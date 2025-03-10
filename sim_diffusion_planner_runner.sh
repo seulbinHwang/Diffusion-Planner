@@ -21,7 +21,7 @@ SPLIT="test14-random"  # e.g., "val14"
 # Options: 
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
-CHALLENGE="closed_loop_reactive_agents"  # e.g., "closed_loop_reactive_agents"
+CHALLENGE="closed_loop_reactive_agents_new"  # e.g., "closed_loop_reactive_agents"
 # TODO: cfg.simulation = CHALLENGE 이 cfg.observation 에 미치는 영향 확인 ->
 ###################################
 
@@ -59,4 +59,9 @@ python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     distributed_mode='SINGLE_NODE' \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"
+    hydra.searchpath="[pkg://diffusion_planner.config.scenario_filter,
+    pkg://diffusion_planner.config,
+    pkg://nuplan.planning.script.config.common,
+    pkg://nuplan.planning.script.experiments  ]"
+
+#  nuplan.planning.script.config.simulation

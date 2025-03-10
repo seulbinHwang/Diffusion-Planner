@@ -37,6 +37,32 @@ class DiffusionPlanner(AbstractPlanner):
             enable_ema: bool = True,
             device: str = "cpu",
         ):
+        """
+{
+    'config':
+        {
+            '_target_': 'diffusion_planner.utils.config.Config',
+            '_convert_': 'all',
+            'args_file': './checkpoints/args.json'
+        },
+    'ckpt_path': './checkpoints/model.pth',
+    'past_trajectory_sampling':
+        {
+            '_target_': 'nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling',
+            '_convert_': 'all',
+            'num_poses': 20,
+            'time_horizon': 2
+        },
+    'future_trajectory_sampling':
+        {
+            '_target_': 'nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling',
+            '_convert_': 'all',
+            'num_poses': 80,
+            'time_horizon': 8
+        },
+    'device': 'cuda'
+}
+        """
 
         assert device in ["cpu", "cuda"], f"device {device} not supported"
         if device == "cuda":
@@ -59,6 +85,7 @@ class DiffusionPlanner(AbstractPlanner):
         self.data_processor = DataProcessor(config)
         
         self.observation_normalizer = config.observation_normalizer
+        self.npc_trajectories = None
 
     def name(self) -> str:
         """
@@ -105,10 +132,10 @@ class DiffusionPlanner(AbstractPlanner):
         return model_inputs
 
     def outputs_to_trajectory(self, outputs: Dict[str, torch.Tensor], ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:    
-
+        # a = outputs['prediction'] # [B, P, V_future, 4] = (1, 11, 80, 4)
         predictions = outputs['prediction'][0, 0].detach().cpu().numpy().astype(np.float64) # T, 4
-        heading = np.arctan2(predictions[:, 3], predictions[:, 2])[..., None]
-        predictions = np.concatenate([predictions[..., :2], heading], axis=-1) 
+        heading = np.arctan2(predictions[:, 3], predictions[:, 2])[..., None] # T, 1
+        predictions = np.concatenate([predictions[..., :2], heading], axis=-1)  # T, 3
 
         states = transform_predictions_to_states(predictions, ego_state_history, self._future_horizon, self._step_interval)
 
@@ -119,13 +146,36 @@ class DiffusionPlanner(AbstractPlanner):
         Inherited.
         """
         inputs = self.planner_input_to_model_inputs(current_input)
-
-        inputs = self.observation_normalizer(inputs)        
+        """ inputs
+neighbor_agents_past: torch.Size([1, 32, 21, 11])
+ego_current_state: torch.Size([1, 4])
+static_objects: torch.Size([1, 5, 10])
+lanes: torch.Size([1, 70, 20, 12])
+lanes_speed_limit: torch.Size([1, 70, 1])
+lanes_has_speed_limit: torch.Size([1, 70, 1])
+route_lanes: torch.Size([1, 25, 20, 12])
+route_lanes_speed_limit: torch.Size([1, 25, 1])
+route_lanes_has_speed_limit: torch.Size([1, 25, 1])
+        """
+        inputs = self.observation_normalizer(inputs)
+        """
+outputs: Dict
+    {
+        ...
+        [training-only] "score": Predicted future states, [B, P, 1 + V_future, 4]
+        [inference-only] "prediction": Predicted future states, [B, P, V_future, 4] = (1, 11, 80, 4)
+        ...
+    }
+        """
         _, outputs = self._planner(inputs)
 
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(outputs, current_input.history.ego_states)
         )
+        npc_predictions = outputs['prediction'][0, 1:].detach().cpu().numpy().astype(np.float64) # [P, V_future, 4] = (10, 80, 4)
+        npc_headings = np.arctan2(npc_predictions[:, :, 3], npc_predictions[:, :, 2])[..., None] # [P, V_future, 1]
+        npc_predictions = np.concatenate([npc_predictions[..., :2], npc_headings], axis=-1)  # [P, V_future, 3]
+        self.npc_trajectories = [npc_predictions[i] for i in range(npc_predictions.shape[0])]
 
         return trajectory
     
