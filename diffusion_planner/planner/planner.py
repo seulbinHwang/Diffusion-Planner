@@ -99,6 +99,7 @@ class DiffusionPlanner(AbstractPlanner):
 
     def initialize(self, initialization: PlannerInitialization) -> None:
         """
+        initialization = self._simulation.initialize()
         Inherited.
         """
         self._map_api = initialization.map_api
@@ -128,7 +129,7 @@ class DiffusionPlanner(AbstractPlanner):
 
     def planner_input_to_model_inputs(
             self, planner_input: PlannerInput) -> Dict[str, torch.Tensor]:
-        """ inputs
+        """ model_inputs
 neighbor_agents_past: torch.Size([1, 32, 21, 11])
 ego_current_state: torch.Size([1, 4])
 static_objects: torch.Size([1, 5, 10])
@@ -150,7 +151,7 @@ route_lanes_has_speed_limit: torch.Size([1, 25, 1])
     def outputs_to_trajectory(
             self, outputs: Dict[str, torch.Tensor],
             ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
-        # a = outputs['prediction'] # [B, P, V_future, 4] = (1, 11, 80, 4)
+        # a = outputs['prediction'] # [B, P, V_future, 4] = (1, 11, 80, 4)z
         predictions = outputs['prediction'][0, 0].detach().cpu().numpy().astype(
             np.float64)  # T, 4
         heading = np.arctan2(predictions[:, 3], predictions[:, 2])[...,
@@ -196,6 +197,9 @@ outputs: Dict
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(
                 outputs, current_input.history.ego_states))
+
+
+        ######### 추가한 부분 ########
         npc_predictions = outputs['prediction'][
             0, 1:].detach().cpu().numpy().astype(
                 np.float64)  # [P, V_future, 4] = (10, 80, 4)

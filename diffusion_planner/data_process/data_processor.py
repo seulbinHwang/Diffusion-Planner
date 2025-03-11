@@ -76,9 +76,10 @@ class DataProcessor(object):
             observation_buffer)
         static_objects, static_objects_types = sampled_static_objects_to_array_list(
             observation_buffer[-1])
-        """selected_indices
-        에이전트 배열 내에서의 위치를 나타내며, 
-            직접적인 token id(각 에이전트의 고유 식별자)는 반환하지 않습니다.
+        """selected_indices : (num_agents,)
+            에이전트 배열 내에서의 위치를 나타내며, 
+                직접적인 token id(각 에이전트의 고유 식별자)는 반환하지 않습니다.
+        static_objects : (num_static, 10)
         """
         _, neighbor_agents_past, selected_indices, static_objects = \
             agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types,
@@ -88,10 +89,11 @@ class DataProcessor(object):
         Map
         '''
         # Simply fixing disconnected routes without pre-searching for reference lines
+        # route_roadblock_ids: List[str] # Roadblock ids comprising goal route
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-            map_api, self._map_features, ego_coords, self._radius,
+            map_api, self._map_features, ego_coords, self._radius, # 100
             traffic_light_data)
         vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
                                  traffic_light_data, speed_limit, lane_route,
