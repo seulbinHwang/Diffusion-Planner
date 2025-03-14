@@ -7,7 +7,7 @@ Categories:
     2. Get agents array for model input
 """
 import numpy as np
-from typing import Dict
+from typing import Dict, List
 
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import AgentInternalIndex
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -65,9 +65,9 @@ def sampled_tracked_objects_to_array_list(past_tracked_objects):
         TrackedObjectType.VEHICLE, TrackedObjectType.PEDESTRIAN,
         TrackedObjectType.BICYCLE
     ]
-    output = [] # List[ np.ndarray (N, 8) ]
-    output_types = [] # List[List[TrackedObjectType]]
-    track_token_ids = {} # Dict[]
+    output = []  # List[ np.ndarray (N, 8) ]
+    output_types = []  # List[List[TrackedObjectType]]
+    track_token_ids = {}  # Dict[]
 
     for i in range(len(past_tracked_objects)):
         if type(past_tracked_objects[i]) == DetectionsTracks:
@@ -218,13 +218,14 @@ def _pad_agent_states_with_zeros(agent_trajectories):
 
 
 def agent_past_process(past_ego_states, past_tracked_objects,
-                       tracked_objects_types, num_agents, static_objects,
-                       static_objects_types, num_static, max_ped_bike,
-                       anchor_ego_state):
+                       tracked_objects_types, track_token_ids, num_agents,
+                       static_objects, static_objects_types, num_static,
+                       max_ped_bike, anchor_ego_state):
     """
     This function process the data from the raw agent data.
     :param past_ego_states: The input array data of the ego past.
     :param past_tracked_objects: The input array data of agents in the past.
+    :param track_token_ids: The track token ids. ( Dict[str, int] )
     :param tracked_objects_types: The type of agents in the past.
     :param num_agents: Clip the number of agents.
     :param static_objects: The input array data of static objects in the past.
@@ -236,15 +237,30 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     """
     agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, length, width
     ego_history = past_ego_states
-    agents = past_tracked_objects
+    agents = past_tracked_objects  #  List[ np.ndarray (N, 8) ]: N: number of agents
 
     if past_ego_states is not None:
         ego = convert_absolute_quantities_to_relative(ego_history,
                                                       anchor_ego_state)
     else:
         ego = None
-
+    # agents :  List[ np.ndarray (N, 8) ]
     agent_history = _filter_agents_array(agents, reverse=True)
+    agent_last_frame = agent_history[-1]  # (num_agents, 8)
+    agent_last_frame_id = agent_last_frame[:,
+                                           AgentInternalIndex.track_token(
+                                           )]  # (num_agents,)
+    agent_last_frame_token_str: List[str] = [
+    ]  # len(agent_last_frame_token_str) = num_agents
+    # Convert track token to string using track_token_ids
+    for agent_idx in range(agent_last_frame_id.shape[0]):
+        a_agent_integer_id = int(agent_last_frame_id[agent_idx])
+        # Convert integer id to string using track_token_ids
+        for key, value in track_token_ids.items():
+            if value == a_agent_integer_id:
+                agent_last_frame_token_str.append(key)
+                break
+    assert len(agent_last_frame_token_str) == agent_last_frame_id.shape[0]
     agent_types = tracked_objects_types[-1]
 
     if agent_history[-1].shape[0] == 0:
@@ -261,6 +277,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
                                                         'agent'))
 
         # Calculate yaw rate
+        # (num_frames, num_agents, 8)
         agents_array = np.zeros(
             (len(local_coords_agent_states),
              local_coords_agent_states[0].shape[0], agents_states_dim))
@@ -325,21 +342,22 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     agents = np.zeros(
         (num_agents, agents_array.shape[0], agents_array.shape[-1] + 3),
         dtype=np.float32)
-
+    # agents_array: (num_frames, num_agents, 8)
+    # distance_to_ego: (num_agents,)
     distance_to_ego = np.linalg.norm(agents_array[-1, :, :2], axis=-1)
 
     # Sort indices by distance
-    sorted_indices = np.argsort(distance_to_ego)
+    sorted_indices = np.argsort(distance_to_ego)  # (num_agents,)
 
     # Collect the indices of pedestrians and bicycles
     ped_bike_indices = [
         i for i in sorted_indices
         if agent_types[i] in (TrackedObjectType.PEDESTRIAN,
                               TrackedObjectType.BICYCLE)
-    ]
+    ]  # len(ped_bike_indices) = num_pedestrian + num_bicycle
     vehicle_indices = [
         i for i in sorted_indices if agent_types[i] == TrackedObjectType.VEHICLE
-    ]
+    ]  # len(vehicle_indices) = num_vehicle
 
     # If the total number of available agents is less than or equal to num_agents, no need to filter further
     if len(ped_bike_indices) + len(vehicle_indices) <= num_agents:
@@ -372,7 +390,11 @@ def agent_past_process(past_ego_states, past_tracked_objects,
                                                      0]  # Mark as PEDESTRIAN
         else:  # TrackedObjectType.BICYCLE
             agents[i, :, agents_array.shape[-1]:] = [0, 0, 1]  # Mark as BICYCLE
-
+    # Sort agent_last_frame_id and agent_last_frame_token_str by sorted agents.
+    agent_last_frame_id = agent_last_frame_id[selected_indices]  # (num_agents,)
+    agent_last_frame_token_str = [
+        agent_last_frame_token_str[i] for i in selected_indices
+    ]  # len(agent_last_frame_token_str) = num_agents
     static_objects = np.zeros((num_static, static_objects_array.shape[-1] + 4),
                               dtype=np.float32)
     static_distance_to_ego = np.linalg.norm(static_objects_array[:, :2],
@@ -395,7 +417,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     if ego is not None:
         ego = ego.astype(np.float32)
 
-    return ego, agents, selected_indices, static_objects
+    return ego, agents, selected_indices, static_objects, agent_last_frame_id, agent_last_frame_token_str
 
 
 def agent_future_process(anchor_ego_state, future_tracked_objects, num_agents,

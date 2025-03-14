@@ -5,17 +5,18 @@ from diffusion_planner.utils.normalizer import StateNormalizer, ObservationNorma
 
 
 class Config:
-    
+
     def __init__(
-            self,
-            args_file,
+        self,
+        args_file,
     ):
         with open(args_file, 'r') as f:
             args_dict = json.load(f)
-            
+
         for key, value in args_dict.items():
             setattr(self, key, value)
-        self.state_normalizer = StateNormalizer(self.state_normalizer['mean'], self.state_normalizer['std'])
+        self.state_normalizer = StateNormalizer(self.state_normalizer['mean'],
+                                                self.state_normalizer['std'])
         self.observation_normalizer = ObservationNormalizer({
             k: {
                 'mean': torch.as_tensor(v['mean']),

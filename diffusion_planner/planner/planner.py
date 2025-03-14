@@ -65,7 +65,8 @@ class DiffusionPlanner(AbstractPlanner):
         assert device in ["cpu", "cuda"], f"device {device} not supported"
         if device == "cuda":
             assert torch.cuda.is_available(), "cuda is not available"
-
+        # 8
+        # 8 /80 = 0.1
         self._future_horizon = future_trajectory_sampling.time_horizon  # [s]
         self._step_interval = future_trajectory_sampling.time_horizon / future_trajectory_sampling.num_poses  # [s]
 
@@ -106,6 +107,15 @@ class DiffusionPlanner(AbstractPlanner):
         self._route_roadblock_ids = initialization.route_roadblock_ids
 
         if self._ckpt_path is not None:
+            """
+- **'ema_state_dict':**  (Exponential Moving Average)
+    EMA 방식으로 업데이트된 가중치들이 저장된 부분으로, EMA가 활성화된 경우 이 가중치들을 사용
+- **'model':** 
+    체크포인트를 저장할 때, 실제 모델 가중치를 담기 위해 사용한 키로, 
+    EMA가 사용되지 않을 때 이 하위 딕셔너리의 가중치를 사용
+- **"module." 접두사:** 
+    분산 학습(DDP) 환경에서 모델이 래핑될 때 붙는 접두사로, 이를 제거하여 원래 모델의 가중치 키로 복원
+            """
             state_dict: Dict = torch.load(self._ckpt_path)
 
             if self._ema_enabled:
@@ -145,13 +155,12 @@ route_lanes_has_speed_limit: torch.Size([1, 25, 1])
         model_inputs = self.data_processor.observation_adapter(
             history, traffic_light_data, self._map_api,
             self._route_roadblock_ids, self._device)
-
         return model_inputs
 
     def outputs_to_trajectory(
             self, outputs: Dict[str, torch.Tensor],
             ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
-        # a = outputs['prediction'] # [B, P, V_future, 4] = (1, 11, 80, 4)z
+        # a = outputs['prediction'] # [B, P, V_future, 4] = (1, 11, 80, 4)
         predictions = outputs['prediction'][0, 0].detach().cpu().numpy().astype(
             np.float64)  # T, 4
         heading = np.arctan2(predictions[:, 3], predictions[:, 2])[...,
@@ -159,9 +168,11 @@ route_lanes_has_speed_limit: torch.Size([1, 25, 1])
         predictions = np.concatenate([predictions[..., :2], heading],
                                      axis=-1)  # T, 3
 
-        states = transform_predictions_to_states(predictions, ego_state_history,
-                                                 self._future_horizon,
-                                                 self._step_interval)
+        states = transform_predictions_to_states(
+            predictions,
+            ego_state_history,
+            self._future_horizon,  # 8
+            self._step_interval)  # 0.1
 
         return states
 
@@ -197,7 +208,6 @@ outputs: Dict
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(
                 outputs, current_input.history.ego_states))
-
 
         ######### 추가한 부분 ########
         npc_predictions = outputs['prediction'][

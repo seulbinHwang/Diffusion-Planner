@@ -3,8 +3,11 @@ from torch.utils.data import Dataset
 
 from diffusion_planner.utils.train_utils import openjson, opendata
 
+
 class DiffusionPlannerData(Dataset):
-    def __init__(self, data_dir, data_list, past_neighbor_num, predicted_neighbor_num, future_len):
+
+    def __init__(self, data_dir, data_list, past_neighbor_num,
+                 predicted_neighbor_num, future_len):
         self.data_dir = data_dir
         self.data_list = openjson(data_list)
         self._past_neighbor_num = past_neighbor_num
@@ -22,8 +25,10 @@ class DiffusionPlannerData(Dataset):
         ego_current_state = data['ego_current_state']
         ego_agent_future = data['ego_agent_future']
 
-        neighbor_agents_past = data['neighbor_agents_past'][:self._past_neighbor_num]
-        neighbor_agents_future = data['neighbor_agents_future'][:self._predicted_neighbor_num]
+        neighbor_agents_past = data['neighbor_agents_past'][:self.
+                                                            _past_neighbor_num]
+        neighbor_agents_future = data[
+            'neighbor_agents_future'][:self._predicted_neighbor_num]
 
         lanes = data['lanes']
         lanes_speed_limit = data['lanes_speed_limit']

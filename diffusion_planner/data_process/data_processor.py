@@ -55,13 +55,13 @@ class DataProcessor(object):
         ego
         '''
         ego_agent_past = None  # inference no need ego_agent_past
-        ego_state = history_buffer.current_state[0] # EgoState
+        ego_state = history_buffer.current_state[0]  # EgoState
         ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
         anchor_ego_state = np.array([
             ego_state.rear_axle.x, ego_state.rear_axle.y,
             ego_state.rear_axle.heading
         ],
-                                    dtype=np.float64) # shape: (3,)
+                                    dtype=np.float64)  # shape: (3,)
         '''
         neighbor
         '''
@@ -81,10 +81,17 @@ class DataProcessor(object):
                 직접적인 token id(각 에이전트의 고유 식별자)는 반환하지 않습니다.
         static_objects : (num_static, 10)
         """
-        _, neighbor_agents_past, selected_indices, static_objects = \
-            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types,
+        _, neighbor_agents_past, selected_indices, static_objects,  neighbor_agents_id, neighbor_agents_token_str = \
+            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, track_token_ids,
                                self.num_agents, static_objects, static_objects_types,
                                self.num_static, self.max_ped_bike, anchor_ego_state)
+        """
+        neighbor_agents_past: (32, 23, 11)
+        selected_indices : (26,)
+        static_objects: (5, 10)
+        neighbor_agents_id: (26,)
+        len(neighbor_agents_token_str) 26
+        """
         '''
         Map
         '''
@@ -93,7 +100,10 @@ class DataProcessor(object):
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-            map_api, self._map_features, ego_coords, self._radius, # 100
+            map_api,
+            self._map_features,
+            ego_coords,
+            self._radius,  # 100
             traffic_light_data)
         vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
                                  traffic_light_data, speed_limit, lane_route,
@@ -101,7 +111,8 @@ class DataProcessor(object):
                                  self._max_points)
 
         data = {
-            "neighbor_agents_past": neighbor_agents_past[:, -21:],
+            "neighbor_agents_past": neighbor_agents_past[:,
+                                                         -21:],  # (32, 21, 11)
             "ego_current_state": np.array(
                 [0., 0., 1., 0.],
                 dtype=np.float32),  # ego centric x, y, cos, sin

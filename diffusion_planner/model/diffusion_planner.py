@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 
@@ -7,6 +6,7 @@ from diffusion_planner.model.module.decoder import Decoder
 
 
 class Diffusion_Planner(nn.Module):
+
     def __init__(self, config):
         super().__init__()
 
@@ -16,7 +16,7 @@ class Diffusion_Planner(nn.Module):
     @property
     def sde(self):
         return self.decoder.decoder.sde
-    
+
     def forward(self, inputs):
 
         encoder_outputs = self.encoder(inputs)
@@ -26,6 +26,7 @@ class Diffusion_Planner(nn.Module):
 
 
 class Diffusion_Planner_Encoder(nn.Module):
+
     def __init__(self, config):
         super().__init__()
 
@@ -44,12 +45,14 @@ class Diffusion_Planner_Encoder(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
         self.apply(_basic_init)
 
         # Initialize embedding MLP:
         nn.init.normal_(self.encoder.pos_emb.weight, std=0.02)
         nn.init.normal_(self.encoder.neighbor_encoder.type_emb.weight, std=0.02)
-        nn.init.normal_(self.encoder.lane_encoder.speed_limit_emb.weight, std=0.02)
+        nn.init.normal_(self.encoder.lane_encoder.speed_limit_emb.weight,
+                        std=0.02)
         nn.init.normal_(self.encoder.lane_encoder.traffic_emb.weight, std=0.02)
 
     def forward(self, inputs):
@@ -57,9 +60,10 @@ class Diffusion_Planner_Encoder(nn.Module):
         encoder_outputs = self.encoder(inputs)
 
         return encoder_outputs
-    
+
 
 class Diffusion_Planner_Decoder(nn.Module):
+
     def __init__(self, config):
         super().__init__()
 
@@ -78,6 +82,7 @@ class Diffusion_Planner_Decoder(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
+
         self.apply(_basic_init)
 
         # Initialize timestep embedding MLP:
@@ -90,13 +95,15 @@ class Diffusion_Planner_Decoder(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.decoder.dit.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(
+            self.decoder.dit.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(
+            self.decoder.dit.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.decoder.dit.final_layer.proj[-1].weight, 0)
         nn.init.constant_(self.decoder.dit.final_layer.proj[-1].bias, 0)
 
     def forward(self, encoder_outputs, inputs):
 
         decoder_outputs = self.decoder(encoder_outputs, inputs)
-        
+
         return decoder_outputs

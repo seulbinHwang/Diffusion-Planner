@@ -2,7 +2,9 @@ import torch
 
 from diffusion_planner.utils.train_utils import openjson
 
+
 class StateNormalizer:
+
     def __init__(self, mean, std):
         self.mean = torch.as_tensor(mean)
         self.std = torch.as_tensor(std)
@@ -10,10 +12,12 @@ class StateNormalizer:
     @classmethod
     def from_json(cls, args):
         data = openjson(args.normalization_file_path)
-        mean = [[data["ego"]["mean"]]] + [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
-        std = [[data["ego"]["std"]]] + [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
+        mean = [[data["ego"]["mean"]]
+               ] + [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
+        std = [[data["ego"]["std"]]
+              ] + [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
         return cls(mean, std)
-    
+
     def __call__(self, data):
         return (data - self.mean.to(data.device)) / self.std.to(data.device)
 
@@ -28,6 +32,7 @@ class StateNormalizer:
 
 
 class ObservationNormalizer:
+
     def __init__(self, normalization_dict):
         self._normalization_dict = normalization_dict
 
@@ -42,7 +47,10 @@ class ObservationNormalizer:
         ndt = {}
         for k, v in data.items():
             if k not in ["ego", "neighbor"]:
-                ndt[k]= {"mean": torch.tensor(v["mean"], dtype=torch.float32), "std": torch.tensor(v["std"], dtype=torch.float32)}
+                ndt[k] = {
+                    "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                    "std": torch.tensor(v["std"], dtype=torch.float32)
+                }
         return cls(ndt)
 
     def __call__(self, data):
@@ -50,7 +58,8 @@ class ObservationNormalizer:
             if k not in data:  # Check if key `k` exists in `data`
                 continue
             mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
-            data[k] = (data[k] - v["mean"].to(data[k].device)) / v["std"].to(data[k].device)
+            data[k] = (data[k] - v["mean"].to(data[k].device)) / v["std"].to(
+                data[k].device)
             data[k][mask] = 0
         return data
 
@@ -59,9 +68,14 @@ class ObservationNormalizer:
             if k not in data:  # Check if key `k` exists in `data`
                 continue
             mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
-            data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(data[k].device)
+            data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(
+                data[k].device)
             data[k][mask] = 0
         return data
 
     def to_dict(self):
-        return {k: {kk: vv.detach().cpu().numpy().tolist() for kk, vv in v.items()} for k, v in self._normalization_dict.items()}
+        return {
+            k: {
+                kk: vv.detach().cpu().numpy().tolist() for kk, vv in v.items()
+            } for k, v in self._normalization_dict.items()
+        }
