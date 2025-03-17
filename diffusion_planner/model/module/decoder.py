@@ -42,7 +42,7 @@ class Decoder(nn.Module):
     def sde(self):
         return self._sde
 
-    def forward(self, encoder_outputs, inputs, neighbor_agents_token_str):
+    def forward(self, encoder_outputs, inputs):
         """
         Diffusion decoder process.
 
@@ -78,6 +78,8 @@ class Decoder(nn.Module):
                 }
 
         """
+        neighbor_agents_token_str = inputs[
+            "neighbor_agents_token_str"]  # List[List[str]]
         # Extract ego & neighbor current states
         ego_current = inputs['ego_current_state'][:, None, :4]  # [B, 1, 4]
         neighbors_current = inputs[
@@ -142,7 +144,7 @@ class Decoder(nn.Module):
 
             return {
                 "prediction":
-                    x0,
+                    x0,  # [B, P, V_future, 4]
                 "neighbor_selected_agents_token_str":
                     neighbor_selected_agents_token_str
             }

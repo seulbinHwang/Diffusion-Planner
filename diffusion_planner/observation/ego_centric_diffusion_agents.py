@@ -88,17 +88,20 @@ class EgoCentricDiffusionAgents(AbstractMLAgents):
                                         predictions[self.prediction_type]).data
 
         # Retrieve first (and only) batch as a numpy array
-        agents_prediction = agents_prediction_tensor[0].cpu().detach().numpy()
+        agents_prediction = agents_prediction_tensor[0].cpu().detach().numpy(
+        )  # (num_frames, num_agents, 6)
         neighbor_selected_agents_token_str = predictions[
             "neighbor_selected_agents_token_str"]  # List[List[str]]
-        return {
+        b = AgentsTrajectories(
+            [cast(npt.NDArray[np.float32],
+                  agents_prediction)]).get_agents_only_trajectories()
+        return_ = {
             self.prediction_type:
-                AgentsTrajectories(
-                    [cast(npt.NDArray[np.float32],
-                          agents_prediction)]).get_agents_only_trajectories(),
+                b,
             "neighbor_selected_agents_token_str":
                 neighbor_selected_agents_token_str
         }
+        return return_
 
     def _update_observation_with_predictions(self,
                                              predictions: TargetsType) -> None:
@@ -116,9 +119,10 @@ class EgoCentricDiffusionAgents(AbstractMLAgents):
         neighbor_selected_agents_token_str = predictions[
             "neighbor_selected_agents_token_str"]  # List[List[str]]
 
-        agent_predictions.reshape_to_agents()
+        agent_predictions.reshape_to_agents()  # (agents, num_frames, 6)
+        a = agent_predictions.data[0]  # (agents, num_frames, 6)
         agent_poses = agent_predictions.poses[
-            0]  # Fetch the first batch for the pose data # (num_agents, num_frames, 2)
+            0]  # Fetch the first batch for the pose data # (num_agents, num_frames, 3)
         agent_velocities = agent_predictions.xy_velocity[
             0]  # (num_agents, num_frames, 2)
         a_neighbor_selected_agents_token_str = neighbor_selected_agents_token_str[
@@ -135,7 +139,7 @@ class EgoCentricDiffusionAgents(AbstractMLAgents):
             """
             agent_token : str
             agent : SceneObject(TrackedObject) 
-            poses_horizon: (num_frames, 2)
+            poses_horizon: (num_frames, 3)
             xy_velocity_horizon: (num_frames, 2)
             """
             """

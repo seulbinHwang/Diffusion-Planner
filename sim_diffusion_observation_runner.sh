@@ -21,7 +21,7 @@ SPLIT="test14-random"  # e.g., "val14"
 # Options: 
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
-CHALLENGE="closed_loop_reactive_agents" # e.g., "closed_loop_reactive_agents"
+CHALLENGE="closed_loop_reactive_diffusion_agents" # e.g., "closed_loop_reactive_agents"
 ###################################
 
 
@@ -38,17 +38,14 @@ echo "Processing $CKPT_FILE..."
 FILENAME=$(basename "$CKPT_FILE")
 FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}"
 # diffusion_planner/planner/planner.py 의 DiffusionPlanner
-PLANNER=diffusion_planner
+PLANNER=idm_planner
 # print PLANNER
-echo "PLANNER: $PLANNER"
 # $ARGS_FILE /home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
 python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     planner=$PLANNER \
-    planner.diffusion_planner.config.args_file=$ARGS_FILE \
-    planner.diffusion_planner.ckpt_path=$CKPT_FILE \
     scenario_builder=$SCENARIO_BUILDER \
     scenario_filter=$SPLIT \
     experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \

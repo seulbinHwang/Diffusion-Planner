@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import warnings
 import torch
 import numpy as np
 from typing import Deque, Dict, List, Type, Tuple, Optional
-from __future__ import annotations
 
 import timm
 
@@ -86,7 +87,6 @@ def convert_decoder_outputs_to_agents_trajectories(
     """
     # predictions.shape = (B, P, V_future, 4)
     B = predictions.shape[0]  # batch size
-    P = predictions.shape[1]  # number of agents or predictions
     V_future = predictions.shape[2]  # number of future frames
 
     data_list = []
@@ -114,18 +114,20 @@ def convert_decoder_outputs_to_agents_trajectories(
 
         # Allocate arrays for velocity, yaw_rate
         # shape = (V_future, P)
-        vx = torch.zeros_like(x)
-        vy = torch.zeros_like(x)
-        yaw_rate = torch.zeros_like(x)
+        vx = torch.zeros_like(x)  # (V_future, P)
+        vy = torch.zeros_like(x)  # (V_future, P)
+        yaw_rate = torch.zeros_like(x)  # (V_future, P)
 
         # Finite difference
         # for i=1..V_future-1, compute velocity, yaw_rate
-        for i in range(1, V_future):
-            vx[i] = (x[i] - x[i - 1]) / dt  # shape => (P,)
-            vy[i] = (y[i] - y[i - 1]) / dt  # shape => (P,)
-            dtheta = angle_difference(heading[i],
-                                      heading[i - 1])  # shape => (P,)
-            yaw_rate[i] = dtheta / dt
+        for point_idx in range(1, V_future):
+            vx[point_idx] = (x[point_idx] -
+                             x[point_idx - 1]) / dt  # shape => (P,)
+            vy[point_idx] = (y[point_idx] -
+                             y[point_idx - 1]) / dt  # shape => (P,)
+            dtheta = angle_difference(heading[point_idx],
+                                      heading[point_idx - 1])  # shape => (P,)
+            yaw_rate[point_idx] = dtheta / dt
 
         # stack => shape (V_future, P, 6)
         # last dim: [x, y, heading, vx, vy, yaw_rate]
@@ -147,15 +149,13 @@ def identity(ego_state, predictions):
 
 class DiffusionPlanner(TorchModuleWrapper):
 
-    def __init__(
-        self,
-        config: Config,
-        ckpt_path: str,
-        past_trajectory_sampling: TrajectorySampling,
-        future_trajectory_sampling: TrajectorySampling,
-        feature_builders: List[AbstractFeatureBuilder],
-        target_builders: Optional[List[AbstractTargetBuilder]] = None,
-    ):
+    def __init__(self,
+                 config: Config,
+                 ckpt_path: str,
+                 future_trajectory_sampling: TrajectorySampling,
+                 feature_builders: List[AbstractFeatureBuilder],
+                 target_builders: Optional[List[AbstractTargetBuilder]] = None,
+                 enable_ema: bool = True):
         if target_builders is None:
             target_builders = []
         super().__init__(
@@ -163,7 +163,10 @@ class DiffusionPlanner(TorchModuleWrapper):
             target_builders=target_builders,
             future_trajectory_sampling=future_trajectory_sampling,
         )
+        self._ema_enabled = enable_ema
         self._config = config
+        self.encoder = Diffusion_Planner_Encoder(config)
+        self.decoder = Diffusion_Planner_Decoder(config)
         self._ckpt_path = ckpt_path
         if self._ckpt_path is not None:
             state_dict: Dict = torch.load(self._ckpt_path)
@@ -179,20 +182,16 @@ class DiffusionPlanner(TorchModuleWrapper):
                 for k, v in state_dict.items()
                 if k.startswith("module.")
             }
-            self._planner.load_state_dict(model_state_dict)
+            self.load_state_dict(model_state_dict)
         else:
             print("load random model")
-
-        self.encoder = Diffusion_Planner_Encoder(config)
-        self.decoder = Diffusion_Planner_Decoder(config)
 
     def forward(self, features: FeaturesType) -> TargetsType:
         """
         The main inference call for the model.
         :param features: A dictionary of the required features.
             FeaturesType = Dict[str, ModelInputFeature]
-            {"processed_data": ModelInputFeature,
-            "neighbor_agents_token_str": List[List[str]]}
+            {"processed_data": ModelInputFeature}
         :return: The results of the inference as a TargetsType.
             decoder_outputs: TargetsType = Dict[str, AbstractModelFeature]
 {
@@ -203,15 +202,12 @@ class DiffusionPlanner(TorchModuleWrapper):
 }
         """
         features = features["processed_data"].to_dict()
-        neighbor_agents_token_str = features[
-            "neighbor_agents_token_str"]  # List[List[str]]
         encoder_outputs = self.encoder(features)
-        decoder_outputs = self.decoder(encoder_outputs, features,
-                                       neighbor_agents_token_str)
+        decoder_outputs = self.decoder(encoder_outputs, features)
         decoder_prediction_outputs = decoder_outputs[
-            "prediction"]  # [B, P, V_future, 4]
+            "prediction"][:, 1:]  # [B, P, V_future, 4]
         neighbor_selected_agents_token_str = decoder_outputs[
-            "neighbor_selected_agents_token_str"]
+            "neighbor_selected_agents_token_str"]  # List[List[str]]
         time_gap = self.future_trajectory_sampling.step_time
         agents_trajectories = convert_decoder_outputs_to_agents_trajectories(
             decoder_prediction_outputs, time_gap)
@@ -301,9 +297,8 @@ class Diffusion_Planner_Decoder(nn.Module):
         nn.init.constant_(self.decoder.dit.final_layer.proj[-1].weight, 0)
         nn.init.constant_(self.decoder.dit.final_layer.proj[-1].bias, 0)
 
-    def forward(self, encoder_outputs, inputs, neighbor_agents_token_str):
+    def forward(self, encoder_outputs, inputs):
 
-        decoder_outputs = self.decoder(encoder_outputs, inputs,
-                                       neighbor_agents_token_str)
+        decoder_outputs = self.decoder(encoder_outputs, inputs)
 
         return decoder_outputs

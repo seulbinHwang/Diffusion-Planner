@@ -246,21 +246,20 @@ def agent_past_process(past_ego_states, past_tracked_objects,
         ego = None
     # agents :  List[ np.ndarray (N, 8) ]
     agent_history = _filter_agents_array(agents, reverse=True)
-    agent_last_frame = agent_history[-1]  # (num_agents, 8)
-    agent_last_frame_id = agent_last_frame[:,
-                                           AgentInternalIndex.track_token(
-                                           )]  # (num_agents,)
-    agent_last_frame_token_str: List[str] = [
-    ]  # len(agent_last_frame_token_str) = num_agents
+    agent_last_frame = agent_history[-1]  # (last_frame_num_agents, 8)
+    neighbor_agents_id = agent_last_frame[:,
+                                          AgentInternalIndex.track_token(
+                                          )]  # (last_frame_num_agents,)
+    neighbor_agents_token_str: List[str] = [
+    ]  # len(neighbor_agents_token_str) = num_agents
     # Convert track token to string using track_token_ids
-    for agent_idx in range(agent_last_frame_id.shape[0]):
-        a_agent_integer_id = int(agent_last_frame_id[agent_idx])
+    for agent_idx in range(neighbor_agents_id.shape[0]):
+        a_agent_integer_id = int(neighbor_agents_id[agent_idx])
         # Convert integer id to string using track_token_ids
         for key, value in track_token_ids.items():
             if value == a_agent_integer_id:
-                agent_last_frame_token_str.append(key)
+                neighbor_agents_token_str.append(key)
                 break
-    assert len(agent_last_frame_token_str) == agent_last_frame_id.shape[0]
     agent_types = tracked_objects_types[-1]
 
     if agent_history[-1].shape[0] == 0:
@@ -269,52 +268,40 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     else:
         local_coords_agent_states = []
         padded_agent_states = _pad_agent_states(agent_history, reverse=True)
-
         for agent_state in padded_agent_states:
+            # agent_state: np (last_frame_num_agents, 8)
             local_coords_agent_states.append(
                 convert_absolute_quantities_to_relative(agent_state,
                                                         anchor_ego_state,
                                                         'agent'))
 
         # Calculate yaw rate
-        # (num_frames, num_agents, 8)
+        # (num_frames, last_Frame_num_agents, 8)
         agents_array = np.zeros(
             (len(local_coords_agent_states),
              local_coords_agent_states[0].shape[0], agents_states_dim))
 
-        for i in range(len(local_coords_agent_states)):
-            agents_array[i, :,
-                         0] = local_coords_agent_states[i][:,
-                                                           AgentInternalIndex.x(
-                                                           )].squeeze()
-            agents_array[i, :,
-                         1] = local_coords_agent_states[i][:,
-                                                           AgentInternalIndex.y(
-                                                           )].squeeze()
-            agents_array[i, :,
-                         2] = np.cos(local_coords_agent_states[i]
+        for frame_idx in range(len(local_coords_agent_states)):
+            agents_array[frame_idx, :, 0] = local_coords_agent_states[
+                frame_idx][:, AgentInternalIndex.x()].squeeze()
+            agents_array[frame_idx, :, 1] = local_coords_agent_states[
+                frame_idx][:, AgentInternalIndex.y()].squeeze()
+            agents_array[frame_idx, :,
+                         2] = np.cos(local_coords_agent_states[frame_idx]
                                      [:,
                                       AgentInternalIndex.heading()].squeeze())
-            agents_array[i, :,
-                         3] = np.sin(local_coords_agent_states[i]
+            agents_array[frame_idx, :,
+                         3] = np.sin(local_coords_agent_states[frame_idx]
                                      [:,
                                       AgentInternalIndex.heading()].squeeze())
-            agents_array[i, :,
-                         4] = local_coords_agent_states[i][:,
-                                                           AgentInternalIndex.
-                                                           vx()].squeeze()
-            agents_array[i, :,
-                         5] = local_coords_agent_states[i][:,
-                                                           AgentInternalIndex.
-                                                           vy()].squeeze()
-            agents_array[i, :,
-                         6] = local_coords_agent_states[i][:,
-                                                           AgentInternalIndex.
-                                                           width()].squeeze()
-            agents_array[i, :,
-                         7] = local_coords_agent_states[i][:,
-                                                           AgentInternalIndex.
-                                                           length()].squeeze()
+            agents_array[frame_idx, :, 4] = local_coords_agent_states[
+                frame_idx][:, AgentInternalIndex.vx()].squeeze()
+            agents_array[frame_idx, :, 5] = local_coords_agent_states[
+                frame_idx][:, AgentInternalIndex.vy()].squeeze()
+            agents_array[frame_idx, :, 6] = local_coords_agent_states[
+                frame_idx][:, AgentInternalIndex.width()].squeeze()
+            agents_array[frame_idx, :, 7] = local_coords_agent_states[
+                frame_idx][:, AgentInternalIndex.length()].squeeze()
 
     static_objects_array = np.zeros((static_objects.shape[0], 6))
     if static_objects.shape[0] != 0:
@@ -332,22 +319,27 @@ def agent_past_process(past_ego_states, past_tracked_objects,
         static_objects_array[:, 4] = local_coords_static_objects_states[:, 3]
         static_objects_array[:, 5] = local_coords_static_objects_states[:, 4]
     '''
-    Post-process the agents array to select a fixed number of agents closest to the ego vehicle.
+    Post-process the agents array 
+        to select a fixed number of agents closest to the ego vehicle.
     agents: <np.ndarray: num_agents, num_frames, 11>]].
-        Agent type is one-hot encoded: [1, 0, 0] vehicle, [0, 1, 0] pedestrain, [0, 0, 1] bicycle 
+        Agent type is one-hot encoded: 
+            [1, 0, 0] vehicle, [0, 1, 0] pedestrain, [0, 0, 1] bicycle 
             and added to the feature of the agent
-        The num_agents is padded or trimmed to fit the predefined number of agents across.
+        The num_agents 
+            is padded or trimmed to fit the predefined number of agents across.
     '''
     # Initialize the result array
+    # agents_array: (num_frames, last_Frame_num_agents, 8)
     agents = np.zeros(
         (num_agents, agents_array.shape[0], agents_array.shape[-1] + 3),
-        dtype=np.float32)
-    # agents_array: (num_frames, num_agents, 8)
-    # distance_to_ego: (num_agents,)
-    distance_to_ego = np.linalg.norm(agents_array[-1, :, :2], axis=-1)
+        dtype=np.float32)  # (num_agents=32, num_frames, 11)
+    # agents_array: (num_frames, last_Frame_num_agents, 8)
+    # distance_to_ego: (last_Frame_num_agents,)
+    distance_to_ego = np.linalg.norm(agents_array[-1, :, :2],
+                                     axis=-1)  # (last_Frame_num_agents, )
 
     # Sort indices by distance
-    sorted_indices = np.argsort(distance_to_ego)  # (num_agents,)
+    sorted_indices = np.argsort(distance_to_ego)  # (last_Frame_num_agents)
 
     # Collect the indices of pedestrians and bicycles
     ped_bike_indices = [
@@ -358,7 +350,6 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     vehicle_indices = [
         i for i in sorted_indices if agent_types[i] == TrackedObjectType.VEHICLE
     ]  # len(vehicle_indices) = num_vehicle
-
     # If the total number of available agents is less than or equal to num_agents, no need to filter further
     if len(ped_bike_indices) + len(vehicle_indices) <= num_agents:
         selected_indices = sorted_indices[:num_agents]
@@ -380,21 +371,25 @@ def agent_past_process(past_ego_states, past_tracked_objects,
             selected_indices, key=lambda idx: distance_to_ego[idx])[:num_agents]
 
     # Populate the final agents array with the selected agents' features
-    for i, j in enumerate(selected_indices):
+    for i, sorted_idx in enumerate(
+            selected_indices):  # selected_indices:  (shrinked_num_agents = 10)
+        # agents # (num_agents=32, num_frames, 11)
+        # agents_array # (num_frames, last_Frame_num_agents, 8)
         agents[i, :, :agents_array.
-               shape[-1]] = agents_array[:, j, :agents_array.shape[-1]]
-        if agent_types[j] == TrackedObjectType.VEHICLE:
+               shape[-1]] = agents_array[:, sorted_idx, :agents_array.shape[-1]]
+        if agent_types[sorted_idx] == TrackedObjectType.VEHICLE:
             agents[i, :, agents_array.shape[-1]:] = [1, 0, 0]  # Mark as VEHICLE
-        elif agent_types[j] == TrackedObjectType.PEDESTRIAN:
+        elif agent_types[sorted_idx] == TrackedObjectType.PEDESTRIAN:
             agents[i, :, agents_array.shape[-1]:] = [0, 1,
                                                      0]  # Mark as PEDESTRIAN
         else:  # TrackedObjectType.BICYCLE
             agents[i, :, agents_array.shape[-1]:] = [0, 0, 1]  # Mark as BICYCLE
-    # Sort agent_last_frame_id and agent_last_frame_token_str by sorted agents.
-    agent_last_frame_id = agent_last_frame_id[selected_indices]  # (num_agents,)
-    agent_last_frame_token_str = [
-        agent_last_frame_token_str[i] for i in selected_indices
-    ]  # len(agent_last_frame_token_str) = num_agents
+    # neighbor_agents_id: (last_Frame_num_agents) -> (shrinked_num_agents,)
+    neighbor_agents_id = neighbor_agents_id[
+        selected_indices]  # (shrinked_num_agents,)
+    neighbor_agents_token_str = [
+        neighbor_agents_token_str[i] for i in selected_indices
+    ]  # len(neighbor_agents_token_str) = num_agents
     static_objects = np.zeros((num_static, static_objects_array.shape[-1] + 4),
                               dtype=np.float32)
     static_distance_to_ego = np.linalg.norm(static_objects_array[:, :2],
@@ -417,7 +412,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     if ego is not None:
         ego = ego.astype(np.float32)
 
-    return ego, agents, selected_indices, static_objects, agent_last_frame_id, agent_last_frame_token_str
+    return ego, agents, selected_indices, static_objects, neighbor_agents_id, neighbor_agents_token_str
 
 
 def agent_future_process(anchor_ego_state, future_tracked_objects, num_agents,

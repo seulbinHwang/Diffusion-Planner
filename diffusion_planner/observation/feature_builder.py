@@ -55,7 +55,6 @@ class ModelInputFeature(AbstractModelFeature):
     route_lanes: Tensor  # shape: (1, 25, 20, 12)
     route_lanes_speed_limit: Tensor  # shape: (1, 25, 1)
     route_lanes_has_speed_limit: Tensor  # shape: (1, 25, 1)
-
     # 새로 추가: agent 토큰 문자열 정보 (List[List[str]]: batch dimension x agent dimension)
     neighbor_agents_token_str: List[List[str]] = field(default_factory=list)
 
@@ -200,10 +199,9 @@ class DataProcessor(AbstractFeatureBuilder):
     def get_features_from_simulation(
             self, current_input: PlannerInput,
             initialization: PlannerInitialization) -> AbstractModelFeature:
-        # neighbor_agents_id: numpy shape : (N_neighbor,)
         # neighbor_agents_token_str: List[List[str]]
         model_inputs, neighbor_agents_token_str = self.observation_adapter(
-            history_buffer=current_input.history,
+            history_buffer=current_input.history,  # SimulationHistoryBuffer
             traffic_light_data=list(current_input.traffic_light_data),
             map_api=initialization.map_api,
             route_roadblock_ids=initialization.route_roadblock_ids)
@@ -212,7 +210,7 @@ class DataProcessor(AbstractFeatureBuilder):
         my_feature = ModelInputFeature(
             neighbor_agents_past=model_inputs[
                 "neighbor_agents_past"],  # [1, 32, 21, 11]
-            neighbor_agents_id=model_inputs["neighbor_agents_id"],  # [32,]
+            neighbor_agents_id=model_inputs["neighbor_agents_id"],  # [1, 20]
             ego_current_state=model_inputs["ego_current_state"],  # [1, 4]
             static_objects=model_inputs["static_objects"],  # [1, 5, 10]
             lanes=model_inputs["lanes"],  # [1, 70, 20, 12]
@@ -224,16 +222,18 @@ class DataProcessor(AbstractFeatureBuilder):
                 "route_lanes_speed_limit"],  # [1, 25, 1]
             route_lanes_has_speed_limit=model_inputs[
                 "route_lanes_has_speed_limit"],  # [1, 25, 1]
-            neighbor_agents_token_str=neighbor_agents_token_str,
+            neighbor_agents_token_str=
+            neighbor_agents_token_str,  # List[List[str]]
         )
         return my_feature
 
-    def observation_adapter(self,
-                            history_buffer,
-                            traffic_light_data,
-                            map_api,
-                            route_roadblock_ids,
-                            device='cpu'):
+    def observation_adapter(
+            self,
+            history_buffer,  # SimulationHistoryBuffer
+            traffic_light_data,  # List
+            map_api,
+            route_roadblock_ids,
+            device='cpu'):
         '''
         ego
         '''
@@ -249,31 +249,32 @@ class DataProcessor(AbstractFeatureBuilder):
         neighbor
         '''
         # observation_buffer: Deque[Observation]
-        observation_buffer = history_buffer.observation_buffer  # Past observations including the current
+        # Past observations including the current
+        observation_buffer = history_buffer.observation_buffer
         """
         neighbor_agents_past : List[ np.ndarray (N, 8) ]: N: number of agents 
             - len(neighbor_agents_past) = 총 시간 스텝 수
         neighbor_agents_types: List[List[TrackedObjectType]]
         track_token_ids: Dict[str, int]
         """
-        neighbor_agents_past, neighbor_agents_types, track_token_ids = sampled_tracked_objects_to_array_list(
-            observation_buffer)
+        (neighbor_agents_past, neighbor_agents_types, track_token_ids
+        ) = sampled_tracked_objects_to_array_list(observation_buffer)
         static_objects, static_objects_types = sampled_static_objects_to_array_list(
             observation_buffer[-1])
 
-        _, neighbor_agents_past, selected_indices, static_objects,  neighbor_agents_id, neighbor_agents_token_str = \
-            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, track_token_ids,
-                               self.num_agents, static_objects, static_objects_types,
-                               self.num_static, self.max_ped_bike, anchor_ego_state)
+        (_, neighbor_agents_past, selected_indices, static_objects,
+         neighbor_agents_id, neighbor_agents_token_str) = agent_past_process(
+             ego_agent_past, neighbor_agents_past, neighbor_agents_types,
+             track_token_ids, self.num_agents, static_objects,
+             static_objects_types, self.num_static, self.max_ped_bike,
+             anchor_ego_state)
         """
-        neighbor_agents_past: (B, N_neighbor, T_past, 11)
+        neighbor_agents_past: (num_agents, T_past, 11)
         selected_indices : ???
         static_objects: (B, N_static, 10) 
             - 마지막 4 차원은 one-hot # (CZONE_SIGN, BARRIER, TRAFFIC_CONE, ELSE)
-        """
-        """selected_indices : (num_agents,)
-            에이전트 배열 내에서의 위치를 나타내며, 
-                직접적인 token id(각 에이전트의 고유 식별자)는 반환하지 않습니다.
+        neighbor_agents_id:  (shrinked_num_agents,)
+        neighbor_agents_token_str : List[str] # len = shrinked_num_agents
         """
         '''
         Map
@@ -282,12 +283,13 @@ class DataProcessor(AbstractFeatureBuilder):
         # route_roadblock_ids: List[str] # Roadblock ids comprising goal route
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
-        coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-            map_api,
-            self._map_features,
-            ego_coords,
-            self._radius,  # 100
-            traffic_light_data)
+        (coords, traffic_light_data, speed_limit,
+         lane_route) = get_neighbor_vector_set_map(
+             map_api,
+             self._map_features,
+             ego_coords,
+             self._radius,  # 100
+             traffic_light_data)
         vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
                                  traffic_light_data, speed_limit, lane_route,
                                  self._map_features, self._max_elements,
