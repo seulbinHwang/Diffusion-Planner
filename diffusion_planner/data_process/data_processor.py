@@ -15,7 +15,7 @@ from diffusion_planner.data_process.utils import convert_to_model_inputs
 class DataProcessor(object):
 
     def __init__(self, config):
-
+        self.i = 0
         self._save_dir = getattr(config, "save_path", None)
 
         self.past_time_horizon = 2  # [seconds]
@@ -108,7 +108,8 @@ class DataProcessor(object):
         vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
                                  traffic_light_data, speed_limit, lane_route,
                                  self._map_features, self._max_elements,
-                                 self._max_points)
+                                 self._max_points, self.i)
+        self.i += 1
 
         data = {
             "neighbor_agents_past": neighbor_agents_past[:,
@@ -118,6 +119,7 @@ class DataProcessor(object):
                 dtype=np.float32),  # ego centric x, y, cos, sin
             "static_objects": static_objects
         }
+
         data.update(vector_map)
         data = convert_to_model_inputs(data, device)
 

@@ -78,18 +78,20 @@ class Decoder(nn.Module):
                 }
 
         """
-        neighbor_agents_token_str = inputs[
-            "neighbor_agents_token_str"]  # List[List[str]]
+        neighbor_agents_token_str = inputs.get("neighbor_agents_token_str",
+                                               None)  # List[List[str]]
         # Extract ego & neighbor current states
         ego_current = inputs['ego_current_state'][:, None, :4]  # [B, 1, 4]
         neighbors_current = inputs[
             "neighbor_agents_past"][:, :self._predicted_neighbor_num,
                                     -1, :4]  # [B, P, 4]
         neighbor_selected_agents_token_str = []
-        for neighbor_agents_token_str_ in neighbor_agents_token_str:
-            a: List[str] = neighbor_agents_token_str_[:self.
+        if neighbor_agents_token_str is not None:
+            for neighbor_agents_token_str_ in neighbor_agents_token_str:
+                a: List[
+                    str] = neighbor_agents_token_str_[:self.
                                                       _predicted_neighbor_num]
-            neighbor_selected_agents_token_str.append(a)
+                neighbor_selected_agents_token_str.append(a)
         not_zero = torch.ne(neighbors_current[..., :4], 0)  # [B, P, 4]
         sum_ = torch.sum(not_zero, dim=-1)  # [B, P]
         neighbor_current_mask = sum_ == 0  # [B, P] -> 차량 정보가 없는 경우 True
@@ -116,13 +118,14 @@ class Decoder(nn.Module):
                              neighbor_current_mask).reshape(B, P, -1, 4)
             }
         else:
-            # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
-            xT = torch.cat([
-                current_states[:, :, None],
-                torch.randn(B, P, self._future_len, 4).to(current_states.device)
-                * 0.5
-            ],
-                           dim=2).reshape(B, P, -1)
+            # [B, P(=1 + predicted_neighbor_num), (1 + V_future) * 4]
+            xT = torch.cat(
+                [
+                    current_states[:, :, None],  # [B, P, 1, 4]
+                    torch.randn(B, P, self._future_len, 4).to(
+                        current_states.device) * 0.5
+                ],
+                dim=2).reshape(B, P, -1)
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, P, -1, 4)
@@ -141,10 +144,9 @@ class Decoder(nn.Module):
                              })
             x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :,
                                                                          1:]
-
             return {
                 "prediction":
-                    x0,  # [B, P, V_future, 4]
+                    x0,  # [B, P, V_future, 4] # Exclude current state
                 "neighbor_selected_agents_token_str":
                     neighbor_selected_agents_token_str
             }

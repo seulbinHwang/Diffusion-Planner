@@ -22,6 +22,7 @@ from nuplan.planning.training.preprocessing.feature_builders.vector_builder_util
 
 from diffusion_planner.data_process.utils import vector_set_coordinates_to_local_frame
 
+import matplotlib.pyplot as plt
 
 # =====================
 # 1. Get lanes, speed limit, traffic light and lane's roadblock ids
@@ -139,7 +140,8 @@ def get_neighbor_vector_set_map(
 
     # extract lanes
     if VectorFeatureLayer.LANE in feature_layers:
-        lanes_mid, lanes_left, lanes_right, lane_ids, lane_speed_limit, lane_has_speed_limit, lane_route = _get_lane_polylines(
+        (lanes_mid, lanes_left, lanes_right, lane_ids, lane_speed_limit,
+         lane_has_speed_limit, lane_route) = _get_lane_polylines(
             map_api, point, radius)
 
         # lane baseline paths
@@ -283,12 +285,12 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
     for i in range(polylines.shape[0]):
         if avails[i][0]:
-            polyline = polylines[i]
-            polyline_vector = polyline[1:] - polyline[:-1]
+            polyline = polylines[i] # polyline: (20, 2)
+            polyline_vector = polyline[1:] - polyline[:-1] # polyline_vector: (19, 2)
             polyline_vector = np.insert(polyline_vector,
                                         polyline_vector.shape[0],
                                         0,
-                                        axis=0)
+                                        axis=0) # polyline_vector: (20, 2)
 
             if np.linalg.norm(left_boundary[i, -1] -
                               polyline[0]) < np.linalg.norm(left_boundary[i,
@@ -313,10 +315,113 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
     return new_polylines
 
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+def draw_(vector_map_lanes, vector_map_route_lanes, index_):
+    # --------------------- #
+    # 추가: 그림을 그리는 코드
+    # --------------------- #
+    #
+    # - lanes (70, 20, 12)
+    # - route_lanes (25, 20, 12)
+    # 색상: lanes = 'white', route_lanes = 'red'
+    # 중심선: 점선, 왼/오 경계: 실선
+    #
+    import math
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_facecolor('black')  # 배경색: 검정, 흰색/빨간색 선이 선명하게 보임
+
+    # --- vector_map_lanes 그리기 ---
+    for lane_idx in range(vector_map_lanes.shape[0]):
+        lane_data = vector_map_lanes[lane_idx]  # (20, 12)
+
+        # 유효 포인트 추출 (x, y 좌표가 모두 0인 경우 제외)
+        valid_mask = ~np.all(lane_data[:, 0:2] == 0, axis=1)
+        lane_data = lane_data[valid_mask]
+
+        if lane_data.shape[0] < 2:
+            continue
+
+        center_xy = lane_data[:, 0:2]
+        left_xy = lane_data[:, 0:2] + lane_data[:, 4:6]
+        right_xy = lane_data[:, 0:2] + lane_data[:, 6:8]
+
+        ax.plot(center_xy[:, 0], center_xy[:, 1], linestyle='--', color='white', linewidth=1)
+        ax.plot(left_xy[:, 0], left_xy[:, 1], linestyle='-', color='white', linewidth=1)
+        ax.plot(right_xy[:, 0], right_xy[:, 1], linestyle='-', color='white', linewidth=1)
+
+    # --- vector_map_route_lanes 그리기 ---
+    for lane_idx in range(vector_map_route_lanes.shape[0]):
+        lane_data = vector_map_route_lanes[lane_idx]  # (20, 12)
+
+        valid_mask = ~np.all(lane_data[:, 0:2] == 0, axis=1)
+        lane_data = lane_data[valid_mask]
+
+        if lane_data.shape[0] < 2:
+            continue
+
+        center_xy = lane_data[:, 0:2]
+        left_xy = lane_data[:, 0:2] + lane_data[:, 4:6]
+        right_xy = lane_data[:, 0:2] + lane_data[:, 6:8]
+
+        ax.plot(center_xy[:, 0], center_xy[:, 1], linestyle='--', color='red', linewidth=1)
+        ax.plot(left_xy[:, 0], left_xy[:, 1], linestyle='-', color='red', linewidth=1)
+        ax.plot(right_xy[:, 0], right_xy[:, 1], linestyle='-', color='red', linewidth=1)
+
+    # --- 정사각형 테두리 그리기 ---
+    # 원점 중심으로 가로 200m, 세로 200m = x, y각각 [-100, +100]
+    square = Rectangle(
+        (-100, -100),  # 좌측 하단 좌표
+        200,           # 너비 (100 - (-100))
+        200,           # 높이 (100 - (-100))
+        linewidth=2,
+        edgecolor='cyan',
+        facecolor='none'
+    )
+    ax.add_patch(square)
+
+    # --- Ego Vehicle 그리기 ---
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    axis_range = max(xlim[1] - xlim[0], ylim[1] - ylim[0])
+    ego_length = axis_range / 40.0
+    ego_width = axis_range / 100.0
+
+    ego_rect = Rectangle(
+        (-ego_length / 2, -ego_width / 2),
+        ego_length,
+        ego_width,
+        angle=0,
+        edgecolor='cyan',
+        facecolor='none',
+        linewidth=2
+    )
+    ax.add_patch(ego_rect)
+
+    # 차량 heading 표시 화살표
+    ax.arrow(
+        0, 0,
+        ego_length / 2, 0,
+        head_width=ego_width / 2,
+        head_length=ego_length / 10,
+        fc='cyan',
+        ec='cyan'
+    )
+
+    ax.set_aspect('equal', 'datalim')
+    plt.title("Lane and Route Lane Visualization", color='white')
+    plt.savefig(f"map_visualization{index_}.png", dpi=150, facecolor='black')
+    plt.close(fig)
+
 
 def map_process(route_roadblock_ids, anchor_ego_state, coords,
                 traffic_light_data, speed_limit, lane_route, map_features,
-                max_elements, max_points):
+                max_elements, max_points, index_=0):
     """
     This function process the data from the raw vector set map data.
     :param route_roadblock_ids: route road block ids.
@@ -372,7 +477,9 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
                 None)
 
             if feature_name == 'LANE':
-                coords, left_coords, right_coords, tl_data, avails, lane_has_speed_limit_array, lane_speed_limit_array, lane_routes = _convert_lane_to_fixed_size(
+                (coords, left_coords, right_coords, tl_data, avails,
+                 lane_has_speed_limit_array, lane_speed_limit_array, lane_routes) = (
+                    _convert_lane_to_fixed_size(
                     anchor_ego_state,
                     feature_coords,
                     speed_limit,
@@ -385,7 +492,7 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
                     traffic_light_encoding_dim if feature_name in [
                         VectorFeatureLayer.LANE.name,
                     ] else None,
-                )
+                ))
                 left_coords = vector_set_coordinates_to_local_frame(
                     left_coords, avails, anchor_ego_state)
                 right_coords = vector_set_coordinates_to_local_frame(
@@ -462,7 +569,12 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
         else:
             pass
 
-    vector_map_output = {'lanes': vector_map_lanes, 'lanes_speed_limit': lane_speed_limit_array, 'lanes_has_speed_limit': lane_has_speed_limit_array, \
-                         'route_lanes': vector_map_route_lanes, 'route_lanes_speed_limit': route_lanes_speed_limit, 'route_lanes_has_speed_limit': route_lanes_has_speed_limit}
-
+    vector_map_output = {'lanes': vector_map_lanes, 'lanes_speed_limit': lane_speed_limit_array,
+                         'lanes_has_speed_limit': lane_has_speed_limit_array, \
+                         'route_lanes': vector_map_route_lanes, 'route_lanes_speed_limit': route_lanes_speed_limit,
+                         'route_lanes_has_speed_limit': route_lanes_has_speed_limit}
+    if vector_map_lanes is not None and vector_map_route_lanes is not None:
+        # 예: 매 index가 10의 배수일 때만 그림을 저장하려면 아래 조건 사용
+        # if index_ % 10 == 0:
+        draw_(vector_map_lanes, vector_map_route_lanes, index_)
     return vector_map_output

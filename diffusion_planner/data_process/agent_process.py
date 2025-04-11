@@ -251,7 +251,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
                                           AgentInternalIndex.track_token(
                                           )]  # (last_frame_num_agents,)
     neighbor_agents_token_str: List[str] = [
-    ]  # len(neighbor_agents_token_str) = num_agents
+    ]  # len(neighbor_agents_token_str) = last_frame_num_agents
     # Convert track token to string using track_token_ids
     for agent_idx in range(neighbor_agents_id.shape[0]):
         a_agent_integer_id = int(neighbor_agents_id[agent_idx])
@@ -375,6 +375,9 @@ def agent_past_process(past_ego_states, past_tracked_objects,
             selected_indices):  # selected_indices:  (shrinked_num_agents = 10)
         # agents # (num_agents=32, num_frames, 11)
         # agents_array # (num_frames, last_Frame_num_agents, 8)
+        # TODO:
+        if i >= 10:
+            break
         agents[i, :, :agents_array.
                shape[-1]] = agents_array[:, sorted_idx, :agents_array.shape[-1]]
         if agent_types[sorted_idx] == TrackedObjectType.VEHICLE:

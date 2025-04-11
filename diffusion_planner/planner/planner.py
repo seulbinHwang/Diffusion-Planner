@@ -169,7 +169,7 @@ route_lanes_has_speed_limit: torch.Size([1, 25, 1])
                                      axis=-1)  # T, 3
 
         states = transform_predictions_to_states(
-            predictions,
+            predictions,  # [T, 3]
             ego_state_history,
             self._future_horizon,  # 8
             self._step_interval)  # 0.1
@@ -194,6 +194,8 @@ route_lanes_speed_limit: torch.Size([1, 25, 1])
 route_lanes_has_speed_limit: torch.Size([1, 25, 1])
         """
         inputs = self.observation_normalizer(inputs)
+        numpy_neighbor_agents_past = inputs["neighbor_agents_past"].detach(
+        ).cpu().numpy().astype(np.float64)
         """
 outputs: Dict
     {
@@ -208,22 +210,21 @@ outputs: Dict
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(
                 outputs, current_input.history.ego_states))
-
-        ######### 추가한 부분 ########
-        npc_predictions = outputs['prediction'][
-            0, 1:].detach().cpu().numpy().astype(
-                np.float64)  # [P, V_future, 4] = (10, 80, 4)
-        npc_headings = np.arctan2(npc_predictions[:, :, 3],
-                                  npc_predictions[:, :,
-                                                  2])[...,
-                                                      None]  # [P, V_future, 1]
-        npc_predictions = np.concatenate(
-            [npc_predictions[..., :2], npc_headings],
-            axis=-1)  # [P, V_future, 3]4
-        self.npc_trajectories = {}
-        for i in range(npc_predictions.shape[0]):
-            self.npc_trajectories[i] = InterpolatedTrajectory(
-                transform_predictions_to_states(
-                    npc_predictions[i], current_input.history.ego_states,
-                    self._future_horizon, self._step_interval))
+        # ######### 추가한 부분 ########
+        # npc_predictions = outputs['prediction'][
+        #     0, 1:].detach().cpu().numpy().astype(
+        #         np.float64)  # [P, V_future, 4] = (10, 80, 4)
+        # npc_headings = np.arctan2(npc_predictions[:, :, 3],
+        #                           npc_predictions[:, :,
+        #                                           2])[...,
+        #                                               None]  # [P, V_future, 1]
+        # npc_predictions = np.concatenate(
+        #     [npc_predictions[..., :2], npc_headings],
+        #     axis=-1)  # [P, V_future, 3]4
+        # self.npc_trajectories = {}
+        # for i in range(npc_predictions.shape[0]):
+        #     self.npc_trajectories[i] = InterpolatedTrajectory(
+        #         transform_predictions_to_states(
+        #             npc_predictions[i], current_input.history.ego_states,
+        #             self._future_horizon, self._step_interval))
         return trajectory

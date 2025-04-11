@@ -260,11 +260,11 @@ def route_roadblock_correction(
     search_depth_backward: int = 15,
     search_depth_forward: int = 30,
 ) -> List[str]:
-    """
+    """ Simply fixing disconnected routes without pre-searching for reference lines
     Applies several methods to correct route roadblocks.
     :param ego_state: class containing ego state
     :param map_api: map object
-    :param route_roadblocks_dict: dictionary of on-route roadblocks
+    :param route_roadblock_ids: Roadblock ids comprising goal route
     :param search_depth_backward: depth of forward BFS search, defaults to 15
     :param search_depth_forward:  depth of backward BFS search, defaults to 30
     :return: list of roadblock id's of corrected route

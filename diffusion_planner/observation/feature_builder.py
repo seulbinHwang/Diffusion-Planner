@@ -2,16 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Type
-
+import time
 import numpy as np
 import torch
-
+import sys
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization
 from nuplan.planning.training.preprocessing.feature_builders.abstract_feature_builder import AbstractFeatureBuilder
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import AbstractModelFeature, FeatureDataType
-
+import torch
+import matplotlib.pyplot as plt
 from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization, PlannerInput
 import numpy as np
 from tqdm import tqdm
@@ -32,7 +33,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 import torch
 from torch import Tensor
-from torch.utils.data.dataloader import default_collate
 
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import \
     AbstractModelFeature
@@ -46,6 +46,7 @@ class ModelInputFeature(AbstractModelFeature):
     but can be >1 if collate is used in a DataLoader scenario.
     """
     neighbor_agents_past: Tensor  # shape: (1, N, T, 11) etc.
+    neighbor_agents_original: Tensor  # shape: (1, N, T, 2) etc.
     neighbor_agents_id: Tensor  # shape: (N,) or (1, N)
     ego_current_state: Tensor  # shape: (1, 4)
     static_objects: Tensor  # shape: (1, 5, 10)
@@ -76,6 +77,7 @@ class ModelInputFeature(AbstractModelFeature):
         """
         return ModelInputFeature(
             neighbor_agents_past=self.neighbor_agents_past.to(device),
+            neighbor_agents_original=self.neighbor_agents_original.to(device),
             neighbor_agents_id=self.neighbor_agents_id.to(device),
             ego_current_state=self.ego_current_state.to(device),
             static_objects=self.static_objects.to(device),
@@ -96,6 +98,7 @@ class ModelInputFeature(AbstractModelFeature):
         """
         return {
             "neighbor_agents_past": self.neighbor_agents_past,
+            "neighbor_agents_original": self.neighbor_agents_original,
             "neighbor_agents_id": self.neighbor_agents_id,
             "ego_current_state": self.ego_current_state,
             "static_objects": self.static_objects,
@@ -138,6 +141,8 @@ class ModelInputFeature(AbstractModelFeature):
             features_list.append(
                 ModelInputFeature(
                     neighbor_agents_past=self.neighbor_agents_past[i:i + 1],
+                    neighbor_agents_original=self.neighbor_agents_original[i:i +
+                                                                           1],
                     neighbor_agents_id=self.neighbor_agents_id[i:i + 1],
                     ego_current_state=self.ego_current_state[i:i + 1],
                     static_objects=self.static_objects[i:i + 1],
@@ -205,11 +210,16 @@ class DataProcessor(AbstractFeatureBuilder):
             traffic_light_data=list(current_input.traffic_light_data),
             map_api=initialization.map_api,
             route_roadblock_ids=initialization.route_roadblock_ids)
+        neighbor_agents_original = model_inputs["neighbor_agents_past"].detach(
+        ).clone()  # [1, 32, 21, 11]
+        neighbor_agents_original = neighbor_agents_original[:, :, :, :
+                                                            6]  # [1, 32, 21, 2]
         model_inputs = self.observation_normalizer(
             model_inputs)  # Dict[str, torch.Tensor]
         my_feature = ModelInputFeature(
             neighbor_agents_past=model_inputs[
                 "neighbor_agents_past"],  # [1, 32, 21, 11]
+            neighbor_agents_original=neighbor_agents_original,  # [1, 32, 21, 2]
             neighbor_agents_id=model_inputs["neighbor_agents_id"],  # [1, 20]
             ego_current_state=model_inputs["ego_current_state"],  # [1, 4]
             static_objects=model_inputs["static_objects"],  # [1, 5, 10]
@@ -268,6 +278,7 @@ class DataProcessor(AbstractFeatureBuilder):
              track_token_ids, self.num_agents, static_objects,
              static_objects_types, self.num_static, self.max_ped_bike,
              anchor_ego_state)
+        # anchor_ego_state:  [6.64917136e+05 3.99964917e+06 2.76081205e+00]
         """
         neighbor_agents_past: (num_agents, T_past, 11)
         selected_indices : ???
@@ -275,6 +286,7 @@ class DataProcessor(AbstractFeatureBuilder):
             - 마지막 4 차원은 one-hot # (CZONE_SIGN, BARRIER, TRAFFIC_CONE, ELSE)
         neighbor_agents_id:  (shrinked_num_agents,)
         neighbor_agents_token_str : List[str] # len = shrinked_num_agents
+            - ego 와 가까운 순서대로 정렬된 agent token 문자열
         """
         '''
         Map
