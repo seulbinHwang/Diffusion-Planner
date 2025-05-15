@@ -15,14 +15,16 @@ from nuplan.common.maps.abstract_map_objects import RoadBlockGraphEdgeMapObject
 def normalize_angle(angle: np.ndarray):
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
+
 class BreadthFirstSearchRoadBlock:
     """
     A class that performs iterative breadth first search. The class operates on the roadblock graph.
     """
 
-    def __init__(
-        self, start_roadblock_id: int, map_api: Optional[AbstractMap], forward_search: str = True
-    ):
+    def __init__(self,
+                 start_roadblock_id: int,
+                 map_api: Optional[AbstractMap],
+                 forward_search: str = True):
         """
         Constructor of BreadthFirstSearchRoadBlock class
         :param start_roadblock_id: roadblock id where graph starts
@@ -38,8 +40,8 @@ class BreadthFirstSearchRoadBlock:
         self._target_roadblock_ids: List[str] = None
 
     def search(
-        self, target_roadblock_id: Union[str, List[str]], max_depth: int
-    ) -> Tuple[List[RoadBlockGraphEdgeMapObject], bool]:
+            self, target_roadblock_id: Union[str, List[str]],
+            max_depth: int) -> Tuple[List[RoadBlockGraphEdgeMapObject], bool]:
         """
         Apply BFS to find route to target roadblock.
         :param target_roadblock_id: id of target roadblock
@@ -83,9 +85,8 @@ class BreadthFirstSearchRoadBlock:
                 path_found = True
                 break
 
-            neighbors = (
-                current_edge.outgoing_edges if self._forward_search else current_edge.incoming_edges
-            )
+            neighbors = (current_edge.outgoing_edges if self._forward_search
+                         else current_edge.incoming_edges)
 
             # Populate queue
             for next_edge in neighbors:
@@ -132,9 +133,8 @@ class BreadthFirstSearchRoadBlock:
         """
         return current_edge.id in self._target_roadblock_ids and depth <= max_depth
 
-    def _construct_path(
-        self, end_edge: RoadBlockGraphEdgeMapObject, depth: int
-    ) -> List[RoadBlockGraphEdgeMapObject]:
+    def _construct_path(self, end_edge: RoadBlockGraphEdgeMapObject,
+                        depth: int) -> List[RoadBlockGraphEdgeMapObject]:
         """
         Constructs a path when goal was found.
         :param end_edge: The end edge to start back propagating back to the start edge.
@@ -177,19 +177,17 @@ def get_current_roadblock_candidates(
     roadblock_candidates = []
 
     layers = [SemanticMapLayer.ROADBLOCK, SemanticMapLayer.ROADBLOCK_CONNECTOR]
-    roadblock_dict = map_api.get_proximal_map_objects(
-        point=ego_pose.point, radius=1.0, layers=layers
-    )
+    roadblock_dict = map_api.get_proximal_map_objects(point=ego_pose.point,
+                                                      radius=1.0,
+                                                      layers=layers)
     roadblock_candidates = (
-        roadblock_dict[SemanticMapLayer.ROADBLOCK]
-        + roadblock_dict[SemanticMapLayer.ROADBLOCK_CONNECTOR]
-    )
+        roadblock_dict[SemanticMapLayer.ROADBLOCK] +
+        roadblock_dict[SemanticMapLayer.ROADBLOCK_CONNECTOR])
 
     if not roadblock_candidates:
         for layer in layers:
             roadblock_id_, distance = map_api.get_distance_to_nearest_map_object(
-                point=ego_pose.point, layer=layer
-            )
+                point=ego_pose.point, layer=layer)
             roadblock = map_api.get_map_object(roadblock_id_, layer)
 
             if roadblock:
@@ -205,18 +203,19 @@ def get_current_roadblock_candidates(
         lane_displacement_error, lane_heading_error = np.inf, np.inf
 
         for lane in roadblock.interior_edges:
-            lane_discrete_path: List[StateSE2] = lane.baseline_path.discrete_path
+            lane_discrete_path: List[
+                StateSE2] = lane.baseline_path.discrete_path
             lane_discrete_points = np.array(
-                [state.point.array for state in lane_discrete_path], dtype=np.float64
-            )
-            lane_state_distances = (
-                (lane_discrete_points - ego_pose.point.array[None, ...]) ** 2.0
-            ).sum(axis=-1) ** 0.5
+                [state.point.array for state in lane_discrete_path],
+                dtype=np.float64)
+            lane_state_distances = ((lane_discrete_points -
+                                     ego_pose.point.array[None, ...])**2.0).sum(
+                                         axis=-1)**0.5
             argmin = np.argmin(lane_state_distances)
 
             heading_error = np.abs(
-                normalize_angle(lane_discrete_path[argmin].heading - ego_pose.heading)
-            )
+                normalize_angle(lane_discrete_path[argmin].heading -
+                                ego_pose.heading))
             displacement_error = lane_state_distances[argmin]
 
             if displacement_error < lane_displacement_error:
@@ -225,13 +224,12 @@ def get_current_roadblock_candidates(
                     displacement_error,
                 )
 
-            if (
-                heading_error < heading_error_thresh
-                and displacement_error < displacement_error_thresh
-            ):
+            if (heading_error < heading_error_thresh and
+                    displacement_error < displacement_error_thresh):
                 if roadblock.id in route_roadblocks_dict.keys():
                     on_route_candidates.append(roadblock)
-                    on_route_candidate_displacement_errors.append(displacement_error)
+                    on_route_candidate_displacement_errors.append(
+                        displacement_error)
                 else:
                     candidates.append(roadblock)
                     candidate_displacement_errors.append(displacement_error)
@@ -241,7 +239,8 @@ def get_current_roadblock_candidates(
 
     if on_route_candidates:  # prefer on-route roadblocks
         return (
-            on_route_candidates[np.argmin(on_route_candidate_displacement_errors)],
+            on_route_candidates[np.argmin(
+                on_route_candidate_displacement_errors)],
             on_route_candidates,
         )
     elif candidates:  # fallback to most promising candidate
@@ -275,14 +274,14 @@ def route_roadblock_correction(
     for id_ in route_roadblock_ids:
         block = map_api.get_map_object(id_, SemanticMapLayer.ROADBLOCK)
         block = block or map_api.get_map_object(
-            id_, SemanticMapLayer.ROADBLOCK_CONNECTOR
-        )
+            id_, SemanticMapLayer.ROADBLOCK_CONNECTOR)
         route_roadblock_dict[id_] = block
 
     starting_block, starting_block_candidates = get_current_roadblock_candidates(
-        ego_state, map_api, route_roadblock_dict
-    )
-    starting_block_ids = [roadblock.id for roadblock in starting_block_candidates]
+        ego_state, map_api, route_roadblock_dict)
+    starting_block_ids = [
+        roadblock.id for roadblock in starting_block_candidates
+    ]
 
     route_roadblocks = list(route_roadblock_dict.values())
     route_roadblock_ids = list(route_roadblock_dict.keys())
@@ -290,12 +289,11 @@ def route_roadblock_correction(
     # Fix 1: when agent starts off-route
     if starting_block.id not in route_roadblock_ids:
         # Backward search if current roadblock not in route
-        graph_search = BreadthFirstSearchRoadBlock(
-            route_roadblock_ids[0], map_api, forward_search=False
-        )
+        graph_search = BreadthFirstSearchRoadBlock(route_roadblock_ids[0],
+                                                   map_api,
+                                                   forward_search=False)
         (path, path_id), path_found = graph_search.search(
-            starting_block_ids, max_depth=search_depth_backward
-        )
+            starting_block_ids, max_depth=search_depth_backward)
 
         if path_found:
             route_roadblocks[:0] = path[:-1]
@@ -303,20 +301,19 @@ def route_roadblock_correction(
 
         else:
             # Forward search to any route roadblock
-            graph_search = BreadthFirstSearchRoadBlock(
-                starting_block.id, map_api, forward_search=True
-            )
+            graph_search = BreadthFirstSearchRoadBlock(starting_block.id,
+                                                       map_api,
+                                                       forward_search=True)
             (path, path_id), path_found = graph_search.search(
-                route_roadblock_ids[:3], max_depth=search_depth_forward
-            )
+                route_roadblock_ids[:3], max_depth=search_depth_forward)
 
             if path_found:
                 end_roadblock_idx = np.argmax(
-                    np.array(route_roadblock_ids) == path_id[-1]
-                )
+                    np.array(route_roadblock_ids) == path_id[-1])
 
-                route_roadblocks = route_roadblocks[end_roadblock_idx + 1 :]
-                route_roadblock_ids = route_roadblock_ids[end_roadblock_idx + 1 :]
+                route_roadblocks = route_roadblocks[end_roadblock_idx + 1:]
+                route_roadblock_ids = route_roadblock_ids[end_roadblock_idx +
+                                                          1:]
 
                 route_roadblocks[:0] = path
                 route_roadblock_ids[:0] = path_id
@@ -325,19 +322,19 @@ def route_roadblock_correction(
     roadblocks_to_append = {}
     for i in range(len(route_roadblocks) - 1):
         next_incoming_block_ids = [
-            _roadblock.id for _roadblock in route_roadblocks[i + 1].incoming_edges
+            _roadblock.id
+            for _roadblock in route_roadblocks[i + 1].incoming_edges
         ]
         is_incoming = route_roadblock_ids[i] in next_incoming_block_ids
 
         if is_incoming:
             continue
 
-        graph_search = BreadthFirstSearchRoadBlock(
-            route_roadblock_ids[i], map_api, forward_search=True
-        )
+        graph_search = BreadthFirstSearchRoadBlock(route_roadblock_ids[i],
+                                                   map_api,
+                                                   forward_search=True)
         (path, path_id), path_found = graph_search.search(
-            route_roadblock_ids[i + 1], max_depth=search_depth_forward
-        )
+            route_roadblock_ids[i + 1], max_depth=search_depth_forward)
 
         if path_found and path and len(path) >= 3:
             path, path_id = path[1:-1], path_id[1:-1]
@@ -346,14 +343,13 @@ def route_roadblock_correction(
     # append missing intermediate roadblocks
     offset = 1
     for i, (path, path_id) in roadblocks_to_append.items():
-        route_roadblocks[i + offset : i + offset] = path
-        route_roadblock_ids[i + offset : i + offset] = path_id
+        route_roadblocks[i + offset:i + offset] = path
+        route_roadblock_ids[i + offset:i + offset] = path_id
         offset += len(path)
 
     # Fix 3: cut route-loops
     route_roadblocks, route_roadblock_ids = remove_route_loops(
-        route_roadblocks, route_roadblock_ids
-    )
+        route_roadblocks, route_roadblock_ids)
 
     return route_roadblock_ids
 
@@ -377,8 +373,7 @@ def remove_route_loops(
         if str(roadblock.__class__.__name__) == "NuPlanRoadBlockConnector":
             if not roadblock_occupancy_map:
                 roadblock_occupancy_map = STRTreeOccupancyMapFactory.get_from_geometry(
-                    [roadblock.polygon], [roadblock.id]
-                )
+                    [roadblock.polygon], [roadblock.id])
                 continue
 
             strtree, index_by_id = roadblock_occupancy_map._build_strtree()

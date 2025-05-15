@@ -17,34 +17,38 @@ def diffusion_loss_func(
 
     model_type: str,
     eps: float = 1e-3,
-):   
+):
     ego_future, neighbors_future, neighbor_future_mask = futures
+    # ego_future: [B. T, 4]
+    # neighbors_future: [B, Pn, T, 4]
     neighbors_future_valid = ~neighbor_future_mask # [B, P, V]
 
     B, Pn, T, _ = neighbors_future.shape
     ego_current, neighbors_current = inputs["ego_current_state"][:, :4], inputs["neighbor_agents_past"][:, :Pn, -1, :4]
+    # ego_current: [B, 4]
+    # neighbors_current: [B, Pn, 4]
     neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
     neighbor_mask = torch.concat((neighbor_current_mask.unsqueeze(-1), neighbor_future_mask), dim=-1)
 
-    gt_future = torch.cat([ego_future[:, None, :, :], neighbors_future[..., :]], dim=1) # [B, P = 1 + 1 + neighbor, T, 4]
+    gt_future = torch.cat([ego_future[:, None, :, :], neighbors_future[..., :]], dim=1) # [B, P = 1 + Pn, T, 4]
     current_states = torch.cat([ego_current[:, None], neighbors_current], dim=1) # [B, P, 4]
 
     P = gt_future.shape[1]
     t = torch.rand(B, device=gt_future.device) * (1 - eps) + eps # [B,]
     z = torch.randn_like(gt_future, device=gt_future.device) # [B, P, T, 4]
     
-    all_gt = torch.cat([current_states[:, :, None, :], norm(gt_future)], dim=2)
+    all_gt = torch.cat([current_states[:, :, None, :], norm(gt_future)], dim=2) # [B, P, 1 + T, 4]
     all_gt[:, 1:][neighbor_mask] = 0.0
 
     mean, std = marginal_prob(all_gt[..., 1:, :], t)
     std = std.view(-1, *([1] * (len(all_gt[..., 1:, :].shape)-1)))
 
-    xT = mean + std * z
-    xT = torch.cat([all_gt[:, :, :1, :], xT], dim=2)
+    xT = mean + std * z # xT: [B, P, T, 4]
+    xT = torch.cat([all_gt[:, :, :1, :], xT], dim=2) # [B, P, 1 + T, 4]
     
     merged_inputs = {
         **inputs,
-        "sampled_trajectories": xT,
+        "sampled_trajectories": xT, # [B, P, 1 + T, 4]
         "diffusion_time": t,
     }
 
