@@ -73,7 +73,7 @@ class Decoder(nn.Module):
 
         """
         # Extract ego & neighbor current states
-        ego_current = inputs['ego_current_state'][:, None, :4]
+        ego_current = inputs['ego_current_state'][:, None, :4] # [B, 1, 4]
         neighbors_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num, -1, :4]
         neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
         inputs["neighbor_current_mask"] = neighbor_current_mask
