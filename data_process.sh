@@ -1,10 +1,10 @@
 ###################################
 # User Configuration Section
 ###################################
-NUPLAN_DATA_PATH="REPLACE_WITH_NUPLAN_DATA_PATH" # nuplan training data path (e.g., "/data/nuplan-v1.1/trainval")
-NUPLAN_MAP_PATH="REPLACE_WITH_NUPLAN_MAP_PATH" # nuplan map path (e.g., "/data/nuplan-v1.1/maps")
+NUPLAN_DATA_PATH="/mnt/nuplan/dataset/nuplan-v1.1/splits/trainval" # nuplan training data path (e.g., "/data/nuplan-v1.1/trainval")
+NUPLAN_MAP_PATH="/mnt/nuplan/dataset/maps" # nuplan map path (e.g., "/data/nuplan-v1.1/maps")
 
-TRAIN_SET_PATH="REPLACE_WITH_TRAIN_SET_PATH" # preprocess training data
+TRAIN_SET_PATH="/mnt/nuplan/dataset/processed/" # preprocess training data
 ###################################
 
 python data_process.py \
