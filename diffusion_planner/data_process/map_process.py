@@ -258,6 +258,10 @@ def _prune_route_by_connectivity(route_roadblock_ids: List[str],
     :param route_roadblock_ids: List of roadblock ids representing route.
     :param roadblock_ids: Set of ids of extracted roadblocks within query radius.
     :return: List of pruned roadblock ids (connected and within query radius).
+
+- roadblock_ids = pruned_lane_roadblock_ids: List[str]
+  - lane_routes 중, route_roadblock_ids 인 친구들
+  - ego 거리 순으로 선별되어 있음
     """
     pruned_route_roadblock_ids: List[str] = []
     route_start = False  # wait for route to come into query radius before declaring broken connection
