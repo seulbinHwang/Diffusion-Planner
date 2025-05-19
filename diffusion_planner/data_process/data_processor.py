@@ -50,6 +50,7 @@ class DataProcessor(object):
                             traffic_light_data,
                             map_api,
                             route_roadblock_ids,
+                            npc_route_roadblock_ids,
                             device='cpu'):
         '''
         ego
