@@ -7,7 +7,7 @@ Categories:
     2. Get agents array for model input
 """
 import numpy as np
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import AgentInternalIndex
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -355,6 +355,22 @@ def agent_past_process(past_ego_states, past_tracked_objects,
         # Sort and limit the selected indices to num_agents
         selected_indices = sorted(
             selected_indices, key=lambda idx: distance_to_ego[idx])[:num_agents]
+    # === 추가된 부분: 각 selected agent의 문자열 track_token 목록 생성 ===
+    agents_track_token: List[Optional[str]] = []
+    if len(selected_indices) > 0:
+        # 원본 마지막 프레임의 DetectionsTracks 가져오기
+        last_detections = past_tracked_objects[-1]
+        raw_list = last_detections.tracked_objects if isinstance(last_detections, DetectionsTracks) else last_detections
+        # selected_indices 순서대로 track_token 추출
+        for idx in selected_indices:
+            if 0 <= idx < len(raw_list):
+                agents_track_token.append(raw_list[idx].track_token)
+            else:
+                agents_track_token.append(None)
+    # 슬롯이 부족하면 None으로 패딩
+    while len(agents_track_token) < num_agents:
+        agents_track_token.append(None)
+    # === 추가된 부분 끝 ===
 
     # Populate the final agents array with the selected agents' features
     for i, j in enumerate(selected_indices):
@@ -390,7 +406,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     if ego is not None:
         ego = ego.astype(np.float32)
 
-    return ego, agents, selected_indices, static_objects
+    return ego, agents, selected_indices, static_objects, agents_track_token
 
 
 def agent_future_process(anchor_ego_state, future_tracked_objects, num_agents,

@@ -1,6 +1,8 @@
+from typing import Optional, Dict, List
 import numpy as np
 from tqdm import tqdm
-
+from types import SimpleNamespace
+from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.state_representation import Point2D
 
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
@@ -71,7 +73,7 @@ class DataProcessor(object):
             observation_buffer)
         static_objects, static_objects_types = sampled_static_objects_to_array_list(
             observation_buffer[-1])
-        _, neighbor_agents_past, _, static_objects = \
+        _, neighbor_agents_past, _, static_objects, near_agents_track_token = \
             agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
         '''
         Map
@@ -79,6 +81,35 @@ class DataProcessor(object):
         # Simply fixing disconnected routes without pre-searching for reference lines
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
+        near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
+        for token in near_agents_track_token: # List[Optional[str]]
+            # 1) 토큰에 해당하는 객체 찾기
+            last_obs = observation_buffer[-1]  # DetectionsTracks
+            obj = next(
+                (o for o in last_obs.tracked_objects if o.track_token == token),
+                None
+            )
+            if obj is None:
+                near_token_to_route_roadblock_ids[token] = None
+                continue
+
+            # 2) npc_state 생성 ― ego_state 역할을 대신할 간단한 객체
+            #    rear_axle 에 Point2D(x, y)를 담고, heading 속성도 붙여줍니다.
+            point = StateSE2(obj.center.x, obj.center.y, obj.center.heading)
+            npc_state = SimpleNamespace(rear_axle=point)
+
+            # 3) 기존 npc_route_roadblock_ids[token] 에 보정 함수 적용
+            # npc_route_roadblock_ids: Dict[str, List[str]]
+            a_npc_route_roadblock_ids = npc_route_roadblock_ids.get(token)
+            if a_npc_route_roadblock_ids is None:
+                near_token_to_route_roadblock_ids[token] = None
+            else:
+                near_token_to_route_roadblock_ids[
+                    token] = route_roadblock_correction(
+                    npc_state,
+                    map_api,
+                    a_npc_route_roadblock_ids
+                )
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
             map_api, self._map_features, ego_coords, self._radius,
             traffic_light_data)
@@ -139,7 +170,7 @@ class DataProcessor(object):
             static_objects, static_objects_types = sampled_static_objects_to_array_list(
                 present_tracked_objects)
 
-            ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects = \
+            ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects, _ = \
                 agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
             '''
             Map
