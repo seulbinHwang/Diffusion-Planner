@@ -28,7 +28,7 @@ class DataProcessor(object):
         self.num_agents = config.agent_num
         self.num_static = config.static_objects_num
         self.max_ped_bike = 10  # Limit the number of pedestrians and bicycles in the agent.
-        self._radius = 100  # [m] query radius scope relative to the current pose.
+        self._radius = 200  #100  # [m] query radius scope relative to the current pose.
 
         self._map_features = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
@@ -45,6 +45,7 @@ class DataProcessor(object):
             'RIGHT_BOUNDARY': config.lane_len,
             'ROUTE_LANES': config.route_len
         }  # maximum number of points per feature to extract per feature layer.
+        self.predicted_neighbor_num = config.predicted_neighbor_num
 
     # Use for inference
     def observation_adapter(self,
@@ -59,6 +60,8 @@ class DataProcessor(object):
         '''
         ego_agent_past = None  # inference no need ego_agent_past
         ego_state = history_buffer.current_state[0]
+        ego_x = ego_state.rear_axle.x
+        ego_y = ego_state.rear_axle.y
         ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
         anchor_ego_state = np.array([
             ego_state.rear_axle.x, ego_state.rear_axle.y,
@@ -73,8 +76,12 @@ class DataProcessor(object):
             observation_buffer)
         static_objects, static_objects_types = sampled_static_objects_to_array_list(
             observation_buffer[-1])
-        _, neighbor_agents_past, _, static_objects, near_agents_track_token = \
-            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+        (_, neighbor_agents_past, _,
+         static_objects, agents_track_token) = agent_past_process(
+             ego_agent_past, neighbor_agents_past, neighbor_agents_types,
+             self.num_agents, static_objects, static_objects_types,
+             self.num_static, self.max_ped_bike, anchor_ego_state)
+        neighbor_agents_current = neighbor_agents_past[:, -1,] # (32, 11)
         '''
         Map
         '''
@@ -82,17 +89,22 @@ class DataProcessor(object):
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
         near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
-        for token in near_agents_track_token: # List[Optional[str]]
+        near_agents_current = []
+        near_agent_count = 0
+        for idx, token in enumerate(agents_track_token):  # List[Optional[str]]
+            if near_agent_count >= self.predicted_neighbor_num:
+                break
             # 1) 토큰에 해당하는 객체 찾기
             last_obs = observation_buffer[-1]  # DetectionsTracks
             obj = next(
                 (o for o in last_obs.tracked_objects if o.track_token == token),
-                None
-            )
+                None)
             if obj is None:
-                near_token_to_route_roadblock_ids[token] = None
-                continue
-
+                raise ValueError("Object not found in the last observation.")
+            if abs(obj.center.x -
+                   ego_x) > self._radius / 2 or abs(obj.center.y -
+                                                    ego_y) > self._radius / 2:
+                continue  # 사각형 밖이면 결과에 포함하지 않음
             # 2) npc_state 생성 ― ego_state 역할을 대신할 간단한 객체
             #    rear_axle 에 Point2D(x, y)를 담고, heading 속성도 붙여줍니다.
             point = StateSE2(obj.center.x, obj.center.y, obj.center.heading)
@@ -106,17 +118,24 @@ class DataProcessor(object):
             else:
                 near_token_to_route_roadblock_ids[
                     token] = route_roadblock_correction(
-                    npc_state,
-                    map_api,
-                    a_npc_route_roadblock_ids
+                        npc_state, map_api, a_npc_route_roadblock_ids)
+                # neighbor_agents_current: (32, 11)
+                near_agents_current.append(
+                    neighbor_agents_current[idx]
                 )
+            near_agent_count += 1
+        # near_agents_current : (near_agent_count, 11)
+        near_agents_current = np.array(near_agents_current)  # (near_agent_count, 11)
+
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
             map_api, self._map_features, ego_coords, self._radius,
             traffic_light_data)
-        vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
-                                 traffic_light_data, speed_limit, lane_route,
-                                 self._map_features, self._max_elements,
-                                 self._max_points)
+        vector_map = map_process(route_roadblock_ids,
+                                 near_token_to_route_roadblock_ids,
+                                 near_agents_current,
+                                 anchor_ego_state, coords, traffic_light_data,
+                                 speed_limit, lane_route, self._map_features,
+                                 self._max_elements, self._max_points)
 
         data = {
             "neighbor_agents_past":

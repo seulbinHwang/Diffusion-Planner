@@ -360,7 +360,8 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     if len(selected_indices) > 0:
         # 원본 마지막 프레임의 DetectionsTracks 가져오기
         last_detections = past_tracked_objects[-1]
-        raw_list = last_detections.tracked_objects if isinstance(last_detections, DetectionsTracks) else last_detections
+        raw_list = last_detections.tracked_objects if isinstance(
+            last_detections, DetectionsTracks) else last_detections
         # selected_indices 순서대로 track_token 추출
         for idx in selected_indices:
             if 0 <= idx < len(raw_list):

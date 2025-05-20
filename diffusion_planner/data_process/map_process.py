@@ -7,7 +7,7 @@ Categories:
     2. Get maps array for model input
 """
 
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 import numpy as np
 from shapely import LineString
 
@@ -261,7 +261,6 @@ def _prune_route_by_connectivity(route_roadblock_ids: List[str],
 
 - roadblock_ids = pruned_lane_roadblock_ids: List[str]
   - lane_routes 중, route_roadblock_ids 인 친구들
-  - ego 거리 순으로 선별되어 있음
     """
     pruned_route_roadblock_ids: List[str] = []
     route_start = False  # wait for route to come into query radius before declaring broken connection
@@ -318,9 +317,9 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
     return new_polylines
 
 
-def map_process(route_roadblock_ids, anchor_ego_state, coords,
-                traffic_light_data, speed_limit, lane_route, map_features,
-                max_elements, max_points):
+def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
+                near_agents_current, anchor_ego_state, coords, traffic_light_data, speed_limit,
+                lane_route, map_features, max_elements, max_points):
     """
     This function process the data from the raw vector set map data.
     :param route_roadblock_ids: route road block ids.
@@ -376,20 +375,22 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
                 None)
 
             if feature_name == 'LANE':
-                coords, left_coords, right_coords, tl_data, avails, lane_has_speed_limit_array, lane_speed_limit_array, lane_routes = _convert_lane_to_fixed_size(
-                    anchor_ego_state,
-                    feature_coords,
-                    speed_limit,
-                    lane_route,
-                    list_array_data[f"coords.LEFT_BOUNDARY"],
-                    list_array_data[f"coords.RIGHT_BOUNDARY"],
-                    feature_tl_data,
-                    max_elements[feature_name],
-                    max_points[feature_name],
-                    traffic_light_encoding_dim if feature_name in [
-                        VectorFeatureLayer.LANE.name,
-                    ] else None,
-                )
+                (coords, left_coords, right_coords, tl_data, avails,
+                 lane_has_speed_limit_array, lane_speed_limit_array,
+                 lane_routes) = _convert_lane_to_fixed_size(
+                     anchor_ego_state,
+                     feature_coords,
+                     speed_limit,
+                     lane_route,
+                     list_array_data[f"coords.LEFT_BOUNDARY"],
+                     list_array_data[f"coords.RIGHT_BOUNDARY"],
+                     feature_tl_data,
+                     max_elements[feature_name],
+                     max_points[feature_name],
+                     traffic_light_encoding_dim if feature_name in [
+                         VectorFeatureLayer.LANE.name,
+                     ] else None,
+                 )
                 left_coords = vector_set_coordinates_to_local_frame(
                     left_coords, avails, anchor_ego_state)
                 right_coords = vector_set_coordinates_to_local_frame(
@@ -411,7 +412,25 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
 
                 for route in lane_routes:
                     lane_on_route.append(route in pruned_route_roadblock_ids)
-
+                # 코드 추가
+                lane_on_npc_routes: List[Optional[List[bool]]] = []
+                # # Dict [str, Optional[List[str]]]
+                for token, npc_route_roadblock_ids in near_token_to_route_roadblock_ids.items():
+                    if npc_route_roadblock_ids is None:
+                        lane_on_npc_routes.append(None)
+                        continue
+                    pruned_lane_roadblock_ids = [
+                        route for route in npc_route_roadblock_ids
+                        if route in lane_routes
+                    ]
+                    pruned_route_roadblock_ids = _prune_route_by_connectivity(
+                        npc_route_roadblock_ids, pruned_lane_roadblock_ids)
+                    npc_lane_on_route = []
+                    for route in lane_routes:
+                        npc_lane_on_route.append(
+                            route in pruned_route_roadblock_ids)
+                    lane_on_npc_routes.append(npc_lane_on_route)
+                # 코드 추가 끝
             elif feature_name == 'LEFT_BOUNDARY' or feature_name == 'RIGHT_BOUNDARY':
                 continue
 
@@ -439,6 +458,7 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
                 f'vector_set_map.traffic_light_data.{feature_name}']
             avails = array_output[
                 f'vector_set_map.availabilities.{feature_name}']
+            # vector_map_lanes: (70, 20 , 12)
             vector_map_lanes = _lane_polyline_process(polylines, left_boundary,
                                                       right_boundary, avails,
                                                       traffic_light_state)
@@ -463,6 +483,46 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
                     loc += 1
                 if loc == max_elements["ROUTE_LANES"]:
                     break
+            # 코드 추가
+            vector_map_npc_route_lanes: List[np.ndarray] = [] # len: max 10, elements: (25, 20, 12)
+            npc_route_lanes_speed_limit: List[np.ndarray] = [] # len: max 10, elements: (25, 1)
+            npc_route_lanes_has_speed_limit: List[np.ndarray] = [] # len: max 10, elements: (25, 1)
+            for near_agent_current, lane_on_a_npc_routes in zip(near_agents_current, lane_on_npc_routes):
+                near_agent_current = near_agent_current[None] # (1, 11)
+                vector_map_lanes_xy = vector_map_lanes[:, :, :2] # (70, 20, 2)
+                vector_map_lanes_norm_dist = np.linalg.norm(
+                    vector_map_lanes_xy - near_agent_current[:, :2], axis=-1) # (70, 20)
+                vector_map_lanes_min_dist = np.min(vector_map_lanes_norm_dist, axis=-1) # (70,)
+                # sort by distance.
+                vector_map_lanes_min_dist_order = np.argsort(vector_map_lanes_min_dist) # (70,)
+                a_npc_ordered_vector_map_lanes = vector_map_lanes[vector_map_lanes_min_dist_order] # (70, 20, 12)
+                ############
+                vector_map_a_npc_route_lanes = np.zeros(
+                    (max_elements["ROUTE_LANES"], vector_map_lanes.shape[-2],
+                     vector_map_lanes.shape[-1]),
+                    dtype=np.float32) # (25, 20, 12)
+                a_npc_route_lanes_speed_limit = np.zeros(
+                    (max_elements["ROUTE_LANES"], 1), dtype=np.float32) # (25, 1)
+                a_npc_route_lanes_has_speed_limit = np.zeros(
+                    (max_elements["ROUTE_LANES"], 1), dtype=np.bool_) # (25, 1)
+                loc = 0
+                for i in range(len(lane_on_a_npc_routes)):
+                    if lane_on_a_npc_routes[i] == True:
+                        vector_map_a_npc_route_lanes[loc] = a_npc_ordered_vector_map_lanes[i]
+                        a_npc_route_lanes_speed_limit[loc] = lane_speed_limit_array[i]
+                        a_npc_route_lanes_has_speed_limit[
+                            loc] = lane_has_speed_limit_array[i]
+                        loc += 1
+                    if loc == max_elements["ROUTE_LANES"]:
+                        break
+                vector_map_npc_route_lanes.append(vector_map_a_npc_route_lanes)
+                npc_route_lanes_speed_limit.append(
+                    a_npc_route_lanes_speed_limit)
+                npc_route_lanes_has_speed_limit.append(
+                    a_npc_route_lanes_has_speed_limit)
+
+
+            # 코드 추가 끝
         else:
             pass
 
@@ -471,6 +531,10 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
                          'lanes_has_speed_limit': lane_has_speed_limit_array, \
                          'route_lanes': vector_map_route_lanes,
                          'route_lanes_speed_limit': route_lanes_speed_limit,
-                         'route_lanes_has_speed_limit': route_lanes_has_speed_limit}
+                         'route_lanes_has_speed_limit': route_lanes_has_speed_limit,
+                         'npc_route_lanes': vector_map_npc_route_lanes,
+                            'npc_route_lanes_speed_limit': npc_route_lanes_speed_limit,
+                            'npc_route_lanes_has_speed_limit': npc_route_lanes_has_speed_limit,
+                         }
 
     return vector_map_output
