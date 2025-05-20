@@ -12,6 +12,9 @@ from diffusion_planner.data_process.agent_process import (
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
 from diffusion_planner.data_process.ego_process import get_ego_past_array_from_scenario, get_ego_future_array_from_scenario, calculate_additional_ego_states
 from diffusion_planner.data_process.utils import convert_to_model_inputs
+import os
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 
 class DataProcessor(object):
@@ -46,6 +49,7 @@ class DataProcessor(object):
             'ROUTE_LANES': config.route_len
         }  # maximum number of points per feature to extract per feature layer.
         self.predicted_neighbor_num = config.predicted_neighbor_num
+        self.step_index = 0
 
     # Use for inference
     def observation_adapter(self,
@@ -81,7 +85,10 @@ class DataProcessor(object):
              ego_agent_past, neighbor_agents_past, neighbor_agents_types,
              self.num_agents, static_objects, static_objects_types,
              self.num_static, self.max_ped_bike, anchor_ego_state)
-        neighbor_agents_current = neighbor_agents_past[:, -1,] # (32, 11)
+        neighbor_agents_current = neighbor_agents_past[
+            :,
+            -1,
+        ]  # (32, 11)
         '''
         Map
         '''
@@ -120,22 +127,21 @@ class DataProcessor(object):
                     token] = route_roadblock_correction(
                         npc_state, map_api, a_npc_route_roadblock_ids)
                 # neighbor_agents_current: (32, 11)
-                near_agents_current.append(
-                    neighbor_agents_current[idx]
-                )
+                near_agents_current.append(neighbor_agents_current[idx])
             near_agent_count += 1
         # near_agents_current : (near_agent_count, 11)
-        near_agents_current = np.array(near_agents_current)  # (near_agent_count, 11)
+        near_agents_current = np.array(
+            near_agents_current)  # (near_agent_count, 11)
 
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
             map_api, self._map_features, ego_coords, self._radius,
             traffic_light_data)
         vector_map = map_process(route_roadblock_ids,
                                  near_token_to_route_roadblock_ids,
-                                 near_agents_current,
-                                 anchor_ego_state, coords, traffic_light_data,
-                                 speed_limit, lane_route, self._map_features,
-                                 self._max_elements, self._max_points)
+                                 near_agents_current, anchor_ego_state, coords,
+                                 traffic_light_data, speed_limit, lane_route,
+                                 self._map_features, self._max_elements,
+                                 self._max_points)
 
         data = {
             "neighbor_agents_past":
@@ -150,7 +156,111 @@ class DataProcessor(object):
         data.update(vector_map)
         data = convert_to_model_inputs(data, device)
 
+        # 시각화 코드 호출
+        self._draw_step(lanes=vector_map['lanes'], # (70, 20, 12)
+                        neighbor_agents=neighbor_agents_current, # (32, 11)
+                        near_agents=near_agents_current, # (near_agent_count, 11)
+                        npc_routes=vector_map.get('npc_route_lanes', []), # List[(25, 20, 12)]
+                        ego_route=vector_map['route_lanes'], # (25, 20, 12)
+                        ego_state=ego_state,
+                        save_dir=self._save_dir,
+                        token=self.step_index)
+        self.step_index += 1
         return data
+
+    def _draw_step(self, lanes: np.ndarray, neighbor_agents: np.ndarray,
+                   near_agents: np.ndarray, npc_routes: List[np.ndarray],
+                   ego_route: np.ndarray, ego_state: StateSE2,
+                   save_dir: Optional[str], token: int) -> None:
+        """
+        한 스텝 분량의 맵과 에이전트를 시각화하여 JPG 파일로 저장합니다.
+
+        Args:
+            lanes: 전체 차선 벡터 배열, shape=(N, P, D). (70, 20, 12)
+            neighbor_agents: 주변 32대 차량 상태 배열, shape=(M, 11). # (32, 11)
+            near_agents: 핵심 npc 차량 상태 배열, shape=(K, 11). # (near_agent_count, 11)
+            npc_routes: 각 핵심 npc 차량 경로 차선 배열 리스트. # List[(25 , 20, 12)]
+            ego_route: ego 차량 경로 차선 벡터, shape=(R, P, D).  # (25, 20, 12)
+            ego_state: ego의 현재 상태(StateSE2 객체).
+            save_dir: 그림 저장 디렉토리.
+            token: 시나리오 토큰(파일명 식별자).
+        """
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.set_facecolor('black')
+
+        # 1. 전체 차선 (흰선)
+        for lane in lanes:
+            valid = ~np.all(lane[:, :2] == 0, axis=1)
+            pts = lane[valid]
+            if pts.shape[0] < 2:
+                continue
+            center = pts[:, :2]
+            left = center + pts[:, 4:6]
+            right = center + pts[:, 6:8]
+            ax.plot(center[:, 0],
+                    center[:, 1],
+                    '--',
+                    color='white',
+                    linewidth=1)
+            ax.plot(left[:, 0], left[:, 1], '-', color='white', linewidth=1)
+            ax.plot(right[:, 0], right[:, 1], '-', color='white', linewidth=1)
+
+        # 2. 주변 차량 (흰색 사각형)
+        for state in neighbor_agents:
+            x, y = state[0], state[1]
+            w, l = 2.0, 4.5  # 예시 크기
+            rect = Rectangle((x - l / 2, y - w / 2), l, w, color='white')
+            ax.add_patch(rect)
+
+        # 3-4. 핵심 npc 차량 및 경로 (각각 다른 색)
+        colors = plt.cm.get_cmap('tab10', len(near_agents))
+        for idx, state in enumerate(near_agents):
+            x, y = state[0], state[1]
+            color = colors(idx)
+            rect = Rectangle((x - 2.25, y - 1.0), 4.5, 2.0, color=color)
+            ax.add_patch(rect)
+            # NPC 경로
+            route = npc_routes[idx]
+            valid = ~np.all(route[:, :2] == 0, axis=1)
+            pts = route[valid]
+            ax.plot(pts[:, 0], pts[:, 1], '-', color=color, linewidth=1)
+
+        # 5-6. Ego 차량 및 경로 (cyan)
+        ex, ey = ego_state.rear_axle.x, ego_state.rear_axle.y
+        ego_w, ego_l = 2.0, 4.5
+        ego_rect = Rectangle((ex - ego_l / 2, ey - ego_w / 2),
+                             ego_l,
+                             ego_w,
+                             edgecolor='cyan',
+                             facecolor='none',
+                             linewidth=2)
+        ax.add_patch(ego_rect)
+        # ego 경로
+        valid = ~np.all(ego_route[:, :2] == 0, axis=1)
+        pts = ego_route[valid]
+        ax.plot(pts[:, 0], pts[:, 1], '-', color='cyan', linewidth=2)
+
+        # 400m, 200m 사각형
+        for size in (400, 200):
+            half = size / 2
+            square = Rectangle((ex - half, ey - half),
+                               size,
+                               size,
+                               edgecolor='magenta',
+                               facecolor='none',
+                               linewidth=2)
+            ax.add_patch(square)
+
+        ax.set_aspect('equal', 'box')
+        ax.set_xlabel('X [m]')
+        ax.set_ylabel('Y [m]')
+        plt.title(f"Visualization Step: {token}", color='white')
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(os.path.join(save_dir, f"vis_{token}.jpg"),
+                        dpi=150,
+                        facecolor='black')
+        plt.close(fig)
 
     # Use for data preprocess
     def work(self, scenarios):

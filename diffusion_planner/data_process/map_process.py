@@ -318,8 +318,9 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
 
 def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
-                near_agents_current, anchor_ego_state, coords, traffic_light_data, speed_limit,
-                lane_route, map_features, max_elements, max_points):
+                near_agents_current, anchor_ego_state, coords,
+                traffic_light_data, speed_limit, lane_route, map_features,
+                max_elements, max_points):
     """
     This function process the data from the raw vector set map data.
     :param route_roadblock_ids: route road block ids.
@@ -415,7 +416,8 @@ def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
                 # 코드 추가
                 lane_on_npc_routes: List[Optional[List[bool]]] = []
                 # # Dict [str, Optional[List[str]]]
-                for token, npc_route_roadblock_ids in near_token_to_route_roadblock_ids.items():
+                for token, npc_route_roadblock_ids in near_token_to_route_roadblock_ids.items(
+                ):
                     if npc_route_roadblock_ids is None:
                         lane_on_npc_routes.append(None)
                         continue
@@ -484,32 +486,43 @@ def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
                 if loc == max_elements["ROUTE_LANES"]:
                     break
             # 코드 추가
-            vector_map_npc_route_lanes: List[np.ndarray] = [] # len: max 10, elements: (25, 20, 12)
-            npc_route_lanes_speed_limit: List[np.ndarray] = [] # len: max 10, elements: (25, 1)
-            npc_route_lanes_has_speed_limit: List[np.ndarray] = [] # len: max 10, elements: (25, 1)
-            for near_agent_current, lane_on_a_npc_routes in zip(near_agents_current, lane_on_npc_routes):
-                near_agent_current = near_agent_current[None] # (1, 11)
-                vector_map_lanes_xy = vector_map_lanes[:, :, :2] # (70, 20, 2)
+            vector_map_npc_route_lanes: List[np.ndarray] = [
+            ]  # len: max 10, elements: (25, 20, 12)
+            npc_route_lanes_speed_limit: List[np.ndarray] = [
+            ]  # len: max 10, elements: (25, 1)
+            npc_route_lanes_has_speed_limit: List[np.ndarray] = [
+            ]  # len: max 10, elements: (25, 1)
+            for near_agent_current, lane_on_a_npc_routes in zip(
+                    near_agents_current, lane_on_npc_routes):
+                near_agent_current = near_agent_current[None]  # (1, 11)
+                vector_map_lanes_xy = vector_map_lanes[:, :, :2]  # (70, 20, 2)
                 vector_map_lanes_norm_dist = np.linalg.norm(
-                    vector_map_lanes_xy - near_agent_current[:, :2], axis=-1) # (70, 20)
-                vector_map_lanes_min_dist = np.min(vector_map_lanes_norm_dist, axis=-1) # (70,)
+                    vector_map_lanes_xy - near_agent_current[:, :2],
+                    axis=-1)  # (70, 20)
+                vector_map_lanes_min_dist = np.min(vector_map_lanes_norm_dist,
+                                                   axis=-1)  # (70,)
                 # sort by distance.
-                vector_map_lanes_min_dist_order = np.argsort(vector_map_lanes_min_dist) # (70,)
-                a_npc_ordered_vector_map_lanes = vector_map_lanes[vector_map_lanes_min_dist_order] # (70, 20, 12)
+                vector_map_lanes_min_dist_order = np.argsort(
+                    vector_map_lanes_min_dist)  # (70,)
+                a_npc_ordered_vector_map_lanes = vector_map_lanes[
+                    vector_map_lanes_min_dist_order]  # (70, 20, 12)
                 ############
                 vector_map_a_npc_route_lanes = np.zeros(
                     (max_elements["ROUTE_LANES"], vector_map_lanes.shape[-2],
                      vector_map_lanes.shape[-1]),
-                    dtype=np.float32) # (25, 20, 12)
+                    dtype=np.float32)  # (25, 20, 12)
                 a_npc_route_lanes_speed_limit = np.zeros(
-                    (max_elements["ROUTE_LANES"], 1), dtype=np.float32) # (25, 1)
+                    (max_elements["ROUTE_LANES"], 1),
+                    dtype=np.float32)  # (25, 1)
                 a_npc_route_lanes_has_speed_limit = np.zeros(
-                    (max_elements["ROUTE_LANES"], 1), dtype=np.bool_) # (25, 1)
+                    (max_elements["ROUTE_LANES"], 1), dtype=np.bool_)  # (25, 1)
                 loc = 0
                 for i in range(len(lane_on_a_npc_routes)):
                     if lane_on_a_npc_routes[i] == True:
-                        vector_map_a_npc_route_lanes[loc] = a_npc_ordered_vector_map_lanes[i]
-                        a_npc_route_lanes_speed_limit[loc] = lane_speed_limit_array[i]
+                        vector_map_a_npc_route_lanes[
+                            loc] = a_npc_ordered_vector_map_lanes[i]
+                        a_npc_route_lanes_speed_limit[
+                            loc] = lane_speed_limit_array[i]
                         a_npc_route_lanes_has_speed_limit[
                             loc] = lane_has_speed_limit_array[i]
                         loc += 1
@@ -520,7 +533,6 @@ def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
                     a_npc_route_lanes_speed_limit)
                 npc_route_lanes_has_speed_limit.append(
                     a_npc_route_lanes_has_speed_limit)
-
 
             # 코드 추가 끝
         else:
