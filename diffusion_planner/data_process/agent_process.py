@@ -73,12 +73,25 @@ def sampled_tracked_objects_to_array_list(past_tracked_objects):
             track_object = past_tracked_objects[i].tracked_objects
         else:
             track_object = past_tracked_objects[i]
+        # track_token_ids: A dictionary used to assign track tokens (str) to integer IDs.
         arrayified, track_token_ids, agent_types = _extract_agent_array(
             track_object, track_token_ids, object_types)
         output.append(arrayified)
         output_types.append(agent_types)
-
-    return output, output_types
+    # 코드 추가
+    neighbor_agents_current_ids = output[-1][:,
+                                             AgentInternalIndex.track_token(
+                                             )]  # (N,)
+    ids_track_token = {
+        track_ids: track_token
+        for track_token, track_ids in track_token_ids.items()
+    }
+    neighbor_agents_current_track_tokens = []  # List[str]
+    for current_id in neighbor_agents_current_ids:
+        neighbor_agents_current_track_tokens.append(
+            ids_track_token[current_id])
+    # 코드 추가 끝
+    return output, output_types, neighbor_agents_current_track_tokens
 
 
 def sampled_static_objects_to_array_list(present_tracked_objects):
@@ -213,9 +226,10 @@ def _pad_agent_states_with_zeros(agent_trajectories):
 
 
 def agent_past_process(past_ego_states, past_tracked_objects,
-                       tracked_objects_types, num_agents, static_objects,
-                       static_objects_types, num_static, max_ped_bike,
-                       anchor_ego_state):
+                       tracked_objects_types,
+                       neighbor_agents_current_track_tokens, num_agents,
+                       static_objects, static_objects_types, num_static,
+                       max_ped_bike, anchor_ego_state):
     """
     This function process the data from the raw agent data.
     :param past_ego_states: The input array data of the ego past.
@@ -359,15 +373,9 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     agents_track_token: List[Optional[str]] = []
     if len(selected_indices) > 0:
         # 원본 마지막 프레임의 DetectionsTracks 가져오기
-        last_detections = past_tracked_objects[-1]
-        raw_list = last_detections.tracked_objects if isinstance(
-            last_detections, DetectionsTracks) else last_detections
-        # selected_indices 순서대로 track_token 추출
         for idx in selected_indices:
-            if 0 <= idx < len(raw_list):
-                agents_track_token.append(raw_list[idx].track_token)
-            else:
-                agents_track_token.append(None)
+            agents_track_token.append(
+                neighbor_agents_current_track_tokens[idx])
     # 슬롯이 부족하면 None으로 패딩
     while len(agents_track_token) < num_agents:
         agents_track_token.append(None)

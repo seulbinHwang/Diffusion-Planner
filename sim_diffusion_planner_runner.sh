@@ -21,7 +21,7 @@ SPLIT="test14-random"  # e.g., "val14"
 # Options:
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
-CHALLENGE="closed_loop_reactive_agents" # e.g., "closed_loop_reactive_agents"
+CHALLENGE="closed_loop_nonreactive_agents" # e.g., "closed_loop_reactive_agents"
 ###################################
 
 
@@ -59,5 +59,3 @@ python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
     hydra.searchpath="[pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"
-
-#  nuplan.planning.script.config.simulation
