@@ -2,11 +2,11 @@ _target_: nuplan.planning.scenario_builder.scenario_filter.ScenarioFilter
 _convert_: "all"
 
 scenario_types: # List of scenario types to include
-  - starting_left_turn
+#  - starting_left_turn
 #  - starting_right_turn
 #  - starting_straight_traffic_light_intersection_traversal
 #  - stopping_with_lead
-#  - high_lateral_acceleration
+  - high_lateral_acceleration
 #  - high_magnitude_speed
 #  - low_magnitude_speed
 #  - traversing_pickup_dropoff

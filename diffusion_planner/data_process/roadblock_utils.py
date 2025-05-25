@@ -348,8 +348,8 @@ def route_roadblock_correction(
         offset += len(path)
 
     # Fix 3: cut route-loops
-    route_roadblocks, route_roadblock_ids = remove_route_loops(
-        route_roadblocks, route_roadblock_ids)
+    # route_roadblocks, route_roadblock_ids = remove_route_loops(
+    #     route_roadblocks, route_roadblock_ids)
 
     return route_roadblock_ids
 

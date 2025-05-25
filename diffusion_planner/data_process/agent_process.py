@@ -88,8 +88,7 @@ def sampled_tracked_objects_to_array_list(past_tracked_objects):
     }
     neighbor_agents_current_track_tokens = []  # List[str]
     for current_id in neighbor_agents_current_ids:
-        neighbor_agents_current_track_tokens.append(
-            ids_track_token[current_id])
+        neighbor_agents_current_track_tokens.append(ids_track_token[current_id])
     # 코드 추가 끝
     return output, output_types, neighbor_agents_current_track_tokens
 
@@ -374,8 +373,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     if len(selected_indices) > 0:
         # 원본 마지막 프레임의 DetectionsTracks 가져오기
         for idx in selected_indices:
-            agents_track_token.append(
-                neighbor_agents_current_track_tokens[idx])
+            agents_track_token.append(neighbor_agents_current_track_tokens[idx])
     # 슬롯이 부족하면 None으로 패딩
     while len(agents_track_token) < num_agents:
         agents_track_token.append(None)

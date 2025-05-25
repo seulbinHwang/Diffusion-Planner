@@ -318,9 +318,9 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
 
 def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
-                near_agents_current, anchor_ego_state, coords,
-                traffic_light_data, speed_limit, lane_route, map_features,
-                max_elements, max_points):
+                near_token_to_raw_route_roadblock_ids, near_agents_current,
+                anchor_ego_state, coords, traffic_light_data, speed_limit,
+                lane_route, map_features, max_elements, max_points):
     """
     This function process the data from the raw vector set map data.
     :param route_roadblock_ids: route road block ids.
@@ -415,24 +415,35 @@ def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
                     lane_on_route.append(route in pruned_route_roadblock_ids)
                 # 코드 추가
                 lane_on_npc_routes: List[List[bool]] = []
+                lane_on_raw_npc_routes: List[List[bool]] = []
                 # # Dict [str, Optional[List[str]]]
                 for token, npc_route_roadblock_ids in near_token_to_route_roadblock_ids.items(
                 ):
                     npc_lane_on_route = []
+                    npc_lane_on_raw_route = []
                     if npc_route_roadblock_ids is None:
                         for _ in lane_routes:
                             npc_lane_on_route.append(None)
+                            npc_lane_on_raw_route.append(None)
                     else:
                         pruned_lane_roadblock_ids = [
                             route for route in npc_route_roadblock_ids
                             if route in lane_routes
                         ]
-                        pruned_route_roadblock_ids = _prune_route_by_connectivity(
-                            npc_route_roadblock_ids, pruned_lane_roadblock_ids)
+                        pruned_lane_raw_roadblock_ids = [
+                            route for route in
+                            near_token_to_raw_route_roadblock_ids[token]
+                            if route in lane_routes
+                        ]
+                        # pruned_route_roadblock_ids = _prune_route_by_connectivity(
+                        #     npc_route_roadblock_ids, pruned_lane_roadblock_ids)
                         for route in lane_routes:
                             npc_lane_on_route.append(
-                                route in pruned_route_roadblock_ids)
+                                route in pruned_lane_roadblock_ids)
+                            npc_lane_on_raw_route.append(
+                                route in pruned_lane_raw_roadblock_ids)
                     lane_on_npc_routes.append(npc_lane_on_route)
+                    lane_on_raw_npc_routes.append(npc_lane_on_raw_route)
                 # 코드 추가 끝
             elif feature_name == 'LEFT_BOUNDARY' or feature_name == 'RIGHT_BOUNDARY':
                 continue
@@ -510,9 +521,9 @@ def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
                 a_npc_ordered_vector_map_lanes = vector_map_lanes[
                     vector_map_lanes_min_dist_order]  # (70, 20, 12)
                 # sort lane_on_a_npc_routes by vector_map_lanes_min_dist_order.
-                lane_on_a_npc_routes = np.array(lane_on_a_npc_routes) # (70,)
+                lane_on_a_npc_routes = np.array(lane_on_a_npc_routes)  # (70,)
                 lane_on_a_npc_routes = lane_on_a_npc_routes[
-                    vector_map_lanes_min_dist_order] # (70,)
+                    vector_map_lanes_min_dist_order]  # (70,)
                 ############
                 vector_map_a_npc_route_lanes = np.zeros(
                     (max_elements["ROUTE_LANES"], vector_map_lanes.shape[-2],
@@ -557,4 +568,4 @@ def map_process(route_roadblock_ids, near_token_to_route_roadblock_ids,
                             'npc_route_lanes_has_speed_limit': npc_route_lanes_has_speed_limit,
                          }
 
-    return vector_map_output
+    return vector_map_output, lane_on_raw_npc_routes

@@ -77,6 +77,7 @@ class DiffusionPlanner(AbstractPlanner):
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
         self._npc_route_roadblock_ids = initialization.npc_route_roadblock_ids
+        self._tokens_to_position = initialization.tokens_to_position
 
         if self._ckpt_path is not None:
             state_dict: Dict = torch.load(self._ckpt_path,
@@ -109,6 +110,7 @@ class DiffusionPlanner(AbstractPlanner):
             history, traffic_light_data, self._map_api,
             self._route_roadblock_ids,
             self._npc_route_roadblock_ids,
+            self._tokens_to_position,
             self._device)
 
         return model_inputs

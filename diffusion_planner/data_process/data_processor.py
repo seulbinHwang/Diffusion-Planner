@@ -18,7 +18,6 @@ from matplotlib.patches import Rectangle
 from matplotlib.patches import Polygon
 
 
-
 class DataProcessor(object):
 
     def __init__(self, config):
@@ -63,20 +62,39 @@ class DataProcessor(object):
                             map_api,
                             route_roadblock_ids,
                             npc_route_roadblock_ids,
+                            tokens_to_position, # TODO: 디버깅 용으로, 추후 삭제
                             device='cpu'):
         '''
         ego
         '''
         ego_agent_past = None  # inference no need ego_agent_past
         ego_state = history_buffer.current_state[0]
-        ego_x = ego_state.rear_axle.x
-        ego_y = ego_state.rear_axle.y
         ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
         anchor_ego_state = np.array([
             ego_state.rear_axle.x, ego_state.rear_axle.y,
             ego_state.rear_axle.heading
         ],
                                     dtype=np.float64)
+        # tokens_to_position: Dict[str, Optional[np.ndarray]] w.r.t. world coordinates
+        # TODO: change from world coordinates to ego coordinates
+        ego_x, ego_y, ego_yaw = anchor_ego_state
+        c, s = np.cos(ego_yaw), np.sin(ego_yaw)
+        # Rotation matrix to go from world → ego frame: R(-yaw)
+        # TODO: 디버깅 용으로, 추후 삭제
+        R = np.array([[ c,  s],
+                      [-s,  c]])
+        tokens_to_position_ego: Dict[str, Optional[np.ndarray]] = {}
+        for token, pos in tokens_to_position.items():
+            if pos is None:
+                tokens_to_position_ego[token] = None
+            else:
+                # pos may be shape (2,) or (N,2)
+                shifted = pos - np.array([ego_x, ego_y])
+                # apply rotation: world → ego
+                if shifted.ndim == 1:
+                    tokens_to_position_ego[token] = R.dot(shifted)
+                else:
+                    tokens_to_position_ego[token] = shifted.dot(R.T)
         '''
         neighbor
         '''
@@ -103,10 +121,13 @@ class DataProcessor(object):
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
         near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
+        near_token_to_raw_route_roadblock_ids: Dict[str,
+                                                    Optional[List[str]]] = {}
         near_agents_current = []
         near_agent_count = 0
         near_agent_tokens = []
-        for agent_idx, token in enumerate(agents_track_token):  # List[Optional[str]]
+        for agent_idx, token in enumerate(
+                agents_track_token):  # List[Optional[str]]
             if token is None:
                 break
             if near_agent_count >= self.predicted_neighbor_num:
@@ -126,8 +147,11 @@ class DataProcessor(object):
             # a_npc_route_roadblock_ids: Optional[List[str]]
             a_npc_route_roadblock_ids = npc_route_roadblock_ids.get(token)
             if a_npc_route_roadblock_ids is None:
+                near_token_to_raw_route_roadblock_ids[token] = None
                 near_token_to_route_roadblock_ids[token] = None
             else:
+                near_token_to_raw_route_roadblock_ids[
+                    token] = a_npc_route_roadblock_ids
                 point = StateSE2(obj.center.x, obj.center.y, obj.center.heading)
                 npc_state = SimpleNamespace(rear_axle=point)
                 near_token_to_route_roadblock_ids[
@@ -143,12 +167,12 @@ class DataProcessor(object):
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
             map_api, self._map_features, ego_coords, self._radius,
             traffic_light_data)
-        vector_map = map_process(route_roadblock_ids,
-                                 near_token_to_route_roadblock_ids,
-                                 near_agents_current, anchor_ego_state, coords,
-                                 traffic_light_data, speed_limit, lane_route,
-                                 self._map_features, self._max_elements,
-                                 self._max_points)
+        vector_map, lane_on_raw_npc_routes = map_process(
+            route_roadblock_ids, near_token_to_route_roadblock_ids,
+            near_token_to_raw_route_roadblock_ids, near_agents_current,
+            anchor_ego_state, coords, traffic_light_data, speed_limit,
+            lane_route, self._map_features, self._max_elements,
+            self._max_points)
 
         data = {
             "neighbor_agents_past":
@@ -171,21 +195,25 @@ class DataProcessor(object):
                     lanes=vector_map['lanes'],  # (70, 20, 12)
                     neighbor_agents=neighbor_agents_current,  # (32, 11)
                     near_agent=near_agents_current[idx],  # (11)
-                    near_agent_token = token,
-                    npc_route=vector_map['npc_route_lanes'][idx],  # (25, 20, 12)
+                    near_agent_token=token,
+                    npc_route=vector_map['npc_route_lanes']
+                    [idx],  # (25, 20, 12)
                     ego_state=ego_state,
+                    lane_on_raw_npc_routes=lane_on_raw_npc_routes[
+                        idx],  # List[bool]
+                    positions = tokens_to_position_ego[token],
                     save_dir="visualization",
                     step_index=self.step_index)
         self.step_index += 1
         return data
 
-
     def _draw_step(self, lanes: np.ndarray, neighbor_agents: np.ndarray,
-                   near_agent: np.ndarray,
-                   near_agent_token: str,
-                   npc_route: np.ndarray,
-                   ego_state: StateSE2,
-                   save_dir: Optional[str], step_index: int) -> None:
+                   near_agent: np.ndarray, near_agent_token: str,
+                   npc_route: np.ndarray, ego_state: StateSE2,
+                   lane_on_raw_npc_routes: List[bool],
+                   positions: Optional[np.ndarray], # (n, 2) or None
+        save_dir: Optional[str],
+                   step_index: int) -> None:
         """
         한 스텝 분량의 맵과 에이전트를 시각화하여 JPG 파일로 저장합니다.
 
@@ -201,7 +229,7 @@ class DataProcessor(object):
         fig, ax = plt.subplots(figsize=(8, 8))
         ax.set_facecolor('black')
         # 1. 전체 차선 (흰선)
-        for lane in lanes:
+        for idx, lane in enumerate(lanes):
             # lane: (20, 12)
             valid = ~np.all(lane[:, :2] == 0, axis=1)  # valid: (20,)
             pts = lane[valid]
@@ -210,57 +238,64 @@ class DataProcessor(object):
             center = pts[:, :2]
             left = center + pts[:, 4:6]
             right = center + pts[:, 6:8]
-            ax.plot(center[:, 0],
-                    center[:, 1],
-                    '--',
-                    color='white',
-                    linewidth=1)
-            ax.plot(left[:, 0], left[:, 1], '-', color='white', linewidth=1)
-            ax.plot(right[:, 0], right[:, 1], '-', color='white', linewidth=1)
+            if lane_on_raw_npc_routes[idx] == True:
+                color_ = 'red'
+                linewidth = 1
+                ax.plot(center[:, 0],
+                        center[:, 1],
+                        '--',
+                        color=color_,
+                        linewidth=linewidth)
+            else:
+                color_ = 'white'
+                linewidth = 1
+
+            ax.plot(left[:, 0],
+                    left[:, 1],
+                    '-',
+                    color=color_,
+                    linewidth=linewidth)
+            ax.plot(right[:, 0],
+                    right[:, 1],
+                    '-',
+                    color=color_,
+                    linewidth=linewidth)
         # 5-6. Ego 차량 및 경로 (cyan)
         # 5. Ego 차량 (cyan, ego 프레임이므로 회전 0)
         ego_w, ego_l = 2.0, 4.5
         # rear_axle(0,0) 기준으로, 좌하단 모서리만 이동
         ego_rect = Rectangle(
             (-ego_l / 2, -ego_w / 2),  # left-bottom corner
-            ego_l, ego_w,  # width=length, height=width
+            ego_l,
+            ego_w,  # width=length, height=width
             edgecolor='cyan',
             facecolor='none',
-            linewidth=2
-        )
+            linewidth=2)
         ax.add_patch(ego_rect)
 
         # 400m, 200m 사각형
         # 6. 400m/200m 세계좌표축 정렬 사각형
         yaw = ego_state.rear_axle.heading  # ego 프레임→세계축 회전각
-        for size in (int(self._radius * 2), int(self._radius)):
+        for size in (int(self._radius * 2), int(self._radius * 2)):
             half = size / 2
             # ego 프레임에서의 사각형 중심이 (0,0)인 네 꼭짓점
-            corners = np.array([
-                [-half, -half],
-                [-half, half],
-                [half, half],
-                [half, -half]
-            ])  # shape=(4,2)
+            corners = np.array([[-half, -half], [-half, half], [half, half],
+                                [half, -half]])  # shape=(4,2)
 
             # 세계축 정렬을 위해 -yaw 만큼 회전
             c, s = np.cos(-yaw), np.sin(-yaw)
-            rot = np.array([[c, -s],
-                            [s, c]])
+            rot = np.array([[c, -s], [s, c]])
             world_corners = corners.dot(rot.T)
 
-            square = Polygon(
-                world_corners,
-                closed=True,
-                edgecolor='magenta',
-                facecolor='none',
-                linewidth=2
-            )
+            square = Polygon(world_corners,
+                             closed=True,
+                             edgecolor='magenta',
+                             facecolor='none',
+                             linewidth=1)
             ax.add_patch(square)
 
-
         # 2. 주변 차량 (흰색 사각형)
-        for state in neighbor_agents: # (32, 11)
+        for state in neighbor_agents:  # (32, 11)
             x, y = state[0], state[1]
             cos_yaw, sin_yaw = state[2], state[3]
             yaw = np.arctan2(sin_yaw, cos_yaw)
@@ -270,7 +305,8 @@ class DataProcessor(object):
             ox = dx * np.cos(yaw) - dy * np.sin(yaw)
             oy = dx * np.sin(yaw) + dy * np.cos(yaw)
             rect = Rectangle((x + ox, y + oy),
-                             length, width,
+                             length,
+                             width,
                              angle=np.degrees(yaw),
                              color='white')
             ax.add_patch(rect)
@@ -289,28 +325,35 @@ class DataProcessor(object):
         cos_yaw, sin_yaw = near_agent[2], near_agent[3]
         yaw = np.arctan2(sin_yaw, cos_yaw)
         width, length = near_agent[6], near_agent[7]
-        dx, dy = -length/2, -width/2
-        ox = dx*np.cos(yaw) - dy*np.sin(yaw)
-        oy = dx*np.sin(yaw) + dy*np.cos(yaw)
-        npc_rect = Rectangle((x+ox, y+oy),
-                             length, width,
+        dx, dy = -length / 2, -width / 2
+        ox = dx * np.cos(yaw) - dy * np.sin(yaw)
+        oy = dx * np.sin(yaw) + dy * np.cos(yaw)
+        npc_rect = Rectangle((x + ox, y + oy),
+                             length,
+                             width,
                              angle=np.degrees(yaw),
                              color=color)
         ax.add_patch(npc_rect)
 
         # NPC 경로
-        valid_elems = ~np.all(npc_route==0, axis=(1,2))
+        valid_elems = ~np.all(npc_route == 0, axis=(1, 2))
         for lane in npc_route[valid_elems]:
-            valid = ~np.all(lane[:,:2]==0, axis=1)
+            valid = ~np.all(lane[:, :2] == 0, axis=1)
             pts = lane[valid]
-            if pts.shape[0]<2: continue
-            center = pts[:,:2]
-            left = center + pts[:,4:6]
-            right = center + pts[:,6:8]
-            ax.plot(center[:,0], center[:,1], '--', color=color, linewidth=1)
-            ax.plot(left[:,0], left[:,1], '-', color=color, linewidth=1)
-            ax.plot(right[:,0], right[:,1], '-', color=color, linewidth=1)
+            if pts.shape[0] < 2:
+                continue
+            center = pts[:, :2]
+            left = center + pts[:, 4:6]
+            right = center + pts[:, 6:8]
+            # ax.plot(center[:,0], center[:,1], '--', color=color, linewidth=1)
+            ax.plot(left[:, 0], left[:, 1], '-', color=color, linewidth=1)
+            ax.plot(right[:, 0], right[:, 1], '-', color=color, linewidth=1)
 
+        # 7. positions 경로 (파란 실선)
+        if positions is not None and positions.ndim == 2 and positions.shape[1] == 2:
+            # positions: shape=(T,2)
+            ax.plot(positions[:, 0], positions[:, 1],
+                    '-', color='blue', linewidth=1, label='positions')
 
         ax.set_aspect('equal', 'box')
         ax.set_xlabel('X [m]')
@@ -325,11 +368,10 @@ class DataProcessor(object):
         plt.close(fig)
 
     def _draw_step_all(self, lanes: np.ndarray, neighbor_agents: np.ndarray,
-                   near_agents: np.ndarray,
-                   near_agent_tokens: List[str],
-                   npc_routes: List[np.ndarray],
-                   ego_route: np.ndarray, ego_state: StateSE2,
-                   save_dir: Optional[str], token: int) -> None:
+                       near_agents: np.ndarray, near_agent_tokens: List[str],
+                       npc_routes: List[np.ndarray], ego_route: np.ndarray,
+                       ego_state: StateSE2, save_dir: Optional[str],
+                       token: int) -> None:
         """
         한 스텝 분량의 맵과 에이전트를 시각화하여 JPG 파일로 저장합니다.
 
@@ -368,11 +410,11 @@ class DataProcessor(object):
         # rear_axle(0,0) 기준으로, 좌하단 모서리만 이동
         ego_rect = Rectangle(
             (-ego_l / 2, -ego_w / 2),  # left-bottom corner
-            ego_l, ego_w,  # width=length, height=width
+            ego_l,
+            ego_w,  # width=length, height=width
             edgecolor='cyan',
             facecolor='none',
-            linewidth=2
-        )
+            linewidth=2)
         ax.add_patch(ego_rect)
         for lane in ego_route:  # lane.shape == (20,12)
             # (x,y) 둘 다 0인 포인트만 골라서 제외
@@ -393,31 +435,23 @@ class DataProcessor(object):
         for size in (int(self._radius * 2), int(self._radius)):
             half = size / 2
             # ego 프레임에서의 사각형 중심이 (0,0)인 네 꼭짓점
-            corners = np.array([
-                [-half, -half],
-                [-half, half],
-                [half, half],
-                [half, -half]
-            ])  # shape=(4,2)
+            corners = np.array([[-half, -half], [-half, half], [half, half],
+                                [half, -half]])  # shape=(4,2)
 
             # 세계축 정렬을 위해 -yaw 만큼 회전
             c, s = np.cos(-yaw), np.sin(-yaw)
-            rot = np.array([[c, -s],
-                            [s, c]])
+            rot = np.array([[c, -s], [s, c]])
             world_corners = corners.dot(rot.T)
 
-            square = Polygon(
-                world_corners,
-                closed=True,
-                edgecolor='magenta',
-                facecolor='none',
-                linewidth=2
-            )
+            square = Polygon(world_corners,
+                             closed=True,
+                             edgecolor='magenta',
+                             facecolor='none',
+                             linewidth=2)
             ax.add_patch(square)
 
-
         # 2. 주변 차량 (흰색 사각형)
-        for state in neighbor_agents: # (32, 11)
+        for state in neighbor_agents:  # (32, 11)
             x, y = state[0], state[1]
             cos_yaw, sin_yaw = state[2], state[3]
             yaw = np.arctan2(sin_yaw, cos_yaw)
@@ -427,7 +461,8 @@ class DataProcessor(object):
             ox = dx * np.cos(yaw) - dy * np.sin(yaw)
             oy = dx * np.sin(yaw) + dy * np.cos(yaw)
             rect = Rectangle((x + ox, y + oy),
-                             length, width,
+                             length,
+                             width,
                              angle=np.degrees(yaw),
                              color='white')
             ax.add_patch(rect)
@@ -447,28 +482,34 @@ class DataProcessor(object):
             cos_yaw, sin_yaw = state[2], state[3]
             yaw = np.arctan2(sin_yaw, cos_yaw)
             width, length = state[6], state[7]
-            dx, dy = -length/2, -width/2
-            ox = dx*np.cos(yaw) - dy*np.sin(yaw)
-            oy = dx*np.sin(yaw) + dy*np.cos(yaw)
-            npc_rect = Rectangle((x+ox, y+oy),
-                                 length, width,
+            dx, dy = -length / 2, -width / 2
+            ox = dx * np.cos(yaw) - dy * np.sin(yaw)
+            oy = dx * np.sin(yaw) + dy * np.cos(yaw)
+            npc_rect = Rectangle((x + ox, y + oy),
+                                 length,
+                                 width,
                                  angle=np.degrees(yaw),
                                  color=color)
             ax.add_patch(npc_rect)
 
             # NPC 경로
             route = npc_routes[idx]
-            valid_elems = ~np.all(route==0, axis=(1,2))
+            valid_elems = ~np.all(route == 0, axis=(1, 2))
             for lane in route[valid_elems]:
-                valid = ~np.all(lane[:,:2]==0, axis=1)
+                valid = ~np.all(lane[:, :2] == 0, axis=1)
                 pts = lane[valid]
-                if pts.shape[0]<2: continue
-                center = pts[:,:2]
-                left = center + pts[:,4:6]
-                right = center + pts[:,6:8]
-                ax.plot(center[:,0], center[:,1], '--', color=color, linewidth=1)
-                ax.plot(left[:,0], left[:,1], '-', color=color, linewidth=1)
-                ax.plot(right[:,0], right[:,1], '-', color=color, linewidth=1)
+                if pts.shape[0] < 2:
+                    continue
+                center = pts[:, :2]
+                left = center + pts[:, 4:6]
+                right = center + pts[:, 6:8]
+                ax.plot(center[:, 0],
+                        center[:, 1],
+                        '--',
+                        color=color,
+                        linewidth=1)
+                ax.plot(left[:, 0], left[:, 1], '-', color=color, linewidth=1)
+                ax.plot(right[:, 0], right[:, 1], '-', color=color, linewidth=1)
 
         # for size in (400, 200):
         #     half = size / 2
