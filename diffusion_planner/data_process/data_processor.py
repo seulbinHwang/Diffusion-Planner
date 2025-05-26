@@ -15,6 +15,9 @@ from diffusion_planner.data_process.utils import convert_to_model_inputs
 class DataProcessor(object):
 
     def __init__(self, config):
+        self._agent_color_map: Dict[str, tuple] = {}
+        self._color_cmap = plt.cm.get_cmap('tab20')
+        self._next_color_idx = 0
 
         self._save_dir = getattr(config, "save_path", None)
 
@@ -207,7 +210,195 @@ class DataProcessor(object):
         data.update(vector_map)
         data = convert_to_model_inputs(data, device)
 
+        # 시각화 코드 호출
+        for idx, token in enumerate(near_agent_tokens):
+            type_one_hot_vector = near_agents_current[idx, 8]
+            if type_one_hot_vector == 1:
+                self._draw_step(
+                    lanes=vector_map['lanes'],  # (70, 20, 12)
+                    neighbor_agents=neighbor_agents_current,  # (32, 11)
+                    near_agent=near_agents_current[idx],  # (11)
+                    near_agent_token=token,
+                    npc_route=vector_map['npc_route_lanes']
+                    [idx],  # (25, 20, 12)
+                    ego_state=ego_state,
+                    lane_on_raw_npc_routes=lane_on_raw_npc_routes[
+                        idx],  # List[bool]
+                    positions=tokens_to_position_ego[token],
+                    save_dir="visualization",
+                    step_index=self.step_index)
+        self.step_index += 1
         return data
+
+    def _draw_step(
+            self,
+            lanes: np.ndarray,
+            neighbor_agents: np.ndarray,
+            near_agent: np.ndarray,
+            near_agent_token: str,
+            npc_route: np.ndarray,
+            ego_state: StateSE2,
+            lane_on_raw_npc_routes: List[bool],
+            positions: Optional[np.ndarray],  # (n, 2) or None
+            save_dir: Optional[str],
+            step_index: int) -> None:
+        """
+        한 스텝 분량의 맵과 에이전트를 시각화하여 JPG 파일로 저장합니다.
+
+        Args:
+            lanes: 전체 차선 벡터 배열, shape=(N, P, D). (70, 20, 12)
+            neighbor_agents: 주변 32대 차량 상태 배열, shape=(M, 11). # (32, 11)
+            near_agent: 핵심 npc 차량 상태 배열, shape=(11). # (11)
+            npc_route: (25 , 20, 12) # len(npc_routes) == len(near_agents)
+            ego_state: ego의 현재 상태(StateSE2 객체).
+            save_dir: 그림 저장 디렉토리.
+            token: 시나리오 토큰(파일명 식별자).
+        """
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.set_facecolor('black')
+        # 1. 전체 차선 (흰선)
+        for idx, lane in enumerate(lanes):
+            # lane: (20, 12)
+            valid = ~np.all(lane[:, :2] == 0, axis=1)  # valid: (20,)
+            pts = lane[valid]
+            if pts.shape[0] < 2:
+                continue
+            center = pts[:, :2]
+            left = center + pts[:, 4:6]
+            right = center + pts[:, 6:8]
+            if lane_on_raw_npc_routes[idx] == True:
+                color_ = 'red'
+                linewidth = 1
+                ax.plot(center[:, 0],
+                        center[:, 1],
+                        '--',
+                        color=color_,
+                        linewidth=linewidth)
+            else:
+                color_ = 'white'
+                linewidth = 1
+
+            ax.plot(left[:, 0],
+                    left[:, 1],
+                    '-',
+                    color=color_,
+                    linewidth=linewidth)
+            ax.plot(right[:, 0],
+                    right[:, 1],
+                    '-',
+                    color=color_,
+                    linewidth=linewidth)
+        # 5-6. Ego 차량 및 경로 (cyan)
+        # 5. Ego 차량 (cyan, ego 프레임이므로 회전 0)
+        ego_w, ego_l = 2.0, 4.5
+        # rear_axle(0,0) 기준으로, 좌하단 모서리만 이동
+        ego_rect = Rectangle(
+            (-ego_l / 2, -ego_w / 2),  # left-bottom corner
+            ego_l,
+            ego_w,  # width=length, height=width
+            edgecolor='cyan',
+            facecolor='none',
+            linewidth=2)
+        ax.add_patch(ego_rect)
+
+        # 400m, 200m 사각형
+        # 6. 400m/200m 세계좌표축 정렬 사각형
+        yaw = ego_state.rear_axle.heading  # ego 프레임→세계축 회전각
+        for size in (int(self._radius * 2), int(self._radius * 2)):
+            half = size / 2
+            # ego 프레임에서의 사각형 중심이 (0,0)인 네 꼭짓점
+            corners = np.array([[-half, -half], [-half, half], [half, half],
+                                [half, -half]])  # shape=(4,2)
+
+            # 세계축 정렬을 위해 -yaw 만큼 회전
+            c, s = np.cos(-yaw), np.sin(-yaw)
+            rot = np.array([[c, -s], [s, c]])
+            world_corners = corners.dot(rot.T)
+
+            square = Polygon(world_corners,
+                             closed=True,
+                             edgecolor='magenta',
+                             facecolor='none',
+                             linewidth=1)
+            ax.add_patch(square)
+
+        # 2. 주변 차량 (흰색 사각형)
+        for state in neighbor_agents:  # (32, 11)
+            x, y = state[0], state[1]
+            cos_yaw, sin_yaw = state[2], state[3]
+            yaw = np.arctan2(sin_yaw, cos_yaw)
+            width, length = state[6], state[7]
+            # 중심->좌하단 오프셋
+            dx, dy = -length / 2, -width / 2
+            ox = dx * np.cos(yaw) - dy * np.sin(yaw)
+            oy = dx * np.sin(yaw) + dy * np.cos(yaw)
+            rect = Rectangle((x + ox, y + oy),
+                             length,
+                             width,
+                             angle=np.degrees(yaw),
+                             color='white')
+            ax.add_patch(rect)
+
+        # (3-4) 핵심 npc 차량 및 경로: 토큰별 색 고정 사용
+        # 토큰별로 컬러 매핑 (처음 등장시 할당)
+        if near_agent_token not in self._agent_color_map:
+            color = self._color_cmap(self._next_color_idx % 20)
+            self._agent_color_map[near_agent_token] = color
+            self._next_color_idx += 1
+        else:
+            color = self._agent_color_map[near_agent_token]
+
+        # 차량 박스
+        x, y = near_agent[0], near_agent[1]
+        cos_yaw, sin_yaw = near_agent[2], near_agent[3]
+        yaw = np.arctan2(sin_yaw, cos_yaw)
+        width, length = near_agent[6], near_agent[7]
+        dx, dy = -length / 2, -width / 2
+        ox = dx * np.cos(yaw) - dy * np.sin(yaw)
+        oy = dx * np.sin(yaw) + dy * np.cos(yaw)
+        npc_rect = Rectangle((x + ox, y + oy),
+                             length,
+                             width,
+                             angle=np.degrees(yaw),
+                             color=color)
+        ax.add_patch(npc_rect)
+
+        # NPC 경로
+        valid_elems = ~np.all(npc_route == 0, axis=(1, 2))
+        for lane in npc_route[valid_elems]:
+            valid = ~np.all(lane[:, :2] == 0, axis=1)
+            pts = lane[valid]
+            if pts.shape[0] < 2:
+                continue
+            center = pts[:, :2]
+            left = center + pts[:, 4:6]
+            right = center + pts[:, 6:8]
+            # ax.plot(center[:,0], center[:,1], '--', color=color, linewidth=1)
+            ax.plot(left[:, 0], left[:, 1], '-', color=color, linewidth=1)
+            ax.plot(right[:, 0], right[:, 1], '-', color=color, linewidth=1)
+
+        # 7. positions 경로 (파란 실선)
+        if positions is not None and positions.ndim == 2 and positions.shape[
+                1] == 2:
+            # positions: shape=(T,2)
+            ax.plot(positions[:, 0],
+                    positions[:, 1],
+                    '-',
+                    color='blue',
+                    linewidth=1,
+                    label='positions')
+
+        ax.set_aspect('equal', 'box')
+        ax.set_xlabel('X [m]')
+        ax.set_ylabel('Y [m]')
+        plt.title(f"Visualization Step: {step_index}", color='white')
+        save_dir = os.path.join(save_dir, near_agent_token)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            plt.savefig(os.path.join(save_dir, f"vis_{step_index}.jpg"),
+                        dpi=150,
+                        facecolor='black')
+        plt.close(fig)
 
     # Use for data preprocess
     def work(self, scenarios):
