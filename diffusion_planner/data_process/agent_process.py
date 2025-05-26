@@ -7,7 +7,7 @@ Categories:
     2. Get agents array for model input
 """
 import numpy as np
-from typing import Dict
+from typing import Dict, List, Optional
 
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import AgentInternalIndex
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -73,12 +73,23 @@ def sampled_tracked_objects_to_array_list(past_tracked_objects):
             track_object = past_tracked_objects[i].tracked_objects
         else:
             track_object = past_tracked_objects[i]
+        # track_token_ids:  token to int ids
         arrayified, track_token_ids, agent_types = _extract_agent_array(
             track_object, track_token_ids, object_types)
         output.append(arrayified)
         output_types.append(agent_types)
-
-    return output, output_types
+    # 코드 추가
+    current_frame_npc_ids = output[-1][:,
+                                       AgentInternalIndex.track_token()]  # (N,)
+    ids_track_token = {
+        track_ids: track_token
+        for track_token, track_ids in track_token_ids.items()
+    }
+    current_frame_npc_tokens = []  # List[str]
+    for current_id in current_frame_npc_ids:
+        current_frame_npc_tokens.append(ids_track_token[current_id])
+    # 코드 추가 끝
+    return output, output_types, current_frame_npc_tokens
 
 
 def sampled_static_objects_to_array_list(present_tracked_objects):
@@ -213,9 +224,10 @@ def _pad_agent_states_with_zeros(agent_trajectories):
 
 
 def agent_past_process(past_ego_states, past_tracked_objects,
-                       tracked_objects_types, num_agents, static_objects,
-                       static_objects_types, num_static, max_ped_bike,
-                       anchor_ego_state):
+                       tracked_objects_types,
+                       current_frame_npc_tokens: List[str], num_agents,
+                       static_objects, static_objects_types, num_static,
+                       max_ped_bike, anchor_ego_state):
     """
     This function process the data from the raw agent data.
     :param past_ego_states: The input array data of the ego past.
@@ -355,6 +367,16 @@ def agent_past_process(past_ego_states, past_tracked_objects,
         # Sort and limit the selected indices to num_agents
         selected_indices = sorted(
             selected_indices, key=lambda idx: distance_to_ego[idx])[:num_agents]
+    # === 추가된 부분: 각 selected agent의 문자열 track_token 목록 생성 ===
+    agents_token: List[Optional[str]] = []  # 길이: agents_num = 32
+    if len(selected_indices) > 0:
+        # 원본 마지막 프레임의 DetectionsTracks 가져오기
+        for idx in selected_indices:
+            agents_token.append(current_frame_npc_tokens[idx])
+    # 슬롯이 부족하면 None으로 패딩
+    while len(agents_token) < num_agents:
+        agents_token.append(None)
+    # === 추가된 부분 끝 ===
 
     # Populate the final agents array with the selected agents' features
     for i, j in enumerate(selected_indices):
@@ -390,7 +412,7 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     if ego is not None:
         ego = ego.astype(np.float32)
 
-    return ego, agents, selected_indices, static_objects
+    return ego, agents, selected_indices, static_objects, agents_token
 
 
 def agent_future_process(anchor_ego_state, future_tracked_objects, num_agents,

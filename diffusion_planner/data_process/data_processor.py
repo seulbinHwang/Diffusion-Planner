@@ -44,6 +44,66 @@ class DataProcessor(object):
             'ROUTE_LANES': config.route_len
         }  # maximum number of points per feature to extract per feature layer.
 
+
+    def _extract_near_agents(
+        self, agents_token: List[Optional[str]], observation_buffer,
+        npc_route_roadblock_ids: Dict[str, Optional[List[str]]],
+        neighbor_agents_current: np.ndarray, map_api: AbstractMap, ego_x: float,
+        ego_y: float
+    ) -> (Dict[str, Optional[List[str]]], Dict[str, Optional[List[str]]],
+          np.ndarray, List[str]):
+        """
+        tokens_to_position_ego 처리 후, 반경 내 NPC 에이전트에 대해
+        raw/보정된 route_roadblock_ids와 현재 상태, 토큰 리스트를 반환합니다.
+        """
+        near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
+        near_token_to_raw_route_roadblock_ids: Dict[str,
+                                                    Optional[List[str]]] = {}
+        near_agents_current = []
+        near_agent_tokens: List[str] = []
+        near_agents_count = 0
+
+        for agent_idx, token in enumerate(agents_token):
+            if token is None or near_agents_count >= self.predicted_neighbor_num:
+                break
+
+            last_obs = observation_buffer[-1]
+            obj = next(
+                (o for o in last_obs.tracked_objects if o.track_token == token),
+                None)
+            if obj is None:
+                continue
+
+            # 반경 필터링
+            if abs(obj.center.x - ego_x) > self._radius / 2 or \
+               abs(obj.center.y - ego_y) > self._radius / 2:
+                continue
+
+            # raw vs 보정 route 가져오기
+            a_npc_route_roadblock_ids = npc_route_roadblock_ids.get(token)
+            if a_npc_route_roadblock_ids is None:
+                near_token_to_raw_route_roadblock_ids[token] = None
+                near_token_to_route_roadblock_ids[token] = None
+            else:
+                near_token_to_raw_route_roadblock_ids[
+                    token] = a_npc_route_roadblock_ids
+                point = StateSE2(obj.center.x, obj.center.y, obj.center.heading)
+                npc_state = SimpleNamespace(rear_axle=point)
+                near_token_to_route_roadblock_ids[
+                    token] = route_roadblock_correction(
+                        npc_state, map_api, a_npc_route_roadblock_ids)
+
+            # 상태 및 토큰 저장
+            near_agents_current.append(neighbor_agents_current[agent_idx])
+            near_agent_tokens.append(token)
+            near_agents_count += 1
+        # TODO: near_agents_count 가 무조건 self.predicted_neighbor_num 와
+        #  같아야 하는지 확인 필요
+        near_agents_current = np.array(near_agents_current)
+        return (near_token_to_route_roadblock_ids,
+                near_token_to_raw_route_roadblock_ids, near_agents_current,
+                near_agent_tokens)
+
     # Use for inference
     def observation_adapter(self,
                             history_buffer,
@@ -87,16 +147,36 @@ class DataProcessor(object):
         neighbor
         '''
         observation_buffer = history_buffer.observation_buffer  # Past observations including the current
-        neighbor_agents_past, neighbor_agents_types = sampled_tracked_objects_to_array_list(
-            observation_buffer)
+        (neighbor_agents_past, neighbor_agents_types, current_frame_npc_tokens
+        ) = sampled_tracked_objects_to_array_list(observation_buffer)
         static_objects, static_objects_types = sampled_static_objects_to_array_list(
             observation_buffer[-1])
-        _, neighbor_agents_past, _, static_objects = \
-            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+        (_, neighbor_agents_past, _,
+         static_objects, agents_token) = agent_past_process(
+             ego_agent_past, neighbor_agents_past, neighbor_agents_types,
+             current_frame_npc_tokens, self.num_agents, static_objects,
+             static_objects_types, self.num_static, self.max_ped_bike,
+             anchor_ego_state)
+        # neighbor_agents_current: (32, 11)
+        neighbor_agents_current = neighbor_agents_past[:, -1, :]
         '''
         Map
         '''
         # Simply fixing disconnected routes without pre-searching for reference lines
+        (
+            near_token_to_route_roadblock_ids,  # Dict[str, Optional[List[str]]]
+            near_token_to_raw_route_roadblock_ids,  # TODO: 디버깅 용으로, 추후 삭제
+            near_agents_current,  # (n, 11)
+            near_agent_tokens,  # List[str]
+        ) = self._extract_near_agents(
+            agents_token,  # List[Optional[str]]
+            observation_buffer,
+            npc_route_roadblock_ids,
+            neighbor_agents_current,
+            map_api,
+            ego_x,
+            ego_y)
+
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
         coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
