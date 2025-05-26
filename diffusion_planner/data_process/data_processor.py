@@ -182,13 +182,17 @@ class DataProcessor(object):
 
         route_roadblock_ids = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
-        coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-            map_api, self._map_features, ego_coords, self._radius,
-            traffic_light_data)
-        vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
-                                 traffic_light_data, speed_limit, lane_route,
-                                 self._map_features, self._max_elements,
-                                 self._max_points)
+
+        (coords, traffic_light_data, speed_limit,
+         lane_route) = get_neighbor_vector_set_map(map_api, self._map_features,
+                                                   ego_coords, self._radius,
+                                                   traffic_light_data)
+        vector_map, lane_on_raw_npc_routes = map_process(
+            route_roadblock_ids, near_token_to_route_roadblock_ids,
+            near_token_to_raw_route_roadblock_ids, near_agents_current,
+            anchor_ego_state, coords, traffic_light_data, speed_limit,
+            lane_route, self._map_features, self._max_elements,
+            self._max_points)
 
         data = {
             "neighbor_agents_past":
