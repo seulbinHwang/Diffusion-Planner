@@ -7,7 +7,7 @@ Categories:
     2. Get maps array for model input
 """
 
-from typing import List, Dict, Tuple, Set
+from typing import List, Dict, Tuple, Set, Optional
 import numpy as np
 from shapely import LineString
 
@@ -532,20 +532,22 @@ def map_process(
                 None)
 
             if feature_name == 'LANE':
-                coords, left_coords, right_coords, tl_data, avails, lane_has_speed_limit_array, lane_speed_limit_array, lane_routes = _convert_lane_to_fixed_size(
-                    anchor_ego_state,
-                    feature_coords,
-                    speed_limit,
-                    lane_route,
-                    list_array_data[f"coords.LEFT_BOUNDARY"],
-                    list_array_data[f"coords.RIGHT_BOUNDARY"],
-                    feature_tl_data,
-                    max_elements[feature_name],
-                    max_points[feature_name],
-                    traffic_light_encoding_dim if feature_name in [
-                        VectorFeatureLayer.LANE.name,
-                    ] else None,
-                )
+                (coords, left_coords, right_coords, tl_data, avails,
+                 lane_has_speed_limit_array, lane_speed_limit_array,
+                 lane_routes) = _convert_lane_to_fixed_size(
+                     anchor_ego_state,
+                     feature_coords,
+                     speed_limit,
+                     lane_route,
+                     list_array_data[f"coords.LEFT_BOUNDARY"],
+                     list_array_data[f"coords.RIGHT_BOUNDARY"],
+                     feature_tl_data,
+                     max_elements[feature_name],
+                     max_points[feature_name],
+                     traffic_light_encoding_dim if feature_name in [
+                         VectorFeatureLayer.LANE.name,
+                     ] else None,
+                 )
                 left_coords = vector_set_coordinates_to_local_frame(
                     left_coords, avails, anchor_ego_state)
                 right_coords = vector_set_coordinates_to_local_frame(
@@ -600,6 +602,7 @@ def map_process(
                 f'vector_set_map.traffic_light_data.{feature_name}']
             avails = array_output[
                 f'vector_set_map.availabilities.{feature_name}']
+            # vector_map_lanes: (70, 20 , 12)
             vector_map_lanes = _lane_polyline_process(polylines, left_boundary,
                                                       right_boundary, avails,
                                                       traffic_light_state)
@@ -638,6 +641,10 @@ def map_process(
                          'lanes_has_speed_limit': lane_has_speed_limit_array, \
                          'route_lanes': vector_map_route_lanes,
                          'route_lanes_speed_limit': route_lanes_speed_limit,
-                         'route_lanes_has_speed_limit': route_lanes_has_speed_limit}
+                         'route_lanes_has_speed_limit': route_lanes_has_speed_limit,
+                         'npc_route_lanes': vector_map_npc_route_lanes,
+                            'npc_route_lanes_speed_limit': npc_route_lanes_speed_limit,
+                            'npc_route_lanes_has_speed_limit': npc_route_lanes_has_speed_limit,
+                         }
 
-    return vector_map_output
+    return vector_map_output, lane_on_raw_npc_routes

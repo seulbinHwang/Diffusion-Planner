@@ -1,6 +1,8 @@
+from typing import Optional, Dict, List
 import numpy as np
 from tqdm import tqdm
-
+from types import SimpleNamespace
+from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.state_representation import Point2D
 
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
@@ -10,6 +12,11 @@ from diffusion_planner.data_process.agent_process import (
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
 from diffusion_planner.data_process.ego_process import get_ego_past_array_from_scenario, get_ego_future_array_from_scenario, calculate_additional_ego_states
 from diffusion_planner.data_process.utils import convert_to_model_inputs
+import os
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.patches import Polygon
+from nuplan.common.maps.abstract_map import AbstractMap
 
 
 class DataProcessor(object):
@@ -30,7 +37,8 @@ class DataProcessor(object):
         self.num_static = config.static_objects_num
         self.max_ped_bike = 10  # Limit the number of pedestrians and bicycles in the agent.
         self._radius = 100  # [m] query radius scope relative to the current pose.
-
+        self.predicted_neighbor_num = config.predicted_neighbor_num
+        self.step_index = 0
         self._map_features = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
@@ -46,7 +54,6 @@ class DataProcessor(object):
             'RIGHT_BOUNDARY': config.lane_len,
             'ROUTE_LANES': config.route_len
         }  # maximum number of points per feature to extract per feature layer.
-
 
     def _extract_near_agents(
         self, agents_token: List[Optional[str]], observation_buffer,
@@ -111,14 +118,15 @@ class DataProcessor(object):
                 near_agent_tokens)
 
     # Use for inference
-    def observation_adapter(self,
-                            history_buffer,
-                            traffic_light_data,
-                            map_api,
-                            route_roadblock_ids,
-                            npc_route_roadblock_ids,
-                            tokens_to_position, # TODO: 디버깅 용으로, 추후 삭제
-                            device='cpu'):
+    def observation_adapter(
+            self,
+            history_buffer,
+            traffic_light_data,
+            map_api,
+            route_roadblock_ids,
+            npc_route_roadblock_ids: Dict[str, Optional[List[str]]],
+            tokens_to_position,  # TODO: 디버깅 용으로, 추후 삭제
+            device='cpu'):
         '''
         ego
         '''
@@ -431,14 +439,18 @@ class DataProcessor(object):
             sampled_past_observations = past_tracked_objects + [
                 present_tracked_objects
             ]
-            neighbor_agents_past, neighbor_agents_types = \
+            (neighbor_agents_past, neighbor_agents_types, _) = \
                 sampled_tracked_objects_to_array_list(sampled_past_observations)
 
             static_objects, static_objects_types = sampled_static_objects_to_array_list(
                 present_tracked_objects)
-
-            ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects = \
-                agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+            # TODO: 위 수정에 맞게 같이 수정해야함
+            (ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects, _ )= \
+                agent_past_process(ego_agent_past, neighbor_agents_past,
+                                   neighbor_agents_types, self.num_agents,
+                                   static_objects, static_objects_types,
+                                   self.num_static, self.max_ped_bike,
+                                   anchor_ego_state)
             '''
             Map
             '''
@@ -476,8 +488,9 @@ class DataProcessor(object):
 
             sampled_future_observations = [present_tracked_objects
                                           ] + future_tracked_objects
-            future_tracked_objects_array_list, _ = sampled_tracked_objects_to_array_list(
-                sampled_future_observations)
+            (future_tracked_objects_array_list, _,
+             _) = sampled_tracked_objects_to_array_list(
+                 sampled_future_observations)
             neighbor_agents_future = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
                 self.num_agents, neighbor_indices)
