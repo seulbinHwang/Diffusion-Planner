@@ -76,6 +76,9 @@ class DiffusionPlanner(AbstractPlanner):
         """
         self._map_api = initialization.map_api
         self._route_roadblock_ids = initialization.route_roadblock_ids
+        self._npc_route_roadblock_ids = initialization.npc_route_roadblock_ids
+        # TODO: 디버깅용 변수
+        self._tokens_to_position = initialization.tokens_to_position
 
         if self._ckpt_path is not None:
             state_dict: Dict = torch.load(self._ckpt_path,
@@ -106,7 +109,10 @@ class DiffusionPlanner(AbstractPlanner):
         traffic_light_data = list(planner_input.traffic_light_data)
         model_inputs = self.data_processor.observation_adapter(
             history, traffic_light_data, self._map_api,
-            self._route_roadblock_ids, self._device)
+            self._route_roadblock_ids,
+            self._npc_route_roadblock_ids,
+            self._tokens_to_position,
+            self._device)
 
         return model_inputs
 

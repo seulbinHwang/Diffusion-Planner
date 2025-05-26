@@ -50,6 +50,8 @@ class DataProcessor(object):
                             traffic_light_data,
                             map_api,
                             route_roadblock_ids,
+                            npc_route_roadblock_ids,
+                            tokens_to_position, # TODO: 디버깅 용으로, 추후 삭제
                             device='cpu'):
         '''
         ego
@@ -62,6 +64,25 @@ class DataProcessor(object):
             ego_state.rear_axle.heading
         ],
                                     dtype=np.float64)
+        # tokens_to_position: Dict[str, Optional[np.ndarray]] w.r.t. world coordinates
+        # TODO: change from world coordinates to ego coordinates
+        ego_x, ego_y, ego_yaw = anchor_ego_state
+        c, s = np.cos(ego_yaw), np.sin(ego_yaw)
+        # Rotation matrix to go from world → ego frame: R(-yaw)
+        # TODO: 디버깅 용으로, 추후 삭제
+        R = np.array([[c, s], [-s, c]])
+        tokens_to_position_ego: Dict[str, Optional[np.ndarray]] = {}
+        for token, pos in tokens_to_position.items():
+            if pos is None:
+                tokens_to_position_ego[token] = None
+            else:
+                # pos may be shape (2,) or (N,2)
+                shifted = pos - np.array([ego_x, ego_y])
+                # apply rotation: world → ego
+                if shifted.ndim == 1:
+                    tokens_to_position_ego[token] = R.dot(shifted)
+                else:
+                    tokens_to_position_ego[token] = shifted.dot(R.T)
         '''
         neighbor
         '''
