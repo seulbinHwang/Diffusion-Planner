@@ -259,6 +259,7 @@ def route_roadblock_correction(
     route_roadblock_ids: List[str],
     search_depth_backward: int = 15,
     search_depth_forward: int = 30,
+    remove_route_loops_flag: bool = True,
 ) -> List[str]:
     """
     Applies several methods to correct route roadblocks.
@@ -348,8 +349,9 @@ def route_roadblock_correction(
         offset += len(path)
 
     # Fix 3: cut route-loops
-    route_roadblocks, route_roadblock_ids = remove_route_loops(
-        route_roadblocks, route_roadblock_ids)
+    if remove_route_loops_flag:
+        route_roadblocks, route_roadblock_ids = remove_route_loops(
+            route_roadblocks, route_roadblock_ids)
 
     return route_roadblock_ids
 

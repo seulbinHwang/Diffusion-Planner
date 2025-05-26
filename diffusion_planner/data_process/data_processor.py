@@ -91,7 +91,10 @@ class DataProcessor(object):
                 npc_state = SimpleNamespace(rear_axle=point)
                 near_token_to_route_roadblock_ids[
                     token] = route_roadblock_correction(
-                        npc_state, map_api, a_npc_route_roadblock_ids)
+                        npc_state,
+                        map_api,
+                        a_npc_route_roadblock_ids,
+                        remove_route_loops_flag=False)
 
             # 상태 및 토큰 저장
             near_agents_current.append(neighbor_agents_current[agent_idx])
