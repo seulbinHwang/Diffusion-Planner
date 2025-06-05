@@ -135,11 +135,14 @@ class DataProcessor(object):
             neighbor_agents_past, neighbor_agents_types = \
                 sampled_tracked_objects_to_array_list(sampled_past_observations)
 
-            static_objects, static_objects_types = sampled_static_objects_to_array_list(
-                present_tracked_objects)
+            (static_objects, static_objects_types
+            ) = sampled_static_objects_to_array_list(present_tracked_objects)
 
-            ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects = \
-                agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+            (ego_agent_past, neighbor_agents_past,
+             neighbor_indices, static_objects) = agent_past_process(
+                 ego_agent_past, neighbor_agents_past, neighbor_agents_types,
+                 self.num_agents, static_objects, static_objects_types,
+                 self.num_static, self.max_ped_bike, anchor_ego_state)
             '''
             Map
             '''
@@ -151,9 +154,11 @@ class DataProcessor(object):
                 route_roadblock_ids = route_roadblock_correction(
                     ego_state, map_api, route_roadblock_ids)
 
-            coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-                map_api, self._map_features, ego_coords, self._radius,
-                traffic_light_data)
+            (coords, traffic_light_data, speed_limit,
+             lane_route) = get_neighbor_vector_set_map(map_api,
+                                                       self._map_features,
+                                                       ego_coords, self._radius,
+                                                       traffic_light_data)
 
             vector_map = map_process(route_roadblock_ids, anchor_ego_state,
                                      coords, traffic_light_data, speed_limit,
@@ -177,8 +182,9 @@ class DataProcessor(object):
 
             sampled_future_observations = [present_tracked_objects
                                           ] + future_tracked_objects
-            future_tracked_objects_array_list, _ = sampled_tracked_objects_to_array_list(
-                sampled_future_observations)
+            (future_tracked_objects_array_list,
+             _) = sampled_tracked_objects_to_array_list(
+                 sampled_future_observations)
             neighbor_agents_future = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
                 self.num_agents, neighbor_indices)
