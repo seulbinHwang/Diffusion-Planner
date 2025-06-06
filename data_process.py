@@ -184,6 +184,8 @@ if __name__ == "__main__":
 
     # 10) 최종적으로 만들어진 파일 목록 저장
     npz_files = [f for f in os.listdir(args.save_path) if f.endswith('.npz')]
-    with open('./diffusion_planner_training.json', 'w') as json_file:
+    with open(
+            '/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json',
+            'w') as json_file:
         json.dump(npz_files, json_file, indent=4)
     print(f"Saved {len(npz_files)} .npz file names")
