@@ -141,7 +141,7 @@ if __name__ == "__main__":
         log_names = json.load(f)
 
     # 3-1) 깨진 로그 목록 읽어 제외  ### NEW
-    bad_logs_path = os.path.join(args.data_path, "bad_logs.json")
+    bad_logs_path = os.path.join(args.data_path, "bad_db.json")
     if os.path.exists(bad_logs_path):
         with open(bad_logs_path) as f:
             bad_logs = set(json.load(f))
