@@ -192,23 +192,23 @@ if __name__ == "__main__":
         args_list = [(args, sc) for sc in remaining]
         batch_size = 32
 
-        for batch_start in range(0, len(args_list), batch_size):
-            batch = args_list[batch_start:batch_start + batch_size]
+        # 외부 루프에만 tqdm 적용
+        for batch_start in tqdm(
+                range(0, len(args_list), batch_size),
+                desc="Processing batches",
+                unit="batch",
+        ):
+            batch = args_list[batch_start: batch_start + batch_size]
+
             # 1) 현재 배치 태스크 예약
             futures = [
                 worker.submit(Task(process_single_scenario), cfg_and_scn)
                 for cfg_and_scn in batch
             ]
 
-            # 2) 배치 완료까지 대기하며 진행바 표시
-            for fut in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f"Processing scenarios [{batch_start+1}-{batch_start+len(batch)}]",
-                unit="sc",
-            ):
+            # 2) 배치 완료까지 대기 (내부 tqdm 제거)
+            for fut in as_completed(futures):
                 fut.result()  # 예외가 있으면 여기서 터트려 줍니다
-
     else:
         print("새로 처리할 시나리오가 없습니다.")
 
