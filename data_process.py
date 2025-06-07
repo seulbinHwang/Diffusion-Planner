@@ -101,7 +101,7 @@ if __name__ == "__main__":
                         help='limit total number of scenarios')
     parser.add_argument('--shuffle_scenarios',
                         type=bool,
-                        default=True,
+                        default=False,
                         help='shuffle scenarios')
     parser.add_argument('--agent_num',
                         type=int,
@@ -185,7 +185,7 @@ if __name__ == "__main__":
     ]
     print(f"processed: {len(remaining)}")
     print(f"Remaining to process: {len(remaining)}")
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=1)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=8)
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
