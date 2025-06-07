@@ -11,7 +11,7 @@ from nuplan.planning.utils.multithreading.worker_parallel import SingleMachinePa
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.utils.multithreading.worker_pool import Task
-from concurrent.futures import as_completed   # NEW
+from concurrent.futures import as_completed  # NEW
 
 
 def get_filter_parameters(num_scenarios_per_type=None,
@@ -40,10 +40,9 @@ def get_filter_parameters(num_scenarios_per_type=None,
 
     return (scenario_types, scenario_tokens, log_names, map_names,
             num_scenarios_per_type, limit_total_scenarios,
-            timestamp_threshold_s, ego_displacement_minimum_m,
-            expand_scenarios, remove_invalid_goals, shuffle,
-            ego_start_speed_threshold, ego_stop_speed_threshold,
-            speed_noise_tolerance)
+            timestamp_threshold_s, ego_displacement_minimum_m, expand_scenarios,
+            remove_invalid_goals, shuffle, ego_start_speed_threshold,
+            ego_stop_speed_threshold, speed_noise_tolerance)
 
 
 def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
@@ -64,10 +63,12 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
         processor.work([scenario])  # 내부에서 save_to_disk가 호출되어 .npz 파일 생성됨
 
         # 3) 파일이 정상적으로 만들어졌는지 간단히 검사
-        if os.path.exists(final_filepath) and os.path.getsize(final_filepath) == 0:
+        if os.path.exists(final_filepath) and os.path.getsize(
+                final_filepath) == 0:
             # 완전히 쓰이지 않은 빈 파일이므로 삭제
             os.remove(final_filepath)
-            raise RuntimeError(f"Scenario {scenario.map_name}_{scenario.token}: 생성된 파일이 비어있음")
+            raise RuntimeError(
+                f"Scenario {scenario.map_name}_{scenario.token}: 생성된 파일이 비어있음")
 
     except Exception:
         # 4) 예외 발생 시, 미완성된 .npz 파일이 있으면 삭제하고 예외를 전파
@@ -134,7 +135,11 @@ if __name__ == "__main__":
     os.makedirs(args.save_path, exist_ok=True)
 
     # 2) 이미 생성된 .npz 확인
-    processed = {f.replace('.npz', '') for f in os.listdir(args.save_path) if f.endswith('.npz')}
+    processed = {
+        f.replace('.npz', '')
+        for f in os.listdir(args.save_path)
+        if f.endswith('.npz')
+    }
 
     # 3) 학습에 쓸 로그 이름 읽기
     with open('./nuplan_train.json', encoding="utf-8") as f:
@@ -155,42 +160,46 @@ if __name__ == "__main__":
 
     # 4) 시나리오 빌더
     map_version = "nuplan-maps-v1.0"
-    builder = NuPlanScenarioBuilder(args.data_path, args.map_path,
-                                    sensor_root=None, db_files=None,
+    builder = NuPlanScenarioBuilder(args.data_path,
+                                    args.map_path,
+                                    sensor_root=None,
+                                    db_files=None,
                                     map_version=map_version)
-    print("a")
-
-    scenario_filter = ScenarioFilter(
-        *get_filter_parameters(
-            args.scenarios_per_type,
-            args.total_scenarios,
-            args.shuffle_scenarios,
-            log_names=log_names           # 깨진 로그가 빠진 목록
-        )
-    )
-    print("b")
+    scenario_filter = ScenarioFilter(*get_filter_parameters(
+        args.scenarios_per_type,
+        args.total_scenarios,
+        args.shuffle_scenarios,
+        log_names=log_names  # 깨진 로그가 빠진 목록
+    ))
     # 5) 시나리오 생성
     worker = SingleMachineParallelExecutor(use_process_pool=True)
     scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
     print(f"Total scenarios after filtering: {len(scenarios)}")
 
     # 6) 아직 안 한 시나리오만
-    remaining = [s for s in scenarios if
-                 f"{s._map_name}_{s.token}" not in processed]
+    remaining = [
+        s for s in scenarios if f"{s._map_name}_{s.token}" not in processed
+    ]
     print(f"Remaining to process: {len(remaining)}")
 
-    # 7) 병렬 처리 + 실시간 완료율 표시  ──────────────────────
+    # 7) 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
         args_list = [(args, sc) for sc in remaining]
-        worker = SingleMachineParallelExecutor(use_process_pool=True)
 
-        futures = worker._executor.map(Task(process_single_scenario).fn,
-                                       args_list)  # 원래 map 그대로
-        for _ in tqdm(as_completed(futures),
-                      total=len(args_list),
-                      desc="Processing scenarios",
-                      unit="sc"):
-            pass
+        # worker.submit 을 써서 모든 태스크를 한 번에 예약
+        futures = [
+            worker.submit(Task(process_single_scenario), cfg_and_scn)
+            for cfg_and_scn in args_list
+        ]
+
+        # 끝난 순서대로 as_completed + tqdm 로 진행바
+        for fut in tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Processing scenarios",
+            unit="sc",
+        ):
+            fut.result()   # 예외가 있으면 여기서 터트려 줍니다
     else:
         print("새로 처리할 시나리오가 없습니다.")
 
