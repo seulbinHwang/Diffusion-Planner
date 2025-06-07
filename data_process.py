@@ -180,10 +180,10 @@ if __name__ == "__main__":
     b = f"{a._map_name}_{a.token}"
     print(f"b: {b}")
     # 6) 아직 안 한 시나리오만
+    print(f"processed: {len(processed)}")
     remaining = [
         s for s in scenarios if f"{s._map_name}_{s.token}" not in processed
     ]
-    print(f"processed: {len(remaining)}")
     print(f"Remaining to process: {len(remaining)}")
     worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=16)
 
