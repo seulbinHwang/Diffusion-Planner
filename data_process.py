@@ -185,20 +185,24 @@ if __name__ == "__main__":
     ]
     print(f"processed: {len(remaining)}")
     print(f"Remaining to process: {len(remaining)}")
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=8)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=16)
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
         args_list = [(args, sc) for sc in remaining]
         batch_size = 32
+        # 전체 배치 개수
+        num_batches = (len(args_list) + batch_size - 1) // batch_size
 
-        # 외부 루프에만 tqdm 적용
-        for batch_start in tqdm(
-                range(0, len(args_list), batch_size),
+        # 배치 단위로 진행 상황 표시
+        for batch_idx in tqdm(
+                range(num_batches),
+                total=num_batches,
                 desc="Processing batches",
                 unit="batch",
         ):
-            batch = args_list[batch_start: batch_start + batch_size]
+            start = batch_idx * batch_size
+            batch = args_list[start: start + batch_size]
 
             # 1) 현재 배치 태스크 예약
             futures = [
@@ -206,9 +210,10 @@ if __name__ == "__main__":
                 for cfg_and_scn in batch
             ]
 
-            # 2) 배치 완료까지 대기 (내부 tqdm 제거)
+            # 2) 배치 완료까지 대기
             for fut in as_completed(futures):
-                fut.result()  # 예외가 있으면 여기서 터트려 줍니다
+                fut.result()
+
     else:
         print("새로 처리할 시나리오가 없습니다.")
 
