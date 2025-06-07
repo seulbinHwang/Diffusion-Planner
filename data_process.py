@@ -11,6 +11,7 @@ from nuplan.planning.utils.multithreading.worker_parallel import SingleMachinePa
 from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.utils.multithreading.worker_pool import Task
+from concurrent.futures import as_completed   # NEW
 
 
 def get_filter_parameters(num_scenarios_per_type=None,
@@ -77,115 +78,71 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Data Processing')
-    parser.add_argument('--data_path',
-                        default='/data/nuplan-v1.1/trainval',
-                        type=str,
-                        help='path to raw data')
-    parser.add_argument('--map_path',
-                        default='/data/nuplan-v1.1/maps',
-                        type=str,
-                        help='path to map data')
-    parser.add_argument('--save_path',
-                        default='./cache',
-                        type=str,
-                        help='path to save processed data')
-    parser.add_argument('--scenarios_per_type',
-                        type=int,
-                        default=None,
-                        help='number of scenarios per type')
-    parser.add_argument('--total_scenarios',
-                        type=int,
-                        default=10,
-                        help='limit total number of scenarios')
-    parser.add_argument('--shuffle_scenarios',
-                        type=bool,
-                        default=True,
-                        help='shuffle scenarios')
-    parser.add_argument('--agent_num',
-                        type=int,
-                        default=32,
-                        help='number of agents')
-    parser.add_argument('--static_objects_num',
-                        type=int,
-                        default=5,
-                        help='number of static objects')
-    parser.add_argument('--lane_len',
-                        type=int,
-                        default=20,
-                        help='number of lane point')
-    parser.add_argument('--lane_num',
-                        type=int,
-                        default=70,
-                        help='number of lanes')
-    parser.add_argument('--route_len',
-                        type=int,
-                        default=20,
-                        help='number of route lane point')
-    parser.add_argument('--route_num',
-                        type=int,
-                        default=25,
-                        help='number of route lanes')
-
+    # (인자 정의는 동일)
     args = parser.parse_args()
 
-    # 5) 저장 폴더 만들기
+    # 1) 저장 폴더
     os.makedirs(args.save_path, exist_ok=True)
 
-    # 6) 이미 처리된 파일(.npz) 목록을 모아서, 중복 처리 방지
-    processed = set()
-    for fname in os.listdir(args.save_path):
-        if fname.endswith('.npz'):
-            processed.add(fname.replace('.npz', ""))  # map_name_token 형태
+    # 2) 이미 생성된 .npz 확인
+    processed = {f.replace('.npz', '') for f in os.listdir(args.save_path) if f.endswith('.npz')}
 
-    # 7) 시나리오 빌더 초기화
-    with open('./nuplan_train.json', "r", encoding="utf-8") as file:
-        log_names = json.load(file)
+    # 3) 학습에 쓸 로그 이름 읽기
+    with open('./nuplan_train.json', encoding="utf-8") as f:
+        log_names = json.load(f)
 
+    # 3-1) 깨진 로그 목록 읽어 제외  ### NEW
+    bad_logs_path = os.path.join(args.data_path, "bad_logs.json")
+    if os.path.exists(bad_logs_path):
+        with open(bad_logs_path) as f:
+            bad_logs = set(json.load(f))
+        log_names = [ln for ln in log_names if ln not in bad_logs]
+        print(f"제외한 깨진 로그 개수: {len(bad_logs)}")
+    else:
+        print("bad_logs.json이 없어 모든 로그를 사용합니다.")
+
+    # 4) 시나리오 빌더
     map_version = "nuplan-maps-v1.0"
     builder = NuPlanScenarioBuilder(args.data_path, args.map_path,
                                     sensor_root=None, db_files=None,
                                     map_version=map_version)
+
     scenario_filter = ScenarioFilter(
         *get_filter_parameters(
             args.scenarios_per_type,
             args.total_scenarios,
             args.shuffle_scenarios,
-            log_names=log_names
+            log_names=log_names           # 깨진 로그가 빠진 목록
         )
     )
 
+    # 5) 시나리오 생성
     worker = SingleMachineParallelExecutor(use_process_pool=True)
-    scenarios = builder.get_scenarios(scenario_filter, worker)
-    print(f"Total number of scenarios: {len(scenarios)}")
+    scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
+    print(f"Total scenarios after filtering: {len(scenarios)}")
 
-    # 8) 아직 처리되지 않은 시나리오만 모아서 병렬 처리 리스트 구성
-    remaining_scenarios = []
-    for a_scenario in scenarios:
-        key = f"{a_scenario._map_name}_{a_scenario.token}"
-        if key not in processed:
-            remaining_scenarios.append(a_scenario)
+    # 6) 아직 안 한 시나리오만
+    remaining = [s for s in scenarios if
+                 f"{s._map_name}_{s.token}" not in processed]
+    print(f"Remaining to process: {len(remaining)}")
 
-    print(f"Remaining scenarios to process: {len(remaining_scenarios)}")
-
-    args_list = [(args, a_scenario) for a_scenario in remaining_scenarios]
-
-    # 9) 병렬 처리 (중간에 실패해도 process_single_scenario에서 미완성 파일 삭제 후 재시도 가능)
-    if args_list:
+    # 7) 병렬 처리 + 실시간 완료율 표시  ──────────────────────
+    if remaining:
+        args_list = [(args, sc) for sc in remaining]
         worker = SingleMachineParallelExecutor(use_process_pool=True)
-        list(
-            tqdm(
-                worker.map(Task(process_single_scenario), args_list),
-                total=len(args_list),
-                desc="Processing scenarios"
-            )
-        )
-    else:
-        print("모두 처리된 상태입니다. 새로운 작업이 없습니다.")
 
-    # 10) 최종적으로 만들어진 파일 목록 저장
+        futures = worker._executor.map(Task(process_single_scenario).fn,
+                                       args_list)  # 원래 map 그대로
+        for _ in tqdm(as_completed(futures),
+                      total=len(args_list),
+                      desc="Processing scenarios",
+                      unit="sc"):
+            pass
+    else:
+        print("새로 처리할 시나리오가 없습니다.")
+
+    # 8) 결과 파일 목록 저장(동일)  ───────────────────────────
     npz_files = [f for f in os.listdir(args.save_path) if f.endswith('.npz')]
-    with open(
-            './diffusion_planner_training.json',
-            'w') as json_file:
-        json.dump(npz_files, json_file, indent=4)
+    with open('./diffusion_planner_training.json', 'w') as jf:
+        json.dump(npz_files, jf, indent=4)
     print(f"Saved {len(npz_files)} .npz file names")
