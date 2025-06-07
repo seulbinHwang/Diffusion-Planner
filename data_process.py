@@ -78,6 +78,55 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Data Processing')
+    parser.add_argument('--data_path',
+                        default='/data/nuplan-v1.1/trainval',
+                        type=str,
+                        help='path to raw data')
+    parser.add_argument('--map_path',
+                        default='/data/nuplan-v1.1/maps',
+                        type=str,
+                        help='path to map data')
+    parser.add_argument('--save_path',
+                        default='./cache',
+                        type=str,
+                        help='path to save processed data')
+    parser.add_argument('--scenarios_per_type',
+                        type=int,
+                        default=None,
+                        help='number of scenarios per type')
+    parser.add_argument('--total_scenarios',
+                        type=int,
+                        default=10,
+                        help='limit total number of scenarios')
+    parser.add_argument('--shuffle_scenarios',
+                        type=bool,
+                        default=True,
+                        help='shuffle scenarios')
+    parser.add_argument('--agent_num',
+                        type=int,
+                        default=32,
+                        help='number of agents')
+    parser.add_argument('--static_objects_num',
+                        type=int,
+                        default=5,
+                        help='number of static objects')
+    parser.add_argument('--lane_len',
+                        type=int,
+                        default=20,
+                        help='number of lane point')
+    parser.add_argument('--lane_num',
+                        type=int,
+                        default=70,
+                        help='number of lanes')
+    parser.add_argument('--route_len',
+                        type=int,
+                        default=20,
+                        help='number of route lane point')
+    parser.add_argument('--route_num',
+                        type=int,
+                        default=25,
+                        help='number of route lanes')
+
     # (인자 정의는 동일)
     args = parser.parse_args()
 
