@@ -4,9 +4,7 @@ import json
 import numpy as np
 from tqdm import tqdm
 from typing import Any, Tuple
-import sqlite3
-from pathlib import Path
-from tqdm import tqdm
+
 from diffusion_planner.data_process.data_processor import DataProcessor
 
 from nuplan.planning.utils.multithreading.worker_parallel import SingleMachineParallelExecutor
@@ -47,24 +45,6 @@ def get_filter_parameters(num_scenarios_per_type=None,
             ego_start_speed_threshold, ego_stop_speed_threshold,
             speed_noise_tolerance)
 
-
-def scan_bad_logs(data_root: str) -> set[str]:
-    """
-    data_root 아래 모든 .db 파일을 quick_check로 검사해,
-    손상된 DB의 stem(log_name) 집합을 반환합니다.
-    """
-    bad = set()
-    db_files = list(Path(data_root).rglob("*.db"))
-    for db in tqdm(db_files, desc="quick_check", unit="db"):
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-            ok = con.execute("PRAGMA quick_check;").fetchone()[0] == "ok"
-            con.close()
-            if not ok:
-                bad.add(db.stem)
-        except sqlite3.DatabaseError:
-            bad.add(db.stem)
-    return bad
 
 def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
     """
@@ -159,20 +139,16 @@ if __name__ == "__main__":
     # 3) 학습에 쓸 로그 이름 읽기
     with open('./nuplan_train.json', encoding="utf-8") as f:
         log_names = json.load(f)
-    # ── bad_logs.json 자동 관리
-    bad_json = os.path.join(args.data_path, "bad_logs.json")
-    if os.path.exists(bad_json):
-        bad_logs = set(json.load(open(bad_json)))
-        print(f"불러온 깨진 로그: {len(bad_logs)} 개")
+
+    # 3-1) 깨진 로그 목록 읽어 제외  ### NEW
+    bad_logs_path = os.path.join(args.data_path, "bad_logs.json")
+    if os.path.exists(bad_logs_path):
+        with open(bad_logs_path) as f:
+            bad_logs = set(json.load(f))
+        log_names = [ln for ln in log_names if ln not in bad_logs]
+        print(f"제외한 깨진 로그 개수: {len(bad_logs)}")
     else:
-        bad_logs = scan_bad_logs(args.data_path)
-        json.dump(list(bad_logs), open(bad_json, "w"), indent=2)
-        print(f"bad_logs.json 생성: {len(bad_logs)} 개")
-
-    # 깨진 로그 제외
-    log_names = [ln for ln in log_names if ln not in bad_logs]
-    print(f"사용할 로그 수: {len(log_names)} (깨진 {len(bad_logs)}개 제외)")
-
+        print("bad_logs.json이 없어 모든 로그를 사용합니다.")
 
     # 4) 시나리오 빌더
     map_version = "nuplan-maps-v1.0"
