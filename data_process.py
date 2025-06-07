@@ -172,14 +172,18 @@ if __name__ == "__main__":
         log_names=log_names  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=4)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=1)
     scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
     print(f"Total scenarios after filtering: {len(scenarios)}")
-
+    a = scenarios[0]
+    print("a:", a)
+    b = f"{a._map_name}_{a.token}"
+    print(f"b: {b}")
     # 6) 아직 안 한 시나리오만
     remaining = [
         s for s in scenarios if f"{s._map_name}_{s.token}" not in processed
     ]
+    print("processed:", processed)
     print(f"Remaining to process: {len(remaining)}")
 
     # 7) 병렬 처리 + 실시간 완료율 표시 ──────────────────────
