@@ -148,13 +148,14 @@ if __name__ == "__main__":
         log_names = [ln for ln in log_names if ln not in bad_logs]
         print(f"제외한 깨진 로그 개수: {len(bad_logs)}")
     else:
-        print("bad_logs.json이 없어 모든 로그를 사용합니다.")
+        print("bad_db.json이 없어 모든 로그를 사용합니다.")
 
     # 4) 시나리오 빌더
     map_version = "nuplan-maps-v1.0"
     builder = NuPlanScenarioBuilder(args.data_path, args.map_path,
                                     sensor_root=None, db_files=None,
                                     map_version=map_version)
+    print("a")
 
     scenario_filter = ScenarioFilter(
         *get_filter_parameters(
@@ -164,7 +165,7 @@ if __name__ == "__main__":
             log_names=log_names           # 깨진 로그가 빠진 목록
         )
     )
-
+    print("b")
     # 5) 시나리오 생성
     worker = SingleMachineParallelExecutor(use_process_pool=True)
     scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
