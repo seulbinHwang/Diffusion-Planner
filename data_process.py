@@ -185,7 +185,7 @@ if __name__ == "__main__":
         s for s in scenarios if f"{s._map_name}_{s.token}" not in processed
     ]
     print(f"Remaining to process: {len(remaining)}")
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=16)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=32)
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
