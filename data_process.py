@@ -135,11 +135,14 @@ if __name__ == "__main__":
     os.makedirs(args.save_path, exist_ok=True)
 
     # 2) 이미 생성된 .npz 확인
-    processed = {
-        f.replace('.npz', '')
-        for f in os.listdir(args.save_path)
-        if f.endswith('.npz')
-    }
+    processed = set()
+    with os.scandir(args.save_path) as it:
+        for entry in it:
+            name = entry.name
+            # .npz 끝나는 것만
+            if name.endswith('.npz'):
+                # replace 대신 슬라이싱: 조금 더 빠름
+                processed.add(name[:-4])
 
     # 3) 학습에 쓸 로그 이름 읽기
     with open('./nuplan_train.json', encoding="utf-8") as f:
@@ -175,17 +178,21 @@ if __name__ == "__main__":
     worker = SingleMachineParallelExecutor(use_process_pool=True)
     scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
     print(f"Total scenarios after filtering: {len(scenarios)}")
-    a = scenarios[0]
-    print("a:", a)
-    b = f"{a._map_name}_{a.token}"
-    print(f"b: {b}")
-    # 6) 아직 안 한 시나리오만
+
+    #######
+    # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
     print(f"processed: {len(processed)}")
-    remaining = [
-        s for s in scenarios if f"{s._map_name}_{s.token}" not in processed
-    ]
+    # 6-1) ID → 시나리오 객체 매핑
+    scenario_id_map = {
+        f"{s._map_name}_{s.token}": s
+        for s in scenarios
+    }
+    # 6-2) processed와 차집합 연산
+    remaining_ids = scenario_id_map.keys() - processed
+    # 6-3) 최종 리스트
+    remaining = [scenario_id_map[token] for token in remaining_ids]
     print(f"Remaining to process: {len(remaining)}")
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=24)
+
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
