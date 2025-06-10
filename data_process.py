@@ -192,13 +192,13 @@ if __name__ == "__main__":
     # 6-3) 최종 리스트
     remaining = [scenario_id_map[token] for token in remaining_ids]
     print(f"Remaining to process: {len(remaining)}")
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=12)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=24)
 
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
         args_list = [(args, sc) for sc in remaining]
-        batch_size = 12
+        batch_size = 24
         # 전체 배치 개수
         num_batches = (len(args_list) + batch_size - 1) // batch_size
 
