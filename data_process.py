@@ -68,7 +68,7 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
             # 완전히 쓰이지 않은 빈 파일이므로 삭제
             os.remove(final_filepath)
             raise RuntimeError(
-                f"Scenario {scenario.map_name}_{scenario.token}: 생성된 파일이 비어있음")
+                f"Scenario {scenario._map_name}_{scenario.token}: 생성된 파일이 비어있음")
 
     except Exception:
         # 4) 예외 발생 시, 미완성된 .npz 파일이 있으면 삭제하고 예외를 전파
@@ -185,12 +185,12 @@ if __name__ == "__main__":
         s for s in scenarios if f"{s._map_name}_{s.token}" not in processed
     ]
     print(f"Remaining to process: {len(remaining)}")
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=32)
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=24)
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
         args_list = [(args, sc) for sc in remaining]
-        batch_size = 32
+        batch_size = 24
         # 전체 배치 개수
         num_batches = (len(args_list) + batch_size - 1) // batch_size
 
@@ -212,7 +212,11 @@ if __name__ == "__main__":
 
             # 2) 배치 완료까지 대기
             for fut in as_completed(futures):
-                fut.result()
+                try:
+                    fut.result()
+                except Exception as e:
+                    # 로그 남기고 다음 시나리오로 넘어감
+                    print(f"[Error] {e}")
 
     else:
         print("새로 처리할 시나리오가 없습니다.")
