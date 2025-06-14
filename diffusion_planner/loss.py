@@ -53,9 +53,9 @@ def _compute_xy_yaw_losses(score: torch.Tensor, gt: torch.Tensor,
 
     return {
         'neighbor_prediction_loss_xy': neigh_xy,
-        # 'ego_planning_loss_xy': ego_xy,
+        'ego_planning_loss_xy': ego_xy,
         'neighbor_prediction_loss_yaw': neigh_yaw,
-        # 'ego_planning_loss_yaw': ego_yaw
+        'ego_planning_loss_yaw': ego_yaw
     }
 
 
