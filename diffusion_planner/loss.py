@@ -25,7 +25,7 @@ def _compute_xy_yaw_losses(score: torch.Tensor, gt: torch.Tensor,
         - 'ego_planning_loss_yaw' (float): mean abs angular error (rad) for ego.
     """
     # score[..., :2]: Tensor[B, P, T, 2] -> (x, y)
-    pred_xy = score[..., :2]
+    pred_xy = score[..., :2] # [B, P, T, 2]
     gt_xy = gt[..., :2]
     # Euclidean distance: sqrt((dx)^2 + (dy)^2)
     dist_xy = torch.sqrt(((pred_xy - gt_xy).pow(2).sum(-1)) + 1e-6)  # [B, P, T]
@@ -53,9 +53,9 @@ def _compute_xy_yaw_losses(score: torch.Tensor, gt: torch.Tensor,
 
     return {
         'neighbor_prediction_loss_xy': neigh_xy,
-        'ego_planning_loss_xy': ego_xy,
+        # 'ego_planning_loss_xy': ego_xy,
         'neighbor_prediction_loss_yaw': neigh_yaw,
-        'ego_planning_loss_yaw': ego_yaw
+        # 'ego_planning_loss_yaw': ego_yaw
     }
 
 
