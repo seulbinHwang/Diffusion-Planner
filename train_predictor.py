@@ -140,7 +140,7 @@ def get_args():
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',
-                        default=20)
+                        default=10)
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
@@ -165,7 +165,7 @@ def get_args():
     parser.add_argument('--alpha_planning_loss',
                         type=float,
                         help='coefficient of planning loss (default: 1.0)',
-                        default=0.)
+                        default=1.0)
 
     parser.add_argument('--device',
                         type=str,
@@ -376,23 +376,56 @@ def model_training(args):
                            model_ema.ema, save_best)
                 print(f"Model saved in {save_path}\n")
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
-                latest_art = wandb.Artifact(
-                    name="latest-model",
-                    type="model",
-                    metadata={"epoch": epoch + 1, "loss": train_total_loss}
-                )
+                latest_art = wandb.Artifact(name="latest-model",
+                                            type="model",
+                                            metadata={
+                                                "epoch": epoch + 1,
+                                                "loss": train_total_loss
+                                            })
+                # 로컬에 저장된 latest.pth 파일을 담아 넣는 동작
                 latest_art.add_file(os.path.join(save_path, "latest.pth"))
+                """
+이 상자(Artifact)를 W&B 서버로 전송하고, ["latest"]라는 별명을 붙여 줘요.
+별명을 쓰면, 다음에 다시 “latest”라는 이름으로 덮어써 가며 하나의 모델만 관리할 수 있습니다.
+                """
                 wandb.log_artifact(latest_art, aliases=["latest"])
+                # 이전 버전 삭제
+                api = wandb.Api()
+                # wandb.run.entity: jksg01019-naver-labs
+                # wandb.run.project: Diffusion-Planner
+                entity = wandb.run.entity
+                project = wandb.run.project
+                # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
+                current = api.artifact(
+                    f"{entity}/{project}/model/latest-model:latest")
 
+                # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
+                for v in api.artifact_versions(
+                        f"{entity}/{project}/model/latest-model"):
+                    if v.id != current.id:
+                        v.delete()
                 # ── best-model 아티팩트 (조건부 덮어쓰기) ──
                 if save_best:
-                    best_art = wandb.Artifact(
-                        name="best-model",
-                        type="model",
-                        metadata={"epoch": epoch + 1, "loss": train_total_loss}
-                    )
+                    best_art = wandb.Artifact(name="best-model",
+                                              type="model",
+                                              metadata={
+                                                  "epoch": epoch + 1,
+                                                  "loss": train_total_loss
+                                              })
                     best_art.add_file(os.path.join(save_path, "best.pth"))
                     wandb.log_artifact(best_art, aliases=["best"])
+                    # 이전 버전 삭제
+                    entity = wandb.run.entity
+                    project = wandb.run.project
+                    # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
+                    current = api.artifact(
+                        f"{entity}/{project}/model/best-model:best")
+
+                    # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
+                    for v in api.artifact_versions(
+                            f"{entity}/{project}/model/best-model"):
+                        if v.id != current.id:
+                            v.delete()
 
         scheduler.step()
         train_sampler.set_epoch(epoch + 1)
