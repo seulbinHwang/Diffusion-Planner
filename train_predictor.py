@@ -165,7 +165,7 @@ def get_args():
     parser.add_argument('--alpha_planning_loss',
                         type=float,
                         help='coefficient of planning loss (default: 1.0)',
-                        default=1.0)
+                        default=0.)
 
     parser.add_argument('--device',
                         type=str,
