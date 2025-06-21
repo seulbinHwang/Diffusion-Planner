@@ -207,7 +207,7 @@ def get_args():
                         help='path to resume model',
                         default=None)
 
-    parser.add_argument('--use_wandb', default=False, type=boolean)
+    parser.add_argument('--use_wandb', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)
 
     # distributed training parameters
