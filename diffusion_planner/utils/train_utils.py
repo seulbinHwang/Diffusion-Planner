@@ -5,6 +5,7 @@ from mmengine import fileio
 import io
 import os
 import json
+from pickle import UnpicklingError
 
 
 def openjson(path):
@@ -17,9 +18,16 @@ def opendata(path):
 
     npz_bytes = fileio.get(path)
     buff = io.BytesIO(npz_bytes)
-    npz_data = np.load(buff)
+    try:
+        npz_data = np.load(buff, allow_pickle=True)
 
-    return npz_data
+        return npz_data
+    except (EOFError, UnpicklingError):
+        print(f"[경고] 잘못된 파일 건너뜁니다: {path}")
+        # 샘플 스킵용 빈 배열을 리턴하거나,
+        # raise IndexError로 DataLoader가 다음 샘플로 넘어가게 할 수 있음
+        return None
+
 
 
 def set_seed(CUR_SEED):
