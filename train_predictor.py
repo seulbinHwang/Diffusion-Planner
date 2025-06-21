@@ -1,4 +1,6 @@
 import os
+# 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 import torch
 import argparse
 from torch import optim
@@ -227,6 +229,7 @@ def get_args():
 
 def model_training(args):
     best_loss = float('inf')
+    torch.cuda.empty_cache()
     # init ddp
     global_rank, rank, _ = ddp.ddp_setup_universal(True, args)
 
@@ -352,7 +355,8 @@ def model_training(args):
         train_loss, train_total_loss = train_epoch(train_loader,
                                                    diffusion_planner, optimizer,
                                                    args, model_ema, aug)
-
+        if args.device.startswith('cuda'):
+            torch.cuda.empty_cache()
         if global_rank == 0:
             lr_dict = {'lr': optimizer.param_groups[0]['lr']}
             wandb_logger.log_metrics(
