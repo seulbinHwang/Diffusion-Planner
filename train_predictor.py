@@ -144,7 +144,7 @@ def get_args():
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
-                        default=1024)
+                        default=512)
     parser.add_argument('--learning_rate',
                         type=float,
                         help='learning rate (default: 5e-4)',
