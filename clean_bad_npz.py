@@ -108,3 +108,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+
+chmod +x clean_bad_npz.py
+./clean_bad_npz.py \
+  --data_dir /mnt/nuplan/dataset/processed \
+  --data_list /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json
+
+"""
