@@ -142,7 +142,7 @@ def get_args():
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',
-                        default=1)
+                        default=10)
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
