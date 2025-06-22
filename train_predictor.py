@@ -401,11 +401,11 @@ def model_training(args):
                 project = wandb.run.project
                 # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
                 current = api.artifact(
-                    f"{entity}/{project}/model/latest-model:latest")
+                    f"{entity}/{project}/latest-model:latest")
 
                 # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                 for v in api.artifact_versions(
-                        f"{entity}/{project}/model/latest-model"):
+                        f"{entity}/{project}/latest-model"):
                     if v.id != current.id:
                         v.delete()
                 # ── best-model 아티팩트 (조건부 덮어쓰기) ──
@@ -423,11 +423,11 @@ def model_training(args):
                     project = wandb.run.project
                     # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
                     current = api.artifact(
-                        f"{entity}/{project}/model/best-model:best")
+                        f"{entity}/{project}/best-model:best")
 
                     # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                     for v in api.artifact_versions(
-                            f"{entity}/{project}/model/best-model"):
+                            f"{entity}/{project}/best-model"):
                         if v.id != current.id:
                             v.delete()
 
