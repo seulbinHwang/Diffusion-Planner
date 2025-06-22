@@ -407,6 +407,7 @@ def model_training(args):
 
                 # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                 for v in api.artifact_versions(
+                        "model",
                         f"{entity}/{project}/latest-model"):
                     if v.id != current.id:
                         v.delete()
@@ -420,7 +421,7 @@ def model_training(args):
                                               })
                     best_art.add_file(os.path.join(save_path, "best.pth"))
                     wandb.log_artifact(best_art, aliases=["best"])
-                    latest_art.wait()  # 업로드 완료 보장
+                    best_art.wait()  # 업로드 완료 보장
 
                     # 이전 버전 삭제
                     entity = wandb.run.entity
@@ -431,6 +432,7 @@ def model_training(args):
 
                     # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                     for v in api.artifact_versions(
+                            "model",
                             f"{entity}/{project}/best-model"):
                         if v.id != current.id:
                             v.delete()
