@@ -393,6 +393,8 @@ def model_training(args):
 별명을 쓰면, 다음에 다시 “latest”라는 이름으로 덮어써 가며 하나의 모델만 관리할 수 있습니다.
                 """
                 wandb.log_artifact(latest_art, aliases=["latest"])
+                latest_art.wait()  # 업로드 완료 보장
+
                 # 이전 버전 삭제
                 api = wandb.Api()
                 # wandb.run.entity: jksg01019-naver-labs
@@ -418,6 +420,8 @@ def model_training(args):
                                               })
                     best_art.add_file(os.path.join(save_path, "best.pth"))
                     wandb.log_artifact(best_art, aliases=["best"])
+                    latest_art.wait()  # 업로드 완료 보장
+
                     # 이전 버전 삭제
                     entity = wandb.run.entity
                     project = wandb.run.project
