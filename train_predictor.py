@@ -38,7 +38,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="npc-alpha-0-lr-0.0005")
+                        default="npc-alpha-0-lr-0.0005-gpu-8")
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
