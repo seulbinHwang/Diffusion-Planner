@@ -38,7 +38,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="diffusion-planner-training")
+                        default="npc-alpha-0-lr-0.0005")
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -380,14 +380,14 @@ def model_training(args):
                            model_ema.ema, save_best)
                 print(f"Model saved in {save_path}\n")
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
-                latest_art = wandb.Artifact(name="latest-model",
-                                            type="model",
+                latest_art = wandb.Artifact(name="latest-model", # latest-model 라는 이름의 데이터 묶음
+                                            type="model", # "dataset" 이 될수도 있음
                                             metadata={
                                                 "epoch": epoch + 1,
                                                 "loss": train_total_loss
                                             })
                 # 로컬에 저장된 latest.pth 파일을 담아 넣는 동작
-                latest_art.add_file(os.path.join(save_path, "latest.pth"))
+                latest_art.add_file(local_path=os.path.join(save_path, name="latest.pth"))
                 """
 이 상자(Artifact)를 W&B 서버로 전송하고, ["latest"]라는 별명을 붙여 줘요.
 별명을 쓰면, 다음에 다시 “latest”라는 이름으로 덮어써 가며 하나의 모델만 관리할 수 있습니다.
@@ -419,7 +419,7 @@ def model_training(args):
                                                   "epoch": epoch + 1,
                                                   "loss": train_total_loss
                                               })
-                    best_art.add_file(os.path.join(save_path, "best.pth"))
+                    best_art.add_file(os.path.join(local_path=save_path, name="best.pth"))
                     wandb.log_artifact(best_art, aliases=["best"])
                     best_art.wait()  # 업로드 완료 보장
 
