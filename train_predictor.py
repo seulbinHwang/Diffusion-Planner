@@ -38,7 +38,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="npc-alpha-0-lr-0.0005-gpu-4")
+                        default="npc-alpha-0-lr-0.005-gpu-4")
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -150,7 +150,7 @@ def get_args():
     parser.add_argument('--learning_rate',
                         type=float,
                         help='learning rate (default: 5e-4)',
-                        default=5e-4)
+                        default=5e-3)
     parser.add_argument('--warm_up_epoch',
                         type=int,
                         help='number of warm up',
