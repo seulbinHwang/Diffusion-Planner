@@ -175,6 +175,7 @@ def get_args():
                         default='cuda')
 
     parser.add_argument('--use_ema', default=True, type=boolean)
+    parser.add_argument('--delete_weight', default=False, type=boolean)
 
     # Model
     parser.add_argument('--encoder_depth',
@@ -380,7 +381,10 @@ def model_training(args):
                            model_ema.ema, save_best)
                 print(f"Model saved in {save_path}\n")
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
-                latest_art = wandb.Artifact(name="latest-model", # latest-model 라는 이름의 데이터 묶음
+                # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
+                # f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth'
+                name_ = f"{args.name}__{time}__latest-model"
+                latest_art = wandb.Artifact(name=name_, # latest-model 라는 이름의 데이터 묶음
                                             type="model", # "dataset" 이 될수도 있음
                                             metadata={
                                                 "epoch": epoch + 1,
@@ -394,26 +398,27 @@ def model_training(args):
                 """
                 wandb.log_artifact(latest_art, aliases=["latest"])
                 latest_art.wait()  # 업로드 완료 보장
+                if args.delete_weight:
+                    # 이전 버전 삭제
+                    api = wandb.Api()
+                    # wandb.run.entity: jksg01019-naver-labs
+                    # wandb.run.project: Diffusion-Planner
+                    entity = wandb.run.entity
+                    project = wandb.run.project
+                    # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
+                    current = api.artifact(
+                        f"{entity}/{project}/latest-model:latest")
 
-                # 이전 버전 삭제
-                api = wandb.Api()
-                # wandb.run.entity: jksg01019-naver-labs
-                # wandb.run.project: Diffusion-Planner
-                entity = wandb.run.entity
-                project = wandb.run.project
-                # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
-                current = api.artifact(
-                    f"{entity}/{project}/latest-model:latest")
-
-                # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                for v in api.artifact_versions(
-                        "model",
-                        f"{entity}/{project}/latest-model"):
-                    if v.id != current.id:
-                        v.delete()
+                    # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
+                    for v in api.artifact_versions(
+                            "model",
+                            f"{entity}/{project}/latest-model"):
+                        if v.id != current.id:
+                            v.delete()
                 # ── best-model 아티팩트 (조건부 덮어쓰기) ──
                 if save_best:
-                    best_art = wandb.Artifact(name="best-model",
+                    name_ = f"{args.name}__{time}__best-model"
+                    best_art = wandb.Artifact(name=name_,
                                               type="model",
                                               metadata={
                                                   "epoch": epoch + 1,
@@ -424,18 +429,19 @@ def model_training(args):
                     best_art.wait()  # 업로드 완료 보장
 
                     # 이전 버전 삭제
-                    entity = wandb.run.entity
-                    project = wandb.run.project
-                    # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
-                    current = api.artifact(
-                        f"{entity}/{project}/best-model:best")
+                    if args.delete_weight:
+                        entity = wandb.run.entity
+                        project = wandb.run.project
+                        # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
+                        current = api.artifact(
+                            f"{entity}/{project}/best-model:best")
 
-                    # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                    for v in api.artifact_versions(
-                            "model",
-                            f"{entity}/{project}/best-model"):
-                        if v.id != current.id:
-                            v.delete()
+                        # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
+                        for v in api.artifact_versions(
+                                "model",
+                                f"{entity}/{project}/best-model"):
+                            if v.id != current.id:
+                                v.delete()
 
         scheduler.step()
         train_sampler.set_epoch(epoch + 1)
