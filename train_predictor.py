@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 from diffusion_planner.model.diffusion_planner import Diffusion_Planner
-
+from requests.exceptions import HTTPError
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
 from diffusion_planner.utils.lr_schedule import CosineAnnealingWarmUpRestarts
@@ -232,9 +232,9 @@ def get_args():
 def safe_get_artifacts(api, type_name, path):
     try:
         return list(api.artifacts(type_name, path))
-    except wandb.errors.CommError as e:
+    except (wandb.errors.CommError, HTTPError) as e:
         # 404 또는 권한 오류 → 컬렉션이 아직 없다고 판단
-        print(f"[SKIP] '{path}' 컬렉션 없음: {e}")
+        print(f"[SKIP] '{path}' 컬렉션 없음/권한 문제: {e}")
         return []
 
 def purge_collection(api, entity, project, coll_name):
