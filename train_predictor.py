@@ -229,6 +229,25 @@ def get_args():
     return args
 
 
+def safe_get_artifacts(api, type_name, path):
+    try:
+        return list(api.artifacts(type_name, path))
+    except wandb.errors.CommError as e:
+        # 404 또는 권한 오류 → 컬렉션이 아직 없다고 판단
+        print(f"[SKIP] '{path}' 컬렉션 없음: {e}")
+        return []
+
+def purge_collection(api, entity, project, coll_name):
+    path = f"{entity}/{project}/{coll_name}"
+    versions = safe_get_artifacts(api, "model", path)  # 신규 API 사용
+    if not versions:
+        print(f"[PURGE] {coll_name}: 삭제할 버전이 없습니다.")
+        return
+    for art in versions:
+        art.delete()
+    print(f"[PURGE] {coll_name}: {len(versions)}개 버전 모두 삭제 완료.")
+
+
 def model_training(args):
     best_loss = float('inf')
     torch.cuda.empty_cache()
@@ -355,28 +374,8 @@ def model_training(args):
         project = wandb.run.project
 
         # 우리가 새로 만들 컬렉션 이름 (time_str는 앞에서 한 번 계산됨)
-        latest_coll = f"{args.name}_latest-model"
-        try:
-            versions = list(api.artifact_versions(
-                "model",  # 타입
-                f"{entity}/{project}/{latest_coll}"))
-            for v in versions:
-                v.delete()
-            print(f"[PURGE] {latest_coll} : {len(versions)}개 버전을 모두 삭제했습니다.")
-        except wandb.errors.CommError:
-            # 컬렉션이 아예 없을 수도 있음
-            print(f"[PURGE] {latest_coll} : 삭제할 이전 버전이 없습니다.")
-        best_coll = f"{args.name}_best-model"
-        try:
-            versions = list(api.artifact_versions(
-                "model",  # 타입
-                f"{entity}/{project}/{best_coll}"))
-            for v in versions:
-                v.delete()
-            print(f"[PURGE] {best_coll} : {len(versions)}개 버전을 모두 삭제했습니다.")
-        except wandb.errors.CommError:
-            # 컬렉션이 아예 없을 수도 있음
-            print(f"[PURGE] {best_coll} : 삭제할 이전 버전이 없습니다.")
+        purge_collection(api, entity, project, f"{args.name}_latest-model")
+        purge_collection(api, entity, project, f"{args.name}_best-model")
     if args.ddp:
         torch.distributed.barrier()
 
@@ -443,7 +442,7 @@ def model_training(args):
                         f"{entity}/{project}/{latest_coll}:latest")
 
                     # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                    for v in api.artifact_versions(
+                    for v in api.artifacts(
                             "model",
                             f"{entity}/{project}/{latest_coll}"):
                         if v.id != current.id:
@@ -471,7 +470,7 @@ def model_training(args):
                             f"{entity}/{project}/{best_coll}:best")
 
                         # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                        for v in api.artifact_versions(
+                        for v in api.artifacts(
                                 "model",
                                 f"{entity}/{project}/{best_coll}"):
                             if v.id != current.id:
