@@ -38,7 +38,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="alpha-0")
+                        default="alpha-1")
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -167,7 +167,7 @@ def get_args():
     parser.add_argument('--alpha_planning_loss',
                         type=float,
                         help='coefficient of planning loss (default: 1.0)',
-                        default=0.)
+                        default=1.)
 
     parser.add_argument('--device',
                         type=str,
