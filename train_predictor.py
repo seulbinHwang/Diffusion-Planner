@@ -175,7 +175,8 @@ def get_args():
                         default='cuda')
 
     parser.add_argument('--use_ema', default=True, type=boolean)
-    parser.add_argument('--delete_weight', default=False, type=boolean)
+    parser.add_argument('--reset_wb_weight', default=True, type=boolean)
+    parser.add_argument('--delete_wb_weight', default=False, type=boolean)
 
     # Model
     parser.add_argument('--encoder_depth',
@@ -346,7 +347,36 @@ def model_training(args):
                           wandb_resume_id=wandb_id,
                           save_path=save_path,
                           rank=global_rank)
+    if global_rank == 0 and args.reset_wb_weight:
+        api = wandb.Api()
 
+        # 현재 run의 entity / project
+        entity = wandb.run.entity
+        project = wandb.run.project
+
+        # 우리가 새로 만들 컬렉션 이름 (time_str는 앞에서 한 번 계산됨)
+        latest_coll = f"{args.name}_latest-model"
+        try:
+            versions = list(api.artifact_versions(
+                "model",  # 타입
+                f"{entity}/{project}/{latest_coll}"))
+            for v in versions:
+                v.delete()
+            print(f"[PURGE] {latest_coll} : {len(versions)}개 버전을 모두 삭제했습니다.")
+        except wandb.errors.CommError:
+            # 컬렉션이 아예 없을 수도 있음
+            print(f"[PURGE] {latest_coll} : 삭제할 이전 버전이 없습니다.")
+        best_coll = f"{args.name}_best-model"
+        try:
+            versions = list(api.artifact_versions(
+                "model",  # 타입
+                f"{entity}/{project}/{best_coll}"))
+            for v in versions:
+                v.delete()
+            print(f"[PURGE] {best_coll} : {len(versions)}개 버전을 모두 삭제했습니다.")
+        except wandb.errors.CommError:
+            # 컬렉션이 아예 없을 수도 있음
+            print(f"[PURGE] {best_coll} : 삭제할 이전 버전이 없습니다.")
     if args.ddp:
         torch.distributed.barrier()
 
@@ -371,7 +401,7 @@ def model_training(args):
             },
                                      step=epoch + 1)
 
-            if (epoch + 1) % args.save_utd == 0:
+            if (epoch + 1) % args.save_utd == 1:
                 save_best = False
                 if train_total_loss < best_loss:
                     best_loss = train_total_loss
@@ -384,10 +414,11 @@ def model_training(args):
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
                 # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
                 # f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth'
-                name_ = f"{args.name}__{time_str}__latest-model"
-                latest_art = wandb.Artifact(name=name_, # latest-model 라는 이름의 데이터 묶음
+                latest_coll = f"{args.name}_latest-model"
+                latest_art = wandb.Artifact(name=latest_coll, # latest-model 라는 이름의 데이터 묶음
                                             type="model", # "dataset" 이 될수도 있음
                                             metadata={
+                                                "time_str": time_str,
                                                 "epoch": epoch + 1,
                                                 "loss": train_total_loss
                                             })
@@ -399,7 +430,7 @@ def model_training(args):
                 """
                 wandb.log_artifact(latest_art, aliases=["latest"])
                 latest_art.wait()  # 업로드 완료 보장
-                if args.delete_weight:
+                if args.delete_wb_weight:
                     # 이전 버전 삭제
                     api = wandb.Api()
                     # wandb.run.entity: jksg01019-naver-labs
@@ -407,21 +438,23 @@ def model_training(args):
                     entity = wandb.run.entity
                     project = wandb.run.project
                     # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
+                    
                     current = api.artifact(
-                        f"{entity}/{project}/latest-model:latest")
+                        f"{entity}/{project}/{latest_coll}:latest")
 
                     # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                     for v in api.artifact_versions(
                             "model",
-                            f"{entity}/{project}/latest-model"):
+                            f"{entity}/{project}/{latest_coll}"):
                         if v.id != current.id:
                             v.delete()
                 # ── best-model 아티팩트 (조건부 덮어쓰기) ──
                 if save_best:
-                    name_ = f"{args.name}__{time_str}__best-model"
-                    best_art = wandb.Artifact(name=name_,
+                    best_coll = f"{args.name}_best-model"
+                    best_art = wandb.Artifact(name=best_coll,
                                               type="model",
                                               metadata={
+                                                  "time_str": time_str,
                                                   "epoch": epoch + 1,
                                                   "loss": train_total_loss
                                               })
@@ -430,17 +463,17 @@ def model_training(args):
                     best_art.wait()  # 업로드 완료 보장
 
                     # 이전 버전 삭제
-                    if args.delete_weight:
+                    if args.delete_wb_weight:
                         entity = wandb.run.entity
                         project = wandb.run.project
                         # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
                         current = api.artifact(
-                            f"{entity}/{project}/best-model:best")
+                            f"{entity}/{project}/{best_coll}:best")
 
                         # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                         for v in api.artifact_versions(
                                 "model",
-                                f"{entity}/{project}/best-model"):
+                                f"{entity}/{project}/{best_coll}"):
                             if v.id != current.id:
                                 v.delete()
 
