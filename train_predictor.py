@@ -247,6 +247,7 @@ def model_training(args):
             from datetime import datetime
             time = datetime.now()
             time = time.strftime("%Y-%m-%d-%H:%M:%S")
+            time_str = datetime.now().strftime("%Y-%m-%d-%H-%M")
 
             save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
             os.makedirs(save_path, exist_ok=True)
@@ -383,7 +384,7 @@ def model_training(args):
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
                 # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
                 # f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth'
-                name_ = f"{args.name}__{time}__latest-model"
+                name_ = f"{args.name}__{time_str}__latest-model"
                 latest_art = wandb.Artifact(name=name_, # latest-model 라는 이름의 데이터 묶음
                                             type="model", # "dataset" 이 될수도 있음
                                             metadata={
@@ -417,7 +418,7 @@ def model_training(args):
                             v.delete()
                 # ── best-model 아티팩트 (조건부 덮어쓰기) ──
                 if save_best:
-                    name_ = f"{args.name}__{time}__best-model"
+                    name_ = f"{args.name}__{time_str}__best-model"
                     best_art = wandb.Artifact(name=name_,
                                               type="model",
                                               metadata={
