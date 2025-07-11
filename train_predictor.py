@@ -38,7 +38,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="alpha-0")
+                        default="npc_current_state_aug")
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -175,8 +175,8 @@ def get_args():
                         default='cuda')
 
     parser.add_argument('--use_ema', default=True, type=boolean)
-    parser.add_argument('--reset_wb_weight', default=True, type=boolean)
-    parser.add_argument('--delete_wb_weight', default=False, type=boolean)
+    parser.add_argument('--remove_existing_wb_weight', default=True, type=boolean)
+    parser.add_argument('--delete_wb_weight_when_running', default=False, type=boolean)
 
     # Model
     parser.add_argument('--encoder_depth',
@@ -366,7 +366,7 @@ def model_training(args):
                           wandb_resume_id=wandb_id,
                           save_path=save_path,
                           rank=global_rank)
-    if global_rank == 0 and args.reset_wb_weight:
+    if global_rank == 0 and args.remove_existing_wb_weight:
         api = wandb.Api()
 
         # 현재 run의 entity / project
@@ -429,7 +429,7 @@ def model_training(args):
                 """
                 wandb.log_artifact(latest_art, aliases=["latest"])
                 latest_art.wait()  # 업로드 완료 보장
-                if args.delete_wb_weight:
+                if args.delete_wb_weight_when_running:
                     # 이전 버전 삭제
                     api = wandb.Api()
                     # wandb.run.entity: jksg01019-naver-labs
@@ -462,7 +462,7 @@ def model_training(args):
                     best_art.wait()  # 업로드 완료 보장
 
                     # 이전 버전 삭제
-                    if args.delete_wb_weight:
+                    if args.delete_wb_weight_when_running:
                         entity = wandb.run.entity
                         project = wandb.run.project
                         # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다

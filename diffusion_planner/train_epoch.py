@@ -27,7 +27,7 @@ def train_epoch(data_loader,
             data structure in batch: Tuple(Tensor) 
 
             ego_current_state,
-            ego_future_gt,
+            ego_future_gt, = ego_agent_future
 
             neighbor_agents_past,
             neighbors_future_gt,
