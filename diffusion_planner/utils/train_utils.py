@@ -29,7 +29,6 @@ def opendata(path):
         return None
 
 
-
 def set_seed(CUR_SEED):
     random.seed(CUR_SEED)
     np.random.seed(CUR_SEED)
