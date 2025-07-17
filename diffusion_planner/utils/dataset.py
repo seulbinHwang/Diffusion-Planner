@@ -27,6 +27,7 @@ class DiffusionPlannerData(Dataset):
                                                             _past_neighbor_num]
         neighbor_agents_future = data[
             'neighbor_agents_future'][:self._predicted_neighbor_num]
+        neighbor_agents_future_all = data['neighbor_agents_future']
 
         lanes = data['lanes']
         lanes_speed_limit = data['lanes_speed_limit']
@@ -50,6 +51,7 @@ class DiffusionPlannerData(Dataset):
             "route_lanes_speed_limit": route_lanes_speed_limit,
             "route_lanes_has_speed_limit": route_lanes_has_speed_limit,
             "static_objects": static_objects,
+            "neighbors_future_gt_all": neighbor_agents_future_all,
         }
 
         return tuple(data.values())

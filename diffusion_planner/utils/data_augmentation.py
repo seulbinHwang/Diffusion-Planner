@@ -42,7 +42,7 @@ def heading_transform(heading, transform_mat):
         torch.sin(heading) * transform_mat[..., 0, 1]).reshape(*shape)
 
 
-class StatePerturbation():
+class StatePerturbation:
     """
     Data augmentation that perturbs the current ego position and generates a feasible trajectory that
     satisfies polynomial constraints.
@@ -81,10 +81,11 @@ class StatePerturbation():
                           [0, 0, 2, 6 * T, 12 * T**2, 20 * T**3]],
                          device=device,
                          dtype=torch.float32))
-        self.t_matrix = torch.pow(
-            torch.linspace(TIME_INTERVAL, REFINE_HORIZON,
-                           NUM_REFINE).unsqueeze(1),
-            torch.arange(6).unsqueeze(0)).to(device=device)  # shape (B, N+1)
+        # TIME_INTERVAL: 0.1, REFINE_HORIZON: 2.0, NUM_REFINE: 20
+        a = torch.linspace(TIME_INTERVAL, REFINE_HORIZON, NUM_REFINE).unsqueeze(
+            1)  # (20, 1) # [0.1, 0.2, ..., 2.0]
+        b = torch.arange(6).unsqueeze(0)  # (1,6) # [[0, 1, 2, 3, 4, 5]]
+        self.t_matrix = torch.pow(a, b).to(device=device)  # shape (B, N+1)
 
     def __call__(self, inputs, ego_future, neighbors_future):
         aug_flag, aug_ego_current_state = self.augment(inputs)
@@ -98,25 +99,30 @@ class StatePerturbation():
 
     def augment(self, inputs):
         # Only aug current state
-        ego_current_state = inputs['ego_current_state'].clone()
+        ego_current_state = inputs['ego_current_state'].clone()  # (B, 10)
 
         B = ego_current_state.shape[0]
         aug_flag = (torch.rand(B) >= self._augment_prob).bool().to(
-            self._device) & ~(abs(ego_current_state[:, 4]) < 2.0)
+            self._device) & ~(abs(ego_current_state[:, 4]) < 2.0)  # (B)
 
-        random_tensor = torch.rand(B, len(self._low)).to(self._device)
-        scaled_random_tensor = self._low + (self._high -
-                                            self._low) * random_tensor
+        random_tensor = torch.rand(B, len(self._low)).to(self._device)  # (B, 9)
+        scaled_random_tensor = self._low + (
+            self._high - self._low) * random_tensor  # # (B, 9)
 
         new_state = torch.zeros((B, 9), dtype=torch.float32).to(self._device)
+        # (B, 9)
         new_state[:,
                   3:] = ego_current_state[:, 4:
                                           10]  # x, y, h is 0 because of ego-centric, update vx, vy, ax, ay, steering angle, yaw rate
+        # (B, 9)
         new_state = new_state + scaled_random_tensor
+        # (B, 9)
         new_state[:, 3] = torch.max(new_state[:, 3],
                                     torch.tensor(0.0, device=new_state.device))
+        # (B, 9)
         new_state[:, -1] = torch.clip(new_state[:, -1], -0.85, 0.85)
 
+        # ego_current_state: (B, 10)
         ego_current_state[:, :2] = new_state[:, :2]
         ego_current_state[:, 2] = torch.cos(new_state[:, 2])
         ego_current_state[:, 3] = torch.sin(new_state[:, 2])
@@ -125,9 +131,10 @@ class StatePerturbation():
                                                -2:]  # steering angle, yaw rate
 
         # update steering angle and yaw rate
+        # cur_velocity, yaw_rate: (B)
         cur_velocity = ego_current_state[:, 4]
         yaw_rate = ego_current_state[:, 9]
-
+        # steering_angle, new_yaw_rate: (B)
         steering_angle = torch.zeros_like(cur_velocity)
         new_yaw_rate = torch.zeros_like(yaw_rate)
 
@@ -265,9 +272,9 @@ class StatePerturbation():
             ego_future: refined future trajectory of the ego vehicle
         """
 
-        P = self.num_refine
-        dt = self.time_interval
-        T = self.refine_horizon
+        P = self.num_refine  # 20
+        dt = self.time_interval  # 0.1
+        T = self.refine_horizon  # 2.0
         B = aug_current_state.shape[0]
         M_t = self.t_matrix.unsqueeze(0).expand(B, -1, -1)
         A = self.coeff_matrix.unsqueeze(0).expand(B, -1, -1)
@@ -311,15 +318,13 @@ class StatePerturbation():
         ax = A @ sx[:, :, None]  # B, 6, 1
         ay = A @ sy[:, :, None]  # B, 6, 1
 
-        traj_x = M_t @ ax
-        traj_y = M_t @ ay
-        traj_heading = torch.cat([
-            torch.atan2(traj_y[:, :1, 0] - y0.unsqueeze(-1),
-                        traj_x[:, :1, 0] - x0.unsqueeze(-1)),
-            torch.atan2(traj_y[:, 1:, 0] - traj_y[:, :-1, 0],
-                        traj_x[:, 1:, 0] - traj_x[:, :-1, 0])
-        ],
-                                 dim=1)
+        traj_x = M_t @ ax  # (B, P, 1)
+        traj_y = M_t @ ay  # (B, P, 1)
+        a = torch.atan2(traj_y[:, :1, 0] - y0.unsqueeze(-1),
+                        traj_x[:, :1, 0] - x0.unsqueeze(-1))  # (B, 1)
+        b = torch.atan2(traj_y[:, 1:, 0] - traj_y[:, :-1, 0],
+                        traj_x[:, 1:, 0] - traj_x[:, :-1, 0])  # (B, P-1)
+        traj_heading = torch.cat([a, b], dim=1)  # (B, P)
 
         return torch.concatenate([
             torch.cat([traj_x, traj_y, traj_heading[..., None]], axis=-1),

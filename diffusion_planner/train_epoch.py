@@ -6,7 +6,8 @@ from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.train_utils import get_epoch_mean_loss
 from diffusion_planner.utils import ddp
 from diffusion_planner.loss import diffusion_loss_func
-
+from diffusion_planner.utils.data_augmentation import StatePerturbation
+from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 
 def train_epoch(data_loader,
                 model,
@@ -54,15 +55,20 @@ def train_epoch(data_loader,
                 'route_lanes': batch[7].to(args.device),
                 'route_lanes_speed_limit': batch[8].to(args.device),
                 'route_lanes_has_speed_limit': batch[9].to(args.device),
-                'static_objects': batch[10].to(args.device)
+                'static_objects': batch[10].to(args.device),
             }
 
             ego_future = batch[1].to(args.device)
             neighbors_future = batch[3].to(args.device)
+            neighbors_future_all = batch[11].to(args.device)
             # Normalize to ego-centric
-            if aug is not None:
+            if isinstance(aug, StatePerturbation):
                 inputs, ego_future, neighbors_future = aug(
                     inputs, ego_future, neighbors_future)
+            if isinstance(aug, NPCStatePerturbation):
+                inputs, neighbors_future = aug(
+                    inputs, neighbors_future_all, args)
+
 
             # heading to cos sin
             ego_future = torch.cat(

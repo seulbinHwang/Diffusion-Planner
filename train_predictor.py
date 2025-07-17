@@ -15,6 +15,7 @@ from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNorma
 from diffusion_planner.utils.lr_schedule import CosineAnnealingWarmUpRestarts
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.data_augmentation import StatePerturbation
+from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.utils.dataset import DiffusionPlannerData
 from diffusion_planner.utils import ddp
 
@@ -116,7 +117,8 @@ def get_args():
                         default='normalization.json',
                         help='filepath of normalizaiton.json',
                         type=str)
-    parser.add_argument('--use_data_augment', default=True, type=boolean)
+    parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
+    parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument(
         '--pin-mem',
@@ -296,9 +298,18 @@ def model_training(args):
     batch_size = args.batch_size
 
     # set up data loaders
-    aug = StatePerturbation(
+    if args.use_ego_data_augment and args.use_npc_data_augment:
+        raise ValueError("You cannot use both ego and npc data augmentation at the same time. ")
+    if args.use_ego_data_augment:
+        aug = StatePerturbation(
         augment_prob=args.augment_prob,
-        device=args.device) if args.use_data_augment else None
+        device=args.device)
+    elif args.use_npc_data_augment:
+        aug = NPCStatePerturbation(
+            augment_prob=args.augment_prob,
+            device=args.device)
+    else:
+        aug = None
     train_set = DiffusionPlannerData(args.train_set, args.train_set_list,
                                      args.agent_num,
                                      args.predicted_neighbor_num,
