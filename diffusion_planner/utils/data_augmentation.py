@@ -265,7 +265,7 @@ class StatePerturbation:
         refine future trajectory with quintic spline interpolation
         
         Args:
-            aug_current_state: (B, 16) current state of the ego vehicle after augmentation
+            aug_current_state: (B, 10) current state of the ego vehicle after augmentation
             ego_future:        (B, 80, 3) future trajectory of the ego vehicle
             
         Returns:
@@ -282,28 +282,37 @@ class StatePerturbation:
         # state: [x, y, heading, velocity, acceleration, yaw_rate]
 
         x0, y0, theta0, v0, a0, omega0 = (
-            aug_current_state[:, 0], aug_current_state[:, 1],
+            aug_current_state[:, 0], # x0
+            aug_current_state[:, 1], # y0
             torch.atan2(
                 (ego_future[:, int(P / 2), 1] - aug_current_state[:, 1]),
-                (ego_future[:, int(P / 2), 0] - aug_current_state[:, 0])),
+                (ego_future[:, int(P / 2), 0] - aug_current_state[:, 0])), # theta0
             torch.norm(aug_current_state[:, 4:6],
-                       dim=-1), torch.norm(aug_current_state[:, 6:8],
-                                           dim=-1), aug_current_state[:, 9])
+                       dim=-1), # v0
+            torch.norm(aug_current_state[:, 6:8],
+                                           dim=-1), # a0
+            aug_current_state[:, 9] # omega0
+        )
 
         xT, yT, thetaT, vT, aT, omegaT = (
-            ego_future[:, P, 0], ego_future[:, P, 1], ego_future[:, P, 2],
+            ego_future[:, P, 0], # xT
+            ego_future[:, P, 1], # yT
+            ego_future[:, P, 2], # thetaT
             torch.norm(ego_future[:, P, :2] - ego_future[:, P - 1, :2],
-                       dim=-1) / dt,
+                       dim=-1) / dt, # vT
             torch.norm(ego_future[:, P, :2] - 2 * ego_future[:, P - 1, :2] +
                        ego_future[:, P - 2, :2],
-                       dim=-1) / dt**2,
+                       dim=-1) / dt**2, # aT
             self.normalize_angle(ego_future[:, P, 2] - ego_future[:, P - 1, 2])
-            / dt)
+            / dt) # omegaT
 
         # Boundary conditions
         sx = torch.stack([
-            x0, v0 * torch.cos(theta0), a0 * torch.cos(theta0) -
-            v0 * torch.sin(theta0) * omega0, xT, vT * torch.cos(thetaT),
+            x0,
+            v0 * torch.cos(theta0),
+            a0 * torch.cos(theta0) - v0 * torch.sin(theta0) * omega0,
+            xT,
+            vT * torch.cos(thetaT),
             aT * torch.cos(thetaT) - vT * torch.sin(thetaT) * omegaT
         ],
                          dim=-1)

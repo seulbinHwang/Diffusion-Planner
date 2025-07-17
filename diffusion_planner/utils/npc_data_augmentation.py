@@ -45,8 +45,14 @@ class NPCStatePerturbation:
         self.refine_horizon = REFINE_HORIZON
         self.num_refine = NUM_REFINE
         self.time_interval = TIME_INTERVAL
-
         T = REFINE_HORIZON + TIME_INTERVAL
+        self.A_inv_const = torch.tensor(
+            [[1, 0, 0, 0, 0, 0],
+             [0, 1, 0, 0, 0, 0],
+             [0, 0, 2, 0, 0, 0],
+             [1, T, T ** 2, T ** 3, T ** 4, T ** 5],
+             [0, 1, 2 * T, 3 * T ** 2, 4 * T ** 3, 5 * T ** 4],
+             [0, 0, 2, 6 * T, 12 * T ** 2, 20 * T ** 3]]).inverse()  # (6, 6)
         self.coeff_matrix = torch.linalg.inv(
             torch.tensor([[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0],
                           [0, 0, 2, 0, 0, 0], [1, T, T**2, T**3, T**4, T**5],
@@ -54,6 +60,8 @@ class NPCStatePerturbation:
                           [0, 0, 2, 6 * T, 12 * T**2, 20 * T**3]],
                          device=device,
                          dtype=torch.float32))
+        # A_inv_const 와 coeff_matrix가 같은지 확인
+        assert torch.allclose(self.A_inv_const, self.coeff_matrix)
         # TIME_INTERVAL: 0.1, REFINE_HORIZON: 2.0, NUM_REFINE: 20
         a = torch.linspace(TIME_INTERVAL, REFINE_HORIZON, NUM_REFINE).unsqueeze(
             1)  # (20, 1) # [0.1, 0.2, ..., 2.0]
@@ -105,12 +113,11 @@ class NPCStatePerturbation:
             aug_near_current_wrt_self # (B, Pnn, 11)
         )
         """
-        aug_near_current: (B, Pnn, 11)
         neighbor_agents_past: (B, agent_num, time_len, 11)
         neighbors_future_all: (B, agent_num, future_len, 3) -> (B, agent_num, future_len, 4)
-        aug_flags: (B, Pnn) (bool)
+        aug_flags: (B, agent_num) (bool)
         """
-        aug_near_current, neighbor_agents_past, neighbors_future_all, aug_flags = \
+        neighbor_agents_past, neighbors_future_all, aug_flags = \
             self.reorder_neighbors_after_augmentation(
             aug_near_current, neighbor_agents_past, neighbors_future_all,
             aug_flags)
@@ -120,8 +127,9 @@ class NPCStatePerturbation:
         )
         inputs["neighbor_agents_past"] = neighbor_agents_past
         # neighbors_future_all: (B, agent_num, future_len, 4) -> (B, agent_num, future_len, 3)
+        neighbor_agents_current = neighbor_agents_past[:, :, -1, :]  # (B, agent_num, 11)
         neighbors_future_all = self.interpolation_future_trajectory(
-            aug_near_current, neighbors_future_all, aug_flags)
+            neighbor_agents_current, neighbors_future_all, aug_flags)
         # return neighbors_future : (B, Pnn, future_len, 3)
         neighbors_future = neighbors_future_all[:, :args.predicted_neighbor_num,
                                                     :, :]
@@ -129,7 +137,7 @@ class NPCStatePerturbation:
 
 
     def refine_neighbor_past_trajectories(self,
-            aug_flag: Tensor,  # (B, Pnn)
+            aug_flags: Tensor,  # (B, agent_num)
             ordered_neighbor_agents_past: Tensor,
             # (B, agent_num, time_len, 11)
     ) -> Tensor:
@@ -139,7 +147,7 @@ class NPCStatePerturbation:
         - 시작·끝 점의 **위치·속도·가속도·yaw‑rate** 경계조건을 정확히 만족
 
         Args:
-            aug_flag (Tensor): (B,Pnn)
+            aug_flags (Tensor): (B,agent_num)
                 각 배치의 Pnn개 예측 대상(agent)별 augment 여부.
             ordered_neighbor_agents_past (Tensor): (B,agent_num,time_len,11)
                 과거 20step(–2s→–0.1s)+현재 프레임 순서의 궤적.
@@ -150,61 +158,57 @@ class NPCStatePerturbation:
         """
         # ───────────────── 기본 파라미터 ─────────────────
         B, agent_num, time_len, D = ordered_neighbor_agents_past.shape
-        Pnn = aug_flag.shape[1]
         device, dtype = ordered_neighbor_agents_past.device, ordered_neighbor_agents_past.dtype
-        steps: int = time_len - 1  # 20
         T: float = self.refine_horizon  # 2.0
 
         # ───────────────── 1. 대상 마스크 계산 ─────────────────
-        mask_flat: Tensor = aug_flag.clone().reshape(-1)  # (B * Pnn)
+        mask_flat: Tensor = aug_flags.clone().reshape(-1)  # (B * agent_num)
 
         if mask_flat.sum() == 0:
             # 보정 대상이 없으면 원본 그대로 반환
             return ordered_neighbor_agents_past.clone()
 
         # ───────────────── 2. 데이터 전개 ─────────────────
-        near_agents_past = ordered_neighbor_agents_past[:,
-                           :Pnn]  # (B, Pnn, time_len, 11)
-        near_agents_past = near_agents_past.reshape(-1, time_len,
-                                                    D)  # (B·Pnn, time_len, 11)
+        neighbor_agents_past = ordered_neighbor_agents_past.reshape(-1, time_len,
+                                                    D)  # (B·agent_num, time_len, 11)
 
-        near_current = near_agents_past[:, -1]  # (B·Pnn, 11)   (t = 0s)
-        near_past = near_agents_past[:, :-1]  # (B·Pnn, time_len - 1, 11)
+        neighbor_current = neighbor_agents_past[:, -1]  # (B·agent_num, 11)   (t = 0s)
+        neighbor_past = neighbor_agents_past[:, :-1]  # (B·agent_num, time_len - 1, 11)
 
         sel_idx = mask_flat.nonzero(as_tuple=True)[0]  # (M,)  보정 대상 인덱스
         M: int = sel_idx.size(0)
 
-        aug_near_current: Tensor = near_current[sel_idx]  # (M, 11)
-        aug_near_past: Tensor = near_past[sel_idx]  # (M, time_len - 1, 11)
+        aug_neighbor_current: Tensor = neighbor_current[sel_idx]  # (M, 11)
+        aug_neighbor_past: Tensor = neighbor_past[sel_idx]  # (M, time_len - 1, 11)
 
         # ───────────────── 3. Quintic 경계조건 ─────────────────
         # 현재(t=0)
-        x0, y0 = aug_near_current[:, 0], aug_near_current[:, 1]  # (M,)
-        cos0, sin0 = aug_near_current[:, 2], aug_near_current[:, 3]
+        x0, y0 = aug_neighbor_current[:, 0], aug_neighbor_current[:, 1]  # (M,)
+        cos0, sin0 = aug_neighbor_current[:, 2], aug_neighbor_current[:, 3]
         theta0 = torch.atan2(sin0, cos0)  # (M,)
 
-        v0 = torch.norm(aug_near_current[:, 4:6],
+        v0 = torch.norm(aug_neighbor_current[:, 4:6],
                         dim=-1)  # (M,) speed magnitude
         # 가속도 벡터 (t=-0.1 → t=0)
-        a0_vec = (aug_near_current[:, 4:6] - aug_near_past[:, -1,
+        a0_vec = (aug_neighbor_current[:, 4:6] - aug_neighbor_past[:, -1,
                                              4:6]) / self.time_interval
         a0 = torch.norm(a0_vec, dim=-1)  # (M,)
 
-        theta_prev = torch.atan2(aug_near_past[:, -1, 3],
-                                 aug_near_past[:, -1, 2])  # (M,)
+        theta_prev = torch.atan2(aug_neighbor_past[:, -1, 3],
+                                 aug_neighbor_past[:, -1, 2])  # (M,)
         omega0 = self.normalize_angle(theta0 - theta_prev) / self.time_interval  # (M,)
 
         # 과거 첫 프레임(t = –2s, index 0)
-        xT, yT = aug_near_past[:, 0, 0], aug_near_past[:, 0, 1]
-        cosT, sinT = aug_near_past[:, 0, 2], aug_near_past[:, 0, 3]
+        xT, yT = aug_neighbor_past[:, 0, 0], aug_neighbor_past[:, 0, 1]
+        cosT, sinT = aug_neighbor_past[:, 0, 2], aug_neighbor_past[:, 0, 3]
         thetaT = torch.atan2(sinT, cosT)
 
-        vT = torch.norm(aug_near_past[:, 0, 4:6], dim=-1)  # (M,)
-        aT_vec = (aug_near_past[:, 1, 4:6] - aug_near_past[:, 0,
+        vT = torch.norm(aug_neighbor_past[:, 0, 4:6], dim=-1)  # (M,)
+        aT_vec = (aug_neighbor_past[:, 1, 4:6] - aug_neighbor_past[:, 0,
                                              4:6]) / self.time_interval
         aT = torch.norm(aT_vec, dim=-1)
 
-        theta_next = torch.atan2(aug_near_past[:, 1, 3], aug_near_past[:, 1, 2])
+        theta_next = torch.atan2(aug_neighbor_past[:, 1, 3], aug_neighbor_past[:, 1, 2])
         omegaT = self.normalize_angle(theta_next - thetaT) / self.time_interval
 
         # Boundary vectors (M, 6)
@@ -227,20 +231,13 @@ class NPCStatePerturbation:
         ], dim=-1)
 
         # ───────────────── 4. Quintic 계수 ─────────────────
-        A_inv = torch.tensor(
-            [[1, 0, 0, 0, 0, 0],
-             [0, 1, 0, 0, 0, 0],
-             [0, 0, 2, 0, 0, 0],
-             [1, T, T ** 2, T ** 3, T ** 4, T ** 5],
-             [0, 1, 2 * T, 3 * T ** 2, 4 * T ** 3, 5 * T ** 4],
-             [0, 0, 2, 6 * T, 12 * T ** 2, 20 * T ** 3]],
-            device=device, dtype=dtype).inverse()  # (6, 6)
 
+        A_inv = self.coeff_matrix.to(device=device, dtype=dtype)
         ax_coef = (A_inv @ sx.unsqueeze(-1)).squeeze(-1)  # (M, 6)
         ay_coef = (A_inv @ sy.unsqueeze(-1)).squeeze(-1)  # (M, 6)
 
         # ───────────────── 5. 궤적 샘플링 (t = -2 … -0.1) ─────────────────
-        t_vec = torch.linspace(self.time_interval, T, steps, device=device,
+        t_vec = torch.linspace(self.time_interval, T, time_len - 1, device=device,
                                dtype=dtype)  # (time_len - 1,) 0.1…2.0
         T_mat = torch.stack([t_vec ** i for i in range(6)],
                             dim=-1)  # (time_len - 1, 6)
@@ -259,11 +256,27 @@ class NPCStatePerturbation:
 
         vx = dx / self.time_interval  # (M, time_len - 1)
         vy = dy / self.time_interval
-        heading = torch.atan2(dy, dx)  # (M, time_len - 1)
+        # 0으로 나누는 경우 방지하여 heading 구하기
+        # ── 정지‑구간 안전 처리 ────────────────────────────────
+        heading_raw = torch.atan2(dy, dx)  # (M, steps)
+        mask_zero = (dx.abs() + dy.abs()) < 1e-6  # True → dx=dy≈0
+
+        # 초기값(가장 과거 프레임)에서는 θ_prev 를 사용
+        theta_prev = torch.atan2(aug_neighbor_past[:, -1, 3],  # (M,)
+                                 aug_neighbor_past[:, -1, 2])
+
+        heading = heading_raw.clone()
+        heading[:, 0] = torch.where(mask_zero[:, 0], theta_prev,
+                                    heading_raw[:, 0])
+
+        # forward‑fill : 1~steps‑1
+        for t in range(1, heading.shape[1]):
+            heading[:, t] = torch.where(mask_zero[:, t], heading[:, t - 1],
+                                        heading_raw[:, t])
         cos_h, sin_h = torch.cos(heading), torch.sin(heading)
 
         # ────────── 5‑②. new_seg 구성 (M, time_len - 1, 6) ──────────
-        new_seg = torch.zeros((M, steps, 6), device=device, dtype=dtype)
+        new_seg = torch.zeros((M, time_len - 1, 6), device=device, dtype=dtype)
         new_seg[..., 0] = traj_x
         new_seg[..., 1] = traj_y
         new_seg[..., 2] = cos_h
@@ -271,21 +284,21 @@ class NPCStatePerturbation:
         new_seg[..., 4] = vx
         new_seg[..., 5] = vy
 
-        # ───────────────── 6. near_past 덮어쓰기 (전 구간) ─────────────────
-        near_past[sel_idx, :, :6] = new_seg  # t = −2 … −0.1 전부 교체
+        # ───────────────── 6. neighbor_past 덮어쓰기 (전 구간) ─────────────────
+        # (B·agent_num, time_len - 1, 11)
+        neighbor_past[sel_idx, :, :6] = new_seg  # t = −2 … −0.1 전부 교체
 
         # ───────────────── 7. 원본 텐서 복원 ─────────────────
-        near_agents_past[sel_idx, :-1, :6] = near_past[sel_idx, :, :6]
-        near_agents_past = near_agents_past.reshape(B, Pnn, time_len, D)
+        # (B·agent_num, time_len, 11)
+        neighbor_agents_past[sel_idx, :-1, :6] = neighbor_past[sel_idx, :, :6]
+        neighbor_agents_past = neighbor_agents_past.reshape(B, agent_num, time_len, D)
 
-        neighbor_agents_past = ordered_neighbor_agents_past.clone()
-        neighbor_agents_past[:, :Pnn] = near_agents_past
         return neighbor_agents_past
 
 
     def interpolation_future_trajectory(
         self,
-        aug_near_current: torch.Tensor,
+        neighbor_agents_current: torch.Tensor,
         neighbors_future_all: torch.Tensor,
         aug_flags: torch.Tensor,
     ) -> torch.Tensor:
@@ -294,9 +307,9 @@ class NPCStatePerturbation:
         부드럽게 재보간한다.
 
         Args:
-            aug_near_current (Tensor):
+            neighbor_agents_current (Tensor):
                 증강된 현재 NPC 상태.
-                **Shape** – ``(B, Pnn, 11)``
+                **Shape** – ``(B, agent_num, 11)``
                 ``[x, y, cosθ, sinθ, v_x, v_y, a_x, a_y, steer, yaw_rate, padding]``
             neighbors_future_all (Tensor):
                 보간 전 미래 궤적.
@@ -304,7 +317,7 @@ class NPCStatePerturbation:
                 ``[x, y, cosθ, sinθ]`` × future_len
             aug_flags (Tensor):
                 보간 수행 여부 플래그.
-                **Shape** – ``(B, Pnn,)`` bool
+                **Shape** – ``(B, agent_num,)`` bool
 
         Returns:
             Tensor:
@@ -312,71 +325,84 @@ class NPCStatePerturbation:
                 보간이 적용된 미래 궤적.
                 **Shape** – ``(B, agent_num, future_len, 3)``
         """
-        # aug_near_current: (B, Pnn, 11) -> (B * Pnn, 11)
-        Pnn = aug_near_current.shape[1]  # predicted_neighbor_num
-        aug_near_current = aug_near_current.reshape(-1,
-                                                    aug_near_current.shape[-1])
-        aug_flags = aug_flags.reshape(-1)  # (B * Pnn,)
-        neighbors_future_all = neighbors_future_all.to(self._device)
-        aug_near_current = aug_near_current.to(self._device)  # (B * Pnn, 11)
+        # neighbor_agents_current: (B, agent_num, 11) -> (B * agent_num, 11)
+        neighbor_agents_current = neighbor_agents_current.reshape(-1,
+                                                    neighbor_agents_current.shape[-1])
+        aug_flags = aug_flags.reshape(-1)  # (B * agent_num,)
         aug_flags = aug_flags.to(self._device)
-        # neighbors_future_all: (B, agent_num, future_len, 4)
-        # I want to make neighbors_future_all from neighbors_future_all
-        # (B, agent_num, future_len, 4) -> (B * agent_num, future_len, 4)  -> (B * agent_num, future_len, 3)
-        b, agent_num, future_len, four_dim = neighbors_future_all.shape
-        near_future = neighbors_future_all[:, :Pnn, :, :].clone(
-        )  # (B, Pnn, future_len, 4)
-        near_future = near_future.reshape(b * Pnn, future_len,
-                                          four_dim)  # (B * Pnn, future_len, 4)
+        if aug_flags.sum() == 0:
+            # If no augmentation is needed, return the original future trajectory
+            # neighbors_future_all: (B, agent_num, future_len, 4) -> (B , agent_num, future_len, 3)
+            neighbors_future_cos = neighbors_future_all[..., 2]  # (B, agent_num, future_len)
+            neighbors_future_sin = neighbors_future_all[..., 3]  # (B, agent_num, future_len)
+            neighbors_future_all = torch.cat(
+                [
+                    neighbors_future_all[..., :2],  # x, y
+                    torch.atan2(neighbors_future_sin, neighbors_future_cos)[..., None],  # heading
+                ],
+                dim=-1)
+            return neighbors_future_all
+        sel_idx = aug_flags.nonzero(as_tuple=True)[0]  # (M,)  보정 대상 인덱스
+        neighbors_future_all = neighbors_future_all.to(self._device)
+        neighbor_agents_current = neighbor_agents_current.to(self._device)  # (B * agent_num, 11)
+        aug_neighbor_agents_current = neighbor_agents_current[sel_idx]  # (M, 11)
 
-        # (B * Pnn, future_len, 4) -> (B * Pnn, future_len, 3)
-        cos_ = near_future[:, :, 2]  # cos # (B * Pnn, future_len)
-        sin_ = near_future[:, :, 3]  # sin # (B * Pnn, future_len)
-        near_future = torch.cat(
+        # neighbors_future_all: (B, agent_num, future_len, 4)
+        # (B, agent_num, future_len, 4) -> (B * agent_num, future_len, 4)  -> (B * agent_num, future_len, 3)
+        batch_, agent_num, future_len, four_dim = neighbors_future_all.shape
+        neighbor_future = neighbors_future_all.reshape(batch_ * agent_num, future_len,
+                                          four_dim)  # (B * agent_num, future_len, 4)
+        aug_neighbor_future = neighbor_future[sel_idx]  # (M, future_len, 4)
+
+        # (M, future_len, 4) -> (M, future_len, 3)
+        cos_ = aug_neighbor_future[:, :, 2]  # cos # (M, future_len)
+        sin_ = aug_neighbor_future[:, :, 3]  # sin # (M, future_len)
+        aug_neighbor_future = torch.cat(
             [
-                near_future[:, :, :2],  # x, y
+                aug_neighbor_future[:, :, :2],  # x, y
                 torch.atan2(sin_, cos_)[..., None],  # heading
             ],
-            dim=-1)  # (B * Pnn, future_len, 3)
-        near_future = near_future.to(self._device)
+            dim=-1)  # (M, future_len, 3)
+        
+        aug_neighbor_future = aug_neighbor_future.to(self._device)
 
         refine_P = self.num_refine  # 20
         dt = self.time_interval  # 0.1
-        T = self.refine_horizon  # 2.0
-        B_n_Pnn = aug_near_current.shape[0]
-        M_t = self.t_matrix.unsqueeze(0).expand(B_n_Pnn, -1, -1)
-        A = self.coeff_matrix.unsqueeze(0).expand(B_n_Pnn, -1, -1)
+        M = aug_neighbor_agents_current.shape[0]
+        M_t = self.t_matrix.unsqueeze(0).expand(M, -1, -1)
+        # (M, 6, 6)
+        A = self.coeff_matrix.unsqueeze(0).expand(M, -1, -1)
 
         # state: [x, y, heading, velocity, acceleration, yaw_rate]
 
         x0, y0, theta0, v0 = (
-            aug_near_current[:, 0],  # (B_n_Pnn,)
-            aug_near_current[:, 1],
+            aug_neighbor_agents_current[:, 0],  # (M,)
+            aug_neighbor_agents_current[:, 1],
             torch.atan2(
-                (near_future[:, int(refine_P / 2), 1] - aug_near_current[:, 1]),
-                (near_future[:, int(refine_P / 2), 0] -
-                 aug_near_current[:, 0])),
-            torch.norm(aug_near_current[:, 4:6], dim=-1),
+                (aug_neighbor_future[:, int(refine_P / 2), 1] - aug_neighbor_agents_current[:, 1]),
+                (aug_neighbor_future[:, int(refine_P / 2), 0] -
+                 aug_neighbor_agents_current[:, 0])),
+            torch.norm(aug_neighbor_agents_current[:, 4:6], dim=-1),
         )
-        first_fut_point_vel = (near_future[:, 1, 0:2] -
-                               near_future[:, 0, 0:2]) / dt  # (B * Pnn, 2)
-        a0_vec = (first_fut_point_vel - aug_near_current[:, 4:6]) / dt
+        first_fut_point_vel = (aug_neighbor_future[:, 1, 0:2] -
+                               aug_neighbor_future[:, 0, 0:2]) / dt  # (M, 2)
+        a0_vec = (first_fut_point_vel - aug_neighbor_agents_current[:, 4:6]) / dt
         a0 = torch.norm(a0_vec, dim=-1)
-        omega0 = self.normalize_angle(near_future[:, 0, 2] - theta0) / dt
+        omega0 = self.normalize_angle(aug_neighbor_future[:, 0, 2] - theta0) / dt
 
         xT, yT, thetaT, vT, aT, omegaT = (
-            near_future[:, refine_P,
-                        0], near_future[:, refine_P,
-                                        1], near_future[:, refine_P, 2],
+            aug_neighbor_future[:, refine_P,
+                        0], aug_neighbor_future[:, refine_P,
+                                        1], aug_neighbor_future[:, refine_P, 2],
             torch.norm(
-                near_future[:, refine_P, :2] - near_future[:, refine_P - 1, :2],
+                aug_neighbor_future[:, refine_P, :2] - aug_neighbor_future[:, refine_P - 1, :2],
                 dim=-1) / dt,
-            torch.norm(near_future[:, refine_P, :2] -
-                       2 * near_future[:, refine_P - 1, :2] +
-                       near_future[:, refine_P - 2, :2],
+            torch.norm(aug_neighbor_future[:, refine_P, :2] -
+                       2 * aug_neighbor_future[:, refine_P - 1, :2] +
+                       aug_neighbor_future[:, refine_P - 2, :2],
                        dim=-1) / dt**2,
-            self.normalize_angle(near_future[:, refine_P, 2] -
-                                 near_future[:, refine_P - 1, 2]) / dt)
+            self.normalize_angle(aug_neighbor_future[:, refine_P, 2] -
+                                 aug_neighbor_future[:, refine_P - 1, 2]) / dt)
 
         # Boundary conditions
         sx = torch.stack([
@@ -384,7 +410,7 @@ class NPCStatePerturbation:
             v0 * torch.sin(theta0) * omega0, xT, vT * torch.cos(thetaT),
             aT * torch.cos(thetaT) - vT * torch.sin(thetaT) * omegaT
         ],
-                         dim=-1)
+                         dim=-1) # (M, 6)
 
         sy = torch.stack([
             y0, v0 * torch.sin(theta0), a0 * torch.sin(theta0) +
@@ -392,354 +418,22 @@ class NPCStatePerturbation:
             aT * torch.sin(thetaT) + vT * torch.cos(thetaT) * omegaT
         ],
                          dim=-1)
-
-        # ───────────────── 4. Quintic 계수 ─────────────────
-        A_inv = torch.tensor(
-            [[1, 0, 0, 0, 0, 0],
-             [0, 1, 0, 0, 0, 0],
-             [0, 0, 2, 0, 0, 0],
-             [1, T, T ** 2, T ** 3, T ** 4, T ** 5],
-             [0, 1, 2 * T, 3 * T ** 2, 4 * T ** 3, 5 * T ** 4],
-             [0, 0, 2, 6 * T, 12 * T ** 2, 20 * T ** 3]],
-            device=device, dtype=dtype).inverse()  # (6, 6)
-
-        ax_coef = (A_inv @ sx.unsqueeze(-1)).squeeze(-1)  # (M, 6)
-        ay_coef = (A_inv @ sy.unsqueeze(-1)).squeeze(-1)  # (M, 6)
-
-        # ───────────────── 5. 궤적 샘플링 (t = -2 … -0.1) ─────────────────
-        t_vec = torch.linspace(self.time_interval, T, steps, device=device,
-                               dtype=dtype)  # (time_len - 1,) 0.1…2.0
-        T_mat = torch.stack([t_vec ** i for i in range(6)],
-                            dim=-1)  # (time_len - 1, 6)
-
-        # 양수 방향으로 생성 후 flip → 과거→최근 순서
-        traj_x = (T_mat @ ax_coef.T).T.flip(dims=[1])  # (M, time_len - 1)
-        traj_y = (T_mat @ ay_coef.T).T.flip(dims=[1])  # (M, time_len - 1)
-
-        # ────────── 5‑①. 속도·헤딩 (forward 차분) ──────────
-        # pos_x/y 에 현재(t=0) 위치 붙여 forward diff
-        pos_x = torch.cat([traj_x, x0.unsqueeze(1)], dim=1)  # (M, time_len)
-        pos_y = torch.cat([traj_y, y0.unsqueeze(1)], dim=1)  # (M, time_len)
-
-        dx = pos_x[:, 1:] - pos_x[:, :-1]  # (M, time_len - 1)
-        dy = pos_y[:, 1:] - pos_y[:, :-1]  # (M, time_len - 1)
-
-        vx = dx / self.time_interval  # (M, time_len - 1)
-        vy = dy / self.time_interval
-        heading = torch.atan2(dy, dx)  # (M, time_len - 1)
-        cos_h, sin_h = torch.cos(heading), torch.sin(heading)
-
-        # ────────── 5‑②. new_seg 구성 (M, time_len - 1, 6) ──────────
-        new_seg = torch.zeros((M, steps, 6), device=device, dtype=dtype)
-        new_seg[..., 0] = traj_x
-        new_seg[..., 1] = traj_y
-        new_seg[..., 2] = cos_h
-        new_seg[..., 3] = sin_h
-        new_seg[..., 4] = vx
-        new_seg[..., 5] = vy
-
-        # ───────────────── 6. near_past 덮어쓰기 (전 구간) ─────────────────
-        near_past[sel_idx, :, :6] = new_seg  # t = −2 … −0.1 전부 교체
-
-        # ───────────────── 7. 원본 텐서 복원 ─────────────────
-        near_agents_past[sel_idx, :-1, :6] = near_past[sel_idx, :, :6]
-        near_agents_past = near_agents_past.reshape(B, Pnn, time_len, D)
-
-        neighbor_agents_past = ordered_neighbor_agents_past.clone()
-        neighbor_agents_past[:, :Pnn] = near_agents_past
-        return neighbor_agents_past
-
-
-    def interpolation_future_trajectory(
-        self,
-        aug_near_current: torch.Tensor,
-        neighbors_future_all: torch.Tensor,
-        aug_flags: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Quintic 스플라인으로 **NPC 미래 궤적** 앞 `20` step(0.1s 간격, 2s 구간)을
-        부드럽게 재보간한다.
-
-        Args:
-            aug_near_current (Tensor):
-                증강된 현재 NPC 상태.
-                **Shape** – ``(B, Pnn, 11)``
-                ``[x, y, cosθ, sinθ, v_x, v_y, a_x, a_y, steer, yaw_rate, padding]``
-            neighbors_future_all (Tensor):
-                보간 전 미래 궤적.
-                **Shape** – ``(B, agent_num, future_len, 4)``
-                ``[x, y, cosθ, sinθ]`` × future_len
-            aug_flags (Tensor):
-                보간 수행 여부 플래그.
-                **Shape** – ``(B, Pnn,)`` bool
-
-        Returns:
-            Tensor:
-                ``neighbors_future_all`` –
-                보간이 적용된 미래 궤적.
-                **Shape** – ``(B, agent_num, future_len, 3)``
-        """
-        # aug_near_current: (B, Pnn, 11) -> (B * Pnn, 11)
-        Pnn = aug_near_current.shape[1]  # predicted_neighbor_num
-        aug_near_current = aug_near_current.reshape(-1,
-                                                    aug_near_current.shape[-1])
-        aug_flags = aug_flags.reshape(-1)  # (B * Pnn,)
-        neighbors_future_all = neighbors_future_all.to(self._device)
-        aug_near_current = aug_near_current.to(self._device)  # (B * Pnn, 11)
-        aug_flags = aug_flags.to(self._device)
-        # neighbors_future_all: (B, agent_num, future_len, 4)
-        # I want to make neighbors_future_all from neighbors_future_all
-        # (B, agent_num, future_len, 4) -> (B * agent_num, future_len, 4)  -> (B * agent_num, future_len, 3)
-        b, agent_num, future_len, four_dim = neighbors_future_all.shape
-        near_future = neighbors_future_all[:, :Pnn, :, :].clone(
-        )  # (B, Pnn, future_len, 4)
-        near_future = near_future.reshape(b * Pnn, future_len,
-                                          four_dim)  # (B * Pnn, future_len, 4)
-
-        # (B * Pnn, future_len, 4) -> (B * Pnn, future_len, 3)
-        cos_ = near_future[:, :, 2]  # cos # (B * Pnn, future_len)
-        sin_ = near_future[:, :, 3]  # sin # (B * Pnn, future_len)
-        near_future = torch.cat(
-            [
-                near_future[:, :, :2],  # x, y
-                torch.atan2(sin_, cos_)[..., None],  # heading
-            ],
-            dim=-1)  # (B * Pnn, future_len, 3)
-        near_future = near_future.to(self._device)
-
-        refine_P = self.num_refine  # 20
-        dt = self.time_interval  # 0.1
-        T = self.refine_horizon  # 2.0
-        B_n_Pnn = aug_near_current.shape[0]
-        M_t = self.t_matrix.unsqueeze(0).expand(B_n_Pnn, -1, -1)
-        A = self.coeff_matrix.unsqueeze(0).expand(B_n_Pnn, -1, -1)
-
-        # state: [x, y, heading, velocity, acceleration, yaw_rate]
-
-        x0, y0, theta0, v0 = (
-            aug_near_current[:, 0],  # (B_n_Pnn,)
-            aug_near_current[:, 1],
-            torch.atan2(
-                (near_future[:, int(refine_P / 2), 1] - aug_near_current[:, 1]),
-                (near_future[:, int(refine_P / 2), 0] -
-                 aug_near_current[:, 0])),
-            torch.norm(aug_near_current[:, 4:6], dim=-1),
-        )
-        first_fut_point_vel = (near_future[:, 1, 0:2] -
-                               near_future[:, 0, 0:2]) / dt  # (B * Pnn, 2)
-        a0_vec = (first_fut_point_vel - aug_near_current[:, 4:6]) / dt
-        a0 = torch.norm(a0_vec, dim=-1)
-        omega0 = self.normalize_angle(near_future[:, 0, 2] - theta0) / dt
-
-        xT, yT, thetaT, vT, aT, omegaT = (
-            near_future[:, refine_P,
-                        0], near_future[:, refine_P,
-                                        1], near_future[:, refine_P, 2],
-            torch.norm(
-                near_future[:, refine_P, :2] - near_future[:, refine_P - 1, :2],
-                dim=-1) / dt,
-            torch.norm(near_future[:, refine_P, :2] -
-                       2 * near_future[:, refine_P - 1, :2] +
-                       near_future[:, refine_P - 2, :2],
-                       dim=-1) / dt**2,
-            self.normalize_angle(near_future[:, refine_P, 2] -
-                                 near_future[:, refine_P - 1, 2]) / dt)
-
-        # Boundary conditions
-        sx = torch.stack([
-            x0, v0 * torch.cos(theta0), a0 * torch.cos(theta0) -
-            v0 * torch.sin(theta0) * omega0, xT, vT * torch.cos(thetaT),
-            aT * torch.cos(thetaT) - vT * torch.sin(thetaT) * omegaT
-        ],
-                         dim=-1)
-
-        sy = torch.stack([
-            y0, v0 * torch.sin(theta0), a0 * torch.sin(theta0) +
-            v0 * torch.cos(theta0) * omega0, yT, vT * torch.sin(thetaT),
-            aT * torch.sin(thetaT) + vT * torch.cos(thetaT) * omegaT
-        ],
-                         dim=-1)
-
-        # ───────────────── 4. Quintic 계수 ─────────────────
-        A_inv = torch.tensor(
-            [[1, 0, 0, 0, 0, 0],
-             [0, 1, 0, 0, 0, 0],
-             [0, 0, 2, 0, 0, 0],
-             [1, T, T ** 2, T ** 3, T ** 4, T ** 5],
-             [0, 1, 2 * T, 3 * T ** 2, 4 * T ** 3, 5 * T ** 4],
-             [0, 0, 2, 6 * T, 12 * T ** 2, 20 * T ** 3]],
-            device=device, dtype=dtype).inverse()  # (6, 6)
-
-        ax_coef = (A_inv @ sx.unsqueeze(-1)).squeeze(-1)  # (M, 6)
-        ay_coef = (A_inv @ sy.unsqueeze(-1)).squeeze(-1)  # (M, 6)
-
-        # ───────────────── 5. 궤적 샘플링 (t = -2 … -0.1) ─────────────────
-        t_vec = torch.linspace(self.time_interval, T, steps, device=device,
-                               dtype=dtype)  # (time_len - 1,) 0.1…2.0
-        T_mat = torch.stack([t_vec ** i for i in range(6)],
-                            dim=-1)  # (time_len - 1, 6)
-
-        # 양수 방향으로 생성 후 flip → 과거→최근 순서
-        traj_x = (T_mat @ ax_coef.T).T.flip(dims=[1])  # (M, time_len - 1)
-        traj_y = (T_mat @ ay_coef.T).T.flip(dims=[1])  # (M, time_len - 1)
-
-        # ────────── 5‑①. 속도·헤딩 (forward 차분) ──────────
-        # pos_x/y 에 현재(t=0) 위치 붙여 forward diff
-        pos_x = torch.cat([traj_x, x0.unsqueeze(1)], dim=1)  # (M, time_len)
-        pos_y = torch.cat([traj_y, y0.unsqueeze(1)], dim=1)  # (M, time_len)
-
-        dx = pos_x[:, 1:] - pos_x[:, :-1]  # (M, time_len - 1)
-        dy = pos_y[:, 1:] - pos_y[:, :-1]  # (M, time_len - 1)
-
-        vx = dx / self.time_interval  # (M, time_len - 1)
-        vy = dy / self.time_interval
-        heading = torch.atan2(dy, dx)  # (M, time_len - 1)
-        cos_h, sin_h = torch.cos(heading), torch.sin(heading)
-
-        # ────────── 5‑②. new_seg 구성 (M, time_len - 1, 6) ──────────
-        new_seg = torch.zeros((M, steps, 6), device=device, dtype=dtype)
-        new_seg[..., 0] = traj_x
-        new_seg[..., 1] = traj_y
-        new_seg[..., 2] = cos_h
-        new_seg[..., 3] = sin_h
-        new_seg[..., 4] = vx
-        new_seg[..., 5] = vy
-
-        # ───────────────── 6. near_past 덮어쓰기 (전 구간) ─────────────────
-        near_past[sel_idx, :, :6] = new_seg  # t = −2 … −0.1 전부 교체
-
-        # ───────────────── 7. 원본 텐서 복원 ─────────────────
-        near_agents_past[sel_idx, :-1, :6] = near_past[sel_idx, :, :6]
-        near_agents_past = near_agents_past.reshape(B, Pnn, time_len, D)
-
-        neighbor_agents_past = ordered_neighbor_agents_past.clone()
-        neighbor_agents_past[:, :Pnn] = near_agents_past
-        return neighbor_agents_past
-
-
-    def interpolation_future_trajectory(
-        self,
-        aug_near_current: torch.Tensor,
-        neighbors_future_all: torch.Tensor,
-        aug_flags: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Quintic 스플라인으로 **NPC 미래 궤적** 앞 `20` step(0.1s 간격, 2s 구간)을
-        부드럽게 재보간한다.
-
-        Args:
-            aug_near_current (Tensor):
-                증강된 현재 NPC 상태.
-                **Shape** – ``(B, Pnn, 11)``
-                ``[x, y, cosθ, sinθ, v_x, v_y, a_x, a_y, steer, yaw_rate, padding]``
-            neighbors_future_all (Tensor):
-                보간 전 미래 궤적.
-                **Shape** – ``(B, agent_num, future_len, 4)``
-                ``[x, y, cosθ, sinθ]`` × future_len
-            aug_flags (Tensor):
-                보간 수행 여부 플래그.
-                **Shape** – ``(B, Pnn,)`` bool
-
-        Returns:
-            Tensor:
-                ``neighbors_future_all`` –
-                보간이 적용된 미래 궤적.
-                **Shape** – ``(B, agent_num, future_len, 3)``
-        """
-        # aug_near_current: (B, Pnn, 11) -> (B * Pnn, 11)
-        Pnn = aug_near_current.shape[1]  # predicted_neighbor_num
-        aug_near_current = aug_near_current.reshape(-1,
-                                                    aug_near_current.shape[-1])
-        aug_flags = aug_flags.reshape(-1)  # (B * Pnn,)
-        neighbors_future_all = neighbors_future_all.to(self._device)
-        aug_near_current = aug_near_current.to(self._device)  # (B * Pnn, 11)
-        aug_flags = aug_flags.to(self._device)
-        # neighbors_future_all: (B, agent_num, future_len, 4)
-        # I want to make neighbors_future_all from neighbors_future_all
-        # (B, agent_num, future_len, 4) -> (B * agent_num, future_len, 4)  -> (B * agent_num, future_len, 3)
-        b, agent_num, future_len, four_dim = neighbors_future_all.shape
-        near_future = neighbors_future_all[:, :Pnn, :, :].clone(
-        )  # (B, Pnn, future_len, 4)
-        near_future = near_future.reshape(b * Pnn, future_len,
-                                          four_dim)  # (B * Pnn, future_len, 4)
-
-        # (B * Pnn, future_len, 4) -> (B * Pnn, future_len, 3)
-        cos_ = near_future[:, :, 2]  # cos # (B * Pnn, future_len)
-        sin_ = near_future[:, :, 3]  # sin # (B * Pnn, future_len)
-        near_future = torch.cat(
-            [
-                near_future[:, :, :2],  # x, y
-                torch.atan2(sin_, cos_)[..., None],  # heading
-            ],
-            dim=-1)  # (B * Pnn, future_len, 3)
-        near_future = near_future.to(self._device)
-
-        refine_P = self.num_refine  # 20
-        dt = self.time_interval  # 0.1
-        T = self.refine_horizon  # 2.0
-        B_n_Pnn = aug_near_current.shape[0]
-        M_t = self.t_matrix.unsqueeze(0).expand(B_n_Pnn, -1, -1)
-        A = self.coeff_matrix.unsqueeze(0).expand(B_n_Pnn, -1, -1)
-
-        # state: [x, y, heading, velocity, acceleration, yaw_rate]
-
-        x0, y0, theta0, v0 = (
-            aug_near_current[:, 0],  # (B_n_Pnn,)
-            aug_near_current[:, 1],
-            torch.atan2(
-                (near_future[:, int(refine_P / 2), 1] - aug_near_current[:, 1]),
-                (near_future[:, int(refine_P / 2), 0] -
-                 aug_near_current[:, 0])),
-            torch.norm(aug_near_current[:, 4:6], dim=-1),
-        )
-        first_fut_point_vel = (near_future[:, 1, 0:2] -
-                               near_future[:, 0, 0:2]) / dt  # (B * Pnn, 2)
-        a0_vec = (first_fut_point_vel - aug_near_current[:, 4:6]) / dt
-        a0 = torch.norm(a0_vec, dim=-1)
-        omega0 = self.normalize_angle(near_future[:, 0, 2] - theta0) / dt
-
-        xT, yT, thetaT, vT, aT, omegaT = (
-            near_future[:, refine_P,
-                        0], near_future[:, refine_P,
-                                        1], near_future[:, refine_P, 2],
-            torch.norm(
-                near_future[:, refine_P, :2] - near_future[:, refine_P - 1, :2],
-                dim=-1) / dt,
-            torch.norm(near_future[:, refine_P, :2] -
-                       2 * near_future[:, refine_P - 1, :2] +
-                       near_future[:, refine_P - 2, :2],
-                       dim=-1) / dt**2,
-            self.normalize_angle(near_future[:, refine_P, 2] -
-                                 near_future[:, refine_P - 1, 2]) / dt)
-
-        # Boundary conditions
-        sx = torch.stack([
-            x0, v0 * torch.cos(theta0), a0 * torch.cos(theta0) -
-            v0 * torch.sin(theta0) * omega0, xT, vT * torch.cos(thetaT),
-            aT * torch.cos(thetaT) - vT * torch.sin(thetaT) * omegaT
-        ],
-                         dim=-1)
-
-        sy = torch.stack([
-            y0, v0 * torch.sin(theta0), a0 * torch.sin(theta0) +
-            v0 * torch.cos(theta0) * omega0, yT, vT * torch.sin(thetaT),
-            aT * torch.sin(thetaT) + vT * torch.cos(thetaT) * omegaT
-        ],
-                         dim=-1)
-
-        ax_coef = (A @ sx[:, :, None]).squeeze(-1)  # B_n_Pnn, 6, 1
-        ay_coef = (A @ sy[:, :, None]).squeeze(-1)  # B_n_Pnn, 6, 1
-
-        traj_x = M_t @ ax_coef  # (B_n_Pnn, P, 1)
-        traj_y = M_t @ ay_coef  # (B_n_Pnn, P, 1)
+        # (M, 6, 6) @ (M, 6, 1) -> (M, 6, 1)
+        ax_coef = A @ sx[:, :, None]  # M, 6, 1
+        ay_coef = A @ sy[:, :, None]  # M, 6, 1
+        # M_t: (M, P, 6) @ ax_coef: (M, 6, 1) -> (M, P, 1)
+        traj_x = M_t @ ax_coef  # (M, P, 1)
+        traj_y = M_t @ ay_coef  # (M, P, 1)
         a = torch.atan2(traj_y[:, :1, 0] - y0.unsqueeze(-1),
-                        traj_x[:, :1, 0] - x0.unsqueeze(-1))  # (B_n_Pnn, 1)
+                        traj_x[:, :1, 0] - x0.unsqueeze(-1))  # (M, 1)
         b = torch.atan2(traj_y[:, 1:, 0] - traj_y[:, :-1, 0],
-                        traj_x[:, 1:, 0] - traj_x[:, :-1, 0])  # (B_n_Pnn, P-1)
-        traj_heading = torch.cat([a, b], dim=1)  # (B_n_Pnn, P)
-        traj_cos = torch.cos(traj_heading)  # (B_n_Pnn, P)
+                        traj_x[:, 1:, 0] - traj_x[:, :-1, 0])  # (M, P-1)
+        traj_heading = torch.cat([a, b], dim=1)  # (M, P)
+
+
+        traj_cos = torch.cos(traj_heading)  # (M, P)
         traj_sin = torch.sin(traj_heading)
-        # (B_n_Pnn, P, 4)
+        # (M, P, 4)
         refined_result = torch.stack(
             [
                 traj_x[:, :, 0],  # x
@@ -747,33 +441,40 @@ class NPCStatePerturbation:
                 traj_cos,  # cos
                 traj_sin,  # sin
             ],
-            dim=-1)  # (B_n_Pnn, P=20, 4)
+            dim=-1)  # (M, P=20, 4)
         """
         `refined_result`(20 step)을
-        `ordered_neighbors_interpolated_future[:, :, 1:21]` 영역에 복사한다.
+        `ordered_neighbors_interpolated_future[:, :, 0:20]` 영역에 복사한다.
         보간 대상은 `aug_flags == True` 인 샘플에 한정한다.
         """
-
-        near_future[aug_flags, :refine_P, :] = refined_result[
-            aug_flags]  # 보간 결과 적용 # (B * Pnn, 20, 4)
-        # near_future: (B * Pnn, 20, 4) -> (B, Pnn, 20, 4)
-        near_future = near_future.reshape(b, Pnn, refine_P, four_dim)
-        # neighbors_future_all 에 near_future 을 반영한다.
-        neighbors_future_all[:, :Pnn, :refine_P, :] = near_future
-        # neighbors_future_all: (B, agent_num, future_len, 4) -> (B, agent_num, future_len, 3)
-        cos_yaw = neighbors_future_all[:, :, :, 2]  # (B, agent_num, future_len)
-        sin_yaw = neighbors_future_all[:, :, :, 3]  # (B, agent_num, future_len)
-        # clamp를 사용하여 atan2의 입력값이 0에 가까워지는 것을 방지
-        eps = torch.finfo(cos_yaw.dtype).eps
-        cos_yaw = cos_yaw.clamp(min=eps)
-        yaw = torch.atan2(sin_yaw, cos_yaw)  # (B, agent_num, future_len)
-        neighbors_future_all = torch.cat(
+        # neighbor_future: (B * agent_num, future_len, 3) -> (B * agent_num, refine_P, 4)
+        neighbor_future_yaw = neighbor_future[:, :, 2]  # (B * agent_num, future_len)
+        neighbor_future_cos = neighbor_future_yaw.cos()  # (B * agent_num, future_len)
+        neighbor_future_sin = neighbor_future_yaw.sin()  # (B * agent_num, future_len)
+        neighbor_future = torch.stack(
             [
-                neighbors_future_all[:, :, :, :2],  # x, y
+                neighbor_future[:, :, 0],  # x
+                neighbor_future[:, :, 1],  # y
+                neighbor_future_cos,  # cos
+                neighbor_future_sin,  # sin
+            ],
+            dim=-1)  # (B * agent_num, future_len, 4)
+        # 보간 결과 적용 # (B * agent_num, future_len, 4)
+        neighbor_future[sel_idx, :refine_P, :] = refined_result  
+        # neighbor_future: (B * agent_num, future_len, 4) -> (B, agent_num, future_len, 4)
+
+        neighbor_future = neighbor_future.reshape(batch_, agent_num, future_len, four_dim)
+        # neighbor_future: (B, agent_num, future_len, 4) -> (B, agent_num, future_len, 3)
+        cos_yaw = neighbor_future[:, :, :, 2]  # (B, agent_num, future_len)
+        sin_yaw = neighbor_future[:, :, :, 3]  # (B, agent_num, future_len)
+        yaw = torch.atan2(sin_yaw, cos_yaw)  # (B, agent_num, future_len)
+        neighbor_future = torch.cat(
+            [
+                neighbor_future[:, :, :, :2],  # x, y
                 yaw[..., None],  # heading
             ],
             dim=-1) # (B, agent_num, future_len, 3)
-        return neighbors_future_all
+        return neighbor_future
 
     @staticmethod
     def convert_npc_state_to_self_frame(near_current_states: Tensor) -> Tensor:
@@ -1067,10 +768,10 @@ class NPCStatePerturbation:
             neighbor_agents_past: torch.Tensor,
             neighbors_future_all: torch.Tensor,
             aug_flags: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         증강(augmentation)‑된 **가까운 Pnn대 NPC**의 현재 위치를 과거·미래 시계열에 반영하고,
-        *모든* 주변 ``agents_num``대 NPC를 **새로운 거리 순서**(ego → NPC 거리 오름차순)로
+        *모든* 주변 ``agent_num``대 NPC를 **새로운 거리 순서**(ego → NPC 거리 오름차순)로
         재정렬
 
         Args:
@@ -1080,43 +781,39 @@ class NPCStatePerturbation:
                 ``[x, y, cosθ, sinθ, v_x, v_y, width, length, one‑hot(3)]``
             neighbor_agents_past (Tensor):
                 증강 전 거리순으로 정렬된 과거~현재 궤적
-                **Shape** – ``(B, agents_num, time_len, 11)``
+                **Shape** – ``(B, agent_num, time_len, 11)``
             neighbors_future_all (Tensor):
                 증강 전 거리순으로 정렬된 미래 궤적(현재 제외)
-                **Shape** – ``(B, agents_num, future_len, 3)``
+                **Shape** – ``(B, agent_num, future_len, 3)``
             aug_flags (Tensor):
                 `aug_near_current` 각 NPC별 증강 여부
                 **Shape** – ``(B, Pnn)``  (bool)
 
 
         Returns:
-            Tuple[Tensor, Tensor, Tensor, Tensor]:
-            0. aug_near_current
-                증강된 현재 프레임 반영
-                ``(B, Pnn, 11)``
-
+            Tuple[Tensor, Tensor, Tensor]:
 
             1. **neighbor_agents_past** –
                증강된 현재 프레임 반영 + 새 거리순 정렬
-               ``(B, agents_num, time_len, 11)``
+               ``(B, agent_num, time_len, 11)``
 
             2. **neighbors_future_all** –
                새 거리순 정렬된 미래 궤적
-               ``(B, agents_num, future_len, 4)``
+               ``(B, agent_num, future_len, 4)``
 
             3. **aug_flags** –
                새 거리순에서 앞 `Pnn` NPC에 대한 증강 여부
-               ``(B, Pnn)``  (bool)
+               ``(B, agent_num)``  (bool)
         """
         # ───── 기본 정보 및 안전장치 ──────────────────────────────────────────
         B, Pnn, _ = aug_near_current.shape
-        _, agents_num, time_len, _ = neighbor_agents_past.shape
+        _, agent_num, time_len, _ = neighbor_agents_past.shape
         _, _, future_len, _ = neighbors_future_all.shape
         device = neighbor_agents_past.device
         neighbors_future_all = neighbors_future_all.to(device=device,
                                                        dtype=neighbor_agents_past.dtype)
-        if Pnn > agents_num:
-            raise ValueError(f"Pnn({Pnn}) must be ≤ agents_num({agents_num})")
+        if Pnn > agent_num:
+            raise ValueError(f"Pnn({Pnn}) must be ≤ agent_num({agent_num})")
 
         # ───── (2) dtype 정합성 보장 ────────────────────────
         aug_near_current = aug_near_current.to(device=device,
@@ -1155,12 +852,10 @@ class NPCStatePerturbation:
             future_4ch, idx.expand(-1, -1, future_len, 4), dim=1)
 
         # ───── 4. aug_flags 재정렬 및 최신 상태 추출 ─────────
-        flag_full = torch.zeros((B, agents_num), dtype=torch.bool,
+        flag_full = torch.zeros((B, agent_num), dtype=torch.bool,
                                 device=device)
         flag_full[:, :Pnn] = aug_flags
-        flag_reordered = torch.take_along_dim(flag_full, order_idx, dim=1)
-        aug_flags = flag_reordered[:, :Pnn]
+        flag_reordered = torch.take_along_dim(flag_full, order_idx, dim=1) # (B, agent_num)
 
-        aug_near_current = neighbor_agents_past[:, :Pnn, -1, :]  # (B, Pnn, 11)
 
-        return aug_near_current, neighbor_agents_past, neighbors_future_all, aug_flags
+        return neighbor_agents_past, neighbors_future_all, flag_reordered
