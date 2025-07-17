@@ -1116,7 +1116,7 @@ class NPCStatePerturbation:
         yaw_ = neighbors_future_all[..., 2]  # (B, agents_num, future_len)
         cos_yaw = torch.cos(yaw_)  # (B, agents_num, future_len)
         sin_yaw = torch.sin(yaw_)  # (B, agents_num, future_len)
-        neighbors_future_all = torch.cat(
+        future_4ch = torch.cat(
             [neighbors_future_all[..., :2], cos_yaw[..., None],
                 sin_yaw[..., None]], dim=-1) # (B, agents_num, future_len, 4)
 
@@ -1130,7 +1130,13 @@ class NPCStatePerturbation:
 
         # ───── 1. 현재 프레임에 증강 결과 반영 ────────────────────────────────
         past_updated = neighbor_agents_past.clone()  # (B, agent_num, T, 11)
-        past_updated[:, :Pnn, -1, :] = aug_near_current  # (x,y 등 전부)
+        mask = aug_flags[:, :Pnn].to(device)  # (B, Pnn)
+        # True인 위치에만 덮어쓰기
+        past_updated[:, :Pnn, -1, :] = torch.where(
+            mask.unsqueeze(-1),
+            aug_near_current,
+            past_updated[:, :Pnn, -1, :]
+        )
 
         # ───── 2. 신규 거리 계산 (ego → NPC) ────────────────────────────────
         cur_xy: torch.Tensor = past_updated[:, :, -1, :2]  # (B, agent_num, 2)
@@ -1139,24 +1145,20 @@ class NPCStatePerturbation:
 
         # ───── 3. 텐서 재정렬 (take_along_dim 사용으로 메모리 효율화) ─────────────────
         # 과거 궤적 재정렬
-        neighbor_agents_past = torch.take_along_dim(
-            past_updated,
-            order_idx.unsqueeze(-1).unsqueeze(-1),  # (B, agent_num, 1, 1)
-            dim=1
-        )  # (B, agent_num, T, 11)
+        # 4) gather를 이용한 재정렬
+        idx_past = order_idx[:, :, None, None].expand(-1, -1, time_len, 11) # (B, agent_num, time_len, 11)
+        neighbor_agents_past = past_updated.gather(dim=1, index=idx_past)
 
-        # 미래 궤적 재정렬
-        neighbors_future_all = torch.take_along_dim(
-            neighbors_future_all,
-            order_idx.unsqueeze(-1).unsqueeze(-1),  # (B, agent_num, 1, 1)
-            dim=1
-        )  # (B, agent_num, F, 4)
+        idx_fut = order_idx[:, :, None, None].expand(-1, -1, future_len, 4) # (B, agent_num, future_len, 4)
+        neighbors_future_all = future_4ch.gather(dim=1, index=idx_fut)
 
-        # ───── 4. aug_flags 재정렬 (앞 Pnn 개만 반환) ────────────────────────
-        flag_full = torch.zeros((B, agents_num), dtype=torch.bool,
-                                device=device)
+        # 5) augment 플래그 재정렬
+        flag_full = torch.zeros((B, agents_num), dtype=torch.bool, device=device)
         flag_full[:, :Pnn] = aug_flags
-        flag_reordered = torch.take_along_dim(flag_full, order_idx, dim=1)  # (B, agent_num)
-        aug_flags = flag_reordered[:, :Pnn]  # (B, Pnn)
-        aug_near_current = neighbor_agents_past[:, :Pnn, -1, :11]  # (B, Pnn, 11)
+        flag_reordered = flag_full.gather(dim=1, index=order_idx)
+        aug_flags = flag_reordered[:, :Pnn]
+
+        # 6) 재정렬 후 최신 상태 추출
+        aug_near_current = neighbor_agents_past[:, :Pnn, -1, :]
+
         return aug_near_current, neighbor_agents_past, neighbors_future_all, aug_flags
