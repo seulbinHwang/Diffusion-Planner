@@ -39,7 +39,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="npc_current_state_aug")
+                        default="npc_current_state_aug_0.5")
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -245,9 +245,35 @@ def purge_collection(api, entity, project, coll_name):
     if not versions:
         print(f"[PURGE] {coll_name}: 삭제할 버전이 없습니다.")
         return
+
+    deleted_count = 0
+    failed_count = 0
+
     for art in versions:
-        art.delete()
-    print(f"[PURGE] {coll_name}: {len(versions)}개 버전 모두 삭제 완료.")
+        try:
+            # alias가 있는 artifact의 경우 alias를 먼저 제거
+            if hasattr(art, 'aliases') and art.aliases:
+                print(f"[PURGE] {coll_name}: Artifact {art.id}에 alias가 있어 alias를 먼저 제거합니다: {art.aliases}")
+                for alias in art.aliases:
+                    try:
+                        art.delete_alias(alias)
+                        print(f"[PURGE] {coll_name}: Alias '{alias}' 제거 완료")
+                    except Exception as alias_err:
+                        print(f"[PURGE] {coll_name}: Alias '{alias}' 제거 실패: {alias_err}")
+
+            # artifact 삭제 시도
+            art.delete()
+            deleted_count += 1
+            print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 완료")
+
+        except Exception as e:
+            failed_count += 1
+            print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 실패 - {str(e)}")
+            # alias가 있는 경우의 오류는 경고로만 처리하고 계속 진행
+            if "due to existing alias" in str(e):
+                print(f"[PURGE] {coll_name}: Alias로 인한 삭제 실패는 정상적인 상황입니다. 계속 진행합니다.")
+
+    print(f"[PURGE] {coll_name}: 삭제 완료 {deleted_count}개, 실패 {failed_count}개")
 
 
 def model_training(args):
