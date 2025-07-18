@@ -5,7 +5,6 @@ from torch import Tensor
 import numpy as np
 from typing import List, Optional, Tuple, Union, cast, Dict
 
-from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
 
 NUM_REFINE = 20
 REFINE_HORIZON = 2.0
@@ -40,12 +39,11 @@ class NPCStatePerturbation:
         self._device = torch.device(device)
         self._low = torch.tensor(low).to(self._device)
         self._high = torch.tensor(high).to(self._device)
-        self._wheel_base = get_pacifica_parameters().wheel_base
 
         self.refine_horizon = REFINE_HORIZON
         self.num_refine = NUM_REFINE
         self.time_interval = TIME_INTERVAL
-        T = REFINE_HORIZON + TIME_INTERVAL
+        T = - REFINE_HORIZON
         self.A_inv_const = torch.tensor(
             [[1, 0, 0, 0, 0, 0],
              [0, 1, 0, 0, 0, 0],
@@ -53,6 +51,8 @@ class NPCStatePerturbation:
              [1, T, T ** 2, T ** 3, T ** 4, T ** 5],
              [0, 1, 2 * T, 3 * T ** 2, 4 * T ** 3, 5 * T ** 4],
              [0, 0, 2, 6 * T, 12 * T ** 2, 20 * T ** 3]]).inverse()  # (6, 6)
+        T = REFINE_HORIZON + TIME_INTERVAL
+
         self.coeff_matrix = torch.linalg.inv(
             torch.tensor([[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0],
                           [0, 0, 2, 0, 0, 0], [1, T, T**2, T**3, T**4, T**5],
@@ -60,8 +60,17 @@ class NPCStatePerturbation:
                           [0, 0, 2, 6 * T, 12 * T**2, 20 * T**3]],
                          device=device,
                          dtype=torch.float32))
-        # A_inv_const 와 coeff_matrix가 같은지 확인
-        assert torch.allclose(self.A_inv_const, self.coeff_matrix)
+        ##### # 0.1 , 2.0, 20
+        t_vec = torch.linspace(self.time_interval, REFINE_HORIZON, NUM_REFINE, device=device,
+                               dtype=torch.float32)  # (time_len - 1,) 0.1,,, 2.0
+        # i want to make -2.0 , -1.9, ..., -0.1
+        t_veec_2 = torch.linspace(-REFINE_HORIZON, -self.time_interval,
+                                    NUM_REFINE,
+                                    device=device,
+                                    dtype=torch.float32)
+        self.T_mat = torch.stack([t_veec_2 ** i for i in range(6)],
+                            dim=-1)  # (time_len - 1, 6)
+
         # TIME_INTERVAL: 0.1, REFINE_HORIZON: 2.0, NUM_REFINE: 20
         a = torch.linspace(TIME_INTERVAL, REFINE_HORIZON, NUM_REFINE).unsqueeze(
             1)  # (20, 1) # [0.1, 0.2, ..., 2.0]
@@ -231,20 +240,16 @@ class NPCStatePerturbation:
         ], dim=-1)
 
         # ───────────────── 4. Quintic 계수 ─────────────────
-
-        A_inv = self.coeff_matrix.to(device=device, dtype=dtype)
-        ax_coef = (A_inv @ sx.unsqueeze(-1)).squeeze(-1)  # (M, 6)
-        ay_coef = (A_inv @ sy.unsqueeze(-1)).squeeze(-1)  # (M, 6)
+        # coeff_matrix: (6, 6) # sx, sy: (M, 6) -> (M, 6, 1)
+        # (6, 6) @ (M, 6, 1) -> (M, 6, 1) -> (M, 6)
+        ax_coef = (self.A_inv_const @ sx.unsqueeze(-1)).squeeze(-1)  # (M, 6)
+        ay_coef = (self.A_inv_const @ sy.unsqueeze(-1)).squeeze(-1)  # (M, 6)
 
         # ───────────────── 5. 궤적 샘플링 (t = -2 … -0.1) ─────────────────
-        t_vec = torch.linspace(self.time_interval, T, time_len - 1, device=device,
-                               dtype=dtype)  # (time_len - 1,) 0.1…2.0
-        T_mat = torch.stack([t_vec ** i for i in range(6)],
-                            dim=-1)  # (time_len - 1, 6)
 
         # 양수 방향으로 생성 후 flip → 과거→최근 순서
-        traj_x = (T_mat @ ax_coef.T).T.flip(dims=[1])  # (M, time_len - 1)
-        traj_y = (T_mat @ ay_coef.T).T.flip(dims=[1])  # (M, time_len - 1)
+        traj_x = (self.T_mat @ ax_coef.T).T  # (M, time_len - 1)
+        traj_y = (self.T_mat @ ay_coef.T).T  # (M, time_len - 1)
 
         # ────────── 5‑①. 속도·헤딩 (forward 차분) ──────────
         # pos_x/y 에 현재(t=0) 위치 붙여 forward diff
@@ -261,12 +266,8 @@ class NPCStatePerturbation:
         heading_raw = torch.atan2(dy, dx)  # (M, steps)
         mask_zero = (dx.abs() + dy.abs()) < 1e-6  # True → dx=dy≈0
 
-        # 초기값(가장 과거 프레임)에서는 θ_prev 를 사용
-        theta_prev = torch.atan2(aug_neighbor_past[:, -1, 3],  # (M,)
-                                 aug_neighbor_past[:, -1, 2])
-
         heading = heading_raw.clone()
-        heading[:, 0] = torch.where(mask_zero[:, 0], theta_prev,
+        heading[:, 0] = torch.where(mask_zero[:, 0], thetaT,
                                     heading_raw[:, 0])
 
         # forward‑fill : 1~steps‑1
@@ -283,6 +284,7 @@ class NPCStatePerturbation:
         new_seg[..., 3] = sin_h
         new_seg[..., 4] = vx
         new_seg[..., 5] = vy
+        # 첫 경계 조건
 
         # ───────────────── 6. neighbor_past 덮어쓰기 (전 구간) ─────────────────
         # (B·agent_num, time_len - 1, 11)
@@ -447,19 +449,6 @@ class NPCStatePerturbation:
         `ordered_neighbors_interpolated_future[:, :, 0:20]` 영역에 복사한다.
         보간 대상은 `aug_flags == True` 인 샘플에 한정한다.
         """
-        # neighbor_future: (B * agent_num, future_len, 3) -> (B * agent_num, refine_P, 4)
-        neighbor_future_yaw = neighbor_future[:, :, 2]  # (B * agent_num, future_len)
-        neighbor_future_cos = neighbor_future_yaw.cos()  # (B * agent_num, future_len)
-        neighbor_future_sin = neighbor_future_yaw.sin()  # (B * agent_num, future_len)
-        neighbor_future = torch.stack(
-            [
-                neighbor_future[:, :, 0],  # x
-                neighbor_future[:, :, 1],  # y
-                neighbor_future_cos,  # cos
-                neighbor_future_sin,  # sin
-            ],
-            dim=-1)  # (B * agent_num, future_len, 4)
-        # 보간 결과 적용 # (B * agent_num, future_len, 4)
         neighbor_future[sel_idx, :refine_P, :] = refined_result  
         # neighbor_future: (B * agent_num, future_len, 4) -> (B, agent_num, future_len, 4)
 
@@ -473,7 +462,7 @@ class NPCStatePerturbation:
                 neighbor_future[:, :, :, :2],  # x, y
                 yaw[..., None],  # heading
             ],
-            dim=-1) # (B, agent_num, future_len, 3)
+            dim=-1).to(self._device) # (B, agent_num, future_len, 3)
         return neighbor_future
 
     @staticmethod
@@ -561,7 +550,7 @@ class NPCStatePerturbation:
             raise ValueError("augment_prob는 0.0 이상 1.0 이하이어야 합니다.")
 
         # 1) 배치당 선택할 agent 개수
-        k = int(round(predicted_neighbor_num * augment_prob))
+        k = int(round(predicted_neighbor_num * augment_prob + 0.00001))
 
         # 2) 극단 case 처리
         if k <= 0:
