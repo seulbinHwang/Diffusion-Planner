@@ -39,7 +39,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="npc_current_state_aug_0.5")
+                        default="test") # npc_current_state_aug_0.5
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -119,7 +119,7 @@ def get_args():
                         type=str)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
-    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--num_workers', default=1, type=int)
     parser.add_argument(
         '--pin-mem',
         action='store_true',
@@ -148,7 +148,7 @@ def get_args():
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
-                        default=1024)
+                        default=1)
     parser.add_argument('--learning_rate',
                         type=float,
                         help='learning rate (default: 5e-4)',
@@ -177,7 +177,7 @@ def get_args():
                         default='cuda')
 
     parser.add_argument('--use_ema', default=True, type=boolean)
-    parser.add_argument('--remove_existing_wb_weight', default=True, type=boolean)
+    parser.add_argument('--remove_existing_wb_weight', default=False, type=boolean)
     parser.add_argument('--delete_wb_weight_when_running', default=False, type=boolean)
 
     # Model
@@ -213,7 +213,7 @@ def get_args():
                         help='path to resume model',
                         default=None)
 
-    parser.add_argument('--use_wandb', default=True, type=boolean)
+    parser.add_argument('--use_wandb', default=False, type=boolean)
     parser.add_argument('--notes', default='', type=str)
 
     # distributed training parameters

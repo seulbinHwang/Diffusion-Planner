@@ -21,9 +21,11 @@ def train_epoch(data_loader,
 
     if args.ddp:
         torch.cuda.synchronize()
-
+    print("0")
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
+        print("1")
         for batch in data_epoch:
+            print("2")
             '''
             data structure in batch: Tuple(Tensor) 
 
@@ -68,71 +70,71 @@ def train_epoch(data_loader,
             if isinstance(aug, NPCStatePerturbation):
                 inputs, neighbors_future = aug(
                     inputs, neighbors_future_all, args)
-
-
-            # heading to cos sin
-            ego_future = torch.cat(
-                [
-                    ego_future[..., :2],
-                    torch.stack(
-                        [ego_future[..., 2].cos(), ego_future[..., 2].sin()],
-                        dim=-1),
-                ],
-                dim=-1,
-            )
-
-            mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
-                             dim=-1) == 0
-            neighbors_future = torch.cat(
-                [
-                    neighbors_future[..., :2],
-                    torch.stack([
-                        neighbors_future[..., 2].cos(),
-                        neighbors_future[..., 2].sin()
-                    ],
-                                dim=-1),
-                ],
-                dim=-1,
-            )
-            neighbors_future[mask] = 0.
-            inputs = args.observation_normalizer(inputs)
-
-            # call the mdoel
-            optimizer.zero_grad()
-            loss = {}
-
-            loss, _ = diffusion_loss_func(
-                model, inputs,
-                ddp.get_model(model, args.ddp).sde.marginal_prob,
-                (ego_future, neighbors_future, mask), args.state_normalizer,
-                loss, args.diffusion_model_type)
-
-            loss['loss'] = loss[
-                'neighbor_prediction_loss'] + args.alpha_planning_loss * loss[
-                    'ego_planning_loss']
-
-            total_loss = loss['loss'].item()
-
-            # loss backward
-            loss['loss'].backward()
-
-            nn.utils.clip_grad_norm_(model.parameters(), 5)
-            optimizer.step()
-
-            ema.update(model)
-
-            if args.ddp:
-                torch.cuda.synchronize()
-
-            data_epoch.set_postfix(loss='{:.4f}'.format(total_loss))
-            epoch_loss.append(loss)
-
+            #
+            #
+            # # heading to cos sin
+            # ego_future = torch.cat(
+            #     [
+            #         ego_future[..., :2],
+            #         torch.stack(
+            #             [ego_future[..., 2].cos(), ego_future[..., 2].sin()],
+            #             dim=-1),
+            #     ],
+            #     dim=-1,
+            # )
+            #
+            # mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
+            #                  dim=-1) == 0
+            # neighbors_future = torch.cat(
+            #     [
+            #         neighbors_future[..., :2],
+            #         torch.stack([
+            #             neighbors_future[..., 2].cos(),
+            #             neighbors_future[..., 2].sin()
+            #         ],
+            #                     dim=-1),
+            #     ],
+            #     dim=-1,
+            # )
+            # neighbors_future[mask] = 0.
+            # inputs = args.observation_normalizer(inputs)
+            #
+            # # call the mdoel
+            # optimizer.zero_grad()
+            # loss = {}
+            #
+            # loss, _ = diffusion_loss_func(
+            #     model, inputs,
+            #     ddp.get_model(model, args.ddp).sde.marginal_prob,
+            #     (ego_future, neighbors_future, mask), args.state_normalizer,
+            #     loss, args.diffusion_model_type)
+            #
+            # loss['loss'] = loss[
+            #     'neighbor_prediction_loss'] + args.alpha_planning_loss * loss[
+            #         'ego_planning_loss']
+            #
+            # total_loss = loss['loss'].item()
+            #
+            # # loss backward
+            # loss['loss'].backward()
+            #
+            # nn.utils.clip_grad_norm_(model.parameters(), 5)
+            # optimizer.step()
+            #
+            # ema.update(model)
+            #
+            # if args.ddp:
+            #     torch.cuda.synchronize()
+            #
+            # data_epoch.set_postfix(loss='{:.4f}'.format(total_loss))
+            # epoch_loss.append(loss)
+    raise NotImplementedError("The training loop is not fully implemented yet.")
     epoch_mean_loss = get_epoch_mean_loss(epoch_loss)
 
     if args.ddp:
         epoch_mean_loss = ddp.reduce_and_average_losses(
             epoch_mean_loss, torch.device(args.device))
-
+    print("3")
     if ddp.get_rank() == 0:
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
