@@ -88,163 +88,180 @@ class NPCStatePerturbation:
         neighbor_agents_past: torch.Tensor,  # (B, agent_num, time_len, 11)
         neighbors_future_all: torch.Tensor,  # (B, agent_num, future_len, 3)
         aug_near_current: torch.Tensor,  # (B, Pnn, 11)
-        valid_mask: torch.Tensor,  # (B, agent_num)  (bool)
-            near_invalid_future_start_idx: torch.Tensor,  # (B, Pnn)
-        aug_flags: torch.Tensor,  # (B, Pnn)  (bool)
-        batch_idx: int = 0,
+        valid_mask: torch.Tensor,  # (B, agent_num) bool
+        near_invalid_future_start_idx: torch.Tensor,  # (B, Pnn)
+        aug_flags: torch.Tensor,  # (B, Pnn) bool
         save_path: str = "debug_vis.png",
     ) -> None:
         """
-        • 배치 `batch_idx` 만 시각화
-        • 빨간색 : 원본 NPC 궤적/상태
-        • 파란색 : 증강된 현재 NPC
-        • 과거/미래 궤적은 `aug_flags==True` & **실제 존재** 에이전트만 그림
-        • 패딩(전부 0) 슬롯은 자동으로 무시
+        • 첫 1~4개 배치만 서브플롯으로 그려서 하나의 PNG 로 저장
+          - B=1  → 1×1
+          - B=2  → 1×2
+          - B=3  → 2×2 (1칸 비어 있음)
+          - B>=4 → 2×2 (앞 4개 배치만)
         """
         import matplotlib.pyplot as plt
         from matplotlib.patches import Polygon
-        import math, numpy as np
+        import numpy as np, math
 
-        # ── 텐서 → NumPy ───────────────────────────────
-        a_neighbor_agent_past = neighbor_agents_past[batch_idx].cpu().numpy(
-        )  # (N, T, 11)
-        a_neighbors_future_all = neighbors_future_all[batch_idx].cpu().numpy(
-        )  # (N, F, 3)
-        a_aug_near_current = aug_near_current[batch_idx].cpu().numpy(
-        )  # (Pnn, 11)
-        a_valid_agents = valid_mask[batch_idx].cpu().numpy().astype(
-            bool)  # (N,)
-        a_near_invalid_future_start_idx = near_invalid_future_start_idx[
-            batch_idx].cpu().numpy()  # (Pnn,)
-        a_aug_flag = aug_flags[batch_idx].cpu().numpy().astype(bool)  # (Pnn,)
+        B = neighbor_agents_past.size(0)
+        B_vis = min(B, 4)  # 최대 4개만 시각화
 
-        agent_num, T, _ = a_neighbor_agent_past.shape
-        Pnn = a_aug_near_current.shape[0]  # Pnn: predicted neighbor num
-        F = a_neighbors_future_all.shape[1]
+        # ── (1) 서브플롯 배치 결정 ─────────────────────────────
+        if B_vis == 1:
+            nrows, ncols = 1, 1
+        elif B_vis == 2:
+            nrows, ncols = 1, 2
+        else:  # 3 또는 4
+            nrows, ncols = 2, 2
 
-        # ── ② Figure 초기화 ─────────────────────────────
-        fig, ax = plt.subplots(figsize=(8, 8))
-        ax.set_aspect("equal")
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(8 * ncols, 8 * nrows),
+            squeeze=False,  # 항상 2차원 배열로
+        )
 
-        def _rect_corners(x, y, yaw, w, l):
-            hw, hl = w / 2.0, l / 2.0
-            local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
-            R = np.array([[math.cos(yaw), -math.sin(yaw)],
-                          [math.sin(yaw), math.cos(yaw)]])
-            return local @ R.T + np.array([x, y])
+        # 플랫 인덱스를 돌며 각 배치 시각화
+        for b in range(nrows * ncols):
+            ax = axes[b // ncols][b % ncols]
 
-        # ── ③ 과거 궤적 & heading (빨간색) ───────────────
-        for i in range(Pnn):  # a_aug_flag==True & 존재
-            if not a_valid_agents[i]:
+            if b >= B_vis:
+                # 비어 있는 칸 : 축 끄기
+                ax.axis("off")
                 continue
-            if not a_aug_flag[i]:
-                continue
-            for t in range(T - 1):
-                x, y = a_neighbor_agent_past[i, t, 0:2]
-                cos_, sin_ = a_neighbor_agent_past[i, t, 2:4]
-                ax.plot(x, y, "o", color="red", ms=2)
-                ax.arrow(x,
-                         y,
-                         cos_,
-                         sin_,
-                         head_width=0.05,
-                         head_length=0.1,
-                         color="red",
-                         linewidth=0.5,
-                         length_includes_head=True)
 
-        # ── ④ 미래 궤적 & heading (빨간색) ───────────────
-        for i in range(Pnn):
-            if not a_valid_agents[i]:
-                continue
-            if not a_aug_flag[i]:
-                continue
-            for f in range(F):
-                if a_near_invalid_future_start_idx[i] <= f:
+            # ───── 텐서 → numpy (선택 배치만) ───────────────────
+            a_past = neighbor_agents_past[b].cpu().numpy()  # (N,T,11)
+            a_fut = neighbors_future_all[b].cpu().numpy()  # (N,F,3)
+            a_aug = aug_near_current[b].cpu().numpy()  # (Pnn,11)
+            a_valid = valid_mask[b].cpu().numpy().astype(bool)  # (N,)
+            a_inv_st = near_invalid_future_start_idx[b].cpu().numpy()  # (Pnn,)
+            a_flag = aug_flags[b].cpu().numpy().astype(bool)  # (Pnn,)
+
+            N, T, _ = a_past.shape
+            Pnn = a_aug.shape[0]
+            F = a_fut.shape[1]
+
+            # ───── 0) 공통 설정 ────────────────────────────────
+            ax.set_aspect("equal")
+            ax.axhline(0, color="black", linewidth=2, linestyle="--")
+            ax.axvline(0, color="black", linewidth=2, linestyle="--")
+            ax.set_title(f"Batch {b}")
+
+            # ───── helper ─────────────────────────────────────
+            def _rect_corners(x, y, yaw, w, l):
+                hw, hl = w / 2.0, l / 2.0
+                local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+                R = np.array([[math.cos(yaw), -math.sin(yaw)],
+                              [math.sin(yaw), math.cos(yaw)]])
+                return local @ R.T + np.array([x, y])
+
+            # ① 과거 궤적
+            for i in range(Pnn):
+                if not (a_valid[i] and a_flag[i]):
                     continue
-                x, y, yaw = a_neighbors_future_all[i, f]
-                ax.plot(x, y, "o", color="red", ms=2)
+                for t in range(T - 1):  # 현재 제외
+                    x, y = a_past[i, t, 0:2]
+                    cos_, sin_ = a_past[i, t, 2:4]
+                    ax.plot(x, y, "o", color="red", ms=2)
+                    ax.arrow(x,
+                             y,
+                             cos_,
+                             sin_,
+                             head_width=0.05,
+                             head_length=0.1,
+                             color="red",
+                             linewidth=0.5,
+                             length_includes_head=True)
+
+            # ② 미래 궤적
+            for i in range(Pnn):
+                if not (a_valid[i] and a_flag[i]):
+                    continue
+                for f in range(F):
+                    if a_inv_st[i] <= f:  # (0,0,0) trailing zone
+                        continue
+                    x, y, yaw = a_fut[i, f]
+                    ax.plot(x, y, "o", color="red", ms=2)
+                    ax.arrow(x,
+                             y,
+                             math.cos(yaw),
+                             math.sin(yaw),
+                             head_width=0.05,
+                             head_length=0.1,
+                             color="red",
+                             linewidth=0.5,
+                             length_includes_head=True)
+
+            # ③ 현재 프레임 (빨간 박스)
+            for i in range(N):
+                if not a_valid[i]:
+                    continue
+                x, y = a_past[i, -1, 0:2]
+                cos_, sin_ = a_past[i, -1, 2:4]
+                yaw = math.atan2(sin_, cos_)
+                w, l = a_past[i, -1, 6:8]
+                if w <= 0 or l <= 0:
+                    continue
+                rect = Polygon(_rect_corners(x, y, yaw, w, l),
+                               closed=True,
+                               fill=False,
+                               edgecolor="red",
+                               linewidth=1.0)
+                ax.add_patch(rect)
                 ax.arrow(x,
                          y,
                          math.cos(yaw),
                          math.sin(yaw),
-                         head_width=0.05,
-                         head_length=0.1,
+                         head_width=0.1,
+                         head_length=0.2,
                          color="red",
-                         linewidth=0.5,
+                         linewidth=1.0,
+                         length_includes_head=True)
+                ax.text(x,
+                        y,
+                        str(i),
+                        color="red",
+                        fontsize=8,
+                        ha="center",
+                        va="center",
+                        zorder=5)
+
+            # ④ 증강 현재 (파란 박스)
+            for k in range(Pnn):
+                if not a_valid[k]:
+                    continue
+                x, y = a_aug[k, 0:2]
+                cos_, sin_ = a_aug[k, 2:4]
+                yaw = math.atan2(sin_, cos_)
+                w, l = a_aug[k, 6:8]
+                if w <= 0 or l <= 0:
+                    continue
+                style = "--" if a_flag[k] else "-"
+                rect = Polygon(_rect_corners(x, y, yaw, w, l),
+                               closed=True,
+                               fill=False,
+                               edgecolor="blue",
+                               linestyle=style,
+                               linewidth=1.0)
+                ax.add_patch(rect)
+                ax.arrow(x,
+                         y,
+                         math.cos(yaw),
+                         math.sin(yaw),
+                         head_width=0.1,
+                         head_length=0.2,
+                         color="blue",
+                         linewidth=1.0,
                          length_includes_head=True)
 
-        # ── ⑤ 현재 프레임 (빨간 사각형) ──────────────────
-        for i in range(agent_num):
-            if not a_valid_agents[i]:
-                continue
-            x, y = a_neighbor_agent_past[i, -1, 0:2]
-            cos_, sin_ = a_neighbor_agent_past[i, -1, 2:4]
-            yaw = math.atan2(sin_, cos_)
-            w, l = a_neighbor_agent_past[i, -1, 6:8]
-            if w <= 0 or l <= 0:
-                continue
-            rect = Polygon(_rect_corners(x, y, yaw, w, l),
-                           closed=True,
-                           fill=False,
-                           edgecolor="red",
-                           linewidth=1.0)
-            ax.add_patch(rect)
-            ax.arrow(x,
-                     y,
-                     math.cos(yaw),
-                     math.sin(yaw),
-                     head_width=0.1,
-                     head_length=0.2,
-                     color="red",
-                     linewidth=1.0,
-                     length_includes_head=True)
+        # ───── (마무리) 공통 레이블/저장 ───────────────────────
+        for ax in axes.flatten():
+            ax.set_xlabel("x [m]")
+            ax.set_ylabel("y [m]")
+            ax.grid(True)
 
-        # ── ⑥ aug near 현재 프레임 (파란 사각형) ──────────────
-        for k in range(Pnn):
-            if not a_valid_agents[k]:
-                continue
-            x, y = a_aug_near_current[k, 0:2]
-            cos_, sin_ = a_aug_near_current[k, 2:4]
-            yaw = math.atan2(sin_, cos_)
-            w, l = a_aug_near_current[k, 6:8]
-            if w <= 0 or l <= 0:
-                continue
-            style = '--' if a_aug_flag[k] else '-'
-            rect = Polygon(_rect_corners(x, y, yaw, w, l),
-                           closed=True,
-                           fill=False,
-                           edgecolor="blue",
-                           linestyle=style,
-                           linewidth=1.0)
-            ax.add_patch(rect)
-            ax.arrow(x,
-                     y,
-                     math.cos(yaw),
-                     math.sin(yaw),
-                     head_width=0.1,
-                     head_length=0.2,
-                     color="blue",
-                     linewidth=1.0,
-                     length_includes_head=True)
-
-            # 필요 시 속도벡터(주석 해제)
-            # if a_aug_flag[k]:
-            #     vx0, vy0 = a_neighbor_agent_past[k, -1, 4], a_neighbor_agent_past[k, -1, 5]
-            #     ax.arrow(x, y, vx0, vy0,
-            #              head_width=0.1, head_length=0.2,
-            #              color="red", linewidth=1.0,
-            #              length_includes_head=True)
-            #     vx1, vy1 = a_aug_near_current[k, 4], a_aug_near_current[k, 5]
-            #     ax.arrow(x, y, vx1, vy1,
-            #              head_width=0.1, head_length=0.2,
-            #              color="blue", linewidth=1.0,
-            #              length_includes_head=True)
-
-        # ── ⑦ 마무리 ────────────────────────────────────
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
-        ax.grid(True)
         plt.tight_layout()
         plt.savefig(save_path, dpi=200)
         plt.close(fig)
@@ -306,13 +323,66 @@ class NPCStatePerturbation:
 
         # F 그대로 남은 위치 = trailing_zero 전혀 없음 → ∞로 치환
         inf = torch.tensor(float("inf"), device=device, dtype=dtype)
-        near_invalid_future_start_idx = torch.where(zero_start_idx_val == F, inf,
-                                     zero_start_idx_val.to(dtype))  # (B,Pnn)
+        near_invalid_future_start_idx = torch.where(
+            zero_start_idx_val == F, inf,
+            zero_start_idx_val.to(dtype))  # (B,Pnn)
 
         # ── (4) healthy_near_future_mask ─────────────────────────────
-        healthy_near_future_mask = near_invalid_future_start_idx >= (num_refine + 1)
+        healthy_near_future_mask = near_invalid_future_start_idx >= (
+            num_refine + 1)
 
         return near_invalid_future_start_idx, healthy_near_future_mask
+
+    @staticmethod
+    def get_healthy_near_past_mask(
+        near_agents_past: torch.Tensor  # (B, Pnn, time_len, 11)
+    ) -> torch.BoolTensor:  # (B, Pnn)
+        """
+        healthy_near_past_mask 정의
+        ------------------------------------------
+        • 한 에이전트의 과거 궤적(time_len 개 프레임) 중
+          단 한 프레임이라도 11‑차원 상태 벡터가 전부 0.0 이라면
+          → 해당 에이전트는 **비정상(False)**
+        • 그런 프레임이 전혀 없으면
+          → **정상(True)**
+
+        Returns
+        -------
+        healthy_near_past_mask : torch.BoolTensor
+            shape (B, Pnn)
+        """
+        if near_agents_past.ndim != 4 or near_agents_past.size(-1) != 11:
+            raise ValueError(
+                f"'near_agents_past' must have shape (B, Pnn, time_len, 11), "
+                f"got {near_agents_past.shape}")
+
+        # (1) 각 프레임이 **전부 0** 인지 검사  →  (B, Pnn, time_len) bool
+        zero_frame_mask = (near_agents_past == 0).all(dim=-1)
+
+        # (2) 그 중 하나라도 True 가 있으면 비정상
+        has_zero_frame = zero_frame_mask.any(dim=-1)  # (B, Pnn) bool
+
+        # (3) healthy = NOT(has_zero_frame)
+        healthy_near_past_mask = ~has_zero_frame  # (B, Pnn)
+        return healthy_near_past_mask
+
+    @staticmethod
+    def reshape_neighbors_future_all_4_to_3(
+            neighbors_future_all: torch.Tensor) -> torch.Tensor:
+        neighbors_future_all_3_dim = torch.zeros(
+            neighbors_future_all.shape[0],
+            neighbors_future_all.shape[1],
+            neighbors_future_all.shape[2],
+            3,
+            device=neighbors_future_all.device,
+            dtype=neighbors_future_all.dtype)
+
+        # neighbors_future_all_3_dim: (B, agent_num, future_len, 3)
+        neighbors_future_all_3_dim[:, :, :, 0:2] = neighbors_future_all[:, :, :,
+                                                                        0:2]
+        neighbors_future_all_3_dim[:, :, :, 2] = torch.atan2(
+            neighbors_future_all[:, :, :, 3], neighbors_future_all[:, :, :, 2])
+        return neighbors_future_all_3_dim
 
     def __call__(self, inputs: Dict[str, torch.Tensor],
                  neighbors_future_all: torch.Tensor,
@@ -334,6 +404,16 @@ class NPCStatePerturbation:
         near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_future_flag(
             neighbors_future_all[:, :args.predicted_neighbor_num, :, :],
             self.num_refine)  # (B, Pnn), (B, Pnn) (bool)
+
+        # healthy_near_past_mask 만들기 # (B, Pnn) (bool)
+        near_agents_past = neighbor_agents_past[:, :args.
+                                                predicted_neighbor_num, :, :]  # (B, Pnn, time_len, 11)
+        """ 
+        near_agents_past 의 (11) 이 전부 0. 인 time_len가 1개라도 있으면 -> healthy_near_past_mask 의 원소값 False
+        """
+        # healthy_near_past_mask: (B, Pnn) (bool)
+        healthy_near_past_mask = self.get_healthy_near_past_mask(
+            near_agents_past)
         near_agents_current = neighbor_agents_past[:, :
                                                    args.predicted_neighbor_num,
                                                    -1, :]  # (B, pnn, 11)
@@ -345,7 +425,7 @@ class NPCStatePerturbation:
         aug_flags = self.generate_aug_flag(
             self._augment_prob, near_current_wrt_self,
             valid_agent_mask[:, :args.predicted_neighbor_num],
-            healthy_near_future_mask)
+            healthy_near_past_mask, healthy_near_future_mask)
         # aug_near_current_wrt_self: (B, Pnn, 11)
         aug_near_current_wrt_self = self.augment(near_current_wrt_self,
                                                  aug_flags)
@@ -363,7 +443,6 @@ class NPCStatePerturbation:
             valid_agent_mask.clone().detach(),
             near_invalid_future_start_idx.clone().detach(),
             aug_flags.clone().detach(),
-            batch_idx=0,
             save_path=f"debug_vis_{self.count}.png"  # 필요 시 경로/파일명 변경
         )
         """
@@ -374,31 +453,24 @@ class NPCStatePerturbation:
         neighbor_agents_past, neighbors_future_all, aug_flags = \
             self.reorder_neighbors_after_augmentation(
             aug_near_current, neighbor_agents_past, neighbors_future_all,
+                valid_agent_mask,
             aug_flags)
-        neighbors_future_all_dim_three = torch.zeros(
-            neighbors_future_all.shape[0],
-            neighbors_future_all.shape[1],
-            neighbors_future_all.shape[2],
-            3,
-            device=neighbors_future_all.device,
-            dtype=neighbors_future_all.dtype)
-        # neighbors_future_all_dim_three: (B, agent_num, future_len, 3)
-        neighbors_future_all_dim_three[:, :, :,
-                                       0:2] = neighbors_future_all[:, :, :, 0:2]
-        neighbors_future_all_dim_three[:, :, :, 2] = torch.atan2(
-            neighbors_future_all[:, :, :, 3], neighbors_future_all[:, :, :, 2])
+        neighbors_future_all_3_dim = self.reshape_neighbors_future_all_4_to_3(
+            neighbors_future_all)
+        near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_future_flag(
+            neighbors_future_all_3_dim[:, :args.predicted_neighbor_num, :, :],
+            self.num_refine)  # (B, Pnn), (B, Pnn) (bool)
         aug_near_current_new = neighbor_agents_past[:, :
                                                     args.predicted_neighbor_num,
                                                     -1, :]  # (B, Pnn, 11)
         aug_flags_new = aug_flags[:, :args.predicted_neighbor_num]  # (B, Pnn)
         self._debug_visualize_states(
             neighbor_agents_past.clone().detach(),
-            neighbors_future_all_dim_three.clone().detach(),
+            neighbors_future_all_3_dim.clone().detach(),
             aug_near_current_new.clone().detach(),
             valid_agent_mask.clone().detach(),
             near_invalid_future_start_idx.clone().detach(),
             aug_flags_new.clone().detach(),
-            batch_idx=0,
             save_path=f"debug_vis_{self.count}_revised.png"  # 필요 시 경로/파일명 변경
         )
         ##################
@@ -825,6 +897,7 @@ class NPCStatePerturbation:
         augment_prob: float,
         near_current_wrt_self: Tensor,  # (B, Pnn, 11)
         valid_agent_mask: Tensor,  # (B, Pnn) (bool)
+        healthy_near_past_mask: Tensor,  # (B, Pnn) (bool)
         healthy_near_future_mask: Tensor  # (B, Pnn) (bool)
     ) -> Tensor:
         """
@@ -844,7 +917,7 @@ class NPCStatePerturbation:
         # ② 속도 조건 마스크
         fast_mask = vx.abs() >= 2.0  # (B, Pnn)
         # ③ 두 조건을 모두 만족하는 후보
-        candidate_mask = valid_agent_mask & fast_mask & healthy_near_future_mask  # (B, Pnn)
+        candidate_mask = valid_agent_mask & fast_mask & healthy_near_past_mask & healthy_near_future_mask  # (B, Pnn)
 
         # 초기 aug_flags (전부 False)
         aug_flags = torch.zeros((B, predicted_neighbor_num),
@@ -1019,6 +1092,7 @@ class NPCStatePerturbation:
             aug_near_current: torch.Tensor,  # (B, Pnn, 11)
             neighbor_agents_past: torch.Tensor,  # (B, agent_num, time_len, 11)
             neighbors_future_all: torch.Tensor,  # (B, agent_num, future_len, 3)
+            valid_agent_mask: torch.Tensor,  # (B, agent_num) (bool)
             aug_flags: torch.Tensor,  # (B, Pnn) (bool)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -1051,14 +1125,12 @@ class NPCStatePerturbation:
 
         # ─── 2. “실제 NPC” 마스크 생성  (전부 0 ➜ False) ───────────────
         # 현재 프레임(-1) 전체 11‑D 벡터가 완전히 0 이면 가짜‑슬롯
-        valid_mask: torch.Tensor = (past_updated[:, :, -1, :].abs().sum(dim=-1)
-                                    > 0)  # (B,N)
 
         # ─── 3. 거리 계산 & 무한대 패널티 부여 ───────────────────────
         cur_xy = past_updated[:, :, -1, :2]  # (B,N,2)
         dist = torch.linalg.norm(cur_xy, dim=-1)  # (B,N)
         big_val = torch.tensor(float("inf"), device=device, dtype=dtype)
-        dist = torch.where(valid_mask, dist, big_val)  # 가짜 슬롯 → inf
+        dist = torch.where(valid_agent_mask, dist, big_val)  # 가짜 슬롯 → inf
 
         # 〈유효‑NPC 오름차순, 그다음 가짜‑NPC〉
         order_idx = dist.argsort(dim=1)  # (B,N)
@@ -1092,7 +1164,7 @@ class NPCStatePerturbation:
                                 device=device)  # (B,N)
         flag_full[:, :Pnn] = aug_flags  # 증강표시 주입
         # 가짜 슬롯엔 무조건 False
-        flag_full = flag_full & valid_mask
+        flag_full = flag_full & valid_agent_mask
 
         flag_reordered = torch.take_along_dim(flag_full, order_idx,
                                               dim=1)  # (B,N)

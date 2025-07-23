@@ -21,11 +21,8 @@ def train_epoch(data_loader,
 
     if args.ddp:
         torch.cuda.synchronize()
-    print("0")
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
-        print("1")
         for batch in data_epoch:
-            print("2")
             '''
             data structure in batch: Tuple(Tensor) 
 
@@ -134,7 +131,6 @@ def train_epoch(data_loader,
     if args.ddp:
         epoch_mean_loss = ddp.reduce_and_average_losses(
             epoch_mean_loss, torch.device(args.device))
-    print("3")
     if ddp.get_rank() == 0:
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
