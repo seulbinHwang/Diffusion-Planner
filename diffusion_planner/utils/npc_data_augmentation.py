@@ -89,6 +89,7 @@ class NPCStatePerturbation:
         neighbors_future_all: torch.Tensor,  # (B, agent_num, future_len, 3)
         aug_near_current: torch.Tensor,  # (B, Pnn, 11)
         valid_mask: torch.Tensor,  # (B, agent_num)  (bool)
+            near_invalid_future_start_idx: torch.Tensor,  # (B, Pnn)
         aug_flags: torch.Tensor,  # (B, Pnn)  (bool)
         batch_idx: int = 0,
         save_path: str = "debug_vis.png",
@@ -113,6 +114,8 @@ class NPCStatePerturbation:
         )  # (Pnn, 11)
         a_valid_agents = valid_mask[batch_idx].cpu().numpy().astype(
             bool)  # (N,)
+        a_near_invalid_future_start_idx = near_invalid_future_start_idx[
+            batch_idx].cpu().numpy()  # (Pnn,)
         a_aug_flag = aug_flags[batch_idx].cpu().numpy().astype(bool)  # (Pnn,)
 
         agent_num, T, _ = a_neighbor_agent_past.shape
@@ -157,9 +160,9 @@ class NPCStatePerturbation:
             if not a_aug_flag[i]:
                 continue
             for f in range(F):
-                x, y, yaw = a_neighbors_future_all[i, f]
-                if x == 0 and y == 0 and yaw == 0:
+                if a_near_invalid_future_start_idx[i] <= f:
                     continue
+                x, y, yaw = a_neighbors_future_all[i, f]
                 ax.plot(x, y, "o", color="red", ms=2)
                 ax.arrow(x,
                          y,
@@ -197,11 +200,9 @@ class NPCStatePerturbation:
                      linewidth=1.0,
                      length_includes_head=True)
 
-        # ── ⑥ 증강 현재 프레임 (파란 사각형) ──────────────
+        # ── ⑥ aug near 현재 프레임 (파란 사각형) ──────────────
         for k in range(Pnn):
             if not a_valid_agents[k]:
-                continue
-            if not a_aug_flag[k]:
                 continue
             x, y = a_aug_near_current[k, 0:2]
             cos_, sin_ = a_aug_near_current[k, 2:4]
@@ -253,9 +254,8 @@ class NPCStatePerturbation:
                            torch.Tensor]) -> Union[np.ndarray, torch.Tensor]:
         return (angle + np.pi) % (2 * np.pi) - np.pi
 
-
-    def get_valid_agent_mask(self,
-        neighbor_agents_past: torch.Tensor) -> torch.Tensor:
+    def get_valid_agent_mask(
+            self, neighbor_agents_past: torch.Tensor) -> torch.Tensor:
         """
         Get a mask indicating which agents have valid past trajectories.
         Args:
@@ -268,6 +268,51 @@ class NPCStatePerturbation:
             B, agent_num, time_len * C1).all(dim=2)
         valid_agent_mask = ~invalid_agent_mask  # shape (B, agent_num)
         return valid_agent_mask
+
+    @staticmethod
+    def get_healthy_future_flag(
+            near_future_all: torch.Tensor,  # (B, Pnn, future_len, 3)
+            num_refine: int,  # self.num_refine
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        1) near_invalid_future_start_idx 계산
+           - 어떤 agent 의 미래 (future_len,3) 중 (0,0,0)이
+             처음 등장한 시점부터 끝까지 한 번도 끊기지 않으면
+             그 시작 인덱스를 기록, 그렇지 않으면 ∞ 로 설정
+        2) healthy_near_future_mask 생성
+           - near_invalid_future_start_idx ≥ num_refine + 1  → True
+           - 그보다 작거나 같으면 False
+        """
+        B, Pnn, F, _ = near_future_all.shape
+        device = near_future_all.device
+        dtype = near_future_all.dtype
+
+        # ── (1) (0,0,0) 여부 마스크 ──────────────────────────────
+        zero_mask = (near_future_all == 0).all(dim=-1)  # (B, Pnn, F)  bool
+
+        # ── (2) "뒤에서부터 모두 0"  누적 AND ───────────────────
+        #   flip → cumprod → flip  로 trailing‑zero 구간 추출
+        trailing_zero = torch.flip(  # (B,Pnn,F)
+            torch.cumprod(torch.flip(zero_mask, dims=[2]).int(), dim=2),
+            dims=[2]).bool()
+
+        # ── (3) near_invalid_future_start_idx 계산 ─────────────────────────────
+        idx_range = torch.arange(F, device=device).view(1, 1, F)  # (1,1,F)
+        idx_exp = idx_range.expand(B, Pnn, F)  # (B,Pnn,F)
+
+        # trailing_zero==True → 해당 인덱스, False → F(임시 큰값)
+        cand = torch.where(trailing_zero, idx_exp, torch.full_like(idx_exp, F))
+        zero_start_idx_val, _ = cand.min(dim=2)  # (B,Pnn)
+
+        # F 그대로 남은 위치 = trailing_zero 전혀 없음 → ∞로 치환
+        inf = torch.tensor(float("inf"), device=device, dtype=dtype)
+        near_invalid_future_start_idx = torch.where(zero_start_idx_val == F, inf,
+                                     zero_start_idx_val.to(dtype))  # (B,Pnn)
+
+        # ── (4) healthy_near_future_mask ─────────────────────────────
+        healthy_near_future_mask = near_invalid_future_start_idx >= (num_refine + 1)
+
+        return near_invalid_future_start_idx, healthy_near_future_mask
 
     def __call__(self, inputs: Dict[str, torch.Tensor],
                  neighbors_future_all: torch.Tensor,
@@ -283,8 +328,12 @@ class NPCStatePerturbation:
             neighbors_future: (B, Pnn, future_len, 3)
 
         """
-        neighbor_agents_past = inputs['neighbor_agents_past']  # (B, agent_num, time_len, 11)
+        neighbor_agents_past = inputs[
+            'neighbor_agents_past']  # (B, agent_num, time_len, 11)
         valid_agent_mask = self.get_valid_agent_mask(neighbor_agents_past)
+        near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_future_flag(
+            neighbors_future_all[:, :args.predicted_neighbor_num, :, :],
+            self.num_refine)  # (B, Pnn), (B, Pnn) (bool)
         near_agents_current = neighbor_agents_past[:, :
                                                    args.predicted_neighbor_num,
                                                    -1, :]  # (B, pnn, 11)
@@ -292,12 +341,11 @@ class NPCStatePerturbation:
         near_current_wrt_self = self.convert_near_current_from_ego_to_self(
             near_agents_current,
             valid_agent_mask[:, :args.predicted_neighbor_num])
-        batch_ = near_current_wrt_self.shape[0]
         # aug_flags: (B, pnn)
         aug_flags = self.generate_aug_flag(
-            batch_, args.predicted_neighbor_num, self._augment_prob,
-            near_current_wrt_self,
-            valid_agent_mask[:, :args.predicted_neighbor_num])
+            self._augment_prob, near_current_wrt_self,
+            valid_agent_mask[:, :args.predicted_neighbor_num],
+            healthy_near_future_mask)
         # aug_near_current_wrt_self: (B, Pnn, 11)
         aug_near_current_wrt_self = self.augment(near_current_wrt_self,
                                                  aug_flags)
@@ -313,6 +361,7 @@ class NPCStatePerturbation:
             neighbors_future_all.clone().detach(),
             aug_near_current.clone().detach(),
             valid_agent_mask.clone().detach(),
+            near_invalid_future_start_idx.clone().detach(),
             aug_flags.clone().detach(),
             batch_idx=0,
             save_path=f"debug_vis_{self.count}.png"  # 필요 시 경로/파일명 변경
@@ -347,6 +396,7 @@ class NPCStatePerturbation:
             neighbors_future_all_dim_three.clone().detach(),
             aug_near_current_new.clone().detach(),
             valid_agent_mask.clone().detach(),
+            near_invalid_future_start_idx.clone().detach(),
             aug_flags_new.clone().detach(),
             batch_idx=0,
             save_path=f"debug_vis_{self.count}_revised.png"  # 필요 시 경로/파일명 변경
@@ -714,6 +764,7 @@ class NPCStatePerturbation:
         near_agents_current : Tensor
             - shape: **(B, pnn, 11)**
             - 뒤쪽 슬롯은 모두 0 으로 패딩될 수 있음.
+        valid_agent_mask: (B, pnn) (bool)
 
         Returns
         -------
@@ -771,11 +822,11 @@ class NPCStatePerturbation:
 
     @staticmethod
     def generate_aug_flag(
-            B: int,
-            predicted_neighbor_num: int,
-            augment_prob: float,
-            near_current_wrt_self: Tensor,  # (B, Pnn, 11)
-            valid_agent_mask) -> Tensor:
+        augment_prob: float,
+        near_current_wrt_self: Tensor,  # (B, Pnn, 11)
+        valid_agent_mask: Tensor,  # (B, Pnn) (bool)
+        healthy_near_future_mask: Tensor  # (B, Pnn) (bool)
+    ) -> Tensor:
         """
         - 조건
           1) 상태 벡터가 전부 0이 아닌 실제 NPC
@@ -783,6 +834,8 @@ class NPCStatePerturbation:
         - 위 두 조건을 모두 만족하는 NPC들 중에서
           k_b = round(M_b * augment_prob) (배치 b의 후보 수 = M_b) 만큼 무작위 선택(True)
         """
+        B, predicted_neighbor_num, _ = near_current_wrt_self.shape
+
         if not (0.0 <= augment_prob <= 1.0):
             raise ValueError("augment_prob는 0.0 이상 1.0 이하여야 합니다.")
 
@@ -791,7 +844,7 @@ class NPCStatePerturbation:
         # ② 속도 조건 마스크
         fast_mask = vx.abs() >= 2.0  # (B, Pnn)
         # ③ 두 조건을 모두 만족하는 후보
-        candidate_mask = valid_agent_mask & fast_mask  # (B, Pnn)
+        candidate_mask = valid_agent_mask & fast_mask & healthy_near_future_mask  # (B, Pnn)
 
         # 초기 aug_flags (전부 False)
         aug_flags = torch.zeros((B, predicted_neighbor_num),
