@@ -299,7 +299,7 @@ class NPCStatePerturbation:
         return valid_agent_mask
 
     @staticmethod
-    def get_healthy_future_flag(
+    def get_healthy_near_future_mask(
             near_future_all: torch.Tensor,  # (B, Pnn, future_len, 3)
             num_refine: int,  # self.num_refine
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -397,10 +397,12 @@ class NPCStatePerturbation:
         return neighbors_future_all_3_dim
 
     def add_accel_yaw_rate_to_near_current(
-        self,
-        near_current_wrt_self: torch.Tensor,  # (B, Pnn, 11)
-        near_agents_past_latest: torch.Tensor  # (B, Pnn, 11)
+            self,
+            near_agents_past: torch.Tensor,  # (B, Pnn, time_len, 11)
     ) -> torch.Tensor:
+        near_agents_current = near_agents_past[:, :, -1, :]  # (B, Pnn, 11)
+        near_agents_past_latest = near_agents_past[:, :, -2, :]  # (B, Pnn, 11)
+        # -1 step value
         near_agents_past_latest_vxy = near_agents_past_latest[:, :, 4:
                                                               6]  # (B, Pnn, 2)
         near_agent_past_latest_yaw = near_agents_past_latest[:, :,
@@ -408,25 +410,26 @@ class NPCStatePerturbation:
         near_agent_past_latest_yaw = torch.atan2(
             near_agent_past_latest_yaw[:, :, 1],
             near_agent_past_latest_yaw[:, :, 0])  # (B, Pnn)
-        near_current_wrt_self_yaw = near_current_wrt_self[:, :,
-                                                          2:4]  # (B, Pnn, 2)
+        # 0 step value
+        near_current_wrt_self_yaw = near_agents_current[:, :,
+                                                        2:4]  # (B, Pnn, 2)
         near_current_wrt_self_yaw = torch.atan2(
             near_current_wrt_self_yaw[:, :, 1],
             near_current_wrt_self_yaw[:, :, 0])  # (B, Pnn)
-
-        accel = (near_current_wrt_self[:, :, 4:6] - near_agents_past_latest_vxy
+        # get acceleration and yaw rate.
+        accel = (near_agents_current[:, :, 4:6] - near_agents_past_latest_vxy
                 ) / self.time_interval  # (B, Pnn, 2)
         yaw_rate = self.normalize_angle(
             near_current_wrt_self_yaw -
             near_agent_past_latest_yaw) / self.time_interval  # (B, Pnn)
-        near_current_wrt_self_w_more = torch.cat(
+        near_current_w_more = torch.cat(
             [
-                near_current_wrt_self,  # (B, Pnn, 11)
+                near_agents_current,  # (B, Pnn, 11)
                 accel,  # (B, Pnn, 2)
                 yaw_rate.unsqueeze(-1)  # (B, Pnn, 1)
             ],
             dim=-1)  # (B, Pnn, 14)
-        return near_current_wrt_self_w_more
+        return near_current_w_more
 
     def __call__(self, inputs: Dict[str, torch.Tensor],
                  neighbors_future_all: torch.Tensor,
@@ -442,50 +445,55 @@ class NPCStatePerturbation:
             neighbors_future: (B, Pnn, future_len, 3)
 
         """
-        neighbor_agents_past = inputs[
-            'neighbor_agents_past']  # (B, agent_num, time_len, 11)
+        Pnn = args.predicted_neighbor_num
+        # # (B, agent_num, time_len, 11)
+        neighbor_agents_past = inputs['neighbor_agents_past']
+        # (B, agent_num)
         valid_agent_mask = self.get_valid_agent_mask(neighbor_agents_past)
-        near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_future_flag(
-            neighbors_future_all[:, :args.predicted_neighbor_num, :, :],
-            self.num_refine)  # (B, Pnn), (B, Pnn) (bool)
-
-        # healthy_near_past_mask 만들기 # (B, Pnn) (bool)
-        near_agents_past = neighbor_agents_past[:, :args.
-                                                predicted_neighbor_num, :, :]  # (B, Pnn, time_len, 11)
+        # (B, Pnn, future_len, 3)
+        near_agents_future = neighbors_future_all[:, :Pnn, :, :]
+        # (B, Pnn), (B, Pnn) (bool)
+        near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_near_future_mask(
+            near_agents_future, self.num_refine)
+        near_agents_past = neighbor_agents_past[:, :
+                                                Pnn, :, :]  # (B, Pnn, time_len, 11)
+        # TODO
+        near_current_xyyaw = neighbor_agents_past[:, :Pnn,
+                                                  -1, :4]  # (B, pnn, 4)
         """ 
         near_agents_past 의 (11) 이 전부 0. 인 time_len가 1개라도 있으면 -> healthy_near_past_mask 의 원소값 False
         """
         # healthy_near_past_mask: (B, Pnn) (bool)
         healthy_near_past_mask = self.get_healthy_near_past_mask(
             near_agents_past)
-        near_agents_current = neighbor_agents_past[:, :
-                                                   args.predicted_neighbor_num,
-                                                   -1, :]  # (B, pnn, 11)
-        near_agents_past_latest = near_agents_past[:, :, -1, :]  # (B, Pnn, 11)
-        # near_current_wrt_self_w_more: (B, pnn, 14)
-        near_current_wrt_self_w_more = self.add_accel_yaw_rate_to_near_current(
-            near_agents_current, near_agents_past_latest)
+        # (B, pnn, 11)
+        # near_current_w_more: (B, pnn, 14)
+        near_current_w_more = self.add_accel_yaw_rate_to_near_current(
+            near_agents_past)
         # near_current_wrt_self: (B, pnn, 11)
+        valid_near_agent_mask = valid_agent_mask[:, :Pnn]  # (B, Pnn) (bool)
+        # near_current_w_more_wrt_self: (B, Pnn, 14)
         near_current_w_more_wrt_self = self.convert_near_current_from_ego_to_self(
-            near_current_wrt_self_w_more,
-            valid_agent_mask[:, :args.predicted_neighbor_num])
-        near_current_wrt_self = near_current_w_more_wrt_self[:, :, :
-                                                             11]  # (B, pnn, 11)
+            near_current_w_more,
+            valid_near_agent_mask  # (B, Pnn) (bool)
+        )
+        # (B, pnn)
+        near_current_wrt_self_vx = near_current_w_more_wrt_self[:, :, 4]
         # aug_flags: (B, pnn)
-        aug_flags = self.generate_aug_flag(
-            self._augment_prob, near_current_wrt_self,
-            valid_agent_mask[:, :args.predicted_neighbor_num],
-            healthy_near_past_mask, healthy_near_future_mask)
+        aug_flags = self.generate_aug_flag(self._augment_prob,
+                                           near_current_wrt_self_vx,
+                                           valid_near_agent_mask,
+                                           healthy_near_past_mask,
+                                           healthy_near_future_mask)
 
         # aug_near_current_wrt_self: (B, Pnn, 14)
         aug_near_current_w_more_wrt_self = self.augment(
             near_current_w_more_wrt_self, aug_flags)
-        near_current_xyyaw = near_agents_current[:, :, :4]  # (B, pnn, 4)
         # aug_near_current_w_more: (B, pnn, 14)
         aug_near_current_w_more = self.convert_near_current_from_self_to_ego(
             near_current_xyyaw,  # (B, Pnn, 4)
             aug_near_current_w_more_wrt_self,  # (B, Pnn, 14),
-            valid_agent_mask[:, :args.predicted_neighbor_num]  # (B, Pnn) (bool)
+            valid_near_agent_mask  # (B, Pnn) (bool)
         )
         aug_near_current = aug_near_current_w_more[:, :, :11]  # (B, Pnn, 11)
         self._debug_visualize_states(
@@ -510,13 +518,12 @@ class NPCStatePerturbation:
             aug_flags)
         neighbors_future_all_3_dim = self.reshape_neighbors_future_all_4_to_3(
             neighbors_future_all)
-        near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_future_flag(
-            neighbors_future_all_3_dim[:, :args.predicted_neighbor_num, :, :],
+        near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_near_future_mask(
+            neighbors_future_all_3_dim[:, :Pnn, :, :],
             self.num_refine)  # (B, Pnn), (B, Pnn) (bool)
-        aug_near_current_new = neighbor_agents_past[:, :
-                                                    args.predicted_neighbor_num,
+        aug_near_current_new = neighbor_agents_past[:, :Pnn,
                                                     -1, :]  # (B, Pnn, 11)
-        aug_flags_new = aug_flags[:, :args.predicted_neighbor_num]  # (B, Pnn)
+        aug_flags_new = aug_flags[:, :Pnn]  # (B, Pnn)
         # self._debug_visualize_states(
         #     neighbor_agents_past.clone().detach(),
         #     neighbors_future_all_3_dim.clone().detach(),
@@ -537,10 +544,8 @@ class NPCStatePerturbation:
         neighbors_future_all = self.interpolation_future_trajectory(
             neighbor_agents_current, neighbors_future_all, aug_flags)
         # return neighbors_future : (B, Pnn, future_len, 3)
-        neighbors_future = neighbors_future_all[:, :args.
-                                                predicted_neighbor_num, :, :]
-        aug_near_current_new = neighbor_agents_past[:, :
-                                                    args.predicted_neighbor_num,
+        neighbors_future = neighbors_future_all[:, :Pnn, :, :]
+        aug_near_current_new = neighbor_agents_past[:, :Pnn,
                                                     -1, :]  # (B, Pnn, 11)
         self._debug_visualize_states(
             neighbor_agents_past.clone().detach(),
@@ -979,7 +984,7 @@ class NPCStatePerturbation:
     @staticmethod
     def generate_aug_flag(
         augment_prob: float,
-        near_current_wrt_self: Tensor,  # (B, Pnn, 11)
+        near_current_wrt_self_vx: Tensor,  # (B, Pnn)
         valid_agent_mask: Tensor,  # (B, Pnn) (bool)
         healthy_near_past_mask: Tensor,  # (B, Pnn) (bool)
         healthy_near_future_mask: Tensor  # (B, Pnn) (bool)
@@ -991,15 +996,14 @@ class NPCStatePerturbation:
         - 위 두 조건을 모두 만족하는 NPC들 중에서
           k_b = round(M_b * augment_prob) (배치 b의 후보 수 = M_b) 만큼 무작위 선택(True)
         """
-        B, predicted_neighbor_num, _ = near_current_wrt_self.shape
+        B, predicted_neighbor_num = near_current_wrt_self_vx.shape
 
         if not (0.0 <= augment_prob <= 1.0):
             raise ValueError("augment_prob는 0.0 이상 1.0 이하여야 합니다.")
 
-        device = near_current_wrt_self.device
-        vx = near_current_wrt_self[..., 4]  # (B, Pnn)
+        device = near_current_wrt_self_vx.device
         # ② 속도 조건 마스크
-        fast_mask = vx.abs() >= 2.0  # (B, Pnn)
+        fast_mask = near_current_wrt_self_vx.abs() >= 2.0  # (B, Pnn)
         # ③ 두 조건을 모두 만족하는 후보
         candidate_mask = valid_agent_mask & fast_mask & healthy_near_past_mask & healthy_near_future_mask  # (B, Pnn)
 
