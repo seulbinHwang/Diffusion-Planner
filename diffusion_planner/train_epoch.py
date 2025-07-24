@@ -123,7 +123,7 @@ def train_epoch(data_loader,
 
             data_epoch.set_postfix(loss='{:.4f}'.format(total_loss))
             epoch_loss.append(loss)
-    raise NotImplementedError("The training loop is not fully implemented yet.")
+
     epoch_mean_loss = get_epoch_mean_loss(epoch_loss)
 
     if args.ddp:
