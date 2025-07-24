@@ -85,7 +85,7 @@ class NPCStatePerturbation:
             neighbor_agents_past: torch.Tensor,  # (B, agent_num, time_len, 11)
             neighbors_future_all: torch.Tensor,  # (B, agent_num, future_len, 3)
             aug_neighbor_current: torch.Tensor,  # (B, agent_num, 11)
-            valid_mask: torch.Tensor,  # (B, agent_num) bool
+            valid_neighbor_mask: torch.Tensor,  # (B, agent_num) bool
             neighbor_invalid_future_start_idx: torch.Tensor,  # (B, Pnn)
             neighbor_aug_flag: torch.Tensor,  # (B, agent_num) bool
             save_path: str = "debug_vis.png",
@@ -98,7 +98,6 @@ class NPCStatePerturbation:
             "velocity" → 속도 벡터 표시 (크기 = 실제 속도)
             None       → 둘 다 표시하지 않음
         """
-
 
         # ── 옵션 플래그 설정 ───────────────────────────────
         draw_heading = draw_additional == "heading"
@@ -129,12 +128,18 @@ class NPCStatePerturbation:
                 continue
 
             # ── 텐서 → numpy (선택 배치) ─────────────────
-            a_neighbor_agetns_past = neighbor_agents_past[b].cpu().numpy()  # (agent_num,T,11)
-            a_neighbors_future_all = neighbors_future_all[b].cpu().numpy()  # (agent_num,F,3)
-            a_aug_neighbor_current = aug_neighbor_current[b].cpu().numpy()  # (agent_num,11)
-            a_neighbor_valid_mask = valid_mask[b].cpu().numpy().astype(bool)  # (agent_num,)
-            a_nifsi = neighbor_invalid_future_start_idx[b].cpu().numpy()  # (agent_num,)
-            a_neighbor_aug_flag = neighbor_aug_flag[b].cpu().numpy().astype(bool)  # (agent_num,)
+            a_neighbor_agetns_past = neighbor_agents_past[b].cpu().numpy(
+            )  # (agent_num,T,11)
+            a_neighbors_future_all = neighbors_future_all[b].cpu().numpy(
+            )  # (agent_num,F,3)
+            a_aug_neighbor_current = aug_neighbor_current[b].cpu().numpy(
+            )  # (agent_num,11)
+            a_neighbor_valid_mask = valid_neighbor_mask[b].cpu().numpy().astype(
+                bool)  # (agent_num,)
+            a_nifsi = neighbor_invalid_future_start_idx[b].cpu().numpy(
+            )  # (agent_num,)
+            a_neighbor_aug_flag = neighbor_aug_flag[b].cpu().numpy().astype(
+                bool)  # (agent_num,)
 
             agent_num, T, _ = a_neighbor_agetns_past.shape
             F = a_neighbors_future_all.shape[1]
@@ -191,7 +196,7 @@ class NPCStatePerturbation:
                 if not (a_neighbor_valid_mask[i] and a_neighbor_aug_flag[i]):
                     continue
                 for f in range(F):
-                    if a_nifsi[i] <= f:  # trailing zeros
+                    if f >= a_nifsi[i]:  # trailing zeros
                         continue
                     x, y, yaw = a_neighbors_future_all[i, f]
                     ax.plot(x, y, "o", color="red", ms=2)
@@ -207,7 +212,7 @@ class NPCStatePerturbation:
                                  linewidth=0.5,
                                  length_includes_head=True)
 
-                    if draw_velocity and f < F - 1 and a_nifsi[i] > f + 1:
+                    if draw_velocity and f < (F - 1) and f < (a_nifsi[i] - 1):
                         # 인접 두 점으로 속도 벡터 근사
                         x_next, y_next = a_neighbors_future_all[i, f + 1, 0:2]
                         vx, vy = (x_next - x) / dt, (y_next - y) / dt
@@ -309,32 +314,31 @@ class NPCStatePerturbation:
            - near_invalid_future_start_idx ≥ num_refine + 1  → True
            - 그보다 작거나 같으면 False
         """
-        B, Pnn, F, _ = near_future_all.shape
+        B, N, F, _ = near_future_all.shape
         device = near_future_all.device
         dtype = near_future_all.dtype
 
         # ── (1) (0,0,0) 여부 마스크 ──────────────────────────────
-        zero_mask = (near_future_all == 0).all(dim=-1)  # (B, Pnn, F)  bool
+        zero_mask = (near_future_all == 0).all(dim=-1)  # (B, N, F)  bool
 
         # ── (2) "뒤에서부터 모두 0"  누적 AND ───────────────────
         #   flip → cumprod → flip  로 trailing‑zero 구간 추출
-        trailing_zero = torch.flip(  # (B,Pnn,F)
+        trailing_zero = torch.flip(  # (B,N,F)
             torch.cumprod(torch.flip(zero_mask, dims=[2]).int(), dim=2),
             dims=[2]).bool()
 
         # ── (3) near_invalid_future_start_idx 계산 ─────────────────────────────
         idx_range = torch.arange(F, device=device).view(1, 1, F)  # (1,1,F)
-        idx_exp = idx_range.expand(B, Pnn, F)  # (B,Pnn,F)
+        idx_exp = idx_range.expand(B, N, F)  # (B,N,F)
 
         # trailing_zero==True → 해당 인덱스, False → F(임시 큰값)
         cand = torch.where(trailing_zero, idx_exp, torch.full_like(idx_exp, F))
-        zero_start_idx_val, _ = cand.min(dim=2)  # (B,Pnn)
+        zero_start_idx_val, _ = cand.min(dim=2)  # (B,N)
 
         # F 그대로 남은 위치 = trailing_zero 전혀 없음 → ∞로 치환
         inf = torch.tensor(float("inf"), device=device, dtype=dtype)
         near_invalid_future_start_idx = torch.where(
-            zero_start_idx_val == F, inf,
-            zero_start_idx_val.to(dtype))  # (B,Pnn)
+            zero_start_idx_val == F, inf, zero_start_idx_val.to(dtype))  # (B,N)
 
         # ── (4) healthy_near_future_mask ─────────────────────────────
         healthy_near_future_mask = near_invalid_future_start_idx >= (
@@ -447,7 +451,7 @@ class NPCStatePerturbation:
         Pnn = args.predicted_neighbor_num
         # # (B, agent_num, time_len, 11)
         neighbor_agents_past = inputs['neighbor_agents_past']
-        B = neighbor_agents_past.shape[0]  # batch size
+        B, agent_num, _, _ = neighbor_agents_past.shape
         # (B, agent_num)
         valid_neighbor_mask = self.get_valid_neighbor_mask(neighbor_agents_past)
         # (B, Pnn, future_len, 3)
@@ -487,10 +491,9 @@ class NPCStatePerturbation:
             near_current_w_more_wrt_self, near_aug_flag)
         # make neighbor_aug_flag: (B, agent_num) by add False padding at near_aug_flag (B, Pnn).
         # near_aug_flag: (B, agent_num)
-        neighbor_aug_flag = torch.zeros(
-            (B, Pnn),
-            dtype=torch.bool,
-            device=self._device)
+        neighbor_aug_flag = torch.zeros((B, agent_num),
+                                        dtype=torch.bool,
+                                        device=self._device)
         neighbor_aug_flag[:, :Pnn] = near_aug_flag
         # aug_near_current_w_more: (B, Pnn, 14)
         aug_near_current_w_more = self.convert_near_current_from_self_to_ego(
@@ -501,7 +504,8 @@ class NPCStatePerturbation:
         ################### for visualization ################
         aug_near_current = aug_near_current_w_more[:, :, :11]  # (B, Pnn, 11)
         # aug_neighbor_current (B, agent_num, 11) 만들기
-        aug_neighbor_current = neighbor_agents_past[:, :, -1, :].clone()  # (B, agent_num, 11)
+        aug_neighbor_current = neighbor_agents_past[:, :, -1, :].clone(
+        )  # (B, agent_num, 11)
         aug_neighbor_current[:, :Pnn, :] = aug_near_current
         # neighbor_invalid_future_start_idx (B, agent_num) 만들기.
         neighbor_invalid_future_start_idx, _ = self.get_healthy_near_future_mask(
@@ -530,18 +534,17 @@ class NPCStatePerturbation:
             near_aug_flag)
         neighbors_future_all_3_dim = self.reshape_neighbors_future_all_4_to_3(
             neighbors_future_all)
-        near_invalid_future_start_idx, _ = self.get_healthy_near_future_mask(
-            neighbors_future_all_3_dim[:, :Pnn, :, :],
-            self.num_refine)  # (B, Pnn), (B, Pnn) (bool)
+        neighbor_invalid_future_start_idx, _ = self.get_healthy_near_future_mask(
+            neighbors_future_all_3_dim,
+            self.num_refine)  # (B, agent_num), (B, agent_num) (bool)
         aug_neighbor_current_new = aug_neighbor_current_w_more[:, :, :11]
-        aug_flags_new = neighbor_aug_flag[:, :Pnn]  # (B, Pnn)
         self._debug_visualize_states(
             neighbor_agents_past.clone().detach(),
             neighbors_future_all_3_dim.clone().detach(),
             aug_neighbor_current_new.clone().detach(),
             valid_neighbor_mask.clone().detach(),
-            near_invalid_future_start_idx.clone().detach(),
-            aug_flags_new.clone().detach(),
+            neighbor_invalid_future_start_idx.clone().detach(),
+            neighbor_aug_flag.clone().detach(),
             save_path=f"debug_vis_{self.count}_revised.png"  # 필요 시 경로/파일명 변경
         )
         ##################
@@ -557,20 +560,20 @@ class NPCStatePerturbation:
             neighbor_aug_flag, neighbor_agents_current, neighbors_future_all,
             aug_neighbor_current_w_more)
         # return neighbors_future : (B, Pnn, future_len, 3)
-        neighbors_future = neighbors_future_all[:, :Pnn, :, :]
-        aug_near_current_new = neighbor_agents_past[:, :Pnn,
-                                                    -1, :]  # (B, Pnn, 11)
+        near_future = neighbors_future_all[:, :Pnn, :, :]
+        aug_neighbor_current_new = neighbor_agents_past[:, :,
+                                                        -1, :]  # (B, Pnn, 11)
         self._debug_visualize_states(
             neighbor_agents_past.clone().detach(),
-            neighbors_future.clone().detach(),
-            aug_near_current_new.clone().detach(),
+            neighbors_future_all.clone().detach(),
+            aug_neighbor_current_new.clone().detach(),
             valid_neighbor_mask.clone().detach(),
-            near_invalid_future_start_idx.clone().detach(),
-            aug_flags_new.clone().detach(),
+            neighbor_invalid_future_start_idx.clone().detach(),
+            neighbor_aug_flag.clone().detach(),
             save_path=f"debug_vis_{self.count}_rrevised_.png"  # 필요 시 경로/파일명 변경
         )
         self.count += 1
-        return inputs, neighbors_future
+        return inputs, near_future
 
     def refine_neighbor_past_trajectories(
         self,
@@ -1157,7 +1160,7 @@ class NPCStatePerturbation:
         device, dtype = aug_near_current_w_more_wrt_self.device, aug_near_current_w_more_wrt_self.dtype
         near_current_xyyaw = near_current_xyyaw.to(device=device, dtype=dtype)
 
-        # ─── (3) 유효‑마스크(valid_mask) 생성 ───────────
+        # ─── (3) 유효‑마스크(valid_near_mask) 생성 ───────────
         mask_exp = valid_near_mask.unsqueeze(-1)  # (B, Pnn, 1)  브로드캐스트용
 
         # ─── (4) 로컬→ego 변환 (모든 슬롯 계산) ──────────
