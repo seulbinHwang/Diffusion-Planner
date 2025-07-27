@@ -51,10 +51,15 @@ def sampled_past_ego_states_to_array(
         )] = past_ego_states[i].dynamic_car_state.rear_axle_velocity_2d.x
         output[i, EgoInternalIndex.vy(
         )] = past_ego_states[i].dynamic_car_state.rear_axle_velocity_2d.y
+        # output[i, EgoInternalIndex.ax(
+        # )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.x
+        # output[i, EgoInternalIndex.ay(
+        # )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.y
+
         output[i, EgoInternalIndex.ax(
-        )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.x
+        )] = past_ego_states[i].car_footprint.width
         output[i, EgoInternalIndex.ay(
-        )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.y
+        )] = past_ego_states[i].car_footprint.length
 
     return output
 
@@ -96,6 +101,17 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
             yaw_rate * get_pacifica_parameters().wheel_base / abs(cur_velocity))
         steering_angle = np.clip(steering_angle, -2 / 3 * np.pi, 2 / 3 * np.pi)
         yaw_rate = np.clip(yaw_rate, -0.95, 0.95)
+    # ego_agent_past: (T, 7)
+    # past: (T, 8) # +3 for one-hot encoding of the agent type (car, pedestrian, cyclist) and ego is always car.
+    past = np.zeros((ego_agent_past.shape[0], ego_agent_past.shape[1] + 1 + 3), dtype=np.float32)
+
+    past[:, :2] = ego_agent_past[:, :2]
+    past[:, 2] = np.cos(ego_agent_past[:, 2])
+    past[:, 3] = np.sin(ego_agent_past[:, 2])
+    past[:, 4:8] = ego_agent_past[:, 3:]
+    # add one-hot encoding for agent type.
+    past[:, 8] = 1.0  # ego is always car
+
 
     current = np.zeros((ego_agent_past.shape[1] + 3), dtype=np.float32)
     current[:2] = current_state[:2]
@@ -105,4 +121,4 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
     current[8] = steering_angle
     current[9] = yaw_rate
 
-    return current
+    return past, current

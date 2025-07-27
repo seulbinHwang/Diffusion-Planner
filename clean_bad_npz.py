@@ -113,7 +113,7 @@ if __name__ == "__main__":
 
 chmod +x clean_bad_npz.py
 ./clean_bad_npz.py \
-  --data_dir /mnt/nuplan/dataset/processed \
-  --data_list /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json
+  --data_dir /home/hsb/nuplan/dataset/processed \
+  --data_list /home/hsb/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json
 
 """

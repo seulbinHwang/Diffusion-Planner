@@ -177,8 +177,8 @@ def convert_absolute_quantities_to_relative(agent_state,
                                     agent_local_acc).squeeze(axis=-1)
         agent_state[:, EgoInternalIndex.vx()] = transformed_vel[:, 0]
         agent_state[:, EgoInternalIndex.vy()] = transformed_vel[:, 1]
-        agent_state[:, EgoInternalIndex.ax()] = transformed_acc[:, 0]
-        agent_state[:, EgoInternalIndex.ay()] = transformed_acc[:, 1]
+        # agent_state[:, EgoInternalIndex.ax()] = transformed_acc[:, 0]
+        # agent_state[:, EgoInternalIndex.ay()] = transformed_acc[:, 1]
     elif agent_type == 'agent':
         agent_global_poses = agent_state[:, [
             AgentInternalIndex.x(),

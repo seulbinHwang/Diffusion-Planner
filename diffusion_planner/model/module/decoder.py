@@ -55,6 +55,7 @@ class Decoder(nn.Module):
             inputs: Dict
                 {
                     ...
+                    "ego_agent_past": past and current ego states,
                     "ego_current_state": current ego states,            
                     "neighbor_agent_past": past and current neighbor states,  
 
@@ -85,7 +86,7 @@ class Decoder(nn.Module):
         assert P == (1 + self._predicted_neighbor_num)
 
         # Extract context encoding
-        ego_neighbor_encoding = encoder_outputs['encoding']
+        ego_neighbor_encoding = encoder_outputs['encoding'] #  (B, 107, 192)
         route_lanes = inputs['route_lanes']
 
         if self.training:

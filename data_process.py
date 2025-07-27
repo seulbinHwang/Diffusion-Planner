@@ -4,6 +4,8 @@ import json
 import numpy as np
 from tqdm import tqdm
 from typing import Any, Tuple
+import sqlite3
+from pathlib import Path
 
 from diffusion_planner.data_process.data_processor import DataProcessor
 
@@ -12,6 +14,74 @@ from nuplan.planning.scenario_builder.scenario_filter import ScenarioFilter
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.utils.multithreading.worker_pool import Task
 from concurrent.futures import as_completed  # NEW
+import wandb
+from datetime import datetime
+import json
+import os
+import shutil
+
+# ─── 1단계: 필요한 모듈 import 및 원본 함수 백업 ───
+import nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_filter_utils as sf
+_ORIG_GET = sf.get_scenarios_from_log_file   # 원본 함수
+
+# ─── 2단계: Top-level 래퍼 함수 정의 (Pickle 가능) ───
+def safe_get_scenarios_from_log_file(params):
+    """
+    params는
+      • GetScenariosFromDbFileParams  단일 객체
+      • 또는 그 객체들의 list (worker_map이 chunking해서 넘김)
+    반환: List[ScenarioDict]  ← 원본 함수와 동일
+    """
+    def _call_orig(param_list):
+        # _ORIG_GET은 "list"를 받아서 "List[ScenarioDict]"를 반환
+        return _ORIG_GET(param_list)
+
+    # 1) always list 로 맞추기
+    param_list = params if isinstance(params, list) else [params]
+
+    try:
+        # 배치 전체 먼저 시도
+        return _call_orig(param_list)
+
+    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+        # 배치 내 개별 DB를 순차 검사
+        merged: list = []
+        for p in param_list:
+            try:
+                merged.extend(_call_orig([p]))   # 성공하면 그대로 추가
+            except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+                db_path = p.log_file_absolute_path
+                print(f"[Warning] Skip corrupt DB: {db_path}\n         └─ {e}")
+
+                # data_root 경로는 params 안에 이미 들어 있음
+                bad_db_path = Path(p.data_root) / "bad_db.json"
+                try:
+                    bad_list = json.loads(bad_db_path.read_text()) if bad_db_path.exists() else []
+                    bad_list.append(db_path)
+                    bad_db_path.write_text(json.dumps(bad_list, indent=2))
+                except Exception as io_err:
+                    print(f"[Warning] Could not update bad_db.json: {io_err}")
+                # 손상된 DB는 simply skip
+        return merged
+
+
+# ─── 3단계: 모든 모듈에서 같은 함수 객체를 보도록 패치 ───
+sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
+
+# 이미 함수 핸들이 캐시된 모듈에도 덮어쓰기
+import nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder as sb
+sb.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
+
+
+def boolean(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def get_filter_parameters(num_scenarios_per_type=None,
@@ -103,6 +173,10 @@ if __name__ == "__main__":
                         type=bool,
                         default=False,
                         help='shuffle scenarios')
+    parser.add_argument('--reset_save_path',
+                        type=bool,
+                        default=True,
+                        help='shuffle scenarios')
     parser.add_argument('--agent_num',
                         type=int,
                         default=32,
@@ -127,11 +201,39 @@ if __name__ == "__main__":
                         type=int,
                         default=25,
                         help='number of route lanes')
+      # ────── WandB 옵션 추가 ──────
+    parser.add_argument('--use_wandb', default=False, type=boolean)
+    parser.add_argument('--save_image', default=False, type=boolean)
 
+    parser.add_argument('--wandb_project', type=str,
+                         default='Diffusion-Planner', help='wandb project')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                         help='wandb entity (team or user)')
+    parser.add_argument('--name',
+                        type=str,
+                        help='log name (default: "diffusion-planner-training")',
+                        default="test_0727") # npc_current_state_aug_0.5
     # (인자 정의는 동일)
     args = parser.parse_args()
-
+    sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
+    if args.use_wandb:
+        os.environ["WANDB_MODE"] = "online" if args.use_wandb else "offline"
+        ctrl_run = wandb.init(
+            project=args.wandb_project,
+            name = args.name,
+            entity = args.wandb_entity,
+            settings = wandb.Settings(start_method="fork"),
+        )
+    else:
+        ctrl_run = None
+    args.wandb_group = ctrl_run.id if ctrl_run else None
     # 1) 저장 폴더
+    if args.reset_save_path:
+        # 기존 폴더 삭제 후 새로 생성
+        if os.path.exists(args.save_path):
+            shutil.rmtree(args.save_path)
+            print(f"Removed existing save path: {args.save_path}")
+
     os.makedirs(args.save_path, exist_ok=True)
 
     # 2) 이미 생성된 .npz 확인
@@ -227,7 +329,8 @@ if __name__ == "__main__":
 
     else:
         print("새로 처리할 시나리오가 없습니다.")
-
+    if ctrl_run is not None:
+        ctrl_run.finish()
     # 8) 결과 파일 목록 저장(동일)  ───────────────────────────
     npz_files = [f for f in os.listdir(args.save_path) if f.endswith('.npz')]
     with open('./diffusion_planner_training.json', 'w') as jf:
