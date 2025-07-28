@@ -241,8 +241,10 @@ class DataProcessor(object):
             data.update(vector_map)
 
             # 디버깅용 그림 그리기
-            self._visualize_scenario(ego_agent_past, neighbor_agents_past,
-                                     vector_map['lanes'], map_name, token)
+            if  self._wandb_enabled or self.config.save_image:
+                print("Visualizing scenario:", map_name, token)
+                self._visualize_scenario(ego_agent_past, neighbor_agents_past,
+                                         vector_map['lanes'], map_name, token)
 
             self.save_to_disk(self._save_dir, data)
 
