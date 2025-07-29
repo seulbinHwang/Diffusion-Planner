@@ -316,11 +316,12 @@ if __name__ == "__main__":
         log_names=log_names  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
-    worker = SingleMachineParallelExecutor(use_process_pool=False)
-    scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
+    loader_pool = SingleMachineParallelExecutor(use_process_pool=False)
+    scenarios = builder.get_scenarios(scenario_filter, loader_pool)  # 내부에서 병렬 로딩
     print(f"Total scenarios after filtering: {len(scenarios)}")
+    loader_pool.shutdown()
     batch_size = 24
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=batch_size)
+    proc_pool = SingleMachineParallelExecutor(use_process_pool=True, max_workers=batch_size)
 
     #######
     # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
@@ -345,15 +346,18 @@ if __name__ == "__main__":
         # map: iterable 인자들을 “열” 단위로 넘긴다.
         # 1st iterable  → remaining 시나리오들
         # 2nd iterable  → cfg_dict 를 시나리오 수 만큼 반복
-        results = worker.map(
-            Task(run_scenario),
-            remaining,
-            [cfg_dict] * len(remaining),
-            verbose=True,  # tqdm 진행률 표시
-        )
-        # 결과 소비(예외 전파용) ─ 이미 _map 내부에서 tqdm 으로 진행률 출력
-        for _ in results:
-            pass
+        try:
+            results = proc_pool.map(
+                Task(run_scenario),
+                remaining,
+                [cfg_dict] * len(remaining),
+                verbose=True,  # tqdm 진행률 표시
+            )
+            # 결과 소비(예외 전파용) ─ 이미 _map 내부에서 tqdm 으로 진행률 출력
+            for _ in results:
+                pass
+        finally:
+            proc_pool.shutdown()
     else:
         print("새로 처리할 시나리오가 없습니다.")
     if ctrl_run is not None:
