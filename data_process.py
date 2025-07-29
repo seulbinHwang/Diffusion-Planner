@@ -18,6 +18,25 @@ import wandb
 from datetime import datetime
 import json
 import os
+import multiprocessing as mp
+
+def available_cpu_count() -> int:
+    """
+    컨테이너/호스트 어디서 실행해도
+    현재 프로세스에 **실제로 할당된 논리 CPU 개수**를 반환.
+    1) Linux & Python 3.9+ : os.sched_getaffinity(0)
+    2) 그 외 : os.cpu_count()  (fallback)
+    """
+    try:
+        return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
+        print(f"Available CPUs: {return_}")  # 디버그용
+        return return_       # cgroup cpuset 존중
+    except AttributeError:
+        print("Using os.cpu_count() as fallback for CPU count.")
+        return_ = os.cpu_count()  # 전체 CPU 개수
+        print(f"Total CPUs: {return_}")  # 디버그용
+        return return_ or 1                 # 최소 1
+
 import shutil
 _PROCESSOR = None          # 워커‑프로세스 전역 캐시
 _CFG_NS    = None          # cfg 를 다시 만들지 않도록 캐시
@@ -316,12 +335,12 @@ if __name__ == "__main__":
         log_names=log_names  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
-    loader_pool = SingleMachineParallelExecutor(use_process_pool=False)
+    loader_pool = SingleMachineParallelExecutor(use_process_pool=False, max_workers=available_cpu_count())
     scenarios = builder.get_scenarios(scenario_filter, loader_pool)  # 내부에서 병렬 로딩
     print(f"Total scenarios after filtering: {len(scenarios)}")
     loader_pool.shutdown()
     batch_size = 24
-    proc_pool = SingleMachineParallelExecutor(use_process_pool=True, max_workers=batch_size)
+    proc_pool = SingleMachineParallelExecutor(use_process_pool=True, max_workers=available_cpu_count())
 
     #######
     # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
