@@ -316,10 +316,11 @@ if __name__ == "__main__":
         log_names=log_names  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
-    batch_size = 24
-    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=batch_size)
+    worker = SingleMachineParallelExecutor(use_process_pool=False)
     scenarios = builder.get_scenarios(scenario_filter, worker)  # 내부에서 병렬 로딩
     print(f"Total scenarios after filtering: {len(scenarios)}")
+    batch_size = 24
+    worker = SingleMachineParallelExecutor(use_process_pool=True, max_workers=batch_size)
 
     #######
     # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
