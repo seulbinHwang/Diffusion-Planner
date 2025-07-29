@@ -3,7 +3,7 @@ import argparse
 import json
 import numpy as np
 from tqdm import tqdm
-from typing import Any, Tuple
+from typing import Any, Tuple, Dict
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +19,45 @@ from datetime import datetime
 import json
 import os
 import shutil
+_PROCESSOR = None          # 워커‑프로세스 전역 캐시
+_CFG_NS    = None          # cfg 를 다시 만들지 않도록 캐시
+
+def run_scenario(
+    scn,                    # NuPlan 시나리오 객체   (executor.map 의 1st iterable)
+    cfg_dict: Dict          # config 를 dict 로 직렬화한 것 (2nd iterable)
+) -> None:
+    """
+    • 각 워커 프로세스에서 여러 번 호출된다.
+    • 최초 호출 시에만 DataProcessor 를 만들어 전역에 저장하고 재사용한다.
+    • 원래 `process_single_scenario` 와 동일한 예외‑안전 로직 포함.
+    """
+    global _PROCESSOR, _CFG_NS
+
+    # ── 0) Lazy‑initialization (프로세스당 1회) ─────────────────
+    if _PROCESSOR is None:
+        _CFG_NS = argparse.Namespace(**cfg_dict)
+        _PROCESSOR = DataProcessor(_CFG_NS)
+
+    cfg = _CFG_NS          # 가독성용 얼라이어스
+
+    # ── 1) 저장 파일 경로 ──────────────────────────────────────
+    file_name      = f"{scn._map_name}_{scn.token}.npz"
+    final_filepath = os.path.join(cfg.save_path, file_name)
+
+    try:
+        # ── 2) 실제 전처리 (DataProcessor 내부에서 .npz 저장) ──
+        _PROCESSOR.work([scn])
+
+        # ── 3) 생성된 파일 무결성 체크 ────────────────────────
+        if os.path.exists(final_filepath) and os.path.getsize(final_filepath) == 0:
+            os.remove(final_filepath)
+            raise RuntimeError(f"{file_name}: 파일이 비어 있습니다.")
+
+    except Exception:
+        # ── 4) 오류 발생 시 불완전 파일 제거 후 예외 전파 ──────
+        if os.path.exists(final_filepath):
+            os.remove(final_filepath)
+        raise
 
 # ─── 1단계: 필요한 모듈 import 및 원본 함수 백업 ───
 import nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_filter_utils as sf
@@ -299,34 +338,21 @@ if __name__ == "__main__":
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
-        args_list = [(args, sc) for sc in remaining]
         # 전체 배치 개수
-        num_batches = (len(args_list) + batch_size - 1) // batch_size
+        cfg_dict = vars(args)  # Namespace -> dict (pickle friendly)
 
-        # 배치 단위로 진행 상황 표시
-        for batch_idx in tqdm(
-                range(num_batches),
-                total=num_batches,
-                desc="Processing batches",
-                unit="batch",
-        ):
-            start = batch_idx * batch_size
-            batch = args_list[start: start + batch_size]
-
-            # 1) 현재 배치 태스크 예약
-            futures = [
-                worker.submit(Task(process_single_scenario), cfg_and_scn)
-                for cfg_and_scn in batch
-            ]
-
-            # 2) 배치 완료까지 대기
-            for fut in as_completed(futures):
-                try:
-                    fut.result()
-                except Exception as e:
-                    # 로그 남기고 다음 시나리오로 넘어감
-                    print(f"[Error] {e}")
-
+        # map: iterable 인자들을 “열” 단위로 넘긴다.
+        # 1st iterable  → remaining 시나리오들
+        # 2nd iterable  → cfg_dict 를 시나리오 수 만큼 반복
+        results = worker.map(
+            Task(run_scenario),
+            remaining,
+            [cfg_dict] * len(remaining),
+            verbose=True,  # tqdm 진행률 표시
+        )
+        # 결과 소비(예외 전파용) ─ 이미 _map 내부에서 tqdm 으로 진행률 출력
+        for _ in results:
+            pass
     else:
         print("새로 처리할 시나리오가 없습니다.")
     if ctrl_run is not None:
