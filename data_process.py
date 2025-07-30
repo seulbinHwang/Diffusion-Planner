@@ -18,7 +18,19 @@ import wandb
 from datetime import datetime
 import json
 import os
-import multiprocessing as mp
+from scenario_utils import get_or_load_scenarios  # 새 유틸리티 함수
+
+"""
+<DB에서 처음 추출 + 캐시 저장>
+python preprocess.py \
+  --scenarios_cache_out my_scenarios.pkl \
+  --scenarios_cache_in ""              # 비워두거나 생략
+
+<이미 저장된 캐시 사용(빠르게 실행)>
+python preprocess.py \
+  --scenarios_cache_in my_scenarios.pkl
+
+"""
 
 def available_cpu_count() -> int:
     """
@@ -207,6 +219,18 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Data Processing')
+    parser.add_argument(
+        '--scenarios_cache_in',  # 2) 불러올 파일
+        type=str,
+        default=None,
+        help='미리 저장해둔 시나리오 *.pkl 경로 (지정 시 DB 로딩 건너뜀)',
+    )
+    parser.add_argument(
+        '--scenarios_cache_out',  # 1) 저장할 파일
+        type=str,
+        default='scenarios_cache.pkl',
+        help='새로 추출한 시나리오를 저장할 *.pkl 경로',
+    )
     parser.add_argument('--data_path',
                         default='/data/nuplan-v1.1/trainval',
                         type=str,
@@ -336,9 +360,19 @@ if __name__ == "__main__":
     ))
     # 5) 시나리오 생성
     loader_pool = SingleMachineParallelExecutor(use_process_pool=False, max_workers=available_cpu_count())
-    scenarios = builder.get_scenarios(scenario_filter, loader_pool)  # 내부에서 병렬 로딩
-    print(f"Total scenarios after filtering: {len(scenarios)}")
+    scenarios = get_or_load_scenarios(
+        builder=builder,
+        scenario_filter=scenario_filter,
+        loader_pool=loader_pool,
+        cache_in=args.scenarios_cache_in,
+        cache_out=args.scenarios_cache_out,
+    )
+
+    # scenarios = builder.get_scenarios(scenario_filter, loader_pool)  # 내부에서 병렬 로딩
+    print(f"Total scenarios: {len(scenarios)}")
     loader_pool.shutdown()
+
+
     batch_size = 24
     proc_pool = SingleMachineParallelExecutor(use_process_pool=True, max_workers=available_cpu_count())
 
