@@ -222,13 +222,13 @@ if __name__ == "__main__":
     parser.add_argument(
         '--scenarios_cache_in',  # 2) 불러올 파일
         type=str,
-        default=None,
+        default='scenarios_cache.pkl', #None,
         help='미리 저장해둔 시나리오 *.pkl 경로 (지정 시 DB 로딩 건너뜀)',
     )
     parser.add_argument(
         '--scenarios_cache_out',  # 1) 저장할 파일
         type=str,
-        default='scenarios_cache.pkl',
+        default=None,#'scenarios_cache.pkl',
         help='새로 추출한 시나리오를 저장할 *.pkl 경로',
     )
     parser.add_argument('--data_path',
