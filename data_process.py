@@ -370,7 +370,7 @@ if __name__ == "__main__":
 
     # scenarios = builder.get_scenarios(scenario_filter, loader_pool)  # 내부에서 병렬 로딩
     print(f"Total scenarios: {len(scenarios)}")
-    loader_pool.shutdown()
+    loader_pool._executor.shutdown(wait=True)
 
 
     batch_size = 24
@@ -410,7 +410,7 @@ if __name__ == "__main__":
             for _ in results:
                 pass
         finally:
-            proc_pool.shutdown()
+            proc_pool._executor.shutdown(wait=True)
     else:
         print("새로 처리할 시나리오가 없습니다.")
     if ctrl_run is not None:
