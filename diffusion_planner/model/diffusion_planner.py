@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 
-from diffusion_planner.model.module.encoder2 import Encoder
+from diffusion_planner.model.module.encoder import Encoder
 from diffusion_planner.model.module.decoder import Decoder
 
 

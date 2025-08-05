@@ -127,6 +127,8 @@ class EgoFusionEncoder(nn.Module):
 
         self._hidden_dim = hidden_dim
         self._channel = channels_mlp_dim
+        self.type_emb = nn.Linear(3, channels_mlp_dim)
+
 
         self.channel_pre_project = Mlp(in_features=8 + 1,
                                        hidden_features=channels_mlp_dim,

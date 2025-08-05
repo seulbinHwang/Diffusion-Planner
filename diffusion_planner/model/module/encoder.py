@@ -13,7 +13,7 @@ class Encoder(nn.Module):
 
         self.hidden_dim = config.hidden_dim
 
-        self.token_num = config.agent_num + config.static_objects_num + config.lane_num
+        self.token_num = 1 + config.agent_num + config.static_objects_num + config.lane_num
         self.neighbor_encoder = AgentFusionEncoder(
             config.time_len,
             drop_path_rate=config.encoder_drop_path_rate,
@@ -65,7 +65,9 @@ class Encoder(nn.Module):
         encoding_input = torch.cat(
             [encoding_neighbors, encoding_static, encoding_lanes],
             dim=1)
-
+        print("neighbor_pos.shape:", neighbor_pos.shape)
+        print("static_pos.shape:", static_pos.shape)
+        print("lane_pos.shape:", lane_pos.shape)
         encoding_pos = torch.cat([neighbor_pos, static_pos, lane_pos],
                                  dim=1).view(B * self.token_num, -1)
         encoding_mask = torch.cat(
