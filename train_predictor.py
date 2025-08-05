@@ -348,6 +348,7 @@ def model_training(args):
                               sampler=train_sampler,
                               batch_size=batch_size // ddp.get_world_size(),
                               num_workers=args.num_workers,
+                              prefetch_factor=4,
                               pin_memory=args.pin_mem,
                               drop_last=True)
 
