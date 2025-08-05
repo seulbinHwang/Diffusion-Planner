@@ -197,34 +197,50 @@ class RouteEncoder(nn.Module):
 
     def forward(self, x):
         '''
-        x: B, P, V, D
+        x: B, P, V, D # (B, P=25, V=20, D=12)
         '''
         # only x and x->x' vector, no boundary, no speed limit, no traffic light
-        x = x[..., :4]
+        x = x[..., :4] # (B, P, V, 4)
 
         B, P, V, _ = x.shape
+        """
+        mask_v: (B, P, V) -> True if all 4 values are 0 # (점이 없는 경우)
+        mask_p: (B, P) -> True if all V values are 0 # (차선이 없는 경우)
+        mask_b: (B) -> True if all P values are 0 # (route lanes가 없는 경우)
+        """
         mask_v = torch.sum(torch.ne(x[..., :4], 0), dim=-1).to(x.device) == 0
         mask_p = torch.sum(~mask_v, dim=-1) == 0
         mask_b = torch.sum(~mask_p, dim=-1) == 0
-        x = x.view(B, P * V, -1)
+        x = x.view(B, P * V, -1) # (B, P * V, 4)
 
-        valid_indices = ~mask_b.view(-1)
-        x = x[valid_indices]
-
-        x = self.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
+        valid_indices = ~mask_b.view(-1) # (B)
+        x = x[valid_indices] # (B`, P * V, 4)
+        """
+        token
+            - P (route lane 차선 수) * V(차선 당 점의 수) = 25 * 20 = 500 
+            - channel_pre_project: -> (B`, P * V, C) where C is channels_mlp_dim
+        channel
+            - 4 (x, y, dx, dy)
+            - token_pre_project: -> (B`, C, T) where T is tokens_mlp_dim
+        """
+        x = self.channel_pre_project(x) # (B`, P * V, C) where C is channels_mlp_dim
+        x = x.permute(0, 2, 1)# (B`, C, P=25 * V=20)
+        x = self.token_pre_project(x) # (B`, C, T) where T is tokens_mlp_dim
+        x = x.permute(0, 2, 1) # (B`, T, C) # (8, 32, 64)
         x = self.Mixer(x)
+        # x.shape: (B`, T, C) # (8, 32, 64)
 
         x = torch.mean(x, dim=1)
+        # x.shape: (B`, C) # (8, 64)
 
         x = self.emb_project(self.norm(x))
+        # x.shape: (B`, D=192)
 
         x_result = torch.zeros((B, x.shape[-1]), device=x.device)
         x_result[valid_indices] = x  # Fill in valid parts
-
-        return x_result.view(B, -1)
+        return_ = x_result.view(B, -1)
+        # return_.shape: (B, D=192)
+        return return_
 
 
 class DiT(nn.Module):
