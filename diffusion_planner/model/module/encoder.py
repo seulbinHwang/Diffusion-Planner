@@ -65,9 +65,6 @@ class Encoder(nn.Module):
         encoding_input = torch.cat(
             [encoding_neighbors, encoding_static, encoding_lanes],
             dim=1)
-        print("neighbor_pos.shape:", neighbor_pos.shape)
-        print("static_pos.shape:", static_pos.shape)
-        print("lane_pos.shape:", lane_pos.shape)
         encoding_pos = torch.cat([neighbor_pos, static_pos, lane_pos],
                                  dim=1).view(B * self.token_num, -1)
         encoding_mask = torch.cat(

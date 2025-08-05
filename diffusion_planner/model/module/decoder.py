@@ -267,55 +267,59 @@ class DiT(nn.Module):
     def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
         """
         Forward pass of DiT.
-        x:  [B, 1+ Pnn, (1 + T) * 4]
+        x:  [B, 1+ Pnn, (1 + T) * 4] # (81*4 = 324)
         t:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
         cross_c: [B, one_Pnn, D] = [B, N = 107, D = 192]
+        route_lanes: (B, 25, 20, 12)
         neighbor_current_mask: [B, Pnn]
         """
         B, one_Pnn, _ = x.shape
-
+        # (B, 11, 324) -> (B, 11, D=192)
         x = self.preproj(x)
 
-        a = self.agent_embedding.weight[0][None, :]
-        b = self.agent_embedding.weight[1][None, :]
-        b_expanded = b.expand(one_Pnn - 1, -1)
-        print("a.shape:", a.shape)
-        print("b.shape:", b.shape)
-        print("b_expanded.shape:", b_expanded.shape)
+        a = self.agent_embedding.weight[0][None, :] # (1, D = 192)
+        b = self.agent_embedding.weight[1][None, :] # (1, D)
+        b_expanded = b.expand(one_Pnn - 1, -1) # (Pnn, D)
 
         x_embedding = torch.cat([
             a,
             b_expanded,
         ], dim=0)  # (one_Pnn, D)
-        print("x_embedding.shape:", x_embedding.shape)
         x_embedding = x_embedding[None, :, :].expand(B, -1,
                                                      -1)  # (B, one_Pnn, D)
-        print("x_embedding.shape:", x_embedding.shape)
+        # [B, one_Pnn, D] + (B, one_Pnn, D)
         x = x + x_embedding
-        print("route_lanes.shape:", route_lanes.shape)
+        # route_lanes: (B, 25, 20, 12)
+        # route_encoding: (B, D=192)
         route_encoding = self.route_encoder(route_lanes)
-        print("route_encoding.shape:", route_encoding.shape)
         y = route_encoding
+        # t: [B,]
+        # t_embedding: (B, D=192)
         t_embedding = self.t_embedder(t)
-        print("t_embedding.shape:", t_embedding.shape)
+        # y = (B, D=192) + (B, D=192) = (B, D=192)
         y = y + t_embedding
 
-        attn_mask = torch.zeros((B, one_Pnn), dtype=torch.bool, device=x.device)
-        attn_mask[:, 1:] = neighbor_current_mask
+        all_current_mask_for_attn = torch.zeros((B, one_Pnn), dtype=torch.bool, device=x.device)
+        all_current_mask_for_attn[:, 1:] = neighbor_current_mask
 
         for block in self.blocks:
-            x = block(x, cross_c, y, attn_mask)
-
-        print("x.shape:", x.shape)
-        print("y.shape:", y.shape)
+            """
+            Input shapes:
+            x: (B, one_Pnn, D=192)
+            cross_c: (B, N=107, D=192)
+            y: (B, D=192)
+            all_current_mask_for_attn: (B, one_Pnn)
+            """
+            x = block(x, cross_c, y, all_current_mask_for_attn)
+        # output: x: (B, one_Pnn, D=192)
+        # y: (B, D=192)
         x = self.final_layer(x, y)
-        print("x.shape after final layer:", x.shape)
-        raise NotImplementedError(
-            "The final layer should be implemented in the subclass.")
+        # x.shape: (B, one_Pnn, (1 + T) * 4)
 
         if self._model_type == "score":
             return x / (self.marginal_prob_std(t)[:, None, None] + 1e-6)
         elif self._model_type == "x_start":
+            # x: (B, one_Pnn, (1 + T) * 4)
             return x
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
