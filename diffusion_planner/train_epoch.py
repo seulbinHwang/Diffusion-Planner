@@ -104,7 +104,11 @@ def train_epoch(data_loader,
             # call the mdoel
             optimizer.zero_grad()
             loss = {}
-
+            """
+            ego_future.shape: [8, 80, 4]
+            neighbors_future.shape: [8, 10, 80, 4]
+            mask.shape: [8, 10, 80]
+            """
             loss, _ = diffusion_loss_func(
                 model, inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,

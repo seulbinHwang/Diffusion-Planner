@@ -76,40 +76,40 @@ class Decoder(nn.Module):
         """
         # Extract ego & neighbor current states
         ego_current = inputs['ego_current_state'][:, None, :4] # [B, 1, 4]
-        neighbors_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num, -1, :4]
-        neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0
+        neighbors_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num, -1, :4] # [B, pnn, 4]
+        neighbor_current_mask = torch.sum(torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0 # [B, pnn]
         inputs["neighbor_current_mask"] = neighbor_current_mask
 
-        current_states = torch.cat([ego_current, neighbors_current], dim=1) # [B, P, 4]
+        current_states = torch.cat([ego_current, neighbors_current], dim=1) # [B, 1+Pnn, 4]
 
-        B, P, _ = current_states.shape
-        assert P == (1 + self._predicted_neighbor_num)
+        B, one_Pnn, _ = current_states.shape
+        assert one_Pnn == (1 + self._predicted_neighbor_num)
 
         # Extract context encoding
         ego_neighbor_encoding = encoder_outputs['encoding'] #  (B, 107, 192)
-        route_lanes = inputs['route_lanes']
+        route_lanes = inputs['route_lanes'] # (B, 25, 20, 12)
 
         if self.training:
-            sampled_trajectories = inputs['sampled_trajectories'].reshape(B, P, -1) # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
-            diffusion_time = inputs['diffusion_time']
+            sampled_trajectories = inputs['sampled_trajectories'].reshape(B, one_Pnn, -1) # [B, 1+ Pnn, 1 + T, 4] -> [B, one_Pnn, (1 + T) * 4]
+            diffusion_time = inputs['diffusion_time'] # [B,]
 
             return {
                     "score": self.dit(
-                        sampled_trajectories, 
-                        diffusion_time,
-                        ego_neighbor_encoding,
-                        route_lanes,
-                        neighbor_current_mask
-                    ).reshape(B, P, -1, 4)
+                        sampled_trajectories, #  [B, 1+ Pnn, (1 + T) * 4]
+                        diffusion_time, # [B,]
+                        ego_neighbor_encoding, # [B, 107, 192]
+                        route_lanes, # [B, 25, 20, 12]
+                        neighbor_current_mask # [B, Pnn]
+                    ).reshape(B, one_Pnn, -1, 4)
                 }
         else:
             # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
-            xT = torch.cat([current_states[:, :, None], torch.randn(B, P, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, P, -1)
+            xT = torch.cat([current_states[:, :, None], torch.randn(B, one_Pnn, self._future_len, 4).to(current_states.device) * 0.5], dim=2).reshape(B, one_Pnn, -1)
 
             def initial_state_constraint(xt, t, step):
-                xt = xt.reshape(B, P, -1, 4)
+                xt = xt.reshape(B, one_Pnn, -1, 4)
                 xt[:, :, 0, :] = current_states
-                return xt.reshape(B, P, -1)
+                return xt.reshape(B, one_Pnn, -1)
             
             x0 = dpm_sampler(
                         self.dit,
@@ -139,7 +139,7 @@ class Decoder(nn.Module):
                             "guidance_type": "classifier" if self._guidance_fn is not None else "uncond"
                         },
                 )
-            x0 = self._state_normalizer.inverse(x0.reshape(B, P, -1, 4))[:, :, 1:]
+            x0 = self._state_normalizer.inverse(x0.reshape(B, one_Pnn, -1, 4))[:, :, 1:]
 
             return {
                     "prediction": x0
