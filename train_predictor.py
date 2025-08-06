@@ -302,9 +302,10 @@ def model_training(args):
             time = time.strftime("%Y-%m-%d-%H:%M:%S")
             time_str = datetime.now().strftime("%Y-%m-%d-%H-%M")
 
+
             save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
             os.makedirs(save_path, exist_ok=True)
-
+        args.save_path = save_path
         # Save args
         args_dict = vars(args)
         args_dict = {
@@ -320,6 +321,7 @@ def model_training(args):
              indent=4)
     else:
         save_path = None
+        args.save_path = None
 
     # set seed
     set_seed(args.seed + global_rank)
@@ -472,12 +474,6 @@ def model_training(args):
                 """
                 wandb.log_artifact(latest_art, aliases=["latest"])
                 latest_art.wait()  # 업로드 완료 보장
-                # ── 업로드 완료 후 로컬 latest.pth 완전 삭제
-                try:
-                    os.remove(os.path.join(save_path, "latest.pth"))
-                    print(f"[CLEANUP] 로컬 latest 체크포인트 삭제: {save_path}/latest.pth")
-                except OSError as e:
-                    print(f"[CLEANUP] latest 체크포인트 삭제 실패: {e}")
 
                 if args.delete_wb_weight_when_running:
                     # 이전 버전 삭제
@@ -510,21 +506,7 @@ def model_training(args):
                     best_art.add_file(os.path.join(save_path, "best.pth"))
                     wandb.log_artifact(best_art, aliases=["best"])
                     best_art.wait()  # 업로드 완료 보장
-                    # ── 업로드 완료 후 로컬 best.pth 완전 삭제
-                    try:
-                        os.remove(os.path.join(save_path, "best.pth"))
-                        print(f"[CLEANUP] 로컬 best 체크포인트 삭제: {save_path}/best.pth")
-                    except OSError as e:
-                        print(f"[CLEANUP] best 체크포인트 삭제 실패: {e}")
 
-                    # ── TensorBoard 로그 전체 삭제
-                    tb_dir = os.path.join(save_path, "tb")  # Logger에서 사용하는 실제 로그 폴더명
-                    if os.path.isdir(tb_dir):
-                        try:
-                            shutil.rmtree(tb_dir)
-                            print(f"[CLEANUP] 로컬 TensorBoard 로그 삭제: {tb_dir}")
-                        except Exception as e:
-                            print(f"[CLEANUP] TensorBoard 로그 삭제 실패: {e}")
 
                     # 이전 버전 삭제
                     if args.delete_wb_weight_when_running:
@@ -551,3 +533,17 @@ if __name__ == "__main__":
 
     # Run
     model_training(args)
+    # (모든 rank 공통) ── 훈련 종료 후 정리 ──
+    if torch.distributed.get_rank() == 0:
+        wandb.finish()              # W&B flush & writer close
+    torch.distributed.barrier()      # 모든 rank가 finish() 도달 확인
+
+    if torch.distributed.get_rank() == 0:
+        # TensorBoard 로그·체크포인트 일괄 삭제
+        for f in ["latest.pth", "best.pth"]:
+            p = os.path.join(args.save_path, f)
+            if os.path.exists(p):
+                os.remove(p)
+        tb_dir = os.path.join(args.save_path, "tb")
+        if os.path.isdir(tb_dir):
+            shutil.rmtree(tb_dir)
