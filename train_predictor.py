@@ -3,6 +3,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 import torch
 import argparse
+import shutil
 from torch import optim
 from timm.utils import ModelEma
 from torch.utils.data import DataLoader, DistributedSampler
@@ -471,6 +472,13 @@ def model_training(args):
                 """
                 wandb.log_artifact(latest_art, aliases=["latest"])
                 latest_art.wait()  # 업로드 완료 보장
+                # ── 업로드 완료 후 로컬 latest.pth 완전 삭제
+                try:
+                    os.remove(os.path.join(save_path, "latest.pth"))
+                    print(f"[CLEANUP] 로컬 latest 체크포인트 삭제: {save_path}/latest.pth")
+                except OSError as e:
+                    print(f"[CLEANUP] latest 체크포인트 삭제 실패: {e}")
+
                 if args.delete_wb_weight_when_running:
                     # 이전 버전 삭제
                     api = wandb.Api()
@@ -502,6 +510,21 @@ def model_training(args):
                     best_art.add_file(os.path.join(save_path, "best.pth"))
                     wandb.log_artifact(best_art, aliases=["best"])
                     best_art.wait()  # 업로드 완료 보장
+                    # ── 업로드 완료 후 로컬 best.pth 완전 삭제
+                    try:
+                        os.remove(os.path.join(save_path, "best.pth"))
+                        print(f"[CLEANUP] 로컬 best 체크포인트 삭제: {save_path}/best.pth")
+                    except OSError as e:
+                        print(f"[CLEANUP] best 체크포인트 삭제 실패: {e}")
+
+                    # ── TensorBoard 로그 전체 삭제
+                    tb_dir = os.path.join(save_path, "tb")  # Logger에서 사용하는 실제 로그 폴더명
+                    if os.path.isdir(tb_dir):
+                        try:
+                            shutil.rmtree(tb_dir)
+                            print(f"[CLEANUP] 로컬 TensorBoard 로그 삭제: {tb_dir}")
+                        except Exception as e:
+                            print(f"[CLEANUP] TensorBoard 로그 삭제 실패: {e}")
 
                     # 이전 버전 삭제
                     if args.delete_wb_weight_when_running:
