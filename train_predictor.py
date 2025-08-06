@@ -526,6 +526,40 @@ def model_training(args):
         scheduler.step()
         train_sampler.set_epoch(epoch + 1)
 
+    # ── 모든 훈련 종료 후 정리 ──
+    torch.distributed.barrier()  # ① 모든 rank의 학습 루프 종료 동기화
+
+    # ② 모든 rank에서 wandb 종료 (사용 시)
+    if args.use_wandb:
+        wandb.finish()
+        if global_rank == 0:
+            wandb_logger.finish()  # TensorBoard Logger의 writer.close() 호출
+
+    torch.distributed.barrier()  # ③ 모든 rank의 wandb 종료 동기화
+
+    # ④ Rank 0에서만 로컬 파일 정리
+    if global_rank == 0 and args.save_path:
+        print("[CLEANUP] 훈련 종료 후 로컬 체크포인트 및 로그 정리 시작")
+        # TensorBoard 로그·체크포인트 일괄 삭제
+        for f in ["latest.pth", "best.pth", "args.json"]:
+            p = os.path.join(args.save_path, f)
+            try:
+                os.remove(p)
+                print(f"[CLEANUP] 파일 삭제: {p}")
+            except FileNotFoundError:
+                print(f"[CLEANUP] 파일 없음 (이미 삭제됨): {p}")
+            except Exception as e:
+                print(f"[CLEANUP] 파일 삭제 오류: {p}, {e}")
+
+        tb_dir = os.path.join(args.save_path, "tb")
+        try:
+            shutil.rmtree(tb_dir)
+            print(f"[CLEANUP] 디렉터리 삭제: {tb_dir}")
+        except FileNotFoundError:
+            print(f"[CLEANUP] 디렉터리 없음 (이미 삭제됨): {tb_dir}")
+        except Exception as e:
+            print(f"[CLEANUP] 디렉터리 삭제 오류: {tb_dir}, {e}")
+
 
 if __name__ == "__main__":
 
@@ -533,17 +567,3 @@ if __name__ == "__main__":
 
     # Run
     model_training(args)
-    # (모든 rank 공통) ── 훈련 종료 후 정리 ──
-    if torch.distributed.get_rank() == 0:
-        wandb.finish()              # W&B flush & writer close
-    torch.distributed.barrier()      # 모든 rank가 finish() 도달 확인
-
-    if torch.distributed.get_rank() == 0:
-        # TensorBoard 로그·체크포인트 일괄 삭제
-        for f in ["latest.pth", "best.pth"]:
-            p = os.path.join(args.save_path, f)
-            if os.path.exists(p):
-                os.remove(p)
-        tb_dir = os.path.join(args.save_path, "tb")
-        if os.path.isdir(tb_dir):
-            shutil.rmtree(tb_dir)
