@@ -115,6 +115,6 @@ if __name__ == "__main__":
 chmod +x clean_bad_npz.py
 ./clean_bad_npz.py \
   --data_dir /media/user/E/dataset/processed \
-  --data_list //media/user/E/algorithms/Diffusion-Planner/diffusion_planner_training.json
+  --data_list /media/user/E/projects/Diffusion-Planner/diffusion_planner_training.json
 
 """
