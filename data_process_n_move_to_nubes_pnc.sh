@@ -1,0 +1,48 @@
+#!/bin/bash
+# This script runs the data processing and then cleans the generated dataset.
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+echo "Step 1: Running data processing..."
+
+# Configuration from data_process_pnc.sh
+# You can modify these paths if needed.
+NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
+NUPLAN_MAP_PATH="/media/user/E/dataset/maps"
+TRAIN_SET_PATH="/media/user/E/dataset/processed/"
+
+# Run the data processing script
+# This is the command from data_process_pnc.sh
+python data_process.py \
+    --data_path "$NUPLAN_DATA_PATH" \
+    --map_path "$NUPLAN_MAP_PATH" \
+    --save_path "$TRAIN_SET_PATH" \
+    --total_scenarios 1000000
+
+echo "Data processing finished."
+echo "---------------------------------"
+echo "Step 2: Cleaning bad NPZ files..."
+
+# The data_process.py script generates 'diffusion_planner_training.json' in the current directory.
+DATA_LIST_PATH="./diffusion_planner_training.json"
+
+# Make the cleaning script executable
+chmod +x clean_bad_npz.py
+
+# Run the cleaning script.
+# The --data_dir corresponds to TRAIN_SET_PATH, and --data_list is the generated JSON file.
+./clean_bad_npz.py \
+  --data_dir "$TRAIN_SET_PATH" \
+  --data_list "$DATA_LIST_PATH"
+
+echo "Cleaning finished."
+echo "---------------------------------"
+echo "Step 3: Uploading processed data..."
+
+nubescli dir-upload labs-mlops/ad/research/pnc/hsb/dataset/processed \
+                    "$TRAIN_SET_PATH" \
+                    -e -j 128
+
+echo "Upload complete."
+echo "Pipeline finished successfully."
