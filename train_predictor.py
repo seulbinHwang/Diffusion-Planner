@@ -40,7 +40,7 @@ def get_args():
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="test_0727") # npc_current_state_aug_0.5
+                        default="npc_aug_n_ego_past") # npc_current_state_aug_0.5
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
