@@ -148,7 +148,7 @@ def get_args():
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
-                        default=8)
+                        default=1024)
     parser.add_argument('--learning_rate',
                         type=float,
                         help='learning rate (default: 5e-4)',
@@ -157,6 +157,10 @@ def get_args():
                         type=int,
                         help='number of warm up',
                         default=5)
+    parser.add_argument('prefetch_factor',
+                        type=int,
+                        help='number of warm up',
+                        default=2)
     parser.add_argument('--encoder_drop_path_rate',
                         type=float,
                         help='encoder drop out rate',
@@ -348,7 +352,7 @@ def model_training(args):
                               sampler=train_sampler,
                               batch_size=batch_size // ddp.get_world_size(),
                               num_workers=args.num_workers,
-                              prefetch_factor=4,
+                              prefetch_factor=args.prefetch_factor,
                               pin_memory=args.pin_mem,
                               drop_last=True)
 
