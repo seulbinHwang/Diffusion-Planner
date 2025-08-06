@@ -2,7 +2,6 @@ echo "Start downloading diffusion_planner_training.json"
 nubescli download \
     labs-mlops/ad/research/pnc/hsb/dataset/processed_json/diffusion_planner_training.json \
     /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json \
-    -j $(nproc) \
     --no-progress
 echo "Finish downloading diffusion_planner_training.json"
 
