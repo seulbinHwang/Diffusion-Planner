@@ -1,19 +1,19 @@
-echo "Start downloading diffusion_planner_training.json"
-nubescli download \
-    labs-mlops/ad/research/pnc/hsb/dataset/processed_json/diffusion_planner_training.json \
-    /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json \
-    --no-progress
-echo "Finish downloading diffusion_planner_training.json"
+#echo "Start downloading diffusion_planner_training.json"
+#nubescli download \
+#    labs-mlops/ad/research/pnc/hsb/dataset/processed_json/diffusion_planner_training.json \
+#    /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json \
+#    --no-progress
+#echo "Finish downloading diffusion_planner_training.json"
+#
+#echo "Start downloading processed dataset"
+#nubescli dir-download \
+#    labs-mlops/ad/research/pnc/hsb/dataset/processed \
+#    /mnt/nuplan/dataset/processed \
+#    -j $(nproc) \
+#    -w \
+#    --no-progress
+#echo "Finish downloading processed dataset"
 
-echo "Start downloading processed dataset"
-nubescli dir-download \
-    labs-mlops/ad/research/pnc/hsb/dataset/processed \
-    /mnt/nuplan/dataset/processed \
-    -j $(nproc) \
-    -w \
-    --no-progress
-
-echo "Finish downloading processed dataset"
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 
