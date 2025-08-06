@@ -96,6 +96,7 @@ def main():
 
     # JSON 업데이트 여부 확인
     ans = input("Remove entries from JSON list? [y/N]: ").strip().lower()
+    ans = 'y'
     if ans == 'y':
         backup = args.data_list + ".bak"
         os.rename(args.data_list, backup)
@@ -113,7 +114,7 @@ if __name__ == "__main__":
 
 chmod +x clean_bad_npz.py
 ./clean_bad_npz.py \
-  --data_dir /home/hsb/nuplan/dataset/processed \
-  --data_list /home/hsb/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json
+  --data_dir /media/user/E/dataset/processed \
+  --data_list //media/user/E/algorithms/Diffusion-Planner/diffusion_planner_training.json
 
 """
