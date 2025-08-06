@@ -10,7 +10,9 @@ nubescli dir-download \
     labs-mlops/ad/research/pnc/hsb/dataset/processed \
     /mnt/nuplan/dataset/processed \
     -j $(nproc) \
+    -w \
     --no-progress
+
 echo "Finish downloading processed dataset"
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7

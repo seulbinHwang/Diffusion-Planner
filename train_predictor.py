@@ -158,7 +158,7 @@ def get_args():
                         type=int,
                         help='number of warm up',
                         default=5)
-    parser.add_argument('prefetch_factor',
+    parser.add_argument('--prefetch_factor',
                         type=int,
                         help='number of warm up',
                         default=2)
