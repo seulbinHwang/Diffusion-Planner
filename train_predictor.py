@@ -313,7 +313,7 @@ def model_training(args):
 
         if args.resume_local_path_model_path is not None:
             # resume_local_path_model_path: ./training_log/npc_aug_n_ego_past/2025-08-06-07:23:04/
-
+            save_path = args.resume_local_path_model_path
             # 폴더명 자체가 타임스탬프이므로 그대로 재사용
             time_str = os.path.basename(os.path.normpath(args.resume_local_path_model_path))
         else:
@@ -414,12 +414,15 @@ def model_training(args):
     scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs,
                                               args.warm_up_epoch)
 
+    allow_val_change = False
     if args.resume_local_path_model_path is not None:
         print(f"Model loaded from {args.resume_local_path_model_path}")
         (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
          model_ema) = resume_model(args.resume_local_path_model_path,
                                    diffusion_planner, optimizer, scheduler,
                                    model_ema, args.device)
+        if args.resume_model_from_wandb:
+            allow_val_change = True
     else:
         init_epoch = 0
         wandb_id = None
@@ -430,7 +433,8 @@ def model_training(args):
                           args,
                           wandb_resume_id=wandb_id,
                           save_path=save_path,
-                          rank=global_rank)
+                          rank=global_rank,
+                          allow_val_change=allow_val_change)
     if global_rank == 0 and args.remove_existing_wb_weight:
         api = wandb.Api()
 
