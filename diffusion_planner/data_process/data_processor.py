@@ -142,7 +142,8 @@ class DataProcessor(object):
                 ego_state.rear_axle.x, ego_state.rear_axle.y,
                 ego_state.rear_axle.heading
             ],
-                                        dtype=np.float64)
+                                        dtype=np.float64) # shape (3,)
+            # ego_agent_past: np (21, 7) # x, y, theta, vx, vy, width, length
             ego_agent_past, time_stamps_past = get_ego_past_array_from_scenario(
                 scenario, self.num_past_poses, self.past_time_horizon)
 

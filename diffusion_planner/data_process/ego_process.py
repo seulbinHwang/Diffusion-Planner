@@ -7,17 +7,18 @@ from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex
 from nuplan.planning.training.preprocessing.features.trajectory_utils import convert_absolute_to_relative_poses
 from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 
-
-def get_ego_past_array_from_scenario(scenario, num_past_poses,
+def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
                                      past_time_horizon):
 
     current_ego_state = scenario.initial_ego_state
 
     past_ego_states = scenario.get_ego_past_trajectory(
         iteration=0, num_samples=num_past_poses, time_horizon=past_time_horizon)
-
-    sampled_past_ego_states = list(past_ego_states) + [current_ego_state]
+    # list(past_ego_states): List[EgoState]
+    sampled_past_ego_states: List[EgoState] = list(past_ego_states) + [current_ego_state]
+    # past_ego_states_array: np (21, 7)
     past_ego_states_array = sampled_past_ego_states_to_array(
         sampled_past_ego_states)
 
@@ -81,6 +82,8 @@ def get_ego_future_array_from_scenario(scenario, current_ego_state,
 
 
 def calculate_additional_ego_states(ego_agent_past, time_stamp):
+    # ego_agent_past: (N, 7) where N is the number of past states.
+    # 7: x, y, heading, vx, vy, width, length
     # transform haeding to cos h, sin h and calculate the steering_angle and yaw_rate for current state
 
     current_state = ego_agent_past[-1]
@@ -104,7 +107,7 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
     # ego_agent_past: (T, 7)
     # past: (T, 8) # +3 for one-hot encoding of the agent type (car, pedestrian, cyclist) and ego is always car.
     past = np.zeros((ego_agent_past.shape[0], ego_agent_past.shape[1] + 1 + 3), dtype=np.float32)
-
+    # past: x, y, cos(heading), sin(heading), vx, vy, width, length, agent_type
     past[:, :2] = ego_agent_past[:, :2]
     past[:, 2] = np.cos(ego_agent_past[:, 2])
     past[:, 3] = np.sin(ego_agent_past[:, 2])
