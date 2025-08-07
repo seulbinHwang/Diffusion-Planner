@@ -12,7 +12,8 @@ class TensorBoardLogger():
                  args,
                  wandb_resume_id,
                  save_path,
-                 rank=0):
+                 rank=0,
+                 allow_val_change=False):
         """
         project_name (str): wandb project name
         config: dict or argparser
@@ -30,40 +31,43 @@ class TensorBoardLogger():
   이 실험을 묶어 놓을 **프로젝트 이름**
   W\&B 웹에서 ‘Diffusion-Planner’라는 폴더 안에 결과가 저장돼요.
 
+* `config=args`
+  실험에 사용된 모든 설정(hyperparameter)을 `args` 변수에서 가져와 저장해요.
+  나중에 실험 결과를 분석할 때, 어떤 설정값으로 얻은 결과인지 쉽게 알 수 있어요.
+
 * `name=run_name`
-  이번 실험의 **별명**이에요. 
+  이번 실험의 **별명**이에요.
   예를 들어 `diffusion-planner-training` 같은 식으로, 여러 번 돌린 실험을 구분할 때 씁니다.
 
 * `notes=notes`
-  이 실험에 대한 **짧은 설명**을 남겨요. 
+  이 실험에 대한 **짧은 설명**을 남겨요.
 
 * `resume="allow"`
   이전에 중단된 같은 실험이 있으면, 이어서 기록을 붙여 쌓도록 허용해 줍니다.
 
 * `id=wandb_resume_id`
-  이어 붙일 때 쓸 **기존 실험의 고유번호**예요. 
+  이어 붙일 때 쓸 **기존 실험의 고유번호**예요.
   보통은 중단 후 재시작할 때 내부적으로 사용되고, 처음엔 `None`이라 새로 만듭니다.
 
 * `sync_tensorboard=True`
-  코드가 TensorBoard로 남기는 로그(그래프, 손실 곡선 등)를 
+  코드가 TensorBoard로 남기는 로그(그래프, 손실 곡선 등)를
   **자동으로 W\&B로 가져가서** 똑같이 보여 달라고 요청하는 옵션
 
 * `dir=f'{save_path}'`
   W&B가 자체 로그 파일(메트릭, 설정 등)을 **저장할 로컬 폴더** 경로
   보통 `save_path` 안에 `.wandb/` 폴더가 생김
             """
-            wandb_writer = wandb.init(
-                project='Diffusion-Planner',  # 폴더
-                name=run_name,  # 별명: diffusion-planner-training
-                notes=notes,  # 메모: " "
-                resume="allow",
-                id=wandb_resume_id,  # None
-                sync_tensorboard=True,
-                dir=f'{save_path}')
-            wandb.config.update(args)
-            self.id = wandb_writer.id
+            self.run = wandb.init(project='Diffusion-Planner',
+                                  config=args,
+                                  name=run_name,
+                                  notes=notes,
+                                  resume='allow',
+                                  id=wandb_resume_id)
+            self.id = self.run.id
+            wandb.config.update(args, allow_val_change=allow_val_change)
 
-            self.writer = SummaryWriter(log_dir=f'{save_path}/tb')
+            log_dir = os.path.join(save_path, "tb")
+            self.writer = SummaryWriter(log_dir=log_dir)
 
     def log_metrics(self, metrics: dict, step: int):
         """
