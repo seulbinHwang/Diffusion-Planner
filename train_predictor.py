@@ -54,7 +54,7 @@ def get_args():
         '--resume_model_from_wandb',
         type=str,
         help='wandb artifact version to resume from (e.g., "latest")',
-        default=None)
+        default="latest")
 
     # Data
     parser.add_argument('--train_set',
@@ -312,10 +312,10 @@ def model_training(args):
         print("Use device: {}".format(args.device))
 
         if args.resume_local_path_model_path is not None:
-            # TODO
-            save_path = args.resume_local_path_model_path
+            # resume_local_path_model_path: ./training_log/npc_aug_n_ego_past/2025-08-06-07:23:04/
+
             # 폴더명 자체가 타임스탬프이므로 그대로 재사용
-            time_str = os.path.basename(os.path.normpath(save_path))
+            time_str = os.path.basename(os.path.normpath(args.resume_local_path_model_path))
         else:
             from datetime import datetime
             time = datetime.now()
@@ -584,6 +584,10 @@ if __name__ == "__main__":
     args = get_args()
 
     if args.resume_model_from_wandb:
+        # resume_model_from_wandb 가 "latest"가 아니면 에러를 발생시킵니다.
+        if args.resume_model_from_wandb not in ['latest']:
+            raise ValueError(
+                "args.resume_model_from_wandb must be 'latest.")
         if not args.name:
             raise ValueError(
                 "args.name must be provided to resume from a wandb artifact.")
@@ -658,8 +662,10 @@ if __name__ == "__main__":
                     raise FileNotFoundError(
                         f"다운로드된 아티팩트 디렉터리에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: {save_path}. "
                         f"사용 가능한 파일: {downloaded_files}")
+                save_path = os.path.dirname(
+                    os.path.abspath(model_path))
+                args.resume_local_path_model_path = save_path
 
-                args.resume_local_path_model_path = model_path
                 print(
                     f"아티팩트를 {save_path}에 다운로드했습니다. 체크포인트에서 학습을 재개합니다: {args.resume_local_path_model_path}"
                 )
