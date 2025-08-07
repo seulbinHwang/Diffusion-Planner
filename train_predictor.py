@@ -37,14 +37,24 @@ def boolean(v):
 def get_args():
     # Arguments
     parser = argparse.ArgumentParser(description='Training')
-    parser.add_argument('--name',
-                        type=str,
-                        help='log name (default: "diffusion-planner-training")',
-                        default="npc_aug_n_ego_past") # npc_current_state_aug_0.5
+    parser.add_argument(
+        '--name',
+        type=str,
+        help='log name (default: "diffusion-planner-training")',
+        default="npc_aug_n_ego_past")  # npc_current_state_aug_0.5
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
                         default=".")
+    parser.add_argument('--resume_local_path_model_path',
+                        type=str,
+                        help='path to resume model',
+                        default=None)
+    parser.add_argument(
+        '--resume_model_from_wandb',
+        type=str,
+        help='wandb artifact version to resume from (e.g., "latest")',
+        default=None)
 
     # Data
     parser.add_argument('--train_set',
@@ -182,8 +192,12 @@ def get_args():
                         default='cuda')
 
     parser.add_argument('--use_ema', default=True, type=boolean)
-    parser.add_argument('--remove_existing_wb_weight', default=False, type=boolean)
-    parser.add_argument('--delete_wb_weight_when_running', default=False, type=boolean)
+    parser.add_argument('--remove_existing_wb_weight',
+                        default=False,
+                        type=boolean)
+    parser.add_argument('--delete_wb_weight_when_running',
+                        default=False,
+                        type=boolean)
 
     # Model
     parser.add_argument('--encoder_depth',
@@ -213,10 +227,6 @@ def get_args():
                         type=int,
                         help='number of neighbor agents to predict',
                         default=10)
-    parser.add_argument('--resume_model_path',
-                        type=str,
-                        help='path to resume model',
-                        default=None)
 
     parser.add_argument('--use_wandb', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)
@@ -244,6 +254,7 @@ def safe_get_artifacts(api, type_name, path):
         print(f"[SKIP] '{path}' 컬렉션 없음/권한 문제: {e}")
         return []
 
+
 def purge_collection(api, entity, project, coll_name):
     path = f"{entity}/{project}/{coll_name}"
     versions = safe_get_artifacts(api, "model", path)  # 신규 API 사용
@@ -258,13 +269,17 @@ def purge_collection(api, entity, project, coll_name):
         try:
             # alias가 있는 artifact의 경우 alias를 먼저 제거
             if hasattr(art, 'aliases') and art.aliases:
-                print(f"[PURGE] {coll_name}: Artifact {art.id}에 alias가 있어 alias를 먼저 제거합니다: {art.aliases}")
+                print(
+                    f"[PURGE] {coll_name}: Artifact {art.id}에 alias가 있어 alias를 먼저 제거합니다: {art.aliases}"
+                )
                 for alias in art.aliases:
                     try:
                         art.delete_alias(alias)
                         print(f"[PURGE] {coll_name}: Alias '{alias}' 제거 완료")
                     except Exception as alias_err:
-                        print(f"[PURGE] {coll_name}: Alias '{alias}' 제거 실패: {alias_err}")
+                        print(
+                            f"[PURGE] {coll_name}: Alias '{alias}' 제거 실패: {alias_err}"
+                        )
 
             # artifact 삭제 시도
             art.delete()
@@ -276,7 +291,9 @@ def purge_collection(api, entity, project, coll_name):
             print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 실패 - {str(e)}")
             # alias가 있는 경우의 오류는 경고로만 처리하고 계속 진행
             if "due to existing alias" in str(e):
-                print(f"[PURGE] {coll_name}: Alias로 인한 삭제 실패는 정상적인 상황입니다. 계속 진행합니다.")
+                print(
+                    f"[PURGE] {coll_name}: Alias로 인한 삭제 실패는 정상적인 상황입니다. 계속 진행합니다."
+                )
 
     print(f"[PURGE] {coll_name}: 삭제 완료 {deleted_count}개, 실패 {failed_count}개")
 
@@ -294,14 +311,16 @@ def model_training(args):
         print("Learning rate: {}".format(args.learning_rate))
         print("Use device: {}".format(args.device))
 
-        if args.resume_model_path is not None:
-            save_path = args.resume_model_path
+        if args.resume_local_path_model_path is not None:
+            # TODO
+            save_path = args.resume_local_path_model_path
+            # 폴더명 자체가 타임스탬프이므로 그대로 재사용
+            time_str = os.path.basename(os.path.normpath(save_path))
         else:
             from datetime import datetime
             time = datetime.now()
             time = time.strftime("%Y-%m-%d-%H:%M:%S")
             time_str = datetime.now().strftime("%Y-%m-%d-%H-%M")
-
 
             save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
             os.makedirs(save_path, exist_ok=True)
@@ -332,15 +351,15 @@ def model_training(args):
 
     # set up data loaders
     if args.use_ego_data_augment and args.use_npc_data_augment:
-        raise ValueError("You cannot use both ego and npc data augmentation at the same time. ")
+        raise ValueError(
+            "You cannot use both ego and npc data augmentation at the same time. "
+        )
     if args.use_ego_data_augment:
-        aug = StatePerturbation(
-        augment_prob=args.augment_prob,
-        device=args.device)
+        aug = StatePerturbation(augment_prob=args.augment_prob,
+                                device=args.device)
     elif args.use_npc_data_augment:
-        aug = NPCStatePerturbation(
-            augment_prob=args.augment_prob,
-            device=args.device)
+        aug = NPCStatePerturbation(augment_prob=args.augment_prob,
+                                   device=args.device)
     else:
         aug = None
     train_set = DiffusionPlannerData(args.train_set, args.train_set_list,
@@ -395,11 +414,12 @@ def model_training(args):
     scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs,
                                               args.warm_up_epoch)
 
-    if args.resume_model_path is not None:
-        print(f"Model loaded from {args.resume_model_path}")
+    if args.resume_local_path_model_path is not None:
+        print(f"Model loaded from {args.resume_local_path_model_path}")
         (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
-         model_ema) = resume_model(args.resume_model_path, diffusion_planner,
-                                   optimizer, scheduler, model_ema, args.device)
+         model_ema) = resume_model(args.resume_local_path_model_path,
+                                   diffusion_planner, optimizer, scheduler,
+                                   model_ema, args.device)
     else:
         init_epoch = 0
         wandb_id = None
@@ -459,13 +479,14 @@ def model_training(args):
                 # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
                 # f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth'
                 latest_coll = f"{args.name}_latest-model"
-                latest_art = wandb.Artifact(name=latest_coll, # latest-model 라는 이름의 데이터 묶음
-                                            type="model", # "dataset" 이 될수도 있음
-                                            metadata={
-                                                "time_str": time_str,
-                                                "epoch": epoch + 1,
-                                                "loss": train_total_loss
-                                            })
+                latest_art = wandb.Artifact(
+                    name=latest_coll,  # latest-model 라는 이름의 데이터 묶음
+                    type="model",  # "dataset" 이 될수도 있음
+                    metadata={
+                        "time_str": time_str,
+                        "epoch": epoch + 1,
+                        "loss": train_total_loss
+                    })
                 # 로컬에 저장된 latest.pth 파일을 담아 넣는 동작
                 latest_art.add_file(os.path.join(save_path, "latest.pth"))
                 """
@@ -483,14 +504,13 @@ def model_training(args):
                     entity = wandb.run.entity
                     project = wandb.run.project
                     # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
-                    
+
                     current = api.artifact(
                         f"{entity}/{project}/{latest_coll}:latest")
 
                     # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                    for v in api.artifacts(
-                            "model",
-                            f"{entity}/{project}/{latest_coll}"):
+                    for v in api.artifacts("model",
+                                           f"{entity}/{project}/{latest_coll}"):
                         if v.id != current.id:
                             v.delete()
                 # ── best-model 아티팩트 (조건부 덮어쓰기) ──
@@ -507,7 +527,6 @@ def model_training(args):
                     wandb.log_artifact(best_art, aliases=["best"])
                     best_art.wait()  # 업로드 완료 보장
 
-
                     # 이전 버전 삭제
                     if args.delete_wb_weight_when_running:
                         entity = wandb.run.entity
@@ -518,15 +537,14 @@ def model_training(args):
 
                         # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
                         for v in api.artifacts(
-                                "model",
-                                f"{entity}/{project}/{best_coll}"):
+                                "model", f"{entity}/{project}/{best_coll}"):
                             if v.id != current.id:
                                 v.delete()
 
         scheduler.step()
         train_sampler.set_epoch(epoch + 1)
 
-    # ── 모든 훈련 종료 후 정리 ──
+    # ── 모든 훈련 종료 후 정리 ─
     torch.distributed.barrier()  # ① 모든 rank의 학습 루프 종료 동기화
 
     # ② 모든 rank에서 wandb 종료 (사용 시)
@@ -564,6 +582,99 @@ def model_training(args):
 if __name__ == "__main__":
 
     args = get_args()
+
+    if args.resume_model_from_wandb:
+        if not args.name:
+            raise ValueError(
+                "args.name must be provided to resume from a wandb artifact.")
+
+        print(
+            f"Resuming from wandb artifact: {args.name}:{args.resume_model_from_wandb}"
+        )
+
+        # W&B Public API를 사용하여 아티팩트와 원본 Run의 config를 가져옵니다.
+        api = wandb.Api()
+
+        try:
+            # resume_model_from_wandb 값('best', 'latest' 등)에 따라 컬렉션과 파일 이름을 결정합니다.
+            resume_alias = args.resume_model_from_wandb
+            if resume_alias == 'best':
+                collection_name = f"{args.name}_best-model"
+                checkpoint_filename = "best.pth"
+            else:  # 'latest' 또는 'v10'과 같은 특정 버전을 처리합니다.
+                collection_name = f"{args.name}_latest-model"
+                checkpoint_filename = "latest.pth"
+
+            # Public API를 사용해 아티팩트를 가져오려면 entity와 project 정보가 필요합니다.
+            # 임시 Run을 생성하여 컨텍스트(entity, project)를 얻어옵니다.
+            temp_run_for_context = wandb.init(project="Diffusion-Planner",
+                                              name=f"temp_api_run_{args.name}",
+                                              job_type="api_access")
+            # wandb.run.entity: jksg01019-naver-labs
+            # wandb.run.project: Diffusion-Planner
+            entity = temp_run_for_context.entity
+            project = temp_run_for_context.project
+            temp_run_for_context.finish()
+
+            artifact_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
+            print(f"아티팩트 경로에서 가져오는 중: {artifact_path}")
+            # Public API를 통해 아티팩트 객체를 가져옵니다.
+            artifact = api.artifact(artifact_path, type='model')
+
+            # 이 아티팩트를 생성한 원본 Run을 가져옵니다.
+            source_run = artifact.logged_by()
+
+            # 원본 Run의 config에서 save_path를 가져옵니다.
+            if 'save_path' in source_run.config:
+                save_path = source_run.config['save_path']
+                os.makedirs(save_path, exist_ok=True)
+
+                # 다운로드될 체크포인트 파일의 전체 경로를 지정합니다.
+                target_file_path = os.path.join(save_path, checkpoint_filename)
+
+                # 만약 해당 경로에 파일이 이미 존재하면, 덮어쓰기를 위해 삭제합니다.
+                if os.path.exists(target_file_path):
+                    print(f"기존 파일 '{target_file_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
+                    os.remove(target_file_path)
+
+                # 아티팩트 파일을 다운로드하기 위해 임시 Run이 필요합니다.
+                download_run = wandb.init(
+                    project=project,
+                    name=f"resume_run_download_{args.name}",
+                    resume="allow")
+                # 현재 Run에서 사용할 아티팩트를 지정합니다.
+                artifact_for_download = download_run.use_artifact(
+                    artifact, aliases=[resume_alias])
+                # 원본 save_path에 아티팩트 파일을 다운로드합니다.
+                artifact_for_download.download(root=save_path)
+                download_run.finish()
+
+                # 다운로드된 체크포인트의 전체 경로를 설정합니다.
+                model_path = os.path.join(save_path, checkpoint_filename)
+                if not os.path.exists(model_path):
+                    downloaded_files = os.listdir(save_path)
+                    raise FileNotFoundError(
+                        f"다운로드된 아티팩트 디렉터리에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: {save_path}. "
+                        f"사용 가능한 파일: {downloaded_files}")
+
+                args.resume_local_path_model_path = model_path
+                print(
+                    f"아티팩트를 {save_path}에 다운로드했습니다. 체크포인트에서 학습을 재개합니다: {args.resume_local_path_model_path}"
+                )
+            else:
+                raise ValueError("원본 Run의 config에 'save_path'가 없습니다.")
+
+        except Exception as e:
+            print(f"W&B에서 재개하는 동안 오류 발생: {e}")
+            # 오류 발생 시 임시 Run이 종료되도록 보장합니다.
+            if wandb.run:
+                wandb.finish()
+            raise e
+
+    if 'WORLD_SIZE' in os.environ:
+        args.distributed = int(os.environ['WORLD_SIZE']) > 1
+    else:
+        args.distributed = False
 
     # Run
     model_training(args)
