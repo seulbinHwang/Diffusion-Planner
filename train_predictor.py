@@ -54,7 +54,7 @@ def get_args():
         '--resume_model_from_wandb',
         type=str,
         help='wandb artifact version to resume from (e.g., "latest")',
-        default="latest")
+        default=None)
 
     # Data
     parser.add_argument('--train_set',
