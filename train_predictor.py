@@ -627,6 +627,7 @@ if __name__ == "__main__":
             # 원본 Run의 config에서 save_path를 가져옵니다.
             if 'save_path' in source_run.config:
                 save_path = source_run.config['save_path']
+                print(f"원본 Run의 config에서 save_path를 찾았습니다: {save_path}")
                 os.makedirs(save_path, exist_ok=True)
 
                 # 다운로드될 체크포인트 파일의 전체 경로를 지정합니다.
@@ -648,6 +649,7 @@ if __name__ == "__main__":
                 # 원본 save_path에 아티팩트 파일을 다운로드합니다.
                 artifact_for_download.download(root=save_path)
                 download_run.finish()
+                print(f"아티팩트 '{artifact_path}'을(를) {save_path}에 다운로드했습니다.")
 
                 # 다운로드된 체크포인트의 전체 경로를 설정합니다.
                 model_path = os.path.join(save_path, checkpoint_filename)
