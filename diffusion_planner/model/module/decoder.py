@@ -94,7 +94,8 @@ class Decoder(nn.Module):
         assert one_P == (1 + self._predicted_neighbor_num)
 
         # Extract context encoding
-        ego_neighbor_encoding = encoder_outputs['encoding']  #  (B, 107, 192)
+        ego_neighbor_encoding = encoder_outputs['encoding']  #  (B, 107 + future_len, 192)
+        ego_future_global = encoder_outputs.get('ego_future_global')
         route_lanes = inputs['route_lanes']  # (B, 25, 20, 12)
 
         if self.training:
@@ -107,7 +108,7 @@ class Decoder(nn.Module):
                 "score":
                     self.dit(sampled_trajectories, diffusion_time,
                              ego_neighbor_encoding, route_lanes,
-                             neighbor_current_mask).reshape(B, one_P, -1, 4)
+                             neighbor_current_mask, ego_future_global).reshape(B, one_P, -1, 4)
             }
         else:
             # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
@@ -129,7 +130,8 @@ class Decoder(nn.Module):
                 other_model_params={
                     "cross_c": ego_neighbor_encoding,
                     "route_lanes": route_lanes,
-                    "neighbor_current_mask": neighbor_current_mask
+                    "neighbor_current_mask": neighbor_current_mask,
+                    "global_cond": ego_future_global
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": initial_state_constraint,
@@ -142,7 +144,8 @@ class Decoder(nn.Module):
                         "model_condition": {
                             "cross_c": ego_neighbor_encoding,
                             "route_lanes": route_lanes,
-                            "neighbor_current_mask": neighbor_current_mask
+                            "neighbor_current_mask": neighbor_current_mask,
+                            "global_cond": ego_future_global
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
@@ -280,14 +283,15 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
+    def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask, global_cond=None):
         """
         Forward pass of DiT.
         x:  [B, 1+ Pnn, (1 + T) * 4] # (81*4 = 324)
         t:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
-        cross_c: [B, one_Pnn, D] = [B, N = 107, D = 192]
+        cross_c: [B, one_Pnn, D] = [B, N = 107 + future_len, D = 192]
         route_lanes: (B, 25, 20, 12)
         neighbor_current_mask: [B, Pnn]
+        global_cond: (B, D)
         """
         B, one_Pnn, _ = x.shape
         # (B, 11, 324) -> (B, 11, D=192)
@@ -309,11 +313,10 @@ class DiT(nn.Module):
         # route_encoding: (B, D=192)
         route_encoding = self.route_encoder(route_lanes)
         y = route_encoding
-        # t: [B,]
-        # t_embedding: (B, D=192)
         t_embedding = self.t_embedder(t)
-        # y = (B, D=192) + (B, D=192) = (B, D=192)
         y = y + t_embedding
+        if global_cond is not None:
+            y = y + global_cond
 
         all_current_mask_for_attn = torch.zeros((B, one_Pnn), dtype=torch.bool, device=x.device)
         all_current_mask_for_attn[:, 1:] = neighbor_current_mask

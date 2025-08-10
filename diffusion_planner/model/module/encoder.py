@@ -3,6 +3,8 @@ import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 
+import math
+
 from diffusion_planner.model.module.mixer import MixerBlock
 
 
@@ -13,7 +15,12 @@ class Encoder(nn.Module):
 
         self.hidden_dim = config.hidden_dim
 
-        self.token_num = 1 + config.agent_num + config.static_objects_num + config.lane_num
+        self.token_num = config.future_len + 1 + config.agent_num + config.static_objects_num + config.lane_num
+        self.ego_future_encoder = EgoFutureEncoder(
+            config.future_len,
+            drop_path_rate=config.encoder_drop_path_rate,
+            hidden_dim=config.hidden_dim,
+            depth=config.encoder_depth)
         self.neighbor_encoder = AgentFusionEncoder(
             config.time_len,
             drop_path_rate=config.encoder_drop_path_rate,
@@ -50,12 +57,16 @@ class Encoder(nn.Module):
         # static objects
         static = inputs['static_objects']
 
+        # ego future plan
+        ego_future = inputs['ego_future']
+
         # vector maps
         lanes = inputs['lanes']
         lanes_speed_limit = inputs['lanes_speed_limit']
         lanes_has_speed_limit = inputs['lanes_has_speed_limit']
 
         B = neighbors.shape[0]
+        encoding_future, future_mask, future_pos, future_global = self.ego_future_encoder(ego_future)
         encoding_neighbors, neighbors_mask, neighbor_pos = self.neighbor_encoder(ego_past,
             neighbors)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
@@ -63,12 +74,12 @@ class Encoder(nn.Module):
             lanes, lanes_speed_limit, lanes_has_speed_limit)
 
         encoding_input = torch.cat(
-            [encoding_neighbors, encoding_static, encoding_lanes],
+            [encoding_future, encoding_neighbors, encoding_static, encoding_lanes],
             dim=1)
-        encoding_pos = torch.cat([neighbor_pos, static_pos, lane_pos],
+        encoding_pos = torch.cat([future_pos, neighbor_pos, static_pos, lane_pos],
                                  dim=1).view(B * self.token_num, -1)
         encoding_mask = torch.cat(
-            [neighbors_mask, static_mask, lanes_mask], dim=1).view(-1)
+            [future_mask, neighbors_mask, static_mask, lanes_mask], dim=1).view(-1)
         encoding_pos = self.pos_emb(encoding_pos[~encoding_mask])
         encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim),
                                           device=encoding_pos.device)
@@ -80,6 +91,7 @@ class Encoder(nn.Module):
 
         encoder_outputs['encoding'] = self.fusion(
             encoding_input, encoding_mask.view(B, self.token_num))
+        encoder_outputs['ego_future_global'] = future_global
 
         return encoder_outputs
 
@@ -124,7 +136,8 @@ class AgentFusionEncoder(nn.Module):
 
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
-        self.channel_pre_project = Mlp(in_features=8 + 1,
+        # x,y,cos,sin + time(sin,cos,rel) + valid_mask
+        self.channel_pre_project = Mlp(in_features=8 + 3 + 1,
                                        hidden_features=channels_mlp_dim,
                                        out_features=channels_mlp_dim,
                                        act_layer=nn.GELU,
@@ -167,7 +180,15 @@ class AgentFusionEncoder(nn.Module):
         B, M, V, _ = x.shape
         mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1).to(x.device) == 0
         mask_p = torch.sum(~mask_v, dim=-1) == 0
-        x = torch.cat([x, (~mask_v).float().unsqueeze(-1)], dim=-1)
+        base_time = torch.linspace(-0.1 * (V - 1), 0.0, V, device=x.device)
+        time_norm = (base_time - base_time.min()) / (base_time.max() - base_time.min())
+        time_rel = base_time / (0.1 * (V - 1))
+        time_feat = torch.cat(
+            [torch.sin(2 * math.pi * time_norm),
+             torch.cos(2 * math.pi * time_norm),
+             time_rel], dim=-1)
+        time_feat = time_feat.view(1, 1, V, 3).expand(B, M, -1, -1)
+        x = torch.cat([x, time_feat, (~mask_v).float().unsqueeze(-1)], dim=-1)
         x = x.view(B * M, V, -1)
 
         valid_indices = ~mask_p.view(-1)
@@ -196,6 +217,89 @@ class AgentFusionEncoder(nn.Module):
 
         return x_result.view(B, M, -1), mask_p.reshape(B,
                                                        -1), pos.view(B, M, -1)
+
+
+class EgoFutureEncoder(nn.Module):
+
+    def __init__(self,
+                 future_len,
+                 drop_path_rate=0.3,
+                 hidden_dim=192,
+                 depth=3,
+                 tokens_mlp_dim=None,
+                 channels_mlp_dim=128):
+        super().__init__()
+
+        if tokens_mlp_dim is None:
+            tokens_mlp_dim = future_len
+
+        self._future_len = future_len
+        # x,y,cos,sin + time(sin,cos,rel) + valid_mask
+        self.channel_pre_project = Mlp(in_features=4 + 3 + 1,
+                                       hidden_features=channels_mlp_dim,
+                                       out_features=channels_mlp_dim,
+                                       act_layer=nn.GELU,
+                                       drop=0.)
+        self.token_pre_project = Mlp(in_features=future_len,
+                                     hidden_features=tokens_mlp_dim,
+                                     out_features=tokens_mlp_dim,
+                                     act_layer=nn.GELU,
+                                     drop=0.)
+        self.blocks = nn.ModuleList([
+            MixerBlock(tokens_mlp_dim, channels_mlp_dim, drop_path_rate)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(channels_mlp_dim)
+        self.emb_project = Mlp(in_features=channels_mlp_dim,
+                               hidden_features=hidden_dim,
+                               out_features=hidden_dim,
+                               act_layer=nn.GELU,
+                               drop=drop_path_rate)
+
+    def forward(self, ego_future):
+        """
+        ego_future: (B, F, 4)
+        Returns:
+            tokens: (B, F, hidden_dim)
+            mask: (B, F) bool
+            pos: (B, F, 8)
+            global_vec: (B, hidden_dim)
+        """
+        B, F, _ = ego_future.shape
+
+        mask = torch.sum(torch.ne(ego_future, 0), dim=-1) == 0
+
+        time_idx = torch.arange(F, device=ego_future.device, dtype=ego_future.dtype)
+        time_norm = (time_idx / (F - 1)).view(1, F, 1)
+        time_sec = (time_idx + 1) * 0.1
+        time_rel = (time_sec / (0.1 * F)).view(1, F, 1)
+        time_feat = torch.cat([
+            torch.sin(2 * math.pi * time_norm),
+            torch.cos(2 * math.pi * time_norm),
+            time_rel
+        ], dim=-1)
+        time_feat = time_feat.expand(B, -1, -1)
+
+        x = torch.cat([ego_future, time_feat, (~mask).float().unsqueeze(-1)], dim=-1)
+        x = self.channel_pre_project(x)
+        x = x.permute(0, 2, 1)
+        x = self.token_pre_project(x)
+        x = x.permute(0, 2, 1)
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        tokens = self.emb_project(x.reshape(B * F, -1)).view(B, F, -1)
+        global_vec = self.emb_project(x.mean(dim=1))
+
+        pos = torch.zeros((B, F, 8), device=ego_future.device)
+        pos[..., :4] = ego_future
+        # ego future tokens: [1,0,0,0]
+        pos[..., -4:] = 0.0
+        pos[..., -4] = 1.0
+        pos[mask] = 0.0
+
+        return tokens, mask, pos, global_vec
 
 
 class StaticFusionEncoder(nn.Module):
