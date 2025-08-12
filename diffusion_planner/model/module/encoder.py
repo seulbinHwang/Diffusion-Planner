@@ -180,13 +180,13 @@ class AgentFusionEncoder(nn.Module):
         B, M, V, _ = x.shape
         mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1).to(x.device) == 0
         mask_p = torch.sum(~mask_v, dim=-1) == 0
-        base_time = torch.linspace(-0.1 * (V - 1), 0.0, V, device=x.device)
-        time_norm = (base_time - base_time.min()) / (base_time.max() - base_time.min())
-        time_rel = base_time / (0.1 * (V - 1))
+        base_time = torch.linspace(-0.1 * (V - 1), 0.0, V, device=x.device) # (V,)
+        time_norm = (base_time - base_time.min()) / (base_time.max() - base_time.min()) # (V, 1)
+        time_rel = base_time / (0.1 * (V - 1)) # (V, 1)
         time_feat = torch.cat(
             [torch.sin(2 * math.pi * time_norm),
              torch.cos(2 * math.pi * time_norm),
-             time_rel], dim=-1)
+             time_rel], dim=-1) # (V, 3)
         time_feat = time_feat.view(1, 1, V, 3).expand(B, M, -1, -1)
         x = torch.cat([x, time_feat, (~mask_v).float().unsqueeze(-1)], dim=-1)
         x = x.view(B * M, V, -1)
