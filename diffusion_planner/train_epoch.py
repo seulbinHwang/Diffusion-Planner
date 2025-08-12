@@ -22,6 +22,7 @@ def train_epoch(data_loader, model, optimizer, args, ema, aug: StatePerturbation
             data structure in batch: Tuple(Tensor) 
 
             ego_current_state,
+            ego_agent_past,
             ego_future_gt,
 
             neighbor_agents_past,
@@ -42,23 +43,19 @@ def train_epoch(data_loader, model, optimizer, args, ema, aug: StatePerturbation
             # prepare data
             inputs = {
                 'ego_current_state': batch[0].to(args.device),
-
-                'neighbor_agents_past': batch[2].to(args.device),
-
-                'lanes': batch[4].to(args.device),
-                'lanes_speed_limit': batch[5].to(args.device),
-                'lanes_has_speed_limit': batch[6].to(args.device),
-
-                'route_lanes': batch[7].to(args.device),
-                'route_lanes_speed_limit': batch[8].to(args.device),
-                'route_lanes_has_speed_limit': batch[9].to(args.device),
-
-                'static_objects': batch[10].to(args.device)
-
+                'ego_agent_past': batch[1].to(args.device),
+                'neighbor_agents_past': batch[3].to(args.device),
+                'lanes': batch[5].to(args.device),
+                'lanes_speed_limit': batch[6].to(args.device),
+                'lanes_has_speed_limit': batch[7].to(args.device),
+                'route_lanes': batch[8].to(args.device),
+                'route_lanes_speed_limit': batch[9].to(args.device),
+                'route_lanes_has_speed_limit': batch[10].to(args.device),
+                'static_objects': batch[11].to(args.device)
             }
 
-            ego_future = batch[1].to(args.device)
-            neighbors_future = batch[3].to(args.device)
+            ego_future = batch[2].to(args.device)
+            neighbors_future = batch[4].to(args.device)
             # Normalize to ego-centric
             if aug is not None:
                 inputs, ego_future, neighbors_future = aug(inputs, ego_future, neighbors_future)
