@@ -3,6 +3,8 @@ import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 
+import math
+
 from diffusion_planner.model.module.mixer import MixerBlock
 
 
@@ -130,11 +132,12 @@ class EgoFusionEncoder(nn.Module):
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
 
-        self.channel_pre_project = Mlp(in_features=8 + 1,
-                                       hidden_features=channels_mlp_dim,
-                                       out_features=channels_mlp_dim,
-                                       act_layer=nn.GELU,
-                                       drop=0.)
+        # x,y,cos,sin + time(sin,cos,rel) + valid_mask
+        self.channel_pre_project = Mlp(in_features=8 + 3 + 1,
+                                        hidden_features=channels_mlp_dim,
+                                        out_features=channels_mlp_dim,
+                                        act_layer=nn.GELU,
+                                        drop=0.)
         self.token_pre_project = Mlp(in_features=time_len,
                                      hidden_features=tokens_mlp_dim,
                                      out_features=tokens_mlp_dim,
@@ -170,7 +173,15 @@ class EgoFusionEncoder(nn.Module):
         mask_v = torch.sum(torch.ne(x, 0), dim=-1).to(
             x.device) == 0  # (B, P, V)
         mask_p = torch.sum(~mask_v, dim=-1) == 0  # (B, P)
-        x = torch.cat([x, (~mask_v).float().unsqueeze(-1)], dim=-1)
+        base_time = torch.linspace(-0.1 * (V - 1), 0.0, V, device=x.device)
+        time_norm = (base_time - base_time.min()) / (base_time.max() - base_time.min())
+        time_rel = base_time / (0.1 * (V - 1))
+        time_feat = torch.cat([
+            torch.sin(2 * math.pi * time_norm),
+            torch.cos(2 * math.pi * time_norm),
+            time_rel], dim=-1)
+        time_feat = time_feat.view(1, 1, V, 3).expand(B, P, -1, -1)
+        x = torch.cat([x, time_feat, (~mask_v).float().unsqueeze(-1)], dim=-1)
         x = x.view(B * P, V, -1)
 
         valid_indices = ~mask_p.view(-1)  # (B * P)
@@ -216,7 +227,7 @@ class AgentFusionEncoder(nn.Module):
 
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
-        self.channel_pre_project = Mlp(in_features=8 + 1,
+        self.channel_pre_project = Mlp(in_features=8 + 3 + 1,
                                        hidden_features=channels_mlp_dim,
                                        out_features=channels_mlp_dim,
                                        act_layer=nn.GELU,
@@ -254,7 +265,15 @@ class AgentFusionEncoder(nn.Module):
         B, P, V, _ = x.shape
         mask_v = torch.sum(torch.ne(x[..., :8], 0), dim=-1).to(x.device) == 0
         mask_p = torch.sum(~mask_v, dim=-1) == 0
-        x = torch.cat([x, (~mask_v).float().unsqueeze(-1)], dim=-1)
+        base_time = torch.linspace(-0.1 * (V - 1), 0.0, V, device=x.device)
+        time_norm = (base_time - base_time.min()) / (base_time.max() - base_time.min())
+        time_rel = base_time / (0.1 * (V - 1))
+        time_feat = torch.cat([
+            torch.sin(2 * math.pi * time_norm),
+            torch.cos(2 * math.pi * time_norm),
+            time_rel], dim=-1)
+        time_feat = time_feat.view(1, 1, V, 3).expand(B, P, -1, -1)
+        x = torch.cat([x, time_feat, (~mask_v).float().unsqueeze(-1)], dim=-1)
         x = x.view(B * P, V, -1)
 
         valid_indices = ~mask_p.view(-1)
