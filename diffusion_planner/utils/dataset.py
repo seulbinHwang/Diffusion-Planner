@@ -19,6 +19,7 @@ class DiffusionPlannerData(Dataset):
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
 
         ego_current_state = data['ego_current_state']
+        ego_agent_past = data['ego_agent_past']
         ego_agent_future = data['ego_agent_future']
 
         neighbor_agents_past = data['neighbor_agents_past'][:self._past_neighbor_num]
@@ -36,6 +37,7 @@ class DiffusionPlannerData(Dataset):
 
         data = {
             "ego_current_state": ego_current_state,
+            "ego_agent_past": ego_agent_past,
             "ego_future_gt": ego_agent_future,
             "neighbor_agents_past": neighbor_agents_past,
             "neighbors_future_gt": neighbor_agents_future,

@@ -43,7 +43,15 @@ class ObservationNormalizer:
         ndt = {}
         for k, v in data.items():
             if k not in ["ego", "neighbor"]:
-                ndt[k]= {"mean": torch.tensor(v["mean"], dtype=torch.float32), "std": torch.tensor(v["std"], dtype=torch.float32)}
+                ndt[k] = {
+                    "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                    "std": torch.tensor(v["std"], dtype=torch.float32),
+                }
+        if "ego_agent_past" not in ndt and "neighbor_agents_past" in ndt:
+            ndt["ego_agent_past"] = {
+                "mean": ndt["neighbor_agents_past"]["mean"].clone(),
+                "std": ndt["neighbor_agents_past"]["std"].clone(),
+            }
         return cls(ndt)
 
     def __call__(self, data):
