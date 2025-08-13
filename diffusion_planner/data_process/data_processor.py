@@ -251,7 +251,9 @@ class DataProcessor(object):
             # 디버깅용 그림 그리기
             if  self._wandb_enabled or self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
-                self._visualize_scenario(ego_agent_past, neighbor_agents_past,
+                self._visualize_scenario(ego_agent_past,
+                                         ego_agent_future_11_dim,
+                                         neighbor_agents_past,
                                          vector_map['lanes'], map_name, token)
 
             self.save_to_disk(self._save_dir, data)
@@ -259,6 +261,7 @@ class DataProcessor(object):
     def _visualize_scenario(
         self,
         ego_agent_past: np.ndarray,  # (T=21, 11)
+        ego_agent_future_11_dim: np.ndarray,  # (Tf, 11)
         neighbor_agents_past: np.ndarray,  # (P=32, T=21, 11)
         lanes: np.ndarray,  # (N=70, V=25, 12)
         map_name: str,
@@ -269,6 +272,8 @@ class DataProcessor(object):
         Args:
             ego_agent_past: (T=21, 11) ego vehicle 과거 상태
                 - x, y, cos(yaw), sin(yaw), v_x, v_y, width, length
+            ego_agent_future_11_dim: (Tf, 11) ego vehicle 미래 상태
+                - x, y, cos(yaw), sin(yaw), v_x, v_y, width, length + 3 one hot
             neighbor_agents_past: (P=32, T=21, 11) neighbor agents 과거 상태
                 - x, y, cos(yaw), sin(yaw), v_x, v_y, width, length + 3 one hot
             lanes: (N=70, V=25, 12) lane polylines
@@ -314,7 +319,7 @@ class DataProcessor(object):
                         linewidth=1,
                         alpha=0.7)
 
-        # 2. Ego vehicle 그리기
+        # 2. Ego vehicle 과거 그리기
         for t in range(ego_agent_past.shape[0]):  # T=21
             # 전체 8차원 벡터가 모두 0인 경우만 유효하지 않은 데이터로 처리
             if np.all(ego_agent_past[t] == 0):
@@ -341,7 +346,33 @@ class DataProcessor(object):
                 time_info=time_info  # 시간 정보 추가
             )
 
-        # 3. Neighbor vehicles 그리기
+        # 3. Ego vehicle 미래 그리기
+        for t in range(ego_agent_future_11_dim.shape[0]):  # Tf
+            if np.all(ego_agent_future_11_dim[t] == 0):
+                continue
+            x, y = ego_agent_future_11_dim[t, 0], ego_agent_future_11_dim[t, 1]
+            cos_yaw, sin_yaw = (ego_agent_future_11_dim[t, 2],
+                                 ego_agent_future_11_dim[t, 3])
+            width, length = (ego_agent_future_11_dim[t, 6],
+                             ego_agent_future_11_dim[t, 7])
+
+            yaw = math.atan2(sin_yaw, cos_yaw)
+            time_info = (t + 1) * (self.future_time_horizon /
+                                   self.num_future_poses)
+
+            rect = self._draw_vehicle_rectangle(
+                ax,
+                x,
+                y,
+                yaw,
+                width,
+                length,
+                'green',
+                alpha=0.8 if t == ego_agent_future_11_dim.shape[0] - 1 else 0.5,
+                show_heading=True,
+                time_info=time_info)
+
+        # 4. Neighbor vehicles 그리기
         for p in range(neighbor_agents_past.shape[0]):  # P=32
             agent_trajectory = neighbor_agents_past[p, :, :]  # (T=21, 11)
 
@@ -389,12 +420,12 @@ class DataProcessor(object):
                                                     current_color,
                                                     alpha=0.8)
 
-        # 4. 그래프 설정
+        # 5. 그래프 설정
         ax.set_xlabel('X (m)', color='white')
         ax.set_ylabel('Y (m)', color='white')
         ax.tick_params(colors='white')
         ax.grid(True, alpha=0.3, color='gray')
-        # 5. 범례 추가
+        # 6. 범례 추가
         legend_elements = [
             plt.Line2D([0], [0],
                        marker='s',
@@ -402,6 +433,13 @@ class DataProcessor(object):
                        markerfacecolor='red',
                        markersize=10,
                        label='Ego Vehicle',
+                       linestyle='None'),
+            plt.Line2D([0], [0],
+                       marker='s',
+                       color='w',
+                       markerfacecolor='green',
+                       markersize=10,
+                       label='Ego Future',
                        linestyle='None'),
             plt.Line2D([0], [0],
                        marker='s',
@@ -441,15 +479,14 @@ class DataProcessor(object):
                   labelcolor='white',
                   facecolor='black',
                   edgecolor='white')
-
-        # 6. 제목 설정
+        # 7. 제목 설정
         ax.set_title(f'Scenario Visualization - {map_name}_{token}',
                      color='white',
                      fontsize=14,
                      pad=20)
         fig.tight_layout(pad=0.5)
 
-        # 7. wandb에 이미지 업로드
+        # 8. wandb에 이미지 업로드
         if self._wandb_enabled:
             # (1) Figure → wandb.Image 직접 전달
             wandb_image = wandb.Image(fig, caption=f"{map_name}_{token}")
