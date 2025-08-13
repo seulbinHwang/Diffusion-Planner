@@ -195,7 +195,16 @@ class DataProcessor(object):
             '''
             ego_agent_future = get_ego_future_array_from_scenario(
                 scenario, ego_state, self.num_future_poses,
-                self.future_time_horizon)
+                self.future_time_horizon)  # (T, 7)
+            # x, y, cos(yaw), sin(yaw), vx, vy, width, length, agent_type
+            ego_agent_future_processed = np.zeros(
+                (ego_agent_future.shape[0], 11), dtype=np.float32)
+            ego_agent_future_processed[:, :2] = ego_agent_future[:, :2]
+            ego_agent_future_processed[:, 2] = np.cos(ego_agent_future[:, 2])
+            ego_agent_future_processed[:, 3] = np.sin(ego_agent_future[:, 2])
+            ego_agent_future_processed[:, 4:8] = ego_agent_future[:, 3:]
+            ego_agent_future_processed[:, 8] = 1.0  # ego is always vehicle
+            ego_agent_future = ego_agent_future_processed
 
             present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
             future_tracked_objects = [

@@ -5,9 +5,9 @@ from typing import List
 from nuplan.common.actor_state.state_representation import TimePoint
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex
-from nuplan.planning.training.preprocessing.features.trajectory_utils import convert_absolute_to_relative_poses
 from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
+from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 
 def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
                                      past_time_horizon):
@@ -65,20 +65,47 @@ def sampled_past_ego_states_to_array(
     return output
 
 
-def get_ego_future_array_from_scenario(scenario, current_ego_state,
-                                       num_future_poses, future_time_horizon):
+def get_ego_future_array_from_scenario(scenario: NuPlanScenario,
+                                       current_ego_state: EgoState,
+                                       num_future_poses: int,
+                                       future_time_horizon: float) -> npt.NDArray[np.float32]:
 
     future_trajectory_absolute_states = scenario.get_ego_future_trajectory(
         iteration=0,
         num_samples=num_future_poses,
         time_horizon=future_time_horizon)
 
-    # Get all future poses of the ego relative to the ego coordinate system
-    future_trajectory_relative_poses = convert_absolute_to_relative_poses(
-        current_ego_state.rear_axle,
-        [state.rear_axle for state in future_trajectory_absolute_states])
+    sampled_future_ego_states: List[EgoState] = list(
+        future_trajectory_absolute_states)
 
-    return future_trajectory_relative_poses
+    # build array [x, y, heading, vx, vy, width, length]
+    future_ego_states_array = np.zeros((len(sampled_future_ego_states), 7),
+                                       dtype=np.float64)
+    for i, state in enumerate(sampled_future_ego_states):
+        future_ego_states_array[i, EgoInternalIndex.x()] = state.rear_axle.x
+        future_ego_states_array[i, EgoInternalIndex.y()] = state.rear_axle.y
+        future_ego_states_array[i, EgoInternalIndex.heading()] = \
+            state.rear_axle.heading
+        future_ego_states_array[i, EgoInternalIndex.vx()] = \
+            state.dynamic_car_state.rear_axle_velocity_2d.x
+        future_ego_states_array[i, EgoInternalIndex.vy()] = \
+            state.dynamic_car_state.rear_axle_velocity_2d.y
+        future_ego_states_array[i, EgoInternalIndex.ax()] = \
+            state.car_footprint.width
+        future_ego_states_array[i, EgoInternalIndex.ay()] = \
+            state.car_footprint.length
+
+    anchor_ego_state = np.array([
+        current_ego_state.rear_axle.x,
+        current_ego_state.rear_axle.y,
+        current_ego_state.rear_axle.heading,
+    ],
+                                 dtype=np.float64)
+
+    future_ego_states_array = convert_absolute_quantities_to_relative(
+        future_ego_states_array, anchor_ego_state, 'ego')
+
+    return future_ego_states_array.astype(np.float32)
 
 
 def calculate_additional_ego_states(ego_agent_past, time_stamp):
