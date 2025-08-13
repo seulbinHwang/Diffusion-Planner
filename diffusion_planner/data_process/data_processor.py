@@ -193,9 +193,15 @@ class DataProcessor(object):
             '''
             ego & agents future
             '''
-            ego_agent_future = get_ego_future_array_from_scenario(
+            ego_agent_future, ego_agent_future_11_dim = get_ego_future_array_from_scenario(
                 scenario, ego_state, self.num_future_poses,
                 self.future_time_horizon)
+
+            Tf, Df = ego_agent_future_11_dim.shape
+            assert Tf == self.num_future_poses, (
+                "Ego agent future states should have T time steps")
+            assert Df == 11, (
+                "Ego agent future states should have 11 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, agent type)")
 
             present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
             future_tracked_objects = [
@@ -235,6 +241,7 @@ class DataProcessor(object):
                 "ego_agent_past": ego_agent_past,
                 "ego_current_state": ego_current_state,
                 "ego_agent_future": ego_agent_future,
+                "ego_agent_future_11_dim": ego_agent_future_11_dim,
                 "neighbor_agents_past": neighbor_agents_past,
                 "neighbor_agents_future": neighbor_agents_future,
                 "static_objects": static_objects
