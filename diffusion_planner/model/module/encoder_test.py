@@ -174,13 +174,15 @@ class AgentFusionEncoder(nn.Module):
         self.time_gap = 0.1
         self.time_min = -2.0
         self.time_max = 8.0
+        self.num_fourier_frequencies = 4
+        num_fourier_dim = 2 * self.num_fourier_frequencies + 1  # 2K + 1
 
         self._hidden_dim = hidden_dim
         self._channel = channels_mlp_dim
 
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
-        self.channel_pre_project = Mlp(in_features=8 + 1,
+        self.channel_pre_project = Mlp(in_features=8 + num_fourier_dim + 1,
                                        hidden_features=channels_mlp_dim,
                                        out_features=channels_mlp_dim,
                                        act_layer=nn.GELU,
@@ -207,7 +209,7 @@ class AgentFusionEncoder(nn.Module):
             self, agents_past_current: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Input: agents_past_current (B, agents_num, time_len, 8)
+        Input: agents_past_current (B, agents_num, time_len, 8 + 2K + 1)
 
         Output:
             agents_past_cur_off_p_mask: (B, agents_num, time_len)
@@ -249,7 +251,7 @@ class AgentFusionEncoder(nn.Module):
             self,
             ego_future: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Input: ego_future (B, future_len, 8)
+        Input: ego_future (B, future_len,  8 + 2K + 1)
 
         Output:
             ego_future_off_p_mask: (B, future_len)
@@ -267,50 +269,50 @@ class AgentFusionEncoder(nn.Module):
 
     def _get_on_agents_past_cur(
         self,
-        agents_past_current: torch.Tensor,  # (B, agents_num, time_len, 8)
+        agents_past_current: torch.Tensor,  # (B, agents_num, time_len, 8 + 2K + 1 )
         agents_past_cur_on_p_mask: torch.
         Tensor,  # (B, agents_num, time_len, 1) # float
         agents_past_cur_on_mask: torch.Tensor  # (B * agents_num)
-    ) -> torch.Tensor:  # (agents_past_cur_on_num, time_len, 9)
+    ) -> torch.Tensor:  # (agents_past_cur_on_num, time_len, 8 + 2K + 1 "+1")
         B, agents_num, time_len, _ = agents_past_current.shape
-        # agents_past_current: (B , agents_num, time_len, 9)
+        # agents_past_current: (B , agents_num, time_len, 8 + 2K + 1 "+1")
         agents_past_current = torch.cat(
             [agents_past_current, agents_past_cur_on_p_mask], dim=-1)
-        # agents_past_current: (B * agents_num, time_len, 9)
+        # agents_past_current: (B * agents_num, time_len, 8 + 2K + 1 "+1")
         agents_past_current = agents_past_current.view(B * agents_num, time_len,
                                                        -1)
         """
         agents_past_cur_on_mask 에서, True의 개수 = 
         (B * agents_num) 개 중에서 agents_past_cur_on_num 개
         """
-        # on_agents_past_cur: (agents_past_cur_on_num, time_len, 9)
+        # on_agents_past_cur: (agents_past_cur_on_num, time_len, 8 + 2K + 1 "+1")
         on_agents_past_cur = agents_past_current[agents_past_cur_on_mask]
         return on_agents_past_cur
 
     def _get_on_ego_future(
         self,
-        ego_future: torch.Tensor,  # (B, future_len, 8)
+        ego_future: torch.Tensor,  # (B, future_len,  8 + 2K + 1)
         ego_future_on_p_mask: torch.Tensor,  # (B, future_len, 1)
         ego_future_on_mask: torch.Tensor  # (B)
     ) -> torch.Tensor:
         ego_future = torch.cat([ego_future, ego_future_on_p_mask],
-                               dim=-1)  # (B, future_len, 9)
-        # (ego_future_on_num, future_len, 9)
+                               dim=-1)  # (B, future_len,  8 + 2K + 1 + "1")
+        # (ego_future_on_num, future_len, 10 + 2k)
         on_ego_future = ego_future[ego_future_on_mask]
-        return on_ego_future  # (ego_future_on_num, future_len, 9)
+        return on_ego_future  # (ego_future_on_num, future_len, 10 + 2k)
 
     def _concat_past_cur_and_future(
         self,
         on_agents_past_cur: torch.
-        Tensor,  # (agents_past_cur_on_num, time_len, 9)
-        on_ego_future: torch.Tensor  # (ego_future_on_num, future_len, 9)
-    ) -> torch.Tensor:  # (on_all_num = agents_past_cur_on_num * time_len + ego_future_on_num * future_len, 9)
-        # (agents_past_cur_on_num * time_len, 9)
+        Tensor,  # (agents_past_cur_on_num, time_len, 10 + 2k)
+        on_ego_future: torch.Tensor  # (ego_future_on_num, future_len, 10 + 2k)
+    ) -> torch.Tensor:  # (on_all_num = agents_past_cur_on_num * time_len + ego_future_on_num * future_len, 10 + 2k)
+        # (agents_past_cur_on_num * time_len, 10+2k)
         on_agents_past_cur = on_agents_past_cur.view(
             -1, on_agents_past_cur.shape[-1])
-        # (ego_future_on_num * future_len, 9)
+        # (ego_future_on_num * future_len, 10 + 2k)
         on_ego_future = on_ego_future.view(-1, on_ego_future.shape[-1])
-        # (on_all_num = agents_past_cur_on_num * time_len + on_ego_future_on_num * future_len, 9)
+        # (on_all_num = agents_past_cur_on_num * time_len + on_ego_future_on_num * future_len, 10 + 2k)
         on_all = torch.cat([on_agents_past_cur, on_ego_future], dim=0)
         return on_all
 
@@ -362,11 +364,14 @@ class AgentFusionEncoder(nn.Module):
         agents_past_current = torch.cat([ego_past_current, npc_past_current],
                                         dim=1)
         B, agents_num, time_len, _ = agents_past_current.shape
+        future_len = ego_future.shape[1]
         agents_type = agents_past_current[:, :, -1, 8:]  # (B, agents_num, 3)
+        ego_type = agents_type[:, 0, :].clone()  # (B, 3)
         # (B, agents_num, time_len, d_8)
         agents_past_current = agents_past_current[..., :8]
         ### add timestep
         # agents_past_current_timestep: (B, agents_num, time_len)
+        # [-2.0, -1.9, ..., 0.0]
         agents_past_current_timestep = timegrid_past_3d(
             dt=self.time_gap,
             total_steps=time_len,
@@ -376,10 +381,11 @@ class AgentFusionEncoder(nn.Module):
             dtype=agents_past_current.dtype)
         agent_past_current_time_fourier = self._encode_time_with_fourier_features(
             agents_past_current_timestep)  # (B, agents_num, time_len, 2K + 1)
-        agent_past_current = torch.cat(
+        agents_past_current = torch.cat(
             [agents_past_current, agent_past_current_time_fourier],
             dim=-1)  # (B, agents_num, time_len, 8 + 2K + 1)
         ############
+        # TODO: pos 구하기
         pos = agents_past_current[:, :, -1, :8].clone(
         )  # x, y, cos, sin # (B, agents_num, 8)
         # neighbor: [0,1,0,0]
@@ -402,7 +408,7 @@ class AgentFusionEncoder(nn.Module):
          agents_past_cur_on_mask) = self._reverse_agents_past_cur_mask(
              agents_past_cur_off_p_mask, agents_past_cur_off_mask)
 
-        # on_agents_past_cur: (agents_past_cur_on_num, time_len, 9)
+        # on_agents_past_cur: (agents_past_cur_on_num, time_len, 8 + 2K + 1 "+ 1" )
         on_agents_past_cur = self._get_on_agents_past_cur(
             agents_past_current, agents_past_cur_on_p_mask,
             agents_past_cur_on_mask)
@@ -434,12 +440,11 @@ class AgentFusionEncoder(nn.Module):
         ego_future_on_p_mask = ~ego_future_off_p_mask.unsqueeze(
             -1)  # (B, future_len, 1)
         ego_future_on_mask = ~ego_future_off_mask  # (B)
-        # (ego_future_on_num, future_len, 9)
+        # (ego_future_on_num, future_len, 10 + 2k)
         on_ego_future = self._get_on_ego_future(ego_future,
                                                 ego_future_on_p_mask,
                                                 ego_future_on_mask)
         # on_all_num = agents_past_cur_on_num * time_len + ego_future_on_num * future_len
-        # (on_all_num, 9)
         agents_past_cur_on_num = on_agents_past_cur.shape[0]
         on_agents_past_cur_num = agents_past_cur_on_num * time_len
         ego_future_on_num = on_ego_future.shape[0]
@@ -454,7 +459,7 @@ class AgentFusionEncoder(nn.Module):
             agents_past_cur_on_num, time_len, -1)
         # on_ego_future: (ego_future_on_num, future_len, channels_mlp_dim)
         on_ego_future = on_all[on_agents_past_cur_num:, :].view(
-            ego_future_on_num, -1, on_all.shape[-1])
+            ego_future_on_num, future_len, -1)
         # TODO: channel_pre_project 구현하기
 
         on_agents_past_cur = on_agents_past_cur.permute(0, 2, 1)
