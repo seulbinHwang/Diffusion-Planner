@@ -175,9 +175,11 @@ class AgentFusionEncoder(nn.Module):
         self.time_min = -2.0
         self.time_max = 8.0
         self.num_fourier_frequencies = 4
+        self.chunk_length = 10
         num_fourier_dim = 2 * self.num_fourier_frequencies + 1  # 2K + 1
 
         self._hidden_dim = hidden_dim
+        self.tokens_mlp_dim = tokens_mlp_dim
         self._channel = channels_mlp_dim
 
         self.type_emb = nn.Linear(3, channels_mlp_dim)
@@ -269,7 +271,8 @@ class AgentFusionEncoder(nn.Module):
 
     def _get_on_agents_past_cur(
         self,
-        agents_past_current: torch.Tensor,  # (B, agents_num, time_len, 8 + 2K + 1 )
+        agents_past_current: torch.
+        Tensor,  # (B, agents_num, time_len, 8 + 2K + 1 )
         agents_past_cur_on_p_mask: torch.
         Tensor,  # (B, agents_num, time_len, 1) # float
         agents_past_cur_on_mask: torch.Tensor  # (B * agents_num)
@@ -353,6 +356,138 @@ class AgentFusionEncoder(nn.Module):
 
         # 최종: (..., 2K + 1)  [cos | sin | t_hat]
         return torch.cat([fourier, t_scalar], dim=-1)
+
+    @staticmethod
+    def _compute_equal_chunks(
+            seq_len: int, chunk_num: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """AdaptiveAvgPool1d와 동일한 **균등 분할 경계**를 계산한다.
+
+        분할 포인트 b_m = ceil(m * V / chunk_num)를 이용해 [b_{m-1}, b_m-1]를 구간으로 정한다.
+
+        Args:
+            seq_len (int): 시점 길이 V.
+            chunk_num (int): 구간 수 chunk_num.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - starts: (chunk_num,) 각 구간 시작 인덱스(포함)
+                - ends:   (chunk_num,) 각 구간 종료 인덱스(포함)
+        """
+        boundaries = torch.div(torch.arange(0, chunk_num + 1) * seq_len,
+                               chunk_num,
+                               rounding_mode="ceil")
+        starts = boundaries[:-1]  # (chunk_num,)
+        ends = boundaries[1:] - 1  # (chunk_num,)
+        return starts, ends
+
+    def _gated_attentive_pool(
+            self,
+            chunk_values: torch.Tensor,  # (N, L, C)
+            chunk_off_points_mask: torch.Tensor,  # (N, L)
+            chunk_is_invalid: torch.Tensor  # (N)
+    ) -> torch.Tensor:
+        """게이트드 어텐션 풀링을 **tokens_mlp_dim개 쿼리**로 일반화하여 (N, tokens_mlp_dim, C) 출력을 반환한다.
+        Args:
+            chunk_values (torch.Tensor):
+                - shape: (N, L, C)
+                - 의미: 구간 내부 L개 시점의 채널 임베딩(이미 per-timestep proj를 통과한 값)
+            chunk_off_points_mask (torch.Tensor):
+                - shape: (N, L)   # True=무효(해당 프레임 제외)
+            chunk_is_invalid: shape: (N,) # True=해당 구간에 유효 시점 0개
+
+        Returns:
+            torch.Tensor:
+                - shape: (N, tokens_mlp_dim, C)
+                - 의미: tokens_mlp_dim개의 쿼리별로 풀링된 구간 대표 벡터
+
+        """
+        # ----- 1) 게이트 전처리: h_t = GELU(W z_t) -----
+        # chunk_values: (N, L, C) → gated_hidden: (N, L, C)
+        gated_hidden = F.gelu(self.gate_linear_W(chunk_values))
+
+        # ----- 2) Q개 점수 산출: logits_{t,q} -----
+        # (N, L, C) → (N, L, tokens_mlp_dim)
+        logits = self.gate_linear_V(gated_hidden)
+
+        # chunk_off_points_mask.unsqueeze(-1): (N, L, 1)
+        # 없는 시간의 점의 가중치를 -1e9로 설정하여 softmax에서 무시.
+        logits = logits.masked_fill(chunk_off_points_mask.unsqueeze(-1), -1e9)
+
+        # ----- 3) L축 softmax (쿼리별로 시점 가중치) -----
+        # (N, L, tokens_mlp_dim)
+        attn = torch.softmax(logits, dim=1)
+
+        # 모든 시점이 무효인 경우(분모 0) softmax NaN 방지 → 0으로 설정
+        # chunk_off_points_mask: (N, L)
+        # chunk_valid_points_num: (N, 1)
+        if chunk_is_invalid.any():
+            attn[chunk_is_invalid] = 0.0  # (해당 샘플은 0 가중치)
+
+        # ----- 4) 값 변환 및 가중합 -----
+        # value_linear: (C→C)
+        # values_proj: (N, L, C)
+        values_proj = self.value_linear(chunk_values)
+
+        # einsum으로 Σ_t a_{t,q} * v_t  → (N, tokens_mlp_dim, C)
+        # attn: (N, L, tokens_mlp_dim), values_proj: (N, L, C)
+        pooled = torch.einsum("nlq,nlc->nqc", attn,
+                              values_proj)  # (N, tokens_mlp_dim, C)
+
+        return pooled
+
+    def traj_to_chunk_token(
+        self,
+        valid_traj_token: torch.Tensor,
+        valid_traj_off_p_mask: torch.Tensor,
+        chunk_starts: torch.Tensor,
+        chunk_ends: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """균등 분할된 각 구간에 대해 **집계 토큰**과 **구간 마스크**를 만든다.
+
+        Args:
+            valid_traj_token (torch.Tensor):
+                - shape: (N, V, C)   # 유효 에이전트 수 N, 시점 V, 채널 C
+            valid_traj_off_p_mask (torch.Tensor):
+                - shape: (N, V)      # True = 무효(시점)
+            chunk_starts (torch.Tensor):
+                - shape: (chunk_num,)        # 구간 시작 인덱스(포함)
+            chunk_ends (torch.Tensor):
+                - shape: (chunk_num,)        # 구간 종료 인덱스(포함)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - chunk_tokens: (N, chunk_num, tokens_mlp_dim, C)
+                - invalid_chunk_mask: (N, chunk_num)  # True = 무효(해당 구간에 유효 시점 0개)
+        """
+        num_agents_valid, _, channel_dim = valid_traj_token.shape
+        chunks_num = chunk_starts.numel()
+
+        chunk_tokens = valid_traj_token.new_zeros(
+            num_agents_valid, chunks_num, self.tokens_mlp_dim,
+            channel_dim)  # (N, chunk_num, tokens_mlp_dim, C)
+        invalid_chunk_mask = torch.zeros(
+            num_agents_valid,
+            chunks_num,
+            dtype=torch.bool,
+            device=valid_traj_token.device)  # (N, chunk_num)
+
+        for chunk_idx in range(chunks_num):
+            start, end = int(chunk_starts[chunk_idx].item()), int(
+                chunk_ends[chunk_idx].item())
+            chunk_values = valid_traj_token[:, start:end + 1, :]  # (N, L, C)
+            # (N, L)
+            chunk_off_points_mask = valid_traj_off_p_mask[:, start:end + 1]
+            # (N,)
+            chunk_is_invalid = (chunk_off_points_mask == False).sum(dim=1) == 0
+            invalid_chunk_mask[:, chunk_idx] = chunk_is_invalid
+
+            pooled = self._gated_attentive_pool(
+                chunk_values, chunk_off_points_mask,
+                chunk_is_invalid)  # (N, tokens_mlp_dim, C)
+            # (N, chunk_num, tokens_mlp_dim, C)
+            chunk_tokens[:, chunk_idx, :, :] = pooled
+
+        return chunk_tokens, invalid_chunk_mask  # (N, chunk_num, tokens_mlp_dim, C), (N, chunk_num)
 
     def forward(self, ego_past_current, npc_past_current, ego_future):
         '''
@@ -460,7 +595,41 @@ class AgentFusionEncoder(nn.Module):
         # on_ego_future: (ego_future_on_num, future_len, channels_mlp_dim)
         on_ego_future = on_all[on_agents_past_cur_num:, :].view(
             ego_future_on_num, future_len, -1)
-        # TODO: channel_pre_project 구현하기
+        """
+        token_pre_project = hard split + gated attentional pooling
+        """
+        # ---------- 8) 균등 분할 경계 ----------
+        past_cur_chunk_num = time_len // self.chunk_length
+        past_chunk_start_idx, past_chunk_end_idx = self._compute_equal_chunks(
+            seq_len=time_len, chunk_num=past_cur_chunk_num
+        )  # (past_cur_chunk_num,), (past_cur_chunk_num,)
+        future_chunk_num = future_len // self.chunk_length
+        fut_chunk_start_idx, fut_chunk_end_idx = self._compute_equal_chunks(
+            seq_len=future_len, chunk_num=future_chunk_num
+        )  # (future_chunk_num,), (future_chunk_num,)
+        """
+        # agents_past_cur_off_p_mask: (B, agents_num, time_len)
+        # agents_past_cur_on_mask: (B * agents_num)
+        
+        # on_agents_past_cur_off_p_mask: (agents_past_cur_on_num, time_len)
+        """
+        agents_past_cur_off_p_mask = agents_past_cur_off_p_mask.view(
+            B * agents_num, time_len)  # (B * agents_num, time_len)
+        on_agents_past_cur_off_p_mask = agents_past_cur_off_p_mask[
+            agents_past_cur_on_mask]  # (agents_past_cur_on_num, time_len)
+
+        # past_cur_chunk_tokens: (agents_past_cur_on_num, chunk_num, tokens_mlp_dim, C)
+        # invalid_past_cur_chunk_mask: (agents_past_cur_on_num, chunk_num)
+        # TODO: 여기서부터
+        (past_cur_chunk_tokens, invalid_past_cur_chunk_mask
+        ) = self.traj_to_chunk_token(
+            on_agents_past_cur,  # (agents_past_cur_on_num, time_len, channels_mlp_dim)
+            agents_past_cur_off_p_mask,  # (agents_past_cur_on_num, time_len)
+            past_chunk_start_idx,
+            past_chunk_end_idx,
+        )
+
+        #################
 
         on_agents_past_cur = on_agents_past_cur.permute(0, 2, 1)
 
