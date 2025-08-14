@@ -10,7 +10,10 @@ echo "Step 1: Running data processing..."
 # You can modify these paths if needed.
 NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
 NUPLAN_MAP_PATH="/media/user/E/dataset/maps"
-TRAIN_SET_PATH="/media/user/E/dataset/processed/"
+# 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
+TRAIN_SET_NAME="processed_ego_past_future"
+TRAIN_SET_PATH="/media/user/E/dataset/${TRAIN_SET_NAME}"
+TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
 # This is the command from data_process_pnc.sh
@@ -40,9 +43,11 @@ echo "Cleaning finished."
 echo "---------------------------------"
 echo "Step 3: Uploading processed data..."
 
-nubescli dir-upload labs-mlops/ad/research/pnc/hsb/dataset/processed \
+nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
                     "$TRAIN_SET_PATH" \
                     -e -j 128
 
+nubescli upload labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
+                    /media/user/E/projects/Diffusion-Planner/diffusion_planner_training.json
 echo "Upload complete."
 echo "Pipeline finished successfully."

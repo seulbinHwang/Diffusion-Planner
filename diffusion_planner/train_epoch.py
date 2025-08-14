@@ -42,6 +42,9 @@ def train_epoch(data_loader,
             route_lanes_has_speed_limit,
 
             static_objects,
+            neighbors_future_gt_all
+            ego_future_gt_11_dim, = ego_agent_future_11_dim
+
 
             '''
 
@@ -60,7 +63,8 @@ def train_epoch(data_loader,
                 'route_lanes_speed_limit': batch[9].to(args.device),
                 'route_lanes_has_speed_limit': batch[10].to(args.device),
 
-                'static_objects': batch[11].to(args.device)
+                'static_objects': batch[11].to(args.device),
+                'ego_future_gt_11_dim': batch[13].to(args.device),
 
             }
 
@@ -87,6 +91,7 @@ def train_epoch(data_loader,
 
             mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
                              dim=-1) == 0
+            # neighbors_future shape: [B, N, T, 4]
             neighbors_future = torch.cat(
                 [
                     neighbors_future[..., :2],
