@@ -1,7 +1,7 @@
 ###################################
 # User Configuration Section
 ###################################
-NUPLAN_DATA_PATH="/home/hsb/nuplan/dataset/nuplan-v1.1/splits/trainval" # nuplan training data path (e.g., "/data/nuplan-v1.1/trainval")
+NUPLAN_DATA_PATH="/home/hsb/nuplan/dataset/nuplan-v1.1/splits/trainval_test" # nuplan training data path (e.g., "/data/nuplan-v1.1/trainval")
 NUPLAN_MAP_PATH="/home/hsb/nuplan/dataset/maps" # nuplan map path (e.g., "/data/nuplan-v1.1/maps")
 
 TRAIN_SET_PATH="/home/hsb/nuplan/dataset/processed/" # preprocess training data

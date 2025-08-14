@@ -192,6 +192,8 @@ class DataProcessor(object):
                                      self._max_elements, self._max_points)
             '''
             ego & agents future
+            ego_agent_future : rear axle x,y, ~~~
+            ego_agent_future_11_dim : center x,y, ~~~
             '''
             ego_agent_future, ego_agent_future_11_dim = get_ego_future_array_from_scenario(
                 scenario, ego_state, self.num_future_poses,
@@ -240,8 +242,8 @@ class DataProcessor(object):
                 "token": token,
                 "ego_agent_past": ego_agent_past,
                 "ego_current_state": ego_current_state,
-                "ego_agent_future": ego_agent_future,
-                "ego_agent_future_11_dim": ego_agent_future_11_dim,
+                "ego_agent_future": ego_agent_future, # rear_axle x,y
+                "ego_agent_future_11_dim": ego_agent_future_11_dim, # center x,y
                 "neighbor_agents_past": neighbor_agents_past,
                 "neighbor_agents_future": neighbor_agents_future,
                 "static_objects": static_objects
@@ -370,7 +372,8 @@ class DataProcessor(object):
                 'green',
                 alpha=0.8 if t == ego_agent_future_11_dim.shape[0] - 1 else 0.5,
                 show_heading=True,
-                time_info=time_info)
+                # time_info=time_info
+            )
 
         # 4. Neighbor vehicles 그리기
         for p in range(neighbor_agents_past.shape[0]):  # P=32
