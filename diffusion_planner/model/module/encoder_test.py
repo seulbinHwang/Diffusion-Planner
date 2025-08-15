@@ -490,6 +490,83 @@ class AgentFusionEncoder(nn.Module):
 
         return chunks, invalid_chunk_mask  # (N, chunk_num, tokens_mlp_dim, C), (N, chunk_num)
 
+    def _get_type_embedding(
+        self,
+        agents_type: torch.Tensor,  # (B, agents_num, 3)
+        ego_fut_type: torch.Tensor,  # (B, 3)
+        agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
+        ego_future_on_mask: torch.Tensor,  # (B)
+        on_agents_past_cur_on_chunk_mask: torch.
+        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
+        on_ego_fut_on_chunk_mask: torch.
+        Tensor,  # (ego_future_on_num * future_chunk_num)
+        past_cur_chunk_num: int,
+        future_chunk_num: int,
+    ) -> torch.Tensor:
+        ######## Add Type Embedding ########
+        # (B * agents_num, 3)
+        B, agents_num = agents_type.shape[:2]
+        agents_type = agents_type.view(B * agents_num, -1)
+        # (agents_past_cur_on_num, 3)
+        agents_type = agents_type[agents_past_cur_on_mask]
+        agents_past_cur_on_num = agents_type.shape[0]
+        # (agents_past_cur_on_num, 3) -> (agents_past_cur_on_num, 1, 3) -> (agents_past_cur_on_num, past_cur_chunk_num, 3)
+        agents_type = agents_type.unsqueeze(1).expand(-1, past_cur_chunk_num,
+                                                      -1)
+        # (agents_past_cur_on_num, past_cur_chunk_num, 3) -> (agents_past_cur_on_num * past_cur_chunk_num, 3)
+        agents_type = agents_type.view(
+            agents_past_cur_on_num * past_cur_chunk_num, -1)
+        # (agents_past_cur_on_num * past_cur_chunk_num, 3) -> (on_past_cur_on_chunk_num, 3)
+        agents_type = agents_type[on_agents_past_cur_on_chunk_mask]
+        ##############################
+        # ego_fut_type: (B, 3) -> (ego_future_on_num, 3)
+        ego_fut_type = ego_fut_type[ego_future_on_mask]
+        ego_future_on_num = ego_fut_type.shape[0]
+        # (ego_future_on_num, 3) -> (ego_future_on_num, 1, 3) -> (ego_future_on_num, future_chunk_num, 3)
+        ego_fut_type = ego_fut_type.unsqueeze(1).expand(-1, future_chunk_num,
+                                                        -1)
+        # (ego_future_on_num, future_chunk_num, 3) -> (ego_future_on_num * future_chunk_num, 3)
+        ego_fut_type = ego_fut_type.view(ego_future_on_num * future_chunk_num,
+                                         -1)
+        # (ego_future_on_num * future_chunk_num, 3) -> (on_ego_fut_on_chunk_num, 3)
+        ego_fut_type = ego_fut_type[on_ego_fut_on_chunk_mask]
+        # (on_all_on_chunk_num, 3)
+        agents_ego_fut_type = torch.cat([agents_type, ego_fut_type], dim=0)
+
+        agents_ego_fut_type_emb = self.type_emb(agents_ego_fut_type)
+        return agents_ego_fut_type_emb
+
+    def _fill_on_chunk_to_on_agent(
+            self,
+            on_all_on_chunk: torch.Tensor,  # (on_all_on_chunk_num, C)
+            on_agents_past_cur_on_chunk_mask: torch.
+        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
+            on_ego_fut_on_chunk_mask: torch.
+        Tensor,  # (ego_future_on_num * future_chunk_num)
+            on_past_cur_on_chunk_num: int,
+            agents_past_cur_on_num: int,
+            ego_future_on_num: int,
+            past_cur_chunk_num: int,
+            future_chunk_num: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # (on_past_cur_on_chunk_num, C)
+        on_agents_past_cur_on_chunk = on_all_on_chunk[:
+                                                      on_past_cur_on_chunk_num, :]
+        on_agents_past_cur_chunk = torch.zeros(
+            (agents_past_cur_on_num * past_cur_chunk_num, self._channel),
+            device=on_all_on_chunk.device)
+        # on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
+        on_agents_past_cur_chunk[
+            on_agents_past_cur_on_chunk_mask] = on_agents_past_cur_on_chunk
+
+        # (on_ego_fut_on_chunk_num, C)
+        on_ego_fut_on_chunk = on_all_on_chunk[on_past_cur_on_chunk_num:, :]
+        on_ego_fut_chunk = torch.zeros(
+            (ego_future_on_num * future_chunk_num, self._channel),
+            device=on_all_on_chunk.device)
+        # on_ego_fut_on_chunk_mask: (ego_future_on_num * future_chunk_num)
+        on_ego_fut_chunk[on_ego_fut_on_chunk_mask] = on_ego_fut_on_chunk
+        return on_agents_past_cur_chunk, on_ego_fut_chunk
+
     def forward(self, ego_past_current, npc_past_current, ego_future):
         '''
         ego_past_current: B, 1, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
@@ -502,7 +579,7 @@ class AgentFusionEncoder(nn.Module):
         B, agents_num, time_len, _ = agents_past_current.shape
         future_len = ego_future.shape[1]
         agents_type = agents_past_current[:, :, -1, 8:]  # (B, agents_num, 3)
-        ego_type = agents_type[:, 0, :].clone()  # (B, 3)
+        ego_fut_type = ego_future[:, 0, 8:].clone()  # (B, 3)
         # (B, agents_num, time_len, d_8)
         agents_past_current = agents_past_current[..., :8]
         ### add timestep
@@ -692,44 +769,48 @@ class AgentFusionEncoder(nn.Module):
         # pooling
         # on_all_on_chunk: (on_all_on_chunk_num, C)
         on_all_on_chunk = torch.mean(on_all_on_chunk, dim=1)
-        # (on_past_cur_on_chunk_num, C)
-        on_agents_past_cur_on_chunk = on_all_on_chunk[:
-                                                      on_past_cur_on_chunk_num, :]
-        on_agents_past_cur_chunk = torch.zeros(
-            (agents_past_cur_on_num * past_cur_chunk_num, self._channel),
-            device=on_all_on_chunk.device)
-        # on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
-        on_agents_past_cur_chunk[
-            on_agents_past_cur_on_chunk_mask] = on_agents_past_cur_on_chunk
-
-        # (on_ego_fut_on_chunk_num, C)
-        on_ego_fut_on_chunk = on_all_on_chunk[on_past_cur_on_chunk_num:, :]
-        on_ego_fut_chunk = torch.zeros(
-            (ego_future_on_num * future_chunk_num, self._channel),
-            device=on_all_on_chunk.device)
-        # on_ego_fut_on_chunk_mask: (ego_future_on_num * future_chunk_num)
-        on_ego_fut_chunk[on_ego_fut_on_chunk_mask] = on_ego_fut_on_chunk
 
         # TODO: 여기서부터!
+        agents_ego_fut_type_emb = self._get_type_embedding(
+            agents_type, ego_fut_type, agents_past_cur_on_mask,
+            ego_future_on_mask, on_agents_past_cur_on_chunk_mask,
+            on_ego_fut_on_chunk_mask, past_cur_chunk_num, future_chunk_num)
 
-        agents_type = agents_type.view(B * agents_num,
-                                       -1)  # (B * agents_num, 3)
-        agents_type = agents_type[
-            agents_past_cur_on_mask]  # (on_agents_past_cur.sum(), 3)
-        type_embedding = self.type_emb(
-            agents_type)  # Type embedding for valid data
-        agents_past_current = agents_past_current + type_embedding
+        # on_all_on_chunk: (on_all_on_chunk_num, C)
+        on_all_on_chunk = on_all_on_chunk + agents_ego_fut_type_emb
 
-        agents_past_current = self.emb_project(self.norm(agents_past_current))
+        on_all_on_chunk = self.emb_project(self.norm(on_all_on_chunk))
 
-        x_result = torch.zeros((B * agents_num, agents_past_current.shape[-1]),
-                               device=agents_past_current.device)
-        x_result[
-            agents_past_cur_on_mask] = agents_past_current  # Fill in valid parts
+        ########################
+        # on_agents_past_cur_chunk: (agents_past_cur_on_num * past_cur_chunk_num, C)
+        # on_ego_fut_chunk: (ego_future_on_num * future_chunk_num, C)
+        on_agents_past_cur_chunk, on_ego_fut_chunk = self._fill_on_chunk_to_on_agent(
+            on_all_on_chunk, on_agents_past_cur_on_chunk_mask,
+            on_ego_fut_on_chunk_mask, on_past_cur_on_chunk_num,
+            agents_past_cur_on_num, ego_future_on_num, past_cur_chunk_num,
+            future_chunk_num)
+        # _fill_on_agent_to_agent
+        agents_past_cur_chunk = torch.zeros(
+            (B * agents_num, past_cur_chunk_num, self._channel),
+            device=on_agents_past_cur_chunk.device)
+        # agents_past_cur_on_mask: (B * agents_num) -> agents_past_cur_on_num
+        agents_past_cur_chunk[
+            agents_past_cur_on_mask] = on_agents_past_cur_chunk
+        # (B * agents_num, past_cur_chunk_num, self._channel)
+        # -> (B,  agents_num * past_cur_chunk_num , self._channel)
+        agents_past_cur_chunk = agents_past_cur_chunk.view(
+            B, agents_num * past_cur_chunk_num, self._channel)
 
-        return x_result.view(B,
-                             agents_num, -1), agents_past_cur_off_mask.reshape(
-                                 B, -1), pos.view(B, agents_num, -1)
+        ego_fut_chunk = torch.zeros((B, future_chunk_num, self._channel),
+                                    device=on_ego_fut_chunk.device)
+        # ego_future_on_mask: (B)
+        # -> ego_future_on_num
+        ego_fut_chunk[ego_future_on_mask] = on_ego_fut_chunk
+        # concat: (B, agents_num * past_cur_chunk_num + future_chunk_num, self._channel)
+        all_chunk = torch.cat([agents_past_cur_chunk, ego_fut_chunk], dim=1)
+
+        return all_chunk, agents_past_cur_off_mask.reshape(B, -1), pos.view(
+            B, agents_num, -1)
 
 
 class StaticFusionEncoder(nn.Module):
