@@ -827,7 +827,9 @@ class AgentFusionEncoder(nn.Module):
             # (ego_future_on_num, future_chunk_num) True=무효
         )
 
+        # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, C)
         # all_chunk_off_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
+        # all_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 8)
         return all_chunk, all_chunk_off_mask
 
     def _concat_chunks_and_build_mask(
