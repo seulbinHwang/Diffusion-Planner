@@ -570,6 +570,123 @@ class AgentFusionEncoder(nn.Module):
         on_ego_fut_chunk[on_ego_fut_on_chunk_mask] = on_ego_fut_on_chunk
         return on_agents_past_cur_chunk, on_ego_fut_chunk
 
+    def _concat_chunks_and_build_mask(
+        self,
+        agents_past_cur_chunk: torch.Tensor,
+        ego_fut_chunk: torch.Tensor,
+        past_cur_chunk_num: int,
+        future_chunk_num: int,
+        agents_past_cur_on_mask: torch.Tensor,
+        on_agents_past_cur_off_chunk_mask: torch.Tensor,
+        ego_future_on_mask: torch.Tensor,
+        on_ego_fut_off_chunk_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """에이전트 과거/현재 구간과 ego 미래 구간의 **토큰/마스크**를 결합한다.
+
+        개요:
+            - 과거/현재(agents)와 미래(ego)의 구간별 토큰을 concat하여 `all_chunk`를 만들고,
+            - 각각의 구간 무효(오프) 마스크를 적절히 브로드캐스트/리쉐이프/대입하여
+              배치 단위 `(B, agents_num * past_cur_chunk_num + future_chunk_num)`의
+              **최종 무효 마스크** `all_chunk_off_mask`를 만든다.
+
+        Args:
+            agents_past_cur_chunk (torch.Tensor):
+                - shape: (B, agents_num * past_cur_chunk_num, C)
+                - 의미: 에이전트별 과거/현재 구간 토큰을 (에이전트,구간)축을 펼쳐 concat한 토큰.
+            ego_fut_chunk (torch.Tensor):
+                - shape: (B, future_chunk_num, C)
+                - 의미: ego 미래 구간 토큰.
+            past_cur_chunk_num (int):
+                - 에이전트당 과거/현재 구간 수.
+            future_chunk_num (int):
+                - ego 미래 구간 수.
+            agents_past_cur_on_mask (torch.Tensor):
+                - shape: (B * agents_num,)
+                - dtype: torch.bool
+                - 의미: 에이전트 **유효(True)** 마스크. (주의: True=유효, False=무효)
+                  * 기존 코드 컨벤션과 동일하게 사용합니다.
+            on_agents_past_cur_off_chunk_mask (torch.Tensor):
+                - shape: (agents_past_cur_on_num, past_cur_chunk_num)
+                - dtype: torch.bool
+                - 의미: **구간 무효(True=무효)** 마스크(유효 에이전트만 추려진 상태).
+            ego_future_on_mask (torch.Tensor):
+                - shape: (B,)
+                - dtype: torch.bool
+                - 의미: 배치별 ego 미래 시퀀스 **유효(True)** 마스크.
+            on_ego_fut_off_chunk_mask (torch.Tensor):
+                - shape: (ego_future_on_num, future_chunk_num)
+                - dtype: torch.bool
+                - 의미: **구간 무효(True=무효)** 마스크(유효 배치만 추려진 상태).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - all_chunk:
+                    * shape: (B, agents_num * past_cur_chunk_num + future_chunk_num, C)
+                    * 의미: 과거/현재(에이전트) + 미래(ego)의 구간 토큰을 열 방향으로 이어붙인 결과
+                - all_chunk_off_mask:
+                    * shape: (B, agents_num * past_cur_chunk_num + future_chunk_num)
+                    * dtype: torch.bool
+                    * 의미: **True=무효(패딩)** 키 패딩 마스크. 위 all_chunk의 각 토큰과 1:1 대응.
+
+        Note:
+            - `agents_num`은 `agents_past_cur_chunk.shape[1] // past_cur_chunk_num` 로 유추합니다.
+            - 디바이스/ dtype은 입력 텐서들에서 자동으로 맞춥니다.
+        """
+        # -------------------- 기본 치수/디바이스 유추 --------------------
+        B: int = agents_past_cur_chunk.size(
+            0)  # (B, agents_num * past_cur_chunk_num, C)
+        # (B, A*past_cur_chunk_num, C) → agents_num 유추
+        agents_num: int = agents_past_cur_chunk.size(1) // past_cur_chunk_num
+        device = agents_past_cur_chunk.device
+
+        # -------------------- 1) 에이전트 과거/현재 구간 무효 마스크 구성 --------------------
+        # (B*agents_num, past_cur_chunk_num), 기본 True=무효로 초기화
+        agents_past_cur_off_chunk_mask_all = torch.ones(
+            B * agents_num,
+            past_cur_chunk_num,
+            dtype=torch.bool,
+            device=device,
+        )  # True=무효(기본)
+
+        # 유효 에이전트 위치에 대해 실제 구간 무효 마스크를 덮어쓰기
+        # agents_past_cur_on_mask: (B * agents_num), True=유효
+        # on_agents_past_cur_off_chunk_mask: (agents_past_cur_on_num, past_cur_chunk_num), True=무효
+        agents_past_cur_off_chunk_mask_all[
+            agents_past_cur_on_mask] = on_agents_past_cur_off_chunk_mask
+
+        # (B, agents_num * past_cur_chunk_num)로 펴기
+        agents_past_cur_off_chunk_mask_all = agents_past_cur_off_chunk_mask_all.view(
+            B, agents_num, past_cur_chunk_num).reshape(
+                B, agents_num * past_cur_chunk_num)  # (B, A*M_past)
+
+        # -------------------- 2) ego 미래 구간 무효 마스크 구성 --------------------
+        # (B, future_chunk_num), 기본 True=무효로 초기화
+        ego_fut_off_chunk_mask_all = torch.ones(
+            B,
+            future_chunk_num,
+            dtype=torch.bool,
+            device=device,
+        )  # (B, M_future), True=무효(기본)
+
+        # 유효 배치(ego_future_on_mask=True)에 대해 실제 구간 무효 마스크를 덮어쓰기
+        # on_ego_fut_off_chunk_mask: (ego_future_on_num, future_chunk_num), True=무효
+        ego_fut_off_chunk_mask_all[
+            ego_future_on_mask] = on_ego_fut_off_chunk_mask  # (B, M_future)
+
+        # -------------------- 3) 최종 마스크 결합 --------------------
+        all_chunk_off_mask = torch.cat(
+            [agents_past_cur_off_chunk_mask_all, ego_fut_off_chunk_mask_all],
+            dim=1)  # (B, A*M_past + M_future)
+
+        # -------------------- 4) 토큰 결합 --------------------
+        # agents_past_cur_chunk: (B, A*M_past, C)
+        # ego_fut_chunk        : (B, M_future, C)
+        all_chunk = torch.cat([agents_past_cur_chunk, ego_fut_chunk],
+                              dim=1)  # (B, A*M_past + M_future, C)
+
+        return all_chunk, all_chunk_off_mask
+
+
     def forward(self, ego_past_current, npc_past_current, ego_future):
         '''
         ego_past_current: B, 1, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
@@ -600,6 +717,11 @@ class AgentFusionEncoder(nn.Module):
         agents_past_current = torch.cat(
             [agents_past_current, agent_past_current_time_fourier],
             dim=-1)  # (B, agents_num, time_len, 8 + 2K + 1)
+        agents_past_cur_xyyaw = agents_past_current[:, :, :, :4].clone()  # (B, agents_num, time_len, 4)
+        agents_past_cur_xyyaw_time = torch.cat(
+            [agents_past_cur_xyyaw, agent_past_current_time_fourier],
+            dim=-1)  # (B, agents_num, time_len, 4 + 2K + 1)
+        # TODO: 여기서부터, delta x, delta y, delta yaw 구하기
         ############
         # TODO: pos 구하기
         pos = agents_past_current[:, :, -1, :8].clone(
@@ -829,124 +951,10 @@ class AgentFusionEncoder(nn.Module):
 
         # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, C)
         # all_chunk_off_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
-        # all_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 8)
-        return all_chunk, all_chunk_off_mask
+        # all_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 8 + 2K + 1)
 
-    def _concat_chunks_and_build_mask(
-        self,
-        agents_past_cur_chunk: torch.Tensor,
-        ego_fut_chunk: torch.Tensor,
-        past_cur_chunk_num: int,
-        future_chunk_num: int,
-        agents_past_cur_on_mask: torch.Tensor,
-        on_agents_past_cur_off_chunk_mask: torch.Tensor,
-        ego_future_on_mask: torch.Tensor,
-        on_ego_fut_off_chunk_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """에이전트 과거/현재 구간과 ego 미래 구간의 **토큰/마스크**를 결합한다.
+        return all_chunk, all_chunk_off_mask, all_chunk_pos
 
-        개요:
-            - 과거/현재(agents)와 미래(ego)의 구간별 토큰을 concat하여 `all_chunk`를 만들고,
-            - 각각의 구간 무효(오프) 마스크를 적절히 브로드캐스트/리쉐이프/대입하여
-              배치 단위 `(B, agents_num * past_cur_chunk_num + future_chunk_num)`의
-              **최종 무효 마스크** `all_chunk_off_mask`를 만든다.
-
-        Args:
-            agents_past_cur_chunk (torch.Tensor):
-                - shape: (B, agents_num * past_cur_chunk_num, C)
-                - 의미: 에이전트별 과거/현재 구간 토큰을 (에이전트,구간)축을 펼쳐 concat한 토큰.
-            ego_fut_chunk (torch.Tensor):
-                - shape: (B, future_chunk_num, C)
-                - 의미: ego 미래 구간 토큰.
-            past_cur_chunk_num (int):
-                - 에이전트당 과거/현재 구간 수.
-            future_chunk_num (int):
-                - ego 미래 구간 수.
-            agents_past_cur_on_mask (torch.Tensor):
-                - shape: (B * agents_num,)
-                - dtype: torch.bool
-                - 의미: 에이전트 **유효(True)** 마스크. (주의: True=유효, False=무효)
-                  * 기존 코드 컨벤션과 동일하게 사용합니다.
-            on_agents_past_cur_off_chunk_mask (torch.Tensor):
-                - shape: (agents_past_cur_on_num, past_cur_chunk_num)
-                - dtype: torch.bool
-                - 의미: **구간 무효(True=무효)** 마스크(유효 에이전트만 추려진 상태).
-            ego_future_on_mask (torch.Tensor):
-                - shape: (B,)
-                - dtype: torch.bool
-                - 의미: 배치별 ego 미래 시퀀스 **유효(True)** 마스크.
-            on_ego_fut_off_chunk_mask (torch.Tensor):
-                - shape: (ego_future_on_num, future_chunk_num)
-                - dtype: torch.bool
-                - 의미: **구간 무효(True=무효)** 마스크(유효 배치만 추려진 상태).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - all_chunk:
-                    * shape: (B, agents_num * past_cur_chunk_num + future_chunk_num, C)
-                    * 의미: 과거/현재(에이전트) + 미래(ego)의 구간 토큰을 열 방향으로 이어붙인 결과
-                - all_chunk_off_mask:
-                    * shape: (B, agents_num * past_cur_chunk_num + future_chunk_num)
-                    * dtype: torch.bool
-                    * 의미: **True=무효(패딩)** 키 패딩 마스크. 위 all_chunk의 각 토큰과 1:1 대응.
-
-        Note:
-            - `agents_num`은 `agents_past_cur_chunk.shape[1] // past_cur_chunk_num` 로 유추합니다.
-            - 디바이스/ dtype은 입력 텐서들에서 자동으로 맞춥니다.
-        """
-        # -------------------- 기본 치수/디바이스 유추 --------------------
-        B: int = agents_past_cur_chunk.size(
-            0)  # (B, agents_num * past_cur_chunk_num, C)
-        # (B, A*past_cur_chunk_num, C) → agents_num 유추
-        agents_num: int = agents_past_cur_chunk.size(1) // past_cur_chunk_num
-        device = agents_past_cur_chunk.device
-
-        # -------------------- 1) 에이전트 과거/현재 구간 무효 마스크 구성 --------------------
-        # (B*agents_num, past_cur_chunk_num), 기본 True=무효로 초기화
-        agents_past_cur_off_chunk_mask_all = torch.ones(
-            B * agents_num,
-            past_cur_chunk_num,
-            dtype=torch.bool,
-            device=device,
-        )  # True=무효(기본)
-
-        # 유효 에이전트 위치에 대해 실제 구간 무효 마스크를 덮어쓰기
-        # agents_past_cur_on_mask: (B * agents_num), True=유효
-        # on_agents_past_cur_off_chunk_mask: (agents_past_cur_on_num, past_cur_chunk_num), True=무효
-        agents_past_cur_off_chunk_mask_all[
-            agents_past_cur_on_mask] = on_agents_past_cur_off_chunk_mask
-
-        # (B, agents_num * past_cur_chunk_num)로 펴기
-        agents_past_cur_off_chunk_mask_all = agents_past_cur_off_chunk_mask_all.view(
-            B, agents_num, past_cur_chunk_num).reshape(
-                B, agents_num * past_cur_chunk_num)  # (B, A*M_past)
-
-        # -------------------- 2) ego 미래 구간 무효 마스크 구성 --------------------
-        # (B, future_chunk_num), 기본 True=무효로 초기화
-        ego_fut_off_chunk_mask_all = torch.ones(
-            B,
-            future_chunk_num,
-            dtype=torch.bool,
-            device=device,
-        )  # (B, M_future), True=무효(기본)
-
-        # 유효 배치(ego_future_on_mask=True)에 대해 실제 구간 무효 마스크를 덮어쓰기
-        # on_ego_fut_off_chunk_mask: (ego_future_on_num, future_chunk_num), True=무효
-        ego_fut_off_chunk_mask_all[
-            ego_future_on_mask] = on_ego_fut_off_chunk_mask  # (B, M_future)
-
-        # -------------------- 3) 최종 마스크 결합 --------------------
-        all_chunk_off_mask = torch.cat(
-            [agents_past_cur_off_chunk_mask_all, ego_fut_off_chunk_mask_all],
-            dim=1)  # (B, A*M_past + M_future)
-
-        # -------------------- 4) 토큰 결합 --------------------
-        # agents_past_cur_chunk: (B, A*M_past, C)
-        # ego_fut_chunk        : (B, M_future, C)
-        all_chunk = torch.cat([agents_past_cur_chunk, ego_fut_chunk],
-                              dim=1)  # (B, A*M_past + M_future, C)
-
-        return all_chunk, all_chunk_off_mask
 
 
 class StaticFusionEncoder(nn.Module):
