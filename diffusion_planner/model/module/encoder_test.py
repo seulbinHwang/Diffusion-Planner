@@ -382,7 +382,7 @@ class AgentFusionEncoder(nn.Module):
             self,
             chunk_values: torch.Tensor,  # (N, L, C)
             chunk_off_points_mask: torch.Tensor,  # (N, L)
-            chunk_is_invalid: torch.Tensor  # (N)
+            chunk_is_off: torch.Tensor  # (N)
     ) -> torch.Tensor:
         """게이트드 어텐션 풀링을 **tokens_mlp_dim개 쿼리**로 일반화하여 (N, tokens_mlp_dim, C) 출력을 반환한다.
         Args:
@@ -391,7 +391,7 @@ class AgentFusionEncoder(nn.Module):
                 - 의미: 구간 내부 L개 시점의 채널 임베딩(이미 per-timestep proj를 통과한 값)
             chunk_off_points_mask (torch.Tensor):
                 - shape: (N, L)   # True=무효(해당 프레임 제외)
-            chunk_is_invalid: shape: (N,) # True=해당 구간에 유효 시점 0개
+            chunk_is_off: shape: (N,) # True=해당 구간에 유효 시점 0개
 
         Returns:
             torch.Tensor:
@@ -418,8 +418,9 @@ class AgentFusionEncoder(nn.Module):
         # 모든 시점이 무효인 경우(분모 0) softmax NaN 방지 → 0으로 설정
         # chunk_off_points_mask: (N, L)
         # chunk_valid_points_num: (N, 1)
-        if chunk_is_invalid.any():
-            attn[chunk_is_invalid] = 0.0  # (해당 샘플은 0 가중치)
+        # chunk_is_off: (N,)
+        if chunk_is_off.any():
+            attn[chunk_is_off] = 0.0  # (해당 샘플은 0 가중치)
 
         # ----- 4) 값 변환 및 가중합 -----
         # value_linear: (C→C)
@@ -473,15 +474,15 @@ class AgentFusionEncoder(nn.Module):
             start, end = int(chunk_starts[chunk_idx].item()), int(
                 chunk_ends[chunk_idx].item())
             chunk_values = on_trajs[:, start:end + 1, :]  # (N, L, channel_mlp_dim)
-            # (N, L)
+            # chunk_off_points_mask: (N, L)
             chunk_off_points_mask = on_trajs_off_p_mask[:, start:end + 1]
-            # (N,)
-            chunk_is_invalid = (chunk_off_points_mask == False).sum(dim=1) == 0
-            invalid_chunk_mask[:, chunk_idx] = chunk_is_invalid
+            # chunk_is_off: (N,)
+            chunk_is_off = (chunk_off_points_mask == False).sum(dim=1) == 0
+            invalid_chunk_mask[:, chunk_idx] = chunk_is_off
             # chunk_token: (N, tokens_mlp_dim, channel_mlp_dim)
             chunk_token = self._gated_attentive_pool(
                 chunk_values, chunk_off_points_mask,
-                chunk_is_invalid)  # (N, tokens_mlp_dim, channel_mlp_dim)
+                chunk_is_off)  # (N, tokens_mlp_dim, channel_mlp_dim)
             # (N, chunk_num, tokens_mlp_dim, channel_mlp_dim)
             chunks[:, chunk_idx, :, :] = chunk_token
         # (N, chunk_num, tokens_mlp_dim, channel_mlp_dim), (N, chunk_num)
@@ -1217,13 +1218,14 @@ class AgentFusionEncoder(nn.Module):
 
         #################
         """
-        on_agents_past_cur_chunk: (agents_past_cur_on_num * past_cur_chunk_num, tokens_mlp_dim, C)
+        on_agents_past_cur_chunk: (agents_past_cur_on_num * past_cur_chunk_num, tokens_mlp_dim, channels_mlp_dim)
         on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
         
-        on_agents_past_cur_on_chunk: (on_past_cur_on_chunk_num, tokens_mlp_dim, C)
+        on_agents_past_cur_on_chunk: (on_past_cur_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
             on_past_cur_on_chunk_num: 
                 agents_past_cur_on_num * past_cur_chunk_num 중, True인 개수
         """
+        # TODO: 
         on_agents_past_cur_chunk = on_agents_past_cur_chunk.view(
             agents_past_cur_on_num * past_cur_chunk_num, self.tokens_mlp_dim,
             -1)
@@ -1233,10 +1235,10 @@ class AgentFusionEncoder(nn.Module):
             on_agents_past_cur_on_chunk_mask]
         on_past_cur_on_chunk_num = on_agents_past_cur_on_chunk.shape[0]
         """
-        on_ego_fut_chunk: (ego_future_on_num, future_chunk_num * tokens_mlp_dim, C)
+        on_ego_fut_chunk: (ego_future_on_num, future_chunk_num * tokens_mlp_dim, channels_mlp_dim)
         on_ego_fut_on_chunk_mask: (ego_future_on_num * future_chunk_num)
         
-        on_ego_fut_on_chunk: (on_ego_fut_on_chunk_num, tokens_mlp_dim, C)
+        on_ego_fut_on_chunk: (on_ego_fut_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
             on_ego_fut_on_chunk_num:
                 ego_future_on_num * future_chunk_num 중, True인 개수
         """
@@ -1247,7 +1249,7 @@ class AgentFusionEncoder(nn.Module):
         on_ego_fut_on_chunk = on_ego_fut_chunk[on_ego_fut_on_chunk_mask]
         on_ego_fut_on_chunk_num = on_ego_fut_on_chunk.shape[0]
         """
-        on_all_on_chunk: (on_all_on_chunk_num, tokens_mlp_dim, C)
+        on_all_on_chunk: (on_all_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
             on_all_on_chunk_num = on_past_cur_on_chunk_num + on_ego_fut_on_chunk_num
         """
         on_all_on_chunk = torch.cat(
@@ -1257,7 +1259,7 @@ class AgentFusionEncoder(nn.Module):
         for block in self.blocks:
             on_all_on_chunk = block(on_all_on_chunk)
         # pooling
-        # on_all_on_chunk: (on_all_on_chunk_num, C)
+        # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
         on_all_on_chunk = torch.mean(on_all_on_chunk, dim=1)
 
         agents_ego_fut_type_emb = self._get_type_embedding(
@@ -1265,14 +1267,14 @@ class AgentFusionEncoder(nn.Module):
             ego_future_on_mask, on_agents_past_cur_on_chunk_mask,
             on_ego_fut_on_chunk_mask, past_cur_chunk_num, future_chunk_num)
 
-        # on_all_on_chunk: (on_all_on_chunk_num, C)
+        # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
         on_all_on_chunk = on_all_on_chunk + agents_ego_fut_type_emb
 
         on_all_on_chunk = self.emb_project(self.norm(on_all_on_chunk))
 
         ########################
-        # on_agents_past_cur_chunk: (agents_past_cur_on_num * past_cur_chunk_num, C)
-        # on_ego_fut_chunk: (ego_future_on_num * future_chunk_num, C)
+        # on_agents_past_cur_chunk: (agents_past_cur_on_num * past_cur_chunk_num, channels_mlp_dim)
+        # on_ego_fut_chunk: (ego_future_on_num * future_chunk_num, channels_mlp_dim)
         on_agents_past_cur_chunk, on_ego_fut_chunk = self._fill_on_chunk_to_on_agent(
             on_all_on_chunk, on_agents_past_cur_on_chunk_mask,
             on_ego_fut_on_chunk_mask, on_past_cur_on_chunk_num,
@@ -1300,8 +1302,8 @@ class AgentFusionEncoder(nn.Module):
 
         all_chunk, all_chunk_off_mask = self._concat_chunks_and_build_mask(
             agents_past_cur_chunk=agents_past_cur_chunk,
-            # (B, agents_num*past_cur_chunk_num, C)
-            ego_fut_chunk=ego_fut_chunk,  # (B, future_chunk_num, C)
+            # (B, agents_num*past_cur_chunk_num, channels_mlp_dim)
+            ego_fut_chunk=ego_fut_chunk,  # (B, future_chunk_num, channels_mlp_dim)
             past_cur_chunk_num=past_cur_chunk_num,
             future_chunk_num=future_chunk_num,
             agents_past_cur_on_mask=agents_past_cur_on_mask,
@@ -1313,7 +1315,7 @@ class AgentFusionEncoder(nn.Module):
             # (ego_future_on_num, future_chunk_num) True=무효
         )
 
-        # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, C)
+        # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, channels_mlp_dim)
         # all_chunk_off_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
         # all_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 8 + 2K + 1)
 
