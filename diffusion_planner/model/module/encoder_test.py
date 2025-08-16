@@ -26,12 +26,7 @@ def timegrid_past_3d(dt: float,
     마지막 축(시간축): [-dt*(N-1), ..., -dt*1, 0.0]
     항상 독립 메모리 텐서(복사본)를 반환합니다.
     """
-    if total_steps <= 0:
-        raise ValueError("total_steps must be >= 1")
-    if B <= 0 or agents_num <= 0:
-        raise ValueError("B and agents_num must be >= 1")
-
-    # (N,) = [N-1, ..., 0]
+    # (total_steps,) = [total_steps-1, ..., 1, 0]
     idx = torch.arange(total_steps - 1, -1, -1, device=device, dtype=dtype)
     base = -float(dt) * idx
     base[-1] = torch.tensor(0.0, dtype=dtype, device=device)  # -0.0 → 0.0
@@ -273,7 +268,7 @@ class AgentFusionEncoder(nn.Module):
                                         dim=-1) == 0  # (B)
         return ego_future_off_p_mask, ego_future_off_mask
 
-    def _get_on_agents_past_cur(
+    def _filter_on_agents_past_cur(
         self,
         agents_past_current: torch.
         Tensor,  # (B, agents_num, time_len, 8 + 2K + 1 )
@@ -329,11 +324,11 @@ class AgentFusionEncoder(nn.Module):
 
         Args:
             t_sec (torch.Tensor):
-                - shape: (...,)   # 초 단위 시간
+                - shape: (...,)   # 초 단위 시간 # (B, agents_num, time_len)
 
         Returns:
             torch.Tensor:
-                - shape: (..., 2K + 1)
+                - shape: (..., 2K + 1) # (B, agents_num, time_len, 2K + 1)
                 - 구성: [cos(·), sin(·),  t_hat]
                     * 앞쪽 2K채널: Fourier 성분
                     * 마지막 1채널: 중심화 시간 스칼라
@@ -875,22 +870,11 @@ class AgentFusionEncoder(nn.Module):
             [ego_future_center_feature, ego_fut_center_type], dim=-1)
         return ego_future_center_feature
 
-    def forward(self, ego_past_current, npc_past_current, ego_future):
-        '''
-        ego_past_current: B, 1, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
-        npc_past_current: B, agent_num, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
-        ego_future: B, future_len=80, D_11
-        '''
-        # (B, agents_num=1+agent_num, time_len, D)
-        agents_past_current = torch.cat([ego_past_current, npc_past_current],
-                                        dim=1)
+    def _add_timestep_to_agents_past_cur(
+            self, agents_past_current: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # agents_past_current: (B, agents_num, time_len, d_8)
         B, agents_num, time_len, _ = agents_past_current.shape
-        future_len = ego_future.shape[1]
-        agents_type = agents_past_current[:, :, -1, 8:]  # (B, agents_num, 3)
-        ego_fut_type = ego_future[:, 0, 8:].clone()  # (B, 3)
-        # (B, agents_num, time_len, d_8)
-        agents_past_current = agents_past_current[..., :8]
-        ### add timestep
         # agents_past_current_timestep: (B, agents_num, time_len)
         # [-2.0, -1.9, ..., 0.0]
         agents_past_current_timestep = timegrid_past_3d(
@@ -905,12 +889,38 @@ class AgentFusionEncoder(nn.Module):
         agents_past_current = torch.cat(
             [agents_past_current, agent_past_current_time_fourier],
             dim=-1)  # (B, agents_num, time_len, 8 + 2K + 1)
+
         ######### FOR POSITIONAL EMBEDDING #########
         agents_past_cur_xyyaw = agents_past_current[:, :, :, :4].clone(
         )  # (B, agents_num, time_len, 4)
         agents_past_cur_xyyaw_time = torch.cat(
             [agents_past_cur_xyyaw, agent_past_current_time_fourier], dim=-1
         )  # agents_past_cur_xyyaw_time: (B, agents_num, time_len, 4 + 2K + 1)
+
+        # (B, agents_num, time_len, 8 + 2K + 1)
+        # (B, agents_num, time_len, 4 + 2K + 1)
+        return agents_past_current, agents_past_cur_xyyaw_time
+
+    def forward(self, ego_past_current, npc_past_current, ego_future):
+        '''
+        ego_past_current: B, 1, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
+        npc_past_current: B, agent_num, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
+        ego_future: B, future_len=80, D_11
+        '''
+        # (B, agents_num=1+agent_num, time_len, D)
+        agents_past_current = torch.cat([ego_past_current, npc_past_current],
+                                        dim=1)
+        B, agents_num, time_len, _ = agents_past_current.shape
+        ############
+        agents_type = agents_past_current[:, :, -1, 8:]  # (B, agents_num, 3)
+        ############
+        # (B, agents_num, time_len, d_8)
+        agents_past_current = agents_past_current[..., :8]
+        ### add timestep
+        # agents_past_current: (B, agents_num, time_len, 8 "+ 2K + 1")
+        # agents_past_cur_xyyaw_time: (B, agents_num, time_len, 4 + 2K + 1)
+        (agents_past_current, agents_past_cur_xyyaw_time
+        ) = self._add_timestep_to_agents_past_cur(agents_past_current)
 
         ############
         """
@@ -927,17 +937,28 @@ class AgentFusionEncoder(nn.Module):
              agents_past_cur_off_p_mask, agents_past_cur_off_mask)
 
         # on_agents_past_cur: (agents_past_cur_on_num, time_len, 8 + 2K + 1 "+ 1" )
-        on_agents_past_cur = self._get_on_agents_past_cur(
+        on_agents_past_cur = self._filter_on_agents_past_cur(
             agents_past_current, agents_past_cur_on_p_mask,
             agents_past_cur_on_mask)
 
         #################################
+        future_len = ego_future.shape[1]
+        ego_fut_type = ego_future[:, 0, 8:].clone()  # (B, 3)
+
         # ego_future: (B, future_len, 8)
         ego_future = ego_future[..., :8]
         # ego_future_timestep: (B, future_len)
+
+        ### add timestep
+        # ego_future: (B, future_len, 8 "+ 2K + 1")
+        # ego_future_xyyaw_time: (B, future_len, 4 + 2K + 1)
+        # TODO: _add_timestep_to_agents_past_cur 을 이름바꾸고 함수 만들어야 함!!
+        (ego_future, ego_future_xyyaw_time
+        ) = self._add_timestep_to_agents_past_cur(ego_future)
+
         ego_future_timestep = timegrid_future_2d(
             dt=self.time_gap,
-            total_steps=ego_future.shape[1],  # future_len
+            total_steps=future_len,
             B=B,
             device=ego_future.device,
             dtype=ego_future.dtype)
