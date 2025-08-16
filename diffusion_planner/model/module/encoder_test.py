@@ -680,18 +680,18 @@ class AgentFusionEncoder(nn.Module):
 
         return all_chunk, all_chunk_off_mask
 
-    def _get_agent_past_cur_center_delta(
+    def _get_agent_past_cur_chunks_delta(
         self,
-        agents_past_cur_center_pos_time: torch.
+        agents_past_cur_chunks_pos_time: torch.
         Tensor,  # (B, agents_num, past_cur_chunk_num, _)
         agent_cur_xyyaw: torch.Tensor  # (B, agents_num, 4 )
     ) -> torch.Tensor:  # (B, agents_num, past_cur_chunk_num, 4)
         eps: float = 1e-8
         # (B, agents_num, past_cur_chunk_num, 2)
-        agents_past_cur_center_xy = agents_past_cur_center_pos_time[:, :, :, :2]
+        agents_past_cur_center_xy = agents_past_cur_chunks_pos_time[:, :, :, :2]
         # (B, agents_num, past_cur_chunk_num)
-        agents_past_cur_center_cos = agents_past_cur_center_pos_time[:, :, :, 2]
-        agents_past_cur_center_sin = agents_past_cur_center_pos_time[:, :, :, 3]
+        agents_past_cur_center_cos = agents_past_cur_chunks_pos_time[:, :, :, 2]
+        agents_past_cur_center_sin = agents_past_cur_chunks_pos_time[:, :, :, 3]
 
         # (B, agents_num, 4) # x, y, cos(yaw), sin(yaw)
         # (B, agents_num, 2) # x, y
@@ -717,30 +717,30 @@ class AgentFusionEncoder(nn.Module):
             2)  # (B, agents_num, past_cur_chunk_num, 2)
         # (B, agents_num, past_cur_chunk_num, 2)
 
-        agent_past_cur_center_delta = torch.cat(
+        agent_past_cur_chunks_delta = torch.cat(
             [
                 agents_past_cur_center_delta_xy,
                 agents_past_cur_center_delta_cos_sin
             ],
             dim=-1)  # (B, agents_num, past_cur_chunk_num, 4)
 
-        return agent_past_cur_center_delta  # (B, agents_num, past_cur_chunk_num, 4)
+        return agent_past_cur_chunks_delta  # (B, agents_num, past_cur_chunk_num, 4)
 
-    def _get_agents_past_cur_center_type(
-            self, agents_past_cur_center_feature: torch.Tensor) -> torch.Tensor:
+    def _get_agents_past_cur_chunks_type(
+            self, agents_past_cur_chunks_feature: torch.Tensor) -> torch.Tensor:
         # (B, agents_num, past_cur_chunk_num, 4 + 2k + 1 + 4)
-        B, agents_num, past_cur_chunk_num = agents_past_cur_center_feature.shape[:
+        B, agents_num, past_cur_chunk_num = agents_past_cur_chunks_feature.shape[:
                                                                                  3]
-        agents_past_cur_center_type = torch.zeros(
+        agents_past_cur_chunks_type = torch.zeros(
             (B, agents_num, past_cur_chunk_num, 4),
-            device=agents_past_cur_center_feature.device,
-            dtype=agents_past_cur_center_feature.dtype,
+            device=agents_past_cur_chunks_feature.device,
+            dtype=agents_past_cur_chunks_feature.dtype,
         )
-        agents_past_cur_center_type[:, 0, :, 0] = 1.0  # ego
-        agents_past_cur_center_type[:, 1:, :, 1] = 1.0  # neighbor
-        return agents_past_cur_center_type  # (B, agents_num, past_cur_chunk_num, 4)
+        agents_past_cur_chunks_type[:, 0, :, 0] = 1.0  # ego
+        agents_past_cur_chunks_type[:, 1:, :, 1] = 1.0  # neighbor
+        return agents_past_cur_chunks_type  # (B, agents_num, past_cur_chunk_num, 4)
 
-    def _get_agents_past_cur_center_pos_time(
+    def _get_agents_past_cur_chunks_pos_time(
         self,
         past_chunk_start_idx: torch.Tensor,  # (past_cur_chunk_num,)
         past_chunk_end_idx: torch.Tensor,  # (past_cur_chunk_num,)
@@ -799,12 +799,12 @@ class AgentFusionEncoder(nn.Module):
                                                      past_cur_chunk_num,
                                                      feat_dim)
         # centers: (B, agents_num, M, 4 + 2K + 1)
-        agents_past_cur_center_pos_time = torch.gather(
+        agents_past_cur_chunks_pos_time = torch.gather(
             agents_past_cur_xyyaw_time, dim=2, index=gather_idx)
 
-        return agents_past_cur_center_pos_time  # (B, agents_num, past_cur_chunk_num, 4 + 2K + 1)
+        return agents_past_cur_chunks_pos_time  # (B, agents_num, past_cur_chunk_num, 4 + 2K + 1)
 
-    def _get_agents_past_cur_center_feature(
+    def _get_agents_past_cur_chunks_feature(
         self,
         past_chunk_start_idx: torch.Tensor,  # (past_cur_chunk_num,)
         past_chunk_end_idx: torch.Tensor,  # (past_cur_chunk_num,)
@@ -816,32 +816,143 @@ class AgentFusionEncoder(nn.Module):
         past_cur_chunk_num = past_chunk_start_idx.shape[0]
         ##########
         # (B, agents_num, past_cur_chunk_num, 4 + 2K + 1)
-        agents_past_cur_center_pos_time = self._get_agents_past_cur_center_pos_time(
+        agents_past_cur_chunks_pos_time = self._get_agents_past_cur_chunks_pos_time(
             past_chunk_start_idx, past_chunk_end_idx,
             agents_past_cur_off_p_mask, agents_past_cur_xyyaw_time)
 
         # (B, agents_num, 4)
         agent_cur_xyyaw = agents_past_cur_xyyaw_time[:, :, -1, :4].clone()
-        # agent_past_cur_center_delta: # (B, agents_num, past_cur_chunk_num, 4)
-        agent_past_cur_center_delta = self._get_agent_past_cur_center_delta(
-            agents_past_cur_center_pos_time, agent_cur_xyyaw)
+        # agent_past_cur_chunks_delta: # (B, agents_num, past_cur_chunk_num, 4)
+        agent_past_cur_chunks_delta = self._get_agent_past_cur_chunks_delta(
+            agents_past_cur_chunks_pos_time, agent_cur_xyyaw)
         # (B, agents_num, past_cur_chunk_num, 4 + 2K + 1 + 4)
-        agents_past_cur_center_feature = torch.cat(
-            [agents_past_cur_center_pos_time, agent_past_cur_center_delta],
+        agents_past_cur_chunks_feature = torch.cat(
+            [agents_past_cur_chunks_pos_time, agent_past_cur_chunks_delta],
             dim=-1)
         # (B, agents_num, past_cur_chunk_num, 4)
-        agents_past_cur_center_type = self._get_agents_past_cur_center_type(
-            agents_past_cur_center_feature)
+        agents_past_cur_chunks_type = self._get_agents_past_cur_chunks_type(
+            agents_past_cur_chunks_feature)
         # (B, agents_num, past_cur_chunk_num, 4 + 2K + 1 + 4 + 4)
-        agents_past_cur_center_feature = torch.cat(
-            [agents_past_cur_center_feature, agents_past_cur_center_type],
+        agents_past_cur_chunks_feature = torch.cat(
+            [agents_past_cur_chunks_feature, agents_past_cur_chunks_type],
             dim=-1)
         # (B, agents_num * past_cur_chunk_num, 4 + 2K + 1 + 4 + 4)
-        agents_past_cur_center_feature = agents_past_cur_center_feature.view(
+        agents_past_cur_chunks_feature = agents_past_cur_chunks_feature.view(
             B, agents_num * past_cur_chunk_num, -1)
-        return agents_past_cur_center_feature
+        return agents_past_cur_chunks_feature
 
-    def _get_ego_future_center_feature(
+    def _get_ego_fut_chunks_pos_time(
+        self,
+        fut_chunk_start_idx: torch.Tensor,  # (future_chunk_num,)
+        fut_chunk_end_idx: torch.Tensor,  # (future_chunk_num,)
+        ego_future_off_p_mask: torch.Tensor,  # (B, future_len)
+        ego_future_xyyaw_time: torch.Tensor  # (B, future_len, 4 + 2K + 1)
+    ) -> torch.Tensor:  # (B, future_chunk_num, 4 + 2K + 1)
+        B, future_len, feat_dim = ego_future_xyyaw_time.shape
+        future_chunk_num: int = fut_chunk_start_idx.numel()
+        device = ego_future_xyyaw_time.device
+        dtype_idx = torch.long
+
+        # center_idx: (B, future_chunk_num) [long]
+        center_idx = torch.empty(B,
+                                 future_chunk_num,
+                                 dtype=dtype_idx,
+                                 device=device)
+
+        for chunk_idx in range(future_chunk_num):
+            start_idx = int(fut_chunk_start_idx[chunk_idx].item())
+            end_idx = int(fut_chunk_end_idx[chunk_idx].item())
+            L = end_idx - start_idx + 1
+
+            # valid: (B, L)   True=유효
+            valid = ~ego_future_off_p_mask[:, start_idx:end_idx + 1]
+
+            # 상대 인덱스 t: (B, L)
+            t = torch.arange(L, device=device,
+                             dtype=dtype_idx).view(1, L).expand(B, L)
+
+            # 유효한 곳의 첫/마지막 인덱스
+            big = (L + 1)
+            first_true = torch.where(valid, t,
+                                     torch.full_like(t,
+                                                     big)).amin(dim=-1)  # (B,)
+            last_true = torch.where(valid, t,
+                                    torch.full_like(t, -1)).amax(dim=-1)  # (B,)
+
+            has_valid = last_true >= 0  # (B,)
+            center_rel = (first_true + last_true) // 2  # (B,)
+            center_abs = center_rel + start_idx  # (B,)
+
+            # 유효 프레임이 하나도 없으면 산술 중앙으로 fallback
+            default_center = torch.full_like(center_abs,
+                                             (start_idx + end_idx) // 2)
+            center_abs = torch.where(has_valid, center_abs,
+                                     default_center)  # (B,)
+
+            center_idx[:, chunk_idx] = center_abs
+
+        # gather용 인덱스: (B, future_chunk_num, feat_dim)
+        gather_idx = center_idx.unsqueeze(-1).expand(B, future_chunk_num,
+                                                     feat_dim)
+        # (B, future_chunk_num, 4 + 2K + 1)
+        ego_fut_chunks_pos_time = torch.gather(ego_future_xyyaw_time,
+                                               dim=1,
+                                               index=gather_idx)
+
+        return ego_fut_chunks_pos_time
+
+    def _get_ego_fut_chunks_delta(
+        self,
+        ego_fut_center_pos_time: torch.Tensor,
+        # (B, future_chunk_num, 4 + 2K + 1)
+        ego_cur_xyyaw: torch.Tensor  # (B, 4)
+    ) -> torch.Tensor:  # (B, future_chunk_num, 4)
+
+        # (B, future_chunk_num, 2)
+        ego_fut_center_xy = ego_fut_center_pos_time[:, :, :2]
+        # (B, future_chunk_num)
+        ego_fut_center_cos = ego_fut_center_pos_time[:, :, 2]
+        ego_fut_center_sin = ego_fut_center_pos_time[:, :, 3]
+
+        # 현재 ego: (B, 2) / (B,)
+        ego_cur_xy = ego_cur_xyyaw[:, :2]
+        ego_cur_cos = ego_cur_xyyaw[:, 2]
+        ego_cur_sin = ego_cur_xyyaw[:, 3]
+
+        # Δyaw = yaw_center - yaw_cur 의 cos/sin 직계산
+        # cos(Δ) = cos_c*cos_0 + sin_c*sin_0
+        # sin(Δ) = sin_c*cos_0 - cos_c*sin_0
+        cos_d = ego_fut_center_cos * ego_cur_cos.unsqueeze(
+            1) + ego_fut_center_sin * ego_cur_sin.unsqueeze(1)
+        sin_d = ego_fut_center_sin * ego_cur_cos.unsqueeze(
+            1) - ego_fut_center_cos * ego_cur_sin.unsqueeze(1)
+
+        # Δxy
+        delta_xy = ego_fut_center_xy - ego_cur_xy.unsqueeze(
+            1)  # (B, future_chunk_num, 2)
+
+        # concat: (B, future_chunk_num, 4)
+        ego_fut_chunks_delta = torch.cat(
+            [delta_xy, cos_d.unsqueeze(-1),
+             sin_d.unsqueeze(-1)], dim=-1)
+        return ego_fut_chunks_delta
+
+    def _get_ego_fut_chunks_type(
+            self,
+            ego_future_chunks_feature: torch.Tensor
+            # (B, future_chunk_num, 4 + 2K + 1 + 4)
+    ) -> torch.Tensor:  # (B, future_chunk_num, 4)
+        B, future_chunk_num = ego_future_chunks_feature.shape[:2]
+        ego_fut_chunks_type = torch.zeros(
+            (B, future_chunk_num, 4),
+            device=ego_future_chunks_feature.device,
+            dtype=ego_future_chunks_feature.dtype,
+        )
+        # ego one-hot
+        ego_fut_chunks_type[:, :, 0] = 1.0
+        return ego_fut_chunks_type
+
+    def _get_ego_future_chunks_feature(
         self,
         fut_chunk_start_idx: torch.Tensor,  # (future_chunk_num)
         fut_chunk_end_idx: torch.Tensor,  # (future_chunk_num)
@@ -852,22 +963,22 @@ class AgentFusionEncoder(nn.Module):
         B, future_len, _ = ego_future_xyyaw_time.shape
         future_chunk_num = fut_chunk_start_idx.shape[0]
         # (B, future_chunk_num, 4 + 2K + 1)
-        ego_fut_center_pos_time = self._get_ego_fut_center_pos_time(
+        ego_fut_chunks_pos_time = self._get_ego_fut_chunks_pos_time(
             fut_chunk_start_idx, fut_chunk_end_idx, ego_future_off_p_mask,
             ego_future_xyyaw_time)
-        # ego_fut_center_delta: # (B, future_chunk_num, 4)
-        ego_fut_center_delta = self._get_ego_fut_center_delta(
-            ego_fut_center_pos_time, ego_cur_xyyaw)
+        # ego_fut_chunks_delta: # (B, future_chunk_num, 4)
+        ego_fut_chunks_delta = self._get_ego_fut_chunks_delta(
+            ego_fut_chunks_pos_time, ego_cur_xyyaw)
         # (B, future_chunk_num, 4 + 2K + 1 + 4)
-        ego_future_center_feature = torch.cat(
-            [ego_fut_center_pos_time, ego_fut_center_delta], dim=-1)
+        ego_future_chunks_feature = torch.cat(
+            [ego_fut_chunks_pos_time, ego_fut_chunks_delta], dim=-1)
         # (B, future_chunk_num, 4)
-        ego_fut_center_type = self._get_ego_fut_center_type(
-            ego_future_center_feature)
+        ego_fut_chunks_type = self._get_ego_fut_chunks_type(
+            ego_future_chunks_feature)
         # (B, future_chunk_num, 4 + 2K + 1 + 4 + 4)
-        ego_future_center_feature = torch.cat(
-            [ego_future_center_feature, ego_fut_center_type], dim=-1)
-        return ego_future_center_feature
+        ego_future_chunks_feature = torch.cat(
+            [ego_future_chunks_feature, ego_fut_chunks_type], dim=-1)
+        return ego_future_chunks_feature
 
     def _add_timestep_to_agents_past_cur(
             self, agents_past_current: torch.Tensor
@@ -900,17 +1011,17 @@ class AgentFusionEncoder(nn.Module):
         # (B, agents_num, time_len, 4 + 2K + 1)
         return agents_past_current, agents_past_cur_xyyaw_time
 
-    def _add_timestep_to_ego_fut(self, ego_future: torch.Tensor
-                                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _add_timestep_to_ego_fut(
+            self,
+            ego_future: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # ego_future: (B, future_len, d_8)
         B, future_len, _ = ego_future.shape
         # ego_future_timestep: (B, future_len)
-        ego_future_timestep = timegrid_future_2d(
-            dt=self.time_gap,
-            total_steps=future_len,
-            B=B,
-            device=ego_future.device,
-            dtype=ego_future.dtype)
+        ego_future_timestep = timegrid_future_2d(dt=self.time_gap,
+                                                 total_steps=future_len,
+                                                 B=B,
+                                                 device=ego_future.device,
+                                                 dtype=ego_future.dtype)
         ego_future_time_fourier = self._encode_time_with_fourier_features(
             ego_future_timestep)  # (B, future_len, 2K + 1)
         ego_future = torch.cat([ego_future, ego_future_time_fourier],
@@ -925,7 +1036,11 @@ class AgentFusionEncoder(nn.Module):
         # ego_future_xyyaw_time: (B, future_len, 4 + 2K + 1)
         return ego_future, ego_future_xyyaw_time
 
-    def forward(self, ego_past_current, npc_past_current, ego_future, chunk_length=10):
+    def forward(self,
+                ego_past_current,
+                npc_past_current,
+                ego_future,
+                chunk_length=10):
         '''
         ego_past_current: B, 1, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
         npc_past_current: B, agent_num, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
@@ -980,8 +1095,8 @@ class AgentFusionEncoder(nn.Module):
         ### add timestep
         # ego_future: (B, future_len, 8 "+ 2K + 1")
         # ego_future_xyyaw_time: (B, future_len, 4 + 2K + 1)
-        (ego_future, ego_future_xyyaw_time
-        ) = self._add_timestep_to_ego_fut(ego_future)
+        (ego_future,
+         ego_future_xyyaw_time) = self._add_timestep_to_ego_fut(ego_future)
         ############
         """
         ego_future_off_p_mask: (B, future_len)
@@ -992,23 +1107,23 @@ class AgentFusionEncoder(nn.Module):
         """
         ego_future_off_p_mask, ego_future_off_mask = self._get_ego_future_mask(
             ego_future)  # (B, future_len)
-        ego_future_on_p_mask =(~ego_future_off_p_mask).float().unsqueeze(
+        ego_future_on_p_mask = (~ego_future_off_p_mask).float().unsqueeze(
             -1)  # (B, future_len, 1)
         ego_future_on_mask = ~ego_future_off_mask  # (B)
         ###########
         # on_ego_future:
         # (ego_future_on_num, future_len, 8 + 2K + 1 "+ 1")
         on_ego_future = self._filter_on_ego_future(ego_future,
-                                                ego_future_on_p_mask,
-                                                ego_future_on_mask)
+                                                   ego_future_on_p_mask,
+                                                   ego_future_on_mask)
         # on_all_time_num = agents_past_cur_on_num * time_len + ego_future_on_num * future_len
         agents_past_cur_on_num = on_agents_past_cur.shape[0]
         on_agents_past_cur_num = agents_past_cur_on_num * time_len
         ego_future_on_num = on_ego_future.shape[0]
 
         # on_all (on_all_time_num, 10 + 2k)
-            # on_all_time_num =
-            # agents_past_cur_on_num * time_len + on_ego_future_on_num * future_len
+        # on_all_time_num =
+        # agents_past_cur_on_num * time_len + on_ego_future_on_num * future_len
         on_all = self._concat_past_cur_and_future(on_agents_past_cur,
                                                   on_ego_future)
 
@@ -1030,7 +1145,7 @@ class AgentFusionEncoder(nn.Module):
         )  # (past_cur_chunk_num,), (past_cur_chunk_num,)
         #################
         # (B, agents_num * past_cur_chunk_num, 4 + 2K + 1 + 4 + 4)
-        agents_past_cur_center_feature = self._get_agents_past_cur_center_feature(
+        agents_past_cur_chunks_feature = self._get_agents_past_cur_chunks_feature(
             past_chunk_start_idx, past_chunk_end_idx,
             agents_past_cur_off_p_mask, agents_past_cur_xyyaw_time)
 
@@ -1044,16 +1159,16 @@ class AgentFusionEncoder(nn.Module):
         # ego_future_off_p_mask: (B, future_len)
 
         # agents_past_cur_xyyaw_time: (B, agents_num, time_len, 4 + 2K + 1)
-        ego_cur_xyyaw = agents_past_cur_xyyaw_time[:, 0,
-                                                   -1, :4].clone()  # (B, 4)
+        # ego_cur_xyyaw: (B, 4)
+        ego_cur_xyyaw = agents_past_cur_xyyaw_time[:, 0, -1, :4].clone()
 
-        # ego_future_center_feature: (B, future_chunk_num, 4 + 2K + 1 + 4 + 4)
-        ego_future_center_feature = self._get_ego_future_center_feature(
+        # ego_future_chunks_feature: (B, future_chunk_num, 4 + 2K + 1 + 4 + 4)
+        ego_future_chunks_feature = self._get_ego_future_chunks_feature(
             fut_chunk_start_idx, fut_chunk_end_idx, ego_future_off_p_mask,
             ego_future_xyyaw_time, ego_cur_xyyaw)
         #################
         all_chunk_pos_feature = torch.cat(
-            [agents_past_cur_center_feature, ego_future_center_feature], dim=1
+            [agents_past_cur_chunks_feature, ego_future_chunks_feature], dim=1
         )  # (B, agents_num * past_cur_chunk_num + future_chunk_num, 4 + 2K + 1 + 4 + 4)
         #################
         """
