@@ -820,18 +820,11 @@ class AgentFusionEncoder(nn.Module):
         B, agents_num, time_len, _ = agents_past_cur_xyyaw_time.shape
         past_cur_chunk_num = past_chunk_start_idx.shape[0]
         ##########
+        # (B, agents_num, past_cur_chunk_num, 4 + 2K + 1)
+        agents_past_cur_center_pos = self._get_agents_past_cur_center_pos(
+            past_chunk_start_idx, past_chunk_end_idx,
+            agents_past_cur_off_p_mask, agents_past_cur_xyyaw_time)
 
-        # TODO: 필요해지면 아래 주석 해제
-
-        # agents_past_cur_center_pos = self._get_agents_past_cur_center_pos(
-        #     past_chunk_start_idx, past_chunk_end_idx,
-        #     agents_past_cur_off_p_mask, agents_past_cur_xyyaw_time)
-
-        # (past_cur_chunk_num,)
-        past_chunk_center_idx = (past_chunk_start_idx + past_chunk_end_idx) // 2
-        # (B, agents_num, past_cur_chunk_num, 4 + 2k + 1)
-        agents_past_cur_center_pos = agents_past_cur_xyyaw_time[:, :,
-                                                                past_chunk_center_idx, :]
         agent_cur_xyyaw = agents_past_cur_xyyaw_time[:, :, -1, :4].clone(
         )  # (B, agents_num, 4)
         agent_past_cur_center_delta = self._get_agent_past_cur_center_delta(
