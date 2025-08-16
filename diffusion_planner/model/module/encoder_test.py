@@ -435,17 +435,17 @@ class AgentFusionEncoder(nn.Module):
 
     def traj_to_chunk_token(
         self,
-        valid_traj_token: torch.Tensor,
-        valid_traj_off_p_mask: torch.Tensor,
+        on_trajs: torch.Tensor,
+        on_trajs_off_p_mask: torch.Tensor,
         chunk_starts: torch.Tensor,
         chunk_ends: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """균등 분할된 각 구간에 대해 **집계 토큰**과 **구간 마스크**를 만든다.
 
         Args:
-            valid_traj_token (torch.Tensor):
+            on_trajs (torch.Tensor):
                 - shape: (N, V, C)   # 유효 에이전트 수 N, 시점 V, 채널 C
-            valid_traj_off_p_mask (torch.Tensor):
+            on_trajs_off_p_mask (torch.Tensor):
                 - shape: (N, V)      # True = 무효(시점)
             chunk_starts (torch.Tensor):
                 - shape: (chunk_num,)        # 구간 시작 인덱스(포함)
@@ -457,35 +457,35 @@ class AgentFusionEncoder(nn.Module):
                 - chunks: (N, chunk_num, tokens_mlp_dim, C)
                 - invalid_chunk_mask: (N, chunk_num)  # True = 무효(해당 구간에 유효 시점 0개)
         """
-        num_agents_valid, _, channel_dim = valid_traj_token.shape
+        trajs_on_num, _, channel_mlp_dim = on_trajs.shape
         chunks_num = chunk_starts.numel()
 
-        chunks = valid_traj_token.new_zeros(
-            num_agents_valid, chunks_num, self.tokens_mlp_dim,
-            channel_dim)  # (N, chunk_num, tokens_mlp_dim, C)
+        chunks = on_trajs.new_zeros(
+            trajs_on_num, chunks_num, self.tokens_mlp_dim,
+            channel_mlp_dim)  # (N, chunk_num, tokens_mlp_dim, channel_mlp_dim)
         invalid_chunk_mask = torch.zeros(
-            num_agents_valid,
+            trajs_on_num,
             chunks_num,
             dtype=torch.bool,
-            device=valid_traj_token.device)  # (N, chunk_num)
+            device=on_trajs.device)  # (N, chunk_num)
 
         for chunk_idx in range(chunks_num):
             start, end = int(chunk_starts[chunk_idx].item()), int(
                 chunk_ends[chunk_idx].item())
-            chunk_values = valid_traj_token[:, start:end + 1, :]  # (N, L, C)
+            chunk_values = on_trajs[:, start:end + 1, :]  # (N, L, channel_mlp_dim)
             # (N, L)
-            chunk_off_points_mask = valid_traj_off_p_mask[:, start:end + 1]
+            chunk_off_points_mask = on_trajs_off_p_mask[:, start:end + 1]
             # (N,)
             chunk_is_invalid = (chunk_off_points_mask == False).sum(dim=1) == 0
             invalid_chunk_mask[:, chunk_idx] = chunk_is_invalid
-            # chunk_token: (N, tokens_mlp_dim, C)
+            # chunk_token: (N, tokens_mlp_dim, channel_mlp_dim)
             chunk_token = self._gated_attentive_pool(
                 chunk_values, chunk_off_points_mask,
-                chunk_is_invalid)  # (N, tokens_mlp_dim, C)
-            # (N, chunk_num, tokens_mlp_dim, C)
+                chunk_is_invalid)  # (N, tokens_mlp_dim, channel_mlp_dim)
+            # (N, chunk_num, tokens_mlp_dim, channel_mlp_dim)
             chunks[:, chunk_idx, :, :] = chunk_token
-
-        return chunks, invalid_chunk_mask  # (N, chunk_num, tokens_mlp_dim, C), (N, chunk_num)
+        # (N, chunk_num, tokens_mlp_dim, channel_mlp_dim), (N, chunk_num)
+        return chunks, invalid_chunk_mask
 
     def _get_type_embedding(
         self,
@@ -1182,8 +1182,10 @@ class AgentFusionEncoder(nn.Module):
         on_agents_past_cur_off_p_mask = agents_past_cur_off_p_mask[
             agents_past_cur_on_mask]  # (agents_past_cur_on_num, time_len)
 
-        # on_agents_past_cur_chunk: (agents_past_cur_on_num, past_cur_chunk_num, tokens_mlp_dim, C)
-        # on_agents_past_cur_off_chunk_mask: (agents_past_cur_on_num, past_cur_chunk_num)
+        # on_agents_past_cur_chunk:
+        #   (agents_past_cur_on_num, past_cur_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+        # on_agents_past_cur_off_chunk_mask:
+        #   (agents_past_cur_on_num, past_cur_chunk_num)
 
         (on_agents_past_cur_chunk, on_agents_past_cur_off_chunk_mask
         ) = self.traj_to_chunk_token(
@@ -1200,8 +1202,10 @@ class AgentFusionEncoder(nn.Module):
         """
         on_ego_future_off_p_mask = ego_future_off_p_mask[ego_future_on_mask]
 
-        # on_ego_fut_chunk: (ego_future_on_num, future_chunk_num, tokens_mlp_dim, C)
-        # on_ego_fut_off_chunk_mask: (ego_future_on_num, future_chunk_num)
+        # on_ego_fut_chunk:
+        #   (ego_future_on_num, future_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+        # on_ego_fut_off_chunk_mask:
+        #   (ego_future_on_num, future_chunk_num)
 
         (on_ego_fut_chunk,
          on_ego_fut_off_chunk_mask) = self.traj_to_chunk_token(
