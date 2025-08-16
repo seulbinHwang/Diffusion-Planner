@@ -465,15 +465,14 @@ class AgentFusionEncoder(nn.Module):
             trajs_on_num, chunks_num, self.tokens_mlp_dim,
             channel_mlp_dim)  # (N, chunk_num, tokens_mlp_dim, channel_mlp_dim)
         invalid_chunk_mask = torch.zeros(
-            trajs_on_num,
-            chunks_num,
-            dtype=torch.bool,
+            trajs_on_num, chunks_num, dtype=torch.bool,
             device=on_trajs.device)  # (N, chunk_num)
 
         for chunk_idx in range(chunks_num):
             start, end = int(chunk_starts[chunk_idx].item()), int(
                 chunk_ends[chunk_idx].item())
-            chunk_values = on_trajs[:, start:end + 1, :]  # (N, L, channel_mlp_dim)
+            chunk_values = on_trajs[:,
+                                    start:end + 1, :]  # (N, L, channel_mlp_dim)
             # chunk_off_points_mask: (N, L)
             chunk_off_points_mask = on_trajs_off_p_mask[:, start:end + 1]
             # chunk_is_off: (N,)
@@ -939,9 +938,8 @@ class AgentFusionEncoder(nn.Module):
         return ego_fut_chunks_delta
 
     def _get_ego_fut_chunks_type(
-            self,
-            ego_future_chunks_feature: torch.Tensor
-            # (B, future_chunk_num, 4 + 2K + 1 + 4)
+        self, ego_future_chunks_feature: torch.Tensor
+        # (B, future_chunk_num, 4 + 2K + 1 + 4)
     ) -> torch.Tensor:  # (B, future_chunk_num, 4)
         B, future_chunk_num = ego_future_chunks_feature.shape[:2]
         ego_fut_chunks_type = torch.zeros(
@@ -1037,15 +1035,64 @@ class AgentFusionEncoder(nn.Module):
         # ego_future_xyyaw_time: (B, future_len, 4 + 2K + 1)
         return ego_future, ego_future_xyyaw_time
 
+    def _get_on_agents_past_cur_on_chunk(
+        self, on_agents_past_cur_chunk: torch.Tensor,
+        on_agents_past_cur_off_chunk_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        on_agents_past_cur_chunk: (agents_past_cur_on_num, past_cur_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+        on_agents_past_cur_off_chunk_mask: (agents_past_cur_on_num, past_cur_chunk_num)
+
+        on_agents_past_cur_on_chunk: (on_past_cur_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+            on_past_cur_on_chunk_num:
+                agents_past_cur_on_num * past_cur_chunk_num 중, True인 개수
+        on_agents_past_cur_on_chunk_mask: (on_past_cur_on_chunk_num)
+        """
+        agents_past_cur_on_num, past_cur_chunk_num = on_agents_past_cur_chunk.shape[:
+                                                                                    2]
+        on_agents_past_cur_chunk = on_agents_past_cur_chunk.view(
+            agents_past_cur_on_num * past_cur_chunk_num, self.tokens_mlp_dim,
+            -1)
+        on_agents_past_cur_on_chunk_mask = ~on_agents_past_cur_off_chunk_mask.view(
+            agents_past_cur_on_num * past_cur_chunk_num)
+        on_agents_past_cur_on_chunk = on_agents_past_cur_chunk[
+            on_agents_past_cur_on_chunk_mask]
+        return on_agents_past_cur_on_chunk, on_agents_past_cur_on_chunk_mask
+
+    def _get_on_ego_fut_on_chunk(
+        self,
+        on_ego_fut_chunk: torch.Tensor,
+        on_ego_fut_off_chunk_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        on_ego_fut_chunk: (ego_future_on_num, future_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+        on_ego_fut_off_chunk_mask: (ego_future_on_num, future_chunk_num)
+
+        on_ego_fut_on_chunk: (on_ego_fut_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+            on_ego_fut_on_chunk_num:
+                ego_future_on_num * future_chunk_num 중, True인 개수
+        on_ego_fut_on_chunk_mask: (on_ego_fut_on_chunk_num)
+        """
+        ego_future_on_num, future_chunk_num = on_ego_fut_chunk.shape[:2]
+        on_ego_fut_chunk = on_ego_fut_chunk.view(
+            ego_future_on_num * future_chunk_num, self.tokens_mlp_dim, -1)
+        on_ego_fut_on_chunk_mask = ~on_ego_fut_off_chunk_mask.view(
+            ego_future_on_num * future_chunk_num)
+        on_ego_fut_on_chunk = on_ego_fut_chunk[on_ego_fut_on_chunk_mask]
+        return on_ego_fut_on_chunk, on_ego_fut_on_chunk_mask
+
     def forward(self,
                 ego_past_current,
                 npc_past_current,
                 ego_future,
                 chunk_length=10):
         '''
-        ego_past_current: B, 1, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
-        npc_past_current: B, agent_num, time_len, D_11 (x, y, cos, sin, vx, vy, w, l, type(3))
-        ego_future: B, future_len=80, D_11
+        ego_past_current: (B, 1, time_len, 11)
+        npc_past_current: (B, agent_num, time_len, 11)
+        ego_future: (B, future_len, 11)
+        chunk_length: 10
+
+        (x, y, cos, sin, vx, vy, w, l, type(3)
         '''
         # (B, agents_num=1+agent_num, time_len, D)
         agents_past_current = torch.cat([ego_past_current, npc_past_current],
@@ -1215,39 +1262,18 @@ class AgentFusionEncoder(nn.Module):
              fut_chunk_start_idx,  # (future_chunk_num,)
              fut_chunk_end_idx,  # (future_chunk_num,)
          )
-
-        #################
-        """
-        on_agents_past_cur_chunk: (agents_past_cur_on_num * past_cur_chunk_num, tokens_mlp_dim, channels_mlp_dim)
-        on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
-        
-        on_agents_past_cur_on_chunk: (on_past_cur_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
-            on_past_cur_on_chunk_num: 
-                agents_past_cur_on_num * past_cur_chunk_num 중, True인 개수
-        """
-        # TODO: 
-        on_agents_past_cur_chunk = on_agents_past_cur_chunk.view(
-            agents_past_cur_on_num * past_cur_chunk_num, self.tokens_mlp_dim,
-            -1)
-        on_agents_past_cur_on_chunk_mask = ~on_agents_past_cur_off_chunk_mask.view(
-            agents_past_cur_on_num * past_cur_chunk_num)
-        on_agents_past_cur_on_chunk = on_agents_past_cur_chunk[
-            on_agents_past_cur_on_chunk_mask]
+        # on_agents_past_cur_on_chunk: (on_past_cur_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+        # on_agents_past_cur_on_chunk_mask: (on_past_cur_on_chunk_num)
+        (on_agents_past_cur_on_chunk, on_agents_past_cur_on_chunk_mask
+        ) = self._get_on_agents_past_cur_on_chunk(
+            on_agents_past_cur_chunk, on_agents_past_cur_off_chunk_mask)
         on_past_cur_on_chunk_num = on_agents_past_cur_on_chunk.shape[0]
-        """
-        on_ego_fut_chunk: (ego_future_on_num, future_chunk_num * tokens_mlp_dim, channels_mlp_dim)
-        on_ego_fut_on_chunk_mask: (ego_future_on_num * future_chunk_num)
-        
-        on_ego_fut_on_chunk: (on_ego_fut_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
-            on_ego_fut_on_chunk_num:
-                ego_future_on_num * future_chunk_num 중, True인 개수
-        """
-        on_ego_fut_chunk = on_ego_fut_chunk.view(
-            ego_future_on_num * future_chunk_num, self.tokens_mlp_dim, -1)
-        on_ego_fut_on_chunk_mask = ~on_ego_fut_off_chunk_mask.view(
-            ego_future_on_num * future_chunk_num)
-        on_ego_fut_on_chunk = on_ego_fut_chunk[on_ego_fut_on_chunk_mask]
-        on_ego_fut_on_chunk_num = on_ego_fut_on_chunk.shape[0]
+
+        # on_ego_fut_on_chunk: (on_ego_fut_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
+        # on_ego_fut_on_chunk_mask: (on_ego_fut_on_chunk_num)
+        (on_ego_fut_on_chunk,
+         on_ego_fut_on_chunk_mask) = self._get_on_ego_fut_on_chunk(
+             on_ego_fut_chunk, on_ego_fut_off_chunk_mask)
         """
         on_all_on_chunk: (on_all_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
             on_all_on_chunk_num = on_past_cur_on_chunk_num + on_ego_fut_on_chunk_num
@@ -1303,7 +1329,8 @@ class AgentFusionEncoder(nn.Module):
         all_chunk, all_chunk_off_mask = self._concat_chunks_and_build_mask(
             agents_past_cur_chunk=agents_past_cur_chunk,
             # (B, agents_num*past_cur_chunk_num, channels_mlp_dim)
-            ego_fut_chunk=ego_fut_chunk,  # (B, future_chunk_num, channels_mlp_dim)
+            ego_fut_chunk=
+            ego_fut_chunk,  # (B, future_chunk_num, channels_mlp_dim)
             past_cur_chunk_num=past_cur_chunk_num,
             future_chunk_num=future_chunk_num,
             agents_past_cur_on_mask=agents_past_cur_on_mask,
