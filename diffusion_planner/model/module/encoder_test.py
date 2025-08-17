@@ -13,44 +13,56 @@ import torch.nn as nn
 
 
 def encode_time_with_fourier_features(
-        t_sec: torch.Tensor, time_min: float, time_max: float,
-        num_fourier_frequencies: int) -> torch.Tensor:
-    """시간 값을 Fourier(2K) + 중심화된 시간 스칼라(1)로 인코딩한다.
+    t_sec: torch.Tensor,
+    time_min: float,
+    time_max: float,
+    num_fourier_frequencies: int,
+) -> torch.Tensor:
+    """시간 값을 Fourier(2K) + 중심화 시간 스칼라(1)로 인코딩합니다(AMP 안전).
 
     Args:
-        t_sec (torch.Tensor):
-            - shape: (...,)   # 초 단위 시간 # (B, agents_num, time_len)
+        t_sec (torch.Tensor): (...,) 형태의 초 단위 시간 텐서.
+        time_min (float): 시간 최소값.
+        time_max (float): 시간 최대값.
+        num_fourier_frequencies (int): K, 사용할 주파수 개수.
 
     Returns:
-        torch.Tensor:
-            - shape: (..., 2K + 1) # (B, agents_num, time_len, 2K + 1)
-            - 구성: [cos(·), sin(·),  t_hat]
-                * 앞쪽 2K채널: Fourier 성분
-                * 마지막 1채널: 중심화 시간 스칼라
+        torch.Tensor: (..., 2K + 1) 형태의 인코딩 텐서. 채널 구성은
+            [cos(·), sin(·), t_hat]이며, 앞의 2K채널이 Fourier 성분,
+            마지막 1채널이 중심화된 시간 스칼라(t_hat)입니다.
+
+    Note:
+        - 삼각함수 계산은 fp32에서 수행 후, 최종적으로 입력 텐서 dtype으로 캐스팅합니다.
+        - 0으로 나누기 방지를 위해 작은 epsilon을 분모에 더합니다.
     """
-    eps = 1e-6  # 작은 값 추가로 0으로 나누기 방지
+    eps: float = 1e-6
+
     # 정규화된 시간: (...,)
-    t_norm = (t_sec - time_min) / (time_max - time_min + eps)
-    t_norm = t_norm.clamp(0.0, 1.0)
+    t_norm: torch.Tensor = (t_sec - time_min) / (time_max - time_min + eps
+                                                )  # (...,)
+    t_norm: torch.Tensor = t_norm.clamp(0.0, 1.0).to(torch.float32)  # (...,)
 
     # 주파수 인덱스: (K,)
-    k_indices = torch.arange(1,
-                             num_fourier_frequencies + 1,
-                             device=t_sec.device,
-                             dtype=t_sec.dtype)  # (K,)
+    k_indices: torch.Tensor = torch.arange(1,
+                                           num_fourier_frequencies + 1,
+                                           device=t_sec.device,
+                                           dtype=torch.float32)  # (K,)
 
-    # 각 주파수 각도: (..., K)
-    angles = t_norm.unsqueeze(-1) * k_indices * torch.pi  # (..., K)
+    # 각도: (..., K)
+    angles: torch.Tensor = t_norm.unsqueeze(
+        -1) * k_indices * torch.pi  # (..., K)
 
     # Fourier 성분: (..., 2K)
-    fourier = torch.cat(
+    fourier: torch.Tensor = torch.cat(
         [torch.cos(angles), torch.sin(angles)], dim=-1)  # (..., 2K)
 
     # 중심화 시간 스칼라: (..., 1),  t_hat = 2 * t_norm - 1
-    t_scalar = (2.0 * t_norm - 1.0).unsqueeze(-1)  # (..., 1)
+    t_scalar: torch.Tensor = (2.0 * t_norm - 1.0).unsqueeze(-1)  # (..., 1)
 
-    # 최종: (..., 2K + 1)  [cos | sin | t_hat]
-    return torch.cat([fourier, t_scalar], dim=-1)
+    # 최종 인코딩: (..., 2K + 1)  [cos | sin | t_hat]
+    out: torch.Tensor = torch.cat([fourier, t_scalar],
+                                  dim=-1).to(t_sec.dtype)  # (..., 2K + 1)
+    return out
 
 
 def timegrid_past_3d(dt: float,
@@ -106,6 +118,7 @@ class Encoder(nn.Module):
         self.hidden_dim = config.hidden_dim
         self.chunk_length = 10
         self.num_fourier_frequencies = 4
+        self.pos_scale = nn.Parameter(torch.tensor(1.0))
         self.agents_encoder = AgentFusionEncoder(
             config.time_len,
             config.future_len,
@@ -182,7 +195,7 @@ class Encoder(nn.Module):
         encoding_pos_result[
             ~encoding_mask] = encoding_pos  # Fill in valid parts
 
-        encoding_input = encoding_input + encoding_pos_result.view(
+        encoding_input = encoding_input + self.pos_scale * encoding_pos_result.view(
             B, self.token_num, -1)
 
         encoder_outputs['encoding'] = self.fusion(
@@ -208,8 +221,9 @@ class SelfAttentionBlock(nn.Module):
                        drop=dropout)
 
     def forward(self, x, mask):
+        x_norm = self.norm1(x)
         x = x + self.drop_path(
-            self.attn(self.norm1(x), x, x, key_padding_mask=mask)[0])
+            self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)[0])
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -1368,7 +1382,6 @@ class AgentFusionEncoder(nn.Module):
         on_all_on_chunk += self.type_scale * agents_ego_fut_type_emb
         # on_all_on_chunk: (on_all_on_chunk_num, hidden_dim)
         on_all_on_chunk = self.emb_project(self.norm(on_all_on_chunk))
-
         ########################
         # on_agents_past_cur_chunk: (agents_past_cur_on_num, past_cur_chunk_num, hidden_dim)
         # on_ego_fut_chunk: (ego_future_on_num, future_chunk_num, hidden_dim)
