@@ -119,6 +119,9 @@ class Encoder(nn.Module):
         self.chunk_length = 10
         self.num_fourier_frequencies = 4
         self.pos_scale = nn.Parameter(torch.tensor(1.0))
+        self.time_gap = 0.1
+        self.time_min = -(config.time_len - 1) * self.time_gap
+        self.time_max = config.future_len * self.time_gap
         self.agents_encoder = AgentFusionEncoder(
             config.time_len,
             config.future_len,
@@ -126,18 +129,27 @@ class Encoder(nn.Module):
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
             depth=config.encoder_depth,
-            num_fourier_frequencies=self.num_fourier_frequencies)
+            num_fourier_frequencies=self.num_fourier_frequencies,
+            time_gap=self.time_gap,
+            time_min=self.time_min,
+            time_max=self.time_max)
         self.static_encoder = StaticFusionEncoder(
             config.static_objects_state_dim,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
-            num_fourier_frequencies=self.num_fourier_frequencies)
+            num_fourier_frequencies=self.num_fourier_frequencies,
+            time_gap=self.time_gap,
+            time_min=self.time_min,
+            time_max=self.time_max)
         self.lane_encoder = LaneFusionEncoder(
             config.lane_len,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
             depth=config.encoder_depth,
-            num_fourier_frequencies=self.num_fourier_frequencies)
+            num_fourier_frequencies=self.num_fourier_frequencies,
+            time_gap=self.time_gap,
+            time_min=self.time_min,
+            time_max=self.time_max)
         self.token_num = (1 * self.agents_encoder.future_chunk_num) + (
             (1 + config.agent_num) * self.agents_encoder.past_cur_chunk_num
         ) + config.static_objects_num + config.lane_num
@@ -156,9 +168,11 @@ class Encoder(nn.Module):
         # type (ego, neighbor, static, lane)
         self.pos_emb = nn.Linear(
             4 + 2 * self.num_fourier_frequencies + 1 + 4 + 4, config.hidden_dim)
+
     """
     
     """
+
     def forward(self, inputs):
         encoder_outputs = {}
         # ego
@@ -247,11 +261,14 @@ class AgentFusionEncoder(nn.Module):
                  tokens_mlp_dim=64,
                  channels_mlp_dim=128,
                  chunk_length=10,
-                 num_fourier_frequencies=4):
+                 num_fourier_frequencies=4,
+                 time_gap=0.1,
+                 time_min=-2.0,
+                 time_max=8.0):
         super().__init__()
-        self.time_gap = 0.1
-        self.time_min = -2.0
-        self.time_max = 8.0
+        self.time_gap = time_gap
+        self.time_min = time_min
+        self.time_max = time_max
         self.future_len = future_len
         self.chunk_length = chunk_length
         self.past_cur_chunk_num = max(1, time_len // self.chunk_length)
@@ -267,7 +284,7 @@ class AgentFusionEncoder(nn.Module):
         self._hidden_dim = hidden_dim
         self.tokens_mlp_dim = tokens_mlp_dim
 
-        self.type_scale = nn.Parameter(torch.tensor(0.1))  # 스케일 조정용
+        self.type_scale = nn.Parameter(torch.tensor(0.03))  # 스케일 조정용
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
         self.channel_pre_project = Mlp(in_features=8 + num_fourier_dim + 1,
@@ -1520,9 +1537,14 @@ class StaticFusionEncoder(nn.Module):
                  drop_path_rate=0.3,
                  hidden_dim=192,
                  device='cuda',
-                 num_fourier_frequencies=4):
+                 num_fourier_frequencies=4,
+                 time_gap=0.1,
+                 time_min=-2.0,
+                 time_max=8.0):
         super().__init__()
-
+        self.time_gap = time_gap
+        self.time_min = time_min
+        self.time_max = time_max
         self._hidden_dim = hidden_dim
         self.num_fourier_frequencies = num_fourier_frequencies
         self.projection = Mlp(in_features=dim,
@@ -1560,31 +1582,32 @@ class StaticFusionEncoder(nn.Module):
         return static_encoding, mask_p, static_feature
 
     def _get_static_xyyaw_time(self, static_info: torch.Tensor) -> torch.Tensor:
-        # static_info: (B, static_objects_num, 10)
-        B, static_objects_num, _ = static_info.shape
+        """정적 객체의 (x,y,cos,sin) + '현재시점' 시간채널(전부 0) 결합.
 
-        # static_info_timestep: (B, static_objects_num)
-        # [-2.0, -1.9, ..., 0.0]
-        static_info_timestep = torch.zeros(
-            (B, static_objects_num),
-            device=static_info.device,
-            dtype=static_info.dtype,
-        )
-        static_time_fourier = encode_time_with_fourier_features(
-            static_info_timestep,
-            time_min=0.,
-            time_max=0.,
-            num_fourier_frequencies=self.num_fourier_frequencies
-        )  # (B, static_objects_num, 2K + 1)
+        정적 객체는 과거/미래 시계열이 없고, 현재 시점만 의미가 있다.
+        시간 채널(2K+1)은 모두 0으로 채워 동일 차원을 유지한다.
 
-        ######### FOR POSITIONAL EMBEDDING #########
-        static_xyyaw = static_info[:, :, :4].clone(
-        )  # (B, static_objects_num, 4)
-        static_xyyaw_time = torch.cat(
-            [static_xyyaw, static_time_fourier],
-            dim=-1)  # static_xyyaw_time: (B, static_objects_num, 4 + 2K + 1)
+        Args:
+            static_info (torch.Tensor):
+                모양 [B, P, D]
+                - B: 배치 크기
+                - P: 정적 객체 개수
+                - D: 피처 차원(앞 4개는 x,y,cos,sin)
 
-        # (B, static_objects_num, 4 + 2K + 1)
+        Returns:
+            torch.Tensor:
+                모양 [B, P, 4 + (2K+1)]
+                - 앞 4: (x, y, cos, sin)
+                - 뒤 2K+1: 시간 채널(전부 0, 현재 시점 표현)
+                - K = self.num_fourier_frequencies
+        """
+        B, P, _ = static_info.shape  # B,P,_
+        static_xyyaw = static_info[:, :, :4].clone()  # [B,P,4]
+        K: int = self.num_fourier_frequencies
+        zeros_time = static_info.new_zeros(  # [B,P,2K+1]
+            B, P, 2 * K + 1)
+        static_xyyaw_time = torch.cat(  # [B,P,4+(2K+1)]
+            [static_xyyaw, zeros_time], dim=-1)
         return static_xyyaw_time
 
     def _get_static_feature(
@@ -1623,9 +1646,14 @@ class LaneFusionEncoder(nn.Module):
                  depth=3,
                  tokens_mlp_dim=64,
                  channels_mlp_dim=128,
-                 num_fourier_frequencies=4):
+                 num_fourier_frequencies=4,
+                 time_gap=0.1,
+                 time_min=-2.0,
+                 time_max=8.0):
         super().__init__()
-
+        self.time_gap = time_gap
+        self.time_min = time_min
+        self.time_max = time_max
         self._lane_len = lane_len
         self.num_fourier_frequencies = num_fourier_frequencies
         self._channel = channels_mlp_dim
@@ -1658,29 +1686,31 @@ class LaneFusionEncoder(nn.Module):
                                drop=drop_path_rate)
 
     def _get_lane_xyyaw_time(self, lane_pos: torch.Tensor) -> torch.Tensor:
-        # lane_pos: (B, lane_num, 4)
-        B, lane_num, _ = lane_pos.shape
+        """차선 중심 포인트의 (x,y,cos,sin) + '현재시점' 시간채널(전부 0) 결합.
 
-        # lane_timestep: (B, lane_num)
-        # [-2.0, -1.9, ..., 0.0]
-        lane_timestep = torch.zeros(
-            (B, lane_num),
-            device=lane_pos.device,
-            dtype=lane_pos.dtype,
-        )
-        lane_time_fourier = encode_time_with_fourier_features(
-            lane_timestep,
-            time_min=0.,
-            time_max=0.,
-            num_fourier_frequencies=self.num_fourier_frequencies
-        )  # (B, lane_num, 2K + 1)
+        차선도 현재 프레임에서 추출된 벡터 표현만 사용한다.
+        시간 채널(2K+1)은 모두 0으로 채워 동일 차원을 유지한다.
 
-        ######### FOR POSITIONAL EMBEDDING #########
-        lane_xyyaw_time = torch.cat(
-            [lane_pos, lane_time_fourier],
-            dim=-1)  # lane_xyyaw_time: (B, lane_num, 4 + 2K + 1)
+        Args:
+            lane_pos (torch.Tensor):
+                모양 [B, L, 4]
+                - B: 배치 크기
+                - L: 차선(폴리라인) 수
+                - 4: (x, y, cos, sin)
 
-        # (B, lane_num, 4 + 2K + 1)
+        Returns:
+            torch.Tensor:
+                모양 [B, L, 4 + (2K+1)]
+                - 앞 4: (x, y, cos, sin)
+                - 뒤 2K+1: 시간 채널(전부 0, 현재 시점 표현)
+                - K = self.num_fourier_frequencies
+        """
+        B, L, _ = lane_pos.shape  # B,L,4
+        K: int = self.num_fourier_frequencies
+        zeros_time: torch.Tensor = lane_pos.new_zeros(  # [B,L,2K+1]
+            B, L, 2 * K + 1)
+        lane_xyyaw_time: torch.Tensor = torch.cat(  # [B,L,4+(2K+1)]
+            [lane_pos, zeros_time], dim=-1)
         return lane_xyyaw_time
 
     def _get_lane_feature(
@@ -1730,9 +1760,9 @@ class LaneFusionEncoder(nn.Module):
         lane_feature = self._get_lane_feature(lane_xyyaw_time)
 
         B, lane_num, lane_len, _ = lane_info.shape
-        agents_past_cur_off_p_mask = torch.sum(torch.ne(lane_info[..., :8], 0),
-                                               dim=-1).to(lane_info.device) == 0
-        mask_p = torch.sum(~agents_past_cur_off_p_mask, dim=-1) == 0
+        mask_v = torch.sum(torch.ne(lane_info[..., :8], 0),
+                           dim=-1).to(lane_info.device) == 0
+        mask_p = torch.sum(~mask_v, dim=-1) == 0
         lane_info = lane_info.view(B * lane_num, lane_len, -1)
 
         valid_indices = ~mask_p.view(-1)
@@ -1808,26 +1838,69 @@ class FusionEncoder(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, x, mask):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """장면 융합 전용 포워드(배치별 전부 패딩 샘플은 건너뜀).
+
+        모든 토큰이 패딩(True)인 배치는 연산을 생략하고 0을 반환한다.
+        유효 토큰이 하나라도 있는 배치만 CLS 토큰을 붙여 블록을 통과시킨 뒤,
+        최종 출력에서 CLS를 제거하고 원래 위치에 복원한다.
+
+        Args:
+            x (torch.Tensor): 입력 토큰 시퀀스.
+                모양: [B, T, H]
+                - B: 배치 크기
+                - T: 토큰 길이
+                - H: 히든 차원
+            mask (torch.Tensor): 키 패딩 마스크(True=패딩으로 무시).
+                모양: [B, T]
+
+        Returns:
+            torch.Tensor: CLS 제외 최종 시퀀스 임베딩.
+                모양: [B, T, H]
         """
-        x:    [B, T, H]
-        mask: [B, T]  (True = 패딩으로 무시)
-        """
-        # 2) CLS를 앞에 붙임
-        B, T, H = x.shape
-        cls = self.cls_token.expand(B, 1, H)
-        x = torch.cat([cls, x], dim=1)  # [B, T+1, H]
-        x[:, 0:1, :] = x[:, 0:1, :] + self.cls_pos  # CLS 위치 임베딩만 추가
+        # 입력 별칭(가독성)
+        seq_tokens = x  # [B, T, H]
+        seq_key_pad_mask = mask  # [B, T], True=pad
 
-        # 3) 마스크도 앞에 False를 붙임(=CLS는 항상 유효)
-        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=mask.device)
-        mask = torch.cat([cls_mask, mask], dim=1)  # [B, T+1]
+        B, T, H = seq_tokens.shape  # B, T, H 스칼라
 
-        for b in self.blocks:
-            x = b(x, mask)
-        x = self.norm(x)
+        # 1) 전체 패딩 배치 식별 및 결과 버퍼 준비
+        is_all_pad_per_batch = seq_key_pad_mask.all(dim=1)  # [B]
+        will_process_mask = ~is_all_pad_per_batch  # [B]
+        out_tokens = seq_tokens.new_zeros(B, T, H)  # [B, T, H]
 
-        scene = x[:, 0, :]  # CLS/scene 벡터
-        x_wo_cls = x[:, 1:, :]  # 원래 토큰 길이로 복원
+        # 2) 유효 배치만 선택
+        if will_process_mask.any():
+            kept_tokens = seq_tokens[will_process_mask]  # [B_keep, T, H]
+            kept_key_pad = seq_key_pad_mask[will_process_mask]  # [B_keep, T]
 
-        return x_wo_cls
+            B_keep: int = kept_tokens.size(0)
+
+            # 3) CLS 부착 및 CLS 위치 임베딩 추가
+            cls_tokens = self.cls_token.expand(B_keep, 1, H)  # [B_keep, 1, H]
+            kept_with_cls = torch.cat([cls_tokens, kept_tokens],
+                                      dim=1)  # [B_keep, T+1, H]
+            kept_with_cls[:, 0:
+                          1, :] = kept_with_cls[:, 0:
+                                                1, :] + self.cls_pos  # [B_keep, 1, H] += pos
+
+            # 4) 마스크에 CLS(False) 추가
+            cls_false = torch.zeros(B_keep,
+                                    1,
+                                    dtype=torch.bool,
+                                    device=kept_key_pad.device)  # [B_keep,1]
+            kept_mask_with_cls = torch.cat([cls_false, kept_key_pad],
+                                           dim=1)  # [B_keep, T+1]
+
+            # 5) 블록 통과
+            fused = kept_with_cls  # [B_keep, T+1, H]
+            for block in self.blocks:
+                fused = block(fused, kept_mask_with_cls)  # [B_keep, T+1, H]
+            fused = self.norm(fused)  # [B_keep, T+1, H]
+
+            # 6) CLS 제거 후 원래 배치 위치에 복원
+            fused_wo_cls = fused[:, 1:, :]  # [B_keep, T, H]
+            out_tokens[will_process_mask] = fused_wo_cls  # [B, T, H]
+
+        # 전부 패딩 배치는 out_tokens의 0 유지
+        return out_tokens  # [B, T, H]
