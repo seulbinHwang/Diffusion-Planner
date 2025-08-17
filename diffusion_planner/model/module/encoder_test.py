@@ -1,13 +1,13 @@
-import torch
-import torch.nn as nn
-from typing import Tuple
+""" 아래 전체 클래스, 내가 직접 설계해서 구현해본거야. 구현 상에 버그가 있는지? 내 의도대로 동작하지 않게 잘못 구현된 부분이 있는지? 매우 냉철하고 비판적으로 검토해줘! """
+
+
+
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 import torch.nn.functional as F
 
 from diffusion_planner.model.module.mixer import MixerBlock
 
-import torch
 from typing import Optional
 from typing import Tuple
 import torch
@@ -105,24 +105,31 @@ class Encoder(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
         self.hidden_dim = config.hidden_dim
-
-        self.token_num = 1 + config.agent_num + config.static_objects_num + config.lane_num
+        self.chunk_length = 10
+        self.num_fourier_frequencies = 4
         self.agents_encoder = AgentFusionEncoder(
             config.time_len,
+            config.future_len,
+            chunk_length=self.chunk_length,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
-            depth=config.encoder_depth)
+            depth=config.encoder_depth,
+            num_fourier_frequencies=self.num_fourier_frequencies)
         self.static_encoder = StaticFusionEncoder(
             config.static_objects_state_dim,
             drop_path_rate=config.encoder_drop_path_rate,
-            hidden_dim=config.hidden_dim)
+            hidden_dim=config.hidden_dim,
+            num_fourier_frequencies=self.num_fourier_frequencies)
         self.lane_encoder = LaneFusionEncoder(
             config.lane_len,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
-            depth=config.encoder_depth)
+            depth=config.encoder_depth,
+            num_fourier_frequencies=self.num_fourier_frequencies)
+        self.token_num = (1 * self.agents_encoder.future_chunk_num) + (
+            config.agent_num * self.agents_encoder.past_cur_chunk_num
+        ) + config.static_objects_num + config.lane_num
 
         self.fusion = FusionEncoder(
             hidden_dim=config.hidden_dim,
@@ -131,8 +138,13 @@ class Encoder(nn.Module):
             depth=config.encoder_depth,
             device=config.device)
 
-        # position embedding encode x, y, cos, sin, type (ego, neighbor, static, lane)
-        self.pos_emb = nn.Linear(8, config.hidden_dim)
+        # position embedding encode
+        # x, y, cos, sin,
+        # time : 2 * num_fourier_frequencies + 1
+        # diff to current time position : 4
+        # type (ego, neighbor, static, lane)
+        self.pos_emb = nn.Linear(
+            4 + 2 * self.num_fourier_frequencies + 1 + 4 + 4, config.hidden_dim)
 
     def forward(self, inputs):
         encoder_outputs = {}
@@ -151,6 +163,7 @@ class Encoder(nn.Module):
         lanes_has_speed_limit = inputs['lanes_has_speed_limit']
 
         B = neighbors.shape[0]
+        # agents_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
         encoding_agents, agents_mask, agents_pos = self.agents_encoder(
             ego_past, neighbors)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
@@ -201,23 +214,28 @@ class SelfAttentionBlock(nn.Module):
         return x
 
 
-""" 아래 AgentFusionEncoder / StaticFusionEncoder 클래스, 내가 직접 설계해서 구현해본거야. 구현 상에 버그가 있는지? 내 의도대로 동작하지 않게 잘못 구현된 부분이 있는지? 매우 냉철하고 비판적으로 검토해줘! """
 
 
 class AgentFusionEncoder(nn.Module):
 
     def __init__(self,
                  time_len,
+                 future_len,
                  drop_path_rate=0.3,
                  hidden_dim=192,
                  depth=3,
                  tokens_mlp_dim=64,
-                 channels_mlp_dim=128):
+                 channels_mlp_dim=128,
+                 chunk_length=10,
+                 num_fourier_frequencies=4):
         super().__init__()
         self.time_gap = 0.1
         self.time_min = -2.0
         self.time_max = 8.0
-        self.num_fourier_frequencies = 4
+        self.chunk_length = chunk_length
+        self.past_cur_chunk_num = max(1, time_len // self.chunk_length)
+        self.future_chunk_num = max(1, future_len // self.chunk_length)
+        self.num_fourier_frequencies = num_fourier_frequencies
         num_fourier_dim = 2 * self.num_fourier_frequencies + 1  # 2K + 1
 
         # 게이트드 풀링에 필요한 선형층 정의
@@ -1137,16 +1155,11 @@ class AgentFusionEncoder(nn.Module):
         # (B, future_chunk_num, hidden_dim)
         return agents_past_cur_chunk, ego_fut_chunk
 
-    def forward(self,
-                ego_past_current,
-                npc_past_current,
-                ego_future,
-                chunk_length=10):
+    def forward(self, ego_past_current, npc_past_current, ego_future):
         '''
         ego_past_current: (B, 1, time_len, 11)
         npc_past_current: (B, agent_num, time_len, 11)
         ego_future: (B, future_len, 11)
-        chunk_length: 10
 
         (x, y, cos, sin, vx, vy, w, l, type(3)
         '''
@@ -1244,9 +1257,9 @@ class AgentFusionEncoder(nn.Module):
         token_pre_project = hard split + gated attentional pooling
         """
         # ---------- 8) 균등 분할 경계 ----------
-        past_cur_chunk_num = max(1, time_len // chunk_length)
+
         past_chunk_start_idx, past_chunk_end_idx = self._compute_equal_chunks(
-            seq_len=time_len, chunk_num=past_cur_chunk_num,
+            seq_len=time_len, chunk_num=self.past_cur_chunk_num,
             device=device)  # (past_cur_chunk_num,), (past_cur_chunk_num,)
         #################
         # (B, agents_num * past_cur_chunk_num, 4 + 2K + 1 + 4 + 4)
@@ -1255,9 +1268,8 @@ class AgentFusionEncoder(nn.Module):
             agents_past_cur_off_p_mask, agents_past_cur_xyyaw_time)
 
         #################
-        future_chunk_num = max(1, future_len // chunk_length)
         fut_chunk_start_idx, fut_chunk_end_idx = self._compute_equal_chunks(
-            seq_len=future_len, chunk_num=future_chunk_num,
+            seq_len=future_len, chunk_num=self.future_chunk_num,
             device=device)  # (future_chunk_num,), (future_chunk_num,)
         #################
         # ego_future_xyyaw_time: (B, future_len, 4 + 2K + 1)
@@ -1348,7 +1360,8 @@ class AgentFusionEncoder(nn.Module):
         agents_ego_fut_type_emb = self._get_type_embedding(
             agents_type, ego_fut_type, agents_past_cur_on_mask,
             ego_future_on_mask, on_agents_past_cur_on_chunk_mask,
-            on_ego_fut_on_chunk_mask, past_cur_chunk_num, future_chunk_num)
+            on_ego_fut_on_chunk_mask, self.past_cur_chunk_num,
+            self.future_chunk_num)
 
         # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
         on_all_on_chunk += self.type_scale * agents_ego_fut_type_emb
@@ -1362,8 +1375,8 @@ class AgentFusionEncoder(nn.Module):
          on_ego_fut_chunk) = self._fill_on_chunk_to_on_agent(
              on_all_on_chunk, on_agents_past_cur_on_chunk_mask,
              on_ego_fut_on_chunk_mask, on_past_cur_on_chunk_num,
-             agents_past_cur_on_num, ego_future_on_num, past_cur_chunk_num,
-             future_chunk_num)
+             agents_past_cur_on_num, ego_future_on_num, self.past_cur_chunk_num,
+             self.future_chunk_num)
         # agents_past_cur_chunk: (B, agents_num * past_cur_chunk_num , hidden_dim)
         # ego_fut_chunk: (B, future_chunk_num, hidden_dim)
         (agents_past_cur_chunk, ego_fut_chunk) = self._fill_on_agent_to_agent(
@@ -1395,11 +1408,16 @@ class AgentFusionEncoder(nn.Module):
 
 class StaticFusionEncoder(nn.Module):
 
-    def __init__(self, dim, drop_path_rate=0.3, hidden_dim=192, device='cuda'):
+    def __init__(self,
+                 dim,
+                 drop_path_rate=0.3,
+                 hidden_dim=192,
+                 device='cuda',
+                 num_fourier_frequencies=4):
         super().__init__()
 
         self._hidden_dim = hidden_dim
-        self.num_fourier_frequencies = 4
+        self.num_fourier_frequencies = num_fourier_frequencies
         self.projection = Mlp(in_features=dim,
                               hidden_features=hidden_dim,
                               out_features=hidden_dim,
@@ -1497,11 +1515,12 @@ class LaneFusionEncoder(nn.Module):
                  hidden_dim=192,
                  depth=3,
                  tokens_mlp_dim=64,
-                 channels_mlp_dim=128):
+                 channels_mlp_dim=128,
+                 num_fourier_frequencies=4):
         super().__init__()
 
         self._lane_len = lane_len
-        self.num_fourier_frequencies = 4
+        self.num_fourier_frequencies = num_fourier_frequencies
         self._channel = channels_mlp_dim
 
         self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
@@ -1531,29 +1550,83 @@ class LaneFusionEncoder(nn.Module):
                                act_layer=nn.GELU,
                                drop=drop_path_rate)
 
+    def _get_lane_xyyaw_time(self, lane_pos: torch.Tensor) -> torch.Tensor:
+        # lane_pos: (B, lane_num, 4)
+        B, lane_num, _ = lane_pos.shape
+
+        # lane_timestep: (B, lane_num)
+        # [-2.0, -1.9, ..., 0.0]
+        lane_timestep = torch.zeros(
+            (B, lane_num),
+            device=lane_pos.device,
+            dtype=lane_pos.dtype,
+        )
+        lane_time_fourier = encode_time_with_fourier_features(
+            lane_timestep,
+            time_min=0.,
+            time_max=0.,
+            num_fourier_frequencies=self.num_fourier_frequencies
+        )  # (B, lane_num, 2K + 1)
+
+        ######### FOR POSITIONAL EMBEDDING #########
+        lane_xyyaw_time = torch.cat(
+            [lane_pos, lane_time_fourier],
+            dim=-1)  # lane_xyyaw_time: (B, lane_num, 4 + 2K + 1)
+
+        # (B, lane_num, 4 + 2K + 1)
+        return lane_xyyaw_time
+
+    def _get_lane_feature(
+        self, lane_xyyaw_time: torch.Tensor
+        # (B, lane_num, 4 + 2K + 1)
+    ) -> torch.Tensor:
+        # First: add (x, y, cos, sin) delta -> (0., 0., 1., 0.)
+        B, lane_num, _ = lane_xyyaw_time.shape
+        delta_feature = torch.zeros(
+            (B, lane_num, 4),
+            device=lane_xyyaw_time.device,
+            dtype=lane_xyyaw_time.dtype,
+        )
+        delta_feature[:, :, 2] = 1.0  # cos
+        # (B, lane_num, 4 + 2K + 1 + 4)
+        lane_xyyaw_time = torch.cat([lane_xyyaw_time, delta_feature], dim=-1)
+        # lane_type: (B, lane_num, 4) # 4:
+        lane_type = torch.zeros(
+            (B, lane_num, 4),
+            device=lane_xyyaw_time.device,
+            dtype=lane_xyyaw_time.dtype,
+        )
+        lane_type[:, :, -1] = 1.0  # type
+        # static_feature: (B, lane_num, 4 + 2K + 1 + 4 + 4)
+        lane_feature = torch.cat([lane_xyyaw_time, lane_type], dim=-1)
+        return lane_feature
+
     def forward(self, lane_info, speed_limit, has_speed_limit):
         '''
-        lane_info: B, P, V, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
-        speed_limit: B, P, 1
-        has_speed_limit: B, P, 1
+        lane_info: B, lane_num, lane_len, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
+        speed_limit: B, lane_num, 1
+        has_speed_limit: B, lane_num, 1
         '''
+
         traffic = lane_info[:, :, 0, 8:]
         lane_info = lane_info[..., :8]
 
-        pos = lane_info[:, :,
-                        int(self._lane_len / 2), :8].clone()  # x, y, x'-x, y'-y
-        heading = torch.atan2(pos[..., 3], pos[..., 2])
-        pos[..., 2] = torch.cos(heading)
-        pos[..., 3] = torch.sin(heading)
-        # lane: [0, 0,0,1]
-        pos[..., -4:] = 0.0
-        pos[..., -1] = 1.0
+        lane_pos = lane_info[:, :, int(self._lane_len /
+                                       2), :4].clone()  # (B, lane_num, 4)
+        heading = torch.atan2(lane_pos[..., 3], lane_pos[..., 2])
+        lane_pos[..., 2] = torch.cos(heading)
+        lane_pos[..., 3] = torch.sin(heading)
+        # lane_pos: (B, lane_num, 4)
+        # lane_xyyaw_time: (B, lane_num, 4 + 2K + 1)
+        lane_xyyaw_time = self._get_lane_xyyaw_time(lane_pos)
+        # lane_feature: (B, lane_num, 4 + 2K + 1 + 4 + 4)
+        lane_feature = self._get_lane_feature(lane_xyyaw_time)
 
-        B, P, V, _ = lane_info.shape
+        B, lane_num, lane_len, _ = lane_info.shape
         agents_past_cur_off_p_mask = torch.sum(torch.ne(lane_info[..., :8], 0),
                                                dim=-1).to(lane_info.device) == 0
         mask_p = torch.sum(~agents_past_cur_off_p_mask, dim=-1) == 0
-        lane_info = lane_info.view(B * P, V, -1)
+        lane_info = lane_info.view(B * lane_num, lane_len, -1)
 
         valid_indices = ~mask_p.view(-1)
         lane_info = lane_info[valid_indices]
@@ -1568,9 +1641,9 @@ class LaneFusionEncoder(nn.Module):
         lane_info = torch.mean(lane_info, dim=1)
 
         # Reshape speed_limit and traffic to match flattened dimensions
-        speed_limit = speed_limit.view(B * P, 1)
-        has_speed_limit = has_speed_limit.view(B * P, 1)
-        traffic = traffic.view(B * P, -1)
+        speed_limit = speed_limit.view(B * lane_num, 1)
+        has_speed_limit = has_speed_limit.view(B * lane_num, 1)
+        traffic = traffic.view(B * lane_num, -1)
 
         # Apply embedding directly to valid speed limit data
         has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
@@ -1596,13 +1669,12 @@ class LaneFusionEncoder(nn.Module):
         lane_info = lane_info + speed_limit_embedding + traffic_light_embedding
         lane_info = self.emb_project(self.norm(lane_info))
 
-        lane_embedding = torch.zeros((B * P, lane_info.shape[-1]),
+        lane_embedding = torch.zeros((B * lane_num, lane_info.shape[-1]),
                                      device=lane_info.device)
         lane_embedding[valid_indices] = lane_info  # Fill in valid parts
 
-        return lane_embedding.view(B, P,
-                                   -1), mask_p.reshape(B,
-                                                       -1), pos.view(B, P, -1)
+        return lane_embedding.view(B, lane_num,
+                                   -1), mask_p.reshape(B, -1), lane_feature
 
 
 class FusionEncoder(nn.Module):
