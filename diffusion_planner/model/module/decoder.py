@@ -95,6 +95,7 @@ class Decoder(nn.Module):
 
         # Extract context encoding
         ego_neighbor_encoding = encoder_outputs['encoding']  #  (B, 107, 192)
+        ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
         route_lanes = inputs['route_lanes']  # (B, 25, 20, 12)
 
         if self.training:
@@ -106,7 +107,7 @@ class Decoder(nn.Module):
             return {
                 "score":
                     self.dit(sampled_trajectories, diffusion_time,
-                             ego_neighbor_encoding, route_lanes,
+                             ego_neighbor_encoding, ego_fut_global, route_lanes,
                              neighbor_current_mask).reshape(B, one_P, -1, 4)
             }
         else:
@@ -280,12 +281,13 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross_c, route_lanes, neighbor_current_mask):
+    def forward(self, x, t, cross_c, ego_fut_global, route_lanes, neighbor_current_mask):
         """
         Forward pass of DiT.
         x:  [B, 1+ Pnn, (1 + T) * 4] # (81*4 = 324)
         t:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
         cross_c: [B, one_Pnn, D] = [B, N = 107, D = 192]
+        ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
         route_lanes: (B, 25, 20, 12)
         neighbor_current_mask: [B, Pnn]
         """
@@ -313,7 +315,7 @@ class DiT(nn.Module):
         # t_embedding: (B, D=192)
         t_embedding = self.t_embedder(t)
         # y = (B, D=192) + (B, D=192) = (B, D=192)
-        y = y + t_embedding
+        y = y + ego_fut_global + t_embedding
 
         all_current_mask_for_attn = torch.zeros((B, one_Pnn), dtype=torch.bool, device=x.device)
         all_current_mask_for_attn[:, 1:] = neighbor_current_mask

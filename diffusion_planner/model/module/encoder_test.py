@@ -156,7 +156,9 @@ class Encoder(nn.Module):
         # type (ego, neighbor, static, lane)
         self.pos_emb = nn.Linear(
             4 + 2 * self.num_fourier_frequencies + 1 + 4 + 4, config.hidden_dim)
-
+    """
+    
+    """
     def forward(self, inputs):
         encoder_outputs = {}
         # ego
@@ -177,8 +179,9 @@ class Encoder(nn.Module):
 
         B = neighbors.shape[0]
         # agents_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
-        encoding_agents, agents_mask, agents_pos = self.agents_encoder(
-            ego_past, neighbors, ego_future)
+        # ego_fut_global: (B, hidden_dim)
+        (encoding_agents, agents_mask, agents_pos,
+         ego_fut_global) = self.agents_encoder(ego_past, neighbors, ego_future)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
             lanes, lanes_speed_limit, lanes_has_speed_limit)
@@ -200,6 +203,7 @@ class Encoder(nn.Module):
 
         encoder_outputs['encoding'] = self.fusion(
             encoding_input, encoding_mask.view(B, self.token_num))
+        encoder_outputs["ego_fut_global"] = ego_fut_global
 
         return encoder_outputs
 
@@ -223,7 +227,11 @@ class SelfAttentionBlock(nn.Module):
     def forward(self, x, mask):
         x_norm = self.norm1(x)
         x = x + self.drop_path(
-            self.attn(x_norm, x_norm, x_norm, key_padding_mask=mask)[0])
+            self.attn(x_norm,
+                      x_norm,
+                      x_norm,
+                      key_padding_mask=mask,
+                      need_weights=False)[0])
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -278,6 +286,11 @@ class AgentFusionEncoder(nn.Module):
                                out_features=hidden_dim,
                                act_layer=nn.GELU,
                                drop=drop_path_rate)
+
+        # 각 미래 chunk를 스칼라 로짓으로
+        self.ego_fut_pool_q = nn.Linear(hidden_dim, 1)
+        # 잔차 스케일: 0으로 시작(초기엔 평균만), 학습되며 켜짐
+        self.ego_fut_pool_scale = nn.Parameter(torch.tensor(0.0))
 
     def _get_agents_past_cur_mask(
             self, agents_past_current: torch.Tensor
@@ -1416,8 +1429,88 @@ class AgentFusionEncoder(nn.Module):
         # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, hidden_dim)
         # all_off_chunk_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
         # all_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 4 + (2k + 1) + 4 + 4)
+        # ego_fut_global: (B, hidden_dim)
 
-        return all_chunk, all_off_chunk_mask, all_chunk_pos_feature
+        ego_fut_global = self._get_ego_fut_global(ego_fut_chunk,
+                                                  ego_future_on_mask,
+                                                  on_ego_fut_off_chunk_mask)
+        return all_chunk, all_off_chunk_mask, all_chunk_pos_feature, ego_fut_global
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor,
+                     dim: int) -> torch.Tensor:
+        """
+        x:    (B, M, H) # (B, future_chunk_num, hidden_dim)
+        mask: (B, M)  # True=무효 # (B, future_chunk_num)
+        return: (B, H) # (B, hidden_dim)
+        """
+        # 고정 전제
+        assert dim == 1, "dim은 1이어야 합니다."
+        assert x.dim() == 3 and mask.dim() == 2, "x:(B,M,H), mask:(B,M) 필요"
+        assert mask.dtype == torch.bool, "mask는 bool이어야 합니다."
+
+        B, M, H = x.shape
+        assert mask.shape == (B, M)
+
+        valid = ~mask  # (B, M)
+        denom = valid.sum(dim=dim, keepdim=True)  # (B, 1)
+        denom = denom.clamp(min=1)  # (B, 1)  # 0 분모 방지
+
+        valid_exp = valid.unsqueeze(-1)  # (B, M, 1)
+        x_masked = x * valid_exp  # (B, M, H)  # 브로드캐스트
+
+        numer = x_masked.sum(dim=dim)  # (B, H)
+
+        out = numer / denom  # (B, H)  # (B,H)/(B,1) 브로드캐스트
+        assert out.shape == (B, H)
+
+        return out
+
+    def _get_ego_fut_global(
+        self,
+        ego_fut_chunk: torch.Tensor,  # (B, future_chunk_num, hidden_dim)
+        ego_future_on_mask: torch.Tensor,  # (B)
+        on_ego_fut_off_chunk_mask: torch.
+        Tensor,  # (ego_future_on_num, future_chunk_num)
+    ) -> torch.Tensor:  # (B, hidden_dim):
+        # --- (A) 배치 크기로 확장된 미래 chunk 마스크 만들기: (B, future_chunk_num) ---
+        B, future_chunk_num = ego_fut_chunk.shape[:2]
+        # --- (A) 배치 크기 마스크로 복원: (B, future_chunk_num), True=무효 ---
+        ego_fut_off_chunk_mask_full = torch.ones((B, future_chunk_num),
+                                                 dtype=torch.bool,
+                                                 device=ego_fut_chunk.device)
+        # 유효한 배치 위치에만 on_... 마스크 주입
+        ego_fut_off_chunk_mask_full[
+            ego_future_on_mask] = on_ego_fut_off_chunk_mask
+
+        # --- (B) 안정적 기본값: 마스크드 평균 ---
+        ego_fut_global_mean = self._masked_mean(
+            ego_fut_chunk, mask=ego_fut_off_chunk_mask_full,
+            dim=1)  # (B, hidden_dim)
+
+        # --- (C) 학습형 주의 풀링(가중합) + NaN 방지 ---
+        # 로짓 계산 (AMP 안전을 위해 fp32로)
+        logits = self.ego_fut_pool_q(
+            ego_fut_chunk).float()  # (B, future_chunk_num, 1)
+        logits = logits.masked_fill(ego_fut_off_chunk_mask_full.unsqueeze(-1),
+                                    float('-inf'))
+        all_off = ego_fut_off_chunk_mask_full.all(dim=1)  # (B,)
+        if all_off.any():
+            logits[all_off] = 0.0  # softmax NaN 방지
+
+        weights = F.softmax(logits, dim=1).to(ego_fut_chunk.dtype)  # (B, M, 1)
+        if all_off.any():
+            weights[all_off] = 0.0
+
+        ego_fut_global_attn = (weights * ego_fut_chunk).sum(
+            dim=1)  # (B, hidden_dim)
+
+        # --- (D) 최종 대표 토큰: 평균 + (학습형 풀링 잔차) ---
+        ego_fut_global = ego_fut_global_mean + (
+            self.ego_fut_pool_scale * ego_fut_global_attn)  # (B, hidden_dim)
+
+        # 기존 반환값 + ego_fut_global 추가
+        return ego_fut_global
 
 
 class StaticFusionEncoder(nn.Module):
