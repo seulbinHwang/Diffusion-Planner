@@ -12,6 +12,8 @@ class MixerBlock(nn.Module):
         self.tokens_mlp = Mlp(in_features=tokens_mlp_dim, hidden_features=tokens_mlp_dim, act_layer=nn.GELU, drop=drop_path_rate)
         
     def forward(self, x):
+        if x.size(0) == 0:  # N==0
+            return x
         y = self.norm1(x)
         y = y.permute(0, 2, 1) # (N, tokens, C) -> (N, C, tokens)
         y = self.tokens_mlp(y) # (N, C, tokens) -> (N, C, tokens)

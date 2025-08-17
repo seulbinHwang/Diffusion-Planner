@@ -84,14 +84,14 @@ def timegrid_future_2d(dt: float,
                        device: Optional[torch.device] = None,
                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """
-    반환 모양: (B, agents_num, total_steps)
+    반환 모양: (B, total_steps)
     마지막 축(시간축): [dt, 2*dt, ..., N*dt]
     항상 독립 메모리 텐서(복사본)를 반환합니다.
     """
     if total_steps <= 0:
         raise ValueError("total_steps must be >= 1")
     if B <= 0:
-        raise ValueError("B and agents_num must be >= 1")
+        raise ValueError("B must be >= 1")
 
     # (N,) = [1, 2, ..., N]
     idx = torch.arange(1, total_steps + 1, device=device, dtype=dtype)
@@ -201,7 +201,7 @@ class SelfAttentionBlock(nn.Module):
         return x
 
 
-""" 아래 AgentFusionEncoder 클래스, 내가 직접 설계해서 구현해본거야. 구현 상에 버그가 있는지? 내 의도대로 동작하지 않게 잘못 구현된 부분이 있는지? 매우 냉철하고 비판적으로 검토해줘! """
+""" 아래 AgentFusionEncoder / StaticFusionEncoder 클래스, 내가 직접 설계해서 구현해본거야. 구현 상에 버그가 있는지? 내 의도대로 동작하지 않게 잘못 구현된 부분이 있는지? 매우 냉철하고 비판적으로 검토해줘! """
 
 
 class AgentFusionEncoder(nn.Module):
@@ -228,7 +228,7 @@ class AgentFusionEncoder(nn.Module):
         self._hidden_dim = hidden_dim
         self.tokens_mlp_dim = tokens_mlp_dim
 
-        self.type_scale = nn.Parameter(torch.tensor(1.0))  # 스케일 조정용
+        self.type_scale = nn.Parameter(torch.tensor(0.1))  # 스케일 조정용
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
         self.channel_pre_project = Mlp(in_features=8 + num_fourier_dim + 1,
@@ -412,23 +412,21 @@ class AgentFusionEncoder(nn.Module):
         # (N, L, C) → (N, L, tokens_mlp_dim)
         logits = self.gate_linear_V(gated_hidden)
 
-        # chunk_off_points_mask.unsqueeze(-1): (N, L, 1)
-        # 없는 시간의 점의 가중치를 -1e9로 설정하여 softmax에서 무시.
-        # _gated_attentive_pool
-        NEG_INF = -1e4 if (chunk_values.dtype == torch.float16) else -1e9
-        logits = logits.masked_fill(chunk_off_points_mask.unsqueeze(-1),
-                                    NEG_INF)
-
-        # ----- 3) L축 softmax (쿼리별로 시점 가중치) -----
-        # (N, L, tokens_mlp_dim)
-        attn = torch.softmax(logits, dim=1)
-
-        # 모든 시점이 무효인 경우(분모 0) softmax NaN 방지 → 0으로 설정
-        # chunk_off_points_mask: (N, L)
-        # chunk_valid_points_num: (N, 1)
-        # chunk_is_off: (N,)
+        ##############3
+        # 3) FP16/FP32 안전 마스킹(softmax 전)
+        logits = logits.float()  # 안정성 위해 fp32로
+        logits = logits.masked_fill((chunk_off_points_mask).unsqueeze(-1),
+                                    float('-inf'))  # 유효 아님 → -inf
         if chunk_is_off.any():
-            attn[chunk_is_off] = 0.0  # (해당 샘플은 0 가중치)
+            # 전부 -inf이면 softmax NaN → 해당 행은 0으로 세팅해 NaN 회피(균등분포가 됨)
+            logits[chunk_is_off] = 0.0
+
+        # 4) 소프트맥스 & 전부 마스크된 행은 0으로 고정(gradient도 0)
+        attn = F.softmax(logits, dim=1)  # (N,L,Q) fp32
+        attn = attn.to(chunk_values.dtype)
+        if chunk_is_off.any():
+            attn[chunk_is_off] = 0.0
+        ###############
 
         # ----- 4) 값 변환 및 가중합 -----
         # value_linear: (C→C)
@@ -496,12 +494,13 @@ class AgentFusionEncoder(nn.Module):
         return chunks, invalid_chunk_mask
 
     def _get_on_past_cur_on_chunk_num_sized_agents_type(
-            self,
-            agents_type: torch.Tensor,  # (B, agents_num, 3)
-            agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
-            on_agents_past_cur_on_chunk_mask: torch.
-        Tensor,  # (on_past_cur_on_num * past_cur_chunk_num)
-            past_cur_chunk_num: int):
+        self,
+        agents_type: torch.Tensor,  # (B, agents_num, 3)
+        agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
+        on_agents_past_cur_on_chunk_mask: torch.
+        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
+        past_cur_chunk_num: int
+    ) -> torch.Tensor:  # (on_past_cur_on_chunk_num, 3)
         # (B * agents_num, 3)
         B, agents_num = agents_type.shape[:2]
         agents_type = agents_type.view(B * agents_num, -1)
@@ -561,6 +560,7 @@ class AgentFusionEncoder(nn.Module):
         agents_type = self._get_on_past_cur_on_chunk_num_sized_agents_type(
             agents_type, agents_past_cur_on_mask,
             on_agents_past_cur_on_chunk_mask, past_cur_chunk_num)
+        # ego_fut_type: (on_ego_fut_on_chunk_num, 3)
         ego_fut_type = self._get_on_ego_fut_on_chunk_num_sized_ego_fut_type(
             ego_fut_type, ego_future_on_mask, on_ego_fut_on_chunk_mask,
             future_chunk_num)
@@ -618,7 +618,6 @@ class AgentFusionEncoder(nn.Module):
         """과거/현재(agents)와 미래(ego)의 구간 무효(True) 마스크를 (B, A*M_past + M_future)로 결합해 반환.
 
         개요:
-            - 과거/현재(agents)와 미래(ego)의 구간별 토큰을 concat하여 `all_chunk`를 만들고,
             - 각각의 구간 무효(오프) 마스크를 적절히 브로드캐스트/리쉐이프/대입하여
               배치 단위 `(B, agents_num * past_cur_chunk_num + future_chunk_num)`의
               **최종 무효 마스크** `all_off_chunk_mask`를 만든다.
@@ -1387,7 +1386,7 @@ class AgentFusionEncoder(nn.Module):
             # (ego_future_on_num, future_chunk_num) True=무효
         )
 
-        # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, all_chunk)
+        # all_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, hidden_dim)
         # all_off_chunk_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
         # all_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 4 + (2k + 1) + 4 + 4)
 
@@ -1433,8 +1432,7 @@ class StaticFusionEncoder(nn.Module):
             static_encoding[valid_indices] = static_info
         static_encoding = static_encoding.view(B, P, -1)  # (B, P, hidden_dim)
         mask_p = mask_p.view(B, P)  # (B, P)
-        pos = pos.view(B, P, -1)  # (B, P, 8)
-        return static_encoding, mask_p, pos
+        return static_encoding, mask_p, static_feature
 
     def _get_static_xyyaw_time(self, static_info: torch.Tensor) -> torch.Tensor:
         # static_info: (B, static_objects_num, 10)
@@ -1464,9 +1462,10 @@ class StaticFusionEncoder(nn.Module):
         # (B, static_objects_num, 4 + 2K + 1)
         return static_xyyaw_time
 
-    def _get_static_feature(self,
-                            static_xyyaw_time: torch.Tensor # (B, static_objects_num, 4 + 2K + 1)
-                            ) -> torch.Tensor:
+    def _get_static_feature(
+        self,
+        static_xyyaw_time: torch.Tensor  # (B, static_objects_num, 4 + 2K + 1)
+    ) -> torch.Tensor:
         # First: add (x, y, cos, sin) delta -> (0., 0., 1., 0.)
         B, static_objects_num, _ = static_xyyaw_time.shape
         delta_feature = torch.zeros(
@@ -1475,9 +1474,19 @@ class StaticFusionEncoder(nn.Module):
             dtype=static_xyyaw_time.dtype,
         )
         delta_feature[:, :, 2] = 1.0  # cos
-        static_xyyaw_time = torch.cat(
-            [static_xyyaw_time, delta_feature], dim=-1)  # (B, static_objects_num, 4 + 2K + 1 + 4)
-
+        # (B, static_objects_num, 4 + 2K + 1 + 4)
+        static_xyyaw_time = torch.cat([static_xyyaw_time, delta_feature],
+                                      dim=-1)
+        # static_type: (B, static_objects_num, 4) # 4:
+        static_type = torch.zeros(
+            (B, static_objects_num, 4),
+            device=static_xyyaw_time.device,
+            dtype=static_xyyaw_time.dtype,
+        )
+        static_type[:, :, -2] = 1.0  # type
+        # static_feature: (B, static_objects_num, 4 + 2K + 1 + 4 + 4)
+        static_feature = torch.cat([static_xyyaw_time, static_type], dim=-1)
+        return static_feature
 
 
 class LaneFusionEncoder(nn.Module):
@@ -1492,6 +1501,7 @@ class LaneFusionEncoder(nn.Module):
         super().__init__()
 
         self._lane_len = lane_len
+        self.num_fourier_frequencies = 4
         self._channel = channels_mlp_dim
 
         self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
@@ -1521,16 +1531,17 @@ class LaneFusionEncoder(nn.Module):
                                act_layer=nn.GELU,
                                drop=drop_path_rate)
 
-    def forward(self, x, speed_limit, has_speed_limit):
+    def forward(self, lane_info, speed_limit, has_speed_limit):
         '''
-        x: B, P, V, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
+        lane_info: B, P, V, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
         speed_limit: B, P, 1
         has_speed_limit: B, P, 1
         '''
-        traffic = x[:, :, 0, 8:]
-        x = x[..., :8]
+        traffic = lane_info[:, :, 0, 8:]
+        lane_info = lane_info[..., :8]
 
-        pos = x[:, :, int(self._lane_len / 2), :8].clone()  # x, y, x'-x, y'-y
+        pos = lane_info[:, :,
+                        int(self._lane_len / 2), :8].clone()  # x, y, x'-x, y'-y
         heading = torch.atan2(pos[..., 3], pos[..., 2])
         pos[..., 2] = torch.cos(heading)
         pos[..., 3] = torch.sin(heading)
@@ -1538,23 +1549,23 @@ class LaneFusionEncoder(nn.Module):
         pos[..., -4:] = 0.0
         pos[..., -1] = 1.0
 
-        B, P, V, _ = x.shape
-        agents_past_cur_off_p_mask = torch.sum(torch.ne(x[..., :8], 0),
-                                               dim=-1).to(x.device) == 0
+        B, P, V, _ = lane_info.shape
+        agents_past_cur_off_p_mask = torch.sum(torch.ne(lane_info[..., :8], 0),
+                                               dim=-1).to(lane_info.device) == 0
         mask_p = torch.sum(~agents_past_cur_off_p_mask, dim=-1) == 0
-        x = x.view(B * P, V, -1)
+        lane_info = lane_info.view(B * P, V, -1)
 
         valid_indices = ~mask_p.view(-1)
-        x = x[valid_indices]
+        lane_info = lane_info[valid_indices]
 
-        x = self.channel_pre_project(x)
-        x = x.permute(0, 2, 1)
-        x = self.token_pre_project(x)
-        x = x.permute(0, 2, 1)
+        lane_info = self.channel_pre_project(lane_info)
+        lane_info = lane_info.permute(0, 2, 1)
+        lane_info = self.token_pre_project(lane_info)
+        lane_info = lane_info.permute(0, 2, 1)
         for block in self.blocks:
-            x = block(x)
+            lane_info = block(lane_info)
 
-        x = torch.mean(x, dim=1)
+        lane_info = torch.mean(lane_info, dim=1)
 
         # Reshape speed_limit and traffic to match flattened dimensions
         speed_limit = speed_limit.view(B * P, 1)
@@ -1565,7 +1576,7 @@ class LaneFusionEncoder(nn.Module):
         has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
         speed_limit = speed_limit[valid_indices].squeeze(-1)
         speed_limit_embedding = torch.zeros(
-            (speed_limit.shape[0], self._channel), device=x.device)
+            (speed_limit.shape[0], self._channel), device=lane_info.device)
 
         if has_speed_limit.sum() > 0:
             speed_limit_with_limit = self.speed_limit_emb(
@@ -1582,13 +1593,15 @@ class LaneFusionEncoder(nn.Module):
         traffic_light_embedding = self.traffic_emb(
             traffic)  # Traffic light embedding for valid data
 
-        x = x + speed_limit_embedding + traffic_light_embedding
-        x = self.emb_project(self.norm(x))
+        lane_info = lane_info + speed_limit_embedding + traffic_light_embedding
+        lane_info = self.emb_project(self.norm(lane_info))
 
-        x_result = torch.zeros((B * P, x.shape[-1]), device=x.device)
-        x_result[valid_indices] = x  # Fill in valid parts
+        lane_embedding = torch.zeros((B * P, lane_info.shape[-1]),
+                                     device=lane_info.device)
+        lane_embedding[valid_indices] = lane_info  # Fill in valid parts
 
-        return x_result.view(B, P, -1), mask_p.reshape(B,
+        return lane_embedding.view(B, P,
+                                   -1), mask_p.reshape(B,
                                                        -1), pos.view(B, P, -1)
 
 
