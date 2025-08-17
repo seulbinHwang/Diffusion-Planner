@@ -1,7 +1,5 @@
 """ 아래 전체 클래스, 내가 직접 설계해서 구현해본거야. 구현 상에 버그가 있는지? 내 의도대로 동작하지 않게 잘못 구현된 부분이 있는지? 매우 냉철하고 비판적으로 검토해줘! """
 
-
-
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 import torch.nn.functional as F
@@ -128,7 +126,7 @@ class Encoder(nn.Module):
             depth=config.encoder_depth,
             num_fourier_frequencies=self.num_fourier_frequencies)
         self.token_num = (1 * self.agents_encoder.future_chunk_num) + (
-            config.agent_num * self.agents_encoder.past_cur_chunk_num
+            (1 + config.agent_num) * self.agents_encoder.past_cur_chunk_num
         ) + config.static_objects_num + config.lane_num
 
         self.fusion = FusionEncoder(
@@ -151,6 +149,8 @@ class Encoder(nn.Module):
         # ego
         ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
         ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
+
+        ego_future = inputs["ego_future_gt_11_dim"]  # (B ,future_len= 80, 11)
         # agents
         neighbors = inputs['neighbor_agents_past']
 
@@ -165,7 +165,7 @@ class Encoder(nn.Module):
         B = neighbors.shape[0]
         # agents_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
         encoding_agents, agents_mask, agents_pos = self.agents_encoder(
-            ego_past, neighbors)
+            ego_past, neighbors, ego_future)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
             lanes, lanes_speed_limit, lanes_has_speed_limit)
@@ -214,8 +214,6 @@ class SelfAttentionBlock(nn.Module):
         return x
 
 
-
-
 class AgentFusionEncoder(nn.Module):
 
     def __init__(self,
@@ -232,6 +230,7 @@ class AgentFusionEncoder(nn.Module):
         self.time_gap = 0.1
         self.time_min = -2.0
         self.time_max = 8.0
+        self.future_len = future_len
         self.chunk_length = chunk_length
         self.past_cur_chunk_num = max(1, time_len // self.chunk_length)
         self.future_chunk_num = max(1, future_len // self.chunk_length)
@@ -440,10 +439,10 @@ class AgentFusionEncoder(nn.Module):
             logits[chunk_is_off] = 0.0
 
         # 4) 소프트맥스 & 전부 마스크된 행은 0으로 고정(gradient도 0)
-        attn = F.softmax(logits, dim=1)  # (N,L,Q) fp32
-        attn = attn.to(chunk_values.dtype)
-        if chunk_is_off.any():
-            attn[chunk_is_off] = 0.0
+        attn = F.softmax(logits, dim=1).to(chunk_values.dtype)  # (N,L,Q) fp32
+        attn = attn.masked_fill(chunk_is_off.view(-1, 1, 1), 0.0)
+        # if chunk_is_off.any():
+        #     attn[chunk_is_off] = 0.0
         ###############
 
         # ----- 4) 값 변환 및 가중합 -----
@@ -1163,6 +1162,8 @@ class AgentFusionEncoder(nn.Module):
 
         (x, y, cos, sin, vx, vy, w, l, type(3)
         '''
+        assert self.future_len == ego_future.shape[1], \
+            f"ego_future.shape[1] should be {self.future_len}, but got {ego_future.shape[1]}"
         # (B, agents_num=1+agent_num, time_len, D)
         agents_past_current = torch.cat([ego_past_current, npc_past_current],
                                         dim=1)
@@ -1642,7 +1643,7 @@ class LaneFusionEncoder(nn.Module):
 
         # Reshape speed_limit and traffic to match flattened dimensions
         speed_limit = speed_limit.view(B * lane_num, 1)
-        has_speed_limit = has_speed_limit.view(B * lane_num, 1)
+        has_speed_limit = has_speed_limit.to(torch.bool).view(B * lane_num, 1)
         traffic = traffic.view(B * lane_num, -1)
 
         # Apply embedding directly to valid speed limit data
@@ -1689,6 +1690,11 @@ class FusionEncoder(nn.Module):
 
         dpr = drop_path_rate
 
+        # 1) CLS/scene 토큰과 그 위치 임베딩
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.cls_pos = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.cls_pos, std=0.02)
         self.blocks = nn.ModuleList([
             SelfAttentionBlock(hidden_dim, num_heads, dropout=dpr)
             for i in range(depth)
@@ -1697,9 +1703,25 @@ class FusionEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x, mask):
-        mask[:, 0] = False
+        """
+        x:    [B, T, H]
+        mask: [B, T]  (True = 패딩으로 무시)
+        """
+        # 2) CLS를 앞에 붙임
+        B, T, H = x.shape
+        cls = self.cls_token.expand(B, 1, H)
+        x = torch.cat([cls, x], dim=1)  # [B, T+1, H]
+        x[:, 0:1, :] = x[:, 0:1, :] + self.cls_pos  # CLS 위치 임베딩만 추가
+
+        # 3) 마스크도 앞에 False를 붙임(=CLS는 항상 유효)
+        cls_mask = torch.zeros(B, 1, dtype=torch.bool, device=mask.device)
+        mask = torch.cat([cls_mask, mask], dim=1)  # [B, T+1]
 
         for b in self.blocks:
             x = b(x, mask)
+        x = self.norm(x)
 
-        return self.norm(x)
+        scene = x[:, 0, :]  # CLS/scene 벡터
+        x_wo_cls = x[:, 1:, :]  # 원래 토큰 길이로 복원
+
+        return x_wo_cls
