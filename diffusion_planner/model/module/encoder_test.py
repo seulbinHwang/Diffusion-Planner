@@ -6,8 +6,7 @@ import torch.nn.functional as F
 
 from diffusion_planner.model.module.mixer import MixerBlock
 
-from typing import Optional
-from typing import Tuple
+from typing import Tuple, Dict, Optional
 import torch
 import torch.nn as nn
 
@@ -169,17 +168,124 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Linear(
             4 + 2 * self.num_fourier_frequencies + 1 + 4 + 4, config.hidden_dim)
 
-    """
-    
-    """
+    def _sample_uniform_prefix_lengths(self, batch_size: int,
+                                       max_future_len: int,
+                                       device: torch.device) -> torch.Tensor:
+        """무작위 길이 M_i를 각 배치별로 균일 분포에서 샘플링합니다.
 
-    def forward(self, inputs):
+        Args:
+            batch_size (int): 배치 크기 B.
+            max_future_len (int): 전체 미래 길이 N(예: 80).
+            device (torch.device): 결과 텐서를 올릴 디바이스.
+
+        Returns:
+            torch.Tensor: [B] 형태의 정수 텐서. 각 값은 M_i ∈ {0,1,...,N}.
+        """
+        # shape: (B,)
+        # 낮은 값 포함(0), 높은 값은 제외 → high = N+1 로 설정해 {0..N} 범위
+        prefix_lengths: torch.Tensor = torch.randint(low=0,
+                                                     high=max_future_len + 1,
+                                                     size=(batch_size,),
+                                                     device=device)
+        return prefix_lengths
+
+    def _build_known_mask_from_lengths(self, prefix_lengths: torch.Tensor,
+                                       max_future_len: int) -> torch.Tensor:
+        """길이 M_i로부터 '알려진 구간(조건 제공)' 마스크를 만듭니다.
+
+        정의:
+            known_mask[b, t] = True  ⇔  t < M_b
+            (여기서 t는 0..N-1 인덱스이며, 시간은 0.1s,1.0s 등과 매핑 가능)
+
+        Args:
+            prefix_lengths (torch.Tensor): [B] 각 배치의 M_i.
+            max_future_len (int): 전체 미래 길이 N.
+
+        Returns:
+            torch.Tensor: [B, N]의 bool 텐서. True=알려진(조건), False=미제공.
+        """
+        # time_index: [1, N] → [0..N-1] 인덱스
+        time_index = torch.arange(max_future_len,
+                                  device=prefix_lengths.device)  # (N,)
+        # 브로드캐스트 비교 → (B, N)
+        known_mask = time_index.unsqueeze(0) < prefix_lengths.unsqueeze(1)
+        return known_mask  # (B, N), bool
+
+    def _truncate_and_pad_ego_future_for_encoder(
+            self, ego_future_full: torch.Tensor,
+            known_mask: torch.Tensor) -> torch.Tensor:
+        """미래 궤적을 [처음 M_i 스텝 유지 + 나머지 0패딩]으로 변환합니다.
+
+        주의:
+        - 에이전트 인코더의 assert(길이 고정)를 만족시키기 위해 **길이는 그대로 N 유지**합니다.
+        - 마스크 판단은 에이전서 내부에서 첫 8채널이 0인지로 이루어지므로,
+          M_i 이후 프레임은 **앞 8채널을 0**으로 채웁니다.
+        - 마지막 3채널(type)은 항상 ego를 의미하도록 **[1,0,0]**(또는 입력의 ego one-hot)을 유지합니다.
+
+        Args:
+            ego_future_full (torch.Tensor):
+                형태: [B, N, 11]
+                채널: [x, y, cos, sin, vx, vy, w, l, type(3)]
+            known_mask (torch.Tensor):
+                형태: [B, N], bool
+                True=조건 제공(유지), False=미제공(패딩)
+
+        Returns:
+            torch.Tensor:
+                형태: [B, N, 11]
+                처음 M_i는 원본 유지, 나머지는 앞 8채널 0, type 3채널은 ego one-hot 유지.
+        """
+        B, N, D = ego_future_full.shape  # (B, N, 11)
+        assert D == 11, "ego_future_full의 마지막 차원은 11이어야 합니다."
+
+        # (B, 3) ego 타입 벡터를 첫 프레임에서 추출(이미 one-hot이라 가정)
+        ego_type: torch.Tensor = ego_future_full[:, 0, 8:11].clone()  # (B, 3)
+
+        # 기본 패딩 텐서: 앞 8채널=0, type 3채널=ego one-hot 반복
+        padded_default = ego_future_full.new_zeros(B, N, D)  # (B, N, 11)
+        padded_default[:, :, 8:11] = ego_type.unsqueeze(1).expand(-1, N, -1)
+
+        # keep: (B, N, 1)  True=원본 유지
+        keep = known_mask.unsqueeze(-1)
+
+        # 최종: 알려진 구간은 원본, 나머지는 기본 패딩
+        ego_future_masked = torch.where(keep, ego_future_full,
+                                        padded_default)  # (B, N, 11)
+        return ego_future_masked
+
+    def forward(self, inputs: Dict[str,
+                                   torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """인코더 전방 패스(무작위 길이 M로 ego 미래를 잘라 조건 제공).
+
+        입력 딕셔너리 키와 텐서 형태:
+            - ego_agent_past:           [B, V=21, 11]
+            - ego_future_gt_11_dim:     [B, N=80, 11]
+            - neighbor_agents_past:     [B, A, V=21, 11]
+            - static_objects:           [B, P, D_static]
+            - lanes:                    [B, L, lane_len, D_lane]
+            - lanes_speed_limit:        [B, L, 1]
+            - lanes_has_speed_limit:    [B, L, 1]
+
+        처리 개요:
+            1) 배치별로 M_i ~ Uniform{0..N} 샘플.
+            2) ego 미래를 처음 M_i만 남기고, 나머지 스텝은 앞 8채널 0으로 패딩.
+               (길이는 N을 유지하여 에이전트 인코더와 호환)
+            3) 나머지 인코딩/융합은 기존과 동일.
+
+        Returns:
+            Dict[str, torch.Tensor]:
+                - 'encoding':        [B, T_token, H]
+                - 'ego_fut_global':  [B, H]
+                - 'ego_plan_known_mask': [B, N]  (True=조건 제공)
+                - 'ego_plan_prefix_lengths': [B] (각 배치의 M_i)
+        """
         encoder_outputs = {}
         # ego
         ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
         ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
 
-        ego_future = inputs["ego_future_gt_11_dim"]  # (B ,future_len= 80, 11)
+        ego_future_full = inputs[
+            "ego_future_gt_11_dim"]  # (B ,future_len= 80, 11)
         # agents
         neighbors = inputs['neighbor_agents_past']
 
@@ -192,14 +298,34 @@ class Encoder(nn.Module):
         lanes_has_speed_limit = inputs['lanes_has_speed_limit']
 
         B = neighbors.shape[0]
+        future_len: int = ego_future_full.shape[1]
+
+        # ---------------------- 1) M_i 샘플링 ---------------------- #
+        prefix_lengths = self._sample_uniform_prefix_lengths(
+            batch_size=B,
+            max_future_len=future_len,
+            device=ego_future_full.device,
+        )  # (B,)
+        known_mask = self._build_known_mask_from_lengths(
+            prefix_lengths,
+            max_future_len=future_len)  # (B, future_len) True=조건 제공
+
+        # ---------------------- 2) 잘라 + 패딩 ---------------------- #
+        ego_future_masked = self._truncate_and_pad_ego_future_for_encoder(
+            ego_future_full,
+            known_mask)  # (B, future_len, 11)  길이 유지, 마스크는 내부에서 활용됨
+
+        # ---------------------- 3) 인코딩 ---------------------- #
         # agents_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
         # ego_fut_global: (B, hidden_dim)
         (encoding_agents, agents_mask, agents_pos,
-         ego_fut_global) = self.agents_encoder(ego_past, neighbors, ego_future)
+         ego_fut_global) = self.agents_encoder(ego_past, neighbors,
+                                               ego_future_masked)
         encoding_static, static_mask, static_pos = self.static_encoder(static)
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
             lanes, lanes_speed_limit, lanes_has_speed_limit)
 
+        # ---------------------- 4) 포지션 임베딩 결합 ---------------------- #
         encoding_input = torch.cat(
             [encoding_agents, encoding_static, encoding_lanes], dim=1)
         encoding_pos = torch.cat([agents_pos, static_pos, lane_pos],
@@ -284,7 +410,7 @@ class AgentFusionEncoder(nn.Module):
         self._hidden_dim = hidden_dim
         self.tokens_mlp_dim = tokens_mlp_dim
 
-        self.type_scale = nn.Parameter(torch.tensor(0.03))  # 스케일 조정용
+        self.type_scale = nn.Parameter(torch.tensor(0.01))  # 스케일 조정용
         self.type_emb = nn.Linear(3, channels_mlp_dim)
 
         self.channel_pre_project = Mlp(in_features=8 + num_fourier_dim + 1,
@@ -538,8 +664,8 @@ class AgentFusionEncoder(nn.Module):
         for chunk_idx in range(chunks_num):
             start, end = int(chunk_starts[chunk_idx].item()), int(
                 chunk_ends[chunk_idx].item())
-            chunk_values = on_trajs[:,
-                                    start:end + 1, :]  # (N, L, channel_mlp_dim)
+            # chunk_values: (N, L, channel_mlp_dim)
+            chunk_values = on_trajs[:, start:end + 1, :]
             # chunk_off_points_mask: (N, L)
             chunk_off_points_mask = on_trajs_off_p_mask[:, start:end + 1]
             # chunk_is_off: (N,)
@@ -1098,11 +1224,12 @@ class AgentFusionEncoder(nn.Module):
         # ego_future: (B, future_len, d_8)
         B, future_len, _ = ego_future.shape
         # ego_future_timestep: (B, future_len)
-        ego_future_timestep = timegrid_future_2d(dt=self.time_gap,
-                                                 total_steps=future_len,
-                                                 B=B,
-                                                 device=ego_future.device,
-                                                 dtype=ego_future.dtype)
+        ego_future_timestep = timegrid_future_2d(
+            dt=self.time_gap,  # 0.1
+            total_steps=future_len,  # 80
+            B=B,
+            device=ego_future.device,
+            dtype=ego_future.dtype)
         ego_future_time_fourier = encode_time_with_fourier_features(
             ego_future_timestep, self.time_min, self.time_max,
             self.num_fourier_frequencies)  # (B, future_len, 2K + 1)
