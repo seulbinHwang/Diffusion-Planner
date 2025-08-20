@@ -2005,10 +2005,10 @@ class FusionEncoder(nn.Module):
 
             # 3) CLS 부착 및 CLS 위치 임베딩 추가
             cls_tokens = self.cls_token.expand(B_keep, 1, H)  # [B_keep, 1, H]
-            kept_with_cls = torch.cat([cls_tokens, kept_tokens],
+            cls_with_tokens = torch.cat([cls_tokens, kept_tokens],
                                       dim=1)  # [B_keep, T+1, H]
-            kept_with_cls[:, 0:
-                          1, :] = kept_with_cls[:, 0:
+            cls_with_tokens[:, 0:
+                          1, :] = cls_with_tokens[:, 0:
                                                 1, :] + self.cls_pos  # [B_keep, 1, H] += pos
 
             # 4) 마스크에 CLS(False) 추가
@@ -2016,17 +2016,17 @@ class FusionEncoder(nn.Module):
                                     1,
                                     dtype=torch.bool,
                                     device=kept_key_pad.device)  # [B_keep,1]
-            kept_mask_with_cls = torch.cat([cls_false, kept_key_pad],
+            cls_with_token_mask = torch.cat([cls_false, kept_key_pad],
                                            dim=1)  # [B_keep, T+1]
 
             # 5) 블록 통과
-            fused = kept_with_cls  # [B_keep, T+1, H]
+            # cls_with_tokens  # [B_keep, T+1, H]
             for block in self.blocks:
-                fused = block(fused, kept_mask_with_cls)  # [B_keep, T+1, H]
-            fused = self.norm(fused)  # [B_keep, T+1, H]
+                cls_with_tokens = block(cls_with_tokens, cls_with_token_mask)  # [B_keep, T+1, H]
+            cls_with_tokens = self.norm(cls_with_tokens)  # [B_keep, T+1, H]
 
             # 6) CLS 제거 후 원래 배치 위치에 복원
-            fused_wo_cls = fused[:, 1:, :]  # [B_keep, T, H]
+            fused_wo_cls = cls_with_tokens[:, 1:, :]  # [B_keep, T, H]
             out_tokens[will_process_mask] = fused_wo_cls  # [B, T, H]
 
         # 전부 패딩 배치는 out_tokens의 0 유지

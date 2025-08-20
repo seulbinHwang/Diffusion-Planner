@@ -309,13 +309,13 @@ class DiT(nn.Module):
         x = x + x_embedding
         # route_lanes: (B, 25, 20, 12)
         # route_encoding: (B, D=192)
-        route_encoding = self.route_encoder(route_lanes)
-        y = route_encoding
+        # route_encoding = self.route_encoder(route_lanes)
+        # y = route_encoding
         # t: [B,]
         # t_embedding: (B, D=192)
         t_embedding = self.t_embedder(t)
         # y = (B, D=192) + (B, D=192) = (B, D=192)
-        y = y + ego_fut_global + t_embedding
+        y = ego_fut_global + t_embedding
 
         all_current_mask_for_attn = torch.zeros((B, one_Pnn), dtype=torch.bool, device=x.device)
         all_current_mask_for_attn[:, 1:] = neighbor_current_mask
