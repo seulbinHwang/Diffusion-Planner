@@ -113,7 +113,7 @@ def train_epoch(data_loader,
             loss, _ = diffusion_loss_func(
                 model, inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
-                (ego_future, neighbors_future, mask), args.state_normalizer,
+                (neighbors_future, mask), args.state_normalizer,
                 loss, args.diffusion_model_type)
 
             loss['loss'] = loss['neighbor_prediction_loss']

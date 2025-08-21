@@ -79,19 +79,20 @@ class Decoder(nn.Module):
 
         """
         # Extract ego & neighbor current states
-        neighbors_current = inputs[
-            "neighbor_agents_past"][:, :self._predicted_neighbor_num,
-                                    -1, :4]  # [B, pnn, 4]
-        neighbor_current_mask = torch.sum(
-            torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0  # [B, pnn]
-        inputs["neighbor_current_mask"] = neighbor_current_mask
+        near_current = inputs["neighbor_agents_past"][:, :self.
+                                                      _predicted_neighbor_num,
+                                                      -1, :4]  # [B, pnn, 4]
+        near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
+                                      dim=-1) == 0  # [B, pnn]
+        inputs["near_current_mask"] = near_current_mask
 
-        B, Pnn, _ = neighbors_current.shape
+        B, Pnn, _ = near_current.shape
         assert Pnn == (self._predicted_neighbor_num)
+        assert near_current_mask.shape[1] == Pnn
 
         # Extract context encoding
-        ego_neighbor_encoding = encoder_outputs[
-            'encoding']  #  (B, token_num, 192)
+        scene_encoding_token = encoder_outputs[
+            'encoding']  #  (B, token_num, hidden_dim)
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
 
         if self.training:
@@ -101,33 +102,36 @@ class Decoder(nn.Module):
             # (B, Pnn, (1 + T) * 4)
             return {
                 "score":
-                    self.dit(sampled_trajectories, diffusion_time,
-                             ego_neighbor_encoding,
-                             ego_fut_global, neighbor_current_mask).reshape(
-                                 B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) * 4)
+                    self.dit(
+                        sampled_trajectories,  # ( B, Pnn, (1 + T) * 4 )
+                        diffusion_time,  # (B)
+                        scene_encoding_token,  # (B, token_num, hidden_dim)
+                        ego_fut_global,  # (B, hidden_dim)
+                        near_current_mask  # (B, Pnn)
+                    ).reshape(B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) * 4)
             }
         else:
             # [B, Pnn, (1 + future_len) * 4]
             xT = torch.cat(
                 [
-                    neighbors_current[:, :, None],  # (B, Pnn, 1, 4)
+                    near_current[:, :, None],  # (B, Pnn, 1, 4)
                     torch.randn(B, Pnn, self._future_len,
                                 4).to(  # (B, Pnn, T, 4)
-                                    neighbors_current.device) * 0.5
+                                    near_current.device) * 0.5
                 ],
                 dim=2).reshape(B, Pnn, -1)
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, Pnn, -1, 4)
-                xt[:, :, 0, :] = neighbors_current
+                xt[:, :, 0, :] = near_current
                 return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(
                 self.dit,
                 xT,
                 other_model_params={
-                    "cross_c": ego_neighbor_encoding,
-                    "neighbor_current_mask": neighbor_current_mask
+                    "cross_c": scene_encoding_token,
+                    "near_current_mask": near_current_mask
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": initial_state_constraint,
@@ -138,8 +142,8 @@ class Decoder(nn.Module):
                     "classifier_kwargs": {
                         "model": self.dit,
                         "model_condition": {
-                            "cross_c": ego_neighbor_encoding,
-                            "neighbor_current_mask": neighbor_current_mask
+                            "cross_c": scene_encoding_token,
+                            "near_current_mask": near_current_mask
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
@@ -277,14 +281,20 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross_c, ego_fut_global, neighbor_current_mask):
+    def forward(self, x, t, cross_c, ego_fut_global, near_current_mask):
         """
+        # TODO: 여기서부터
+                        sampled_trajectories,  # ( B, Pnn, (1 + T) * 4 )
+                        diffusion_time,  # (B)
+                        scene_encoding_token,  # (B, token_num, hidden_dim)
+                        ego_fut_global,  # (B, hidden_dim)
+                        near_current_mask  # (B, Pnn)
         Forward pass of DiT.
         x:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
         t:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
         cross_c: [B, Pnn, D] = [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
-        neighbor_current_mask: [B, Pnn]
+        near_current_mask: [B, Pnn]
         """
         B, Pnn, _ = x.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
@@ -302,9 +312,9 @@ class DiT(nn.Module):
             x: (B, Pnn, D=192)
             cross_c: (B, N=token_num, D=192)
             y: (B, D=192)
-            neighbor_current_mask: (B, Pnn)
+            near_current_mask: (B, Pnn)
             """
-            x = block(x, cross_c, y, neighbor_current_mask)
+            x = block(x, cross_c, y, near_current_mask)
         # output: x: (B, Pnn, D=192)
         # y: (B, D=192)
         x = self.final_layer(x, y)

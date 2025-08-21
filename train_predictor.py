@@ -41,7 +41,7 @@ def get_args():
         '--name',
         type=str,
         help='log name (default: "diffusion-planner-training")',
-        default="npc_aug_n_ego_past")  # npc_current_state_aug_0.5
+        default="ego_fut_conditioned")  # npc_current_state_aug_0.5
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
@@ -126,7 +126,7 @@ def get_args():
                         default=0.5)
     parser.add_argument('--normalization_file_path',
                         default='normalization.json',
-                        help='filepath of normalizaiton.json',
+                        help='filepath of normalization.json',
                         type=str)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
