@@ -181,11 +181,6 @@ def get_args():
                         help='decoder drop out rate',
                         default=0.1)
 
-    parser.add_argument('--alpha_planning_loss',
-                        type=float,
-                        help='coefficient of planning loss (default: 1.0)',
-                        default=0.)
-
     parser.add_argument('--device',
                         type=str,
                         help='run on which device (default: cuda)',
@@ -315,7 +310,8 @@ def model_training(args):
             # resume_local_path_model_path: ./training_log/npc_aug_n_ego_past/2025-08-06-07:23:04/
             save_path = args.resume_local_path_model_path
             # 폴더명 자체가 타임스탬프이므로 그대로 재사용
-            time_str = os.path.basename(os.path.normpath(args.resume_local_path_model_path))
+            time_str = os.path.basename(
+                os.path.normpath(args.resume_local_path_model_path))
         else:
             from datetime import datetime
             time = datetime.now()
@@ -590,8 +586,7 @@ if __name__ == "__main__":
     if args.resume_model_from_wandb:
         # resume_model_from_wandb 가 "latest"가 아니면 에러를 발생시킵니다.
         if args.resume_model_from_wandb not in ['latest']:
-            raise ValueError(
-                "args.resume_model_from_wandb must be 'latest.")
+            raise ValueError("args.resume_model_from_wandb must be 'latest.")
         if not args.name:
             raise ValueError(
                 "args.name must be provided to resume from a wandb artifact.")
@@ -666,8 +661,7 @@ if __name__ == "__main__":
                     raise FileNotFoundError(
                         f"다운로드된 아티팩트 디렉터리에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: {save_path}. "
                         f"사용 가능한 파일: {downloaded_files}")
-                save_path = os.path.dirname(
-                    os.path.abspath(model_path))
+                save_path = os.path.dirname(os.path.abspath(model_path))
                 args.resume_local_path_model_path = save_path
 
                 print(

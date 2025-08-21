@@ -9,6 +9,7 @@ from diffusion_planner.loss import diffusion_loss_func
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 
+
 def train_epoch(data_loader,
                 model,
                 optimizer,
@@ -52,20 +53,15 @@ def train_epoch(data_loader,
             inputs = {
                 'ego_agent_past': batch[0].to(args.device),
                 'ego_current_state': batch[1].to(args.device),
-
                 'neighbor_agents_past': batch[3].to(args.device),
-
                 'lanes': batch[5].to(args.device),
                 'lanes_speed_limit': batch[6].to(args.device),
                 'lanes_has_speed_limit': batch[7].to(args.device),
-
                 'route_lanes': batch[8].to(args.device),
                 'route_lanes_speed_limit': batch[9].to(args.device),
                 'route_lanes_has_speed_limit': batch[10].to(args.device),
-
                 'static_objects': batch[11].to(args.device),
                 'ego_future_gt_11_dim': batch[13].to(args.device),
-
             }
 
             ego_future = batch[2].to(args.device)
@@ -76,8 +72,8 @@ def train_epoch(data_loader,
                 inputs, ego_future, neighbors_future = aug(
                     inputs, ego_future, neighbors_future)
             if isinstance(aug, NPCStatePerturbation):
-                inputs, neighbors_future = aug(
-                    inputs, neighbors_future_all, args)
+                inputs, neighbors_future = aug(inputs, neighbors_future_all,
+                                               args)
             # heading to cos sin
             ego_future = torch.cat(
                 [
@@ -120,11 +116,9 @@ def train_epoch(data_loader,
                 (ego_future, neighbors_future, mask), args.state_normalizer,
                 loss, args.diffusion_model_type)
 
-            loss['loss'] = loss[
-                'neighbor_prediction_loss'] + args.alpha_planning_loss * loss[
-                    'ego_planning_loss']
+            loss['loss'] = loss['neighbor_prediction_loss']
 
-            total_loss = loss['loss'].item()
+            total_loss = loss['loss'].item()  # scalar
 
             # loss backward
             loss['loss'].backward()

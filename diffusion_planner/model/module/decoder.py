@@ -63,7 +63,7 @@ class Decoder(nn.Module):
                     "ego_current_state": current ego states,
                     "neighbor_agent_past": past and current neighbor states,
 
-                    [training-only] "sampled_trajectories": sampled current-future ego & neighbor states,        [B, P, 1 + V_future, 4]
+                    [training-only] "sampled_trajectories": sampled current-future ego & neighbor states,        [B, P, 1 + future_len, 4]
                     [training-only] "diffusion_time": timestep of diffusion process $t \in [0, 1]$,              [B]
                     ...
                 }
@@ -72,14 +72,13 @@ class Decoder(nn.Module):
             decoder_outputs: Dict
                 {
                     ...
-                    [training-only] "score": Predicted future states, [B, P, 1 + V_future, 4]
-                    [inference-only] "prediction": Predicted future states, [B, P, V_future, 4]
+                    [training-only] "score": Predicted future states, [B, P, 1 + future_len, 4]
+                    [inference-only] "prediction": Predicted future states, [B, P, future_len, 4]
                     ...
                 }
 
         """
         # Extract ego & neighbor current states
-        ego_current = inputs['ego_current_state'][:, None, :4]  # [B, 1, 4]
         neighbors_current = inputs[
             "neighbor_agents_past"][:, :self._predicted_neighbor_num,
                                     -1, :4]  # [B, pnn, 4]
@@ -87,49 +86,47 @@ class Decoder(nn.Module):
             torch.ne(neighbors_current[..., :4], 0), dim=-1) == 0  # [B, pnn]
         inputs["neighbor_current_mask"] = neighbor_current_mask
 
-        current_states = torch.cat([ego_current, neighbors_current],
-                                   dim=1)  # [B, 1+Pnn, 4]
-
-        B, one_P, _ = current_states.shape
-        assert one_P == (1 + self._predicted_neighbor_num)
+        B, Pnn, _ = neighbors_current.shape
+        assert Pnn == (self._predicted_neighbor_num)
 
         # Extract context encoding
-        ego_neighbor_encoding = encoder_outputs['encoding']  #  (B, 107, 192)
+        ego_neighbor_encoding = encoder_outputs[
+            'encoding']  #  (B, token_num, 192)
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
-        route_lanes = inputs['route_lanes']  # (B, 25, 20, 12)
 
         if self.training:
             sampled_trajectories = inputs['sampled_trajectories'].reshape(
-                B, one_P,
-                -1)  # [B, 1+ Pnn, 1 + T, 4] -> [B, one_P, (1 + T) * 4]
+                B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
             diffusion_time = inputs['diffusion_time']
-
+            # (B, Pnn, (1 + T) * 4)
             return {
                 "score":
                     self.dit(sampled_trajectories, diffusion_time,
-                             ego_neighbor_encoding, ego_fut_global, route_lanes,
-                             neighbor_current_mask).reshape(B, one_P, -1, 4)
+                             ego_neighbor_encoding,
+                             ego_fut_global, neighbor_current_mask).reshape(
+                                 B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) * 4)
             }
         else:
-            # [B, 1 + predicted_neighbor_num, (1 + V_future) * 4]
-            xT = torch.cat([
-                current_states[:, :, None],
-                torch.randn(B, one_P, self._future_len, 4).to(
-                    current_states.device) * 0.5
-            ],
-                           dim=2).reshape(B, one_P, -1)
+            # [B, Pnn, (1 + future_len) * 4]
+            xT = torch.cat(
+                [
+                    neighbors_current[:, :, None],  # (B, Pnn, 1, 4)
+                    torch.randn(B, Pnn, self._future_len,
+                                4).to(  # (B, Pnn, T, 4)
+                                    neighbors_current.device) * 0.5
+                ],
+                dim=2).reshape(B, Pnn, -1)
 
             def initial_state_constraint(xt, t, step):
-                xt = xt.reshape(B, one_P, -1, 4)
-                xt[:, :, 0, :] = current_states
-                return xt.reshape(B, one_P, -1)
+                xt = xt.reshape(B, Pnn, -1, 4)
+                xt[:, :, 0, :] = neighbors_current
+                return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(
                 self.dit,
                 xT,
                 other_model_params={
                     "cross_c": ego_neighbor_encoding,
-                    "route_lanes": route_lanes,
                     "neighbor_current_mask": neighbor_current_mask
                 },
                 dpm_solver_params={
@@ -142,7 +139,6 @@ class Decoder(nn.Module):
                         "model": self.dit,
                         "model_condition": {
                             "cross_c": ego_neighbor_encoding,
-                            "route_lanes": route_lanes,
                             "neighbor_current_mask": neighbor_current_mask
                         },
                         "inputs": inputs,
@@ -156,8 +152,9 @@ class Decoder(nn.Module):
                         if self._guidance_fn is not None else "uncond"
                 },
             )
-            x0 = self._state_normalizer.inverse(x0.reshape(B, one_P, -1,
-                                                           4))[:, :, 1:]
+            x0 = self._state_normalizer.inverse(x0.reshape(
+                B, Pnn, -1, 4))  # (B, Pnn, 1 + T, 4)
+            x0 = x0[:, :, 1:]  # (B, Pnn, T, 4)
 
             return {"prediction": x0}
 
@@ -201,7 +198,7 @@ class RouteEncoder(nn.Module):
         x: B, P, V, D # (B, P=25, V=20, D=12)
         '''
         # only x and x->x' vector, no boundary, no speed limit, no traffic light
-        x = x[..., :4] # (B, P, V, 4)
+        x = x[..., :4]  # (B, P, V, 4)
 
         B, P, V, _ = x.shape
         """
@@ -212,10 +209,10 @@ class RouteEncoder(nn.Module):
         mask_v = torch.sum(torch.ne(x[..., :4], 0), dim=-1).to(x.device) == 0
         mask_p = torch.sum(~mask_v, dim=-1) == 0
         mask_b = torch.sum(~mask_p, dim=-1) == 0
-        x = x.view(B, P * V, -1) # (B, P * V, 4)
+        x = x.view(B, P * V, -1)  # (B, P * V, 4)
 
-        valid_indices = ~mask_b.view(-1) # (B)
-        x = x[valid_indices] # (B`, P * V, 4)
+        valid_indices = ~mask_b.view(-1)  # (B)
+        x = x[valid_indices]  # (B`, P * V, 4)
         """
         token
             - P (route lane 차선 수) * V(차선 당 점의 수) = 25 * 20 = 500 
@@ -224,10 +221,11 @@ class RouteEncoder(nn.Module):
             - 4 (x, y, dx, dy)
             - token_pre_project: -> (B`, C, T) where T is tokens_mlp_dim
         """
-        x = self.channel_pre_project(x) # (B`, P * V, C) where C is channels_mlp_dim
-        x = x.permute(0, 2, 1)# (B`, C, P=25 * V=20)
-        x = self.token_pre_project(x) # (B`, C, T) where T is tokens_mlp_dim
-        x = x.permute(0, 2, 1) # (B`, T, C) # (8, 32, 64)
+        x = self.channel_pre_project(
+            x)  # (B`, P * V, C) where C is channels_mlp_dim
+        x = x.permute(0, 2, 1)  # (B`, C, P=25 * V=20)
+        x = self.token_pre_project(x)  # (B`, C, T) where T is tokens_mlp_dim
+        x = x.permute(0, 2, 1)  # (B`, T, C) # (8, 32, 64)
         x = self.Mixer(x)
         # x.shape: (B`, T, C) # (8, 32, 64)
 
@@ -261,8 +259,6 @@ class DiT(nn.Module):
         assert model_type in ["score",
                               "x_start"], f"Unknown model type: {model_type}"
         self._model_type = model_type
-        self.route_encoder = route_encoder
-        self.agent_embedding = nn.Embedding(2, hidden_dim)
         self.preproj = Mlp(in_features=output_dim,
                            hidden_features=512,
                            out_features=hidden_dim,
@@ -281,63 +277,44 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross_c, ego_fut_global, route_lanes, neighbor_current_mask):
+    def forward(self, x, t, cross_c, ego_fut_global, neighbor_current_mask):
         """
         Forward pass of DiT.
-        x:  [B, 1+ Pnn, (1 + T) * 4] # (81*4 = 324)
+        x:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
         t:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
-        cross_c: [B, one_Pnn, D] = [B, N = 107, D = 192]
+        cross_c: [B, Pnn, D] = [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
-        route_lanes: (B, 25, 20, 12)
         neighbor_current_mask: [B, Pnn]
         """
-        B, one_Pnn, _ = x.shape
-        # (B, 11, 324) -> (B, 11, D=192)
+        B, Pnn, _ = x.shape
+        # (B, Pnn, 324) -> (B, Pnn, D=192)
         x = self.preproj(x)
 
-        a = self.agent_embedding.weight[0][None, :] # (1, D = 192)
-        b = self.agent_embedding.weight[1][None, :] # (1, D)
-        b_expanded = b.expand(one_Pnn - 1, -1) # (Pnn, D)
-
-        x_embedding = torch.cat([
-            a,
-            b_expanded,
-        ], dim=0)  # (one_Pnn, D)
-        x_embedding = x_embedding[None, :, :].expand(B, -1,
-                                                     -1)  # (B, one_Pnn, D)
-        # [B, one_Pnn, D] + (B, one_Pnn, D)
-        x = x + x_embedding
-        # route_lanes: (B, 25, 20, 12)
-        # route_encoding: (B, D=192)
-        # route_encoding = self.route_encoder(route_lanes)
-        # y = route_encoding
         # t: [B,]
         # t_embedding: (B, D=192)
         t_embedding = self.t_embedder(t)
         # y = (B, D=192) + (B, D=192) = (B, D=192)
         y = ego_fut_global + t_embedding
 
-        all_current_mask_for_attn = torch.zeros((B, one_Pnn), dtype=torch.bool, device=x.device)
-        all_current_mask_for_attn[:, 1:] = neighbor_current_mask
-
         for block in self.blocks:
             """
             Input shapes:
-            x: (B, one_Pnn, D=192)
-            cross_c: (B, N=107, D=192)
+            x: (B, Pnn, D=192)
+            cross_c: (B, N=token_num, D=192)
             y: (B, D=192)
-            all_current_mask_for_attn: (B, one_Pnn)
+            neighbor_current_mask: (B, Pnn)
             """
-            x = block(x, cross_c, y, all_current_mask_for_attn)
-        # output: x: (B, one_Pnn, D=192)
+            x = block(x, cross_c, y, neighbor_current_mask)
+        # output: x: (B, Pnn, D=192)
         # y: (B, D=192)
         x = self.final_layer(x, y)
-        # x.shape: (B, one_Pnn, (1 + T) * 4)
+        # x.shape: (B, Pnn, (1 + T) * 4)
 
         if self._model_type == "score":
             return x / (self.marginal_prob_std(t)[:, None, None] + 1e-6)
         elif self._model_type == "x_start":
-            # x: (B, one_Pnn, (1 + T) * 4)
+            # CURRENT DEFAULT OPTION: "x_start"
+            # x: (B, Pnn, (1 + T) * 4)
             return x
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
