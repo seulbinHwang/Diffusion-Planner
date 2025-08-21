@@ -113,7 +113,7 @@ class Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_dim = config.hidden_dim
-        self.chunk_length = 10
+        self.chunk_length = 20
         self.num_fourier_frequencies = 4
         self.pos_scale = nn.Parameter(torch.tensor(1.0))
         self.time_gap = 0.1
@@ -234,7 +234,7 @@ class Encoder(nn.Module):
         assert D == 11, "ego_future_full의 마지막 차원은 11이어야 합니다."
 
         # (B, 3) ego 타입 벡터를 첫 프레임에서 추출(이미 one-hot이라 가정)
-        ego_type = ego_future_full[:, 0, 8:11].detach() # (B, 3)
+        ego_type = ego_future_full[:, 0, 8:11].clone()  # (B, 3)
 
         # 기본 패딩 텐서: 앞 8채널=0, type 3채널=ego one-hot 반복
         padded_default = ego_future_full.new_zeros(B, N, D)  # (B, N, 11)
@@ -411,17 +411,20 @@ class SelfAttentionBlock(nn.Module):
 
     def forward(self, x, mask):
         """
-        x:  [on_B, token_nums, H]
-        mask: [on_B, token_nums]
+        x:  [on_B, 1+ token_num, H]
+        mask: [on_B, 1 + token_num]
 
         """
+        x = x.masked_fill(mask.unsqueeze(-1), 0.0)
+
         x_norm = self.norm1(x)
-        x = x + self.drop_path(
-            self.attn(x_norm,
+        y = self.attn(x_norm,
                       x_norm,
                       x_norm,
                       key_padding_mask=mask,
-                      need_weights=False)[0])
+                      need_weights=False)[0]
+        y = self.attn_out_drop(y)  # <-- actually use it
+        x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return x
@@ -538,7 +541,7 @@ class AgentFusionEncoder(nn.Module):
             self,
             ego_future: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Input: ego_future (B, future_len,  8 + 2K + 1)
+        Input: ego_future (B, future_len,  12 + 2K + 1)
 
         Output:
             ego_future_off_p_mask: (B, future_len)
@@ -2015,8 +2018,6 @@ class FusionEncoder(nn.Module):
             device='cuda'):
         super().__init__()
 
-        dpr = drop_path_rate
-
         # 1) CLS/scene 토큰과 그 위치 임베딩
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         self.cls_pos = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -2100,6 +2101,9 @@ class FusionEncoder(nn.Module):
                     cls_with_token_mask)  # [on_B, token_num+1]
             cls_with_tokens = self.norm(
                 cls_with_tokens)  # [on_B, token_num+1, H]
+            # >>> add this to keep padded tokens truly zero <<<
+            cls_with_tokens = cls_with_tokens.masked_fill(
+                cls_with_token_mask.unsqueeze(-1), 0.0)
 
             # 6) CLS 제거 후 원래 배치 위치에 복원
             fused_wo_cls = cls_with_tokens[:, 1:, :]  # [on_B, token_num, H]
