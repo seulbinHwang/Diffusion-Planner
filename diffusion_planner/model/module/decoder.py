@@ -63,7 +63,7 @@ class Decoder(nn.Module):
                     "ego_current_state": current ego states,
                     "neighbor_agent_past": past and current neighbor states,
 
-                    [training-only] "sampled_trajectories": sampled current-future ego & neighbor states,        [B, P, 1 + future_len, 4]
+                    [training-only] "near_cur_future_norm_xT": sampled current-future ego & neighbor states,        [B, P, 1 + future_len, 4]
                     [training-only] "diffusion_time": timestep of diffusion process $t \in [0, 1]$,              [B]
                     ...
                 }
@@ -96,19 +96,19 @@ class Decoder(nn.Module):
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
 
         if self.training:
-            sampled_trajectories = inputs['sampled_trajectories'].reshape(
+            near_cur_future_norm_xT = inputs['near_cur_future_norm_xT'].reshape(
                 B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
             diffusion_time = inputs['diffusion_time']
-            # (B, Pnn, (1 + T) * 4)
+            # (B, Pnn, (1 + T) , 4)
             return {
                 "score":
                     self.dit(
-                        sampled_trajectories,  # ( B, Pnn, (1 + T) * 4 )
+                        near_cur_future_norm_xT,  # ( B, Pnn, (1 + T) * 4 )
                         diffusion_time,  # (B)
                         scene_encoding_token,  # (B, token_num, hidden_dim)
                         ego_fut_global,  # (B, hidden_dim)
                         near_current_mask  # (B, Pnn)
-                    ).reshape(B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) * 4)
+                    ).reshape(B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) , 4)
             }
         else:
             # [B, Pnn, (1 + future_len) * 4]
@@ -281,28 +281,29 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, x, t, cross_c, ego_fut_global, near_current_mask):
+    def forward(self, near_cur_future_norm_xT, diffusion_time, cross_c,
+                ego_fut_global, near_current_mask):
         """
         # TODO: 여기서부터
-                        sampled_trajectories,  # ( B, Pnn, (1 + T) * 4 )
+                        near_cur_future_norm_xT,  # ( B, Pnn, (1 + T) * 4 )
                         diffusion_time,  # (B)
                         scene_encoding_token,  # (B, token_num, hidden_dim)
                         ego_fut_global,  # (B, hidden_dim)
                         near_current_mask  # (B, Pnn)
         Forward pass of DiT.
-        x:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
-        t:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
+        near_cur_future_norm_xT:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
+        diffusion_time:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
         cross_c: [B, Pnn, D] = [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
         near_current_mask: [B, Pnn]
         """
-        B, Pnn, _ = x.shape
+        B, Pnn, _ = near_cur_future_norm_xT.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
-        x = self.preproj(x)
+        x = self.preproj(near_cur_future_norm_xT)
 
-        # t: [B,]
+        # diffusion_time: [B,]
         # t_embedding: (B, D=192)
-        t_embedding = self.t_embedder(t)
+        t_embedding = self.t_embedder(diffusion_time)
         # y = (B, D=192) + (B, D=192) = (B, D=192)
         y = ego_fut_global + t_embedding
 
@@ -321,7 +322,8 @@ class DiT(nn.Module):
         # x.shape: (B, Pnn, (1 + T) * 4)
 
         if self._model_type == "score":
-            return x / (self.marginal_prob_std(t)[:, None, None] + 1e-6)
+            return x / (self.marginal_prob_std(diffusion_time)[:, None, None] +
+                        1e-6)
         elif self._model_type == "x_start":
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, (1 + T) * 4)

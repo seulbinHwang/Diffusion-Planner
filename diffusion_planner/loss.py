@@ -120,13 +120,13 @@ def diffusion_loss_func(
 
     merged_inputs = {
         **inputs,
-        "sampled_trajectories": near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
+        "near_cur_future_norm_xT": near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
         "diffusion_time": batch_diffusion_time,  # [B,]
     }
 
     _, decoder_output = model(merged_inputs)
     ####### TODO: 아래부터 다시 검증
-    # decoder_output["score"]: (B, Pnn, (1 + T) * 4)
+    # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
     score = decoder_output["score"][:, :, 1:, :]  # (B, Pnn, T, 4)
 
     if model_type == "score":
