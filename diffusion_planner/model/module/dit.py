@@ -111,13 +111,11 @@ class DiTBlock(nn.Module):
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        # TODO: residual?
-        x = self.cross_attn(self.norm3(x),
+        x += self.cross_attn(self.norm3(x),
                             cross_c,
                             cross_c,
                             key_padding_mask=cross_mask)[0]
-        # TODO: residual?
-        x = self.mlp2(self.norm4(x))
+        x += self.mlp2(self.norm4(x))
 
         return x
 
@@ -131,9 +129,10 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size)
         self.proj = nn.Sequential(
-            nn.LayerNorm(hidden_size),
+            # nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
-            nn.GELU(approximate="tanh"), nn.LayerNorm(hidden_size * 4),
+            nn.GELU(approximate="tanh"),
+            # nn.LayerNorm(hidden_size * 4),
             nn.Linear(hidden_size * 4, output_size, bias=True))
 
         self.adaLN_modulation = nn.Sequential(

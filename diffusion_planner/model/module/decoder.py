@@ -97,13 +97,6 @@ class Decoder(nn.Module):
                      )  # (B, token_num) bool
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
-        if self.training:
-            near_cur_future_mask = inputs[
-                'near_cur_future_mask']  # (B, Pnn, 1+T)
-            neighbor_token_mask = near_cur_future_mask.all(
-                dim=-1)  # (B, Pnn) True=무효
-        else:
-            neighbor_token_mask = near_current_mask  # (B, Pnn) True=무효
 
         if self.training:
             near_cur_future_norm_xT = inputs['near_cur_future_norm_xT'].reshape(
@@ -142,7 +135,7 @@ class Decoder(nn.Module):
                 xT,
                 other_model_params={
                     "cross_c": scene_encoding_token,
-                    "ego_fut_global": ego_fut_global,  # ← 반드시 추가
+                    "ego_fut_global": ego_fut_global,
                     "near_current_mask": near_current_mask,
                     "cross_mask": cross_mask,
                 },
@@ -157,7 +150,6 @@ class Decoder(nn.Module):
                         "model_condition": {
                             "cross_c": scene_encoding_token,
                             "ego_fut_global": ego_fut_global,
-                            # ← classifier_guidance에서도 필요
                             "near_current_mask": near_current_mask,
                             "cross_mask": cross_mask,
                         },
