@@ -162,7 +162,7 @@ class Encoder(nn.Module):
         # x, y, cos, sin,
         # type (ego, neighbor, static, lane)
         self.pos_emb = nn.Linear(8, config.hidden_dim)
-        nn.init.normal_(self.encoder.pos_emb.weight, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
 
     def _sample_uniform_prefix_lengths(self, batch_size: int,
                                        max_future_len: int,
@@ -1894,11 +1894,11 @@ class LaneFusionEncoder(nn.Module):
         self._channel = channels_mlp_dim
 
         self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
-        nn.init.normal_(self.encoder.lane_encoder.speed_limit_emb.weight, std=0.02)
+        nn.init.normal_(self.speed_limit_emb.weight, std=0.02)
 
         self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
         self.traffic_emb = nn.Linear(4, channels_mlp_dim)
-        nn.init.normal_(self.encoder.lane_encoder.traffic_emb.weight, std=0.02)
+        nn.init.normal_(self.traffic_emb.weight, std=0.02)
 
         self.channel_pre_project = Mlp(in_features=8,
                                        hidden_features=channels_mlp_dim,
