@@ -1,18 +1,18 @@
-#echo "Start downloading diffusion_planner_training.json"
-#nubescli download \
-#    labs-mlops/ad/research/pnc/hsb/dataset/processed_json/diffusion_planner_training.json \
-#    /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json \
-#    --no-progress
-#echo "Finish downloading diffusion_planner_training.json"
-#
-#echo "Start downloading processed dataset"
-#nubescli dir-download \
-#    labs-mlops/ad/research/pnc/hsb/dataset/processed \
-#    /mnt/nuplan/dataset/processed \
-#    -j $(nproc) \
-#    -w \
-#    --no-progress
-#echo "Finish downloading processed dataset"
+echo "Start downloading diffusion_planner_training.json"
+nubescli download \
+    labs-mlops/ad/research/pnc/hsb/dataset/processed_ego_past_future_json/diffusion_planner_training.json \
+    /mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json \
+    --no-progress
+echo "Finish downloading diffusion_planner_training.json"
+
+echo "Start downloading processed dataset"
+nubescli dir-download \
+    labs-mlops/ad/research/pnc/hsb/dataset/processed_ego_past_future \
+    /mnt/nuplan/dataset/processed_ego_past_future \
+    -j $(nproc) \
+    -w \
+    --no-progress
+echo "Finish downloading processed dataset"
 
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
@@ -23,7 +23,7 @@
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python" # python path (e.g., "/home/xxx/anaconda3/envs/diffusion_planner/bin/python")
 
 # Set training data path
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed/" # preprocess data using data_process.sh
+TRAIN_SET_PATH="/mnt/nuplan/dataset/processed_ego_past_future/" # preprocess data using data_process.sh
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 ###################################
 

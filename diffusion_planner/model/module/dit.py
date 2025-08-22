@@ -97,18 +97,27 @@ class DiTBlock(nn.Module):
                         hidden_features=mlp_hidden_dim,
                         act_layer=approx_gelu,
                         drop=0)
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
     def forward(self, x, cross_c, y, attn_mask, cross_mask):
         # y: (B, D=192)
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
          gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
 
+
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
         msa_out = self.attn(modulated_x,
                             modulated_x,
                             modulated_x,
                             key_padding_mask=attn_mask)[0]  # (B, P, D)
-        msa_out = torch.nan_to_num(msa_out, nan=0.0)  # ← NaN → 0 # (B, P, D)
+        # (선택) 쿼리 전체가 패딩인 배치 행은 0으로
+        dead_q = attn_mask.all(dim=1)  # (B,)
+        if dead_q.any():
+            msa_out = msa_out.clone()
+            msa_out[dead_q] = 0.0
+        msa_out = torch.nan_to_num(msa_out, nan=0.0, posinf=0.0,
+                                   neginf=0.0)  # ← NaN → 0 # (B, P, D)
         x = x + gate_msa.unsqueeze(1) * msa_out  # (B, P, D)
 
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
@@ -118,7 +127,12 @@ class DiTBlock(nn.Module):
                                     cross_c,
                                     cross_c,
                                     key_padding_mask=cross_mask)[0]
-        cross_out = torch.nan_to_num(cross_out, nan=0.0)  # ← NaN → 0
+        dead_kv = cross_mask.all(dim=1)  # (B,)
+        if dead_kv.any():
+            cross_out = cross_out.clone()
+            cross_out[dead_kv] = 0.0
+        cross_out = torch.nan_to_num(cross_out, nan=0.0, posinf=0.0,
+                                     neginf=0.0)  # ← NaN → 0
         x = x + cross_out
         x += self.mlp2(self.norm4(x))
 
@@ -142,6 +156,10 @@ class FinalLayer(nn.Module):
 
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.proj[-1].weight)  # proj의 마지막 Linear
+        nn.init.zeros_(self.proj[-1].bias)
 
     def forward(self, x, y):
         B, P, _ = x.shape

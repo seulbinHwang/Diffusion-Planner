@@ -1840,7 +1840,7 @@ class StaticFusionEncoder(nn.Module):
 
         valid_indices = ~mask_p.reshape(-1)
 
-        if valid_indices.sum() > 0:
+        if valid_indices.sum().item() > 0:
             static_info = static_info.reshape(B * static_objects_num, -1)
             static_info = static_info[valid_indices]
             static_info = self.projection(static_info)
@@ -1984,12 +1984,12 @@ class LaneFusionEncoder(nn.Module):
         speed_limit_embedding = torch.zeros(
             (speed_limit.shape[0], self._channel), device=lane_info.device)
 
-        if has_speed_limit.sum() > 0:
+        if has_speed_limit.sum().item() > 0:
             speed_limit_with_limit = self.speed_limit_emb(
                 speed_limit[has_speed_limit].unsqueeze(-1))
             speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
 
-        if (~has_speed_limit).sum() > 0:
+        if (~has_speed_limit).sum().item() > 0:
             speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
                 (~has_speed_limit).sum().item(), -1)
             speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
@@ -2077,7 +2077,7 @@ class FusionEncoder(nn.Module):
                                               H)  # [B, token_num, H]
 
         # 2) 유효 배치만 선택
-        if is_valid_batch.any():
+        if is_valid_batch.any().item():
             # [on_B, token_num, H]
             on_batch_tokens = encoding_input[is_valid_batch]
             # [on_B, token_num]
