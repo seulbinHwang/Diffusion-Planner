@@ -107,15 +107,14 @@ class DiTBlock(nn.Module):
 
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        msa_out = self.attn(modulated_x,
-                            modulated_x,
-                            modulated_x,
-                            key_padding_mask=attn_mask)[0]  # (B, P, D)
-        # (선택) 쿼리 전체가 패딩인 배치 행은 0으로
-        dead_q = attn_mask.all(dim=1)  # (B,)
-        if dead_q.any():
-            msa_out = msa_out.clone()
-            msa_out[dead_q] = 0.0
+        if attn_mask.all(dim=1).any():
+            msa_out = torch.zeros_like(x)
+        else:
+            msa_out = self.attn(
+                modulated_x, modulated_x, modulated_x,
+                key_padding_mask=attn_mask,
+                need_weights=False  # ← 가중치 미계산
+            )[0]
         msa_out = torch.nan_to_num(msa_out, nan=0.0, posinf=0.0,
                                    neginf=0.0)  # ← NaN → 0 # (B, P, D)
         x = x + gate_msa.unsqueeze(1) * msa_out  # (B, P, D)
@@ -123,14 +122,15 @@ class DiTBlock(nn.Module):
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        cross_out = self.cross_attn(self.norm3(x),
-                                    cross_c,
-                                    cross_c,
-                                    key_padding_mask=cross_mask)[0]
-        dead_kv = cross_mask.all(dim=1)  # (B,)
-        if dead_kv.any():
-            cross_out = cross_out.clone()
-            cross_out[dead_kv] = 0.0
+        q = self.norm3(x)
+        if cross_mask.all(dim=1).any():
+            cross_out = torch.zeros_like(x)
+        else:
+            cross_out = self.cross_attn(
+                q, cross_c, cross_c,
+                key_padding_mask=cross_mask,
+                need_weights=False
+            )[0]
         cross_out = torch.nan_to_num(cross_out, nan=0.0, posinf=0.0,
                                      neginf=0.0)  # ← NaN → 0
         x = x + cross_out
@@ -148,10 +148,10 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size)
         self.proj = nn.Sequential(
-            # nn.LayerNorm(hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
-            # nn.LayerNorm(hidden_size * 4),
+            nn.LayerNorm(hidden_size * 4),
             nn.Linear(hidden_size * 4, output_size, bias=True))
 
         self.adaLN_modulation = nn.Sequential(
