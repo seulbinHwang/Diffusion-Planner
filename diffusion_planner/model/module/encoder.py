@@ -373,9 +373,10 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         # (B, token_num, hidden_dim)
         encoding_input += encoding_pos_result.reshape(B, self.token_num, -1)
         encoder_outputs = {}
-
-        encoder_outputs['encoding'] = self.fusion(
+        encoding_tokens, encoding_mask = self.fusion(
             encoding_input, encoding_mask.reshape(B, self.token_num))
+        encoder_outputs['encoding'] = encoding_tokens # (B, token_num, hidden_dim)
+        encoder_outputs['encoding_mask'] = encoding_mask # (B, token_num)
         encoder_outputs["ego_fut_global"] = ego_fut_global
 
         return encoder_outputs
@@ -2116,4 +2117,6 @@ class FusionEncoder(nn.Module):
             out_tokens[is_valid_batch] = fused_wo_cls  # [B, token_num, H]
 
         # 전부 패딩 배치는 out_tokens의 0 유지
-        return out_tokens  # [B, token_num, H]
+        # out_tokens [B, token_num, H]
+        # encoding_mask: [B, token_num]  # True=패딩
+        return out_tokens, encoding_mask

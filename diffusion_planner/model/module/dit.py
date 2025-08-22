@@ -104,17 +104,22 @@ class DiTBlock(nn.Module):
          gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulated_x, modulated_x, modulated_x,
-            key_padding_mask=attn_mask)[0]
+        msa_out = self.attn(modulated_x,
+                            modulated_x,
+                            modulated_x,
+                            key_padding_mask=attn_mask)[0]  # (B, P, D)
+        msa_out = torch.nan_to_num(msa_out, nan=0.0)  # ← NaN → 0 # (B, P, D)
+        x = x + gate_msa.unsqueeze(1) * msa_out  # (B, P, D)
 
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        x += self.cross_attn(self.norm3(x),
-                            cross_c,
-                            cross_c,
-                            key_padding_mask=cross_mask)[0]
+        cross_out = self.cross_attn(self.norm3(x),
+                                    cross_c,
+                                    cross_c,
+                                    key_padding_mask=cross_mask)[0]
+        cross_out = torch.nan_to_num(cross_out, nan=0.0)  # ← NaN → 0
+        x = x + cross_out
         x += self.mlp2(self.norm4(x))
 
         return x

@@ -93,8 +93,8 @@ class Decoder(nn.Module):
         # Extract context encoding
         scene_encoding_token = encoder_outputs[
             'encoding']  #  (B, token_num, hidden_dim)
-        cross_mask = (scene_encoding_token.abs().sum(dim=-1) == 0
-                     )  # (B, token_num) bool
+        scene_encoding_token_mask = encoder_outputs[
+            'encoding_mask']  # (B, token_num) bool
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
 
@@ -111,7 +111,7 @@ class Decoder(nn.Module):
                         scene_encoding_token,  # (B, token_num, hidden_dim)
                         ego_fut_global,  # (B, hidden_dim)
                         near_current_mask,  # (B, Pnn),
-                        cross_mask  # (B, token_num) bool
+                        scene_encoding_token_mask  # (B, token_num) bool
                     ).reshape(B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) , 4)
             }
         else:
@@ -137,7 +137,7 @@ class Decoder(nn.Module):
                     "cross_c": scene_encoding_token,
                     "ego_fut_global": ego_fut_global,
                     "near_current_mask": near_current_mask,
-                    "cross_mask": cross_mask,
+                    "cross_mask": scene_encoding_token_mask,
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": initial_state_constraint,
@@ -151,7 +151,7 @@ class Decoder(nn.Module):
                             "cross_c": scene_encoding_token,
                             "ego_fut_global": ego_fut_global,
                             "near_current_mask": near_current_mask,
-                            "cross_mask": cross_mask,
+                            "cross_mask": scene_encoding_token_mask,
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,

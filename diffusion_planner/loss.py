@@ -144,14 +144,10 @@ def diffusion_loss_func(
         # dpm_loss: (B, Pnn, T)
         dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
     # near_future_valid: [B, Pnn, T]
-    masked_prediction_loss = dpm_loss[near_future_valid]
-
-    if masked_prediction_loss.numel() > 0:
-        loss["neighbor_prediction_loss"] = masked_prediction_loss.mean(
-        )  # float
-    else:
-        loss["neighbor_prediction_loss"] = torch.tensor(
-            0.0, device=masked_prediction_loss.device)
+    valid = near_future_valid.float()
+    denom = valid.sum().clamp(min=1) # denom: shape [B, Pnn]
+    loss_val = (dpm_loss * valid).sum() / denom  # 항상 requires_grad=True
+    loss["neighbor_prediction_loss"] = loss_val
 
     # compute and merge xy/yaw losses via helper
     if model_type == "x_start":
