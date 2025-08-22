@@ -93,7 +93,17 @@ class Decoder(nn.Module):
         # Extract context encoding
         scene_encoding_token = encoder_outputs[
             'encoding']  #  (B, token_num, hidden_dim)
+        cross_mask = (scene_encoding_token.abs().sum(dim=-1) == 0
+                     )  # (B, token_num) bool
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
+        assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
+        if self.training:
+            near_cur_future_mask = inputs[
+                'near_cur_future_mask']  # (B, Pnn, 1+T)
+            neighbor_token_mask = near_cur_future_mask.all(
+                dim=-1)  # (B, Pnn) True=무효
+        else:
+            neighbor_token_mask = near_current_mask  # (B, Pnn) True=무효
 
         if self.training:
             near_cur_future_norm_xT = inputs['near_cur_future_norm_xT'].reshape(
@@ -107,7 +117,8 @@ class Decoder(nn.Module):
                         diffusion_time,  # (B)
                         scene_encoding_token,  # (B, token_num, hidden_dim)
                         ego_fut_global,  # (B, hidden_dim)
-                        near_current_mask  # (B, Pnn)
+                        near_current_mask,  # (B, Pnn),
+                        cross_mask  # (B, token_num) bool
                     ).reshape(B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) , 4)
             }
         else:
@@ -131,7 +142,9 @@ class Decoder(nn.Module):
                 xT,
                 other_model_params={
                     "cross_c": scene_encoding_token,
-                    "near_current_mask": near_current_mask
+                    "ego_fut_global": ego_fut_global,  # ← 반드시 추가
+                    "near_current_mask": near_current_mask,
+                    "cross_mask": cross_mask,
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": initial_state_constraint,
@@ -143,7 +156,10 @@ class Decoder(nn.Module):
                         "model": self.dit,
                         "model_condition": {
                             "cross_c": scene_encoding_token,
-                            "near_current_mask": near_current_mask
+                            "ego_fut_global": ego_fut_global,
+                            # ← classifier_guidance에서도 필요
+                            "near_current_mask": near_current_mask,
+                            "cross_mask": cross_mask,
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
@@ -282,24 +298,20 @@ class DiT(nn.Module):
         return self._model_type
 
     def forward(self, near_cur_future_norm_xT, diffusion_time, cross_c,
-                ego_fut_global, near_current_mask):
+                ego_fut_global, near_current_mask, cross_mask):
         """
-        # TODO: 여기서부터
-                        near_cur_future_norm_xT,  # ( B, Pnn, (1 + T) * 4 )
-                        diffusion_time,  # (B)
-                        scene_encoding_token,  # (B, token_num, hidden_dim)
-                        ego_fut_global,  # (B, hidden_dim)
-                        near_current_mask  # (B, Pnn)
         Forward pass of DiT.
         near_cur_future_norm_xT:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
         diffusion_time:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
-        cross_c: [B, Pnn, D] = [B, N = token_num, D = 192]
+        cross_c: [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
         near_current_mask: [B, Pnn]
+        cross_mask: (B, token_num)
         """
         B, Pnn, _ = near_cur_future_norm_xT.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
         x = self.preproj(near_cur_future_norm_xT)
+        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
 
         # diffusion_time: [B,]
         # t_embedding: (B, D=192)
@@ -315,11 +327,14 @@ class DiT(nn.Module):
             y: (B, D=192)
             near_current_mask: (B, Pnn)
             """
-            x = block(x, cross_c, y, near_current_mask)
+            x = block(x, cross_c, y, near_current_mask, cross_mask)
+            x = x.masked_fill(near_current_mask.unsqueeze(-1),
+                              0.0)  # ← 블록 출력도 0 클램프
         # output: x: (B, Pnn, D=192)
         # y: (B, D=192)
         x = self.final_layer(x, y)
         # x.shape: (B, Pnn, (1 + T) * 4)
+        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 최종 출력도 0
 
         if self._model_type == "score":
             return x / (self.marginal_prob_std(diffusion_time)[:, None, None] +

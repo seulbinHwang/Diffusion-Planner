@@ -100,7 +100,7 @@ def train_epoch(data_loader,
                 dim=-1,
             )
             neighbors_future[mask] = 0.
-            inputs = args.observation_normalizer(inputs)
+            norm_inputs = args.observation_normalizer(inputs)
 
             # call the mdoel
             optimizer.zero_grad()
@@ -111,7 +111,7 @@ def train_epoch(data_loader,
             mask.shape: [8, 10, 80]
             """
             loss, _ = diffusion_loss_func(
-                model, inputs,
+                model, norm_inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
                 (neighbors_future, mask), args.state_normalizer,
                 loss, args.diffusion_model_type)

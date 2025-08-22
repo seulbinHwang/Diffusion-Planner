@@ -98,7 +98,7 @@ class DiTBlock(nn.Module):
                         act_layer=approx_gelu,
                         drop=0)
 
-    def forward(self, x, cross_c, y, attn_mask):
+    def forward(self, x, cross_c, y, attn_mask, cross_mask):
         # y: (B, D=192)
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
          gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
@@ -111,7 +111,12 @@ class DiTBlock(nn.Module):
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
-        x = self.cross_attn(self.norm3(x), cross_c, cross_c)[0]
+        # TODO: residual?
+        x = self.cross_attn(self.norm3(x),
+                            cross_c,
+                            cross_c,
+                            key_padding_mask=cross_mask)[0]
+        # TODO: residual?
         x = self.mlp2(self.norm4(x))
 
         return x

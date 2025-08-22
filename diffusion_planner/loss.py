@@ -6,16 +6,16 @@ from diffusion_planner.utils.normalizer import StateNormalizer
 
 
 def _compute_xy_yaw_losses(
-        score: torch.Tensor, near_future_norm_gt: torch.Tensor,
+        score_denorm: torch.Tensor, near_future_gt: torch.Tensor,
         near_future_valid: torch.Tensor) -> Dict[str, torch.Tensor]:
     """
     Compute separate XY and Yaw RMSE losses for ego and neighbors.
 
     Args:
-        score (Tensor(B, Pnn, T, 4)):
+        score_denorm (Tensor(B, Pnn, T, 4)):
             Model output trajectories, where last dim is [dx, dy, cos(yaw), sin(yaw)].
-        near_future_norm_gt (Tensor[B, Pnn, T, 4]):
-            Ground truth trajectories in same format as score.
+        near_future_gt (Tensor[B, Pnn, T, 4]):
+            Ground truth trajectories in same format as score_denorm.
         near_future_valid (BoolTensor[B, Pnn, T]):
             Mask for valid neighbor entries (excludes ego at index 0).
     Returns:
@@ -23,9 +23,9 @@ def _compute_xy_yaw_losses(
         - 'neighbor_prediction_loss_xy' (float): mean Euclidean distance over neighbor coords.
         - 'neighbor_prediction_loss_yaw' (float): mean abs angular error (rad) for neighbors.
     """
-    # score[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
-    pred_xy = score[..., :2]  # [B, Pnn, T, 2]
-    gt_xy = near_future_norm_gt[..., :2]
+    # score_denorm[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
+    pred_xy = score_denorm[..., :2]  # [B, Pnn, T, 2]
+    gt_xy = near_future_gt[..., :2]
     # Euclidean distance: sqrt((dx)^2 + (dy)^2)
     dist_ = torch.sqrt(((pred_xy - gt_xy).pow(2).sum(-1)) + 1e-6)  # [B, Pnn, T]
     # neighbors: exclude ego index 0
@@ -34,10 +34,10 @@ def _compute_xy_yaw_losses(
     ) > 0 else torch.tensor(0.0, device=dist_.device)
 
     # Compute yaw angles from cos/sin
-    pred_cos = score[..., 2]  # [B, P, T]
-    pred_sin = score[..., 3]
-    gt_cos = near_future_norm_gt[..., 2]
-    gt_sin = near_future_norm_gt[..., 3]
+    pred_cos = score_denorm[..., 2]  # [B, P, T]
+    pred_sin = score_denorm[..., 3]
+    gt_cos = near_future_gt[..., 2]
+    gt_sin = near_future_gt[..., 3]
     yaw_pred = torch.atan2(pred_sin, pred_cos)  # [B, P, T]
     yaw_gt = torch.atan2(gt_sin, gt_cos)
     # Angular error wrapped to [-pi, pi]
@@ -56,16 +56,16 @@ def _compute_xy_yaw_losses(
 
 def diffusion_loss_func(
     model: nn.Module,
-    inputs: Dict[str, torch.Tensor],
-    marginal_prob: Callable[[torch.Tensor], torch.Tensor],
+    norm_inputs: Dict[str, torch.Tensor],
+    marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
+                                                                torch.Tensor]],
     futures: Tuple[torch.Tensor, torch.Tensor],
-    norm: StateNormalizer,
+    state_normalizer: StateNormalizer,
     loss: Dict[str, Any],
     model_type: str,
     eps: float = 1e-3,
 ):
     """
-    ego_future.shape: [8, 80, 4] # [B, T, 4]
     near_future_gt.shape: [8, Pnn, 80, 4] # [B, Pnn, T, 4]
     near_future_mask.shape: [8, Pnn, 80] # [B, Pnn, T]
     """
@@ -77,16 +77,18 @@ def diffusion_loss_func(
     B, Pnn, T, _ = near_future_gt.shape
     # ego_current: [B, 4]
     # neighbors_current: [B, Pnn, 4]
-    near_current_xyyaw = inputs["neighbor_agents_past"][:, :Pnn, -1, :4]
+    near_current_xyyaw_norm = norm_inputs["neighbor_agents_past"][:, :Pnn,
+                                                                  -1, :4]
     # near_current_mask: [B, Pnn]
-    near_current_mask = torch.sum(torch.ne(near_current_xyyaw[..., :4], 0),
+    near_current_mask = torch.sum(torch.ne(near_current_xyyaw_norm[..., :4], 0),
                                   dim=-1) == 0  # [B, Pnn]
     # near_future_mask: (B, Pnn, T)
     # near_cur_future_mask: [B, Pnn, 1+T]
     near_cur_future_mask = torch.concat(
         (near_current_mask.unsqueeze(-1), near_future_mask), dim=-1)
+    assert near_cur_future_mask.shape == (B, Pnn, 1 + T)
     # near_future_gt: [B, Pnn, T, 4]
-    # near_current_xyyaw: [B, Pnn, 4]
+    # near_current_xyyaw_norm: [B, Pnn, 4]
     # batch_diffusion_time: [B,] diffusion time uniformly sampled in [eps, 1]
     # random_noise: [B, Pnn + 1, T, 4] noise sampled from standard normal
     batch_diffusion_time = torch.rand(
@@ -95,9 +97,11 @@ def diffusion_loss_func(
         near_future_gt, device=near_future_gt.device)  # [B, Pnn, T, 4]
 
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
-    near_cur_future_norm_gt = torch.cat(
-        [near_current_xyyaw[:, :, None, :],
-         norm(near_future_gt)], dim=2)  # [B, Pnn, 1 + T, 4]
+    near_cur_future_norm_gt = torch.cat([
+        near_current_xyyaw_norm[:, :, None, :],
+        state_normalizer(near_future_gt)
+    ],
+                                        dim=2)  # [B, Pnn, 1 + T, 4]
     # near_cur_future_mask: [B, Pnn, 1+T]
     near_cur_future_norm_gt[near_cur_future_mask] = 0.0
     near_future_norm_gt = near_cur_future_norm_gt[:, :, 1:, :]  # [B, Pnn, T, 4]
@@ -114,24 +118,29 @@ def diffusion_loss_func(
     std = std.view(-1, *([1] * (len(near_future_norm_gt.shape) - 1)))
     #  near_future_norm_xT.shape: torch.Size([B, Pnn, T, 4])
     near_future_norm_xT = mean + std * random_noise
+    near_future_norm_xT[near_future_mask] = 0.0
     # near_cur_future_norm_xT.shape after concat: torch.Size([B, Pnn, 1+T, 4])
     near_cur_future_norm_xT = torch.cat(
         [near_cur_future_norm_gt[:, :, :1, :], near_future_norm_xT], dim=2)
+    assert near_cur_future_norm_xT.shape == (B, Pnn, 1 + T, 4)
 
     merged_inputs = {
-        **inputs,
-        "near_cur_future_norm_xT": near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
+        **norm_inputs,
+        "near_cur_future_norm_xT":
+            near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
         "diffusion_time": batch_diffusion_time,  # [B,]
     }
 
     _, decoder_output = model(merged_inputs)
+
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
     score = decoder_output["score"][:, :, 1:, :]  # (B, Pnn, T, 4)
+    assert score.shape == (B, Pnn, T, 4)
 
     if model_type == "score":
         dpm_loss = torch.sum((score * std + random_noise)**2, dim=-1)
     elif model_type == "x_start":
-        # near_future_norm_gt: [B, Pnn, T, 4]
+        # near_future_gt: [B, Pnn, T, 4]
         # dpm_loss: (B, Pnn, T)
         dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
     # near_future_valid: [B, Pnn, T]
@@ -145,12 +154,16 @@ def diffusion_loss_func(
             0.0, device=masked_prediction_loss.device)
 
     # compute and merge xy/yaw losses via helper
-    xy_yaw_losses = _compute_xy_yaw_losses(score, near_future_norm_gt,
-                                           near_future_valid)
-    loss.update(xy_yaw_losses)
+    if model_type == "x_start":
+        score_denorm = state_normalizer.inverse(score)  # [B,P,T,4]
+        near_future_gt = state_normalizer.inverse(near_future_norm_gt)
+        with torch.no_grad():
+            xy_yaw_losses = _compute_xy_yaw_losses(score_denorm, near_future_gt,
+                                                   near_future_valid)
+        loss.update(xy_yaw_losses)
 
-    assert not torch.isnan(
-        dpm_loss).sum(), f"loss cannot be nan, random_noise={random_noise}"
+    assert torch.isfinite(dpm_loss).all().item(
+    ), f"loss cannot be nan, random_noise={random_noise}"
     """
     loss
         "neighbor_prediction_loss" (float): mean RMSE over neighbor coords.
