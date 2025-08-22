@@ -97,6 +97,9 @@ class DiTBlock(nn.Module):
                         hidden_features=mlp_hidden_dim,
                         act_layer=approx_gelu,
                         drop=0)
+        self.gate_cross = nn.Parameter(torch.tensor(0.0))
+        self.gate_mlp2 = nn.Parameter(torch.tensor(0.0))
+
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
@@ -133,8 +136,8 @@ class DiTBlock(nn.Module):
             )[0]
         cross_out = torch.nan_to_num(cross_out, nan=0.0, posinf=0.0,
                                      neginf=0.0)  # ← NaN → 0
-        x = x + cross_out
-        x += self.mlp2(self.norm4(x))
+        x = x + self.gate_cross * cross_out
+        x += self.gate_mlp2  * self.mlp2(self.norm4(x))
 
         return x
 
@@ -148,10 +151,10 @@ class FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size)
         self.proj = nn.Sequential(
-            nn.LayerNorm(hidden_size),
+            # nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size * 4, bias=True),
             nn.GELU(approximate="tanh"),
-            nn.LayerNorm(hidden_size * 4),
+            # nn.LayerNorm(hidden_size * 4),
             nn.Linear(hidden_size * 4, output_size, bias=True))
 
         self.adaLN_modulation = nn.Sequential(
@@ -163,7 +166,6 @@ class FinalLayer(nn.Module):
 
     def forward(self, x, y):
         B, P, _ = x.shape
-
         shift, scale = self.adaLN_modulation(y).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.proj(x)
