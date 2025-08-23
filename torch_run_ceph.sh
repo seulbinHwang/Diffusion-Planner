@@ -9,7 +9,7 @@ TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 ###################################
 #
-## ---------------- Preflight clean-up ----------------
+# ---------------- Preflight clean-up ----------------
 #echo "[Preflight] Cleaning previous artifacts..."
 #
 ## 1) 학습 리스트 JSON 삭제
