@@ -7,10 +7,8 @@ from diffusion_planner.utils.train_utils import openjson
 class StateNormalizer:
 
     def __init__(self, mean, std):
-        self.mean = torch.as_tensor(mean)
-        self.std = torch.as_tensor(std)
-        print("self.mean.shape:", self.mean.shape)
-        print("self.std.shape:", self.std.shape)
+        self.mean = torch.as_tensor(mean) # (10, 1, 4)
+        self.std = torch.as_tensor(std) # (10, 1, 4)
 
     @classmethod
     def from_json(cls, args):
@@ -20,7 +18,8 @@ class StateNormalizer:
         return cls(mean, std)
 
     def __call__(self, data):
-        print("data.shape:", data.shape)
+        # data: (256, 10, 80, 4)
+        # mean, std: (10, 1, 4)
         return (data - self.mean.to(data.device)) / self.std.to(data.device)
 
     def inverse(self, data):

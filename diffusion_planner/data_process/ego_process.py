@@ -12,18 +12,11 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 
 """
-Traceback (most recent call last):
-  File "/mnt/nuplan/projects/Diffusion-Planner/train_predictor.py", line 686, in <module>
-    model_training(args)
-  File "/mnt/nuplan/projects/Diffusion-Planner/train_predictor.py", line 451, in model_training
-    train_loss, train_total_loss = train_epoch(train_loader,
-  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/train_epoch.py", line 113, in train_epoch
-    loss, _ = diffusion_loss_func(
-  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/loss.py", line 102, in diffusion_loss_func
-    state_normalizer(near_future_gt)
-  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/utils/normalizer.py", line 23, in __call__
-    return (data - self.mean.to(data.device)) / self.std.to(data.device)
-RuntimeError: The size of tensor a (10) must match the size of tensor b (11) at non-singleton dimension 1
+  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/model/module/encoder.py", line 1701, in forward
+    ego_fut_global = self._get_ego_fut_global(
+  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/model/module/encoder.py", line 1780, in _get_ego_fut_global
+    weights = (weights * row_valid).to(ego_fut_chunk.dtype)
+RuntimeError: The size of tensor a (4) must match the size of tensor b (256) at non-singleton dimension 1
 """
 
 def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,

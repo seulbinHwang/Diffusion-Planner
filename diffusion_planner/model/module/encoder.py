@@ -1777,6 +1777,8 @@ class AgentFusionEncoder(nn.Module):
         weights = F.softmax(logits, dim=1)  # (B, M, 1), fp32
         row_valid = (~ego_fut_all_chunk_off).to(weights.dtype).unsqueeze(
             -1)  # (B, 1, 1)
+        print("weights:", weights.shape)
+        print("row_valid:", row_valid.shape)
         weights = (weights * row_valid).to(ego_fut_chunk.dtype)
 
         ego_fut_global_attn = (weights * ego_fut_chunk).sum(
