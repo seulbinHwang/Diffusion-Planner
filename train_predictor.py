@@ -1,6 +1,8 @@
 import os
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+# DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
+os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
 import argparse
 import shutil
@@ -32,6 +34,12 @@ def boolean(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def print_parameter_index_mapping(model):
+    print("Parameter index mapping:")
+    for idx, (name, _) in enumerate(model.named_parameters()):
+        print(f"{idx}: {name}")
 
 
 def get_args():
@@ -397,9 +405,10 @@ def model_training(args):
         )
 
     if global_rank == 0:
+        model_to_print = ddp.get_model(diffusion_planner, args.ddp)
         print("Model Params: {}".format(
-            sum(p.numel() for p in ddp.get_model(diffusion_planner,
-                                                 args.ddp).parameters())))
+            sum(p.numel() for p in model_to_print.parameters())))
+        print_parameter_index_mapping(model_to_print)
 
     # optimizer
     params = [{
