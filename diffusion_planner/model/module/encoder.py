@@ -1768,9 +1768,7 @@ class AgentFusionEncoder(nn.Module):
         logits = self.ego_fut_pool_q(ego_fut_chunk).float()
         logits = logits.masked_fill(ego_fut_off_chunk_mask_full.unsqueeze(-1),
                                     float('-inf'))
-        print("ego_fut_off_chunk_mask_full.shape:", ego_fut_off_chunk_mask_full.shape)
         ego_fut_all_chunk_off = ego_fut_off_chunk_mask_full.all(dim=1)  # (B,)
-        print("ego_fut_all_chunk_off.shape:", ego_fut_all_chunk_off.shape)
         if ego_fut_all_chunk_off.any().item():
             logits = logits.clone()  # 선택(메모리 여유시): in-place 걱정 줄이기
             logits[ego_fut_all_chunk_off] = 0.0  # softmax NaN 방지
