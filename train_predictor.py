@@ -235,6 +235,7 @@ def get_args():
 
     args = parser.parse_args()
 
+
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
 

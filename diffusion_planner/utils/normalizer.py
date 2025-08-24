@@ -9,17 +9,18 @@ class StateNormalizer:
     def __init__(self, mean, std):
         self.mean = torch.as_tensor(mean)
         self.std = torch.as_tensor(std)
+        print("self.mean.shape:", self.mean.shape)
+        print("self.std.shape:", self.std.shape)
 
     @classmethod
     def from_json(cls, args):
         data = openjson(args.normalization_file_path)
-        mean = [[data["ego"]["mean"]]
-               ] + [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
-        std = [[data["ego"]["std"]]
-              ] + [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
+        mean = [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
+        std =  [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
         return cls(mean, std)
 
     def __call__(self, data):
+        print("data.shape:", data.shape)
         return (data - self.mean.to(data.device)) / self.std.to(data.device)
 
     def inverse(self, data):
