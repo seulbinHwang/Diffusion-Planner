@@ -104,20 +104,26 @@ class DiTBlock(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
     def forward(self, x, cross_c, y, attn_mask, cross_mask):
+        """
+        Input shapes:
+            x: (B, Pnn, D=192)
+            cross_c: (B, N=token_num, D=192)
+            y: (B, D=192)
+            attn_mask: near_current_mask: (B, Pnn)
+            cross_mask: (B, token_num)
+        """
         # y: (B, D=192)
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
          gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
 
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        if attn_mask.all(dim=1).any():
-            msa_out = torch.zeros_like(x)
-        else:
-            msa_out = self.attn(
-                modulated_x, modulated_x, modulated_x,
-                key_padding_mask=attn_mask,
-                need_weights=False  # ← 가중치 미계산
-            )[0]
+        msa_out = self.attn(
+            modulated_x, modulated_x, modulated_x,
+            key_padding_mask=attn_mask,
+            need_weights=False  # ← 가중치 미계산
+        )[0]
+        msa_out[attn_mask.all(dim=1)] = 0
         msa_out = torch.nan_to_num(msa_out, nan=0.0, posinf=0.0,
                                    neginf=0.0)  # ← NaN → 0 # (B, P, D)
         x = x + gate_msa.unsqueeze(1) * msa_out  # (B, P, D)

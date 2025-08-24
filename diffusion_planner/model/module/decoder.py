@@ -312,11 +312,13 @@ class DiT(nn.Module):
 
         for block in self.blocks:
             """
+            
             Input shapes:
             x: (B, Pnn, D=192)
             cross_c: (B, N=token_num, D=192)
             y: (B, D=192)
             near_current_mask: (B, Pnn)
+            cross_mask: (B, token_num)
             """
             x = block(x, cross_c, y, near_current_mask, cross_mask)
             x = x.masked_fill(near_current_mask.unsqueeze(-1),
