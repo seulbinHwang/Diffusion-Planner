@@ -242,6 +242,7 @@ class DataProcessor(object):
                 "token": token,
                 "ego_agent_past": ego_agent_past,
                 "ego_current_state": ego_current_state,
+                # TODO: ego_agent_future 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
                 "ego_agent_future": ego_agent_future, # rear_axle x,y
                 "ego_agent_future_11_dim": ego_agent_future_11_dim, # center x,y
                 "neighbor_agents_past": neighbor_agents_past,
