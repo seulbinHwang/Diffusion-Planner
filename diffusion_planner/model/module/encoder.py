@@ -372,7 +372,8 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
             ~encoding_mask] = encoding_pos  # Fill in valid parts
 
         # (B, token_num, hidden_dim)
-        encoding_input += encoding_pos_result.reshape(B, self.token_num, -1)
+        encoding_input = encoding_input + encoding_pos_result.reshape(
+            B, self.token_num, -1)
         encoder_outputs = {}
         encoding_tokens, encoding_mask = self.fusion(
             encoding_input, encoding_mask.reshape(B, self.token_num))
@@ -1663,7 +1664,8 @@ class AgentFusionEncoder(nn.Module):
             self.future_chunk_num)
 
         # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
-        on_all_on_chunk += self.type_scale * agents_ego_fut_type_emb
+        on_all_on_chunk = on_all_on_chunk + (
+            self.type_scale * agents_ego_fut_type_emb)
         # on_all_on_chunk: (on_all_on_chunk_num, hidden_dim)
         on_all_on_chunk = self.emb_project(self.norm(on_all_on_chunk))
         ########################
