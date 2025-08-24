@@ -148,6 +148,8 @@ def diffusion_loss_func(
     # std.shape: torch.Size([B, 1, 1, 1])
     """
     mean, std = marginal_prob(near_future_norm_gt, batch_diffusion_time)
+    mean = _require_finite("marginal_prob mean", mean)
+    std = _require_finite("marginal_prob std", std)
     # std.shape after view: torch.Size([B, 1, 1, 1])
 
     std = std.view(-1, *([1] * (len(near_future_norm_gt.shape) - 1)))
@@ -170,6 +172,7 @@ def diffusion_loss_func(
 
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
     score = decoder_output["score"][:, :, 1:, :]  # (B, Pnn, T, 4)
+    score = _require_finite("decoder_output['score']", score)
     assert score.shape == (B, Pnn, T, 4)
 
     if model_type == "score":
