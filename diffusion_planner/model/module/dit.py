@@ -111,6 +111,11 @@ class DiTBlock(nn.Module):
             y: (B, D=192)
             attn_mask: near_current_mask: (B, Pnn)
             cross_mask: (B, token_num)
+
+        Note:
+            softmax 연산은 입력이 모두 마스킹된 경우 NaN을 발생시킬 수 있다.
+            이를 방지하기 위해 완전히 마스킹된 배치는 어텐션을 건너뛰고
+            출력 텐서를 0으로 초기화한다.
         """
         # y: (B, D=192)
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
@@ -118,30 +123,38 @@ class DiTBlock(nn.Module):
 
 
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        msa_out = self.attn(
-            modulated_x, modulated_x, modulated_x,
-            key_padding_mask=attn_mask,
-            need_weights=False  # ← 가중치 미계산
-        )[0]
-        msa_out[attn_mask.all(dim=1)] = 0
+        # 모든 토큰이 마스킹된 배치는 NaN을 방지하기 위해 어텐션을 생략한다
+        msa_out = torch.zeros_like(x)
+        valid_mask = ~attn_mask.all(dim=1)
+        if valid_mask.any():
+            msa_out[valid_mask] = self.attn(
+                modulated_x[valid_mask],
+                modulated_x[valid_mask],
+                modulated_x[valid_mask],
+                key_padding_mask=attn_mask[valid_mask],
+                need_weights=False,
+            )[0]
         msa_out = torch.nan_to_num(msa_out, nan=0.0, posinf=0.0,
-                                   neginf=0.0)  # ← NaN → 0 # (B, P, D)
+                                   neginf=0.0)  # (B, P, D)
         x = x + gate_msa.unsqueeze(1) * msa_out  # (B, P, D)
 
         modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
 
         q = self.norm3(x)
-        if cross_mask.all(dim=1).any():
-            cross_out = torch.zeros_like(x)
-        else:
-            cross_out = self.cross_attn(
-                q, cross_c, cross_c,
-                key_padding_mask=cross_mask,
-                need_weights=False
+        cross_out = torch.zeros_like(x)
+        valid_cross = ~cross_mask.all(dim=1)
+        if valid_cross.any():
+            cross_out[valid_cross] = self.cross_attn(
+                q[valid_cross],
+                cross_c[valid_cross],
+                cross_c[valid_cross],
+                key_padding_mask=cross_mask[valid_cross],
+                need_weights=False,
             )[0]
+        # 교차 어텐션에서도 완전히 마스크된 배치는 0으로 채워 NaN을 방지한다
         cross_out = torch.nan_to_num(cross_out, nan=0.0, posinf=0.0,
-                                     neginf=0.0)  # ← NaN → 0
+                                     neginf=0.0)
         x = x + self.gate_cross * cross_out
         x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
 
