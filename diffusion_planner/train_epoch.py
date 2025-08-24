@@ -74,6 +74,7 @@ def train_epoch(data_loader,
             if isinstance(aug, NPCStatePerturbation):
                 inputs, neighbors_future = aug(inputs, neighbors_future_all,
                                                args)
+            print("ego_future.shape:", ego_future.shape)
             # heading to cos sin
             ego_future = torch.cat(
                 [
@@ -143,3 +144,4 @@ def train_epoch(data_loader,
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
     return epoch_mean_loss, epoch_mean_loss['loss']
+

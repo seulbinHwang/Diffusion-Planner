@@ -11,6 +11,14 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 
+"""
+  File "/mnt/nuplan/projects/Diffusion-Planner/train_predictor.py", line 451, in model_training
+    train_loss, train_total_loss = train_epoch(train_loader,
+  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/train_epoch.py", line 82, in train_epoch
+    [ego_future[..., 2].cos(), ego_future[..., 2].sin()],
+IndexError: index 2 is out of bounds for dimension 1 with size 0
+"""
+
 def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
                                      past_time_horizon):
 
