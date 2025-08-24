@@ -62,7 +62,8 @@ class TensorBoardLogger():
                                   name=run_name,
                                   notes=notes,
                                   resume='allow',
-                                  id=wandb_resume_id)
+                                  id=wandb_resume_id,
+                                  sync_tensorboard=True)  # TensorBoard 로그를 W&B와 자동 동기화
             self.id = self.run.id
             wandb.config.update(args, allow_val_change=allow_val_change)
 
@@ -77,6 +78,8 @@ class TensorBoardLogger():
         if self.writer is not None:
             for key, value in metrics.items():
                 self.writer.add_scalar(key, value, step)
+            if wandb.run:  # W&B 대시보드에서도 동일한 메트릭을 보기 위해 추가
+                wandb.log(metrics, step=step)
 
     def finish(self):
         if self.writer is not None:
