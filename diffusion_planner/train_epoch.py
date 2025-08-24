@@ -74,17 +74,16 @@ def train_epoch(data_loader,
             if isinstance(aug, NPCStatePerturbation):
                 inputs, neighbors_future = aug(inputs, neighbors_future_all,
                                                args)
-            print("ego_future.shape:", ego_future.shape)
-            # heading to cos sin
-            ego_future = torch.cat(
-                [
-                    ego_future[..., :2],
-                    torch.stack(
-                        [ego_future[..., 2].cos(), ego_future[..., 2].sin()],
-                        dim=-1),
-                ],
-                dim=-1,
-            )
+            # # heading to cos sin
+            # ego_future = torch.cat(
+            #     [
+            #         ego_future[..., :2],
+            #         torch.stack(
+            #             [ego_future[..., 2].cos(), ego_future[..., 2].sin()],
+            #             dim=-1),
+            #     ],
+            #     dim=-1,
+            # )
 
             mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
                              dim=-1) == 0
