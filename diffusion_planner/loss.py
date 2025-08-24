@@ -1,8 +1,30 @@
 from typing import Any, Callable, Dict, List, Tuple
+import logging
+
 import torch
 import torch.nn as nn
 
 from diffusion_planner.utils.normalizer import StateNormalizer
+
+
+def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Ensure ``tensor`` has no NaN or Inf values.
+
+    Args:
+        name: Name of the tensor for logging.
+        tensor: Tensor to validate.
+
+    Returns:
+        The original tensor if it contains only finite values.
+
+    Raises:
+        ValueError: If NaN or Inf values are detected in the tensor.
+    """
+    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+        msg = f"{name} contains NaN or Inf values"
+        logging.error(msg)
+        raise ValueError(msg)
+    return tensor
 
 
 def _compute_xy_yaw_losses(
@@ -70,6 +92,16 @@ def diffusion_loss_func(
     near_future_mask.shape: [8, Pnn, 80] # [B, Pnn, T]
     """
     near_future_gt, near_future_mask = futures
+    near_future_gt = _require_finite("near_future_gt", near_future_gt)
+
+    checked_norm_inputs: Dict[str, torch.Tensor] = {}
+    for k, v in norm_inputs.items():
+        if isinstance(v, torch.Tensor):
+            checked_norm_inputs[k] = _require_finite(f"norm_inputs['{k}']", v)
+        else:
+            checked_norm_inputs[k] = v
+    norm_inputs = checked_norm_inputs
+
     # ego_future: [B. T, 4]
     # near_future_gt: [B, Pnn, T]
     near_future_valid = ~near_future_mask
