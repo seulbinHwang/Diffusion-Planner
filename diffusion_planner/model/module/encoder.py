@@ -1778,11 +1778,9 @@ class AgentFusionEncoder(nn.Module):
         # 4) softmax → 행 게이팅(곱)으로 all-off를 0으로
         weights = F.softmax(logits, dim=1)  # (B, future_chunk_num, 1), fp32
         row_valid = (~ego_fut_all_chunk_off).to(weights.dtype).unsqueeze(
-            -1)  # (B, 1, 1)
-        print("weights:", weights.shape)
-        print("row_valid:", row_valid.shape)
-        weights = (weights * row_valid).to(ego_fut_chunk.dtype)
-
+            -1).unsqueeze(-1)  # (B, 1, 1)
+        weights = (weights * row_valid).to(ego_fut_chunk.dtype) # (B, future_chunk_num, 1)
+        # ego_fut_chunk: (B, future_chunk_num, hidden_dim)
         ego_fut_global_attn = (weights * ego_fut_chunk).sum(
             dim=1)  # (B, hidden_dim)
 
