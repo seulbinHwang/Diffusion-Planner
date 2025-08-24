@@ -9,6 +9,7 @@ from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
 from diffusion_planner.model.module.mixer import MixerBlock
 from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, FinalLayer
+from diffusion_planner.loss import _require_finite
 
 
 class Decoder(nn.Module):
@@ -103,17 +104,16 @@ class Decoder(nn.Module):
                 B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
             diffusion_time = inputs['diffusion_time']
             # (B, Pnn, (1 + T) , 4)
-            return {
-                "score":
-                    self.dit(
-                        near_cur_future_norm_xT,  # ( B, Pnn, (1 + T) * 4 )
-                        diffusion_time,  # (B)
-                        scene_encoding_token,  # (B, token_num, hidden_dim)
-                        ego_fut_global,  # (B, hidden_dim)
-                        near_current_mask,  # (B, Pnn),
-                        scene_encoding_token_mask  # (B, token_num) bool
-                    ).reshape(B, Pnn, -1, 4)  #  (B, Pnn, (1 + T) , 4)
-            }
+            score = self.dit(
+                near_cur_future_norm_xT,  # ( B, Pnn, (1 + T) * 4 )
+                diffusion_time,  # (B)
+                scene_encoding_token,  # (B, token_num, hidden_dim)
+                ego_fut_global,  # (B, hidden_dim)
+                near_current_mask,  # (B, Pnn),
+                scene_encoding_token_mask  # (B, token_num) bool
+            )
+            _require_finite("decoder_dit_output", score)
+            return {"score": score.reshape(B, Pnn, -1, 4)}  #  (B, Pnn, (1 + T) , 4)
         else:
             # [B, Pnn, (1 + future_len) * 4]
             xT = torch.cat(
