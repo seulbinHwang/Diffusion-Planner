@@ -137,7 +137,7 @@ class DiTBlock(nn.Module):
         cross_out = torch.nan_to_num(cross_out, nan=0.0, posinf=0.0,
                                      neginf=0.0)  # ← NaN → 0
         x = x + self.gate_cross * cross_out
-        x += self.gate_mlp2  * self.mlp2(self.norm4(x))
+        x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
 
         return x
 
