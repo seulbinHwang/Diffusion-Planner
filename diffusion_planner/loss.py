@@ -129,9 +129,12 @@ def diffusion_loss_func(
         near_future_gt, device=near_future_gt.device)  # [B, Pnn, T, 4]
 
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
+    normed_future = state_normalizer(near_future_gt)
+    normed_future = _require_finite("state_normalizer(near_future_gt)",
+                                    normed_future)
     near_cur_future_norm_gt = torch.cat([
         near_current_xyyaw_norm[:, :, None, :],
-        state_normalizer(near_future_gt)
+        normed_future
     ],
                                         dim=2)  # [B, Pnn, 1 + T, 4]
     # near_cur_future_mask: [B, Pnn, 1+T]

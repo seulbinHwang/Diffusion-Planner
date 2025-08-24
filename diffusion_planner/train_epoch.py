@@ -100,6 +100,9 @@ def train_epoch(data_loader,
                 dim=-1,
             )
             neighbors_future[mask] = 0.
+            if not torch.isfinite(neighbors_future).all():
+                raise ValueError(
+                    "Non-finite values detected in neighbors_future")
             norm_inputs = args.observation_normalizer(inputs)
 
             # call the mdoel
