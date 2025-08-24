@@ -23,11 +23,11 @@ class Decoder(nn.Module):
 
         self.dit = DiT(
             sde=self._sde,
-            route_encoder=RouteEncoder(
-                config.route_num,
-                config.lane_len,
-                drop_path_rate=config.encoder_drop_path_rate,
-                hidden_dim=config.hidden_dim),
+            # route_encoder=RouteEncoder(
+            #     config.route_num,
+            #     config.lane_len,
+            #     drop_path_rate=config.encoder_drop_path_rate,
+            #     hidden_dim=config.hidden_dim),
             depth=config.decoder_depth,
             output_dim=(config.future_len + 1) * 4,  # x, y, cos, sin
             hidden_dim=config.hidden_dim,
@@ -258,7 +258,6 @@ class DiT(nn.Module):
 
     def __init__(self,
                  sde: SDE,
-                 route_encoder: nn.Module,
                  depth,
                  output_dim,
                  hidden_dim=192,
