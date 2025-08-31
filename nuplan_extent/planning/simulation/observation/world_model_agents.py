@@ -16,13 +16,14 @@ from nuplan.planning.training.preprocessing.utils.agents_preprocessing import so
 from nuplan.common.actor_state.tracked_objects_types import AGENT_TYPES, TrackedObjectType
 from nuplan.planning.simulation.simulation_time_controller.simulation_iteration import SimulationIteration
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
-from nuplan.planning.simulation.planner.abstract_planner import PlannerInput
+from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import AbstractModelFeature
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
+from scipy.spatial.distance import cdist
 # /Users/user/PycharmProjects/nuplan-devkit/nuplan/common/actor_state/tracked_objects.py
 
 
@@ -75,8 +76,8 @@ class WorldModelAgents(AbstractMLAgents):
             if tracked_object.tracked_object_type == TrackedObjectType.VEHICLE
         }
         self._diffusion_agents = sort_dict(unique_agents)
-        self._log_replay_agents = sort_dict(self._get_open_loop_track_objects(
-            self.current_iteration))
+        self._log_replay_agents = sort_dict(
+            self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
 
     def _get_open_loop_track_objects(
@@ -107,26 +108,42 @@ class WorldModelAgents(AbstractMLAgents):
         next_relative_pose = StateSE2.from_matrix(next_relative_matrix)
         return next_relative_pose
 
-    def update_observation(
-            self,
-            iteration: SimulationIteration,
+    def _filter_agents_out_of_range(self, ego_state: EgoState) -> None:
+        """
+        Filter out agents that are out of range.
+        :param ego_state: The ego state used as the center of the given radius
+        :param radius: [m] The radius around the ego state
+        """
+        if len(self._diffusion_agents) == 0:
+            return
+
+        diffusion_agents_xy: npt.NDArray[np.int32] = np.array([
+            agent.center.point.array
+            for agent in self._diffusion_agents.values()
+        ])
+        distances = cdist(np.expand_dims(ego_state.center.point.array, axis=0),
+                          diffusion_agents_xy)
+        remove_indices = np.argwhere(distances.flatten() > self._radius)
+        remove_tokens = np.array(list(
+            self._diffusion_agents.keys()))[remove_indices.flatten()]
+
+        # Remove agents which are out of scope
+        for token in remove_tokens:
+            self._diffusion_agents.pop(token)
+
+    def _update_diffusion_agents_observation(
+            self, iteration: SimulationIteration,
             next_iteration: SimulationIteration,
             history: SimulationHistoryBuffer,
-            ego_state: Optional[EgoState] = None,
-            ego_future_trajectory: Optional[InterpolatedTrajectory] = None
-    ) -> None:
-        """
-        - 자동차
-            - ego 기준, radius 안에 들어오면 -> diffusion 생성 대상
-            - ego 기준, radius 밖에 있으면 -> 삭제. 관리 안함
-        -
-        """
+            next_ego_state: Optional[EgoState],
+            ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
+
         self.current_iteration = next_iteration.index
-        if ego_state is None:
+        if next_ego_state is None:
             next_relative_pose = None
         else:
             next_relative_pose = self._get_next_relative_ego_pose(
-                history, ego_state)
+                history, next_ego_state)
         self.step_time = next_iteration.time_point - iteration.time_point
 
         # Construct input features
@@ -143,8 +160,11 @@ class WorldModelAgents(AbstractMLAgents):
         )
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
             next_iteration.index)
+        # nuplan/planning/simulation/planner/abstract_planner.py
+        diffusion_agents_track_tokens = set(self._diffusion_agents.keys())
         current_input = PlannerInput(next_iteration, history,
-                                     traffic_light_data)
+                                     traffic_light_data,
+                                     diffusion_agents_track_tokens)
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
@@ -156,6 +176,32 @@ class WorldModelAgents(AbstractMLAgents):
         ])
         features["next_ego_state"] = next_ego_state[None, None, :]
         predictions = self._infer_model(features)
+
+    # def _update_log_replay_agents_observation(self, next_iteration: SimulationIteration) -> None:
+
+    def update_observation(
+            self,
+            iteration: SimulationIteration,
+            next_iteration: SimulationIteration,
+            history: SimulationHistoryBuffer,
+            next_ego_state: Optional[EgoState] = None,
+            ego_future_trajectory: Optional[InterpolatedTrajectory] = None
+    ) -> None:
+        """
+        - 자동차
+            - ego 기준, radius 안에 들어오면 -> diffusion 생성 대상
+            - ego 기준, radius 밖에 있으면 -> 삭제. 관리 안함
+        - log-replay
+            -
+        """
+        ego_state = history.current_state[0]
+        self._filter_agents_out_of_range(ego_state)
+        self._update_diffusion_agents_observation(iteration, next_iteration,
+                                                  history, next_ego_state,
+                                                  ego_future_trajectory)
+        self._log_replay_agents = sort_dict(
+            self._get_open_loop_track_objects(self.current_iteration))
+        self._agents = {**self._diffusion_agents, **self._log_replay_agents}
 
     def _infer_model(self,
                      features: FeaturesType) -> Dict[str, AbstractModelFeature]:

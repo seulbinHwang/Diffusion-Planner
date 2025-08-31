@@ -22,3 +22,17 @@ class HorizonPlannerInitialization:
     mission_goal: StateSE2
     map_api: AbstractMap  # The API towards maps.
     scenario: AbstractScenario
+
+
+@dataclass(frozen=True)
+class PlannerInput:
+    """
+    Input to a planner for which a trajectory should be computed.
+    """
+
+    iteration: SimulationIteration  # Iteration and time in a simulation progress
+    history: SimulationHistoryBuffer  # Rolling buffer containing past observations and states.
+    traffic_light_data: Optional[
+        List[TrafficLightStatusData]]  # The traffic light status data
+    diffusion_agents_track_tokens: set[
+        str]  # The track tokens of diffusion agents to be considered
