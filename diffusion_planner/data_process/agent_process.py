@@ -7,11 +7,11 @@ Categories:
     2. Get agents array for model input
 """
 import numpy as np
-from typing import Dict
-
+from typing import Dict, Deque, List, Tuple
+from nuplan.common.actor_state.tracked_objects import TrackedObjects, TrackedObject
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import AgentInternalIndex
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
-from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
+from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 
@@ -19,41 +19,58 @@ from diffusion_planner.data_process.utils import convert_absolute_quantities_to_
 # =====================
 # 1. Get list of agent array from raw data
 # =====================
-def _extract_agent_array(tracked_objects, track_token_ids, object_types):
+def _extract_agent_array(
+        tracked_objects: TrackedObjects, token_to_id, object_types
+) -> Tuple[np.ndarray, Dict[str, int], List[TrackedObjectType]]:
     """
     Extracts the relevant data from the agents present in a past detection into a array.
     Only objects of specified type will be transformed. Others will be ignored.
     The output is a array as described in AgentInternalIndex
     :param tracked_objects: The tracked objects to turn into a array.
-    :track_token_ids: A dictionary used to assign track tokens to integer IDs.
+        TrackedObjects
+    :token_to_id: A dictionary used to assign track tokens to integer IDs.
+        {}
     :object_type: TrackedObjectType to filter agents by.
-    :return: The generated array and the updated track_token_ids dict.
+        object_types = [
+            TrackedObjectType.VEHICLE, TrackedObjectType.PEDESTRIAN,
+            TrackedObjectType.BICYCLE
+        ]
+    :return: The generated array and the updated token_to_id dict.
     """
-    agents = tracked_objects.get_tracked_objects_of_types(object_types)
+    agents: List[TrackedObject] = tracked_objects.get_tracked_objects_of_types(
+        object_types)
     agent_types = []
-    output = np.zeros((len(agents), AgentInternalIndex.dim()), dtype=np.float64)
-    max_agent_id = len(track_token_ids)
+    frame_agents_num = len(agents)
+    # (frame_agents_num, 8)
+    frame_agents_feature = np.zeros(
+        (frame_agents_num, AgentInternalIndex.dim()), dtype=np.float64)
+    max_id_number = len(token_to_id)
 
     for idx, agent in enumerate(agents):
-        if agent.track_token not in track_token_ids:
-            track_token_ids[agent.track_token] = max_agent_id
-            max_agent_id += 1
-        track_token_int = track_token_ids[agent.track_token]
+        if agent.track_token not in token_to_id:
+            token_to_id[agent.track_token] = max_id_number
+            max_id_number += 1
+        int_id = token_to_id[agent.track_token]
 
-        output[idx, AgentInternalIndex.track_token()] = float(track_token_int)
-        output[idx, AgentInternalIndex.vx()] = agent.velocity.x
-        output[idx, AgentInternalIndex.vy()] = agent.velocity.y
-        output[idx, AgentInternalIndex.heading()] = agent.center.heading
-        output[idx, AgentInternalIndex.width()] = agent.box.width
-        output[idx, AgentInternalIndex.length()] = agent.box.length
-        output[idx, AgentInternalIndex.x()] = agent.center.x
-        output[idx, AgentInternalIndex.y()] = agent.center.y
+        frame_agents_feature[idx,
+                             AgentInternalIndex.track_token()] = float(int_id)
+        frame_agents_feature[idx, AgentInternalIndex.vx()] = agent.velocity.x
+        frame_agents_feature[idx, AgentInternalIndex.vy()] = agent.velocity.y
+        frame_agents_feature[
+            idx, AgentInternalIndex.heading()] = agent.center.heading
+        frame_agents_feature[idx, AgentInternalIndex.width()] = agent.box.width
+        frame_agents_feature[idx,
+                             AgentInternalIndex.length()] = agent.box.length
+        frame_agents_feature[idx, AgentInternalIndex.x()] = agent.center.x
+        frame_agents_feature[idx, AgentInternalIndex.y()] = agent.center.y
         agent_types.append(agent.tracked_object_type)
 
-    return output, track_token_ids, agent_types
+    return frame_agents_feature, token_to_id, agent_types
 
 
-def sampled_tracked_objects_to_array_list(past_tracked_objects):
+def sampled_tracked_objects_to_array_list(
+        past_tracked_objects: Deque[Observation])\
+        -> Tuple[List[np.ndarray], List[List[TrackedObjectType]]]:
     """
     Arrayifies the agents features from the provided past detections.
     For N past detections, output is a list of length N, with each array as described in `_extract_agent_array()`.
@@ -64,24 +81,26 @@ def sampled_tracked_objects_to_array_list(past_tracked_objects):
         TrackedObjectType.VEHICLE, TrackedObjectType.PEDESTRIAN,
         TrackedObjectType.BICYCLE
     ]
-    output = []
-    output_types = []
-    track_token_ids = {}
+    all_frame_agents_feature = []
+    all_frame_agents_types = []
+    token_to_id = {}
 
-    for i in range(len(past_tracked_objects)):
-        if type(past_tracked_objects[i]) == DetectionsTracks:
-            track_object = past_tracked_objects[i].tracked_objects
+    for past_idx in range(len(past_tracked_objects)):
+        if type(past_tracked_objects[past_idx]) == DetectionsTracks:
+            track_object: TrackedObjects = past_tracked_objects[
+                past_idx].tracked_objects
         else:
-            track_object = past_tracked_objects[i]
-        arrayified, track_token_ids, agent_types = _extract_agent_array(
-            track_object, track_token_ids, object_types)
-        output.append(arrayified)
-        output_types.append(agent_types)
+            track_object = past_tracked_objects[past_idx]
+        # Tuple[np.ndarray ((frame_agents_num, 8)), Dict[str, int], List[TrackedObjectType]]
+        frame_agents_feature, token_to_id, agent_types = _extract_agent_array(
+            track_object, token_to_id, object_types)
+        all_frame_agents_feature.append(frame_agents_feature)
+        all_frame_agents_types.append(agent_types)
 
-    return output, output_types
+    return all_frame_agents_feature, all_frame_agents_types
 
 
-def sampled_static_objects_to_array_list(present_tracked_objects):
+def sampled_static_objects_to_array_list(present_tracked_objects: Observation):
 
     static_object_types = [
         TrackedObjectType.CZONE_SIGN, TrackedObjectType.BARRIER,
@@ -89,22 +108,23 @@ def sampled_static_objects_to_array_list(present_tracked_objects):
     ]
 
     if type(present_tracked_objects) == DetectionsTracks:
-        present_tracked_objects = present_tracked_objects.tracked_objects
+        present_tracked_objects: TrackedObjects = present_tracked_objects.tracked_objects
 
-    static_obj = present_tracked_objects.get_tracked_objects_of_types(
-        static_object_types)
-    agent_types = []
-    output = np.zeros((len(static_obj), 5), dtype=np.float64)
+    static_obj: List[
+        TrackedObject] = present_tracked_objects.get_tracked_objects_of_types(
+            static_object_types)
+    static_objects_types = []
+    present_static_feature = np.zeros((len(static_obj), 5), dtype=np.float64)
 
     for idx, agent in enumerate(static_obj):
-        output[idx, 0] = agent.center.x
-        output[idx, 1] = agent.center.y
-        output[idx, 2] = agent.center.heading
-        output[idx, 3] = agent.box.width
-        output[idx, 4] = agent.box.length
-        agent_types.append(agent.tracked_object_type)
+        present_static_feature[idx, 0] = agent.center.x
+        present_static_feature[idx, 1] = agent.center.y
+        present_static_feature[idx, 2] = agent.center.heading
+        present_static_feature[idx, 3] = agent.box.width
+        present_static_feature[idx, 4] = agent.box.length
+        static_objects_types.append(agent.tracked_object_type)
 
-    return output, agent_types
+    return present_static_feature, static_objects_types
 
 
 # =====================
@@ -212,26 +232,33 @@ def _pad_agent_states_with_zeros(agent_trajectories):
     return pad_agent_trajectories
 
 
-def agent_past_process(past_ego_states, past_tracked_objects,
-                       tracked_objects_types, num_agents, static_objects,
-                       static_objects_types, num_static, max_ped_bike,
-                       anchor_ego_state):
+def agent_past_process(
+        past_ego_states,
+        all_frame_agents_feature: List[
+            np.ndarray],  # (frame_agents_num, 8) # frame_agents_num 길이가 가변적
+        all_frame_agents_types: List[List[TrackedObjectType]],
+        num_agents: int,
+        present_static_feature: np.ndarray,  # (len(static_obj), 5)
+        static_objects_types: List[TrackedObjectType],
+        num_static: int,
+        max_ped_bike: int,
+        anchor_ego_state: np.ndarray, #(3,)
+):
     """
     This function process the data from the raw agent data.
     :param past_ego_states: The input array data of the ego past.
-    :param past_tracked_objects: The input array data of agents in the past.
-    :param tracked_objects_types: The type of agents in the past.
+    :param all_frame_agents_feature: The input array data of agents in the past.
+    :param all_frame_agents_types: The type of agents in the past.
     :param num_agents: Clip the number of agents.
-    :param static_objects: The input array data of static objects in the past.
+    :param present_static_feature: The input array data of static objects in the past.
     :param static_objects_types: The type of static objects in the past.
     :param num_static: Clip the number of static objects.
     :param max_ped_bike: Clip the total number of ped and bike.
     :param anchor_ego_state: Ego current state
-    :return: ego, agents, selected_indices, static_objects
+    :return: ego, agents, selected_indices, present_static_feature
     """
     agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, length, width
     ego_history = past_ego_states
-    agents = past_tracked_objects
 
     if past_ego_states is not None:
         ego = convert_absolute_quantities_to_relative(ego_history,
@@ -239,8 +266,8 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     else:
         ego = None
 
-    agent_history = _filter_agents_array(agents, reverse=True)
-    agent_types = tracked_objects_types[-1]
+    agent_history = _filter_agents_array(all_frame_agents_feature, reverse=True)
+    agent_types = all_frame_agents_types[-1]
 
     if agent_history[-1].shape[0] == 0:
         # Return zero array when there are no agents in the scene
@@ -294,10 +321,10 @@ def agent_past_process(past_ego_states, past_tracked_objects,
                                                            AgentInternalIndex.
                                                            length()].squeeze()
 
-    static_objects_array = np.zeros((static_objects.shape[0], 6))
-    if static_objects.shape[0] != 0:
+    static_objects_array = np.zeros((present_static_feature.shape[0], 6))
+    if present_static_feature.shape[0] != 0:
         local_coords_static_objects_states = convert_absolute_quantities_to_relative(
-            static_objects, anchor_ego_state, 'static')
+            present_static_feature, anchor_ego_state, 'static')
 
         static_objects_array[:, 0] = local_coords_static_objects_states[:, 0]
         static_objects_array[:, 1] = local_coords_static_objects_states[:, 1]

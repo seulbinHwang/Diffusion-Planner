@@ -1,6 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 import matplotlib
+
 matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -91,12 +92,19 @@ class DataProcessor(object):
         neighbor
         '''
         observation_buffer = history_buffer.observation_buffer  # Past observations including the current
-        neighbor_agents_past, neighbor_agents_types = sampled_tracked_objects_to_array_list(
-            observation_buffer)
-        static_objects, static_objects_types = sampled_static_objects_to_array_list(
-            observation_buffer[-1])
-        _, neighbor_agents_past, _, static_objects = \
-            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+        # all_frame_agents_feature: List[np.ndarray], (frame_agents_num, 8) # frame_agents_num 길이가 가변적
+        # all_frame_agents_types:  List[List[TrackedObjectType]]
+        (all_frame_agents_feature, all_frame_agents_types
+        ) = sampled_tracked_objects_to_array_list(observation_buffer)
+        # present_static_feature: np.ndarray, (len(static_obj), 5)
+        # static_objects_types: List[TrackedObjectType]
+        (present_static_feature,
+         static_objects_types) = sampled_static_objects_to_array_list(
+             observation_buffer[-1])
+        (_, neighbor_agents_past, _, static_objects) = agent_past_process(
+            ego_agent_past, all_frame_agents_feature, all_frame_agents_types,
+            self.num_agents, present_static_feature, static_objects_types,
+            self.num_static, self.max_ped_bike, anchor_ego_state)
         '''
         Map
         '''
@@ -142,7 +150,7 @@ class DataProcessor(object):
                 ego_state.rear_axle.x, ego_state.rear_axle.y,
                 ego_state.rear_axle.heading
             ],
-                                        dtype=np.float64) # shape (3,)
+                                        dtype=np.float64)  # shape (3,)
             # ego_agent_past: np (21, 7) # x, y, theta, vx, vy, width, length
             ego_agent_past, time_stamps_past = get_ego_past_array_from_scenario(
                 scenario, self.num_past_poses, self.past_time_horizon)
@@ -203,7 +211,8 @@ class DataProcessor(object):
             assert Tf == self.num_future_poses, (
                 "Ego agent future states should have T time steps")
             assert Df == 11, (
-                "Ego agent future states should have 11 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, agent type)")
+                "Ego agent future states should have 11 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, agent type)"
+            )
 
             present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
             future_tracked_objects = [
@@ -240,19 +249,23 @@ class DataProcessor(object):
             data = {
                 "map_name": map_name,
                 "token": token,
-                "ego_agent_past": ego_agent_past, # (time_len, 11)
-                "ego_current_state": ego_current_state, # (10,)
+                "ego_agent_past": ego_agent_past,  # (time_len, 11)
+                "ego_current_state": ego_current_state,  # (10,)
                 # TODO: ego_agent_future 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
-                "ego_agent_future": ego_agent_future, # rear_axle x,y # (future_len, 3)
-                "ego_agent_future_11_dim": ego_agent_future_11_dim, # center x,y # (future_len, 11)
-                "neighbor_agents_past": neighbor_agents_past, # (num_agents, time_len, 11)
-                "neighbor_agents_future": neighbor_agents_future, # (num_agents, future_len, 3)
-                "static_objects": static_objects # (num_static, 5)
+                "ego_agent_future":
+                    ego_agent_future,  # rear_axle x,y # (future_len, 3)
+                "ego_agent_future_11_dim":
+                    ego_agent_future_11_dim,  # center x,y # (future_len, 11)
+                "neighbor_agents_past":
+                    neighbor_agents_past,  # (num_agents, time_len, 11)
+                "neighbor_agents_future":
+                    neighbor_agents_future,  # (num_agents, future_len, 3)
+                "static_objects": static_objects  # (num_static, 5)
             }
             data.update(vector_map)
 
             # 디버깅용 그림 그리기
-            if  self._wandb_enabled or self.config.save_image:
+            if self._wandb_enabled or self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
                 self._visualize_scenario(ego_agent_past,
                                          ego_agent_future_11_dim,
@@ -302,7 +315,8 @@ class DataProcessor(object):
             valid_lane_data = lane_data[valid_mask]  # (N_valid, 12)
             lane_points = valid_lane_data[:, :2]  # (N_valid, 2) - x, y 좌표
             left_vectors = valid_lane_data[:, 4:6]  # (N_valid, 2) - 왼쪽 경계까지의 벡터
-            right_vectors = valid_lane_data[:, 6:8]  # (N_valid, 2) - 오른쪽 경계까지의 벡터
+            right_vectors = valid_lane_data[:,
+                                            6:8]  # (N_valid, 2) - 오른쪽 경계까지의 벡터
 
             # 왼쪽 경계선 계산 및 그리기
             left_boundary = lane_points + left_vectors
@@ -355,7 +369,7 @@ class DataProcessor(object):
                 continue
             x, y = ego_agent_future_11_dim[t, 0], ego_agent_future_11_dim[t, 1]
             cos_yaw, sin_yaw = (ego_agent_future_11_dim[t, 2],
-                                 ego_agent_future_11_dim[t, 3])
+                                ego_agent_future_11_dim[t, 3])
             width, length = (ego_agent_future_11_dim[t, 6],
                              ego_agent_future_11_dim[t, 7])
 
@@ -398,12 +412,7 @@ class DataProcessor(object):
                 if not valid_mask[t]:  # invalid한 시점은 skip
                     continue
                 x, y = agent_trajectory[t, 0], agent_trajectory[t, 1]
-                ax.plot(x,
-                        y,
-                        'o',
-                        color=past_color,
-                        markersize=2,
-                        alpha=0.6)
+                ax.plot(x, y, 'o', color=past_color, markersize=2, alpha=0.6)
 
             # 현재 위치 (마지막 시간)를 사각형으로 그리기
             if valid_mask[-1]:  # 마지막 시점이 valid한 경우만
@@ -506,8 +515,11 @@ class DataProcessor(object):
         elif self.config.save_image:
             # save to disk if wandb is not enabled
             save_path = os.path.join(self._save_dir, f"{map_name}_{token}.png")
-            fig.savefig(save_path, bbox_inches='tight', pad_inches=0.1,
-                        facecolor='black', edgecolor='none')
+            fig.savefig(save_path,
+                        bbox_inches='tight',
+                        pad_inches=0.1,
+                        facecolor='black',
+                        edgecolor='none')
             print(f"Saved visualization to {save_path}")
         plt.close(fig)  # 메모리 절약을 위해 닫기
 

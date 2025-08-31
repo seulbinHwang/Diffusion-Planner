@@ -178,7 +178,6 @@ class WorldModelAgents(AbstractMLAgents):
         features["next_ego_state"] = next_ego_state[None, None, :]
         self._infer_model(features)
 
-
     def update_observation(
             self,
             iteration: SimulationIteration,

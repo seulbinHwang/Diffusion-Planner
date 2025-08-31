@@ -10,7 +10,6 @@ from nuplan.common.actor_state.vehicle_parameters import get_pacifica_parameters
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
-
 """
   File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/model/module/encoder.py", line 1701, in forward
     ego_fut_global = self._get_ego_fut_global(
@@ -18,6 +17,7 @@ from diffusion_planner.data_process.utils import convert_absolute_quantities_to_
     weights = (weights * row_valid).to(ego_fut_chunk.dtype)
 RuntimeError: The size of tensor a (4) must match the size of tensor b (256) at non-singleton dimension 1
 """
+
 
 def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
                                      past_time_horizon):
@@ -27,7 +27,9 @@ def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
     past_ego_states = scenario.get_ego_past_trajectory(
         iteration=0, num_samples=num_past_poses, time_horizon=past_time_horizon)
     # list(past_ego_states): List[EgoState]
-    sampled_past_ego_states: List[EgoState] = list(past_ego_states) + [current_ego_state]
+    sampled_past_ego_states: List[EgoState] = list(past_ego_states) + [
+        current_ego_state
+    ]
     # past_ego_states_array: np (21, 7)
     past_ego_states_array = sampled_past_ego_states_to_array(
         sampled_past_ego_states)
@@ -55,9 +57,8 @@ def sampled_past_ego_states_to_array(
     for i in range(0, len(past_ego_states), 1):
         output[i, EgoInternalIndex.x()] = past_ego_states[i].center.x
         output[i, EgoInternalIndex.y()] = past_ego_states[i].center.y
-        output[
-            i,
-            EgoInternalIndex.heading()] = past_ego_states[i].center.heading
+        output[i,
+               EgoInternalIndex.heading()] = past_ego_states[i].center.heading
         output[i, EgoInternalIndex.vx(
         )] = past_ego_states[i].dynamic_car_state.center_velocity_2d.x
         output[i, EgoInternalIndex.vy(
@@ -67,10 +68,10 @@ def sampled_past_ego_states_to_array(
         # output[i, EgoInternalIndex.ay(
         # )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.y
 
-        output[i, EgoInternalIndex.ax(
-        )] = past_ego_states[i].car_footprint.width
-        output[i, EgoInternalIndex.ay(
-        )] = past_ego_states[i].car_footprint.length
+        output[i,
+               EgoInternalIndex.ax()] = past_ego_states[i].car_footprint.width
+        output[i,
+               EgoInternalIndex.ay()] = past_ego_states[i].car_footprint.length
 
     return output
 
@@ -91,23 +92,25 @@ def sampled_future_ego_states_to_array(
     for i in range(len(future_ego_states)):
         output[i, EgoInternalIndex.x()] = future_ego_states[i].center.x
         output[i, EgoInternalIndex.y()] = future_ego_states[i].center.y
-        output[i, EgoInternalIndex.heading()] = future_ego_states[i].center.heading
+        output[i,
+               EgoInternalIndex.heading()] = future_ego_states[i].center.heading
         output[i, EgoInternalIndex.vx(
         )] = future_ego_states[i].dynamic_car_state.center_velocity_2d.x
         output[i, EgoInternalIndex.vy(
         )] = future_ego_states[i].dynamic_car_state.center_velocity_2d.y
-        output[i, EgoInternalIndex.ax(
-        )] = future_ego_states[i].car_footprint.width
-        output[i, EgoInternalIndex.ay(
-        )] = future_ego_states[i].car_footprint.length
+        output[i,
+               EgoInternalIndex.ax()] = future_ego_states[i].car_footprint.width
+        output[
+            i,
+            EgoInternalIndex.ay()] = future_ego_states[i].car_footprint.length
 
     return output
 
 
-def get_ego_future_array_from_scenario(scenario: NuPlanScenario,
-                                       current_ego_state: EgoState,
-                                       num_future_poses: int,
-                                       future_time_horizon: float) -> npt.NDArray[np.float32]:
+def get_ego_future_array_from_scenario(
+        scenario: NuPlanScenario, current_ego_state: EgoState,
+        num_future_poses: int,
+        future_time_horizon: float) -> npt.NDArray[np.float32]:
     """Return ego future states in ego-centric coordinates with rich features.
 
     The returned array has shape (T, 11) where each element consists of
@@ -175,7 +178,8 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
         yaw_rate = np.clip(yaw_rate, -0.95, 0.95)
     # ego_agent_past: (T, 7)
     # past: (T, 8) # +3 for one-hot encoding of the agent type (car, pedestrian, cyclist) and ego is always car.
-    past = np.zeros((ego_agent_past.shape[0], ego_agent_past.shape[1] + 1 + 3), dtype=np.float32)
+    past = np.zeros((ego_agent_past.shape[0], ego_agent_past.shape[1] + 1 + 3),
+                    dtype=np.float32)
     # past: x, y, cos(heading), sin(heading), vx, vy, width, length, agent_type
     past[:, :2] = ego_agent_past[:, :2]
     past[:, 2] = np.cos(ego_agent_past[:, 2])
@@ -183,7 +187,6 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
     past[:, 4:8] = ego_agent_past[:, 3:]
     # add one-hot encoding for agent type.
     past[:, 8] = 1.0  # ego is always car
-
 
     current = np.zeros((ego_agent_past.shape[1] + 3), dtype=np.float32)
     current[:2] = current_state[:2]

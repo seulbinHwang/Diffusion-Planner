@@ -463,12 +463,13 @@ def map_process(route_roadblock_ids, anchor_ego_state, coords,
             pass
 
     vector_map_output = {
-        'lanes': vector_map_lanes, # (lane_num, lane_len, 12)
-        'lanes_speed_limit': lane_speed_limit_array, # (lane_num, 1)
-        'lanes_has_speed_limit': lane_has_speed_limit_array, # (lane_num, 1)
-        'route_lanes': vector_map_route_lanes, # (route_num, lane_len, 12)
-        'route_lanes_speed_limit': route_lanes_speed_limit, # (route_num, 1)
-        'route_lanes_has_speed_limit': route_lanes_has_speed_limit # (route_num, 1)
+        'lanes': vector_map_lanes,  # (lane_num, lane_len, 12)
+        'lanes_speed_limit': lane_speed_limit_array,  # (lane_num, 1)
+        'lanes_has_speed_limit': lane_has_speed_limit_array,  # (lane_num, 1)
+        'route_lanes': vector_map_route_lanes,  # (route_num, lane_len, 12)
+        'route_lanes_speed_limit': route_lanes_speed_limit,  # (route_num, 1)
+        'route_lanes_has_speed_limit':
+            route_lanes_has_speed_limit  # (route_num, 1)
     }
 
     return vector_map_output

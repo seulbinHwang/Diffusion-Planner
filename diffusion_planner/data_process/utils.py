@@ -124,9 +124,10 @@ def _global_velocity_to_local(velocity, anchor_heading):
     return np.stack([velocity_x, velocity_y], axis=-1)
 
 
-def convert_absolute_quantities_to_relative(agent_state, # (N, 7)
-                                            ego_state, # (3,)
-                                            agent_type='ego'):
+def convert_absolute_quantities_to_relative(
+        agent_state,  # (N, 7)
+        ego_state,  # (3,)
+        agent_type='ego'):
     """
     Converts the agent or ego history to ego-centric coordinates.
     :param agent_state: The agent states to convert, in the AgentInternalIndex schema.
@@ -147,7 +148,7 @@ def convert_absolute_quantities_to_relative(agent_state, # (N, 7)
             EgoInternalIndex.x(),
             EgoInternalIndex.y(),
             EgoInternalIndex.heading()
-        ]] # (N, 3)
+        ]]  # (N, 3)
         transforms = _local_to_local_transforms(agent_global_poses, ego_pose)
         transformed_poses = _transform_matrix_to_state_se2_array_batch(
             transforms)
