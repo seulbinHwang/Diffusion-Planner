@@ -13,7 +13,7 @@ model_config:  # Dictionary key from existing planner model config (e.g. policy_
   # All feature builders
   feature_builders:
 
-    - _target_: nuplan_extent.planning.training.preprocessing.feature_builders.horizon_vector_feature_builder.GenericAgentsFeatureBuilder
+    - _target_: nuplan_extent.planning.training.preprocessing.feature_builders.world_model_feature_builder.WorldModelFeatureBuilder
       _convert_: 'all'
       agent_features: [VEHICLE, PEDESTRIAN, BICYCLE]
       past_trajectory_sampling:

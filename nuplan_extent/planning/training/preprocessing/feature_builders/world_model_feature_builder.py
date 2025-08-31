@@ -13,15 +13,13 @@ from nuplan.planning.training.preprocessing.feature_builders.abstract_feature_bu
     AbstractFeatureBuilder,
     AbstractModelFeature,
 )
-from nuplan_extent.planning.training.preprocessing.features.diffusion import Diffusion
+from nuplan_extent.planning.training.preprocessing.features.world_model import WorldModelFeature
 from nuplan.planning.training.preprocessing.features.raster_utils import (
     get_agents_raster,
     get_baseline_paths_raster,
     get_ego_raster,
     get_roadmap_raster,
 )
-
-# nuplan-devkit/nuplan/planning/training/preprocessing/features/raster.py
 
 
 class WorldModelFeatureBuilder(AbstractFeatureBuilder):
@@ -40,13 +38,12 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
     @classmethod
     def get_feature_type(cls) -> Type[AbstractModelFeature]:
-        # TODO
         """Inherited, see superclass."""
-        return Diffusion  # type: ignore
+        return WorldModelFeature  # type: ignore
 
     def get_features_from_simulation(
             self, current_input: PlannerInput,
-            initialization: PlannerInitialization) -> Diffusion:
+            initialization: PlannerInitialization) -> WorldModelFeature:
         # TODO
         """Inherited, see superclass."""
         history = current_input.history

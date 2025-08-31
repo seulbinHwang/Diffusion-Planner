@@ -27,3 +27,11 @@ class WorldModel(TorchModuleWrapper):
             target_builders=target_builders,
             future_trajectory_sampling=future_trajectory_sampling,
         )
+
+    def forward(self, features: FeaturesType) -> TargetsType:
+        """
+        The main inference call for the model.
+        :param features: A dictionary of the required features.
+        :return: The results of the inference as a TargetsType.
+        """
+        pass

@@ -25,6 +25,7 @@ from nuplan.planning.training.preprocessing.features.abstract_model_feature impo
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from scipy.spatial.distance import cdist
 # /Users/user/PycharmProjects/nuplan-devkit/nuplan/common/actor_state/tracked_objects.py
+from nuplan.common.utils.interpolatable_state import InterpolatableState
 
 
 class WorldModelAgents(AbstractMLAgents):
@@ -137,6 +138,7 @@ class WorldModelAgents(AbstractMLAgents):
             history: SimulationHistoryBuffer,
             next_ego_state: Optional[EgoState],
             ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
+        self.step_time = next_iteration.time_point - iteration.time_point
 
         self.current_iteration = next_iteration.index
         if next_ego_state is None:
@@ -144,7 +146,6 @@ class WorldModelAgents(AbstractMLAgents):
         else:
             next_relative_pose = self._get_next_relative_ego_pose(
                 history, next_ego_state)
-        self.step_time = next_iteration.time_point - iteration.time_point
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
@@ -175,9 +176,8 @@ class WorldModelAgents(AbstractMLAgents):
             next_relative_pose.heading
         ])
         features["next_ego_state"] = next_ego_state[None, None, :]
-        predictions = self._infer_model(features)
+        self._infer_model(features)
 
-    # def _update_log_replay_agents_observation(self, next_iteration: SimulationIteration) -> None:
 
     def update_observation(
             self,
@@ -203,12 +203,26 @@ class WorldModelAgents(AbstractMLAgents):
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
 
-    def _infer_model(self,
-                     features: FeaturesType) -> Dict[str, AbstractModelFeature]:
-        """Inherited, see superclass."""
-        predictions: Dict[str, AbstractModelFeature] = self._model_loader.infer(
+    def _infer_model(
+        self,
+        features: FeaturesType,
+    ) -> None:
+        predictions: Dict[str, AbstractTrajectory] = self._model_loader.infer(
             features)
-        # TODO: predictions 를 "track_token" : InterpolatedTrajectory(AbstractModelFeature) 형태로?
-        """
-        
-        """
+        for agent_token, agent_prediction in predictions.items():
+            agent_meta = self._diffusion_agents[agent_token]
+            new_state: EgoState = agent_prediction.get_state_at_time(
+                self.step_time)
+            new_agent = Agent(
+                tracked_object_type=agent_meta.tracked_object_type,
+                oriented_box=new_state.car_footprint,
+                velocity=new_state.dynamic_car_state.center_velocity_2d,
+                metadata=agent_meta.metadata,
+            )
+            new_agent.predictions = [
+                PredictedTrajectory(
+                    probability=1.,
+                    waypoints=agent_prediction.get_sampled_trajectory())
+            ]
+
+            self._diffusion_agents[agent_token] = new_agent
