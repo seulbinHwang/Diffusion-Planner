@@ -8,7 +8,7 @@ import matplotlib.patches as patches
 import math
 import wandb
 import os
-from typing import Dict, Tuple, Union  # NEW: type annotation 추가
+from typing import Dict, Tuple, Union, List  # NEW: type annotation 추가
 from nuplan.common.actor_state.state_representation import Point2D
 
 # matplotlib 설정 추가
@@ -126,25 +126,22 @@ class DataProcessor(object):
         Map
         '''
         # Simply fixing disconnected routes without pre-searching for reference lines
-        route_roadblock_ids = route_roadblock_correction(
+        route_roadblock_ids: List[str] = route_roadblock_correction(
             ego_state, map_api, route_roadblock_ids)
-        coords, traffic_light_data, speed_limit, lane_route = get_neighbor_vector_set_map(
-            map_api, self._map_features, ego_coords, self._radius,
-            traffic_light_data)
+        (coords, traffic_light_data, speed_limit,
+         lane_route) = get_neighbor_vector_set_map(map_api, self._map_features,
+                                                   ego_coords, self._radius,
+                                                   traffic_light_data)
         vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
                                  traffic_light_data, speed_limit, lane_route,
                                  self._map_features, self._max_elements,
                                  self._max_points)
 
         data = {
+            "ego_agent_past": ego_agent_past[-21:],  # (21, 11)
             "neighbor_agents_past":
-                neighbor_agents_past[:, -21:],
-            "ego_current_state":
-                np.array(
-                    [0., 0., 1., 0., 0., 0., 0., 0., 0., 0.], dtype=np.float32
-                ),  # ego centric x, y, cos, sin, vx, vy, ax, ay, steering angle, yaw rate, we only use x, y, cos, sin during inference
-            "static_objects":
-                static_objects
+                neighbor_agents_past[:, -21:],  # (agent_num, 21, 11)
+            "static_objects": static_objects
         }
         data.update(vector_map)
         data = convert_to_model_inputs(data, device)

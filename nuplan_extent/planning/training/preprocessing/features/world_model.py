@@ -17,7 +17,7 @@ from nuplan.planning.training.preprocessing.features.abstract_model_feature impo
 class WorldModelFeature(AbstractModelFeature):
     ego_agent_past: FeatureDataType  # (time_len, 11)
     neighbor_agents_past: FeatureDataType  # (agent_num, time_len, 11)
-    static_objects: FeatureDataType  # (static_objects_num, 5)
+    static_objects: FeatureDataType  # (static_objects_num, 10)
     ###########
     lanes: FeatureDataType  # (lane_num, lane_len, 12)
     lanes_speed_limit: FeatureDataType  # (lane_num, 1)

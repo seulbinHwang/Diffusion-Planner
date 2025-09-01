@@ -321,10 +321,9 @@ def agent_past_process(
         # ego_agent_past: (num_frames, 11)
         ego_agent_past = convert_absolute_quantities_to_relative(
             all_frame_ego_feature, anchor_ego_state)
+        ego_agent_past = ego_agent_past.astype(np.float32)
     else:
         ego_agent_past = None
-    if ego_agent_past is not None:
-        ego_agent_past = ego_agent_past.astype(np.float32)
     # (saved_agents_num, 8) # saved_agents_num 길이가 가변적
     all_frame_cur_exists_agents: List[np.ndarray] = _filter_agents_array(
         all_frame_agents_feature, reverse=True)
