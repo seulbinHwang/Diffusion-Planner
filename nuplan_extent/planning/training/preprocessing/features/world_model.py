@@ -17,7 +17,6 @@ from nuplan.planning.training.preprocessing.features.abstract_model_feature impo
 class WorldModelFeature(AbstractModelFeature):
     ego_agent_past: FeatureDataType  # (time_len, 11)
     neighbor_agents_past: FeatureDataType  # (agent_num, time_len, 11)
-    ego_current_state: FeatureDataType  # (10,)
     static_objects: FeatureDataType  # (static_objects_num, 5)
     ###########
     lanes: FeatureDataType  # (lane_num, lane_len, 12)
@@ -40,7 +39,6 @@ class WorldModelFeature(AbstractModelFeature):
             ego_agent_past=to_tensor(self.ego_agent_past).contiguous(),
             neighbor_agents_past=to_tensor(
                 self.neighbor_agents_past).contiguous(),
-            ego_current_state=to_tensor(self.ego_current_state).contiguous(),
             static_objects=to_tensor(self.static_objects).contiguous(),
             lanes=to_tensor(self.lanes).contiguous(),
             lanes_speed_limit=to_tensor(self.lanes_speed_limit).contiguous(),
@@ -73,8 +71,6 @@ class WorldModelFeature(AbstractModelFeature):
             ego_agent_past=to_tensor(self.ego_agent_past).to(device=device),
             neighbor_agents_past=to_tensor(
                 self.neighbor_agents_past).to(device=device),
-            ego_current_state=to_tensor(
-                self.ego_current_state).to(device=device),
             static_objects=to_tensor(self.static_objects).to(device=device),
             lanes=to_tensor(self.lanes).to(device=device),
             lanes_speed_limit=to_tensor(
@@ -120,8 +116,6 @@ class WorldModelFeature(AbstractModelFeature):
             ego_agent_past=default_collate([b.ego_agent_past for b in batch]),
             neighbor_agents_past=default_collate(
                 [b.neighbor_agents_past for b in batch]),
-            ego_current_state=default_collate(
-                [b.ego_current_state for b in batch]),
             static_objects=default_collate([b.static_objects for b in batch]),
             lanes=default_collate([b.lanes for b in batch]),
             lanes_speed_limit=default_collate(
@@ -159,7 +153,6 @@ class WorldModelFeature(AbstractModelFeature):
                 WorldModelFeature(
                     ego_agent_past=self.ego_agent_past[i],
                     neighbor_agents_past=self.neighbor_agents_past[i],
-                    ego_current_state=self.ego_current_state[i],
                     static_objects=self.static_objects[i],
                     lanes=self.lanes[i],
                     lanes_speed_limit=self.lanes_speed_limit[i],

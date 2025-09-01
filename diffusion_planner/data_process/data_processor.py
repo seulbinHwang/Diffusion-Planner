@@ -18,7 +18,8 @@ matplotlib.rcParams['figure.max_open_warning'] = 0
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from diffusion_planner.data_process.agent_process import (
     agent_past_process, sampled_tracked_objects_to_array_list,
-    sampled_static_objects_to_array_list, agent_future_process)
+    sampled_ego_objects_to_array_list, sampled_static_objects_to_array_list,
+    agent_future_process)
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
 from diffusion_planner.data_process.ego_process import get_ego_past_array_from_scenario, get_ego_future_array_from_scenario, calculate_additional_ego_states
 from diffusion_planner.data_process.utils import convert_to_model_inputs
@@ -91,20 +92,36 @@ class DataProcessor(object):
         '''
         neighbor
         '''
+        ego_state_buffer = history_buffer.ego_state_buffer
+        # all_frame_ego_feature: np.ndarray: (num_frames, 10)
+        all_frame_ego_feature = sampled_ego_objects_to_array_list(
+            ego_state_buffer)
+
         observation_buffer = history_buffer.observation_buffer  # Past observations including the current
         # all_frame_agents_feature: List[np.ndarray], (frame_agents_num, 8) # frame_agents_num 길이가 가변적
         # all_frame_agents_types:  List[List[TrackedObjectType]]
         (all_frame_agents_feature, all_frame_agents_types
         ) = sampled_tracked_objects_to_array_list(observation_buffer)
+
         # present_static_feature: np.ndarray, (len(static_obj), 5)
         # static_objects_types: List[TrackedObjectType]
         (present_static_feature,
          static_objects_types) = sampled_static_objects_to_array_list(
              observation_buffer[-1])
-        (_, neighbor_agents_past, _, static_objects) = agent_past_process(
-            ego_agent_past, all_frame_agents_feature, all_frame_agents_types,
-            self.num_agents, present_static_feature, static_objects_types,
-            self.num_static, self.max_ped_bike, anchor_ego_state)
+        # neighbor_agents_past: (agent_num, num_frames, 11)
+        # static_objects: (num_static, 10)
+        """
+    # ego_agent_past: (num_frames, 11)
+    # neighbor_agents_past: (agent_num, num_frames, 11)
+    # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
+    # static_objects: (num_static, 10)
+        """
+        (ego_agent_past,
+         neighbor_agents_past, _, static_objects) = agent_past_process(
+             all_frame_ego_feature, all_frame_agents_feature,
+             all_frame_agents_types, self.num_agents, present_static_feature,
+             static_objects_types, self.num_static, self.max_ped_bike,
+             anchor_ego_state)
         '''
         Map
         '''

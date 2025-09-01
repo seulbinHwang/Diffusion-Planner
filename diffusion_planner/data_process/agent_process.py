@@ -12,7 +12,7 @@ from nuplan.common.actor_state.tracked_objects import TrackedObjects, TrackedObj
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import AgentInternalIndex
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
-
+from nuplan.common.actor_state.ego_state import EgoState
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 
 
@@ -98,6 +98,35 @@ def sampled_tracked_objects_to_array_list(
         all_frame_agents_types.append(agent_types)
 
     return all_frame_agents_feature, all_frame_agents_types
+
+
+def _extract_ego_array(track_ego: EgoState) -> np.ndarray:
+    # (10)
+    frame_ego_feature = np.zeros((10,), dtype=np.float64)
+
+    frame_ego_feature[0] = track_ego.center.x
+    frame_ego_feature[1] = track_ego.center.y
+    frame_ego_feature[2] = track_ego.center.heading
+    frame_ego_feature[3] = track_ego.dynamic_car_state.center_velocity_2d.x
+    frame_ego_feature[4] = track_ego.dynamic_car_state.center_velocity_2d.y
+    frame_ego_feature[5] = track_ego.car_footprint.width
+    frame_ego_feature[6] = track_ego.car_footprint.length
+    frame_ego_feature[7:10] = [1, 0, 0]  # Mark as VEHICLE
+
+    return frame_ego_feature
+
+
+def sampled_ego_objects_to_array_list(
+        ego_state_buffer: Deque[EgoState]) -> np.ndarray:
+    all_frame_ego_feature = []
+
+    for past_idx in range(len(ego_state_buffer)):
+        track_ego: EgoState = ego_state_buffer[past_idx]
+        frame_agents_feature = _extract_ego_array(track_ego)
+        all_frame_ego_feature.append(frame_agents_feature)
+    all_frame_ego_feature = np.stack(all_frame_ego_feature)  # (num_frames, 10)
+
+    return all_frame_ego_feature
 
 
 def sampled_static_objects_to_array_list(present_tracked_objects: Observation):
@@ -258,7 +287,7 @@ def _pad_agent_states_with_zeros(agent_trajectories):
 
 
 def agent_past_process(
-        past_ego_states,
+        all_frame_ego_feature: np.ndarray,  # (num_frames, 10)
         all_frame_agents_feature: List[
             np.ndarray],  # (frame_agents_num, 8) # frame_agents_num 길이가 가변적
         all_frame_agents_types: List[List[TrackedObjectType]],
@@ -269,13 +298,13 @@ def agent_past_process(
         max_ped_bike: int,
         anchor_ego_state: np.ndarray,  #(3,)
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
-    # ego:
+    # ego_agent_past: (num_frames, 11)
     # neighbor_agents_past: (agent_num, num_frames, 11)
     # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
     # static_objects: (num_static, 10)
     """
     This function process the data from the raw agent data.
-    :param past_ego_states: The input array data of the ego past.
+    :param all_frame_ego_feature: The input array data of the ego past.
     :param all_frame_agents_feature: The input array data of agents in the past.
     :param all_frame_agents_types: The type of agents in the past.
     :param agent_num: Clip the number of agents.
@@ -284,14 +313,18 @@ def agent_past_process(
     :param num_static: Clip the number of static objects.
     :param max_ped_bike: Clip the total number of ped and bike.
     :param anchor_ego_state: Ego current state
-    :return: ego, agents, sorted_cur_neighbor_indices, present_static_feature
+    :return: ego_agent_past, agents, sorted_cur_neighbor_indices, present_static_feature
     """
     agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, length, width
-    if past_ego_states is not None:
-        ego = convert_absolute_quantities_to_relative(past_ego_states,
-                                                      anchor_ego_state)
+    if all_frame_ego_feature is not None:
+        # all_frame_ego_feature: (num_frames, 10)
+        # ego_agent_past: (num_frames, 11)
+        ego_agent_past = convert_absolute_quantities_to_relative(
+            all_frame_ego_feature, anchor_ego_state)
     else:
-        ego = None
+        ego_agent_past = None
+    if ego_agent_past is not None:
+        ego_agent_past = ego_agent_past.astype(np.float32)
     # (saved_agents_num, 8) # saved_agents_num 길이가 가변적
     all_frame_cur_exists_agents: List[np.ndarray] = _filter_agents_array(
         all_frame_agents_feature, reverse=True)
@@ -475,10 +508,7 @@ def agent_past_process(
         else:
             static_objects[i, six_:] = [0, 0, 0, 1]
 
-    if ego is not None:
-        ego = ego.astype(np.float32)
-
-    return ego, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects
+    return ego_agent_past, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects
 
 
 def agent_future_process(anchor_ego_state, future_tracked_objects, num_agents,

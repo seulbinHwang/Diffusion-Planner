@@ -125,7 +125,7 @@ def _global_velocity_to_local(velocity, anchor_heading):
 
 
 def convert_absolute_quantities_to_relative(
-        agent_state,  # (N, 7)
+        agent_state,  # (N, 7) or (N, 10)
         ego_state,  # (3,)
         agent_type='ego'):
     """
@@ -144,6 +144,7 @@ def convert_absolute_quantities_to_relative(
     )
 
     if agent_type == 'ego':
+        new_agent_state = np.zeros((agent_state.shape[0], 11), dtype=np.float64)
         agent_global_poses = agent_state[:, [
             EgoInternalIndex.x(),
             EgoInternalIndex.y(),
@@ -152,33 +153,24 @@ def convert_absolute_quantities_to_relative(
         transforms = _local_to_local_transforms(agent_global_poses, ego_pose)
         transformed_poses = _transform_matrix_to_state_se2_array_batch(
             transforms)
-        agent_state[:, EgoInternalIndex.x()] = transformed_poses[:, 0]
-        agent_state[:, EgoInternalIndex.y()] = transformed_poses[:, 1]
-        agent_state[:, EgoInternalIndex.heading()] = transformed_poses[:, 2]
+        new_agent_state[:, EgoInternalIndex.x()] = transformed_poses[:, 0]
+        new_agent_state[:, EgoInternalIndex.y()] = transformed_poses[:, 1]
+        new_agent_state[:, 2] = np.cos(transformed_poses[:, 2])
+        new_agent_state[:, 3] = np.sin(transformed_poses[:, 2])
 
         # local vel,acc to local
         agent_local_vel = agent_state[:, [
             EgoInternalIndex.vx(), EgoInternalIndex.vy()
         ]]
-        agent_local_acc = agent_state[:, [
-            EgoInternalIndex.ax(), EgoInternalIndex.ay()
-        ]]
         agent_local_vel = np.expand_dims(np.concatenate(
             (agent_local_vel, np.zeros(
                 (agent_local_vel.shape[0], 1))), axis=-1),
                                          axis=-1)
-        agent_local_acc = np.expand_dims(np.concatenate(
-            (agent_local_acc, np.zeros(
-                (agent_local_acc.shape[0], 1))), axis=-1),
-                                         axis=-1)
         transformed_vel = np.matmul(transforms,
                                     agent_local_vel).squeeze(axis=-1)
-        transformed_acc = np.matmul(transforms,
-                                    agent_local_acc).squeeze(axis=-1)
-        agent_state[:, EgoInternalIndex.vx()] = transformed_vel[:, 0]
-        agent_state[:, EgoInternalIndex.vy()] = transformed_vel[:, 1]
-        # agent_state[:, EgoInternalIndex.ax()] = transformed_acc[:, 0]
-        # agent_state[:, EgoInternalIndex.ay()] = transformed_acc[:, 1]
+        new_agent_state[:, 4] = transformed_vel[:, 0]
+        new_agent_state[:, 5] = transformed_vel[:, 1]
+        agent_state = new_agent_state
     elif agent_type == 'agent':
         agent_global_poses = agent_state[:, [
             AgentInternalIndex.x(),
