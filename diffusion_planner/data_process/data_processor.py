@@ -72,14 +72,14 @@ class DataProcessor(object):
             )
         self._wandb_enabled = wandb.run is not None
 
-
     # Use for inference
     def observation_adapter(self,
                             history_buffer,
                             traffic_light_data,
                             map_api,
                             route_roadblock_ids,
-                            device='cpu', do_unsqueeze=True) -> Dict[str, torch.Tensor]:
+                            device='cpu',
+                            do_unsqueeze=True) -> Dict[str, torch.Tensor]:
         '''
         ego
         '''

@@ -138,6 +138,11 @@ class WorldModelAgents(AbstractMLAgents):
     def _get_interpol_time_points(
             self, iteration: SimulationIteration) -> List[TimePoint]:
         self.step_s_time: float = self.step_time.time_s
+        """
+        self.step_s_time : 0.15
+        self.plan_dt : 0.1 이면
+            q = 1.5 -> interpol_num = 2
+        """
         q = Decimal(str(self.step_s_time)) / Decimal(str(self.plan_dt))
         interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         interpol_num = max(interpol_num, 1)
@@ -147,7 +152,9 @@ class WorldModelAgents(AbstractMLAgents):
             interpol_points_times = [0.1, 0.2]
             interpol_time_points = [TimePoint(ego_time + 0.1s), TimePoint(ego_time + 0.2s)]
         """
-        interpol_indices = np.linspace( 0, interpol_num, num=interpol_num+1,
+        interpol_indices = np.linspace(0,
+                                       interpol_num,
+                                       num=interpol_num + 1,
                                        dtype=int)[1:]  # (interpol_num, )
         interpol_points_times = interpol_indices * self.plan_dt  # (interpol_num, )
         interpol_time_points = []
@@ -202,7 +209,8 @@ class WorldModelAgents(AbstractMLAgents):
             current_ego_state.rear_axle.heading,
         ],
                           dtype=np.float32)  # shape (3,)
-
+        # absolute: (T, 10)
+        # relative: (T, 11)
         relative: np.ndarray = convert_absolute_quantities_to_relative(
             absolute, anchor, 'ego')  # shape (T, 11)
         return relative
@@ -257,10 +265,11 @@ class WorldModelAgents(AbstractMLAgents):
             ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
         self.current_iteration = next_iteration.index
         self.step_time = next_iteration.time_point - iteration.time_point
+        current_ego_state: EgoState = history.current_state[0]
 
+        ego_agent_next_11_dim = None
         if next_ego_state is not None:
             interpol_time_points = self._get_interpol_time_points(iteration)
-            current_ego_state: EgoState = history.current_state[0]
 
             next_ego_plans = self._get_next_ego_plans(current_ego_state,
                                                       next_ego_state,
@@ -268,14 +277,11 @@ class WorldModelAgents(AbstractMLAgents):
             # (interpol_num, 11)
             ego_agent_next_11_dim = (self._ego_plans_to_diffusion_array(
                 next_ego_plans, current_ego_state))
-        else:
-            ego_agent_next_11_dim = None
+
+        ego_agent_future_11_dim = None
         if ego_future_trajectory is not None:
-            current_ego_state_for_future: EgoState = history.current_state[0]
             ego_agent_future_11_dim = self._ego_future_to_diffusion_array(
-                ego_future_trajectory, current_ego_state_for_future)
-        else:
-            ego_agent_future_11_dim = None
+                ego_future_trajectory, current_ego_state)
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
@@ -295,8 +301,8 @@ class WorldModelAgents(AbstractMLAgents):
         current_input = PlannerInput(next_iteration, history,
                                      traffic_light_data,
                                      diffusion_agents_track_tokens,
-                                     ego_agent_next_11_dim,
-                                     ego_agent_future_11_dim)
+                                     ego_agent_next_11_dim.astype(np.float32),
+                                     ego_agent_future_11_dim.astype(np.float32))
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)

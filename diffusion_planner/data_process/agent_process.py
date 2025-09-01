@@ -342,11 +342,12 @@ def agent_past_process(
 
         for frame_cur_exists_agents in all_frame_cur_exists_agents:
             # frame_cur_exists_agents: (current_agents_num, 8)
-            all_frame_cur_exists_agents_local.append(
-                convert_absolute_quantities_to_relative(
-                    frame_cur_exists_agents,
-                    anchor_ego_state,  #(3,)
-                    'agent'))
+            # a: (current_agents_num, 8)
+            a = convert_absolute_quantities_to_relative(
+                frame_cur_exists_agents,
+                anchor_ego_state,  #(3,)
+                'agent')
+            all_frame_cur_exists_agents_local.append(a)
 
         # Calculate yaw rate
         # agents_states_dim: id, vx, vy, heading, width, length, x, y
@@ -397,6 +398,7 @@ def agent_past_process(
     # present_static_feature_6: (cur_static_num, 6)
     present_static_feature_6 = np.zeros((present_static_feature.shape[0], 6))
     if present_static_feature.shape[0] != 0:
+        # present_static_feature_local: (cur_static_num, 5)
         present_static_feature_local = convert_absolute_quantities_to_relative(
             present_static_feature, anchor_ego_state, 'static')
 

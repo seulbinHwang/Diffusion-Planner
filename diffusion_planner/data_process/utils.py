@@ -125,7 +125,7 @@ def _global_velocity_to_local(velocity, anchor_heading):
 
 
 def convert_absolute_quantities_to_relative(
-        agent_state,  # (N, 7) or (N, 10)
+        agent_state,  # (N, _)
         ego_state,  # (3,)
         agent_type='ego'):
     """
@@ -144,7 +144,10 @@ def convert_absolute_quantities_to_relative(
     )
 
     if agent_type == 'ego':
-        new_agent_state = np.zeros((agent_state.shape[0], 11), dtype=np.float64)
+        time_num, state_dim = agent_state.shape
+        new_agent_state = np.zeros((agent_state.shape[0], state_dim + 1),
+                                   dtype=np.float64)
+        new_agent_state[:, 6:] = agent_state[:, 5:]
         agent_global_poses = agent_state[:, [
             EgoInternalIndex.x(),
             EgoInternalIndex.y(),
@@ -170,7 +173,6 @@ def convert_absolute_quantities_to_relative(
                                     agent_local_vel).squeeze(axis=-1)
         new_agent_state[:, 4] = transformed_vel[:, 0]
         new_agent_state[:, 5] = transformed_vel[:, 1]
-        # (_, 11)
         agent_state = new_agent_state
     elif agent_type == 'agent':
         agent_global_poses = agent_state[:, [
@@ -302,14 +304,12 @@ def convert_to_model_inputs(data, device, do_unsqueeze):
     tensor_data = {}
     for k, v in data.items():
         if isinstance(v, np.ndarray) and v.dtype == np.bool_:
-            a = torch.tensor(
-                v, dtype=torch.bool).to(device)
+            a = torch.tensor(v, dtype=torch.bool).to(device)
             if do_unsqueeze:
                 a = a.unsqueeze(0)
             tensor_data[k] = a
         else:
-            b = torch.tensor(
-                v, dtype=torch.float32).to(device)
+            b = torch.tensor(v, dtype=torch.float32).to(device)
             if do_unsqueeze:
                 b = b.unsqueeze(0)
             tensor_data[k] = b
