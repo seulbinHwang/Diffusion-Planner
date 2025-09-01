@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import torch
 from torch.utils.data.dataloader import default_collate
 
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import (
@@ -11,8 +10,12 @@ from nuplan.planning.training.preprocessing.features.abstract_model_feature impo
     FeatureDataType,
     to_tensor,
 )
+from dataclasses import fields as dataclass_fields
+
+import torch
 
 
+# nuplan/planning/script/builders/simulation_builder.py
 @dataclass
 class WorldModelFeature(AbstractModelFeature):
     ego_agent_past: FeatureDataType  # (time_len, 11)
@@ -29,8 +32,9 @@ class WorldModelFeature(AbstractModelFeature):
     near_route_lanes_speed_limit: Optional[FeatureDataType]  # (Pnn, 1)
     near_route_lanes_has_speed_limit: Optional[FeatureDataType]  # (Pnn, 1)
     ###########
-    ego_agent_next_11_dim: Optional[FeatureDataType] = None  # (interpol_num, 11)
-    ego_agent_future_11_dim: Optional[
+    ego_agent_next_11_dim: Optional[
+        FeatureDataType] = None  # (interpol_num, 11)
+    ego_future_gt_11_dim: Optional[
         FeatureDataType] = None  # (future_time_len, 11)
 
     def to_feature_tensor(self) -> WorldModelFeature:
@@ -61,8 +65,8 @@ class WorldModelFeature(AbstractModelFeature):
                 self.near_route_lanes_has_speed_limit).contiguous(),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).contiguous(),
-            ego_agent_future_11_dim=None if self.ego_agent_future_11_dim is None
-            else to_tensor(self.ego_agent_future_11_dim).contiguous(),
+            ego_future_gt_11_dim=None if self.ego_future_gt_11_dim is None else
+            to_tensor(self.ego_future_gt_11_dim).contiguous(),
         )
 
     def to_device(self, device: torch.device) -> WorldModelFeature:
@@ -94,8 +98,8 @@ class WorldModelFeature(AbstractModelFeature):
                 self.near_route_lanes_has_speed_limit).to(device=device),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).to(device=device),
-            ego_agent_future_11_dim=None if self.ego_agent_future_11_dim is None
-            else to_tensor(self.ego_agent_future_11_dim).to(device=device),
+            ego_future_gt_11_dim=None if self.ego_future_gt_11_dim is None else
+            to_tensor(self.ego_future_gt_11_dim).to(device=device),
         )
 
     @classmethod
@@ -133,8 +137,7 @@ class WorldModelFeature(AbstractModelFeature):
             near_route_lanes_has_speed_limit=_collate_optional(
                 "near_route_lanes_has_speed_limit"),
             ego_agent_next_11_dim=_collate_optional("ego_agent_next_11_dim"),
-            ego_agent_future_11_dim=_collate_optional(
-                "ego_agent_future_11_dim"),
+            ego_future_gt_11_dim=_collate_optional("ego_future_gt_11_dim"),
         )
 
     @classmethod
@@ -174,7 +177,67 @@ class WorldModelFeature(AbstractModelFeature):
                     self.near_route_lanes_has_speed_limit[i],
                     ego_agent_next_11_dim=None if self.ego_agent_next_11_dim
                     is None else self.ego_agent_next_11_dim[i],
-                    ego_agent_future_11_dim=None if self.ego_agent_future_11_dim
-                    is None else self.ego_agent_future_11_dim[i],
+                    ego_future_gt_11_dim=None if self.ego_future_gt_11_dim
+                    is None else self.ego_future_gt_11_dim[i],
                 ))
         return features
+
+    def to_tensor_dict(
+        self,
+        *,
+        make_contiguous: bool = False,
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """WorldModelFeature를 Dict[str, Optional[torch.Tensor]]로 변환합니다.
+
+        각 필드에 대해:
+        - 값이 None이면 결과 딕셔너리에서도 None 유지
+        - None이 아니면 `to_tensor`로 torch.Tensor로 변환 (이미 텐서여도 그대로 처리)
+        - 선택적으로 device로 이동 및 contiguous 메모리 보장
+
+        Args:
+            make_contiguous: True면 각 텐서에 .contiguous() 적용.
+            device: 지정 시 각 텐서를 해당 device로 이동.
+
+        Returns:
+            Dict[str, Optional[torch.Tensor]]: 필드명 → 텐서(or None) 매핑 딕셔너리.
+
+        Note:
+            대표적인 텐서 shape 예시(배치 차원 포함):
+            - "ego_agent_past": (B, time_len, 11)
+            - "neighbor_agents_past": (B, agent_num, time_len, 11)
+            - "static_objects": (B, static_objects_num, 10)
+            - "lanes": (B, lane_num, lane_len, 12)
+            - "lanes_speed_limit": (B, lane_num, 1)
+            - "lanes_has_speed_limit": (B, lane_num, 1)
+            - "route_lanes": (B, route_num, lane_len, 12) or None
+            - "route_lanes_speed_limit": (B, route_num, 1) or None
+            - "route_lanes_has_speed_limit": (B, route_num, 1) or None
+            - "near_route_lanes": (B, Pnn, lane_len, 12) or None
+            - "near_route_lanes_speed_limit": (B, Pnn, 1) or None
+            - "near_route_lanes_has_speed_limit": (B, Pnn, 1) or None
+            - "ego_agent_next_11_dim": (B, interpol_num, 11) or None
+            - "ego_agent_future_11_dim": (B, future_time_len, 11) or None
+        """
+
+        # 지역 import로 의존성 최소화 (클래스 외부 수정 없이 동작)
+
+        def _to_tensor_or_none(value: Any) -> Optional[torch.Tensor]:
+            if value is None:
+                return None
+            tensor = value if isinstance(value,
+                                         torch.Tensor) else to_tensor(value)
+            if device is not None:
+                tensor = tensor.to(device=device)
+            if make_contiguous:
+                tensor = tensor.contiguous()
+            return tensor
+
+        tensor_dict: Dict[str, Optional[torch.Tensor]] = {}
+        # type(self)를 사용해 상속/확장에도 안전하게 모든 데이터클래스 필드 순회
+        for field in dataclass_fields(type(self)):
+            field_name = field.name
+            field_value = getattr(self, field_name)
+            tensor_dict[field_name] = _to_tensor_or_none(field_value)
+
+        return tensor_dict

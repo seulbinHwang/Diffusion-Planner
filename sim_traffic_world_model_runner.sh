@@ -49,6 +49,9 @@ python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     planner=$PLANNER \
     planner.diffusion_planner.config.args_file=$ARGS_FILE \
     planner.diffusion_planner.ckpt_path=$CKPT_FILE \
+    observation.model_config.ckpt_path=$CKPT_FILE \
+    observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
+    observation.checkpoint_path=$CKPT_FILE \
     scenario_builder=$SCENARIO_BUILDER \
     scenario_filter=$SPLIT \
     experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \

@@ -67,5 +67,5 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             near_route_lanes_speed_limit=None,
             near_route_lanes_has_speed_limit=None,
             ego_agent_next_11_dim=current_input.ego_agent_next_11_dim,
-            ego_agent_future_11_dim=current_input.ego_agent_future_11_dim)
+            ego_future_gt_11_dim=current_input.ego_agent_future_11_dim)
         return world_model_feature

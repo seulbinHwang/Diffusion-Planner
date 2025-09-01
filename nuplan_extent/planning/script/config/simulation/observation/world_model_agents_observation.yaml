@@ -9,7 +9,10 @@ target_velocity: 10         # Desired velocity in free traffic [m/s]
 model_config:  # Dictionary key from existing planner model config (e.g. policy_world_model_nar)
   _target_: nuplan_extent.planning.training.modeling.models.world_model.WorldModel
   _convert_: 'all'
-
+  config:
+    _target_: diffusion_planner.utils.config.Config
+    _convert_: "all"
+  ckpt_path: ???
   # All feature builders
   feature_builders:
 
@@ -41,4 +44,4 @@ model_config:  # Dictionary key from existing planner model config (e.g. policy_
       future_trajectory_sampling: ${model.future_trajectory_sampling}
 
 
-checkpoint_path: "/mnt/nas20/yihan01.hu/workspace/world_model/training/world_model/ablation/pretraining_104m_2HZ_gptm_with_mid_augmentation/training_world_model/2023.12.22.00.11.19/checkpoints/epoch=9.ckpt"
+checkpoint_path: ???

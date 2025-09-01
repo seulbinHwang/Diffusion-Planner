@@ -115,7 +115,7 @@ class Decoder(nn.Module):
             _require_finite("decoder_dit_output", score)
             return {"score": score.reshape(B, Pnn, -1, 4)}  #  (B, Pnn, (1 + T) , 4)
         else:
-            # [B, Pnn, (1 + future_len) * 4]
+            # xT: [B, Pnn, (1 + future_len) * 4]
             xT = torch.cat(
                 [
                     near_current[:, :, None],  # (B, Pnn, 1, 4)
@@ -164,6 +164,8 @@ class Decoder(nn.Module):
                         if self._guidance_fn is not None else "uncond"
                 },
             )
+            #  (B, Pnn, (1 + T) , 4)
+            assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
             x0 = self._state_normalizer.inverse(x0.reshape(
                 B, Pnn, -1, 4))  # (B, Pnn, 1 + T, 4)
             x0 = x0[:, :, 1:]  # (B, Pnn, T, 4)

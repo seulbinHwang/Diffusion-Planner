@@ -296,21 +296,31 @@ class Encoder(nn.Module):
 
         B = neighbors.shape[0]
         future_len: int = ego_future_full.shape[1]
+        if self.training:
+            # ---------------------- 1) M_i 샘플링 ---------------------- #
+            prefix_lengths = self._sample_uniform_prefix_lengths(
+                batch_size=B,
+                max_future_len=future_len,
+                device=ego_future_full.device,
+            )  # (B,)
+            known_mask = self._build_known_mask_from_lengths(
+                prefix_lengths,
+                max_future_len=future_len)  # (B, future_len) True=조건 제공
 
-        # ---------------------- 1) M_i 샘플링 ---------------------- #
-        prefix_lengths = self._sample_uniform_prefix_lengths(
-            batch_size=B,
-            max_future_len=future_len,
-            device=ego_future_full.device,
-        )  # (B,)
-        known_mask = self._build_known_mask_from_lengths(
-            prefix_lengths,
-            max_future_len=future_len)  # (B, future_len) True=조건 제공
+            # ---------------------- 2) 잘라 + 패딩 ---------------------- #
+            ego_future_trajectory = self._truncate_and_pad_ego_future_for_encoder(
+                ego_future_full,
+                known_mask)  # (B, future_len, 11)  길이 유지, 마스크는 내부에서 활용됨
+        else:
+            # TODO: "using" ego_agent_next_11_dim 도 해보자.
+            ego_future_trajectory = ego_future_full
+            if ego_future_trajectory is None:
+                ego_future_trajectory = torch.zeros(
+                    (B, future_len, 11),
+                        device=ego_past.device,
+                        dtype=ego_past.dtype)
 
-        # ---------------------- 2) 잘라 + 패딩 ---------------------- #
-        truncated_ego_future = self._truncate_and_pad_ego_future_for_encoder(
-            ego_future_full,
-            known_mask)  # (B, future_len, 11)  길이 유지, 마스크는 내부에서 활용됨
+
 
         # ---------------------- 3) 인코딩 ---------------------- #
         # ego_fut_global: (B, hidden_dim)
@@ -322,7 +332,7 @@ class Encoder(nn.Module):
         """
         (encoding_agents_chunk, agents_chunk_mask, agents_chunk_pos,
          ego_fut_global) = self.agents_encoder(ego_past, neighbors,
-                                               truncated_ego_future)
+                                               ego_future_trajectory)
         """
         encoding_static: (B, static_objects_num, hidden_dim)
         static_mask: (B, static_objects_num)
