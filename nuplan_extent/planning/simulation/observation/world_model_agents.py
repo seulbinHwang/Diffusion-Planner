@@ -26,6 +26,7 @@ from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from scipy.spatial.distance import cdist
 # /Users/user/PycharmProjects/nuplan-devkit/nuplan/common/actor_state/tracked_objects.py
 from nuplan.common.utils.interpolatable_state import InterpolatableState
+from decimal import Decimal, ROUND_HALF_UP
 
 
 class WorldModelAgents(AbstractMLAgents):
@@ -47,6 +48,7 @@ class WorldModelAgents(AbstractMLAgents):
         self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
         self._target_velocity = target_velocity
+        self.plan_dt = 0.1  # [s] # TODO: remove hardcoding
 
     def _initialize_open_loop_detection_types(
             self, open_loop_detections: List[str]) -> None:
@@ -132,22 +134,57 @@ class WorldModelAgents(AbstractMLAgents):
         for token in remove_tokens:
             self._diffusion_agents.pop(token)
 
+    def _create_ego_trajectory(
+            self, current_ego_state: EgoState,
+            next_ego_state: EgoState) -> InterpolatedTrajectory:
+        """현재 ego 상태와 다음 ego 상태로 보간 궤적을 생성한다.
+
+        Args:
+            current_ego_state (EgoState): 현재 ego의 상태.
+            next_ego_state (EgoState): 다음 ego의 상태.
+
+        Returns:
+            InterpolatedTrajectory: 두 상태로 구성된 길이 2의 궤적.
+        """
+        states: List[InterpolatableState] = [current_ego_state, next_ego_state]
+        trajectory = InterpolatedTrajectory(trajectory=states)
+        return trajectory
+
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
             next_iteration: SimulationIteration,
             history: SimulationHistoryBuffer,
             next_ego_state: Optional[EgoState],
             ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
-        self.step_time = next_iteration.time_point - iteration.time_point
-        self.step_s_time:float = self.step_time.time_s
-
         self.current_iteration = next_iteration.index
-        """
-        TODO:
-            next_ego_state 가 None이 아닐 경우,
-            "ego의 현재 위치 EgoState"와 next_ego_state 를 list로 만든 후,
-            이를 InterpolatedTrajectory 로 만든다.
-        """
+        self.step_time = next_iteration.time_point - iteration.time_point
+
+        if next_ego_state is not None:
+            self.step_s_time: float = self.step_time.time_s
+            q = Decimal(str(self.step_s_time)) / Decimal(str(self.plan_dt))
+            interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+            interpol_times = np.linspace(
+                0, self.step_s_time, interpol_num + 1)[1:].astype(
+                    np.float64)  # shape (interpol_num, )
+            interpol_times *= self.plan_dt  # (interpol_num, )
+            interpol_time_points = []
+            for t in interpol_times:
+                time_point = TimePoint(
+                    time_us=int(iteration.time_point.time_us + t * 1e6))
+                interpol_time_points.append(time_point)
+            # i want to make interpol_array np.array([
+            current_ego_state: EgoState = history.current_state[0]
+            next_ego_trajectory: InterpolatedTrajectory = self._create_ego_trajectory(
+                current_ego_state, next_ego_state)
+            next_ego_plans: List[
+                InterpolatableState] = next_ego_trajectory.get_state_at_times(
+                    interpol_time_points)
+            """
+            TODO: 
+            I want to make np.array of shape (interpol_num, 11) from next_ego_plans.
+                - 11
+                    - x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy, width, length, 1(vehicle), 0, 0
+            """
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
