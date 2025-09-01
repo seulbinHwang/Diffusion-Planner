@@ -135,30 +135,20 @@ class WorldModelAgents(AbstractMLAgents):
         for token in remove_tokens:
             self._diffusion_agents.pop(token)
 
-    def _create_ego_trajectory(
-            self, current_ego_state: EgoState,
-            next_ego_state: EgoState) -> InterpolatedTrajectory:
-        """현재 ego 상태와 다음 ego 상태로 보간 궤적을 생성한다.
-
-        Args:
-            current_ego_state (EgoState): 현재 ego의 상태.
-            next_ego_state (EgoState): 다음 ego의 상태.
-
-        Returns:
-            InterpolatedTrajectory: 두 상태로 구성된 길이 2의 궤적.
-        """
-        states: List[InterpolatableState] = [current_ego_state, next_ego_state]
-        trajectory = InterpolatedTrajectory(trajectory=states)
-        return trajectory
-
     def _get_interpol_time_points(
             self, iteration: SimulationIteration) -> List[TimePoint]:
         self.step_s_time: float = self.step_time.time_s
         q = Decimal(str(self.step_s_time)) / Decimal(str(self.plan_dt))
         interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-        interpol_indices = np.linspace(0, self.step_s_time,
-                                       interpol_num + 1)[1:].astype(
-                                           np.float64)  # shape (interpol_num, )
+        interpol_num = max(interpol_num, 1)
+        """
+        if interpol_num = 2,
+            interpol_indices = [1, 2]
+            interpol_points_times = [0.1, 0.2]
+            interpol_time_points = [TimePoint(ego_time + 0.1s), TimePoint(ego_time + 0.2s)]
+        """
+        interpol_indices = np.linspace( 0, interpol_num, num=interpol_num+1,
+                                       dtype=int)[1:]  # (interpol_num, )
         interpol_points_times = interpol_indices * self.plan_dt  # (interpol_num, )
         interpol_time_points = []
         for interpol_time in interpol_points_times:
@@ -170,8 +160,8 @@ class WorldModelAgents(AbstractMLAgents):
     def _get_next_ego_plans(
             self, current_ego_state: EgoState, next_ego_state: EgoState,
             interpol_time_points: List[TimePoint]) -> List[InterpolatableState]:
-        next_ego_trajectory: InterpolatedTrajectory = self._create_ego_trajectory(
-            current_ego_state, next_ego_state)
+        states: List[InterpolatableState] = [current_ego_state, next_ego_state]
+        next_ego_trajectory = InterpolatedTrajectory(trajectory=states)
         next_ego_plans: List[
             InterpolatableState] = next_ego_trajectory.get_state_at_times(
                 interpol_time_points)
@@ -194,7 +184,8 @@ class WorldModelAgents(AbstractMLAgents):
 
         num_plans = len(next_ego_plans)
         absolute: npt.NDArray[np.float64] = np.zeros(
-            (num_plans, 7), dtype=np.float64)  # shape (T, 7)
+            (num_plans, 10), dtype=np.float64)  # shape (T, 10)
+        absolute[:, 7] = 1  # is vehicle
 
         for i, state in enumerate(next_ego_plans):
             absolute[i, 0] = state.center.x
@@ -212,13 +203,12 @@ class WorldModelAgents(AbstractMLAgents):
         ],
                           dtype=np.float32)  # shape (3,)
 
-        relative: np.ndarray= convert_absolute_quantities_to_relative(
-                absolute, anchor, 'ego')  # shape (T, 11)
+        relative: np.ndarray = convert_absolute_quantities_to_relative(
+            absolute, anchor, 'ego')  # shape (T, 11)
         return relative
 
     def _ego_future_to_diffusion_array(
-            self,
-            ego_future_trajectory: InterpolatedTrajectory,
+            self, ego_future_trajectory: InterpolatedTrajectory,
             current_ego_state: EgoState) -> npt.NDArray[np.float64]:
         """미래 ego 궤적을 diffusion planner 입력 배열로 변환한다.
 
@@ -259,7 +249,6 @@ class WorldModelAgents(AbstractMLAgents):
             absolute, anchor, 'ego')  # shape (T, 11)
         return relative
 
-
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
             next_iteration: SimulationIteration,
@@ -277,10 +266,8 @@ class WorldModelAgents(AbstractMLAgents):
                                                       next_ego_state,
                                                       interpol_time_points)
             # (interpol_num, 11)
-            ego_agent_next_11_dim = (
-                self._ego_plans_to_diffusion_array(next_ego_plans,
-                                                   current_ego_state)
-            )
+            ego_agent_next_11_dim = (self._ego_plans_to_diffusion_array(
+                next_ego_plans, current_ego_state))
         else:
             ego_agent_next_11_dim = None
         if ego_future_trajectory is not None:
