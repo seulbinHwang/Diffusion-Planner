@@ -216,6 +216,50 @@ class WorldModelAgents(AbstractMLAgents):
                 absolute, anchor, 'ego')  # shape (T, 11)
         return relative
 
+    def _ego_future_to_diffusion_array(
+            self,
+            ego_future_trajectory: InterpolatedTrajectory,
+            current_ego_state: EgoState) -> npt.NDArray[np.float64]:
+        """미래 ego 궤적을 diffusion planner 입력 배열로 변환한다.
+
+        Args:
+            ego_future_trajectory (InterpolatedTrajectory): 변환할 미래 ego 궤적.
+            current_ego_state (EgoState): 기준이 되는 현재 ego 상태.
+
+        Returns:
+            npt.NDArray[np.float64]: (T, 11) 모양의 배열. 열 구성은
+            [x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy,
+            width, length, 1, 0, 0] 이다.
+        """
+
+        future_states: List[EgoState] = list(
+            ego_future_trajectory.get_sampled_trajectory())
+        num_states = len(future_states)
+        absolute: npt.NDArray[np.float64] = np.zeros(
+            (num_states, 10), dtype=np.float64)  # shape (T, 7)
+        absolute[:, 7] = 1  # is vehicle
+
+        for i, state in enumerate(future_states):
+            absolute[i, 0] = state.center.x
+            absolute[i, 1] = state.center.y
+            absolute[i, 2] = state.center.heading
+            absolute[i, 3] = state.dynamic_car_state.center_velocity_2d.x
+            absolute[i, 4] = state.dynamic_car_state.center_velocity_2d.y
+            absolute[i, 5] = state.car_footprint.width
+            absolute[i, 6] = state.car_footprint.length
+
+        anchor = np.array([
+            current_ego_state.rear_axle.x,
+            current_ego_state.rear_axle.y,
+            current_ego_state.rear_axle.heading,
+        ],
+                          dtype=np.float32)  # shape (3,)
+
+        relative: np.ndarray = convert_absolute_quantities_to_relative(
+            absolute, anchor, 'ego')  # shape (T, 11)
+        return relative
+
+
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
             next_iteration: SimulationIteration,
@@ -240,13 +284,11 @@ class WorldModelAgents(AbstractMLAgents):
         else:
             ego_agent_next_11_dim = None
         if ego_future_trajectory is not None:
-            """
-            TODO
-            ego_future_trajectory 로 부터, ego_agent_future_11_dim (future_time_len, 11) 생성
-            11
-                - x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy,
-                - width, length, 1, 0, 0
-            """
+            current_ego_state_for_future: EgoState = history.current_state[0]
+            ego_agent_future_11_dim = self._ego_future_to_diffusion_array(
+                ego_future_trajectory, current_ego_state_for_future)
+        else:
+            ego_agent_future_11_dim = None
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
@@ -266,7 +308,8 @@ class WorldModelAgents(AbstractMLAgents):
         current_input = PlannerInput(next_iteration, history,
                                      traffic_light_data,
                                      diffusion_agents_track_tokens,
-                                     ego_agent_next_11_dim=ego_agent_next_11_dim)
+                                     ego_agent_next_11_dim,
+                                     ego_agent_future_11_dim)
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
