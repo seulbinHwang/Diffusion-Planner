@@ -139,13 +139,17 @@ class WorldModelAgents(AbstractMLAgents):
             next_ego_state: Optional[EgoState],
             ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
         self.step_time = next_iteration.time_point - iteration.time_point
+        self.step_s_time:float = self.step_time.time_s
 
         self.current_iteration = next_iteration.index
-        if next_ego_state is None:
-            next_relative_pose = None
-        else:
+
+        if next_ego_state is not None:
             next_relative_pose = self._get_next_relative_ego_pose(
                 history, next_ego_state)
+            next_ego_state = np.array([
+                next_relative_pose.x, next_relative_pose.y,
+                next_relative_pose.heading
+            ])
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
@@ -171,11 +175,7 @@ class WorldModelAgents(AbstractMLAgents):
                 current_input, initialization)
 
         # Infer model
-        next_ego_state = np.array([
-            next_relative_pose.x, next_relative_pose.y,
-            next_relative_pose.heading
-        ])
-        features["next_ego_state"] = next_ego_state[None, None, :]
+
         self._infer_model(features)
 
     def update_observation(

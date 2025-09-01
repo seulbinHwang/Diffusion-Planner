@@ -7,6 +7,8 @@ from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.simulation.simulation_time_controller.simulation_iteration import SimulationIteration
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 from nuplan.common.maps.maps_datatypes import TrafficLightStatusData
+from nuplan.planning.training.preprocessing.features.abstract_model_feature import (
+    FeatureDataType,)
 
 
 @dataclass(frozen=True)
@@ -36,3 +38,7 @@ class PlannerInput:
         List[TrafficLightStatusData]]  # The traffic light status data
     diffusion_agents_track_tokens: set[
         str]  # The track tokens of diffusion agents to be considered
+    next_ego_state: Optional[FeatureDataType] = None  # (11,)
+    step_s_time: Optional[float] = None
+    ego_agent_future_11_dim: Optional[
+        FeatureDataType] = None  # (future_time_len, 11)

@@ -8,7 +8,8 @@ import matplotlib.patches as patches
 import math
 import wandb
 import os
-from typing import Dict, Tuple, Union, List  # NEW: type annotation 추가
+import torch
+from typing import Dict, Tuple, Union, List
 from nuplan.common.actor_state.state_representation import Point2D
 
 # matplotlib 설정 추가
@@ -71,17 +72,17 @@ class DataProcessor(object):
             )
         self._wandb_enabled = wandb.run is not None
 
+
     # Use for inference
     def observation_adapter(self,
                             history_buffer,
                             traffic_light_data,
                             map_api,
                             route_roadblock_ids,
-                            device='cpu'):
+                            device='cpu', do_unsqueeze=True) -> Dict[str, torch.Tensor]:
         '''
         ego
         '''
-        ego_agent_past = None  # inference no need ego_agent_past
         ego_state = history_buffer.current_state[0]
         ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
         anchor_ego_state = np.array([
@@ -138,13 +139,15 @@ class DataProcessor(object):
                                  self._max_points)
 
         data = {
-            "ego_agent_past": ego_agent_past[-21:],  # (21, 11)
+            "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
             "neighbor_agents_past":
-                neighbor_agents_past[:, -21:],  # (agent_num, 21, 11)
+                neighbor_agents_past[:, -21:],  # (agent_num, time_len, 11)
             "static_objects": static_objects
         }
+        # data: Dict[str, np.ndarray]
         data.update(vector_map)
-        data = convert_to_model_inputs(data, device)
+        # data: Dict[str, torch.Tensor]
+        data = convert_to_model_inputs(data, device, do_unsqueeze)
 
         return data
 
