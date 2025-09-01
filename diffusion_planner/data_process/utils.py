@@ -170,6 +170,7 @@ def convert_absolute_quantities_to_relative(
                                     agent_local_vel).squeeze(axis=-1)
         new_agent_state[:, 4] = transformed_vel[:, 0]
         new_agent_state[:, 5] = transformed_vel[:, 1]
+        # (_, 11)
         agent_state = new_agent_state
     elif agent_type == 'agent':
         agent_global_poses = agent_state[:, [

@@ -38,7 +38,7 @@ class PlannerInput:
         List[TrafficLightStatusData]]  # The traffic light status data
     diffusion_agents_track_tokens: set[
         str]  # The track tokens of diffusion agents to be considered
-    next_ego_state: Optional[FeatureDataType] = None  # (11,)
-    step_s_time: Optional[float] = None
+    ego_agent_next_11_dim: Optional[
+        FeatureDataType] = None  # (interpol_num, 11)
     ego_agent_future_11_dim: Optional[
         FeatureDataType] = None  # (future_time_len, 11)

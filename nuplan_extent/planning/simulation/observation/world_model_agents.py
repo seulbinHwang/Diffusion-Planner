@@ -27,6 +27,7 @@ from scipy.spatial.distance import cdist
 # /Users/user/PycharmProjects/nuplan-devkit/nuplan/common/actor_state/tracked_objects.py
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from decimal import Decimal, ROUND_HALF_UP
+from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 
 
 class WorldModelAgents(AbstractMLAgents):
@@ -150,6 +151,71 @@ class WorldModelAgents(AbstractMLAgents):
         trajectory = InterpolatedTrajectory(trajectory=states)
         return trajectory
 
+    def _get_interpol_time_points(
+            self, iteration: SimulationIteration) -> List[TimePoint]:
+        self.step_s_time: float = self.step_time.time_s
+        q = Decimal(str(self.step_s_time)) / Decimal(str(self.plan_dt))
+        interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        interpol_indices = np.linspace(0, self.step_s_time,
+                                       interpol_num + 1)[1:].astype(
+                                           np.float64)  # shape (interpol_num, )
+        interpol_points_times = interpol_indices * self.plan_dt  # (interpol_num, )
+        interpol_time_points = []
+        for interpol_time in interpol_points_times:
+            time_point = TimePoint(time_us=int(iteration.time_point.time_us +
+                                               interpol_time * 1e6))
+            interpol_time_points.append(time_point)
+        return interpol_time_points
+
+    def _get_next_ego_plans(
+            self, current_ego_state: EgoState, next_ego_state: EgoState,
+            interpol_time_points: List[TimePoint]) -> List[InterpolatableState]:
+        next_ego_trajectory: InterpolatedTrajectory = self._create_ego_trajectory(
+            current_ego_state, next_ego_state)
+        next_ego_plans: List[
+            InterpolatableState] = next_ego_trajectory.get_state_at_times(
+                interpol_time_points)
+        return next_ego_plans
+
+    def _ego_plans_to_diffusion_array(
+            self, next_ego_plans: List[EgoState],
+            current_ego_state: EgoState) -> npt.NDArray[np.float64]:
+        """ego 미래 상태들을 diffusion planner 입력 배열로 변환한다.
+
+        Args:
+            next_ego_plans (List[InterpolatableState]): 변환할 ego 상태 리스트.
+            current_ego_state (EgoState): 기준이 되는 현재 ego 상태.
+
+        Returns:
+            npt.NDArray[np.float64]: (T, 11) 모양의 배열. 열 구성은
+            [x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy,
+            width, length, 1, 0, 0] 이다.
+        """
+
+        num_plans = len(next_ego_plans)
+        absolute: npt.NDArray[np.float64] = np.zeros(
+            (num_plans, 7), dtype=np.float64)  # shape (T, 7)
+
+        for i, state in enumerate(next_ego_plans):
+            absolute[i, 0] = state.center.x
+            absolute[i, 1] = state.center.y
+            absolute[i, 2] = state.center.heading
+            absolute[i, 3] = state.dynamic_car_state.center_velocity_2d.x
+            absolute[i, 4] = state.dynamic_car_state.center_velocity_2d.y
+            absolute[i, 5] = state.car_footprint.width
+            absolute[i, 6] = state.car_footprint.length
+
+        anchor = np.array([
+            current_ego_state.rear_axle.x,
+            current_ego_state.rear_axle.y,
+            current_ego_state.rear_axle.heading,
+        ],
+                          dtype=np.float32)  # shape (3,)
+
+        relative: np.ndarray= convert_absolute_quantities_to_relative(
+                absolute, anchor, 'ego')  # shape (T, 11)
+        return relative
+
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
             next_iteration: SimulationIteration,
@@ -160,30 +226,26 @@ class WorldModelAgents(AbstractMLAgents):
         self.step_time = next_iteration.time_point - iteration.time_point
 
         if next_ego_state is not None:
-            self.step_s_time: float = self.step_time.time_s
-            q = Decimal(str(self.step_s_time)) / Decimal(str(self.plan_dt))
-            interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-            interpol_times = np.linspace(
-                0, self.step_s_time, interpol_num + 1)[1:].astype(
-                    np.float64)  # shape (interpol_num, )
-            interpol_times *= self.plan_dt  # (interpol_num, )
-            interpol_time_points = []
-            for t in interpol_times:
-                time_point = TimePoint(
-                    time_us=int(iteration.time_point.time_us + t * 1e6))
-                interpol_time_points.append(time_point)
-            # i want to make interpol_array np.array([
+            interpol_time_points = self._get_interpol_time_points(iteration)
             current_ego_state: EgoState = history.current_state[0]
-            next_ego_trajectory: InterpolatedTrajectory = self._create_ego_trajectory(
-                current_ego_state, next_ego_state)
-            next_ego_plans: List[
-                InterpolatableState] = next_ego_trajectory.get_state_at_times(
-                    interpol_time_points)
+
+            next_ego_plans = self._get_next_ego_plans(current_ego_state,
+                                                      next_ego_state,
+                                                      interpol_time_points)
+            # (interpol_num, 11)
+            ego_agent_next_11_dim = (
+                self._ego_plans_to_diffusion_array(next_ego_plans,
+                                                   current_ego_state)
+            )
+        else:
+            ego_agent_next_11_dim = None
+        if ego_future_trajectory is not None:
             """
-            TODO: 
-            I want to make np.array of shape (interpol_num, 11) from next_ego_plans.
-                - 11
-                    - x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy, width, length, 1(vehicle), 0, 0
+            TODO
+            ego_future_trajectory 로 부터, ego_agent_future_11_dim (future_time_len, 11) 생성
+            11
+                - x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy,
+                - width, length, 1, 0, 0
             """
 
         # Construct input features
@@ -200,11 +262,11 @@ class WorldModelAgents(AbstractMLAgents):
         )
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
             next_iteration.index)
-        # nuplan/planning/simulation/planner/abstract_planner.py
         diffusion_agents_track_tokens = set(self._diffusion_agents.keys())
         current_input = PlannerInput(next_iteration, history,
                                      traffic_light_data,
-                                     diffusion_agents_track_tokens)
+                                     diffusion_agents_track_tokens,
+                                     ego_agent_next_11_dim=ego_agent_next_11_dim)
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
