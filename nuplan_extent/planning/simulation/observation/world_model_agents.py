@@ -142,15 +142,12 @@ class WorldModelAgents(AbstractMLAgents):
         self.step_s_time:float = self.step_time.time_s
 
         self.current_iteration = next_iteration.index
-
-        if next_ego_state is not None:
-            next_relative_pose = self._get_next_relative_ego_pose(
-                history, next_ego_state)
-            # TODO: (x, y, yaw) -> (11,) 로 바꾸기 x, y, cos(yaw), sin(yaw), vx, vy, width, length, 1(vehicle), 0, 0
-            next_ego_state = np.array([
-                next_relative_pose.x, next_relative_pose.y,
-                next_relative_pose.heading
-            ])
+        """
+        TODO:
+            next_ego_state 가 None이 아닐 경우,
+            "ego의 현재 위치 EgoState"와 next_ego_state 를 list로 만든 후,
+            이를 InterpolatedTrajectory 로 만든다.
+        """
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
