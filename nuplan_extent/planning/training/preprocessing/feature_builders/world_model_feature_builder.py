@@ -4,7 +4,8 @@ from typing import Dict, Type
 
 import torch
 
-from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization, PlannerInput
+from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization
+from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan.planning.training.preprocessing.feature_builders.abstract_feature_builder import (
     AbstractFeatureBuilder,
     AbstractModelFeature,
@@ -65,6 +66,6 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             near_route_lanes=None,
             near_route_lanes_speed_limit=None,
             near_route_lanes_has_speed_limit=None,
-            next_ego_state=None,
-            ego_agent_future_11_dim=None)
+            ego_agent_next_11_dim=current_input.ego_agent_next_11_dim,
+            ego_agent_future_11_dim=current_input.ego_agent_future_11_dim)
         return world_model_feature

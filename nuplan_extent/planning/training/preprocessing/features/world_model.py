@@ -29,7 +29,7 @@ class WorldModelFeature(AbstractModelFeature):
     near_route_lanes_speed_limit: Optional[FeatureDataType]  # (Pnn, 1)
     near_route_lanes_has_speed_limit: Optional[FeatureDataType]  # (Pnn, 1)
     ###########
-    next_ego_state: Optional[FeatureDataType] = None  # (11,)
+    ego_agent_next_11_dim: Optional[FeatureDataType] = None  # (interpol_num, 11)
     ego_agent_future_11_dim: Optional[
         FeatureDataType] = None  # (future_time_len, 11)
 
@@ -59,8 +59,8 @@ class WorldModelFeature(AbstractModelFeature):
             near_route_lanes_has_speed_limit=None
             if self.near_route_lanes_has_speed_limit is None else to_tensor(
                 self.near_route_lanes_has_speed_limit).contiguous(),
-            next_ego_state=None if self.next_ego_state is None else to_tensor(
-                self.next_ego_state).contiguous(),
+            ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
+            else to_tensor(self.ego_agent_next_11_dim).contiguous(),
             ego_agent_future_11_dim=None if self.ego_agent_future_11_dim is None
             else to_tensor(self.ego_agent_future_11_dim).contiguous(),
         )
@@ -92,8 +92,8 @@ class WorldModelFeature(AbstractModelFeature):
             near_route_lanes_has_speed_limit=None
             if self.near_route_lanes_has_speed_limit is None else to_tensor(
                 self.near_route_lanes_has_speed_limit).to(device=device),
-            next_ego_state=None if self.next_ego_state is None else to_tensor(
-                self.next_ego_state).to(device=device),
+            ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
+            else to_tensor(self.ego_agent_next_11_dim).to(device=device),
             ego_agent_future_11_dim=None if self.ego_agent_future_11_dim is None
             else to_tensor(self.ego_agent_future_11_dim).to(device=device),
         )
@@ -132,7 +132,7 @@ class WorldModelFeature(AbstractModelFeature):
                 "near_route_lanes_speed_limit"),
             near_route_lanes_has_speed_limit=_collate_optional(
                 "near_route_lanes_has_speed_limit"),
-            next_ego_state=_collate_optional("next_ego_state"),
+            ego_agent_next_11_dim=_collate_optional("ego_agent_next_11_dim"),
             ego_agent_future_11_dim=_collate_optional(
                 "ego_agent_future_11_dim"),
         )
@@ -172,8 +172,8 @@ class WorldModelFeature(AbstractModelFeature):
                     near_route_lanes_has_speed_limit=None
                     if self.near_route_lanes_has_speed_limit is None else
                     self.near_route_lanes_has_speed_limit[i],
-                    next_ego_state=None
-                    if self.next_ego_state is None else self.next_ego_state[i],
+                    ego_agent_next_11_dim=None if self.ego_agent_next_11_dim
+                    is None else self.ego_agent_next_11_dim[i],
                     ego_agent_future_11_dim=None if self.ego_agent_future_11_dim
                     is None else self.ego_agent_future_11_dim[i],
                 ))

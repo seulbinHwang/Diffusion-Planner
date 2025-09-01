@@ -275,8 +275,8 @@ class WorldModelAgents(AbstractMLAgents):
                                                       next_ego_state,
                                                       interpol_time_points)
             # (interpol_num, 11)
-            ego_agent_next_11_dim = (self._ego_plans_to_diffusion_array(
-                next_ego_plans, current_ego_state))
+            ego_agent_next_11_dim = self._ego_plans_to_diffusion_array(
+                next_ego_plans, current_ego_state)
 
         ego_agent_future_11_dim = None
         if ego_future_trajectory is not None:
