@@ -146,6 +146,7 @@ class WorldModelAgents(AbstractMLAgents):
         if next_ego_state is not None:
             next_relative_pose = self._get_next_relative_ego_pose(
                 history, next_ego_state)
+            # TODO: (x, y, yaw) -> (11,) 로 바꾸기 x, y, cos(yaw), sin(yaw), vx, vy, width, length, 1(vehicle), 0, 0
             next_ego_state = np.array([
                 next_relative_pose.x, next_relative_pose.y,
                 next_relative_pose.heading
