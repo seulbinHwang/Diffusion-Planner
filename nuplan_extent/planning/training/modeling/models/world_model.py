@@ -33,6 +33,7 @@ class WorldModel(TorchModuleWrapper):
             target_builders=target_builders,
             future_trajectory_sampling=future_trajectory_sampling,
         )
+        self.config = config
         self._planner = Diffusion_Planner(config)
         self._ckpt_path = ckpt_path
         self._ema_enabled = enable_ema
@@ -67,4 +68,17 @@ class WorldModel(TorchModuleWrapper):
         """
         outputs: Dict[str, torch.Tensor]
             "prediction" : (B, Pnn, T, 4)
+        """
+        npc_future_trajectories = outputs['prediction']  # (B, Pnn, T, 4)
+        assert npc_future_trajectories.shape == (
+            1,
+            self.config.predicted_neighbor_num,
+            self.config.future_len,
+            4,
+        )
+        npc_future_trajectories = npc_future_trajectories.squeeze(0)  # (Pnn, T, 4)
+        """
+        TODO: npc_future_trajectories 는 x, y, cos(yaw), sin(yaw) 로 되어있음.
+        그런데, 각 차량의 중심에 대한 x, y, yaw 값임. (ego 좌표계 기준)
+        나는 npc_future_trajectories를, 각 챠량의 rear_axle 좌표계 기준으로 바꾸고 싶음.
         """
