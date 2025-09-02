@@ -1,7 +1,7 @@
 from typing import cast, List, Dict, Optional
 import numpy as np
 import numpy.typing as npt
-
+import torch
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
 from nuplan.common.actor_state.oriented_box import OrientedBox
 from nuplan.common.actor_state.state_representation import StateSE2, StateVector2D, TimePoint
@@ -16,10 +16,10 @@ from nuplan.planning.training.preprocessing.utils.agents_preprocessing import so
 from nuplan.common.actor_state.tracked_objects_types import AGENT_TYPES, TrackedObjectType
 from nuplan.planning.simulation.simulation_time_controller.simulation_iteration import SimulationIteration
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
-from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
+from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import AbstractModelFeature
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
@@ -28,7 +28,37 @@ from scipy.spatial.distance import cdist
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from decimal import Decimal, ROUND_HALF_UP
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
+from nuplan.planning.simulation.observation.observation_type import Observation
 
+
+def convert_center_to_rear_axle(traj_center: np.ndarray, rear_wheelbase: float) -> np.ndarray:
+    """
+    차량 중심 기준 궤적을 뒷축 중심 기준 궤적으로 변환
+
+    Args:
+        traj_center: (T, 4) array of [x_center, y_center, cos_yaw, sin_yaw]
+        rear_wheelbase:  (중심에서 뒷축까지의 거리)
+
+    Returns:
+        traj_rear_axle: (T, 4) array of [x_rear_axle, y_rear_axle, cos_yaw, sin_yaw]
+    """
+    # 각 시점에서 차량의 방향 벡터 (뒤쪽 방향)
+    cos_yaw = traj_center[:, 2]  # (T,)
+    sin_yaw = traj_center[:, 3]  # (T,)
+
+    # 뒷축 방향으로의 오프셋 벡터 계산 (차량 좌표계에서 뒤쪽은 -x 방향)
+    offset_x = -rear_wheelbase * cos_yaw  # (T,)
+    offset_y = -rear_wheelbase * sin_yaw  # (T,)
+
+    # 뒷축 중심 좌표 계산
+    x_rear_axle = traj_center[:, 0] + offset_x  # (T,)
+    y_rear_axle = traj_center[:, 1] + offset_y  # (T,)
+
+    # 결과 조합 (yaw는 그대로 유지)
+    traj_rear_axle = np.column_stack(
+        [x_rear_axle, y_rear_axle, cos_yaw, sin_yaw])
+
+    return traj_rear_axle
 
 class WorldModelAgents(AbstractMLAgents):
     """
@@ -72,6 +102,8 @@ class WorldModelAgents(AbstractMLAgents):
         Initializes the agents based on the first step of the scenario
         """
         self.current_iteration = 0
+        self.current_ego_state = None
+        self.current_observation = None
 
         unique_agents = {
             tracked_object.track_token: tracked_object
@@ -265,23 +297,25 @@ class WorldModelAgents(AbstractMLAgents):
             ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
         self.current_iteration = next_iteration.index
         self.step_time = next_iteration.time_point - iteration.time_point
-        current_ego_state: EgoState = history.current_state[0]
+        # current_ego_state: EgoState
+        # current_observation: Observation
+        self.current_ego_state, self.current_observation = history.current_state
 
         ego_agent_next_11_dim = None
         if next_ego_state is not None:
             interpol_time_points = self._get_interpol_time_points(iteration)
 
-            next_ego_plans = self._get_next_ego_plans(current_ego_state,
+            next_ego_plans = self._get_next_ego_plans(self.current_ego_state,
                                                       next_ego_state,
                                                       interpol_time_points)
             # (interpol_num, 11)
             ego_agent_next_11_dim = self._ego_plans_to_diffusion_array(
-                next_ego_plans, current_ego_state)
+                next_ego_plans, self.current_ego_state)
 
         ego_agent_future_11_dim = None
         if ego_future_trajectory is not None:
             ego_agent_future_11_dim = self._ego_future_to_diffusion_array(
-                ego_future_trajectory, current_ego_state)
+                ego_future_trajectory, self.current_ego_state)
 
         # Construct input features
         initialization = HorizonPlannerInitialization(
@@ -335,12 +369,49 @@ class WorldModelAgents(AbstractMLAgents):
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
 
+    def get_rear_wheelbases(self, agents:List[Agent]) -> List[float]:
+        """각 차량의 중심에서 뒷축까지 거리를 계산한다.
+
+        Returns:
+            List[float]: shape (N,) 각 차량의 뒷축까지 거리 [m].
+
+        """
+        rear_wheelbases: List[float] = []
+        for agent in agents:
+            box = agent.box
+            rear_wheelbases.append(float(box.rear_axle_to_center_dist))
+        return rear_wheelbases
+
     def _infer_model(
         self,
         features: FeaturesType,
     ) -> None:
-        predictions: Dict[str, AbstractTrajectory] = self._model_loader.infer(
+        # npc_future_trajectories: (Pnn, T, 4)
+        """
+        TODO: self._model_loader.infer 가 track_token 추출해야함.
+
+        """
+        npc_future_trajectories: torch.Tensor = self._model_loader.infer(
             features)
+        """
+        TODO: npc_future_trajectories 는 x, y, cos(yaw), sin(yaw) 로 되어있음.
+        그런데, 각 차량의 중심에 대한 x, y, yaw 값임. (ego 좌표계 기준)
+        나는 npc_future_trajectories를, 각 챠량의 rear_axle 좌표계 기준으로 바꾸고 싶음.
+        
+        self.current_observation 을 사용해서.
+        """
+        current_agents: List[Agent] = self.current_observation.tracked_objects.get_agents()
+        # TODO: current_agents 중에서, track_token에 해당하는 것만 추출해야함.
+        rear_wheelbases = self.get_rear_wheelbases(current_agents)
+        # npc_future_trajectories from torch.Tensor to numpy
+        npc_future_trajectories = npc_future_trajectories.detach().numpy()  # (Pnn, T, 4)
+        for npc_idx in range(npc_future_trajectories.shape[0]):
+            traj = npc_future_trajectories[npc_idx].cpu().numpy() # (T, 4)
+            rear_wheelbase = rear_wheelbases[npc_idx]
+            traj = convert_center_to_rear_axle(traj, rear_wheelbase) # (T, 4)
+            npc_future_trajectories[npc_idx] = traj
+
+
         for agent_token, agent_prediction in predictions.items():
             agent_meta = self._diffusion_agents[agent_token]
             new_state: EgoState = agent_prediction.get_state_at_time(

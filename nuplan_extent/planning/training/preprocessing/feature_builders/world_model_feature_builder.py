@@ -4,8 +4,8 @@ from typing import Dict, Type
 
 import torch
 
-from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization
 from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
+from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization
 from nuplan.planning.training.preprocessing.feature_builders.abstract_feature_builder import (
     AbstractFeatureBuilder,
     AbstractModelFeature,
@@ -36,7 +36,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
     def get_features_from_simulation(
             self, current_input: PlannerInput,
-            initialization: PlannerInitialization) -> WorldModelFeature:
+            initialization: HorizonPlannerInitialization) -> WorldModelFeature:
         history_buffer = current_input.history
         traffic_light_data = list(current_input.traffic_light_data)
         model_inputs: Dict[
