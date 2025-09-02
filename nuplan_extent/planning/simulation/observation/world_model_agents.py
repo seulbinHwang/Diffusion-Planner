@@ -74,6 +74,8 @@ class WorldModelAgents(AbstractMLAgents):
         :param scenario: scenario
         """
         super().__init__(model, scenario)
+        self.config = model.config
+        self.predicted_neighbor_num = self.config.predicted_neighbor_num
         self.current_iteration = 0
         self._open_loop_detections_types: List[TrackedObjectType] = []
         self._initialize_open_loop_detection_types(open_loop_detections_types)
