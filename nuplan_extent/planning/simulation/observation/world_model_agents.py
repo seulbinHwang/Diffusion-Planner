@@ -31,7 +31,62 @@ from diffusion_planner.data_process.utils import convert_absolute_quantities_to_
 from nuplan.planning.simulation.observation.observation_type import Observation
 
 
-def convert_center_to_rear_axle(traj_center: np.ndarray, rear_wheelbase: float) -> np.ndarray:
+def rotation_matrix(theta: float) -> np.ndarray:
+    """주어진 θ로부터 2×2 회전 행렬 반환."""
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s], [s, c]], dtype=np.float32)
+
+
+def ego_to_global(traj_ego: np.ndarray, ego_pos: np.ndarray,
+                  ego_yaw: float) -> tuple[np.ndarray, np.ndarray]:
+    """
+    traj_ego: (T,4) array of [x_ego, y_ego, cos_ego_yaw, sin_ego_yaw]
+    ego_pos: (2,) global 위치
+    ego_yaw: 스칼라 ego yaw
+    returns:
+      coords_global: (T,2) global x,y
+      yaw_global:   (T,) global yaw
+    """
+    coords_ego = traj_ego[:, :2]  # (T,2)
+    yaw_ego_frame = np.arctan2(traj_ego[:, 3], traj_ego[:, 2])  # (T,)
+    R_e2g = rotation_matrix(ego_yaw)  # ego→global 회전
+    coords_global = coords_ego.dot(R_e2g.T) + ego_pos  # (T,2)
+    yaw_global = yaw_ego_frame + ego_yaw  # (T,)
+    return coords_global, yaw_global
+
+
+def global_to_local(coords_global: np.ndarray, yaw_global: np.ndarray,
+                    veh_pos: np.ndarray, veh_yaw: float) -> np.ndarray:
+    """
+    coords_global: (T,2), yaw_global: (T,)
+    veh_pos: (2,), veh_yaw: 스칼라
+    returns:
+      future_traj_wrt_npc_rear: (T,4) array of [x_local, y_local, cos_local_yaw, sin_local_yaw]
+    """
+    R_g2v = rotation_matrix(-veh_yaw)  # global→veh 회전
+    delta = coords_global - veh_pos  # (T,2)
+    coords_local = delta.dot(R_g2v.T)  # (T,2)
+    yaw_local = yaw_global - veh_yaw  # (T,)
+
+    cos_l = np.cos(yaw_local)[:, None]  # (T,1)
+    sin_l = np.sin(yaw_local)[:, None]  # (T,1)
+    return np.concatenate([coords_local, cos_l, sin_l], axis=1)
+
+
+def transform_trajectory(npc_traj_wrt_ego_rear: np.ndarray,
+                         ego_rear_axle_xy: np.ndarray, ego_yaw: float,
+                         veh_rear_axle_xy: np.ndarray,
+                         veh_yaw: float) -> np.ndarray:
+    """
+    ego계 기준 npc_traj_wrt_ego_rear → 각 vehicle 로컬계 기준 (T,4) trajectory.
+    """
+    coords_g, yaw_g = ego_to_global(npc_traj_wrt_ego_rear, ego_rear_axle_xy,
+                                    ego_yaw)
+    return global_to_local(coords_g, yaw_g, veh_rear_axle_xy, veh_yaw)
+
+
+def convert_center_to_rear_axle(traj_center: np.ndarray,
+                                rear_wheelbase: float) -> np.ndarray:
     """
     차량 중심 기준 궤적을 뒷축 중심 기준 궤적으로 변환
 
@@ -59,6 +114,7 @@ def convert_center_to_rear_axle(traj_center: np.ndarray, rear_wheelbase: float) 
         [x_rear_axle, y_rear_axle, cos_yaw, sin_yaw])
 
     return traj_rear_axle
+
 
 class WorldModelAgents(AbstractMLAgents):
     """
@@ -146,28 +202,54 @@ class WorldModelAgents(AbstractMLAgents):
         next_relative_pose = StateSE2.from_matrix(next_relative_matrix)
         return next_relative_pose
 
+    def _compute_sorted_distances(
+            self, ego_state: EgoState,
+            agents: Dict[str,
+                         Agent]) -> tuple[list[str], npt.NDArray[np.float64]]:
+        """ego와 각 agent 사이의 거리를 계산해 정렬된 결과를 반환한다.
+
+        Args:
+            ego_state (EgoState): 기준이 되는 ego 상태.
+            agents (Dict[str, Agent]): 거리를 계산할 agent 사전.
+
+        Returns:
+            tuple[list[str], npt.NDArray[np.float64]]:
+                - track token이 거리 오름차순으로 정렬된 리스트.
+                - 정렬된 거리 배열로 shape (N,)이다.
+        """
+        if len(agents) == 0:
+            return [], np.empty((0,), dtype=np.float64)
+
+        agent_xy: npt.NDArray[np.float32] = np.array(
+            [agent.center.point.array for agent in agents.values()],
+            dtype=np.float32)  # shape (N, 2)
+        ego_xy: npt.NDArray[np.float32] = np.expand_dims(
+            ego_state.center.point.array,
+            axis=0).astype(np.float32)  # shape (1, 2)
+        distances: npt.NDArray[np.float64] = cdist(
+            ego_xy, agent_xy).flatten()  # shape (N,)
+        tokens: list[str] = list(agents.keys())
+        sorted_indices: npt.NDArray[np.int64] = np.argsort(distances)
+        sorted_tokens: list[str] = [tokens[i] for i in sorted_indices]
+        sorted_distances: npt.NDArray[np.float64] = distances[sorted_indices]
+        return sorted_tokens, sorted_distances
+
     def _filter_agents_out_of_range(self, ego_state: EgoState) -> None:
-        """
-        Filter out agents that are out of range.
-        :param ego_state: The ego state used as the center of the given radius
-        :param radius: [m] The radius around the ego state
-        """
-        if len(self._diffusion_agents) == 0:
-            return
+        """ego 기준 반경 내 가장 가까운 agent들을 선택한다.
 
-        diffusion_agents_xy: npt.NDArray[np.int32] = np.array([
-            agent.center.point.array
-            for agent in self._diffusion_agents.values()
-        ])
-        distances = cdist(np.expand_dims(ego_state.center.point.array, axis=0),
-                          diffusion_agents_xy)
-        remove_indices = np.argwhere(distances.flatten() > self._radius)
-        remove_tokens = np.array(list(
-            self._diffusion_agents.keys()))[remove_indices.flatten()]
-
-        # Remove agents which are out of scope
-        for token in remove_tokens:
-            self._diffusion_agents.pop(token)
+        Args:
+            ego_state (EgoState): 기준이 되는 ego 상태.
+        """
+        sorted_tokens, sorted_distances = self._compute_sorted_distances(
+            ego_state, self._diffusion_agents)
+        within_radius_tokens = [
+            token for token, dist in zip(sorted_tokens, sorted_distances)
+            if dist <= self._radius
+        ]
+        selected_tokens = within_radius_tokens[:self.predicted_neighbor_num]
+        self._diffusion_agents = {
+            token: self._diffusion_agents[token] for token in selected_tokens
+        }
 
     def _get_interpol_time_points(
             self, iteration: SimulationIteration) -> List[TimePoint]:
@@ -333,7 +415,8 @@ class WorldModelAgents(AbstractMLAgents):
         )
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
             next_iteration.index)
-        diffusion_agents_track_tokens = set(self._diffusion_agents.keys())
+        diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
+            self.current_ego_state, self._diffusion_agents)
         current_input = PlannerInput(next_iteration, history,
                                      traffic_light_data,
                                      diffusion_agents_track_tokens,
@@ -345,7 +428,7 @@ class WorldModelAgents(AbstractMLAgents):
 
         # Infer model
 
-        self._infer_model(features)
+        self._infer_model(features, diffusion_agents_track_tokens)
 
     def update_observation(
             self,
@@ -371,7 +454,10 @@ class WorldModelAgents(AbstractMLAgents):
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
 
-    def get_rear_wheelbases(self, agents:List[Agent]) -> List[float]:
+    def get_rear_wheelbases(
+            self, agents: List[Agent],
+            diffusion_agents_track_tokens: List[str]) -> List[float]:
+        # TODO: current_agents 중에서, track_token에 해당하는 것만 추출해야함.
         """각 차량의 중심에서 뒷축까지 거리를 계산한다.
 
         Returns:
@@ -384,10 +470,8 @@ class WorldModelAgents(AbstractMLAgents):
             rear_wheelbases.append(float(box.rear_axle_to_center_dist))
         return rear_wheelbases
 
-    def _infer_model(
-        self,
-        features: FeaturesType,
-    ) -> None:
+    def _infer_model(self, features: FeaturesType,
+                     diffusion_agents_track_tokens: List[str]) -> None:
         # npc_future_trajectories: (Pnn, T, 4)
         """
         TODO: self._model_loader.infer 가 track_token 추출해야함.
@@ -402,17 +486,21 @@ class WorldModelAgents(AbstractMLAgents):
         
         self.current_observation 을 사용해서.
         """
-        current_agents: List[Agent] = self.current_observation.tracked_objects.get_agents()
-        # TODO: current_agents 중에서, track_token에 해당하는 것만 추출해야함.
-        rear_wheelbases = self.get_rear_wheelbases(current_agents)
+        current_agents: List[
+            Agent] = self.current_observation.tracked_objects.get_agents()
+        rear_wheelbases = self.get_rear_wheelbases(
+            current_agents, diffusion_agents_track_tokens)
         # npc_future_trajectories from torch.Tensor to numpy
-        npc_future_trajectories = npc_future_trajectories.detach().numpy()  # (Pnn, T, 4)
+        npc_future_trajectories = npc_future_trajectories.detach().numpy(
+        )  # (Pnn, T, 4)
         for npc_idx in range(npc_future_trajectories.shape[0]):
-            traj = npc_future_trajectories[npc_idx].cpu().numpy() # (T, 4)
+            traj = npc_future_trajectories[npc_idx].cpu().numpy()  # (T, 4)
             rear_wheelbase = rear_wheelbases[npc_idx]
-            traj = convert_center_to_rear_axle(traj, rear_wheelbase) # (T, 4)
-            npc_future_trajectories[npc_idx] = traj
-
+            traj = convert_center_to_rear_axle(traj, rear_wheelbase)  # (T, 4)
+            # ego 뒷축 좌표계 → vehicle 뒷축 좌표계 로 일괄 변환
+            future_traj_wrt_npc_rear = transform_trajectory(
+                traj, ego_rear_axle_xy, ego_yaw,
+                np.array(veh.rear_axle_xy, dtype=np.float32), veh.heading_theta)
 
         for agent_token, agent_prediction in predictions.items():
             agent_meta = self._diffusion_agents[agent_token]

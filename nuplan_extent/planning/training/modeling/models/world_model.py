@@ -16,6 +16,7 @@ from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 
+
 # nuplan/planning/training/preprocessing/feature_builders/raster_feature_builder.py
 # nuplan_extent.planning.training.preprocessing.feature_builders.horizon_vector_feature_builder.GenericAgentsFeatureBuilder
 class WorldModel(TorchModuleWrapper):
@@ -60,7 +61,6 @@ class WorldModel(TorchModuleWrapper):
         else:
             raise RuntimeError("No checkpoint path provided")
 
-
     def outputs_to_trajectory(
             self, outputs: Dict[str, torch.Tensor],
             ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
@@ -75,6 +75,7 @@ class WorldModel(TorchModuleWrapper):
                                                  self._step_interval)
 
         return states
+
     def forward(self, features: WorldModelFeature) -> torch.Tensor:
         """
         The main inference call for the model.
@@ -93,7 +94,8 @@ class WorldModel(TorchModuleWrapper):
             self.config.future_len,
             4,
         )
-        npc_future_trajectories = npc_future_trajectories.squeeze(0)  # (Pnn, T, 4)
+        npc_future_trajectories = npc_future_trajectories.squeeze(
+            0)  # (Pnn, T, 4)
         return npc_future_trajectories
         """
         TODO: npc_future_trajectories 는 x, y, cos(yaw), sin(yaw) 로 되어있음.
@@ -109,4 +111,4 @@ class WorldModel(TorchModuleWrapper):
             """
             future_trajectory = InterpolatedTrajectory(
                 trajectory=self.outputs_to_trajectory(npc_future_trajectory,
-                                                 self_history))
+                                                      self_history))
