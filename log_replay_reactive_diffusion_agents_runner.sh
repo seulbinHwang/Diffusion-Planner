@@ -26,7 +26,7 @@ CHALLENGE="log_replay_reactive_diffusion_agents" # e.g., "closed_loop_reactive_a
 # nuplan/planning/script/experiments/simulation/closed_loop_reactive_agents.yaml
 
 BRANCH_NAME=CHALLENGE
-ARGS_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
+ARGS_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/args_base.json
 CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/npc_model.pth
 
 if [ "$SPLIT" == "val14" ]; then
@@ -43,7 +43,7 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
 # $SPLIT test14-random
 
 # 달라진점: simulation ("log_replay_reactive_diffusion_agents") / observation
-python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
+python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     observation.model_config.config.args_file=$ARGS_FILE \
     observation.model_config.ckpt_path=$CKPT_FILE \
@@ -58,4 +58,4 @@ python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     distributed_mode='SINGLE_NODE' \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments, pkg://nuplan_extent.planning.script.experiments, , pkg://nuplan_extent.planning.script.config.simulation  ]"
+    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan_extent.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"

@@ -23,6 +23,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         """
         self._config = config
         self.data_processor = DataProcessor(config)
+        self.observation_normalizer = config.observation_normalizer
 
     @classmethod
     def get_feature_unique_name(cls) -> str:
@@ -45,7 +46,14 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 traffic_light_data,
                 initialization.map_api,
                 initialization.route_roadblock_ids,
-                do_unsqueeze=False)
+                squeeze=True)
+        # (interpol_num, 11)
+        model_inputs[
+            "ego_agent_next_11_dim"] = current_input.ego_agent_next_11_dim
+        # (future_len, 11)
+        model_inputs[
+            "ego_future_gt_11_dim"] = current_input.ego_agent_future_11_dim
+        model_inputs = self.observation_normalizer(model_inputs)
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)
             neighbor_agents_past=model_inputs[
@@ -66,6 +74,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             near_route_lanes=None,
             near_route_lanes_speed_limit=None,
             near_route_lanes_has_speed_limit=None,
-            ego_agent_next_11_dim=current_input.ego_agent_next_11_dim,
-            ego_future_gt_11_dim=current_input.ego_agent_future_11_dim)
+            ego_agent_next_11_dim=model_inputs[
+                "ego_agent_next_11_dim"],  # (interpol_num, 11)
+            ego_future_gt_11_dim=model_inputs["ego_future_gt_11_dim"]
+        )  # (future_len, 11)
         return world_model_feature

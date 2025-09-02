@@ -34,8 +34,7 @@ class WorldModelFeature(AbstractModelFeature):
     ###########
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
-    ego_future_gt_11_dim: Optional[
-        FeatureDataType] = None  # (future_time_len, 11)
+    ego_future_gt_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
 
     def to_feature_tensor(self) -> WorldModelFeature:
         """Convert numpy arrays to torch tensors."""
@@ -217,7 +216,7 @@ class WorldModelFeature(AbstractModelFeature):
             - "near_route_lanes_speed_limit": (B, Pnn, 1) or None
             - "near_route_lanes_has_speed_limit": (B, Pnn, 1) or None
             - "ego_agent_next_11_dim": (B, interpol_num, 11) or None
-            - "ego_agent_future_11_dim": (B, future_time_len, 11) or None
+            - "ego_agent_future_11_dim": (B, future_len, 11) or None
         """
 
         # 지역 import로 의존성 최소화 (클래스 외부 수정 없이 동작)

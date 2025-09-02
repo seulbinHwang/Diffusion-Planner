@@ -79,7 +79,7 @@ class DataProcessor(object):
                             map_api,
                             route_roadblock_ids,
                             device='cpu',
-                            do_unsqueeze=True) -> Dict[str, torch.Tensor]:
+                            squeeze=False) -> Dict[str, torch.Tensor]:
         '''
         ego
         '''
@@ -95,6 +95,7 @@ class DataProcessor(object):
         '''
         ego_state_buffer = history_buffer.ego_state_buffer
         # all_frame_ego_feature: np.ndarray: (num_frames, 10)
+        # 가장 과거 -> 가장 최근 순서
         all_frame_ego_feature = sampled_ego_objects_to_array_list(
             ego_state_buffer)
 
@@ -147,7 +148,7 @@ class DataProcessor(object):
         # data: Dict[str, np.ndarray]
         data.update(vector_map)
         # data: Dict[str, torch.Tensor]
-        data = convert_to_model_inputs(data, device, do_unsqueeze)
+        data = convert_to_model_inputs(data, device, squeeze)
 
         return data
 

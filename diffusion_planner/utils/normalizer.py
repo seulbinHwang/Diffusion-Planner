@@ -17,6 +17,13 @@ class StateNormalizer:
         std =  [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
         return cls(mean, std)
 
+    @classmethod
+    def from_json2(cls, args_dict):
+        data = openjson(args_dict["normalization_file_path"])
+        mean = [[data["neighbor"]["mean"]]] * args_dict["predicted_neighbor_num"]
+        std =  [[data["neighbor"]["std"]]] * args_dict["predicted_neighbor_num"]
+        return cls(mean, std)
+
     def __call__(self, data):
         # data: (256, 10, 80, 4)
         # mean, std: (10, 1, 4)
@@ -44,6 +51,19 @@ class ObservationNormalizer:
         else:
             path = args.normalization_file_path
 
+        data = openjson(path)
+        ndt = {}
+        for k, v in data.items():
+            if k not in ["ego", "neighbor"]:
+                ndt[k] = {
+                    "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                    "std": torch.tensor(v["std"], dtype=torch.float32)
+                }
+        return cls(ndt)
+
+    @classmethod
+    def from_json2(cls, args_dict):
+        path = args_dict.normalization_file_path
         data = openjson(path)
         ndt = {}
         for k, v in data.items():

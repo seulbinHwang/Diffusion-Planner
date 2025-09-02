@@ -45,7 +45,7 @@ echo "PLANNER: $PLANNER"
 # $ARGS_FILE /home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
-python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
+python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     planner=$PLANNER \
     planner.diffusion_planner.config.args_file=$ARGS_FILE \
@@ -63,4 +63,4 @@ python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     distributed_mode='SINGLE_NODE' \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments, pkg://nuplan_extent.planning.script.experiments, , pkg://nuplan_extent.planning.script.config.simulation  ]"
+    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan_extent.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"

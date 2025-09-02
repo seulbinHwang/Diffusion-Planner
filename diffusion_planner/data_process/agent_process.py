@@ -121,6 +121,7 @@ def sampled_ego_objects_to_array_list(
     all_frame_ego_feature = []
 
     for past_idx in range(len(ego_state_buffer)):
+        # 가장 과거 -> 가장 최근 순서
         track_ego: EgoState = ego_state_buffer[past_idx]
         frame_agents_feature = _extract_ego_array(track_ego)
         all_frame_ego_feature.append(frame_agents_feature)
@@ -321,6 +322,7 @@ def agent_past_process(
         # ego_agent_past: (num_frames, 11)
         ego_agent_past = convert_absolute_quantities_to_relative(
             all_frame_ego_feature, anchor_ego_state)
+        assert ego_agent_past.shape[1] == 11
         ego_agent_past = ego_agent_past.astype(np.float32)
     else:
         ego_agent_past = None

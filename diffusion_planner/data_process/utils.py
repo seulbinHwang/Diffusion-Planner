@@ -300,17 +300,17 @@ def vector_set_coordinates_to_local_frame(
 # =====================
 # 3. Numpy-Tensor transformation
 # =====================
-def convert_to_model_inputs(data, device, do_unsqueeze):
+def convert_to_model_inputs(data, device, squeeze):
     tensor_data = {}
     for k, v in data.items():
         if isinstance(v, np.ndarray) and v.dtype == np.bool_:
             a = torch.tensor(v, dtype=torch.bool).to(device)
-            if do_unsqueeze:
+            if not squeeze:
                 a = a.unsqueeze(0)
             tensor_data[k] = a
         else:
             b = torch.tensor(v, dtype=torch.float32).to(device)
-            if do_unsqueeze:
+            if not squeeze:
                 b = b.unsqueeze(0)
             tensor_data[k] = b
 

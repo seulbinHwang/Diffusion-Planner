@@ -1,4 +1,4 @@
-from typing import List, Dict, Deque
+from typing import List, Dict, Deque, Optional
 
 import timm
 import torch
@@ -27,7 +27,7 @@ class WorldModel(TorchModuleWrapper):
         ckpt_path: str,  #
         feature_builders: List[AbstractFeatureBuilder],  #
         target_builders: List[AbstractTargetBuilder],  # 안씀
-        future_trajectory_sampling: TrajectorySampling,  # 안씀
+        future_trajectory_sampling: TrajectorySampling,  # 씀.
         enable_ema: bool = True,
     ):
         super().__init__(
@@ -81,7 +81,7 @@ class WorldModel(TorchModuleWrapper):
         The main inference call for the model.
         :param features: A dictionary of the required features.
         """
-        inputs = features.to_tensor_dict()
+        inputs: Dict[str, Optional[torch.Tensor]] = features.to_tensor_dict()
         _, outputs = self._planner(inputs)
         """
         outputs: Dict[str, torch.Tensor]
@@ -97,18 +97,3 @@ class WorldModel(TorchModuleWrapper):
         npc_future_trajectories = npc_future_trajectories.squeeze(
             0)  # (Pnn, T, 4)
         return npc_future_trajectories
-        """
-        TODO: npc_future_trajectories 는 x, y, cos(yaw), sin(yaw) 로 되어있음.
-        그런데, 각 차량의 중심에 대한 x, y, yaw 값임. (ego 좌표계 기준)
-        나는 npc_future_trajectories를, 각 챠량의 rear_axle 좌표계 기준으로 바꾸고 싶음.
-        """
-        for agent_idx in range(npc_future_trajectories.shape[0]):
-            npc_future_trajectory = npc_future_trajectories[agent_idx]  # (T, 4)
-            """
-            TODO:
-            npc_future_trajectory 의 값에 대해
-                ego 뒷축 좌표계 → vehicle 뒷축 좌표계 로 일괄 변환
-            """
-            future_trajectory = InterpolatedTrajectory(
-                trajectory=self.outputs_to_trajectory(npc_future_trajectory,
-                                                      self_history))
