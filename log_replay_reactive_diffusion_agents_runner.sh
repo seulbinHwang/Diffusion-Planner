@@ -6,9 +6,9 @@ export HYDRA_FULL_ERROR=1
 ###################################
 # Set environment variables
 export NUPLAN_DEVKIT_ROOT="/home/user/PycharmProjects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
-export NUPLAN_DATA_ROOT="/home/user/PycharmProjects/Diffusion-Planner/data" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
-export NUPLAN_MAPS_ROOT="/home/user/PycharmProjects/Diffusion-Planner/data/nuplan-v1.1/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
-export NUPLAN_EXP_ROOT="/home/user/PycharmProjects/Diffusion-Planner/data/nuplan-v1.1/exp" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
+export NUPLAN_DATA_ROOT="/home/user/nuplan/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
+export NUPLAN_MAPS_ROOT="/home/user/nuplan/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
+export NUPLAN_EXP_ROOT="/home/user/nuplan/exp" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 
 # Dataset split to use
 # Options:
@@ -21,11 +21,11 @@ SPLIT="val14"  # e.g., "val14"
 # Options:
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
-CHALLENGE="closed_loop_reactive_diffusion_agents" # e.g., "closed_loop_reactive_agents"
+CHALLENGE="log_replay_reactive_diffusion_agents" # e.g., "closed_loop_reactive_agents"
 ###################################
 # nuplan/planning/script/experiments/simulation/closed_loop_reactive_agents.yaml
 
-BRANCH_NAME=diffusion_planner_release
+BRANCH_NAME=CHALLENGE
 ARGS_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
 CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/model.pth
 
@@ -35,20 +35,14 @@ else
     SCENARIO_BUILDER="nuplan_challenge"
 fi
 echo "Processing $CKPT_FILE..."
-FILENAME=$(basename "$CKPT_FILE")
-FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}"
-# diffusion_planner/planner/planner.py 의 DiffusionPlanner
-PLANNER=diffusion_planner
-# print PLANNER
-echo "PLANNER: $PLANNER"
+FILENAME=$(basename "$CKPT_FILE") # FILENAME: model.pth
+FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
+
 # $ARGS_FILE /home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
 python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
-    planner=$PLANNER \
-    planner.diffusion_planner.config.args_file=$ARGS_FILE \
-    planner.diffusion_planner.ckpt_path=$CKPT_FILE \
     observation.model_config.ckpt_path=$CKPT_FILE \
     observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
     observation.checkpoint_path=$CKPT_FILE \
