@@ -23,17 +23,17 @@ class WorldModel(TorchModuleWrapper):
 
     def __init__(
         self,
-        config: Config,
-        ckpt_path: str,
-        feature_builders: List[AbstractFeatureBuilder],
-        target_builders: List[AbstractTargetBuilder],
-        future_trajectory_sampling: TrajectorySampling,
+        config: Config,  #
+        ckpt_path: str,  #
+        feature_builders: List[AbstractFeatureBuilder],  #
+        target_builders: List[AbstractTargetBuilder],  # 안씀
+        future_trajectory_sampling: TrajectorySampling,  # 안씀
         enable_ema: bool = True,
     ):
         super().__init__(
+            future_trajectory_sampling=future_trajectory_sampling,
             feature_builders=feature_builders,
             target_builders=target_builders,
-            future_trajectory_sampling=future_trajectory_sampling,
         )
         self.config = config
         self._planner = Diffusion_Planner(config)

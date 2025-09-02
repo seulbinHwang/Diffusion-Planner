@@ -21,7 +21,7 @@ SPLIT="val14"  # e.g., "val14"
 # Options:
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
-CHALLENGE="log_replay_reactive_diffusion_agents" # e.g., "closed_loop_reactive_agents"
+CHALLENGE="log_replay_nonreactive_agents" # e.g., "closed_loop_reactive_agents"
 ###################################
 # nuplan/planning/script/experiments/simulation/closed_loop_reactive_agents.yaml
 
@@ -42,13 +42,8 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
 
-# 달라진점: simulation ("log_replay_reactive_diffusion_agents") / observation
 python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
-    observation.model_config.config.args_file=$ARGS_FILE \
-    observation.model_config.ckpt_path=$CKPT_FILE \
-    observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
-    observation.checkpoint_path=$CKPT_FILE \
     scenario_builder=$SCENARIO_BUILDER \
     scenario_filter=$SPLIT \
     experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \

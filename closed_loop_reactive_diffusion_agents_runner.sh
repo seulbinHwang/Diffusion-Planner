@@ -27,7 +27,8 @@ CHALLENGE="closed_loop_reactive_diffusion_agents" # e.g., "closed_loop_reactive_
 
 BRANCH_NAME=CHALLENGE
 ARGS_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
-CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/model.pth
+PLANNER_CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/model.pth
+CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/npc_model.pth
 
 if [ "$SPLIT" == "val14" ]; then
     SCENARIO_BUILDER="nuplan"
@@ -48,7 +49,8 @@ python $NUPLAN_DEVKIT_ROOT/nuplan/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     planner=$PLANNER \
     planner.diffusion_planner.config.args_file=$ARGS_FILE \
-    planner.diffusion_planner.ckpt_path=$CKPT_FILE \
+    planner.diffusion_planner.ckpt_path=$PLANNER_CKPT_FILE \
+    observation.model_config.config.args_file=$ARGS_FILE \
     observation.model_config.ckpt_path=$CKPT_FILE \
     observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
     observation.checkpoint_path=$CKPT_FILE \
