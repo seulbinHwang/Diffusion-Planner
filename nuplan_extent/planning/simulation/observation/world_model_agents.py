@@ -457,7 +457,8 @@ class WorldModelAgents(AbstractMLAgents):
     def get_rear_wheelbases(
             self, agents: List[Agent],
             diffusion_agents_track_tokens: List[str]) -> List[float]:
-        # TODO: current_agents 중에서, track_token에 해당하는 것만 추출해야함.
+        # TODO: diffusion_agents_track_tokens에 해당하는 agent의 것만 추출해야함.
+        #  diffusion_agents_track_tokens 순서 그대로 rear_wheelbases 리스트 만들어야함.
         """각 차량의 중심에서 뒷축까지 거리를 계산한다.
 
         Returns:
