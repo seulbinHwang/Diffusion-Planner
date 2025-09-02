@@ -1,12 +1,14 @@
-from typing import cast, List, Dict, Optional
+from typing import cast, List, Dict, Optional, Deque, Tuple
 import numpy as np
 import numpy.typing as npt
 import torch
+from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
-from nuplan.common.actor_state.oriented_box import OrientedBox
+from nuplan.common.actor_state.car_footprint import CarFootprint
 from nuplan.common.actor_state.state_representation import StateSE2, StateVector2D, TimePoint
 from nuplan.common.actor_state.tracked_objects import TrackedObject
-from nuplan.common.actor_state.waypoint import Waypoint
+from collections import deque
+from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
 from nuplan.common.geometry.convert import numpy_array_to_absolute_pose, numpy_array_to_absolute_velocity
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWrapper
@@ -28,7 +30,124 @@ from scipy.spatial.distance import cdist
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from decimal import Decimal, ROUND_HALF_UP
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
+from nuplan.common.actor_state.vehicle_parameters import VehicleParameters
+from nuplan.common.actor_state.dynamic_car_state import DynamicCarState
 from nuplan.planning.simulation.observation.observation_type import Observation
+
+
+def observations_to_agents_buffer(
+        observations_buffer: Deque[Observation]) -> Deque[List[Agent]]:
+    """Observation 버퍼를 Agent 리스트 버퍼로 변환한다.
+
+    Args:
+        observations_buffer (Deque[Observation]): 시간 순서로 정렬된 관측 버퍼.
+
+    Returns:
+        Deque[List[Agent]]: 각 관측에서 추출한 Agent 리스트를 저장한 버퍼.
+
+    Raises:
+        TypeError: 관측이 ``DetectionsTracks`` 타입이 아닐 경우.
+    """
+    agents_buffer: Deque[List[Agent]] = deque(maxlen=observations_buffer.maxlen)
+    for observation in observations_buffer:
+        if not isinstance(observation, DetectionsTracks):
+            raise TypeError("observations_buffer는 DetectionsTracks만 포함해야 합니다.")
+        agents_buffer.append(observation.tracked_objects.get_agents())
+
+    return agents_buffer
+
+
+def build_current_ego_state_histories(
+        agents_buffer: Deque[List[Agent]],
+        max_len: int) -> Dict[str, Deque[EgoState]]:
+    """현재 시점에 존재하는 Agent들의 과거 기록을 생성한다.
+
+    버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
+    각 Agent의 상태를 수집한다. 과거 시점에 해당 Agent가 없으면 바로 직전 시점의 Agent를 복제하여
+    채워 넣는다.
+
+    Args:
+        agents_buffer (Deque[List[Agent]]): 시간 순서대로 정렬된 Agent 버퍼. 길이 :math:`T`의 버퍼이며,
+            각 시점마다 임의 길이의 ``Agent`` 리스트를 포함한다.
+
+    Returns:
+        Dict[str, Deque[EgoState]]: 현재 시점에 존재하는 Agent 수 :math:`N` 만큼의 리스트를 반환한다. 각 내부
+            리스트는 길이 :math:`T`이며, 시간 역순(현재→과거)으로 해당 Agent의 히스토리를 담고 있다.
+    """
+
+    if not agents_buffer:
+        return {}
+
+    current_agents: List[Agent] = agents_buffer[-1]
+    token_to_idx = {
+        agent.track_token: idx for idx, agent in enumerate(current_agents)
+    }
+    histories: Dict[str, Deque] = {
+        agent.track_token: deque(maxlen=max_len) for agent in current_agents
+    }
+    # 현재 시점 상태 추가
+    for agent in current_agents:
+        histories[agent.track_token].append(agent)
+    # max_len
+    for past_agents in reversed(list(agents_buffer)[:-1]):
+        past_agent_lookup: Dict[str, Agent] = {
+            agent.track_token: agent for agent in past_agents
+        }
+        for token, idx in token_to_idx.items():
+            agent_history: Deque[Agent] = histories[token]
+            agent_history.append(past_agent_lookup.get(token,
+                                                       agent_history[-1]))
+    # histories를 시간 순서(과거→현재)로 뒤집기
+    for history in histories.values():
+        history.reverse()
+        for i, agent in enumerate(history):
+            history[i] = agent_to_ego_state(agent)
+    return histories
+
+
+def agent_to_ego_state(
+    agent: Agent,
+    tire_steering_angle: float = 0.0,
+    is_in_auto_mode: bool = False,
+) -> EgoState:
+    """Agent 인스턴스를 EgoState로 변환합니다.
+
+    Args:
+        agent (Agent): CarFootprint 정보를 포함한 에이전트.
+        tire_steering_angle (float): 타이어 조향각 [rad]. 기본값은 0.0.
+        is_in_auto_mode (bool): 자율 주행 모드 여부. 기본값은 False.
+
+    Returns:
+        EgoState: 생성된 EgoState 인스턴스.
+
+    Raises:
+        TypeError: ``agent.box``가 ``CarFootprint``가 아닌 경우.
+    """
+
+    if not isinstance(agent.box, CarFootprint):
+        raise TypeError("agent.box는 CarFootprint 타입이어야 합니다.")
+
+    car_footprint: CarFootprint = agent.box
+    vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
+
+    rear_axle_velocity: StateVector2D = agent.velocity  # shape: (2,)
+    rear_axle_acceleration: StateVector2D = StateVector2D(0.0,
+                                                          0.0)  # shape: (2,)
+
+    dynamic_car_state = DynamicCarState.build_from_rear_axle(
+        rear_axle_to_center_dist=vehicle_params.rear_axle_to_center,
+        rear_axle_velocity_2d=rear_axle_velocity,
+        rear_axle_acceleration_2d=rear_axle_acceleration,
+        angular_velocity=agent.angular_velocity or 0.0,
+    )
+
+    return EgoState(
+        car_footprint=car_footprint,
+        dynamic_car_state=dynamic_car_state,
+        tire_steering_angle=tire_steering_angle,
+        is_in_auto_mode=is_in_auto_mode,
+        time_point=TimePoint(agent.metadata.timestamp_us),
+    )
 
 
 def rotation_matrix(theta: float) -> np.ndarray:
@@ -137,7 +256,8 @@ class WorldModelAgents(AbstractMLAgents):
         self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
         self._target_velocity = target_velocity
-        self.plan_dt = 0.1  # [s] # TODO: remove hardcoding
+        self._step_interval = 0.1  # [s]
+        self._future_horizon = self.config.future_len * self._step_interval  # [s]
 
     def _initialize_open_loop_detection_types(
             self, open_loop_detections: List[str]) -> None:
@@ -256,10 +376,10 @@ class WorldModelAgents(AbstractMLAgents):
         self.step_s_time: float = self.step_time.time_s
         """
         self.step_s_time : 0.15
-        self.plan_dt : 0.1 이면
+        self._step_interval : 0.1 이면
             q = 1.5 -> interpol_num = 2
         """
-        q = Decimal(str(self.step_s_time)) / Decimal(str(self.plan_dt))
+        q = Decimal(str(self.step_s_time)) / Decimal(str(self._step_interval))
         interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         interpol_num = max(interpol_num, 1)
         """
@@ -272,7 +392,7 @@ class WorldModelAgents(AbstractMLAgents):
                                        interpol_num,
                                        num=interpol_num + 1,
                                        dtype=int)[1:]  # (interpol_num, )
-        interpol_points_times = interpol_indices * self.plan_dt  # (interpol_num, )
+        interpol_points_times = interpol_indices * self._step_interval  # (interpol_num, )
         interpol_time_points = []
         for interpol_time in interpol_points_times:
             time_point = TimePoint(time_us=int(iteration.time_point.time_us +
@@ -379,6 +499,7 @@ class WorldModelAgents(AbstractMLAgents):
             history: SimulationHistoryBuffer,
             next_ego_state: Optional[EgoState],
             ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
+        self.history_buffer = history
         self.current_iteration = next_iteration.index
         self.step_time = next_iteration.time_point - iteration.time_point
         # current_ego_state: EgoState
@@ -415,20 +536,18 @@ class WorldModelAgents(AbstractMLAgents):
         )
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
             next_iteration.index)
-        diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
+        self.diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
             self.current_ego_state, self._diffusion_agents)
         current_input = PlannerInput(next_iteration, history,
                                      traffic_light_data,
-                                     diffusion_agents_track_tokens,
+                                     self.diffusion_agents_track_tokens,
                                      ego_agent_next_11_dim.astype(np.float32),
                                      ego_agent_future_11_dim.astype(np.float32))
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
-
         # Infer model
-
-        self._infer_model(features, diffusion_agents_track_tokens)
+        self._infer_model(features)
 
     def update_observation(
             self,
@@ -454,54 +573,142 @@ class WorldModelAgents(AbstractMLAgents):
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
 
-    def get_rear_wheelbases(
-            self, agents: List[Agent],
-            diffusion_agents_track_tokens: List[str]) -> List[float]:
-        # TODO: diffusion_agents_track_tokens에 해당하는 agent의 것만 추출해야함.
-        #  diffusion_agents_track_tokens 순서 그대로 rear_wheelbases 리스트 만들어야함.
-        """각 차량의 중심에서 뒷축까지 거리를 계산한다.
+    @staticmethod
+    def extract_rear_wheelbases(agents: Dict[str, Agent],
+                                track_tokens: List[str]) -> List[float]:
+        """주어진 토큰 순서대로 차량의 뒷축까지 거리를 추출한다.
 
+        Args:
+            agents (Dict[str, Agent]): shape (M,) track token을 키로 하는 agent 사전.
+            track_tokens (List[str]): shape (N,) 뒷축 거리를 추출할 track token 목록.
+
+        Returns:
+            List[float]: shape (N,) 각 차량의 중심에서 뒷축까지 거리 [m].
+
+        Raises:
+            KeyError: 주어진 track token에 해당하는 agent가 없을 때 발생.
+        """
+        rear_wheelbases: List[float] = []
+        for token in track_tokens:
+            agent = agents[token]
+            box = agent.box
+            assert isinstance(box, CarFootprint)
+            rear_wheelbases.append(float(box.rear_axle_to_center_dist))
+        return rear_wheelbases
+
+    def get_rear_wheelbases(
+            self, agents: Dict[str, Agent],
+            diffusion_agents_track_tokens: List[str]) -> List[float]:
+        """각 차량의 중심에서 뒷축까지 거리를 계산한다.
+        Args:
+            agents (List[Agent]): shape (M,) 현재 프레임에서 관측된 agent 목록.
+            diffusion_agents_track_tokens (List[str]): shape (N,) wheelbase를 추출할 track token.
         Returns:
             List[float]: shape (N,) 각 차량의 뒷축까지 거리 [m].
 
         """
+
         rear_wheelbases: List[float] = []
-        for agent in agents:
+        for token in diffusion_agents_track_tokens:
+            agent = agents[token]
             box = agent.box
+            assert isinstance(box, CarFootprint)
             rear_wheelbases.append(float(box.rear_axle_to_center_dist))
         return rear_wheelbases
 
-    def _infer_model(self, features: FeaturesType,
-                     diffusion_agents_track_tokens: List[str]) -> None:
-        # npc_future_trajectories: (Pnn, T, 4)
-        """
-        TODO: self._model_loader.infer 가 track_token 추출해야함.
+    def outputs_to_trajectory(
+            self, future_traj_wrt_npc_rear: np.ndarray,
+            ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
+        heading = np.arctan2(future_traj_wrt_npc_rear[:, 3],
+                             future_traj_wrt_npc_rear[:, 2])[..., None]
+        future_traj_wrt_npc_rear = np.concatenate(
+            [future_traj_wrt_npc_rear[..., :2], heading], axis=-1)
+
+        states = transform_predictions_to_states(future_traj_wrt_npc_rear,
+                                                 ego_state_history,
+                                                 self._future_horizon,
+                                                 self._step_interval)
+        return states
+
+    def get_rear_axle_pose(
+            self, current_ego_state: EgoState) -> Tuple[np.ndarray, float]:
+        """차량 뒷축의 위치와 방향을 계산한다.
+
+        Returns:
+            np.ndarray: shape (3,) [x, y, yaw_rad] 형태의 뒷축 SE(2) 포즈.
 
         """
-        npc_future_trajectories: torch.Tensor = self._model_loader.infer(
+        rear_axle = current_ego_state.car_footprint.rear_axle
+        position: np.ndarray = np.array([
+            rear_axle.x,
+            rear_axle.y,
+        ],
+                                        dtype=float)  # shape: (2,)
+        return position, rear_axle.heading,
+
+    def get_rear_axle_poses(self,
+                            current_agent: Agent) -> Tuple[np.ndarray, float]:
+        """각 차량의 뒷축 위치와 방향을 계산한다.
+
+        Returns:
+            List[np.ndarray]: shape (N, 3) 각 차량의 뒷축 [x, y, yaw_rad].
+
+        """
+        box = current_agent.box
+        assert isinstance(box, CarFootprint)
+        rear_axle = box.rear_axle
+        position: np.ndarray = np.array([
+            rear_axle.x,
+            rear_axle.y,
+        ],
+                                        dtype=float)  # shape: (2,)
+
+        return position, rear_axle.heading
+
+    def _infer_model(self, features: FeaturesType) -> None:
+        # npc_future_trajs_wrt_ego: (Pnn, T, 4)
+        npc_future_trajs_wrt_ego: torch.Tensor = self._model_loader.infer(
             features)
-        """
-        TODO: npc_future_trajectories 는 x, y, cos(yaw), sin(yaw) 로 되어있음.
-        그런데, 각 차량의 중심에 대한 x, y, yaw 값임. (ego 좌표계 기준)
-        나는 npc_future_trajectories를, 각 챠량의 rear_axle 좌표계 기준으로 바꾸고 싶음.
-        
-        self.current_observation 을 사용해서.
-        """
+        # Deque[EgoState]
+        agents_buffer: Deque[List[Agent]] = observations_to_agents_buffer(
+            self.history_buffer.observation_buffer)
+        agent_histories: Dict[
+            str, Deque[EgoState]] = build_current_ego_state_histories(
+                agents_buffer, self.history_buffer.observation_buffer.maxlen)
         current_agents: List[
             Agent] = self.current_observation.tracked_objects.get_agents()
-        rear_wheelbases = self.get_rear_wheelbases(
-            current_agents, diffusion_agents_track_tokens)
-        # npc_future_trajectories from torch.Tensor to numpy
-        npc_future_trajectories = npc_future_trajectories.detach().numpy(
+        current_agents: Dict[str, Agent] = {
+            agent.track_token: agent
+            for agent in current_agents
+            if agent.track_token is not None
+        }  # shape (M,)
+        rear_wheelbases: List[float] = self.get_rear_wheelbases(
+            current_agents, self.diffusion_agents_track_tokens)
+        # npc_future_trajs_wrt_ego from torch.Tensor to numpy
+        npc_future_trajs_wrt_ego = npc_future_trajs_wrt_ego.detach().numpy(
         )  # (Pnn, T, 4)
-        for npc_idx in range(npc_future_trajectories.shape[0]):
-            traj = npc_future_trajectories[npc_idx].cpu().numpy()  # (T, 4)
+        predictions: Dict[str, AbstractTrajectory] = {}
+        for npc_idx in range(npc_future_trajs_wrt_ego.shape[0]):
+            track_token: str = self.diffusion_agents_track_tokens[npc_idx]
+            a_npc_future_traj_wrt_ego = npc_future_trajs_wrt_ego[npc_idx].cpu(
+            ).numpy()  # (T, 4)
             rear_wheelbase = rear_wheelbases[npc_idx]
-            traj = convert_center_to_rear_axle(traj, rear_wheelbase)  # (T, 4)
+            a_npc_future_traj_wrt_ego = convert_center_to_rear_axle(
+                a_npc_future_traj_wrt_ego, rear_wheelbase)  # (T, 4)
             # ego 뒷축 좌표계 → vehicle 뒷축 좌표계 로 일괄 변환
+            ego_rear_axle_xy, ego_yaw = self.get_rear_axle_pose(
+                self.current_ego_state)
+            agent_rear_axle_xy, agent_yaw = self.get_rear_axle_poses(
+                current_agents[track_token])
+
             future_traj_wrt_npc_rear = transform_trajectory(
-                traj, ego_rear_axle_xy, ego_yaw,
-                np.array(veh.rear_axle_xy, dtype=np.float32), veh.heading_theta)
+                a_npc_future_traj_wrt_ego, ego_rear_axle_xy, ego_yaw,
+                agent_rear_axle_xy, agent_yaw)  # (T, 4)
+            self_history: Deque[EgoState] = agent_histories[track_token]
+            future_trajectory = InterpolatedTrajectory(
+                trajectory=self.outputs_to_trajectory(future_traj_wrt_npc_rear,
+                                                      self_history))
+            predictions[track_token] = future_trajectory
 
         for agent_token, agent_prediction in predictions.items():
             agent_meta = self._diffusion_agents[agent_token]
