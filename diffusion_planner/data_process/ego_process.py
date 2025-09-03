@@ -52,7 +52,7 @@ def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
 
 def sampled_past_ego_states_to_array(
         past_ego_states: List[EgoState]) -> npt.NDArray[np.float32]:
-
+    # 원래 있더 ㄴ함수임
     output = np.zeros((len(past_ego_states), 7), dtype=np.float64)
     for i in range(0, len(past_ego_states), 1):
         output[i, EgoInternalIndex.x()] = past_ego_states[i].center.x
@@ -78,7 +78,9 @@ def sampled_past_ego_states_to_array(
 
 def sampled_future_ego_states_to_array(
         future_ego_states: List[EgoState]) -> npt.NDArray[np.float32]:
-    """Convert future ego states to a numpy array.
+    """ 내가 만든거
+
+    Convert future ego states to a numpy array.
 
     Args:
         future_ego_states: List of future ego states.

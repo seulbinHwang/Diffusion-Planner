@@ -1,7 +1,7 @@
 from typing import cast, List, Dict, Optional, Deque, Tuple
 import numpy as np
 import numpy.typing as npt
-import torch
+from nuplan.common.actor_state.dynamic_car_state import get_velocity_shifted
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
 from nuplan.common.actor_state.car_footprint import CarFootprint
@@ -33,34 +33,39 @@ from diffusion_planner.data_process.utils import convert_absolute_quantities_to_
 from nuplan.common.actor_state.vehicle_parameters import VehicleParameters
 from nuplan.common.actor_state.dynamic_car_state import DynamicCarState
 from nuplan.planning.simulation.observation.observation_type import Observation
+from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 
 
 def observations_to_agents_buffer(
         observations_buffer: Deque[Observation]) -> Deque[List[Agent]]:
-    """Observation 버퍼를 Agent 리스트 버퍼로 변환한다.
+    """Observation 버퍼에서 **차량(vehicles)** 만 추출해 Agent 리스트 버퍼로 변환한다.
 
     Args:
         observations_buffer (Deque[Observation]): 시간 순서로 정렬된 관측 버퍼.
 
     Returns:
-        Deque[List[Agent]]: 각 관측에서 추출한 Agent 리스트를 저장한 버퍼.
+        Deque[List[Agent]]: 각 관측에서 추출한 차량 Agent 리스트를 저장한 버퍼.
 
     Raises:
         TypeError: 관측이 ``DetectionsTracks`` 타입이 아닐 경우.
     """
-    agents_buffer: Deque[List[Agent]] = deque(maxlen=observations_buffer.maxlen)
+    vehicles_buffer: Deque[List[Agent]] = deque(maxlen=observations_buffer.maxlen)
     for observation in observations_buffer:
         if isinstance(observation, DetectionsTracks):
-            agents_buffer.append(observation.tracked_objects.get_agents())
+            # 오직 차량(VEHICLE) 타입만 추출한다.
+            vehicles = [
+                agent for agent in observation.tracked_objects.get_agents()
+                if agent.tracked_object_type == TrackedObjectType.VEHICLE
+            ]
+            vehicles_buffer.append(vehicles)
         else:
-            # [FIX] 더 친절한 에러 메시지 (혹은 스킵을 원하면 continue)
-            raise TypeError(f"observations_buffer는 DetectionsTracks만 포함해야 합니다. "
+            raise TypeError("observations_buffer는 DetectionsTracks만 포함해야 합니다. "
                             f"받은 타입: {type(observation)}")
-    return agents_buffer
+    return vehicles_buffer
 
 
-def build_current_ego_state_histories(
-        agents_buffer: Deque[List[Agent]]) -> Dict[str, Deque[EgoState]]:
+def build_current_ego_state_buffer(
+        vehicles_buffer: Deque[List[Agent]]) -> Dict[str, Deque[EgoState]]:
     """현재 시점에 존재하는 Agent들의 과거 기록을 생성한다.
 
     버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
@@ -69,18 +74,19 @@ def build_current_ego_state_histories(
     TODO: 이 방식이 최선인가?
 
     Args:
-        agents_buffer (Deque[List[Agent]]): 시간 순서대로 정렬된 Agent 버퍼. 길이 :math:`T`의 버퍼이며,
+        vehicles_buffer (Deque[List[Agent]]): 시간 순서대로 정렬된 Agent 버퍼. 길이 :math:`T`의 버퍼이며,
             각 시점마다 임의 길이의 ``Agent`` 리스트를 포함한다.
 
     Returns:
         Dict[str, Deque[EgoState]]: 현재 시점에 존재하는 Agent 수 :math:`N` 만큼의 리스트를 반환한다. 각 내부
             리스트는 길이 :math:`T`이며, 시간 역순(현재→과거)으로 해당 Agent의 히스토리를 담고 있다.
     """
-    max_len = agents_buffer.maxlen
-    if not agents_buffer:
+    max_len = vehicles_buffer.maxlen
+    if not vehicles_buffer:
         return {}
+    # only for car.
     current_agents: List[Agent] = [
-        agent for agent in agents_buffer[-1] if agent.track_token is not None
+        agent for agent in vehicles_buffer[-1]
     ]
     current_token_to_idx = {
         agent.track_token: idx for idx, agent in enumerate(current_agents)
@@ -92,7 +98,7 @@ def build_current_ego_state_histories(
     for agent in current_agents:
         token_to_history[agent.track_token].append(agent)
     # max_len
-    for past_agents in reversed(list(agents_buffer)[:-1]):
+    for past_agents in reversed(list(vehicles_buffer)[:-1]):
         # 가장 최근 -> 가장 오래된 순서로 과거 시점 상태 추가
         past_agent_lookup: Dict[str, Agent] = {
             agent.track_token: agent for agent in past_agents
@@ -139,9 +145,9 @@ def agent_to_ego_state(
 
     car_footprint: CarFootprint = agent.box
     vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
-
     rear_axle_velocity: StateVector2D = agent.velocity or StateVector2D(
         0.0, 0.0)
+
     rear_axle_acceleration: StateVector2D = StateVector2D(0.0, 0.0)
     angular_velocity = (agent.angular_velocity
                         if agent.angular_velocity is not None else 0.0)
@@ -680,10 +686,6 @@ class WorldModelAgents(AbstractMLAgents):
 
     def infer_model(self, features: Dict[str, AbstractModelFeature],
                     next_iteration: SimulationIteration) -> None:
-        """
-
-
-        """
         feature: AbstractModelFeature = features["world_model_feature"]
         # near_future_tarjs_wrt_ego: (Pnn, T, 4)
         near_future_tarjs_wrt_ego: np.ndarray = self._model_loader.infer(
@@ -700,11 +702,11 @@ class WorldModelAgents(AbstractMLAgents):
             token_to_future_traj_wrt_ego[token] = near_future_tarjs_wrt_ego[idx]
 
         # Deque[EgoState]
-        agents_buffer: Deque[List[Agent]] = observations_to_agents_buffer(
+        vehicles_buffer: Deque[List[Agent]] = observations_to_agents_buffer(
             self.observation_buffer)
         token_to_history: Dict[
             str,
-            Deque[EgoState]] = build_current_ego_state_histories(agents_buffer)
+            Deque[EgoState]] = build_current_ego_state_buffer(vehicles_buffer)
         current_agents: List[
             Agent] = self.current_observation.tracked_objects.get_agents()
         # current_agents: 쓰임
@@ -743,13 +745,20 @@ class WorldModelAgents(AbstractMLAgents):
         new_agents = {}
         for agent_token, interpol_traj in token_to_interpol_traj.items():
             agent_ = self._diffusion_agents[agent_token]
-            # TODO: next_iteration.time_point 가 맞나? self.step_time 이 맞나?
+            # EgoState의 속도는 자차 좌표계 기준 벡터
             new_state: EgoState = interpol_traj.get_state_at_time(
                 next_iteration.time_point)
+            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 변환이 필요하다.
+            v_local = new_state.dynamic_car_state.center_velocity_2d
+            v_global = numpy_array_to_absolute_velocity(
+                new_state.center,
+                np.array([[v_local.x, v_local.y]], dtype=np.float32)
+            )[0]
+
             new_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,
                 oriented_box=new_state.car_footprint,
-                velocity=new_state.dynamic_car_state.center_velocity_2d,
+                velocity=v_global,
                 metadata=agent_.metadata,
             )
             new_agent.predictions = [
