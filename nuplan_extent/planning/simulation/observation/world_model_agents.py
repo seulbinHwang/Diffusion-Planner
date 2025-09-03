@@ -452,7 +452,7 @@ class WorldModelAgents(AbstractMLAgents):
             absolute[i, 0] = state.center.x # 절대 위치
             absolute[i, 1] = state.center.y # 절대 위치
             absolute[i, 2] = state.center.heading # 절대 헤딩
-            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 변환이 필요하다.
+            # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
             v_local = state.dynamic_car_state.center_velocity_2d
             v_global = numpy_array_to_absolute_velocity(
                 state.center,
@@ -503,7 +503,7 @@ class WorldModelAgents(AbstractMLAgents):
             absolute[i, 0] = state.center.x
             absolute[i, 1] = state.center.y
             absolute[i, 2] = state.center.heading
-            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 변환이 필요하다.
+            # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
             v_local = state.dynamic_car_state.center_velocity_2d
             v_global = numpy_array_to_absolute_velocity(
                 state.center,
@@ -762,7 +762,7 @@ class WorldModelAgents(AbstractMLAgents):
             # EgoState의 속도는 자차 좌표계 기준 벡터
             new_state: EgoState = interpol_traj.get_state_at_time(
                 next_iteration.time_point)
-            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 변환이 필요하다.
+            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 자차 좌표계 -> 글로벌 좌표계로의 변환이 필요하다.
             v_local = new_state.dynamic_car_state.center_velocity_2d
             v_global = numpy_array_to_absolute_velocity(
                 new_state.center,

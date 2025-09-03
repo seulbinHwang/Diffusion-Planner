@@ -14,7 +14,7 @@ from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks, Observation
 from nuplan.common.actor_state.ego_state import EgoState
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
-
+from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 
 # =====================
 # 1. Get list of agent array from raw data
@@ -107,8 +107,14 @@ def _extract_ego_array(track_ego: EgoState) -> np.ndarray:
     frame_ego_feature[0] = track_ego.center.x
     frame_ego_feature[1] = track_ego.center.y
     frame_ego_feature[2] = track_ego.center.heading
-    frame_ego_feature[3] = track_ego.dynamic_car_state.center_velocity_2d.x
-    frame_ego_feature[4] = track_ego.dynamic_car_state.center_velocity_2d.y
+    # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
+    v_local = track_ego.dynamic_car_state.center_velocity_2d
+    v_global = numpy_array_to_absolute_velocity(
+        track_ego.center,
+        np.array([[v_local.x, v_local.y]], dtype=np.float32)
+    )[0]
+    frame_ego_feature[3] = v_global.x
+    frame_ego_feature[4] = v_global.y
     frame_ego_feature[5] = track_ego.car_footprint.width
     frame_ego_feature[6] = track_ego.car_footprint.length
     frame_ego_feature[7:10] = [1, 0, 0]  # Mark as VEHICLE
