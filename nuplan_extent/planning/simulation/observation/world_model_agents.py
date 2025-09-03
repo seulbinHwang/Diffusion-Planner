@@ -13,7 +13,7 @@ from nuplan_extent.planning.training.preprocessing.features.world_model import W
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWrapper
 from nuplan.planning.simulation.observation.abstract_ml_agents import AbstractMLAgents
-from nuplan.planning.training.modeling.types import FeaturesType, TargetsType
+from nuplan.common.actor_state.scene_object import SceneObjectMetadata
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import sort_dict
 from nuplan.common.actor_state.tracked_objects_types import AGENT_TYPES, TrackedObjectType
 from nuplan.planning.simulation.simulation_time_controller.simulation_iteration import SimulationIteration
@@ -52,7 +52,7 @@ def observations_to_agents_buffer(
     vehicles_buffer: Deque[List[Agent]] = deque(maxlen=observations_buffer.maxlen)
     for observation in observations_buffer:
         if isinstance(observation, DetectionsTracks):
-            # 오직 차량(VEHICLE) 타입만 추출한다.
+            # Agent 중에, 오직 차량(VEHICLE) 타입만 추출한다.
             vehicles = [
                 agent for agent in observation.tracked_objects.get_agents()
                 if agent.tracked_object_type == TrackedObjectType.VEHICLE
@@ -65,7 +65,9 @@ def observations_to_agents_buffer(
 
 
 def build_current_ego_state_buffer(
-        vehicles_buffer: Deque[List[Agent]]) -> Dict[str, Deque[EgoState]]:
+        vehicles_buffer: Deque[List[Agent]],
+iteration: SimulationIteration
+) -> Dict[str, Deque[EgoState]]:
     """현재 시점에 존재하는 Agent들의 과거 기록을 생성한다.
 
     버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
@@ -85,23 +87,27 @@ def build_current_ego_state_buffer(
     if not vehicles_buffer:
         return {}
     # only for car.
-    current_agents: List[Agent] = [
+    current_vehicles: List[Agent] = [
         agent for agent in vehicles_buffer[-1]
     ]
     current_token_to_idx = {
-        agent.track_token: idx for idx, agent in enumerate(current_agents)
+        agent.track_token: idx for idx, agent in enumerate(current_vehicles)
     }
     token_to_history: Dict[str, Deque] = {
-        agent.track_token: deque(maxlen=max_len) for agent in current_agents
+        agent.track_token: deque(maxlen=max_len) for agent in current_vehicles
     }
     # 현재 시점 상태 추가
-    for agent in current_agents:
-        token_to_history[agent.track_token].append(agent)
+    for a_vehicle in current_vehicles:
+        assert a_vehicle.metadata.timestamp_us == iteration.time_point.time_us, \
+            f"현재 시점 관측의 timestamp_us ({a_vehicle.metadata.timestamp_us})가 " \
+            f"iteration.time_point.time_us ({iteration.time_point.time_us})와 다른데, 그 차이는 " \
+            f" {a_vehicle.metadata.timestamp_us - iteration.time_point.time_us} 입니다."
+        token_to_history[a_vehicle.track_token].append(a_vehicle)
     # max_len
-    for past_agents in reversed(list(vehicles_buffer)[:-1]):
+    for past_vehicles in reversed(list(vehicles_buffer)[:-1]):
         # 가장 최근 -> 가장 오래된 순서로 과거 시점 상태 추가
         past_agent_lookup: Dict[str, Agent] = {
-            agent.track_token: agent for agent in past_agents
+            agent.track_token: agent for agent in past_vehicles
         }
         for current_token in current_token_to_idx.keys():
             agent_history: Deque[Agent] = token_to_history[current_token]
@@ -138,24 +144,26 @@ def agent_to_ego_state(
 
     Raises:
         TypeError: ``agent.box``가 ``CarFootprint``가 아닌 경우.
+
+    중요
+        - 결국 아래 값들만 제대로 넣어서 전달하면됨
+            - time_point
+            - car_footprint
+                - rear_axle
     """
 
     if not isinstance(agent.box, CarFootprint):
         raise TypeError("agent.box는 CarFootprint 타입이어야 합니다.")
-
+    ######## TODO
     car_footprint: CarFootprint = agent.box
     vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
-    rear_axle_velocity: StateVector2D = agent.velocity or StateVector2D(
-        0.0, 0.0)
+    rear_axle_velocity = StateVector2D(0.0, 0.0)
 
-    rear_axle_acceleration: StateVector2D = StateVector2D(0.0, 0.0)
-    angular_velocity = (agent.angular_velocity
-                        if agent.angular_velocity is not None else 0.0)
+    rear_axle_acceleration = StateVector2D(0.0, 0.0)
     dynamic_car_state = DynamicCarState.build_from_rear_axle(
         rear_axle_to_center_dist=vehicle_params.rear_axle_to_center,
         rear_axle_velocity_2d=rear_axle_velocity,
         rear_axle_acceleration_2d=rear_axle_acceleration,
-        angular_velocity=angular_velocity,
     )
 
     return EgoState(
@@ -577,7 +585,7 @@ class WorldModelAgents(AbstractMLAgents):
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
         # Infer model
-        self.infer_model(features, next_iteration)
+        self.infer_model(features, iteration, next_iteration)
 
     def update_observation(
             self,
@@ -699,6 +707,7 @@ class WorldModelAgents(AbstractMLAgents):
         return position, rear_axle.heading
 
     def infer_model(self, features: Dict[str, AbstractModelFeature],
+                    iteration: SimulationIteration,
                     next_iteration: SimulationIteration) -> None:
         feature: AbstractModelFeature = features["world_model_feature"]
         # near_future_tarjs_wrt_ego: (Pnn, T, 4)
@@ -720,7 +729,7 @@ class WorldModelAgents(AbstractMLAgents):
             self.observation_buffer)
         token_to_history: Dict[
             str,
-            Deque[EgoState]] = build_current_ego_state_buffer(vehicles_buffer)
+            Deque[EgoState]] = build_current_ego_state_buffer(vehicles_buffer, iteration)
         current_agents: List[
             Agent] = self.current_observation.tracked_objects.get_agents()
         # current_agents: 쓰임
@@ -768,12 +777,20 @@ class WorldModelAgents(AbstractMLAgents):
                 new_state.center,
                 np.array([[v_local.x, v_local.y]], dtype=np.float32)
             )[0]
+            # TODO: new_timestamp_us 를 이렇게 주는게 맞는지 확인 필요
+            new_timestamp_us = next_iteration.time_point.time_us
+            new_metadata= SceneObjectMetadata(new_timestamp_us,
+                                              agent_.metadata.token,
+                                                agent_.metadata.track_id,
+                                                agent_.metadata.track_token,
+                                                agent_.metadata.category_name
+                                              )
 
             new_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,
                 oriented_box=new_state.car_footprint,
                 velocity=v_global,
-                metadata=agent_.metadata,
+                metadata=new_metadata,
             )
             new_agent.predictions = [
                 PredictedTrajectory(
