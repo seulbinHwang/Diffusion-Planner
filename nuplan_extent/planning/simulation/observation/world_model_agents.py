@@ -50,10 +50,12 @@ def observations_to_agents_buffer(
     """
     agents_buffer: Deque[List[Agent]] = deque(maxlen=observations_buffer.maxlen)
     for observation in observations_buffer:
-        if not isinstance(observation, DetectionsTracks):
-            raise TypeError("observations_buffer는 DetectionsTracks만 포함해야 합니다.")
-        agents_buffer.append(observation.tracked_objects.get_agents())
-
+        if isinstance(observation, DetectionsTracks):
+            agents_buffer.append(observation.tracked_objects.get_agents())
+        else:
+            # [FIX] 더 친절한 에러 메시지 (혹은 스킵을 원하면 continue)
+            raise TypeError(f"observations_buffer는 DetectionsTracks만 포함해야 합니다. "
+                            f"받은 타입: {type(observation)}")
     return agents_buffer
 
 
@@ -97,19 +99,18 @@ def build_current_ego_state_histories(
         }
         for current_token in current_token_to_idx.keys():
             agent_history: Deque[Agent] = token_to_history[current_token]
+            if agent_history[-1] is None:
+                continue  # 이미 이 토큰의 히스토리 수집 종료
             history_agent = past_agent_lookup.get(current_token, None)
-            if agent_history[-1] is not None:
-                token_to_history[current_token].append(history_agent)
+            token_to_history[current_token].append(history_agent)
     # histories를 시간 순서(과거→현재)로 뒤집기
     for token, history in token_to_history.items():
         history.reverse()
         # 만약 history 의 첫 원소가 None이면, 제거한다.
         if history[0] is None:
             history.popleft()
-        converted = deque(
-            (agent_to_ego_state(agent) for agent in history),
-            maxlen=history.maxlen
-        )
+        converted = deque((agent_to_ego_state(agent) for agent in history),
+                          maxlen=history.maxlen)
         token_to_history[token] = converted
     return token_to_history
 
@@ -139,12 +140,11 @@ def agent_to_ego_state(
     car_footprint: CarFootprint = agent.box
     vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
 
-    rear_axle_velocity: StateVector2D = agent.velocity or StateVector2D(0.0,
-                                                                        0.0)
+    rear_axle_velocity: StateVector2D = agent.velocity or StateVector2D(
+        0.0, 0.0)
     rear_axle_acceleration: StateVector2D = StateVector2D(0.0, 0.0)
-    angular_velocity = (
-        agent.angular_velocity if agent.angular_velocity is not None else 0.0
-    )
+    angular_velocity = (agent.angular_velocity
+                        if agent.angular_velocity is not None else 0.0)
     dynamic_car_state = DynamicCarState.build_from_rear_axle(
         rear_axle_to_center_dist=vehicle_params.rear_axle_to_center,
         rear_axle_velocity_2d=rear_axle_velocity,
@@ -331,18 +331,6 @@ class WorldModelAgents(AbstractMLAgents):
             if tracked_object.track_token is not None
         }
 
-    def _get_next_relative_ego_pose(self, history: SimulationHistoryBuffer,
-                                    ego_state: EgoState) -> StateSE2:
-        # using current frame ego state instead of history.ego_states[-1]
-        self._ego_anchor_state = history.ego_states[-1]
-        next_global_pose = ego_state.rear_axle
-
-        ego_to_global = self._ego_anchor_state.rear_axle.as_matrix()
-        global_to_ego = np.linalg.inv(ego_to_global)
-        next_relative_matrix = global_to_ego @ next_global_pose.as_matrix()
-        next_relative_pose = StateSE2.from_matrix(next_relative_matrix)
-        return next_relative_pose
-
     def _compute_sorted_distances(
             self, ego_state: EgoState,
             agents: Dict[str,
@@ -351,7 +339,7 @@ class WorldModelAgents(AbstractMLAgents):
 
         Args:
             ego_state (EgoState): 기준이 되는 ego 상태.
-            agents (Dict[str, Agent]): 거리를 계산할 agent 사전.
+            agents (Dict[str, Agent]): 거리를 계산할 agent 사전. 길이 = N.
 
         Returns:
             tuple[list[str], npt.NDArray[np.float64]]:
@@ -360,16 +348,15 @@ class WorldModelAgents(AbstractMLAgents):
         """
         if len(agents) == 0:
             return [], np.empty((0,), dtype=np.float64)
-
+        tokens: list[str] = list(agents.keys())  # len(tokens) == len(distances)
         agent_xy: npt.NDArray[np.float32] = np.array(
-            [agent.center.point.array for agent in agents.values()],
+            [agents[token].center.point.array for token in tokens],
             dtype=np.float32)  # shape (N, 2)
         ego_xy: npt.NDArray[np.float32] = np.expand_dims(
             ego_state.center.point.array,
             axis=0).astype(np.float32)  # shape (1, 2)
         distances: npt.NDArray[np.float64] = cdist(
             ego_xy, agent_xy).flatten()  # shape (N,)
-        tokens: list[str] = list(agents.keys())  # len(tokens) == len(distances)
         sorted_indices: npt.NDArray[np.int64] = np.argsort(distances)
         sorted_tokens: list[str] = [tokens[i] for i in sorted_indices]
         sorted_distances: npt.NDArray[np.float64] = distances[sorted_indices]
@@ -693,6 +680,10 @@ class WorldModelAgents(AbstractMLAgents):
 
     def infer_model(self, features: Dict[str, AbstractModelFeature],
                     next_iteration: SimulationIteration) -> None:
+        """
+
+
+        """
         feature: AbstractModelFeature = features["world_model_feature"]
         # near_future_tarjs_wrt_ego: (Pnn, T, 4)
         near_future_tarjs_wrt_ego: np.ndarray = self._model_loader.infer(
@@ -700,7 +691,11 @@ class WorldModelAgents(AbstractMLAgents):
         # list[str]
         self.diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
+
         token_to_future_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        near_number = near_future_tarjs_wrt_ego.shape[0]
+        assert near_number == self.predicted_neighbor_num
+        assert near_number <= len(self.diffusion_agents_track_tokens)
         for idx, token in enumerate(self.diffusion_agents_track_tokens):
             token_to_future_traj_wrt_ego[token] = near_future_tarjs_wrt_ego[idx]
 
