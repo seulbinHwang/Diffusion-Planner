@@ -156,7 +156,7 @@ def convert_absolute_quantities_to_relative(
         # agent_global_poses, ego_pose: 절대 좌표계 기준 값
         transforms = _local_to_local_transforms(agent_global_poses, ego_pose)
         transformed_poses = _transform_matrix_to_state_se2_array_batch(
-            transforms) # transformed_poses: ego 좌표계 기준 값
+            transforms)  # transformed_poses: ego 좌표계 기준 값
         new_agent_state[:, EgoInternalIndex.x()] = transformed_poses[:, 0]
         new_agent_state[:, EgoInternalIndex.y()] = transformed_poses[:, 1]
         new_agent_state[:, 2] = np.cos(transformed_poses[:, 2])

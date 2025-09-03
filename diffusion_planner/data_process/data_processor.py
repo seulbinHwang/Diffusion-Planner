@@ -169,8 +169,8 @@ class DataProcessor(object):
                 ego_state.rear_axle.heading
             ],
                                         dtype=np.float64)  # shape (3,)
-            # ego_agent_past: np (21, 7) # x, y, theta, vx, vy, width, length
-            ego_agent_past, time_stamps_past = get_ego_past_array_from_scenario(
+            # all_frame_ego_feature: np (21, 10) # x, y, theta, vx, vy, width, length
+            all_frame_ego_feature, time_stamps_past = get_ego_past_array_from_scenario(
                 scenario, self.num_past_poses, self.past_time_horizon)
 
             present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
@@ -184,17 +184,21 @@ class DataProcessor(object):
             sampled_past_observations = past_tracked_objects + [
                 present_tracked_objects
             ]
-            neighbor_agents_past, neighbor_agents_types = \
+            # all_frame_agents_feature: List[np.ndarray], (frame_agents_num, 8) # frame_agents_num 길이가 가변적
+            # all_frame_agents_types:  List[List[TrackedObjectType]]
+            all_frame_agents_feature, all_frame_agents_types = \
                 sampled_tracked_objects_to_array_list(sampled_past_observations)
-
-            (static_objects, static_objects_types
+            # present_static_feature: np.ndarray, (len(static_obj), 5)
+            # static_objects_types: List[TrackedObjectType]
+            (present_static_feature, static_objects_types
             ) = sampled_static_objects_to_array_list(present_tracked_objects)
 
             (ego_agent_past, neighbor_agents_past,
              neighbor_indices, static_objects) = agent_past_process(
-                 ego_agent_past, neighbor_agents_past, neighbor_agents_types,
-                 self.num_agents, static_objects, static_objects_types,
-                 self.num_static, self.max_ped_bike, anchor_ego_state)
+                 all_frame_ego_feature, all_frame_agents_feature,
+                 all_frame_agents_types, self.num_agents,
+                 present_static_feature, static_objects_types, self.num_static,
+                 self.max_ped_bike, anchor_ego_state)
             '''
             Map
             '''
@@ -221,9 +225,10 @@ class DataProcessor(object):
             ego_agent_future : rear axle x,y, ~~~
             ego_agent_future_11_dim : center x,y, ~~~
             '''
-            ego_agent_future, ego_agent_future_11_dim = get_ego_future_array_from_scenario(
-                scenario, ego_state, self.num_future_poses,
-                self.future_time_horizon)
+            (ego_agent_future,
+             ego_agent_future_11_dim) = get_ego_future_array_from_scenario(
+                 scenario, ego_state, self.num_future_poses,
+                 self.future_time_horizon)
 
             Tf, Df = ego_agent_future_11_dim.shape
             assert Tf == self.num_future_poses, (
@@ -257,7 +262,7 @@ class DataProcessor(object):
             # ego_current_state = calculate_additional_ego_states(
             #     ego_agent_past, time_stamps_past)
             # ego_agent_past: (T, 7) -> (T=21, 11)
-            ego_agent_past, ego_current_state = calculate_additional_ego_states(
+            _, ego_current_state = calculate_additional_ego_states(
                 ego_agent_past, time_stamps_past)
             T, D = ego_agent_past.shape
             assert T == self.num_past_poses + 1, "Ego agent past states should have T+1 time steps"
