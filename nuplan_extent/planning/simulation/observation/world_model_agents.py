@@ -449,11 +449,18 @@ class WorldModelAgents(AbstractMLAgents):
         absolute[:, 7] = 1  # is vehicle
 
         for i, state in enumerate(next_ego_plans):
-            absolute[i, 0] = state.center.x
-            absolute[i, 1] = state.center.y
-            absolute[i, 2] = state.center.heading
-            absolute[i, 3] = state.dynamic_car_state.center_velocity_2d.x
-            absolute[i, 4] = state.dynamic_car_state.center_velocity_2d.y
+            absolute[i, 0] = state.center.x # 절대 위치
+            absolute[i, 1] = state.center.y # 절대 위치
+            absolute[i, 2] = state.center.heading # 절대 헤딩
+            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 변환이 필요하다.
+            v_local = state.dynamic_car_state.center_velocity_2d
+            v_global = numpy_array_to_absolute_velocity(
+                state.center,
+                np.array([[v_local.x, v_local.y]], dtype=np.float32)
+            )[0]
+            # TODO: 이 부분이 맞는지 visualize로 확인 필요
+            absolute[i, 3] = v_global.x # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
+            absolute[i, 4] = v_global.y # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
             absolute[i, 5] = state.car_footprint.width
             absolute[i, 6] = state.car_footprint.length
 
@@ -496,8 +503,15 @@ class WorldModelAgents(AbstractMLAgents):
             absolute[i, 0] = state.center.x
             absolute[i, 1] = state.center.y
             absolute[i, 2] = state.center.heading
-            absolute[i, 3] = state.dynamic_car_state.center_velocity_2d.x
-            absolute[i, 4] = state.dynamic_car_state.center_velocity_2d.y
+            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 변환이 필요하다.
+            v_local = state.dynamic_car_state.center_velocity_2d
+            v_global = numpy_array_to_absolute_velocity(
+                state.center,
+                np.array([[v_local.x, v_local.y]], dtype=np.float32)
+            )[0]
+            # TODO: 이 부분이 맞는지 visualize로 확인 필요
+            absolute[i, 3] = v_global.x
+            absolute[i, 4] = v_global.y
             absolute[i, 5] = state.car_footprint.width
             absolute[i, 6] = state.car_footprint.length
 
