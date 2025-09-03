@@ -99,13 +99,16 @@ def build_current_ego_state_histories(
             if agent_history[-1] is not None:
                 token_to_history[current_token].append(history_agent)
     # histories를 시간 순서(과거→현재)로 뒤집기
-    for history in token_to_history.values():
+    for token, history in token_to_history.items():
         history.reverse()
         # 만약 history 의 첫 원소가 None이면, 제거한다.
         if history[0] is None:
             history.popleft()
-        for i, agent in enumerate(history):
-            history[i] = agent_to_ego_state(agent)
+        converted = deque(
+            (agent_to_ego_state(agent) for agent in history),
+            maxlen=history.maxlen
+        )
+        token_to_history[token] = converted
     return token_to_history
 
 
@@ -430,7 +433,7 @@ class WorldModelAgents(AbstractMLAgents):
 
     def _preprocess_next_ego_plans(
             self, next_ego_plans: List[EgoState],
-            current_ego_state: EgoState) -> npt.NDArray[np.float64]:
+            current_ego_state: EgoState) -> npt.NDArray[np.float32]:
         """ego 미래 상태들을 diffusion planner 입력 배열로 변환한다.
 
         Args:
@@ -468,11 +471,11 @@ class WorldModelAgents(AbstractMLAgents):
         relative: np.ndarray = convert_absolute_quantities_to_relative(
             absolute, anchor, 'ego')  # shape (interpol_num, 11)
         assert (interpol_num, 11) == relative.shape
-        return relative
+        return relative.astype(np.float32)
 
     def _preprocess_ego_future_traj(
             self, ego_future_trajectory: InterpolatedTrajectory,
-            current_ego_state: EgoState) -> npt.NDArray[np.float64]:
+            current_ego_state: EgoState) -> npt.NDArray[np.float32]:
         """미래 ego 궤적을 diffusion planner 입력 배열로 변환한다.
 
         Args:
@@ -511,7 +514,7 @@ class WorldModelAgents(AbstractMLAgents):
         relative: np.ndarray = convert_absolute_quantities_to_relative(
             absolute, anchor, 'ego')  # shape (T, 11)
         assert (future_len__plus_1, 11) == relative.shape
-        return relative
+        return relative.astype(np.float32)
 
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
@@ -557,8 +560,8 @@ class WorldModelAgents(AbstractMLAgents):
             history,
             traffic_light_data,
             # self.diffusion_agents_track_tokens,
-            ego_agent_next_11_dim.astype(np.float32),
-            ego_agent_future_11_dim.astype(np.float32))
+            ego_agent_next_11_dim,
+            ego_agent_future_11_dim)
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
@@ -654,7 +657,7 @@ class WorldModelAgents(AbstractMLAgents):
         """차량 뒷축의 위치와 방향을 계산한다.
 
         Returns:
-            np.ndarray: shape (3,) [x, y, yaw_rad] 형태의 뒷축 SE(2) 포즈.
+            Tuple[np.ndarray, float]: shape (2,), 차량 뒷축 [x, y]와 방향 yaw_rad.
 
         """
         rear_axle = current_ego_state.car_footprint.rear_axle
@@ -670,7 +673,7 @@ class WorldModelAgents(AbstractMLAgents):
         """각 차량의 뒷축 위치와 방향을 계산한다.
 
         Returns:
-            List[np.ndarray]: shape (N, 3) 각 차량의 뒷축 [x, y, yaw_rad].
+            Tuple[np.ndarray, float]: shape (2,), 차량 뒷축 [x, y]와 방향 yaw_rad.
 
         """
         box = current_agent.box
@@ -689,7 +692,7 @@ class WorldModelAgents(AbstractMLAgents):
         feature: AbstractModelFeature = features["world_model_feature"]
         # near_future_tarjs_wrt_ego: (Pnn, T, 4)
         near_future_tarjs_wrt_ego: np.ndarray = self._model_loader.infer(
-            feature).detach().numpy()
+            feature).detach().cpu().numpy()
         # list[str]
         self.diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
@@ -721,7 +724,7 @@ class WorldModelAgents(AbstractMLAgents):
         for token, future_traj_wrt_ego in token_to_future_traj_wrt_ego.items():
             # future_traj_wrt_ego: (T, 4)
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
-            if np.all(future_traj_wrt_ego == 0):
+            if np.allclose(future_traj_wrt_ego, 0.0):
                 continue
             rear_wheelbase = token_to_rear_wheelbase[token]
             future_traj_wrt_ego = convert_center_to_rear_axle(
@@ -737,7 +740,8 @@ class WorldModelAgents(AbstractMLAgents):
                 trajectory=self.outputs_to_trajectory(future_traj_wrt_npc_rear,
                                                       self_history))
             token_to_interpol_traj[token] = future_trajectory
-        self._diffusion_agents = {}
+
+        new_agents = {}
         for agent_token, interpol_traj in token_to_interpol_traj.items():
             agent_ = self._diffusion_agents[agent_token]
             # TODO: next_iteration.time_point 가 맞나? self.step_time 이 맞나?
@@ -754,5 +758,6 @@ class WorldModelAgents(AbstractMLAgents):
                     probability=1.,
                     waypoints=interpol_traj.get_sampled_trajectory())
             ]
+            new_agents[agent_token] = new_agent
 
-            self._diffusion_agents[agent_token] = new_agent
+            self._diffusion_agents = new_agents
