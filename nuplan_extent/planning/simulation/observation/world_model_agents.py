@@ -77,7 +77,9 @@ def build_current_ego_state_histories(
     max_len = agents_buffer.maxlen
     if not agents_buffer:
         return {}
-    current_agents: List[Agent] = agents_buffer[-1]
+    current_agents: List[Agent] = [
+        agent for agent in agents_buffer[-1] if agent.track_token is not None
+    ]
     current_token_to_idx = {
         agent.track_token: idx for idx, agent in enumerate(current_agents)
     }
@@ -137,15 +139,17 @@ def agent_to_ego_state(
     car_footprint: CarFootprint = agent.box
     vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
 
-    rear_axle_velocity: StateVector2D = agent.velocity  # shape: (2,)
-    rear_axle_acceleration: StateVector2D = StateVector2D(0.0,
-                                                          0.0)  # shape: (2,)
-
+    rear_axle_velocity: StateVector2D = agent.velocity or StateVector2D(0.0,
+                                                                        0.0)
+    rear_axle_acceleration: StateVector2D = StateVector2D(0.0, 0.0)
+    angular_velocity = (
+        agent.angular_velocity if agent.angular_velocity is not None else 0.0
+    )
     dynamic_car_state = DynamicCarState.build_from_rear_axle(
         rear_axle_to_center_dist=vehicle_params.rear_axle_to_center,
         rear_axle_velocity_2d=rear_axle_velocity,
         rear_axle_acceleration_2d=rear_axle_acceleration,
-        angular_velocity=agent.angular_velocity or 0.0,
+        angular_velocity=angular_velocity,
     )
 
     return EgoState(
@@ -760,4 +764,4 @@ class WorldModelAgents(AbstractMLAgents):
             ]
             new_agents[agent_token] = new_agent
 
-            self._diffusion_agents = new_agents
+        self._diffusion_agents = new_agents
