@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Dict, Type
+from typing import Dict, Type, Optional
+import numpy as np
 
 import torch
 
@@ -24,6 +25,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         self._config = config
         self.data_processor = DataProcessor(config)
         self.observation_normalizer = config.observation_normalizer
+        self.unnormalized_features: Optional[Dict[str, np.ndarray]] = None
 
     @classmethod
     def get_feature_unique_name(cls) -> str:
@@ -53,6 +55,12 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         # (future_len, 11)
         model_inputs[
             "ego_future_gt_11_dim"] = current_input.ego_agent_future_11_dim
+        self.unnormalized_features = model_inputs.copy()
+        for key in self.unnormalized_features:
+            # torch -> numpy
+            self.unnormalized_features[key] = self.unnormalized_features[
+                key].cpu().numpy()
+
         model_inputs = self.observation_normalizer(model_inputs)
         """
     world_model_feature: Dict[str, numpy.ndarray] 가 아래와 같이 구성되어 있고, 이게 함수의 input으로 쓰일거야.

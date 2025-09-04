@@ -1,6 +1,7 @@
-from typing import cast, List, Dict, Optional, Deque, Tuple
+from typing import cast, List, Dict, Optional, Deque, Tuple, Union
 import numpy as np
 import numpy.typing as npt
+import draw_machine
 from nuplan.common.actor_state.dynamic_car_state import get_velocity_shifted
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
@@ -49,7 +50,8 @@ def observations_to_agents_buffer(
     Raises:
         TypeError: 관측이 ``DetectionsTracks`` 타입이 아닐 경우.
     """
-    vehicles_buffer: Deque[List[Agent]] = deque(maxlen=observations_buffer.maxlen)
+    vehicles_buffer: Deque[List[Agent]] = deque(
+        maxlen=observations_buffer.maxlen)
     for observation in observations_buffer:
         if isinstance(observation, DetectionsTracks):
             # Agent 중에, 오직 차량(VEHICLE) 타입만 추출한다.
@@ -66,8 +68,7 @@ def observations_to_agents_buffer(
 
 def build_current_ego_state_buffer(
         vehicles_buffer: Deque[List[Agent]],
-iteration: SimulationIteration
-) -> Dict[str, Deque[EgoState]]:
+        iteration: SimulationIteration) -> Dict[str, Deque[EgoState]]:
     """현재 시점에 존재하는 Agent들의 과거 기록을 생성한다.
 
     버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
@@ -87,9 +88,7 @@ iteration: SimulationIteration
     if not vehicles_buffer:
         return {}
     # only for car.
-    current_vehicles: List[Agent] = [
-        agent for agent in vehicles_buffer[-1]
-    ]
+    current_vehicles: List[Agent] = [agent for agent in vehicles_buffer[-1]]
     current_token_to_idx = {
         agent.track_token: idx for idx, agent in enumerate(current_vehicles)
     }
@@ -457,18 +456,17 @@ class WorldModelAgents(AbstractMLAgents):
         absolute[:, 7] = 1  # is vehicle
 
         for i, state in enumerate(next_ego_plans):
-            absolute[i, 0] = state.center.x # 절대 위치
-            absolute[i, 1] = state.center.y # 절대 위치
-            absolute[i, 2] = state.center.heading # 절대 헤딩
+            absolute[i, 0] = state.center.x  # 절대 위치
+            absolute[i, 1] = state.center.y  # 절대 위치
+            absolute[i, 2] = state.center.heading  # 절대 헤딩
             # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
             v_local = state.dynamic_car_state.center_velocity_2d
             v_global = numpy_array_to_absolute_velocity(
                 state.center,
-                np.array([[v_local.x, v_local.y]], dtype=np.float32)
-            )[0]
+                np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
             # TODO: 이 부분이 맞는지 visualize로 확인 필요
-            absolute[i, 3] = v_global.x # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
-            absolute[i, 4] = v_global.y # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
+            absolute[i, 3] = v_global.x  # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
+            absolute[i, 4] = v_global.y  # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
             absolute[i, 5] = state.car_footprint.width
             absolute[i, 6] = state.car_footprint.length
 
@@ -515,8 +513,7 @@ class WorldModelAgents(AbstractMLAgents):
             v_local = state.dynamic_car_state.center_velocity_2d
             v_global = numpy_array_to_absolute_velocity(
                 state.center,
-                np.array([[v_local.x, v_local.y]], dtype=np.float32)
-            )[0]
+                np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
             # TODO: 이 부분이 맞는지 visualize로 확인 필요
             absolute[i, 3] = v_global.x
             absolute[i, 4] = v_global.y
@@ -535,12 +532,21 @@ class WorldModelAgents(AbstractMLAgents):
         assert (future_len__plus_1, 11) == relative.shape
         return relative.astype(np.float32)
 
+    def set_vis_features(self, is_vis_features: bool, vis_features_path: str):
+        """
+        Set params for saving features, for visualization, only when simulation feature video callback is on.
+        :param is_vis_features: whether to save features
+        :param vis_features_path: path to save features
+        """
+        self._is_vis_features = is_vis_features
+        self._vis_features_path = vis_features_path
+
     def _update_diffusion_agents_observation(
-            self, iteration: SimulationIteration,
-            next_iteration: SimulationIteration,
-            history: SimulationHistoryBuffer,
-            next_ego_state: Optional[EgoState],
-            ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
+        self, iteration: SimulationIteration,
+        next_iteration: SimulationIteration, history: SimulationHistoryBuffer,
+        next_ego_state: Optional[EgoState],
+        ego_future_trajectory: Optional[InterpolatedTrajectory]
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
 
         ego_agent_next_11_dim = None
         if next_ego_state is not None:
@@ -585,7 +591,13 @@ class WorldModelAgents(AbstractMLAgents):
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
         # Infer model
-        self.infer_model(features, iteration, next_iteration)
+
+        token_to_future_traj_wrt_ego = self.infer_model(features, iteration,
+                                                        next_iteration)
+        world_model_feature: Dict[
+            str, np.ndarray] = self._model_loader.feature_builders[
+                0].unnormalized_features
+        return world_model_feature, token_to_future_traj_wrt_ego
 
     def update_observation(
             self,
@@ -606,13 +618,18 @@ class WorldModelAgents(AbstractMLAgents):
         self._ego_anchor_state, self.current_observation = history.current_state
         self.current_iteration = next_iteration.index
         self.step_time_point = next_iteration.time_point - iteration.time_point
-        self._update_diffusion_agents_observation(iteration, next_iteration,
-                                                  history, next_ego_state,
-                                                  ego_future_trajectory)
+        (world_model_feature, token_to_future_traj_wrt_ego
+        ) = self._update_diffusion_agents_observation(iteration, next_iteration,
+                                                      history, next_ego_state,
+                                                      ego_future_trajectory)
         self._filter_agents_out_of_range(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
+        if self._is_vis_features:
+            draw_machine.draw_world_model_to_png(world_model_feature,
+                                                 token_to_future_traj_wrt_ego,
+                                                 self._vis_features_path)
 
     @staticmethod
     def extract_rear_wheelbases(agents: Dict[str, Agent],
@@ -706,9 +723,10 @@ class WorldModelAgents(AbstractMLAgents):
 
         return position, rear_axle.heading
 
-    def infer_model(self, features: Dict[str, AbstractModelFeature],
-                    iteration: SimulationIteration,
-                    next_iteration: SimulationIteration) -> None:
+    def infer_model(
+            self, features: Dict[str, AbstractModelFeature],
+            iteration: SimulationIteration,
+            next_iteration: SimulationIteration) -> Dict[str, np.ndarray]:
         feature: AbstractModelFeature = features["world_model_feature"]
         # near_future_tarjs_wrt_ego: (Pnn, T, 4)
         near_future_tarjs_wrt_ego: np.ndarray = self._model_loader.infer(
@@ -728,8 +746,8 @@ class WorldModelAgents(AbstractMLAgents):
         vehicles_buffer: Deque[List[Agent]] = observations_to_agents_buffer(
             self.observation_buffer)
         token_to_history: Dict[
-            str,
-            Deque[EgoState]] = build_current_ego_state_buffer(vehicles_buffer, iteration)
+            str, Deque[EgoState]] = build_current_ego_state_buffer(
+                vehicles_buffer, iteration)
         current_agents: List[
             Agent] = self.current_observation.tracked_objects.get_agents()
         # current_agents: 쓰임
@@ -775,16 +793,14 @@ class WorldModelAgents(AbstractMLAgents):
             v_local = new_state.dynamic_car_state.center_velocity_2d
             v_global = numpy_array_to_absolute_velocity(
                 new_state.center,
-                np.array([[v_local.x, v_local.y]], dtype=np.float32)
-            )[0]
+                np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
             # TODO: new_timestamp_us 를 이렇게 주는게 맞는지 확인 필요
             new_timestamp_us = next_iteration.time_point.time_us
-            new_metadata= SceneObjectMetadata(new_timestamp_us,
-                                              agent_.metadata.token,
-                                                agent_.metadata.track_id,
-                                                agent_.metadata.track_token,
-                                                agent_.metadata.category_name
-                                              )
+            new_metadata = SceneObjectMetadata(new_timestamp_us,
+                                               agent_.metadata.token,
+                                               agent_.metadata.track_id,
+                                               agent_.metadata.track_token,
+                                               agent_.metadata.category_name)
 
             new_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,
@@ -800,3 +816,5 @@ class WorldModelAgents(AbstractMLAgents):
             new_agents[agent_token] = new_agent
 
         self._diffusion_agents = new_agents
+        # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
+        return token_to_future_traj_wrt_ego

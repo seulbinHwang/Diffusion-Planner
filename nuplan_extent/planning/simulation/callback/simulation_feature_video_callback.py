@@ -17,7 +17,6 @@ from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner
 from nuplan.planning.simulation.simulation_setup import SimulationSetup
 from nuplan.planning.simulation.trajectory.abstract_trajectory import \
     AbstractTrajectory
-from nuplan_extent.planning.simulation.main_callback.utils import save_video
 from nuplan.planning.simulation.planner.ml_planner.ml_planner import MLPlanner
 
 logger = logging.getLogger(__name__)
@@ -31,14 +30,14 @@ class SimulationFeatureVideoCallback(AbstractCallback):
     """
 
     def __init__(
-            self,
-            simulation_directory: Union[str, pathlib.Path],
-            videos_output_dir: Union[str, pathlib.Path],
-            feature_log_dir: Union[str, pathlib.Path],
-            visualized_scenario_tokens: Optional[List[str]] = [],
-            visualize_all_scenarios: bool = False,
-            bev_range: List[float] = [-56., -56., 56., 56.],
-            image_subfix: str = ".png",
+        self,
+        simulation_directory: Union[str, pathlib.Path],
+        videos_output_dir: Union[str, pathlib.Path],
+        feature_log_dir: Union[str, pathlib.Path],
+        visualized_scenario_tokens: Optional[List[str]] = [],
+        visualize_all_scenarios: bool = False,
+        bev_range: List[float] = [-56., -56., 56., 56.],
+        image_subfix: str = ".png",
     ):
         """
         Construct simulation feature callback.
@@ -78,7 +77,6 @@ class SimulationFeatureVideoCallback(AbstractCallback):
             feature_log_directory = scenario_directory / "features"
             feature_log_directory.mkdir(exist_ok=True, parents=True)
 
-
     def on_initialization_end(self, setup: SimulationSetup,
                               planner: AbstractPlanner) -> None:
         """Inherited, see superclass."""
@@ -89,7 +87,25 @@ class SimulationFeatureVideoCallback(AbstractCallback):
     def on_step_start(self, setup: SimulationSetup,
                       planner: AbstractPlanner) -> None:
         """Inherited, see superclass."""
-
+        scenario_token = setup.scenario.token
+        if self._visualize_all_scenarios or (
+                scenario_token in self._visualized_scenario_tokens):
+            scenario_directory = self._get_scenario_folder(
+                planner.name(), setup.scenario)
+            feature_log_directory = scenario_directory / "features"
+            simulation_iteration_index = setup.time_controller.get_iteration(
+            ).index  # int
+            # TODO: 여기에 그리기
+            if isinstance(planner, MLPlanner):
+                setup.observations.set_vis_features(
+                    is_vis_features=True,
+                    vis_features_path=feature_log_directory /
+                    "{:04d}{}".format(simulation_iteration_index, self._subfix))
+            else:
+                raise NotImplementedError()
+        else:
+            setup.observations.set_vis_features(is_vis_features=False,
+                                                vis_features_path=None)
 
     def on_planner_start(self, setup: SimulationSetup,
                          planner: AbstractPlanner) -> None:
@@ -102,23 +118,6 @@ class SimulationFeatureVideoCallback(AbstractCallback):
     def on_step_end(self, setup: SimulationSetup, planner: AbstractPlanner,
                     sample: SimulationHistorySample) -> None:
         """Inherited, see superclass."""
-        scenario_token = setup.scenario.token
-        if self._visualize_all_scenarios or (
-                scenario_token in self._visualized_scenario_tokens):
-            scenario_directory = self._get_scenario_folder(
-                planner.name(), setup.scenario)
-            feature_log_directory = scenario_directory / "features"
-            simulation_iteration_index = setup.time_controller.get_iteration(
-            ).index
-            # TODO: 여기에 그리기
-            if isinstance(planner, MLPlanner):
-                planner._model_loader._model.set_vis_features(
-                    True, feature_log_directory / "{:04d}{}".format(
-                        simulation_iteration_index, self._subfix))
-            else:
-                raise NotImplementedError()
-        else:
-            planner._model_loader._model.set_vis_features(False, None)
 
     def on_simulation_end(self, setup: SimulationSetup,
                           planner: AbstractPlanner,
@@ -137,15 +136,13 @@ class SimulationFeatureVideoCallback(AbstractCallback):
                 image = cv2.imread(p)
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 video_images.append(image)
-            video_save_path = pathlib.Path(
-                self._videos_output_path / "feature_selected_scenarios")
+            video_save_path = pathlib.Path(self._videos_output_path /
+                                           "feature_selected_scenarios")
             video_name = scenario_token + ".webm"
             if not video_save_path.exists():
                 video_save_path.mkdir(parents=True, exist_ok=True)
-            save_video(video_images[0].shape[:2],
-                       video_images,
-                       video_save_path / video_name,
-                       database_interval)
+            save_video(video_images[0].shape[:2], video_images,
+                       video_save_path / video_name, database_interval)
 
     def _get_scenario_folder(self, planner_name: str,
                              scenario: AbstractScenario) -> pathlib.Path:
