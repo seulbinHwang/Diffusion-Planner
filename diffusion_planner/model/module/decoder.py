@@ -299,42 +299,117 @@ class DiT(nn.Module):
         near_current_mask: [B, Pnn]
         cross_mask: (B, token_num)
         """
-        B, Pnn, _ = near_cur_future_norm_xT.shape
-        # (B, Pnn, 324) -> (B, Pnn, D=192)
-        x = self.preproj(near_cur_future_norm_xT)
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
+        B, Pnn, in_dim = near_cur_future_norm_xT.shape  # in_dim = (1 + T) * 4
+        _, N, D = cross_c.shape  # D = hidden_dim
 
-        # diffusion_time: [B,]
-        # t_embedding: (B, D=192)
+        # diffusion_time: [B,] -> t_embedding: (B, D=192)
+        # y: (B, D=192) = ego_fut_global + t_embedding
         t_embedding = self.t_embedder(diffusion_time)
-        # y = (B, D=192) + (B, D=192) = (B, D=192)
         y = ego_fut_global + t_embedding
 
-        for block in self.blocks:
-            """
-            
-            Input shapes:
-            x: (B, Pnn, D=192)
-            cross_c: (B, N=token_num, D=192)
-            y: (B, D=192)
-            near_current_mask: (B, Pnn)
-            cross_mask: (B, token_num)
-            """
-            x = block(x, cross_c, y, near_current_mask, cross_mask)
-            x = x.masked_fill(near_current_mask.unsqueeze(-1),
-                              0.0)  # ← 블록 출력도 0 클램프
-        # output: x: (B, Pnn, D=192)
-        # y: (B, D=192)
-        x = self.final_layer(x, y)
-        # x.shape: (B, Pnn, (1 + T) * 4)
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 최종 출력도 0
+        # ----------------------------------------------------------------------
+        # [핵심] 배치별로 유효 토큰(False)이 앞으로 오도록 정렬하여, 유효 길이까지만 잘라 연산
+        #  - near 쿼리(Pnn 축): 유효 길이 Lp
+        #  - cross K/V(N 축):  버킷 내 최대 유효 길이 Lc_max
+        # ----------------------------------------------------------------------
 
+        # (1) near(이웃) 토큰 정렬: 유효(False)=0, 무효(True)=1 이므로 argsort로 유효를 앞쪽으로
+        # near_order: (B, Pnn), mask_near_sorted: (B, Pnn)
+        near_order = torch.argsort(near_current_mask.to(torch.int), dim=1)  # (B, Pnn)
+        idx_feat_near = near_order.unsqueeze(-1).expand(B, Pnn, in_dim)     # (B, Pnn, in_dim)
+        near_sorted = torch.gather(near_cur_future_norm_xT, dim=1, index=idx_feat_near)  # (B, Pnn, in_dim)
+        mask_near_sorted = torch.gather(near_current_mask, dim=1, index=near_order)     # (B, Pnn)
+
+        # (2) cross(장면 컨텍스트) 토큰 정렬: 동일하게 유효를 앞쪽으로
+        # cross_order: (B, N), mask_cross_sorted: (B, N)
+        cross_order = torch.argsort(cross_mask.to(torch.int), dim=1)              # (B, N)
+        idx_feat_cross = cross_order.unsqueeze(-1).expand(B, N, D)                # (B, N, D)
+        cross_sorted = torch.gather(cross_c, dim=1, index=idx_feat_cross)         # (B, N, D)
+        mask_cross_sorted = torch.gather(cross_mask, dim=1, index=cross_order)    # (B, N)
+
+        # (3) 배치별 유효 길이 계산
+        # Lp: (B,) near 유효 길이,  Lc: (B,) cross 유효 길이
+        Lp = (~mask_near_sorted).sum(dim=1)  # (B,)
+        Lc = (~mask_cross_sorted).sum(dim=1) # (B,)
+
+        # (4) 정렬 상태의 출력 버퍼 준비 (초기값 0)
+        # x_sorted_out: (B, Pnn, out_dim)  # out_dim = (1 + T) * 4
+        out_dim = in_dim
+        x_sorted_out = near_sorted.new_zeros(B, Pnn, out_dim)
+
+        # (5) near 유효 길이(Lp)가 같은 샘플끼리 버킷으로 묶어 처리 → Self-Attn 길이 단축
+        # unique_Lp: (K,), inv_Lp: (B,)
+        unique_Lp, inv_Lp = torch.unique(Lp, sorted=True, return_inverse=True)
+        for k in range(unique_Lp.numel()):
+            Lp_val = int(unique_Lp[k].item())
+            if Lp_val == 0:
+                # 이 버킷의 샘플들은 near 유효 토큰이 0개 → 연산 스킵
+                continue
+
+            # 이 버킷에 속한 배치 인덱스
+            # batch_idx: (B_k,)
+            batch_mask = (inv_Lp == k)
+            if not batch_mask.any():
+                continue
+            batch_idx = torch.nonzero(batch_mask, as_tuple=False).squeeze(-1)  # (B_k,)
+            Bk = batch_idx.numel()
+
+            # (5-1) near 쿼리 유효 구간만 슬라이스
+            # near_chunk: (B_k, Lp_val, in_dim)
+            near_chunk = near_sorted[batch_idx, :Lp_val, :]
+
+            # (5-2) cross K/V도 버킷 내 최대 유효 길이 Lc_max까지만 슬라이스
+            # cross_chunk: (B_k, Lc_max, D) (Lc_max=0이면 (B_k, 0, D))
+            # cross_mask_chunk: (B_k, Lc_max)
+            Lc_batch = Lc[batch_idx]
+            Lc_max = int(Lc_batch.max().item())
+            if Lc_max > 0:
+                cross_chunk = cross_sorted[batch_idx, :Lc_max, :]
+                cross_mask_chunk = mask_cross_sorted[batch_idx, :Lc_max]
+            else:
+                cross_chunk = cross_sorted.new_zeros(Bk, 0, D)
+                cross_mask_chunk = mask_cross_sorted.new_ones(Bk, 0)
+
+            # (5-3) 사전 투영: (B_k, Lp_val, in_dim) -> (B_k, Lp_val, D)
+            x = self.preproj(near_chunk)
+
+            # (5-4) 블록 스택 통과
+            # attn_mask_near_all_false: (B_k, Lp_val)  # 모두 False(패딩 없음)
+            attn_mask_near_all_false = torch.zeros(Bk, Lp_val, dtype=torch.bool, device=x.device)
+            for block in self.blocks:
+                """
+                Input shapes:
+                x: (B_k, Lp_val, D)
+                cross_chunk: (B_k, Lc_max, D)
+                y[batch_idx]: (B_k, D)
+                attn_mask_near_all_false: (B_k, Lp_val)
+                cross_mask_chunk: (B_k, Lc_max)
+                """
+                x = block(x, cross_chunk, y[batch_idx], attn_mask_near_all_false, cross_mask_chunk)
+
+            # (5-5) 최종 투영: (B_k, Lp_val, D) -> (B_k, Lp_val, out_dim)
+            x = self.final_layer(x, y[batch_idx])
+
+            # (5-6) 정렬 상태 출력 버퍼의 앞쪽 Lp_val 위치에만 써넣기
+            x_sorted_out[batch_idx, :Lp_val, :] = x  # (나머지 패딩 위치는 0 유지)
+
+        # (6) 정렬을 되돌려 원래 P 슬롯 순서로 복원
+        # inv_near_order: (B, Pnn), idx_feat_inv: (B, Pnn, out_dim)
+        inv_near_order = torch.empty_like(near_order)
+        arange_P = torch.arange(Pnn, device=near_order.device).unsqueeze(0).expand(B, Pnn)
+        inv_near_order.scatter_(1, near_order, arange_P)  # 역순열 구축
+        idx_feat_inv = inv_near_order.unsqueeze(-1).expand(B, Pnn, out_dim)
+        x_out_original_order = torch.gather(x_sorted_out, dim=1, index=idx_feat_inv)  # (B, Pnn, out_dim)
+
+        # (7) 안전하게 무효 토큰은 최종 출력에서도 0으로 보장
+        x_out_original_order = x_out_original_order.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
+
+        # (8) 타입에 따른 반환 (원본과 동일)
         if self._model_type == "score":
-            return x / (self.marginal_prob_std(diffusion_time)[:, None, None] +
-                        1e-6)
+            return x_out_original_order / (self.marginal_prob_std(diffusion_time)[:, None, None] + 1e-6)
         elif self._model_type == "x_start":
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, (1 + T) * 4)
-            return x
+            return x_out_original_order
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
