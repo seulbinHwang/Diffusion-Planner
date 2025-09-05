@@ -4,6 +4,11 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
+# TensorFloat-32(TF32) 연산을 허용하여
+#   - Ampere(A100 등) GPU에서 matmul/cuDNN 연산을 FP32보다 빠르게 처리하고
+#   - 눈에 띄는 정밀도 손실 없이 학습·추론 속도를 높이기 위한 설정입니다.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import argparse
 import shutil
 from torch import optim
@@ -214,7 +219,7 @@ def get_args():
     parser.add_argument('--num_heads',
                         type=int,
                         help='number of multi-head',
-                        default=6)
+                        default=8)
     parser.add_argument('--hidden_dim',
                         type=int,
                         help='hidden dimension',

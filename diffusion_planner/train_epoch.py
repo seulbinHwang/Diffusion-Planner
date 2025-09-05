@@ -9,6 +9,8 @@ from diffusion_planner.loss import diffusion_loss_func
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 
+AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
+
 
 def train_epoch(data_loader,
                 model,
@@ -105,21 +107,21 @@ def train_epoch(data_loader,
                     "Non-finite values detected in neighbors_future")
             norm_inputs = args.observation_normalizer(inputs)
 
-            # call the mdoel
-            optimizer.zero_grad()
+            # call the model
+            optimizer.zero_grad(set_to_none=True)
             loss = {}
             """
             ego_future.shape: [8, 80, 4]
             neighbors_future.shape: [8, 10, 80, 4]
             mask.shape: [8, 10, 80]
             """
-            loss, _ = diffusion_loss_func(
-                model, norm_inputs,
-                ddp.get_model(model, args.ddp).sde.marginal_prob,
-                (neighbors_future, mask), args.state_normalizer,
-                loss, args.diffusion_model_type)
-
-            loss['loss'] = loss['neighbor_prediction_loss']
+            with torch.autocast("cuda", dtype=AMP_DTYPE):
+                loss, _ = diffusion_loss_func(
+                    model, norm_inputs,
+                    ddp.get_model(model, args.ddp).sde.marginal_prob,
+                    (neighbors_future, mask), args.state_normalizer,
+                    loss, args.diffusion_model_type)
+                loss['loss'] = loss['neighbor_prediction_loss']
 
             total_loss = loss['loss'].item()  # scalar
 

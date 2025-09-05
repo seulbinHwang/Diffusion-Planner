@@ -13,6 +13,7 @@ from nuplan.planning.training.preprocessing.target_builders.abstract_target_buil
 from nuplan_extent.planning.training.preprocessing.features.world_model import WorldModelFeature
 from diffusion_planner.utils.config import Config
 from diffusion_planner.model.diffusion_planner import Diffusion_Planner
+from diffusion_planner.utils.amp import amp_context_for_infer
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 
@@ -82,7 +83,9 @@ class WorldModel(TorchModuleWrapper):
         :param features: A dictionary of the required features.
         """
         inputs: Dict[str, Optional[torch.Tensor]] = features.to_tensor_dict()
-        _, outputs = self._planner(inputs)
+        with torch.inference_mode():
+            with amp_context_for_infer():
+                _, outputs = self._planner(inputs)
         """
         outputs: Dict[str, torch.Tensor]
             "prediction" : (B, Pnn, T, 4)
