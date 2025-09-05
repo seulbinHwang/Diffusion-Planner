@@ -113,7 +113,9 @@ class Decoder(nn.Module):
                 scene_encoding_token_mask  # (B, token_num) bool
             )
             _require_finite("decoder_dit_output", score)
-            return {"score": score.reshape(B, Pnn, -1, 4)}  #  (B, Pnn, (1 + T) , 4)
+            return {
+                "score": score.reshape(B, Pnn, -1, 4)
+            }  #  (B, Pnn, (1 + T) , 4)
         else:
             # xT: [B, Pnn, (1 + future_len) * 4]
             xT = torch.cat(

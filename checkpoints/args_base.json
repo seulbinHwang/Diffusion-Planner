@@ -19,7 +19,7 @@
     "device": "cuda",
     "encoder_depth": 3,
     "decoder_depth": 3,
-    "num_heads": 6,
+    "num_heads": 8,
     "hidden_dim": 192,
     "diffusion_model_type": "x_start",
     "predicted_neighbor_num": 10,

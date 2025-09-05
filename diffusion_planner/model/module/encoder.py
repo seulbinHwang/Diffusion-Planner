@@ -3,6 +3,16 @@ from timm.layers import DropPath
 import torch.nn.functional as F
 
 from diffusion_planner.model.module.mixer import MixerBlock
+# ==== (encoder.py 상단 import 근처에 추가) ====
+from typing import Tuple  # 이미 있으면 중복 추가 불필요
+try:
+    from flash_attn.flash_attn_varlen import flash_attn_varlen_qkvpacked_func
+    _FA2_AVAILABLE = True
+    _FA2_IMPORT_ERR = None
+except Exception as _e:
+    _FA2_AVAILABLE = False
+    _FA2_IMPORT_ERR = _e
+# ============================================
 
 from typing import Tuple, Dict, Optional
 import torch
@@ -315,12 +325,9 @@ class Encoder(nn.Module):
             # TODO: "using" ego_agent_next_11_dim 도 해보자.
             ego_future_trajectory = ego_future_full
             if ego_future_trajectory is None:
-                ego_future_trajectory = torch.zeros(
-                    (B, future_len, 11),
-                        device=ego_past.device,
-                        dtype=ego_past.dtype)
-
-
+                ego_future_trajectory = torch.zeros((B, future_len, 11),
+                                                    device=ego_past.device,
+                                                    dtype=ego_past.dtype)
 
         # ---------------------- 3) 인코딩 ---------------------- #
         # ego_fut_global: (B, hidden_dim)
@@ -387,8 +394,9 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         encoder_outputs = {}
         encoding_tokens, encoding_mask = self.fusion(
             encoding_input, encoding_mask.reshape(B, self.token_num))
-        encoder_outputs['encoding'] = encoding_tokens # (B, token_num, hidden_dim)
-        encoder_outputs['encoding_mask'] = encoding_mask # (B, token_num)
+        encoder_outputs[
+            'encoding'] = encoding_tokens  # (B, token_num, hidden_dim)
+        encoder_outputs['encoding_mask'] = encoding_mask  # (B, token_num)
         encoder_outputs["ego_fut_global"] = ego_fut_global
 
         return encoder_outputs
@@ -399,7 +407,7 @@ class SelfAttentionBlock(nn.Module):
     def __init__(
             self,
             dim=192,
-            heads=6,
+            heads=8,
             attn_drop_p: float = 0.0,  # 어텐션 드롭아웃
             ffn_drop_p: float = 0.0,  # FFN 드롭아웃
             drop_path_p: float = 0.0,  # Stochastic Depth
@@ -407,12 +415,12 @@ class SelfAttentionBlock(nn.Module):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim)
+        # 원본의 self.attn(nn.MultiheadAttention)은 폴백 경로에서만 사용
         self.attn = nn.MultiheadAttention(dim,
                                           heads,
                                           attn_drop_p,
                                           batch_first=True)
-
-        self.attn_out_drop = nn.Dropout(attn_drop_p)  # ← MHA 출력에도 동일 확률로 살짝
+        self.attn_out_drop = nn.Dropout(attn_drop_p)
         self.drop_path = DropPath(
             drop_path_p) if drop_path_p > 0.0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
@@ -422,22 +430,196 @@ class SelfAttentionBlock(nn.Module):
                        act_layer=nn.GELU,
                        drop=ffn_drop_p)
 
+        # === FlashAttention‑2용 QKV/출력 프로젝션 ===
+        self.num_heads = heads
+        self.head_dim = dim // heads
+        assert dim % heads == 0, f"dim({dim}) must be divisible by heads({heads})"
+        if (self.head_dim % 8) != 0:
+            # 권장: 8 배수
+            print(f"[Warning] head_dim={self.head_dim} (not multiple of 8). "
+                  "FlashAttention‑2 성능이 저하될 수 있습니다.")
+
+        # 유효 토큰에만 적용하는 선형 레이어
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=True)
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+        # FlashAttention dropout 확률(학습 시에만 사용)
+        self._attn_dropout_p = attn_drop_p
+
+    # ------------------------------------------------------------------
+    # 아래 유틸리티 함수들은 varlen 커널 구동을 위한 핵심 로직입니다.
+    # 모두 타입 힌트와 Google Style 한글 docstring, 자주 쓰이는 shape 주석 포함.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_compute_dtype(x: torch.Tensor) -> torch.dtype:
+        """연산 dtype을 선택합니다(BF16/FP16 우선).
+
+        AMP/autocast와의 정합성을 위해 입력 텐서 `x`의 dtype이 FP16/BF16이면 그대로,
+        아니라면 FP16을 사용하여 FlashAttention‑2의 장점을 극대화합니다.
+
+        Args:
+            x (torch.Tensor): 임의 텐서. (shape 무관)
+
+        Returns:
+            torch.dtype: torch.float16 또는 torch.bfloat16
+        """
+        return x.dtype if x.dtype in (torch.float16,
+                                      torch.bfloat16) else torch.float16
+
+    @staticmethod
+    def _unpad_from_mask(
+        x: torch.Tensor,  # (B, L, D)
+        mask: torch.Tensor  # (B, L)  True=pad(무효)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
+        """패딩 마스크로부터 유효 토큰만 추출(unpad)합니다.
+
+        FlashAttention‑2 varlen 커널은 (B, L, D)를 직접 받지 않고, **유효 토큰을 연결한 2D 버퍼**와
+        **배치별 누적 길이(cu_seqlens)**를 필요로 합니다. 또한 pad back(복원)을 위한 인덱스도 반환합니다.
+
+        Args:
+            x (torch.Tensor): 입력 시퀀스, 모양 (B, L, D).
+            mask (torch.Tensor): 키 패딩 마스크(True=pad), 모양 (B, L).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
+                x_unpad: (T, D) 유효 토큰만 이어붙인 텐서. T = sum(seqlens).
+                indices: (T,)  원래 (B*L) 평탄화 인덱스에서 유효 토큰의 위치.
+                cu_seqlens: (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0.
+                max_seqlen: int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1).
+                seqlens: (B,) int32  배치별 유효 토큰 개수.
+
+        Note:
+            - 유효 토큰이 전혀 없는 경우 T=0이 되어, 호출 측에서 안전하게 영 텐서를 반환하도록 합니다.
+        """
+        B, L, D = x.shape
+        valid = (~mask).to(torch.bool)  # (B, L)
+        seqlens = valid.sum(dim=1).to(torch.int32)  # (B,)
+        cu_seqlens = torch.nn.functional.pad(  # (B+1,)
+            seqlens.cumsum(dim=0), (1, 0))
+        flat_valid = valid.reshape(B * L)  # (B*L,)
+        indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1).to(
+            torch.long)  # (T,)
+        x_unpad = x.reshape(B * L, D).index_select(0, indices)  # (T, D)
+        max_seqlen = int(seqlens.max().item()) if B > 0 else 0
+        return x_unpad, indices, cu_seqlens, max_seqlen, seqlens
+
+    @staticmethod
+    def _pad_to_batch(
+        y_unpad: torch.Tensor,  # (T, D)
+        indices: torch.Tensor,  # (T,)
+        B: int,
+        L: int,
+        D: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """언패드 결과를 원래 배치 모양으로 복원합니다.
+
+        Args:
+            y_unpad (torch.Tensor): 언패드 출력, 모양 (T, D).
+            indices (torch.Tensor): 유효 토큰의 플랫 인덱스, 모양 (T,).
+            B (int): 배치 크기.
+            L (int): 시퀀스 길이.
+            D (int): 히든 차원.
+            device (torch.device): 출력 텐서 디바이스.
+            dtype (torch.dtype): 출력 텐서 dtype.
+
+        Returns:
+            torch.Tensor: 복원된 텐서, 모양 (B, L, D).
+
+        Note:
+            - 유효 토큰이 없을 때도 (B, L, D) 영 텐서를 안전하게 반환합니다.
+            - `index_copy_`를 사용해 gradient가 정확히 유효 위치로만 전파됩니다.
+        """
+        out = torch.zeros(B * L, D, device=device, dtype=dtype)  # (B*L, D)
+        if y_unpad.numel() > 0:
+            out.index_copy_(0, indices, y_unpad)  # 유효 위치만 채움
+        return out.view(B, L, D)  # (B, L, D)
+
+    def _self_attn_flash_varlen(
+            self,
+            x: torch.Tensor,  # (B, L, D)
+            mask: torch.Tensor,  # (B, L) True=pad
+    ) -> torch.Tensor:
+        """FlashAttention‑2(varlen) Self‑Attention을 수행합니다.
+
+        1) `mask`를 이용해 유효 토큰만 언패드 → 2) QKV/어텐션/출력 프로젝션을 유효 토큰에만 수행
+        → 3) pad back으로 (B, L, D) 복원합니다. 패딩 토큰은 연산 경로에 참여하지 않으므로
+        연산량과 메모리 사용량이 유효 길이에 비례합니다.
+
+        Args:
+            x (torch.Tensor): 입력(쿼리=키=값), 모양 (B, L, D).
+            mask (torch.Tensor): 키 패딩 마스크(True=pad), 모양 (B, L).
+
+        Returns:
+            torch.Tensor: Self‑Attention 출력, 모양 (B, L, D).
+        """
+        if not _FA2_AVAILABLE:
+            raise RuntimeError("FlashAttention‑2가 사용 불가능합니다. "
+                               "설치 오류: " + str(_FA2_IMPORT_ERR))
+            # # FlashAttention‑2가 없으면 원래 경로로 폴백
+            # y = self.attn(x, x, x, key_padding_mask=mask,
+            #               need_weights=False)[0]  # (B, L, D)
+            return y
+
+        B, L, D = x.shape
+
+        # (1) 언패드
+        x_unpad, idx, cu, max_len, seqlens = self._unpad_from_mask(
+            x, mask)  # x_unpad: (T, D)
+        T = x_unpad.shape[0]
+        if T == 0 or max_len == 0:
+            return torch.zeros_like(x)
+
+        # (2) QKV 프로젝션 (유효 토큰만)
+        qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
+        qkv = qkv.view(T, 3, self.num_heads, self.head_dim)  # (T, 3, H, Hd)
+        comp_dtype = self._get_compute_dtype(qkv)
+        qkv = qkv.to(comp_dtype)
+
+        # (3) FlashAttention‑2 varlen
+        # out: (T, H, Hd)
+        out = flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_seqlens=cu.to(torch.int32),
+            max_seqlen=max_len,
+            dropout_p=self._attn_dropout_p if self.training else 0.0,
+            softmax_scale=None,
+            causal=False,
+            return_softmax=False,
+        )  # (T, H, Hd)
+
+        # (4) 출력 프로젝션 + pad back
+        out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
+        out = self.out_proj(out.to(x.dtype))  # (T, D) -> in dtype
+        out = self._pad_to_batch(out, idx, B, L, D, x.device,
+                                 x.dtype)  # (B, L, D)
+        return out
+
+    # ------------------------------------------------------------------
+
     def forward(self, x, mask):
         """
-        x:  [on_B, 1+ token_num, H]
-        mask: [on_B, 1 + token_num]
+        x:  [on_B, 1 + token_num, H]
+        mask: [on_B, 1 + token_num]  # True=pad
 
+        Note:
+            - 입력을 먼저 마스크로 0 클램프(원본 유지)한 뒤 LN → varlen Self‑Attention.
+            - pad back된 출력은 마스크 위치가 0이며, 이후 MLP/DropPath를 통과하면서도
+              마스크는 다시 0으로 클램프합니다(원본 동작과 정합).
         """
+        # (on_B, L, H)
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
 
-        x_norm = self.norm1(x)
-        y = self.attn(x_norm,
-                      x_norm,
-                      x_norm,
-                      key_padding_mask=mask,
-                      need_weights=False)[0]
-        y = self.attn_out_drop(y)  # <-- actually use it
+        x_norm = self.norm1(x)  # (on_B, L, H)
+
+        # === FlashAttention‑2(varlen) 또는 폴백 ===
+        y = self._self_attn_flash_varlen(x_norm, mask)  # (on_B, L, H)
+
+        y = self.attn_out_drop(y)
         x = x + self.drop_path(y)
+
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return x
@@ -1674,8 +1856,8 @@ class AgentFusionEncoder(nn.Module):
             self.future_chunk_num)
 
         # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
-        on_all_on_chunk = on_all_on_chunk + (
-            self.type_scale * agents_ego_fut_type_emb)
+        on_all_on_chunk = on_all_on_chunk + (self.type_scale *
+                                             agents_ego_fut_type_emb)
         # on_all_on_chunk: (on_all_on_chunk_num, hidden_dim)
         on_all_on_chunk = self.emb_project(self.norm(on_all_on_chunk))
         ########################
@@ -1787,9 +1969,10 @@ class AgentFusionEncoder(nn.Module):
 
         # 4) softmax → 행 게이팅(곱)으로 all-off를 0으로
         weights = F.softmax(logits, dim=1)  # (B, future_chunk_num, 1), fp32
-        row_valid = (~ego_fut_all_chunk_off).to(weights.dtype).unsqueeze(
-            -1).unsqueeze(-1)  # (B, 1, 1)
-        weights = (weights * row_valid).to(ego_fut_chunk.dtype) # (B, future_chunk_num, 1)
+        row_valid = (~ego_fut_all_chunk_off).to(
+            weights.dtype).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        weights = (weights * row_valid).to(
+            ego_fut_chunk.dtype)  # (B, future_chunk_num, 1)
         # ego_fut_chunk: (B, future_chunk_num, hidden_dim)
         ego_fut_global_attn = (weights * ego_fut_chunk).sum(
             dim=1)  # (B, hidden_dim)
@@ -2034,7 +2217,7 @@ class FusionEncoder(nn.Module):
     def __init__(
             self,
             hidden_dim=192,
-            num_heads=6,
+            num_heads=8,
             drop_path_rate=0.2,
             depth=3,
             attn_drop_p: float = 0.025,  # 권장 0.0~0.1

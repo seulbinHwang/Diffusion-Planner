@@ -214,7 +214,7 @@ def get_args():
     parser.add_argument('--num_heads',
                         type=int,
                         help='number of multi-head',
-                        default=6)
+                        default=8)
     parser.add_argument('--hidden_dim',
                         type=int,
                         help='hidden dimension',
