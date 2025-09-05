@@ -571,6 +571,7 @@ class SelfAttentionBlock(nn.Module):
         if not _FA2_AVAILABLE:
             raise RuntimeError("FlashAttention‑2가 사용 불가능합니다. "
                                "설치 오류: " + str(_FA2_IMPORT_ERR))
+            # TODO: cpu 만 사용가능할 때, PyTorch SDPA(패딩 포함) 사용하는 옵션 추가 (아래 주석 해제)
             # # FlashAttention‑2가 없으면 원래 경로로 폴백
             # y = self.attn(x, x, x, key_padding_mask=mask,
             #               need_weights=False)[0]  # (B, L, D)

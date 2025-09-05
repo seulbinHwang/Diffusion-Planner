@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 from typing import Tuple
-
+import torch.nn.functional as F
 # ===== FlashAttention-2 varlen import =====
 try:
     from flash_attn.flash_attn_varlen import (
@@ -273,6 +273,7 @@ class DiTBlock(nn.Module):
         Raises:
             RuntimeError: FlashAttention‑2 모듈이 없는 경우.
         """
+        # TODO: cpu 만 사용가능할 때, PyTorch SDPA(패딩 포함) 사용하는 옵션 추가
         self._check_flash_available()
         B, L, D = x.shape
 
@@ -337,6 +338,7 @@ class DiTBlock(nn.Module):
             - 모든 토큰이 마스크된 배치(전부 pad)인 경우 (B, Lq, D) 영 텐서를 반환합니다.
             - 드롭아웃은 학습 시에만 활성화됩니다.
         """
+        # TODO: cpu 만 사용가능할 때, PyTorch SDPA(패딩 포함) 사용하는 옵션 추가
         self._check_flash_available()
         B, Lq, D = q_in.shape
         _, Lk, _ = kv_in.shape
