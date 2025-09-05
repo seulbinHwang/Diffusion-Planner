@@ -455,8 +455,9 @@ class SelfAttentionBlock(nn.Module):
     def _get_compute_dtype(x: torch.Tensor) -> torch.dtype:
         """연산 dtype을 선택합니다(BF16/FP16 우선).
 
-        AMP/autocast와의 정합성을 위해 입력 텐서 `x`의 dtype이 FP16/BF16이면 그대로,
-        아니라면 FP16을 사용하여 FlashAttention‑2의 장점을 극대화합니다.
+        1) autocast가 켜져 있으면 해당 dtype을 우선 사용합니다.
+        2) 입력 텐서 `x`가 FP16/BF16이면 그대로 사용합니다.
+        3) 그 외에는 GPU 아키텍처에 따라 BF16(>=SM80) 또는 FP16을 반환합니다.
 
         Args:
             x (torch.Tensor): 임의 텐서. (shape 무관)
@@ -464,8 +465,20 @@ class SelfAttentionBlock(nn.Module):
         Returns:
             torch.dtype: torch.float16 또는 torch.bfloat16
         """
-        return x.dtype if x.dtype in (torch.float16,
-                                      torch.bfloat16) else torch.float16
+        if torch.is_autocast_enabled():
+            try:
+                return torch.get_autocast_gpu_dtype()
+            except Exception:
+                pass
+
+        if x.dtype in (torch.float16, torch.bfloat16):
+            return x.dtype
+
+        if x.is_cuda and torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(x.device)
+            return torch.bfloat16 if major >= 8 else torch.float16
+
+        return torch.float16
 
     @staticmethod
     def _unpad_from_mask(

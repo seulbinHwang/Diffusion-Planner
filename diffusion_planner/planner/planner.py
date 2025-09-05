@@ -18,6 +18,7 @@ from nuplan.planning.simulation.planner.abstract_planner import (
 from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from diffusion_planner.data_process.data_processor import DataProcessor
 from diffusion_planner.utils.config import Config
+from diffusion_planner.utils.amp import amp_context_for_infer
 
 
 def identity(ego_state, predictions):
@@ -133,7 +134,12 @@ class DiffusionPlanner(AbstractPlanner):
         inputs = self.planner_input_to_model_inputs(current_input)
 
         inputs = self.observation_normalizer(inputs)
-        _, outputs = self._planner(inputs)
+        with torch.inference_mode():
+            if self._device == "cuda":
+                with amp_context_for_infer():
+                    _, outputs = self._planner(inputs)
+            else:
+                _, outputs = self._planner(inputs)
 
         trajectory = InterpolatedTrajectory(
             trajectory=self.outputs_to_trajectory(
