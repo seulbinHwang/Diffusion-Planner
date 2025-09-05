@@ -25,6 +25,7 @@ from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.simulation.history.simulation_history import SimulationHistory
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
 from nuplan.planning.utils.serialization.to_scene import tracked_object_types
+from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
 
 
 class BokehAgentStates(NamedTuple):
@@ -43,6 +44,10 @@ class BokehAgentStates(NamedTuple):
     velocity_ys: List[float]  # [m/s], A list of velocity in y (body frame).
     speeds: List[float]  # [m/s], A list of speed.
     headings: List[float]  # [m], a list of headings
+    prediction_xs: List[List[float]]  # [m], predicted trajectory xs for each agent
+    prediction_ys: List[List[float]]  # [m], predicted trajectory ys for each agent
+    past_xs: List[List[float]]  # [m], past trajectory xs for each agent
+    past_ys: List[List[float]]  # [m], past trajectory ys for each agent
 
 
 @dataclass(frozen=True)
@@ -437,6 +442,10 @@ class AgentStatePlot(BaseScenarioPlot):
         default_factory=dict)  # A dict of data for each frame
     plots: Dict[str, GlyphRenderer] = field(
         default_factory=dict)  # A dict of plots for each type
+    prediction_plots: Dict[str, GlyphRenderer] = field(
+        default_factory=dict)  # Predicted trajectory plots for each type
+    past_plots: Dict[str, GlyphRenderer] = field(
+        default_factory=dict)  # Past trajectory plots for each type
     track_id_history: Optional[Dict[str, int]] = None  # Track id history
 
     def __post_init__(self) -> None:
@@ -488,6 +497,8 @@ class AgentStatePlot(BaseScenarioPlot):
 
                 for category, data_source in data_sources.items():
                     plot = self.plots.get(category, None)
+                    prediction_plot = self.prediction_plots.get(category, None)
+                    past_plot = self.past_plots.get(category, None)
                     data = dict(data_source.data)
                     if plot is None:
                         agent_color = simulation_tile_agent_style.get(category)
@@ -498,6 +509,22 @@ class AgentStatePlot(BaseScenarioPlot):
                             fill_alpha=agent_color["fill_alpha"],
                             line_color=agent_color["line_color"],
                             line_width=agent_color["line_width"],
+                            source=data,
+                        )
+                        self.prediction_plots[category] = main_figure.multi_line(
+                            xs="prediction_xs",
+                            ys="prediction_ys",
+                            line_color="#00C8C8",
+                            line_alpha=0.8,
+                            line_width=2,
+                            source=data,
+                        )
+                        self.past_plots[category] = main_figure.multi_line(
+                            xs="past_xs",
+                            ys="past_ys",
+                            line_color="#FFC0CB",
+                            line_alpha=0.8,
+                            line_width=1,
                             source=data,
                         )
                         agent_hover = HoverTool(
@@ -516,6 +543,10 @@ class AgentStatePlot(BaseScenarioPlot):
                         main_figure.add_tools(agent_hover)
                     else:
                         self.plots[category].data_source.data = data
+                        if prediction_plot:
+                            self.prediction_plots[category].data_source.data = data
+                        if past_plot:
+                            self.past_plots[category].data_source.data = data
 
                 self.render_event.clear()  # type: ignore
 
@@ -566,6 +597,10 @@ tracked_object_types = {
                     velocity_ys = []
                     speeds = []
                     headings = []
+                    prediction_xs = []
+                    prediction_ys = []
+                    past_xs = []
+                    past_ys = []
                     # List[TrackedObject]
                     for tracked_object in tracked_objects.get_tracked_objects_of_type(
                             tracked_object_type):
@@ -592,6 +627,33 @@ tracked_object_types = {
                             self._get_track_id(tracked_object.track_token))
                         track_tokens.append(tracked_object.track_token)
 
+                        if isinstance(tracked_object, Agent):
+                            if tracked_object.predictions:
+                                first_pred = tracked_object.predictions[0]
+                                pred_states = first_pred.get_sampled_trajectory()
+                                pred_xs = [state.center.x for state in pred_states]
+                                pred_ys = [state.center.y for state in pred_states]
+                                prediction_xs.append(pred_xs)
+                                prediction_ys.append(pred_ys)
+                            else:
+                                prediction_xs.append([])
+                                prediction_ys.append([])
+
+                            if tracked_object.past_trajectory:
+                                past_states = tracked_object.past_trajectory.get_sampled_trajectory()
+                                past_x_vals = [state.center.x for state in past_states]
+                                past_y_vals = [state.center.y for state in past_states]
+                                past_xs.append(past_x_vals)
+                                past_ys.append(past_y_vals)
+                            else:
+                                past_xs.append([])
+                                past_ys.append([])
+                        else:
+                            prediction_xs.append([])
+                            prediction_ys.append([])
+                            past_xs.append([])
+                            past_ys.append([])
+
                     agent_states = BokehAgentStates(
                         xs=corner_xs,
                         ys=corner_ys,
@@ -604,6 +666,10 @@ tracked_object_types = {
                         velocity_ys=velocity_ys,
                         speeds=speeds,
                         headings=headings,
+                        prediction_xs=prediction_xs,
+                        prediction_ys=prediction_ys,
+                        past_xs=past_xs,
+                        past_ys=past_ys,
                     )
 
                     frame_dict[tracked_object_type_name] = ColumnDataSource(
