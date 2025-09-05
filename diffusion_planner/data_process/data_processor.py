@@ -36,7 +36,8 @@ class DataProcessor(object):
 
         self.num_agents = config.agent_num
         self.num_static = config.static_objects_num
-        self.max_ped_bike = 10  # Limit the number of pedestrians and bicycles in the agent.
+        self.max_ped = 128  # Limit the number of pedestrians in the agent.
+        self.max_bike = 64  # Limit the number of bicycles in the agent.
         self._radius = 100  # [m] query radius scope relative to the current pose.
 
         self._map_features = [
@@ -96,7 +97,7 @@ class DataProcessor(object):
         static_objects, static_objects_types = sampled_static_objects_to_array_list(
             observation_buffer[-1])
         _, neighbor_agents_past, _, static_objects = \
-            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped_bike, anchor_ego_state)
+            agent_past_process(ego_agent_past, neighbor_agents_past, neighbor_agents_types, self.num_agents, static_objects, static_objects_types, self.num_static, self.max_ped, self.max_bike, anchor_ego_state)
         '''
         Map
         '''
@@ -168,7 +169,7 @@ class DataProcessor(object):
              neighbor_indices, static_objects) = agent_past_process(
                  ego_agent_past, neighbor_agents_past, neighbor_agents_types,
                  self.num_agents, static_objects, static_objects_types,
-                 self.num_static, self.max_ped_bike, anchor_ego_state)
+                 self.num_static, self.max_ped, self.max_bike, anchor_ego_state)
             '''
             Map
             '''
