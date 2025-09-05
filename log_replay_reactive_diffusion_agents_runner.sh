@@ -9,7 +9,7 @@ export NUPLAN_DEVKIT_ROOT="/home/user/PycharmProjects/nuplan-devkit"  #"REPLACE_
 export NUPLAN_DATA_ROOT="/home/user/nuplan/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
 export NUPLAN_MAPS_ROOT="/home/user/nuplan/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
 export NUPLAN_EXP_ROOT="/home/user/nuplan/exp" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
-
+# nuplan/planning/script/config/simulation/main_callback/time_callback.yaml
 # Dataset split to use
 # Options:
 #   - "test14-random" # 14개 시나리오 # 각 유형별로 무작위로 20개의 시나리오를 선택해 평가
@@ -46,6 +46,7 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     observation.model_config.config.args_file=$ARGS_FILE \
+    main_callback+=simulation_feature_video_callback \
     observation.model_config.ckpt_path=$CKPT_FILE \
     observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
     observation.checkpoint_path=$CKPT_FILE \

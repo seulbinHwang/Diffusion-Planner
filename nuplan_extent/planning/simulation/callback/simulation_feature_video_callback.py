@@ -200,9 +200,6 @@ class SimulationFeatureVideoCallback(AbstractCallback):
                 `visualize_all_scenarios=True`인 경우에 한해 모든 시나리오를 시각화한다.
             visualize_all_scenarios (bool):
                 `True`일 경우 **모든 시나리오**를 시각화 대상으로 처리한다.
-            bev_range (List[float]):
-                BEV(탑뷰) 이미지 범위 설정값. 기본값은 `[-56, -56, 56, 56]`.
-                (현재 코드에서는 직접 사용하지 않지만, 외부 렌더러와의 인터페이스를 고려해 보관)
             image_subfix (str):
                 저장될 이미지 파일의 접미사(확장자). 예: `.png`, `.jpg`.
 
@@ -222,7 +219,6 @@ class SimulationFeatureVideoCallback(AbstractCallback):
         self._feature_log_directory = pathlib.Path(
             simulation_directory) / feature_log_dir
         self._subfix = image_subfix
-        self._bev_range = bev_range
 
     def on_initialization_start(self, setup: SimulationSetup,
                                 planner: AbstractPlanner) -> None:

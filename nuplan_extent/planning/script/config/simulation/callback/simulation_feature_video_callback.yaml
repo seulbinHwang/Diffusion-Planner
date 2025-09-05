@@ -1,0 +1,9 @@
+simulation_feature_video_callback:
+  _target_: nuplan_extent.planning.simulation.callback.simulation_feature_video_callback.SimulationFeatureVideoCallback
+  _convert_: 'all'
+
+  simulation_directory: ${output_dir} #  시뮬레이션 산출물이 기록될 **루트 디렉터리**.
+  videos_output_dir: simulation_log   # 동영상 파일들을 저장할 **상대 경로** 또는 **절대 경로**. , 실제 저장 경로는 `simulation_directory / videos_output_dir`.
+  feature_log_dir: # 렌더링된 피처 이미지들을 저장할 **상대/절대 경로**. , 실제 저장 경로는 `simulation_directory / feature_log_dir`.
+  visualized_scenario_tokens: # 시각화할 시나리오 토큰 목록. 지정되지 않았거나 빈 리스트일 경우, `visualize_all_scenarios=True`인 경우에 한해 모든 시나리오를 시각화한다.
+  visualize_all_scenarios: False

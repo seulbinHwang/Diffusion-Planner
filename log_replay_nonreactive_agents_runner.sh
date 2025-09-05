@@ -45,6 +45,7 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     scenario_builder=$SCENARIO_BUILDER \
+    main_callback+=simulation_feature_video_callback \
     scenario_filter=$SPLIT \
     experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
     verbose=true \
