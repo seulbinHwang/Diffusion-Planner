@@ -306,7 +306,7 @@ def collect_valid_xy_for_bounds(
 
     # ego past, ego pred, ego future
     for key in ("ego_agent_past", "ego_agent_next_11_dim",
-                "ego_future_gt_11_dim"):
+                "ego_future_gt_11_dim", "ego_agent_future_11_dim"):
         A = world_model_feature.get(key)
         if A is None or A.size == 0:
             continue
@@ -797,8 +797,10 @@ def draw_world_model_to_png(
         draw_ego_predicted(ax, world_model_feature.get("ego_agent_next_11_dim"),
                            draw_option)
     if draw_option.draw_ego_future_gt:
-        draw_ego_future_gt(ax, world_model_feature.get("ego_future_gt_11_dim"),
-                           draw_option)
+        data_ = world_model_feature.get("ego_future_gt_11_dim", None)
+        if data_ is None:
+            data_ = world_model_feature.get("ego_agent_future_11_dim", None)
+        draw_ego_future_gt(ax, data_, draw_option)
 
     # 5) 축 범위/스타일
     bounds = compute_auto_bounds(world_model_feature, draw_option,
