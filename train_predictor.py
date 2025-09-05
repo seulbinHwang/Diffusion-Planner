@@ -234,7 +234,7 @@ def get_args():
     parser.add_argument('--predicted_neighbor_num',
                         type=int,
                         help='number of neighbor agents to predict',
-                        default=10)
+                        default=448)
 
     parser.add_argument('--use_wandb', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)

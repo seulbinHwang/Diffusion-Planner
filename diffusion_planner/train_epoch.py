@@ -67,6 +67,8 @@ def train_epoch(data_loader,
             }
 
             ego_future = batch[2].to(args.device)
+            # ["neighbor_agents_future"][:self._predicted_neighbor_num]
+            # (B, num_agents, future_len, 3) -> (B, predicted_neighbor_num, future_len, 3)
             neighbors_future = batch[4].to(args.device)
             neighbors_future_all = batch[12].to(args.device)
             # Normalize to ego-centric
@@ -89,7 +91,7 @@ def train_epoch(data_loader,
 
             mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
                              dim=-1) == 0
-            # neighbors_future shape: [B, N, T, 4]
+            # (B, predicted_neighbor_num, future_len, 3) -> (B, predicted_neighbor_num, future_len, 4)
             neighbors_future = torch.cat(
                 [
                     neighbors_future[..., :2],

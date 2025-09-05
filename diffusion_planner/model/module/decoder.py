@@ -100,7 +100,7 @@ class Decoder(nn.Module):
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
 
         if self.training:
-            near_cur_future_norm_xT = inputs['near_cur_future_norm_xT'].reshape(
+            near_cur_future_norm_xT = inputs["near_cur_future_norm_xT"].reshape(
                 B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
             diffusion_time = inputs['diffusion_time']
             # (B, Pnn, (1 + T) , 4)

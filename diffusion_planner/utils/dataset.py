@@ -27,9 +27,10 @@ class DiffusionPlannerData(Dataset):
 
         neighbor_agents_past = data['neighbor_agents_past'][:self.
                                                             _past_neighbor_num]
+        # (num_agents, future_len, 3) -> (predicted_neighbor_num, future_len, 3)
         neighbor_agents_future = data[
-            'neighbor_agents_future'][:self._predicted_neighbor_num]
-        neighbor_agents_future_all = data['neighbor_agents_future']
+            "neighbor_agents_future"][:self._predicted_neighbor_num]
+        neighbor_agents_future_all = data["neighbor_agents_future"]
 
         lanes = data['lanes']
         lanes_speed_limit = data['lanes_speed_limit']

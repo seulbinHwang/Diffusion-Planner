@@ -88,7 +88,9 @@ def diffusion_loss_func(
     eps: float = 1e-3,
 ):
     """
+
     near_future_gt.shape: [8, Pnn, 80, 4] # [B, Pnn, T, 4]
+        ["neighbor_agents_future"][:self._predicted_neighbor_num]
     near_future_mask.shape: [8, Pnn, 80] # [B, Pnn, T]
     """
     near_future_gt, near_future_mask = futures
