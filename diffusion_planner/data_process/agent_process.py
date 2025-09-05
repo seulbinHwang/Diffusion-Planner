@@ -304,6 +304,7 @@ def agent_past_process(
         num_static: int,
         max_ped_bike: int,
         anchor_ego_state: np.ndarray,  #(3,)
+        radius: float ,
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     # ego_agent_past: (num_frames, 11)
     # neighbor_agents_past: (agent_num, num_frames, 11)

@@ -123,7 +123,7 @@ class DataProcessor(object):
              all_frame_ego_feature, all_frame_agents_feature,
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_ped_bike,
-             anchor_ego_state)
+             anchor_ego_state, self._radius)
         '''
         Map
         '''
