@@ -630,7 +630,7 @@ tracked_object_types = {
                         if isinstance(tracked_object, Agent):
                             if tracked_object.predictions:
                                 first_pred = tracked_object.predictions[0]
-                                pred_states = first_pred.get_sampled_trajectory()
+                                pred_states = first_pred.trajectory.get_sampled_trajectory()
                                 pred_xs = [state.center.x for state in pred_states]
                                 pred_ys = [state.center.y for state in pred_states]
                                 prediction_xs.append(pred_xs)
@@ -640,7 +640,7 @@ tracked_object_types = {
                                 prediction_ys.append([])
 
                             if tracked_object.past_trajectory:
-                                past_states = tracked_object.past_trajectory.get_sampled_trajectory()
+                                past_states = tracked_object.past_trajectory.trajectory.get_sampled_trajectory()
                                 past_x_vals = [state.center.x for state in past_states]
                                 past_y_vals = [state.center.y for state in past_states]
                                 past_xs.append(past_x_vals)
