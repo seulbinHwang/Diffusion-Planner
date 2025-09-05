@@ -9,7 +9,7 @@ import math
 import wandb
 import os
 import torch
-from typing import Dict, Tuple, Union, List
+from typing import Dict, Tuple, Union, List, Optional
 from nuplan.common.actor_state.state_representation import Point2D
 import draw_machine
 # matplotlib 설정 추가
@@ -72,6 +72,36 @@ class DataProcessor(object):
             )
         self._wandb_enabled = wandb.run is not None
 
+    def _filter_agents_within_radius(
+            self,
+            neighbor_agents_past: np.ndarray,
+            neighbor_agents_future: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        """ego 중심 self._radius 이내 에이전트 필터링.
+
+        Args:
+            neighbor_agents_past (np.ndarray): (N, Tp, 11) 상대 좌표계 과거 에이전트.
+            neighbor_agents_future (Optional[np.ndarray], optional):
+                (N, Tf, 3) 상대 좌표계 미래 에이전트. 기본값은 ``None``.
+
+        Returns:
+            Tuple[np.ndarray, Optional[np.ndarray]]:
+                반경 내 에이전트만 남긴 ``neighbor_agents_past`` 와 ``neighbor_agents_future``.
+        """
+        # distances: (N,)
+        distances = np.linalg.norm(neighbor_agents_past[:, -1, :2], axis=-1)
+        # mask: (N,)
+        mask = distances <= self._radius
+        # mask_expanded: (N, 1, 1)
+        mask_expanded = mask[:, None, None]
+        # filtered_neighbor_agents_past: (N, Tp, 11)
+        filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
+        filtered_neighbor_agents_future = None
+        if neighbor_agents_future is not None:
+            # filtered_neighbor_agents_future: (N, Tf, 3)
+            filtered_neighbor_agents_future = neighbor_agents_future * mask_expanded
+        return filtered_neighbor_agents_past, filtered_neighbor_agents_future
+
     # Use for inference
     def observation_adapter(self,
                             history_buffer,
@@ -124,6 +154,8 @@ class DataProcessor(object):
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_ped_bike,
              anchor_ego_state, self._radius)
+        neighbor_agents_past, _ = self._filter_agents_within_radius(
+            neighbor_agents_past)
         '''
         Map
         '''
@@ -255,6 +287,9 @@ class DataProcessor(object):
             neighbor_agents_future = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
                 self.num_agents, neighbor_indices)
+            neighbor_agents_past, neighbor_agents_future = \
+                self._filter_agents_within_radius(neighbor_agents_past,
+                                                 neighbor_agents_future)
             '''
             ego current
             
