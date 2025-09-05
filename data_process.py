@@ -261,7 +261,7 @@ if __name__ == "__main__":
                         help='shuffle scenarios')
     parser.add_argument('--agent_num',
                         type=int,
-                        default=32,
+                        default=448,
                         help='number of agents')
     parser.add_argument('--static_objects_num',
                         type=int,

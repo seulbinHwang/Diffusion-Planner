@@ -193,6 +193,7 @@ class DataProcessor(object):
             (present_static_feature, static_objects_types
             ) = sampled_static_objects_to_array_list(present_tracked_objects)
 
+            # : ego_agent_past: (num_frames, 11)
             (ego_agent_past, neighbor_agents_past,
              neighbor_indices, static_objects) = agent_past_process(
                  all_frame_ego_feature, all_frame_agents_feature,
@@ -259,9 +260,7 @@ class DataProcessor(object):
             
             
             '''
-            # ego_current_state = calculate_additional_ego_states(
-            #     ego_agent_past, time_stamps_past)
-            # ego_agent_past: (T, 7) -> (T=21, 11)
+            # ego_agent_past: (T, 11)
             _, ego_current_state = calculate_additional_ego_states(
                 ego_agent_past, time_stamps_past)
             T, D = ego_agent_past.shape
