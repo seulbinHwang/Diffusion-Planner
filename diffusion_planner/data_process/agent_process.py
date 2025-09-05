@@ -214,7 +214,7 @@ def _pad_agent_states_with_zeros(agent_trajectories):
 
 def agent_past_process(past_ego_states, past_tracked_objects,
                        tracked_objects_types, num_agents, static_objects,
-                       static_objects_types, num_static, max_ped_bike,
+                       static_objects_types, num_static, max_ped, max_bike,
                        anchor_ego_state):
     """
     This function process the data from the raw agent data.
@@ -225,7 +225,8 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     :param static_objects: The input array data of static objects in the past.
     :param static_objects_types: The type of static objects in the past.
     :param num_static: Clip the number of static objects.
-    :param max_ped_bike: Clip the total number of ped and bike.
+    :param max_ped: Clip the number of pedestrians.
+    :param max_bike: Clip the number of bicycles.
     :param anchor_ego_state: Ego current state
     :return: ego, agents, selected_indices, static_objects
     """
@@ -326,30 +327,39 @@ def agent_past_process(past_ego_states, past_tracked_objects,
     # Sort indices by distance
     sorted_indices = np.argsort(distance_to_ego)
 
-    # Collect the indices of pedestrians and bicycles
-    ped_bike_indices = [
+    # Collect the indices of pedestrians, bicycles and vehicles
+    ped_indices = [
         i for i in sorted_indices
-        if agent_types[i] in (TrackedObjectType.PEDESTRIAN,
-                              TrackedObjectType.BICYCLE)
+        if agent_types[i] == TrackedObjectType.PEDESTRIAN
+    ]
+    bike_indices = [
+        i for i in sorted_indices
+        if agent_types[i] == TrackedObjectType.BICYCLE
     ]
     vehicle_indices = [
         i for i in sorted_indices if agent_types[i] == TrackedObjectType.VEHICLE
     ]
 
     # If the total number of available agents is less than or equal to num_agents, no need to filter further
-    if len(ped_bike_indices) + len(vehicle_indices) <= num_agents:
+    if len(ped_indices) + len(bike_indices) + len(vehicle_indices) <= num_agents:
         selected_indices = sorted_indices[:num_agents]
     else:
-        # Limit the number of pedestrians and bicycles to max_ped_bike, while retaining the remaining ones for later use
-        selected_ped_bike_indices = ped_bike_indices[:max_ped_bike]
-        remaining_ped_bike_indices = ped_bike_indices[max_ped_bike:]
+        # Limit the number of pedestrians and bicycles separately, while retaining the remaining ones for later use
+        selected_ped_indices = ped_indices[:max_ped]
+        selected_bike_indices = bike_indices[:max_bike]
+        remaining_ped_indices = ped_indices[max_ped:]
+        remaining_bike_indices = bike_indices[max_bike:]
 
         # Combine the limited pedestrians/bicycles and all available vehicles
-        selected_indices = selected_ped_bike_indices + vehicle_indices
+        selected_indices = selected_ped_indices + selected_bike_indices + vehicle_indices
 
         # If the combined selection is still less than num_agents, fill the remaining slots with additional pedestrians and bicycles
         remaining_slots = num_agents - len(selected_indices)
         if remaining_slots > 0:
+            remaining_ped_bike_indices = remaining_ped_indices + remaining_bike_indices
+            remaining_ped_bike_indices = sorted(
+                remaining_ped_bike_indices,
+                key=lambda idx: distance_to_ego[idx])
             selected_indices += remaining_ped_bike_indices[:remaining_slots]
 
         # Sort and limit the selected indices to num_agents
