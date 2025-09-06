@@ -73,9 +73,9 @@ class DataProcessor(object):
         self._wandb_enabled = wandb.run is not None
 
     def _filter_agents_within_radius(
-            self,
-            neighbor_agents_past: np.ndarray,
-            neighbor_agents_future: Optional[np.ndarray] = None
+        self,
+        neighbor_agents_past: np.ndarray,
+        neighbor_agents_future: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         """ego 중심 정사각형 영역(가로·세로 2*radius)으로 에이전트 클리핑.
 
