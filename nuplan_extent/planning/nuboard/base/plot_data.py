@@ -44,8 +44,10 @@ class BokehAgentStates(NamedTuple):
     velocity_ys: List[float]  # [m/s], A list of velocity in y (body frame).
     speeds: List[float]  # [m/s], A list of speed.
     headings: List[float]  # [m], a list of headings
-    prediction_xs: List[List[float]]  # [m], predicted trajectory xs for each agent
-    prediction_ys: List[List[float]]  # [m], predicted trajectory ys for each agent
+    prediction_xs: List[
+        List[float]]  # [m], predicted trajectory xs for each agent
+    prediction_ys: List[
+        List[float]]  # [m], predicted trajectory ys for each agent
     past_xs: List[List[float]]  # [m], past trajectory xs for each agent
     past_ys: List[List[float]]  # [m], past trajectory ys for each agent
 
@@ -511,14 +513,15 @@ class AgentStatePlot(BaseScenarioPlot):
                             line_width=agent_color["line_width"],
                             source=data,
                         )
-                        self.prediction_plots[category] = main_figure.multi_line(
-                            xs="prediction_xs",
-                            ys="prediction_ys",
-                            line_color="#00C8C8",
-                            line_alpha=0.8,
-                            line_width=2,
-                            source=data,
-                        )
+                        self.prediction_plots[
+                            category] = main_figure.multi_line(
+                                xs="prediction_xs",
+                                ys="prediction_ys",
+                                line_color="#00C8C8",
+                                line_alpha=0.8,
+                                line_width=2,
+                                source=data,
+                            )
                         self.past_plots[category] = main_figure.multi_line(
                             xs="past_xs",
                             ys="past_ys",
@@ -544,7 +547,8 @@ class AgentStatePlot(BaseScenarioPlot):
                     else:
                         self.plots[category].data_source.data = data
                         if prediction_plot:
-                            self.prediction_plots[category].data_source.data = data
+                            self.prediction_plots[
+                                category].data_source.data = data
                         if past_plot:
                             self.past_plots[category].data_source.data = data
 
@@ -630,9 +634,14 @@ tracked_object_types = {
                         if isinstance(tracked_object, Agent):
                             if tracked_object.predictions:
                                 first_pred = tracked_object.predictions[0]
-                                pred_states = first_pred.trajectory.get_sampled_trajectory()
-                                pred_xs = [state.center.x for state in pred_states]
-                                pred_ys = [state.center.y for state in pred_states]
+                                pred_states = first_pred.trajectory.get_sampled_trajectory(
+                                )
+                                pred_xs = [
+                                    state.center.x for state in pred_states
+                                ]
+                                pred_ys = [
+                                    state.center.y for state in pred_states
+                                ]
                                 prediction_xs.append(pred_xs)
                                 prediction_ys.append(pred_ys)
                             else:
@@ -640,9 +649,14 @@ tracked_object_types = {
                                 prediction_ys.append([])
 
                             if tracked_object.past_trajectory:
-                                past_states = tracked_object.past_trajectory.trajectory.get_sampled_trajectory()
-                                past_x_vals = [state.center.x for state in past_states]
-                                past_y_vals = [state.center.y for state in past_states]
+                                past_states = tracked_object.past_trajectory.trajectory.get_sampled_trajectory(
+                                )
+                                past_x_vals = [
+                                    state.center.x for state in past_states
+                                ]
+                                past_y_vals = [
+                                    state.center.y for state in past_states
+                                ]
                                 past_xs.append(past_x_vals)
                                 past_ys.append(past_y_vals)
                             else:

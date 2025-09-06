@@ -4,7 +4,7 @@ import matplotlib
 
 matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 import math
 import wandb
 import os
@@ -15,7 +15,7 @@ import draw_machine
 # matplotlib 설정 추가
 plt.rcParams['figure.max_open_warning'] = 0  # 경고 메시지 비활성화
 matplotlib.rcParams['figure.max_open_warning'] = 0
-
+from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from diffusion_planner.data_process.agent_process import (
     agent_past_process, sampled_tracked_objects_to_array_list,
@@ -74,27 +74,42 @@ class DataProcessor(object):
 
     def _filter_agents_within_radius(
         self,
-        neighbor_agents_past: np.ndarray,
-        neighbor_agents_future: Optional[np.ndarray] = None
-    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """ego 중심 정사각형 영역(가로·세로 2*radius)으로 에이전트 클리핑.
+        neighbor_agents_past: Optional[np.ndarray],
+        neighbor_agents_future: Optional[np.ndarray] = None,
+        neighbor_indices: Optional[Union[np.ndarray, List[int]]] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+        """ego 중심 정사각형 영역(가로·세로 2*radius)으로 에이전트를 클리핑하고,
+        대응하는 `neighbor_indices`도 함께 마스킹합니다.
 
-        원래는 원형 반경(r) 내부 여부를 L2 거리로 판정했지만,
-        이제는 정사각형의 내부 여부를 다음 조건으로 판정합니다:
-            |x| <= r  AND  |y| <= r
-        (여기서 (x, y)는 상대좌표계의 마지막 시점 위치)
+        판정 규칙:
+            - 마지막 시점의 상대좌표 (x, y)에 대해  |x| <= r  AND  |y| <= r  이면 영역 내부(True)
 
         Args:
-            neighbor_agents_past (np.ndarray): (N, Tp, 11)
-                상대 좌표계 과거 에이전트 시퀀스.
-            neighbor_agents_future (Optional[np.ndarray], optional): (N, Tf, 3)
-                상대 좌표계 미래 에이전트 시퀀스. 기본값 None.
+            neighbor_agents_past (np.ndarray):
+                - shape: (N, Tp, 11)
+                - 상대 좌표계 과거 에이전트 시퀀스.
+            neighbor_agents_future (Optional[np.ndarray], optional):
+                - shape: (N, Tf, 3)
+                - 상대 좌표계 미래 에이전트 시퀀스. 기본값 None.
+            neighbor_indices (Optional[Union[np.ndarray, List[int]]], optional):
+                - shape: (N,)
+                - 현재 프레임의 트래킹 객체 리스트에서 각 에이전트가 가리키는 인덱스.
+                - 제공되는 경우, 영역 밖(False) 에이전트의 인덱스를 **-1**로 마스킹합니다.
+                  (형상을 유지하며, 압축/삭제는 하지 않음)
 
         Returns:
-            Tuple[np.ndarray, Optional[np.ndarray]]:
+            Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
                 - filtered_neighbor_agents_past:   (N, Tp, 11)
+                  영역 밖 에이전트는 0으로 채움(개수 고정).
                 - filtered_neighbor_agents_future: (N, Tf, 3) 또는 None
-              정사각형 바깥 에이전트는 전체 시퀀스를 0으로 채운 상태로 유지됩니다(개수 고정).
+                  입력이 None이 아니면 동일 규칙으로 0 마스킹.
+                - filtered_neighbor_indices:       (N,) 또는 None
+                  입력 `neighbor_indices`가 주어진 경우에만 반환하며,
+                  영역 밖 위치는 **-1** 로 설정.
+
+        Notes:
+            - 본 함수는 개수를 유지하는 **마스킹** 방식입니다(압축 X).
+            - `neighbor_indices` 길이가 N과 다르면 `ValueError`를 발생시킵니다.
         """
         # 마지막 시점 상대 좌표 (N, 2)  ← ego 기준이므로 ego는 정중앙(0,0)
         cur_xy = neighbor_agents_past[:, -1, :2]  # (N, 2)
@@ -115,8 +130,18 @@ class DataProcessor(object):
         if neighbor_agents_future is not None:
             # filtered_neighbor_agents_future: (N, Tf, 3)
             filtered_neighbor_agents_future = neighbor_agents_future * mask_expanded
-
-        return filtered_neighbor_agents_past, filtered_neighbor_agents_future
+        # Indices 마스킹 (옵션)
+        filtered_neighbor_indices: Optional[np.ndarray] = None
+        if neighbor_indices is not None:
+            idx = np.asarray(neighbor_indices)
+            if idx.shape[0] != mask.shape[0]:
+                raise ValueError(
+                    f"`neighbor_indices` 길이({idx.shape[0]})와 에이전트 수({mask.shape[0]})가 다릅니다."
+                )
+            # 영역 밖은 -1로 마스킹(형상 유지)
+            filtered_neighbor_indices = idx.copy()
+            filtered_neighbor_indices[~mask] = -1
+        return filtered_neighbor_agents_past, filtered_neighbor_agents_future, filtered_neighbor_indices
 
     # Use for inference
     def observation_adapter(self,
@@ -125,6 +150,7 @@ class DataProcessor(object):
                             map_api,
                             route_roadblock_ids,
                             device='cpu',
+                            scenario: Optional[NuPlanScenario] = None,
                             squeeze=False) -> Dict[str, torch.Tensor]:
         '''
         ego
@@ -188,10 +214,17 @@ class DataProcessor(object):
          lane_route) = get_neighbor_vector_set_map(map_api, self._map_features,
                                                    ego_coords, self._radius,
                                                    traffic_light_data)
-        vector_map = map_process(route_roadblock_ids, anchor_ego_state, coords,
-                                 traffic_light_data, speed_limit, lane_route,
-                                 self._map_features, self._max_elements,
-                                 self._max_points)
+        # # 길아: agent_num
+        neighbor_token_to_rr_ids: Dict[
+            str, Optional[List[str]]] = get_npc_route_roadblock_ids(
+                scenario, neighbor_track_token, self._radius)
+        # (agent_num, 11)
+        neighbor_agents_current = neighbor_agents_past[:, -1, :]
+        vector_map = map_process(route_roadblock_ids, neighbor_token_to_rr_ids,
+                                 neighbor_track_token, neighbor_agents_current,
+                                 anchor_ego_state, coords, traffic_light_data,
+                                 speed_limit, lane_route, self._map_features,
+                                 self._max_elements, self._max_points)
 
         data = {
             "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
@@ -248,18 +281,26 @@ class DataProcessor(object):
             ) = sampled_static_objects_to_array_list(present_tracked_objects)
 
             # : ego_agent_past: (num_frames, 11)
+            # neighbor_agents_past: (agent_num, num_frames, 11)
+            # neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
             (ego_agent_past, neighbor_agents_past, neighbor_indices,
              static_objects, final_veh_num) = agent_past_process(
                  all_frame_ego_feature, all_frame_agents_feature,
                  all_frame_agents_types, self.num_agents,
                  present_static_feature, static_objects_types, self.num_static,
                  self.max_ped_bike, anchor_ego_state)
+            neighbor_agents_past, _, neighbor_indices = \
+                self._filter_agents_within_radius(neighbor_agents_past,
+                                                 None, neighbor_indices)
+            # 길아: agent_num
             neighbor_track_token: List[
                 Optional[str]] = get_neighbor_track_tokens(
                     present_tracked_objects=present_tracked_objects,
                     neighbor_indices=neighbor_indices,
                     agents_num=self.num_agents,
                 )
+            # (agent_num, 11)
+            neighbor_agents_current = neighbor_agents_past[:, -1, :]
             '''
             Map
             '''
@@ -270,9 +311,10 @@ class DataProcessor(object):
             if route_roadblock_ids != ['']:
                 route_roadblock_ids = route_roadblock_correction(
                     ego_state, map_api, route_roadblock_ids)
-            near_token_to_route_roadblock_ids: Dict[
+            # # 길아: agent_num
+            neighbor_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                    scenario, neighbor_track_token, self._radius, final_veh_num)
+                    scenario, neighbor_track_token, self._radius)
 
             (coords, traffic_light_data, speed_limit,
              lane_route) = get_neighbor_vector_set_map(map_api,
@@ -280,10 +322,11 @@ class DataProcessor(object):
                                                        ego_coords, self._radius,
                                                        traffic_light_data)
 
-            vector_map = map_process(route_roadblock_ids, anchor_ego_state,
-                                     coords, traffic_light_data, speed_limit,
-                                     lane_route, self._map_features,
-                                     self._max_elements, self._max_points)
+            vector_map = map_process(
+                route_roadblock_ids, neighbor_token_to_rr_ids,
+                neighbor_track_token, neighbor_agents_current, anchor_ego_state,
+                coords, traffic_light_data, speed_limit, lane_route,
+                self._map_features, self._max_elements, self._max_points)
             '''
             ego & agents future
             ego_agent_future : rear axle x,y, ~~~
@@ -319,7 +362,7 @@ class DataProcessor(object):
             neighbor_agents_future = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
                 self.num_agents, neighbor_indices)
-            neighbor_agents_past, neighbor_agents_future = \
+            _, neighbor_agents_future, _ = \
                 self._filter_agents_within_radius(neighbor_agents_past,
                                                  neighbor_agents_future)
             '''

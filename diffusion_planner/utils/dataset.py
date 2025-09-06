@@ -20,27 +20,29 @@ class DiffusionPlannerData(Dataset):
     def __getitem__(self, idx):
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
 
-        ego_agent_past = data['ego_agent_past']
-        ego_current_state = data['ego_current_state']
-        ego_agent_future = data['ego_agent_future']
-        ego_agent_future_11_dim = data['ego_agent_future_11_dim']
+        ego_agent_past = data["ego_agent_past"]
+        ego_current_state = data["ego_current_state"]
+        ego_agent_future = data["ego_agent_future"]
+        ego_agent_future_11_dim = data["ego_agent_future_11_dim"]
 
-        neighbor_agents_past = data['neighbor_agents_past'][:self.
+        neighbor_agents_past = data["neighbor_agents_past"][:self.
                                                             _past_neighbor_num]
         # (num_agents, future_len, 3) -> (predicted_neighbor_num, future_len, 3)
         neighbor_agents_future = data[
             "neighbor_agents_future"][:self._predicted_neighbor_num]
         neighbor_agents_future_all = data["neighbor_agents_future"]
 
-        lanes = data['lanes']
-        lanes_speed_limit = data['lanes_speed_limit']
-        lanes_has_speed_limit = data['lanes_has_speed_limit']
+        lanes = data["lanes"]
+        lanes_speed_limit = data["lanes_speed_limit"]
+        lanes_has_speed_limit = data["lanes_has_speed_limit"]
 
-        route_lanes = data['route_lanes']
-        route_lanes_speed_limit = data['route_lanes_speed_limit']
-        route_lanes_has_speed_limit = data['route_lanes_has_speed_limit']
+        route_lanes = data["route_lanes"]
+        route_lanes_speed_limit = data["route_lanes_speed_limit"]
+        route_lanes_has_speed_limit = data["route_lanes_has_speed_limit"]
+        agent_route_lane_order = data["agent_route_lane_order"][:self._predicted_neighbor_num] # (predicted_neighbor_num, lane_num)
 
-        static_objects = data['static_objects']
+        static_objects = data["static_objects"]
+
 
         data = {
             "ego_agent_past": ego_agent_past,
@@ -57,6 +59,7 @@ class DiffusionPlannerData(Dataset):
             "static_objects": static_objects,
             "neighbors_future_gt_all": neighbor_agents_future_all,
             "ego_future_gt_11_dim": ego_agent_future_11_dim,
+            "agent_route_lane_order": agent_route_lane_order,
         }
 
         return tuple(data.values())

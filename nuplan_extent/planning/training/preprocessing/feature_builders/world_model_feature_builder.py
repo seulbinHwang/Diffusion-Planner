@@ -48,6 +48,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 traffic_light_data,
                 initialization.map_api,
                 initialization.route_roadblock_ids,
+                initialization.scenario,
                 squeeze=True)
         # (interpol_num, 11)
         model_inputs[
@@ -132,9 +133,6 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 "route_lanes_speed_limit"],  # (route_num, 1)
             route_lanes_has_speed_limit=model_inputs[
                 "route_lanes_has_speed_limit"],  # (route_num, 1)
-            near_route_lanes=None,
-            near_route_lanes_speed_limit=None,
-            near_route_lanes_has_speed_limit=None,
             ego_agent_next_11_dim=model_inputs[
                 "ego_agent_next_11_dim"],  # (interpol_num, 11)
             ego_future_gt_11_dim=model_inputs["ego_future_gt_11_dim"]

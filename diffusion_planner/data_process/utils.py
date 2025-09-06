@@ -28,6 +28,203 @@ from nuplan.planning.simulation.observation.observation_type import DetectionsTr
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from typing import List, Optional, Union
 import numpy as np
+from typing import Tuple
+
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+
+from typing import Dict, List, Optional, Tuple
+import numpy as np
+
+from typing import List, Optional
+import numpy as np
+
+
+def build_agent_route_lane_order(
+    npc_route_indices: List[List[int]],
+    lane_num: Optional[int] = None,
+    dtype: np.dtype = np.int32,
+) -> np.ndarray:
+    """NPC별로 선택된 route 차선 인덱스(npc_route_indices)를 기준으로,
+    각 에이전트에 대해 '가까운 차선 순서'를 정수 랭크로 기록한 행렬을 생성합니다.
+
+    규칙:
+        - 한 에이전트의 npc_route_indices[i] 가 [5, 2, 7] 이라면,
+          해당 에이전트 행에서 lane 5→0, lane 2→1, lane 7→2 로 표기합니다.
+        - 그 에이전트의 route가 아닌 차선은 -1로 표기합니다.
+        - npc_route_indices[i] 안에 중복 인덱스가 있으면 최초 등장에만 랭크를 부여합니다.
+
+    Args:
+        npc_route_indices (List[List[int]]):
+            - 길이: agent_num
+            - 각 원소는 해당 에이전트가 선택한 '가까운 순' 차선 인덱스 리스트
+              (예: [lane_idx_0, lane_idx_1, ...]).
+        lane_num (Optional[int], optional):
+            - 전체 차선 개수. 지정하지 않으면 npc_route_indices 전체에서
+              등장한 최대 인덱스의 +1로 유추합니다.
+              (모든 리스트가 비어 있으면 0으로 처리)
+        dtype (np.dtype, optional):
+            - 반환 행렬의 dtype. 기본값 np.int32.
+
+    Returns:
+        np.ndarray:
+            - `agent_route_lane_order`, shape = (agent_num, lane_num), dtype = `dtype`
+            - 각 [i, j] 원소는:
+                · j번 차선이 에이전트 i의 npc_route에서 가까운 순서로 몇 번째인지(0,1,2,...)를 나타냄
+                · 해당 에이전트의 route가 아니면 -1
+
+    Raises:
+        ValueError: npc_route_indices에 음수 인덱스가 있거나,
+                    lane_num 유추 후 범위를 벗어나는 인덱스가 발견된 경우.
+
+    Examples:
+        >>> npc_route_indices = [[5, 2, 7], [1, 0]]
+        >>> arr = build_agent_route_lane_order(npc_route_indices, lane_num=8)
+        >>> # arr[0]: lane 5->0, lane 2->1, lane 7->2, 나머지 -1
+        >>> # arr[1]: lane 1->0, lane 0->1, 나머지 -1
+    """
+    agent_num: int = len(npc_route_indices)
+
+    # lane_num 미지정 시, 등장한 최대 인덱스 기반으로 유추
+    if lane_num is None:
+        max_idx = -1
+        for idx_list in npc_route_indices:
+            if any(i < 0 for i in idx_list):
+                raise ValueError("npc_route_indices에 음수 인덱스가 포함되어 있습니다.")
+            if idx_list:
+                max_idx = max(max_idx, max(idx_list))
+        lane_num = max_idx + 1 if max_idx >= 0 else 0
+
+    # 기본값 -1로 초기화
+    agent_route_lane_order = np.full((agent_num, lane_num), -1, dtype=dtype)
+
+    # 에이전트별로 가까운 순서 랭크 부여
+    for agent_i, lane_list in enumerate(npc_route_indices):
+        seen = set()
+        rank = 0
+        for lane_idx in lane_list:
+            if lane_idx < 0:
+                raise ValueError(f"음수 인덱스가 발견되었습니다: {lane_idx}")
+            if lane_idx >= lane_num:
+                raise ValueError(
+                    f"lane_idx {lane_idx} 가 lane_num={lane_num} 범위를 벗어났습니다.")
+            if lane_idx in seen:
+                continue
+            agent_route_lane_order[agent_i, lane_idx] = rank
+            seen.add(lane_idx)
+            rank += 1
+
+    return agent_route_lane_order
+
+
+def _select_token_and_ordered_npc_route_indices(
+    token_to_lane_on_routes: Dict[str, List[bool]],  # 길이 == agent_num (키 개수)
+    neighbor_agent_tokens: List[Optional[str]],  # 길이 == agent_num, ego와 가까운 순서
+    neighbor_agents_current: np.ndarray,  # shape: (agent_num, 11), ego와 가까운 순서
+    vector_map_lanes: np.ndarray,  # shape: (lane_num, P, D), 좌표는 [:, :, :2]
+    max_route_lanes: int,
+) -> np.ndarray:
+    """토큰별 '경로 위 차선' 인덱스를 가까운 차선부터 최대 `max_route_lanes`개 선택하고,
+    에이전트(이웃) 순서(이미 ego와 가까운 순)대로 `npc_route_indices`를 생성합니다.
+
+    설계 가정:
+    - `token_to_lane_on_routes`, `neighbor_agent_tokens`, `neighbor_agents_current`의 길이는 모두 `agent_num`으로 동일합니다.
+    - `neighbor_agent_tokens`와 `neighbor_agents_current`는 **ego와 가까운 순서**로 이미 정렬되어 있습니다.
+    - `max_route_lanes < lane_num`이 보장됩니다.
+
+    선택 기준(각 에이전트 i에 대해):
+    - 모든 차선과 에이전트 현재 위치 간 최소거리(폴리라인 점들 중 최소)를 계산해 차선을 가까운→먼 순으로 정렬
+    - 그 순서대로 `token_to_lane_on_routes[token][lane_idx]`가 True인 차선만 최대 `max_route_lanes`개 선택
+
+    Args:
+        token_to_lane_on_routes (Dict[str, List[bool]]):
+            - 키: 에이전트 토큰(str) — 총 키 개수 == agent_num
+            - 값: 길이 `lane_num`의 불리언 리스트 (해당 차선이 NPC 경로 위인지)
+        neighbor_agent_tokens (List[Optional[str]]): 길이 `agent_num`. 에이전트 토큰(없을 수 있어 None).
+        neighbor_agents_current (np.ndarray): shape=(agent_num, 11). 거리 계산에 x=[:,0], y=[:,1] 사용.
+        vector_map_lanes (np.ndarray): shape=(lane_num, P, D). 거리 계산에 좌표 성분 [:, :, :2] 사용.
+        max_route_lanes (int): NPC 당 최대 선택할 차선 개수. (항상 lane_num보다 작음)
+
+    Returns:
+        np.ndarray:
+            - `agent_route_lane_order`, shape = (agent_num, lane_num), dtype = `dtype`
+            - 각 [i, j] 원소는:
+                · j번 차선이 에이전트 i의 npc_route에서 가까운 순서로 몇 번째인지(0,1,2,...)를 나타냄
+                · 해당 에이전트의 route가 아니면 -1
+
+
+    Raises:
+        ValueError: 입력 shape/길이가 맞지 않거나, 불리언 마스크 길이 ≠ lane_num 인 경우.
+    """
+    # --- 기본 검증 ---
+    if neighbor_agents_current.ndim != 2 or neighbor_agents_current.shape[1] < 2:
+        raise ValueError(
+            f"`neighbor_agents_current` shape가 올바르지 않습니다: {neighbor_agents_current.shape}"
+        )
+    agent_num = neighbor_agents_current.shape[0]
+    lane_num = int(vector_map_lanes.shape[0])
+
+    if len(neighbor_agent_tokens) != agent_num:
+        raise ValueError(
+            "`neighbor_agent_tokens` 길이와 `neighbor_agents_current`의 첫 축 크기가 다릅니다."
+        )
+    if vector_map_lanes.ndim != 3 or vector_map_lanes.shape[2] < 2:
+        raise ValueError(
+            f"`vector_map_lanes` shape가 올바르지 않습니다: {vector_map_lanes.shape}")
+    if not (0 < max_route_lanes < lane_num):
+        raise ValueError(
+            f"`max_route_lanes`는 0 < max_route_lanes < lane_num 을 만족해야 합니다. "
+            f"(max_route_lanes={max_route_lanes}, lane_num={lane_num})")
+
+    # --- 준비: 차선 좌표 ---
+    lanes_xy = vector_map_lanes[:, :, :2]  # (lane_num, P, 2)
+
+    token_to_route_indices: Dict[str, List[int]] = {}
+    npc_route_indices: List[List[int]] = []
+
+    # 중복/None 토큰을 위해 고유 키를 만드는 헬퍼
+    def _unique_key(base: Optional[str], idx: int) -> str:
+        key = base if base is not None else "__none__"
+        # 동일 키가 이미 존재하면 인덱스 suffix로 고유화
+        return key if key not in token_to_route_indices else f"{key}#{idx}"
+
+    # --- 에이전트(이미 ego 근접 순) 순회 ---
+    for agent_idx in range(agent_num):
+        token = neighbor_agent_tokens[agent_idx]
+
+        # 마스크 획득 (없으면 전부 False로 처리)
+        lane_on_routes = token_to_lane_on_routes[
+            token]  # (Dict[str, List[bool]]):
+        # lane_on_routes: List[bool], 길이 == lane_num
+
+        agent_xy = neighbor_agents_current[agent_idx, :2]  # (2,)
+
+        # 각 차선 폴리라인과의 최소거리 (lane_num,)
+        diff = lanes_xy - agent_xy[None, None, :]  # (lane_num, P, 2)
+        dists = np.linalg.norm(diff, axis=-1)  # (lane_num, P)
+        min_dists = np.min(dists, axis=1)  # (lane_num,)
+        lane_dist_order = np.argsort(min_dists)  # (lane_num,)
+
+        # 가까운 순서대로 True인 차선만 최대 max_route_lanes개 선택
+        selected: List[int] = []
+        lane_on_routes_arr = np.asarray(lane_on_routes, dtype=bool)
+        for lane_idx in lane_dist_order:
+            if lane_on_routes_arr[lane_idx]:
+                selected.append(int(lane_idx))
+                if len(selected) >= max_route_lanes:
+                    break
+
+        token_to_route_indices[token] = selected
+        npc_route_indices.append(selected)
+
+    # 반환 길이 검증(요구조건: 둘 다 agent_num 크기 보장)
+    assert len(token_to_route_indices) == agent_num, \
+        f"token_to_route_indices 키 개수({len(token_to_route_indices)}) != agent_num({agent_num})"
+    assert len(npc_route_indices) == agent_num, \
+        f"npc_route_indices 길이({len(npc_route_indices)}) != agent_num({agent_num})"
+    agent_route_lane_order = build_agent_route_lane_order(
+        npc_route_indices, lane_num=lane_num)  # 검증용 호출
+    return agent_route_lane_order
 
 
 def get_neighbor_track_tokens(
@@ -164,7 +361,6 @@ def get_npc_route_roadblock_ids(
     scenario: NuPlanScenario,
     neighbor_track_token: List[Optional[str]],
     radius: float = 100.,
-    vehicle_num: int = 256,
 ) -> Dict[str, Optional[List[str]]]:
 
     def select_nearest_connectors_by_mean_distance(
@@ -303,43 +499,18 @@ def get_npc_route_roadblock_ids(
                 tokens.add(obj.track_token)
         return tokens
 
-    def _select_nearest_vehicle_tokens(ego_state: EgoState,
-                                       detections: DetectionsTracks,
-                                       candidates: Set[str],
-                                       vehicle_num: int) -> Set[str]:
-        """ego와의 거리 순서대로 최대 ``vehicle_num``개 차량 토큰 선택.
-
-        Args:
-            ego_state (EgoState): 거리 계산 기준이 되는 ego 상태.
-            detections (DetectionsTracks): 초기 시점의 트래킹 결과.
-            candidates (Set[str]): 거리 비교 대상 토큰 집합.
-            vehicle_num (int): 선택할 최대 차량 대수.
-
-        Returns:
-            Set[str]: 거리 기준 상위 ``vehicle_num``개의 차량 토큰.
-        """
-        center_x = ego_state.rear_axle.x
-        center_y = ego_state.rear_axle.y
-        distances: List[Tuple[float, str]] = []
-        for obj in detections.tracked_objects:
-            if obj.track_token not in candidates or obj.tracked_object_type != TrackedObjectType.VEHICLE:
-                continue
-            dx = obj.center.x - center_x
-            dy = obj.center.y - center_y
-            dist = float(np.hypot(dx, dy))
-            distances.append((dist, obj.track_token))
-        distances.sort(key=lambda x: x[0])
-        return {token for _, token in distances[:vehicle_num]}
-
     # ─────────── 1단계: 차량별 프레임 수집 ────────────
     token_to_trajectory: Dict[str, List['SceneObject']] = defaultdict(list)
     ##########
     initial_detections = scenario.get_tracked_objects_at_iteration(0)
+    # 1) 반경 내 토큰
     square_tokens = _filter_vehicle_tokens_in_square(scenario.initial_ego_state,
                                                      initial_detections, radius)
-    valid_tokens = _select_nearest_vehicle_tokens(scenario.initial_ego_state,
-                                                  initial_detections,
-                                                  square_tokens, vehicle_num)
+    # 2) neighbor_track_token과의 교집합으로 후보 제한(None 제거)
+    neighbor_token_set = {t for t in neighbor_track_token if t is not None}
+    candidate_tokens = square_tokens & neighbor_token_set
+    # 3) ego와의 거리 순으로 상위 vehicle_num개만 선택
+
     ##########
     total_horizon_s = (
         scenario.get_time_point(scenario.get_number_of_iterations() - 1).time_s
@@ -347,7 +518,7 @@ def get_npc_route_roadblock_ids(
     for det_batch in scenario.get_future_tracked_objects(0, total_horizon_s):
         for det in det_batch.tracked_objects:
             if det.tracked_object_type == TrackedObjectType.VEHICLE and (
-                    det.track_token in valid_tokens):
+                    det.track_token in candidate_tokens):
                 token_to_trajectory[det.track_token].append(det)
 
     token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
