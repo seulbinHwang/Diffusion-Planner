@@ -10,17 +10,70 @@ Categories:
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 import numpy as np
 import torch
-from typing import Deque, Dict, List, Optional, Set, Type
+from typing import Deque, Dict, List, Optional, Set, Type, Tuple
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex, AgentInternalIndex
 from nuplan.common.maps.abstract_map_objects import RoadBlockGraphEdgeMapObject
 from shapely.geometry import Point
 from collections import defaultdict
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.common.maps.abstract_map import SemanticMapLayer
+from nuplan.common.maps.abstract_map import AbstractMap, MapObject
+from nuplan.common.actor_state.state_representation import Point2D
+import shapely.geometry as geom
+from shapely import affinity
+import math
+from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
+
+
+def get_directional_proximal_map_objects(
+    map_api: AbstractMap,
+    point: Point2D,
+    radius: float,
+    heading: float,
+    layers: List[SemanticMapLayer],
+) -> Dict[SemanticMapLayer, List[MapObject]]:
+    """주어진 heading 방향에 맞춘 정사각형 영역 내의 객체를 조회한다.
+
+    Args:
+        point (Point2D): [m] 중심점의 좌표.
+        radius (float): [m] 정사각형 한 변의 절반 길이.
+        heading (float): [rad] 정사각형을 회전시킬 heading. 0은 세계 좌표계 x축과 정렬.
+        layers (List[SemanticMapLayer]): 조회할 레이어 목록.
+
+    Returns:
+        Dict[SemanticMapLayer, List[MapObject]]: 레이어별로 발견된 MapObject 목록.
+    """
+
+    x_min, x_max = point.x - radius, point.x + radius
+    y_min, y_max = point.y - radius, point.y + radius
+    patch = geom.box(x_min, y_min, x_max, y_max)
+    patch = affinity.rotate(patch,
+                            math.degrees(heading),
+                            origin=(point.x, point.y))
+
+    supported_layers = map_api.get_available_map_objects()
+    unsupported_layers = [
+        layer for layer in layers if layer not in supported_layers
+    ]
+
+    assert (
+        len(unsupported_layers) == 0
+    ), f"Object representation for layer(s): {unsupported_layers} is unavailable"
+
+    object_map: Dict[SemanticMapLayer, List[MapObject]] = defaultdict(list)
+
+    for layer in layers:
+        object_map[layer] = map_api._get_proximity_map_object(patch, layer)
+
+    return object_map
 
 
 def get_npc_route_roadblock_ids(
-        scenario: NuPlanScenario) -> Dict[str, Optional[List[str]]]:
+        scenario: NuPlanScenario,
+        radius: float = 100.,
+vehicle_num: int = 256,
+) -> Dict[str, Optional[List[str]]]:
 
     def select_nearest_connectors_by_mean_distance(
         connector_candidates: List[RoadBlockGraphEdgeMapObject],
@@ -132,14 +185,78 @@ def get_npc_route_roadblock_ids(
                 Point(pt.x, pt.y).distance(polygon) for pt in trajectory_points
             ]))
 
+    def _filter_vehicle_tokens_in_square(
+            ego_state: EgoState,
+            detections: DetectionsTracks,
+            radius: float) -> Set[str]:
+        """정사각형 영역 내에 위치한 차량 토큰 추출.
+
+        Args:
+            ego_state (EgoState): 정사각형 중심이 되는 ego 상태.
+            detections (DetectionsTracks): 초기 시점의 트래킹 결과.
+            radius (float): 정사각형 한 변의 절반 길이 [m].
+
+        Returns:
+            Set[str]: 영역 내부 차량의 트랙 토큰 집합.
+        """
+        center_x = ego_state.rear_axle.x
+        center_y = ego_state.rear_axle.y
+        min_x, max_x = center_x - radius, center_x + radius
+        min_y, max_y = center_y - radius, center_y + radius
+        tokens: Set[str] = set()
+        for obj in detections.tracked_objects:
+            if obj.tracked_object_type != TrackedObjectType.VEHICLE:
+                continue
+            px, py = obj.center.x, obj.center.y
+            if min_x <= px <= max_x and min_y <= py <= max_y:
+                tokens.add(obj.track_token)
+        return tokens
+
+    def _select_nearest_vehicle_tokens(
+            ego_state: EgoState,
+            detections: DetectionsTracks,
+            candidates: Set[str],
+            vehicle_num: int) -> Set[str]:
+        """ego와의 거리 순서대로 최대 ``vehicle_num``개 차량 토큰 선택.
+
+        Args:
+            ego_state (EgoState): 거리 계산 기준이 되는 ego 상태.
+            detections (DetectionsTracks): 초기 시점의 트래킹 결과.
+            candidates (Set[str]): 거리 비교 대상 토큰 집합.
+            vehicle_num (int): 선택할 최대 차량 대수.
+
+        Returns:
+            Set[str]: 거리 기준 상위 ``vehicle_num``개의 차량 토큰.
+        """
+        center_x = ego_state.rear_axle.x
+        center_y = ego_state.rear_axle.y
+        distances: List[Tuple[float, str]] = []
+        for obj in detections.tracked_objects:
+            if obj.track_token not in candidates or obj.tracked_object_type != TrackedObjectType.VEHICLE:
+                continue
+            dx = obj.center.x - center_x
+            dy = obj.center.y - center_y
+            dist = float(np.hypot(dx, dy))
+            distances.append((dist, obj.track_token))
+        distances.sort(key=lambda x: x[0])
+        return {token for _, token in distances[:vehicle_num]}
+
     # ─────────── 1단계: 차량별 프레임 수집 ────────────
     token_to_trajectory: Dict[str, List['SceneObject']] = defaultdict(list)
+    ##########
+    initial_detections = scenario.get_tracked_objects_at_iteration(0)
+    square_tokens = _filter_vehicle_tokens_in_square(
+        scenario.initial_ego_state, initial_detections, radius)
+    valid_tokens = _select_nearest_vehicle_tokens(
+        scenario.initial_ego_state, initial_detections, square_tokens, vehicle_num)
+    ##########
     total_horizon_s = (
         scenario.get_time_point(scenario.get_number_of_iterations() - 1).time_s
         - scenario.get_time_point(0).time_s)
     for det_batch in scenario.get_future_tracked_objects(0, total_horizon_s):
         for det in det_batch.tracked_objects:
-            if det.tracked_object_type == TrackedObjectType.VEHICLE:
+            if det.tracked_object_type == TrackedObjectType.VEHICLE and (
+                    det.track_token in valid_tokens):
                 token_to_trajectory[det.track_token].append(det)
 
     token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
@@ -151,7 +268,8 @@ def get_npc_route_roadblock_ids(
         if not agent_list:
             token_to_route_roadblock_ids[agent_token] = None
             continue
-
+        token_to_position[agent_token] = []
+        ###########
         roadblock_sequence: List[str] = []
         previous_roadblocks_set: Set['RoadBlockGraphEdgeMapObject'] = set()
         inside_connector_flag = False
