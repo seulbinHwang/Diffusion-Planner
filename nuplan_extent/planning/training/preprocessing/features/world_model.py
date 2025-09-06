@@ -28,9 +28,7 @@ class WorldModelFeature(AbstractModelFeature):
     route_lanes: Optional[FeatureDataType]  # (route_num, lane_len, 12)
     route_lanes_speed_limit: Optional[FeatureDataType]  # (route_num, 1)
     route_lanes_has_speed_limit: Optional[FeatureDataType]  # (route_num, 1)
-    near_route_lanes: Optional[FeatureDataType]  # (Pnn, lane_len, 12)
-    near_route_lanes_speed_limit: Optional[FeatureDataType]  # (Pnn, 1)
-    near_route_lanes_has_speed_limit: Optional[FeatureDataType]  # (Pnn, 1)
+    near_route_lanes: Optional[FeatureDataType]  # (Pnn, 25)
     ###########
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
