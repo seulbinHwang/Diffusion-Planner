@@ -294,21 +294,22 @@ def _pad_agent_states_with_zeros(agent_trajectories):
 
 
 def agent_past_process(
-        all_frame_ego_feature: np.ndarray,  # (num_frames, 10)
-        all_frame_agents_feature: List[
-            np.ndarray],  # (frame_agents_num, 8) # frame_agents_num 길이가 가변적
-        all_frame_agents_types: List[List[TrackedObjectType]],
-        agent_num: int,
-        present_static_feature: np.ndarray,  # (cur_static_num, 5)
-        static_objects_types: List[TrackedObjectType],
-        num_static: int,
-        max_ped_bike: int,
-        anchor_ego_state: np.ndarray,  #(3,)
-) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    all_frame_ego_feature: np.ndarray,  # (num_frames, 10)
+    all_frame_agents_feature: List[
+        np.ndarray],  # (frame_agents_num, 8) # frame_agents_num 길이가 가변적
+    all_frame_agents_types: List[List[TrackedObjectType]],
+    agent_num: int,
+    present_static_feature: np.ndarray,  # (cur_static_num, 5)
+    static_objects_types: List[TrackedObjectType],
+    num_static: int,
+    max_ped_bike: int,
+    anchor_ego_state: np.ndarray,  #(3,)
+) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray, int]:
     # ego_agent_past: (num_frames, 11)
     # neighbor_agents_past: (agent_num, num_frames, 11)
     # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
     # static_objects: (num_static, 10)
+    # final_vehicle_num: int
     """
     This function process the data from the raw agent data.
     :param all_frame_ego_feature: The input array data of the ego past.
@@ -320,7 +321,7 @@ def agent_past_process(
     :param num_static: Clip the number of static objects.
     :param max_ped_bike: Clip the total number of ped and bike.
     :param anchor_ego_state: Ego current state
-    :return: ego_agent_past, agents, sorted_cur_neighbor_indices, present_static_feature
+    :return: ego_agent_past, agents, sorted_cur_neighbor_indices, present_static_feature, final_vehicle_num
     """
     agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, length, width
     if all_frame_ego_feature is not None:
@@ -480,6 +481,11 @@ def agent_past_process(
         """
         sorted_cur_neighbor_indices 의 길이는 무조건 agent_num 이다.
         """
+    final_vehicle_num = len([
+        idx for idx in sorted_cur_neighbor_indices
+        if current_agent_types[idx] == TrackedObjectType.VEHICLE
+    ])
+
     # Populate the final agents array with the selected agents' features
     for sort_idx, cur_neighbor_idx in enumerate(sorted_cur_neighbor_indices):
         # neighbor_agents_past: (agent_num, num_frames, 11)
@@ -517,7 +523,7 @@ def agent_past_process(
         else:
             static_objects[i, six_:] = [0, 0, 0, 1]
 
-    return ego_agent_past, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects
+    return ego_agent_past, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects, final_vehicle_num
 
 
 def agent_future_process(

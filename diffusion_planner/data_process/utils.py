@@ -70,9 +70,10 @@ def get_directional_proximal_map_objects(
 
 
 def get_npc_route_roadblock_ids(
-        scenario: NuPlanScenario,
-        radius: float = 100.,
-vehicle_num: int = 256,
+    scenario: NuPlanScenario,
+neighbor_track_token: List[Optional[str]],
+    radius: float = 100.,
+    vehicle_num: int = 256,
 ) -> Dict[str, Optional[List[str]]]:
 
     def select_nearest_connectors_by_mean_distance(
@@ -185,10 +186,9 @@ vehicle_num: int = 256,
                 Point(pt.x, pt.y).distance(polygon) for pt in trajectory_points
             ]))
 
-    def _filter_vehicle_tokens_in_square(
-            ego_state: EgoState,
-            detections: DetectionsTracks,
-            radius: float) -> Set[str]:
+    def _filter_vehicle_tokens_in_square(ego_state: EgoState,
+                                         detections: DetectionsTracks,
+                                         radius: float) -> Set[str]:
         """정사각형 영역 내에 위치한 차량 토큰 추출.
 
         Args:
@@ -212,11 +212,11 @@ vehicle_num: int = 256,
                 tokens.add(obj.track_token)
         return tokens
 
-    def _select_nearest_vehicle_tokens(
-            ego_state: EgoState,
-            detections: DetectionsTracks,
-            candidates: Set[str],
-            vehicle_num: int) -> Set[str]:
+    def _select_nearest_vehicle_tokens(ego_state: EgoState,
+                                       detections: DetectionsTracks,
+                                       candidates: Set[str],
+
+                                       vehicle_num: int) -> Set[str]:
         """ego와의 거리 순서대로 최대 ``vehicle_num``개 차량 토큰 선택.
 
         Args:
@@ -245,10 +245,11 @@ vehicle_num: int = 256,
     token_to_trajectory: Dict[str, List['SceneObject']] = defaultdict(list)
     ##########
     initial_detections = scenario.get_tracked_objects_at_iteration(0)
-    square_tokens = _filter_vehicle_tokens_in_square(
-        scenario.initial_ego_state, initial_detections, radius)
-    valid_tokens = _select_nearest_vehicle_tokens(
-        scenario.initial_ego_state, initial_detections, square_tokens, vehicle_num)
+    square_tokens = _filter_vehicle_tokens_in_square(scenario.initial_ego_state,
+                                                     initial_detections, radius)
+    valid_tokens = _select_nearest_vehicle_tokens(scenario.initial_ego_state,
+                                                  initial_detections,
+                                                  square_tokens, vehicle_num)
     ##########
     total_horizon_s = (
         scenario.get_time_point(scenario.get_number_of_iterations() - 1).time_s
@@ -260,15 +261,11 @@ vehicle_num: int = 256,
                 token_to_trajectory[det.track_token].append(det)
 
     token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
-    # TODO: token_to_position 는 디버깅용 이므로, 디버깅이 끝나면 지우는 것이 좋습니다.
-    token_to_position: Dict[str, Optional[List[np.ndarray]]] = {}
     # ─────────── 2단계: 에이전트별 경로 생성 ────────────
     for agent_token, agent_list in token_to_trajectory.items():
-        token_to_position[agent_token] = []
         if not agent_list:
             token_to_route_roadblock_ids[agent_token] = None
             continue
-        token_to_position[agent_token] = []
         ###########
         roadblock_sequence: List[str] = []
         previous_roadblocks_set: Set['RoadBlockGraphEdgeMapObject'] = set()
@@ -278,8 +275,6 @@ vehicle_num: int = 256,
 
         for time_idx, agent_ in enumerate(agent_list):  # 시간 순
             npc_point = agent_.center.point
-            token_to_position[agent_token].append(
-                np.array([npc_point.x, npc_point.y]))
             current_roadblocks = set(
                 scenario.map_api.get_all_map_objects(
                     npc_point, SemanticMapLayer.ROADBLOCK))
@@ -329,11 +324,7 @@ vehicle_num: int = 256,
 
         token_to_route_roadblock_ids[
             agent_token] = roadblock_sequence if roadblock_sequence else None
-        # token_to_position: Dict[str, Optional[List[np.ndarray]]] -> Dict[str, Optional[np.ndarray]]
-        if token_to_position[agent_token]:
-            token_to_position[agent_token] = np.array(
-                token_to_position[agent_token])
-    return token_to_route_roadblock_ids, token_to_position
+    return token_to_route_roadblock_ids
 
 
 # =====================

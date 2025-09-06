@@ -23,7 +23,7 @@ from diffusion_planner.data_process.agent_process import (
     agent_future_process)
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
 from diffusion_planner.data_process.ego_process import get_ego_past_array_from_scenario, get_ego_future_array_from_scenario, calculate_additional_ego_states
-from diffusion_planner.data_process.utils import convert_to_model_inputs
+from diffusion_planner.data_process.utils import convert_to_model_inputs, get_npc_route_roadblock_ids
 
 
 class DataProcessor(object):
@@ -164,8 +164,8 @@ class DataProcessor(object):
     # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
     # static_objects: (num_static, 10)
         """
-        (ego_agent_past,
-         neighbor_agents_past, _, static_objects) = agent_past_process(
+        (ego_agent_past, neighbor_agents_past, _,
+         static_objects, final_veh_num) = agent_past_process(
              all_frame_ego_feature, all_frame_agents_feature,
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_ped_bike,
@@ -242,8 +242,8 @@ class DataProcessor(object):
             ) = sampled_static_objects_to_array_list(present_tracked_objects)
 
             # : ego_agent_past: (num_frames, 11)
-            (ego_agent_past, neighbor_agents_past,
-             neighbor_indices, static_objects) = agent_past_process(
+            (ego_agent_past, neighbor_agents_past, neighbor_indices,
+             static_objects, final_veh_num) = agent_past_process(
                  all_frame_ego_feature, all_frame_agents_feature,
                  all_frame_agents_types, self.num_agents,
                  present_static_feature, static_objects_types, self.num_static,
@@ -258,6 +258,9 @@ class DataProcessor(object):
             if route_roadblock_ids != ['']:
                 route_roadblock_ids = route_roadblock_correction(
                     ego_state, map_api, route_roadblock_ids)
+            token_to_route_roadblock_ids: Dict[
+                str, Optional[List[str]]] = get_npc_route_roadblock_ids(
+                    scenario, self._radius, final_veh_num)
 
             (coords, traffic_light_data, speed_limit,
              lane_route) = get_neighbor_vector_set_map(map_api,
