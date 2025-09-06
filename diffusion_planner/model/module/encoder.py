@@ -118,17 +118,117 @@ def timegrid_future_2d(dt: float,
     return base.reshape(1, total_steps).expand(B, total_steps).clone()
 
 
+class NearAgentsRouteLaneEncoder(nn.Module):
+    """에이전트별 route lane 요약 인코더(초경량).
+
+    입력:
+        route_lanes:       (B, Pnn, R, H)
+            - lane 인코더 출력에서 에이전트별 가까운 순으로 선택된 route lane 임베딩
+        route_lanes_mask:  (B, Pnn, R)  # bool, True=pad(무효)
+        route_lane_pos:    (B, Pnn, R, Dpos=8)
+            - 각 route lane의 포지션 특징(예: 중앙점 x,y, yaw 등 4 + type one-hot 4)
+
+    출력:
+        near_agents_route_lane_emb: (B, Pnn, H)
+            - 에이전트별 단일 임베딩
+
+    원리(가벼운 게이트/가중합):
+        s_r = w_e^T * e_r + w_p^T * p_r + b
+        α = softmax(s)  (마스크된 항은 -inf로 처리)
+        E_agent = Σ_r α_r * e_r  (유효한 lane만)
+        (유효 lane이 0개면 학습 가능한 unknown 임베딩으로 대체)
+    """
+
+    def __init__(self,
+                 hidden_dim: int,
+                 pos_dim: int = 8,
+                 attn_drop_p: float = 0.0):
+        super().__init__()
+        # 점수 산출: 임베딩( H→1 ), 포지션( pos_dim→1 )
+        self.score_e = nn.Linear(hidden_dim, 1, bias=True)
+        self.score_p = nn.Linear(pos_dim, 1, bias=False)
+
+        # 모든 route lane이 결측일 때 사용할 학습 가능한 대체 벡터
+        self.unknown_emb = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.trunc_normal_(self.unknown_emb, std=0.02)
+
+        # 출력 안정화용 LayerNorm + (선택) dropout
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(
+            attn_drop_p) if attn_drop_p > 0 else nn.Identity()
+
+    def forward(
+            self,
+            route_lanes: torch.Tensor,  # (B, Pnn, route_num, hidden_dim)
+            route_lanes_mask: torch.Tensor,  # (B, Pnn, route_num)  True=pad
+            route_lane_pos: torch.Tensor,  # (B, Pnn, route_num, pos_dim)
+    ) -> torch.Tensor:  # (B, Pnn, hidden_dim)
+        """
+            route_lanes:       (B, Pnn, route_num, hidden_dim)
+            route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
+            route_lane_pos:    (B, Pnn, route_num, Dpos)
+        """
+        assert route_lanes.dim() == 4 and route_lane_pos.dim() == 4, \
+            f"route_lanes {route_lanes.shape}, route_lane_pos {route_lane_pos.shape}"
+        assert route_lanes_mask.dim(
+        ) == 3, f"route_lanes_mask {route_lanes_mask.shape}"
+        B, Pnn, route_num, hidden_dim = route_lanes.shape
+        assert route_lane_pos.shape[:3] == (B, Pnn,
+                                            route_num), "pos와 lanes의 앞 3축이 달라요."
+        assert route_lanes_mask.shape == (B, Pnn, route_num), "mask shape 불일치"
+
+        # s_e: (B,Pnn,route_num,1)
+        s_e = self.score_e(route_lanes)
+        # s_p: (B,Pnn,route_num,1)
+        s_p = self.score_p(route_lane_pos)
+        logits = (s_e + s_p).squeeze(-1)  # (B,Pnn,route_num)
+
+        # 마스크 적용: pad(True) → -inf로 softmax 제외
+        logits = logits.float()  # 안정적 softmax
+        logits = logits.masked_fill(route_lanes_mask, float("-inf"))
+
+        # 모든 route가 결측인 에이전트(행 전체 -inf) 방지
+        all_off = route_lanes_mask.all(dim=-1)  # (B,Pnn) True=전부 무효
+        if all_off.any().item():
+            logits = logits.clone()
+            logits[all_off] = 0.0  # softmax NaN 방지
+
+        # (B,Pnn,route_num) → (B,Pnn,route_num,1)
+        attn = F.softmax(logits, dim=-1).unsqueeze(-1).to(route_lanes.dtype)
+        # 결측 에이전트는 가중치 0
+        attn = attn * (~route_lanes_mask).unsqueeze(-1)
+
+        # 가중합: (B,Pnn,hidden_dim)
+        # route_lanes: (B,Pnn,route_num,hidden_dim)
+        pooled = (attn * route_lanes).sum(dim=2)  # Σ_R
+
+        # 결측 에이전트는 unknown_emb로 대체
+        if all_off.any().item():
+            unknown = self.unknown_emb.to(
+                dtype=pooled.dtype, device=pooled.device)  # (1,1,hidden_dim)
+            pooled[all_off] = unknown.expand_as(pooled[all_off])
+
+        # 정규화/드롭아웃
+        pooled = self.drop(self.norm(pooled))  # (B,Pnn,hidden_dim)
+        return pooled
+
+
 class Encoder(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.hidden_dim = config.hidden_dim
+        self.route_order_drop_prob: float = getattr(config,
+                                                    "route_order_drop_prob",
+                                                    0.5)
+
         self.chunk_length = 20
         self.num_fourier_frequencies = 4
         self.pos_scale = nn.Parameter(torch.tensor(1.0))
         self.time_gap = 0.1
         self.time_min = -(config.time_len - 1) * self.time_gap
         self.time_max = config.future_len * self.time_gap
+        self.config = config
         self.agents_encoder = AgentFusionEncoder(
             config.time_len,
             config.future_len,
@@ -157,6 +257,8 @@ class Encoder(nn.Module):
             time_gap=self.time_gap,
             time_min=self.time_min,
             time_max=self.time_max)
+        self.route_encoder = NearAgentsRouteLaneEncoder(
+            hidden_dim=config.hidden_dim, pos_dim=8, attn_drop_p=0.0)
         self.token_num = (1 * self.agents_encoder.future_chunk_num) + (
             (1 + config.agent_num) * self.agents_encoder.past_cur_chunk_num
         ) + config.static_objects_num + config.lane_num
@@ -173,6 +275,35 @@ class Encoder(nn.Module):
         # type (ego, neighbor, static, lane)
         self.pos_emb = nn.Linear(8, config.hidden_dim)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
+
+    @staticmethod
+    def _mask_all_routes_like(
+        route_lanes: torch.Tensor,  # (B, Pnn, K, H)
+        route_lanes_mask: torch.Tensor,  # (B, Pnn, K)
+        route_lane_pos: torch.Tensor,  # (B, Pnn, K, Dpos)
+        drop_mask_b: torch.Tensor,  # (B,) bool, False인 샘플을 "경로 없음"으로 강제
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """배치 마스크에 따라 해당 샘플의 모든 route 토큰을 패딩 처리합니다.
+
+        Args:
+            route_lanes: (B, Pnn, K, H)
+            route_lanes_mask: (B, Pnn, K)  # True=pad
+            route_lane_pos: (B, Pnn, K, Dpos)
+            drop_mask_b: (B,) bool         # True=유지(keep), False=드롭(경로 없음)
+
+        Returns:
+            (route_lanes, route_lanes_mask, route_lane_pos)  # same shapes
+        """
+        if drop_mask_b.dtype != torch.bool:
+            drop_mask_b = drop_mask_b.to(torch.bool)
+
+        if (~drop_mask_b).any().item():
+            b_drop = ~drop_mask_b  # (B,) False=drop → True 인덱스가 드롭 대상
+            # 마스크/값을 샘플 단위로 전체 패딩(True)/제로로 클램프
+            route_lanes[b_drop] = 0.0
+            route_lanes_mask[b_drop] = True
+            route_lane_pos[b_drop] = 0.0
+        return route_lanes, route_lanes_mask, route_lane_pos
 
     def _sample_uniform_prefix_lengths(self, batch_size: int,
                                        max_future_len: int,
@@ -290,19 +421,21 @@ class Encoder(nn.Module):
         ego_future_full = inputs["ego_future_gt_11_dim"]
         # agents
         # (B, A, V=21, D=11)
-        neighbors = inputs['neighbor_agents_past']
+        neighbors = inputs["neighbor_agents_past"]
 
         # static objects
         # (B, P, D_static)
-        static = inputs['static_objects']
+        static = inputs["static_objects"]
 
         # vector maps
         # (B, L, lane_len, D_lane)
-        lanes = inputs['lanes']
+        lanes = inputs["lanes"]
         # ( B, L, 1) 속도 제한
-        lanes_speed_limit = inputs['lanes_speed_limit']
+        lanes_speed_limit = inputs["lanes_speed_limit"]
         # (B, L, 1) 속도 제한 여부
-        lanes_has_speed_limit = inputs['lanes_has_speed_limit']
+        lanes_has_speed_limit = inputs["lanes_has_speed_limit"]
+        # (B, Pnn, lane_num) # -1: route가 아님
+        agent_route_lane_order = inputs["agent_route_lane_order"]
 
         B = neighbors.shape[0]
         future_len: int = ego_future_full.shape[1]
@@ -353,6 +486,31 @@ class Encoder(nn.Module):
         """
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
             lanes, lanes_speed_limit, lanes_has_speed_limit)
+        # agent_route_lane_order: (B, Pnn, lane_num) # -1: route가 아님 # agent당 유효한 route의 최대 수는 최대 route_num 개임. (즉, route_num 이하임) # route_num <= lane_num 항상
+        (route_lanes, route_lanes_mask,
+         route_lane_pos) = self.build_route_lane_tensors_from_order(
+             encoding_lanes, lanes_mask, lane_pos, agent_route_lane_order,
+             self.config.route_num)
+        """
+            route_lanes:       (B, Pnn, route_num, H)
+            route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
+            route_lane_pos:    (B, Pnn, route_num, Dpos)
+        
+        near_agents_route_lane_emb: (B, Pnn, H)
+        """
+        # --- [NEW] 3‑B) 학습 시 샘플 단위로 50% 확률로 "경로 없음" 강제 ---
+        if self.training and self.route_order_drop_prob > 0.0:
+            # route_keep_mask[b] = True면 주어진 order를 사용, False면 "경로 없음"
+            route_keep_mask: torch.Tensor = (torch.rand(
+                (B,), device=encoding_lanes.device) >= float(
+                    self.route_order_drop_prob))  # (B,) bool
+
+            # 샘플 단위 드롭을 실제 텐서에 반영 (전부 패딩 처리)
+            route_lanes, route_lanes_mask, route_lane_pos = self._mask_all_routes_like(
+                route_lanes, route_lanes_mask, route_lane_pos, route_keep_mask)
+        near_agents_route_lane_emb = self.route_encoder(route_lanes,
+                                                        route_lanes_mask,
+                                                        route_lane_pos)
 
         # ---------------------- 4) 포지션 임베딩 결합 ---------------------- #
         """
@@ -395,11 +553,94 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         encoding_tokens, encoding_mask = self.fusion(
             encoding_input, encoding_mask.reshape(B, self.token_num))
         encoder_outputs[
-            'encoding'] = encoding_tokens  # (B, token_num, hidden_dim)
-        encoder_outputs['encoding_mask'] = encoding_mask  # (B, token_num)
+            "encoding"] = encoding_tokens  # (B, token_num, hidden_dim)
+        encoder_outputs["encoding_mask"] = encoding_mask  # (B, token_num)
         encoder_outputs["ego_fut_global"] = ego_fut_global
+        encoder_outputs[
+            "near_agents_route_lane_emb"] = near_agents_route_lane_emb  # (B, Pnn, hidden_dim)
 
         return encoder_outputs
+
+    @staticmethod
+    def build_route_lane_tensors_from_order(
+        encoding_lanes: torch.Tensor,  # (B, lane_num, H)
+        lanes_mask: torch.Tensor,  # (B, lane_num)  # True=pad
+        lane_pos: torch.Tensor,  # (B, lane_num, Dpos=8)
+        agent_route_lane_order: torch.
+        Tensor,  # (B, Pnn, lane_num)  # -1=not in route, 0..=rank(가까운 순)
+        route_num: int,  # 선택할 최대 route 개수(≤ lane_num)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """에이전트-별 랭크(agent_route_lane_order)에 따라, 가까운 순으로 최대 route_num개의
+        차선을 선택해 (임베딩, 마스크, 포지션)을 에이전트 축으로 확장해 반환합니다.
+
+        Returns:
+            route_lanes:       (B, Pnn, route_num, H)
+            route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
+            route_lane_pos:    (B, Pnn, route_num, Dpos)
+        """
+        assert encoding_lanes.ndim == 3, f"encoding_lanes shape invalid: {encoding_lanes.shape}"
+        assert lanes_mask.ndim == 2, f"lanes_mask shape invalid: {lanes_mask.shape}"
+        assert lane_pos.ndim == 3, f"lane_pos shape invalid: {lane_pos.shape}"
+        assert agent_route_lane_order.ndim == 3, f"agent_route_lane_order shape invalid: {agent_route_lane_order.shape}"
+
+        B, L, H = encoding_lanes.shape
+        _, Lm = lanes_mask.shape
+        assert L == Lm, "lane_num mismatch between encoding_lanes and lanes_mask"
+        _, Lp = lane_pos.shape[:2]
+        assert L == Lp, "lane_num mismatch between encoding_lanes and lane_pos"
+
+        # (B, Pnn, L)  # -1=not in route → 큰 값으로 바꿔서 '최소값 top-k'에서 탈락시키기
+        order_long = agent_route_lane_order.to(torch.long)
+        lanes_mask_exp = lanes_mask.unsqueeze(1).expand(B, order_long.shape[1],
+                                                        L)  # (B, Pnn, L)
+        valid = (order_long >= 0) & (~lanes_mask_exp)  # 내 route이면서 lane 유효
+
+        BIG = 2**30  # 충분히 큰 값(랭크보다 큼)
+        order_for_sort = torch.where(valid, order_long,
+                                     torch.full_like(order_long, BIG))
+
+        # 에이전트별 '랭크가 작은 순'으로 최대 route_num개 선택
+        # vals: (B, Pnn, route_num), idx: (B, Pnn, route_num)
+        vals, idx = torch.topk(order_for_sort,
+                               k=route_num,
+                               dim=-1,
+                               largest=False)
+        sel_valid = vals != BIG  # (B, Pnn, route_num)
+
+        # --- gather 준비 ---
+        # 임베딩: (B, 1, L, H) -> (B, Pnn, L, H)
+        enc_exp = encoding_lanes.unsqueeze(1).expand(B, order_long.shape[1], L,
+                                                     H)
+        # 좌표: (B, 1, L, Dpos) -> (B, Pnn, L, Dpos)
+        pos_exp = lane_pos.unsqueeze(1).expand(B, order_long.shape[1], L,
+                                               lane_pos.shape[-1])
+        # 인덱스 확장
+        gather_idx_H = idx.unsqueeze(-1).expand(B, order_long.shape[1],
+                                                route_num, H)  # (B,Pnn,K,H)
+        gather_idx_pos = idx.unsqueeze(-1).expand(
+            B, order_long.shape[1], route_num,
+            lane_pos.shape[-1])  # (B,Pnn,K,Dpos)
+
+        # --- gather ---
+        route_lanes = torch.gather(enc_exp, 2,
+                                   gather_idx_H)  # (B, Pnn, route_num, H)
+        route_lane_pos = torch.gather(
+            pos_exp, 2, gather_idx_pos)  # (B, Pnn, route_num, Dpos)
+
+        # 마스크: lanes_mask에서 같은 인덱스 gather 후, sel_valid로 보강
+        lanes_mask_expanded = lanes_mask.unsqueeze(1).expand(
+            B, order_long.shape[1], L)  # (B,Pnn,L)
+        gathered_lane_mask = torch.gather(lanes_mask_expanded, 2,
+                                          idx)  # (B,Pnn,route_num)
+        route_lanes_mask = gathered_lane_mask | (~sel_valid)  # True=pad(무효)
+
+        # 무효 위치는 0으로 채우기
+        route_lanes = route_lanes.masked_fill(route_lanes_mask.unsqueeze(-1),
+                                              0.0)
+        route_lane_pos = route_lane_pos.masked_fill(
+            route_lanes_mask.unsqueeze(-1), 0.0)
+
+        return route_lanes, route_lanes_mask, route_lane_pos
 
 
 class SelfAttentionBlock(nn.Module):
@@ -883,7 +1124,7 @@ class AgentFusionEncoder(nn.Module):
         # 3) FP16/FP32 안전 마스킹(softmax 전)
         logits = logits.float()  # 안정성 위해 fp32로
         logits = logits.masked_fill((chunk_off_points_mask).unsqueeze(-1),
-                                    float('-inf'))  # 유효 아님 → -inf
+                                    float("-inf"))  # 유효 아님 → -inf
         if chunk_is_off.any().item():
             # 전부 -inf이면 softmax NaN → 해당 행은 0으로 세팅해 NaN 회피(균등분포가 됨)
             logits = logits.clone()
@@ -1975,7 +2216,7 @@ class AgentFusionEncoder(nn.Module):
         # (B, future_chunk_num, 1)
         logits = self.ego_fut_pool_q(ego_fut_chunk).float()
         logits = logits.masked_fill(ego_fut_off_chunk_mask_full.unsqueeze(-1),
-                                    float('-inf'))
+                                    float("-inf"))
         ego_fut_all_chunk_off = ego_fut_off_chunk_mask_full.all(dim=1)  # (B,)
         if ego_fut_all_chunk_off.any().item():
             logits = logits.clone()  # 선택(메모리 여유시): in-place 걱정 줄이기
@@ -2009,7 +2250,7 @@ class StaticFusionEncoder(nn.Module):
                  dim,
                  drop_path_rate=0.3,
                  hidden_dim=192,
-                 device='cuda',
+                 device="cuda",
                  num_fourier_frequencies=4,
                  time_gap=0.1,
                  time_min=-2.0,

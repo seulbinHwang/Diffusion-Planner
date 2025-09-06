@@ -97,6 +97,8 @@ class Decoder(nn.Module):
         scene_encoding_token_mask = encoder_outputs[
             'encoding_mask']  # (B, token_num) bool
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
+        near_agents_route_lane_emb = encoder_outputs[
+            "near_agents_route_lane_emb"]  # (B, Pnn, hidden_dim)
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
 
         if self.training:
@@ -109,6 +111,7 @@ class Decoder(nn.Module):
                 diffusion_time,  # (B)
                 scene_encoding_token,  # (B, token_num, hidden_dim)
                 ego_fut_global,  # (B, hidden_dim)
+                near_agents_route_lane_emb,  # (B, Pnn, hidden_dim)
                 near_current_mask,  # (B, Pnn),
                 scene_encoding_token_mask  # (B, token_num) bool
             )
@@ -293,7 +296,8 @@ class DiT(nn.Module):
         return self._model_type
 
     def forward(self, near_cur_future_norm_xT, diffusion_time, cross_c,
-                ego_fut_global, near_current_mask, cross_mask):
+                ego_fut_global, near_agents_route_lane_emb, near_current_mask,
+                cross_mask):
         """
         Forward pass of DiT.
         near_cur_future_norm_xT:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
@@ -301,6 +305,7 @@ class DiT(nn.Module):
         cross_c: [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
         near_current_mask: [B, Pnn]
+        near_agents_route_lane_emb, # (B, Pnn, D)
         cross_mask: (B, token_num)
         """
         B, Pnn, _ = near_cur_future_norm_xT.shape
@@ -324,7 +329,8 @@ class DiT(nn.Module):
             near_current_mask: (B, Pnn)
             cross_mask: (B, token_num)
             """
-            x = block(x, cross_c, y, near_current_mask, cross_mask)
+            x = block(x, cross_c, y, near_agents_route_lane_emb,
+                      near_current_mask, cross_mask)
             x = x.masked_fill(near_current_mask.unsqueeze(-1),
                               0.0)  # ← 블록 출력도 0 클램프
         # output: x: (B, Pnn, D=192)

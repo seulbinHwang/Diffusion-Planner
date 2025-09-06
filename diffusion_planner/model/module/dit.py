@@ -18,16 +18,51 @@ except Exception as _e:
 # =========================================
 
 
-def modulate(x, shift, scale, only_first=False):
-    if only_first:
-        x_first, x_rest = x[:, :1], x[:, 1:]
-        x = torch.cat(
-            [x_first * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), x_rest],
-            dim=1)
-    else:
-        x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+def modulate(
+    x: torch.Tensor,  # (B, L, D)
+    shift: torch.Tensor,  # (B, D) 또는 (B, L, D)
+    scale: torch.Tensor,  # (B, D) 또는 (B, L, D)
+    only_first: bool = False,
+) -> torch.Tensor:
+    """브로드캐스트 친화적 adaLN 모듈레이션.
 
-    return x
+    전역/에이전트별 모듈레이션 벡터를 x에 적용합니다.
+    shift/scale는 (B, D) 또는 (B, L, D) 형태를 모두 허용합니다.
+
+    Args:
+        x: (B, L, D) 입력 시퀀스 임베딩.
+        shift: (B, D) 또는 (B, L, D). 이동(shift) 항.
+        scale: (B, D) 또는 (B, L, D). 스케일(scale) 항.
+        only_first: True면 첫 토큰에만 모듈레이션을 적용합니다.
+
+    Returns:
+        torch.Tensor: (B, L, D) 모듈레이션 적용 결과.
+    """
+    if x.dim() != 3:
+        raise ValueError(f"x must be (B, L, D), got {tuple(x.shape)}")
+
+    # (B, D) → (B, 1, D)로 승격하여 L축으로 브로드캐스트
+    if shift.dim() == 2 and scale.dim() == 2:
+        shift = shift.unsqueeze(1)  # (B, 1, D)
+        scale = scale.unsqueeze(1)  # (B, 1, D)
+    elif shift.dim() == 3 and scale.dim() == 3:
+        # 이미 (B, L, D)
+        pass
+    else:
+        raise ValueError(
+            f"shift/scale must be (B,D) or (B,L,D); "
+            f"got shift={tuple(shift.shape)}, scale={tuple(scale.shape)}")
+    # ★ 추가: dtype/device 정렬
+    shift = shift.to(dtype=x.dtype, device=x.device)
+    scale = scale.to(dtype=x.dtype, device=x.device)
+
+
+    if only_first:
+        x_first = x[:, :1] * (1 + scale[:, :1]) + shift[:, :1]
+        x_rest = x[:, 1:]
+        return torch.cat([x_first, x_rest], dim=1)
+    else:
+        return x * (1 + scale) + shift
 
 
 def scale(x, scale, only_first=False):
@@ -107,8 +142,13 @@ class DiTBlock(nn.Module):
                         hidden_features=mlp_hidden_dim,
                         act_layer=approx_gelu,
                         drop=0)
+
+        # 전역(ego_fut_global + t)에서 (B, D) 모듈레이션 6개 생성
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
+        nn.init.zeros_(self.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+
         self.norm3 = nn.LayerNorm(dim)
         self.norm4 = nn.LayerNorm(dim)
         self.mlp2 = Mlp(in_features=dim,
@@ -133,9 +173,20 @@ class DiTBlock(nn.Module):
         # Dropout 확률(Train일 때만 FA2에 전달)
         self._attn_dropout_p = dropout
 
-        # adaLN‑Zero 초기화(원본 유지)
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        # ==== (추가) per-agent route 기반 잔차 모듈레이션 ====
+        # 입력: near_agents_route_lane_emb (B, Pnn, D) → 출력: (B, Pnn, 6D)
+        self.route_adaLN_modulation = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim, bias=True),
+        )
+        # 잔차 0 초기화(adaLN‑Zero 정신 유지): 초기엔 전역만 작동
+        nn.init.zeros_(self.route_adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.route_adaLN_modulation[-1].bias)
+
+        # 경로 잔차의 전체 스케일(학습 가능한 스칼라, 0에서 시작)
+        self.route_msa_alpha = nn.Parameter(torch.tensor(0.0))  # Self-Attn 경로용
+        self.route_mlp_alpha = nn.Parameter(torch.tensor(0.0))  # MLP1 경로용
 
     # ====================== 유틸/헬퍼 함수들 ======================
 
@@ -384,24 +435,163 @@ class DiTBlock(nn.Module):
                                  q_in.dtype)  # (B, Lq, D)
         return out
 
+    # ====================== (추가) 함수화된 per‑agent adaLN 로직 ======================
+
+    def _compute_global_adaln(
+        self,
+        global_condition: torch.
+        Tensor,  # (B, D)  = ego_fut_global + t_embedding
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor]:
+        """전역 조건으로부터 (B, D) 모듈레이션 6개를 계산합니다."""
+        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
+         gate_mlp) = self.adaLN_modulation(global_condition).chunk(6, dim=1)
+        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+    def _compute_route_residual_adaln(
+        self,
+        per_agent_route_lane_emb: torch.Tensor,  # (B, P, D)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor]:
+        """에이전트별 route 임베딩으로부터 (B, P, D) 잔차 모듈레이션 6개를 계산합니다.
+
+        Note:
+            - 마지막 선형층을 0으로 초기화했으므로, 초기 출력은 0에 가깝습니다(안정성↑).
+        """
+        route_modulation: torch.Tensor = self.route_adaLN_modulation(
+            per_agent_route_lane_emb)
+        (delta_shift_msa, delta_scale_msa, delta_gate_msa, delta_shift_mlp,
+         delta_scale_mlp, delta_gate_mlp) = route_modulation.chunk(6, dim=-1)
+        return (delta_shift_msa, delta_scale_msa, delta_gate_msa,
+                delta_shift_mlp, delta_scale_mlp, delta_gate_mlp)
+
+    def _combine_global_and_route_modulations(
+        self,
+        global_modulations: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                  torch.Tensor, torch.Tensor,
+                                  torch.Tensor],  # (B,D)×6
+        route_residuals: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                               torch.Tensor, torch.Tensor,
+                               torch.Tensor],  # (B,P,D)×6
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor]:
+        """전역 모듈레이션(B,D)과 per‑agent 잔차(B,P,D)를 결합해 (B,P,D) 6개를 반환합니다.
+
+        결합식:
+            shift_msa^p = shift_msa + route_msa_alpha * Δshift_msa^p
+            scale_msa^p = scale_msa + route_msa_alpha * Δscale_msa^p
+            gate_msa^p  = gate_msa  + route_msa_alpha * Δgate_msa^p
+            (MLP 경로도 동일; α는 학습 가능한 스칼라)
+        """
+        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
+         gate_mlp) = global_modulations
+        (d_shift_msa, d_scale_msa, d_gate_msa, d_shift_mlp, d_scale_mlp,
+         d_gate_mlp) = route_residuals
+
+        # (B, D) → (B, 1, D) 승격 후 (B, P, D) 잔차와 합
+        shift_msa_pa = shift_msa.unsqueeze(
+            1) + self.route_msa_alpha * d_shift_msa
+        scale_msa_pa = scale_msa.unsqueeze(
+            1) + self.route_msa_alpha * d_scale_msa
+        gate_msa_pa = gate_msa.unsqueeze(1) + self.route_msa_alpha * d_gate_msa
+
+        shift_mlp_pa = shift_mlp.unsqueeze(
+            1) + self.route_mlp_alpha * d_shift_mlp
+        scale_mlp_pa = scale_mlp.unsqueeze(
+            1) + self.route_mlp_alpha * d_scale_mlp
+        gate_mlp_pa = gate_mlp.unsqueeze(1) + self.route_mlp_alpha * d_gate_mlp
+
+        return shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa, gate_mlp_pa
+
+    def _apply_modulated_self_attention(
+            self,
+            x: torch.Tensor,  # (B, P, D)
+            attn_mask: torch.Tensor,  # (B, P) True=pad
+            shift_msa_pa: torch.Tensor,  # (B, P, D)
+            scale_msa_pa: torch.Tensor,  # (B, P, D)
+            gate_msa_pa: torch.Tensor,  # (B, P, D)
+    ) -> torch.Tensor:
+        """per‑agent 모듈레이션을 적용한 Self‑Attention 경로."""
+        modulated_x = modulate(self.norm1(x), shift_msa_pa,
+                               scale_msa_pa)  # (B, P, D)
+        msa_out = self._self_attn_flash_varlen(modulated_x,
+                                               attn_mask)  # (B, P, D)
+        x = x + gate_msa_pa * msa_out  # (B, P, D)
+        return x
+
+    def _apply_modulated_mlp1(
+            self,
+            x: torch.Tensor,  # (B, P, D)
+            shift_mlp_pa: torch.Tensor,  # (B, P, D)
+            scale_mlp_pa: torch.Tensor,  # (B, P, D)
+            gate_mlp_pa: torch.Tensor,  # (B, P, D)
+    ) -> torch.Tensor:
+        """per‑agent 모듈레이션을 적용한 MLP1 경로."""
+        modulated_x = modulate(self.norm2(x), shift_mlp_pa,
+                               scale_mlp_pa)  # (B, P, D)
+        x = x + gate_mlp_pa * self.mlp1(modulated_x)  # (B, P, D)
+        return x
+
     # ====================== forward (원 변수명 유지) ======================
 
-    def forward(self, x, cross_c, y, attn_mask, cross_mask):
+    def forward(
+            self,
+            x: torch.Tensor,  # (B, Pnn, D)
+            cross_c: torch.Tensor,  # (B, token_num, D)
+            y: torch.Tensor,  # (B, D)  = ego_fut_global + t_embedding
+            near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+            attn_mask: torch.Tensor,  # (B, Pnn) True=pad # near_current_mask
+            cross_mask: torch.Tensor,  # (B, token_num)   True=pad
+    ) -> torch.Tensor:
         """
-        Input shapes:
-            x: (B, Pnn, D=192)
-            cross_c: (B, N=token_num, D=192)
-            y: (B, D=192)
-            attn_mask: near_current_mask: (B, Pnn)
-            cross_mask: (B, token_num)
+        순서:
+            1) 전역 모듈레이션(B,D) 6개 계산
+            2) per‑agent route 잔차(B,P,D) 6개 계산
+            3) 결합하여 (B,P,D) 6개 모듈레이션 생성
+            4) Self‑Attention → MLP1 (per‑agent 모듈레이션 적용)
+            5) Cross‑Attention → MLP2 (원본 게이트 유지)
 
         Note:
             - FlashAttention‑2 varlen 경로로 무효 토큰(패딩)을 완전히 건너뜁니다.
             - pad back 시 마스크된 위치는 자연스럽게 0이 되며, gradient도 올바르게 흘러갑니다.
         """
         # y: (B, D=192)
+        # 1) 전역(B,D)
+        # global_mods: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+        global_mods = self._compute_global_adaln(y)  # (B,D)×6
+        # 2) per-agent 잔차(B,P,D)
+        route_residuals = self._compute_route_residual_adaln(
+            near_agents_route_lane_emb.to(x.dtype))  # (B,P,D)×6
+        # 3) 결합(B,P,D)
+        (shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa,
+         gate_mlp_pa) = self._combine_global_and_route_modulations(
+             global_mods, route_residuals)
+        # ★ 추가: dtype 안전화
+        dtype = x.dtype
+        shift_msa_pa = shift_msa_pa.to(dtype)
+        scale_msa_pa = scale_msa_pa.to(dtype)
+        gate_msa_pa  = gate_msa_pa.to(dtype)
+        shift_mlp_pa = shift_mlp_pa.to(dtype)
+        scale_mlp_pa = scale_mlp_pa.to(dtype)
+        gate_mlp_pa  = gate_mlp_pa.to(dtype)
+        # 4) Self‑Attention + MLP1 (per‑agent 모듈레이션)
+        x = self._apply_modulated_self_attention(x, attn_mask, shift_msa_pa,
+                                                 scale_msa_pa, gate_msa_pa)
+        x = self._apply_modulated_mlp1(x, shift_mlp_pa, scale_mlp_pa,
+                                       gate_mlp_pa)
+        # 5) Cross‑Attention (원본 유지) + MLP2(게이트)
+        q = self.norm3(x)  # (B, P, D)
+        cross_out = self._cross_attn_flash_varlen(q, cross_c, attn_mask,
+                                                  cross_mask)  # (B, P, D)
+        x = x + self.gate_cross * cross_out
+        x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
+        return x
+
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
          gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
+        """ TODO: near_agents_route_lane_emb 는 각 생성 대상 agent별로 scale/shift 를 만드는데에 쓰임.
+        그리고 각 생성 대상 agent별 scale/shift 를 각각 적용해야함. (adaLN_modulation의 출력값은 모든 생성 대상 agent에 대해 동일하게 적용하는 것과 다름)
+        """
 
         # ----- Self-Attention (varlen) -----
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)  # (B, P, D)
