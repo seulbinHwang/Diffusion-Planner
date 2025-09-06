@@ -7,7 +7,7 @@ Categories:
     2. Get agents array for model input
 """
 import numpy as np
-from typing import Dict, Deque, List, Tuple, Optional
+from typing import Dict, Deque, List, Tuple, Optional, Union
 from nuplan.common.actor_state.tracked_objects import TrackedObjects, TrackedObject
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import AgentInternalIndex
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
@@ -304,7 +304,6 @@ def agent_past_process(
         num_static: int,
         max_ped_bike: int,
         anchor_ego_state: np.ndarray,  #(3,)
-        radius: float ,
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     # ego_agent_past: (num_frames, 11)
     # neighbor_agents_past: (agent_num, num_frames, 11)
@@ -521,23 +520,84 @@ def agent_past_process(
     return ego_agent_past, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects
 
 
-def agent_future_process(anchor_ego_state, future_tracked_objects, num_agents,
-                         agent_index):
+def agent_future_process(
+        anchor_ego_state: np.ndarray,  # (3,)
+        future_tracked_objects: List[
+            np.ndarray],  # 길이 = 1(현재)+Tf, 각 원소: (frame_agents_num, 8)
+        num_agents: int,  # 출력 이웃 슬롯 수
+        agent_index: Union[np.ndarray,
+                           List[int]],  # 길이 K(≤ num_agents), 현재 프레임의 행 인덱스들
+) -> np.ndarray:
+    """현재 시점에서 선택된 에이전트 집합(행 인덱스)을 유지한 채 미래 시퀀스를 (x, y, heading)로 생성합니다.
+    개요:
+        - 입력으로 들어온 `future_tracked_objects`(현재+미래 프레임들의 원시 감지 배열)를
+          현재 프레임에 존재하는 에이전트만 남기도록 정렬/필터링합니다.
+        - 각 프레임을 ego 기준 상대좌표계로 변환한 뒤, 에이전트 행 정렬을 고정하고
+          결측 에이전트는 0으로 패딩합니다.
+        - 과거 처리 단계에서 결정된 `agent_index`(= 현재 프레임의 선택/순서)를 그대로 사용해
+          같은 에이전트만, 같은 순서로 서브셋팅하여 최종 (num_agents, Tf, 3) 배열을 만듭니다.
 
-    agent_future = _filter_agents_array(future_tracked_objects)
+    Args:
+        anchor_ego_state (np.ndarray):
+            - 모양: **(3,)**
+            - 의미: [x_ego, y_ego, yaw_ego] (월드 좌표계, 현재 시점).
+            - 용도: 절대 좌표/속도를 ego 상대좌표계로 변환할 때 기준으로 사용.
+        future_tracked_objects (List[np.ndarray]):
+            - 길이: **1 + Tf** (인덱스 0이 현재, 1..Tf 가 미래 프레임)
+            - 각 원소 모양: **(frame_agents_num, 8)**
+            - 스키마: `AgentInternalIndex` 순서( track_id, vx, vy, heading, width, length, x, y ).
+        num_agents (int):
+            - 출력할 이웃 슬롯(행)의 고정 개수. K < num_agents 인 경우 남는 행은 0으로 채워짐.
+        agent_index (Union[np.ndarray, List[int]]):
+            - 모양: **(K, )**, 값: 정수 인덱스, **K ≤ num_agents**.
+            - 의미: 과거 처리(`agent_past_process`)에서 결정된 "현재 프레임의 에이전트 행 인덱스 집합".
+              이 순서가 최종 출력의 행 순서가 됩니다.
+
+    Returns:
+        np.ndarray:
+            - 모양: **(num_agents, Tf, 3)**
+            - 채널: [x, y, heading] (모두 **ego 상대좌표계**)
+            - dtype: `np.float32`
+            - 특이사항: 선택된 에이전트가 미래 프레임에서 사라진 구간은 0으로 패딩됩니다.
+              또한 `agent_index` 길이가 `num_agents`보다 작으면 남은 행은 전부 0입니다.
+
+    Notes:
+        - 내부 단계
+            1) `_filter_agents_array(future_tracked_objects)`
+               → 현재 프레임(리스트의 첫 원소)에 존재하는 에이전트만 남기도록 프레임별 배열을 일치.
+            2) `convert_absolute_quantities_to_relative(..., anchor_ego_state, 'agent')`
+               → 각 프레임을 ego 상대좌표계로 변환.
+            3) `_pad_agent_states_with_zeros(...)`
+               → 현재 프레임의 행 순서를 기준으로 모든 프레임의 행을 고정, 결측은 0 패딩.
+            4) `agent_index`로 서브셋팅
+               → 과거에서 고른 동일 에이전트만, 동일한 행 순서로 (x, y, heading) 추출.
+        - 안전성 전제: `agent_index`는 현재 프레임의 유효 행 범위 내 정수 인덱스여야 합니다
+          (보통 `agent_past_process`의 반환값을 그대로 넘기므로 보장됩니다).
+
+    """
+    agent_future = _filter_agents_array(
+        future_tracked_objects)  # list 길이 = 1 + Tf, 각 (frame_agents_num, 8)
+
     local_coords_agent_states = []
     for agent_state in agent_future:
+        # agent_state: (frame_agents_num, 8)  → ego 상대좌표계로 변환
         local_coords_agent_states.append(
             convert_absolute_quantities_to_relative(agent_state,
                                                     anchor_ego_state, 'agent'))
+
+    # padded_agent_states: (1 + Tf, current_agents_num, 8)
+    #  - 현재 프레임의 행 순서 고정, 결측은 0으로 패딩
     padded_agent_states = _pad_agent_states_with_zeros(
         local_coords_agent_states)
 
-    # fill agent features into the array
+    # 최종 결과 버퍼: (num_agents, Tf, 3)  ← 현재(인덱스 0) 제외한 미래 구간만 사용
     agent_futures = np.zeros(shape=(num_agents,
                                     padded_agent_states.shape[0] - 1, 3),
                              dtype=np.float32)
+
+    # agent_index의 순서가 곧 출력 행 순서가 된다.
     for i, j in enumerate(agent_index):
+        # padded_agent_states[1:, j, [x, y, heading]] → (Tf, 3)
         agent_futures[i] = padded_agent_states[1:, j, [
             AgentInternalIndex.x(),
             AgentInternalIndex.y(),

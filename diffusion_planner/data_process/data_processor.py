@@ -77,29 +77,45 @@ class DataProcessor(object):
             neighbor_agents_past: np.ndarray,
             neighbor_agents_future: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        """ego 중심 self._radius 이내 에이전트 필터링.
+        """ego 중심 정사각형 영역(가로·세로 2*radius)으로 에이전트 클리핑.
+
+        원래는 원형 반경(r) 내부 여부를 L2 거리로 판정했지만,
+        이제는 정사각형의 내부 여부를 다음 조건으로 판정합니다:
+            |x| <= r  AND  |y| <= r
+        (여기서 (x, y)는 상대좌표계의 마지막 시점 위치)
 
         Args:
-            neighbor_agents_past (np.ndarray): (N, Tp, 11) 상대 좌표계 과거 에이전트.
-            neighbor_agents_future (Optional[np.ndarray], optional):
-                (N, Tf, 3) 상대 좌표계 미래 에이전트. 기본값은 ``None``.
+            neighbor_agents_past (np.ndarray): (N, Tp, 11)
+                상대 좌표계 과거 에이전트 시퀀스.
+            neighbor_agents_future (Optional[np.ndarray], optional): (N, Tf, 3)
+                상대 좌표계 미래 에이전트 시퀀스. 기본값 None.
 
         Returns:
             Tuple[np.ndarray, Optional[np.ndarray]]:
-                반경 내 에이전트만 남긴 ``neighbor_agents_past`` 와 ``neighbor_agents_future``.
+                - filtered_neighbor_agents_past:   (N, Tp, 11)
+                - filtered_neighbor_agents_future: (N, Tf, 3) 또는 None
+              정사각형 바깥 에이전트는 전체 시퀀스를 0으로 채운 상태로 유지됩니다(개수 고정).
         """
-        # distances: (N,)
-        distances = np.linalg.norm(neighbor_agents_past[:, -1, :2], axis=-1)
-        # mask: (N,)
-        mask = distances <= self._radius
-        # mask_expanded: (N, 1, 1)
+        # 마지막 시점 상대 좌표 (N, 2)  ← ego 기준이므로 ego는 정중앙(0,0)
+        cur_xy = neighbor_agents_past[:, -1, :2]  # (N, 2)
+
+        # 정사각형 내부 판정: |x| <= r AND |y| <= r  → (N,)
+        mask_x = np.abs(cur_xy[:, 0]) <= self._radius  # (N,)
+        mask_y = np.abs(cur_xy[:, 1]) <= self._radius  # (N,)
+        mask = mask_x & mask_y  # (N,), True=정사각형 내부(유효)
+
+        # 브로드캐스팅을 위한 차원 확장: (N, 1, 1)
         mask_expanded = mask[:, None, None]
+
+        # 정사각형 바깥 에이전트는 전체 시퀀스를 0으로 만듦(개수는 고정)
         # filtered_neighbor_agents_past: (N, Tp, 11)
         filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
+
         filtered_neighbor_agents_future = None
         if neighbor_agents_future is not None:
             # filtered_neighbor_agents_future: (N, Tf, 3)
             filtered_neighbor_agents_future = neighbor_agents_future * mask_expanded
+
         return filtered_neighbor_agents_past, filtered_neighbor_agents_future
 
     # Use for inference
@@ -153,7 +169,7 @@ class DataProcessor(object):
              all_frame_ego_feature, all_frame_agents_feature,
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_ped_bike,
-             anchor_ego_state, self._radius)
+             anchor_ego_state)
         neighbor_agents_past, _ = self._filter_agents_within_radius(
             neighbor_agents_past)
         '''
@@ -284,6 +300,7 @@ class DataProcessor(object):
             (future_tracked_objects_array_list,
              _) = sampled_tracked_objects_to_array_list(
                  sampled_future_observations)
+            # neighbor_agents_future: (num_agents, future_len, 3)
             neighbor_agents_future = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
                 self.num_agents, neighbor_indices)
