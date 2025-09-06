@@ -83,6 +83,7 @@ class Decoder(nn.Module):
         near_current = inputs["neighbor_agents_past"][:, :self.
                                                       _predicted_neighbor_num,
                                                       -1, :4]  # [B, pnn, 4]
+        # 모든 값이 0인 경우 -> 패딩된 에이전트(True)
         near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
                                       dim=-1) == 0  # [B, pnn]
         inputs["near_current_mask"] = near_current_mask
@@ -303,10 +304,42 @@ class DiT(nn.Module):
         near_current_mask: [B, Pnn]
         cross_mask: (B, token_num)
         """
-        B, Pnn, _ = near_cur_future_norm_xT.shape
-        # (B, Pnn, 324) -> (B, Pnn, D=192)
+        B, Pnn, dim_in = near_cur_future_norm_xT.shape
+        # --------------------------------------------------------------
+        # 패딩 토큰을 제거하여 불필요한 연산을 줄인다
+        # near_current_mask: (B, Pnn) -> 패딩 위치가 True
+        # valid_mask: (B, Pnn) -> 실제 에이전트 위치가 True
+        # valid_counts: (B,) -> 배치별 실제 에이전트 수
+        # max_valid: int -> 배치 내 최대 실제 에이전트 수
+        # --------------------------------------------------------------
+        orig_mask = near_current_mask  # (B, Pnn)
+        valid_mask = ~orig_mask  # (B, Pnn)
+        valid_counts = valid_mask.sum(dim=1)  # (B)
+        max_valid = valid_counts.max().item()  # scalar
+
+        if max_valid == 0:
+            # 모든 배치가 패딩된 경우: 출력도 0으로 반환
+            out_dim = self.final_layer.proj[-1].out_features
+            return torch.zeros(B, Pnn, out_dim,
+                               device=near_cur_future_norm_xT.device)
+
+        sort_idx = None  # (B, Pnn)
+        if max_valid < Pnn:
+            # 유효 토큰을 앞으로 모으기 위한 정렬 인덱스
+            sort_idx = valid_mask.int().sort(dim=1, descending=True)[1]
+            # near_cur_future_norm_xT: (B, Pnn, dim_in) -> 정렬 후 동일
+            near_cur_future_norm_xT = torch.gather(
+                near_cur_future_norm_xT, 1,
+                sort_idx.unsqueeze(-1).expand(-1, -1, dim_in))
+            near_current_mask = torch.gather(orig_mask, 1, sort_idx)  # (B, Pnn)
+            # 가장 긴 유효 길이(max_valid)까지만 사용
+            near_cur_future_norm_xT = near_cur_future_norm_xT[:, :max_valid]  # (B, max_valid, dim_in)
+            near_current_mask = near_current_mask[:, :max_valid]  # (B, max_valid)
+
+        # (B, max_valid, (1+T)*4=dim_in) -> (B, max_valid, D=hidden_dim)
         x = self.preproj(near_cur_future_norm_xT)
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
+        # 패딩 위치는 0으로 유지
+        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # (B, max_valid, D)
 
         # diffusion_time: [B,]
         # t_embedding: (B, D=192)
@@ -324,21 +357,29 @@ class DiT(nn.Module):
             near_current_mask: (B, Pnn)
             cross_mask: (B, token_num)
             """
-            x = block(x, cross_c, y, near_current_mask, cross_mask)
-            x = x.masked_fill(near_current_mask.unsqueeze(-1),
-                              0.0)  # ← 블록 출력도 0 클램프
-        # output: x: (B, Pnn, D=192)
-        # y: (B, D=192)
-        x = self.final_layer(x, y)
-        # x.shape: (B, Pnn, (1 + T) * 4)
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 최종 출력도 0
+            # 각 블록마다 패딩 토큰을 0으로 유지하며 self/cross attention 수행
+            x = block(x, cross_c, y, near_current_mask, cross_mask)  # (B, max_valid, D)
+            x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
+
+        # 최종 출력 레이어
+        x = self.final_layer(x, y)  # (B, max_valid, (1+T)*4)
+        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # (B, max_valid, (1+T)*4)
+
+        if sort_idx is not None:
+            # 원래 위치로 복원: (B, Pnn, dim_out)
+            out = torch.zeros(B, Pnn, x.shape[-1], device=x.device, dtype=x.dtype)
+            out.scatter_(1,
+                         sort_idx[:, :max_valid].unsqueeze(-1).expand(
+                             -1, -1, x.shape[-1]),
+                         x)
+            x = out
 
         if self._model_type == "score":
-            return x / (self.marginal_prob_std(diffusion_time)[:, None, None] +
-                        1e-6)
-        elif self._model_type == "x_start":
-            # CURRENT DEFAULT OPTION: "x_start"
-            # x: (B, Pnn, (1 + T) * 4)
-            return x
-        else:
+            x = x / (self.marginal_prob_std(diffusion_time)[:, None, None] +
+                     1e-6)
+        elif self._model_type != "x_start":
             raise ValueError(f"Unknown model type: {self._model_type}")
+
+        # 최종적으로 원래 패딩 위치는 0으로 유지
+        x = x.masked_fill(orig_mask.unsqueeze(-1), 0.0)
+        return x
