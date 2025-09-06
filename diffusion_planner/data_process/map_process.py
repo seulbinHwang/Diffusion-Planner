@@ -339,6 +339,7 @@ def _compute_lane_on_npc_routes(
     lane_on_raw_npc_routes: List[List[bool]] = []
 
     for token, npc_route_ids in near_token_to_route_roadblock_ids.items():
+        # npc_route_ids: Optional[List[str]]
         # len = M (M = max_elements) (70게)
         npc_lane_on_route: List[bool] = []
         npc_lane_on_raw_route: List[bool] = []
@@ -351,7 +352,6 @@ def _compute_lane_on_npc_routes(
         else:
             # lane_routes에 포함되는 경로 id 선별
             pruned_route_ids = [r for r in npc_route_ids if r in lane_routes]
-            # 연결성 기준 후처리 (주석 해제하면 바로 사용 가능)
             pruned_route_ids = _prune_route_by_connectivity(
                 npc_route_ids, pruned_route_ids)
             # raw 경로도 동일하게 필터링
