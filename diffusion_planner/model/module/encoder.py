@@ -498,6 +498,7 @@ class Encoder(nn.Module):
         
         near_agents_route_lane_emb: (B, Pnn, H)
         """
+
         # --- [NEW] 3‑B) 학습 시 샘플 단위로 50% 확률로 "경로 없음" 강제 ---
         if self.training and self.route_order_drop_prob > 0.0:
             # route_keep_mask[b] = True면 주어진 order를 사용, False면 "경로 없음"
@@ -511,6 +512,8 @@ class Encoder(nn.Module):
         near_agents_route_lane_emb = self.route_encoder(route_lanes,
                                                         route_lanes_mask,
                                                         route_lane_pos)
+        # (B, Pnn) True=해당 에이전트가 유효 route를 가짐
+        route_known_mask = self._compute_route_known_mask(route_lanes_mask)
 
         # ---------------------- 4) 포지션 임베딩 결합 ---------------------- #
         """
@@ -558,8 +561,28 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         encoder_outputs["ego_fut_global"] = ego_fut_global
         encoder_outputs[
             "near_agents_route_lane_emb"] = near_agents_route_lane_emb  # (B, Pnn, hidden_dim)
-
+        encoder_outputs[
+            "route_known_mask"] = route_known_mask  # (B, Pnn) True=해당 에이전트가 유효 route
         return encoder_outputs
+
+    @staticmethod
+    def _compute_route_known_mask(
+            route_lanes_mask: torch.Tensor) -> torch.Tensor:
+        """route 유효 여부(에이전트별)를 계산합니다.
+
+        Args:
+            route_lanes_mask (torch.Tensor): (B, Pnn, R) bool, True=pad/무효
+
+        Returns:
+            torch.Tensor: (B, Pnn) bool, True=해당 에이전트가 **유효한 route lane을 1개 이상** 가짐.
+                - 정의: (~route_lanes_mask).any(dim=-1)
+                - R=0(선택된 route가 전혀 없는 설정)에도 안전: `.any()`는 False 반환 → 'unknown' 처리.
+        """
+        if route_lanes_mask.dim() != 3:
+            raise ValueError(
+                f"route_lanes_mask must be (B,Pnn,R), got {tuple(route_lanes_mask.shape)}"
+            )
+        return (~route_lanes_mask).any(dim=-1)  # (B, Pnn) True=known
 
     @staticmethod
     def build_route_lane_tensors_from_order(

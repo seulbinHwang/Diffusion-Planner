@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
+from typing import Optional
 
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
@@ -99,6 +100,8 @@ class Decoder(nn.Module):
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
         near_agents_route_lane_emb = encoder_outputs[
             "near_agents_route_lane_emb"]  # (B, Pnn, hidden_dim)
+        route_known_mask = encoder_outputs[
+            "route_known_mask"]  # (B, Pnn) bool # True=해당 에이전트가 유효 route
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
 
         if self.training:
@@ -113,7 +116,8 @@ class Decoder(nn.Module):
                 ego_fut_global,  # (B, hidden_dim)
                 near_agents_route_lane_emb,  # (B, Pnn, hidden_dim)
                 near_current_mask,  # (B, Pnn),
-                scene_encoding_token_mask  # (B, token_num) bool
+                scene_encoding_token_mask,  # (B, token_num) bool
+                route_known_mask,  # (B, Pnn) bool # True=해당 에이전트가 유효 route
             )
             _require_finite("decoder_dit_output", score)
             return {
@@ -141,8 +145,10 @@ class Decoder(nn.Module):
                 other_model_params={
                     "cross_c": scene_encoding_token,
                     "ego_fut_global": ego_fut_global,
+                    "near_agents_route_lane_emb": near_agents_route_lane_emb,
                     "near_current_mask": near_current_mask,
                     "cross_mask": scene_encoding_token_mask,
+                    "route_known_mask": route_known_mask,
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": initial_state_constraint,
@@ -153,10 +159,18 @@ class Decoder(nn.Module):
                     "classifier_kwargs": {
                         "model": self.dit,
                         "model_condition": {
-                            "cross_c": scene_encoding_token,
-                            "ego_fut_global": ego_fut_global,
-                            "near_current_mask": near_current_mask,
-                            "cross_mask": scene_encoding_token_mask,
+                            "cross_c":
+                                scene_encoding_token,
+                            "ego_fut_global":
+                                ego_fut_global,
+                            "near_agents_route_lane_emb":
+                                near_agents_route_lane_emb,
+                            "near_current_mask":
+                                near_current_mask,
+                            "cross_mask":
+                                scene_encoding_token_mask,
+                            "route_known_mask":
+                                route_known_mask,
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
@@ -295,9 +309,19 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
-    def forward(self, near_cur_future_norm_xT, diffusion_time, cross_c,
-                ego_fut_global, near_agents_route_lane_emb, near_current_mask,
-                cross_mask):
+    def forward(
+        self,
+        near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, (1+T)*4)
+        diffusion_time: torch.Tensor,  # (B,)
+        cross_c: torch.Tensor,  # (B, token_num, D)
+        ego_fut_global: torch.Tensor,  # (B, D)
+        near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+        near_current_mask: torch.Tensor,  # (B, Pnn) True=pad
+        cross_mask: torch.Tensor,  # (B, token_num) True=pad
+        route_known_mask: Optional[
+            torch.
+            Tensor] = None  # (B, Pnn) True=known # 제공 시 per‑agent 잔차 모듈레이션 Δ를 해당 위치만 활성화.
+    ) -> torch.Tensor:
         """
         Forward pass of DiT.
         near_cur_future_norm_xT:  [B, Pnn, (1 + T) * 4] # (81*4 = 324)
@@ -330,7 +354,7 @@ class DiT(nn.Module):
             cross_mask: (B, token_num)
             """
             x = block(x, cross_c, y, near_agents_route_lane_emb,
-                      near_current_mask, cross_mask)
+                      near_current_mask, cross_mask, route_known_mask)
             x = x.masked_fill(near_current_mask.unsqueeze(-1),
                               0.0)  # ← 블록 출력도 0 클램프
         # output: x: (B, Pnn, D=192)

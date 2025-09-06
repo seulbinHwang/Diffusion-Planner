@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
-from typing import Tuple
+from typing import Tuple, Optional
 import torch.nn.functional as F
 # ===== FlashAttention-2 varlen import =====
 try:
@@ -55,7 +55,6 @@ def modulate(
     # ★ 추가: dtype/device 정렬
     shift = shift.to(dtype=x.dtype, device=x.device)
     scale = scale.to(dtype=x.dtype, device=x.device)
-
 
     if only_first:
         x_first = x[:, :1] * (1 + scale[:, :1]) + shift[:, :1]
@@ -451,17 +450,44 @@ class DiTBlock(nn.Module):
     def _compute_route_residual_adaln(
         self,
         per_agent_route_lane_emb: torch.Tensor,  # (B, P, D)
+        route_known_mask: Optional[torch.Tensor] = None
+        # (B, P)  True=route known
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor]:
-        """에이전트별 route 임베딩으로부터 (B, P, D) 잔차 모듈레이션 6개를 계산합니다.
+        """에이전트별 route 임베딩(B, P, D)으로부터 (B, P, D) 잔차 모듈레이션 6개를 계산합니다.
 
-        Note:
-            - 마지막 선형층을 0으로 초기화했으므로, 초기 출력은 0에 가깝습니다(안정성↑).
+        Args:
+            per_agent_route_lane_emb (torch.Tensor): (B, P, D) route 기반 임베딩.
+            route_known_mask (Optional[torch.Tensor]): (B, P) bool, True=route 정보 있음.
+                - 제공되면, 알려지지 않은 에이전트(=False)의 잔차 Δ를 0으로 강제합니다.
+
+        Returns:
+            Tuple[torch.Tensor, ...]: (delta_shift_msa, delta_scale_msa, delta_gate_msa,
+                                       delta_shift_mlp, delta_scale_mlp, delta_gate_mlp),
+                                       각각 (B, P, D).
         """
         route_modulation: torch.Tensor = self.route_adaLN_modulation(
             per_agent_route_lane_emb)
         (delta_shift_msa, delta_scale_msa, delta_gate_msa, delta_shift_mlp,
          delta_scale_mlp, delta_gate_mlp) = route_modulation.chunk(6, dim=-1)
+        if route_known_mask is not None:
+            if route_known_mask.dtype != torch.bool:
+                raise ValueError(
+                    f"route_known_mask must be bool, got {route_known_mask.dtype}"
+                )
+            if route_known_mask.shape != per_agent_route_lane_emb.shape[:2]:
+                raise ValueError(
+                    f"route_known_mask shape must be (B,P)={per_agent_route_lane_emb.shape[:2]}, "
+                    f"got {tuple(route_known_mask.shape)}")
+            # (B,P) → (B,P,1)로 승격 후 Δ항을 0으로 강제
+            keep = route_known_mask.unsqueeze(-1)  # True=keep Δ, False=zero Δ
+            delta_shift_msa = delta_shift_msa.masked_fill(~keep, 0)
+            delta_scale_msa = delta_scale_msa.masked_fill(~keep, 0)
+            delta_gate_msa = delta_gate_msa.masked_fill(~keep, 0)
+            delta_shift_mlp = delta_shift_mlp.masked_fill(~keep, 0)
+            delta_scale_mlp = delta_scale_mlp.masked_fill(~keep, 0)
+            delta_gate_mlp = delta_gate_mlp.masked_fill(~keep, 0)
+
         return (delta_shift_msa, delta_scale_msa, delta_gate_msa,
                 delta_shift_mlp, delta_scale_mlp, delta_gate_mlp)
 
@@ -535,13 +561,14 @@ class DiTBlock(nn.Module):
     # ====================== forward (원 변수명 유지) ======================
 
     def forward(
-            self,
-            x: torch.Tensor,  # (B, Pnn, D)
-            cross_c: torch.Tensor,  # (B, token_num, D)
-            y: torch.Tensor,  # (B, D)  = ego_fut_global + t_embedding
-            near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-            attn_mask: torch.Tensor,  # (B, Pnn) True=pad # near_current_mask
-            cross_mask: torch.Tensor,  # (B, token_num)   True=pad
+        self,
+        x: torch.Tensor,  # (B, Pnn, D)
+        cross_c: torch.Tensor,  # (B, token_num, D)
+        y: torch.Tensor,  # (B, D)  = ego_fut_global + t_embedding
+        near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+        attn_mask: torch.Tensor,  # (B, Pnn) True=pad # near_current_mask
+        cross_mask: torch.Tensor,  # (B, token_num)   True=pad
+        route_known_mask: Optional[torch.Tensor] = None  # (B, Pnn) True=known
     ) -> torch.Tensor:
         """
         순서:
@@ -559,9 +586,10 @@ class DiTBlock(nn.Module):
         # 1) 전역(B,D)
         # global_mods: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
         global_mods = self._compute_global_adaln(y)  # (B,D)×6
-        # 2) per-agent 잔차(B,P,D)
+        # 2) per-agent 잔차(B,P,D) 6개 (+선택적 마스킹 적용)
         route_residuals = self._compute_route_residual_adaln(
-            near_agents_route_lane_emb.to(x.dtype))  # (B,P,D)×6
+            near_agents_route_lane_emb.to(x.dtype),
+            route_known_mask=route_known_mask)  # (B,P,D)×6
         # 3) 결합(B,P,D)
         (shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa,
          gate_mlp_pa) = self._combine_global_and_route_modulations(
@@ -570,10 +598,10 @@ class DiTBlock(nn.Module):
         dtype = x.dtype
         shift_msa_pa = shift_msa_pa.to(dtype)
         scale_msa_pa = scale_msa_pa.to(dtype)
-        gate_msa_pa  = gate_msa_pa.to(dtype)
+        gate_msa_pa = gate_msa_pa.to(dtype)
         shift_mlp_pa = shift_mlp_pa.to(dtype)
         scale_mlp_pa = scale_mlp_pa.to(dtype)
-        gate_mlp_pa  = gate_mlp_pa.to(dtype)
+        gate_mlp_pa = gate_mlp_pa.to(dtype)
         # 4) Self‑Attention + MLP1 (per‑agent 모듈레이션)
         x = self._apply_modulated_self_attention(x, attn_mask, shift_msa_pa,
                                                  scale_msa_pa, gate_msa_pa)
