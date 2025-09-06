@@ -8,7 +8,7 @@ Categories:
     3. Numpy-Tensor transformation
 """
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
-import numpy as np
+from types import SimpleNamespace
 import torch
 from typing import Deque, Dict, List, Optional, Set, Type, Tuple
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex, AgentInternalIndex
@@ -22,8 +22,99 @@ from nuplan.common.actor_state.state_representation import Point2D
 import shapely.geometry as geom
 from shapely import affinity
 import math
+from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
+from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
+from typing import List, Optional, Union
+import numpy as np
+
+
+def get_neighbor_track_tokens(
+    present_tracked_objects: Union[object, List[object]],
+    neighbor_indices: Union[np.ndarray, List[int]],
+    agents_num: int,
+) -> List[Optional[str]]:
+    """현재 프레임의 트래킹 객체와 `neighbor_indices`를 이용해,
+    `neighbor_agents_past`에 최종 선정된 에이전트(agents_num)의 track token을 반환합니다.
+
+    이 함수는 `agent_past_process(...)`가 반환한 `neighbor_indices`의 **순서가
+    `neighbor_agents_past`의 0축(에이전트 축) 순서와 동일**하다는 가정하에 동작합니다.
+    각 인덱스는 현재 프레임의 트래킹 객체 리스트(또는 컨테이너)에서의 위치를 가리킵니다.
+
+    Args:
+        present_tracked_objects (Union[object, List[object]]):
+            - 현재 프레임의 트래킹 객체 모음.
+            - NuPlan의 `TrackedObjects` 컨테이너(속성 `.tracked_objects` 보유) 또는
+              `List[TrackedObject]` 형태 모두 지원합니다.
+            - 각 객체는 `track_token`(str) 속성을 갖는다고 가정합니다.
+        neighbor_indices (Union[np.ndarray, List[int]]):
+            - shape: (K,), K ≤ agents_num
+            - `agent_past_process`가 선택한 이웃 에이전트들의 **현재 프레임 인덱스** 배열.
+              길이가 `agents_num`보다 짧을 수 있으며, 이 경우 나머지는 `None`으로 채웁니다.
+        agents_num (int):
+            - `neighbor_agents_past`의 에이전트 축 크기(고정 개수).
+
+    Returns:
+        List[Optional[str]]:
+            - `neighbor_track_token`, 길이 = `agents_num`
+            - 각 원소는 선택된 에이전트의 `track_token`(str) 또는 매칭 불가 시 `None`.
+
+    Examples:
+        >>> # present_tracked_objects: TrackedObjects 컨테이너 혹은 List[TrackedObject]
+        >>> # neighbor_indices: np.array([5, 2, 0])  # 세 명만 실제 선택됨
+        >>> # agents_num = 5  # 패딩 포함 고정 크기
+        >>> tokens = get_neighbor_track_tokens(present_tracked_objects, neighbor_indices, agents_num)
+        >>> len(tokens)
+        5
+        >>> tokens[:3]   # 앞의 3개는 실제 선택된 에이전트 토큰
+        ['abc123', 'def456', 'ghi789']
+        >>> tokens[3:]   # 남는 두 개는 패딩: None
+        [None, None]
+    """
+    # 1) 현재 프레임의 객체 리스트 확보 (컨테이너/리스트 모두 지원)
+    if hasattr(present_tracked_objects, "tracked_objects"):
+        objects_list = list(
+            present_tracked_objects.tracked_objects)  # NuPlan 컨테이너
+    elif isinstance(present_tracked_objects, (list, tuple)):
+        objects_list = list(present_tracked_objects)  # 이미 리스트/튜플
+    else:
+        # 마지막 방어선: 이터러블이면 리스트로 변환, 아니면 빈 리스트
+        try:
+            objects_list = list(present_tracked_objects)
+        except TypeError:
+            objects_list = []
+
+    # 2) 현재 프레임 토큰 테이블 구성
+    present_tokens: List[Optional[str]] = []
+    for obj in objects_list:
+        token = getattr(obj, "track_token", None)
+        if token is None:
+            # 혹시 구현체에 따라 이름이 다를 수 있으므로 보조 키도 점검
+            token = getattr(obj, "token", None)
+        present_tokens.append(token)
+
+    # 3) neighbor_indices 정규화 (길이 K ≤ agents_num)
+    if neighbor_indices is None:
+        idx_array = np.empty((0,), dtype=int)
+    else:
+        idx_array = np.asarray(neighbor_indices).reshape(-1)
+        # 실수형으로 들어온 경우가 있어도 안전하게 정수 변환
+        idx_array = idx_array.astype(int, copy=False)
+
+    # 4) 에이전트 개수(agents_num)에 맞춰 토큰 리스트 생성 (부족분은 None 패딩)
+    neighbor_track_token: List[Optional[str]] = []
+    total_present = len(present_tokens)
+
+    for i in range(agents_num):
+        token_i: Optional[str] = None
+        if i < idx_array.shape[0]:
+            idx = int(idx_array[i])
+            if 0 <= idx < total_present:
+                token_i = present_tokens[idx]
+        neighbor_track_token.append(token_i)
+
+    return neighbor_track_token
 
 
 def get_directional_proximal_map_objects(
@@ -71,7 +162,7 @@ def get_directional_proximal_map_objects(
 
 def get_npc_route_roadblock_ids(
     scenario: NuPlanScenario,
-neighbor_track_token: List[Optional[str]],
+    neighbor_track_token: List[Optional[str]],
     radius: float = 100.,
     vehicle_num: int = 256,
 ) -> Dict[str, Optional[List[str]]]:
@@ -215,7 +306,6 @@ neighbor_track_token: List[Optional[str]],
     def _select_nearest_vehicle_tokens(ego_state: EgoState,
                                        detections: DetectionsTracks,
                                        candidates: Set[str],
-
                                        vehicle_num: int) -> Set[str]:
         """ego와의 거리 순서대로 최대 ``vehicle_num``개 차량 토큰 선택.
 
@@ -322,8 +412,18 @@ neighbor_track_token: List[Optional[str]],
                         roadblock_sequence.append(roadblock.id)
                 previous_roadblocks_set = current_roadblocks
 
-        token_to_route_roadblock_ids[
-            agent_token] = roadblock_sequence if roadblock_sequence else None
+        if roadblock_sequence:
+            start = agent_list[0]
+            npc_state = SimpleNamespace(rear_axle=StateSE2(
+                start.center.x, start.center.y, start.center.heading))
+            corrected_ids = route_roadblock_correction(
+                npc_state,
+                scenario.map_api,
+                roadblock_sequence,
+                remove_route_loops_flag=False)
+            token_to_route_roadblock_ids[agent_token] = corrected_ids
+        else:
+            token_to_route_roadblock_ids[agent_token] = None
     return token_to_route_roadblock_ids
 
 
