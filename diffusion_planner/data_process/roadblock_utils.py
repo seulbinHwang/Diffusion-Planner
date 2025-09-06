@@ -262,13 +262,43 @@ def route_roadblock_correction(
     remove_route_loops_flag: bool = True,
 ) -> List[str]:
     """
-    Applies several methods to correct route roadblocks.
-    :param ego_state: class containing ego state
-    :param map_api: map object
-    :param route_roadblocks_dict: dictionary of on-route roadblocks
-    :param search_depth_backward: depth of forward BFS search, defaults to 15
-    :param search_depth_forward:  depth of backward BFS search, defaults to 30
-    :return: list of roadblock id's of corrected route
+    지도상의 roadblock 그래프를 이용해 경로 roadblock ID 시퀀스를 '현실적인 연결성'을
+    갖도록 보정합니다. 시작점이 경로 밖인 경우 연결 경로를 앞에 붙이고, 경로 중간의
+    끊긴 부분은 BFS로 중간 노드를 삽입하며, 필요 시 끝부분 루프(자기 교차)는 제거합니다.
+
+    알고리즘 개요(세 가지 Fix):
+        Fix 1) 시작점 보정:
+            - 현재 차량이 올라탄 것으로 추정되는 roadblock(후보들)을 찾습니다.
+            - 현재 roadblock이 경로에 없다면,
+              · 역방향 BFS(시작=경로 첫 노드, 목표=시작 후보들, 깊이=search_depth_backward)로
+                연결 경로를 찾아 **앞에 붙임**. 실패 시
+              · 정방향 BFS(시작=현재 roadblock, 목표=경로 선두 몇 개, 깊이=search_depth_forward)로
+                닿은 지점 이전을 잘라내고 **앞에 붙임**.
+        Fix 2) 연결성 보강:
+            - 인접 노드 쌍 (i, i+1)에 대해 실제로 incoming 연결이 없으면,
+              정방향 BFS(깊이=search_depth_forward)로 중간 경로를 찾아
+              양 끝을 제외한 **중간 노드**들만 (i, i+1) 사이에 삽입.
+        Fix 3) 루프 제거(옵션):
+            - `remove_route_loops_flag=True`면, 교차 면적이 큰
+              roadblock connector를 만나기 전까지만 남기고 **뒤를 잘라냄**.
+
+    Args:
+        ego_state (EgoState): 보정 기준이 되는 현재 차량 상태(ego 또는 NPC 대용).
+        map_api (AbstractMap): 지도 API 핸들.
+        route_roadblock_ids (List[str]): 보정 전 route roadblock ID 시퀀스.
+        search_depth_backward (int): 역방향 BFS 최대 깊이.
+        search_depth_forward (int): 정방향 BFS 최대 깊이.
+        remove_route_loops_flag (bool): True면 끝부분 루프를 제거.
+
+    Returns:
+        List[str]: 보정된 route roadblock ID 시퀀스.
+
+    Notes:
+        - BFS는 깊이 제한으로 국소 탐색만 수행하므로 계산량이 제어됩니다.
+        - `_extract_near_agents`에서 NPC 경로 보정에 사용할 때는
+          `remove_route_loops_flag=False`로 호출하여 루프 제거를 생략합니다
+          (겹침 판정 등에 활용하기 위함).
+        - 시작 roadblock 추정은 헤딩/거리 임계값(π/4, 3m)과 1m 근방 후보 검색을 사용합니다.
     """
 
     route_roadblock_dict = {}

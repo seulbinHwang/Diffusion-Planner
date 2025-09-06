@@ -253,14 +253,30 @@ def _convert_lane_to_fixed_size(ego_pose, feature_coords, speed_limit,
 def _prune_route_by_connectivity(route_roadblock_ids: List[str],
                                  roadblock_ids: Set[str]) -> List[str]:
     """
-    Prune route by overlap with extracted roadblock elements within query radius to maintain connectivity in route
-    feature. Assumes route_roadblock_ids is ordered and connected to begin with.
-    :param route_roadblock_ids: List of roadblock ids representing route.
-    :param roadblock_ids: Set of ids of extracted roadblocks within query radius.
-    :return: List of pruned roadblock ids (connected and within query radius).
+    경로 시퀀스에서, 관측/반경 등으로 실제 유효하다고 판단되는 roadblock 집합
+    `roadblock_ids`에 '처음으로 진입'한 이후, '처음 끊기는 지점' 직전까지의
+    **연속 구간만** 남겨 반환합니다.
 
-    - roadblock_ids = pruned_lane_roadblock_ids: List[str]
-      - lane_routes 중, route_roadblock_ids 인 친구들
+    알고리즘 개요:
+        - `route_roadblock_ids`를 앞에서부터 훑으면서,
+          아직 유효 집합에 들어오지 않았다면 건너뜁니다.
+        - 유효 집합에 **처음 진입**하면 그때부터 수집을 시작합니다.
+        - 이후 유효 집합에 **없는 ID를 처음 만나면** 거기서 중단합니다.
+        - 결과적으로 "밖 → (진입) → 안(연속) → (탈출)에서 종료"의
+          **첫 연속 구간**만 남습니다.
+
+    Args:
+        route_roadblock_ids (List[str]): 원본 경로 roadblock ID 시퀀스(순서 보존).
+        roadblock_ids (Set[str]): 유효하다고 보는 roadblock ID 집합
+            (리스트로 들어와도 동작하지만, 성능/의도상 집합 사용을 권장).
+
+    Returns:
+        List[str]: 유효 집합 내의 **연속** 구간으로 잘라낸 route roadblock ID 시퀀스.
+
+    Notes:
+        - "안→밖→다시 안"처럼 여러 구간이 있을 때는 **첫 구간만** 반환합니다.
+        - 이어지는 후속 처리에서 `lane_routes`와의 포함 여부 마스크를 만들 때
+          연결성이 보장된 구간만 사용하도록 하기 위한 전처리 단계입니다.
     """
     pruned_route_roadblock_ids: List[str] = []
     route_start = False  # wait for route to come into query radius before declaring broken connection
@@ -318,61 +334,78 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
 
 def _compute_lane_on_npc_routes(
-        near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]],
-        near_token_to_raw_route_roadblock_ids: Dict[str, Optional[List[str]]],
-        lane_routes: List[str]) -> (List[List[bool]], List[List[bool]]):
-    """
-    lane_routes:List[str] : len = M (M = max_elements) (70게)
-        ego 거리 순으로 정렬되어 있음
+    near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]],
+    lane_routes: List[str],
+) -> List[List[bool]]:
+    """NPC 경로(보정/원본)가 현재 추출된 차선 목록(lane_routes)에 포함되는지 불리언 마스크로 반환합니다.
 
-    각 토큰별 npc 경로와 raw 경로에 대해 현재 lane_routes 포함 여부를
-    True/False 리스트로 반환한다.
-    또한 pruned route ids에 대해 _prune_route_by_connectivity로 연결성 기준 후처리를 수행
+    성능 최적화:
+        - `lane_routes` 및 NPC 경로를 집합(set)으로 변환해 멤버십 체크를 상수 시간으로 수행합니다.
+          (NPC당 O(M)으로 감소; M은 `len(lane_routes)`)
+
+    알고리즘 개요:
+        1) `lane_routes`를 집합(`lane_routes_set`)으로 변환합니다.
+        2) 각 NPC(토큰)별로:
+           - 보정 경로가 없다면 길이 M의 False 리스트 2개(보정/원본)를 생성합니다.
+           - 보정 경로가 있다면:
+             a) `lane_routes_set`에 실제 존재하는 ID만 필터링(집합)합니다.
+             b) `_prune_route_by_connectivity`로 **연속 구간**만 남깁니다(리스트 반환).
+             c) (b) 결과를 집합으로 바꾸고, `lane_routes` 순서에 맞춰 불리언 마스크를 만듭니다.
+             d) 원본 경로는 현재 구현상 연결성 보정 없이, 집합 멤버십으로만 마스크를 만듭니다.
+
+    Args:
+        near_token_to_route_roadblock_ids (Dict[str, Optional[List[str]]]):
+            토큰 → **보정된** route roadblock ID 리스트(또는 None).
+        lane_routes (List[str]):
+            길이 M의 roadblock ID 리스트. 현재 프레임에서 추출된 차선들에 해당하며
+            **Ego와의 거리 가까운 순**이 반영된 순서를 가집니다.
 
     Returns:
-        lane_on_npc_routes : List[List[bool]]
-        lane_on_raw_npc_routes : List[List[bool]]
-            - 전부 ego와의 거리 순서로 정렬되어 있음
-            - 각 요소 List[bool] 의 길이는  len = M (M = max_elements) (70게)
+        - lane_on_npc_routes: List[List[bool]] (shape: (n, M))
+          각 NPC × 각 차선에 대해, 해당 차선이 **보정 경로**에 포함되면 True.
+
+    Notes:
+        - n: '근처'로 선별된 NPC 수, M: 추출된 차선 수(`len(lane_routes)`).
+        - 원본/보정 결과가 다를 수 있습니다(현재 원본에는 연결성 보정 미적용).
+          동일 정책을 원하면 원본에도 `_prune_route_by_connectivity`를 적용하세요.
+        - 반환 리스트에서 NPC의 순서는 상위 단계(dict 삽입 순서)에 따릅니다.
     """
     lane_on_npc_routes: List[List[bool]] = []
     lane_on_raw_npc_routes: List[List[bool]] = []
 
+    # 집합으로 변환하여 멤버십 체크 비용을 상수화
+    lane_routes_set: Set[str] = set(lane_routes)
+
     for token, npc_route_ids in near_token_to_route_roadblock_ids.items():
-        # npc_route_ids: Optional[List[str]]
-        # len = M (M = max_elements) (70게)
-        npc_lane_on_route: List[bool] = []
-        npc_lane_on_raw_route: List[bool] = []
-        raw_ids = near_token_to_raw_route_roadblock_ids.get(token)
-
+        # npc_route_ids: Optional[List[str]] (None 가능)
         if npc_route_ids is None:
-            for _ in lane_routes:
-                npc_lane_on_route.append(False)
-                npc_lane_on_raw_route.append(False)
+            # 보정/원본 모두 False 마스크
+            npc_lane_on_route = [False] * len(lane_routes)
         else:
-            # lane_routes에 포함되는 경로 id 선별
-            pruned_route_ids = [r for r in npc_route_ids if r in lane_routes]
-            pruned_route_ids = _prune_route_by_connectivity(
-                npc_route_ids, pruned_route_ids)
-            # raw 경로도 동일하게 필터링
-            pruned_raw_ids = [r for r in raw_ids if r in lane_routes
-                             ] if raw_ids else []
+            # (1) 보정 경로: lane_routes에 실제 존재하는 후보만 set으로 필터
+            candidate_ids_in_lane: Set[str] = {
+                rid for rid in npc_route_ids if rid in lane_routes_set
+            }
+            # (2) 연결성 보정: 연속 구간만 리스트로 반환
+            pruned_route_ids_list: List[str] = _prune_route_by_connectivity(
+                npc_route_ids, candidate_ids_in_lane)
+            pruned_route_ids_set: Set[str] = set(pruned_route_ids_list)
 
-            for route in lane_routes:
-                npc_lane_on_route.append(route in pruned_route_ids)
-                npc_lane_on_raw_route.append(route in pruned_raw_ids)
+            # (4) lane_routes 순서에 맞춰 불리언 마스크 생성(O(M))
+            npc_lane_on_route = [
+                route in pruned_route_ids_set for route in lane_routes
+            ]
 
         lane_on_npc_routes.append(npc_lane_on_route)
-        lane_on_raw_npc_routes.append(npc_lane_on_raw_route)
 
-    return lane_on_npc_routes, lane_on_raw_npc_routes
+    return lane_on_npc_routes
 
 
 def _extract_npc_route_lanes(
     near_agents_current: np.ndarray, lane_on_npc_routes: List[List[bool]],
     vector_map_lanes: np.ndarray, lane_speed_limit_array: np.ndarray,
     lane_has_speed_limit_array: np.ndarray, max_route_lanes: int
-) -> (List[np.ndarray], List[np.ndarray], List[np.ndarray]):
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
     """
     near_agents_current: (n, 11) # n 은 최대 10
     lane_on_npc_routes : List[List[bool]]
@@ -401,60 +434,47 @@ def _extract_npc_route_lanes(
     npc_route_lanes_speed_limit: List[np.ndarray] = []
     npc_route_lanes_has_speed_limit: List[np.ndarray] = []
 
-    for near_agent_current, lane_on_a_npc_routes in zip(
-        near_agents_current,
-        lane_on_npc_routes
-    ):
+    for near_agent_current, lane_on_a_npc_routes in zip(near_agents_current,
+                                                        lane_on_npc_routes):
         # 1) 에이전트 상태 재형성
         near_agent_current = near_agent_current[None]  # (1, 11)
         # 2) (x,y) 좌표만 추출
         vector_map_lanes_xy = vector_map_lanes[:, :, :2]  # (M, P, 2)
         # 3) 거리 계산 및 최소값 정렬
-        vector_map_lanes_norm_dist = np.linalg.norm(
-            vector_map_lanes_xy - near_agent_current[:, :2],
-            axis=-1
-        )  # (M, P)
-        vector_map_lanes_min_dist = np.min(
-            vector_map_lanes_norm_dist,
-            axis=-1
-        )  # (M,)
+        vector_map_lanes_norm_dist = np.linalg.norm(vector_map_lanes_xy -
+                                                    near_agent_current[:, :2],
+                                                    axis=-1)  # (M, P)
+        vector_map_lanes_min_dist = np.min(vector_map_lanes_norm_dist,
+                                           axis=-1)  # (M,)
         vector_map_lanes_min_dist_order = np.argsort(
-            vector_map_lanes_min_dist
-        )  # (M,)
+            vector_map_lanes_min_dist)  # (M,)
         # 4) 가장 가까운 순서대로 lanes 재정렬
         a_npc_ordered_vector_map_lanes = vector_map_lanes[
-            vector_map_lanes_min_dist_order
-        ]  # (M, P, D)
+            vector_map_lanes_min_dist_order]  # (M, P, D)
         # 5) lane_on flags도 같은 순서로 재정렬
-        lane_on_a_npc_routes = np.array(
-            lane_on_a_npc_routes
-        )[vector_map_lanes_min_dist_order]  # (M,)
+        lane_on_a_npc_routes = np.array(lane_on_a_npc_routes)[
+            vector_map_lanes_min_dist_order]  # (M,)
 
         # 6) 결과 배열 초기화
         vector_map_a_npc_route_lanes = np.zeros(
-            (
-                max_route_lanes,
-                vector_map_lanes.shape[-2],
-                vector_map_lanes.shape[-1]
-            ),
-            dtype=np.float32
-        )  # (max, P, D)
-        a_npc_route_lanes_speed_limit = np.zeros(
-            (max_route_lanes, 1),
-            dtype=np.float32
-        )
-        a_npc_route_lanes_has_speed_limit = np.zeros(
-            (max_route_lanes, 1),
-            dtype=np.bool_
-        )
+            (max_route_lanes, vector_map_lanes.shape[-2],
+             vector_map_lanes.shape[-1]),
+            dtype=np.float32)  # (max, P, D)
+        a_npc_route_lanes_speed_limit = np.zeros((max_route_lanes, 1),
+                                                 dtype=np.float32)
+        a_npc_route_lanes_has_speed_limit = np.zeros((max_route_lanes, 1),
+                                                     dtype=np.bool_)
         # 7) 조건에 맞는 차선만 추출
         loc = 0
         if lane_on_a_npc_routes is not None:
             for i in range(len(lane_on_a_npc_routes)):
                 if lane_on_a_npc_routes[i] == True:
-                    vector_map_a_npc_route_lanes[loc] = a_npc_ordered_vector_map_lanes[i]
-                    a_npc_route_lanes_speed_limit[loc] = lane_speed_limit_array[i]
-                    a_npc_route_lanes_has_speed_limit[loc] = lane_has_speed_limit_array[i]
+                    vector_map_a_npc_route_lanes[
+                        loc] = a_npc_ordered_vector_map_lanes[i]
+                    a_npc_route_lanes_speed_limit[loc] = lane_speed_limit_array[
+                        i]
+                    a_npc_route_lanes_has_speed_limit[
+                        loc] = lane_has_speed_limit_array[i]
                     loc += 1
                 if loc == max_route_lanes:
                     break
@@ -462,13 +482,12 @@ def _extract_npc_route_lanes(
         # 8) 리스트에 추가
         vector_map_npc_route_lanes.append(vector_map_a_npc_route_lanes)
         npc_route_lanes_speed_limit.append(a_npc_route_lanes_speed_limit)
-        npc_route_lanes_has_speed_limit.append(a_npc_route_lanes_has_speed_limit)
+        npc_route_lanes_has_speed_limit.append(
+            a_npc_route_lanes_has_speed_limit)
 
-    return (
-        vector_map_npc_route_lanes,
-        npc_route_lanes_speed_limit,
-        npc_route_lanes_has_speed_limit
-    )
+    return (vector_map_npc_route_lanes, npc_route_lanes_speed_limit,
+            npc_route_lanes_has_speed_limit)
+
 
 def map_process(
         route_roadblock_ids,
@@ -569,10 +588,9 @@ def map_process(
 
                 for route in lane_routes:
                     lane_on_route.append(route in pruned_route_roadblock_ids)
-                lane_on_npc_routes, lane_on_raw_npc_routes = \
+                lane_on_npc_routes = \
                     _compute_lane_on_npc_routes(
                         near_token_to_route_roadblock_ids,
-                        near_token_to_raw_route_roadblock_ids,
                         lane_routes
                     )
             elif feature_name == 'LEFT_BOUNDARY' or feature_name == 'RIGHT_BOUNDARY':

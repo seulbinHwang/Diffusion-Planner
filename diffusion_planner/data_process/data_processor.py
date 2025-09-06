@@ -1,10 +1,10 @@
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple, Deque
 import numpy as np
 from tqdm import tqdm
 from types import SimpleNamespace
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.state_representation import Point2D
-
+from nuplan.planning.simulation.observation.observation_type import Observation
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from diffusion_planner.data_process.agent_process import (
     agent_past_process, sampled_tracked_objects_to_array_list,
@@ -56,19 +56,50 @@ class DataProcessor(object):
         }  # maximum number of points per feature to extract per feature layer.
 
     def _extract_near_agents(
-        self, agents_token: List[Optional[str]], observation_buffer,
-        npc_route_roadblock_ids: Dict[str, Optional[List[str]]],
-        neighbor_agents_current: np.ndarray, map_api: AbstractMap, ego_x: float,
+        self,
+        agents_token: List[Optional[str]],  # 추적 토큰 목록. 길이 최대 M(예: 32).
+        observation_buffer: Deque[Observation],  #  과거~현재 관측 버퍼. 마지막 원소
+        npc_route_roadblock_ids: Dict[
+            str, Optional[List[str]]],  #  토큰별 **원본** route roadblock ID 리스트
+        neighbor_agents_current: np.ndarray,  # (M, 11) #  이웃 후보의 현재 상태
+        map_api: AbstractMap,
+        ego_x: float,
         ego_y: float
-    ) -> (Dict[str, Optional[List[str]]], Dict[str, Optional[List[str]]],
-          np.ndarray, List[str]):
+    ) -> Tuple[Dict[str, Optional[List[str]]], np.ndarray, List[str]]:
         """
-        tokens_to_position_ego 처리 후, 반경 내 NPC 에이전트에 대해
-        raw/보정된 route_roadblock_ids와 현재 상태, 토큰 리스트를 반환합니다.
+        Returns:
+                - near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]],
+                    토큰 → **보정된** route roadblock ID 리스트(또는 None).
+                - near_agents_current (np.ndarray): shape=(n, 11). np.ndarray,
+                    선별된 '근처' NPC들의 현재 상태 벡터(ego 좌표계).
+                    여기서 n ≤ `self.predicted_neighbor_num`.
+                - near_agent_tokens (List[str]): 길이 n. 위 상태 벡터 행과 1:1 대응되는 토큰 순서.
+
+        Ego 주변의 '근처' NPC만 선별하여, 각 NPC의 (원본/보정) route roadblock ID와
+        현재 상태 벡터를 정리해 반환합니다. 보정은 지도 그래프 기반의
+        `route_roadblock_correction`을 사용합니다.
+
+        알고리즘 개요:
+            1) `agents_token` 순서대로 최대 `self.predicted_neighbor_num`개까지 검사합니다.
+            2) 현재 프레임(`observation_buffer[-1]`)에서 동일 토큰의 객체를 찾습니다.
+            3) Ego 중심 (ego_x, ego_y)을 기준으로, |dx| ≤ R/2, |dy| ≤ R/2 인
+               **정사각형 박스**(R=`self._radius`) 내에 있는 NPC만 '근처'로 채택합니다.
+            4) 채택된 NPC에 대해:
+               - 원본 경로 ID 리스트를 저장하고,
+               - (x, y, heading)으로 간이 상태를 만들어
+                 `route_roadblock_correction(..., remove_route_loops_flag=False)`로
+                 **보정된 경로 ID 리스트**를 얻습니다.
+               - NPC의 현재 상태 벡터(ego 기준)를 누적합니다.
+            5) 보정/원본 경로 dict, 상태 배열, 토큰 리스트를 반환합니다.
+
+
+        Notes:
+            - 거리 필터는 원형이 아니라 **정사각형 박스(|dx|, |dy| 기준)** 를 사용합니다.
+            - 반환되는 `near_agents_current`와 `near_agent_tokens`의 순서는
+              상호 대응되며, 상위 처리에서의 dict 삽입 순서를 통해 일관성이 유지됩니다.
+            - 보정 시 `remove_route_loops_flag=False`로 호출하여 루프 제거는 건너뜁니다.
         """
         near_token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
-        near_token_to_raw_route_roadblock_ids: Dict[str,
-                                                    Optional[List[str]]] = {}
         near_agents_current = []
         near_agent_tokens: List[str] = []
         near_agents_count = 0
@@ -92,11 +123,8 @@ class DataProcessor(object):
             # raw vs 보정 route 가져오기
             a_npc_route_roadblock_ids = npc_route_roadblock_ids.get(token)
             if a_npc_route_roadblock_ids is None:
-                near_token_to_raw_route_roadblock_ids[token] = None
                 near_token_to_route_roadblock_ids[token] = None
             else:
-                near_token_to_raw_route_roadblock_ids[
-                    token] = a_npc_route_roadblock_ids
                 point = StateSE2(obj.center.x, obj.center.y, obj.center.heading)
                 npc_state = SimpleNamespace(rear_axle=point)
                 near_token_to_route_roadblock_ids[
@@ -113,8 +141,7 @@ class DataProcessor(object):
         # TODO: near_agents_count 가 무조건 self.predicted_neighbor_num 와
         #  같아야 하는지 확인 필요
         near_agents_current = np.array(near_agents_current)
-        return (near_token_to_route_roadblock_ids,
-                near_token_to_raw_route_roadblock_ids, near_agents_current,
+        return (near_token_to_route_roadblock_ids, near_agents_current,
                 near_agent_tokens)
 
     # Use for inference
