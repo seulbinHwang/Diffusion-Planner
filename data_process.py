@@ -3,7 +3,7 @@ import argparse
 import json
 import numpy as np
 from tqdm import tqdm
-from typing import Any, Tuple, Dict
+from typing import Any, Tuple, Dict, List
 import sqlite3
 from pathlib import Path
 
@@ -392,7 +392,7 @@ if __name__ == "__main__":
                         help='number of route lanes')
     # ────── WandB 옵션 추가 ──────
     parser.add_argument('--use_wandb', default=False, type=boolean)
-    parser.add_argument('--save_image', default=False, type=boolean)
+    parser.add_argument('--save_image', default=True, type=boolean)
 
     parser.add_argument('--wandb_project',
                         type=str,
@@ -467,7 +467,7 @@ if __name__ == "__main__":
         args.scenarios_per_type,
         args.total_scenarios,
         args.shuffle_scenarios,
-        log_names=log_names  # 깨진 로그가 빠진 목록
+        log_names=None,#log_names  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
     loader_pool = SingleMachineParallelExecutor(

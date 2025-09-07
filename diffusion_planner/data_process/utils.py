@@ -31,7 +31,13 @@ from shapely import affinity
 from nuplan.common.maps.abstract_map import AbstractMap, MapObject
 from nuplan.common.maps.abstract_map import SemanticMapLayer
 from nuplan.common.actor_state.state_representation import Point2D
-
+from typing import Set
+import math
+from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.planning.simulation.observation.observation_type import \
+    DetectionsTracks
+from nuplan.common.actor_state.tracked_objects_types import \
+    TrackedObjectType
 
 def _map_object_to_geometry(obj: MapObject) -> Optional[geom.base.BaseGeometry]:
     """MapObject로부터 Shapely 기하를 얻는다.
@@ -202,7 +208,7 @@ def build_agent_route_lane_order(
 
 def _select_token_and_ordered_npc_route_indices(
     token_to_lane_on_routes: Dict[str, List[bool]],  # 길이 == agent_num (키 개수)
-    neighbor_agent_tokens: List[Optional[str]],  # 길이 == agent_num, ego와 가까운 순서
+    neighbor_track_token: List[Optional[str]],  # 길이 == agent_num, ego와 가까운 순서
     neighbor_agents_current: np.ndarray,  # shape: (agent_num, 11), ego와 가까운 순서
     vector_map_lanes: np.ndarray,  # shape: (lane_num, P, D), 좌표는 [:, :, :2]
     max_route_lanes: int,
@@ -211,8 +217,8 @@ def _select_token_and_ordered_npc_route_indices(
     에이전트(이웃) 순서(이미 ego와 가까운 순)대로 `npc_route_indices`를 생성합니다.
 
     설계 가정:
-    - `token_to_lane_on_routes`, `neighbor_agent_tokens`, `neighbor_agents_current`의 길이는 모두 `agent_num`으로 동일합니다.
-    - `neighbor_agent_tokens`와 `neighbor_agents_current`는 **ego와 가까운 순서**로 이미 정렬되어 있습니다.
+    - `token_to_lane_on_routes`, `neighbor_track_token`, `neighbor_agents_current`의 길이는 모두 `agent_num`으로 동일합니다.
+    - `neighbor_track_token`와 `neighbor_agents_current`는 **ego와 가까운 순서**로 이미 정렬되어 있습니다.
     - `max_route_lanes < lane_num`이 보장됩니다.
 
     선택 기준(각 에이전트 i에 대해):
@@ -223,7 +229,7 @@ def _select_token_and_ordered_npc_route_indices(
         token_to_lane_on_routes (Dict[str, List[bool]]):
             - 키: 에이전트 토큰(str) — 총 키 개수 == agent_num
             - 값: 길이 `lane_num`의 불리언 리스트 (해당 차선이 NPC 경로 위인지)
-        neighbor_agent_tokens (List[Optional[str]]): 길이 `agent_num`. 에이전트 토큰(없을 수 있어 None).
+        neighbor_track_token (List[Optional[str]]): 길이 `agent_num`. 에이전트 토큰(없을 수 있어 None).
         neighbor_agents_current (np.ndarray): shape=(agent_num, 11). 거리 계산에 x=[:,0], y=[:,1] 사용.
         vector_map_lanes (np.ndarray): shape=(lane_num, P, D). 거리 계산에 좌표 성분 [:, :, :2] 사용.
         max_route_lanes (int): NPC 당 최대 선택할 차선 개수. (항상 lane_num보다 작음)
@@ -247,9 +253,9 @@ def _select_token_and_ordered_npc_route_indices(
     agent_num = neighbor_agents_current.shape[0]
     lane_num = int(vector_map_lanes.shape[0])
 
-    if len(neighbor_agent_tokens) != agent_num:
+    if len(neighbor_track_token) != agent_num:
         raise ValueError(
-            "`neighbor_agent_tokens` 길이와 `neighbor_agents_current`의 첫 축 크기가 다릅니다."
+            "`neighbor_track_token` 길이와 `neighbor_agents_current`의 첫 축 크기가 다릅니다."
         )
     if vector_map_lanes.ndim != 3 or vector_map_lanes.shape[2] < 2:
         raise ValueError(
@@ -273,9 +279,12 @@ def _select_token_and_ordered_npc_route_indices(
 
     # --- 에이전트(이미 ego 근접 순) 순회 ---
     for agent_idx in range(agent_num):
-        token = neighbor_agent_tokens[agent_idx]
+        token = neighbor_track_token[agent_idx]
+        if token is None:
+            continue
 
         # 마스크 획득 (없으면 전부 False로 처리)
+        ###############################
         lane_on_routes = token_to_lane_on_routes[
             token]  # (Dict[str, List[bool]]):
         # lane_on_routes: List[bool], 길이 == lane_num
@@ -513,13 +522,7 @@ def get_npc_route_roadblock_ids(
                 Point(pt.x, pt.y).distance(polygon) for pt in trajectory_points
             ]))
 
-    from typing import Set
-    import math
-    from nuplan.common.actor_state.ego_state import EgoState
-    from nuplan.planning.simulation.observation.observation_type import \
-        DetectionsTracks
-    from nuplan.common.actor_state.tracked_objects_types import \
-        TrackedObjectType
+
 
     def _filter_vehicle_tokens_in_square(
         ego_state: EgoState,
@@ -588,9 +591,11 @@ def get_npc_route_roadblock_ids(
     # 3) ego와의 거리 순으로 상위 vehicle_num개만 선택
 
     ##########
-    total_horizon_s = (
-        scenario.get_time_point(scenario.get_number_of_iterations() - 1).time_s
-        - scenario.get_time_point(0).time_s)
+    # a = scenario.get_time_point(scenario.get_number_of_iterations() - 1).time_s
+    # b = scenario.get_time_point(0).time_s
+    # total_horizon_s = a - b
+    # print("a:", a, "b:", b, "total_horizon_s:", total_horizon_s)
+    total_horizon_s = 8.
     for det_batch in scenario.get_future_tracked_objects(0, total_horizon_s):
         for det in det_batch.tracked_objects:
             if det.tracked_object_type == TrackedObjectType.VEHICLE and (
