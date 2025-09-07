@@ -19,7 +19,6 @@ from datetime import datetime
 import json
 import os
 from scenario_utils import get_or_load_scenarios  # 새 유틸리티 함수
-
 """
 <DB에서 처음 추출 + 캐시 저장>
 python preprocess.py \
@@ -31,6 +30,104 @@ python preprocess.py \
   --scenarios_cache_in my_scenarios.pkl
 
 """
+# data_process.py (상단 import 아래 어울리는 곳)
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import json
+
+
+def _load_all_sample_stats(save_dir: str) -> Dict[str, List[float]]:
+    """save_path 안의 *.stats.json 사이드카를 모두 읽어 리스트로 병합한다.
+
+    Returns:
+        Dict[str, List[float]]:
+            {
+              "vehicle_count": [...],
+              "pedestrian_count": [...],
+              "bicycle_count": [...],
+              "lane_speed_limit_ratio_percent": [...],
+              "mean_speed_limit_kmh": [...],  # None/결측 제외
+            }
+    """
+    vehicle, ped, bike = [], [], []
+    ratio_pct, mean_kmh = [], []
+    for name in os.listdir(save_dir):
+        if not name.endswith(".stats.json"):
+            continue
+        path = os.path.join(save_dir, name)
+        try:
+            with open(path, "r") as f:
+                d = json.load(f)
+            vehicle.append(int(d.get("vehicle_count", 0)))
+            ped.append(int(d.get("pedestrian_count", 0)))
+            bike.append(int(d.get("bicycle_count", 0)))
+            ratio = float(d.get("lane_speed_limit_ratio_percent", 0.0))
+            ratio_pct.append(ratio)
+            mk = d.get("mean_speed_limit_kmh", None)
+            if mk is not None:
+                mean_kmh.append(float(mk))
+        except Exception as e:
+            print(f"[Warn] stats load error: {name} ({e})")
+            continue
+
+    return {
+        "vehicle_count": vehicle,
+        "pedestrian_count": ped,
+        "bicycle_count": bike,
+        "lane_speed_limit_ratio_percent": ratio_pct,
+        "mean_speed_limit_kmh": mean_kmh,
+    }
+
+
+def _plot_and_save_histograms(
+    stats: Dict[str, List[float]],
+    out_path: str,
+    title_prefix: str = "Dataset Statistics",
+) -> None:
+    """수집된 리스트로 5개 히스토그램을 그리고 하나의 PNG로 저장한다."""
+    # 5개 subplot (3x2 레이아웃; 마지막 한 칸은 비워둠)
+    fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    axes = axes.ravel()
+
+    def _hist(ax, data, title, xlabel, bins="auto"):
+        if len(data) == 0:
+            ax.text(0.5, 0.5, "No Data", ha="center", va="center")
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("Count")
+            return
+        ax.hist(data, bins=bins)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Count")
+        ax.grid(True, alpha=0.3)
+
+    _hist(axes[0], stats["vehicle_count"], f"{title_prefix}: Vehicles / sample",
+          "Vehicles per sample")
+    _hist(axes[1], stats["pedestrian_count"],
+          f"{title_prefix}: Pedestrians / sample", "Pedestrians per sample")
+    _hist(axes[2], stats["bicycle_count"], f"{title_prefix}: Bicycles / sample",
+          "Bicycles per sample")
+    _hist(axes[3],
+          stats["lane_speed_limit_ratio_percent"],
+          f"{title_prefix}: % Lanes with speed limit",
+          "% (per sample)",
+          bins=20)
+    _hist(axes[4],
+          stats["mean_speed_limit_kmh"],
+          f"{title_prefix}: Mean speed limit (km/h) on limited lanes",
+          "km/h",
+          bins=20)
+
+    # 마지막 subplot 비우기
+    axes[5].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
 
 def available_cpu_count() -> int:
     """
@@ -42,20 +139,23 @@ def available_cpu_count() -> int:
     try:
         return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
         print(f"Available CPUs: {return_}")  # 디버그용
-        return return_       # cgroup cpuset 존중
+        return return_  # cgroup cpuset 존중
     except AttributeError:
         print("Using os.cpu_count() as fallback for CPU count.")
         return_ = os.cpu_count()  # 전체 CPU 개수
         print(f"Total CPUs: {return_}")  # 디버그용
-        return return_ or 1                 # 최소 1
+        return return_ or 1  # 최소 1
+
 
 import shutil
-_PROCESSOR = None          # 워커‑프로세스 전역 캐시
-_CFG_NS    = None          # cfg 를 다시 만들지 않도록 캐시
+
+_PROCESSOR = None  # 워커‑프로세스 전역 캐시
+_CFG_NS = None  # cfg 를 다시 만들지 않도록 캐시
+
 
 def run_scenario(
-    scn,                    # NuPlan 시나리오 객체   (executor.map 의 1st iterable)
-    cfg_dict: Dict          # config 를 dict 로 직렬화한 것 (2nd iterable)
+    scn,  # NuPlan 시나리오 객체   (executor.map 의 1st iterable)
+    cfg_dict: Dict  # config 를 dict 로 직렬화한 것 (2nd iterable)
 ) -> None:
     """
     • 각 워커 프로세스에서 여러 번 호출된다.
@@ -69,10 +169,10 @@ def run_scenario(
         _CFG_NS = argparse.Namespace(**cfg_dict)
         _PROCESSOR = DataProcessor(_CFG_NS)
 
-    cfg = _CFG_NS          # 가독성용 얼라이어스
+    cfg = _CFG_NS  # 가독성용 얼라이어스
 
     # ── 1) 저장 파일 경로 ──────────────────────────────────────
-    file_name      = f"{scn._map_name}_{scn.token}.npz"
+    file_name = f"{scn._map_name}_{scn.token}.npz"
     final_filepath = os.path.join(cfg.save_path, file_name)
 
     try:
@@ -80,7 +180,8 @@ def run_scenario(
         _PROCESSOR.work([scn])
 
         # ── 3) 생성된 파일 무결성 체크 ────────────────────────
-        if os.path.exists(final_filepath) and os.path.getsize(final_filepath) == 0:
+        if os.path.exists(final_filepath) and os.path.getsize(
+                final_filepath) == 0:
             os.remove(final_filepath)
             raise RuntimeError(f"{file_name}: 파일이 비어 있습니다.")
 
@@ -90,9 +191,12 @@ def run_scenario(
             os.remove(final_filepath)
         raise
 
+
 # ─── 1단계: 필요한 모듈 import 및 원본 함수 백업 ───
 import nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_filter_utils as sf
-_ORIG_GET = sf.get_scenarios_from_log_file   # 원본 함수
+
+_ORIG_GET = sf.get_scenarios_from_log_file  # 원본 함수
+
 
 # ─── 2단계: Top-level 래퍼 함수 정의 (Pickle 가능) ───
 def safe_get_scenarios_from_log_file(params):
@@ -102,6 +206,7 @@ def safe_get_scenarios_from_log_file(params):
       • 또는 그 객체들의 list (worker_map이 chunking해서 넘김)
     반환: List[ScenarioDict]  ← 원본 함수와 동일
     """
+
     def _call_orig(param_list):
         # _ORIG_GET은 "list"를 받아서 "List[ScenarioDict]"를 반환
         return _ORIG_GET(param_list)
@@ -118,7 +223,7 @@ def safe_get_scenarios_from_log_file(params):
         merged: list = []
         for p in param_list:
             try:
-                merged.extend(_call_orig([p]))   # 성공하면 그대로 추가
+                merged.extend(_call_orig([p]))  # 성공하면 그대로 추가
             except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
                 db_path = p.log_file_absolute_path
                 print(f"[Warning] Skip corrupt DB: {db_path}\n         └─ {e}")
@@ -126,7 +231,8 @@ def safe_get_scenarios_from_log_file(params):
                 # data_root 경로는 params 안에 이미 들어 있음
                 bad_db_path = Path(p.data_root) / "bad_db.json"
                 try:
-                    bad_list = json.loads(bad_db_path.read_text()) if bad_db_path.exists() else []
+                    bad_list = json.loads(bad_db_path.read_text()
+                                         ) if bad_db_path.exists() else []
                     bad_list.append(db_path)
                     bad_db_path.write_text(json.dumps(bad_list, indent=2))
                 except Exception as io_err:
@@ -140,6 +246,7 @@ sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
 
 # 이미 함수 핸들이 캐시된 모듈에도 덮어쓰기
 import nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder as sb
+
 sb.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
 
 
@@ -222,13 +329,13 @@ if __name__ == "__main__":
     parser.add_argument(
         '--scenarios_cache_in',  # 2) 불러올 파일
         type=str,
-        default='scenarios_cache.pkl', #None,
+        default='scenarios_cache.pkl',  #None,
         help='미리 저장해둔 시나리오 *.pkl 경로 (지정 시 DB 로딩 건너뜀)',
     )
     parser.add_argument(
         '--scenarios_cache_out',  # 1) 저장할 파일
         type=str,
-        default=None,#'scenarios_cache.pkl',
+        default=None,  #'scenarios_cache.pkl',
         help='새로 추출한 시나리오를 저장할 *.pkl 경로',
     )
     parser.add_argument('--data_path',
@@ -283,18 +390,22 @@ if __name__ == "__main__":
                         type=int,
                         default=25,
                         help='number of route lanes')
-      # ────── WandB 옵션 추가 ──────
+    # ────── WandB 옵션 추가 ──────
     parser.add_argument('--use_wandb', default=False, type=boolean)
     parser.add_argument('--save_image', default=False, type=boolean)
 
-    parser.add_argument('--wandb_project', type=str,
-                         default='Diffusion-Planner', help='wandb project')
-    parser.add_argument('--wandb_entity', type=str, default=None,
-                         help='wandb entity (team or user)')
+    parser.add_argument('--wandb_project',
+                        type=str,
+                        default='Diffusion-Planner',
+                        help='wandb project')
+    parser.add_argument('--wandb_entity',
+                        type=str,
+                        default=None,
+                        help='wandb entity (team or user)')
     parser.add_argument('--name',
                         type=str,
                         help='log name (default: "diffusion-planner-training")',
-                        default="test_0727") # npc_current_state_aug_0.5
+                        default="test_0727")  # npc_current_state_aug_0.5
     # (인자 정의는 동일)
     args = parser.parse_args()
     sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
@@ -302,9 +413,9 @@ if __name__ == "__main__":
         os.environ["WANDB_MODE"] = "online" if args.use_wandb else "offline"
         ctrl_run = wandb.init(
             project=args.wandb_project,
-            name = args.name,
-            entity = args.wandb_entity,
-            settings = wandb.Settings(start_method="fork"),
+            name=args.name,
+            entity=args.wandb_entity,
+            settings=wandb.Settings(start_method="fork"),
         )
     else:
         ctrl_run = None
@@ -359,7 +470,8 @@ if __name__ == "__main__":
         log_names=log_names  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
-    loader_pool = SingleMachineParallelExecutor(use_process_pool=False, max_workers=available_cpu_count())
+    loader_pool = SingleMachineParallelExecutor(
+        use_process_pool=False, max_workers=available_cpu_count())
     scenarios = get_or_load_scenarios(
         builder=builder,
         scenario_filter=scenario_filter,
@@ -372,23 +484,19 @@ if __name__ == "__main__":
     print(f"Total scenarios: {len(scenarios)}")
     loader_pool._executor.shutdown(wait=True)
 
-
-    proc_pool = SingleMachineParallelExecutor(use_process_pool=True, max_workers=available_cpu_count())
+    proc_pool = SingleMachineParallelExecutor(use_process_pool=True,
+                                              max_workers=available_cpu_count())
 
     #######
     # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
     print(f"processed: {len(processed)}")
     # 6-1) ID → 시나리오 객체 매핑
-    scenario_id_map = {
-        f"{s._map_name}_{s.token}": s
-        for s in scenarios
-    }
+    scenario_id_map = {f"{s._map_name}_{s.token}": s for s in scenarios}
     # 6-2) processed와 차집합 연산
     remaining_ids = scenario_id_map.keys() - processed
     # 6-3) 최종 리스트
     remaining = [scenario_id_map[token] for token in remaining_ids]
     print(f"Remaining to process: {len(remaining)}")
-
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
     if remaining:
@@ -419,3 +527,9 @@ if __name__ == "__main__":
     with open('./diffusion_planner_training.json', 'w') as jf:
         json.dump(npz_files, jf, indent=4)
     print(f"Saved {len(npz_files)} .npz file names")
+
+    # 집계 & 히스토그램 저장
+    stats = _load_all_sample_stats(args.save_path)
+    hist_png = os.path.join(args.save_path, "dataset_statistics_histograms.png")
+    _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-Planner")
+    print(f"Saved histogram PNG: {hist_png}")

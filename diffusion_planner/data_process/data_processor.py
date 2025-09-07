@@ -24,6 +24,9 @@ from diffusion_planner.data_process.agent_process import (
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
 from diffusion_planner.data_process.ego_process import get_ego_past_array_from_scenario, get_ego_future_array_from_scenario, calculate_additional_ego_states
 from diffusion_planner.data_process.utils import convert_to_model_inputs, get_npc_route_roadblock_ids, get_neighbor_track_tokens
+# [ADDED] 통계 저장용
+import json
+from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
 
 
 class DataProcessor(object):
@@ -71,6 +74,127 @@ class DataProcessor(object):
                 settings=wandb.Settings(start_method="fork"),
             )
         self._wandb_enabled = wandb.run is not None
+
+    # [ADDED] 통계 유틸 함수들
+    # =========================
+    @staticmethod
+    def _count_valid_neighbors_by_type(
+            neighbor_agents_past: np.ndarray,  # (N, Tp, 11)
+    ) -> Tuple[int, int, int]:
+        """마지막 시점의 에이전트 상태로 유효/타입을 판정해 수를 셉니다.
+
+        규칙:
+          - 유효성: 마지막 시점의 앞 8차원(kinematics/size)이 모두 0이면 무효로 간주
+            · 즉, valid = any(|state_last[:8]| > eps)
+          - 타입: 마지막 3차원(one-hot) = [vehicle, pedestrian, bicycle]
+            · 임계값 0.5 초과를 1로 해석(부동소수 오차 대비)
+
+        Args:
+            neighbor_agents_past (np.ndarray):
+                - shape: (N, Tp, 11)
+                - 마지막 차원 11 = [x, y, cos, sin, vx, vy, width, length, onehot_vehicle, onehot_ped, onehot_bike]
+
+        Returns:
+            Tuple[int, int, int]: (vehicle_count, pedestrian_count, bicycle_count)
+
+        Raises:
+            ValueError: 입력의 마지막 차원 크기가 11이 아닌 경우.
+        """
+        if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[
+                -1] != 11:
+            raise ValueError(
+                f"`neighbor_agents_past` shape는 (N, Tp, 11)이어야 합니다. "
+                f"got {neighbor_agents_past.shape}")
+
+        # 마지막 시점만 사용
+        last: np.ndarray = neighbor_agents_past[:, -1, :]  # (N, 11)
+
+        # 유효성 마스크: 앞 8차원 중 하나라도 |.| > eps 이면 유효
+        eps = 1e-8
+        valid_mask: np.ndarray = (np.abs(last[:, :8]) > eps).any(axis=1)  # (N,)
+
+        # 타입 one-hot (vehicle, pedestrian, bicycle)
+        type_oh: np.ndarray = last[:, 8:11]  # (N, 3)
+        veh_mask = type_oh[:, 0] > 0.5
+        ped_mask = type_oh[:, 1] > 0.5
+        bik_mask = type_oh[:, 2] > 0.5
+
+        vehicle_count = int(np.sum(valid_mask & veh_mask))
+        pedestrian_count = int(np.sum(valid_mask & ped_mask))
+        bicycle_count = int(np.sum(valid_mask & bik_mask))
+
+        return vehicle_count, pedestrian_count, bicycle_count
+
+    @staticmethod
+    def _compute_lane_speed_stats(
+        vector_map_output: Dict[str,
+                                np.ndarray],) -> Tuple[float, Optional[float]]:
+        """차선 관련 통계를 계산한다.
+
+        분모는 '유효 차선' 개수:
+            - vector_map_output['lanes'] 의 각 차선 텐서 합(|.|) > 0
+
+        통계:
+            - 속도제한 차선 비율(%):
+                100 * (#(유효 ∧ has_speed_limit True)) / (#유효)
+            - 속도제한 차선들의 평균 제한속도(km/h):
+                mean(lanes_speed_limit[유효 ∧ True]) * 3.6
+                (없으면 None 반환)
+
+        Args:
+            vector_map_output: map_process(...) 가 반환한 dict
+
+        Returns:
+            Tuple[float, Optional[float]]: (ratio_percent, mean_speed_kmh or None)
+        """
+        lanes: np.ndarray = vector_map_output[
+            'lanes']  # (lane_num, lane_len, 12)
+        has_speed: np.ndarray = vector_map_output[
+            'lanes_has_speed_limit']  # (lane_num, 1) bool
+        speed_mps: np.ndarray = vector_map_output[
+            'lanes_speed_limit']  # (lane_num, 1) float
+
+        # 유효 차선 판정: 모든 성분이 0인 행은 패딩으로 간주
+        lanes_valid_mask = (np.abs(lanes).sum(axis=(1, 2)) > 0)  # (lane_num,)
+        if lanes_valid_mask.sum() == 0:
+            return 0.0, None
+
+        has_speed_mask = (has_speed.reshape(-1).astype(bool)
+                         ) & lanes_valid_mask  # (lane_num,)
+        ratio_percent = float(100.0 * has_speed_mask.sum() /
+                              lanes_valid_mask.sum())
+
+        mean_speed_kmh: Optional[float] = None
+        if has_speed_mask.any():
+            mean_speed_kmh = float(
+                speed_mps.reshape(-1)[has_speed_mask].mean() * 3.6)
+
+        return ratio_percent, mean_speed_kmh
+
+    def _save_sample_stats_json(
+        self,
+        map_name: str,
+        token: str,
+        stats: Dict[str, Union[int, float, None]],
+    ) -> None:
+        """샘플별 통계를 `<save_path>/<map>_<token>.stats.json` 으로 저장한다.
+
+        원자적 저장을 위해 `.tmp`로 쓴 뒤 최종 파일명으로 교체한다.
+
+        Args:
+            map_name: 맵 이름
+            token: 시나리오 토큰
+            stats: 저장할 통계 딕셔너리
+        """
+        if not self._save_dir:
+            return
+        os.makedirs(self._save_dir, exist_ok=True)
+        out_path = os.path.join(self._save_dir,
+                                f"{map_name}_{token}.stats.json")
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(stats, f, indent=2)
+        os.replace(tmp_path, out_path)
 
     def _filter_agents_within_radius(
         self,
@@ -331,6 +455,32 @@ class DataProcessor(object):
                 neighbor_track_token, neighbor_agents_current, anchor_ego_state,
                 coords, traffic_light_data, speed_limit, lane_route,
                 self._map_features, self._max_elements, self._max_points)
+
+            # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
+            try:
+                veh_cnt, ped_cnt, bic_cnt = self._count_valid_neighbors_by_type(
+                    neighbor_agents_past=neighbor_agents_past)
+                ratio_percent, mean_speed_kmh = self._compute_lane_speed_stats(
+                    vector_map)
+                stats_payload = {
+                    "vehicle_count":
+                        int(veh_cnt),
+                    "pedestrian_count":
+                        int(ped_cnt),
+                    "bicycle_count":
+                        int(bic_cnt),
+                    "lane_speed_limit_ratio_percent":
+                        float(ratio_percent),
+                    # None 은 JSON 으로 null 저장
+                    "mean_speed_limit_kmh": (None if mean_speed_kmh is None else
+                                             float(mean_speed_kmh)),
+                }
+                self._save_sample_stats_json(map_name, token, stats_payload)
+            except Exception as _e:
+                # 통계 수집이 실패해도 전처리 전체는 계속 진행
+                print(
+                    f"[Warn] stats collection failed for {map_name}_{token}: {_e}"
+                )
             '''
             ego & agents future
             ego_agent_future : rear axle x,y, ~~~
