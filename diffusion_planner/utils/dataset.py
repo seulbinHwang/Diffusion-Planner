@@ -8,6 +8,10 @@ class DiffusionPlannerData(Dataset):
 
     def __init__(self, data_dir, data_list, past_neighbor_num,
                  predicted_neighbor_num, future_len):
+        """
+        data_dir: "/mnt/nuplan/dataset/processed"
+        data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+        """
         self.data_dir = data_dir
         self.data_list = openjson(data_list)
         self._past_neighbor_num = past_neighbor_num

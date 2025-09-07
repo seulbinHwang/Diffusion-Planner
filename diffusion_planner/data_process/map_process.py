@@ -20,14 +20,14 @@ from nuplan.planning.training.preprocessing.feature_builders.vector_builder_util
     VectorFeatureLayerMapping, LaneSegmentTrafficLightData,
     get_traffic_light_encoding, get_map_object_polygons)
 
-from diffusion_planner.data_process.utils import vector_set_coordinates_to_local_frame, _select_token_and_ordered_npc_route_indices
+from diffusion_planner.data_process.utils import vector_set_coordinates_to_local_frame, _select_token_and_ordered_npc_route_indices, get_directional_proximal_map_objects
 
 
 # =====================
 # 1. Get lanes, speed limit, traffic light and lane's roadblock ids
 # =====================
 def _get_lane_polylines(
-    map_api: AbstractMap, point: Point2D, radius: float
+    map_api: AbstractMap, point: Point2D, ego_heading: float, radius: float
 ) -> Tuple[MapObjectPolylines, MapObjectPolylines, MapObjectPolylines,
            LaneSegmentLaneIDs]:
     """
@@ -55,7 +55,9 @@ def _get_lane_polylines(
     lane_has_speed_limit = []
     lane_roadblock_ids = []
     layer_names = [SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR]
-    layers = map_api.get_proximal_map_objects(point, radius, layer_names)
+    layers = get_directional_proximal_map_objects(map_api, point, ego_heading,
+                                                  radius, layer_names)
+    # layers = map_api.get_proximal_map_objects(point, radius, layer_names)
 
     map_objects = []
 
@@ -105,6 +107,7 @@ def get_neighbor_vector_set_map(
     map_api: AbstractMap,
     map_features: List[str],
     point: Point2D,
+    ego_heading: float,
     radius: float,
     traffic_light_status_data: List[TrafficLightStatusData],
 ) -> Tuple[Dict[str, MapObjectPolylines], Dict[str,
@@ -139,8 +142,9 @@ def get_neighbor_vector_set_map(
 
     # extract lanes
     if VectorFeatureLayer.LANE in feature_layers:
-        lanes_mid, lanes_left, lanes_right, lane_ids, lane_speed_limit, lane_has_speed_limit, lane_route = _get_lane_polylines(
-            map_api, point, radius)
+        (lanes_mid, lanes_left, lanes_right, lane_ids, lane_speed_limit,
+         lane_has_speed_limit,
+         lane_route) = _get_lane_polylines(map_api, point, ego_heading, radius)
 
         # lane baseline paths
         coords[VectorFeatureLayer.LANE.name] = lanes_mid

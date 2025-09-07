@@ -16,28 +16,111 @@ from nuplan.common.maps.abstract_map_objects import RoadBlockGraphEdgeMapObject
 from shapely.geometry import Point
 from collections import defaultdict
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
-from nuplan.common.maps.abstract_map import SemanticMapLayer
-from nuplan.common.maps.abstract_map import AbstractMap, MapObject
-from nuplan.common.actor_state.state_representation import Point2D
-import shapely.geometry as geom
-from shapely import affinity
-import math
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from typing import List, Optional, Union
 import numpy as np
-from typing import Tuple
 
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
-import numpy as np
+import math
+import shapely.geometry as geom
+from shapely import affinity
+from nuplan.common.maps.abstract_map import AbstractMap, MapObject
+from nuplan.common.maps.abstract_map import SemanticMapLayer
+from nuplan.common.actor_state.state_representation import Point2D
 
-from typing import Dict, List, Optional, Tuple
-import numpy as np
 
-from typing import List, Optional
-import numpy as np
+def _map_object_to_geometry(obj: MapObject) -> Optional[geom.base.BaseGeometry]:
+    """MapObject로부터 Shapely 기하를 얻는다.
+
+    우선순위:
+        1) obj.polygon 이 존재하면 그대로 사용
+        2) obj.baseline_path.discrete_path 가 있으면 LineString으로 구성
+        3) 둘 다 없으면 None
+
+    Args:
+        obj (MapObject): NuPlan 맵 객체.
+
+    Returns:
+        Optional[geom.base.BaseGeometry]: Shapely Polygon/LineString/Point 등. 없으면 None.
+    """
+    # 1) 다각형이 있는 타입(예: Lane, RoadBlock, Connector 등)
+    polygon = getattr(obj, "polygon", None)
+    if polygon is not None:
+        return polygon
+
+    # 2) 차선류 등: baseline_path → LineString
+    baseline_path = getattr(obj, "baseline_path", None)
+    if baseline_path is not None and hasattr(baseline_path, "discrete_path"):
+        pts = [(n.x, n.y) for n in baseline_path.discrete_path]
+        if len(pts) >= 2:
+            return geom.LineString(pts)
+        elif len(pts) == 1:
+            return geom.Point(pts[0])
+
+    # 3) 기타(공개 속성으로는 기하 획득 불가)
+    return None
+
+
+def get_directional_proximal_map_objects(
+    map_api: AbstractMap,
+    point: Point2D,
+    heading: float,
+    radius: float,
+    layers: List[SemanticMapLayer],
+) -> Dict[SemanticMapLayer, List[MapObject]]:
+    """heading 방향으로 회전된 정사각형(변=2*radius) 내부와 교차하는 객체를 조회한다.
+
+    구현 방식(공개 API 기반):
+        1) 먼저 R' = radius * sqrt(2) 로 키운 축정렬 AABB로 coarse 후보를
+           `get_proximal_map_objects`로 가져온다.
+        2) Shapely로 heading만큼 회전시킨 정사각형 패치를 만들고,
+           각 MapObject의 기하(Polygon 또는 LineString)와 교차하는 것만 남긴다.
+
+    Args:
+        map_api (AbstractMap): 맵 API(NuPlanMap 등).
+        point (Point2D): [m] 패치 중심 좌표.
+        radius (float): [m] 회전 정사각형의 반변 길이(= 한 변의 절반).
+        heading (float): [rad] 패치 회전 각. 0이면 세계 좌표 x축 정렬.
+        layers (List[SemanticMapLayer]): 조회할 레이어 목록.
+
+    Returns:
+        Dict[SemanticMapLayer, List[MapObject]]: 레이어별 교차 객체 목록.
+    """
+    supported_layers = map_api.get_available_map_objects()
+    unsupported = [ly for ly in layers if ly not in supported_layers]
+    assert len(unsupported) == 0, (
+        f"Object representation for layer(s): {unsupported} is unavailable")
+
+    # (1) AABB(축정렬) 기반 coarse 후보 조회: 회전 정사각형을 항상 포함하도록 R' = R * sqrt(2)
+    coarse_radius = float(radius) * math.sqrt(2.0)
+    coarse_candidates = map_api.get_proximal_map_objects(
+        point, coarse_radius, layers)
+
+    # (2) 회전된 정사각형 패치 생성
+    x_min, x_max = point.x - radius, point.x + radius
+    y_min, y_max = point.y - radius, point.y + radius
+    rotated_patch = geom.box(x_min, y_min, x_max, y_max)
+    rotated_patch = affinity.rotate(rotated_patch,
+                                    math.degrees(heading),
+                                    origin=(point.x, point.y))
+
+    # (3) 실제 교차 여부로 필터링
+    filtered: Dict[SemanticMapLayer, List[MapObject]] = defaultdict(list)
+    for layer in layers:
+        objs = coarse_candidates.get(layer, [])
+        for obj in objs:
+            shape = _map_object_to_geometry(obj)
+            if shape is None:
+                # 공개 속성으로 기하를 얻을 수 없는 타입은 보수적으로 스킵(축정렬 결과만으로는 방향성 보장 불가)
+                continue
+            if shape.intersects(rotated_patch):
+                filtered[layer].append(obj)
+
+    return filtered
 
 
 def build_agent_route_lane_order(
@@ -314,49 +397,6 @@ def get_neighbor_track_tokens(
     return neighbor_track_token
 
 
-def get_directional_proximal_map_objects(
-    map_api: AbstractMap,
-    point: Point2D,
-    radius: float,
-    heading: float,
-    layers: List[SemanticMapLayer],
-) -> Dict[SemanticMapLayer, List[MapObject]]:
-    """주어진 heading 방향에 맞춘 정사각형 영역 내의 객체를 조회한다.
-
-    Args:
-        point (Point2D): [m] 중심점의 좌표.
-        radius (float): [m] 정사각형 한 변의 절반 길이.
-        heading (float): [rad] 정사각형을 회전시킬 heading. 0은 세계 좌표계 x축과 정렬.
-        layers (List[SemanticMapLayer]): 조회할 레이어 목록.
-
-    Returns:
-        Dict[SemanticMapLayer, List[MapObject]]: 레이어별로 발견된 MapObject 목록.
-    """
-
-    x_min, x_max = point.x - radius, point.x + radius
-    y_min, y_max = point.y - radius, point.y + radius
-    patch = geom.box(x_min, y_min, x_max, y_max)
-    patch = affinity.rotate(patch,
-                            math.degrees(heading),
-                            origin=(point.x, point.y))
-
-    supported_layers = map_api.get_available_map_objects()
-    unsupported_layers = [
-        layer for layer in layers if layer not in supported_layers
-    ]
-
-    assert (
-        len(unsupported_layers) == 0
-    ), f"Object representation for layer(s): {unsupported_layers} is unavailable"
-
-    object_map: Dict[SemanticMapLayer, List[MapObject]] = defaultdict(list)
-
-    for layer in layers:
-        object_map[layer] = map_api._get_proximity_map_object(patch, layer)
-
-    return object_map
-
-
 def get_npc_route_roadblock_ids(
     scenario: NuPlanScenario,
     neighbor_track_token: List[Optional[str]],
@@ -473,30 +513,66 @@ def get_npc_route_roadblock_ids(
                 Point(pt.x, pt.y).distance(polygon) for pt in trajectory_points
             ]))
 
-    def _filter_vehicle_tokens_in_square(ego_state: EgoState,
-                                         detections: DetectionsTracks,
-                                         radius: float) -> Set[str]:
-        """정사각형 영역 내에 위치한 차량 토큰 추출.
+    from typing import Set
+    import math
+    from nuplan.common.actor_state.ego_state import EgoState
+    from nuplan.planning.simulation.observation.observation_type import \
+        DetectionsTracks
+    from nuplan.common.actor_state.tracked_objects_types import \
+        TrackedObjectType
+
+    def _filter_vehicle_tokens_in_square(
+        ego_state: EgoState,
+        detections: DetectionsTracks,
+        radius: float,
+    ) -> Set[str]:
+        """ego heading에 정렬된 정사각형(변=2*radius) 내부에 있는 차량 토큰을 반환한다.
+
+        정사각형 축 정의:
+            - 좌표계 원점: ego rear_axle (x, y)
+            - 축 방향: ego heading에 정렬된 로컬 x/y 축(ego 좌표계)
+            - 포함 판정: 로컬 좌표 (x_local, y_local) 가 모두 [-radius, +radius] 범위에 있으면 포함
+
+        구현 메모:
+            - 월드 → ego 로컬 변환은 ego heading에 대해 -heading 회전과 평행이동을 적용한 것과 동일.
+            - 수치적 안정성을 위해 비교는 경계 포함(<=)으로 처리.
 
         Args:
-            ego_state (EgoState): 정사각형 중심이 되는 ego 상태.
-            detections (DetectionsTracks): 초기 시점의 트래킹 결과.
-            radius (float): 정사각형 한 변의 절반 길이 [m].
+            ego_state: ego의 상태(특히 rear_axle.x, rear_axle.y, rear_axle.heading 사용)
+            detections: 현재 프레임의 트래킹 결과(DetectionsTracks)
+            radius: 정사각형 한 변의 절반 길이 [m]
 
         Returns:
-            Set[str]: 영역 내부 차량의 트랙 토큰 집합.
+            Set[str]: 정사각형 내부에 있는 VEHICLE 타입 객체들의 track_token 집합
         """
-        center_x = ego_state.rear_axle.x
-        center_y = ego_state.rear_axle.y
-        min_x, max_x = center_x - radius, center_x + radius
-        min_y, max_y = center_y - radius, center_y + radius
+        cx = float(ego_state.rear_axle.x)
+        cy = float(ego_state.rear_axle.y)
+        h = float(ego_state.rear_axle.heading)
+        cos_h = math.cos(h)
+        sin_h = math.sin(h)
+
         tokens: Set[str] = set()
+
         for obj in detections.tracked_objects:
             if obj.tracked_object_type != TrackedObjectType.VEHICLE:
                 continue
-            px, py = obj.center.x, obj.center.y
-            if min_x <= px <= max_x and min_y <= py <= max_y:
-                tokens.add(obj.track_token)
+
+            # 월드 좌표에서 ego 원점으로 평행이동
+            dx = float(obj.center.x) - cx
+            dy = float(obj.center.y) - cy
+
+            # 월드 → ego 로컬 회전(각도 -h 적용과 동일)
+            # x_local =  cos(h)*dx + sin(h)*dy
+            # y_local = -sin(h)*dx + cos(h)*dy
+            x_local = dx * cos_h + dy * sin_h
+            y_local = -dx * sin_h + dy * cos_h
+
+            if (-radius <= x_local <= radius) and (-radius <= y_local <=
+                                                   radius):
+                token = getattr(obj, "track_token", None)
+                if token is not None:
+                    tokens.add(token)
+
         return tokens
 
     # ─────────── 1단계: 차량별 프레임 수집 ────────────

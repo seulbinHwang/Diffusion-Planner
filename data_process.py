@@ -373,7 +373,6 @@ if __name__ == "__main__":
     loader_pool._executor.shutdown(wait=True)
 
 
-    batch_size = 24
     proc_pool = SingleMachineParallelExecutor(use_process_pool=True, max_workers=available_cpu_count())
 
     #######

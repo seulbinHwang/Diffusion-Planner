@@ -157,6 +157,7 @@ class DataProcessor(object):
         '''
         ego_state = history_buffer.current_state[0]
         ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
+        ego_heading: float = ego_state.rear_axle.heading  #
         anchor_ego_state = np.array([
             ego_state.rear_axle.x, ego_state.rear_axle.y,
             ego_state.rear_axle.heading
@@ -212,7 +213,8 @@ class DataProcessor(object):
             ego_state, map_api, route_roadblock_ids)
         (coords, traffic_light_data, speed_limit,
          lane_route) = get_neighbor_vector_set_map(map_api, self._map_features,
-                                                   ego_coords, self._radius,
+                                                   ego_coords, ego_heading,
+                                                   self._radius,
                                                    traffic_light_data)
         # # 길아: agent_num
         neighbor_token_to_rr_ids: Dict[
@@ -251,6 +253,7 @@ class DataProcessor(object):
             '''
             ego_state = scenario.initial_ego_state
             ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
+            ego_heading = ego_state.rear_axle.heading
             anchor_ego_state = np.array([
                 ego_state.rear_axle.x, ego_state.rear_axle.y,
                 ego_state.rear_axle.heading
@@ -319,7 +322,8 @@ class DataProcessor(object):
             (coords, traffic_light_data, speed_limit,
              lane_route) = get_neighbor_vector_set_map(map_api,
                                                        self._map_features,
-                                                       ego_coords, self._radius,
+                                                       ego_coords, ego_heading,
+                                                       self._radius,
                                                        traffic_light_data)
 
             vector_map = map_process(
