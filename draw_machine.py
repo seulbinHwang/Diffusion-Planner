@@ -12,6 +12,68 @@ Array = np.ndarray
 WorldModelFeature = Dict[str, Array]
 TokenTrajDict = Dict[str, Array]  # value: (future_len, 4) with [x, y, cos, sin]
 
+
+def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
+    """미래 포인트(3,)=[x,y,yaw]가 **유효**하면 True.
+    - 규칙: |x|>eps 또는 |y|>eps 이면 유효로 간주( yaw=0 이어도 상관 없음 )
+    """
+    if row3.shape[-1] != 3:
+        raise ValueError("neighbor_agents_future의 마지막 차원은 3이어야 합니다.")
+    return bool((abs(float(row3[0])) > eps) or (abs(float(row3[1])) > eps))
+
+
+def draw_neighbor_future_points(ax: plt.Axes, neighbor_agents_future: Array,
+                                options: DrawingOptions) -> None:
+    """neighbor_agents_future (agent_num, future_len, 3=[x,y,yaw])를
+    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..agent_num-1)를 흰색으로 표기.
+
+    규칙:
+      - invalid: |x|<=eps and |y|<=eps → 스킵
+      - 마커: 흰색 'x', 선 없음
+      - 라벨: 첫 점이 유효할 때만 표시
+    """
+    if neighbor_agents_future is None or neighbor_agents_future.size == 0:
+        return
+    if neighbor_agents_future.ndim != 3 or neighbor_agents_future.shape[-1] != 3:
+        raise ValueError(
+            "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
+
+    eps = options.invalid_eps
+    agent_num, future_len, _ = neighbor_agents_future.shape
+    ms = options.neighbor_future_marker_size
+    text_d = options.agent_index_offset_m
+    text_color = options.agent_index_color
+
+    for a in range(agent_num):
+        traj = neighbor_agents_future[a]  # (future_len, 3)
+        # 모든 유효 포인트를 x마커로 그리기
+        for t in range(future_len):
+            row = traj[t]
+            if not is_valid_future_row_xyyaw(row, eps):
+                continue
+            x, y = float(row[0]), float(row[1])
+            ax.plot(x,
+                    y,
+                    marker='x',
+                    markersize=ms,
+                    linestyle='None',
+                    color="#FFFFFF",
+                    zorder=26)
+
+        # 첫 점 라벨(유효할 때만)
+        first = traj[0]
+        if is_valid_future_row_xyyaw(first, eps):
+            fx, fy = float(first[0]), float(first[1])
+            ax.text(fx + text_d,
+                    fy + text_d,
+                    str(a),
+                    color=text_color,
+                    fontsize=options.agent_index_fontsize,
+                    ha='left',
+                    va='bottom',
+                    zorder=30)
+
+
 # =============================================================================
 # 옵션/스타일
 # =============================================================================
@@ -76,6 +138,7 @@ class DrawingOptions:
     draw_lane_boundaries: bool = True
     draw_lane_centerline: bool = True
     draw_token_future_arrows: bool = True
+    draw_neighbor_agents_future: bool = True
 
     draw_velocity_arrows_past_all: bool = True
     draw_velocity_arrows_pred_all: bool = True
@@ -92,6 +155,11 @@ class DrawingOptions:
     equal_aspect: bool = True
 
     invalid_eps: float = 0.0
+
+    agent_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
+    agent_index_offset_m: float = 0.5  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
+    agent_index_color: str = "#FFFFFF"  # 번호 텍스트 색
+    neighbor_future_marker_size: float = 5.0  # 미래 포인트 'x' 마커 크기
 
 
 # 스타일 사전
@@ -340,6 +408,19 @@ def collect_valid_xy_for_bounds(
                 xs.extend(xy[:, 0].tolist())
                 ys.extend(xy[:, 1].tolist())
 
+    # neighbor future points: (agent_num, future_len, 3)  -> (x,y)만 사용
+    neigh_fut = world_model_feature.get("neighbor_agents_future")
+    if neigh_fut is not None and neigh_fut.size > 0:
+        if neigh_fut.ndim != 3 or neigh_fut.shape[-1] != 3:
+            raise ValueError(
+                "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
+        # 유효 마스크: |x|>eps or |y|>eps
+        valid_mask = (np.abs(neigh_fut[..., 0]) > eps) | (np.abs(
+            neigh_fut[..., 1]) > eps)  # (A, T)
+        if np.any(valid_mask):
+            xy = neigh_fut[..., :2][valid_mask]  # (K, 2)
+            xs.extend(xy[:, 0].tolist())
+            ys.extend(xy[:, 1].tolist())
     return xs, ys
 
 
@@ -465,6 +546,40 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
                                    line_color=st["velocity_line_color"],
                                    line_width=st["velocity_line_width"],
                                    zorder=7 if t == current_t else 4)
+
+
+def annotate_neighbor_indices_for_past(ax: plt.Axes,
+                                       neighbor_agents_past: Array,
+                                       options: DrawingOptions) -> None:
+    """neighbor_agents_past (agent_num, T=21, 11)의 '현재 상태'(마지막 스텝) 근처에
+    에이전트 인덱스(0..agent_num-1)를 흰색 텍스트로 표기.
+    - invalid 스텝은 스킵
+    """
+    if neighbor_agents_past is None or neighbor_agents_past.size == 0:
+        return
+    if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[-1] != 11:
+        raise ValueError(
+            "neighbor_agents_past의 shape은 (agent_num, 21, 11) 이어야 합니다.")
+
+    eps = options.invalid_eps
+    agent_num, time_len, feat_dim = neighbor_agents_past.shape
+    current_t = time_len - 1
+    text_d = options.agent_index_offset_m
+    text_color = options.agent_index_color
+
+    for a in range(agent_num):
+        row = neighbor_agents_past[a, current_t]  # (11,)
+        if not is_valid_agent_row(row, eps):
+            continue
+        x, y = float(row[0]), float(row[1])
+        ax.text(x + text_d,
+                y + text_d,
+                str(a),
+                color=text_color,
+                fontsize=options.agent_index_fontsize,
+                ha='left',
+                va='bottom',
+                zorder=30)
 
 
 def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
@@ -782,6 +897,12 @@ def draw_world_model_to_png(
     if draw_option.draw_lane_centerline:
         draw_lane_centerlines(ax, lanes, draw_option)
 
+    # 2.5) 이웃 에이전트의 '미래 포인트(x 마커)' 먼저 그리기 (있을 때만)
+    if draw_option.draw_neighbor_agents_future:
+        neighbor_future = world_model_feature.get("neighbor_agents_future")
+        if neighbor_future is not None:
+            draw_neighbor_future_points(ax, neighbor_future, draw_option)
+
     # 3) 토큰 미래 화살표(개별) - 차선 위에, 에이전트 윤곽과 겹치지 않게 중간 zorder
     if draw_option.draw_token_future_arrows:
         draw_token_future_arrows(ax, token_to_future_traj_wrt_ego, draw_option)
@@ -790,6 +911,10 @@ def draw_world_model_to_png(
     if draw_option.draw_neighbor_past:
         draw_neighbor_past(ax, world_model_feature.get("neighbor_agents_past"),
                            draw_option)
+        # 현재 프레임(마지막 스텝) 옆에 에이전트 인덱스 표기
+        annotate_neighbor_indices_for_past(
+            ax, world_model_feature.get("neighbor_agents_past"), draw_option)
+
     if draw_option.draw_ego_past:
         draw_ego_past(ax, world_model_feature.get("ego_agent_past"),
                       draw_option)
@@ -815,11 +940,29 @@ def draw_world_model_to_png(
 if __name__ == "__main__":
     # world_model_feature 예시(실데이터로 교체)
     world_model_feature = {
-        "ego_agent_past": np.zeros((21, 11), dtype=np.float32),
-        "neighbor_agents_past": np.zeros((5, 21, 11), dtype=np.float32),
-        "ego_agent_next_11_dim": np.zeros((30, 11), dtype=np.float32),
-        "ego_future_gt_11_dim": np.zeros((80, 11), dtype=np.float32),
-        "lanes": np.zeros((70, 50, 12), dtype=np.float32),
+        "ego_agent_past":
+            np.zeros((21, 11), dtype=np.float32),
+        "neighbor_agents_past":
+            np.zeros((5, 21, 11), dtype=np.float32),
+        "ego_agent_next_11_dim":
+            np.zeros((30, 11), dtype=np.float32),
+        "ego_future_gt_11_dim":
+            np.zeros((80, 11), dtype=np.float32),
+        "lanes":
+            np.zeros((70, 50, 12), dtype=np.float32),
+        "neighbor_agents_future":
+            np.array([
+                np.column_stack([
+                    np.linspace(0, 10, 20),
+                    np.linspace(0, 0, 20),
+                    np.zeros(20)
+                ]),
+                np.column_stack([
+                    np.linspace(1, 8, 20),
+                    np.linspace(2, 2, 20),
+                    np.zeros(20)
+                ]),
+            ]),
     }
 
     # 토큰 미래 포즈 예시: key는 무시되고 value만 사용됨
