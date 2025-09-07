@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
@@ -22,6 +22,8 @@ class Decoder(nn.Module):
         self._predicted_neighbor_num = config.predicted_neighbor_num
         self._future_len = config.future_len
         self._sde = VPSDE_linear()
+        self._cond_last_prob: float = getattr(config, "cond_last_prob",
+                                              0.20)  # 20%
 
         self.dit = DiT(
             sde=self._sde,
@@ -46,6 +48,72 @@ class Decoder(nn.Module):
     @property
     def sde(self):
         return self._sde
+
+    def _maybe_apply_last_pos_condition_training(
+        self,
+        x_t: torch.Tensor,  # (B, Pnn, (1 + T) * 4)  # 정규화 상태
+        near_current_mask: torch.Tensor,  # (B, Pnn)  True=무효 에이전트
+        cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)  # 정규화 목표점
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """훈련 시, **배치 단위**로 cond_last_prob 확률(기본 20%)에 따라
+        마지막 스텝(목표점)을 관측(노이즈 0)으로 **전원 적용/전원 미적용**한다.
+
+        배치 토글:
+            - 토글=True (약 20%): 이번 배치의 모든 유효 Pnn에 목표를 주입
+            - 토글=False (약 80%): 이번 배치에는 전혀 목표를 주지 않음
+
+        Args:
+            x_t: (B, Pnn, (1 + T) * 4), 정규화된 입력 시퀀스.
+            near_current_mask: (B, Pnn), True=무효 이웃 에이전트.
+            cond_last_pos_norm: (B, Pnn, 4), 정규화된 목표점(마지막 프레임 값).
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                - x_t_out: (B, Pnn, (1 + T) * 4)
+                    * 배치 토글이 True일 때, 모든 유효 에이전트의 마지막 프레임을
+                      cond_last_pos_norm으로 치환(=노이즈 0).
+                    * 배치 토글이 False면 입력을 그대로 반환.
+                - apply_mask: (B, Pnn) 또는 None
+                    * 이번 배치에서 실제로 목표를 적용한 에이전트 마스크(로깅/평가용).
+                    * 미적용 시 None.
+        """
+        B, Pnn, flat = x_t.shape
+        assert flat % 4 == 0, "near_cur_future_norm_xT의 마지막 차원은 4의 배수여야 합니다."
+        T_plus1: int = flat // 4
+        assert T_plus1 >= 2, "미래 길이 T는 최소 1 이상이어야 합니다."
+        assert cond_last_pos_norm.shape == (B, Pnn,
+                                            4), "cond_last_pos_norm shape 불일치"
+
+        # cond_last_prob==0 이면 빠르게 종료
+        if self._cond_last_prob <= 0.0:
+            return x_t, None
+
+        # (1) 적용 가능 위치: 유효 에이전트 & 목표값 finite
+        has_goal: torch.Tensor = torch.isfinite(cond_last_pos_norm).all(
+            dim=-1)  # (B, Pnn)
+        can_apply: torch.Tensor = (~near_current_mask) & has_goal  # (B, Pnn)
+
+        # (2) 배치 단일 베르누이 샘플: 약 20% 확률로 전체 적용
+        batch_toggle: bool = (torch.rand((), device=x_t.device).item()
+                              < float(self._cond_last_prob))
+
+        if not batch_toggle:
+            # 이번 배치는 전원 미적용
+            return x_t, None
+
+        # (3) 전체 적용: 유효한 위치(can_apply)에만 주입
+        if not can_apply.any().item():
+            # 유효한 에이전트가 하나도 없으면 변경 없음
+            return x_t, None
+
+        x_seq = x_t.view(B, Pnn, T_plus1, 4).clone()
+        # 마지막 프레임을 목표로 치환(노이즈 0과 동치)
+        x_seq[can_apply, -1, :] = cond_last_pos_norm[can_apply]
+        x_out = x_seq.view(B, Pnn, flat)
+
+        # 로깅/평가용 마스크 반환(이번 배치에서 실제 적용된 위치)
+        apply_mask: torch.Tensor = can_apply  # (B, Pnn)
+        return x_out, apply_mask
 
     def forward(self, encoder_outputs, inputs):
         """
@@ -84,6 +152,7 @@ class Decoder(nn.Module):
         near_current = inputs["neighbor_agents_past"][:, :self.
                                                       _predicted_neighbor_num,
                                                       -1, :4]  # [B, pnn, 4]
+        cond_last_pos_norm = inputs["cond_last_pos_norm"]  # [B, Pnn, 4]
         near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
                                       dim=-1) == 0  # [B, pnn]
         inputs["near_current_mask"] = near_current_mask
@@ -107,6 +176,9 @@ class Decoder(nn.Module):
         if self.training:
             near_cur_future_norm_xT = inputs["near_cur_future_norm_xT"].reshape(
                 B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
+            # 🔹 20% 확률로 마지막 프레임(목표) 주입 — Conditioned Generation 학습 신호
+            near_cur_future_norm_xT, _ = self._maybe_apply_last_pos_condition_training(
+                near_cur_future_norm_xT, near_current_mask, cond_last_pos_norm)
             diffusion_time = inputs['diffusion_time']
             # (B, Pnn, (1 + T) , 4)
             score = self.dit(
@@ -134,9 +206,30 @@ class Decoder(nn.Module):
                 ],
                 dim=2).reshape(B, Pnn, -1)
 
+            # cond_last_pos가 주어지면 목표도 함께 고정
+            cond_last_pos_raw = None
+            if "cond_last_pos_norm" in inputs:
+                cond_last_pos_raw = self._state_normalizer.inverse(
+                    inputs["cond_last_pos_norm"])  # (B, Pnn, 4)
+
+            if cond_last_pos_raw is not None:
+                cond_last_mask = torch.isfinite(cond_last_pos_raw).all(
+                    dim=-1)  # (B, Pnn)
+            else:
+                cond_last_mask = torch.zeros(B,
+                                             Pnn,
+                                             dtype=torch.bool,
+                                             device=xT.device)
+
             def initial_state_constraint(xt, t, step):
-                xt = xt.reshape(B, Pnn, -1, 4)
+                xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
+                # 항상 현재(첫 프레임) 고정
                 xt[:, :, 0, :] = near_current
+                # 선택적으로 마지막(목표)도 고정 → Conditioned Generation
+                if cond_last_pos_raw is not None and cond_last_mask.any().item(
+                ):
+                    xt[cond_last_mask,
+                       -1, :] = cond_last_pos_raw[cond_last_mask]
                 return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(

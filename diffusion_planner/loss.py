@@ -132,6 +132,7 @@ def diffusion_loss_func(
 
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
     normed_future = state_normalizer(near_future_gt)
+    cond_last_pos_norm = normed_future[:, :, -1, :] # [B, Pnn, 4]
     normed_future = _require_finite("state_normalizer(near_future_gt)",
                                     normed_future)
     near_cur_future_norm_gt = torch.cat([
@@ -168,6 +169,7 @@ def diffusion_loss_func(
         "near_cur_future_norm_xT":
             near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
         "diffusion_time": batch_diffusion_time,  # [B,]
+        "cond_last_pos_norm": cond_last_pos_norm, # [B, Pnn, 4]
     }
 
     _, decoder_output = model(merged_inputs)
