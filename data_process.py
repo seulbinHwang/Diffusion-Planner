@@ -19,6 +19,32 @@ from datetime import datetime
 import json
 import os
 from scenario_utils import get_or_load_scenarios  # 새 유틸리티 함수
+# 임시 몽키패치
+from nuplan.database.nuplan_db.lidar_pc import LidarPc
+import sqlite3
+from typing import Set
+
+def _safe_from_db_row(row: sqlite3.Row) -> LidarPc:
+    keys: Set[str] = set(row.keys())  # type: ignore
+    def _hex_or_none(field: str):
+        if field not in keys:
+            return None
+        val = row[field]
+        return val.hex() if val is not None else None
+
+    return LidarPc(
+        token=_hex_or_none("token"),
+        next_token=_hex_or_none("next_token"),
+        prev_token=_hex_or_none("prev_token"),
+        ego_pose_token=_hex_or_none("ego_pose_token"),
+        lidar_token=_hex_or_none("lidar_token"),
+        scene_token=_hex_or_none("scene_token"),
+        filename=row["filename"] if "filename" in keys else None,
+        timestamp=row["timestamp"] if "timestamp" in keys else None,
+    )
+
+LidarPc.from_db_row = staticmethod(_safe_from_db_row)
+
 """
 <DB에서 처음 추출 + 캐시 저장>
 python preprocess.py \
@@ -497,6 +523,7 @@ if __name__ == "__main__":
     remaining_ids = scenario_id_map.keys() - processed
     # 6-3) 최종 리스트
     remaining = [scenario_id_map[token] for token in remaining_ids]
+    remaining = remaining[:10]
     print(f"Remaining to process: {len(remaining)}")
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────

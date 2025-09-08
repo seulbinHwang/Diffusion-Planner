@@ -285,7 +285,7 @@ class DataProcessor(object):
             ego_state.rear_axle.heading
         ],
                                     dtype=np.float64)
-        '''
+        '''_scenario_total_horizon_s
         neighbor
         '''
         ego_state_buffer = history_buffer.ego_state_buffer
@@ -319,11 +319,13 @@ class DataProcessor(object):
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_ped_bike,
              anchor_ego_state)
-        neighbor_agents_past, _ = self._filter_agents_within_radius(
-            neighbor_agents_past)
+        neighbor_agents_past, _, neighbor_indices = \
+            self._filter_agents_within_radius(neighbor_agents_past,
+                                              None, neighbor_indices)
         # 현재 프레임의 트래킹 컨테이너로부터, 선별된 neighbor들의 track token 추출
         neighbor_track_token: List[Optional[str]] = get_neighbor_track_tokens(
-            present_tracked_objects=history_buffer.observation_buffer[-1],
+            present_tracked_objects=history_buffer.observation_buffer[-1].
+            tracked_objects,
             neighbor_indices=neighbor_indices,
             agents_num=self.num_agents,
         )
@@ -331,17 +333,33 @@ class DataProcessor(object):
         Map
         '''
         # Simply fixing disconnected routes without pre-searching for reference lines
-        route_roadblock_ids: List[str] = route_roadblock_correction(
-            ego_state, map_api, route_roadblock_ids)
+        if route_roadblock_ids and route_roadblock_ids != ['']:
+            route_roadblock_ids: List[str] = route_roadblock_correction(
+                ego_state, map_api, list(route_roadblock_ids))
+        else:
+            route_roadblock_ids = []
+        # route_roadblock_ids: List[str] = route_roadblock_correction(
+        #     ego_state, map_api, route_roadblock_ids)
         (coords, traffic_light_data, speed_limit,
          lane_route) = get_neighbor_vector_set_map(map_api, self._map_features,
                                                    ego_coords, ego_heading,
                                                    self._radius,
                                                    traffic_light_data)
         # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
+        present_tracked_objects: TrackedObjects = scenario.initial_tracked_objects.tracked_objects
+        past_tracked_objects: List[TrackedObjects] = [
+            tracked_objects.tracked_objects
+            for tracked_objects in scenario.get_past_tracked_objects(
+                iteration=0,
+                time_horizon=self.past_time_horizon,
+                num_samples=self.num_past_poses)
+        ]
+        sampled_past_observations = past_tracked_objects + [
+            present_tracked_objects
+        ]
         car_token_to_rr_ids: Dict[
             str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                scenario, neighbor_track_token)
+                scenario, sampled_past_observations, neighbor_track_token)
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,
@@ -360,6 +378,10 @@ class DataProcessor(object):
         data.update(vector_map)
         # data: Dict[str, torch.Tensor]
         data = convert_to_model_inputs(data, device, squeeze)
+        if "agent_route_lane_order" in vector_map and isinstance(
+                vector_map["agent_route_lane_order"], np.ndarray):
+            vector_map["agent_route_lane_order"] = vector_map[
+                "agent_route_lane_order"].astype(np.int64)
 
         return data
 
@@ -437,7 +459,7 @@ class DataProcessor(object):
                 scenario, self.num_past_poses, self.past_time_horizon)
 
             present_tracked_objects: TrackedObjects = scenario.initial_tracked_objects.tracked_objects
-            past_tracked_objects = [
+            past_tracked_objects: List[TrackedObjects] = [
                 tracked_objects.tracked_objects
                 for tracked_objects in scenario.get_past_tracked_objects(
                     iteration=0,
@@ -477,37 +499,6 @@ class DataProcessor(object):
                 )
             # (agent_num, 11)
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
-
-            # present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
-            # future_tracked_objects = [
-            #     tracked_objects.tracked_objects
-            #     for tracked_objects in scenario.get_future_tracked_objects(
-            #         iteration=0,
-            #         time_horizon=self.future_time_horizon,
-            #         num_samples=self.num_future_poses)
-            # ]
-            #
-            # sampled_future_observations = [present_tracked_objects
-            #                               ] + future_tracked_objects
-            # (future_tracked_objects_array_list,
-            #  _) = sampled_tracked_objects_to_array_list(
-            #      sampled_future_observations)
-            # # neighbor_agents_future: (num_agents, future_len, 3)
-            # neighbor_agents_future = agent_future_process(
-            #     anchor_ego_state, future_tracked_objects_array_list,
-            #     self.num_agents, neighbor_indices)
-            # _, neighbor_agents_future, _ = \
-            #     self._filter_agents_within_radius(neighbor_agents_past,
-            #                                      neighbor_agents_future)
-            # # agents_past_cur_off_mask: (agents_num)
-            # _, agents_past_cur_off_mask = self._get_agents_past_cur_mask_np(
-            #     neighbor_agents_past)
-            # token_to_agents_future: Dict[str, np.ndarray] = {
-            # }  # token → (future_len, 2)
-            # for idx, (token_, future) in enumerate(
-            #         zip(neighbor_track_token, neighbor_agents_future)):
-            #     if token_ is not None and not agents_past_cur_off_mask[idx]:
-            #         token_to_agents_future[token_] = future[:, :2]
             '''
             Map
             '''
@@ -520,7 +511,7 @@ class DataProcessor(object):
             # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
             car_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                    scenario, neighbor_track_token)
+                    scenario, sampled_past_observations, neighbor_track_token)
 
             (coords, traffic_light_data, speed_limit,
              lane_route) = get_neighbor_vector_set_map(map_api,
@@ -585,8 +576,9 @@ class DataProcessor(object):
                     num_samples=self.num_future_poses)
             ]
 
-            sampled_future_observations: List[TrackedObjects] = [present_tracked_objects
-                                          ] + future_tracked_objects
+            sampled_future_observations: List[TrackedObjects] = [
+                present_tracked_objects
+            ] + future_tracked_objects
             (future_tracked_objects_array_list,
              _) = sampled_tracked_objects_to_array_list(
                  sampled_future_observations)
@@ -637,3 +629,7 @@ class DataProcessor(object):
                     data,
                     token_to_future_traj_wrt_ego=None,
                     save_path=save_path)
+            self.save_to_disk(self._save_dir, data)
+
+    def save_to_disk(self, dir, data):
+        np.savez(f"{dir}/{data['map_name']}_{data['token']}.npz", **data)

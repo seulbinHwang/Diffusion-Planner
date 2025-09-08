@@ -7,9 +7,13 @@ Categories:
     2. Map coordination transformation
     3. Numpy-Tensor transformation
 """
+from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajectory
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 from types import SimpleNamespace
+from nuplan.database.nuplan_db.nuplan_scenario_queries import \
+    get_end_sensor_time_from_db
+from nuplan.database.nuplan_db.nuplan_db_utils import get_lidarpc_sensor_data
 import torch
 from nuplan.common.actor_state.tracked_objects import TrackedObjects, TrackedObject
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex, AgentInternalIndex
@@ -42,6 +46,78 @@ from nuplan.common.actor_state.tracked_objects_types import \
 # utils.py (적절한 위치에 추가)
 from typing import List, Optional, Sequence
 import warnings
+from types import SimpleNamespace
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
+from nuplan.common.actor_state.state_representation import StateSE2
+from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
+from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajectory
+
+
+def get_npc_route_roadblock_ids(
+        scenario: NuPlanScenario,
+        sampled_past_observations: List[TrackedObjects],
+        neighbor_track_token: List[Optional[str]],  # 길이 = agent_num
+) -> Dict[str, List[str]]:
+    """
+    get_future_tracked_objects를 이용해 한 번에 궤적을 수집하고,
+    get_roadblock_ids_from_trajectory로 연결성 기반 ID 시퀀스를 추출합니다.
+    """
+
+    # iteration=0 시점부터 시나리오 끝까지 future 트랙 객체를 한줄로 가져옴
+    # 전체 horizon은 시나리오 총 길이(초)로 지정
+    # horizon = max(30.0,  _scenario_total_horizon_s(scenario))
+    horizon = 20.
+    num_samples = int(horizon / 0.1)
+    # 1) 에이전트별 StateSE2 리스트 수집
+    neighbor_track_token_set = set(
+        [t for t in neighbor_track_token if t is not None])
+    if not neighbor_track_token_set:
+        return {}
+    trajectories: Dict[str, List[SimpleNamespace]] = defaultdict(list)
+    first_pose: Dict[str, SimpleNamespace] = {}
+    future_observations: List[TrackedObjects] = []
+    for dets in scenario.get_future_tracked_objects(0, horizon, num_samples):
+        future_observations.append(dets.tracked_objects)
+    past_future_observations: List[TrackedObjects] = []
+    past_future_observations.extend(sampled_past_observations)
+    past_future_observations.extend(future_observations)
+    for tracked_objects in past_future_observations:
+        for obj in tracked_objects:
+            # obj: TrackedObjects
+            if obj.tracked_object_type != TrackedObjectType.VEHICLE:
+                continue
+            token = obj.track_token
+            if token not in neighbor_track_token_set:
+                continue
+            # heading은 실제로 사용하지 않지만, 넣어도 무방(여기서는 0.0 또는 obj.center.heading 가능)
+            rear_axle_state = StateSE2(obj.center.x, obj.center.y,
+                                       obj.center.heading)
+            pseudo_ego = SimpleNamespace(rear_axle=rear_axle_state)
+            if first_pose.get(token, None) is None:
+                first_pose[token] = pseudo_ego
+
+            trajectories[token].append(pseudo_ego)
+
+    # 2) 연결성 기반 roadblock ID 추출
+    result: Dict[str, List[str]] = {}
+    for token, pseudo_ego_states in trajectories.items():
+        if not pseudo_ego_states:
+            result[token] = []
+            continue
+        # 덕 타이핑: pseudo_ego_states[*].rear_axle.point 만 참조됨
+        rb_ids: List[str] = get_roadblock_ids_from_trajectory(
+            scenario.map_api, pseudo_ego_states)
+        if len(rb_ids) == 0:
+            result[token] = []
+            continue
+        corrected_ids = route_roadblock_correction(
+            first_pose[token],
+            scenario.map_api,
+            rb_ids,
+        )
+
+        result[token] = corrected_ids
+    return result
 
 
 def _prefer_rr_on_conflict(
@@ -192,7 +268,8 @@ def get_directional_proximal_map_objects(
 
 
 def build_agent_route_lane_order(
-    npc_route_indices: List[List[int]], #  # 길이: agent_num, 원소: List[int] (길이 가변적)
+    npc_route_indices: List[
+        List[int]],  #  # 길이: agent_num, 원소: List[int] (길이 가변적)
     lane_num: Optional[int] = None,
     dtype: np.dtype = np.int32,
 ) -> np.ndarray:
@@ -298,7 +375,7 @@ def _select_token_and_ordered_npc_route_indices(
             raise ValueError(
                 f"`vector_map_lanes` shape가 올바르지 않습니다: {vector_map_lanes.shape}"
             )
-        if not (0 < route_num < lane_num):
+        if not (0 < route_num <= lane_num):
             raise ValueError(
                 f"`route_num`는 0 < route_num < lane_num 을 만족해야 합니다. "
                 f"(route_num={route_num}, lane_num={lane_num})")
@@ -331,21 +408,23 @@ def _select_token_and_ordered_npc_route_indices(
 
         Args:
             lane_dist_order (np.ndarray): shape=(lane_num,) 정렬된 lane 인덱스.
-            lane_on_routes_mask (np.ndarray): shape=(lane_num,) bool 마스크.
+            lane_on_routes_mask (np.ndarray): shape<=(lane_num,) bool 마스크.
             max_pick (int): 최대 선택 개수.
 
         Returns:
             List[int]: 선택된 lane 인덱스 리스트(길이 ≤ max_pick).
         """
         selected: List[int] = []
+        # print(f"len(lane_dist_order): {len(lane_dist_order)}, len(lane_on_routes_mask): {len(lane_on_routes_mask)}")
         for lane_idx in lane_dist_order:
             if lane_idx >= len(lane_on_routes_mask):
-                break
+                continue
             if lane_on_routes_mask[lane_idx]:
                 selected.append(int(lane_idx))
                 if len(selected) >= max_pick:
                     break
         return selected
+
     """토큰별 '경로 위 차선'을 가까운 순으로 최대 `route_num`개 뽑아 랭크 행렬을 만든다.
 
     절차(에이전트 i에 대해):
@@ -385,7 +464,8 @@ def _select_token_and_ordered_npc_route_indices(
     agent_num, lane_num = _validate_inputs()
     lanes_xy = vector_map_lanes[:, :, :2]  # (lane_num, P, 2)
 
-    npc_route_indices: List[List[int]] = [] # 길이: agent_num, 원소: List[int] (길이 가변적)
+    npc_route_indices: List[List[int]] = [
+    ]  # 길이: agent_num, 원소: List[int] (길이 가변적)
 
     for agent_idx in range(agent_num):
         selected: List[int] = []
@@ -399,14 +479,20 @@ def _select_token_and_ordered_npc_route_indices(
                 token, [False] * lane_num)
 
         # (1) 경로가 전혀 없으면 건너뜀
-        lane_on_routes_arr = np.asarray(lane_on_routes, dtype=bool) # (lane_num,)
+        lane_on_routes_arr = np.asarray(lane_on_routes,
+                                        dtype=bool)  # (lane_num,)
         if lane_on_routes_arr.sum() == 0:
             npc_route_indices.append(selected)
             continue
-
+        valid_len = len(lane_on_routes)
+        if valid_len == 0:
+            npc_route_indices.append([])
+            continue
         # (2) 가까운 lane 정렬
         agent_xy = neighbor_agents_current[agent_idx, :2]  # (2,)
-        lane_dist_order = _lane_min_dist_order(lanes_xy, agent_xy) # shape=(lane_num,) 최소거리 오름차순 lane 인덱스 배열.
+        lane_dist_order = _lane_min_dist_order(
+            lanes_xy[:valid_len],
+            agent_xy)  # shape=(lane_num,) 최소거리 오름차순 lane 인덱스 배열.
 
         # (3) 정렬 순으로 True lane만 최대 route_num개 선택
         selected = _select_lanes_by_order(lane_dist_order, lane_on_routes_arr,
@@ -520,40 +606,18 @@ def _scenario_total_horizon_s(scn: AbstractScenario) -> float:
     # 1) 시작 시각(초): 공개 API 사용
     start_s = float(scn.get_time_point(0).time_s)
 
-    # 2) 우선, 시나리오 자체 duration이 유효하면 그걸 사용 (extracted scenario인 경우)
-    try:
-        end_s = float(
-            scn.get_time_point(scn.get_number_of_iterations() - 1).time_s)
-        if end_s > start_s + 1e-9:
-            return end_s - start_s
-    except Exception:
-        pass
-
     # 3) fallback: DB의 실제 끝 시각(마이크로초)으로 계산
-    try:
-        # 내부 모듈: nuPlan devkit 표준
-        from nuplan.database.nuplan_db.nuplan_scenario_queries import get_end_sensor_time_from_db
-        from nuplan.database.nuplan_db.nuplan_db_utils import get_lidarpc_sensor_data
+    # 내부 모듈: nuPlan devkit 표준
 
-        # NuPlanScenario는 _log_file을 보유 (public은 아니지만 일반적으로 접근 가능)
-        log_file_path: str = getattr(scn, "_log_file")
-        end_us: int = get_end_sensor_time_from_db(log_file_path,
-                                                  get_lidarpc_sensor_data())
-        end_s = float(end_us) * 1e-6
-        return max(0.0, end_s - start_s)
-    except Exception:
-        # 4) 최후의 수단: 미래 타임스탬프를 큰 horizon으로 끝까지 스트리밍 (느릴 수 있음)
-        last_s = start_s
-        try:
-            for tp in scn.get_future_timestamps(
-                    0, time_horizon=10_000.0):  # 10k초면 사실상 끝까지
-                last_s = float(tp.time_s)
-        except Exception:
-            pass
-        return max(0.0, last_s - start_s)
+    # NuPlanScenario는 _log_file을 보유 (public은 아니지만 일반적으로 접근 가능)
+    log_file_path: str = getattr(scn, "_log_file")
+    end_us: int = get_end_sensor_time_from_db(log_file_path,
+                                              get_lidarpc_sensor_data())
+    end_s = float(end_us) * 1e-6
+    return max(0.0, end_s - start_s)
 
 
-def get_npc_route_roadblock_ids(
+def get_npc_route_roadblock_ids2(
     scenario: NuPlanScenario,
     neighbor_track_token: List[Optional[str]],
 ) -> Dict[str, Optional[List[str]]]:
@@ -729,7 +793,7 @@ def get_npc_route_roadblock_ids(
                 키=토큰, 값=해당 차량의 시간 순 궤적 리스트(길이 가변).
         """
         car_token_to_object_list: Dict[str,
-                                      List[TrackedObject]] = defaultdict(list)
+                                       List[TrackedObject]] = defaultdict(list)
         num_samples = int(total_horizon_s * 10)  # 0.1 s 간격
         for det_batch in scenario.get_future_tracked_objects(
                 0, total_horizon_s, num_samples):

@@ -29,7 +29,7 @@ from diffusion_planner.data_process.utils import vector_set_coordinates_to_local
 def _get_lane_polylines(
     map_api: AbstractMap, point: Point2D, ego_heading: float, radius: float
 ) -> Tuple[MapObjectPolylines, MapObjectPolylines, MapObjectPolylines,
-           LaneSegmentLaneIDs]:
+           LaneSegmentLaneIDs, List[float], List[bool], List[str]]:
     """
     Extract ids, baseline path polylines, and boundary polylines of neighbor lanes and lane connectors around ego vehicle.
     :param map_api: map to perform extraction on.
@@ -110,8 +110,8 @@ def get_neighbor_vector_set_map(
     ego_heading: float,
     radius: float,
     traffic_light_status_data: List[TrafficLightStatusData],
-) -> Tuple[Dict[str, MapObjectPolylines], Dict[str,
-                                               LaneSegmentTrafficLightData]]:
+) -> Tuple[Dict[str, MapObjectPolylines], Dict[
+        str, LaneSegmentTrafficLightData], Dict[str, np.ndarray], List[str]]:
     """
     Extract neighbor vector set map information around ego vehicle.
     :param map_api: map to perform extraction on.
@@ -321,7 +321,7 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 def _compute_lane_on_npc_routes(
         car_token_to_rr_ids: Dict[
             str, Optional[List[str]]],  # 길이 ≤ agent_num (차량만 포함 가능)
-        lane_routes: List[str],  # 길이 = lane_num
+        lane_routes: List[str],  # 길이 <= lane_num 이하
 ) -> Dict[str, List[bool]]:
     """토큰별 NPC 경로가 현재 추출된 차선(lane_routes)에 포함되는지 불리언 마스크로 반환한다.
 
@@ -334,11 +334,11 @@ def _compute_lane_on_npc_routes(
             키 = 토큰(str), 값 = 보정된 RoadBlock ID 시퀀스(List[str]) 또는 None.
             길이 ≤ agent_num (차량만 선별).
         lane_routes (List[str]):
-            길이 = lane_num. 현재 샘플에서 추출된 lane들의 roadblock id(거리 순 정렬).
+            길이 <= lane_num. 현재 샘플에서 추출된 lane들의 roadblock id(거리 순 정렬).
 
     Returns:
         Dict[str, List[bool]]:
-            `token_to_lane_on_routes`. 키=토큰, 값=길이 lane_num의 불리언 리스트.
+            `token_to_lane_on_routes`. 키=토큰, 값=길이  <= lane_num의 불리언 리스트.
             각 j에 대해 lane_routes[j]가 해당 토큰의 보정 경로에 포함되면 True.
 
     Notes:
@@ -356,15 +356,15 @@ def _compute_lane_on_npc_routes(
 
         Args:
             npc_route_ids (Optional[List[str]]): 보정된 NPC 경로 ID 시퀀스(가변 길이) 또는 None.
-            lane_routes (List[str]): 길이 = lane_num. 현재 샘플 lane의 roadblock ID.
+            lane_routes (List[str]): 길이 <= lane_num. 현재 샘플 lane의 roadblock ID.
             lane_routes_set (Set[str]): `lane_routes`의 집합 표현.
 
         Returns:
-            List[bool]: 길이 = lane_num. 포함 여부 불리언 마스크.
+            List[bool]: 길이 = len(lane_routes). 포함 여부 불리언 마스크.
         """
-        lane_num: int = len(lane_routes)
+        valid_lane_num: int = len(lane_routes)
         if npc_route_ids is None:
-            return [False] * lane_num
+            return [False] * valid_lane_num
 
         # lane_routes 안에 실제 존재하는 후보만 필터링
         candidate_ids_in_lane: Set[str] = {
@@ -374,8 +374,8 @@ def _compute_lane_on_npc_routes(
         pruned_route_ids_list: List[str] = _prune_route_by_connectivity(
             npc_route_ids, candidate_ids_in_lane)
         pruned_route_ids_set: Set[str] = set(pruned_route_ids_list)
-
-        return [route in pruned_route_ids_set for route in lane_routes]
+        a = [route in pruned_route_ids_set for route in lane_routes]
+        return a
 
     lane_routes_set: Set[str] = set(lane_routes)
     car_token_to_lane_on_routes: Dict[str, List[bool]] = {}
@@ -492,7 +492,7 @@ def map_process(
                         car_token_to_rr_ids, lane_routes)
 
                 for route in lane_routes:
-                    lane_on_route.append(route in route_roadblock_ids)
+                    lane_on_route.append(route in pruned_route_roadblock_ids)
 
             elif feature_name == 'LEFT_BOUNDARY' or feature_name == 'RIGHT_BOUNDARY':
                 continue
