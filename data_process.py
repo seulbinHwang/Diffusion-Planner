@@ -573,7 +573,7 @@ if __name__ == "__main__":
         args.scenarios_per_type,
         args.total_scenarios,
         args.shuffle_scenarios,
-        log_names=None,#log_names  # 깨진 로그가 빠진 목록
+        log_names=log_names,  # 깨진 로그가 빠진 목록
     ))
     # 5) 시나리오 생성
     loader_pool = SingleMachineParallelExecutor(
@@ -602,7 +602,7 @@ if __name__ == "__main__":
     remaining_ids = scenario_id_map.keys() - processed
     # 6-3) 최종 리스트
     remaining = [scenario_id_map[token] for token in remaining_ids]
-    remaining = remaining[:88]
+    remaining = remaining
     print(f"Remaining to process: {len(remaining)}")
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
