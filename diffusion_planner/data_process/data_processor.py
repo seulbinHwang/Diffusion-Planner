@@ -257,9 +257,11 @@ class DataProcessor(object):
         # Indices 마스킹 (옵션)
         filtered_neighbor_indices: Optional[np.ndarray] = None
         if neighbor_indices is not None:
-            neighbor_indices = np.array(neighbor_indices) # (N,) # N은 agent_num 이하
+            neighbor_indices = np.array(
+                neighbor_indices)  # (N,) # N은 agent_num 이하
             N_len_mask = mask[:len(neighbor_indices)]  # (N,)
-            filtered_neighbor_indices = neighbor_indices[N_len_mask] # (N`,) # N`는 N 이하
+            filtered_neighbor_indices = neighbor_indices[
+                N_len_mask]  # (N`,) # N`는 N 이하
 
         return filtered_neighbor_agents_past, filtered_neighbor_agents_future, filtered_neighbor_indices
 
@@ -337,12 +339,12 @@ class DataProcessor(object):
                                                    self._radius,
                                                    traffic_light_data)
         # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
-        neighbor_token_to_rr_ids: Dict[
+        car_token_to_rr_ids: Dict[
             str, Optional[List[str]]] = get_npc_route_roadblock_ids(
                 scenario, neighbor_track_token)
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
-        vector_map = map_process(route_roadblock_ids, neighbor_token_to_rr_ids,
+        vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,
                                  neighbor_track_token, neighbor_agents_current,
                                  anchor_ego_state, coords, traffic_light_data,
                                  speed_limit, lane_route, self._map_features,
@@ -434,7 +436,7 @@ class DataProcessor(object):
                 route_roadblock_ids = route_roadblock_correction(
                     ego_state, map_api, route_roadblock_ids)
             # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
-            neighbor_token_to_rr_ids: Dict[
+            car_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
                     scenario, neighbor_track_token)
 
@@ -445,7 +447,7 @@ class DataProcessor(object):
                                                        self._radius,
                                                        traffic_light_data)
             vector_map = map_process(
-                route_roadblock_ids, neighbor_token_to_rr_ids,
+                route_roadblock_ids, car_token_to_rr_ids,
                 neighbor_track_token, neighbor_agents_current, anchor_ego_state,
                 coords, traffic_light_data, speed_limit, lane_route,
                 self._map_features, self._max_elements, self._max_points)
@@ -544,8 +546,7 @@ class DataProcessor(object):
 
             # 디버깅용 그림 그리기
             save_dir = os.path.join(self._save_dir, "debug_vis")
-            save_path = os.path.join(save_dir,
-                                        f"{map_name}_{token}.png")
+            save_path = os.path.join(save_dir, f"{map_name}_{token}.png")
             os.makedirs(save_dir, exist_ok=True)
             if self._wandb_enabled or self.config.save_image:
                 print("Visualizing scenario:", map_name, token)

@@ -585,7 +585,7 @@ def draw_lane_centerlines(
             )
 
         base_fs = max(1, options.agent_index_fontsize - 1)  # 조금 작게
-        vstep = 0.15  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
+        vstep = 0.15 * 2.  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
 
         # 각 차선 j 순회
         for j in range(lane_num):
@@ -1071,7 +1071,7 @@ def draw_world_model_to_png(
             ax,
             lanes,
             draw_option,
-            agent_route_lane_order=agent_route_lane_order,
+            agent_route_lane_order=route_order_K,
         )
 
     # 이웃 에이전트 미래 포인트(x마커)

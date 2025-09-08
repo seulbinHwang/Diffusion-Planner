@@ -319,64 +319,75 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
 
 def _compute_lane_on_npc_routes(
-        neighbor_token_to_rr_ids: Dict[str,
-                                       Optional[List[str]]],  # 길이: agent_num 보다 작을 수 있음 (자동차만 선별 했으니까)
-        lane_routes: List[str],  # 길이 lane_num
+        car_token_to_rr_ids: Dict[
+            str, Optional[List[str]]],  # 길이 ≤ agent_num (차량만 포함 가능)
+        lane_routes: List[str],  # 길이 = lane_num
 ) -> Dict[str, List[bool]]:
-    """토큰별 NPC 경로(보정)가 현재 추출된 차선 목록(lane_routes)에 포함되는지 불리언 마스크로 반환합니다.
+    """토큰별 NPC 경로가 현재 추출된 차선(lane_routes)에 포함되는지 불리언 마스크로 반환한다.
 
-    성능 최적화:
-        - `lane_routes`를 집합(set)으로 변환해 멤버십 체크를 상수 시간으로 수행합니다.
+    각 토큰의 경로(RoadBlock ID 시퀀스)를 현재 샘플에서 추출된 lane의 roadblock id 리스트
+    `lane_routes`에 대하여 멤버십으로 투영한다. 연결성 보정을 위해
+    `_prune_route_by_connectivity`를 사용하여 연속 구간만 유지한다.
 
     Args:
-        neighbor_token_to_rr_ids (Dict[str, Optional[List[str]]]):
-            토큰 → **보정된** route roadblock ID 리스트(또는 None).
-             # 길아: agent_num 보다 작거나 같음
-        lane_routes (List[str]): # 길이 lane_num
-            길이 M의 roadblock ID 리스트. 현재 프레임에서 추출된 차선들(거리 가까운 순 정렬).
+        car_token_to_rr_ids (Dict[str, Optional[List[str]]]):
+            키 = 토큰(str), 값 = 보정된 RoadBlock ID 시퀀스(List[str]) 또는 None.
+            길이 ≤ agent_num (차량만 선별되었을 수 있음).
+        lane_routes (List[str]):
+            길이 = lane_num. 현재 샘플에서 추출된 lane들의 roadblock id(거리 순 정렬).
 
     Returns:
         Dict[str, List[bool]]:
-            - `token_to_lane_on_routes`
-            - 키: NPC 토큰(str)
-            - 값: 길이 M의 불리언 리스트. `lane_routes[j]`가 해당 NPC의 보정 경로에
-              포함되면 True, 아니면 False.
+            `token_to_lane_on_routes`. 키=토큰, 값=길이 lane_num의 불리언 리스트.
+            각 j에 대해 lane_routes[j]가 해당 토큰의 보정 경로에 포함되면 True.
 
     Notes:
-        - lane_num = len(lane_routes).
-        - 보정 경로는 `_prune_route_by_connectivity`로 **연속 구간**만 보존합니다.
+        - 시간 복잡도 절감을 위해 `lane_routes`는 집합으로 변환 후 멤버십 체크.
+        - 연결성 보정은 `_prune_route_by_connectivity(route_ids, ids_in_lane_set)` 호출.
     """
+    from typing import Dict, List, Optional, Set
 
-    # 집합으로 변환하여 멤버십 체크 비용을 상수화
-    lane_routes_set: Set[str] = set(lane_routes)
-    lane_num: int = len(lane_routes)
-    # 길이: agent_num
-    token_to_lane_on_routes: Dict[str, List[bool]] = {}
-    for token, npc_route_ids in neighbor_token_to_rr_ids.items():
+    def _build_mask_for_token(
+        npc_route_ids: Optional[List[str]],
+        lane_routes: List[str],
+        lane_routes_set: Set[str],
+    ) -> List[bool]:
+        """단일 토큰에 대한 lane 포함 마스크를 생성한다.
+
+        Args:
+            npc_route_ids (Optional[List[str]]): 보정된 NPC 경로 ID 시퀀스(가변 길이) 또는 None.
+            lane_routes (List[str]): 길이 = lane_num. 현재 샘플 lane의 roadblock ID.
+            lane_routes_set (Set[str]): `lane_routes`의 집합 표현.
+
+        Returns:
+            List[bool]: 길이 = lane_num. 포함 여부 불리언 마스크.
+        """
+        lane_num: int = len(lane_routes)
         if npc_route_ids is None:
-            token_to_lane_on_routes[token] = [False] * lane_num
-            continue
+            return [False] * lane_num
 
-        # lane_routes 안에 실제 존재하는 후보만 필터
+        # lane_routes 안에 실제 존재하는 후보만 필터링
         candidate_ids_in_lane: Set[str] = {
             rid for rid in npc_route_ids if rid in lane_routes_set
         }
-        # 연결성 보정(연속 구간)
+        # 연속 구간 보정
         pruned_route_ids_list: List[str] = _prune_route_by_connectivity(
             npc_route_ids, candidate_ids_in_lane)
         pruned_route_ids_set: Set[str] = set(pruned_route_ids_list)
 
-        # lane_routes 순서에 맞춰 불리언 마스크 생성
-        token_to_lane_on_routes[token] = [
-            route in pruned_route_ids_set for route in lane_routes
-        ]
+        return [route in pruned_route_ids_set for route in lane_routes]
 
+    lane_routes_set: Set[str] = set(lane_routes)
+    token_to_lane_on_routes: Dict[str, List[bool]] = {}
+    for token, npc_route_ids in car_token_to_rr_ids.items():
+        token_to_lane_on_routes[token] = _build_mask_for_token(
+            npc_route_ids, lane_routes, lane_routes_set)
     return token_to_lane_on_routes
 
 
 def map_process(
         route_roadblock_ids,
-        neighbor_token_to_rr_ids: Dict[str, Optional[List[str]]],
+        car_token_to_rr_ids: Dict[str, Optional[List[str]]],
         neighbor_track_token: List[Optional[str]],  # 길이: agent_num
         neighbor_agents_current,  # # (agent_num, 11)
         anchor_ego_state,
@@ -477,7 +488,7 @@ def map_process(
                 # token_to_lane_on_routes: 길이 agent_num
                 token_to_lane_on_routes: Dict[
                     str, List[bool]] = _compute_lane_on_npc_routes(
-                        neighbor_token_to_rr_ids, lane_routes)
+                        car_token_to_rr_ids, lane_routes)
 
                 for route in lane_routes:
                     lane_on_route.append(route in pruned_route_roadblock_ids)

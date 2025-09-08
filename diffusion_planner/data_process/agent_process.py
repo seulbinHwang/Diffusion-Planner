@@ -136,7 +136,8 @@ def sampled_ego_objects_to_array_list(
     return all_frame_ego_feature
 
 
-def sampled_static_objects_to_array_list(present_tracked_objects: TrackedObjects):
+def sampled_static_objects_to_array_list(
+        present_tracked_objects: TrackedObjects):
 
     static_object_types = [
         TrackedObjectType.CZONE_SIGN, TrackedObjectType.BARRIER,

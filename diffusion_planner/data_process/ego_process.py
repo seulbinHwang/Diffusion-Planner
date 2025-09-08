@@ -54,7 +54,8 @@ def sampled_past_ego_states_to_array(
         output[i,
                EgoInternalIndex.heading()] = past_ego_states[i].center.heading
         # --- 자차좌표계 → 세계좌표계 속도 변환: 회전만 적용 ---
-        v_local = past_ego_states[i].dynamic_car_state.center_velocity_2d  # body-frame velocity
+        v_local = past_ego_states[
+            i].dynamic_car_state.center_velocity_2d  # body-frame velocity
         he = float(past_ego_states[i].center.heading)
         c, s = np.cos(he), np.sin(he)
         vx_w = c * float(v_local.x) - s * float(v_local.y)
@@ -98,7 +99,8 @@ def sampled_future_ego_states_to_array(
         output[i,
                EgoInternalIndex.heading()] = future_ego_states[i].center.heading
         # --- 자차좌표계 → 세계좌표계 속도 변환: 회전만 적용 ---
-        v_local = future_ego_states[i].dynamic_car_state.center_velocity_2d  # body-frame velocity
+        v_local = future_ego_states[
+            i].dynamic_car_state.center_velocity_2d  # body-frame velocity
         he = float(future_ego_states[i].center.heading)
         c, s = np.cos(he), np.sin(he)
         vx_w = c * float(v_local.x) - s * float(v_local.y)
