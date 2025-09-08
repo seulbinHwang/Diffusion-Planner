@@ -498,7 +498,7 @@ if __name__ == "__main__":
                         help='number of route lanes')
     # ────── WandB 옵션 추가 ──────
     parser.add_argument('--use_wandb', default=False, type=boolean)
-    parser.add_argument('--save_image', default=True, type=boolean)
+    parser.add_argument('--save_image', default=False, type=boolean)
 
     parser.add_argument('--wandb_project',
                         type=str,
