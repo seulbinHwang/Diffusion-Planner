@@ -70,7 +70,7 @@ def get_npc_route_roadblock_ids(
     num_samples = int(horizon / 0.1)
     # 1) 에이전트별 StateSE2 리스트 수집
     neighbor_track_token_set = set(
-        [t for t in neighbor_track_token if t is not None])
+        [str(t) for t in neighbor_track_token if t is not None])
     if not neighbor_track_token_set:
         return {}
     trajectories: Dict[str, List[SimpleNamespace]] = defaultdict(list)
@@ -86,7 +86,7 @@ def get_npc_route_roadblock_ids(
             # obj: TrackedObjects
             if obj.tracked_object_type != TrackedObjectType.VEHICLE:
                 continue
-            token = obj.track_token
+            token = str(obj.track_token)
             if token not in neighbor_track_token_set:
                 continue
             # heading은 실제로 사용하지 않지만, 넣어도 무방(여기서는 0.0 또는 obj.center.heading 가능)

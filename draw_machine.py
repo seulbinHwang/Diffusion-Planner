@@ -163,7 +163,7 @@ class DrawingOptions:
     route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 흰색
     neighbor_future_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     # 🔽 새 옵션
-    max_agents_to_draw: Optional[int] = 5
+    max_agents_to_draw: Optional[int] = None
 
 # 스타일 사전
 EGO_PAST_STYLE = {
@@ -1071,7 +1071,7 @@ def draw_world_model_to_png(
             ax,
             lanes,
             draw_option,
-            agent_route_lane_order=route_order_K,
+            agent_route_lane_order=None, #route_order_K,
         )
 
     # 이웃 에이전트 미래 포인트(x마커)

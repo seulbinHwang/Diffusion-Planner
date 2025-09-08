@@ -303,7 +303,8 @@ def agent_past_process(
     present_static_feature: np.ndarray,  # (cur_static_num, 5)
     static_objects_types: List[TrackedObjectType],
     num_static: int,
-    max_ped_bike: int,
+    max_pedestrians: int,
+    max_bicycles: int,
     anchor_ego_state: np.ndarray,  #(3,)
 ) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray, int]:
     # ego_agent_past: (num_frames, 11)
@@ -320,7 +321,8 @@ def agent_past_process(
     :param present_static_feature: The input array data of static objects in the past.
     :param static_objects_types: The type of static objects in the past.
     :param num_static: Clip the number of static objects.
-    :param max_ped_bike: Clip the total number of ped and bike.
+    :param max_pedestrians: Upper bound for pedestrians to keep (hard cap).
+    :param max_bicycles: Upper bound for bicycles to keep (hard cap).
     :param anchor_ego_state: Ego current state
     :return: ego_agent_past, agents, sorted_cur_neighbor_indices, present_static_feature, final_vehicle_num
     """
@@ -441,47 +443,43 @@ def agent_past_process(
     # Sort indices by distance
     # sorted_cur_agent_indices: (current_agents_num,) # order method: ascending
     sorted_cur_agent_indices = np.argsort(dist_from_cur_agent_to_ego)
-
-    # Collect the indices of pedestrians and bicycles
-    ped_bike_sorted_indices = [
-        sorted_idx for sorted_idx in sorted_cur_agent_indices
-        if current_agent_types[sorted_idx] in (TrackedObjectType.PEDESTRIAN,
-                                               TrackedObjectType.BICYCLE)
+    ##################
+    # ── 타입별 거리 오름차순 인덱스 수집 ───────────────────────────
+    ped_sorted_indices = [
+        idx for idx in sorted_cur_agent_indices
+        if current_agent_types[idx] == TrackedObjectType.PEDESTRIAN
+    ]
+    bike_sorted_indices = [
+        idx for idx in sorted_cur_agent_indices
+        if current_agent_types[idx] == TrackedObjectType.BICYCLE
     ]
     vehicle_sorted_indices = [
-        sorted_idx for sorted_idx in sorted_cur_agent_indices
-        if current_agent_types[sorted_idx] == TrackedObjectType.VEHICLE
+        idx for idx in sorted_cur_agent_indices
+        if current_agent_types[idx] == TrackedObjectType.VEHICLE
     ]
 
-    # If the total number of available agents is less than or equal to agent_num, no need to filter further
+    # ── 보행자/자전거 상한 적용(하드 캡) ────────────────────────────
+    # agent_num을 넘지 않도록 캡 자체도 안전하게 제한
+    ped_cap = min(max_pedestrians, agent_num)
+    sel_peds = ped_sorted_indices[:ped_cap]
 
-    if len(ped_bike_sorted_indices) + len(vehicle_sorted_indices) <= agent_num:
-        """
-        sorted_cur_neighbor_indices 는 agent_num 보다 작을수도 있다.
-        """
-        sorted_cur_neighbor_indices = sorted_cur_agent_indices[:agent_num]
-    else:
-        # Limit the number of pedestrians and bicycles to max_ped_bike, while retaining the remaining ones for later use
-        selected_ped_bike_indices = ped_bike_sorted_indices[:max_ped_bike]
-        unselected_ped_bike_indices = ped_bike_sorted_indices[max_ped_bike:]
+    remain = agent_num - len(sel_peds)
+    bike_cap = min(max_bicycles, remain)
+    sel_bikes = bike_sorted_indices[:bike_cap]
 
-        # Combine the limited pedestrians/bicycles and all available vehicles
-        sorted_cur_neighbor_indices = selected_ped_bike_indices + vehicle_sorted_indices
+    # ── 남는 슬롯은 차량으로 채움(차량은 상한 없음) ───────────────
+    remain -= len(sel_bikes)
+    sel_vehs = vehicle_sorted_indices[:max(0, remain)]
 
-        # If the combined selection is still less than agent_num, fill the remaining slots with additional pedestrians and bicycles
-        remaining_slots = agent_num - len(sorted_cur_neighbor_indices)
-        if remaining_slots > 0:
-            sorted_cur_neighbor_indices += unselected_ped_bike_indices[:
-                                                                       remaining_slots]
+    selected_indices = sel_peds + sel_bikes + sel_vehs
 
-        # Sort and limit the selected indices to agent_num
+    # 전역 거리 기준으로 다시 정렬하고 agent_num으로 클립
+    sorted_cur_neighbor_indices = sorted(
+        selected_indices,
+        key=lambda idx: dist_from_cur_agent_to_ego[idx])[:agent_num]
 
-        sorted_cur_neighbor_indices = sorted(
-            sorted_cur_neighbor_indices,
-            key=lambda idx: dist_from_cur_agent_to_ego[idx])[:agent_num]
-        """
-        sorted_cur_neighbor_indices 의 길이는 무조건 agent_num 이다.
-        """
+    ##################
+
     final_vehicle_num = len([
         idx for idx in sorted_cur_neighbor_indices
         if current_agent_types[idx] == TrackedObjectType.VEHICLE

@@ -40,9 +40,14 @@ class StateNormalizer:
 
 
 class ObservationNormalizer:
-
+    # [ADD] 정규화에서 절대 건드리지 말아야 할 키(항상 원본 그대로 유지)
+    PASSTHROUGH_KEYS = {"agent_route_lane_order"}
     def __init__(self, normalization_dict):
-        self._normalization_dict = normalization_dict
+        # [ADD] 혹시 dict 안에 들어있더라도 패스스루 키는 제거
+        self._normalization_dict = {
+            k: v for k, v in normalization_dict.items()
+            if k not in self.PASSTHROUGH_KEYS
+        }
 
     @classmethod
     def from_json(cls, args):
@@ -67,11 +72,14 @@ class ObservationNormalizer:
         data = openjson(path)
         ndt = {}
         for k, v in data.items():
-            if k not in ["ego", "neighbor"]:
-                ndt[k] = {
-                    "mean": torch.tensor(v["mean"], dtype=torch.float32),
-                    "std": torch.tensor(v["std"], dtype=torch.float32)
-                }
+            if k in ["ego", "neighbor"]:
+                continue
+            if k in cls.PASSTHROUGH_KEYS:
+                continue
+            ndt[k] = {
+                "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                "std": torch.tensor(v["std"], dtype=torch.float32),
+            }
         return cls(ndt)
 
     def __call__(self, data):
@@ -83,17 +91,27 @@ class ObservationNormalizer:
             norm_data[k] = (data[k] - v["mean"].to(
                 data[k].device)) / v["std"].to(data[k].device)
             norm_data[k][mask] = 0
+        # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
+        if "agent_route_lane_order" in data:
+            norm_data["agent_route_lane_order"] = data["agent_route_lane_order"].to(torch.long)
+
         return norm_data
 
-    def inverse(self, data):
+    def inverse(self, data: dict) -> dict:
         norm_data = copy(data)
+
+        # 역정규화도 정의된 키만 수행
         for k, v in self._normalization_dict.items():
-            if k not in data:  # Check if key `k` exists in `data`
+            if k not in data:
                 continue
             mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
-            norm_data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(
-                data[k].device)
+            norm_data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(data[k].device)
             norm_data[k][mask] = 0
+
+        # 패스스루 키는 원본 그대로 (정수 유지)
+        if "agent_route_lane_order" in data:
+            norm_data["agent_route_lane_order"] = data["agent_route_lane_order"].to(torch.long)
+
         return norm_data
 
     def to_dict(self):

@@ -113,47 +113,126 @@ def _plot_and_save_histograms(
     out_path: str,
     title_prefix: str = "Dataset Statistics",
 ) -> None:
-    """수집된 리스트로 5개 히스토그램을 그리고 하나의 PNG로 저장한다."""
-    # 5개 subplot (3x2 레이아웃; 마지막 한 칸은 비워둠)
+    """수집된 리스트로 5개 히스토그램을 그리고 하나의 PNG로 저장한다.
+    - y축: % (전체 대비 비율)
+    - vehicle/pedestrian/bicycle: 정수 구간(bin)
+    - bins='auto' 대신 가중치 지원되는 **엣지 직접 계산** 사용
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
+
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
     axes = axes.ravel()
 
-    def _hist(ax, data, title, xlabel, bins="auto"):
-        if len(data) == 0:
+    def _int_bin_edges(data: np.ndarray) -> np.ndarray:
+        """정수형 데이터용 bin edges(정수 중앙에 막대가 오도록 -0.5, +0.5 간격)."""
+        if data.size == 0:
+            return np.array([-0.5, 0.5], dtype=float)
+        vmin = max(0, int(np.floor(np.nanmin(data))))
+        vmax = int(np.ceil(np.nanmax(data)))
+        if vmax < vmin:
+            vmax = vmin
+        return np.arange(vmin - 0.5, vmax + 1.5, 1.0)
+
+    def _auto_continuous_edges(data: np.ndarray, max_bins: int = 50) -> np.ndarray:
+        """가중치 지원을 위해 '엣지'를 직접 만들기(Freedman–Diaconis 유사)."""
+        data = data[np.isfinite(data)]
+        if data.size == 0:
+            return np.array([0.0, 1.0])
+        dmin, dmax = float(np.min(data)), float(np.max(data))
+        if not np.isfinite(dmin) or not np.isfinite(dmax):
+            return np.array([0.0, 1.0])
+        if dmax <= dmin:
+            eps = 1.0 if dmax == 0 else abs(dmax) * 0.1
+            return np.array([dmin - eps, dmax + eps])
+
+        q25, q75 = np.percentile(data, [25, 75])
+        iqr = q75 - q25
+        n = data.size
+        if iqr > 0:
+            bw = 2.0 * iqr * (n ** (-1.0 / 3.0))
+        else:
+            sd = np.std(data)
+            bw = 3.5 * sd * (n ** (-1.0 / 3.0)) if sd > 0 else (dmax - dmin) / 10.0
+        bw = max(bw, (dmax - dmin) / 100.0)  # 너무 촘촘/빈약 방지
+
+        nbins = int(np.ceil((dmax - dmin) / bw))
+        nbins = max(5, min(nbins, max_bins))
+        return np.linspace(dmin, dmax, nbins + 1)
+
+    def _hist(ax, data, title, xlabel, bins="auto", integer_bins=False):
+        data = np.asarray(data, dtype=float)
+        data = data[np.isfinite(data)]
+        if data.size == 0:
             ax.text(0.5, 0.5, "No Data", ha="center", va="center")
             ax.set_title(title)
             ax.set_xlabel(xlabel)
-            ax.set_ylabel("Count")
+            ax.set_ylabel("Percentage of samples (%)")
+            ax.grid(True, alpha=0.3)
             return
-        ax.hist(data, bins=bins)
+
+        # y축을 %로: 각 샘플에 100/N 가중치
+        weights = np.full_like(data, 100.0 / data.size, dtype=float)
+
+        # bin 엣지 결정
+        if integer_bins:
+            edges = _int_bin_edges(data)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        else:
+            if isinstance(bins, int):
+                # 명시적 bin 개수 → 엣지 균등 분할
+                dmin, dmax = float(np.min(data)), float(np.max(data))
+                if dmax <= dmin:
+                    edges = np.array([dmin - 0.5, dmax + 0.5])
+                else:
+                    edges = np.linspace(dmin, dmax, bins + 1)
+            else:
+                # 'auto' 등 문자열 → 직접 엣지 계산
+                edges = _auto_continuous_edges(data)
+
+        ax.hist(data, bins=edges, weights=weights)
         ax.set_title(title)
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("Count")
+        ax.set_ylabel("Percentage of samples (%)")
         ax.grid(True, alpha=0.3)
 
-    _hist(axes[0], stats["vehicle_count"], f"{title_prefix}: Vehicles / sample",
-          "Vehicles per sample")
+    # 정수 개수 계열(대수): 정수 bin + % y축
+    _hist(axes[0], stats["vehicle_count"],
+          f"{title_prefix}: Vehicles / sample",
+          "Vehicles per sample",
+          integer_bins=True)
+
     _hist(axes[1], stats["pedestrian_count"],
-          f"{title_prefix}: Pedestrians / sample", "Pedestrians per sample")
-    _hist(axes[2], stats["bicycle_count"], f"{title_prefix}: Bicycles / sample",
-          "Bicycles per sample")
-    _hist(axes[3],
-          stats["lane_speed_limit_ratio_percent"],
+          f"{title_prefix}: Pedestrians / sample",
+          "Pedestrians per sample",
+          integer_bins=True)
+
+    _hist(axes[2], stats["bicycle_count"],
+          f"{title_prefix}: Bicycles / sample",
+          "Bicycles per sample",
+          integer_bins=True)
+
+    # 비율(%): 명시적인 bin 개수(20) → 엣지 생성 + % y축
+    _hist(axes[3], stats["lane_speed_limit_ratio_percent"],
           f"{title_prefix}: % Lanes with speed limit",
           "% (per sample)",
-          bins=20)
-    _hist(axes[4],
-          stats["mean_speed_limit_kmh"],
+          bins=20,
+          integer_bins=False)
+
+    # 연속값: 자동 엣지 계산 + % y축
+    _hist(axes[4], stats["mean_speed_limit_kmh"],
           f"{title_prefix}: Mean speed limit (km/h) on limited lanes",
           "km/h",
-          bins=20)
+          bins="auto",   # 내부에서 엣지 직접 계산
+          integer_bins=False)
 
-    # 마지막 subplot 비우기
     axes[5].axis("off")
-
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
 
 
 def available_cpu_count() -> int:
@@ -523,7 +602,7 @@ if __name__ == "__main__":
     remaining_ids = scenario_id_map.keys() - processed
     # 6-3) 최종 리스트
     remaining = [scenario_id_map[token] for token in remaining_ids]
-    remaining = remaining[:10]
+    remaining = remaining[:88]
     print(f"Remaining to process: {len(remaining)}")
 
     # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
@@ -561,5 +640,5 @@ if __name__ == "__main__":
     save_path = os.path.join(args.save_path, "histograms")
     os.makedirs(save_path, exist_ok=True)
     hist_png = os.path.join(args.save_path, "dataset_statistics_histograms.png")
-    _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-Planner")
+    _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-world model")
     print(f"Saved histogram PNG: {hist_png}")

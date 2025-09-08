@@ -534,6 +534,11 @@ def map_process(
                 car_token_to_lane_on_routes, neighbor_track_token,
                 neighbor_agents_current, vector_map_lanes,
                 max_elements["ROUTE_LANES"])
+            if isinstance(agent_route_lane_order, np.ndarray):
+                if agent_route_lane_order.dtype != np.int64:
+                    agent_route_lane_order = agent_route_lane_order.astype(np.int64)
+            else:
+                agent_route_lane_order = np.asarray(agent_route_lane_order, dtype=np.int64)
 
         elif feature_name == "ROUTE_LANES":
             loc = 0
@@ -567,7 +572,7 @@ def map_process(
         'route_lanes_has_speed_limit':
             route_lanes_has_speed_limit,  # (route_num, 1),
         "agent_route_lane_order":
-            agent_route_lane_order  # (agent_num, lane_num) # -1 if not on route
+            agent_route_lane_order  # (agent_num, lane_num) # -1 if not on route # <- np.int64 보장
     }
 
     return vector_map_output

@@ -43,7 +43,14 @@ class DataProcessor(object):
 
         self.num_agents = config.agent_num
         self.num_static = config.static_objects_num
-        self.max_ped_bike = 10  # Limit the number of pedestrians and bicycles in the agent.
+        # [변경] 타입별 상한 신설: 보행자/자전거
+        self.max_pedestrians = getattr(config, "max_pedestrians", 128)
+        self.max_bicycles = getattr(config, "max_bicycles", 64)
+        # 안전 검사: 타입별 상한 합이 전체 슬롯보다 크지 않도록
+        assert self.max_pedestrians >= 0 and self.max_bicycles >= 0
+        assert (self.max_pedestrians + self.max_bicycles) <= self.num_agents, \
+            f"Type caps exceed agent_num: {self.max_pedestrians}+{self.max_bicycles} > {self.num_agents}"
+
         self._radius = 100  # [m] query radius scope relative to the current pose.
 
         self._map_features = [
@@ -317,8 +324,8 @@ class DataProcessor(object):
          static_objects, final_veh_num) = agent_past_process(
              all_frame_ego_feature, all_frame_agents_feature,
              all_frame_agents_types, self.num_agents, present_static_feature,
-             static_objects_types, self.num_static, self.max_ped_bike,
-             anchor_ego_state)
+             static_objects_types, self.num_static, self.max_pedestrians,
+             self.max_bicycles, anchor_ego_state)
         neighbor_agents_past, _, neighbor_indices = \
             self._filter_agents_within_radius(neighbor_agents_past,
                                               None, neighbor_indices)
@@ -374,15 +381,18 @@ class DataProcessor(object):
                 neighbor_agents_past[:, -21:],  # (agent_num, time_len, 11)
             "static_objects": static_objects
         }
+        if "agent_route_lane_order" in vector_map:
+            aro = vector_map["agent_route_lane_order"]
+            if isinstance(aro, np.ndarray) and aro.dtype != np.int64:
+                vector_map["agent_route_lane_order"] = aro.astype(np.int64)
         # data: Dict[str, np.ndarray]
         data.update(vector_map)
         # data: Dict[str, torch.Tensor]
         data = convert_to_model_inputs(data, device, squeeze)
-        if "agent_route_lane_order" in vector_map and isinstance(
-                vector_map["agent_route_lane_order"], np.ndarray):
-            vector_map["agent_route_lane_order"] = vector_map[
-                "agent_route_lane_order"].astype(np.int64)
-
+        # 변환 후에도 안전하게 보정
+        if "agent_route_lane_order" in data:
+            data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
+                torch.int64)
         return data
 
     @staticmethod
@@ -486,7 +496,7 @@ class DataProcessor(object):
                  all_frame_ego_feature, all_frame_agents_feature,
                  all_frame_agents_types, self.num_agents,
                  present_static_feature, static_objects_types, self.num_static,
-                 self.max_ped_bike, anchor_ego_state)
+                 self.max_pedestrians, self.max_bicycles, anchor_ego_state)
 
             neighbor_agents_past, _, neighbor_indices = \
                 self._filter_agents_within_radius(neighbor_agents_past,
@@ -617,6 +627,10 @@ class DataProcessor(object):
                     neighbor_agents_future,  # (num_agents, future_len, 3) # DONE
                 "static_objects": static_objects  # (num_static, 5) # TODO
             }
+            # [ADD] 저장 전 안전 보정 (훈련용 npz)
+            aro = vector_map.get("agent_route_lane_order", None)
+            if isinstance(aro, np.ndarray) and aro.dtype != np.int64:
+                vector_map["agent_route_lane_order"] = aro.astype(np.int64)
             data.update(vector_map)
 
             # 디버깅용 그림 그리기

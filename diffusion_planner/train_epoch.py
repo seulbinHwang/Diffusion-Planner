@@ -64,7 +64,7 @@ def train_epoch(data_loader,
                 "route_lanes_has_speed_limit": batch[10].to(args.device),
                 "static_objects": batch[11].to(args.device),
                 "ego_future_gt_11_dim": batch[13].to(args.device),
-                "agent_route_lane_order": batch[14].to(args.device),
+                "agent_route_lane_order": batch[14].to(args.device, dtype=torch.long),
             }
 
             ego_future = batch[2].to(args.device)
