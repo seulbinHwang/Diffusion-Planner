@@ -609,7 +609,7 @@ def draw_lane_centerlines(
                 for k, i in enumerate(agent_idxs):
                     rank_ij = int(ranks_j[int(i)])
                     label = f"{int(i)}--{rank_ij}"  # "에이전트인덱스:해당차선랭크"
-                    label = f"{int(i)}"  # "에이전트인덱스:해당차선랭크"
+                    label = f"{int(i)}"  # "에이전트인덱스"
                     ax.text(
                         x,
                         y + vstep * k,          # 위로 살짝씩 쌓기

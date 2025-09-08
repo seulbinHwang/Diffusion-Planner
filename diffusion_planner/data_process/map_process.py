@@ -332,7 +332,7 @@ def _compute_lane_on_npc_routes(
     Args:
         car_token_to_rr_ids (Dict[str, Optional[List[str]]]):
             키 = 토큰(str), 값 = 보정된 RoadBlock ID 시퀀스(List[str]) 또는 None.
-            길이 ≤ agent_num (차량만 선별되었을 수 있음).
+            길이 ≤ agent_num (차량만 선별).
         lane_routes (List[str]):
             길이 = lane_num. 현재 샘플에서 추출된 lane들의 roadblock id(거리 순 정렬).
 
@@ -378,11 +378,12 @@ def _compute_lane_on_npc_routes(
         return [route in pruned_route_ids_set for route in lane_routes]
 
     lane_routes_set: Set[str] = set(lane_routes)
-    token_to_lane_on_routes: Dict[str, List[bool]] = {}
+    car_token_to_lane_on_routes: Dict[str, List[bool]] = {}
     for token, npc_route_ids in car_token_to_rr_ids.items():
-        token_to_lane_on_routes[token] = _build_mask_for_token(
+        # npc_route_ids: Optional[List[str]]
+        car_token_to_lane_on_routes[token] = _build_mask_for_token(
             npc_route_ids, lane_routes, lane_routes_set)
-    return token_to_lane_on_routes
+    return car_token_to_lane_on_routes
 
 
 def map_process(
@@ -485,13 +486,13 @@ def map_process(
                 ]
                 pruned_route_roadblock_ids = _prune_route_by_connectivity(
                     route_roadblock_ids, pruned_lane_roadblock_ids)
-                # token_to_lane_on_routes: 길이 agent_num
-                token_to_lane_on_routes: Dict[
+                # car_token_to_lane_on_routes: 길이 agent_num 보다 작거나 같음 (차량만 포함 가능)
+                car_token_to_lane_on_routes: Dict[
                     str, List[bool]] = _compute_lane_on_npc_routes(
                         car_token_to_rr_ids, lane_routes)
 
                 for route in lane_routes:
-                    lane_on_route.append(route in pruned_route_roadblock_ids)
+                    lane_on_route.append(route in route_roadblock_ids)
 
             elif feature_name == 'LEFT_BOUNDARY' or feature_name == 'RIGHT_BOUNDARY':
                 continue
@@ -530,7 +531,7 @@ def map_process(
                 · 해당 에이전트의 route가 아니면 -1
             """
             agent_route_lane_order = _select_token_and_ordered_npc_route_indices(
-                token_to_lane_on_routes, neighbor_track_token,
+                car_token_to_lane_on_routes, neighbor_track_token,
                 neighbor_agents_current, vector_map_lanes,
                 max_elements["ROUTE_LANES"])
 

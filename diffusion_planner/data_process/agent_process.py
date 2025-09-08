@@ -70,7 +70,7 @@ def _extract_agent_array(
 
 
 def sampled_tracked_objects_to_array_list(
-        past_tracked_objects: Deque[Observation])\
+        past_tracked_objects: List[TrackedObjects] )\
         -> Tuple[List[np.ndarray], List[List[TrackedObjectType]]]:
     """
     Arrayifies the agents features from the provided past detections.

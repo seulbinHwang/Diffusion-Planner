@@ -16,7 +16,7 @@ import draw_machine
 # matplotlib 설정 추가
 plt.rcParams['figure.max_open_warning'] = 0  # 경고 메시지 비활성화
 matplotlib.rcParams['figure.max_open_warning'] = 0
-from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
+
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from diffusion_planner.data_process.agent_process import (
     agent_past_process, sampled_tracked_objects_to_array_list,
@@ -363,6 +363,57 @@ class DataProcessor(object):
 
         return data
 
+    @staticmethod
+    def _get_agents_past_cur_mask_np(
+            neighbor_agents_past: np.ndarray,  # (agents_num, time_len, 11)
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """에이전트 과거/현재 시퀀스에서 유효성 마스크를 **NumPy 입출력**으로 계산한다.
+
+        정의
+        ----
+        - 프레임 유효(on/off) 판정(포인트 단위):
+          마지막 차원 앞 8개([x, y, cos, sin, vx, vy, width, length]) 값 중
+          하나라도 0이 아니면 **유효(True)**, 모두 0이면 **무효(False)**.
+        - 에이전트 유효(on/off) 판정(에이전트 단위):
+          해당 에이전트의 모든 프레임이 무효이면 **무효(True)**.
+
+        Args:
+            neighbor_agents_past (np.ndarray):
+                에이전트 과거/현재 시퀀스. shape = (agents_num, time_len, 11)
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - agents_past_cur_off_p_mask (np.ndarray): shape = (agents_num, time_len), dtype=bool
+                  각 프레임이 **무효(True)** 인지 여부(포인트 단위 마스크).
+                - agents_past_cur_off_mask (np.ndarray): shape = (agents_num,), dtype=bool
+                  에이전트 전체가 **무효(True)** 인지 여부(에이전트 단위 마스크).
+
+        Raises:
+            ValueError: 입력이 (N, T, 11) 형태가 아니거나 마지막 차원(<8)일 때.
+        """
+        if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[-1] < 8:
+            raise ValueError(
+                f"`neighbor_agents_past`는 (agents_num, time_len, 11) 형태여야 하며 "
+                f"마지막 차원은 최소 8이어야 합니다. got {neighbor_agents_past.shape}")
+
+        # (agents_num, time_len, 8)  — 0이 아니면 True
+        agents_past_current_is_not_zero = (neighbor_agents_past[..., :8] != 0)
+
+        # (agents_num, time_len) — 8개 값 중 하나라도 0이 아니면 유효
+        agents_past_current_not_zero_num = agents_past_current_is_not_zero.sum(
+            axis=-1)
+        agents_past_cur_off_p_mask = (agents_past_current_not_zero_num == 0
+                                     )  # 무효(True)
+
+        # (agents_num) — 에이전트 단위: 유효 프레임 수가 0이면 무효(True)
+        agents_past_cur_on_p_mask = ~agents_past_cur_off_p_mask
+        agents_past_cur_off_mask = (agents_past_cur_on_p_mask.sum(axis=-1) == 0)
+
+        return agents_past_cur_off_p_mask.astype(
+            bool), agents_past_cur_off_mask.astype(bool)
+
+        return agents_past_cur_off_p_mask, agents_past_cur_off_mask
+
     # Use for data preprocess
     def work(self, scenarios):
 
@@ -426,6 +477,37 @@ class DataProcessor(object):
                 )
             # (agent_num, 11)
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
+
+            # present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
+            # future_tracked_objects = [
+            #     tracked_objects.tracked_objects
+            #     for tracked_objects in scenario.get_future_tracked_objects(
+            #         iteration=0,
+            #         time_horizon=self.future_time_horizon,
+            #         num_samples=self.num_future_poses)
+            # ]
+            #
+            # sampled_future_observations = [present_tracked_objects
+            #                               ] + future_tracked_objects
+            # (future_tracked_objects_array_list,
+            #  _) = sampled_tracked_objects_to_array_list(
+            #      sampled_future_observations)
+            # # neighbor_agents_future: (num_agents, future_len, 3)
+            # neighbor_agents_future = agent_future_process(
+            #     anchor_ego_state, future_tracked_objects_array_list,
+            #     self.num_agents, neighbor_indices)
+            # _, neighbor_agents_future, _ = \
+            #     self._filter_agents_within_radius(neighbor_agents_past,
+            #                                      neighbor_agents_future)
+            # # agents_past_cur_off_mask: (agents_num)
+            # _, agents_past_cur_off_mask = self._get_agents_past_cur_mask_np(
+            #     neighbor_agents_past)
+            # token_to_agents_future: Dict[str, np.ndarray] = {
+            # }  # token → (future_len, 2)
+            # for idx, (token_, future) in enumerate(
+            #         zip(neighbor_track_token, neighbor_agents_future)):
+            #     if token_ is not None and not agents_past_cur_off_mask[idx]:
+            #         token_to_agents_future[token_] = future[:, :2]
             '''
             Map
             '''
@@ -446,11 +528,12 @@ class DataProcessor(object):
                                                        ego_coords, ego_heading,
                                                        self._radius,
                                                        traffic_light_data)
-            vector_map = map_process(
-                route_roadblock_ids, car_token_to_rr_ids,
-                neighbor_track_token, neighbor_agents_current, anchor_ego_state,
-                coords, traffic_light_data, speed_limit, lane_route,
-                self._map_features, self._max_elements, self._max_points)
+            vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,
+                                     neighbor_track_token,
+                                     neighbor_agents_current, anchor_ego_state,
+                                     coords, traffic_light_data, speed_limit,
+                                     lane_route, self._map_features,
+                                     self._max_elements, self._max_points)
 
             # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
             try:
@@ -494,7 +577,7 @@ class DataProcessor(object):
             )
 
             present_tracked_objects = scenario.initial_tracked_objects.tracked_objects
-            future_tracked_objects = [
+            future_tracked_objects: List[TrackedObjects] = [
                 tracked_objects.tracked_objects
                 for tracked_objects in scenario.get_future_tracked_objects(
                     iteration=0,
@@ -502,7 +585,7 @@ class DataProcessor(object):
                     num_samples=self.num_future_poses)
             ]
 
-            sampled_future_observations = [present_tracked_objects
+            sampled_future_observations: List[TrackedObjects] = [present_tracked_objects
                                           ] + future_tracked_objects
             (future_tracked_objects_array_list,
              _) = sampled_tracked_objects_to_array_list(

@@ -11,11 +11,11 @@ from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 from types import SimpleNamespace
 import torch
-from typing import Deque, Dict, List, Optional, Set, Type, Tuple
+from nuplan.common.actor_state.tracked_objects import TrackedObjects, TrackedObject
 from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex, AgentInternalIndex
 from nuplan.common.maps.abstract_map_objects import RoadBlockGraphEdgeMapObject
 from shapely.geometry import Point
-from collections import defaultdict
+from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.ego_state import EgoState
@@ -23,7 +23,7 @@ from nuplan.planning.simulation.observation.observation_type import DetectionsTr
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from typing import List, Optional, Union, Sequence
 import numpy as np
-
+from nuplan.common.actor_state.tracked_objects import TrackedObject
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 import math
@@ -192,7 +192,7 @@ def get_directional_proximal_map_objects(
 
 
 def build_agent_route_lane_order(
-    npc_route_indices: List[List[int]],
+    npc_route_indices: List[List[int]], #  # 길이: agent_num, 원소: List[int] (길이 가변적)
     lane_num: Optional[int] = None,
     dtype: np.dtype = np.int32,
 ) -> np.ndarray:
@@ -269,49 +269,15 @@ def build_agent_route_lane_order(
 
 
 def _select_token_and_ordered_npc_route_indices(
-    token_to_lane_on_routes: Dict[
-        str, List[bool]],  # 길이 = agent_num (키 개수). 각 값: 길이 lane_num
+    car_token_to_lane_on_routes: Dict[
+        str, List[bool]],  # 길이 <= agent_num (키 개수). 각 값: 길이 lane_num
     neighbor_track_token: List[Optional[str]],  # 길이 = agent_num
     neighbor_agents_current: np.
     ndarray,  # shape: (agent_num, 11) → x=[:,0], y=[:,1]
     vector_map_lanes: np.ndarray,  # shape: (lane_num, P, D) → 좌표는 [:, :, :2]
     route_num: int,
 ) -> np.ndarray:
-    """토큰별 '경로 위 차선'을 가까운 순으로 최대 `route_num`개 뽑아 랭크 행렬을 만든다.
 
-    절차(에이전트 i에 대해):
-      1) lane 폴리라인과 에이전트 현재 위치 간 최소거리로 **lane**을 가까운→먼 순으로 정렬
-      2) 그 순서대로 `token_to_lane_on_routes[token][lane_idx]`가 True인 lane만
-         최대 `route_num`개 선택하여 `npc_route_indices[i] = [lane_idx0, lane_idx1, ...]`
-      3) 모든 에이전트 i에 대해 위 작업 후 `build_agent_route_lane_order`로
-         (agent_num, lane_num) 랭크 행렬을 생성(해당 에이전트의 route가 아니면 -1)
-
-    Args:
-        token_to_lane_on_routes (Dict[str, List[bool]]):
-            길이 = agent_num. 키=토큰, 값=길이 lane_num의 불리언 마스크.
-        neighbor_track_token (List[Optional[str]]):
-            길이 = agent_num. 에이전트 토큰(없으면 None).
-        neighbor_agents_current (np.ndarray):
-            shape = (agent_num, 11). 현재 프레임의 이웃 에이전트 상태(ego 기준).
-            - x = [:, 0], y = [:, 1] 만 사용.
-        vector_map_lanes (np.ndarray):
-            shape = (lane_num, P, D). lane 폴리라인. 좌표는 [:, :, :2] 사용.
-        route_num (int):
-            각 에이전트에 대해 선택할 최대 차선 개수(0 < route_num < lane_num).
-
-    Returns:
-        np.ndarray:
-            `agent_route_lane_order`, shape = (agent_num, lane_num), dtype = np.int32.
-            - [i, j] = 에이전트 i에서 lane j의 "가까운 True 차선 순위(0,1,2,...)".
-            - 해당 에이전트의 route가 아니면 -1.
-
-    Raises:
-        ValueError: 입력 길이/shape가 올바르지 않거나 `route_num` 제약 위반 시.
-
-    Notes:
-        - `neighbor_track_token`과 `neighbor_agents_current`는 **ego와 가까운 순**이라 가정.
-        - 거리 계산은 lane 폴리라인의 모든 점과의 최소거리(유클리드) 기준.
-    """
     from typing import List
 
     # ────────────── 보조 함수: 입력 검증 ──────────────
@@ -380,12 +346,46 @@ def _select_token_and_ordered_npc_route_indices(
                 if len(selected) >= max_pick:
                     break
         return selected
+    """토큰별 '경로 위 차선'을 가까운 순으로 최대 `route_num`개 뽑아 랭크 행렬을 만든다.
 
+    절차(에이전트 i에 대해):
+      1) lane 폴리라인과 에이전트 현재 위치 간 최소거리로 **lane**을 가까운→먼 순으로 정렬
+      2) 그 순서대로 `car_token_to_lane_on_routes[token][lane_idx]`가 True인 lane만
+         최대 `route_num`개 선택하여 `npc_route_indices[i] = [lane_idx0, lane_idx1, ...]`
+      3) 모든 에이전트 i에 대해 위 작업 후 `build_agent_route_lane_order`로
+         (agent_num, lane_num) 랭크 행렬을 생성(해당 에이전트의 route가 아니면 -1)
+
+    Args:
+        car_token_to_lane_on_routes (Dict[str, List[bool]]):
+            길이 = agent_num 보다 작거나 같음 . 키=토큰, 값=길이 lane_num의 불리언 마스크.
+        neighbor_track_token (List[Optional[str]]):
+            길이 = agent_num. 에이전트 토큰(없으면 None).
+        neighbor_agents_current (np.ndarray):
+            shape = (agent_num, 11). 현재 프레임의 이웃 에이전트 상태(ego 기준).
+            - x = [:, 0], y = [:, 1] 만 사용.
+        vector_map_lanes (np.ndarray):
+            shape = (lane_num, P, D). lane 폴리라인. 좌표는 [:, :, :2] 사용.
+        route_num (int):
+            각 에이전트에 대해 선택할 최대 차선 개수(0 < route_num < lane_num).
+
+    Returns:
+        np.ndarray:
+            `agent_route_lane_order`, shape = (agent_num, lane_num), dtype = np.int32.
+            - [i, j] = 에이전트 i에서 lane j의 "가까운 True 차선 순위(0,1,2,...)".
+            - 해당 에이전트의 route가 아니면 -1.
+
+    Raises:
+        ValueError: 입력 길이/shape가 올바르지 않거나 `route_num` 제약 위반 시.
+
+    Notes:
+        - `neighbor_track_token`과 `neighbor_agents_current`는 **ego와 가까운 순**이라 가정.
+        - 거리 계산은 lane 폴리라인의 모든 점과의 최소거리(유클리드) 기준.
+    """
     # ────────────── 메인 ──────────────
     agent_num, lane_num = _validate_inputs()
     lanes_xy = vector_map_lanes[:, :, :2]  # (lane_num, P, 2)
 
-    npc_route_indices: List[List[int]] = []
+    npc_route_indices: List[List[int]] = [] # 길이: agent_num, 원소: List[int] (길이 가변적)
 
     for agent_idx in range(agent_num):
         selected: List[int] = []
@@ -394,21 +394,21 @@ def _select_token_and_ordered_npc_route_indices(
         if token is None:
             lane_on_routes = [False] * lane_num
         else:
-            lane_on_routes = token_to_lane_on_routes.get(
+            # car_token_to_lane_on_routes (Dict[str, List[bool]])
+            lane_on_routes = car_token_to_lane_on_routes.get(
                 token, [False] * lane_num)
 
         # (1) 경로가 전혀 없으면 건너뜀
-        lane_on_routes_array = np.asarray(lane_on_routes, dtype=bool)
-        if lane_on_routes_array.sum() == 0:
+        lane_on_routes_arr = np.asarray(lane_on_routes, dtype=bool) # (lane_num,)
+        if lane_on_routes_arr.sum() == 0:
             npc_route_indices.append(selected)
             continue
 
         # (2) 가까운 lane 정렬
         agent_xy = neighbor_agents_current[agent_idx, :2]  # (2,)
-        lane_dist_order = _lane_min_dist_order(lanes_xy, agent_xy)
+        lane_dist_order = _lane_min_dist_order(lanes_xy, agent_xy) # shape=(lane_num,) 최소거리 오름차순 lane 인덱스 배열.
 
         # (3) 정렬 순으로 True lane만 최대 route_num개 선택
-        lane_on_routes_arr = np.asarray(lane_on_routes, dtype=bool)
         selected = _select_lanes_by_order(lane_dist_order, lane_on_routes_arr,
                                           route_num)
 
@@ -503,6 +503,54 @@ def get_neighbor_track_tokens(
             neighbor_track_token[slot_idx] = None
 
     return neighbor_track_token
+
+
+# 시나리오 전체 horizon(초) 계산: 시작~끝 타임스탬프 차이
+def _scenario_total_horizon_s(scn: AbstractScenario) -> float:
+    """
+    시나리오 시작 시각(초)부터 **로그 파일의 끝 시각(초)** 까지의 horizon을 계산한다.
+    - 시나리오 토큰이 1개뿐이라 duration이 0이어도, DB의 end time을 사용해 올바르게 계산한다.
+
+    Args:
+        scn: nuPlan Scenario 객체
+
+    Returns:
+        float: horizon [s]
+    """
+    # 1) 시작 시각(초): 공개 API 사용
+    start_s = float(scn.get_time_point(0).time_s)
+
+    # 2) 우선, 시나리오 자체 duration이 유효하면 그걸 사용 (extracted scenario인 경우)
+    try:
+        end_s = float(
+            scn.get_time_point(scn.get_number_of_iterations() - 1).time_s)
+        if end_s > start_s + 1e-9:
+            return end_s - start_s
+    except Exception:
+        pass
+
+    # 3) fallback: DB의 실제 끝 시각(마이크로초)으로 계산
+    try:
+        # 내부 모듈: nuPlan devkit 표준
+        from nuplan.database.nuplan_db.nuplan_scenario_queries import get_end_sensor_time_from_db
+        from nuplan.database.nuplan_db.nuplan_db_utils import get_lidarpc_sensor_data
+
+        # NuPlanScenario는 _log_file을 보유 (public은 아니지만 일반적으로 접근 가능)
+        log_file_path: str = getattr(scn, "_log_file")
+        end_us: int = get_end_sensor_time_from_db(log_file_path,
+                                                  get_lidarpc_sensor_data())
+        end_s = float(end_us) * 1e-6
+        return max(0.0, end_s - start_s)
+    except Exception:
+        # 4) 최후의 수단: 미래 타임스탬프를 큰 horizon으로 끝까지 스트리밍 (느릴 수 있음)
+        last_s = start_s
+        try:
+            for tp in scn.get_future_timestamps(
+                    0, time_horizon=10_000.0):  # 10k초면 사실상 끝까지
+                last_s = float(tp.time_s)
+        except Exception:
+            pass
+        return max(0.0, last_s - start_s)
 
 
 def get_npc_route_roadblock_ids(
@@ -667,8 +715,8 @@ def get_npc_route_roadblock_ids(
     def _collect_future_vehicle_trajectories(
         scenario: NuPlanScenario,
         candidate_tokens: Set[str],
-        total_horizon_s: float = 40.0,
-    ) -> Dict[str, List["SceneObject"]]:
+        total_horizon_s: float = 20.,
+    ) -> Dict[str, List[TrackedObject]]:
         """미래 기간 동안의 차량 궤적을 토큰별로 수집한다.
 
         Args:
@@ -680,16 +728,16 @@ def get_npc_route_roadblock_ids(
             Dict[str, List[SceneObject]]:
                 키=토큰, 값=해당 차량의 시간 순 궤적 리스트(길이 가변).
         """
-        car_token_to_trajectory: Dict[str,
-                                      List["SceneObject"]] = defaultdict(list)
-        num_samples = int(total_horizon_s * 0.1)  # 0.1 s 간격
+        car_token_to_object_list: Dict[str,
+                                      List[TrackedObject]] = defaultdict(list)
+        num_samples = int(total_horizon_s * 10)  # 0.1 s 간격
         for det_batch in scenario.get_future_tracked_objects(
                 0, total_horizon_s, num_samples):
             for det in det_batch.tracked_objects:
                 if det.tracked_object_type == TrackedObjectType.VEHICLE and (
                         det.track_token in candidate_tokens):
-                    car_token_to_trajectory[det.track_token].append(det)
-        return car_token_to_trajectory
+                    car_token_to_object_list[det.track_token].append(det)
+        return car_token_to_object_list
 
     def _finalize_connector_segment_if_open(
         inside_connector_flag: bool,
@@ -753,12 +801,15 @@ def get_npc_route_roadblock_ids(
 
     candidate_tokens = _collect_candidate_tokens(neighbor_track_token)
 
-    car_token_to_trajectory: Dict[
-        str, List["SceneObject"]] = _collect_future_vehicle_trajectories(
-            scenario, candidate_tokens, total_horizon_s=40.0)
+    car_token_to_object_list: Dict[
+        str, List[TrackedObject]] = _collect_future_vehicle_trajectories(
+            scenario,
+            candidate_tokens,  # 기존 필터는 유지 (neighbor 토큰 기반)
+            total_horizon_s=20.,
+        )
     car_token_to_rr_ids: Dict[str, Optional[List[str]]] = {}
 
-    for car_token, car_list in car_token_to_trajectory.items():
+    for car_token, car_list in car_token_to_object_list.items():
         if not car_list:
             car_token_to_rr_ids[car_token] = None
             continue
@@ -801,10 +852,12 @@ def get_npc_route_roadblock_ids(
 
                 if chosen_ids:
                     # 선택 결과와 교집합 되는 쪽을 남기고, 반대편은 비운다.
-                    chosen_rbc = {rc for rc in current_connectors if
-                                  rc.id in chosen_ids}
-                    chosen_rb = {rb for rb in current_roadblocks if
-                                 rb.id in chosen_ids}
+                    chosen_rbc = {
+                        rc for rc in current_connectors if rc.id in chosen_ids
+                    }
+                    chosen_rb = {
+                        rb for rb in current_roadblocks if rb.id in chosen_ids
+                    }
 
                     if chosen_rbc and not chosen_rb:
                         current_connectors = chosen_rbc
@@ -825,7 +878,6 @@ def get_npc_route_roadblock_ids(
                 else:
                     # tie-breaker가 비었으면 RBC 우선
                     current_roadblocks = set()
-
 
             # ── (A) Connector 영역 ──
             if current_connectors:
@@ -877,7 +929,7 @@ def get_npc_route_roadblock_ids(
                 roadblock_sequence,
                 remove_route_loops_flag=False,
             )
-            car_token_to_rr_ids[car_token] = corrected_ids
+            car_token_to_rr_ids[car_token] = roadblock_sequence
         else:
             car_token_to_rr_ids[car_token] = None
 
