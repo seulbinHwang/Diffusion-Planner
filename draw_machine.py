@@ -42,7 +42,7 @@ def draw_neighbor_future_points(ax: plt.Axes, neighbor_agents_future: Array,
     agent_num, future_len, _ = neighbor_agents_future.shape
     ms = options.neighbor_future_marker_size
     text_d = options.agent_index_offset_m
-    text_color = options.agent_index_color
+    text_color =  options.future_agent_index_color
 
     for a in range(agent_num):
         traj = neighbor_agents_future[a]  # (future_len, 3)
@@ -68,7 +68,7 @@ def draw_neighbor_future_points(ax: plt.Axes, neighbor_agents_future: Array,
                     fy + text_d,
                     str(a),
                     color=text_color,
-                    fontsize=options.agent_index_fontsize,
+                    fontsize=options.agent_index_fontsize + 5,
                     ha='left',
                     va='bottom',
                     zorder=30)
@@ -131,20 +131,20 @@ class DrawingOptions:
         - token: 앞 4차원이 모두 |value| ≤ invalid_eps 이면 invalid
     """
 
-    draw_ego_past: bool = True
+    draw_ego_past: bool = False
     draw_neighbor_past: bool = True
-    draw_ego_pred: bool = True
-    draw_ego_future_gt: bool = True
+    draw_ego_pred: bool = False # TODO
+    draw_ego_future_gt: bool = False
     draw_lane_boundaries: bool = True
     draw_lane_centerline: bool = True
-    draw_token_future_arrows: bool = True
+    draw_token_future_arrows: bool = False
     draw_neighbor_agents_future: bool = True
 
-    draw_velocity_arrows_past_all: bool = True
-    draw_velocity_arrows_pred_all: bool = True
-    draw_velocity_arrows_future_all: bool = True
+    draw_velocity_arrows_past_all: bool = False
+    draw_velocity_arrows_pred_all: bool = False
+    draw_velocity_arrows_future_all: bool = False
 
-    arrow_length_m: float = 2.0
+    arrow_length_m: float = 5.0
     heading_line_scale: float = 0.5
 
     background_color: str = "#121212"
@@ -156,74 +156,139 @@ class DrawingOptions:
 
     invalid_eps: float = 0.0
 
-    agent_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
+    agent_index_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
     agent_index_offset_m: float = 0.5  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
-    agent_index_color: str = "#FFFFFF"  # 번호 텍스트 색
-    neighbor_future_marker_size: float = 5.0  # 미래 포인트 'x' 마커 크기
-
+    past_agent_index_color: str = "#FFFFFF"  # 번호 텍스트 색 # 흰색
+    future_agent_index_color: str = "#808080" # 번호 텍스트 색 # 회색
+    route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 흰색
+    neighbor_future_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+    # 🔽 새 옵션
+    max_agents_to_draw: Optional[int] = 5
 
 # 스타일 사전
 EGO_PAST_STYLE = {
-    "fill_color": "#FFFFFF",
-    "line_color": "#808080",
-    "line_width": 2.0,
+    "fill_color": "#FFFFFF",  # 흰색
+    "line_color": "#808080",  # 회색
+    "line_width": 0.4,
     "fill_alpha_current": 1.0,
 }
 EGO_PRED_STYLE = {
-    "line_color": "#FFFFFF",
-    "line_width": 2.0,
-    "velocity_line_color": "#00C8C8",
+    "line_color": "#FFFFFF",           # 흰색
+    "line_width": 0.4,
+    "velocity_line_color": "#00C8C8",  # 청록색(시안)
     "velocity_line_alpha": 0.8,
-    "velocity_line_width": 2.0,
+    "velocity_line_width": 0.4,
 }
 EGO_FUTURE_GT_STYLE = {
-    "line_color": "#FFFFFF",
-    "line_width": 1.0,
-    "velocity_line_color": "#00C8C8",
+    "line_color": "#FFFFFF",           # 흰색
+    "line_width": 0.2,
+    "velocity_line_color": "#00C8C8",  # 청록색(시안)
     "velocity_line_alpha": 0.8,
-    "velocity_line_width": 2.0,
+    "velocity_line_width": 0.4,
 }
 NEIGHBOR_STYLE = {
     "vehicles": {
-        "fill_color": "#84E573",
-        "fill_alpha": 0.5,
-        "line_color": "#84E573",
-        "line_width": 1.0,
-        "velocity_line_color": "#84E573",
-        "velocity_line_width": 1.0,
+        "fill_color": "#84E573",           # 연두색(라임 그린)
+        "fill_alpha": 1.0,
+        "line_color": "#84E573",           # 연두색(라임 그린)
+        "line_width": 0.2,
+        "velocity_line_color": "#84E573",  # 연두색(라임 그린)
+        "velocity_line_width": 0.2,
     },
     "pedestrians": {
-        "fill_color": "#4D83E1",
-        "fill_alpha": 0.5,
-        "line_color": "#4D83E1",
-        "line_width": 1.0,
-        "velocity_line_color": "#4D83E1",
-        "velocity_line_width": 1.0,
+        "fill_color": "#4D83E1",           # 파란색(밝은 파랑)
+        "fill_alpha": 1.0,
+        "line_color": "#4D83E1",           # 파란색(밝은 파랑)
+        "line_width": 0.2,
+        "velocity_line_color": "#4D83E1",  # 파란색(밝은 파랑)
+        "velocity_line_width": 0.2,
     },
     "bicycles": {
-        "fill_color": "#FF4D4D",
-        "fill_alpha": 0.5,
-        "line_color": "#FF4D4D",
-        "line_width": 1.0,
-        "velocity_line_color": "#FF4D4D",
-        "velocity_line_width": 1.0,
+        "fill_color": "#FF4D4D",           # 빨간색(밝은 빨강)
+        "fill_alpha": 1.0,
+        "line_color": "#FF4D4D",           # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": "#FF4D4D",  # 빨간색(밝은 빨강)
+        "velocity_line_width": 0.2,
     },
 }
-LANE_BOUNDARY_COLOR = "#2d3ea7"
+LANE_BOUNDARY_COLOR = "#2d3ea7"  # 남색(인디고 계열)
 SIGNAL_COLORS = {
-    0: "#00C853",  # green
-    1: "#FFD600",  # yellow
-    2: "#D50000",  # red
-    3: "#B0BEC5",  # unknown
+    0: "#00C853",  # 녹색(신호등 초록)
+    1: "#FFD600",  # 노란색(신호등 노랑)
+    2: "#D50000",  # 진한 빨간색(신호등 빨강)
+    3: "#B0BEC5",  # 회색(청회색)
 }
 TOKEN_FUTURE_STYLE = {
-    "line_color": "#FFFFFF",
-    "line_width": 1.0,
+    "line_color": "#FFFFFF",  # 흰색
+    "line_width": 0.2,
 }
+
 
 # =============================================================================
 # 유틸리티(도형/화살표/클래스/유효성/범위)
 # =============================================================================
+from typing import Dict, Optional, Tuple
+
+def _clip_agents_first_k_from_wmf(
+    world_model_feature: Dict[str, Array],
+    max_agents_to_draw: Optional[int],
+) -> Tuple[Optional[Array], Optional[Array], Optional[Array], Optional[int]]:
+    """world_model_feature에서 에이전트 축(0축)을 공유하는 3개 배열을 동일한 K로 슬라이스.
+    대상 키:
+      - 'neighbor_agents_past'   : (A, T, 11)
+      - 'neighbor_agents_future' : (A, Tf, 3)
+      - 'agent_route_lane_order' : (A, L)
+
+    Args:
+        world_model_feature: 입력 피쳐 dict.
+        max_agents_to_draw: None이면 원본 그대로. 정수면 앞쪽 K개로 슬라이스.
+
+    Returns:
+        (neighbor_past_K, neighbor_future_K, route_order_K, K or None)
+        - 각 요소는 해당 키가 없으면 None.
+        - K는 실제로 적용된 개수(None이면 제한 없음).
+    """
+    if max_agents_to_draw is None:
+        # 제한 없음: 원본 그대로 반환
+        return (
+            world_model_feature.get("neighbor_agents_past", None),
+            world_model_feature.get("neighbor_agents_future", None),
+            world_model_feature.get("agent_route_lane_order", None),
+            None,
+        )
+
+    # 각 배열의 길이(A) 수집
+    lengths = []
+    for key in ("neighbor_agents_past", "neighbor_agents_future", "agent_route_lane_order"):
+        arr = world_model_feature.get(key, None)
+        if arr is not None and hasattr(arr, "shape") and len(arr.shape) >= 1:
+            lengths.append(arr.shape[0])
+
+    if not lengths:
+        # 슬라이스할 것이 없음
+        return (
+            world_model_feature.get("neighbor_agents_past", None),
+            world_model_feature.get("neighbor_agents_future", None),
+            world_model_feature.get("agent_route_lane_order", None),
+            None,
+        )
+
+    # 모든 배열에 공통으로 적용될 K 결정
+    K = max(0, min(int(max_agents_to_draw), min(lengths)))
+
+    def _clip(arr: Optional[Array]) -> Optional[Array]:
+        if arr is None:
+            return None
+        if arr.shape[0] <= K:
+            return arr
+        return arr[:K, ...]
+
+    neighbor_past_K   = _clip(world_model_feature.get("neighbor_agents_past", None))
+    neighbor_future_K = _clip(world_model_feature.get("neighbor_agents_future", None))
+    route_order_K     = _clip(world_model_feature.get("agent_route_lane_order", None))
+
+    return neighbor_past_K, neighbor_future_K, route_order_K, K
 
 
 def oriented_box_corners(x: float, y: float, cos_yaw: float, sin_yaw: float,
@@ -463,13 +528,101 @@ def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
                     zorder=1)
 
 
-def draw_lane_centerlines(ax: plt.Axes, lanes: Array,
-                          options: DrawingOptions) -> None:
-    """센터라인을 점선으로 그림(양 끝점 모두 valid일 때만 선분을 그림, 색은 신호 반영)."""
+def draw_lane_centerlines(
+    ax: plt.Axes,
+    lanes: Array,
+    options: DrawingOptions,
+    agent_route_lane_order: Optional[Array] = None,
+) -> None:
+    """센터라인을 점선으로 그리거나, agent_route_lane_order가 주어지면 에이전트-차선 매핑을 텍스트로 표기한다.
+
+    동작 모드
+    ----------
+    1) agent_route_lane_order is None:
+        - 기존 로직 유지: 차선 센터라인을 **점선**으로 그림.
+        - 양 끝점이 모두 유효한 구간만 선분을 그림.
+        - 색은 lane의 signal(0~3: green/yellow/red/unknown)에 따라 사용.
+
+    2) agent_route_lane_order is not None:
+        - 센터라인 **선을 그리지 않음**.
+        - 각 차선 j의 모든 유효 포인트 위치에 대해,
+          agent_route_lane_order[:, j] != -1 인 모든 에이전트 i에 대해
+          텍스트 **"i:rank"** 를 그 위치에 표기.
+          (rank = agent_route_lane_order[i, j])
+        - 동일 위치에 여러 텍스트가 겹치지 않도록, 세로로 약간(offset) 띄워서 적층.
+
+    Args
+    ----
+    ax : plt.Axes
+        Matplotlib 축.
+    lanes : np.ndarray
+        shape = (lane_num, lane_len, 12)
+        · 0-1: centerline (x,y)
+        · 2-3: centerline diff (dx,dy)
+        · 4-5: left boundary vector (dx,dy)
+        · 6-7: right boundary vector (dx,dy)
+        · 8-11: signal one-hot [green, yellow, red, unknown]
+    options : DrawingOptions
+        그리기 옵션(색/두께/간격 등).
+    agent_route_lane_order : Optional[np.ndarray]
+        shape = (agent_num, lane_num), 각 [i, j] = 해당 에이전트 i에게서
+        차선 j의 '가까운 순서 랭크(0,1,2,...)'; 경로에 없으면 -1.
+    """
     if lanes is None or lanes.size == 0:
         return
 
     eps = options.invalid_eps
+    lane_num = lanes.shape[0]
+
+    # ────────────── (B) 텍스트 표기 모드 ──────────────
+    if agent_route_lane_order is not None:
+        if (agent_route_lane_order.ndim != 2 or
+                agent_route_lane_order.shape[1] != lane_num):
+            raise ValueError(
+                "agent_route_lane_order의 shape는 (agent_num, lane_num) 이어야 하며 "
+                f"lane_num({lane_num})과 두 번째 축이 같아야 합니다. "
+                f"got {agent_route_lane_order.shape}"
+            )
+
+        base_fs = max(1, options.agent_index_fontsize - 1)  # 조금 작게
+        vstep = 0.15  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
+
+        # 각 차선 j 순회
+        for j in range(lane_num):
+            lane_j = lanes[j]                 # (lane_len, 12)
+            center = lane_j[:, 0:2]           # (lane_len, 2)
+            valid = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)  # (lane_len,)
+
+            # 이 차선을 자신의 경로에 포함하는 모든 agent i와 그 rank
+            ranks_j: Array = agent_route_lane_order[:, j]        # (agent_num,)
+            agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]      # (K,)
+            if agent_idxs.size == 0:
+                continue
+
+            # 유효 포인트마다 텍스트 찍기
+            # (여러 agent가 있으면 위로 살짝씩 띄워서 겹침 완화)
+            for p_idx in range(center.shape[0]):
+                if not valid[p_idx]:
+                    continue
+                x, y = float(center[p_idx, 0]), float(center[p_idx, 1])
+
+                for k, i in enumerate(agent_idxs):
+                    rank_ij = int(ranks_j[int(i)])
+                    label = f"{int(i)}--{rank_ij}"  # "에이전트인덱스:해당차선랭크"
+                    label = f"{int(i)}"  # "에이전트인덱스:해당차선랭크"
+                    ax.text(
+                        x,
+                        y + vstep * k,          # 위로 살짝씩 쌓기
+                        label,
+                        color=options.route_agent_index_color,
+                        fontsize=base_fs,
+                        ha="center",
+                        va="bottom",
+                        zorder=3,
+                    )
+        return  # 텍스트 모드에서는 선을 그리지 않음
+
+    # ────────────── (A) 기존 점선 센터라인 모드 ──────────────
     for lane_i in lanes:  # (lane_len, 12)
         center = lane_i[:, 0:2]
         signals = lane_i[:, 8:12]
@@ -484,11 +637,13 @@ def draw_lane_centerlines(ax: plt.Axes, lanes: Array,
                 continue
             c0, c1 = center[j], center[j + 1]
             color = SIGNAL_COLORS.get(int(state_idx[j]), "#B0BEC5")
-            ax.plot([c0[0], c1[0]], [c0[1], c1[1]],
-                    color=color,
-                    linewidth=1.2,
-                    linestyle=(0, (4, 4)),
-                    zorder=2)
+            ax.plot(
+                [c0[0], c1[0]], [c0[1], c1[1]],
+                color=color,
+                linewidth=1.2,
+                linestyle=(0, (4, 4)),
+                zorder=2
+            )
 
 
 def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
@@ -512,7 +667,7 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
             x, y = float(row[0]), float(row[1])
             c, s = float(row[2]), float(row[3])
             vx, vy = float(row[4]), float(row[5])
-            L, W = float(row[6]), float(row[7])
+            W, L = float(row[6]), float(row[7])
             cls = infer_agent_class(row[8:11])
             st = NEIGHBOR_STYLE[cls]
 
@@ -565,7 +720,7 @@ def annotate_neighbor_indices_for_past(ax: plt.Axes,
     agent_num, time_len, feat_dim = neighbor_agents_past.shape
     current_t = time_len - 1
     text_d = options.agent_index_offset_m
-    text_color = options.agent_index_color
+    text_color = options.past_agent_index_color
 
     for a in range(agent_num):
         row = neighbor_agents_past[a, current_t]  # (11,)
@@ -601,7 +756,7 @@ def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
         x, y = float(row[0]), float(row[1])
         c, s = float(row[2]), float(row[3])
         vx, vy = float(row[4]), float(row[5])
-        L, W = float(row[6]), float(row[7])
+        W, L = float(row[6]), float(row[7])
 
         fill_color = EGO_PAST_STYLE["fill_color"] if t == current_t else None
         fill_alpha = EGO_PAST_STYLE[
@@ -654,7 +809,7 @@ def draw_ego_predicted(ax: plt.Axes, ego_agent_next_11_dim: Array,
         x, y = float(row[0]), float(row[1])
         c, s = float(row[2]), float(row[3])
         vx, vy = float(row[4]), float(row[5])
-        L, W = float(row[6]), float(row[7])
+        W, L = float(row[6]), float(row[7])
 
         corners = oriented_box_corners(x, y, c, s, L, W)
         add_polygon(ax,
@@ -704,7 +859,7 @@ def draw_ego_future_gt(ax: plt.Axes, ego_future_gt_11_dim: Array,
         x, y = float(row[0]), float(row[1])
         c, s = float(row[2]), float(row[3])
         vx, vy = float(row[4]), float(row[5])
-        L, W = float(row[6]), float(row[7])
+        W, L = float(row[6]), float(row[7])
 
         corners = oriented_box_corners(x, y, c, s, L, W)
         add_polygon(ax,
@@ -886,6 +1041,20 @@ def draw_world_model_to_png(
     - 좌표계는 "현재 이고 뒷축 좌표계(＋x=ego heading)" 가정.
     """
     draw_option = options or DrawingOptions()
+    # ── (0) 에이전트 앞쪽 K개로 통일 슬라이스 ─────────────────────────
+    neigh_past_K, neigh_future_K, route_order_K, K = _clip_agents_first_k_from_wmf(
+        world_model_feature, draw_option.max_agents_to_draw
+    )
+
+    # bounds 계산을 위해 dict 복사 후 슬라이스 반영
+    wmf_for_bounds = dict(world_model_feature)
+    if neigh_past_K is not None: wmf_for_bounds[
+        "neighbor_agents_past"] = neigh_past_K
+    if neigh_future_K is not None: wmf_for_bounds[
+        "neighbor_agents_future"] = neigh_future_K
+    if route_order_K is not None: wmf_for_bounds[
+        "agent_route_lane_order"] = route_order_K
+
 
     # 1) Figure/Axes
     fig, ax = create_figure_and_axes(draw_option)
@@ -894,26 +1063,28 @@ def draw_world_model_to_png(
     lanes = world_model_feature.get("lanes")
     if draw_option.draw_lane_boundaries:
         draw_lane_boundaries(ax, lanes, draw_option)
+    # agent_route_lane_order가 있으면 텍스트 표기 모드로 전환
+    agent_route_lane_order = world_model_feature.get("agent_route_lane_order",
+                                                     None)
     if draw_option.draw_lane_centerline:
-        draw_lane_centerlines(ax, lanes, draw_option)
+        draw_lane_centerlines(
+            ax,
+            lanes,
+            draw_option,
+            agent_route_lane_order=agent_route_lane_order,
+        )
 
-    # 2.5) 이웃 에이전트의 '미래 포인트(x 마커)' 먼저 그리기 (있을 때만)
-    if draw_option.draw_neighbor_agents_future:
-        neighbor_future = world_model_feature.get("neighbor_agents_future")
-        if neighbor_future is not None:
-            draw_neighbor_future_points(ax, neighbor_future, draw_option)
-
+    # 이웃 에이전트 미래 포인트(x마커)
+    if draw_option.draw_neighbor_agents_future and (neigh_future_K is not None):
+        draw_neighbor_future_points(ax, neigh_future_K, draw_option)
     # 3) 토큰 미래 화살표(개별) - 차선 위에, 에이전트 윤곽과 겹치지 않게 중간 zorder
     if draw_option.draw_token_future_arrows:
         draw_token_future_arrows(ax, token_to_future_traj_wrt_ego, draw_option)
 
-    # 4) 에이전트(과거/예측/GT)
-    if draw_option.draw_neighbor_past:
-        draw_neighbor_past(ax, world_model_feature.get("neighbor_agents_past"),
-                           draw_option)
-        # 현재 프레임(마지막 스텝) 옆에 에이전트 인덱스 표기
-        annotate_neighbor_indices_for_past(
-            ax, world_model_feature.get("neighbor_agents_past"), draw_option)
+    # ── (4) 에이전트(과거/미래/예측/GT) ─────────────────────────────
+    if draw_option.draw_neighbor_past and (neigh_past_K is not None):
+        draw_neighbor_past(ax, neigh_past_K, draw_option)
+        annotate_neighbor_indices_for_past(ax, neigh_past_K, draw_option)
 
     if draw_option.draw_ego_past:
         draw_ego_past(ax, world_model_feature.get("ego_agent_past"),
@@ -927,9 +1098,8 @@ def draw_world_model_to_png(
             data_ = world_model_feature.get("ego_agent_future_11_dim", None)
         draw_ego_future_gt(ax, data_, draw_option)
 
-    # 5) 축 범위/스타일
-    bounds = compute_auto_bounds(world_model_feature, draw_option,
-                                 token_to_future_traj_wrt_ego)
+    # ── (5) 축 범위/스타일 ───────────────────────────────────────────
+    bounds = compute_auto_bounds(wmf_for_bounds, draw_option, token_to_future_traj_wrt_ego)
     set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
     apply_axes_style(ax, draw_option)
 

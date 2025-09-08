@@ -53,6 +53,7 @@ def _load_all_sample_stats(save_dir: str) -> Dict[str, List[float]]:
     """
     vehicle, ped, bike = [], [], []
     ratio_pct, mean_kmh = [], []
+    save_dir = os.path.join(save_dir, "json_temp")
     for name in os.listdir(save_dir):
         if not name.endswith(".stats.json"):
             continue
@@ -380,7 +381,7 @@ if __name__ == "__main__":
                         help='number of lane point')
     parser.add_argument('--lane_num',
                         type=int,
-                        default=70,
+                        default=150,
                         help='number of lanes')
     parser.add_argument('--route_len',
                         type=int,
@@ -530,6 +531,8 @@ if __name__ == "__main__":
 
     # 집계 & 히스토그램 저장
     stats = _load_all_sample_stats(args.save_path)
+    save_path = os.path.join(args.save_path, "histograms")
+    os.makedirs(save_path, exist_ok=True)
     hist_png = os.path.join(args.save_path, "dataset_statistics_histograms.png")
     _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-Planner")
     print(f"Saved histogram PNG: {hist_png}")

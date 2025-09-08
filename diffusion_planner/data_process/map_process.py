@@ -320,7 +320,7 @@ def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
 
 def _compute_lane_on_npc_routes(
         neighbor_token_to_rr_ids: Dict[str,
-                                       Optional[List[str]]],  # 길이: agent_num
+                                       Optional[List[str]]],  # 길이: agent_num 보다 작을 수 있음 (자동차만 선별 했으니까)
         lane_routes: List[str],  # 길이 lane_num
 ) -> Dict[str, List[bool]]:
     """토큰별 NPC 경로(보정)가 현재 추출된 차선 목록(lane_routes)에 포함되는지 불리언 마스크로 반환합니다.
@@ -331,7 +331,7 @@ def _compute_lane_on_npc_routes(
     Args:
         neighbor_token_to_rr_ids (Dict[str, Optional[List[str]]]):
             토큰 → **보정된** route roadblock ID 리스트(또는 None).
-             # 길아: agent_num
+             # 길아: agent_num 보다 작거나 같음
         lane_routes (List[str]): # 길이 lane_num
             길이 M의 roadblock ID 리스트. 현재 프레임에서 추출된 차선들(거리 가까운 순 정렬).
 

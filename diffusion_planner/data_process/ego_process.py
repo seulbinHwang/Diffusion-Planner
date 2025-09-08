@@ -53,13 +53,14 @@ def sampled_past_ego_states_to_array(
         output[i, EgoInternalIndex.y()] = past_ego_states[i].center.y
         output[i,
                EgoInternalIndex.heading()] = past_ego_states[i].center.heading
-        # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
-        v_local = past_ego_states[i].dynamic_car_state.center_velocity_2d
-        v_global = numpy_array_to_absolute_velocity(
-            past_ego_states[i].center,
-            np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
-        output[i, EgoInternalIndex.vx()] = v_global.x
-        output[i, EgoInternalIndex.vy()] = v_global.y
+        # --- 자차좌표계 → 세계좌표계 속도 변환: 회전만 적용 ---
+        v_local = past_ego_states[i].dynamic_car_state.center_velocity_2d  # body-frame velocity
+        he = float(past_ego_states[i].center.heading)
+        c, s = np.cos(he), np.sin(he)
+        vx_w = c * float(v_local.x) - s * float(v_local.y)
+        vy_w = s * float(v_local.x) + c * float(v_local.y)
+        output[i, EgoInternalIndex.vx()] = vx_w
+        output[i, EgoInternalIndex.vy()] = vy_w
         # output[i, EgoInternalIndex.ax(
         # )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.x
         # output[i, EgoInternalIndex.ay(
@@ -96,14 +97,14 @@ def sampled_future_ego_states_to_array(
         output[i, EgoInternalIndex.y()] = future_ego_states[i].center.y
         output[i,
                EgoInternalIndex.heading()] = future_ego_states[i].center.heading
-        # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
-        v_local = future_ego_states[i].dynamic_car_state.center_velocity_2d
-        v_global = numpy_array_to_absolute_velocity(
-            future_ego_states[i].center,
-            np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
-
-        output[i, EgoInternalIndex.vx()] = v_global.x
-        output[i, EgoInternalIndex.vy()] = v_global.y
+        # --- 자차좌표계 → 세계좌표계 속도 변환: 회전만 적용 ---
+        v_local = future_ego_states[i].dynamic_car_state.center_velocity_2d  # body-frame velocity
+        he = float(future_ego_states[i].center.heading)
+        c, s = np.cos(he), np.sin(he)
+        vx_w = c * float(v_local.x) - s * float(v_local.y)
+        vy_w = s * float(v_local.x) + c * float(v_local.y)
+        output[i, EgoInternalIndex.vx()] = vx_w
+        output[i, EgoInternalIndex.vy()] = vy_w
         output[i,
                EgoInternalIndex.ax()] = future_ego_states[i].car_footprint.width
         output[
@@ -176,15 +177,6 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
         yaw_rate = np.clip(yaw_rate, -0.95, 0.95)
     # ego_agent_past: (T, 7)
     # past: (T, 8) # +3 for one-hot encoding of the agent type (car, pedestrian, cyclist) and ego is always car.
-    past = np.zeros((ego_agent_past.shape[0], ego_agent_past.shape[1] + 1 + 3),
-                    dtype=np.float32)
-    # past: x, y, cos(heading), sin(heading), vx, vy, width, length, agent_type
-    past[:, :2] = ego_agent_past[:, :2]
-    past[:, 2] = np.cos(ego_agent_past[:, 2])
-    past[:, 3] = np.sin(ego_agent_past[:, 2])
-    past[:, 4:8] = ego_agent_past[:, 3:]
-    # add one-hot encoding for agent type.
-    past[:, 8] = 1.0  # ego is always car
 
     current = np.zeros((ego_agent_past.shape[1] + 3), dtype=np.float32)
     current[:2] = current_state[:2]
@@ -194,4 +186,4 @@ def calculate_additional_ego_states(ego_agent_past, time_stamp):
     current[8] = steering_angle
     current[9] = yaw_rate
 
-    return past, current
+    return current

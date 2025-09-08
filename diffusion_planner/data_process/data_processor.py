@@ -190,7 +190,9 @@ class DataProcessor(object):
         if not self._save_dir:
             return
         os.makedirs(self._save_dir, exist_ok=True)
-        out_path = os.path.join(self._save_dir,
+        json_temp_folder = os.path.join(self._save_dir, "json_temp")
+        os.makedirs(json_temp_folder, exist_ok=True)
+        out_path = os.path.join(json_temp_folder,
                                 f"{map_name}_{token}.stats.json")
         tmp_path = out_path + ".tmp"
         with open(tmp_path, "w") as f:
@@ -334,10 +336,10 @@ class DataProcessor(object):
                                                    ego_coords, ego_heading,
                                                    self._radius,
                                                    traffic_light_data)
-        # # 길아: agent_num
+        # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
         neighbor_token_to_rr_ids: Dict[
             str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                scenario, neighbor_track_token, self._radius)
+                scenario, neighbor_track_token)
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         vector_map = map_process(route_roadblock_ids, neighbor_token_to_rr_ids,
@@ -378,7 +380,6 @@ class DataProcessor(object):
             ],
                                         dtype=np.float64)  # shape (3,)
             # all_frame_ego_feature: np (21, 10) # x, y, theta, vx, vy, width, length
-            print("0")
             all_frame_ego_feature, time_stamps_past = get_ego_past_array_from_scenario(
                 scenario, self.num_past_poses, self.past_time_horizon)
 
@@ -397,7 +398,6 @@ class DataProcessor(object):
             # all_frame_agents_types:  List[List[TrackedObjectType]]
             all_frame_agents_feature, all_frame_agents_types = \
                 sampled_tracked_objects_to_array_list(sampled_past_observations)
-            print("1")
             # present_static_feature: np.ndarray, (len(static_obj), 5)
             # static_objects_types: List[TrackedObjectType]
             (present_static_feature, static_objects_types
@@ -412,12 +412,10 @@ class DataProcessor(object):
                  all_frame_agents_types, self.num_agents,
                  present_static_feature, static_objects_types, self.num_static,
                  self.max_ped_bike, anchor_ego_state)
-            print("2")
 
             neighbor_agents_past, _, neighbor_indices = \
                 self._filter_agents_within_radius(neighbor_agents_past,
                                                  None, neighbor_indices)
-            # 길아: agent_num
             neighbor_track_token: List[
                 Optional[str]] = get_neighbor_track_tokens(
                     present_tracked_objects=present_tracked_objects,
@@ -432,16 +430,13 @@ class DataProcessor(object):
             route_roadblock_ids = scenario.get_route_roadblock_ids()
             traffic_light_data = list(
                 scenario.get_traffic_light_status_at_iteration(0))
-            print("3")
             if route_roadblock_ids != ['']:
                 route_roadblock_ids = route_roadblock_correction(
                     ego_state, map_api, route_roadblock_ids)
-            # # 길아: agent_num
-            print("4")
+            # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
             neighbor_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                    scenario, neighbor_track_token, self._radius)
-            print("5.")
+                    scenario, neighbor_track_token)
 
             (coords, traffic_light_data, speed_limit,
              lane_route) = get_neighbor_vector_set_map(map_api,
@@ -449,13 +444,11 @@ class DataProcessor(object):
                                                        ego_coords, ego_heading,
                                                        self._radius,
                                                        traffic_light_data)
-            print("6")
             vector_map = map_process(
                 route_roadblock_ids, neighbor_token_to_rr_ids,
                 neighbor_track_token, neighbor_agents_current, anchor_ego_state,
                 coords, traffic_light_data, speed_limit, lane_route,
                 self._map_features, self._max_elements, self._max_points)
-            print("7")
 
             # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
             try:
@@ -491,7 +484,6 @@ class DataProcessor(object):
              ego_agent_future_11_dim) = get_ego_future_array_from_scenario(
                  scenario, ego_state, self.num_future_poses,
                  self.future_time_horizon)
-            print("8")
             Tf, Df = ego_agent_future_11_dim.shape
             assert Tf == self.num_future_poses, (
                 "Ego agent future states should have T time steps")
@@ -513,7 +505,6 @@ class DataProcessor(object):
             (future_tracked_objects_array_list,
              _) = sampled_tracked_objects_to_array_list(
                  sampled_future_observations)
-            print("9")
             # neighbor_agents_future: (num_agents, future_len, 3)
             neighbor_agents_future = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
@@ -521,43 +512,44 @@ class DataProcessor(object):
             _, neighbor_agents_future, _ = \
                 self._filter_agents_within_radius(neighbor_agents_past,
                                                  neighbor_agents_future)
-            print("10")
             '''
             ego current
             
             
             '''
             # ego_agent_past: (T, 11)
-            _, ego_current_state = calculate_additional_ego_states(
+            ego_current_state = calculate_additional_ego_states(
                 ego_agent_past, time_stamps_past)
             T, D = ego_agent_past.shape
             assert T == self.num_past_poses + 1, "Ego agent past states should have T+1 time steps"
             assert D == 11, "Ego agent past states should have 8 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length)"
-            print("11")
             # gather data
             data = {
                 "map_name": map_name,
                 "token": token,
-                "ego_agent_past": ego_agent_past,  # (time_len, 11)
-                "ego_current_state": ego_current_state,  # (10,)
+                "ego_agent_past": ego_agent_past,  # (time_len, 11) # DONE
+                "ego_current_state": ego_current_state,  # (10,) # TODO
                 # TODO: ego_agent_future 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
                 "ego_agent_future":
-                    ego_agent_future,  # rear_axle x,y # (future_len, 3)
+                    ego_agent_future,  # rear_axle x,y # (future_len, 3) # DONE
                 "ego_agent_future_11_dim":
-                    ego_agent_future_11_dim,  # center x,y # (future_len, 11)
+                    ego_agent_future_11_dim,  # center x,y # (future_len, 11) # DONE
                 "neighbor_agents_past":
-                    neighbor_agents_past,  # (num_agents, time_len, 11)
+                    neighbor_agents_past,  # (num_agents, time_len, 11) # DONE
                 "neighbor_agents_future":
-                    neighbor_agents_future,  # (num_agents, future_len, 3)
-                "static_objects": static_objects  # (num_static, 5)
+                    neighbor_agents_future,  # (num_agents, future_len, 3) # DONE
+                "static_objects": static_objects  # (num_static, 5) # TODO
             }
             data.update(vector_map)
 
             # 디버깅용 그림 그리기
+            save_dir = os.path.join(self._save_dir, "debug_vis")
+            save_path = os.path.join(save_dir,
+                                        f"{map_name}_{token}.png")
+            os.makedirs(save_dir, exist_ok=True)
             if self._wandb_enabled or self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
                 draw_machine.draw_world_model_to_png(
                     data,
                     token_to_future_traj_wrt_ego=None,
-                    save_path=self._save_dir)
-            print("12")
+                    save_path=save_path)

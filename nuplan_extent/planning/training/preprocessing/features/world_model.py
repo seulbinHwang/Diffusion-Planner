@@ -136,10 +136,10 @@ class WorldModelFeature(AbstractModelFeature):
         for i in range(batch_size):
             features.append(
                 WorldModelFeature(
-                    ego_agent_past=self.ego_agent_past[i],
-                    neighbor_agents_past=self.neighbor_agents_past[i],
+                    ego_agent_past=self.ego_agent_past[i], # DONE
+                    neighbor_agents_past=self.neighbor_agents_past[i], # DONE
                     static_objects=self.static_objects[i],
-                    lanes=self.lanes[i],
+                    lanes=self.lanes[i], # DONE
                     lanes_speed_limit=self.lanes_speed_limit[i],
                     lanes_has_speed_limit=self.lanes_has_speed_limit[i],
                     route_lanes=None

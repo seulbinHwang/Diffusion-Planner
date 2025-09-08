@@ -117,7 +117,7 @@ def get_args():
     parser.add_argument('--lane_num',
                         type=int,
                         help='number of lanes',
-                        default=70)
+                        default=150)
 
     parser.add_argument('--route_len',
                         type=int,

@@ -7,6 +7,7 @@ Categories:
     2. Map coordination transformation
     3. Numpy-Tensor transformation
 """
+from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 from types import SimpleNamespace
 import torch
@@ -20,7 +21,7 @@ from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Sequence
 import numpy as np
 
 from collections import defaultdict
@@ -207,23 +208,23 @@ def build_agent_route_lane_order(
 
 
 def _select_token_and_ordered_npc_route_indices(
-    token_to_lane_on_routes: Dict[str, List[bool]],  # 길이 == agent_num (키 개수)
+    token_to_lane_on_routes: Dict[str, List[bool]],  # 길이 <= agent_num (키 개수)
     neighbor_track_token: List[Optional[str]],  # 길이 == agent_num, ego와 가까운 순서
     neighbor_agents_current: np.ndarray,  # shape: (agent_num, 11), ego와 가까운 순서
     vector_map_lanes: np.ndarray,  # shape: (lane_num, P, D), 좌표는 [:, :, :2]
-    max_route_lanes: int,
+    route_num: int,
 ) -> np.ndarray:
-    """토큰별 '경로 위 차선' 인덱스를 가까운 차선부터 최대 `max_route_lanes`개 선택하고,
+    """토큰별 '경로 위 차선' 인덱스를 가까운 차선부터 최대 `route_num`개 선택하고,
     에이전트(이웃) 순서(이미 ego와 가까운 순)대로 `npc_route_indices`를 생성합니다.
 
     설계 가정:
     - `token_to_lane_on_routes`, `neighbor_track_token`, `neighbor_agents_current`의 길이는 모두 `agent_num`으로 동일합니다.
     - `neighbor_track_token`와 `neighbor_agents_current`는 **ego와 가까운 순서**로 이미 정렬되어 있습니다.
-    - `max_route_lanes < lane_num`이 보장됩니다.
+    - `route_num < lane_num`이 보장됩니다.
 
     선택 기준(각 에이전트 i에 대해):
     - 모든 차선과 에이전트 현재 위치 간 최소거리(폴리라인 점들 중 최소)를 계산해 차선을 가까운→먼 순으로 정렬
-    - 그 순서대로 `token_to_lane_on_routes[token][lane_idx]`가 True인 차선만 최대 `max_route_lanes`개 선택
+    - 그 순서대로 `token_to_lane_on_routes[token][lane_idx]`가 True인 차선만 최대 `route_num`개 선택
 
     Args:
         token_to_lane_on_routes (Dict[str, List[bool]]):
@@ -232,7 +233,7 @@ def _select_token_and_ordered_npc_route_indices(
         neighbor_track_token (List[Optional[str]]): 길이 `agent_num`. 에이전트 토큰(없을 수 있어 None).
         neighbor_agents_current (np.ndarray): shape=(agent_num, 11). 거리 계산에 x=[:,0], y=[:,1] 사용.
         vector_map_lanes (np.ndarray): shape=(lane_num, P, D). 거리 계산에 좌표 성분 [:, :, :2] 사용.
-        max_route_lanes (int): NPC 당 최대 선택할 차선 개수. (항상 lane_num보다 작음)
+        route_num (int): NPC 당 최대 선택할 차선 개수. (항상 lane_num보다 작음)
 
     Returns:
         np.ndarray:
@@ -260,35 +261,39 @@ def _select_token_and_ordered_npc_route_indices(
     if vector_map_lanes.ndim != 3 or vector_map_lanes.shape[2] < 2:
         raise ValueError(
             f"`vector_map_lanes` shape가 올바르지 않습니다: {vector_map_lanes.shape}")
-    if not (0 < max_route_lanes < lane_num):
+    if not (0 < route_num < lane_num):
         raise ValueError(
-            f"`max_route_lanes`는 0 < max_route_lanes < lane_num 을 만족해야 합니다. "
-            f"(max_route_lanes={max_route_lanes}, lane_num={lane_num})")
+            f"`route_num`는 0 < route_num < lane_num 을 만족해야 합니다. "
+            f"(route_num={route_num}, lane_num={lane_num})")
 
     # --- 준비: 차선 좌표 ---
     lanes_xy = vector_map_lanes[:, :, :2]  # (lane_num, P, 2)
 
-    token_to_route_indices: Dict[str, List[int]] = {}
+    # token_to_route_indices: Dict[str, List[int]] = {}
     npc_route_indices: List[List[int]] = []
 
-    # 중복/None 토큰을 위해 고유 키를 만드는 헬퍼
-    def _unique_key(base: Optional[str], idx: int) -> str:
-        key = base if base is not None else "__none__"
-        # 동일 키가 이미 존재하면 인덱스 suffix로 고유화
-        return key if key not in token_to_route_indices else f"{key}#{idx}"
 
     # --- 에이전트(이미 ego 근접 순) 순회 ---
     for agent_idx in range(agent_num):
-        token = neighbor_track_token[agent_idx]
+        selected: List[int] = []
+
+        token = neighbor_track_token[agent_idx] # Optional[str]
         if token is None:
-            continue
-
-        # 마스크 획득 (없으면 전부 False로 처리)
-        ###############################
-        lane_on_routes = token_to_lane_on_routes[
-            token]  # (Dict[str, List[bool]]):
+            lane_on_routes = [False] * lane_num
+        else:
+            # 마스크 획득 (없으면 전부 False로 처리)
+            ###############################
+            # token_to_lane_on_routes: Dict[str, List[bool]]
+            lane_on_routes = token_to_lane_on_routes.get(
+                token, [False] * lane_num
+        )  # (Dict[str, List[bool]]):
         # lane_on_routes: List[bool], 길이 == lane_num
-
+        # if all False in lane_on_routes를 코딩할거임.
+        lane_on_routes_array = np.asarray(lane_on_routes, dtype=bool)
+        if lane_on_routes_array.sum() == 0:
+            # token_to_route_indices[token] = selected
+            npc_route_indices.append(selected)
+            continue
         agent_xy = neighbor_agents_current[agent_idx, :2]  # (2,)
 
         # 각 차선 폴리라인과의 최소거리 (lane_num,)
@@ -298,20 +303,19 @@ def _select_token_and_ordered_npc_route_indices(
         lane_dist_order = np.argsort(min_dists)  # (lane_num,)
 
         # 가까운 순서대로 True인 차선만 최대 max_route_lanes개 선택
-        selected: List[int] = []
         lane_on_routes_arr = np.asarray(lane_on_routes, dtype=bool)
         for lane_idx in lane_dist_order:
+            if lane_idx >= len(lane_on_routes_arr):
+                break
             if lane_on_routes_arr[lane_idx]:
                 selected.append(int(lane_idx))
-                if len(selected) >= max_route_lanes:
+                if len(selected) >= route_num:
                     break
 
-        token_to_route_indices[token] = selected
+        # token_to_route_indices[token] = selected
         npc_route_indices.append(selected)
 
     # 반환 길이 검증(요구조건: 둘 다 agent_num 크기 보장)
-    assert len(token_to_route_indices) == agent_num, \
-        f"token_to_route_indices 키 개수({len(token_to_route_indices)}) != agent_num({agent_num})"
     assert len(npc_route_indices) == agent_num, \
         f"npc_route_indices 길이({len(npc_route_indices)}) != agent_num({agent_num})"
     agent_route_lane_order = build_agent_route_lane_order(
@@ -320,96 +324,83 @@ def _select_token_and_ordered_npc_route_indices(
 
 
 def get_neighbor_track_tokens(
-    present_tracked_objects: Union[object, List[object]],
-    neighbor_indices: Union[np.ndarray, List[int]],
+    present_tracked_objects: TrackedObjects,
+    neighbor_indices: Union[Sequence[int], np.ndarray],
     agents_num: int,
+    object_types: Optional[Sequence[TrackedObjectType]] = None,
 ) -> List[Optional[str]]:
-    """현재 프레임의 트래킹 객체와 `neighbor_indices`를 이용해,
-    `neighbor_agents_past`에 최종 선정된 에이전트(agents_num)의 track token을 반환합니다.
+    """현재 프레임에서 선별된 이웃의 `track_token`을, 에이전트 슬롯 순서대로 반환합니다.
 
-    이 함수는 `agent_past_process(...)`가 반환한 `neighbor_indices`의 **순서가
-    `neighbor_agents_past`의 0축(에이전트 축) 순서와 동일**하다는 가정하에 동작합니다.
-    각 인덱스는 현재 프레임의 트래킹 객체 리스트(또는 컨테이너)에서의 위치를 가리킵니다.
+    개요
+    - `agent_past_process(...)`가 반환한 `neighbor_indices`는
+      "현재 프레임(=리스트의 마지막 프레임)의 에이전트 배열"의 **행 인덱스**입니다.
+    - 같은 현재 프레임의 `TrackedObjects`에서 `VEHICLE/PEDESTRIAN/BICYCLE`만
+      `_extract_agent_array`와 동일한 순서로 나열해두면,
+      `neighbor_indices[k]` → 해당 행의 `TrackedObject.track_token`으로 1:1 매핑할 수 있습니다.
+    - 반환 리스트 길이는 항상 `agents_num`이며, 유효한 이웃보다 슬롯이 많으면 나머지는 `None`으로 채웁니다.
 
     Args:
-        present_tracked_objects (Union[object, List[object]]):
-            - 현재 프레임의 트래킹 객체 모음.
-            - NuPlan의 `TrackedObjects` 컨테이너(속성 `.tracked_objects` 보유) 또는
-              `List[TrackedObject]` 형태 모두 지원합니다.
-            - 각 객체는 `track_token`(str) 속성을 갖는다고 가정합니다.
-        neighbor_indices (Union[np.ndarray, List[int]]):
-            - shape: (K,), K ≤ agents_num
-            - `agent_past_process`가 선택한 이웃 에이전트들의 **현재 프레임 인덱스** 배열.
-              길이가 `agents_num`보다 짧을 수 있으며, 이 경우 나머지는 `None`으로 채웁니다.
-        agents_num (int):
-            - `neighbor_agents_past`의 에이전트 축 크기(고정 개수).
+        present_tracked_objects:
+            - 현재 프레임의 관측. `TrackedObjects` 또는 `DetectionsTracks`(또는 `tracked_objects` 속성 보유형).
+        neighbor_indices:
+            - 모양: **(K, )**, `int` 인덱스. `agent_past_process`의 `sorted_cur_neighbor_indices`.
+            - 이 순서가 곧 `neighbor_agents_past`의 행 순서(거리 오름차순 등)입니다.
+        agents_num:
+            - 최종 슬롯 개수. 반환 리스트 길이가 됩니다.
+        object_types:
+            - 필터링할 타입. 기본은 `[VEHICLE, PEDESTRIAN, BICYCLE]`.
+              `_extract_agent_array`와 동일해야 인덱스 정합이 보장됩니다.
 
     Returns:
         List[Optional[str]]:
-            - `neighbor_track_token`, 길이 = `agents_num`
-            - 각 원소는 선택된 에이전트의 `track_token`(str) 또는 매칭 불가 시 `None`.
+            - 길이: `agents_num`
+            - 각 원소는 해당 슬롯의 `track_token`(문자열). 비어 있으면 `None`.
 
-    Examples:
-        >>> # present_tracked_objects: TrackedObjects 컨테이너 혹은 List[TrackedObject]
-        >>> # neighbor_indices: np.array([5, 2, 0])  # 세 명만 실제 선택됨
-        >>> # agents_num = 5  # 패딩 포함 고정 크기
-        >>> tokens = get_neighbor_track_tokens(present_tracked_objects, neighbor_indices, agents_num)
-        >>> len(tokens)
-        5
-        >>> tokens[:3]   # 앞의 3개는 실제 선택된 에이전트 토큰
-        ['abc123', 'def456', 'ghi789']
-        >>> tokens[3:]   # 남는 두 개는 패딩: None
-        [None, None]
+    Notes:
+        - 인덱스 범위를 벗어나거나 타입 불일치로 매핑이 안 되면 `None`을 넣습니다.
+        - `neighbor_indices` 길이가 `agents_num`보다 길 경우, 앞 `agents_num`개만 사용합니다.
     """
-    # 1) 현재 프레임의 객체 리스트 확보 (컨테이너/리스트 모두 지원)
-    if hasattr(present_tracked_objects, "tracked_objects"):
-        objects_list = list(
-            present_tracked_objects.tracked_objects)  # NuPlan 컨테이너
-    elif isinstance(present_tracked_objects, (list, tuple)):
-        objects_list = list(present_tracked_objects)  # 이미 리스트/튜플
-    else:
-        # 마지막 방어선: 이터러블이면 리스트로 변환, 아니면 빈 리스트
-        try:
-            objects_list = list(present_tracked_objects)
-        except TypeError:
-            objects_list = []
+    if agents_num < 0:
+        raise ValueError(f"`agents_num`은 음수가 될 수 없습니다. got {agents_num}")
 
-    # 2) 현재 프레임 토큰 테이블 구성
-    present_tokens: List[Optional[str]] = []
-    for obj in objects_list:
-        token = getattr(obj, "track_token", None)
-        if token is None:
-            # 혹시 구현체에 따라 이름이 다를 수 있으므로 보조 키도 점검
-            token = getattr(obj, "token", None)
-        present_tokens.append(token)
+    tracked_objects = present_tracked_objects
 
-    # 3) neighbor_indices 정규화 (길이 K ≤ agents_num)
+    # `_extract_agent_array`와 동일한 타입 필터 순서 유지
+    if object_types is None:
+        object_types = (
+            TrackedObjectType.VEHICLE,
+            TrackedObjectType.PEDESTRIAN,
+            TrackedObjectType.BICYCLE,
+        )
+
+    # 현재 프레임에서 관심 타입만 '그 순서 그대로' 나열
+    current_agents: List[TrackedObject] = tracked_objects.get_tracked_objects_of_types(object_types)  # type: ignore[assignment]
+    tokens_in_present_order: List[str] = [str(agent.track_token) for agent in current_agents]  # (M,)
+
+    # 반환 버퍼 준비
+    neighbor_track_token: List[Optional[str]] = [None] * int(agents_num)
+
+    # neighbor_indices 정규화(int list)
     if neighbor_indices is None:
-        idx_array = np.empty((0,), dtype=int)
-    else:
-        idx_array = np.asarray(neighbor_indices).reshape(-1)
-        # 실수형으로 들어온 경우가 있어도 안전하게 정수 변환
-        idx_array = idx_array.astype(int, copy=False)
+        return neighbor_track_token
+    # numpy, list, tuple 등 모두 int 리스트로 캐스팅
+    idx_list: List[int] = list(map(int, np.asarray(neighbor_indices).reshape(-1).tolist()))
 
-    # 4) 에이전트 개수(agents_num)에 맞춰 토큰 리스트 생성 (부족분은 None 패딩)
-    neighbor_track_token: List[Optional[str]] = []
-    total_present = len(present_tokens)
-
-    for i in range(agents_num):
-        token_i: Optional[str] = None
-        if i < idx_array.shape[0]:
-            idx = int(idx_array[i])
-            if 0 <= idx < total_present:
-                token_i = present_tokens[idx]
-        neighbor_track_token.append(token_i)
+    # 앞에서부터 agents_num개만 매핑
+    max_fill = min(len(idx_list), agents_num)
+    for slot_idx in range(max_fill):
+        src_idx = idx_list[slot_idx]
+        if 0 <= src_idx < len(tokens_in_present_order):
+            neighbor_track_token[slot_idx] = tokens_in_present_order[src_idx]
+        else:
+            # 범위를 벗어나면 안전하게 None 유지
+            neighbor_track_token[slot_idx] = None
 
     return neighbor_track_token
-
 
 def get_npc_route_roadblock_ids(
     scenario: NuPlanScenario,
     neighbor_track_token: List[Optional[str]],
-    radius: float = 100.,
 ) -> Dict[str, Optional[List[str]]]:
 
     def select_nearest_connectors_by_mean_distance(
@@ -523,71 +514,11 @@ def get_npc_route_roadblock_ids(
             ]))
 
 
-
-    def _filter_vehicle_tokens_in_square(
-        ego_state: EgoState,
-        detections: DetectionsTracks,
-        radius: float,
-    ) -> Set[str]:
-        """ego heading에 정렬된 정사각형(변=2*radius) 내부에 있는 차량 토큰을 반환한다.
-
-        정사각형 축 정의:
-            - 좌표계 원점: ego rear_axle (x, y)
-            - 축 방향: ego heading에 정렬된 로컬 x/y 축(ego 좌표계)
-            - 포함 판정: 로컬 좌표 (x_local, y_local) 가 모두 [-radius, +radius] 범위에 있으면 포함
-
-        구현 메모:
-            - 월드 → ego 로컬 변환은 ego heading에 대해 -heading 회전과 평행이동을 적용한 것과 동일.
-            - 수치적 안정성을 위해 비교는 경계 포함(<=)으로 처리.
-
-        Args:
-            ego_state: ego의 상태(특히 rear_axle.x, rear_axle.y, rear_axle.heading 사용)
-            detections: 현재 프레임의 트래킹 결과(DetectionsTracks)
-            radius: 정사각형 한 변의 절반 길이 [m]
-
-        Returns:
-            Set[str]: 정사각형 내부에 있는 VEHICLE 타입 객체들의 track_token 집합
-        """
-        cx = float(ego_state.rear_axle.x)
-        cy = float(ego_state.rear_axle.y)
-        h = float(ego_state.rear_axle.heading)
-        cos_h = math.cos(h)
-        sin_h = math.sin(h)
-
-        tokens: Set[str] = set()
-
-        for obj in detections.tracked_objects:
-            if obj.tracked_object_type != TrackedObjectType.VEHICLE:
-                continue
-
-            # 월드 좌표에서 ego 원점으로 평행이동
-            dx = float(obj.center.x) - cx
-            dy = float(obj.center.y) - cy
-
-            # 월드 → ego 로컬 회전(각도 -h 적용과 동일)
-            # x_local =  cos(h)*dx + sin(h)*dy
-            # y_local = -sin(h)*dx + cos(h)*dy
-            x_local = dx * cos_h + dy * sin_h
-            y_local = -dx * sin_h + dy * cos_h
-
-            if (-radius <= x_local <= radius) and (-radius <= y_local <=
-                                                   radius):
-                token = getattr(obj, "track_token", None)
-                if token is not None:
-                    tokens.add(token)
-
-        return tokens
-
     # ─────────── 1단계: 차량별 프레임 수집 ────────────
     token_to_trajectory: Dict[str, List['SceneObject']] = defaultdict(list)
-    ##########
-    initial_detections = scenario.get_tracked_objects_at_iteration(0)
-    # 1) 반경 내 토큰
-    square_tokens = _filter_vehicle_tokens_in_square(scenario.initial_ego_state,
-                                                     initial_detections, radius)
+    ##########    # 1) 반경 내 토큰
     # 2) neighbor_track_token과의 교집합으로 후보 제한(None 제거)
-    neighbor_token_set = {t for t in neighbor_track_token if t is not None}
-    candidate_tokens = square_tokens & neighbor_token_set
+    candidate_tokens = {t for t in neighbor_track_token if t is not None}
     # 3) ego와의 거리 순으로 상위 vehicle_num개만 선택
 
     ##########
@@ -601,8 +532,8 @@ def get_npc_route_roadblock_ids(
             if det.tracked_object_type == TrackedObjectType.VEHICLE and (
                     det.track_token in candidate_tokens):
                 token_to_trajectory[det.track_token].append(det)
-
     token_to_route_roadblock_ids: Dict[str, Optional[List[str]]] = {}
+
     # ─────────── 2단계: 에이전트별 경로 생성 ────────────
     for agent_token, agent_list in token_to_trajectory.items():
         if not agent_list:
@@ -829,17 +760,23 @@ def convert_absolute_quantities_to_relative(
 
         # local vel,acc to local
         # agent_local_vel: 자차량 좌표계 기준 속도 벡터
-        agent_local_vel = agent_state[:, [
-            EgoInternalIndex.vx(), EgoInternalIndex.vy()
-        ]]
-        agent_local_vel = np.expand_dims(np.concatenate(
-            (agent_local_vel, np.zeros(
-                (agent_local_vel.shape[0], 1))), axis=-1),
-                                         axis=-1)
-        transformed_vel = np.matmul(transforms,
-                                    agent_local_vel).squeeze(axis=-1)
-        new_agent_state[:, 4] = transformed_vel[:, 0]
-        new_agent_state[:, 5] = transformed_vel[:, 1]
+        # agent_local_vel = agent_state[:, [
+        #     EgoInternalIndex.vx(), EgoInternalIndex.vy()
+        # ]]
+        # agent_local_vel = np.expand_dims(np.concatenate(
+        #     (agent_local_vel, np.zeros(
+        #         (agent_local_vel.shape[0], 1))), axis=-1),
+        #                                  axis=-1)
+        # transformed_vel = np.matmul(transforms,
+        #                             agent_local_vel).squeeze(axis=-1)
+        # --- velocity (world -> anchor ego frame) ---
+        agent_global_velocities = agent_state[:, [EgoInternalIndex.vx(),
+                                                  EgoInternalIndex.vy()]]
+        transformed_velocities = _global_velocity_to_local(
+            agent_global_velocities, ego_pose[-1])
+
+        new_agent_state[:, 4] = transformed_velocities[:, 0]
+        new_agent_state[:, 5] = transformed_velocities[:, 1]
         agent_state = new_agent_state
     elif agent_type == 'agent':
         agent_global_poses = agent_state[:, [
