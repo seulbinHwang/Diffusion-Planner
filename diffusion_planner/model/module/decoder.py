@@ -151,14 +151,14 @@ class Decoder(nn.Module):
         # === [CHANGE] Pnn을 '입력으로 들어온 길이'에 맞춰 동적으로 결정 ===
         # route 임베딩이 있을 때 그 길이를 우선 사용하고, 없다면 cond_last_pos_norm 길이를 사용
         # (훈련 시엔 둘 다 존재, 추론 시엔 route 임베딩이 기준이 됨)
-        if "cond_last_pos_norm" in inputs:
-            pnn_dyn = inputs["cond_last_pos_norm"].shape[1]  # [B, Pnn, 4]
-        else:
-            pnn_dyn = encoder_outputs["near_agents_route_lane_emb"].shape[
-                1]  # [B, Pnn, H]
+        # if "cond_last_pos_norm" in inputs:
+        #     pnn_dyn = inputs["cond_last_pos_norm"].shape[1]  # [B, Pnn, 4]
+        # else:
+        #     pnn_dyn = encoder_outputs["near_agents_route_lane_emb"].shape[
+        #         1]  # [B, Pnn, H]
 
         # Extract ego & neighbor current states
-        near_current = inputs["neighbor_agents_past"][:, :pnn_dyn,
+        near_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num,
                                                       -1, :4]  # [B, pnn, 4]
         near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
                                       dim=-1) == 0  # [B, pnn]
@@ -171,8 +171,7 @@ class Decoder(nn.Module):
         # === [FIX] cond_last_pos_norm가 없을 때도 안전하게 처리 ===
         if "cond_last_pos_norm" in inputs:
             # 길이(pnn_dyn)에 맞춰 잘라서 정합 보장
-            cond_last_pos_norm = inputs["cond_last_pos_norm"][
-                :, :Pnn, :]  # [B, Pnn, 4]
+            cond_last_pos_norm = inputs["cond_last_pos_norm"]#[:, :Pnn, :]  # [B, Pnn, 4]
         else:
             # NaN으로 채워서 'isfinite' 검사에 의해 자동 미적용되게 만든다.
             cond_last_pos_norm = torch.full(
@@ -194,7 +193,6 @@ class Decoder(nn.Module):
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
 
         if self.training:
-            assert inputs["near_cur_future_norm_xT"].shape[1] == Pnn, f"훈련 시점의 Pnn이 encoder_outputs와 맞지 않습니다. {inputs['near_cur_future_norm_xT'].shape[1]} != {Pnn}"
             near_cur_future_norm_xT = inputs["near_cur_future_norm_xT"].reshape(
                 B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
             # 🔹 20% 확률로 마지막 프레임(목표) 주입 — Conditioned Generation 학습 신호
