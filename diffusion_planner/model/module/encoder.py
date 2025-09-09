@@ -164,51 +164,125 @@ class NearAgentsRouteLaneEncoder(nn.Module):
             route_lane_pos: torch.Tensor,  # (B, Pnn, route_num, pos_dim)
     ) -> torch.Tensor:  # (B, Pnn, hidden_dim)
         """
-            route_lanes:       (B, Pnn, route_num, hidden_dim)
-            route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
-            route_lane_pos:    (B, Pnn, route_num, Dpos)
+        에이전트별 후보 경로(route) 집합을 내용(feature) 점수와 위치(positional) 점수로
+        가중합하여 **하나의 대표 경로 임베딩**을 산출합니다.
+
+        이 모듈은 각 이웃 에이전트(예: 주변 차량)마다 주어진 여러 후보 경로를 입력으로 받아,
+        (1) 경로 임베딩 기반 점수 `score_e(route_lanes)`와 (2) 경로 위치 특징 기반 점수
+        `score_p(route_lane_pos)`를 더해 **per-route 로짓**을 만든 뒤,
+        (3) 마스크된 항목을 제외하고 softmax 가중치를 계산하여,
+        (4) 경로 임베딩의 **가중합(pooling)**을 반환합니다.
+        만약 특정 에이전트의 모든 후보 경로가 무효(마스크)라면, 해당 에이전트의 출력은
+        학습 가능한 **`unknown_emb`** 벡터로 대체됩니다.
+
+        차원 표기:
+            - B: 배치 크기
+            - Pnn: 이웃 에이전트 수 (predicted neighbor num)
+            - R: 후보 경로 수 (`route_num`)
+            - H: 경로 임베딩 차원 (`hidden_dim`)
+            - Dpos: 경로 위치 특징 차원 (`pos_dim`)
+
+        Args:
+            route_lanes (torch.Tensor):
+                경로 임베딩 텐서. 각 후보 경로의 내용(feature) 표현.
+                **Shape:** `(B, Pnn, R, H)`.
+            route_lanes_mask (torch.Tensor):
+                경로 마스크. **`True`는 pad(무효)**, **`False`는 유효** 후보 경로를 의미.
+                softmax 계산에서 무효 항목이 제외되도록 로짓을 `-inf`로 마스킹합니다.
+                **Shape:** `(B, Pnn, R)`.
+            route_lane_pos (torch.Tensor):
+                경로의 위치/기하 특징(예: 중심점, 방향, 길이 등).
+                `score_p`가 사용하여 per-route 스칼라 점수를 산출합니다.
+                **Shape:** `(B, Pnn, R, Dpos)`.
+
+        Returns:
+            torch.Tensor:
+                에이전트별 대표 경로 임베딩(가중합 결과)에 정규화/드롭아웃을 적용한 출력.
+                **Shape:** `(B, Pnn, H)`.
+
+        Raises:
+            AssertionError: 입력 텐서의 차원 또는 선행 축(B, Pnn, R)이 서로 불일치할 때.
+
+        동작 개요:
+            1) **점수 계산**
+               - 내용 점수: `s_e = score_e(route_lanes)` → `(B, Pnn, R, 1)`
+               - 위치 점수: `s_p = score_p(route_lane_pos)` → `(B, Pnn, R, 1)`
+               - 합산 로짓: `logits = (s_e + s_p).squeeze(-1)` → `(B, Pnn, R)`
+            2) **마스킹 및 수치 안정화**
+               - `route_lanes_mask == True`(무효) 위치는 `-inf`로 채워 softmax에서 배제.
+               - 만약 한 에이전트의 모든 경로가 무효라면(`all_off=True`) 해당 행의 로짓을
+                 `0`으로 대체하여 **softmax NaN을 방지**합니다.
+            3) **주의(Attention) 가중치 계산**
+               - `attn = softmax(logits, dim=-1)` → `(B, Pnn, R)`
+               - 무효 항목 가중치는 0이 되도록 `(~route_lanes_mask)`로 한 번 더 차단.
+            4) **가중합 풀링**
+               - `(attn[..., None] * route_lanes).sum(dim=2)` → `(B, Pnn, H)`
+            5) **결측 에이전트 대체**
+               - `all_off=True`인 에이전트의 결과는 학습 가능한 `unknown_emb`로 치환.
+            6) **정규화 및 드롭아웃**
+               - `LayerNorm` 및 `Dropout`을 적용하여 최종 출력 생성.
+
+        주의:
+            - `route_lanes_mask`는 **True=무효** 규칙을 따릅니다. (pad 의미)
+            - 로짓은 softmax 전 **float32**로 변환하여 수치 안정성을 높입니다.
+            - `unknown_emb`는 `(1, 1, H)` 형태(또는 호환 가능한 브로드캐스트 형태)로 가정하며,
+              출력 텐서의 **device/dtype**에 맞춰 사용됩니다.
+            - 모든 연산은 유효 경로에 대해서만 그래디언트가 전파됩니다(마스크된 항목 제외).
         """
         assert route_lanes.dim() == 4 and route_lane_pos.dim() == 4, \
             f"route_lanes {route_lanes.shape}, route_lane_pos {route_lane_pos.shape}"
-        assert route_lanes_mask.dim(
-        ) == 3, f"route_lanes_mask {route_lanes_mask.shape}"
-        B, Pnn, route_num, hidden_dim = route_lanes.shape
+        assert route_lanes_mask.dim() == 3, f"route_lanes_mask {route_lanes_mask.shape}"
+        B, Pnn, route_num, hidden_dim = route_lanes.shape  # B:배치, Pnn:에이전트 수, route_num:R, hidden_dim:H
+        # route_lane_pos.shape[:3] == (B,Pnn,R) 확인
         assert route_lane_pos.shape[:3] == (B, Pnn,
                                             route_num), "pos와 lanes의 앞 3축이 달라요."
         assert route_lanes_mask.shape == (B, Pnn, route_num), "mask shape 불일치"
 
-        # s_e: (B,Pnn,route_num,1)
+        # s_e: (B,Pnn,R,1)
         s_e = self.score_e(route_lanes)
-        # s_p: (B,Pnn,route_num,1)
+        # s_p: (B,Pnn,R,1)
         s_p = self.score_p(route_lane_pos)
-        logits = (s_e + s_p).squeeze(-1)  # (B,Pnn,route_num)
+        # logits: (B,Pnn,R)
+        logits = (s_e + s_p).squeeze(-1)
 
         # 마스크 적용: pad(True) → -inf로 softmax 제외
-        logits = logits.float()  # 안정적 softmax
+        # logits(float32): (B,Pnn,R)
+        logits = logits.float()
+        # logits(masked): (B,Pnn,R)  # pad 위치는 -inf
         logits = logits.masked_fill(route_lanes_mask, float("-inf"))
 
-        # 모든 route가 결측인 에이전트(행 전체 -inf) 방지
-        all_off = route_lanes_mask.all(dim=-1)  # (B,Pnn) True=전부 무효
+        # all_off: (B,Pnn)  # 해당 에이전트의 모든 route가 무효(True)
+        all_off = route_lanes_mask.all(dim=-1)
         if all_off.any().item():
+            # logits.clone(): (B,Pnn,R)
             logits = logits.clone()
-            logits[all_off] = 0.0  # softmax NaN 방지
+            # logits[all_off]: (N_all_off, R)  # N_all_off = all_off에서 True인 (B,Pnn) 개수
+            logits[all_off] = 0.0  # softmax NaN 방지: 전부 무효인 행을 0으로 채움
 
-        # (B,Pnn,route_num) → (B,Pnn,route_num,1)
+        # attn_pre: (B,Pnn,R) → softmax → (B,Pnn,R)
+        # attn: (B,Pnn,R,1)  # 마지막 차원으로 1을 붙여 (R,1) 가중합에 대비
         attn = F.softmax(logits, dim=-1).unsqueeze(-1).to(route_lanes.dtype)
-        # 결측 에이전트는 가중치 0
+        # (~route_lanes_mask): (B,Pnn,R) → unsqueeze(-1): (B,Pnn,R,1)
+        # attn_masked: (B,Pnn,R,1)  # 무효 route 가중치 0
         attn = attn * (~route_lanes_mask).unsqueeze(-1)
 
-        # 가중합: (B,Pnn,hidden_dim)
-        # route_lanes: (B,Pnn,route_num,hidden_dim)
-        pooled = (attn * route_lanes).sum(dim=2)  # Σ_R
+        # (attn * route_lanes): (B,Pnn,R,1) * (B,Pnn,R,H) → 브로드캐스트 → (B,Pnn,R,H)
+        # pooled: (B,Pnn,H)  # R축(=route_num)으로 가중합
+        pooled = (attn * route_lanes).sum(dim=2)
 
-        # 결측 에이전트는 unknown_emb로 대체
+        # ★ 결측 에이전트는 unknown_emb로 대체 (수정된 부분)
+        # all_off: (B,Pnn)  # 해당 에이전트의 모든 route가 무효(True)
         if all_off.any().item():
-            unknown = self.unknown_emb.to(
-                dtype=pooled.dtype, device=pooled.device)  # (1,1,hidden_dim)
-            pooled[all_off] = unknown.expand_as(pooled[all_off])
-
-        # 정규화/드롭아웃
+            # self.unknown_emb: (1,1,H)
+            # self.unknown_emb[0,0]: (H,)  # 1D 벡터
+            # pooled[all_off]: (N_all_off, H)  # (B,Pnn) bool 마스크로 인덱싱한 결과
+            # unknown_row: (H,)
+            unknown_row = self.unknown_emb[0, 0].to(device=pooled.device,
+                                                    dtype=pooled.dtype)
+            # pooled[all_off]: (N_all_off, H)  ← (H,)가 행 방향으로 브로드캐스트되어 채워짐
+            pooled[all_off] = unknown_row
+        # norm 입력/출력: (B,Pnn,H)
+        # drop: (B,Pnn,H)
         pooled = self.drop(self.norm(pooled))  # (B,Pnn,hidden_dim)
         return pooled
 
@@ -613,6 +687,8 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         assert L == Lm, "lane_num mismatch between encoding_lanes and lanes_mask"
         _, Lp = lane_pos.shape[:2]
         assert L == Lp, "lane_num mismatch between encoding_lanes and lane_pos"
+        # === [ADD] torch.topk(k=0) 방지: route_num을 최소 1로 보정 ===
+        route_num = int(max(1, route_num))
 
         # (B, Pnn, L)  # -1=not in route → 큰 값으로 바꿔서 '최소값 top-k'에서 탈락시키기
         order_long = agent_route_lane_order.to(torch.long)
