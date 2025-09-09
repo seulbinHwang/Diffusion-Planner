@@ -226,30 +226,26 @@ class Decoder(nn.Module):
                 ],
                 dim=2).reshape(B, Pnn, -1)
 
-            # cond_last_pos가 주어지면 목표도 함께 고정
-            cond_last_pos_raw = None
+            # --- (After) ---
+            # cond_last_pos_norm: [B, Pnn, 4]  (state_normalizer로 정규화된 목표값)
+            cond_last_pos = None
             if torch.isfinite(cond_last_pos_norm).any():
-                cond_last_pos_raw = self._state_normalizer.inverse(
-                    cond_last_pos_norm)  # 이미 Pnn 길이에 맞춘 변수
+                cond_last_pos = cond_last_pos_norm  # ★ 그대로 사용 (inverse 금지)
 
-            if cond_last_pos_raw is not None:
-                cond_last_mask = torch.isfinite(cond_last_pos_raw).all(
-                    dim=-1)  # (B, Pnn)
+            if cond_last_pos is not None:
+                cond_last_mask = torch.isfinite(cond_last_pos).all(
+                    dim=-1)  # [B, Pnn]
             else:
-                cond_last_mask = torch.zeros(B,
-                                             Pnn,
-                                             dtype=torch.bool,
+                cond_last_mask = torch.zeros(B, Pnn, dtype=torch.bool,
                                              device=xT.device)
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
-                # 항상 현재(첫 프레임) 고정
+                # 항상 현재(첫 프레임) 고정 — 관측 정규화 값(훈련과 동일)
                 xt[:, :, 0, :] = near_current
-                # 선택적으로 마지막(목표)도 고정 → Conditioned Generation
-                if cond_last_pos_raw is not None and cond_last_mask.any().item(
-                ):
-                    xt[cond_last_mask,
-                       -1, :] = cond_last_pos_raw[cond_last_mask]
+                # 선택적으로 마지막(목표) 고정 — state 정규화 값(훈련과 동일)
+                if cond_last_pos is not None and cond_last_mask.any().item():
+                    xt[cond_last_mask, -1, :] = cond_last_pos[cond_last_mask]
                 return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(

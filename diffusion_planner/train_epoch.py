@@ -12,20 +12,6 @@ from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
-# === [ADD] 간단한 Pnn 커리큘럼 함수 (에폭 기반) =========================
-def _compute_pnn_curriculum(epoch_idx: int,
-                            pnn_max: int,
-                            pnn_min: int = 32,
-                            step: int = 32) -> int:
-    """
-    예: epoch 별로 32 -> 64 -> 96 -> ... 식으로 증가.
-    - epoch_idx: 0부터 시작한다고 가정
-    - pnn_max: 최종 상한(보통 캐시/설정의 predicted_neighbor_num 최대값)
-    - pnn_min: 시작값(기본 32)
-    - step: 증가 간격(기본 32)
-    """
-    target = pnn_min + epoch_idx * step
-    return int(min(pnn_max, max(pnn_min, target)))
 
 
 # =====================================================================
