@@ -550,7 +550,7 @@ if __name__ == "__main__":
     if args.reset_save_path:
         # 기존 폴더 삭제 후 새로 생성
         if os.path.exists(args.save_path):
-            ans = input("\nDelete these files? [y/N]: ").strip().lower()
+            ans = input("\n[data_process.py] Delete these files? [y/N]: ").strip().lower()
             if ans == 'y':
                 shutil.rmtree(args.save_path)
                 print(f"Removed existing save path: {args.save_path}")
