@@ -278,17 +278,17 @@ class Encoder(nn.Module):
 
     @staticmethod
     def _mask_all_routes_like(
-        route_lanes: torch.Tensor,  # (B, Pnn, K, H)
-        route_lanes_mask: torch.Tensor,  # (B, Pnn, K)
-        route_lane_pos: torch.Tensor,  # (B, Pnn, K, Dpos)
+        route_lanes: torch.Tensor,  # (B, Pnn, route_num, H)
+        route_lanes_mask: torch.Tensor,  # (B, Pnn, route_num)
+        route_lane_pos: torch.Tensor,  # (B, Pnn, route_num, Dpos)
         drop_mask_b: torch.Tensor,  # (B,) bool, False인 샘플을 "경로 없음"으로 강제
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """배치 마스크에 따라 해당 샘플의 모든 route 토큰을 패딩 처리합니다.
 
         Args:
-            route_lanes: (B, Pnn, K, H)
-            route_lanes_mask: (B, Pnn, K)  # True=pad
-            route_lane_pos: (B, Pnn, K, Dpos)
+            route_lanes: (B, Pnn, route_num, H)
+            route_lanes_mask: (B, Pnn, route_num)  # True=pad
+            route_lane_pos: (B, Pnn, route_num, Dpos)
             drop_mask_b: (B,) bool         # True=유지(keep), False=드롭(경로 없음)
 
         Returns:
@@ -507,8 +507,10 @@ class Encoder(nn.Module):
                     self.route_order_drop_prob))  # (B,) bool
 
             # 샘플 단위 드롭을 실제 텐서에 반영 (전부 패딩 처리)
-            route_lanes, route_lanes_mask, route_lane_pos = self._mask_all_routes_like(
-                route_lanes, route_lanes_mask, route_lane_pos, route_keep_mask)
+            (route_lanes, route_lanes_mask,
+             route_lane_pos) = self._mask_all_routes_like(
+                 route_lanes, route_lanes_mask, route_lane_pos, route_keep_mask)
+        # (B, Pnn, hidden_dim)
         near_agents_route_lane_emb = self.route_encoder(route_lanes,
                                                         route_lanes_mask,
                                                         route_lane_pos)
@@ -639,10 +641,10 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
                                                lane_pos.shape[-1])
         # 인덱스 확장
         gather_idx_H = idx.unsqueeze(-1).expand(B, order_long.shape[1],
-                                                route_num, H)  # (B,Pnn,K,H)
+                                                route_num, H)  # (B,Pnn,route_num,H)
         gather_idx_pos = idx.unsqueeze(-1).expand(
             B, order_long.shape[1], route_num,
-            lane_pos.shape[-1])  # (B,Pnn,K,Dpos)
+            lane_pos.shape[-1])  # (B,Pnn,route_num,Dpos)
 
         # --- gather ---
         route_lanes = torch.gather(enc_exp, 2,

@@ -32,6 +32,52 @@ from diffusion_planner.utils import ddp
 from diffusion_planner.train_epoch import train_epoch
 
 
+import math
+
+def pnn_schedule(epoch: int,
+                 total_epochs: int,
+                 *,
+                 base: int = 32,           # 시작 Pnn
+                 cap: int,                 # 최종 Pnn (보통 args.predicted_neighbor_num)
+                 step: int = 32,           # Pnn 증분 단위(캐시/모델 구조와 맞추기)
+                 ramp_fraction: float = 0.30  # 총 학습의 몇 % 지점에서 cap 도달할지
+                 ) -> int:
+    """
+    커리큘럼: [0 .. ramp_end-1] 구간에서 base→cap을 'step' 단위로 균등 분할해서 올리고,
+             ramp_end 이후엔 cap으로 고정한다.
+    - epoch: 0-indexed
+    - total_epochs: 전체 학습 epoch 수(예: 500)
+    - base/cap/step: (base + k*step)이 cap을 넘지 않도록 설계
+    - ramp_fraction: cap에 도달할 시점(비율). 예: 0.30 → 500×0.30≈150epoch에 cap 도달
+
+    장점:
+    - 학습 초기 충분한 '쉬운 구간'을 확보 (안정·속도 유리)
+    - 전체의 60~80%는 풀 난이도에서 수렴 (성능 유지)
+    """
+    cap = int(cap)
+    base = int(base)
+    step = int(step)
+    total_epochs = int(total_epochs)
+    ramp_end = max(1, int(round(total_epochs * ramp_fraction)))  # cap 도달 epoch (0-index 기준 ramp_end-1)
+
+    if cap <= base:
+        return cap  # 방어: 이미 최대 이하라면 그대로
+
+    steps_needed = math.ceil((cap - base) / step)  # 몇 번 올려야 cap에 도달하는지
+    # 0..(ramp_end-1) 구간을 steps_needed 칸으로 균등 분할하여 인덱스 계산
+    # epoch=ramp_end-1일 때 idx=steps_needed가 되도록 설계
+    idx = 0 if ramp_end == 0 else min(
+        steps_needed,
+        math.floor(((epoch + 1) / ramp_end) * steps_needed)
+    )
+
+    pnn = base + idx * step
+    if pnn > cap:
+        pnn = cap
+    return int(pnn)
+
+
+
 def boolean(v):
     if isinstance(v, bool):
         return v
@@ -250,7 +296,6 @@ def get_args():
 
     args = parser.parse_args()
 
-
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
 
@@ -467,6 +512,18 @@ def model_training(args):
     for epoch in range(init_epoch, train_epochs):
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
+        # === [ADD] 이 에폭에서 사용할 예측 대상 수(Pnn_curr)와 컨텍스트 클립 수 ===
+        args.curr_predicted_neighbor_num = pnn_schedule(
+            epoch, train_epochs,
+            base=32,
+            cap=args.predicted_neighbor_num,  # 보통 448
+            step=32,
+            ramp_fraction=0.30,  # 0.20~0.40 사이에서 취향과 자원에 맞게 조절
+        )
+        if global_rank == 0:
+            clip_num = min(args.agent_num, args.curr_predicted_neighbor_num * 2)
+            print(f"[Curriculum] Pnn_curr={args.curr_predicted_neighbor_num} | "
+                  f"context_clip={clip_num} (<= agent_num={args.agent_num})")
 
         train_loss, train_total_loss = train_epoch(train_loader,
                                                    diffusion_planner, optimizer,
@@ -704,4 +761,3 @@ if __name__ == "__main__":
 
     # Run
     model_training(args)
-

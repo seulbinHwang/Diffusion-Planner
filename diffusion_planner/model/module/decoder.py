@@ -148,18 +148,38 @@ class Decoder(nn.Module):
                 }
 
         """
+        # === [CHANGE] Pnn을 '입력으로 들어온 길이'에 맞춰 동적으로 결정 ===
+        # route 임베딩이 있을 때 그 길이를 우선 사용하고, 없다면 cond_last_pos_norm 길이를 사용
+        # (훈련 시엔 둘 다 존재, 추론 시엔 route 임베딩이 기준이 됨)
+        if "cond_last_pos_norm" in inputs:
+            pnn_dyn = inputs["cond_last_pos_norm"].shape[1]  # [B, Pnn, 4]
+        else:
+            pnn_dyn = encoder_outputs["near_agents_route_lane_emb"].shape[
+                1]  # [B, Pnn, H]
+
         # Extract ego & neighbor current states
-        near_current = inputs["neighbor_agents_past"][:, :self.
-                                                      _predicted_neighbor_num,
+        near_current = inputs["neighbor_agents_past"][:, :pnn_dyn,
                                                       -1, :4]  # [B, pnn, 4]
-        cond_last_pos_norm = inputs["cond_last_pos_norm"]  # [B, Pnn, 4]
         near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
                                       dim=-1) == 0  # [B, pnn]
         inputs["near_current_mask"] = near_current_mask
 
         B, Pnn, _ = near_current.shape
-        assert Pnn == (self._predicted_neighbor_num)
+        assert Pnn <= (self._predicted_neighbor_num)
         assert near_current_mask.shape[1] == Pnn
+
+        # === [FIX] cond_last_pos_norm가 없을 때도 안전하게 처리 ===
+        if "cond_last_pos_norm" in inputs:
+            # 길이(pnn_dyn)에 맞춰 잘라서 정합 보장
+            cond_last_pos_norm = inputs["cond_last_pos_norm"][
+                :, :Pnn, :]  # [B, Pnn, 4]
+        else:
+            # NaN으로 채워서 'isfinite' 검사에 의해 자동 미적용되게 만든다.
+            cond_last_pos_norm = torch.full(
+                (B, Pnn, 4), float('nan'),
+                device=near_current.device,
+                dtype=near_current.dtype
+            )
 
         # Extract context encoding
         scene_encoding_token = encoder_outputs[
@@ -208,9 +228,9 @@ class Decoder(nn.Module):
 
             # cond_last_pos가 주어지면 목표도 함께 고정
             cond_last_pos_raw = None
-            if "cond_last_pos_norm" in inputs:
+            if torch.isfinite(cond_last_pos_norm).any():
                 cond_last_pos_raw = self._state_normalizer.inverse(
-                    inputs["cond_last_pos_norm"])  # (B, Pnn, 4)
+                    cond_last_pos_norm)  # 이미 Pnn 길이에 맞춘 변수
 
             if cond_last_pos_raw is not None:
                 cond_last_mask = torch.isfinite(cond_last_pos_raw).all(

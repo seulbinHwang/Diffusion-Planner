@@ -12,6 +12,25 @@ from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
+# === [ADD] 간단한 Pnn 커리큘럼 함수 (에폭 기반) =========================
+def _compute_pnn_curriculum(epoch_idx: int,
+                            pnn_max: int,
+                            pnn_min: int = 32,
+                            step: int = 32) -> int:
+    """
+    예: epoch 별로 32 -> 64 -> 96 -> ... 식으로 증가.
+    - epoch_idx: 0부터 시작한다고 가정
+    - pnn_max: 최종 상한(보통 캐시/설정의 predicted_neighbor_num 최대값)
+    - pnn_min: 시작값(기본 32)
+    - step: 증가 간격(기본 32)
+    """
+    target = pnn_min + epoch_idx * step
+    return int(min(pnn_max, max(pnn_min, target)))
+
+
+# =====================================================================
+
+
 def train_epoch(data_loader,
                 model,
                 optimizer,
@@ -53,18 +72,30 @@ def train_epoch(data_loader,
 
             # prepare data
             inputs = {
-                "ego_agent_past": batch[0].to(args.device),
-                "ego_current_state": batch[1].to(args.device),
-                "neighbor_agents_past": batch[3].to(args.device),
-                "lanes": batch[5].to(args.device),
-                "lanes_speed_limit": batch[6].to(args.device),
-                "lanes_has_speed_limit": batch[7].to(args.device),
-                "route_lanes": batch[8].to(args.device),
-                "route_lanes_speed_limit": batch[9].to(args.device),
-                "route_lanes_has_speed_limit": batch[10].to(args.device),
-                "static_objects": batch[11].to(args.device),
-                "ego_future_gt_11_dim": batch[13].to(args.device),
-                "agent_route_lane_order": batch[14].to(args.device, dtype=torch.long),
+                "ego_agent_past":
+                    batch[0].to(args.device),
+                "ego_current_state":
+                    batch[1].to(args.device),
+                "neighbor_agents_past":
+                    batch[3].to(args.device),
+                "lanes":
+                    batch[5].to(args.device),
+                "lanes_speed_limit":
+                    batch[6].to(args.device),
+                "lanes_has_speed_limit":
+                    batch[7].to(args.device),
+                "route_lanes":
+                    batch[8].to(args.device),
+                "route_lanes_speed_limit":
+                    batch[9].to(args.device),
+                "route_lanes_has_speed_limit":
+                    batch[10].to(args.device),
+                "static_objects":
+                    batch[11].to(args.device),
+                "ego_future_gt_11_dim":
+                    batch[13].to(args.device),
+                "agent_route_lane_order":
+                    batch[14].to(args.device, dtype=torch.long),
             }
 
             ego_future = batch[2].to(args.device)
@@ -79,17 +110,30 @@ def train_epoch(data_loader,
             if isinstance(aug, NPCStatePerturbation):
                 inputs, neighbors_future = aug(inputs, neighbors_future_all,
                                                args)
-            # # heading to cos sin
-            # ego_future = torch.cat(
-            #     [
-            #         ego_future[..., :2],
-            #         torch.stack(
-            #             [ego_future[..., 2].cos(), ego_future[..., 2].sin()],
-            #             dim=-1),
-            #     ],
-            #     dim=-1,
-            # )
+            # --- (증강 끝난 뒤) 여기서 커리큘럼 Pnn/컨텍스트 클립 적용 ---
+            # 현재 에폭의 Pnn (없으면 기본 predicted_neighbor_num 사용)
+            pnn_curr = int(
+                getattr(args, "curr_predicted_neighbor_num",
+                        args.predicted_neighbor_num))
 
+            # 이 배치에서 실제 사용할 Pnn (해당 샘플에 존재하는 최대치로 clamp)
+            # 컨텍스트 에이전트는 ego-거리순으로 Top-clip_num만 사용
+            clip_num = min(args.agent_num, pnn_curr * 2)
+
+            # 1) 예측 대상의 GT(미래)만 Pnn_eff로 제한  → 손실·디코더의 Q 크기 결정
+            neighbors_future = neighbors_future[:, :
+                                                pnn_curr]  # (B, pnn_curr, T, 3)
+
+            # 2) route conditioning도 Pnn_eff로 제한  → 디코더가 Pnn을 이 길이에 맞춤
+            inputs["agent_route_lane_order"] = inputs[
+                "agent_route_lane_order"][:, :pnn_curr, ...] # (B, pnn_curr, lane_num)
+            # (이 값은 Encoder에서 (B, pnn_curr, ...) 경로 임베딩으로 변환되어
+            #  decoder.forward에서 Pnn 동적 길이의 기준으로 쓰임)
+
+            # 3) 컨텍스트 에이전트는 Top-clip_num만 남기고 나머지는 0으로 마스킹
+            #    (인코더의 varlen 경로가 무효 토큰은 완전히 건너뜀 → 연산량↓)
+            if clip_num < inputs["neighbor_agents_past"].shape[1]:
+                inputs["neighbor_agents_past"][:, clip_num:, :, :] = 0.0
             mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
                              dim=-1) == 0
             # (B, predicted_neighbor_num, future_len, 3) -> (B, predicted_neighbor_num, future_len, 4)
@@ -122,8 +166,8 @@ def train_epoch(data_loader,
                 loss, _ = diffusion_loss_func(
                     model, norm_inputs,
                     ddp.get_model(model, args.ddp).sde.marginal_prob,
-                    (neighbors_future, mask), args.state_normalizer,
-                    loss, args.diffusion_model_type)
+                    (neighbors_future, mask), args.state_normalizer, loss,
+                    args.diffusion_model_type)
                 loss["loss"] = loss["neighbor_prediction_loss"]
 
             total_loss = loss["loss"].item()  # scalar
@@ -151,4 +195,3 @@ def train_epoch(data_loader,
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
     return epoch_mean_loss, epoch_mean_loss["loss"]
-
