@@ -28,6 +28,7 @@ echo "Data processing finished."
 echo "---------------------------------"
 echo "Step 2: Cleaning bad NPZ files..."
 
+
 # The data_process.py script generates 'diffusion_planner_training.json' in the current directory.
 DATA_LIST_PATH="./diffusion_planner_training.json"
 
