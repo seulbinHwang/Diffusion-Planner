@@ -617,9 +617,6 @@ class DiTBlock(nn.Module):
 
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
          gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
-        """ TODO: near_agents_route_lane_emb 는 각 생성 대상 agent별로 scale/shift 를 만드는데에 쓰임.
-        그리고 각 생성 대상 agent별 scale/shift 를 각각 적용해야함. (adaLN_modulation의 출력값은 모든 생성 대상 agent에 대해 동일하게 적용하는 것과 다름)
-        """
 
         # ----- Self-Attention (varlen) -----
         modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)  # (B, P, D)
