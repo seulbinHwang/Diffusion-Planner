@@ -310,7 +310,7 @@ def get_args():
     parser.add_argument('--predicted_neighbor_num',
                         type=int,
                         help='number of neighbor agents to predict',
-                        default=448)
+                        default=32)
 
     parser.add_argument('--use_wandb', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)
@@ -551,7 +551,7 @@ def model_training(args):
         #     step=32,
         #     ramp_fraction=0.30,  # 0.20~0.40 사이에서 취향과 자원에 맞게 조절
         # )
-        args.curr_predicted_neighbor_num = args.predicted_neighbor_num
+        # args.curr_predicted_neighbor_num = args.predicted_neighbor_num
         # === [ADD] Pnn에 맞춘 동적 배치 크기 계산 & DataLoader 재생성 ======
         # bs_global_now, bs_per_rank_now = bs_schedule_by_pnn(
         #     pnn_curr=args.curr_predicted_neighbor_num,

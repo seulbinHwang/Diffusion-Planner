@@ -98,28 +98,28 @@ def train_epoch(data_loader,
                                                args)
             # --- (증강 끝난 뒤) 여기서 커리큘럼 Pnn/컨텍스트 클립 적용 ---
             # 현재 에폭의 Pnn (없으면 기본 predicted_neighbor_num 사용)
-            pnn_curr = int(
-                getattr(args, "curr_predicted_neighbor_num",
-                        args.predicted_neighbor_num))
+            # pnn_curr = int(
+            #     getattr(args, "curr_predicted_neighbor_num",
+            #             args.predicted_neighbor_num))
 
             # 이 배치에서 실제 사용할 Pnn (해당 샘플에 존재하는 최대치로 clamp)
             # 컨텍스트 에이전트는 ego-거리순으로 Top-clip_num만 사용
-            clip_num = min(args.agent_num, pnn_curr * 2)
+            # clip_num = min(args.agent_num, pnn_curr * 2)
 
             # 1) 예측 대상의 GT(미래)만 Pnn_eff로 제한  → 손실·디코더의 Q 크기 결정
-            neighbors_future = neighbors_future[:, :
-                                                pnn_curr]  # (B, pnn_curr, T, 3)
+            # neighbors_future = neighbors_future[:, :
+            #                                     pnn_curr]  # (B, pnn_curr, T, 3)
 
             # 2) route conditioning도 Pnn_eff로 제한  → 디코더가 Pnn을 이 길이에 맞춤
-            inputs["agent_route_lane_order"] = inputs[
-                "agent_route_lane_order"][:, :pnn_curr, ...] # (B, pnn_curr, lane_num)
+            # inputs["agent_route_lane_order"] = inputs[
+            #     "agent_route_lane_order"][:, :pnn_curr, ...] # (B, pnn_curr, lane_num)
             # (이 값은 Encoder에서 (B, pnn_curr, ...) 경로 임베딩으로 변환되어
             #  decoder.forward에서 Pnn 동적 길이의 기준으로 쓰임)
 
             # 3) 컨텍스트 에이전트는 Top-clip_num만 남기고 나머지는 0으로 마스킹
             #    (인코더의 varlen 경로가 무효 토큰은 완전히 건너뜀 → 연산량↓)
-            if clip_num < inputs["neighbor_agents_past"].shape[1]:
-                inputs["neighbor_agents_past"][:, clip_num:, :, :] = 0.0
+            # if clip_num < inputs["neighbor_agents_past"].shape[1]:
+            #     inputs["neighbor_agents_past"][:, clip_num:, :, :] = 0.0
             mask = torch.sum(torch.ne(neighbors_future[..., :3], 0),
                              dim=-1) == 0
             # (B, predicted_neighbor_num, future_len, 3) -> (B, predicted_neighbor_num, future_len, 4)
