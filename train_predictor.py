@@ -402,7 +402,7 @@ def model_training(args):
     # set seed
     set_seed(args.seed + global_rank)
     # Enable anomaly detection to trace NaN/Inf origins during training
-    torch.autograd.set_detect_anomaly(True)
+    # torch.autograd.set_detect_anomaly(True)
 
     # training parameters
     train_epochs = args.train_epochs
