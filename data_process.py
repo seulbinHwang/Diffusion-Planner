@@ -494,7 +494,7 @@ if __name__ == "__main__":
                         help='shuffle scenarios')
     parser.add_argument('--agent_num',
                         type=int,
-                        default=448,
+                        default=32,
                         help='number of agents')
     parser.add_argument('--static_objects_num',
                         type=int,
@@ -506,7 +506,7 @@ if __name__ == "__main__":
                         help='number of lane point')
     parser.add_argument('--lane_num',
                         type=int,
-                        default=150,
+                        default=100,
                         help='number of lanes')
     parser.add_argument('--route_len',
                         type=int,

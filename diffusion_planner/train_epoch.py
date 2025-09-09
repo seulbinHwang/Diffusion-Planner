@@ -178,7 +178,8 @@ def train_epoch(data_loader,
             nn.utils.clip_grad_norm_(model.parameters(), 5)
             optimizer.step()
 
-            ema.update(model)
+            if ema is not None:
+                ema.update(model)
 
             if args.ddp:
                 torch.cuda.synchronize()

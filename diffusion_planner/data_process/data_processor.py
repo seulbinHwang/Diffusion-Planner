@@ -44,8 +44,8 @@ class DataProcessor(object):
         self.num_agents = config.agent_num
         self.num_static = config.static_objects_num
         # [변경] 타입별 상한 신설: 보행자/자전거
-        self.max_pedestrians = getattr(config, "max_pedestrians", 128)
-        self.max_bicycles = getattr(config, "max_bicycles", 64)
+        self.max_pedestrians = getattr(config, "max_pedestrians", 7) #128)
+        self.max_bicycles = getattr(config, "max_bicycles", 3) #64)
         # 안전 검사: 타입별 상한 합이 전체 슬롯보다 크지 않도록
         assert self.max_pedestrians >= 0 and self.max_bicycles >= 0
         assert (self.max_pedestrians + self.max_bicycles) <= self.num_agents, \

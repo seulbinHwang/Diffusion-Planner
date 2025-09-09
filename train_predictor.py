@@ -76,6 +76,34 @@ def pnn_schedule(epoch: int,
         pnn = cap
     return int(pnn)
 
+# === [ADD] Pnn 기반 배치 크기 스케줄러 ==================================
+def bs_schedule_by_pnn(pnn_curr: int,
+                       pnn_base: int,
+                       bs_base: int,
+                       *,
+                       world_size: int = 1,
+                       alpha: float = 1.5,
+                       min_per_rank: int = 1,
+                       max_global: int = None):
+    """
+    메모리 예산을 대략 일정하게 유지하기 위해, Pnn(=시퀀스 길이)↑ 시 global batch를 줄입니다.
+      - pnn_base: pnn_schedule의 시작값(예: 32)과 일치시킬 것
+      - bs_base : 기준 '글로벌' 배치 크기(args.batch_size)
+      - alpha   : 메모리 증가 근사 지수(1~2 권장; self-attn 지배면 2에 가까움)
+    반환:
+      - (bs_global_now, bs_per_rank_now)
+    """
+    if pnn_curr <= 0:
+        pnn_curr = pnn_base
+    scale = (float(pnn_base) / float(pnn_curr)) ** float(alpha)
+    bs_global = int(max(world_size, round(bs_base * scale)))
+    if max_global is not None:
+        bs_global = min(bs_global, int(max_global))
+    # DDP 정합: world_size 배수로 내림
+    bs_global = (bs_global // world_size) * world_size
+    bs_per_rank = max(min_per_rank, bs_global // world_size)
+    return bs_global, bs_per_rank
+# =======================================================================
 
 
 def boolean(v):
@@ -429,13 +457,13 @@ def model_training(args):
                                        num_replicas=ddp.get_world_size(),
                                        rank=global_rank,
                                        shuffle=True)
-    train_loader = DataLoader(train_set,
-                              sampler=train_sampler,
-                              batch_size=batch_size // ddp.get_world_size(),
-                              num_workers=args.num_workers,
-                              prefetch_factor=args.prefetch_factor,
-                              pin_memory=args.pin_mem,
-                              drop_last=True)
+    # train_loader = DataLoader(train_set,
+    #                           sampler=train_sampler,
+    #                           batch_size=batch_size // ddp.get_world_size(),
+    #                           num_workers=args.num_workers,
+    #                           prefetch_factor=args.prefetch_factor,
+    #                           pin_memory=args.pin_mem,
+    #                           drop_last=True)
 
     if global_rank == 0:
         print("Dataset Prepared: {} train data\n".format(len(train_set)))
@@ -450,7 +478,7 @@ def model_training(args):
 
     if args.ddp:
         diffusion_planner = DDP(diffusion_planner, device_ids=[rank])
-
+    model_ema = None
     if args.use_ema:
         model_ema = ModelEma(
             diffusion_planner,
@@ -470,7 +498,10 @@ def model_training(args):
         'lr': args.learning_rate
     }]
 
-    optimizer = optim.AdamW(params, fused=True)
+    try:
+        optimizer = optim.AdamW(params, fused=True)
+    except (TypeError, RuntimeError):  # fused 미지원 환경
+        optimizer = optim.AdamW(params)
     scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs,
                                               args.warm_up_epoch)
 
@@ -520,10 +551,40 @@ def model_training(args):
             step=32,
             ramp_fraction=0.30,  # 0.20~0.40 사이에서 취향과 자원에 맞게 조절
         )
+        # === [ADD] Pnn에 맞춘 동적 배치 크기 계산 & DataLoader 재생성 ======
+        bs_global_now, bs_per_rank_now = bs_schedule_by_pnn(
+            pnn_curr=args.curr_predicted_neighbor_num,
+            pnn_base=32,                     # pnn_schedule 시작값과 일치
+            bs_base=args.batch_size,         # "글로벌" 배치 크기 기준
+            alpha=getattr(args, "bs_pnn_alpha", 1.5),
+            world_size=ddp.get_world_size(),
+            min_per_rank=1,
+        )
+
+        # DDP sampler에 epoch 설정(셔플 시드 고정은 '현재 에폭' 직전에 호출)
+        train_sampler.set_epoch(epoch)
+
+        # 이 에폭에 사용할 DataLoader를 '그때그때' 생성
+        train_loader = DataLoader(
+            train_set,
+            sampler=train_sampler,
+            batch_size=bs_per_rank_now,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            pin_memory=args.pin_mem,
+            drop_last=True,
+        )
+        # ===================================================================
+
+
         if global_rank == 0:
             clip_num = min(args.agent_num, args.curr_predicted_neighbor_num * 2)
-            print(f"[Curriculum] Pnn_curr={args.curr_predicted_neighbor_num} | "
-                  f"context_clip={clip_num} (<= agent_num={args.agent_num})")
+            print(
+                f"[Curriculum] Pnn_curr={args.curr_predicted_neighbor_num} | "
+                f"context_clip={clip_num} (<= agent_num={args.agent_num}) | "
+                f"batch(per-rank/global)={bs_per_rank_now}/{bs_global_now} | "
+                f"alpha={getattr(args,'bs_pnn_alpha',1.5):.2f}"
+            )
 
         train_loss, train_total_loss = train_epoch(train_loader,
                                                    diffusion_planner, optimizer,
@@ -550,7 +611,7 @@ def model_training(args):
                 # save model at the end of epoch
                 save_model(diffusion_planner, optimizer, scheduler, save_path,
                            epoch, train_total_loss, wandb_logger.id,
-                           model_ema.ema, save_best)
+                           model_ema.ema if model_ema is not None else None, save_best)
                 print(f"Model saved in {save_path}\n")
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
                 # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
@@ -619,7 +680,7 @@ def model_training(args):
                                 v.delete()
 
         scheduler.step()
-        train_sampler.set_epoch(epoch + 1)
+        # train_sampler.set_epoch(epoch + 1)
 
     # ── 모든 훈련 종료 후 정리 ─
     torch.distributed.barrier()  # ① 모든 rank의 학습 루프 종료 동기화
