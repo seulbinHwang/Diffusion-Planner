@@ -21,7 +21,8 @@ python data_process.py \
     --data_path "$NUPLAN_DATA_PATH" \
     --map_path "$NUPLAN_MAP_PATH" \
     --save_path "$TRAIN_SET_PATH" \
-    --total_scenarios 1000000
+    --total_scenarios 1000000 \
+    --reset_save_path False
 
 echo "Data processing finished."
 echo "---------------------------------"
@@ -35,7 +36,8 @@ chmod +x clean_bad_npz.py
 
 # Run the cleaning script.
 # The --data_dir corresponds to TRAIN_SET_PATH, and --data_list is the generated JSON file.
-./clean_bad_npz.py \
+# 파이썬으로 호출하는 게 가장 안전 (chmod 불필요)
+python ./clean_bad_npz.py \
   --data_dir "$TRAIN_SET_PATH" \
   --data_list "$DATA_LIST_PATH"
 

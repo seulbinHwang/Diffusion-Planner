@@ -646,4 +646,23 @@ class DataProcessor(object):
             self.save_to_disk(self._save_dir, data)
 
     def save_to_disk(self, dir, data):
-        np.savez(f"{dir}/{data['map_name']}_{data['token']}.npz", **data)
+        os.makedirs(dir, exist_ok=True)
+        final_path = f"{dir}/{data['map_name']}_{data['token']}.npz"
+        tmp_path = final_path + ".tmp"
+
+        try:
+            # 1) 임시 파일에 먼저 완전히 기록
+            with open(tmp_path, "wb") as f:
+                np.savez(f, **data)
+                f.flush()
+                os.fsync(f.fileno())  # 디스크 동기화(리눅스에서 유효)
+
+            # 2) 원자적 치환(부분 파일이 최종 경로에 나타나지 않음)
+            os.replace(tmp_path, final_path)
+
+        except Exception:
+            # 실패 시 임시파일만 제거(최종 파일은 손대지 않음)
+            if os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except: pass
+            raise

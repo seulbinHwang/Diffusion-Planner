@@ -258,6 +258,23 @@ import shutil
 _PROCESSOR = None  # 워커‑프로세스 전역 캐시
 _CFG_NS = None  # cfg 를 다시 만들지 않도록 캐시
 
+def _is_valid_npz_quick(path: str) -> bool:
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            need = {"map_name","token","ego_agent_past","neighbor_agents_past"}
+            if not need <= set(z.files):
+                return False
+            eg, nb = z["ego_agent_past"], z["neighbor_agents_past"]
+            return (eg.ndim == 2 and eg.shape[-1] == 11 and
+                    nb.ndim == 3 and nb.shape[-1] == 11)
+    except Exception:
+        return False
+
+
+def _is_valid_npz(path: str) -> bool:
+    # quick보다 조금 더 엄격하게 하고 싶으면 여기에서 추가 검사
+    return _is_valid_npz_quick(path)
+
 
 def run_scenario(
     scn,  # NuPlan 시나리오 객체   (executor.map 의 1st iterable)
@@ -286,10 +303,13 @@ def run_scenario(
         _PROCESSOR.work([scn])
 
         # ── 3) 생성된 파일 무결성 체크 ────────────────────────
-        if os.path.exists(final_filepath) and os.path.getsize(
-                final_filepath) == 0:
-            os.remove(final_filepath)
-            raise RuntimeError(f"{file_name}: 파일이 비어 있습니다.")
+        if os.path.exists(final_filepath):
+            ok_size = os.path.getsize(final_filepath) > 0
+            ok_npz = _is_valid_npz(final_filepath)
+            if not (ok_size and ok_npz):
+                os.remove(final_filepath)
+                raise RuntimeError(
+                    f"{file_name}: invalid npz (size={ok_size}, npz={ok_npz})")
 
     except Exception:
         # ── 4) 오류 발생 시 불완전 파일 제거 후 예외 전파 ──────
@@ -470,7 +490,7 @@ if __name__ == "__main__":
                         help='shuffle scenarios')
     parser.add_argument('--reset_save_path',
                         type=bool,
-                        default=True,
+                        default=False,
                         help='shuffle scenarios')
     parser.add_argument('--agent_num',
                         type=int,
