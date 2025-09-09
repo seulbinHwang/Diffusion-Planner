@@ -615,30 +615,6 @@ class DiTBlock(nn.Module):
         x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
         return x
 
-        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-         gate_mlp) = self.adaLN_modulation(y).chunk(6, dim=1)
-
-        # ----- Self-Attention (varlen) -----
-        modulated_x = modulate(self.norm1(x), shift_msa, scale_msa)  # (B, P, D)
-        # (B, L, D).
-        msa_out = self._self_attn_flash_varlen(modulated_x,
-                                               attn_mask)  # (B, P, D)
-        x = x + gate_msa.unsqueeze(1) * msa_out  # (B, P, D)
-
-        # ----- MLP1 -----
-        modulated_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp1(modulated_x)
-
-        # ----- Cross-Attention (varlen) -----
-        q = self.norm3(x)  # (B, P, D)
-        cross_out = self._cross_attn_flash_varlen(q, cross_c, attn_mask,
-                                                  cross_mask)  # (B, P, D)
-        x = x + self.gate_cross * cross_out
-
-        # ----- MLP2 (게이트) -----
-        x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
-
-        return x
 
 
 class FinalLayer(nn.Module):

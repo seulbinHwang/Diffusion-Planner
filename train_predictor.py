@@ -130,7 +130,7 @@ def get_args():
         '--name',
         type=str,
         help='log name (default: "diffusion-planner-training")',
-        default="ego_fut_conditioned")  # npc_current_state_aug_0.5
+        default="world-model-small")  # npc_current_state_aug_0.5
     parser.add_argument('--save_dir',
                         type=str,
                         help='save dir for model ckpt',
