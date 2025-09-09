@@ -194,6 +194,7 @@ class Decoder(nn.Module):
         assert ego_fut_global.shape == (B, scene_encoding_token.shape[-1])
 
         if self.training:
+            assert inputs["near_cur_future_norm_xT"].shape[1] == Pnn, f"훈련 시점의 Pnn이 encoder_outputs와 맞지 않습니다. {inputs['near_cur_future_norm_xT'].shape[1]} != {Pnn}"
             near_cur_future_norm_xT = inputs["near_cur_future_norm_xT"].reshape(
                 B, Pnn, -1)  # [B, Pnn, 1 + T, 4] -> [B, Pnn, (1 + T) * 4]
             # 🔹 20% 확률로 마지막 프레임(목표) 주입 — Conditioned Generation 학습 신호
