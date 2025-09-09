@@ -96,7 +96,7 @@ def main():
 
     # JSON 업데이트 여부 확인
     ans = input("Remove entries from JSON list? [y/N]: ").strip().lower()
-    ans = 'y'
+    # ans = 'y'
     if ans == 'y':
         backup = args.data_list + ".bak"
         os.rename(args.data_list, backup)

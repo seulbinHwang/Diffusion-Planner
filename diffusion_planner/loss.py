@@ -187,8 +187,9 @@ def diffusion_loss_func(
         dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
     # near_future_valid: [B, Pnn, T]
     valid = near_future_valid.float()
-    denom = valid.sum().clamp(min=1) # denom: shape [B, Pnn]
-    loss_val = (dpm_loss * valid).sum() / denom  # 항상 requires_grad=True
+    denom = valid.sum().clamp(min=1) # denom: scalar
+    valid_dpm_loss = dpm_loss * valid # (B, Pnn, T)
+    loss_val = valid_dpm_loss.sum() / denom  # 항상 requires_grad=True
     loss["neighbor_prediction_loss"] = loss_val
 
     # compute and merge xy/yaw losses via helper
