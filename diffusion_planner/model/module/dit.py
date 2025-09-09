@@ -336,7 +336,7 @@ class DiTBlock(nn.Module):
 
         # (2) QKV 프로젝션 (유효 토큰만)
         qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
-        qkv = qkv.view(T, 3, self.num_heads, self.head_dim)  # (T, 3, H, Hd)
+        qkv = qkv.reshape(T, 3, self.num_heads, self.head_dim)  # (T, 3, H, Hd)
         comp_dtype = self._get_compute_dtype(qkv)
         qkv = qkv.to(comp_dtype)
 
@@ -404,9 +404,9 @@ class DiTBlock(nn.Module):
             return torch.zeros(B, Lq, D, device=q_in.device, dtype=q_in.dtype)
 
         # (2) Q / KV 프로젝션 (유효 토큰만)
-        q = self.q_proj_cross(q_unpad).view(Tq, self.num_heads,
+        q = self.q_proj_cross(q_unpad).reshape(Tq, self.num_heads,
                                             self.head_dim)  # (Tq, H, Hd)
-        kv = self.kv_proj_cross(kv_unpad).view(Tk, 2, self.num_heads,
+        kv = self.kv_proj_cross(kv_unpad).reshape(Tk, 2, self.num_heads,
                                                self.head_dim)  # (Tk, 2, H, Hd)
         comp_dtype = self._get_compute_dtype(q)
         q = q.to(comp_dtype)
@@ -613,6 +613,7 @@ class DiTBlock(nn.Module):
                                                   cross_mask)  # (B, P, D)
         x = x + self.gate_cross * cross_out
         x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
+        x = x.masked_fill(attn_mask.unsqueeze(-1), 0.0)
         return x
 
 
