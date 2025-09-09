@@ -9,6 +9,8 @@ import torch
 #   - 눈에 띄는 정밀도 손실 없이 학습·추론 속도를 높이기 위한 설정입니다.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')  # PyTorch>=2.0
+
 import argparse
 import shutil
 from torch import optim
@@ -423,7 +425,7 @@ def model_training(args):
         'lr': args.learning_rate
     }]
 
-    optimizer = optim.AdamW(params)
+    optimizer = optim.AdamW(params, fused=True)
     scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs,
                                               args.warm_up_epoch)
 
@@ -465,6 +467,7 @@ def model_training(args):
     for epoch in range(init_epoch, train_epochs):
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
+
         train_loss, train_total_loss = train_epoch(train_loader,
                                                    diffusion_planner, optimizer,
                                                    args, model_ema, aug)
