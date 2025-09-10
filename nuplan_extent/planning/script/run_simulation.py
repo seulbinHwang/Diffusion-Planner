@@ -24,13 +24,16 @@ logger = logging.getLogger(__name__)
 set_default_path()
 
 # If set, use the env. variable to overwrite the Hydra config
+print("NUPLAN_HYDRA_CONFIG_PATH:", os.getenv('NUPLAN_HYDRA_CONFIG_PATH'))
 CONFIG_PATH = os.getenv('NUPLAN_HYDRA_CONFIG_PATH', 'config/simulation')
+print("CONFIG_PATH:", CONFIG_PATH)
 
 if os.environ.get('NUPLAN_HYDRA_CONFIG_PATH') is not None:
     CONFIG_PATH = os.path.join('../../../../', CONFIG_PATH)
 
 if os.path.basename(CONFIG_PATH) != 'simulation':
     CONFIG_PATH = os.path.join(CONFIG_PATH, 'simulation')
+
 CONFIG_NAME = 'default_simulation'
 
 
