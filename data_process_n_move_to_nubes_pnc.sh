@@ -29,14 +29,14 @@ TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
 # This is the command from data_process_pnc.sh
-taskset -c 0-95  \
-CUDA_VISIBLE_DEVICES="" NVIDIA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=0 \
+CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
+taskset -c 0-95 \
 python data_process.py \
-    --data_path "$NUPLAN_DATA_PATH" \
-    --map_path "$NUPLAN_MAP_PATH" \
-    --save_path "$TRAIN_SET_PATH" \
-    --total_scenarios 1000000 \
-    --reset_save_path False
+  --data_path "$NUPLAN_DATA_PATH" \
+  --map_path "$NUPLAN_MAP_PATH" \
+  --save_path "$TRAIN_SET_PATH" \
+  --total_scenarios 1000000 \
+  --reset_save_path False
 
 echo "Data processing finished."
 echo "---------------------------------"
