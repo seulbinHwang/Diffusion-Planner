@@ -88,10 +88,10 @@ def run_simulation(
 
     runners = build_simulations(
         cfg=cfg,
-        callbacks=callbacks,
         worker=common_builder.worker,
-        pre_built_planners=planners,
+        callbacks=callbacks,
         callbacks_worker=callbacks_worker_pool,
+        pre_built_planners=planners,
     )
 
     if common_builder.profiler:

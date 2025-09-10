@@ -104,6 +104,7 @@ def build_simulations(
                 cfg.simulation_time_controller, scenario=scenario)
 
             # Perception
+            print("cfg.observation:", cfg.observation)
             observations: AbstractObservation = build_observations(
                 cfg.observation, scenario=scenario)
 
