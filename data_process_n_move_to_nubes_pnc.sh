@@ -29,6 +29,7 @@ TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
 # This is the command from data_process_pnc.sh
+taskset -c 0-95  \
 CUDA_VISIBLE_DEVICES="" NVIDIA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=0 \
 python data_process.py \
     --data_path "$NUPLAN_DATA_PATH" \
