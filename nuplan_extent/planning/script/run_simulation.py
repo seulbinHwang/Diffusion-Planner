@@ -25,16 +25,30 @@ set_default_path()
 
 # If set, use the env. variable to overwrite the Hydra config
 print("NUPLAN_HYDRA_CONFIG_PATH:", os.getenv('NUPLAN_HYDRA_CONFIG_PATH'))
-CONFIG_PATH = os.getenv('NUPLAN_HYDRA_CONFIG_PATH', 'config/simulation')
+# ✅ nuplan-devkit의 simulation 디렉토리를 기본값으로 사용
+# nuplan-devkit 루트 (환경변수 이용, fallback은 현재 디렉토리)
+DEVKIT_ROOT = Path(os.environ.get("NUPLAN_DEVKIT_ROOT", ".")).resolve()
+
+# simulation config 디렉토리
+DEVKIT_SIM_CONFIG_DIR = DEVKIT_ROOT / "nuplan" / "planning" / "script" / "config" / "simulation"
+
+# Hydra config path/name
+CONFIG_PATH = os.environ.get("NUPLAN_HYDRA_CONFIG_PATH", str(DEVKIT_SIM_CONFIG_DIR))
+CONFIG_NAME = "default_simulation"
+
 print("CONFIG_PATH:", CONFIG_PATH)
 
-if os.environ.get('NUPLAN_HYDRA_CONFIG_PATH') is not None:
-    CONFIG_PATH = os.path.join('../../../../', CONFIG_PATH)
 
-if os.path.basename(CONFIG_PATH) != 'simulation':
-    CONFIG_PATH = os.path.join(CONFIG_PATH, 'simulation')
-
-CONFIG_NAME = 'default_simulation'
+# CONFIG_PATH = os.getenv('NUPLAN_HYDRA_CONFIG_PATH', 'config/simulation')
+# print("CONFIG_PATH:", CONFIG_PATH)
+#
+# if os.environ.get('NUPLAN_HYDRA_CONFIG_PATH') is not None:
+#     CONFIG_PATH = os.path.join('../../../../', CONFIG_PATH)
+#
+# if os.path.basename(CONFIG_PATH) != 'simulation':
+#     CONFIG_PATH = os.path.join(CONFIG_PATH, 'simulation')
+#
+# CONFIG_NAME = 'default_simulation'
 
 
 def run_simulation(
