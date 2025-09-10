@@ -9,12 +9,14 @@ _os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
 # PyTorch가 임의로 CUDA 초기화하지 않도록 CPU 기본 디바이스 지정
 try:
-    import torch as _torch  # 이 시점에 import 해도 CUDA는 안 켜짐
+    import torch as _torch
     if hasattr(_torch, "set_default_device"):
         _torch.set_default_device("cpu")
-    # 혹시라도 cudnn을 참조하지 않도록
     if hasattr(_torch.backends, "cudnn"):
         _torch.backends.cudnn.enabled = False
+    # --- [선택] 디버그 로그 ---
+    print(f"[CPU-ONLY] CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}, "
+          f"torch.cuda.is_available()={_torch.cuda.is_available()}")
 except Exception:
     pass
 # ================================================================================
@@ -258,6 +260,25 @@ def _plot_and_save_histograms(
     plt.close(fig)
 
 
+# [추가] 전역 CPU 고정값(기본 96). 환경변수 DP_MAX_CPUS로 덮어쓰기 가능
+DP_MAX_CPUS = int(os.environ.get("DP_MAX_CPUS", "96"))
+
+# [추가] 과다 스레딩 방지(각 워커 프로세스 내부 스레드 1로 고정)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("BLIS_NUM_THREADS", "1")
+
+# [추가] PyTorch 내부 스레드 제한(모듈 임포트 시 1로 고정)
+try:
+    import torch as _torch_threads
+    if hasattr(_torch_threads, "set_num_threads"):
+        _torch_threads.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
+    if hasattr(_torch_threads, "set_num_interop_threads"):
+        _torch_threads.set_num_interop_threads(int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1")))
+except Exception:
+    pass
 
 
 def available_cpu_count() -> int:
@@ -267,7 +288,7 @@ def available_cpu_count() -> int:
     1) Linux & Python 3.9+ : os.sched_getaffinity(0)
     2) 그 외 : os.cpu_count()  (fallback)
     """
-    return 96
+    return DP_MAX_CPUS
     try:
         return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
         print(f"Available CPUs: {return_}")  # 디버그용
@@ -309,12 +330,19 @@ def run_scenario(
     # --- child process CPU-only guard (redundant but safest) ---
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
+    # [추가] 스레드 수 1로 고정 포함한 새 블록
     try:
         import torch
         if hasattr(torch, "set_default_device"):
             torch.set_default_device("cpu")
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.enabled = False
+        # 자식 프로세스의 내부 스레드도 1로 고정
+        if hasattr(torch, "set_num_threads"):
+            torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(
+                int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1")))
     except Exception:
         pass
     """
