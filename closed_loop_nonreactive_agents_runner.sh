@@ -47,7 +47,7 @@ echo "PLANNER: $PLANNER"
 # $SPLIT test14-random
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
-    main_callback+=simulation_feature_video_callback \
+    +callback=simulation_feature_video_callback \
     planner=$PLANNER \
     planner.diffusion_planner.config.args_file=$ARGS_FILE \
     planner.diffusion_planner.ckpt_path=$PLANNER_CKPT_FILE \

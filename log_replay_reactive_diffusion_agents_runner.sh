@@ -47,7 +47,7 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: npc_mo
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     observation.model_config.config.args_file=$ARGS_FILE \
-    +main_callback=simulation_feature_video_callback \
+    +callback=simulation_feature_video_callback \
     observation.model_config.ckpt_path=$CKPT_FILE \
     observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
     observation.checkpoint_path=$CKPT_FILE \

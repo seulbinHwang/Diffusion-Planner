@@ -43,7 +43,7 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
 
-#     main_callback+=simulation_feature_video_callback \
+#     +callback=simulation_feature_video_callback \
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     scenario_builder=$SCENARIO_BUILDER \

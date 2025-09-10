@@ -48,7 +48,7 @@ echo "PLANNER: $PLANNER"
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     planner=$PLANNER \
-    main_callback+=simulation_feature_video_callback \
+    +callback=simulation_feature_video_callback \
     planner.diffusion_planner.config.args_file=$ARGS_FILE \
     planner.diffusion_planner.ckpt_path=$PLANNER_CKPT_FILE \
     observation.model_config.config.args_file=$ARGS_FILE \
