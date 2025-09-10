@@ -1,20 +1,56 @@
-# ==== CPU-ONLY GUARD (must be the first block before any torch/nuplan imports) ====
+# ==== CPU-ONLY & THREADING GUARD (must be first) ==============================
 import os as _os
-# 완전히 숨김: 이 프로세스 및 자식 프로세스에서 GPU가 보이지 않음
+
+# ---- GPU 완전 차단 ----
 _os.environ["CUDA_VISIBLE_DEVICES"] = ""
-# nvidia-container-runtime 사용하는 환경 대비
 _os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
-# macOS 대비(해당 없으면 무시됨)
 _os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
-# PyTorch가 임의로 CUDA 초기화하지 않도록 CPU 기본 디바이스 지정
+# ---- BLAS/OMP 과다 병렬 방지 (각 프로세스가 1스레드만 쓰게) ----
+_os.environ.setdefault("OMP_NUM_THREADS", "1")
+_os.environ.setdefault("MKL_NUM_THREADS", "1")
+_os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+_os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+# PyTorch intra/inter-op 스레드 환경변수 (있으면 import 시점에 반영)
+_os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")  # inter-op
+_os.environ.setdefault("TORCH_NUM_THREADS", "1")          # intra-op
+
+# ---- 멀티프로세싱은 spawn으로 (fork로 인한 상태 상속 이슈 회피) ----
+try:
+    import multiprocessing as _mp
+    _mp.set_start_method("spawn", force=True)
+except Exception:
+    pass
+
+# ---- PyTorch 초기화: CPU 기본 + 스레드 수 고정 + inter-op 재설정 노옵화 ----
 try:
     import torch as _torch
     if hasattr(_torch, "set_default_device"):
         _torch.set_default_device("cpu")
     if hasattr(_torch.backends, "cudnn"):
         _torch.backends.cudnn.enabled = False
-    # --- [선택] 디버그 로그 ---
+
+    # 초기에 한 번만 낮은 스레드 수로 고정
+    try:
+        if hasattr(_torch, "set_num_threads"):
+            _torch.set_num_threads(1)             # intra-op
+        if hasattr(_torch, "set_num_interop_threads"):
+            _torch.set_num_interop_threads(1)     # inter-op
+    except Exception:
+        # 이미 풀 시작 이후면 여기서도 에러가 날 수 있으니 무시
+        pass
+
+    # 이후 어떤 모듈이 set_num_interop_threads(...)를 다시 호출해도 무시되게 노옵 패치
+    try:
+        _orig_set_interop = getattr(_torch, "set_num_interop_threads", None)
+        if callable(_orig_set_interop):
+            def _noop_set_num_interop_threads(*args, **kwargs):
+                # 재설정 시도 무시(크래시 방지)
+                return None
+            _torch.set_num_interop_threads = _noop_set_num_interop_threads
+    except Exception:
+        pass
+
     print(f"[CPU-ONLY] CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}, "
           f"torch.cuda.is_available()={_torch.cuda.is_available()}")
 except Exception:
@@ -327,22 +363,36 @@ def run_scenario(
     scn,  # NuPlan 시나리오 객체   (executor.map 의 1st iterable)
     cfg_dict: Dict  # config 를 dict 로 직렬화한 것 (2nd iterable)
 ) -> None:
-    # --- child process CPU-only guard (redundant but safest) ---
+    import os
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
-    # [추가] 스레드 수 1로 고정 포함한 새 블록
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")
+    os.environ.setdefault("TORCH_NUM_THREADS", "1")
     try:
         import torch
         if hasattr(torch, "set_default_device"):
             torch.set_default_device("cpu")
         if hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.enabled = False
-        # 자식 프로세스의 내부 스레드도 1로 고정
-        if hasattr(torch, "set_num_threads"):
-            torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
-        if hasattr(torch, "set_num_interop_threads"):
-            torch.set_num_interop_threads(
-                int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1")))
+        try:
+            if hasattr(torch, "set_num_threads"):
+                torch.set_num_threads(1)
+            if hasattr(torch, "set_num_interop_threads"):
+                torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+        try:
+            _orig = getattr(torch, "set_num_interop_threads", None)
+            if callable(_orig):
+                def _noop_set_num_interop_threads(*args, **kwargs):
+                    return None
+                torch.set_num_interop_threads = _noop_set_num_interop_threads
+        except Exception:
+            pass
     except Exception:
         pass
     """
