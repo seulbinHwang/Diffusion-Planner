@@ -50,7 +50,7 @@ echo "Step 3: Uploading processed data..."
 
 nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
                     "$TRAIN_SET_PATH" \
-                    -e -j 128
+                    -e -j 96
 
 nubescli upload labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
                     /media/user/E/projects/Diffusion-Planner/diffusion_planner_training.json
