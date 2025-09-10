@@ -267,6 +267,7 @@ def available_cpu_count() -> int:
     1) Linux & Python 3.9+ : os.sched_getaffinity(0)
     2) 그 외 : os.cpu_count()  (fallback)
     """
+    return 96
     try:
         return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
         print(f"Available CPUs: {return_}")  # 디버그용
