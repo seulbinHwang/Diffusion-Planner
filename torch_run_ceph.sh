@@ -7,6 +7,8 @@ set -euo pipefail
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
 TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+TRAIN_SET_NAME="processed_route_with_small"
+TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 ###################################
 #
 # ---------------- Preflight clean-up ----------------
@@ -36,8 +38,7 @@ fi
 
 echo "[Preflight] Done."
 # ----------------------------------------------------
-TRAIN_SET_NAME="processed_route_with_small"
-TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
+
 echo "Start downloading diffusion_planner_training.json"
 nubescli download \
     labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
