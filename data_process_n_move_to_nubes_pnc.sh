@@ -5,8 +5,8 @@
 set -e
 
 echo "Step 1: Running data processing..."
-# Ensure the script uses CPU only
-export CUDA_VISIBLE_DEVICES=""
+# 기존의 export 라인은 지우고, 아래 한 줄로 대체
+
 # Configuration from data_process_pnc.sh
 # You can modify these paths if needed.
 NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
@@ -18,6 +18,7 @@ TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
 # This is the command from data_process_pnc.sh
+CUDA_VISIBLE_DEVICES="" NVIDIA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=0 \
 python data_process.py \
     --data_path "$NUPLAN_DATA_PATH" \
     --map_path "$NUPLAN_MAP_PATH" \

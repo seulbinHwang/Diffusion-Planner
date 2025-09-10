@@ -1,4 +1,29 @@
+# ==== CPU-ONLY GUARD (must be the first block before any torch/nuplan imports) ====
+import os as _os
+# 완전히 숨김: 이 프로세스 및 자식 프로세스에서 GPU가 보이지 않음
+_os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# nvidia-container-runtime 사용하는 환경 대비
+_os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
+# macOS 대비(해당 없으면 무시됨)
+_os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+
+# PyTorch가 임의로 CUDA 초기화하지 않도록 CPU 기본 디바이스 지정
+try:
+    import torch as _torch  # 이 시점에 import 해도 CUDA는 안 켜짐
+    if hasattr(_torch, "set_default_device"):
+        _torch.set_default_device("cpu")
+    # 혹시라도 cudnn을 참조하지 않도록
+    if hasattr(_torch.backends, "cudnn"):
+        _torch.backends.cudnn.enabled = False
+except Exception:
+    pass
+# ================================================================================
+
+
+
 import os
+
+
 import argparse
 import json
 import numpy as np
@@ -280,11 +305,23 @@ def run_scenario(
     scn,  # NuPlan 시나리오 객체   (executor.map 의 1st iterable)
     cfg_dict: Dict  # config 를 dict 로 직렬화한 것 (2nd iterable)
 ) -> None:
+    # --- child process CPU-only guard (redundant but safest) ---
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
+    try:
+        import torch
+        if hasattr(torch, "set_default_device"):
+            torch.set_default_device("cpu")
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.enabled = False
+    except Exception:
+        pass
     """
     • 각 워커 프로세스에서 여러 번 호출된다.
     • 최초 호출 시에만 DataProcessor 를 만들어 전역에 저장하고 재사용한다.
     • 원래 `process_single_scenario` 와 동일한 예외‑안전 로직 포함.
     """
+
     global _PROCESSOR, _CFG_NS
 
     # ── 0) Lazy‑initialization (프로세스당 1회) ─────────────────
