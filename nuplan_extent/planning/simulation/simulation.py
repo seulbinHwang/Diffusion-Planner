@@ -8,9 +8,10 @@ from nuplan.planning.simulation.callback.abstract_callback import AbstractCallba
 from nuplan.planning.simulation.callback.multi_callback import MultiCallback
 from nuplan.planning.simulation.history.simulation_history import SimulationHistory, SimulationHistorySample
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
-from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization, PlannerInput
+from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization, PlannerInput
 from nuplan.planning.simulation.simulation_setup import SimulationSetup
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
+from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ class Simulation:
         # Restart simulation
         self._is_simulation_running = True
 
-    def initialize(self) -> PlannerInitialization:
+    def initialize(self) -> HorizonPlannerInitialization:
         """
         Initialize the simulation
          - Initialize Planner with goals and maps
@@ -124,7 +125,7 @@ class Simulation:
         else:
             npc_route_roadblock_ids = None
             # Return the planner initialization structure for this simulation
-        return PlannerInitialization(
+        return HorizonPlannerInitialization(
             route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
             mission_goal=self._scenario.get_mission_goal(),
             map_api=self._scenario.map_api,
@@ -189,9 +190,14 @@ class Simulation:
         if next_iteration:
             self._ego_controller.update_state(iteration, next_iteration,
                                               ego_state, trajectory)
-            self._observations.update_observation(
-                iteration, next_iteration, self._history_buffer,
-                self._ego_controller.get_state(), trajectory)
+            if isinstance(self._observations, WorldModelAgents):
+                self._observations.update_observation(
+                    iteration, next_iteration, self._history_buffer,
+                    self._ego_controller.get_state(), trajectory)
+            else:
+                self._observations.update_observation(iteration,
+                                                     next_iteration,
+                                                     self._history_buffer)
         else:
             self._is_simulation_running = False
 

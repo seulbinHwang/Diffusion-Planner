@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from dataclasses import dataclass
 from nuplan.common.actor_state.state_representation import StateSE2
@@ -18,12 +18,14 @@ class HorizonPlannerInitialization:
     """
 
     # The state which was achieved by expert driver in a scenario
-    expert_goal_state: StateSE2
     route_roadblock_ids: List[str]  # Roadblock ids comprising goal route
     # The mission goal which commonly is not achievable in a single scenario
     mission_goal: StateSE2
     map_api: AbstractMap  # The API towards maps.
-    scenario: AbstractScenario
+    expert_goal_state: Optional[StateSE2] = None
+    npc_route_roadblock_ids: Optional[Dict[str, List[str]]] = None
+    scenario: Optional[AbstractScenario] = None
+
 
 
 @dataclass(frozen=True)
