@@ -178,10 +178,9 @@ class SimulationFeatureVideoCallback(AbstractCallback):
         self,
         simulation_directory: Union[str, pathlib.Path],
         videos_output_dir: Union[str, pathlib.Path],
-        feature_log_dir: Union[str, pathlib.Path],
+        image_log_dir: Union[str, pathlib.Path],
         visualized_scenario_tokens: Optional[List[str]] = [],
         visualize_all_scenarios: bool = False,
-        bev_range: List[float] = [-56., -56., 56., 56.],
         image_subfix: str = ".png",
     ):
         """콜백 인스턴스를 생성한다.
@@ -192,9 +191,9 @@ class SimulationFeatureVideoCallback(AbstractCallback):
             videos_output_dir (Union[str, pathlib.Path]):
                 동영상 파일들을 저장할 **상대 경로** 또는 **절대 경로**.
                 실제 저장 경로는 `simulation_directory / videos_output_dir`.
-            feature_log_dir (Union[str, pathlib.Path]):
+            image_log_dir (Union[str, pathlib.Path]):
                 렌더링된 피처 이미지들을 저장할 **상대/절대 경로**.
-                실제 저장 경로는 `simulation_directory / feature_log_dir`.
+                실제 저장 경로는 `simulation_directory / image_log_dir`.
             visualized_scenario_tokens (Optional[List[str]]):
                 시각화할 시나리오 토큰 목록. 지정되지 않았거나 빈 리스트일 경우,
                 `visualize_all_scenarios=True`인 경우에 한해 모든 시나리오를 시각화한다.
@@ -217,7 +216,7 @@ class SimulationFeatureVideoCallback(AbstractCallback):
         self._videos_output_path = pathlib.Path(
             simulation_directory) / videos_output_dir
         self._feature_log_directory = pathlib.Path(
-            simulation_directory) / feature_log_dir
+            simulation_directory) / image_log_dir
         self._subfix = image_subfix
 
     def on_initialization_start(self, setup: SimulationSetup,
@@ -225,7 +224,7 @@ class SimulationFeatureVideoCallback(AbstractCallback):
         """시뮬레이션 초기화 시작 시 호출된다.
 
         필요한 경우, **시나리오별 결과 저장 디렉터리**를 생성한다.
-        (예: `{feature_log_dir}/{planner}/{scenario_type}/{log_name}/{scenario_name}/features`)
+        (예: `{image_log_dir}/{planner}/{scenario_type}/{log_name}/{scenario_name}/features`)
 
         Args:
             setup (SimulationSetup): 시뮬레이션 설정/컨텍스트.
@@ -422,7 +421,7 @@ class SimulationFeatureVideoCallback(AbstractCallback):
         디렉터리 구조는 다음과 같다.
 
         ```
-        {feature_log_dir}/{planner_name}/{scenario_type}/{log_name}/{scenario_name}/
+        {image_log_dir}/{planner_name}/{scenario_type}/{log_name}/{scenario_name}/
         ```
 
         Args:
@@ -432,7 +431,6 @@ class SimulationFeatureVideoCallback(AbstractCallback):
         Returns:
             pathlib.Path: 위 규칙에 따라 구성된 디렉터리 경로.
         """
-        return (self._feature_log_directory / planner_name /
-                scenario.scenario_type / scenario.log_name /
-                scenario.scenario_name  # type: ignore
+        sub_folder_name = f"{planner_name}_{scenario.scenario_type}_{scenario.log_name}_{scenario.scenario_name}"
+        return (self._feature_log_directory / sub_folder_name  # type: ignore
                )
