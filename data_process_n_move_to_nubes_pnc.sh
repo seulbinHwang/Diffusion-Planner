@@ -5,7 +5,8 @@
 set -e
 
 echo "Step 1: Running data processing..."
-
+# Ensure the script uses CPU only
+export CUDA_VISIBLE_DEVICES=""
 # Configuration from data_process_pnc.sh
 # You can modify these paths if needed.
 NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
