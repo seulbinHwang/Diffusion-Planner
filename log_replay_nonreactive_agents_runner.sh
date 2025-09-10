@@ -21,6 +21,7 @@ SPLIT="val14"  # e.g., "val14"
 # Options:
 #   - "closed_loop_nonreactive_agents"
 #   - "closed_loop_reactive_agents"
+# nuplan_extent/planning/script/experiments/simulation/log_replay_nonreactive_agents.yaml
 CHALLENGE="log_replay_nonreactive_agents" # e.g., "closed_loop_reactive_agents"
 ###################################
 # nuplan/planning/script/experiments/simulation/closed_loop_reactive_agents.yaml
@@ -54,4 +55,4 @@ python nuplan_extent/planning/script/run_simulation.py \
     distributed_mode='SINGLE_NODE' \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan_extent.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"
+    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan_extent.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"
