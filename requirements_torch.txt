@@ -1,16 +1,9 @@
-# GPU 휠을 안정적으로 받기 위해: 기본 인덱스는 PyPI, 추가 인덱스로 cu124 지정
 --index-url https://pypi.org/simple
 --extra-index-url https://download.pytorch.org/whl/cu124
 
-# 반드시 CUDA 빌드(+cu124) 명시
 torch==2.4.1+cu124
 torchvision==0.19.1+cu124
-
-# Lightning은 2.4~<2.6 권장 (2.0.1은 Torch 2.4와 매트릭스 미스매치 가능)
 pytorch_lightning>=2.4,<2.6
-
-# TB는 너무 옛 버전 고정 대신 적절 범위 권장(아래 grpcio 상향과 함께 안정)
 tensorboard>=2.14,<2.21
-
 timm==1.0.10
 mmengine
