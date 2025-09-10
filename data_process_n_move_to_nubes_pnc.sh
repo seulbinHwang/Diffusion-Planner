@@ -5,15 +5,14 @@
 set -e
 
 echo "Step 1: Running data processing..."
-# Ensure the script uses CPU only
-export CUDA_VISIBLE_DEVICES=""
+
 # Configuration from data_process_pnc.sh
 # You can modify these paths if needed.
 NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
 NUPLAN_MAP_PATH="/media/user/E/dataset/maps"
 # 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
-TRAIN_SET_NAME="processed_route_with_small"
-TRAIN_SET_PATH="/media/user/E/dataset/${TRAIN_SET_NAME}"
+TRAIN_SET_NAME="processed_route_with_many"
+TRAIN_SET_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
