@@ -801,10 +801,11 @@ class SelfAttentionBlock(nn.Module):
 
         self.norm1 = nn.LayerNorm(dim)
         # 원본의 self.attn(nn.MultiheadAttention)은 폴백 경로에서만 사용
-        self.attn = nn.MultiheadAttention(dim,
-                                          heads,
-                                          attn_drop_p,
-                                          batch_first=True)
+        self.use_fallback_mha = not _FA2_AVAILABLE
+        if self.use_fallback_mha:
+            self.attn = nn.MultiheadAttention(dim, heads, attn_drop_p, batch_first=True)
+        else:
+            self.attn = None
         self.attn_out_drop = nn.Dropout(attn_drop_p)
         self.drop_path = DropPath(
             drop_path_p) if drop_path_p > 0.0 else nn.Identity()
