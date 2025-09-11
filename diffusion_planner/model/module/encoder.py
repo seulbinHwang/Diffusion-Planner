@@ -928,10 +928,11 @@ class SelfAttentionBlock(nn.Module):
         Returns:
             torch.Tensor: Self‑Attention 출력, 모양 (B, L, D).
         """
-        if not _FLASH_ATTN_AVAILABLE:
+        if not _FA2_AVAILABLE:
             raise RuntimeError("FlashAttention‑2(varlen) 모듈을 불러오지 못했습니다. "
                                "pip install flash-attn>=2.3 등으로 설치 후 다시 시도하세요. "
-                               f"(원인: {_FLASH_ATTN_IMPORT_ERROR})")
+                               f"(원인: {_FA2_IMPORT_ERR})")
+
             # TODO: cpu 만 사용가능할 때, PyTorch SDPA(패딩 포함) 사용하는 옵션 추가 (아래 주석 해제)
             # # FlashAttention‑2가 없으면 원래 경로로 폴백
             # y = self.attn(x, x, x, key_padding_mask=mask,

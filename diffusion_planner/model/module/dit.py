@@ -211,10 +211,10 @@ class DiTBlock(nn.Module):
         Raises:
             RuntimeError: FlashAttention‑2를 불러오지 못한 경우.
         """
-        if not _FLASH_ATTN_AVAILABLE:
+        if not _FA2_AVAILABLE:
             raise RuntimeError("FlashAttention‑2(varlen) 모듈을 불러오지 못했습니다. "
                                "pip install flash-attn>=2.3 등으로 설치 후 다시 시도하세요. "
-                               f"(원인: {_FLASH_ATTN_IMPORT_ERROR})")
+                               f"(원인: {_FA2_IMPORT_ERR})")
 
     @staticmethod
     def _get_compute_dtype(x: torch.Tensor) -> torch.dtype:
