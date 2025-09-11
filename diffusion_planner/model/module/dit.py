@@ -4,16 +4,32 @@ import torch.nn as nn
 from timm.models.layers import Mlp
 from typing import Tuple, Optional
 import torch.nn.functional as F
+# ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
 try:
-    # flash-attn >= 2.3 권장 경로
     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+    try:
+        # 일부 버전(옛 코드) 표기
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
+        )
+    except ImportError:
+        # flash-attn 2.8.x의 정식 이름
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
+        )
     _FA2_AVAILABLE = True
     _FA2_IMPORT_ERR = None
 except Exception as _e1:
     try:
-        # 드물게 top-level에 export되는 빌드
         from flash_attn import flash_attn_varlen_qkvpacked_func
-
+        try:
+            from flash_attn import (
+                flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
+            )
+        except ImportError:
+            from flash_attn import (
+                flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
+            )
         _FA2_AVAILABLE = True
         _FA2_IMPORT_ERR = None
     except Exception as _e2:
@@ -21,9 +37,8 @@ except Exception as _e1:
         _FA2_IMPORT_ERR = Exception(
             f"interface import err: {_e1}; top-level err: {_e2}"
         )
+        flash_attn_varlen_cross_func = None
 # ===========================================================
-
-# =========================================
 
 
 def modulate(
@@ -357,7 +372,6 @@ class DiTBlock(nn.Module):
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,
-            return_softmax=False,
         )  # (T, H, Hd)
 
         # (4) 출력 프로젝션 + pad back
@@ -422,7 +436,7 @@ class DiTBlock(nn.Module):
 
         # (3) FlashAttention‑2 varlen (Cross-Attn)
         # out: (Tq, H, Hd)
-        out = flash_attn_varlen_q_kvpacked_func(
+        out = flash_attn_varlen_cross_func(
             q=q,
             kv=kv,
             cu_seqlens_q=cu_q.to(torch.int32),
@@ -432,7 +446,6 @@ class DiTBlock(nn.Module):
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,
-            return_softmax=False,
         )  # (Tq, H, Hd)
 
         # (4) 출력 프로젝션 + pad back

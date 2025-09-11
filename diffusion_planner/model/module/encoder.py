@@ -5,17 +5,32 @@ import torch.nn.functional as F
 from diffusion_planner.model.module.mixer import MixerBlock
 # ==== (encoder.py 상단 import 근처에 추가) ====
 from typing import Tuple  # 이미 있으면 중복 추가 불필요
-# ===== FlashAttention-2 varlen import (2.x 표준 경로) =====
+# ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
 try:
-    # flash-attn >= 2.3 권장 경로
     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+    try:
+        # 일부 버전(옛 코드) 표기
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
+        )
+    except ImportError:
+        # flash-attn 2.8.x의 정식 이름
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
+        )
     _FA2_AVAILABLE = True
     _FA2_IMPORT_ERR = None
 except Exception as _e1:
     try:
-        # 드물게 top-level에 export되는 빌드
         from flash_attn import flash_attn_varlen_qkvpacked_func
-
+        try:
+            from flash_attn import (
+                flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
+            )
+        except ImportError:
+            from flash_attn import (
+                flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
+            )
         _FA2_AVAILABLE = True
         _FA2_IMPORT_ERR = None
     except Exception as _e2:
@@ -23,6 +38,9 @@ except Exception as _e1:
         _FA2_IMPORT_ERR = Exception(
             f"interface import err: {_e1}; top-level err: {_e2}"
         )
+        flash_attn_varlen_cross_func = None
+# ===========================================================
+
 # ===========================================================
 
 # ============================================
@@ -958,7 +976,6 @@ class SelfAttentionBlock(nn.Module):
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,
-            return_softmax=False,
         )  # (T, H, Hd)
 
         # (4) 출력 프로젝션 + pad back
