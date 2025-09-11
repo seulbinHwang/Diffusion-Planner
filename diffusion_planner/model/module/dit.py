@@ -5,16 +5,28 @@ from timm.models.layers import Mlp
 from typing import Tuple, Optional
 import torch.nn.functional as F
 # ===== FlashAttention-2 varlen import =====
+# ===== FlashAttention-2 varlen import (2.x 표준 경로) =====
 try:
-    from flash_attn.flash_attn_varlen import (
-        flash_attn_varlen_qkvpacked_func,  # Self-Attn (Q=K=V)
+    from flash_attn.flash_attn_interface import (
+        flash_attn_varlen_qkvpacked_func,   # Self-Attn (Q=K=V)
         flash_attn_varlen_q_kvpacked_func,  # Cross-Attn (Q vs KV)
     )
     _FLASH_ATTN_AVAILABLE = True
     _FLASH_ATTN_IMPORT_ERROR = None
-except Exception as _e:
-    _FLASH_ATTN_AVAILABLE = False
-    _FLASH_ATTN_IMPORT_ERROR = _e
+except Exception as _e1:
+    # 구버전(1.x) 호환: 함수명이 unpadded* 였음 → varlen* 별칭으로 연결
+    try:
+        from flash_attn.flash_attn_interface import (
+            flash_attn_unpadded_qkvpacked_func as flash_attn_varlen_qkvpacked_func,
+            flash_attn_unpadded_kvpacked_func as flash_attn_varlen_q_kvpacked_func,
+        )
+        _FLASH_ATTN_AVAILABLE = True
+        _FLASH_ATTN_IMPORT_ERROR = None
+    except Exception as _e2:
+        _FLASH_ATTN_AVAILABLE = False
+        _FLASH_ATTN_IMPORT_ERROR = f"{_e1}; { _e2 }"
+# ===========================================================
+
 # =========================================
 
 
