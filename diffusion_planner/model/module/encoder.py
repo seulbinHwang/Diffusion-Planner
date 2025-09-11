@@ -892,36 +892,20 @@ class SelfAttentionBlock(nn.Module):
 
     @staticmethod
     def _pad_to_batch(
-        y_unpad: torch.Tensor,  # (T, D)
-        indices: torch.Tensor,  # (T,)
-        B: int,
-        L: int,
-        D: int,
-        device: torch.device,
-        dtype: torch.dtype,
+            y_unpad: torch.Tensor,
+            indices: torch.Tensor,
+            B: int, L: int, D: int,
+            device: torch.device,
+            dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
-        """언패드 결과를 원래 배치 모양으로 복원합니다.
-
-        Args:
-            y_unpad (torch.Tensor): 언패드 출력, 모양 (T, D).
-            indices (torch.Tensor): 유효 토큰의 플랫 인덱스, 모양 (T,).
-            B (int): 배치 크기.
-            L (int): 시퀀스 길이.
-            D (int): 히든 차원.
-            device (torch.device): 출력 텐서 디바이스.
-            dtype (torch.dtype): 출력 텐서 dtype.
-
-        Returns:
-            torch.Tensor: 복원된 텐서, 모양 (B, L, D).
-
-        Note:
-            - 유효 토큰이 없을 때도 (B, L, D) 영 텐서를 안전하게 반환합니다.
-            - `index_copy_`를 사용해 gradient가 정확히 유효 위치로만 전파됩니다.
-        """
-        out = torch.zeros(B * L, D, device=device, dtype=dtype)  # (B*L, D)
+        if dtype is None:
+            dtype = y_unpad.dtype
+        out = torch.zeros(B * L, D, device=device, dtype=dtype)
         if y_unpad.numel() > 0:
-            out.index_copy_(0, indices, y_unpad)  # 유효 위치만 채움
-        return out.view(B, L, D)  # (B, L, D)
+            if y_unpad.dtype != dtype:
+                y_unpad = y_unpad.to(dtype)
+            out.index_copy_(0, indices, y_unpad)
+        return out.view(B, L, D)
 
     def _self_attn_flash_varlen(
             self,
@@ -982,8 +966,7 @@ class SelfAttentionBlock(nn.Module):
         out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
         out = self.out_proj(out.to(x.dtype))  # (T, D) -> in dtype
         out = out.to(x.dtype)
-        out = self._pad_to_batch(out, idx, B, L, D, x.device,
-                                 x.dtype)  # (B, L, D)
+        out = self._pad_to_batch(out, idx, B, L, D, x.device)  # (B, L, D)
         return out
 
     # ------------------------------------------------------------------

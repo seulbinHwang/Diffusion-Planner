@@ -452,32 +452,26 @@ class DiT(nn.Module):
     # =====================[ 추가 2/3 ]=====================
     @staticmethod
     def _pad_to_batch(
-        y_unpad: torch.Tensor,  # (T, D_out)
-        indices: torch.Tensor,  # (T,)
-        B: int,
-        L: int,
-        D: int,
-        device: torch.device,
-        dtype: torch.dtype,
+            self,
+            y_unpad: torch.Tensor,  # (T, D_out)
+            indices: torch.Tensor,  # (T,)
+            B: int,
+            L: int,
+            D: int,
+            device: torch.device,
+            dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         """언패드 결과를 원래 배치 shape으로 복원합니다.
-
-        Args:
-            y_unpad: 언패드 출력. **shape:** (T, D_out)
-            indices: 유효 토큰의 플랫 인덱스. **shape:** (T,)
-            B: 배치 크기
-            L: 시퀀스 길이(=Pnn)
-            D: 출력 차원(D_out)
-            device: 출력 텐서 디바이스
-            dtype: 출력 텐서 dtype
-
-        Returns:
-            복원된 배치 출력. **shape:** (B, L, D_out)
+        dtype이 주어지지 않으면 소스(y_unpad)의 dtype을 따릅니다.
         """
-        out = torch.zeros(B * L, D, device=device, dtype=dtype)  # (B*L, D_out)
+        if dtype is None:
+            dtype = y_unpad.dtype
+        out = torch.zeros(B * L, D, device=device, dtype=dtype)
         if y_unpad.numel() > 0:
-            out.index_copy_(0, indices, y_unpad)  # 유효 위치만 채움 (grad 안전)
-        return out.view(B, L, D)  # (B, L, D_out)
+            if y_unpad.dtype != dtype:  # ← 안전 캐스팅
+                y_unpad = y_unpad.to(dtype)
+            out.index_copy_(0, indices, y_unpad)
+        return out.view(B, L, D)
 
     # =====================[ 추가 3/3 ]=====================
     def preproj_varlen(
@@ -522,7 +516,7 @@ class DiT(nn.Module):
             L=Pnn,
             D=x_unpad.shape[-1],
             device=near_cur_future_norm_xT.device,
-            dtype=x_unpad.dtype,
+            # dtype=x_unpad.dtype,
         )  # (B, Pnn, D)
         return x
 

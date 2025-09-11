@@ -292,38 +292,29 @@ class DiTBlock(nn.Module):
         max_seqlen = int(seqlens.max().item()) if B > 0 else 0
         return x_unpad, indices, cu_seqlens, max_seqlen, seqlens
 
-    @staticmethod
     def _pad_to_batch(
-        y_unpad: torch.Tensor,  # (T, D)
-        indices: torch.Tensor,  # (T,)
-        B: int,
-        L: int,
-        D: int,
-        device: torch.device,
-        dtype: torch.dtype,
+            self,
+            y_unpad: torch.Tensor,  # (T, D)
+            indices: torch.Tensor,  # (T,)
+            B: int,
+            L: int,
+            D: int,
+            device: torch.device,
+            dtype: Optional[torch.dtype] = None,  # ← Optional
     ) -> torch.Tensor:
-        """언패드 결과를 원래 배치 shape으로 복원합니다.
-
-        Args:
-            y_unpad (torch.Tensor): 언패드 출력. 모양 (T, D).
-            indices (torch.Tensor): 유효 토큰의 플랫 인덱스. 모양 (T,).
-            B (int): 배치 크기.
-            L (int): 시퀀스 길이.
-            D (int): 히든 차원.
-            device (torch.device): 결과 텐서를 올릴 디바이스.
-            dtype (torch.dtype): 결과 텐서 dtype.
-
-        Returns:
-            torch.Tensor: 복원된 배치 출력. 모양 (B, L, D).
-
-        Note:
-            - 유효 토큰이 전혀 없는 경우에도 안전하게 (B, L, D) 영 텐서를 반환합니다.
-            - in-place가 아닌 `index_copy_`를 사용해 gradient가 정확히 흘러가도록 합니다.
         """
-        out = torch.zeros(B * L, D, device=device, dtype=dtype)  # (B*L, D)
+        언패드 결과를 원래 배치 shape으로 복원합니다.
+        dtype이 주어지지 않으면 소스(y_unpad)의 dtype을 그대로 사용합니다.
+        """
+        if dtype is None:
+            dtype = y_unpad.dtype  # ← 핵심: 소스 dtype 사용
+
+        out = torch.zeros(B * L, D, device=device, dtype=dtype)
         if y_unpad.numel() > 0:
-            out.index_copy_(0, indices, y_unpad)  # 유효 위치만 채움
-        return out.view(B, L, D)  # (B, L, D)
+            if y_unpad.dtype != dtype:  # ← 안전 캐스트
+                y_unpad = y_unpad.to(dtype)
+            out.index_copy_(0, indices, y_unpad)
+        return out.view(B, L, D)
 
     def _self_attn_flash_varlen(
             self,
@@ -377,8 +368,8 @@ class DiTBlock(nn.Module):
         # (4) 출력 프로젝션 + pad back
         out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
         out = self.out_proj(out.to(x.dtype))  # (T, D) -> 원 dtype
-        out = self._pad_to_batch(out, idx, B, L, D, x.device,
-                                 x.dtype)  # (B, L, D)
+        out = self._pad_to_batch(out, idx, B, L, D, x.device)
+
         return out
 
     def _cross_attn_flash_varlen(
@@ -451,8 +442,7 @@ class DiTBlock(nn.Module):
         # (4) 출력 프로젝션 + pad back
         out = out.reshape(Tq, self.num_heads * self.head_dim)  # (Tq, D)
         out = self.out_proj_cross(out.to(q_in.dtype))  # (Tq, D)
-        out = self._pad_to_batch(out, q_idx, B, Lq, D, q_in.device,
-                                 q_in.dtype)  # (B, Lq, D)
+        out = self._pad_to_batch(out, q_idx, B, Lq, D, q_in.device)
         return out
 
     # ====================== (추가) 함수화된 per‑agent adaLN 로직 ======================
