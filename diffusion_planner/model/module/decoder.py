@@ -112,13 +112,16 @@ class Decoder(nn.Module):
             return x_t, None
 
         x_seq = x_t.view(B, Pnn, T_plus1, 4).clone()
-        # 마지막 프레임을 목표로 치환(노이즈 0과 동치)
-        x_seq[can_apply, -1, :] = cond_last_pos_norm[can_apply]
-        x_out = x_seq.view(B, Pnn, flat)
 
-        # 로깅/평가용 마스크 반환(이번 배치에서 실제 적용된 위치)
-        apply_mask: torch.Tensor = can_apply  # (B, Pnn)
-        return x_out, apply_mask
+        # 마지막 프레임만 뽑아서 (B, Pnn, 4) 모양으로 맞춘 뒤 where로 바꿔끼우기
+        last = x_seq[:, :, -1, :]  # (B, Pnn, 4)
+        apply_cond = can_apply.unsqueeze(-1)  # (B, Pnn, 1) → 4에 브로드캐스트
+        # cond_last_pos_norm은 이미 _cast_like로 dtype/device 맞춤
+        last = torch.where(apply_cond, cond_last_pos_norm, last)  # (B, Pnn, 4)
+        x_seq[:, :, -1, :] = last
+
+        x_out = x_seq.view(B, Pnn, flat)
+        return x_out, can_apply
 
     def forward(self, encoder_outputs, inputs):
         """
@@ -242,12 +245,13 @@ class Decoder(nn.Module):
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
-                # 항상 현재(첫 프레임) 고정
                 xt[:, :, 0, :] = near_current
-                # 선택적으로 마지막(목표) 고정
+
                 if cond_last_pos is not None and cond_last_mask.any().item():
-                    # ★ FIX: 대입 직전 dtype/device 일치 (방어적)
-                    xt[cond_last_mask, -1, :] = _cast_like(cond_last_pos[cond_last_mask], xt)
+                    last = xt[:, :, -1, :]  # (B, Pnn, 4)
+                    src = _cast_like(cond_last_pos, xt)  # (B, Pnn, 4)
+                    last = torch.where(cond_last_mask.unsqueeze(-1), src, last)
+                    xt[:, :, -1, :] = last
                 return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(
