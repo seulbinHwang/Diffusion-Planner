@@ -64,8 +64,6 @@ class ObservationNormalizer:
             path = args.normalization_file_path
 
         data = openjson(path)
-        print("[ObservationNormalizer2] data:", data)
-
         ndt = {}
         for k, v in data.items():
             if k not in ["ego", "neighbor"]:
