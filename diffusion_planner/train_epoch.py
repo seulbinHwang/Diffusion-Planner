@@ -60,8 +60,8 @@ def train_epoch(data_loader,
             inputs = {
                 "ego_agent_past":
                     batch[0].to(args.device),
-                "ego_current_state":
-                    batch[1].to(args.device),
+                # "ego_current_state":
+                #     batch[1].to(args.device),
                 "neighbor_agents_past":
                     batch[3].to(args.device),
                 "lanes":

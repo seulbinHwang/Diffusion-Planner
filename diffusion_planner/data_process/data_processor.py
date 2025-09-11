@@ -605,6 +605,7 @@ class DataProcessor(object):
             
             '''
             # ego_agent_past: (T, 11)
+            # TODO:ego_current_state 14 차원으로 나옴
             ego_current_state = calculate_additional_ego_states(
                 ego_agent_past, time_stamps_past)
             T, D = ego_agent_past.shape
