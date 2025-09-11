@@ -452,7 +452,6 @@ class DiT(nn.Module):
     # =====================[ 추가 2/3 ]=====================
     @staticmethod
     def _pad_to_batch(
-            self,
             y_unpad: torch.Tensor,  # (T, D_out)
             indices: torch.Tensor,  # (T,)
             B: int,
