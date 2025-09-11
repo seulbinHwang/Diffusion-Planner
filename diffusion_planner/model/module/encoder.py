@@ -13,21 +13,16 @@ try:
     _FA2_IMPORT_ERR = None
 except Exception as _e1:
     try:
-        # 일부 구버전/포크
-        from flash_attn.flash_attn_varlen import flash_attn_varlen_qkvpacked_func
+        # 드물게 top-level에 export되는 빌드
+        from flash_attn import flash_attn_varlen_qkvpacked_func
+
         _FA2_AVAILABLE = True
         _FA2_IMPORT_ERR = None
     except Exception as _e2:
-        try:
-            # 드물게 top-level에 export되는 빌드
-            from flash_attn import flash_attn_varlen_qkvpacked_func
-            _FA2_AVAILABLE = True
-            _FA2_IMPORT_ERR = None
-        except Exception as _e3:
-            _FA2_AVAILABLE = False
-            _FA2_IMPORT_ERR = Exception(
-                f"interface import err: {_e1}; varlen import err: {_e2}; top-level err: {_e3}"
-            )
+        _FA2_AVAILABLE = False
+        _FA2_IMPORT_ERR = Exception(
+            f"interface import err: {_e1}; top-level err: {_e2}"
+        )
 # ===========================================================
 
 # ============================================
