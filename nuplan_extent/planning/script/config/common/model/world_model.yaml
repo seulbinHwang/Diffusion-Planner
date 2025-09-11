@@ -1,0 +1,36 @@
+_target_: nuplan_extent.planning.training.modeling.models.world_model.WorldModel
+_convert_: 'all'
+config:
+  _target_: diffusion_planner.utils.config.Config
+  _convert_: "all"
+  args_file: ???
+ckpt_path: ???
+future_trajectory_sampling:
+  _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+  _convert_: 'all'
+  num_poses: 80
+  time_horizon: 8
+# All feature builders
+feature_builders:
+
+  - _target_: nuplan_extent.planning.training.preprocessing.feature_builders.world_model_feature_builder.WorldModelFeatureBuilder
+    _convert_: 'all'
+    config:
+      _target_: diffusion_planner.utils.config.Config
+      _convert_: "all"
+
+      args_file: ???
+
+
+#      past_trajectory_sampling:
+#        _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling
+#        _convert_: 'all'
+#        num_poses: ${common_cfg.input_cfg.num_past_steps} # 1
+#        time_horizon: ${common_cfg.input_cfg.past_time_horizon} # 0.5
+
+
+target_builders:
+  - _target_: nuplan_extent.planning.training.preprocessing.feature_builders.ego_trajectory_with_past_target_builder.EgoTrajectoryWithPastTargetBuilder
+    _convert_: 'all'
+    future_trajectory_sampling: ${model.future_trajectory_sampling}
+

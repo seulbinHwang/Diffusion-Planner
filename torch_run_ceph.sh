@@ -46,17 +46,17 @@ echo "[Preflight] Done."
 #    --no-progress
 #echo "Finish downloading diffusion_planner_training.json"
 
-echo "Start downloading processed dataset"
-nubescli dir-download \
-    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME} \
-    "$TRAIN_SET_PATH" \
-    -j "$(nproc)" \
-    -s \
-    --no-progress
-echo "Finish downloading processed dataset"
+#echo "Start downloading processed dataset"
+#nubescli dir-download \
+#    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME} \
+#    "$TRAIN_SET_PATH" \
+#    -j "$(nproc)" \
+#    -s \
+#    --no-progress
+#echo "Finish downloading processed dataset"
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 
-"$RUN_PYTHON_PATH" -m torch.distributed.rcond_last_pos_normun --nnodes 1 --nproc-per-node 4 --standalone train_predictor.py \
+"$RUN_PYTHON_PATH" -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH"

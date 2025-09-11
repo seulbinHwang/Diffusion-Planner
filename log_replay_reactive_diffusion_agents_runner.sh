@@ -64,6 +64,6 @@ python nuplan_extent/planning/script/run_simulation.py \
     distributed_mode='SINGLE_NODE' \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://nuplan.planning.script.config.common, pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments  ]"
+    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://nuplan.planning.script.config.common , pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments ]"
 
-    # # nuplan.planning.script.config.common.splitter.nuplan.yaml
+    # nuplan_extent/planning/script/config/common/model/world_model.yaml
