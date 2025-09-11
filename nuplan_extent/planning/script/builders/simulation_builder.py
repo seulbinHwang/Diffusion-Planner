@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 from nuplan.common.utils.distributed_scenario_filter import DistributedMode, DistributedScenarioFilter
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario_builder import NuPlanScenarioBuilder
 from nuplan.planning.script.builders.metric_builder import build_metrics_engines
-from nuplan.planning.script.builders.observation_builder import build_observations
+from nuplan_extent.planning.script.builders.observation_builder import build_observations
 from nuplan.planning.script.builders.planner_builder import build_planners
 from nuplan.planning.script.builders.utils.utils_type import is_target_type
 from nuplan.planning.simulation.callback.abstract_callback import AbstractCallback
@@ -104,7 +104,6 @@ def build_simulations(
                 cfg.simulation_time_controller, scenario=scenario)
 
             # Perception
-            print("cfg.observation:", cfg.observation)
             observations: AbstractObservation = build_observations(
                 cfg.observation, scenario=scenario)
 

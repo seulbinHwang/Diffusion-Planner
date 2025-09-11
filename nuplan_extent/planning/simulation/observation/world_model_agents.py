@@ -21,7 +21,7 @@ from nuplan.planning.simulation.simulation_time_controller.simulation_iteration 
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
-from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
+from nuplan_extent.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import AbstractModelFeature
@@ -35,6 +35,7 @@ from nuplan.common.actor_state.vehicle_parameters import VehicleParameters
 from nuplan.common.actor_state.dynamic_car_state import DynamicCarState
 from nuplan.planning.simulation.observation.observation_type import Observation
 from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
+from nuplan.planning.training.modeling.types import FeaturesType, TargetsType
 
 
 def observations_to_agents_buffer(
@@ -285,6 +286,7 @@ class WorldModelAgents(AbstractMLAgents):
         self.predicted_neighbor_num = self.config.predicted_neighbor_num
         self.current_iteration = 0
         self._open_loop_detections_types: List[TrackedObjectType] = []
+        # ["PEDESTRIAN", "BARRIER", "CZONE_SIGN", "TRAFFIC_CONE", "GENERIC_OBJECT"]
         self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
         self._target_velocity = target_velocity
@@ -313,13 +315,14 @@ class WorldModelAgents(AbstractMLAgents):
         self.current_iteration = 0
         self.current_observation = None
 
-        unique_agents = {
+        unique_agents: Dict[str, TrackedObject] = {
             tracked_object.track_token: tracked_object
             for tracked_object in
             self._scenario.initial_tracked_objects.tracked_objects
             if tracked_object.tracked_object_type == TrackedObjectType.VEHICLE
         }
-        self._diffusion_agents = sort_dict(unique_agents)
+        self._diffusion_agents: Dict[str,
+                                     TrackedObject] = sort_dict(unique_agents)
         self._filter_agents_out_of_range(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
             self._get_open_loop_track_objects(self.current_iteration))
@@ -392,7 +395,7 @@ class WorldModelAgents(AbstractMLAgents):
         ]
         selected_tokens: List[
             str] = within_radius_tokens[:self.predicted_neighbor_num]
-        self._diffusion_agents = {
+        self._diffusion_agents: Dict[str, TrackedObject] = {
             token: self._diffusion_agents[token] for token in selected_tokens
         }
 
@@ -403,6 +406,8 @@ class WorldModelAgents(AbstractMLAgents):
         step_s_time : 0.15 (시뮬레이션 시간 간격 (초))
         self._step_interval : 0.1 이면 (future trajectory의 점 사이 시간 간격)
             q = 1.5 -> interpol_num = 2
+        [현실]
+            step_s_time: 0.09992 self._step_interval: 0.1 interpol_num: 1
         """
         q = Decimal(str(step_s_time)) / Decimal(str(self._step_interval))
         interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
@@ -412,6 +417,10 @@ class WorldModelAgents(AbstractMLAgents):
             interpol_indices = [1, 2]
             interpol_points_times = [0.1, 0.2]
             interpol_time_points = [TimePoint(current_time + 0.1s), TimePoint(current_time + 0.2s)]
+        [현실] 
+            interpol_indices: [1] 
+            interpol_points_times: [0.1]
+            interpol_time_points = [TimePoint(current_time + 0.1s)]
         """
         interpol_indices = np.linspace(0,
                                        interpol_num,
@@ -428,6 +437,10 @@ class WorldModelAgents(AbstractMLAgents):
     def _get_next_ego_plans(
             self, current_ego_state: EgoState, next_ego_state: EgoState,
             interpol_time_points: List[TimePoint]) -> List[InterpolatableState]:
+        """
+
+        interpol_time_points = [TimePoint(current_time + 0.1s)]
+        """
         states: List[InterpolatableState] = [current_ego_state, next_ego_state]
         next_ego_trajectory = InterpolatedTrajectory(trajectory=states)
         next_ego_plans: List[
@@ -615,9 +628,10 @@ class WorldModelAgents(AbstractMLAgents):
             -
         """
         self.observation_buffer: Deque[Observation] = history.observation_buffer
+        # EgoState, Observation
         self._ego_anchor_state, self.current_observation = history.current_state
-        self.current_iteration = next_iteration.index
-        self.step_time_point = next_iteration.time_point - iteration.time_point
+        self.current_iteration: int = next_iteration.index
+        self.step_time_point: TimePoint = next_iteration.time_point - iteration.time_point
         (world_model_feature, token_to_future_traj_wrt_ego
         ) = self._update_diffusion_agents_observation(iteration, next_iteration,
                                                       history, next_ego_state,
@@ -818,3 +832,14 @@ class WorldModelAgents(AbstractMLAgents):
         self._diffusion_agents = new_agents
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         return token_to_future_traj_wrt_ego
+
+    def _infer_model(self, features: FeaturesType) -> TargetsType:
+        pass
+
+    def _update_observation_with_predictions(
+            self, agent_predictions: TargetsType) -> None:
+        """
+        Update smart agent using the predictions from the ML model
+        :param agent_predictions: The prediction output from the ML_model
+        """
+        pass

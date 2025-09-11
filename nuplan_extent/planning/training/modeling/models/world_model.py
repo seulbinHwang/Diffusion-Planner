@@ -41,10 +41,9 @@ class WorldModel(TorchModuleWrapper):
         self._ema_enabled = enable_ema
         self._step_interval = 0.1  # [s]
         self._future_horizon = self.config.future_len * self._step_interval  # [s]
-
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         if self._ckpt_path is not None:
-            state_dict: Dict = torch.load(self._ckpt_path,
-                                          map_location=self._device)
+            state_dict: Dict = torch.load(self._ckpt_path, map_location=device)
 
             if self._ema_enabled:
                 state_dict = state_dict['ema_state_dict']

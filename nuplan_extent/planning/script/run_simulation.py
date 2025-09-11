@@ -33,11 +33,11 @@ DEVKIT_ROOT = Path(os.environ.get("NUPLAN_DEVKIT_ROOT", ".")).resolve()
 DEVKIT_SIM_CONFIG_DIR = DEVKIT_ROOT / "nuplan" / "planning" / "script" / "config" / "simulation"
 
 # Hydra config path/name
-CONFIG_PATH = os.environ.get("NUPLAN_HYDRA_CONFIG_PATH", str(DEVKIT_SIM_CONFIG_DIR))
+CONFIG_PATH = os.environ.get("NUPLAN_HYDRA_CONFIG_PATH",
+                             str(DEVKIT_SIM_CONFIG_DIR))
 CONFIG_NAME = "default_simulation"
 
 print("CONFIG_PATH:", CONFIG_PATH)
-
 
 # CONFIG_PATH = os.getenv('NUPLAN_HYDRA_CONFIG_PATH', 'config/simulation')
 # print("CONFIG_PATH:", CONFIG_PATH)

@@ -40,7 +40,7 @@ model_config:
 
 
   target_builders:
-    - _target_: nuplan_extent.planning.training.preprocessing.feature_builders.ego_trajectory_with_past_target_builder.EgoTrajectoryWithPastTargetBuilder
+    - _target_: nuplan.planning.training.preprocessing.target_builders.ego_trajectory_target_builder.EgoTrajectoryTargetBuilder
       _convert_: 'all'
       future_trajectory_sampling:
         _target_: nuplan.planning.simulation.trajectory.trajectory_sampling.TrajectorySampling

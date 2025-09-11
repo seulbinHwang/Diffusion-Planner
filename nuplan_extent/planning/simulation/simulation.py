@@ -12,6 +12,7 @@ from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPl
 from nuplan.planning.simulation.simulation_setup import SimulationSetup
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
 from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents
+from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ class Simulation:
         # Restart simulation
         self._is_simulation_running = True
 
-    def initialize(self) -> HorizonPlannerInitialization:
+    def initialize(self) -> PlannerInitialization:
         """
         Initialize the simulation
          - Initialize Planner with goals and maps
@@ -110,7 +111,7 @@ class Simulation:
         # Initialize history from scenario
         self._history_buffer = SimulationHistoryBuffer.initialize_from_scenario(
             self._history_buffer_size, self._scenario,
-            self._observations.observation_type())
+            self._observations.observation_type())  # DetectionsTracks
 
         # Initialize observations
         self._observations.initialize()
@@ -119,17 +120,16 @@ class Simulation:
         self._history_buffer.append(self._ego_controller.get_state(),
                                     self._observations.get_observation())
 
-        if hasattr(self._scenario, 'get_npc_route_roadblock_ids'):
-            npc_route_roadblock_ids = self._scenario.get_npc_route_roadblock_ids(
-            )
-        else:
-            npc_route_roadblock_ids = None
-            # Return the planner initialization structure for this simulation
-        return HorizonPlannerInitialization(
+        # if hasattr(self._scenario, 'get_npc_route_roadblock_ids'):
+        #     npc_route_roadblock_ids = self._scenario.get_npc_route_roadblock_ids(
+        #     )
+        # else:
+        #     npc_route_roadblock_ids = None
+        # Return the planner initialization structure for this simulation
+        return PlannerInitialization(
             route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
             mission_goal=self._scenario.get_mission_goal(),
             map_api=self._scenario.map_api,
-            npc_route_roadblock_ids=npc_route_roadblock_ids,
         )
 
     def get_planner_input(self) -> PlannerInput:
@@ -195,9 +195,8 @@ class Simulation:
                     iteration, next_iteration, self._history_buffer,
                     self._ego_controller.get_state(), trajectory)
             else:
-                self._observations.update_observation(iteration,
-                                                     next_iteration,
-                                                     self._history_buffer)
+                self._observations.update_observation(iteration, next_iteration,
+                                                      self._history_buffer)
         else:
             self._is_simulation_running = False
 

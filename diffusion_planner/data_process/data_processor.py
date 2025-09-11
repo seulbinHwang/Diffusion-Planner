@@ -69,19 +69,19 @@ class DataProcessor(object):
             'ROUTE_LANES': config.route_len
         }  # maximum number of points per feature to extract per feature layer.
         # wandb 사용 여부를 한 곳에서만 판단
-        if getattr(config, "use_wandb", True) and wandb.run is None:
-            # 컨트롤러 run id를 같은 group 으로 묶어 두면 대시보드가 깔끔
-            wandb.init(
-                project=getattr(config, "wandb_project", "Diffusion-Planner"),
-                entity=getattr(config, "wandb_entity", None),
-                group=getattr(config, "wandb_group", None),  # ← 컨트롤러 ID
-                job_type="preprocess-worker",
-                name=f"{config.name}-worker-{os.getpid()}",
-                mode=getattr(config, "wandb_mode", "online"),
-                reinit=True,  # fork 안전
-                settings=wandb.Settings(start_method="fork"),
-            )
-        self._wandb_enabled = wandb.run is not None
+        # if getattr(config, "use_wandb", True) and wandb.run is None:
+        #     # 컨트롤러 run id를 같은 group 으로 묶어 두면 대시보드가 깔끔
+        #     wandb.init(
+        #         project=getattr(config, "wandb_project", "Diffusion-Planner"),
+        #         entity=getattr(config, "wandb_entity", None),
+        #         group=getattr(config, "wandb_group", None),  # ← 컨트롤러 ID
+        #         job_type="preprocess-worker",
+        #         name=f"-worker-{os.getpid()}",
+        #         mode=getattr(config, "wandb_mode", "online"),
+        #         reinit=True,  # fork 안전
+        #         settings=wandb.Settings(start_method="fork"),
+        #     )
+        # self._wandb_enabled = wandb.run is not None
 
     # [ADDED] 통계 유틸 함수들
     # =========================
@@ -638,7 +638,8 @@ class DataProcessor(object):
             save_dir = os.path.join(self._save_dir, "debug_vis")
             save_path = os.path.join(save_dir, f"{map_name}_{token}.png")
             os.makedirs(save_dir, exist_ok=True)
-            if self._wandb_enabled or self.config.save_image:
+            # if self._wandb_enabled or self.config.save_image:
+            if self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
                 draw_machine.draw_world_model_to_png(
                     data,

@@ -27,7 +27,6 @@ class HorizonPlannerInitialization:
     scenario: Optional[AbstractScenario] = None
 
 
-
 @dataclass(frozen=True)
 class PlannerInput:
     """

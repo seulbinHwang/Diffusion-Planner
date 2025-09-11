@@ -407,7 +407,6 @@ class SimulationFeatureVideoCallback(AbstractCallback):
             video_name = scenario_token + ".webm"
             video_save_path.mkdir(parents=True, exist_ok=True)
 
-
             # (H, W), frames, output_path, fps(source: database_interval)
             save_video(
                 frame_size_hw=video_images[0].shape[:2],

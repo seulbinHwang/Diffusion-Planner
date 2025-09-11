@@ -2,7 +2,12 @@ from copy import copy, deepcopy
 import torch
 
 from diffusion_planner.utils.train_utils import openjson
-
+from pathlib import Path  # 추가
+try:  # 추가
+    from hydra.utils import to_absolute_path  # 추가
+except Exception:  # 추가
+    def to_absolute_path(path: str) -> str:  # 추가
+        return str(Path(path).expanduser().resolve())  # 추가
 
 class StateNormalizer:
 
@@ -14,8 +19,8 @@ class StateNormalizer:
     def from_json(cls, args):
         data = openjson(args.normalization_file_path)
         a  = [data["neighbor"]["mean"]]
-        # print(
-        #     f"[StateNormalizer] a: shape: {data['neighbor']['mean']}")
+        print(
+            f"[StateNormalizer] a: shape: {data['neighbor']['mean']}")
 
         mean = [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
         std =  [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
@@ -24,9 +29,9 @@ class StateNormalizer:
     @classmethod
     def from_json2(cls, args_dict):
         # args_dict["normalization_file_path"]: "normalization.json"
-        # TODO: 내가 원하는 normalization_file_path는 내가 코드를 실행한(래포지토리의 가장 상위) 위치에 있는 normalization.json
-        data = openjson(args_dict["normalization_file_path"])
-        print("[StateNormalizer2] data:", data)
+        path_str = args_dict.get("normalization_file_path",
+                                 "normalization.json")  # 추가
+        data = openjson(to_absolute_path(path_str))  # 추가
         mean = [[data["neighbor"]["mean"]]] * args_dict["predicted_neighbor_num"]
         std =  [[data["neighbor"]["std"]]] * args_dict["predicted_neighbor_num"]
         return cls(mean, std)
@@ -67,7 +72,7 @@ class ObservationNormalizer:
         ndt = {}
         for k, v in data.items():
             if k not in ["ego", "neighbor"]:
-                # print(f"[ObservationNormalizer] key: {k} is and value: {v['mean']}")
+                print(f"[ObservationNormalizer] key: {k} is and value: {v['mean']}")
                 ndt[k] = {
                     "mean": torch.tensor(v["mean"], dtype=torch.float32),
                     "std": torch.tensor(v["std"], dtype=torch.float32)
@@ -76,9 +81,9 @@ class ObservationNormalizer:
 
     @classmethod
     def from_json2(cls, args_dict):
-        path = args_dict.normalization_file_path
-        data = openjson(path)
-        print("[ObservationNormalizer2] data:", data)
+        path_str = args_dict.get("normalization_file_path",
+                                 "normalization.json")  # 추가
+        data = openjson(to_absolute_path(path_str))  # 추가
 
         ndt = {}
         for k, v in data.items():
