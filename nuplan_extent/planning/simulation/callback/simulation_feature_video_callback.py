@@ -207,6 +207,8 @@ class SimulationFeatureVideoCallback(AbstractCallback):
               파이썬에서 권장되지 않는 패턴이지만(가변 기본 인자), 이 콜백은 외부 설정(YAML 등)
               로드 시 일반적으로 명시적으로 값이 주입되므로 그대로 유지한다.
         """
+        if visualized_scenario_tokens is None:
+            visualized_scenario_tokens = []
         assert isinstance(visualized_scenario_tokens,
                           list), "visualized_scenario_tokens must be a list"
 

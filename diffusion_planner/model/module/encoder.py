@@ -403,11 +403,20 @@ class Encoder(nn.Module):
             drop_mask_b = drop_mask_b.to(torch.bool)
 
         if (~drop_mask_b).any().item():
-            b_drop = ~drop_mask_b  # (B,) False=drop → True 인덱스가 드롭 대상
-            # 마스크/값을 샘플 단위로 전체 패딩(True)/제로로 클램프
-            route_lanes[b_drop] = 0.0
-            route_lanes_mask[b_drop] = True
-            route_lane_pos[b_drop] = 0.0
+            # (B,) -> (B,1,1) for broadcast
+            b_drop = (~drop_mask_b).view(-1, 1, 1)  # True = 드롭 대상 배치
+
+            # 값/포지션: float 복사 마스크로 곱셈(새 텐서 반환)
+            keep_f_lanes = (~b_drop).unsqueeze(-1).to(
+                route_lanes.dtype)  # (B,1,1,1)
+            keep_f_pos = (~b_drop).unsqueeze(-1).to(
+                route_lane_pos.dtype)  # (B,1,1,1)
+            route_lanes = route_lanes * keep_f_lanes
+            route_lane_pos = route_lane_pos * keep_f_pos
+
+            # 마스크: out‑of‑place 결합(원본 텐서 저장소를 수정하지 않음)
+            route_lanes_mask = route_lanes_mask | b_drop.expand_as(
+                route_lanes_mask)
         return route_lanes, route_lanes_mask, route_lane_pos
 
     def _sample_uniform_prefix_lengths(self, batch_size: int,
@@ -766,11 +775,14 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
                                           idx)  # (B,Pnn,route_num)
         route_lanes_mask = gathered_lane_mask | (~sel_valid)  # True=pad(무효)
 
-        # 무효 위치는 0으로 채우기
-        route_lanes = route_lanes.masked_fill(route_lanes_mask.unsqueeze(-1),
-                                              0.0)
-        route_lane_pos = route_lane_pos.masked_fill(
-            route_lanes_mask.unsqueeze(-1), 0.0)
+        # 무효 위치는 0으로 채우기 (곱셈으로 처리하여 마스크 alias 문제 제거)
+        mask_f = route_lanes_mask.unsqueeze(-1).to(
+            route_lanes.dtype)  # (B,Pnn,R,1) float copy
+        route_lanes = route_lanes * (1 - mask_f)  # (B,Pnn,R,H)
+
+        mask_pos_f = route_lanes_mask.unsqueeze(-1).to(
+            route_lane_pos.dtype)  # (B,Pnn,R,1) float copy
+        route_lane_pos = route_lane_pos * (1 - mask_pos_f)  # (B,Pnn,R,Dpos)
 
         return route_lanes, route_lanes_mask, route_lane_pos
 
