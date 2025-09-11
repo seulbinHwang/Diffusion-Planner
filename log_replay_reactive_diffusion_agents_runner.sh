@@ -66,4 +66,4 @@ python nuplan_extent/planning/script/run_simulation.py \
     enable_simulation_progress_bar=true \
     hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://nuplan.planning.script.config.common , pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments ]"
 
-    # nuplan_extent/planning/script/config/common/model/world_model.yaml
+    # nuplan_extent.planning.script.config.common.model -> world_model.yaml
