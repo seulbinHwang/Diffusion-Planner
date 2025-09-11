@@ -12,6 +12,11 @@ from diffusion_planner.model.module.mixer import MixerBlock
 from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, FinalLayer
 from diffusion_planner.loss import _require_finite
 
+from typing import Tuple, Optional
+
+def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """ref 텐서의 dtype/device로 x를 캐스팅합니다."""
+    return x.to(dtype=ref.dtype, device=ref.device)
 
 class Decoder(nn.Module):
 
@@ -83,7 +88,7 @@ class Decoder(nn.Module):
         assert T_plus1 >= 2, "미래 길이 T는 최소 1 이상이어야 합니다."
         assert cond_last_pos_norm.shape == (B, Pnn,
                                             4), "cond_last_pos_norm shape 불일치"
-
+        cond_last_pos_norm = _cast_like(cond_last_pos_norm, x_t)
         # cond_last_prob==0 이면 빠르게 종료
         if self._cond_last_prob <= 0.0:
             return x_t, None
@@ -174,11 +179,10 @@ class Decoder(nn.Module):
             cond_last_pos_norm = inputs["cond_last_pos_norm"]#[:, :Pnn, :]  # [B, Pnn, 4]
         else:
             # NaN으로 채워서 'isfinite' 검사에 의해 자동 미적용되게 만든다.
-            cond_last_pos_norm = torch.full(
-                (B, Pnn, 4), float('nan'),
-                device=near_current.device,
-                dtype=near_current.dtype
-            )
+            cond_last_pos_norm = near_current.new_full((B, Pnn, 4), float('nan'))
+
+        # ★ FIX: 이후 모든 사용을 안전하게 만들기 위해 dtype/device를 near_current에 정렬
+        cond_last_pos_norm = _cast_like(cond_last_pos_norm, near_current)
 
         # Extract context encoding
         scene_encoding_token = encoder_outputs[
@@ -215,36 +219,35 @@ class Decoder(nn.Module):
                 "score": score.reshape(B, Pnn, -1, 4)
             }  #  (B, Pnn, (1 + T) , 4)
         else:
-            # xT: [B, Pnn, (1 + future_len) * 4]
+            # === Inference ===
+            # ★ FIX: 랜덤 초기 x_T를 near_current와 동일 dtype/device로 생성
+            noise = near_current.new_empty((B, Pnn, self._future_len, 4)).normal_(mean=0.0, std=0.5)
             xT = torch.cat(
                 [
-                    near_current[:, :, None],  # (B, Pnn, 1, 4)
-                    torch.randn(B, Pnn, self._future_len,
-                                4).to(  # (B, Pnn, T, 4)
-                                    near_current.device) * 0.5
+                    near_current[:, :, None, :],  # (B, Pnn, 1, 4)
+                    noise                         # (B, Pnn, T, 4)
                 ],
-                dim=2).reshape(B, Pnn, -1)
+                dim=2
+            ).reshape(B, Pnn, -1)  # (B, Pnn, (1+T)*4)
 
-            # --- (After) ---
-            # cond_last_pos_norm: [B, Pnn, 4]  (state_normalizer로 정규화된 목표값)
+            # cond_last_pos_norm: [B, Pnn, 4] (이미 near_current와 dtype/device 일치)
             cond_last_pos = None
             if torch.isfinite(cond_last_pos_norm).any():
-                cond_last_pos = cond_last_pos_norm  # ★ 그대로 사용 (inverse 금지)
+                cond_last_pos = cond_last_pos_norm
 
             if cond_last_pos is not None:
-                cond_last_mask = torch.isfinite(cond_last_pos).all(
-                    dim=-1)  # [B, Pnn]
+                cond_last_mask = torch.isfinite(cond_last_pos).all(dim=-1)  # [B, Pnn]
             else:
-                cond_last_mask = torch.zeros(B, Pnn, dtype=torch.bool,
-                                             device=xT.device)
+                cond_last_mask = torch.zeros(B, Pnn, dtype=torch.bool, device=xT.device)
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
-                # 항상 현재(첫 프레임) 고정 — 관측 정규화 값(훈련과 동일)
+                # 항상 현재(첫 프레임) 고정
                 xt[:, :, 0, :] = near_current
-                # 선택적으로 마지막(목표) 고정 — state 정규화 값(훈련과 동일)
+                # 선택적으로 마지막(목표) 고정
                 if cond_last_pos is not None and cond_last_mask.any().item():
-                    xt[cond_last_mask, -1, :] = cond_last_pos[cond_last_mask]
+                    # ★ FIX: 대입 직전 dtype/device 일치 (방어적)
+                    xt[cond_last_mask, -1, :] = _cast_like(cond_last_pos[cond_last_mask], xt)
                 return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(
@@ -376,8 +379,9 @@ class RouteEncoder(nn.Module):
         x = self.emb_project(self.norm(x))
         # x.shape: (B`, D=192)
 
-        x_result = torch.zeros((B, x.shape[-1]), device=x.device)
-        x_result[valid_indices] = x  # Fill in valid parts
+        # ★ FIX: 결과 버퍼를 x(dtype/device)에 맞춰 생성
+        x_result = torch.zeros((B, x.shape[-1]), device=x.device, dtype=x.dtype)
+        x_result[valid_indices] = x  # dtype 충돌 없이 안전
         return_ = x_result.view(B, -1)
         # return_.shape: (B, D=192)
         return return_
@@ -559,6 +563,8 @@ class DiT(nn.Module):
         # diffusion_time: [B,]
         # t_embedding: (B, D=192)
         t_embedding = self.t_embedder(diffusion_time)
+        t_embedding = t_embedding.to(x.dtype)
+        ego_fut_global = ego_fut_global.to(x.dtype)  # 방어적 정렬
         # y = (B, D=192) + (B, D=192) = (B, D=192)
         y = ego_fut_global + t_embedding
 

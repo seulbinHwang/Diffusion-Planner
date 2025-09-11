@@ -949,6 +949,7 @@ class SelfAttentionBlock(nn.Module):
         # (4) 출력 프로젝션 + pad back
         out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
         out = self.out_proj(out.to(x.dtype))  # (T, D) -> in dtype
+        out = out.to(x.dtype)
         out = self._pad_to_batch(out, idx, B, L, D, x.device,
                                  x.dtype)  # (B, L, D)
         return out
@@ -2381,8 +2382,10 @@ class StaticFusionEncoder(nn.Module):
         )  # (B, static_objects_num, 4)
         # static_feature: (B, static_objects_num, 4 + 4)
         static_feature = self._get_static_feature(static_xyyaw)
-
-        out_dtype = static_info.dtype  # 또는 next(self.parameters()).dtype
+        # [FIX] 오토캐스트 환경이면 버퍼 dtype을 현재 GPU autocast dtype으로
+        out_dtype = (torch.get_autocast_gpu_dtype()
+                     if torch.is_autocast_enabled() and static_info.is_cuda
+                     else static_info.dtype)
         static_encoding = torch.zeros(
             (B * static_objects_num, self._hidden_dim),
             device=static_info.device,
@@ -2397,6 +2400,7 @@ class StaticFusionEncoder(nn.Module):
             static_info = static_info.reshape(B * static_objects_num, -1)
             static_info = static_info[valid_indices]
             static_info = self.projection(static_info)
+            static_info = static_info.to(dtype=static_encoding.dtype)  # [FIX] 좌변 dtype 일치화
             static_encoding[valid_indices] = static_info
         static_encoding = static_encoding.reshape(
             B, static_objects_num, -1)  # (B, static_objects_num, hidden_dim)
@@ -2537,17 +2541,21 @@ class LaneFusionEncoder(nn.Module):
         # Apply embedding directly to valid speed limit data
         has_speed_limit = has_speed_limit[valid_indices].squeeze(-1)
         speed_limit = speed_limit[valid_indices].squeeze(-1)
-        speed_limit_embedding = torch.zeros(
-            (speed_limit.shape[0], self._channel), device=lane_info.device)
 
+        # [FIX] 버퍼 dtype을 lane_info(dtype)로 강제
+        speed_limit_embedding = torch.zeros(
+            (speed_limit.shape[0], self._channel),
+            device=lane_info.device,
+            dtype=lane_info.dtype,
+        )
         if has_speed_limit.sum().item() > 0:
             speed_limit_with_limit = self.speed_limit_emb(
-                speed_limit[has_speed_limit].unsqueeze(-1))
+                speed_limit[has_speed_limit].unsqueeze(-1)).to(lane_info.dtype)
             speed_limit_embedding[has_speed_limit] = speed_limit_with_limit
 
         if (~has_speed_limit).sum().item() > 0:
             speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-                (~has_speed_limit).sum().item(), -1)
+                (~has_speed_limit).sum().item(), -1).to(lane_info.dtype)
             speed_limit_embedding[~has_speed_limit] = speed_limit_no_limit
 
         # Process traffic lights directly for valid positions
@@ -2642,12 +2650,13 @@ class FusionEncoder(nn.Module):
             on_B: int = on_batch_tokens.size(0)
 
             # 3) CLS 부착 및 CLS 위치 임베딩 추가
-            cls_tokens = self.cls_token.expand(on_B, 1, H)  # [on_B, 1, H]
+            cls_tokens = self.cls_token.expand(on_B, 1, H).to(on_batch_tokens.dtype)  # [on_B, 1, H]
             cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens],
                                         dim=1)  # [on_B, token_num+1, H]
+            cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
             cls_with_tokens[:, 0:
                             1, :] = cls_with_tokens[:, 0:
-                                                    1, :] + self.cls_pos  # [on_B, 1, H] += pos
+                                                    1, :] + cls_pos  # [on_B, 1, H] += pos
 
             # 4) 마스크에 CLS(False) 추가
             cls_false = torch.zeros(
@@ -2670,7 +2679,7 @@ class FusionEncoder(nn.Module):
 
             # 6) CLS 제거 후 원래 배치 위치에 복원
             fused_wo_cls = cls_with_tokens[:, 1:, :]  # [on_B, token_num, H]
-            out_tokens[is_valid_batch] = fused_wo_cls  # [B, token_num, H]
+            out_tokens[is_valid_batch] = fused_wo_cls.to(out_tokens.dtype)  # [B, token_num, H]
 
         # 전부 패딩 배치는 out_tokens의 0 유지
         # out_tokens [B, token_num, H]

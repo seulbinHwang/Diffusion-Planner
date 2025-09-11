@@ -514,18 +514,19 @@ class DiTBlock(nn.Module):
         (d_shift_msa, d_scale_msa, d_gate_msa, d_shift_mlp, d_scale_mlp,
          d_gate_mlp) = route_residuals
 
-        # (B, D) → (B, 1, D) 승격 후 (B, P, D) 잔차와 합
-        shift_msa_pa = shift_msa.unsqueeze(
-            1) + self.route_msa_alpha * d_shift_msa
-        scale_msa_pa = scale_msa.unsqueeze(
-            1) + self.route_msa_alpha * d_scale_msa
-        gate_msa_pa = gate_msa.unsqueeze(1) + self.route_msa_alpha * d_gate_msa
+        # ★ FIX: 스칼라 파라미터 α를 연산 dtype에 맞춤 (수치/성능 안정화)
+        alpha_msa = self.route_msa_alpha.to(dtype=shift_msa.dtype)
+        alpha_mlp = self.route_mlp_alpha.to(dtype=shift_mlp.dtype)
 
-        shift_mlp_pa = shift_mlp.unsqueeze(
-            1) + self.route_mlp_alpha * d_shift_mlp
-        scale_mlp_pa = scale_mlp.unsqueeze(
-            1) + self.route_mlp_alpha * d_scale_mlp
-        gate_mlp_pa = gate_mlp.unsqueeze(1) + self.route_mlp_alpha * d_gate_mlp
+
+        # (B, D) → (B, 1, D) 승격 후 (B, P, D) 잔차와 합
+        shift_msa_pa = shift_msa.unsqueeze(1) + alpha_msa * d_shift_msa
+        scale_msa_pa = scale_msa.unsqueeze(1) + alpha_msa * d_scale_msa
+        gate_msa_pa  = gate_msa.unsqueeze(1)  + alpha_msa * d_gate_msa
+
+        shift_mlp_pa = shift_mlp.unsqueeze(1) + alpha_mlp * d_shift_mlp
+        scale_mlp_pa = scale_mlp.unsqueeze(1) + alpha_mlp * d_scale_mlp
+        gate_mlp_pa  = gate_mlp.unsqueeze(1)  + alpha_mlp * d_gate_mlp
 
         return shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa, gate_mlp_pa
 
@@ -611,8 +612,10 @@ class DiTBlock(nn.Module):
         q = self.norm3(x)  # (B, P, D)
         cross_out = self._cross_attn_flash_varlen(q, cross_c, attn_mask,
                                                   cross_mask)  # (B, P, D)
-        x = x + self.gate_cross * cross_out
-        x = x + self.gate_mlp2 * self.mlp2(self.norm4(x))
+        gate_cross = self.gate_cross.to(x.dtype)
+        gate_mlp2 = self.gate_mlp2.to(x.dtype)
+        x = x + gate_cross * cross_out
+        x = x + gate_mlp2 * self.mlp2(self.norm4(x))
         x = x.masked_fill(attn_mask.unsqueeze(-1), 0.0)
         return x
 
