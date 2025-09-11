@@ -39,12 +39,12 @@ echo "[Preflight] Cleaning previous artifacts..."
 echo "[Preflight] Done."
 # ----------------------------------------------------
 
-echo "Start downloading diffusion_planner_training.json"
-nubescli download \
-    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
-    "$TRAIN_SET_LIST_PATH" \
-    --no-progress
-echo "Finish downloading diffusion_planner_training.json"
+#echo "Start downloading diffusion_planner_training.json"
+#nubescli download \
+#    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
+#    "$TRAIN_SET_LIST_PATH" \
+#    --no-progress
+#echo "Finish downloading diffusion_planner_training.json"
 
 echo "Start downloading processed dataset"
 nubescli dir-download \
