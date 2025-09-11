@@ -14,7 +14,7 @@ from nuplan.planning.training.preprocessing.feature_builders.abstract_feature_bu
 from nuplan_extent.planning.training.preprocessing.features.world_model import WorldModelFeature
 from diffusion_planner.utils.config import Config
 from diffusion_planner.data_process.data_processor import DataProcessor
-
+from diffusion_planner.data_process.utils import convert_to_model_inputs
 
 class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
@@ -48,7 +48,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 traffic_light_data,
                 initialization.map_api,
                 initialization.route_roadblock_ids,
-                initialization.scenario,
+                scenario=initialization.scenario,
                 squeeze=True)
         # (interpol_num, 11)
         model_inputs[
@@ -56,6 +56,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         # (future_len, 11)
         model_inputs[
             "ego_future_gt_11_dim"] = current_input.ego_agent_future_11_dim
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model_inputs = convert_to_model_inputs(model_inputs, device, squeeze=True)
         self.unnormalized_features = model_inputs.copy()
         for key in self.unnormalized_features:
             # torch -> numpy

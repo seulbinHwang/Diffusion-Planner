@@ -9,7 +9,7 @@ from nuplan.common.actor_state.state_representation import TimePoint
 # from nuplan.common.geometry.compute import AngularInterpolator
 from scipy.interpolate import interp1d
 import numpy.typing as npt
-
+from nuplan.common.geometry.compute import principal_value
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from nuplan.common.utils.split_state import SplitState
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory

@@ -438,7 +438,6 @@ class WorldModelAgents(AbstractMLAgents):
             self, current_ego_state: EgoState, next_ego_state: EgoState,
             interpol_time_points: List[TimePoint]) -> List[InterpolatableState]:
         """
-
         interpol_time_points = [TimePoint(current_time + 0.1s)]
         """
         states: List[InterpolatableState] = [current_ego_state, next_ego_state]
@@ -455,6 +454,7 @@ class WorldModelAgents(AbstractMLAgents):
 
         Args:
             next_ego_plans (List[InterpolatableState]): 변환할 ego 상태 리스트.
+                - 내 경우에는 실제로 돌려보니 길이가 1이었음.
             current_ego_state (EgoState): 기준이 되는 현재 ego 상태.
 
         Returns:
@@ -474,12 +474,15 @@ class WorldModelAgents(AbstractMLAgents):
             absolute[i, 2] = state.center.heading  # 절대 헤딩
             # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
             v_local = state.dynamic_car_state.center_velocity_2d
-            v_global = numpy_array_to_absolute_velocity(
-                state.center,
-                np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
-            # TODO: 이 부분이 맞는지 visualize로 확인 필요
-            absolute[i, 3] = v_global.x  # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
-            absolute[i, 4] = v_global.y  # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
+            # v_global = numpy_array_to_absolute_velocity(
+            #     state.center,
+            #     np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
+            he = float(state.center.heading)
+            c, s = np.cos(he), np.sin(he)
+            vx_w = c * float(v_local.x) - s * float(v_local.y)
+            vy_w = s * float(v_local.x) + c * float(v_local.y)
+            absolute[i, 3] = vx_w  # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
+            absolute[i, 4] = vy_w  # 자차량 좌표계 속도 -> 글로벌 좌표계 속도
             absolute[i, 5] = state.car_footprint.width
             absolute[i, 6] = state.car_footprint.length
 
@@ -524,12 +527,15 @@ class WorldModelAgents(AbstractMLAgents):
             absolute[i, 2] = state.center.heading
             # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
             v_local = state.dynamic_car_state.center_velocity_2d
-            v_global = numpy_array_to_absolute_velocity(
-                state.center,
-                np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
-            # TODO: 이 부분이 맞는지 visualize로 확인 필요
-            absolute[i, 3] = v_global.x
-            absolute[i, 4] = v_global.y
+            # v_global = numpy_array_to_absolute_velocity(
+            #     state.center,
+            #     np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
+            he = float(state.center.heading)
+            c, s = np.cos(he), np.sin(he)
+            vx_w = c * float(v_local.x) - s * float(v_local.y)
+            vy_w = s * float(v_local.x) + c * float(v_local.y)
+            absolute[i, 3] = vx_w
+            absolute[i, 4] = vy_w
             absolute[i, 5] = state.car_footprint.width
             absolute[i, 6] = state.car_footprint.length
 
@@ -805,9 +811,14 @@ class WorldModelAgents(AbstractMLAgents):
                 next_iteration.time_point)
             # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 자차 좌표계 -> 글로벌 좌표계로의 변환이 필요하다.
             v_local = new_state.dynamic_car_state.center_velocity_2d
-            v_global = numpy_array_to_absolute_velocity(
-                new_state.center,
-                np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
+            he = float(new_state.center.heading)
+            c, s = np.cos(he), np.sin(he)
+            vx_w = c * float(v_local.x) - s * float(v_local.y)
+            vy_w = s * float(v_local.x) + c * float(v_local.y)
+
+            # v_global = numpy_array_to_absolute_velocity(
+            #     new_state.center,
+            #     np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
             # TODO: new_timestamp_us 를 이렇게 주는게 맞는지 확인 필요
             new_timestamp_us = next_iteration.time_point.time_us
             new_metadata = SceneObjectMetadata(new_timestamp_us,
@@ -819,7 +830,7 @@ class WorldModelAgents(AbstractMLAgents):
             new_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,
                 oriented_box=new_state.car_footprint,
-                velocity=v_global,
+                velocity=StateVector2D(vx_w, vy_w),
                 metadata=new_metadata,
             )
             new_agent.predictions = [
