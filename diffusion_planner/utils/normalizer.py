@@ -15,7 +15,7 @@ class StateNormalizer:
         data = openjson(args.normalization_file_path)
         a  = [data["neighbor"]["mean"]]
         print(
-            f"[StateNormalizer] a: shape: {data['neighbor']['mean'].shape}")
+            f"[StateNormalizer] a: shape: {data['neighbor']['mean']}")
 
         mean = [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
         std =  [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
