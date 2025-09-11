@@ -2713,3 +2713,51 @@ class FusionEncoder(nn.Module):
         # out_tokens [B, token_num, H]
         # encoding_mask: [B, token_num]  # True=패딩
         return out_tokens, encoding_mask
+
+
+"""
+class FusionEncoder(nn.Module):
+
+
+    def forward(self, encoding_input: torch.Tensor,
+                encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        장면 융합 포워드(항상 전체 배치를 블록에 통과).
+
+        - CLS 토큰을 모든 배치에 부착한 뒤, 블록들을 항상 호출합니다.
+        - 마스크(True=pad)는 CLS 앞에 False를 추가해 전달합니다.
+        - 블록/정규화 이후, 마스크 위치는 0으로 유지합니다.
+        - 최종적으로 CLS를 제거하고 (B, token_num, H)로 복원합니다.
+
+        Args:
+            encoding_input: (B, token_num, H)
+            encoding_mask:  (B, token_num)  True=pad
+
+        Returns:
+            fused_wo_cls: (B, token_num, H)
+            encoding_mask: (B, token_num)  # 입력 마스크 그대로 반환
+        
+        B, token_num, H = encoding_input.shape
+
+        # 1) CLS 부착 + CLS 위치 임베딩
+        x = torch.cat([self.cls_token.expand(B, 1, H).to(encoding_input.dtype),
+                       encoding_input], dim=1)  # (B, 1+token_num, H)
+        x[:, 0:1, :] = x[:, 0:1, :] + self.cls_pos.to(x.dtype)
+
+        # 2) 마스크에 CLS(False) 추가
+        cls_false = torch.zeros(B, 1, dtype=torch.bool, device=encoding_mask.device)
+        mask_with_cls = torch.cat([cls_false, encoding_mask], dim=1)  # (B, 1+token_num)
+
+        # 3) 블록 통과 (항상 호출)
+        for block in self.blocks:
+            x = block(x, mask_with_cls)  # SelfAttentionBlock는 (B, 1+L, H)/(B, 1+L) 기대
+
+        # 4) 최종 정규화 + pad 위치 0 유지
+        x = self.norm(x)
+        x = x.masked_fill(mask_with_cls.unsqueeze(-1), 0.0)
+
+        # 5) CLS 제거
+        fused_wo_cls = x[:, 1:, :]  # (B, token_num, H)
+
+        return fused_wo_cls.to(encoding_input.dtype), encoding_mask
+
+"""
