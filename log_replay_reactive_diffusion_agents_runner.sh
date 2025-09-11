@@ -43,6 +43,10 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: npc_mo
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
 
+# nuplan_extent.planning.script.config.simulation
+# nuplan_extent/planning/script/config/simulation/callback/simulation_feature_video_callback.yaml
+
+# nuplan_extent.planning.script.experiments.simulation/  log_replay_reactive_diffusion_agents.yaml
 # 달라진점: simulation ("log_replay_reactive_diffusion_agents") / observation
 python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
@@ -60,4 +64,6 @@ python nuplan_extent/planning/script/run_simulation.py \
     distributed_mode='SINGLE_NODE' \
     number_of_gpus_allocated_per_simulation=0.15 \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"
+    hydra.searchpath="[pkg://nuplan.planning.script.config.common, pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments  ]"
+
+    # # nuplan.planning.script.config.common.splitter.nuplan.yaml
