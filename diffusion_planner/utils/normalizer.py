@@ -69,7 +69,7 @@ class ObservationNormalizer:
         ndt = {}
         for k, v in data.items():
             if k not in ["ego", "neighbor"]:
-                print(f"[ObservationNormalizer] key: {k} is and value: {v['mean'].shape}")
+                print(f"[ObservationNormalizer] key: {k} is and value: {v['mean']}")
                 ndt[k] = {
                     "mean": torch.tensor(v["mean"], dtype=torch.float32),
                     "std": torch.tensor(v["std"], dtype=torch.float32)
