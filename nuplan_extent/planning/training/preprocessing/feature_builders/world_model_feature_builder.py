@@ -135,6 +135,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 "route_lanes_speed_limit"],  # (route_num, 1)
             route_lanes_has_speed_limit=model_inputs[
                 "route_lanes_has_speed_limit"],  # (route_num, 1)
+            agent_route_lane_order=model_inputs[
+                "agent_route_lane_order"],  # (agent_num, 1)
             ego_agent_next_11_dim=model_inputs[
                 "ego_agent_next_11_dim"],  # (interpol_num, 11)
             ego_future_gt_11_dim=model_inputs["ego_future_gt_11_dim"]

@@ -514,12 +514,13 @@ class WorldModelAgents(AbstractMLAgents):
             width, length, 1, 0, 0] 이다.
         """
 
+
         future_states: List[EgoState] = list(
             ego_future_trajectory.get_sampled_trajectory())
         future_len__plus_1 = len(future_states)
         absolute: npt.NDArray[np.float64] = np.zeros(
-            (future_len__plus_1, 10), dtype=np.float64)  # shape (T, 7)
-        absolute[:, 7] = 1  # is vehicle
+            (self.config.future_len, 10), dtype=np.float64)  # shape (T, 7)
+
 
         for i, state in enumerate(future_states):
             absolute[i, 0] = state.center.x
@@ -538,6 +539,7 @@ class WorldModelAgents(AbstractMLAgents):
             absolute[i, 4] = vy_w
             absolute[i, 5] = state.car_footprint.width
             absolute[i, 6] = state.car_footprint.length
+            absolute[i, 7] = 1  # is vehicle
 
         anchor = np.array([
             current_ego_state.rear_axle.x,
@@ -545,10 +547,10 @@ class WorldModelAgents(AbstractMLAgents):
             current_ego_state.rear_axle.heading,
         ],
                           dtype=np.float32)  # shape (3,)
-
+        # TODO: 얘가 zero padding을 잘 해주는지, 코드 전체적으로 확인 필요
         relative: np.ndarray = convert_absolute_quantities_to_relative(
             absolute, anchor, 'ego')  # shape (T, 11)
-        assert (future_len__plus_1, 11) == relative.shape
+        relative[future_len__plus_1:, :] = 0.0
         return relative.astype(np.float32)
 
     def set_vis_features(self, is_vis_features: bool, vis_features_path: str):
@@ -580,6 +582,7 @@ class WorldModelAgents(AbstractMLAgents):
 
         ego_agent_future_11_dim = None
         if ego_future_trajectory is not None:
+            # ego_agent_future_11_dim: (17, 11) 차원이 나왔네?
             ego_agent_future_11_dim = self._preprocess_ego_future_traj(
                 ego_future_trajectory, self._ego_anchor_state)
 
