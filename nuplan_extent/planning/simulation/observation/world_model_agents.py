@@ -3,7 +3,7 @@ import numpy as np
 import numpy.typing as npt
 import draw_machine
 from nuplan.common.actor_state.dynamic_car_state import get_velocity_shifted
-from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
+from nuplan_extent.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
 from nuplan.common.actor_state.car_footprint import CarFootprint
 from nuplan.common.actor_state.state_representation import StateSE2, StateVector2D, TimePoint
@@ -67,9 +67,9 @@ def observations_to_agents_buffer(
     return vehicles_buffer
 
 
-def build_current_ego_state_buffer(
+def get_token_to_history(
         vehicles_buffer: Deque[List[Agent]],
-        iteration: SimulationIteration) -> Dict[str, Deque[EgoState]]:
+        iteration: SimulationIteration) -> Dict[str, Deque[Agent]]:
     """현재 시점에 존재하는 Agent들의 과거 기록을 생성한다.
 
     버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
@@ -121,58 +121,12 @@ def build_current_ego_state_buffer(
         # 만약 history 의 첫 원소가 None이면, 제거한다.
         if history[0] is None:
             history.popleft()
-        converted = deque((agent_to_ego_state(agent) for agent in history),
+        converted = deque((agent for agent in history),
                           maxlen=history.maxlen)
         token_to_history[token] = converted
     return token_to_history
 
 
-def agent_to_ego_state(
-    agent: Agent,
-    tire_steering_angle: float = 0.0,
-    is_in_auto_mode: bool = False,
-) -> EgoState:
-    """Agent 인스턴스를 EgoState로 변환합니다.
-
-    Args:
-        agent (Agent): CarFootprint 정보를 포함한 에이전트.
-        tire_steering_angle (float): 타이어 조향각 [rad]. 기본값은 0.0.
-        is_in_auto_mode (bool): 자율 주행 모드 여부. 기본값은 False.
-
-    Returns:
-        EgoState: 생성된 EgoState 인스턴스.
-
-    Raises:
-        TypeError: ``agent.box``가 ``CarFootprint``가 아닌 경우.
-
-    중요
-        - 결국 아래 값들만 제대로 넣어서 전달하면됨
-            - time_point
-            - car_footprint
-                - rear_axle
-    """
-
-    if not isinstance(agent.box, CarFootprint):
-        raise TypeError(f"agent.box는 CarFootprint 타입이어야 합니다. 받은 타입: {type(agent.box)}")
-    ######## TODO
-    car_footprint: CarFootprint = agent.box
-    vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
-    rear_axle_velocity = StateVector2D(0.0, 0.0)
-
-    rear_axle_acceleration = StateVector2D(0.0, 0.0)
-    dynamic_car_state = DynamicCarState.build_from_rear_axle(
-        rear_axle_to_center_dist=vehicle_params.rear_axle_to_center,
-        rear_axle_velocity_2d=rear_axle_velocity,
-        rear_axle_acceleration_2d=rear_axle_acceleration,
-    )
-
-    return EgoState(
-        car_footprint=car_footprint,
-        dynamic_car_state=dynamic_car_state,
-        tire_steering_angle=tire_steering_angle,
-        is_in_auto_mode=is_in_auto_mode,
-        time_point=TimePoint(agent.metadata.timestamp_us),
-    )
 
 
 def rotation_matrix(theta: float) -> np.ndarray:
@@ -698,14 +652,14 @@ class WorldModelAgents(AbstractMLAgents):
         return token_to_rear_wheelbase
 
     def outputs_to_trajectory(
-            self, future_traj_wrt_npc_rear: np.ndarray,
-            ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
-        heading = np.arctan2(future_traj_wrt_npc_rear[:, 3],
-                             future_traj_wrt_npc_rear[:, 2])[..., None]
-        future_traj_wrt_npc_rear = np.concatenate(
-            [future_traj_wrt_npc_rear[..., :2], heading], axis=-1)
+            self, future_traj_wrt_npc_center: np.ndarray,
+            ego_state_history: Deque[Agent]) -> List[InterpolatableState]:
+        heading = np.arctan2(future_traj_wrt_npc_center[:, 3],
+                             future_traj_wrt_npc_center[:, 2])[..., None]
+        future_traj_wrt_npc_center = np.concatenate(
+            [future_traj_wrt_npc_center[..., :2], heading], axis=-1)
 
-        states = transform_predictions_to_states(future_traj_wrt_npc_rear,
+        states = transform_predictions_to_states(future_traj_wrt_npc_center,
                                                  ego_state_history,
                                                  self._future_horizon,
                                                  self._step_interval)
@@ -727,24 +681,21 @@ class WorldModelAgents(AbstractMLAgents):
                                         dtype=float)  # shape: (2,)
         return position, rear_axle.heading,
 
-    def get_rear_axle_poses(self,
+    def get_npc_center_poses(self,
                             current_agent: Agent) -> Tuple[np.ndarray, float]:
-        """각 차량의 뒷축 위치와 방향을 계산한다.
+        """각 차량의 중앙 위치와 방향을 계산한다.
 
         Returns:
-            Tuple[np.ndarray, float]: shape (2,), 차량 뒷축 [x, y]와 방향 yaw_rad.
+            Tuple[np.ndarray, float]: shape (2,), 차량 중앙 [x, y]와 방향 yaw_rad.
 
-        """
-        box = current_agent.box
-        assert isinstance(box, CarFootprint)
-        rear_axle = box.rear_axle
+        """# .center.x
         position: np.ndarray = np.array([
-            rear_axle.x,
-            rear_axle.y,
+            current_agent.center.x,
+            current_agent.center.y,
         ],
                                         dtype=float)  # shape: (2,)
 
-        return position, rear_axle.heading
+        return position, current_agent.center.heading
 
     def infer_model(
             self, features: Dict[str, AbstractModelFeature],
@@ -772,7 +723,7 @@ class WorldModelAgents(AbstractMLAgents):
         vehicles_buffer: Deque[List[Agent]] = observations_to_agents_buffer(
             self.observation_buffer) # self.observation_buffer: Deque[Observation]
         token_to_history: Dict[
-            str, Deque[EgoState]] = build_current_ego_state_buffer(
+            str, Deque[Agent]] = get_token_to_history(
                 vehicles_buffer, iteration)
         current_agents: List[
             Agent] = self.current_observation.tracked_objects.get_agents()
@@ -783,8 +734,6 @@ class WorldModelAgents(AbstractMLAgents):
             if agent.track_token is not None
         }  # shape (M,)
 
-        token_to_rear_wheelbase: Dict[str, float] = self.get_rear_wheelbases(
-            current_token_to_agent, self.diffusion_agents_track_tokens)
         ego_rear_axle_xy, ego_yaw = self.get_rear_axle_pose(
             self._ego_anchor_state)
         token_to_interpol_traj: Dict[str, AbstractTrajectory] = {}
@@ -794,18 +743,15 @@ class WorldModelAgents(AbstractMLAgents):
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
             if np.allclose(future_traj_wrt_ego, 0.0):
                 raise ValueError("future_traj_wrt_ego 값이 전부 0. 입니다.")
-            rear_wheelbase: float = token_to_rear_wheelbase[token]
-            future_traj_wrt_ego = convert_center_to_rear_axle(
-                future_traj_wrt_ego, rear_wheelbase)  # (T, 4)
             # ego 뒷축 좌표계 → vehicle 뒷축 좌표계 로 일괄 변환
-            agent_rear_axle_xy, agent_yaw = self.get_rear_axle_poses(
+            agent_center_xy, agent_yaw = self.get_npc_center_poses(
                 current_token_to_agent[token])
-            future_traj_wrt_npc_rear = transform_trajectory(
+            future_traj_wrt_npc_center = transform_trajectory(
                 future_traj_wrt_ego, ego_rear_axle_xy, ego_yaw,
-                agent_rear_axle_xy, agent_yaw)  # (T, 4)
-            self_history: Deque[EgoState] = token_to_history[token]
+                agent_center_xy, agent_yaw)  # (T, 4)
+            self_history: Deque[Agent] = token_to_history[token]
             future_trajectory = InterpolatedTrajectory(
-                trajectory=self.outputs_to_trajectory(future_traj_wrt_npc_rear,
+                trajectory=self.outputs_to_trajectory(future_traj_wrt_npc_center,
                                                       self_history))
             token_to_interpol_traj[token] = future_trajectory
 
