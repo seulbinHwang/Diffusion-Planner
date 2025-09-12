@@ -36,7 +36,7 @@ from nuplan.common.actor_state.dynamic_car_state import DynamicCarState
 from nuplan.planning.simulation.observation.observation_type import Observation
 from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 from nuplan.planning.training.modeling.types import FeaturesType, TargetsType
-
+from nuplan.common.actor_state.waypoint import Waypoint
 
 def observations_to_agents_buffer(
         observations_buffer: Deque[Observation]) -> Deque[List[Agent]]:
@@ -759,20 +759,6 @@ class WorldModelAgents(AbstractMLAgents):
         # 진짜 존재하는 대상만
         for agent_token, interpol_traj in token_to_interpol_traj.items():
             agent_ = self._diffusion_agents[agent_token]
-            # EgoState의 속도는 자차 좌표계 기준 벡터
-            new_state: EgoState = interpol_traj.get_state_at_time(
-                next_iteration.time_point)
-            # Agent의 속도는 글로벌 좌표계 기준 벡터이므로, 자차 좌표계 -> 글로벌 좌표계로의 변환이 필요하다.
-            v_local = new_state.dynamic_car_state.center_velocity_2d
-            he = float(new_state.center.heading)
-            c, s = np.cos(he), np.sin(he)
-            vx_w = c * float(v_local.x) - s * float(v_local.y)
-            vy_w = s * float(v_local.x) + c * float(v_local.y)
-
-            # v_global = numpy_array_to_absolute_velocity(
-            #     new_state.center,
-            #     np.array([[v_local.x, v_local.y]], dtype=np.float32))[0]
-            # TODO: new_timestamp_us 를 이렇게 주는게 맞는지 확인 필요
             new_timestamp_us = next_iteration.time_point.time_us
             new_metadata = SceneObjectMetadata(new_timestamp_us,
                                                agent_.metadata.token,
@@ -780,10 +766,17 @@ class WorldModelAgents(AbstractMLAgents):
                                                agent_.metadata.track_token,
                                                agent_.metadata.category_name)
 
+
+            # EgoState의 속도는 자차 좌표계 기준 벡터
+            new_waypoint: Waypoint = interpol_traj.get_state_at_time(
+                next_iteration.time_point)
+
+            # TODO: new_timestamp_us 를 이렇게 주는게 맞는지 확인 필요
+
             new_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,
-                oriented_box=new_state.car_footprint,
-                velocity=StateVector2D(vx_w, vy_w),
+                oriented_box=new_waypoint.oriented_box,
+                velocity=new_waypoint.velocity,
                 metadata=new_metadata,
             )
             new_agent.predictions = [

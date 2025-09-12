@@ -1295,18 +1295,63 @@ def vector_set_coordinates_to_local_frame(
 # =====================
 # 3. Numpy-Tensor transformation
 # =====================
-def convert_to_model_inputs(data, device, squeeze):
-    tensor_data = {}
-    for k, v in data.items():
-        if isinstance(v, np.ndarray) and v.dtype == np.bool_:
-            a = torch.tensor(v, dtype=torch.bool).to(device)
-            if not squeeze:
-                a = a.unsqueeze(0)
-            tensor_data[k] = a
-        else:
-            b = torch.tensor(v, dtype=torch.float32).to(device)
-            if not squeeze:
-                b = b.unsqueeze(0)
-            tensor_data[k] = b
+from typing import Any, Dict, Mapping, Union
+import numpy as np
+import torch
 
-    return tensor_data
+
+def convert_to_model_inputs(
+        data: Mapping[str, Any],
+        device: Union[torch.device, str],
+        squeeze: bool
+) -> Dict[str, torch.Tensor]:
+    """
+    딕셔너리 값을 torch.Tensor로 변환합니다.
+
+    규칙
+    - bool 계열은 torch.bool 유지
+    - 그 외 수치형은 torch.float32로 캐스팅
+    - squeeze=False 이면 배치 차원(앞쪽) 1을 추가
+
+    Args:
+        data: {키: 값} 형태. 값은 torch.Tensor / np.ndarray / 파이썬 스칼라/리스트 모두 허용
+        device: 배치 후 올릴 디바이스 (예: "cuda:0", torch.device("cpu"))
+        squeeze: False면 앞쪽에 차원 하나 unsqueeze(0)
+
+    Returns:
+        키별 torch.Tensor 딕셔너리
+    """
+    out: Dict[str, torch.Tensor] = {}
+
+    for k, v in data.items():
+        # 1) 이미 Tensor인 경우: 재생성 하지 말고 .to(...) 만
+        if isinstance(v, torch.Tensor):
+            target_dtype = torch.bool if v.dtype == torch.bool else torch.float32
+            t = v.to(device=device, dtype=target_dtype, non_blocking=True)
+
+        # 2) Numpy 배열인 경우: 복사 최소화를 위해 from_numpy/as_tensor 사용
+        elif isinstance(v, np.ndarray):
+            if v.dtype == np.bool_:
+                # bool은 dtype 보존 -> 이후 device로만 이동
+                t = torch.from_numpy(v).to(device=device, non_blocking=True)
+                if t.dtype != torch.bool:
+                    t = t.to(dtype=torch.bool)
+            else:
+                # 수치형은 float32로
+                t = torch.from_numpy(v).to(device=device, dtype=torch.float32,
+                                           non_blocking=True)
+
+        # 3) 파이썬 bool 스칼라
+        elif isinstance(v, (bool, np.bool_)):
+            t = torch.tensor(v, dtype=torch.bool, device=device)
+
+        # 4) 나머지(리스트/스칼라 등): as_tensor로 한 번에
+        else:
+            t = torch.as_tensor(v, dtype=torch.float32, device=device)
+
+        if not squeeze:
+            t = t.unsqueeze(0)
+
+        out[k] = t
+
+    return out
