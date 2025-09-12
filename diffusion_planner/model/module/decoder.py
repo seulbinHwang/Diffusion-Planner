@@ -14,9 +14,11 @@ from diffusion_planner.loss import _require_finite
 
 from typing import Tuple, Optional
 
+
 def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """ref 텐서의 dtype/device로 x를 캐스팅합니다."""
     return x.to(dtype=ref.dtype, device=ref.device)
+
 
 class Decoder(nn.Module):
 
@@ -166,7 +168,8 @@ class Decoder(nn.Module):
         #         1]  # [B, Pnn, H]
 
         # Extract ego & neighbor current states
-        near_current = inputs["neighbor_agents_past"][:, :self._predicted_neighbor_num,
+        near_current = inputs["neighbor_agents_past"][:, :self.
+                                                      _predicted_neighbor_num,
                                                       -1, :4]  # [B, pnn, 4]
         near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
                                       dim=-1) == 0  # [B, pnn]
@@ -179,10 +182,12 @@ class Decoder(nn.Module):
         # === [FIX] cond_last_pos_norm가 없을 때도 안전하게 처리 ===
         if "cond_last_pos_norm" in inputs:
             # 길이(pnn_dyn)에 맞춰 잘라서 정합 보장
-            cond_last_pos_norm = inputs["cond_last_pos_norm"]#[:, :Pnn, :]  # [B, Pnn, 4]
+            cond_last_pos_norm = inputs[
+                "cond_last_pos_norm"]  #[:, :Pnn, :]  # [B, Pnn, 4]
         else:
             # NaN으로 채워서 'isfinite' 검사에 의해 자동 미적용되게 만든다.
-            cond_last_pos_norm = near_current.new_full((B, Pnn, 4), float('nan'))
+            cond_last_pos_norm = near_current.new_full((B, Pnn, 4),
+                                                       float('nan'))
 
         # ★ FIX: 이후 모든 사용을 안전하게 만들기 위해 dtype/device를 near_current에 정렬
         cond_last_pos_norm = _cast_like(cond_last_pos_norm, near_current)
@@ -224,14 +229,14 @@ class Decoder(nn.Module):
         else:
             # === Inference ===
             # ★ FIX: 랜덤 초기 x_T를 near_current와 동일 dtype/device로 생성
-            noise = near_current.new_empty((B, Pnn, self._future_len, 4)).normal_(mean=0.0, std=0.5)
+            noise = near_current.new_empty(
+                (B, Pnn, self._future_len, 4)).normal_(mean=0.0, std=0.5)
             xT = torch.cat(
                 [
                     near_current[:, :, None, :],  # (B, Pnn, 1, 4)
-                    noise                         # (B, Pnn, T, 4)
+                    noise  # (B, Pnn, T, 4)
                 ],
-                dim=2
-            ).reshape(B, Pnn, -1)  # (B, Pnn, (1+T)*4)
+                dim=2).reshape(B, Pnn, -1)  # (B, Pnn, (1+T)*4)
 
             # cond_last_pos_norm: [B, Pnn, 4] (이미 near_current와 dtype/device 일치)
             cond_last_pos = None
@@ -239,9 +244,13 @@ class Decoder(nn.Module):
                 cond_last_pos = cond_last_pos_norm
 
             if cond_last_pos is not None:
-                cond_last_mask = torch.isfinite(cond_last_pos).all(dim=-1)  # [B, Pnn]
+                cond_last_mask = torch.isfinite(cond_last_pos).all(
+                    dim=-1)  # [B, Pnn]
             else:
-                cond_last_mask = torch.zeros(B, Pnn, dtype=torch.bool, device=xT.device)
+                cond_last_mask = torch.zeros(B,
+                                             Pnn,
+                                             dtype=torch.bool,
+                                             device=xT.device)
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
@@ -456,13 +465,13 @@ class DiT(nn.Module):
     # =====================[ 추가 2/3 ]=====================
     @staticmethod
     def _pad_to_batch(
-            y_unpad: torch.Tensor,  # (T, D_out)
-            indices: torch.Tensor,  # (T,)
-            B: int,
-            L: int,
-            D: int,
-            device: torch.device,
-            dtype: Optional[torch.dtype] = None,
+        y_unpad: torch.Tensor,  # (T, D_out)
+        indices: torch.Tensor,  # (T,)
+        B: int,
+        L: int,
+        D: int,
+        device: torch.device,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         """언패드 결과를 원래 배치 shape으로 복원합니다.
         dtype이 주어지지 않으면 소스(y_unpad)의 dtype을 따릅니다.

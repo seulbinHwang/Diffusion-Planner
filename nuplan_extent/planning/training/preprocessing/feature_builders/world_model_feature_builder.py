@@ -15,6 +15,7 @@ from nuplan_extent.planning.training.preprocessing.features.world_model import W
 from diffusion_planner.utils.config import Config
 from diffusion_planner.data_process.data_processor import DataProcessor
 from diffusion_planner.data_process.utils import convert_to_model_inputs
+from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 
 class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
@@ -40,7 +41,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     def get_features_from_simulation(
             self, current_input: PlannerInput,
             initialization: HorizonPlannerInitialization) -> WorldModelFeature:
-        history_buffer = current_input.history
+        history_buffer: SimulationHistoryBuffer = current_input.history
         traffic_light_data = list(current_input.traffic_light_data)
         model_inputs: Dict[
             str, torch.Tensor] = self.data_processor.observation_adapter(
@@ -57,7 +58,9 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         model_inputs[
             "ego_future_gt_11_dim"] = current_input.ego_agent_future_11_dim
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model_inputs = convert_to_model_inputs(model_inputs, device, squeeze=True)
+        model_inputs = convert_to_model_inputs(model_inputs,
+                                               device,
+                                               squeeze=True)
         self.unnormalized_features = model_inputs.copy()
         for key in self.unnormalized_features:
             # torch -> numpy

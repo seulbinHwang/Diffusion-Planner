@@ -10,33 +10,28 @@ try:
     try:
         # 일부 버전(옛 코드) 표기
         from flash_attn.flash_attn_interface import (
-            flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
-        )
+            flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func)
     except ImportError:
         # flash-attn 2.8.x의 정식 이름
         from flash_attn.flash_attn_interface import (
-            flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
-        )
+            flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func)
     _FA2_AVAILABLE = True
     _FA2_IMPORT_ERR = None
 except Exception as _e1:
     try:
         from flash_attn import flash_attn_varlen_qkvpacked_func
         try:
-            from flash_attn import (
-                flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
-            )
+            from flash_attn import (flash_attn_varlen_q_kvpacked_func as
+                                    flash_attn_varlen_cross_func)
         except ImportError:
-            from flash_attn import (
-                flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
-            )
+            from flash_attn import (flash_attn_varlen_kvpacked_func as
+                                    flash_attn_varlen_cross_func)
         _FA2_AVAILABLE = True
         _FA2_IMPORT_ERR = None
     except Exception as _e2:
         _FA2_AVAILABLE = False
         _FA2_IMPORT_ERR = Exception(
-            f"interface import err: {_e1}; top-level err: {_e2}"
-        )
+            f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
 # ===========================================================
 
@@ -418,9 +413,9 @@ class DiTBlock(nn.Module):
 
         # (2) Q / KV 프로젝션 (유효 토큰만)
         q = self.q_proj_cross(q_unpad).reshape(Tq, self.num_heads,
-                                            self.head_dim)  # (Tq, H, Hd)
-        kv = self.kv_proj_cross(kv_unpad).reshape(Tk, 2, self.num_heads,
-                                               self.head_dim)  # (Tk, 2, H, Hd)
+                                               self.head_dim)  # (Tq, H, Hd)
+        kv = self.kv_proj_cross(kv_unpad).reshape(
+            Tk, 2, self.num_heads, self.head_dim)  # (Tk, 2, H, Hd)
         comp_dtype = self._get_compute_dtype(q)
         q = q.to(comp_dtype)
         kv = kv.to(comp_dtype)
@@ -529,15 +524,14 @@ class DiTBlock(nn.Module):
         alpha_msa = self.route_msa_alpha.to(dtype=shift_msa.dtype)
         alpha_mlp = self.route_mlp_alpha.to(dtype=shift_mlp.dtype)
 
-
         # (B, D) → (B, 1, D) 승격 후 (B, P, D) 잔차와 합
         shift_msa_pa = shift_msa.unsqueeze(1) + alpha_msa * d_shift_msa
         scale_msa_pa = scale_msa.unsqueeze(1) + alpha_msa * d_scale_msa
-        gate_msa_pa  = gate_msa.unsqueeze(1)  + alpha_msa * d_gate_msa
+        gate_msa_pa = gate_msa.unsqueeze(1) + alpha_msa * d_gate_msa
 
         shift_mlp_pa = shift_mlp.unsqueeze(1) + alpha_mlp * d_shift_mlp
         scale_mlp_pa = scale_mlp.unsqueeze(1) + alpha_mlp * d_scale_mlp
-        gate_mlp_pa  = gate_mlp.unsqueeze(1)  + alpha_mlp * d_gate_mlp
+        gate_mlp_pa = gate_mlp.unsqueeze(1) + alpha_mlp * d_gate_mlp
 
         return shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa, gate_mlp_pa
 
@@ -629,7 +623,6 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp2 * self.mlp2(self.norm4(x))
         x = x.masked_fill(attn_mask.unsqueeze(-1), 0.0)
         return x
-
 
 
 class FinalLayer(nn.Module):

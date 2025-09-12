@@ -307,8 +307,8 @@ class DataProcessor(object):
         (all_frame_agents_feature, all_frame_agents_types
         ) = sampled_tracked_objects_to_array_list(observation_buffer)
 
-        # present_static_feature: np.ndarray, (len(static_obj), 5)
-        # static_objects_types: List[TrackedObjectType]
+        # present_static_feature : np.ndarray, (len(static_obj), 5)
+        # static_objects_types : List[TrackedObjectType]
         (present_static_feature,
          static_objects_types) = sampled_static_objects_to_array_list(
              observation_buffer[-1])

@@ -11,33 +11,28 @@ try:
     try:
         # 일부 버전(옛 코드) 표기
         from flash_attn.flash_attn_interface import (
-            flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
-        )
+            flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func)
     except ImportError:
         # flash-attn 2.8.x의 정식 이름
         from flash_attn.flash_attn_interface import (
-            flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
-        )
+            flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func)
     _FA2_AVAILABLE = True
     _FA2_IMPORT_ERR = None
 except Exception as _e1:
     try:
         from flash_attn import flash_attn_varlen_qkvpacked_func
         try:
-            from flash_attn import (
-                flash_attn_varlen_q_kvpacked_func as flash_attn_varlen_cross_func
-            )
+            from flash_attn import (flash_attn_varlen_q_kvpacked_func as
+                                    flash_attn_varlen_cross_func)
         except ImportError:
-            from flash_attn import (
-                flash_attn_varlen_kvpacked_func as flash_attn_varlen_cross_func
-            )
+            from flash_attn import (flash_attn_varlen_kvpacked_func as
+                                    flash_attn_varlen_cross_func)
         _FA2_AVAILABLE = True
         _FA2_IMPORT_ERR = None
     except Exception as _e2:
         _FA2_AVAILABLE = False
         _FA2_IMPORT_ERR = Exception(
-            f"interface import err: {_e1}; top-level err: {_e2}"
-        )
+            f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
 # ===========================================================
 
@@ -262,7 +257,8 @@ class NearAgentsRouteLaneEncoder(nn.Module):
         """
         assert route_lanes.dim() == 4 and route_lane_pos.dim() == 4, \
             f"route_lanes {route_lanes.shape}, route_lane_pos {route_lane_pos.shape}"
-        assert route_lanes_mask.dim() == 3, f"route_lanes_mask {route_lanes_mask.shape}"
+        assert route_lanes_mask.dim(
+        ) == 3, f"route_lanes_mask {route_lanes_mask.shape}"
         B, Pnn, route_num, hidden_dim = route_lanes.shape  # B:배치, Pnn:에이전트 수, route_num:R, hidden_dim:H
         # route_lane_pos.shape[:3] == (B,Pnn,R) 확인
         assert route_lane_pos.shape[:3] == (B, Pnn,
@@ -757,7 +753,8 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
                                                lane_pos.shape[-1])
         # 인덱스 확장
         gather_idx_H = idx.unsqueeze(-1).expand(B, order_long.shape[1],
-                                                route_num, H)  # (B,Pnn,route_num,H)
+                                                route_num,
+                                                H)  # (B,Pnn,route_num,H)
         gather_idx_pos = idx.unsqueeze(-1).expand(
             B, order_long.shape[1], route_num,
             lane_pos.shape[-1])  # (B,Pnn,route_num,Dpos)
@@ -803,7 +800,10 @@ class SelfAttentionBlock(nn.Module):
         # 원본의 self.attn(nn.MultiheadAttention)은 폴백 경로에서만 사용
         self.use_fallback_mha = not _FA2_AVAILABLE
         if self.use_fallback_mha:
-            self.attn = nn.MultiheadAttention(dim, heads, attn_drop_p, batch_first=True)
+            self.attn = nn.MultiheadAttention(dim,
+                                              heads,
+                                              attn_drop_p,
+                                              batch_first=True)
         else:
             self.attn = None
         self.attn_out_drop = nn.Dropout(attn_drop_p)
@@ -905,11 +905,13 @@ class SelfAttentionBlock(nn.Module):
 
     @staticmethod
     def _pad_to_batch(
-            y_unpad: torch.Tensor,
-            indices: torch.Tensor,
-            B: int, L: int, D: int,
-            device: torch.device,
-            dtype: Optional[torch.dtype] = None,
+        y_unpad: torch.Tensor,
+        indices: torch.Tensor,
+        B: int,
+        L: int,
+        D: int,
+        device: torch.device,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         if dtype is None:
             dtype = y_unpad.dtype
@@ -2412,8 +2414,8 @@ class StaticFusionEncoder(nn.Module):
         static_feature = self._get_static_feature(static_xyyaw)
         # [FIX] 오토캐스트 환경이면 버퍼 dtype을 현재 GPU autocast dtype으로
         out_dtype = (torch.get_autocast_gpu_dtype()
-                     if torch.is_autocast_enabled() and static_info.is_cuda
-                     else static_info.dtype)
+                     if torch.is_autocast_enabled() and static_info.is_cuda else
+                     static_info.dtype)
         static_encoding = torch.zeros(
             (B * static_objects_num, self._hidden_dim),
             device=static_info.device,
@@ -2428,7 +2430,8 @@ class StaticFusionEncoder(nn.Module):
             static_info = static_info.reshape(B * static_objects_num, -1)
             static_info = static_info[valid_indices]
             static_info = self.projection(static_info)
-            static_info = static_info.to(dtype=static_encoding.dtype)  # [FIX] 좌변 dtype 일치화
+            static_info = static_info.to(
+                dtype=static_encoding.dtype)  # [FIX] 좌변 dtype 일치화
             static_encoding[valid_indices] = static_info
         static_encoding = static_encoding.reshape(
             B, static_objects_num, -1)  # (B, static_objects_num, hidden_dim)
@@ -2678,7 +2681,8 @@ class FusionEncoder(nn.Module):
             on_B: int = on_batch_tokens.size(0)
 
             # 3) CLS 부착 및 CLS 위치 임베딩 추가
-            cls_tokens = self.cls_token.expand(on_B, 1, H).to(on_batch_tokens.dtype)  # [on_B, 1, H]
+            cls_tokens = self.cls_token.expand(on_B, 1, H).to(
+                on_batch_tokens.dtype)  # [on_B, 1, H]
             cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens],
                                         dim=1)  # [on_B, token_num+1, H]
             cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
@@ -2707,7 +2711,8 @@ class FusionEncoder(nn.Module):
 
             # 6) CLS 제거 후 원래 배치 위치에 복원
             fused_wo_cls = cls_with_tokens[:, 1:, :]  # [on_B, token_num, H]
-            out_tokens[is_valid_batch] = fused_wo_cls.to(out_tokens.dtype)  # [B, token_num, H]
+            out_tokens[is_valid_batch] = fused_wo_cls.to(
+                out_tokens.dtype)  # [B, token_num, H]
 
         # 전부 패딩 배치는 out_tokens의 0 유지
         # out_tokens [B, token_num, H]

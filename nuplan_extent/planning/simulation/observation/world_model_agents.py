@@ -90,7 +90,7 @@ def build_current_ego_state_buffer(
         return {}
     # only for car.
     current_vehicles: List[Agent] = [agent for agent in vehicles_buffer[-1]]
-    current_token_to_idx = {
+    current_token_to_idx: Dict[str, int] = {
         agent.track_token: idx for idx, agent in enumerate(current_vehicles)
     }
     token_to_history: Dict[str, Deque] = {
@@ -107,7 +107,7 @@ def build_current_ego_state_buffer(
     for past_vehicles in reversed(list(vehicles_buffer)[:-1]):
         # 가장 최근 -> 가장 오래된 순서로 과거 시점 상태 추가
         past_agent_lookup: Dict[str, Agent] = {
-            agent.track_token: agent for agent in past_vehicles
+            past_agent.track_token: past_agent for past_agent in past_vehicles
         }
         for current_token in current_token_to_idx.keys():
             agent_history: Deque[Agent] = token_to_history[current_token]
@@ -153,7 +153,7 @@ def agent_to_ego_state(
     """
 
     if not isinstance(agent.box, CarFootprint):
-        raise TypeError("agent.box는 CarFootprint 타입이어야 합니다.")
+        raise TypeError(f"agent.box는 CarFootprint 타입이어야 합니다. 받은 타입: {type(agent.box)}")
     ######## TODO
     car_footprint: CarFootprint = agent.box
     vehicle_params: VehicleParameters = car_footprint.vehicle_parameters
@@ -509,18 +509,16 @@ class WorldModelAgents(AbstractMLAgents):
             current_ego_state (EgoState): 기준이 되는 현재 ego 상태.
 
         Returns:
-            npt.NDArray[np.float64]: (T, 11) 모양의 배열. 열 구성은
+            npt.NDArray[np.float64]: (config.future_len, 11) 모양의 배열. 열 구성은
             [x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy,
             width, length, 1, 0, 0] 이다.
         """
 
-
         future_states: List[EgoState] = list(
             ego_future_trajectory.get_sampled_trajectory())
-        future_len__plus_1 = len(future_states)
+        future_len_plus_1 = len(future_states)
         absolute: npt.NDArray[np.float64] = np.zeros(
             (self.config.future_len, 10), dtype=np.float64)  # shape (T, 7)
-
 
         for i, state in enumerate(future_states):
             absolute[i, 0] = state.center.x
@@ -547,10 +545,9 @@ class WorldModelAgents(AbstractMLAgents):
             current_ego_state.rear_axle.heading,
         ],
                           dtype=np.float32)  # shape (3,)
-        # TODO: 얘가 zero padding을 잘 해주는지, 코드 전체적으로 확인 필요
         relative: np.ndarray = convert_absolute_quantities_to_relative(
             absolute, anchor, 'ego')  # shape (T, 11)
-        relative[future_len__plus_1:, :] = 0.0
+        relative[future_len_plus_1:, :] = 0.0
         return relative.astype(np.float32)
 
     def set_vis_features(self, is_vis_features: bool, vis_features_path: str):
@@ -582,7 +579,7 @@ class WorldModelAgents(AbstractMLAgents):
 
         ego_agent_future_11_dim = None
         if ego_future_trajectory is not None:
-            # ego_agent_future_11_dim: (17, 11) 차원이 나왔네?
+            # (config.future_len, 11)
             ego_agent_future_11_dim = self._preprocess_ego_future_traj(
                 ego_future_trajectory, self._ego_anchor_state)
 
@@ -613,7 +610,7 @@ class WorldModelAgents(AbstractMLAgents):
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
         # Infer model
-
+        # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         token_to_future_traj_wrt_ego = self.infer_model(features, iteration,
                                                         next_iteration)
         world_model_feature: Dict[
@@ -641,6 +638,9 @@ class WorldModelAgents(AbstractMLAgents):
         self._ego_anchor_state, self.current_observation = history.current_state
         self.current_iteration: int = next_iteration.index
         self.step_time_point: TimePoint = next_iteration.time_point - iteration.time_point
+        # world_model_feature: Dict[str, np.ndarray]
+        # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
+
         (world_model_feature, token_to_future_traj_wrt_ego
         ) = self._update_diffusion_agents_observation(iteration, next_iteration,
                                                       history, next_ego_state,
@@ -758,16 +758,19 @@ class WorldModelAgents(AbstractMLAgents):
         self.diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
 
-        token_to_future_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        # 진짜 존재하는 대상만
+        token_to_future_traj_wrt_ego: Dict[str, np.ndarray] = {} # (T, 4)
         near_number = near_future_tarjs_wrt_ego.shape[0]
         assert near_number == self.predicted_neighbor_num
-        assert near_number <= len(self.diffusion_agents_track_tokens)
+
+
+        # 진짜 존재하는 대상만
         for idx, token in enumerate(self.diffusion_agents_track_tokens):
             token_to_future_traj_wrt_ego[token] = near_future_tarjs_wrt_ego[idx]
 
         # Deque[EgoState]
         vehicles_buffer: Deque[List[Agent]] = observations_to_agents_buffer(
-            self.observation_buffer)
+            self.observation_buffer) # self.observation_buffer: Deque[Observation]
         token_to_history: Dict[
             str, Deque[EgoState]] = build_current_ego_state_buffer(
                 vehicles_buffer, iteration)
@@ -785,13 +788,13 @@ class WorldModelAgents(AbstractMLAgents):
         ego_rear_axle_xy, ego_yaw = self.get_rear_axle_pose(
             self._ego_anchor_state)
         token_to_interpol_traj: Dict[str, AbstractTrajectory] = {}
-        # (Pnn)
+        # 진짜 존재하는 대상만
         for token, future_traj_wrt_ego in token_to_future_traj_wrt_ego.items():
             # future_traj_wrt_ego: (T, 4)
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
             if np.allclose(future_traj_wrt_ego, 0.0):
-                continue
-            rear_wheelbase = token_to_rear_wheelbase[token]
+                raise ValueError("future_traj_wrt_ego 값이 전부 0. 입니다.")
+            rear_wheelbase: float = token_to_rear_wheelbase[token]
             future_traj_wrt_ego = convert_center_to_rear_axle(
                 future_traj_wrt_ego, rear_wheelbase)  # (T, 4)
             # ego 뒷축 좌표계 → vehicle 뒷축 좌표계 로 일괄 변환
@@ -806,7 +809,8 @@ class WorldModelAgents(AbstractMLAgents):
                                                       self_history))
             token_to_interpol_traj[token] = future_trajectory
 
-        new_agents = {}
+        token_to_new_agent: Dict[str, Agent] = {}
+        # 진짜 존재하는 대상만
         for agent_token, interpol_traj in token_to_interpol_traj.items():
             agent_ = self._diffusion_agents[agent_token]
             # EgoState의 속도는 자차 좌표계 기준 벡터
@@ -841,9 +845,9 @@ class WorldModelAgents(AbstractMLAgents):
                     probability=1.,
                     waypoints=interpol_traj.get_sampled_trajectory())
             ]
-            new_agents[agent_token] = new_agent
+            token_to_new_agent[agent_token] = new_agent
 
-        self._diffusion_agents = new_agents
+        self._diffusion_agents = token_to_new_agent
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         return token_to_future_traj_wrt_ego
 
