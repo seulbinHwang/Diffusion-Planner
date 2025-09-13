@@ -17,6 +17,7 @@ from diffusion_planner.data_process.data_processor import DataProcessor
 from diffusion_planner.data_process.utils import convert_to_model_inputs
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 
+
 class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
     def __init__(self, config: Config) -> None:
@@ -52,11 +53,15 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 scenario=initialization.scenario,
                 squeeze=True)
         # (interpol_num, 11)
+
         model_inputs[
             "ego_agent_next_11_dim"] = current_input.ego_agent_next_11_dim
         # (future_len, 11)
         model_inputs[
             "ego_future_gt_11_dim"] = current_input.ego_agent_future_11_dim
+        # # List[Optional[str]], (agent_num,)
+        neighbor_track_token = model_inputs["neighbor_track_token"]
+        model_inputs.pop("neighbor_track_token")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model_inputs = convert_to_model_inputs(model_inputs,
                                                device,
@@ -66,6 +71,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             # torch -> numpy
             self.unnormalized_features[key] = self.unnormalized_features[
                 key].cpu().numpy()
+        self.unnormalized_features[
+            "neighbor_track_token"] = neighbor_track_token
 
         model_inputs = self.observation_normalizer(model_inputs)
         """

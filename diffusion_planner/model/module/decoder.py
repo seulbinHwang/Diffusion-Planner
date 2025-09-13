@@ -311,7 +311,7 @@ class Decoder(nn.Module):
             assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
             x0 = self._state_normalizer.inverse(x0.reshape(
                 B, Pnn, -1, 4))  # (B, Pnn, 1 + T, 4)
-            x0 = x0[:, :, 1:]  # (B, Pnn, T, 4)
+            # x0 = x0[:, :, 1:]  # (B, Pnn, T, 4)
 
             return {"prediction": x0}
 

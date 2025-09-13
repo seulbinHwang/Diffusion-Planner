@@ -1,10 +1,14 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0 #,1,2,3,4,5,6,7
 export HYDRA_FULL_ERROR=1
 
 ###################################
 # User Configuration Section
 ###################################
 # Set environment variables
+
+#unset RAY_ADDRESS
+#ray stop -f >/dev/null 2>&1 || true
+
 HOME_DIR="/home/user/nuplan"
 export OC_CAUSE=1
 export NUPLAN_DEVKIT_ROOT="/home/user/PycharmProjects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
@@ -62,7 +66,7 @@ python nuplan_extent/planning/script/run_simulation.py \
     verbose=true \
     worker=sequential \
     distributed_mode='SINGLE_NODE' \
-    number_of_gpus_allocated_per_simulation=1.0 \
+    number_of_gpus_allocated_per_simulation=1. \
     enable_simulation_progress_bar=true \
     hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan_extent.planning.script.config.common, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://nuplan.planning.script.config.common , pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments ]"
 

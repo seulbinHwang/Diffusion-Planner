@@ -46,7 +46,7 @@ def _extract_agent_array(
     frame_agents_feature = np.zeros(
         (frame_agents_num, AgentInternalIndex.dim()), dtype=np.float64)
     max_id_number = len(token_to_id)
-
+    # 프레임 내 index
     for idx, agent in enumerate(agents):
         if agent.track_token not in token_to_id:
             token_to_id[agent.track_token] = max_id_number
@@ -71,7 +71,9 @@ def _extract_agent_array(
 
 def sampled_tracked_objects_to_array_list(
         past_tracked_objects: List[TrackedObjects] )\
-        -> Tuple[List[np.ndarray], List[List[TrackedObjectType]]]:
+        -> Tuple[List[np.ndarray], List[List[TrackedObjectType]],
+        Dict[str, int]
+        ]:
     """
     Arrayifies the agents features from the provided past detections.
     For N past detections, output is a list of length N, with each array as described in `_extract_agent_array()`.
@@ -98,7 +100,7 @@ def sampled_tracked_objects_to_array_list(
         all_frame_agents_feature.append(frame_agents_feature)
         all_frame_agents_types.append(agent_types)
 
-    return all_frame_agents_feature, all_frame_agents_types
+    return all_frame_agents_feature, all_frame_agents_types, token_to_id
 
 
 def _extract_ego_array(track_ego: EgoState) -> np.ndarray:
@@ -110,11 +112,12 @@ def _extract_ego_array(track_ego: EgoState) -> np.ndarray:
     frame_ego_feature[2] = track_ego.center.heading
     # EgoState의 속도는 자차량 좌표계 기준 벡터이므로, 세계 좌표계로 변환이 필요하다.
     v_local = track_ego.dynamic_car_state.center_velocity_2d
-    v_global = numpy_array_to_absolute_velocity(
-        track_ego.center, np.array([[v_local.x, v_local.y]],
-                                   dtype=np.float32))[0]
-    frame_ego_feature[3] = v_global.x
-    frame_ego_feature[4] = v_global.y
+    he = float(track_ego.center.heading)
+    c, s = np.cos(he), np.sin(he)
+    vx_w = c * float(v_local.x) - s * float(v_local.y)
+    vy_w = s * float(v_local.x) + c * float(v_local.y)
+    frame_ego_feature[3] = vx_w
+    frame_ego_feature[4] = vy_w
     frame_ego_feature[5] = track_ego.car_footprint.width
     frame_ego_feature[6] = track_ego.car_footprint.length
     frame_ego_feature[7:10] = [1, 0, 0]  # Mark as VEHICLE
@@ -187,7 +190,7 @@ def _filter_agents_array(
     for past_idx in range(len(all_frame_agents_feature)):
         frame_exist_agents = []
         # (frame_agents_num, 8)
-        frame_agents_feature: np.ndarray = all_frame_agents_feature[past_idx]
+        frame_agents_feature: np.ndarray = all_frame_agents_feature[past_idx] # (_, 8)
         for agent_idx in range(frame_agents_feature.shape[0]):
             if target_frame_agents_feature.shape[0] > 0:
                 agent_id = float(
@@ -306,7 +309,7 @@ def agent_past_process(
     max_pedestrians: int,
     max_bicycles: int,
     anchor_ego_state: np.ndarray,  #(3,)
-) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray, int]:
+) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     # ego_agent_past: (num_frames, 11)
     # neighbor_agents_past: (agent_num, num_frames, 11)
     # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
@@ -337,6 +340,7 @@ def agent_past_process(
     else:
         ego_agent_past = None
     # (saved_agents_num, 8) # saved_agents_num 길이가 가변적
+
     all_frame_cur_exists_agents: List[np.ndarray] = _filter_agents_array(
         all_frame_agents_feature, reverse=True)
     current_agent_types: List[TrackedObjectType] = all_frame_agents_types[-1]
@@ -346,7 +350,7 @@ def agent_past_process(
         all_frame_np_agents_local = np.zeros(
             (len(all_frame_cur_exists_agents), 0, agents_states_dim))
     else:
-        all_frame_cur_exists_agents_local: List[np.ndarray] = []
+        all_frame_cur_exists_agents_local: List[np.ndarray] = [] # (num_frames, current_agents_num, 8)
         # all_frame_cur_exists_agents 와 frame_cur_exists_agents_local의
         # np.ndarray shape: (current_agents_num, 8) 로 동일
         all_frame_cur_exists_agents: List[np.ndarray] = _pad_agent_states(
@@ -365,9 +369,10 @@ def agent_past_process(
         # agents_states_dim: id, vx, vy, heading, width, length, x, y
         # all_frame_np_agents_local: (num_frames, current_agents_num, 8)
         # all_frame_np_agents_local 8: x, y, cos h, sin h, vx, vy, length, width
+        # (num_frames, current_agents_num, 8)
         all_frame_np_agents_local = np.zeros(
             (len(all_frame_cur_exists_agents_local),
-             all_frame_cur_exists_agents_local[0].shape[0], agents_states_dim))
+             all_frame_cur_exists_agents_local[0].shape[0], agents_states_dim + 1))
 
         for past_idx in range(len(all_frame_cur_exists_agents_local)):
             frame_cur_exists_agents_local = all_frame_cur_exists_agents_local[
@@ -406,6 +411,11 @@ def agent_past_process(
                 7] = frame_cur_exists_agents_local[:,
                                                    AgentInternalIndex.length(
                                                    )].squeeze()
+            all_frame_np_agents_local[
+                past_idx, :,
+                8] = frame_cur_exists_agents_local[:,
+            AgentInternalIndex.track_token()].squeeze()  # id
+
     #  present_static_feature: (cur_static_num, 5)
     # present_static_feature_6: (cur_static_num, 6)
     present_static_feature_6 = np.zeros((present_static_feature.shape[0], 6))
@@ -434,8 +444,9 @@ def agent_past_process(
     # neighbor_agents_past: (agent_num, num_frames, 11)
     neighbor_agents_past = np.zeros(
         (agent_num, all_frame_np_agents_local.shape[0],
-         all_frame_np_agents_local.shape[-1] + 3),
+         agents_states_dim + 3),
         dtype=np.float32)
+    neighbor_agents_track_id = - np.ones((agent_num,), dtype=np.float32)
     # dist_from_cur_agent_to_ego: (current_agents_num,)
     dist_from_cur_agent_to_ego = np.linalg.norm(
         all_frame_np_agents_local[-1, :, :2], axis=-1)
@@ -488,12 +499,14 @@ def agent_past_process(
     # Populate the final agents array with the selected agents' features
     for sort_idx, cur_neighbor_idx in enumerate(sorted_cur_neighbor_indices):
         # neighbor_agents_past: (agent_num, num_frames, 11)
-        # all_frame_np_agents_local: (num_frames, current_agents_num, 8)
+        # all_frame_np_agents_local: (num_frames, current_agents_num, 9)
         # current_agent_types: List[TrackedObjectType]
-        eight_ = all_frame_np_agents_local.shape[-1]
+        eight_ = agents_states_dim
         neighbor_agents_past[
             sort_idx, :, :
             eight_] = all_frame_np_agents_local[:, cur_neighbor_idx, :eight_]
+        neighbor_agents_track_id[sort_idx] = all_frame_np_agents_local[
+            -1, cur_neighbor_idx, eight_]
         if current_agent_types[cur_neighbor_idx] == TrackedObjectType.VEHICLE:
             neighbor_agents_past[sort_idx, :, eight_:] = [1, 0,
                                                           0]  # Mark as VEHICLE
@@ -522,7 +535,7 @@ def agent_past_process(
         else:
             static_objects[i, six_:] = [0, 0, 0, 1]
 
-    return ego_agent_past, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects, final_vehicle_num
+    return ego_agent_past, neighbor_agents_past, sorted_cur_neighbor_indices, static_objects, neighbor_agents_track_id
 
 
 def agent_future_process(

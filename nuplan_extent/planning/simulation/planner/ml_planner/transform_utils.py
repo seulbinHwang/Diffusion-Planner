@@ -12,6 +12,7 @@ from nuplan.planning.metrics.utils.state_extractors import approximate_derivativ
 from nuplan.common.actor_state.waypoint import Waypoint
 from nuplan.common.actor_state.oriented_box import OrientedBox
 
+
 def vel_acc_to_waypoint(
     state: StateSE2,
     velocity: npt.NDArray[np.float32],
@@ -32,8 +33,7 @@ def vel_acc_to_waypoint(
     velocity_ = StateVector2D(*velocity)
     return Waypoint(time_point=TimePoint(int(timestamp * 1e6)),
                     oriented_box=oriented_box_,
-                    velocity=velocity_
-                    )
+                    velocity=velocity_)
 
     return EgoState.build_from_rear_axle(
         rear_axle_pose=state,
@@ -46,7 +46,8 @@ def vel_acc_to_waypoint(
     )
 
 
-def _get_fixed_timesteps(agent_state: Agent, future_horizon: float, step_interval: float) -> List[float]:
+def _get_fixed_timesteps(agent_state: Agent, future_horizon: float,
+                         step_interval: float) -> List[float]:
     """
     Get a fixed array of timesteps starting from a agent_state's time.
 
@@ -62,8 +63,8 @@ def _get_fixed_timesteps(agent_state: Agent, future_horizon: float, step_interva
 
 
 def _project_from_global_to_ego_centric_ds(
-    ego_poses: npt.NDArray[np.float32], values: npt.NDArray[np.float32]
-) -> npt.NDArray[np.float32]:
+        ego_poses: npt.NDArray[np.float32],
+        values: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
     """
     Project value from the global xy frame to the ego centric ds frame.
 
@@ -73,14 +74,17 @@ def _project_from_global_to_ego_centric_ds(
     """
     headings = ego_poses[:, -1:]
 
-    values_lon = values[:, :1] * np.cos(headings) + values[:, 1:2] * np.sin(headings)
-    values_lat = values[:, :1] * np.sin(headings) - values[:, 1:2] * np.cos(headings)
+    values_lon = values[:, :1] * np.cos(headings) + values[:, 1:2] * np.sin(
+        headings)
+    values_lat = values[:, :1] * np.sin(headings) - values[:, 1:2] * np.cos(
+        headings)
     values = np.concatenate((values_lon, values_lat), axis=1)
     return values
 
 
 def _get_velocity_and_acceleration(
-    ego_poses: List[StateSE2], agent_history: Deque[Agent], timesteps: List[float]
+    ego_poses: List[StateSE2], agent_history: Deque[Agent],
+    timesteps: List[float]
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
     """
     Given the past, current and planned ego poses, estimate the velocity and acceleration by taking the derivatives.
@@ -91,55 +95,73 @@ def _get_velocity_and_acceleration(
     :return: the approximated velocity and acceleration in ego centric frame
     """
     ego_history_len = len(agent_history)
-    current_ego_state = agent_history[-1]
+    current_agent_state = agent_history[-1]
     # state.metadata.timestamp_s
 
     # Past and current
-    timesteps_past_current = [state.metadata.timestamp_s for state in agent_history]
+    timesteps_past_current = [
+        state.metadata.timestamp_s for state in agent_history
+    ]
     ego_poses_past_current: npt.NDArray[np.float32] = np.stack(
-        [np.array(state.center.serialize()) for state in agent_history]
-    )
+        [np.array(state.center.serialize()) for state in agent_history])
 
     # Planned
-    dt = current_ego_state.metadata.timestamp_s - agent_history[-2].metadata.timestamp_s
-    timesteps_current_planned: npt.NDArray[np.float32] = np.array([current_ego_state.metadata.timestamp_s] + timesteps)
-    ego_poses_current_planned: npt.NDArray[np.float32] = np.stack(
-        [current_ego_state.center.serialize()] + [pose.serialize() for pose in ego_poses]
-    )
+    if len(agent_history) >= 2:
+        dt = current_agent_state.metadata.timestamp_s - agent_history[
+            -2].metadata.timestamp_s
+    else:
+        # TODO: better way to get dt
+        dt = timesteps[1] - timesteps[0]
+    timesteps_current_planned: npt.NDArray[np.float32] = np.array(
+        [current_agent_state.metadata.timestamp_s] + timesteps)
+    ego_poses_current_planned: npt.NDArray[
+        np.float32] = np.stack([current_agent_state.center.serialize()] +
+                               [pose.serialize() for pose in ego_poses])
 
     # Interpolation to have equal space for derivatives
-    ego_poses_interpolate = interp1d(
-        timesteps_current_planned, ego_poses_current_planned, axis=0, fill_value='extrapolate'
-    )
+    ego_poses_interpolate = interp1d(timesteps_current_planned,
+                                     ego_poses_current_planned,
+                                     axis=0,
+                                     fill_value='extrapolate')
     timesteps_current_planned_interp = np.arange(
-        start=current_ego_state.metadata.timestamp_s, stop=timesteps[-1] + 1e-6, step=dt
-    )
-    ego_poses_current_planned_interp = ego_poses_interpolate(timesteps_current_planned_interp)
+        start=current_agent_state.metadata.timestamp_s,
+        stop=timesteps[-1] + 1e-6,
+        step=dt)
+    ego_poses_current_planned_interp = ego_poses_interpolate(
+        timesteps_current_planned_interp)
 
     # Combine past current and planned
-    timesteps_past_current_planned = [*timesteps_past_current, *timesteps_current_planned_interp[1:]]
+    timesteps_past_current_planned = [
+        *timesteps_past_current, *timesteps_current_planned_interp[1:]
+    ]
     ego_poses_past_current_planned: npt.NDArray[np.float32] = np.concatenate(
-        [ego_poses_past_current, ego_poses_current_planned_interp[1:]], axis=0
-    )
+        [ego_poses_past_current, ego_poses_current_planned_interp[1:]], axis=0)
 
     # Take derivatives
     ego_velocity_past_current_planned = approximate_derivatives(
-        ego_poses_past_current_planned[:, :2], timesteps_past_current_planned, axis=0
-    )
+        ego_poses_past_current_planned[:, :2],
+        timesteps_past_current_planned,
+        axis=0)
     ego_acceleration_past_current_planned = approximate_derivatives(
-        ego_poses_past_current_planned[:, :2], timesteps_past_current_planned, axis=0, deriv_order=2
-    )
+        ego_poses_past_current_planned[:, :2],
+        timesteps_past_current_planned,
+        axis=0,
+        deriv_order=2)
 
     # Only take the planned for output
-    ego_velocity_planned_xy = ego_velocity_past_current_planned[ego_history_len:]
-    ego_acceleration_planned_xy = ego_acceleration_past_current_planned[ego_history_len:]
+    ego_velocity_planned_xy = ego_velocity_past_current_planned[
+        ego_history_len:]
+    ego_acceleration_planned_xy = ego_acceleration_past_current_planned[
+        ego_history_len:]
 
     # Projection
 
     # Interpolate back
     ego_velocity_interp_back = interp1d(
-        timesteps_past_current_planned[ego_history_len:], ego_velocity_planned_xy, axis=0, fill_value='extrapolate'
-    )
+        timesteps_past_current_planned[ego_history_len:],
+        ego_velocity_planned_xy,
+        axis=0,
+        fill_value='extrapolate')
     ego_acceleration_interp_back = interp1d(
         timesteps_past_current_planned[ego_history_len:],
         ego_acceleration_planned_xy,
@@ -154,8 +176,8 @@ def _get_velocity_and_acceleration(
 
 
 def _get_absolute_waypoints_from_numpy_poses(
-    poses: npt.NDArray[np.float32], agent_history: Deque[Agent], timesteps: List[float]
-) -> List[Waypoint]:
+        poses: npt.NDArray[np.float32], agent_history: Deque[Agent],
+        timesteps: List[float]) -> List[Waypoint]:
     """
     Converts an array of relative numpy poses to a list of absolute EgoState objects.
 
@@ -166,18 +188,22 @@ def _get_absolute_waypoints_from_numpy_poses(
     """
     ego_state = agent_history[-1]
     relative_states = [StateSE2.deserialize(pose) for pose in poses]
-    absolute_states = relative_to_absolute_poses(ego_state.center, relative_states)
-    velocities, accelerations = _get_velocity_and_acceleration(absolute_states, agent_history, timesteps)
+    absolute_states = relative_to_absolute_poses(ego_state.center,
+                                                 relative_states)
+    velocities, accelerations = _get_velocity_and_acceleration(
+        absolute_states, agent_history, timesteps)
     waypoints = [
         vel_acc_to_waypoint(state, velocity, acceleration, timestep, ego_state)
-        for state, velocity, acceleration, timestep in zip(absolute_states, velocities, accelerations, timesteps)
+        for state, velocity, acceleration, timestep in zip(
+            absolute_states, velocities, accelerations, timesteps)
     ]
 
     return waypoints
 
+
 # nuplan-devkit/nuplan/planning/simulation/planner/ml_planner/transform_utils.py
 def transform_predictions_to_states(
-    predicted_poses: npt.NDArray[np.float32], # 자기 자신의 중심 좌표계 기준
+    predicted_poses: npt.NDArray[np.float32],  # 자기 자신의 중심 좌표계 기준
     agent_history: Deque[Agent],
     future_horizon: float,
     step_interval: float,
@@ -195,7 +221,8 @@ def transform_predictions_to_states(
     """
     agent_state: Agent = agent_history[-1]
     timesteps = _get_fixed_timesteps(agent_state, future_horizon, step_interval)
-    waypoints = _get_absolute_waypoints_from_numpy_poses(predicted_poses, agent_history, timesteps)
+    waypoints = _get_absolute_waypoints_from_numpy_poses(
+        predicted_poses, agent_history, timesteps)
 
     if include_ego_state:
         ego_state_waypoint = Waypoint(

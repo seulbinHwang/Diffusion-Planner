@@ -30,6 +30,7 @@ import json
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
 
 
+
 class DataProcessor(object):
 
     def __init__(self, config):
@@ -272,6 +273,38 @@ class DataProcessor(object):
 
         return filtered_neighbor_agents_past, filtered_neighbor_agents_future, filtered_neighbor_indices
 
+    def _filter_agents_within_radius2(
+        self,
+        neighbor_agents_past: np.ndarray,
+        neighbor_agents_track_token: List[Optional[str]],
+    ) -> Tuple[np.ndarray, List[Optional[str]]]:
+        # 마지막 시점 상대 좌표 (agent_num, 2)  ← ego 기준이므로 ego는 정중앙(0,0)
+        cur_xy = neighbor_agents_past[:, -1, :2]  # (agent_num, 2)
+
+        # 정사각형 내부 판정: |x| <= r AND |y| <= r  → (agent_num,)
+        mask_x = np.abs(cur_xy[:, 0]) <= self._radius  # (agent_num,)
+        mask_y = np.abs(cur_xy[:, 1]) <= self._radius  # (agent_num,)
+        mask = mask_x & mask_y  # (agent_num,), True=정사각형 내부(유효)
+
+        # 브로드캐스팅을 위한 차원 확장: (agent_num, 1, 1)
+        mask_expanded = mask[:, None, None]
+
+        # 정사각형 바깥 에이전트는 전체 시퀀스를 0으로 만듦(개수는 고정)
+        # filtered_neighbor_agents_past: (agent_num, Tp, 11)
+        filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
+
+        filtered_neighbor_agents_track_token: List[Optional[str]] = []
+        for i, m in enumerate(mask):
+            if m:
+                filtered_neighbor_agents_track_token.append(
+                    neighbor_agents_track_token[i])
+            else:
+                filtered_neighbor_agents_track_token.append(None)
+
+
+        return filtered_neighbor_agents_past, filtered_neighbor_agents_track_token
+
+
     # Use for inference
     def observation_adapter(self,
                             history_buffer,
@@ -304,7 +337,8 @@ class DataProcessor(object):
         observation_buffer = history_buffer.observation_buffer  # Past observations including the current
         # all_frame_agents_feature: List[np.ndarray], (frame_agents_num, 8) # frame_agents_num 길이가 가변적
         # all_frame_agents_types:  List[List[TrackedObjectType]]
-        (all_frame_agents_feature, all_frame_agents_types
+        # token_to_id: Dict[str, int]
+        (all_frame_agents_feature, all_frame_agents_types, token_to_id
         ) = sampled_tracked_objects_to_array_list(observation_buffer)
 
         # present_static_feature : np.ndarray, (len(static_obj), 5)
@@ -321,14 +355,23 @@ class DataProcessor(object):
     # static_objects: (num_static, 10)
         """
         (ego_agent_past, neighbor_agents_past, neighbor_indices,
-         static_objects, final_veh_num) = agent_past_process(
+         static_objects, neighbor_agents_track_id) = agent_past_process(
              all_frame_ego_feature, all_frame_agents_feature,
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_pedestrians,
              self.max_bicycles, anchor_ego_state)
-        neighbor_agents_past, _, neighbor_indices = \
-            self._filter_agents_within_radius(neighbor_agents_past,
-                                              None, neighbor_indices)
+        """
+        neighbor_agents_track_id: np.ndarray, (agent_num,) # -1 for padding
+        token_to_id: Dict[str, int]
+        """
+        id_to_token = {v: k for k, v in token_to_id.items()}
+        neighbor_agents_track_token: List[Optional[str]] = []
+        for track_id in neighbor_agents_track_id:
+            if track_id == -1:
+                neighbor_agents_track_token.append(None)
+            else:
+                neighbor_agents_track_token.append(id_to_token[track_id])
+        ###################3
         # 현재 프레임의 트래킹 컨테이너로부터, 선별된 neighbor들의 track token 추출
         neighbor_track_token: List[Optional[str]] = get_neighbor_track_tokens(
             present_tracked_objects=history_buffer.observation_buffer[-1].
@@ -336,6 +379,23 @@ class DataProcessor(object):
             neighbor_indices=neighbor_indices,
             agents_num=self.num_agents,
         )
+        assert len(neighbor_agents_track_token
+                   ) == len(
+            neighbor_track_token) == 32, f"Two track token lists have different lengths: {len(neighbor_agents_track_token)} != {len(neighbor_track_token)}"
+
+        for t1, t2 in zip(neighbor_agents_track_token, neighbor_track_token):
+            assert t1 == t2, f"Two track token lists do not match: {t1} != {t2}"
+        #####################
+        neighbor_agents_past, neighbor_agents_track_token = \
+            self._filter_agents_within_radius2(neighbor_agents_past, neighbor_agents_track_token)
+
+        # neighbor_agents_past, _, neighbor_indices = \
+        #     self._filter_agents_within_radius(neighbor_agents_past,
+        #                                       None, neighbor_indices)
+
+
+
+
         '''
         Map
         '''
@@ -376,6 +436,7 @@ class DataProcessor(object):
                                  self._max_elements, self._max_points)
 
         data = {
+
             "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
             "neighbor_agents_past":
                 neighbor_agents_past[:, -21:],  # (agent_num, time_len, 11)
@@ -389,6 +450,7 @@ class DataProcessor(object):
         data.update(vector_map)
         # data: Dict[str, torch.Tensor]
         data = convert_to_model_inputs(data, device, squeeze)
+        data["neighbor_track_token"] = neighbor_agents_track_token # List[Optional[str]], (agent_num,)
         # 변환 후에도 안전하게 보정
         if "agent_route_lane_order" in data:
             data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
@@ -492,7 +554,7 @@ class DataProcessor(object):
             # neighbor_agents_past: (agent_num, num_frames, 11)
             # neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
             (ego_agent_past, neighbor_agents_past, neighbor_indices,
-             static_objects, final_veh_num) = agent_past_process(
+             static_objects, neighbor_agents_track_id) = agent_past_process(
                  all_frame_ego_feature, all_frame_agents_feature,
                  all_frame_agents_types, self.num_agents,
                  present_static_feature, static_objects_types, self.num_static,

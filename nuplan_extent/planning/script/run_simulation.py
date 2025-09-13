@@ -16,7 +16,9 @@ from nuplan.planning.script.builders.simulation_callback_builder import (
 )
 from nuplan.planning.script.utils import run_runners, set_default_path, set_up_common_builder
 from nuplan.planning.simulation.planner.abstract_planner import AbstractPlanner
+import ray
 
+ray.init(num_gpus=1)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -123,7 +125,7 @@ def clean_up_s3_artifacts() -> None:
         rmtree(local_s3_path)
 
 
-@hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME)
+@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     """
     Execute all available challenges simultaneously on the same scenario. Calls run_simulation to allow planner to

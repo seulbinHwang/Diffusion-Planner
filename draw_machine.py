@@ -131,25 +131,26 @@ class DrawingOptions:
         - token: 앞 4차원이 모두 |value| ≤ invalid_eps 이면 invalid
     """
 
-    draw_ego_past: bool = False
-    draw_neighbor_past: bool = True
-    draw_ego_pred: bool = False # TODO
-    draw_ego_future_gt: bool = False
-    draw_lane_boundaries: bool = True
-    draw_lane_centerline: bool = True
-    draw_token_future_arrows: bool = False
-    draw_neighbor_agents_future: bool = True
+    draw_ego_past: bool = True # check
+    draw_neighbor_past: bool = True # check
+    draw_ego_pred: bool = False # check
+    draw_ego_future_gt: bool = False # check
+    draw_lane_boundaries: bool = True # check
+    draw_lane_centerline: bool = False # check
+    draw_token_future_arrows: bool = True
+    draw_neighbor_agents_future: bool = False
+    draw_token_refined: bool = True
 
-    draw_velocity_arrows_past_all: bool = False
-    draw_velocity_arrows_pred_all: bool = False
-    draw_velocity_arrows_future_all: bool = False
+    draw_velocity_arrows_past_all: bool = True # check
+    draw_velocity_arrows_pred_all: bool = False # check
+    draw_velocity_arrows_future_all: bool = True # check
 
     arrow_length_m: float = 5.0
     heading_line_scale: float = 0.5
 
     background_color: str = "#121212"
     show_axis: bool = False
-    fig_size: Tuple[float, float] = (9.0, 9.0)
+    fig_size: Tuple[float, float] = (18.0, 18.0)
     dpi: int = 200
     margin_m: float = 5.0
     equal_aspect: bool = True
@@ -160,8 +161,13 @@ class DrawingOptions:
     agent_index_offset_m: float = 0.5  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
     past_agent_index_color: str = "#FFFFFF"  # 번호 텍스트 색 # 흰색
     future_agent_index_color: str = "#808080" # 번호 텍스트 색 # 회색
-    route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 흰색
+    route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 청록색
     neighbor_future_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+
+    # 🔽 [추가] 토큰 시작 인덱스 텍스트 표기용 옵션
+    token_index_color: str = "#00C8C8"     # 청록색
+    token_index_offset_m: float = 0.3      # y축으로 살짝 아래(미터 단위)
+    token_index_fontsize: int = 5          # 기본은 에이전트 번호와 동일 크기
     # 🔽 새 옵션
     max_agents_to_draw: Optional[int] = None
 
@@ -173,16 +179,23 @@ EGO_PAST_STYLE = {
     "fill_alpha_current": 1.0,
 }
 EGO_PRED_STYLE = {
-    "line_color": "#FFFFFF",           # 흰색
+    "line_color": "#00C8C8",           # 청록색
     "line_width": 0.4,
     "velocity_line_color": "#00C8C8",  # 청록색(시안)
     "velocity_line_alpha": 0.8,
     "velocity_line_width": 0.4,
 }
 EGO_FUTURE_GT_STYLE = {
-    "line_color": "#FFFFFF",           # 흰색
+    "line_color": "#FFFFFF",  # 흰색
     "line_width": 0.2,
     "velocity_line_color": "#00C8C8",  # 청록색(시안)
+    "velocity_line_alpha": 0.8,
+    "velocity_line_width": 0.4,
+}
+REFINED_FUTURE_STYLE = {
+    "line_color": "#FF4D4D",           #  빨간색(밝은 빨강)
+    "line_width": 0.2,
+    "velocity_line_color": "#FF4D4D",  #  빨간색(밝은 빨강)
     "velocity_line_alpha": 0.8,
     "velocity_line_width": 0.4,
 }
@@ -222,6 +235,15 @@ SIGNAL_COLORS = {
 TOKEN_FUTURE_STYLE = {
     "line_color": "#FFFFFF",  # 흰색
     "line_width": 0.2,
+}
+TOKEN_REFINED_STYLE = {
+    "line_color": "#FF4D4D",  # 흰색
+    "line_width": 0.2,
+}
+
+NEW_WAYPOINT_STYLE = {
+    "line_color": "#FFA500",  # 주황색
+    "line_width": 0.6,
 }
 
 
@@ -408,10 +430,12 @@ def is_valid_token_row(row4: Array, eps: float) -> bool:
     return bool(np.any(np.abs(row4[..., :4]) > eps))
 
 
+# [Add]
 def collect_valid_xy_for_bounds(
     world_model_feature: WorldModelFeature,
     options: DrawingOptions,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict] = None,
+    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[List[float], List[float]]:
     """모든 요소에서 valid (x,y)만 모아 bounds 계산에 사용."""
     eps = options.invalid_eps
@@ -486,6 +510,21 @@ def collect_valid_xy_for_bounds(
             xy = neigh_fut[..., :2][valid_mask]  # (K, 2)
             xs.extend(xy[:, 0].tolist())
             ys.extend(xy[:, 1].tolist())
+
+    # [Add] refined 토큰(각 row 11,)에서도 valid (x, y) 수집
+    if token_to_refined_traj_wrt_ego:
+        for _, arr in token_to_refined_traj_wrt_ego.items():
+            if arr is None or arr.size == 0:
+                continue
+            if arr.ndim != 2 or arr.shape[1] != 11:
+                continue  # 형식 불일치 시 스킵
+            # agent와 동일 규칙: 앞 8차원 중 하나라도 |value| > eps → valid
+            valid_mask = np.any(np.abs(arr[:, :8]) > eps, axis=1)  # (N,)
+            if np.any(valid_mask):
+                xy = arr[valid_mask, 0:2]  # (K, 2)
+                xs.extend(xy[:, 0].tolist())
+                ys.extend(xy[:, 1].tolist())
+
     return xs, ys
 
 
@@ -891,6 +930,175 @@ def draw_ego_future_gt(ax: plt.Axes, ego_future_gt_11_dim: Array,
                 line_alpha=EGO_FUTURE_GT_STYLE["velocity_line_alpha"],
                 zorder=24)
 
+# [Add]
+def draw_token_refined_trajectories(
+    ax: plt.Axes,
+    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]],
+    options: DrawingOptions,
+    token_to_new_waypoint_array: Optional[Dict[str, np.ndarray]] = None,
+) -> None:
+    """토큰별 refined 궤적(연속 다스텝)과 **신규 waypoint(단일 11차원)**를 함께 그린다.
+
+    - refined: REFINED_FUTURE_STYLE(빨강)로 연속 박스 + 첫 유효 포인트에 idx(빨강, 아래쪽 오프셋)
+    - new waypoint: NEW_WAYPOINT_STYLE(주황) 테두리 박스 + idx(주황, 오른쪽 오프셋)
+
+    Args:
+        ax: Matplotlib 축.
+        token_to_refined_traj_wrt_ego: Dict[str, np.ndarray] | None
+            각 value: shape = (1 + future_len, 11)
+            row(11,) = [x, y, cos, sin, vx, vy, length, width, onehot(3,)]
+        options: 렌더링 옵션.
+        token_to_new_waypoint_array: Dict[str, np.ndarray] | None
+            각 value: shape = (11,) (단일 스텝)
+    """
+    if not token_to_refined_traj_wrt_ego and not token_to_new_waypoint_array:
+        return
+
+    eps = options.invalid_eps
+
+    # 표시할 토큰 순서: refined의 key 순서 우선, new_waypoint에만 있는 토큰은 뒤에 추가
+    ordered_tokens: List[str] = []
+    if token_to_refined_traj_wrt_ego:
+        ordered_tokens.extend(list(token_to_refined_traj_wrt_ego.keys()))
+    if token_to_new_waypoint_array:
+        for k in token_to_new_waypoint_array.keys():
+            if k not in ordered_tokens:
+                ordered_tokens.append(k)
+
+    for idx, token in enumerate(ordered_tokens):
+        # ── (A) refined 연속 궤적(빨강) ───────────────────────────────
+        if token_to_refined_traj_wrt_ego and (token in token_to_refined_traj_wrt_ego):
+            arr = token_to_refined_traj_wrt_ego[token]
+            if arr is not None and arr.size > 0:
+                if arr.ndim != 2 or arr.shape[1] != 11:
+                    raise ValueError(
+                        "token_to_refined_traj_wrt_ego의 각 value는 (1 + future_len, 11) 이어야 합니다."
+                    )
+                seq_len = arr.shape[0]
+                label_drawn = False
+                for t in range(seq_len):
+                    row = arr[t]  # (11,)
+                    if not is_valid_agent_row(row, eps):
+                        continue
+                    x, y = float(row[0]), float(row[1])
+                    c, s = float(row[2]), float(row[3])
+                    vx, vy = float(row[4]), float(row[5])
+                    W, L = float(row[6]), float(row[7])
+
+                    corners = oriented_box_corners(x, y, c, s, L, W)
+                    add_polygon(
+                        ax,
+                        corners,
+                        edge_color=REFINED_FUTURE_STYLE["line_color"],
+                        line_width=REFINED_FUTURE_STYLE["line_width"],
+                        fill_color=None,
+                        fill_alpha=None,
+                        zorder=24,
+                    )
+                    add_heading_line(
+                        ax,
+                        x,
+                        y,
+                        c,
+                        s,
+                        nominal_length=L * options.heading_line_scale,
+                        color=REFINED_FUTURE_STYLE["line_color"],
+                        line_width=REFINED_FUTURE_STYLE["line_width"],
+                        zorder=24,
+                    )
+                    if options.draw_velocity_arrows_future_all:
+                        add_velocity_arrow(
+                            ax,
+                            x,
+                            y,
+                            vx,
+                            vy,
+                            length_m=options.arrow_length_m,
+                            line_color=REFINED_FUTURE_STYLE["velocity_line_color"],
+                            line_width=REFINED_FUTURE_STYLE["velocity_line_width"],
+                            line_alpha=REFINED_FUTURE_STYLE["velocity_line_alpha"],
+                            zorder=24,
+                        )
+
+                    # 첫 유효 포인트에 빨간색 idx(아래쪽 오프셋)
+                    if not label_drawn:
+                        ax.text(
+                            x,
+                            y - options.token_index_offset_m,
+                            str(idx),
+                            color=REFINED_FUTURE_STYLE["line_color"],
+                            fontsize=options.token_index_fontsize,
+                            ha="center",
+                            va="top",
+                            zorder=25,
+                        )
+                        label_drawn = True
+
+        # ── (B) 신규 waypoint(주황) ─────────────────────────────────
+        if token_to_new_waypoint_array and (token in token_to_new_waypoint_array):
+            wp = token_to_new_waypoint_array[token]
+            if wp is None:
+                continue
+            wp = np.asarray(wp)
+            if wp.ndim == 2:
+                wp = wp.squeeze()
+            if wp.ndim != 1 or wp.shape[0] != 11:
+                raise ValueError("token_to_new_waypoint_array의 각 value는 shape (11,) 이어야 합니다.")
+
+            if not is_valid_agent_row(wp, eps):
+                continue
+
+            x, y = float(wp[0]), float(wp[1])
+            c, s = float(wp[2]), float(wp[3])
+            W, L = float(wp[6]), float(wp[7])
+
+            corners_wp = oriented_box_corners(x, y, c, s, L, W)
+            # 테두리만 주황색으로
+            add_polygon(
+                ax,
+                corners_wp,
+                edge_color=NEW_WAYPOINT_STYLE["line_color"],
+                line_width=NEW_WAYPOINT_STYLE["line_width"],
+                fill_color=None,
+                fill_alpha=None,
+                zorder=28,  # refined(24)보다 위
+            )
+            add_heading_line(
+                ax,
+                x,
+                y,
+                c,
+                s,
+                nominal_length=L * options.heading_line_scale,
+                color=NEW_WAYPOINT_STYLE["line_color"],
+                line_width=NEW_WAYPOINT_STYLE["line_width"],
+                zorder=28,
+            )
+            if options.draw_velocity_arrows_future_all:
+                add_velocity_arrow(
+                    ax,
+                    x,
+                    y,
+                    0.0,
+                    0.0,
+                    length_m=options.arrow_length_m,
+                    line_color=NEW_WAYPOINT_STYLE["line_color"],
+                    line_width=NEW_WAYPOINT_STYLE["line_width"],
+                    line_alpha=1.0,
+                    zorder=28,
+                )
+            # 번호 라벨: 주황색, "오른쪽"으로 살짝 이동
+            ax.text(
+                x + options.token_index_offset_m,
+                y,
+                str(idx),
+                color=NEW_WAYPOINT_STYLE["line_color"],
+                fontsize=options.token_index_fontsize,
+                ha="left",
+                va="center",
+                zorder=29,
+            )
+
 
 def draw_token_future_arrows(
     ax: plt.Axes,
@@ -909,9 +1117,9 @@ def draw_token_future_arrows(
     """
     if not token_to_future_traj_wrt_ego:
         return
-
     eps = options.invalid_eps
-    for _, arr in token_to_future_traj_wrt_ego.items():
+    # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
+    for idx, (token, arr) in enumerate(token_to_future_traj_wrt_ego.items()):  # [ADD]
         if arr is None or arr.size == 0:
             continue
         if arr.ndim != 2 or arr.shape[1] != 4:
@@ -941,6 +1149,16 @@ def draw_token_future_arrows(
                 zorder=23  # 에이전트 윤곽(24~27) 바로 아래/사이에 위치하도록
             )
 
+            # [ADD] 시작 화살표(t==0)에만 인덱스 텍스트를 화살표 '살짝 아래'에 표기
+            if t == 0:  # [ADD]
+                ax.text(  # [ADD]
+                    x,                                          # [ADD]
+                    y - options.agent_index_offset_m,           # [ADD] "아래쪽" = y 음의 방향으로 오프셋
+                    str(idx),                                   # [ADD] 삽입순서 인덱스(0,1,2,…)
+                    color="#00C8C8",                            # [ADD] 요청 색상
+                    fontsize=options.agent_index_fontsize,      # [ADD] 기존 폰트 크기 재사용
+                    ha="center", va="top", zorder=24,           # [ADD] 화살표(23) 위에 보이도록
+                )                                               # [ADD]
 
 # =============================================================================
 # Figure/Axis & 범위/저장
@@ -969,10 +1187,16 @@ def compute_auto_bounds(
     world_model_feature: WorldModelFeature,
     options: DrawingOptions,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict] = None,
+    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[float, float, float, float]:
     """valid (x,y)만 모아 자동으로 축 범위를 산출."""
-    xs, ys = collect_valid_xy_for_bounds(world_model_feature, options,
-                                         token_to_future_traj_wrt_ego)
+    # [Add]
+    xs, ys = collect_valid_xy_for_bounds(
+        world_model_feature,
+        options,
+        token_to_future_traj_wrt_ego,
+        token_to_refined_traj_wrt_ego,
+    )
     if not xs or not ys:
         return -10.0, 10.0, -10.0, 10.0
     xmin, xmax = min(xs), max(xs)
@@ -1002,9 +1226,12 @@ def save_figure_to_png(fig: plt.Figure, save_path: str) -> None:
 # =============================================================================
 
 
+# [Add]
 def draw_world_model_to_png(
     world_model_feature: WorldModelFeature,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
+    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]],  # (1 + future_len=80, 11)
+token_to_new_waypoint_array: Optional[Dict[str, np.ndarray]],  # (11,)
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
@@ -1080,7 +1307,16 @@ def draw_world_model_to_png(
     # 3) 토큰 미래 화살표(개별) - 차선 위에, 에이전트 윤곽과 겹치지 않게 중간 zorder
     if draw_option.draw_token_future_arrows:
         draw_token_future_arrows(ax, token_to_future_traj_wrt_ego, draw_option)
-
+    # [Add] refined 토큰 궤적(폴리곤/헤딩/속도)
+    # [Add]
+    if draw_option.draw_token_refined and (
+            token_to_refined_traj_wrt_ego or token_to_new_waypoint_array):
+        draw_token_refined_trajectories(
+            ax,
+            token_to_refined_traj_wrt_ego,
+            draw_option,
+            token_to_new_waypoint_array=token_to_new_waypoint_array,
+        )
     # ── (4) 에이전트(과거/미래/예측/GT) ─────────────────────────────
     if draw_option.draw_neighbor_past and (neigh_past_K is not None):
         draw_neighbor_past(ax, neigh_past_K, draw_option)
@@ -1099,7 +1335,13 @@ def draw_world_model_to_png(
         draw_ego_future_gt(ax, data_, draw_option)
 
     # ── (5) 축 범위/스타일 ───────────────────────────────────────────
-    bounds = compute_auto_bounds(wmf_for_bounds, draw_option, token_to_future_traj_wrt_ego)
+    # [Add]
+    bounds = compute_auto_bounds(
+        wmf_for_bounds,
+        draw_option,
+        token_to_future_traj_wrt_ego,
+        token_to_refined_traj_wrt_ego,
+    )
     set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
     apply_axes_style(ax, draw_option)
 
