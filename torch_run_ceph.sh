@@ -87,4 +87,5 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  "$@"
+  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/world-model-small/2025-09-11-05:32:07" \
+  --name "world-model-small"
