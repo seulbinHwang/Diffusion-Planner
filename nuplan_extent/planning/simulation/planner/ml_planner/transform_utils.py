@@ -167,9 +167,7 @@ def _get_velocity_and_acceleration(
 
 def _get_absolute_waypoints_from_numpy_poses(
         poses: npt.NDArray[np.float32], agent_history: Deque[Agent],
-        timesteps: List[float],
-step_s_time: float
-) -> List[Waypoint]:
+        timesteps: List[float], step_s_time: float) -> List[Waypoint]:
     """
     Converts an array of relative numpy poses to a list of absolute EgoState objects.
 
@@ -183,9 +181,10 @@ step_s_time: float
     absolute_states = relative_to_absolute_poses(agent_state.center,
                                                  relative_states)
     velocities, accelerations = _get_velocity_and_acceleration(
-        absolute_states, agent_history, timesteps , step_s_time)
+        absolute_states, agent_history, timesteps, step_s_time)
     waypoints = [
-        vel_acc_to_waypoint(state, velocity, acceleration, timestep, agent_state)
+        vel_acc_to_waypoint(state, velocity, acceleration, timestep,
+                            agent_state)
         for state, velocity, acceleration, timestep in zip(
             absolute_states, velocities, accelerations, timesteps)
     ]
@@ -199,7 +198,7 @@ def transform_predictions_to_states(
     agent_history: Deque[Agent],
     future_horizon: float,
     step_interval: float,
-step_s_time: float,
+    step_s_time: float,
     include_ego_state: bool = True,
 ) -> List[Waypoint]:
     """
@@ -213,7 +212,8 @@ step_s_time: float,
     :return: transformed absolute states
     """
     agent_state: Agent = agent_history[-1]
-    timesteps: List[float] = _get_fixed_timesteps(agent_state, future_horizon, step_interval)
+    timesteps: List[float] = _get_fixed_timesteps(agent_state, future_horizon,
+                                                  step_interval)
     waypoints = _get_absolute_waypoints_from_numpy_poses(
         predicted_poses, agent_history, timesteps, step_s_time)
 

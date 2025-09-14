@@ -4,6 +4,7 @@ import pathlib
 from concurrent.futures import Future
 from typing import List, Optional, Union, Tuple
 from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents
+from nuplan_extent.planning.simulation.observation.world_model_log_replay import WorldModelLogReplay
 import cv2
 from abc import ABC, abstractmethod
 import torch  # noqa: F401  # (현재 코드에서는 직접 사용하지 않지만 외부 인터페이스 호환을 위해 유지)
@@ -300,7 +301,8 @@ class SimulationFeatureVideoCallback(AbstractCallback):
             ).index  # int
 
             # 각 스텝의 렌더링 저장 경로를 Planner/Observation에 전달
-            if isinstance(setup.observations, WorldModelAgents):
+            if isinstance(setup.observations,
+                          (WorldModelAgents, WorldModelLogReplay)):
                 setup.observations.set_vis_features(
                     is_vis_features=True,
                     vis_features_path=feature_log_directory /

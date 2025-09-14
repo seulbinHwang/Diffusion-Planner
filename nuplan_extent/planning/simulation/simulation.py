@@ -12,6 +12,7 @@ from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPl
 from nuplan.planning.simulation.simulation_setup import SimulationSetup
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
 from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents
+from nuplan_extent.planning.simulation.observation.world_model_log_replay import WorldModelLogReplay
 from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization
 
 logger = logging.getLogger(__name__)
@@ -60,8 +61,8 @@ class Simulation:
         self._simulation_history_buffer_duration = simulation_history_buffer_duration + self._scenario.database_interval
         # The + 1 here is to account for duration. For example, 20 steps at 0.1s starting at 0s will have a duration
         # of 1.9s. At 21 steps the duration will achieve the target 2s duration.
-        a = int(self._simulation_history_buffer_duration
-                                        / self._scenario.database_interval)
+        a = int(self._simulation_history_buffer_duration /
+                self._scenario.database_interval)
         self._history_buffer_size = a + 1
         self._history_buffer: Optional[SimulationHistoryBuffer] = None
 
@@ -190,7 +191,8 @@ class Simulation:
         if next_iteration:
             self._ego_controller.update_state(iteration, next_iteration,
                                               ego_state, trajectory)
-            if isinstance(self._observations, WorldModelAgents):
+            if isinstance(self._observations,
+                          (WorldModelAgents, WorldModelLogReplay)):
                 self._observations.update_observation(
                     iteration, next_iteration, self._history_buffer,
                     self._ego_controller.get_state(), trajectory)

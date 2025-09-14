@@ -498,6 +498,10 @@ class AgentStatePlot(BaseScenarioPlot):
                     return
 
                 for category, data_source in data_sources.items():
+                    """
+                    category: (str) vehicles, pedestrians, ...
+                    data_sources: (ColumnDataSources)
+                    """
                     plot = self.plots.get(category, None)
                     prediction_plot = self.prediction_plots.get(category, None)
                     past_plot = self.past_plots.get(category, None)
@@ -601,8 +605,8 @@ tracked_object_types = {
                     velocity_ys = []
                     speeds = []
                     headings = []
-                    prediction_xs = []
-                    prediction_ys = []
+                    prediction_xs: List[List[float]] = []
+                    prediction_ys: List[List[float]] = []
                     past_xs = []
                     past_ys = []
                     # List[TrackedObject]
@@ -611,8 +615,6 @@ tracked_object_types = {
                         # tracked_object: TrackedObject = Union[Agent, StaticObject, SceneObject, AgentTemporalState]
                         # tracked_object.predictions: Optional[List[PredictedTrajectory]] # Optional list of (possibly multiple) predicted trajectories.
                         # tracked_object.past_trajectory: Optional[PredictedTrajectory]
-                        """ TODO
-                        """
                         agent_corners = tracked_object.box.all_corners()
                         corners_x = [corner.x for corner in agent_corners]
                         corners_y = [corner.y for corner in agent_corners]
@@ -633,23 +635,28 @@ tracked_object_types = {
 
                         if isinstance(tracked_object, Agent):
                             if tracked_object.predictions:
-                                first_pred = tracked_object.predictions[0]
-                                pred_states = first_pred.trajectory.get_sampled_trajectory(
-                                )
-                                pred_xs = [
-                                    state.center.x for state in pred_states
-                                ]
-                                pred_ys = [
-                                    state.center.y for state in pred_states
-                                ]
-                                prediction_xs.append(pred_xs)
-                                prediction_ys.append(pred_ys)
-                            else:
-                                prediction_xs.append([])
-                                prediction_ys.append([])
+                                predictions_list: List[
+                                    PredictedTrajectory] = tracked_object.predictions
+                                if len(predictions_list) >= 1:
+                                    first_pred: PredictedTrajectory = predictions_list[
+                                        0]
+                                    pred_states = first_pred.trajectory.get_sampled_trajectory(
+                                    )
+                                    pred_xs = [
+                                        state.center.x for state in pred_states
+                                    ]
+                                    pred_ys = [
+                                        state.center.y for state in pred_states
+                                    ]
+                                    prediction_xs.append(pred_xs)
+                                    prediction_ys.append(pred_ys)
+                                else:
+                                    prediction_xs.append([])
+                                    prediction_ys.append([])
 
-                            if tracked_object.past_trajectory:
-                                past_states = tracked_object.past_trajectory.trajectory.get_sampled_trajectory(
+                            if tracked_object.past_trajectory is not None:
+                                past_trajectory_: PredictedTrajectory = tracked_object.past_trajectory
+                                past_states = past_trajectory_.trajectory.get_sampled_trajectory(
                                 )
                                 past_x_vals = [
                                     state.center.x for state in past_states

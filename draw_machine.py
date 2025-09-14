@@ -136,14 +136,14 @@ class DrawingOptions:
     draw_ego_pred: bool = False # check
     draw_ego_future_gt: bool = False # check
     draw_lane_boundaries: bool = True # check
-    draw_lane_centerline: bool = True # check
+    draw_lane_centerline: bool = False # check
     draw_token_future_arrows: bool = True
     draw_neighbor_agents_future: bool = False
-    draw_token_refined: bool = True
+    draw_token_refined: bool = False
 
-    draw_velocity_arrows_past_all: bool = True # check
+    draw_velocity_arrows_past_all: bool = False # check
     draw_velocity_arrows_pred_all: bool = False # check
-    draw_velocity_arrows_future_all: bool = True # check
+    draw_velocity_arrows_future_all: bool = False # check
 
     arrow_length_m: float = 5.0
     heading_line_scale: float = 0.5

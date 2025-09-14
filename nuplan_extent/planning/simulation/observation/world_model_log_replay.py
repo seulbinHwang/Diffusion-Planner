@@ -13,7 +13,7 @@ from nuplan.planning.simulation.observation.observation_type import DetectionsTr
 
 np.set_printoptions(precision=3, suppress=True)
 
-from nuplan_extent.planning.training.preprocessing.features.world_model import WorldModelFeature
+from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWrapper
 from nuplan.planning.simulation.observation.abstract_ml_agents import AbstractMLAgents
@@ -424,7 +424,8 @@ def convert_center_to_rear_axle(traj_center: np.ndarray,
     return traj_rear_axle
 
 
-class WorldModelAgents(AbstractMLAgents):
+# nuplan_extent/planning/simulation/observation/world_model_agents.py
+class WorldModelLogReplay(AbstractMLAgents):
     """
     Simulate agents based on World model.
     """
@@ -441,7 +442,7 @@ class WorldModelAgents(AbstractMLAgents):
     ) -> None:
         """
         # TODO: 먼저, 시나리오에서 도로 속도가 없는 경우에, 딥러닝 모델을 학습 시켜서 대응 했음.
-        Initializes the WorldModelAgents class.
+        Initializes the WorldModelLogReplay class.
         :param model: Model to use for inference.
         :param scenario: scenario
         """
@@ -451,26 +452,27 @@ class WorldModelAgents(AbstractMLAgents):
         self.current_iteration = 0
         self._open_loop_detections_types: List[TrackedObjectType] = []
         # ["PEDESTRIAN", "BARRIER", "CZONE_SIGN", "TRAFFIC_CONE", "GENERIC_OBJECT"]
-        self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
         self._target_velocity = target_velocity
         self._step_interval = self._step_interval_us / 1e6  # [s]
 
-    def _initialize_open_loop_detection_types(
-            self, open_loop_detections: List[str]) -> None:
-        """
-        Initializes open-loop detections with the enum types from TrackedObjectType
-        :param open_loop_detections: A list of open-loop detections types as strings
-        :return: A list of open-loop detections types as strings as the corresponding TrackedObjectType
-        """
-        for _type in open_loop_detections:
-            try:
-                self._open_loop_detections_types.append(
-                    TrackedObjectType[_type])
-            except KeyError:
-                raise ValueError(
-                    f"The given detection type {_type} does not exist or is not supported!"
-                )
+    def get_observation(self) -> DetectionsTracks:
+        """Inherited, see superclass."""
+        all_things: DetectionsTracks = self._scenario.get_tracked_objects_at_iteration(
+            self.current_iteration)
+        tracked_objects: TrackedObjects = all_things.tracked_objects
+        new_tracked_objects_list: List[TrackedObject] = []
+        diffusion_agents_tokens = list(self._diffusion_agents.keys())
+        for tracked_object in tracked_objects:
+            # tracked_object: Agent # 바꿔치기 하면됨.
+            if tracked_object.track_token in diffusion_agents_tokens:
+                diffusion_agent = self._diffusion_agents[
+                    tracked_object.track_token]
+                tracked_object.predictions = diffusion_agent.predictions
+            new_tracked_objects_list.append(tracked_object)
+        all_things.tracked_objects = TrackedObjects(new_tracked_objects_list)
+
+        return all_things
 
     def _initialize_agents(self) -> None:
         """
@@ -488,12 +490,6 @@ class WorldModelAgents(AbstractMLAgents):
         self._diffusion_agents: Dict[str,
                                      TrackedObject] = sort_dict(unique_agents)
         self._filter_agents_out_of_range(self._ego_anchor_state)
-        self._log_replay_agents = sort_dict(
-            self._get_open_loop_track_objects(self.current_iteration))
-        self._agents: Dict[str, TrackedObject] = {
-            **self._diffusion_agents,
-            **self._log_replay_agents
-        }
 
     def _get_open_loop_track_objects(
             self, iteration: int) -> Dict[str, TrackedObject]:
@@ -815,15 +811,15 @@ class WorldModelAgents(AbstractMLAgents):
              iteration, next_iteration, history, next_ego_state,
              ego_future_trajectory)
         self._filter_agents_out_of_range(self._ego_anchor_state)
-        self._log_replay_agents = sort_dict(
-            self._get_open_loop_track_objects(self.current_iteration))
-        self._agents = {**self._diffusion_agents, **self._log_replay_agents}
         if self._is_vis_features:
-            draw_machine.draw_world_model_to_png(
-                world_model_feature, token_to_future_traj_wrt_ego,
-                token_to_refined_traj_wrt_ego, token_to_new_waypoint_array,
-                neighbor_track_token, self.current_token_to_np_history,
-                self._vis_features_path)
+            pass
+            # draw_machine.draw_world_model_to_png(world_model_feature,
+            #                                      token_to_future_traj_wrt_ego,
+            #                                      token_to_refined_traj_wrt_ego,
+            #                                      token_to_new_waypoint_array,
+            #                                      neighbor_track_token,
+            #                                      self.current_token_to_np_history,
+            #                                      self._vis_features_path)
 
     @staticmethod
     def extract_rear_wheelbases(agents: Dict[str, Agent],

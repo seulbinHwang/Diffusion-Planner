@@ -60,7 +60,6 @@ class WorldModel(TorchModuleWrapper):
         else:
             raise RuntimeError("No checkpoint path provided")
 
-
     def forward(self, features: WorldModelFeature) -> torch.Tensor:
         """
         The main inference call for the model.
