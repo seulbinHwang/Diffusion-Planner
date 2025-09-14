@@ -305,7 +305,6 @@ def get_token_to_history(
             f"iteration.time_point.time_us ({iteration.time_point.time_us})와 다른데, 그 차이는 " \
             f" {a_vehicle.metadata.timestamp_us - iteration.time_point.time_us} 입니다."
         current_token_to_agent_history[a_vehicle.track_token].append(a_vehicle)
-        track_token = a_vehicle.track_token
 
     # max_len
     # list(vehicles_buffer) : List[List[Agent]] 과거 -> 현재

@@ -139,7 +139,7 @@ class DrawingOptions:
     draw_lane_centerline: bool = True # check
     draw_token_future_arrows: bool = True
     draw_neighbor_agents_future: bool = False
-    draw_token_refined: bool = False
+    draw_token_refined: bool = True
 
     draw_velocity_arrows_past_all: bool = True # check
     draw_velocity_arrows_pred_all: bool = False # check
@@ -151,7 +151,7 @@ class DrawingOptions:
     background_color: str = "#121212"
     show_axis: bool = False
     fig_size: Tuple[float, float] = (18.0, 18.0)
-    dpi: int = 200
+    dpi: int = 400
     margin_m: float = 5.0
     equal_aspect: bool = True
 
@@ -741,7 +741,24 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
                                    line_color=st["velocity_line_color"],
                                    line_width=st["velocity_line_width"],
                                    zorder=7 if t == current_t else 4)
-
+            if options.draw_velocity_arrows_past_all:
+                if t % 2 == 0:
+                    offset = 2
+                else:
+                    offset = 1
+                # [추가] 속도 크기 텍스트(km/h) - 모든 과거 지점
+                speed_kmh = float(np.hypot(vx, vy)) * 3.6
+                ax.text(
+                    x,  # 점 위쪽에 표기
+                    y + options.agent_index_offset_m * offset,
+                    f"{speed_kmh:.1f}",
+                    color=options.past_agent_index_color,
+                    fontsize=2, #options.agent_index_fontsize,
+                    ha="center",
+                    va="bottom",
+                    zorder=30,
+                    clip_on=True,  # tight 저장 시 bbox 폭주 방지
+                )
 
 def annotate_neighbor_indices_for_past(ax: plt.Axes,
 neighbor_track_token: List[Optional[str]],
@@ -772,7 +789,7 @@ neighbor_track_token: List[Optional[str]],
         x, y = float(row[0]), float(row[1])
         ax.text(x + text_d,
                 y + text_d,
-                str(track_token),
+                str(track_token)[:5],
                 color=text_color,
                 fontsize=options.agent_index_fontsize,
                 ha='left',
@@ -1023,13 +1040,25 @@ def draw_token_refined_trajectories(
                             line_alpha=REFINED_FUTURE_STYLE["velocity_line_alpha"],
                             zorder=24,
                         )
-
+                        # [추가] 속도 크기 텍스트(km/h) - refined 모든 지점 (색: #FF4D4D)
+                        speed_kmh = float(np.hypot(vx, vy)) * 3.6
+                        ax.text(
+                            x,
+                            y + options.token_index_offset_m,
+                            f"{speed_kmh:.1f}",
+                            color=REFINED_FUTURE_STYLE["line_color"],  # "#FF4D4D"
+                            fontsize=options.token_index_fontsize,
+                            ha="center",
+                            va="bottom",
+                            zorder=25,
+                            clip_on=True,
+                        )
                     # 첫 유효 포인트에 빨간색 idx(아래쪽 오프셋)
                     if not label_drawn:
                         ax.text(
                             x,
                             y - options.token_index_offset_m,
-                            str(idx),
+                            str(token)[:5],
                             color=REFINED_FUTURE_STYLE["line_color"],
                             fontsize=options.token_index_fontsize,
                             ha="center",
@@ -1092,11 +1121,24 @@ def draw_token_refined_trajectories(
                     line_alpha=1.0,
                     zorder=28,
                 )
+                # [추가] 속도 크기 텍스트(km/h) - next waypoint 1점 (색: 주황)
+                speed_kmh = float(np.hypot(vx, vy)) * 3.6
+                ax.text(
+                    x,
+                    y + options.token_index_offset_m,
+                    f"{speed_kmh:.1f}",
+                    color=NEW_WAYPOINT_STYLE["line_color"],
+                    fontsize=options.token_index_fontsize,
+                    ha="center",
+                    va="bottom",
+                    zorder=29,
+                    clip_on=True,
+                )
             # 번호 라벨: 주황색, "오른쪽"으로 살짝 이동
             ax.text(
                 x + options.token_index_offset_m,
                 y,
-                str(idx),
+                str(token)[:5],
                 color=NEW_WAYPOINT_STYLE["line_color"],
                 fontsize=options.token_index_fontsize,
                 ha="left",
@@ -1159,7 +1201,7 @@ def draw_token_future_arrows(
                 ax.text(  # [ADD]
                     x,                                          # [ADD]
                     y - options.agent_index_offset_m,           # [ADD] "아래쪽" = y 음의 방향으로 오프셋
-                    str(token),                                   # [ADD] 삽입순서 인덱스(0,1,2,…)
+                    str(token)[:5],                                   # [ADD] 삽입순서 인덱스(0,1,2,…)
                     color=TOKEN_FUTURE_STYLE["index_color"],                            # [ADD] 요청 색상
                     fontsize=options.agent_index_fontsize,      # [ADD] 기존 폰트 크기 재사용
                     ha="center", va="top", zorder=24,           # [ADD] 화살표(23) 위에 보이도록
@@ -1321,7 +1363,23 @@ def draw_token_histories(
                     line_alpha=1.0,
                     zorder=20 if t == current_t else 18,
                 )
-
+                # [추가] 속도 크기 텍스트(km/h) - 모든 히스토리 지점
+                speed_kmh = float(np.hypot(vx, vy)) * 3.6
+                if t % 2 == 0:
+                    offset = 4
+                else:
+                    offset = 3
+                ax.text(
+                    x,
+                    y - options.token_index_offset_m * offset,
+                    f"{speed_kmh:.1f}",
+                    color=line_color,
+                    fontsize=2, #options.token_index_fontsize,
+                    ha="center",
+                    va="bottom",
+                    zorder=21,
+                    clip_on=True,
+                )
             # 마지막 유효 포인트 업데이트
             if (last_valid_xy is None) or (t >= current_t):
                 last_valid_xy = (x, y)
@@ -1332,7 +1390,7 @@ def draw_token_histories(
             ax.text(
                 lx,
                 ly,
-                str(token),
+                str(token)[:5],
                 color=line_color,
                 fontsize=max(options.token_index_fontsize, options.agent_index_fontsize),
                 ha="left",
@@ -1439,8 +1497,8 @@ current_token_to_np_history: Dict[str, np.ndarray], # (history_len, 11)
         if neighbor_track_token is not None:
             annotate_neighbor_indices_for_past(ax, neighbor_track_token, neigh_past_K, draw_option)
 
-    if current_token_to_np_history:
-        draw_token_histories(ax, current_token_to_np_history, draw_option)
+    # if current_token_to_np_history:
+    #     draw_token_histories(ax, current_token_to_np_history, draw_option)
 
     if draw_option.draw_ego_past:
         draw_ego_past(ax, world_model_feature.get("ego_agent_past"),
