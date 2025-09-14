@@ -486,7 +486,7 @@ def model_training(args):
                                              'cuda' else args.device)
 
     if args.ddp:
-        diffusion_planner = DDP(diffusion_planner, device_ids=[rank], find_unused_parameters=True)
+        diffusion_planner = DDP(diffusion_planner, device_ids=[rank])# find_unused_parameters=True)
     model_ema = None
     if args.use_ema:
         model_ema = ModelEma(
