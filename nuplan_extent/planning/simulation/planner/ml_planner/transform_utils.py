@@ -35,16 +35,6 @@ def vel_acc_to_waypoint(
                     oriented_box=oriented_box_,
                     velocity=velocity_)
 
-    return EgoState.build_from_rear_axle(
-        rear_axle_pose=state,
-        rear_axle_velocity_2d=StateVector2D(*velocity),
-        rear_axle_acceleration_2d=StateVector2D(*acceleration),
-        tire_steering_angle=0.0,
-        time_point=TimePoint(int(timestamp * 1e6)),
-        vehicle_parameters=vehicle,
-        is_in_auto_mode=True,
-    )
-
 
 def _get_fixed_timesteps(agent_state: Agent, future_horizon: float,
                          step_interval: float) -> List[float]:
@@ -84,7 +74,7 @@ def _project_from_global_to_ego_centric_ds(
 
 def _get_velocity_and_acceleration(
     ego_poses: List[StateSE2], agent_history: Deque[Agent],
-    timesteps: List[float]
+    timesteps: List[float], step_s_time: float
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
     """
     Given the past, current and planned ego poses, estimate the velocity and acceleration by taking the derivatives.
@@ -110,8 +100,7 @@ def _get_velocity_and_acceleration(
         dt = current_agent_state.metadata.timestamp_s - agent_history[
             -2].metadata.timestamp_s
     else:
-        # TODO: better way to get dt
-        dt = timesteps[1] - timesteps[0]
+        dt = step_s_time
     timesteps_current_planned: npt.NDArray[np.float32] = np.array(
         [current_agent_state.metadata.timestamp_s] + timesteps)
     ego_poses_current_planned: npt.NDArray[
@@ -123,6 +112,7 @@ def _get_velocity_and_acceleration(
                                      ego_poses_current_planned,
                                      axis=0,
                                      fill_value='extrapolate')
+    # 0.1초 간격으로 출력하길 원하지만 -> 일단 시뮬레이션 시간 간격으로 맞춤
     timesteps_current_planned_interp = np.arange(
         start=current_agent_state.metadata.timestamp_s,
         stop=timesteps[-1] + 1e-6,
@@ -177,7 +167,9 @@ def _get_velocity_and_acceleration(
 
 def _get_absolute_waypoints_from_numpy_poses(
         poses: npt.NDArray[np.float32], agent_history: Deque[Agent],
-        timesteps: List[float]) -> List[Waypoint]:
+        timesteps: List[float],
+step_s_time: float
+) -> List[Waypoint]:
     """
     Converts an array of relative numpy poses to a list of absolute EgoState objects.
 
@@ -186,14 +178,14 @@ def _get_absolute_waypoints_from_numpy_poses(
     :param timesteps: timestamps corresponding to each state
     :return: list of agent states
     """
-    ego_state = agent_history[-1]
+    agent_state = agent_history[-1]
     relative_states = [StateSE2.deserialize(pose) for pose in poses]
-    absolute_states = relative_to_absolute_poses(ego_state.center,
+    absolute_states = relative_to_absolute_poses(agent_state.center,
                                                  relative_states)
     velocities, accelerations = _get_velocity_and_acceleration(
-        absolute_states, agent_history, timesteps)
+        absolute_states, agent_history, timesteps , step_s_time)
     waypoints = [
-        vel_acc_to_waypoint(state, velocity, acceleration, timestep, ego_state)
+        vel_acc_to_waypoint(state, velocity, acceleration, timestep, agent_state)
         for state, velocity, acceleration, timestep in zip(
             absolute_states, velocities, accelerations, timesteps)
     ]
@@ -207,6 +199,7 @@ def transform_predictions_to_states(
     agent_history: Deque[Agent],
     future_horizon: float,
     step_interval: float,
+step_s_time: float,
     include_ego_state: bool = True,
 ) -> List[Waypoint]:
     """
@@ -220,9 +213,9 @@ def transform_predictions_to_states(
     :return: transformed absolute states
     """
     agent_state: Agent = agent_history[-1]
-    timesteps = _get_fixed_timesteps(agent_state, future_horizon, step_interval)
+    timesteps: List[float] = _get_fixed_timesteps(agent_state, future_horizon, step_interval)
     waypoints = _get_absolute_waypoints_from_numpy_poses(
-        predicted_poses, agent_history, timesteps)
+        predicted_poses, agent_history, timesteps, step_s_time)
 
     if include_ego_state:
         ego_state_waypoint = Waypoint(

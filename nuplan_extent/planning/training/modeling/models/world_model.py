@@ -60,20 +60,6 @@ class WorldModel(TorchModuleWrapper):
         else:
             raise RuntimeError("No checkpoint path provided")
 
-    def outputs_to_trajectory(
-            self, outputs: Dict[str, torch.Tensor],
-            ego_state_history: Deque[EgoState]) -> List[InterpolatableState]:
-
-        predictions = outputs['prediction'][0, 0].detach().cpu().numpy().astype(
-            np.float64)  # T, 4
-        heading = np.arctan2(predictions[:, 3], predictions[:, 2])[..., None]
-        predictions = np.concatenate([predictions[..., :2], heading], axis=-1)
-
-        states = transform_predictions_to_states(predictions, ego_state_history,
-                                                 self._future_horizon,
-                                                 self._step_interval)
-
-        return states
 
     def forward(self, features: WorldModelFeature) -> torch.Tensor:
         """

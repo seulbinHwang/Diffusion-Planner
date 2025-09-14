@@ -58,11 +58,11 @@ class Simulation:
         # We add self._scenario.database_interval to the buffer duration here to ensure that the minimum
         # simulation_history_buffer_duration is satisfied
         self._simulation_history_buffer_duration = simulation_history_buffer_duration + self._scenario.database_interval
-
         # The + 1 here is to account for duration. For example, 20 steps at 0.1s starting at 0s will have a duration
         # of 1.9s. At 21 steps the duration will achieve the target 2s duration.
-        self._history_buffer_size = int(self._simulation_history_buffer_duration
-                                        / self._scenario.database_interval) + 1
+        a = int(self._simulation_history_buffer_duration
+                                        / self._scenario.database_interval)
+        self._history_buffer_size = a + 1
         self._history_buffer: Optional[SimulationHistoryBuffer] = None
 
         # Flag that keeps track whether simulation is still running
