@@ -965,15 +965,28 @@ class WorldModelAgents(AbstractMLAgents):
         near_track_token = neighbor_track_token[:self.
                                                 predicted_neighbor_num]  # len == Pnn
         # token_to_traj_wrt_ego: Dict[str, np.ndarray] # (T, 4)
+        token_to_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        for idx, token in enumerate(near_track_token):
+            if token is not None:
+                a_near_future_tarjs_wrt_ego = near_future_tarjs_wrt_ego[idx, 1:, :] # (T, 4)
+                token_to_traj_wrt_ego[token] = a_near_future_tarjs_wrt_ego
+                # if token == "81efd27d45035418":
+                #     print("=========================================")
+                #     a = near_future_tarjs_wrt_ego[idx, :, :] # (1+T, 4)
+                #     b = a[:3, :] # (2, 4)
+                #     dist = np.linalg.norm(b[1:, :2] - b[:-1, :2], axis=1) # (2,)
+                #     vel = (dist / self.step_time_point.time_s)
+                #     print("b:", np.round(b, 2),
+                #           "vel (km/h):", np.round(vel * 3.6, 2),
+                #           "vel (m/s):", np.round(vel, 2)
+                #           )
+
         token_to_traj_wrt_ego: Dict[str, np.ndarray] = {
             token: near_future_tarjs_wrt_ego[idx, 1:, :]
             for idx, token in enumerate(near_track_token)
             if token is not None
         }
 
-        # token_to_traj_wrt_ego = self._get_token_to_traj_wrt_ego(
-        #     self._agents, near_future_tarjs_wrt_ego, ego_rear_axle_xy, ego_yaw)
-        # list[str]
         self.diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
 
@@ -985,8 +998,10 @@ class WorldModelAgents(AbstractMLAgents):
         # near_future_tarjs_wrt_ego: 차량 이외의 대상도 포함되어 있음
         for idx, token in enumerate(self.diffusion_agents_track_tokens):
             if token_to_traj_wrt_ego.get(token) is not None:
-                token_to_future_traj_wrt_ego[token] = token_to_traj_wrt_ego[
-                    token]
+                a = token_to_traj_wrt_ego[token]
+                token_to_future_traj_wrt_ego[token] = a # (T, 4)
+
+
 
         current_token_to_agent_history: Dict[str,
                                        Deque[Agent]] = get_token_to_history(
@@ -1056,6 +1071,16 @@ class WorldModelAgents(AbstractMLAgents):
                 global_future_arrays,
                 anchor_ego_state)  # anchor_ego_state: (3,)
             token_to_refined_traj_wrt_ego[token] = local_future_arrays
+            # if token == "81efd27d45035418":
+            #     a = local_future_arrays[:3, :6] # (3, 6)
+            #     vel_x = a[:, 4]
+            #     vel_y = a[:, 5]
+            #     vel_ = np.linalg.norm(np.stack([vel_x, vel_y], axis=1), axis=1) # (3,)
+            #
+            #     print("local_future_arrays:", np.round(a, 2),
+            #           "vel_ (km/h):", np.round(vel_* 3.6, 2),
+            #           "vel_ (m/s):", np.round(vel_, 2)
+            #           )
             token_to_interpol_traj[token] = future_trajectory
 
         token_to_new_agent: Dict[str, Agent] = {}
@@ -1081,6 +1106,17 @@ class WorldModelAgents(AbstractMLAgents):
                 new_waypoint_array, anchor_ego_state)  # anchor_ego_state: (3,)
             token_to_new_waypoint_array[
                 agent_token] = new_local_waypoint_array  # (1, 11)
+            # if agent_token == "81efd27d45035418":
+            #     a = new_local_waypoint_array[:, :6] # (1, 6)
+            #     vel_x = a[:, 4]
+            #     vel_y = a[:, 5]
+            #     vel = np.linalg.norm(np.stack([vel_x, vel_y], axis=1), axis=1) # (1,)
+            #     print("new_local_waypoint_array:", np.round(new_local_waypoint_array[:, :6], 2),
+            #           "vel (km/h):", np.round(vel * 3.6, 2),
+            #           "vel (m/s):", np.round(vel, 2)
+            #
+            #           )
+
             ################
             new_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,

@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+export PYTHONUNBUFFERED=1
 
 ###################################
 # User Configuration Section
@@ -57,6 +59,21 @@ echo "[Preflight] Done."
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 
-"$RUN_PYTHON_PATH" -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone train_predictor.py \
+RUN_ID=$(date +%Y%m%d-%H%M%S)
+LOG_DIR=/mnt/nuplan/logs/$RUN_ID
+mkdir -p "$LOG_DIR"
+
+# 디버그: 파이썬/CPP 스택, NCCL 조기실패
+export TORCH_SHOW_CPP_STACKTRACES=1
+export PYTHONFAULTHANDLER=1
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,COLL
+export NCCL_ASYNC_ERROR_HANDLING=1
+
+# torchelastic가 자식(rank0) 오류를 JSON으로 저장하게 함 (아주 중요!)
+export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
+
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee 3 \
+ train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH"

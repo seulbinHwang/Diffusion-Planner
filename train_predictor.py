@@ -1,6 +1,7 @@
 import os
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
@@ -10,6 +11,8 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')  # PyTorch>=2.0
+import sys, os, faulthandler, traceback
+faulthandler.enable(all_threads=True)
 
 import argparse
 import shutil
@@ -33,6 +36,12 @@ from diffusion_planner.train_epoch import train_epoch
 
 
 import math
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 def pnn_schedule(epoch: int,
                  total_epochs: int,
@@ -822,4 +831,12 @@ if __name__ == "__main__":
         args.distributed = False
 
     # Run
-    model_training(args)
+    try:
+        model_training(args)
+    except BaseException:
+        rank = int(os.environ.get("RANK", -1))
+        print(f"\n[rank{rank}] Unhandled exception (printing full traceback):",
+              file=sys.stderr, flush=True)
+        traceback.print_exc()           # <-- 표준에러로 자세한 스택
+        sys.stderr.flush()
+        raise

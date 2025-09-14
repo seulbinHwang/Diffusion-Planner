@@ -143,7 +143,7 @@ class DrawingOptions:
 
     draw_velocity_arrows_past_all: bool = True # check
     draw_velocity_arrows_pred_all: bool = False # check
-    draw_velocity_arrows_future_all: bool = False # check
+    draw_velocity_arrows_future_all: bool = True # check
 
     arrow_length_m: float = 5.0
     heading_line_scale: float = 0.5
@@ -163,6 +163,13 @@ class DrawingOptions:
     future_agent_index_color: str = "#808080" # 번호 텍스트 색 # 회색
     route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 청록색
     neighbor_future_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+
+
+    # ── [추가] 토큰 미래 궤적 드로잉 모드 및 스타일 ─────────────────────
+    token_future_draw_mode: str = "point"  # 'arrow' 또는 'point'
+    token_future_point_marker: str = "o"
+    token_future_point_marker_size: float = 0.8
+    token_future_arrow_length_m: float = 1.0
 
     # 🔽 [추가] 토큰 시작 인덱스 텍스트 표기용 옵션
     token_index_color: str = "#00C8C8"     # 청록색
@@ -787,14 +794,14 @@ neighbor_track_token: List[Optional[str]],
             assert track_token is None
             continue
         x, y = float(row[0]), float(row[1])
-        ax.text(x + text_d,
-                y + text_d,
-                str(track_token)[:5],
-                color=text_color,
-                fontsize=options.agent_index_fontsize,
-                ha='left',
-                va='bottom',
-                zorder=30)
+        # ax.text(x + text_d,
+        #         y + text_d,
+        #         str(track_token)[:5],
+        #         color=text_color,
+        #         fontsize=options.agent_index_fontsize,
+        #         ha='left',
+        #         va='bottom',
+        #         zorder=30)
 
 
 def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
@@ -1028,44 +1035,48 @@ def draw_token_refined_trajectories(
                         zorder=24,
                     )
                     if options.draw_velocity_arrows_future_all:
-                        add_velocity_arrow(
-                            ax,
-                            x,
-                            y,
-                            vx,
-                            vy,
-                            length_m=options.arrow_length_m,
-                            line_color=REFINED_FUTURE_STYLE["velocity_line_color"],
-                            line_width=REFINED_FUTURE_STYLE["velocity_line_width"],
-                            line_alpha=REFINED_FUTURE_STYLE["velocity_line_alpha"],
-                            zorder=24,
-                        )
+                        # add_velocity_arrow(
+                        #     ax,
+                        #     x,
+                        #     y,
+                        #     vx,
+                        #     vy,
+                        #     length_m=options.arrow_length_m,
+                        #     line_color=REFINED_FUTURE_STYLE["velocity_line_color"],
+                        #     line_width=REFINED_FUTURE_STYLE["velocity_line_width"],
+                        #     line_alpha=REFINED_FUTURE_STYLE["velocity_line_alpha"],
+                        #     zorder=24,
+                        # )
                         # [추가] 속도 크기 텍스트(km/h) - refined 모든 지점 (색: #FF4D4D)
                         speed_kmh = float(np.hypot(vx, vy)) * 3.6
+                        if t % 2 == 0:
+                            offset = 5
+                        else:
+                            offset = 3
                         ax.text(
                             x,
-                            y + options.token_index_offset_m,
+                            y + options.token_index_offset_m * offset,
                             f"{speed_kmh:.1f}",
                             color=REFINED_FUTURE_STYLE["line_color"],  # "#FF4D4D"
-                            fontsize=options.token_index_fontsize,
+                            fontsize=2, #options.token_index_fontsize,
                             ha="center",
                             va="bottom",
                             zorder=25,
                             clip_on=True,
                         )
                     # 첫 유효 포인트에 빨간색 idx(아래쪽 오프셋)
-                    if not label_drawn:
-                        ax.text(
-                            x,
-                            y - options.token_index_offset_m,
-                            str(token)[:5],
-                            color=REFINED_FUTURE_STYLE["line_color"],
-                            fontsize=options.token_index_fontsize,
-                            ha="center",
-                            va="top",
-                            zorder=25,
-                        )
-                        label_drawn = True
+                    # if not label_drawn:
+                    #     ax.text(
+                    #         x,
+                    #         y - options.token_index_offset_m,
+                    #         str(token)[:5],
+                    #         color=REFINED_FUTURE_STYLE["line_color"],
+                    #         fontsize=options.token_index_fontsize,
+                    #         ha="center",
+                    #         va="top",
+                    #         zorder=25,
+                    #     )
+                    #     label_drawn = True
 
         # ── (B) 신규 waypoint(주황) ─────────────────────────────────
         if token_to_new_waypoint_array and (token in token_to_new_waypoint_array):
@@ -1135,36 +1146,61 @@ def draw_token_refined_trajectories(
                     clip_on=True,
                 )
             # 번호 라벨: 주황색, "오른쪽"으로 살짝 이동
-            ax.text(
-                x + options.token_index_offset_m,
-                y,
-                str(token)[:5],
-                color=NEW_WAYPOINT_STYLE["line_color"],
-                fontsize=options.token_index_fontsize,
-                ha="left",
-                va="center",
-                zorder=29,
-            )
+            # ax.text(
+            #     x + options.token_index_offset_m,
+            #     y,
+            #     str(token)[:5],
+            #     color=NEW_WAYPOINT_STYLE["line_color"],
+            #     fontsize=options.token_index_fontsize,
+            #     ha="left",
+            #     va="center",
+            #     zorder=29,
+            # )
 
-
+from typing import Optional, Literal
 def draw_token_future_arrows(
     ax: plt.Axes,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
     options: DrawingOptions,
+    draw_mode: Optional[Literal["arrow", "point"]] = None,
 ) -> None:
-    """토큰 기준 미래 포즈를 '개별 화살표'로 그림.
+    """토큰 기준 미래 포즈를 '화살표(방향 포함)' 또는 '점(방향 미사용)'으로 그림.
 
-    Parameters
-    ----------
-    token_to_future_traj_wrt_ego : Dict[str, np.ndarray] | None
-        각 value: shape (future_len=80, 4) = [x, y, cos(yaw), sin(yaw)]
-        - invalid 규칙: 4값 모두 0(±eps) → 스킵
-        - valid 시: (x,y)에서 (cos,sin) 방향으로 길이 options.arrow_length_m(기본 2 m) 화살표
-    options : DrawingOptions
+    Args:
+        ax: Matplotlib 축.
+        token_to_future_traj_wrt_ego: Dict[str, np.ndarray] | None
+            각 value: shape (future_len, 4) = [x, y, cos(yaw), sin(yaw)]
+            - invalid 규칙: 4값 모두 0(±eps) → 스킵
+        options: DrawingOptions
+            - token_future_draw_mode: 'arrow' | 'point'
+            - token_future_point_marker, token_future_point_marker_size
+            - token_future_arrow_length_m
+        draw_mode: Optional['arrow' | 'point']
+            - 우선순위: draw_mode 인자(있으면) > options.token_future_draw_mode(없으면 'arrow')
+
+    동작:
+        - 'arrow' 모드:
+            (x,y)에서 (cos,sin) 방향으로 고정 길이(options.token_future_arrow_length_m) 화살표
+        - 'point' 모드:
+            (x,y) 위치에 포인트만 표시(방향 미사용)
+
+    Note:
+        - t==0 (각 토큰의 첫 포인트)에는 토큰 문자열을 살짝 아래(y-오프셋)에 표시.
     """
     if not token_to_future_traj_wrt_ego:
         return
+
+    # 모드 결정 (인자 > 옵션 > 기본값 'arrow')
+    mode = (draw_mode or getattr(options, "token_future_draw_mode", "arrow")).lower()
+    if mode not in {"arrow", "point"}:
+        raise ValueError(f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point'.")
+
+
     eps = options.invalid_eps
+    point_marker = getattr(options, "token_future_point_marker", "o")
+    point_ms = float(getattr(options, "token_future_point_marker_size", 0.8))
+    arrow_len = float(getattr(options, "token_future_arrow_length_m", 1.0))
+
     # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
     for idx, (token, arr) in enumerate(token_to_future_traj_wrt_ego.items()):  # [ADD]
         if arr is None or arr.size == 0:
@@ -1183,30 +1219,43 @@ def draw_token_future_arrows(
             x, y = float(row[0]), float(row[1])
             c, s = float(row[2]), float(row[3])
 
-            # 방향 벡터 (c, s)를 정규화하여 고정 길이 화살표
-            add_velocity_arrow(
-                ax,
-                x,
-                y,
-                c,
-                s,
-                length_m=1., #options.arrow_length_m,
-                line_color=TOKEN_FUTURE_STYLE["line_color"],
-                line_width=TOKEN_FUTURE_STYLE["line_width"],
-                zorder=23  # 에이전트 윤곽(24~27) 바로 아래/사이에 위치하도록
-            )
+            if mode == "arrow":
+                # 방향 벡터 (c, s)를 정규화하여 고정 길이(옵션) 화살표
+                add_velocity_arrow(
+                    ax,
+                    x,
+                    y,
+                    c,
+                    s,
+                    length_m=arrow_len,
+                    line_color=TOKEN_FUTURE_STYLE["line_color"],
+                    line_width=TOKEN_FUTURE_STYLE["line_width"],
+                    zorder=23,
+                )
+            else:
+                # 점만 표시(방향 정보 사용하지 않음)
+                ax.plot(
+                    x,
+                    y,
+                    marker=point_marker,
+                    markersize=point_ms,
+                    linestyle="None",
+                    color=TOKEN_FUTURE_STYLE["line_color"],
+                    zorder=23,
+                )
 
-            # [ADD] 시작 화살표(t==0)에만 인덱스 텍스트를 화살표 '살짝 아래'에 표기
-            if t == 0:  # [ADD]
-                ax.text(  # [ADD]
-                    x,                                          # [ADD]
-                    y - options.agent_index_offset_m,           # [ADD] "아래쪽" = y 음의 방향으로 오프셋
-                    str(token)[:5],                                   # [ADD] 삽입순서 인덱스(0,1,2,…)
-                    color=TOKEN_FUTURE_STYLE["index_color"],                            # [ADD] 요청 색상
-                    fontsize=options.agent_index_fontsize,      # [ADD] 기존 폰트 크기 재사용
-                    ha="center", va="top", zorder=24,           # [ADD] 화살표(23) 위에 보이도록
-                )                                               # [ADD]
-
+            # 시작 포인트(t==0)에 토큰 식별 라벨(흰색)을 화살표/점 바로 아래에 표기
+            # if t == 0:
+            #     ax.text(
+            #         x,
+            #         y - options.agent_index_offset_m,
+            #         str(token)[:5],
+            #         color=TOKEN_FUTURE_STYLE["index_color"],
+            #         fontsize=options.agent_index_fontsize,
+            #         ha="center",
+            #         va="top",
+            #         zorder=24,
+            #     )
 # =============================================================================
 # Figure/Axis & 범위/저장
 # =============================================================================
@@ -1385,18 +1434,18 @@ def draw_token_histories(
                 last_valid_xy = (x, y)
 
         # 토큰 문자열 라벨(주황색): 마지막 유효 포인트 기준, 오른쪽으로 오프셋
-        if last_valid_xy is not None:
-            lx, ly = last_valid_xy
-            ax.text(
-                lx,
-                ly,
-                str(token)[:5],
-                color=line_color,
-                fontsize=max(options.token_index_fontsize, options.agent_index_fontsize),
-                ha="left",
-                va="center",
-                zorder=21,
-            )
+        # if last_valid_xy is not None:
+        #     lx, ly = last_valid_xy
+        #     ax.text(
+        #         lx,
+        #         ly,
+        #         str(token)[:5],
+        #         color=line_color,
+        #         fontsize=max(options.token_index_fontsize, options.agent_index_fontsize),
+        #         ha="left",
+        #         va="center",
+        #         zorder=21,
+        #     )
 
 # [Add]
 def draw_world_model_to_png(
