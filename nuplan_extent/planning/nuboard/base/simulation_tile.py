@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from selenium.webdriver.chrome.options import Options as ChromeOptions
 
 import cv2
 import msgpack
@@ -454,10 +455,24 @@ class SimulationTile:
 
         try:
             if len(selected_simulation_figure.ego_state_plot.data_sources):
-                chrome_options = webdriver.ChromeOptions()
-                chrome_options.headless = True
-                driver = webdriver.Chrome(chrome_options=chrome_options)
-                driver.set_window_size(1920, 1080)
+                options = ChromeOptions()
+                # Chrome 109+ 권장: 새로운 헤드리스 모드
+                try:
+                    options.add_argument("--headless=new")
+                except Exception:
+                    # 구버전 Chrome 호환
+                    options.add_argument("--headless")
+
+                # 화면 크기는 headless에서 옵션으로 넘기는 게 더 안정적입니다.
+                options.add_argument("--window-size=1920,1080")
+
+                # (리눅스/컨테이너 환경에서 흔히 필요한 안정화 옵션)
+                options.add_argument("--disable-gpu")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+
+                # Selenium 4.6+ : Selenium Manager가 chromedriver 자동 준비
+                driver = webdriver.Chrome(options=options)
                 shape = None
                 simulation_figure = self._create_initial_figure(
                     figure_index=figure_index,

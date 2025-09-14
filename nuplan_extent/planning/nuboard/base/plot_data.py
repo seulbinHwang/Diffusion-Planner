@@ -467,7 +467,7 @@ class AgentStatePlot(BaseScenarioPlot):
             return np.nan
 
         number_track_id = self.track_id_history.get(track_id, None)
-        if not number_track_id:
+        if number_track_id is None:
             self.track_id_history[track_id] = len(self.track_id_history)
             number_track_id = len(self.track_id_history)
 
@@ -634,25 +634,25 @@ tracked_object_types = {
                         track_tokens.append(tracked_object.track_token)
 
                         if isinstance(tracked_object, Agent):
-                            if tracked_object.predictions:
-                                predictions_list: List[
-                                    PredictedTrajectory] = tracked_object.predictions
-                                if len(predictions_list) >= 1:
-                                    first_pred: PredictedTrajectory = predictions_list[
-                                        0]
-                                    pred_states = first_pred.trajectory.get_sampled_trajectory(
-                                    )
-                                    pred_xs = [
-                                        state.center.x for state in pred_states
-                                    ]
-                                    pred_ys = [
-                                        state.center.y for state in pred_states
-                                    ]
-                                    prediction_xs.append(pred_xs)
-                                    prediction_ys.append(pred_ys)
-                                else:
-                                    prediction_xs.append([])
-                                    prediction_ys.append([])
+                            predictions_list: List[
+                                PredictedTrajectory] = tracked_object.predictions
+                            if len(predictions_list) >= 1:
+
+                                first_pred: PredictedTrajectory = predictions_list[
+                                    0]
+                                pred_states = first_pred.trajectory.get_sampled_trajectory(
+                                )
+                                pred_xs = [
+                                    state.center.x for state in pred_states
+                                ]
+                                pred_ys = [
+                                    state.center.y for state in pred_states
+                                ]
+                                prediction_xs.append(pred_xs)
+                                prediction_ys.append(pred_ys)
+                            else:
+                                prediction_xs.append([])
+                                prediction_ys.append([])
 
                             if tracked_object.past_trajectory is not None:
                                 past_trajectory_: PredictedTrajectory = tracked_object.past_trajectory
