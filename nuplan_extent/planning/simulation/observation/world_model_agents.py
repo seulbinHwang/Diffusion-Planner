@@ -10,6 +10,8 @@ from nuplan.common.actor_state.state_representation import StateSE2, StateVector
 from nuplan.common.actor_state.tracked_objects import TrackedObject
 from collections import deque
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
+np.set_printoptions(precision=3, suppress=True)
+
 from nuplan_extent.planning.training.preprocessing.features.world_model import WorldModelFeature
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWrapper
@@ -877,7 +879,7 @@ class WorldModelAgents(AbstractMLAgents):
         future_traj_wrt_npc_center = np.concatenate(
             [future_traj_wrt_npc_center[..., :2], heading], axis=-1)
 
-        waypoints, timesteps_past_current_print = transform_predictions_to_states(future_traj_wrt_npc_center,
+        waypoints = transform_predictions_to_states(future_traj_wrt_npc_center,
                                                  ego_state_history,
                                                  self._future_horizon,
                                                  self._step_interval,
