@@ -9,15 +9,18 @@ export HYDRA_FULL_ERROR=1
 #unset RAY_ADDRESS
 #ray stop -f >/dev/null 2>&1 || true
 HOME_DIR="/media/user/E" #"/home/user"
+PROJECTS_FOLDER="projects"
 DATASET_DIR="${HOME_DIR}" # ${HOME_DIR}/nuplan
+PROJECTS_DIR="${HOME_DIR}/${PROJECTS_FOLDER}"
 export OC_CAUSE=1
-export NUPLAN_DEVKIT_ROOT="${HOME_DIR}/projects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
+export NUPLAN_DEVKIT_ROOT="${PROJECTS_DIR}/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
+# data_root: ${oc.env:NUPLAN_DATA_ROOT}/nuplan-v1.1/splits/trainval
 export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
 export NUPLAN_MAPS_ROOT="${DATASET_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
 export NUPLAN_EXP_ROOT="${DATASET_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 
-ARGS_FILE=/home/user/E/projects/Diffusion-Planner/checkpoints/args_base.json
-CKPT_FILE=/home/user/E/projects/Diffusion-Planner/checkpoints/npc_model.pth
+ARGS_FILE=$ROJECTS_DIR/Diffusion-Planner/checkpoints/args_base.json
+CKPT_FILE=$PROJECTS_DIR/Diffusion-Planner/checkpoints/npc_model.pth
 # nuplan/planning/script/config/simulation/main_callback/time_callback.yaml
 # Dataset split to use
 # Options:
