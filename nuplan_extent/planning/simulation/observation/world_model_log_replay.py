@@ -897,8 +897,7 @@ class WorldModelLogReplay(AbstractMLAgents):
                     idx, 1:, :]  # (T, 4)
                 token_to_traj_wrt_ego[token] = a_near_future_tarjs_wrt_ego
         # near_track_token: List[str] # len == Pnn
-        near_track_token = token_to_traj_wrt_ego.keys()
-        assert isinstance(near_track_token, list)
+        near_track_token = list(token_to_traj_wrt_ego.keys())
 
         # 진짜 존재하는 대상만
         token_to_refined_traj_wrt_ego: Dict[str, np.ndarray] = {}  # (T, 11)
