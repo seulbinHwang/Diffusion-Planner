@@ -19,6 +19,7 @@ NuBoard 런처 스크립트 (Jupyter → .py 변환)
 """
 
 from __future__ import annotations
+from nuplan_extent.planning.script.run_nuboard import main as main_nuboard
 
 import json
 import logging
@@ -230,7 +231,6 @@ def run_nuboard_with_overrides(
     cfg = hydra.compose(config_name="default_nuboard", overrides=overrides)
 
     # NuBoard 실행 (nuplan-devkit의 run_nuboard.py 내부 main 함수 사용)
-    from nuplan_extent.planning.script.run_nuboard import main as main_nuboard
 
     logger.info("NuBoard 시작 준비 완료")
     logger.info(" - Nuboard 파일 개수: %d", len(nuboard_paths))
