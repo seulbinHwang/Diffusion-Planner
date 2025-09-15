@@ -53,7 +53,6 @@ RESULT_FOLDER: str = f"{HOME_DIR}/exp/simulation/log_replay_reactive_diffusion_a
 # - NUPLAN_EXP_ROOT: nuPlan 실험 결과(실행 산출물) 루트 경로
 #   예: "/data/nuplan-v1.1/exp"
 # - NUPLAN_SIMULATION_ALLOW_ANY_BUILDER (선택): 커스텀 빌더 허용 플래그 (확장 코드 있을 때 편리)
-HOME_DIR="/home/user/nuplan"
 ENV_VARS: Dict[str, str] = {
     "NUPLAN_DEVKIT_ROOT": f"{PROJECTS_DIR}/nuplan-devkit",
     "NUPLAN_DATA_ROOT":  f"{HOME_DIR}/dataset",
