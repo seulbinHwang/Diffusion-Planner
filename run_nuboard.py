@@ -191,7 +191,7 @@ def _initialize_hydra(config_path: Path) -> None:
     config_path_rel = relpath(str(config_path), start=getcwd())  # <-- 절대→상대
 
     # Hydra 1.1~1.3 모두 안전하게 동작
-    hydra.initialize(version_base=None, config_path=config_path_rel)
+    hydra.initialize(config_path=config_path_rel)
 
 
 
