@@ -19,8 +19,8 @@ export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nup
 export NUPLAN_MAPS_ROOT="${DATASET_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
 export NUPLAN_EXP_ROOT="${DATASET_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 
-ARGS_FILE=$ROJECTS_DIR/Diffusion-Planner/checkpoints/args_base.json
-CKPT_FILE=$PROJECTS_DIR/Diffusion-Planner/checkpoints/npc_model.pth
+ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base.json"
+CKPT_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/npc_model.pth"
 # nuplan/planning/script/config/simulation/main_callback/time_callback.yaml
 # Dataset split to use
 # Options:
