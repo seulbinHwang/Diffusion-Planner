@@ -12,7 +12,7 @@ HOME_DIR="/media/user/E" #"/home/user"
 DATASET_DIR="${HOME_DIR}" # ${HOME_DIR}/nuplan
 export OC_CAUSE=1
 export NUPLAN_DEVKIT_ROOT="${HOME_DIR}/projects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
-export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
+export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset/splits" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
 export NUPLAN_MAPS_ROOT="${DATASET_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
 export NUPLAN_EXP_ROOT="${DATASET_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 
