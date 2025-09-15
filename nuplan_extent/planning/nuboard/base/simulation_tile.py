@@ -48,9 +48,7 @@ from nuplan.planning.nuboard.tabs.config.scenario_tab_config import (
     prev_button_config,
 )
 from nuplan.planning.simulation.simulation_log import SimulationLog
-from bokeh.document import Document
-from bokeh.layouts import column
-from bokeh.resources import INLINE
+
 try:
     import chromedriver_binary
 except ImportError:
@@ -475,10 +473,6 @@ class SimulationTile:
 
                 # Selenium 4.6+ : Selenium Manager가 chromedriver 자동 준비
                 driver = webdriver.Chrome(options=options)
-
-                # 2) 서버 문서(self._doc)와 분리된, 내보내기 전용 Document 준비
-                export_doc = Document()
-
                 shape = None
                 simulation_figure = self._create_initial_figure(
                     figure_index=figure_index,
@@ -487,37 +481,22 @@ class SimulationTile:
                 )
                 # Copy the data sources
                 simulation_figure.copy_datasources(selected_simulation_figure)
-
-                # 4) "즉시 실행"용 더미 Doc: add_next_tick_callback을 즉시 실행하도록 만듭니다.
-                class _ImmediateDoc:
-                    def add_next_tick_callback(self, cb):
-                        cb()
-
-                # 5) 일시적으로 self._doc을 즉시실행 Doc으로 바꿔 동기 렌더링을 유도
-                orig_doc = self._doc
-                self._doc = _ImmediateDoc()
-                try:
-                    # 내보내기용 Document에 실제 Figure를 루트로 추가
-                    export_doc.add_root(column(simulation_figure.figure))
-                    self._render_scenario(main_figure=simulation_figure)
-                    length = len(
-                        selected_simulation_figure.ego_state_plot.data_sources)
-                    for frame_index in tqdm(range(length), desc="Rendering video"):
-                        self._render_plots(main_figure=simulation_figure,
-                                           frame_index=frame_index)
-                        image = get_screenshot_as_png(column(
-                            simulation_figure.figure),
-                                                      driver=driver)
-                        shape = image.size
-                        images.append(image)
-                        label = f"Rendering video now... ({frame_index}/{length})"
-                        self._doc.add_next_tick_callback(
-                            partial(self._update_video_button_label,
-                                    figure_index=figure_index,
-                                    label=label))
-                finally:
-                    self._doc = orig_doc  # 원복
-                    driver.quit()
+                self._render_scenario(main_figure=simulation_figure)
+                length = len(
+                    selected_simulation_figure.ego_state_plot.data_sources)
+                for frame_index in tqdm(range(length), desc="Rendering video"):
+                    self._render_plots(main_figure=simulation_figure,
+                                       frame_index=frame_index)
+                    image = get_screenshot_as_png(column(
+                        simulation_figure.figure),
+                                                  driver=driver)
+                    shape = image.size
+                    images.append(image)
+                    label = f"Rendering video now... ({frame_index}/{length})"
+                    self._doc.add_next_tick_callback(
+                        partial(self._update_video_button_label,
+                                figure_index=figure_index,
+                                label=label))
 
                 fourcc = cv2.VideoWriter_fourcc("M", "J", "P", "G")
                 if database_interval:
