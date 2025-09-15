@@ -8,13 +8,13 @@ export HYDRA_FULL_ERROR=1
 
 #unset RAY_ADDRESS
 #ray stop -f >/dev/null 2>&1 || true
-
-HOME_DIR="/home/user/nuplan"
+HOME_DIR="/media/user/E" #"/home/user"
+DATASET_DIR="${HOME_DIR}" # ${HOME_DIR}/nuplan
 export OC_CAUSE=1
-export NUPLAN_DEVKIT_ROOT="/home/user/PycharmProjects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
-export NUPLAN_DATA_ROOT="${HOME_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
-export NUPLAN_MAPS_ROOT="${HOME_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
-export NUPLAN_EXP_ROOT="${HOME_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
+export NUPLAN_DEVKIT_ROOT="${HOME_DIR}/PycharmProjects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
+export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
+export NUPLAN_MAPS_ROOT="${DATASET_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
+export NUPLAN_EXP_ROOT="${DATASET_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 # nuplan/planning/script/config/simulation/main_callback/time_callback.yaml
 # Dataset split to use
 # Options:
