@@ -125,7 +125,7 @@ def clean_up_s3_artifacts() -> None:
         rmtree(local_s3_path)
 
 
-@hydra.main(version_base=None, config_path=CONFIG_PATH, config_name=CONFIG_NAME)
+@hydra.main(config_path=CONFIG_PATH, config_name=CONFIG_NAME)
 def main(cfg: DictConfig) -> None:
     """
     Execute all available challenges simultaneously on the same scenario. Calls run_simulation to allow planner to
