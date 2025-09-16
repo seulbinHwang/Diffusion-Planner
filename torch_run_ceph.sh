@@ -68,7 +68,7 @@ export TORCH_SHOW_CPP_STACKTRACES=1
 export PYTHONFAULTHANDLER=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 
-DEBUG_LOG=1   # 1: 상세 디버그, 0: 일반 학습
+DEBUG_LOG=0   # 1: 상세 디버그, 0: 일반 학습
 
 if (( DEBUG_LOG )); then
   export NCCL_DEBUG=INFO
@@ -87,5 +87,5 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/world-model-small/2025-09-11-05:32:07" \
-  --name "world-model-small"
+  --name "half-life-weighted-loss-h-two" \
+#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/world-model-small/2025-09-11-05:32:07" \
