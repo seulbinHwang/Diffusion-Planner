@@ -26,6 +26,42 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(msg)
     return tensor
 
+# [add] ----------------------------------------------------------------------
+def _build_half_life_weights(
+    T: int, # 80
+    *,
+    dt_s: float = 0.1,
+    half_life_s: float = 2.0,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """half-life 기반 시간 가중치 텐서를 생성합니다.
+
+    각 시간 스텝 j(0-index)에 대해 t_j = (j+1)*dt_s 로 두고,
+    w_j = 0.5 ** (t_j / half_life_s) 로 정의합니다.
+    예) half_life_s=2.0이면, 2초→1/2, 4초→1/4, 8초→1/16.
+
+    Args:
+        T (int): 미래 스텝 수(프레임 수).
+        dt_s (float): 프레임 간 시간 간격(초). 기본 0.1초.
+        half_life_s (float): half-life(초).
+        device (torch.device): 출력 텐서가 위치할 디바이스.
+        dtype (torch.dtype): 출력 텐서 dtype.
+
+    Returns:
+        torch.Tensor: (1, 1, T) 모양의 가중치 텐서.  # shape: [1, 1, T]
+
+    Note:
+        - 시간축은 [dt_s, 2*dt_s, ..., T*dt_s].
+        - 브로드캐스트를 위해 (1,1,T)로 반환합니다.
+    """
+    # t: (T,) = [dt_s, 2*dt_s, ..., T*dt_s]
+    t = torch.arange(1, T + 1, device=device, dtype=dtype) * float(dt_s)  # [T]
+    # w: (T,) = 0.5 ** (t / half_life_s)
+    w = torch.pow(0.5, t / float(half_life_s))  # [T]
+    return w.view(1, 1, T)  # [1, 1, T]
+# ----------------------------------------------------------------------------
+
 
 def _compute_xy_yaw_losses(
         score_denorm: torch.Tensor, near_future_gt: torch.Tensor,
@@ -187,10 +223,28 @@ def diffusion_loss_func(
         dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
     # near_future_valid: [B, Pnn, T]
     valid = near_future_valid.float()
-    denom = valid.sum().clamp(min=1) # denom: scalar
-    valid_dpm_loss = dpm_loss * valid # (B, Pnn, T)
-    loss_val = valid_dpm_loss.sum() / denom  # 항상 requires_grad=True
+
+    # [add] ---- 시간 가중치(half-life) 적용 ------------------------------------
+    # half-life과 dt(초)는 필요 시 조정 가능
+    time_step_s: float = 0.1    # 0.1초 간격(데이터/시뮬 규격에 맞게 조정)
+    half_life_s: float = 2.0    # 2초에서 가중치 1/2
+    w_t: torch.Tensor = _build_half_life_weights(
+        T, # 80
+        dt_s=time_step_s, # 0.1
+        half_life_s=half_life_s, # 2.0
+        device=dpm_loss.device,
+        dtype=dpm_loss.dtype,
+    )  # [1, 1, T]
+    # 유효 마스크와 함께 곱해서 "가중 평균"으로 정규화
+    weighted_dpm = dpm_loss * w_t                       # (B, Pnn, T)
+    denom = (valid * w_t).sum().clamp(min=1e-6)        # 스칼라(가중치 포함 유효개수)
+    valid_dpm_loss = weighted_dpm * valid              # (B, Pnn, T)
+    loss_val = valid_dpm_loss.sum() / denom            # 스칼라(gradient O)
     loss["neighbor_prediction_loss"] = loss_val
+
+    # denom = valid.sum().clamp(min=1) # denom: scalar
+    # valid_dpm_loss = dpm_loss * valid # (B, Pnn, T)
+    # loss_val = valid_dpm_loss.sum() / denom  # 항상 requires_grad=True
 
     # compute and merge xy/yaw losses via helper
     if model_type == "x_start":
