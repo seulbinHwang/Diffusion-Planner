@@ -595,8 +595,11 @@ class DiT(nn.Module):
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 최종 출력도 0
 
         if self._model_type == "score":
-            return x / (self.marginal_prob_std(diffusion_time)[:, None, None] +
-                        1e-6)
+            std = self.marginal_prob_std(diffusion_time).float()[
+                :, None, None]  # FP32
+            out = (x.float() / (std + 1e-6)).to(
+                x.dtype)  # 계산은 FP32, 최종만 원래 dtype
+            return out
         elif self._model_type == "x_start":
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, (1 + T) * 4)

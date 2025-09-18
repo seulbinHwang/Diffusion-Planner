@@ -290,26 +290,32 @@ class NearAgentsRouteLaneEncoder(nn.Module):
 
         # attn_pre: (B,Pnn,R) → softmax → (B,Pnn,R)
         # attn: (B,Pnn,R,1)  # 마지막 차원으로 1을 붙여 (R,1) 가중합에 대비
-        attn = F.softmax(logits, dim=-1).unsqueeze(-1).to(route_lanes.dtype)
+        attn = F.softmax(logits, dim=-1).unsqueeze(-1)
         # (~route_lanes_mask): (B,Pnn,R) → unsqueeze(-1): (B,Pnn,R,1)
         # attn_masked: (B,Pnn,R,1)  # 무효 route 가중치 0
         attn = attn * (~route_lanes_mask).unsqueeze(-1)
 
         # (attn * route_lanes): (B,Pnn,R,1) * (B,Pnn,R,H) → 브로드캐스트 → (B,Pnn,R,H)
         # pooled: (B,Pnn,H)  # R축(=route_num)으로 가중합
-        pooled = (attn * route_lanes).sum(dim=2)
+        pooled = (attn.float() * route_lanes.float()).sum(dim=2).to(
+            route_lanes.dtype)
 
         # ★ 결측 에이전트는 unknown_emb로 대체 (수정된 부분)
         # all_off: (B,Pnn)  # 해당 에이전트의 모든 route가 무효(True)
         if all_off.any().item():
             # self.unknown_emb: (1,1,H)
             # self.unknown_emb[0,0]: (H,)  # 1D 벡터
-            # pooled[all_off]: (N_all_off, H)  # (B,Pnn) bool 마스크로 인덱싱한 결과
             # unknown_row: (H,)
+            # pooled[all_off]: (N_all_off, H)  # (B,Pnn) bool 마스크로 인덱싱한 결과
             unknown_row = self.unknown_emb[0, 0].to(device=pooled.device,
                                                     dtype=pooled.dtype)
-            # pooled[all_off]: (N_all_off, H)  ← (H,)가 행 방향으로 브로드캐스트되어 채워짐
-            pooled[all_off] = unknown_row
+            # pooled: (B,Pnn,H)
+            pooled = torch.where(
+                all_off.unsqueeze(-1),  # (B, Pnn, 1) True → 대체
+                unknown_row.expand_as(pooled),  # (B, Pnn, H)
+                pooled
+            )
+
         # norm 입력/출력: (B,Pnn,H)
         # drop: (B,Pnn,H)
         pooled = self.drop(self.norm(pooled))  # (B,Pnn,hidden_dim)
@@ -1298,13 +1304,12 @@ class AgentFusionEncoder(nn.Module):
 
         # ----- 4) 값 변환 및 가중합 -----
         # value_linear: (C→C)
-        # values_proj: (N, L, C)
-        values_proj = self.value_linear(chunk_values)
-
         # einsum으로 Σ_t a_{t,q} * v_t  → (N, tokens_mlp_dim, C)
         # attn: (N, L, tokens_mlp_dim), values_proj: (N, L, C)
-        chunk_token = torch.einsum("nlq,nlc->nqc", attn,
-                                   values_proj)  # (N, tokens_mlp_dim, C)
+        values_proj = self.value_linear(chunk_values).float()  # (N, L, C)
+        attn_f = attn.float()  # (N, L, Q)
+        chunk_token = torch.einsum("nlq,nlc->nqc", attn_f, values_proj).to(
+            chunk_values.dtype)
 
         return chunk_token
 
@@ -2261,7 +2266,7 @@ class AgentFusionEncoder(nn.Module):
             on_all_on_chunk = block(on_all_on_chunk)
         # pooling
         # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
-        on_all_on_chunk = torch.mean(on_all_on_chunk, dim=1)
+        on_all_on_chunk = on_all_on_chunk.float().mean(dim=1).to(on_all_on_chunk.dtype)
         # agents_ego_fut_type_emb: (on_all_on_chunk_num, channels_mlp_dim)
         agents_ego_fut_type_emb = self._get_type_embedding(
             agents_type, ego_fut_type, agents_past_cur_on_mask,
@@ -2344,11 +2349,14 @@ class AgentFusionEncoder(nn.Module):
 
         ego_fut_on_chunk_mask_full = ego_fut_on_chunk_mask_full.unsqueeze(
             -1)  # (B, future_chunk_num, 1)
-        ego_fut_on_chunk = ego_fut_chunk * ego_fut_on_chunk_mask_full  # (B, future_chunk_num, H)  # 브로드캐스트
 
-        ego_fut_on_chunk_sum = ego_fut_on_chunk.sum(dim=dim)  # (B, H)
+        ego_fut_on_chunk_sum = (
+                    ego_fut_chunk.float() * ego_fut_on_chunk_mask_full.float()).sum(
+            dim=dim)
+        ego_fut_on_chunk_mean = (
+                    ego_fut_on_chunk_sum / on_chunk_num_per_batch.to(
+                torch.float32)).to(ego_fut_chunk.dtype)
 
-        ego_fut_on_chunk_mean = ego_fut_on_chunk_sum / on_chunk_num_per_batch  # (B, H)  # (B,H)/(B,1) 브로드캐스트
         assert ego_fut_on_chunk_mean.shape == (B, H)
 
         return ego_fut_on_chunk_mean
@@ -2588,7 +2596,7 @@ class LaneFusionEncoder(nn.Module):
         for block in self.blocks:
             lane_info = block(lane_info)
 
-        lane_info = torch.mean(lane_info, dim=1)
+        lane_info = lane_info.float().mean(dim=1).to(lane_info.dtype)
 
         # Reshape speed_limit and traffic to match flattened dimensions
         speed_limit = speed_limit.reshape(B * lane_num, 1)
