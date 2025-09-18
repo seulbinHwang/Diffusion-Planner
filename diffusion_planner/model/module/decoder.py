@@ -4,7 +4,7 @@ import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple
-
+from flash_attn.bert_padding import unpad_input, pad_input
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
@@ -265,7 +265,7 @@ class Decoder(nn.Module):
 
             x0 = dpm_sampler(
                 self.dit,
-                xT,
+                xT.float(),
                 other_model_params={
                     "cross_c": scene_encoding_token,
                     "ego_fut_global": ego_fut_global,
@@ -307,6 +307,7 @@ class Decoder(nn.Module):
                         if self._guidance_fn is not None else "uncond"
                 },
             )
+            x0 = x0.to(xT.dtype)
             #  (B, Pnn, (1 + T) , 4)
             assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
             x0 = self._state_normalizer.inverse(x0.reshape(
@@ -386,7 +387,7 @@ class RouteEncoder(nn.Module):
         x = self.Mixer(x)
         # x.shape: (B`, T, C) # (8, 32, 64)
 
-        x = torch.mean(x, dim=1)
+        x = x.float().mean(dim=1).to(x.dtype)
         # x.shape: (B`, C) # (8, 64)
 
         x = self.emb_project(self.norm(x))
@@ -430,62 +431,6 @@ class DiT(nn.Module):
         self._sde = sde
         self.marginal_prob_std = self._sde.marginal_prob_std
 
-        # =====================[ 추가 1/3 ]=====================
-
-    @staticmethod
-    def _unpad_from_mask(
-        x: torch.Tensor,  # (B, L, D_in)
-        mask: torch.Tensor  # (B, L)  True=pad(무효)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
-        """패딩 마스크를 이용해 배치 텐서에서 **유효 토큰만** 추출(unpad)합니다.
-
-        Args:
-            x: 입력 시퀀스. **shape:** (B, L, D_in)
-            mask: 키 패딩 마스크(True=pad). **shape:** (B, L)
-
-        Returns:
-            x_unpad: 유효 토큰만 2D로 평탄화. **shape:** (T, D_in)
-            indices: 유효 토큰의 플랫 인덱스. **shape:** (T,)
-            cu_seqlens: 배치별 누적 길이(prefix sum). **shape:** (B+1,)
-            max_seqlen: 배치 내 최대 유효 길이. **int**
-            seqlens: 배치별 유효 길이. **shape:** (B,)
-        """
-        B, L, D = x.shape
-        valid = (~mask).to(torch.bool)  # (B, L)
-        seqlens = valid.sum(dim=1).to(torch.int32)  # (B,)
-        cu_seqlens = torch.nn.functional.pad(seqlens.cumsum(dim=0),
-                                             (1, 0))  # (B+1,)
-        flat_valid = valid.reshape(B * L)  # (B*L,)
-        indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1).to(
-            torch.long)  # (T,)
-        x_unpad = x.reshape(B * L, D).index_select(0, indices)  # (T, D)
-        max_seqlen = int(seqlens.max().item()) if B > 0 else 0
-        return x_unpad, indices, cu_seqlens, max_seqlen, seqlens
-
-    # =====================[ 추가 2/3 ]=====================
-    @staticmethod
-    def _pad_to_batch(
-        y_unpad: torch.Tensor,  # (T, D_out)
-        indices: torch.Tensor,  # (T,)
-        B: int,
-        L: int,
-        D: int,
-        device: torch.device,
-        dtype: Optional[torch.dtype] = None,
-    ) -> torch.Tensor:
-        """언패드 결과를 원래 배치 shape으로 복원합니다.
-        dtype이 주어지지 않으면 소스(y_unpad)의 dtype을 따릅니다.
-        """
-        if dtype is None:
-            dtype = y_unpad.dtype
-        out = torch.zeros(B * L, D, device=device, dtype=dtype)
-        if y_unpad.numel() > 0:
-            if y_unpad.dtype != dtype:  # ← 안전 캐스팅
-                y_unpad = y_unpad.to(dtype)
-            out.index_copy_(0, indices, y_unpad)
-        return out.view(B, L, D)
-
-    # =====================[ 추가 3/3 ]=====================
     def preproj_varlen(
             self,
             near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, F=(1+T)*4)
@@ -509,8 +454,12 @@ class DiT(nn.Module):
         """
         B, Pnn, F = near_cur_future_norm_xT.shape
         # 유효 토큰만 추출
-        x_unpad, idx, _, _, _ = self._unpad_from_mask(
-            near_cur_future_norm_xT, near_current_mask)  # x_unpad: (T, F)
+        # unpad_input은 'True=유효' 마스크를 기대 → 반전 필요
+        attention_mask = (~near_current_mask).to(
+            torch.bool)  # (B, Pnn), True=유효
+        x_unpad, indices, cu_seqlens, max_seqlen = unpad_input(
+            near_cur_future_norm_xT, attention_mask
+        )  # x_unpad: (T, F), indices: (T,), cu: (B+1,), max_seqlen: int
 
         # 모든 토큰이 pad인 극단 케이스 방어
         if x_unpad.numel() == 0:
@@ -521,15 +470,7 @@ class DiT(nn.Module):
         x_unpad = self.preproj(x_unpad)  # (T, D)
 
         # 배치 모양으로 복원 (pad 위치는 0)
-        x = self._pad_to_batch(
-            y_unpad=x_unpad,
-            indices=idx,
-            B=B,
-            L=Pnn,
-            D=x_unpad.shape[-1],
-            device=near_cur_future_norm_xT.device,
-            # dtype=x_unpad.dtype,
-        )  # (B, Pnn, D)
+        x = pad_input(x_unpad, indices, B, Pnn)  # (B, Pnn, D)
         return x
 
     @property
@@ -595,8 +536,8 @@ class DiT(nn.Module):
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 최종 출력도 0
 
         if self._model_type == "score":
-            std = self.marginal_prob_std(diffusion_time).float()[
-                :, None, None]  # FP32
+            std = self.marginal_prob_std(diffusion_time).float()[:, None,
+                                                                 None]  # FP32
             out = (x.float() / (std + 1e-6)).to(
                 x.dtype)  # 계산은 FP32, 최종만 원래 dtype
             return out

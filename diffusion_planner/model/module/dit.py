@@ -408,9 +408,9 @@ class DiTBlock(nn.Module):
         kv_mask_valid = (~kv_mask).to(torch.bool)
         q_unpad, q_idx, cu_q, max_q = unpad_input(q_in, q_mask_valid)  # (Tq, D)
         kv_unpad, _, cu_k, max_k = unpad_input(kv_in, kv_mask_valid)  # (Tk, D)
-        if q_unpad.numel() == 0 or kv_unpad.numel() == 0 or max_q == 0 or max_k == 0:
+        if q_unpad.numel() == 0 or kv_unpad.numel(
+        ) == 0 or max_q == 0 or max_k == 0:
             return torch.zeros(B, Lq, D, device=q_in.device, dtype=q_in.dtype)
-
 
         Tq = q_unpad.shape[0]
         Tk = kv_unpad.shape[0]

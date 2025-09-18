@@ -313,8 +313,7 @@ class NearAgentsRouteLaneEncoder(nn.Module):
             pooled = torch.where(
                 all_off.unsqueeze(-1),  # (B, Pnn, 1) True → 대체
                 unknown_row.expand_as(pooled),  # (B, Pnn, H)
-                pooled
-            )
+                pooled)
 
         # norm 입력/출력: (B,Pnn,H)
         # drop: (B,Pnn,H)
@@ -902,15 +901,15 @@ class SelfAttentionBlock(nn.Module):
         B, L, D = x.shape
         valid = (~mask).to(torch.bool)  # (B, L)
         seqlens = valid.sum(dim=1).to(torch.int32)  # (B,)
-        cu_seqlens = torch.nn.functional.pad(
-            seqlens.cumsum(dim=0), pad=(1, 0)) # [학습 input] # (B+1,)
+        cu_seqlens = torch.nn.functional.pad(seqlens.cumsum(dim=0),
+                                             pad=(1, 0))  # [학습 input] # (B+1,)
         flat_valid = valid.reshape(B * L)  # (B*L,)
         # torch.nonzero: True인 원소들의 **인덱스(좌표)**를 반환. # as_tuple=False: (N,1) 반환.
         # long = int64
         indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1).to(
             torch.long)  # (T,) # [pad back용]
         x_unpad = x.reshape(B * L, D).index_select(0, indices)  # (T, D)
-        max_seqlen = int(seqlens.max().item()) if B > 0 else 0 #  [학습 input]
+        max_seqlen = int(seqlens.max().item()) if B > 0 else 0  #  [학습 input]
         """
         x_unpad: (T, D) 유효 토큰만 이어붙인 텐서. T = sum(seqlens). [학습 input]
         indices: (T,)  원래 (B*L) 평탄화 인덱스에서 유효 토큰의 위치. [pad back용]
@@ -981,8 +980,8 @@ class SelfAttentionBlock(nn.Module):
         # x_unpad, indices, cu_seqlens, max_len = self._unpad_from_mask(
         #     x, mask)  # x_unpad: (T, D)
         attention_mask = (~mask).to(torch.bool)  # True=유효
-        x_unpad, indices, cu_seqlens, max_len = unpad_input(x,
-                                                            attention_mask)  # (T,D), (T,), (B+1,), int
+        x_unpad, indices, cu_seqlens, max_len = unpad_input(
+            x, attention_mask)  # (T,D), (T,), (B+1,), int
 
         T = x_unpad.shape[0]
         if T == 0 or max_len == 0:
@@ -1001,9 +1000,10 @@ class SelfAttentionBlock(nn.Module):
         """
         # out: (T, H, Hd)
         out = flash_attn_varlen_qkvpacked_func(
-            qkv, # (T, 3, H, Hd)
-            cu_seqlens=cu_seqlens.to(torch.int32), #  (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0.
-            max_seqlen=max_len, # int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1).
+            qkv,  # (T, 3, H, Hd)
+            cu_seqlens=cu_seqlens.to(
+                torch.int32),  #  (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0.
+            max_seqlen=max_len,  # int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1).
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,
@@ -1308,8 +1308,8 @@ class AgentFusionEncoder(nn.Module):
         # attn: (N, L, tokens_mlp_dim), values_proj: (N, L, C)
         values_proj = self.value_linear(chunk_values).float()  # (N, L, C)
         attn_f = attn.float()  # (N, L, Q)
-        chunk_token = torch.einsum("nlq,nlc->nqc", attn_f, values_proj).to(
-            chunk_values.dtype)
+        chunk_token = torch.einsum("nlq,nlc->nqc", attn_f,
+                                   values_proj).to(chunk_values.dtype)
 
         return chunk_token
 
@@ -2266,7 +2266,8 @@ class AgentFusionEncoder(nn.Module):
             on_all_on_chunk = block(on_all_on_chunk)
         # pooling
         # on_all_on_chunk: (on_all_on_chunk_num, channels_mlp_dim)
-        on_all_on_chunk = on_all_on_chunk.float().mean(dim=1).to(on_all_on_chunk.dtype)
+        on_all_on_chunk = on_all_on_chunk.float().mean(dim=1).to(
+            on_all_on_chunk.dtype)
         # agents_ego_fut_type_emb: (on_all_on_chunk_num, channels_mlp_dim)
         agents_ego_fut_type_emb = self._get_type_embedding(
             agents_type, ego_fut_type, agents_past_cur_on_mask,
@@ -2350,12 +2351,11 @@ class AgentFusionEncoder(nn.Module):
         ego_fut_on_chunk_mask_full = ego_fut_on_chunk_mask_full.unsqueeze(
             -1)  # (B, future_chunk_num, 1)
 
-        ego_fut_on_chunk_sum = (
-                    ego_fut_chunk.float() * ego_fut_on_chunk_mask_full.float()).sum(
-            dim=dim)
-        ego_fut_on_chunk_mean = (
-                    ego_fut_on_chunk_sum / on_chunk_num_per_batch.to(
-                torch.float32)).to(ego_fut_chunk.dtype)
+        ego_fut_on_chunk_sum = (ego_fut_chunk.float() *
+                                ego_fut_on_chunk_mask_full.float()).sum(dim=dim)
+        ego_fut_on_chunk_mean = (ego_fut_on_chunk_sum /
+                                 on_chunk_num_per_batch.to(torch.float32)).to(
+                                     ego_fut_chunk.dtype)
 
         assert ego_fut_on_chunk_mean.shape == (B, H)
 
@@ -2393,11 +2393,10 @@ class AgentFusionEncoder(nn.Module):
         weights = F.softmax(logits, dim=1)  # (B, future_chunk_num, 1), fp32
         row_valid = (~ego_fut_all_chunk_off).to(
             weights.dtype).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        weights = (weights * row_valid).to(
-            ego_fut_chunk.dtype)  # (B, future_chunk_num, 1)
+        weights = weights * row_valid  # fp32 그대로 유지   # (B, future_chunk_num, 1)
         # ego_fut_chunk: (B, future_chunk_num, hidden_dim)
-        ego_fut_global_attn = (weights * ego_fut_chunk).sum(
-            dim=1)  # (B, hidden_dim)
+        ego_fut_global_attn = (weights.float() * ego_fut_chunk.float()).sum(
+            dim=1).to(ego_fut_chunk.dtype)  # (B, hidden_dim)
 
         # --- (B) 안정적 기본값: 마스크드 평균 ---
         ego_fut_global_mean = self._masked_mean(ego_fut_chunk,
