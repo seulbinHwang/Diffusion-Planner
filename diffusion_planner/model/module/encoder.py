@@ -3,6 +3,8 @@ from timm.layers import DropPath
 import torch.nn.functional as F
 
 from diffusion_planner.model.module.mixer import MixerBlock
+from flash_attn.bert_padding import unpad_input, pad_input
+
 # ==== (encoder.py 상단 import 근처에 추가) ====
 from typing import Tuple  # 이미 있으면 중복 추가 불필요
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
@@ -870,8 +872,8 @@ class SelfAttentionBlock(nn.Module):
     def _unpad_from_mask(
         x: torch.Tensor,  # (B, L, D)
         mask: torch.Tensor  # (B, L)  True=pad(무효)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
-        """패딩 마스크로부터 유효 토큰만 추출(unpad)합니다.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """패딩 마스크로부터 유효 토큰만 추출(unpad)
 
         FlashAttention‑2 varlen 커널은 (B, L, D)를 직접 받지 않고, **유효 토큰을 연결한 2D 버퍼**와
         **배치별 누적 길이(cu_seqlens)**를 필요로 합니다. 또한 pad back(복원)을 위한 인덱스도 반환합니다.
@@ -894,14 +896,23 @@ class SelfAttentionBlock(nn.Module):
         B, L, D = x.shape
         valid = (~mask).to(torch.bool)  # (B, L)
         seqlens = valid.sum(dim=1).to(torch.int32)  # (B,)
-        cu_seqlens = torch.nn.functional.pad(  # (B+1,)
-            seqlens.cumsum(dim=0), (1, 0))
+        cu_seqlens = torch.nn.functional.pad(
+            seqlens.cumsum(dim=0), pad=(1, 0)) # [학습 input] # (B+1,)
         flat_valid = valid.reshape(B * L)  # (B*L,)
+        # torch.nonzero: True인 원소들의 **인덱스(좌표)**를 반환. # as_tuple=False: (N,1) 반환.
+        # long = int64
         indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1).to(
-            torch.long)  # (T,)
+            torch.long)  # (T,) # [pad back용]
         x_unpad = x.reshape(B * L, D).index_select(0, indices)  # (T, D)
-        max_seqlen = int(seqlens.max().item()) if B > 0 else 0
-        return x_unpad, indices, cu_seqlens, max_seqlen, seqlens
+        max_seqlen = int(seqlens.max().item()) if B > 0 else 0 #  [학습 input]
+        """
+        x_unpad: (T, D) 유효 토큰만 이어붙인 텐서. T = sum(seqlens). [학습 input]
+        indices: (T,)  원래 (B*L) 평탄화 인덱스에서 유효 토큰의 위치. [pad back용]
+        cu_seqlens: (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0. [학습 input]
+        max_len= max_seqlen: int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1). [학습 input]
+        seqlens = seqlens: (B,) int32  배치별 유효 토큰 개수.
+        """
+        return x_unpad, indices, cu_seqlens, max_seqlen
 
     @staticmethod
     def _pad_to_batch(
@@ -954,8 +965,19 @@ class SelfAttentionBlock(nn.Module):
         B, L, D = x.shape
 
         # (1) 언패드
-        x_unpad, idx, cu, max_len, seqlens = self._unpad_from_mask(
-            x, mask)  # x_unpad: (T, D)
+        """
+        x_unpad: (T, D) 유효 토큰만 이어붙인 텐서. T = sum(seqlens). [학습 input]
+        indices: (T,)  원래 (B*L) 평탄화 인덱스에서 유효 토큰의 위치. [pad back용]
+        cu_seqlens: (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0. [학습 input]
+        max_len= max_seqlen: int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1). [학습 input]
+        seqlens = seqlens: (B,) int32  배치별 유효 토큰 개수.
+        """
+        # x_unpad, indices, cu_seqlens, max_len = self._unpad_from_mask(
+        #     x, mask)  # x_unpad: (T, D)
+        attention_mask = (~mask).to(torch.bool)  # True=유효
+        x_unpad, indices, cu_seqlens, max_len = unpad_input(x,
+                                                            attention_mask)  # (T,D), (T,), (B+1,), int
+
         T = x_unpad.shape[0]
         if T == 0 or max_len == 0:
             return torch.zeros_like(x)
@@ -967,11 +989,15 @@ class SelfAttentionBlock(nn.Module):
         qkv = qkv.to(comp_dtype)
 
         # (3) FlashAttention‑2 varlen
+        """
+        # 원래 input x: (B, L, D) → 언패드 x_unpad: (T, D) → QKV: (T, 3, H, Hd)
+        batch 내에서, 각 L 토큰들끼리만 서로 어텐션을 수행합니다.
+        """
         # out: (T, H, Hd)
         out = flash_attn_varlen_qkvpacked_func(
-            qkv,
-            cu_seqlens=cu.to(torch.int32),
-            max_seqlen=max_len,
+            qkv, # (T, 3, H, Hd)
+            cu_seqlens=cu_seqlens.to(torch.int32), #  (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0.
+            max_seqlen=max_len, # int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1).
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,
@@ -981,7 +1007,8 @@ class SelfAttentionBlock(nn.Module):
         out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
         out = self.out_proj(out.to(x.dtype))  # (T, D) -> in dtype
         out = out.to(x.dtype)
-        out = self._pad_to_batch(out, idx, B, L, D, x.device)  # (B, L, D)
+        # out = self._pad_to_batch(out, indices, B, L, D, x.device)  # (B, L, D)
+        out = pad_input(out, indices, B, L)  # (B, L, D)
         return out
 
     # ------------------------------------------------------------------

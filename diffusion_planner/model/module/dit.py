@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from timm.models.layers import Mlp
 from typing import Tuple, Optional
+from flash_attn.bert_padding import unpad_input, pad_input
+
 import torch.nn.functional as F
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
 try:
@@ -332,13 +334,14 @@ class DiTBlock(nn.Module):
         Raises:
             RuntimeError: FlashAttention‑2 모듈이 없는 경우.
         """
-        # TODO: cpu 만 사용가능할 때, PyTorch SDPA(패딩 포함) 사용하는 옵션 추가
         self._check_flash_available()
         B, L, D = x.shape
 
         # (1) 언패드
-        x_unpad, idx, cu, max_len, seqlens = self._unpad_from_mask(
-            x, attn_mask)  # x_unpad: (T, D)
+        # x_unpad, idx, cu, max_len, seqlens = self._unpad_from_mask(
+        #     x, attn_mask)  # x_unpad: (T, D)
+        attention_mask = (~attn_mask).to(torch.bool)  # True=valid
+        x_unpad, idx, cu, max_len = unpad_input(x, attention_mask)
         T = x_unpad.shape[0]
         if T == 0 or max_len == 0:
             return torch.zeros_like(x)
@@ -363,8 +366,7 @@ class DiTBlock(nn.Module):
         # (4) 출력 프로젝션 + pad back
         out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
         out = self.out_proj(out.to(x.dtype))  # (T, D) -> 원 dtype
-        out = self._pad_to_batch(out, idx, B, L, D, x.device)
-
+        out = pad_input(out, idx, B, L)  # (B, L, D)
         return out
 
     def _cross_attn_flash_varlen(
@@ -402,14 +404,16 @@ class DiTBlock(nn.Module):
         _, Lk, _ = kv_in.shape
 
         # (1) 언패드(Q, KV 각각)
-        q_unpad, q_idx, cu_q, max_q, _ = self._unpad_from_mask(
-            q_in, q_mask)  # (Tq, D)
-        kv_unpad, _, cu_k, max_k, _ = self._unpad_from_mask(kv_in,
-                                                            kv_mask)  # (Tk, D)
+        q_mask_valid = (~q_mask).to(torch.bool)
+        kv_mask_valid = (~kv_mask).to(torch.bool)
+        q_unpad, q_idx, cu_q, max_q = unpad_input(q_in, q_mask_valid)  # (Tq, D)
+        kv_unpad, _, cu_k, max_k = unpad_input(kv_in, kv_mask_valid)  # (Tk, D)
+        if q_unpad.numel() == 0 or kv_unpad.numel() == 0 or max_q == 0 or max_k == 0:
+            return torch.zeros(B, Lq, D, device=q_in.device, dtype=q_in.dtype)
+
+
         Tq = q_unpad.shape[0]
         Tk = kv_unpad.shape[0]
-        if Tq == 0 or max_q == 0 or Tk == 0 or max_k == 0:
-            return torch.zeros(B, Lq, D, device=q_in.device, dtype=q_in.dtype)
 
         # (2) Q / KV 프로젝션 (유효 토큰만)
         q = self.q_proj_cross(q_unpad).reshape(Tq, self.num_heads,
@@ -437,7 +441,8 @@ class DiTBlock(nn.Module):
         # (4) 출력 프로젝션 + pad back
         out = out.reshape(Tq, self.num_heads * self.head_dim)  # (Tq, D)
         out = self.out_proj_cross(out.to(q_in.dtype))  # (Tq, D)
-        out = self._pad_to_batch(out, q_idx, B, Lq, D, q_in.device)
+        # (5) 패드 복원(★ Q 인덱스 사용)
+        out = pad_input(out, q_idx, B, Lq)  # (B, Lq, D)
         return out
 
     # ====================== (추가) 함수화된 per‑agent adaLN 로직 ======================

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 from diffusion_planner.utils.normalizer import StateNormalizer
-
+AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
     """Ensure ``tensor`` has no NaN or Inf values.
@@ -207,8 +207,8 @@ def diffusion_loss_func(
         "diffusion_time": batch_diffusion_time,  # [B,]
         "cond_last_pos_norm": cond_last_pos_norm, # [B, Pnn, 4]
     }
-
-    _, decoder_output = model(merged_inputs)
+    with torch.autocast("cuda", dtype=AMP_DTYPE):
+        _, decoder_output = model(merged_inputs)
 
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
     score = decoder_output["score"][:, :, 1:, :]  # (B, Pnn, T, 4)

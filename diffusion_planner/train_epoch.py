@@ -9,7 +9,7 @@ from diffusion_planner.loss import diffusion_loss_func
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 
-AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
+
 
 
 
@@ -148,13 +148,12 @@ def train_epoch(data_loader,
             neighbors_future.shape: [8, 10, 80, 4]
             mask.shape: [8, 10, 80]
             """
-            with torch.autocast("cuda", dtype=AMP_DTYPE):
-                loss, _ = diffusion_loss_func(
-                    model, norm_inputs,
-                    ddp.get_model(model, args.ddp).sde.marginal_prob,
-                    (neighbors_future, mask), args.state_normalizer, loss,
-                    args.diffusion_model_type)
-                loss["loss"] = loss["neighbor_prediction_loss"]
+            loss, _ = diffusion_loss_func(
+                model, norm_inputs,
+                ddp.get_model(model, args.ddp).sde.marginal_prob,
+                (neighbors_future, mask), args.state_normalizer, loss,
+                args.diffusion_model_type)
+            loss["loss"] = loss["neighbor_prediction_loss"]
 
             total_loss = loss["loss"].item()  # scalar
 
