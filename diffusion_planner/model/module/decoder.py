@@ -158,14 +158,7 @@ class Decoder(nn.Module):
                 }
 
         """
-        # === [CHANGE] Pnn을 '입력으로 들어온 길이'에 맞춰 동적으로 결정 ===
-        # route 임베딩이 있을 때 그 길이를 우선 사용하고, 없다면 cond_last_pos_norm 길이를 사용
-        # (훈련 시엔 둘 다 존재, 추론 시엔 route 임베딩이 기준이 됨)
-        # if "cond_last_pos_norm" in inputs:
-        #     pnn_dyn = inputs["cond_last_pos_norm"].shape[1]  # [B, Pnn, 4]
-        # else:
-        #     pnn_dyn = encoder_outputs["near_agents_route_lane_emb"].shape[
-        #         1]  # [B, Pnn, H]
+
 
         # Extract ego & neighbor current states
         near_current = inputs["neighbor_agents_past"][:, :self.

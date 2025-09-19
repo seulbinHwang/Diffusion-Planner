@@ -250,69 +250,6 @@ class DiTBlock(nn.Module):
 
         return torch.float16
 
-    @staticmethod
-    def _unpad_from_mask(
-        x: torch.Tensor,  # (B, L, D)
-        mask: torch.Tensor  # (B, L)  True=pad(무효)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
-        """패딩 마스크를 이용해 배치 텐서에서 유효 토큰만 추출(unpad)합니다.
-
-        이 함수는 FlashAttention‑2 varlen 커널에 필요한 **연속(unpadded) 토큰 버퍼**와
-        **누적 길이(cu_seqlens)**를 생성합니다. 또한 pad back(복원)을 위한 인덱스도 반환합니다.
-
-        Args:
-            x (torch.Tensor): 입력 시퀀스. 모양 (B, L, D).
-            mask (torch.Tensor): 키 패딩 마스크(True=pad). 모양 (B, L).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]:
-                x_unpad: (T, D) 유효 토큰만 2D로 평탄화한 텐서.
-                indices: (T,)  원래 (B*L) 플랫 인덱스에서 유효 토큰의 위치(long).
-                cu_seqlens: (B+1,) int32  배치별 누적 길이(prefix sum). 첫 원소는 0.
-                max_seqlen: int  배치 내 최대 유효 길이.
-                seqlens: (B,) int32  배치별 유효 토큰 길이.
-
-        Note:
-            - valid 토큰 수 T = seqlens.sum(). (0인 배치가 있어도 무방)
-            - 반환된 `indices`와 `_pad_to_batch()`를 함께 사용해 원래 배치 모양으로 복원이 가능합니다.
-        """
-        B, L, D = x.shape
-        valid = (~mask).to(torch.bool)  # (B, L)
-        seqlens = valid.sum(dim=1).to(torch.int32)  # (B,)
-        cu_seqlens = torch.nn.functional.pad(  # (B+1,)
-            seqlens.cumsum(dim=0), (1, 0))
-        flat_valid = valid.reshape(B * L)  # (B*L,)
-        indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1).to(
-            torch.long)  # (T,)
-        x_unpad = x.reshape(B * L, D).index_select(dim=0,
-                                                   index=indices)  # (T, D)
-        max_seqlen = int(seqlens.max().item()) if B > 0 else 0
-        return x_unpad, indices, cu_seqlens, max_seqlen, seqlens
-
-    def _pad_to_batch(
-            self,
-            y_unpad: torch.Tensor,  # (T, D)
-            indices: torch.Tensor,  # (T,)
-            B: int,
-            L: int,
-            D: int,
-            device: torch.device,
-            dtype: Optional[torch.dtype] = None,  # ← Optional
-    ) -> torch.Tensor:
-        """
-        언패드 결과를 원래 배치 shape으로 복원합니다.
-        dtype이 주어지지 않으면 소스(y_unpad)의 dtype을 그대로 사용합니다.
-        """
-        if dtype is None:
-            dtype = y_unpad.dtype  # ← 핵심: 소스 dtype 사용
-
-        out = torch.zeros(B * L, D, device=device, dtype=dtype)
-        if y_unpad.numel() > 0:
-            if y_unpad.dtype != dtype:  # ← 안전 캐스트
-                y_unpad = y_unpad.to(dtype)
-            out.index_copy_(0, indices, y_unpad)
-        return out.view(B, L, D)
-
     def _self_attn_flash_varlen(
             self,
             x: torch.Tensor,  # (B, L, D)
@@ -477,6 +414,7 @@ class DiTBlock(nn.Module):
                                        delta_shift_mlp, delta_scale_mlp, delta_gate_mlp),
                                        각각 (B, P, D).
         """
+        # route_modulation: (B, P, 6D)
         route_modulation: torch.Tensor = self.route_adaLN_modulation(
             per_agent_route_lane_emb)
         (delta_shift_msa, delta_scale_msa, delta_gate_msa, delta_shift_mlp,
