@@ -502,24 +502,24 @@ class DiT(nn.Module):
         t_embedding = self.t_embedder(diffusion_time)
         t_embedding = t_embedding.to(x.dtype)
         ego_fut_global = ego_fut_global.to(x.dtype)  # 방어적 정렬
-        y = t_embedding
 
         for block in self.blocks:
             """
             Input shapes:
             x: (B, Pnn, D=192)
             cross_c: (B, N=token_num, D=192)
-            y: (B, D=192)
+            t_embedding: (B, D=192)
             near_current_mask: (B, Pnn)
             cross_mask: (B, token_num)
             """
-            x = block(x, cross_c, y, ego_fut_global, near_agents_route_lane_emb,
-                      near_current_mask, cross_mask, route_known_mask)
+            x = block(x, cross_c, t_embedding, ego_fut_global,
+                      near_agents_route_lane_emb, near_current_mask, cross_mask,
+                      route_known_mask)
             x = x.masked_fill(near_current_mask.unsqueeze(-1),
                               0.0)  # ← 블록 출력도 0 클램프
         # output: x: (B, Pnn, D=192)
-        # y: (B, D=192)
-        x = self.final_layer(x, y)
+        # t_embedding: (B, D=192)
+        x = self.final_layer(x, t_embedding)
         # x.shape: (B, Pnn, (1 + T) * 4)
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 최종 출력도 0
 

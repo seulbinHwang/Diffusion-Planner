@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 
 from diffusion_planner.utils.normalizer import StateNormalizer
+
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
+
 
 def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
     """Ensure ``tensor`` has no NaN or Inf values.
@@ -26,9 +28,10 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(msg)
     return tensor
 
+
 # [add] ----------------------------------------------------------------------
 def _build_half_life_weights(
-    T: int, # 80
+    T: int,  # 80
     *,
     dt_s: float = 0.1,
     half_life_s: float = 2.0,
@@ -60,12 +63,15 @@ def _build_half_life_weights(
     # w: (T,) = 0.5 ** (t / half_life_s)
     w = torch.pow(0.5, t / float(half_life_s))  # [T]
     return w.view(1, 1, T)  # [1, 1, T]
+
+
 # ----------------------------------------------------------------------------
 
 
-def _compute_xy_yaw_losses(
-        score_denorm: torch.Tensor, near_future_gt: torch.Tensor,
-        near_future_valid: torch.Tensor) -> Dict[str, torch.Tensor]:
+def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
+                           near_future_gt: torch.Tensor,
+                           near_future_valid: torch.Tensor,
+                           early_stage_num: int = 5) -> Dict[str, torch.Tensor]:
     """
     Compute separate XY and Yaw RMSE losses for ego and neighbors.
 
@@ -86,9 +92,18 @@ def _compute_xy_yaw_losses(
     gt_xy = near_future_gt[..., :2]
     # Euclidean distance: sqrt((dx)^2 + (dy)^2)
     dist_ = torch.sqrt(((pred_xy - gt_xy).pow(2).sum(-1)) + 1e-6)  # [B, Pnn, T]
-    # neighbors: exclude ego index 0
+
     valid_dist = dist_[near_future_valid]  # [num_valid]
     valid_dist_mean = valid_dist.mean() if valid_dist.numel(
+    ) > 0 else torch.tensor(0.0, device=dist_.device)
+
+    early_stage_dist_ = dist_[..., :
+                              early_stage_num]  # [B, Pnn, early_stage_num]
+    near_future_early_valid = near_future_valid[
+        ..., :early_stage_num]  # [B, Pnn, early_stage_num]
+    early_valid_dist = early_stage_dist_[
+        near_future_early_valid]  # [num_early_valid]
+    early_valid_dist_mean = early_valid_dist.mean() if early_valid_dist.numel(
     ) > 0 else torch.tensor(0.0, device=dist_.device)
 
     # Compute yaw angles from cos/sin
@@ -101,14 +116,22 @@ def _compute_xy_yaw_losses(
     # Angular error wrapped to [-pi, pi]
     yaw_err = (yaw_pred - yaw_gt +
                torch.pi) % (2 * torch.pi) - torch.pi  # [B, P, T]
-    dist_yaw = torch.abs(yaw_err)  # abs error in radians
+    dist_yaw = torch.abs(yaw_err)  # abs error in radians # [B, P, T]
     masked_yaw = dist_yaw[near_future_valid]
     neigh_yaw = masked_yaw.mean() if masked_yaw.numel() > 0 else torch.tensor(
         0.0, device=dist_yaw.device)
 
+    early_stage_dist_yaw = dist_yaw[
+        ..., :early_stage_num]  # [B, Pnn, early_stage_num]
+    early_valid_yaw = early_stage_dist_yaw[near_future_early_valid]
+    early_valid_yaw_mean = early_valid_yaw.mean() if early_valid_yaw.numel(
+    ) > 0 else torch.tensor(0.0, device=dist_yaw.device)
+
     return {
         'neighbor_prediction_loss_xy': valid_dist_mean,  # scalar
         'neighbor_prediction_loss_yaw': neigh_yaw,  # scalar
+        'neighbor_prediction_loss_xy_early': early_valid_dist_mean,  # scalar
+        'neighbor_prediction_loss_yaw_early': early_valid_yaw_mean,  # scalar
     }
 
 
@@ -168,14 +191,12 @@ def diffusion_loss_func(
 
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
     normed_future = state_normalizer(near_future_gt)
-    cond_last_pos_norm = normed_future[:, :, -1, :] # [B, Pnn, 4]
+    cond_last_pos_norm = normed_future[:, :, -1, :]  # [B, Pnn, 4]
     normed_future = _require_finite("state_normalizer(near_future_gt)",
                                     normed_future)
-    near_cur_future_norm_gt = torch.cat([
-        near_current_xyyaw_norm[:, :, None, :],
-        normed_future
-    ],
-                                        dim=2)  # [B, Pnn, 1 + T, 4]
+    near_cur_future_norm_gt = torch.cat(
+        [near_current_xyyaw_norm[:, :, None, :], normed_future],
+        dim=2)  # [B, Pnn, 1 + T, 4]
     # near_cur_future_mask: [B, Pnn, 1+T]
     near_cur_future_norm_gt[near_cur_future_mask] = 0.0
     near_future_norm_gt = near_cur_future_norm_gt[:, :, 1:, :]  # [B, Pnn, T, 4]
@@ -205,7 +226,7 @@ def diffusion_loss_func(
         "near_cur_future_norm_xT":
             near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
         "diffusion_time": batch_diffusion_time,  # [B,]
-        "cond_last_pos_norm": cond_last_pos_norm, # [B, Pnn, 4]
+        "cond_last_pos_norm": cond_last_pos_norm,  # [B, Pnn, 4]
     }
     with torch.autocast("cuda", dtype=AMP_DTYPE):
         _, decoder_output = model(merged_inputs)
@@ -226,20 +247,20 @@ def diffusion_loss_func(
 
     # [add] ---- 시간 가중치(half-life) 적용 ------------------------------------
     # half-life과 dt(초)는 필요 시 조정 가능
-    time_step_s: float = 0.1    # 0.1초 간격(데이터/시뮬 규격에 맞게 조정)
-    half_life_s: float = 2.0    # 2초에서 가중치 1/2
+    time_step_s: float = 0.1  # 0.1초 간격(데이터/시뮬 규격에 맞게 조정)
+    half_life_s: float = 2.0  # 2초에서 가중치 1/2
     w_t: torch.Tensor = _build_half_life_weights(
-        T, # 80
-        dt_s=time_step_s, # 0.1
-        half_life_s=half_life_s, # 2.0
+        T,  # 80
+        dt_s=time_step_s,  # 0.1
+        half_life_s=half_life_s,  # 2.0
         device=dpm_loss.device,
         dtype=dpm_loss.dtype,
     )  # [1, 1, T]
     # 유효 마스크와 함께 곱해서 "가중 평균"으로 정규화
-    weighted_dpm = dpm_loss * w_t                       # (B, Pnn, T)
-    denom = (valid * w_t).sum().clamp(min=1e-6)        # 스칼라(가중치 포함 유효개수)
-    valid_dpm_loss = weighted_dpm * valid              # (B, Pnn, T)
-    loss_val = valid_dpm_loss.sum() / denom            # 스칼라(gradient O)
+    weighted_dpm = dpm_loss * w_t  # (B, Pnn, T)
+    denom = (valid * w_t).sum().clamp(min=1e-6)  # 스칼라(가중치 포함 유효개수)
+    valid_dpm_loss = weighted_dpm * valid  # (B, Pnn, T)
+    loss_val = valid_dpm_loss.sum() / denom  # 스칼라(gradient O)
     loss["neighbor_prediction_loss"] = loss_val
 
     # denom = valid.sum().clamp(min=1) # denom: scalar

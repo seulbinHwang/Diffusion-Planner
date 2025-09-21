@@ -7,9 +7,8 @@ import subprocess
 
 def ddp_setup_universal(verbose=False, args=None):
     import os, torch
-    print("[DEBUG] RANK=", os.getenv("RANK"),
-          "LOCAL_RANK=", os.getenv("LOCAL_RANK"),
-          "WORLD_SIZE=", os.getenv("WORLD_SIZE"),
+    print("[DEBUG] RANK=", os.getenv("RANK"), "LOCAL_RANK=",
+          os.getenv("LOCAL_RANK"), "WORLD_SIZE=", os.getenv("WORLD_SIZE"),
           "CUDA_VISIBLE_DEVICES=", os.getenv("CUDA_VISIBLE_DEVICES"))
     print("[DEBUG] torch.cuda.device_count()=", torch.cuda.device_count())
     if args.ddp == False:

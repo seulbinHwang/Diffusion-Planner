@@ -9,11 +9,6 @@ from diffusion_planner.loss import diffusion_loss_func
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 
-
-
-
-
-
 # =====================================================================
 
 

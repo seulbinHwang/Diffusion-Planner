@@ -190,7 +190,8 @@ def _filter_agents_array(
     for past_idx in range(len(all_frame_agents_feature)):
         frame_exist_agents = []
         # (frame_agents_num, 8)
-        frame_agents_feature: np.ndarray = all_frame_agents_feature[past_idx] # (_, 8)
+        frame_agents_feature: np.ndarray = all_frame_agents_feature[
+            past_idx]  # (_, 8)
         for agent_idx in range(frame_agents_feature.shape[0]):
             if target_frame_agents_feature.shape[0] > 0:
                 agent_id = float(
@@ -309,7 +310,8 @@ def agent_past_process(
     max_pedestrians: int,
     max_bicycles: int,
     anchor_ego_state: np.ndarray,  #(3,)
-) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray,
+           np.ndarray]:
     # ego_agent_past: (num_frames, 11)
     # neighbor_agents_past: (agent_num, num_frames, 11)
     # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
@@ -350,7 +352,8 @@ def agent_past_process(
         all_frame_np_agents_local = np.zeros(
             (len(all_frame_cur_exists_agents), 0, agents_states_dim))
     else:
-        all_frame_cur_exists_agents_local: List[np.ndarray] = [] # (num_frames, current_agents_num, 8)
+        all_frame_cur_exists_agents_local: List[np.ndarray] = [
+        ]  # (num_frames, current_agents_num, 8)
         # all_frame_cur_exists_agents 와 frame_cur_exists_agents_local의
         # np.ndarray shape: (current_agents_num, 8) 로 동일
         all_frame_cur_exists_agents: List[np.ndarray] = _pad_agent_states(
@@ -372,7 +375,8 @@ def agent_past_process(
         # (num_frames, current_agents_num, 8)
         all_frame_np_agents_local = np.zeros(
             (len(all_frame_cur_exists_agents_local),
-             all_frame_cur_exists_agents_local[0].shape[0], agents_states_dim + 1))
+             all_frame_cur_exists_agents_local[0].shape[0],
+             agents_states_dim + 1))
 
         for past_idx in range(len(all_frame_cur_exists_agents_local)):
             frame_cur_exists_agents_local = all_frame_cur_exists_agents_local[
@@ -414,7 +418,9 @@ def agent_past_process(
             all_frame_np_agents_local[
                 past_idx, :,
                 8] = frame_cur_exists_agents_local[:,
-            AgentInternalIndex.track_token()].squeeze()  # id
+                                                   AgentInternalIndex.
+                                                   track_token()].squeeze(
+                                                   )  # id
 
     #  present_static_feature: (cur_static_num, 5)
     # present_static_feature_6: (cur_static_num, 6)
@@ -443,10 +449,9 @@ def agent_past_process(
     # all_frame_np_agents_local: (num_frames, current_agents_num, 8)
     # neighbor_agents_past: (agent_num, num_frames, 11)
     neighbor_agents_past = np.zeros(
-        (agent_num, all_frame_np_agents_local.shape[0],
-         agents_states_dim + 3),
+        (agent_num, all_frame_np_agents_local.shape[0], agents_states_dim + 3),
         dtype=np.float32)
-    neighbor_agents_track_id = - np.ones((agent_num,), dtype=np.float32)
+    neighbor_agents_track_id = -np.ones((agent_num,), dtype=np.float32)
     # dist_from_cur_agent_to_ego: (current_agents_num,)
     dist_from_cur_agent_to_ego = np.linalg.norm(
         all_frame_np_agents_local[-1, :, :2], axis=-1)

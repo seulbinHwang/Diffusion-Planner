@@ -272,7 +272,7 @@ def build_agent_route_lane_order(
         List[int]],  #  # 길이: agent_num, 원소: List[int] (길이 가변적)
     lane_num: Optional[int] = None,
     dtype: np.dtype = np.int32,
-) -> np.ndarray:
+) -> np.ndarray:  # (agent_num, lane_num)
     """NPC별로 선택된 route 차선 인덱스(npc_route_indices)를 기준으로,
     각 에이전트에 대해 '가까운 차선 순서'를 정수 랭크로 기록한 행렬을 생성합니다.
 
@@ -353,7 +353,7 @@ def _select_token_and_ordered_npc_route_indices(
     ndarray,  # shape: (agent_num, 11) → x=[:,0], y=[:,1]
     vector_map_lanes: np.ndarray,  # shape: (lane_num, P, D) → 좌표는 [:, :, :2]
     route_num: int,
-) -> np.ndarray:
+) -> np.ndarray:  # (agent_num, lane_num)
 
     from typing import List
 
@@ -503,7 +503,7 @@ def _select_token_and_ordered_npc_route_indices(
     # 반환 길이 검증
     assert len(npc_route_indices) == agent_num, \
         f"npc_route_indices 길이({len(npc_route_indices)}) != agent_num({agent_num})"
-
+    # (agent_num, lane_num)
     agent_route_lane_order = build_agent_route_lane_order(npc_route_indices,
                                                           lane_num=lane_num)
     return agent_route_lane_order
@@ -1300,11 +1300,9 @@ import numpy as np
 import torch
 
 
-def convert_to_model_inputs(
-        data: Mapping[str, Any],
-        device: Union[torch.device, str],
-        squeeze: bool
-) -> Dict[str, torch.Tensor]:
+def convert_to_model_inputs(data: Mapping[str, Any], device: Union[torch.device,
+                                                                   str],
+                            squeeze: bool) -> Dict[str, torch.Tensor]:
     """
     딕셔너리 값을 torch.Tensor로 변환합니다.
 
@@ -1338,7 +1336,8 @@ def convert_to_model_inputs(
                     t = t.to(dtype=torch.bool)
             else:
                 # 수치형은 float32로
-                t = torch.from_numpy(v).to(device=device, dtype=torch.float32,
+                t = torch.from_numpy(v).to(device=device,
+                                           dtype=torch.float32,
                                            non_blocking=True)
 
         # 3) 파이썬 bool 스칼라

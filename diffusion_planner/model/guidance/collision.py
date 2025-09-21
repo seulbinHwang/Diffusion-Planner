@@ -137,11 +137,11 @@ def collision_guidance_fn(x, t, cond, inputs, *args, **kwargs) -> torch.Tensor:
     #                (clip_distances[clip_distances <= 1].detach() > 0).float()) +
     #                                                              1e-5)).exp()
 
-    reward_a = (torch.sum(clip_distances[clip_distances > 1]) / (torch.sum(
-        (clip_distances[clip_distances > 1].detach() > 0).float()) + 1e-5) +
-               torch.sum(clip_distances[clip_distances <= 1]) / (torch.sum(
-                   (clip_distances[clip_distances <= 1].detach() > 0).float()) +
-                                                                 1e-5))
+    reward_a = (
+        torch.sum(clip_distances[clip_distances > 1]) / (torch.sum(
+            (clip_distances[clip_distances > 1].detach() > 0).float()) + 1e-5) +
+        torch.sum(clip_distances[clip_distances <= 1]) / (torch.sum(
+            (clip_distances[clip_distances <= 1].detach() > 0).float()) + 1e-5))
     reward = -reward_a.exp()
 
     x_aux = torch.autograd.grad(reward.sum(),

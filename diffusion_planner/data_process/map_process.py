@@ -536,9 +536,11 @@ def map_process(
                 max_elements["ROUTE_LANES"])
             if isinstance(agent_route_lane_order, np.ndarray):
                 if agent_route_lane_order.dtype != np.int64:
-                    agent_route_lane_order = agent_route_lane_order.astype(np.int64)
+                    agent_route_lane_order = agent_route_lane_order.astype(
+                        np.int64)
             else:
-                agent_route_lane_order = np.asarray(agent_route_lane_order, dtype=np.int64)
+                agent_route_lane_order = np.asarray(agent_route_lane_order,
+                                                    dtype=np.int64)
 
         elif feature_name == "ROUTE_LANES":
             loc = 0

@@ -135,14 +135,12 @@ class NPCStatePerturbation:
             )  # (agent_num,11)
             a_neighbor_valid_mask = valid_neighbor_mask[b].cpu().numpy().astype(
                 bool)  # (agent_num,)
-            print("num_of_a_neighbor_valid_mask:",
-                  a_neighbor_valid_mask.sum())
+            print("num_of_a_neighbor_valid_mask:", a_neighbor_valid_mask.sum())
             a_nifsi = neighbor_invalid_future_start_idx[b].cpu().numpy(
             )  # (agent_num,)
             a_neighbor_aug_flag = neighbor_aug_flag[b].cpu().numpy().astype(
                 bool)  # (agent_num,)
-            print("num_of_a_neighbor_aug_flag:",
-                  a_neighbor_aug_flag.sum())
+            print("num_of_a_neighbor_aug_flag:", a_neighbor_aug_flag.sum())
 
             agent_num, T, _ = a_neighbor_agents_past.shape
             F = a_neighbors_future_all.shape[1]
@@ -438,9 +436,12 @@ class NPCStatePerturbation:
             dim=-1)  # (B, Pnn, 14)
         return near_current_w_more
 
-    def __call__(self, inputs: Dict[str, torch.Tensor],
-                 neighbors_future_all: torch.Tensor,
-                 args, save_plot = False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
+    def __call__(
+            self,
+            inputs: Dict[str, torch.Tensor],
+            neighbors_future_all: torch.Tensor,
+            args,
+            save_plot=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Args:
             inputs:
@@ -508,7 +509,8 @@ class NPCStatePerturbation:
 
         if save_plot:
             ################### for visualization ################
-            aug_near_current = aug_near_current_w_more[:, :, :11]  # (B, Pnn, 11)
+            aug_near_current = aug_near_current_w_more[:, :, :
+                                                       11]  # (B, Pnn, 11)
             # aug_neighbor_current (B, agent_num, 11) 만들기
             aug_neighbor_current = neighbor_agents_past[:, :, -1, :].clone(
             )  # (B, agent_num, 11)
@@ -569,7 +571,7 @@ class NPCStatePerturbation:
         near_future = neighbors_future_all[:, :Pnn, :, :]
         if save_plot:
             aug_neighbor_current_new = neighbor_agents_past[:, :,
-                                       -1, :]  # (B, Pnn, 11)
+                                                            -1, :]  # (B, Pnn, 11)
             self._debug_visualize_states(
                 neighbor_agents_past.clone().detach(),
                 neighbors_future_all.clone().detach(),
@@ -577,7 +579,8 @@ class NPCStatePerturbation:
                 valid_neighbor_mask.clone().detach(),
                 neighbor_invalid_future_start_idx.clone().detach(),
                 neighbor_aug_flag.clone().detach(),
-                save_path=f"debug_vis_{self.count}_rrevised_.png"  # 필요 시 경로/파일명 변경
+                save_path=
+                f"debug_vis_{self.count}_rrevised_.png"  # 필요 시 경로/파일명 변경
             )
             self.count += 1
         return inputs, near_future

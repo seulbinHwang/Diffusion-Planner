@@ -13,7 +13,8 @@ class Config:
         for key, value in args_dict.items():
             setattr(self, key, value)
         self.state_normalizer = StateNormalizer.from_json2(args_dict)
-        self.observation_normalizer = ObservationNormalizer.from_json2(args_dict)
+        self.observation_normalizer = ObservationNormalizer.from_json2(
+            args_dict)
         """
         ego_current_state : 10
         neighbor_agents_past : 11 

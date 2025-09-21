@@ -57,13 +57,14 @@ class TensorBoardLogger():
   W&B가 자체 로그 파일(메트릭, 설정 등)을 **저장할 로컬 폴더** 경로
   보통 `save_path` 안에 `.wandb/` 폴더가 생김
             """
-            self.run = wandb.init(project='Diffusion-Planner',
-                                  config=args,
-                                  name=run_name,
-                                  notes=notes,
-                                  resume='allow',
-                                  id=wandb_resume_id,
-                                  sync_tensorboard=True)  # TensorBoard 로그를 W&B와 자동 동기화
+            self.run = wandb.init(
+                project='Diffusion-Planner',
+                config=args,
+                name=run_name,
+                notes=notes,
+                resume='allow',
+                id=wandb_resume_id,
+                sync_tensorboard=True)  # TensorBoard 로그를 W&B와 자동 동기화
             self.id = self.run.id
             wandb.config.update(args, allow_val_change=allow_val_change)
 

@@ -43,10 +43,11 @@ class DiffusionPlannerData(Dataset):
         route_lanes = data["route_lanes"]
         route_lanes_speed_limit = data["route_lanes_speed_limit"]
         route_lanes_has_speed_limit = data["route_lanes_has_speed_limit"]
-        agent_route_lane_order = data["agent_route_lane_order"].astype("int64")[:self._predicted_neighbor_num] # (predicted_neighbor_num, lane_num)
+        agent_route_lane_order = data["agent_route_lane_order"].astype(
+            "int64"
+        )[:self._predicted_neighbor_num]  # (predicted_neighbor_num, lane_num)
 
         static_objects = data["static_objects"]
-
 
         data = {
             "ego_agent_past": ego_agent_past,

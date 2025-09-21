@@ -30,7 +30,6 @@ import json
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
 
 
-
 class DataProcessor(object):
 
     def __init__(self, config):
@@ -45,8 +44,8 @@ class DataProcessor(object):
         self.num_agents = config.agent_num
         self.num_static = config.static_objects_num
         # [변경] 타입별 상한 신설: 보행자/자전거
-        self.max_pedestrians = getattr(config, "max_pedestrians", 7) #128)
-        self.max_bicycles = getattr(config, "max_bicycles", 3) #64)
+        self.max_pedestrians = getattr(config, "max_pedestrians", 7)  #128)
+        self.max_bicycles = getattr(config, "max_bicycles", 3)  #64)
         # 안전 검사: 타입별 상한 합이 전체 슬롯보다 크지 않도록
         assert self.max_pedestrians >= 0 and self.max_bicycles >= 0
         assert (self.max_pedestrians + self.max_bicycles) <= self.num_agents, \
@@ -301,9 +300,7 @@ class DataProcessor(object):
             else:
                 filtered_neighbor_agents_track_token.append(None)
 
-
         return filtered_neighbor_agents_past, filtered_neighbor_agents_track_token
-
 
     # Use for inference
     def observation_adapter(self,
@@ -354,8 +351,8 @@ class DataProcessor(object):
     # sorted_cur_neighbor_indices: np.ndarray (_,) # 길이는 agent_num 혹은 그 이하
     # static_objects: (num_static, 10)
         """
-        (ego_agent_past, neighbor_agents_past, neighbor_indices,
-         static_objects, neighbor_agents_track_id) = agent_past_process(
+        (ego_agent_past, neighbor_agents_past, neighbor_indices, static_objects,
+         neighbor_agents_track_id) = agent_past_process(
              all_frame_ego_feature, all_frame_agents_feature,
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_pedestrians,
@@ -379,9 +376,9 @@ class DataProcessor(object):
             neighbor_indices=neighbor_indices,
             agents_num=self.num_agents,
         )
-        assert len(neighbor_agents_track_token
-                   ) == len(
-            neighbor_track_token) == 32, f"Two track token lists have different lengths: {len(neighbor_agents_track_token)} != {len(neighbor_track_token)}"
+        assert len(neighbor_agents_track_token) == len(
+            neighbor_track_token
+        ) == 32, f"Two track token lists have different lengths: {len(neighbor_agents_track_token)} != {len(neighbor_track_token)}"
 
         for t1, t2 in zip(neighbor_agents_track_token, neighbor_track_token):
             assert t1 == t2, f"Two track token lists do not match: {t1} != {t2}"
@@ -392,10 +389,6 @@ class DataProcessor(object):
         # neighbor_agents_past, _, neighbor_indices = \
         #     self._filter_agents_within_radius(neighbor_agents_past,
         #                                       None, neighbor_indices)
-
-
-
-
         '''
         Map
         '''
@@ -436,7 +429,6 @@ class DataProcessor(object):
                                  self._max_elements, self._max_points)
 
         data = {
-
             "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
             "neighbor_agents_past":
                 neighbor_agents_past[:, -21:],  # (agent_num, time_len, 11)
@@ -450,7 +442,8 @@ class DataProcessor(object):
         data.update(vector_map)
         # data: Dict[str, torch.Tensor]
         data = convert_to_model_inputs(data, device, squeeze)
-        data["neighbor_track_token"] = neighbor_agents_track_token # List[Optional[str]], (agent_num,)
+        data[
+            "neighbor_track_token"] = neighbor_agents_track_token  # List[Optional[str]], (agent_num,)
         # 변환 후에도 안전하게 보정
         if "agent_route_lane_order" in data:
             data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
@@ -727,6 +720,8 @@ class DataProcessor(object):
         except Exception:
             # 실패 시 임시파일만 제거(최종 파일은 손대지 않음)
             if os.path.exists(tmp_path):
-                try: os.remove(tmp_path)
-                except: pass
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
             raise
