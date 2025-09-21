@@ -116,7 +116,9 @@ def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
     # Angular error wrapped to [-pi, pi]
     yaw_err = (yaw_pred - yaw_gt +
                torch.pi) % (2 * torch.pi) - torch.pi  # [B, P, T]
-    dist_yaw = torch.abs(yaw_err)  # abs error in radians # [B, P, T]
+    yaw_err_deg = torch.rad2deg(yaw_err)  # [-180, 180]
+
+    dist_yaw = torch.abs(yaw_err_deg)  # abs error in radians # [B, P, T]
     masked_yaw = dist_yaw[near_future_valid]
     neigh_yaw = masked_yaw.mean() if masked_yaw.numel() > 0 else torch.tensor(
         0.0, device=dist_yaw.device)
@@ -129,9 +131,9 @@ def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
 
     return {
         'neighbor_prediction_loss_xy': valid_dist_mean,  # scalar
-        'neighbor_prediction_loss_yaw': neigh_yaw,  # scalar
+        'neighbor_prediction_loss_yaw': neigh_yaw,  # scalar # degree
         'neighbor_prediction_loss_xy_early': early_valid_dist_mean,  # scalar
-        'neighbor_prediction_loss_yaw_early': early_valid_yaw_mean,  # scalar
+        'neighbor_prediction_loss_yaw_early': early_valid_yaw_mean,  # scalar # degree
     }
 
 
