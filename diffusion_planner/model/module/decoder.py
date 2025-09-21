@@ -449,9 +449,15 @@ class DiT(nn.Module):
         # unpad_input은 'True=유효' 마스크를 기대 → 반전 필요
         attention_mask = (~near_current_mask).to(
             torch.bool)  # (B, Pnn), True=유효
-        x_unpad, indices, cu_seqlens, max_seqlen = unpad_input(
-            near_cur_future_norm_xT, attention_mask
-        )  # x_unpad: (T, F), indices: (T,), cu: (B+1,), max_seqlen: int
+
+        res = unpad_input(near_cur_future_norm_xT, attention_mask)
+        # x_unpad: (T, F), indices: (T,), cu: (B+1,), max_seqlen: int
+        if len(res) == 4:
+            x_unpad, indices, cu_seqlens, max_seqlen = res
+            # seqlens가 필요하면 cu_seqlens로부터 복원 가능
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        elif len(res) == 5:
+            x_unpad, indices, cu_seqlens, max_seqlen, seqlens = res
 
         # 모든 토큰이 pad인 극단 케이스 방어
         if x_unpad.numel() == 0:

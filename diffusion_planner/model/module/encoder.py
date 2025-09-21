@@ -938,14 +938,22 @@ class SelfAttentionBlock(nn.Module):
         max_len= max_seqlen: int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1). [학습 input]
         seqlens = seqlens: (B,) int32  배치별 유효 토큰 개수.
         """
-        # x_unpad, indices, cu_seqlens, max_len = self._unpad_from_mask(
+        # x_unpad, indices, cu_seqlens, max_seqlen = self._unpad_from_mask(
         #     x, mask)  # x_unpad: (T, D)
         attention_mask = (~mask).to(torch.bool)  # True=유효
-        x_unpad, indices, cu_seqlens, max_len = unpad_input(
-            x, attention_mask)  # (T,D), (T,), (B+1,), int
+
+        res = unpad_input(x, attention_mask)
+
+        # v2.7 이하: 4개 / v2.8.x: 5개
+        if len(res) == 4:
+            x_unpad, indices, cu_seqlens, max_seqlen = res
+            # seqlens가 필요하면 cu_seqlens로부터 복원 가능
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        elif len(res) == 5:
+            x_unpad, indices, cu_seqlens, max_seqlen, seqlens = res
 
         T = x_unpad.shape[0]
-        if T == 0 or max_len == 0:
+        if T == 0 or max_seqlen == 0:
             return torch.zeros_like(x)
 
         # (2) QKV 프로젝션 (유효 토큰만)
@@ -964,7 +972,7 @@ class SelfAttentionBlock(nn.Module):
             qkv,  # (T, 3, H, Hd)
             cu_seqlens=cu_seqlens.to(
                 torch.int32),  #  (B+1,) int32  배치별 누적 길이(prefix sum), 첫 원소는 0.
-            max_seqlen=max_len,  # int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1).
+            max_seqlen=max_seqlen,  # int  배치 내 최대 유효 길이(≥1일 수 있음; CLS만 유효해도 1).
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,

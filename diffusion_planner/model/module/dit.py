@@ -293,9 +293,20 @@ class DiTBlock(nn.Module):
         # x_unpad, idx, cu, max_len, seqlens = self._unpad_from_mask(
         #     x, attn_mask)  # x_unpad: (T, D)
         attention_mask = (~attn_mask).to(torch.bool)  # True=valid
-        x_unpad, idx, cu, max_len = unpad_input(x, attention_mask)
+
+
+        res = unpad_input(x, attention_mask)
+
+        # v2.7 이하: 4개 / v2.8.x: 5개
+        if len(res) == 4:
+            x_unpad, indices, cu_seqlens, max_seqlen = res
+            # seqlens가 필요하면 cu_seqlens로부터 복원 가능
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+        elif len(res) == 5:
+            x_unpad, indices, cu_seqlens, max_seqlen, seqlens = res
+
         T = x_unpad.shape[0]
-        if T == 0 or max_len == 0:
+        if T == 0 or max_seqlen == 0:
             return torch.zeros_like(x)
 
         # (2) QKV 프로젝션 (유효 토큰만)
@@ -308,8 +319,8 @@ class DiTBlock(nn.Module):
         # out: (T, H, Hd)
         out = flash_attn_varlen_qkvpacked_func(
             qkv,  # (T, 3, H, Hd)
-            cu_seqlens=cu.to(torch.int32),
-            max_seqlen=max_len,  # int  배치 내 최대 유효 길이.
+            cu_seqlens=cu_seqlens.to(torch.int32),
+            max_seqlen=max_seqlen,  # int  배치 내 최대 유효 길이.
             dropout_p=self._attn_dropout_p if self.training else 0.0,
             softmax_scale=None,
             causal=False,
@@ -318,7 +329,7 @@ class DiTBlock(nn.Module):
         # (4) 출력 프로젝션 + pad back
         out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
         out = self.out_proj(out.to(x.dtype))  # (T, D) -> 원 dtype
-        out = pad_input(out, idx, B, L)  # (B, L, D)
+        out = pad_input(out, indices, B, L)  # (B, L, D)
         return out
 
     def _cross_attn_flash_varlen(
@@ -358,8 +369,25 @@ class DiTBlock(nn.Module):
         # (1) 언패드(Q, KV 각각)
         q_mask_valid = (~q_mask).to(torch.bool)
         kv_mask_valid = (~kv_mask).to(torch.bool)
-        q_unpad, q_idx, cu_q, max_q = unpad_input(q_in, q_mask_valid)  # (Tq, D)
-        kv_unpad, _, cu_k, max_k = unpad_input(kv_in, kv_mask_valid)  # (Tk, D)
+        q_unpad, q_idx, cu_q, max_q, _ = unpad_input(q_in, q_mask_valid)  # (Tq, D)
+        res = unpad_input(q_in, q_mask_valid)  # (Tq, D)
+        # v2.7 이하: 4개 / v2.8.x: 5개
+        if len(res) == 4:
+            q_unpad, q_idx, cu_q, max_q = res
+            # seqlens가 필요하면 cu_seqlens로부터 복원 가능
+            seqlens = (cu_q[1:] - cu_q[:-1]).to(torch.int32)
+        elif len(res) == 5:
+            q_unpad, q_idx, cu_q, max_q, seqlens = res
+        res = unpad_input(kv_in, kv_mask_valid)  # (Tk, D)
+        # v2.7 이하: 4개 / v2.8.x: 5개
+        if len(res) == 4:
+            kv_unpad, indices, cu_k, max_k = res
+            # seqlens가 필요하면 cu_seqlens로부터 복원 가능
+            seqlens = (cu_k[1:] - cu_k[:-1]).to(torch.int32)
+        elif len(res) == 5:
+            kv_unpad, indices, cu_k, max_k, seqlens = res
+
+
         if q_unpad.numel() == 0 or kv_unpad.numel(
         ) == 0 or max_q == 0 or max_k == 0:
             return torch.zeros(B, Lq, D, device=q_in.device, dtype=q_in.dtype)
