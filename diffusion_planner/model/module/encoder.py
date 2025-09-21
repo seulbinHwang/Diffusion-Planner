@@ -223,7 +223,6 @@ class NearAgentsRouteLaneEncoder(nn.Module):
         x: (B_Pnn, route_num, D), mask: (B_Pnn, route_num) True=pad → (B_Pnn, D)
         전부 마스크(N행)는 0 벡터로 반환.
         """
-        B_Pnn, route_num, D = x.shape
         very_neg = torch.finfo(
             x.dtype).min if x.dtype in (torch.float16,
                                         torch.bfloat16) else -1e30
@@ -1066,10 +1065,59 @@ class AgentFusionEncoder(nn.Module):
                                act_layer=nn.GELU,
                                drop=drop_path_rate)
 
-        # 각 미래 chunk를 스칼라 로짓으로
-        self.ego_fut_pool_q = nn.Linear(hidden_dim, 1)
-        # 잔차 스케일: 0으로 시작(초기엔 평균만), 학습되며 켜짐
-        self.ego_fut_pool_scale = nn.Parameter(torch.tensor(0.0))
+        ###################
+        # --- Ego future global pooling: PMA-lite + DeepSets ---
+        self.ego_fut_in_norm = nn.LayerNorm(hidden_dim)
+
+        self.ego_fut_num_seeds = 4  # future_chunk_num이 작으므로 2~4 권장
+        self.ego_fut_seeds = nn.Parameter(
+            torch.zeros(1, self.ego_fut_num_seeds, hidden_dim))
+        nn.init.trunc_normal_(self.ego_fut_seeds, std=0.02)
+
+        ffn_hidden = int(hidden_dim * 2.0)  # 소형 FFN
+        self.ego_fut_seed_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_hidden, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_hidden, hidden_dim, bias=True),
+        )
+        # 잔차 게이트(0에서 시작 → 학습되며 켜짐)
+        self.ego_fut_seed_ffn_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # 여러 시드의 출력을 (B, hidden_dim) 하나로 합치는 게이트
+        self.ego_fut_seed_gate = nn.Linear(hidden_dim, 1, bias=True)
+
+        # DeepSets(mean/max) 잔차 게이트(0에서 시작)
+        self.ego_fut_ds_mean_alpha = nn.Parameter(torch.tensor(0.0))
+        self.ego_fut_ds_max_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # 출력 정규화/드롭
+        self.ego_fut_out_norm = nn.LayerNorm(hidden_dim)
+        self.ego_fut_out_drop = nn.Identity()  # 필요 시 nn.Dropout(p)로 교체 가능
+
+        # 어텐션 드롭아웃(선택): 0~0.1 권장. 기본 0.
+        self.ego_fut_attn_drop_p = 0.0
+
+    @staticmethod
+    def _masked_max_ego_chunks(ego_fut_chunk: torch.Tensor,
+                               ego_fut_off_chunk_mask_full: torch.Tensor,
+                               dim: int) -> torch.Tensor:
+        """
+        ego_fut_chunk: (B, future_chunk_num, hidden_dim)
+        ego_fut_off_chunk_mask_full: (B, future_chunk_num)  True=무효
+        return: (B, hidden_dim)
+        """
+        assert dim == 1, "dim은 1이어야 합니다."
+        assert ego_fut_off_chunk_mask_full.dtype == torch.bool
+        # FP16/BF16에서도 안전한 아주 작은 값
+        very_neg = (torch.finfo(ego_fut_chunk.dtype).min if ego_fut_chunk.dtype
+                    in (torch.float16, torch.bfloat16) else -1e30)
+        x = ego_fut_chunk.masked_fill(ego_fut_off_chunk_mask_full.unsqueeze(-1),
+                                      very_neg)
+        mx = x.amax(dim=dim)  # (B, hidden_dim)
+        all_off = ego_fut_off_chunk_mask_full.all(dim=dim)  # (B,)
+        if all_off.any().item():
+            mx = torch.where(all_off.unsqueeze(-1), torch.zeros_like(mx), mx)
+        return mx
 
     def _get_agents_past_cur_mask(
             self, agents_past_current: torch.Tensor
@@ -2327,48 +2375,80 @@ class AgentFusionEncoder(nn.Module):
         self,
         ego_fut_chunk: torch.Tensor,  # (B, future_chunk_num, hidden_dim)
         ego_future_on_mask: torch.Tensor,  # (B) True=유효
-        on_ego_fut_off_chunk_mask: torch.
-        Tensor,  # (ego_future_on_num, future_chunk_num) True=무효
-    ) -> torch.Tensor:  # (B, hidden_dim):
-        # --- (A) 배치 크기로 확장된 미래 chunk 마스크 만들기: (B, future_chunk_num) ---
-        B, future_chunk_num = ego_fut_chunk.shape[:2]
-        # --- (A) 배치 크기 마스크로 복원: (B, future_chunk_num), True=무효 ---
+        on_ego_fut_off_chunk_mask: torch.Tensor,
+        # (ego_future_on_num, future_chunk_num) True=무효
+    ) -> torch.Tensor:  # (B, hidden_dim)
+        # --- (A) 배치 크기로 확장된 미래 chunk 마스크: (B, future_chunk_num) True=무효 ---
+        B, future_chunk_num, hidden_dim = ego_fut_chunk.shape
         ego_fut_off_chunk_mask_full = torch.ones((B, future_chunk_num),
                                                  dtype=torch.bool,
                                                  device=ego_fut_chunk.device)
-        # 유효한 배치 위치에만 on_... 마스크 주입
         ego_fut_off_chunk_mask_full[
-            ego_future_on_mask] = on_ego_fut_off_chunk_mask
+            ego_future_on_mask] = on_ego_fut_off_chunk_mask  # 주입
 
-        # --- (C) 학습형 주의 풀링(가중합) + NaN 방지 ---
-        # 로짓 계산 (AMP 안전을 위해 fp32로)
-        # (B, future_chunk_num, 1)
-        logits = self.ego_fut_pool_q(ego_fut_chunk).float()
-        logits = logits.masked_fill(ego_fut_off_chunk_mask_full.unsqueeze(-1),
-                                    float("-inf"))
+        # --- (B) 프리노름 + 패딩을 0으로 고정(gradient 차단) ---
+        ego_fut_chunk = self.ego_fut_in_norm(ego_fut_chunk)
+        ego_fut_chunk = ego_fut_chunk.masked_fill(
+            ego_fut_off_chunk_mask_full.unsqueeze(-1),
+            0.0)  # (B, future_chunk_num, hidden_dim)
+
+        # --- (C) PMA‑lite: 학습 시드들이 chunk들을 요약 ---
+        # ego_fut_seeds: (1, ego_fut_num_seeds, hidden_dim) -> (B, ego_fut_num_seeds, hidden_dim)
+        seeds = self.ego_fut_seeds.to(ego_fut_chunk.dtype).expand(
+            B, self.ego_fut_num_seeds,
+            hidden_dim)  # (B, ego_fut_num_seeds, hidden_dim)
+
+        # 점수: (B, ego_fut_num_seeds, future_chunk_num) = (B, ego_fut_num_seeds, D) @ (B, future_chunk_num, D)^T / sqrt(D)
+        logits = torch.einsum("bsd,bmd->bsm", seeds, ego_fut_chunk) / math.sqrt(
+            max(1.0, float(hidden_dim)))
+        # pad(True) → -inf
+        if ego_fut_off_chunk_mask_full.any().item():
+            logits = logits.masked_fill(
+                ego_fut_off_chunk_mask_full.unsqueeze(1), float("-inf"))
+
         ego_fut_all_chunk_off = ego_fut_off_chunk_mask_full.all(dim=1)  # (B,)
         if ego_fut_all_chunk_off.any().item():
-            logits = logits.clone()  # 선택(메모리 여유시): in-place 걱정 줄이기
+            logits = logits.clone()
             logits[ego_fut_all_chunk_off] = 0.0  # softmax NaN 방지
+        # (B, ego_fut_num_seeds, future_chunk_num)
+        attn = F.softmax(logits, dim=-1)
+        if self.ego_fut_attn_drop_p > 0 and self.training:
+            attn = F.dropout(attn, p=self.ego_fut_attn_drop_p)
 
-        # 4) softmax → 행 게이팅(곱)으로 all-off를 0으로
-        weights = F.softmax(logits, dim=1)  # (B, future_chunk_num, 1), fp32
-        row_valid = (~ego_fut_all_chunk_off).to(
-            weights.dtype).unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
-        weights = weights * row_valid  # fp32 그대로 유지   # (B, future_chunk_num, 1)
-        # ego_fut_chunk: (B, future_chunk_num, hidden_dim)
-        ego_fut_global_attn = (weights.float() * ego_fut_chunk.float()).sum(
-            dim=1).to(ego_fut_chunk.dtype)  # (B, hidden_dim)
+        # 시드별 요약: (B, ego_fut_num_seeds, future_chunk_num) @ (B, future_chunk_num, D) -> (B, ego_fut_num_seeds, D)
+        y_seed = torch.einsum("bsm,bmd->bsd", attn, ego_fut_chunk)
 
-        # --- (B) 안정적 기본값: 마스크드 평균 ---
+        # 시드별 소형 FFN 잔차(게이트 0에서 시작)
+        y_seed = y_seed + self.ego_fut_seed_ffn_alpha.to(
+            y_seed.dtype) * self.ego_fut_seed_ffn(y_seed)
+
+        # 여러 시드를 하나로: softmax 게이트 → (B, D)
+        w = F.softmax(self.ego_fut_seed_gate(y_seed).squeeze(-1),
+                      dim=1).unsqueeze(-1)  # (B,ego_fut_num_seeds,1)
+        y_pool = (w * y_seed).sum(dim=1)  # (B, hidden_dim)
+
+        # --- (D) DeepSets(mean/max) 잔차(게이트 0에서 시작) ---
         ego_fut_global_mean = self._masked_mean(ego_fut_chunk,
                                                 ego_fut_off_chunk_mask_full,
-                                                dim=1)  # (B, hidden_dim)
-        # --- (D) 최종 대표 토큰: 평균 + (학습형 풀링 잔차) ---
-        ego_fut_global = ego_fut_global_mean + (
-            self.ego_fut_pool_scale * ego_fut_global_attn)  # (B, hidden_dim)
+                                                dim=1)
+        ego_fut_global_max = self._masked_max_ego_chunks(
+            ego_fut_chunk, ego_fut_off_chunk_mask_full, dim=1)
 
-        # 기존 반환값 + ego_fut_global 추가
+        ego_fut_global = y_pool \
+                         + self.ego_fut_ds_mean_alpha.to(
+            y_pool.dtype) * ego_fut_global_mean \
+                         + self.ego_fut_ds_max_alpha.to(
+            y_pool.dtype) * ego_fut_global_max  # (B, hidden_dim)
+
+        # --- (E) all‑off 배치는 0 벡터 고정 ---
+        if ego_fut_all_chunk_off.any().item():
+            ego_fut_global = torch.where(ego_fut_all_chunk_off.unsqueeze(-1),
+                                         torch.zeros_like(ego_fut_global),
+                                         ego_fut_global)
+
+        # --- (F) 정규화/드롭아웃 ---
+        ego_fut_global = self.ego_fut_out_drop(
+            self.ego_fut_out_norm(ego_fut_global))
         return ego_fut_global
 
 
