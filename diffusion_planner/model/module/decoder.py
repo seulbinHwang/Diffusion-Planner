@@ -159,7 +159,6 @@ class Decoder(nn.Module):
 
         """
 
-
         # Extract ego & neighbor current states
         near_current = inputs["neighbor_agents_past"][:, :self.
                                                       _predicted_neighbor_num,
@@ -479,9 +478,7 @@ class DiT(nn.Module):
         near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
         near_current_mask: torch.Tensor,  # (B, Pnn) True=pad
         cross_mask: torch.Tensor,  # (B, token_num) True=pad
-        route_known_mask: Optional[
-            torch.
-            Tensor] = None  # (B, Pnn) True=known # 제공 시 per‑agent 잔차 모듈레이션 Δ를 해당 위치만 활성화.
+        route_known_mask: torch.Tensor  # (B, Pnn) True=known
     ) -> torch.Tensor:
         """
         Forward pass of DiT.
@@ -505,12 +502,10 @@ class DiT(nn.Module):
         t_embedding = self.t_embedder(diffusion_time)
         t_embedding = t_embedding.to(x.dtype)
         ego_fut_global = ego_fut_global.to(x.dtype)  # 방어적 정렬
-        # y = (B, D=192) + (B, D=192) = (B, D=192)
-        y = ego_fut_global + t_embedding
+        y = t_embedding
 
         for block in self.blocks:
             """
-            
             Input shapes:
             x: (B, Pnn, D=192)
             cross_c: (B, N=token_num, D=192)
@@ -518,7 +513,7 @@ class DiT(nn.Module):
             near_current_mask: (B, Pnn)
             cross_mask: (B, token_num)
             """
-            x = block(x, cross_c, y, near_agents_route_lane_emb,
+            x = block(x, cross_c, y, ego_fut_global, near_agents_route_lane_emb,
                       near_current_mask, cross_mask, route_known_mask)
             x = x.masked_fill(near_current_mask.unsqueeze(-1),
                               0.0)  # ← 블록 출력도 0 클램프

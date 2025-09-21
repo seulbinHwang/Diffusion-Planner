@@ -1,7 +1,7 @@
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 import torch.nn.functional as F
-
+import math
 from diffusion_planner.model.module.mixer import MixerBlock
 from flash_attn.bert_padding import unpad_input, pad_input
 
@@ -147,154 +147,165 @@ def timegrid_future_2d(dt: float,
 
 
 class NearAgentsRouteLaneEncoder(nn.Module):
-    """에이전트별 route lane 요약 인코더(초경량).
+    """
+    (route_num, D) → (D) 경량 Set-Encoder.
+    입력 route_lanes는 이미 LaneEncoder/Fusion에서 위치/신호 등 정보가 반영된 토큰들이라고 가정.
+
+    구성:
+      1) LayerNorm
+      2) Seeded attentional pooling (PMA-lite, 순열 invariant)
+      3) DeepSets(mean/max) 잔차 (스칼라 게이트 0에서 시작 → 학습되며 켜짐)
+      4) all-off(모든 route가 pad)인 에이전트는 0 벡터 반환
 
     입력:
-        route_lanes:       (B, Pnn, R, H)
-            - lane 인코더 출력에서 에이전트별 가까운 순으로 선택된 route lane 임베딩
-        route_lanes_mask:  (B, Pnn, R)  # bool, True=pad(무효)
-            - 각 route lane의 포지션 특징(예: 중앙점 x,y, yaw 등 4 + type one-hot 4)
+      route_lanes:       (B, Pnn, route_num, D)
+      route_lanes_mask:  (B, Pnn, route_num)   # True=pad(무효)
 
     출력:
-        near_agents_route_lane_emb: (B, Pnn, H)
-            - 에이전트별 단일 임베딩
-
+      near_agents_route_lane_emb: (B, Pnn, D)
     """
 
-    def __init__(self, hidden_dim: int, attn_drop_p: float = 0.0):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_seeds: int = 4,
+        attn_drop_p: float = 0.0,
+        out_drop_p: float = 0.0,
+        ffn_ratio: float = 2.0,
+    ):
         super().__init__()
-        # 점수 산출: 임베딩( H→1 ), 포지션( pos_dim→1 )
-        self.score_e = nn.Linear(hidden_dim, 1, bias=True)
+        self.hidden_dim = hidden_dim
+        self.num_seeds = int(num_seeds)
 
-        # 모든 route lane이 결측일 때 사용할 학습 가능한 대체 벡터
-        self.unknown_emb = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        nn.init.trunc_normal_(self.unknown_emb, std=0.02)
+        # 1) 입력 정규화 + 1층 Self-Attention (batch_first=True)
+        self.in_norm = nn.LayerNorm(hidden_dim)
+        # Self-Attn 뒤 소형 FFN(잔차 게이트 0 시작)
+        ffn_hidden = int(hidden_dim * ffn_ratio)
 
-        # 출력 안정화용 LayerNorm + (선택) dropout
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.drop = nn.Dropout(
-            attn_drop_p) if attn_drop_p > 0 else nn.Identity()
+        # 2) Seeded attentional pooling (학습 쿼리 k개)
+        self.seeds = nn.Parameter(torch.zeros(1, self.num_seeds, hidden_dim))
+        nn.init.trunc_normal_(self.seeds, std=0.02)
+
+        # seed 요약 후 소형 FFN(게이트 0 시작)
+        self.seed_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_hidden, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_hidden, hidden_dim, bias=True),
+        )
+        self.seed_ffn_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # seed 가중합 → 단일 벡터
+        self.seed_gate = nn.Linear(hidden_dim, 1, bias=True)
+
+        # 3) DeepSets(mean/max) 잔차(스칼라 게이트 0 시작)
+        self.ds_mean_alpha = nn.Parameter(torch.tensor(0.0))
+        self.ds_max_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # 4) 출력 정규화/드롭아웃
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_drop = nn.Dropout(
+            out_drop_p) if out_drop_p > 0 else nn.Identity()
+
+        self.attn_drop_p = float(attn_drop_p)
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B_Pnn, route_num, D), mask: (B_Pnn, route_num) True=pad → (B_Pnn, D)
+        """
+        valid = (~mask).to(x.dtype)  # (B_Pnn,route_num)
+        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return (x * valid.unsqueeze(-1)).sum(dim=1) / denom
+
+    @staticmethod
+    def _masked_max(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B_Pnn, route_num, D), mask: (B_Pnn, route_num) True=pad → (B_Pnn, D)
+        전부 마스크(N행)는 0 벡터로 반환.
+        """
+        B_Pnn, route_num, D = x.shape
+        very_neg = torch.finfo(
+            x.dtype).min if x.dtype in (torch.float16,
+                                        torch.bfloat16) else -1e30
+        x_masked = x.masked_fill(mask.unsqueeze(-1), very_neg)
+        mx = x_masked.amax(dim=1)  # (B_Pnn,D)
+        all_off = mask.all(dim=1)  # (B_Pnn,)
+        if all_off.any().item():
+            mx = torch.where(all_off.unsqueeze(-1), torch.zeros_like(mx), mx)
+        return mx
 
     def forward(
-        self,
-        route_lanes: torch.Tensor,  # (B, Pnn, route_num, hidden_dim)
-        route_lanes_mask: torch.Tensor,  # (B, Pnn, route_num)  True=pad
-    ) -> torch.Tensor:  # (B, Pnn, hidden_dim)
-        """
-        에이전트별 후보 경로(route) 집합을 내용(feature) 점수와 위치(positional) 점수로
-        가중합하여 **하나의 대표 경로 임베딩**을 산출합니다.
+            self,
+            route_lanes: torch.Tensor,  # (B, Pnn, route_num, D)
+            route_lanes_mask: torch.Tensor,  # (B, Pnn, route_num) True=pad
+    ) -> torch.Tensor:  # (B, Pnn, D)
+        assert route_lanes.dim() == 4 and route_lanes_mask.dim() == 3
+        B, Pnn, route_num, D = route_lanes.shape
+        assert D == self.hidden_dim, f"hidden_dim mismatch: got {D}, expected {self.hidden_dim}"
+        assert route_lanes_mask.shape == (B, Pnn, route_num)
 
-        이 모듈은 각 이웃 에이전트(예: 주변 차량)마다 주어진 여러 후보 경로를 입력으로 받아,
-        (1) 경로 임베딩 기반 점수 `score_e(route_lanes)`에서
-        (3) 마스크된 항목을 제외하고 softmax 가중치를 계산하여,
-        (4) 경로 임베딩의 **가중합(pooling)**을 반환합니다.
-        만약 특정 에이전트의 모든 후보 경로가 무효(마스크)라면, 해당 에이전트의 출력은
-        학습 가능한 **`unknown_emb`** 벡터로 대체됩니다.
+        # ---- 준비: dtype/device & 모양 변환 ----
+        route_lanes = self.in_norm(route_lanes)  # (B,Pnn,route_num,D)
+        route_lanes_mask = route_lanes_mask.to(torch.bool)  # (B,Pnn,route_num)
+        route_lanes = route_lanes.masked_fill(route_lanes_mask.unsqueeze(-1),
+                                              0.0)  # 패딩은 0 고정
 
-        차원 표기:
-            - B: 배치 크기
-            - Pnn: 이웃 에이전트 수 (predicted neighbor num)
-            - route_num: 후보 경로 수 (`route_num`)
-            - H: 경로 임베딩 차원 (`hidden_dim`)
+        B_Pnn = B * Pnn
+        route_lanes_3 = route_lanes.reshape(B_Pnn, route_num,
+                                            D)  # (B_Pnn,route_num,D)
+        route_lanes_mask_2 = route_lanes_mask.reshape(
+            B_Pnn, route_num)  # (B_Pnn,route_num)
+        no_route_agent_mask = route_lanes_mask_2.all(dim=1)  # (B_Pnn,)
 
-        Args:
-            route_lanes (torch.Tensor):
-                경로 임베딩 텐서. 각 후보 경로의 내용(feature) 표현.
-                **Shape:** `(B, Pnn, route_num, H)`.
-            route_lanes_mask (torch.Tensor):
-                경로 마스크. **`True`는 pad(무효)**, **`False`는 유효** 후보 경로를 의미.
-                softmax 계산에서 무효 항목이 제외되도록 로짓을 `-inf`로 마스킹합니다.
-                **Shape:** `(B, Pnn, route_num)`.
-
-        Returns:
-            torch.Tensor:
-                에이전트별 대표 경로 임베딩(가중합 결과)에 정규화/드롭아웃을 적용한 출력.
-                **Shape:** `(B, Pnn, H)`.
-
-        동작 개요:
-            1) **점수 계산**
-               - 내용 점수: `s_e = score_e(route_lanes)` → `(B, Pnn, route_num, 1)`
-               - 합산 로짓: `logits = (s_e).squeeze(-1)` → `(B, Pnn, route_num)`
-            2) **마스킹 및 수치 안정화**
-               - `route_lanes_mask == True`(무효) 위치는 `-inf`로 채워 softmax에서 배제.
-               - 만약 한 에이전트의 모든 경로가 무효라면(`all_off=True`) 해당 행의 로짓을
-                 `0`으로 대체하여 **softmax NaN을 방지**합니다.
-            3) **주의(Attention) 가중치 계산**
-               - `attn = softmax(logits, dim=-1)` → `(B, Pnn, route_num)`
-               - 무효 항목 가중치는 0이 되도록 `(~route_lanes_mask)`로 한 번 더 차단.
-            4) **가중합 풀링**
-               - `(attn[..., None] * route_lanes).sum(dim=2)` → `(B, Pnn, H)`
-            5) **결측 에이전트 대체**
-               - `all_off=True`인 에이전트의 결과는 학습 가능한 `unknown_emb`로 치환.
-            6) **정규화 및 드롭아웃**
-               - `LayerNorm` 및 `Dropout`을 적용하여 최종 출력 생성.
-
-        주의:
-            - 로짓은 softmax 전 **float32**로 변환하여 수치 안정성을 높입니다.
-            - `unknown_emb`는 `(1, 1, H)` 형태(또는 호환 가능한 브로드캐스트 형태)로 가정하며,
-              출력 텐서의 **device/dtype**에 맞춰 사용됩니다.
-            - 모든 연산은 유효 경로에 대해서만 그래디언트가 전파됩니다(마스크된 항목 제외).
-        """
-        assert route_lanes.dim() == 4, \
-            f"route_lanes {route_lanes.shape}"
-        assert route_lanes_mask.dim(
-        ) == 3, f"route_lanes_mask {route_lanes_mask.shape}"
-        B, Pnn, route_num, hidden_dim = route_lanes.shape  # B:배치, Pnn:에이전트 수, route_num:route_num, hidden_dim:H
-        assert route_lanes_mask.shape == (B, Pnn, route_num), "mask shape 불일치"
-
-        # s_e: (B,Pnn,route_num,1)
-        s_e = self.score_e(route_lanes)
-        # s_p: (B,Pnn,route_num,1)
-        # logits: (B,Pnn,route_num)
-        logits = s_e.squeeze(-1)
-
-        # 마스크 적용: pad(True) → -inf로 softmax 제외
-        # logits(float32): (B,Pnn,route_num)
-        logits = logits.float()
-        # logits(masked): (B,Pnn,route_num)  # pad 위치는 -inf
-        logits = logits.masked_fill(route_lanes_mask, float("-inf"))
-
-        # all_off: (B,Pnn)  # 해당 에이전트의 모든 route가 무효(True)
-        # (B, Pnn, route_num)  -> (B, Pnn)  # 모든 route가 True(무효)인 행
-        all_off = route_lanes_mask.all(dim=-1)
-        # all_off.any().item(): # 하나라도 True인 행이 있으면
-        if all_off.any().item():
-            # logits.clone(): (B,Pnn,route_num)
+        # ---- 2) Seeded attentional pooling (PMA-lite) ----
+        # (1, num_seeds, D) → (B_Pnn, num_seeds, D)
+        seeds = self.seeds.to(route_lanes_3.dtype).expand(
+            B_Pnn, self.num_seeds, D)
+        # 점수: (B_Pnn,num_seeds,route_num) = (B_Pnn,num_seeds,D) @ (B_Pnn,D, route_num) / sqrt(D)
+        logits = torch.einsum("nkd,nrd->nkr", seeds, route_lanes_3) / math.sqrt(
+            max(1.0, float(D)))
+        # 마스크: pad(True) → -inf
+        if route_lanes_mask_2.any().item():  # (B_Pnn,route_num)
+            logits = logits.masked_fill(route_lanes_mask_2.unsqueeze(1),
+                                        float("-inf"))
+        # 전부 마스크 행 softmax NaN 방지
+        if no_route_agent_mask.any().item():  # (B_Pnn,)
             logits = logits.clone()
-            # logits[all_off]: (N_all_off, route_num)  # N_all_off = all_off에서 True인 (B,Pnn) 개수
-            logits[all_off] = 0.0  # softmax NaN 방지: 전부 무효인 행을 0으로 채움
+            logits[no_route_agent_mask] = 0.0
 
-        # attn_pre: (B,Pnn,route_num) → softmax → (B,Pnn,route_num)
-        # attn: (B,Pnn,route_num,1)  # 마지막 차원으로 1을 붙여 (route_num,1) 가중합에 대비
-        attn = F.softmax(logits, dim=-1).unsqueeze(-1)
-        # (~route_lanes_mask): (B,Pnn,route_num) → unsqueeze(-1): (B,Pnn,route_num,1)
-        # attn_masked: (B,Pnn,route_num,1)  # 무효 route 가중치 0
-        attn = attn * (~route_lanes_mask).unsqueeze(-1)
+        attn = F.softmax(logits, dim=-1)
+        if self.attn_drop_p > 0 and self.training:
+            attn = F.dropout(attn, p=self.attn_drop_p)
 
-        # (attn * route_lanes): (B,Pnn,route_num,1) * (B,Pnn,route_num,H) → 브로드캐스트 → (B,Pnn,route_num,H)
-        # pooled: (B,Pnn,H)  # R축(=route_num)으로 가중합
-        pooled = (attn.float() * route_lanes.float()).sum(dim=2).to(
-            route_lanes.dtype)
+        # (B_Pnn,num_seeds,route_num) @ (B_Pnn,route_num,D) = (B_Pnn,num_seeds,D)
+        y_seed = torch.einsum("nkr,nrd->nkd", attn,
+                              route_lanes_3)  # (B_Pnn,num_seeds,D)
+        # 소형 FFN 잔차(게이트 0 시작)
+        y_seed = y_seed + self.seed_ffn_alpha.to(
+            y_seed.dtype) * self.seed_ffn(y_seed)
 
-        # ★ 결측 에이전트는 unknown_emb로 대체 (수정된 부분)
-        # all_off: (B,Pnn)  # 해당 에이전트의 모든 route가 무효(True)
-        if all_off.any().item():
-            # self.unknown_emb: (1,1,H)
-            # self.unknown_emb[0,0]: (H,)  # 1D 벡터
-            # unknown_row: (H,)
-            # pooled[all_off]: (N_all_off, H)  # (B,Pnn) bool 마스크로 인덱싱한 결과
-            unknown_row = self.unknown_emb[0, 0].to(device=pooled.device,
-                                                    dtype=pooled.dtype)
-            # pooled: (B,Pnn,H)
-            pooled = torch.where(
-                all_off.unsqueeze(-1),  # (B, Pnn, 1) True → 대체
-                unknown_row.expand_as(pooled),  # (B, Pnn, H)
-                pooled)
+        # seed 가중합 → (B_Pnn,D)
+        w = F.softmax(self.seed_gate(y_seed).squeeze(-1),
+                      dim=1).unsqueeze(-1)  # (B_Pnn,num_seeds,1)
+        y_pool = (w * y_seed).sum(dim=1)  # (B_Pnn,D)
 
-        # norm 입력/출력: (B,Pnn,H)
-        # drop: (B,Pnn,H)
-        pooled = self.drop(self.norm(pooled))  # (B,Pnn,hidden_dim)
-        return pooled
+        # ---- 3) DeepSets(mean/max) 잔차 ----
+        ds_mean = self._masked_mean(route_lanes_3,
+                                    route_lanes_mask_2)  # (B_Pnn,D)
+        ds_max = self._masked_max(route_lanes_3,
+                                  route_lanes_mask_2)  # (B_Pnn,D)
+        out = y_pool \
+              + self.ds_mean_alpha.to(y_pool.dtype) * ds_mean \
+              + self.ds_max_alpha.to(y_pool.dtype)  * ds_max                   # (B_Pnn,D)
+
+        # all-off 는 0 보장
+        if no_route_agent_mask.any().item():
+            out = torch.where(no_route_agent_mask.unsqueeze(-1),
+                              torch.zeros_like(out), out)
+
+        # ---- 4) 정규화/드롭아웃 & 모양 복원 ----
+        out = self.out_drop(self.out_norm(out))  # (B_Pnn,D)
+        return out.view(B, Pnn, D)  # (B,Pnn,D)
 
 
 class Encoder(nn.Module):
@@ -664,8 +675,8 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
             (route_lanes, route_lanes_mask) = self._mask_all_routes_like(
                 route_lanes, route_lanes_mask, route_keep_mask)
         # (B, Pnn, hidden_dim)
-        near_agents_route_lane_emb = self.npc_route_encoder(route_lanes,
-                                                        route_lanes_mask)
+        near_agents_route_lane_emb = self.npc_route_encoder(
+            route_lanes, route_lanes_mask)
         # (B, Pnn) True=해당 에이전트가 유효 route를 가짐
         route_known_mask = (~route_lanes_mask).any(
             dim=-1)  # (B, Pnn) True=known
