@@ -133,7 +133,8 @@ def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
         'neighbor_prediction_loss_xy': valid_dist_mean,  # scalar
         'neighbor_prediction_loss_yaw': neigh_yaw,  # scalar # degree
         'neighbor_prediction_loss_xy_early': early_valid_dist_mean,  # scalar
-        'neighbor_prediction_loss_yaw_early': early_valid_yaw_mean,  # scalar # degree
+        'neighbor_prediction_loss_yaw_early':
+            early_valid_yaw_mean,  # scalar # degree
     }
 
 

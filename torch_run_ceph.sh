@@ -66,8 +66,12 @@ mkdir -p "$LOG_DIR"
 # 디버그: 파이썬/CPP 스택, NCCL 조기실패
 export TORCH_SHOW_CPP_STACKTRACES=1
 export PYTHONFAULTHANDLER=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# CUDA 런타임이 한 GPU에서 동시에 유지하는 “연결/큐(=스케줄링 슬롯)”의 상한을 32로 늘려라
+export CUDA_DEVICE_MAX_CONNECTIONS=32
+# CPU에서 돌아가는 연산(전처리, 일부 텐서 연산, BLAS 등)의 스레드 수를 컨트롤해서, GPU 학습 중 CPU 과도한 스레드 난립 방지
+printf "[ENV] %-28s %s\n" "OMP_NUM_THREADS:"            "${OMP_NUM_THREADS-<unset>}"
+printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
 DEBUG_LOG=0   # 1: 상세 디버그, 0: 일반 학습
 
 if (( DEBUG_LOG )); then

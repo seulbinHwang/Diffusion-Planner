@@ -1,10 +1,39 @@
 import os
+from typing import Optional
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
+# --- sanity check: env vars that must be ints ---
+# def _fix_int_env(name: str, default: Optional[int] = None):
+#     v = os.environ.get(name)
+#     if v is None:
+#         return
+#     try:
+#         int(str(v).strip())
+#     except Exception:
+#         msg = f"[WARN] invalid {name}={v!r}"
+#         if default is None:
+#             os.environ.pop(name, None)
+#             print(msg + " -> unset")
+#         else:
+#             os.environ[name] = str(int(default))
+#             print(msg + f" -> set {name}={default}")
+#
+# for _k,_d in [
+#     ("CUDA_DEVICE_MAX_CONNECTIONS", 32),
+#     ("TORCH_NCCL_ASYNC_ERROR_HANDLING", 1),
+#     ("OMP_NUM_THREADS", 8),
+# ]:
+#     _fix_int_env(_k, _d)
+
+# deprecated 키는 사용 금지
+os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+
+
+
 # TensorFloat-32(TF32) 연산을 허용하여
 #   - Ampere(A100 등) GPU에서 matmul/cuDNN 연산을 FP32보다 빠르게 처리하고
 #   - 눈에 띄는 정밀도 손실 없이 학습·추론 속도를 높이기 위한 설정입니다.
@@ -495,11 +524,11 @@ def model_training(args):
             device=args.device,
         )
 
-    if global_rank == 0:
-        model_to_print = ddp.get_model(diffusion_planner, args.ddp)
-        print("Model Params: {}".format(
-            sum(p.numel() for p in model_to_print.parameters())))
-        print_parameter_index_mapping(model_to_print)
+    # if global_rank == 0:
+    #     model_to_print = ddp.get_model(diffusion_planner, args.ddp)
+    #     print("Model Params: {}".format(
+    #         sum(p.numel() for p in model_to_print.parameters())))
+    #     print_parameter_index_mapping(model_to_print)
 
     # optimizer
     params = [{

@@ -294,7 +294,6 @@ class DiTBlock(nn.Module):
         #     x, attn_mask)  # x_unpad: (T, D)
         attention_mask = (~attn_mask).to(torch.bool)  # True=valid
 
-
         res = unpad_input(x, attention_mask)
 
         # v2.7 이하: 4개 / v2.8.x: 5개
@@ -369,7 +368,8 @@ class DiTBlock(nn.Module):
         # (1) 언패드(Q, KV 각각)
         q_mask_valid = (~q_mask).to(torch.bool)
         kv_mask_valid = (~kv_mask).to(torch.bool)
-        q_unpad, q_idx, cu_q, max_q, _ = unpad_input(q_in, q_mask_valid)  # (Tq, D)
+        q_unpad, q_idx, cu_q, max_q, _ = unpad_input(q_in,
+                                                     q_mask_valid)  # (Tq, D)
         res = unpad_input(q_in, q_mask_valid)  # (Tq, D)
         # v2.7 이하: 4개 / v2.8.x: 5개
         if len(res) == 4:
@@ -386,7 +386,6 @@ class DiTBlock(nn.Module):
             seqlens = (cu_k[1:] - cu_k[:-1]).to(torch.int32)
         elif len(res) == 5:
             kv_unpad, indices, cu_k, max_k, seqlens = res
-
 
         if q_unpad.numel() == 0 or kv_unpad.numel(
         ) == 0 or max_q == 0 or max_k == 0:

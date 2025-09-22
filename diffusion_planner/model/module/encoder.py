@@ -2636,6 +2636,25 @@ class LaneFusionEncoder(nn.Module):
         lane_info = lane_info.reshape(B * lane_num, lane_len, -1)
 
         valid_indices = ~mask_p.reshape(-1)
+
+        num_valid = int(valid_indices.sum().item())
+
+        if num_valid == 0:
+            # 최종 임베딩 차원(H)
+            H = self.emb_project.fc2.out_features  # timm.Mlp의 최종 out_features
+
+            # ⚠️ autocast 켜진 경우, 다른 임베딩과 dtype을 맞춰줌 (fp16/bf16)
+            out_dtype = (torch.get_autocast_gpu_dtype()
+                         if torch.is_autocast_enabled() and lane_info.is_cuda
+                         else lane_info.dtype)
+
+            lane_embedding = torch.zeros((B, lane_num, H),
+                                         device=lane_info.device,
+                                         dtype=out_dtype)
+            print("[Warning] All lane inputs are padding. Returning zero embeddings.")
+            # mask와 feature는 그대로 복원
+            return lane_embedding, mask_p.reshape(B, lane_num), lane_feature
+
         lane_info = lane_info[valid_indices]
 
         lane_info = self.channel_pre_project(lane_info)
