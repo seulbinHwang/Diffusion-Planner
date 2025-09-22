@@ -32,8 +32,6 @@ import torch
 # deprecated 키는 사용 금지
 os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
 
-
-
 # TensorFloat-32(TF32) 연산을 허용하여
 #   - Ampere(A100 등) GPU에서 matmul/cuDNN 연산을 FP32보다 빠르게 처리하고
 #   - 눈에 띄는 정밀도 손실 없이 학습·추론 속도를 높이기 위한 설정입니다.
@@ -41,7 +39,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')  # PyTorch>=2.0
 import sys, os, faulthandler, traceback
+
 faulthandler.enable(all_threads=True)
+from timm.optim.optim_factory import param_groups_weight_decay
 
 import argparse
 import shutil
@@ -63,7 +63,6 @@ from diffusion_planner.utils import ddp
 import time
 from diffusion_planner.train_epoch import train_epoch
 
-
 import math
 
 try:
@@ -72,14 +71,24 @@ try:
 except Exception:
     pass
 
-def pnn_schedule(epoch: int,
-                 total_epochs: int,
-                 *,
-                 base: int = 32,           # 시작 Pnn
-                 cap: int,                 # 최종 Pnn (보통 args.predicted_neighbor_num)
-                 step: int = 32,           # Pnn 증분 단위(캐시/모델 구조와 맞추기)
-                 ramp_fraction: float = 0.30  # 총 학습의 몇 % 지점에서 cap 도달할지
-                 ) -> int:
+
+# === [NEW] LR auto-scaling (root scale for Adam/AdamW) ======================
+def _effective_global_batch(batch_size: int, world_size: int) -> int:
+    """DataLoader가 사용하는 실제 글로벌 배치(DDP 정합)"""
+    world_size = max(1, int(world_size))
+    per_rank = max(1, batch_size // world_size)
+    return per_rank * world_size  # drop_last 정합 반영
+
+
+def pnn_schedule(
+    epoch: int,
+    total_epochs: int,
+    *,
+    base: int = 32,  # 시작 Pnn
+    cap: int,  # 최종 Pnn (보통 args.predicted_neighbor_num)
+    step: int = 32,  # Pnn 증분 단위(캐시/모델 구조와 맞추기)
+    ramp_fraction: float = 0.30  # 총 학습의 몇 % 지점에서 cap 도달할지
+) -> int:
     """
     커리큘럼: [0 .. ramp_end-1] 구간에서 base→cap을 'step' 단위로 균등 분할해서 올리고,
              ramp_end 이후엔 cap으로 고정한다.
@@ -96,7 +105,8 @@ def pnn_schedule(epoch: int,
     base = int(base)
     step = int(step)
     total_epochs = int(total_epochs)
-    ramp_end = max(1, int(round(total_epochs * ramp_fraction)))  # cap 도달 epoch (0-index 기준 ramp_end-1)
+    ramp_end = max(1, int(round(
+        total_epochs * ramp_fraction)))  # cap 도달 epoch (0-index 기준 ramp_end-1)
 
     if cap <= base:
         return cap  # 방어: 이미 최대 이하라면 그대로
@@ -105,14 +115,13 @@ def pnn_schedule(epoch: int,
     # 0..(ramp_end-1) 구간을 steps_needed 칸으로 균등 분할하여 인덱스 계산
     # epoch=ramp_end-1일 때 idx=steps_needed가 되도록 설계
     idx = 0 if ramp_end == 0 else min(
-        steps_needed,
-        math.floor(((epoch + 1) / ramp_end) * steps_needed)
-    )
+        steps_needed, math.floor(((epoch + 1) / ramp_end) * steps_needed))
 
     pnn = base + idx * step
     if pnn > cap:
         pnn = cap
     return int(pnn)
+
 
 # === [ADD] Pnn 기반 배치 크기 스케줄러 ==================================
 def bs_schedule_by_pnn(pnn_curr: int,
@@ -133,7 +142,7 @@ def bs_schedule_by_pnn(pnn_curr: int,
     """
     if pnn_curr <= 0:
         pnn_curr = pnn_base
-    scale = (float(pnn_base) / float(pnn_curr)) ** float(alpha)
+    scale = (float(pnn_base) / float(pnn_curr))**float(alpha)
     bs_global = int(max(world_size, round(bs_base * scale)))
     if max_global is not None:
         bs_global = min(bs_global, int(max_global))
@@ -141,6 +150,8 @@ def bs_schedule_by_pnn(pnn_curr: int,
     bs_global = (bs_global // world_size) * world_size
     bs_per_rank = max(min_per_rank, bs_global // world_size)
     return bs_global, bs_per_rank
+
+
 # =======================================================================
 
 
@@ -275,6 +286,11 @@ def get_args():
                         type=int,
                         help='fix random seed',
                         default=3407)
+    parser.add_argument('--weight_decay',
+                        type=float,
+                        default=1e-2,
+                        help='AdamW weight decay for decayed params')
+
     parser.add_argument('--train_epochs',
                         type=int,
                         help='epochs of training',
@@ -420,11 +436,128 @@ def purge_collection(api, entity, project, coll_name):
     print(f"[PURGE] {coll_name}: 삭제 완료 {deleted_count}개, 실패 {failed_count}개")
 
 
+# --- put this in a utils file or near your optimizer build code ---
+from typing import List, Set
+import torch
+import torch.nn as nn
+from timm.optim.optim_factory import param_groups_weight_decay
+
+# 토큰/포지션 계열에서 자주 쓰는 속성 이름들(모듈의 attribute로 존재하는 nn.Parameter)
+_TOKEN_POS_ATTRS = (
+    # 일반
+    "cls_token",
+    "class_token",
+    "dist_token",
+    # 위치/상대위치
+    "cls_pos",
+    "pos_embed",
+    "absolute_pos_embed",
+    "rel_pos",
+    "rel_pos_bias",
+    "relative_position_bias_table",
+    # RoPE/ALiBi 류
+    "rope",
+    "alibi",
+    "rotary_emb",
+    "rotary_embedding",
+)
+
+
+def discover_extra_no_weight_decay_names(
+    model: nn.Module,
+    include_seed_params: bool = True,
+) -> List[str]:
+    """
+    모델을 실제로 순회하여 '토큰/포지션'류 파라미터 이름만 수집합니다.
+    - nn.Parameter 이면서 차원>=2 인 것만 채택 (행렬 아닌 토큰류)
+    - Linear/Conv 등 submodule의 .weight/.bias는 제외
+    - (옵션) seeds/ego_fut_seeds 같은 학습 쿼리 토큰도 포함
+    """
+    extra: Set[str] = set()
+
+    # (1) 모듈 attribute로 붙은 nn.Parameter 후보 탐색
+    for mod_name, mod in model.named_modules():
+        for attr in _TOKEN_POS_ATTRS:
+            if hasattr(mod, attr):
+                p = getattr(mod, attr)
+                if isinstance(p,
+                              nn.Parameter) and p.requires_grad and p.ndim >= 2:
+                    full_name = f"{mod_name}.{attr}" if mod_name else attr
+                    extra.add(full_name)
+
+        # (선택) 학습 쿼리 토큰(seeds 류)
+        if include_seed_params:
+            for attr in ("seeds", "ego_fut_seeds"):
+                if hasattr(mod, attr):
+                    p = getattr(mod, attr)
+                    # 보통 형태: (1, K, H) → 첫 축이 batch-like
+                    if isinstance(
+                            p, nn.Parameter
+                    ) and p.requires_grad and p.ndim >= 2 and p.shape[0] == 1:
+                        full_name = f"{mod_name}.{attr}" if mod_name else attr
+                        extra.add(full_name)
+
+    # (2) timm 모델이 no_weight_decay() 제공하면 합치기 (관례)
+    if hasattr(model, "no_weight_decay") and callable(
+            getattr(model, "no_weight_decay")):
+        try:
+            extra.update(set(model.no_weight_decay()))
+        except Exception:
+            pass
+
+    # DDP/랩핑 전개 여부와 무관하게 named_parameters() 기준의 풀네임과 일치시켜야 합니다.
+    return sorted(extra)
+
+
+def build_adamw_with_param_groups(
+    model: nn.Module,
+    lr: float,
+    weight_decay: float,
+    include_seed_params: bool = True,
+):
+    """
+    - timm의 param_groups_weight_decay를 사용해 bias/Norm/1D 자동 no-decay
+    - 위 discover 함수로 찾은 토큰/포지션 파라미터 추가 no-decay
+    - Optimizer에는 전역 WD=0.0 (그룹에 이미 들어감)
+    """
+    # 토큰/포지션 추가 no-decay 수집
+    extra_nwd = discover_extra_no_weight_decay_names(
+        model, include_seed_params=include_seed_params)
+
+    # 그룹 생성 (timm 헬퍼)
+    param_groups = param_groups_weight_decay(
+        model,
+        weight_decay=weight_decay,
+        no_weight_decay_list=extra_nwd,
+    )
+    # 공통 LR 부여
+    for g in param_groups:
+        g["lr"] = lr
+
+    # 최종 옵티마이저 (전역 WD는 0.0로 중복 방지)
+    try:
+        optim = torch.optim.AdamW(param_groups, fused=True, weight_decay=0.0)
+    except (TypeError, RuntimeError):
+        optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
+
+    return optim, extra_nwd
+
+
 def model_training(args):
     best_loss = float('inf')
     torch.cuda.empty_cache()
     # init ddp
     global_rank, rank, _ = ddp.ddp_setup_universal(True, args)
+    world_size = ddp.get_world_size()
+
+    # === [NEW] Auto LR by batch-size (root scaling) =========================
+    BASE_GLOBAL_BATCH = 2048  # 기존 기준 글로벌 배치
+    BASE_LR = 5e-4  # 기존 기준 LR (Adam/AdamW)
+
+    # DataLoader가 실제로 사용할 글로벌 배치(정수 배수)로 계산
+    current_global_batch = _effective_global_batch(args.batch_size, world_size)
+    scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
+    args.learning_rate = BASE_LR * scale
 
     if global_rank == 0:
         # Logging
@@ -515,7 +648,9 @@ def model_training(args):
                                              'cuda' else args.device)
 
     if args.ddp:
-        diffusion_planner = DDP(diffusion_planner, device_ids=[rank])# find_unused_parameters=True)
+        diffusion_planner = DDP(diffusion_planner,
+                                device_ids=[rank
+                                           ])  # find_unused_parameters=True)
     model_ema = None
     if args.use_ema:
         model_ema = ModelEma(
@@ -523,23 +658,16 @@ def model_training(args):
             decay=0.999,
             device=args.device,
         )
+    # --- build param groups with correct no-decay (timm helper) ---
+    base_model = ddp.get_model(diffusion_planner, args.ddp)
+    optimizer, extra_nwd = build_adamw_with_param_groups(
+        model=base_model,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+        include_seed_params=True,
+        # ← seeds/ego_fut_seeds도 no-decay에 포함(원치 않으면 False)
+    )
 
-    # if global_rank == 0:
-    #     model_to_print = ddp.get_model(diffusion_planner, args.ddp)
-    #     print("Model Params: {}".format(
-    #         sum(p.numel() for p in model_to_print.parameters())))
-    #     print_parameter_index_mapping(model_to_print)
-
-    # optimizer
-    params = [{
-        'params': ddp.get_model(diffusion_planner, args.ddp).parameters(),
-        'lr': args.learning_rate
-    }]
-
-    try:
-        optimizer = optim.AdamW(params, fused=True)
-    except (TypeError, RuntimeError):  # fused 미지원 환경
-        optimizer = optim.AdamW(params)
     scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs,
                                               args.warm_up_epoch)
 
@@ -579,6 +707,7 @@ def model_training(args):
 
     # begin training
     for epoch in range(init_epoch, train_epochs):
+        scheduler.step()
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
         epoch_t0 = time.perf_counter()
@@ -604,8 +733,12 @@ def model_training(args):
         if global_rank == 0:
             lr_dict = {'lr': optimizer.param_groups[0]['lr']}
             metrics = {
-                **{f"train_loss/{k}": v for k, v in train_loss.items()},
-                **{f"lr/{k}": v for k, v in lr_dict.items()},
+                **{
+                    f"train_loss/{k}": v for k, v in train_loss.items()
+                },
+                **{
+                    f"lr/{k}": v for k, v in lr_dict.items()
+                },
                 "speed/epoch_time_sec": epoch_time_sec,
                 "speed/epoch_samples_per_sec": epoch_sps,
                 "speed/epoch_batches": len(train_loader),
@@ -621,7 +754,8 @@ def model_training(args):
                 # save model at the end of epoch
                 save_model(diffusion_planner, optimizer, scheduler, save_path,
                            epoch, train_total_loss, wandb_logger.id,
-                           model_ema.ema if model_ema is not None else None, save_best)
+                           model_ema.ema if model_ema is not None else None,
+                           save_best)
                 print(f"Model saved in {save_path}\n")
                 # ── latest-model 아티팩트 (매번 덮어쓰기) ──
                 # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
@@ -689,7 +823,7 @@ def model_training(args):
                             if v.id != current.id:
                                 v.delete()
 
-        scheduler.step()
+        # scheduler.step()
         train_sampler.set_epoch(epoch + 1)
 
     # ── 모든 훈련 종료 후 정리 ─
@@ -836,7 +970,8 @@ if __name__ == "__main__":
     except BaseException:
         rank = int(os.environ.get("RANK", -1))
         print(f"\n[rank{rank}] Unhandled exception (printing full traceback):",
-              file=sys.stderr, flush=True)
-        traceback.print_exc()           # <-- 표준에러로 자세한 스택
+              file=sys.stderr,
+              flush=True)
+        traceback.print_exc()  # <-- 표준에러로 자세한 스택
         sys.stderr.flush()
         raise

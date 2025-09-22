@@ -2651,7 +2651,9 @@ class LaneFusionEncoder(nn.Module):
             lane_embedding = torch.zeros((B, lane_num, H),
                                          device=lane_info.device,
                                          dtype=out_dtype)
-            print("[Warning] All lane inputs are padding. Returning zero embeddings.")
+            print(
+                "[Warning] All lane inputs are padding. Returning zero embeddings."
+            )
             # mask와 feature는 그대로 복원
             return lane_embedding, mask_p.reshape(B, lane_num), lane_feature
 
