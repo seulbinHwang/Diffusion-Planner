@@ -79,8 +79,8 @@ class TensorBoardLogger():
         if self.writer is not None:
             for key, value in metrics.items():
                 self.writer.add_scalar(key, value, step)
-            if wandb.run:  # W&B 대시보드에서도 동일한 메트릭을 보기 위해 추가
-                wandb.log(metrics, step=step)
+            # if wandb.run:  # W&B 대시보드에서도 동일한 메트릭을 보기 위해 추가
+            #     wandb.log(metrics, step=step)
 
     def finish(self):
         if self.writer is not None:

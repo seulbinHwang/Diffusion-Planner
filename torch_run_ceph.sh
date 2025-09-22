@@ -87,6 +87,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "new-adaLN-weighted-loss-h-two" \
+  --name "new-adaLN-weighted-loss-h-two_4096" \
   --batch_size 4096
-  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
+#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

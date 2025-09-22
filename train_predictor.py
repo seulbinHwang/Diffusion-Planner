@@ -31,7 +31,7 @@ from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.utils.dataset import DiffusionPlannerData
 from diffusion_planner.utils import ddp
-
+import time
 from diffusion_planner.train_epoch import train_epoch
 
 
@@ -412,11 +412,11 @@ def model_training(args):
                 os.path.normpath(args.resume_local_path_model_path))
         else:
             from datetime import datetime
-            time = datetime.now()
-            time = time.strftime("%Y-%m-%d-%H:%M:%S")
+            time_ = datetime.now()
+            time_ = time_.strftime("%Y-%m-%d-%H:%M:%S")
             time_str = datetime.now().strftime("%Y-%m-%d-%H-%M")
 
-            save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
+            save_path = f"{args.save_dir}/training_log/{args.name}/{time_}/"
             os.makedirs(save_path, exist_ok=True)
         args.save_path = save_path
         # Save args
@@ -552,66 +552,37 @@ def model_training(args):
     for epoch in range(init_epoch, train_epochs):
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
-        # === [ADD] 이 에폭에서 사용할 예측 대상 수(Pnn_curr)와 컨텍스트 클립 수 ===
-        # args.curr_predicted_neighbor_num = pnn_schedule(
-        #     epoch, train_epochs,
-        #     base=32,
-        #     cap=args.predicted_neighbor_num,  # 보통 448
-        #     step=32,
-        #     ramp_fraction=0.30,  # 0.20~0.40 사이에서 취향과 자원에 맞게 조절
-        # )
-        # args.curr_predicted_neighbor_num = args.predicted_neighbor_num
-        # === [ADD] Pnn에 맞춘 동적 배치 크기 계산 & DataLoader 재생성 ======
-        # bs_global_now, bs_per_rank_now = bs_schedule_by_pnn(
-        #     pnn_curr=args.curr_predicted_neighbor_num,
-        #     pnn_base=32,                     # pnn_schedule 시작값과 일치
-        #     bs_base=args.batch_size,         # "글로벌" 배치 크기 기준
-        #     alpha=getattr(args, "bs_pnn_alpha", 1.5),
-        #     world_size=ddp.get_world_size(),
-        #     min_per_rank=1,
-        # )
-
-        # DDP sampler에 epoch 설정(셔플 시드 고정은 '현재 에폭' 직전에 호출)
-        # train_sampler.set_epoch(epoch)
-
-        # 이 에폭에 사용할 DataLoader를 '그때그때' 생성
-        # train_loader = DataLoader(
-        #     train_set,
-        #     sampler=train_sampler,
-        #     batch_size=bs_per_rank_now,
-        #     num_workers=args.num_workers,
-        #     prefetch_factor=args.prefetch_factor,
-        #     pin_memory=args.pin_mem,
-        #     drop_last=True,
-        # )
-        # ===================================================================
-
-
-        # if global_rank == 0:
-        #     clip_num = min(args.agent_num, args.curr_predicted_neighbor_num * 2)
-        #     print(
-        #         f"[Curriculum] Pnn_curr={args.curr_predicted_neighbor_num} | "
-        #         f"context_clip={clip_num} (<= agent_num={args.agent_num}) | "
-        #         f"batch(per-rank/global)={bs_per_rank_now}/{bs_global_now} | "
-        #         f"alpha={getattr(args,'bs_pnn_alpha',1.5):.2f}"
-        #     )
-
+        epoch_t0 = time.perf_counter()
         train_loss, train_total_loss = train_epoch(train_loader,
                                                    diffusion_planner, optimizer,
                                                    args, model_ema, aug)
         if args.device.startswith('cuda'):
             torch.cuda.empty_cache()
+        # === [추가] 에폭 종료 시간 & 에폭 속도 계산 ===
+        if args.ddp:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+        epoch_time_sec = time.perf_counter() - epoch_t0
+
+        # 실제 글로벌 배치 크기(정확)
+        world_size = ddp.get_world_size()
+        bs_per_rank = args.batch_size // world_size
+        global_batch_size = bs_per_rank * world_size
+        # 에폭당 처리 샘플 수 (drop_last이므로 len(loader)*global_batch_size)
+        samples_this_epoch = len(train_loader) * global_batch_size
+        epoch_sps = samples_this_epoch / max(epoch_time_sec, 1e-9)
+        ###########################
         if global_rank == 0:
             lr_dict = {'lr': optimizer.param_groups[0]['lr']}
-            wandb_logger.log_metrics(
-                {
-                    f"train_loss/{k}": v for k, v in train_loss.items()
-                },
-                step=epoch + 1)
-            wandb_logger.log_metrics({
-                f"lr/{k}": v for k, v in lr_dict.items()
-            },
-                                     step=epoch + 1)
+            metrics = {
+                **{f"train_loss/{k}": v for k, v in train_loss.items()},
+                **{f"lr/{k}": v for k, v in lr_dict.items()},
+                "speed/epoch_time_sec": epoch_time_sec,
+                "speed/epoch_samples_per_sec": epoch_sps,
+                "speed/epoch_batches": len(train_loader),
+                "speed/global_batch_size": global_batch_size,
+            }
+            wandb_logger.log_metrics(metrics, step=epoch + 1)
 
             if (epoch + 1) % args.save_utd == 1:
                 save_best = False
