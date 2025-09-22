@@ -80,6 +80,31 @@ def _effective_global_batch(batch_size: int, world_size: int) -> int:
     return per_rank * world_size  # drop_last 정합 반영
 
 
+# === [NEW] Epoch auto-scaling by global batch ===============================
+def _auto_scale_train_epochs(
+    base_global_batch: int,
+    base_epochs: int,
+    current_global_batch: int,
+    beta: float = 0.4,
+    clamp_min: Optional[int] = 1,
+    clamp_max: Optional[int] = None,
+) -> int:
+    """
+    E = base_epochs * (current_global_batch / base_global_batch) ** beta
+    - beta=0.4 (AdamW에서 '빠르게' 쪽으로 살짝 치우친 값)
+    - clamp_min/clamp_max: 필요 없는 경우 None
+    """
+    if current_global_batch <= 0 or base_global_batch <= 0:
+        return int(base_epochs)
+    k = float(current_global_batch) / float(base_global_batch)
+    scaled = int(round(float(base_epochs) * (k**float(beta))))
+    if clamp_min is not None:
+        scaled = max(int(clamp_min), scaled)
+    if clamp_max is not None:
+        scaled = min(int(clamp_max), scaled)
+    return scaled
+
+
 def pnn_schedule(
     epoch: int,
     total_epochs: int,
@@ -559,9 +584,29 @@ def model_training(args):
     scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
     args.learning_rate = BASE_LR * scale
 
+    # === [NEW] Epoch auto-scaling (beta=0.4, fast-oriented) =================
+    # - 앵커 에폭은 "현재 args.train_epochs"를 기준(기본 500)
+    EPOCH_BETA = 0.3
+    base_epochs_anchor = int(args.train_epochs)
+
+    scaled_epochs = _auto_scale_train_epochs(
+        base_global_batch=BASE_GLOBAL_BATCH,
+        base_epochs=base_epochs_anchor,
+        current_global_batch=current_global_batch,
+        beta=EPOCH_BETA,
+        clamp_min=1,  # 필요하면 None으로
+        clamp_max=None,  # 필요하면 예: 2000 등
+    )
+    args.train_epochs = int(scaled_epochs)
+
     if global_rank == 0:
         # Logging
         print("------------- {} -------------".format(args.name))
+        k = current_global_batch / float(BASE_GLOBAL_BATCH)
+        print(
+            f"[Epoch Auto-Scale] base_epochs={base_epochs_anchor}, beta={EPOCH_BETA}, "
+            f"B={current_global_batch} (k={k:.3f}) -> train_epochs={args.train_epochs}"
+        )
         print("Batch size: {}".format(args.batch_size))
         print("Learning rate: {}".format(args.learning_rate))
         print("Use device: {}".format(args.device))
@@ -678,6 +723,18 @@ def model_training(args):
          model_ema) = resume_model(args.resume_local_path_model_path,
                                    diffusion_planner, optimizer, scheduler,
                                    model_ema, args.device)
+        # --- [NEW] If resumed, ensure total epochs > init_epoch ------------------
+        # 재개 시 총 에폭이 초기 에폭보다 작거나 같으면 최소 1epoch 더 돌도록 보정
+        if args.train_epochs <= init_epoch:
+            old = int(args.train_epochs)
+            args.train_epochs = int(init_epoch) + 1
+            if global_rank == 0:
+                print(
+                    f"[ADJUST] scaled train_epochs ({old}) <= init_epoch ({init_epoch}). "
+                    f"Bumping to {args.train_epochs}.")
+
+        # (로컬 변수도 갱신하여 아래 스케줄러/루프에서 동일 값 사용)
+        train_epochs = int(args.train_epochs)
         if args.resume_model_from_wandb:
             allow_val_change = True
     else:
