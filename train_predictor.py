@@ -594,7 +594,7 @@ def model_training(args):
         base_epochs=base_epochs_anchor,
         current_global_batch=current_global_batch,
         beta=EPOCH_BETA,
-        clamp_min=1,  # 필요하면 None으로
+        clamp_min=max(1, args.warm_up_epoch + 1),  # warmup 안전
         clamp_max=None,  # 필요하면 예: 2000 등
     )
     args.train_epochs = int(scaled_epochs)
