@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -24,7 +24,7 @@ class DrawInfos:
         """
         딥러닝 output 값 그대로
         """
-        self.diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray]  # (T, 4)
+        self.diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}  # (T, 4)
         """
         history Agent 만든걸 -> (History_len, 11) numpy로 변환한 것들
         npc 미래 궤적 보정 input으로 쓰이는걸 그려보기 위해 저장
@@ -41,6 +41,14 @@ class DrawInfos:
         """
         self.diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (11,)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "model_input_key_to_unnorm_value": self.model_input_key_to_unnorm_value,
+            "diff_token_to_np_gen_traj_wrt_ego": self.diff_token_to_np_gen_traj_wrt_ego,
+            "diff_token_to_np_history_wrt_ego": self.diff_token_to_np_history_wrt_ego,
+            "diff_token_to_interp_np_traj_wrt_ego": self.diff_token_to_interp_np_traj_wrt_ego,
+            "diff_token_to_next_wp_wrt_ego": self.diff_token_to_next_wp_wrt_ego,
+        }
 
 def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
     """미래 포인트(3,)=[x,y,yaw]가 **유효**하면 True.
@@ -1485,11 +1493,11 @@ current_token_to_np_history: Dict[str, np.ndarray], # (history_len, 11)
 """
 # [Add]
 def draw_world_model_to_png(
-    draw_infos: DrawInfos,
+    data_: Dict[str, Any],
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
-    """주어진 world_model_feature(+토큰 미래 포즈)를 그림으로 렌더링하고 PNG로 저장.
+    """주어진 world_model_feature과 output을 그림으로 렌더링하고 PNG로 저장.
 
     Parameters
     ----------

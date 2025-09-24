@@ -694,13 +694,14 @@ class DataProcessor(object):
             save_path = os.path.join(save_dir, f"{map_name}_{token}.png")
             os.makedirs(save_dir, exist_ok=True)
             # if self._wandb_enabled or self.config.save_image:
+
+            self.save_to_disk(self._save_dir, data)
             if self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
+                data["token_to_future_traj_wrt_ego"] = None,
                 draw_machine.draw_world_model_to_png(
                     data,
-                    token_to_future_traj_wrt_ego=None,
                     save_path=save_path)
-            self.save_to_disk(self._save_dir, data)
 
     def save_to_disk(self, dir, data):
         os.makedirs(dir, exist_ok=True)

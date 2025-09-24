@@ -869,7 +869,7 @@ class WorldModelAgents(AbstractMLAgents):
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
         if self._is_vis_features:
-            draw_machine.draw_world_model_to_png(self._draw_infos,
+            draw_machine.draw_world_model_to_png(self._draw_infos.to_dict(),
                                                  self._vis_features_path)
 
     @staticmethod
