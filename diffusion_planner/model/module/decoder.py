@@ -125,6 +125,48 @@ class Decoder(nn.Module):
         x_out = x_seq.view(B, Pnn, flat)
         return x_out, can_apply
 
+    def _get_near_current_infos(
+            self,
+            target_agents_mask: torch.Tensor,  # [B, agent_num] bool
+            neighbor_agents_past: torch.Tensor,  # [B, agent_num, time_len, 11]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            near_current_xyyaw: [B, pnn, 4]  (x, y, cos(yaw), sin(yaw))
+            near_current_mask: [B, pnn]  True=빈 슬롯(무효 에이전트)
+        """
+        # neighbor_agents_past_xyyaw: [B, agent_num, time_len, 4]
+        neighbor_agents_past_xyyaw = neighbor_agents_past[..., :4]
+        # 마지막 타임스텝만 추출: [B, agent_num, 4]
+        neighbor_current_xyyaw = neighbor_agents_past_xyyaw[:, :, -1, :]
+
+        if target_agents_mask is None:
+            near_current_xyyaw = neighbor_current_xyyaw[:, :self.
+                                                        _predicted_neighbor_num, :]  # [B, pnn, 4]
+            # [B, pnn]
+            near_current_mask = torch.sum(torch.ne(near_current_xyyaw, 0),
+                                          dim=-1) == 0
+
+        else:
+            B, agent_num, time_len, D4 = neighbor_agents_past_xyyaw.shape
+            # 출력 버퍼(초기 0): [B, agent_num, 4]
+            near_current_xyyaw = torch.zeros(
+                (B, agent_num, 4),
+                dtype=neighbor_current_xyyaw.dtype,
+                device=neighbor_current_xyyaw.device,
+            )
+
+            # 마스크가 True인 “그 자리”에 값 대입 (슬롯 유지)
+            # target_agents_mask: [B, agent_num] bool
+            near_current_xyyaw[target_agents_mask] = neighbor_current_xyyaw[
+                target_agents_mask]
+            # TODO: 임시 -> _predicted_neighbor_num 에 대한 의존성 타파?
+            near_current_xyyaw = near_current_xyyaw[:, :self.
+                                                    _predicted_neighbor_num, :]  # [B, pnn, 4]
+            # [B, pnn]  True=빈 슬롯(무효 에이전트)
+            near_current_mask = (near_current_xyyaw.ne(0).sum(dim=-1) == 0)
+        return near_current_xyyaw, near_current_mask
+
     def forward(self, encoder_outputs, inputs):
         """
         Diffusion decoder process.
@@ -159,47 +201,17 @@ class Decoder(nn.Module):
 
         """
 
-        # Extract ego & neighbor current states
-        target_agents_mask = inputs["target_agents_mask"]  # [B, agent_num] bool
-        if target_agents_mask is None:
-            near_current_xyyaw = inputs[
-                "neighbor_agents_past"][:, :self._predicted_neighbor_num,
-                                        -1, :4]  # [B, pnn, 4]
-            near_current_mask = torch.sum(torch.ne(near_current_xyyaw[..., :4],
-                                                   0),
-                                          dim=-1) == 0  # [B, pnn]
-            inputs["near_current_mask"] = near_current_mask
-
-        else:
-            # neighbor_agents_past_xyyaw: [B, agent_num, time_len, 4]
-            neighbor_agents_past_xyyaw = inputs["neighbor_agents_past"][..., :4]
-            B, agent_num, time_len, D4 = neighbor_agents_past_xyyaw.shape
-
-            # 마지막 타임스텝만 추출: [B, agent_num, 4]
-            neighbor_current_xyyaw = neighbor_agents_past_xyyaw[:, :, -1, :]
-
-            # 출력 버퍼(초기 0): [B, agent_num, 4]
-            near_current_xyyaw = torch.zeros(
-                (B, agent_num, 4),
-                dtype=neighbor_current_xyyaw.dtype,
-                device=neighbor_current_xyyaw.device,
-            )
-
-            # 마스크가 True인 “그 자리”에 값 대입 (슬롯 유지)
-            near_current_xyyaw[target_agents_mask] = neighbor_current_xyyaw[
-                target_agents_mask]
-            # TODO: 임시
-            near_current_xyyaw = near_current_xyyaw[:, :self.
-                                                    _predicted_neighbor_num, :]  # [B, pnn, 4]
-            # [B, agent_num] — 모두 0이면 True (빈 슬롯)
-            near_current_mask = (near_current_xyyaw.ne(0).sum(dim=-1) == 0)
-
-            inputs["near_current_mask"] = near_current_mask
+        # near_current_xyyaw: [B, pnn, 4]  (x, y, cos(yaw), sin(yaw))
+        # near_current_mask: [B, pnn]  True=빈 슬롯(무효 에이전트)
+        near_current_xyyaw, near_current_mask = self._get_near_current_infos(
+            target_agents_mask=inputs[
+                "target_agents_mask"],  # [B, agent_num] bool
+            neighbor_agents_past=inputs[
+                "neighbor_agents_past"],  # [B, agent_num, time_len, 11]
+        )
+        inputs["near_current_mask"] = near_current_mask
 
         B, Pnn, _ = near_current_xyyaw.shape
-
-        assert Pnn == (self._predicted_neighbor_num)
-        assert near_current_mask.shape[1] == Pnn
 
         if "cond_last_pos_norm" in inputs:
             # 길이(pnn_dyn)에 맞춰 잘라서 정합 보장

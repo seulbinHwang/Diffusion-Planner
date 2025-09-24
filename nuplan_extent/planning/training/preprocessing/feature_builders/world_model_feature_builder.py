@@ -122,6 +122,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         output
             - target_agents_mask: np.ndarray, (agent_num,) bool
         """
+        assert isinstance(neighbor_track_token, list)
         agent_num = len(neighbor_track_token)
         target_agents_mask = np.zeros((agent_num,), dtype=bool)
         for idx in range(agent_num):

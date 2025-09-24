@@ -667,27 +667,30 @@ class DataProcessor(object):
             assert T == self.num_past_poses + 1, "Ego agent past states should have T+1 time steps"
             assert D == 11, "Ego agent past states should have 8 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length)"
             # gather data
-            data = {
+            input_data = {
                 "map_name": map_name,
                 "token": token,
-                "ego_agent_past": ego_agent_past,  # (time_len, 11) # DONE
                 "ego_current_state": ego_current_state,  # (10,) # TODO
                 # TODO: ego_agent_future 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
+                ############
+                "ego_agent_past": ego_agent_past,  # (time_len, 11) # DONE
+                "neighbor_agents_past":
+                    neighbor_agents_past,  # (num_agents, time_len, 11) # DONE
+                "static_objects": static_objects,  # (num_static, 5) # TODO
+                ############
                 "ego_agent_future":
                     ego_agent_future,  # rear_axle x,y # (future_len, 3) # DONE
                 "ego_agent_future_11_dim":
                     ego_agent_future_11_dim,  # center x,y # (future_len, 11) # DONE
-                "neighbor_agents_past":
-                    neighbor_agents_past,  # (num_agents, time_len, 11) # DONE
+
                 "neighbor_agents_future":
                     neighbor_agents_future,  # (num_agents, future_len, 3) # DONE
-                "static_objects": static_objects  # (num_static, 5) # TODO
             }
             # [ADD] 저장 전 안전 보정 (훈련용 npz)
             aro = vector_map.get("agent_route_lane_order", None)
             if isinstance(aro, np.ndarray) and aro.dtype != np.int64:
                 vector_map["agent_route_lane_order"] = aro.astype(np.int64)
-            data.update(vector_map)
+            input_data.update(vector_map)
 
             # 디버깅용 그림 그리기
             save_dir = os.path.join(self._save_dir, "debug_vis")
@@ -695,13 +698,13 @@ class DataProcessor(object):
             os.makedirs(save_dir, exist_ok=True)
             # if self._wandb_enabled or self.config.save_image:
 
-            self.save_to_disk(self._save_dir, data)
+            self.save_to_disk(self._save_dir, input_data)
             if self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
-                data["token_to_future_traj_wrt_ego"] = None,
-                draw_machine.draw_world_model_to_png(
-                    data,
-                    save_path=save_path)
+                input_data["token_to_future_traj_wrt_ego"] = None,
+                draw_machine.draw_world_model_to_png(input_data,
+                                                     output_data=None,
+                                                     save_path=save_path)
 
     def save_to_disk(self, dir, data):
         os.makedirs(dir, exist_ok=True)

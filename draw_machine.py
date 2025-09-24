@@ -24,7 +24,8 @@ class DrawInfos:
         """
         딥러닝 output 값 그대로
         """
-        self.diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}  # (T, 4)
+        self.diff_token_to_np_gen_traj_wrt_ego: Dict[str,
+                                                     np.ndarray] = {}  # (T, 4)
         """
         history Agent 만든걸 -> (History_len, 11) numpy로 변환한 것들
         npc 미래 궤적 보정 input으로 쓰이는걸 그려보기 위해 저장
@@ -41,14 +42,20 @@ class DrawInfos:
         """
         self.diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (11,)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "model_input_key_to_unnorm_value": self.model_input_key_to_unnorm_value,
-            "diff_token_to_np_gen_traj_wrt_ego": self.diff_token_to_np_gen_traj_wrt_ego,
-            "diff_token_to_np_history_wrt_ego": self.diff_token_to_np_history_wrt_ego,
-            "diff_token_to_interp_np_traj_wrt_ego": self.diff_token_to_interp_np_traj_wrt_ego,
-            "diff_token_to_next_wp_wrt_ego": self.diff_token_to_next_wp_wrt_ego,
+    def to_dict(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        input_data = self.model_input_key_to_unnorm_value
+        output_data = {
+            "diff_token_to_np_gen_traj_wrt_ego":
+                self.diff_token_to_np_gen_traj_wrt_ego,
+            "diff_token_to_np_history_wrt_ego":
+                self.diff_token_to_np_history_wrt_ego,
+            "diff_token_to_interp_np_traj_wrt_ego":
+                self.diff_token_to_interp_np_traj_wrt_ego,
+            "diff_token_to_next_wp_wrt_ego":
+                self.diff_token_to_next_wp_wrt_ego,
         }
+        return input_data, output_data
+
 
 def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
     """미래 포인트(3,)=[x,y,yaw]가 **유효**하면 True.
@@ -79,7 +86,7 @@ def draw_neighbor_future_points(ax: plt.Axes, neighbor_agents_future: Array,
     agent_num, future_len, _ = neighbor_agents_future.shape
     ms = options.neighbor_future_marker_size
     text_d = options.agent_index_offset_m
-    text_color =  options.future_agent_index_color
+    text_color = options.future_agent_index_color
 
     for a in range(agent_num):
         traj = neighbor_agents_future[a]  # (future_len, 3)
@@ -168,19 +175,19 @@ class DrawingOptions:
         - token: 앞 4차원이 모두 |value| ≤ invalid_eps 이면 invalid
     """
 
-    draw_ego_past: bool = True # check
-    draw_neighbor_past: bool = True # check
-    draw_ego_pred: bool = False # check
-    draw_ego_future_gt: bool = False # check
-    draw_lane_boundaries: bool = True # check
-    draw_lane_centerline: bool = False # check
+    draw_ego_past: bool = True  # check
+    draw_neighbor_past: bool = True  # check
+    draw_ego_pred: bool = False  # check
+    draw_ego_future_gt: bool = False  # check
+    draw_lane_boundaries: bool = True  # check
+    draw_lane_centerline: bool = False  # check
     draw_token_future_arrows: bool = True
     draw_neighbor_agents_future: bool = False
     draw_token_refined: bool = False
 
-    draw_velocity_arrows_past_all: bool = False # check
-    draw_velocity_arrows_pred_all: bool = False # check
-    draw_velocity_arrows_future_all: bool = False # check
+    draw_velocity_arrows_past_all: bool = False  # check
+    draw_velocity_arrows_pred_all: bool = False  # check
+    draw_velocity_arrows_future_all: bool = False  # check
 
     arrow_length_m: float = 5.0
     heading_line_scale: float = 0.5
@@ -197,10 +204,9 @@ class DrawingOptions:
     agent_index_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
     agent_index_offset_m: float = 0.5  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
     past_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 청록색
-    future_agent_index_color: str = "#808080" # 번호 텍스트 색 # 회색
+    future_agent_index_color: str = "#808080"  # 번호 텍스트 색 # 회색
     route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 청록색
     neighbor_future_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
-
 
     # ── [추가] 토큰 미래 궤적 드로잉 모드 및 스타일 ─────────────────────
     token_future_draw_mode: str = "point"  # 'arrow' 또는 'point'
@@ -209,11 +215,12 @@ class DrawingOptions:
     token_future_arrow_length_m: float = 1.0
 
     # 🔽 [추가] 토큰 시작 인덱스 텍스트 표기용 옵션
-    token_index_color: str = "#00C8C8"     # 청록색
-    token_index_offset_m: float = 0.3      # y축으로 살짝 아래(미터 단위)
-    token_index_fontsize: int = 5          # 기본은 에이전트 번호와 동일 크기
+    token_index_color: str = "#00C8C8"  # 청록색
+    token_index_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)
+    token_index_fontsize: int = 5  # 기본은 에이전트 번호와 동일 크기
     # 🔽 새 옵션
     max_agents_to_draw: Optional[int] = None
+
 
 # 스타일 사전
 EGO_PAST_STYLE = {
@@ -223,7 +230,7 @@ EGO_PAST_STYLE = {
     "fill_alpha_current": 1.0,
 }
 EGO_PRED_STYLE = {
-    "line_color": "#00C8C8",           # 청록색
+    "line_color": "#00C8C8",  # 청록색
     "line_width": 0.4,
     "velocity_line_color": "#00C8C8",  # 청록색(시안)
     "velocity_line_alpha": 0.8,
@@ -237,7 +244,7 @@ EGO_FUTURE_GT_STYLE = {
     "velocity_line_width": 0.4,
 }
 REFINED_FUTURE_STYLE = {
-    "line_color": "#FF4D4D",           #  빨간색(밝은 빨강)
+    "line_color": "#FF4D4D",  #  빨간색(밝은 빨강)
     "line_width": 0.2,
     "velocity_line_color": "#FF4D4D",  #  빨간색(밝은 빨강)
     "velocity_line_alpha": 0.8,
@@ -245,25 +252,25 @@ REFINED_FUTURE_STYLE = {
 }
 NEIGHBOR_STYLE = {
     "vehicles": {
-        "fill_color": "#84E573",           # 연두색(라임 그린)
+        "fill_color": "#84E573",  # 연두색(라임 그린)
         "fill_alpha": 1.0,
-        "line_color": "#84E573",           # 연두색(라임 그린)
+        "line_color": "#84E573",  # 연두색(라임 그린)
         "line_width": 0.2,
         "velocity_line_color": "#84E573",  # 연두색(라임 그린)
         "velocity_line_width": 0.2,
     },
     "pedestrians": {
-        "fill_color": "#4D83E1",           # 파란색(밝은 파랑)
+        "fill_color": "#4D83E1",  # 파란색(밝은 파랑)
         "fill_alpha": 1.0,
-        "line_color": "#4D83E1",           # 파란색(밝은 파랑)
+        "line_color": "#4D83E1",  # 파란색(밝은 파랑)
         "line_width": 0.2,
         "velocity_line_color": "#4D83E1",  # 파란색(밝은 파랑)
         "velocity_line_width": 0.2,
     },
     "bicycles": {
-        "fill_color": "#FF4D4D",           # 빨간색(밝은 빨강)
+        "fill_color": "#FF4D4D",  # 빨간색(밝은 빨강)
         "fill_alpha": 1.0,
-        "line_color": "#FF4D4D",           # 빨간색(밝은 빨강)
+        "line_color": "#FF4D4D",  # 빨간색(밝은 빨강)
         "line_width": 0.2,
         "velocity_line_color": "#FF4D4D",  # 빨간색(밝은 빨강)
         "velocity_line_width": 0.2,
@@ -279,7 +286,7 @@ SIGNAL_COLORS = {
 TOKEN_FUTURE_STYLE = {
     "line_color": "#FFFFFF",  # 흰색
     "line_width": 0.2,
-    "index_color": "#FFFFFF",     # 흰색
+    "index_color": "#FFFFFF",  # 흰색
 }
 TOKEN_REFINED_STYLE = {
     "line_color": "#FF4D4D",  # 흰색
@@ -291,14 +298,14 @@ NEW_WAYPOINT_STYLE = {
     "line_width": 0.2,
 }
 
-
 # =============================================================================
 # 유틸리티(도형/화살표/클래스/유효성/범위)
 # =============================================================================
 from typing import Dict, Optional, Tuple
 
-def _clip_agents_first_k_from_wmf(
-    world_model_feature: Dict[str, Array],
+
+def _clip_agents_first_k_from_data(
+    input_data: Dict[str, Array],
     max_agents_to_draw: Optional[int],
 ) -> Tuple[Optional[Array], Optional[Array], Optional[Array], Optional[int]]:
     """world_model_feature에서 에이전트 축(0축)을 공유하는 3개 배열을 동일한 K로 슬라이스.
@@ -308,7 +315,7 @@ def _clip_agents_first_k_from_wmf(
       - 'agent_route_lane_order' : (A, L)
 
     Args:
-        world_model_feature: 입력 피쳐 dict.
+        input_data: 입력 피쳐 dict.
         max_agents_to_draw: None이면 원본 그대로. 정수면 앞쪽 K개로 슬라이스.
 
     Returns:
@@ -319,25 +326,26 @@ def _clip_agents_first_k_from_wmf(
     if max_agents_to_draw is None:
         # 제한 없음: 원본 그대로 반환
         return (
-            world_model_feature.get("neighbor_agents_past", None),
-            world_model_feature.get("neighbor_agents_future", None),
-            world_model_feature.get("agent_route_lane_order", None),
+            input_data.get("neighbor_agents_past", None),
+            input_data.get("neighbor_agents_future", None),
+            input_data.get("agent_route_lane_order", None),
             None,
         )
 
     # 각 배열의 길이(A) 수집
     lengths = []
-    for key in ("neighbor_agents_past", "neighbor_agents_future", "agent_route_lane_order"):
-        arr = world_model_feature.get(key, None)
+    for key in ("neighbor_agents_past", "neighbor_agents_future",
+                "agent_route_lane_order"):
+        arr = input_data.get(key, None)
         if arr is not None and hasattr(arr, "shape") and len(arr.shape) >= 1:
             lengths.append(arr.shape[0])
 
     if not lengths:
         # 슬라이스할 것이 없음
         return (
-            world_model_feature.get("neighbor_agents_past", None),
-            world_model_feature.get("neighbor_agents_future", None),
-            world_model_feature.get("agent_route_lane_order", None),
+            input_data.get("neighbor_agents_past", None),
+            input_data.get("neighbor_agents_future", None),
+            input_data.get("agent_route_lane_order", None),
             None,
         )
 
@@ -351,9 +359,9 @@ def _clip_agents_first_k_from_wmf(
             return arr
         return arr[:K, ...]
 
-    neighbor_past_K   = _clip(world_model_feature.get("neighbor_agents_past", None))
-    neighbor_future_K = _clip(world_model_feature.get("neighbor_agents_future", None))
-    route_order_K     = _clip(world_model_feature.get("agent_route_lane_order", None))
+    neighbor_past_K = _clip(input_data.get("neighbor_agents_past", None))
+    neighbor_future_K = _clip(input_data.get("neighbor_agents_future", None))
+    route_order_K = _clip(input_data.get("agent_route_lane_order", None))
 
     return neighbor_past_K, neighbor_future_K, route_order_K, K
 
@@ -665,21 +673,20 @@ def draw_lane_centerlines(
             raise ValueError(
                 "agent_route_lane_order의 shape는 (agent_num, lane_num) 이어야 하며 "
                 f"lane_num({lane_num})과 두 번째 축이 같아야 합니다. "
-                f"got {agent_route_lane_order.shape}"
-            )
+                f"got {agent_route_lane_order.shape}")
 
         base_fs = max(1, options.agent_index_fontsize - 1)  # 조금 작게
         vstep = 0.15 * 2.  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
 
         # 각 차선 j 순회
         for j in range(lane_num):
-            lane_j = lanes[j]                 # (lane_len, 12)
-            center = lane_j[:, 0:2]           # (lane_len, 2)
+            lane_j = lanes[j]  # (lane_len, 12)
+            center = lane_j[:, 0:2]  # (lane_len, 2)
             valid = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)  # (lane_len,)
 
             # 이 차선을 자신의 경로에 포함하는 모든 agent i와 그 rank
-            ranks_j: Array = agent_route_lane_order[:, j]        # (agent_num,)
-            agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]      # (K,)
+            ranks_j: Array = agent_route_lane_order[:, j]  # (agent_num,)
+            agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # (K,)
             if agent_idxs.size == 0:
                 continue
 
@@ -696,7 +703,7 @@ def draw_lane_centerlines(
                     label = f"{int(i)}"  # "에이전트인덱스"
                     ax.text(
                         x,
-                        y + vstep * k,          # 위로 살짝씩 쌓기
+                        y + vstep * k,  # 위로 살짝씩 쌓기
                         label,
                         color=options.route_agent_index_color,
                         fontsize=base_fs,
@@ -721,13 +728,11 @@ def draw_lane_centerlines(
                 continue
             c0, c1 = center[j], center[j + 1]
             color = SIGNAL_COLORS.get(int(state_idx[j]), "#B0BEC5")
-            ax.plot(
-                [c0[0], c1[0]], [c0[1], c1[1]],
-                color=color,
-                linewidth=1.2,
-                linestyle=(0, (4, 4)),
-                zorder=2
-            )
+            ax.plot([c0[0], c1[0]], [c0[1], c1[1]],
+                    color=color,
+                    linewidth=1.2,
+                    linestyle=(0, (4, 4)),
+                    zorder=2)
 
 
 def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
@@ -797,16 +802,16 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
                     y + options.agent_index_offset_m * offset,
                     f"{speed_kmh:.1f}",
                     color=options.past_agent_index_color,
-                    fontsize=2, #options.agent_index_fontsize,
+                    fontsize=2,  #options.agent_index_fontsize,
                     ha="center",
                     va="bottom",
                     zorder=30,
                     clip_on=True,  # tight 저장 시 bbox 폭주 방지
                 )
 
-def annotate_neighbor_indices_for_past(ax: plt.Axes,
-neighbor_track_token: List[Optional[str]],
-                                       neighbor_agents_past: Array,
+
+def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
+    Optional[str]], neighbor_agents_past: Array,
                                        options: DrawingOptions) -> None:
     """neighbor_agents_past (agent_num, T=21, 11)의 '현재 상태'(마지막 스텝) 근처에
     에이전트 인덱스(0..agent_num-1)를 흰색 텍스트로 표기.
@@ -995,6 +1000,7 @@ def draw_ego_future_gt(ax: plt.Axes, ego_future_gt_11_dim: Array,
                 line_alpha=EGO_FUTURE_GT_STYLE["velocity_line_alpha"],
                 zorder=24)
 
+
 # [Add]
 def draw_token_refined_trajectories(
     ax: plt.Axes,
@@ -1032,7 +1038,8 @@ def draw_token_refined_trajectories(
 
     for idx, token in enumerate(ordered_tokens):
         # ── (A) refined 연속 궤적(빨강) ───────────────────────────────
-        if token_to_refined_traj_wrt_ego and (token in token_to_refined_traj_wrt_ego):
+        if token_to_refined_traj_wrt_ego and (token
+                                              in token_to_refined_traj_wrt_ego):
             arr = token_to_refined_traj_wrt_ego[token]
             if arr is not None and arr.size > 0:
                 if arr.ndim != 2 or arr.shape[1] != 11:
@@ -1094,8 +1101,9 @@ def draw_token_refined_trajectories(
                             x,
                             y + options.token_index_offset_m * offset,
                             f"{speed_kmh:.1f}",
-                            color=REFINED_FUTURE_STYLE["line_color"],  # "#FF4D4D"
-                            fontsize=2, #options.token_index_fontsize,
+                            color=REFINED_FUTURE_STYLE[
+                                "line_color"],  # "#FF4D4D"
+                            fontsize=2,  #options.token_index_fontsize,
                             ha="center",
                             va="bottom",
                             zorder=25,
@@ -1116,15 +1124,18 @@ def draw_token_refined_trajectories(
                     #     label_drawn = True
 
         # ── (B) 신규 waypoint(주황) ─────────────────────────────────
-        if token_to_new_waypoint_array and (token in token_to_new_waypoint_array):
-            wp = token_to_new_waypoint_array[token] # (11,)
+        if token_to_new_waypoint_array and (token
+                                            in token_to_new_waypoint_array):
+            wp = token_to_new_waypoint_array[token]  # (11,)
             if wp is None:
                 continue
             wp = np.asarray(wp)
             if wp.ndim == 2:
                 wp = wp.squeeze()
             if wp.ndim != 1 or wp.shape[0] != 11:
-                raise ValueError("token_to_new_waypoint_array의 각 value는 shape (11,) 이어야 합니다.")
+                raise ValueError(
+                    "token_to_new_waypoint_array의 각 value는 shape (11,) 이어야 합니다."
+                )
 
             if not is_valid_agent_row(wp, eps):
                 continue
@@ -1194,7 +1205,10 @@ def draw_token_refined_trajectories(
             #     zorder=29,
             # )
 
+
 from typing import Optional, Literal
+
+
 def draw_token_future_arrows(
     ax: plt.Axes,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
@@ -1228,10 +1242,11 @@ def draw_token_future_arrows(
         return
 
     # 모드 결정 (인자 > 옵션 > 기본값 'arrow')
-    mode = (draw_mode or getattr(options, "token_future_draw_mode", "arrow")).lower()
+    mode = (draw_mode or
+            getattr(options, "token_future_draw_mode", "arrow")).lower()
     if mode not in {"arrow", "point"}:
-        raise ValueError(f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point'.")
-
+        raise ValueError(
+            f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point'.")
 
     eps = options.invalid_eps
     point_marker = getattr(options, "token_future_point_marker", "o")
@@ -1239,7 +1254,8 @@ def draw_token_future_arrows(
     arrow_len = float(getattr(options, "token_future_arrow_length_m", 1.0))
 
     # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
-    for idx, (token, arr) in enumerate(token_to_future_traj_wrt_ego.items()):  # [ADD]
+    for idx, (token,
+              arr) in enumerate(token_to_future_traj_wrt_ego.items()):  # [ADD]
         if arr is None or arr.size == 0:
             continue
         if arr.ndim != 2 or arr.shape[1] != 4:
@@ -1293,6 +1309,8 @@ def draw_token_future_arrows(
             #         va="top",
             #         zorder=24,
             #     )
+
+
 # =============================================================================
 # Figure/Axis & 범위/저장
 # =============================================================================
@@ -1409,10 +1427,10 @@ def draw_token_histories(
             if not is_valid_agent_row(row, eps):
                 continue
 
-            x, y   = float(row[0]), float(row[1])
-            c, s   = float(row[2]), float(row[3])
+            x, y = float(row[0]), float(row[1])
+            c, s = float(row[2]), float(row[3])
             vx, vy = float(row[4]), float(row[5])
-            W, L   = float(row[6]), float(row[7])
+            W, L = float(row[6]), float(row[7])
 
             # 사각형(테두리만 주황) + 헤딩선
             corners = oriented_box_corners(x, y, c, s, L, W)
@@ -1441,8 +1459,10 @@ def draw_token_histories(
             if options.draw_velocity_arrows_past_all:
                 add_velocity_arrow(
                     ax,
-                    x, y,
-                    vx, vy,
+                    x,
+                    y,
+                    vx,
+                    vy,
                     length_m=options.arrow_length_m,
                     line_color=line_color,
                     line_width=line_width,
@@ -1460,7 +1480,7 @@ def draw_token_histories(
                     y - options.token_index_offset_m * offset,
                     f"{speed_kmh:.1f}",
                     color=line_color,
-                    fontsize=2, #options.token_index_fontsize,
+                    fontsize=2,  #options.token_index_fontsize,
                     ha="center",
                     va="bottom",
                     zorder=21,
@@ -1483,6 +1503,8 @@ def draw_token_histories(
         #         va="center",
         #         zorder=21,
         #     )
+
+
 """
     world_model_feature: WorldModelFeature,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
@@ -1491,9 +1513,12 @@ token_to_new_waypoint_array: Optional[Dict[str, np.ndarray]],  # (11,)
 neighbor_track_token: Optional[List[Optional[str]]], # (agent_num,)
 current_token_to_np_history: Dict[str, np.ndarray], # (history_len, 11)
 """
+
+
 # [Add]
 def draw_world_model_to_png(
-    data_: Dict[str, Any],
+    input_data: Dict[str, Any],
+    output_data: Optional[Dict[str, Any]],
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
@@ -1501,11 +1526,14 @@ def draw_world_model_to_png(
 
     Parameters
     ----------
-    world_model_feature : Dict[str, np.ndarray]
+    input_data : Dict[str, np.ndarray]
         - 'ego_agent_past' : (time_len=21, 11)
         - 'neighbor_agents_past' : (agent_num, 21, 11)
+        - "static_objects": (static_objects_num, 10) - 현재 미사용
+        ###########################
         - 'ego_agent_next_11_dim' : (interpol_num, 11)
         - 'ego_future_gt_11_dim' : (future_len=80, 11)
+        ###########################
         - 'lanes' : (lane_num, lane_len, 12)
           · 0-1: centerline (x,y)
           · 2-3: centerline diff (dx,dy)
@@ -1531,36 +1559,34 @@ def draw_world_model_to_png(
     """
     draw_option = options or DrawingOptions()
     # ── (0) 에이전트 앞쪽 K개로 통일 슬라이스 ─────────────────────────
-    neigh_past_K, neigh_future_K, route_order_K, K = _clip_agents_first_k_from_wmf(
-        world_model_feature, draw_option.max_agents_to_draw
-    )
+    (neigh_past_K, neigh_future_K, route_order_K,
+     K) = _clip_agents_first_k_from_data(input_data,
+                                         draw_option.max_agents_to_draw)
 
     # bounds 계산을 위해 dict 복사 후 슬라이스 반영
-    wmf_for_bounds = dict(world_model_feature)
-    if neigh_past_K is not None: wmf_for_bounds[
-        "neighbor_agents_past"] = neigh_past_K
-    if neigh_future_K is not None: wmf_for_bounds[
-        "neighbor_agents_future"] = neigh_future_K
-    if route_order_K is not None: wmf_for_bounds[
-        "agent_route_lane_order"] = route_order_K
-
+    clipped_input_data = dict(input_data)
+    if neigh_past_K is not None:
+        clipped_input_data["neighbor_agents_past"] = neigh_past_K
+    if neigh_future_K is not None:
+        clipped_input_data["neighbor_agents_future"] = neigh_future_K
+    if route_order_K is not None:
+        clipped_input_data["agent_route_lane_order"] = route_order_K
 
     # 1) Figure/Axes
     fig, ax = create_figure_and_axes(draw_option)
 
     # 2) 바닥 레이어(차선)
-    lanes = world_model_feature.get("lanes")
+    lanes = input_data.get("lanes")
     if draw_option.draw_lane_boundaries:
         draw_lane_boundaries(ax, lanes, draw_option)
     # agent_route_lane_order가 있으면 텍스트 표기 모드로 전환
-    agent_route_lane_order = world_model_feature.get("agent_route_lane_order",
-                                                     None)
+    agent_route_lane_order = input_data.get("agent_route_lane_order", None)
     if draw_option.draw_lane_centerline:
         draw_lane_centerlines(
             ax,
             lanes,
             draw_option,
-            agent_route_lane_order=None, #route_order_K,
+            agent_route_lane_order=None,  #route_order_K,
         )
 
     # 이웃 에이전트 미래 포인트(x마커)
@@ -1568,11 +1594,11 @@ def draw_world_model_to_png(
         draw_neighbor_future_points(ax, neigh_future_K, draw_option)
     # 3) 토큰 미래 화살표(개별) - 차선 위에, 에이전트 윤곽과 겹치지 않게 중간 zorder
     if draw_option.draw_token_future_arrows:
-        draw_token_future_arrows(ax,  token_to_future_traj_wrt_ego, draw_option)
+        draw_token_future_arrows(ax, token_to_future_traj_wrt_ego, draw_option)
     # [Add] refined 토큰 궤적(폴리곤/헤딩/속도)
     # [Add]
-    if draw_option.draw_token_refined and (
-            token_to_refined_traj_wrt_ego or token_to_new_waypoint_array):
+    if draw_option.draw_token_refined and (token_to_refined_traj_wrt_ego or
+                                           token_to_new_waypoint_array):
         draw_token_refined_trajectories(
             ax,
             token_to_refined_traj_wrt_ego,
@@ -1583,27 +1609,27 @@ def draw_world_model_to_png(
     if draw_option.draw_neighbor_past and (neigh_past_K is not None):
         draw_neighbor_past(ax, neigh_past_K, draw_option)
         if neighbor_track_token is not None:
-            annotate_neighbor_indices_for_past(ax, neighbor_track_token, neigh_past_K, draw_option)
+            annotate_neighbor_indices_for_past(ax, neighbor_track_token,
+                                               neigh_past_K, draw_option)
 
     # if current_token_to_np_history:
     #     draw_token_histories(ax, current_token_to_np_history, draw_option)
 
     if draw_option.draw_ego_past:
-        draw_ego_past(ax, world_model_feature.get("ego_agent_past"),
-                      draw_option)
+        draw_ego_past(ax, input_data.get("ego_agent_past"), draw_option)
     if draw_option.draw_ego_pred:
-        draw_ego_predicted(ax, world_model_feature.get("ego_agent_next_11_dim"),
+        draw_ego_predicted(ax, input_data.get("ego_agent_next_11_dim"),
                            draw_option)
     if draw_option.draw_ego_future_gt:
-        data_ = world_model_feature.get("ego_future_gt_11_dim", None)
+        data_ = input_data.get("ego_future_gt_11_dim", None)
         if data_ is None:
-            data_ = world_model_feature.get("ego_agent_future_11_dim", None)
+            data_ = input_data.get("ego_agent_future_11_dim", None)
         draw_ego_future_gt(ax, data_, draw_option)
 
     # ── (5) 축 범위/스타일 ───────────────────────────────────────────
     # [Add]
     bounds = compute_auto_bounds(
-        wmf_for_bounds,
+        clipped_input_data,
         draw_option,
         token_to_future_traj_wrt_ego,
         token_to_refined_traj_wrt_ego,
@@ -1616,8 +1642,8 @@ def draw_world_model_to_png(
 
 
 if __name__ == "__main__":
-    # world_model_feature 예시(실데이터로 교체)
-    world_model_feature = {
+    # input_data 예시(실데이터로 교체)
+    input_data = {
         "ego_agent_past":
             np.zeros((21, 11), dtype=np.float32),
         "neighbor_agents_past":
@@ -1665,7 +1691,7 @@ if __name__ == "__main__":
     )
 
     draw_world_model_to_png(
-        world_model_feature,
+        input_data,
         save_path="scene_with_tokens.png",
         options=options,
         token_to_future_traj_wrt_ego=token_to_future_traj_wrt_ego,
