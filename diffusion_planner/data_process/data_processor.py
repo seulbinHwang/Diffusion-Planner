@@ -209,7 +209,7 @@ class DataProcessor(object):
     def _filter_agents_within_radius(
         self,
         neighbor_agents_past: Optional[np.ndarray],
-        neighbor_agents_future: Optional[np.ndarray] = None,
+        neighbor_future_gt_3_dim: Optional[np.ndarray] = None,
         neighbor_indices: Optional[Union[np.ndarray, List[int]]] = None
     ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """ego 중심 정사각형 영역(가로·세로 2*radius)으로 에이전트를 클리핑하고,
@@ -222,7 +222,7 @@ class DataProcessor(object):
             neighbor_agents_past (np.ndarray):
                 - shape: (agent_num, Tp, 11)
                 - 상대 좌표계 과거 에이전트 시퀀스.
-            neighbor_agents_future (Optional[np.ndarray], optional):
+            neighbor_future_gt_3_dim (Optional[np.ndarray], optional):
                 - shape: (agent_num, Tf, 3)
                 - 상대 좌표계 미래 에이전트 시퀀스. 기본값 None.
             neighbor_indices (Optional[Union[np.ndarray, List[int]]], optional):
@@ -258,9 +258,9 @@ class DataProcessor(object):
         filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
 
         filtered_neighbor_agents_future = None
-        if neighbor_agents_future is not None:
+        if neighbor_future_gt_3_dim is not None:
             # filtered_neighbor_agents_future: (agent_num, Tf, 3)
-            filtered_neighbor_agents_future = neighbor_agents_future * mask_expanded
+            filtered_neighbor_agents_future = neighbor_future_gt_3_dim * mask_expanded
         # Indices 마스킹 (옵션)
         filtered_neighbor_indices: Optional[np.ndarray] = None
         if neighbor_indices is not None:
@@ -618,14 +618,14 @@ class DataProcessor(object):
                 )
             '''
             ego & agents future
-            ego_agent_future : rear axle x,y, ~~~
-            ego_agent_future_11_dim : center x,y, ~~~
+            ego_future_gt_3_dim : rear axle x,y, ~~~
+            planner_future_11_dim : center x,y, ~~~
             '''
-            (ego_agent_future,
-             ego_agent_future_11_dim) = get_ego_future_array_from_scenario(
+            (ego_future_gt_3_dim,
+             ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
                  scenario, ego_state, self.num_future_poses,
                  self.future_time_horizon)
-            Tf, Df = ego_agent_future_11_dim.shape
+            Tf, Df = ego_future_gt_11_dim.shape
             assert Tf == self.num_future_poses, (
                 "Ego agent future states should have T time steps")
             assert Df == 11, (
@@ -647,13 +647,13 @@ class DataProcessor(object):
             (future_tracked_objects_array_list,
              _) = sampled_tracked_objects_to_array_list(
                  sampled_future_observations)
-            # neighbor_agents_future: (num_agents, future_len, 3)
-            neighbor_agents_future = agent_future_process(
+            # neighbor_future_gt_3_dim: (num_agents, future_len, 3)
+            neighbor_future_gt_3_dim = agent_future_process(
                 anchor_ego_state, future_tracked_objects_array_list,
                 self.num_agents, neighbor_indices)
-            _, neighbor_agents_future, _ = \
+            _, neighbor_future_gt_3_dim, _ = \
                 self._filter_agents_within_radius(neighbor_agents_past,
-                                                 neighbor_agents_future)
+                                                 neighbor_future_gt_3_dim)
             '''
             ego current
             
@@ -671,21 +671,22 @@ class DataProcessor(object):
                 "map_name": map_name,
                 "token": token,
                 "ego_current_state": ego_current_state,  # (10,) # TODO
-                # TODO: ego_agent_future 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
-                ############
+                ############ SAME AS INFERENCE ############
                 "ego_agent_past": ego_agent_past,  # (time_len, 11) # DONE
                 "neighbor_agents_past":
                     neighbor_agents_past,  # (num_agents, time_len, 11) # DONE
                 "static_objects": static_objects,  # (num_static, 5) # TODO
-                ############
-                "ego_agent_future":
-                    ego_agent_future,  # rear_axle x,y # (future_len, 3) # DONE
-                "ego_agent_future_11_dim":
-                    ego_agent_future_11_dim,  # center x,y # (future_len, 11) # DONE
-
-                "neighbor_agents_future":
-                    neighbor_agents_future,  # (num_agents, future_len, 3) # DONE
+                ############################################
+                ############ LEARNING ONLY #################
+                # TODO: ego_future_gt_3_dim 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
+                "ego_future_gt_3_dim":
+                    ego_future_gt_3_dim,  # rear_axle x,y # (future_len, 3) # DONE
+                "ego_future_gt_11_dim":
+                    ego_future_gt_11_dim,  # center x,y # (future_len, 11) # DONE
+                "neighbor_future_gt_3_dim":
+                    neighbor_future_gt_3_dim,  # (num_agents, future_len, 3) # DONE
             }
+                ############################################
             # [ADD] 저장 전 안전 보정 (훈련용 npz)
             aro = vector_map.get("agent_route_lane_order", None)
             if isinstance(aro, np.ndarray) and aro.dtype != np.int64:

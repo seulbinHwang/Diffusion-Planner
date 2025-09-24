@@ -40,5 +40,5 @@ class PlannerInput:
     diffusion_agents_tokens: List[str] # len: valid diffusion agent num
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
-    ego_agent_future_11_dim: Optional[
+    planner_future_11_dim: Optional[
         FeatureDataType] = None  # (future_len, 11)

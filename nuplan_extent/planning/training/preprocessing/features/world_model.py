@@ -18,10 +18,12 @@ import torch
 # nuplan/planning/script/builders/simulation_builder.py
 @dataclass
 class WorldModelFeature(AbstractModelFeature):
+    ########### SAME AS LEARNING INPUT ###########
     ego_agent_past: FeatureDataType  # (time_len, 11)
     neighbor_agents_past: FeatureDataType  # (agent_num, time_len, 11)
     static_objects: FeatureDataType  # (static_objects_num, 10)
-    ###########
+    ################################################
+    ########### SAME AS LEARNING INPUT ###########
     lanes: FeatureDataType  # (lane_num, lane_len, 12)
     lanes_speed_limit: FeatureDataType  # (lane_num, 1)
     lanes_has_speed_limit: FeatureDataType  # (lane_num, 1)
@@ -30,13 +32,13 @@ class WorldModelFeature(AbstractModelFeature):
     route_lanes_has_speed_limit: Optional[FeatureDataType]  # (route_num, 1)
     agent_route_lane_order: Optional[
         FeatureDataType]  # (agent_num, lane_num) # -1 if not on route
+    ################################################
+    ################ inference only ################
     target_agents_mask: Optional[FeatureDataType]  # (agent_num,) bool
-    ###########
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
-    ego_future_gt_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
-
-    ############
+    planner_future_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
+    ################################################
 
     def to_feature_tensor(self) -> WorldModelFeature:
         """Convert numpy arrays to torch tensors."""
@@ -62,8 +64,8 @@ class WorldModelFeature(AbstractModelFeature):
             to_tensor(self.target_agents_mask).contiguous(),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).contiguous(),
-            ego_future_gt_11_dim=None if self.ego_future_gt_11_dim is None else
-            to_tensor(self.ego_future_gt_11_dim).contiguous(),
+            planner_future_11_dim=None if self.planner_future_11_dim is None else
+            to_tensor(self.planner_future_11_dim).contiguous(),
         )
 
     def to_device(self, device: torch.device) -> WorldModelFeature:
@@ -91,8 +93,8 @@ class WorldModelFeature(AbstractModelFeature):
             to_tensor(self.target_agents_mask).to(device=device),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).to(device=device),
-            ego_future_gt_11_dim=None if self.ego_future_gt_11_dim is None else
-            to_tensor(self.ego_future_gt_11_dim).to(device=device),
+            planner_future_11_dim=None if self.planner_future_11_dim is None else
+            to_tensor(self.planner_future_11_dim).to(device=device),
         )
 
     @classmethod
@@ -127,7 +129,7 @@ class WorldModelFeature(AbstractModelFeature):
             agent_route_lane_order=_collate_optional("agent_route_lane_order"),
             target_agents_mask=_collate_optional("target_agents_mask"),
             ego_agent_next_11_dim=_collate_optional("ego_agent_next_11_dim"),
-            ego_future_gt_11_dim=_collate_optional("ego_future_gt_11_dim"),
+            planner_future_11_dim=_collate_optional("planner_future_11_dim"),
         )
 
     @classmethod
@@ -163,8 +165,8 @@ class WorldModelFeature(AbstractModelFeature):
                     else self.target_agents_mask[i],
                     ego_agent_next_11_dim=None if self.ego_agent_next_11_dim
                     is None else self.ego_agent_next_11_dim[i],
-                    ego_future_gt_11_dim=None if self.ego_future_gt_11_dim
-                    is None else self.ego_future_gt_11_dim[i],
+                    planner_future_11_dim=None if self.planner_future_11_dim
+                    is None else self.planner_future_11_dim[i],
                 ))
         return features
 
@@ -205,7 +207,7 @@ class WorldModelFeature(AbstractModelFeature):
             - "near_route_lanes_speed_limit": (B, Pnn, 1) or None
             - "near_route_lanes_has_speed_limit": (B, Pnn, 1) or None
             - "ego_agent_next_11_dim": (B, interpol_num, 11) or None
-            - "ego_agent_future_11_dim": (B, future_len, 11) or None
+            - "planner_future_11_dim": (B, future_len, 11) or None
         """
 
         # 지역 import로 의존성 최소화 (클래스 외부 수정 없이 동작)

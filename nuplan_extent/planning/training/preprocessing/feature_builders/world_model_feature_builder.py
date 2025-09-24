@@ -58,7 +58,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             "ego_agent_next_11_dim"] = current_input.ego_agent_next_11_dim
         # (future_len, 11)
         model_inputs[
-            "ego_future_gt_11_dim"] = current_input.ego_agent_future_11_dim
+            "planner_future_11_dim"] = current_input.planner_future_11_dim
         # # List[Optional[str]], (agent_num,)
         neighbor_track_token = model_inputs["neighbor_track_token"]
         model_inputs.pop("neighbor_track_token")
@@ -108,7 +108,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             target_agents_mask=target_agents_mask,  # (agent_num,) bool
             ego_agent_next_11_dim=model_inputs[
                 "ego_agent_next_11_dim"],  # (interpol_num, 11)
-            ego_future_gt_11_dim=model_inputs["ego_future_gt_11_dim"]
+            planner_future_11_dim=model_inputs["planner_future_11_dim"]
         )  # (future_len, 11)
         return world_model_feature
 

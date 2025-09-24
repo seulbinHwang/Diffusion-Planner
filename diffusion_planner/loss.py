@@ -151,12 +151,13 @@ def diffusion_loss_func(
 ):
     """
 
-    near_future_gt.shape: [8, Pnn, 80, 4] # [B, Pnn, T, 4]
-        ["neighbor_agents_future"][:self._predicted_neighbor_num]
+    near_future_gt_4_dim.shape: [8, Pnn, 80, 4] # [B, Pnn, T, 4]
+        ["neighbor_future_gt_3_dim"][:self._predicted_neighbor_num]
     near_future_mask.shape: [8, Pnn, 80] # [B, Pnn, T]
     """
-    near_future_gt, near_future_mask = futures
-    near_future_gt = _require_finite("near_future_gt", near_future_gt)
+    near_future_gt_4_dim, near_future_mask = futures
+    near_future_gt_4_dim = _require_finite("near_future_gt_4_dim",
+                                           near_future_gt_4_dim)
 
     checked_norm_inputs: Dict[str, torch.Tensor] = {}
     for k, v in norm_inputs.items():
@@ -167,10 +168,10 @@ def diffusion_loss_func(
     norm_inputs = checked_norm_inputs
 
     # ego_future: [B. T, 4]
-    # near_future_gt: [B, Pnn, T]
+    # near_future_gt_4_dim: [B, Pnn, T]
     near_future_valid = ~near_future_mask
 
-    B, Pnn, T, _ = near_future_gt.shape
+    B, Pnn, T, _ = near_future_gt_4_dim.shape
     # ego_current: [B, 4]
     # neighbors_current: [B, Pnn, 4]
     near_current_xyyaw_norm = norm_inputs["neighbor_agents_past"][:, :Pnn,
@@ -183,19 +184,20 @@ def diffusion_loss_func(
     near_cur_future_mask = torch.concat(
         (near_current_mask.unsqueeze(-1), near_future_mask), dim=-1)
     assert near_cur_future_mask.shape == (B, Pnn, 1 + T)
-    # near_future_gt: [B, Pnn, T, 4]
+    # near_future_gt_4_dim: [B, Pnn, T, 4]
     # near_current_xyyaw_norm: [B, Pnn, 4]
     # batch_diffusion_time: [B,] diffusion time uniformly sampled in [eps, 1]
     # random_noise: [B, Pnn + 1, T, 4] noise sampled from standard normal
     batch_diffusion_time = torch.rand(
-        B, device=near_future_gt.device) * (1 - eps) + eps  # [B,]
+        B, device=near_future_gt_4_dim.device) * (1 - eps) + eps  # [B,]
     random_noise = torch.randn_like(
-        near_future_gt, device=near_future_gt.device)  # [B, Pnn, T, 4]
+        near_future_gt_4_dim,
+        device=near_future_gt_4_dim.device)  # [B, Pnn, T, 4]
 
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
-    normed_future = state_normalizer(near_future_gt)
+    normed_future = state_normalizer(near_future_gt_4_dim)
     cond_last_pos_norm = normed_future[:, :, -1, :]  # [B, Pnn, 4]
-    normed_future = _require_finite("state_normalizer(near_future_gt)",
+    normed_future = _require_finite("state_normalizer(near_future_gt_4_dim)",
                                     normed_future)
     near_cur_future_norm_gt = torch.cat(
         [near_current_xyyaw_norm[:, :, None, :], normed_future],
@@ -242,7 +244,7 @@ def diffusion_loss_func(
     if model_type == "score":
         dpm_loss = torch.sum((score * std + random_noise)**2, dim=-1)
     elif model_type == "x_start":
-        # near_future_gt: [B, Pnn, T, 4]
+        # near_future_gt_4_dim: [B, Pnn, T, 4]
         # dpm_loss: (B, Pnn, T)
         dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
     # near_future_valid: [B, Pnn, T]

@@ -703,7 +703,7 @@ class WorldModelAgents(AbstractMLAgents):
             [x_local, y_local, cos(yaw_local), sin(yaw_local), vx, vy,
             width, length, 1, 0, 0] 이다.
         """
-        ego_agent_future_11_dim = None
+        planner_future_11_dim = None
         if ego_future_trajectory is not None:
             # (future_len, 11)
             future_states: List[EgoState] = list(
@@ -740,11 +740,11 @@ class WorldModelAgents(AbstractMLAgents):
                 current_ego_state.rear_axle.heading,
             ],
                               dtype=np.float32)  # shape (3,)
-            ego_agent_future_11_dim = convert_absolute_quantities_to_relative(
+            planner_future_11_dim = convert_absolute_quantities_to_relative(
                 global_ego_fut_traj_10, anchor, 'ego')  # shape (future_len, 11)
-            ego_agent_future_11_dim[valid_future_len:, :] = 0.
-            ego_agent_future_11_dim = ego_agent_future_11_dim.astype(np.float32)
-        return ego_agent_future_11_dim
+            planner_future_11_dim[valid_future_len:, :] = 0.
+            planner_future_11_dim = planner_future_11_dim.astype(np.float32)
+        return planner_future_11_dim
 
     def set_vis_features(self, is_vis_features: bool, vis_features_path: str):
         """
@@ -778,7 +778,7 @@ class WorldModelAgents(AbstractMLAgents):
         self, next_iteration: SimulationIteration,
         history: SimulationHistoryBuffer,
         interp_next_ego_11_dim: Optional[npt.NDArray[np.float32]],
-        ego_agent_future_11_dim: Optional[npt.NDArray[np.float32]]
+        planner_future_11_dim: Optional[npt.NDArray[np.float32]]
     ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]]]:
         # Construct input features
         initialization = HorizonPlannerInitialization(
@@ -801,7 +801,7 @@ class WorldModelAgents(AbstractMLAgents):
                                      traffic_light_data,
                                      diffusion_agents_tokens,
                                      interp_next_ego_11_dim,
-                                     ego_agent_future_11_dim)
+                                     planner_future_11_dim)
         # WorldModelFeatureBuilder.get_features_from_simulation
         # from nuplan_extent/planning/training/preprocessing/feature_builders/world_model_feature_builder.py
         model_input_key_to_value: Dict[
@@ -827,7 +827,7 @@ class WorldModelAgents(AbstractMLAgents):
             np.ndarray] = self.from_next_ego_state_to_traj_np(
                 iteration, next_ego_state)
         # (future_len, 11)
-        ego_agent_future_11_dim: Optional[
+        planner_future_11_dim: Optional[
             np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
                                                         self._ego_anchor_state)
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
@@ -835,7 +835,7 @@ class WorldModelAgents(AbstractMLAgents):
         (model_input_key_to_value,
          neighbor_token_dist_order) = self._get_model_input(
              next_iteration, history, interp_next_ego_11_dim,
-             ego_agent_future_11_dim)
+             planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)

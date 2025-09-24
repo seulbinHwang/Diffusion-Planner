@@ -493,7 +493,7 @@ class Encoder(nn.Module):
 
         입력 딕셔너리 키와 텐서 형태:
             - ego_agent_past:           [B, V=21, 11]
-            - ego_future_gt_11_dim:     [B, N=80, 11]
+            - planner_future_11_dim:     [B, N=80, 11]
             - neighbor_agents_past:     [B, A, V=21, 11]
             - static_objects:           [B, P, D_static]
             - lanes:                    [B, L, lane_len, D_lane]
@@ -515,7 +515,7 @@ class Encoder(nn.Module):
         ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
         ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
         # (B ,future_len= 80, 11)
-        ego_future_full = inputs["ego_future_gt_11_dim"]
+        ego_future_full = inputs["planner_future_11_dim"]
         # agents
         # (B, A, V=21, D=11)
         neighbors = inputs["neighbor_agents_past"]

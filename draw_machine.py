@@ -66,9 +66,9 @@ def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
     return bool((abs(float(row3[0])) > eps) or (abs(float(row3[1])) > eps))
 
 
-def draw_neighbor_future_points(ax: plt.Axes, neighbor_agents_future: Array,
+def draw_neighbor_future_points(ax: plt.Axes, neighbor_future_gt_3_dim: Array,
                                 options: DrawingOptions) -> None:
-    """neighbor_agents_future (agent_num, future_len, 3=[x,y,yaw])를
+    """neighbor_future_gt_3_dim (agent_num, future_len, 3=[x,y,yaw])를
     흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..agent_num-1)를 흰색으로 표기.
 
     규칙:
@@ -76,20 +76,20 @@ def draw_neighbor_future_points(ax: plt.Axes, neighbor_agents_future: Array,
       - 마커: 흰색 'x', 선 없음
       - 라벨: 첫 점이 유효할 때만 표시
     """
-    if neighbor_agents_future is None or neighbor_agents_future.size == 0:
+    if neighbor_future_gt_3_dim is None or neighbor_future_gt_3_dim.size == 0:
         return
-    if neighbor_agents_future.ndim != 3 or neighbor_agents_future.shape[-1] != 3:
+    if neighbor_future_gt_3_dim.ndim != 3 or neighbor_future_gt_3_dim.shape[-1] != 3:
         raise ValueError(
             "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
 
     eps = options.invalid_eps
-    agent_num, future_len, _ = neighbor_agents_future.shape
+    agent_num, future_len, _ = neighbor_future_gt_3_dim.shape
     ms = options.neighbor_future_marker_size
     text_d = options.agent_index_offset_m
     text_color = options.future_agent_index_color
 
     for a in range(agent_num):
-        traj = neighbor_agents_future[a]  # (future_len, 3)
+        traj = neighbor_future_gt_3_dim[a]  # (future_len, 3)
         # 모든 유효 포인트를 x마커로 그리기
         for t in range(future_len):
             row = traj[t]
@@ -136,7 +136,7 @@ class DrawingOptions:
     draw_ego_pred : bool
         ego_agent_next_11_dim(interpol_num, 11) 예측 궤적 렌더링 여부.
     draw_ego_future_gt : bool
-        ego_future_gt_11_dim(80, 11) GT 미래 궤적 렌더링 여부.
+        planner_future_11_dim(80, 11) GT 미래 궤적 렌더링 여부.
     draw_lane_boundaries : bool
         차선 좌/우 경계(LANE) 렌더링 여부(실선 #2d3ea7).
     draw_lane_centerline : bool
@@ -311,7 +311,7 @@ def _clip_agents_first_k_from_data(
     """world_model_feature에서 에이전트 축(0축)을 공유하는 3개 배열을 동일한 K로 슬라이스.
     대상 키:
       - 'neighbor_agents_past'   : (A, T, 11)
-      - 'neighbor_agents_future' : (A, Tf, 3)
+      - 'neighbor_future_gt_3_dim' : (A, Tf, 3)
       - 'agent_route_lane_order' : (A, L)
 
     Args:
@@ -327,14 +327,14 @@ def _clip_agents_first_k_from_data(
         # 제한 없음: 원본 그대로 반환
         return (
             input_data.get("neighbor_agents_past", None),
-            input_data.get("neighbor_agents_future", None),
+            input_data.get("neighbor_future_gt_3_dim", None),
             input_data.get("agent_route_lane_order", None),
             None,
         )
 
     # 각 배열의 길이(A) 수집
     lengths = []
-    for key in ("neighbor_agents_past", "neighbor_agents_future",
+    for key in ("neighbor_agents_past", "neighbor_future_gt_3_dim",
                 "agent_route_lane_order"):
         arr = input_data.get(key, None)
         if arr is not None and hasattr(arr, "shape") and len(arr.shape) >= 1:
@@ -344,7 +344,7 @@ def _clip_agents_first_k_from_data(
         # 슬라이스할 것이 없음
         return (
             input_data.get("neighbor_agents_past", None),
-            input_data.get("neighbor_agents_future", None),
+            input_data.get("neighbor_future_gt_3_dim", None),
             input_data.get("agent_route_lane_order", None),
             None,
         )
@@ -360,7 +360,7 @@ def _clip_agents_first_k_from_data(
         return arr[:K, ...]
 
     neighbor_past_K = _clip(input_data.get("neighbor_agents_past", None))
-    neighbor_future_K = _clip(input_data.get("neighbor_agents_future", None))
+    neighbor_future_K = _clip(input_data.get("neighbor_future_gt_3_dim", None))
     route_order_K = _clip(input_data.get("agent_route_lane_order", None))
 
     return neighbor_past_K, neighbor_future_K, route_order_K, K
@@ -516,7 +516,7 @@ def collect_valid_xy_for_bounds(
 
     # ego past, ego pred, ego future
     for key in ("ego_agent_past", "ego_agent_next_11_dim",
-                "ego_future_gt_11_dim", "ego_agent_future_11_dim"):
+                "planner_future_11_dim", "planner_future_11_dim"):
         A = world_model_feature.get(key)
         if A is None or A.size == 0:
             continue
@@ -551,7 +551,7 @@ def collect_valid_xy_for_bounds(
                 ys.extend(xy[:, 1].tolist())
 
     # neighbor future points: (agent_num, future_len, 3)  -> (x,y)만 사용
-    neigh_fut = world_model_feature.get("neighbor_agents_future")
+    neigh_fut = world_model_feature.get("neighbor_future_gt_3_dim")
     if neigh_fut is not None and neigh_fut.size > 0:
         if neigh_fut.ndim != 3 or neigh_fut.shape[-1] != 3:
             raise ValueError(
@@ -950,18 +950,18 @@ def draw_ego_predicted(ax: plt.Axes, ego_agent_next_11_dim: Array,
                                zorder=27)
 
 
-def draw_ego_future_gt(ax: plt.Axes, ego_future_gt_11_dim: Array,
+def draw_ego_future_gt(ax: plt.Axes, planner_future_11_dim: Array,
                        options: DrawingOptions) -> None:
     """이고 차량 **GT 미래** 시퀀스를 그림(미래 위치는 채우지 않음). invalid 스텝은 스킵."""
-    if ego_future_gt_11_dim is None or ego_future_gt_11_dim.size == 0:
+    if planner_future_11_dim is None or planner_future_11_dim.size == 0:
         return
     eps = options.invalid_eps
-    future_len, feat_dim = ego_future_gt_11_dim.shape
+    future_len, feat_dim = planner_future_11_dim.shape
     if feat_dim != 11:
         raise ValueError("ego_future_gt_11_dim의 마지막 차원은 11이어야 합니다.")
 
     for t in range(future_len):
-        row = ego_future_gt_11_dim[t]
+        row = planner_future_11_dim[t]
         if not is_valid_agent_row(row, eps):
             continue
 
@@ -1532,7 +1532,7 @@ def draw_world_model_to_png(
         - "static_objects": (static_objects_num, 10) - 현재 미사용
         ###########################
         - 'ego_agent_next_11_dim' : (interpol_num, 11)
-        - 'ego_future_gt_11_dim' : (future_len=80, 11)
+        - 'planner_future_11_dim' : (future_len=80, 11)
         ###########################
         - 'lanes' : (lane_num, lane_len, 12)
           · 0-1: centerline (x,y)
@@ -1568,7 +1568,7 @@ def draw_world_model_to_png(
     if neigh_past_K is not None:
         clipped_input_data["neighbor_agents_past"] = neigh_past_K
     if neigh_future_K is not None:
-        clipped_input_data["neighbor_agents_future"] = neigh_future_K
+        clipped_input_data["neighbor_future_gt_3_dim"] = neigh_future_K
     if route_order_K is not None:
         clipped_input_data["agent_route_lane_order"] = route_order_K
 
@@ -1621,9 +1621,9 @@ def draw_world_model_to_png(
         draw_ego_predicted(ax, input_data.get("ego_agent_next_11_dim"),
                            draw_option)
     if draw_option.draw_ego_future_gt:
-        data_ = input_data.get("ego_future_gt_11_dim", None)
+        data_ = input_data.get("planner_future_11_dim", None)
         if data_ is None:
-            data_ = input_data.get("ego_agent_future_11_dim", None)
+            data_ = input_data.get("planner_future_11_dim", None)
         draw_ego_future_gt(ax, data_, draw_option)
 
     # ── (5) 축 범위/스타일 ───────────────────────────────────────────
@@ -1650,11 +1650,11 @@ if __name__ == "__main__":
             np.zeros((5, 21, 11), dtype=np.float32),
         "ego_agent_next_11_dim":
             np.zeros((30, 11), dtype=np.float32),
-        "ego_future_gt_11_dim":
+        "planner_future_11_dim":
             np.zeros((80, 11), dtype=np.float32),
         "lanes":
             np.zeros((70, 50, 12), dtype=np.float32),
-        "neighbor_agents_future":
+        "neighbor_future_gt_3_dim":
             np.array([
                 np.column_stack([
                     np.linspace(0, 10, 20),

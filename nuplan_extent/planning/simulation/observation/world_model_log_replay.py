@@ -671,10 +671,10 @@ class WorldModelLogReplay(AbstractMLAgents):
             ego_agent_next_11_dim = self._preprocess_next_ego_plans(
                 next_ego_plans, self._ego_anchor_state)
 
-        ego_agent_future_11_dim = None
+        planner_future_11_dim = None
         if ego_future_trajectory is not None:
             # (config.future_len, 11)
-            ego_agent_future_11_dim = self._preprocess_ego_future_traj(
+            planner_future_11_dim = self._preprocess_ego_future_traj(
                 ego_future_trajectory, self._ego_anchor_state)
 
         # Construct input features
@@ -699,7 +699,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             traffic_light_data,
             # self.diffusion_agents_track_tokens,
             ego_agent_next_11_dim,
-            ego_agent_future_11_dim)
+            planner_future_11_dim)
         features: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)
