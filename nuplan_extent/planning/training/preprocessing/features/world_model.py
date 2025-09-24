@@ -30,10 +30,12 @@ class WorldModelFeature(AbstractModelFeature):
     route_lanes_has_speed_limit: Optional[FeatureDataType]  # (route_num, 1)
     agent_route_lane_order: Optional[
         FeatureDataType]  # (agent_num, lane_num) # -1 if not on route
+    target_agents_mask: Optional[FeatureDataType]  # (agent_num,) bool
     ###########
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
     ego_future_gt_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
+
     ############
 
     def to_feature_tensor(self) -> WorldModelFeature:
@@ -56,6 +58,8 @@ class WorldModelFeature(AbstractModelFeature):
                 self.route_lanes_has_speed_limit).contiguous(),
             agent_route_lane_order=None if self.agent_route_lane_order is None
             else to_tensor(self.agent_route_lane_order).contiguous(),
+            target_agents_mask=None if self.target_agents_mask is None else
+            to_tensor(self.target_agents_mask).contiguous(),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).contiguous(),
             ego_future_gt_11_dim=None if self.ego_future_gt_11_dim is None else
@@ -83,6 +87,8 @@ class WorldModelFeature(AbstractModelFeature):
                 device=device),
             agent_route_lane_order=None if self.agent_route_lane_order is None
             else to_tensor(self.agent_route_lane_order).to(device=device),
+            target_agents_mask=None if self.target_agents_mask is None else
+            to_tensor(self.target_agents_mask).to(device=device),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).to(device=device),
             ego_future_gt_11_dim=None if self.ego_future_gt_11_dim is None else
@@ -119,6 +125,7 @@ class WorldModelFeature(AbstractModelFeature):
             route_lanes_has_speed_limit=_collate_optional(
                 "route_lanes_has_speed_limit"),
             agent_route_lane_order=_collate_optional("agent_route_lane_order"),
+            target_agents_mask=_collate_optional("target_agents_mask"),
             ego_agent_next_11_dim=_collate_optional("ego_agent_next_11_dim"),
             ego_future_gt_11_dim=_collate_optional("ego_future_gt_11_dim"),
         )
@@ -152,6 +159,8 @@ class WorldModelFeature(AbstractModelFeature):
                     self.route_lanes_has_speed_limit[i],
                     agent_route_lane_order=None if self.agent_route_lane_order
                     is None else self.agent_route_lane_order[i],
+                    target_agents_mask=None if self.target_agents_mask is None
+                    else self.target_agents_mask[i],
                     ego_agent_next_11_dim=None if self.ego_agent_next_11_dim
                     is None else self.ego_agent_next_11_dim[i],
                     ego_future_gt_11_dim=None if self.ego_future_gt_11_dim
@@ -191,6 +200,7 @@ class WorldModelFeature(AbstractModelFeature):
             - "route_lanes_speed_limit": (B, route_num, 1) or None
             - "route_lanes_has_speed_limit": (B, route_num, 1) or None
             - "agent_route_lane_order": (B, agent_num, lane_num) or None
+            - "target_agents_mask": (B, agent_num) or None
             - "near_route_lanes": (B, Pnn, lane_len, 12) or None
             - "near_route_lanes_speed_limit": (B, Pnn, 1) or None
             - "near_route_lanes_has_speed_limit": (B, Pnn, 1) or None

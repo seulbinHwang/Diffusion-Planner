@@ -13,6 +13,35 @@ WorldModelFeature = Dict[str, Array]
 TokenTrajDict = Dict[str, Array]  # value: (future_len, 4) with [x, y, cos, sin]
 
 
+class DrawInfos:
+
+    def __init__(self):
+        """
+        딥러닝 input으로 쓰인 값들
+        이 안에, "neighbor_track_token" 가 있고, 이게 neighbor_token_dist_order: List[Optional[str]]
+        """
+        self.model_input_key_to_unnorm_value: Dict[str, np.ndarray] = {}
+        """
+        딥러닝 output 값 그대로
+        """
+        self.diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray]  # (T, 4)
+        """
+        history Agent 만든걸 -> (History_len, 11) numpy로 변환한 것들
+        npc 미래 궤적 보정 input으로 쓰이는걸 그려보기 위해 저장
+        """
+        self.diff_token_to_np_history_wrt_ego: Dict[str, np.ndarray] = {
+        }  # (History_len, 11)
+        """
+        interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
+        """
+        self.diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] = {
+        }  # (Future_len, 11)
+        """
+        interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
+        """
+        self.diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (11,)
+
+
 def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
     """미래 포인트(3,)=[x,y,yaw]가 **유효**하면 True.
     - 규칙: |x|>eps 또는 |y|>eps 이면 유효로 간주( yaw=0 이어도 상관 없음 )
@@ -1446,15 +1475,17 @@ def draw_token_histories(
         #         va="center",
         #         zorder=21,
         #     )
-
-# [Add]
-def draw_world_model_to_png(
+"""
     world_model_feature: WorldModelFeature,
     token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
     token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]],  # (1 + future_len=80, 11)
 token_to_new_waypoint_array: Optional[Dict[str, np.ndarray]],  # (11,)
 neighbor_track_token: Optional[List[Optional[str]]], # (agent_num,)
 current_token_to_np_history: Dict[str, np.ndarray], # (history_len, 11)
+"""
+# [Add]
+def draw_world_model_to_png(
+    draw_infos: DrawInfos,
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:

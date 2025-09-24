@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Type, Optional
+from typing import Dict, Type, Optional, List
 import numpy as np
 
 import torch
@@ -63,9 +63,10 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         neighbor_track_token = model_inputs["neighbor_track_token"]
         model_inputs.pop("neighbor_track_token")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model_inputs: Dict[str, torch.Tensor] = convert_to_model_inputs(model_inputs,
-                                               device,
-                                               squeeze=True)
+        model_inputs: Dict[str,
+                           torch.Tensor] = convert_to_model_inputs(model_inputs,
+                                                                   device,
+                                                                   squeeze=True)
         self.unnormalized_features = model_inputs.copy()
         for key in self.unnormalized_features:
             # torch -> numpy
@@ -78,8 +79,12 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         """
         input
             - neighbor_track_token :  List[Optional[str]], (agent_num,)
-            - self._diffusion_vehicles_tokens: List[str], (valid_agent_num) maxlen=Pnn
+            - diffusion_agents_tokens: List[str], (valid_agent_num) maxlen=Pnn
+        output
+            - target_agents_mask: np.ndarray, (agent_num,) bool
         """
+        target_agents_mask = self._get_target_agents_mask(
+            neighbor_track_token, current_input.diffusion_agents_tokens)
 
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)
@@ -100,11 +105,29 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 "route_lanes_has_speed_limit"],  # (route_num, 1)
             agent_route_lane_order=model_inputs[
                 "agent_route_lane_order"],  # (agent_num, 1)
+            target_agents_mask=target_agents_mask,  # (agent_num,) bool
             ego_agent_next_11_dim=model_inputs[
                 "ego_agent_next_11_dim"],  # (interpol_num, 11)
             ego_future_gt_11_dim=model_inputs["ego_future_gt_11_dim"]
         )  # (future_len, 11)
         return world_model_feature
+
+    def _get_target_agents_mask(
+            self, neighbor_track_token: List[Optional[str]],
+            diffusion_agents_tokens: List[str]) -> np.ndarray:
+        """
+        input
+            - neighbor_track_token :  List[Optional[str]], (agent_num,)
+            - diffusion_agents_tokens: List[str], (valid_agent_num) maxlen=Pnn
+        output
+            - target_agents_mask: np.ndarray, (agent_num,) bool
+        """
+        agent_num = len(neighbor_track_token)
+        target_agents_mask = np.zeros((agent_num,), dtype=bool)
+        for idx in range(agent_num):
+            if neighbor_track_token[idx] in diffusion_agents_tokens:
+                target_agents_mask[idx] = True
+        return target_agents_mask
 
     def get_features_from_scenario(
             self, scenario: "AbstractScenario") -> WorldModelFeature:  # 추가

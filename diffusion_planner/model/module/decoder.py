@@ -160,14 +160,44 @@ class Decoder(nn.Module):
         """
 
         # Extract ego & neighbor current states
-        near_current_xyyaw = inputs[
-            "neighbor_agents_past"][:, :self._predicted_neighbor_num,
-                                    -1, :4]  # [B, pnn, 4]
-        near_current_mask = torch.sum(torch.ne(near_current_xyyaw[..., :4], 0),
-                                      dim=-1) == 0  # [B, pnn]
-        inputs["near_current_mask"] = near_current_mask
+        target_agents_mask = inputs["target_agents_mask"]  # [B, agent_num] bool
+        if target_agents_mask is None:
+            near_current_xyyaw = inputs[
+                "neighbor_agents_past"][:, :self._predicted_neighbor_num,
+                                        -1, :4]  # [B, pnn, 4]
+            near_current_mask = torch.sum(torch.ne(near_current_xyyaw[..., :4],
+                                                   0),
+                                          dim=-1) == 0  # [B, pnn]
+            inputs["near_current_mask"] = near_current_mask
+
+        else:
+            # neighbor_agents_past_xyyaw: [B, agent_num, time_len, 4]
+            neighbor_agents_past_xyyaw = inputs["neighbor_agents_past"][..., :4]
+            B, agent_num, time_len, D4 = neighbor_agents_past_xyyaw.shape
+
+            # 마지막 타임스텝만 추출: [B, agent_num, 4]
+            neighbor_current_xyyaw = neighbor_agents_past_xyyaw[:, :, -1, :]
+
+            # 출력 버퍼(초기 0): [B, agent_num, 4]
+            near_current_xyyaw = torch.zeros(
+                (B, agent_num, 4),
+                dtype=neighbor_current_xyyaw.dtype,
+                device=neighbor_current_xyyaw.device,
+            )
+
+            # 마스크가 True인 “그 자리”에 값 대입 (슬롯 유지)
+            near_current_xyyaw[target_agents_mask] = neighbor_current_xyyaw[
+                target_agents_mask]
+            # TODO: 임시
+            near_current_xyyaw = near_current_xyyaw[:, :self.
+                                                    _predicted_neighbor_num, :]  # [B, pnn, 4]
+            # [B, agent_num] — 모두 0이면 True (빈 슬롯)
+            near_current_mask = (near_current_xyyaw.ne(0).sum(dim=-1) == 0)
+
+            inputs["near_current_mask"] = near_current_mask
 
         B, Pnn, _ = near_current_xyyaw.shape
+
         assert Pnn == (self._predicted_neighbor_num)
         assert near_current_mask.shape[1] == Pnn
 

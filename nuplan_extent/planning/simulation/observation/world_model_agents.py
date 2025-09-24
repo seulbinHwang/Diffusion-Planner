@@ -56,13 +56,13 @@ def agent_to_feature_vector(
     - [0] center x
     - [1] center y
     - [2] center yaw
-    - [4] center v_x
-    - [5] center v_y
+    - [3] center v_x
+    - [4] center v_y
+    - [5] 패딩 0.0
     - [6] 패딩 0.0
-    - [7] 패딩 0.0
-    - [8] 1.0
+    - [7] 1.0
+    - [8] 0.0
     - [9] 0.0
-    - [10] 0.0
 
     위와 같이 마지막 세 항목이 항상 [1, 0, 0]이 되도록 끝에 고정 배치합니다.
 
@@ -113,7 +113,7 @@ def agent_to_feature_vector(
 
 # [Add]
 def sort_refined_trajs_by_first_xy_l2(
-    token_to_refined_traj_wrt_ego: Dict[str, np.ndarray],
+    diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray],
     *,
     invalid_eps: float = 0.0,
 ) -> Dict[str, np.ndarray]:
@@ -128,7 +128,7 @@ def sort_refined_trajs_by_first_xy_l2(
       (예: 0으로 채워진 더미/미사용 시퀀스를 뒤로 밀고 싶을 때 유용)
 
     Args:
-        token_to_refined_traj_wrt_ego: Dict[str, np.ndarray]
+        diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray]
             - 각 value: (T, 11), T ≥ 1
         invalid_eps: float, optional
             - 0.0(기본): 무효 처리 없음(정말로 원점이면 거리 0으로 취급)
@@ -141,11 +141,11 @@ def sort_refined_trajs_by_first_xy_l2(
     Raises:
         ValueError: 배열 shape가 (T, 11)이 아닌 항목이 있을 때.
     """
-    if not token_to_refined_traj_wrt_ego:
-        return token_to_refined_traj_wrt_ego
+    if not diff_token_to_interp_np_traj_wrt_ego:
+        return diff_token_to_interp_np_traj_wrt_ego
 
     sortable_triplets: List[Tuple[str, float, np.ndarray]] = []
-    for token, arr in token_to_refined_traj_wrt_ego.items():
+    for token, arr in diff_token_to_interp_np_traj_wrt_ego.items():
         if not isinstance(arr,
                           np.ndarray) or arr.ndim != 2 or arr.shape[1] != 11:
             raise ValueError(
@@ -251,8 +251,11 @@ def observations_to_agents_buffer(
             # Agent 중에, 오직 차량(VEHICLE) 타입만 추출한다.
             vehicles = [
                 agent for agent in observation.tracked_objects.get_agents()
-                if (agent.tracked_object_type == TrackedObjectType.VEHICLE) and
-                (agent.track_token in diffusion_agents_track_tokens)
+                if (agent.tracked_object_type in {
+                    TrackedObjectType.VEHICLE,
+                    TrackedObjectType.PEDESTRIAN,
+                    TrackedObjectType.BICYCLE,
+                }) and (agent.track_token in diffusion_agents_track_tokens)
             ]
             vehicles_buffer.append(vehicles)
         else:
@@ -269,7 +272,6 @@ def get_token_to_history(
     버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
     각 Agent의 상태를 수집한다. 특정 과거시점에 해당 Agent가 존재하지 않으면, 더 이상 과거 상태는
     수집하지 않는다.
-    TODO: 이 방식이 최선인가?
 
     Args:
         vehicles_buffer (Deque[List[Agent]]): 시간 순서대로 정렬된 Agent 버퍼. 길이 :math:`T`의 버퍼이며,
@@ -288,7 +290,6 @@ def get_token_to_history(
     max_len = vehicles_buffer.maxlen
     if not vehicles_buffer:
         return {}
-    # only for car.
     current_vehicles: List[Agent] = [agent for agent in vehicles_buffer[-1]]
     current_token_list: List[str] = [
         agent.track_token for agent in current_vehicles
@@ -379,13 +380,14 @@ def global_to_local(coords_global: np.ndarray, yaw_global: np.ndarray,
 
 def transform_trajectory(future_traj_wrt_ego: np.ndarray,
                          ego_rear_axle_xy: np.ndarray, ego_yaw: float,
-                         veh_center_xy: np.ndarray,
-                         veh_yaw: float) -> np.ndarray:
+                         agent_xyyaw: np.ndarray) -> np.ndarray:
     """
     ego계 기준 future_traj_wrt_ego → 각 vehicle 로컬계 기준 (T,4) trajectory.
     """
     coords_g, yaw_g = ego_to_global(future_traj_wrt_ego, ego_rear_axle_xy,
                                     ego_yaw)
+    veh_center_xy = agent_xyyaw[:2]
+    veh_yaw = float(agent_xyyaw[2])
     return global_to_local(coords_g, yaw_g, veh_center_xy, veh_yaw)
 
 
@@ -479,15 +481,19 @@ class WorldModelAgents(AbstractMLAgents):
             tracked_object.track_token: tracked_object
             for tracked_object in
             self._scenario.initial_tracked_objects.tracked_objects
-            if tracked_object.tracked_object_type == TrackedObjectType.VEHICLE
+            if tracked_object.tracked_object_type in {
+                TrackedObjectType.VEHICLE,
+                TrackedObjectType.PEDESTRIAN,
+                TrackedObjectType.BICYCLE,
+            }
         }
-        self._diffusion_vehicles: Dict[str,
-                                       TrackedObject] = sort_dict(unique_agents)
+        self._diffusion_agents: Dict[str,
+                                     TrackedObject] = sort_dict(unique_agents)
         self._filter_diffusion_agents(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
             self._get_open_loop_track_objects(self.current_iteration))
         self._agents: Dict[str, TrackedObject] = {
-            **self._diffusion_vehicles,
+            **self._diffusion_agents,
             **self._log_replay_agents
         }
 
@@ -556,9 +562,9 @@ class WorldModelAgents(AbstractMLAgents):
         # sorted_tokens: list[str],
         # sorted_distances: npt.NDArray[np.float64]
         sorted_tokens, sorted_distances = self._compute_sorted_distances(
-            ego_state, self._diffusion_vehicles)
+            ego_state, self._diffusion_agents)
         if len(sorted_tokens) == 0:
-            self._diffusion_vehicles = {}
+            self._diffusion_agents = {}
             return
 
         # 벡터화: 반경 내 토큰 추출
@@ -569,7 +575,7 @@ class WorldModelAgents(AbstractMLAgents):
         # 반경 내 인덱스 마스크
         dist_mask: np.ndarray = sorted_distances <= self._radius  # (N,)
         if not np.any(dist_mask):
-            self._diffusion_vehicles = {}
+            self._diffusion_agents = {}
             return
 
         # 반경 내 토큰 (거리 오름차순 유지)
@@ -582,8 +588,8 @@ class WorldModelAgents(AbstractMLAgents):
 
         # 사전을 선택된 토큰으로 슬라이스
         # (파이썬 dict 재구성은 불가피하지만 크기는 K로 제한됨)
-        self._diffusion_vehicles = {
-            t: self._diffusion_vehicles[t] for t in selected_tokens
+        self._diffusion_agents = {
+            t: self._diffusion_agents[t] for t in selected_tokens
         }
 
     def _get_interpol_time_points(
@@ -784,11 +790,14 @@ class WorldModelAgents(AbstractMLAgents):
         )
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
             next_iteration.index)
-        # diffusion_agents_track_tokens: list[str]
-
+        # target_agents_mask: np.ndarray, (agent_num,) bool
+        # diffusion_agents_tokens: List[str]
+        diffusion_agents_tokens = list(self._diffusion_agents.keys())
         current_input = PlannerInput(next_iteration, history,
-                                     traffic_light_data, interp_next_ego_11_dim,
-                                     ego_agent_future_11_dim)  # (1+T, 11)
+                                     traffic_light_data,
+                                     diffusion_agents_tokens,
+                                     interp_next_ego_11_dim,
+                                     ego_agent_future_11_dim)
         # WorldModelFeatureBuilder.get_features_from_simulation
         # from nuplan_extent/planning/training/preprocessing/feature_builders/world_model_feature_builder.py
         model_input_key_to_value: Dict[
@@ -798,16 +807,16 @@ class WorldModelAgents(AbstractMLAgents):
             str, np.ndarray] = self._model_loader.feature_builders[
                 0].unnormalized_features
         neighbor_token_dist_order: List[Optional[
-            str]] = model_input_key_to_unnorm_value["neighbor_token_dist_order"]
+            str]] = model_input_key_to_unnorm_value["neighbor_track_token"]
         return (model_input_key_to_value, model_input_key_to_unnorm_value,
                 neighbor_token_dist_order)
 
     def _update_diffusion_agents_observation(
-        self, iteration: SimulationIteration,
-        next_iteration: SimulationIteration, history: SimulationHistoryBuffer,
-        next_ego_state: Optional[EgoState],
-        ego_future_trajectory: Optional[InterpolatedTrajectory]
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+            self, iteration: SimulationIteration,
+            next_iteration: SimulationIteration,
+            history: SimulationHistoryBuffer,
+            next_ego_state: Optional[EgoState],
+            ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
         interp_next_ego_11_dim = self.from_next_ego_state_to_traj_np(
             iteration, next_ego_state)
 
@@ -820,15 +829,12 @@ class WorldModelAgents(AbstractMLAgents):
          neighbor_token_dist_order) = self._get_model_input(
              next_iteration, history, interp_next_ego_11_dim,
              ego_agent_future_11_dim)
+        self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
-        (token_to_future_traj_wrt_ego, token_to_refined_traj_wrt_ego,
-         token_to_new_waypoint_array) = self.infer_model(
-             model_input_key_to_value, iteration, next_iteration,
-             neighbor_token_dist_order)
-
-        return model_input_key_to_unnorm_value, token_to_future_traj_wrt_ego, token_to_refined_traj_wrt_ego, token_to_new_waypoint_array, neighbor_token_dist_order
+        self.infer_model(model_input_key_to_value, iteration, next_iteration,
+                         neighbor_token_dist_order)
 
     def update_observation(
             self,
@@ -845,6 +851,7 @@ class WorldModelAgents(AbstractMLAgents):
         - log-replay
             -
         """
+        self._draw_infos = draw_machine.DrawInfos()
         self.observation_buffer: Deque[Observation] = history.observation_buffer
         # EgoState, Observation
         self._ego_anchor_state, self.current_observation = history.current_state
@@ -853,22 +860,17 @@ class WorldModelAgents(AbstractMLAgents):
         # model_input_key_to_unnorm_value: Dict[str, np.ndarray]
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
 
-        (model_input_key_to_unnorm_value, token_to_future_traj_wrt_ego,
-         token_to_refined_traj_wrt_ego, token_to_new_waypoint_array,
-         neighbor_token_dist_order) = self._update_diffusion_agents_observation(
-             iteration, next_iteration, history, next_ego_state,
-             ego_future_trajectory)
+        self._update_diffusion_agents_observation(iteration, next_iteration,
+                                                  history, next_ego_state,
+                                                  ego_future_trajectory)
 
         self._filter_diffusion_agents(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
             self._get_open_loop_track_objects(self.current_iteration))
-        self._agents = {**self._diffusion_vehicles, **self._log_replay_agents}
+        self._agents = {**self._diffusion_agents, **self._log_replay_agents}
         if self._is_vis_features:
-            draw_machine.draw_world_model_to_png(
-                model_input_key_to_unnorm_value, token_to_future_traj_wrt_ego,
-                token_to_refined_traj_wrt_ego, token_to_new_waypoint_array,
-                neighbor_token_dist_order, self.current_token_to_np_history,
-                self._vis_features_path)
+            draw_machine.draw_world_model_to_png(self._draw_infos,
+                                                 self._vis_features_path)
 
     @staticmethod
     def extract_rear_wheelbases(agents: Dict[str, Agent],
@@ -945,74 +947,13 @@ class WorldModelAgents(AbstractMLAgents):
                                         dtype=float)  # shape: (2,)
         return position, rear_axle.heading,
 
-    def get_npc_center_poses(self,
-                             current_agent: Agent) -> Tuple[np.ndarray, float]:
-        """각 차량의 중앙 위치와 방향을 계산한다.
-
-        Returns:
-            Tuple[np.ndarray, float]: shape (2,), 차량 중앙 [x, y]와 방향 yaw_rad.
-
-        """# .center.x
-        position: np.ndarray = np.array([
-            current_agent.center.x,
-            current_agent.center.y,
-        ],
-                                        dtype=float)  # shape: (2,)
-
-        return position, current_agent.center.heading
-
-    def infer_model(
-        self, model_input_key_to_value: Dict[str, AbstractModelFeature],
-        iteration: SimulationIteration, next_iteration: SimulationIteration,
-        neighbor_token_dist_order: List[Optional[str]]
-    ) -> Dict[str, np.ndarray]:
-        ego_rear_axle_xy, ego_yaw = self.get_rear_axle_pose(
-            self._ego_anchor_state)
-        model_inputs: AbstractModelFeature = model_input_key_to_value[
-            "world_model_feature"]
-        # nuplan_extent/planning/training/modeling/models/world_model.py
-        # WorldModel.forward
-
-        # future_np_trajs_wrt_ego: (Pnn, 1+T, 4)
-        future_np_trajs_wrt_ego: np.ndarray = self._model_loader.infer(
-            model_inputs).detach().cpu().numpy()
-        near_tokens_dist_order = neighbor_token_dist_order[:self.
-                                                           predicted_neighbor_num]  # len == Pnn
-        # token_to_np_traj_wrt_ego: Dict[str, np.ndarray] # (T, 4)
-        token_to_np_traj_wrt_ego: Dict[str, np.ndarray] = {
-            token: future_np_trajs_wrt_ego[idx, 1:, :]
-            for idx, token in enumerate(near_tokens_dist_order)
-            if token is not None
-        }
-
-        diffusion_agents_track_tokens, _ = self._compute_sorted_distances(
-            self._ego_anchor_state, self._diffusion_vehicles)
-
-        # 진짜 존재하는 대상만
-        token_to_future_traj_wrt_ego: Dict[str, np.ndarray] = {}  # (T, 4)
-        token_to_refined_traj_wrt_ego: Dict[str, np.ndarray] = {}  # (T, 11)
-
-        # 진짜 존재하는 대상만 # diffusion_agents_track_tokens: 차량만 포함
-        # future_np_trajs_wrt_ego: 차량 이외의 대상도 포함되어 있음
-        for idx, token in enumerate(diffusion_agents_track_tokens):
-            if token_to_np_traj_wrt_ego.get(token) is not None:
-                a = token_to_np_traj_wrt_ego[token]
-                token_to_future_traj_wrt_ego[token] = a  # (T, 4)
-
-        current_token_to_agent_history: Dict[
-            str,
-            Deque[Agent]] = get_token_to_history(self.observation_buffer,
-                                                 iteration,
-                                                 diffusion_agents_track_tokens)
-        anchor_ego_state = np.array([
-            self._ego_anchor_state.rear_axle.x,
-            self._ego_anchor_state.rear_axle.y,
-            self._ego_anchor_state.rear_axle.heading
-        ],
-                                    dtype=np.float64)  # shape (3,)
-        self.current_token_to_np_history: Dict[str, np.ndarray] = {
-        }  #(token, (len(history), 11))
-        for token, history in current_token_to_agent_history.items():
+    def _get_diff_token_to_np_history_to_draw(
+            self,
+            diffusion_token_to_agent_history: Dict[str, Deque[Agent]],
+            cur_ego_global_xyyaw: np.ndarray,  # shape: (3,)
+    ):
+        diff_token_to_np_history_wrt_ego: Dict[str, np.ndarray] = {}
+        for token, history in diffusion_token_to_agent_history.items():
             history_array = [
                 agent_to_feature_vector(agent) for agent in history
             ]
@@ -1021,75 +962,94 @@ class WorldModelAgents(AbstractMLAgents):
             # convert absolute to relative
 
             history_array = convert_absolute_quantities_to_relative(
-                history_array, anchor_ego_state)
-            self.current_token_to_np_history[
+                history_array, cur_ego_global_xyyaw)
+            diff_token_to_np_history_wrt_ego[
                 token] = history_array  # (len(history), 11)
+        self._draw_infos.diff_token_to_np_history_wrt_ego = diff_token_to_np_history_wrt_ego
 
+    def _get_diff_token_to_cur_xyyaw(
+            self,
+            diffusion_tokens_dist_order: List[
+                str],  # valid diffusion agent 토큰 리스트 (거리 오름차순) 
+    ) -> Dict[str, np.ndarray]:
         current_agents: List[
             Agent] = self.current_observation.tracked_objects.get_agents()
         # current_agents: 쓰임
-        current_token_to_agent: Dict[str, Agent] = {
-            agent.track_token: agent
+        # np.ndarray: (3,)
+        diff_token_to_global_xyyaw: Dict[str, np.ndarray] = {
+            agent.track_token:
+                np.array([agent.center.x, agent.center.y, agent.center.heading])
             for agent in current_agents
-            if agent.track_token is not None
-        }  # shape (M,)
+            if agent.track_token is not None and
+            agent.track_token in diffusion_tokens_dist_order
+        }  # shape (3,)
+        return diff_token_to_global_xyyaw
 
-        token_to_interpol_traj: Dict[str, AbstractTrajectory] = {}
-
-        anchor_ego_state = np.array([
-            self._ego_anchor_state.rear_axle.x,
-            self._ego_anchor_state.rear_axle.y,
-            self._ego_anchor_state.rear_axle.heading
-        ],
-                                    dtype=np.float64)  # shape (3,)
+    def _get_diff_token_to_interpol_traj_wrt_ego(
+            self,
+            diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray],  # (T, 4)
+            diff_token_to_global_xyyaw: Dict[str, np.ndarray],  # (token, (3,))
+            diffusion_token_to_agent_history: Dict[
+                str, Deque[Agent]],  # (token, Deque[Agent])
+            cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
+    ) -> Dict[str, AbstractTrajectory]:
         sim_step_gap_s: float = self.sim_step_gap_time_point.time_s
-        for token, future_traj_wrt_ego in token_to_future_traj_wrt_ego.items():
+        ego_rear_axle_xy, ego_yaw = self.get_rear_axle_pose(
+            self._ego_anchor_state)
+
+        diff_token_to_interp_np_traj_wrt_ego: Dict[str,
+                                                   np.ndarray] = {}  # (T, 11)
+        diff_token_to_interpol_traj: Dict[str, AbstractTrajectory] = {}
+        # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
+        for token, future_traj_wrt_ego in diff_token_to_np_gen_traj_wrt_ego.items(
+        ):
             # future_traj_wrt_ego: (T, 4)
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
             if np.allclose(future_traj_wrt_ego, 0.0):
                 raise ValueError("future_traj_wrt_ego 값이 전부 0. 입니다.")
-            agent_center_xy, agent_yaw = self.get_npc_center_poses(
-                current_token_to_agent[token])
+            agent_xyyaw = diff_token_to_global_xyyaw[token]
             future_traj_wrt_npc_center = transform_trajectory(
-                future_traj_wrt_ego, ego_rear_axle_xy, ego_yaw, agent_center_xy,
-                agent_yaw)  # (T, 4)
-            self_history: Deque[Agent] = current_token_to_agent_history[token]
-
+                future_traj_wrt_ego, ego_rear_axle_xy, ego_yaw,
+                agent_xyyaw)  # (T, 4)
+            self_history: Deque[Agent] = diffusion_token_to_agent_history[token]
             future_trajectory = InterpolatedTrajectory(
                 trajectory=self.outputs_to_trajectory(
                     future_traj_wrt_npc_center, self_history, sim_step_gap_s))
-            ################ 그림 그리기 용 ############
-            future_waypoints: List[
-                Waypoint] = future_trajectory.get_sampled_trajectory()
-            global_future_arrays = [
-                waypoint_to_numpy10(wp) for wp in future_waypoints
-            ]  # List[(10,)]
-            global_future_arrays = np.stack(global_future_arrays,
-                                            axis=0)  # (T, 10)
-            ################
-            # local_future_arrays: (T, 11)
-            local_future_arrays = convert_absolute_quantities_to_relative(
-                global_future_arrays,
-                anchor_ego_state)  # anchor_ego_state: (3,)
-            token_to_refined_traj_wrt_ego[token] = local_future_arrays
-            # if token == "81efd27d45035418":
-            #     a = local_future_arrays[:3, :6] # (3, 6)
-            #     vel_x = a[:, 4]
-            #     vel_y = a[:, 5]
-            #     vel_ = np.linalg.norm(np.stack([vel_x, vel_y], axis=1), axis=1) # (3,)
-            #
-            #     print("local_future_arrays:", np.round(a, 2),
-            #           "vel_ (km/h):", np.round(vel_* 3.6, 2),
-            #           "vel_ (m/s):", np.round(vel_, 2)
-            #           )
-            token_to_interpol_traj[token] = future_trajectory
+            diff_token_to_interp_np_traj_wrt_ego[
+                token] = self._get_rel_future_arrays_to_draw(
+                    future_trajectory, cur_ego_global_xyyaw)
+            diff_token_to_interpol_traj[token] = future_trajectory
+        # [Add] 첫 시점 (x,y) L2 거리가 작은 순서로 정렬
+        self._draw_infos.diff_token_to_interp_np_traj_wrt_ego = diff_token_to_interp_np_traj_wrt_ego
+        return diff_token_to_interpol_traj
 
-        token_to_new_agent: Dict[str, Agent] = {}
-        # 진짜 존재하는 대상만
-        token_to_new_waypoint_array: Dict[str, np.ndarray] = {}  # (1, 11)
-        for agent_token, interpol_traj in token_to_interpol_traj.items():
-            agent_ = self._diffusion_vehicles[agent_token]
-            # TODO: new_timestamp_us 를 이렇게 주는게 맞는지 확인 필요
+    def _get_rel_future_arrays_to_draw(
+            self,
+            future_trajectory: InterpolatedTrajectory,
+            cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
+    ):
+        future_waypoints: List[
+            Waypoint] = future_trajectory.get_sampled_trajectory()
+        global_future_arrays = [
+            waypoint_to_numpy10(wp) for wp in future_waypoints
+        ]  # List[(10,)]
+        global_future_arrays = np.stack(global_future_arrays, axis=0)  # (T, 10)
+        # rel_future_arrays: (T, 11)
+        rel_future_arrays = convert_absolute_quantities_to_relative(
+            global_future_arrays,
+            cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)
+        return rel_future_arrays
+
+    def _update_diffusion_agents(
+            self,
+            diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
+            next_iteration: SimulationIteration,
+            cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
+    ) -> None:
+        diff_token_to_updated_agent: Dict[str, Agent] = {}
+        diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)
+        for diff_token, interpol_traj in diff_token_to_interpol_traj.items():
+            agent_ = self._diffusion_agents[diff_token]
             new_timestamp_us = next_iteration.time_point.time_us
             new_metadata = SceneObjectMetadata(new_timestamp_us,
                                                agent_.metadata.token,
@@ -1098,57 +1058,123 @@ class WorldModelAgents(AbstractMLAgents):
                                                agent_.metadata.category_name)
 
             # EgoState의 속도는 자차 좌표계 기준 벡터
-            new_waypoint: Waypoint = interpol_traj.get_state_at_time(
+            updated_waypoint: Waypoint = interpol_traj.get_state_at_time(
                 next_iteration.time_point)
-            ################ 그림 그리기 용 ############
-            new_waypoint_array = waypoint_to_numpy10(new_waypoint).reshape(
-                1, -1)  # (1, 10)
-            new_local_waypoint_array = convert_absolute_quantities_to_relative(
-                new_waypoint_array, anchor_ego_state)  # anchor_ego_state: (3,)
-            token_to_new_waypoint_array[
-                agent_token] = new_local_waypoint_array  # (1, 11)
-            # if agent_token == "81efd27d45035418":
-            #     a = new_local_waypoint_array[:, :6] # (1, 6)
-            #     vel_x = a[:, 4]
-            #     vel_y = a[:, 5]
-            #     vel = np.linalg.norm(np.stack([vel_x, vel_y], axis=1), axis=1) # (1,)
-            #     print("new_local_waypoint_array:", np.round(new_local_waypoint_array[:, :6], 2),
-            #           "vel (km/h):", np.round(vel * 3.6, 2),
-            #           "vel (m/s):", np.round(vel, 2)
-            #
-            #           )
-
-            ################
-            new_agent = Agent(
+            updated_agent = Agent(
                 tracked_object_type=agent_.tracked_object_type,
-                oriented_box=new_waypoint.oriented_box,
-                velocity=new_waypoint.velocity,
+                oriented_box=updated_waypoint.oriented_box,
+                velocity=updated_waypoint.velocity,
                 metadata=new_metadata,
             )
-            new_agent.predictions = [
+            updated_agent.predictions = [
                 PredictedTrajectory(
                     probability=1.,
                     waypoints=interpol_traj.get_sampled_trajectory())
             ]
-            token_to_new_agent[agent_token] = new_agent
+            diff_token_to_updated_agent[diff_token] = updated_agent
+            # (11)
+            diff_token_to_next_wp_wrt_ego[
+                diff_token] = self._get_new_local_waypoint_array_to_draw(
+                    updated_waypoint, cur_ego_global_xyyaw)
 
-        self._diffusion_vehicles = token_to_new_agent
+        self._diffusion_agents = diff_token_to_updated_agent
+        self._draw_infos.diff_token_to_next_wp_wrt_ego = diff_token_to_next_wp_wrt_ego
 
-        # [Add] 첫 시점 (x,y) L2 거리가 작은 순서로 정렬
-        token_to_refined_traj_wrt_ego = sort_refined_trajs_by_first_xy_l2(
-            token_to_refined_traj_wrt_ego,
-            invalid_eps=0.0,  # 0.0: (0,0)도 진짜 근거리로 취급 / 필요시 1e-6 ~ 1e-3로 조정
-        )
-        token_to_new_waypoint_array = sort_refined_trajs_by_first_xy_l2(
-            token_to_new_waypoint_array,
-            invalid_eps=0.0,  # 0.0: (0,0)도 진짜 근거리로 취급 / 필요시 1e-6 ~ 1e-3로 조정
-        )
-        # token_to_new_waypoint_array 의 각 values: (1, 11) -> (11,) 로 바꿔줌
-        for token in token_to_new_waypoint_array.keys():
-            token_to_new_waypoint_array[token] = token_to_new_waypoint_array[
-                token].reshape(-1)
-        # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
-        return token_to_future_traj_wrt_ego, token_to_refined_traj_wrt_ego, token_to_new_waypoint_array
+    def _get_new_local_waypoint_array_to_draw(
+            self,
+            updated_waypoint: Waypoint,
+            cur_ego_global_xyyaw: np.ndarray  # shape (3,)
+    ):
+        new_waypoint_array = waypoint_to_numpy10(updated_waypoint).reshape(
+            1, -1)  # (1, 10)
+        # new_local_waypoint_array: (1, 11)
+        new_local_waypoint_array = convert_absolute_quantities_to_relative(
+            new_waypoint_array,
+            cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)
+        # (1, 11) -> (11,)
+        new_local_waypoint_array = new_local_waypoint_array.reshape(-1)
+        return new_local_waypoint_array
+
+    def _get_token_to_np_traj_wrt_ego(
+            self,
+            model_inputs: AbstractModelFeature,
+            neighbor_token_dist_order: List[Optional[str]],  # len == agent_num
+    ) -> Tuple[Dict[str, np.ndarray], List[str]]:
+        """
+
+        Returns:
+            Dict[str, np.ndarray]: (token, (T, 4)) # ego 좌표계 기준 차량 중심의 값
+            List[str]: (token,) # self._diffusion_agents 의 토큰 리스트 (거리 오름차순) # len == valid diffusion agent num
+        """
+
+        # nuplan_extent/planning/training/modeling/models/world_model.py
+        # WorldModel.forward
+        # future_np_trajs_wrt_ego: (Pnn, 1+T, 4) # diffusion_agents 에서 생성하라는거만 생성햇음.
+        # ego와 거리 순으로 모든 agent가 들어있음. (생성 안했으면, 빈 값을 준다.)
+        future_np_trajs_wrt_ego: np.ndarray = self._model_loader.infer(
+            model_inputs).detach().cpu().numpy()
+        gen_slot_len = future_np_trajs_wrt_ego.shape[0]
+        # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
+        diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        for idx, token in enumerate(neighbor_token_dist_order):
+            if idx >= gen_slot_len:
+                break
+            np_traj_wrt_ego = future_np_trajs_wrt_ego[idx, 1:, :]  # (T, 4)
+            np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
+            if np.allclose(np_traj_sum, 0.0) or token is None:
+                continue
+            diff_token_to_np_gen_traj_wrt_ego[token] = np_traj_wrt_ego
+        ### 디버깅용 ###
+        self._draw_infos.diff_token_to_np_gen_traj_wrt_ego = diff_token_to_np_gen_traj_wrt_ego
+        diffusion_tokens_dist_order_1 = set(
+            diff_token_to_np_gen_traj_wrt_ego.keys())
+        diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
+            self._ego_anchor_state, self._diffusion_agents)
+        assert diffusion_tokens_dist_order_1 == set(
+            diffusion_tokens_dist_order), \
+            "diff_token_to_np_traj_wrt_ego의 토큰과 self._diffusion_agents의 토큰이 일치하지 않습니다."
+        ######
+        return diff_token_to_np_gen_traj_wrt_ego, diffusion_tokens_dist_order
+
+    def infer_model(
+        self,
+        model_input_key_to_value: Dict[str, AbstractModelFeature],
+        iteration: SimulationIteration,
+        next_iteration: SimulationIteration,
+        neighbor_token_dist_order: List[Optional[str]]  # len == agent_num
+    ) -> None:
+        model_inputs: AbstractModelFeature = model_input_key_to_value[
+            "world_model_feature"]
+        # diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] # (T, 4)
+        # diffusion_tokens_dist_order: List[str] # valid diffusion agent 토큰 리스트 (거리 오름차순)
+        (diff_token_to_np_gen_traj_wrt_ego,
+         diffusion_tokens_dist_order) = self._get_token_to_np_traj_wrt_ego(
+             model_inputs, neighbor_token_dist_order)
+
+        cur_ego_global_xyyaw = np.array([
+            self._ego_anchor_state.rear_axle.x,
+            self._ego_anchor_state.rear_axle.y,
+            self._ego_anchor_state.rear_axle.heading
+        ],
+                                        dtype=np.float64)  # shape (3,)
+        #  Dict[str, np.ndarray] # (token, (3,)) # 현재 시점의 위치/방향
+        diff_token_to_global_xyyaw = self._get_diff_token_to_cur_xyyaw(
+            diffusion_tokens_dist_order)
+
+        #  Dict[str, Deque[Agent]]
+        # Dict[str, Deque[Agent]]
+        diffusion_token_to_agent_history = get_token_to_history(
+            self.observation_buffer, iteration, diffusion_tokens_dist_order)
+        # (token, (len(history), 11))
+        ###### 디버깅용 ######
+        self._get_diff_token_to_np_history_to_draw(
+            diffusion_token_to_agent_history, cur_ego_global_xyyaw)
+
+        diff_token_to_interpol_traj = self._get_diff_token_to_interpol_traj_wrt_ego(
+            diff_token_to_np_gen_traj_wrt_ego, diff_token_to_global_xyyaw,
+            diffusion_token_to_agent_history, cur_ego_global_xyyaw)
+        self._update_diffusion_agents(diff_token_to_interpol_traj,
+                                      next_iteration, cur_ego_global_xyyaw)
 
     def _infer_model(self, features: FeaturesType) -> TargetsType:
         pass
