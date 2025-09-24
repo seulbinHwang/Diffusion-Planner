@@ -18,7 +18,6 @@ from nuplan.planning.simulation.trajectory.interpolated_trajectory import Interp
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 
 
-# nuplan/planning/script/config/common/model/raster_model.yaml
 class WorldModel(TorchModuleWrapper):
 
     def __init__(

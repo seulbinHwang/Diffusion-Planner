@@ -34,6 +34,7 @@ class WorldModelFeature(AbstractModelFeature):
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
     ego_future_gt_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
+    ############
 
     def to_feature_tensor(self) -> WorldModelFeature:
         """Convert numpy arrays to torch tensors."""

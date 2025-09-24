@@ -160,29 +160,28 @@ class Decoder(nn.Module):
         """
 
         # Extract ego & neighbor current states
-        near_current = inputs["neighbor_agents_past"][:, :self.
-                                                      _predicted_neighbor_num,
-                                                      -1, :4]  # [B, pnn, 4]
-        near_current_mask = torch.sum(torch.ne(near_current[..., :4], 0),
+        near_current_xyyaw = inputs[
+            "neighbor_agents_past"][:, :self._predicted_neighbor_num,
+                                    -1, :4]  # [B, pnn, 4]
+        near_current_mask = torch.sum(torch.ne(near_current_xyyaw[..., :4], 0),
                                       dim=-1) == 0  # [B, pnn]
         inputs["near_current_mask"] = near_current_mask
 
-        B, Pnn, _ = near_current.shape
-        assert Pnn <= (self._predicted_neighbor_num)
+        B, Pnn, _ = near_current_xyyaw.shape
+        assert Pnn == (self._predicted_neighbor_num)
         assert near_current_mask.shape[1] == Pnn
 
-        # === [FIX] cond_last_pos_norm가 없을 때도 안전하게 처리 ===
         if "cond_last_pos_norm" in inputs:
             # 길이(pnn_dyn)에 맞춰 잘라서 정합 보장
             cond_last_pos_norm = inputs[
                 "cond_last_pos_norm"]  #[:, :Pnn, :]  # [B, Pnn, 4]
         else:
             # NaN으로 채워서 'isfinite' 검사에 의해 자동 미적용되게 만든다.
-            cond_last_pos_norm = near_current.new_full((B, Pnn, 4),
-                                                       float('nan'))
+            cond_last_pos_norm = near_current_xyyaw.new_full((B, Pnn, 4),
+                                                             float('nan'))
 
         # ★ FIX: 이후 모든 사용을 안전하게 만들기 위해 dtype/device를 near_current에 정렬
-        cond_last_pos_norm = _cast_like(cond_last_pos_norm, near_current)
+        cond_last_pos_norm = _cast_like(cond_last_pos_norm, near_current_xyyaw)
 
         # Extract context encoding
         scene_encoding_token = encoder_outputs[
@@ -221,14 +220,15 @@ class Decoder(nn.Module):
         else:
             # === Inference ===
             # ★ FIX: 랜덤 초기 x_T를 near_current와 동일 dtype/device로 생성
-            noise = near_current.new_empty(
+            noise = near_current_xyyaw.new_empty(
                 (B, Pnn, self._future_len, 4)).normal_(mean=0.0, std=0.5)
+            # xT: (B, Pnn, (1+T)*4)
             xT = torch.cat(
                 [
-                    near_current[:, :, None, :],  # (B, Pnn, 1, 4)
+                    near_current_xyyaw[:, :, None, :],  # (B, Pnn, 1, 4)
                     noise  # (B, Pnn, T, 4)
                 ],
-                dim=2).reshape(B, Pnn, -1)  # (B, Pnn, (1+T)*4)
+                dim=2).reshape(B, Pnn, -1)
 
             # cond_last_pos_norm: [B, Pnn, 4] (이미 near_current와 dtype/device 일치)
             cond_last_pos = None
@@ -239,6 +239,7 @@ class Decoder(nn.Module):
                 cond_last_mask = torch.isfinite(cond_last_pos).all(
                     dim=-1)  # [B, Pnn]
             else:
+                # (B, Pnn) # True 이면 last pose 정보가 있다는 뜻
                 cond_last_mask = torch.zeros(B,
                                              Pnn,
                                              dtype=torch.bool,
@@ -246,7 +247,7 @@ class Decoder(nn.Module):
 
             def initial_state_constraint(xt, t, step):
                 xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
-                xt[:, :, 0, :] = near_current
+                xt[:, :, 0, :] = near_current_xyyaw
 
                 if cond_last_pos is not None and cond_last_mask.any().item():
                     last = xt[:, :, -1, :]  # (B, Pnn, 4)

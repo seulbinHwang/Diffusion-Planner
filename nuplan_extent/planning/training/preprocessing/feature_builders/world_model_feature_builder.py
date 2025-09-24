@@ -63,7 +63,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         neighbor_track_token = model_inputs["neighbor_track_token"]
         model_inputs.pop("neighbor_track_token")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model_inputs = convert_to_model_inputs(model_inputs,
+        model_inputs: Dict[str, torch.Tensor] = convert_to_model_inputs(model_inputs,
                                                device,
                                                squeeze=True)
         self.unnormalized_features = model_inputs.copy()
@@ -76,58 +76,11 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
         model_inputs = self.observation_normalizer(model_inputs)
         """
-    world_model_feature: Dict[str, numpy.ndarray] 가 아래와 같이 구성되어 있고, 이게 함수의 input으로 쓰일거야.
-        ego_agent_past: (time_len, 11)
-            - time_len: (2.0초 과거, 1.9초 과거 , ... 0.1초 과거, 현재) 21개
-            - 11: x , y, cos(yaw), sin(yaw), "vx, vy", length, width, one-hot (car, pedestrian, bicycle)
-                - current ego 차량 뒷축 좌표계  기준 값들임. 단위는 m, rad, m/s 
-                - 직사각형(+ 사각형의 중점에서 나오는 heading 방향선도 그리기) 그리기 
-                    - x, y, cos(yaw), sin(yaw) , length, width 로 
-                    - "fill_color": "#FFFFFF", "line_color": "#808080", "line_width": 2
-                    - 현재 위치만 속을 칠하고(fill_alpha=1.0) , 과거 위치는 속을 안채우기
-                - 실선 화살표 (속도): (vx, vy) # 크기와 상관없이 길이는 2으로 + 방향만 잘 그리기 
-                  - "line_color": "#808080", "line_width": 2 
-        neighbor_agents_past: (agent_num, time_len, 11)
-            - time_len: (2.0초 과거, 1.9초 과거 , ... 0.1초 과거, 현재) 21개
-            - 11: x, y, cos(yaw), sin(yaw), "vx, vy", length, width, one-hot (car, pedestrian, bicycle)
-                - current ego 차량 뒷축 좌표계  기준 값들임. 단위는 m, rad, m/s 
-                - 직사각형(+ 사각형의 중점에서 나오는 heading 방향선도 그리기) 그리기 
-                    - x, y, cos(yaw), sin(yaw) , length, width 로 
-                        "vehicles": {"fill_color": "#84E573", "fill_alpha": 0.5, "line_color": "#84E573", "line_width": 1},
-                        "pedestrians": {"fill_color": "#4D83E1", "fill_alpha": 0.5, "line_color": "#4D83E1", "line_width": 1},
-                        "bicycles": {"fill_color": "#FF4D4D", "fill_alpha": 0.5, "line_color": "#FF4D4D", "line_width": 1},
-                        - 현재 위치만 속을 칠하고(fill_alpha=0.5) , 과거 위치는 속을 안채우기
-                - 실선 화살표 (속도): (vx, vy) # 크기와 상관없이 길이는 2으로 + 방향만 잘 그리기 
-                        "vehicles": {"line_color": "#84E573", "line_width": 1},
-                        "pedestrians": {"line_color": "#4D83E1", "line_width": 1},
-                        "bicycles": {"line_color": "#FF4D4D", "line_width": 1},
-        ego_agent_next_11_dim: (interpol_num, 11)
-            - interpol_num: (0.1초 후, ... ) 0.1초 간격으로 interpol_num개
-            - 11: x, y, cos(yaw), sin(yaw), "vx, vy", length, width, one-hot (car, pedestrian, bicycle)
-            - current ego 차량 뒷축 좌표계  기준 값들임. 단위는 m, rad, m/s 
-                - 직사각형(+ 사각형의 중점에서 나오는 heading 방향선도 그리기) 그리기 
-                    - x, y, cos(yaw), sin(yaw) , length, width 로 
-                    - "fill_color": "#808080", "line_color": "#FFFFFF", "line_width": 2
-                    - 미래 위치는 속을 안채우기
-                - 실선 화살표 (속도): (vx, vy) # 크기와 상관없이 길이는 2으로 + 방향만 잘 그리기 
-                  - "line_color": "#00C8C8", "line_alpha": 0.8, "line_width": 2
-        ego_future_gt_11_dim: (future_len, 11)
-            - future_len: (0.1초 후, ... 8.0초 후) 0.1초 간격으로 80개
-            - 11: x, y, cos(yaw), sin(yaw), "vx, vy", length, width, one-hot (car, pedestrian, bicycle)
-            - current ego 차량 뒷축 좌표계  기준 값들임. 단위는 m, rad, m/s 
-                - 직사각형(+ 사각형의 중점에서 나오는 heading 방향선도 그리기) 그리기 
-                    - x, y, cos(yaw), sin(yaw) , length, width 로 
-                    - "fill_color": "#808080", "line_color": "#FFFFFF", "line_width": 1
-                    - 미래 위치는 속을 안채우기
-                - 실선 화살표 (속도): (vx, vy) # 크기와 상관없이 길이는 2으로 + 방향만 잘 그리기 
-                  - "line_color": "#00C8C8", "line_alpha": 0.8, "line_width": 2            
-        lanes: (lane_num, lane_len, 12)
-            - lane_num: 70개 (차선 개수)
-            - lane_len: 차선을 등간격으로 나눈 갯수
-            - 12: 
-            - LANE (차선의 실선): "line_color": "#2d3ea7" 실선
-            - BASELINE_PATHS(차선 실선과 차선 실선 사이의 중심 경로(centerline) ): "line_color": "#CBCBCB" 점선
+        input
+            - neighbor_track_token :  List[Optional[str]], (agent_num,)
+            - self._diffusion_vehicles_tokens: List[str], (valid_agent_num) maxlen=Pnn
         """
+
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)
             neighbor_agents_past=model_inputs[

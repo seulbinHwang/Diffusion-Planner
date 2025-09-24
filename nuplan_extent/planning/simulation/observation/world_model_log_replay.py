@@ -952,11 +952,9 @@ class WorldModelLogReplay(AbstractMLAgents):
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
             if np.allclose(future_traj_wrt_ego, 0.0):
                 raise ValueError("future_traj_wrt_ego 값이 전부 0. 입니다.")
-            self_history: Deque[Agent] = current_token_to_agent_history[
-                token]
+            self_history: Deque[Agent] = current_token_to_agent_history[token]
             agent_ = self_history[-1]
-            agent_center_xy, agent_yaw = self.get_npc_center_poses(
-                agent_)
+            agent_center_xy, agent_yaw = self.get_npc_center_poses(agent_)
             future_traj_wrt_npc_center = transform_trajectory(
                 future_traj_wrt_ego, ego_rear_axle_xy, ego_yaw, agent_center_xy,
                 agent_yaw)  # (T, 4)
