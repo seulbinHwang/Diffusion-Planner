@@ -28,6 +28,21 @@ from nuplan.planning.utils.serialization.to_scene import tracked_object_types
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
 
 
+BLACK = "#000000"
+PURPLE = "#E6E6FA"
+RED = "#D50000"
+ORANGE = "#FFA500"
+GREEN = "#008000"
+GRAY = "#808080"
+LIME = "#84E573"
+LIGHTBLUE = "#4D83E1"
+WHITE = "#FFFFFF"  # 미래 궤적 raw 예측 값
+PALE_CYAN = "#BFFFFF"  # 미래 궤적 refined 예측 값 # EGO Planner 궤적 값
+LIGHT_CYAN = "#80FFFF"  # 미래 궤적 refined state 값 # EGO Planner 궤적 next state 값
+BRIGHT_CYAN = "#40FFFF"  # 미래 궤적 GT 예측 값 (3 dim)
+CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim)
+
+
 class BokehAgentStates(NamedTuple):
     """Agent states in bokeh."""
 
@@ -521,15 +536,23 @@ class AgentStatePlot(BaseScenarioPlot):
                             category] = main_figure.multi_line(
                                 xs="prediction_xs",
                                 ys="prediction_ys",
-                                line_color="#00C8C8",
+                                line_color=PALE_CYAN,
                                 line_alpha=0.8,
                                 line_width=2,
                                 source=data,
                             )
+                        if category == "vehicles":
+                            line_color = LIME
+                        elif category == "pedestrians":
+                            line_color = LIGHTBLUE
+                        elif category == "bicycles":
+                            line_color = ORANGE
+                        else:
+                            line_color = GRAY
                         self.past_plots[category] = main_figure.multi_line(
                             xs="past_xs",
                             ys="past_ys",
-                            line_color="#FFC0CB",
+                            line_color=line_color,
                             line_alpha=0.8,
                             line_width=1,
                             source=data,

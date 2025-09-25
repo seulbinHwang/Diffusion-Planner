@@ -14,10 +14,6 @@ from dataclasses import fields as dataclass_fields
 
 import torch
 
-"""
-heading_line_scale
-arrow_length_m
-"""
 # nuplan/planning/script/builders/simulation_builder.py
 @dataclass
 class WorldModelFeature(AbstractModelFeature):
