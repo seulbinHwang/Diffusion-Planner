@@ -515,7 +515,7 @@ class Encoder(nn.Module):
         ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
         ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
         # (B ,future_len= 80, 11)
-        ego_future_full = inputs["planner_future_11_dim"]
+        planner_future_11_dim = inputs["planner_future_11_dim"]
         # agents
         # (B, A, V=21, D=11)
         neighbors = inputs["neighbor_agents_past"]
@@ -535,13 +535,13 @@ class Encoder(nn.Module):
         agent_route_lane_order = inputs["agent_route_lane_order"]
 
         B = neighbors.shape[0]
-        future_len: int = ego_future_full.shape[1]
+        future_len: int = planner_future_11_dim.shape[1]
         if self.training:
             # ---------------------- 1) M_i 샘플링 ---------------------- #
             prefix_lengths = self._sample_uniform_prefix_lengths(
                 batch_size=B,
                 max_future_len=future_len,
-                device=ego_future_full.device,
+                device=planner_future_11_dim.device,
             )  # (B,)
             known_mask = self._build_known_mask_from_lengths(
                 prefix_lengths,
@@ -549,11 +549,11 @@ class Encoder(nn.Module):
 
             # ---------------------- 2) 잘라 + 패딩 ---------------------- #
             ego_future_trajectory = self._truncate_and_pad_ego_future_for_encoder(
-                ego_future_full,
+                planner_future_11_dim,
                 known_mask)  # (B, future_len, 11)  길이 유지, 마스크는 내부에서 활용됨
         else:
             # TODO: "using" ego_agent_next_11_dim 도 해보자.
-            ego_future_trajectory = ego_future_full
+            ego_future_trajectory = planner_future_11_dim
             if ego_future_trajectory is None:
                 ego_future_trajectory = torch.zeros((B, future_len, 11),
                                                     device=ego_past.device,
