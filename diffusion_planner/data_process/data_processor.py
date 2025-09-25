@@ -52,7 +52,8 @@ class DataProcessor(object):
             f"Type caps exceed agent_num: {self.max_pedestrians}+{self.max_bicycles} > {self.num_agents}"
 
         self._radius = 100  # [m] query radius scope relative to the current pose.
-        self.all_car_token_to_rr_ids: Optional[Dict[str, Optional[List[str]]]] = None
+        self.all_car_token_to_rr_ids: Optional[Dict[str,
+                                                    Optional[List[str]]]] = None
         self._map_features = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
@@ -437,7 +438,7 @@ class DataProcessor(object):
                     neighbor_track_token=None)
         car_token_to_rr_ids: Dict[
             str, Optional[List[str]]] = self._get_car_token_to_rr_ids(
-            self.all_car_token_to_rr_ids, neighbor_track_token)
+                self.all_car_token_to_rr_ids, neighbor_track_token)
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,

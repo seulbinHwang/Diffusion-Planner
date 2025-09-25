@@ -700,6 +700,7 @@ def draw_lane_centerlines(
     lanes: Array,
     options: DrawingOptions,
     agent_route_lane_order: Optional[Array] = None,
+    agent_idx_candidates: Optional[List[int]] = None,
 ) -> None:
     """센터라인을 점선으로 그리거나, agent_route_lane_order가 주어지면 에이전트-차선 매핑을 텍스트로 표기한다.
 
@@ -744,42 +745,43 @@ def draw_lane_centerlines(
 
     # ────────────── (B) 텍스트 표기 모드 ──────────────
     if agent_route_lane_order is not None:
-        if (agent_route_lane_order.ndim != 2 or
-                agent_route_lane_order.shape[1] != lane_num):
-            raise ValueError(
-                "agent_route_lane_order의 shape는 (agent_num, lane_num) 이어야 하며 "
-                f"lane_num({lane_num})과 두 번째 축이 같아야 합니다. "
-                f"got {agent_route_lane_order.shape}")
-
-        vstep = 0.15 * 2.  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
+        if agent_idx_candidates is None:
+            draw_all = True
+        else:
+            draw_all = False
+        vstep = 0.3  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
 
         # 각 차선 lane_idx 순회
         for lane_idx in range(lane_num):
             lane_j = lanes[lane_idx]  # (lane_len, 12)
-            center = lane_j[:, 0:2]  # (lane_len, 2)
-            valid = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)  # (lane_len,)
+            lane_j_center = lane_j[:, 0:2]  # (lane_len, 2)
+            # (lane_len,)
+            lane_point_valid_mask = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)
 
             # 이 차선을 자신의 경로에 포함하는 모든 agent i와 그 rank
-            # (agent_num, lane_num),
+            # agent_route_lane_order: (agent_num, lane_num),
             ranks_j: Array = agent_route_lane_order[:, lane_idx]  # (agent_num,)
-            agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # (K,)
-            if agent_idxs.size == 0:
+            valid_agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # (K,)
+            if valid_agent_idxs.size == 0:
                 continue
 
             # 유효 포인트마다 텍스트 찍기
             # (여러 agent가 있으면 위로 살짝씩 띄워서 겹침 완화)
-            for p_idx in range(center.shape[0]):
-                if not valid[p_idx]:
+            for point_idx in range(lane_j_center.shape[0]):
+                if not lane_point_valid_mask[point_idx]:
                     continue
-                x, y = float(center[p_idx, 0]), float(center[p_idx, 1])
-
-                for k, i in enumerate(agent_idxs):
-                    rank_ij = int(ranks_j[int(i)])
-                    label = f"{int(i)}--{rank_ij}"  # "에이전트인덱스:해당차선랭크"
-                    label = f"{int(i)}"  # "에이전트인덱스"
+                point_x, point_y = float(lane_j_center[point_idx, 0]), float(
+                    lane_j_center[point_idx, 1])
+                for count, agent_idx in enumerate(valid_agent_idxs):
+                    if (not draw_all) and (agent_idx
+                                           not in agent_idx_candidates):
+                        continue
+                    rank_ij = int(ranks_j[int(agent_idx)])
+                    label = f"{int(agent_idx)}--{rank_ij}"  # "에이전트인덱스:해당차선랭크"
+                    # label = f"{int(agent_idx)}"  # "에이전트인덱스"
                     ax.text(
-                        x,
-                        y + vstep * k,  # 위로 살짝씩 쌓기
+                        point_x,
+                        point_y + vstep * count,  # 위로 살짝씩 쌓기
                         label,
                         color=options.LANE_route_agent_index_color,
                         fontsize=options.LANE_AGENT_index_fontsize,
@@ -1636,6 +1638,19 @@ def draw_neighbor_past_output(
         #     )
 
 
+def get_agent_idx_from_tokens(
+        token_candidates: List[str],
+        neighbor_track_token: Optional[List[Optional[str]]]) -> List[int]:
+    """token_candidates에 포함된 토큰을 가진 이웃 차량의 인덱스를 반환."""
+    agent_idx_candidates = []
+    if neighbor_track_token is None:
+        return agent_idx_candidates
+    for idx, token in enumerate(neighbor_track_token):
+        if token is not None and token in token_candidates:
+            agent_idx_candidates.append(idx)
+    return agent_idx_candidates
+
+
 def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
               draw_option: DrawingOptions):
     lanes = input_data.get("lanes")
@@ -1643,13 +1658,21 @@ def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
         draw_lane_boundaries(ax, lanes, draw_option)
     # agent_route_lane_order가 있으면 텍스트 표기 모드로 전환
     if draw_option.LANE_draw_lane_centerline:
+        """ 디버깅 용으로 작성해놓음
+        - token_candidates 에 route를 확인하고 싶은 agent의 token을 넣어주면 됨
+        - agent_idx_candidates 를 None으로 설정하면 -> 모든 차량에 대해서 text를 그리게 됨
+        """
+        token_candidates: List[str] = []
+        agent_idx_candidates: List[int] = get_agent_idx_from_tokens(
+            token_candidates, input_data.get("neighbor_track_token", None))
+
         draw_lane_centerlines(
             ax,
             lanes,
             draw_option,
             agent_route_lane_order=input_data.get(
                 "agent_route_lane_order", None),  #agent_K_route_lane_order,
-        )
+            agent_idx_candidates=agent_idx_candidates)
 
 
 def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
