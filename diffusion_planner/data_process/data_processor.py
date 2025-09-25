@@ -52,7 +52,7 @@ class DataProcessor(object):
             f"Type caps exceed agent_num: {self.max_pedestrians}+{self.max_bicycles} > {self.num_agents}"
 
         self._radius = 100  # [m] query radius scope relative to the current pose.
-
+        self.all_car_token_to_rr_ids: Optional[Dict[str, Optional[List[str]]]] = None
         self._map_features = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
@@ -302,6 +302,18 @@ class DataProcessor(object):
 
         return filtered_neighbor_agents_past, filtered_neighbor_agents_track_token
 
+    def _get_car_token_to_rr_ids(
+        self, all_car_token_to_rr_ids: Dict[str, Optional[List[str]]],
+        neighbor_track_token: List[Optional[str]]
+    ) -> Dict[str, Optional[List[str]]]:
+        car_token_to_rr_ids: Dict[str, Optional[List[str]]] = {}
+        for token in neighbor_track_token:
+            if token is None:
+                continue
+            if token in all_car_token_to_rr_ids:
+                car_token_to_rr_ids[token] = all_car_token_to_rr_ids[token]
+        return car_token_to_rr_ids
+
     # Use for inference
     def observation_adapter(self,
                             history_buffer,
@@ -417,9 +429,15 @@ class DataProcessor(object):
         sampled_past_observations = past_tracked_objects + [
             present_tracked_objects
         ]
+        if self.all_car_token_to_rr_ids is None:
+            self.all_car_token_to_rr_ids: Dict[
+                str, Optional[List[str]]] = get_npc_route_roadblock_ids(
+                    scenario,
+                    sampled_past_observations,
+                    neighbor_track_token=None)
         car_token_to_rr_ids: Dict[
-            str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                scenario, sampled_past_observations, neighbor_track_token)
+            str, Optional[List[str]]] = self._get_car_token_to_rr_ids(
+            self.all_car_token_to_rr_ids, neighbor_track_token)
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,
@@ -686,7 +704,7 @@ class DataProcessor(object):
                 "neighbor_future_gt_3_dim":
                     neighbor_future_gt_3_dim,  # (num_agents, future_len, 3) # DONE
             }
-                ############################################
+            ############################################
             # [ADD] 저장 전 안전 보정 (훈련용 npz)
             aro = vector_map.get("agent_route_lane_order", None)
             if isinstance(aro, np.ndarray) and aro.dtype != np.int64:

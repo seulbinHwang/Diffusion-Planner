@@ -56,7 +56,7 @@ from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajector
 def get_npc_route_roadblock_ids(
         scenario: NuPlanScenario,
         sampled_past_observations: List[TrackedObjects],
-        neighbor_track_token: List[Optional[str]],  # 길이 = agent_num
+        neighbor_track_token: Optional[List[Optional[str]]],  # 길이 = agent_num
 ) -> Dict[str, List[str]]:
     """
     get_future_tracked_objects를 이용해 한 번에 궤적을 수집하고,
@@ -69,10 +69,15 @@ def get_npc_route_roadblock_ids(
     horizon = 20.
     num_samples = int(horizon / 0.1)
     # 1) 에이전트별 StateSE2 리스트 수집
-    neighbor_track_token_set = set(
-        [str(t) for t in neighbor_track_token if t is not None])
-    if not neighbor_track_token_set:
-        return {}
+    if neighbor_track_token is None:
+        allow_all_token = True
+        neighbor_track_token_set = {}
+    else:
+        allow_all_token = False
+        neighbor_track_token_set = set(
+            [str(t) for t in neighbor_track_token if t is not None])
+        if not neighbor_track_token_set:
+            return {}
     trajectories: Dict[str, List[SimpleNamespace]] = defaultdict(list)
     first_pose: Dict[str, SimpleNamespace] = {}
     future_observations: List[TrackedObjects] = []
@@ -82,12 +87,14 @@ def get_npc_route_roadblock_ids(
     past_future_observations.extend(sampled_past_observations)
     past_future_observations.extend(future_observations)
     for tracked_objects in past_future_observations:
+        # tracked_objects: TrackedObjects
         for obj in tracked_objects:
-            # obj: TrackedObjects
+            # obj: TrackedObject
             if obj.tracked_object_type != TrackedObjectType.VEHICLE:
                 continue
             token = str(obj.track_token)
-            if token not in neighbor_track_token_set:
+            if (not allow_all_token) and (token
+                                          not in neighbor_track_token_set):
                 continue
             # heading은 실제로 사용하지 않지만, 넣어도 무방(여기서는 0.0 또는 obj.center.heading 가능)
             rear_axle_state = StateSE2(obj.center.x, obj.center.y,
@@ -358,28 +365,6 @@ def _select_token_and_ordered_npc_route_indices(
     from typing import List
 
     # ────────────── 보조 함수: 입력 검증 ──────────────
-    def _validate_inputs() -> Tuple[int, int]:
-        if neighbor_agents_current.ndim != 2 or neighbor_agents_current.shape[
-                1] < 2:
-            raise ValueError(
-                f"`neighbor_agents_current` shape가 올바르지 않습니다: {neighbor_agents_current.shape}"
-            )
-        agent_num = neighbor_agents_current.shape[0]
-        lane_num = int(vector_map_lanes.shape[0])
-
-        if len(neighbor_track_token) != agent_num:
-            raise ValueError(
-                "`neighbor_track_token` 길이와 `neighbor_agents_current`의 첫 축 크기가 다릅니다."
-            )
-        if vector_map_lanes.ndim != 3 or vector_map_lanes.shape[2] < 2:
-            raise ValueError(
-                f"`vector_map_lanes` shape가 올바르지 않습니다: {vector_map_lanes.shape}"
-            )
-        if not (0 < route_num <= lane_num):
-            raise ValueError(
-                f"`route_num`는 0 < route_num < lane_num 을 만족해야 합니다. "
-                f"(route_num={route_num}, lane_num={lane_num})")
-        return agent_num, lane_num
 
     # ────────────── 보조 함수: 각 에이전트 ↔ lane 최소거리 정렬 ──────────────
     def _lane_min_dist_order(lanes_xy: np.ndarray,
@@ -461,7 +446,8 @@ def _select_token_and_ordered_npc_route_indices(
         - 거리 계산은 lane 폴리라인의 모든 점과의 최소거리(유클리드) 기준.
     """
     # ────────────── 메인 ──────────────
-    agent_num, lane_num = _validate_inputs()
+    agent_num = neighbor_agents_current.shape[0]
+    lane_num = int(vector_map_lanes.shape[0])
     lanes_xy = vector_map_lanes[:, :, :2]  # (lane_num, P, 2)
 
     npc_route_indices: List[List[int]] = [
