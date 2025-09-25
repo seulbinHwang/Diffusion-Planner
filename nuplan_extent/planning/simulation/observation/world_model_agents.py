@@ -995,7 +995,7 @@ class WorldModelAgents(AbstractMLAgents):
             self._ego_anchor_state)
         ########## TO DRAW ##########
         diff_token_to_interp_np_traj_wrt_ego: Dict[str,
-                                                   np.ndarray] = {}  # (T, 11)
+                                                   np.ndarray] = {}  # (1+T, 11)
         #############################
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory] = {}
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
@@ -1032,8 +1032,8 @@ class WorldModelAgents(AbstractMLAgents):
         global_future_arrays = [
             waypoint_to_numpy10(wp) for wp in future_waypoints
         ]  # List[(10,)]
-        global_future_arrays = np.stack(global_future_arrays, axis=0)  # (T, 10)
-        # rel_future_arrays: (T, 11)
+        global_future_arrays = np.stack(global_future_arrays, axis=0)  # (1+T, 10)
+        # rel_future_arrays: (1+T, 11)
         rel_future_arrays = convert_absolute_quantities_to_relative(
             global_future_arrays,
             cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)

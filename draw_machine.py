@@ -12,6 +12,21 @@ Array = np.ndarray
 WorldModelFeature = Dict[str, Array]
 TokenTrajDict = Dict[str, Array]  # value: (future_len, 4) with [x, y, cos, sin]
 
+BLACK = "#000000"
+PURPLE = "#E6E6FA"
+RED = "#D50000"
+ORANGE = "#FFA500"
+GREEN = "#008000"
+GRAY = "#808080"
+CYAN = "#00FFFF"
+LIME = "#84E573"
+LIGHTBLUE = "#4D83E1"
+WHITE = "#FFFFFF"  # 미래 궤적 raw 예측 값
+PALE_CYAN = "#BFFFFF"  # 미래 궤적 refined 예측 값
+LIGHT_CYAN = "#80FFFF"  # 미래 궤적 refined state 값
+BRIGHT_CYAN = "#40FFFF"  # 미래 궤적 GT 예측 값 (3 dim)
+CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim)
+
 
 class DrawInfos:
 
@@ -36,7 +51,7 @@ class DrawInfos:
         interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
         """
         self.diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] = {
-        }  # (Future_len, 11)
+        }  # (1 + Future_len, 11)
         """
         interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
         """
@@ -66,8 +81,8 @@ def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
     return bool((abs(float(row3[0])) > eps) or (abs(float(row3[1])) > eps))
 
 
-def draw_neighbor_future_points(ax: plt.Axes, neighbor_future_gt_3_dim: Array,
-                                options: DrawingOptions) -> None:
+def draw_neighbor_future_gt_3_dim(ax: plt.Axes, neighbor_future_gt_3_dim: Array,
+                                  options: DrawingOptions) -> None:
     """neighbor_future_gt_3_dim (agent_num, future_len, 3=[x,y,yaw])를
     흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..agent_num-1)를 흰색으로 표기.
 
@@ -78,15 +93,13 @@ def draw_neighbor_future_points(ax: plt.Axes, neighbor_future_gt_3_dim: Array,
     """
     if neighbor_future_gt_3_dim is None or neighbor_future_gt_3_dim.size == 0:
         return
-    if neighbor_future_gt_3_dim.ndim != 3 or neighbor_future_gt_3_dim.shape[-1] != 3:
+    if neighbor_future_gt_3_dim.ndim != 3 or neighbor_future_gt_3_dim.shape[
+            -1] != 3:
         raise ValueError(
             "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
 
     eps = options.invalid_eps
     agent_num, future_len, _ = neighbor_future_gt_3_dim.shape
-    ms = options.neighbor_future_marker_size
-    text_d = options.agent_index_offset_m
-    text_color = options.future_agent_index_color
 
     for a in range(agent_num):
         traj = neighbor_future_gt_3_dim[a]  # (future_len, 3)
@@ -99,20 +112,20 @@ def draw_neighbor_future_points(ax: plt.Axes, neighbor_future_gt_3_dim: Array,
             ax.plot(x,
                     y,
                     marker='x',
-                    markersize=ms,
+                    markersize=options.NEI_future_gt_3_dim_marker_size,
                     linestyle='None',
-                    color="#FFFFFF",
+                    color=options.NEI_future_gt_3_dim_COLOR,
                     zorder=26)
 
         # 첫 점 라벨(유효할 때만)
         first = traj[0]
         if is_valid_future_row_xyyaw(first, eps):
             fx, fy = float(first[0]), float(first[1])
-            ax.text(fx + text_d,
-                    fy + text_d,
+            ax.text(fx + options.NEI_future_gt_3_dim_text_offset_m,
+                    fy + options.NEI_future_gt_3_dim_text_offset_m,
                     str(a),
-                    color=text_color,
-                    fontsize=options.agent_index_fontsize + 5,
+                    color=options.NEI_future_gt_3_dim_agent_index_color,
+                    fontsize=options.NEI_future_gt_3_dim_agent_index_fontsize,
                     ha='left',
                     va='bottom',
                     zorder=30)
@@ -129,11 +142,11 @@ class DrawingOptions:
 
     Attributes
     ----------
-    draw_ego_past : bool
+    EGO_draw_ego_past : bool
         ego_agent_past(21, 11) 시퀀스 렌더링 여부.
     draw_neighbor_past : bool
         neighbor_agents_past(agent_num, 21, 11) 시퀀스 렌더링 여부.
-    draw_ego_pred : bool
+    EGO_draw_ego_agent_next_11_dim : bool
         ego_agent_next_11_dim(interpol_num, 11) 예측 궤적 렌더링 여부.
     draw_ego_future_gt : bool
         planner_future_11_dim(80, 11) GT 미래 궤적 렌더링 여부.
@@ -141,7 +154,7 @@ class DrawingOptions:
         차선 좌/우 경계(LANE) 렌더링 여부(실선 #2d3ea7).
     draw_lane_centerline : bool
         차선 센터라인(BASELINE_PATHS) 점선 렌더링 여부(신호색상 반영).
-    draw_token_future_arrows : bool
+    DIFF_draw_neighbor_future_gen_traj : bool
         token_to_future_traj_wrt_ego의 각 시점 화살표(길이 고정 2 m) 렌더링 여부.
     draw_velocity_arrows_past_all : bool
         과거 시퀀스의 모든 타임스텝에서 속도 화살표를 그림(True) / 현재만 그림(False).
@@ -150,10 +163,10 @@ class DrawingOptions:
     draw_velocity_arrows_future_all : bool
         GT 미래 시퀀스 모든 스텝에서 속도 화살표 그림 여부.
 
-    arrow_length_m : float
+    COMMON_vel_arrow_len_m : float
         속도/방향 화살표의 고정 길이 [m]. 기본 2.0.
-    heading_line_scale : float
-        헤딩선 길이 비율(사각형 길이 * heading_line_scale).
+    COMMON_heading_line_scale : float
+        헤딩선 길이 비율(사각형 길이 * COMMON_heading_line_scale).
 
     background_color : str
         축/그림 배경색.
@@ -175,24 +188,16 @@ class DrawingOptions:
         - token: 앞 4차원이 모두 |value| ≤ invalid_eps 이면 invalid
     """
 
-    draw_ego_past: bool = True  # check
-    draw_neighbor_past: bool = True  # check
-    draw_ego_pred: bool = False  # check
     draw_ego_future_gt: bool = False  # check
-    draw_lane_boundaries: bool = True  # check
-    draw_lane_centerline: bool = False  # check
-    draw_token_future_arrows: bool = True
-    draw_neighbor_agents_future: bool = False
-    draw_token_refined: bool = False
 
     draw_velocity_arrows_past_all: bool = False  # check
     draw_velocity_arrows_pred_all: bool = False  # check
     draw_velocity_arrows_future_all: bool = False  # check
 
-    arrow_length_m: float = 5.0
-    heading_line_scale: float = 0.5
+    COMMON_vel_arrow_len_m: float = 5.0
+    COMMON_heading_line_scale: float = 0.5
 
-    background_color: str = "#121212"
+    background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (18.0, 18.0)
     dpi: int = 400
@@ -203,99 +208,141 @@ class DrawingOptions:
 
     agent_index_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
     agent_index_offset_m: float = 0.5  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
-    past_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 청록색
-    future_agent_index_color: str = "#808080"  # 번호 텍스트 색 # 회색
-    route_agent_index_color: str = "#00C8C8"  # 번호 텍스트 색 # 청록색
-    neighbor_future_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
-
-    # ── [추가] 토큰 미래 궤적 드로잉 모드 및 스타일 ─────────────────────
-    token_future_draw_mode: str = "point"  # 'arrow' 또는 'point'
-    token_future_point_marker: str = "o"
-    token_future_point_marker_size: float = 0.8
-    token_future_arrow_length_m: float = 1.0
+    past_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
 
     # 🔽 [추가] 토큰 시작 인덱스 텍스트 표기용 옵션
-    token_index_color: str = "#00C8C8"  # 청록색
+    token_index_color: str = CYAN  # 청록색
     token_index_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)
     token_index_fontsize: int = 5  # 기본은 에이전트 번호와 동일 크기
     # 🔽 새 옵션
     max_agents_to_draw: Optional[int] = None
+    ######## LANES ########
+    LANE_draw_lane_boundaries: bool = True  # check
+    LANE_draw_lane_centerline: bool = False  # check
+    LANE_draw_agent_route_lane_order: bool = False  # check
+    LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
+    LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
+    LANE_signal_colors = {
+        0: GREEN,  # 녹색(신호등 초록)
+        1: ORANGE,  # 노란색(신호등 노랑)
+        2: RED,  # 진한 빨간색(신호등 빨강)
+        3: GRAY,  # 회색(청회색)
+    }
+    ######### [EGO] ##############
+    ########### [EGO] PAST ##################
+    EGO_draw_ego_past: bool = True  # check
+    ##############################
+    ########### [EGO] FUTURE PLANNER ##################
+    EGO_draw_ego_agent_next_11_dim: bool = False  # check
+    ######################################
+
+    ######### [NEIGHBOR] #########
+    ########### [NEIGHBOR] PAST ##################
+    NEI_draw_neighbor_past: bool = True  # check
+    NEI_draw_velocity_arrow: bool = False  # check
+    NEI_draw_velocity_text: bool = False  # check
+    NEI_vel_text_y_offset: float = 0.5
+    NEI_vel_text_color = CYAN
+    NEI_vel_text_fontsize = 2
+
+    NEI_neighbor_style = {
+        "vehicles": {
+            "fill_color": LIME,  # 연두색(라임 그린)
+            "fill_alpha": 0.5,
+            "line_color": LIME,  # 연두색(라임 그린)
+            "line_width": 0.2,
+            "velocity_line_color": LIME,  # 연두색(라임 그린)
+            "velocity_line_width": 0.2,
+        },
+        "pedestrians": {
+            "fill_color": LIGHTBLUE,
+            "fill_alpha": 0.5,
+            "line_color": LIGHTBLUE,
+            "line_width": 0.2,
+            "velocity_line_color": LIGHTBLUE,
+            "velocity_line_width": 0.2,
+        },
+        "bicycles": {
+            "fill_color": ORANGE,
+            "fill_alpha": 0.5,
+            "line_color": ORANGE,
+            "line_width": 0.2,
+            "velocity_line_color": ORANGE,
+            "velocity_line_width": 0.2,
+        },
+    }
+    NEI_draw_past_token: bool = False
+    NEI_past_token_place_offset_m: float = 0.5
+    NEI_past_token_color: str = CYAN  # TODO
+    NEI_past_token_fontsize: int = 5
+    ########### [NEIGHBOR] PAST OUTPUT ##################
+    NEI_draw_neighbor_past_output = False
+    NEI_neighbor_past_output_style = {
+        "line_color": ORANGE,  # 주황색 # TODO
+        "line_width": 0.2,
+    }
+    NEI_draw_neighbor_past_output_vel = False
+    NEI_neighbor_past_output_vel_offset_m = 0.3
+    NEI_neighbor_past_output_vel_fontsize = 2
+    NEI_neighbor_past_output_token_fontsize = 2
+    ########################
+    ######### [NEIGHBOR] FUTURE GT #############
+    NEI_draw_neighbor_future_gt_3_dim: bool = False
+    NEI_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+    NEI_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
+    NEI_future_gt_3_dim_text_offset_m: float = 0.5  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
+    NEI_future_gt_3_dim_agent_index_color: str = BRIGHT_CYAN
+    NEI_future_gt_3_dim_agent_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
+    ######## [NEIGHBOR] FUTURE OUTPUT ##########
+    DIFF_draw_neighbor_future_gen_traj: bool = True
+    DIFF_future_gen_traj_mode: str = "point"  # 'arrow' 또는 'point'
+    DIFF_future_gen_traj_point_marker: str = "o"
+    DIFF_future_gen_traj_point_marker_size: float = 0.8
+    DIFF_future_gen_traj_arrow_len_m: float = 1.0
+    DIFF_future_gen_traj_style = {
+        "line_color": WHITE,  # 흰색
+        "line_width": 0.2,
+        "index_color": WHITE,  # 흰색
+    }
+    ########################
+    DIFF_draw_neighbor_future_gen_refined_traj: bool = False
+    DIFF_future_gen_refined_style = {
+        "line_color": PALE_CYAN,  # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": PALE_CYAN,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    DIFF_draw_future_gen_refined_velocity: bool = False
+    DIFF_future_gen_refined_velocity_offset_m: float = 0.3
+    DIFF_future_gen_refined_velocity_font_size = 2
+
+    DIFF_new_waypoint_style = {
+        "line_color": ORANGE,  # 주황색
+        "line_width": 0.2,
+    }
 
 
 # 스타일 사전
 EGO_PAST_STYLE = {
-    "fill_color": "#FFFFFF",  # 흰색
+    "fill_color": WHITE,  # 흰색
     "line_color": "#808080",  # 회색
     "line_width": 0.4,
     "fill_alpha_current": 1.0,
 }
 EGO_PRED_STYLE = {
-    "line_color": "#00C8C8",  # 청록색
+    "line_color": CYAN,  # 청록색
     "line_width": 0.4,
-    "velocity_line_color": "#00C8C8",  # 청록색(시안)
+    "velocity_line_color": CYAN,  # 청록색(시안)
     "velocity_line_alpha": 0.8,
     "velocity_line_width": 0.4,
 }
 EGO_FUTURE_GT_STYLE = {
-    "line_color": "#FFFFFF",  # 흰색
+    "line_color": WHITE,  # 흰색
     "line_width": 0.2,
-    "velocity_line_color": "#00C8C8",  # 청록색(시안)
+    "velocity_line_color": CYAN,  # 청록색(시안)
     "velocity_line_alpha": 0.8,
     "velocity_line_width": 0.4,
-}
-REFINED_FUTURE_STYLE = {
-    "line_color": "#FF4D4D",  #  빨간색(밝은 빨강)
-    "line_width": 0.2,
-    "velocity_line_color": "#FF4D4D",  #  빨간색(밝은 빨강)
-    "velocity_line_alpha": 0.8,
-    "velocity_line_width": 0.4,
-}
-NEIGHBOR_STYLE = {
-    "vehicles": {
-        "fill_color": "#84E573",  # 연두색(라임 그린)
-        "fill_alpha": 1.0,
-        "line_color": "#84E573",  # 연두색(라임 그린)
-        "line_width": 0.2,
-        "velocity_line_color": "#84E573",  # 연두색(라임 그린)
-        "velocity_line_width": 0.2,
-    },
-    "pedestrians": {
-        "fill_color": "#4D83E1",  # 파란색(밝은 파랑)
-        "fill_alpha": 1.0,
-        "line_color": "#4D83E1",  # 파란색(밝은 파랑)
-        "line_width": 0.2,
-        "velocity_line_color": "#4D83E1",  # 파란색(밝은 파랑)
-        "velocity_line_width": 0.2,
-    },
-    "bicycles": {
-        "fill_color": "#FF4D4D",  # 빨간색(밝은 빨강)
-        "fill_alpha": 1.0,
-        "line_color": "#FF4D4D",  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
-        "velocity_line_color": "#FF4D4D",  # 빨간색(밝은 빨강)
-        "velocity_line_width": 0.2,
-    },
-}
-LANE_BOUNDARY_COLOR = "#2d3ea7"  # 남색(인디고 계열)
-SIGNAL_COLORS = {
-    0: "#00C853",  # 녹색(신호등 초록)
-    1: "#FFD600",  # 노란색(신호등 노랑)
-    2: "#D50000",  # 진한 빨간색(신호등 빨강)
-    3: "#B0BEC5",  # 회색(청회색)
-}
-TOKEN_FUTURE_STYLE = {
-    "line_color": "#FFFFFF",  # 흰색
-    "line_width": 0.2,
-    "index_color": "#FFFFFF",  # 흰색
-}
-TOKEN_REFINED_STYLE = {
-    "line_color": "#FF4D4D",  # 흰색
-    "line_width": 0.2,
-}
-
-NEW_WAYPOINT_STYLE = {
-    "line_color": "#FFA500",  # 주황색
-    "line_width": 0.2,
 }
 
 # =============================================================================
@@ -319,7 +366,7 @@ def _clip_agents_first_k_from_data(
         max_agents_to_draw: None이면 원본 그대로. 정수면 앞쪽 K개로 슬라이스.
 
     Returns:
-        (neighbor_past_K, neighbor_future_K, route_order_K, K or None)
+        (neighbor_past_K, neighbor_future_K, agent_K_route_lane_order, K or None)
         - 각 요소는 해당 키가 없으면 None.
         - K는 실제로 적용된 개수(None이면 제한 없음).
     """
@@ -361,9 +408,10 @@ def _clip_agents_first_k_from_data(
 
     neighbor_past_K = _clip(input_data.get("neighbor_agents_past", None))
     neighbor_future_K = _clip(input_data.get("neighbor_future_gt_3_dim", None))
-    route_order_K = _clip(input_data.get("agent_route_lane_order", None))
+    agent_K_route_lane_order = _clip(
+        input_data.get("agent_route_lane_order", None))
 
-    return neighbor_past_K, neighbor_future_K, route_order_K, K
+    return neighbor_past_K, neighbor_future_K, agent_K_route_lane_order, K
 
 
 def oriented_box_corners(x: float, y: float, cos_yaw: float, sin_yaw: float,
@@ -487,8 +535,9 @@ def is_valid_token_row(row4: Array, eps: float) -> bool:
 def collect_valid_xy_for_bounds(
     world_model_feature: WorldModelFeature,
     options: DrawingOptions,
-    token_to_future_traj_wrt_ego: Optional[TokenTrajDict] = None,
-    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]] = None,
+    diff_token_to_np_gen_traj_wrt_ego: Optional[TokenTrajDict] = None,
+    diff_token_to_interp_np_traj_wrt_ego: Optional[Dict[str,
+                                                        np.ndarray]] = None,
 ) -> Tuple[List[float], List[float]]:
     """모든 요소에서 valid (x,y)만 모아 bounds 계산에 사용."""
     eps = options.invalid_eps
@@ -537,8 +586,8 @@ def collect_valid_xy_for_bounds(
             ys.extend(xy[:, 1].tolist())
 
     # tokens
-    if token_to_future_traj_wrt_ego:
-        for _, arr in token_to_future_traj_wrt_ego.items():
+    if diff_token_to_np_gen_traj_wrt_ego:
+        for _, arr in diff_token_to_np_gen_traj_wrt_ego.items():
             if arr is None or arr.size == 0:
                 continue
             if arr.shape[-1] != 4:
@@ -565,8 +614,8 @@ def collect_valid_xy_for_bounds(
             ys.extend(xy[:, 1].tolist())
 
     # [Add] refined 토큰(각 row 11,)에서도 valid (x, y) 수집
-    if token_to_refined_traj_wrt_ego:
-        for _, arr in token_to_refined_traj_wrt_ego.items():
+    if diff_token_to_interp_np_traj_wrt_ego:
+        for _, arr in diff_token_to_interp_np_traj_wrt_ego.items():
             if arr is None or arr.size == 0:
                 continue
             if arr.ndim != 2 or arr.shape[1] != 11:
@@ -588,7 +637,10 @@ def collect_valid_xy_for_bounds(
 
 def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
                          options: DrawingOptions) -> None:
-    """좌/우 차선 경계를 실선으로 그림(양 끝점 모두 valid일 때만 선분을 그림)."""
+    """좌/우 차선 경계를 실선으로 그림(양 끝점 모두 valid일 때만 선분을 그림).
+
+    (lane_num, lane_len, 12)
+    """
     if lanes is None or lanes.size == 0:
         return
 
@@ -611,11 +663,11 @@ def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
             r0 = center[j] + right_vec[j]
             r1 = center[j + 1] + right_vec[j + 1]
             ax.plot([l0[0], l1[0]], [l0[1], l1[1]],
-                    color=LANE_BOUNDARY_COLOR,
+                    color=options.LANE_lane_boundary_color,
                     linewidth=1.0,
                     zorder=1)
             ax.plot([r0[0], r1[0]], [r0[1], r1[1]],
-                    color=LANE_BOUNDARY_COLOR,
+                    color=options.LANE_lane_boundary_color,
                     linewidth=1.0,
                     zorder=1)
 
@@ -662,7 +714,8 @@ def draw_lane_centerlines(
     """
     if lanes is None or lanes.size == 0:
         return
-
+    if options.LANE_draw_agent_route_lane_order == False:
+        agent_route_lane_order = None
     eps = options.invalid_eps
     lane_num = lanes.shape[0]
 
@@ -678,14 +731,15 @@ def draw_lane_centerlines(
         base_fs = max(1, options.agent_index_fontsize - 1)  # 조금 작게
         vstep = 0.15 * 2.  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
 
-        # 각 차선 j 순회
-        for j in range(lane_num):
-            lane_j = lanes[j]  # (lane_len, 12)
+        # 각 차선 lane_idx 순회
+        for lane_idx in range(lane_num):
+            lane_j = lanes[lane_idx]  # (lane_len, 12)
             center = lane_j[:, 0:2]  # (lane_len, 2)
             valid = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)  # (lane_len,)
 
             # 이 차선을 자신의 경로에 포함하는 모든 agent i와 그 rank
-            ranks_j: Array = agent_route_lane_order[:, j]  # (agent_num,)
+            # (agent_num, lane_num),
+            ranks_j: Array = agent_route_lane_order[:, lane_idx]  # (agent_num,)
             agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # (K,)
             if agent_idxs.size == 0:
                 continue
@@ -705,7 +759,7 @@ def draw_lane_centerlines(
                         x,
                         y + vstep * k,  # 위로 살짝씩 쌓기
                         label,
-                        color=options.route_agent_index_color,
+                        color=options.LANE_route_agent_index_color,
                         fontsize=base_fs,
                         ha="center",
                         va="bottom",
@@ -727,7 +781,7 @@ def draw_lane_centerlines(
             if not (valid[j] and valid[j + 1]):
                 continue
             c0, c1 = center[j], center[j + 1]
-            color = SIGNAL_COLORS.get(int(state_idx[j]), "#B0BEC5")
+            color = options.LANE_signal_colors.get(int(state_idx[j]), GRAY)
             ax.plot([c0[0], c1[0]], [c0[1], c1[1]],
                     color=color,
                     linewidth=1.2,
@@ -758,16 +812,18 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
             vx, vy = float(row[4]), float(row[5])
             W, L = float(row[6]), float(row[7])
             cls = infer_agent_class(row[8:11])
-            st = NEIGHBOR_STYLE[cls]
+            neighbor_cls_style = options.NEI_neighbor_style[cls]
 
-            fill_color = st["fill_color"] if t == current_t else None
-            fill_alpha = st["fill_alpha"] if t == current_t else None
+            fill_color = neighbor_cls_style[
+                "fill_color"] if t == current_t else None
+            fill_alpha = neighbor_cls_style[
+                "fill_alpha"] if t == current_t else None
 
             corners = oriented_box_corners(x, y, c, s, L, W)
             add_polygon(ax,
                         corners,
-                        edge_color=st["line_color"],
-                        line_width=st["line_width"],
+                        edge_color=neighbor_cls_style["line_color"],
+                        line_width=neighbor_cls_style["line_width"],
                         fill_color=fill_color,
                         fill_alpha=fill_alpha,
                         zorder=5 if t == current_t else 4)
@@ -776,21 +832,23 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
                              y,
                              c,
                              s,
-                             nominal_length=L * options.heading_line_scale,
-                             color=st["line_color"],
-                             line_width=st["line_width"],
+                             nominal_length=L *
+                             options.COMMON_heading_line_scale,
+                             color=neighbor_cls_style["line_color"],
+                             line_width=neighbor_cls_style["line_width"],
                              zorder=6 if t == current_t else 4)
-            if options.draw_velocity_arrows_past_all or t == current_t:
-                add_velocity_arrow(ax,
-                                   x,
-                                   y,
-                                   vx,
-                                   vy,
-                                   length_m=options.arrow_length_m,
-                                   line_color=st["velocity_line_color"],
-                                   line_width=st["velocity_line_width"],
-                                   zorder=7 if t == current_t else 4)
-            if options.draw_velocity_arrows_past_all:
+            if options.NEI_draw_velocity_arrow or t == current_t:
+                add_velocity_arrow(
+                    ax,
+                    x,
+                    y,
+                    vx,
+                    vy,
+                    length_m=options.COMMON_vel_arrow_len_m,
+                    line_color=neighbor_cls_style["velocity_line_color"],
+                    line_width=neighbor_cls_style["velocity_line_width"],
+                    zorder=7 if t == current_t else 4)
+            if options.NEI_draw_velocity_text:
                 if t % 2 == 0:
                     offset = 2
                 else:
@@ -799,10 +857,10 @@ def draw_neighbor_past(ax: plt.Axes, neighbor_agents_past: Array,
                 speed_kmh = float(np.hypot(vx, vy)) * 3.6
                 ax.text(
                     x,  # 점 위쪽에 표기
-                    y + options.agent_index_offset_m * offset,
+                    y + options.NEI_vel_text_y_offset * offset,
                     f"{speed_kmh:.1f}",
-                    color=options.past_agent_index_color,
-                    fontsize=2,  #options.agent_index_fontsize,
+                    color=options.NEI_vel_text_color,
+                    fontsize=options.NEI_vel_text_fontsize,
                     ha="center",
                     va="bottom",
                     zorder=30,
@@ -826,8 +884,6 @@ def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
     eps = options.invalid_eps
     agent_num, time_len, feat_dim = neighbor_agents_past.shape
     current_t = time_len - 1
-    text_d = options.agent_index_offset_m
-    text_color = options.past_agent_index_color
 
     for a in range(agent_num):
         track_token = neighbor_track_token[a]
@@ -836,14 +892,14 @@ def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
             assert track_token is None
             continue
         x, y = float(row[0]), float(row[1])
-        # ax.text(x + text_d,
-        #         y + text_d,
-        #         str(track_token)[:5],
-        #         color=text_color,
-        #         fontsize=options.agent_index_fontsize,
-        #         ha='left',
-        #         va='bottom',
-        #         zorder=30)
+        ax.text(x + options.NEI_past_token_place_offset_m,
+                y + options.NEI_past_token_place_offset_m,
+                str(track_token)[:5],
+                color=options.NEI_past_token_color,
+                fontsize=options.NEI_past_token_fontsize,
+                ha='left',
+                va='bottom',
+                zorder=30)
 
 
 def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
@@ -884,7 +940,7 @@ def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
                          y,
                          c,
                          s,
-                         nominal_length=L * options.heading_line_scale,
+                         nominal_length=L * options.COMMON_heading_line_scale,
                          color=EGO_PAST_STYLE["line_color"],
                          line_width=EGO_PAST_STYLE["line_width"],
                          zorder=21 if t == current_t else 9)
@@ -894,14 +950,14 @@ def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
                                y,
                                vx,
                                vy,
-                               length_m=options.arrow_length_m,
+                               length_m=options.COMMON_vel_arrow_len_m,
                                line_color=EGO_PAST_STYLE["line_color"],
                                line_width=EGO_PAST_STYLE["line_width"],
                                zorder=22 if t == current_t else 9)
 
 
-def draw_ego_predicted(ax: plt.Axes, ego_agent_next_11_dim: Array,
-                       options: DrawingOptions) -> None:
+def draw_ego_agent_next_11_dim(ax: plt.Axes, ego_agent_next_11_dim: Array,
+                               options: DrawingOptions) -> None:
     """이고 차량 **예측** 시퀀스를 그림(미래 위치는 채우지 않음). invalid 스텝은 스킵."""
     if ego_agent_next_11_dim is None or ego_agent_next_11_dim.size == 0:
         return
@@ -933,7 +989,7 @@ def draw_ego_predicted(ax: plt.Axes, ego_agent_next_11_dim: Array,
                          y,
                          c,
                          s,
-                         nominal_length=L * options.heading_line_scale,
+                         nominal_length=L * options.COMMON_heading_line_scale,
                          color=EGO_PRED_STYLE["line_color"],
                          line_width=EGO_PRED_STYLE["line_width"],
                          zorder=26)
@@ -943,7 +999,7 @@ def draw_ego_predicted(ax: plt.Axes, ego_agent_next_11_dim: Array,
                                y,
                                vx,
                                vy,
-                               length_m=options.arrow_length_m,
+                               length_m=options.COMMON_vel_arrow_len_m,
                                line_color=EGO_PRED_STYLE["velocity_line_color"],
                                line_width=EGO_PRED_STYLE["velocity_line_width"],
                                line_alpha=EGO_PRED_STYLE["velocity_line_alpha"],
@@ -983,7 +1039,7 @@ def draw_ego_future_gt(ax: plt.Axes, planner_future_11_dim: Array,
                          y,
                          c,
                          s,
-                         nominal_length=L * options.heading_line_scale,
+                         nominal_length=L * options.COMMON_heading_line_scale,
                          color=EGO_FUTURE_GT_STYLE["line_color"],
                          line_width=EGO_FUTURE_GT_STYLE["line_width"],
                          zorder=24)
@@ -994,7 +1050,7 @@ def draw_ego_future_gt(ax: plt.Axes, planner_future_11_dim: Array,
                 y,
                 vx,
                 vy,
-                length_m=options.arrow_length_m,
+                length_m=options.COMMON_vel_arrow_len_m,
                 line_color=EGO_FUTURE_GT_STYLE["velocity_line_color"],
                 line_width=EGO_FUTURE_GT_STYLE["velocity_line_width"],
                 line_alpha=EGO_FUTURE_GT_STYLE["velocity_line_alpha"],
@@ -1002,54 +1058,47 @@ def draw_ego_future_gt(ax: plt.Axes, planner_future_11_dim: Array,
 
 
 # [Add]
-def draw_token_refined_trajectories(
+def draw_neighbor_future_gen_refined_traj(
     ax: plt.Axes,
-    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]],
+    diff_token_to_interp_np_traj_wrt_ego: Optional[Dict[str, np.ndarray]],
     options: DrawingOptions,
-    token_to_new_waypoint_array: Optional[Dict[str, np.ndarray]] = None,
+    diff_token_to_next_wp_wrt_ego: Optional[Dict[str, np.ndarray]],
 ) -> None:
     """토큰별 refined 궤적(연속 다스텝)과 **신규 waypoint(단일 11차원)**를 함께 그린다.
 
-    - refined: REFINED_FUTURE_STYLE(빨강)로 연속 박스 + 첫 유효 포인트에 idx(빨강, 아래쪽 오프셋)
-    - new waypoint: NEW_WAYPOINT_STYLE(주황) 테두리 박스 + idx(주황, 오른쪽 오프셋)
+    - refined: DIFF_future_gen_refined_style(빨강)로 연속 박스 + 첫 유효 포인트에 idx(빨강, 아래쪽 오프셋)
+    - new waypoint: options.DIFF_new_waypoint_style(주황) 테두리 박스 + idx(주황, 오른쪽 오프셋)
 
     Args:
         ax: Matplotlib 축.
-        token_to_refined_traj_wrt_ego: Dict[str, np.ndarray] | None
+        diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] | None
             각 value: shape = (1 + future_len, 11)
             row(11,) = [x, y, cos, sin, vx, vy, length, width, onehot(3,)]
         options: 렌더링 옵션.
-        token_to_new_waypoint_array: Dict[str, np.ndarray] | None
+        diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] | None
             각 value: shape = (11,) (단일 스텝)
     """
-    if not token_to_refined_traj_wrt_ego and not token_to_new_waypoint_array:
+    if not diff_token_to_interp_np_traj_wrt_ego and not diff_token_to_next_wp_wrt_ego:
         return
 
     eps = options.invalid_eps
 
     # 표시할 토큰 순서: refined의 key 순서 우선, new_waypoint에만 있는 토큰은 뒤에 추가
     ordered_tokens: List[str] = []
-    if token_to_refined_traj_wrt_ego:
-        ordered_tokens.extend(list(token_to_refined_traj_wrt_ego.keys()))
-    if token_to_new_waypoint_array:
-        for k in token_to_new_waypoint_array.keys():
-            if k not in ordered_tokens:
-                ordered_tokens.append(k)
+    if diff_token_to_interp_np_traj_wrt_ego:
+        ordered_tokens.extend(list(diff_token_to_interp_np_traj_wrt_ego.keys()))
 
     for idx, token in enumerate(ordered_tokens):
         # ── (A) refined 연속 궤적(빨강) ───────────────────────────────
-        if token_to_refined_traj_wrt_ego and (token
-                                              in token_to_refined_traj_wrt_ego):
-            arr = token_to_refined_traj_wrt_ego[token]
-            if arr is not None and arr.size > 0:
-                if arr.ndim != 2 or arr.shape[1] != 11:
-                    raise ValueError(
-                        "token_to_refined_traj_wrt_ego의 각 value는 (1 + future_len, 11) 이어야 합니다."
-                    )
-                seq_len = arr.shape[0]
+        if diff_token_to_interp_np_traj_wrt_ego and (
+                token in diff_token_to_interp_np_traj_wrt_ego):
+            interp_np_traj = diff_token_to_interp_np_traj_wrt_ego[
+                token]  # (1+future_len, 11)
+            if interp_np_traj is not None and interp_np_traj.size > 0:
+                seq_len = interp_np_traj.shape[0]
                 label_drawn = False
                 for t in range(seq_len):
-                    row = arr[t]  # (11,)
+                    row = interp_np_traj[t]  # (11,)
                     if not is_valid_agent_row(row, eps):
                         continue
                     x, y = float(row[0]), float(row[1])
@@ -1061,8 +1110,10 @@ def draw_token_refined_trajectories(
                     add_polygon(
                         ax,
                         corners,
-                        edge_color=REFINED_FUTURE_STYLE["line_color"],
-                        line_width=REFINED_FUTURE_STYLE["line_width"],
+                        edge_color=options.
+                        DIFF_future_gen_refined_style["line_color"],
+                        line_width=options.
+                        DIFF_future_gen_refined_style["line_width"],
                         fill_color=None,
                         fill_alpha=None,
                         zorder=24,
@@ -1073,25 +1124,26 @@ def draw_token_refined_trajectories(
                         y,
                         c,
                         s,
-                        nominal_length=L * options.heading_line_scale,
-                        color=REFINED_FUTURE_STYLE["line_color"],
-                        line_width=REFINED_FUTURE_STYLE["line_width"],
+                        nominal_length=L * options.COMMON_heading_line_scale,
+                        color=options.
+                        DIFF_future_gen_refined_style["line_color"],
+                        line_width=options.
+                        DIFF_future_gen_refined_style["line_width"],
                         zorder=24,
                     )
-                    if options.draw_velocity_arrows_future_all:
+                    if options.DIFF_draw_future_gen_refined_velocity:
                         # add_velocity_arrow(
                         #     ax,
                         #     x,
                         #     y,
                         #     vx,
                         #     vy,
-                        #     length_m=options.arrow_length_m,
-                        #     line_color=REFINED_FUTURE_STYLE["velocity_line_color"],
-                        #     line_width=REFINED_FUTURE_STYLE["velocity_line_width"],
-                        #     line_alpha=REFINED_FUTURE_STYLE["velocity_line_alpha"],
+                        #     length_m=options.COMMON_vel_arrow_len_m,
+                        #     line_color=options.DIFF_future_gen_refined_style["velocity_line_color"],
+                        #     line_width=options.DIFF_future_gen_refined_style["velocity_line_width"],
+                        #     line_alpha=options.DIFF_future_gen_refined_style["velocity_line_alpha"],
                         #     zorder=24,
                         # )
-                        # [추가] 속도 크기 텍스트(km/h) - refined 모든 지점 (색: #FF4D4D)
                         speed_kmh = float(np.hypot(vx, vy)) * 3.6
                         if t % 2 == 0:
                             offset = 5
@@ -1099,11 +1151,14 @@ def draw_token_refined_trajectories(
                             offset = 3
                         ax.text(
                             x,
-                            y + options.token_index_offset_m * offset,
+                            y +
+                            options.DIFF_future_gen_refined_velocity_offset_m *
+                            offset,
                             f"{speed_kmh:.1f}",
-                            color=REFINED_FUTURE_STYLE[
-                                "line_color"],  # "#FF4D4D"
-                            fontsize=2,  #options.token_index_fontsize,
+                            color=options.
+                            DIFF_future_gen_refined_style["line_color"],
+                            fontsize=options.
+                            DIFF_future_gen_refined_velocity_font_size,
                             ha="center",
                             va="bottom",
                             zorder=25,
@@ -1115,8 +1170,8 @@ def draw_token_refined_trajectories(
                     #         x,
                     #         y - options.token_index_offset_m,
                     #         str(token)[:5],
-                    #         color=REFINED_FUTURE_STYLE["line_color"],
-                    #         fontsize=options.token_index_fontsize,
+                    #         color=options.DIFF_future_gen_refined_style["line_color"],
+                    #         fontsize=options.DIFF_future_gen_refined_velocity_font_size,
                     #         ha="center",
                     #         va="top",
                     #         zorder=25,
@@ -1124,9 +1179,9 @@ def draw_token_refined_trajectories(
                     #     label_drawn = True
 
         # ── (B) 신규 waypoint(주황) ─────────────────────────────────
-        if token_to_new_waypoint_array and (token
-                                            in token_to_new_waypoint_array):
-            wp = token_to_new_waypoint_array[token]  # (11,)
+        if diff_token_to_next_wp_wrt_ego and (token
+                                              in diff_token_to_next_wp_wrt_ego):
+            wp = diff_token_to_next_wp_wrt_ego[token]  # (11,)
             if wp is None:
                 continue
             wp = np.asarray(wp)
@@ -1150,8 +1205,8 @@ def draw_token_refined_trajectories(
             add_polygon(
                 ax,
                 corners_wp,
-                edge_color=NEW_WAYPOINT_STYLE["line_color"],
-                line_width=NEW_WAYPOINT_STYLE["line_width"],
+                edge_color=options.DIFF_new_waypoint_style["line_color"],
+                line_width=options.DIFF_new_waypoint_style["line_width"],
                 fill_color=None,
                 fill_alpha=None,
                 zorder=28,  # refined(24)보다 위
@@ -1162,21 +1217,21 @@ def draw_token_refined_trajectories(
                 y,
                 c,
                 s,
-                nominal_length=L * options.heading_line_scale,
-                color=NEW_WAYPOINT_STYLE["line_color"],
-                line_width=NEW_WAYPOINT_STYLE["line_width"],
+                nominal_length=L * options.COMMON_heading_line_scale,
+                color=options.DIFF_new_waypoint_style["line_color"],
+                line_width=options.DIFF_new_waypoint_style["line_width"],
                 zorder=28,
             )
-            if options.draw_velocity_arrows_future_all:
+            if options.DIFF_draw_future_gen_refined_velocity:
                 add_velocity_arrow(
                     ax,
                     x,
                     y,
                     vx,
                     vy,
-                    length_m=options.arrow_length_m,
-                    line_color=NEW_WAYPOINT_STYLE["line_color"],
-                    line_width=NEW_WAYPOINT_STYLE["line_width"],
+                    length_m=options.COMMON_vel_arrow_len_m,
+                    line_color=options.DIFF_new_waypoint_style["line_color"],
+                    line_width=options.DIFF_new_waypoint_style["line_width"],
                     line_alpha=1.0,
                     zorder=28,
                 )
@@ -1186,8 +1241,8 @@ def draw_token_refined_trajectories(
                     x,
                     y + options.token_index_offset_m,
                     f"{speed_kmh:.1f}",
-                    color=NEW_WAYPOINT_STYLE["line_color"],
-                    fontsize=options.token_index_fontsize,
+                    color=options.DIFF_new_waypoint_style["line_color"],
+                    fontsize=options.DIFF_future_gen_refined_velocity_font_size,
                     ha="center",
                     va="bottom",
                     zorder=29,
@@ -1198,8 +1253,8 @@ def draw_token_refined_trajectories(
             #     x + options.token_index_offset_m,
             #     y,
             #     str(token)[:5],
-            #     color=NEW_WAYPOINT_STYLE["line_color"],
-            #     fontsize=options.token_index_fontsize,
+            #     color=options.DIFF_new_waypoint_style["line_color"],
+            #     fontsize=options.DIFF_future_gen_refined_velocity_font_size,
             #     ha="left",
             #     va="center",
             #     zorder=29,
@@ -1209,9 +1264,9 @@ def draw_token_refined_trajectories(
 from typing import Optional, Literal
 
 
-def draw_token_future_arrows(
+def draw_neighbor_future_gen_traj(
     ax: plt.Axes,
-    token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
+    diff_token_to_np_gen_traj_wrt_ego: Optional[TokenTrajDict],
     options: DrawingOptions,
     draw_mode: Optional[Literal["arrow", "point"]] = None,
 ) -> None:
@@ -1219,53 +1274,47 @@ def draw_token_future_arrows(
 
     Args:
         ax: Matplotlib 축.
-        token_to_future_traj_wrt_ego: Dict[str, np.ndarray] | None
+        diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] | None
             각 value: shape (future_len, 4) = [x, y, cos(yaw), sin(yaw)]
             - invalid 규칙: 4값 모두 0(±eps) → 스킵
         options: DrawingOptions
-            - token_future_draw_mode: 'arrow' | 'point'
-            - token_future_point_marker, token_future_point_marker_size
-            - token_future_arrow_length_m
+            - DIFF_future_gen_traj_mode: 'arrow' | 'point'
+            - DIFF_future_gen_traj_point_marker, DIFF_future_gen_traj_point_marker_size
+            - DIFF_future_gen_traj_arrow_len_m
         draw_mode: Optional['arrow' | 'point']
-            - 우선순위: draw_mode 인자(있으면) > options.token_future_draw_mode(없으면 'arrow')
+            - 우선순위: draw_mode 인자(있으면) > options.DIFF_future_gen_traj_mode(없으면 'arrow')
 
     동작:
         - 'arrow' 모드:
-            (x,y)에서 (cos,sin) 방향으로 고정 길이(options.token_future_arrow_length_m) 화살표
+            (x,y)에서 (cos,sin) 방향으로 고정 길이(options.DIFF_future_gen_traj_arrow_len_m) 화살표
         - 'point' 모드:
             (x,y) 위치에 포인트만 표시(방향 미사용)
 
     Note:
         - t==0 (각 토큰의 첫 포인트)에는 토큰 문자열을 살짝 아래(y-오프셋)에 표시.
     """
-    if not token_to_future_traj_wrt_ego:
+    if not diff_token_to_np_gen_traj_wrt_ego:
         return
 
-    # 모드 결정 (인자 > 옵션 > 기본값 'arrow')
-    mode = (draw_mode or
-            getattr(options, "token_future_draw_mode", "arrow")).lower()
+    mode = options.DIFF_future_gen_traj_mode
     if mode not in {"arrow", "point"}:
         raise ValueError(
             f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point'.")
 
     eps = options.invalid_eps
-    point_marker = getattr(options, "token_future_point_marker", "o")
-    point_ms = float(getattr(options, "token_future_point_marker_size", 0.8))
-    arrow_len = float(getattr(options, "token_future_arrow_length_m", 1.0))
-
     # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
-    for idx, (token,
-              arr) in enumerate(token_to_future_traj_wrt_ego.items()):  # [ADD]
-        if arr is None or arr.size == 0:
+    for idx, (token, np_gen_traj_wrt_ego) in enumerate(
+            diff_token_to_np_gen_traj_wrt_ego.items()):  # [ADD]
+        if np_gen_traj_wrt_ego is None or np_gen_traj_wrt_ego.size == 0:
             continue
-        if arr.ndim != 2 or arr.shape[1] != 4:
+        if np_gen_traj_wrt_ego.ndim != 2 or np_gen_traj_wrt_ego.shape[1] != 4:
             raise ValueError(
                 "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
             )
 
-        future_len = arr.shape[0]
+        future_len = np_gen_traj_wrt_ego.shape[0]
         for t in range(future_len):
-            row = arr[t]  # (4,) = [x, y, cos, sin]
+            row = np_gen_traj_wrt_ego[t]  # (4,) = [x, y, cos, sin]
             if not is_valid_token_row(row, eps):
                 continue
 
@@ -1280,9 +1329,9 @@ def draw_token_future_arrows(
                     y,
                     c,
                     s,
-                    length_m=arrow_len,
-                    line_color=TOKEN_FUTURE_STYLE["line_color"],
-                    line_width=TOKEN_FUTURE_STYLE["line_width"],
+                    length_m=options.DIFF_future_gen_traj_arrow_len_m,
+                    line_color=options.DIFF_future_gen_traj_style["line_color"],
+                    line_width=options.DIFF_future_gen_traj_style["line_width"],
                     zorder=23,
                 )
             else:
@@ -1290,10 +1339,10 @@ def draw_token_future_arrows(
                 ax.plot(
                     x,
                     y,
-                    marker=point_marker,
-                    markersize=point_ms,
+                    marker=options.DIFF_future_gen_traj_point_marker,
+                    markersize=options.DIFF_future_gen_traj_point_marker_size,
                     linestyle="None",
-                    color=TOKEN_FUTURE_STYLE["line_color"],
+                    color=options.DIFF_future_gen_traj_style["line_color"],
                     zorder=23,
                 )
 
@@ -1303,7 +1352,7 @@ def draw_token_future_arrows(
             #         x,
             #         y - options.agent_index_offset_m,
             #         str(token)[:5],
-            #         color=TOKEN_FUTURE_STYLE["index_color"],
+            #         color=options.DIFF_future_gen_traj_style["index_color"],
             #         fontsize=options.agent_index_fontsize,
             #         ha="center",
             #         va="top",
@@ -1337,16 +1386,17 @@ def apply_axes_style(ax: plt.Axes, options: DrawingOptions) -> None:
 def compute_auto_bounds(
     world_model_feature: WorldModelFeature,
     options: DrawingOptions,
-    token_to_future_traj_wrt_ego: Optional[TokenTrajDict] = None,
-    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]] = None,
+    diff_token_to_np_gen_traj_wrt_ego: Optional[TokenTrajDict] = None,
+    diff_token_to_interp_np_traj_wrt_ego: Optional[Dict[str,
+                                                        np.ndarray]] = None,
 ) -> Tuple[float, float, float, float]:
     """valid (x,y)만 모아 자동으로 축 범위를 산출."""
     # [Add]
     xs, ys = collect_valid_xy_for_bounds(
         world_model_feature,
         options,
-        token_to_future_traj_wrt_ego,
-        token_to_refined_traj_wrt_ego,
+        diff_token_to_np_gen_traj_wrt_ego,
+        diff_token_to_interp_np_traj_wrt_ego,
     )
     if not xs or not ys:
         return -10.0, 10.0, -10.0, 10.0
@@ -1377,7 +1427,7 @@ def save_figure_to_png(fig: plt.Figure, save_path: str) -> None:
 # =============================================================================
 
 
-def draw_token_histories(
+def draw_neighbor_past_output(
     ax: plt.Axes,
     current_token_to_np_history: Optional[Dict[str, np.ndarray]],
     options: DrawingOptions,
@@ -1397,7 +1447,7 @@ def draw_token_histories(
     동작 규칙
     --------
     - invalid 스텝은 스킵: 앞 8차원 중 하나라도 |value| > eps(=options.invalid_eps)일 때만 유효.
-    - 박스/헤딩/속도화살표 색상과 두께는 NEW_WAYPOINT_STYLE 사용(주황색).
+    - 박스/헤딩/속도화살표 색상과 두께는 DIFF_new_waypoint_style 사용(주황색).
     - 텍스트는 토큰 문자열을 **마지막 유효 프레임** 위치의 오른쪽에 주황색으로 표기.
     - 속도 화살표는 options.draw_velocity_arrows_past_all에 따라
       · True  → 모든 히스토리 스텝
@@ -1407,8 +1457,8 @@ def draw_token_histories(
         return
 
     eps = options.invalid_eps
-    line_color = NEW_WAYPOINT_STYLE["line_color"]
-    line_width = NEW_WAYPOINT_STYLE["line_width"]
+    line_color = options.NEI_neighbor_past_output_style["line_color"]
+    line_width = options.NEI_neighbor_past_output_style["line_width"]
 
     for token, hist in current_token_to_np_history.items():
         if hist is None:
@@ -1449,21 +1499,21 @@ def draw_token_histories(
                 y,
                 c,
                 s,
-                nominal_length=L * options.heading_line_scale,
+                nominal_length=L * options.COMMON_heading_line_scale,
                 color=line_color,
                 line_width=line_width,
                 zorder=19 if t == current_t else 18,
             )
 
             # 속도 화살표: 모든 스텝
-            if options.draw_velocity_arrows_past_all:
+            if options.NEI_draw_neighbor_past_output_vel:
                 add_velocity_arrow(
                     ax,
                     x,
                     y,
                     vx,
                     vy,
-                    length_m=options.arrow_length_m,
+                    length_m=options.COMMON_vel_arrow_len_m,
                     line_color=line_color,
                     line_width=line_width,
                     line_alpha=1.0,
@@ -1477,10 +1527,10 @@ def draw_token_histories(
                     offset = 3
                 ax.text(
                     x,
-                    y - options.token_index_offset_m * offset,
+                    y - options.NEI_neighbor_past_output_vel_offset_m * offset,
                     f"{speed_kmh:.1f}",
                     color=line_color,
-                    fontsize=2,  #options.token_index_fontsize,
+                    fontsize=options.NEI_neighbor_past_output_vel_fontsize,
                     ha="center",
                     va="bottom",
                     zorder=21,
@@ -1498,7 +1548,7 @@ def draw_token_histories(
         #         ly,
         #         str(token)[:5],
         #         color=line_color,
-        #         fontsize=max(options.token_index_fontsize, options.agent_index_fontsize),
+        #         fontsize=options.NEI_neighbor_past_output_token_fontsize,
         #         ha="left",
         #         va="center",
         #         zorder=21,
@@ -1507,9 +1557,9 @@ def draw_token_histories(
 
 """
     world_model_feature: WorldModelFeature,
-    token_to_future_traj_wrt_ego: Optional[TokenTrajDict],
-    token_to_refined_traj_wrt_ego: Optional[Dict[str, np.ndarray]],  # (1 + future_len=80, 11)
-token_to_new_waypoint_array: Optional[Dict[str, np.ndarray]],  # (11,)
+    diff_token_to_np_gen_traj_wrt_ego: Optional[TokenTrajDict],
+    diff_token_to_interp_np_traj_wrt_ego: Optional[Dict[str, np.ndarray]],  # (1 + future_len=80, 11)
+diff_token_to_next_wp_wrt_ego: Optional[Dict[str, np.ndarray]],  # (11,)
 neighbor_track_token: Optional[List[Optional[str]]], # (agent_num,)
 current_token_to_np_history: Dict[str, np.ndarray], # (history_len, 11)
 """
@@ -1540,10 +1590,10 @@ def draw_world_model_to_png(
           · 4-5: left boundary vector (dx,dy)
           · 6-7: right boundary vector (dx,dy)
           · 8-11: signal one-hot [green, yellow, red, unknown]
-    token_to_future_traj_wrt_ego : Dict[str, np.ndarray], optional
+    diff_token_to_np_gen_traj_wrt_ego : Dict[str, np.ndarray], optional
         각 value: (future_len=80, 4) = [x, y, cos, sin].
         - invalid: 4값 모두 0(±eps) → 스킵
-        - valid: (x,y)에서 (cos,sin) 방향으로 길이 2 m(=options.arrow_length_m) 화살표
+        - valid: (x,y)에서 (cos,sin) 방향으로 길이 2 m(=options.COMMON_vel_arrow_len_m) 화살표
     save_path : str
         저장할 PNG 경로.
     options : Optional[DrawingOptions]
@@ -1559,80 +1609,100 @@ def draw_world_model_to_png(
     """
     draw_option = options or DrawingOptions()
     # ── (0) 에이전트 앞쪽 K개로 통일 슬라이스 ─────────────────────────
-    (neigh_past_K, neigh_future_K, route_order_K,
+    (neighbor_K_agents_past, neighbor_K_future_gt_3_dim,
+     agent_K_route_lane_order,
      K) = _clip_agents_first_k_from_data(input_data,
                                          draw_option.max_agents_to_draw)
 
     # bounds 계산을 위해 dict 복사 후 슬라이스 반영
     clipped_input_data = dict(input_data)
-    if neigh_past_K is not None:
-        clipped_input_data["neighbor_agents_past"] = neigh_past_K
-    if neigh_future_K is not None:
-        clipped_input_data["neighbor_future_gt_3_dim"] = neigh_future_K
-    if route_order_K is not None:
-        clipped_input_data["agent_route_lane_order"] = route_order_K
+    if neighbor_K_agents_past is not None:
+        clipped_input_data["neighbor_agents_past"] = neighbor_K_agents_past
+    if neighbor_K_future_gt_3_dim is not None:
+        clipped_input_data[
+            "neighbor_future_gt_3_dim"] = neighbor_K_future_gt_3_dim
+    if agent_K_route_lane_order is not None:
+        clipped_input_data["agent_route_lane_order"] = agent_K_route_lane_order
 
     # 1) Figure/Axes
     fig, ax = create_figure_and_axes(draw_option)
 
     # 2) 바닥 레이어(차선)
     lanes = input_data.get("lanes")
-    if draw_option.draw_lane_boundaries:
+    if draw_option.LANE_draw_lane_boundaries:
         draw_lane_boundaries(ax, lanes, draw_option)
     # agent_route_lane_order가 있으면 텍스트 표기 모드로 전환
-    agent_route_lane_order = input_data.get("agent_route_lane_order", None)
-    if draw_option.draw_lane_centerline:
+    if draw_option.LANE_draw_lane_centerline:
         draw_lane_centerlines(
             ax,
             lanes,
             draw_option,
-            agent_route_lane_order=None,  #route_order_K,
+            agent_route_lane_order=input_data.get(
+                "agent_route_lane_order", None),  #agent_K_route_lane_order,
         )
-
-    # 이웃 에이전트 미래 포인트(x마커)
-    if draw_option.draw_neighbor_agents_future and (neigh_future_K is not None):
-        draw_neighbor_future_points(ax, neigh_future_K, draw_option)
-    # 3) 토큰 미래 화살표(개별) - 차선 위에, 에이전트 윤곽과 겹치지 않게 중간 zorder
-    if draw_option.draw_token_future_arrows:
-        draw_token_future_arrows(ax, token_to_future_traj_wrt_ego, draw_option)
-    # [Add] refined 토큰 궤적(폴리곤/헤딩/속도)
-    # [Add]
-    if draw_option.draw_token_refined and (token_to_refined_traj_wrt_ego or
-                                           token_to_new_waypoint_array):
-        draw_token_refined_trajectories(
-            ax,
-            token_to_refined_traj_wrt_ego,
-            draw_option,
-            token_to_new_waypoint_array=token_to_new_waypoint_array,
-        )
-    # ── (4) 에이전트(과거/미래/예측/GT) ─────────────────────────────
-    if draw_option.draw_neighbor_past and (neigh_past_K is not None):
-        draw_neighbor_past(ax, neigh_past_K, draw_option)
-        if neighbor_track_token is not None:
-            annotate_neighbor_indices_for_past(ax, neighbor_track_token,
-                                               neigh_past_K, draw_option)
-
-    # if current_token_to_np_history:
-    #     draw_token_histories(ax, current_token_to_np_history, draw_option)
-
-    if draw_option.draw_ego_past:
+    #########################################
+    ### [EGO PAST] ###
+    if draw_option.EGO_draw_ego_past:
         draw_ego_past(ax, input_data.get("ego_agent_past"), draw_option)
-    if draw_option.draw_ego_pred:
-        draw_ego_predicted(ax, input_data.get("ego_agent_next_11_dim"),
-                           draw_option)
+    if draw_option.EGO_draw_ego_agent_next_11_dim:
+        # TODO
+        draw_ego_agent_next_11_dim(ax, input_data.get("ego_agent_next_11_dim"),
+                                   draw_option)
     if draw_option.draw_ego_future_gt:
         data_ = input_data.get("planner_future_11_dim", None)
         if data_ is None:
             data_ = input_data.get("planner_future_11_dim", None)
         draw_ego_future_gt(ax, data_, draw_option)
+    #########################################
+    ### [NEIGHBOR PAST] ###
+    if draw_option.NEI_draw_neighbor_past and (neighbor_K_agents_past
+                                               is not None):
+        draw_neighbor_past(ax, neighbor_K_agents_past, draw_option)
+        # List[Optional[str]]
+        neighbor_track_token = input_data.get("neighbor_track_token", None)
+        if draw_option.NEI_draw_past_token and neighbor_track_token is not None:
+            annotate_neighbor_indices_for_past(ax, neighbor_track_token,
+                                               neighbor_K_agents_past,
+                                               draw_option)
+    #########################################
+    ### [NEIGHBOR PAST OUTPUT] ###
+    # (history_len, 11)
+    diff_token_to_np_history_wrt_ego = output_data.get(
+        "diff_token_to_np_history_wrt_ego", None)
+    if draw_option.NEI_draw_neighbor_past_output and diff_token_to_np_history_wrt_ego is not None:
+        draw_neighbor_past_output(ax, diff_token_to_np_history_wrt_ego,
+                                  draw_option)
+    ### [NEIGHBOR FUTURE GT] ###
+    if draw_option.NEI_draw_neighbor_future_gt_3_dim and (
+            neighbor_K_future_gt_3_dim is not None):
+        draw_neighbor_future_gt_3_dim(ax, neighbor_K_future_gt_3_dim,
+                                      draw_option)
+    ### [NEIGHBOR FUTURE OUTPUT] ###
+    diff_token_to_np_gen_traj_wrt_ego = output_data.get(
+        "diff_token_to_np_gen_traj_wrt_ego", None)
+    if draw_option.DIFF_draw_neighbor_future_gen_traj:
+        draw_neighbor_future_gen_traj(ax, diff_token_to_np_gen_traj_wrt_ego,
+                                      draw_option)
+    if draw_option.DIFF_draw_neighbor_future_gen_refined_traj:
+        diff_token_to_interp_np_traj_wrt_ego = output_data.get(
+            "diff_token_to_interp_np_traj_wrt_ego", None)
+        diff_token_to_next_wp_wrt_ego = output_data.get(
+            "diff_token_to_next_wp_wrt_ego", None)
+        draw_neighbor_future_gen_refined_traj(
+            ax,
+            diff_token_to_interp_np_traj_wrt_ego,
+            draw_option,
+            diff_token_to_next_wp_wrt_ego,
+        )
+    #########################################
 
     # ── (5) 축 범위/스타일 ───────────────────────────────────────────
     # [Add]
     bounds = compute_auto_bounds(
         clipped_input_data,
         draw_option,
-        token_to_future_traj_wrt_ego,
-        token_to_refined_traj_wrt_ego,
+        diff_token_to_np_gen_traj_wrt_ego,
+        diff_token_to_interp_np_traj_wrt_ego,
     )
     set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
     apply_axes_style(ax, draw_option)
@@ -1670,7 +1740,7 @@ if __name__ == "__main__":
     }
 
     # 토큰 미래 포즈 예시: key는 무시되고 value만 사용됨
-    token_to_future_traj_wrt_ego = {
+    diff_token_to_np_gen_traj_wrt_ego = {
         "token_a": np.array([[1.0, 2.0, 0.0, 1.0]] * 80, dtype=np.float32),
         # 위 방향 화살표 80개
         "token_b": np.array([[5.0, -3.0, 1.0, 0.0]] * 80, dtype=np.float32),
@@ -1678,12 +1748,12 @@ if __name__ == "__main__":
     }
 
     options = DrawingOptions(
-        draw_lane_boundaries=True,
-        draw_lane_centerline=True,
-        draw_token_future_arrows=True,  # 토큰 화살표 on
+        LANE_draw_lane_boundaries=True,
+        LANE_draw_lane_centerline=True,
+        DIFF_draw_neighbor_future_gen_traj=True,  # 토큰 화살표 on
         draw_ego_past=True,
         draw_neighbor_past=True,
-        draw_ego_pred=True,
+        EGO_draw_ego_agent_next_11_dim=True,
         draw_ego_future_gt=True,
         background_color="#121212",
         show_axis=False,
@@ -1694,5 +1764,5 @@ if __name__ == "__main__":
         input_data,
         save_path="scene_with_tokens.png",
         options=options,
-        token_to_future_traj_wrt_ego=token_to_future_traj_wrt_ego,
+        diff_token_to_np_gen_traj_wrt_ego=diff_token_to_np_gen_traj_wrt_ego,
     )
