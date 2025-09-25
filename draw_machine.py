@@ -23,8 +23,173 @@ LIGHTBLUE = "#4D83E1"
 WHITE = "#FFFFFF"  # 미래 궤적 raw 예측 값
 PALE_CYAN = "#BFFFFF"  # 미래 궤적 refined 예측 값 # EGO Planner 궤적 값
 LIGHT_CYAN = "#80FFFF"  # 미래 궤적 refined state 값 # EGO Planner 궤적 next state 값
-BRIGHT_CYAN = "#40FFFF"  # 미래 궤적 GT 예측 값 (3 dim)
-CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim)
+BRIGHT_CYAN = "#40FFFF"  # neighbor_future_gt_3_dim
+CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim) # ego_future_gt_11_dim
+
+
+# [ADD]
+def _collect_valid_xy_from_input_data(
+    input_data: WorldModelFeature,
+    options: DrawingOptions,
+) -> Tuple[List[float], List[float]]:
+    """input_data에서 valid (x,y) 좌표만 수집해 반환.
+
+    수집 대상
+    - lanes: center/left/right (유효 포인트만)
+    - ego: ego_agent_past, ego_agent_next_11_dim, planner_future_11_dim
+    - neighbor: neighbor_agents_past
+    - neighbor future GT: neighbor_future_gt_3_dim (x,y만 사용)
+    """
+    eps = options.invalid_eps
+    xs_local: List[float] = []
+    ys_local: List[float] = []
+
+    # lanes: 각 포인트가 valid일 때 center/left/right 좌표 반영
+    lanes = input_data.get("lanes")
+    if lanes is not None and lanes.size > 0:
+        valid_mask = np.any(np.abs(lanes[:, :, :8]) > eps,
+                            axis=2)  # (lane_num, lane_len)
+        centers = lanes[:, :, 0:2]
+        lefts = centers + lanes[:, :, 4:6]
+        rights = centers + lanes[:, :, 6:8]
+        if np.any(valid_mask):
+            c_valid = centers[valid_mask]
+            l_valid = lefts[valid_mask]
+            r_valid = rights[valid_mask]
+            xs_local.extend(c_valid[:, 0].tolist())
+            ys_local.extend(c_valid[:, 1].tolist())
+            xs_local.extend(l_valid[:, 0].tolist())
+            ys_local.extend(l_valid[:, 1].tolist())
+            xs_local.extend(r_valid[:, 0].tolist())
+            ys_local.extend(r_valid[:, 1].tolist())
+
+    # ego past, ego pred, ego future
+    for key in ("ego_agent_past", "ego_agent_next_11_dim",
+                "planner_future_11_dim", "planner_future_11_dim"):
+        A = input_data.get(key)
+        if A is None or A.size == 0:
+            continue
+        valid_mask = np.any(np.abs(A[:, :8]) > eps, axis=1)  # (N,)
+        if np.any(valid_mask):
+            xy = A[valid_mask, 0:2]
+            xs_local.extend(xy[:, 0].tolist())
+            ys_local.extend(xy[:, 1].tolist())
+
+    # neighbor past
+    neigh = input_data.get("neighbor_agents_past")
+    if neigh is not None and neigh.size > 0:
+        valid_mask = np.any(np.abs(neigh[:, :, :8]) > eps,
+                            axis=2)  # (agent_num, T)
+        if np.any(valid_mask):
+            xy = neigh[:, :, 0:2][valid_mask]
+            xs_local.extend(xy[:, 0].tolist())
+            ys_local.extend(xy[:, 1].tolist())
+
+    # neighbor future points: (agent_num, future_len, 3) -> (x,y)만 사용
+    neigh_fut = input_data.get("neighbor_future_gt_3_dim")
+    if neigh_fut is not None and neigh_fut.size > 0:
+        if neigh_fut.ndim != 3 or neigh_fut.shape[-1] != 3:
+            raise ValueError(
+                "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
+        valid_mask = (np.abs(neigh_fut[..., 0]) > eps) | (np.abs(
+            neigh_fut[..., 1]) > eps)  # (A, T)
+        if np.any(valid_mask):
+            xy = neigh_fut[..., :2][valid_mask]  # (K, 2)
+            xs_local.extend(xy[:, 0].tolist())
+            ys_local.extend(xy[:, 1].tolist())
+
+    return xs_local, ys_local
+
+
+# [ADD]
+def _collect_valid_xy_from_output_data(
+    output_data: Dict[str, Any],
+    options: DrawingOptions,
+) -> Tuple[List[float], List[float]]:
+    """output_data의 모든 key를 검사하여 valid (x,y) 좌표만 수집해 반환.
+
+    예상 키와 타입
+    - diff_token_to_np_gen_traj_wrt_ego: Dict[str, (T,4)] 또는 (4,)
+    - diff_token_to_np_history_wrt_ego: Dict[str, (H,11)] 또는 (11,)
+    - diff_token_to_interp_np_traj_wrt_ego: Dict[str, (N,11)] 또는 (11,)
+    - diff_token_to_next_wp_wrt_ego: Dict[str, (11,)] 또는 (1,11)
+    """
+    eps = options.invalid_eps
+    xs_local: List[float] = []
+    ys_local: List[float] = []
+
+    if not output_data:
+        return xs_local, ys_local
+
+    # (1) diff_token_to_np_gen_traj_wrt_ego: Dict[str, (T,4)] 또는 (4,)
+    token_to_traj = output_data.get("diff_token_to_np_gen_traj_wrt_ego")
+    if isinstance(token_to_traj, dict) and len(token_to_traj) > 0:
+        for _, arr in token_to_traj.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            if arr.ndim == 2 and arr.shape[1] == 4:
+                valid_mask = np.any(np.abs(arr[:, :4]) > eps, axis=1)
+                if np.any(valid_mask):
+                    xy = arr[valid_mask, 0:2]
+                    xs_local.extend(xy[:, 0].tolist())
+                    ys_local.extend(xy[:, 1].tolist())
+            elif arr.ndim == 1 and arr.shape[0] == 4:
+                if is_valid_token_row(arr, eps):
+                    xs_local.append(float(arr[0]))
+                    ys_local.append(float(arr[1]))
+
+    # (2) diff_token_to_np_history_wrt_ego: Dict[str, (H,11)] 또는 (11,)
+    hist_dict = output_data.get("diff_token_to_np_history_wrt_ego")
+    if isinstance(hist_dict, dict) and len(hist_dict) > 0:
+        for _, arr in hist_dict.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            if arr.ndim == 2 and arr.shape[1] == 11:
+                valid_mask = np.any(np.abs(arr[:, :8]) > eps, axis=1)
+                if np.any(valid_mask):
+                    xy = arr[valid_mask, 0:2]
+                    xs_local.extend(xy[:, 0].tolist())
+                    ys_local.extend(xy[:, 1].tolist())
+            elif arr.ndim == 1 and arr.shape[0] == 11:
+                if is_valid_agent_row(arr, eps):
+                    xs_local.append(float(arr[0]))
+                    ys_local.append(float(arr[1]))
+
+    # (3) diff_token_to_interp_np_traj_wrt_ego: Dict[str, (N,11)] 또는 (11,)
+    interp_dict = output_data.get("diff_token_to_interp_np_traj_wrt_ego")
+    if isinstance(interp_dict, dict) and len(interp_dict) > 0:
+        for _, arr in interp_dict.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            if arr.ndim == 2 and arr.shape[1] == 11:
+                valid_mask = np.any(np.abs(arr[:, :8]) > eps, axis=1)
+                if np.any(valid_mask):
+                    xy = arr[valid_mask, 0:2]
+                    xs_local.extend(xy[:, 0].tolist())
+                    ys_local.extend(xy[:, 1].tolist())
+            elif arr.ndim == 1 and arr.shape[0] == 11:
+                if is_valid_agent_row(arr, eps):
+                    xs_local.append(float(arr[0]))
+                    ys_local.append(float(arr[1]))
+
+    # (4) diff_token_to_next_wp_wrt_ego: Dict[str, (11,)] 또는 (1,11)
+    next_wp_dict = output_data.get("diff_token_to_next_wp_wrt_ego")
+    if isinstance(next_wp_dict, dict) and len(next_wp_dict) > 0:
+        for _, arr in next_wp_dict.items():
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            if arr.ndim == 2:
+                arr = arr.squeeze()
+            if arr.ndim == 1 and arr.shape[0] == 11:
+                if is_valid_agent_row(arr, eps):
+                    xs_local.append(float(arr[0]))
+                    ys_local.append(float(arr[1]))
+
+    return xs_local, ys_local
 
 
 class DrawInfos:
@@ -188,8 +353,6 @@ class DrawingOptions:
     equal_aspect: bool = True
     invalid_eps: float = 0.0
 
-
-
     COMMON_vel_arrow_len_m: float = 5.0
     COMMON_heading_line_scale: float = 0.5
 
@@ -240,6 +403,16 @@ class DrawingOptions:
         "velocity_line_width": 0.4,
     }
     EGO_draw_planner_velocity: bool = False  # check
+    ########## [EGO] FUTURE EGO GT 11 ##########
+    EGO_draw_ego_future_gt_11_dim: bool = False
+    EGO_future_gt_11_style = {
+        "line_color": CYAN,
+        "line_width": 0.2,
+        "velocity_line_color": CYAN,
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    EGO_draw_future_11_velocity: bool = False  # check
     ######################################
 
     ######### [NEIGHBOR] #########
@@ -250,7 +423,6 @@ class DrawingOptions:
     NEI_vel_text_y_offset: float = 0.5
     NEI_vel_text_color = CYAN
     NEI_vel_text_fontsize = 2
-
 
     NEI_neighbor_style = {
         "vehicles": {
@@ -313,7 +485,6 @@ class DrawingOptions:
     }
     DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
 
-
     ########################
     DIFF_draw_neighbor_future_gen_refined_traj: bool = False
     DIFF_future_gen_refined_style = {
@@ -329,7 +500,6 @@ class DrawingOptions:
     DIFF_future_gen_refined_token_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)
     DIFF_new_waypoint_vel_text_y_offset_m = 1.
     DIFF_new_waypoint_vel_token_x_offset_m = 1.
-
 
     DIFF_new_waypoint_style = {
         "line_color": ORANGE,  # 주황색
@@ -464,79 +634,21 @@ def collect_valid_xy_for_bounds(
     output_data: Dict[str, Any],
     options: DrawingOptions,
 ) -> Tuple[List[float], List[float]]:
-    """모든 요소에서 valid (x,y)만 모아 bounds 계산에 사용."""
-    eps = options.invalid_eps
+    """모든 요소에서 valid (x,y)만 모아 bounds 계산에 사용.
+
+    - lanes(center/left/right), ego/neighbor past, neighbor future GT
+    - output_data의 모든 key도 검사하여 (x,y) 수집
+    """
+    xs_input, ys_input = _collect_valid_xy_from_input_data(input_data, options)
+    xs_output, ys_output = _collect_valid_xy_from_output_data(
+        output_data, options)
+
     xs: List[float] = []
     ys: List[float] = []
-
-    # lanes: 각 포인트가 valid일 때 center/left/right 좌표 반영
-    lanes = input_data.get("lanes")
-    if lanes is not None and lanes.size > 0:
-        valid_mask = np.any(np.abs(lanes[:, :, :8]) > eps,
-                            axis=2)  # (lane_num, lane_len)
-        centers = lanes[:, :, 0:2]
-        lefts = centers + lanes[:, :, 4:6]
-        rights = centers + lanes[:, :, 6:8]
-        if np.any(valid_mask):
-            c_valid = centers[valid_mask]
-            l_valid = lefts[valid_mask]
-            r_valid = rights[valid_mask]
-            xs.extend(c_valid[:, 0].tolist())
-            ys.extend(c_valid[:, 1].tolist())
-            xs.extend(l_valid[:, 0].tolist())
-            ys.extend(l_valid[:, 1].tolist())
-            xs.extend(r_valid[:, 0].tolist())
-            ys.extend(r_valid[:, 1].tolist())
-
-    # ego past, ego pred, ego future
-    for key in ("ego_agent_past", "ego_agent_next_11_dim",
-                "planner_future_11_dim", "planner_future_11_dim"):
-        A = input_data.get(key)
-        if A is None or A.size == 0:
-            continue
-        valid_mask = np.any(np.abs(A[:, :8]) > eps, axis=1)  # (N,)
-        if np.any(valid_mask):
-            xy = A[valid_mask, 0:2]
-            xs.extend(xy[:, 0].tolist())
-            ys.extend(xy[:, 1].tolist())
-
-    # neighbor past
-    neigh = input_data.get("neighbor_agents_past")
-    if neigh is not None and neigh.size > 0:
-        valid_mask = np.any(np.abs(neigh[:, :, :8]) > eps,
-                            axis=2)  # (agent_num, T)
-        if np.any(valid_mask):
-            xy = neigh[:, :, 0:2][valid_mask]
-            xs.extend(xy[:, 0].tolist())
-            ys.extend(xy[:, 1].tolist())
-
-    # tokens
-    if diff_token_to_np_gen_traj_wrt_ego:
-        for _, arr in diff_token_to_np_gen_traj_wrt_ego.items():
-            if arr is None or arr.size == 0:
-                continue
-            if arr.shape[-1] != 4:
-                continue
-            valid_mask = np.any(np.abs(arr[:, :4]) > eps,
-                                axis=1)  # (future_len,)
-            if np.any(valid_mask):
-                xy = arr[valid_mask, 0:2]
-                xs.extend(xy[:, 0].tolist())
-                ys.extend(xy[:, 1].tolist())
-
-    # neighbor future points: (agent_num, future_len, 3)  -> (x,y)만 사용
-    neigh_fut = input_data.get("neighbor_future_gt_3_dim")
-    if neigh_fut is not None and neigh_fut.size > 0:
-        if neigh_fut.ndim != 3 or neigh_fut.shape[-1] != 3:
-            raise ValueError(
-                "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
-        # 유효 마스크: |x|>eps or |y|>eps
-        valid_mask = (np.abs(neigh_fut[..., 0]) > eps) | (np.abs(
-            neigh_fut[..., 1]) > eps)  # (A, T)
-        if np.any(valid_mask):
-            xy = neigh_fut[..., :2][valid_mask]  # (K, 2)
-            xs.extend(xy[:, 0].tolist())
-            ys.extend(xy[:, 1].tolist())
+    xs.extend(xs_input)
+    ys.extend(ys_input)
+    xs.extend(xs_output)
+    ys.extend(ys_output)
 
     return xs, ys
 
@@ -972,6 +1084,60 @@ def draw_planner_future_11_dim(ax: plt.Axes, planner_future_11_dim: Array,
                 line_alpha=options.
                 EGO_planner_future_11_style["velocity_line_alpha"],
                 zorder=24)
+
+
+def draw_ego_future_gt_11_dim(ax: plt.Axes, ego_future_gt_11_dim: Array,
+                              options: DrawingOptions) -> None:
+    """이고 차량 **GT 미래** 시퀀스를 그림(미래 위치는 채우지 않음). invalid 스텝은 스킵."""
+    if ego_future_gt_11_dim is None or ego_future_gt_11_dim.size == 0:
+        return
+    eps = options.invalid_eps
+    future_len, feat_dim = ego_future_gt_11_dim.shape
+    if feat_dim != 11:
+        raise ValueError("ego_future_gt_11_dim의 마지막 차원은 11이어야 합니다.")
+
+    for t in range(future_len):
+        row = ego_future_gt_11_dim[t]
+        if not is_valid_agent_row(row, eps):
+            continue
+
+        x, y = float(row[0]), float(row[1])
+        c, s = float(row[2]), float(row[3])
+        vx, vy = float(row[4]), float(row[5])
+        W, L = float(row[6]), float(row[7])
+
+        corners = oriented_box_corners(x, y, c, s, L, W)
+        add_polygon(ax,
+                    corners,
+                    edge_color=options.EGO_future_gt_11_style["line_color"],
+                    line_width=options.EGO_future_gt_11_style["line_width"],
+                    fill_color=None,
+                    fill_alpha=None,
+                    zorder=24)
+        add_heading_line(
+            ax,
+            x,
+            y,
+            c,
+            s,
+            nominal_length=L * options.COMMON_heading_line_scale,
+            color=options.EGO_future_gt_11_style["line_color"],
+            line_width=options.EGO_future_gt_11_style["line_width"],
+            zorder=24)
+        if options.EGO_draw_future_11_velocity:
+            add_velocity_arrow(ax,
+                               x,
+                               y,
+                               vx,
+                               vy,
+                               length_m=options.COMMON_vel_arrow_len_m,
+                               line_color=options.
+                               EGO_future_gt_11_style["velocity_line_color"],
+                               line_width=options.
+                               EGO_future_gt_11_style["velocity_line_width"],
+                               line_alpha=options.
+                               EGO_future_gt_11_style["velocity_line_alpha"],
+                               zorder=24)
 
 
 # [Add]
@@ -1470,54 +1636,8 @@ def draw_neighbor_past_output(
         #     )
 
 
-# [Add]
-def draw_world_model_to_png(
-    input_data: Dict[str, Any],
-    output_data: Optional[Dict[str, Any]],
-    save_path: str,
-    options: Optional[DrawingOptions] = None,
-) -> None:
-    """주어진 world_model_feature과 output을 그림으로 렌더링하고 PNG로 저장.
-
-    Parameters
-    ----------
-    input_data : Dict[str, np.ndarray]
-        - 'ego_agent_past' : (time_len=21, 11)
-        - 'neighbor_agents_past' : (agent_num, 21, 11)
-        - "static_objects": (static_objects_num, 10) - 현재 미사용
-        ###########################
-        - 'ego_agent_next_11_dim' : (interpol_num, 11)
-        - 'planner_future_11_dim' : (future_len=80, 11)
-        ###########################
-        - 'lanes' : (lane_num, lane_len, 12)
-          · 0-1: centerline (x,y)
-          · 2-3: centerline diff (dx,dy)
-          · 4-5: left boundary vector (dx,dy)
-          · 6-7: right boundary vector (dx,dy)
-          · 8-11: signal one-hot [green, yellow, red, unknown]
-    diff_token_to_np_gen_traj_wrt_ego : Dict[str, np.ndarray], optional
-        각 value: (future_len=80, 4) = [x, y, cos, sin].
-        - invalid: 4값 모두 0(±eps) → 스킵
-        - valid: (x,y)에서 (cos,sin) 방향으로 길이 2 m(=options.COMMON_vel_arrow_len_m) 화살표
-    save_path : str
-        저장할 PNG 경로.
-    options : Optional[DrawingOptions]
-        렌더링 옵션. None이면 기본 옵션 사용.
-
-    Notes
-    -----
-    - invalid 스텝/포인트는 그리지 않음
-      · agent: [x,y,cos,sin,vx,vy,length,width] 8개가 모두 0(±eps) → 스킵
-      · lanes: 앞 8차원이 모두 0(±eps) → 스킵, 선분은 양 끝점 valid일 때만 그림
-      · token: [x,y,cos,sin] 4개가 모두 0(±eps) → 스킵
-    - 좌표계는 "현재 이고 뒷축 좌표계(＋x=ego heading)" 가정.
-    """
-    draw_option = options or DrawingOptions()
-
-    # 1) Figure/Axes
-    fig, ax = create_figure_and_axes(draw_option)
-
-    # 2) 바닥 레이어(차선)
+def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
+              draw_option: DrawingOptions):
     lanes = input_data.get("lanes")
     if draw_option.LANE_draw_lane_boundaries:
         draw_lane_boundaries(ax, lanes, draw_option)
@@ -1530,8 +1650,10 @@ def draw_world_model_to_png(
             agent_route_lane_order=input_data.get(
                 "agent_route_lane_order", None),  #agent_K_route_lane_order,
         )
-    #########################################
-    ### [EGO PAST] ###
+
+
+def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
+             draw_option: DrawingOptions):
     if draw_option.EGO_draw_ego_past:
         draw_ego_past(ax, input_data.get("ego_agent_past"), draw_option)
     if draw_option.EGO_draw_ego_agent_next_11_dim:
@@ -1541,7 +1663,15 @@ def draw_world_model_to_png(
     if draw_option.EGO_draw_planner_future_11_dim:
         data_ = input_data.get("planner_future_11_dim", None)
         draw_planner_future_11_dim(ax, data_, draw_option)
-    #########################################
+    ### [EGO FUTURE GT 11] ###
+    if draw_option.EGO_draw_ego_future_gt_11_dim:
+        data_ = input_data.get("ego_future_gt_11_dim", None)
+        draw_ego_future_gt_11_dim(ax, data_, draw_option)
+
+
+def draw_neighbor_past_all(ax: plt.Axes, input_data: WorldModelFeature,
+                           output_data: Optional[Dict[str, Any]],
+                           draw_option: DrawingOptions):
     ### [NEIGHBOR PAST] ###
     neighbor_agents_past = input_data.get("neighbor_agents_past", None)
     if draw_option.NEI_draw_neighbor_past and (neighbor_agents_past
@@ -1561,6 +1691,11 @@ def draw_world_model_to_png(
     if draw_option.NEI_draw_neighbor_past_output and diff_token_to_np_history_wrt_ego is not None:
         draw_neighbor_past_output(ax, diff_token_to_np_history_wrt_ego,
                                   draw_option)
+
+
+def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
+                             output_data: Optional[Dict[str, Any]],
+                             draw_option: DrawingOptions):
     ### [NEIGHBOR FUTURE GT] ###
     neighbor_future_gt_3_dim = input_data.get("neighbor_future_gt_3_dim", None)
     if draw_option.NEI_draw_neighbor_future_gt_3_dim and (
@@ -1585,6 +1720,32 @@ def draw_world_model_to_png(
         )
     #########################################
 
+
+def draw_neighbor(ax: plt.Axes, input_data: WorldModelFeature,
+                  output_data: Optional[Dict[str, Any]],
+                  draw_option: DrawingOptions):
+    draw_neighbor_past_all(ax, input_data, output_data, draw_option)
+    draw_neighbor_future_all(ax, input_data, output_data, draw_option)
+
+
+# [Add]
+def draw_world_model_to_png(
+    input_data: Dict[str, Any],
+    output_data: Optional[Dict[str, Any]],
+    save_path: str,
+    options: Optional[DrawingOptions] = None,
+) -> None:
+    draw_option = options or DrawingOptions()
+
+    # 1) Figure/Axes
+    fig, ax = create_figure_and_axes(draw_option)
+
+    #########################################
+    draw_lane(ax, input_data, draw_option)
+    draw_ego(ax, input_data, draw_option)
+    draw_neighbor(ax, input_data, output_data, draw_option)
+    #########################################
+
     # ── (5) 축 범위/스타일 ───────────────────────────────────────────
     # [Add]
     bounds = compute_auto_bounds(input_data, output_data, draw_option)
@@ -1593,60 +1754,3 @@ def draw_world_model_to_png(
 
     # 6) 저장
     save_figure_to_png(fig, save_path)
-
-
-if __name__ == "__main__":
-    # input_data 예시(실데이터로 교체)
-    input_data = {
-        "ego_agent_past":
-            np.zeros((21, 11), dtype=np.float32),
-        "neighbor_agents_past":
-            np.zeros((5, 21, 11), dtype=np.float32),
-        "ego_agent_next_11_dim":
-            np.zeros((30, 11), dtype=np.float32),
-        "planner_future_11_dim":
-            np.zeros((80, 11), dtype=np.float32),
-        "lanes":
-            np.zeros((70, 50, 12), dtype=np.float32),
-        "neighbor_future_gt_3_dim":
-            np.array([
-                np.column_stack([
-                    np.linspace(0, 10, 20),
-                    np.linspace(0, 0, 20),
-                    np.zeros(20)
-                ]),
-                np.column_stack([
-                    np.linspace(1, 8, 20),
-                    np.linspace(2, 2, 20),
-                    np.zeros(20)
-                ]),
-            ]),
-    }
-
-    # 토큰 미래 포즈 예시: key는 무시되고 value만 사용됨
-    diff_token_to_np_gen_traj_wrt_ego = {
-        "token_a": np.array([[1.0, 2.0, 0.0, 1.0]] * 80, dtype=np.float32),
-        # 위 방향 화살표 80개
-        "token_b": np.array([[5.0, -3.0, 1.0, 0.0]] * 80, dtype=np.float32),
-        # +x 방향 화살표 80개
-    }
-
-    options = DrawingOptions(
-        LANE_draw_lane_boundaries=True,
-        LANE_draw_lane_centerline=True,
-        DIFF_draw_neighbor_future_gen_traj=True,  # 토큰 화살표 on
-        draw_ego_past=True,
-        draw_neighbor_past=True,
-        EGO_draw_ego_agent_next_11_dim=True,
-        EGO_draw_planner_future_11_dim=True,
-        background_color="#121212",
-        show_axis=False,
-        invalid_eps=0.0,
-    )
-
-    draw_world_model_to_png(
-        input_data,
-        save_path="scene_with_tokens.png",
-        options=options,
-        diff_token_to_np_gen_traj_wrt_ego=diff_token_to_np_gen_traj_wrt_ego,
-    )
