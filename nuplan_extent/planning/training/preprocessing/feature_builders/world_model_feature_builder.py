@@ -46,6 +46,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         traffic_light_data = list(current_input.traffic_light_data)
         model_inputs: Dict[
             str, torch.Tensor] = self.data_processor.observation_adapter(
+                current_input.iteration.index,
                 history_buffer,
                 traffic_light_data,
                 initialization.map_api,

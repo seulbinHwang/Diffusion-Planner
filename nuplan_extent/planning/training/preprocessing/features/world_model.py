@@ -14,6 +14,7 @@ from dataclasses import fields as dataclass_fields
 
 import torch
 
+
 # nuplan/planning/script/builders/simulation_builder.py
 @dataclass
 class WorldModelFeature(AbstractModelFeature):
@@ -37,6 +38,7 @@ class WorldModelFeature(AbstractModelFeature):
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
     planner_future_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
+
     ################################################
 
     def to_feature_tensor(self) -> WorldModelFeature:
@@ -63,8 +65,8 @@ class WorldModelFeature(AbstractModelFeature):
             to_tensor(self.target_agents_mask).contiguous(),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).contiguous(),
-            planner_future_11_dim=None if self.planner_future_11_dim is None else
-            to_tensor(self.planner_future_11_dim).contiguous(),
+            planner_future_11_dim=None if self.planner_future_11_dim is None
+            else to_tensor(self.planner_future_11_dim).contiguous(),
         )
 
     def to_device(self, device: torch.device) -> WorldModelFeature:
@@ -92,8 +94,8 @@ class WorldModelFeature(AbstractModelFeature):
             to_tensor(self.target_agents_mask).to(device=device),
             ego_agent_next_11_dim=None if self.ego_agent_next_11_dim is None
             else to_tensor(self.ego_agent_next_11_dim).to(device=device),
-            planner_future_11_dim=None if self.planner_future_11_dim is None else
-            to_tensor(self.planner_future_11_dim).to(device=device),
+            planner_future_11_dim=None if self.planner_future_11_dim is None
+            else to_tensor(self.planner_future_11_dim).to(device=device),
         )
 
     @classmethod

@@ -27,7 +27,6 @@ from nuplan.planning.simulation.observation.observation_type import DetectionsTr
 from nuplan.planning.utils.serialization.to_scene import tracked_object_types
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
 
-
 BLACK = "#000000"
 PURPLE = "#E6E6FA"
 RED = "#D50000"

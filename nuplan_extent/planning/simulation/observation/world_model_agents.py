@@ -447,7 +447,6 @@ class WorldModelAgents(AbstractMLAgents):
         super().__init__(model, scenario)
         self.config = model.config
         self.predicted_neighbor_num = self.config.predicted_neighbor_num
-        self.current_iteration = 0
         self._open_loop_detections_types: List[TrackedObjectType] = []
         # ["PEDESTRIAN", "BARRIER", "CZONE_SIGN", "TRAFFIC_CONE", "GENERIC_OBJECT"]
         self._initialize_open_loop_detection_types(open_loop_detections_types)
@@ -474,7 +473,6 @@ class WorldModelAgents(AbstractMLAgents):
         """
         Initializes the agents based on the first step of the scenario
         """
-        self.current_iteration = 0
         self.current_observation = None
 
         unique_agents: Dict[str, TrackedObject] = {
@@ -491,7 +489,7 @@ class WorldModelAgents(AbstractMLAgents):
                                      TrackedObject] = sort_dict(unique_agents)
         self._filter_diffusion_agents(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
-            self._get_open_loop_track_objects(self.current_iteration))
+            self._get_open_loop_track_objects(0))
         self._agents: Dict[str, TrackedObject] = {
             **self._diffusion_agents,
             **self._log_replay_agents
@@ -775,8 +773,7 @@ class WorldModelAgents(AbstractMLAgents):
         return interp_next_ego_11_dim
 
     def _get_model_input(
-        self, next_iteration: SimulationIteration,
-        history: SimulationHistoryBuffer,
+        self, iteration: SimulationIteration, history: SimulationHistoryBuffer,
         interp_next_ego_11_dim: Optional[npt.NDArray[np.float32]],
         planner_future_11_dim: Optional[npt.NDArray[np.float32]]
     ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]]]:
@@ -793,12 +790,11 @@ class WorldModelAgents(AbstractMLAgents):
             # (x, y, yaw) 의 StateSE2
         )
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
-            next_iteration.index)
+            iteration.index)
         # target_agents_mask: np.ndarray, (agent_num,) bool
         # diffusion_agents_tokens: List[str] # len: valid diffusion agent num
         diffusion_agents_tokens = list(self._diffusion_agents.keys())
-        current_input = PlannerInput(next_iteration, history,
-                                     traffic_light_data,
+        current_input = PlannerInput(iteration, history, traffic_light_data,
                                      diffusion_agents_tokens,
                                      interp_next_ego_11_dim,
                                      planner_future_11_dim)
@@ -811,8 +807,9 @@ class WorldModelAgents(AbstractMLAgents):
             str, np.ndarray] = self._model_loader.feature_builders[
                 0].unnormalized_features
         # neighbor_token_dist_order: len = agent_num
-        neighbor_token_dist_order: List[Optional[
-            str]] = model_input_key_to_unnorm_value["neighbor_track_token"] # (agent_num, )
+        neighbor_token_dist_order: List[
+            Optional[str]] = model_input_key_to_unnorm_value[
+                "neighbor_track_token"]  # (agent_num, )
         self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
         return (model_input_key_to_value, neighbor_token_dist_order)
 
@@ -834,8 +831,7 @@ class WorldModelAgents(AbstractMLAgents):
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
         (model_input_key_to_value,
          neighbor_token_dist_order) = self._get_model_input(
-             next_iteration, history, interp_next_ego_11_dim,
-             planner_future_11_dim)
+             iteration, history, interp_next_ego_11_dim, planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
@@ -854,7 +850,6 @@ class WorldModelAgents(AbstractMLAgents):
         self.observation_buffer: Deque[Observation] = history.observation_buffer
         # EgoState, Observation
         self._ego_anchor_state, self.current_observation = history.current_state
-        self.current_iteration: int = next_iteration.index
         self.sim_step_gap_time_point: TimePoint = next_iteration.time_point - iteration.time_point
 
         self._update_diffusion_agents_observation(iteration, next_iteration,
@@ -862,7 +857,7 @@ class WorldModelAgents(AbstractMLAgents):
                                                   ego_future_trajectory)
         self._filter_diffusion_agents(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
-            self._get_open_loop_track_objects(self.current_iteration))
+            self._get_open_loop_track_objects(next_iteration.index))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
         if self._is_vis_features:
             input_data, output_data = self._draw_infos.to_dict()
@@ -1032,7 +1027,8 @@ class WorldModelAgents(AbstractMLAgents):
         global_future_arrays = [
             waypoint_to_numpy10(wp) for wp in future_waypoints
         ]  # List[(10,)]
-        global_future_arrays = np.stack(global_future_arrays, axis=0)  # (1+T, 10)
+        global_future_arrays = np.stack(global_future_arrays,
+                                        axis=0)  # (1+T, 10)
         # rel_future_arrays: (1+T, 11)
         rel_future_arrays = convert_absolute_quantities_to_relative(
             global_future_arrays,
@@ -1074,7 +1070,7 @@ class WorldModelAgents(AbstractMLAgents):
             ########## TO DRAW ##########
             diff_token_to_next_wp_wrt_ego[
                 diff_token] = self._get_new_local_waypoint_array_to_draw(
-                    updated_waypoint, cur_ego_global_xyyaw) # (11)
+                    updated_waypoint, cur_ego_global_xyyaw)  # (11)
             #############################
 
         self._diffusion_agents = diff_token_to_updated_agent
@@ -1109,7 +1105,6 @@ class WorldModelAgents(AbstractMLAgents):
                 List[str]: # self._diffusion_agents 의 토큰 리스트 (거리 오름차순)
                 # len == valid diffusion agent num
         """
-
         """
         # nuplan_extent/planning/training/modeling/models/world_model.py
         # WorldModel.forward

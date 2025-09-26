@@ -70,33 +70,36 @@ def _extract_agent_array(
 
 
 def sampled_tracked_objects_to_array_list(
-        past_tracked_objects: List[TrackedObjects] )\
+        tracked_objects_list: List[TrackedObjects] )\
         -> Tuple[List[np.ndarray], List[List[TrackedObjectType]],
         Dict[str, int]
         ]:
     """
     Arrayifies the agents features from the provided past detections.
     For N past detections, output is a list of length N, with each array as described in `_extract_agent_array()`.
-    :param past_tracked_objects: The tracked objects to arrayify.
+    :param tracked_objects_list: The tracked objects to arrayify.
     :return: The arrayified objects.
     """
     object_types = [
         TrackedObjectType.VEHICLE, TrackedObjectType.PEDESTRIAN,
         TrackedObjectType.BICYCLE
     ]
+    # List[ np.ndarray ((frame_agents_num, 8)) ]
     all_frame_agents_feature = []
+    # List[ List[TrackedObjectType] ]
     all_frame_agents_types = []
+    # Dict[str, int]
     token_to_id = {}
 
-    for past_idx in range(len(past_tracked_objects)):
-        if type(past_tracked_objects[past_idx]) == DetectionsTracks:
-            track_object: TrackedObjects = past_tracked_objects[
-                past_idx].tracked_objects
+    for timestep_idx in range(len(tracked_objects_list)):
+        if type(tracked_objects_list[timestep_idx]) == DetectionsTracks:
+            tracked_objects: TrackedObjects = tracked_objects_list[
+                timestep_idx].tracked_objects
         else:
-            track_object = past_tracked_objects[past_idx]
+            tracked_objects = tracked_objects_list[timestep_idx]
         # Tuple[np.ndarray ((frame_agents_num, 8)), Dict[str, int], List[TrackedObjectType]]
         frame_agents_feature, token_to_id, agent_types = _extract_agent_array(
-            track_object, token_to_id, object_types)
+            tracked_objects, token_to_id, object_types)
         all_frame_agents_feature.append(frame_agents_feature)
         all_frame_agents_types.append(agent_types)
 
@@ -548,8 +551,8 @@ def agent_future_process(
         future_tracked_objects: List[
             np.ndarray],  # 길이 = 1(현재)+Tf, 각 원소: (frame_agents_num, 8)
         num_agents: int,  # 출력 이웃 슬롯 수
-        agent_index: Union[np.ndarray,
-                           List[int]],  # 길이 K(≤ num_agents), 현재 프레임의 행 인덱스들
+        neighbor_indices: Union[
+            np.ndarray, List[int]],  # 길이 K(≤ num_agents), 현재 프레임의 행 인덱스들
 ) -> np.ndarray:
     """현재 시점에서 선택된 에이전트 집합(행 인덱스)을 유지한 채 미래 시퀀스를 (x, y, heading)로 생성합니다.
     개요:
@@ -557,7 +560,7 @@ def agent_future_process(
           현재 프레임에 존재하는 에이전트만 남기도록 정렬/필터링합니다.
         - 각 프레임을 ego 기준 상대좌표계로 변환한 뒤, 에이전트 행 정렬을 고정하고
           결측 에이전트는 0으로 패딩합니다.
-        - 과거 처리 단계에서 결정된 `agent_index`(= 현재 프레임의 선택/순서)를 그대로 사용해
+        - 과거 처리 단계에서 결정된 `neighbor_indices`(= 현재 프레임의 선택/순서)를 그대로 사용해
           같은 에이전트만, 같은 순서로 서브셋팅하여 최종 (num_agents, Tf, 3) 배열을 만듭니다.
 
     Args:
@@ -571,7 +574,7 @@ def agent_future_process(
             - 스키마: `AgentInternalIndex` 순서( track_id, vx, vy, heading, width, length, x, y ).
         num_agents (int):
             - 출력할 이웃 슬롯(행)의 고정 개수. K < num_agents 인 경우 남는 행은 0으로 채워짐.
-        agent_index (Union[np.ndarray, List[int]]):
+        neighbor_indices (Union[np.ndarray, List[int]]):
             - 모양: **(K, )**, 값: 정수 인덱스, **K ≤ num_agents**.
             - 의미: 과거 처리(`agent_past_process`)에서 결정된 "현재 프레임의 에이전트 행 인덱스 집합".
               이 순서가 최종 출력의 행 순서가 됩니다.
@@ -582,7 +585,7 @@ def agent_future_process(
             - 채널: [x, y, heading] (모두 **ego 상대좌표계**)
             - dtype: `np.float32`
             - 특이사항: 선택된 에이전트가 미래 프레임에서 사라진 구간은 0으로 패딩됩니다.
-              또한 `agent_index` 길이가 `num_agents`보다 작으면 남은 행은 전부 0입니다.
+              또한 `neighbor_indices` 길이가 `num_agents`보다 작으면 남은 행은 전부 0입니다.
 
     Notes:
         - 내부 단계
@@ -592,9 +595,9 @@ def agent_future_process(
                → 각 프레임을 ego 상대좌표계로 변환.
             3) `_pad_agent_states_with_zeros(...)`
                → 현재 프레임의 행 순서를 기준으로 모든 프레임의 행을 고정, 결측은 0 패딩.
-            4) `agent_index`로 서브셋팅
+            4) `neighbor_indices`로 서브셋팅
                → 과거에서 고른 동일 에이전트만, 동일한 행 순서로 (x, y, heading) 추출.
-        - 안전성 전제: `agent_index`는 현재 프레임의 유효 행 범위 내 정수 인덱스여야 합니다
+        - 안전성 전제: `neighbor_indices`는 현재 프레임의 유효 행 범위 내 정수 인덱스여야 합니다
           (보통 `agent_past_process`의 반환값을 그대로 넘기므로 보장됩니다).
 
     """
@@ -619,7 +622,7 @@ def agent_future_process(
                              dtype=np.float32)
 
     # agent_index의 순서가 곧 출력 행 순서가 된다.
-    for i, j in enumerate(agent_index):
+    for i, j in enumerate(neighbor_indices):
         # padded_agent_states[1:, j, [x, y, heading]] → (Tf, 3)
         agent_futures[i] = padded_agent_states[1:, j, [
             AgentInternalIndex.x(),
