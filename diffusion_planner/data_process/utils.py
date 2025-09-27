@@ -54,9 +54,10 @@ from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajector
 
 
 def get_npc_route_roadblock_ids(
-        scenario: NuPlanScenario,
-        sampled_past_observations: List[TrackedObjects],
-        neighbor_track_token: Optional[List[Optional[str]]],  # 길이 = agent_num
+    scenario: NuPlanScenario,
+    sampled_past_observations: List[TrackedObjects],
+    neighbor_track_token: Optional[List[Optional[str]]],  # 길이 = agent_num
+    horizon=20.,
 ) -> Dict[str, List[str]]:
     """
     get_future_tracked_objects를 이용해 한 번에 궤적을 수집하고,
@@ -66,7 +67,6 @@ def get_npc_route_roadblock_ids(
     # iteration=0 시점부터 시나리오 끝까지 future 트랙 객체를 한줄로 가져옴
     # 전체 horizon은 시나리오 총 길이(초)로 지정
     # horizon = max(30.0,  _scenario_total_horizon_s(scenario))
-    horizon = 20.
     num_samples = int(horizon / 0.1)
     # 1) 에이전트별 StateSE2 리스트 수집
     if neighbor_track_token is None:

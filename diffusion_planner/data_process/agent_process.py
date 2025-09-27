@@ -36,7 +36,10 @@ def _extract_agent_array(
             TrackedObjectType.VEHICLE, TrackedObjectType.PEDESTRIAN,
             TrackedObjectType.BICYCLE
         ]
-    :return: The generated array and the updated token_to_id dict.
+    :return:
+        frame_agents_feature : np.ndarray ((frame_agents_num, 8)),
+        token_to_id : Dict[str, int],
+        agent_types : List[TrackedObjectType]
     """
     agents: List[TrackedObject] = tracked_objects.get_tracked_objects_of_types(
         object_types)
@@ -75,9 +78,11 @@ def sampled_tracked_objects_to_array_list(
         Dict[str, int]
         ]:
     """
-    Arrayifies the agents features from the provided past detections.
-    For N past detections, output is a list of length N, with each array as described in `_extract_agent_array()`.
-    :param tracked_objects_list: The tracked objects to arrayify.
+    Arrayifies the agents features from the provided sequential detections.
+    For N past detections, output is a list of length N,
+        with each array as described in `_extract_agent_array()`.
+    :param tracked_objects_list:
+        The tracked objects to arrayify.
     :return: The arrayified objects.
     """
     object_types = [
@@ -88,8 +93,7 @@ def sampled_tracked_objects_to_array_list(
     all_frame_agents_feature = []
     # List[ List[TrackedObjectType] ]
     all_frame_agents_types = []
-    # Dict[str, int]
-    token_to_id = {}
+    token_to_id: Dict[str, int] = {}
 
     for timestep_idx in range(len(tracked_objects_list)):
         if type(tracked_objects_list[timestep_idx]) == DetectionsTracks:
@@ -97,12 +101,18 @@ def sampled_tracked_objects_to_array_list(
                 timestep_idx].tracked_objects
         else:
             tracked_objects = tracked_objects_list[timestep_idx]
-        # Tuple[np.ndarray ((frame_agents_num, 8)), Dict[str, int], List[TrackedObjectType]]
+        # frame_agents_feature : np.ndarray ((frame_agents_num, 8)),
+        # token_to_id : Dict[str, int],
+        # agent_types : List[TrackedObjectType]
         frame_agents_feature, token_to_id, agent_types = _extract_agent_array(
             tracked_objects, token_to_id, object_types)
         all_frame_agents_feature.append(frame_agents_feature)
         all_frame_agents_types.append(agent_types)
-
+    """
+    all_frame_agents_feature: List[ np.ndarray ((frame_agents_num, 8)) ] # len: num_frames
+    all_frame_agents_types: List[ List[TrackedObjectType] ] # len: num_frames
+    token_to_id: Dict[str, int] 
+    """
     return all_frame_agents_feature, all_frame_agents_types, token_to_id
 
 
@@ -177,24 +187,32 @@ def _filter_agents_array(
     all_frame_agents_feature: List[
         np.ndarray],  # (frame_agents_num, 8) # frame_agents_num 길이가 가변적
     reverse: bool = False
-) -> List[np.ndarray]:
+) -> List[
+        np.
+        ndarray]:  # len: num_frames, np.ndarray shape: (frame_save_agents_num, 8) # frame_save_agents_num: 길이 가변적
     """
+    all_frame_agents_feature
+        - `AgentInternalIndex` 순서( track_id, vx, vy, heading, width, length, x, y ).
+
     Filter detections to keep only agents which appear in the first frame (or last frame if reverse=True)
-    :param all_frame_agents_feature: The past agents in the scene. A list of [num_frames] arrays, each complying with the AgentInternalIndex schema
+    :param all_frame_agents_feature:
+        The past agents in the scene.
+        A list of [num_frames] arrays, each complying with the AgentInternalIndex schema
     :param reverse: if True, the last element in the list will be used as the filter
     :return: filtered agents in the same format as the input `agents` parameter
     """
+    # target_frame_agents_feature: (target_frame_agents_num, 8)
     target_frame_agents_feature = all_frame_agents_feature[
         -1] if reverse else all_frame_agents_feature[0]
     # target_frame_agents_id: (target_frame_agents_num,)
     target_frame_agents_id = target_frame_agents_feature[:,
                                                          AgentInternalIndex.
                                                          track_token()]
-    for past_idx in range(len(all_frame_agents_feature)):
-        frame_exist_agents = []
+    for time_idx in range(len(all_frame_agents_feature)):
+        frame_exist_agents = []  # len: frame_save_agents_num # 길이 가변적
         # (frame_agents_num, 8)
         frame_agents_feature: np.ndarray = all_frame_agents_feature[
-            past_idx]  # (_, 8)
+            time_idx]  # (_, 8)
         for agent_idx in range(frame_agents_feature.shape[0]):
             if target_frame_agents_feature.shape[0] > 0:
                 agent_id = float(
@@ -207,10 +225,47 @@ def _filter_agents_array(
                         frame_agents_feature[agent_idx, :].squeeze())
 
         if len(frame_exist_agents) > 0:
-            all_frame_agents_feature[past_idx] = np.stack(
+            all_frame_agents_feature[time_idx] = np.stack(
                 frame_exist_agents)  # (frame_save_agents_num, 8)
         else:
-            all_frame_agents_feature[past_idx] = np.empty(
+            all_frame_agents_feature[time_idx] = np.empty(
+                (0, frame_agents_feature.shape[1]), dtype=np.float32)  # (0, 8)
+
+    return all_frame_agents_feature
+
+
+def _filter_agents_array_w_token(
+    all_frame_agents_feature: List[
+        np.ndarray],  # (frame_agents_num, 8) # frame_agents_num 길이가 가변적
+    neighbor_token_id: List[Optional[int]],  # (agent_num, )
+) -> List[
+        np.
+        ndarray]:  # len: num_frames, np.ndarray shape: (frame_save_agents_num, 8) # frame_save_agents_num: 길이 가변적
+    for time_idx in range(len(all_frame_agents_feature)):
+        frame_exist_agents = []  # len: frame_save_agents_num # 길이 가변적
+        # (frame_agents_num, 8)
+        frame_agents_feature: np.ndarray = all_frame_agents_feature[
+            time_idx]  # (_, 8)
+        neighbor_token_id_wo_none = [
+            token for token in neighbor_token_id if token is not None
+        ]  #
+        neighbor_token_id_wo_none_array = np.array(neighbor_token_id_wo_none,
+                                                   dtype=np.float32)  #
+        for agent_idx in range(frame_agents_feature.shape[0]):
+            frame_a_agent_feature = frame_agents_feature[agent_idx, :]  # (8,)
+            if neighbor_token_id_wo_none_array.shape[0] > 0:
+                agent_id = float(frame_a_agent_feature[int(
+                    AgentInternalIndex.track_token())])
+                is_in_target_frame = bool(
+                    (agent_id == neighbor_token_id_wo_none_array).max())
+                if is_in_target_frame:
+                    frame_exist_agents.append(frame_a_agent_feature.squeeze())
+
+        if len(frame_exist_agents) > 0:
+            all_frame_agents_feature[time_idx] = np.stack(
+                frame_exist_agents)  # (frame_save_agents_num, 8)
+        else:
+            all_frame_agents_feature[time_idx] = np.empty(
                 (0, frame_agents_feature.shape[1]), dtype=np.float32)  # (0, 8)
 
     return all_frame_agents_feature
@@ -297,6 +352,74 @@ def _pad_agent_states_with_zeros(agent_trajectories):
             if row_idx in mapped_rows:
                 pad_agent_trajectories[idx, row_idx] = frame[
                     frame[:, track_id_idx] == row_idx]
+
+    return pad_agent_trajectories
+
+
+def _pad_agent_states_with_zeros_w_token(
+        agent_trajectories: List[np.ndarray],
+        neighbor_token_id: List[Optional[int]],  # (agent_num, )
+):
+    """
+    주어진 이웃 토큰(neighbor_token_id)의 (x,y,heading)을
+    모든 시점에 대해 (agents_num, 1+Tf, 3) 텐서로 채웁니다.
+    - 토큰이 해당 시점 프레임에 없으면 0으로 유지합니다.
+    - 기존 구현의 동작과 출력 형태를 그대로 보존합니다.
+    - 이웃 에이전트에 대한 내부 for-loop을 없애고 벡터화합니다.
+    """
+    track_id_idx = AgentInternalIndex.track_token()
+    x_idx = AgentInternalIndex.x()
+    y_idx = AgentInternalIndex.y()
+    heading_idx = AgentInternalIndex.heading()
+
+    agent_num = len(neighbor_token_id)
+    future_all_len = len(agent_trajectories)
+
+    # 출력 버퍼: (agents_num, 1+Tf, 3)
+    pad_agent_trajectories = np.zeros((agent_num, future_all_len, 3),
+                                      dtype=np.float32)
+
+    # 이웃 토큰을 벡터로 준비 (None → NaN 로 마스킹)
+    # neighbor_token_id_array: shape (agents_num,)
+    neighbor_token_id_array = np.array([
+        np.nan if token is None else float(token) for token in neighbor_token_id
+    ],
+                                       dtype=np.float32)
+    valid_neighbor_mask = ~np.isnan(neighbor_token_id_array)
+    if not np.any(valid_neighbor_mask):
+        return pad_agent_trajectories  # 전부 None이면 바로 반환
+
+    valid_neighbor_indices = np.nonzero(valid_neighbor_mask)[0]  # (K,)
+    valid_neighbor_tokens = neighbor_token_id_array[valid_neighbor_mask]  # (K,)
+
+    # 각 시점 프레임에 대해 한 번씩만 처리 (프레임 길이가 가변이므로 이 루프는 필요)
+    for timestep_idx, frame in enumerate(agent_trajectories):
+        # frame: (frame_agents_num, 8) 혹은 (0, 8)
+        if frame.size == 0:
+            continue
+
+        # 현재 프레임의 에이전트 track_id들
+        frame_ids = frame[:, track_id_idx].astype(np.float32,
+                                                  copy=False)  # (F,)
+
+        # 교집합 계산: frame에 실제로 존재하는 이웃 토큰만 추림
+        #  - inter: 공통 토큰 값(정렬됨)
+        #  - idx_frame: frame_ids 내 위치
+        #  - idx_neighbors: valid_neighbor_tokens 내 위치
+        inter, idx_frame, idx_neighbors = np.intersect1d(frame_ids,
+                                                         valid_neighbor_tokens,
+                                                         assume_unique=False,
+                                                         return_indices=True)
+        if inter.size == 0:
+            continue
+
+        # 해당 행의 (x, y, heading) 한 번에 수집
+        xyh = frame[idx_frame][:, [x_idx, y_idx, heading_idx]].astype(
+            np.float32, copy=False)  # (M, 3)
+
+        # 원래 neighbor_token_id 위치로 되돌려 채움
+        neighbor_positions = valid_neighbor_indices[idx_neighbors]  # (M,)
+        pad_agent_trajectories[neighbor_positions, timestep_idx, :] = xyh
 
     return pad_agent_trajectories
 
@@ -547,13 +670,13 @@ def agent_past_process(
 
 
 def agent_future_process(
-        anchor_ego_state: np.ndarray,  # (3,)
-        future_tracked_objects: List[
-            np.ndarray],  # 길이 = 1(현재)+Tf, 각 원소: (frame_agents_num, 8)
-        num_agents: int,  # 출력 이웃 슬롯 수
-        neighbor_indices: Union[
-            np.ndarray, List[int]],  # 길이 K(≤ num_agents), 현재 프레임의 행 인덱스들
-) -> np.ndarray:
+    anchor_ego_state: np.ndarray,  # (3,)
+    future_tracked_objects: List[
+        np.ndarray],  # 길이 = 1(현재)+Tf, 각 원소: (frame_agents_num, 8)
+    num_agents: int,  # 출력 이웃 슬롯 수
+    neighbor_indices: Union[np.ndarray,
+                            List[int]],  # 길이 K(≤ num_agents), 현재 프레임의 행 인덱스들
+) -> np.ndarray:  # **(num_agents, Tf, 3)**
     """현재 시점에서 선택된 에이전트 집합(행 인덱스)을 유지한 채 미래 시퀀스를 (x, y, heading)로 생성합니다.
     개요:
         - 입력으로 들어온 `future_tracked_objects`(현재+미래 프레임들의 원시 감지 배열)를
@@ -601,8 +724,8 @@ def agent_future_process(
           (보통 `agent_past_process`의 반환값을 그대로 넘기므로 보장됩니다).
 
     """
-    agent_future = _filter_agents_array(
-        future_tracked_objects)  # list 길이 = 1 + Tf, 각 (frame_agents_num, 8)
+    # len: num_frames, np.ndarray shape: (frame_save_agents_num, 8) # frame_save_agents_num: 길이 가변적
+    agent_future = _filter_agents_array(future_tracked_objects)
 
     local_coords_agent_states = []
     for agent_state in agent_future:
@@ -615,19 +738,43 @@ def agent_future_process(
     #  - 현재 프레임의 행 순서 고정, 결측은 0으로 패딩
     padded_agent_states = _pad_agent_states_with_zeros(
         local_coords_agent_states)
-
+    future_len = padded_agent_states.shape[0] - 1  # Tf
+    padded_agent_states_future = padded_agent_states[
+        1:, :, :]  # (Tf, current_agents_num, 8)
     # 최종 결과 버퍼: (num_agents, Tf, 3)  ← 현재(인덱스 0) 제외한 미래 구간만 사용
-    agent_futures = np.zeros(shape=(num_agents,
-                                    padded_agent_states.shape[0] - 1, 3),
+    agent_futures = np.zeros(shape=(num_agents, future_len, 3),
                              dtype=np.float32)
 
     # agent_index의 순서가 곧 출력 행 순서가 된다.
-    for i, j in enumerate(neighbor_indices):
-        # padded_agent_states[1:, j, [x, y, heading]] → (Tf, 3)
-        agent_futures[i] = padded_agent_states[1:, j, [
+    for i, key_frame_idx in enumerate(neighbor_indices):
+        # padded_agent_states[1:, key_frame_idx, [x, y, heading]] → (Tf, 3)
+        agent_futures[i] = padded_agent_states_future[:, key_frame_idx, [
             AgentInternalIndex.x(),
             AgentInternalIndex.y(),
             AgentInternalIndex.heading()
         ]]
 
     return agent_futures
+
+
+def agent_future_all_process(
+        anchor_ego_state: np.ndarray,  # (3,)
+        future_tracked_objects: List[
+            np.ndarray],  # 길이 = 1(현재)+Tf, 각 원소: (frame_agents_num, 8)
+        neighbor_token_id: List[Optional[int]],  # (agent_num, )
+) -> np.ndarray:  # (agents_num, 1 + Tf, 3)
+    # len: num_frames, np.ndarray shape: (frame_save_agents_num, 8) # frame_save_agents_num: 길이 가변적
+    agent_future = _filter_agents_array_w_token(future_tracked_objects,
+                                                neighbor_token_id)
+
+    local_coords_agent_states = []
+    for agent_state in agent_future:
+        # agent_state: (frame_agents_num, 8)  → ego 상대좌표계로 변환
+        local_coords_agent_states.append(
+            convert_absolute_quantities_to_relative(agent_state,
+                                                    anchor_ego_state, 'agent'))
+
+    # padded_agent_states: (agents_num, 1 + Tf, 3)
+    padded_agent_states = _pad_agent_states_with_zeros_w_token(
+        local_coords_agent_states, neighbor_token_id)
+    return padded_agent_states

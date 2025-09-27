@@ -505,6 +505,10 @@ class DrawingOptions:
         "line_color": ORANGE,  # 주황색
         "line_width": 0.2,
     }
+    ###################
+    DIFF_draw_near_future_all_gt_3_dim: bool = False
+    DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+    DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
 
 
 # =============================================================================
@@ -1716,6 +1720,43 @@ def draw_neighbor_past_all(ax: plt.Axes, input_data: WorldModelFeature,
                                   draw_option)
 
 
+def draw_near_future_all_gt_3_dim(ax: plt.Axes, near_future_all_gt_3_dim: Array,
+                                  options: DrawingOptions) -> None:
+    """near_future_all_gt_3_dim (Pnn, future_all_len, 3=[x,y,yaw])를
+    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..Pnn-1)를 흰색으로 표기.
+
+    규칙:
+      - invalid: |x|<=eps and |y|<=eps → 스킵
+      - 마커: 흰색 'x', 선 없음
+      - 라벨: 첫 점이 유효할 때만 표시
+    """
+    if near_future_all_gt_3_dim is None or near_future_all_gt_3_dim.size == 0:
+        return
+    if near_future_all_gt_3_dim.ndim != 3 or near_future_all_gt_3_dim.shape[
+            -1] != 3:
+        raise ValueError(
+            "near_future_all_gt_3_dim는 (Pnn, future_len, 3) 이어야 합니다.")
+
+    eps = options.invalid_eps
+    Pnn, future_len, _ = near_future_all_gt_3_dim.shape
+
+    for a in range(Pnn):
+        traj = near_future_all_gt_3_dim[a]  # (future_all_len, 3)
+        # 모든 유효 포인트를 x마커로 그리기
+        for t in range(future_len):
+            row = traj[t]
+            if not is_valid_future_row_xyyaw(row, eps):
+                continue
+            x, y = float(row[0]), float(row[1])
+            ax.plot(x,
+                    y,
+                    marker='x',
+                    markersize=options.DIFF_future_all_gt_3_dim_marker_size,
+                    linestyle='None',
+                    color=options.DIFF_future_all_gt_3_dim_COLOR,
+                    zorder=26)
+
+
 def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
                              output_data: Optional[Dict[str, Any]],
                              draw_option: DrawingOptions):
@@ -1741,6 +1782,11 @@ def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
             draw_option,
             diff_token_to_next_wp_wrt_ego,
         )
+    near_future_all_gt_3_dim = input_data.get("near_future_all_gt_3_dim", None) # (Pnn, future_len_all, 3)
+    if draw_option.DIFF_draw_near_future_all_gt_3_dim and (
+            near_future_all_gt_3_dim is not None):
+        draw_near_future_all_gt_3_dim(ax, near_future_all_gt_3_dim,
+                                      draw_option)
     #########################################
 
 
