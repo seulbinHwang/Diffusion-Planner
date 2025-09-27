@@ -476,7 +476,7 @@ class DataProcessor(object):
                 neighbor_token_id.append(None)
             else:
                 neighbor_token_id.append(token_to_id[track_token])
-        # (agents_num, 1 + Tf = future_len_all, 3)
+        # (agents_num, 1 + Tf = future_all_len, 3)
         neighbor_future_all_gt_3_dim = agent_future_all_process(
             anchor_ego_state, self.init_future_tracked_objects_array_list,
             neighbor_token_id)
@@ -488,7 +488,7 @@ class DataProcessor(object):
             "neighbor_future_gt_3_dim":
                 neighbor_future_gt_3_dim,  # (num_agents, future_len, 3)
             "neighbor_future_all_gt_3_dim":
-                neighbor_future_all_gt_3_dim,  # (num_agents, future_len_all, 3)
+                neighbor_future_all_gt_3_dim,  # (num_agents, future_all_len, 3)
             "static_objects": static_objects
         }
         if "agent_route_lane_order" in vector_map:

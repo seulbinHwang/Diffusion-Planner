@@ -58,6 +58,8 @@ class BokehAgentStates(NamedTuple):
     velocity_ys: List[float]  # [m/s], A list of velocity in y (body frame).
     speeds: List[float]  # [m/s], A list of speed.
     headings: List[float]  # [m], a list of headings
+    gt_future_xs: List[List[float]]
+    gt_future_ys: List[List[float]]
     prediction_xs: List[
         List[float]]  # [m], predicted trajectory xs for each agent
     prediction_ys: List[
@@ -458,6 +460,8 @@ class AgentStatePlot(BaseScenarioPlot):
         default_factory=dict)  # A dict of data for each frame
     plots: Dict[str, GlyphRenderer] = field(
         default_factory=dict)  # A dict of plots for each type
+    gt_future_plots: Dict[str, GlyphRenderer] = field(
+        default_factory=dict)  # Predicted trajectory plots for each type
     prediction_plots: Dict[str, GlyphRenderer] = field(
         default_factory=dict)  # Predicted trajectory plots for each type
     past_plots: Dict[str, GlyphRenderer] = field(
@@ -517,6 +521,7 @@ class AgentStatePlot(BaseScenarioPlot):
                     data_sources: (ColumnDataSources)
                     """
                     plot = self.plots.get(category, None)
+                    gt_future_plot = self.gt_future_plots.get(category, None)
                     prediction_plot = self.prediction_plots.get(category, None)
                     past_plot = self.past_plots.get(category, None)
                     data = dict(data_source.data)
@@ -529,6 +534,14 @@ class AgentStatePlot(BaseScenarioPlot):
                             fill_alpha=agent_color["fill_alpha"],
                             line_color=agent_color["line_color"],
                             line_width=agent_color["line_width"],
+                            source=data,
+                        )
+                        self.gt_future_plots[category] = main_figure.multi_line(
+                            xs="gt_future_xs",
+                            ys="gt_future_ys",
+                            line_color=BRIGHT_CYAN,
+                            line_alpha=0.8,
+                            line_width=2,
                             source=data,
                         )
                         self.prediction_plots[
@@ -572,6 +585,9 @@ class AgentStatePlot(BaseScenarioPlot):
                         main_figure.add_tools(agent_hover)
                     else:
                         self.plots[category].data_source.data = data
+                        if gt_future_plot:
+                            self.gt_future_plots[
+                                category].data_source.data = data
                         if prediction_plot:
                             self.prediction_plots[
                                 category].data_source.data = data
@@ -627,6 +643,8 @@ tracked_object_types = {
                     velocity_ys = []
                     speeds = []
                     headings = []
+                    gt_future_xs: List[List[float]] = []
+                    gt_future_ys: List[List[float]] = []
                     prediction_xs: List[List[float]] = []
                     prediction_ys: List[List[float]] = []
                     past_xs = []
@@ -659,9 +677,22 @@ tracked_object_types = {
                             predictions_list: List[
                                 PredictedTrajectory] = tracked_object.predictions
                             if len(predictions_list) >= 1:
-
-                                first_pred: PredictedTrajectory = predictions_list[
+                                # GT
+                                gt_future: PredictedTrajectory = predictions_list[
                                     0]
+                                gt_future_states = gt_future.trajectory.get_sampled_trajectory(
+                                )
+                                gt_future_x = [
+                                    state.center.x for state in gt_future_states
+                                ]
+                                gt_future_y = [
+                                    state.center.y for state in gt_future_states
+                                ]
+                                gt_future_xs.append(gt_future_x)
+                                gt_future_ys.append(gt_future_y)
+                                # PRED
+                                first_pred: PredictedTrajectory = predictions_list[
+                                    1]
                                 pred_states = first_pred.trajectory.get_sampled_trajectory(
                                 )
                                 pred_xs = [
@@ -673,6 +704,8 @@ tracked_object_types = {
                                 prediction_xs.append(pred_xs)
                                 prediction_ys.append(pred_ys)
                             else:
+                                gt_future_xs.append([])
+                                gt_future_ys.append([])
                                 prediction_xs.append([])
                                 prediction_ys.append([])
 
@@ -692,6 +725,8 @@ tracked_object_types = {
                                 past_xs.append([])
                                 past_ys.append([])
                         else:
+                            gt_future_xs.append([])
+                            gt_future_ys.append([])
                             prediction_xs.append([])
                             prediction_ys.append([])
                             past_xs.append([])
@@ -709,6 +744,8 @@ tracked_object_types = {
                         velocity_ys=velocity_ys,
                         speeds=speeds,
                         headings=headings,
+                        gt_future_xs=gt_future_xs,
+                        gt_future_ys=gt_future_ys,
                         prediction_xs=prediction_xs,
                         prediction_ys=prediction_ys,
                         past_xs=past_xs,

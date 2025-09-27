@@ -1782,7 +1782,7 @@ def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
             draw_option,
             diff_token_to_next_wp_wrt_ego,
         )
-    near_future_all_gt_3_dim = input_data.get("near_future_all_gt_3_dim", None) # (Pnn, future_len_all, 3)
+    near_future_all_gt_3_dim = input_data.get("near_future_all_gt_3_dim", None) # (Pnn, future_all_len, 3)
     if draw_option.DIFF_draw_near_future_all_gt_3_dim and (
             near_future_all_gt_3_dim is not None):
         draw_near_future_all_gt_3_dim(ax, near_future_all_gt_3_dim,

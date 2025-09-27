@@ -86,12 +86,24 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         target_agents_mask = self._get_target_agents_mask(
             neighbor_track_token, current_input.diffusion_agents_tokens)
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
-            "neighbor_future_all_gt_3_dim", None) # (agent_num, future_len_all, 3)
-        # near_future_all_gt_3_dim : (Pnn, future_len_all, 3)
+            "neighbor_future_all_gt_3_dim",
+            None)  # (agent_num, future_all_len, 3)
+        token_to_future_all_gt_3_dim: Dict[str, np.ndarray] = {}
+        # near_future_all_gt_3_dim : (Pnn, future_all_len, 3)
         if neighbor_future_all_gt_3_dim is not None:
-            near_future_all_gt_3_dim = neighbor_future_all_gt_3_dim[target_agents_mask]
-            self.unnormalized_features[
-                "near_future_all_gt_3_dim"] = near_future_all_gt_3_dim
+            near_future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
+                target_agents_mask]
+            for idx, token in enumerate(neighbor_track_token):
+                if token is not None:
+                    token_to_future_all_gt_3_dim[
+                        token] = neighbor_future_all_gt_3_dim[
+                            idx]  # (future_all_len, 3)
+        else:
+            near_future_all_gt_3_dim = None
+        self.unnormalized_features[
+            "near_future_all_gt_3_dim"] = near_future_all_gt_3_dim  # (Pnn, future_all_len, 3) or None
+        self.unnormalized_features[
+            "token_to_future_all_gt_3_dim"] = token_to_future_all_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
 
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)

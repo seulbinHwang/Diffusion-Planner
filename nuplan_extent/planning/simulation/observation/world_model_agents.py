@@ -28,7 +28,7 @@ from nuplan_extent.planning.simulation.trajectory.interpolated_trajectory import
 from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization
 from nuplan.planning.training.preprocessing.features.abstract_model_feature import AbstractModelFeature
-from scipy.optimize import linear_sum_assignment
+from nuplan.common.actor_state.oriented_box import OrientedBox
 
 from scipy.spatial.distance import cdist
 # /Users/user/PycharmProjects/nuplan-devkit/nuplan/common/actor_state/tracked_objects.py
@@ -776,7 +776,8 @@ class WorldModelAgents(AbstractMLAgents):
         self, iteration: SimulationIteration, history: SimulationHistoryBuffer,
         interp_next_ego_11_dim: Optional[npt.NDArray[np.float32]],
         planner_future_11_dim: Optional[npt.NDArray[np.float32]]
-    ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]]]:
+    ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]], Dict[
+            str, np.ndarray]]:
         # Construct input features
         initialization = HorizonPlannerInitialization(
             # 시나리오가 끝나고도 계속 진행했을 때 최종적으로 도달해야 하는 포즈 (존재하지 않을 수도 있음)
@@ -810,8 +811,11 @@ class WorldModelAgents(AbstractMLAgents):
         neighbor_token_dist_order: List[
             Optional[str]] = model_input_key_to_unnorm_value[
                 "neighbor_track_token"]  # (agent_num, )
+        token_to_future_all_gt_3_dim: np.ndarray = model_input_key_to_unnorm_value[
+            "token_to_future_all_gt_3_dim"]  #  (Pnn, future_all_len, 3)
         self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
-        return (model_input_key_to_value, neighbor_token_dist_order)
+        return (model_input_key_to_value, neighbor_token_dist_order,
+                token_to_future_all_gt_3_dim)
 
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
@@ -829,14 +833,16 @@ class WorldModelAgents(AbstractMLAgents):
                                                         self._ego_anchor_state)
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
-        (model_input_key_to_value,
-         neighbor_token_dist_order) = self._get_model_input(
+        # near_future_all_gt_3_dim: np.ndarray, (Pnn, future_all_len, 3)
+        (model_input_key_to_value, neighbor_token_dist_order,
+         token_to_future_all_gt_3_dim) = self._get_model_input(
              iteration, history, interp_next_ego_11_dim, planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         self.infer_model(model_input_key_to_value, iteration, next_iteration,
-                         neighbor_token_dist_order)
+                         neighbor_token_dist_order,
+                         token_to_future_all_gt_3_dim)
 
     def update_observation(
             self,
@@ -1035,15 +1041,39 @@ class WorldModelAgents(AbstractMLAgents):
             cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)
         return rel_future_arrays
 
+    def from_np_to_waypoint_list(
+        self,
+        a_near_future_all_gt_3_dim: Optional[np.ndarray]  # (future_all_len, 3)
+    ) -> List[Waypoint]:
+        a_near_future_all_waypoints: List[Waypoint] = []
+        if a_near_future_all_gt_3_dim is not None:
+            for t in range(a_near_future_all_gt_3_dim.shape[0]):
+                state = a_near_future_all_gt_3_dim[t, :]  # (3,)
+                waypoint = Waypoint(time_point=TimePoint(time_us=0),
+                                    oriented_box=OrientedBox(
+                                        center=StateSE2(x=float(state[0]),
+                                                        y=float(state[1]),
+                                                        heading=float(
+                                                            state[2])),
+                                        length=0,
+                                        width=0,
+                                        height=0,
+                                    ))
+                a_near_future_all_waypoints.append(waypoint)
+        return a_near_future_all_waypoints
+
     def _update_diffusion_agents(
-            self,
-            diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
-            next_iteration: SimulationIteration,
-            cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
+        self,
+        diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
+        next_iteration: SimulationIteration,
+        cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
+        token_to_future_all_gt_3_dim: Dict[str,
+                                           np.ndarray]  # len : valid_agent_num
     ) -> None:
         diff_token_to_updated_agent: Dict[str, Agent] = {}
         diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)
         for diff_token, interpol_traj in diff_token_to_interpol_traj.items():
+
             agent_ = self._diffusion_agents[diff_token]
             new_timestamp_us = next_iteration.time_point.time_us
             new_metadata = SceneObjectMetadata(new_timestamp_us,
@@ -1061,9 +1091,16 @@ class WorldModelAgents(AbstractMLAgents):
                 velocity=updated_waypoint.velocity,
                 metadata=new_metadata,
             )
+            a_near_future_all_gt_3_dim = token_to_future_all_gt_3_dim[
+                diff_token]  # (future_all_len, 3)
             updated_agent.predictions = [
+                # GT 궤적
+                PredictedTrajectory(probability=0.5,
+                                    waypoints=self.from_np_to_waypoint_list(
+                                        a_near_future_all_gt_3_dim)),
+                # 모델 생성 궤적
                 PredictedTrajectory(
-                    probability=1.,
+                    probability=0.5,
                     waypoints=interpol_traj.get_sampled_trajectory())
             ]
             diff_token_to_updated_agent[diff_token] = updated_agent
@@ -1141,7 +1178,9 @@ class WorldModelAgents(AbstractMLAgents):
         model_input_key_to_value: Dict[str, AbstractModelFeature],
         iteration: SimulationIteration,
         next_iteration: SimulationIteration,
-        neighbor_token_dist_order: List[Optional[str]]  # len == agent_num
+        neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
+        token_to_future_all_gt_3_dim: Dict[str,
+                                           np.ndarray]  # len : valid_agent_num
     ) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
             "world_model_feature"]
@@ -1174,7 +1213,8 @@ class WorldModelAgents(AbstractMLAgents):
             diff_token_to_np_gen_traj_wrt_ego, diff_token_to_global_xyyaw,
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
         self._update_diffusion_agents(diff_token_to_interpol_traj,
-                                      next_iteration, cur_ego_global_xyyaw)
+                                      next_iteration, cur_ego_global_xyyaw,
+                                      token_to_future_all_gt_3_dim)
 
     def _infer_model(self, features: FeaturesType) -> TargetsType:
         pass
