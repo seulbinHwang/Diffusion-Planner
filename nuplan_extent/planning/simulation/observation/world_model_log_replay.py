@@ -448,7 +448,6 @@ class WorldModelLogReplay(AbstractMLAgents):
         super().__init__(model, scenario)
         self.config = model.config
         self.predicted_neighbor_num = self.config.predicted_neighbor_num
-        self.current_iteration = 0
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
 
@@ -459,14 +458,16 @@ class WorldModelLogReplay(AbstractMLAgents):
         tracked_objects: TrackedObjects = all_things.tracked_objects
         new_tracked_objects_list: List[TrackedObject] = []
         diffusion_agents_tokens = list(self._diffusion_agents.keys())
-        for tracked_object in tracked_objects:
-            # tracked_object: Agent # 바꿔치기 하면됨.
-            if tracked_object.track_token in diffusion_agents_tokens:
-                diffusion_agent = self._diffusion_agents[
-                    tracked_object.track_token]
-                tracked_object.predictions = diffusion_agent.predictions
-            new_tracked_objects_list.append(tracked_object)
-        all_things.tracked_objects = TrackedObjects(new_tracked_objects_list)
+
+        if self._diffusion_agents:
+            for tracked_object in tracked_objects:
+                # tracked_object: Agent # 바꿔치기 하면됨.
+                if tracked_object.track_token in diffusion_agents_tokens:
+                    diffusion_agent = self._diffusion_agents[
+                        tracked_object.track_token]
+                    tracked_object.predictions = diffusion_agent.predictions
+                new_tracked_objects_list.append(tracked_object)
+            all_things.tracked_objects = TrackedObjects(new_tracked_objects_list)
 
         return all_things
 
@@ -476,6 +477,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         """
         self.current_iteration = 0
         self.current_observation = None
+        self._diffusion_agents = {}
 
     def _get_diffusion_agents(self, ego_state: EgoState) -> None:
         """
@@ -499,7 +501,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         unique_agents: Dict[str, TrackedObject] = {
             tracked_object.track_token: tracked_object
             for tracked_object in
-            self._scenario.initial_tracked_objects.tracked_objects
+            self._scenario.get_tracked_objects_at_iteration(self.current_iteration).tracked_objects
             if tracked_object.tracked_object_type in {
                 TrackedObjectType.VEHICLE,
                 TrackedObjectType.PEDESTRIAN,
@@ -906,12 +908,12 @@ class WorldModelLogReplay(AbstractMLAgents):
         neighbor_token_dist_order: List[
             Optional[str]] = model_input_key_to_unnorm_value[
                 "neighbor_track_token"]  # (agent_num, )
-        token_to_future_gt_3_dim: np.ndarray = \
+        diff_token_to_future_gt_3_dim: np.ndarray = \
         model_input_key_to_unnorm_value[
-            "token_to_future_gt_3_dim"]  # (Pnn, future_all_len, 3)
+            "diff_token_to_future_gt_3_dim"]  # (Pnn, future_len, 3)
         self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
         return (model_input_key_to_value, neighbor_token_dist_order,
-                token_to_future_gt_3_dim)
+                diff_token_to_future_gt_3_dim)
 
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
@@ -929,15 +931,15 @@ class WorldModelLogReplay(AbstractMLAgents):
                                                         self._ego_anchor_state)
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
-        # token_to_future_gt_3_dim: Dict[str, np.ndarray] # len : valid_agent_num
+        # diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] # len : valid_agent_num
         (model_input_key_to_value, neighbor_token_dist_order,
-         token_to_future_gt_3_dim) = self._get_model_input(
+         diff_token_to_future_gt_3_dim) = self._get_model_input(
              iteration, history, interp_next_ego_11_dim, planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         self.infer_model(model_input_key_to_value, iteration, next_iteration,
-                         neighbor_token_dist_order, token_to_future_gt_3_dim)
+                         neighbor_token_dist_order, diff_token_to_future_gt_3_dim)
 
     def update_observation(
             self,
@@ -1246,7 +1248,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         iteration: SimulationIteration,
         next_iteration: SimulationIteration,
         neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
-        token_to_future_gt_3_dim: Dict[
+        diff_token_to_future_gt_3_dim: Dict[
             str, np.ndarray]  # len : valid_agent_num # (future_len, 3)
     ) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
@@ -1281,7 +1283,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
         self._update_diffusion_agents(diff_token_to_interpol_traj,
                                       next_iteration, cur_ego_global_xyyaw,
-                                      token_to_future_gt_3_dim)
+                                      diff_token_to_future_gt_3_dim)
 
     def _infer_model(self, features: FeaturesType) -> TargetsType:
         pass
@@ -1312,7 +1314,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
         next_iteration: SimulationIteration,
         cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
-        token_to_future_gt_3_dim: Dict[str, np.ndarray]  # len : valid_agent_num
+        diff_token_to_future_gt_3_dim: Dict[str, np.ndarray]  # len : valid_agent_num
     ) -> None:
         diff_token_to_updated_agent: Dict[str, Agent] = {}
         diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)
@@ -1335,7 +1337,7 @@ class WorldModelLogReplay(AbstractMLAgents):
                 velocity=updated_waypoint.velocity,
                 metadata=new_metadata,
             )
-            a_near_future_gt_3_dim = token_to_future_gt_3_dim[
+            a_near_future_gt_3_dim = diff_token_to_future_gt_3_dim[
                 diff_token]  # (future_len, 3)
             updated_agent.predictions = [
                 # GT 궤적

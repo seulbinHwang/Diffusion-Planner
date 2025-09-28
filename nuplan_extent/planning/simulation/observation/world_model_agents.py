@@ -812,11 +812,11 @@ class WorldModelAgents(AbstractMLAgents):
         neighbor_token_dist_order: List[
             Optional[str]] = model_input_key_to_unnorm_value[
                 "neighbor_track_token"]  # (agent_num, )
-        token_to_future_all_gt_3_dim: np.ndarray = model_input_key_to_unnorm_value[
-            "token_to_future_all_gt_3_dim"]  #  (Pnn, future_all_len, 3)
+        diff_token_to_future_all_gt_3_dim: np.ndarray = model_input_key_to_unnorm_value[
+            "diff_token_to_future_all_gt_3_dim"]  #  (Pnn, future_all_len, 3)
         self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
         return (model_input_key_to_value, neighbor_token_dist_order,
-                token_to_future_all_gt_3_dim)
+                diff_token_to_future_all_gt_3_dim)
 
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
@@ -834,16 +834,15 @@ class WorldModelAgents(AbstractMLAgents):
                                                         self._ego_anchor_state)
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
-        # near_future_all_gt_3_dim: np.ndarray, (Pnn, future_all_len, 3)
         (model_input_key_to_value, neighbor_token_dist_order,
-         token_to_future_all_gt_3_dim) = self._get_model_input(
+         diff_token_to_future_all_gt_3_dim) = self._get_model_input(
              iteration, history, interp_next_ego_11_dim, planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         self.infer_model(model_input_key_to_value, iteration, next_iteration,
                          neighbor_token_dist_order,
-                         token_to_future_all_gt_3_dim)
+                         diff_token_to_future_all_gt_3_dim)
 
     def update_observation(
             self,
@@ -1068,7 +1067,7 @@ class WorldModelAgents(AbstractMLAgents):
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
         next_iteration: SimulationIteration,
         cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
-        token_to_future_all_gt_3_dim: Dict[str,
+        diff_token_to_future_all_gt_3_dim: Dict[str,
                                            np.ndarray]  # len : valid_agent_num
     ) -> None:
         diff_token_to_updated_agent: Dict[str, Agent] = {}
@@ -1092,7 +1091,7 @@ class WorldModelAgents(AbstractMLAgents):
                 velocity=updated_waypoint.velocity,
                 metadata=new_metadata,
             )
-            a_near_future_all_gt_3_dim = token_to_future_all_gt_3_dim[
+            a_near_future_all_gt_3_dim = diff_token_to_future_all_gt_3_dim[
                 diff_token]  # (future_all_len, 3)
             updated_agent.predictions = [
                 # GT 궤적
@@ -1180,7 +1179,7 @@ class WorldModelAgents(AbstractMLAgents):
         iteration: SimulationIteration,
         next_iteration: SimulationIteration,
         neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
-        token_to_future_all_gt_3_dim: Dict[str,
+        diff_token_to_future_all_gt_3_dim: Dict[str,
                                            np.ndarray]  # len : valid_agent_num
     ) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
@@ -1215,7 +1214,7 @@ class WorldModelAgents(AbstractMLAgents):
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
         self._update_diffusion_agents(diff_token_to_interpol_traj,
                                       next_iteration, cur_ego_global_xyyaw,
-                                      token_to_future_all_gt_3_dim)
+                                      diff_token_to_future_all_gt_3_dim)
 
     def _infer_model(self, features: FeaturesType) -> TargetsType:
         pass

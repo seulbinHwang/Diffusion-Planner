@@ -46,35 +46,41 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     ) -> None:
         neighbor_future_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_gt_3_dim", None)  # (agent_num, future_len, 3)
+        target_track_token: List[Optional[str]] = []
+        for idx, token in enumerate(neighbor_track_token):
+            if target_agents_mask[idx]:
+                target_track_token.append(token)
+            else:
+                target_track_token.append(None)
 
-        token_to_future_gt_3_dim: Dict[str, np.ndarray] = {}
+        diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] = {}  # (future_len, 3)
         if neighbor_future_gt_3_dim is not None:
-            for idx, token in enumerate(neighbor_track_token):
+            for idx, token in enumerate(target_track_token):
                 if token is not None:
-                    token_to_future_gt_3_dim[token] = neighbor_future_gt_3_dim[
+                    diff_token_to_future_gt_3_dim[token] = neighbor_future_gt_3_dim[
                         idx]  # (future_len, 3)
 
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_all_gt_3_dim",
             None)  # (agent_num, future_all_len, 3)
-        token_to_future_all_gt_3_dim: Dict[str, np.ndarray] = {}
+        diff_token_to_future_all_gt_3_dim: Dict[str, np.ndarray] = {}
         # near_future_all_gt_3_dim : (Pnn, future_all_len, 3)
         if neighbor_future_all_gt_3_dim is not None:
             near_future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
-                target_agents_mask]
-            for idx, token in enumerate(neighbor_track_token):
+                target_agents_mask]  # : (Pnn, future_all_len, 3)
+            for idx, token in enumerate(target_track_token):
                 if token is not None:
-                    token_to_future_all_gt_3_dim[
+                    diff_token_to_future_all_gt_3_dim[
                         token] = neighbor_future_all_gt_3_dim[
                             idx]  # (future_all_len, 3)
         else:
             near_future_all_gt_3_dim = None
         self.unnormalized_features[
-            "token_to_future_gt_3_dim"] = token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
+            "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
         self.unnormalized_features[
             "near_future_all_gt_3_dim"] = near_future_all_gt_3_dim  # (Pnn, future_all_len, 3) or None
         self.unnormalized_features[
-            "token_to_future_all_gt_3_dim"] = token_to_future_all_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
+            "diff_token_to_future_all_gt_3_dim"] = diff_token_to_future_all_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
 
     def get_features_from_simulation(
             self, current_input: PlannerInput,
