@@ -39,10 +39,11 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         """Inherited, see superclass."""
         return WorldModelFeature  # type: ignore
 
-    def _post_process_unnormalized_features(self,
-                                            neighbor_track_token:  List[Optional[str]], # len: agents_num
-                                            target_agents_mask: np.ndarray, # len: agents_num
-                                            ) -> None:
+    def _post_process_unnormalized_features(
+            self,
+            neighbor_track_token: List[Optional[str]],  # len: agents_num
+            target_agents_mask: np.ndarray,  # len: agents_num
+    ) -> None:
         neighbor_future_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_gt_3_dim", None)  # (agent_num, future_len, 3)
 
@@ -50,8 +51,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         if neighbor_future_gt_3_dim is not None:
             for idx, token in enumerate(neighbor_track_token):
                 if token is not None:
-                    token_to_future_gt_3_dim[
-                        token] = neighbor_future_gt_3_dim[
+                    token_to_future_gt_3_dim[token] = neighbor_future_gt_3_dim[
                         idx]  # (future_len, 3)
 
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
@@ -66,15 +66,15 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 if token is not None:
                     token_to_future_all_gt_3_dim[
                         token] = neighbor_future_all_gt_3_dim[
-                        idx]  # (future_all_len, 3)
+                            idx]  # (future_all_len, 3)
         else:
             near_future_all_gt_3_dim = None
-        self.unnormalized_features["token_to_future_gt_3_dim"] = token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
+        self.unnormalized_features[
+            "token_to_future_gt_3_dim"] = token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
         self.unnormalized_features[
             "near_future_all_gt_3_dim"] = near_future_all_gt_3_dim  # (Pnn, future_all_len, 3) or None
         self.unnormalized_features[
             "token_to_future_all_gt_3_dim"] = token_to_future_all_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
-
 
     def get_features_from_simulation(
             self, current_input: PlannerInput,
@@ -122,8 +122,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         """
         target_agents_mask = self._get_target_agents_mask(
             neighbor_track_token, current_input.diffusion_agents_tokens)
-        self._post_process_unnormalized_features(neighbor_track_token, target_agents_mask)
-
+        self._post_process_unnormalized_features(neighbor_track_token,
+                                                 target_agents_mask)
 
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)

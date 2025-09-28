@@ -600,7 +600,8 @@ class WorldModelAgents(AbstractMLAgents):
         [현실]
             sim_step_gap_s: 0.09992 self._planner_step_gap_s: 0.1 interpol_num: 1
         """
-        q = Decimal(str(sim_step_gap_s)) / Decimal(str(self._planner_step_gap_s))
+        q = Decimal(str(sim_step_gap_s)) / Decimal(str(
+            self._planner_step_gap_s))
         interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         interpol_num = max(interpol_num, 1)
         """

@@ -476,6 +476,26 @@ class WorldModelLogReplay(AbstractMLAgents):
         """
         self.current_iteration = 0
         self.current_observation = None
+
+    def _get_diffusion_agents(self, ego_state: EgoState) -> None:
+        """
+        ego 기준 정사각형(한 변 2*radius) 내에서 가까운 predicted_neighbor_num개 에이전트만 유지.
+
+        변경 사항
+        - 기존: 반지름 self._radius 원(디스크) 내부 필터링 → 거리 오름차순 상위 K 선택
+        - 변경: ego 뒷축을 원점, ego yaw에 정렬된 정사각형(한 변 2*self._radius) 내부 필터링
+               → 거리(유클리드) 오름차순 상위 K 선택
+
+        절차
+        1) ego와 각 agent 사이의 거리(유클리드)를 계산하여 오름차순으로 정렬된 토큰/거리 획득
+        2) 같은 순서에서 각 agent의 월드좌표를 ego 뒷축 기준으로 평행이동 후, ego yaw만큼 회전(세계→ego)
+        3) ego 좌표계에서 |x_e| ≤ radius and |y_e| ≤ radius 인 토큰만 남김
+        4) 그 중 거리순 상위 predicted_neighbor_num 개 선택
+        5) 사전 슬라이싱으로 self._diffusion_agents 업데이트
+
+        시간 복잡도
+        - O(N) 벡터 연산 (파이썬 for-루프 없이 NumPy로 마스킹/슬라이싱)
+        """
         unique_agents: Dict[str, TrackedObject] = {
             tracked_object.track_token: tracked_object
             for tracked_object in
@@ -486,57 +506,52 @@ class WorldModelLogReplay(AbstractMLAgents):
                 TrackedObjectType.BICYCLE,
             }
         }
-        self._diffusion_agents: Dict[str,
-                                     TrackedObject] = sort_dict(unique_agents)
-        self._filter_diffusion_agents(self._ego_anchor_state)
-
-    # TODO
-    def _filter_diffusion_agents(self, ego_state: EgoState) -> None:
-        """ego 기준 반경 내에서 가장 가까운 predicted_neighbor_num개 에이전트만 유지.
-
-        절차
-        - (정렬 완료) 토큰/거리 획득
-        - 벡터화된 불리언 마스크로 반경 필터링
-        - 상위 K개 토큰 선택
-        - 사전 슬라이싱
-
-        시간 복잡도
-        - 마스킹/슬라이싱은 NumPy 벡터 연산(O(N)); 파이썬 for-루프 제거
-        """
-        # 정렬된 토큰/거리 얻기
-        # sorted_tokens: list[str],
-        # sorted_distances: npt.NDArray[np.float64]
+        unique_agents: Dict[str, TrackedObject] = sort_dict(unique_agents)
+        # 1) 거리 오름차순 토큰/거리 얻기
         sorted_tokens, sorted_distances = self._compute_sorted_distances(
-            ego_state, self._diffusion_agents)
+            ego_state, unique_agents)
         if len(sorted_tokens) == 0:
             self._diffusion_agents = {}
             return
 
-        # 벡터화: 반경 내 토큰 추출
-        # sorted_distances: np.ndarray(shape=(N,)),
-        # sorted_tokens_arr: np.ndarray(dtype=object, shape=(N,))
         sorted_tokens_arr: np.ndarray = np.asarray(sorted_tokens, dtype=object)
 
-        # 반경 내 인덱스 마스크
-        dist_mask: np.ndarray = sorted_distances <= self._radius  # (N,)
-        if not np.any(dist_mask):
+        # 2) ego 좌표계로 좌표 변환 (세계 → ego)
+        #    - 원점: ego 뒷축 (rear_axle)
+        #    - 회전: ego yaw에 정렬 (rotation_matrix(-yaw))
+        ego_xy: np.ndarray = np.asarray(ego_state.rear_axle.point.array,
+                                        dtype=np.float32)  # (2,)
+        ego_yaw: float = float(ego_state.rear_axle.heading)
+        R_g2e: np.ndarray = rotation_matrix(-ego_yaw)  # (2,2) 세계→ego 회전
+
+        # sorted_tokens 순서에 맞춰 에이전트 좌표 수집
+        agents_xy: np.ndarray = np.array(
+            [unique_agents[t].center.point.array for t in sorted_tokens],
+            dtype=np.float32)  # (N,2)
+
+        delta_xy: np.ndarray = agents_xy - ego_xy[None, :]  # (N,2) 평행이동
+        local_xy: np.ndarray = delta_xy.dot(R_g2e.T)  # (N,2) ego 좌표계
+        abs_local_xy: np.ndarray = np.abs(local_xy)  # (N,2)
+
+        # 3) ego 기준 정사각형(한 변 2*radius) 내부 마스크
+        half_side_length: float = float(self._radius)
+        square_mask: np.ndarray = (
+            (abs_local_xy[:, 0] <= half_side_length) &
+            (abs_local_xy[:, 1] <= half_side_length))  # (N,)
+
+        if not np.any(square_mask):
             self._diffusion_agents = {}
             return
 
-        # 반경 내 토큰 (거리 오름차순 유지)
-        within_tokens_arr: np.ndarray = sorted_tokens_arr[dist_mask]  # (M,)
+        # 정사각형 내부 토큰 (거리 오름차순 정렬 유지)
+        within_tokens_arr: np.ndarray = sorted_tokens_arr[square_mask]  # (M,)
 
-        # 상위 K개만 선택
-        k = int(self.predicted_neighbor_num)
-        # (min(M,K),)
+        # 4) 상위 K개만 선택
+        k: int = int(self.predicted_neighbor_num)
         selected_tokens: list[str] = within_tokens_arr[:k].tolist()
 
-        # 사전을 선택된 토큰으로 슬라이스
-        # (파이썬 dict 재구성은 불가피하지만 크기는 K로 제한됨)
-        self._diffusion_agents = {
-            t: self._diffusion_agents[t] for t in selected_tokens
-        }
-
+        # 5) 사전을 선택된 토큰으로 슬라이스 (삽입 순서 유지 → 거리 오름차순)
+        self._diffusion_agents = {t: unique_agents[t] for t in selected_tokens}
 
     def _get_open_loop_track_objects(
             self, iteration: int) -> Dict[str, TrackedObject]:
@@ -776,7 +791,6 @@ class WorldModelLogReplay(AbstractMLAgents):
             interpol_abs_next_ego, anchor, 'ego')
         return interp_next_ego_11_dim.astype(np.float32)
 
-
     def from_next_ego_state_to_traj_np(
         self,
         iteration: SimulationIteration,
@@ -795,7 +809,6 @@ class WorldModelLogReplay(AbstractMLAgents):
             interp_next_ego_11_dim = self._interpolated_state_to_local_np(
                 interp_next_ego_state, self._ego_anchor_state)
         return interp_next_ego_11_dim
-
 
     def _from_ego_fut_traj_to_np(
             self, ego_future_trajectory: InterpolatedTrajectory,
@@ -855,12 +868,11 @@ class WorldModelLogReplay(AbstractMLAgents):
         return planner_future_11_dim
 
     def _get_model_input(
-            self, iteration: SimulationIteration,
-            history: SimulationHistoryBuffer,
-            interp_next_ego_11_dim: Optional[npt.NDArray[np.float32]],
-            planner_future_11_dim: Optional[npt.NDArray[np.float32]]
+        self, iteration: SimulationIteration, history: SimulationHistoryBuffer,
+        interp_next_ego_11_dim: Optional[npt.NDArray[np.float32]],
+        planner_future_11_dim: Optional[npt.NDArray[np.float32]]
     ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]], Dict[
-        str, np.ndarray]]:
+            str, np.ndarray]]:
         # Construct input features
         initialization = HorizonPlannerInitialization(
             # 시나리오가 끝나고도 계속 진행했을 때 최종적으로 도달해야 하는 포즈 (존재하지 않을 수도 있음)
@@ -886,14 +898,14 @@ class WorldModelLogReplay(AbstractMLAgents):
         # from nuplan_extent/planning/training/preprocessing/feature_builders/world_model_feature_builder.py
         model_input_key_to_value: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
-            current_input, initialization)
+                current_input, initialization)
         model_input_key_to_unnorm_value: Dict[
             str, np.ndarray] = self._model_loader.feature_builders[
-            0].unnormalized_features
+                0].unnormalized_features
         # neighbor_token_dist_order: len = agent_num
         neighbor_token_dist_order: List[
             Optional[str]] = model_input_key_to_unnorm_value[
-            "neighbor_track_token"]  # (agent_num, )
+                "neighbor_track_token"]  # (agent_num, )
         token_to_future_gt_3_dim: np.ndarray = \
         model_input_key_to_unnorm_value[
             "token_to_future_gt_3_dim"]  # (Pnn, future_all_len, 3)
@@ -902,11 +914,11 @@ class WorldModelLogReplay(AbstractMLAgents):
                 token_to_future_gt_3_dim)
 
     def _update_diffusion_agents_observation(
-        self, iteration: SimulationIteration,
-        next_iteration: SimulationIteration, history: SimulationHistoryBuffer,
-        next_ego_state: Optional[EgoState],
-        ego_future_trajectory: Optional[InterpolatedTrajectory]
-    ) -> None:
+            self, iteration: SimulationIteration,
+            next_iteration: SimulationIteration,
+            history: SimulationHistoryBuffer,
+            next_ego_state: Optional[EgoState],
+            ego_future_trajectory: Optional[InterpolatedTrajectory]) -> None:
         # (interpol_num, 11)
         interp_next_ego_11_dim: Optional[
             np.ndarray] = self.from_next_ego_state_to_traj_np(
@@ -925,9 +937,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         self.infer_model(model_input_key_to_value, iteration, next_iteration,
-                         neighbor_token_dist_order,
-                         token_to_future_gt_3_dim)
-
+                         neighbor_token_dist_order, token_to_future_gt_3_dim)
 
     def update_observation(
             self,
@@ -945,9 +955,12 @@ class WorldModelLogReplay(AbstractMLAgents):
             -
         """
         self._draw_infos = draw_machine.DrawInfos()
+
         self.observation_buffer: Deque[Observation] = history.observation_buffer
         # EgoState, Observation
         self._ego_anchor_state, self.current_observation = history.current_state
+        self._get_diffusion_agents(self._ego_anchor_state)
+
         self.sim_step_gap_time_point: TimePoint = next_iteration.time_point - iteration.time_point
 
         self.current_iteration: int = next_iteration.index
@@ -955,9 +968,9 @@ class WorldModelLogReplay(AbstractMLAgents):
         # world_model_feature: Dict[str, np.ndarray]
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
 
-        self._update_diffusion_agents_observation(
-             iteration, next_iteration, history, next_ego_state,
-             ego_future_trajectory)
+        self._update_diffusion_agents_observation(iteration, next_iteration,
+                                                  history, next_ego_state,
+                                                  ego_future_trajectory)
         if self._is_vis_features:
             input_data, output_data = self._draw_infos.to_dict()
             draw_machine.draw_world_model_to_png(input_data, output_data,
@@ -1233,8 +1246,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         iteration: SimulationIteration,
         next_iteration: SimulationIteration,
         neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
-        token_to_future_gt_3_dim: Dict[str,
-                                           np.ndarray]  # len : valid_agent_num # (future_len, 3)
+        token_to_future_gt_3_dim: Dict[
+            str, np.ndarray]  # len : valid_agent_num # (future_len, 3)
     ) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
             "world_model_feature"]
@@ -1294,14 +1307,12 @@ class WorldModelLogReplay(AbstractMLAgents):
                 a_near_future_all_waypoints.append(waypoint)
         return a_near_future_all_waypoints
 
-
     def _update_diffusion_agents(
         self,
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
         next_iteration: SimulationIteration,
         cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
-        token_to_future_gt_3_dim: Dict[str,
-                                           np.ndarray]  # len : valid_agent_num
+        token_to_future_gt_3_dim: Dict[str, np.ndarray]  # len : valid_agent_num
     ) -> None:
         diff_token_to_updated_agent: Dict[str, Agent] = {}
         diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)
@@ -1325,7 +1336,7 @@ class WorldModelLogReplay(AbstractMLAgents):
                 metadata=new_metadata,
             )
             a_near_future_gt_3_dim = token_to_future_gt_3_dim[
-                diff_token]  # (future_all_len, 3)
+                diff_token]  # (future_len, 3)
             updated_agent.predictions = [
                 # GT 궤적
                 PredictedTrajectory(probability=0.5,
