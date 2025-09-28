@@ -78,8 +78,6 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         self.unnormalized_features[
             "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
         self.unnormalized_features[
-            "near_future_all_gt_3_dim"] = near_future_all_gt_3_dim  # (Pnn, future_all_len, 3) or None
-        self.unnormalized_features[
             "diff_token_to_future_all_gt_3_dim"] = diff_token_to_future_all_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
 
     def get_features_from_simulation(
