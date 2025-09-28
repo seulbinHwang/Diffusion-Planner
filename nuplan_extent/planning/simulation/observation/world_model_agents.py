@@ -451,7 +451,7 @@ class WorldModelAgents(AbstractMLAgents):
         # ["PEDESTRIAN", "BARRIER", "CZONE_SIGN", "TRAFFIC_CONE", "GENERIC_OBJECT"]
         self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
-        self._planner_step_gap = self._step_interval_us / 1e6  # [s]
+        self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
 
     def _initialize_open_loop_detection_types(
             self, open_loop_detections: List[str]) -> None:
@@ -595,12 +595,12 @@ class WorldModelAgents(AbstractMLAgents):
         sim_step_gap_s: float = self.sim_step_gap_time_point.time_s
         """
         sim_step_gap_s : 0.15 (시뮬레이션 시간 간격 (초))
-        self._planner_step_gap : 0.1 이면 (future trajectory의 점 사이 시간 간격)
+        self._planner_step_gap_s : 0.1 이면 (future trajectory의 점 사이 시간 간격)
             q = 1.5 -> interpol_num = 2
         [현실]
-            sim_step_gap_s: 0.09992 self._planner_step_gap: 0.1 interpol_num: 1
+            sim_step_gap_s: 0.09992 self._planner_step_gap_s: 0.1 interpol_num: 1
         """
-        q = Decimal(str(sim_step_gap_s)) / Decimal(str(self._planner_step_gap))
+        q = Decimal(str(sim_step_gap_s)) / Decimal(str(self._planner_step_gap_s))
         interpol_num = int(q.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         interpol_num = max(interpol_num, 1)
         """
@@ -617,7 +617,7 @@ class WorldModelAgents(AbstractMLAgents):
                                        interpol_num,
                                        num=interpol_num + 1,
                                        dtype=int)[1:]  # (interpol_num, )
-        interpol_points_times = interpol_indices * self._planner_step_gap  # (interpol_num, )
+        interpol_points_times = interpol_indices * self._planner_step_gap_s  # (interpol_num, )
         next_state_interpol_time_points: List[TimePoint] = []
         for interpol_time in interpol_points_times:
             time_point = TimePoint(time_us=int(iteration.time_point.time_us +
@@ -925,7 +925,7 @@ class WorldModelAgents(AbstractMLAgents):
         waypoints = transform_predictions_to_states(future_traj_wrt_npc_center,
                                                     ego_state_history,
                                                     self._future_horizon,
-                                                    self._planner_step_gap,
+                                                    self._planner_step_gap_s,
                                                     sim_step_gap_s)
         return waypoints
 
