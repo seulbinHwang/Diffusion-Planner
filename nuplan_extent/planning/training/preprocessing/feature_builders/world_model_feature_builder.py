@@ -64,17 +64,12 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             "neighbor_future_all_gt_3_dim",
             None)  # (agent_num, future_all_len, 3)
         diff_token_to_future_all_gt_3_dim: Dict[str, np.ndarray] = {}
-        # near_future_all_gt_3_dim : (Pnn, future_all_len, 3)
         if neighbor_future_all_gt_3_dim is not None:
-            near_future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
-                target_agents_mask]  # : (Pnn, future_all_len, 3)
             for idx, token in enumerate(target_track_token):
                 if token is not None:
                     diff_token_to_future_all_gt_3_dim[
                         token] = neighbor_future_all_gt_3_dim[
                             idx]  # (future_all_len, 3)
-        else:
-            near_future_all_gt_3_dim = None
         self.unnormalized_features[
             "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
         self.unnormalized_features[
