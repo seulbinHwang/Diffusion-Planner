@@ -35,6 +35,7 @@ if [ "$SPLIT" == "val14" ]; then
 else
     SCENARIO_BUILDER="nuplan_challenge"
 fi
+SPLIT="val14_mini"  # e.g., "val14"
 echo "Processing $CKPT_FILE..."
 FILENAME=$(basename "$CKPT_FILE") # FILENAME: model.pth
 FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
