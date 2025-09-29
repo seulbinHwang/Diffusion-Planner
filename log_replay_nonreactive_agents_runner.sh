@@ -51,9 +51,8 @@ python nuplan_extent/planning/script/run_simulation.py \
     scenario_filter=$SPLIT \
     experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
     verbose=true \
-    worker=ray_distributed \
-    worker.threads_per_node=128 \
+    worker=sequential \
     distributed_mode='SINGLE_NODE' \
-    number_of_gpus_allocated_per_simulation=0.15 \
+    number_of_gpus_allocated_per_simulation=1. \
     enable_simulation_progress_bar=true \
     hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan_extent.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"

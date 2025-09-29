@@ -18,7 +18,8 @@ scenario_types: # List of scenario types to include
   - following_lane_with_lead
 
 map_names: null
-
+scenario_tokens: null
+log_names: null
 num_scenarios_per_type: 3
 limit_total_scenarios: null
 timestamp_threshold_s: 15

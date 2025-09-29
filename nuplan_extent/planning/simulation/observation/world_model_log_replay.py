@@ -56,13 +56,13 @@ def agent_to_feature_vector(
     - [0] center x
     - [1] center y
     - [2] center yaw
-    - [4] center v_x
-    - [5] center v_y
+    - [3] center v_x
+    - [4] center v_y
+    - [5] 패딩 0.0
     - [6] 패딩 0.0
-    - [7] 패딩 0.0
-    - [8] 1.0
+    - [7] 1.0
+    - [8] 0.0
     - [9] 0.0
-    - [10] 0.0
 
     위와 같이 마지막 세 항목이 항상 [1, 0, 0]이 되도록 끝에 고정 배치합니다.
 
@@ -94,10 +94,6 @@ def agent_to_feature_vector(
     y_pos: float = float(center_pose.y)
     yaw_rad: float = float(center_pose.heading)
 
-    # 방향 → cos/sin
-    cos_yaw: float = float(np.cos(yaw_rad))
-    sin_yaw: float = float(np.sin(yaw_rad))
-
     # 속도
     if not hasattr(agent, "velocity"):
         raise AttributeError("agent.velocity 속성이 없습니다.")
@@ -117,7 +113,7 @@ def agent_to_feature_vector(
 
 # [Add]
 def sort_refined_trajs_by_first_xy_l2(
-    token_to_refined_traj_wrt_ego: Dict[str, np.ndarray],
+    diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray],
     *,
     invalid_eps: float = 0.0,
 ) -> Dict[str, np.ndarray]:
@@ -132,7 +128,7 @@ def sort_refined_trajs_by_first_xy_l2(
       (예: 0으로 채워진 더미/미사용 시퀀스를 뒤로 밀고 싶을 때 유용)
 
     Args:
-        token_to_refined_traj_wrt_ego: Dict[str, np.ndarray]
+        diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray]
             - 각 value: (T, 11), T ≥ 1
         invalid_eps: float, optional
             - 0.0(기본): 무효 처리 없음(정말로 원점이면 거리 0으로 취급)
@@ -145,11 +141,11 @@ def sort_refined_trajs_by_first_xy_l2(
     Raises:
         ValueError: 배열 shape가 (T, 11)이 아닌 항목이 있을 때.
     """
-    if not token_to_refined_traj_wrt_ego:
-        return token_to_refined_traj_wrt_ego
+    if not diff_token_to_interp_np_traj_wrt_ego:
+        return diff_token_to_interp_np_traj_wrt_ego
 
     sortable_triplets: List[Tuple[str, float, np.ndarray]] = []
-    for token, arr in token_to_refined_traj_wrt_ego.items():
+    for token, arr in diff_token_to_interp_np_traj_wrt_ego.items():
         if not isinstance(arr,
                           np.ndarray) or arr.ndim != 2 or arr.shape[1] != 11:
             raise ValueError(
@@ -255,7 +251,11 @@ def observations_to_agents_buffer(
             # Agent 중에, 오직 차량(VEHICLE) 타입만 추출한다.
             vehicles = [
                 agent for agent in observation.tracked_objects.get_agents()
-                if (agent.track_token in diffusion_agents_track_tokens)
+                if (agent.tracked_object_type in {
+                    TrackedObjectType.VEHICLE,
+                    TrackedObjectType.PEDESTRIAN,
+                    TrackedObjectType.BICYCLE,
+                }) and (agent.track_token in diffusion_agents_track_tokens)
             ]
             vehicles_buffer.append(vehicles)
         else:
@@ -272,7 +272,6 @@ def get_token_to_history(
     버퍼의 마지막 원소(현재 시점)에 존재하는 Agent들만을 대상으로 하며, 시간 역순(현재→과거)으로
     각 Agent의 상태를 수집한다. 특정 과거시점에 해당 Agent가 존재하지 않으면, 더 이상 과거 상태는
     수집하지 않는다.
-    TODO: 이 방식이 최선인가?
 
     Args:
         vehicles_buffer (Deque[List[Agent]]): 시간 순서대로 정렬된 Agent 버퍼. 길이 :math:`T`의 버퍼이며,
@@ -291,7 +290,6 @@ def get_token_to_history(
     max_len = vehicles_buffer.maxlen
     if not vehicles_buffer:
         return {}
-    # only for car.
     current_vehicles: List[Agent] = [agent for agent in vehicles_buffer[-1]]
     current_token_list: List[str] = [
         agent.track_token for agent in current_vehicles
@@ -382,13 +380,14 @@ def global_to_local(coords_global: np.ndarray, yaw_global: np.ndarray,
 
 def transform_trajectory(future_traj_wrt_ego: np.ndarray,
                          ego_rear_axle_xy: np.ndarray, ego_yaw: float,
-                         veh_center_xy: np.ndarray,
-                         veh_yaw: float) -> np.ndarray:
+                         agent_xyyaw: np.ndarray) -> np.ndarray:
     """
     ego계 기준 future_traj_wrt_ego → 각 vehicle 로컬계 기준 (T,4) trajectory.
     """
     coords_g, yaw_g = ego_to_global(future_traj_wrt_ego, ego_rear_axle_xy,
                                     ego_yaw)
+    veh_center_xy = agent_xyyaw[:2]
+    veh_yaw = float(agent_xyyaw[2])
     return global_to_local(coords_g, yaw_g, veh_center_xy, veh_yaw)
 
 
@@ -467,7 +466,8 @@ class WorldModelLogReplay(AbstractMLAgents):
                         tracked_object.track_token]
                     tracked_object.predictions = diffusion_agent.predictions
                 new_tracked_objects_list.append(tracked_object)
-            all_things.tracked_objects = TrackedObjects(new_tracked_objects_list)
+            all_things.tracked_objects = TrackedObjects(
+                new_tracked_objects_list)
 
         return all_things
 
@@ -481,79 +481,126 @@ class WorldModelLogReplay(AbstractMLAgents):
 
     def _get_diffusion_agents(self, ego_state: EgoState) -> None:
         """
-        ego 기준 정사각형(한 변 2*radius) 내에서 가까운 predicted_neighbor_num개 에이전트만 유지.
+        ego 기준, '타입별 상한(cap) 적용 → 정사각형(한 변 2*radius) 필터' 순서로 diffusion 대상 에이전트를 선별한다.
 
-        변경 사항
-        - 기존: 반지름 self._radius 원(디스크) 내부 필터링 → 거리 오름차순 상위 K 선택
-        - 변경: ego 뒷축을 원점, ego yaw에 정렬된 정사각형(한 변 2*self._radius) 내부 필터링
-               → 거리(유클리드) 오름차순 상위 K 선택
+        변경된 절차:
+            1) ego와의 유클리드 거리 오름차순으로 정렬
+            2) 거리 정렬 순서를 유지한 채, 보행자/자전거 상한(cap)을 우선 적용하고
+               남는 슬롯은 차량으로 채워 최대 predicted_neighbor_num개 선택
+               - cap: self.config.max_pedestrians / self.config.max_bicycles
+                 (없으면 predicted_neighbor_num을 사용하여 사실상 상한 없음)
+               - 최종 후보 집합 내부 순서는 전역 거리 오름차순 유지
+            3) 위 후보 집합을 ego 기준 정사각형(|x_e| ≤ radius AND |y_e| ≤ radius)으로 최종 필터링
+               - 이후 부족 슬롯은 재보충하지 않음(요청 사양)
+            4) self._diffusion_agents를 선택된 토큰으로 슬라이스(거리 오름차순 유지)
 
-        절차
-        1) ego와 각 agent 사이의 거리(유클리드)를 계산하여 오름차순으로 정렬된 토큰/거리 획득
-        2) 같은 순서에서 각 agent의 월드좌표를 ego 뒷축 기준으로 평행이동 후, ego yaw만큼 회전(세계→ego)
-        3) ego 좌표계에서 |x_e| ≤ radius and |y_e| ≤ radius 인 토큰만 남김
-        4) 그 중 거리순 상위 predicted_neighbor_num 개 선택
-        5) 사전 슬라이싱으로 self._diffusion_agents 업데이트
-
-        시간 복잡도
-        - O(N) 벡터 연산 (파이썬 for-루프 없이 NumPy로 마스킹/슬라이싱)
+        시간 복잡도:
+            - 거리 정렬 O(N log N), 나머지는 NumPy 벡터 연산(O(N))
         """
+        # 시나리오에서 후보 에이전트 수집 (차량/보행자/자전거만)
         unique_agents: Dict[str, TrackedObject] = {
             tracked_object.track_token: tracked_object
             for tracked_object in
-            self._scenario.get_tracked_objects_at_iteration(self.current_iteration).tracked_objects
-            if tracked_object.tracked_object_type in {
+            self._scenario.get_tracked_objects_at_iteration(
+                self.current_iteration).tracked_objects
+            if (tracked_object.track_token is not None) and
+            (tracked_object.tracked_object_type in {
                 TrackedObjectType.VEHICLE,
                 TrackedObjectType.PEDESTRIAN,
                 TrackedObjectType.BICYCLE,
-            }
+            })
         }
-        unique_agents: Dict[str, TrackedObject] = sort_dict(unique_agents)
-        # 1) 거리 오름차순 토큰/거리 얻기
+
+        # 1) 거리 기준 오름차순 정렬
         sorted_tokens, sorted_distances = self._compute_sorted_distances(
             ego_state, unique_agents)
         if len(sorted_tokens) == 0:
             self._diffusion_agents = {}
             return
 
-        sorted_tokens_arr: np.ndarray = np.asarray(sorted_tokens, dtype=object)
+        # 2) 타입별(cap) 적용 → 최대 K개 후보 구성 (전역 거리 오름차순 유지)
+        K: int = int(self.predicted_neighbor_num)
+        max_pedestrians_cfg: int = int(
+            getattr(self.config, "max_pedestrians", 7))
+        max_bicycles_cfg: int = int(getattr(self.config, "max_bicycles", 3))
+        ped_cap: int = max(0, min(max_pedestrians_cfg, K))
+        bike_cap_hint: int = max(0, min(max_bicycles_cfg, K))  # 남은 슬롯과 함께 다시 제한
 
-        # 2) ego 좌표계로 좌표 변환 (세계 → ego)
-        #    - 원점: ego 뒷축 (rear_axle)
-        #    - 회전: ego yaw에 정렬 (rotation_matrix(-yaw))
-        ego_xy: np.ndarray = np.asarray(ego_state.rear_axle.point.array,
-                                        dtype=np.float32)  # (2,)
-        ego_yaw: float = float(ego_state.rear_axle.heading)
-        R_g2e: np.ndarray = rotation_matrix(-ego_yaw)  # (2,2) 세계→ego 회전
+        # 타입별로 거리순 분할
+        pedestrian_tokens: List[str] = []
+        bicycle_tokens: List[str] = []
+        vehicle_tokens: List[str] = []
+        for token in sorted_tokens:
+            obj_type = unique_agents[token].tracked_object_type
+            if obj_type == TrackedObjectType.PEDESTRIAN:
+                pedestrian_tokens.append(token)
+            elif obj_type == TrackedObjectType.BICYCLE:
+                bicycle_tokens.append(token)
+            elif obj_type == TrackedObjectType.VEHICLE:
+                vehicle_tokens.append(token)
+            else:
+                # 현재 대상 외 타입은 무시
+                pass
 
-        # sorted_tokens 순서에 맞춰 에이전트 좌표 수집
-        agents_xy: np.ndarray = np.array(
-            [unique_agents[t].center.point.array for t in sorted_tokens],
-            dtype=np.float32)  # (N,2)
+        # cap 적용: 보행자 → 자전거 → 차량(상한 없음)
+        selected_pedestrian_tokens: List[str] = pedestrian_tokens[:ped_cap]
+        remaining_slots: int = K - len(selected_pedestrian_tokens)
+        selected_bicycle_tokens: List[str] = []
+        if remaining_slots > 0:
+            bike_take = min(bike_cap_hint, remaining_slots)
+            selected_bicycle_tokens = bicycle_tokens[:bike_take]
+            remaining_slots -= len(selected_bicycle_tokens)
 
-        delta_xy: np.ndarray = agents_xy - ego_xy[None, :]  # (N,2) 평행이동
-        local_xy: np.ndarray = delta_xy.dot(R_g2e.T)  # (N,2) ego 좌표계
-        abs_local_xy: np.ndarray = np.abs(local_xy)  # (N,2)
+        selected_vehicle_tokens: List[str] = []
+        if remaining_slots > 0:
+            selected_vehicle_tokens = vehicle_tokens[:remaining_slots]
 
-        # 3) ego 기준 정사각형(한 변 2*radius) 내부 마스크
-        half_side_length: float = float(self._radius)
-        square_mask: np.ndarray = (
-            (abs_local_xy[:, 0] <= half_side_length) &
-            (abs_local_xy[:, 1] <= half_side_length))  # (N,)
-
-        if not np.any(square_mask):
+        # 전역 거리 오름차순 유지: 기존 정렬 리스트를 따라 재조합
+        selected_set = set(selected_pedestrian_tokens +
+                           selected_bicycle_tokens + selected_vehicle_tokens)
+        pre_square_selected_tokens: List[str] = [
+            t for t in sorted_tokens if t in selected_set
+        ]
+        if len(pre_square_selected_tokens) == 0:
             self._diffusion_agents = {}
             return
 
-        # 정사각형 내부 토큰 (거리 오름차순 정렬 유지)
-        within_tokens_arr: np.ndarray = sorted_tokens_arr[square_mask]  # (M,)
+        # 3) 정사각형(|x_e| ≤ radius AND |y_e| ≤ radius) 최종 필터
+        #    - ego 뒷축을 원점, ego yaw 정렬 좌표계에서 판정
+        ego_xy: np.ndarray = np.asarray(ego_state.rear_axle.point.array,
+                                        dtype=np.float32)  # (2,)
+        ego_yaw: float = float(ego_state.rear_axle.heading)
+        R_g2e: np.ndarray = rotation_matrix(-ego_yaw)  # 세계→ego 회전 (2,2)
 
-        # 4) 상위 K개만 선택
-        k: int = int(self.predicted_neighbor_num)
-        selected_tokens: list[str] = within_tokens_arr[:k].tolist()
+        # 선택된 후보들의 월드 좌표(거리 오름차순 순서)
+        agents_xy_pre: np.ndarray = np.array([
+            unique_agents[t].center.point.array
+            for t in pre_square_selected_tokens
+        ],
+                                             dtype=np.float32)  # (M,2)
 
-        # 5) 사전을 선택된 토큰으로 슬라이스 (삽입 순서 유지 → 거리 오름차순)
-        self._diffusion_agents = {t: unique_agents[t] for t in selected_tokens}
+        delta_xy_pre: np.ndarray = agents_xy_pre - ego_xy[None, :]  # (M,2)
+        local_xy_pre: np.ndarray = delta_xy_pre.dot(R_g2e.T)  # (M,2)
+        abs_local_xy_pre: np.ndarray = np.abs(local_xy_pre)  # (M,2)
+
+        half_side_length: float = float(self._radius)
+        square_mask_pre: np.ndarray = (
+            (abs_local_xy_pre[:, 0] <= half_side_length) &
+            (abs_local_xy_pre[:, 1] <= half_side_length))  # (M,)
+
+        if not np.any(square_mask_pre):
+            self._diffusion_agents = {}
+            return
+
+        final_selected_tokens_within_square: List[str] = [
+            t for t, keep in zip(pre_square_selected_tokens, square_mask_pre)
+            if bool(keep)
+        ]
+
+        # 4) 사전 슬라이스(거리 오름차순 유지). 정사각형 필터 이후 부족 슬롯은 재보충하지 않음.
+        self._diffusion_agents = {
+            t: unique_agents[t] for t in final_selected_tokens_within_square
+        }
 
     def _get_open_loop_track_objects(
             self, iteration: int) -> Dict[str, TrackedObject]:
@@ -939,7 +986,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         self.infer_model(model_input_key_to_value, iteration, next_iteration,
-                         neighbor_token_dist_order, diff_token_to_future_gt_3_dim)
+                         neighbor_token_dist_order,
+                         diff_token_to_future_gt_3_dim)
 
     def update_observation(
             self,
@@ -1314,7 +1362,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
         next_iteration: SimulationIteration,
         cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
-        diff_token_to_future_gt_3_dim: Dict[str, np.ndarray]  # len : valid_agent_num
+        diff_token_to_future_gt_3_dim: Dict[str,
+                                            np.ndarray]  # len : valid_agent_num
     ) -> None:
         diff_token_to_updated_agent: Dict[str, Agent] = {}
         diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)

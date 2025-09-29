@@ -545,49 +545,91 @@ class WorldModelAgents(AbstractMLAgents):
         return sorted_tokens, sorted_distances
 
     def _filter_diffusion_agents(self, ego_state: EgoState) -> None:
-        """ego 기준 반경 내에서 가장 가까운 predicted_neighbor_num개 에이전트만 유지.
+        """ego 기준으로 diffusion 대상 에이전트를 선별한다.
 
-        절차
-        - (정렬 완료) 토큰/거리 획득
-        - 벡터화된 불리언 마스크로 반경 필터링
-        - 상위 K개 토큰 선택
-        - 사전 슬라이싱
+        변경된 절차(요청 반영):
+            1) 거리 오름차순으로 정렬한 뒤, 타입별 상한(cap)을 적용해 최대 K(= predicted_neighbor_num)개를 고른다.
+               - 보행자 → 자전거 → 차량 순서로 채움
+               - cap은 self.config.max_pedestrians / self.config.max_bicycles 에서 읽음
+                 (없으면 K를 상한으로 사용하여 사실상 '상한 없음'처럼 동작)
+               - 최종 집합의 내부 순서는 전역 거리 오름차순을 유지
+            2) 위에서 고른 집합을 원 반경(self._radius) 내에 있는 토큰만 남기도록 최종 필터링한다.
+               - 반경 필터 이후 부족 슬롯은 재보충하지 않는다(요청 사양)
 
-        시간 복잡도
-        - 마스킹/슬라이싱은 NumPy 벡터 연산(O(N)); 파이썬 for-루프 제거
+        시간 복잡도:
+            - 거리 계산/정렬 O(N log N), 이후 마스킹/슬라이싱은 벡터 연산(O(N))
         """
-        # 정렬된 토큰/거리 얻기
-        # sorted_tokens: list[str],
-        # sorted_distances: npt.NDArray[np.float64]
+        # 0) 거리 기준 정렬
         sorted_tokens, sorted_distances = self._compute_sorted_distances(
             ego_state, self._diffusion_agents)
         if len(sorted_tokens) == 0:
             self._diffusion_agents = {}
             return
 
-        # 벡터화: 반경 내 토큰 추출
-        # sorted_distances: np.ndarray(shape=(N,)),
-        # sorted_tokens_arr: np.ndarray(dtype=object, shape=(N,))
-        sorted_tokens_arr: np.ndarray = np.asarray(sorted_tokens, dtype=object)
+        # 토큰 → 거리 매핑 (반경 필터 시 사용)
+        token_to_distance: Dict[str, float] = {
+            t: float(d) for t, d in zip(sorted_tokens, sorted_distances)
+        }
 
-        # 반경 내 인덱스 마스크
-        dist_mask: np.ndarray = sorted_distances <= self._radius  # (N,)
-        if not np.any(dist_mask):
-            self._diffusion_agents = {}
-            return
-
-        # 반경 내 토큰 (거리 오름차순 유지)
-        within_tokens_arr: np.ndarray = sorted_tokens_arr[dist_mask]  # (M,)
-
-        # 상위 K개만 선택
+        # 1) 타입별(cap) 선별: 보행자 → 자전거 → 차량
         k = int(self.predicted_neighbor_num)
-        # (min(M,K),)
-        selected_tokens: list[str] = within_tokens_arr[:k].tolist()
+        max_pedestrians_cfg: int = int(
+            getattr(self.config, "max_pedestrians", 7))
+        max_bicycles_cfg: int = int(getattr(self.config, "max_bicycles", 3))
+        ped_cap: int = max(0, min(max_pedestrians_cfg, k))
+        bike_cap: int = max(0, min(max_bicycles_cfg,
+                                   k))  # 최종 적용은 남은 슬롯과의 min으로 다시 제한
 
-        # 사전을 선택된 토큰으로 슬라이스
-        # (파이썬 dict 재구성은 불가피하지만 크기는 K로 제한됨)
+        # 거리 오름차순으로 이미 정렬된 목록을 타입별로 분할
+        pedestrian_tokens: List[str] = []
+        bicycle_tokens: List[str] = []
+        vehicle_tokens: List[str] = []
+        for token in sorted_tokens:
+            obj_type = self._diffusion_agents[token].tracked_object_type
+            if obj_type == TrackedObjectType.PEDESTRIAN:
+                pedestrian_tokens.append(token)
+            elif obj_type == TrackedObjectType.BICYCLE:
+                bicycle_tokens.append(token)
+            elif obj_type == TrackedObjectType.VEHICLE:
+                vehicle_tokens.append(token)
+            else:
+                # 그 외 타입은 무시(현재 설계상 VEHICLE/PEDESTRIAN/BICYCLE만 대상)
+                pass
+
+        # 보행자 우선 선발
+        selected_pedestrian_tokens: List[str] = pedestrian_tokens[:ped_cap]
+        remaining_slots: int = k - len(selected_pedestrian_tokens)
+        if remaining_slots <= 0:
+            # 반경 필터 전, 거리 오름차순 유지
+            pre_radius_selected_tokens: List[str] = selected_pedestrian_tokens
+        else:
+            # 자전거 선발 (남은 슬롯 고려)
+            bike_take = min(bike_cap, remaining_slots)
+            selected_bicycle_tokens: List[str] = bicycle_tokens[:bike_take]
+            remaining_slots -= len(selected_bicycle_tokens)
+
+            # 남는 슬롯은 차량으로 채움(차량은 cap 없음)
+            selected_vehicle_tokens: List[
+                str] = vehicle_tokens[:max(0, remaining_slots)]
+
+            # 전역 거리 오름차순 순서를 그대로 유지하려면, 기존 정렬 리스트를 따라 재조합
+            selected_set = set(selected_pedestrian_tokens +
+                               selected_bicycle_tokens +
+                               selected_vehicle_tokens)
+            pre_radius_selected_tokens = [
+                t for t in sorted_tokens if t in selected_set
+            ]
+
+        # 2) 원 반경 필터: (최종 단계) 반경 밖 토큰은 제외, 재보충 없음
+        final_selected_tokens_within_radius: List[str] = [
+            t for t in pre_radius_selected_tokens
+            if token_to_distance[t] <= self._radius
+        ]
+
+        # 사전을 선택된 토큰만 남기도록 슬라이스(거리 오름차순 유지)
         self._diffusion_agents = {
-            t: self._diffusion_agents[t] for t in selected_tokens
+            t: self._diffusion_agents[t]
+            for t in final_selected_tokens_within_radius
         }
 
     def _get_interpol_time_points(
@@ -1067,8 +1109,8 @@ class WorldModelAgents(AbstractMLAgents):
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory],
         next_iteration: SimulationIteration,
         cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
-        diff_token_to_future_all_gt_3_dim: Dict[str,
-                                           np.ndarray]  # len : valid_agent_num
+        diff_token_to_future_all_gt_3_dim: Dict[
+            str, np.ndarray]  # len : valid_agent_num
     ) -> None:
         diff_token_to_updated_agent: Dict[str, Agent] = {}
         diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)
@@ -1179,8 +1221,8 @@ class WorldModelAgents(AbstractMLAgents):
         iteration: SimulationIteration,
         next_iteration: SimulationIteration,
         neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
-        diff_token_to_future_all_gt_3_dim: Dict[str,
-                                           np.ndarray]  # len : valid_agent_num
+        diff_token_to_future_all_gt_3_dim: Dict[
+            str, np.ndarray]  # len : valid_agent_num
     ) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
             "world_model_feature"]

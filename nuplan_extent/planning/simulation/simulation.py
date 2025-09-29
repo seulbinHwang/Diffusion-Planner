@@ -8,7 +8,7 @@ from nuplan.planning.simulation.callback.abstract_callback import AbstractCallba
 from nuplan.planning.simulation.callback.multi_callback import MultiCallback
 from nuplan.planning.simulation.history.simulation_history import SimulationHistory, SimulationHistorySample
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
-from nuplan_extent.planning.simulation.planner.abstract_planner import HorizonPlannerInitialization, PlannerInput
+from nuplan.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan.planning.simulation.simulation_setup import SimulationSetup
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
 from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents

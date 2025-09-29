@@ -53,12 +53,14 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             else:
                 target_track_token.append(None)
 
-        diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] = {}  # (future_len, 3)
+        diff_token_to_future_gt_3_dim: Dict[str,
+                                            np.ndarray] = {}  # (future_len, 3)
         if neighbor_future_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
                 if token is not None:
-                    diff_token_to_future_gt_3_dim[token] = neighbor_future_gt_3_dim[
-                        idx]  # (future_len, 3)
+                    diff_token_to_future_gt_3_dim[
+                        token] = neighbor_future_gt_3_dim[
+                            idx]  # (future_len, 3)
 
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_all_gt_3_dim",

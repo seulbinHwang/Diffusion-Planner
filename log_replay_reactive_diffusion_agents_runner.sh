@@ -8,13 +8,19 @@ export HYDRA_FULL_ERROR=1
 
 #unset RAY_ADDRESS
 #ray stop -f >/dev/null 2>&1 || true
-
-HOME_DIR="/home/user/nuplan"
+HOME_DIR="/media/user/E" #"/home/user"
+PROJECTS_FOLDER="projects"
+DATASET_DIR="${HOME_DIR}" # ${HOME_DIR}/nuplan
+PROJECTS_DIR="${HOME_DIR}/${PROJECTS_FOLDER}"
 export OC_CAUSE=1
-export NUPLAN_DEVKIT_ROOT="/home/user/PycharmProjects/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
-export NUPLAN_DATA_ROOT="${HOME_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
-export NUPLAN_MAPS_ROOT="${HOME_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
-export NUPLAN_EXP_ROOT="${HOME_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
+export NUPLAN_DEVKIT_ROOT="${PROJECTS_DIR}/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
+# data_root: ${oc.env:NUPLAN_DATA_ROOT}/nuplan-v1.1/splits/trainval
+export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
+export NUPLAN_MAPS_ROOT="${DATASET_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
+export NUPLAN_EXP_ROOT="${DATASET_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
+
+ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base.json"
+CKPT_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/npc_model.pth"
 # nuplan/planning/script/config/simulation/main_callback/time_callback.yaml
 # Dataset split to use
 # Options:
@@ -32,14 +38,14 @@ CHALLENGE="log_replay_reactive_diffusion_agents" # e.g., "closed_loop_reactive_a
 # nuplan/planning/script/experiments/simulation/closed_loop_reactive_agents.yaml
 
 BRANCH_NAME=CHALLENGE
-ARGS_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/args_base.json
-CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/npc_model.pth
+
 
 if [ "$SPLIT" == "val14" ]; then
     SCENARIO_BUILDER="nuplan"
 else
     SCENARIO_BUILDER="nuplan_challenge"
 fi
+SPLIT="val14_mini"  # e.g., "val14"
 echo "Processing $CKPT_FILE..."
 FILENAME=$(basename "$CKPT_FILE") # FILENAME: npc_model.pth
 FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: npc_model

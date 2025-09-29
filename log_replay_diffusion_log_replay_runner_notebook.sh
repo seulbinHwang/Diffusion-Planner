@@ -8,9 +8,9 @@ export HYDRA_FULL_ERROR=1
 
 #unset RAY_ADDRESS
 #ray stop -f >/dev/null 2>&1 || true
-HOME_DIR="/media/user/E" #"/home/user"
-PROJECTS_FOLDER="projects"
-DATASET_DIR="${HOME_DIR}" # ${HOME_DIR}/nuplan
+HOME_DIR="/home/user" #"/home/user"
+PROJECTS_FOLDER="PycharmProjects"
+DATASET_DIR=${HOME_DIR}/nuplan
 PROJECTS_DIR="${HOME_DIR}/${PROJECTS_FOLDER}"
 export OC_CAUSE=1
 export NUPLAN_DEVKIT_ROOT="${PROJECTS_DIR}/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
