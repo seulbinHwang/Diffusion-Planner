@@ -745,7 +745,7 @@ def draw_lane_centerlines(
 
     # ────────────── (B) 텍스트 표기 모드 ──────────────
     if agent_route_lane_order is not None:
-        if draw_token_list is None:
+        if draw_token_int_list is None:
             draw_all = True
         else:
             draw_all = False
@@ -908,13 +908,14 @@ def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
     eps = options.invalid_eps
     agent_num, time_len, feat_dim = neighbor_agents_past.shape
     current_t = time_len - 1
-
+    print("========================")
     for a in range(agent_num):
         track_token = neighbor_track_token[a]
         row = neighbor_agents_past[a, current_t]  # (11,)
         if not is_valid_agent_row(row, eps):
             assert track_token is None
             continue
+        print("track_token:", track_token)
         x, y = float(row[0]), float(row[1])
         ax.text(x + options.NEI_past_token_place_offset_m,
                 y + options.NEI_past_token_place_offset_m,
@@ -1664,7 +1665,7 @@ def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
         - token_candidates 에 route를 확인하고 싶은 agent의 token을 넣어주면 됨
         - draw_token_list 를 None으로 설정하면 -> 모든 차량에 대해서 text를 그리게 됨
         """
-        draw_token_list: List[str] = []
+        draw_token_list: List[str] = ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
         draw_token_int_list: List[int] = get_agent_idx_from_tokens(
             draw_token_list, input_data.get("neighbor_track_token", None))
         draw_lane_centerlines(
@@ -1730,8 +1731,9 @@ def draw_diff_future_all_gt_3_dim(ax: plt.Axes, diff_token_to_future_all_gt_3_di
 
     eps = options.invalid_eps
     for track_token, future_all_gt_3_dim in diff_token_to_future_all_gt_3_dim.items():
-        if track_token not in draw_token_list:
-            continue
+        if draw_token_list is not None:
+            if track_token not in draw_token_list:
+                continue
         future_all_len = future_all_gt_3_dim.shape[0] # (future_all_len, 3)
         # 모든 유효 포인트를 x마커로 그리기
         for t in range(future_all_len):
@@ -1777,7 +1779,7 @@ def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
     if draw_option.DIFF_draw_diff_future_all_gt_3_dim and (
             diff_token_to_future_all_gt_3_dim is not None):
         draw_diff_future_all_gt_3_dim(ax, diff_token_to_future_all_gt_3_dim,
-                                      draw_option)
+                                      draw_option=["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"])
     #########################################
 
 

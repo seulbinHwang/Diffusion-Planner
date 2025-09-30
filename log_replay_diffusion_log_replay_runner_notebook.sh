@@ -1,6 +1,24 @@
-export HYDRA_FULL_ERROR=1
+# === 진단 모드: 터미널에 원인 직접 보기 ===
+set -Eeuo pipefail
 
-export CUDA_LAUNCH_BLOCKING=1
+# 1) 파이썬 예외/크래시를 상세히 (Signal로 죽어도 트레이스 찍힘)
+export HYDRA_FULL_ERROR=1
+export PYTHONFAULTHANDLER=1
+export PYTHONUNBUFFERED=1
+export PYTHONWARNINGS=default
+
+# 2) Ray + C++ 프로세스 로그를 터미널로 직출 & 상세 레벨
+export RAY_LOG_TO_STDERR=1          # Ray가 자체 로그를 드라이버 STDERR로도 보냄
+export GLOG_logtostderr=1           # gcs_server, raylet, plasma_store 같은 C++ 로그를 STDERR로
+export RAY_BACKEND_LOG_LEVEL=debug  # Ray 파이썬 로그 레벨
+export RAY_CPP_LOG_LEVEL=debug      # Ray C++ 로그 레벨(지원되면)
+export RAY_DEDUP_LOGS=0             # 중복 로그 억제 끄기(원인 파악엔 생략 없이 보는게 유리)
+
+
+#export HYDRA_FULL_ERROR=1 # Hydra 풀스택
+#export OC_CAUSE=1 # OmegaConf 에러 원인 체인
+#
+#export CUDA_LAUNCH_BLOCKING=1 # (이미 쓰는 중) CUDA 디버깅 편의
 ###################################
 # User Configuration Section
 ###################################
@@ -12,7 +30,7 @@ HOME_DIR="/home/user" #"/home/user"
 PROJECTS_FOLDER="PycharmProjects"
 DATASET_DIR=${HOME_DIR}/nuplan
 PROJECTS_DIR="${HOME_DIR}/${PROJECTS_FOLDER}"
-export OC_CAUSE=1
+
 export NUPLAN_DEVKIT_ROOT="${PROJECTS_DIR}/nuplan-devkit"  #"REPLACE_WITH_NUPLAN_DEVIKIT_DIR"  # nuplan-devkit absolute path (e.g., "/home/user/nuplan-devkit")
 # data_root: ${oc.env:NUPLAN_DATA_ROOT}/nuplan-v1.1/splits/trainval
 export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nuplan dataset absolute path (e.g. "/data")
@@ -59,7 +77,8 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: npc_mo
 
 # nuplan_extent.planning.script.experiments.simulation/  log_replay_reactive_diffusion_agents.yaml
 # 달라진점: simulation ("log_replay_reactive_diffusion_agents") / observation
-python nuplan_extent/planning/script/run_simulation.py \
+
+stdbuf -oL -eL python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
     observation.model_config.config.args_file=$ARGS_FILE \
     +callback=simulation_feature_video_callback \
@@ -68,7 +87,7 @@ python nuplan_extent/planning/script/run_simulation.py \
     observation.checkpoint_path=$CKPT_FILE \
     scenario_builder=$SCENARIO_BUILDER \
     scenario_filter=$SPLIT \
-    experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
+    experiment_uid=$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
     verbose=true \
     worker=sequential \
     distributed_mode='SINGLE_NODE' \
