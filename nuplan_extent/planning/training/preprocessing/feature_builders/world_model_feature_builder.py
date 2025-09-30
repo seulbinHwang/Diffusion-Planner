@@ -42,12 +42,15 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     def _post_process_unnormalized_features(
             self,
             neighbor_track_token: List[Optional[str]],  # len: agents_num
-            target_agents_mask: np.ndarray,  # len: agents_num
+            target_agents_mask: Optional[np.ndarray],  # len: agents_num
     ) -> None:
         neighbor_future_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_gt_3_dim", None)  # (agent_num, future_len, 3)
-        target_track_token: List[Optional[str]] = []
+        target_track_token: List[Optional[str]] = [] # len: agents_num
         for idx, token in enumerate(neighbor_track_token):
+            if token is None:
+                target_track_token.append(None)
+                continue
             if target_agents_mask[idx]:
                 target_track_token.append(token)
             else:
@@ -69,9 +72,10 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         if neighbor_future_all_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
                 if token is not None:
-                    diff_token_to_future_all_gt_3_dim[
-                        token] = neighbor_future_all_gt_3_dim[
+                    a = neighbor_future_all_gt_3_dim[
                             idx]  # (future_all_len, 3)
+                    diff_token_to_future_all_gt_3_dim[
+                        token] = a
         self.unnormalized_features[
             "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
         self.unnormalized_features[
@@ -154,7 +158,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
     def _get_target_agents_mask(
             self, neighbor_track_token: List[Optional[str]],
-            diffusion_agents_tokens: List[str]) -> np.ndarray:
+            diffusion_agents_tokens: Optional[List[str]]) -> Optional[np.ndarray]:
         """
         input
             - neighbor_track_token :  List[Optional[str]], (agent_num,)
@@ -162,9 +166,15 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         output
             - target_agents_mask: np.ndarray, (agent_num,) bool
         """
-        assert isinstance(neighbor_track_token, list)
         agent_num = len(neighbor_track_token)
+
         target_agents_mask = np.zeros((agent_num,), dtype=bool)
+        if diffusion_agents_tokens is None:
+            target_agents_mask[:self._config.predicted_neighbor_num] = True
+            return target_agents_mask
+
+        assert isinstance(neighbor_track_token, list)
+
         for idx in range(agent_num):
             if neighbor_track_token[idx] in diffusion_agents_tokens:
                 target_agents_mask[idx] = True

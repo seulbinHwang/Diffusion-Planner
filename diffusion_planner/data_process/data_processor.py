@@ -6,7 +6,7 @@ matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 import math
-import wandb
+import copy
 import os
 import torch
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
@@ -56,6 +56,7 @@ class DataProcessor(object):
                                                     Optional[List[str]]]] = None
         self.init_future_tracked_objects_array_list: Optional[List[
             np.ndarray]] = None
+        self._init_token_to_id: Optional[Dict[str, int]] = None
         self._map_features = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
@@ -399,12 +400,12 @@ class DataProcessor(object):
         for t1, t2 in zip(neighbor_agents_track_token, neighbor_track_token):
             assert t1 == t2, f"Two track token lists do not match: {t1} != {t2}"
         #####################
-        neighbor_agents_past, neighbor_agents_track_token = \
-            self._filter_agents_within_radius2(neighbor_agents_past, neighbor_agents_track_token)
+        # neighbor_agents_past, neighbor_agents_track_token = \
+        #     self._filter_agents_within_radius2(neighbor_agents_past, neighbor_agents_track_token)
 
-        # neighbor_agents_past, _, neighbor_indices = \
-        #     self._filter_agents_within_radius(neighbor_agents_past,
-        #                                       None, neighbor_indices)
+        neighbor_agents_past, _, neighbor_indices = \
+            self._filter_agents_within_radius(neighbor_agents_past,
+                                              None, neighbor_indices)
         '''
         Map
         '''
@@ -463,7 +464,7 @@ class DataProcessor(object):
             # future_tracked_objects_array_list: List[ np.ndarray ((frame_agents_num, 8)) ]
             # 길이: 1 + num_future_poses
             # frame_agents_num: 각 프레임마다 다름
-            self.init_future_tracked_objects_array_list, token_to_id = self._get_future_tracked_objects_array_list(
+            self.init_future_tracked_objects_array_list, self._init_token_to_id = self._get_future_tracked_objects_array_list(
                 scenario,
                 iteration=0,
                 future_time_horizon=scenario_duration,
@@ -475,10 +476,11 @@ class DataProcessor(object):
             if track_token is None:
                 neighbor_token_id.append(None)
             else:
-                neighbor_token_id.append(token_to_id[track_token])
+                neighbor_token_id.append(self._init_token_to_id[track_token])
         # (agents_num, 1 + Tf = future_all_len, 3)
+        init_future_tracked_objects_array_list = copy.deepcopy(self.init_future_tracked_objects_array_list)
         neighbor_future_all_gt_3_dim = agent_future_all_process(
-            anchor_ego_state, self.init_future_tracked_objects_array_list,
+            anchor_ego_state, init_future_tracked_objects_array_list,
             neighbor_token_id)
 
         data = {

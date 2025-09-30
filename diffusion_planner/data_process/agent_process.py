@@ -241,16 +241,16 @@ def _filter_agents_array_w_token(
 ) -> List[
         np.
         ndarray]:  # len: num_frames, np.ndarray shape: (frame_save_agents_num, 8) # frame_save_agents_num: 길이 가변적
+    neighbor_token_id_wo_none = [
+        token for token in neighbor_token_id if token is not None
+    ]  #
+    neighbor_token_id_wo_none_array = np.array(neighbor_token_id_wo_none,
+                                               dtype=np.float32)  #
     for time_idx in range(len(all_frame_agents_feature)):
         frame_exist_agents = []  # len: frame_save_agents_num # 길이 가변적
         # (frame_agents_num, 8)
         frame_agents_feature: np.ndarray = all_frame_agents_feature[
             time_idx]  # (_, 8)
-        neighbor_token_id_wo_none = [
-            token for token in neighbor_token_id if token is not None
-        ]  #
-        neighbor_token_id_wo_none_array = np.array(neighbor_token_id_wo_none,
-                                                   dtype=np.float32)  #
         for agent_idx in range(frame_agents_feature.shape[0]):
             frame_a_agent_feature = frame_agents_feature[agent_idx, :]  # (8,)
             if neighbor_token_id_wo_none_array.shape[0] > 0:
@@ -622,10 +622,6 @@ def agent_past_process(
 
     ##################
 
-    final_vehicle_num = len([
-        idx for idx in sorted_cur_neighbor_indices
-        if current_agent_types[idx] == TrackedObjectType.VEHICLE
-    ])
 
     # Populate the final agents array with the selected agents' features
     for sort_idx, cur_neighbor_idx in enumerate(sorted_cur_neighbor_indices):

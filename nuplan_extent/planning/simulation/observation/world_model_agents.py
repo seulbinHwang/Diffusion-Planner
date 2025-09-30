@@ -485,13 +485,13 @@ class WorldModelAgents(AbstractMLAgents):
                 TrackedObjectType.BICYCLE,
             }
         }
-        self._diffusion_agents: Dict[str,
+        self._diffusion_agents = {}
+        dynamic_agents: Dict[str,
                                      TrackedObject] = sort_dict(unique_agents)
-        self._filter_diffusion_agents(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
             self._get_open_loop_track_objects(0))
         self._agents: Dict[str, TrackedObject] = {
-            **self._diffusion_agents,
+            **dynamic_agents,
             **self._log_replay_agents
         }
 
@@ -837,7 +837,8 @@ class WorldModelAgents(AbstractMLAgents):
             iteration.index)
         # target_agents_mask: np.ndarray, (agent_num,) bool
         # diffusion_agents_tokens: List[str] # len: valid diffusion agent num
-        diffusion_agents_tokens = list(self._diffusion_agents.keys())
+        # diffusion_agents_tokens = list(self._diffusion_agents.keys())
+        diffusion_agents_tokens = None
         current_input = PlannerInput(iteration, history, traffic_light_data,
                                      diffusion_agents_tokens,
                                      interp_next_ego_11_dim,
@@ -903,7 +904,6 @@ class WorldModelAgents(AbstractMLAgents):
         self._update_diffusion_agents_observation(iteration, next_iteration,
                                                   history, next_ego_state,
                                                   ego_future_trajectory)
-        self._filter_diffusion_agents(self._ego_anchor_state)
         self._log_replay_agents = sort_dict(
             self._get_open_loop_track_objects(next_iteration.index))
         self._agents = {**self._diffusion_agents, **self._log_replay_agents}
@@ -1195,6 +1195,7 @@ class WorldModelAgents(AbstractMLAgents):
         gen_slot_len = future_np_trajs_wrt_ego.shape[0]
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
             if idx >= gen_slot_len:
                 break
@@ -1203,6 +1204,7 @@ class WorldModelAgents(AbstractMLAgents):
             if np.allclose(np_traj_sum, 0.0) or token is None:
                 continue
             diff_token_to_np_gen_traj_wrt_ego[token] = np_traj_wrt_ego
+            self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_wrt_ego = diff_token_to_np_gen_traj_wrt_ego
         diffusion_tokens_dist_order_1 = set(

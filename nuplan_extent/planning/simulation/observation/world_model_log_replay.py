@@ -450,26 +450,24 @@ class WorldModelLogReplay(AbstractMLAgents):
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
 
-    def get_observation(self) -> DetectionsTracks:
+    def _update_observation_core(self) -> None:
         """Inherited, see superclass."""
+        self._get_current_agents()
+        diffusion_agents_tokens = set(self._diffusion_agents.keys())
+        for token, tracked_object in self._agents.items():
+            if token in diffusion_agents_tokens:
+                diffusion_agent = self._diffusion_agents[token]
+                tracked_object.predictions = diffusion_agent.predictions
+
+
+    def _get_current_agents(self):
         all_things: DetectionsTracks = self._scenario.get_tracked_objects_at_iteration(
             self.current_iteration)
-        tracked_objects: TrackedObjects = all_things.tracked_objects
-        new_tracked_objects_list: List[TrackedObject] = []
-        diffusion_agents_tokens = list(self._diffusion_agents.keys())
-
-        if self._diffusion_agents:
-            for tracked_object in tracked_objects:
-                # tracked_object: Agent # 바꿔치기 하면됨.
-                if tracked_object.track_token in diffusion_agents_tokens:
-                    diffusion_agent = self._diffusion_agents[
-                        tracked_object.track_token]
-                    tracked_object.predictions = diffusion_agent.predictions
-                new_tracked_objects_list.append(tracked_object)
-            all_things.tracked_objects = TrackedObjects(
-                new_tracked_objects_list)
-
-        return all_things
+        unique_agents = {
+            tracked_object.track_token: tracked_object
+            for tracked_object in all_things.tracked_objects
+        }
+        self._agents = sort_dict(unique_agents)
 
     def _initialize_agents(self) -> None:
         """
@@ -478,6 +476,9 @@ class WorldModelLogReplay(AbstractMLAgents):
         self.current_iteration = 0
         self.current_observation = None
         self._diffusion_agents = {}
+        self._get_current_agents()
+
+
 
     def _get_diffusion_agents(self, ego_state: EgoState) -> None:
         """
@@ -602,21 +603,6 @@ class WorldModelLogReplay(AbstractMLAgents):
             t: unique_agents[t] for t in final_selected_tokens_within_square
         }
 
-    def _get_open_loop_track_objects(
-            self, iteration: int) -> Dict[str, TrackedObject]:
-        """
-        Get open-loop tracked objects from scenario.
-        :param iteration: The simulation iteration.
-        :return: A list of TrackedObjects.
-        """
-        detections = self._scenario.get_tracked_objects_at_iteration(iteration)
-        tracked_objects = detections.tracked_objects.get_tracked_objects_of_types(
-            self._open_loop_detections_types)
-        return {
-            tracked_object.track_token: tracked_object
-            for tracked_object in tracked_objects
-            if tracked_object.track_token is not None
-        }
 
     def _get_interpol_time_points(
             self, iteration: SimulationIteration) -> List[TimePoint]:
@@ -938,7 +924,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             iteration.index)
         # target_agents_mask: np.ndarray, (agent_num,) bool
         # diffusion_agents_tokens: List[str] # len: valid diffusion agent num
-        diffusion_agents_tokens = list(self._diffusion_agents.keys())
+        diffusion_agents_tokens = None #list(self._diffusion_agents.keys())
         current_input = PlannerInput(iteration, history, traffic_light_data,
                                      diffusion_agents_tokens,
                                      interp_next_ego_11_dim,
@@ -1009,7 +995,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         self.observation_buffer: Deque[Observation] = history.observation_buffer
         # EgoState, Observation
         self._ego_anchor_state, self.current_observation = history.current_state
-        self._get_diffusion_agents(self._ego_anchor_state)
+        # self._get_diffusion_agents(self._ego_anchor_state)
 
         self.sim_step_gap_time_point: TimePoint = next_iteration.time_point - iteration.time_point
 
@@ -1174,6 +1160,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         gen_slot_len = future_np_trajs_wrt_ego.shape[0]
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
             if idx >= gen_slot_len:
                 break
@@ -1182,16 +1169,12 @@ class WorldModelLogReplay(AbstractMLAgents):
             if np.allclose(np_traj_sum, 0.0) or token is None:
                 continue
             diff_token_to_np_gen_traj_wrt_ego[token] = np_traj_wrt_ego
+            self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_wrt_ego = diff_token_to_np_gen_traj_wrt_ego
-        diffusion_tokens_dist_order_1 = set(
-            diff_token_to_np_gen_traj_wrt_ego.keys())
+        
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
-        assert diffusion_tokens_dist_order_1 == set(
-            diffusion_tokens_dist_order), \
-            "diff_token_to_np_traj_wrt_ego의 토큰과 self._diffusion_agents의 토큰이 일치하지 않습니다."
-        ######
         return diff_token_to_np_gen_traj_wrt_ego, diffusion_tokens_dist_order
 
     def _get_diff_token_to_cur_xyyaw(
@@ -1332,6 +1315,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         self._update_diffusion_agents(diff_token_to_interpol_traj,
                                       next_iteration, cur_ego_global_xyyaw,
                                       diff_token_to_future_gt_3_dim)
+        self._update_observation_core()
 
     def _infer_model(self, features: FeaturesType) -> TargetsType:
         pass

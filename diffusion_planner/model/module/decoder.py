@@ -127,7 +127,7 @@ class Decoder(nn.Module):
 
     def _get_near_current_infos(
             self,
-            target_agents_mask: torch.Tensor,  # [B, agent_num] bool
+            target_agents_mask: Optional[torch.Tensor],  # [B, agent_num] bool
             neighbor_agents_past: torch.Tensor,  # [B, agent_num, time_len, 11]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """

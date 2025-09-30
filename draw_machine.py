@@ -468,8 +468,8 @@ class DrawingOptions:
     DIFF_future_gt_3_dim_agent_index_color: str = BRIGHT_CYAN
     DIFF_future_gt_3_dim_agent_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
-    DIFF_draw_diff_future_gen_traj: bool = True
-    DIFF_draw_diff_future_gen_traj_token: bool = True
+    DIFF_draw_diff_future_gen_traj: bool = False
+    DIFF_draw_diff_future_gen_traj_token: bool = False
     DIFF_future_gen_traj_mode: str = "point"  # 'arrow' 또는 'point'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
@@ -502,7 +502,7 @@ class DrawingOptions:
         "line_width": 0.2,
     }
     ###################
-    DIFF_draw_diff_future_all_gt_3_dim: bool = False
+    DIFF_draw_diff_future_all_gt_3_dim: bool = True
     DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
 
@@ -700,7 +700,7 @@ def draw_lane_centerlines(
     lanes: Array,
     options: DrawingOptions,
     agent_route_lane_order: Optional[Array] = None,
-    agent_idx_candidates: Optional[List[int]] = None,
+    draw_token_int_list: Optional[List[int]] = None,
 ) -> None:
     """센터라인을 점선으로 그리거나, agent_route_lane_order가 주어지면 에이전트-차선 매핑을 텍스트로 표기한다.
 
@@ -745,7 +745,7 @@ def draw_lane_centerlines(
 
     # ────────────── (B) 텍스트 표기 모드 ──────────────
     if agent_route_lane_order is not None:
-        if agent_idx_candidates is None:
+        if draw_token_list is None:
             draw_all = True
         else:
             draw_all = False
@@ -774,7 +774,7 @@ def draw_lane_centerlines(
                     lane_j_center[point_idx, 1])
                 for count, agent_idx in enumerate(valid_agent_idxs):
                     if (not draw_all) and (agent_idx
-                                           not in agent_idx_candidates):
+                                           not in draw_token_int_list):
                         continue
                     rank_ij = int(ranks_j[int(agent_idx)])
                     label = f"{int(agent_idx)}--{rank_ij}"  # "에이전트인덱스:해당차선랭크"
@@ -1639,16 +1639,18 @@ def draw_neighbor_past_output(
 
 
 def get_agent_idx_from_tokens(
-        token_candidates: List[str],
-        neighbor_track_token: Optional[List[Optional[str]]]) -> List[int]:
+        draw_token_list: Optional[List[str]],
+        neighbor_track_token: Optional[List[Optional[str]]]) -> Optional[List[int]]:
     """token_candidates에 포함된 토큰을 가진 이웃 차량의 인덱스를 반환."""
-    agent_idx_candidates = []
     if neighbor_track_token is None:
-        return agent_idx_candidates
+        return None
+    draw_token_int_list = []
+    if neighbor_track_token is None:
+        return draw_token_int_list
     for idx, token in enumerate(neighbor_track_token):
-        if token is not None and token in token_candidates:
-            agent_idx_candidates.append(idx)
-    return agent_idx_candidates
+        if token is not None and token in draw_token_list:
+            draw_token_int_list.append(idx)
+    return draw_token_int_list
 
 
 def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
@@ -1660,19 +1662,18 @@ def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
     if draw_option.LANE_draw_lane_centerline:
         """ 디버깅 용으로 작성해놓음
         - token_candidates 에 route를 확인하고 싶은 agent의 token을 넣어주면 됨
-        - agent_idx_candidates 를 None으로 설정하면 -> 모든 차량에 대해서 text를 그리게 됨
+        - draw_token_list 를 None으로 설정하면 -> 모든 차량에 대해서 text를 그리게 됨
         """
-        token_candidates: List[str] = []
-        agent_idx_candidates: List[int] = get_agent_idx_from_tokens(
-            token_candidates, input_data.get("neighbor_track_token", None))
-
+        draw_token_list: List[str] = []
+        draw_token_int_list: List[int] = get_agent_idx_from_tokens(
+            draw_token_list, input_data.get("neighbor_track_token", None))
         draw_lane_centerlines(
             ax,
             lanes,
             draw_option,
             agent_route_lane_order=input_data.get(
                 "agent_route_lane_order", None),  #agent_K_route_lane_order,
-            agent_idx_candidates=agent_idx_candidates)
+            draw_token_int_list=draw_token_int_list)
 
 
 def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
@@ -1717,7 +1718,7 @@ def draw_neighbor_past_all(ax: plt.Axes, input_data: WorldModelFeature,
 
 
 def draw_diff_future_all_gt_3_dim(ax: plt.Axes, diff_token_to_future_all_gt_3_dim: Dict[str, Array],
-                                  options: DrawingOptions) -> None:
+                                  options: DrawingOptions, draw_token_list: Optional[List[str]] = None) -> None:
     """near_future_all_gt_3_dim (Pnn, future_all_len, 3=[x,y,yaw])를
     흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..Pnn-1)를 흰색으로 표기.
 
@@ -1729,9 +1730,11 @@ def draw_diff_future_all_gt_3_dim(ax: plt.Axes, diff_token_to_future_all_gt_3_di
 
     eps = options.invalid_eps
     for track_token, future_all_gt_3_dim in diff_token_to_future_all_gt_3_dim.items():
-        future_len = future_all_gt_3_dim.shape[0]
+        if track_token not in draw_token_list:
+            continue
+        future_all_len = future_all_gt_3_dim.shape[0] # (future_all_len, 3)
         # 모든 유효 포인트를 x마커로 그리기
-        for t in range(future_len):
+        for t in range(future_all_len):
             row = future_all_gt_3_dim[t]
             if not is_valid_future_row_xyyaw(row, eps):
                 continue
@@ -1770,7 +1773,7 @@ def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
             draw_option,
             diff_token_to_next_wp_wrt_ego,
         )
-    diff_token_to_future_all_gt_3_dim = input_data.get("diff_token_to_future_all_gt_3_dim", None) # (Pnn, future_all_len, 3)
+    diff_token_to_future_all_gt_3_dim = input_data.get("diff_token_to_future_all_gt_3_dim", None) # (future_all_len, 3)
     if draw_option.DIFF_draw_diff_future_all_gt_3_dim and (
             diff_token_to_future_all_gt_3_dim is not None):
         draw_diff_future_all_gt_3_dim(ax, diff_token_to_future_all_gt_3_dim,
