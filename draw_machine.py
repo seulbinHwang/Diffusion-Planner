@@ -1779,7 +1779,7 @@ def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
     if draw_option.DIFF_draw_diff_future_all_gt_3_dim and (
             diff_token_to_future_all_gt_3_dim is not None):
         draw_diff_future_all_gt_3_dim(ax, diff_token_to_future_all_gt_3_dim,
-                                      draw_option=["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"])
+                                      draw_option, draw_token_list=["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"])
     #########################################
 
 
