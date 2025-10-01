@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import render_fast_collections
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
 
@@ -345,17 +345,17 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (18.0, 18.0)
-    dpi: int = 100
+    dpi: int = 400
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
 
     COMMON_vel_arrow_len_m: float = 5.0
-    COMMON_heading_line_scale: float = 0.5
+    COMMON_heading_line_scale: float = 0.1
 
     ######## LANES ########
     LANE_draw_lane_boundaries: bool = True  # check
-    LANE_boundary_width: float = 1.
+    LANE_boundary_width: float = 0.2
     LANE_draw_lane_centerline: bool = True  # check
     LANE_draw_agent_route_lane_order: bool = True  # check
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
@@ -366,7 +366,7 @@ class DrawingOptions:
         2: RED,  # 진한 빨간색(신호등 빨강)
         3: GRAY,  # 회색(청회색)
     }
-    LANE_AGENT_index_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
+    LANE_AGENT_index_fontsize: int = 2  # 에이전트 번호 텍스트 폰트 크기
 
     ######### [EGO] ##############
     ########### [EGO] PAST ##################
@@ -602,7 +602,7 @@ def add_velocity_arrow(ax: plt.Axes,
             (x, y),
             (x + dx, y + dy),
             arrowstyle="-|>",
-            mutation_scale=8.0,
+            mutation_scale=3.0,
             linewidth=line_width,
             color=line_color,
             alpha=line_alpha,
@@ -1525,7 +1525,7 @@ def set_axes_limits_with_margin(ax: plt.Axes, bounds: Tuple[float, float, float,
 
 def save_figure_to_png(fig: plt.Figure, save_path: str) -> None:
     """Figure를 PNG로 저장하고 Figure를 닫음."""
-    plt.savefig(save_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.savefig(save_path, dpi=fig.get_dpi(),facecolor=fig.get_facecolor()) # bbox_inches="tight",
     plt.close(fig)
 
 
@@ -1810,45 +1810,121 @@ def draw_neighbor(ax: plt.Axes, input_data: WorldModelFeature,
     draw_neighbor_future_all(ax, input_data, output_data, draw_option, draw_token_list)
 
 
-def draw_lane(
-    ax: plt.Axes,
-    input_data: WorldModelFeature,
-    draw_option: DrawingOptions,
-    draw_token_list: Optional[List[str]] = None,
-) -> None:
-    """차선(경계/센터라인) 레이어를 그린다.
 
-    Args:
-        ax: Matplotlib Axes.
-        input_data: world model 입력 데이터(dict).
-        draw_option: 렌더링 옵션.
-        draw_token_list: 특정 에이전트 토큰만 텍스트 표기하고 싶을 때 사용. None이면 전체.
-    """
+def draw_lane(ax: plt.Axes, input_data: WorldModelFeature,
+              draw_option: DrawingOptions, draw_token_list: Optional[List[str]]=None):
     lanes = input_data.get("lanes")
 
+    render_fast_collections.apply_rasterization(ax, rasterization_zorder=10)
     if draw_option.LANE_draw_lane_boundaries:
-        draw_lane_boundaries(ax, lanes, draw_option)
-
+        render_fast_collections.draw_lane_boundaries_fast(
+            ax,
+            lanes.astype(np.float32),
+            boundary_color=draw_option.LANE_lane_boundary_color,
+            linewidth=draw_option.LANE_boundary_width,
+            invalid_eps=draw_option.invalid_eps,
+        )
+        # draw_lane_boundaries(ax, lanes, draw_option)
     # agent_route_lane_order가 있으면 텍스트 표기 모드로 전환
     if draw_option.LANE_draw_lane_centerline:
-        """
-        디버깅 용으로 작성해놓음
+        """ 디버깅 용으로 작성해놓음
         - token_candidates 에 route를 확인하고 싶은 agent의 token을 넣어주면 됨
         - draw_token_list 를 None으로 설정하면 -> 모든 차량에 대해서 text를 그리게 됨
         """
         draw_token_int_list: Optional[List[int]] = get_agent_idx_from_tokens(
-            draw_token_list,
-            input_data.get("neighbor_track_token", None)
+            draw_token_list, input_data.get("neighbor_track_token", None))
+        render_fast_collections.draw_lane_centerlines_fast(
+            ax,
+            lanes.astype(np.float32),
+            signal_colors=draw_option.LANE_signal_colors,
+            draw_agent_route_lane_order=bool(draw_option.LANE_draw_agent_route_lane_order),
+            agent_route_lane_order=input_data.get("agent_route_lane_order", None),
+            draw_token_int_list=draw_token_int_list,
+            label_stride=4,  # 원본의 point_idx % 4 규칙 유지
+            route_label_color=draw_option.LANE_route_agent_index_color,
+            route_label_fontsize=draw_option.LANE_AGENT_index_fontsize,
+            route_label_vstep_m=0.3,
+            dashed_linewidth=1.2,
+            dashed_pattern=(0, (4, 4)),
+            invalid_eps=draw_option.invalid_eps,
         )
 
-        draw_lane_centerlines(
-            ax,
-            lanes,
-            draw_option,
-            agent_route_lane_order=input_data.get("agent_route_lane_order", None),
-            # agent_K_route_lane_order,
-            draw_token_int_list=draw_token_int_list,
-        )
+
+def lock_axes_bounds_before_drawing(
+    ax: plt.Axes,
+    input_data: Dict[str, Any],
+    output_data: Optional[Dict[str, Any]],
+    options: "DrawingOptions",
+) -> Tuple[float, float, float, float]:
+    """그리기 전에 축 범위를 계산·고정하고, autoscale을 꺼서 이후 드로잉 동안 축이 변하지 않게 한다.
+
+    동작:
+        1) compute_auto_bounds(...)로 (xmin, xmax, ymin, ymax) 계산
+        2) set_axes_limits_with_margin(...)으로 여백 포함해 축 고정
+        3) ax.set_autoscale_on(False)로 autoscale 비활성화
+        4) apply_axes_style(...)로 축 스타일(비율/축표시) 적용
+           - 당신 코드에서는 adjustable='box'라 limits를 바꾸지 않음
+
+    Returns:
+        (xmin, xmax, ymin, ymax): 계산된 원시 범위(여백 전). 디버깅/로그용.
+    """
+    # ① 우선 범위 계산(숫자 배열에서만 계산하므로 빠름)
+    xmin, xmax, ymin, ymax = compute_auto_bounds(input_data, output_data, options)
+
+    # ② 여백 포함해서 축 고정
+    set_axes_limits_with_margin(ax, (xmin, xmax, ymin, ymax), options.margin_m)
+
+    # ③ autoscale 비활성화(그 이후 add_patch/plot 등 호출 시 축 갱신 안 함)
+    ax.set_autoscale_on(False)  # == ax.autoscale(False)
+
+    # ④ 축 스타일 적용(비율/equal, 축 숨김 등)
+    apply_axes_style(ax, options)
+
+    return xmin, xmax, ymin, ymax
+
+def set_axes_limits_with_small_auto_margin(
+    ax,
+    bounds: tuple[float, float, float, float],
+    frac: float = 0.02,  # 스팬의 2%
+    min_m: float = 0.5,
+    max_m: float = 3.0,
+) -> None:
+    xmin, xmax, ymin, ymax = bounds
+    xspan = max(xmax - xmin, 1e-6)
+    yspan = max(ymax - ymin, 1e-6)
+    span = max(xspan, yspan)
+    m = max(min(span * frac, max_m), min_m)
+    ax.set_xlim(xmin - m, xmax + m)
+    ax.set_ylim(ymin - m, ymax + m)
+    ax.set_autoscale_on(False)  # 🔒 이후 추가되는 아티스트가 축을 바꾸지 못하게
+
+
+def resize_figure_to_data_aspect(
+    fig,
+    bounds: tuple[float, float, float, float],
+    target_long_side_px: int = 1200,  # 긴 변 픽셀 목표(용량 통제 핵심)
+) -> None:
+    xmin, xmax, ymin, ymax = bounds
+    xspan = max(xmax - xmin, 1e-6)
+    yspan = max(ymax - ymin, 1e-6)
+    aspect = xspan / yspan
+
+    if aspect >= 1.0:
+        w_px = target_long_side_px
+        h_px = max(1, int(round(w_px / aspect)))
+    else:
+        h_px = target_long_side_px
+        w_px = max(1, int(round(h_px * aspect)))
+
+    dpi = fig.get_dpi()
+    fig.set_size_inches(w_px / dpi, h_px / dpi)
+
+
+def make_axes_fill_figure(fig, ax) -> None:
+    # Figure 바깥 여백 제거 + Axes를 Figure 전체로 확장
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
+    ax.set_position([0, 0, 1, 1])
+
 
 # [Add]
 def draw_world_model_to_png(
@@ -1857,13 +1933,20 @@ def draw_world_model_to_png(
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
-    draw_token_list: List[str] = ["79fda306f0655a3c"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    draw_token_list: List[str] = ["63070d02949f5bd8"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
     # draw_token_list = None
     draw_option = options or DrawingOptions()
 
     # 1) Figure/Axes
     fig, ax = create_figure_and_axes(draw_option)
-
+    # 2) 🔑 그리기 전에: 범위 계산 → 축 고정 → 비율 지정 → Figure/Axes 배치
+    bounds = compute_auto_bounds(input_data, output_data, draw_option)
+    set_axes_limits_with_small_auto_margin(ax, bounds, frac=0.02, min_m=0.5, max_m=3.0)
+    ax.set_aspect('equal', adjustable='box')  # 데이터 비율 유지(축 한계는 그대로)
+    ax.set_autoscale_on(False)                # 이후 추가되는 아티스트가 축을 건드리지 못함
+    resize_figure_to_data_aspect(fig, bounds, target_long_side_px=1200)
+    make_axes_fill_figure(fig, ax)
+    apply_axes_style(ax, draw_option)         # 축 숨김 등(축 범위엔 영향 없음)
     #########################################
     draw_lane(ax, input_data, draw_option, draw_token_list)
     draw_ego(ax, input_data, draw_option)
@@ -1872,9 +1955,9 @@ def draw_world_model_to_png(
 
     # # ── (5) 축 범위/스타일 ───────────────────────────────────────────
     # # [Add]
-    bounds = compute_auto_bounds(input_data, output_data, draw_option)
-    set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
-    apply_axes_style(ax, draw_option)
+    # bounds = compute_auto_bounds(input_data, output_data, draw_option)
+    # set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
+    # apply_axes_style(ax, draw_option)
 
     # 6) 저장
     save_figure_to_png(fig, save_path)

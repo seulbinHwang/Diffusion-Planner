@@ -18,6 +18,7 @@ from diffusion_planner.data_process.utils import convert_to_model_inputs
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 
 
+
 class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
     def __init__(self, config: Config) -> None:
@@ -39,13 +40,25 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         """Inherited, see superclass."""
         return WorldModelFeature  # type: ignore
 
+    def _get_token_to_current_xy(self,
+                                 target_track_token: List[Optional[str]] # len: agents_num
+                                 ) -> Dict[str, np.ndarray]:
+        neighbor_agents_past = self.unnormalized_features["neighbor_agents_past"] # (agent_num, time_len, 11)
+        neighbor_current_xy = neighbor_agents_past[:, -1, :2] # (agent_num, 2)
+        token_to_current_xy = {}
+        for idx, token in enumerate(target_track_token):
+            if token is None:
+                continue
+            token_to_current_xy[token] = neighbor_current_xy[idx] # (2,)
+        return token_to_current_xy
+
+
     def _post_process_unnormalized_features(
             self,
             neighbor_track_token: List[Optional[str]],  # len: agents_num
             target_agents_mask: Optional[np.ndarray],  # len: agents_num
     ) -> None:
-        neighbor_future_gt_3_dim = self.unnormalized_features.get(
-            "neighbor_future_gt_3_dim", None)  # (agent_num, future_len, 3)
+
         target_track_token: List[Optional[str]] = [] # len: agents_num
         for idx, token in enumerate(neighbor_track_token):
             if token is None:
@@ -56,15 +69,17 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             else:
                 target_track_token.append(None)
 
+
         diff_token_to_future_gt_3_dim: Dict[str,
                                             np.ndarray] = {}  # (future_len, 3)
+        neighbor_future_gt_3_dim = self.unnormalized_features.get(
+            "neighbor_future_gt_3_dim", None)  # (agent_num, future_len, 3)
         if neighbor_future_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
                 if token is not None:
                     diff_token_to_future_gt_3_dim[
                         token] = neighbor_future_gt_3_dim[
                             idx]  # (future_len, 3)
-
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_all_gt_3_dim",
             None)  # (agent_num, future_all_len, 3)
@@ -72,10 +87,13 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         if neighbor_future_all_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
                 if token is not None:
-                    a = neighbor_future_all_gt_3_dim[
-                            idx]  # (future_all_len, 3)
+                    # (future_all_len, 3)
+                    future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
+                            idx]
                     diff_token_to_future_all_gt_3_dim[
-                        token] = a
+                        token] = future_all_gt_3_dim
+
+
         self.unnormalized_features[
             "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
         self.unnormalized_features[

@@ -1,7 +1,7 @@
 from typing import cast, List, Dict, Optional, Deque, Tuple, Union
 import numpy as np
 import numpy.typing as npt
-import draw_machine
+import draw_machine_2 as draw_machine
 from nuplan.common.actor_state.dynamic_car_state import get_velocity_shifted
 from nuplan_extent.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory
@@ -34,7 +34,7 @@ from scipy.spatial.distance import cdist
 # /Users/user/PycharmProjects/nuplan-devkit/nuplan/common/actor_state/tracked_objects.py
 from nuplan.common.utils.interpolatable_state import InterpolatableState
 from decimal import Decimal, ROUND_HALF_UP
-from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
+from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative, ego_local_traj3_to_global
 from nuplan.common.actor_state.vehicle_parameters import VehicleParameters
 from nuplan.common.actor_state.dynamic_car_state import DynamicCarState
 from nuplan.planning.simulation.observation.observation_type import Observation
@@ -1112,6 +1112,17 @@ class WorldModelAgents(AbstractMLAgents):
         diff_token_to_future_all_gt_3_dim: Dict[
             str, np.ndarray]  # len : valid_agent_num
     ) -> None:
+        # [NEW] 1) GT(ego frame) → Global frame 변환
+        gt_global: Dict[str, np.ndarray] = {}
+        for token, local_traj_xyh in diff_token_to_future_all_gt_3_dim.items():
+            gt_global[token] = ego_local_traj3_to_global(
+                local_traj_xyh=local_traj_xyh,  # (T,3) in ego
+                cur_ego_global_xyyaw=cur_ego_global_xyyaw,  # (3,) global
+            )  # (T,3) in global
+        diff_token_to_future_all_gt_3_dim = gt_global
+
+
+
         diff_token_to_updated_agent: Dict[str, Agent] = {}
         diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] = {}  # (1, 11)
         for diff_token, interpol_traj in diff_token_to_interpol_traj.items():

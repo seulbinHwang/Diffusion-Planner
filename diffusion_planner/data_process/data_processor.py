@@ -453,13 +453,13 @@ class DataProcessor(object):
                                  self._max_elements, self._max_points)
         # (num_agents, future_len, 3)
         # FOR OPEN-LOOP SIMULATION.
-        neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
-            scenario, anchor_ego_state, neighbor_agents_past, neighbor_indices,
-            iteration)  # (num_agents, future_len, 3)
+        # neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
+        #     scenario, anchor_ego_state, neighbor_agents_past, neighbor_indices,
+        #     iteration)  # (num_agents, future_len, 3)
         # FOR CLOSED-LOOP SIMULATION.
 
         if self.init_future_tracked_objects_array_list is None:
-            scenario_duration: float = scenario.duration_s.time_s
+            scenario_duration: float = scenario.duration_s.time_s + self.future_time_horizon
             num_samples = int(scenario_duration * 10.)
             # future_tracked_objects_array_list: List[ np.ndarray ((frame_agents_num, 8)) ]
             # 길이: 1 + num_future_poses
@@ -482,6 +482,8 @@ class DataProcessor(object):
         neighbor_future_all_gt_3_dim = agent_future_all_process(
             anchor_ego_state, init_future_tracked_objects_array_list,
             neighbor_token_id)
+        neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
+        iteration + self.num_future_poses, :] # (agents_num, future_len, 3)
 
         data = {
             "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
@@ -796,9 +798,9 @@ class DataProcessor(object):
         neighbor_future_gt_3_dim = agent_future_process(
             anchor_ego_state, future_tracked_objects_array_list,
             self.num_agents, neighbor_indices)
-        _, neighbor_future_gt_3_dim, _ = \
-            self._filter_agents_within_radius(neighbor_agents_past,
-                                              neighbor_future_gt_3_dim)
+        # _, neighbor_future_gt_3_dim, _ = \
+        #     self._filter_agents_within_radius(neighbor_agents_past,
+        #                                       neighbor_future_gt_3_dim)
         return neighbor_future_gt_3_dim
 
     def save_to_disk(self, dir, data):

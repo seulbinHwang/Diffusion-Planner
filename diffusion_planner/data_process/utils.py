@@ -53,6 +53,65 @@ from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajectory
 
 
+from typing import Dict
+import numpy as np
+import numpy.typing as npt
+
+
+def ego_local_traj3_to_global(
+    local_traj_xyh: npt.NDArray[np.floating],   # shape: (T, 3) = [x_e, y_e, yaw_e]
+    cur_ego_global_xyyaw: npt.NDArray[np.floating],  # shape: (3,) = [x_g, y_g, yaw_g]
+    *, invalid_eps: float = 0.0,
+) -> npt.NDArray[np.float64]:
+    """ego 좌표계 (x, y, heading) 시퀀스를 세계 절대 좌표계로 변환하되,
+    (0., 0., 0.)인 무효 행은 제거하고 유효 행만 반환합니다.
+
+    Args:
+        local_traj_xyh (np.ndarray): shape (T, 3). 각 행은 [x_e, y_e, yaw_e].
+        cur_ego_global_xyyaw (np.ndarray): shape (3,). [x_g, y_g, yaw_g].
+        invalid_eps (float, optional): 무효 판정 허용 오차.
+            - 0.0: 정확히 (0., 0., 0.)만 무효
+            - >0.0: |x_e|, |y_e|, |yaw_e| 모두 eps 이하이면 무효
+
+    Returns:
+        np.ndarray: shape (T_valid, 3). 각 행은 [x_g, y_g, yaw_g].
+                    유효 행이 하나도 없으면 (0, 3) 배열을 반환.
+    """
+    if local_traj_xyh.ndim != 2 or local_traj_xyh.shape[1] != 3:
+        raise ValueError(f"`local_traj_xyh` shape must be (T,3), got {local_traj_xyh.shape}")
+    if cur_ego_global_xyyaw.shape != (3,):
+        raise ValueError(f"`cur_ego_global_xyyaw` shape must be (3,), got {cur_ego_global_xyyaw.shape}")
+
+    # ── 1) 무효 행 필터링: (x, y, yaw) 모두 0(또는 eps 이내)이면 제거 ─────────────────
+    if invalid_eps <= 0.0:
+        invalid_mask = (local_traj_xyh[:, 0] == 0.0) & (local_traj_xyh[:, 1] == 0.0) & (local_traj_xyh[:, 2] == 0.0)
+    else:
+        invalid_mask = (
+            np.isclose(local_traj_xyh[:, 0], 0.0, atol=invalid_eps) &
+            np.isclose(local_traj_xyh[:, 1], 0.0, atol=invalid_eps) &
+            np.isclose(local_traj_xyh[:, 2], 0.0, atol=invalid_eps)
+        )
+    valid_mask = ~invalid_mask
+    if not np.any(valid_mask):
+        return np.empty((0, 3), dtype=np.float64)
+
+    local_valid = local_traj_xyh[valid_mask]  # (T_valid, 3)
+
+    # ── 2) ego→global 변환 ────────────────────────────────────────────────────────
+    x_e = local_valid[:, 0]
+    y_e = local_valid[:, 1]
+    yaw_e = local_valid[:, 2]
+
+    x_g0, y_g0, yaw_g0 = map(float, cur_ego_global_xyyaw.tolist())  # 글로벌 기준(ego 현재 포즈)
+    c, s = np.cos(yaw_g0), np.sin(yaw_g0)
+    x_g = x_e * c - y_e * s + x_g0
+    y_g = x_e * s + y_e * c + y_g0
+    yaw_g = yaw_e + yaw_g0
+    # 필요하면 yaw_g = (yaw_g + np.pi) % (2 * np.pi) - np.pi  # [-pi, pi] 정규화
+
+    return np.stack([x_g, y_g, yaw_g], axis=1).astype(np.float64)
+
+
 def get_npc_route_roadblock_ids(
     scenario: NuPlanScenario,
     sampled_past_observations: List[TrackedObjects],

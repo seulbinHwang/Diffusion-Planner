@@ -69,7 +69,7 @@ def build_simulations(
         distributed_mode=DistributedMode[cfg.distributed_mode],
     )
     scenarios = scenario_filter.get_scenarios()
-
+    scenarios = [scenarios[0]]
     metric_engines_map = {}
     if cfg.run_metric:
         logger.info('Building metric engines...')
