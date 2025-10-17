@@ -459,7 +459,6 @@ class WorldModelLogReplay(AbstractMLAgents):
                 diffusion_agent = self._diffusion_agents[token]
                 tracked_object.predictions = diffusion_agent.predictions
 
-
     def _get_current_agents(self):
         all_things: DetectionsTracks = self._scenario.get_tracked_objects_at_iteration(
             self.current_iteration)
@@ -477,8 +476,6 @@ class WorldModelLogReplay(AbstractMLAgents):
         self.current_observation = None
         self._diffusion_agents = {}
         self._get_current_agents()
-
-
 
     def _get_diffusion_agents(self, ego_state: EgoState) -> None:
         """
@@ -602,7 +599,6 @@ class WorldModelLogReplay(AbstractMLAgents):
         self._diffusion_agents = {
             t: unique_agents[t] for t in final_selected_tokens_within_square
         }
-
 
     def _get_interpol_time_points(
             self, iteration: SimulationIteration) -> List[TimePoint]:
@@ -924,7 +920,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             iteration.index)
         # target_agents_mask: np.ndarray, (agent_num,) bool
         # diffusion_agents_tokens: List[str] # len: valid diffusion agent num
-        diffusion_agents_tokens = None #list(self._diffusion_agents.keys())
+        diffusion_agents_tokens = None  #list(self._diffusion_agents.keys())
         current_input = PlannerInput(iteration, history, traffic_light_data,
                                      diffusion_agents_tokens,
                                      interp_next_ego_11_dim,
@@ -1172,7 +1168,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_wrt_ego = diff_token_to_np_gen_traj_wrt_ego
-        
+
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
         return diff_token_to_np_gen_traj_wrt_ego, diffusion_tokens_dist_order
