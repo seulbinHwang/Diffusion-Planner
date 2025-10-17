@@ -12,7 +12,14 @@ from collections import deque
 from nuplan.planning.simulation.observation.observation_type import DetectionsTracks
 
 np.set_printoptions(precision=3, suppress=True)
-
+from nuplan_extent.planning.simulation.observation.smoother import (
+    compute_forward_backward_signs,
+    slip_limit_stage,
+    yawrate_smooth_stage,
+    SmootherConfig,
+    SlipParams,
+    RateParams,
+)
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from nuplan.planning.scenario_builder.abstract_scenario import AbstractScenario
 from nuplan.planning.training.modeling.torch_module_wrapper import TorchModuleWrapper
@@ -449,6 +456,50 @@ class WorldModelLogReplay(AbstractMLAgents):
         self.predicted_neighbor_num = self.config.predicted_neighbor_num
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
+
+    def _build_smoother_config(self) -> SmootherConfig:
+        """후처리 스무더 파라미터 번들을 구성합니다. (스켈레톤: 값은 예시/초기값으로 두고 나중에 조정)
+
+        Returns:
+            SmootherConfig: 에이전트 타입별 파라미터 모음.
+        """
+        veh_slip = SlipParams(beta_body_max_deg=10.0, w_p=1.0, w_theta=0.1)
+        bic_slip = SlipParams(beta_body_max_deg=15.0, w_p=1.0, w_theta=0.2)
+        ped_slip = SlipParams(beta_body_max_deg=18.0, w_p=1.0,
+                              w_theta=0.5)  # 사용은 안하지만 형태 통일
+
+        veh_rate = RateParams(v_dir=0.4,
+                              v_floor=0.4,
+                              phi_dot_cap=1.0,
+                              R_min=6.0,
+                              aN_max=4.0,
+                              alpha_max=1.0,
+                              straight_eps_deg=1.0)
+        bic_rate = RateParams(v_dir=0.35,
+                              v_floor=0.3,
+                              phi_dot_cap=1.2,
+                              R_min=4.0,
+                              aN_max=2.5,
+                              alpha_max=1.6,
+                              straight_eps_deg=1.0)
+        ped_rate = RateParams(v_dir=0.45,
+                              v_floor=0.3,
+                              phi_dot_cap=2.5,
+                              R_min=None,
+                              aN_max=3.0,
+                              alpha_max=1.8,
+                              straight_eps_deg=1.0)
+        dt = float(self._planner_step_gap_s)  # 보통 0.1s
+
+        return SmootherConfig(
+            veh_slip=veh_slip,
+            veh_rate=veh_rate,
+            bic_slip=bic_slip,
+            bic_rate=bic_rate,
+            ped_slip=ped_slip,
+            ped_rate=ped_rate,
+            dt=dt,
+        )
 
     def _update_observation_core(self) -> None:
         """Inherited, see superclass."""
@@ -903,7 +954,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         interp_next_ego_11_dim: Optional[npt.NDArray[np.float32]],
         planner_future_11_dim: Optional[npt.NDArray[np.float32]]
     ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]], Dict[
-            str, np.ndarray]]:
+            str, np.ndarray], np.ndarray]:
         # Construct input features
         initialization = HorizonPlannerInitialization(
             # 시나리오가 끝나고도 계속 진행했을 때 최종적으로 도달해야 하는 포즈 (존재하지 않을 수도 있음)
@@ -937,12 +988,14 @@ class WorldModelLogReplay(AbstractMLAgents):
         neighbor_token_dist_order: List[
             Optional[str]] = model_input_key_to_unnorm_value[
                 "neighbor_track_token"]  # (agent_num, )
-        diff_token_to_future_gt_3_dim: np.ndarray = \
-        model_input_key_to_unnorm_value[
-            "diff_token_to_future_gt_3_dim"]  # (Pnn, future_len, 3)
+        diff_token_to_future_gt_3_dim: Dict[
+            str, np.ndarray] = model_input_key_to_unnorm_value[
+                "diff_token_to_future_gt_3_dim"]  # Dict[str, np.ndarray] # len : valid_agent_num
+        neighbor_agents_past = model_input_key_to_unnorm_value[
+            "neighbor_agents_past"]
         self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
         return (model_input_key_to_value, neighbor_token_dist_order,
-                diff_token_to_future_gt_3_dim)
+                diff_token_to_future_gt_3_dim, neighbor_agents_past)
 
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
@@ -962,14 +1015,16 @@ class WorldModelLogReplay(AbstractMLAgents):
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
         # diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] # len : valid_agent_num
         (model_input_key_to_value, neighbor_token_dist_order,
-         diff_token_to_future_gt_3_dim) = self._get_model_input(
-             iteration, history, interp_next_ego_11_dim, planner_future_11_dim)
+         diff_token_to_future_gt_3_dim,
+         neighbor_agents_past) = self._get_model_input(iteration, history,
+                                                       interp_next_ego_11_dim,
+                                                       planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
         self.infer_model(model_input_key_to_value, iteration, next_iteration,
                          neighbor_token_dist_order,
-                         diff_token_to_future_gt_3_dim)
+                         diff_token_to_future_gt_3_dim, neighbor_agents_past)
 
     def update_observation(
             self,
@@ -1131,10 +1186,56 @@ class WorldModelLogReplay(AbstractMLAgents):
         sorted_distances: npt.NDArray[np.float64] = distances[sorted_indices]
         return sorted_tokens, sorted_distances
 
+    def _filter_trajectory(
+        self,
+        future_np_trajs_wrt_ego: np.ndarray,
+        neighbor_agents_past: np.ndarray,  # (Pnn,time_len, 11)
+        veh_valid_mask: np.ndarray,  # (Pnn,)
+        bic_valid_mask: np.ndarray,  # (Pnn,)
+        ped_valid_mask: np.ndarray  # (Pnn,)
+    ) -> npt.NDArray[np.float32]:
+        # 0) 원시 입력 준비
+        near_cur_future_raw: np.ndarray = future_np_trajs_wrt_ego.astype(
+            np.float32)  # (Pnn, 81, 4)
+        near_agents_current: np.ndarray = near_cur_future_raw[:,
+                                                              0, :]  # (Pnn, 4)
+        near_future_raw: np.ndarray = near_cur_future_raw[:,
+                                                          1:, :]  # (Pnn, 80, 4)
+
+        # 1) σ_k 계산 (현재+미래 81프레임)
+        near_current_future_dir = compute_forward_backward_signs(
+            near_cur_future_raw=near_cur_future_raw)  # (Pnn, 81) bool
+
+        # 2) 슬립각 제한 단계 (앵커 보정→순차 보정)
+        cfg = self._build_smoother_config()  # 아래 헬퍼를 스켈레톤으로 추가
+        near_current_future_a2, near_future_body_slip = slip_limit_stage(
+            near_agents_current=near_agents_current,
+            near_future_raw=near_future_raw,
+            near_current_future_dir=near_current_future_dir,
+            veh_valid_mask=veh_valid_mask,
+            bic_valid_mask=bic_valid_mask,
+            ped_valid_mask=ped_valid_mask,
+            cfg=cfg,
+        )  # (Pnn,81,4), (Pnn,80)
+
+        # 3) 각속도 제약 + 스무딩 단계
+        near_future_a3 = yawrate_smooth_stage(
+            near_current_future_a2=near_current_future_a2,
+            near_current_future_dir=near_current_future_dir,
+            near_future_body_slip=near_future_body_slip,
+            veh_valid_mask=veh_valid_mask,
+            bic_valid_mask=bic_valid_mask,
+            ped_valid_mask=ped_valid_mask,
+            cfg=cfg,
+        )  # (Pnn, 80, 4)
+        return near_current_future_a2, near_future_a3
+
     def _get_token_to_np_traj_wrt_ego(
-            self,
-            model_inputs: AbstractModelFeature,
-            neighbor_token_dist_order: List[Optional[str]],  # len == agent_num
+        self,
+        model_inputs: AbstractModelFeature,
+        neighbor_token_dist_order: List[Optional[str]],  # len == agent_num
+        neighbor_agents_past: np.ndarray
+        # (agent_num, time_len, 11)
     ) -> Tuple[Dict[str, np.ndarray], List[str]]:
         """
         Returns:
@@ -1154,8 +1255,14 @@ class WorldModelLogReplay(AbstractMLAgents):
         future_np_trajs_wrt_ego: np.ndarray = self._model_loader.infer(
             model_inputs).detach().cpu().numpy()
         gen_slot_len = future_np_trajs_wrt_ego.shape[0]
+        # neighbor_agents_past: (Pnn, time_len, 11)
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        diff_token_to_np_hist_wrt_ego: Dict[str, np.ndarray] = {}
+        veh_valid_mask = []
+        bic_valid_mask = []
+        ped_valid_mask = []
+
         self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
             if idx >= gen_slot_len:
@@ -1163,11 +1270,42 @@ class WorldModelLogReplay(AbstractMLAgents):
             np_traj_wrt_ego = future_np_trajs_wrt_ego[idx, 1:, :]  # (T, 4)
             np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
             if np.allclose(np_traj_sum, 0.0) or token is None:
+                veh_valid_mask.append(False)
+                bic_valid_mask.append(False)
+                ped_valid_mask.append(False)
                 continue
             diff_token_to_np_gen_traj_wrt_ego[token] = np_traj_wrt_ego
-            self._diffusion_agents[token] = self._agents[token]
+            agent_past = neighbor_agents_past[idx]  # (time_len, 11)
+            agent_class = agent_past[-1,
+                                     8:]  # (3,) one-hot # vehicle, ped, bicycle
+            veh_valid_mask.append(bool(agent_class[0]))
+            ped_valid_mask.append(bool(agent_class[1]))
+            bic_valid_mask.append(bool(agent_class[2]))
+            diff_token_to_np_hist_wrt_ego[token] = agent_past
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_wrt_ego = diff_token_to_np_gen_traj_wrt_ego
+
+        veh_valid_mask = np.array(veh_valid_mask, dtype=bool)  # (Pnn,)
+        bic_valid_mask = np.array(bic_valid_mask, dtype=bool)  # (Pnn,)
+        ped_valid_mask = np.array(ped_valid_mask, dtype=bool)  # (Pnn,)
+        near_current_future_a2, near_future_a3 = self._filter_trajectory(
+            future_np_trajs_wrt_ego, neighbor_agents_past, veh_valid_mask,
+            bic_valid_mask, ped_valid_mask)
+        diff_token_to_np_slip_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        diff_token_to_np_smooth_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        for idx, token in enumerate(neighbor_token_dist_order):
+            if idx >= gen_slot_len:
+                break
+            np_slip_traj_wrt_ego = near_current_future_a2[idx, 1:, :]  # (T, 4)
+            np_smooth_traj_wrt_ego = near_future_a3[idx, :, :]  # (T, 4)
+            np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
+            if np.allclose(np_traj_sum, 0.0) or token is None:
+                continue
+            diff_token_to_np_slip_traj_wrt_ego[token] = np_slip_traj_wrt_ego
+            diff_token_to_np_smooth_traj_wrt_ego[token] = np_smooth_traj_wrt_ego
+            self._diffusion_agents[token] = self._agents[token]
+        self._draw_infos.diff_token_to_np_slip_traj_wrt_ego = diff_token_to_np_slip_traj_wrt_ego
+        self._draw_infos.diff_token_to_np_smooth_traj_wrt_ego = diff_token_to_np_smooth_traj_wrt_ego
 
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
@@ -1276,7 +1414,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         next_iteration: SimulationIteration,
         neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
         diff_token_to_future_gt_3_dim: Dict[
-            str, np.ndarray]  # len : valid_agent_num # (future_len, 3)
+            str, np.ndarray],  # len : valid_agent_num # (future_len, 3)
+        neighbor_agents_past: np.ndarray  # (agents_num, time_len, 11)
     ) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
             "world_model_feature"]
@@ -1284,7 +1423,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         # diffusion_tokens_dist_order: List[str] # valid diffusion agent 토큰 리스트 (거리 오름차순)
         (diff_token_to_np_gen_traj_wrt_ego,
          diffusion_tokens_dist_order) = self._get_token_to_np_traj_wrt_ego(
-             model_inputs, neighbor_token_dist_order)
+             model_inputs, neighbor_token_dist_order, neighbor_agents_past)
 
         cur_ego_global_xyyaw = np.array([
             self._ego_anchor_state.rear_axle.x,

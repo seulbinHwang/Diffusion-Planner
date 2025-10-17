@@ -1339,10 +1339,9 @@ class WorldModelAgents(AbstractMLAgents):
         veh_valid_mask = np.array(veh_valid_mask, dtype=bool)  # (Pnn,)
         bic_valid_mask = np.array(bic_valid_mask, dtype=bool)  # (Pnn,)
         ped_valid_mask = np.array(ped_valid_mask, dtype=bool)  # (Pnn,)
-        near_current_future_a2, near_future_a3 = self._filter_trajectory(future_np_trajs_wrt_ego,
-                                                 neighbor_agents_past,
-                                                 veh_valid_mask, bic_valid_mask,
-                                                 ped_valid_mask)
+        near_current_future_a2, near_future_a3 = self._filter_trajectory(
+            future_np_trajs_wrt_ego, neighbor_agents_past, veh_valid_mask,
+            bic_valid_mask, ped_valid_mask)
         diff_token_to_np_slip_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_smooth_traj_wrt_ego: Dict[str, np.ndarray] = {}
         for idx, token in enumerate(neighbor_token_dist_order):
