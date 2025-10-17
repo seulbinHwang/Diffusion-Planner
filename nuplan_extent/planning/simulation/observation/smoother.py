@@ -290,7 +290,9 @@ def compute_forward_backward_signs(
     # 3) σ_i 결정: 유효 구간만 sign(d_i), 그 외 0
     sigma_seg_int = np.zeros_like(d, dtype=np.int8)  # (Pnn,80) in {-1,0,+1}
     # sign(d) → {+1(전진), -1(후진)}; 단, d==0이면 0으로 남음(모름)
-    sigma_values = np.sign(d, dtype=np.int8)  # numpy>=1.20: dtype 인자 사용
+    clean = np.nan_to_num(d, nan=0.0, posinf=np.finfo(d.dtype).max,
+                          neginf=np.finfo(d.dtype).min)
+    sigma_values = np.sign(clean).astype(np.int8, copy=False)
     sigma_seg_int[seg_valid] = sigma_values[seg_valid]
 
     # 4) (Pnn, 81) 프레임 길이로 확장 (마지막 프레임=0)
