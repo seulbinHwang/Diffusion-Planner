@@ -1989,8 +1989,8 @@ def draw_world_model_to_png(
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
-    # draw_token_list: List[str] = ["79fda306f0655a3c"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
-    draw_token_list = None
+    draw_token_list: List[str] = ["58a9e2ba05555824"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    # draw_token_list = None
     draw_option = options or DrawingOptions()
 
     # 1) Figure/Axes
