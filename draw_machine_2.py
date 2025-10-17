@@ -505,7 +505,7 @@ class DrawingOptions:
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
     DIFF_future_gen_traj_style = {
         "line_color": WHITE,  # 흰색
-        "line_width": 0.2,
+        "line_width": 0.3,
         "index_color": WHITE,  # 흰색
     }
     DIFF_draw_diff_future_slip_traj: bool = True
@@ -517,7 +517,7 @@ class DrawingOptions:
     DIFF_draw_diff_future_smooth_traj: bool = True
     DIFF_future_smooth_traj_style = {
         "line_color": PALE_RED,  # 흰색
-        "line_width": 0.2,
+        "line_width": 0.1,
         "index_color": PALE_RED,  # 흰색
     }
     DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
