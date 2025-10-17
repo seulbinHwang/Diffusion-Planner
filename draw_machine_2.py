@@ -374,7 +374,7 @@ class DrawingOptions:
     LANE_draw_lane_boundaries: bool = True  # check
     LANE_boundary_width: float = 0.2
     LANE_draw_lane_centerline: bool = True  # check
-    LANE_draw_agent_route_lane_order: bool = True  # check
+    LANE_draw_agent_route_lane_order: bool = False  # check
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
     LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
     LANE_signal_colors = {
@@ -499,7 +499,7 @@ class DrawingOptions:
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_gen_traj_mode: str = "point"  # 'arrow' 또는 'point'
+    DIFF_future_gen_traj_mode: str = "arrow"  # 'arrow' 또는 'point'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
@@ -523,7 +523,7 @@ class DrawingOptions:
     DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
 
     ########################
-    DIFF_draw_diff_future_gen_refined_traj: bool = True
+    DIFF_draw_diff_future_gen_refined_traj: bool = False
     DIFF_future_gen_refined_style = {
         "line_color": PALE_CYAN,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
