@@ -113,7 +113,7 @@ def _collect_valid_xy_from_output_data(
     """output_data의 모든 key를 검사하여 valid (x,y) 좌표만 수집해 반환.
 
     예상 키와 타입
-    - diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,4)] 또는 (4,)
+    - diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,11)] 또는 (11)
     - diff_token_to_np_history_wrt_ego: Dict[str, (H,11)] 또는 (11,)
     - diff_token_to_interp_np_traj_wrt_ego: Dict[str, (N,11)] 또는 (11,)
     - diff_token_to_next_wp_wrt_ego: Dict[str, (11,)] 또는 (1,11)
@@ -125,13 +125,14 @@ def _collect_valid_xy_from_output_data(
     if not output_data:
         return xs_local, ys_local
 
-    # (1) diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,4)] 또는 (4,)
+    # (1) diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,11)] 또는
     token_to_traj = output_data.get("diff_token_to_np_gen_traj_11_wrt_ego")
     if isinstance(token_to_traj, dict) and len(token_to_traj) > 0:
         for _, arr in token_to_traj.items():
             if arr is None:
                 continue
-            arr = np.asarray(arr)
+            arr = np.asarray(arr).copy()
+            arr = arr[:, 0:4]  # (T,4)
             if arr.ndim == 2 and arr.shape[1] == 4:
                 valid_mask = np.any(np.abs(arr[:, :4]) > eps, axis=1)
                 if np.any(valid_mask):
@@ -208,7 +209,7 @@ class DrawInfos:
         딥러닝 output 값 그대로
         """
         self.diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {
-        }  # (T, 4)
+        }  # (T, 11)
         """
         딥러닝 output 값에서, 슬립 초과한거 제거한거
         """
