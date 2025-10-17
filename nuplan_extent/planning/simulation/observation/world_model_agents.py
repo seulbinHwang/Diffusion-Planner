@@ -1264,6 +1264,7 @@ class WorldModelAgents(AbstractMLAgents):
             near_current_future_dir=near_current_future_dir,
             veh_valid_mask=veh_valid_mask,
             bic_valid_mask=bic_valid_mask,
+            ped_valid_mask=ped_valid_mask,
             cfg=cfg,
         )  # (Pnn,81,4), (Pnn,80)
 
@@ -1274,9 +1275,10 @@ class WorldModelAgents(AbstractMLAgents):
             near_future_body_slip=near_future_body_slip,
             veh_valid_mask=veh_valid_mask,
             bic_valid_mask=bic_valid_mask,
+            ped_valid_mask=ped_valid_mask,
             cfg=cfg,
         )  # (Pnn, 80, 4)
-        return near_future_a3
+        return near_current_future_a2, near_future_a3
 
     def _get_token_to_np_traj_wrt_ego(
         self,
@@ -1337,22 +1339,25 @@ class WorldModelAgents(AbstractMLAgents):
         veh_valid_mask = np.array(veh_valid_mask, dtype=bool)  # (Pnn,)
         bic_valid_mask = np.array(bic_valid_mask, dtype=bool)  # (Pnn,)
         ped_valid_mask = np.array(ped_valid_mask, dtype=bool)  # (Pnn,)
-        near_future_a3 = self._filter_trajectory(future_np_trajs_wrt_ego,
+        near_current_future_a2, near_future_a3 = self._filter_trajectory(future_np_trajs_wrt_ego,
                                                  neighbor_agents_past,
-                                                 veh_valid_mask,
-                                                 bic_valid_mask,
+                                                 veh_valid_mask, bic_valid_mask,
                                                  ped_valid_mask)
-
+        diff_token_to_np_slip_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_smooth_traj_wrt_ego: Dict[str, np.ndarray] = {}
         for idx, token in enumerate(neighbor_token_dist_order):
             if idx >= gen_slot_len:
                 break
-            np_traj_wrt_ego = near_future_a3[idx, :, :]  # (T, 4)
+            np_slip_traj_wrt_ego = near_current_future_a2[idx, 1:, :]  # (T, 4)
+            np_smooth_traj_wrt_ego = near_future_a3[idx, :, :]  # (T, 4)
             np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
             if np.allclose(np_traj_sum, 0.0) or token is None:
                 continue
-            diff_token_to_np_smooth_traj_wrt_ego[token] = np_traj_wrt_ego
+            diff_token_to_np_slip_traj_wrt_ego[token] = np_slip_traj_wrt_ego
+            diff_token_to_np_smooth_traj_wrt_ego[token] = np_smooth_traj_wrt_ego
             self._diffusion_agents[token] = self._agents[token]
+        self._draw_infos.diff_token_to_np_slip_traj_wrt_ego = diff_token_to_np_slip_traj_wrt_ego
+        self._draw_infos.diff_token_to_np_smooth_traj_wrt_ego = diff_token_to_np_smooth_traj_wrt_ego
 
         diffusion_tokens_dist_order_1 = set(
             diff_token_to_np_smooth_traj_wrt_ego.keys())

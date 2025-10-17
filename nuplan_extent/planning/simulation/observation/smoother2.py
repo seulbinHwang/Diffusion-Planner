@@ -1275,7 +1275,6 @@ def _integrate_arc_positions_and_phi(
     phi_eff0: npt.NDArray[np.float32],  # (Pnn,)   시작 σ-aware 방향각
     dphi_seq: npt.NDArray[np.float32],  # (Pnn, 80) Δφ[k] = ω_smooth[k] dt
     speed: npt.NDArray[np.float32],  # (Pnn, 80) v[k]
-    dt: float,
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
     """σ-aware 축에서 φ를 적분하고, 원호적분으로 위치를 갱신합니다.
 
@@ -1316,7 +1315,7 @@ def _integrate_arc_positions_and_phi(
 
     # 원호 적분
     ds = (speed.astype(np.float32)) * np.float32(
-        dt)  # (Pnn,80)  (cfg.dt가 상단 스코프에 있다면 전달 필요)
+        cfg.dt)  # (Pnn,80)  (cfg.dt가 상단 스코프에 있다면 전달 필요)
     # 이 헬퍼는 순수함수로 두기 위해 dt를 외부 전역에 의존하지 않도록, 상위에서 Δs를 전달해도 됩니다.
     # 여기서는 간편화를 위해 ds 계산을 유지합니다.
 
@@ -1421,6 +1420,7 @@ def yawrate_smooth_stage(
     Returns:
         np.ndarray: near_future_a3 (Pnn, 80, 4)
     """
+    Pnn = near_current_future_a2.shape[0]
     dt = float(cfg.dt)
 
     # 0) 기초량: 좌표/헤딩/세그먼트/σ
@@ -1483,7 +1483,6 @@ def yawrate_smooth_stage(
         phi_eff0=phi_eff0,
         dphi_seq=dphi_seq,
         speed=speeds,
-        dt=dt,
     )  # (Pnn,80,2), (Pnn,80)
 
     # 6) 헤딩 복원(슬립각 보존)
