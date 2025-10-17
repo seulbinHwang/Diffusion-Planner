@@ -1,7 +1,7 @@
 from typing import cast, List, Dict, Optional, Deque, Tuple, Union
 import numpy as np
 import numpy.typing as npt
-import draw_machine_2 as draw_machine
+import draw_machine as draw_machine
 from nuplan.common.actor_state.dynamic_car_state import get_velocity_shifted
 from nuplan_extent.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from nuplan.common.actor_state.agent import Agent, PredictedTrajectory

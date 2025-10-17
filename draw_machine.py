@@ -21,6 +21,10 @@ GRAY = "#808080"
 LIME = "#84E573"
 LIGHTBLUE = "#4D83E1"
 WHITE = "#FFFFFF"  # 미래 궤적 raw 예측 값
+LIGHT_PINK = "#F7CCCC" # slip 각 초과 제거한 궤적 값
+PALE_RED = "#EE9999" # 경로 제약 보정한 궤적 값
+SOFT_RED = "#E66666" #
+BRIGHT_RED = "#DD3333" #
 PALE_CYAN = "#BFFFFF"  # 미래 궤적 refined 예측 값 # EGO Planner 궤적 값
 LIGHT_CYAN = "#80FFFF"  # 미래 궤적 refined state 값 # EGO Planner 궤적 next state 값
 BRIGHT_CYAN = "#40FFFF"  # neighbor_future_gt_3_dim
@@ -206,6 +210,16 @@ class DrawInfos:
         self.diff_token_to_np_gen_traj_wrt_ego: Dict[str,
                                                      np.ndarray] = {}  # (T, 4)
         """
+        딥러닝 output 값에서, 슬립 초과한거 제거한거
+        """
+        self.diff_token_to_np_slip_traj_wrt_ego: Dict[str,
+                                                     np.ndarray] = {}  # (T, 4)
+        """
+        딥러닝 output 값에서, 슬립 초과 제거 + 경로 제약 보정한거
+        """
+        self.diff_token_to_np_smooth_traj_wrt_ego: Dict[str,
+                                                     np.ndarray] = {}  # (T, 4)
+        """
         history Agent 만든걸 -> (History_len, 11) numpy로 변환한 것들
         npc 미래 궤적 보정 input으로 쓰이는걸 그려보기 위해 저장
         """
@@ -226,6 +240,9 @@ class DrawInfos:
         output_data = {
             "diff_token_to_np_gen_traj_wrt_ego":
                 self.diff_token_to_np_gen_traj_wrt_ego,
+            "diff_token_to_np_slip_traj_wrt_ego":
+                self.diff_token_to_np_slip_traj_wrt_ego,
+            "diff_token_to_np_smooth_traj_wrt_ego": self.diff_token_to_np_smooth_traj_wrt_ego,
             "diff_token_to_np_history_wrt_ego":
                 self.diff_token_to_np_history_wrt_ego,
             "diff_token_to_interp_np_traj_wrt_ego":
@@ -357,7 +374,7 @@ class DrawingOptions:
     LANE_draw_lane_boundaries: bool = True  # check
     LANE_boundary_width: float = 1.
     LANE_draw_lane_centerline: bool = True  # check
-    LANE_draw_agent_route_lane_order: bool = True  # check
+    LANE_draw_agent_route_lane_order: bool = False  # check
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
     LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
     LANE_signal_colors = {
@@ -482,19 +499,31 @@ class DrawingOptions:
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_gen_traj_mode: str = "point"  # 'arrow' 또는 'point'
+    DIFF_future_gen_traj_mode: str = "arrow"  # 'arrow' 또는 'point'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
     DIFF_future_gen_traj_style = {
         "line_color": WHITE,  # 흰색
-        "line_width": 0.2,
+        "line_width": 0.3,
         "index_color": WHITE,  # 흰색
+    }
+    DIFF_draw_diff_future_slip_traj: bool = True
+    DIFF_future_slip_traj_style = {
+        "line_color": LIGHT_PINK,  # 흰색
+        "line_width": 0.2,
+        "index_color": LIGHT_PINK,  # 흰색
+    }
+    DIFF_draw_diff_future_smooth_traj: bool = True
+    DIFF_future_smooth_traj_style = {
+        "line_color": PALE_RED,  # 흰색
+        "line_width": 0.1,
+        "index_color": PALE_RED,  # 흰색
     }
     DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
 
     ########################
-    DIFF_draw_diff_future_gen_refined_traj: bool = True
+    DIFF_draw_diff_future_gen_refined_traj: bool = False
     DIFF_future_gen_refined_style = {
         "line_color": PALE_CYAN,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
@@ -1375,6 +1404,8 @@ from typing import Optional, Literal
 def draw_diff_future_gen_traj(
     ax: plt.Axes,
     diff_token_to_np_gen_traj_wrt_ego: Optional[TokenTrajDict],
+        diff_token_to_np_slip_traj_wrt_ego: Optional[TokenTrajDict],
+        diff_token_to_np_smooth_traj_wrt_ego: Optional[TokenTrajDict],
     options: DrawingOptions,
     draw_token_list: Optional[List[str]]=None
 ) -> None:
@@ -1468,6 +1499,101 @@ def draw_diff_future_gen_traj(
                     va="top",
                     zorder=24,
                 )
+
+    if options.DIFF_draw_diff_future_slip_traj and diff_token_to_np_slip_traj_wrt_ego:
+        for idx, (token, np_slip_traj_wrt_ego) in enumerate(
+                diff_token_to_np_slip_traj_wrt_ego.items()):  # [ADD]
+            if draw_token_list is not None and token not in draw_token_list:
+                continue
+            if np_slip_traj_wrt_ego is None or np_slip_traj_wrt_ego.size == 0:
+                continue
+            if np_slip_traj_wrt_ego.ndim != 2 or np_slip_traj_wrt_ego.shape[1] != 4:
+                raise ValueError(
+                    "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
+                )
+
+            future_len = np_slip_traj_wrt_ego.shape[0]
+            for t in range(future_len):
+                row = np_slip_traj_wrt_ego[t]  # (4,) = [x, y, cos, sin]
+                if not is_valid_token_row(row, eps):
+                    continue
+
+                x, y = float(row[0]), float(row[1])
+                c, s = float(row[2]), float(row[3])
+
+                if mode == "arrow":
+                    # 방향 벡터 (c, s)를 정규화하여 고정 길이(옵션) 화살표
+                    add_velocity_arrow(
+                        ax,
+                        x,
+                        y,
+                        c,
+                        s,
+                        length_m=options.DIFF_future_gen_traj_arrow_len_m,
+                        line_color=options.DIFF_future_slip_traj_style["line_color"],
+                        line_width=options.DIFF_future_slip_traj_style["line_width"],
+                        zorder=23,
+                    )
+                else:
+                    # 점만 표시(방향 정보 사용하지 않음)
+                    ax.plot(
+                        x,
+                        y,
+                        marker=options.DIFF_future_gen_traj_point_marker,
+                        markersize=options.DIFF_future_gen_traj_point_marker_size,
+                        linestyle="None",
+                        color=options.DIFF_future_slip_traj_style["line_color"],
+                        zorder=23,
+                    )
+
+    if options.DIFF_draw_diff_future_smooth_traj and diff_token_to_np_smooth_traj_wrt_ego:
+        for idx, (token, np_smooth_traj_wrt_ego) in enumerate(
+                diff_token_to_np_slip_traj_wrt_ego.items()):  # [ADD]
+            if draw_token_list is not None and token not in draw_token_list:
+                continue
+            if np_smooth_traj_wrt_ego is None or np_smooth_traj_wrt_ego.size == 0:
+                continue
+            if np_smooth_traj_wrt_ego.ndim != 2 or np_smooth_traj_wrt_ego.shape[
+                1] != 4:
+                raise ValueError(
+                    "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
+                )
+
+            future_len = np_smooth_traj_wrt_ego.shape[0]
+            for t in range(future_len):
+                row = np_smooth_traj_wrt_ego[t]  # (4,) = [x, y, cos, sin]
+                if not is_valid_token_row(row, eps):
+                    continue
+
+                x, y = float(row[0]), float(row[1])
+                c, s = float(row[2]), float(row[3])
+
+                if mode == "arrow":
+                    # 방향 벡터 (c, s)를 정규화하여 고정 길이(옵션) 화살표
+                    add_velocity_arrow(
+                        ax,
+                        x,
+                        y,
+                        c,
+                        s,
+                        length_m=options.DIFF_future_gen_traj_arrow_len_m,
+                        line_color=options.DIFF_future_smooth_traj_style[
+                            "line_color"],
+                        line_width=options.DIFF_future_smooth_traj_style[
+                            "line_width"],
+                        zorder=23,
+                    )
+                else:
+                    # 점만 표시(방향 정보 사용하지 않음)
+                    ax.plot(
+                        x,
+                        y,
+                        marker=options.DIFF_future_gen_traj_point_marker,
+                        markersize=options.DIFF_future_gen_traj_point_marker_size,
+                        linestyle="None",
+                        color=options.DIFF_future_smooth_traj_style["line_color"],
+                        zorder=23,
+                    )
 
 
 # =============================================================================
@@ -1780,9 +1906,15 @@ def draw_neighbor_future_all(ax: plt.Axes, input_data: WorldModelFeature,
     ### [NEIGHBOR FUTURE OUTPUT] ###
     diff_token_to_np_gen_traj_wrt_ego = output_data.get(
         "diff_token_to_np_gen_traj_wrt_ego", None)
+    diff_token_to_np_slip_traj_wrt_ego = output_data.get(
+        "diff_token_to_np_slip_traj_wrt_ego", None)
+    diff_token_to_np_smooth_traj_wrt_ego = output_data.get(
+        "diff_token_to_np_smooth_traj_wrt_ego", None)
     if draw_option.DIFF_draw_diff_future_gen_traj:
         draw_diff_future_gen_traj(ax, diff_token_to_np_gen_traj_wrt_ego,
-                                      draw_option, draw_token_list)
+                                  diff_token_to_np_slip_traj_wrt_ego,
+                                  diff_token_to_np_smooth_traj_wrt_ego,
+                                  draw_option, draw_token_list)
     diff_token_to_interp_np_traj_wrt_ego = output_data.get(
         "diff_token_to_interp_np_traj_wrt_ego", None)
     diff_token_to_next_wp_wrt_ego = output_data.get(
@@ -1857,8 +1989,8 @@ def draw_world_model_to_png(
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
-    draw_token_list: List[str] = ["79fda306f0655a3c"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
-    # draw_token_list = None
+    # draw_token_list: List[str] = ["79fda306f0655a3c"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    draw_token_list = None
     draw_option = options or DrawingOptions()
 
     # 1) Figure/Axes
