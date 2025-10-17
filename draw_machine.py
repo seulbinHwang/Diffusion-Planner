@@ -383,7 +383,7 @@ class DrawingOptions:
         2: RED,  # 진한 빨간색(신호등 빨강)
         3: GRAY,  # 회색(청회색)
     }
-    LANE_AGENT_index_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
+    LANE_AGENT_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
 
     ######### [EGO] ##############
     ########### [EGO] PAST ##################
