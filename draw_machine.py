@@ -517,18 +517,18 @@ class DrawingOptions:
     }
     DIFF_draw_diff_future_slip_traj: bool = True
     DIFF_future_slip_style = {
-        "line_color": LIGHT_PINK,  # 빨간색(밝은 빨강)
+        "line_color": ORANGE,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
-        "velocity_line_color": LIGHT_PINK,  # 빨간색(밝은 빨강)
+        "velocity_line_color": ORANGE,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
 
     DIFF_draw_diff_future_smooth_traj: bool = True
     DIFF_future_smooth_style = {
-        "line_color": PALE_RED,  # 빨간색(밝은 빨강)
+        "line_color": RED,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
-        "velocity_line_color": PALE_RED,  # 빨간색(밝은 빨강)
+        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
@@ -1414,59 +1414,196 @@ def draw_diff_future_gen_refined_traj(
 from typing import Optional, Literal
 
 
-def draw_diff_future_gen_traj(
-        ax: plt.Axes,
-        diff_token_to_np_gen_traj_11_wrt_ego: Optional[TokenTrajDict],
-        diff_token_to_np_slip_traj_11_wrt_ego: Optional[TokenTrajDict],
-        diff_token_to_np_smooth_traj_11_wrt_ego: Optional[TokenTrajDict],
-        options: DrawingOptions,
-        draw_token_list: Optional[List[str]] = None) -> None:
-    """토큰 기준 미래 포즈를 '화살표(방향 포함)' 또는 '점(방향 미사용)'으로 그림.
+from typing import Optional, Dict, List, Tuple, Any
+
+
+def draw_token_trajectory_rects_unfilled(
+    ax: plt.Axes,
+    traj_11: Array,
+    style: Dict[str, Any],
+    options: DrawingOptions,
+    zorder: int,
+) -> Optional[Tuple[float, float]]:
+    """(T, 11) 궤적을 '속이 비어 있는 사각형 + 헤딩선'으로 렌더링.
 
     Args:
         ax: Matplotlib 축.
-        diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] | None
-            각 value: shape (future_len, 4) = [x, y, cos(yaw), sin(yaw)]
-            - invalid 규칙: 4값 모두 0(±eps) → 스킵
-        options: DrawingOptions
-            - DIFF_future_gen_traj_mode: 'arrow' | 'point'
-            - DIFF_future_gen_traj_point_marker, DIFF_future_gen_traj_point_marker_size
-            - DIFF_future_gen_traj_arrow_len_m
-        draw_mode: Optional['arrow' | 'point']
-            - 우선순위: draw_mode 인자(있으면) > options.DIFF_future_gen_traj_mode(없으면 'arrow')
+        traj_11: (T, 11) 배열. row = [x, y, cos, sin, vx, vy, width, length, onehot(3,)]
+                 ※ width=row[6], length=row[7]이며, 사각형 그릴 때 (length, width) 순서에 유의.
+        style: {"line_color": str, "line_width": float} 키 사용.
+        options: DrawingOptions (invalid_eps, COMMON_heading_line_scale 등 사용).
+        zorder: matplotlib z-order.
 
-    동작:
-        - 'arrow' 모드:
-            (x,y)에서 (cos,sin) 방향으로 고정 길이(options.DIFF_future_gen_traj_arrow_len_m) 화살표
-        - 'point' 모드:
-            (x,y) 위치에 포인트만 표시(방향 미사용)
-
-    Note:
-        - t==0 (각 토큰의 첫 포인트)에는 토큰 문자열을 살짝 아래(y-오프셋)에 표시.
+    Returns:
+        Optional[(x0, y0)]: 첫 번째 **유효** 프레임의 (x, y). 없으면 None.
     """
-    if not diff_token_to_np_gen_traj_11_wrt_ego:
-        return
-
-    mode = options.DIFF_future_gen_traj_mode
-    if mode not in {"arrow", "point"}:
-        raise ValueError(
-            f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point'.")
+    if traj_11 is None or traj_11.size == 0:
+        return None
+    arr = np.asarray(traj_11)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[1] != 11:
+        # 요청 스펙: (T,11)만 지원
+        return None
 
     eps = options.invalid_eps
-    # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
-    """ diff_token_to_np_gen_traj_11_wrt_ego 그리기
-    TODO: add_polygon 과 add_heading_line 을 이용해서 그리기
+    first_valid_xy: Optional[Tuple[float, float]] = None
+
+    for t in range(arr.shape[0]):
+        row = arr[t]  # (11,)
+        if not is_valid_agent_row(row, eps):
+            continue
+
+        x, y = float(row[0]), float(row[1])
+        c, s = float(row[2]), float(row[3])
+        W, L = float(row[6]), float(row[7])  # 주의: 저장은 (W, L) 순서, draw는 (L, W)
+
+        corners = oriented_box_corners(x, y, c, s, L, W)
+        add_polygon(
+            ax,
+            corners,
+            edge_color=style["line_color"],
+            line_width=style["line_width"],
+            fill_color=None,          # 속 비우기
+            fill_alpha=None,
+            zorder=zorder,
+        )
+        add_heading_line(
+            ax,
+            x,
+            y,
+            c,
+            s,
+            nominal_length=L * options.COMMON_heading_line_scale,
+            color=style["line_color"],
+            line_width=style["line_width"],
+            zorder=zorder,
+        )
+
+        if first_valid_xy is None:
+            first_valid_xy = (x, y)
+
+    return first_valid_xy
+
+
+def draw_traj_dict_as_unfilled_rects(
+    ax: plt.Axes,
+    token_to_traj_11: Optional[Dict[str, Array]],
+    style: Dict[str, Any],
+    options: DrawingOptions,
+    zorder: int,
+    draw_token_list: Optional[List[str]] = None,
+    annotate_token: bool = False,
+    annotate_fontsize: Optional[int] = None,
+) -> None:
+    """Dict[str, (T,11)]를 '속 빈 사각형'으로 렌더링하고 필요 시 토큰 라벨을 추가.
+
+    Args:
+        ax: Matplotlib 축.
+        token_to_traj_11: Dict[token, (T,11)].
+        style: {"line_color": str, "line_width": float}.
+        options: DrawingOptions.
+        zorder: z-order.
+        draw_token_list: 필터링할 토큰 목록. None이면 전체.
+        annotate_token: True면 각 토큰의 **첫 유효 프레임** 위치에 토큰 문자열 라벨을 표시.
+        annotate_fontsize: 라벨 폰트 크기. None이면 options.DIFF_future_gt_3_dim_token_fontsize 사용.
     """
+    if not token_to_traj_11:
+        return
 
-    if options.DIFF_draw_diff_future_slip_traj and diff_token_to_np_slip_traj_11_wrt_ego:
-        """
-        TODO: add_polygon 과 add_heading_line 을 이용해서 그리기
-        """
+    if annotate_fontsize is None:
+        annotate_fontsize = options.DIFF_future_gt_3_dim_token_fontsize
 
-    if options.DIFF_draw_diff_future_smooth_traj and diff_token_to_np_smooth_traj_11_wrt_ego:
-        """
-        TODO: add_polygon 과 add_heading_line 을 이용해서 그리기
-        """
+    for token, traj in token_to_traj_11.items():
+        if draw_token_list is not None and token not in draw_token_list:
+            continue
+
+        first_xy = draw_token_trajectory_rects_unfilled(
+            ax=ax,
+            traj_11=traj,
+            style=style,
+            options=options,
+            zorder=zorder,
+        )
+        # (선택) 토큰 라벨 추가: 첫 유효 프레임 좌표 기준, 아래쪽으로 약간 오프셋
+        if annotate_token and options.DIFF_draw_diff_future_gen_traj_token and (first_xy is not None):
+            fx, fy = first_xy
+            ax.text(
+                fx,
+                fy - options.DIFF_future_gen_trak_token_text_y_offset_m,
+                str(token)[:5],
+                color=style["line_color"],
+                fontsize=annotate_fontsize,
+                ha="center",
+                va="top",
+                zorder=zorder + 1,
+                clip_on=True,
+            )
+
+
+def draw_diff_future_gen_traj(
+    ax: plt.Axes,
+    diff_token_to_np_gen_traj_11_wrt_ego: Optional[Dict[str, Array]],
+    diff_token_to_np_slip_traj_11_wrt_ego: Optional[Dict[str, Array]],
+    diff_token_to_np_smooth_traj_11_wrt_ego: Optional[Dict[str, Array]],
+    options: DrawingOptions,
+    draw_token_list: Optional[List[str]] = None,
+) -> None:
+    """세 종류의 (T,11) 미래 궤적을 '속이 비어 있는 사각형'으로 렌더링.
+
+    각 row(11,) = [x, y, cos, sin, vx, vy, width, length, onehot(3,)]
+
+    렌더링 규칙
+    ----------
+    1) invalid 스텝 스킵: 앞 8차원 중 하나라도 |value|>eps 일 때만 유효(`is_valid_agent_row` 사용)
+    2) 모두 **속 비움(fill 없음)** + 헤딩선 표시
+    3) 겹침 순서(z-order): gen=22 → slip=23 → smooth=24 (smooth가 맨 위)
+    4) 토큰 라벨: `gen`의 첫 유효 프레임 기준 1회 표기
+       - 토큰 라벨 on/off: `options.DIFF_draw_diff_future_gen_traj_token`
+       - 위치 오프셋: `options.DIFF_future_gen_trak_token_text_y_offset_m`
+       - 색/두께: 각 스타일의 line_color/line_width 사용
+
+    Args:
+        ax: Matplotlib 축.
+        diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,11)] | None
+        diff_token_to_np_slip_traj_11_wrt_ego: Dict[str, (T,11)] | None
+        diff_token_to_np_smooth_traj_11_wrt_ego: Dict[str, (T,11)] | None
+        options: DrawingOptions
+        draw_token_list: 특정 토큰만 그리고 싶을 때 지정. None이면 전체.
+    """
+    # 1) 원본 gen (흰색) — 라벨은 여기서만
+    draw_traj_dict_as_unfilled_rects(
+        ax=ax,
+        token_to_traj_11=diff_token_to_np_gen_traj_11_wrt_ego,
+        style=options.DIFF_future_gen_style,
+        options=options,
+        zorder=22,
+        draw_token_list=draw_token_list,
+        annotate_token=True,
+        annotate_fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+    )
+
+    # 2) slip 초과 제거본 (연한 분홍)
+    draw_traj_dict_as_unfilled_rects(
+        ax=ax,
+        token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
+        style=options.DIFF_future_slip_style,
+        options=options,
+        zorder=23,
+        draw_token_list=draw_token_list,
+        annotate_token=False,
+    )
+
+    # 3) 경로 제약 보정본 (옅은 빨강) — 최상단
+    draw_traj_dict_as_unfilled_rects(
+        ax=ax,
+        token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
+        style=options.DIFF_future_smooth_style,
+        options=options,
+        zorder=24,
+        draw_token_list=draw_token_list,
+        annotate_token=False,
+    )
 
 
 # =============================================================================
