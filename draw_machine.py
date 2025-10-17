@@ -498,7 +498,7 @@ class DrawingOptions:
     DIFF_future_all_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
-    DIFF_draw_diff_future_gen_traj_token: bool = False
+    DIFF_draw_diff_future_gen_traj_token: bool = True
     DIFF_future_gen_traj_mode: str = "arrow"  # 'arrow' 또는 'point'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
@@ -631,7 +631,7 @@ def add_velocity_arrow(ax: plt.Axes,
             (x, y),
             (x + dx, y + dy),
             arrowstyle="-|>",
-            mutation_scale=8.0,
+            mutation_scale=4.0,
             linewidth=line_width,
             color=line_color,
             alpha=line_alpha,
