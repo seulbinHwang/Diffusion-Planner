@@ -1258,6 +1258,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         # neighbor_agents_past: (Pnn, time_len, 11)
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_hist_wrt_ego: Dict[str, np.ndarray] = {}
         veh_valid_mask = []
         bic_valid_mask = []
@@ -1265,9 +1266,15 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
+            agent_current = neighbor_agents_past[idx, 0]  # (11)
+            # agent_current: (11) -> (T, 11)
+            np_gen_traj_wrt_ego = np.tile(
+                agent_current,
+                (future_np_trajs_wrt_ego.shape[1] - 1, 1))  # (T, 11)
             if idx >= gen_slot_len:
                 break
             np_traj_wrt_ego = future_np_trajs_wrt_ego[idx, 1:, :]  # (T, 4)
+            np_gen_traj_wrt_ego[:, :4] = np_traj_wrt_ego  # (T, 11)
             np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
             if np.allclose(np_traj_sum, 0.0) or token is None:
                 veh_valid_mask.append(False)
@@ -1275,6 +1282,8 @@ class WorldModelLogReplay(AbstractMLAgents):
                 ped_valid_mask.append(False)
                 continue
             diff_token_to_np_gen_traj_wrt_ego[token] = np_traj_wrt_ego
+            diff_token_to_np_gen_traj_11_wrt_ego[
+                token] = np_gen_traj_wrt_ego  # (T, 11)
             agent_past = neighbor_agents_past[idx]  # (time_len, 11)
             agent_class = agent_past[-1,
                                      8:]  # (3,) one-hot # vehicle, ped, bicycle
@@ -1283,7 +1292,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             bic_valid_mask.append(bool(agent_class[2]))
             diff_token_to_np_hist_wrt_ego[token] = agent_past
         ### 디버깅용 ###
-        self._draw_infos.diff_token_to_np_gen_traj_wrt_ego = diff_token_to_np_gen_traj_wrt_ego
+        self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego
 
         veh_valid_mask = np.array(veh_valid_mask, dtype=bool)  # (Pnn,)
         bic_valid_mask = np.array(bic_valid_mask, dtype=bool)  # (Pnn,)
@@ -1291,21 +1300,29 @@ class WorldModelLogReplay(AbstractMLAgents):
         near_current_future_a2, near_future_a3 = self._filter_trajectory(
             future_np_trajs_wrt_ego, neighbor_agents_past, veh_valid_mask,
             bic_valid_mask, ped_valid_mask)
-        diff_token_to_np_slip_traj_wrt_ego: Dict[str, np.ndarray] = {}
-        diff_token_to_np_smooth_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        diff_token_to_np_slip_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
+        diff_token_to_np_smooth_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
         for idx, token in enumerate(neighbor_token_dist_order):
+            agent_current = neighbor_agents_past[idx, 0]  # (11)
+            # agent_current: (11) -> (T, 11)
+            np_slip_traj_wrt_ego = np.tile(
+                agent_current, (near_future_a3.shape[1], 1))  # (T, 11)
+            np_smooth_traj_wrt_ego = np.tile(
+                agent_current, (near_future_a3.shape[1], 1))  # (T, 11)
             if idx >= gen_slot_len:
                 break
-            np_slip_traj_wrt_ego = near_current_future_a2[idx, 1:, :]  # (T, 4)
-            np_smooth_traj_wrt_ego = near_future_a3[idx, :, :]  # (T, 4)
+            np_slip_traj_wrt_ego[:, :4] = near_current_future_a2[
+                idx, 1:, :]  # (T, 4)
+            np_smooth_traj_wrt_ego[:, :4] = near_future_a3[idx, :, :]  # (T, 4)
             np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
             if np.allclose(np_traj_sum, 0.0) or token is None:
                 continue
-            diff_token_to_np_slip_traj_wrt_ego[token] = np_slip_traj_wrt_ego
-            diff_token_to_np_smooth_traj_wrt_ego[token] = np_smooth_traj_wrt_ego
+            diff_token_to_np_slip_traj_11_wrt_ego[token] = np_slip_traj_wrt_ego
+            diff_token_to_np_smooth_traj_11_wrt_ego[
+                token] = np_smooth_traj_wrt_ego
             self._diffusion_agents[token] = self._agents[token]
-        self._draw_infos.diff_token_to_np_slip_traj_wrt_ego = diff_token_to_np_slip_traj_wrt_ego
-        self._draw_infos.diff_token_to_np_smooth_traj_wrt_ego = diff_token_to_np_smooth_traj_wrt_ego
+        self._draw_infos.diff_token_to_np_slip_traj_11_wrt_ego = diff_token_to_np_slip_traj_11_wrt_ego
+        self._draw_infos.diff_token_to_np_smooth_traj_11_wrt_ego = diff_token_to_np_smooth_traj_11_wrt_ego
 
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
