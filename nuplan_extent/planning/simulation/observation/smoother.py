@@ -1091,7 +1091,7 @@ def _compute_omega_max(
     v = speeds
     v_star = np.maximum(v,
                         params['v_floor'][:,
-                                          None]).astype(np.float32)  # (Pnn,80)
+                                          None]).astype(np.float32)  # (Pnn,1)
     comp0 = params['phi_dot_cap'][:,
                                   None].astype(np.float32)  # (Pnn,1)→(Pnn,80)
     # R_min==+∞ → comp1=0? 가 아니라 v/R_min→0. 하지만 min에서 0이 우세해버리므로,
@@ -1100,8 +1100,10 @@ def _compute_omega_max(
     comp1 = np.divide(v,
                       R,
                       out=np.full_like(v, np.inf, dtype=np.float32),
-                      where=np.isfinite(R))
-    comp2 = (params['aN_max'][:, None] / v_star).astype(np.float32)
+                      where=np.isfinite(R)) # (Pnn,80)
+    comp2 = (params['aN_max'][:, None] / v_star).astype(np.float32) # (Pnn,80)
+    # comp0 : (Pnn,1) → (Pnn,80)
+    comp0_repeat = np.repeat(comp0, repeats=80, axis=1).astype(np.float32)
 
     omega_max = np.minimum(comp0, np.minimum(comp1, comp2)).astype(np.float32)
     # 수치적으로 음수/NaN 방지
@@ -1195,75 +1197,74 @@ def _tv_smooth_forward_backward(
 
 def _integrate_arc_positions_and_phi(
     p0_xy: npt.NDArray[np.float32],  # (Pnn, 2) frame-0 위치
-    sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81) σ 프레임열
+    sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81) σ 프레임열 # "현재 + 미래 0, ..., 79"
     phi_eff0: npt.NDArray[np.float32],  # (Pnn,)   시작 σ-aware 방향각
-    dphi_seq: npt.NDArray[np.float32],  # (Pnn, 80) Δφ[k] = ω_smooth[k] dt
-    speed: npt.NDArray[np.float32],  # (Pnn, 80) v[k]
+    dphi_seq: npt.NDArray[np.float32],  # (Pnn, 80) Δφ[k] = ω_smooth[k] dt # # "현재 + 미래 0, ..., 78"
+    speed: npt.NDArray[np.float32],  # (Pnn, 80) v[k] # "현재 + 미래 0, ..., 78"
     dt: float,
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """σ-aware 축에서 φ를 적분하고, 원호적분으로 위치를 갱신합니다.
+    """스텝-바이-스텝 전진 적분으로 위치를 갱신하고, 각 스텝의 끝 세계 방향각을 복원합니다.
 
-    절차:
-        1) φ_eff_frame[0] = φ_eff0
-           φ_eff_frame[k+1] = wrap( φ_eff_frame[k] + dφ[k] )
-        2) 세계 방향각(시작/끝):
-           φ_world_start[k] = wrap( φ_eff_frame[k]   + π*(σ_frame[k]  == -1) )
-           φ_world_end  [k] = wrap( φ_eff_frame[k+1] + π*(σ_frame[k+1]== -1) )
-        3) 원호 적분(각 스텝 이동거리 Δs = v[k] dt):
-           (sinc/cosc)로 p_{k+1} 계산, 누적합
-
-    Args:
-        p0_xy (np.ndarray): (Pnn, 2) 시작 위치
-        sigma_frames (np.ndarray): (Pnn, 81)
-        phi_eff0 (np.ndarray): (Pnn,)
-        dphi_seq (np.ndarray): (Pnn, 80)
-        speed (np.ndarray): (Pnn, 80)
+    진행(세그먼트 k = 0..79):
+      1) 시작 세계 각:   φ_k   = wrap( φ_eff_k + π·I[σ_k=-1] )
+      2) 이동/회전량:    ds_k  = v_k * dt,    dφ_k = dphi_seq[:, k]
+      3) sinc/cosc 적분: x_{k+1}, y_{k+1}
+      4) 유효각 갱신:    φ_eff_{k+1} = wrap( φ_eff_k + dφ_k )
+      5) 끝 세계 각:     φ_{k+1} = wrap( φ_eff_{k+1} + π·I[σ_{k+1}=-1] )
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]:
-            positions_1_80: (Pnn, 80, 2)  # 미래 frame 0.,,,79 위치
-            phi_world_end:  (Pnn, 80)     # 각 세그먼트 끝(world) 방향각 φ_{k+1} # 미래 frame 0.,,,79
+        positions_1_80: (Pnn, 80, 2)  # frame 1..80 위치 (각 k 스텝의 끝 위치)
+        phi_world_end:  (Pnn, 80)     # 각 스텝 끝 세계 방향각 φ_{k+1}
     """
     Pnn = p0_xy.shape[0]
-    # φ_eff_frame: (Pnn, 81) # 현재 + 미래 0..79
-    phi_eff_frame = np.zeros((Pnn, 81), dtype=np.float32)
-    phi_eff_frame[:, 0] = phi_eff0.astype(np.float32)
-    # 누적 적분
-    cum = np.cumsum(dphi_seq.astype(np.float32), axis=1)  # (Pnn,80)
-    phi_eff_frame[:, 1:] = _wrap_to_pi(phi_eff_frame[:, [0]] + cum)
 
-    # 세계 시작/끝 방향각
-    pi_off_start = _sigma_to_pi_offset(sigma_frames[:, :-1])  # (Pnn,80)
-    pi_off_end = _sigma_to_pi_offset(sigma_frames[:, 1:])  # (Pnn,80)
-    phi_world_start = _wrap_to_pi(phi_eff_frame[:, :-1] + pi_off_start)
-    phi_world_end = _wrap_to_pi(phi_eff_frame[:, 1:] + pi_off_end)
+    # 출력 버퍼
+    positions_1_80 = np.zeros((Pnn, 80, 2), dtype=np.float32)
+    phi_world_end  = np.zeros((Pnn, 80),     dtype=np.float32)
 
-    # 원호 적분
-    ds = (speed.astype(np.float32)) * np.float32(
-        dt)  # (Pnn,80)  (cfg.dt가 상단 스코프에 있다면 전달 필요)
-    # 이 헬퍼는 순수함수로 두기 위해 dt를 외부 전역에 의존하지 않도록, 상위에서 Δs를 전달해도 됩니다.
-    # 여기서는 간편화를 위해 ds 계산을 유지합니다.
+    # 현재 스텝의 시작 상태 (복사해서 안전하게 사용)
+    xk = p0_xy[:, 0].astype(np.float32).copy()    # (Pnn,)
+    yk = p0_xy[:, 1].astype(np.float32).copy()    # (Pnn,)
+    phi_eff_k = phi_eff0.astype(np.float32).copy()  # (Pnn,)
 
-    sinc = _sinc(dphi_seq)
-    cosc = _cosc(dphi_seq)
-    c = np.cos(phi_world_start).astype(np.float32)
-    s = np.sin(phi_world_start).astype(np.float32)
+    # 시간축 전진 적분
+    for k in range(80):
+        # 1) 시작 세계 방향각 φ_k  (후진이면 +π로 복원)
+        pi_off_start_k = _sigma_to_pi_offset(sigma_frames[:, k])      # (Pnn,)
+        phi_world_k = _wrap_to_pi(phi_eff_k + pi_off_start_k)         # (Pnn,)
 
-    step_dx = (ds * (c * sinc - s * cosc)).astype(np.float32)  # (Pnn,80)
-    step_dy = (ds * (s * sinc + c * cosc)).astype(np.float32)  # (Pnn,80)
-    cum_dx = np.cumsum(step_dx, axis=1).astype(np.float32)  # (Pnn,80)
-    cum_dy = np.cumsum(step_dy, axis=1).astype(np.float32)  # (Pnn,80)
+        # 2) 이번 스텝 이동/회전량
+        ds_k   = (speed[:, k].astype(np.float32)) * np.float32(dt)    # (Pnn,)
+        dphi_k = dphi_seq[:, k].astype(np.float32)                    # (Pnn,)
 
-    x1_80 = (p0_xy[:, [0]] + cum_dx).astype(np.float32)  # (Pnn,80)
-    y1_80 = (p0_xy[:, [1]] + cum_dy).astype(np.float32)  # (Pnn,80)
+        # 3) sinc/cosc로 위치 업데이트
+        s = _sinc(dphi_k)          # (Pnn,)
+        csc = _cosc(dphi_k)        # (Pnn,)
+        c = np.cos(phi_world_k).astype(np.float32)
+        s_ = np.sin(phi_world_k).astype(np.float32)
 
-    positions = np.stack([x1_80, y1_80],
-                         axis=-1).astype(np.float32)  # (Pnn,80,2)
-    return positions, phi_world_end.astype(np.float32)
+        dx = ds_k * (c * s - s_ * csc)   # (Pnn,)
+        dy = ds_k * (s_ * s + c * csc)   # (Pnn,)
+
+        xk = xk + dx
+        yk = yk + dy
+
+        # 끝 위치 기록 (frame k+1)
+        positions_1_80[:, k, 0] = xk
+        positions_1_80[:, k, 1] = yk
+
+        # 4) σ-aware 유효각 업데이트
+        phi_eff_k = _wrap_to_pi(phi_eff_k + dphi_k)
+
+        # 5) 끝 세계 각 (다음 프레임 σ_{k+1}로 복원)
+        pi_off_end_k = _sigma_to_pi_offset(sigma_frames[:, k + 1])     # (Pnn,)
+        phi_world_end[:, k] = _wrap_to_pi(phi_eff_k + pi_off_end_k)    # (Pnn,)
+
+    return positions_1_80, phi_world_end
 
 
 def _restore_heading_from_phi_and_slip(
-        phi_world_end: npt.NDArray[np.float32],  # (Pnn, 80) # "현재 + 미래 0, ..., 79"
+        phi_world_end: npt.NDArray[np.float32],  # (Pnn, 80) # "미래 0, ..., 79"
         sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81) # "현재 + 미래 0, ..., 79"
         near_future_body_slip: npt.NDArray[np.float32],  # (Pnn, 81)  # "현재 + 미래 0, ..., 79"
 ) -> npt.NDArray[np.float32]:
@@ -1285,7 +1286,7 @@ def _restore_heading_from_phi_and_slip(
     beta_b = near_future_body_slip[:, 1:].astype(np.float32)
 
     pi_off_end = _sigma_to_pi_offset(sigma_frames[:, 1:])  # (Pnn,80)
-    theta_eff = _wrap_to_pi(phi_world_end - beta_b)  # (Pnn,80)
+    theta_eff = _wrap_to_pi(phi_world_end - 0)  # (Pnn,80)
     """
     theta_eff 에서, 후진인 경우 π 오프셋을 다시 빼서 θ_end 계산
     """
@@ -1415,7 +1416,7 @@ def yawrate_smooth_stage(
 
     # 5) φ 적분 → 위치 원호 적분
     # "현재 + 미래 0, ..., 78"
-    dphi_seq = (omega_clip1 * dt).astype(np.float32)  # (Pnn,80)
+    dphi_seq = (omega_smooth * dt).astype(np.float32)  # (Pnn,80)
     # phi_eff0: 현재
     phi_eff0 = phi_eff_seg[:, 0].astype(np.float32)  # (Pnn,)
     p0_xy = near_current_future_a2[:, 0, :2].astype(np.float32)  # (Pnn,2)
