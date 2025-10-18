@@ -463,8 +463,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         Returns:
             SmootherConfig: 에이전트 타입별 파라미터 모음.
         """
-        veh_slip = SlipParams(beta_body_max_deg=10.0, w_p=1.0, w_theta=0.1)
-        bic_slip = SlipParams(beta_body_max_deg=15.0, w_p=1.0, w_theta=0.2)
+        veh_slip = SlipParams(beta_body_max_deg=10.0, w_p=0.1, w_theta=1.0)
+        bic_slip = SlipParams(beta_body_max_deg=15.0, w_p=0.2, w_theta=1.0)
         ped_slip = SlipParams(beta_body_max_deg=18.0, w_p=1.0,
                               w_theta=0.5)  # 사용은 안하지만 형태 통일
 

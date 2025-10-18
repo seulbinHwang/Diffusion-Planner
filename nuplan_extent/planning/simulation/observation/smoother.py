@@ -213,6 +213,31 @@ def _compute_segment_valid_mask(
     return valid_left & valid_right & move_ok  # (Pnn, 80)
 
 
+def _prepare_sliplimit_basics(
+    near_agents_current: npt.NDArray[np.float32],  # (Pnn, 4)
+    near_future_raw: npt.NDArray[np.float32],  # (Pnn, 80, 4)
+    dt: float,
+) -> Tuple[
+        npt.NDArray[np.float32],  # cur_future_raw (Pnn,81,4)
+        npt.NDArray[np.bool_],  # seg_valid (Pnn,80)
+        npt.NDArray[np.float32],  # dist_raw (Pnn,80)
+        npt.NDArray[np.float32],  # speed_raw (Pnn,80)
+]:
+    """슬립 단계 전용 기초량을 한 번만 계산해 반환."""
+    cur_future_raw = _concat_current_and_future(near_agents_current,
+                                                near_future_raw)  # (Pnn,81,4)
+    x_raw, y_raw, _ = _extract_xy_theta(cur_future_raw)  # (Pnn,81)
+    frame_is_padding = _compute_frame_padding_mask(cur_future_raw)  # (Pnn,81)
+    seg_valid = _compute_segment_valid_mask(frame_is_padding,
+                                            x_raw,
+                                            y_raw,
+                                            eps_move=0.0)  # (Pnn,80)
+    dx_raw, dy_raw = _compute_dx_dy(x_raw, y_raw)  # (Pnn,80)
+    dist_raw, speed_raw = _compute_segment_speeds(dx_raw, dy_raw,
+                                                  float(dt))  # (Pnn,80)
+    return cur_future_raw.astype(np.float32), seg_valid, dist_raw, speed_raw
+
+
 def _segments_to_framewise_sigma(
         sigma_seg_int: npt.NDArray[np.int8],  # (Pnn, 80) in {-1,0,+1}
 ) -> npt.NDArray[np.int8]:
@@ -278,8 +303,9 @@ def compute_forward_backward_signs(
         near_cur_future_raw)  # (Pnn,81)
 
     # 1) 세그먼트 이동방향각 φ̂_i, 정렬도 d_i
-    phi_hat = _compute_segment_motion_angles(x, y)  # (Pnn,80) # 가장 끝 점은 미포함
-    d = _compute_alignment_cosine(phi_hat, theta)  # (Pnn,80)
+    phi_hat = _compute_segment_motion_angles(
+        x, y)  # (Pnn,80) # 가장 끝 점은 미포함 # 현재 + 미래 79 프레임
+    d = _compute_alignment_cosine(phi_hat, theta)  # (Pnn,80) # 현재 + 미래 79 프레임
 
     # 2) 세그먼트 유효성 마스크(패딩/정지 구간 제외)
     seg_valid = _compute_segment_valid_mask(frame_is_padding,
@@ -288,7 +314,8 @@ def compute_forward_backward_signs(
                                             eps_move=0.0)  # (Pnn,80)
 
     # 3) σ_i 결정: 유효 구간만 sign(d_i), 그 외 0
-    sigma_seg_int = np.zeros_like(d, dtype=np.int8)  # (Pnn,80) in {-1,0,+1}
+    sigma_seg_int = np.zeros_like(
+        d, dtype=np.int8)  # (Pnn,80) in {-1,0,+1} # 현재 + 미래 79 프레임
     # sign(d) → {+1(전진), -1(후진)}; 단, d==0이면 0으로 남음(모름)
     clean = np.nan_to_num(d,
                           nan=0.0,
@@ -502,52 +529,50 @@ def _compute_pedestrian_body_slip(
         cur_future_raw: npt.NDArray[np.float32],  # (Pnn, 81, 4)
         near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
 ) -> npt.NDArray[np.float32]:
-    """보행자에 대해 원래 경로로부터 몸체 슬립각(프레임 기준)을 계산합니다.
+    """보행자 몸체 슬립각 β_s (frame s 기준)를 원래 경로에서 계산합니다.
 
-    정의(프레임-기준 매핑):
-        - frame 0 : (현재→p0) 구간 슬립
-        - frame s : (frame s → s+1) 구간 슬립, s=1..79
-        - frame 80: frame 79 값을 복사
-
-    Returns:
-        ped_body_slip: (Pnn, 81) [rad]
+    β_s = wrap( φ_s − θ_s,eff ),  s = 0..79
+    - φ_s: frame s→s+1 속도방향
+    - θ_s,eff = θ_s + π·I[σ_s=-1]
+    - frame 80은 frame 79 복사
     """
-    Pnn = cur_future_raw.shape[0]
-    # 좌표/헤딩
     x, y, theta = _extract_xy_theta(cur_future_raw)  # (Pnn,81)
     phi_hat = _compute_segment_motion_angles(x, y)  # (Pnn,80)
-    frame_is_padding = _compute_frame_padding_mask(cur_future_raw)  # (Pnn,81)
+    frame_is_padding = _compute_frame_padding_mask(cur_future_raw)
     seg_valid = _compute_segment_valid_mask(frame_is_padding,
                                             x,
                                             y,
                                             eps_move=0.0)  # (Pnn,80)
 
-    ped_slip = np.zeros((Pnn, 81), dtype=np.float32)
+    theta_eff_start = _sigma_to_theta_eff(
+        theta[:, :-1], near_current_future_dir[:, :-1])  # (Pnn,80)
+    beta = _wrap_to_pi(phi_hat - theta_eff_start).astype(np.float32)  # (Pnn,80)
 
-    # s=0 (현재→p0)
-    sigma0 = near_current_future_dir[:, 0]  # (Pnn,)
-    theta_cur = theta[:, 0]  # (Pnn,)
-    theta_eff_cur = _sigma_to_theta_eff(theta_cur, sigma0)  # (Pnn,)
-    beta_m1 = _wrap_to_pi(phi_hat[:, 0] - theta_eff_cur)  # (Pnn,)
-    # 세그먼트 유효한 곳만 기록
-    valid0 = seg_valid[:, 0]
-    ped_slip[valid0, 0] = beta_m1[valid0]
-
-    # s=1..79
-    if phi_hat.shape[1] > 1:
-        s_idx = np.arange(1, 80, dtype=np.int32)  # [1..79]
-        # 각 s에 대해 θ_{s+1} 사용
-        theta_next = theta[:, 1 + s_idx]  # (Pnn,79)
-        sigma_s = near_current_future_dir[:, s_idx]  # (Pnn,79)
-        theta_eff_next = _sigma_to_theta_eff(theta_next, sigma_s)  # (Pnn,79)
-        beta_s = _wrap_to_pi(phi_hat[:, s_idx] - theta_eff_next)  # (Pnn,79)
-        valid_s = seg_valid[:, s_idx]  # (Pnn,79)
-        # 프레임 매핑: frame s ← seg s
-        ped_slip[:, 1:80][valid_s] = beta_s[valid_s]
-
-    # 마지막 프레임 복사 규칙
+    ped_slip = np.zeros((cur_future_raw.shape[0], 81), dtype=np.float32)
+    ped_slip[:, :80] = np.where(seg_valid, beta, 0.0).astype(np.float32)
     ped_slip[:, 80] = ped_slip[:, 79]
     return ped_slip
+
+
+def _compute_body_slip_from_states(
+        cur_future_states: npt.NDArray[np.float32],  # (Pnn, 81, 4)  보정 후 상태
+        near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
+        seg_valid: npt.NDArray[np.bool_],  # (Pnn, 80)
+) -> npt.NDArray[np.float32]:
+    """보정된 점/헤딩으로부터 frame s 기준 슬립각 β_s를 계산해 반환.
+
+    β_s = wrap( φ_s − θ_s,eff ), s=0..79. frame 80은 79 복사.
+    """
+    x, y, theta = _extract_xy_theta(cur_future_states)  # (Pnn,81)
+    phi = _compute_segment_motion_angles(x, y)  # (Pnn,80)
+    theta_eff_start = _sigma_to_theta_eff(
+        theta[:, :-1], near_current_future_dir[:, :-1])  # (Pnn,80)
+    beta = _wrap_to_pi(phi - theta_eff_start).astype(np.float32)  # (Pnn,80)
+
+    out = np.zeros((cur_future_states.shape[0], 81), dtype=np.float32)
+    out[:, :80] = np.where(seg_valid, beta, 0.0).astype(np.float32)
+    out[:, 80] = 0.
+    return out
 
 
 # =============================================================================
@@ -583,10 +608,8 @@ def anchor_adjustment_current_to_k0(
     # 유효 세그먼트(현재→p0)가 있는 에이전트만 처리
     x, y, theta = _extract_xy_theta(cur_future_raw)  # (Pnn,81)
     frame_is_padding = _compute_frame_padding_mask(cur_future_raw)  # (Pnn,81)
-    seg_valid = _compute_segment_valid_mask(frame_is_padding,
-                                            x,
-                                            y,
-                                            eps_move=0.0)  # (Pnn,80)
+    seg_valid = _compute_segment_valid_mask(
+        frame_is_padding, x, y, eps_move=0.0)  # (Pnn,80) # 현재 + 미래 79 프레임
     current_valid = seg_valid[:, 0]  # (Pnn,)
 
     target_rows = (veh_valid_mask | bic_valid_mask) & current_valid  # (Pnn,)
@@ -633,171 +656,117 @@ def anchor_adjustment_current_to_k0(
 
 
 def sequential_slip_limit_closed_loop(
-    cur_future_copy: npt.NDArray[np.float32],  # (Pnn, 81, 4) in/out
-    cur_future_raw: npt.NDArray[np.float32],  # (Pnn, 81, 4) read-only
-    near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
-    veh_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
-    bic_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
-    cfg: SmootherConfig,
-) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """k=0..79 순차(폐루프) 슬립각 제한을 **벡터화**로 수행합니다. (시간축 1-pass, 배치 완전 벡터화)
+        cur_future_copy: npt.NDArray[np.float32],  # (Pnn, 81, 4) in/out
+        cur_future_raw: npt.NDArray[
+            np.float32],  # (Pnn, 81, 4) read-only (fallback 용)
+        near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
+        veh_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
+        bic_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
+        cfg: SmootherConfig,
+        *,
+        seg_valid_precomputed: Optional[npt.NDArray[
+            np.bool_]] = None,  # (Pnn,80)
+        dist_raw_precomputed: Optional[npt.NDArray[
+            np.float32]] = None,  # (Pnn,80)
+        speed_raw_precomputed: Optional[npt.NDArray[
+            np.float32]] = None,  # (Pnn,80)
+) -> npt.NDArray[np.float32]:
+    """k=1..79에 대해 '시작 프레임 s의 유효 헤딩'과 '속도벡터 방향' 차이를 제한하는 폐루프 보정.
 
-    벡터화 전략
-    - 세그먼트별 상수량(φ̂, v_k, d_k, θ̂_{k+1}, σ_k)을 **모두 행렬화**.
-    - Δβ_k, α*_k, θ_{k+1} 보정, φ'_k, 스텝 변위 Δx_k, Δy_k를 **전 구간 동시 계산**.
-    - 누적합(cumsum)으로 p_1 기준 위치를 **한 번에 적분**.
-    - 가변 길이(패딩) 처리는 세그먼트 유효 마스크로 **쓰기 단계만 가드**.
+    규칙(세그먼트 [s→s+1]):
+      - φ_s = atan2(y_{s+1}-y_s, x_{s+1}-x_s)  (현재 보정 상태 기준)
+      - θ_s,eff = θ_s + π·I[σ_s=-1]
+      - β̂_s = wrap(φ_s − θ_s,eff), β_clip = clip(β̂_s)
+      - Δβ_s = β̂_s − β_clip
+      - θ_s ← wrap(θ_s + α*_s Δβ_s)
+      - φ'_s ← φ_s − (1−α*_s) Δβ_s
+      - p_{s+1} ← p_s + d_s [cos φ'_s, sin φ'_s]   (d_s: raw 세그먼트 길이 유지)
 
-    Shapes:
-        cur_future_copy: (Pnn, 81, 4)  in/out
-            - [x, y, cosθ, sinθ], frame 0은 current, frame 1..80은 미래
-            - frame 1은 `앵커 보정`에서 이미 업데이트 되었음(위치만)
-        cur_future_raw:  (Pnn, 81, 4)  read-only (원시 궤적)
-        near_current_future_dir: (Pnn, 81) in {-1,0,+1}
-        veh_valid_mask, bic_valid_mask: (Pnn,)
-    Returns:
-        cur_future_copy: (Pnn, 81, 4)
-            - frame 2..80의 위치/헤딩이 벡터화 보정으로 반영됨(차/자전거만)
-        body_slip_frames: (Pnn, 81)  [rad]
-            - frame s(1..79): 보정 후 clip(β̂_s)
-            - frame 0, 80: 0 (상위 단계에서 별도 처리)
+    반환:
+      - cur_future_copy: 보정 반영
     """
-    Pnn = cur_future_copy.shape[0]
     dt = float(cfg.dt)
+    Pnn = cur_future_copy.shape[0]
 
-    # -------------------------------------------------------------------------
-    # 1) 원시 기초량(모두 벡터화 준비)
-    # -------------------------------------------------------------------------
-    # 좌표, 헤딩(라디안)
-    x_raw, y_raw, theta_raw = _extract_xy_theta(cur_future_raw)  # (Pnn,81)
-    # 세그먼트 차분/거리/속력
-    dx, dy = _compute_dx_dy(x_raw, y_raw)  # (Pnn,80)
-    dist, speed = _compute_segment_speeds(dx, dy, dt)  # (Pnn,80)
-    phi_hat = np.arctan2(dy, dx).astype(np.float32)  # (Pnn,80)
+    # 미리 계산된 값이 있으면 사용, 없으면 fallback (호환성)
+    seg_valid = seg_valid_precomputed # (Pnn,80)
+    dist_raw = dist_raw_precomputed # (Pnn,80)
+    speed_raw = speed_raw_precomputed # (Pnn,80)
 
-    # 세그먼트 유효(패딩/정지 제외)
-    frame_is_padding = _compute_frame_padding_mask(cur_future_raw)  # (Pnn,81)
-    seg_valid = _compute_segment_valid_mask(frame_is_padding,
-                                            x_raw,
-                                            y_raw,
-                                            eps_move=0.0)  # (Pnn,80)
-
-    # 본 함수는 s=1..79만 처리 (frame s → s+1). s=0(현재→p0)은 앵커 단계에서 처리함.
-    s_mask = seg_valid[:, 1:]  # (Pnn,79) bool
-    if not np.any(s_mask):
-        # 차/자전거라도 유효 세그먼트가 없다면 그대로 반환
-        return cur_future_copy, np.zeros((Pnn, 81), dtype=np.float32)
-
-    # -------------------------------------------------------------------------
-    # 2) 타입별 파라미터를 에이전트별 스칼라로 Broadcasting 준비
-    # -------------------------------------------------------------------------
     proc_rows = (veh_valid_mask | bic_valid_mask)  # (Pnn,)
-    # β_max per agent (라디안)
-    beta_max_agent = np.zeros((Pnn,), dtype=np.float32)
-    if np.any(veh_valid_mask):
-        beta_max_agent[veh_valid_mask] = _deg2rad(
-            cfg.veh_slip.beta_body_max_deg)
-    if np.any(bic_valid_mask):
-        beta_max_agent[bic_valid_mask] = _deg2rad(
-            cfg.bic_slip.beta_body_max_deg)
-    beta_max_b = beta_max_agent[:, None]  # (Pnn,1) → (Pnn,79) broadcast
 
-    # α* 가중치 per agent
+    # 타입별 파라미터(에이전트별 스칼라 브로드캐스트)
+    beta_max_agent = np.zeros((Pnn,), dtype=np.float32)
     w_p_agent = np.zeros((Pnn,), dtype=np.float32)
     w_th_agent = np.zeros((Pnn,), dtype=np.float32)
     if np.any(veh_valid_mask):
+        beta_max_agent[veh_valid_mask] = _deg2rad(
+            cfg.veh_slip.beta_body_max_deg)
         w_p_agent[veh_valid_mask] = float(cfg.veh_slip.w_p)
         w_th_agent[veh_valid_mask] = float(cfg.veh_slip.w_theta)
     if np.any(bic_valid_mask):
+        beta_max_agent[bic_valid_mask] = _deg2rad(
+            cfg.bic_slip.beta_body_max_deg)
         w_p_agent[bic_valid_mask] = float(cfg.bic_slip.w_p)
         w_th_agent[bic_valid_mask] = float(cfg.bic_slip.w_theta)
-    w_p_b = w_p_agent[:, None]  # (Pnn,1)
-    w_th_b = w_th_agent[:, None]  # (Pnn,1)
 
-    # 쓰기 가드(차/자전거 & 세그먼트 유효)
-    proc_mask_2d = (proc_rows[:, None] & s_mask)  # (Pnn,79)
 
-    # -------------------------------------------------------------------------
-    # 3) 전 구간 동시 계산: Δβ_s, α*_s, θ_{s+1}, φ'_s
-    # -------------------------------------------------------------------------
-    # 세그먼트별 준비 (인덱스 s=1..79 → 열 1:80 슬라이스)
-    phi_s = phi_hat[:, 1:]  # (Pnn,79)
-    v_s = speed[:, 1:]  # (Pnn,79)
-    d_s = dist[:, 1:]  # (Pnn,79)
+    # 시간 순방향 폐루프
+    # seg_valid: (Pnn,80) ,  현재 + 미래 0 ~ 78 프레임
+    for s in range(1, 80): # 미래 0 번째 ~ 78 번째 프레임
+        valid_rows = proc_rows & seg_valid[:, s]
+        if not np.any(valid_rows):
+            continue
 
-    theta_next_hat_s = theta_raw[:, 2:]  # (Pnn,79) : frame s+1의 원시 헤딩
-    sigma_s = near_current_future_dir[:, 1:80]  # (Pnn,79) : 세그먼트 s의 σ
+        # 현재 보정 상태에서의 속도방향 φ_s
+        ps = cur_future_copy[valid_rows, s, 0:2]  # (M,2)
+        psp = cur_future_copy[valid_rows, s + 1, 0:2]  # (M,2)
+        phi_s = np.arctan2(psp[:, 1] - ps[:, 1],
+                           psp[:, 0] - ps[:, 0]).astype(np.float32)
 
-    # θ_eff_{s+1} = θ̂_{s+1} + (σ_s == -1 ? π : 0)
-    theta_eff_next_s = theta_next_hat_s + (sigma_s == -1) * np.pi
-    theta_eff_next_s = _wrap_to_pi(theta_eff_next_s.astype(
-        np.float32))  # (Pnn,79)
+        # 시작 프레임 s의 헤딩 → σ-aware
+        theta_s = np.arctan2(cur_future_copy[valid_rows, s, 3],
+                             cur_future_copy[valid_rows, s,
+                                             2]).astype(np.float32)
+        sigma_s = near_current_future_dir[valid_rows, s].astype(np.int8)
+        theta_eff_s = _sigma_to_theta_eff(theta_s, sigma_s)  # (M,)
 
-    # β̂_s = wrap( φ̂_s − θ_eff_{s+1} )
-    beta_hat_s = _wrap_to_pi(phi_s - theta_eff_next_s)  # (Pnn,79)
+        # β̂_s → clip → Δβ_s
+        beta_hat = _wrap_to_pi(phi_s - theta_eff_s)  # (M,)
+        beta_max = beta_max_agent[valid_rows]  # (M,)
+        beta_clip = np.clip(beta_hat, -beta_max, +beta_max).astype(np.float32)
+        delta_beta = (beta_hat - beta_clip).astype(np.float32)
 
-    # α*_s = [w_p (v_s dt)^2] / ([w_p (v_s dt)^2] + w_θ)
-    vdt2_s = (v_s * dt)**2  # (Pnn,79)
-    num = w_p_b * vdt2_s  # (Pnn,79)
-    den = num + w_th_b  # (Pnn,79)
-    alpha_s = np.divide(num,
-                        den,
-                        out=np.zeros_like(num, dtype=np.float32),
-                        where=(den > 0))  # (Pnn,79)
+        # α*_s (속도 기반 분배)
+        v_s = speed_raw[valid_rows, s].astype(np.float32)
+        vdt2 = (v_s * dt)**2
+        num = (w_p_agent[valid_rows] * vdt2).astype(np.float32)
+        den = (num + w_th_agent[valid_rows]).astype(np.float32)
+        alpha_s = np.divide(num,
+                            den,
+                            out=np.zeros_like(num, dtype=np.float32),
+                            where=(den > 0))
 
-    # clip(β̂_s) 및 Δβ_s
-    beta_clip_s = np.clip(beta_hat_s, -beta_max_b, +beta_max_b)  # (Pnn,79)
-    delta_beta_s = (beta_hat_s - beta_clip_s).astype(np.float32)  # (Pnn,79)
+        # 헤딩 보정: θ_s ← wrap(θ_s + α*_s Δβ_s)
+        theta_s_new = _wrap_to_pi(theta_s + alpha_s * delta_beta)
+        cur_future_copy[valid_rows, s,
+                        2] = np.cos(theta_s_new).astype(np.float32)
+        cur_future_copy[valid_rows, s,
+                        3] = np.sin(theta_s_new).astype(np.float32)
 
-    # 보정 후 헤딩 θ_{s+1} ← wrap( θ̂_{s+1} + α*_s Δβ_s )
-    theta_next_adj_s = _wrap_to_pi(theta_next_hat_s +
-                                   alpha_s * delta_beta_s)  # (Pnn,79)
-    cos_next = np.cos(theta_next_adj_s).astype(np.float32)  # (Pnn,79)
-    sin_next = np.sin(theta_next_adj_s).astype(np.float32)  # (Pnn,79)
+        # 이동방향 보정: φ'_s
+        phi_prime = (phi_s - (1.0 - alpha_s) * delta_beta).astype(np.float32)
 
-    # 보정 이동방향 φ'_s = φ̂_s − (1−α*_s)Δβ_s
-    phi_prime_s = (phi_s - (1.0 - alpha_s) * delta_beta_s).astype(
-        np.float32)  # (Pnn,79)
-    step_dx = d_s * np.cos(phi_prime_s).astype(np.float32)  # (Pnn,79)
-    step_dy = d_s * np.sin(phi_prime_s).astype(np.float32)  # (Pnn,79)
+        # 위치 업데이트: p_{s+1} (원시 거리 보존)
+        d_s = dist_raw[valid_rows, s].astype(np.float32)
+        cur_future_copy[valid_rows, s + 1,
+                        0] = ps[:,
+                                0] + d_s * np.cos(phi_prime).astype(np.float32)
+        cur_future_copy[valid_rows, s + 1,
+                        1] = ps[:,
+                                1] + d_s * np.sin(phi_prime).astype(np.float32)
 
-    # 차/자전거 & 유효 세그먼트 외에는 0 step (cumsum 영향 제거)
-    step_dx = np.where(proc_mask_2d, step_dx,
-                       0.0).astype(np.float32)  # (Pnn,79)
-    step_dy = np.where(proc_mask_2d, step_dy,
-                       0.0).astype(np.float32)  # (Pnn,79)
-
-    # -------------------------------------------------------------------------
-    # 4) 위치 적분(원시가 아닌, 앵커에서 확정된 p1 기준) + 헤딩/슬립 기록 (마스킹하여 쓰기)
-    # -------------------------------------------------------------------------
-    # 누적합으로 p2..p80 상대 위치 계산 (p_{s+1} = p1 + Σ_{j=1..s} Δstep_j)
-    cum_dx = np.cumsum(step_dx, axis=1)  # (Pnn,79)
-    cum_dy = np.cumsum(step_dy, axis=1)  # (Pnn,79)
-
-    p1_x = cur_future_copy[:, 1, 0][:, None]  # (Pnn,1)
-    p1_y = cur_future_copy[:, 1, 1][:, None]  # (Pnn,1)
-    new_x_2_80 = (p1_x + cum_dx).astype(np.float32)  # (Pnn,79)
-    new_y_2_80 = (p1_y + cum_dy).astype(np.float32)  # (Pnn,79)
-
-    # 쓰기: 위치 (frame 2..80 ← s=1..79), 마스크 밖은 기존 값 유지
-    cur_future_copy[:, 2:, 0] = np.where(proc_mask_2d, new_x_2_80,
-                                         cur_future_copy[:, 2:, 0])
-    cur_future_copy[:, 2:, 1] = np.where(proc_mask_2d, new_y_2_80,
-                                         cur_future_copy[:, 2:, 1])
-
-    # 쓰기: 헤딩 (frame 2..80), 마스크 밖은 기존 값 유지
-    cur_future_copy[:, 2:, 2] = np.where(proc_mask_2d, cos_next,
-                                         cur_future_copy[:, 2:, 2])
-    cur_future_copy[:, 2:, 3] = np.where(proc_mask_2d, sin_next,
-                                         cur_future_copy[:, 2:, 3])
-
-    # 슬립각(프레임 기준) 기록: frame s ← clip(β̂_s), s=1..79
-    body_slip_frames = np.zeros((Pnn, 81), dtype=np.float32)  # (Pnn,81)
-    body_slip_frames[:, 1:80] = np.where(proc_mask_2d, beta_clip_s,
-                                         0.0).astype(np.float32)
-
-    # frame 0, 80은 상위 단계에서 채움(여기서는 0 유지)
-    return cur_future_copy, body_slip_frames
+    return cur_future_copy
 
 
 # =============================================================================
@@ -814,40 +783,32 @@ def slip_limit_stage(
     ped_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
     cfg: SmootherConfig,
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """[2단계] 슬립각 제한: 앵커 보정 → 순차 보정.
+    """[2단계] 슬립각 제한: 앵커 보정 → (수정된) 폐루프 보정 → 슬립각 β_s 산출.
 
-    파이프라인:
-        0) 입력 결합: current + future(80) → (Pnn,81,4)
-        1) 차량/자전거: (현재→p0) 앵커 보정(거리 보존, θ_cur 고정)
-        2) 차량/자전거: s=1..79 순차(폐루프) 보정(θ_{s+1}, p_{s+1})
-        3) 보행자: 궤적 보정 없음
-        4) 몸체 슬립각:
-           - 차량/자전거: 보정 후 clip(β̂) 값을 프레임 기준으로 채움
-           - 보행자: 원래 경로에서 계산한 β 값을 프레임 기준으로 채움
-           - frame 80은 frame 79 값을 복사
-
-    Args:
-        near_agents_current: (Pnn, 4)  = [x, y, cos, sin]
-        near_future_raw:     (Pnn, 80, 4)
-        near_current_future_dir: (Pnn, 81) in {-1,0,+1}
-        veh_valid_mask, bic_valid_mask, ped_valid_mask: (Pnn,)
-        cfg: SmootherConfig
-
-    Returns:
-        near_current_future_a2: (Pnn, 81, 4)
-            - 사람: 입력 그대로
-            - 차량/자전거: p0 앵커 + s=1..79 폐루프 보정 반영
-        near_future_body_slip: (Pnn, 81) [rad]
-            - frame 0  : (현재→p0) 구간 슬립
-            - frame 1~79: 해당 구간 슬립
-            - frame 80 : frame 79 값 복사
+    변경점:
+      - Raw 기초량을 1회 계산해 재사용(중복 제거).
+      - sequential 보정에서 '시작 헤딩' 기준으로 슬립 제한(요청 반영).
+      - near_future_body_slip의 frame s에는 s의 슬립각(β_s)을 담아 반환.
+        (frame 80은 frame 79 복사)
     """
-    # 0) 결합
-    cur_future_raw = _concat_current_and_future(near_agents_current,
-                                                near_future_raw)  # (Pnn,81,4)
-    cur_future_copy = cur_future_raw.copy()  # 수정 대상
+    dt = float(cfg.dt)
 
-    # 1) 앵커 보정 (차량/자전거)
+    # 0) Raw 기초량 1회 계산
+    """
+    cur_future_raw : (Pnn,81,4)
+    seg_valid : (Pnn,80)
+    dist_raw : (Pnn,80)
+    speed_raw : (Pnn,80)
+    """
+    cur_future_raw, seg_valid, dist_raw, speed_raw = _prepare_sliplimit_basics(
+        near_agents_current=near_agents_current,
+        near_future_raw=near_future_raw,
+        dt=dt,
+    )
+    # cur_future_copy: (Pnn,81,4)
+    cur_future_copy = cur_future_raw.copy()  # in/out
+
+    # 1) 앵커 보정 (s=0, 차량/자전거, 거리 보존 · θ_cur 고정)
     cur_future_copy = anchor_adjustment_current_to_k0(
         cur_future_copy=cur_future_copy,
         cur_future_raw=cur_future_raw,
@@ -857,76 +818,32 @@ def slip_limit_stage(
         cfg=cfg,
     )
 
-    # 2) 순차(폐루프) 보정 (차량/자전거)
-    cur_future_copy, vehbic_slip_frames = sequential_slip_limit_closed_loop(
+    # 2) 수정된 폐루프 보정 (s=1..79, 시작 헤딩 기준)
+    # cur_future_copy: (Pnn,81,4)
+    # vehbic_slip_frames: (Pnn,81)
+        # 첫 점 기록 안되어 있음 (자전거/자동차)
+    cur_future_copy = sequential_slip_limit_closed_loop(
         cur_future_copy=cur_future_copy,
         cur_future_raw=cur_future_raw,
         near_current_future_dir=near_current_future_dir,
         veh_valid_mask=veh_valid_mask,
         bic_valid_mask=bic_valid_mask,
         cfg=cfg,
+        seg_valid_precomputed=seg_valid,
+        dist_raw_precomputed=dist_raw,
+        speed_raw_precomputed=speed_raw,
     )
 
-    # 3) 보행자: 원래 경로에서 슬립각 계산
-    ped_slip_frames = _compute_pedestrian_body_slip(
-        cur_future_raw=cur_future_raw,
+    # 3) (최종) 슬립각 β_s 계산을 '보정된 상태'에서 일괄 수행  → frame s ↦ β_s
+    # (Pnn,81)
+    near_future_body_slip = _compute_body_slip_from_states(
+        cur_future_states=cur_future_copy,
         near_current_future_dir=near_current_future_dir,
-    )  # (Pnn,81)
+        seg_valid=seg_valid,
+    )  # (Pnn,81) with frame s = β_s, frame 80 = 0.
 
-    # 4) frame 0 (현재→p0) 슬립각 채우기
-    #    - 보행자는 ped_slip_frames[:,0] 이미 포함
-    #    - 차량/자전거는 앵커 보정으로 clip(β̂_{-1})이 적용되어야 하나,
-    #      sequential 함수에서는 frame 0을 채우지 않는다. 따라서 여기서 계산해 채움.
-    #      (cur_future_stage의 p0가 보정되었지만, β는 clip(β̂) 값이므로 원시 φ̂와 θ_eff_cur로 계산 가능)
-    x_raw, y_raw, theta_raw = _extract_xy_theta(cur_future_raw)
-    frame_is_padding = _compute_frame_padding_mask(cur_future_raw)
-    seg_valid = _compute_segment_valid_mask(frame_is_padding,
-                                            x_raw,
-                                            y_raw,
-                                            eps_move=0.0)  # (Pnn,80)
-    valid0 = seg_valid[:, 0]
-
-    Pnn = cur_future_copy.shape[0]
-    body_slip_frames = np.zeros((Pnn, 81), dtype=np.float32)
-
-    # 보행자/기타: ped 계산 우선 반영
-    body_slip_frames[ped_valid_mask, :] = ped_slip_frames[ped_valid_mask, :]
-
-    # 차량/자전거: frame 0 슬립각 계산(clip(β̂_{-1}))
-    if np.any((veh_valid_mask | bic_valid_mask) & valid0):
-        rows = (veh_valid_mask | bic_valid_mask) & valid0
-        # φ̂_{-1} = atan2(y1 - y0, x1 - x0) (원시 기준)
-        phi_hat0 = np.arctan2(y_raw[rows, 1] - y_raw[rows, 0], x_raw[rows, 1] -
-                              x_raw[rows, 0]).astype(np.float32)
-        theta_cur = theta_raw[rows, 0]
-        sigma0 = near_current_future_dir[rows, 0]
-        theta_eff_cur = _sigma_to_theta_eff(theta_cur, sigma0)
-
-        # 타입별 β_max
-        rows_idx = np.where(rows)[0]
-        veh_rows_local = veh_valid_mask[rows_idx]
-        bic_rows_local = bic_valid_mask[rows_idx]
-        beta_max = np.zeros_like(theta_eff_cur, dtype=np.float32)
-        if np.any(veh_rows_local):
-            beta_max[veh_rows_local] = _deg2rad(cfg.veh_slip.beta_body_max_deg)
-        if np.any(bic_rows_local):
-            beta_max[bic_rows_local] = _deg2rad(cfg.bic_slip.beta_body_max_deg)
-
-        beta_hat_m1 = _wrap_to_pi(phi_hat0 - theta_eff_cur)
-        beta_clip_m1 = np.clip(beta_hat_m1, -beta_max,
-                               +beta_max).astype(np.float32)
-        body_slip_frames[rows, 0] = beta_clip_m1
-
-    # 차량/자전거: s=1..79 슬립각(보정 후 clip(β̂)) 반영
-    vehbic_rows = (veh_valid_mask | bic_valid_mask)
-    body_slip_frames[vehbic_rows, 1:80] = vehbic_slip_frames[vehbic_rows, 1:80]
-
-    # 마지막 프레임(80) 복사 규칙
-    body_slip_frames[:, 80] = body_slip_frames[:, 79]
-
-    # near_current_future_a2, near_future_body_slip 반환
+    # 반환
     near_current_future_a2 = cur_future_copy
-    near_future_body_slip = body_slip_frames
     return near_current_future_a2, near_future_body_slip
 
 
@@ -1106,9 +1023,11 @@ def _build_agent_param_arrays(
 
 
 def _low_speed_switch_phi(
-        phi_eff_seg: npt.NDArray[np.float32],  # (Pnn, 80)
-        theta_frames: npt.NDArray[np.float32],  # (Pnn, 81)
-        speeds: npt.NDArray[np.float32],  # (Pnn, 80)
+        phi_eff_seg: npt.NDArray[
+            np.float32],  # (Pnn, 80) # "현재 + 미래 0, ..., 78"
+        theta_frames: npt.NDArray[
+            np.float32],  # (Pnn, 81) # "현재 + 미래 0, ..., 79"
+        speeds: npt.NDArray[np.float32],  # (Pnn, 80) # "현재 + 미래 0, ..., 78"
         v_dir: npt.NDArray[np.float32],  # (Pnn,)
 ) -> npt.NDArray[np.float32]:
     """저속 구간은 헤딩을, 그 외에는 σ-aware 속도방향을 채택.
@@ -1126,10 +1045,11 @@ def _low_speed_switch_phi(
     Returns:
         np.ndarray: (Pnn, 80) phi_use_seg
     """
-    use_heading = (speeds < v_dir[:, None])
+    use_heading = (speeds < v_dir[:,
+                                  None])  # (Pnn,80) bool "현재 + 미래 0, ..., 78"
     phi_use = np.where(use_heading, theta_frames[:, :-1],
-                       phi_eff_seg).astype(np.float32)
-    return _wrap_to_pi(phi_use)
+                       phi_eff_seg).astype(np.float32)  # "현재 + 미래 0, ..., 78"
+    return _wrap_to_pi(phi_use)  # "현재 + 미래 0, ..., 78"
 
 
 def _unwrap_diff_along_time(
@@ -1428,65 +1348,81 @@ def yawrate_smooth_stage(
     dt = float(cfg.dt)
 
     # 0) 기초량: 좌표/헤딩/세그먼트/σ
-    x, y, theta_frames = _extract_xy_theta(near_current_future_a2)  # (Pnn,81)×3
+    x, y, theta_frames = _extract_xy_theta(
+        near_current_future_a2)  # (Pnn,81)×3 # 현재 + 미래 0, ..., 79
     frame_is_padding = _compute_frame_padding_mask(
-        near_current_future_a2)  # (Pnn,81)
+        near_current_future_a2)  # (Pnn,81) # 현재 + 미래 0, ..., 79
     seg_valid = _compute_segment_valid_mask(
         frame_is_padding, x, y,
-        eps_move=0.0)  # (Pnn,80)  (양 끝 프레임이 non-padding)
+        eps_move=0.0)  # (Pnn,80)  (양 끝 프레임이 non-padding) # 현재 + 미래 0, ..., 78
 
-    dx, dy = _compute_dx_dy(x, y)  # (Pnn,80)
-    _, speeds = _compute_segment_speeds(dx, dy, dt)  # (Pnn,80)
-    phi_world_seg = np.arctan2(dy, dx).astype(np.float32)  # (Pnn,80)
+    dx, dy = _compute_dx_dy(x, y)  # (Pnn,80) # "현재 + 미래 0, ..., 78"
+    _, speeds = _compute_segment_speeds(dx, dy,
+                                        dt)  # (Pnn,80)  # "현재 + 미래 0, ..., 78"
+    phi_world_seg = np.arctan2(dy, dx).astype(
+        np.float32)  # (Pnn,80)  # "현재 + 미래 0, ..., 78"
     sigma_seg = near_current_future_dir[:, :-1].astype(
-        np.int8)  # (Pnn,80), frame k의 σ 사용
-    sigma_frames = near_current_future_dir.astype(np.int8)  # (Pnn,81)
+        np.int8)  # (Pnn,80), frame k의 σ 사용  # "현재 + 미래 0, ..., 78"
+    sigma_frames = near_current_future_dir.astype(
+        np.int8)  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
 
     # σ-aware 방향각(세그먼트)
-    phi_eff_seg = _sigma_adjust_phi(phi_world_seg, sigma_seg)  # (Pnn,80)
+    phi_eff_seg = _sigma_adjust_phi(
+        phi_world_seg, sigma_seg)  # (Pnn,80)  # "현재 + 미래 0, ..., 78"
 
     # 1) 저속 스위치용 파라미터 준비(에이전트별)
+    # Dict[str, npt.NDArray[np.float32]] #
+    # 'v_dir','v_floor','phi_dot_cap','R_min','aN_max','alpha_max'
+    # 모두 shape (Pnn,)
     params = _build_agent_param_arrays(veh_valid_mask, bic_valid_mask,
                                        ped_valid_mask, cfg)
+    # "현재 + 미래 0, ..., 78"
     phi_use_seg = _low_speed_switch_phi(phi_eff_seg, theta_frames, speeds,
                                         params['v_dir'])  # (Pnn,80)
 
     # 2) φ_use 프레임열(81) 구성 → 언랩 차분으로 ω_eff(80)
-    phi_use_frame = np.concatenate([phi_use_seg, phi_use_seg[
+    # "현재 + 미래 0, ..., 79"
+    phi_use_frame = np.concatenate([phi_use_seg, theta_frames[
         :,
         -1:,
     ]], axis=1).astype(np.float32)  # (Pnn,81)
+    # omega_eff : "현재 + 미래 0, ..., 78"
     omega_eff = _unwrap_diff_along_time(phi_use_frame, dt)  # (Pnn,80)
 
     # 유효하지 않은 세그먼트는 ω=0으로
     omega_eff = np.where(seg_valid, omega_eff, 0.0).astype(np.float32)
 
     # 3) 스텝별 허용 상한 ω_max (v_floor 게이팅/반경/옆가속/기본캡 포함)
+    # "현재 + 미래 0, ..., 78"
     omega_max = _compute_omega_max(speeds, params)  # (Pnn,80)
+    # "현재 + 미래 0, ..., 78"
     omega_clip1 = _clip_once(omega_eff, omega_max, seg_valid)  # (Pnn,80)
 
     # 4) TV 스무딩 (각가속 제한) — 왕복 1회 (필요 시 cfg에 반복 횟수 추가 가능)
     alpha_max_dt = (params['alpha_max'] * dt).astype(np.float32)  # (Pnn,)
+    # "현재 + 미래 0, ..., 78"
     omega_smooth = _tv_smooth_forward_backward(
-        omega=omega_clip1,
-        omega_max=omega_max,
+        omega=omega_clip1,  # "현재 + 미래 0, ..., 78"
+        omega_max=omega_max,  # "현재 + 미래 0, ..., 78"
         alpha_max_dt=alpha_max_dt,
-        valid_mask=seg_valid,
+        valid_mask=seg_valid,  # "현재 + 미래 0, ..., 78"
         n_pass=1,
-    )  # (Pnn,80)
+    )  # (Pnn,80) # "현재 + 미래 0, ..., 78"
 
     # 5) φ 적분 → 위치 원호 적분
+    # "현재 + 미래 0, ..., 78"
     dphi_seq = (omega_smooth * dt).astype(np.float32)  # (Pnn,80)
+    # phi_eff0: 현재
     phi_eff0 = phi_eff_seg[:, 0].astype(np.float32)  # (Pnn,)
     p0_xy = near_current_future_a2[:, 0, :2].astype(np.float32)  # (Pnn,2)
 
     # 원호 적분 / φ_world_end 복원
     positions_1_80, phi_world_end = _integrate_arc_positions_and_phi(
-        p0_xy=p0_xy,
-        sigma_frames=sigma_frames,
-        phi_eff0=phi_eff0,
-        dphi_seq=dphi_seq,
-        speed=speeds,
+        p0_xy=p0_xy,  # (Pnn,2) # 현재 위치
+        sigma_frames=sigma_frames,  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
+        phi_eff0=phi_eff0,  # (Pnn,) # 현재
+        dphi_seq=dphi_seq,  # (Pnn,80) # "현재 + 미래 0, ..., 78"
+        speed=speeds,  # (Pnn,80)  # "현재 + 미래 0, ..., 78"
         dt=dt,
     )  # (Pnn,80,2), (Pnn,80)
 

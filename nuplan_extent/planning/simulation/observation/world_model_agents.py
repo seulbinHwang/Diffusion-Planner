@@ -524,8 +524,8 @@ class WorldModelAgents(AbstractMLAgents):
         Returns:
             SmootherConfig: 에이전트 타입별 파라미터 모음.
         """
-        veh_slip = SlipParams(beta_body_max_deg=10.0, w_p=1.0, w_theta=0.1)
-        bic_slip = SlipParams(beta_body_max_deg=15.0, w_p=1.0, w_theta=0.2)
+        veh_slip = SlipParams(beta_body_max_deg=10.0, w_p=0.1, w_theta=1.0)
+        bic_slip = SlipParams(beta_body_max_deg=15.0, w_p=0.2, w_theta=1.0)
         ped_slip = SlipParams(beta_body_max_deg=18.0, w_p=1.0,
                               w_theta=0.5)  # 사용은 안하지만 형태 통일
 
@@ -1272,7 +1272,7 @@ class WorldModelAgents(AbstractMLAgents):
         near_future_a3 = yawrate_smooth_stage(
             near_current_future_a2=near_current_future_a2,
             near_current_future_dir=near_current_future_dir,
-            near_future_body_slip=near_future_body_slip,
+            near_future_body_slip=near_future_body_slip, # (Pnn,81)
             veh_valid_mask=veh_valid_mask,
             bic_valid_mask=bic_valid_mask,
             ped_valid_mask=ped_valid_mask,
@@ -1378,7 +1378,6 @@ class WorldModelAgents(AbstractMLAgents):
             self._diffusion_agents[token] = self._agents[token]
         self._draw_infos.diff_token_to_np_slip_traj_11_wrt_ego = diff_token_to_np_slip_traj_11_wrt_ego
         self._draw_infos.diff_token_to_np_smooth_traj_11_wrt_ego = diff_token_to_np_smooth_traj_11_wrt_ego
-
 
         diffusion_tokens_dist_order_1 = set(
             diff_token_to_np_smooth_traj_11_wrt_ego.keys())

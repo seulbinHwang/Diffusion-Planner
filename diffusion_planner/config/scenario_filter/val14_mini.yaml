@@ -19,7 +19,7 @@ scenario_types: # List of scenario types to include
 
 map_names: null
 scenario_tokens: null
-log_names: ["2021.05.12.19.36.12_veh-35_00005_00204"]
+log_names: null #["2021.05.12.19.36.12_veh-35_00005_00204"]
 num_scenarios_per_type: 3
 limit_total_scenarios: null
 timestamp_threshold_s: 15

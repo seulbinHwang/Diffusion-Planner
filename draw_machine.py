@@ -367,7 +367,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (18.0, 18.0)
-    dpi: int = 100
+    dpi: int = 400
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -494,7 +494,7 @@ class DrawingOptions:
     DIFF_future_gt_3_dim_token_color: str = BRIGHT_CYAN
     DIFF_future_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
     ############################################
-    DIFF_draw_diff_future_all_gt_3_dim: bool = True
+    DIFF_draw_diff_future_all_gt_3_dim: bool = False
     DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
     DIFF_draw_diff_future_all_gt_3_dim_token: bool = False
@@ -503,7 +503,7 @@ class DrawingOptions:
     DIFF_future_all_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
-    DIFF_draw_diff_future_gen_traj_token: bool = True
+    DIFF_draw_diff_future_gen_traj_token: bool = False
     DIFF_future_gen_traj_mode: str = "arrow"  # 'arrow' 또는 'point'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
@@ -524,7 +524,7 @@ class DrawingOptions:
         "velocity_line_width": 0.4,
     }
 
-    DIFF_draw_diff_future_smooth_traj: bool = True
+    DIFF_draw_diff_future_smooth_traj: bool = False
     DIFF_future_smooth_style = {
         "line_color": RED,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
@@ -888,6 +888,8 @@ def draw_neighbor_past(ax: plt.Axes,
             draw_all_time = True
         track = neighbor_agents_past[agent_idx]  # (T, 11)
         for t in range(time_len):
+            if t != current_t:
+                continue
             if not draw_all_time and t != current_t:
                 continue
             row = track[t]
@@ -1450,6 +1452,8 @@ def draw_token_trajectory_rects_unfilled(
     first_valid_xy: Optional[Tuple[float, float]] = None
 
     for t in range(arr.shape[0]):
+        if t > 1:
+            break
         row = arr[t]  # (11,)
         if not is_valid_agent_row(row, eps):
             continue
@@ -1584,26 +1588,28 @@ def draw_diff_future_gen_traj(
     )
 
     # 2) slip 초과 제거본 (연한 분홍)
-    draw_traj_dict_as_unfilled_rects(
-        ax=ax,
-        token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
-        style=options.DIFF_future_slip_style,
-        options=options,
-        zorder=23,
-        draw_token_list=draw_token_list,
-        annotate_token=False,
-    )
+    if options.DIFF_draw_diff_future_slip_traj:
+        draw_traj_dict_as_unfilled_rects(
+            ax=ax,
+            token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
+            style=options.DIFF_future_slip_style,
+            options=options,
+            zorder=23,
+            draw_token_list=draw_token_list,
+            annotate_token=False,
+        )
 
     # 3) 경로 제약 보정본 (옅은 빨강) — 최상단
-    draw_traj_dict_as_unfilled_rects(
-        ax=ax,
-        token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
-        style=options.DIFF_future_smooth_style,
-        options=options,
-        zorder=24,
-        draw_token_list=draw_token_list,
-        annotate_token=False,
-    )
+    if options.DIFF_draw_diff_future_smooth_traj:
+        draw_traj_dict_as_unfilled_rects(
+            ax=ax,
+            token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
+            style=options.DIFF_future_smooth_style,
+            options=options,
+            zorder=24,
+            draw_token_list=draw_token_list,
+            annotate_token=False,
+        )
 
 
 # =============================================================================
@@ -2014,6 +2020,8 @@ def draw_world_model_to_png(
     draw_token_list: List[str] = [
         "58a9e2ba05555824"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    draw_token_list: List[str] = ["f476b2c85dd7508c"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+
     # draw_token_list = None
     draw_option = options or DrawingOptions()
 
