@@ -1452,8 +1452,8 @@ def draw_token_trajectory_rects_unfilled(
     first_valid_xy: Optional[Tuple[float, float]] = None
 
     for t in range(arr.shape[0]):
-        if t > 1:
-            break
+        # if t > 1:
+        #     break
         row = arr[t]  # (11,)
         if not is_valid_agent_row(row, eps):
             continue

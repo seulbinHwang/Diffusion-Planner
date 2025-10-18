@@ -835,6 +835,7 @@ def slip_limit_stage(
     )
 
     # 3) (최종) 슬립각 β_s 계산을 '보정된 상태'에서 일괄 수행  → frame s ↦ β_s
+    # (Pnn,81)
     near_future_body_slip = _compute_body_slip_from_states(
         cur_future_states=cur_future_copy,
         near_current_future_dir=near_current_future_dir,
@@ -1366,8 +1367,9 @@ def yawrate_smooth_stage(
         np.int8)  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
 
     # σ-aware 방향각(세그먼트)
+    # (Pnn,80)  # "현재 + 미래 0, ..., 78"
     phi_eff_seg = _sigma_adjust_phi(
-        phi_world_seg, sigma_seg)  # (Pnn,80)  # "현재 + 미래 0, ..., 78"
+        phi_world_seg, sigma_seg)
 
     # 1) 저속 스위치용 파라미터 준비(에이전트별)
     # Dict[str, npt.NDArray[np.float32]] #
@@ -1381,7 +1383,7 @@ def yawrate_smooth_stage(
 
     # 2) φ_use 프레임열(81) 구성 → 언랩 차분으로 ω_eff(80)
     # "현재 + 미래 0, ..., 79"
-    phi_use_frame = np.concatenate([phi_use_seg, theta_frames[
+    phi_use_frame = np.concatenate([phi_use_seg, phi_use_seg[
         :,
         -1:,
     ]], axis=1).astype(np.float32)  # (Pnn,81)
