@@ -1221,11 +1221,11 @@ def _integrate_arc_positions_and_phi(
 
     Returns:
         Tuple[np.ndarray, np.ndarray]:
-            positions_1_80: (Pnn, 80, 2)  # frame 1..80 위치
-            phi_world_end:  (Pnn, 80)     # 각 세그먼트 끝(world) 방향각 φ_{k+1}
+            positions_1_80: (Pnn, 80, 2)  # 미래 frame 0.,,,79 위치
+            phi_world_end:  (Pnn, 80)     # 각 세그먼트 끝(world) 방향각 φ_{k+1} # 미래 frame 0.,,,79
     """
     Pnn = p0_xy.shape[0]
-    # φ_eff_frame: (Pnn, 81)
+    # φ_eff_frame: (Pnn, 81) # 현재 + 미래 0..79
     phi_eff_frame = np.zeros((Pnn, 81), dtype=np.float32)
     phi_eff_frame[:, 0] = phi_eff0.astype(np.float32)
     # 누적 적분
@@ -1263,9 +1263,9 @@ def _integrate_arc_positions_and_phi(
 
 
 def _restore_heading_from_phi_and_slip(
-        phi_world_end: npt.NDArray[np.float32],  # (Pnn, 80)
-        sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81)
-        body_slip_frames: npt.NDArray[np.float32],  # (Pnn, 81) or (Pnn, 80)
+        phi_world_end: npt.NDArray[np.float32],  # (Pnn, 80) # "현재 + 미래 0, ..., 79"
+        sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81) # "현재 + 미래 0, ..., 79"
+        near_future_body_slip: npt.NDArray[np.float32],  # (Pnn, 81)  # "현재 + 미래 0, ..., 79"
 ) -> npt.NDArray[np.float32]:
     """슬립각을 보존하며 θ_{k+1}를 복원합니다.
 
@@ -1276,20 +1276,22 @@ def _restore_heading_from_phi_and_slip(
     Args:
         phi_world_end (np.ndarray): (Pnn, 80)
         sigma_frames (np.ndarray): (Pnn, 81)
-        body_slip_frames (np.ndarray): (Pnn, 81) 또는 (Pnn, 80)
+        near_future_body_slip (np.ndarray): (Pnn, 81)
 
     Returns:
         np.ndarray: (Pnn, 80) θ_{k+1}
     """
     # β^b_k 준비: (Pnn,80)
-    if body_slip_frames.shape[1] == 81:
-        beta_b = body_slip_frames[:, :80].astype(np.float32)
-    else:
-        beta_b = body_slip_frames.astype(np.float32)
+    beta_b = near_future_body_slip[:, 1:].astype(np.float32)
 
-    theta_eff_end = _wrap_to_pi(phi_world_end - beta_b)  # (Pnn,80)
     pi_off_end = _sigma_to_pi_offset(sigma_frames[:, 1:])  # (Pnn,80)
-    theta_end = _wrap_to_pi(theta_eff_end - pi_off_end)  # (Pnn,80)
+    theta_eff = _wrap_to_pi(phi_world_end - beta_b)  # (Pnn,80)
+    """
+    theta_eff 에서, 후진인 경우 π 오프셋을 다시 빼서 θ_end 계산
+    """
+    theta_end = _wrap_to_pi(theta_eff - pi_off_end)  # (Pnn,80)
+
+
     return theta_end
 
 
@@ -1320,7 +1322,7 @@ def _pack_xy_cos_sin(
 def yawrate_smooth_stage(
     near_current_future_a2: npt.NDArray[np.float32],  # (Pnn, 81, 4)
     near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
-    near_future_body_slip: npt.NDArray[np.float32],  # (Pnn, 81) or (Pnn, 80)
+    near_future_body_slip: npt.NDArray[np.float32], # (Pnn,81)
     veh_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
     bic_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
     ped_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
@@ -1383,15 +1385,15 @@ def yawrate_smooth_stage(
 
     # 2) φ_use 프레임열(81) 구성 → 언랩 차분으로 ω_eff(80)
     # "현재 + 미래 0, ..., 79"
-    phi_use_frame = np.concatenate([phi_use_seg, phi_use_seg[
+    phi_use_frame = np.concatenate([phi_use_seg, theta_frames[
         :,
         -1:,
     ]], axis=1).astype(np.float32)  # (Pnn,81)
     # omega_eff : "현재 + 미래 0, ..., 78"
-    # TODO:
     omega_eff = _unwrap_diff_along_time(phi_use_frame, dt)  # (Pnn,80)
 
     # 유효하지 않은 세그먼트는 ω=0으로
+    # 현재 + 미래 0, ..., 78
     omega_eff = np.where(seg_valid, omega_eff, 0.0).astype(np.float32)
 
     # 3) 스텝별 허용 상한 ω_max (v_floor 게이팅/반경/옆가속/기본캡 포함)
@@ -1413,7 +1415,7 @@ def yawrate_smooth_stage(
 
     # 5) φ 적분 → 위치 원호 적분
     # "현재 + 미래 0, ..., 78"
-    dphi_seq = (omega_smooth * dt).astype(np.float32)  # (Pnn,80)
+    dphi_seq = (omega_clip1 * dt).astype(np.float32)  # (Pnn,80)
     # phi_eff0: 현재
     phi_eff0 = phi_eff_seg[:, 0].astype(np.float32)  # (Pnn,)
     p0_xy = near_current_future_a2[:, 0, :2].astype(np.float32)  # (Pnn,2)
@@ -1430,9 +1432,9 @@ def yawrate_smooth_stage(
 
     # 6) 헤딩 복원(슬립각 보존)
     headings_1_80 = _restore_heading_from_phi_and_slip(
-        phi_world_end=phi_world_end,
-        sigma_frames=sigma_frames,
-        body_slip_frames=near_future_body_slip,
+        phi_world_end=phi_world_end, # (Pnn,80)
+        sigma_frames=sigma_frames, # (Pnn,81)  # "현재 + 미래 0, ..., 79"
+        near_future_body_slip=near_future_body_slip, # (Pnn,81)  # "현재 + 미래 0, ..., 79"
     )  # (Pnn,80)
 
     # 7) (x,y,cosθ,sinθ) 포장 + 유효 세그먼트에만 쓰기

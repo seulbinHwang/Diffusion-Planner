@@ -367,7 +367,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (18.0, 18.0)
-    dpi: int = 400
+    dpi: int = 800
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -524,7 +524,7 @@ class DrawingOptions:
         "velocity_line_width": 0.4,
     }
 
-    DIFF_draw_diff_future_smooth_traj: bool = False
+    DIFF_draw_diff_future_smooth_traj: bool = True
     DIFF_future_smooth_style = {
         "line_color": RED,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
@@ -1452,8 +1452,8 @@ def draw_token_trajectory_rects_unfilled(
     first_valid_xy: Optional[Tuple[float, float]] = None
 
     for t in range(arr.shape[0]):
-        # if t > 1:
-        #     break
+        if t > 1:
+            break
         row = arr[t]  # (11,)
         if not is_valid_agent_row(row, eps):
             continue
