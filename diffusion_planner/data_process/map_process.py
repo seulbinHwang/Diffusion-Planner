@@ -486,6 +486,7 @@ def map_process(
                 ]
                 pruned_route_roadblock_ids = _prune_route_by_connectivity(
                     route_roadblock_ids, pruned_lane_roadblock_ids)
+
                 # car_token_to_lane_on_routes: 길이 agent_num 보다 작거나 같음 (차량만 포함 가능)
                 car_token_to_lane_on_routes: Dict[
                     str, List[bool]] = _compute_lane_on_npc_routes(
@@ -530,6 +531,7 @@ def map_process(
                 · j번 차선이 에이전트 i의 npc_route에서 가까운 순서로 몇 번째인지(0,1,2,...)를 나타냄
                 · 해당 에이전트의 route가 아니면 -1
             """
+
             agent_route_lane_order = _select_token_and_ordered_npc_route_indices(
                 car_token_to_lane_on_routes, neighbor_track_token,
                 neighbor_agents_current, vector_map_lanes,

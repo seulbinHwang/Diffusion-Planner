@@ -114,6 +114,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 initialization.map_api,
                 initialization.route_roadblock_ids,
                 scenario=initialization.scenario,
+                use_route_lanes=initialization.use_route_lanes,
                 squeeze=True)
         # (interpol_num, 11)
 

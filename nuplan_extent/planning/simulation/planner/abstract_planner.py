@@ -25,6 +25,7 @@ class HorizonPlannerInitialization:
     expert_goal_state: Optional[StateSE2] = None
     npc_route_roadblock_ids: Optional[Dict[str, List[str]]] = None
     scenario: Optional[AbstractScenario] = None
+    use_route_lanes: bool = False
 
 
 @dataclass(frozen=True)

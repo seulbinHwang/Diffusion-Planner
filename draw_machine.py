@@ -367,7 +367,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (18.0, 18.0)
-    dpi: int = 100
+    dpi: int = 400
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -773,7 +773,7 @@ def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
                 :, idx]  # (filtered_agent_num,)
             has_route_mask = (agent_route_a_lane_order != -1) # True면 경로에 포함
             if np.any(has_route_mask):
-                color = RED
+                color = CYAN
                 # 유효한 인접 포인트 구간만 강조 라인으로 그림
                 for j in range(center.shape[0] - 1):
                     if not (valid[j] and valid[j + 1]):
@@ -1143,7 +1143,6 @@ def draw_planner_future_11_dim(ax: plt.Axes, planner_future_11_dim: Array,
             options,
             mode=options.EGO_future_traj_draw_mode,
             zorder=24,
-            debug="ego_planner_future",
         )
 
 
@@ -1477,7 +1476,6 @@ def draw_token_trajectory_non_rects(
     options: DrawingOptions,
     mode: str,
     zorder: int,
-        debug: str = "none",
 ) -> Optional[Tuple[float, float]]:
     if traj_11 is None or traj_11.size == 0:
         return None
@@ -1521,8 +1519,6 @@ def draw_token_trajectory_non_rects(
                 zorder=zorder,
             )
         elif mode == "line":
-            if debug != "none":
-                print("debug:", debug, "traj.shape:", traj.shape)
             if t < future_len - 1:
                 next_row = traj[t + 1]
                 if not is_valid_token_row(next_row, eps):
@@ -1609,7 +1605,6 @@ def draw_traj_dict_as_non_square(
     annotate_token: bool = False,
     annotate_fontsize: Optional[int] = None,
     annotate_offset: float = 0.0,
-        debug:str = "none",
 ) -> None:
     """토큰 기준 미래 포즈를 '화살표(방향 포함)' 또는 '점(방향 미사용)'으로 그림.
 
@@ -1650,8 +1645,7 @@ def draw_traj_dict_as_non_square(
                                                    style,
                                                    options,
                                                    mode,
-                                                   zorder=20,
-                                                   debug=debug)
+                                                   zorder=20)
         if annotate_token and (first_xy is not None):
             fx, fy = first_xy
             ax.text(
@@ -1754,8 +1748,7 @@ def draw_diff_future_traj_w_square(
                 token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
                 style=options.DIFF_future_slip_style,
                 options=options,
-                draw_token_list=draw_token_list,
-            debug="diff_slip")
+                draw_token_list=draw_token_list)
         if options.DIFF_draw_diff_future_smooth_traj:
             draw_traj_dict_as_non_square(
                 ax=ax,
@@ -2170,7 +2163,6 @@ def draw_world_model_to_png(
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
-    print("----------------------start draw_world_model_to_png-----------------------")
     draw_token_list: List[str] = [
         "58a9e2ba05555824"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]

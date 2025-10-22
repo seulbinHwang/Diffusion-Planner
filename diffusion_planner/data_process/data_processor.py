@@ -316,6 +316,8 @@ class DataProcessor(object):
                 continue
             if token in all_car_token_to_rr_ids:
                 car_token_to_rr_ids[token] = all_car_token_to_rr_ids[token]
+            else:
+                car_token_to_rr_ids[token] = None
         return car_token_to_rr_ids
 
     # Use for inference
@@ -327,6 +329,7 @@ class DataProcessor(object):
                             route_roadblock_ids: Optional[Dict[str, List[str]]],
                             device='cpu',
                             scenario: Optional[NuPlanScenario] = None,
+                            use_route_lanes: bool = False,
                             squeeze=False) -> Dict[str, torch.Tensor]:
         '''
         ego
@@ -424,7 +427,7 @@ class DataProcessor(object):
                                                    traffic_light_data)
         # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
 
-        if self.all_car_token_to_rr_ids is None:
+        if use_route_lanes and self.all_car_token_to_rr_ids is None:
             present_tracked_objects: TrackedObjects = scenario.initial_tracked_objects.tracked_objects
             past_tracked_objects: List[TrackedObjects] = [
                 tracked_objects.tracked_objects
@@ -441,6 +444,8 @@ class DataProcessor(object):
                     scenario,
                     sampled_past_observations,
                     neighbor_track_token=None)
+        elif not use_route_lanes:
+            self.all_car_token_to_rr_ids = {}
         car_token_to_rr_ids: Dict[
             str, Optional[List[str]]] = self._get_car_token_to_rr_ids(
                 self.all_car_token_to_rr_ids, neighbor_track_token)
