@@ -457,6 +457,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
         self.use_route_lanes = True
+        self.use_ego_plan = True
 
     def _build_smoother_config(self) -> SmootherConfig:
         """후처리 스무더 파라미터 번들을 구성합니다. (스켈레톤: 값은 예시/초기값으로 두고 나중에 조정)
@@ -1014,9 +1015,12 @@ class WorldModelLogReplay(AbstractMLAgents):
             np.ndarray] = self.from_next_ego_state_to_traj_np(
                 iteration, next_ego_state)
         # (future_len, 11)
-        planner_future_11_dim: Optional[
-            np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
-                                                        self._ego_anchor_state)
+        if self.use_ego_plan:
+            planner_future_11_dim: Optional[
+                np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
+                                                            self._ego_anchor_state)
+        else:
+            planner_future_11_dim = None
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
         # diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] # len : valid_agent_num
