@@ -324,7 +324,7 @@ class DataProcessor(object):
                             history_buffer,
                             traffic_light_data,
                             map_api,
-                            route_roadblock_ids,
+                            route_roadblock_ids: Optional[Dict[str, List[str]]],
                             device='cpu',
                             scenario: Optional[NuPlanScenario] = None,
                             squeeze=False) -> Dict[str, torch.Tensor]:

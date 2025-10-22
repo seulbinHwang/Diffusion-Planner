@@ -456,6 +456,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         self.predicted_neighbor_num = self.config.predicted_neighbor_num
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
+        self.use_route_lanes = True
 
     def _build_smoother_config(self) -> SmootherConfig:
         """후처리 스무더 파라미터 번들을 구성합니다. (스켈레톤: 값은 예시/초기값으로 두고 나중에 조정)
@@ -470,10 +471,10 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         veh_rate = RateParams(v_dir=0.4,
                               v_floor=0.4,
-                              phi_dot_cap=1.0,
-                              R_min=6.0,
-                              aN_max=4.0,
-                              alpha_max=1.0,
+                              phi_dot_cap=5.0,
+                              R_min=3.0,
+                              aN_max=12.0,
+                              alpha_max=4.0,
                               straight_eps_deg=1.0)
         bic_rate = RateParams(v_dir=0.35,
                               v_floor=0.3,
@@ -956,11 +957,16 @@ class WorldModelLogReplay(AbstractMLAgents):
     ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]], Dict[
             str, np.ndarray], np.ndarray]:
         # Construct input features
+        # route_roadblock_ids: Optional[Dict[str, List[str]]
+        if self.use_route_lanes:
+            route_roadblock_ids = self._scenario.get_route_roadblock_ids()
+        else:
+            route_roadblock_ids = None
         initialization = HorizonPlannerInitialization(
             # 시나리오가 끝나고도 계속 진행했을 때 최종적으로 도달해야 하는 포즈 (존재하지 않을 수도 있음)
             mission_goal=self._scenario.get_mission_goal(),
             # (x, y, yaw) 의 StateSE2
-            route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
+            route_roadblock_ids=route_roadblock_ids,
             map_api=self._scenario.map_api,
             scenario=self._scenario,
             # 전문 운전자(ground truth)의 실제 마지막 상태 (항상 존재)
@@ -1192,7 +1198,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         neighbor_agents_past: np.ndarray,  # (Pnn,time_len, 11)
         veh_valid_mask: np.ndarray,  # (Pnn,)
         bic_valid_mask: np.ndarray,  # (Pnn,)
-        ped_valid_mask: np.ndarray  # (Pnn,)
+        ped_valid_mask: np.ndarray,  # (Pnn,)
+        draw_idx
     ) -> npt.NDArray[np.float32]:
         # 0) 원시 입력 준비
         near_cur_future_raw: np.ndarray = future_np_trajs_wrt_ego.astype(
@@ -1227,6 +1234,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             bic_valid_mask=bic_valid_mask,
             ped_valid_mask=ped_valid_mask,
             cfg=cfg,
+            draw_idx=draw_idx
         )  # (Pnn, 80, 4)
         return near_current_future_a2, near_future_a3
 
@@ -1265,7 +1273,10 @@ class WorldModelLogReplay(AbstractMLAgents):
         ped_valid_mask = []
 
         self._diffusion_agents = {}
+        draw_idx = None
         for idx, token in enumerate(neighbor_token_dist_order):
+            if token == "f476b2c85dd7508c":
+                draw_idx = idx
             agent_current = neighbor_agents_past[idx, 0]  # (11)
             # agent_current: (11) -> (T, 11)
             np_gen_traj_wrt_ego = np.tile(
@@ -1299,7 +1310,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         ped_valid_mask = np.array(ped_valid_mask, dtype=bool)  # (Pnn,)
         near_current_future_a2, near_future_a3 = self._filter_trajectory(
             future_np_trajs_wrt_ego, neighbor_agents_past, veh_valid_mask,
-            bic_valid_mask, ped_valid_mask)
+            bic_valid_mask, ped_valid_mask, draw_idx)
         diff_token_to_np_slip_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_smooth_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
         for idx, token in enumerate(neighbor_token_dist_order):
