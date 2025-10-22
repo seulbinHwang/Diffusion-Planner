@@ -438,6 +438,7 @@ class DrawingOptions:
     ######### [NEIGHBOR] #########
     ########### [NEIGHBOR] PAST ##################
     NEI_draw_neighbor_past: bool = True  # check
+    NEI_draw_neighbor_only_current: bool = True  # check
     NEI_draw_velocity_arrow: bool = False  # check
     NEI_draw_velocity_text: bool = False  # check
     NEI_vel_text_y_offset: float = 0.5
@@ -885,15 +886,13 @@ def draw_neighbor_past(ax: plt.Axes,
 
     for agent_idx in range(agent_num):
         if (draw_token_int_list is not None) and (agent_idx
-                                                  not in draw_token_int_list):
-            draw_all_time = False
+                                                  not in draw_token_int_list) or options.NEI_draw_neighbor_only_current:
+            draw_all_time_for_target = False
         else:
-            draw_all_time = True
+            draw_all_time_for_target = True
         track = neighbor_agents_past[agent_idx]  # (T, 11)
         for t in range(time_len):
-            if t != current_t:
-                continue
-            if not draw_all_time and t != current_t:
+            if not draw_all_time_for_target and t != current_t:
                 continue
             row = track[t]
             if not is_valid_agent_row(row, eps):
