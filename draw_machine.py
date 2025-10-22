@@ -403,7 +403,7 @@ class DrawingOptions:
 
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_draw_ego_agent_next_11_dim: bool = False
+    EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_next_11_dim_style = {
         "line_color": LIGHT_CYAN,
         "line_width": 0.4,
@@ -510,6 +510,7 @@ class DrawingOptions:
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
     DIFF_future_gen_style = {
         "line_color": WHITE,  # 빨간색(밝은 빨강)
+        "token_color": WHITE,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
         "velocity_line_color": WHITE,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
@@ -518,6 +519,7 @@ class DrawingOptions:
     DIFF_draw_diff_future_slip_traj: bool = True
     DIFF_future_slip_style = {
         "line_color": ORANGE,  # 빨간색(밝은 빨강)
+        "token_color": ORANGE,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
         "velocity_line_color": ORANGE,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
@@ -527,6 +529,7 @@ class DrawingOptions:
     DIFF_draw_diff_future_smooth_traj: bool = True
     DIFF_future_smooth_style = {
         "line_color": RED,  # 빨간색(밝은 빨강)
+        "token_color": RED,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
         "velocity_line_color": RED,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
@@ -1545,7 +1548,7 @@ def draw_traj_dict_as_unfilled_rects(
             )
 
 # draw_traj_dict_as_unfilled_rects
-def draw_traj_dict_as_line(
+def draw_traj_dict_as_non_square(
     ax: plt.Axes,
     token_to_traj_11: Optional[TokenTrajDict],
     style: Dict[str, Any],
@@ -1650,7 +1653,7 @@ def draw_traj_dict_as_line(
                     x,
                     y - options.DIFF_future_gen_trak_token_text_y_offset_m,
                     str(token),
-                    color=style["line_color"],
+                    color=style["token_color"],
                     fontsize=options.LANE_AGENT_index_fontsize,
                     ha="center",
                     va="top",
@@ -1726,7 +1729,7 @@ def draw_diff_future_gen_traj_w_square(
             )
     elif options.DIFF_future_gen_traj_mode in ["arrow", "point", "line"]:
         if options.DIFF_draw_diff_future_gen_traj:
-            draw_traj_dict_as_line(
+            draw_traj_dict_as_non_square(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_gen_traj_11_wrt_ego,
                 style=options.DIFF_future_gen_style,
@@ -1734,7 +1737,7 @@ def draw_diff_future_gen_traj_w_square(
                 draw_token_list=draw_token_list
             )
         if options.DIFF_draw_diff_future_slip_traj:
-            draw_traj_dict_as_line(
+            draw_traj_dict_as_non_square(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
                 style=options.DIFF_future_slip_style,
@@ -1742,7 +1745,7 @@ def draw_diff_future_gen_traj_w_square(
                 draw_token_list=draw_token_list
             )
         if options.DIFF_draw_diff_future_smooth_traj:
-            draw_traj_dict_as_line(
+            draw_traj_dict_as_non_square(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
                 style=options.DIFF_future_smooth_style,
