@@ -1276,17 +1276,17 @@ class WorldModelAgents(AbstractMLAgents):
             ped_valid_mask=ped_valid_mask,
             cfg=cfg,
         )  # (Pnn,81,4), (Pnn,80)
-
+        near_future_a3 = near_current_future_a2[: , 1:, :]  # (Pnn, 80, 4)
         # 3) 각속도 제약 + 스무딩 단계
-        near_future_a3 = yawrate_smooth_stage(
-            near_current_future_a2=near_current_future_a2,
-            near_current_future_dir=near_current_future_dir,
-            near_future_body_slip=near_future_body_slip, # (Pnn,81)
-            veh_valid_mask=veh_valid_mask,
-            bic_valid_mask=bic_valid_mask,
-            ped_valid_mask=ped_valid_mask,
-            cfg=cfg,
-        )  # (Pnn, 80, 4)
+        # near_future_a3 = yawrate_smooth_stage(
+        #     near_current_future_a2=near_current_future_a2,
+        #     near_current_future_dir=near_current_future_dir,
+        #     near_future_body_slip=near_future_body_slip, # (Pnn,81)
+        #     veh_valid_mask=veh_valid_mask,
+        #     bic_valid_mask=bic_valid_mask,
+        #     ped_valid_mask=ped_valid_mask,
+        #     cfg=cfg,
+        # )  # (Pnn, 80, 4)
         return near_current_future_a2, near_future_a3
 
     def _get_token_to_np_traj_wrt_ego(
@@ -1396,7 +1396,7 @@ class WorldModelAgents(AbstractMLAgents):
             diffusion_tokens_dist_order), \
             "diff_token_to_np_traj_wrt_ego의 토큰과 self._diffusion_agents의 토큰이 일치하지 않습니다."
         ######
-        return diff_token_to_np_smooth_traj_wrt_ego, diffusion_tokens_dist_order
+        return diff_token_to_np_slip_traj_11_wrt_ego, diffusion_tokens_dist_order
 
     def infer_model(
         self,
