@@ -504,7 +504,7 @@ class DrawingOptions:
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_gen_traj_mode: str = "line"  # 'sqaure' / 'arrow'/ 'point' / 'line'
+    DIFF_future_gen_traj_mode: str = "line"  # 'square' / 'arrow'/ 'point' / 'line'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
@@ -1585,20 +1585,20 @@ def draw_traj_dict_as_line(
 
     eps = options.invalid_eps
     # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
-    for idx, (token, np_gen_traj_wrt_ego) in enumerate(
+    for idx, (token, traj) in enumerate(
             token_to_traj_11.items()):  # [ADD]
         if draw_token_list is not None and token not in draw_token_list:
             continue
-        if np_gen_traj_wrt_ego is None or np_gen_traj_wrt_ego.size == 0:
+        if traj is None or traj.size == 0:
             continue
-        if np_gen_traj_wrt_ego.ndim != 2 or np_gen_traj_wrt_ego.shape[1] != 11:
+        if traj.ndim != 2 or traj.shape[1] != 11:
             raise ValueError(
                 "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
             )
-        np_gen_traj_wrt_ego = np_gen_traj_wrt_ego[:, :4]  # (future_len, 4)
-        future_len = np_gen_traj_wrt_ego.shape[0]
+        traj = traj[:, :4]  # (future_len, 4)
+        future_len = traj.shape[0]
         for t in range(future_len):
-            row = np_gen_traj_wrt_ego[t]  # (4,) = [x, y, cos, sin]
+            row = traj[t]  # (4,) = [x, y, cos, sin]
             if not is_valid_token_row(row, eps):
                 continue
 
@@ -1631,7 +1631,7 @@ def draw_traj_dict_as_line(
                 )
             elif mode == "line":
                 if t < future_len - 1:
-                    next_row = np_gen_traj_wrt_ego[t + 1]
+                    next_row = traj[t + 1]
                     if not is_valid_token_row(next_row, eps):
                         continue
                     next_x, next_y = float(next_row[0]), float(next_row[1])
