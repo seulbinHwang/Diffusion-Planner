@@ -393,6 +393,7 @@ class DrawingOptions:
     ######### [EGO] ##############
     ########### [EGO] PAST ##################
     EGO_draw_ego_past: bool = True  # check
+    EGO_draw_ego_only_current: bool = True  # check
     EGO_past_style = {
         "fill_color": WHITE,  # 흰색
         "line_color": GRAY,  # 회색
@@ -403,6 +404,8 @@ class DrawingOptions:
 
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
+    EGO_future_traj_draw_mode : str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+
     EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_next_11_dim_style = {
         "line_color": LIGHT_CYAN,
@@ -414,7 +417,7 @@ class DrawingOptions:
     EGO_draw_ego_agent_next_11_vel: bool = False
     ###################################################
     ########### [EGO] FUTURE PLANNER ##################
-    EGO_draw_planner_future_11_dim: bool = False  # check
+    EGO_draw_planner_future_11_dim: bool = True  # check
     EGO_planner_future_11_style = {
         "line_color": PALE_CYAN,
         "line_width": 0.2,
@@ -505,7 +508,7 @@ class DrawingOptions:
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_gen_traj_mode: str = "line"  # 'square' / 'arrow'/ 'point' / 'line'
+    DIFF_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
@@ -1007,7 +1010,8 @@ def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
         row = ego_agent_past[t]
         if not is_valid_agent_row(row, eps):
             continue
-
+        if options.EGO_draw_ego_only_current and t != current_t:
+            continue
         x, y = float(row[0]), float(row[1])
         c, s = float(row[2]), float(row[3])
         vx, vy = float(row[4]), float(row[5])
@@ -1103,55 +1107,20 @@ def draw_planner_future_11_dim(ax: plt.Axes, planner_future_11_dim: Array,
     """이고 차량 **GT 미래** 시퀀스를 그림(미래 위치는 채우지 않음). invalid 스텝은 스킵."""
     if planner_future_11_dim is None or planner_future_11_dim.size == 0:
         return
-    eps = options.invalid_eps
     future_len, feat_dim = planner_future_11_dim.shape
     if feat_dim != 11:
         raise ValueError("ego_future_gt_11_dim의 마지막 차원은 11이어야 합니다.")
-
-    for t in range(future_len):
-        row = planner_future_11_dim[t]
-        if not is_valid_agent_row(row, eps):
-            continue
-
-        x, y = float(row[0]), float(row[1])
-        c, s = float(row[2]), float(row[3])
-        vx, vy = float(row[4]), float(row[5])
-        W, L = float(row[6]), float(row[7])
-
-        corners = oriented_box_corners(x, y, c, s, L, W)
-        add_polygon(
-            ax,
-            corners,
-            edge_color=options.EGO_planner_future_11_style["line_color"],
-            line_width=options.EGO_planner_future_11_style["line_width"],
-            fill_color=None,
-            fill_alpha=None,
-            zorder=24)
-        add_heading_line(
-            ax,
-            x,
-            y,
-            c,
-            s,
-            nominal_length=L * options.COMMON_heading_line_scale,
-            color=options.EGO_planner_future_11_style["line_color"],
-            line_width=options.EGO_planner_future_11_style["line_width"],
-            zorder=24)
-        if options.EGO_draw_planner_velocity:
-            add_velocity_arrow(
-                ax,
-                x,
-                y,
-                vx,
-                vy,
-                length_m=options.COMMON_vel_arrow_len_m,
-                line_color=options.
-                EGO_planner_future_11_style["velocity_line_color"],
-                line_width=options.
-                EGO_planner_future_11_style["velocity_line_width"],
-                line_alpha=options.
-                EGO_planner_future_11_style["velocity_line_alpha"],
-                zorder=24)
+    if options.EGO_future_traj_draw_mode == "rectangle":
+        draw_token_trajectory_rects_unfilled(ax,
+                                             planner_future_11_dim,
+                                             options.EGO_planner_future_11_style,
+                                             options,
+                                             zorder=24,
+                                             draw_velocity=options.EGO_draw_planner_velocity
+                                             )
+    elif options.EGO_future_traj_draw_mode in ["arrow", "point", "line"]:
+        pass
+        
 
 
 def draw_ego_future_gt_11_dim(ax: plt.Axes, ego_future_gt_11_dim: Array,
@@ -1422,11 +1391,12 @@ from typing import Optional, Dict, List, Tuple, Any
 
 
 def draw_token_trajectory_rects_unfilled(
-    ax: plt.Axes,
-    traj_11: Array,
-    style: Dict[str, Any],
-    options: DrawingOptions,
-    zorder: int,
+        ax: plt.Axes,
+        traj_11: Array,
+        style: Dict[str, Any],
+        options: DrawingOptions,
+        zorder: int,
+        draw_velocity: Optional[bool] = None,
 ) -> Optional[Tuple[float, float]]:
     """(T, 11) 궤적을 '속이 비어 있는 사각형 + 헤딩선'으로 렌더링.
 
@@ -1462,6 +1432,7 @@ def draw_token_trajectory_rects_unfilled(
 
         x, y = float(row[0]), float(row[1])
         c, s = float(row[2]), float(row[3])
+        vx, vy = float(row[4]), float(row[5])
         W, L = float(row[6]), float(row[7])  # 주의: 저장은 (W, L) 순서, draw는 (L, W)
 
         corners = oriented_box_corners(x, y, c, s, L, W)
@@ -1470,7 +1441,7 @@ def draw_token_trajectory_rects_unfilled(
             corners,
             edge_color=style["line_color"],
             line_width=style["line_width"],
-            fill_color=None,          # 속 비우기
+            fill_color=None,  # 속 비우기
             fill_alpha=None,
             zorder=zorder,
         )
@@ -1485,12 +1456,99 @@ def draw_token_trajectory_rects_unfilled(
             line_width=style["line_width"],
             zorder=zorder,
         )
+        if draw_velocity is True:
+            add_velocity_arrow(
+                ax,
+                x,
+                y,
+                vx,
+                vy,
+                length_m=options.COMMON_vel_arrow_len_m,
+                line_color=options.
+                style["velocity_line_color"],
+                line_width=options.
+                style["velocity_line_width"],
+                line_alpha=options.
+                style["velocity_line_alpha"],
+                zorder=zorder)
 
         if first_valid_xy is None:
             first_valid_xy = (x, y)
 
     return first_valid_xy
 
+
+# draw_token_trajectory_rects_unfilled
+def draw_token_trajectory_non_rects(
+        ax: plt.Axes,
+        traj_11: Array,
+        style: Dict[str, Any],
+        options: DrawingOptions,
+        mode: str,
+        zorder: int,
+) -> Optional[Tuple[float, float]]:
+    if traj_11 is None or traj_11.size == 0:
+        return None
+    if traj_11.ndim != 2 or traj_11.shape[1] != 11:
+        raise ValueError(
+            "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
+        )
+    eps = options.invalid_eps
+    first_valid_xy: Optional[Tuple[float, float]] = None
+    traj = traj_11[:, :4]  # (future_len, 4)
+    future_len = traj.shape[0]
+    for t in range(future_len):
+        row = traj[t]  # (4,) = [x, y, cos, sin]
+        if not is_valid_token_row(row, eps):
+            continue
+
+        x, y = float(row[0]), float(row[1])
+        c, s = float(row[2]), float(row[3])
+
+        if mode == "arrow":
+            # 방향 벡터 (c, s)를 정규화하여 고정 길이(옵션) 화살표
+            add_velocity_arrow(
+                ax,
+                x,
+                y,
+                c,
+                s,
+                length_m=options.DIFF_future_gen_traj_arrow_len_m,
+                line_color=style["line_color"],
+                line_width=style["line_width"],
+                zorder=zorder,
+            )
+        elif mode == "point":
+            # 점만 표시(방향 정보 사용하지 않음)
+            ax.plot(
+                x,
+                y,
+                marker=options.DIFF_future_gen_traj_point_marker,
+                markersize=options.DIFF_future_gen_traj_point_marker_size,
+                linestyle="None",
+                color=style["line_color"],
+                zorder=zorder,
+            )
+        elif mode == "line":
+            if t < future_len - 1:
+                next_row = traj[t + 1]
+                if not is_valid_token_row(next_row, eps):
+                    continue
+                next_x, next_y = float(next_row[0]), float(next_row[1])
+                ax.plot(
+                    [x, next_x],
+                    [y, next_y],
+                    linestyle="-",
+                    color=style["line_color"],
+                    linewidth=style["line_width"],
+                    zorder=zorder,
+                )
+
+        #  시작 포인트(t==0)에 토큰 식별 라벨(흰색)을 화살표/점 바로 아래에 표기
+        if first_valid_xy is None:
+            first_valid_xy = (x, y)
+
+        return first_valid_xy
 
 def draw_traj_dict_as_unfilled_rects(
     ax: plt.Axes,
@@ -1532,6 +1590,7 @@ def draw_traj_dict_as_unfilled_rects(
             zorder=zorder,
         )
         # (선택) 토큰 라벨 추가: 첫 유효 프레임 좌표 기준, 아래쪽으로 약간 오프셋
+        # TODO
         if annotate_token and options.DIFF_draw_diff_future_gen_traj_token and (first_xy is not None):
             fx, fy = first_xy
             ax.text(
@@ -1552,7 +1611,8 @@ def draw_traj_dict_as_non_square(
     token_to_traj_11: Optional[TokenTrajDict],
     style: Dict[str, Any],
     options: DrawingOptions,
-    draw_token_list: Optional[List[str]]=None
+    draw_token_list: Optional[List[str]]=None,
+        draw_token: bool = False,
 ) -> None:
     """토큰 기준 미래 포즈를 '화살표(방향 포함)' 또는 '점(방향 미사용)'으로 그림.
 
@@ -1562,11 +1622,11 @@ def draw_traj_dict_as_non_square(
             각 value: shape (future_len, 4) = [x, y, cos(yaw), sin(yaw)]
             - invalid 규칙: 4값 모두 0(±eps) → 스킵
         options: DrawingOptions
-            - DIFF_future_gen_traj_mode: 'arrow' | 'point'
+            - DIFF_future_traj_draw_mode: 'arrow' | 'point'
             - DIFF_future_gen_traj_point_marker, DIFF_future_gen_traj_point_marker_size
             - DIFF_future_gen_traj_arrow_len_m
         draw_mode: Optional['arrow' | 'point']
-            - 우선순위: draw_mode 인자(있으면) > options.DIFF_future_gen_traj_mode(없으면 'arrow')
+            - 우선순위: draw_mode 인자(있으면) > options.DIFF_future_traj_draw_mode(없으면 'arrow')
 
     동작:
         - 'arrow' 모드:
@@ -1580,87 +1640,40 @@ def draw_traj_dict_as_non_square(
     if not token_to_traj_11:
         return
 
-    mode = options.DIFF_future_gen_traj_mode
+    mode = options.DIFF_future_traj_draw_mode
     if mode not in {"arrow", "point", "line"}:
         raise ValueError(
             f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point' or 'line'.")
 
-    eps = options.invalid_eps
     # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
-    for idx, (token, traj) in enumerate(
+    for idx, (token, traj_11) in enumerate(
             token_to_traj_11.items()):  # [ADD]
         if draw_token_list is not None and token not in draw_token_list:
             continue
-        if traj is None or traj.size == 0:
-            continue
-        if traj.ndim != 2 or traj.shape[1] != 11:
-            raise ValueError(
-                "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
+        first_xy = draw_token_trajectory_non_rects(ax,
+                                        traj_11,
+                                        style,
+                                        options,
+                                        mode,
+                                        zorder=20)
+        # TODO
+        if options.DIFF_draw_diff_future_gen_traj_token and (
+                first_xy is not None):
+            fx, fy = first_xy
+            ax.text(
+                fx,
+                fy - options.DIFF_future_gen_trak_token_text_y_offset_m,
+                str(token),
+                color=style["token_color"],
+                fontsize=options.LANE_AGENT_index_fontsize,
+                ha="center",
+                va="top",
+                zorder=24,
             )
-        traj = traj[:, :4]  # (future_len, 4)
-        future_len = traj.shape[0]
-        for t in range(future_len):
-            row = traj[t]  # (4,) = [x, y, cos, sin]
-            if not is_valid_token_row(row, eps):
-                continue
-
-            x, y = float(row[0]), float(row[1])
-            c, s = float(row[2]), float(row[3])
-
-            if mode == "arrow":
-                # 방향 벡터 (c, s)를 정규화하여 고정 길이(옵션) 화살표
-                add_velocity_arrow(
-                    ax,
-                    x,
-                    y,
-                    c,
-                    s,
-                    length_m=options.DIFF_future_gen_traj_arrow_len_m,
-                    line_color=style["line_color"],
-                    line_width=style["line_width"],
-                    zorder=23,
-                )
-            elif mode == "point":
-                # 점만 표시(방향 정보 사용하지 않음)
-                ax.plot(
-                    x,
-                    y,
-                    marker=options.DIFF_future_gen_traj_point_marker,
-                    markersize=options.DIFF_future_gen_traj_point_marker_size,
-                    linestyle="None",
-                    color=style["line_color"],
-                    zorder=23,
-                )
-            elif mode == "line":
-                if t < future_len - 1:
-                    next_row = traj[t + 1]
-                    if not is_valid_token_row(next_row, eps):
-                        continue
-                    next_x, next_y = float(next_row[0]), float(next_row[1])
-                    ax.plot(
-                        [x, next_x],
-                        [y, next_y],
-                        linestyle="-",
-                        color=style["line_color"],
-                        linewidth=style["line_width"],
-                        zorder=23,
-                    )
-
-            #  시작 포인트(t==0)에 토큰 식별 라벨(흰색)을 화살표/점 바로 아래에 표기
-            if t == 0 and options.DIFF_draw_diff_future_gen_traj_token:
-                ax.text(
-                    x,
-                    y - options.DIFF_future_gen_trak_token_text_y_offset_m,
-                    str(token),
-                    color=style["token_color"],
-                    fontsize=options.LANE_AGENT_index_fontsize,
-                    ha="center",
-                    va="top",
-                    zorder=24,
-                )
 
 
-def draw_diff_future_gen_traj_w_square(
+
+def draw_diff_future_traj_w_square(
     ax: plt.Axes,
     diff_token_to_np_gen_traj_11_wrt_ego: Optional[Dict[str, Array]],
     diff_token_to_np_slip_traj_11_wrt_ego: Optional[Dict[str, Array]],
@@ -1691,7 +1704,7 @@ def draw_diff_future_gen_traj_w_square(
         draw_token_list: 특정 토큰만 그리고 싶을 때 지정. None이면 전체.
     """
     # 1) 원본 gen (흰색) — 라벨은 여기서만
-    if options.DIFF_future_gen_traj_mode == "square":
+    if options.DIFF_future_traj_draw_mode == "rectangle":
         draw_traj_dict_as_unfilled_rects(
             ax=ax,
             token_to_traj_11=diff_token_to_np_gen_traj_11_wrt_ego,
@@ -1726,7 +1739,7 @@ def draw_diff_future_gen_traj_w_square(
                 draw_token_list=draw_token_list,
                 annotate_token=False,
             )
-    elif options.DIFF_future_gen_traj_mode in ["arrow", "point", "line"]:
+    elif options.DIFF_future_traj_draw_mode in ["arrow", "point", "line"]:
         if options.DIFF_draw_diff_future_gen_traj:
             draw_traj_dict_as_non_square(
                 ax=ax,
@@ -2078,7 +2091,7 @@ def draw_neighbor_future_all(ax: plt.Axes,
     diff_token_to_np_smooth_traj_11_wrt_ego = output_data.get(
         "diff_token_to_np_smooth_traj_11_wrt_ego", None)
     if draw_option.DIFF_draw_diff_future_gen_traj:
-        draw_diff_future_gen_traj_w_square(ax, diff_token_to_np_gen_traj_11_wrt_ego,
+        draw_diff_future_traj_w_square(ax, diff_token_to_np_gen_traj_11_wrt_ego,
                                   diff_token_to_np_slip_traj_11_wrt_ego,
                                   diff_token_to_np_smooth_traj_11_wrt_ego,
                                   draw_option, draw_token_list)

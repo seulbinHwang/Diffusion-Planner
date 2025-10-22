@@ -1114,7 +1114,7 @@ class DPM_Solver:
                 torch.ones_like(x).to(x) * atol,
                 rtol * torch.max(torch.abs(x_lower), torch.abs(x_prev)))
             norm_fn = lambda v: torch.sqrt(
-                torch.square(v.reshape(
+                torch.rectangle(v.reshape(
                     (v.shape[0], -1))).mean(dim=-1, keepdim=True))
             E = norm_fn((x_higher - x_lower) / delta).max()
             if torch.all(E <= 1.):
