@@ -1017,8 +1017,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         # (future_len, 11)
         if self.use_ego_plan:
             planner_future_11_dim: Optional[
-                np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
-                                                            self._ego_anchor_state)
+                np.ndarray] = self._from_ego_fut_traj_to_np(
+                    ego_future_trajectory, self._ego_anchor_state)
         else:
             planner_future_11_dim = None
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
@@ -1197,14 +1197,13 @@ class WorldModelLogReplay(AbstractMLAgents):
         return sorted_tokens, sorted_distances
 
     def _filter_trajectory(
-        self,
-        future_np_trajs_wrt_ego: np.ndarray,
-        neighbor_agents_past: np.ndarray,  # (Pnn,time_len, 11)
-        veh_valid_mask: np.ndarray,  # (Pnn,)
-        bic_valid_mask: np.ndarray,  # (Pnn,)
-        ped_valid_mask: np.ndarray,  # (Pnn,)
-        draw_idx
-    ) -> npt.NDArray[np.float32]:
+            self,
+            future_np_trajs_wrt_ego: np.ndarray,
+            neighbor_agents_past: np.ndarray,  # (Pnn,time_len, 11)
+            veh_valid_mask: np.ndarray,  # (Pnn,)
+            bic_valid_mask: np.ndarray,  # (Pnn,)
+            ped_valid_mask: np.ndarray,  # (Pnn,)
+            draw_idx) -> npt.NDArray[np.float32]:
         # 0) 원시 입력 준비
         near_cur_future_raw: np.ndarray = future_np_trajs_wrt_ego.astype(
             np.float32)  # (Pnn, 81, 4)
@@ -1228,7 +1227,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             ped_valid_mask=ped_valid_mask,
             cfg=cfg,
         )  # (Pnn,81,4), (Pnn,80)
-        near_future_a3 = near_current_future_a2[: , 1:, :]  # (Pnn, 80, 4)
+        near_future_a3 = near_current_future_a2[:, 1:, :]  # (Pnn, 80, 4)
 
         # # 3) 각속도 제약 + 스무딩 단계
         # near_future_a3 = yawrate_smooth_stage(

@@ -689,9 +689,9 @@ def sequential_slip_limit_closed_loop(
     Pnn = cur_future_copy.shape[0]
 
     # 미리 계산된 값이 있으면 사용, 없으면 fallback (호환성)
-    seg_valid = seg_valid_precomputed # (Pnn,80)
-    dist_raw = dist_raw_precomputed # (Pnn,80)
-    speed_raw = speed_raw_precomputed # (Pnn,80)
+    seg_valid = seg_valid_precomputed  # (Pnn,80)
+    dist_raw = dist_raw_precomputed  # (Pnn,80)
+    speed_raw = speed_raw_precomputed  # (Pnn,80)
 
     proc_rows = (veh_valid_mask | bic_valid_mask)  # (Pnn,)
 
@@ -710,10 +710,9 @@ def sequential_slip_limit_closed_loop(
         w_p_agent[bic_valid_mask] = float(cfg.bic_slip.w_p)
         w_th_agent[bic_valid_mask] = float(cfg.bic_slip.w_theta)
 
-
     # 시간 순방향 폐루프
     # seg_valid: (Pnn,80) ,  현재 + 미래 0 ~ 78 프레임
-    for s in range(1, 80): # 미래 0 번째 ~ 78 번째 프레임
+    for s in range(1, 80):  # 미래 0 번째 ~ 78 번째 프레임
         valid_rows = proc_rows & seg_valid[:, s]
         if not np.any(valid_rows):
             continue
@@ -821,7 +820,7 @@ def slip_limit_stage(
     # 2) 수정된 폐루프 보정 (s=1..79, 시작 헤딩 기준)
     # cur_future_copy: (Pnn,81,4)
     # vehbic_slip_frames: (Pnn,81)
-        # 첫 점 기록 안되어 있음 (자전거/자동차)
+    # 첫 점 기록 안되어 있음 (자전거/자동차)
     cur_future_copy = sequential_slip_limit_closed_loop(
         cur_future_copy=cur_future_copy,
         cur_future_raw=cur_future_raw,
@@ -1321,7 +1320,7 @@ def _pack_xy_cos_sin(
 def yawrate_smooth_stage(
     near_current_future_a2: npt.NDArray[np.float32],  # (Pnn, 81, 4)
     near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
-    near_future_body_slip: npt.NDArray[np.float32], # (Pnn,81)
+    near_future_body_slip: npt.NDArray[np.float32],  # (Pnn,81)
     veh_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
     bic_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
     ped_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
@@ -1369,8 +1368,7 @@ def yawrate_smooth_stage(
 
     # σ-aware 방향각(세그먼트)
     # (Pnn,80)  # "현재 + 미래 0, ..., 78"
-    phi_eff_seg = _sigma_adjust_phi(
-        phi_world_seg, sigma_seg)
+    phi_eff_seg = _sigma_adjust_phi(phi_world_seg, sigma_seg)
 
     # 1) 저속 스위치용 파라미터 준비(에이전트별)
     # Dict[str, npt.NDArray[np.float32]] #
@@ -1431,9 +1429,10 @@ def yawrate_smooth_stage(
 
     # 6) 헤딩 복원(슬립각 보존)
     headings_1_80 = _restore_heading_from_phi_and_slip(
-        phi_world_end=phi_world_end, # (Pnn,80)
-        sigma_frames=sigma_frames, # (Pnn,81)  # "현재 + 미래 0, ..., 79"
-        body_slip_frames=near_future_body_slip, # (Pnn,81)  # "현재 + 미래 0, ..., 79"
+        phi_world_end=phi_world_end,  # (Pnn,80)
+        sigma_frames=sigma_frames,  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
+        body_slip_frames=
+        near_future_body_slip,  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
     )  # (Pnn,80)
 
     # 7) (x,y,cosθ,sinθ) 포장 + 유효 세그먼트에만 쓰기

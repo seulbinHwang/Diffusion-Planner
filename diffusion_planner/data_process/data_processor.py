@@ -478,12 +478,15 @@ class DataProcessor(object):
             else:
                 neighbor_token_id.append(self._init_token_to_id[track_token])
         # (agents_num, 1 + Tf = future_all_len, 3)
-        init_future_tracked_objects_array_list = copy.deepcopy(self.init_future_tracked_objects_array_list)
+        init_future_tracked_objects_array_list = copy.deepcopy(
+            self.init_future_tracked_objects_array_list)
         neighbor_future_all_gt_3_dim = agent_future_all_process(
             anchor_ego_state, init_future_tracked_objects_array_list,
             neighbor_token_id)
         neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
-        iteration + self.num_future_poses, :] # (agents_num, future_len, 3)
+                                                                iteration +
+                                                                self.
+                                                                num_future_poses, :]  # (agents_num, future_len, 3)
 
         data = {
             "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)

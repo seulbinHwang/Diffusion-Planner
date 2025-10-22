@@ -934,8 +934,8 @@ class WorldModelAgents(AbstractMLAgents):
         # (future_len, 11)
         if self.use_ego_plan:
             planner_future_11_dim: Optional[
-                np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
-                                                            self._ego_anchor_state)
+                np.ndarray] = self._from_ego_fut_traj_to_np(
+                    ego_future_trajectory, self._ego_anchor_state)
         else:
             planner_future_11_dim = None
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
@@ -1276,7 +1276,7 @@ class WorldModelAgents(AbstractMLAgents):
             ped_valid_mask=ped_valid_mask,
             cfg=cfg,
         )  # (Pnn,81,4), (Pnn,80)
-        near_future_a3 = near_current_future_a2[: , 1:, :]  # (Pnn, 80, 4)
+        near_future_a3 = near_current_future_a2[:, 1:, :]  # (Pnn, 80, 4)
         # 3) 각속도 제약 + 스무딩 단계
         # near_future_a3 = yawrate_smooth_stage(
         #     near_current_future_a2=near_current_future_a2,

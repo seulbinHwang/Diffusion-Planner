@@ -15,6 +15,7 @@ from pathlib import Path
 # 이 모듈 내에서 호출할 때마다 1씩 증가하는 전역 카운터
 _PLOT_OMEGA_SEQ = count(1)
 
+
 @dataclass
 class SlipParams:
     """슬립각(몸체 슬립) 제약/분배 파라미터 묶음.
@@ -695,9 +696,9 @@ def sequential_slip_limit_closed_loop(
     Pnn = cur_future_copy.shape[0]
 
     # 미리 계산된 값이 있으면 사용, 없으면 fallback (호환성)
-    seg_valid = seg_valid_precomputed # (Pnn,80)
-    dist_raw = dist_raw_precomputed # (Pnn,80)
-    speed_raw = speed_raw_precomputed # (Pnn,80)
+    seg_valid = seg_valid_precomputed  # (Pnn,80)
+    dist_raw = dist_raw_precomputed  # (Pnn,80)
+    speed_raw = speed_raw_precomputed  # (Pnn,80)
 
     proc_rows = (veh_valid_mask | bic_valid_mask)  # (Pnn,)
 
@@ -716,10 +717,9 @@ def sequential_slip_limit_closed_loop(
         w_p_agent[bic_valid_mask] = float(cfg.bic_slip.w_p)
         w_th_agent[bic_valid_mask] = float(cfg.bic_slip.w_theta)
 
-
     # 시간 순방향 폐루프
     # seg_valid: (Pnn,80) ,  현재 + 미래 0 ~ 78 프레임
-    for s in range(1, 80): # 미래 0 번째 ~ 78 번째 프레임
+    for s in range(1, 80):  # 미래 0 번째 ~ 78 번째 프레임
         valid_rows = proc_rows & seg_valid[:, s]
         if not np.any(valid_rows):
             continue
@@ -827,7 +827,7 @@ def slip_limit_stage(
     # 2) 수정된 폐루프 보정 (s=1..79, 시작 헤딩 기준)
     # cur_future_copy: (Pnn,81,4)
     # vehbic_slip_frames: (Pnn,81)
-        # 첫 점 기록 안되어 있음 (자전거/자동차)
+    # 첫 점 기록 안되어 있음 (자전거/자동차)
     cur_future_copy = sequential_slip_limit_closed_loop(
         cur_future_copy=cur_future_copy,
         cur_future_raw=cur_future_raw,
@@ -1077,23 +1077,28 @@ def _unwrap_diff_along_time(
     if dt <= 0:
         raise ValueError("dt must be positive.")
     return (dphi / dt).astype(np.float32)
+
+
 def plot_omega_max_components_for_agent(
-    idx: int,
-    speeds: npt.NDArray[np.float32],                  # (Pnn, 80)
-    omega_eff: npt.NDArray[np.float32],              # (Pnn, 80)
-    *,
-    # ---- 반드시 외부에서 "이미 계산된" 배열을 넘깁니다 ----
-    omega_max: npt.NDArray[np.float32],              # (Pnn, 80)  _compute_omega_max 결과
-    omega_clip1: Optional[npt.NDArray[np.float32]] = None,  # (Pnn, 80) _clip_once 결과(옵션)
-    v_star: npt.NDArray[np.float32],                 # (Pnn, 80)  max(v, v_floor)
-    comp1: npt.NDArray[np.float32],                  # (Pnn, 80)  v / R_min       (보행자면 +inf/nan 가능)
-    comp2: npt.NDArray[np.float32],                  # (Pnn, 80)  aN_max / v_star
-    # ---- 선분(스칼라) 파라미터 ----
-    phi_dot_cap: npt.NDArray[np.float32],            # (Pnn,)     각속도 기본 상한
-    v_dir: npt.NDArray[np.float32],                  # (Pnn,)     저속-헤딩 스위치 임계속도
-    filename: Optional[str] = None,
-    y_max: Optional[float] = None,
-    seg_valid: Optional[npt.NDArray[np.bool_]] = None,  # (Pnn, 80) (무효 세그먼트 음영표시)
+        idx: int,
+        speeds: npt.NDArray[np.float32],  # (Pnn, 80)
+        omega_eff: npt.NDArray[np.float32],  # (Pnn, 80)
+        *,
+        # ---- 반드시 외부에서 "이미 계산된" 배열을 넘깁니다 ----
+        omega_max: npt.NDArray[np.float32],  # (Pnn, 80)  _compute_omega_max 결과
+        omega_clip1: Optional[npt.NDArray[
+            np.float32]] = None,  # (Pnn, 80) _clip_once 결과(옵션)
+        v_star: npt.NDArray[np.float32],  # (Pnn, 80)  max(v, v_floor)
+        comp1: npt.NDArray[
+            np.float32],  # (Pnn, 80)  v / R_min       (보행자면 +inf/nan 가능)
+        comp2: npt.NDArray[np.float32],  # (Pnn, 80)  aN_max / v_star
+        # ---- 선분(스칼라) 파라미터 ----
+    phi_dot_cap: npt.NDArray[np.float32],  # (Pnn,)     각속도 기본 상한
+        v_dir: npt.NDArray[np.float32],  # (Pnn,)     저속-헤딩 스위치 임계속도
+        filename: Optional[str] = None,
+        y_max: Optional[float] = None,
+        seg_valid: Optional[npt.NDArray[
+            np.bool_]] = None,  # (Pnn, 80) (무효 세그먼트 음영표시)
 ) -> str:
     """단일 에이전트 idx에 대해 ω_max 구성요소를 시각화해 저장합니다.
 
@@ -1131,18 +1136,20 @@ def plot_omega_max_components_for_agent(
     if not (0 <= idx < Pnn):
         raise IndexError(f"idx={idx} out of range (Pnn={Pnn}).")
 
-    v          = speeds[idx].astype(np.float32)            # (80,)
-    v_star_i   = v_star[idx].astype(np.float32)            # (80,)
-    comp1_i    = comp1[idx].astype(np.float32)             # (80,)
-    comp2_i    = comp2[idx].astype(np.float32)             # (80,)
-    om_eff_i   = omega_eff[idx].astype(np.float32)         # (80,)
-    om_max_i   = omega_max[idx].astype(np.float32)         # (80,)
-    om_clip1_i = omega_clip1[idx].astype(np.float32) if (omega_clip1 is not None) else None
+    v = speeds[idx].astype(np.float32)  # (80,)
+    v_star_i = v_star[idx].astype(np.float32)  # (80,)
+    comp1_i = comp1[idx].astype(np.float32)  # (80,)
+    comp2_i = comp2[idx].astype(np.float32)  # (80,)
+    om_eff_i = omega_eff[idx].astype(np.float32)  # (80,)
+    om_max_i = omega_max[idx].astype(np.float32)  # (80,)
+    om_clip1_i = omega_clip1[idx].astype(np.float32) if (omega_clip1
+                                                         is not None) else None
 
-    phi_dot_cap_i = float(phi_dot_cap[idx])                # scalar
-    v_dir_i       = float(v_dir[idx])                      # scalar
+    phi_dot_cap_i = float(phi_dot_cap[idx])  # scalar
+    v_dir_i = float(v_dir[idx])  # scalar
 
-    seg_valid_i = seg_valid[idx] if seg_valid is not None else None  # (80,) or None
+    seg_valid_i = seg_valid[
+        idx] if seg_valid is not None else None  # (80,) or None
 
     # -------- x축 인덱스 --------
     k = np.arange(80, dtype=int)
@@ -1158,22 +1165,27 @@ def plot_omega_max_components_for_agent(
     # 음수 대칭 곡선도 축 범위 계산에 포함
     pool = [
         _finite(om_eff_i),
-        _finite(comp1_i), _finite(-comp1_i),
-        _finite(comp2_i), _finite(-comp2_i),
-        _finite(om_max_i), _finite(-om_max_i),
-        _finite(np.full_like(om_max_i,  +phi_dot_cap_i, dtype=np.float32)),
-        _finite(np.full_like(om_max_i,  -phi_dot_cap_i, dtype=np.float32)),
+        _finite(comp1_i),
+        _finite(-comp1_i),
+        _finite(comp2_i),
+        _finite(-comp2_i),
+        _finite(om_max_i),
+        _finite(-om_max_i),
+        _finite(np.full_like(om_max_i, +phi_dot_cap_i, dtype=np.float32)),
+        _finite(np.full_like(om_max_i, -phi_dot_cap_i, dtype=np.float32)),
     ]
     if om_clip1_i is not None:
         pool.extend([_finite(om_clip1_i)])
 
     data_min = np.nanmin(np.concatenate(pool)) if pool else 0.0
     data_max = np.nanmax(np.concatenate(pool)) if pool else 1.0
-    if not np.isfinite(data_min): data_min = 0.0
-    if not np.isfinite(data_max): data_max = 1.0
+    if not np.isfinite(data_min):
+        data_min = 0.0
+    if not np.isfinite(data_max):
+        data_max = 1.0
     span = max(1e-6, data_max - data_min)
     y_bottom = data_min - 0.1 * span
-    y_top    = data_max + 0.1 * span
+    y_top = data_max + 0.1 * span
     if y_max is not None and y_max > 0:
         y_top = max(y_top, float(y_max))
 
@@ -1188,6 +1200,7 @@ def plot_omega_max_components_for_agent(
     def rad_deg_fmt(val, _pos):
         deg = np.degrees(val)
         return f"{val:.1f} rad/s\n({deg:.1f} °/s)"
+
     ax_left.yaxis.set_major_formatter(FuncFormatter(rad_deg_fmt))
 
     # 오른쪽 y축: 속도(m/s)
@@ -1218,27 +1231,63 @@ def plot_omega_max_components_for_agent(
 
     # -------- 곡선/선분(왼쪽 축: 각속도류) --------
     # 본값
-    ax_left.plot(k, om_eff_i, color="yellow", lw=2.0, label=r"$\omega_{\mathrm{eff}}$")
-    ax_left.plot(k, np.where(np.isfinite(comp1_i), comp1_i, np.nan),
-                 color="blue", lw=1.8, label=r"$v/R_{\min}$")
-    ax_left.plot(k, np.where(np.isfinite(comp2_i), comp2_i, np.nan),
-                 color="navy", lw=1.8, label=r"$a_{N,\max}/v_*$")
-    ax_left.plot(k, om_max_i, color="purple", lw=2.2, ls="--", label=r"$\omega_{\max}$")
+    ax_left.plot(k,
+                 om_eff_i,
+                 color="yellow",
+                 lw=2.0,
+                 label=r"$\omega_{\mathrm{eff}}$")
+    ax_left.plot(k,
+                 np.where(np.isfinite(comp1_i), comp1_i, np.nan),
+                 color="blue",
+                 lw=1.8,
+                 label=r"$v/R_{\min}$")
+    ax_left.plot(k,
+                 np.where(np.isfinite(comp2_i), comp2_i, np.nan),
+                 color="navy",
+                 lw=1.8,
+                 label=r"$a_{N,\max}/v_*$")
+    ax_left.plot(k,
+                 om_max_i,
+                 color="purple",
+                 lw=2.2,
+                 ls="--",
+                 label=r"$\omega_{\max}$")
     if om_clip1_i is not None:
-        ax_left.plot(k, om_clip1_i, color="black", lw=1.6, ls="--", label=r"$\omega_{\mathrm{clip1}}$")
+        ax_left.plot(k,
+                     om_clip1_i,
+                     color="black",
+                     lw=1.6,
+                     ls="--",
+                     label=r"$\omega_{\mathrm{clip1}}$")
 
     # 음수 대칭(같은 색, 범례 없이)
-    ax_left.plot(k, -np.where(np.isfinite(comp1_i), comp1_i, np.nan),
-                 color="blue", lw=1.2, alpha=0.8)
-    ax_left.plot(k, -np.where(np.isfinite(comp2_i), comp2_i, np.nan),
-                 color="navy", lw=1.2, alpha=0.8)
+    ax_left.plot(k,
+                 -np.where(np.isfinite(comp1_i), comp1_i, np.nan),
+                 color="blue",
+                 lw=1.2,
+                 alpha=0.8)
+    ax_left.plot(k,
+                 -np.where(np.isfinite(comp2_i), comp2_i, np.nan),
+                 color="navy",
+                 lw=1.2,
+                 alpha=0.8)
     ax_left.plot(k, -om_max_i, color="purple", lw=1.8, ls="--", alpha=0.9)
 
     # 수평선(상수 상한 ±phi_dot_cap)
     if np.isfinite(phi_dot_cap_i):
-        ax_left.hlines(+phi_dot_cap_i, k[0], k[-1], colors="green", linestyles="--", lw=1.8,
+        ax_left.hlines(+phi_dot_cap_i,
+                       k[0],
+                       k[-1],
+                       colors="green",
+                       linestyles="--",
+                       lw=1.8,
                        label=r"$\dot\varphi_0$")
-        ax_left.hlines(-phi_dot_cap_i, k[0], k[-1], colors="green", linestyles="--", lw=1.2)
+        ax_left.hlines(-phi_dot_cap_i,
+                       k[0],
+                       k[-1],
+                       colors="green",
+                       linestyles="--",
+                       lw=1.2)
 
     # -------- 오른쪽 축(속도) --------
     # ax_right.plot(k, v,          color="red",  lw=1.8, label="v (m/s)")
@@ -1248,8 +1297,11 @@ def plot_omega_max_components_for_agent(
     # -------- 범례(양쪽 합침) --------
     lines_left, labels_left = ax_left.get_legend_handles_labels()
     lines_right, labels_right = ax_right.get_legend_handles_labels()
-    ax_left.legend(lines_left + lines_right, labels_left + labels_right,
-                   loc="upper right", ncol=2, fontsize=9)
+    ax_left.legend(lines_left + lines_right,
+                   labels_left + labels_right,
+                   loc="upper right",
+                   ncol=2,
+                   fontsize=9)
 
     ax_left.grid(True, which="both", axis="both", alpha=0.25)
     fig.tight_layout()
@@ -1269,11 +1321,10 @@ def plot_omega_max_components_for_agent(
     return str(out_path)
 
 
-
-
 def _compute_omega_max(
-        speeds: npt.NDArray[np.float32],  # (Pnn, 80)
-        params: Dict[str, npt.NDArray[np.float32]],  # keys: 'phi_dot_cap','R_min','aN_max','v_floor','v_dir'
+    speeds: npt.NDArray[np.float32],  # (Pnn, 80)
+    params: Dict[str, npt.NDArray[
+        np.float32]],  # keys: 'phi_dot_cap','R_min','aN_max','v_floor','v_dir'
 ) -> npt.NDArray[np.float32]:
     """세그먼트별 허용 각속도 상한 ω_max(k)을 계산합니다.
 
@@ -1287,11 +1338,12 @@ def _compute_omega_max(
     """
     # 기본 준비
     v = speeds.astype(np.float32)  # (Pnn,80)
-    phi_dot_cap = params['phi_dot_cap'][:, None].astype(np.float32)  # (Pnn,1)→broadcast
-    v_floor = params['v_floor'][:, None].astype(np.float32)          # (Pnn,1)
-    v_dir = params['v_dir'][:, None].astype(np.float32)              # (Pnn,1)
-    R = params['R_min'][:, None]                                     # (Pnn,1)
-    aN_max = params['aN_max'][:, None].astype(np.float32)            # (Pnn,1)
+    phi_dot_cap = params['phi_dot_cap'][:, None].astype(
+        np.float32)  # (Pnn,1)→broadcast
+    v_floor = params['v_floor'][:, None].astype(np.float32)  # (Pnn,1)
+    v_dir = params['v_dir'][:, None].astype(np.float32)  # (Pnn,1)
+    R = params['R_min'][:, None]  # (Pnn,1)
+    aN_max = params['aN_max'][:, None].astype(np.float32)  # (Pnn,1)
 
     # 저속 여부 마스크
     low_speed = (v < v_dir)  # (Pnn,80)
@@ -1299,22 +1351,25 @@ def _compute_omega_max(
     # 정상 속도 구간용 구성요소
     v_star = np.maximum(v, v_floor).astype(np.float32)  # (Pnn,80)
     # R이 유한한 경우에만 v/R 계산, 그 외(+∞ 등)는 +∞로 채워 반경항을 무시
-    comp1 = np.divide(v, R,
+    comp1 = np.divide(v,
+                      R,
                       out=np.full_like(v, np.inf, dtype=np.float32),
                       where=np.isfinite(R))  # (Pnn,80)
     comp2 = (aN_max / v_star).astype(np.float32)  # (Pnn,80)
 
     # 정상 속도 ω_max: min(φ̇_cap, v/R_min, aN_max/v*)
-    hi_speed_limit = np.minimum(phi_dot_cap, np.minimum(comp1, comp2)).astype(np.float32)
+    hi_speed_limit = np.minimum(phi_dot_cap,
+                                np.minimum(comp1, comp2)).astype(np.float32)
 
     # 저속 게이팅 적용
-    omega_max = np.where(low_speed, phi_dot_cap, hi_speed_limit).astype(np.float32)
+    omega_max = np.where(low_speed, phi_dot_cap,
+                         hi_speed_limit).astype(np.float32)
 
     # 안전 처리
-    omega_max = np.where(np.isfinite(omega_max), omega_max, phi_dot_cap).astype(np.float32)
+    omega_max = np.where(np.isfinite(omega_max), omega_max,
+                         phi_dot_cap).astype(np.float32)
     omega_max = np.maximum(omega_max, 0.0).astype(np.float32)
     return omega_max, v_star, comp1, comp2
-
 
 
 def _clip_once(
@@ -1339,10 +1394,10 @@ def _clip_once(
 
 
 def _tv_smooth_forward_backward(
-    omega,        # (Pnn, 80) float32: 1차 클립된 각속도 열(세그먼트 기준)
-    omega_max,    # (Pnn, 80) float32: 스텝별 허용 상한
-    alpha_max_dt, # (Pnn,)    float32: 에이전트별 각가속 상한 * dt
-    valid_mask,   # (Pnn, 80) bool: 세그먼트 유효 마스크(True=유효)
+    omega,  # (Pnn, 80) float32: 1차 클립된 각속도 열(세그먼트 기준)
+    omega_max,  # (Pnn, 80) float32: 스텝별 허용 상한
+    alpha_max_dt,  # (Pnn,)    float32: 에이전트별 각가속 상한 * dt
+    valid_mask,  # (Pnn, 80) bool: 세그먼트 유효 마스크(True=유효)
     n_pass=1,
 ):
     """
@@ -1390,8 +1445,10 @@ def _tv_smooth_forward_backward(
             # 경계 처리:
             # - prev_valid=True  → 가속 제약 적용 (±alpha_max_dt)
             # - prev_valid=False → 가속 제약 끊고(±∞), 포인트 상한만 적용
-            lo = np.where(prev_valid, fwd[:, k - 1] - alpha_max_dt, -INF)  # (Pnn,)
-            hi = np.where(prev_valid, fwd[:, k - 1] + alpha_max_dt, +INF)  # (Pnn,)
+            lo = np.where(prev_valid, fwd[:, k - 1] - alpha_max_dt,
+                          -INF)  # (Pnn,)
+            hi = np.where(prev_valid, fwd[:, k - 1] + alpha_max_dt,
+                          +INF)  # (Pnn,)
 
             # 1) 각가속 제약(경계에서는 해제됨) → 2) 포인트 상한 → 3) 유효 마스크
             # z : (Pnn,)
@@ -1416,8 +1473,10 @@ def _tv_smooth_forward_backward(
             # 경계 처리:
             # - next_valid=True  → 가속 제약 적용
             # - next_valid=False → 가속 제약 끊고(±∞), 포인트 상한만 적용
-            lo = np.where(next_valid, bwd[:, k + 1] - alpha_max_dt, -INF)  # (Pnn,)
-            hi = np.where(next_valid, bwd[:, k + 1] + alpha_max_dt, +INF)  # (Pnn,)
+            lo = np.where(next_valid, bwd[:, k + 1] - alpha_max_dt,
+                          -INF)  # (Pnn,)
+            hi = np.where(next_valid, bwd[:, k + 1] + alpha_max_dt,
+                          +INF)  # (Pnn,)
 
             # 1) 각가속 제약(경계에서는 해제됨) → 2) 포인트 상한 → 3) 유효 마스크
             z = np.clip(fwd[:, k], lo, hi)
@@ -1430,12 +1489,14 @@ def _tv_smooth_forward_backward(
     return out
 
 
-
 def _integrate_arc_positions_and_phi(
     p0_xy: npt.NDArray[np.float32],  # (Pnn, 2) frame-0 위치
-    sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81) σ 프레임열 # "현재 + 미래 0, ..., 79"
+    sigma_frames: npt.NDArray[
+        np.int8],  # (Pnn, 81) σ 프레임열 # "현재 + 미래 0, ..., 79"
     phi_eff0: npt.NDArray[np.float32],  # (Pnn,)   시작 σ-aware 방향각
-    dphi_seq: npt.NDArray[np.float32],  # (Pnn, 80) Δφ[k] = ω_smooth[k] dt # # "현재 + 미래 0, ..., 78"
+    dphi_seq: npt.NDArray[
+        np.
+        float32],  # (Pnn, 80) Δφ[k] = ω_smooth[k] dt # # "현재 + 미래 0, ..., 78"
     speed: npt.NDArray[np.float32],  # (Pnn, 80) v[k] # "현재 + 미래 0, ..., 78"
     dt: float,
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
@@ -1456,31 +1517,31 @@ def _integrate_arc_positions_and_phi(
 
     # 출력 버퍼
     positions_1_80 = np.zeros((Pnn, 80, 2), dtype=np.float32)
-    phi_world_end  = np.zeros((Pnn, 80),     dtype=np.float32)
+    phi_world_end = np.zeros((Pnn, 80), dtype=np.float32)
 
     # 현재 스텝의 시작 상태 (복사해서 안전하게 사용)
-    xk = p0_xy[:, 0].astype(np.float32).copy()    # (Pnn,)
-    yk = p0_xy[:, 1].astype(np.float32).copy()    # (Pnn,)
+    xk = p0_xy[:, 0].astype(np.float32).copy()  # (Pnn,)
+    yk = p0_xy[:, 1].astype(np.float32).copy()  # (Pnn,)
     phi_eff_k = phi_eff0.astype(np.float32).copy()  # (Pnn,)
 
     # 시간축 전진 적분
     for k in range(80):
         # 1) 시작 세계 방향각 φ_k  (후진이면 +π로 복원)
-        pi_off_start_k = _sigma_to_pi_offset(sigma_frames[:, k])      # (Pnn,)
-        phi_world_k = _wrap_to_pi(phi_eff_k + pi_off_start_k)         # (Pnn,)
+        pi_off_start_k = _sigma_to_pi_offset(sigma_frames[:, k])  # (Pnn,)
+        phi_world_k = _wrap_to_pi(phi_eff_k + pi_off_start_k)  # (Pnn,)
 
         # 2) 이번 스텝 이동/회전량
-        ds_k   = (speed[:, k].astype(np.float32)) * np.float32(dt)    # (Pnn,)
-        dphi_k = dphi_seq[:, k].astype(np.float32)                    # (Pnn,)
+        ds_k = (speed[:, k].astype(np.float32)) * np.float32(dt)  # (Pnn,)
+        dphi_k = dphi_seq[:, k].astype(np.float32)  # (Pnn,)
 
         # 3) sinc/cosc로 위치 업데이트
-        s = _sinc(dphi_k)          # (Pnn,)
-        csc = _cosc(dphi_k)        # (Pnn,)
+        s = _sinc(dphi_k)  # (Pnn,)
+        csc = _cosc(dphi_k)  # (Pnn,)
         c = np.cos(phi_world_k).astype(np.float32)
         s_ = np.sin(phi_world_k).astype(np.float32)
 
-        dx = ds_k * (c * s - s_ * csc)   # (Pnn,)
-        dy = ds_k * (s_ * s + c * csc)   # (Pnn,)
+        dx = ds_k * (c * s - s_ * csc)  # (Pnn,)
+        dy = ds_k * (s_ * s + c * csc)  # (Pnn,)
 
         xk = xk + dx
         yk = yk + dy
@@ -1493,8 +1554,8 @@ def _integrate_arc_positions_and_phi(
         phi_eff_k = _wrap_to_pi(phi_eff_k + dphi_k)
 
         # 5) 끝 세계 각 (다음 프레임 σ_{k+1}로 복원)
-        pi_off_end_k = _sigma_to_pi_offset(sigma_frames[:, k + 1])     # (Pnn,)
-        phi_world_end[:, k] = _wrap_to_pi(phi_eff_k + pi_off_end_k)    # (Pnn,)
+        pi_off_end_k = _sigma_to_pi_offset(sigma_frames[:, k + 1])  # (Pnn,)
+        phi_world_end[:, k] = _wrap_to_pi(phi_eff_k + pi_off_end_k)  # (Pnn,)
 
     return positions_1_80, phi_world_end
 
@@ -1502,7 +1563,8 @@ def _integrate_arc_positions_and_phi(
 def _restore_heading_from_phi_and_slip(
         phi_world_end: npt.NDArray[np.float32],  # (Pnn, 80) # "미래 0, ..., 79"
         sigma_frames: npt.NDArray[np.int8],  # (Pnn, 81) # "현재 + 미래 0, ..., 79"
-        near_future_body_slip: npt.NDArray[np.float32],  # (Pnn, 81)  # "현재 + 미래 0, ..., 79"
+        near_future_body_slip: npt.NDArray[
+            np.float32],  # (Pnn, 81)  # "현재 + 미래 0, ..., 79"
 ) -> npt.NDArray[np.float32]:
     """슬립각을 보존하며 θ_{k+1}를 복원합니다.
 
@@ -1527,7 +1589,6 @@ def _restore_heading_from_phi_and_slip(
     theta_eff 에서, 후진인 경우 π 오프셋을 다시 빼서 θ_end 계산
     """
     theta_end = _wrap_to_pi(theta_eff - pi_off_end)  # (Pnn,80)
-
 
     return theta_end
 
@@ -1557,15 +1618,14 @@ def _pack_xy_cos_sin(
 
 
 def yawrate_smooth_stage(
-    near_current_future_a2: npt.NDArray[np.float32],  # (Pnn, 81, 4)
-    near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
-    near_future_body_slip: npt.NDArray[np.float32], # (Pnn,81)
-    veh_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
-    bic_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
-    ped_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
-    cfg: SmootherConfig,
-draw_idx
-) -> npt.NDArray[np.float32]:
+        near_current_future_a2: npt.NDArray[np.float32],  # (Pnn, 81, 4)
+        near_current_future_dir: npt.NDArray[np.int8],  # (Pnn, 81)
+        near_future_body_slip: npt.NDArray[np.float32],  # (Pnn,81)
+        veh_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
+        bic_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
+        ped_valid_mask: npt.NDArray[np.bool_],  # (Pnn,)
+        cfg: SmootherConfig,
+        draw_idx) -> npt.NDArray[np.float32]:
     """[3단계] 각속도 제약 + 스무딩: σ-aware 방향각, 저속 보정, TV 스무딩, 적분, 헤딩 복원.
 
     파이프라인:
@@ -1608,8 +1668,7 @@ draw_idx
 
     # σ-aware 방향각(세그먼트)
     # (Pnn,80)  # "현재 + 미래 0, ..., 78"
-    phi_eff_seg = _sigma_adjust_phi(
-        phi_world_seg, sigma_seg)
+    phi_eff_seg = _sigma_adjust_phi(phi_world_seg, sigma_seg)
 
     # 1) 저속 스위치용 파라미터 준비(에이전트별)
     # Dict[str, npt.NDArray[np.float32]] #
@@ -1636,7 +1695,8 @@ draw_idx
 
     # 3) 스텝별 허용 상한 ω_max (v_floor 게이팅/반경/옆가속/기본캡 포함)
     # "현재 + 미래 0, ..., 78"
-    omega_max, v_star, comp1, comp2 = _compute_omega_max(speeds, params)  # (Pnn,80)
+    omega_max, v_star, comp1, comp2 = _compute_omega_max(speeds,
+                                                         params)  # (Pnn,80)
     # "현재 + 미래 0, ..., 78"
     omega_clip1 = _clip_once(omega_eff, omega_max, seg_valid)  # (Pnn,80)
     if draw_idx is not None:
@@ -1684,9 +1744,10 @@ draw_idx
 
     # 6) 헤딩 복원(슬립각 보존)
     headings_1_80 = _restore_heading_from_phi_and_slip(
-        phi_world_end=phi_world_end, # (Pnn,80)
-        sigma_frames=sigma_frames, # (Pnn,81)  # "현재 + 미래 0, ..., 79"
-        near_future_body_slip=near_future_body_slip, # (Pnn,81)  # "현재 + 미래 0, ..., 79"
+        phi_world_end=phi_world_end,  # (Pnn,80)
+        sigma_frames=sigma_frames,  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
+        near_future_body_slip=
+        near_future_body_slip,  # (Pnn,81)  # "현재 + 미래 0, ..., 79"
     )  # (Pnn,80)
 
     # 7) (x,y,cosθ,sinθ) 포장 + 유효 세그먼트에만 쓰기

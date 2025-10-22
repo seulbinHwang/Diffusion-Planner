@@ -622,7 +622,6 @@ def agent_past_process(
 
     ##################
 
-
     # Populate the final agents array with the selected agents' features
     for sort_idx, cur_neighbor_idx in enumerate(sorted_cur_neighbor_indices):
         # neighbor_agents_past: (agent_num, num_frames, 11)

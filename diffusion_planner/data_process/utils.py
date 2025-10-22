@@ -52,16 +52,18 @@ from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType
 from nuplan.common.maps.nuplan_map.utils import get_roadblock_ids_from_trajectory
 
-
 from typing import Dict
 import numpy as np
 import numpy.typing as npt
 
 
 def ego_local_traj3_to_global(
-    local_traj_xyh: npt.NDArray[np.floating],   # shape: (T, 3) = [x_e, y_e, yaw_e]
-    cur_ego_global_xyyaw: npt.NDArray[np.floating],  # shape: (3,) = [x_g, y_g, yaw_g]
-    *, invalid_eps: float = 0.0,
+    local_traj_xyh: npt.NDArray[
+        np.floating],  # shape: (T, 3) = [x_e, y_e, yaw_e]
+    cur_ego_global_xyyaw: npt.NDArray[
+        np.floating],  # shape: (3,) = [x_g, y_g, yaw_g]
+    *,
+    invalid_eps: float = 0.0,
 ) -> npt.NDArray[np.float64]:
     """ego 좌표계 (x, y, heading) 시퀀스를 세계 절대 좌표계로 변환하되,
     (0., 0., 0.)인 무효 행은 제거하고 유효 행만 반환합니다.
@@ -78,19 +80,22 @@ def ego_local_traj3_to_global(
                     유효 행이 하나도 없으면 (0, 3) 배열을 반환.
     """
     if local_traj_xyh.ndim != 2 or local_traj_xyh.shape[1] != 3:
-        raise ValueError(f"`local_traj_xyh` shape must be (T,3), got {local_traj_xyh.shape}")
+        raise ValueError(
+            f"`local_traj_xyh` shape must be (T,3), got {local_traj_xyh.shape}")
     if cur_ego_global_xyyaw.shape != (3,):
-        raise ValueError(f"`cur_ego_global_xyyaw` shape must be (3,), got {cur_ego_global_xyyaw.shape}")
+        raise ValueError(
+            f"`cur_ego_global_xyyaw` shape must be (3,), got {cur_ego_global_xyyaw.shape}"
+        )
 
     # ── 1) 무효 행 필터링: (x, y, yaw) 모두 0(또는 eps 이내)이면 제거 ─────────────────
     if invalid_eps <= 0.0:
-        invalid_mask = (local_traj_xyh[:, 0] == 0.0) & (local_traj_xyh[:, 1] == 0.0) & (local_traj_xyh[:, 2] == 0.0)
+        invalid_mask = (local_traj_xyh[:, 0] == 0.0) & (
+            local_traj_xyh[:, 1] == 0.0) & (local_traj_xyh[:, 2] == 0.0)
     else:
         invalid_mask = (
             np.isclose(local_traj_xyh[:, 0], 0.0, atol=invalid_eps) &
             np.isclose(local_traj_xyh[:, 1], 0.0, atol=invalid_eps) &
-            np.isclose(local_traj_xyh[:, 2], 0.0, atol=invalid_eps)
-        )
+            np.isclose(local_traj_xyh[:, 2], 0.0, atol=invalid_eps))
     valid_mask = ~invalid_mask
     if not np.any(valid_mask):
         return np.empty((0, 3), dtype=np.float64)
@@ -102,7 +107,8 @@ def ego_local_traj3_to_global(
     y_e = local_valid[:, 1]
     yaw_e = local_valid[:, 2]
 
-    x_g0, y_g0, yaw_g0 = map(float, cur_ego_global_xyyaw.tolist())  # 글로벌 기준(ego 현재 포즈)
+    x_g0, y_g0, yaw_g0 = map(float,
+                             cur_ego_global_xyyaw.tolist())  # 글로벌 기준(ego 현재 포즈)
     c, s = np.cos(yaw_g0), np.sin(yaw_g0)
     x_g = x_e * c - y_e * s + x_g0
     y_g = x_e * s + y_e * c + y_g0

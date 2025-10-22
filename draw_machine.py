@@ -404,7 +404,7 @@ class DrawingOptions:
 
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode : str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    EGO_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_next_11_dim_style = {
@@ -888,8 +888,9 @@ def draw_neighbor_past(ax: plt.Axes,
     current_t = time_len - 1
 
     for agent_idx in range(agent_num):
-        if (draw_token_int_list is not None) and (agent_idx
-                                                  not in draw_token_int_list) or options.NEI_draw_neighbor_only_current:
+        if (draw_token_int_list
+                is not None) and (agent_idx not in draw_token_int_list
+                                 ) or options.NEI_draw_neighbor_only_current:
             draw_all_time_for_target = False
         else:
             draw_all_time_for_target = True
@@ -1111,16 +1112,22 @@ def draw_planner_future_11_dim(ax: plt.Axes, planner_future_11_dim: Array,
     if feat_dim != 11:
         raise ValueError("ego_future_gt_11_dim의 마지막 차원은 11이어야 합니다.")
     if options.EGO_future_traj_draw_mode == "rectangle":
-        draw_token_trajectory_rects_unfilled(ax,
-                                             planner_future_11_dim,
-                                             options.EGO_planner_future_11_style,
-                                             options,
-                                             zorder=24,
-                                             draw_velocity=options.EGO_draw_planner_velocity
-                                             )
+        draw_token_trajectory_rects_unfilled(
+            ax,
+            planner_future_11_dim,
+            options.EGO_planner_future_11_style,
+            options,
+            zorder=24,
+            draw_velocity=options.EGO_draw_planner_velocity)
     elif options.EGO_future_traj_draw_mode in ["arrow", "point", "line"]:
-        pass
-        
+        draw_token_trajectory_non_rects(
+            ax,
+            planner_future_11_dim,
+            options.EGO_planner_future_11_style,
+            options,
+            mode=options.EGO_future_traj_draw_mode,
+            zorder=24,
+        )
 
 
 def draw_ego_future_gt_11_dim(ax: plt.Axes, ego_future_gt_11_dim: Array,
@@ -1386,17 +1393,16 @@ def draw_diff_future_gen_refined_traj(
 
 from typing import Optional, Literal
 
-
 from typing import Optional, Dict, List, Tuple, Any
 
 
 def draw_token_trajectory_rects_unfilled(
-        ax: plt.Axes,
-        traj_11: Array,
-        style: Dict[str, Any],
-        options: DrawingOptions,
-        zorder: int,
-        draw_velocity: Optional[bool] = None,
+    ax: plt.Axes,
+    traj_11: Array,
+    style: Dict[str, Any],
+    options: DrawingOptions,
+    zorder: int,
+    draw_velocity: Optional[bool] = None,
 ) -> Optional[Tuple[float, float]]:
     """(T, 11) 궤적을 '속이 비어 있는 사각형 + 헤딩선'으로 렌더링.
 
@@ -1457,20 +1463,16 @@ def draw_token_trajectory_rects_unfilled(
             zorder=zorder,
         )
         if draw_velocity is True:
-            add_velocity_arrow(
-                ax,
-                x,
-                y,
-                vx,
-                vy,
-                length_m=options.COMMON_vel_arrow_len_m,
-                line_color=options.
-                style["velocity_line_color"],
-                line_width=options.
-                style["velocity_line_width"],
-                line_alpha=options.
-                style["velocity_line_alpha"],
-                zorder=zorder)
+            add_velocity_arrow(ax,
+                               x,
+                               y,
+                               vx,
+                               vy,
+                               length_m=options.COMMON_vel_arrow_len_m,
+                               line_color=options.style["velocity_line_color"],
+                               line_width=options.style["velocity_line_width"],
+                               line_alpha=options.style["velocity_line_alpha"],
+                               zorder=zorder)
 
         if first_valid_xy is None:
             first_valid_xy = (x, y)
@@ -1480,19 +1482,18 @@ def draw_token_trajectory_rects_unfilled(
 
 # draw_token_trajectory_rects_unfilled
 def draw_token_trajectory_non_rects(
-        ax: plt.Axes,
-        traj_11: Array,
-        style: Dict[str, Any],
-        options: DrawingOptions,
-        mode: str,
-        zorder: int,
+    ax: plt.Axes,
+    traj_11: Array,
+    style: Dict[str, Any],
+    options: DrawingOptions,
+    mode: str,
+    zorder: int,
 ) -> Optional[Tuple[float, float]]:
     if traj_11 is None or traj_11.size == 0:
         return None
     if traj_11.ndim != 2 or traj_11.shape[1] != 11:
         raise ValueError(
-            "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
-        )
+            "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다.")
     eps = options.invalid_eps
     first_valid_xy: Optional[Tuple[float, float]] = None
     traj = traj_11[:, :4]  # (future_len, 4)
@@ -1550,6 +1551,7 @@ def draw_token_trajectory_non_rects(
 
         return first_valid_xy
 
+
 def draw_traj_dict_as_unfilled_rects(
     ax: plt.Axes,
     token_to_traj_11: Optional[Dict[str, Array]],
@@ -1559,6 +1561,7 @@ def draw_traj_dict_as_unfilled_rects(
     draw_token_list: Optional[List[str]] = None,
     annotate_token: bool = False,
     annotate_fontsize: Optional[int] = None,
+    annotate_offset: float = 0.0,
 ) -> None:
     """Dict[str, (T,11)]를 '속 빈 사각형'으로 렌더링하고 필요 시 토큰 라벨을 추가.
 
@@ -1589,13 +1592,11 @@ def draw_traj_dict_as_unfilled_rects(
             options=options,
             zorder=zorder,
         )
-        # (선택) 토큰 라벨 추가: 첫 유효 프레임 좌표 기준, 아래쪽으로 약간 오프셋
-        # TODO
-        if annotate_token and options.DIFF_draw_diff_future_gen_traj_token and (first_xy is not None):
+        if annotate_token and (first_xy is not None):
             fx, fy = first_xy
             ax.text(
                 fx,
-                fy - options.DIFF_future_gen_trak_token_text_y_offset_m,
+                fy - annotate_offset,
                 str(token)[:5],
                 color=style["line_color"],
                 fontsize=annotate_fontsize,
@@ -1605,14 +1606,17 @@ def draw_traj_dict_as_unfilled_rects(
                 clip_on=True,
             )
 
+
 # draw_traj_dict_as_unfilled_rects
 def draw_traj_dict_as_non_square(
     ax: plt.Axes,
     token_to_traj_11: Optional[TokenTrajDict],
     style: Dict[str, Any],
     options: DrawingOptions,
-    draw_token_list: Optional[List[str]]=None,
-        draw_token: bool = False,
+    draw_token_list: Optional[List[str]] = None,
+    annotate_token: bool = False,
+    annotate_fontsize: Optional[int] = None,
+    annotate_offset: float = 0.0,
 ) -> None:
     """토큰 기준 미래 포즈를 '화살표(방향 포함)' 또는 '점(방향 미사용)'으로 그림.
 
@@ -1646,31 +1650,27 @@ def draw_traj_dict_as_non_square(
             f"Unsupported draw_mode: {mode}. Use 'arrow' or 'point' or 'line'.")
 
     # [ADD] 삽입순서 그대로 인덱스 부여를 위해 enumerate(dict.items()) 사용
-    for idx, (token, traj_11) in enumerate(
-            token_to_traj_11.items()):  # [ADD]
+    for idx, (token, traj_11) in enumerate(token_to_traj_11.items()):  # [ADD]
         if draw_token_list is not None and token not in draw_token_list:
             continue
         first_xy = draw_token_trajectory_non_rects(ax,
-                                        traj_11,
-                                        style,
-                                        options,
-                                        mode,
-                                        zorder=20)
-        # TODO
-        if options.DIFF_draw_diff_future_gen_traj_token and (
-                first_xy is not None):
+                                                   traj_11,
+                                                   style,
+                                                   options,
+                                                   mode,
+                                                   zorder=20)
+        if annotate_token and (first_xy is not None):
             fx, fy = first_xy
             ax.text(
                 fx,
-                fy - options.DIFF_future_gen_trak_token_text_y_offset_m,
+                fy - annotate_offset,
                 str(token),
                 color=style["token_color"],
-                fontsize=options.LANE_AGENT_index_fontsize,
+                fontsize=annotate_fontsize,
                 ha="center",
                 va="top",
                 zorder=24,
             )
-
 
 
 def draw_diff_future_traj_w_square(
@@ -1712,8 +1712,9 @@ def draw_diff_future_traj_w_square(
             options=options,
             zorder=22,
             draw_token_list=draw_token_list,
-            annotate_token=True,
+            annotate_token=options.DIFF_draw_diff_future_gen_traj_token,
             annotate_fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+            annotate_offset=options.DIFF_future_gen_trak_token_text_y_offset_m,
         )
 
         # 2) slip 초과 제거본 (연한 분홍)
@@ -1746,7 +1747,11 @@ def draw_diff_future_traj_w_square(
                 token_to_traj_11=diff_token_to_np_gen_traj_11_wrt_ego,
                 style=options.DIFF_future_gen_style,
                 options=options,
-                draw_token_list=draw_token_list
+                draw_token_list=draw_token_list,
+                annotate_token=options.DIFF_draw_diff_future_gen_traj_token,
+                annotate_fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                annotate_offset=options.
+                DIFF_future_gen_trak_token_text_y_offset_m,
             )
         if options.DIFF_draw_diff_future_slip_traj:
             draw_traj_dict_as_non_square(
@@ -1754,17 +1759,14 @@ def draw_diff_future_traj_w_square(
                 token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
                 style=options.DIFF_future_slip_style,
                 options=options,
-                draw_token_list=draw_token_list
-            )
+                draw_token_list=draw_token_list)
         if options.DIFF_draw_diff_future_smooth_traj:
             draw_traj_dict_as_non_square(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
                 style=options.DIFF_future_smooth_style,
                 options=options,
-                draw_token_list=draw_token_list
-            )
-
+                draw_token_list=draw_token_list)
 
 
 # =============================================================================
@@ -2092,9 +2094,9 @@ def draw_neighbor_future_all(ax: plt.Axes,
         "diff_token_to_np_smooth_traj_11_wrt_ego", None)
     if draw_option.DIFF_draw_diff_future_gen_traj:
         draw_diff_future_traj_w_square(ax, diff_token_to_np_gen_traj_11_wrt_ego,
-                                  diff_token_to_np_slip_traj_11_wrt_ego,
-                                  diff_token_to_np_smooth_traj_11_wrt_ego,
-                                  draw_option, draw_token_list)
+                                       diff_token_to_np_slip_traj_11_wrt_ego,
+                                       diff_token_to_np_smooth_traj_11_wrt_ego,
+                                       draw_option, draw_token_list)
     diff_token_to_interp_np_traj_wrt_ego = output_data.get(
         "diff_token_to_interp_np_traj_wrt_ego", None)
     diff_token_to_next_wp_wrt_ego = output_data.get(
@@ -2175,7 +2177,9 @@ def draw_world_model_to_png(
     draw_token_list: List[str] = [
         "58a9e2ba05555824"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
-    draw_token_list: List[str] = ["f476b2c85dd7508c"] # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    draw_token_list: List[str] = [
+        "f476b2c85dd7508c"
+    ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
 
     # draw_token_list = None
     draw_option = options or DrawingOptions()
