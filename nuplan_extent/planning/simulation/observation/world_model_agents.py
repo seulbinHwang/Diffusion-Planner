@@ -459,6 +459,8 @@ class WorldModelAgents(AbstractMLAgents):
         self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
+        self.use_route_lanes = True
+        self.use_ego_plan = True
 
     def _initialize_open_loop_detection_types(
             self, open_loop_detections: List[str]) -> None:
@@ -873,11 +875,15 @@ class WorldModelAgents(AbstractMLAgents):
     ) -> Tuple[Dict[str, AbstractModelFeature], List[Optional[str]], Dict[
             str, np.ndarray], np.ndarray]:
         # Construct input features
+        if self.use_route_lanes:
+            route_roadblock_ids = self._scenario.get_route_roadblock_ids()
+        else:
+            route_roadblock_ids = None
         initialization = HorizonPlannerInitialization(
             # 시나리오가 끝나고도 계속 진행했을 때 최종적으로 도달해야 하는 포즈 (존재하지 않을 수도 있음)
             mission_goal=self._scenario.get_mission_goal(),
             # (x, y, yaw) 의 StateSE2
-            route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
+            route_roadblock_ids=route_roadblock_ids,
             map_api=self._scenario.map_api,
             scenario=self._scenario,
             # 전문 운전자(ground truth)의 실제 마지막 상태 (항상 존재)
@@ -926,9 +932,12 @@ class WorldModelAgents(AbstractMLAgents):
             np.ndarray] = self.from_next_ego_state_to_traj_np(
                 iteration, next_ego_state)
         # (future_len, 11)
-        planner_future_11_dim: Optional[
-            np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
-                                                        self._ego_anchor_state)
+        if self.use_ego_plan:
+            planner_future_11_dim: Optional[
+                np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
+                                                            self._ego_anchor_state)
+        else:
+            planner_future_11_dim = None
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
         (model_input_key_to_value, neighbor_token_dist_order,
