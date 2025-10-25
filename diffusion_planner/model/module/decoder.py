@@ -213,8 +213,7 @@ class Decoder(nn.Module):
         # near_current_xyyaw: [B, pnn, 4]  (x, y, cos(yaw), sin(yaw))
         # near_current_mask: [B, pnn]  True=빈 슬롯(무효 에이전트)
         near_current_xyyaw, near_current_mask = self._get_near_current_infos(
-            target_agents_mask=inputs[
-                "target_agents_mask"],  # [B, agent_num] bool
+            target_agents_mask=inputs.get("target_agents_mask", None),  # [B, agent_num] bool
             neighbor_agents_past=inputs[
                 "neighbor_agents_past"],  # [B, agent_num, time_len, 11]
         )
