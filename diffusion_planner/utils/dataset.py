@@ -24,14 +24,15 @@ class DiffusionPlannerData(Dataset):
 
     def __getitem__(self, idx):
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
-
+        # TODO: revive
         # ego_future_gt_11_dim = data["ego_future_gt_11_dim"]
 
         neighbor_agents_past = data["neighbor_agents_past"][:self.
                                                             _past_neighbor_num]
         # (num_agents, future_len, 3) -> (predicted_neighbor_num, future_len, 3)
-        near_future_gt_3_dim = data[
-            "neighbor_future_gt_3_dim"][:self._predicted_neighbor_num]
+        # TODO: revive
+        # near_future_gt_3_dim = data[
+        #     "neighbor_future_gt_3_dim"][:self._predicted_neighbor_num]
         # TODO: remove
         neighbor_agents_future = data[
             "neighbor_agents_future"][:self._predicted_neighbor_num]
