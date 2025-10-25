@@ -50,8 +50,8 @@ class DiffusionPlannerData(Dataset):
             "ego_agent_past": data["ego_agent_past"],  # 0
             "ego_current_state": data["ego_current_state"],  # 1
             ###
-            "ego_future_gt_3_dim": data["ego_agent_future"],  # 2
-            "neighbor_agents_past": neighbor_agents_past,  # 3 ###
+            "ego_future_gt_3_dim": data["ego_agent_future"],  # 2 ###
+            "neighbor_agents_past": neighbor_agents_past,  # 3
             "lanes": lanes,  # 4
             "lanes_speed_limit": lanes_speed_limit,  # 5
             "lanes_has_speed_limit": lanes_has_speed_limit,  # 6
@@ -67,6 +67,7 @@ class DiffusionPlannerData(Dataset):
         }
 
         return tuple(data.values())
+    # TODO: 수정 필요
     #
     #
     # def __getitem__(self, idx):
