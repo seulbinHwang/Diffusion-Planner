@@ -195,12 +195,14 @@ def diffusion_loss_func(
         device=near_future_gt_4_dim.device)  # [B, Pnn, T, 4]
 
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
-    normed_future = state_normalizer(near_future_gt_4_dim)
-    cond_last_pos_norm = normed_future[:, :, -1, :]  # [B, Pnn, 4]
-    normed_future = _require_finite("state_normalizer(near_future_gt_4_dim)",
-                                    normed_future)
+    normed_near_future_gt_4_dim = state_normalizer(
+        near_future_gt_4_dim)  # (B, Pnn, T, 4)
+    normed_near_future_gt_4_dim[near_future_mask] = 0.0
+    cond_last_pos_norm = normed_near_future_gt_4_dim[:, :, -1, :]  # [B, Pnn, 4]
+    normed_near_future_gt_4_dim = _require_finite(
+        "state_normalizer(near_future_gt_4_dim)", normed_near_future_gt_4_dim)
     near_cur_future_norm_gt = torch.cat(
-        [near_current_xyyaw_norm[:, :, None, :], normed_future],
+        [near_current_xyyaw_norm[:, :, None, :], normed_near_future_gt_4_dim],
         dim=2)  # [B, Pnn, 1 + T, 4]
     # near_cur_future_mask: [B, Pnn, 1+T]
     near_cur_future_norm_gt[near_cur_future_mask] = 0.0
@@ -216,11 +218,9 @@ def diffusion_loss_func(
     mean = _require_finite("marginal_prob mean", mean)
     std = _require_finite("marginal_prob std", std)
     # std.shape after view: torch.Size([B, 1, 1, 1])
-
     std = std.view(-1, *([1] * (len(near_future_norm_gt.shape) - 1)))
-    #  near_future_norm_xT.shape: torch.Size([B, Pnn, T, 4])
+    #  near_future_norm_xT.shape: [B, Pnn, T, 4]
     near_future_norm_xT = mean + std * random_noise
-    near_future_norm_xT[near_future_mask] = 0.0
     # near_cur_future_norm_xT.shape after concat: torch.Size([B, Pnn, 1+T, 4])
     near_cur_future_norm_xT = torch.cat(
         [near_cur_future_norm_gt[:, :, :1, :], near_future_norm_xT], dim=2)

@@ -17,6 +17,7 @@ def train_epoch(data_loader,
                 optimizer,
                 args,
                 ema,
+                scheduler,
                 aug: StatePerturbation = None):
     epoch_loss = []
 
@@ -24,6 +25,7 @@ def train_epoch(data_loader,
 
     if args.ddp:
         torch.cuda.synchronize()
+
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
             # prepare data
@@ -55,7 +57,8 @@ def train_epoch(data_loader,
             }
 
             ego_future_gt_3_dim = batch[2].to(args.device)
-            near_future_gt_3_dim = batch[11].to(args.device)
+            near_future_gt_3_dim = batch[11].to(
+                args.device)  # (B, predicted_neighbor_num, future_len, 3)
             # Normalize to ego-centric
             if isinstance(aug, StatePerturbation):
                 inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(
@@ -64,8 +67,11 @@ def train_epoch(data_loader,
                 inputs, near_future_gt_3_dim = aug(inputs, near_future_gt_3_dim,
                                                    args)
 
-            mask = torch.sum(torch.ne(near_future_gt_3_dim[..., :3], 0),
-                             dim=-1) == 0
+            # near_future_mask: (B, predicted_neighbor_num, future_len) # if all zeros in (x, y, yaw), then near_future_mask is True.
+            near_future_mask = torch.sum(torch.ne(near_future_gt_3_dim[..., :3],
+                                                  0),
+                                         dim=-1) == 0
+
             # (B, predicted_neighbor_num, future_len, 3) -> (B, predicted_neighbor_num, future_len, 4)
             near_future_gt_4_dim = torch.cat(
                 [
@@ -78,7 +84,7 @@ def train_epoch(data_loader,
                 ],
                 dim=-1,
             )
-            near_future_gt_4_dim[mask] = 0.
+            near_future_gt_4_dim[near_future_mask] = 0.
             if not torch.isfinite(near_future_gt_4_dim).all():
                 raise ValueError(
                     "Non-finite values detected in near_future_gt_4_dim")
@@ -89,13 +95,13 @@ def train_epoch(data_loader,
             loss = {}
             """
             near_future_gt_4_dim.shape: [8, 10, 80, 4]
-            mask.shape: [8, 10, 80]
+            near_future_mask.shape: [8, 10, 80]
             """
             loss, _ = diffusion_loss_func(
                 model, norm_inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
-                (near_future_gt_4_dim, mask), args.state_normalizer, loss,
-                args.diffusion_model_type)
+                (near_future_gt_4_dim, near_future_mask), args.state_normalizer,
+                loss, args.diffusion_model_type)
             loss["loss"] = loss["neighbor_prediction_loss"]
 
             total_loss = loss["loss"].item()  # scalar
@@ -104,6 +110,7 @@ def train_epoch(data_loader,
             loss["loss"].backward()
 
             nn.utils.clip_grad_norm_(model.parameters(), 5)
+            scheduler.step()
             optimizer.step()
 
             if ema is not None:

@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Tuple
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
@@ -54,7 +54,7 @@ from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from requests.exceptions import HTTPError
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
-from diffusion_planner.utils.lr_schedule import CosineAnnealingWarmUpRestarts
+from diffusion_planner.utils.lr_schedule import CosineAnnealingWarmUpRestarts, build_pytorch_warmup_cosine_scheduler
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
@@ -82,10 +82,10 @@ def _effective_global_batch(batch_size: int, world_size: int) -> int:
 
 # === [NEW] Epoch auto-scaling by global batch ===============================
 def _auto_scale_train_epochs(
-    base_global_batch: int,
-    base_epochs: int,
-    current_global_batch: int,
-    beta: float = 0.4,
+    base_global_batch: int,  # B_0 = 2048
+    base_epochs: int,  # E_0 = 500
+    current_global_batch: int,  # B = 실제 글로벌 배치
+    beta: float = 1.,
     clamp_min: Optional[int] = 1,
     clamp_max: Optional[int] = None,
 ) -> int:
@@ -95,14 +95,15 @@ def _auto_scale_train_epochs(
     - clamp_min/clamp_max: 필요 없는 경우 None
     """
     if current_global_batch <= 0 or base_global_batch <= 0:
-        return int(base_epochs)
-    k = float(current_global_batch) / float(base_global_batch)
-    scaled = int(round(float(base_epochs) * (k**float(beta))))
+        raise ValueError("Global batch sizes must be positive integers.")
+    k = float(current_global_batch) / float(base_global_batch)  # B / B_0
+    scaled_epochs = int(round(float(base_epochs) *
+                              (k**float(beta))))  # E_0 * (B / B_0)^β
     if clamp_min is not None:
-        scaled = max(int(clamp_min), scaled)
+        scaled_epochs = max(int(clamp_min), scaled_epochs)
     if clamp_max is not None:
-        scaled = min(int(clamp_max), scaled)
-    return scaled
+        scaled_epochs = min(int(clamp_max), scaled_epochs)
+    return scaled_epochs
 
 
 def pnn_schedule(
@@ -331,7 +332,7 @@ def get_args():
     parser.add_argument('--learning_rate',
                         type=float,
                         help='learning rate (default: 5e-4)',
-                        default=5e-4)
+                        default=1e-3)
     parser.add_argument('--warm_up_epoch',
                         type=int,
                         help='number of warm up',
@@ -575,41 +576,31 @@ def model_training(args):
     global_rank, rank, _ = ddp.ddp_setup_universal(True, args)
     world_size = ddp.get_world_size()
 
-    # === [NEW] Auto LR by batch-size (root scaling) =========================
+    ########  [LR (1) ] 학습률 선형 스케일링 =========================
     BASE_GLOBAL_BATCH = 2048  # 기존 기준 글로벌 배치
-    BASE_LR = 5e-4  # 기존 기준 LR (Adam/AdamW)
+    BASE_LR = args.learning_rate  # 기존 기준 LR (Adam/AdamW)
 
     # DataLoader가 실제로 사용할 글로벌 배치(정수 배수)로 계산
     current_global_batch = _effective_global_batch(args.batch_size, world_size)
-    scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
+    scale = current_global_batch / float(BASE_GLOBAL_BATCH)
     args.learning_rate = BASE_LR * scale
-
-    # === [NEW] Epoch auto-scaling (beta=0.4, fast-oriented) =================
+    ################################################################
+    ########  [LR (2) ] epoch scaling (keep total steps constant) ########
     # - 앵커 에폭은 "현재 args.train_epochs"를 기준(기본 500)
-    EPOCH_BETA = 0.3
-    base_epochs_anchor = int(args.train_epochs)
+    EPOCH_BETA = 1
+    base_epochs_anchor = int(args.train_epochs)  # 500
 
     scaled_epochs = _auto_scale_train_epochs(
-        base_global_batch=BASE_GLOBAL_BATCH,
-        base_epochs=base_epochs_anchor,
-        current_global_batch=current_global_batch,
-        beta=EPOCH_BETA,
+        base_global_batch=BASE_GLOBAL_BATCH,  # B_0 = 2048
+        base_epochs=base_epochs_anchor,  # E_0 = 500
+        current_global_batch=current_global_batch,  # B = 실제 글로벌 배치
+        beta=EPOCH_BETA,  # 1
         clamp_min=max(1, args.warm_up_epoch + 1),  # warmup 안전
         clamp_max=None,  # 필요하면 예: 2000 등
     )
     args.train_epochs = int(scaled_epochs)
 
     if global_rank == 0:
-        # Logging
-        print("------------- {} -------------".format(args.name))
-        k = current_global_batch / float(BASE_GLOBAL_BATCH)
-        print(
-            f"[Epoch Auto-Scale] base_epochs={base_epochs_anchor}, beta={EPOCH_BETA}, "
-            f"B={current_global_batch} (k={k:.3f}) -> train_epochs={args.train_epochs}"
-        )
-        print("Batch size: {}".format(args.batch_size))
-        print("Learning rate: {}".format(args.learning_rate))
-        print("Use device: {}".format(args.device))
 
         if args.resume_local_path_model_path is not None:
             # resume_local_path_model_path: ./training_log/npc_aug_n_ego_past/2025-08-06-07:23:04/
@@ -673,6 +664,20 @@ def model_training(args):
                                        num_replicas=ddp.get_world_size(),
                                        rank=global_rank,
                                        shuffle=True)
+    ################################################################
+    ######## [LR (3) ] T_w,0  (warmup_steps_at_B0) 구하기 = 배치 B_0에서의 워밍업 스텝 수 ##############
+    # (배치 B_0에서의 에폭당 스텝 수 * 워밍업 에폭 수(args.warm_up_epoch))
+    N = len(train_set)
+    steps_per_epoch_at_B0 = math.ceil(
+        N / float(BASE_GLOBAL_BATCH))  # B_0=2048에서의 epoch당 스텝 수
+    warmup_steps_at_B0 = steps_per_epoch_at_B0 * args.warm_up_epoch
+    ratio = current_global_batch / float(BASE_GLOBAL_BATCH)
+    ####### T_w(B) (warmup_steps) 구하기 : 배치 B에서의 워밍업 스텝 수 ##############
+    WARMUP_SCALE_EXP = 0.5
+    # : warmup_steps
+    warmup_steps = math.ceil(warmup_steps_at_B0 *
+                             ratio**WARMUP_SCALE_EXP)  # B에서의 워밍업 스텝 수
+    ###########################################################
     train_loader = DataLoader(train_set,
                               sampler=train_sampler,
                               batch_size=batch_size // ddp.get_world_size(),
@@ -680,9 +685,26 @@ def model_training(args):
                               prefetch_factor=args.prefetch_factor,
                               pin_memory=args.pin_mem,
                               drop_last=True)
-
+    ############## [LR (2) ] T: 총 업데이트 스텝 수 (유지 대상) 구하기 ####################
+    total_update_steps = args.train_epochs * len(train_loader)
+    ################################################################################
+    # 실제 글로벌 배치 크기(정확)
+    world_size = ddp.get_world_size()
+    bs_per_rank = args.batch_size // world_size
+    global_batch_size = bs_per_rank * world_size
+    # 에폭당 처리 샘플 수 (drop_last이므로 len(loader)*global_batch_size)
+    # samples_this_epoch: N
+    samples_this_epoch = len(train_loader) * global_batch_size
     if global_rank == 0:
+        print("==========[Learning HYPERPARAMETER INFO]===============")
         print("Dataset Prepared: {} train data\n".format(len(train_set)))
+        print(f"[Schedule] B0={BASE_GLOBAL_BATCH}, B={current_global_batch}, "
+              f"eta_max={args.learning_rate:.3e}, "
+              f"E(B)={args.train_epochs}, "
+              f"steps/epoch={len(train_loader)}, "
+              f"T={total_update_steps}, "
+              f"Tw0={warmup_steps_at_B0}, Tw(B)={warmup_steps}")
+        print("=====================================================")
 
     if args.ddp:
         torch.distributed.barrier()
@@ -708,14 +730,18 @@ def model_training(args):
     optimizer, extra_nwd = build_adamw_with_param_groups(
         model=base_model,
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        weight_decay=args.weight_decay,  # 1e-2
         include_seed_params=True,
         # ← seeds/ego_fut_seeds도 no-decay에 포함(원치 않으면 False)
     )
-
-    scheduler = CosineAnnealingWarmUpRestarts(optimizer, train_epochs,
-                                              args.warm_up_epoch)
-
+    ############## [LR (4) ] 선형 워밍업 -> 코사인 디케이 (스케쥴) ##########################
+    scheduler = build_pytorch_warmup_cosine_scheduler(optimizer,
+                                                      total_update_steps,
+                                                      warmup_steps,
+                                                      eta_min=0.05 *
+                                                      args.learning_rate)
+    # if warmup_steps > 0:
+    #     scheduler.step()  # 초기 LR을 warmup 첫 값으로 세팅
     allow_val_change = False
     if args.resume_local_path_model_path is not None:
         print(f"Model loaded from {args.resume_local_path_model_path}")
@@ -764,13 +790,14 @@ def model_training(args):
 
     # begin training
     for epoch in range(init_epoch, train_epochs):
-        scheduler.step()
+        # scheduler.step()
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
         epoch_t0 = time.perf_counter()
         train_loss, train_total_loss = train_epoch(train_loader,
                                                    diffusion_planner, optimizer,
-                                                   args, model_ema, aug)
+                                                   args, model_ema, scheduler,
+                                                   aug)
         if args.device.startswith('cuda'):
             torch.cuda.empty_cache()
         # === [추가] 에폭 종료 시간 & 에폭 속도 계산 ===
@@ -779,12 +806,6 @@ def model_training(args):
             torch.distributed.barrier()
         epoch_time_sec = time.perf_counter() - epoch_t0
 
-        # 실제 글로벌 배치 크기(정확)
-        world_size = ddp.get_world_size()
-        bs_per_rank = args.batch_size // world_size
-        global_batch_size = bs_per_rank * world_size
-        # 에폭당 처리 샘플 수 (drop_last이므로 len(loader)*global_batch_size)
-        samples_this_epoch = len(train_loader) * global_batch_size
         epoch_sps = samples_this_epoch / max(epoch_time_sec, 1e-9)
         ###########################
         if global_rank == 0:
