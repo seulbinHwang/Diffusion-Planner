@@ -25,7 +25,7 @@ class DiffusionPlannerData(Dataset):
     def __getitem__(self, idx):
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
 
-        ego_future_gt_11_dim = data["ego_future_gt_11_dim"]
+        # ego_future_gt_11_dim = data["ego_future_gt_11_dim"]
 
         neighbor_agents_past = data["neighbor_agents_past"][:self.
                                                             _past_neighbor_num]
