@@ -308,6 +308,15 @@ class Decoder(nn.Module):
                     src = _cast_like(cond_last_pos, xt)  # (B, Pnn, 4)
                     last = torch.where(cond_last_mask.unsqueeze(-1), src, last)
                     xt[:, :, -1, :] = last
+                # --- add: unit‑circle projection for future frames only ---
+                # xt: (B, Pnn, 1 + T, 4)
+                yaw = xt[:, :, 1:, 2:4]  # exclude current (index 0)
+                norm = torch.linalg.norm(yaw, dim=-1, keepdim=True).clamp_min(
+                    1e-6) # (B, Pnn, T, 1)
+                yaw_unit = yaw / norm # (B, Pnn, T, 2)
+                xt[:, :, 1:, 2:4] = yaw_unit
+                # ---------------------------------------------------------
+
                 return xt.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(
