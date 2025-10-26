@@ -741,7 +741,7 @@ def model_training(args):
     scheduler = build_pytorch_warmup_cosine_scheduler(optimizer,
                                                       total_update_steps,
                                                       warmup_steps,
-                                                      eta_min=0.05 *
+                                                      eta_min=0.2 *
                                                       args.learning_rate)
     # if warmup_steps > 0:
     #     scheduler.step()  # 초기 LR을 warmup 첫 값으로 세팅
