@@ -109,7 +109,7 @@ def train_epoch(data_loader,
             # loss backward
             loss["loss"].backward()
 
-            nn.utils.clip_grad_norm_(model.parameters(), 20)
+            nn.utils.clip_grad_norm_(model.parameters(), 15)
             scheduler.step()
             optimizer.step()
 
