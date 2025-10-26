@@ -112,6 +112,15 @@ def train_epoch(data_loader,
             nn.utils.clip_grad_norm_(model.parameters(), 15)
             scheduler.step()
             optimizer.step()
+            # === WD warmdown: lr 비례로 그룹별 WD 갱신 ===
+            for pg in optimizer.param_groups:
+                wd_max = pg.get("wd_max", None)
+                lr_max = pg.get("lr_max", None)
+                if wd_max is None or lr_max is None:
+                    continue  # 안전 장치
+                if wd_max > 0.0 and lr_max > 0.0:
+                    pg["weight_decay"] = wd_max * (pg["lr"] / lr_max)
+            # ===========================================
 
             if ema is not None:
                 ema.update(model)
