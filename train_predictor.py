@@ -294,18 +294,20 @@ def get_args():
                         type=str)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
-    parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument(
-        '--pin-mem',
-        action='store_true',
-        help=
-        'Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.'
-    )
-    parser.add_argument('--no-pin-mem',
-                        action='store_false',
-                        dest='pin_mem',
-                        help='')
-    parser.set_defaults(pin_mem=True)
+    parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--pin_mem', default=True, type=boolean)
+
+    # parser.add_argument(
+    #     '--pin-mem',
+    #     action='store_true',
+    #     help=
+    #     'Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.'
+    # )
+    # parser.add_argument('--no-pin-mem',
+    #                     action='store_false',
+    #                     dest='pin_mem',
+    #                     help='')
+    # parser.set_defaults(pin_mem=True)
 
     # Training
     parser.add_argument('--seed',
@@ -332,15 +334,15 @@ def get_args():
     parser.add_argument('--learning_rate',
                         type=float,
                         help='learning rate (default: 5e-4)',
-                        default=1e-3)
+                        default=5e-4)
     parser.add_argument('--warm_up_epoch',
                         type=int,
                         help='number of warm up',
-                        default=5)
+                        default=10)
     parser.add_argument('--prefetch_factor',
                         type=int,
                         help='number of warm up',
-                        default=2)
+                        default=4)
     parser.add_argument('--encoder_drop_path_rate',
                         type=float,
                         help='encoder drop out rate',
@@ -582,7 +584,7 @@ def model_training(args):
 
     # DataLoader가 실제로 사용할 글로벌 배치(정수 배수)로 계산
     current_global_batch = _effective_global_batch(args.batch_size, world_size)
-    scale = current_global_batch / float(BASE_GLOBAL_BATCH)
+    scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
     args.learning_rate = BASE_LR * scale
     ################################################################
     ########  [LR (2) ] epoch scaling (keep total steps constant) ########
@@ -684,6 +686,7 @@ def model_training(args):
                               num_workers=args.num_workers,
                               prefetch_factor=args.prefetch_factor,
                               pin_memory=args.pin_mem,
+                              persistent_workers=True, # 에폭이 바뀌어도 워커 유지
                               drop_last=True)
     ############## [LR (2) ] T: 총 업데이트 스텝 수 (유지 대상) 구하기 ####################
     total_update_steps = args.train_epochs * len(train_loader)

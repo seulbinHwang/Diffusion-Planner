@@ -31,34 +31,34 @@ def train_epoch(data_loader,
             # prepare data
             inputs = {
                 "ego_agent_past":
-                    batch[0].to(args.device),
+                    batch[0].to(args.device, non_blocking=True),
                 # "ego_current_state":
                 #     batch[1].to(args.device),
                 "neighbor_agents_past":
-                    batch[3].to(args.device),
+                    batch[3].to(args.device, non_blocking=True),
                 "lanes":
-                    batch[4].to(args.device),
+                    batch[4].to(args.device, non_blocking=True),
                 "lanes_speed_limit":
-                    batch[5].to(args.device),
+                    batch[5].to(args.device, non_blocking=True),
                 "lanes_has_speed_limit":
-                    batch[6].to(args.device),
+                    batch[6].to(args.device, non_blocking=True),
                 "route_lanes":
-                    batch[7].to(args.device),
+                    batch[7].to(args.device, non_blocking=True),
                 "route_lanes_speed_limit":
-                    batch[8].to(args.device),
+                    batch[8].to(args.device, non_blocking=True),
                 "route_lanes_has_speed_limit":
-                    batch[9].to(args.device),
+                    batch[9].to(args.device, non_blocking=True),
                 "static_objects":
-                    batch[10].to(args.device),
+                    batch[10].to(args.device, non_blocking=True),
                 "planner_future_11_dim":
-                    batch[12].to(args.device),
+                    batch[12].to(args.device, non_blocking=True),
                 "agent_route_lane_order":
-                    batch[13].to(args.device, dtype=torch.long),
+                    batch[13].to(args.device, dtype=torch.long, non_blocking=True),
             }
 
-            ego_future_gt_3_dim = batch[2].to(args.device)
+            ego_future_gt_3_dim = batch[2].to(args.device, non_blocking=True)
             near_future_gt_3_dim = batch[11].to(
-                args.device)  # (B, predicted_neighbor_num, future_len, 3)
+                args.device, non_blocking=True)  # (B, predicted_neighbor_num, future_len, 3)
             # Normalize to ego-centric
             if isinstance(aug, StatePerturbation):
                 inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(
@@ -109,7 +109,7 @@ def train_epoch(data_loader,
             # loss backward
             loss["loss"].backward()
 
-            nn.utils.clip_grad_norm_(model.parameters(), 5)
+            nn.utils.clip_grad_norm_(model.parameters(), 20)
             scheduler.step()
             optimizer.step()
 
