@@ -253,7 +253,7 @@ def diffusion_loss_func(
     # [add] ---- 시간 가중치(half-life) 적용 ------------------------------------
     # half-life과 dt(초)는 필요 시 조정 가능
     time_step_s: float = 0.1  # 0.1초 간격(데이터/시뮬 규격에 맞게 조정)
-    half_life_s: float = 0.5  # 2초에서 가중치 1/2
+    half_life_s: float = 2.  # 2초에서 가중치 1/2
     w_t: torch.Tensor = _build_half_life_weights(
         T,  # 80
         dt_s=time_step_s,  # 0.1
