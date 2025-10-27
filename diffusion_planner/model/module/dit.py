@@ -429,7 +429,7 @@ class DiTBlock(nn.Module):
     def _compute_global_adaln(
         self,
         global_condition: torch.
-        Tensor,  # (B, D)  = ego_fut_global + t_embedding
+        Tensor,  # (B, D)  t_embedding
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor]:
         """전역 조건으로부터 (B, D) 모듈레이션 6개를 계산합니다."""

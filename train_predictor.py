@@ -745,10 +745,10 @@ def model_training(args):
         pg.setdefault("wd_max",
                       float(pg.get("weight_decay", 0.0)))  # 그룹별 WD 기준값
     # ↑↑↑
-
     ############## [LR (4) ] 선형 워밍업 -> 코사인 디케이 (스케쥴) ##########################
+    pseudo_total_update_steps = 110000
     scheduler = build_pytorch_warmup_cosine_scheduler(optimizer,
-                                                      total_update_steps,
+                                                      pseudo_total_update_steps,
                                                       warmup_steps,
                                                       eta_min=0.2 *
                                                       args.learning_rate)
