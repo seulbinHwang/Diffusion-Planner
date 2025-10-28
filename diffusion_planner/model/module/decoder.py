@@ -211,7 +211,7 @@ class Decoder(nn.Module):
                 {
                     ...
                     [training-only] "score": Predicted future states, [B, P, 1 + future_len, 4]
-                    [inference-only] "prediction": Predicted future states, [B, P, future_len, 4]
+                    [inference-only] "prediction": Predicted future states, [B, P, 1 + future_len, 4]
                     ...
                 }
 
