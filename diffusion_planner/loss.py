@@ -85,7 +85,7 @@ def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
     Returns:
         Dict with:
         - 'neighbor_prediction_loss_xy' (float): mean Euclidean distance over neighbor coords.
-        - 'neighbor_prediction_loss_yaw' (float): mean abs angular error (rad) for neighbors.
+        - 'neighbor_prediction_loss_yaw' (float): mean abs angular error (deg) for neighbors.
     """
     # score_denorm[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
     pred_xy = score_denorm[..., :2]  # [B, Pnn, T, 2]

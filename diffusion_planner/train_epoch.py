@@ -53,12 +53,15 @@ def train_epoch(data_loader,
                 "planner_future_11_dim":
                     batch[12].to(args.device, non_blocking=True),
                 "agent_route_lane_order":
-                    batch[13].to(args.device, dtype=torch.long, non_blocking=True),
+                    batch[13].to(args.device,
+                                 dtype=torch.long,
+                                 non_blocking=True),
             }
 
             ego_future_gt_3_dim = batch[2].to(args.device, non_blocking=True)
             near_future_gt_3_dim = batch[11].to(
-                args.device, non_blocking=True)  # (B, predicted_neighbor_num, future_len, 3)
+                args.device,
+                non_blocking=True)  # (B, predicted_neighbor_num, future_len, 3)
             # Normalize to ego-centric
             if isinstance(aug, StatePerturbation):
                 inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(

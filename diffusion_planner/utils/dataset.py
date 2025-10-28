@@ -21,7 +21,6 @@ class DiffusionPlannerData(Dataset):
     def __len__(self):
         return len(self.data_list)
 
-
     def __getitem__(self, idx):
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
         # TODO: revive
@@ -66,11 +65,12 @@ class DiffusionPlannerData(Dataset):
             ###
             "near_future_gt_3_dim": neighbor_agents_future,  # 11 ###
             ### 유일하게 key 이름이 다름.
-            "planner_future_11_dim":  data["ego_agent_future_11_dim"],  # 12 ###
+            "planner_future_11_dim": data["ego_agent_future_11_dim"],  # 12 ###
             "agent_route_lane_order": agent_route_lane_order,  # 13
         }
 
         return tuple(data.values())
+
     # TODO: 수정 필요
     #
     #
