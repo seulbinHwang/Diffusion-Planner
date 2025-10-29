@@ -143,7 +143,7 @@ def diffusion_loss_func(
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
-    futures: Tuple[torch.Tensor, torch.Tensor],
+    futures: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     state_normalizer: StateNormalizer,
     loss: Dict[str, Any],
     model_type: str,
@@ -155,7 +155,7 @@ def diffusion_loss_func(
         ["neighbor_future_gt_3_dim"][:self._predicted_neighbor_num]
     near_future_mask.shape: [8, Pnn, 80] # [B, Pnn, T]
     """
-    near_future_gt_4_dim, near_future_mask = futures
+    near_future_gt_4_dim, near_future_cont_gt, near_future_mask = futures
     near_future_gt_4_dim = _require_finite("near_future_gt_4_dim",
                                            near_future_gt_4_dim)
 
@@ -174,8 +174,7 @@ def diffusion_loss_func(
     B, Pnn, T, _ = near_future_gt_4_dim.shape
     # ego_current: [B, 4]
     # neighbors_current: [B, Pnn, 4]
-    near_current_xyyaw_norm = norm_inputs["neighbor_agents_past"][:, :Pnn,
-                                                                  -1, :4]
+    near_current_xyyaw_norm = norm_inputs["neighbor_agents_past"][:, :Pnn, -1, :4]
     # near_current_mask: [B, Pnn]
     near_current_mask = torch.sum(torch.ne(near_current_xyyaw_norm[..., :4], 0),
                                   dim=-1) == 0  # [B, Pnn]
@@ -197,6 +196,8 @@ def diffusion_loss_func(
     # near_cur_future_norm_gt: [B, Pnn, 1+T, 4]
     normed_near_future_gt_4_dim = state_normalizer(
         near_future_gt_4_dim)  # (B, Pnn, T, 4)
+    normed_near_future_cont_gt = state_normalizer(
+        near_future_cont_gt)  # (B, Pnn, T, 3)
     normed_near_future_gt_4_dim[near_future_mask] = 0.0
     cond_last_pos_norm = normed_near_future_gt_4_dim[:, :, -1, :]  # [B, Pnn, 4]
     normed_near_future_gt_4_dim = _require_finite(
@@ -238,6 +239,7 @@ def diffusion_loss_func(
 
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
     score = decoder_output["score"][:, :, 1:, :]  # (B, Pnn, T, 4)
+    control_score = decoder_output["control_score"] # (B, Pnn, T, 4)
     score = _require_finite("decoder_output['score']", score)
     assert score.shape == (B, Pnn, T, 4)
 
@@ -246,7 +248,11 @@ def diffusion_loss_func(
     elif model_type == "x_start":
         # near_future_gt_4_dim: [B, Pnn, T, 4]
         # dpm_loss: (B, Pnn, T)
-        dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
+        dpm_loss_xyyaw = torch.sum((score - near_future_norm_gt)**2, dim=-1)
+        dpm_loss_cont = torch.sum((control_score - normed_near_future_cont_gt)**2, dim=-1)
+        """
+        TODO [cont] loss 제대로 구현해야 함
+        """
     # near_future_valid: [B, Pnn, T]
     valid = near_future_valid.float()
 

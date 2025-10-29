@@ -29,7 +29,62 @@ PALE_CYAN = "#BFFFFF"  # 미래 궤적 refined 예측 값 # EGO Planner 궤적 �
 LIGHT_CYAN = "#80FFFF"  # 미래 궤적 refined state 값 # EGO Planner 궤적 next state 값
 BRIGHT_CYAN = "#40FFFF"  # neighbor_future_gt_3_dim
 CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim) # ego_future_gt_11_dim
+from typing import Tuple, Optional
 
+def _heading_unit_vectors_from_yaw(yaw: float) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """yaw(라디안)로부터 body 좌표계의 단위 축 벡터를 생성한다.
+
+    Args:
+        yaw (float): 헤딩 각(라디안).
+
+    Returns:
+        Tuple[Tuple[float,float], Tuple[float,float]]:
+            - (h_x, h_y): body x축(전방) 단위벡터  # = (cos(yaw), sin(yaw))
+            - (l_x, l_y): body y축(좌측) 단위벡터  # = (-sin(yaw), cos(yaw))
+    """
+    c = float(np.cos(yaw))
+    s = float(np.sin(yaw))
+    return (c, s), (-s, c)
+
+
+def add_metric_arrow(ax: plt.Axes,
+                     x: float,
+                     y: float,
+                     dx: float,
+                     dy: float,
+                     color: str,
+                     line_width: float,
+                     alpha: Optional[float] = None,
+                     zorder: int = 15) -> None:
+    """길이 자체가 (dx, dy)인 **실제 길이** 화살표를 그린다(정규화/고정길이 아님).
+
+    Args:
+        ax (plt.Axes): Matplotlib Axes.
+        x (float): 시작점 x [m]
+        y (float): 시작점 y [m]
+        dx (float): 끝점까지의 x 변화량 [m]
+        dy (float): 끝점까지의 y 변화량 [m]
+        color (str): 선 색상
+        line_width (float): 선 두께
+        alpha (Optional[float]): 투명도(옵션)
+        zorder (int): z-order
+    """
+    if (abs(dx) + abs(dy)) < 1e-9:
+        return
+    ax.add_patch(
+        FancyArrowPatch(
+            (x, y),
+            (x + dx, y + dy),
+            arrowstyle="-|>",
+            mutation_scale=4.0,
+            linewidth=line_width,
+            color=color,
+            alpha=alpha,
+            zorder=zorder,
+            shrinkA=0.0,
+            shrinkB=0.0,
+        )
+    )
 
 # [ADD]
 def _collect_valid_xy_from_input_data(
@@ -264,54 +319,126 @@ def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
     return bool((abs(float(row3[0])) > eps) or (abs(float(row3[1])) > eps))
 
 
-def draw_neighbor_future_gt_3_dim(
+def draw_diff_token_to_future_gt_3_dim(
         ax: plt.Axes,
         diff_token_to_future_gt_3_dim: Dict[str, Array],
         options,
-        draw_token_list: Optional[List[str]] = None) -> None:
+        draw_token_list: Optional[List[str]] = None,
+        diff_token_to_future_cont_gt: Optional[Dict[str, Array]] = None,  # (future_len, 3)  # V_x^b, V_y^b, yaw_rate
+) -> None:
     """
-    # Dict[str, np.ndarray] # len : valid_agent_num
+    diff_token_to_future_cont_gt 는 (V_x^b, V_y^b, yaw_rate) 시퀀스.
+    - options.DIFF_draw_diff_future_cont_gt_vel:
+        각 점에서 body x축(heading) 방향으로 Vx^b, body y축(heading의 좌측 법선) 방향으로 Vy^b 만큼의 화살표를 그림.
+        그리고 합성 속력 ||v^b|| 를 km/h로 환산해 화살표 끝 부근에 텍스트로 표시.
+    - options.DIFF_draw_diff_future_cont_gt_yaw_rate:
+        각 점 좌표 옆에 yaw_rate(deg/s)를 텍스트로 표시.
 
-    neighbor_future_gt_3_dim (agent_num, future_len, 3=[x,y,yaw])를
-    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..agent_num-1)를 흰색으로 표기.
-
-    규칙:
-      - invalid: |x|<=eps and |y|<=eps → 스킵
-      - 마커: 흰색 'x', 선 없음
-      - 라벨: 첫 점이 유효할 때만 표시
+    future_gt_3_dim: (future_len, 3) = [x, y, yaw]
     """
-
     eps = options.invalid_eps
+    lw = 0.4  # 화살표 선 두께(적당한 기본값)
+
     for track_token, future_gt_3_dim in diff_token_to_future_gt_3_dim.items():
         if draw_token_list is not None and track_token not in draw_token_list:
             continue
-        future_len = future_gt_3_dim.shape[0]
-        # 모든 유효 포인트를 x마커로 그리기
+
+        # 대응하는 제어 GT(속도/요레이트) 시퀀스
+        future_cont_gt = None
+        if diff_token_to_future_cont_gt is not None:
+            future_cont_gt = diff_token_to_future_cont_gt.get(track_token, None)
+            # future_cont_gt: (future_len, 3)
+
+        future_len = int(future_gt_3_dim.shape[0])
+
+        # ── (A) 위치 마커(x) ─────────────────────────────────────────
         for t in range(future_len):
-            row = future_gt_3_dim[t]
+            row = future_gt_3_dim[t]  # (3,) = [x, y, yaw]
             if not is_valid_future_row_xyyaw(row, eps):
                 continue
-            x, y = float(row[0]), float(row[1])
-            ax.plot(x,
-                    y,
-                    marker='x',
-                    markersize=options.DIFF_future_gt_3_dim_marker_size,
-                    linestyle='None',
+            x, y, yaw = float(row[0]), float(row[1]), float(row[2])
+
+            # 위치 'x' 마커
+            ax.plot(
+                x, y,
+                marker='x',
+                markersize=options.DIFF_future_gt_3_dim_marker_size,
+                linestyle='None',
+                color=options.DIFF_future_gt_3_dim_COLOR,
+                zorder=26,
+            )
+
+            # ── (B) 제어(속도 벡터/요레이트 텍스트) 오버레이 ───────────
+            if future_cont_gt is None :
+                continue
+
+            vx_b, vy_b, yaw_rate = map(float, future_cont_gt[t])  # (m/s, m/s, rad/s)
+
+            # (B-1) 속도 화살표(옵션)
+            if options.DIFF_draw_diff_future_cont_gt_vel:
+                # body 축 단위벡터(전방/좌측)
+                (hx, hy), (lx, ly) = _heading_unit_vectors_from_yaw(yaw)
+
+                # Vx, Vy 를 월드 좌표로 투영한 실제 길이 화살표
+                dx_vx, dy_vx = vx_b * hx, vx_b * hy
+                dx_vy, dy_vy = vy_b * lx, vy_b * ly
+
+                add_metric_arrow(
+                    ax, x, y, dx_vx, dy_vx,
                     color=options.DIFF_future_gt_3_dim_COLOR,
-                    zorder=26)
+                    line_width=lw, zorder=27
+                )
+                add_metric_arrow(
+                    ax, x, y, dx_vy, dy_vy,
+                    color=options.DIFF_future_gt_3_dim_COLOR,
+                    line_width=lw, zorder=27
+                )
+
+                # 합성 속력(‖v^b‖) [km/h] 텍스트: 화살표 끝(합성) 근처에 표기
+                speed_kmh = float(np.hypot(vx_b, vy_b)) * 3.6
+                end_x = x + dx_vx + dx_vy
+                end_y = y + dy_vx + dy_vy
+                # 텍스트가 겹치지 않도록 Vy 부호에 따라 법선 방향으로 살짝 오프셋
+                sign = 1.0 if vy_b >= 0.0 else -1.0
+                offset = 0.5  # [m]
+                text_x = end_x + offset * (-ly) * sign
+                text_y = end_y + offset * (lx) * sign
+                ax.text(
+                    text_x, text_y,
+                    f"{speed_kmh:.1f}",
+                    color=options.DIFF_future_gt_3_dim_token_color,
+                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                    ha="center", va="bottom",
+                    zorder=28, clip_on=True
+                )
+
+            # (B-2) yaw rate 텍스트(옵션)
+            if options.DIFF_draw_diff_future_cont_gt_yaw_rate:
+                yaw_rate_deg = float(np.degrees(yaw_rate))
+                ax.text(
+                    x + 0.3, y,  # 점 바로 옆
+                    f"{yaw_rate_deg:.1f}°/s",
+                    color=options.DIFF_future_gt_3_dim_token_color,
+                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                    ha="left", va="center",
+                    zorder=28, clip_on=True
+                )
+
         # 첫 점 라벨(유효할 때만)
         if options.DIFF_draw_diff_future_gt_3_dim_token:
             first = future_gt_3_dim[0]
             if is_valid_future_row_xyyaw(first, eps):
                 fx, fy = float(first[0]), float(first[1])
-                ax.text(fx + options.DIFF_future_gt_3_dim_text_offset_m,
-                        fy + options.DIFF_future_gt_3_dim_text_offset_m,
-                        str(track_token)[:5],
-                        color=options.DIFF_future_gt_3_dim_token_color,
-                        fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
-                        ha='left',
-                        va='bottom',
-                        zorder=30)
+                ax.text(
+                    fx + options.DIFF_future_gt_3_dim_text_offset_m,
+                    fy + options.DIFF_future_gt_3_dim_text_offset_m,
+                    str(track_token)[:5],
+                    color=options.DIFF_future_gt_3_dim_token_color,
+                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                    ha='left', va='bottom',
+                    zorder=30
+                )
+
 
 
 # =============================================================================
@@ -378,8 +505,8 @@ class DrawingOptions:
     ######## LANES ########
     LANE_draw_lane_boundaries: bool = True  # check
     LANE_boundary_width: float = 1.
-    LANE_draw_lane_centerline: bool = True  # check
-    LANE_draw_npc_agent_route: bool = True
+    LANE_draw_lane_centerline: bool = False  # check
+    LANE_draw_npc_agent_route: bool = False
     LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
     LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
@@ -418,7 +545,7 @@ class DrawingOptions:
     EGO_draw_ego_agent_next_11_vel: bool = False
     ###################################################
     ########### [EGO] FUTURE PLANNER ##################
-    EGO_draw_planner_future_11_dim: bool = True  # check
+    EGO_draw_planner_future_11_dim: bool = False  # check
     EGO_planner_future_11_style = {
         "line_color": PALE_CYAN,
         "line_width": 1.4,
@@ -442,7 +569,7 @@ class DrawingOptions:
     ######### [NEIGHBOR] #########
     ########### [NEIGHBOR] PAST ##################
     NEI_draw_neighbor_past: bool = True  # check
-    NEI_draw_neighbor_only_current: bool = True  # check
+    NEI_draw_neighbor_only_current: bool = False  # check
     NEI_draw_velocity_arrow: bool = False  # check
     NEI_draw_velocity_text: bool = False  # check
     NEI_vel_text_y_offset: float = 0.5
@@ -491,13 +618,17 @@ class DrawingOptions:
     NEI_neighbor_past_output_token_fontsize = 2
     ########################
     ######### [NEIGHBOR] FUTURE GT #############
-    DIFF_draw_diff_future_gt_3_dim: bool = False
+    DIFF_draw_diff_future_gt_3_dim: bool = True
+    DIFF_draw_diff_future_cont_gt: bool = True
+    DIFF_draw_diff_future_cont_gt_vel: bool = True
+    DIFF_draw_diff_future_cont_gt_yaw_rate: bool = False
     DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
     DIFF_draw_diff_future_gt_3_dim_token: bool = False
     DIFF_future_gt_3_dim_text_offset_m: float = 0.  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
     DIFF_future_gt_3_dim_token_color: str = BRIGHT_CYAN
     DIFF_future_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
+    ########## [NEIGHBOR] FUTURE CONT GT #############
     ############################################
     DIFF_draw_diff_future_all_gt_3_dim: bool = False
     DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
@@ -521,7 +652,7 @@ class DrawingOptions:
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
-    DIFF_draw_diff_future_slip_traj: bool = True
+    DIFF_draw_diff_future_slip_traj: bool = False
     DIFF_future_slip_style = {
         "line_color": ORANGE,  # 빨간색(밝은 빨강)
         "token_color": ORANGE,  # 빨간색(밝은 빨강)
@@ -2070,10 +2201,15 @@ def draw_neighbor_future_all(ax: plt.Axes,
     ### [NEIGHBOR FUTURE GT] ###
     diff_token_to_future_gt_3_dim = input_data.get(
         "diff_token_to_future_gt_3_dim", None)
+    if draw_option.DIFF_draw_diff_future_cont_gt:
+        diff_token_to_future_cont_gt = input_data.get(
+            "diff_token_to_future_cont_gt", None)
+    else:
+        diff_token_to_future_cont_gt = None
     if draw_option.DIFF_draw_diff_future_gt_3_dim and (
             diff_token_to_future_gt_3_dim is not None):
-        draw_neighbor_future_gt_3_dim(ax, diff_token_to_future_gt_3_dim,
-                                      draw_option, draw_token_list)
+        draw_diff_token_to_future_gt_3_dim(ax, diff_token_to_future_gt_3_dim,
+                                      draw_option, draw_token_list, diff_token_to_future_cont_gt)
     ### [NEIGHBOR FUTURE OUTPUT] ###
     diff_token_to_np_gen_traj_11_wrt_ego = output_data.get(
         "diff_token_to_np_gen_traj_11_wrt_ego", None)

@@ -51,15 +51,18 @@ def train_epoch(data_loader,
                 "static_objects":
                     batch[10].to(args.device, non_blocking=True),
                 "planner_future_11_dim":
-                    batch[12].to(args.device, non_blocking=True),
+                    batch[13].to(args.device, non_blocking=True),
                 "agent_route_lane_order":
-                    batch[13].to(args.device,
+                    batch[14].to(args.device,
                                  dtype=torch.long,
                                  non_blocking=True),
             }
 
             ego_future_gt_3_dim = batch[2].to(args.device, non_blocking=True)
             near_future_gt_3_dim = batch[11].to(
+                args.device,
+                non_blocking=True)  # (B, predicted_neighbor_num, future_len, 3)
+            near_future_cont_gt = batch[12].to(
                 args.device,
                 non_blocking=True)  # (B, predicted_neighbor_num, future_len, 3)
             # Normalize to ego-centric
@@ -103,7 +106,7 @@ def train_epoch(data_loader,
             loss, _ = diffusion_loss_func(
                 model, norm_inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
-                (near_future_gt_4_dim, near_future_mask), args.state_normalizer,
+                (near_future_gt_4_dim, near_future_cont_gt, near_future_mask), args.state_normalizer,
                 loss, args.diffusion_model_type)
             loss["loss"] = loss["neighbor_prediction_loss"]
 

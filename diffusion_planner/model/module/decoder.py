@@ -271,6 +271,13 @@ class Decoder(nn.Module):
                 near_future_norm_xT, near_current_mask, cond_last_pos_norm)
             diffusion_time = inputs['diffusion_time']
             # (B, Pnn, T , 4)
+            """
+            TODO [cont]
+            
+            self.DiT의 출력이 제어값이 되어야 함.
+            
+            그리고 여기에 feasibility projector + 적분 기능을 추가해야 함
+            """
             score = self.dit(
                 near_future_norm_xT,  # ( B, Pnn, T* 4 )
                 diffusion_time,  # (B)
@@ -286,8 +293,7 @@ class Decoder(nn.Module):
             score = score.reshape(B, Pnn, self._future_len, 4)  # (B,Pnn,T,4)
             score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
                               dim=2)  # (B,Pnn,1+T,4)
-
-            return {"score": score}  #  (B, Pnn, (1 + T) , 4)
+            return {"score": score,"raw_control_score": raw_control_score, "control_score": control_score}  #  (B, Pnn, (1 + T) , 4), (B, Pnn, T, 4)
         else:
             noise = near_current_xyyaw.new_empty(
                 (B, Pnn, self._future_len, 4)).normal_(0.0,

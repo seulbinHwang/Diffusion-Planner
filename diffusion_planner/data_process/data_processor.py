@@ -10,9 +10,11 @@ import copy
 import os
 import torch
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
-from typing import Dict, Tuple, Union, List, Optional
+from typing import Dict, Tuple, Union, List, Optional, Any
 from nuplan.common.actor_state.state_representation import Point2D
 import draw_machine
+from scipy.signal import savgol_filter  # type: ignore
+
 # matplotlib 설정 추가
 plt.rcParams['figure.max_open_warning'] = 0  # 경고 메시지 비활성화
 matplotlib.rcParams['figure.max_open_warning'] = 0
@@ -91,7 +93,7 @@ class DataProcessor(object):
     # =========================
     @staticmethod
     def _count_valid_neighbors_by_type(
-            neighbor_agents_past: np.ndarray,  # (N, Tp, 11)
+            neighbor_agents_past: np.ndarray,  # (N, time_len, 11)
     ) -> Tuple[int, int, int]:
         """마지막 시점의 에이전트 상태로 유효/타입을 판정해 수를 셉니다.
 
@@ -103,7 +105,7 @@ class DataProcessor(object):
 
         Args:
             neighbor_agents_past (np.ndarray):
-                - shape: (N, Tp, 11)
+                - shape: (N, time_len, 11)
                 - 마지막 차원 11 = [x, y, cos, sin, vx, vy, width, length, onehot_vehicle, onehot_ped, onehot_bike]
 
         Returns:
@@ -115,7 +117,7 @@ class DataProcessor(object):
         if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[
                 -1] != 11:
             raise ValueError(
-                f"`neighbor_agents_past` shape는 (N, Tp, 11)이어야 합니다. "
+                f"`neighbor_agents_past` shape는 (N, time_len, 11)이어야 합니다. "
                 f"got {neighbor_agents_past.shape}")
 
         # 마지막 시점만 사용
@@ -224,10 +226,10 @@ class DataProcessor(object):
 
         Args:
             neighbor_agents_past (np.ndarray):
-                - shape: (agent_num, Tp, 11)
+                - shape: (agent_num, time_len, 11)
                 - 상대 좌표계 과거 에이전트 시퀀스.
             neighbor_future_gt_3_dim (Optional[np.ndarray], optional):
-                - shape: (agent_num, Tf, 3)
+                - shape: (agent_num, future_len, 3)
                 - 상대 좌표계 미래 에이전트 시퀀스. 기본값 None.
             neighbor_indices (Optional[Union[np.ndarray, List[int]]], optional):
                 - shape: (N,) (N은 agent_num 이하)
@@ -235,9 +237,9 @@ class DataProcessor(object):
 
         Returns:
             Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-                - filtered_neighbor_agents_past:   (agent_num, Tp, 11)
+                - filtered_neighbor_agents_past:   (agent_num, time_len, 11)
                   영역 밖 에이전트는 0으로 채움(개수 고정).
-                - filtered_neighbor_agents_future: (agent_num, Tf, 3) 또는 None
+                - filtered_neighbor_agents_future: (agent_num, future_len, 3) 또는 None
                   입력이 None이 아니면 동일 규칙으로 0 마스킹.
                 - filtered_neighbor_indices:       (N`,) # N`는 N 이하
                   입력 `neighbor_indices`가 주어진 경우에만 반환하며,
@@ -258,12 +260,12 @@ class DataProcessor(object):
         mask_expanded = mask[:, None, None]
 
         # 정사각형 바깥 에이전트는 전체 시퀀스를 0으로 만듦(개수는 고정)
-        # filtered_neighbor_agents_past: (agent_num, Tp, 11)
+        # filtered_neighbor_agents_past: (agent_num, time_len, 11)
         filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
 
         filtered_neighbor_agents_future = None
         if neighbor_future_gt_3_dim is not None:
-            # filtered_neighbor_agents_future: (agent_num, Tf, 3)
+            # filtered_neighbor_agents_future: (agent_num, future_len, 3)
             filtered_neighbor_agents_future = neighbor_future_gt_3_dim * mask_expanded
         # Indices 마스킹 (옵션)
         filtered_neighbor_indices: Optional[np.ndarray] = None
@@ -293,7 +295,7 @@ class DataProcessor(object):
         mask_expanded = mask[:, None, None]
 
         # 정사각형 바깥 에이전트는 전체 시퀀스를 0으로 만듦(개수는 고정)
-        # filtered_neighbor_agents_past: (agent_num, Tp, 11)
+        # filtered_neighbor_agents_past: (agent_num, time_len, 11)
         filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
 
         filtered_neighbor_agents_track_token: List[Optional[str]] = []
@@ -458,7 +460,7 @@ class DataProcessor(object):
                                  self._max_elements, self._max_points)
         # (num_agents, future_len, 3)
         # FOR OPEN-LOOP SIMULATION.
-        # neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
+        # neighbor_future_gt_3_dim = self._get_neighbor_future_gt_5_dim(
         #     scenario, anchor_ego_state, neighbor_agents_past, neighbor_indices,
         #     iteration)  # (num_agents, future_len, 3)
         # FOR CLOSED-LOOP SIMULATION.
@@ -482,7 +484,7 @@ class DataProcessor(object):
                 neighbor_token_id.append(None)
             else:
                 neighbor_token_id.append(self._init_token_to_id[track_token])
-        # (agents_num, 1 + Tf = future_all_len, 3)
+        # (agents_num, 1 + future_len = future_all_len, 3)
         init_future_tracked_objects_array_list = copy.deepcopy(
             self.init_future_tracked_objects_array_list)
         neighbor_future_all_gt_3_dim = agent_future_all_process(
@@ -694,19 +696,20 @@ class DataProcessor(object):
              ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
                  scenario, ego_state, self.num_future_poses,
                  self.future_time_horizon)
-            Tf, Df = ego_future_gt_11_dim.shape
-            assert Tf == self.num_future_poses, (
+            future_len, Df = ego_future_gt_11_dim.shape
+            assert future_len == self.num_future_poses, (
                 "Ego agent future states should have T time steps")
             assert Df == 11, (
                 "Ego agent future states should have 11 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, agent type)"
             )
-            neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
-                scenario, anchor_ego_state, neighbor_agents_past,
-                neighbor_indices)  # (num_agents, future_len, 3)
+            neighbor_future_gt_5_dim = self._get_neighbor_future_gt_5_dim(
+                scenario, anchor_ego_state,
+                neighbor_indices)  # (num_agents, future_len, 5)
+            neighbor_future_gt_3_dim = neighbor_future_gt_5_dim[:, :, :3]  # (num_agents, future_len, 3)
+            # neighbor_future_cont_gt: (num_agents, future_len, 3)
+            neighbor_future_cont_gt = self.neighbor_future_cont_gt(neighbor_agents_past, neighbor_future_gt_5_dim)
             '''
             ego current
-            
-            
             '''
             # ego_agent_past: (T, 11)
             # TODO:ego_current_state 14 차원으로 나옴
@@ -734,6 +737,7 @@ class DataProcessor(object):
                     ego_future_gt_11_dim,  # center x,y # (future_len, 11) # DONE
                 "neighbor_future_gt_3_dim":
                     neighbor_future_gt_3_dim,  # (num_agents, future_len, 3) # DONE
+                "neighbor_future_cont_gt": neighbor_future_cont_gt, # (num_agents, future_len, 3)
             }
             ############################################
             # [ADD] 저장 전 안전 보정 (훈련용 npz)
@@ -751,10 +755,223 @@ class DataProcessor(object):
             self.save_to_disk(self._save_dir, input_data)
             if self.config.save_image:
                 print("Visualizing scenario:", map_name, token)
-                input_data["token_to_future_traj_wrt_ego"] = None,
+                input_data["token_to_future_traj_wrt_ego"] = None
+                input_data = self._convert_input_data_to_draw(input_data, neighbor_track_token)
                 draw_machine.draw_world_model_to_png(input_data,
                                                      output_data=None,
                                                      save_path=save_path)
+
+    def _convert_input_data_to_draw(self,
+                           input_data: Dict[str, np.ndarray], neighbor_track_token: List[Optional[str]]
+                           ) -> Dict[str, Any]:
+        """
+        neighbor_future_gt_3_dim : (num_agents, future_len, 3) -> 
+            diff_token_to_future_gt_3_dim : Dict[str, np.ndarray]
+        neighbor_future_cont_gt : (num_agents, future_len, 3) -> 
+            diff_token_to_future_cont_gt : Dict[str, np.ndarray]
+        
+        # HOW? 
+        1) neighbor_track_token 으로 토큰 리스트 획득
+        """
+        near_track_token = neighbor_track_token[:self.config.predicted_neighbor_num]
+        near_future_gt_3_dim = input_data["neighbor_future_gt_3_dim"][:self.config.predicted_neighbor_num]
+        near_future_cont_gt = input_data["neighbor_future_cont_gt"][:self.config.predicted_neighbor_num]
+        
+        diff_token_to_future_gt_3_dim = {}
+        diff_token_to_future_cont_gt = {}
+        for i, token in enumerate(near_track_token):
+            if token is None:
+                continue
+            diff_token_to_future_gt_3_dim[token] = near_future_gt_3_dim[i] # (future_len, 3)
+            diff_token_to_future_cont_gt[token] = near_future_cont_gt[i] # (future_len, 3)
+        input_data["diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim
+        input_data["diff_token_to_future_cont_gt"] = diff_token_to_future_cont_gt
+        return input_data
+
+    # DataProcessor 클래스 내부에 추가 (헬퍼 함수들)
+    @staticmethod
+    def _cos_sin_to_yaw(cos_yaw: np.ndarray, sin_yaw: np.ndarray) -> np.ndarray:
+        """cos/sin 쌍으로부터 yaw(라디안)를 구한다.
+
+        Args:
+            cos_yaw (np.ndarray): (...,) cos(yaw)
+            sin_yaw (np.ndarray): (...,) sin(yaw)
+
+        Returns:
+            np.ndarray: (...,) yaw [rad]
+        """
+        return np.arctan2(sin_yaw, cos_yaw)
+
+    @staticmethod
+    def _rotate_ego_to_body_velocity(
+            velocity_ego: np.ndarray,  # (N, T, 2)  = [v_x(ego), v_y(ego)]
+            yaw: np.ndarray,  # (N, T)     = body yaw(ego frame 기준)
+    ) -> np.ndarray:  # (N, T, 2)  = [v_x^b, v_y^b]
+        """ego 좌표계 속도를 각 시점의 body 좌표계로 회전한다.
+
+        수식:
+            R(-yaw) * [v_x(ego), v_y(ego)]^T
+            R(-θ) = [[ cosθ,  sinθ],
+                     [-sinθ,  cosθ]]
+
+        Returns:
+            np.ndarray: (N, T, 2) = [v_x^b, v_y^b]
+        """
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+        vx_e = velocity_ego[..., 0]
+        vy_e = velocity_ego[..., 1]
+        vx_b = c * vx_e + s * vy_e
+        vy_b = -s * vx_e + c * vy_e
+        return np.stack([vx_b, vy_b], axis=-1)
+
+    def _savgol_yaw_rate_masked(
+            self,
+            yaw_sequence: np.ndarray,  # (N, T_all)
+            valid_mask: np.ndarray,  # (N, T_all), True=유효
+            dt: float,
+            polyorder: int = 2,
+            max_window_length: int = 11,
+    ) -> np.ndarray:  # (N, T_all)
+        """유효 구간에서만 Savitzky–Golay 1차 미분으로 yaw_rate를 계산한다.
+        유효 구간 밖은 0으로 채운다.
+
+        동작
+        ----
+        - 각 에이전트 i에 대해 valid_mask[i]의 True 구간이 연속이라고 가정(문제에서 보장).
+        - 유효 구간 [i0, i1]만 따로 잘라서 미분.
+          · 창 길이는 min(max_window_length, (i1-i0+1))에서 '홀수'이며 polyorder보다 크게 자동 조정.
+          · 창 길이가 너무 짧으면(np<2 또는 window<=polyorder) 중앙차분(np.gradient)로 대체.
+        """
+        N, T_all = yaw_sequence.shape
+        yaw_rate_all = np.zeros_like(yaw_sequence, dtype=np.float64)
+
+
+        for i in range(N):
+            valid_i = valid_mask[i]  # (T_all,)
+            if not np.any(valid_i):
+                continue
+            idx = np.flatnonzero(valid_i) # 유효 인덱스 리스트
+            i0, i1 = int(idx[0]), int(idx[-1])
+            seq = yaw_sequence[i, i0:i1 + 1]  # (M,)
+
+            M = seq.shape[0]
+            if M < 2:
+                # 샘플이 1개면 미분 0
+                continue
+
+            # 창 길이 선택(홀수, polyorder보다 크게)
+            win = min(max_window_length, M)
+            if win % 2 == 0:
+                win -= 1
+            while win > M or win <= polyorder:
+                win -= 2
+            if win < 3:  # 여전히 너무 짧으면 gradient
+                yaw_rate_valid = np.gradient(seq, dt)
+            else:
+                yaw_rate_valid = savgol_filter(
+                    seq,
+                    window_length=win,
+                    polyorder=polyorder,
+                    deriv=1, # 1차 미분을 돌려달라는 뜻
+                    delta=dt,
+                    mode="interp",
+                )
+
+            yaw_rate_all[i, i0:i1 + 1] = yaw_rate_valid
+
+        return yaw_rate_all
+
+    def neighbor_future_cont_gt(
+            self,
+            neighbor_agents_past: np.ndarray,  # (N, time_len, 11)
+            neighbor_future_gt_5_dim: np.ndarray
+            # (N, future_len, 5) = [x(ego), y(ego), yaw, v_x(ego), v_y(ego)]
+    ) -> np.ndarray:  # (N, future_len, 3) = [v_x^b, v_y^b, yaw_rate]
+        """미래 구간의 GT 제어열 (v_x^b, v_y^b, yaw_rate)를 생성한다.
+
+        핵심 처리
+        ----------
+        - 유효/무효 마스크를 만들어 **유효 구간(과거 유효 시작 ~ 미래 유효 끝)** 에서만 Savitzky–Golay로 yaw_rate 계산.
+        - 유효 구간 밖(무효 구간)의 (v_x^b, v_y^b, yaw_rate)는 **반드시 0** 으로 설정.
+        - v^b 계산도 미래 유효 마스크로 0 마스킹.
+
+        Args:
+            neighbor_agents_past: (N, T_past, 11)
+                · [:, :, 2:4] = (cos(yaw), sin(yaw))
+                · [:, :, 4:6] = (v_x(ego), v_y(ego))  # 여기서는 사용하지 않음
+                · invalid 규칙: 마지막 차원 앞 8개 모두 == 0 이면 무효
+            neighbor_future_gt_5_dim: (N, T_future, 5)
+                각 시점: [x(ego), y(ego), yaw, v_x(ego), v_y(ego)]
+                · invalid 규칙: 앞 3개 [x, y, yaw] 모두 == 0 이면 무효
+
+        Returns:
+            np.ndarray: (N, T_future, 3) = [v_x^b, v_y^b, yaw_rate(rad/s)]
+        """
+        N, T_past, _ = neighbor_agents_past.shape
+        _, T_future, _ = neighbor_future_gt_5_dim.shape
+
+        # 샘플링 간격 dt (보통 0.1s)
+        if self.num_future_poses <= 0:
+            raise ValueError("`self.num_future_poses`는 양수여야 합니다.")
+        dt: float = float(self.future_time_horizon) / float(
+            self.num_future_poses)
+
+        # ── (0) 유효/무효 마스크 계산 ─────────────────────────────────────
+        # past_valid: (N, T_past)
+        past_valid_mask: np.ndarray = (
+                    np.abs(neighbor_agents_past[..., :8]) > 0).any(axis=-1)
+        # future_valid: (N, T_future)  — x,y,yaw 세 값 모두 0이면 무효
+        future_valid_mask: np.ndarray = (
+                    np.abs(neighbor_future_gt_5_dim[..., :3]) > 0).any(axis=-1)
+        # concat_valid: (N, T_past + T_future)
+        concat_valid_mask: np.ndarray = np.concatenate(
+            [past_valid_mask, future_valid_mask], axis=1)
+
+        # ── (1) yaw 시퀀스(과거+미래) 만들기 + unwrap ─────────────────────
+        past_cos = neighbor_agents_past[:, :, 2]  # (N, T_past)
+        past_sin = neighbor_agents_past[:, :, 3]  # (N, T_past)
+        past_yaw = self._cos_sin_to_yaw(past_cos, past_sin)  # (N, T_past)
+
+        future_yaw = neighbor_future_gt_5_dim[:, :, 2]  # (N, T_future)
+
+        yaw_concat = np.concatenate([past_yaw, future_yaw],
+                                    axis=1)  # (N, T_all)
+        yaw_unwrapped = np.unwrap(yaw_concat, axis=1)  # (N, T_all)
+
+        # ── (2) 유효 구간에서만 Savitzky–Golay로 yaw_rate 계산 ───────────
+        #     유효 구간 밖은 0으로 유지
+        yaw_rate_concat: np.ndarray = self._savgol_yaw_rate_masked(
+            yaw_sequence=yaw_unwrapped,  # (N, T_all)
+            valid_mask=concat_valid_mask,  # (N, T_all)
+            dt=dt,
+            polyorder=2,
+            max_window_length=11,  # 권장: 11 (0.1s 샘플 기준 ≈1.1s)
+        )  # (N, T_all)
+
+        # 미래 구간만 취함 → (N, T_future)
+        yaw_rate_future: np.ndarray = yaw_rate_concat[:, -T_future:]
+
+        # ── (3) 미래 v^b 계산 (ego → body 회전) ──────────────────────────
+        # velocity_ego: (N, T_future, 2)
+        future_vel_ego: np.ndarray = neighbor_future_gt_5_dim[:, :, 3:5]
+        future_v_body: np.ndarray = self._rotate_ego_to_body_velocity(
+            velocity_ego=future_vel_ego,  # (N, T_future, 2)
+            yaw=future_yaw,  # (N, T_future)
+        )  # (N, T_future, 2) = [v_x^b, v_y^b]
+
+        # ── (4) 무효 구간 0 마스킹 ───────────────────────────────────────
+        invalid_future_mask = ~future_valid_mask  # (N, T_future)
+        if invalid_future_mask.any():
+            future_v_body[invalid_future_mask] = 0.0
+            yaw_rate_future[invalid_future_mask] = 0.0
+
+        # ── (5) (v_x^b, v_y^b, yaw_rate) 합치기 ──────────────────────────
+        neighbor_future_control_gt = np.concatenate(
+            [future_v_body, yaw_rate_future[..., None]], axis=-1
+        )  # (N, T_future, 3)
+
+        return neighbor_future_control_gt
 
     def _get_future_tracked_objects_array_list(
         self,
@@ -789,27 +1006,26 @@ class DataProcessor(object):
         ) = sampled_tracked_objects_to_array_list(sampled_future_observations)
         return future_tracked_objects_array_list, token_to_id
 
-    def _get_neighbor_future_gt_3_dim(
+    def _get_neighbor_future_gt_5_dim(
         self,
         scenario: NuPlanScenario,
         anchor_ego_state: np.ndarray,  # (3,)
-        neighbor_agents_past: np.ndarray,  # (num_agents, Tp, 11)
         neighbor_indices: Union[np.ndarray, List[int]],
         iteration: int = 0,
-    ) -> np.ndarray:  # (num_agents, Tf, 3)
+    ) -> np.ndarray:  # (num_agents, future_len, 5)
         # future_tracked_objects_array_list: List[ np.ndarray ((frame_agents_num, 8)) ]
         # 길이: 1 + num_future_poses
         # frame_agents_num: 각 프레임마다 다름
         future_tracked_objects_array_list, _ = self._get_future_tracked_objects_array_list(
             scenario, iteration)
-        # neighbor_future_gt_3_dim: (num_agents, future_len, 3)
-        neighbor_future_gt_3_dim = agent_future_process(
+        # neighbor_future_gt_3_dim: (num_agents, future_len, 5)
+        neighbor_future_gt_5_dim = agent_future_process(
             anchor_ego_state, future_tracked_objects_array_list,
             self.num_agents, neighbor_indices)
         # _, neighbor_future_gt_3_dim, _ = \
         #     self._filter_agents_within_radius(neighbor_agents_past,
         #                                       neighbor_future_gt_3_dim)
-        return neighbor_future_gt_3_dim
+        return neighbor_future_gt_5_dim
 
     def save_to_disk(self, dir, data):
         os.makedirs(dir, exist_ok=True)

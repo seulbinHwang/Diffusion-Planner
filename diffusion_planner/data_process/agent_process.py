@@ -736,20 +736,22 @@ def agent_future_process(
     future_len = padded_agent_states.shape[0] - 1  # Tf
     padded_agent_states_future = padded_agent_states[
         1:, :, :]  # (Tf, current_agents_num, 8)
-    # 최종 결과 버퍼: (num_agents, Tf, 3)  ← 현재(인덱스 0) 제외한 미래 구간만 사용
-    agent_futures = np.zeros(shape=(num_agents, future_len, 3),
+    # 최종 결과 버퍼: (num_agents, Tf, 5)  ← 현재(인덱스 0) 제외한 미래 구간만 사용
+    agent_futures_5_dim = np.zeros(shape=(num_agents, future_len, 5),
                              dtype=np.float32)
-
     # agent_index의 순서가 곧 출력 행 순서가 된다.
     for i, key_frame_idx in enumerate(neighbor_indices):
         # padded_agent_states[1:, key_frame_idx, [x, y, heading]] → (Tf, 3)
-        agent_futures[i] = padded_agent_states_future[:, key_frame_idx, [
+        agent_futures_5_dim[i, :, :3] = padded_agent_states_future[:, key_frame_idx, [
             AgentInternalIndex.x(),
             AgentInternalIndex.y(),
             AgentInternalIndex.heading()
         ]]
+        # 4 : vx , 5 : vy,
+        agent_futures_5_dim[i, :, 3] = padded_agent_states_future[:, key_frame_idx, AgentInternalIndex.vx()]
+        agent_futures_5_dim[i, :, 4] = padded_agent_states_future[:, key_frame_idx, AgentInternalIndex.vy()]
 
-    return agent_futures
+    return agent_futures_5_dim
 
 
 def agent_future_all_process(
