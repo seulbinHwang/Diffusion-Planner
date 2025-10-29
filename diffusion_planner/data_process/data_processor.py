@@ -825,6 +825,113 @@ class DataProcessor(object):
         vy_b = -s * vx_e + c * vy_e
         return np.stack([vx_b, vy_b], axis=-1)
 
+    from typing import Tuple
+    import numpy as np
+
+    # 필요한 경우에만 SciPy를 import (없으면 자동 fallback)
+    try:
+        from scipy.signal import savgol_filter  # type: ignore
+        _HAVE_SCIPY = True
+    except Exception:
+        _HAVE_SCIPY = False
+
+    def _select_savgol_window_length(
+            self,
+            effective_length: int,
+            polyorder: int,
+            max_window_length: int,
+    ) -> int:
+        """주어진 유효 길이에 맞춰 Savitzky–Golay 창 길이(홀수, polyorder보다 큼)를 선택한다.
+
+        Args:
+            effective_length (int): 유효 구간 길이 M (예: 전체 길이 또는 [i0, i1] 길이).
+            polyorder (int): SavGol 다항 차수.
+            max_window_length (int): 창 길이 상한.
+
+        Returns:
+            int: 사용할 window_length. 3 미만이면 SavGol 대신 gradient를 권장.
+        """
+        if effective_length <= 0:
+            return 0
+        win = min(max_window_length, effective_length)
+        if win % 2 == 0:
+            win -= 1
+        # polyorder보다 항상 커야 함
+        while win > effective_length or win <= polyorder:
+            win -= 2
+        return win
+
+    def _apply_savgol_filter_batch_full_valid(
+            self,
+            yaw_sequence_full: np.ndarray,  # (N_full, T_all)
+            dt: float,
+            polyorder: int,
+            window_length: int,
+    ) -> np.ndarray:
+        """전 타임스텝이 **모두 유효(True)** 인 배치에 대해 Savitzky–Golay 1차 미분을 한 번에 적용.
+
+        Args:
+            yaw_sequence_full (np.ndarray): (N_full, T_all) 연속 yaw(rad) 시퀀스(unwrap 후).
+            dt (float): 샘플링 간격 [s].
+            polyorder (int): SavGol 다항 차수.
+            window_length (int): SavGol 창 길이(홀수, polyorder보다 큼).
+
+        Returns:
+            np.ndarray: (N_full, T_all) yaw_rate(rad/s).
+        """
+        N_full, T_all = yaw_sequence_full.shape
+        if T_all < 2:
+            return np.zeros_like(yaw_sequence_full, dtype=np.float64)
+
+        if (window_length < 3):
+            # SciPy가 없거나 창이 너무 짧으면 중앙차분으로 대체
+            return np.gradient(yaw_sequence_full, dt, axis=1)
+
+        # SciPy 배치 처리 (axis=1 기준)
+        return savgol_filter(
+            yaw_sequence_full,
+            window_length=window_length,
+            polyorder=polyorder,
+            deriv=1,
+            delta=dt,
+            mode="interp",
+            axis=1,
+        )
+
+    def _apply_savgol_filter_1d(
+            self,
+            seq: np.ndarray,  # (M,)
+            dt: float,
+            polyorder: int,
+            window_length: int,
+    ) -> np.ndarray:
+        """단일 1D 시퀀스에 Savitzky–Golay 1차 미분을 적용(창이 짧거나 SciPy 없으면 gradient).
+
+        Args:
+            seq (np.ndarray): (M,) yaw(rad) 시퀀스.
+            dt (float): 샘플링 간격 [s].
+            polyorder (int): SavGol 다항 차수.
+            window_length (int): SavGol 창 길이(홀수, polyorder보다 큼).
+
+        Returns:
+            np.ndarray: (M,) yaw_rate(rad/s).
+        """
+        M = int(seq.shape[0])
+        if M < 2:
+            return np.zeros_like(seq, dtype=np.float64)
+
+        if (window_length < 3):
+            return np.gradient(seq, dt)
+
+        return savgol_filter(
+            seq,
+            window_length=window_length,
+            polyorder=polyorder,
+            deriv=1,
+            delta=dt,
+            mode="interp",
+        )
+
     def _savgol_yaw_rate_masked(
             self,
             yaw_sequence: np.ndarray,  # (N, T_all)
@@ -833,51 +940,80 @@ class DataProcessor(object):
             polyorder: int = 2,
             max_window_length: int = 11,
     ) -> np.ndarray:  # (N, T_all)
-        """유효 구간에서만 Savitzky–Golay 1차 미분으로 yaw_rate를 계산한다.
-        유효 구간 밖은 0으로 채운다.
+        """유효 구간에서만 Savitzky–Golay 1차 미분으로 yaw_rate를 계산(무효 구간은 0).
 
-        동작
-        ----
-        - 각 에이전트 i에 대해 valid_mask[i]의 True 구간이 연속이라고 가정(문제에서 보장).
-        - 유효 구간 [i0, i1]만 따로 잘라서 미분.
-          · 창 길이는 min(max_window_length, (i1-i0+1))에서 '홀수'이며 polyorder보다 크게 자동 조정.
-          · 창 길이가 너무 짧으면(np<2 또는 window<=polyorder) 중앙차분(np.gradient)로 대체.
+        최적화 포인트
+        -------------
+        - **전 타임스텝이 유효(True)** 인 row들을 먼저 **배치 처리**(savgol_filter axis=1).
+        - 일부만 유효한 row는 **슬로우패스(루프)** 로 [i0, i1] 구간만 처리.
+
+        Args:
+            yaw_sequence (np.ndarray): (N, T_all) 연속 yaw(rad) 시퀀스(unwrap 완료).
+            valid_mask (np.ndarray): (N, T_all) True=유효.
+            dt (float): 샘플링 간격 [s].
+            polyorder (int): SavGol 다항 차수(기본 2).
+            max_window_length (int): SavGol 창 길이 상한(기본 11).
+
+        Returns:
+            np.ndarray: (N, T_all) yaw_rate(rad/s).
         """
         N, T_all = yaw_sequence.shape
         yaw_rate_all = np.zeros_like(yaw_sequence, dtype=np.float64)
 
+        if T_all < 2:
+            # 타임 길이가 1 이하면 모든 값 0 유지
+            return yaw_rate_all
 
-        for i in range(N):
+        # 1) 전 구간 유효 / 부분 유효 구분
+        full_valid_row_mask: np.ndarray = valid_mask.all(axis=1)  # (N,)
+        has_full_valid: bool = bool(np.any(full_valid_row_mask))
+
+        # 2) 전 구간 유효 배치 처리
+        if has_full_valid:
+            yaw_seq_full = yaw_sequence[full_valid_row_mask]  # (N_full, T_all)
+            win_full = self._select_savgol_window_length(
+                effective_length=T_all,
+                polyorder=polyorder,
+                max_window_length=max_window_length,
+            )
+            yaw_rate_full = self._apply_savgol_filter_batch_full_valid(
+                yaw_sequence_full=yaw_seq_full,
+                dt=dt,
+                polyorder=polyorder,
+                window_length=win_full,
+            )  # (N_full, T_all)
+            yaw_rate_all[full_valid_row_mask] = yaw_rate_full
+
+        # 3) 부분 유효 슬로우패스(유효 구간 [i0, i1]만 처리)
+        partial_indices = np.flatnonzero(~full_valid_row_mask)  # (N_partial,)
+        for i in partial_indices:
             valid_i = valid_mask[i]  # (T_all,)
             if not np.any(valid_i):
+                # 전부 무효 → 0 유지
                 continue
-            idx = np.flatnonzero(valid_i) # 유효 인덱스 리스트
-            i0, i1 = int(idx[0]), int(idx[-1])
-            seq = yaw_sequence[i, i0:i1 + 1]  # (M,)
 
-            M = seq.shape[0]
+            idx_valid = np.flatnonzero(valid_i)  # 유효 인덱스 리스트
+            i0, i1 = int(idx_valid[0]), int(idx_valid[-1])
+            seq_valid = yaw_sequence[i, i0:i1 + 1]  # (M,)
+
+            M = int(seq_valid.shape[0])
             if M < 2:
-                # 샘플이 1개면 미분 0
+                # 유효 샘플이 1개뿐이면 미분 불가 → 0 유지
                 continue
 
-            # 창 길이 선택(홀수, polyorder보다 크게)
-            win = min(max_window_length, M)
-            if win % 2 == 0:
-                win -= 1
-            while win > M or win <= polyorder:
-                win -= 2
-            if win < 3:  # 여전히 너무 짧으면 gradient
-                yaw_rate_valid = np.gradient(seq, dt)
-            else:
-                yaw_rate_valid = savgol_filter(
-                    seq,
-                    window_length=win,
-                    polyorder=polyorder,
-                    deriv=1, # 1차 미분을 돌려달라는 뜻
-                    delta=dt,
-                    mode="interp",
-                )
+            win_local = self._select_savgol_window_length(
+                effective_length=M,
+                polyorder=polyorder,
+                max_window_length=max_window_length,
+            )
+            yaw_rate_valid = self._apply_savgol_filter_1d(
+                seq=seq_valid,
+                dt=dt,
+                polyorder=polyorder,
+                window_length=win_local,
+            )  # (M,)
 
+            # 유효 구간에만 써넣기(무효 구간은 0 유지)
             yaw_rate_all[i, i0:i1 + 1] = yaw_rate_valid
 
         return yaw_rate_all
