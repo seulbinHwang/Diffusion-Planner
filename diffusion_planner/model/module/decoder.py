@@ -647,7 +647,7 @@ class DiT(nn.Module):
         #   Δscale_base/shift_base/logit_gate_base (모두 [B, Pnn, H])
         composer_out = self.pram_v2_composer(
             state_token_in=state_token_in,  # [B, Pnn, D]
-            ego_future_global=ego_fut_global,  # [B, D] # (배치 단위 0벡터 처리)
+            ego_fut_global=ego_fut_global,  # [B, D] # (배치 단위 0벡터 처리)
             near_agents_route_lane_emb=near_agents_route_lane_emb,
             # [B, Pnn, D]
             route_known_mask=route_known_mask  # [B, Pnn] True=known

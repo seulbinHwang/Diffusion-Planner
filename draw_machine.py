@@ -76,7 +76,7 @@ def add_metric_arrow(ax: plt.Axes,
             (x, y),
             (x + dx, y + dy),
             arrowstyle="-|>",
-            mutation_scale=4.0,
+            mutation_scale=1.0,
             linewidth=line_width,
             color=color,
             alpha=alpha,
@@ -388,14 +388,15 @@ def draw_diff_token_to_future_gt_3_dim(
                     color=options.DIFF_future_gt_3_dim_COLOR,
                     line_width=lw, zorder=27
                 )
-                add_metric_arrow(
-                    ax, x, y, dx_vy, dy_vy,
-                    color=options.DIFF_future_gt_3_dim_COLOR,
-                    line_width=lw, zorder=27
-                )
+                # add_metric_arrow(
+                #     ax, x, y, dx_vy, dy_vy,
+                #     color=options.DIFF_future_gt_3_dim_COLOR,
+                #     line_width=lw, zorder=27
+                # )
 
                 # 합성 속력(‖v^b‖) [km/h] 텍스트: 화살표 끝(합성) 근처에 표기
                 speed_kmh = float(np.hypot(vx_b, vy_b)) * 3.6
+                # speed_kmh = float(vy_b) * 3.6
                 end_x = x + dx_vx + dx_vy
                 end_y = y + dy_vx + dy_vy
                 # 텍스트가 겹치지 않도록 Vy 부호에 따라 법선 방향으로 살짝 오프셋
@@ -407,7 +408,7 @@ def draw_diff_token_to_future_gt_3_dim(
                     text_x, text_y,
                     f"{speed_kmh:.1f}",
                     color=options.DIFF_future_gt_3_dim_token_color,
-                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize- 2,
                     ha="center", va="bottom",
                     zorder=28, clip_on=True
                 )
@@ -419,7 +420,7 @@ def draw_diff_token_to_future_gt_3_dim(
                     x + 0.3, y,  # 점 바로 옆
                     f"{yaw_rate_deg:.1f}°/s",
                     color=options.DIFF_future_gt_3_dim_token_color,
-                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize - 2,
                     ha="left", va="center",
                     zorder=28, clip_on=True
                 )
@@ -521,7 +522,7 @@ class DrawingOptions:
     ######### [EGO] ##############
     ########### [EGO] PAST ##################
     EGO_draw_ego_past: bool = True  # check
-    EGO_draw_ego_only_current: bool = True  # check
+    EGO_draw_ego_only_current: bool = False  # check
     EGO_past_style = {
         "fill_color": WHITE,  # 흰색
         "line_color": GRAY,  # 회색
@@ -555,7 +556,7 @@ class DrawingOptions:
     }
     EGO_draw_planner_velocity: bool = False  # check
     ########## [EGO] FUTURE EGO GT 11 ##########
-    EGO_draw_ego_future_gt_11_dim: bool = False
+    EGO_draw_ego_future_gt_11_dim: bool = True
     EGO_future_gt_11_style = {
         "line_color": CYAN,
         "line_width": 0.2,
@@ -568,7 +569,7 @@ class DrawingOptions:
 
     ######### [NEIGHBOR] #########
     ########### [NEIGHBOR] PAST ##################
-    NEI_draw_neighbor_past: bool = True  # check
+    NEI_draw_neighbor_past: bool = False  # check
     NEI_draw_neighbor_only_current: bool = False  # check
     NEI_draw_velocity_arrow: bool = False  # check
     NEI_draw_velocity_text: bool = False  # check
@@ -620,7 +621,7 @@ class DrawingOptions:
     ######### [NEIGHBOR] FUTURE GT #############
     DIFF_draw_diff_future_gt_3_dim: bool = True
     DIFF_draw_diff_future_cont_gt: bool = True
-    DIFF_draw_diff_future_cont_gt_vel: bool = True
+    DIFF_draw_diff_future_cont_gt_vel: bool = False
     DIFF_draw_diff_future_cont_gt_yaw_rate: bool = False
     DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
@@ -1945,6 +1946,7 @@ def set_axes_limits_with_margin(ax: plt.Axes, bounds: Tuple[float, float, float,
 def save_figure_to_png(fig: plt.Figure, save_path: str) -> None:
     """Figure를 PNG로 저장하고 Figure를 닫음."""
     plt.savefig(save_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    print(f"Saved visualization to: {save_path}")
     plt.close(fig)
 
 
@@ -2136,6 +2138,8 @@ def draw_neighbor_past_all(ax: plt.Axes,
     #########################################
     ### [NEIGHBOR PAST OUTPUT] ###
     # (history_len, 11)
+    if output_data is None:
+        return
     diff_token_to_np_history_wrt_ego = output_data.get(
         "diff_token_to_np_history_wrt_ego", None)
     if draw_option.NEI_draw_neighbor_past_output and diff_token_to_np_history_wrt_ego is not None:
@@ -2299,13 +2303,15 @@ def draw_world_model_to_png(
     save_path: str,
     options: Optional[DrawingOptions] = None,
 ) -> None:
-    draw_token_list: List[str] = [
-        "58a9e2ba05555824"
-    ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
-    draw_token_list: List[str] = [
-        "f476b2c85dd7508c"
-    ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
-
+    # draw_token_list: List[str] = [
+    #     "58a9e2ba05555824"
+    # ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    # draw_token_list: List[str] = [
+    #     "f476b2c85dd7508c"
+    # ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
+    draw_token_list = None
+    if output_data is None:
+        output_data = {}
     # draw_token_list = None
     draw_option = options or DrawingOptions()
 

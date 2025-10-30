@@ -318,22 +318,14 @@ except Exception:
 
 
 def available_cpu_count() -> int:
-    """
-    컨테이너/호스트 어디서 실행해도
-    현재 프로세스에 **실제로 할당된 논리 CPU 개수**를 반환.
-    1) Linux & Python 3.9+ : os.sched_getaffinity(0)
-    2) 그 외 : os.cpu_count()  (fallback)
-    """
-    return DP_MAX_CPUS
+    """현재 프로세스에 할당된 CPU 개수를 자동 감지하고,
+    환경변수 DP_MAX_CPUS로 상한을 둔다."""
+    hard_cap: int = int(os.environ.get("DP_MAX_CPUS", "96"))
     try:
-        return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
-        print(f"Available CPUs: {return_}")  # 디버그용
-        return return_  # cgroup cpuset 존중
+        detected: int = len(os.sched_getaffinity(0))  # cgroup/cpuset 존중
     except AttributeError:
-        print("Using os.cpu_count() as fallback for CPU count.")
-        return_ = os.cpu_count()  # 전체 CPU 개수
-        print(f"Total CPUs: {return_}")  # 디버그용
-        return return_ or 1  # 최소 1
+        detected = os.cpu_count() or 1
+    return min(detected, hard_cap)
 
 
 import shutil
@@ -632,9 +624,13 @@ if __name__ == "__main__":
                         type=int,
                         default=25,
                         help='number of route lanes')
+    parser.add_argument('--predicted_neighbor_num',
+                        type=int,
+                        help='number of neighbor agents to predict',
+                        default=32)
     # ────── WandB 옵션 추가 ──────
     parser.add_argument('--use_wandb', default=False, type=boolean)
-    parser.add_argument('--save_image', default=False, type=boolean)
+    parser.add_argument('--save_image', default=True, type=boolean)
 
     parser.add_argument('--wandb_project',
                         type=str,
