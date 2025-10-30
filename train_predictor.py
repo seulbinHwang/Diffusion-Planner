@@ -722,7 +722,8 @@ def model_training(args):
     if args.ddp:
         diffusion_planner = DDP(diffusion_planner,
                                 device_ids=[rank
-                                           ])  # find_unused_parameters=True)
+                                           ],
+                                find_unused_parameters=True)  # find_unused_parameters=True)
     model_ema = None
     if args.use_ema:
         model_ema = ModelEma(

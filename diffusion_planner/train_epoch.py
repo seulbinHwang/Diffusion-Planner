@@ -10,6 +10,23 @@ from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 
 # =====================================================================
+from typing import List, Tuple
+import torch
+from torch import nn
+
+
+def list_unused_parameters(model: nn.Module) -> List[
+    Tuple[str, torch.nn.Parameter]]:
+    """모델에서 grad가 None인 파라미터 목록을 찾는다.
+
+    Returns:
+        List[(이름, 파라미터)]: 미사용(grad=None) 파라미터들
+    """
+    unused = []
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is None:
+            unused.append((name, p))
+    return unused
 
 
 def train_epoch(data_loader,
@@ -111,7 +128,7 @@ def train_epoch(data_loader,
 
             # loss backward
             loss["loss"].backward()
-
+            list_unused_parameters(model)
             # nn.utils.clip_grad_norm_(model.parameters(), 20)
             scheduler.step()
             optimizer.step()
