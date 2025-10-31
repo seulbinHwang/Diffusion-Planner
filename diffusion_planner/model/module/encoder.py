@@ -2850,6 +2850,9 @@ class FusionEncoder(nn.Module):
                 for p in blk.parameters():
                     touch = touch + p.view(-1)[:1].sum()
             out_tokens = out_tokens + touch * 0.0
+        # ★ 추가: final LayerNorm 파라미터도 터치
+        for p in self.norm.parameters():
+            touch = touch + p.view(-1)[:1].sum()
         # 전부 패딩 배치는 out_tokens의 0 유지
         # out_tokens [B, token_num, H]
         # encoding_mask: [B, token_num]  # True=패딩
