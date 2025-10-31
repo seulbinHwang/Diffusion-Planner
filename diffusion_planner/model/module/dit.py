@@ -275,9 +275,12 @@ class DiTBlock(nn.Module):
 
         T = x_unpad.shape[0]
         if T == 0 or max_seqlen == 0:
-            # 파라미터 터치(0 곱해서 손실엔 영향 0) → 그래프에 포함
             touch = (self.qkv_proj.weight.view(-1)[:1].sum() +
-                     self.out_proj.weight.view(-1)[:1].sum()) * 0.0
+                     (self.qkv_proj.bias.view(-1)[:1].sum()
+                      if self.qkv_proj.bias is not None else 0) +
+                     self.out_proj.weight.view(-1)[:1].sum() +
+                     (self.out_proj.bias.view(-1)[:1].sum()
+                      if self.out_proj.bias is not None else 0)) * 0.0
             return torch.zeros_like(x) + touch
 
         # (2) QKV 프로젝션 (유효 토큰만)

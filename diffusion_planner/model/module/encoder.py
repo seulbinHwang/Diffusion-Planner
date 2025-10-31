@@ -2526,6 +2526,12 @@ class StaticFusionEncoder(nn.Module):
             static_info = static_info.to(
                 dtype=static_encoding.dtype)  # [FIX] 좌변 dtype 일치화
             static_encoding[valid_indices] = static_info
+        else:
+            # projection 파라미터를 0-스케일로 터치
+            touch = static_encoding.new_zeros(())
+            for p in self.projection.parameters():
+                touch = touch + p.view(-1)[:1].sum()
+            static_encoding = static_encoding + touch * 0.0
         static_encoding = static_encoding.reshape(
             B, static_objects_num, -1)  # (B, static_objects_num, hidden_dim)
         mask_p = mask_p.reshape(B,
@@ -2663,8 +2669,17 @@ class LaneFusionEncoder(nn.Module):
             print(
                 "[Warning] All lane inputs are padding. Returning zero embeddings."
             )
-            # mask와 feature는 그대로 복원
-            return lane_embedding, mask_p.reshape(B, lane_num), lane_feature
+            # 파라미터 0-스케일 터치(DDP unused param 방지)
+            touch = lane_embedding.new_zeros(())
+            for mod in [
+                    self.channel_pre_project, self.token_pre_project,
+                    self.emb_project, self.speed_limit_emb,
+                    self.unknown_speed_emb, self.traffic_emb, *self.blocks
+            ]:
+                for p in mod.parameters():
+                    touch = touch + p.view(-1)[:1].sum()
+            return lane_embedding + touch * 0.0, mask_p.reshape(
+                B, lane_num), lane_feature
 
         lane_info = lane_info[valid_indices]
 
@@ -2827,7 +2842,14 @@ class FusionEncoder(nn.Module):
             fused_wo_cls = cls_with_tokens[:, 1:, :]  # [on_B, token_num, H]
             out_tokens[is_valid_batch] = fused_wo_cls.to(
                 out_tokens.dtype)  # [B, token_num, H]
-
+        else:
+            # 모든 배치가 패딩이면, 블록 파라미터를 0-스케일로 터치해 DDP unused param 방지
+            touch = (self.cls_token[..., :1].sum() +
+                     self.cls_pos[..., :1].sum())
+            for blk in self.blocks:
+                for p in blk.parameters():
+                    touch = touch + p.view(-1)[:1].sum()
+            out_tokens = out_tokens + touch * 0.0
         # 전부 패딩 배치는 out_tokens의 0 유지
         # out_tokens [B, token_num, H]
         # encoding_mask: [B, token_num]  # True=패딩
