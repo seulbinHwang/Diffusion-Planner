@@ -51,10 +51,10 @@ import torch.nn as nn
 
 
 def encode_time_with_fourier_features(
-        t_sec: torch.Tensor,
-        time_min: float,
-        time_max: float,
-        num_fourier_frequencies: int,
+    t_sec: torch.Tensor,
+    time_min: float,
+    time_max: float,
+    num_fourier_frequencies: int,
 ) -> torch.Tensor:
     """시간 값을 Fourier(2K) + 중심화 시간 스칼라(1)로 인코딩합니다(AMP 안전).
 
@@ -77,7 +77,7 @@ def encode_time_with_fourier_features(
 
     # 정규화된 시간: (...,)
     t_norm: torch.Tensor = (t_sec - time_min) / (time_max - time_min + eps
-                                                 )  # (...,)
+                                                )  # (...,)
     t_norm: torch.Tensor = t_norm.clamp(0.0, 1.0).to(torch.float32)  # (...,)
 
     # 주파수 인덱스: (K,)
@@ -169,12 +169,12 @@ class NearAgentsRouteLaneEncoder(nn.Module):
     """
 
     def __init__(
-            self,
-            hidden_dim: int,
-            num_seeds: int = 4,
-            attn_drop_p: float = 0.0,
-            out_drop_p: float = 0.0,
-            ffn_ratio: float = 2.0,
+        self,
+        hidden_dim: int,
+        num_seeds: int = 4,
+        attn_drop_p: float = 0.0,
+        out_drop_p: float = 0.0,
+        ffn_ratio: float = 2.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -357,7 +357,7 @@ class Encoder(nn.Module):
         self.npc_route_encoder = NearAgentsRouteLaneEncoder(
             hidden_dim=config.hidden_dim, attn_drop_p=0.0)
         self.token_num = (1 * self.agents_encoder.future_chunk_num) + (
-                (1 + config.agent_num) * self.agents_encoder.past_cur_chunk_num
+            (1 + config.agent_num) * self.agents_encoder.past_cur_chunk_num
         ) + config.static_objects_num + config.lane_num
 
         self.fusion = FusionEncoder(
@@ -375,9 +375,9 @@ class Encoder(nn.Module):
 
     @staticmethod
     def _mask_all_routes_like(
-            route_lanes: torch.Tensor,  # (B, Pnn, route_num, H)
-            route_lanes_mask: torch.Tensor,  # (B, Pnn, route_num)
-            drop_mask_b: torch.Tensor,  # (B,) bool, False인 샘플을 "경로 없음"으로 강제
+        route_lanes: torch.Tensor,  # (B, Pnn, route_num, H)
+        route_lanes_mask: torch.Tensor,  # (B, Pnn, route_num)
+        drop_mask_b: torch.Tensor,  # (B,) bool, False인 샘플을 "경로 없음"으로 강제
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """배치 마스크에 따라 해당 샘플의 모든 route 토큰을 패딩 처리합니다.
 
@@ -491,7 +491,7 @@ class Encoder(nn.Module):
         return truncated_ego_future
 
     def forward(self, inputs: Dict[str,
-    torch.Tensor]) -> Dict[str, torch.Tensor]:
+                                   torch.Tensor]) -> Dict[str, torch.Tensor]:
         """인코더 전방 패스(무작위 길이 M으로 ego 미래를 잘라 조건 제공).
 
         입력 딕셔너리 키와 텐서 형태:
@@ -638,7 +638,7 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
             1):, :]  # (B, lane_num, hidden_dim)
         (near_agents_route_lane_emb,
          route_known_mask) = self._get_near_agents_route_lane_emb(
-            encoding_lanes, lanes_mask, agent_route_lane_order)
+             encoding_lanes, lanes_mask, agent_route_lane_order)
 
         encoder_outputs[
             "near_agents_route_lane_emb"] = near_agents_route_lane_emb  # (B, Pnn, hidden_dim)
@@ -647,19 +647,19 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         return encoder_outputs
 
     def _get_near_agents_route_lane_emb(
-            self,
-            encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
-            lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
-            agent_route_lane_order: torch.
-            Tensor,  # (B, Pnn, lane_num)  -1=not in route
+        self,
+        encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
+        lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
+        agent_route_lane_order: torch.
+        Tensor,  # (B, Pnn, lane_num)  -1=not in route
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # agent_route_lane_order: (B, Pnn, lane_num)
         # -1: route가 아님 # agent당 유효한 route의 최대 수는 최대 route_num 개임. (즉, route_num 이하임) # route_num <= lane_num 항상
 
         (route_lanes,
          route_lanes_mask) = self.build_route_lane_tensors_from_order(
-            encoding_lanes, lanes_mask, agent_route_lane_order,
-            self.config.route_num)
+             encoding_lanes, lanes_mask, agent_route_lane_order,
+             self.config.route_num)
         """
             route_lanes:       (B, Pnn, route_num, H)
             route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
@@ -671,7 +671,7 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
             # route_keep_mask[b] = True면 주어진 order를 사용, False면 "경로 없음"
             route_keep_mask: torch.Tensor = (torch.rand(
                 (B,), device=encoding_lanes.device) >= float(
-                self.route_order_drop_prob))  # (B,) bool
+                    self.route_order_drop_prob))  # (B,) bool
 
             # 샘플 단위 드롭을 실제 텐서에 반영 (전부 패딩 처리)
             (route_lanes, route_lanes_mask) = self._mask_all_routes_like(
@@ -689,7 +689,7 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
             encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
             lanes_mask: torch.Tensor,  # (B, lane_num)  # True=pad
             agent_route_lane_order: torch.
-            Tensor,  # (B, Pnn, lane_num)  # -1=not in route, 0..=rank(가까운 순)
+        Tensor,  # (B, Pnn, lane_num)  # -1=not in route, 0..=rank(가까운 순)
             route_num: int,  # 선택할 최대 route 개수(≤ lane_num)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """에이전트-별 랭크(agent_route_lane_order)에 따라, 가까운 순으로 최대 route_num개의
@@ -711,7 +711,7 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         # valid_route_mask: (B, Pnn, lane_num)  # 내 route이면서 lane 유효
         valid_route_mask = (route_lane_order >= 0) & (~lanes_mask_exp)
 
-        BIG = 2 ** 30  # 충분히 큰 값(랭크보다 큼)
+        BIG = 2**30  # 충분히 큰 값(랭크보다 큼)
         # order_for_sort: (B, Pnn, lane_num)  # 무효 위치는 BIG으로 채움
         order_for_sort = torch.where(valid_route_mask, route_lane_order,
                                      torch.full_like(route_lane_order, BIG))
@@ -745,7 +745,7 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         # route_lane_valid_mask: (B,Pnn,route_num)  # True=유효
         # route_lanes_mask: (B,Pnn,route_num)  # True=pad/무효
         route_lanes_mask = gathered_lane_mask | (~route_lane_valid_mask
-                                                 )  # True=pad(무효)
+                                                )  # True=pad(무효)
 
         # 무효 위치는 0으로 채우기 (곱셈으로 처리하여 마스크 alias 문제 제거)
         # (B,Pnn,R,1) float copy
@@ -839,8 +839,8 @@ class SelfAttentionBlock(nn.Module):
 
     @staticmethod
     def _unpad_from_mask(
-            x: torch.Tensor,  # (B, L, D)
-            mask: torch.Tensor  # (B, L)  True=pad(무효)
+        x: torch.Tensor,  # (B, L, D)
+        mask: torch.Tensor  # (B, L)  True=pad(무효)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """패딩 마스크로부터 유효 토큰만 추출(unpad)
 
@@ -885,13 +885,13 @@ class SelfAttentionBlock(nn.Module):
 
     @staticmethod
     def _pad_to_batch(
-            y_unpad: torch.Tensor,
-            indices: torch.Tensor,
-            B: int,
-            L: int,
-            D: int,
-            device: torch.device,
-            dtype: Optional[torch.dtype] = None,
+        y_unpad: torch.Tensor,
+        indices: torch.Tensor,
+        B: int,
+        L: int,
+        D: int,
+        device: torch.device,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         if dtype is None:
             dtype = y_unpad.dtype
@@ -957,7 +957,13 @@ class SelfAttentionBlock(nn.Module):
 
         T = x_unpad.shape[0]
         if T == 0 or max_seqlen == 0:
-            return torch.zeros_like(x)
+            touch = (self.qkv_proj.weight.view(-1)[:1].sum() +
+                     (self.qkv_proj.bias.view(-1)[:1].sum()
+                      if self.qkv_proj.bias is not None else 0) +
+                     self.out_proj.weight.view(-1)[:1].sum() +
+                     (self.out_proj.bias.view(-1)[:1].sum()
+                      if self.out_proj.bias is not None else 0)) * 0.0
+            return torch.zeros_like(x) + touch
 
         # (2) QKV 프로젝션 (유효 토큰만)
         qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
@@ -1121,8 +1127,7 @@ class AgentFusionEncoder(nn.Module):
         assert ego_fut_off_chunk_mask_full.dtype == torch.bool
         # FP16/BF16에서도 안전한 아주 작은 값
         very_neg = (torch.finfo(ego_fut_chunk.dtype).min if ego_fut_chunk.dtype
-                                                            in (torch.float16,
-                                                                torch.bfloat16) else -1e30)
+                    in (torch.float16, torch.bfloat16) else -1e30)
         x = ego_fut_chunk.masked_fill(ego_fut_off_chunk_mask_full.unsqueeze(-1),
                                       very_neg)
         mx = x.amax(dim=dim)  # (B, hidden_dim)
@@ -1156,8 +1161,8 @@ class AgentFusionEncoder(nn.Module):
         return agents_past_cur_off_p_mask, agents_past_cur_off_mask
 
     def _reverse_agents_past_cur_mask(
-            self, agents_past_cur_off_p_mask: torch.Tensor,
-            agents_past_cur_off_mask: torch.Tensor
+        self, agents_past_cur_off_p_mask: torch.Tensor,
+        agents_past_cur_off_mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Input:
@@ -1170,7 +1175,7 @@ class AgentFusionEncoder(nn.Module):
         """
         agents_past_cur_on_p_mask = (
             ~agents_past_cur_off_p_mask).float().unsqueeze(
-            -1)  # (B, agents_num, time_len, 1)
+                -1)  # (B, agents_num, time_len, 1)
         agents_past_cur_on_mask = ~agents_past_cur_off_mask.reshape(
             -1)  # (B * agents_num)
         return agents_past_cur_on_p_mask, agents_past_cur_on_mask
@@ -1197,12 +1202,12 @@ class AgentFusionEncoder(nn.Module):
         return ego_future_off_p_mask, ego_future_off_mask
 
     def _filter_on_agents_past_cur(
-            self,
-            agents_past_current: torch.
-            Tensor,  # (B, agents_num, time_len, 12 + 2K + 1 )
-            agents_past_cur_on_p_mask: torch.
-            Tensor,  # (B, agents_num, time_len, 1) # float
-            agents_past_cur_on_mask: torch.Tensor  # (B * agents_num)
+        self,
+        agents_past_current: torch.
+        Tensor,  # (B, agents_num, time_len, 12 + 2K + 1 )
+        agents_past_cur_on_p_mask: torch.
+        Tensor,  # (B, agents_num, time_len, 1) # float
+        agents_past_cur_on_mask: torch.Tensor  # (B * agents_num)
     ) -> torch.Tensor:  # (agents_past_cur_on_num, time_len, 12 + 2K + 1 "+1")
         B, agents_num, time_len, _ = agents_past_current.shape
         # agents_past_current: (B , agents_num, time_len, 12 + 2K + 1 "+1")
@@ -1223,10 +1228,10 @@ class AgentFusionEncoder(nn.Module):
         return on_agents_past_cur
 
     def _filter_on_ego_future(
-            self,
-            ego_future: torch.Tensor,  # (B, future_len,  12 + 2K + 1)
-            ego_future_on_p_mask: torch.Tensor,  # (B, future_len, 1)
-            ego_future_on_mask: torch.Tensor  # (B)
+        self,
+        ego_future: torch.Tensor,  # (B, future_len,  12 + 2K + 1)
+        ego_future_on_p_mask: torch.Tensor,  # (B, future_len, 1)
+        ego_future_on_mask: torch.Tensor  # (B)
     ) -> torch.Tensor:
         ego_future = torch.cat(
             [ego_future, ego_future_on_p_mask.to(ego_future.dtype)],
@@ -1239,11 +1244,11 @@ class AgentFusionEncoder(nn.Module):
         return on_ego_future  # (ego_future_on_num, future_len, 14 + 2k)
 
     def _concat_past_cur_and_future(
-            self,
-            on_agents_past_cur: torch.
-            Tensor,  # (agents_past_cur_on_num, time_len, 14 + 2k)
-            on_ego_future: torch.Tensor
-            # (ego_future_on_num, future_len, 14 + 2k)
+        self,
+        on_agents_past_cur: torch.
+        Tensor,  # (agents_past_cur_on_num, time_len, 14 + 2k)
+        on_ego_future: torch.Tensor
+        # (ego_future_on_num, future_len, 14 + 2k)
     ) -> torch.Tensor:  # (on_all_time_num = agents_past_cur_on_num * time_len + ego_future_on_num * future_len, 14 + 2k)
         # (agents_past_cur_on_num * time_len, 10+2k)
         on_agents_past_cur = on_agents_past_cur.reshape(
@@ -1336,11 +1341,11 @@ class AgentFusionEncoder(nn.Module):
         return chunk_token
 
     def traj_to_chunk_token(
-            self,
-            on_trajs: torch.Tensor,
-            on_trajs_off_p_mask: torch.Tensor,
-            chunk_starts: torch.Tensor,
-            chunk_ends: torch.Tensor,
+        self,
+        on_trajs: torch.Tensor,
+        on_trajs_off_p_mask: torch.Tensor,
+        chunk_starts: torch.Tensor,
+        chunk_ends: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """균등 분할된 각 구간에 대해 **집계 토큰**과 **구간 마스크**를 만든다.
 
@@ -1391,12 +1396,12 @@ class AgentFusionEncoder(nn.Module):
         return chunks, invalid_chunk_mask
 
     def _get_on_past_cur_on_chunk_num_sized_agents_type(
-            self,
-            agents_type: torch.Tensor,  # (B, agents_num, 3)
-            agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
-            on_agents_past_cur_on_chunk_mask: torch.
-            Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
-            past_cur_chunk_num: int
+        self,
+        agents_type: torch.Tensor,  # (B, agents_num, 3)
+        agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
+        on_agents_past_cur_on_chunk_mask: torch.
+        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
+        past_cur_chunk_num: int
     ) -> torch.Tensor:  # (on_past_cur_on_chunk_num, 3)
         # (B * agents_num, 3)
         B, agents_num = agents_type.shape[:2]
@@ -1418,12 +1423,12 @@ class AgentFusionEncoder(nn.Module):
         return agents_type
 
     def _get_on_ego_fut_on_chunk_num_sized_ego_fut_type(
-            self,
-            ego_fut_type: torch.Tensor,  # (B, 3)
-            ego_future_on_mask: torch.Tensor,  # (B)
-            on_ego_fut_on_chunk_mask: torch.
-            Tensor,  # (on_ego_fut_on_num * future_chunk_num)
-            future_chunk_num: int
+        self,
+        ego_fut_type: torch.Tensor,  # (B, 3)
+        ego_future_on_mask: torch.Tensor,  # (B)
+        on_ego_fut_on_chunk_mask: torch.
+        Tensor,  # (on_ego_fut_on_num * future_chunk_num)
+        future_chunk_num: int
     ) -> torch.Tensor:
         # ego_fut_type: (B, 3) -> (ego_future_on_num, 3)
         ego_fut_type = ego_fut_type[ego_future_on_mask]
@@ -1442,17 +1447,17 @@ class AgentFusionEncoder(nn.Module):
         return ego_fut_type
 
     def _get_type_embedding(
-            self,
-            agents_type: torch.Tensor,  # (B, agents_num, 3)
-            ego_fut_type: torch.Tensor,  # (B, 3)
-            agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
-            ego_future_on_mask: torch.Tensor,  # (B)
-            on_agents_past_cur_on_chunk_mask: torch.
-            Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
-            on_ego_fut_on_chunk_mask: torch.
-            Tensor,  # (ego_future_on_num * future_chunk_num)
-            past_cur_chunk_num: int,
-            future_chunk_num: int,
+        self,
+        agents_type: torch.Tensor,  # (B, agents_num, 3)
+        ego_fut_type: torch.Tensor,  # (B, 3)
+        agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
+        ego_future_on_mask: torch.Tensor,  # (B)
+        on_agents_past_cur_on_chunk_mask: torch.
+        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
+        on_ego_fut_on_chunk_mask: torch.
+        Tensor,  # (ego_future_on_num * future_chunk_num)
+        past_cur_chunk_num: int,
+        future_chunk_num: int,
     ) -> torch.Tensor:  # (on_all_on_chunk_num, channels_mlp_dim)
         # agents_type: (on_past_cur_on_chunk_num, 3)
         agents_type = self._get_on_past_cur_on_chunk_num_sized_agents_type(
@@ -1475,9 +1480,9 @@ class AgentFusionEncoder(nn.Module):
             self,
             on_all_on_chunk: torch.Tensor,  # (on_all_on_chunk_num, hidden_dim)
             on_agents_past_cur_on_chunk_mask: torch.
-            Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
+        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
             on_ego_fut_on_chunk_mask: torch.
-            Tensor,  # (ego_future_on_num * future_chunk_num)
+        Tensor,  # (ego_future_on_num * future_chunk_num)
             on_past_cur_on_chunk_num: int,
             agents_past_cur_on_num: int,
             ego_future_on_num: int,
@@ -1520,11 +1525,11 @@ class AgentFusionEncoder(nn.Module):
         return on_agents_past_cur_chunk, on_ego_fut_chunk
 
     def _get_all_off_chunk_mask(
-            self,
-            agents_past_cur_on_mask: torch.Tensor,
-            on_agents_past_cur_off_chunk_mask: torch.Tensor,
-            ego_future_on_mask: torch.Tensor,
-            on_ego_fut_off_chunk_mask: torch.Tensor,
+        self,
+        agents_past_cur_on_mask: torch.Tensor,
+        on_agents_past_cur_off_chunk_mask: torch.Tensor,
+        ego_future_on_mask: torch.Tensor,
+        on_ego_fut_off_chunk_mask: torch.Tensor,
     ) -> torch.Tensor:
         """과거/현재(agents)와 미래(ego)의 구간 무효(True) 마스크를 (B, A*M_past + M_future)로 결합해 반환.
 
@@ -1594,7 +1599,7 @@ class AgentFusionEncoder(nn.Module):
         # (B, agents_num * past_cur_chunk_num)로 펴기
         agents_past_cur_off_chunk_mask = agents_past_cur_off_chunk_mask.reshape(
             B, agents_num, past_cur_chunk_num).reshape(
-            B, agents_num * past_cur_chunk_num)  # (B, A*M_past)
+                B, agents_num * past_cur_chunk_num)  # (B, A*M_past)
 
         # -------------------- 2) ego 미래 구간 무효 마스크 구성 --------------------
         # (B, future_chunk_num), 기본 True=무효로 초기화하고, 유효한 chunk 찾아서 False로 덮어쓰기
@@ -1632,12 +1637,12 @@ class AgentFusionEncoder(nn.Module):
         return agents_past_cur_chunks_type  # (B, agents_num, past_cur_chunk_num, 4)
 
     def _get_agents_past_cur_chunks_xyyaw(
-            self,
-            past_chunk_start_idx: torch.Tensor,  # (past_cur_chunk_num,)
-            past_chunk_end_idx: torch.Tensor,  # (past_cur_chunk_num,)
-            agents_past_cur_off_p_mask: torch.Tensor,
-            # (B, agents_num, time_len)
-            agents_past_cur_xyyaw: torch.Tensor  # (B, agents_num, time_len, 4)
+        self,
+        past_chunk_start_idx: torch.Tensor,  # (past_cur_chunk_num,)
+        past_chunk_end_idx: torch.Tensor,  # (past_cur_chunk_num,)
+        agents_past_cur_off_p_mask: torch.Tensor,
+        # (B, agents_num, time_len)
+        agents_past_cur_xyyaw: torch.Tensor  # (B, agents_num, time_len, 4)
     ) -> torch.Tensor:  # (B, agents_num, past_cur_chunk_num, 4)
         B, agents_num, time_len, feat_dim = agents_past_cur_xyyaw.shape
         past_cur_chunk_num: int = past_chunk_start_idx.numel()
@@ -1696,12 +1701,12 @@ class AgentFusionEncoder(nn.Module):
         return agents_past_cur_chunks_xyyaw  # (B, agents_num, past_cur_chunk_num, 4)
 
     def _get_agents_past_cur_chunks_feature(
-            self,
-            past_chunk_start_idx: torch.Tensor,  # (past_cur_chunk_num,)
-            past_chunk_end_idx: torch.Tensor,  # (past_cur_chunk_num,)
-            agents_past_cur_off_p_mask: torch.Tensor,
-            # (B, agents_num, time_len)
-            agents_past_cur_xyyaw: torch.Tensor  # (B, agents_num, time_len, 4)
+        self,
+        past_chunk_start_idx: torch.Tensor,  # (past_cur_chunk_num,)
+        past_chunk_end_idx: torch.Tensor,  # (past_cur_chunk_num,)
+        agents_past_cur_off_p_mask: torch.Tensor,
+        # (B, agents_num, time_len)
+        agents_past_cur_xyyaw: torch.Tensor  # (B, agents_num, time_len, 4)
     ) -> torch.Tensor:  # (B, agents_num * past_cur_chunk_num, 8)
         B, agents_num, time_len, _ = agents_past_cur_xyyaw.shape
         past_cur_chunk_num = past_chunk_start_idx.shape[0]
@@ -1723,11 +1728,11 @@ class AgentFusionEncoder(nn.Module):
         return agents_past_cur_chunks_feature
 
     def _get_ego_fut_chunks_pose(
-            self,
-            fut_chunk_start_idx: torch.Tensor,  # (future_chunk_num,)
-            fut_chunk_end_idx: torch.Tensor,  # (future_chunk_num,)
-            ego_future_off_p_mask: torch.Tensor,  # (B, future_len)
-            ego_future_xyyaw: torch.Tensor  # (B, future_len, 4)
+        self,
+        fut_chunk_start_idx: torch.Tensor,  # (future_chunk_num,)
+        fut_chunk_end_idx: torch.Tensor,  # (future_chunk_num,)
+        ego_future_off_p_mask: torch.Tensor,  # (B, future_len)
+        ego_future_xyyaw: torch.Tensor  # (B, future_len, 4)
     ) -> torch.Tensor:  # (B, future_chunk_num, 4)
         B, future_len, feat_dim = ego_future_xyyaw.shape
         future_chunk_num: int = fut_chunk_start_idx.numel()
@@ -1783,8 +1788,8 @@ class AgentFusionEncoder(nn.Module):
         return ego_fut_chunks_xyyaw
 
     def _get_ego_fut_chunks_type(
-            self, ego_future_chunks_feature: torch.Tensor
-            # (B, future_chunk_num, 4)
+        self, ego_future_chunks_feature: torch.Tensor
+        # (B, future_chunk_num, 4)
     ) -> torch.Tensor:  # (B, future_chunk_num, 4)
         B, future_chunk_num = ego_future_chunks_feature.shape[:2]
         ego_fut_chunks_type = torch.zeros(
@@ -1837,7 +1842,7 @@ class AgentFusionEncoder(nn.Module):
             dim=-1)  # (B, agents_num, time_len, 12 + 2K + 1)
         # (B, agents_num, time_len, 12 + 2K + 1)
         assert agents_past_current.shape[
-                   -1] == 12 + 2 * self.num_fourier_frequencies + 1
+            -1] == 12 + 2 * self.num_fourier_frequencies + 1
         return agents_past_current
 
     def _add_timestep_to_ego_fut(self,
@@ -1860,8 +1865,8 @@ class AgentFusionEncoder(nn.Module):
         return ego_future
 
     def _get_on_agents_past_cur_on_chunk(
-            self, on_agents_past_cur_chunk: torch.Tensor,
-            on_agents_past_cur_off_chunk_mask: torch.Tensor
+        self, on_agents_past_cur_chunk: torch.Tensor,
+        on_agents_past_cur_off_chunk_mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         on_agents_past_cur_chunk: (agents_past_cur_on_num, past_cur_chunk_num, tokens_mlp_dim, channels_mlp_dim)
@@ -1873,9 +1878,8 @@ class AgentFusionEncoder(nn.Module):
         on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
         """
         assert on_agents_past_cur_off_chunk_mask.dtype == torch.bool
-        agents_past_cur_on_num, past_cur_chunk_num = on_agents_past_cur_chunk.shape[
-            :
-            2]
+        agents_past_cur_on_num, past_cur_chunk_num = on_agents_past_cur_chunk.shape[:
+                                                                                    2]
         on_agents_past_cur_chunk = on_agents_past_cur_chunk.reshape(
             agents_past_cur_on_num * past_cur_chunk_num, self.tokens_mlp_dim,
             -1)
@@ -1886,9 +1890,9 @@ class AgentFusionEncoder(nn.Module):
         return on_agents_past_cur_on_chunk, on_agents_past_cur_on_chunk_mask
 
     def _get_on_ego_fut_on_chunk(
-            self,
-            on_ego_fut_chunk: torch.Tensor,
-            on_ego_fut_off_chunk_mask: torch.Tensor,
+        self,
+        on_ego_fut_chunk: torch.Tensor,
+        on_ego_fut_off_chunk_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         on_ego_fut_chunk: (ego_future_on_num, future_chunk_num, tokens_mlp_dim, channels_mlp_dim)
@@ -2009,7 +2013,7 @@ class AgentFusionEncoder(nn.Module):
                 )
 
             agent_past_current_xyyaw = agents_past_current[..., :
-                                                                4]  # (B, A, T, 4)
+                                                           4]  # (B, A, T, 4)
             agents_current_xyyaw = agents_current_xyyaw.to(
                 dtype=dtype, device=device)  # (B, A, 4)
             agents_current_xyyaw = agents_current_xyyaw.unsqueeze(
@@ -2060,7 +2064,7 @@ class AgentFusionEncoder(nn.Module):
             cos_t, sin_t = agent_past_current_xyyaw[
                 ..., 2], agent_past_current_xyyaw[..., 3]
             cos_0, sin_0 = agents_current_xyyaw[...,
-            2], agents_current_xyyaw[..., 3]
+                                                2], agents_current_xyyaw[..., 3]
             cos_d = cos_t * cos_0 + sin_t * sin_0  # (B, T)
             sin_d = sin_t * cos_0 - cos_t * sin_0  # (B, T)
             delta_dir = torch.stack((cos_d, sin_d), dim=-1)  # (B, T, 2)
@@ -2109,7 +2113,7 @@ class AgentFusionEncoder(nn.Module):
         ### add timestep
         # agents_past_current: (B, agents_num, time_len, 12 "+ 2K + 1")
         (agents_past_current
-         ) = self._add_timestep_to_agents_past_cur(agents_past_current)
+        ) = self._add_timestep_to_agents_past_cur(agents_past_current)
 
         ############
         """
@@ -2121,10 +2125,10 @@ class AgentFusionEncoder(nn.Module):
 
         """
         (agents_past_cur_off_p_mask, agents_past_cur_off_mask
-         ) = self._get_agents_past_cur_mask(agents_past_current)
+        ) = self._get_agents_past_cur_mask(agents_past_current)
         (agents_past_cur_on_p_mask,
          agents_past_cur_on_mask) = self._reverse_agents_past_cur_mask(
-            agents_past_cur_off_p_mask, agents_past_cur_off_mask)
+             agents_past_cur_off_p_mask, agents_past_cur_off_mask)
         agents_past_cur_on_p_mask = agents_past_cur_on_p_mask.to(
             agents_past_current.dtype)
 
@@ -2239,7 +2243,7 @@ class AgentFusionEncoder(nn.Module):
         #   (agents_past_cur_on_num, past_cur_chunk_num)
 
         (on_agents_past_cur_chunk, on_agents_past_cur_off_chunk_mask
-         ) = self.traj_to_chunk_token(
+        ) = self.traj_to_chunk_token(
             on_agents_past_cur,
             # (agents_past_cur_on_num, time_len, channels_mlp_dim)
             on_agents_past_cur_off_p_mask,  # (agents_past_cur_on_num, time_len)
@@ -2260,15 +2264,15 @@ class AgentFusionEncoder(nn.Module):
         #   (ego_future_on_num, future_chunk_num)
         (on_ego_fut_chunk,
          on_ego_fut_off_chunk_mask) = self.traj_to_chunk_token(
-            on_ego_future,  # (ego_future_on_num, future_len, channels_mlp_dim)
-            on_ego_future_off_p_mask,  # (ego_future_on_num, future_len)
-            fut_chunk_start_idx,  # (future_chunk_num,)
-            fut_chunk_end_idx,  # (future_chunk_num,)
-        )
+             on_ego_future,  # (ego_future_on_num, future_len, channels_mlp_dim)
+             on_ego_future_off_p_mask,  # (ego_future_on_num, future_len)
+             fut_chunk_start_idx,  # (future_chunk_num,)
+             fut_chunk_end_idx,  # (future_chunk_num,)
+         )
         # on_agents_past_cur_on_chunk: (on_past_cur_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
         # on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
         (on_agents_past_cur_on_chunk, on_agents_past_cur_on_chunk_mask
-         ) = self._get_on_agents_past_cur_on_chunk(
+        ) = self._get_on_agents_past_cur_on_chunk(
             on_agents_past_cur_chunk, on_agents_past_cur_off_chunk_mask)
         on_past_cur_on_chunk_num = on_agents_past_cur_on_chunk.shape[0]
 
@@ -2276,7 +2280,7 @@ class AgentFusionEncoder(nn.Module):
         # on_ego_fut_on_chunk_mask: (ego_future_on_num * future_chunk_num)
         (on_ego_fut_on_chunk,
          on_ego_fut_on_chunk_mask) = self._get_on_ego_fut_on_chunk(
-            on_ego_fut_chunk, on_ego_fut_off_chunk_mask)
+             on_ego_fut_chunk, on_ego_fut_off_chunk_mask)
         """
         on_all_on_chunk: (on_all_on_chunk_num, tokens_mlp_dim, channels_mlp_dim)
             on_all_on_chunk_num = on_past_cur_on_chunk_num + on_ego_fut_on_chunk_num
@@ -2308,10 +2312,10 @@ class AgentFusionEncoder(nn.Module):
         # on_ego_fut_chunk: (ego_future_on_num, future_chunk_num, hidden_dim)
         (on_agents_past_cur_chunk,
          on_ego_fut_chunk) = self._fill_on_chunk_to_on_agent(
-            on_all_on_chunk, on_agents_past_cur_on_chunk_mask,
-            on_ego_fut_on_chunk_mask, on_past_cur_on_chunk_num,
-            agents_past_cur_on_num, ego_future_on_num, self.past_cur_chunk_num,
-            self.future_chunk_num)
+             on_all_on_chunk, on_agents_past_cur_on_chunk_mask,
+             on_ego_fut_on_chunk_mask, on_past_cur_on_chunk_num,
+             agents_past_cur_on_num, ego_future_on_num, self.past_cur_chunk_num,
+             self.future_chunk_num)
 
         # agents_past_cur_chunk: (B, agents_num * past_cur_chunk_num , hidden_dim)
         # ego_fut_chunk: (B, future_chunk_num, hidden_dim)
@@ -2378,18 +2382,18 @@ class AgentFusionEncoder(nn.Module):
                                 ego_fut_on_chunk_mask_full.float()).sum(dim=dim)
         ego_fut_on_chunk_mean = (ego_fut_on_chunk_sum /
                                  on_chunk_num_per_batch.to(torch.float32)).to(
-            ego_fut_chunk.dtype)
+                                     ego_fut_chunk.dtype)
 
         assert ego_fut_on_chunk_mean.shape == (B, H)
 
         return ego_fut_on_chunk_mean
 
     def _get_ego_fut_global(
-            self,
-            ego_fut_chunk: torch.Tensor,  # (B, future_chunk_num, hidden_dim)
-            ego_future_on_mask: torch.Tensor,  # (B) True=유효
-            on_ego_fut_off_chunk_mask: torch.Tensor,
-            # (ego_future_on_num, future_chunk_num) True=무효
+        self,
+        ego_fut_chunk: torch.Tensor,  # (B, future_chunk_num, hidden_dim)
+        ego_future_on_mask: torch.Tensor,  # (B) True=유효
+        on_ego_fut_off_chunk_mask: torch.Tensor,
+        # (ego_future_on_num, future_chunk_num) True=무효
     ) -> torch.Tensor:  # (B, hidden_dim)
         # --- (A) 배치 크기로 확장된 미래 chunk 마스크: (B, future_chunk_num) True=무효 ---
         B, future_chunk_num, hidden_dim = ego_fut_chunk.shape
@@ -2529,8 +2533,8 @@ class StaticFusionEncoder(nn.Module):
         return static_encoding, mask_p, static_feature
 
     def _get_static_feature(
-            self,
-            static_xyyaw: torch.Tensor  # (B, static_objects_num, 4)
+        self,
+        static_xyyaw: torch.Tensor  # (B, static_objects_num, 4)
     ) -> torch.Tensor:
         B, static_objects_num, _ = static_xyyaw.shape
         # static_type: (B, static_objects_num, 4) # 4:
@@ -2599,8 +2603,8 @@ class LaneFusionEncoder(nn.Module):
                                drop=drop_path_rate)
 
     def _get_lane_feature(
-            self, lane_xyyaw: torch.Tensor
-            # (B, lane_num, 4)
+        self, lane_xyyaw: torch.Tensor
+        # (B, lane_num, 4)
     ) -> torch.Tensor:  # (B, lane_num, 4 + 4)
         B, lane_num, _ = lane_xyyaw.shape
         # lane_type: (B, lane_num, 4)
@@ -2797,8 +2801,8 @@ class FusionEncoder(nn.Module):
                                         dim=1)  # [on_B, token_num+1, H]
             cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
             cls_with_tokens[:, 0:
-                               1, :] = cls_with_tokens[:, 0:
-                                                          1, :] + cls_pos  # [on_B, 1, H] += pos
+                            1, :] = cls_with_tokens[:, 0:
+                                                    1, :] + cls_pos  # [on_B, 1, H] += pos
 
             # 4) 마스크에 CLS(False) 추가
             cls_false = torch.zeros(

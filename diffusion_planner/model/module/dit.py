@@ -168,7 +168,6 @@ class DiTBlock(nn.Module):
                         act_layer=approx_gelu,
                         drop=0)
 
-
         self.norm3 = nn.LayerNorm(dim)
         self.norm4 = nn.LayerNorm(dim)
         self.mlp2 = Mlp(in_features=dim,
@@ -187,23 +186,10 @@ class DiTBlock(nn.Module):
         self.out_proj_cross = nn.Linear(dim, dim, bias=True)
 
         # === 게이트(원본 유지) ===
-        self.gate_cross = nn.Parameter(torch.tensor(0.0))
         self.gate_mlp2 = nn.Parameter(torch.tensor(0.0))
 
         # Dropout 확률(Train일 때만 FA2에 전달)
         self._attn_dropout_p = dropout
-
-
-
-        # 경로 잔차의 전체 스케일(학습 가능한 스칼라, 0에서 시작)
-        self.route_msa_alpha = nn.Parameter(torch.tensor(0.0))  # Self-Attn 경로용
-        self.route_mlp_alpha = nn.Parameter(torch.tensor(0.0))  # MLP1 경로용
-
-
-
-        # ego 잔차 스케일 (0에서 시작 → 학습되며 서서히 켜짐)
-        self.ego_msa_alpha = nn.Parameter(torch.tensor(0.0))
-        self.ego_mlp_alpha = nn.Parameter(torch.tensor(0.0))
 
     # ====================== 유틸/헬퍼 함수들 ======================
 
@@ -290,8 +276,8 @@ class DiTBlock(nn.Module):
         T = x_unpad.shape[0]
         if T == 0 or max_seqlen == 0:
             # 파라미터 터치(0 곱해서 손실엔 영향 0) → 그래프에 포함
-            touch = (self.qkv_proj.weight.view(-1)[:1].sum()
-                     + self.out_proj.weight.view(-1)[:1].sum()) * 0.0
+            touch = (self.qkv_proj.weight.view(-1)[:1].sum() +
+                     self.out_proj.weight.view(-1)[:1].sum()) * 0.0
             return torch.zeros_like(x) + touch
 
         # (2) QKV 프로젝션 (유효 토큰만)
@@ -373,7 +359,21 @@ class DiTBlock(nn.Module):
 
         if q_unpad.numel() == 0 or kv_unpad.numel(
         ) == 0 or max_q == 0 or max_k == 0:
-            return torch.zeros(B, Lq, D, device=q_in.device, dtype=q_in.dtype)
+            out_zeros = torch.zeros(B,
+                                    Lq,
+                                    D,
+                                    device=q_in.device,
+                                    dtype=q_in.dtype)
+            touch = (self.q_proj_cross.weight.view(-1)[:1].sum() +
+                     (self.q_proj_cross.bias.view(-1)[:1].sum()
+                      if self.q_proj_cross.bias is not None else 0) +
+                     self.kv_proj_cross.weight.view(-1)[:1].sum() +
+                     (self.kv_proj_cross.bias.view(-1)[:1].sum()
+                      if self.kv_proj_cross.bias is not None else 0) +
+                     self.out_proj_cross.weight.view(-1)[:1].sum() +
+                     (self.out_proj_cross.bias.view(-1)[:1].sum()
+                      if self.out_proj_cross.bias is not None else 0)) * 0.0
+            return out_zeros + touch
 
         Tq = q_unpad.shape[0]
         Tk = kv_unpad.shape[0]
@@ -409,9 +409,6 @@ class DiTBlock(nn.Module):
         return out
 
     # ====================== (추가) 함수화된 per‑agent adaLN 로직 ======================
-
-
-
 
     def _combine_global_and_route_modulations(
         self,
@@ -494,7 +491,6 @@ class DiTBlock(nn.Module):
                                scale_mlp_pa)  # (B, P, D)
         x = x + gate_mlp_pa * self.mlp1(modulated_x)  # (B, P, D)
         return x
-
 
     def forward(
         self,

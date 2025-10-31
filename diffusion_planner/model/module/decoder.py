@@ -574,7 +574,16 @@ class DiT(nn.Module):
         # 모든 토큰이 pad인 극단 케이스 방어
         if x_unpad.numel() == 0:
             D_out = self.preproj.fc2.out_features  # timm Mlp의 최종 out_features
-            return near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
+            zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
+            zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
+            # timm Mlp(fc1/fc2)의 파라미터를 0-스케일로 터치(그래프 포함)
+            touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
+                     (self.preproj.fc1.bias.view(-1)[:1].sum()
+                      if self.preproj.fc1.bias is not None else 0) +
+                     self.preproj.fc2.weight.view(-1)[:1].sum() +
+                     (self.preproj.fc2.bias.view(-1)[:1].sum()
+                      if self.preproj.fc2.bias is not None else 0)) * 0.0
+            return zeros + touch
 
         # 유효 토큰만 pre‑proj 수행  (T, F) -> (T, D)
         x_unpad = self.preproj(x_unpad)  # (T, D)
