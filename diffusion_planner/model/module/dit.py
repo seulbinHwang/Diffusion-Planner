@@ -168,11 +168,6 @@ class DiTBlock(nn.Module):
                         act_layer=approx_gelu,
                         drop=0)
 
-        # 전역(ego_fut_global + t)에서 (B, D) 모듈레이션 6개 생성
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True))
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
 
         self.norm3 = nn.LayerNorm(dim)
         self.norm4 = nn.LayerNorm(dim)
@@ -198,31 +193,13 @@ class DiTBlock(nn.Module):
         # Dropout 확률(Train일 때만 FA2에 전달)
         self._attn_dropout_p = dropout
 
-        # ==== (추가) per-agent route 기반 잔차 모듈레이션 ====
-        # 입력: near_agents_route_lane_emb (B, Pnn, D) → 출력: (B, Pnn, 6D)
-        self.route_adaLN_modulation = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True),
-        )
-        # 잔차 0 초기화(adaLN‑Zero 정신 유지): 초기엔 전역만 작동
-        nn.init.zeros_(self.route_adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.route_adaLN_modulation[-1].bias)
+
 
         # 경로 잔차의 전체 스케일(학습 가능한 스칼라, 0에서 시작)
         self.route_msa_alpha = nn.Parameter(torch.tensor(0.0))  # Self-Attn 경로용
         self.route_mlp_alpha = nn.Parameter(torch.tensor(0.0))  # MLP1 경로용
 
-        # ==== (신규) per-agent ego 계획 기반 잔차 모듈레이션 ====
-        # 입력: concat([near_agents_route_lane_emb, ego_fut_global⊕]) → (B,P,2D)
-        # 출력: (B,P,6D) → Δshift/scale/gate (MSA/MLP1 경로)
-        self.ego_adaLN_mod = nn.Sequential(
-            nn.LayerNorm(2 * dim),
-            nn.SiLU(),
-            nn.Linear(2 * dim, 6 * dim, bias=True),
-        )
-        nn.init.zeros_(self.ego_adaLN_mod[-1].weight)
-        nn.init.zeros_(self.ego_adaLN_mod[-1].bias)
+
 
         # ego 잔차 스케일 (0에서 시작 → 학습되며 서서히 켜짐)
         self.ego_msa_alpha = nn.Parameter(torch.tensor(0.0))
@@ -312,7 +289,10 @@ class DiTBlock(nn.Module):
 
         T = x_unpad.shape[0]
         if T == 0 or max_seqlen == 0:
-            return torch.zeros_like(x)
+            # 파라미터 터치(0 곱해서 손실엔 영향 0) → 그래프에 포함
+            touch = (self.qkv_proj.weight.view(-1)[:1].sum()
+                     + self.out_proj.weight.view(-1)[:1].sum()) * 0.0
+            return torch.zeros_like(x) + touch
 
         # (2) QKV 프로젝션 (유효 토큰만)
         qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
@@ -430,58 +410,8 @@ class DiTBlock(nn.Module):
 
     # ====================== (추가) 함수화된 per‑agent adaLN 로직 ======================
 
-    def _compute_global_adaln(
-        self,
-        global_condition: torch.Tensor,  # (B, D)  t_embedding
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
-        """전역 조건으로부터 (B, D) 모듈레이션 6개를 계산합니다."""
-        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-         gate_mlp) = self.adaLN_modulation(global_condition).chunk(6, dim=1)
-        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
-    def _compute_route_residual_adaln(
-        self,
-        per_agent_route_lane_emb: torch.Tensor,  # (B, P, D)
-        route_known_mask: torch.Tensor
-        # (B, P)  True=route known
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
-        """에이전트별 route 임베딩(B, P, D)으로부터 (B, P, D) 잔차 모듈레이션 6개를 계산합니다.
 
-        Args:
-            per_agent_route_lane_emb (torch.Tensor): (B, P, D) route 기반 임베딩.
-            route_known_mask (Optional[torch.Tensor]): (B, P) bool, True=route 정보 있음.
-                - 제공되면, 알려지지 않은 에이전트(=False)의 잔차 Δ를 0으로 강제합니다.
-
-        Returns:
-            Tuple[torch.Tensor, ...]: (delta_shift_msa, delta_scale_msa, delta_gate_msa,
-                                       delta_shift_mlp, delta_scale_mlp, delta_gate_mlp),
-                                       각각 (B, P, D).
-        """
-        # route_modulation: (B, P, 6D)
-        route_modulation: torch.Tensor = self.route_adaLN_modulation(
-            per_agent_route_lane_emb)
-        (delta_shift_msa, delta_scale_msa, delta_gate_msa, delta_shift_mlp,
-         delta_scale_mlp, delta_gate_mlp) = route_modulation.chunk(6, dim=-1)
-        if route_known_mask.dtype != torch.bool:
-            raise ValueError(
-                f"route_known_mask must be bool, got {route_known_mask.dtype}")
-        if route_known_mask.shape != per_agent_route_lane_emb.shape[:2]:
-            raise ValueError(
-                f"route_known_mask shape must be (B,P)={per_agent_route_lane_emb.shape[:2]}, "
-                f"got {tuple(route_known_mask.shape)}")
-        # (B,P) → (B,P,1)로 승격 후 Δ항을 0으로 강제
-        keep = route_known_mask.unsqueeze(-1)  # True=keep Δ, False=zero Δ
-        delta_shift_msa = delta_shift_msa.masked_fill(~keep, 0)
-        delta_scale_msa = delta_scale_msa.masked_fill(~keep, 0)
-        delta_gate_msa = delta_gate_msa.masked_fill(~keep, 0)
-        delta_shift_mlp = delta_shift_mlp.masked_fill(~keep, 0)
-        delta_scale_mlp = delta_scale_mlp.masked_fill(~keep, 0)
-        delta_gate_mlp = delta_gate_mlp.masked_fill(~keep, 0)
-
-        return (delta_shift_msa, delta_scale_msa, delta_gate_msa,
-                delta_shift_mlp, delta_scale_mlp, delta_gate_mlp)
 
     def _combine_global_and_route_modulations(
         self,
@@ -565,97 +495,8 @@ class DiTBlock(nn.Module):
         x = x + gate_mlp_pa * self.mlp1(modulated_x)  # (B, P, D)
         return x
 
-    def _compute_ego_future_adaln(
-        self,
-        ego_fut_global_expand: torch.Tensor,  # (B, Pnn, D)
-        near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-        route_known_mask: torch.Tensor  # (B, Pnn) True=known
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
-        """
-        ego_fut_global_expand 에서, 마지막 차원의 값이 전부 0. 이면 -> 무효한 에이전트이므로, 잔차 Δ를 0으로 강제합니다.
-
-        """
-        # (B,Pnn) True=valid ego_fut_global_expand
-        valid_ego_mask = (ego_fut_global_expand.abs().sum(dim=-1) != 0)
-
-        pair = torch.cat([near_agents_route_lane_emb, ego_fut_global_expand],
-                         dim=-1)  # (B,Pnn,2D)
-        d_ego = self.ego_adaLN_mod(pair)  # (B,Pnn,6D)
-        (dsh_msa_e, dsc_msa_e, dgt_msa_e, dsh_mlp_e, dsc_mlp_e,
-         dgt_mlp_e) = d_ego.chunk(6, dim=-1)  # 각각 (B,Pnn,D)
-        keep = (valid_ego_mask & route_known_mask).unsqueeze(-1)  # (B,P,1)
-        dsh_msa_e = dsh_msa_e.masked_fill(~keep, 0)
-        dsc_msa_e = dsc_msa_e.masked_fill(~keep, 0)
-        dgt_msa_e = dgt_msa_e.masked_fill(~keep, 0)
-        dsh_mlp_e = dsh_mlp_e.masked_fill(~keep, 0)
-        dsc_mlp_e = dsc_mlp_e.masked_fill(~keep, 0)
-        dgt_mlp_e = dgt_mlp_e.masked_fill(~keep, 0)
-        return dsh_msa_e, dsc_msa_e, dgt_msa_e, dsh_mlp_e, dsc_mlp_e, dgt_mlp_e
 
     def forward(
-        self,
-        x: torch.Tensor,  # (B, Pnn, D)
-        cross_c: torch.Tensor,  # (B, token_num, D)
-        t_embedding: torch.Tensor,  # (B, D)  t_embedding
-        ego_fut_global: torch.Tensor,  # (B, D)
-        near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-        attn_mask: torch.Tensor,  # (B, Pnn) True=pad # near_current_mask
-        cross_mask: torch.Tensor,  # (B, token_num)   True=pad
-        route_known_mask: torch.Tensor  # (B, Pnn) True=known
-    ) -> torch.Tensor:
-        """
-        순서:
-            1) 전역 모듈레이션(B,D) 6개 계산
-            2) per‑agent route 잔차(B,Pnn,D) 6개 계산
-            3) 결합하여 (B,Pnn,D) 6개 모듈레이션 생성
-            4) Self‑Attention → MLP1 (per‑agent 모듈레이션 적용)
-            5) Cross‑Attention → MLP2 (원본 게이트 유지)
-
-        Note:
-            - FlashAttention‑2 varlen 경로로 무효 토큰(패딩)을 완전히 건너뜁니다.
-            - pad back 시 마스크된 위치는 자연스럽게 0이 되며, gradient도 올바르게 흘러갑니다.
-        """
-        B, Pnn, D = x.shape
-        # t_embedding: (B, D=192)
-        # 1) 전역(B,D)
-        # global_mods: shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-        global_mods = self._compute_global_adaln(t_embedding)  # (B,D)×6
-        # 2) per-agent 잔차(B,Pnn,D) 6개 (+선택적 마스킹 적용)
-        route_residuals_mods = self._compute_route_residual_adaln(
-            near_agents_route_lane_emb.to(x.dtype),
-            route_known_mask=route_known_mask)  # (B,Pnn,D)×6
-        #################
-        ego_fut_global_expand = ego_fut_global.to(x.dtype).unsqueeze(1).expand(
-            B, Pnn, D)  # (B,Pnn,D)
-        near_agents_route_lane_emb = near_agents_route_lane_emb.to(x.dtype)
-        # dsh_msa_e, dsc_msa_e, dgt_msa_e, dsh_mlp_e, dsc_mlp_e, dgt_mlp_e
-        ego_fut_residuals = self._compute_ego_future_adaln(
-            ego_fut_global_expand, near_agents_route_lane_emb, route_known_mask)
-
-        #################
-        # 3) 결합(B,Pnn,D)
-        (shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa,
-         gate_mlp_pa) = self._combine_global_and_route_modulations(
-             global_mods, route_residuals_mods, ego_fut_residuals)
-
-        # 4) Self‑Attention + MLP1 (per‑agent 모듈레이션)
-        x = self._apply_modulated_self_attention(x, attn_mask, shift_msa_pa,
-                                                 scale_msa_pa, gate_msa_pa)
-        x = self._apply_modulated_mlp1(x, shift_mlp_pa, scale_mlp_pa,
-                                       gate_mlp_pa)
-        # 5) Cross‑Attention (원본 유지) + MLP2(게이트)
-        q = self.norm3(x)  # (B, Pnn, D)
-        cross_out = self._cross_attn_flash_varlen(q, cross_c, attn_mask,
-                                                  cross_mask)  # (B, Pnn, D)
-        gate_cross = self.gate_cross.to(x.dtype)
-        gate_mlp2 = self.gate_mlp2.to(x.dtype)
-        x = x + gate_cross * cross_out
-        x = x + gate_mlp2 * self.mlp2(self.norm4(x))
-        x = x.masked_fill(attn_mask.unsqueeze(-1), 0.0)
-        return x
-
-    def forward_with_pram_v2(
         self,
         x: torch.Tensor,  # [B, Pnn, D]
         cross_c: torch.Tensor,  # [B, N_c, D]
@@ -720,34 +561,4 @@ class DiTBlock(nn.Module):
 
         # 무효 에이전트 0‑클램프 (안전)
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # [B,Pnn,D]
-        return x
-
-
-class FinalLayer(nn.Module):
-    """
-    The final layer of DiT.
-    """
-
-    def __init__(self, hidden_size, output_size):
-        super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size)
-        self.proj = nn.Sequential(
-            # nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, hidden_size * 4, bias=True),
-            nn.GELU(approximate="tanh"),
-            # nn.LayerNorm(hidden_size * 4),
-            nn.Linear(hidden_size * 4, output_size, bias=True))
-
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
-        nn.init.zeros_(self.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.adaLN_modulation[-1].bias)
-        nn.init.zeros_(self.proj[-1].weight)  # proj의 마지막 Linear
-        nn.init.zeros_(self.proj[-1].bias)
-
-    def forward(self, x, t_embedding):
-        B, P, _ = x.shape
-        shift, scale = self.adaLN_modulation(t_embedding).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
-        x = self.proj(x)
         return x

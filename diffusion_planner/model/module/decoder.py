@@ -9,7 +9,7 @@ from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
 from diffusion_planner.model.module.mixer import MixerBlock
-from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, FinalLayer
+from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock
 from diffusion_planner.loss import _require_finite
 # decoder.py 상단 import 섹션에 추가
 from diffusion_planner.model.module.pram_v2 import (
@@ -502,7 +502,6 @@ class DiT(nn.Module):
             DiTBlock(hidden_dim, heads, dropout, mlp_ratio)
             for i in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_dim, output_dim)
         ##################
         # ----- PRAM‑v2 구성요소 추가 -----
         # S/E/R를 저차원으로 정리(RMSNorm 포함) → 쌍곱(SE/ER/RS) → 혼합 MLP → base 모듈레이션(Δs,b,logit g)을 산출.
@@ -674,7 +673,7 @@ class DiT(nn.Module):
             )  # -> {"SA": ModulationTriplet, "FFN": ..., "CA": ...}
 
             # ★ DiTBlock에 추가한 v2 전용 진입점(스켈레톤; 구현은 이후 단계)
-            x = block.forward_with_pram_v2(
+            x = block(
                 x=x,  # [B, Pnn, H]
                 cross_c=cross_c,  # [B, N_c, H]
                 pram_v2_modulations=
