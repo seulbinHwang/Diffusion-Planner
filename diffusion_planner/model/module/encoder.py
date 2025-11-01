@@ -2769,7 +2769,7 @@ class FusionEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, encoding_input: torch.Tensor,
-                encoding_mask: torch.Tensor) -> torch.Tensor:
+                encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """장면 융합 전용 포워드(배치별 전부 패딩 샘플은 건너뜀).
 
         모든 토큰이 패딩(True)인 배치는 연산을 생략하고 0을 반환한다.
@@ -2850,9 +2850,9 @@ class FusionEncoder(nn.Module):
                 for p in blk.parameters():
                     touch = touch + p.view(-1)[:1].sum()
             out_tokens = out_tokens + touch * 0.0
-        # ★ 추가: final LayerNorm 파라미터도 터치
-        for p in self.norm.parameters():
-            touch = touch + p.view(-1)[:1].sum()
+            # ★ 추가: final LayerNorm 파라미터도 터치
+            for p in self.norm.parameters():
+                touch = touch + p.view(-1)[:1].sum()
         # 전부 패딩 배치는 out_tokens의 0 유지
         # out_tokens [B, token_num, H]
         # encoding_mask: [B, token_num]  # True=패딩
