@@ -527,6 +527,19 @@ class DiT(nn.Module):
         nn.init.zeros_(self.pram_v2_out_proj.weight)
         nn.init.zeros_(self.pram_v2_out_proj.bias)
 
+        # [추가] TimestepEmbedder MLP 초기화 (여기서 1회만)
+        #  - 구조: Sequential[ Linear(256→H), SiLU, Linear(H→H) ]
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        if self.t_embedder.mlp[0].bias is not None:
+            nn.init.constant_(self.t_embedder.mlp[0].bias, 0.0)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        if self.t_embedder.mlp[2].bias is not None:
+            nn.init.constant_(self.t_embedder.mlp[2].bias, 0.0)
+
+        # [선택] 가독성 차원에서 명시(기본값과 동일)
+        nn.init.constant_(self.pram_v2_final_norm.weight, 1.0)
+        nn.init.constant_(self.pram_v2_final_norm.bias, 0.0)
+
         # 9단계 마무리 보정용 스칼라 (k^{final}_s, k^{final}_{sh})
         # 실제 보정 함수는 스켈레톤 상태여도 호출부만 준비해 둡니다.
         self.pram_v2_final_scale_scalar = nn.Parameter(torch.tensor(1.0))
