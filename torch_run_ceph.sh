@@ -88,11 +88,11 @@ fi
 # torchelastic가 자식(rank0) 오류를 JSON으로 저장하게 함 (아주 중요!)
 export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 2 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "new-lr_schedule-weighted-loss-h-two_3072" \
-  --batch_size 3072
+  --batch_size 1536
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
