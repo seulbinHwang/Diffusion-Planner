@@ -522,10 +522,14 @@ class DiT(nn.Module):
 
         # 9단계: v2 전용 최종 LN/Linear(출력 투영)
         self.pram_v2_final_norm = nn.LayerNorm(hidden_dim)
-        self.pram_v2_out_proj = nn.Linear(hidden_dim, output_dim)
-        # ★ adaLN‑Zero 유지 위해 0‑init
-        nn.init.zeros_(self.pram_v2_out_proj.weight)
-        nn.init.zeros_(self.pram_v2_out_proj.bias)
+        self.pram_v2_out_proj = nn.Sequential(
+            # nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_dim, hidden_dim * 4, bias=True),
+            nn.GELU(approximate="tanh"),
+            # nn.LayerNorm(hidden_size * 4),
+            nn.Linear(hidden_dim * 4, output_dim, bias=True))
+        nn.init.zeros_(self.pram_v2_out_proj[-1].weight)  # pram_v2_out_proj의 마지막 Linear
+        nn.init.zeros_(self.pram_v2_out_proj[-1].bias)
 
         # [추가] TimestepEmbedder MLP 초기화 (여기서 1회만)
         #  - 구조: Sequential[ Linear(256→H), SiLU, Linear(H→H) ]

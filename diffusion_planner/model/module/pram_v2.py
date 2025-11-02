@@ -621,7 +621,7 @@ def apply_pram_v2_final_layer(
     composer_out: ComposerOutputs,
     time_out: TimeModulationOutputs,
     final_norm: nn.LayerNorm,  # LN(H) 모듈
-    out_proj: nn.Linear,  # Linear(H -> (T)*4)
+    out_proj: nn.Sequential,  # Linear(H -> (T)*4)
     final_scalars: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """PRAM‑v2 9단계: 최종 모듈레이션 + 최종 투영까지 수행.
