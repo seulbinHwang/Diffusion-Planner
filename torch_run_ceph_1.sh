@@ -106,13 +106,11 @@ if false; then
 	•	똑같은 업데이트를 동시에 적용해.
 fi
 
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 2 --port 23002 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 2 --port 23001 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "new-lr_schedule-weighted-loss-h-two_1536" \
   --batch_size 1536 \
-  --seed 7777 \
-  --sampler_epoch_offset 1000
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

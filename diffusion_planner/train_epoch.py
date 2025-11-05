@@ -1,16 +1,15 @@
 from tqdm import tqdm
 import torch
 from torch import nn
-
+from typing import Tuple
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.train_utils import get_epoch_mean_loss
 from diffusion_planner.utils import ddp
 from diffusion_planner.loss import diffusion_loss_func
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
-
+from diffusion_planner.model.module.feasible import FeasibleProjector
 # =====================================================================
-
 
 
 def train_epoch(data_loader,
@@ -26,6 +25,12 @@ def train_epoch(data_loader,
 
     if args.ddp:
         torch.cuda.synchronize()
+
+    # ---- 전역 스텝/총 스텝 계산(진행도 p) ----
+    # 동일 args 객체를 통해 에폭 간 누적 유지
+    if not hasattr(args, "_global_update_step"):
+        args._global_update_step = 0
+    total_update_steps = max(1, args.train_epochs * len(data_loader))
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
@@ -105,14 +110,34 @@ def train_epoch(data_loader,
                 model, norm_inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
                 (near_future_gt_4_dim, near_future_mask), args.state_normalizer,
-                loss, args.diffusion_model_type)
-            loss["loss"] = loss["neighbor_prediction_loss"]
+                loss, args.diffusion_model_type, args.observation_normalizer)
+
+            # ----- (NEW) 진행도 기반 가중 합성 --------------------------------
+            progress = min(
+                1.0, args._global_update_step /
+                float(max(1, total_update_steps - 1)))
+            w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
+                progress)
+            # 개별 손실이 존재하지 않는 경우(예: score 모드) 대비 안전 get
+            l_dir = loss.get(
+                "neighbor_prediction_loss",
+                torch.tensor(0.0, device=inputs["ego_agent_past"].device))
+            l_int = loss.get(
+                "integration_loss",
+                torch.tensor(0.0, device=inputs["ego_agent_past"].device))
+            l_con = loss.get(
+                "constraint_loss",
+                torch.tensor(0.0, device=inputs["ego_agent_past"].device))
+            loss["w_direct"] = torch.as_tensor(w_dir, device=l_dir.device)
+            loss["w_integration"] = torch.as_tensor(w_int, device=l_dir.device)
+            loss["w_constraint"] = torch.as_tensor(w_const, device=l_dir.device)
+            loss["loss"] = w_dir * l_dir + w_int * l_int + w_const * l_con
 
             total_loss = loss["loss"].item()  # scalar
 
             # loss backward
             loss["loss"].backward()
-            # nn.utils.clip_grad_norm_(model.parameters(), 20)
+            nn.utils.clip_grad_norm_(model.parameters(), 10)
             scheduler.step()
             optimizer.step()
             # === WD warmdown: lr 비례로 그룹별 WD 갱신 ===
@@ -126,6 +151,9 @@ def train_epoch(data_loader,
             # ===========================================
 
             if ema is not None:
+                """
+                수식대로 EMA 가중치를 한 번 갱신
+                """
                 ema.update(model)
 
             if args.ddp:
@@ -133,6 +161,9 @@ def train_epoch(data_loader,
 
             data_epoch.set_postfix(loss="{:.4f}".format(total_loss))
             epoch_loss.append(loss)
+
+            # 전역 스텝 누적(에폭 간 유지)
+            args._global_update_step += 1
 
     epoch_mean_loss = get_epoch_mean_loss(epoch_loss)
 

@@ -66,12 +66,78 @@ def _build_half_life_weights(
 
 
 # ----------------------------------------------------------------------------
+from typing import Dict, Optional
 
+def _compute_control_xy_yaw_diff(
+    control_diff_denorm: torch.Tensor,   # [B, P, T, 3], (vx[m/s], vy[m/s], yaw_rate[rad/s] 또는 deg/s)
+    valid_mask: torch.Tensor,            # [B, P, T], True=유효
+    *,
+    prefix: str = "constraint_diff",
+    omega_in_radian: bool = True,        # True면 rad/s → deg/s 변환
+    eps: float = 1e-6,
+) -> Dict[str, torch.Tensor]:
+    """제어 차이(vx, vy, yaw_rate)의 규모를 물리 단위로 요약 지표로 반환.
 
-def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
-                           near_future_gt: torch.Tensor,
-                           near_future_valid: torch.Tensor,
-                           early_stage_num: int = 5) -> Dict[str, torch.Tensor]:
+    Args:
+        control_diff_denorm: [B, P, T, 3]
+            (vx^b, vy^b, yaw_rate)의 '차이' (이미 denormalize된 값).
+            vx, vy 단위는 m/s, yaw_rate는 rad/s(기본 가정).
+        valid_mask: [B, P, T] True=유효 프레임.
+        prefix: 반환 딕셔너리 키 접두사.
+        w_t: [1, 1, T] 시간 가중치. None이면 균등 가중.
+        omega_in_radian: True면 yaw_rate(rad/s)를 deg/s로 변환해서 리포트.
+        eps: 분모 보호용 epsilon.
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            - f"{prefix}_vx_b_abs_mean_mps"
+            - f"{prefix}_vy_b_abs_mean_mps"
+            - f"{prefix}_yaw_rate_abs_mean_dps"
+            - f"{prefix}_vx_b_rmse_mps"
+            - f"{prefix}_vy_b_rmse_mps"
+            - f"{prefix}_yaw_rate_rmse_dps"
+    """
+    if control_diff_denorm.dim() != 4 or control_diff_denorm.size(-1) != 3:
+        raise ValueError(
+            f"control_diff_denorm must be [B,P,T,3], got {tuple(control_diff_denorm.shape)}"
+        )
+    if valid_mask.shape != control_diff_denorm.shape[:3]:
+        raise ValueError(
+            f"valid_mask shape {tuple(valid_mask.shape)} must match [B,P,T] of control_diff_denorm {tuple(control_diff_denorm.shape[:3])}"
+        )
+
+    vx = control_diff_denorm[..., 0]  # [B,P,T]  m/s
+    vy = control_diff_denorm[..., 1]  # [B,P,T]  m/s
+    omega = control_diff_denorm[..., 2]  # [B,P,T]  rad/s (기본 가정)
+
+    if omega_in_radian:
+        omega_deg = torch.rad2deg(omega)  # deg/s
+    else:
+        omega_deg = omega  # 이미 deg/s 라고 가정
+
+    valid_f = valid_mask.to(dtype=vx.dtype)  # 0/1
+
+    # 균등 가중
+    weight = valid_f
+    denom = weight.sum().clamp_min(eps)  # 스칼라
+
+    # ----- Mean Abs (L1) -----
+    vx_abs_mean = (vx.abs() * weight).sum() / denom
+    vy_abs_mean = (vy.abs() * weight).sum() / denom
+    omg_abs_mean_deg = (omega_deg.abs() * weight).sum() / denom
+
+    return {
+        f"{prefix}_vx_b": vx_abs_mean,            # m/s
+        f"{prefix}_vy_b": vy_abs_mean,            # m/s
+        f"{prefix}_yaw_rate": omg_abs_mean_deg,   # deg/s
+    }
+
+def _compute_xy_yaw_losses(
+        score_denorm: torch.Tensor,
+        near_future_gt: torch.Tensor,
+        near_future_valid: torch.Tensor,
+        early_stage_num: int = 5,
+        prefix: str = "neighbor_prediction_loss") -> Dict[str, torch.Tensor]:
     """
     Compute separate XY and Yaw RMSE losses for ego and neighbors.
 
@@ -130,12 +196,43 @@ def _compute_xy_yaw_losses(score_denorm: torch.Tensor,
     ) > 0 else torch.tensor(0.0, device=dist_yaw.device)
 
     return {
-        'neighbor_prediction_loss_xy': valid_dist_mean,  # scalar
-        'neighbor_prediction_loss_yaw': neigh_yaw,  # scalar # degree
-        'neighbor_prediction_loss_xy_early': early_valid_dist_mean,  # scalar
-        'neighbor_prediction_loss_yaw_early':
-            early_valid_yaw_mean,  # scalar # degree
+        f'{prefix}_xy': valid_dist_mean,  # scalar
+        f'{prefix}_yaw': neigh_yaw,  # scalar # degree
+        f'{prefix}_xy_early': early_valid_dist_mean,  # scalar
+        f'{prefix}_yaw_early': early_valid_yaw_mean,  # scalar # degree
     }
+
+
+# [ADD] ----------------------------------------------------------------------
+def _masked_weighted_mse_from_diff(
+    diff: torch.Tensor,  # (B, P, T, C)
+    valid_mask: torch.Tensor,  # (B, P, T)  (1=valid)
+    w_t: torch.Tensor,  # (1, 1, T)
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """마스크·시간가중 MSE(차원 합) 계산.
+
+    Args:
+        diff: (B, P, T, C) 차이 텐서. 예) u - Filter_soft(u).detach()
+        valid_mask: (B, P, T) 유효 마스크 (True/1=유효)
+        w_t: (1, 1, T) half-life 기반 시간 가중치
+        eps: 분모 보호용 epsilon
+
+    Returns:
+        스칼라 손실 (torch.Tensor, shape=[])
+    """
+    # (B, P, T, C) -> (B, P, T)
+    squared = (diff**2).sum(dim=-1)
+    valid_f = valid_mask.to(dtype=squared.dtype)
+
+    weighted = squared * w_t  # (B, P, T)
+    denom = (valid_f * w_t).sum().clamp_min(eps)  # 스칼라
+
+    loss_val = (weighted * valid_f).sum() / denom
+    return loss_val
+
+
+# ----------------------------------------------------------------------------
 
 
 def diffusion_loss_func(
@@ -147,6 +244,7 @@ def diffusion_loss_func(
     state_normalizer: StateNormalizer,
     loss: Dict[str, Any],
     model_type: str,
+    observation_normalizer,
     eps: float = 1e-3,
 ):
     """
@@ -228,6 +326,7 @@ def diffusion_loss_func(
 
     merged_inputs = {
         **norm_inputs,
+        "near_future_valid": near_future_valid,  # [B, Pnn, T]
         "near_cur_future_norm_xT":
             near_cur_future_norm_xT,  # [B, Pnn, 1 + T, 4]
         "diffusion_time": batch_diffusion_time,  # [B,]
@@ -268,6 +367,47 @@ def diffusion_loss_func(
     loss_val = valid_dpm_loss.sum() / denom  # 스칼라(gradient O)
     loss["neighbor_prediction_loss"] = loss_val
 
+    if model_type == "x_start":
+        ###### L_integration loss 추가 ######
+        if "integrated_trajectory" in decoder_output:
+
+            integrated_trajectory = decoder_output[
+                "integrated_trajectory"][:, :, 1:, :]  # (B, Pnn, T, 4)
+            # near_future_gt_4_dim: [B, Pnn, T, 4]
+            # integration_loss: (B, Pnn, T)
+            integration_loss = torch.sum(
+                (integrated_trajectory - near_future_norm_gt)**2, dim=-1)
+            weighted_integration = integration_loss * w_t  # (B, Pnn, T)
+            valid_integration_loss = weighted_integration * valid  # (B, Pnn, T)
+            integration_loss_val = valid_integration_loss.sum(
+            ) / denom  # 스칼라(gradient O)
+        else:
+            integrated_trajectory = None
+            # 안전 fallback: 해당 항 미제공 시 0 손실
+            integration_loss_val = torch.zeros((),
+                                               device=loss_val.device,
+                                               dtype=loss_val.dtype)
+        loss["integration_loss"] = integration_loss_val
+        ###### L_constraint loss 추가 ######
+        # ------ L_constraint (정식 구현) --------------------------------------
+        # decoder_output["control_constraint_diff"]: (B, P, T, 3)
+        #   = u - Filter_soft(u).detach()  (모델 내부에서 detach 적용되어야 함)
+        # 학습 신호는 u(=보정기 경로)로만 흘러가도록 설계됨.
+        if "control_constraint_diff" in decoder_output:
+            control_constraint_diff = _require_finite(
+                "decoder_output['control_constraint_diff']",
+                decoder_output["control_constraint_diff"])  # (B, P, T, 3)
+            constraint_loss_val = _masked_weighted_mse_from_diff(
+                control_constraint_diff, near_future_valid, w_t)
+        else:
+            # 안전 fallback: 해당 항 미제공 시 0 손실
+            control_constraint_diff = None
+            constraint_loss_val = torch.zeros(
+                (),
+                device=integration_loss_val.device,
+                dtype=integration_loss_val.dtype)
+        loss["constraint_loss"] = constraint_loss_val
+
     # denom = valid.sum().clamp(min=1) # denom: scalar
     # valid_dpm_loss = dpm_loss * valid # (B, Pnn, T)
     # loss_val = valid_dpm_loss.sum() / denom  # 항상 requires_grad=True
@@ -279,7 +419,30 @@ def diffusion_loss_func(
         with torch.no_grad():
             xy_yaw_losses = _compute_xy_yaw_losses(score_denorm, near_future_gt,
                                                    near_future_valid)
-        loss.update(xy_yaw_losses)
+            loss.update(xy_yaw_losses)
+
+            if integrated_trajectory is not None:
+                integrated_trajectory_denorm = state_normalizer.inverse(
+                    integrated_trajectory)  # [B,P,T,4]
+                integ_xy_yaw_losses = _compute_xy_yaw_losses(
+                    integrated_trajectory_denorm,
+                    near_future_gt,
+                    near_future_valid,
+                    prefix="integration_loss")
+                loss.update(integ_xy_yaw_losses)
+            if control_constraint_diff is not None:
+                temp_dict = {
+                    "cur_future_seg_body_control": control_constraint_diff
+                }
+                temp_dict = observation_normalizer.inverse(
+                    temp_dict)  # [B,P,T,3]
+                constraint_diff_denorm = temp_dict[
+                    "cur_future_seg_body_control"]  # [B,P,T,3]
+                constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
+                    constraint_diff_denorm,
+                    near_future_valid,
+                    prefix="constraint_diff")
+                loss.update(constraint_xy_yaw_losses)
 
     assert torch.isfinite(dpm_loss).all().item(
     ), f"loss cannot be nan, random_noise={random_noise}"

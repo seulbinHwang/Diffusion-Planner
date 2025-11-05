@@ -70,9 +70,9 @@ class WorldModel(TorchModuleWrapper):
                 _, outputs = self._planner(inputs)
         """
         outputs: Dict[str, torch.Tensor]
-            "prediction" : (B, Pnn, 1+T, 4)
+            "score" : (B, Pnn, 1+T, 4)
         """
-        npc_future_trajectories = outputs["prediction"]  # (B, Pnn, 1+T, 4)
+        npc_future_trajectories = outputs["score"]  # (B, Pnn, 1+T, 4)
         assert npc_future_trajectories.shape == (
             1,
             self.config.predicted_neighbor_num,

@@ -314,10 +314,6 @@ def get_args():
                         type=int,
                         help='fix random seed',
                         default=3407)
-    parser.add_argument('--sampler_epoch_offset',
-                        type=int,
-                        help='fix random sampler_epoch_offset',
-                        default=0)
     parser.add_argument('--weight_decay',
                         type=float,
                         default=1e-2,
@@ -700,8 +696,7 @@ def model_training(args):
     train_sampler = DistributedSampler(train_set,
                                        num_replicas=ddp.get_world_size(),
                                        rank=global_rank,
-                                       shuffle=True,
-                                       seed=args.seed)
+                                       shuffle=True)
     ################################################################
     ######## [LR (3) ] T_w,0  (warmup_steps_at_B0) 구하기 = 배치 B_0에서의 워밍업 스텝 수 ##############
     # (배치 B_0에서의 에폭당 스텝 수 * 워밍업 에폭 수(args.warm_up_epoch))
@@ -1016,7 +1011,7 @@ def model_training(args):
                                 v.delete()
 
         # scheduler.step()
-        train_sampler.set_epoch(epoch + 1 + args.sampler_epoch_offset)
+        train_sampler.set_epoch(epoch + 1)
 
     # ── 모든 훈련 종료 후 정리 ─
     torch.distributed.barrier()  # ① 모든 rank의 학습 루프 종료 동기화

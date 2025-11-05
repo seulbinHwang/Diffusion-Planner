@@ -2768,8 +2768,9 @@ class FusionEncoder(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, encoding_input: torch.Tensor,
-                encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+            self, encoding_input: torch.Tensor,
+            encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """장면 융합 전용 포워드(배치별 전부 패딩 샘플은 건너뜀).
 
         모든 토큰이 패딩(True)인 배치는 연산을 생략하고 0을 반환한다.

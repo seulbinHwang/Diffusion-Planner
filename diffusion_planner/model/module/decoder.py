@@ -21,6 +21,7 @@ from diffusion_planner.model.module.pram_v2 import (
     apply_pram_v2_final_layer,  # ← 9단계 마무리 보정 호출용(스켈레톤이어도 OK)
 )
 from typing import Tuple, Optional
+from diffusion_planner.model.module.feasible import FeasibleProjector
 
 
 def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -35,12 +36,13 @@ class Decoder(nn.Module):
 
         dpr = config.decoder_drop_path_rate
         self._predicted_neighbor_num = config.predicted_neighbor_num
-        self._future_len = config.future_len
+        self._future_len: int = config.future_len
         self._sde = VPSDE_linear()
         self._cond_last_prob: float = getattr(config, "cond_last_prob",
                                               0.0)  # 20%
 
         self.dit = DiT(
+            config=config,
             sde=self._sde,
             # route_encoder=RouteEncoder(
             #     config.route_num,
@@ -211,7 +213,7 @@ class Decoder(nn.Module):
                 {
                     ...
                     [training-only] "score": Predicted future states, [B, P, 1 + future_len, 4]
-                    [inference-only] "prediction": Predicted future states, [B, P, 1 + future_len, 4]
+                    [inference-only] "score": Predicted future states, [B, P, 1 + future_len, 4]
                     ...
                 }
 
@@ -226,7 +228,16 @@ class Decoder(nn.Module):
                 "neighbor_agents_past"],  # [B, agent_num, time_len, 11]
         )
         inputs["near_current_mask"] = near_current_mask
-
+        near_current_valid = ~near_current_mask  # [B, pnn]  True=유효 에이전트
+        near_future_valid = inputs.get("near_future_valid",
+                                       None)  # [B, pnn, future_len] bool
+        if near_future_valid is None:
+            near_future_valid = near_current_valid.unsqueeze(-1).expand(
+                -1, -1, self._future_len)  # [B, pnn, future_len] bool
+        near_cur_future_valid = torch.cat(
+            [near_current_valid.unsqueeze(-1), near_future_valid],
+            dim=-1)  # [B, pnn, 1 + future_len] bool
+        return_ = {}
         B, Pnn, _ = near_current_xyyaw.shape
 
         if "cond_last_pos_norm" in inputs:
@@ -277,17 +288,24 @@ class Decoder(nn.Module):
                 scene_encoding_token,  # (B, token_num, hidden_dim)
                 ego_fut_global,  # (B, hidden_dim)
                 near_agents_route_lane_emb,  # (B, Pnn, hidden_dim)
-                near_current_mask,  # (B, Pnn),
+                near_cur_future_valid,  # [B, pnn, 1 + future_len] bool
                 scene_encoding_token_mask,  # (B, token_num) bool
                 route_known_mask,  # (B, Pnn) bool # True=해당 에이전트가 유효 route
                 near_current_xyyaw=near_cur_norm_xT,  # (B, Pnn, 4)
             )
             _require_finite("decoder_dit_output", score)
             score = score.reshape(B, Pnn, self._future_len, 4)  # (B,Pnn,T,4)
+            # TODO: near_current_xyyaw 를 detach() 해서 붙이는 게 맞는지 점검
             score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
                               dim=2)  # (B,Pnn,1+T,4)
-
-            return {"score": score}  #  (B, Pnn, (1 + T) , 4)
+            integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
+            integrated_trajectory = torch.cat(
+                [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
+                dim=2)  # (B,Pnn,1+T,4)
+            return_["score"] = score  #  (B, Pnn, (1 + T) , 4)
+            return_[
+                "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
+            return return_
         else:
             noise = near_current_xyyaw.new_empty(
                 (B, Pnn, self._future_len, 4)).normal_(0.0,
@@ -340,7 +358,7 @@ class Decoder(nn.Module):
                     "cross_c": scene_encoding_token,
                     "ego_fut_global": ego_fut_global,
                     "near_agents_route_lane_emb": near_agents_route_lane_emb,
-                    "near_current_mask": near_current_mask,
+                    "near_cur_future_valid": near_cur_future_valid,
                     "cross_mask": scene_encoding_token_mask,
                     "route_known_mask": route_known_mask,
                     "near_current_xyyaw": near_current_xyyaw,
@@ -360,8 +378,8 @@ class Decoder(nn.Module):
                                 ego_fut_global,
                             "near_agents_route_lane_emb":
                                 near_agents_route_lane_emb,
-                            "near_current_mask":
-                                near_current_mask,
+                            "near_cur_future_valid":
+                                near_cur_future_valid,
                             "cross_mask":
                                 scene_encoding_token_mask,
                             "route_known_mask":
@@ -388,8 +406,16 @@ class Decoder(nn.Module):
                  x0.reshape(B, Pnn, -1, 4)],
                 dim=2)  # (B,Pnn,1+T,4)
             x0 = self._state_normalizer.inverse(x0)  # (B,Pnn,1+T,4)
-
-            return {"prediction": x0}
+            integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
+            integrated_trajectory = torch.cat(
+                [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
+                dim=2)  # (B,Pnn,1+T,4)
+            integrated_trajectory = self._state_normalizer.inverse(
+                integrated_trajectory)  # (B,Pnn,1+T,4)
+            return_["score"] = x0  # (B, Pnn, (1 + T) , 4)
+            return_[
+                "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
+            return return_
 
 
 class RouteEncoder(nn.Module):
@@ -476,9 +502,19 @@ class RouteEncoder(nn.Module):
         return return_
 
 
+from dataclasses import dataclass, asdict
+
+
+@dataclass(frozen=True)
+class DiTReturns:
+    integrated_trajectory: torch.Tensor  # (B, Pnn, T, 4)
+    control_constraint_diff: torch.Tensor  # (B, Pnn, T, 3)
+
+
 class DiT(nn.Module):
 
     def __init__(self,
+                 config,
                  sde: SDE,
                  depth,
                  output_dim,
@@ -488,9 +524,13 @@ class DiT(nn.Module):
                  mlp_ratio=4.0,
                  model_type="x_start"):
         super().__init__()
+        self.config = config
 
         assert model_type in ["score",
                               "x_start"], f"Unknown model type: {model_type}"
+        self.final_hidden_tokens = None
+        self.feasible_projector = FeasibleProjector()
+
         self._model_type = model_type
         self.preproj = Mlp(in_features=output_dim,
                            hidden_features=512,
@@ -528,7 +568,8 @@ class DiT(nn.Module):
             nn.GELU(approximate="tanh"),
             # nn.LayerNorm(hidden_size * 4),
             nn.Linear(hidden_dim * 4, output_dim, bias=True))
-        nn.init.zeros_(self.pram_v2_out_proj[-1].weight)  # pram_v2_out_proj의 마지막 Linear
+        nn.init.zeros_(
+            self.pram_v2_out_proj[-1].weight)  # pram_v2_out_proj의 마지막 Linear
         nn.init.zeros_(self.pram_v2_out_proj[-1].bias)
 
         # [추가] TimestepEmbedder MLP 초기화 (여기서 1회만)
@@ -620,7 +661,7 @@ class DiT(nn.Module):
         cross_c: torch.Tensor,  # (B, token_num, D)
         ego_fut_global: torch.Tensor,  # (B, D)
         near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-        near_current_mask: torch.Tensor,  # (B, Pnn) True=pad
+        near_cur_future_valid: torch.Tensor,  # [B, pnn, 1 + future_len] bool
         cross_mask: torch.Tensor,  # (B, token_num) True=pad
         route_known_mask: torch.Tensor,  # (B, Pnn) True=known
         near_current_xyyaw: torch.Tensor  # ★ 추가: (B, Pnn, 4)
@@ -631,10 +672,13 @@ class DiT(nn.Module):
         diffusion_time:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
         cross_c: [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
-        near_current_mask: [B, Pnn]
+        near_cur_future_valid: torch.Tensor,  # [B, pnn, 1 + future_len] bool
         near_agents_route_lane_emb, # (B, Pnn, D)
         cross_mask: (B, token_num)
         """
+        near_current_valid = near_cur_future_valid[:, :,
+                                                   0]  # [B, Pnn] True=유효 에이전트
+        near_current_mask = ~near_current_valid  # [B, Pnn] True=무효 에이전트
         B, Pnn, _ = near_future_norm_xT.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
         # x = self.preproj(near_future_norm_xT)
@@ -708,6 +752,7 @@ class DiT(nn.Module):
                 cross_mask=cross_mask  # [B, N_c]
             )
             x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
+        self.final_hidden_tokens = x.detach().clone()  # (B, Pnn, H)
         # [V2 - END]
         # --- ✅ PRAM‑v2: 9단계 최종 보정 + 최종 투영(= FinalLayer 완전 대체) ---
         x = apply_pram_v2_final_layer(
@@ -736,6 +781,62 @@ class DiT(nn.Module):
         elif self._model_type == "x_start":
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4)
+            # 시작
+            # diffusion_trajectory: (B, Pnn, 1+T, 4)
+            diffusion_trajectory = torch.cat(
+                [near_current_xyyaw.unsqueeze(2),
+                 x.reshape(B, Pnn, -1, 4)],
+                dim=2)
+
+            # (B, Pnn, 1+T, 4)
+            near_current_valid = near_cur_future_valid[:, :, 0]  # (B, Pnn)
+            unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
+                diffusion_trajectory)
+            unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
+                                                                    0, :]  # (B, Pnn, 4)
+
+            unnorm_cur_future_body_control = self.feasible_projector.savgol_filter_for_body_control(
+                unnorm_diffusion_trajectory,
+                near_cur_future_valid,
+            )  # (B, Pnn, 1+T, 3)
+            # cur_future_seg_body_control: (B, Pnn, T, 3)
+            unnorm_cur_future_seg_body_control = self.feasible_projector.compute_midpoint_controls(
+                unnorm_cur_future_body_control, near_cur_future_valid)
+            temp_dict = {
+                "cur_future_seg_body_control:",
+                unnorm_cur_future_seg_body_control
+            }
+            temp_dict = self.config.observation_normalizer(temp_dict)
+            cur_future_seg_body_control = temp_dict[
+                "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
+            cur_future_seg_body_control = self.feasible_projector(
+                near_cur_future_valid,  # (B, Pnn, 1+T)
+                diffusion_trajectory,  # (B, Pnn, 1+T, 4)
+                cur_future_seg_body_control,  # (B, Pnn, T, 3)
+                self.final_hidden_tokens,  # (B, Pnn, H)
+            )
+            temp_dict = {
+                "cur_future_seg_body_control:", cur_future_seg_body_control
+            }
+            temp_dict = self.config.state_normalizer.inverse(temp_dict)
+            unnorm_cur_future_seg_body_control = temp_dict[
+                "cur_future_seg_body_control"]  # (B, Pnn, T,
+            unnorm_integrated_trajectory, unnorm_control_constraint_diff = self.feasible_projector.filter_and_integrate(
+                unnorm_near_current_state,  # (B, Pnn, 4)
+                near_current_valid,  # (B, Pnn)
+                unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 4)
+            )  # (B, Pnn, T, 4)
+            integrated_trajectory = self.config.state_normalizer.inverse(
+                unnorm_integrated_trajectory)  # (B, Pnn, T, 4)
+            temp_dict = {
+                "control_constraint_diff": unnorm_control_constraint_diff
+            }
+            temp_dict = self.config.state_normalizer(temp_dict)
+            control_constraint_diff = temp_dict[
+                "control_constraint_diff"]  # (B, Pnn, T, 3)
+            self.dit_returns = DiTReturns(
+                integrated_trajectory=integrated_trajectory,
+                control_constraint_diff=control_constraint_diff)
             return x
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")

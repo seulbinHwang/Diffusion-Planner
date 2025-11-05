@@ -9,7 +9,7 @@ class Diffusion_Planner(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
+        self.config = config
         self.encoder = Diffusion_Planner_Encoder(config)
         self.decoder = Diffusion_Planner_Decoder(config)
 
@@ -21,9 +21,6 @@ class Diffusion_Planner(nn.Module):
 
         encoder_outputs = self.encoder(inputs)
         decoder_outputs = self.decoder(encoder_outputs, inputs)
-        """
-        decoder_outputs: {}
-        """
 
         return encoder_outputs, decoder_outputs
 
