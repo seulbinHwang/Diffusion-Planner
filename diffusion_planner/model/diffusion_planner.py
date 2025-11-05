@@ -21,6 +21,9 @@ class Diffusion_Planner(nn.Module):
 
         encoder_outputs = self.encoder(inputs)
         decoder_outputs = self.decoder(encoder_outputs, inputs)
+        """
+        decoder_outputs: {}
+        """
 
         return encoder_outputs, decoder_outputs
 
