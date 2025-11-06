@@ -89,22 +89,6 @@ fi
 export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
-if false; then
-	1.	파이썬을 4개 띄워서 동시에 train_predictor.py 를 실행해.
-(각 프로세스는 다른 GPU를 맡게 됨)
-	2.	각 프로세스에 환경변수가 자동으로 주입돼:
-	•	WORLD_SIZE=4 (전체 프로세스 수)
-	•	RANK=0..3 (팀에서 내 전역 등번호)
-	•	LOCAL_RANK=0..3 (이 노드에서 내가 쓸 GPU 번호)
-	3.	네 코드의 ddp_setup_universal()가 이 값들을 읽어서:
-	•	내가 쓸 GPU를 LOCAL_RANK로 지정하고
-	•	프로세스 그룹(통신 방)을 열고
-	•	“전체 인원 몇 명, 난 몇 번”인지 정보(global_rank, rank, world_size)를 리턴해.
-	4.	이후엔 DistributedDataParallel(DDP) 로 감싼 모델이
-	•	각 GPU가 서로 다른 데이터 조각을 처리하고
-	•	역전파 때 그라디언트를 평균해서
-	•	똑같은 업데이트를 동시에 적용해.
-fi
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 2 --port 23001 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  train_predictor.py \
