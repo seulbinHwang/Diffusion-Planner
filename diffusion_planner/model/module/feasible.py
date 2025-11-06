@@ -5,6 +5,7 @@ from diffusion_planner.utils.normalizer import StateNormalizer
 from dataclasses import dataclass, asdict
 from enum import Enum
 from typing import Dict, Iterable, List, Tuple, Union, TypedDict, Optional
+from scipy.signal import savgol_filter  # type: ignore
 
 import numpy as np
 
