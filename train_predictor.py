@@ -296,6 +296,8 @@ def get_args():
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
+    parser.add_argument('--use_feasible', default=False, type=boolean)
+    parser.add_argument('--use_current_input', default=False, type=boolean)
 
     # parser.add_argument(
     #     '--pin-mem',

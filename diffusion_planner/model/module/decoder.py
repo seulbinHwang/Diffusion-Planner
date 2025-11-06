@@ -33,7 +33,7 @@ class Decoder(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-
+        self.config = config
         dpr = config.decoder_drop_path_rate
         self._predicted_neighbor_num = config.predicted_neighbor_num
         self._future_len: int = config.future_len
@@ -283,19 +283,24 @@ class Decoder(nn.Module):
                                                        0, :]  # [B, Pnn, 4]
             near_future_norm_xT = near_cur_future_norm_xT[:, :,
                                                           1:, :]  # [B, Pnn, T, 4]
-            near_future_norm_xT = near_future_norm_xT.reshape(
+            if self.config.use_current_input:
+                xT_input = near_cur_future_norm_xT
+            else:
+                xT_input = near_future_norm_xT
+
+            xT_input = xT_input.reshape(
                 B, Pnn, -1)  # [B, Pnn, T * 4]
 
             # 🔹 20% 확률로 마지막 프레임(목표) 주입 — Conditioned Generation 학습 신호
             # near_cur_future_norm_xT: [B, Pnn, T * 4]
             # near_current_mask [B, pnn]
             # cond_last_pos_norm: [B, Pnn, 4]
-            near_future_norm_xT, _ = self._maybe_apply_last_pos_condition_training(
-                near_future_norm_xT, near_current_mask, cond_last_pos_norm)
+            xT_input, _ = self._maybe_apply_last_pos_condition_training(
+                xT_input, near_current_mask, cond_last_pos_norm)
             diffusion_time = inputs['diffusion_time']
             # (B, Pnn, T , 4)
             score = self.dit(
-                near_future_norm_xT,  # ( B, Pnn, T* 4 )
+                xT_input,  # ( B, Pnn, T* 4 ) # (B, Pnn, (1+T)*4)
                 diffusion_time,  # (B)
                 scene_encoding_token,  # (B, token_num, hidden_dim)
                 ego_fut_global,  # (B, hidden_dim)
@@ -306,12 +311,17 @@ class Decoder(nn.Module):
                 near_current_xyyaw=near_cur_norm_xT,  # (B, Pnn, 4)
             )
             _require_finite("decoder_dit_output", score)
-            score = score.reshape(B, Pnn, self._future_len, 4)  # (B,Pnn,T,4)
-            # TODO: near_current_xyyaw 를 detach() 해서 붙이는 게 맞는지 점검
-            score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
-                              dim=2)  # (B,Pnn,1+T,4)
+            if self.config.use_current_input:
+                score = score.reshape(B, Pnn, 1 + self._future_len,
+                                      4)  # (B,Pnn,T,4)
+            else:
+                score = score.reshape(B, Pnn, self._future_len,
+                                      4)  # (B,Pnn,T,4)
+                # TODO: near_current_xyyaw 를 detach() 해서 붙이는 게 맞는지 점검
+                score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
+                                  dim=2)  # (B,Pnn,1+T,4)
             return_["score"] = score  #  (B, Pnn, (1 + T) , 4)
-            if self.dit.dit_returns is not None:
+            if self.config.use_feasible:
                 integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
                 integrated_trajectory = torch.cat(
                     [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
@@ -323,7 +333,16 @@ class Decoder(nn.Module):
             noise = near_current_xyyaw.new_empty(
                 (B, Pnn, self._future_len, 4)).normal_(0.0,
                                                        0.5)  # (B, Pnn, T, 4)
-            xT = noise.reshape(B, Pnn, -1)  # ★ 현재 프레임 concat 삭제 # (B, Pnn, T*4)
+            if self.config.use_current_input:
+                # xT: (B, Pnn, (1+T)*4)
+                xT = torch.cat(
+                    [
+                        near_current_xyyaw[:, :, None, :],  # (B, Pnn, 1, 4)
+                        noise  # (B, Pnn, T, 4)
+                    ],
+                    dim=2).reshape(B, Pnn, -1)
+            else:
+                xT = noise.reshape(B, Pnn, -1) # (B, Pnn, T*4)
 
             # cond_last_pos_norm: [B, Pnn, 4] (이미 near_current와 dtype/device 일치)
             cond_last_pos = None
@@ -341,7 +360,11 @@ class Decoder(nn.Module):
                                              device=xT.device)
 
             def initial_state_constraint(xt, t, step):
-                xt = xt.reshape(B, Pnn, self._future_len, 4)
+                if self.config.use_current_input:
+                    xt = xt.reshape(B, Pnn, 1+self._future_len, 4)
+                    xt[:, :, 0, :] = near_current_xyyaw
+                else:
+                    xt = xt.reshape(B, Pnn, self._future_len, 4)
 
                 # cond-last injection (있을 때만)
                 if torch.isfinite(cond_last_pos_norm).any():
@@ -410,16 +433,17 @@ class Decoder(nn.Module):
                 },
             )
             x0 = x0.to(xT.dtype)
-
-            assert x0.shape == (B, Pnn, self._future_len * 4)
-
-            # concat near_current_xyyaw to x0.
-            x0 = torch.cat(
-                [near_current_xyyaw.unsqueeze(2),
-                 x0.reshape(B, Pnn, -1, 4)],
-                dim=2)  # (B,Pnn,1+T,4)
+            if self.config.use_current_input:
+                assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
+            else:
+                assert x0.shape == (B, Pnn, self._future_len * 4)
+                # concat near_current_xyyaw to x0.
+                x0 = torch.cat(
+                    [near_current_xyyaw.unsqueeze(2),
+                     x0.reshape(B, Pnn, -1, 4)],
+                    dim=2)  # (B,Pnn,1+T,4)
             x0 = self._state_normalizer.inverse(x0)  # (B,Pnn,1+T,4)
-            if self.dit.dit_returns is not None:
+            if self.config.use_feasible:
                 integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
                 integrated_trajectory = torch.cat(
                     [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
@@ -538,7 +562,6 @@ class DiT(nn.Module):
                  mlp_ratio=4.0,
                  model_type="x_start"):
         super().__init__()
-        self.use_feasible_projection = False
         self.dit_returns = None
         self.config = config
 
@@ -802,7 +825,7 @@ class DiT(nn.Module):
                 [near_current_xyyaw.unsqueeze(2),
                  x.reshape(B, Pnn, -1, 4)],
                 dim=2)
-            if self.use_feasible_projection:
+            if self.config.use_feasible:
                 self._feasible_projection(diffusion_trajectory,
                                           near_cur_future_valid)
             return x  # (B, Pnn, T * 4)
