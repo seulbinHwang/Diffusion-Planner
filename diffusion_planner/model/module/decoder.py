@@ -311,12 +311,13 @@ class Decoder(nn.Module):
             score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
                               dim=2)  # (B,Pnn,1+T,4)
             return_["score"] = score  #  (B, Pnn, (1 + T) , 4)
-            integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
-            integrated_trajectory = torch.cat(
-                [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
-                dim=2)  # (B,Pnn,1+T,4)
-            return_[
-                "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
+            if self.dit.dit_returns is not None:
+                integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
+                integrated_trajectory = torch.cat(
+                    [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
+                    dim=2)  # (B,Pnn,1+T,4)
+                return_[
+                    "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
             return return_
         else:
             noise = near_current_xyyaw.new_empty(
@@ -418,15 +419,16 @@ class Decoder(nn.Module):
                  x0.reshape(B, Pnn, -1, 4)],
                 dim=2)  # (B,Pnn,1+T,4)
             x0 = self._state_normalizer.inverse(x0)  # (B,Pnn,1+T,4)
-            integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
-            integrated_trajectory = torch.cat(
-                [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
-                dim=2)  # (B,Pnn,1+T,4)
-            integrated_trajectory = self._state_normalizer.inverse(
-                integrated_trajectory)  # (B,Pnn,1+T,4)
+            if self.dit.dit_returns is not None:
+                integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
+                integrated_trajectory = torch.cat(
+                    [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
+                    dim=2)  # (B,Pnn,1+T,4)
+                integrated_trajectory = self._state_normalizer.inverse(
+                    integrated_trajectory)  # (B,Pnn,1+T,4)
+                return_[
+                    "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
             return_["score"] = x0  # (B, Pnn, (1 + T) , 4)
-            return_[
-                "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
             return return_
 
 
@@ -536,6 +538,8 @@ class DiT(nn.Module):
                  mlp_ratio=4.0,
                  model_type="x_start"):
         super().__init__()
+        self.use_feasible_projection = False
+        self.dit_returns = None
         self.config = config
 
         assert model_type in ["score",
@@ -798,8 +802,9 @@ class DiT(nn.Module):
                 [near_current_xyyaw.unsqueeze(2),
                  x.reshape(B, Pnn, -1, 4)],
                 dim=2)
-            self._feasible_projection(diffusion_trajectory,
-                                      near_cur_future_valid)
+            if self.use_feasible_projection:
+                self._feasible_projection(diffusion_trajectory,
+                                          near_cur_future_valid)
             return x  # (B, Pnn, T * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
