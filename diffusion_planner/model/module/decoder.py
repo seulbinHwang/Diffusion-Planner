@@ -185,6 +185,21 @@ class Decoder(nn.Module):
             near_current_mask = (near_current_xyyaw.ne(0).sum(dim=-1) == 0)
         return near_current_xyyaw, near_current_mask
 
+    def _get_near_cur_future_valid(
+        self,
+        near_current_mask: torch.Tensor,  # [B, pnn] bool
+        near_future_valid: Optional[
+            torch.Tensor] = None,  # [B, pnn, future_len] bool
+    ) -> torch.Tensor:  # [B, pnn, 1 + future_len] bool
+        near_current_valid = ~near_current_mask  # [B, pnn]  True=유효 에이전트
+        if near_future_valid is None:
+            near_future_valid = near_current_valid.unsqueeze(-1).expand(
+                -1, -1, self._future_len)  # [B, pnn, future_len] bool
+        near_cur_future_valid = torch.cat(
+            [near_current_valid.unsqueeze(-1), near_future_valid],
+            dim=-1)  # [B, pnn, 1 + future_len] bool
+        return near_cur_future_valid
+
     def forward(self, encoder_outputs, inputs):
         """
         Diffusion decoder process.
@@ -228,15 +243,12 @@ class Decoder(nn.Module):
                 "neighbor_agents_past"],  # [B, agent_num, time_len, 11]
         )
         inputs["near_current_mask"] = near_current_mask
-        near_current_valid = ~near_current_mask  # [B, pnn]  True=유효 에이전트
-        near_future_valid = inputs.get("near_future_valid",
-                                       None)  # [B, pnn, future_len] bool
-        if near_future_valid is None:
-            near_future_valid = near_current_valid.unsqueeze(-1).expand(
-                -1, -1, self._future_len)  # [B, pnn, future_len] bool
-        near_cur_future_valid = torch.cat(
-            [near_current_valid.unsqueeze(-1), near_future_valid],
-            dim=-1)  # [B, pnn, 1 + future_len] bool
+        near_cur_future_valid = self._get_near_cur_future_valid(
+            near_current_mask,
+            near_future_valid=inputs.get("near_future_valid",
+                                         None)  # [B, pnn, future_len] bool
+        )
+
         return_ = {}
         B, Pnn, _ = near_current_xyyaw.shape
 
@@ -298,11 +310,11 @@ class Decoder(nn.Module):
             # TODO: near_current_xyyaw 를 detach() 해서 붙이는 게 맞는지 점검
             score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
                               dim=2)  # (B,Pnn,1+T,4)
+            return_["score"] = score  #  (B, Pnn, (1 + T) , 4)
             integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
             integrated_trajectory = torch.cat(
                 [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
                 dim=2)  # (B,Pnn,1+T,4)
-            return_["score"] = score  #  (B, Pnn, (1 + T) , 4)
             return_[
                 "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
             return return_
@@ -782,61 +794,66 @@ class DiT(nn.Module):
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4)
             # 시작
-            # diffusion_trajectory: (B, Pnn, 1+T, 4)
             diffusion_trajectory = torch.cat(
                 [near_current_xyyaw.unsqueeze(2),
                  x.reshape(B, Pnn, -1, 4)],
                 dim=2)
-
-            # (B, Pnn, 1+T, 4)
-            near_current_valid = near_cur_future_valid[:, :, 0]  # (B, Pnn)
-            unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
-                diffusion_trajectory)
-            unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
-                                                                    0, :]  # (B, Pnn, 4)
-
-            unnorm_cur_future_body_control = self.feasible_projector.savgol_filter_for_body_control(
-                unnorm_diffusion_trajectory,
-                near_cur_future_valid,
-            )  # (B, Pnn, 1+T, 3)
-            # cur_future_seg_body_control: (B, Pnn, T, 3)
-            unnorm_cur_future_seg_body_control = self.feasible_projector.compute_midpoint_controls(
-                unnorm_cur_future_body_control, near_cur_future_valid)
-            temp_dict = {
-                "cur_future_seg_body_control:",
-                unnorm_cur_future_seg_body_control
-            }
-            temp_dict = self.config.observation_normalizer(temp_dict)
-            cur_future_seg_body_control = temp_dict[
-                "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
-            cur_future_seg_body_control = self.feasible_projector(
-                near_cur_future_valid,  # (B, Pnn, 1+T)
-                diffusion_trajectory,  # (B, Pnn, 1+T, 4)
-                cur_future_seg_body_control,  # (B, Pnn, T, 3)
-                self.final_hidden_tokens,  # (B, Pnn, H)
-            )
-            temp_dict = {
-                "cur_future_seg_body_control:", cur_future_seg_body_control
-            }
-            temp_dict = self.config.state_normalizer.inverse(temp_dict)
-            unnorm_cur_future_seg_body_control = temp_dict[
-                "cur_future_seg_body_control"]  # (B, Pnn, T,
-            unnorm_integrated_trajectory, unnorm_control_constraint_diff = self.feasible_projector.filter_and_integrate(
-                unnorm_near_current_state,  # (B, Pnn, 4)
-                near_current_valid,  # (B, Pnn)
-                unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 4)
-            )  # (B, Pnn, T, 4)
-            integrated_trajectory = self.config.state_normalizer.inverse(
-                unnorm_integrated_trajectory)  # (B, Pnn, T, 4)
-            temp_dict = {
-                "control_constraint_diff": unnorm_control_constraint_diff
-            }
-            temp_dict = self.config.state_normalizer(temp_dict)
-            control_constraint_diff = temp_dict[
-                "control_constraint_diff"]  # (B, Pnn, T, 3)
-            self.dit_returns = DiTReturns(
-                integrated_trajectory=integrated_trajectory,
-                control_constraint_diff=control_constraint_diff)
-            return x
+            self._feasible_projection(diffusion_trajectory,
+                                      near_cur_future_valid)
+            return x  # (B, Pnn, T * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
+
+    def _feasible_projection(
+        self,
+        diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+T, 4)
+        near_cur_future_valid: torch.Tensor  # (B, Pnn, 1+T) bool
+    ):
+        # diffusion_trajectory: (B, Pnn, 1+T, 4)
+        # (B, Pnn, 1+T, 4)
+        near_current_valid = near_cur_future_valid[:, :, 0]  # (B, Pnn)
+        unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
+            diffusion_trajectory)
+        unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
+                                                                0, :]  # (B, Pnn, 4)
+
+        unnorm_cur_future_body_control = self.feasible_projector.savgol_filter_for_body_control(
+            unnorm_diffusion_trajectory,
+            near_cur_future_valid,
+        )  # (B, Pnn, 1+T, 3)
+        # cur_future_seg_body_control: (B, Pnn, T, 3)
+        unnorm_cur_future_seg_body_control = self.feasible_projector.compute_midpoint_controls(
+            unnorm_cur_future_body_control, near_cur_future_valid)
+        temp_dict = {
+            "cur_future_seg_body_control:", unnorm_cur_future_seg_body_control
+        }
+        temp_dict = self.config.observation_normalizer(temp_dict)
+        cur_future_seg_body_control = temp_dict[
+            "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
+        cur_future_seg_body_control = self.feasible_projector(
+            near_cur_future_valid,  # (B, Pnn, 1+T)
+            diffusion_trajectory,  # (B, Pnn, 1+T, 4)
+            cur_future_seg_body_control,  # (B, Pnn, T, 3)
+            self.final_hidden_tokens,  # (B, Pnn, H)
+        )
+        temp_dict = {
+            "cur_future_seg_body_control:", cur_future_seg_body_control
+        }
+        temp_dict = self.config.state_normalizer.inverse(temp_dict)
+        unnorm_cur_future_seg_body_control = temp_dict[
+            "cur_future_seg_body_control"]  # (B, Pnn, T,
+        (unnorm_integrated_trajectory, unnorm_control_constraint_diff
+        ) = self.feasible_projector.filter_and_integrate(
+            unnorm_near_current_state,  # (B, Pnn, 4)
+            near_current_valid,  # (B, Pnn)
+            unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 4)
+        )  # (B, Pnn, T, 4)
+        integrated_trajectory = self.config.state_normalizer.inverse(
+            unnorm_integrated_trajectory)  # (B, Pnn, T, 4)
+        temp_dict = {"control_constraint_diff": unnorm_control_constraint_diff}
+        temp_dict = self.config.state_normalizer(temp_dict)
+        control_constraint_diff = temp_dict[
+            "control_constraint_diff"]  # (B, Pnn, T, 3)
+        self.dit_returns = DiTReturns(
+            integrated_trajectory=integrated_trajectory,
+            control_constraint_diff=control_constraint_diff)

@@ -68,12 +68,14 @@ def _build_half_life_weights(
 # ----------------------------------------------------------------------------
 from typing import Dict, Optional
 
+
 def _compute_control_xy_yaw_diff(
-    control_diff_denorm: torch.Tensor,   # [B, P, T, 3], (vx[m/s], vy[m/s], yaw_rate[rad/s] 또는 deg/s)
-    valid_mask: torch.Tensor,            # [B, P, T], True=유효
+    control_diff_denorm: torch.
+    Tensor,  # [B, P, T, 3], (vx[m/s], vy[m/s], yaw_rate[rad/s] 또는 deg/s)
+    valid_mask: torch.Tensor,  # [B, P, T], True=유효
     *,
     prefix: str = "constraint_diff",
-    omega_in_radian: bool = True,        # True면 rad/s → deg/s 변환
+    omega_in_radian: bool = True,  # True면 rad/s → deg/s 변환
     eps: float = 1e-6,
 ) -> Dict[str, torch.Tensor]:
     """제어 차이(vx, vy, yaw_rate)의 규모를 물리 단위로 요약 지표로 반환.
@@ -127,10 +129,11 @@ def _compute_control_xy_yaw_diff(
     omg_abs_mean_deg = (omega_deg.abs() * weight).sum() / denom
 
     return {
-        f"{prefix}_vx_b": vx_abs_mean,            # m/s
-        f"{prefix}_vy_b": vy_abs_mean,            # m/s
-        f"{prefix}_yaw_rate": omg_abs_mean_deg,   # deg/s
+        f"{prefix}_vx_b": vx_abs_mean,  # m/s
+        f"{prefix}_vy_b": vy_abs_mean,  # m/s
+        f"{prefix}_yaw_rate": omg_abs_mean_deg,  # deg/s
     }
+
 
 def _compute_xy_yaw_losses(
         score_denorm: torch.Tensor,
@@ -205,7 +208,7 @@ def _compute_xy_yaw_losses(
 
 # [ADD] ----------------------------------------------------------------------
 def _masked_weighted_mse_from_diff(
-    diff: torch.Tensor,  # (B, P, T, C)
+    diff: torch.Tensor,  # (B, P, T, 3)
     valid_mask: torch.Tensor,  # (B, P, T)  (1=valid)
     w_t: torch.Tensor,  # (1, 1, T)
     eps: float = 1e-6,
@@ -213,7 +216,7 @@ def _masked_weighted_mse_from_diff(
     """마스크·시간가중 MSE(차원 합) 계산.
 
     Args:
-        diff: (B, P, T, C) 차이 텐서. 예) u - Filter_soft(u).detach()
+        diff: (B, P, T, 3) 차이 텐서. 예) u - Filter_soft(u).detach()
         valid_mask: (B, P, T) 유효 마스크 (True/1=유효)
         w_t: (1, 1, T) half-life 기반 시간 가중치
         eps: 분모 보호용 epsilon
@@ -285,9 +288,17 @@ def diffusion_loss_func(
     # near_future_gt_4_dim: [B, Pnn, T, 4]
     # near_current_xyyaw_norm: [B, Pnn, 4]
     # batch_diffusion_time: [B,] diffusion time uniformly sampled in [eps, 1]
-    # random_noise: [B, Pnn + 1, T, 4] noise sampled from standard normal
+    """ batch_diffusion_time
+    1 에 가까울수록 더 많은 noise가 추가됨.
+    """
     batch_diffusion_time = torch.rand(
         B, device=near_future_gt_4_dim.device) * (1 - eps) + eps  # [B,]
+    # --- '노이즈가 적은(t<=0.3)' 구간만 쓰는 마스크 -------------------------
+    LOW_NOISE_FRAC = 0.30
+    t_threshold = LOW_NOISE_FRAC  # 0.30
+    low_t_mask = (batch_diffusion_time <= t_threshold)  # [B]  True=저노이즈
+    low_t_mask_bt = low_t_mask.view(B, 1, 1)  # [B,1,1] → [B,P,T] 브로드캐스트
+    # random_noise: [B, Pnn + 1, T, 4] noise sampled from standard normal
     random_noise = torch.randn_like(
         near_future_gt_4_dim,
         device=near_future_gt_4_dim.device)  # [B, Pnn, T, 4]
@@ -368,6 +379,8 @@ def diffusion_loss_func(
     loss["neighbor_prediction_loss"] = loss_val
 
     if model_type == "x_start":
+        valid_low = near_future_valid & low_t_mask_bt  # (B, Pnn, T) bool
+        valid_low_f = valid_low.float()
         ###### L_integration loss 추가 ######
         if "integrated_trajectory" in decoder_output:
 
@@ -378,9 +391,10 @@ def diffusion_loss_func(
             integration_loss = torch.sum(
                 (integrated_trajectory - near_future_norm_gt)**2, dim=-1)
             weighted_integration = integration_loss * w_t  # (B, Pnn, T)
-            valid_integration_loss = weighted_integration * valid  # (B, Pnn, T)
-            integration_loss_val = valid_integration_loss.sum(
-            ) / denom  # 스칼라(gradient O)
+            denom_low = (valid_low_f * w_t).sum().clamp_min(1e-6)
+            integration_loss_val = (weighted_integration *
+                                    valid_low_f).sum() / denom_low
+
         else:
             integrated_trajectory = None
             # 안전 fallback: 해당 항 미제공 시 0 손실
@@ -398,7 +412,10 @@ def diffusion_loss_func(
                 "decoder_output['control_constraint_diff']",
                 decoder_output["control_constraint_diff"])  # (B, P, T, 3)
             constraint_loss_val = _masked_weighted_mse_from_diff(
-                control_constraint_diff, near_future_valid, w_t)
+                control_constraint_diff,  # (B,P,T,3)
+                valid_low,  # <-- 기존 near_future_valid 대신
+                w_t
+            )
         else:
             # 안전 fallback: 해당 항 미제공 시 0 손실
             control_constraint_diff = None

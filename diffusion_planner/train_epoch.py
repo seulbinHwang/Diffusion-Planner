@@ -30,7 +30,8 @@ def train_epoch(data_loader,
     # 동일 args 객체를 통해 에폭 간 누적 유지
     if not hasattr(args, "_global_update_step"):
         args._global_update_step = 0
-    total_update_steps = max(1, args.train_epochs * len(data_loader))
+    total_step_of_this_epoch = len(data_loader)
+    total_update_steps = max(1, args.train_epochs * total_step_of_this_epoch)
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
@@ -128,9 +129,6 @@ def train_epoch(data_loader,
             l_con = loss.get(
                 "constraint_loss",
                 torch.tensor(0.0, device=inputs["ego_agent_past"].device))
-            loss["w_direct"] = torch.as_tensor(w_dir, device=l_dir.device)
-            loss["w_integration"] = torch.as_tensor(w_int, device=l_dir.device)
-            loss["w_constraint"] = torch.as_tensor(w_const, device=l_dir.device)
             loss["loss"] = w_dir * l_dir + w_int * l_int + w_const * l_con
 
             total_loss = loss["loss"].item()  # scalar

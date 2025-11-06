@@ -9,7 +9,6 @@ class Diffusion_Planner(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.config = config
         self.encoder = Diffusion_Planner_Encoder(config)
         self.decoder = Diffusion_Planner_Decoder(config)
 

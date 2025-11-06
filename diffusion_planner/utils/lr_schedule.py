@@ -37,7 +37,8 @@ def build_pytorch_warmup_cosine_scheduler(
     if warmup_steps > 0:
         warmup = LinearLR(
             optimizer,
-            start_factor=1.0 / max(1, warmup_steps),  # 첫 step에서 η_max / warmup_steps
+            start_factor=1.0 /
+            max(1, warmup_steps),  # 첫 step에서 η_max / warmup_steps
             end_factor=1.0,
             total_iters=warmup_steps,
         )
