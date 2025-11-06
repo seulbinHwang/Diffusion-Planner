@@ -41,6 +41,11 @@ class Decoder(nn.Module):
         self._cond_last_prob: float = getattr(config, "cond_last_prob",
                                               0.0)  # 20%
 
+        if self.config.use_current_input:
+            output_dim = (config.future_len + 1) * 4  # x, y, cos, sin
+        else:
+            output_dim = (config.future_len) * 4  # x, y, cos, sin
+
         self.dit = DiT(
             config=config,
             sde=self._sde,
@@ -50,7 +55,7 @@ class Decoder(nn.Module):
             #     drop_path_rate=config.encoder_drop_path_rate,
             #     hidden_dim=config.hidden_dim),
             depth=config.decoder_depth,
-            output_dim=(config.future_len) * 4,  # x, y, cos, sin
+            output_dim=output_dim,  # x, y, cos, sin
             hidden_dim=config.hidden_dim,
             heads=config.num_heads,
             dropout=dpr,
