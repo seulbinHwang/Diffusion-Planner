@@ -107,7 +107,7 @@ def train_epoch(data_loader,
             near_future_gt_4_dim.shape: [8, 10, 80, 4]
             near_future_mask.shape: [8, 10, 80]
             """
-            loss, _ = diffusion_loss_func(
+            loss, _ = diffusion_loss_func(args,
                 model, norm_inputs,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
                 (near_future_gt_4_dim, near_future_mask), args.state_normalizer,

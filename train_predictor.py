@@ -298,6 +298,7 @@ def get_args():
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--use_feasible', default=False, type=boolean)
     parser.add_argument('--use_current_input', default=False, type=boolean)
+    parser.add_argument('--use_huber_loss', default=True, type=boolean)
 
     # parser.add_argument(
     #     '--pin-mem',

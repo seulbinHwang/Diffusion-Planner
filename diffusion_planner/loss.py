@@ -239,6 +239,7 @@ def _masked_weighted_mse_from_diff(
 
 
 def diffusion_loss_func(
+        args,
     model: nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
@@ -350,13 +351,33 @@ def diffusion_loss_func(
     score = decoder_output["score"][:, :, 1:, :]  # (B, Pnn, T, 4)
     score = _require_finite("decoder_output['score']", score)
     assert score.shape == (B, Pnn, T, 4)
+    HUBER_DELTA: float = 1.0  # 허용 오차 구간(조정 가능)
+    if args.use_huber_loss:
+        # (1) 잔차 계산: 모드별로 err 정의
+        if model_type == "score":
+            # 원래 MSE 식의 내부: (score * std + random_noise)
+            err = score * std + random_noise  # (B, Pnn, T, 4)
+        elif model_type == "x_start":
+            # 원래 MSE 식의 내부: (score - near_future_norm_gt)
+            err = score - near_future_norm_gt  # (B, Pnn, T, 4)
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
+        # (2) Huber 손실 계산(요소별)
+        abs_err = err.abs()
+        quad = 0.5 * err.pow(2)  # |e| <= δ일 때 0.5*e^2
+        lin = HUBER_DELTA * (
+                    abs_err - 0.5 * HUBER_DELTA)  # |e| > δ일 때 δ*(|e|-0.5δ)
+        huber = torch.where(abs_err <= HUBER_DELTA, quad, lin)  # (B, Pnn, T, 4)
 
-    if model_type == "score":
-        dpm_loss = torch.sum((score * std + random_noise)**2, dim=-1)
-    elif model_type == "x_start":
-        # near_future_gt_4_dim: [B, Pnn, T, 4]
-        # dpm_loss: (B, Pnn, T)
-        dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
+        # (3) 채널(마지막 차원=4) 합산 → (B, Pnn, T)
+        dpm_loss = huber.sum(dim=-1)
+    else:
+        if model_type == "score":
+            dpm_loss = torch.sum((score * std + random_noise)**2, dim=-1)
+        elif model_type == "x_start":
+            # near_future_gt_4_dim: [B, Pnn, T, 4]
+            # dpm_loss: (B, Pnn, T)
+            dpm_loss = torch.sum((score - near_future_norm_gt)**2, dim=-1)
     # near_future_valid: [B, Pnn, T]
     valid = near_future_valid.float()
 
