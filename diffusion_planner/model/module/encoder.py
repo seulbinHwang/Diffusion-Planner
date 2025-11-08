@@ -48,7 +48,24 @@ except Exception as _e1:
 from typing import Tuple, Dict, Optional
 import torch
 import torch.nn as nn
+from typing import Iterable
 
+def _zero_with_touch(self,
+                     ref: torch.Tensor,
+                     params: Iterable[torch.nn.Parameter]) -> torch.Tensor:
+    """ref와 같은 shape의 0 텐서를 반환하되, 주어진 파라미터들을 0계수로 터치해
+    autograd 그래프를 연결(grad는 0)."""
+    # 스칼라 누산(기기/dtype 맞춤)
+    touch = ref.new_zeros(())
+    for p in params:
+        # 첫 원소만 살짝 참조 → 비용 최소화
+        touch = touch + p.view(-1)[:1].sum()
+    return ref.new_zeros(ref.shape) + touch * 0.0  # broadcast OK
+
+def _ego_fut_params(self) -> Iterable[torch.nn.Parameter]:
+    for n, p in self.agents_encoder.named_parameters():
+        if n.startswith("ego_fut_"):
+            yield p
 
 def encode_time_with_fourier_features(
     t_sec: torch.Tensor,
@@ -579,7 +596,8 @@ class Encoder(nn.Module):
          ego_fut_global) = self.agents_encoder(ego_past, neighbors,
                                                ego_future_trajectory)
         if not self.config.use_pram:
-            ego_fut_global = torch.zeros_like(ego_fut_global)
+            ego_fut_global = self._zero_with_touch(ego_fut_global,
+                                                   self._ego_fut_params())
         """
         encoding_static: (B, static_objects_num, hidden_dim)
         static_mask: (B, static_objects_num)
@@ -647,8 +665,8 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
          route_known_mask) = self._get_near_agents_route_lane_emb(
              encoding_lanes, lanes_mask, agent_route_lane_order)
         if not self.config.use_pram:
-            near_agents_route_lane_emb = torch.zeros_like(
-                near_agents_route_lane_emb)
+            near_agents_route_lane_emb = self._zero_with_touch(
+                near_agents_route_lane_emb, self.npc_route_encoder.parameters())
             route_known_mask = torch.zeros_like(route_known_mask).bool()
 
         encoder_outputs[
