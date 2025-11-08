@@ -516,12 +516,16 @@ class Encoder(nn.Module):
         """
         # ego
         ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
+        if not self.config.use_vel_input:
+            ego_past[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
         ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
         # (B ,future_len= 80, 11)
         planner_future_11_dim = inputs["planner_future_11_dim"]
         # agents
         # (B, A, V=21, D=11)
         neighbors = inputs["neighbor_agents_past"]
+        if not self.config.use_vel_input:
+            neighbors[:, :, :, 4:6] = 0.0  # vx, vy 0으로 설정
 
         # static objects
         # (B, P, D_static)
@@ -561,7 +565,8 @@ class Encoder(nn.Module):
                 ego_future_trajectory = torch.zeros((B, future_len, 11),
                                                     device=ego_past.device,
                                                     dtype=ego_past.dtype)
-
+        if not self.config.use_vel_input:
+            ego_future_trajectory[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
         # ---------------------- 3) 인코딩 ---------------------- #
         # ego_fut_global: (B, hidden_dim)
         """
@@ -573,6 +578,8 @@ class Encoder(nn.Module):
         (encoding_agents_chunk, agents_chunk_mask, agents_chunk_pos,
          ego_fut_global) = self.agents_encoder(ego_past, neighbors,
                                                ego_future_trajectory)
+        if not self.config.use_pram:
+            ego_fut_global = torch.zeros_like(ego_fut_global)
         """
         encoding_static: (B, static_objects_num, hidden_dim)
         static_mask: (B, static_objects_num)
@@ -639,6 +646,10 @@ token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_object
         (near_agents_route_lane_emb,
          route_known_mask) = self._get_near_agents_route_lane_emb(
              encoding_lanes, lanes_mask, agent_route_lane_order)
+        if not self.config.use_pram:
+            near_agents_route_lane_emb = torch.zeros_like(
+                near_agents_route_lane_emb)
+            route_known_mask = torch.zeros_like(route_known_mask).bool()
 
         encoder_outputs[
             "near_agents_route_lane_emb"] = near_agents_route_lane_emb  # (B, Pnn, hidden_dim)
