@@ -318,9 +318,9 @@ class Decoder(nn.Module):
             xT_input, _ = self._maybe_apply_last_pos_condition_training(
                 xT_input, near_current_mask, cond_last_pos_norm)
             diffusion_time = inputs['diffusion_time']
-            # (B, Pnn, T , 4)
+            # (B, Pnn, T , 4) or (B, Pnn, (1+T) , 4)
             score = self.dit(
-                xT_input,  # ( B, Pnn, T* 4 ) # (B, Pnn, (1+T)*4)
+                xT_input,  # ( B, Pnn, T* 4 ) or  (B, Pnn, (1+T)*4)
                 diffusion_time,  # (B)
                 scene_encoding_token,  # (B, token_num, hidden_dim)
                 ego_fut_global,  # (B, hidden_dim)
@@ -349,6 +349,8 @@ class Decoder(nn.Module):
                     dim=2)  # (B,Pnn,1+T,4)
                 return_[
                     "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
+                return_[
+                    "control_constraint_diff"] = self.dit.dit_returns.control_constraint_diff  # (B,Pnn,T,3)
             return return_
         else:
             noise = near_current_xyyaw.new_empty(
@@ -845,17 +847,23 @@ class DiT(nn.Module):
             return out
         elif self._model_type == "x_start":
             # CURRENT DEFAULT OPTION: "x_start"
-            # x: (B, Pnn, T * 4)
-            # 시작
-            diffusion_trajectory = torch.cat(
-                [near_current_xyyaw.unsqueeze(2),
-                 x.reshape(B, Pnn, -1, 4)],
-                dim=2)
+            # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
+                # DiT.forward (model_type == "x_start" 분기 내부)
+                if getattr(self.config, "use_current_input", False):
+                    # x: (B, Pnn, (1+T)*4) → 이미 현재 프레임 포함
+                    diffusion_trajectory = x.reshape(B, Pnn, -1,
+                                                     4)  # (B,Pnn,1+T,4)
+                else:
+                    # x: (B, Pnn, T*4) → 현재 프레임을 앞에 붙여서 1+T로 맞춤
+                    diffusion_trajectory = torch.cat(
+                        [near_current_xyyaw.unsqueeze(2),
+                         x.reshape(B, Pnn, -1, 4)],
+                        dim=2)  # (B,Pnn,1+T,4)
                 self._feasible_projection(diffusion_trajectory,
                                           near_class_one_hot,
                                           near_cur_future_valid)
-            return x  # (B, Pnn, T * 4)
+            return x  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
 
@@ -905,7 +913,7 @@ class DiT(nn.Module):
         ) = self.feasible_projector.filter_and_integrate(
             unnorm_near_current_state,  # (B, Pnn, 4)
             near_current_valid,  # (B, Pnn)
-            unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 4)
+            unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 3)
             near_class_one_hot,
             # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
         )  # (B, Pnn, T, 4)
