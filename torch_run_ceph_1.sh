@@ -96,6 +96,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "use_current_input_false_2_gpu_A" \
-  --batch_size 1536 \
+  --batch_size 2048 \
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

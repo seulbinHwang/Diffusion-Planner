@@ -329,7 +329,7 @@ def get_args():
     parser.add_argument('--train_epochs',
                         type=int,
                         help='epochs of training',
-                        default=500)
+                        default=360)
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',
@@ -831,9 +831,9 @@ def model_training(args):
                       float(pg.get("weight_decay", 0.0)))  # 그룹별 WD 기준값
     # ↑↑↑
     ############## [LR (4) ] 선형 워밍업 -> 코사인 디케이 (스케쥴) ##########################
-    pseudo_total_update_steps = 110000
+    # pseudo_total_update_steps = 110000
     scheduler = build_pytorch_warmup_cosine_scheduler(optimizer,
-                                                      pseudo_total_update_steps,
+                                                      total_step_of_all_epoch,
                                                       warmup_steps,
                                                       eta_min=0.2 *
                                                       args.learning_rate)
