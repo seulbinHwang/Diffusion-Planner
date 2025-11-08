@@ -595,7 +595,8 @@ class DiT(nn.Module):
         assert model_type in ["score",
                               "x_start"], f"Unknown model type: {model_type}"
         self.final_hidden_tokens = None
-        self.feasible_projector = FeasibleProjector(hidden_dim)
+        if self.config.use_feasible:
+            self.feasible_projector = FeasibleProjector(hidden_dim)
 
         self._model_type = model_type
         self.preproj = Mlp(in_features=output_dim,
