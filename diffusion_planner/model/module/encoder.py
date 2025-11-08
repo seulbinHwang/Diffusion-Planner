@@ -50,22 +50,6 @@ import torch
 import torch.nn as nn
 from typing import Iterable
 
-def _zero_with_touch(self,
-                     ref: torch.Tensor,
-                     params: Iterable[torch.nn.Parameter]) -> torch.Tensor:
-    """ref와 같은 shape의 0 텐서를 반환하되, 주어진 파라미터들을 0계수로 터치해
-    autograd 그래프를 연결(grad는 0)."""
-    # 스칼라 누산(기기/dtype 맞춤)
-    touch = ref.new_zeros(())
-    for p in params:
-        # 첫 원소만 살짝 참조 → 비용 최소화
-        touch = touch + p.view(-1)[:1].sum()
-    return ref.new_zeros(ref.shape) + touch * 0.0  # broadcast OK
-
-def _ego_fut_params(self) -> Iterable[torch.nn.Parameter]:
-    for n, p in self.agents_encoder.named_parameters():
-        if n.startswith("ego_fut_"):
-            yield p
 
 def encode_time_with_fourier_features(
     t_sec: torch.Tensor,
@@ -389,6 +373,23 @@ class Encoder(nn.Module):
         # type (ego, neighbor, static, lane)
         self.pos_emb = nn.Linear(8, config.hidden_dim)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
+
+    def _zero_with_touch(self,
+                         ref: torch.Tensor,
+                         params: Iterable[torch.nn.Parameter]) -> torch.Tensor:
+        """ref와 같은 shape의 0 텐서를 반환하되, 주어진 파라미터들을 0계수로 터치해
+        autograd 그래프를 연결(grad는 0)."""
+        # 스칼라 누산(기기/dtype 맞춤)
+        touch = ref.new_zeros(())
+        for p in params:
+            # 첫 원소만 살짝 참조 → 비용 최소화
+            touch = touch + p.view(-1)[:1].sum()
+        return ref.new_zeros(ref.shape) + touch * 0.0  # broadcast OK
+
+    def _ego_fut_params(self) -> Iterable[torch.nn.Parameter]:
+        for n, p in self.agents_encoder.named_parameters():
+            if n.startswith("ego_fut_"):
+                yield p
 
     @staticmethod
     def _mask_all_routes_like(
