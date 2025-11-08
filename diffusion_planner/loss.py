@@ -239,7 +239,7 @@ def _masked_weighted_mse_from_diff(
 
 
 def diffusion_loss_func(
-        args,
+    args,
     model: nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
@@ -365,8 +365,8 @@ def diffusion_loss_func(
         # (2) Huber 손실 계산(요소별)
         abs_err = err.abs()
         quad = 0.5 * err.pow(2)  # |e| <= δ일 때 0.5*e^2
-        lin = HUBER_DELTA * (
-                    abs_err - 0.5 * HUBER_DELTA)  # |e| > δ일 때 δ*(|e|-0.5δ)
+        lin = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA
+                            )  # |e| > δ일 때 δ*(|e|-0.5δ)
         huber = torch.where(abs_err <= HUBER_DELTA, quad, lin)  # (B, Pnn, T, 4)
 
         # (3) 채널(마지막 차원=4) 합산 → (B, Pnn, T)
@@ -435,8 +435,7 @@ def diffusion_loss_func(
             constraint_loss_val = _masked_weighted_mse_from_diff(
                 control_constraint_diff,  # (B,P,T,3)
                 valid_low,  # <-- 기존 near_future_valid 대신
-                w_t
-            )
+                w_t)
         else:
             # 안전 fallback: 해당 항 미제공 시 0 손실
             control_constraint_diff = None
