@@ -22,6 +22,7 @@ from typing import Tuple
 from collections import OrderedDict
 from typing import Dict, Tuple, Optional
 
+
 def _yaw_rate_from_cos_sin_via_sg(
     cos_yaw: Tensor,  # (B, Pnn, T1)
     sin_yaw: Tensor,  # (B, Pnn, T1)
@@ -206,8 +207,14 @@ class FeasibleProjector(nn.Module):
         # --- [NEW] Savitzky–Golay 커널 캐시(LRU) ---
         # key: (W, polyorder, deriv_order, dt, dtype, device)
         # val: torch.Tensor of shape (1, 1, W)
-        self._sg_kernel_cache: "OrderedDict[Tuple[int, int, int, float, torch.dtype, torch.device], torch.Tensor]" = OrderedDict()
+        self._sg_kernel_cache: "OrderedDict[Tuple[int, int, int, float, torch.dtype, torch.device], torch.Tensor]" = OrderedDict(
+        )
         self._sg_kernel_cache_cap: int = 256  # 필요시 조절(메모리-속도 트레이드오프)
+        # [추가 요망] SG 위치별(one‑sided/중앙) 가중치 캐시(LRU)
+        # key: (W, polyorder, deriv_order, m, dt, dtype, device)  → val: (W,) weights
+        self._sg_pos_cache: "OrderedDict[Tuple[int, int, int, int, float, torch.dtype, torch.device], torch.Tensor]" = OrderedDict(
+        )
+        self._sg_pos_cache_cap: int = 2048  # 필요시 조절
 
         self.constraints_h_params = _ConstraintHParams(
             dt=0.1,
@@ -331,7 +338,7 @@ class FeasibleProjector(nn.Module):
         ])
         # pointwise 1x1 (시간축 보존, 채널 결합)
         self.tcn_linear = nn.ModuleList(
-            [nn.Linear(self._C, self._C) for _ in range(4)])
+            [nn.Linear(self._C, self._C) for _ in range(self.tcn_depth)])
 
         # ------------------------------
         # Head & Gate
@@ -359,14 +366,57 @@ class FeasibleProjector(nn.Module):
         with torch.no_grad():
             self.gate_mlp[-1].bias.fill_(b_init)
 
+    def _get_savgol_pos_weights_cached(
+        self,
+        *,
+        window_length: int,
+        polyorder: int,
+        deriv_order: int,
+        dt: float,
+        m: int,  # 창 내부 평가 위치(0..W-1)
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """창 길이 W에서 위치 m(0..W-1)의 k차 미분 SG 가중치 벡터를 반환.
+
+        Returns:
+            torch.Tensor: (W,)  — 창 샘플과 내적하면 해당 위치의 미분 근사값.
+        """
+        key = (int(window_length), int(polyorder), int(deriv_order), int(m),
+               float(dt), dtype, device)
+        if key in self._sg_pos_cache:
+            w = self._sg_pos_cache.pop(key)
+            self._sg_pos_cache[key] = w  # LRU 갱신
+            return w
+
+        W = int(window_length)
+        assert 0 <= m < W, f"m={m}는 [0, {W - 1}] 범위를 벗어났습니다."
+        # 수치 안정: 내부 계산은 float64 선호 후 최종 dtype으로 캐스팅
+        work_dtype = torch.float64
+        # 좌표를 m 기준으로 원점 이동: x_i = i - m
+        x = torch.arange(0, W, device=device, dtype=work_dtype) - float(
+            m)  # (W,)
+        V = torch.stack([x**i for i in range(polyorder + 1)], dim=1)  # (W, P+1)
+        pinv = torch.linalg.pinv(V)  # (P+1, W)
+        e = torch.zeros(polyorder + 1, device=device, dtype=work_dtype)
+        e[deriv_order] = math.factorial(deriv_order)  # d^k/dx^k at 0
+        w = (e @ pinv) / (dt**deriv_order)  # (W,)
+        w = w.to(dtype)  # 최종 dtype
+
+        # LRU 삽입
+        if len(self._sg_pos_cache) >= self._sg_pos_cache_cap:
+            self._sg_pos_cache.popitem(last=False)
+        self._sg_pos_cache[key] = w
+        return w
+
     def _get_savgol_diff_kernel_cached(
-            self,
-            window_length: int,
-            polyorder: int,
-            deriv_order: int,
-            dt: float,
-            device: torch.device,
-            dtype: torch.dtype,
+        self,
+        window_length: int,
+        polyorder: int,
+        deriv_order: int,
+        dt: float,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
         """사비츠키–골레이 1D 미분 커널을 LRU 캐시로 제공.
 
@@ -381,8 +431,8 @@ class FeasibleProjector(nn.Module):
         Returns:
             torch.Tensor: (1, 1, W) 커널. requires_grad=False.
         """
-        key = (int(window_length), int(polyorder), int(deriv_order),
-               float(dt), dtype, device)
+        key = (int(window_length), int(polyorder), int(deriv_order), float(dt),
+               dtype, device)
 
         # 1) 히트: 최근 사용으로 갱신(MRU)
         if key in self._sg_kernel_cache:
@@ -1051,16 +1101,17 @@ class FeasibleProjector(nn.Module):
         is_ped = near_class_one_hot[..., 1] > 0.5  # (B,Pnn) bool
         is_nonholonomic = ~is_ped
 
-        return dict(v_max=v_max_bp, # (B,Pnn)
-                    a_max=a_max_bp, # (B,Pnn)
-                    alpha_max=alpha_max_bp, # (B,Pnn)
-                    a_lat_max=a_lat_max_bp, # (B,Pnn)
-                    R_min=R_min_bp, # (B,Pnn)
-                    omega_abs_max=omega_abs_bp, # (B,Pnn)
-                    a_x_max=a_x_max_bp, # (B,Pnn)
-                    a_y_max=a_y_max_bp, # (B,Pnn)
-                    is_nonholonomic=is_nonholonomic, # (B,Pnn) bool
-                    )
+        return dict(
+            v_max=v_max_bp,  # (B,Pnn)
+            a_max=a_max_bp,  # (B,Pnn)
+            alpha_max=alpha_max_bp,  # (B,Pnn)
+            a_lat_max=a_lat_max_bp,  # (B,Pnn)
+            R_min=R_min_bp,  # (B,Pnn)
+            omega_abs_max=omega_abs_bp,  # (B,Pnn)
+            a_x_max=a_x_max_bp,  # (B,Pnn)
+            a_y_max=a_y_max_bp,  # (B,Pnn)
+            is_nonholonomic=is_nonholonomic,  # (B,Pnn) bool
+        )
 
     # ----------------------------
     # [NEW] 제약/적분 하이퍼 고정값
@@ -1514,23 +1565,30 @@ class FeasibleProjector(nn.Module):
         """ 
         Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn) 
         
+        v_max/a_max/alpha_max/a_lat_max/R_min/omega_abs_max/a_x_max/a_y_max, is_nonholonomic
         
         """
         key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
             near_class_one_hot, device=device, dtype=dtype)
+        # (B,Pnn,T)
         vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
             unnorm_cur_future_seg_body_control)
+        """ key_to_all_states
+        x_next / y_next / cos_next / sin_next: (B,Pnn,T)
+        vx_after / vy_after / omega_after: (B,Pnn,T)
+        """
         key_to_all_states: Dict[str,
                                 torch.Tensor] = self._init_integration_buffers(
                                     B, Pnn, T, dtype, device)
 
-        x_k = unnorm_near_current_state[..., 0]
-        y_k = unnorm_near_current_state[..., 1]
-        cos_yaw_k = unnorm_near_current_state[..., 2]
-        sin_yaw_k = unnorm_near_current_state[..., 3]
-        vx_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
-        vy_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
-        omega_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+        x_k = unnorm_near_current_state[..., 0]  # (B,Pnn)
+        y_k = unnorm_near_current_state[..., 1]  # (B,Pnn)
+        cos_yaw_k = unnorm_near_current_state[..., 2]  # (B,Pnn)
+        sin_yaw_k = unnorm_near_current_state[..., 3]  # (B,Pnn)
+        vx_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)  # (B,Pnn)
+        vy_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)  # (B,Pnn)
+        omega_prev = torch.zeros((B, Pnn), device=device,
+                                 dtype=dtype)  # (B,Pnn)
 
         for k in range(T):
             vx_k, vy_k, yaw_rate_k = vx_b_raw[...,
@@ -1578,26 +1636,26 @@ class FeasibleProjector(nn.Module):
 
     @staticmethod
     def _choose_window_length(
-        effective_length: int,
-        polyorder: int,
-        max_window_length: int,
+            effective_length: int,
+            polyorder: int,
+            max_window_length: int,
     ) -> int:
         """유효 길이에 맞춰 SG 윈도 길이 결정(홀수, polyorder보다 큼).
-
-        Args:
-            effective_length: 현재 구간 길이 M (전체 길이 혹은 [i0, i1]).
-            polyorder: 다항 차수(보통 2).
-            max_window_length: 윈도 길이 상한.
-        Returns:
-            int: 사용 가능한 홀수 윈도 길이. (3 미만이면 SG 대신 유한차분 권장)
+        - 너무 짧으면(≤polyorder 또는 <3) 0을 반환해 유한차분으로 폴백.
         """
-        if effective_length <= 0:
+        # 1) 길이가 너무 짧으면 SG 사용 안 함
+        if effective_length <= polyorder or effective_length < 3:
             return 0
-        win = min(max_window_length, effective_length)
-        win = FeasibleProjector._ensure_odd(win)
-        while win > effective_length or win <= polyorder:
-            win -= 2
-        return max(0, win)
+
+        # 2) 상한 내에서 가능한 가장 큰 홀수 창
+        lim = min(max_window_length, effective_length)
+        win = lim if (lim % 2 == 1) else (lim - 1)
+
+        # 3) 여전히 polyorder보다 작거나 같으면 사용 불가 → 폴백
+        if win <= polyorder:
+            return 0
+
+        return win
 
     @staticmethod
     def _build_savgol_diff_kernel(
@@ -1615,17 +1673,15 @@ class FeasibleProjector(nn.Module):
         """
         # h=1인 정수 격자에서의 설계 → 실제 시간 미분은 dt**deriv 로 스케일
         half = window_length // 2
-        x = torch.arange(-half, half + 1, device=device, dtype=dtype)  # (W,)
-        # Vandermonde: [1, x, x^2, ...]
-        V = torch.stack([x**i for i in range(polyorder + 1)],
-                        dim=1)  # (W, Pnn+1)
-        # Moore–Penrose 역행렬
-        pinv = torch.linalg.pinv(V)  # (Pnn+1, W)
-        e = torch.zeros(polyorder + 1, device=device, dtype=dtype)
-        e[deriv_order] = math.factorial(deriv_order)  # d^k/dx^k at 0
-        # 계수: e^T * pinv  → (W,)
-        coeff = (e @ pinv) / (dt**deriv_order)
-        kernel = coeff.view(1, 1, window_length)  # (1,1,W)
+        work_dtype = torch.float64
+        x = torch.arange(-half, half + 1, device=device, dtype=work_dtype)
+        V = torch.stack([x ** i for i in range(polyorder + 1)], dim=1).to(
+            work_dtype)
+        pinv = torch.linalg.pinv(V)  # float64
+        e = torch.zeros(polyorder + 1, device=device, dtype=work_dtype)
+        e[deriv_order] = math.factorial(deriv_order)
+        coeff = (e @ pinv) / (dt ** deriv_order)  # float64
+        kernel = coeff.to(dtype).view(1, 1, window_length)  # 최종 dtype으로 캐스팅
         return kernel
 
     @staticmethod
@@ -1704,86 +1760,149 @@ class FeasibleProjector(nn.Module):
         idx_partial = torch.nonzero(~full_mask, as_tuple=False).flatten()
         return idx_full, idx_partial
 
+    # [추가 요망] FeasibleProjector 내부에 추가
+    def _build_poswise_weight_banks_cached(
+        self,
+        *,
+        T: int,
+        polyorder: int,
+        max_window_length: int,
+        dt: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """왼/가운데/오른쪽 구간에 쓸 위치별 SG 미분 가중치 뱅크 생성(+캐시된 항목 재사용).
+
+        Returns:
+            w_left_bank:  (half, W)    # m=0..half-1
+            w_center:     (W,)         # m=half
+            w_right_bank: (half, W)    # m=half..W-1
+            half:         int
+        """
+        W = self._choose_window_length(T, polyorder, max_window_length)
+        if W < 3:
+            return (torch.empty(0, device=device, dtype=dtype),
+                    torch.empty(0, device=device, dtype=dtype),
+                    torch.empty(0, device=device, dtype=dtype), 0)
+        half = W // 2
+
+        # 중앙(항상 동일)
+        w_center = self._get_savgol_pos_weights_cached(window_length=W,
+                                                       polyorder=polyorder,
+                                                       deriv_order=1,
+                                                       dt=dt,
+                                                       m=half,
+                                                       device=device,
+                                                       dtype=dtype)  # (W,)
+
+        # 왼쪽/오른쪽 뱅크
+        w_left_list, w_right_list = [], []
+        for m in range(0, half):  # 왼쪽
+            w_left_list.append(
+                self._get_savgol_pos_weights_cached(window_length=W,
+                                                    polyorder=polyorder,
+                                                    deriv_order=1,
+                                                    dt=dt,
+                                                    m=m,
+                                                    device=device,
+                                                    dtype=dtype))
+        for m in range(half + 1, W):  # 기존: range(half, W)
+            w_right_list.append(
+                self._get_savgol_pos_weights_cached(
+                    window_length=W, polyorder=polyorder, deriv_order=1,
+                    dt=dt, m=m, device=device, dtype=dtype
+                )
+            )
+
+        w_left_bank = torch.stack(
+            w_left_list, dim=0) if w_left_list else torch.empty(
+                0, W, device=device, dtype=dtype)  # (half, W)
+        w_right_bank = torch.stack(
+            w_right_list, dim=0) if w_right_list else torch.empty(
+                0, W, device=device, dtype=dtype)  # (half, W)
+        return w_left_bank, w_center, w_right_bank, half
+
+    # [수정 요망] 기존 _sg_derivative_full_rows 를 벡터화로 교체
     def _sg_derivative_full_rows(
         self,
-        seq_bT: torch.Tensor,  # (N_full,T1)
+        seq_bT: torch.Tensor,  # (N_full, T)
         dt: float,
         polyorder: int,
         max_window_length: int,
     ) -> torch.Tensor:
-        """전 타임스텝 유효한 배치를 한 번에 SG-미분(conv1d) 처리."""
+        """전 타임스텝 유효 row를 위치별(one‑sided/중앙) SG로 '완전 벡터화'해 미분."""
         if seq_bT.numel() == 0:
             return seq_bT
         device, dtype = seq_bT.device, seq_bT.dtype
-        N, T1 = seq_bT.shape
-        W = self._choose_window_length(T1, polyorder, max_window_length)
-        if W < 3:
-            return self._finite_difference_derivative(seq_bT, dt)  # (N, T1)
-        kernel = self._get_savgol_diff_kernel_cached(
-            window_length=W,
+        N, T = seq_bT.shape
+
+        w_left_bank, w_center, w_right_bank, half = self._build_poswise_weight_banks_cached(
+            T=T,
             polyorder=polyorder,
-            deriv_order=1,
+            max_window_length=max_window_length,
             dt=dt,
             device=device,
-            dtype=dtype,
-        )  # (1, 1, W)
-        pad = W // 2
-        out = self._conv1d_with_pad(seq_bT.unsqueeze(1),
-                                    kernel,
-                                    pad,
-                                    mode="reflect").squeeze(1)
-        return out  # (N, T1)
+            dtype=dtype)
+        if half == 0:  # W<3 → 유한차분
+            return self._finite_difference_derivative(seq_bT, dt)
 
+        W = w_center.numel()
+        dx = torch.empty_like(seq_bT)
+
+        # 1) 왼쪽: 첫 윈도(공통) × 위치별 가중치(half개) → (N, half)
+        X_left = seq_bT[:, :W]  # (N, W)
+        left = X_left @ w_left_bank.transpose(0, 1)  # (N, half)
+
+        # 2) 가운데: unfold 슬라이딩 창 × 중앙 가중치 → (N, T-2*half)
+        X_mid = seq_bT.unfold(dimension=-1, size=W, step=1)  # (N, T-W+1, W)
+        mid = (X_mid * w_center.view(1, 1, W)).sum(-1)  # (N, T-W+1)
+
+        # 3) 오른쪽: 마지막 윈도(공통) × 위치별 가중치(half개) → (N, half)
+        X_right = seq_bT[:, -W:]  # (N, W)
+        right = X_right @ w_right_bank.transpose(0, 1)  # (N, half)
+
+        # 4) 조립
+        dx[:, :half] = left
+        dx[:, half:T - half] = mid
+        dx[:, T - half:T] = right
+        return dx
+
+    # [수정 요망] 기존 _sg_derivative_partial_rows 개선
     def _sg_derivative_partial_rows(
         self,
         seq_bT: torch.Tensor,  # (N_partial, T)
-        valid_bT: torch.Tensor,  # (N_partial, T)  True=유효
+        valid_bT: torch.Tensor,  # (N_partial, T) True=유효
         dt: float,
         polyorder: int,
         max_window_length: int,
     ) -> torch.Tensor:
-        """일부 구간만 유효한 row들을 슬로우패스로 [i0,i1] 구간만 SG-미분."""
+        """일부만 유효한 row들을 '유효길이 L'별로 묶어 배치 벡터화."""
         if seq_bT.numel() == 0:
             return seq_bT
         device, dtype = seq_bT.device, seq_bT.dtype
-        Np, T = seq_bT.shape
         dx = torch.zeros_like(seq_bT)
-        for i in range(Np):
-            v = valid_bT[i]  # (T,)
-            if not bool(v.any()):
+
+        # 내부 구멍 금지(0→1 전이 금지)
+        v = valid_bT.to(torch.int8)
+        d = v[:, 1:] - v[:, :-1]
+        if (d > 0).any():
+            raise ValueError("[_sg_derivative_partial_rows] 내부 구멍(0→1 전이) 발견.")
+
+        eff_len = valid_bT.sum(dim=1)  # (N_partial,)
+        unique_L = torch.unique(eff_len)
+        for L in unique_L.tolist():
+            if L <= 0:
                 continue
-            idx = torch.nonzero(v, as_tuple=False).flatten()
-            i0, i1 = int(idx[0]), int(idx[-1])
-
-            # NEW: 내부 구멍 금지(연속성 보장)
-            # idx가 연속 증가(간격=1)인지 확인
-            if idx.numel() >= 2 and (idx[1:] - idx[:-1]).ne(1).any():
-                raise ValueError(
-                    "[_sg_derivative_partial_rows] 내부 구멍(유효 구간 불연속)이 감지되었습니다. "
-                    f"i0={i0}, i1={i1}, idx_len={int(idx.numel())}")
-
-            seg = seq_bT[i, i0:i1 + 1].unsqueeze(0)  # (1, L)
-            L = seg.shape[-1]
-            W = self._choose_window_length(L, polyorder, max_window_length)
-            if W < 3:
-                dseg = self._finite_difference_derivative(seg, dt)  # (1, L)
-            else:
-                # --- [CHANGED] 캐시된 커널 사용 ---
-                kernel = self._get_savgol_diff_kernel_cached(
-                    window_length=W,
-                    polyorder=polyorder,
-                    deriv_order=1,
-                    dt=dt,
-                    device=device,
-                    dtype=dtype,
-                )  # (1, 1, W)
-                pad = W // 2
-                dseg = self._conv1d_with_pad(seg.unsqueeze(1),
-                                             kernel,
-                                             pad,
-                                             mode="reflect").squeeze(1)
-            dx[i, i0:i1 + 1] = dseg[0]
-        return dx  # (N_partial, T)
+            sel = (eff_len == L)  # (N_partial,)
+            rows = seq_bT[sel][:, :L]  # (M, L)
+            drows = self._sg_derivative_full_rows(  # (M, L)
+                rows,
+                dt=dt,
+                polyorder=polyorder,
+                max_window_length=max_window_length)
+            dx[sel, :L] = drows
+            # 나머지(무효)는 0 유지
+        return dx
 
     def _savgol_derivative_masked_torch(
         self,
