@@ -7,7 +7,8 @@ from typing import Optional, Dict, Tuple
 from flash_attn.bert_padding import unpad_input, pad_input
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
-from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
+from diffusion_planner.utils.normalizer import ObservationNormalizer, \
+    StateNormalizer
 from diffusion_planner.model.module.mixer import MixerBlock
 from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock
 from diffusion_planner.loss import _require_finite
@@ -74,7 +75,8 @@ class Decoder(nn.Module):
     # TODO: 점검하기
     def _maybe_apply_last_pos_condition_training(
         self,
-        near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, (T) * 4)  # 정규화 상태
+        near_cur_future_norm_xT: torch.Tensor,
+        # (B, Pnn, (T) * 4)  # 정규화 상태
         near_current_mask: torch.Tensor,  # (B, Pnn)  True=무효 에이전트
         cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)  # 정규화 목표점
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -276,7 +278,7 @@ class Decoder(nn.Module):
         if "cond_last_pos_norm" in inputs:
             # 길이(pnn_dyn)에 맞춰 잘라서 정합 보장
             cond_last_pos_norm = inputs[
-                "cond_last_pos_norm"]  #[:, :Pnn, :]  # [B, Pnn, 4]
+                "cond_last_pos_norm"]  # [:, :Pnn, :]  # [B, Pnn, 4]
         else:
             # NaN으로 채워서 'isfinite' 검사에 의해 자동 미적용되게 만든다.
             cond_last_pos_norm = near_current_xyyaw.new_full((B, Pnn, 4),
@@ -287,7 +289,7 @@ class Decoder(nn.Module):
 
         # Extract context encoding
         scene_encoding_token = encoder_outputs[
-            'encoding']  #  (B, token_num, hidden_dim)
+            'encoding']  # (B, token_num, hidden_dim)
         scene_encoding_token_mask = encoder_outputs[
             'encoding_mask']  # (B, token_num) bool
         ego_fut_global = encoder_outputs["ego_fut_global"]  # (B, hidden_dim)
@@ -341,7 +343,7 @@ class Decoder(nn.Module):
                 # TODO: near_current_xyyaw 를 detach() 해서 붙이는 게 맞는지 점검
                 score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
                                   dim=2)  # (B,Pnn,1+T,4)
-            return_["score"] = score  #  (B, Pnn, (1 + T) , 4)
+            return_["score"] = score  # (B, Pnn, (1 + T) , 4)
             if self.config.use_feasible:
                 integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
                 integrated_trajectory = torch.cat(
@@ -728,10 +730,12 @@ class DiT(nn.Module):
         cross_c: torch.Tensor,  # (B, token_num, D)
         ego_fut_global: torch.Tensor,  # (B, D)
         near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-        near_cur_future_valid: torch.Tensor,  # [B, pnn, 1 + future_len] bool
+        near_cur_future_valid: torch.Tensor,
+        # [B, pnn, 1 + future_len] bool
         cross_mask: torch.Tensor,  # (B, token_num) True=pad
         route_known_mask: torch.Tensor,  # (B, Pnn) True=known
-        near_class_one_hot: torch.Tensor,  # (B, Pnn, 3) # 0: 차량, 1: 보행자, 2: 자전거
+        near_class_one_hot: torch.Tensor,
+        # (B, Pnn, 3) # 0: 차량, 1: 보행자, 2: 자전거
         near_current_xyyaw: torch.Tensor  # ★ 추가: (B, Pnn, 4)
     ) -> torch.Tensor:
         """
@@ -763,7 +767,8 @@ class DiT(nn.Module):
         # ★ 추가: state_token_in 생성 (현재 프레임만 사용)
         B, Pnn, _ = near_future_norm_xT.shape
         # state_token_in: [B,Pnn,D]
-        state_token_in = self.pram_v2_state_token_encoder(  # PRAMV2StateTokenEncoder
+        state_token_in = self.pram_v2_state_token_encoder(
+            # PRAMV2StateTokenEncoder
             near_cur_norm=near_current_xyyaw.to(x.dtype),  # [B,Pnn,4]
             near_current_mask=near_current_mask  # [B,Pnn]
         )
@@ -785,7 +790,7 @@ class DiT(nn.Module):
         )
         """
         7) 확산 시간 t의 글로벌 모듈레이션
-        
+
         time_out : TimeModulationOutputs 
             delta_scale_time/shift_time/logit_gate_time (모두 [B, 1, H])
         """
@@ -912,7 +917,7 @@ class DiT(nn.Module):
         (unnorm_integrated_trajectory, unnorm_control_constraint_diff
         ) = self.feasible_projector.filter_and_integrate(
             unnorm_near_current_state,  # (B, Pnn, 4)
-            near_current_valid,  # (B, Pnn)
+            near_cur_future_valid,  # (B, Pnn, 1+T) bool  ← 시점별 마스크
             unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 3)
             near_class_one_hot,
             # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
