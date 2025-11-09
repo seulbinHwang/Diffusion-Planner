@@ -374,8 +374,7 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Linear(8, config.hidden_dim)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
 
-    def _zero_with_touch(self,
-                         ref: torch.Tensor,
+    def _zero_with_touch(self, ref: torch.Tensor,
                          params: Iterable[torch.nn.Parameter]) -> torch.Tensor:
         """ref와 같은 shape의 0 텐서를 반환하되, 주어진 파라미터들을 0계수로 터치해
         autograd 그래프를 연결(grad는 0)."""

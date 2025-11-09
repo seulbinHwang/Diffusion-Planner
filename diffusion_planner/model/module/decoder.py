@@ -857,10 +857,11 @@ class DiT(nn.Module):
                                                      4)  # (B,Pnn,1+T,4)
                 else:
                     # x: (B, Pnn, T*4) → 현재 프레임을 앞에 붙여서 1+T로 맞춤
-                    diffusion_trajectory = torch.cat(
-                        [near_current_xyyaw.unsqueeze(2),
-                         x.reshape(B, Pnn, -1, 4)],
-                        dim=2)  # (B,Pnn,1+T,4)
+                    diffusion_trajectory = torch.cat([
+                        near_current_xyyaw.unsqueeze(2),
+                        x.reshape(B, Pnn, -1, 4)
+                    ],
+                                                     dim=2)  # (B,Pnn,1+T,4)
                 self._feasible_projection(diffusion_trajectory,
                                           near_class_one_hot,
                                           near_cur_future_valid)
@@ -904,9 +905,7 @@ class DiT(nn.Module):
             cur_future_seg_body_control,  # (B, Pnn, T, 3)
             self.final_hidden_tokens,  # (B, Pnn, H)
         )
-        temp_dict = {
-            "cur_future_seg_body_control": cur_future_seg_body_control
-        }
+        temp_dict = {"cur_future_seg_body_control": cur_future_seg_body_control}
         temp_dict = self.config.observation_normalizer.inverse(temp_dict)
         unnorm_cur_future_seg_body_control = temp_dict[
             "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
