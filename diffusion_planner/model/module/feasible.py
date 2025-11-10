@@ -302,9 +302,9 @@ class FeasibleProjector(nn.Module):
         # (B,Pnn,H)->(B,Pnn,Dc)
         self.trunk_compressor = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 128),
+            nn.Linear(hidden_dim, 192),
             nn.GELU(),
-            nn.Linear(128, self._Dc),
+            nn.Linear(192, self._Dc),
         )
 
         # ------------------------------
@@ -748,6 +748,8 @@ class FeasibleProjector(nn.Module):
             mask → prev/fut 분리(+unit-circle) → feature concat → Stem → TCN →
             Head+Gate → U_base와 잔차 결합
         """
+        self._assert_prefix_valid_mask(near_cur_future_valid, context="forward")
+
         # 1) 마스크
         """
             - seg_mask: (B, Pnn, T) float(0/1)
@@ -765,16 +767,16 @@ class FeasibleProjector(nn.Module):
         # 3) 피처 인코딩
         # Z_in: (B, Pnn, T, 192)
         Z_in = self._features_from_inputs(
-            x_prev=x_prev,
-            x_fut=x_fut,
-            u_base=cur_future_seg_body_control,
-            dit_final_hidden_tokens=dit_final_hidden_tokens,
-            near_cur_future_valid=near_cur_future_valid,
+            x_prev=x_prev, # (B, Pnn, T, 4)
+            x_fut=x_fut, # (B, Pnn, T, 4)
+            u_base=cur_future_seg_body_control, # (B, Pnn, T, 3)
+            dit_final_hidden_tokens=dit_final_hidden_tokens, # (B, Pnn, H)
+            near_cur_future_valid=near_cur_future_valid, # (B, Pnn, 1+T)
         )
 
         # 4) Stem → 5) TCN
         # Z_s: (B, Pnn, T, 192)
-        Z_s = self._apply_stem(Z_in,
+        Z_s = self._prepare_tcn_input(Z_in,
                                seg_mask_1)  # (B, Pnn, T, 192) # (B, Pnn, T, 1)
         # Z_tcn: (B, Pnn, T, 192)
         Z_tcn = self._run_tcn(
@@ -783,7 +785,7 @@ class FeasibleProjector(nn.Module):
 
         # 6) ΔU 예측 → 7) 결합
         # delta_u: (B, Pnn, T, 3)
-        delta_u = self._predict_delta_u(Z_tcn, Z_s, seg_mask_1)
+        delta_u = self._predict_delta_u(Z_tcn, seg_mask_1)
         # u_ref: (B, Pnn, T, 3)
         u_ref = cur_future_seg_body_control + delta_u
         return u_ref
@@ -925,9 +927,10 @@ class FeasibleProjector(nn.Module):
         feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,T,48)
         feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,T,48)
         feat_u = self.control_adapter(u_base_in)  # (B,Pnn,T,32)
-
+        # dit_final_hidden_tokens: (B,Pnn,H)
+        # trunk: (B,Pnn,64)
         trunk = self.trunk_compressor(
-            dit_final_hidden_tokens.detach())  # (B,Pnn,64)
+            dit_final_hidden_tokens.detach())
         trunk_rep = trunk.unsqueeze(2).expand(-1, -1, x_prev.size(2),
                                               -1)  # (B,Pnn,T,64)
 
@@ -938,7 +941,7 @@ class FeasibleProjector(nn.Module):
     # =========================================================
     # [C] Stem / TCN 백본
     # =========================================================
-    def _apply_stem(
+    def _prepare_tcn_input(
         self,
         Z_in: torch.Tensor,  # (B, Pnn, T, 192)
         seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
@@ -981,6 +984,7 @@ class FeasibleProjector(nn.Module):
                                             block_idx)  # mask-aware
             Y = F.gelu(Y)
             Y = self.tcn_linear[block_idx](Y)  # pointwise 1×1
+            Y = Y * seg_mask_1  # [추가] 블록 내부 중간단계에서도 0 고정
             Z = (Z + Y) * seg_mask_1  # Residual + mask
         return Z  # (B,Pnn,T,192)
 
@@ -990,7 +994,6 @@ class FeasibleProjector(nn.Module):
     def _predict_delta_u(
         self,
         Z_tcn: torch.Tensor,  # (B, Pnn, T, 192)
-        Z_s: torch.Tensor,  # (B, Pnn, T, 192)  (게이트 입력)
         seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
     ) -> torch.Tensor:
         """잔차 제어 ΔU 산출: Head(초안) + softplus 게이트 스케일.
@@ -1006,7 +1009,7 @@ class FeasibleProjector(nn.Module):
             torch.Tensor: (B, Pnn, T, 3)  (무효 시점은 0)
         """
         delta_u_raw = self.head(Z_tcn)  # (B,Pnn,T,3)
-        gate_scale = F.softplus(self.gate_mlp(Z_s))  # (B,Pnn,T,3)
+        gate_scale = F.softplus(self.gate_mlp(Z_tcn.detach()))  # (B,Pnn,T,3)
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
         delta_u = delta_u * seg_mask_1  # 무효 시점 보정 0
         return delta_u
