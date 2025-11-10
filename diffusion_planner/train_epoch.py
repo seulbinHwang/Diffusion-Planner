@@ -9,6 +9,8 @@ from diffusion_planner.loss import diffusion_loss_func
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.model.module.feasible import FeasibleProjector
+from diffusion_planner.loss import AMP_DTYPE  # = torch.bfloat16
+
 # =====================================================================
 
 
@@ -100,7 +102,6 @@ def train_epoch(data_loader,
                     "Non-finite values detected in near_future_gt_4_dim")
             norm_inputs = args.observation_normalizer(inputs)
 
-            # call the model
             optimizer.zero_grad(set_to_none=True)
             loss = {}
             """
@@ -112,6 +113,7 @@ def train_epoch(data_loader,
                 ddp.get_model(model, args.ddp).sde.marginal_prob,
                 (near_future_gt_4_dim, near_future_mask), args.state_normalizer,
                 loss, args.diffusion_model_type, args.observation_normalizer)
+            state_device = near_future_gt_4_dim.device
 
             # ----- (NEW) 진행도 기반 가중 합성 --------------------------------
             progress = min(
@@ -120,22 +122,30 @@ def train_epoch(data_loader,
             w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
                 progress)
             # 개별 손실이 존재하지 않는 경우(예: score 모드) 대비 안전 get
-            l_dir = loss.get(
-                "neighbor_prediction_loss",
-                torch.tensor(0.0, device=inputs["ego_agent_past"].device))
-            l_int = loss.get(
-                "integration_loss",
-                torch.tensor(0.0, device=inputs["ego_agent_past"].device))
-            l_con = loss.get(
-                "constraint_loss",
-                torch.tensor(0.0, device=inputs["ego_agent_past"].device))
-            loss["loss"] = w_dir * l_dir + w_int * l_int + w_const * l_con
+            l_dir = loss.get("neighbor_prediction_loss",
+                             torch.tensor(0.0, device=state_device))
+            l_int = loss.get("integration_loss",
+                             torch.tensor(0.0, device=state_device))
+            l_con = loss.get("constraint_loss",
+                             torch.tensor(0.0, device=state_device))
+            total = w_dir * l_dir + w_int * l_int + w_const * l_con
+            # if not torch.isfinite(total):
+            #     # feasible만 스킵하고 DiT는 진행
+            #     total = loss[
+            #         "neighbor_prediction_loss"]  # 또는 integration/constraint 제외
+            #     print("integration_loss:", l_int, "constraint_loss:", l_con)
+            loss["loss"] = total
 
             total_loss = loss["loss"].item()  # scalar
 
             # loss backward
             loss["loss"].backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 10)
+            # nn.utils.clip_grad_norm_(model.parameters(), 10)
+            torch.nn.utils.clip_grad_norm_(
+                ddp.get_model(model,
+                              args.ddp).decoder.decoder.dit.feasible_projector.parameters(),
+                max_norm=1.0  # 1~5 시도
+            )
             scheduler.step()
             optimizer.step()
             # === WD warmdown: lr 비례로 그룹별 WD 갱신 ===
@@ -147,7 +157,7 @@ def train_epoch(data_loader,
                 if wd_max > 0.0 and lr_max > 0.0:
                     pg["weight_decay"] = wd_max * (pg["lr"] / lr_max)
             # ===========================================
-
+            torch.cuda.synchronize()
             if ema is not None:
                 """
                 수식대로 EMA 가중치를 한 번 갱신
@@ -158,7 +168,12 @@ def train_epoch(data_loader,
                 torch.cuda.synchronize()
 
             data_epoch.set_postfix(loss="{:.4f}".format(total_loss))
-            epoch_loss.append(loss)
+            epoch_loss.append({
+                k: (v.detach().item()
+                    if torch.is_tensor(v) and v.numel() == 1 else
+                    (v.detach().float().mean().item()
+                     if torch.is_tensor(v) else v)) for k, v in loss.items()
+            })
 
             # 전역 스텝 누적(에폭 간 유지)
             args._global_update_step += 1

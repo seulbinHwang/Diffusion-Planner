@@ -598,7 +598,10 @@ class DiT(nn.Module):
                               "x_start"], f"Unknown model type: {model_type}"
         self.final_hidden_tokens = None
         if self.config.use_feasible:
-            self.feasible_projector = FeasibleProjector(hidden_dim)
+            self.feasible_projector = FeasibleProjector(
+                hidden_dim, self.config.use_dl_correction)
+            # [요망 추가] 이 모듈은 항상 FP32로 고정
+            self.feasible_projector = self.feasible_projector.float()
 
         self._model_type = model_type
         self.preproj = Mlp(in_features=output_dim,
@@ -664,60 +667,68 @@ class DiT(nn.Module):
 
     def preproj_varlen(
             self,
-            near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, F=(1+T)*4)
-            near_current_mask: torch.Tensor,  # (B, Pnn) True=pad(무효 에이전트)
+            near_cur_future_norm_xT: torch.Tensor,  # [B, Pnn, F=(1+T)*4 or T*4]
+            near_current_mask: torch.Tensor,  # [B, Pnn], True=무효(패딩)
     ) -> torch.Tensor:
-        """pre‑proj(Mlp)를 **유효 에이전트 토큰**에만 적용하는 varlen 전처리.
-
-        기존 pre‑proj는 (B,Pnn,F) 전체에 적용되어 K≪Pnn일 때 불필요한 연산이 발생합니다.
-        이 함수는 마스크 기반 **unpad→pre‑proj→pad‑back**으로 pre‑proj도 K에 비례로 줄입니다.
-
-        Args:
-            near_cur_future_norm_xT: 정규화된 (현재+미래) 입력.
-                **shape:** (B, Pnn, F)  (F=(1+T)*4, 예: 81*4=324)
-            near_current_mask: 키 패딩 마스크(True=pad=무효 에이전트).
-                **shape:** (B, Pnn)
-
-        Returns:
-            x: pre‑proj 결과.
-                **shape:** (B, Pnn, D)  (D=hidden_dim, 예: 192)
-                무효 위치는 0으로 채워져 있습니다.
         """
-        B, Pnn, F = near_cur_future_norm_xT.shape
-        # 유효 토큰만 추출
-        # unpad_input은 'True=유효' 마스크를 기대 → 반전 필요
-        attention_mask = (~near_current_mask).to(
-            torch.bool)  # (B, Pnn), True=유효
+        Var-len pre-proj: unpad -> MLP -> pad.
+        - MLP는 FP32로 강제 (수치 안정)
+        - pad 이후 무효 토큰 자리 0 클리어
+        - 최후 방어: nan/inf를 안전값으로 치환
+        Returns:
+            x: [B, Pnn, D]  (D=hidden_dim)
+        """
+        B, Pnn, _ = near_cur_future_norm_xT.shape
+        orig_dtype = near_cur_future_norm_xT.dtype
 
+        # 1) unpad (True=유효)
+        attention_mask = (~near_current_mask).to(torch.bool)  # [B, Pnn]
         res = unpad_input(near_cur_future_norm_xT, attention_mask)
-        # x_unpad: (T, F), indices: (T,), cu: (B+1,), max_seqlen: int
         if len(res) == 4:
             x_unpad, indices, cu_seqlens, max_seqlen = res
-            # seqlens가 필요하면 cu_seqlens로부터 복원 가능
-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-        elif len(res) == 5:
-            x_unpad, indices, cu_seqlens, max_seqlen, seqlens = res
+        else:
+            x_unpad, indices, cu_seqlens, max_seqlen, _ = res
 
-        # 모든 토큰이 pad인 극단 케이스 방어
+        # 2) 유효 토큰이 0개인 배치: 전부 0으로 반환 (그래프 연결용 touch는 유지 가능)
         if x_unpad.numel() == 0:
-            D_out = self.preproj.fc2.out_features  # timm Mlp의 최종 out_features
-            zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
-            zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
-            # timm Mlp(fc1/fc2)의 파라미터를 0-스케일로 터치(그래프 포함)
-            touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc1.bias.view(-1)[:1].sum()
-                      if self.preproj.fc1.bias is not None else 0) +
-                     self.preproj.fc2.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc2.bias.view(-1)[:1].sum()
-                      if self.preproj.fc2.bias is not None else 0)) * 0.0
-            return zeros + touch
+            D_out = self.preproj.fc2.out_features
+            out = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
+            # (선택) 그래프 연결 touch:
+            _ = (self.preproj.fc1.weight.flatten()[:1].sum() +
+                 (self.preproj.fc1.bias[:1].sum()
+                  if self.preproj.fc1.bias is not None else 0) +
+                 self.preproj.fc2.weight.flatten()[:1].sum() +
+                 (self.preproj.fc2.bias[:1].sum()
+                  if self.preproj.fc2.bias is not None else 0)) * 0.0
+            return out  # + _  # 필요하면 그래프 연결
 
-        # 유효 토큰만 pre‑proj 수행  (T, F) -> (T, D)
-        x_unpad = self.preproj(x_unpad)  # (T, D)
+        # 3) MLP는 FP32에서 계산 (AMP 비활성)
+        with torch.autocast(device_type=near_cur_future_norm_xT.device.type,
+                            enabled=False):
+            x_unpad_fp32 = x_unpad.float()  # [T_valid, F]
+            # (디버그) 가중치 NaN 방어: 학습 중 한번이라도 NaN 나면 바로 알림
+            if not torch.isfinite(self.preproj.fc1.weight).all() or \
+                    not torch.isfinite(self.preproj.fc2.weight).all():
+                raise RuntimeError(
+                    "NaN in preproj weights (fc1/fc2). Check upstream grads.")
+            x_unpad_fp32 = self.preproj(x_unpad_fp32)  # [T_valid, D]
+            # 최후 방어
+            x_unpad_fp32 = torch.nan_to_num(x_unpad_fp32,
+                                            nan=0.0,
+                                            posinf=1e6,
+                                            neginf=-1e6)
 
-        # 배치 모양으로 복원 (pad 위치는 0)
-        x = pad_input(x_unpad, indices, B, Pnn)  # (B, Pnn, D)
-        return x
+        # 4) pad back
+        x = pad_input(x_unpad_fp32, indices, B, Pnn)  # [B, Pnn, D] (FP32)
+        # 5) 무효 토큰 자리 0으로 클리어 (pad가 안 채운 쓰레기값 제거)
+        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
+        # 6) (선택) 마지막 검증 + dtype 복원
+        #    -> 이 assert는 preproj_varlen 내부로 옮겨두면 이후 단계가 깔끔합니다.
+        if not torch.isfinite(x).all():
+            # 여기서도 걸리면 pad/unpad 흐름에서 메모리 오염된 것. 최후 방어로 치환.
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        return x.to(dtype=orig_dtype)
 
     @property
     def model_type(self):
@@ -748,13 +759,17 @@ class DiT(nn.Module):
         near_agents_route_lane_emb, # (B, Pnn, D)
         cross_mask: (B, token_num)
         """
+        _require_finite("near_future_norm_xT(input to DiT)",
+                        near_future_norm_xT)
         near_current_valid = near_cur_future_valid[:, :,
                                                    0]  # [B, Pnn] True=유효 에이전트
         near_current_mask = ~near_current_valid  # [B, Pnn] True=무효 에이전트
         B, Pnn, _ = near_future_norm_xT.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
         # x = self.preproj(near_future_norm_xT)
+
         x = self.preproj_varlen(near_future_norm_xT, near_current_mask)
+        _require_finite("dit_preproj_output", x)
 
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
 
@@ -770,7 +785,7 @@ class DiT(nn.Module):
         state_token_in = self.pram_v2_state_token_encoder(
             # PRAMV2StateTokenEncoder
             near_cur_norm=near_current_xyyaw.to(x.dtype),  # [B,Pnn,4]
-            near_current_mask=near_current_mask  # [B,Pnn]
+            near_current_mask=near_current_mask  # xq[B,Pnn]
         )
         # [V2 - START]  ✅ Composer/Time 1회 계산 → 블록별 합성 → v2 전용 포워드
         """
@@ -824,6 +839,8 @@ class DiT(nn.Module):
                 near_current_mask=near_current_mask,  # [B, Pnn]
                 cross_mask=cross_mask  # [B, N_c]
             )
+            if not torch.isfinite(x).all():
+                raise RuntimeError(f"NaN@block{block_index}")
             x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
         self.final_hidden_tokens = x.detach().clone()  # (B, Pnn, H)
         # [V2 - END]
@@ -841,6 +858,7 @@ class DiT(nn.Module):
                 self.pram_v2_final_shift_scalar,  # k_final_sh
             ),
         )  # -> [B, Pnn, (T)*4]
+        _require_finite("dit_head_before_feasible", x)
 
         # 마스크(무효 토큰) 0 클램프 유지
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
@@ -855,79 +873,106 @@ class DiT(nn.Module):
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
-                # DiT.forward (model_type == "x_start" 분기 내부)
+                # (A) 주 헤드 x와 그래프/저장소 분리 + FP32
+                x_for_feasible: torch.Tensor = x.detach()
+                near_cur_fp32: torch.Tensor = near_current_xyyaw.detach()
+
                 if getattr(self.config, "use_current_input", False):
-                    # x: (B, Pnn, (1+T)*4) → 이미 현재 프레임 포함
-                    diffusion_trajectory = x.reshape(B, Pnn, -1,
-                                                     4)  # (B,Pnn,1+T,4)
+                    diffusion_trajectory = x_for_feasible.reshape(
+                        B, Pnn, -1, 4).contiguous()
                 else:
-                    # x: (B, Pnn, T*4) → 현재 프레임을 앞에 붙여서 1+T로 맞춤
                     diffusion_trajectory = torch.cat([
-                        near_current_xyyaw.unsqueeze(2),
-                        x.reshape(B, Pnn, -1, 4)
+                        near_cur_fp32.unsqueeze(2),
+                        x_for_feasible.reshape(B, Pnn, -1, 4)
                     ],
-                                                     dim=2)  # (B,Pnn,1+T,4)
-                self._feasible_projection(diffusion_trajectory,
-                                          near_class_one_hot,
-                                          near_cur_future_valid)
+                                                     dim=2).contiguous()
+
+                # (B) feasible 경로는 오롯이 FP32에서만 실행 (수치안정 ↑)
+                self._feasible_projection(
+                    diffusion_trajectory=diffusion_trajectory,
+                    near_class_one_hot=near_class_one_hot,  # 자동 FP32 브로드캐스트
+                    near_cur_future_valid=near_cur_future_valid,  # bool 그대로
+                )
+                _require_finite("dit_head_after_feasible", x)
             return x  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
 
     def _feasible_projection(
-        self,
-        diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+T, 4)
-        near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
-        near_cur_future_valid: torch.Tensor  # (B, Pnn, 1+T) bool
+            self,
+            diffusion_trajectory: torch.Tensor,  # (B,Pnn,1+T,4)  bf16일 수 있음
+            near_class_one_hot: torch.Tensor,  # (B,Pnn,3)
+            near_cur_future_valid: torch.Tensor  # (B,Pnn,1+T) bool
     ):
-        # diffusion_trajectory: (B, Pnn, 1+T, 4)
-        # (B, Pnn, 1+T, 4)
-        near_current_valid = near_cur_future_valid[:, :, 0]  # (B, Pnn)
+        out_dtype = diffusion_trajectory.dtype  # 나중에 복원할 원래 dtype
+
         unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
             diffusion_trajectory)
-        unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
-                                                                0, :]  # (B, Pnn, 4)
 
-        unnorm_cur_future_control = self.feasible_projector.savgol_filter_for_control(
-            unnorm_diffusion_trajectory,  # (B, Pnn, 1+T, 4),
-            near_cur_future_valid,  # (B, Pnn, 1+T) bool
-        )  # (B, Pnn, 1+T, 3)
-        # cur_future_seg_body_control: (B, Pnn, T, 3) #  v_x^b, v_y^b, ω # 각 시점 몸체 좌표계 기준 속도 + 세계 좌표계 기준 요레이트
-        unnorm_cur_future_seg_body_control = self.feasible_projector.compute_midpoint_controls(
-            unnorm_diffusion_trajectory, unnorm_cur_future_control,
-            near_cur_future_valid)
+        # [요망 추가] 이 블록은 AMP 끄고, 모든 부동 텐서를 FP32로 통일
+        with torch.autocast(device_type=unnorm_diffusion_trajectory.device.type,
+                            enabled=False):
+            fp32 = torch.float32
 
-        temp_dict = {
-            "cur_future_seg_body_control": unnorm_cur_future_seg_body_control
-        }
-        temp_dict = self.config.observation_normalizer(temp_dict)
-        cur_future_seg_body_control = temp_dict[
-            "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
-        # cur_future_seg_body_control: (B, Pnn, T, 3)
-        cur_future_seg_body_control = self.feasible_projector(
-            near_cur_future_valid,  # (B, Pnn, 1+T)
-            diffusion_trajectory,  # (B, Pnn, 1+T, 4)
-            cur_future_seg_body_control,  # (B, Pnn, T, 3)
-            self.final_hidden_tokens,  # (B, Pnn, H)
-        )
-        temp_dict = {"cur_future_seg_body_control": cur_future_seg_body_control}
-        temp_dict = self.config.observation_normalizer.inverse(temp_dict)
-        unnorm_cur_future_seg_body_control = temp_dict[
-            "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
-        (unnorm_integrated_trajectory, unnorm_control_constraint_diff
-        ) = self.feasible_projector.filter_and_integrate(
-            unnorm_near_current_state,  # (B, Pnn, 4)
-            near_cur_future_valid,  # (B, Pnn, 1+T) bool  ← 시점별 마스크
-            unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 3)
-            near_class_one_hot,
-            # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
-        )  # (B, Pnn, T, 4)
+            # --- 입력 FP32로 통일 ---
+            unnorm_diffusion_trajectory = unnorm_diffusion_trajectory.to(fp32)
+            near_class_one_hot_fp32 = near_class_one_hot.to(fp32)
+            # bool 마스크는 그대로 사용해도 OK
+
+            # 1) 세계속도/요레이트 추정 (torch-only, FP32)
+            unnorm_cur_future_control = self.feasible_projector.savgol_filter_for_control(
+                unnorm_diffusion_trajectory,
+                near_cur_future_valid)  # (B,Pnn,1+T,3) FP32
+
+            # 2) 중점 제어(세계→바디) (FP32)
+            unnorm_cur_future_seg_body_control = self.feasible_projector.compute_midpoint_controls(
+                unnorm_diffusion_trajectory, unnorm_cur_future_control,
+                near_cur_future_valid)  # (B,Pnn,T,3) FP32
+
+            # 3) 관측 정규화 → FP32 보장
+            temp = {
+                "cur_future_seg_body_control":
+                    unnorm_cur_future_seg_body_control
+            }
+            temp = self.config.observation_normalizer(temp)
+            cur_future_seg_body_control = temp[
+                "cur_future_seg_body_control"].to(fp32)
+
+            # 4) DL 보정 경로 (있으면) 모두 FP32 인자로 호출
+            if self.config.use_dl_correction:
+                cur_future_seg_body_control = self.feasible_projector(
+                    near_cur_future_valid,
+                    diffusion_trajectory.to(fp32),  # ← FP32
+                    cur_future_seg_body_control,  # ← FP32
+                    self.final_hidden_tokens.to(fp32),  # ← FP32
+                )  # (B,Pnn,T,3) FP32
+
+            # 5) 역정규화 → FP32 유지
+            temp = {"cur_future_seg_body_control": cur_future_seg_body_control}
+            temp = self.config.observation_normalizer.inverse(temp)
+            unnorm_cur_future_seg_body_control = temp[
+                "cur_future_seg_body_control"].to(fp32)
+
+            # 6) 필터+적분 (FP32)
+            unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
+                                                                    0, :].to(
+                                                                        fp32)
+            (unnorm_integrated_trajectory, unnorm_control_constraint_diff
+            ) = self.feasible_projector.filter_and_integrate(
+                unnorm_near_current_state,
+                near_cur_future_valid,
+                unnorm_cur_future_seg_body_control,
+                near_class_one_hot_fp32,
+            )  # (B,Pnn,T,4), (B,Pnn,T,3) FP32
+
+        # 7) 출력은 모델 나머지 경로와 dtype 정합을 위해 원래 dtype으로 복원
         integrated_trajectory = self.config.state_normalizer(
-            unnorm_integrated_trajectory)  # (B, Pnn, T, 4)
-        temp_dict = {"control_constraint_diff": unnorm_control_constraint_diff}
-        temp_dict = self.config.observation_normalizer(temp_dict)
-        control_constraint_diff = temp_dict[
-            "control_constraint_diff"]  # (B, Pnn, T, 3)
+            unnorm_integrated_trajectory).to(out_dtype)
+        temp = {"control_constraint_diff": unnorm_control_constraint_diff}
+        temp = self.config.observation_normalizer(temp)
+        control_constraint_diff = temp["control_constraint_diff"].to(out_dtype)
+
         self.dit_returns = DiTReturns(
             integrated_trajectory=integrated_trajectory,
-            control_constraint_diff=control_constraint_diff)
+            control_constraint_diff=control_constraint_diff,
+        )

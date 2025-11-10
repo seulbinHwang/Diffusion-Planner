@@ -1,7 +1,7 @@
 import os
 from typing import Optional, Tuple
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
@@ -301,6 +301,7 @@ def get_args():
     parser.add_argument('--use_huber_loss', default=True, type=boolean)
     parser.add_argument('--use_vel_input', default=True, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
+    parser.add_argument('--use_dl_correction', default=True, type=boolean)
 
     # parser.add_argument(
     #     '--pin-mem',
@@ -545,6 +546,16 @@ def discover_extra_no_weight_decay_names(
     # DDP/랩핑 전개 여부와 무관하게 named_parameters() 기준의 풀네임과 일치시켜야 합니다.
     return sorted(extra)
 
+def _no_decay_for_spectral_norm(model: nn.Module) -> list[str]:
+    nwd = []
+    for name, mod in model.named_modules():
+        # torch parametrization 경로 이름 맞춰서 추가
+        if hasattr(mod, 'parametrizations') and 'weight' in getattr(mod, 'parametrizations'):
+            nwd.append(f"{name}.parametrizations.weight")     # 최신 PyTorch
+            # 하위 호환(버전에 따라 존재):
+            nwd.append(f"{name}.weight_orig")
+            nwd.append(f"{name}.weight_u")
+    return nwd
 
 def build_adamw_with_param_groups(
     model: nn.Module,
@@ -560,6 +571,7 @@ def build_adamw_with_param_groups(
     # 토큰/포지션 추가 no-decay 수집
     extra_nwd = discover_extra_no_weight_decay_names(
         model, include_seed_params=include_seed_params)
+    extra_nwd.extend(_no_decay_for_spectral_norm(model))
 
     # 그룹 생성 (timm 헬퍼)
     param_groups = param_groups_weight_decay(
@@ -575,7 +587,7 @@ def build_adamw_with_param_groups(
 
     # 최종 옵티마이저 (전역 WD는 0.0로 중복 방지)
     try:
-        optim = torch.optim.AdamW(param_groups, fused=True, weight_decay=0.0)
+        optim = torch.optim.AdamW(param_groups, fused=False, weight_decay=0.0)
     except (TypeError, RuntimeError):
         optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
 
@@ -801,7 +813,7 @@ def model_training(args):
         model_ema = ModelEma(
             diffusion_planner,
             decay=0.999,
-            device=args.device,
+            device="cpu",
         )
     # --- build param groups with correct no-decay (timm helper) ---
     base_model = ddp.get_model(diffusion_planner, args.ddp)

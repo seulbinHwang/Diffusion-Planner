@@ -319,8 +319,8 @@ def diffusion_loss_func(
     near_future_norm_gt = near_cur_future_norm_gt[:, :, 1:, :]  # [B, Pnn, T, 4]
     """
     <forward pass>
-    
-    
+
+
     # mean.shape: torch.Size([B, Pnn, T, 4])
     # std.shape: torch.Size([B, 1, 1, 1])
     """
@@ -344,7 +344,7 @@ def diffusion_loss_func(
         "diffusion_time": batch_diffusion_time,  # [B,]
         "cond_last_pos_norm": cond_last_pos_norm,  # [B, Pnn, 4]
     }
-    with torch.autocast("cuda", dtype=AMP_DTYPE):
+    with torch.autocast("cuda", dtype=AMP_DTYPE):  # torch.bfloat16
         _, decoder_output = model(merged_inputs)
 
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
@@ -405,8 +405,11 @@ def diffusion_loss_func(
         ###### L_integration loss 추가 ######
         if "integrated_trajectory" in decoder_output:
 
-            integrated_trajectory = decoder_output[
-                "integrated_trajectory"][:, :, 1:, :]  # (B, Pnn, T, 4)
+            # [요망 추가]
+            integrated_trajectory = _require_finite(
+                "decoder_output['integrated_trajectory']",
+                decoder_output["integrated_trajectory"]
+            )[:, :, 1:, :]  # (B, Pnn, T, 4)
             # near_future_gt_4_dim: [B, Pnn, T, 4]
             # integration_loss: (B, Pnn, T)
             integration_loss = torch.sum(
@@ -432,10 +435,12 @@ def diffusion_loss_func(
             control_constraint_diff = _require_finite(
                 "decoder_output['control_constraint_diff']",
                 decoder_output["control_constraint_diff"])  # (B, P, T, 3)
-            constraint_loss_val = _masked_weighted_mse_from_diff(
-                control_constraint_diff,  # (B,P,T,3)
-                valid_low,  # <-- 기존 near_future_valid 대신
-                w_t)
+            eps_ch = 1e-3
+            robust = torch.sqrt(
+                (control_constraint_diff**2).sum(dim=-1) + eps_ch**2)  # (B,P,T)
+            weighted = robust * w_t  # 시간 가중
+            denom_c = (valid_low.float() * w_t).sum().clamp_min(1e-6)
+            constraint_loss_val = (weighted * valid_low.float()).sum() / denom_c
         else:
             # 안전 fallback: 해당 항 미제공 시 0 손실
             control_constraint_diff = None
@@ -444,6 +449,8 @@ def diffusion_loss_func(
                 device=integration_loss_val.device,
                 dtype=integration_loss_val.dtype)
         loss["constraint_loss"] = constraint_loss_val
+        print("integration_loss_val: ", integration_loss_val,
+              "constraint_loss_val:", constraint_loss_val, "\n\n\n\n\n")
 
     # denom = valid.sum().clamp(min=1) # denom: scalar
     # valid_dpm_loss = dpm_loss * valid # (B, Pnn, T)
