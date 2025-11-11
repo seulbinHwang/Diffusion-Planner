@@ -574,8 +574,8 @@ class FeasibleProjector(nn.Module):
         # Constants
         p_sat = 0.60
         w_dir = 1.00
-        w_int_min, w_int_max = 0.05, 2.00
-        w_const = 0.02
+        w_int_min, w_int_max = 0.0005, 2.00
+        w_const = 0.0002
         # piecewise-linear for integration weight
         if p <= p_sat:
             w_int = w_int_min + (w_int_max - w_int_min) * (p / p_sat)
