@@ -471,17 +471,17 @@ class Decoder(nn.Module):
                     x0.reshape(B, Pnn, -1, 4)
                 ],
                                dim=2)  # (B,Pnn,1+T,4)
-            x0 = self._state_normalizer.inverse(x0)  # (B,Pnn,1+T,4)
+            unnorm_x0 = self._state_normalizer.inverse(x0)  # (B,Pnn,1+T,4)
             if self.config.use_feasible:
                 integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
                 integrated_trajectory = torch.cat(
                     [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
                     dim=2)  # (B,Pnn,1+T,4)
-                integrated_trajectory = self._state_normalizer.inverse(
+                unnorm_integrated_trajectory = self._state_normalizer.inverse(
                     integrated_trajectory)  # (B,Pnn,1+T,4)
                 return_[
-                    "integrated_trajectory"] = integrated_trajectory  # (B, Pnn, (1 + T) , 4)
-            return_["score"] = x0  # (B, Pnn, (1 + T) , 4)
+                    "integrated_trajectory"] = unnorm_integrated_trajectory  # (B, Pnn, (1 + T) , 4)
+            return_["score"] = unnorm_x0  # (B, Pnn, (1 + T) , 4)
             return return_
 
 

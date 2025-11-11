@@ -929,8 +929,8 @@ class WorldModelAgents(AbstractMLAgents):
                 iteration, next_ego_state)
         # (future_len, 11)
         planner_future_11_dim: Optional[
-            np.ndarray] = self._from_ego_fut_traj_to_np(
-                ego_future_trajectory, self._ego_anchor_state)
+            np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
+                                                        self._ego_anchor_state)
         if not self.use_ego_plan:
             # x, y, cos, sin, vx, vy, width, length, is_vehicle, 0, 0
             planner_future_11_dim[:, :7] = 0.0

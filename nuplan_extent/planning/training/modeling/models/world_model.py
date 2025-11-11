@@ -1,4 +1,4 @@
-from typing import List, Dict, Deque, Optional
+from typing import List, Dict, Deque, Optional, Tuple
 
 import timm
 import torch
@@ -59,7 +59,9 @@ class WorldModel(TorchModuleWrapper):
         else:
             raise RuntimeError("No checkpoint path provided")
 
-    def forward(self, features: WorldModelFeature) -> torch.Tensor:
+    def forward(
+            self,
+            features: WorldModelFeature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         The main inference call for the model.
         :param features: A dictionary of the required features.
@@ -79,6 +81,18 @@ class WorldModel(TorchModuleWrapper):
             1 + self.config.future_len,
             4,
         )
+        npc_integrated_trajectories = outputs.get(
+            "integrated_trajectory")  # (B, Pnn, 1+T, 4)
+        if npc_integrated_trajectories is None:
+            return npc_future_trajectories, None
+        assert npc_integrated_trajectories.shape == (
+            1,
+            self.config.predicted_neighbor_num,
+            1 + self.config.future_len,
+            4,
+        )
         npc_future_trajectories = npc_future_trajectories.squeeze(
             0)  # (Pnn, 1+T, 4)
-        return npc_future_trajectories
+        npc_integrated_trajectories = npc_integrated_trajectories.squeeze(
+            0)  # (Pnn, 1+T, 4)
+        return npc_future_trajectories, npc_integrated_trajectories

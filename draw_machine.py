@@ -211,14 +211,14 @@ class DrawInfos:
         self.diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {
         }  # (T, 11)
         """
-        딥러닝 output 값에서, 슬립 초과한거 제거한거
+        딥러닝 적분 출력값
         """
-        self.diff_token_to_np_slip_traj_11_wrt_ego: Dict[str, np.ndarray] = {
-        }  # (T, 11)
+        self.diff_token_to_np_int_traj_wrt_ego: Dict[str, np.ndarray] = {
+        }  # (T, 4)
         """
-        딥러닝 output 값에서, 슬립 초과 제거 + 경로 제약 보정한거
+        딥러닝 적분 출력삽을 11차원으로 
         """
-        self.diff_token_to_np_smooth_traj_11_wrt_ego: Dict[str, np.ndarray] = {
+        self.diff_token_to_np_int_traj_11_wrt_ego: Dict[str, np.ndarray] = {
         }  # (T, 11)
         """
         history Agent 만든걸 -> (History_len, 11) numpy로 변환한 것들
@@ -241,10 +241,10 @@ class DrawInfos:
         output_data = {
             "diff_token_to_np_gen_traj_11_wrt_ego":
                 self.diff_token_to_np_gen_traj_11_wrt_ego,
-            "diff_token_to_np_slip_traj_11_wrt_ego":
-                self.diff_token_to_np_slip_traj_11_wrt_ego,
-            "diff_token_to_np_smooth_traj_11_wrt_ego":
-                self.diff_token_to_np_smooth_traj_11_wrt_ego,
+            "diff_token_to_np_int_traj_wrt_ego":
+                self.diff_token_to_np_int_traj_wrt_ego,
+            "diff_token_to_np_int_traj_11_wrt_ego":
+                self.diff_token_to_np_int_traj_11_wrt_ego,
             "diff_token_to_np_history_wrt_ego":
                 self.diff_token_to_np_history_wrt_ego,
             "diff_token_to_interp_np_traj_wrt_ego":
@@ -1663,8 +1663,8 @@ def draw_traj_dict_as_non_square(
 def draw_diff_future_traj_w_square(
     ax: plt.Axes,
     diff_token_to_np_gen_traj_11_wrt_ego: Optional[Dict[str, Array]],
-    diff_token_to_np_slip_traj_11_wrt_ego: Optional[Dict[str, Array]],
-    diff_token_to_np_smooth_traj_11_wrt_ego: Optional[Dict[str, Array]],
+    diff_token_to_np_int_traj_wrt_ego: Optional[Dict[str, Array]],
+    diff_token_to_np_int_traj_11_wrt_ego: Optional[Dict[str, Array]],
     options: DrawingOptions,
     draw_token_list: Optional[List[str]] = None,
 ) -> None:
@@ -1685,8 +1685,8 @@ def draw_diff_future_traj_w_square(
     Args:
         ax: Matplotlib 축.
         diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,11)] | None
-        diff_token_to_np_slip_traj_11_wrt_ego: Dict[str, (T,11)] | None
-        diff_token_to_np_smooth_traj_11_wrt_ego: Dict[str, (T,11)] | None
+        diff_token_to_np_int_traj_wrt_ego: Dict[str, (T,11)] | None
+        diff_token_to_np_int_traj_11_wrt_ego: Dict[str, (T,11)] | None
         options: DrawingOptions
         draw_token_list: 특정 토큰만 그리고 싶을 때 지정. None이면 전체.
     """
@@ -1710,7 +1710,7 @@ def draw_diff_future_traj_w_square(
         if options.DIFF_draw_diff_future_slip_traj:
             draw_traj_dict_as_unfilled_rects(
                 ax=ax,
-                token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
+                token_to_traj_11=diff_token_to_np_int_traj_wrt_ego,
                 style=options.DIFF_future_slip_style,
                 options=options,
                 zorder=23,
@@ -1722,7 +1722,7 @@ def draw_diff_future_traj_w_square(
         if options.DIFF_draw_diff_future_smooth_traj:
             draw_traj_dict_as_unfilled_rects(
                 ax=ax,
-                token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
+                token_to_traj_11=diff_token_to_np_int_traj_11_wrt_ego,
                 style=options.DIFF_future_smooth_style,
                 options=options,
                 zorder=24,
@@ -1745,14 +1745,14 @@ def draw_diff_future_traj_w_square(
         if options.DIFF_draw_diff_future_slip_traj:
             draw_traj_dict_as_non_square(
                 ax=ax,
-                token_to_traj_11=diff_token_to_np_slip_traj_11_wrt_ego,
+                token_to_traj_11=diff_token_to_np_int_traj_wrt_ego,
                 style=options.DIFF_future_slip_style,
                 options=options,
                 draw_token_list=draw_token_list)
         if options.DIFF_draw_diff_future_smooth_traj:
             draw_traj_dict_as_non_square(
                 ax=ax,
-                token_to_traj_11=diff_token_to_np_smooth_traj_11_wrt_ego,
+                token_to_traj_11=diff_token_to_np_int_traj_11_wrt_ego,
                 style=options.DIFF_future_smooth_style,
                 options=options,
                 draw_token_list=draw_token_list)
@@ -2077,14 +2077,15 @@ def draw_neighbor_future_all(ax: plt.Axes,
     ### [NEIGHBOR FUTURE OUTPUT] ###
     diff_token_to_np_gen_traj_11_wrt_ego = output_data.get(
         "diff_token_to_np_gen_traj_11_wrt_ego", None)
-    diff_token_to_np_slip_traj_11_wrt_ego = output_data.get(
-        "diff_token_to_np_slip_traj_11_wrt_ego", None)
-    diff_token_to_np_smooth_traj_11_wrt_ego = output_data.get(
-        "diff_token_to_np_smooth_traj_11_wrt_ego", None)
+    diff_token_to_np_int_traj_wrt_ego = output_data.get(
+        "diff_token_to_np_int_traj_wrt_ego", None)
+    diff_token_to_np_int_traj_11_wrt_ego = output_data.get(
+        "diff_token_to_np_int_traj_11_wrt_ego", None)
     draw_diff_future_traj_w_square(ax, diff_token_to_np_gen_traj_11_wrt_ego,
-                                   diff_token_to_np_slip_traj_11_wrt_ego,
-                                   diff_token_to_np_smooth_traj_11_wrt_ego,
+                                   diff_token_to_np_int_traj_wrt_ego,
+                                   diff_token_to_np_int_traj_11_wrt_ego,
                                    draw_option, draw_token_list)
+    # 최종 출력물
     diff_token_to_interp_np_traj_wrt_ego = output_data.get(
         "diff_token_to_interp_np_traj_wrt_ego", None)
     diff_token_to_next_wp_wrt_ego = output_data.get(
