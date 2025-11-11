@@ -95,7 +95,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "use_pram_false_2_gpu_B" \
-  --batch_size 1536 \
+  --batch_size 1280 \
   --seed 7777 \
   --sampler_epoch_offset 1000 \
   --use_feasible true \
