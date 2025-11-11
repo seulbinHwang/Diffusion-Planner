@@ -403,7 +403,7 @@ def diffusion_loss_func(
         valid_low = near_future_valid & low_t_mask_bt  # (B, Pnn, T) bool
         valid_low_f = valid_low.float()
         ###### L_integration loss 추가 ######
-        if "integrated_trajectory" in decoder_output:
+        if "integrated_trajectory" in decoder_output and args.use_feasible_train:
             _require_finite( "decoder_output['integrated_trajectory']",
                              decoder_output["integrated_trajectory"])
             integrated_trajectory = decoder_output[
@@ -429,7 +429,7 @@ def diffusion_loss_func(
         # decoder_output["control_constraint_diff"]: (B, P, T, 3)
         #   = u - Filter_soft(u).detach()  (모델 내부에서 detach 적용되어야 함)
         # 학습 신호는 u(=보정기 경로)로만 흘러가도록 설계됨.
-        if "control_constraint_diff" in decoder_output:
+        if "control_constraint_diff" in decoder_output and args.use_feasible_train:
             control_constraint_diff = _require_finite(
                 "decoder_output['control_constraint_diff']",
                 decoder_output["control_constraint_diff"])  # (B, P, T, 3)

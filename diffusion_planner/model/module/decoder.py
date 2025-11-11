@@ -598,7 +598,7 @@ class DiT(nn.Module):
                               "x_start"], f"Unknown model type: {model_type}"
         self.final_hidden_tokens = None
         if self.config.use_feasible:
-            self.feasible_projector = FeasibleProjector(hidden_dim)
+            self.feasible_projector = FeasibleProjector(hidden_dim, self.config.use_feasible_train)
 
         self._model_type = model_type
         self.preproj = Mlp(in_features=output_dim,

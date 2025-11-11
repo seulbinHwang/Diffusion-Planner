@@ -99,5 +99,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --seed 7777 \
   --sampler_epoch_offset 1000 \
   --use_feasible true \
+  --use_feasible_train false \
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

@@ -131,7 +131,6 @@ def train_epoch(data_loader,
             l_con = loss.get(
                 "constraint_loss",
                 torch.tensor(0.0, device=inputs["ego_agent_past"].device))
-            print("l_int:" , l_int.item(), " l_con:", l_con.item())
             loss["loss"] = w_dir * l_dir + w_int * l_int + w_const * l_con
 
             total_loss = loss["loss"].item()  # scalar
