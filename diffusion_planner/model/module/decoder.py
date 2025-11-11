@@ -855,21 +855,24 @@ class DiT(nn.Module):
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
+                x_for_feasible_detach: torch.Tensor = x.detach()
+                near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach()
+                near_cur_future_valid_detach: torch.Tensor = near_cur_future_valid.detach()
                 # DiT.forward (model_type == "x_start" 분기 내부)
                 if getattr(self.config, "use_current_input", False):
                     # x: (B, Pnn, (1+T)*4) → 이미 현재 프레임 포함
-                    diffusion_trajectory = x.reshape(B, Pnn, -1,
-                                                     4)  # (B,Pnn,1+T,4)
+                    diffusion_trajectory = x_for_feasible_detach.reshape(B, Pnn, -1,
+                                                     4).contiguous()  # (B,Pnn,1+T,4)
                 else:
                     # x: (B, Pnn, T*4) → 현재 프레임을 앞에 붙여서 1+T로 맞춤
                     diffusion_trajectory = torch.cat([
-                        near_current_xyyaw.unsqueeze(2),
-                        x.reshape(B, Pnn, -1, 4)
+                        near_current_xyyaw_detach.unsqueeze(2),
+                        x_for_feasible_detach.reshape(B, Pnn, -1, 4)
                     ],
-                                                     dim=2)  # (B,Pnn,1+T,4)
+                                                     dim=2).contiguous()  # (B,Pnn,1+T,4)
                 self._feasible_projection(diffusion_trajectory,
                                           near_class_one_hot,
-                                          near_cur_future_valid)
+                                          near_cur_future_valid_detach)
             return x  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
@@ -882,7 +885,6 @@ class DiT(nn.Module):
     ):
         # diffusion_trajectory: (B, Pnn, 1+T, 4)
         # (B, Pnn, 1+T, 4)
-        near_current_valid = near_cur_future_valid[:, :, 0]  # (B, Pnn)
         unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
             diffusion_trajectory)
         unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
