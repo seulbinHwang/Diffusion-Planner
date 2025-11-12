@@ -507,9 +507,9 @@ class DrawingOptions:
     DIFF_future_all_gt_3_dim_token_color: str = BRIGHT_CYAN
     DIFF_future_all_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
-    DIFF_draw_diff_future_gen_traj: bool = False
+    DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    DIFF_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
@@ -1470,7 +1470,6 @@ def draw_token_trajectory_rects_unfilled(
     return first_valid_xy
 
 
-# draw_token_trajectory_rects_unfilled
 def draw_token_trajectory_non_rects(
     ax: plt.Axes,
     traj_11: Array,

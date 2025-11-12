@@ -344,6 +344,7 @@ class Decoder(nn.Module):
                 score = torch.cat([near_current_xyyaw.unsqueeze(2), score],
                                   dim=2)  # (B,Pnn,1+T,4)
             return_["score"] = score  # (B, Pnn, (1 + T) , 4)
+
             if self.config.use_feasible:
                 integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
                 integrated_trajectory = torch.cat(

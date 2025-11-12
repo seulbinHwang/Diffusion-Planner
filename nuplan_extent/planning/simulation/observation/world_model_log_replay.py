@@ -1214,7 +1214,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         # future_np_trajs_wrt_ego: (Pnn, 1+T, 4) # diffusion_agents 에서 생성하라는거만 생성햇음.
         # ego와 거리 순으로 모든 agent가 들어있다는 가정!!! (생성 안했으면, 빈 값을 준다.)
         """
-        future_np_trajs_wrt_ego, future_np_int_trajs_wrt_ego = self._model_loader.infer(
+        (future_np_trajs_wrt_ego, future_np_int_trajs_wrt_ego) = self._model_loader.infer(
             model_inputs)
         future_np_trajs_wrt_ego: np.ndarray = future_np_trajs_wrt_ego.detach(
         ).cpu().numpy()  # (Pnn, 1+T, 4)
@@ -1247,9 +1247,13 @@ class WorldModelLogReplay(AbstractMLAgents):
 
             future_np_int_traj_wrt_ego = future_np_int_trajs_wrt_ego[
                 idx, 1:, :]  # (T, 4)
+            np_int_traj_sum = future_np_int_traj_wrt_ego.sum()  # (T, 4) 의 합
             np_gen_int_traj_11_wrt_ego[:, :
                                        4] = future_np_int_traj_wrt_ego  # (T, 11)
             if np.allclose(np_traj_sum, 0.0) or token is None:
+                continue
+            if np.allclose(np_int_traj_sum, 0.0):
+                print(f"{idx} 번째 대상의 보간 궤적이 모두 0입니다.")
                 continue
             diff_token_to_np_gen_traj_wrt_ego[token] = future_np_traj_wrt_ego
             diff_token_to_np_gen_traj_11_wrt_ego[
