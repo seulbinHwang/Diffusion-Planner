@@ -449,6 +449,8 @@ class Decoder(nn.Module):
                                 route_known_mask,
                             "near_class_one_hot":
                                 near_class_one_hot,
+                            "near_current_xyyaw":
+                                near_current_xyyaw,
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
@@ -600,7 +602,9 @@ class DiT(nn.Module):
                               "x_start"], f"Unknown model type: {model_type}"
         self.final_hidden_tokens = None
         if self.config.use_feasible:
-            self.feasible_projector = FeasibleProjector(hidden_dim, self.config.use_feasible_train, self.config.use_feasible_filter)
+            self.feasible_projector = FeasibleProjector(
+                hidden_dim, self.config.use_feasible_train,
+                self.config.use_feasible_filter)
 
         self._model_type = model_type
         self.preproj = Mlp(in_features=output_dim,
@@ -846,7 +850,6 @@ class DiT(nn.Module):
 
         # 마스크(무효 토큰) 0 클램프 유지
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
-
         if self._model_type == "score":
             std = self.marginal_prob_std(diffusion_time).float()[:, None,
                                                                  None]  # FP32
@@ -857,21 +860,28 @@ class DiT(nn.Module):
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
-                x_for_feasible_detach: torch.Tensor = x.detach()
-                near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach()
-                near_cur_future_valid_detach: torch.Tensor = near_cur_future_valid.detach()
+                x_for_feasible_detach: torch.Tensor = x.detach(
+                )  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
+                near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach(
+                )  # (B, Pnn, 4)
+                near_cur_future_valid_detach: torch.Tensor = near_cur_future_valid.detach(
+                )
                 # DiT.forward (model_type == "x_start" 분기 내부)
-                if getattr(self.config, "use_current_input", False):
+                if getattr(self.config, "use_current_input", True):
                     # x: (B, Pnn, (1+T)*4) → 이미 현재 프레임 포함
-                    diffusion_trajectory = x_for_feasible_detach.reshape(B, Pnn, -1,
-                                                     4).contiguous()  # (B,Pnn,1+T,4)
+                    diffusion_trajectory = x_for_feasible_detach.reshape(
+                        B, Pnn, -1, 4).contiguous()  # (B,Pnn,1+T,4)
+                    diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_detach
                 else:
                     # x: (B, Pnn, T*4) → 현재 프레임을 앞에 붙여서 1+T로 맞춤
-                    diffusion_trajectory = torch.cat([
-                        near_current_xyyaw_detach.unsqueeze(2),
-                        x_for_feasible_detach.reshape(B, Pnn, -1, 4)
-                    ],
-                                                     dim=2).contiguous()  # (B,Pnn,1+T,4)
+                    diffusion_trajectory = torch.cat(
+                        [
+                            near_current_xyyaw_detach.unsqueeze(2),
+                            x_for_feasible_detach.reshape(B, Pnn, -1, 4)
+                        ],
+                        dim=2).contiguous()  # (B,Pnn,1+T,4)
+                # (B, Pnn, T, 4) -> (B, Pnn, T*4)
+
                 self._feasible_projection(diffusion_trajectory,
                                           near_class_one_hot,
                                           near_cur_future_valid_detach)

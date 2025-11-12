@@ -1214,8 +1214,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         # future_np_trajs_wrt_ego: (Pnn, 1+T, 4) # diffusion_agents 에서 생성하라는거만 생성햇음.
         # ego와 거리 순으로 모든 agent가 들어있다는 가정!!! (생성 안했으면, 빈 값을 준다.)
         """
-        (future_np_trajs_wrt_ego, future_np_int_trajs_wrt_ego) = self._model_loader.infer(
-            model_inputs)
+        (future_np_trajs_wrt_ego,
+         future_np_int_trajs_wrt_ego) = self._model_loader.infer(model_inputs)
         future_np_trajs_wrt_ego: np.ndarray = future_np_trajs_wrt_ego.detach(
         ).cpu().numpy()  # (Pnn, 1+T, 4)
         future_np_int_trajs_wrt_ego: np.ndarray = future_np_int_trajs_wrt_ego.detach(

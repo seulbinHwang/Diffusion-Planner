@@ -404,8 +404,8 @@ def diffusion_loss_func(
         valid_low_f = valid_low.float()
         ###### L_integration loss 추가 ######
         if "integrated_trajectory" in decoder_output and args.use_feasible_train:
-            _require_finite( "decoder_output['integrated_trajectory']",
-                             decoder_output["integrated_trajectory"])
+            _require_finite("decoder_output['integrated_trajectory']",
+                            decoder_output["integrated_trajectory"])
             integrated_trajectory = decoder_output[
                 "integrated_trajectory"][:, :, 1:, :]  # (B, Pnn, T, 4)
             # near_future_gt_4_dim: [B, Pnn, T, 4]

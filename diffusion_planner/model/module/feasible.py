@@ -196,7 +196,10 @@ class DynamicLimits:
 
 class FeasibleProjector(nn.Module):
 
-    def __init__(self, hidden_dim: int, use_feasible_train: bool = True, use_feasible_filter: bool = True):
+    def __init__(self,
+                 hidden_dim: int,
+                 use_feasible_train: bool = True,
+                 use_feasible_filter: bool = True):
         """Control Correction Network 본체 모듈 정의.
 
         Notes:
@@ -773,17 +776,17 @@ class FeasibleProjector(nn.Module):
         # 3) 피처 인코딩
         # Z_in: (B, Pnn, T, 192)
         Z_in = self._features_from_inputs(
-            x_prev=x_prev, # (B, Pnn, T, 4)
-            x_fut=x_fut, # (B, Pnn, T, 4)
-            u_base=cur_future_seg_body_control, # (B, Pnn, T, 3)
-            dit_final_hidden_tokens=dit_final_hidden_tokens, # (B, Pnn, H)
-            near_cur_future_valid=near_cur_future_valid, # (B, Pnn, 1+T)
+            x_prev=x_prev,  # (B, Pnn, T, 4)
+            x_fut=x_fut,  # (B, Pnn, T, 4)
+            u_base=cur_future_seg_body_control,  # (B, Pnn, T, 3)
+            dit_final_hidden_tokens=dit_final_hidden_tokens,  # (B, Pnn, H)
+            near_cur_future_valid=near_cur_future_valid,  # (B, Pnn, 1+T)
         )
 
         # 4) Stem → 5) TCN
         # Z_s: (B, Pnn, T, 192)
-        Z_s = self._prepare_tcn_input(Z_in,
-                               seg_mask_1)  # (B, Pnn, T, 192) # (B, Pnn, T, 1)
+        Z_s = self._prepare_tcn_input(
+            Z_in, seg_mask_1)  # (B, Pnn, T, 192) # (B, Pnn, T, 1)
         # Z_tcn: (B, Pnn, T, 192)
         Z_tcn = self._run_tcn(
             Z_s, seg_mask,
@@ -935,8 +938,7 @@ class FeasibleProjector(nn.Module):
         feat_u = self.control_adapter(u_base_in)  # (B,Pnn,T,32)
         # dit_final_hidden_tokens: (B,Pnn,H)
         # trunk: (B,Pnn,64)
-        trunk = self.trunk_compressor(
-            dit_final_hidden_tokens.detach())
+        trunk = self.trunk_compressor(dit_final_hidden_tokens.detach())
         trunk_rep = trunk.unsqueeze(2).expand(-1, -1, x_prev.size(2),
                                               -1)  # (B,Pnn,T,64)
 
@@ -1662,9 +1664,8 @@ class FeasibleProjector(nn.Module):
             apply_S4_ax_k = (k > 0)
 
             # (B,Pnn)
-            vx_k, vy_k, yaw_rate_k = vx_b_raw[...,
-                                              k], vy_b_raw[...,
-                                                           k], omega_raw[..., k]
+            vx_b_k, vy_b_k, yaw_rate_k = vx_b_raw[..., k], vy_b_raw[
+                ..., k], omega_raw[..., k]
             """ key_to_limit_bp
             Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn) 
 
@@ -1673,12 +1674,12 @@ class FeasibleProjector(nn.Module):
             """
             # [STE] S0~S4
             if self.use_feasible_filter:
-                vx_k, vy_k, yaw_rate_k = self._apply_constraints_step(
+                vx_b_k, vy_b_k, yaw_rate_k = self._apply_constraints_step(
                     vx_b_prev,  # (B,Pnn)
                     vy_b_prev,  # (B,Pnn)
                     omega_prev,  # (B,Pnn)
-                    vx_k,  # (B,Pnn)
-                    vy_k,  # (B,Pnn)
+                    vx_b_k,  # (B,Pnn)
+                    vy_b_k,  # (B,Pnn)
                     yaw_rate_k,  # (B,Pnn)
                     hp=self.constraints_h_params,  # _ConstraintHParams
                     key_to_limit_bp=key_to_limit_bp,
@@ -1687,22 +1688,30 @@ class FeasibleProjector(nn.Module):
                     apply_S4_ax=apply_S4_ax_k,
                 )
 
-            # 중점 적분
             x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(
-                x_k, y_k, cos_yaw_k, sin_yaw_k, vx_k, vy_k, yaw_rate_k,
+                x_k, y_k, cos_yaw_k, sin_yaw_k, vx_b_k, vy_b_k, yaw_rate_k,
                 self.constraints_h_params)
 
             key_to_all_states["x_next"][..., k] = x_k1
             key_to_all_states["y_next"][..., k] = y_k1
             key_to_all_states["cos_next"][..., k] = cos_k1
             key_to_all_states["sin_next"][..., k] = sin_k1
-            key_to_all_states["vx_after"][..., k] = vx_k
-            key_to_all_states["vy_after"][..., k] = vy_k
+            key_to_all_states["vx_after"][..., k] = vx_b_k
+            key_to_all_states["vy_after"][..., k] = vy_b_k
             key_to_all_states["omega_after"][..., k] = yaw_rate_k
 
             x_k, y_k, cos_yaw_k, sin_yaw_k = x_k1, y_k1, cos_k1, sin_k1
-            vx_b_prev, vy_b_prev, omega_prev = vx_k, vy_k, yaw_rate_k
-
+            vx_b_prev, vy_b_prev, omega_prev = vx_b_k, vy_b_k, yaw_rate_k
+        """ key_to_all_states
+        x_next / y_next / cos_next / sin_next: (B,Pnn,T)
+        vx_after / vy_after / omega_after: (B,Pnn,T)
+        
+        vx_b_raw: (B,Pnn,T)
+        vy_b_raw: (B,Pnn,T)
+        omega_raw: (B,Pnn,T)
+        
+        near_cur_future_valid: (B,Pnn,1+T) bool
+        """
         return self._assemble_outputs(key_to_all_states, vx_b_raw, vy_b_raw,
                                       omega_raw, near_cur_future_valid)
 

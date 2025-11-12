@@ -213,8 +213,8 @@ class DrawInfos:
         """
         딥러닝 적분 출력값
         """
-        self.diff_token_to_np_int_traj_wrt_ego: Dict[str, np.ndarray] = {
-        }  # (T, 4)
+        self.diff_token_to_np_int_traj_wrt_ego: Dict[str,
+                                                     np.ndarray] = {}  # (T, 4)
         """
         딥러닝 적분 출력삽을 11차원으로 
         """
@@ -522,7 +522,6 @@ class DrawingOptions:
         "velocity_line_width": 0.4,
     }
 
-
     DIFF_draw_diff_future_int_traj_11: bool = True
     DIFF_future_int_style = {
         "line_color": RED,  # 빨간색(밝은 빨강)
@@ -719,11 +718,13 @@ def collect_valid_xy_for_bounds(
 # =============================================================================
 
 
-def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
-                         agent_route_lane_order: Optional[Array], # (agent_num, lane_num)
-                         options: DrawingOptions,
-                            draw_token_int_list: Optional[List[int]] = None,
-                         ) -> None:
+def draw_lane_boundaries(
+    ax: plt.Axes,
+    lanes: Array,
+    agent_route_lane_order: Optional[Array],  # (agent_num, lane_num)
+    options: DrawingOptions,
+    draw_token_int_list: Optional[List[int]] = None,
+) -> None:
     """좌/우 차선 경계를 실선으로 그림(양 끝점 모두 valid일 때만 선분을 그림).
 
     (lane_num, lane_len, 12)
@@ -737,8 +738,10 @@ def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
         filtered_agent_route_lane_order = []
         for agent_idx in range(agent_route_lane_order.shape[0]):
             if agent_idx in draw_token_int_list:
-                filtered_agent_route_lane_order.append(agent_route_lane_order[agent_idx])
-        agent_route_lane_order = np.array(filtered_agent_route_lane_order) # (filtered_agent_num, lane_num)
+                filtered_agent_route_lane_order.append(
+                    agent_route_lane_order[agent_idx])
+        agent_route_lane_order = np.array(
+            filtered_agent_route_lane_order)  # (filtered_agent_num, lane_num)
     else:
         agent_route_lane_order = None
     eps = options.invalid_eps
@@ -751,7 +754,6 @@ def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
         if center.shape[0] < 2:
             continue
         color = options.LANE_lane_boundary_color
-
 
         for j in range(center.shape[0] - 1):
             if not (valid[j] and valid[j + 1]):
@@ -771,9 +773,9 @@ def draw_lane_boundaries(ax: plt.Axes, lanes: Array,
         # =============== 에이전트 경로 차선 경계 강조 그리기 [시작] ===============
         if agent_route_lane_order is not None:
             # TODO: 지금은 모든 에이전트를 같은 색으로 표시중. 개별 색상 지정 가능하도록 개선 필요.
-            agent_route_a_lane_order = agent_route_lane_order[
-                :, idx]  # (filtered_agent_num,)
-            has_route_mask = (agent_route_a_lane_order != -1) # True면 경로에 포함
+            agent_route_a_lane_order = agent_route_lane_order[:,
+                                                              idx]  # (filtered_agent_num,)
+            has_route_mask = (agent_route_a_lane_order != -1)  # True면 경로에 포함
             if np.any(has_route_mask):
                 color = CYAN
                 # 유효한 인접 포인트 구간만 강조 라인으로 그림
@@ -799,7 +801,7 @@ def draw_lane_centerlines(
     ax: plt.Axes,
     lanes: Array,
     options: DrawingOptions,
-    agent_route_lane_order: Optional[Array] = None, # (agent_num, lane_num)
+    agent_route_lane_order: Optional[Array] = None,  # (agent_num, lane_num)
     draw_token_int_list: Optional[List[int]] = None,
 ) -> None:
     """센터라인을 점선으로 그리거나, agent_route_lane_order가 주어지면 에이전트-차선 매핑을 텍스트로 표기한다.
@@ -838,7 +840,8 @@ def draw_lane_centerlines(
     """
     if lanes is None or lanes.size == 0:
         return
-    if not (options.LANE_draw_npc_agent_route == True and options.LANE_npc_agent_route_draw_mode =="centerline"):
+    if not (options.LANE_draw_npc_agent_route == True and
+            options.LANE_npc_agent_route_draw_mode == "centerline"):
         agent_route_lane_order = None
     eps = options.invalid_eps
     lane_num = lanes.shape[0]
@@ -1704,7 +1707,8 @@ def draw_diff_future_traj_w_square(
                 draw_token_list=draw_token_list,
                 annotate_token=options.DIFF_draw_diff_future_gen_traj_token,
                 annotate_fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
-                annotate_offset=options.DIFF_future_gen_trak_token_text_y_offset_m,
+                annotate_offset=options.
+                DIFF_future_gen_trak_token_text_y_offset_m,
             )
 
         if options.DIFF_draw_diff_future_int_traj_11:
@@ -1728,8 +1732,6 @@ def draw_diff_future_traj_w_square(
                 draw_token_list=draw_token_list,
                 annotate_token=False,
             )
-
-
 
     elif options.DIFF_future_traj_draw_mode in ["arrow", "point", "line"]:
         if options.DIFF_draw_diff_future_gen_traj:
@@ -1758,7 +1760,6 @@ def draw_diff_future_traj_w_square(
                 style=options.DIFF_future_slip_style,
                 options=options,
                 draw_token_list=draw_token_list)
-
 
 
 # =============================================================================
@@ -2135,12 +2136,13 @@ def draw_lane(
     """
     lanes = input_data.get("lanes")
     # : Optional[Array] # (agent_num, lane_num)
-    agent_route_lane_order: Optional[Array] = input_data.get("agent_route_lane_order",
-                                                  None)
+    agent_route_lane_order: Optional[Array] = input_data.get(
+        "agent_route_lane_order", None)
     draw_token_int_list: Optional[List[int]] = get_agent_idx_from_tokens(
         draw_token_list, input_data.get("neighbor_track_token", None))
     if draw_option.LANE_draw_lane_boundaries:
-        draw_lane_boundaries(ax, lanes, agent_route_lane_order, draw_option, draw_token_int_list)
+        draw_lane_boundaries(ax, lanes, agent_route_lane_order, draw_option,
+                             draw_token_int_list)
 
     # agent_route_lane_order가 있으면 텍스트 표기 모드로 전환
     if draw_option.LANE_draw_lane_centerline:
