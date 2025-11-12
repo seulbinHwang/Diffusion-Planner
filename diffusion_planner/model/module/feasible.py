@@ -196,7 +196,7 @@ class DynamicLimits:
 
 class FeasibleProjector(nn.Module):
 
-    def __init__(self, hidden_dim: int, use_feasible_train: bool = True):
+    def __init__(self, hidden_dim: int, use_feasible_train: bool = True, use_feasible_filter: bool = True):
         """Control Correction Network 본체 모듈 정의.
 
         Notes:
@@ -205,6 +205,7 @@ class FeasibleProjector(nn.Module):
         """
         super().__init__()
         self.use_feasible_train = use_feasible_train
+        self.use_feasible_filter = use_feasible_filter
         # --- [NEW] Savitzky–Golay 커널 캐시(LRU) ---
         # key: (W, polyorder, deriv_order, dt, dtype, device)
         # val: torch.Tensor of shape (1, 1, W)
@@ -1671,19 +1672,20 @@ class FeasibleProjector(nn.Module):
             /omega_abs_max/a_x_max/a_y_max, is_nonholonomic
             """
             # [STE] S0~S4
-            vx_k, vy_k, yaw_rate_k = self._apply_constraints_step(
-                vx_b_prev,  # (B,Pnn)
-                vy_b_prev,  # (B,Pnn)
-                omega_prev,  # (B,Pnn)
-                vx_k,  # (B,Pnn)
-                vy_k,  # (B,Pnn)
-                yaw_rate_k,  # (B,Pnn)
-                hp=self.constraints_h_params,  # _ConstraintHParams
-                key_to_limit_bp=key_to_limit_bp,
-                slip_epsilon=0.20,
-                apply_S2=apply_S2_k,
-                apply_S4_ax=apply_S4_ax_k,
-            )
+            if self.use_feasible_filter:
+                vx_k, vy_k, yaw_rate_k = self._apply_constraints_step(
+                    vx_b_prev,  # (B,Pnn)
+                    vy_b_prev,  # (B,Pnn)
+                    omega_prev,  # (B,Pnn)
+                    vx_k,  # (B,Pnn)
+                    vy_k,  # (B,Pnn)
+                    yaw_rate_k,  # (B,Pnn)
+                    hp=self.constraints_h_params,  # _ConstraintHParams
+                    key_to_limit_bp=key_to_limit_bp,
+                    slip_epsilon=0.20,
+                    apply_S2=apply_S2_k,
+                    apply_S4_ax=apply_S4_ax_k,
+                )
 
             # 중점 적분
             x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(

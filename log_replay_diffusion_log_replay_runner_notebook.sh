@@ -38,7 +38,30 @@ export NUPLAN_DATA_ROOT="${DATASET_DIR}/dataset" #"REPLACE_WITH_DATA_DIR"  # nup
 export NUPLAN_MAPS_ROOT="${DATASET_DIR}/dataset/maps" #"REPLACE_WITH_MAPS_DIR" # nuplan maps absolute path (e.g. "/data/nuplan-v1.1/maps")
 export NUPLAN_EXP_ROOT="${DATASET_DIR}" #"REPLACE_WITH_EXP_DIR" # nuplan experiment absolute path (e.g. "/data/nuplan-v1.1/exp")
 
-ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base.json"
+#ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base.json"
+CUSTOM_ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base_custom.json"
+
+
+
+# get_args()에 넘길 CLI를 정의 (실행 시점에 바꾸고 싶은 값들)
+# ※ normalizer 경로는 존재하는 실제 파일로! (절대경로 권장)
+ARGS_FOR_GET_ARGS=(
+  --use_feasible true
+  --use_feasible_train false
+  --use_feasible_filter false
+  --use_vel_input false
+  --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
+)
+
+# 1) 커스텀 JSON 생성 (기존 템플릿 사용 X)
+python "${PROJECTS_DIR}/Diffusion-Planner/tools/make_args_json_from_cli.py" \
+  --out-json "$CUSTOM_ARGS_FILE" \
+  -- "${ARGS_FOR_GET_ARGS[@]}"
+
+# 2) 생성한 파일을 ARGS_FILE로 사용
+ARGS_FILE="$CUSTOM_ARGS_FILE"
+
+
 CKPT_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/npc_model.pth"
 # nuplan/planning/script/config/simulation/main_callback/time_callback.yaml
 # Dataset split to use

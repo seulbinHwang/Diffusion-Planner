@@ -521,22 +521,24 @@ class DrawingOptions:
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
-    DIFF_draw_diff_future_slip_traj: bool = True
+
+
+    DIFF_draw_diff_future_int_traj_11: bool = True
+    DIFF_future_int_style = {
+        "line_color": RED,  # 빨간색(밝은 빨강)
+        "token_color": RED,  # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+
+    DIFF_draw_diff_future_int_traj_to_be: bool = False
     DIFF_future_slip_style = {
         "line_color": ORANGE,  # 빨간색(밝은 빨강)
         "token_color": ORANGE,  # 빨간색(밝은 빨강)
         "line_width": 1.4,
         "velocity_line_color": ORANGE,  # 빨간색(밝은 빨강)
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-
-    DIFF_draw_diff_future_smooth_traj: bool = False
-    DIFF_future_smooth_style = {
-        "line_color": RED,  # 빨간색(밝은 빨강)
-        "token_color": RED,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
-        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
@@ -1685,7 +1687,7 @@ def draw_diff_future_traj_w_square(
     Args:
         ax: Matplotlib 축.
         diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, (T,11)] | None
-        diff_token_to_np_int_traj_wrt_ego: Dict[str, (T,11)] | None
+        diff_token_to_np_int_traj_wrt_ego: Dict[str, (T,4)] | None
         diff_token_to_np_int_traj_11_wrt_ego: Dict[str, (T,11)] | None
         options: DrawingOptions
         draw_token_list: 특정 토큰만 그리고 싶을 때 지정. None이면 전체.
@@ -1706,8 +1708,18 @@ def draw_diff_future_traj_w_square(
                 annotate_offset=options.DIFF_future_gen_trak_token_text_y_offset_m,
             )
 
-        # 2) slip 초과 제거본 (연한 분홍)
-        if options.DIFF_draw_diff_future_slip_traj:
+        if options.DIFF_draw_diff_future_int_traj_11:
+            draw_traj_dict_as_unfilled_rects(
+                ax=ax,
+                token_to_traj_11=diff_token_to_np_int_traj_11_wrt_ego,
+                style=options.DIFF_future_int_style,
+                options=options,
+                zorder=24,
+                draw_token_list=draw_token_list,
+                annotate_token=False,
+            )
+
+        if options.DIFF_draw_diff_future_int_traj_to_be:
             draw_traj_dict_as_unfilled_rects(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_int_traj_wrt_ego,
@@ -1718,17 +1730,8 @@ def draw_diff_future_traj_w_square(
                 annotate_token=False,
             )
 
-        # 3) 경로 제약 보정본 (옅은 빨강) — 최상단
-        if options.DIFF_draw_diff_future_smooth_traj:
-            draw_traj_dict_as_unfilled_rects(
-                ax=ax,
-                token_to_traj_11=diff_token_to_np_int_traj_11_wrt_ego,
-                style=options.DIFF_future_smooth_style,
-                options=options,
-                zorder=24,
-                draw_token_list=draw_token_list,
-                annotate_token=False,
-            )
+
+
     elif options.DIFF_future_traj_draw_mode in ["arrow", "point", "line"]:
         if options.DIFF_draw_diff_future_gen_traj:
             draw_traj_dict_as_non_square(
@@ -1742,20 +1745,21 @@ def draw_diff_future_traj_w_square(
                 annotate_offset=options.
                 DIFF_future_gen_trak_token_text_y_offset_m,
             )
-        if options.DIFF_draw_diff_future_slip_traj:
+        if options.DIFF_draw_diff_future_int_traj_11:
+            draw_traj_dict_as_non_square(
+                ax=ax,
+                token_to_traj_11=diff_token_to_np_int_traj_11_wrt_ego,
+                style=options.DIFF_future_int_style,
+                options=options,
+                draw_token_list=draw_token_list)
+        if options.DIFF_draw_diff_future_int_traj_to_be:
             draw_traj_dict_as_non_square(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_int_traj_wrt_ego,
                 style=options.DIFF_future_slip_style,
                 options=options,
                 draw_token_list=draw_token_list)
-        if options.DIFF_draw_diff_future_smooth_traj:
-            draw_traj_dict_as_non_square(
-                ax=ax,
-                token_to_traj_11=diff_token_to_np_int_traj_11_wrt_ego,
-                style=options.DIFF_future_smooth_style,
-                options=options,
-                draw_token_list=draw_token_list)
+
 
 
 # =============================================================================
