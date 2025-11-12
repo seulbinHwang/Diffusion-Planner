@@ -119,8 +119,6 @@ def train_epoch(data_loader,
                 float(max(1, total_update_steps - 1)))
             w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
                 progress)
-            w_int = 0.
-            w_const = 0.
             # 개별 손실이 존재하지 않는 경우(예: score 모드) 대비 안전 get
             l_dir = loss.get(
                 "neighbor_prediction_loss",
