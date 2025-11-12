@@ -1257,6 +1257,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             # 추가
             diff_token_to_np_int_traj_11_wrt_ego[
                 token] = np_gen_int_traj_11_wrt_ego  # (T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+            self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego  # TODO: 속도는 잘못된 값이 들어가 있음.
         # 추가
@@ -1399,6 +1400,10 @@ class WorldModelLogReplay(AbstractMLAgents):
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
         ####################
         # diff_token_to_interpol_traj: Dict[str, AbstractTrajectory]
+        """
+        diff_token_to_np_gen_traj_wrt_ego 에는 있는 token이, 
+        diff_token_to_global_xyyaw 에는 없어서 에러가 났다.
+        """
         diff_token_to_interpol_traj = self._get_diff_token_to_interpol_traj_wrt_ego(
             diff_token_to_np_gen_traj_wrt_ego, diff_token_to_global_xyyaw,
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
