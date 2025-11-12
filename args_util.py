@@ -111,12 +111,12 @@ def get_args():
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
-    parser.add_argument('--use_feasible', default=False, type=boolean)
-    parser.add_argument('--use_feasible_train', default=False, type=boolean)
-    parser.add_argument('--use_feasible_filter', default=False, type=boolean)
+    parser.add_argument('--use_feasible', default=True, type=boolean)
+    parser.add_argument('--use_feasible_train', default=True, type=boolean)
+    parser.add_argument('--use_feasible_filter', default=True, type=boolean)
     parser.add_argument('--use_current_input', default=True, type=boolean)
     parser.add_argument('--use_huber_loss', default=True, type=boolean)
-    parser.add_argument('--use_vel_input', default=True, type=boolean)
+    parser.add_argument('--use_vel_input', default=False, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
 
     # parser.add_argument(
