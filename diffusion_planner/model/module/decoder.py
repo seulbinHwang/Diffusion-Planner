@@ -463,6 +463,7 @@ class Decoder(nn.Module):
             x0 = x0.to(xT.dtype)
             if self.config.use_current_input:
                 assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
+                x0 = x0.reshape(B, Pnn, -1, 4)  # (B,Pnn,1+T,4)
             else:
                 assert x0.shape == (B, Pnn, self._future_len * 4)
                 # concat near_current_xyyaw to x0.
