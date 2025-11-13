@@ -469,13 +469,11 @@ def diffusion_loss_func(
                     prefix="integration_loss")
                 loss.update(integ_xy_yaw_losses)
             if control_constraint_diff is not None:
-                temp_dict = {
-                    "cur_future_seg_body_control": control_constraint_diff
-                }
+                temp_dict = {"seg_body_control": control_constraint_diff}
                 temp_dict = observation_normalizer.inverse(
                     temp_dict)  # [B,P,T,3]
                 constraint_diff_denorm = temp_dict[
-                    "cur_future_seg_body_control"]  # [B,P,T,3]
+                    "seg_body_control"]  # [B,P,T,3]
                 constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
                     constraint_diff_denorm,
                     near_future_valid,

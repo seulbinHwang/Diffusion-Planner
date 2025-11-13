@@ -49,6 +49,7 @@ ARGS_FOR_GET_ARGS=(
   --use_feasible true
   --use_feasible_train false
   --use_feasible_filter false
+  --use_past_for_feasible true
   --use_vel_input false
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )

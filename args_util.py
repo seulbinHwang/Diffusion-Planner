@@ -114,6 +114,7 @@ def get_args():
     parser.add_argument('--use_feasible', default=True, type=boolean)
     parser.add_argument('--use_feasible_train', default=True, type=boolean)
     parser.add_argument('--use_feasible_filter', default=True, type=boolean)
+    parser.add_argument('--use_past_for_feasible', default=False, type=boolean)
     parser.add_argument('--use_current_input', default=True, type=boolean)
     parser.add_argument('--use_huber_loss', default=True, type=boolean)
     parser.add_argument('--use_vel_input', default=False, type=boolean)

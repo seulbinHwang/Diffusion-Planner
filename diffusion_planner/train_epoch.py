@@ -119,6 +119,13 @@ def train_epoch(data_loader,
                 float(max(1, total_update_steps - 1)))
             w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
                 progress)
+
+            # <추가하자> 에폭 평균으로 보고하기 위해 loss dict에 저장(이 값들을 나중에 lr/*로 로그)
+            loss["feasible_progress"] = float(progress)
+            loss["feasible_w_dir"] = float(w_dir)
+            loss["feasible_w_int"] = float(w_int)
+            loss["feasible_w_const"] = float(w_const)
+
             # 개별 손실이 존재하지 않는 경우(예: score 모드) 대비 안전 get
             l_dir = loss.get(
                 "neighbor_prediction_loss",

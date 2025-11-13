@@ -181,14 +181,10 @@ def bs_schedule_by_pnn(pnn_curr: int,
 # =======================================================================
 
 
-
-
 def print_parameter_index_mapping(model):
     print("Parameter index mapping:")
     for idx, (name, _) in enumerate(model.named_parameters()):
         print(f"{idx}: {name}")
-
-
 
 
 def safe_get_artifacts(api, type_name, path):
@@ -339,8 +335,8 @@ def build_adamw_with_param_groups(
     )
     # 공통 LR 부여
     for g in param_groups:
-        g["lr"] = lr                     # η_max(B)
-        g["lr_max"] = float(lr)          # 기준 LR(스케줄 시작 시점)
+        g["lr"] = lr  # η_max(B)
+        g["lr_max"] = float(lr)  # 기준 LR(스케줄 시작 시점)
         g["wd_max"] = float(g.get("weight_decay", 0.0))  # 그룹별 기준 WD
 
     # 최종 옵티마이저 (전역 WD는 0.0로 중복 방지)
@@ -388,7 +384,6 @@ def model_training(args):
     )
     args.train_epochs = int(scaled_epochs)
     train_epochs = args.train_epochs
-
 
     if global_rank == 0:
         """
@@ -459,11 +454,13 @@ def model_training(args):
 	•	즉, DataLoader/DistributedSampler가 순회할 단일 샘플 로더를 정의해 주는 역할이며, 
 	    셔플·분산 분배는 Sampler가 담당
     """
-    train_set = DiffusionPlannerData(args.train_set, # "/mnt/nuplan/dataset/processed"
-                                     args.train_set_list, # "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
-                                     args.agent_num,
-                                     args.predicted_neighbor_num,
-                                     args.future_len)
+    train_set = DiffusionPlannerData(
+        args.train_set,  # "/mnt/nuplan/dataset/processed"
+        args.
+        train_set_list,  # "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+        args.agent_num,
+        args.predicted_neighbor_num,
+        args.future_len)
     """ DistributedSampler
 	•	전체 데이터 인덱스를 전역으로 섞고(shuffle=True),
 	•	월드 크기(num_replicas=전체 프로세스 수)만큼 균등 분할한 뒤,
@@ -505,14 +502,15 @@ def model_training(args):
         drop_last=True라서 마지막 불완전 배치는 버려져, 모든 랭크가 동일 스텝 수를 가집니다.
 
     """
-    train_loader = DataLoader(train_set, # DiffusionPlannerData
-                              sampler=train_sampler, # DistributedSampler
-                              batch_size=batch_size // ddp.get_world_size(),
-                              num_workers=args.num_workers,
-                              prefetch_factor=args.prefetch_factor,
-                              pin_memory=args.pin_mem,
-                              persistent_workers=True, # 에폭이 바뀌어도 워커 유지
-                              drop_last=True)
+    train_loader = DataLoader(
+        train_set,  # DiffusionPlannerData
+        sampler=train_sampler,  # DistributedSampler
+        batch_size=batch_size // ddp.get_world_size(),
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        pin_memory=args.pin_mem,
+        persistent_workers=True,  # 에폭이 바뀌어도 워커 유지
+        drop_last=True)
     ############## [LR (2) ] T: 총 업데이트 스텝 수 (유지 대상) 구하기 ####################
     """ total_step_of_this_epoch
     floor( (샘플러가 이 랭크에 준 샘플 수) / (batch_size_per_rank) ).
@@ -562,9 +560,7 @@ def model_training(args):
 
 요약: 한 프로세스-한 GPU로 모델을 배치하고, 역전파 때 자동 동기화까지 처리하는 래퍼입니다.
         """
-        diffusion_planner = DDP(diffusion_planner,
-                                device_ids=[rank
-                                           ])
+        diffusion_planner = DDP(diffusion_planner, device_ids=[rank])
     model_ema = None
     if args.use_ema:
         " 현재 모델을 깊은 복사해서 EMA용 모델(model_ema.ema)을 만듭니다. "
@@ -599,8 +595,8 @@ def model_training(args):
     # ↓↓↓ 여기 추가 (스케줄러 생성/step 이전) ↓↓↓
     for pg in optimizer.param_groups:
         pg.setdefault("lr_max", float(pg["lr"]))  # η_max(B)
-        pg.setdefault("wd_max",
-                      float(pg.get("weight_decay", 0.0)))  # 그룹별 WD 기준값
+        pg.setdefault("wd_max", float(pg.get("weight_decay",
+                                             0.0)))  # 그룹별 WD 기준값
     # ↑↑↑
     ############## [LR (4) ] 선형 워밍업 -> 코사인 디케이 (스케쥴) ##########################
     # pseudo_total_update_steps = 110000
@@ -632,8 +628,8 @@ def model_training(args):
         # ↓↓↓ 여기 추가 (resume이 optimizer를 교체했으므로 보강) ↓↓↓
         for pg in optimizer.param_groups:
             pg.setdefault("lr_max", float(pg["lr"]))  # η_max(B)
-            pg.setdefault("wd_max",
-                          float(pg.get("weight_decay", 0.0)))  # 그룹별 WD 기준값
+            pg.setdefault("wd_max", float(pg.get("weight_decay",
+                                                 0.0)))  # 그룹별 WD 기준값
         # ↑↑↑
         # --- [NEW] If resumed, ensure total epochs > init_epoch ------------------
         # 재개 시 총 에폭이 초기 에폭보다 작거나 같으면 최소 1epoch 더 돌도록 보정
@@ -680,13 +676,14 @@ def model_training(args):
         if global_rank == 0:
             print(f"Epoch {epoch+1}/{train_epochs}")
         epoch_t0 = time.perf_counter()
-        train_loss, train_total_loss = train_epoch(train_loader, # DataLoader
-                                                   diffusion_planner,
-                                                   optimizer,
-                                                   args,
-                                                   model_ema,
-                                                   scheduler,
-                                                   aug)
+        train_loss, train_total_loss = train_epoch(
+            train_loader,  # DataLoader
+            diffusion_planner,
+            optimizer,
+            args,
+            model_ema,
+            scheduler,
+            aug)
         if args.device.startswith('cuda'):
             torch.cuda.empty_cache()
         # === [추가] 에폭 종료 시간 & 에폭 속도 계산 ===
@@ -699,6 +696,13 @@ def model_training(args):
         ###########################
         if global_rank == 0:
             lr_dict = {'lr': optimizer.param_groups[0]['lr']}
+
+            # <추가하자> 에폭 평균으로 집계된 feasible weight/progress를 lr/* 아래에 함께 기록
+            for k in ("feasible_progress", "feasible_w_dir", "feasible_w_int",
+                      "feasible_w_const"):
+                if k in train_loss:  # train_loss는 get_epoch_mean_loss() 결과
+                    lr_dict[k] = train_loss[k]  # 예: lr/feasible_w_dir 로 기록됨
+
             metrics = {
                 **{
                     f"train_loss/{k}": v for k, v in train_loss.items()

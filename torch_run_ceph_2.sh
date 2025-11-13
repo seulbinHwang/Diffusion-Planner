@@ -94,11 +94,10 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --port 23002 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "use_feasible_train_true_2_gpu_B" \
+  --name "use_feasible_train_wo_past_2_gpu_B" \
   --batch_size 1024 \
   --seed 7777 \
   --sampler_epoch_offset 1000 \
-  --use_feasible true \
-  --use_feasible_train true \
+  --use_past_for_feasible false \
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

@@ -150,41 +150,49 @@ class Decoder(nn.Module):
         x_out = x_seq.view(B, Pnn, flat)
         return x_out, can_apply
 
-    def _get_near_current_infos(
+    def _get_near_past_current_infos(
         self,
         target_agents_mask: Optional[torch.Tensor],  # [B, agent_num] bool
         neighbor_agents_past: torch.Tensor,  # [B, agent_num, time_len, 11]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
-            near_current_xyyaw: [B, pnn, 4]  (x, y, cos(yaw), sin(yaw))
-            near_current_mask: [B, pnn]  True=빈 슬롯(무효 에이전트)
+            near_past_current: [B, pnn, time_len, 11]
+            near_past_current_mask: [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
             near_class_one_hot: [B, pnn, 3]  one-hot class vector
         """
-        # neighbor_agents_past_xyyaw: [B, agent_num, time_len, 4]
-        neighbor_agents_past_xyyaw = neighbor_agents_past[..., :4]
+        # neighbor_agents_past_mask : [B, agent_num, time_len] bool # True=무효 점
+        neighbor_agents_past_mask = torch.sum(
+            torch.ne(neighbor_agents_past,
+                     0), dim=-1) == 0  # (B, agent_num, time_len)
+
         neighbor_agents_class_one_hot = neighbor_agents_past[
             ..., 0, 8:11]  # (B, agent_num, 3)
         # 마지막 타임스텝만 추출: [B, agent_num, 4]
-        neighbor_current_xyyaw = neighbor_agents_past_xyyaw[:, :, -1, :]
 
         if target_agents_mask is None:
-            near_current_xyyaw = neighbor_current_xyyaw[:, :self.
-                                                        _predicted_neighbor_num, :]  # [B, pnn, 4]
+            # near_past_current, near_past_current_mask,
+            near_past_current = neighbor_agents_past[:, :self.
+                                                     _predicted_neighbor_num]  # [B, pnn, time_len, 11]
+            near_past_current_mask = neighbor_agents_past_mask[:, :self.
+                                                               _predicted_neighbor_num]  # [B, pnn, time_len]
+
             near_class_one_hot = neighbor_agents_class_one_hot[:, :self.
                                                                _predicted_neighbor_num, :]  # [B, pnn, 3]
-            # [B, pnn]
-            near_current_mask = torch.sum(torch.ne(near_current_xyyaw, 0),
-                                          dim=-1) == 0
 
         else:
-            B, agent_num, time_len, D4 = neighbor_agents_past_xyyaw.shape
-            # 출력 버퍼(초기 0): [B, agent_num, 4]
-            near_current_xyyaw = torch.zeros(
-                (B, agent_num, 4),
-                dtype=neighbor_current_xyyaw.dtype,
-                device=neighbor_current_xyyaw.device,
+            B, agent_num, time_len, D11 = neighbor_agents_past.shape
+            # near_past_current:
+            near_past_current = torch.zeros(
+                (B, agent_num, time_len, D11),
+                dtype=neighbor_agents_past.dtype,
+                device=neighbor_agents_past.device,
             )
+            near_past_current_mask = torch.ones(
+                (B, agent_num, time_len),
+                dtype=neighbor_agents_past_mask.dtype,
+                device=neighbor_agents_past_mask.device,
+            )  # True=빈 슬롯(무효 에이전트)
             near_class_one_hot = torch.zeros(
                 (B, agent_num, 3),
                 dtype=neighbor_agents_class_one_hot.dtype,
@@ -192,35 +200,45 @@ class Decoder(nn.Module):
             )
 
             # 마스크가 True인 “그 자리”에 값 대입 (슬롯 유지)
-            # target_agents_mask: [B, agent_num] bool
-            near_current_xyyaw[target_agents_mask] = neighbor_current_xyyaw[
+            # near_past_current: [B, agent_num, time_len, 11]
+            near_past_current[target_agents_mask] = neighbor_agents_past[
                 target_agents_mask]
+            # near_past_current_mask : [B, agent_num, time_len]  True=빈 슬롯(무효 점)
+            near_past_current_mask[
+                target_agents_mask] = neighbor_agents_past_mask[
+                    target_agents_mask]
+
             near_class_one_hot[
                 target_agents_mask] = neighbor_agents_class_one_hot[
                     target_agents_mask]  #
             # TODO: 임시 -> _predicted_neighbor_num 에 대한 의존성 타파?
-            near_current_xyyaw = near_current_xyyaw[:, :self.
-                                                    _predicted_neighbor_num, :]  # [B, pnn, 4]
+            near_past_current = near_past_current[:, :self.
+                                                  _predicted_neighbor_num]  # [B, pnn, time_len, 11]
             near_class_one_hot = near_class_one_hot[:, :self.
                                                     _predicted_neighbor_num, :]  # [B, pnn, 3]
-            # [B, pnn]  True=빈 슬롯(무효 에이전트)
-            near_current_mask = (near_current_xyyaw.ne(0).sum(dim=-1) == 0)
-        return near_current_xyyaw, near_current_mask, near_class_one_hot
+            # near_past_current_mask : [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
+            near_past_current_mask = near_past_current_mask[:, :self.
+                                                            _predicted_neighbor_num]
 
-    def _get_near_cur_future_valid(
+        return near_past_current, near_past_current_mask, near_class_one_hot
+
+    def _get_near_past_cur_future_valid(
         self,
-        near_current_mask: torch.Tensor,  # [B, pnn] bool
+        near_past_current_mask: torch.
+        Tensor,  # [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
         near_future_valid: Optional[
             torch.Tensor] = None,  # [B, pnn, future_len] bool
     ) -> torch.Tensor:  # [B, pnn, 1 + future_len] bool
-        near_current_valid = ~near_current_mask  # [B, pnn]  True=유효 에이전트
+        near_past_current_valid = ~near_past_current_mask  # [B, pnn, time_len]  True=유효 에이전트
+        near_current_valid = near_past_current_valid[:, :, -1]  # [B, pnn]
+
         if near_future_valid is None:
             near_future_valid = near_current_valid.unsqueeze(-1).expand(
                 -1, -1, self._future_len)  # [B, pnn, future_len] bool
-        near_cur_future_valid = torch.cat(
-            [near_current_valid.unsqueeze(-1), near_future_valid],
-            dim=-1)  # [B, pnn, 1 + future_len] bool
-        return near_cur_future_valid
+        near_past_cur_future_valid = torch.cat(
+            [near_past_current_valid, near_future_valid],
+            dim=-1)  # [B, pnn, time_len + future_len] bool
+        return near_past_cur_future_valid
 
     def forward(self, encoder_outputs, inputs):
         """
@@ -258,16 +276,27 @@ class Decoder(nn.Module):
 
         # near_current_xyyaw: [B, pnn, 4]  (x, y, cos(yaw), sin(yaw))
         # near_current_mask: [B, pnn]  True=빈 슬롯(무효 에이전트)
-        (near_current_xyyaw, near_current_mask,
-         near_class_one_hot) = self._get_near_current_infos(
+        neighbor_agents_past = inputs[
+            "neighbor_agents_past"]  # [B, agent_num, time_len, 11]
+        (near_past_current, near_past_current_mask,
+         near_class_one_hot) = self._get_near_past_current_infos(
              target_agents_mask=inputs.get("target_agents_mask",
                                            None),  # [B, agent_num] bool
-             neighbor_agents_past=inputs[
-                 "neighbor_agents_past"],  # [B, agent_num, time_len, 11]
+             neighbor_agents_past=
+             neighbor_agents_past,  # [B, agent_num, time_len, 11]
          )
+        near_past = near_past_current[:, :, :-1, :].detach(
+        )  # [B, pnn, past_len=(time_len - 1), 11]
+        near_past_current_xyyaw = near_past_current[:, :, :, :
+                                                    4]  # [B, pnn, time_len, 4]
+        near_current_xyyaw = near_past_current_xyyaw[:, :, -1, :]  # [B, pnn, 4]
+        near_current_mask = near_past_current_mask[:, :, -1]  # [B, pnn]
+
         inputs["near_current_mask"] = near_current_mask
-        near_cur_future_valid = self._get_near_cur_future_valid(
-            near_current_mask,
+
+        # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+        near_past_cur_future_valid = self._get_near_past_cur_future_valid(
+            near_past_current_mask,  # : [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
             near_future_valid=inputs.get("near_future_valid",
                                          None)  # [B, pnn, future_len] bool
         )
@@ -327,11 +356,12 @@ class Decoder(nn.Module):
                 scene_encoding_token,  # (B, token_num, hidden_dim)
                 ego_fut_global,  # (B, hidden_dim)
                 near_agents_route_lane_emb,  # (B, Pnn, hidden_dim)
-                near_cur_future_valid,  # [B, pnn, 1 + future_len] bool
+                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
                 scene_encoding_token_mask,  # (B, token_num) bool
                 route_known_mask,  # (B, Pnn) bool # True=해당 에이전트가 유효 route
                 near_class_one_hot,  # (B, Pnn, 3)
                 near_current_xyyaw=near_cur_norm_xT,  # (B, Pnn, 4)
+                near_past=near_past,  # [B, pnn, past_len=(time_len - 1), 11]
             )
             _require_finite("decoder_dit_output", score)
             if self.config.use_current_input:
@@ -420,11 +450,14 @@ class Decoder(nn.Module):
                     "cross_c": scene_encoding_token,
                     "ego_fut_global": ego_fut_global,
                     "near_agents_route_lane_emb": near_agents_route_lane_emb,
-                    "near_cur_future_valid": near_cur_future_valid,
+                    "near_past_cur_future_valid":
+                        near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
                     "cross_mask": scene_encoding_token_mask,
                     "route_known_mask": route_known_mask,
                     "near_class_one_hot": near_class_one_hot,
                     "near_current_xyyaw": near_current_xyyaw,
+                    "near_past":
+                        near_past,  # [B, pnn, past_len=(time_len - 1), 11]
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": initial_state_constraint,
@@ -441,8 +474,8 @@ class Decoder(nn.Module):
                                 ego_fut_global,
                             "near_agents_route_lane_emb":
                                 near_agents_route_lane_emb,
-                            "near_cur_future_valid":
-                                near_cur_future_valid,
+                            "near_past_cur_future_valid":
+                                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
                             "cross_mask":
                                 scene_encoding_token_mask,
                             "route_known_mask":
@@ -451,6 +484,8 @@ class Decoder(nn.Module):
                                 near_class_one_hot,
                             "near_current_xyyaw":
                                 near_current_xyyaw,
+                            "near_past":
+                                near_past,  # [B, pnn, past_len=(time_len - 1), 11]
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
@@ -597,6 +632,7 @@ class DiT(nn.Module):
         super().__init__()
         self.dit_returns = None
         self.config = config
+        self._future_len: int = config.future_len  # <추가하자>
 
         assert model_type in ["score",
                               "x_start"], f"Unknown model type: {model_type}"
@@ -730,19 +766,20 @@ class DiT(nn.Module):
         return self._model_type
 
     def forward(
-        self,
-        near_future_norm_xT: torch.Tensor,  # (B, Pnn, T*4)
-        diffusion_time: torch.Tensor,  # (B,)
-        cross_c: torch.Tensor,  # (B, token_num, D)
-        ego_fut_global: torch.Tensor,  # (B, D)
-        near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-        near_cur_future_valid: torch.Tensor,
-        # [B, pnn, 1 + future_len] bool
-        cross_mask: torch.Tensor,  # (B, token_num) True=pad
-        route_known_mask: torch.Tensor,  # (B, Pnn) True=known
-        near_class_one_hot: torch.Tensor,
-        # (B, Pnn, 3) # 0: 차량, 1: 보행자, 2: 자전거
-        near_current_xyyaw: torch.Tensor  # ★ 추가: (B, Pnn, 4)
+            self,
+            near_future_norm_xT: torch.Tensor,  # (B, Pnn, T*4)
+            diffusion_time: torch.Tensor,  # (B,)
+            cross_c: torch.Tensor,  # (B, token_num, D)
+            ego_fut_global: torch.Tensor,  # (B, D)
+            near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+            near_past_cur_future_valid: torch.Tensor,
+            # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+            cross_mask: torch.Tensor,  # (B, token_num) True=pad
+            route_known_mask: torch.Tensor,  # (B, Pnn) True=known
+            near_class_one_hot: torch.Tensor,
+            # (B, Pnn, 3) # 0: 차량, 1: 보행자, 2: 자전거
+            near_current_xyyaw: torch.Tensor,  # ★ 추가: (B, Pnn, 4)
+            near_past: torch.Tensor,  # (B, Pnn, past_len, 11),
     ) -> torch.Tensor:
         """
         Forward pass of DiT.
@@ -750,10 +787,12 @@ class DiT(nn.Module):
         diffusion_time:  [B,]                 -> Diffusion time uniformly sampled in [eps, 1]
         cross_c: [B, N = token_num, D = 192]
         ego_fut_global: [B, D]   -> Global encoding of the future trajectory of the ego agent.
-        near_cur_future_valid: torch.Tensor,  # [B, pnn, 1 + future_len] bool
+        near_past_cur_future_valid: torch.Tensor, # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
         near_agents_route_lane_emb, # (B, Pnn, D)
         cross_mask: (B, token_num)
         """
+        near_cur_future_valid = near_past_cur_future_valid[:, :, -(
+            self._future_len + 1):]  # [B, Pnn, 1 + future_len] bool
         near_current_valid = near_cur_future_valid[:, :,
                                                    0]  # [B, Pnn] True=유효 에이전트
         near_current_mask = ~near_current_valid  # [B, Pnn] True=무효 에이전트
@@ -864,7 +903,7 @@ class DiT(nn.Module):
                 )  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
                 near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach(
                 )  # (B, Pnn, 4)
-                near_cur_future_valid_detach: torch.Tensor = near_cur_future_valid.detach(
+                near_past_cur_future_valid_detach: torch.Tensor = near_past_cur_future_valid.detach(
                 )
                 # DiT.forward (model_type == "x_start" 분기 내부)
                 if getattr(self.config, "use_current_input", True):
@@ -882,66 +921,100 @@ class DiT(nn.Module):
                         dim=2).contiguous()  # (B,Pnn,1+T,4)
                 # (B, Pnn, T, 4) -> (B, Pnn, T*4)
 
-                self._feasible_projection(diffusion_trajectory,
-                                          near_class_one_hot,
-                                          near_cur_future_valid_detach)
+                self._feasible_projection(
+                    diffusion_trajectory, near_class_one_hot,
+                    near_past_cur_future_valid_detach,
+                    near_past)  # [B, pnn, past_len=(time_len - 1), 11]
             return x  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
 
     def _feasible_projection(
-        self,
-        diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+T, 4)
-        near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
-        near_cur_future_valid: torch.Tensor  # (B, Pnn, 1+T) bool
+            self,
+            diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+            near_past_cur_future_valid: torch.
+        Tensor,  ## [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+            near_past: torch.Tensor,  # (B, Pnn, past_len, 11)
     ):
-        # diffusion_trajectory: (B, Pnn, 1+T, 4)
-        # (B, Pnn, 1+T, 4)
+        # diffusion_trajectory: (B, Pnn, 1+future_len, 4)
+        # (B, Pnn, 1+future_len, 4)
         unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
             diffusion_trajectory)
         unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
                                                                 0, :]  # (B, Pnn, 4)
-
-        unnorm_cur_future_control = self.feasible_projector.savgol_filter_for_control(
-            unnorm_diffusion_trajectory,  # (B, Pnn, 1+T, 4),
-            near_cur_future_valid,  # (B, Pnn, 1+T) bool
-        )  # (B, Pnn, 1+T, 3)
-        # cur_future_seg_body_control: (B, Pnn, T, 3) #  v_x^b, v_y^b, ω # 각 시점 몸체 좌표계 기준 속도 + 세계 좌표계 기준 요레이트
-        unnorm_cur_future_seg_body_control = self.feasible_projector.compute_midpoint_controls(
-            unnorm_diffusion_trajectory, unnorm_cur_future_control,
-            near_cur_future_valid)
+        if self.config.use_past_for_feasible:
+            near_past_xyyaw = near_past[:, :, :, :4]  # (B, Pnn, past_len, 4)
+            unnorm_near_past_xyyaw = self.config.state_normalizer.inverse(
+                near_past_xyyaw)  # (B, Pnn, past_len, 4)
+        else:
+            near_past_xyyaw = None
+            unnorm_near_past_xyyaw = None
+        # unnorm_points_world_control: (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
+        unnorm_points_world_control = self.feasible_projector.savgol_filter_for_control(
+            unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
+            unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
+            near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+        )
+        # unnorm_seg_body_control: (B, Pnn, seq_len, 3) #  v_x^b, v_y^b, ω # 각 시점 몸체 좌표계 기준 속도 + 세계 좌표계 기준 요레이트
+        # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
+        unnorm_seg_body_control = self.feasible_projector.compute_midpoint_controls(
+            unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
+            unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
+            unnorm_points_world_control,  # (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
+            near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+        )
 
         temp_dict = {
-            "cur_future_seg_body_control": unnorm_cur_future_seg_body_control
+            "seg_body_control": unnorm_seg_body_control  # (B, Pnn, seq_len, 3)
         }
         temp_dict = self.config.observation_normalizer(temp_dict)
-        cur_future_seg_body_control = temp_dict[
-            "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
-        # cur_future_seg_body_control: (B, Pnn, T, 3)
-        cur_future_seg_body_control = self.feasible_projector(
-            near_cur_future_valid,  # (B, Pnn, 1+T)
-            diffusion_trajectory,  # (B, Pnn, 1+T, 4)
-            cur_future_seg_body_control,  # (B, Pnn, T, 3)
+        seg_body_control = temp_dict["seg_body_control"]  # (B, Pnn, seq_len, 3)
+        # seg_body_control: (B, Pnn, seq_len, 3)
+        # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
+        seg_body_control = self.feasible_projector(
+            near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+            diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+            near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+            seg_body_control,  # (B, Pnn, seq_len, 3)
             self.final_hidden_tokens,  # (B, Pnn, H)
         )
-        temp_dict = {"cur_future_seg_body_control": cur_future_seg_body_control}
+        temp_dict = {"seg_body_control": seg_body_control}
         temp_dict = self.config.observation_normalizer.inverse(temp_dict)
-        unnorm_cur_future_seg_body_control = temp_dict[
-            "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
+        unnorm_seg_body_control = temp_dict[
+            "seg_body_control"]  # (B, Pnn, seq_len, 3)
+
+        if self.config.use_past_for_feasible:
+            # (B, Pnn, future_len, 3)
+            unnorm_fut_seg_body_control = unnorm_seg_body_control[:, :, -self.
+                                                                  _future_len:, :]
+        else:
+            # (B, Pnn, future_len, 3)
+            unnorm_fut_seg_body_control = unnorm_seg_body_control
+        assert unnorm_fut_seg_body_control.shape[2] == self._future_len
+        near_cur_future_valid = near_past_cur_future_valid[:, :, -(
+            1 + self._future_len):]  # [B, Pnn, 1 + future_len] bool
+        """
+        unnorm_integrated_trajectory: (B, Pnn, future_len, 4)
+        unnorm_control_constraint_diff: (B, Pnn, future_len, 3)
+        """
         (unnorm_integrated_trajectory, unnorm_control_constraint_diff
         ) = self.feasible_projector.filter_and_integrate(
             unnorm_near_current_state,  # (B, Pnn, 4)
-            near_cur_future_valid,  # (B, Pnn, 1+T) bool  ← 시점별 마스크
-            unnorm_cur_future_seg_body_control,  # (B, Pnn, T, 3)
+            near_cur_future_valid,  # (B, Pnn, 1+future_len) bool  ← 시점별 마스크
+            unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
             near_class_one_hot,
             # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
-        )  # (B, Pnn, T, 4)
+        )  # (B, Pnn, future_len, 4)
         integrated_trajectory = self.config.state_normalizer(
-            unnorm_integrated_trajectory)  # (B, Pnn, T, 4)
-        temp_dict = {"control_constraint_diff": unnorm_control_constraint_diff}
+            unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
+        temp_dict = {"seg_body_control": unnorm_control_constraint_diff}
         temp_dict = self.config.observation_normalizer(temp_dict)
         control_constraint_diff = temp_dict[
-            "control_constraint_diff"]  # (B, Pnn, T, 3)
+            "seg_body_control"]  # (B, Pnn, future_len, 3)
         self.dit_returns = DiTReturns(
-            integrated_trajectory=integrated_trajectory,
-            control_constraint_diff=control_constraint_diff)
+            integrated_trajectory=
+            integrated_trajectory,  # (B, Pnn, future_len, 4)
+            control_constraint_diff=
+            control_constraint_diff  # (B, Pnn, future_len, 3)
+        )

@@ -22,6 +22,19 @@ from typing import Tuple
 from collections import OrderedDict
 from typing import Dict, Tuple, Optional
 
+# <추가하자>
+from typing import NamedTuple
+
+
+# <추가하자>
+class PointLenInputs(NamedTuple):
+    unnorm_points_xyyaw: torch.Tensor  # (B,Pnn,point_len,4)
+    points_valid: torch.Tensor  # (B,Pnn,point_len)  bool
+    past_cur_valid: Optional[torch.Tensor]  # (B,Pnn,past_len+1) bool or None
+    cur_future_valid: torch.Tensor  # (B,Pnn,1+future_len) bool
+    past_len: int
+    point_len: int
+
 
 def _yaw_rate_from_cos_sin_via_sg(
     cos_yaw: Tensor,  # (B, Pnn, T1)
@@ -414,6 +427,92 @@ class FeasibleProjector(nn.Module):
         with torch.no_grad():
             return w_cpu_fp32.to(device=device, dtype=dtype)
 
+    # <추가하자>
+    def _prepare_points_and_masks(
+            self,
+            unnorm_diffusion_trajectory: torch.Tensor,  # (B,Pnn,1+future_len,4)
+            unnorm_near_past_xyyaw: Optional[
+                torch.Tensor],  # (B,Pnn,past_len,4) or None
+            near_past_cur_future_valid: torch.
+        Tensor,  # (B,Pnn,past_len+1+future_len) bool
+    ) -> PointLenInputs:
+        """(1) 과거/현재/미래 포인트 결합
+           (2) past_cur / cur_future 마스크 분할
+           (3) 단조성 검증
+
+
+        return PointLenInputs(
+            unnorm_points_xyyaw,  # (B,Pnn,point_len,4)
+            points_valid, # (B,Pnn,point_len)  bool
+            past_cur_valid, # (B,Pnn,past_len+1) bool or None
+            cur_future_valid, # (B,Pnn,1+future_len) bool
+            past_len, # int
+            point_len
+                if unnorm_near_past_xyyaw is None:
+                    = 1 + future_len
+                else:
+                    = past_len + 1 + future_len
+        """
+        B, Pnn, T1_fut, C = unnorm_diffusion_trajectory.shape
+        assert C == 4, "xyyaw 마지막 채널은 4여야 합니다."
+        Bv, Pnnv, total_time_len = near_past_cur_future_valid.shape
+        assert (Bv, Pnnv) == (B, Pnn), "valid 마스크 (B,Pnn) 불일치"
+        if total_time_len < T1_fut:  # T1_fut = 1 + future_len
+            raise ValueError("valid 마스크 길이가 (1+future_len)보다 짧습니다.")
+        if unnorm_near_past_xyyaw is None:
+            past_len = 0
+            # point_len = 1 + future_len
+            unnorm_points_xyyaw = unnorm_diffusion_trajectory  # (B,Pnn,1+future_len,4)
+            # near_past_cur_future_valid: (B,Pnn,past_len+1+future_len)
+            past_cur_valid = None  # 과거~현재 마스크 없음
+            cur_future_valid = near_past_cur_future_valid[:, :, -T1_fut:].to(
+                torch.bool)  # (B,Pnn,1+future_len)
+            points_valid = cur_future_valid  # (B,Pnn,1+future_len)
+            # 현재~미래: True*False* 검증
+            self._assert_cur_future_valid_mask(
+                cur_future_valid,
+                context="savgol_filter_for_control_cur_future")
+        else:
+            assert unnorm_near_past_xyyaw.shape[:2] == (B, Pnn)
+            assert unnorm_near_past_xyyaw.shape[-1] == 4
+            past_len = int(unnorm_near_past_xyyaw.shape[2])
+            time_len = past_len + 1
+            # 포인트 결합
+            # point_len = past_len + 1 + future_len
+            unnorm_points_xyyaw = torch.cat(
+                [unnorm_near_past_xyyaw, unnorm_diffusion_trajectory],
+                dim=2)  # (B,Pnn,past_len+1+future_len,4)
+            # 마스크 분리
+            all_valid = near_past_cur_future_valid.to(
+                torch.bool)  # (B,Pnn,past_len+1+future_len)
+            past_cur_valid = all_valid[..., :time_len]  # (B,Pnn,past_len+1)
+            cur_future_valid = all_valid[..., past_len:]  # (B,Pnn,1+future_len)
+            points_valid = all_valid  # (B,Pnn,point_len)
+            # 검증: 과거~현재(0*1*), 현재~미래(1*0*)
+            self._assert_past_cur_valid_mask(
+                past_cur_valid, context="savgol_filter_for_control_past_cur")
+            self._assert_cur_future_valid_mask(
+                cur_future_valid,
+                context="savgol_filter_for_control_cur_future")
+
+        point_len = int(unnorm_points_xyyaw.shape[2])
+        """
+        point_len
+            if unnorm_near_past_xyyaw is None:
+                = 1 + future_len
+            else:
+                = past_len + 1 + future_len
+        """
+
+        return PointLenInputs(
+            unnorm_points_xyyaw=unnorm_points_xyyaw,  # (B,Pnn,point_len,4)
+            points_valid=points_valid,  # (B,Pnn,point_len)  bool
+            past_cur_valid=past_cur_valid,  # (B,Pnn,past_len+1) bool or None
+            cur_future_valid=cur_future_valid,  # (B,Pnn,1+future_len) bool
+            past_len=past_len,  # int
+            point_len=point_len,  # int
+        )
+
     def _get_savgol_diff_kernel_cached(
         self,
         window_length: int,
@@ -640,164 +739,297 @@ class FeasibleProjector(nn.Module):
         vyb = -sin_yaw * vx_w + cos_yaw * vy_w
         return vxb, vyb
 
+    # <추가하자>
+    def _prepare_midpoint_inputs(
+        self,
+        unnorm_diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+        unnorm_near_past_xyyaw: Optional[
+            torch.Tensor],  # (B, Pnn, past_len, 4) or None
+        unnorm_points_world_control: torch.Tensor,  # (B, Pnn, point_len, 3)
+        near_past_cur_future_valid: torch.
+        Tensor,  # (B, Pnn, time_len(=1+past_len)+future_len) bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """중점 제어 계산을 위해
+        - 좌표 시퀀스(x, y, cos, sin)
+        - 월드 프레임 제어(v_x^w, v_y^w, w)
+        - 유효 마스크
+        를 하나의 공통 타임라인 기준(point_len)으로 정리합니다.
+
+        Returns:
+            unnorm_points_xyyaw: (B, Pnn, point_len, 4)
+            unnorm_points_world_control_aligned: (B, Pnn, point_len, 3)
+            points_valid: (B, Pnn, point_len)  bool
+            point_len: int
+        """
+        # savgol_filter_for_control과 동일한 규칙으로 포인트/마스크 정리
+        point_len_inputs: PointLenInputs = self._prepare_points_and_masks(
+            unnorm_diffusion_trajectory=
+            unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+            unnorm_near_past_xyyaw=
+            unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len)+future_len)
+        )
+        unnorm_points_xyyaw = point_len_inputs.unnorm_points_xyyaw  # (B, Pnn, point_len, 4)
+        points_valid = point_len_inputs.points_valid  # (B, Pnn, point_len)
+        B, Pnn, point_len, _ = unnorm_points_xyyaw.shape
+
+        B_c, P_c, point_len_control, _ = unnorm_points_world_control.shape
+        assert point_len_control == point_len, \
+            f"포인트 개수(point_len={point_len})와 제어 시퀀스 길이(point_len_control={point_len_control})가 다릅니다."
+
+        return unnorm_points_xyyaw, unnorm_points_world_control, points_valid, point_len
+
+    # <추가하자>
+    # <추가하자>
     def compute_midpoint_controls(
         self,
         unnorm_diffusion_trajectory: torch.Tensor,
-        # (B, Pnn, 1+T, 4) [x,y,cos,sin] (세계/ego 프레임)
-        unnorm_cur_future_control: torch.Tensor,
-        # (B, Pnn, 1+T, 3) [v_x^w,v_y^w, w]
-        near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T)    (bool/0-1)
-    ) -> torch.Tensor:  # (B, Pnn, T, 3)   [v_x^b, v_y^b, w]_mid
-        """구간 [t_k, t_{k+1})의 **중점(midpoint) 제어**를 계산한다.
+        # (B, Pnn, 1+future_len, 4) = [x, y, cos, sin] (현재~미래 구간)
+        unnorm_near_past_xyyaw: Optional[torch.Tensor],
+        # (B, Pnn, past_len, 4) = [x, y, cos, sin] (과거 구간) 또는 None
+        unnorm_points_world_control: torch.Tensor,
+        # (B, Pnn, point_len, 3) = [v_x^w, v_y^w, w]  (savgol_filter_for_control 출력)
+        near_past_cur_future_valid: torch.Tensor,
+        # (B, Pnn, time_len(=1+past_len) + future_len) bool  # 과거~현재~미래 노드 유효 마스크
+    ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)  [v_x^b, v_y^b, w]_mid
+        """구간 [t_k, t_{k+1})마다 중점(midpoint) 제어 [v_x^b, v_y^b, w]를 계산한다.
 
-        논리/수식
-        --------
-        - 입력 속도 [v_x, v_y]는 **세계(ego) 프레임** 기준이라고 가정.
-        - 서로 다른 시점의 body 프레임이 회전하므로,
-            중간 속도는 **세계 프레임에서 두 끝점 속도를 가중 평균**하고,
-            그 후 **중간 yaw(두 끝점의 cos/sin 가중 평균 → 정규화)** 으로 **몸체 프레임으로 회전**한다.
-        - 요각속도 w는 세계 프레임 스칼라이므로 **끝점 가중 평균**으로 충분.
-        - 유효성 마스크는 구간 양 끝점에 대해 가중치로 활용(둘 다 무효면 0).
-
-        Args:
-            unnorm_diffusion_trajectory: (B,Pnn,1+T,4) = [x, y, cos, sin] (세계/ego 기준)
-            unnorm_cur_future_control:   (B,Pnn,1+T,3) = [v_x^w, v_y^w, w] (세계 기준)
-            near_cur_future_valid:       (B,Pnn,1+T)   = True/False
-
-        Returns:
-            torch.Tensor: (B,Pnn,T,3) = [v_x^b_mid, v_y^b_mid, w_mid]
+        segment_len = point_len - 1 이고,
+        point_len 은 `_prepare_midpoint_inputs`가 반환하는 값에 따라
+        - past 없음:  point_len = 1 + future_len → segment_len = future_len
+        - past 있음: point_len = past_len + 1 + future_len → segment_len = past_len + future_len
+        로 결정된다.
         """
+        # 1) 포인트/제어/마스크를 하나의 타임라인 기준으로 정리
+        (
+            unnorm_points_xyyaw,  # (B, Pnn, point_len, 4)
+            unnorm_points_world_control_aligned,  # (B, Pnn, point_len, 3)
+            points_valid,  # (B, Pnn, point_len) bool
+            point_len,  # int
+        ) = self._prepare_midpoint_inputs(
+            unnorm_diffusion_trajectory=
+            unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+            unnorm_near_past_xyyaw=
+            unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+            unnorm_points_world_control=
+            unnorm_points_world_control,  # (B, Pnn, point_len, 3)
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
+        )
 
-        B, Pnn, T1, _ = unnorm_diffusion_trajectory.shape
-        if T1 < 2:
-            # 중점이 성립하려면 최소 2 스텝 필요
-            raise ValueError("타임스텝이 2 미만이면 중점 제어를 계산할 수 없습니다.")
+        if point_len < 2:
+            raise ValueError("포인트 개수가 2개 미만이면 중점 제어를 계산할 수 없습니다.")
+
         eps = 1e-6
 
-        # ---- 입력 분해
-        cos_all = unnorm_diffusion_trajectory[..., 2]  # (B,Pnn,T1)
-        sin_all = unnorm_diffusion_trajectory[..., 3]  # (B,Pnn,T1)
-        v_w = unnorm_cur_future_control[..., :2]  # (B,Pnn,T1,2) = [vx^w,vy^w]
-        omega = unnorm_cur_future_control[..., 2]  # (B,Pnn,T1)
-        valid = (near_cur_future_valid
-                 > 0).to(v_w.dtype)  # (B,Pnn,T1) as float {0,1}
+        # 2) 노드 / 제어 성분 분解
+        (
+            cos_all,  # (B, Pnn, point_len)
+            sin_all,  # (B, Pnn, point_len)
+            v_x_all,  # (B, Pnn, point_len)
+            v_y_all,  # (B, Pnn, point_len)
+            omega_all  # (B, Pnn, point_len)
+        ) = self._split_midpoint_nodes_and_controls(
+            unnorm_points_xyyaw=unnorm_points_xyyaw,  # (B, Pnn, point_len, 4)
+            unnorm_points_world_control=
+            unnorm_points_world_control_aligned,  # (B, Pnn, point_len, 3)
+        )
 
-        # 좌/우 끝점 쪼개기
-        v_x_start_w, v_y_start_w = v_w[..., :-1, 0], v_w[..., :-1,
-                                                         1]  # (B,Pnn,T)
-        v_x_end_w, v_y_end_w = v_w[..., 1:, 0], v_w[..., 1:, 1]  # (B,Pnn,T)
-        start_valid, end_valid = valid[..., :-1], valid[..., 1:]  # (B,Pnn,T)
-        omega_start, omega_end = omega[..., :-1], omega[..., 1:]  # (B,Pnn,T)
+        # 3) 세그먼트 유효 마스크(시작/끝/구간) 계산
+        start_valid, end_valid, seg_valid = self._build_midpoint_segment_valid_masks(
+            points_valid=points_valid,  # (B, Pnn, point_len) bool
+            value_dtype=v_x_all.dtype,
+        )  # 모두 (B, Pnn, segment_len)
 
-        # ---- 세계 프레임에서 속도 중점(가중 평균)
-        # (B,Pnn,T)
-        v_x_mid_w = self._weighted_avg_two(
-            v_x_start_w,  # (B,Pnn,T)
-            v_x_end_w,  # (B,Pnn,T)
-            start_valid,  # (B,Pnn,T)
-            end_valid,  # (B,Pnn,T)
-            eps=eps)
-        v_y_mid_w = self._weighted_avg_two(
-            v_y_start_w,  # (B,Pnn,T)
-            v_y_end_w,  # (B,Pnn,T)
-            start_valid,  # (B,Pnn,T)
-            end_valid,  # (B,Pnn,T)
-            eps=eps)  # (B,Pnn,T)
+        # 4) 세계 프레임 중점 속도/각속도 계산
+        v_x_mid_w, v_y_mid_w, omega_mid = self._compute_midpoint_world_values(
+            v_x_all=v_x_all,  # (B, Pnn, point_len)
+            v_y_all=v_y_all,  # (B, Pnn, point_len)
+            omega_all=omega_all,  # (B, Pnn, point_len)
+            start_valid=start_valid,  # (B, Pnn, segment_len)
+            end_valid=end_valid,  # (B, Pnn, segment_len)
+            eps=eps,
+        )  # (B, Pnn, segment_len) 각각
 
-        # ---- 중간 yaw (cos/sin 가중평균 → 정규화)
-        cos_start, sin_start = cos_all[..., :-1], sin_all[..., :-1]  # (B,Pnn,T)
-        cos_end, sin_end = cos_all[..., 1:], sin_all[..., 1:]  # (B,Pnn,T)
-        # (B,Pnn,T)
+        # 5) 중간 yaw(cos/sin) 계산
+        cos_mid, sin_mid = self._compute_midpoint_yaw_from_cos_sin(
+            cos_all=cos_all,  # (B, Pnn, point_len)
+            sin_all=sin_all,  # (B, Pnn, point_len)
+            start_valid=start_valid,  # (B, Pnn, segment_len)
+            end_valid=end_valid,  # (B, Pnn, segment_len)
+            eps=eps,
+        )  # (B, Pnn, segment_len) 각각
+
+        # 6) 세계 → 바디 프레임 회전 + 무효 구간 마스킹
+        unnorm_seg_body_control = self._rotate_midpoint_world_to_body_and_apply_mask(
+            v_x_mid_world=v_x_mid_w,  # (B, Pnn, segment_len)
+            v_y_mid_world=v_y_mid_w,  # (B, Pnn, segment_len)
+            omega_mid=omega_mid,  # (B, Pnn, segment_len)
+            cos_mid=cos_mid,  # (B, Pnn, segment_len)
+            sin_mid=sin_mid,  # (B, Pnn, segment_len)
+            seg_valid=seg_valid,  # (B, Pnn, segment_len)
+        )  # (B, Pnn, segment_len, 3)
+
+        return unnorm_seg_body_control
+
+    # <추가하자>
+    def _build_midpoint_segment_valid_masks(
+        self,
+        points_valid: torch.Tensor,  # (B, Pnn, point_len) bool
+        value_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """중점 제어 계산용 세그먼트 유효 마스크를 생성합니다.
+
+        Args:
+            points_valid: (B, Pnn, point_len) bool
+                각 노드(x,y,cos,sin)가 유효한지 여부.
+            value_dtype: torch.dtype
+                v_x, v_y 등과 맞추기 위한 dtype (float32/float16 등)
+
+        Returns:
+            start_valid: (B, Pnn, segment_len)  # 왼쪽 끝 노드 유효 여부 (float)
+            end_valid:   (B, Pnn, segment_len)  # 오른쪽 끝 노드 유효 여부 (float)
+            seg_valid:   (B, Pnn, segment_len)  # 두 끝 모두 유효한 세그먼트(0/1 float)
+        """
+        # points_valid: (B, Pnn, point_len),  segment_len = point_len - 1
+        valid_bool = points_valid.to(torch.bool)
+        start_valid_bool = valid_bool[..., :-1]  # (B, Pnn, segment_len)
+        end_valid_bool = valid_bool[..., 1:]  # (B, Pnn, segment_len)
+        seg_valid_bool = start_valid_bool & end_valid_bool  # (B, Pnn, segment_len)
+
+        start_valid = start_valid_bool.to(value_dtype)
+        end_valid = end_valid_bool.to(value_dtype)
+        seg_valid = seg_valid_bool.to(value_dtype)
+
+        return start_valid, end_valid, seg_valid
+
+    # <추가하자>
+    def _rotate_midpoint_world_to_body_and_apply_mask(
+            self,
+            v_x_mid_world: torch.Tensor,  # (B, Pnn, segment_len)
+            v_y_mid_world: torch.Tensor,  # (B, Pnn, segment_len)
+            omega_mid: torch.Tensor,  # (B, Pnn, segment_len)
+            cos_mid: torch.Tensor,  # (B, Pnn, segment_len)
+            sin_mid: torch.Tensor,  # (B, Pnn, segment_len)
+            seg_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
+    ) -> torch.Tensor:
+        """세계 속도 중점 + 중간 yaw → 바디 프레임 중점 제어로 변환하고, 무효 구간은 0으로 마스킹한다.
+
+        Returns:
+            unnorm_seg_body_control: (B, Pnn, segment_len, 3)
+        """
+        vxb_mid, vyb_mid = self._world_to_body(
+            v_x_mid_world,  # (B, Pnn, segment_len)
+            v_y_mid_world,  # (B, Pnn, segment_len)
+            cos_mid,  # (B, Pnn, segment_len)
+            sin_mid,  # (B, Pnn, segment_len)
+        )
+
+        vxb_mid = vxb_mid * seg_valid
+        vyb_mid = vyb_mid * seg_valid
+        omega_mid = omega_mid * seg_valid
+
+        unnorm_seg_body_control = torch.stack(
+            [vxb_mid, vyb_mid, omega_mid],
+            dim=-1,
+        )  # (B, Pnn, segment_len, 3)
+
+        return unnorm_seg_body_control
+
+    # <추가하자>
+    def _compute_midpoint_yaw_from_cos_sin(
+        self,
+        cos_all: torch.Tensor,  # (B, Pnn, point_len)
+        sin_all: torch.Tensor,  # (B, Pnn, point_len)
+        start_valid: torch.Tensor,  # (B, Pnn, segment_len)
+        end_valid: torch.Tensor,  # (B, Pnn, segment_len)
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """두 끝점의 cos/sin과 유효 마스크로 중간 yaw의 cos/sin을 계산한다.
+
+        Returns:
+            cos_mid: (B, Pnn, segment_len)
+            sin_mid: (B, Pnn, segment_len)
+        """
+        cos_start = cos_all[..., :-1]  # (B, Pnn, segment_len)
+        cos_end = cos_all[..., 1:]  # (B, Pnn, segment_len)
+        sin_start = sin_all[..., :-1]  # (B, Pnn, segment_len)
+        sin_end = sin_all[..., 1:]  # (B, Pnn, segment_len)
+
+        # cos_mid: (B, Pnn, segment_len)
         cos_mid = self._weighted_avg_two(
-            cos_start,  # (B,Pnn,T)
-            cos_end,  # (B,Pnn,T)
-            start_valid,  # (B,Pnn,T)
-            end_valid,  # (B,Pnn,T)
-            eps=eps)
-        sin_mid = self._weighted_avg_two(sin_start, sin_end, start_valid,
-                                         end_valid)
+            cos_start,  # (B, Pnn, segment_len)
+            cos_end,  # (B, Pnn, segment_len)
+            start_valid,  # (B, Pnn, segment_len)
+            end_valid,  # (B, Pnn, segment_len)
+            eps=eps)  # (B, Pnn, segment_len)
+
+        # sin_mid: (B, Pnn, segment_len)
+        sin_mid = self._weighted_avg_two(
+            sin_start,  # (B, Pnn, segment_len)
+            sin_end,  # (B, Pnn, segment_len)
+            start_valid,  # (B, Pnn, segment_len)
+            end_valid,  # (B, Pnn, segment_len)
+            eps=eps)  # (B, Pnn, segment_len)
+
         norm = (cos_mid * cos_mid + sin_mid * sin_mid).clamp_min(eps).sqrt()
         cos_mid = cos_mid / norm
         sin_mid = sin_mid / norm
 
-        # ---- 세계→바디 회전
-        vxb_mid, vyb_mid = self._world_to_body(v_x_mid_w, v_y_mid_w, cos_mid,
-                                               sin_mid)  # (B,Pnn,T)
+        return cos_mid, sin_mid
 
-        # ---- w 중점(가중 평균, 스칼라)
+    # <추가하자>
+    def _compute_midpoint_world_values(
+        self,
+        v_x_all: torch.Tensor,  # (B, Pnn, point_len)
+        v_y_all: torch.Tensor,  # (B, Pnn, point_len)
+        omega_all: torch.Tensor,  # (B, Pnn, point_len)
+        start_valid: torch.Tensor,  # (B, Pnn, segment_len)
+        end_valid: torch.Tensor,  # (B, Pnn, segment_len)
+        eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """세계 프레임에서 중점 v_x^w, v_y^w, w 를 계산한다.
+
+        Returns:
+            v_x_mid_w: (B, Pnn, segment_len)
+            v_y_mid_w: (B, Pnn, segment_len)
+            omega_mid: (B, Pnn, segment_len)
+        """
+        # 구간 양 끝점 값
+        v_x_start_w = v_x_all[..., :-1]  # (B, Pnn, segment_len)
+        v_x_end_w = v_x_all[..., 1:]  # (B, Pnn, segment_len)
+        v_y_start_w = v_y_all[..., :-1]  # (B, Pnn, segment_len)
+        v_y_end_w = v_y_all[..., 1:]  # (B, Pnn, segment_len)
+
+        omega_start = omega_all[..., :-1]  # (B, Pnn, segment_len)
+        omega_end = omega_all[..., 1:]  # (B, Pnn, segment_len)
+
+        # v_x_mid_w: (B, Pnn, segment_len)
+        v_x_mid_w = self._weighted_avg_two(
+            v_x_start_w,  # (B, Pnn, segment_len)
+            v_x_end_w,  # (B, Pnn, segment_len)
+            start_valid,  # (B, Pnn, segment_len)
+            end_valid,  # (B, Pnn, segment_len)
+            eps=eps)  # (B, Pnn, segment_len)
+
+        # v_y_mid_w: (B, Pnn, segment_len)
+        v_y_mid_w = self._weighted_avg_two(
+            v_y_start_w,  # (B, Pnn, segment_len)
+            v_y_end_w,  # (B, Pnn, segment_len)
+            start_valid,  # (B, Pnn, segment_len)
+            end_valid,  #
+            eps=eps)  # (B, Pnn, segment_len)
+
+        # omega_mid: (B, Pnn, segment_len)
         omega_mid = self._weighted_avg_two(
-            omega_start,  # (B,Pnn,T)
-            omega_end,  # (B,Pnn,T)
-            start_valid,  # (B,Pnn,T)
-            end_valid,  # (B,Pnn,T)
-            eps=eps)  # (B,Pnn,T)
+            omega_start,  # (B, Pnn, segment_len)
+            omega_end,  # (B, Pnn, segment_len)
+            start_valid,  # (B, Pnn, segment_len)
+            end_valid,  # (B, Pnn, segment_len)
+            eps=eps)  # (B, Pnn, segment_len)
 
-        seg_is_valid = ((start_valid > 0) & (end_valid > 0)).to(vxb_mid.dtype)
-        vxb_mid = vxb_mid * seg_is_valid
-        vyb_mid = vyb_mid * seg_is_valid
-        omega_mid = omega_mid * seg_is_valid
-
-        # (B,Pnn,T,3)로 합치기
-        return torch.stack([vxb_mid, vyb_mid, omega_mid], dim=-1)
-
-    def forward(
-            self,
-            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T)  bool
-            diffusion_trajectory: torch.
-        Tensor,  # (B, Pnn, 1+T, 4) [x,y,cos,sin]
-            cur_future_seg_body_control: torch.
-        Tensor,  # (B, Pnn, T, 3)   U_base (정규화)
-            dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
-    ) -> torch.Tensor:  # (B, Pnn, T, 3)   U_ref (정규화)
-        """Control Correction Network 전체 경로를 짧게 연결.
-        파이프라인:
-            mask → prev/fut 분리(+unit-circle) → feature concat → Stem → TCN →
-            Head+Gate → U_base와 잔차 결합
-        """
-        if not self.use_feasible_train:
-            return cur_future_seg_body_control
-
-        self._assert_prefix_valid_mask(near_cur_future_valid, context="forward")
-
-        # 1) 마스크
-        """
-            - seg_mask: (B, Pnn, T) float(0/1)
-            - seg_mask_1: (B, Pnn, T, 1)  → 브로드캐스트 편의를 위한 채널 차원 추가
-        """
-        seg_mask, seg_mask_1 = self._build_segment_mask(near_cur_future_valid)
-
-        # 2) 입력 분해 + 단위원 재투영
-        # (B, Pnn, T, 4)  ← t_k # (B, Pnn, T, 4)  ← t_{k+1}
-        x_prev, x_fut = self._split_prev_fut(
-            diffusion_trajectory)  # diffusion_trajectory: (B, Pnn, 1+T, 4)
-        x_prev = self._normalize_cos_sin(x_prev)
-        x_fut = self._normalize_cos_sin(x_fut)
-
-        # 3) 피처 인코딩
-        # Z_in: (B, Pnn, T, 192)
-        Z_in = self._features_from_inputs(
-            x_prev=x_prev,  # (B, Pnn, T, 4)
-            x_fut=x_fut,  # (B, Pnn, T, 4)
-            u_base=cur_future_seg_body_control,  # (B, Pnn, T, 3)
-            dit_final_hidden_tokens=dit_final_hidden_tokens,  # (B, Pnn, H)
-            near_cur_future_valid=near_cur_future_valid,  # (B, Pnn, 1+T)
-        )
-
-        # 4) Stem → 5) TCN
-        # Z_s: (B, Pnn, T, 192)
-        Z_s = self._prepare_tcn_input(
-            Z_in, seg_mask_1)  # (B, Pnn, T, 192) # (B, Pnn, T, 1)
-        # Z_tcn: (B, Pnn, T, 192)
-        Z_tcn = self._run_tcn(
-            Z_s, seg_mask,
-            seg_mask_1)  # (B, Pnn, T, 192) # (B, Pnn, T) # (B, Pnn, T, 1)
-
-        # 6) ΔU 예측 → 7) 결합
-        # delta_u: (B, Pnn, T, 3)
-        delta_u = self._predict_delta_u(Z_tcn, seg_mask_1)
-        # u_ref: (B, Pnn, T, 3)
-        u_ref = cur_future_seg_body_control + delta_u
-        return u_ref
+        return v_x_mid_w, v_y_mid_w, omega_mid
 
     # ------------------------------
     # 내부: mask‑aware depthwise conv (정규화 합성곱)
@@ -892,11 +1124,11 @@ class FeasibleProjector(nn.Module):
     # =========================================================
     def _features_from_inputs(
             self,
-            x_prev: torch.Tensor,  # (B, Pnn, T, 4)
-            x_fut: torch.Tensor,  # (B, Pnn, T, 4)
-            u_base: torch.Tensor,  # (B, Pnn, T, 3)
+            x_prev: torch.Tensor,  # (B, Pnn, segment_len, 4)
+            x_fut: torch.Tensor,  # (B, Pnn, segment_len, 4)
+            u_base: torch.Tensor,  # (B, Pnn, segment_len, 3)
             dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
-            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T)
+            points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len)
     ) -> torch.Tensor:
         """입력을 통일 피처 Z_in으로 변환.
 
@@ -904,26 +1136,27 @@ class FeasibleProjector(nn.Module):
             prev/fut 인코딩(48) + control 어댑터(32) + trunk 압축(64) → concat(192)
 
         Args:
-            x_prev (torch.Tensor): (B, Pnn, T, 4)
-            x_fut (torch.Tensor): (B, Pnn, T, 4)
-            u_base (torch.Tensor): (B, Pnn, T, 3)
+            x_prev (torch.Tensor): (B, Pnn, segment_len, 4)
+            x_fut (torch.Tensor): (B, Pnn, segment_len, 4)
+            u_base (torch.Tensor): (B, Pnn, segment_len, 3)
             dit_final_hidden_tokens (torch.Tensor): (B, Pnn, H)
 
         Returns:
-            torch.Tensor: (B, Pnn, T, 192)  = Z_in
+            torch.Tensor: (B, Pnn, segment_len, 192)  = Z_in
         """
         # 함수 본문 초입에 추가
-        valid = near_cur_future_valid.to(x_prev.dtype)  # (B,Pnn,1+T)  # 추가 요망!
-        start_valid = valid[..., :-1].unsqueeze(-1)  # (B,Pnn,T,1)  # 추가 요망!
-        end_valid = valid[..., 1:].unsqueeze(-1)  # (B,Pnn,T,1)  # 추가 요망!
+        valid = points_valid.to(x_prev.dtype)  # (B,Pnn,1+segment_len)  # 추가 요망!
+        start_valid = valid[..., :-1].unsqueeze(
+            -1)  # (B,Pnn,segment_len,1)  # 추가 요망!
+        end_valid = valid[...,
+                          1:].unsqueeze(-1)  # (B,Pnn,segment_len,1)  # 추가 요망!
 
         # prev/fut 노드 유효성으로 입력 자체 0화 (LN/Linear 이전 차단)
         x_prev = x_prev * start_valid  # 추가 요망!
         x_fut = x_fut * end_valid  # 추가 요망!
 
         # 세그먼트 유효성(AND)로 u_base 0화
-        seg_mask, seg_mask_1 = self._build_segment_mask(
-            near_cur_future_valid)  # 추가 요망!
+        seg_mask, seg_mask_1 = self._build_segment_mask(points_valid)  # 추가 요망!
         seg_mask_1 = seg_mask_1.to(u_base.dtype)  # 추가 요망!
 
         if self.detach_state_and_u_for_ctrl_losses:  # 추가 필요
@@ -933,18 +1166,42 @@ class FeasibleProjector(nn.Module):
         else:
             u_base_in = u_base * seg_mask_1
 
-        feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,T,48)
-        feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,T,48)
-        feat_u = self.control_adapter(u_base_in)  # (B,Pnn,T,32)
+        feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,segment_len,48)
+        feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,segment_len,48)
+        feat_u = self.control_adapter(u_base_in)  # (B,Pnn,segment_len,32)
         # dit_final_hidden_tokens: (B,Pnn,H)
         # trunk: (B,Pnn,64)
         trunk = self.trunk_compressor(dit_final_hidden_tokens.detach())
         trunk_rep = trunk.unsqueeze(2).expand(-1, -1, x_prev.size(2),
-                                              -1)  # (B,Pnn,T,64)
+                                              -1)  # (B,Pnn,segment_len,64)
 
         Z_in = torch.cat([feat_prev, feat_fut, feat_u, trunk_rep],
-                         dim=-1)  # (B,Pnn,T,192)
+                         dim=-1)  # (B,Pnn,segment_len,192)
         return Z_in
+
+    def _split_midpoint_nodes_and_controls(
+        self,
+        unnorm_points_xyyaw: torch.Tensor,  # (B, Pnn, point_len, 4)
+        unnorm_points_world_control: torch.Tensor,  # (B, Pnn, point_len, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
+        """중점 제어 계산 전, 포인트 단위 성분을 분해한다.
+
+        Returns:
+            cos_all:   (B, Pnn, point_len)
+            sin_all:   (B, Pnn, point_len)
+            v_x_all:   (B, Pnn, point_len)
+            v_y_all:   (B, Pnn, point_len)
+            omega_all: (B, Pnn, point_len)
+        """
+        cos_all = unnorm_points_xyyaw[..., 2]  # (B, Pnn, point_len)
+        sin_all = unnorm_points_xyyaw[..., 3]  # (B, Pnn, point_len)
+
+        v_x_all = unnorm_points_world_control[..., 0]  # (B, Pnn, point_len)
+        v_y_all = unnorm_points_world_control[..., 1]  # (B, Pnn, point_len)
+        omega_all = unnorm_points_world_control[..., 2]  # (B, Pnn, point_len)
+
+        return cos_all, sin_all, v_x_all, v_y_all, omega_all
 
     # =========================================================
     # [C] Stem / TCN 백본
@@ -1517,8 +1774,8 @@ class FeasibleProjector(nn.Module):
 
         Returns:
             Tuple:
-                - unnorm_integrated_trajectory: (B,Pnn,T,4)  # 노드 기반 → mask_node[...,1:]로 마스킹
-                - unnorm_control_constraint_diff: (B,Pnn,T,3)  # 구간 기반 → mask_interval로 마스킹
+                - unnorm_integrated_trajectory: (B,Pnn,future_len,4)  # 노드 기반 → mask_node[...,1:]로 마스킹
+                - unnorm_control_constraint_diff: (B,Pnn,future_len,3)  # 구간 기반 → mask_interval로 마스킹
         """
         # --- 상태 조립(노드 기반) ---
         x_next, y_next = key_to_all_states["x_next"], key_to_all_states[
@@ -1616,39 +1873,40 @@ class FeasibleProjector(nn.Module):
     def filter_and_integrate(
             self,
             unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
-            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T) bool
-            unnorm_cur_future_seg_body_control: torch.Tensor,  # (B, Pnn, T, 3)
+            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
+            unnorm_cur_future_seg_body_control: torch.
+        Tensor,  # (B, Pnn, future_len, 3)
             near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self._assert_prefix_valid_mask(near_cur_future_valid,
-                                       context="filter_and_integrate")
-        B, Pnn, T, _ = unnorm_cur_future_seg_body_control.shape
+        self._assert_cur_future_valid_mask(near_cur_future_valid,
+                                           context="filter_and_integrate")
+        B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
         device = unnorm_cur_future_seg_body_control.device
         dtype = unnorm_cur_future_seg_body_control.dtype
-        if T == 0:
-            raise ValueError("T=0: 적분할 미래 세그먼트가 없습니다.")
+        if future_len == 0:
+            raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
             # 맨 앞에 추가
         if self.detach_state_and_u_for_ctrl_losses:  # 추가 필요
             unnorm_near_current_state = unnorm_near_current_state.detach(
             )  # 추가 필요
         """ key_to_limit_bp
         Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn) 
-        
+
         v_max/a_max/alpha_max/a_lat_max/R_min
         /omega_abs_max/a_x_max/a_y_max, is_nonholonomic
         """
         key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
             near_class_one_hot, device=device, dtype=dtype)
-        # (B,Pnn,T)
+        # (B,Pnn,future_len)
         vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
             unnorm_cur_future_seg_body_control)
         """ key_to_all_states
-        x_next / y_next / cos_next / sin_next: (B,Pnn,T)
-        vx_after / vy_after / omega_after: (B,Pnn,T)
+        x_next / y_next / cos_next / sin_next: (B,Pnn,future_len)
+        vx_after / vy_after / omega_after: (B,Pnn,future_len)
         """
         key_to_all_states: Dict[str,
                                 torch.Tensor] = self._init_integration_buffers(
-                                    B, Pnn, T, dtype, device)
+                                    B, Pnn, future_len, dtype, device)
 
         x_k = unnorm_near_current_state[..., 0]  # (B,Pnn)
         y_k = unnorm_near_current_state[..., 1]  # (B,Pnn)
@@ -1659,7 +1917,7 @@ class FeasibleProjector(nn.Module):
         omega_prev = torch.zeros((B, Pnn), device=device,
                                  dtype=dtype)  # (B,Pnn)
 
-        for k in range(T):
+        for k in range(future_len):
             apply_S2_k = (k > 0)
             apply_S4_ax_k = (k > 0)
 
@@ -1703,14 +1961,14 @@ class FeasibleProjector(nn.Module):
             x_k, y_k, cos_yaw_k, sin_yaw_k = x_k1, y_k1, cos_k1, sin_k1
             vx_b_prev, vy_b_prev, omega_prev = vx_b_k, vy_b_k, yaw_rate_k
         """ key_to_all_states
-        x_next / y_next / cos_next / sin_next: (B,Pnn,T)
-        vx_after / vy_after / omega_after: (B,Pnn,T)
-        
-        vx_b_raw: (B,Pnn,T)
-        vy_b_raw: (B,Pnn,T)
-        omega_raw: (B,Pnn,T)
-        
-        near_cur_future_valid: (B,Pnn,1+T) bool
+        x_next / y_next / cos_next / sin_next: (B,Pnn,future_len)
+        vx_after / vy_after / omega_after: (B,Pnn,future_len)
+
+        vx_b_raw: (B,Pnn,future_len)
+        vy_b_raw: (B,Pnn,future_len)
+        omega_raw: (B,Pnn,future_len)
+
+        near_cur_future_valid: (B,Pnn,1+future_len) bool
         """
         return self._assemble_outputs(key_to_all_states, vx_b_raw, vy_b_raw,
                                       omega_raw, near_cur_future_valid)
@@ -1863,11 +2121,78 @@ class FeasibleProjector(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """왼/가운데/오른쪽 구간에 쓸 위치별 SG 미분 가중치 뱅크 생성(+캐시된 항목 재사용).
 
+1. **창 크기(한 번에 볼 점 개수)**를 정하고,
+   그 창 안에서 각 위치(맨 앞, 중간, 맨 뒤)에 맞는
+   **“기울기 계산용 레시피(섞는 비율표)”**를 전부 만든다.
+
+2. 이 비율표는 단순히 길이(창 크기)만 담는 게 아니라,
+
+   * 앞/중간/뒤 **어디에서 쓰는지**
+   * **얼마나 부드럽게/날카롭게** 기울기를 잡을지
+   * **시간 간격이 얼마인지**
+     같은 조건을 모두 반영해서 숫자가 결정된 레시피다.
+
+3. 이렇게 만든 레시피들을
+
+   * 앞부분용 묶음
+   * 가운데 공통 하나
+   * 뒷부분용 묶음
+     세 덩어리로 정리해 둔다.
+
+4. 나중에 실제 기울기를 구할 때는
+   **그래프 위치(앞·중간·뒤)에 맞는 레시피를 바로 꺼내 써서**
+   빠르고 안정적으로 기울기를 계산한다.
+
+5. 같은 조건으로 계속 쓸 일이 많으니,
+   한 번 만든 레시피 묶음을 **작은 저장소(캐시)에 기억해 뒀다가**
+   재사용해서 **속도와 일관성을 챙기는 역할**까지 한다.
+
+
         Returns:
             w_left_bank:  (half, W)    # m=0..half-1
             w_center:     (W,)         # m=half
             w_right_bank: (half, W)    # m=half..W-1
             half:         int
+
+짧게 말하면, 이 네 개는 **“어디에서 쓸 비율표(레시피)냐”를 나눠서 들고 있는 패키지**야.
+
+* `W` : 한 번에 보는 점 개수(창 크기)
+* `half` : 그 창의 절반 정도 위치 (대충 “앞쪽·뒤쪽 경계”를 나누는 기준)
+
+각 값의 의미는:
+
+1. **`w_left_bank: (half, W)`**
+   → **그래프 맨 앞쪽 근처에서 쓸 레시피들 묶음**
+
+   * `half`줄이 있고, 각 줄이 길이 `W`짜리 비율표야.
+   * “맨 앞 점에서 기울기 계산할 때는 이렇게 섞어라”,
+     “그 다음 점은 이렇게 섞어라” … 이런 식으로 **앞부분 여러 위치용 레시피**가 들어 있음.
+
+2. **`w_center: (W,)`**
+   → **그래프 중간 대부분에서 공통으로 쓰는 레시피 하나**
+
+   * 한 줄짜리, 길이 `W`인 비율표.
+   * 중간 구간은 상황이 비슷해서, 이 하나로 쭉 써도 충분해서 하나만 둔 것.
+
+3. **`w_right_bank: (half, W)`**
+   → **그래프 맨 끝쪽 근처에서 쓸 레시피들 묶음**
+
+   * 이것도 `half`줄 × `W`길이.
+   * “맨 끝에서 한 칸 안쪽 점은 이렇게 섞어라”,
+     “그 앞 점은 이렇게 섞어라” … 같은 **끝부분 위치용 레시피**가 들어 있음.
+
+4. **`half: int`**
+   → “앞쪽 전용 레시피 몇 개 / 뒤쪽 전용 레시피 몇 개를 쓸지”를 알려주는 숫자.
+
+   * 보통 `half = W // 2` 정도라서,
+     앞에서 `half`개, 뒤에서 `half`개, 가운데는 `w_center` 하나로 커버하는 구조라고 보면 돼.
+
+요약하면:
+
+> 그래프 **앞·중간·뒤**에서 기울기를 계산할 때,
+> 각 구간에 맞게 점들을 “어떻게 섞을지” 정해 놓은
+> **왼쪽용 레시피 묶음, 가운데용 레시피 하나, 오른쪽용 레시피 묶음 + 그 개수 정보**라고 보면 된다.
+
         """
         W = self._choose_window_length(T, polyorder, max_window_length)
         if W < 3:
@@ -1914,10 +2239,9 @@ class FeasibleProjector(nn.Module):
                 0, W, device=device, dtype=dtype)  # (half, W)
         return w_left_bank, w_center, w_right_bank, half
 
-    # [수정 요망] 기존 _sg_derivative_full_rows 를 벡터화로 교체
     def _sg_derivative_full_rows(
         self,
-        seq_bT: torch.Tensor,  # (N_full, T)
+        seq_bT: torch.Tensor,  # (N_full, point_len)
         dt: float,
         polyorder: int,
         max_window_length: int,
@@ -1926,10 +2250,15 @@ class FeasibleProjector(nn.Module):
         if seq_bT.numel() == 0:
             return seq_bT
         device, dtype = seq_bT.device, seq_bT.dtype
-        N, T = seq_bT.shape
-
+        N, point_len = seq_bT.shape
+        """
+            w_left_bank:  (half, W)    # m=0..half-1
+            w_center:     (W,)         # m=half
+            w_right_bank: (half, W)    # m=half..W-1
+            half:         int
+        """
         w_left_bank, w_center, w_right_bank, half = self._build_poswise_weight_banks_cached(
-            T=T,
+            T=point_len,
             polyorder=polyorder,
             max_window_length=max_window_length,
             dt=dt,
@@ -1945,9 +2274,10 @@ class FeasibleProjector(nn.Module):
         X_left = seq_bT[:, :W]  # (N, W)
         left = X_left @ w_left_bank.transpose(0, 1)  # (N, half)
 
-        # 2) 가운데: unfold 슬라이딩 창 × 중앙 가중치 → (N, T-2*half)
-        X_mid = seq_bT.unfold(dimension=-1, size=W, step=1)  # (N, T-W+1, W)
-        mid = (X_mid * w_center.view(1, 1, W)).sum(-1)  # (N, T-W+1)
+        # 2) 가운데: unfold 슬라이딩 창 × 중앙 가중치 → (N, point_len-2*half)
+        X_mid = seq_bT.unfold(dimension=-1, size=W,
+                              step=1)  # (N, point_len-W+1, W)
+        mid = (X_mid * w_center.view(1, 1, W)).sum(-1)  # (N, point_len-W+1)
 
         # 3) 오른쪽: 마지막 윈도(공통) × 위치별 가중치(half개) → (N, half)
         X_right = seq_bT[:, -W:]  # (N, W)
@@ -1955,80 +2285,82 @@ class FeasibleProjector(nn.Module):
 
         # 4) 조립
         dx[:, :half] = left
-        dx[:, half:T - half] = mid
-        dx[:, T - half:T] = right
+        dx[:, half:point_len - half] = mid
+        dx[:, point_len - half:point_len] = right
         return dx
 
-    # [수정 요망] 기존 _sg_derivative_partial_rows 개선
     def _sg_derivative_partial_rows(
         self,
-        seq_bT: torch.Tensor,  # (N_partial, T)
-        valid_bT: torch.Tensor,  # (N_partial, T) True=유효
+        seq_bT: torch.Tensor,  # (N_partial, point_len)
+        valid_bT: torch.Tensor,  # (N_partial, point_len) True=유효
         dt: float,
         polyorder: int,
         max_window_length: int,
     ) -> torch.Tensor:
-        """일부만 유효한 row들을 '유효길이 L'별로 묶어 배치 벡터화."""
+        """'단일 유효 블록(연속 True)' 가정 하에, 각 row의 유효 구간에만 SG 미분을 적용.
+
+        - (현재→미래)의 1*0* 패턴, (과거→현재→미래)의 0*1*0* 패턴 모두 지원.
+        - 유효 블록이 없으면 0을 반환.
+        - 유효 블록이 여러 덩어리면 예외 발생(사전 마스크 검증 위배).
+        """
         if seq_bT.numel() == 0:
             return seq_bT
-        device, dtype = seq_bT.device, seq_bT.dtype
+        N, _ = seq_bT.shape
+
         dx = torch.zeros_like(seq_bT)
 
-        # 내부 구멍 금지(0→1 전이 금지)
-        v = valid_bT.to(torch.int8)
-        d = v[:, 1:] - v[:, :-1]
-        if (d > 0).any():
-            raise ValueError("[_sg_derivative_partial_rows] 내부 구멍(0→1 전이) 발견.")
-
-        eff_len = valid_bT.sum(dim=1)  # (N_partial,)
-        unique_L = torch.unique(eff_len)
-        for L in unique_L.tolist():
-            if L <= 0:
-                continue
-            sel = (eff_len == L)  # (N_partial,)
-            rows = seq_bT[sel][:, :L]  # (M, L)
-            drows = self._sg_derivative_full_rows(  # (M, L)
-                rows,
+        # 과거·현재(0*1*), 현재·미래(1*0*)의 **사전 검증**은 호출부에서 수행한다고 가정.
+        # 여기서는 각 row에서 유효 블록을 찾아 해당 구간만 SG 미분.
+        for i in range(N):
+            block = self._find_single_valid_block(valid_bT[i])
+            dx[i] = self._sg_derivative_on_block(
+                seq_bT[i],
+                block,
                 dt=dt,
                 polyorder=polyorder,
-                max_window_length=max_window_length)
-            dx[sel, :L] = drows
-            # 나머지(무효)는 0 유지
+                max_window_length=max_window_length,
+            )
         return dx
 
     def _savgol_derivative_masked_torch(
         self,
-        seq_bT: torch.Tensor,  # (B_Pnn,T1)
-        valid_bT: torch.Tensor,  # (B_Pnn,T1) True=유효
+        seq_bT: torch.Tensor,  # (B_Pnn, point_len)
+        valid_bT: torch.Tensor,  # (B_Pnn, point_len) True=유효
         dt: float,
         polyorder: int,
         max_window_length: int,
-    ) -> torch.Tensor:  # (B_Pnn,T1)
-        """[리팩터링] 유효 구간에서만 SG로 1차 미분. 무효는 0."""
-        dx = torch.zeros_like(seq_bT)
-
-        # idx_full (K,), idx_partial (M,)
+    ) -> torch.Tensor:  # (B_Pnn, point_len)
+        """유효 구간에서만 SG로 1차 미분(무효는 0).
+        - 전체 유효 row → `_sg_derivative_full_rows` (벡터화)
+        - 일부 유효 row(0*1*0*) → `_sg_derivative_partial_rows` (연속 블록만 허용)
+        """
+        dx = torch.zeros_like(seq_bT)  # (B_Pnn, point_len)
+        """ 전 구간 유효 row / 일부만 유효 row 인덱스 분리.
+        idx_full (K,), idx_partial (M,)
+        """
         idx_full, idx_partial = self._split_full_vs_partial_rows(valid_bT)
-        # 1) full valid rows (배치 처리)
+
         if idx_full.numel() > 0:
             dx_full = self._sg_derivative_full_rows(
-                seq_bT[idx_full],  # (N_full,T1)
+                seq_bT[idx_full],  # (N_full, point_len)
                 dt,
                 polyorder,
                 max_window_length)
             dx[idx_full] = dx_full
-        # 2) partial valid rows (슬로우패스)
+
         if idx_partial.numel() > 0:
-            dx_part = self._sg_derivative_partial_rows(seq_bT[idx_partial],
-                                                       valid_bT[idx_partial],
-                                                       dt, polyorder,
-                                                       max_window_length)
+            dx_part = self._sg_derivative_partial_rows(
+                seq_bT[idx_partial],  # (N_partial, point_len)
+                valid_bT[idx_partial],  # (N_partial, point_len)
+                dt,
+                polyorder,
+                max_window_length)
             dx[idx_partial] = dx_part
-        # 무효 구간은 기본 0 유지
-        return dx  # (B_Pnn,T1)
+
+        return dx
 
     # feasible.py 내 FeasibleProjector 클래스 안에 추가
-    def _assert_prefix_valid_mask(
+    def _assert_cur_future_valid_mask(
             self,
             valid_bpt: torch.Tensor,
             context: str = "savgol_filter_for_control") -> None:
@@ -2064,78 +2396,570 @@ class FeasibleProjector(nn.Module):
     # 본 기능: 위치→세계속도, yaw→요레이트, 그리고 body 회전
     # ================================================================
     def savgol_filter_for_control(
-            self,
-            unnorm_diffusion_trajectory: torch.Tensor,
-            # (B, Pnn, 1+T, 4) = [x, y, cos, sin]
-            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T)     True/1=유효
-            *,
-            dt: float = 0.1,
-            polyorder: int = 2,
-            max_window_len_xy: int = 11,  # ≈ 1.1s @10Hz
-            max_window_len_yaw: int = 7,  # ≈ 0.7s @10Hz
-    ) -> torch.Tensor:  # (B, Pnn, 1+T, 3) = [vxw, vyw, w]
-        """ Savitzky–Golay(마스크 인지)로 **세계좌표계** 속도/각속도 추정.
-
-        Args:
-            unnorm_diffusion_trajectory: (B, Pnn, 1+T, 4) = [x, y, cos, sin]
-            near_cur_future_valid: (B, Pnn, 1+T)  True/1 = 유효
-            dt: 샘플 간격(초). nuPlan/데이터셋 특성상 0.1 권장.
-            polyorder: SG 다항 차수(2 권장).
-            max_window_len_xy: x,y에 사용할 윈도 길이 상한(홀수로 강제됨).
-            max_window_len_yaw: yaw에 사용할 윈도 길이 상한(홀수로 강제됨).
+        self,
+        unnorm_diffusion_trajectory: torch.Tensor,
+        # (B,Pnn,1+future_len,4) = [x, y, cos, sin]
+        unnorm_near_past_xyyaw: Optional[torch.Tensor],
+        # (B,Pnn,past_len,4) or None
+        near_past_cur_future_valid: torch.Tensor,
+        # (B,Pnn,past_len+1+future_len) bool
+        *,
+        dt: float = 0.1,
+        polyorder: int = 2,
+        max_window_len_xy: int = 11,
+        max_window_len_yaw: int = 7,
+    ) -> torch.Tensor:
+        """Savitzky–Golay(마스크 인지)로 **세계속도/각속도**를 추정하여 반환.
 
         Returns:
-            (B, Pnn, 1+T, 3) = [v_x^w, v_y^w, w]  (단위: m/s, m/s, rad/s)
+            unnorm_points_world_control:
+                - past가 없으면: (B,Pnn,1+future_len,3)  = [v_x^w, v_y^w, w]
+                - past가 있으면: (B,Pnn,past_len+1+future_len,3)
         """
-        B, Pnn, T1, _ = unnorm_diffusion_trajectory.shape
+        # 1) 포인트/마스크 준비 및 검증
+        point_len_inputs: PointLenInputs = self._prepare_points_and_masks(
+            unnorm_diffusion_trajectory=unnorm_diffusion_trajectory,
+            # (B,Pnn,1+future_len,4)
+            unnorm_near_past_xyyaw=unnorm_near_past_xyyaw,
+            # (B,Pnn,past_len,4) or None
+            near_past_cur_future_valid=near_past_cur_future_valid,
+            # (B,Pnn,past_len+1+future_len) bool
+        )
+        unnorm_points_xyyaw = point_len_inputs.unnorm_points_xyyaw  # (B,Pnn,point_len,4)
+        points_valid = point_len_inputs.points_valid  # (B,Pnn,point_len) bool
+        B, Pnn, point_len, _ = unnorm_points_xyyaw.shape
 
-        # 1) 입력 분리
-        x = unnorm_diffusion_trajectory[..., 0]  # (B,Pnn,T1)
-        y = unnorm_diffusion_trajectory[..., 1]  # (B,Pnn,T1)
-        cos_y = unnorm_diffusion_trajectory[..., 2]  # (B,Pnn,T1)
-        sin_y = unnorm_diffusion_trajectory[..., 3]  # (B,Pnn,T1)
-        valid = (near_cur_future_valid > 0).to(torch.bool)  # (B,Pnn,T1)
+        # 2) 분해
+        x = unnorm_points_xyyaw[..., 0]  # (B,Pnn,point_len)
+        y = unnorm_points_xyyaw[..., 1]  # (B,Pnn,point_len)
+        cos_y = unnorm_points_xyyaw[..., 2]  # (B,Pnn,point_len)
+        sin_y = unnorm_points_xyyaw[..., 3]  # (B,Pnn,point_len)
 
-        # NEW: 입력 가정 강제 (내부 구멍 금지)
-        self._assert_prefix_valid_mask(valid,
-                                       context="savgol_filter_for_control")
+        # 3) SG-미분 (x/y → v_x^w, v_y^w) & (cos/sin → w)
+        # v_x: (B,Pnn,point_len)
+        # v_y: (B,Pnn,point_len)
+        v_x, v_y = self._compute_world_linear_velocity_via_sg(
+            x=x,  # (B,Pnn,point_len)
+            y=y,  # (B,Pnn,point_len)
+            points_valid=points_valid,  # (B,Pnn,point_len)
+            dt=dt,
+            polyorder=polyorder,
+            max_window_len_xy=max_window_len_xy,
+        )
+        # yaw_rate: (B,Pnn,point_len)
+        yaw_rate = self._compute_yaw_rate_via_sg(
+            cos_y=cos_y,  # (B,Pnn,point_len)
+            sin_y=sin_y,  # (B,Pnn,point_len)
+            points_valid=points_valid,  # (B,Pnn,point_len)
+            dt=dt,
+            polyorder=polyorder,
+            max_window_len_yaw=max_window_len_yaw,
+        )
 
-        # 3) SG-미분: x, y, yaw 각각 (마스크 인지)
+        # 4) 마스킹·스택 후 반환
+        unnorm_points_world_control = self._mask_and_stack_world_controls(
+            v_x=v_x, v_y=v_y, yaw_rate=yaw_rate,
+            points_valid=points_valid)  # (B,Pnn,point_len,3)
+        return unnorm_points_world_control
+
+    # <추가하자>
+    def _find_single_valid_block(
+            self,
+            valid_row: torch.Tensor,  # (T,) bool/int8
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """한 행(valid_row)에서 **연속된 True 블록**의 [start, end]를 찾습니다.
+
+        - True가 하나도 없으면 (None, None) 반환
+        - True가 여러 덩어리(불연속)면 ValueError
+
+        Args:
+            valid_row: (T,) bool/int8
+
+        Returns:
+            (start, end): 모두 inclusive 인덱스. 없으면 (None, None).
+        """
+        v = valid_row.to(torch.int8)
+        T = int(v.numel())
+        if v.sum() == 0:
+            return None, None
+
+        idx_true = torch.nonzero(v, as_tuple=False).flatten()
+        start = int(idx_true[0].item())
+        end = int(idx_true[-1].item())
+
+        # 블록 내부가 모두 True인지(연속성) 확인
+        if not v[start:end + 1].all():
+            raise ValueError("[_find_single_valid_block] 유효 블록이 여러 덩어리입니다. "
+                             f"start={start}, end={end}")
+        return start, end
+
+    # <추가하자>
+    def _sg_derivative_on_block(
+        self,
+        seq_row: torch.Tensor,  # (T,)
+        block: Tuple[Optional[int], Optional[int]],
+        *,
+        dt: float,
+        polyorder: int,
+        max_window_length: int,
+    ) -> torch.Tensor:
+        """단일 row에서 유효 블록([start,end])에만 SG 파생을 적용하고, 나머지는 0으로 둡니다.
+
+        Args:
+            seq_row: (T,)
+            block: (start, end), 둘 다 inclusive. 없으면 (None, None)
+
+        Returns:
+            d_row: (T,)  — 유효 블록만 미분값, 바깥은 0
+        """
+        T = int(seq_row.shape[0])
+        d_row = torch.zeros_like(seq_row)
+        start, end = block
+        if start is None or end is None:
+            return d_row  # 전부 무효
+
+        seg = seq_row[start:end + 1].unsqueeze(0)  # (1, L)
+        dseg = self._sg_derivative_full_rows(
+            seg,
+            dt=dt,
+            polyorder=polyorder,
+            max_window_length=max_window_length,
+        ).squeeze(0)  # (L,)
+        d_row[start:end + 1] = dseg
+        return d_row
+
+    # <추가하자>
+    def _compute_world_linear_velocity_via_sg(
+        self,
+        x: torch.Tensor,  # (B,Pnn,point_len)
+        y: torch.Tensor,  # (B,Pnn,point_len)
+        points_valid: torch.Tensor,  # (B,Pnn,point_len)  bool
+        *,
+        dt: float,
+        polyorder: int,
+        max_window_len_xy: int,
+    ) -> Tuple[torch.Tensor,
+               torch.Tensor]:  # (B,Pnn,point_len), (B,Pnn,point_len)
+        """SG(마스크 인지)로 세계속도 v_x^w, v_y^w 추정."""
+        B, Pnn, point_len = x.shape
+
+        # v_x: (B,Pnn,point_len)
+        # v_y: (B,Pnn,point_len)
         v_x = self._savgol_derivative_masked_torch(
-            x.reshape(-1, T1),  # (B_Pnn,T1)
-            valid.reshape(-1, T1),  # (B_Pnn,T1)
-            dt,
-            polyorder,
-            max_window_len_xy)  # v_x^w
-        v_x = v_x.reshape(B, Pnn, T1)  # (B_Pnn,T1) -> (B,Pnn,T1)
-        v_y = self._savgol_derivative_masked_torch(
-            y.reshape(-1, T1),  # (B_Pnn,T1)
-            valid.reshape(-1, T1),  # (B_Pnn,T1)
-            dt,
-            polyorder,
-            max_window_len_xy)  # v_y^w
-        v_y = v_y.reshape(B, Pnn, T1)
+            x.reshape(-1, point_len),  # (B*Pnn, point_len)
+            points_valid.reshape(-1, point_len),  # (B*Pnn, point_len)
+            dt=dt,
+            polyorder=polyorder,
+            max_window_length=max_window_len_xy).reshape(B, Pnn, point_len)
 
-        # --- 변경: cos/sin 직접 미분 → ψ̇ ---
+        v_y = self._savgol_derivative_masked_torch(
+            y.reshape(-1, point_len),  # (B*Pnn, point_len)
+            points_valid.reshape(-1, point_len),  # (B*Pnn, point_len)
+            dt=dt,
+            polyorder=polyorder,
+            max_window_length=max_window_len_xy).reshape(B, Pnn, point_len)
+        return v_x, v_y
+
+    # <추가하자>
+    def _compute_yaw_rate_via_sg(
+        self,
+        cos_y: torch.Tensor,  # (B,Pnn,point_len)
+        sin_y: torch.Tensor,  # (B,Pnn,point_len)
+        points_valid: torch.Tensor,  # (B,Pnn,point_len)  bool
+        *,
+        dt: float,
+        polyorder: int,
+        max_window_len_yaw: int,
+    ) -> torch.Tensor:
+        """cos/sin 각각 SG-미분 뒤 조합해 ψ̇ 추정(unwrap 불필요)."""
         yaw_rate = _yaw_rate_from_cos_sin_via_sg(
-            cos_yaw=cos_y,  # (B,Pnn,T1)
-            sin_yaw=sin_y,  # (B,Pnn,T1)
-            valid_mask=valid,  # (B,Pnn,T1) bool
+            cos_yaw=cos_y,
+            sin_yaw=sin_y,
+            valid_mask=points_valid,
             dt=dt,
             polyorder=polyorder,
             max_window_len=max_window_len_yaw,
             eps=1e-6,
             sg_derivative_fn=self._savgol_derivative_masked_torch,
-            # 당신이 이미 가진 함수
-        )  # (B,Pnn,T1)
+        )
+        return yaw_rate
 
-        # 5) 안전 마스킹(무효 시점은 0)
-        v_x = torch.where(valid, v_x, torch.zeros_like(v_x))
-        v_y = torch.where(valid, v_y, torch.zeros_like(v_y))
-        yaw_rate = torch.where(valid, yaw_rate, torch.zeros_like(yaw_rate))
-        unnorm_cur_future_control = torch.stack([v_x, v_y, yaw_rate],
-                                                dim=-1)  # (B,Pnn,T1,3)
-        return unnorm_cur_future_control
+    # <추가하자>
+    def _infer_forward_lengths_and_validate_base(
+        self,
+        near_past_cur_future_valid: torch.
+        Tensor,  # (B, Pnn, time_len(=1+past_len) + future_len)
+        diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+        seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+    ) -> Tuple[int, int, int, int, int, torch.Tensor, torch.Tensor]:
+        """forward 용 기본 길이/shape 및 최소 검증을 수행한다.
+
+        Returns:
+            B: int
+            Pnn: int
+            past_len: int
+            future_len: int
+            segment_len: int
+            valid_all: (B, Pnn, 1+past_len+future_len) bool
+            cur_future_valid: (B, Pnn, 1+future_len) bool
+        """
+        B, Pnn, total_time_len = near_past_cur_future_valid.shape
+        B2, Pnn2, one_plus_future_len, _ = diffusion_trajectory.shape
+
+        future_len = one_plus_future_len - 1  # 현재 이후 미래 segment 개수
+        if future_len <= 0:
+            raise ValueError("[forward] diffusion_trajectory 길이가 2 미만입니다. "
+                             "최소 (현재, 미래1) 두 노드가 필요합니다.")
+        if (B2, Pnn2) != (B, Pnn):
+            raise ValueError(
+                "[_infer_forward_lengths_and_validate_base] "
+                "near_past_cur_future_valid과 diffusion_trajectory의 "
+                f"batch/agent 축이 다릅니다: "
+                f"(B,Pnn)=({B},{Pnn}), (B2,Pnn2)=({B2},{Pnn2})")
+        past_len = total_time_len - (1 + future_len)
+
+        if past_len < 0:
+            raise ValueError(
+                f"[forward] 마스크 길이가 너무 짧습니다: total_time_len={total_time_len}, future_len={future_len}"
+            )
+        # past_len 은 '과거 노드 개수' (현재 포함 전까지)
+        # <추가하자> 전체 길이 일관성 체크
+        if total_time_len != past_len + 1 + future_len:
+            raise ValueError(
+                f"[forward] near_past_cur_future_valid.shape[2]={total_time_len} "
+                f"!= past_len+1+future_len={past_len + 1 + future_len}")
+
+        if (B2, Pnn2) != (B, Pnn):
+            raise ValueError(
+                f"배치/에이전트 축 불일치: (B,Pnn)=({B},{Pnn}), (B2,Pnn2)=({B2},{Pnn2})")
+
+        # seg_body_control 이 들고 있는 segment 개수 = segment_len
+        _, _, segment_len, _ = seg_body_control.shape
+
+        # 노드 기준 전체 유효 마스크 (bool)
+        valid_all = near_past_cur_future_valid.to(
+            torch.bool)  # (B, Pnn, past_len+1+future_len)
+
+        # 현재~미래 구간만 따로 떼서 1*0* 패턴 검증용(cur_future_valid)
+        cur_future_valid = valid_all[..., past_len:]  # (B, Pnn, 1+future_len)
+        self._assert_cur_future_valid_mask(cur_future_valid,
+                                           context="forward_cur_future_valid")
+
+        return B, Pnn, past_len, future_len, segment_len, valid_all, cur_future_valid
+
+    # <추가하자>
+    def _validate_forward_past_mask_if_needed(
+            self,
+            past_len: int,
+            near_past_xyyaw: Optional[
+                torch.Tensor],  # (B, Pnn, past_len, 4) or None
+            valid_all: torch.Tensor,  # (B, Pnn, past_len+1+future_len) bool
+    ) -> None:
+        """과거 구간을 실제로 사용할 때만 0*1* 패턴 검증."""
+        if past_len > 0 and near_past_xyyaw is not None:
+            past_cur_valid = valid_all[..., :past_len +
+                                       1]  # (B, Pnn, 1+past_len)
+            self._assert_past_cur_valid_mask(past_cur_valid,
+                                             context="forward_past_cur_valid")
+
+    # <추가하자>
+    def _build_forward_points_without_past(
+            self,
+            future_len: int,
+            segment_len: int,
+            diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+            cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """과거 포인트를 사용하지 않는 경우의 points/valid 구성."""
+        expected_segment_len = future_len
+        if segment_len != expected_segment_len:
+            raise ValueError("[forward] near_past_xyyaw is None 인 경우, "
+                             f"seg_body_control 의 segment_len={segment_len} 이 "
+                             f"future_len={future_len} 과 다릅니다.")
+
+        points_trajectory = diffusion_trajectory  # (B, Pnn, 1+future_len, 4)
+        points_valid = cur_future_valid  # (B, Pnn, 1+future_len)
+        return points_trajectory, points_valid
+
+    # <추가하자>
+    def _build_forward_points_with_past(
+        self,
+        past_len: int,
+        future_len: int,
+        segment_len: int,
+        near_past_xyyaw: torch.Tensor,  # (B, Pnn, past_len, 4)
+        diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+        valid_all: torch.Tensor,  # (B, Pnn, 1+past_len+future_len) bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """과거~현재~미래 포인트를 모두 사용하는 경우의 points/valid 구성."""
+        if near_past_xyyaw.shape[2] != past_len:
+            raise ValueError(
+                "[forward] near_past_xyyaw 의 past_len 이 유효 마스크에서 계산한 "
+                f"past_len={past_len} 과 다릅니다. "
+                f"(near_past_xyyaw.shape[2]={near_past_xyyaw.shape[2]})")
+
+        expected_segment_len = past_len + future_len
+        if segment_len != expected_segment_len:
+            raise ValueError(
+                "[forward] near_past_xyyaw 가 있을 때 seg_body_control 의 "
+                f"segment_len={segment_len} 이 "
+                f"past_len+future_len={expected_segment_len} 과 다릅니다.")
+
+        points_trajectory = torch.cat(
+            [near_past_xyyaw, diffusion_trajectory],
+            dim=2)  # (B, Pnn, past_len + 1 + future_len, 4)
+
+        if points_trajectory.shape[2] != (1 + expected_segment_len):
+            raise ValueError(
+                "[forward] points_trajectory 길이(과거+현재+미래)가 "
+                f"1+segment_len={1 + expected_segment_len} 과 일치하지 않습니다. "
+                f"(실제 길이={points_trajectory.shape[2]})")
+
+        # 네트워크 입장에서는 '사용 가능한 모든 segment' 를 보고 싶으므로
+        # 전체 타임라인 마스크를 그대로 넘긴다. (0*1*0* 패턴 허용)
+        points_valid = valid_all  # (B, Pnn, past_len+1+future_len)
+        return points_trajectory, points_valid
+
+    # <추가하자>
+    def _prepare_forward_points_and_mask(
+            self,
+            near_past_cur_future_valid: torch.
+        Tensor,  # (B, Pnn, time_len(=1+past_len) + future_len)
+            diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+            near_past_xyyaw: Optional[
+                torch.Tensor],  # (B, Pnn, past_len, 4) or None
+            seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """forward 에서 사용할 포인트 궤적과 노드 유효 마스크를 준비한다.
+
+        Args:
+            near_past_cur_future_valid:
+                (B, Pnn, time_len(=1+past_len) + future_len) bool
+                = [과거 0..past_len-1, 현재, 미래 1..future_len] 노드 유효 마스크.
+            diffusion_trajectory:
+                (B, Pnn, 1+future_len, 4) = [x, y, cos, sin]
+                현재~미래 구간 포인트.
+            near_past_xyyaw:
+                None 이면 과거 포인트를 사용하지 않는 모드.
+                Tensor 이면 (B, Pnn, past_len, 4) 로 과거 포인트를 포함.
+            seg_body_control:
+                (B, Pnn, segment_len, 3) = [v_x^b, v_y^b, w]_seg.
+                segment_len 은
+                  - near_past_xyyaw is None  → future_len
+                  - near_past_xyyaw not None → past_len + future_len
+
+        Returns:
+            points_trajectory:
+                (B, Pnn, 1+segment_len, 4)
+                - 과거 없음: diffusion_trajectory (현재~미래)
+                - 과거 있음: [near_past_xyyaw, diffusion_trajectory] concat (과거~현재~미래)
+            points_valid:
+                (B, Pnn, 1+segment_len) bool
+                - 과거 없음: 현재~미래 부분(cur_future_valid)
+                - 과거 있음: 과거~현재~미래 전체(near_past_cur_future_valid)
+        """
+        (
+            B,  # int
+            Pnn,  # int
+            past_len,  # int
+            future_len,  # int
+            segment_len,  # int
+            valid_all,  # (B, Pnn, 1+past_len+future_len)
+            cur_future_valid,  # (B, Pnn, 1+future_len)
+        ) = self._infer_forward_lengths_and_validate_base(
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
+            diffusion_trajectory=
+            diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+            seg_body_control=seg_body_control,  # (B, Pnn, segment_len, 3)
+        )
+
+        # 과거 마스크(0*1*)는 실제로 과거 포인트를 사용할 때만 검증
+        self._validate_forward_past_mask_if_needed(
+            past_len=past_len,  # int 
+            near_past_xyyaw=near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+            valid_all=valid_all,  # (B, Pnn, 1+past_len+future_len) bool
+        )
+
+        # 분기: 과거 포인트 사용 여부
+        if near_past_xyyaw is None:
+            """
+            points_trajectory: (B, Pnn, 1+future_len, 4)
+            points_valid: (B, Pnn, 1+future_len)
+            """
+            (points_trajectory, points_valid
+            ) = self._build_forward_points_without_past(
+                future_len=future_len,
+                segment_len=segment_len,
+                diffusion_trajectory=
+                diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+                cur_future_valid=cur_future_valid,  # (B, Pnn, 1+future_len) bool
+            )
+        else:
+            """
+            points_trajectory : (B, Pnn, past_len + 1 + future_len, 4)
+            points_valid : (B, Pnn, past_len+ 1 +future_len)
+            """
+            (points_trajectory,
+             points_valid) = self._build_forward_points_with_past(
+                 past_len=past_len,
+                 future_len=future_len,
+                 segment_len=segment_len,
+                 near_past_xyyaw=near_past_xyyaw,  # (B, Pnn, past_len, 4)
+                 diffusion_trajectory=
+                 diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+                 valid_all=valid_all,  # (B, Pnn, 1+past_len+future_len)
+             )
+
+        # 최종 shape 일관성 체크
+        if points_valid.shape[2] != points_trajectory.shape[2]:
+            raise ValueError(
+                "[forward] points_trajectory 와 points_valid 의 time 축 길이가 다릅니다. "
+                f"points_trajectory.shape[2]={points_trajectory.shape[2]}, "
+                f"points_valid.shape[2]={points_valid.shape[2]}.")
+
+        return points_trajectory, points_valid
+
+    # <추가하자>
+    def _mask_and_stack_world_controls(
+            self,
+            v_x: torch.Tensor,  # (B,Pnn,point_len)
+            v_y: torch.Tensor,  # (B,Pnn,point_len)
+            yaw_rate: torch.Tensor,  # (B,Pnn,point_len)
+            points_valid: torch.Tensor,  # (B,Pnn,point_len)  bool
+    ) -> torch.Tensor:
+        """무효 시점 0 마스킹 후 [v_x^w, v_y^w, w] 스택."""
+        v_x = torch.where(points_valid, v_x, torch.zeros_like(v_x))
+        v_y = torch.where(points_valid, v_y, torch.zeros_like(v_y))
+        yaw_rate = torch.where(points_valid, yaw_rate,
+                               torch.zeros_like(yaw_rate))
+        return torch.stack([v_x, v_y, yaw_rate], dim=-1)  # (B,Pnn,point_len,3)
+
+    # <추가하자>
+    def forward(
+            self,
+            near_past_cur_future_valid: torch.Tensor,
+            # (B, Pnn, time_len(=1+past_len) + future_len) bool  # 과거~현재~미래 노드 유효 마스크
+            diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+            near_past_xyyaw: Optional[
+                torch.Tensor],  # (B, Pnn, past_len, 4) or None
+            seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+            dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
+    ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)
+        """Control Correction Network 전체 경로.
+
+        Args:
+            near_past_cur_future_valid:
+                (B, Pnn, time_len(=1+past_len) + future_len) bool
+                과거~현재~미래 모든 노드의 유효 마스크.
+            diffusion_trajectory:
+                (B, Pnn, 1+future_len, 4) = [x, y, cos, sin]
+                현재~미래 포인트 궤적.
+            near_past_xyyaw:
+                None 이면 현재~미래만 사용 (segment_len = future_len).
+                Tensor 이면 (B, Pnn, past_len, 4) 로 과거~현재~미래 전체 사용
+                (segment_len = past_len + future_len).
+            seg_body_control:
+                (B, Pnn, segment_len, 3)  = [v_x^b, v_y^b, w]_seg (정규화 이전 값).
+            dit_final_hidden_tokens:
+                (B, Pnn, H)  디퓨전 트렁크 최종 은닉.
+
+        Returns:
+            torch.Tensor:
+                u_ref: (B, Pnn, segment_len, 3)
+                입력 seg_body_control 에 대한 보정 제어.
+        """
+        if not self.use_feasible_train:
+            return seg_body_control
+
+        # seg_body_control 에서 segment_len 을 기준으로 사용
+        _, _, segment_len, _ = seg_body_control.shape
+
+        # 1) forward 에서 사용할 포인트 궤적 + 노드 유효 마스크 준비
+        #    - points_trajectory:      (B, Pnn, 1+segment_len, 4)
+        #    - node_valid_for_segments:(B, Pnn, 1+segment_len) bool
+        """ segment_len
+        1. if near_past_xyyaw is None:
+            segment_len = future_len
+        2. if near_past_xyyaw is not None:
+            segment_len = past_len + future_len
+        """
+        points_trajectory, points_valid = self._prepare_forward_points_and_mask(
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
+            diffusion_trajectory=
+            diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+            near_past_xyyaw=near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+            seg_body_control=seg_body_control,  # (B, Pnn, segment_len, 3)
+        )
+
+        # points_valid: (B, Pnn, 1+segment_len) bool
+        # 2) segment 기반 마스크 (양 끝 노드 모두 True 인 segment 만 1.0)
+        #    - seg_mask:   (B, Pnn, segment_len) float(0/1)
+        #    - seg_mask_1: (B, Pnn, segment_len, 1)
+        seg_mask, seg_mask_1 = self._build_segment_mask(points_valid)
+
+        # 3) 입력 분해 + 단위원 재투영
+        #    points_trajectory: (B, Pnn, 1+segment_len, 4)
+        #    x_prev: (B, Pnn, segment_len, 4) ← t_k
+        #    x_fut : (B, Pnn, segment_len, 4) ← t_{k+1}
+        x_prev, x_fut = self._split_prev_fut(points_trajectory)
+        x_prev = self._normalize_cos_sin(x_prev)
+        x_fut = self._normalize_cos_sin(x_fut)
+
+        # 4) 피처 인코딩
+        #    Z_in: (B, Pnn, segment_len, 192)
+        Z_in = self._features_from_inputs(
+            x_prev=x_prev,  # (B, Pnn, segment_len, 4)
+            x_fut=x_fut,  # (B, Pnn, segment_len, 4)
+            u_base=seg_body_control,  # (B, Pnn, segment_len, 3)
+            dit_final_hidden_tokens=dit_final_hidden_tokens,  # (B, Pnn, H)
+            points_valid=points_valid,  # (B, Pnn, 1+segment_len)
+        )
+
+        # 5) Stem → 6) TCN
+        #    Z_s:   (B, Pnn, segment_len, 192)
+        #    Z_tcn: (B, Pnn, segment_len, 192)
+        Z_s = self._prepare_tcn_input(Z_in, seg_mask_1)
+        Z_tcn = self._run_tcn(Z_s, seg_mask, seg_mask_1)
+
+        # 7) ΔU 예측 → 8) 결합
+        #    delta_u, u_ref: (B, Pnn, segment_len, 3)
+        delta_u = self._predict_delta_u(Z_tcn, seg_mask_1)
+        u_ref = seg_body_control + delta_u
+        return u_ref
+
+    def _assert_past_cur_valid_mask(
+        self,
+        valid_bpt: torch.Tensor,
+        context: str = "savgol_filter_for_control_past_cur",
+    ) -> None:
+        """과거~현재(valid_bpt)의 유효 마스크가 행마다 0*1* (단조 증가)인지 검증.
+
+        Args:
+            valid_bpt: (B, Pnn, T1) bool
+            context: 에러 메시지용 위치 정보
+
+        Raises:
+            ValueError: 1→0 전이가 하나라도 있으면(단조 증가 위반) 예외
+        """
+        # <추가하자>
+        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 이어야 합니다."
+        B, Pnn, T1 = valid_bpt.shape
+        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
+        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
+
+        has_10 = (d < 0).any(dim=1)  # 1→0 전이(단조 증가 위반)
+        if has_10.any():
+            bad_idx = torch.nonzero(has_10, as_tuple=False).flatten()
+            max_show = min(int(bad_idx.numel()), 8)
+            sample = bad_idx[:max_show].tolist()
+            b_list = [(i // Pnn) for i in sample]
+            p_list = [(i % Pnn) for i in sample]
+            raise ValueError(
+                f"[{context}] past_cur 유효 마스크는 0*1* 형태여야 합니다(단조 증가). "
+                f"1→0 전이가 감지되었습니다. 오류 row 수={int(bad_idx.numel())}, "
+                f"예시 (b,p)={list(zip(b_list, p_list))}.")
 
 
 # ---------------------------------------------------------------------------
