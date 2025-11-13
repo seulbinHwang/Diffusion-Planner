@@ -938,10 +938,10 @@ class DiT(nn.Module):
         )  # (B, Pnn, T, 4)
         integrated_trajectory = self.config.state_normalizer(
             unnorm_integrated_trajectory)  # (B, Pnn, T, 4)
-        temp_dict = {"control_constraint_diff": unnorm_control_constraint_diff}
+        temp_dict = {"cur_future_seg_body_control": unnorm_control_constraint_diff}
         temp_dict = self.config.observation_normalizer(temp_dict)
         control_constraint_diff = temp_dict[
-            "control_constraint_diff"]  # (B, Pnn, T, 3)
+            "cur_future_seg_body_control"]  # (B, Pnn, T, 3)
         self.dit_returns = DiTReturns(
             integrated_trajectory=integrated_trajectory,
             control_constraint_diff=control_constraint_diff)
