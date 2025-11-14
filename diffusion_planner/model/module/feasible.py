@@ -1681,23 +1681,23 @@ class FeasibleProjector(nn.Module):
         )
         """
         # (S0)
-        # vx_b_k, vy_b_k = self._apply_S0_nonholonomic_ste(
-        #     vx_b_k,  # (B,Pnn)
-        #     vy_b_k,  # (B,Pnn)
-        #     slip_epsilon,
-        #     hp.eta_slip,  # 0.07
-        #     hp.eps,
-        #     is_nonholonomic=key_to_limit_bp["is_nonholonomic"], # (B,Pnn)
-        # )
-        # # (S1)
-        # vx_b_k, vy_b_k = self._apply_S1_speed_limit_ste(
-        #     vx_b_k, vy_b_k, key_to_limit_bp["v_max"], hp.eta_speed, hp.eps)
+        vx_b_k, vy_b_k = self._apply_S0_nonholonomic_ste(
+            vx_b_k,  # (B,Pnn)
+            vy_b_k,  # (B,Pnn)
+            slip_epsilon,
+            hp.eta_slip,  # 0.07
+            hp.eps,
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"], # (B,Pnn)
+        )
+        # (S1)
+        vx_b_k, vy_b_k = self._apply_S1_speed_limit_ste(
+            vx_b_k, vy_b_k, key_to_limit_bp["v_max"], hp.eta_speed, hp.eps)
         # # (S2)
-        # if apply_S2:
-        #     vx_b_k, vy_b_k, omega_k = self._apply_S2_accel_alpha_limits_ste(
-        #         vx_b_prev, vy_b_prev, omega_prev, vx_b_k, vy_b_k, omega_k,
-        #         key_to_limit_bp["a_max"], key_to_limit_bp["alpha_max"], hp.dt,
-        #         hp.eta_inc, hp.eps)
+        if apply_S2:
+            vx_b_k, vy_b_k, omega_k = self._apply_S2_accel_alpha_limits_ste(
+                vx_b_prev, vy_b_prev, omega_prev, vx_b_k, vy_b_k, omega_k,
+                key_to_limit_bp["a_max"], key_to_limit_bp["alpha_max"], hp.dt,
+                hp.eta_inc, hp.eps)
         # (S3)
         omega_k = self._apply_S3_omega_clip_ste(
             vx_b=vx_b_k,
@@ -1738,7 +1738,6 @@ class FeasibleProjector(nn.Module):
         omega_k: torch.Tensor,  # (B,Pnn)
         hp: _ConstraintHParams,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        index = 14
         half_dtheta = 0.5 * omega_k * hp.dt
         # cos_mid, sin_mid: (B,Pnn)
         cos_mid, sin_mid = self._compute_mid_heading_from_cos_sin(
@@ -1944,7 +1943,7 @@ class FeasibleProjector(nn.Module):
                     hp=self.constraints_h_params,  # _ConstraintHParams
                     key_to_limit_bp=
                     key_to_limit_bp,  # Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn)
-                    slip_epsilon=0.0,
+                    slip_epsilon=0.1,
                     apply_S2=apply_S2_k,
                     apply_S4_ax=apply_S4_ax_k,
                 )
