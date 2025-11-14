@@ -1048,12 +1048,10 @@ class WorldModelLogReplay(AbstractMLAgents):
             -
         """
         self._draw_infos = draw_machine.DrawInfos()
-
         self.observation_buffer: Deque[Observation] = history.observation_buffer
         # EgoState, Observation
         self._ego_anchor_state, self.current_observation = history.current_state
         # self._get_diffusion_agents(self._ego_anchor_state)
-
         self.sim_step_gap_time_point: TimePoint = next_iteration.time_point - iteration.time_point
 
         self.current_iteration: int = next_iteration.index
@@ -1226,49 +1224,54 @@ class WorldModelLogReplay(AbstractMLAgents):
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
         # 추가
+        diff_token_to_np_int_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_int_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
 
         self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
             neighbor_agent_current = neighbor_agents_past[idx, 0]  # (11)
-            # neighbor_agent_current: (11) -> (T, 11)
             np_gen_traj_11_wrt_ego = np.tile(
                 neighbor_agent_current,
-                (future_np_trajs_wrt_ego.shape[1] - 1, 1))  # (T, 11)
+                (future_np_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
             np_gen_int_traj_11_wrt_ego = np.tile(
                 neighbor_agent_current,
-                (future_np_int_trajs_wrt_ego.shape[1] - 1, 1))  # (T, 11)
+                (future_np_int_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
             if idx >= gen_slot_len:
                 break
-            future_np_traj_wrt_ego = future_np_trajs_wrt_ego[idx,
-                                                             1:, :]  # (T, 4)
-            np_gen_traj_11_wrt_ego[:, :4] = future_np_traj_wrt_ego  # (T, 11)
-            np_traj_sum = future_np_traj_wrt_ego.sum()  # (T, 4) 의 합
+            future_np_traj_wrt_ego = future_np_trajs_wrt_ego[
+                idx, :, :]  # (1+T, 4)
+            np_gen_traj_11_wrt_ego[:, :4] = future_np_traj_wrt_ego  # (1+T, 11)
+            np_traj_sum = future_np_traj_wrt_ego.sum()  # (1+T, 4) 의 합
 
             future_np_int_traj_wrt_ego = future_np_int_trajs_wrt_ego[
-                idx, 1:, :]  # (T, 4)
-            np_int_traj_sum = future_np_int_traj_wrt_ego.sum()  # (T, 4) 의 합
+                idx, :, :]  # (1+T, 4)
+            np_int_traj_sum = future_np_int_traj_wrt_ego.sum()  # (1+T, 4) 의 합
             np_gen_int_traj_11_wrt_ego[:, :
-                                       4] = future_np_int_traj_wrt_ego  # (T, 11)
+                                       4] = future_np_int_traj_wrt_ego  # (1+T, 11)
             if np.allclose(np_traj_sum, 0.0) or token is None:
                 continue
             if np.allclose(np_int_traj_sum, 0.0):
                 print(f"{idx} 번째 대상의 보간 궤적이 모두 0입니다.")
                 continue
-            diff_token_to_np_gen_traj_wrt_ego[token] = future_np_traj_wrt_ego
+            diff_token_to_np_gen_traj_wrt_ego[token] = future_np_traj_wrt_ego[
+                1:, :]  # (T, 4)
             diff_token_to_np_gen_traj_11_wrt_ego[
-                token] = np_gen_traj_11_wrt_ego  # (T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+                token] = np_gen_traj_11_wrt_ego[:3]  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
             # 추가
+            diff_token_to_np_int_traj_wrt_ego[
+                token] = future_np_int_traj_wrt_ego[1:, :]  # (T, 4)
             diff_token_to_np_int_traj_11_wrt_ego[
-                token] = np_gen_int_traj_11_wrt_ego  # (T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+                token] = np_gen_int_traj_11_wrt_ego[:3]  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
             self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
-        self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego  # TODO: 속도는 잘못된 값이 들어가 있음.
+        self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego  # (1+T, 11)  # TODO: 속도는 잘못된 값이 들어가 있음.
         # 추가
-        self._draw_infos.diff_token_to_np_int_traj_11_wrt_ego = diff_token_to_np_int_traj_11_wrt_ego  # (T, 11) TODO: 속도는 잘못된 값이 들어가 있음.
+        self._draw_infos.diff_token_to_np_int_traj_11_wrt_ego = diff_token_to_np_int_traj_11_wrt_ego  # (1+T, 11) TODO: 속도는 잘못된 값이 들어가 있음.
 
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
+        if self.config.use_integration_trajectory:
+            return diff_token_to_np_int_traj_wrt_ego, diffusion_tokens_dist_order
         return diff_token_to_np_gen_traj_wrt_ego, diffusion_tokens_dist_order
 
     def _get_diff_token_to_cur_xyyaw(

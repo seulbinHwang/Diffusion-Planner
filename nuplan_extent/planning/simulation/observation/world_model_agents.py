@@ -1307,92 +1307,75 @@ class WorldModelAgents(AbstractMLAgents):
         # future_np_trajs_wrt_ego: (Pnn, 1+T, 4) # diffusion_agents 에서 생성하라는거만 생성햇음.
         # ego와 거리 순으로 모든 agent가 들어있다는 가정!!! (생성 안했으면, 빈 값을 준다.)
         """
-        future_np_trajs_wrt_ego: np.ndarray = self._model_loader.infer(
-            model_inputs).detach().cpu().numpy()
+        (future_np_trajs_wrt_ego,
+         future_np_int_trajs_wrt_ego) = self._model_loader.infer(model_inputs)
+        future_np_trajs_wrt_ego: np.ndarray = future_np_trajs_wrt_ego.detach(
+        ).cpu().numpy()  # (Pnn, 1+T, 4)
+        future_np_int_trajs_wrt_ego: np.ndarray = future_np_int_trajs_wrt_ego.detach(
+        ).cpu().numpy()  # (Pnn, 1+T, 4)
         gen_slot_len = future_np_trajs_wrt_ego.shape[0]
         # neighbor_agents_past: (Pnn, time_len, 11)
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
-
-        diff_token_to_np_hist_wrt_ego: Dict[str, np.ndarray] = {}
-        veh_valid_mask = []
-        bic_valid_mask = []
-        ped_valid_mask = []
+        # 추가
+        diff_token_to_np_int_traj_wrt_ego: Dict[str, np.ndarray] = {}
+        diff_token_to_np_int_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
 
         self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
-            agent_current = neighbor_agents_past[idx, 0]  # (11)
-            # agent_current: (11) -> (T, 11)
-            np_gen_traj_wrt_ego = np.tile(
-                agent_current,
-                (future_np_trajs_wrt_ego.shape[1] - 1, 1))  # (T, 11)
+            neighbor_agent_current = neighbor_agents_past[idx, 0]  # (11)
+            # neighbor_agent_current: (11) -> (T, 11)
+            np_gen_traj_11_wrt_ego = np.tile(
+                neighbor_agent_current,
+                (future_np_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
+            np_gen_int_traj_11_wrt_ego = np.tile(
+                neighbor_agent_current,
+                (future_np_int_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
             if idx >= gen_slot_len:
                 break
-            np_traj_wrt_ego = future_np_trajs_wrt_ego[idx, 1:, :]  # (T, 4)
-            np_gen_traj_wrt_ego[:, :4] = np_traj_wrt_ego  # (T, 11)
+            future_np_traj_wrt_ego = future_np_trajs_wrt_ego[idx,
+                                                             :, :]  # (1+T, 4)
+            np_gen_traj_11_wrt_ego[:, :4] = future_np_traj_wrt_ego  # (1+T, 11)
+            np_traj_sum = future_np_traj_wrt_ego.sum()  # (T, 4) 의 합
 
-            np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
+            future_np_int_traj_wrt_ego = future_np_int_trajs_wrt_ego[
+                idx, :, :]  # (1+T, 4)
+            np_int_traj_sum = future_np_int_traj_wrt_ego.sum()  # (1+T, 4) 의 합
+            np_gen_int_traj_11_wrt_ego[:, :
+                                       4] = future_np_int_traj_wrt_ego  # (1+T, 11)
             if np.allclose(np_traj_sum, 0.0) or token is None:
-                veh_valid_mask.append(False)
-                bic_valid_mask.append(False)
-                ped_valid_mask.append(False)
                 continue
-            diff_token_to_np_gen_traj_wrt_ego[token] = np_traj_wrt_ego
+            if np.allclose(np_int_traj_sum, 0.0):
+                print(f"{idx} 번째 대상의 보간 궤적이 모두 0입니다.")
+                continue
+
+            diff_token_to_np_gen_traj_wrt_ego[token] = future_np_traj_wrt_ego[
+                1:, :] # (T, 4)
             diff_token_to_np_gen_traj_11_wrt_ego[
-                token] = np_gen_traj_wrt_ego  # (T, 11)
-            agent_past = neighbor_agents_past[idx]  # (time_len, 11)
-            agent_class = agent_past[-1,
-                                     8:]  # (3,) one-hot # vehicle, ped, bicycle
-            veh_valid_mask.append(bool(agent_class[0]))
-            ped_valid_mask.append(bool(agent_class[1]))
-            bic_valid_mask.append(bool(agent_class[2]))
-            diff_token_to_np_hist_wrt_ego[token] = agent_past
+                token] = np_gen_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+            # 추가
+            diff_token_to_np_int_traj_wrt_ego[
+                token] = future_np_int_traj_wrt_ego[
+                1:, :] # (T, 4)
+            diff_token_to_np_int_traj_11_wrt_ego[
+                token] = np_gen_int_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+            self._diffusion_agents[token] = self._agents[token]
 
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego
-
-        veh_valid_mask = np.array(veh_valid_mask, dtype=bool)  # (Pnn,)
-        bic_valid_mask = np.array(bic_valid_mask, dtype=bool)  # (Pnn,)
-        ped_valid_mask = np.array(ped_valid_mask, dtype=bool)  # (Pnn,)
-        near_current_future_a2, near_future_a3 = self._filter_trajectory(
-            future_np_trajs_wrt_ego, neighbor_agents_past, veh_valid_mask,
-            bic_valid_mask, ped_valid_mask)
-        diff_token_to_np_slip_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
-        diff_token_to_np_smooth_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
-        for idx, token in enumerate(neighbor_token_dist_order):
-            agent_current = neighbor_agents_past[idx, 0]  # (11)
-            # agent_current: (11) -> (T, 11)
-            np_slip_traj_wrt_ego = np.tile(
-                agent_current, (near_future_a3.shape[1], 1))  # (T, 11)
-            np_smooth_traj_wrt_ego = np.tile(
-                agent_current, (near_future_a3.shape[1], 1))  # (T, 11)
-            if idx >= gen_slot_len:
-                break
-            np_slip_traj_wrt_ego[:, :4] = near_current_future_a2[
-                idx, 1:, :]  # (T, 4)
-            np_smooth_traj_wrt_ego[:, :4] = near_future_a3[idx, :, :]  # (T, 4)
-            np_slip_traj_wrt_ego = near_current_future_a2[idx, 1:, :]  # (T, 4)
-            np_smooth_traj_wrt_ego = near_future_a3[idx, :, :]  # (T, 4)
-            np_traj_sum = np_traj_wrt_ego.sum()  # (T, 4) 의 합
-            if np.allclose(np_traj_sum, 0.0) or token is None:
-                continue
-            diff_token_to_np_slip_traj_11_wrt_ego[token] = np_slip_traj_wrt_ego
-            diff_token_to_np_smooth_traj_11_wrt_ego[
-                token] = np_smooth_traj_wrt_ego
-            self._diffusion_agents[token] = self._agents[token]
-        self._draw_infos.diff_token_to_np_slip_traj_11_wrt_ego = diff_token_to_np_slip_traj_11_wrt_ego
-        self._draw_infos.diff_token_to_np_smooth_traj_11_wrt_ego = diff_token_to_np_smooth_traj_11_wrt_ego
+        self._draw_infos.diff_token_to_np_int_traj_11_wrt_ego = diff_token_to_np_int_traj_11_wrt_ego  # (T, 11) TODO: 속도는 잘못된 값이 들어가 있음.
 
         diffusion_tokens_dist_order_1 = set(
-            diff_token_to_np_smooth_traj_11_wrt_ego.keys())
+            diff_token_to_np_int_traj_11_wrt_ego.keys())
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(
             self._ego_anchor_state, self._diffusion_agents)
         assert diffusion_tokens_dist_order_1 == set(
             diffusion_tokens_dist_order), \
             "diff_token_to_np_traj_wrt_ego의 토큰과 self._diffusion_agents의 토큰이 일치하지 않습니다."
-        ######
-        return diff_token_to_np_slip_traj_11_wrt_ego, diffusion_tokens_dist_order
+        if self.config.use_integration_trajectory:
+            return diff_token_to_np_int_traj_wrt_ego, diffusion_tokens_dist_order
+        return diff_token_to_np_gen_traj_wrt_ego, diffusion_tokens_dist_order
 
     def infer_model(
         self,

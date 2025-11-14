@@ -900,9 +900,9 @@ class DiT(nn.Module):
             # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
                 x_for_feasible_detach: torch.Tensor = x.detach(
-                )  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
+                ).float()  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
                 near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach(
-                )  # (B, Pnn, 4)
+                ).float()  # (B, Pnn, 4)
                 near_past_cur_future_valid_detach: torch.Tensor = near_past_cur_future_valid.detach(
                 )
                 # DiT.forward (model_type == "x_start" 분기 내부)

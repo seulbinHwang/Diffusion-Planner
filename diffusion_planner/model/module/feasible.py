@@ -1687,27 +1687,28 @@ class FeasibleProjector(nn.Module):
             slip_epsilon,
             hp.eta_slip,  # 0.07
             hp.eps,
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"])  #
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"], # (B,Pnn)
+        )
         # (S1)
-        vx_b_k, vy_b_k = self._apply_S1_speed_limit_ste(
-            vx_b_k, vy_b_k, key_to_limit_bp["v_max"], hp.eta_speed, hp.eps)
-        # (S2)
-        if apply_S2:
-            vx_b_k, vy_b_k, omega_k = self._apply_S2_accel_alpha_limits_ste(
-                vx_b_prev, vy_b_prev, omega_prev, vx_b_k, vy_b_k, omega_k,
-                key_to_limit_bp["a_max"], key_to_limit_bp["alpha_max"], hp.dt,
-                hp.eta_inc, hp.eps)
-        # (S3)
-        omega_k = self._apply_S3_omega_clip_ste(
-            vx_b=vx_b_k,
-            vy_b=vy_b_k,
-            omega=omega_k,
-            a_lat_max=key_to_limit_bp["a_lat_max"],
-            R_min=key_to_limit_bp["R_min"],
-            omega_abs_max=key_to_limit_bp["omega_abs_max"],
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
-            eta=hp.eta_yaw,
-            eps=hp.eps)
+        # vx_b_k, vy_b_k = self._apply_S1_speed_limit_ste(
+        #     vx_b_k, vy_b_k, key_to_limit_bp["v_max"], hp.eta_speed, hp.eps)
+        # # (S2)
+        # if apply_S2:
+        #     vx_b_k, vy_b_k, omega_k = self._apply_S2_accel_alpha_limits_ste(
+        #         vx_b_prev, vy_b_prev, omega_prev, vx_b_k, vy_b_k, omega_k,
+        #         key_to_limit_bp["a_max"], key_to_limit_bp["alpha_max"], hp.dt,
+        #         hp.eta_inc, hp.eps)
+        # # (S3)
+        # omega_k = self._apply_S3_omega_clip_ste(
+        #     vx_b=vx_b_k,
+        #     vy_b=vy_b_k,
+        #     omega=omega_k,
+        #     a_lat_max=key_to_limit_bp["a_lat_max"],
+        #     R_min=key_to_limit_bp["R_min"],
+        #     omega_abs_max=key_to_limit_bp["omega_abs_max"],
+        #     is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
+        #     eta=hp.eta_yaw,
+        #     eps=hp.eps)
         # (S4)
         # vx_b_k, vy_b_k, omega_k = self._apply_S4_friction_circle_ste(
         #     vx_b_prev,
@@ -1737,6 +1738,7 @@ class FeasibleProjector(nn.Module):
         omega_k: torch.Tensor,  # (B,Pnn)
         hp: _ConstraintHParams,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        index = 14
         half_dtheta = 0.5 * omega_k * hp.dt
         # cos_mid, sin_mid: (B,Pnn)
         cos_mid, sin_mid = self._compute_mid_heading_from_cos_sin(
@@ -1886,7 +1888,7 @@ class FeasibleProjector(nn.Module):
         if future_len == 0:
             raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
             # 맨 앞에 추가
-        if self.detach_state_and_u_for_ctrl_losses:  # 추가 필요
+        if self.detach_state_and_u_for_ctrl_losses:
             unnorm_near_current_state = unnorm_near_current_state.detach(
             )  # 추가 필요
         """ key_to_limit_bp
@@ -1940,23 +1942,22 @@ class FeasibleProjector(nn.Module):
                     vy_b_k,  # (B,Pnn)
                     yaw_rate_k,  # (B,Pnn)
                     hp=self.constraints_h_params,  # _ConstraintHParams
-                    key_to_limit_bp=key_to_limit_bp,
-                    slip_epsilon=0.20,
+                    key_to_limit_bp=key_to_limit_bp, # Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn)
+                    slip_epsilon=0.0,
                     apply_S2=apply_S2_k,
                     apply_S4_ax=apply_S4_ax_k,
                 )
-
             x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(
                 x_k, y_k, cos_yaw_k, sin_yaw_k, vx_b_k, vy_b_k, yaw_rate_k,
                 self.constraints_h_params)
 
-            key_to_all_states["x_next"][..., k] = x_k1
-            key_to_all_states["y_next"][..., k] = y_k1
-            key_to_all_states["cos_next"][..., k] = cos_k1
-            key_to_all_states["sin_next"][..., k] = sin_k1
-            key_to_all_states["vx_after"][..., k] = vx_b_k
-            key_to_all_states["vy_after"][..., k] = vy_b_k
-            key_to_all_states["omega_after"][..., k] = yaw_rate_k
+            key_to_all_states["x_next"][..., k] = x_k1 # (B,Pnn)
+            key_to_all_states["y_next"][..., k] = y_k1 # (B,Pnn)
+            key_to_all_states["cos_next"][..., k] = cos_k1 # (B,Pnn)
+            key_to_all_states["sin_next"][..., k] = sin_k1 # (B,Pnn)
+            key_to_all_states["vx_after"][..., k] = vx_b_k # (B,Pnn)
+            key_to_all_states["vy_after"][..., k] = vy_b_k # (B,Pnn)
+            key_to_all_states["omega_after"][..., k] = yaw_rate_k # (B,Pnn)
 
             x_k, y_k, cos_yaw_k, sin_yaw_k = x_k1, y_k1, cos_k1, sin_k1
             vx_b_prev, vy_b_prev, omega_prev = vx_b_k, vy_b_k, yaw_rate_k

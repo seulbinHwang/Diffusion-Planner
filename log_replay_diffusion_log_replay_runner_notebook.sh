@@ -1,27 +1,9 @@
-## === 진단 모드: 터미널에 원인 직접 보기 ===
-#set -Eeuo pipefail
-#
-## 1) 파이썬 예외/크래시를 상세히 (Signal로 죽어도 트레이스 찍힘)
-#export HYDRA_FULL_ERROR=1
-#export PYTHONFAULTHANDLER=1
-#export PYTHONUNBUFFERED=1
-#export PYTHONWARNINGS=default
-#
-## 2) Ray + C++ 프로세스 로그를 터미널로 직출 & 상세 레벨
-#export RAY_LOG_TO_STDERR=1          # Ray가 자체 로그를 드라이버 STDERR로도 보냄
-#export GLOG_logtostderr=1           # gcs_server, raylet, plasma_store 같은 C++ 로그를 STDERR로
-#export RAY_BACKEND_LOG_LEVEL=debug  # Ray 파이썬 로그 레벨
-#export RAY_CPP_LOG_LEVEL=debug      # Ray C++ 로그 레벨(지원되면)
-#export RAY_DEDUP_LOGS=0             # 중복 로그 억제 끄기(원인 파악엔 생략 없이 보는게 유리)
-
-
 export HYDRA_FULL_ERROR=1 # Hydra 풀스택
 export OC_CAUSE=1 # OmegaConf 에러 원인 체인
 
 export CUDA_LAUNCH_BLOCKING=1 # (이미 쓰는 중) CUDA 디버깅 편의
 ###################################
 # User Configuration Section
-# draw_token_list: Optional[List[str]]=None
 ###################################
 # Set environment variables
 
@@ -48,9 +30,10 @@ CUSTOM_ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base_custom
 ARGS_FOR_GET_ARGS=(
   --use_feasible true
   --use_feasible_train false
-  --use_feasible_filter false
-  --use_past_for_feasible true
+  --use_feasible_filter true
+  --use_past_for_feasible false
   --use_vel_input false
+  --use_integration_trajectory true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )
 

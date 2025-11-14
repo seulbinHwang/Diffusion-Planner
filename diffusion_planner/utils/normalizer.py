@@ -15,7 +15,10 @@ class StateNormalizer:
 
     def __init__(self, mean, std):
         self.mean = torch.as_tensor(mean)  # (10, 1, 4)
+        # to float32
+        self.mean = self.mean.float()
         self.std = torch.as_tensor(std)  # (10, 1, 4)
+        self.std = self.std.float()
 
     @classmethod
     def from_json(cls, args):
@@ -39,10 +42,12 @@ class StateNormalizer:
     def __call__(self, data):
         # data: (256, 10, 80, 4)
         # mean, std: (10, 1, 4)
-        return (data - self.mean.to(data.device)) / self.std.to(data.device)
+        with torch.cuda.amp.autocast(enabled=False):
+            return (data - self.mean.to(data.device)) / self.std.to(data.device)
 
     def inverse(self, data):
-        return data * self.std.to(data.device) + self.mean.to(data.device)
+        with torch.cuda.amp.autocast(enabled=False):
+            return data * self.std.to(data.device) + self.mean.to(data.device)
 
     def to_dict(self):
         return {
@@ -99,39 +104,41 @@ class ObservationNormalizer:
         return cls(ndt)
 
     def __call__(self, data):
-        norm_data = copy(data)
-        for k, v in self._normalization_dict.items():
-            if k not in data:  # Check if key `k` exists in `data`
-                continue
-            mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
-            norm_data[k] = (data[k] - v["mean"].to(
-                data[k].device)) / v["std"].to(data[k].device)
-            norm_data[k][mask] = 0
-        # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
-        if "agent_route_lane_order" in data:
-            norm_data["agent_route_lane_order"] = data[
-                "agent_route_lane_order"].to(torch.long)
+        with torch.cuda.amp.autocast(enabled=False):
+            norm_data = copy(data)
+            for k, v in self._normalization_dict.items():
+                if k not in data:  # Check if key `k` exists in `data`
+                    continue
+                mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
+                norm_data[k] = (data[k] - v["mean"].to(
+                    data[k].device)) / v["std"].to(data[k].device)
+                norm_data[k][mask] = 0
+            # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
+            if "agent_route_lane_order" in data:
+                norm_data["agent_route_lane_order"] = data[
+                    "agent_route_lane_order"].to(torch.long)
 
-        return norm_data
+            return norm_data
 
     def inverse(self, data: dict) -> dict:
-        norm_data = copy(data)
+        with torch.cuda.amp.autocast(enabled=False):
+            norm_data = copy(data)
 
-        # 역정규화도 정의된 키만 수행
-        for k, v in self._normalization_dict.items():
-            if k not in data:
-                continue
-            mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
-            norm_data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(
-                data[k].device)
-            norm_data[k][mask] = 0
+            # 역정규화도 정의된 키만 수행
+            for k, v in self._normalization_dict.items():
+                if k not in data:
+                    continue
+                mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
+                norm_data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(
+                    data[k].device)
+                norm_data[k][mask] = 0
 
-        # 패스스루 키는 원본 그대로 (정수 유지)
-        if "agent_route_lane_order" in data:
-            norm_data["agent_route_lane_order"] = data[
-                "agent_route_lane_order"].to(torch.long)
+            # 패스스루 키는 원본 그대로 (정수 유지)
+            if "agent_route_lane_order" in data:
+                norm_data["agent_route_lane_order"] = data[
+                    "agent_route_lane_order"].to(torch.long)
 
-        return norm_data
+            return norm_data
 
     def to_dict(self):
         return {
