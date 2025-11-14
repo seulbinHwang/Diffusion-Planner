@@ -1334,8 +1334,8 @@ class WorldModelAgents(AbstractMLAgents):
                 (future_np_int_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
             if idx >= gen_slot_len:
                 break
-            future_np_traj_wrt_ego = future_np_trajs_wrt_ego[idx,
-                                                             :, :]  # (1+T, 4)
+            future_np_traj_wrt_ego = future_np_trajs_wrt_ego[
+                idx, :, :]  # (1+T, 4)
             np_gen_traj_11_wrt_ego[:, :4] = future_np_traj_wrt_ego  # (1+T, 11)
             np_traj_sum = future_np_traj_wrt_ego.sum()  # (T, 4) 의 합
 
@@ -1351,13 +1351,12 @@ class WorldModelAgents(AbstractMLAgents):
                 continue
 
             diff_token_to_np_gen_traj_wrt_ego[token] = future_np_traj_wrt_ego[
-                1:, :] # (T, 4)
+                1:, :]  # (T, 4)
             diff_token_to_np_gen_traj_11_wrt_ego[
                 token] = np_gen_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
             # 추가
             diff_token_to_np_int_traj_wrt_ego[
-                token] = future_np_int_traj_wrt_ego[
-                1:, :] # (T, 4)
+                token] = future_np_int_traj_wrt_ego[1:, :]  # (T, 4)
             diff_token_to_np_int_traj_11_wrt_ego[
                 token] = np_gen_int_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
             self._diffusion_agents[token] = self._agents[token]

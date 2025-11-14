@@ -1256,12 +1256,12 @@ class WorldModelLogReplay(AbstractMLAgents):
             diff_token_to_np_gen_traj_wrt_ego[token] = future_np_traj_wrt_ego[
                 1:, :]  # (T, 4)
             diff_token_to_np_gen_traj_11_wrt_ego[
-                token] = np_gen_traj_11_wrt_ego[:3]  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+                token] = np_gen_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
             # 추가
             diff_token_to_np_int_traj_wrt_ego[
                 token] = future_np_int_traj_wrt_ego[1:, :]  # (T, 4)
             diff_token_to_np_int_traj_11_wrt_ego[
-                token] = np_gen_int_traj_11_wrt_ego[:3]  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
+                token] = np_gen_int_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
             self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego  # (1+T, 11)  # TODO: 속도는 잘못된 값이 들어가 있음.

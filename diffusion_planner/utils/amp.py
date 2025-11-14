@@ -15,12 +15,12 @@ def amp_context_for_infer() -> Iterator[None]:
         # 암페어 이상이면 True (A100/RTX30/40 등)
         if torch.cuda.is_bf16_supported():
             return_ = torch.autocast("cuda", dtype=torch.bfloat16)
-            print("[amp_context_for_infer] Using bfloat16 autocast for inference.")
+            # print("[amp_context_for_infer] Using bfloat16 autocast for inference.")
             return return_
         else:
             return_ = torch.autocast("cuda", dtype=torch.float16)
-            print("[amp_context_for_infer] Using float16 autocast for inference.")
+            # print("[amp_context_for_infer] Using float16 autocast for inference.")
             return return_
     return_ = contextlib.nullcontext()
-    print("[amp_context_for_infer] Using no autocast for inference (CPU mode).")
+    # print("[amp_context_for_infer] Using no autocast for inference (CPU mode).")
     return return_

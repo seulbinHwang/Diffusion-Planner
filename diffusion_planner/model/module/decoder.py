@@ -899,8 +899,8 @@ class DiT(nn.Module):
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
-                x_for_feasible_detach: torch.Tensor = x.detach(
-                ).float()  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
+                x_for_feasible_detach: torch.Tensor = x.detach().float(
+                )  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
                 near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach(
                 ).float()  # (B, Pnn, 4)
                 near_past_cur_future_valid_detach: torch.Tensor = near_past_cur_future_valid.detach(
@@ -933,88 +933,123 @@ class DiT(nn.Module):
             self,
             diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
             near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
-            near_past_cur_future_valid: torch.
-        Tensor,  ## [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+            near_past_cur_future_valid: torch.Tensor,
+            # [B, pnn, time_len(=1+past_len) + future_len] bool
             near_past: torch.Tensor,  # (B, Pnn, past_len, 11)
     ):
-        # diffusion_trajectory: (B, Pnn, 1+future_len, 4)
-        # (B, Pnn, 1+future_len, 4)
-        unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
-            diffusion_trajectory)
-        unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
-                                                                0, :]  # (B, Pnn, 4)
-        if self.config.use_past_for_feasible:
-            near_past_xyyaw = near_past[:, :, :, :4]  # (B, Pnn, past_len, 4)
-            unnorm_near_past_xyyaw = self.config.state_normalizer.inverse(
-                near_past_xyyaw)  # (B, Pnn, past_len, 4)
-        else:
-            near_past_xyyaw = None
-            unnorm_near_past_xyyaw = None
-        # unnorm_points_world_control: (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
-        unnorm_points_world_control = self.feasible_projector.savgol_filter_for_control(
-            unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
-            unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
-            near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-        )
-        # unnorm_seg_body_control: (B, Pnn, seq_len, 3) #  v_x^b, v_y^b, ω # 각 시점 몸체 좌표계 기준 속도 + 세계 좌표계 기준 요레이트
-        # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
-        unnorm_seg_body_control = self.feasible_projector.compute_midpoint_controls(
-            unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
-            unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
-            unnorm_points_world_control,  # (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
-            near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-        )
+        """FeasibleProjector 전체 파이프라인을 FP32로 강제해서 실행하는 헬퍼.
 
-        temp_dict = {
-            "seg_body_control": unnorm_seg_body_control  # (B, Pnn, seq_len, 3)
-        }
-        temp_dict = self.config.observation_normalizer(temp_dict)
-        seg_body_control = temp_dict["seg_body_control"]  # (B, Pnn, seq_len, 3)
-        # seg_body_control: (B, Pnn, seq_len, 3)
-        # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
-        seg_body_control = self.feasible_projector(
-            near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-            diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
-            near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
-            seg_body_control,  # (B, Pnn, seq_len, 3)
-            self.final_hidden_tokens,  # (B, Pnn, H)
-        )
-        temp_dict = {"seg_body_control": seg_body_control}
-        temp_dict = self.config.observation_normalizer.inverse(temp_dict)
-        unnorm_seg_body_control = temp_dict[
-            "seg_body_control"]  # (B, Pnn, seq_len, 3)
+        학습/추론 둘 다에서:
+            - autocast(bf16/fp16)를 잠시 끄고
+            - diffusion_trajectory / near_past / one_hot 등을 FP32로 올린 뒤
+            - FeasibleProjector + Savitzky–Golay + 적분/제약 계산을 수행한다.
+        """
+        # ── 1) device 타입 얻기 (cuda / cpu 등) ─────────────────────────
+        device_type: str = diffusion_trajectory.device.type
 
-        if self.config.use_past_for_feasible:
-            # (B, Pnn, future_len, 3)
-            unnorm_fut_seg_body_control = unnorm_seg_body_control[:, :, -self.
-                                                                  _future_len:, :]
-        else:
-            # (B, Pnn, future_len, 3)
-            unnorm_fut_seg_body_control = unnorm_seg_body_control
-        assert unnorm_fut_seg_body_control.shape[2] == self._future_len
-        near_cur_future_valid = near_past_cur_future_valid[:, :, -(
-            1 + self._future_len):]  # [B, Pnn, 1 + future_len] bool
-        """
-        unnorm_integrated_trajectory: (B, Pnn, future_len, 4)
-        unnorm_control_constraint_diff: (B, Pnn, future_len, 3)
-        """
-        (unnorm_integrated_trajectory, unnorm_control_constraint_diff
-        ) = self.feasible_projector.filter_and_integrate(
-            unnorm_near_current_state,  # (B, Pnn, 4)
-            near_cur_future_valid,  # (B, Pnn, 1+future_len) bool  ← 시점별 마스크
-            unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
-            near_class_one_hot,
-            # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
-        )  # (B, Pnn, future_len, 4)
-        integrated_trajectory = self.config.state_normalizer(
-            unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
-        temp_dict = {"seg_body_control": unnorm_control_constraint_diff}
-        temp_dict = self.config.observation_normalizer(temp_dict)
-        control_constraint_diff = temp_dict[
-            "seg_body_control"]  # (B, Pnn, future_len, 3)
-        self.dit_returns = DiTReturns(
-            integrated_trajectory=
-            integrated_trajectory,  # (B, Pnn, future_len, 4)
-            control_constraint_diff=
-            control_constraint_diff  # (B, Pnn, future_len, 3)
-        )
+        # ── 2) 이 블록 안에서는 autocast 완전히 비활성화 ───────────────
+        #     → matmul/conv/linear 등이 bf16/FP16으로 내려가지 않게 함
+        with torch.autocast(device_type=device_type, enabled=False):
+            # ── 3) 혹시 half/bf16이 들어왔더라도 FP32로 강제 캐스팅 ──
+            diffusion_trajectory = diffusion_trajectory.float(
+            )  # (B, Pnn, 1+T, 4)
+            near_class_one_hot = near_class_one_hot.float()  # (B, Pnn, 3)
+            # valid 마스크는 bool 유지
+            near_past_cur_future_valid = near_past_cur_future_valid.to(
+                torch.bool)
+
+            # near_past: (B, Pnn, past_len, 11)
+            if near_past is not None:
+                near_past = near_past.float()
+
+            # ── 4) ↓↓↓ 아래는 기존 코드(몸통) 그대로, 한 단계 들여쓰기만 추가 ↓↓↓
+
+            # diffusion_trajectory: (B, Pnn, 1+future_len, 4)
+            # (B, Pnn, 1+future_len, 4)
+            unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
+                diffusion_trajectory)
+            unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
+                                                                    0, :]  # (B, Pnn, 4)
+            if self.config.use_past_for_feasible:
+                near_past_xyyaw = near_past[:, :, :, :
+                                            4]  # (B, Pnn, past_len, 4)
+                unnorm_near_past_xyyaw = self.config.state_normalizer.inverse(
+                    near_past_xyyaw)  # (B, Pnn, past_len, 4)
+            else:
+                near_past_xyyaw = None
+                unnorm_near_past_xyyaw = None
+            # unnorm_points_world_control: (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
+            unnorm_points_world_control = self.feasible_projector.savgol_filter_for_control(
+                unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
+                unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
+                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+            )
+            # unnorm_seg_body_control: (B, Pnn, seq_len, 3) #  v_x^b, v_y^b, ω # 각 시점 몸체 좌표계 기준 속도 + 세계 좌표계 기준 요레이트
+            # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
+            unnorm_seg_body_control = self.feasible_projector.compute_midpoint_controls(
+                unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
+                unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
+                unnorm_points_world_control,  # (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
+                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+            )
+
+            temp_dict = {
+                "seg_body_control":
+                    unnorm_seg_body_control  # (B, Pnn, seq_len, 3)
+            }
+            temp_dict = self.config.observation_normalizer(temp_dict)
+            seg_body_control = temp_dict[
+                "seg_body_control"]  # (B, Pnn, seq_len, 3)
+            # seg_body_control: (B, Pnn, seq_len, 3)
+            # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
+
+            # FeasibleProjector 본체(컨트롤 보정 네트워크)도 FP32로 실행
+            seg_body_control = self.feasible_projector(
+                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+                diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+                near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+                seg_body_control,  # (B, Pnn, seq_len, 3)
+                self.final_hidden_tokens,  # (B, Pnn, H)
+            )
+            temp_dict = {"seg_body_control": seg_body_control}
+            temp_dict = self.config.observation_normalizer.inverse(temp_dict)
+            unnorm_seg_body_control = temp_dict[
+                "seg_body_control"]  # (B, Pnn, seq_len, 3)
+
+            if self.config.use_past_for_feasible:
+                # (B, Pnn, future_len, 3)
+                unnorm_fut_seg_body_control = unnorm_seg_body_control[:, :,
+                                                                      -self.
+                                                                      _future_len:, :]
+            else:
+                # (B, Pnn, future_len, 3)
+                unnorm_fut_seg_body_control = unnorm_seg_body_control
+            assert unnorm_fut_seg_body_control.shape[2] == self._future_len
+            near_cur_future_valid = near_past_cur_future_valid[:, :, -(
+                1 + self._future_len):]  # [B, Pnn, 1 + future_len] bool
+            """
+            unnorm_integrated_trajectory: (B, Pnn, future_len, 4)
+            unnorm_control_constraint_diff: (B, Pnn, future_len, 3)
+            """
+            (unnorm_integrated_trajectory, unnorm_control_constraint_diff
+            ) = self.feasible_projector.filter_and_integrate(
+                unnorm_near_current_state,  # (B, Pnn, 4)
+                near_cur_future_valid,  # (B, Pnn, 1+future_len) bool  ← 시점별 마스크
+                unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
+                near_class_one_hot,
+                # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
+            )  # (B, Pnn, future_len, 4)
+
+            integrated_trajectory = self.config.state_normalizer(
+                unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
+            temp_dict = {"seg_body_control": unnorm_control_constraint_diff}
+            temp_dict = self.config.observation_normalizer(temp_dict)
+            control_constraint_diff = temp_dict[
+                "seg_body_control"]  # (B, Pnn, future_len, 3)
+
+            self.dit_returns = DiTReturns(
+                integrated_trajectory=
+                integrated_trajectory,  # (B, Pnn, future_len, 4)
+                control_constraint_diff=
+                control_constraint_diff  # (B, Pnn, future_len, 3)
+            )

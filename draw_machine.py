@@ -366,7 +366,7 @@ class DrawingOptions:
     """
     background_color: str = BLACK
     show_axis: bool = False
-    fig_size: Tuple[float, float] = (18.0, 18.0)
+    fig_size: Tuple[float, float] = (15.0, 15.0)
     dpi: int = 400
     margin_m: float = 5.0
     equal_aspect: bool = True
@@ -553,7 +553,7 @@ class DrawingOptions:
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
-    DIFF_draw_future_gen_refined_velocity: bool = False
+    DIFF_draw_future_gen_refined_velocity: bool = True
     DIFF_future_gen_refined_velocity_offset_m: float = 0.3
     DIFF_future_gen_refined_velocity_font_size = 2
     DIFF_future_gen_refined_token_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)

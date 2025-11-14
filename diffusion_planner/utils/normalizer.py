@@ -42,11 +42,11 @@ class StateNormalizer:
     def __call__(self, data):
         # data: (256, 10, 80, 4)
         # mean, std: (10, 1, 4)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(data.device.type, enabled=False):
             return (data - self.mean.to(data.device)) / self.std.to(data.device)
 
     def inverse(self, data):
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast(data.device.type, enabled=False):
             return data * self.std.to(data.device) + self.mean.to(data.device)
 
     def to_dict(self):
@@ -104,7 +104,8 @@ class ObservationNormalizer:
         return cls(ndt)
 
     def __call__(self, data):
-        with torch.cuda.amp.autocast(enabled=False):
+        device_type = list(data.values())[0].device.type
+        with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
             for k, v in self._normalization_dict.items():
                 if k not in data:  # Check if key `k` exists in `data`
@@ -121,7 +122,9 @@ class ObservationNormalizer:
             return norm_data
 
     def inverse(self, data: dict) -> dict:
-        with torch.cuda.amp.autocast(enabled=False):
+        device_type = list(data.values())[0].device.type
+
+        with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
 
             # 역정규화도 정의된 키만 수행
@@ -129,8 +132,8 @@ class ObservationNormalizer:
                 if k not in data:
                     continue
                 mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
-                norm_data[k] = data[k] * v["std"].to(data[k].device) + v["mean"].to(
-                    data[k].device)
+                norm_data[k] = data[k] * v["std"].to(
+                    data[k].device) + v["mean"].to(data[k].device)
                 norm_data[k][mask] = 0
 
             # 패스스루 키는 원본 그대로 (정수 유지)
