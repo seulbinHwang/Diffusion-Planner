@@ -870,7 +870,7 @@ class DiT(nn.Module):
                 cross_mask=cross_mask  # [B, N_c]
             )
             x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
-        self.final_hidden_tokens = x.detach().clone()  # (B, Pnn, H)
+        self.final_hidden_tokens = x.detach().clone().float()  # (B, Pnn, H)
         # [V2 - END]
         # --- ✅ PRAM‑v2: 9단계 최종 보정 + 최종 투영(= FinalLayer 완전 대체) ---
         x = apply_pram_v2_final_layer(
