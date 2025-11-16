@@ -23,6 +23,7 @@ from diffusion_planner.model.module.pram_v2 import (
 )
 from typing import Tuple, Optional
 from diffusion_planner.model.module.feasible import FeasibleProjector
+from diffusion_planner.loss import AMP_DTYPE
 
 
 def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -744,7 +745,6 @@ class DiT(nn.Module):
         if x_unpad.numel() == 0:
             D_out = self.preproj.fc2.out_features  # timm Mlp의 최종 out_features
             zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
-            zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
             # timm Mlp(fc1/fc2)의 파라미터를 0-스케일로 터치(그래프 포함)
             touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
                      (self.preproj.fc1.bias.view(-1)[:1].sum()
@@ -1002,15 +1002,20 @@ class DiT(nn.Module):
                 "seg_body_control"]  # (B, Pnn, seq_len, 3)
             # seg_body_control: (B, Pnn, seq_len, 3)
             # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
-
-            # FeasibleProjector 본체(컨트롤 보정 네트워크)도 FP32로 실행
-            seg_body_control = self.feasible_projector(
-                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-                diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
-                near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
-                seg_body_control,  # (B, Pnn, seq_len, 3)
-                self.final_hidden_tokens,  # (B, Pnn, H)
-            )
+            with torch.autocast(
+                device_type=device_type,
+                dtype=AMP_DTYPE,
+                enabled=(device_type == "cuda"),
+            ):
+                # FeasibleProjector 본체(컨트롤 보정 네트워크)도 FP32로 실행
+                seg_body_control = self.feasible_projector(
+                    near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+                    diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+                    near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+                    seg_body_control,  # (B, Pnn, seq_len, 3)
+                    self.final_hidden_tokens,  # (B, Pnn, H)
+                )
+            seg_body_control = seg_body_control.float()
             temp_dict = {"seg_body_control": seg_body_control}
             temp_dict = self.config.observation_normalizer.inverse(temp_dict)
             unnorm_seg_body_control = temp_dict[

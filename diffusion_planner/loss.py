@@ -344,7 +344,7 @@ def diffusion_loss_func(
         "diffusion_time": batch_diffusion_time,  # [B,]
         "cond_last_pos_norm": cond_last_pos_norm,  # [B, Pnn, 4]
     }
-    with torch.autocast("cuda", dtype=AMP_DTYPE):
+    with torch.autocast("cuda", dtype=AMP_DTYPE): # AMP_DTYPE = torch.bfloat16
         _, decoder_output = model(merged_inputs)
 
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)
