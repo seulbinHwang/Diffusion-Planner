@@ -25,6 +25,39 @@ from typing import Dict, Tuple, Optional
 # <추가하자>
 from typing import NamedTuple
 
+# decoder.py 또는 feasible.py 상단 import 근처에 추가
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
+
+@contextmanager
+def profile_block(name: str,
+                  enabled: bool = True,
+                  device_type: str = "cuda") -> Iterator[None]:
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
+
+    Args:
+        name: 출력에 사용할 블록 이름.
+        enabled: False 이면 아무 것도 하지 않고 그냥 통과.
+        device_type: "cuda" 인 경우, GPU 연산 정합을 위해 앞/뒤에 synchronize 호출.
+    """
+    if not enabled:
+        # 아무 것도 하지 않고 블록만 실행
+        yield
+        return
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time: float = time.perf_counter()
+
+    yield  # 실제 코드 실행
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
+
 
 # <추가하자>
 class PointLenInputs(NamedTuple):
@@ -233,7 +266,7 @@ class FeasibleProjector(nn.Module):
         self._sg_pos_cache: "OrderedDict[Tuple[int, int, int, int, float, torch.dtype, torch.device], torch.Tensor]" = OrderedDict(
         )
         self._sg_pos_cache_cap: int = 2048  # 필요시 조절
-
+        self.enable_profile: bool = False
         self.constraints_h_params = _ConstraintHParams(
             dt=0.1,
             eps=1e-6,
@@ -1687,7 +1720,7 @@ class FeasibleProjector(nn.Module):
             slip_epsilon,
             hp.eta_slip,  # 0.07
             hp.eps,
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"], # (B,Pnn)
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # (B,Pnn)
         )
         # (S1)
         vx_b_k, vy_b_k = self._apply_S1_speed_limit_ste(
@@ -2335,28 +2368,52 @@ class FeasibleProjector(nn.Module):
         - 전체 유효 row → `_sg_derivative_full_rows` (벡터화)
         - 일부 유효 row(0*1*0*) → `_sg_derivative_partial_rows` (연속 블록만 허용)
         """
-        dx = torch.zeros_like(seq_bT)  # (B_Pnn, point_len)
         """ 전 구간 유효 row / 일부만 유효 row 인덱스 분리.
         idx_full (K,), idx_partial (M,)
         """
-        idx_full, idx_partial = self._split_full_vs_partial_rows(valid_bT)
+        dx = torch.zeros_like(seq_bT)  # (B_Pnn, point_len) [!추가하자!]
 
-        if idx_full.numel() > 0:
+        # 1) 유효한 점이 하나도 없는 row(모두 False)는 그대로 0으로 남겨둔다.
+        valid_any = valid_bT.any(dim=1)  # (B_Pnn,)  True=적어도 한 시점 유효 [!추가하자!]
+        if not valid_any.any():  # [!추가하자!]
+            # 모든 row가 완전히 invalid → 처음부터 끝까지 미분값 0 [!추가하자!]
+            return dx  # (B_Pnn, point_len) [!추가하자!]
+
+        # 2) 유효 블록이 하나라도 있는 row만 따로 모은다.
+        seq_eff = seq_bT[valid_any]  # (N_eff, point_len) [!추가하자!]
+        valid_eff = valid_bT[valid_any]  # (N_eff, point_len) [!추가하자!]
+
+        # N_eff 기준으로 full/partial 분리
+        # idx_full_sub, idx_partial_sub: (K,), (M,) [!추가하자!]
+        idx_full_sub, idx_partial_sub = self._split_full_vs_partial_rows(
+            valid_eff)
+
+        # 원래 (B_Pnn) 인덱스로 되돌리기 위한 글로벌 인덱스
+        global_idx = valid_any.nonzero(as_tuple=False).squeeze(
+            -1)  # (N_eff,) [!추가하자!]
+
+        # 3) 전 구간 유효 row: 완전 벡터화된 SG 미분
+        if idx_full_sub.numel() > 0:  # [!추가하자!]
+            # (K, point_len) [!추가하자!]
             dx_full = self._sg_derivative_full_rows(
-                seq_bT[idx_full],  # (N_full, point_len)
+                seq_eff[idx_full_sub],  # (K, point_len)
                 dt,
                 polyorder,
-                max_window_length)
-            dx[idx_full] = dx_full
+                max_window_length,
+            )
+            dx[global_idx[
+                idx_full_sub]] = dx_full  # (K, point_len) → 해당 row에 채우기 [!추가하자!]
 
-        if idx_partial.numel() > 0:
-            dx_part = self._sg_derivative_partial_rows(
-                seq_bT[idx_partial],  # (N_partial, point_len)
-                valid_bT[idx_partial],  # (N_partial, point_len)
+        # 4) 부분 유효 row(0*1*0*): 유효 블록에만 SG + 나머지는 0
+        if idx_partial_sub.numel() > 0:  # [!추가하자!]
+            dx_part = self._sg_derivative_partial_rows(  # (M, point_len) [!추가하자!]
+                seq_eff[idx_partial_sub],
+                valid_eff[idx_partial_sub],
                 dt,
                 polyorder,
-                max_window_length)
-            dx[idx_partial] = dx_part
+                max_window_length,
+            )
+            dx[global_idx[idx_partial_sub]] = dx_part  # [!추가하자!]
 
         return dx
 
@@ -2836,23 +2893,244 @@ class FeasibleProjector(nn.Module):
                                torch.zeros_like(yaw_rate))
         return torch.stack([v_x, v_y, yaw_rate], dim=-1)  # (B,Pnn,point_len,3)
 
-    # <추가하자>
+    # [!추가하자!]
+    def _build_forward_segment_mask_and_active_flat(
+        self,
+        points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len) bool
+        seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+    ) -> Tuple[
+            torch.Tensor,  # seg_mask: (B, Pnn, segment_len)
+            torch.Tensor,  # seg_mask_1: (B, Pnn, segment_len, 1)
+            torch.Tensor,  # seg_mask_flat: (B*Pnn, segment_len)
+            torch.Tensor,  # seg_mask_1_flat: (B*Pnn, segment_len, 1)
+            torch.Tensor,  # active_flat: (B*Pnn,)
+            int,  # B
+            int,  # Pnn
+            int,  # segment_len
+            int,  # B_Pnn
+    ]:
+        """forward용 세그먼트 마스크와 '유효 이웃 플래그'를 생성합니다.
+
+        - 세그먼트 마스크는 양 끝 노드가 모두 유효(True)인 구간만 1.0입니다.
+        - active_flat은 (batch, neighbor)마다 '한 segment라도 유효한지'를 나타내는 플래그입니다.
+
+        Args:
+            points_valid: (B, Pnn, 1+segment_len) bool
+                노드 단위 유효 마스크.
+            seg_body_control: (B, Pnn, segment_len, 3)
+                세그먼트 단위 제어 시퀀스 [v_x^b, v_y^b, w].
+
+        Returns:
+            seg_mask: (B, Pnn, segment_len) float32
+            seg_mask_1: (B, Pnn, segment_len, 1) float32
+            seg_mask_flat: (B*Pnn, segment_len) float32
+            seg_mask_1_flat: (B*Pnn, segment_len, 1) float32
+            active_flat: (B*Pnn,) bool
+                각 (batch, neighbor) 슬롯별로 '한 개 이상 유효 segment가 있으면' True.
+            B: 배치 크기
+            Pnn: neighbor 슬롯 수
+            segment_len: 세그먼트 길이
+            B_Pnn: B * Pnn (flatten된 row 수)
+        """
+        B, Pnn, segment_len, _ = seg_body_control.shape
+        seg_mask, seg_mask_1 = self._build_segment_mask(points_valid)
+        B_Pnn = B * Pnn
+        seg_mask_flat = seg_mask.view(B_Pnn, segment_len)
+        seg_mask_1_flat = seg_mask_1.view(B_Pnn, segment_len, 1)
+        active_flat = seg_mask_flat.any(dim=-1)  # (B*Pnn,)
+        return (
+            seg_mask,
+            seg_mask_1,
+            seg_mask_flat,
+            seg_mask_1_flat,
+            active_flat,
+            B,
+            Pnn,
+            segment_len,
+            B_Pnn,
+        )
+
+    # [!추가하자!]
+    def _gather_forward_active_subset(
+        self,
+        points_trajectory: torch.Tensor,  # (B, Pnn, 1+segment_len, 4)
+        points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len)
+        seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+        seg_mask_flat: torch.Tensor,  # (B*Pnn, segment_len)
+        seg_mask_1_flat: torch.Tensor,  # (B*Pnn, segment_len, 1)
+        dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
+        active_flat: torch.Tensor,  # (B*Pnn,)
+        B_Pnn: int,
+        segment_len: int,
+    ) -> Tuple[
+            torch.Tensor,  # active_indices: (N_active,)
+            torch.
+            Tensor,  # points_trajectory_active: (N_active, 1, 1+segment_len, 4)
+            torch.Tensor,  # points_valid_active: (N_active, 1, 1+segment_len)
+            torch.
+            Tensor,  # seg_body_control_active: (N_active, 1, segment_len, 3)
+            torch.Tensor,  # seg_mask_active: (N_active, 1, segment_len)
+            torch.Tensor,  # seg_mask_1_active: (N_active, 1, segment_len, 1)
+            torch.Tensor,  # dit_tokens_active: (N_active, 1, H)
+    ]:
+        """유효 segment가 있는 이웃들만 골라 (N_active, 1, ·) 형태로 모읍니다.
+        """
+        # (B*Pnn,) -> (N_active,)
+        active_indices = active_flat.nonzero(as_tuple=False).squeeze(
+            -1)  # (N_active,)
+
+        points_trajectory_flat = points_trajectory.view(
+            B_Pnn, 1 + segment_len, 4)  # (B*Pnn, 1+segment_len, 4)
+        points_valid_flat = points_valid.view(
+            B_Pnn, 1 + segment_len)  # (B*Pnn, 1+segment_len)
+        seg_body_control_flat = seg_body_control.view(
+            B_Pnn, segment_len, 3)  # (B*Pnn, segment_len, 3)
+        dit_tokens_flat = dit_final_hidden_tokens.view(B_Pnn, -1)  # (B*Pnn, H)
+
+        points_trajectory_active = points_trajectory_flat[
+            active_indices].unsqueeze(1)  # (N_active, 1, 1+segment_len, 4)
+        points_valid_active = points_valid_flat[active_indices].unsqueeze(
+            1)  # (N_active, 1, 1+segment_len)
+        seg_body_control_active = seg_body_control_flat[
+            active_indices].unsqueeze(1)  # (N_active, 1, segment_len, 3)
+        seg_mask_active = seg_mask_flat[active_indices].unsqueeze(
+            1)  # (N_active, 1, segment_len)
+        seg_mask_1_active = seg_mask_1_flat[active_indices].unsqueeze(
+            1)  # (N_active, 1, segment_len, 1)
+        dit_tokens_active = dit_tokens_flat[active_indices].unsqueeze(
+            1)  # (N_active, 1, H)
+
+        return (
+            active_indices,
+            points_trajectory_active,
+            points_valid_active,
+            seg_body_control_active,
+            seg_mask_active,
+            seg_mask_1_active,
+            dit_tokens_active,
+        )
+
+    # [!추가하자!]
+    def _run_feasible_tcn_for_active_subset(
+            self,
+            points_trajectory_active: torch.
+        Tensor,  # (N_active, 1, 1+segment_len, 4)
+            points_valid_active: torch.Tensor,  # (N_active, 1, 1+segment_len)
+            seg_body_control_active: torch.
+        Tensor,  # (N_active, 1, segment_len, 3)
+            seg_mask_active: torch.Tensor,  # (N_active, 1, segment_len)
+            seg_mask_1_active: torch.Tensor,  # (N_active, 1, segment_len, 1)
+            dit_tokens_active: torch.Tensor,  # (N_active, 1, H)
+    ) -> torch.Tensor:  # (N_active, segment_len, 3)
+        """유효 이웃(active subset)에 대해서만 TCN 기반 ΔU를 계산합니다.
+
+        Args:
+            points_trajectory_active: (N_active, 1, 1+segment_len, 4)
+                active 이웃들의 포인트 궤적.
+            points_valid_active: (N_active, 1, 1+segment_len) bool
+                포인트 유효 마스크.
+            seg_body_control_active: (N_active, 1, segment_len, 3)
+                세그먼트 제어 [v_x^b, v_y^b, w].
+            seg_mask_active: (N_active, 1, segment_len)
+                세그먼트 마스크(0/1).
+            seg_mask_1_active: (N_active, 1, segment_len, 1)
+                세그먼트 마스크(채널용).
+            dit_tokens_active: (N_active, 1, H)
+                디퓨전 트렁크 은닉.
+
+        Returns:
+            delta_u_active: (N_active, segment_len, 3)
+                각 active 이웃에 대한 ΔU.
+        """
+        x_prev_active, x_fut_active = self._split_prev_fut(
+            points_trajectory_active)  # (N_active, 1, segment_len, 4) each
+        x_prev_active = self._normalize_cos_sin(x_prev_active)
+        x_fut_active = self._normalize_cos_sin(x_fut_active)
+
+        Z_in_active = self._features_from_inputs(
+            x_prev=x_prev_active,  # (N_active, 1, segment_len, 4)
+            x_fut=x_fut_active,  # (N_active, 1, segment_len, 4)
+            u_base=seg_body_control_active,  # (N_active, 1, segment_len, 3)
+            dit_final_hidden_tokens=dit_tokens_active,  # (N_active, 1, H)
+            points_valid=points_valid_active,  # (N_active, 1, 1+segment_len)
+        )  # (N_active, 1, segment_len, 192)
+
+        Z_s_active = self._prepare_tcn_input(
+            Z_in_active, seg_mask_1_active)  # (N_active, 1, segment_len, 192)
+        Z_tcn_active = self._run_tcn(
+            Z_s_active, seg_mask_active,
+            seg_mask_1_active)  # (N_active, 1, segment_len, 192)
+
+        delta_u_active = self._predict_delta_u(
+            Z_tcn_active, seg_mask_1_active)  # (N_active, 1, segment_len, 3)
+        delta_u_active = delta_u_active.squeeze(1)  # (N_active, segment_len, 3)
+        return delta_u_active
+
+    # [!추가하자!]
+    def _scatter_forward_delta_u(
+        self,
+        seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+        delta_u_active: torch.Tensor,  # (N_active, segment_len, 3)
+        active_indices: torch.Tensor,  # (N_active,)
+        B: int,
+        Pnn: int,
+        segment_len: int,
+    ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)
+        """active 이웃들에서 계산한 ΔU를 전체 (B,Pnn,segment_len,3) 텐서로 되돌립니다.
+
+        - inactive 이웃의 ΔU는 0으로 두고,
+        - active 이웃 위치에만 ΔU를 채운 뒤,
+        - 최종적으로 U_ref = U_base + ΔU 를 구성합니다.
+
+        Args:
+            seg_body_control: (B, Pnn, segment_len, 3)
+                베이스 제어 U_base.
+            delta_u_active: (N_active, segment_len, 3)
+                active 이웃들의 ΔU.
+            active_indices: (N_active,)
+                flatten된 row 인덱스 (0..B*Pnn-1).
+            B: 배치 크기.
+            Pnn: neighbor 슬롯 수.
+            segment_len: 세그먼트 길이.
+
+        Returns:
+            u_ref: (B, Pnn, segment_len, 3)
+                보정된 제어.
+        """
+        B_Pnn = B * Pnn
+        seg_body_control_flat = seg_body_control.view(
+            B_Pnn, segment_len, 3)  # (B*Pnn, segment_len, 3)
+        delta_u_flat = torch.zeros_like(
+            seg_body_control_flat)  # (B*Pnn, segment_len, 3)
+        delta_u_flat[active_indices] = delta_u_active  # active 위치만 채움
+
+        delta_u = delta_u_flat.view(B, Pnn, segment_len,
+                                    3)  # (B, Pnn, segment_len, 3)
+        u_ref = seg_body_control + delta_u  # (B, Pnn, segment_len, 3)
+        return u_ref
+
     def forward(
             self,
             near_past_cur_future_valid: torch.Tensor,
-            # (B, Pnn, time_len(=1+past_len) + future_len) bool  # 과거~현재~미래 노드 유효 마스크
+            # (B, Pnn, time_len(=1+past_len) + future_len) bool
             diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
             near_past_xyyaw: Optional[
                 torch.Tensor],  # (B, Pnn, past_len, 4) or None
             seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
             dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
     ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)
-        """Control Correction Network 전체 경로.
+        """Control Correction Network 전체 forward 경로.
+
+        - 과거/현재/미래 포인트와 유효 마스크를 정리한 뒤,
+        - 세그먼트 마스크를 만들고,
+        - 유효 segment가 하나라도 있는 이웃들(active subset)에 대해서만
+          TCN 기반 ΔU를 계산한 후,
+        - 전체 (B,Pnn,segment_len,3) 제어 텐서로 다시 scatter 합니다.
 
         Args:
             near_past_cur_future_valid:
                 (B, Pnn, time_len(=1+past_len) + future_len) bool
-                과거~현재~미래 모든 노드의 유효 마스크.
+                과거~현재~미래 노드 유효 마스크.
             diffusion_trajectory:
                 (B, Pnn, 1+future_len, 4) = [x, y, cos, sin]
                 현재~미래 포인트 궤적.
@@ -2861,73 +3139,91 @@ class FeasibleProjector(nn.Module):
                 Tensor 이면 (B, Pnn, past_len, 4) 로 과거~현재~미래 전체 사용
                 (segment_len = past_len + future_len).
             seg_body_control:
-                (B, Pnn, segment_len, 3)  = [v_x^b, v_y^b, w]_seg (정규화 이전 값).
+                (B, Pnn, segment_len, 3)  = [v_x^b, v_y^b, w]_seg.
             dit_final_hidden_tokens:
                 (B, Pnn, H)  디퓨전 트렁크 최종 은닉.
 
         Returns:
-            torch.Tensor:
-                u_ref: (B, Pnn, segment_len, 3)
+            u_ref: (B, Pnn, segment_len, 3)
                 입력 seg_body_control 에 대한 보정 제어.
         """
         if not self.use_feasible_train:
             return seg_body_control
 
-        # seg_body_control 에서 segment_len 을 기준으로 사용
-        _, _, segment_len, _ = seg_body_control.shape
-
-        # 1) forward 에서 사용할 포인트 궤적 + 노드 유효 마스크 준비
-        #    - points_trajectory:      (B, Pnn, 1+segment_len, 4)
-        #    - node_valid_for_segments:(B, Pnn, 1+segment_len) bool
-        """ segment_len
-        1. if near_past_xyyaw is None:
-            segment_len = future_len
-        2. if near_past_xyyaw is not None:
-            segment_len = past_len + future_len
-        """
+        # 1) forward에서 사용할 포인트 궤적 + 노드 유효 마스크 준비
+        #    points_trajectory: (B, Pnn, 1+segment_len, 4)
+        #    points_valid:      (B, Pnn, 1+segment_len) bool
         points_trajectory, points_valid = self._prepare_forward_points_and_mask(
-            near_past_cur_future_valid=
-            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
-            diffusion_trajectory=
-            diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
-            near_past_xyyaw=near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+            near_past_cur_future_valid=near_past_cur_future_valid,
+            diffusion_trajectory=diffusion_trajectory,
+            near_past_xyyaw=near_past_xyyaw,
+            seg_body_control=seg_body_control,
+        )
+
+        # 2) 세그먼트 마스크 및 active 플래그 생성
+        (
+            seg_mask,  # (B, Pnn, segment_len)
+            seg_mask_1,  # (B, Pnn, segment_len, 1)
+            seg_mask_flat,  # (B*Pnn, segment_len)
+            seg_mask_1_flat,  # (B*Pnn, segment_len, 1)
+            active_flat,  # (B*Pnn,)
+            B,
+            Pnn,
+            segment_len,
+            B_Pnn,
+        ) = self._build_forward_segment_mask_and_active_flat(
+            points_valid=points_valid,  # (B, Pnn, 1+segment_len) bool
             seg_body_control=seg_body_control,  # (B, Pnn, segment_len, 3)
         )
 
-        # points_valid: (B, Pnn, 1+segment_len) bool
-        # 2) segment 기반 마스크 (양 끝 노드 모두 True 인 segment 만 1.0)
-        #    - seg_mask:   (B, Pnn, segment_len) float(0/1)
-        #    - seg_mask_1: (B, Pnn, segment_len, 1)
-        seg_mask, seg_mask_1 = self._build_segment_mask(points_valid)
+        # 2-1) 유효 segment가 하나도 없는 경우: 그대로 반환
+        if not active_flat.any():
+            return seg_body_control
 
-        # 3) 입력 분해 + 단위원 재투영
-        #    points_trajectory: (B, Pnn, 1+segment_len, 4)
-        #    x_prev: (B, Pnn, segment_len, 4) ← t_k
-        #    x_fut : (B, Pnn, segment_len, 4) ← t_{k+1}
-        x_prev, x_fut = self._split_prev_fut(points_trajectory)
-        x_prev = self._normalize_cos_sin(x_prev)
-        x_fut = self._normalize_cos_sin(x_fut)
-
-        # 4) 피처 인코딩
-        #    Z_in: (B, Pnn, segment_len, 192)
-        Z_in = self._features_from_inputs(
-            x_prev=x_prev,  # (B, Pnn, segment_len, 4)
-            x_fut=x_fut,  # (B, Pnn, segment_len, 4)
-            u_base=seg_body_control,  # (B, Pnn, segment_len, 3)
+        # 3) active 이웃 subset만 모으기
+        (
+            active_indices,  # (N_active,)
+            points_trajectory_active,  # (N_active, 1, 1+segment_len, 4)
+            points_valid_active,  # (N_active, 1, 1+segment_len)
+            seg_body_control_active,  # (N_active, 1, segment_len, 3)
+            seg_mask_active,  # (N_active, 1, segment_len)
+            seg_mask_1_active,  # (N_active, 1, segment_len, 1)
+            dit_tokens_active,  # (N_active, 1, H)
+        ) = self._gather_forward_active_subset(
+            points_trajectory=points_trajectory,  # (B, Pnn, 1+segment_len, 4)
+            points_valid=points_valid,  # (B, Pnn, 1+segment_len) bool
+            seg_body_control=seg_body_control,  # (B, Pnn, segment_len, 3)
+            seg_mask_flat=seg_mask_flat,  # (B*Pnn, segment_len)
+            seg_mask_1_flat=seg_mask_1_flat,  # (B*Pnn, segment_len, 1)
             dit_final_hidden_tokens=dit_final_hidden_tokens,  # (B, Pnn, H)
-            points_valid=points_valid,  # (B, Pnn, 1+segment_len)
+            active_flat=active_flat,  # (B*Pnn,)
+            B_Pnn=B_Pnn,
+            segment_len=segment_len,
         )
 
-        # 5) Stem → 6) TCN
-        #    Z_s:   (B, Pnn, segment_len, 192)
-        #    Z_tcn: (B, Pnn, segment_len, 192)
-        Z_s = self._prepare_tcn_input(Z_in, seg_mask_1)
-        Z_tcn = self._run_tcn(Z_s, seg_mask, seg_mask_1)
+        # 4) active subset에 대해서만 TCN + Head 수행해 ΔU 계산
+        # (N_active, segment_len, 3)
+        delta_u_active = self._run_feasible_tcn_for_active_subset(
+            points_trajectory_active=
+            points_trajectory_active,  # (N_active, 1, 1+segment_len, 4)
+            points_valid_active=
+            points_valid_active,  # (N_active, 1, 1+segment_len)
+            seg_body_control_active=
+            seg_body_control_active,  # (N_active, 1, segment_len, 3)
+            seg_mask_active=seg_mask_active,  # (N_active, 1, segment_len)
+            seg_mask_1_active=seg_mask_1_active,  # (N_active, 1, segment_len, 1)
+            dit_tokens_active=dit_tokens_active,  # (N_active, 1, H)
+        )
 
-        # 7) ΔU 예측 → 8) 결합
-        #    delta_u, u_ref: (B, Pnn, segment_len, 3)
-        delta_u = self._predict_delta_u(Z_tcn, seg_mask_1)
-        u_ref = seg_body_control + delta_u
+        # 5) ΔU를 전체 (B,Pnn,segment_len,3) 텐서로 scatter 후 U_ref 반환
+        u_ref = self._scatter_forward_delta_u(
+            seg_body_control=seg_body_control,  # (B, Pnn, segment_len, 3)
+            delta_u_active=delta_u_active,  # (N_active, segment_len, 3)
+            active_indices=active_indices,  # (N_active,)
+            B=B,
+            Pnn=Pnn,
+            segment_len=segment_len,
+        )
         return u_ref
 
     def _assert_past_cur_valid_mask(

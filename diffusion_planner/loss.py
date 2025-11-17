@@ -295,8 +295,7 @@ def diffusion_loss_func(
     batch_diffusion_time = torch.rand(
         B, device=near_future_gt_4_dim.device) * (1 - eps) + eps  # [B,]
     # --- '노이즈가 적은(t<=0.3)' 구간만 쓰는 마스크 -------------------------
-    LOW_NOISE_FRAC = 0.30
-    t_threshold = LOW_NOISE_FRAC  # 0.30
+    t_threshold = args.feasible_learn_noise_thresh  # 0.30
     low_t_mask = (batch_diffusion_time <= t_threshold)  # [B]  True=저노이즈
     low_t_mask_bt = low_t_mask.view(B, 1, 1)  # [B,1,1] → [B,P,T] 브로드캐스트
     # random_noise: [B, Pnn + 1, T, 4] noise sampled from standard normal
@@ -344,7 +343,7 @@ def diffusion_loss_func(
         "diffusion_time": batch_diffusion_time,  # [B,]
         "cond_last_pos_norm": cond_last_pos_norm,  # [B, Pnn, 4]
     }
-    with torch.autocast("cuda", dtype=AMP_DTYPE): # AMP_DTYPE = torch.bfloat16
+    with torch.autocast("cuda", dtype=AMP_DTYPE):  # AMP_DTYPE = torch.bfloat16
         _, decoder_output = model(merged_inputs)
 
     # decoder_output["score"]: (B, Pnn, (1 + T) , 4)

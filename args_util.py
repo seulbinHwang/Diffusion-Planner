@@ -103,6 +103,10 @@ def get_args():
                         type=float,
                         help='augmentation probability',
                         default=0.5)
+    parser.add_argument('--feasible_learn_noise_thresh',
+                        type=float,
+                        help='feasible_learn_noise_thresh',
+                        default=0.3)
     parser.add_argument('--normalization_file_path',
                         default='normalization.json',
                         help='filepath of normalization.json',
@@ -117,6 +121,7 @@ def get_args():
     parser.add_argument('--use_past_for_feasible', default=False, type=boolean)
     parser.add_argument('--use_current_input', default=True, type=boolean)
     parser.add_argument('--use_huber_loss', default=True, type=boolean)
+    parser.add_argument('--profile_feasible', default=True, type=boolean)
     parser.add_argument('--use_vel_input', default=False, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
     parser.add_argument('--use_integration_trajectory', default=False, type=boolean)

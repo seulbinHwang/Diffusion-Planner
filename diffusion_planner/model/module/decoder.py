@@ -25,6 +25,41 @@ from typing import Tuple, Optional
 from diffusion_planner.model.module.feasible import FeasibleProjector
 from diffusion_planner.loss import AMP_DTYPE
 
+from typing import NamedTuple
+
+# decoder.py 또는 feasible.py 상단 import 근처에 추가
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
+
+@contextmanager
+def profile_block(name: str,
+                  enabled: bool = True,
+                  device_type: str = "cuda") -> Iterator[None]:
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
+
+    Args:
+        name: 출력에 사용할 블록 이름.
+        enabled: False 이면 아무 것도 하지 않고 그냥 통과.
+        device_type: "cuda" 인 경우, GPU 연산 정합을 위해 앞/뒤에 synchronize 호출.
+    """
+    if not enabled:
+        # 아무 것도 하지 않고 블록만 실행
+        yield
+        return
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time: float = time.perf_counter()
+
+    yield  # 실제 코드 실행
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
+
 
 def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """ref 텐서의 dtype/device로 x를 캐스팅합니다."""
@@ -642,6 +677,7 @@ class DiT(nn.Module):
             self.feasible_projector = FeasibleProjector(
                 hidden_dim, self.config.use_feasible_train,
                 self.config.use_feasible_filter)
+            self.feasible_projector.enable_profile = self.config.profile_feasible
 
         self._model_type = model_type
         self.preproj = Mlp(in_features=output_dim,
@@ -946,6 +982,7 @@ class DiT(nn.Module):
         """
         # ── 1) device 타입 얻기 (cuda / cpu 등) ─────────────────────────
         device_type: str = diffusion_trajectory.device.type
+        use_profile = self.config.profile_feasible
 
         # ── 2) 이 블록 안에서는 autocast 완전히 비활성화 ───────────────
         #     → matmul/conv/linear 등이 bf16/FP16으로 내려가지 않게 함
@@ -978,20 +1015,30 @@ class DiT(nn.Module):
             else:
                 near_past_xyyaw = None
                 unnorm_near_past_xyyaw = None
-            # unnorm_points_world_control: (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
-            unnorm_points_world_control = self.feasible_projector.savgol_filter_for_control(
-                unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
-                unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
-                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-            )
+            with profile_block(
+                    "feasible.savgol_filter_for_control",
+                    enabled=use_profile,
+                    device_type=device_type,
+            ):
+                # unnorm_points_world_control: (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
+                unnorm_points_world_control = self.feasible_projector.savgol_filter_for_control(
+                    unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
+                    unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
+                    near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+                )
             # unnorm_seg_body_control: (B, Pnn, seq_len, 3) #  v_x^b, v_y^b, ω # 각 시점 몸체 좌표계 기준 속도 + 세계 좌표계 기준 요레이트
             # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
-            unnorm_seg_body_control = self.feasible_projector.compute_midpoint_controls(
-                unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
-                unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
-                unnorm_points_world_control,  # (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
-                near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-            )
+            with profile_block(
+                    "feasible.compute_midpoint_controls",
+                    enabled=use_profile,
+                    device_type=device_type,
+            ):
+                unnorm_seg_body_control = self.feasible_projector.compute_midpoint_controls(
+                    unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4),
+                    unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4)
+                    unnorm_points_world_control,  # (B, Pnn, point_len, 3) # v_x^w, v_y^w, ω
+                    near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+                )
 
             temp_dict = {
                 "seg_body_control":
@@ -1003,18 +1050,23 @@ class DiT(nn.Module):
             # seg_body_control: (B, Pnn, seq_len, 3)
             # seq_len 은 ( past_len + future_len )  일 수도 있고, (future_len ) 일 수도 있음.
             with torch.autocast(
-                device_type=device_type,
-                dtype=AMP_DTYPE,
-                enabled=(device_type == "cuda"),
+                    device_type=device_type,
+                    dtype=AMP_DTYPE,
+                    enabled=(device_type == "cuda"),
             ):
                 # FeasibleProjector 본체(컨트롤 보정 네트워크)도 FP32로 실행
-                seg_body_control = self.feasible_projector(
-                    near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
-                    diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
-                    near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
-                    seg_body_control,  # (B, Pnn, seq_len, 3)
-                    self.final_hidden_tokens,  # (B, Pnn, H)
-                )
+                with profile_block(
+                        "feasible.network_forward",
+                        enabled=use_profile,
+                        device_type=device_type,
+                ):
+                    seg_body_control = self.feasible_projector(
+                        near_past_cur_future_valid,  # [B, pnn, time_len(=1+past_len) + future_len] bool # 과거-현재-미래
+                        diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
+                        near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
+                        seg_body_control,  # (B, Pnn, seq_len, 3)
+                        self.final_hidden_tokens,  # (B, Pnn, H)
+                    )
             seg_body_control = seg_body_control.float()
             temp_dict = {"seg_body_control": seg_body_control}
             temp_dict = self.config.observation_normalizer.inverse(temp_dict)
@@ -1036,14 +1088,19 @@ class DiT(nn.Module):
             unnorm_integrated_trajectory: (B, Pnn, future_len, 4)
             unnorm_control_constraint_diff: (B, Pnn, future_len, 3)
             """
-            (unnorm_integrated_trajectory, unnorm_control_constraint_diff
-            ) = self.feasible_projector.filter_and_integrate(
-                unnorm_near_current_state,  # (B, Pnn, 4)
-                near_cur_future_valid,  # (B, Pnn, 1+future_len) bool  ← 시점별 마스크
-                unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
-                near_class_one_hot,
-                # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
-            )  # (B, Pnn, future_len, 4)
+            with profile_block(
+                    "feasible.filter_and_integrate",
+                    enabled=use_profile,
+                    device_type=device_type,
+            ):
+                (unnorm_integrated_trajectory, unnorm_control_constraint_diff
+                ) = self.feasible_projector.filter_and_integrate(
+                    unnorm_near_current_state,  # (B, Pnn, 4)
+                    near_cur_future_valid,  # (B, Pnn, 1+future_len) bool  ← 시점별 마스크
+                    unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
+                    near_class_one_hot,
+                    # (B, Pnn, 3) # 0: vehicle, 1: pedestrian, 2: bicycle
+                )  # (B, Pnn, future_len, 4)
 
             integrated_trajectory = self.config.state_normalizer(
                 unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
