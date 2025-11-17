@@ -2394,26 +2394,37 @@ class FeasibleProjector(nn.Module):
             -1)  # (N_eff,) [!추가하자!]
 
         # 3) 전 구간 유효 row: 완전 벡터화된 SG 미분
+        device_type = seq_bT.device.type  # [!추가하자!]
         if idx_full_sub.numel() > 0:  # [!추가하자!]
-            # (K, point_len) [!추가하자!]
-            dx_full = self._sg_derivative_full_rows(
-                seq_eff[idx_full_sub],  # (K, point_len)
-                dt,
-                polyorder,
-                max_window_length,
-            )
-            dx[global_idx[
-                idx_full_sub]] = dx_full  # (K, point_len) → 해당 row에 채우기 [!추가하자!]
+            with profile_block(
+                    "_sg_derivative_full_rows",
+                    enabled=self.config.profile_feasible,
+                    device_type=device_type,
+            ):
+                # (K, point_len) [!추가하자!]
+                dx_full = self._sg_derivative_full_rows(
+                    seq_eff[idx_full_sub],  # (K, point_len)
+                    dt,
+                    polyorder,
+                    max_window_length,
+                )
+                dx[global_idx[
+                    idx_full_sub]] = dx_full  # (K, point_len) → 해당 row에 채우기 [!추가하자!]
 
         # 4) 부분 유효 row(0*1*0*): 유효 블록에만 SG + 나머지는 0
         if idx_partial_sub.numel() > 0:  # [!추가하자!]
-            dx_part = self._sg_derivative_partial_rows(  # (M, point_len) [!추가하자!]
-                seq_eff[idx_partial_sub],
-                valid_eff[idx_partial_sub],
-                dt,
-                polyorder,
-                max_window_length,
-            )
+            with profile_block(
+                    "_sg_derivative_partial_rows",
+                    enabled=self.config.profile_feasible,
+                    device_type=device_type,
+            ):
+                dx_part = self._sg_derivative_partial_rows(  # (M, point_len) [!추가하자!]
+                    seq_eff[idx_partial_sub],
+                    valid_eff[idx_partial_sub],
+                    dt,
+                    polyorder,
+                    max_window_length,
+                )
             dx[global_idx[idx_partial_sub]] = dx_part  # [!추가하자!]
 
         return dx
