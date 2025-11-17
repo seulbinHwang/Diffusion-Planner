@@ -2387,6 +2387,7 @@ class FeasibleProjector(nn.Module):
         # idx_full_sub, idx_partial_sub: (K,), (M,) [!추가하자!]
         idx_full_sub, idx_partial_sub = self._split_full_vs_partial_rows(
             valid_eff)
+        print("idx_full_sub:", idx_full_sub, "idx_partial_sub:", idx_partial_sub)  # [!디버그용 출력!]
 
         # 원래 (B_Pnn) 인덱스로 되돌리기 위한 글로벌 인덱스
         global_idx = valid_any.nonzero(as_tuple=False).squeeze(
