@@ -835,93 +835,99 @@ class DiT(nn.Module):
         B, Pnn, _ = near_future_norm_xT.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
         # x = self.preproj(near_future_norm_xT)
-        x = self.preproj_varlen(near_future_norm_xT, near_current_mask)
+        device_type =  near_future_norm_xT.device.type
+        with profile_block(
+                "feasible.compute_midpoint_controls",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            x = self.preproj_varlen(near_future_norm_xT, near_current_mask)
 
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
+            x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
 
-        # diffusion_time: [B,]
-        # t_embedding: (B, D=192)
-        t_embedding = self.t_embedder(diffusion_time)
-        t_embedding = t_embedding.to(x.dtype)
-        ego_fut_global = ego_fut_global.to(x.dtype)  # 방어적 정렬
-        ############################
-        # ★ 추가: state_token_in 생성 (현재 프레임만 사용)
-        B, Pnn, _ = near_future_norm_xT.shape
-        # state_token_in: [B,Pnn,D]
-        state_token_in = self.pram_v2_state_token_encoder(
-            # PRAMV2StateTokenEncoder
-            near_cur_norm=near_current_xyyaw.to(x.dtype),  # [B,Pnn,4]
-            near_current_mask=near_current_mask  # [B,Pnn]
-        )
-        # [V2 - START]  ✅ Composer/Time 1회 계산 → 블록별 합성 → v2 전용 포워드
-        """
-        1) “입력 요약” 만들기 (한 번만 계산 → 모든 블록 재사용)
-        2) 쌍곱(상호작용) 특징 만들기 — (SE, ER, RS)
-        3) 쌍곱 포함해 한 덩어리로 묶고 z 만들기 — LN → 작은 MLP
-        5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
-        """
-        # composer_out: ComposerOutputs
-        #   Δscale_base/shift_base/logit_gate_base (모두 [B, Pnn, H])
-        composer_out = self.pram_v2_composer(
-            state_token_in=state_token_in,  # [B, Pnn, D]
-            ego_fut_global=ego_fut_global,  # [B, D] # (배치 단위 0벡터 처리)
-            near_agents_route_lane_emb=near_agents_route_lane_emb,
-            # [B, Pnn, D]
-            route_known_mask=route_known_mask  # [B, Pnn] True=known
-        )
-        """
-        7) 확산 시간 t의 글로벌 모듈레이션
-
-        time_out : TimeModulationOutputs 
-            delta_scale_time/shift_time/logit_gate_time (모두 [B, 1, H])
-        """
-        time_out = self.pram_v2_time_mod(
-            t_embedding)  # [B,1,H] 3종 # PRAMV2TimeModulator
-
-        for block_index, block in enumerate(self.blocks):
-            """ pram_mods
-            Dict[PathName, ModulationTriplet]: 
-                {"SA": ModulationTriplet, "FFN":ModulationTriplet, "CA":ModulationTriplet}
+            # diffusion_time: [B,]
+            # t_embedding: (B, D=192)
+            t_embedding = self.t_embedder(diffusion_time)
+            t_embedding = t_embedding.to(x.dtype)
+            ego_fut_global = ego_fut_global.to(x.dtype)  # 방어적 정렬
+            ############################
+            # ★ 추가: state_token_in 생성 (현재 프레임만 사용)
+            B, Pnn, _ = near_future_norm_xT.shape
+            # state_token_in: [B,Pnn,D]
+            state_token_in = self.pram_v2_state_token_encoder(
+                # PRAMV2StateTokenEncoder
+                near_cur_norm=near_current_xyyaw.to(x.dtype),  # [B,Pnn,4]
+                near_current_mask=near_current_mask  # [B,Pnn]
+            )
+            # [V2 - START]  ✅ Composer/Time 1회 계산 → 블록별 합성 → v2 전용 포워드
             """
-            pram_mods = compute_pram_v2_modulations_for_block(
+            1) “입력 요약” 만들기 (한 번만 계산 → 모든 블록 재사용)
+            2) 쌍곱(상호작용) 특징 만들기 — (SE, ER, RS)
+            3) 쌍곱 포함해 한 덩어리로 묶고 z 만들기 — LN → 작은 MLP
+            5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
+            """
+            # composer_out: ComposerOutputs
+            #   Δscale_base/shift_base/logit_gate_base (모두 [B, Pnn, H])
+            composer_out = self.pram_v2_composer(
+                state_token_in=state_token_in,  # [B, Pnn, D]
+                ego_fut_global=ego_fut_global,  # [B, D] # (배치 단위 0벡터 처리)
+                near_agents_route_lane_emb=near_agents_route_lane_emb,
+                # [B, Pnn, D]
+                route_known_mask=route_known_mask  # [B, Pnn] True=known
+            )
+            """
+            7) 확산 시간 t의 글로벌 모듈레이션
+    
+            time_out : TimeModulationOutputs 
+                delta_scale_time/shift_time/logit_gate_time (모두 [B, 1, H])
+            """
+            time_out = self.pram_v2_time_mod(
+                t_embedding)  # [B,1,H] 3종 # PRAMV2TimeModulator
+
+            for block_index, block in enumerate(self.blocks):
+                """ pram_mods
+                Dict[PathName, ModulationTriplet]: 
+                    {"SA": ModulationTriplet, "FFN":ModulationTriplet, "CA":ModulationTriplet}
+                """
+                pram_mods = compute_pram_v2_modulations_for_block(
+                    # Δscale_base/shift_base/logit_gate_base (모두 [B, Pnn, H])
+                    composer_out=composer_out,
+                    # delta_scale_time/shift_time/logit_gate_time (모두 [B, 1, H])
+                    time_out=time_out,
+                    path_scalars=self.
+                    pram_v2_block_path_scalars,  # PRAMV2BlockPathScalars
+                    block_index=block_index,
+                    batch_size=B,
+                    predicted_neighbor_num=Pnn,
+                    hidden_dim=x.shape[-1],
+                )  # -> {"SA": ModulationTriplet, "FFN": ..., "CA": ...}
+
+                # ★ DiTBlock에 추가한 v2 전용 진입점(스켈레톤; 구현은 이후 단계)
+                x = block(
+                    x=x,  # [B, Pnn, H]
+                    cross_c=cross_c,  # [B, N_c, H]
+                    pram_v2_modulations=
+                    pram_mods,  # Dict[PathName, ModulationTriplet]
+                    near_current_mask=near_current_mask,  # [B, Pnn]
+                    cross_mask=cross_mask  # [B, N_c]
+                )
+                x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
+            self.final_hidden_tokens = x.detach().clone().float()  # (B, Pnn, H)
+            # [V2 - END]
+            # --- ✅ PRAM‑v2: 9단계 최종 보정 + 최종 투영(= FinalLayer 완전 대체) ---
+            x = apply_pram_v2_final_layer(
+                x=x,  # [B, Pnn, H]
                 # Δscale_base/shift_base/logit_gate_base (모두 [B, Pnn, H])
                 composer_out=composer_out,
                 # delta_scale_time/shift_time/logit_gate_time (모두 [B, 1, H])
                 time_out=time_out,
-                path_scalars=self.
-                pram_v2_block_path_scalars,  # PRAMV2BlockPathScalars
-                block_index=block_index,
-                batch_size=B,
-                predicted_neighbor_num=Pnn,
-                hidden_dim=x.shape[-1],
-            )  # -> {"SA": ModulationTriplet, "FFN": ..., "CA": ...}
-
-            # ★ DiTBlock에 추가한 v2 전용 진입점(스켈레톤; 구현은 이후 단계)
-            x = block(
-                x=x,  # [B, Pnn, H]
-                cross_c=cross_c,  # [B, N_c, H]
-                pram_v2_modulations=
-                pram_mods,  # Dict[PathName, ModulationTriplet]
-                near_current_mask=near_current_mask,  # [B, Pnn]
-                cross_mask=cross_mask  # [B, N_c]
-            )
-            x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
-        self.final_hidden_tokens = x.detach().clone().float()  # (B, Pnn, H)
-        # [V2 - END]
-        # --- ✅ PRAM‑v2: 9단계 최종 보정 + 최종 투영(= FinalLayer 완전 대체) ---
-        x = apply_pram_v2_final_layer(
-            x=x,  # [B, Pnn, H]
-            # Δscale_base/shift_base/logit_gate_base (모두 [B, Pnn, H])
-            composer_out=composer_out,
-            # delta_scale_time/shift_time/logit_gate_time (모두 [B, 1, H])
-            time_out=time_out,
-            final_norm=self.pram_v2_final_norm,  # LN(H)
-            out_proj=self.pram_v2_out_proj,  # Linear(H -> (T)*4)
-            final_scalars=(
-                self.pram_v2_final_scale_scalar,  # k_final_s
-                self.pram_v2_final_shift_scalar,  # k_final_sh
-            ),
-        )  # -> [B, Pnn, (T)*4]
+                final_norm=self.pram_v2_final_norm,  # LN(H)
+                out_proj=self.pram_v2_out_proj,  # Linear(H -> (T)*4)
+                final_scalars=(
+                    self.pram_v2_final_scale_scalar,  # k_final_s
+                    self.pram_v2_final_shift_scalar,  # k_final_sh
+                ),
+            )  # -> [B, Pnn, (T)*4]
 
         # 마스크(무효 토큰) 0 클램프 유지
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
@@ -955,17 +961,23 @@ class DiT(nn.Module):
                             x_for_feasible_detach.reshape(B, Pnn, -1, 4)
                         ],
                         dim=2).contiguous()  # (B,Pnn,1+T,4)
+                t_threshold = self.config.feasible_learn_noise_thresh  # 0.30
+                low_t_mask = (diffusion_time <= t_threshold)  # [B]  True=저노이즈
+
                 # (B, Pnn, T, 4) -> (B, Pnn, T*4)
 
                 self._feasible_projection(
-                    diffusion_trajectory, near_class_one_hot,
+                    diffusion_trajectory,
+                    near_class_one_hot,
                     near_past_cur_future_valid_detach,
-                    near_past)  # [B, pnn, past_len=(time_len - 1), 11]
+                    near_past,  # [B, pnn, past_len=(time_len - 1), 11]
+                    low_t_mask,  # [B]  True=저노이즈
+                )
             return x  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
 
-    def _feasible_projection(
+    def _feasible_projection_core(
             self,
             diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
             near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
@@ -1115,3 +1127,98 @@ class DiT(nn.Module):
                 control_constraint_diff=
                 control_constraint_diff  # (B, Pnn, future_len, 3)
             )
+
+    # [추가!!!] 학습 시 low‑t 샘플에 대해서만 FeasibleProjector를 돌리는 래퍼
+    def _feasible_projection(
+        self,
+        diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+        near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+        near_past_cur_future_valid: torch.Tensor,
+        # (B, Pnn, time_len(=1+past_len) + future_len) bool
+        near_past: torch.Tensor,  # (B, Pnn, past_len, 11) 또는 None
+        feasible_low_t_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """FeasibleProjector 호출을 t‑기반으로 부분적으로만 수행하는 래퍼.
+
+        - 학습이 아닐 때(`self.training == False`)나
+          `feasible_low_t_mask` 가 없을 때는
+          기존 전체 파이프라인(_feasible_projection_full)을 그대로 사용.
+        - 학습 + `feasible_low_t_mask` 가 주어졌을 때는
+          diffusion_time <= threshold 인 샘플(batch index) 에 대해서만
+          FeasibleProjector 전체 파이프라인을 실행하고,
+          나머지 샘플은
+            * integrated_trajectory  : 원 궤적(diffusion_trajectory) 그대로
+            * control_constraint_diff: 0
+          로 채운 뒤 `self.dit_returns` 에 통합해서 저장합니다.
+
+        이렇게 하면
+        - high‑t 샘플에 대해 불필요한 Savitzky–Golay + TCN forward 를 줄이면서,
+        - 적어도 한 샘플에 대해서는 항상 FeasibleProjector가 그래프에 등장하므로
+          DDP(find_unused_parameters=False) 환경에서도
+          "unused parameter" 에러 가능성을 줄일 수 있습니다.
+        """
+        # 학습이 아니거나, low‑t 마스크가 없으면 기존 전체 경로 유지
+        if (not self.training) or (feasible_low_t_mask is None):
+            self._feasible_projection_core(
+                diffusion_trajectory,
+                near_class_one_hot,
+                near_past_cur_future_valid,
+                near_past,
+            )
+            return
+
+        B, Pnn, one_plus_T, _ = diffusion_trajectory.shape
+        T = one_plus_T - 1
+        device = diffusion_trajectory.device
+        dtype = diffusion_trajectory.dtype
+
+        # [B] -> bool 로 정리
+        low_t_mask = feasible_low_t_mask.to(device=device)
+        if low_t_mask.dtype != torch.bool:
+            # 0/1 float 같은 케이스 방어용
+            low_t_mask = low_t_mask > 0.5
+
+        # 기본값:
+        #   - integrated_trajectory: 원 궤적(x_start) 그대로 (t=1..T)
+        #   - control_constraint_diff: 전부 0
+        # diffusion_trajectory 는 정규화 상태라고 가정
+        base_integrated = diffusion_trajectory[:, :,
+                                               1:, :].detach()  # (B,Pnn,T,4)
+        base_constraint = torch.zeros((B, Pnn, T, 3),
+                                      device=device,
+                                      dtype=dtype)  # (B,Pnn,T,3)
+
+        integrated_all = base_integrated.clone()  # (B,Pnn,T,4)
+        constraint_all = base_constraint.clone()  # (B,Pnn,T,3)
+
+        # 실제로 FeasibleProjector를 돌릴 배치 인덱스 선택
+        active_idx = torch.nonzero(low_t_mask,
+                                   as_tuple=False).squeeze(-1)  # (N_active,)
+
+        # 만약 이번 배치가 전부 high‑t 라면, 그래도 최소 1개 샘플(0번)은
+        # FeasibleProjector를 한 번 태워서 그래프에는 항상 등장하도록 한다.
+        if active_idx.numel() == 0:
+            active_idx = torch.tensor([0], device=device,
+                                      dtype=torch.long)  # (1,)
+
+        # 서브 배치만 골라서 전체 파이프라인 실행
+        self._feasible_projection_core(
+            diffusion_trajectory[active_idx],
+            near_class_one_hot[active_idx],
+            near_past_cur_future_valid[active_idx],
+            near_past[active_idx] if near_past is not None else None,
+        )
+
+        # `_feasible_projection_core` 은 서브 배치 기준으로 self.dit_returns 를 채운다.
+        integ_active = self.dit_returns.integrated_trajectory  # (N_active, Pnn, T, 4)
+        const_active = self.dit_returns.control_constraint_diff  # (N_active, Pnn, T, 3)
+
+        # 선택된 active 샘플에 대해서만 결과를 덮어쓰기
+        integrated_all[active_idx] = integ_active
+        constraint_all[active_idx] = const_active
+
+        # 전체 배치 기준으로 다시 dit_returns 업데이트
+        self.dit_returns = DiTReturns(
+            integrated_trajectory=integrated_all,  # (B,Pnn,T,4)
+            control_constraint_diff=constraint_all,  # (B,Pnn,T,3)
+        )
