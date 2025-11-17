@@ -929,8 +929,8 @@ class DiT(nn.Module):
                 ),
             )  # -> [B, Pnn, (T)*4]
 
-        # 마스크(무효 토큰) 0 클램프 유지
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
+            # 마스크(무효 토큰) 0 클램프 유지
+            x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
         if self._model_type == "score":
             std = self.marginal_prob_std(diffusion_time).float()[:, None,
                                                                  None]  # FP32
