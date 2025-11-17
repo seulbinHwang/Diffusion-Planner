@@ -984,6 +984,7 @@ class DiT(nn.Module):
             near_past_cur_future_valid: torch.Tensor,
             # [B, pnn, time_len(=1+past_len) + future_len] bool
             near_past: torch.Tensor,  # (B, Pnn, past_len, 11)
+            final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
     ):
         """FeasibleProjector 전체 파이프라인을 FP32로 강제해서 실행하는 헬퍼.
 
@@ -1077,7 +1078,7 @@ class DiT(nn.Module):
                         diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
                         near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
                         seg_body_control,  # (B, Pnn, seq_len, 3)
-                        self.final_hidden_tokens,  # (B, Pnn, H)
+                        final_hidden_tokens,  # (B, Pnn, H)
                     )
             seg_body_control = seg_body_control.float()
             temp_dict = {"seg_body_control": seg_body_control}
@@ -1164,6 +1165,7 @@ class DiT(nn.Module):
                 near_class_one_hot,
                 near_past_cur_future_valid,
                 near_past,
+                self.final_hidden_tokens,
             )
             return
 
@@ -1207,6 +1209,7 @@ class DiT(nn.Module):
             near_class_one_hot[active_idx],
             near_past_cur_future_valid[active_idx],
             near_past[active_idx] if near_past is not None else None,
+            self.final_hidden_tokens[active_idx],
         )
 
         # `_feasible_projection_core` 은 서브 배치 기준으로 self.dit_returns 를 채운다.
