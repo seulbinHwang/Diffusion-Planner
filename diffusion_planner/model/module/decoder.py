@@ -837,7 +837,7 @@ class DiT(nn.Module):
         # x = self.preproj(near_future_norm_xT)
         device_type =  near_future_norm_xT.device.type
         with profile_block(
-                "feasible.compute_midpoint_controls",
+                "DiT.forward",
                 enabled=self.config.profile_feasible,
                 device_type=device_type,
         ):
