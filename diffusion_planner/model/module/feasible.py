@@ -243,6 +243,7 @@ class DynamicLimits:
 class FeasibleProjector(nn.Module):
 
     def __init__(self,
+                 config,
                  hidden_dim: int,
                  use_feasible_train: bool = True,
                  use_feasible_filter: bool = True):
@@ -253,6 +254,7 @@ class FeasibleProjector(nn.Module):
               trunk 압축기(Compressor)는 첫 forward에서 지연 초기화합니다.
         """
         super().__init__()
+        self.config = config
         self.use_feasible_train = use_feasible_train
         self.use_feasible_filter = use_feasible_filter
         # --- [NEW] Savitzky–Golay 커널 캐시(LRU) ---

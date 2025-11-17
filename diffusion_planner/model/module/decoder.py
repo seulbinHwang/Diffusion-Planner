@@ -675,6 +675,7 @@ class DiT(nn.Module):
         self.final_hidden_tokens = None
         if self.config.use_feasible:
             self.feasible_projector = FeasibleProjector(
+                self.config,
                 hidden_dim, self.config.use_feasible_train,
                 self.config.use_feasible_filter)
             self.feasible_projector.enable_profile = self.config.profile_feasible
