@@ -261,10 +261,10 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # 아키텍처 하이퍼파라미터(고정 폭)
         # ------------------------------
-        self._Dx: int = 48  # state encoder 출력 채널 (prev/fut 각각)
-        self._Du: int = 32  # control adapter 출력 채널
-        self._Dc: int = 64  # trunk compressor 출력 채널
-        self._Din: int = self._Dx * 2 + self._Du + self._Dc  # 48+48+32+64=192
+        self._Dx: int = 16  # state encoder 출력 채널 (prev/fut 각각)
+        self._Du: int = 8  # control adapter 출력 채널
+        self._Dc: int = 8  # trunk compressor 출력 채널
+        self._Din: int = self._Dx * 2 + self._Du + self._Dc  # 16+16+32+64=192
         self._C: int = self._Din  # 메인 채널 폭(192)
         self._eps: float = 1e-6
 
@@ -277,32 +277,29 @@ class FeasibleProjector(nn.Module):
         if self.use_feasible_train:
             # 상태 인코더(현재 노드 X_prev: (x,y,cos,sin))
             self.state_prev_encoder = nn.Sequential(
-                nn.LayerNorm(4),
-                nn.Linear(4, 48),
+                nn.LayerNorm(4),          # (B,Pnn,segment_len,4)
+                nn.Linear(4, self._Dx),         # 추가: 4 → 16
                 nn.GELU(),
-                nn.Linear(48, self._Dx),
+                nn.Linear(self._Dx, self._Dx),  # 추가: 16 → 16 (= self._Dx)
             )
-            # 상태 인코더(오른쪽 노드 X_fut)
             self.state_fut_encoder = nn.Sequential(
-                nn.LayerNorm(4),
-                nn.Linear(4, 48),
+                nn.LayerNorm(4),          # (B,Pnn,segment_len,4)
+                nn.Linear(4, self._Dx),         # 추가: 4 → 16
                 nn.GELU(),
-                nn.Linear(48, self._Dx),
+                nn.Linear(self._Dx, self._Dx),  # 추가: 16 → 16 (= self._Dx)
             )
-            # 베이스 제어 어댑터(U_base: (vxb,vyb,w) — 정규화 값)
             self.control_adapter = nn.Sequential(
-                nn.LayerNorm(3),
-                nn.Linear(3, self._Du),
+                nn.LayerNorm(3),          # (B,Pnn,segment_len,3)
+                nn.Linear(3, self._Du),   # 추가: 3 → 8 (= self._Du)
                 nn.GELU(),
             )
 
-            # 트렁크(디퓨전 은닉) 압축기는 H를 알아야 하므로 지연 초기화
-            # (B,Pnn,H)->(B,Pnn,Dc)
+            # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
             self.trunk_compressor = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, 192),
+                nn.Linear(hidden_dim, 64),   # 추가: hidden_dim → 64 (중간 폭 축소)
                 nn.GELU(),
-                nn.Linear(192, self._Dc),
+                nn.Linear(64, self._Dc),     # 추가: 64 → 8 (= self._Dc)
             )
 
             # ------------------------------
@@ -316,10 +313,11 @@ class FeasibleProjector(nn.Module):
             # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
             # ------------------------------
             self._kernel_size: int = 7
-            self._dilations: List[int] = [1, 2, 4, 8]
-            self.tcn_depth = len(self._dilations)
-            self.tcn_pre_lns = nn.ModuleList(
-                [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
+            self._dilations: List[int] = [1, 2]  # 추가: 4블록→2블록
+            self.tcn_depth = len(self._dilations)  # 추가: 현재는 2
+            self.tcn_pre_lns = nn.ModuleList(  # 추가: 블록 수만큼 LayerNorm
+                [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)]
+            )
 
             # depthwise conv (C 채널, groups=C)
             def _same_pad(k: int, d: int) -> int:
@@ -354,9 +352,9 @@ class FeasibleProjector(nn.Module):
             # 소프트 게이트 s = softplus(MLP_g(Z_s))
             self.gate_mlp = nn.Sequential(
                 nn.LayerNorm(self._C),
-                nn.Linear(self._C, 128),
+                nn.Linear(self._C, 32),
                 nn.GELU(),
-                nn.Linear(128, 3),
+                nn.Linear(32, 3),
             )
             # gate 초기 스케일 s0 설정(보수적으로)
             s0 = 0.05
@@ -1114,7 +1112,7 @@ class FeasibleProjector(nn.Module):
         """입력을 통일 피처 Z_in으로 변환.
 
         파이프라인:
-            prev/fut 인코딩(48) + control 어댑터(32) + trunk 압축(64) → concat(192)
+            prev/fut 인코딩(16) + control 어댑터(32) + trunk 압축(64) → concat(192)
 
         Args:
             x_prev (torch.Tensor): (B, Pnn, segment_len, 4)
@@ -1147,8 +1145,8 @@ class FeasibleProjector(nn.Module):
         else:
             u_base_in = u_base * seg_mask_1
 
-        feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,segment_len,48)
-        feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,segment_len,48)
+        feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,segment_len,16)
+        feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,segment_len,16)
         feat_u = self.control_adapter(u_base_in)  # (B,Pnn,segment_len,32)
         # dit_final_hidden_tokens: (B,Pnn,H)
         # trunk: (B,Pnn,64)
