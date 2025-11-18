@@ -69,62 +69,6 @@ class PointLenInputs(NamedTuple):
     point_len: int
 
 
-def _yaw_rate_from_cos_sin_via_sg(
-    cos_yaw: Tensor,  # (B, Pnn, T1)
-    sin_yaw: Tensor,  # (B, Pnn, T1)
-    valid_mask: Tensor,  # (B, Pnn, T1) bool
-    *,
-    dt: float,
-    polyorder: int,
-    max_window_len: int,
-    eps: float = 1e-6,
-    sg_derivative_fn=None,
-) -> Tensor:
-    """SG로 cos/sin을 각각 미분해 각속도 ψ̇를 계산합니다(unwrap 불필요).
-
-    Args:
-        cos_yaw: (B, Pnn, T1) cosψ
-        sin_yaw: (B, Pnn, T1) sinψ
-        valid_mask: (B, Pnn, T1) True=유효
-        dt: 샘플 간격(초). 예: 0.1
-        polyorder: SG 다항 차수(예: 2)
-        max_window_len: SG 윈도 최대 길이(홀수 권장)
-        eps: 수치 안정 epsilon
-        sg_derivative_fn: (seq_bT, valid_bT, dt, polyorder, max_window_length) -> d/dt(seq_bT)
-                          형태의 함수 주입. (당신 코드의 `_savgol_derivative_masked_torch` 전달)
-
-    Returns:
-        yaw_rate: (B, Pnn, T1) 각속도(rad/s)
-    """
-    assert sg_derivative_fn is not None, "sg_derivative_fn을 주입하세요."
-
-    B, Pnn, T1 = cos_yaw.shape
-
-    # 1) (선택) 단위원 재투영으로 안정화
-    cs = torch.stack([cos_yaw, sin_yaw], dim=-1)  # (B,Pnn,T1,2)
-    norm = torch.linalg.norm(cs, dim=-1,
-                             keepdim=True).clamp_min(eps)  # (B,Pnn,T1,1)
-    cos_u = (cs[..., 0:1] / norm).squeeze(-1)  # (B,Pnn,T1)
-    sin_u = (cs[..., 1:2] / norm).squeeze(-1)  # (B,Pnn,T1)
-
-    # 2) SG 미분 (마스크 인지, 토치 전용)
-    dcos = sg_derivative_fn(cos_u.reshape(-1, T1), valid_mask.reshape(-1, T1),
-                            dt, polyorder,
-                            max_window_len).reshape(B, Pnn, T1)  # (B,Pnn,T1)
-    dsin = sg_derivative_fn(sin_u.reshape(-1, T1), valid_mask.reshape(-1, T1),
-                            dt, polyorder,
-                            max_window_len).reshape(B, Pnn, T1)  # (B,Pnn,T1)
-
-    # 3) ψ̇ = (cos*dsin - sin*dcos) / (cos²+sin²)
-    denom = (cos_u * cos_u + sin_u * sin_u).clamp_min(eps)  # (B,Pnn,T1)
-    yaw_rate = (cos_u * dsin - sin_u * dcos) / denom  # (B,Pnn,T1)
-
-    # 4) 무효 시점은 0
-    if valid_mask is not None:
-        yaw_rate = torch.where(valid_mask, yaw_rate, torch.zeros_like(yaw_rate))
-    return yaw_rate
-
-
 # =========================
 # [NEW] 하이퍼/제약 파라미터 컨테이너
 # =========================
@@ -420,58 +364,6 @@ class FeasibleProjector(nn.Module):
             with torch.no_grad():
                 self.gate_mlp[-1].bias.fill_(b_init)
 
-    # 추가: SG용 시퀀스를 윈도우로 펼치고, 마스크와 유효 개수를 한 번에 만드는 함수
-    def _sg_unfold_sequence_and_valid_mask(
-        self,
-        seq_bT: Tensor,  # (N, point_len)
-        valid_bT: Tensor,  # (N, point_len) bool
-        window_length: int,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        """seq/valid를 SG 윈도우 길이 기준으로 (N,T,W) 모양으로 펼친다.
-
-        - 시간축 앞/뒤를 0(무효)로 패딩한 뒤,
-        - unfold를 써서 모든 (row, t) 위치에서 길이 W짜리 윈도우를 만든다.
-        - 마스크도 같이 펼쳐서, 윈도 안에서 실제로 쓸 샘플 개수(valid_count)도 함께 반환한다.
-
-        Args:
-            seq_bT:   (N, point_len)  원본 스칼라 시퀀스 (예: x, y, cos, sin 등)
-            valid_bT: (N, point_len)  각 시점 유효 여부 (True/False)
-            window_length: SG 윈도 길이 W(홀수 권장)
-
-        Returns:
-            seq_window:   (N, point_len, W)  각 (row, t)의 윈도 값
-            mask_window:  (N, point_len, W)  각 (row, t)의 윈도 유효 마스크(0/1 float)
-            valid_count:  (N, point_len)     각 (row, t)에서 윈도 안 유효 샘플 개수
-        """
-        half_window: int = window_length // 2
-
-        # (1) 앞/뒤 0 패딩  → 패딩된 구간은 어차피 mask=0 이라 회귀에서 자동 제외됨
-        #     seq_padded:   (N, point_len + 2*half_window)
-        #     valid_padded: (N, point_len + 2*half_window)
-        seq_padded: Tensor = F.pad(seq_bT, (half_window, half_window),
-                                   mode="constant",
-                                   value=0.0)
-        valid_float: Tensor = valid_bT.to(dtype=seq_bT.dtype)
-        valid_padded: Tensor = F.pad(valid_float, (half_window, half_window),
-                                     mode="constant",
-                                     value=0.0)
-
-        # (2) unfold로 모든 중심 시점 t에 대해 길이 W짜리 윈도 생성
-        #     seq_window:  (N, point_len, W)
-        #     mask_window: (N, point_len, W)
-        seq_window: Tensor = seq_padded.unfold(dimension=-1,
-                                               size=window_length,
-                                               step=1)
-        mask_window: Tensor = valid_padded.unfold(dimension=-1,
-                                                  size=window_length,
-                                                  step=1)
-
-        # (3) 각 (row, t)에서 윈도 안 유효 샘플 개수
-        #     valid_count: (N, point_len)
-        valid_count: Tensor = mask_window.sum(dim=-1)
-
-        return seq_window, mask_window, valid_count
-
     # 추가: 시간축 다항 기저(Φ)와 Gram 행렬(Φ^TΦ의 k별 분해)을 미리 만드는 함수
     def _sg_build_design_matrix_and_gram(
         self,
@@ -562,233 +454,6 @@ class FeasibleProjector(nn.Module):
 
         return design_matrix, gram_per_k, power_per_k
 
-    # 추가: 윈도 값 + 마스크 + 시간 기저를 이용해 A_all, b_all을 배치로 계산
-    def _sg_build_normal_equations_batched(
-            self,
-            seq_window: Tensor,  # (N, point_len, W)
-            mask_window: Tensor,  # (N, point_len, W)
-            gram_per_k: Tensor,  # (W, P+1, P+1)
-            power_per_k: Tensor,  # (W, P+1)
-    ) -> Tuple[Tensor, Tensor]:
-        """Savitzky–Golay 미분에 쓸 작은 행렬 A, 벡터 b를
-        모든 시계열 위치에 대해 한 번에 만드는 함수.
-
-        이 함수는 "각 시점 t 주변의 작은 구간"에서
-        곡선을 근사하기 위한 정보를 미리 정리해 두는 역할을 한다.
-        최종 목표는, 나중에 A·a = b 꼴의 작은 선형 방정식을 풀어서
-        a[1]을 미분값으로 쓰기 위한 준비이다.
-
-        입력 텐서들의 의미:
-
-            seq_window:
-                - shape: (N, point_len, W)
-                - N = 전체 row 수 (보통 B * Pnn)
-                - point_len = 전체 시간 길이 T
-                - W = 윈도 크기 (예: 11)
-                - seq_window[n, t, :] 는
-                  "row n, 시간 t 주변으로 모은 W개의 값"이다.
-                  (즉, 시계열을 윈도 슬라이딩해서 모아 놓은 값)
-
-            mask_window:
-                - shape: (N, point_len, W)
-                - seq_window 와 같은 모양의 0/1 마스크
-                - mask_window[n, t, k] == 1 이면
-                  "row n, 시간 t의 윈도 안에서 k번째 값이 실제로 존재하는 점"
-                - mask_window[n, t, k] == 0 이면
-                  패딩이거나, 원래 데이터에서 비어 있는 시점이어서
-                  계싼에 쓰지 말아야 하는 점
-
-            gram_per_k:
-                - shape: (W, P+1, P+1)
-                - 윈도 안에서 위치 k(0..W-1)에 대해,
-                  시간 관련 특성을 미리 숫자로 정리해 둔 것.
-                - 각 k에 대해 (P+1)×(P+1) 크기의 작은 행렬이 있고,
-                  이 행렬들을 적당히 더하면
-                  한 시점(t)에서 쓸 "최종 작은 행렬 A" 를 만들 수 있다.
-
-            power_per_k:
-                - shape: (W, P+1)
-                - 마찬가지로 위치 k마다의 시간 관련 숫자들을
-                  (P+1) 길이의 벡터로 정리해 둔 것.
-                - 이 값에 실제 관측값(seq_window)을 곱해서 더하면
-                  한 시점(t)에서 쓸 "작은 벡터 b" 를 만들 수 있다.
-
-        이 함수가 하는 일(요약):
-
-            1. 각 (n, t) 에 대해
-               - mask_window[n, t, k] 가 1인 위치들만 골라서
-               - gram_per_k[k], power_per_k[k] 와 곱해준 뒤
-               - k 축을 따라 모두 더한다.
-
-            2. 더한 결과를 다음 두 텐서에 저장한다.
-               - A_all[n, t, :, :] : (P+1, P+1) 크기의 작은 행렬
-               - b_all[n, t, :]     : (P+1,) 크기의 작은 벡터
-
-           이 과정을 모든 (n, t)에 대해 한 번에(batch) 처리한다.
-           파이썬 for-loop 을 돌지 않고,
-           텐서 브로드캐스트와 sum 연산만으로 구현하는 것이 목표다.
-
-        Returns:
-            A_all:
-                - shape: (N, point_len, P+1, P+1)
-                - 각 (n, t) 위치에서 사용할 작은 행렬 A
-
-            b_all:
-                - shape: (N, point_len, P+1)
-                - 각 (n, t) 위치에서 사용할 작은 벡터 b
-        """
-        N, point_len, window_length = seq_window.shape
-        P_plus_one: int = power_per_k.shape[-1]
-
-        # (1) A_all 계산
-        # mask_expanded: (N, T, W, 1, 1)
-        # gram_expanded: (1, 1, W, P+1, P+1)
-        mask_expanded: Tensor = mask_window.unsqueeze(-1).unsqueeze(-1)
-        gram_expanded: Tensor = gram_per_k.view(1, 1, window_length, P_plus_one,
-                                                P_plus_one)
-        # A_all: (N, T, P+1, P+1)
-        A_all: Tensor = (mask_expanded * gram_expanded).sum(dim=2)
-
-        # (2) b_all 계산
-        # weighted_y:      (N, T, W)
-        # weighted_y_ex:   (N, T, W, 1)
-        # power_expanded:  (1, 1, W, P+1)
-        weighted_y: Tensor = seq_window * mask_window
-        weighted_y_ex: Tensor = weighted_y.unsqueeze(-1)  # (N, T, W, 1)
-        power_expanded: Tensor = power_per_k.view(1, 1, window_length,
-                                                  P_plus_one)  # (1, 1, W, P+1)
-
-        # b_all: (N, T, P+1)
-        b_all: Tensor = (weighted_y_ex * power_expanded).sum(dim=2)
-
-        return A_all, b_all
-
-    # 추가: A_all, b_all, 유효 개수, 유한 차분 결과를 합쳐 최종 SG 미분을 만든다.
-    def _sg_solve_normal_equations_batched(
-        self,
-        A_all: Tensor,  # (N, point_len, P+1, P+1)
-        b_all: Tensor,  # (N, point_len, P+1)
-        valid_count: Tensor,  # (N, point_len)
-        valid_center_mask: Tensor,  # (N, point_len) bool  (중심 시점 유효 여부)
-        fd_derivative: Tensor,  # (N, point_len)  유한 차분 결과
-        polyorder: int,
-        regularization_epsilon: float,
-    ) -> Tensor:
-        """정규 방정식을 좋은 위치만 batched solve 해서, 나머지는 유한 차분으로 채운다.
-
-        - 유효 샘플 개수 < polyorder+1 인 위치는 LS 회귀를 하지 않고
-          미리 계산된 유한 차분 결과(fd_derivative)를 그대로 사용한다.
-        - 중심 시점이 invalid 인 곳은 최종 결과를 0으로 만든다.
-
-        Args:
-            A_all:              (N, T, P+1, P+1)
-            b_all:              (N, T, P+1)
-            valid_count:        (N, T)  윈도 내 유효 샘플 개수
-            valid_center_mask:  (N, T)  중심 시점 자체 유효 여부(True/False)
-            fd_derivative:      (N, T)  유한 차분으로 미리 계산한 d/dt
-            polyorder:          다항 차수 P
-            regularization_epsilon: A에 더할 작은 대각 정규화 계수
-
-        Returns:
-            dx_out: (N, T)  최종 SG 미분 결과 (invalid 중심은 0)
-        """
-        N, point_len, dim_p1, _ = A_all.shape
-        min_samples: int = int(polyorder) + 1
-
-        # (1) 기본값은 유한 차분 결과로 깔아두고,
-        #     좋은 위치에 대해서만 LS 결과로 덮어쓴다.
-        dx_out: Tensor = fd_derivative.clone()  # (N, T)
-
-        # (2) "LS를 해볼 가치가 있는 위치" 마스크
-        #     - 윈도 안 유효 샘플이 polyorder+1 이상
-        #     - 중심 시점도 유효
-        good_mask: Tensor = (valid_count
-                             >= min_samples) & valid_center_mask  # (N, T)
-
-        if not good_mask.any():
-            # LS를 쓸 수 있는 위치가 하나도 없으면, 유한 차분 + 중심 마스크만 적용.
-            dx_out = torch.where(valid_center_mask, dx_out,
-                                 torch.zeros_like(dx_out))
-            return dx_out
-
-        # (3) good 위치만 flatten 해서 batched solve
-        good_flat_idx: Tensor = good_mask.view(-1).nonzero(
-            as_tuple=False).squeeze(-1)  # (M,)
-
-        # A_flat: (N*T, P+1, P+1), b_flat: (N*T, P+1)
-        A_flat: Tensor = A_all.view(-1, dim_p1, dim_p1)
-        b_flat: Tensor = b_all.view(-1, dim_p1)
-
-        A_good: Tensor = A_flat[good_flat_idx]  # (M, P+1, P+1)
-        b_good: Tensor = b_flat[good_flat_idx]  # (M, P+1)
-
-        # (4) 작은 정규화 εI 를 더해 수치적으로 안정하게 만든 뒤 batched solve
-        identity_matrix: Tensor = torch.eye(dim_p1,
-                                            device=A_good.device,
-                                            dtype=A_good.dtype).unsqueeze(
-                                                0)  # (1, P+1, P+1)
-        A_good_reg: Tensor = A_good + regularization_epsilon * identity_matrix  # (M, P+1, P+1)
-
-        # coeff_good: (M, P+1)
-        coeff_good: Tensor = torch.linalg.solve(
-            A_good_reg, b_good.unsqueeze(-1)).squeeze(-1)
-
-        # (5) 1차 계수 a_1 이 바로 d/dt 값 (τ를 실제 시간 단위로 잡았기 때문)
-        first_derivative_good: Tensor = coeff_good[:, 1]  # (M,)
-
-        # (6) flatten된 dx_out에 good 위치만 LS 결과로 덮어쓰기
-        dx_out_flat: Tensor = dx_out.view(-1)  # (N*T,)
-        dx_out_flat[good_flat_idx] = first_derivative_good
-        dx_out = dx_out_flat.view(N, point_len)  # (N, T)
-
-        # (7) 중심이 invalid 인 위치는 최종적으로 0으로 처리
-        dx_out = torch.where(valid_center_mask, dx_out,
-                             torch.zeros_like(dx_out))
-
-        return dx_out
-
-    def _get_savgol_pos_weights_cached(
-        self,
-        *,
-        window_length: int,
-        polyorder: int,
-        deriv_order: int,
-        dt: float,
-        m: int,  # 창 내부 평가 위치(0..W-1)
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """창 길이 W에서 위치 m(0..W-1)의 k차 미분 SG 가중치 벡터를 반환.
-
-        Returns:
-            torch.Tensor: (W,)  — 창 샘플과 내적하면 해당 위치의 미분 근사값.
-        """
-        master_key = (int(window_length), int(polyorder), int(deriv_order),
-                      int(m), float(dt))
-        if master_key in self._sg_pos_cache:
-            w_cpu_fp32 = self._sg_pos_cache.pop(master_key)
-            self._sg_pos_cache[master_key] = w_cpu_fp32
-        else:
-            with torch.no_grad():
-                W = int(window_length)  # 추가 요망!
-                work_dtype = torch.float64
-                x = torch.arange(
-                    0, W, device=torch.device("cpu"),
-                    dtype=work_dtype) - float(m)
-                V = torch.stack([x**i for i in range(polyorder + 1)], dim=1)
-                pinv = torch.linalg.pinv(V)
-                e = torch.zeros(polyorder + 1,
-                                device=torch.device("cpu"),
-                                dtype=work_dtype)
-                e[deriv_order] = math.factorial(deriv_order)
-                w = (e @ pinv) / (dt**deriv_order)  # float64
-                w_cpu_fp32 = w.to(torch.float32).contiguous()  # CPU/FP32로 보관
-                if len(self._sg_pos_cache) >= self._sg_pos_cache_cap:
-                    self._sg_pos_cache.popitem(last=False)
-                self._sg_pos_cache[master_key] = w_cpu_fp32
-        with torch.no_grad():
-            return w_cpu_fp32.to(device=device, dtype=dtype)
-
     # <추가하자>
     def _prepare_points_and_masks(
             self,
@@ -874,52 +539,6 @@ class FeasibleProjector(nn.Module):
             past_len=past_len,  # int
             point_len=point_len,  # int
         )
-
-    def _get_savgol_diff_kernel_cached(
-        self,
-        window_length: int,
-        polyorder: int,
-        deriv_order: int,
-        dt: float,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """사비츠키–골레이 1D 미분 커널을 LRU 캐시로 제공.
-
-        Args:
-            window_length (int): 커널 길이 W(홀수).
-            polyorder (int): 다항 차수.
-            deriv_order (int): 미분 차수(보통 1).
-            dt (float): 샘플 간격(초). 커널 값에 직접 반영됨.
-            device (torch.device): 커널을 올릴 디바이스.
-            dtype (torch.dtype): 커널 dtype.
-
-        Returns:
-            torch.Tensor: (1, 1, W) 커널. requires_grad=False.
-        """
-        master_key = (int(window_length), int(polyorder), int(deriv_order),
-                      float(dt))
-        # 1) 조회(저장은 CPU/FP32)
-        if master_key in self._sg_kernel_cache:
-            kernel_cpu_fp32 = self._sg_kernel_cache.pop(master_key)
-            self._sg_kernel_cache[master_key] = kernel_cpu_fp32
-        else:
-            # 2) 생성(항상 CPU/FP32)
-            with torch.no_grad():
-
-                kernel_cpu_fp32 = self._build_savgol_diff_kernel(
-                    window_length=window_length,
-                    polyorder=polyorder,
-                    deriv_order=deriv_order,
-                    dt=dt,
-                    device=torch.device("cpu"),
-                    dtype=torch.float32)
-                if len(self._sg_kernel_cache) >= self._sg_kernel_cache_cap:
-                    self._sg_kernel_cache.popitem(last=False)
-                self._sg_kernel_cache[master_key] = kernel_cpu_fp32
-        # 3) 요청 형식/장치로 변환해 반환
-        with torch.no_grad():
-            return kernel_cpu_fp32.to(device=device, dtype=dtype)
 
     # =========================================================
     # [추가 필요] STE 유틸 (공통)
@@ -1814,17 +1433,6 @@ class FeasibleProjector(nn.Module):
     # ----------------------------
     # [UTIL] 각도/벡터 보조 함수들
     # ----------------------------
-    @staticmethod
-    def _wrap_to_pi(angle_rad: torch.Tensor) -> torch.Tensor:
-        """[-pi, pi]로 래핑.
-
-        Args:
-            angle_rad (torch.Tensor): 라디안 값 [...].
-
-        Returns:
-            torch.Tensor: 같은 shape, [-pi, pi] 래핑.
-        """
-        return torch.atan2(torch.sin(angle_rad), torch.cos(angle_rad))
 
     @staticmethod
     def _compute_mid_heading_from_cos_sin(
@@ -2175,60 +1783,9 @@ class FeasibleProjector(nn.Module):
     # [UTIL] 속도/증분 soft & hard 클립
     # ----------------------------
 
-    @staticmethod
-    def _radial_hard_clip(
-        vx: torch.Tensor,  # (B,Pnn) 또는 (...,)
-        vy: torch.Tensor,  # (B,Pnn) 또는 (...,)
-        v_max: Union[float, torch.Tensor],  # (B,Pnn) 또는 스칼라
-        eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """속도 벡터의 L2 노름을 v_max로 **하드** 제한(방사형 스케일)."""
-        speed = torch.sqrt(vx * vx + vy * vy).clamp_min(eps)
-        if not torch.is_tensor(v_max):
-            v_max_t = torch.tensor(v_max, device=vx.device, dtype=vx.dtype)
-        else:
-            v_max_t = v_max.to(device=vx.device, dtype=vx.dtype)
-        scale = torch.clamp(v_max_t / speed.clamp_min(eps), max=1.0)
-        return vx * scale, vy * scale
-
     # ==========================================
     # 4) S2 (증분 제한) soft clip 수정
     # ==========================================
-
-    @staticmethod
-    def _increment_hard_clip(
-        delta: torch.Tensor,  # (...,) 또는 (...,D)
-        limit: Union[float, torch.Tensor],  # (...,)
-        eps: float,
-    ) -> torch.Tensor:
-        """증분(스칼라/벡터 노름) 하드 클립.
-
-        - 스칼라장: 원소별 clamp.
-        - 벡터: 노름 기반 방사형 스케일.
-        """
-        if delta.ndim == 0 or (delta.ndim >= 1 and
-                               delta.shape[-1] not in (2, 3)):
-            if not torch.is_tensor(limit):
-                limit_t = torch.tensor(limit,
-                                       device=delta.device,
-                                       dtype=delta.dtype)
-            else:
-                limit_t = limit.to(device=delta.device, dtype=delta.dtype)
-            return torch.clamp(delta, -limit_t, limit_t)
-
-        vec_last_dim = delta.ndim - 1
-        norm = torch.linalg.norm(delta, dim=vec_last_dim,
-                                 keepdim=True).clamp_min(eps)
-        if not torch.is_tensor(limit):
-            limit_t = torch.tensor(limit,
-                                   device=delta.device,
-                                   dtype=delta.dtype)
-        else:
-            limit_t = limit.to(device=delta.device, dtype=delta.dtype)
-        if limit_t.ndim == delta.ndim - 1:
-            limit_t = limit_t.unsqueeze(-1)
-        scale = torch.clamp(limit_t / norm, max=1.0)
-        return delta * scale
 
     # ============================
     # [REFACTORED] 본체: Filter + Integrate
@@ -2339,461 +1896,6 @@ class FeasibleProjector(nn.Module):
     # ================================================================
     # [REFACTOR] Savitzky–Golay 유틸들 (모두 torch-only, 미분 가능)
     # ================================================================
-    @staticmethod
-    def _ensure_odd(value: int) -> int:
-        """홀수 보정."""
-        return value if (value % 2 == 1) else (value - 1)
-
-    @staticmethod
-    def _choose_window_length(
-        effective_length: int,
-        polyorder: int,
-        max_window_length: int,
-    ) -> int:
-        """유효 길이에 맞춰 SG 윈도 길이 결정(홀수, polyorder보다 큼).
-        - 너무 짧으면(≤polyorder 또는 <3) 0을 반환해 유한차분으로 폴백.
-        """
-        # 1) 길이가 너무 짧으면 SG 사용 안 함
-        if effective_length <= polyorder or effective_length < 3:
-            return 0
-
-        # 2) 상한 내에서 가능한 가장 큰 홀수 창
-        lim = min(max_window_length, effective_length)
-        win = lim if (lim % 2 == 1) else (lim - 1)
-
-        # 3) 여전히 polyorder보다 작거나 같으면 사용 불가 → 폴백
-        if win <= polyorder:
-            return 0
-
-        return win
-
-    @staticmethod
-    def _build_savgol_diff_kernel(
-        window_length: int,
-        polyorder: int,
-        deriv_order: int,
-        dt: float,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """SG 1D 미분 커널 (conv1d용) 생성. (중심에서의 도함수 근사)
-
-        Returns:
-            (1, 1, window_length) 모양의 커널.
-        """
-        with torch.no_grad():
-            # h=1인 정수 격자에서의 설계 → 실제 시간 미분은 dt**deriv 로 스케일
-            half = window_length // 2
-            work_dtype = torch.float64
-            x = torch.arange(-half, half + 1, device=device, dtype=work_dtype)
-            V = torch.stack([x**i for i in range(polyorder + 1)],
-                            dim=1).to(work_dtype)
-            pinv = torch.linalg.pinv(V)  # float64
-            e = torch.zeros(polyorder + 1, device=device, dtype=work_dtype)
-            e[deriv_order] = math.factorial(deriv_order)
-            coeff = (e @ pinv) / (dt**deriv_order)  # float64
-            kernel = coeff.to(dtype).view(1, 1, window_length)  # 최종 dtype으로 캐스팅
-            return kernel
-
-    @staticmethod
-    def _conv1d_with_pad(
-        seq_bt: torch.Tensor,  # (N, 1, T)
-        kernel: torch.Tensor,  # (1, 1, W)
-        pad: int,
-        mode: str = "reflect",
-    ) -> torch.Tensor:
-        """경계 패딩 후 1D 컨볼루션.
-
-        Args:
-            seq_bt: (N, 1, T) 입력 시퀀스
-            kernel: (1, 1, W) SG 미분 커널
-            pad: 좌/우 패딩 크기
-            mode: "reflect" 권장(경계 편향 완화). T<2 등 불가 상황은 자동 폴백(replicate).
-
-        Returns:
-            (N, 1, T) 동일 길이 출력
-        """
-        if pad > 0:
-            T = seq_bt.shape[-1]
-            pad_mode = mode
-            # reflect는 T>=2 필요. 불가하면 replicate로 폴백
-            if mode == "reflect" and T < 2:
-                pad_mode = "replicate"
-            seq_bt = F.pad(seq_bt, (pad, pad), mode=pad_mode)
-        return F.conv1d(seq_bt, kernel, stride=1)
-
-    @staticmethod
-    def _finite_difference_derivative(
-        seq_bT: torch.Tensor,  # (N, T)
-        dt: float,
-    ) -> torch.Tensor:
-        """윈도가 너무 짧은 경우를 위한 유한차분(중심차분/전방/후방 혼용). 미분 가능."""
-        x = seq_bT
-        N, T = x.shape
-        dx = torch.zeros_like(x)
-        if T >= 3:
-            dx[:, 1:-1] = (x[:, 2:] - x[:, :-2]) / (2.0 * dt)
-            dx[:, 0] = (x[:, 1] - x[:, 0]) / dt
-            dx[:, -1] = (x[:, -1] - x[:, -2]) / dt
-        elif T == 2:
-            dx[:, 0] = (x[:, 1] - x[:, 0]) / dt
-            dx[:, 1] = (x[:, 1] - x[:, 0]) / dt
-        else:
-            dx.zero_()
-        return dx  # (N, T)
-
-    @staticmethod
-    def _unwrap_phase_torch(
-            phase_bT: torch.Tensor,  # (B_Pnn, T1), 라디안
-    ) -> torch.Tensor:
-        """numpy.unwrap 유사 동작(토치 전용). 마지막 차원 기준."""
-        # d = ((Δφ + π) mod 2π) - π
-        pi = math.pi
-        d = torch.diff(phase_bT, dim=-1)
-        d_mod = (d + pi) % (2 * pi) - pi
-        # 경계 케이스(+/-π) 보정은 생략(학습에서는 거의 영향 X)
-        first = phase_bT[..., :1]
-        unwrapped = torch.cat([first, first + torch.cumsum(d_mod, dim=-1)],
-                              dim=-1)
-        return unwrapped  # (B_Pnn, T1)
-
-    @staticmethod
-    def _split_full_vs_partial_rows(
-            valid_bT: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """전 구간 유효 row / 일부만 유효 row 인덱스 분리.
-            valid_bT: (B_Pnn,T1)  True=유효
-
-        Returns:
-            idx_full (K,), idx_partial (M,)
-        """
-        full_mask = valid_bT.all(dim=1)  # (B_Pnn,)
-        idx_full = torch.nonzero(full_mask, as_tuple=False).flatten()
-        idx_partial = torch.nonzero(~full_mask, as_tuple=False).flatten()
-        return idx_full, idx_partial
-
-    # [추가 요망] FeasibleProjector 내부에 추가
-    def _build_poswise_weight_banks_cached(
-        self,
-        *,
-        T: int,
-        polyorder: int,
-        max_window_length: int,
-        dt: float,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """왼/가운데/오른쪽 구간에 쓸 위치별 SG 미분 가중치 뱅크 생성(+캐시된 항목 재사용).
-
-1. **창 크기(한 번에 볼 점 개수)**를 정하고,
-   그 창 안에서 각 위치(맨 앞, 중간, 맨 뒤)에 맞는
-   **“기울기 계산용 레시피(섞는 비율표)”**를 전부 만든다.
-
-2. 이 비율표는 단순히 길이(창 크기)만 담는 게 아니라,
-
-   * 앞/중간/뒤 **어디에서 쓰는지**
-   * **얼마나 부드럽게/날카롭게** 기울기를 잡을지
-   * **시간 간격이 얼마인지**
-     같은 조건을 모두 반영해서 숫자가 결정된 레시피다.
-
-3. 이렇게 만든 레시피들을
-
-   * 앞부분용 묶음
-   * 가운데 공통 하나
-   * 뒷부분용 묶음
-     세 덩어리로 정리해 둔다.
-
-4. 나중에 실제 기울기를 구할 때는
-   **그래프 위치(앞·중간·뒤)에 맞는 레시피를 바로 꺼내 써서**
-   빠르고 안정적으로 기울기를 계산한다.
-
-5. 같은 조건으로 계속 쓸 일이 많으니,
-   한 번 만든 레시피 묶음을 **작은 저장소(캐시)에 기억해 뒀다가**
-   재사용해서 **속도와 일관성을 챙기는 역할**까지 한다.
-
-
-        Returns:
-            w_left_bank:  (half, W)    # m=0..half-1
-            w_center:     (W,)         # m=half
-            w_right_bank: (half, W)    # m=half..W-1
-            half:         int
-
-짧게 말하면, 이 네 개는 **“어디에서 쓸 비율표(레시피)냐”를 나눠서 들고 있는 패키지**야.
-
-* `W` : 한 번에 보는 점 개수(창 크기)
-* `half` : 그 창의 절반 정도 위치 (대충 “앞쪽·뒤쪽 경계”를 나누는 기준)
-
-각 값의 의미는:
-
-1. **`w_left_bank: (half, W)`**
-   → **그래프 맨 앞쪽 근처에서 쓸 레시피들 묶음**
-
-   * `half`줄이 있고, 각 줄이 길이 `W`짜리 비율표야.
-   * “맨 앞 점에서 기울기 계산할 때는 이렇게 섞어라”,
-     “그 다음 점은 이렇게 섞어라” … 이런 식으로 **앞부분 여러 위치용 레시피**가 들어 있음.
-
-2. **`w_center: (W,)`**
-   → **그래프 중간 대부분에서 공통으로 쓰는 레시피 하나**
-
-   * 한 줄짜리, 길이 `W`인 비율표.
-   * 중간 구간은 상황이 비슷해서, 이 하나로 쭉 써도 충분해서 하나만 둔 것.
-
-3. **`w_right_bank: (half, W)`**
-   → **그래프 맨 끝쪽 근처에서 쓸 레시피들 묶음**
-
-   * 이것도 `half`줄 × `W`길이.
-   * “맨 끝에서 한 칸 안쪽 점은 이렇게 섞어라”,
-     “그 앞 점은 이렇게 섞어라” … 같은 **끝부분 위치용 레시피**가 들어 있음.
-
-4. **`half: int`**
-   → “앞쪽 전용 레시피 몇 개 / 뒤쪽 전용 레시피 몇 개를 쓸지”를 알려주는 숫자.
-
-   * 보통 `half = W // 2` 정도라서,
-     앞에서 `half`개, 뒤에서 `half`개, 가운데는 `w_center` 하나로 커버하는 구조라고 보면 돼.
-
-요약하면:
-
-> 그래프 **앞·중간·뒤**에서 기울기를 계산할 때,
-> 각 구간에 맞게 점들을 “어떻게 섞을지” 정해 놓은
-> **왼쪽용 레시피 묶음, 가운데용 레시피 하나, 오른쪽용 레시피 묶음 + 그 개수 정보**라고 보면 된다.
-
-        """
-        W = self._choose_window_length(T, polyorder, max_window_length)
-        if W < 3:
-            return (torch.empty(0, device=device, dtype=dtype),
-                    torch.empty(0, device=device, dtype=dtype),
-                    torch.empty(0, device=device, dtype=dtype), 0)
-        half = W // 2
-
-        # 중앙(항상 동일)
-        w_center = self._get_savgol_pos_weights_cached(window_length=W,
-                                                       polyorder=polyorder,
-                                                       deriv_order=1,
-                                                       dt=dt,
-                                                       m=half,
-                                                       device=device,
-                                                       dtype=dtype)  # (W,)
-
-        # 왼쪽/오른쪽 뱅크
-        w_left_list, w_right_list = [], []
-        for m in range(0, half):  # 왼쪽
-            w_left_list.append(
-                self._get_savgol_pos_weights_cached(window_length=W,
-                                                    polyorder=polyorder,
-                                                    deriv_order=1,
-                                                    dt=dt,
-                                                    m=m,
-                                                    device=device,
-                                                    dtype=dtype))
-        for m in range(half + 1, W):  # 기존: range(half, W)
-            w_right_list.append(
-                self._get_savgol_pos_weights_cached(window_length=W,
-                                                    polyorder=polyorder,
-                                                    deriv_order=1,
-                                                    dt=dt,
-                                                    m=m,
-                                                    device=device,
-                                                    dtype=dtype))
-
-        w_left_bank = torch.stack(
-            w_left_list, dim=0) if w_left_list else torch.empty(
-                0, W, device=device, dtype=dtype)  # (half, W)
-        w_right_bank = torch.stack(
-            w_right_list, dim=0) if w_right_list else torch.empty(
-                0, W, device=device, dtype=dtype)  # (half, W)
-        return w_left_bank, w_center, w_right_bank, half
-
-    def _sg_derivative_full_rows(
-        self,
-        seq_bT: torch.Tensor,  # (N_full, point_len)
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-    ) -> torch.Tensor:
-        """전 타임스텝 유효 row를 위치별(one‑sided/중앙) SG로 '완전 벡터화'해 미분."""
-        if seq_bT.numel() == 0:
-            return seq_bT
-        device, dtype = seq_bT.device, seq_bT.dtype
-        N, point_len = seq_bT.shape
-        """
-            w_left_bank:  (half, W)    # m=0..half-1
-            w_center:     (W,)         # m=half
-            w_right_bank: (half, W)    # m=half..W-1
-            half:         int
-        """
-        w_left_bank, w_center, w_right_bank, half = self._build_poswise_weight_banks_cached(
-            T=point_len,
-            polyorder=polyorder,
-            max_window_length=max_window_length,
-            dt=dt,
-            device=device,
-            dtype=dtype)
-        if half == 0:  # W<3 → 유한차분
-            return self._finite_difference_derivative(seq_bT, dt)
-
-        W = w_center.numel()
-        dx = torch.empty_like(seq_bT)
-
-        # 1) 왼쪽: 첫 윈도(공통) × 위치별 가중치(half개) → (N, half)
-        X_left = seq_bT[:, :W]  # (N, W)
-        left = X_left @ w_left_bank.transpose(0, 1)  # (N, half)
-
-        # 2) 가운데: unfold 슬라이딩 창 × 중앙 가중치 → (N, point_len-2*half)
-        X_mid = seq_bT.unfold(dimension=-1, size=W,
-                              step=1)  # (N, point_len-W+1, W)
-        mid = (X_mid * w_center.view(1, 1, W)).sum(-1)  # (N, point_len-W+1)
-
-        # 3) 오른쪽: 마지막 윈도(공통) × 위치별 가중치(half개) → (N, half)
-        X_right = seq_bT[:, -W:]  # (N, W)
-        right = X_right @ w_right_bank.transpose(0, 1)  # (N, half)
-
-        # 4) 조립
-        dx[:, :half] = left
-        dx[:, half:point_len - half] = mid
-        dx[:, point_len - half:point_len] = right
-        return dx
-
-    def _sg_derivative_partial_rows(
-        self,
-        seq_bT: torch.Tensor,  # (N_partial, point_len)
-        valid_bT: torch.Tensor,  # (N_partial, point_len) True=유효
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-    ) -> torch.Tensor:
-        """'단일 유효 블록(연속 True)' 가정 하에, 각 row의 유효 구간에만 SG 미분을 적용.
-
-        - (현재→미래)의 1*0* 패턴, (과거→현재→미래)의 0*1*0* 패턴 모두 지원.
-        - 유효 블록이 없으면 0을 반환.
-        - 유효 블록이 여러 덩어리면 예외 발생(사전 마스크 검증 위배).
-        """
-        if seq_bT.numel() == 0:
-            return seq_bT
-        N, _ = seq_bT.shape
-
-        dx = torch.zeros_like(seq_bT)
-
-        # 과거·현재(0*1*), 현재·미래(1*0*)의 **사전 검증**은 호출부에서 수행한다고 가정.
-        # 여기서는 각 row에서 유효 블록을 찾아 해당 구간만 SG 미분.
-        for i in range(N):
-            block = self._find_single_valid_block(valid_bT[i])
-            dx[i] = self._sg_derivative_on_block(
-                seq_bT[i],
-                block,
-                dt=dt,
-                polyorder=polyorder,
-                max_window_length=max_window_length,
-            )
-        return dx
-
-    # 지우개: 기존 _savgol_derivative_masked_torch 전체 구현
-    # def _savgol_derivative_masked_torch(...):
-    #     ...
-
-    # 추가: 마스크-aware 배치 LS-SG + 유한 차분 폴백 본체
-    def _savgol_derivative_masked_torch(
-        self,
-        seq_bT: Tensor,  # (B_Pnn, point_len)
-        valid_bT: Tensor,  # (B_Pnn, point_len) True=유효
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-    ) -> Tensor:  # (B_Pnn, point_len)
-        """마스크를 고려한 SG 1차 미분을 완전 배치로 계산한다.
-
-        - 입력:
-            seq_bT:   (N, T)  = 스칼라 시퀀스 (N=B*Pnn)
-            valid_bT: (N, T)  = 각 시점 유효 여부(True/False)
-
-        - 동작:
-            1) 전체에 대해 유한 차분 d/dt 를 먼저 계산해 두고,
-            2) SG 윈도 길이 W를 정한 뒤,
-            3) seq/valid 를 (N,T,W) 윈도 텐서로 펼치고,
-            4) 시간 기저(Φ)와 Gram(Φ_k^TΦ_k)을 미리 만든 다음,
-            5) A_all, b_all 를 브로드캐스트 + sum 으로 계산하고,
-            6) 유효 샘플 개수가 충분한 위치만 batched solve 로 LS-SG 미분을 구해
-               유한 차분 결과 위에 덮어쓴다.
-            7) 중심이 invalid 인 위치는 최종적으로 0으로 만든다.
-
-        Returns:
-            dx_out: (N, T) = 유효 구간에서 SG 미분, 무효는 0
-        """
-        # seq_bT:   (N, T)
-        # valid_bT: (N, T)
-        if seq_bT.numel() == 0:
-            return seq_bT
-
-        device: torch.device = seq_bT.device
-        dtype: torch.dtype = seq_bT.dtype
-        N, point_len = seq_bT.shape  # N = B*Pnn
-
-        # (0) 기본 유한 차분 결과를 먼저 계산해 둔다.  (배치 전체 한 번)
-        #     fd_derivative: (N, T)
-        fd_derivative: Tensor = self._finite_difference_derivative(
-            seq_bT,
-            dt=dt,
-        )
-
-        # (1) SG 윈도 길이 W 선택
-        #     - 전체 길이 T와 max_window_length 중 작은 쪽을 사용
-        #     - 짝수면 한 칸 줄여서 홀수로 맞춘다.
-        window_length: int = int(min(max_window_length, point_len))
-        if window_length <= 0:
-            # 안전장치: 이론상 여기 올 일은 거의 없음
-            return torch.where(
-                valid_bT,
-                fd_derivative,
-                torch.zeros_like(fd_derivative),
-            )
-        if window_length % 2 == 0:
-            window_length -= 1
-        if window_length <= 0:
-            window_length = 1  # 최소 1은 유지
-
-        # (2) 시퀀스를 (N,T,W) 윈도 텐서로 펼치고, 윈도 내 유효 샘플 수 계산
-        #     seq_window:  (N, T, W)
-        #     mask_window: (N, T, W)
-        #     valid_count: (N, T)
-        seq_window, mask_window, valid_count = self._sg_unfold_sequence_and_valid_mask(
-            seq_bT,
-            valid_bT,
-            window_length=window_length,
-        )
-
-        # (3) 시간 기저(Φ)와 Gram(Φ_k^TΦ_k), Φ_k 를 준비
-        #     design_matrix: (W, P+1)
-        #     gram_per_k:    (W, P+1, P+1)
-        #     power_per_k:   (W, P+1)
-        _, gram_per_k, power_per_k = self._sg_build_design_matrix_and_gram(
-            window_length=window_length,
-            polyorder=polyorder,
-            dt=dt,
-            device=device,
-            dtype=dtype,
-        )
-
-        # (4) A_all, b_all 계산
-        #     A_all: (N, T, P+1, P+1)
-        #     b_all: (N, T, P+1)
-        A_all, b_all = self._sg_build_normal_equations_batched(
-            seq_window=seq_window,
-            mask_window=mask_window,
-            gram_per_k=gram_per_k,
-            power_per_k=power_per_k,
-        )
-
-        # (5) batched solve + 유한 차분 폴백을 통해 최종 d/dt 생성
-        #     regularization_epsilon 은 self._eps를 그대로 재사용
-        dx_out: Tensor = self._sg_solve_normal_equations_batched(
-            A_all=A_all, # (N, T, P+1, P+1)
-            b_all=b_all, # (N, T, P+1)
-            valid_count=valid_count, # (N, T)
-            valid_center_mask=valid_bT.to(torch.bool), # (N, T)
-            fd_derivative=fd_derivative, # (N, T)
-            polyorder=polyorder,
-            regularization_epsilon=float(getattr(self, "_eps", 1e-6)),
-        )
-
-        return dx_out  # (N, T)
 
     # feasible.py 내 FeasibleProjector 클래스 안에 추가
     def _assert_cur_future_valid_mask(
@@ -2898,126 +2000,87 @@ class FeasibleProjector(nn.Module):
             points_valid=points_valid)  # (B,Pnn,point_len,3)
         return unnorm_points_world_control
 
-    # <추가하자>
-    def _find_single_valid_block(
-            self,
-            valid_row: torch.Tensor,  # (T,) bool/int8
-    ) -> Tuple[Optional[int], Optional[int]]:
-        """한 행(valid_row)에서 **연속된 True 블록**의 [start, end]를 찾습니다.
-
-        - True가 하나도 없으면 (None, None) 반환
-        - True가 여러 덩어리(불연속)면 ValueError
-
-        Args:
-            valid_row: (T,) bool/int8
-
-        Returns:
-            (start, end): 모두 inclusive 인덱스. 없으면 (None, None).
-        """
-        v = valid_row.to(torch.int8)
-        T = int(v.numel())
-        if v.sum() == 0:
-            return None, None
-
-        idx_true = torch.nonzero(v, as_tuple=False).flatten()
-        start = int(idx_true[0].item())
-        end = int(idx_true[-1].item())
-
-        # 블록 내부가 모두 True인지(연속성) 확인
-        if not v[start:end + 1].all():
-            raise ValueError("[_find_single_valid_block] 유효 블록이 여러 덩어리입니다. "
-                             f"start={start}, end={end}")
-        return start, end
-
-    # <추가하자>
-    def _sg_derivative_on_block(
-        self,
-        seq_row: torch.Tensor,  # (T,)
-        block: Tuple[Optional[int], Optional[int]],
-        *,
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-    ) -> torch.Tensor:
-        """단일 row에서 유효 블록([start,end])에만 SG 파생을 적용하고, 나머지는 0으로 둡니다.
-
-        Args:
-            seq_row: (T,)
-            block: (start, end), 둘 다 inclusive. 없으면 (None, None)
-
-        Returns:
-            d_row: (T,)  — 유효 블록만 미분값, 바깥은 0
-        """
-        T = int(seq_row.shape[0])
-        d_row = torch.zeros_like(seq_row)
-        start, end = block
-        if start is None or end is None:
-            return d_row  # 전부 무효
-
-        seg = seq_row[start:end + 1].unsqueeze(0)  # (1, L)
-        dseg = self._sg_derivative_full_rows(
-            seg,
-            dt=dt,
-            polyorder=polyorder,
-            max_window_length=max_window_length,
-        ).squeeze(0)  # (L,)
-        d_row[start:end + 1] = dseg
-        return d_row
-
-    # <추가하자>
-    def _compute_world_linear_velocity_via_sg(
-        self,
-        x: torch.Tensor,  # (B,Pnn,point_len)
-        y: torch.Tensor,  # (B,Pnn,point_len)
-        points_valid: torch.Tensor,  # (B,Pnn,point_len)  bool
-        *,
-        dt: float,
-        polyorder: int,
-        max_window_len_xy: int,
-    ) -> Tuple[torch.Tensor,
-               torch.Tensor]:  # (B,Pnn,point_len), (B,Pnn,point_len)
-        """SG(마스크 인지)로 세계속도 v_x^w, v_y^w 추정."""
-        B, Pnn, point_len = x.shape
-
-        # v_x: (B,Pnn,point_len)
-        # v_y: (B,Pnn,point_len)
-        v_x = self._savgol_derivative_masked_torch(
-            x.reshape(-1, point_len),  # (B*Pnn, point_len)
-            points_valid.reshape(-1, point_len),  # (B*Pnn, point_len)
-            dt=dt,
-            polyorder=polyorder,
-            max_window_length=max_window_len_xy).reshape(B, Pnn, point_len)
-
-        v_y = self._savgol_derivative_masked_torch(
-            y.reshape(-1, point_len),  # (B*Pnn, point_len)
-            points_valid.reshape(-1, point_len),  # (B*Pnn, point_len)
-            dt=dt,
-            polyorder=polyorder,
-            max_window_length=max_window_len_xy).reshape(B, Pnn, point_len)
-        return v_x, v_y
-
-    # <추가하자>
     def _compute_yaw_rate_via_sg(
         self,
-        cos_y: torch.Tensor,  # (B,Pnn,point_len)
-        sin_y: torch.Tensor,  # (B,Pnn,point_len)
-        points_valid: torch.Tensor,  # (B,Pnn,point_len)  bool
+        cos_y: torch.Tensor,  # (B, Pnn, point_len)
+        sin_y: torch.Tensor,  # (B, Pnn, point_len)
+        points_valid: torch.Tensor,  # (B, Pnn, point_len) bool
         *,
         dt: float,
         polyorder: int,
         max_window_len_yaw: int,
     ) -> torch.Tensor:
-        """cos/sin 각각 SG-미분 뒤 조합해 ψ̇ 추정(unwrap 불필요)."""
-        yaw_rate = _yaw_rate_from_cos_sin_via_sg(
-            cos_yaw=cos_y,
-            sin_yaw=sin_y,
-            valid_mask=points_valid,
+        """cos(ψ), sin(ψ) 시퀀스로부터 각속도 ψ̇를 부드럽게 추정하는 함수.
+
+        - 먼저 cos, sin을 함께 SG에 넣어 두 값의 시간 변화량을 구한다.
+        - 그 뒤, 회전 운동의 관계식을 이용해 ψ̇를 계산한다.
+        - cos, sin 을 다시 단위원으로 정리해 수치적인 오류가 쌓이지 않도록 한다.
+
+        Args:
+            cos_y: (B, Pnn, point_len)
+                각 시점의 cos(ψ) 값.
+            sin_y: (B, Pnn, point_len)
+                각 시점의 sin(ψ) 값.
+            points_valid: (B, Pnn, point_len) bool
+                해당 시점에 자세 정보가 실제로 존재하는지(True/False).
+            dt: float
+                샘플 간 시간 간격.
+            polyorder: int
+                Savitzky–Golay 다항식 차수.
+            max_window_len_yaw: int
+                yaw에 사용할 최대 창 길이.
+
+        Returns:
+            torch.Tensor: (B, Pnn, point_len)
+                각 시점의 부드럽게 추정된 yaw_rate(ψ̇).
+        """
+        batch_size, num_neighbors, point_len = cos_y.shape  # (B,Pnn,T)
+
+        # 추가: cos,sin을 하나의 2채널 시퀀스로 묶어서 SG 한 번만 호출
+        yaw_unit_stack = torch.stack(
+            [cos_y, sin_y],
+            dim=-1,
+        )  # (B, Pnn, point_len, 2)
+
+        yaw_unit_derivative = self._sg_derivative_multi_for_points(
+            sequences_points=yaw_unit_stack,  # (B,Pnn,point_len,2)
+            points_valid=points_valid,  # (B,Pnn,point_len)
             dt=dt,
             polyorder=polyorder,
-            max_window_len=max_window_len_yaw,
-            eps=1e-6,
-            sg_derivative_fn=self._savgol_derivative_masked_torch,
-        )
+            max_window_length=max_window_len_yaw,
+        )  # (B, Pnn, point_len, 2)
+
+        dcos = yaw_unit_derivative[..., 0]  # (B, Pnn, point_len)
+        dsin = yaw_unit_derivative[..., 1]  # (B, Pnn, point_len)
+
+        # 추가: cos,sin을 다시 단위원으로 투영해서 수치 오차를 줄인다.
+        cos_sin_stack = torch.stack(
+            [cos_y, sin_y],
+            dim=-1,
+        )  # (B, Pnn, point_len, 2)
+        norm = torch.linalg.norm(
+            cos_sin_stack,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-6)  # (B, Pnn, point_len, 1)
+
+        cos_unit = (cos_sin_stack[..., 0:1] / norm).squeeze(
+            -1)  # (B,Pnn,point_len)
+        sin_unit = (cos_sin_stack[..., 1:2] / norm).squeeze(
+            -1)  # (B,Pnn,point_len)
+
+        # 추가: ψ̇ = (cos * d(sin) - sin * d(cos)) / (cos² + sin²)
+        denom = (cos_unit * cos_unit + sin_unit * sin_unit).clamp_min(
+            1e-6)  # (B,Pnn,T)
+        yaw_rate = (cos_unit * dsin - sin_unit * dcos) / denom  # (B,Pnn,T)
+
+        # 무효 시점은 0으로 정리
+        yaw_rate = torch.where(
+            points_valid,
+            yaw_rate,
+            torch.zeros_like(yaw_rate),
+        )  # (B,Pnn,T)
+
         return yaw_rate
 
     # <추가하자>
@@ -3603,6 +2666,476 @@ class FeasibleProjector(nn.Module):
             segment_len=segment_len,
         )
         return u_ref
+
+    # ================================================================
+    # [추가] 멀티 채널용 Savitzky–Golay 미분 유틸
+    # ================================================================
+
+    def _savgol_finite_difference_multi(
+        self,
+        sequence_multi_channel: torch.Tensor,  # (N, T, C)
+        dt: float,
+    ) -> torch.Tensor:
+        """여러 값이 한 줄에 모여 있을 때, 가장 단순한 방식으로 시간 변화량을 구하는 함수.
+
+        - 시간축을 따라 앞뒤 값의 차이를 이용해서 "대략적인 속도"를 계산한다.
+        - 창 기반 보간(SG)을 적용하기 전에 기본값(폴백)으로 먼저 만들어 둔다.
+          나중에 SG가 더 좋은 값을 구할 수 있는 위치에서만 이 값을 덮어쓴다.
+
+        Args:
+            sequence_multi_channel: (N, T, C)
+                N개의 row(예: B*Pnn)에 대해, 길이 T인 시퀀스가 C개 채널로 모여 있는 텐서.
+            dt: float
+                샘플 간 시간 간격(초). 예: 0.1
+
+        Returns:
+            torch.Tensor: (N, T, C)
+                각 채널에 대해 유한 차분으로 계산한 시간 미분값.
+        """
+        # 추가: shape 해석
+        num_rows, sequence_length, num_channels = sequence_multi_channel.shape  # (N, T, C)
+
+        derivative_fd = torch.zeros_like(sequence_multi_channel)  # (N, T, C)
+
+        if sequence_length >= 3:
+            # 가운데 구간: 중앙 차분
+            derivative_fd[:, 1:-1, :] = (sequence_multi_channel[:, 2:, :] -
+                                         sequence_multi_channel[:, :-2, :]) / (
+                                             2.0 * dt)
+            # 맨 앞/뒤: 전방/후방 차분
+            derivative_fd[:, 0, :] = (sequence_multi_channel[:, 1, :] -
+                                      sequence_multi_channel[:, 0, :]) / dt
+            derivative_fd[:, -1, :] = (sequence_multi_channel[:, -1, :] -
+                                       sequence_multi_channel[:, -2, :]) / dt
+        elif sequence_length == 2:
+            # 길이가 2일 때는 두 점의 차이를 그대로 양 끝에 복사
+            derivative_fd[:, :, :] = (sequence_multi_channel[:, 1:2, :] -
+                                      sequence_multi_channel[:, 0:1, :]) / dt
+        else:
+            # 길이가 1 이하이면 변화량이 없다고 보고 0 유지
+            derivative_fd.zero_()
+
+        return derivative_fd  # (N, T, C)
+
+    def _savgol_select_window_length(
+        self,
+        sequence_length: int,
+        max_window_length: int,
+    ) -> int:
+        """실제로 사용할 Savitzky–Golay 창 길이를 결정하는 함수.
+
+        - 전체 길이보다 긴 창은 쓸 수 없으니 자동으로 줄인다.
+        - SG 특성상 홀수 길이가 필요하므로 짝수이면 1 줄여서 홀수로 바꾼다.
+
+        Args:
+            sequence_length: int
+                시퀀스 길이 T.
+            max_window_length: int
+                설정해 둔 최대 창 길이.
+
+        Returns:
+            int: 실제로 사용할 창 길이(0 이상).
+                 0이면 SG를 적용하지 않고 유한 차분만 사용한다는 뜻으로 쓸 수 있다.
+        """
+        window_length = int(min(max_window_length, sequence_length))
+        if window_length <= 0:
+            return 0
+        if window_length % 2 == 0:
+            window_length -= 1
+        if window_length <= 0:
+            window_length = 1
+        return window_length
+
+    def _savgol_build_mask_and_count_multi(
+        self,
+        valid_mask_bT: torch.Tensor,  # (N, T) bool
+        window_length: int,
+        value_dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """유효 마스크로부터, 각 시점 주변 창에 실제로 데이터가 몇 개 있는지 계산하는 함수.
+
+        - 중심 시점마다 길이 W짜리 창을 슬라이딩하면서,
+          그 안에서 유효(True)한 샘플 수를 센다.
+
+        Args:
+            valid_mask_bT: (N, T) bool
+                각 시점 값이 실제로 존재하는지(True/False)를 나타내는 마스크.
+            window_length: int
+                SG 창 길이 W.
+            value_dtype: torch.dtype
+                float32/float16 등, 계산에 사용할 실수 타입.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - mask_window: (N, T, W)  창 안에서의 유효 마스크(0/1 float)
+                - valid_count: (N, T)     창 안 유효 샘플 개수
+        """
+        num_rows, sequence_length = valid_mask_bT.shape  # (N, T)
+        half_window = window_length // 2
+
+        valid_float = valid_mask_bT.to(dtype=value_dtype)  # (N, T)
+        valid_padded = F.pad(
+            valid_float,
+            (half_window, half_window),
+            mode="constant",
+            value=0.0,
+        )  # (N, T + 2*half_window)
+
+        mask_window = valid_padded.unfold(
+            dimension=-1,
+            size=window_length,
+            step=1,
+        )  # (N, T, W)
+
+        valid_count = mask_window.sum(dim=-1)  # (N, T)
+
+        return mask_window, valid_count  # (N,T,W), (N,T)
+
+    def _savgol_build_A_all_from_mask_multi(
+            self,
+            mask_window: torch.Tensor,  # (N, T, W)
+            gram_per_k: torch.Tensor,  # (W, P+1, P+1)
+    ) -> torch.Tensor:
+        """창별 시간 정보(gram_per_k)와 마스크를 이용해
+        각 시점에서 쓸 작은 행렬 A를 한 번에 만드는 함수.
+
+        Args:
+            mask_window: (N, T, W)
+                각 시점 t 기준으로 주변 W개 위치가 유효한지(0/1) 나타내는 값.
+            gram_per_k: (W, P+1, P+1)
+                시간 기저 Φ_k에 대한 Φ_k^T Φ_k 값을 위치별로 쌓아둔 텐서.
+
+        Returns:
+            torch.Tensor: (N, T, P+1, P+1)
+                각 (row, t)에서 사용할 작은 행렬 A.
+        """
+        num_rows, sequence_length, window_length = mask_window.shape  # (N, T, W)
+        _, dim_p1, _ = gram_per_k.shape  # (W, P+1, P+1)
+
+        mask_expanded = mask_window.unsqueeze(-1).unsqueeze(
+            -1)  # (N, T, W, 1, 1)
+        gram_expanded = gram_per_k.view(1, 1, window_length, dim_p1,
+                                        dim_p1)  # (1, 1, W, P+1, P+1)
+
+        A_all = (mask_expanded * gram_expanded).sum(dim=2)  # (N, T, P+1, P+1)
+        return A_all
+
+    def _savgol_build_b_all_multi(
+        self,
+        sequence_multi_channel: torch.Tensor,  # (N, T, C)
+        mask_window: torch.Tensor,  # (N, T, W)
+        power_per_k: torch.Tensor,  # (W, P+1)
+        window_length: int,
+    ) -> torch.Tensor:
+        """여러 채널 값과 시간 기저를 이용해, 각 위치에서 쓸 작은 벡터 b를 한 번에 만드는 함수.
+
+        Args:
+            sequence_multi_channel: (N, T, C)
+                시간에 따라 변하는 값들이 C개 채널로 모여 있는 텐서.
+            mask_window: (N, T, W)
+                각 시점 주변 창에 어떤 위치가 유효한지(0/1) 나타내는 값.
+            power_per_k: (W, P+1)
+                시간 기저 Φ_k = [1, τ, τ^2, ...] 를 위치별로 모아둔 텐서.
+            window_length: int
+                창 길이 W.
+
+        Returns:
+            torch.Tensor: (N, T, C, P+1)
+                각 (row, t, channel)에 대해 작은 벡터 b.
+        """
+        num_rows, sequence_length, num_channels = sequence_multi_channel.shape  # (N,T,C)
+        half_window = window_length // 2
+        P_plus_one = power_per_k.shape[-1]
+
+        # (1) 시퀀스를 창 단위로 펼치기
+        #     (N, T, C) → (N*C, T) → pad+unfold → (N, T, W, C)
+        sequence_flat = sequence_multi_channel.reshape(
+            num_rows * num_channels, sequence_length)  # (N*C, T)
+        sequence_padded = F.pad(
+            sequence_flat,
+            (half_window, half_window),
+            mode="constant",
+            value=0.0,
+        )  # (N*C, T + 2*half_window)
+        sequence_window_flat = sequence_padded.unfold(
+            dimension=-1,
+            size=window_length,
+            step=1,
+        )  # (N*C, T, W)
+        sequence_window = sequence_window_flat.view(
+            num_rows, num_channels, sequence_length,
+            window_length).permute(0, 2, 3, 1)  # (N, T, W, C)
+
+        # (2) 마스크를 곱해 유효 위치만 남기기
+        weighted_values = sequence_window * mask_window.unsqueeze(
+            -1)  # (N, T, W, C)
+        weighted_values_ex = weighted_values.unsqueeze(-1)  # (N, T, W, C, 1)
+
+        # (3) 시간 기저 Φ_k 를 채널마다 곱해서 b를 만들기
+        power_expanded = power_per_k.view(1, 1, window_length, 1,
+                                          P_plus_one)  # (1, 1, W, 1, P+1)
+
+        b_all = (weighted_values_ex * power_expanded).sum(
+            dim=2)  # (N, T, C, P+1)
+        return b_all
+
+    def _savgol_solve_multi(
+        self,
+        A_all: torch.Tensor,  # (N, T, P+1, P+1)
+        b_all: torch.Tensor,  # (N, T, C, P+1)
+        valid_count: torch.Tensor,  # (N, T)
+        valid_center_mask: torch.Tensor,  # (N, T) bool
+        fd_derivative: torch.Tensor,  # (N, T, C)
+        polyorder: int,
+        regularization_epsilon: float,
+    ) -> torch.Tensor:
+        """창 기반 LS를 사용할 수 있는 위치에서만 SG 미분을 계산하고,
+        나머지는 유한 차분 결과를 그대로 활용하는 함수.
+
+        Args:
+            A_all: (N, T, P+1, P+1)
+                각 위치에서 사용할 작은 행렬 A.
+            b_all: (N, T, C, P+1)
+                각 위치/채널에서 사용할 작은 벡터 b.
+            valid_count: (N, T)
+                창 안 유효 샘플 개수.
+            valid_center_mask: (N, T) bool
+                중심 시점 자체가 유효한지 여부.
+            fd_derivative: (N, T, C)
+                미리 계산해 둔 유한 차분 결과.
+            polyorder: int
+                다항식 차수 P.
+            regularization_epsilon: float
+                A 행렬에 더해 줄 작은 값(수치 안정용).
+
+        Returns:
+            torch.Tensor: (N, T, C)
+                최종 SG 미분 결과. 중심이 무효인 위치는 0으로 채운다.
+        """
+        num_rows, sequence_length, dim_p1, _ = A_all.shape  # (N, T, P+1, P+1)
+        _, _, num_channels, _ = b_all.shape  # (N, T, C, P+1)
+
+        min_samples = int(polyorder) + 1
+
+        # 기본값은 유한 차분으로 깔아두고, 좋은 위치만 SG로 덮어쓰기
+        derivative_out = fd_derivative.clone()  # (N, T, C)
+
+        # SG를 적용할 수 있는 위치(데이터가 충분하고, 중심이 유효한 곳)
+        good_mask = (valid_count >= min_samples) & valid_center_mask  # (N, T)
+
+        if not good_mask.any():
+            # SG로 풀 곳이 하나도 없으면, 유한 차분 + 중심 마스크만 적용하고 반환
+            derivative_out = torch.where(
+                valid_center_mask.unsqueeze(-1),
+                derivative_out,
+                torch.zeros_like(derivative_out),
+            )
+            return derivative_out
+
+        # good 위치만 flatten 해서 batched solve
+        good_flat_idx = good_mask.view(-1).nonzero(as_tuple=False).squeeze(
+            -1)  # (M,)
+
+        A_flat = A_all.view(-1, dim_p1, dim_p1)  # (N*T, P+1, P+1)
+        A_good = A_flat[good_flat_idx]  # (M, P+1, P+1)
+
+        b_flat = b_all.view(-1, num_channels, dim_p1)  # (N*T, C, P+1)
+        b_good = b_flat[good_flat_idx].permute(0, 2, 1)  # (M, P+1, C)
+
+        identity_matrix = torch.eye(
+            dim_p1,
+            device=A_good.device,
+            dtype=A_good.dtype,
+        ).unsqueeze(0)  # (1, P+1, P+1)
+
+        A_good_reg = A_good + regularization_epsilon * identity_matrix  # (M, P+1, P+1)
+
+        # 다채널(C개)을 한 번에 푸는 배치 선형 시스템
+        coefficients_good = torch.linalg.solve(
+            A_good_reg,
+            b_good,
+        )  # (M, P+1, C)
+
+        first_derivative_good = coefficients_good[:, 1, :]  # (M, C)
+
+        derivative_out_flat = derivative_out.view(-1, num_channels)  # (N*T, C)
+        derivative_out_flat[good_flat_idx] = first_derivative_good
+        derivative_out = derivative_out_flat.view(num_rows, sequence_length,
+                                                  num_channels)  # (N, T, C)
+
+        # 중심이 유효하지 않은 위치는 최종적으로 0으로 처리
+        derivative_out = torch.where(
+            valid_center_mask.unsqueeze(-1),
+            derivative_out,
+            torch.zeros_like(derivative_out),
+        )
+
+        return derivative_out  # (N, T, C)
+
+    def _savgol_derivative_masked_multi_torch(
+        self,
+        seq_bTC: torch.Tensor,  # (N, T, C)
+        valid_bT: torch.Tensor,  # (N, T) bool
+        dt: float,
+        polyorder: int,
+        max_window_length: int,
+    ) -> torch.Tensor:
+        """여러 채널에 대해, 마스크를 고려한 Savitzky–Golay 1차 미분을 한 번에 계산하는 함수.
+
+        전체 흐름:
+            1) 먼저 모든 채널에 대해 유한 차분 결과를 만든다.
+            2) 실제로 사용할 창 길이 W를 결정한다.
+            3) 유효 마스크로부터 창별(mask_window) 유효 샘플 수(valid_count)를 구한다.
+            4) 시간 기저(Φ_k)와 Gram(Φ_k^TΦ_k)을 만든다.
+            5) A_all, b_all을 한 번에 만든다.
+            6) 데이터가 충분한 위치만 작은 선형 시스템을 풀어서 SG 미분값을 구하고,
+               나머지는 유한 차분 결과를 그대로 쓴다.
+
+        Args:
+            seq_bTC: (N, T, C)
+                여러 채널로 묶인 시퀀스 값.
+            valid_bT: (N, T) bool
+                각 시점 유효 여부.
+            dt: float
+                샘플 간 시간 간격.
+            polyorder: int
+                다항식 차수.
+            max_window_length: int
+                사용할 수 있는 최대 창 길이.
+
+        Returns:
+            torch.Tensor: (N, T, C)
+                각 채널에 대한 SG 1차 미분 결과.
+        """
+        if seq_bTC.numel() == 0:
+            return seq_bTC
+
+        num_rows, sequence_length, num_channels = seq_bTC.shape  # (N, T, C)
+        device = seq_bTC.device
+        dtype = seq_bTC.dtype
+
+        # 0) 유한 차분 기본값
+        fd_derivative = self._savgol_finite_difference_multi(
+            sequence_multi_channel=seq_bTC,
+            dt=dt,
+        )  # (N, T, C)
+
+        # 1) 창 길이 선택
+        window_length = self._savgol_select_window_length(
+            sequence_length=sequence_length,
+            max_window_length=max_window_length,
+        )
+
+        if window_length == 0:
+            # SG를 전혀 쓰지 못하는 상황: 유한 차분 결과에 중심 마스크만 씌워 반환
+            return torch.where(
+                valid_bT.unsqueeze(-1),
+                fd_derivative,
+                torch.zeros_like(fd_derivative),
+            )
+
+        # 2) 마스크 기반 창/유효 개수 계산
+        mask_window, valid_count = self._savgol_build_mask_and_count_multi(
+            valid_mask_bT=valid_bT,
+            window_length=window_length,
+            value_dtype=dtype,
+        )  # (N,T,W), (N,T)
+
+        # 3) 시간 기저 및 Gram, power 계산
+        _, gram_per_k, power_per_k = self._sg_build_design_matrix_and_gram(
+            window_length=window_length,
+            polyorder=polyorder,
+            dt=dt,
+            device=device,
+            dtype=dtype,
+        )  # gram_per_k: (W,P+1,P+1), power_per_k: (W,P+1)
+
+        # 4) A_all, b_all 계산
+        A_all = self._savgol_build_A_all_from_mask_multi(
+            mask_window=mask_window,  # (N,T,W)
+            gram_per_k=gram_per_k,  # (W,P+1,P+1)
+        )  # (N,T,P+1,P+1)
+
+        b_all = self._savgol_build_b_all_multi(
+            sequence_multi_channel=seq_bTC,  # (N,T,C)
+            mask_window=mask_window,  # (N,T,W)
+            power_per_k=power_per_k,  # (W,P+1)
+            window_length=window_length,
+        )  # (N,T,C,P+1)
+
+        # 5) LS를 적용할 수 있는 위치만 SG를 쓰고, 나머지는 유한 차분 유지
+        valid_center_mask = valid_bT.to(torch.bool)  # (N,T)
+
+        derivative_out = self._savgol_solve_multi(
+            A_all=A_all,  # (N,T,P+1,P+1)
+            b_all=b_all,  # (N,T,C,P+1)
+            valid_count=valid_count,  # (N,T)
+            valid_center_mask=valid_center_mask,  # (N,T)
+            fd_derivative=fd_derivative,  # (N,T,C)
+            polyorder=polyorder,
+            regularization_epsilon=float(getattr(self, "_eps", 1e-6)),
+        )  # (N,T,C)
+
+        return derivative_out  # (N,T,C)
+
+    # ================================================================
+    # [추가] (B,Pnn,point_len, C) 형태를 멀티 채널 SG에 넘겨주는 헬퍼
+    # ================================================================
+    def _sg_derivative_multi_for_points(
+        self,
+        sequences_points: torch.Tensor,  # (B, Pnn, point_len, C)
+        points_valid: torch.Tensor,  # (B, Pnn, point_len) bool
+        *,
+        dt: float,
+        polyorder: int,
+        max_window_length: int,
+    ) -> torch.Tensor:
+        """(B, Pnn, point_len, C) 모양의 데이터를
+        멀티 채널 SG 미분 함수에 넘기기 좋게 펴고 다시 되돌리는 함수.
+
+        Args:
+            sequences_points: (B, Pnn, point_len, C)
+                예: x,y 좌표나 cos,sin 값을 채널로 묶은 텐서.
+            points_valid: (B, Pnn, point_len) bool
+                각 포인트가 실제로 있는지 나타내는 마스크.
+            dt: float
+                샘플 간 시간 간격.
+            polyorder: int
+                다항식 차수.
+            max_window_length: int
+                최대 창 길이.
+
+        Returns:
+            torch.Tensor: (B, Pnn, point_len, C)
+                각 채널별 SG 1차 미분 결과.
+        """
+        batch_size, num_neighbors, point_len, num_channels = sequences_points.shape  # (B,Pnn,T,C)
+
+        sequence_flat = sequences_points.reshape(
+            batch_size * num_neighbors,
+            point_len,
+            num_channels,
+        )  # (B*Pnn, T, C)
+        valid_flat = points_valid.reshape(
+            batch_size * num_neighbors,
+            point_len,
+        )  # (B*Pnn, T)
+
+        derivative_flat = self._savgol_derivative_masked_multi_torch(
+            seq_bTC=sequence_flat,  # (B*Pnn, T, C)
+            valid_bT=valid_flat,  # (B*Pnn, T)
+            dt=dt,
+            polyorder=polyorder,
+            max_window_length=max_window_length,
+        )  # (B*Pnn, T, C)
+
+        derivative_points = derivative_flat.reshape(
+            batch_size,
+            num_neighbors,
+            point_len,
+            num_channels,
+        )  # (B,Pnn,T,C)
+        return derivative_points
 
     def _assert_past_cur_valid_mask(
         self,
