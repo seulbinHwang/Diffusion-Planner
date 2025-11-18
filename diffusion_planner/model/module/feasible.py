@@ -261,9 +261,9 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # 아키텍처 하이퍼파라미터(고정 폭)
         # ------------------------------
-        self._Dx: int = 16  # state encoder 출력 채널 (prev/fut 각각)
+        self._Dx: int = 12  # state encoder 출력 채널 (prev/fut 각각)
         self._Du: int = 8  # control adapter 출력 채널
-        self._Dc: int = 8  # trunk compressor 출력 채널
+        self._Dc: int = 16  # trunk compressor 출력 채널
         self._Din: int = self._Dx * 2 + self._Du + self._Dc  # 16+16+32+64=192
         self._C: int = self._Din  # 메인 채널 폭(192)
         self._eps: float = 1e-6
@@ -297,9 +297,9 @@ class FeasibleProjector(nn.Module):
             # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
             self.trunk_compressor = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, 64),   # 추가: hidden_dim → 64 (중간 폭 축소)
+                nn.Linear(hidden_dim, 3* self._Dc),   # 추가: hidden_dim → 64 (중간 폭 축소)
                 nn.GELU(),
-                nn.Linear(64, self._Dc),     # 추가: 64 → 8 (= self._Dc)
+                nn.Linear(3* self._Dc, self._Dc),     # 추가: 64 → 8 (= self._Dc)
             )
 
             # ------------------------------
@@ -348,13 +348,13 @@ class FeasibleProjector(nn.Module):
             # 마지막 Linear 0-init → 초기엔 U_ref ≈ U_base
             nn.init.zeros_(self.head[-1].weight)
             nn.init.zeros_(self.head[-1].bias)
-
+            gate_hidden_dim = 32
             # 소프트 게이트 s = softplus(MLP_g(Z_s))
             self.gate_mlp = nn.Sequential(
                 nn.LayerNorm(self._C),
-                nn.Linear(self._C, 32),
+                nn.Linear(self._C, gate_hidden_dim),
                 nn.GELU(),
-                nn.Linear(32, 3),
+                nn.Linear(gate_hidden_dim, 3),
             )
             # gate 초기 스케일 s0 설정(보수적으로)
             s0 = 0.05
