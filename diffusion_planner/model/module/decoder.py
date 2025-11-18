@@ -675,8 +675,7 @@ class DiT(nn.Module):
         self.final_hidden_tokens = None
         if self.config.use_feasible:
             self.feasible_projector = FeasibleProjector(
-                self.config,
-                hidden_dim, self.config.use_feasible_train,
+                self.config, hidden_dim, self.config.use_feasible_train,
                 self.config.use_feasible_filter)
             self.feasible_projector.enable_profile = self.config.profile_feasible
 
@@ -836,7 +835,7 @@ class DiT(nn.Module):
         B, Pnn, _ = near_future_norm_xT.shape
         # (B, Pnn, 324) -> (B, Pnn, D=192)
         # x = self.preproj(near_future_norm_xT)
-        device_type =  near_future_norm_xT.device.type
+        device_type = near_future_norm_xT.device.type
         with profile_block(
                 "DiT.forward",
                 enabled=self.config.profile_feasible,
@@ -844,7 +843,8 @@ class DiT(nn.Module):
         ):
             x = self.preproj_varlen(near_future_norm_xT, near_current_mask)
 
-            x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # ← 무효 토큰 0 클램프
+            x = x.masked_fill(near_current_mask.unsqueeze(-1),
+                              0.0)  # ← 무효 토큰 0 클램프
 
             # diffusion_time: [B,]
             # t_embedding: (B, D=192)
