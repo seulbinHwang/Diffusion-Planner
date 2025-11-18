@@ -1930,6 +1930,63 @@ class FeasibleProjector(nn.Module):
                 f"예시 (b,p)={list(zip(b_list, p_list))}. "
                 f"내부 구멍(1→0→1)이나 선행 무효 후 유효(0→1)는 허용되지 않습니다.")
 
+    # 지우개: 예전 `_compute_world_linear_velocity_via_sg` 구현은
+    #        x, y를 각각 단일 채널 SG에 넣어 두 번 호출하던 코드입니다.
+    #        해당 본문 전체를 지우고 아래 새 구현으로 교체하세요.
+
+    def _compute_world_linear_velocity_via_sg(
+        self,
+        x: torch.Tensor,              # (B, Pnn, point_len)
+        y: torch.Tensor,              # (B, Pnn, point_len)
+        points_valid: torch.Tensor,   # (B, Pnn, point_len) bool
+        *,
+        dt: float,
+        polyorder: int,
+        max_window_len_xy: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """x,y 위치 값이 시간에 따라 어떻게 움직이는지 부드러운 속도로 바꿔 주는 함수.
+
+        - 단순 차분이 아니라, 주변 여러 점을 한꺼번에 보고 "부드러운 기울기"를 추정한다.
+        - x와 y 두 축을 한 번에 처리해서, 계산량을 줄이도록 설계했다.
+
+        Args:
+            x: (B, Pnn, point_len)
+                각 객체의 시간별 x 좌표.
+            y: (B, Pnn, point_len)
+                각 객체의 시간별 y 좌표.
+            points_valid: (B, Pnn, point_len) bool
+                해당 시점에 위치가 실제로 존재하는지(True/False) 표시.
+            dt: float
+                샘플 간 시간 간격.
+            polyorder: int
+                Savitzky–Golay 다항식 차수.
+            max_window_len_xy: int
+                x,y에 사용할 최대 창 길이.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - v_x^w: (B, Pnn, point_len)  x축 방향 세계 속도
+                - v_y^w: (B, Pnn, point_len)  y축 방향 세계 속도
+        """
+        # 추가: x,y를 한 번에 채널로 묶어서 SG 한 번만 호출
+        positions_stack = torch.stack(
+            [x, y],
+            dim=-1,
+        )  # (B, Pnn, point_len, 2)
+
+        velocities_stack = self._sg_derivative_multi_for_points(
+            sequences_points=positions_stack,      # (B,Pnn,point_len,2)
+            points_valid=points_valid,             # (B,Pnn,point_len)
+            dt=dt,
+            polyorder=polyorder,
+            max_window_length=max_window_len_xy,
+        )  # (B, Pnn, point_len, 2)
+
+        v_x_world = velocities_stack[..., 0]  # (B, Pnn, point_len)
+        v_y_world = velocities_stack[..., 1]  # (B, Pnn, point_len)
+
+        return v_x_world, v_y_world
+
     # ================================================================
     # 본 기능: 위치→세계속도, yaw→요레이트, 그리고 body 회전
     # ================================================================
