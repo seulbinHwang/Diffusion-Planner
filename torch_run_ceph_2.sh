@@ -94,7 +94,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --port 23002 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "use_feasible_train_wo_past_2_gpu_B" \
+  --name "feasible_0.4_time_gpu_2_exp_B" \
   --batch_size 1792 \
   --seed 7777 \
   --sampler_epoch_offset 1000 \
