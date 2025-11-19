@@ -1026,7 +1026,11 @@ class DiT(nn.Module):
                 max_window_len_xy,  # int
                 max_window_len_yaw,  # int
             ) = self.feasible_projector.get_feasible_stride_params(future_len)
-
+            print("========= feasible_stride_dt ========")
+            print(f"stride_step: {stride_step}",
+                  f"dt_for_savgol: {dt_for_savgol}",
+                  f"max_window_len_xy: {max_window_len_xy}",
+                  f"max_window_len_yaw: {max_window_len_yaw}")
             # 역정규화 현재+미래 궤적 및 현재 상태
             unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
                 diffusion_trajectory)  # (B, Pnn, 1+T, 4)
@@ -1059,6 +1063,14 @@ class DiT(nn.Module):
                 unnorm_near_past_xyyaw=unnorm_near_past_xyyaw,
                 stride_step=stride_step,
             )
+            print("========= feasible_downsampled_inputs ========")
+            print(f"unnorm_diffusion_trajectory_stride: {unnorm_diffusion_trajectory_stride.shape}",
+                    f"unnorm_near_past_xyyaw_stride: {unnorm_near_past_xyyaw_stride.shape if unnorm_near_past_xyyaw_stride is not None else None}",
+                    f"near_past_cur_future_valid_stride: {near_past_cur_future_valid_stride.shape}",
+                    f"diffusion_trajectory_stride_norm: {diffusion_trajectory_stride_norm.shape}",
+                    f"near_past_xyyaw_stride_norm: {near_past_xyyaw_stride_norm.shape if near_past_xyyaw_stride_norm is not None else None}",
+                    f"past_len_ds: {past_len_ds}",
+                    f"future_len_ds: {future_len_ds}")
 
             # --- (2) Savitzky–Golay + 점 제어 계산 ---
             with profile_block(
@@ -1133,6 +1145,8 @@ class DiT(nn.Module):
                 future_len_full=future_len, # int
                 stride_step=stride_step, # int
             )
+            print("========= feasible_upsampled_future_controls ========")
+            print(f"unnorm_fut_seg_body_control: {unnorm_fut_seg_body_control.shape}")
 
             # --- (5) 제약 기반 필터 + 적분 ---
             near_cur_future_valid = near_past_cur_future_valid[:, :, -(
