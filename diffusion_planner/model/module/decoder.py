@@ -1000,7 +1000,12 @@ class DiT(nn.Module):
 
         # ── 2) 이 블록 안에서는 autocast 완전히 비활성화 ───────────────
         #     → matmul/conv/linear 등이 bf16/FP16으로 내려가지 않게 함
-        with torch.autocast(device_type=device_type, enabled=False):
+        # with torch.autocast(device_type=device_type, enabled=False):
+        with torch.autocast(
+                device_type=device_type,
+                dtype=AMP_DTYPE,
+                enabled=(device_type == "cuda"),
+        ):
             # ── 3) 혹시 half/bf16이 들어왔더라도 FP32로 강제 캐스팅 ──
             diffusion_trajectory = diffusion_trajectory.float(
             )  # (B, Pnn, 1+T, 4)
