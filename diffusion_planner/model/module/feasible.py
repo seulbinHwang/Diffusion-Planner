@@ -357,6 +357,569 @@ class FeasibleProjector(nn.Module):
             with torch.no_grad():
                 self.gate_mlp[-1].bias.fill_(b_init)
 
+    # 추가
+    def _infer_past_future_lengths_for_downsample(
+            self,
+            diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
+            near_past_cur_future_valid: torch.
+        Tensor,  # shape: (B, Pnn, time_len)
+    ) -> Tuple[int, int, int]:
+        """다운샘플링에 사용할 과거 길이와 미래 길이를 계산합니다.
+
+        Args:
+            diffusion_trajectory: 현재+미래 궤적. shape: (B, Pnn, 1+T, 4)
+            near_past_cur_future_valid: 과거~현재~미래 유효 마스크. shape: (B, Pnn, time_len)
+
+        Returns:
+            past_len: 과거 노드 개수.
+            future_len: 미래 노드 개수(T).
+            time_len: 전체 타임라인 길이.
+        """
+        B, Pnn, one_plus_T, _ = diffusion_trajectory.shape
+        mask_B, mask_Pnn, time_len = near_past_cur_future_valid.shape
+
+        if (mask_B, mask_Pnn) != (B, Pnn):
+            raise ValueError(
+                "[FeasibleProjector] diffusion_trajectory 와 near_past_cur_future_valid 의 "
+                f"(B,Pnn)이 다릅니다: (B,Pnn)=({B},{Pnn}), (mask_B,mask_Pnn)=({mask_B},{mask_Pnn})"
+            )
+
+        future_len: int = int(one_plus_T - 1)
+        past_len: int = int(time_len - (1 + future_len))
+        if past_len < 0:
+            raise ValueError(
+                f"[FeasibleProjector] time_len={time_len} 이(가) 1+future_len={1 + future_len} 보다 작습니다."
+            )
+
+        if time_len != past_len + 1 + future_len:
+            raise ValueError(
+                "[FeasibleProjector] time_len 과 (past_len + 1 + future_len) 가 일치하지 않습니다."
+            )
+
+        return past_len, future_len, time_len
+
+    # 추가
+    def _decide_use_past_for_downsample(
+            self,
+            past_len: int,
+            near_past: Optional[
+                torch.Tensor],  # shape: (B, Pnn, past_len, 11) or None
+            unnorm_near_past_xyyaw: Optional[
+                torch.Tensor],  # shape: (B, Pnn, past_len, 4) or None
+    ) -> bool:
+        """과거 구간을 다운샘플에 포함할지 여부를 결정합니다.
+
+        - config.use_past_for_feasible 가 False 이면 과거를 사용하지 않습니다.
+        - past_len 이 0 이면 자동으로 과거를 사용하지 않습니다.
+        - 과거를 쓰겠다고 했는데 텐서가 None 이면 에러를 냅니다.
+        """
+        use_past: bool = bool(
+            getattr(self.config, "use_past_for_feasible", True))
+
+        if use_past and past_len <= 0:
+            # 과거를 쓰기로 했지만 실제 과거가 없으면 자동으로 끕니다.
+            use_past = False
+
+        if use_past:
+            if near_past is None or unnorm_near_past_xyyaw is None:
+                raise ValueError(
+                    "[FeasibleProjector] use_past_for_feasible=True 인데 "
+                    "near_past / unnorm_near_past_xyyaw 가 None 입니다.")
+
+        return use_past
+
+    # 추가
+    def _build_stride_indices_with_past(
+        self,
+        past_len: int,
+        future_len: int,
+        stride_step: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int, int]:
+        """과거~현재~미래 전체 타임라인에서 사용할 다운샘플 index 를 생성합니다.
+
+        현재 시점을 기준으로 앞뒤로 stride_step 간격으로 고르고,
+        항상 현재 시점과 마지막 미래 시점을 포함합니다.
+
+        Returns:
+            sample_idx_full: 전체 타임라인 기준 index. shape: (K,)
+            past_len_ds: 다운샘플 후 과거 노드 개수.
+            future_len_ds: 다운샘플 후 미래 노드 개수.
+        """
+        idx_cur_full: int = past_len
+        idx_last_full: int = past_len + future_len
+
+        if stride_step == 1:
+            sample_idx_full = torch.arange(
+                0,
+                idx_last_full + 1,
+                device=device,
+                dtype=torch.long,
+            )  # shape: (time_len,)
+        else:
+            # 현재 index 기준으로 과거 / 미래를 대칭으로 선택
+            back_rev = torch.arange(
+                idx_cur_full,
+                -1,
+                -stride_step,
+                device=device,
+                dtype=torch.long,
+            )  # shape: (K_back,)
+            back = torch.flip(back_rev, dims=(0,))  # 과거 방향 오름차순
+
+            forward = torch.arange(
+                idx_cur_full + stride_step,
+                idx_last_full + 1,
+                stride_step,
+                device=device,
+                dtype=torch.long,
+            )  # shape: (K_fwd,)
+
+            sample_idx_full = torch.cat([back, forward], dim=0)  # shape: (K,)
+
+        # 현재 index 가 정확히 한 번만 포함되는지 검사
+        current_pos_tensor = (sample_idx_full == idx_cur_full).nonzero(
+            as_tuple=False).view(-1)
+        if current_pos_tensor.numel() != 1:
+            raise ValueError("[FeasibleProjector] 다운샘플 index 계산 중 현재 시점이 "
+                             "정확히 한 번 포함되지 않았습니다.")
+
+        current_pos: int = int(current_pos_tensor.item())
+        past_len_ds: int = current_pos
+        future_len_ds: int = int(sample_idx_full.numel() - 1 - past_len_ds)
+
+        return sample_idx_full, past_len_ds, future_len_ds
+
+    # 추가
+    def _downsample_with_past(
+        self,
+        diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
+        near_past: torch.Tensor,  # shape: (B, Pnn, past_len, 11)
+        near_past_cur_future_valid: torch.
+        Tensor,  # shape: (B, Pnn, past_len+1+T)
+        unnorm_diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
+        unnorm_near_past_xyyaw: torch.Tensor,  # shape: (B, Pnn, past_len, 4)
+        sample_idx_full: torch.Tensor,  # shape: (K,)
+        past_len_ds: int,
+        future_len_ds: int,
+    ) -> Tuple[
+            torch.
+            Tensor,  # unnorm_diffusion_trajectory_stride # shape: (B, Pnn, 1+T_ds, 4)
+            Optional[
+                torch.
+                Tensor],  # unnorm_near_past_xyyaw_stride # shape: (B, Pnn, past_len_ds, 4) or None
+            torch.
+            Tensor,  # near_past_cur_future_valid_stride # shape: (B, Pnn, past_len_ds+1+T_ds)
+            torch.
+            Tensor,  # diffusion_trajectory_stride_norm # shape: (B, Pnn, 1+T_ds, 4)
+            Optional[
+                torch.
+                Tensor],  # near_past_xyyaw_stride_norm # shape: (B, Pnn, past_len_ds, 4) or None
+            int,  # past_len_ds
+            int,  # future_len_ds
+    ]:
+        """과거~현재~미래 전체 타임라인 기준으로 stride 다운샘플을 적용합니다."""
+        # 역정규화 포인트 결합: [과거, 현재+미래]
+        unnorm_points_all = torch.cat(
+            [unnorm_near_past_xyyaw, unnorm_diffusion_trajectory],
+            dim=2,
+        )  # shape: (B, Pnn, past_len+1+T, 4)
+
+        points_valid_all = near_past_cur_future_valid.to(
+            torch.bool)  # shape: (B, Pnn, past_len+1+T)
+
+        # stride 적용
+        unnorm_points_stride = unnorm_points_all[:, :,
+                                                 sample_idx_full, :]  # shape: (B, Pnn, past_len_ds+1+T_ds, 4)
+        valid_stride = points_valid_all[:, :,
+                                        sample_idx_full]  # shape: (B, Pnn, past_len_ds+1+T_ds)
+
+        if past_len_ds > 0:
+            unnorm_near_past_xyyaw_stride: Optional[
+                torch.Tensor] = unnorm_points_stride[:, :, :past_len_ds, :]
+        else:
+            unnorm_near_past_xyyaw_stride = None
+
+        unnorm_diffusion_trajectory_stride = unnorm_points_stride[:, :,
+                                                                  past_len_ds:, :]  # shape: (B, Pnn, 1+T_ds, 4)
+
+        # 정규화 포인트도 동일 index 로 다운샘플
+        near_past_xyyaw = near_past[..., :4]  # shape: (B, Pnn, past_len, 4)
+        points_norm_all = torch.cat(
+            [near_past_xyyaw, diffusion_trajectory],
+            dim=2,
+        )  # shape: (B, Pnn, past_len+1+T, 4)
+
+        points_norm_stride = points_norm_all[:, :,
+                                             sample_idx_full, :]  # shape: (B, Pnn, past_len_ds+1+T_ds, 4)
+
+        if past_len_ds > 0:
+            near_past_xyyaw_stride_norm: Optional[
+                torch.Tensor] = points_norm_stride[:, :, :past_len_ds, :]
+        else:
+            near_past_xyyaw_stride_norm = None
+
+        diffusion_trajectory_stride_norm = points_norm_stride[:, :,
+                                                              past_len_ds:, :]  # shape: (B, Pnn, 1+T_ds, 4)
+
+        near_past_cur_future_valid_stride = valid_stride  # shape: (B, Pnn, past_len_ds+1+T_ds)
+
+        return (
+            unnorm_diffusion_trajectory_stride,
+            unnorm_near_past_xyyaw_stride,
+            near_past_cur_future_valid_stride,
+            diffusion_trajectory_stride_norm,
+            near_past_xyyaw_stride_norm,
+            past_len_ds,
+            future_len_ds,
+        )
+
+    # 추가
+    def _build_stride_indices_without_past(
+        self,
+        future_len: int,
+        stride_step: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, int]:
+        """현재~미래 구간(1+T)만 사용하는 경우의 다운샘플 index 를 생성합니다.
+
+        Returns:
+            sample_idx_local: 현재~미래 구간에서 사용할 index. shape: (1+T_ds,)
+            future_len_ds: 다운샘플 후 미래 노드 개수(T_ds).
+        """
+        total_points: int = 1 + future_len  # 현재 포함
+
+        if stride_step == 1:
+            sample_idx_local = torch.arange(
+                0,
+                total_points,
+                device=device,
+                dtype=torch.long,
+            )  # shape: (1+T,)
+        else:
+            sample_idx_local = torch.arange(
+                0,
+                total_points,
+                stride_step,
+                device=device,
+                dtype=torch.long,
+            )  # shape: (1+T_ds,)
+
+            # 마지막 index(T)는 반드시 포함
+            if int(sample_idx_local[-1].item()) != future_len:
+                raise ValueError(
+                    "[FeasibleProjector] (use_past_for_feasible=False) 환경에서 "
+                    f"stride_step={stride_step} 가 future_len={future_len} 을 정확히 나누지 못했습니다. "
+                    "config.feasible_stride_dt 를 조정해 주세요.")
+
+        future_len_ds: int = int(sample_idx_local.numel() - 1)
+        return sample_idx_local, future_len_ds
+
+    # 추가
+    def _downsample_without_past(
+        self,
+        diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
+        near_past_cur_future_valid: torch.Tensor,  # shape: (B, Pnn, time_len)
+        unnorm_diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
+        sample_idx_local: torch.Tensor,  # shape: (1+T_ds,)
+        future_len_ds: int,
+        future_len: int,
+    ) -> Tuple[
+            torch.Tensor,  # unnorm_diffusion_trajectory_stride
+            Optional[torch.Tensor],  # unnorm_near_past_xyyaw_stride
+            torch.Tensor,  # near_past_cur_future_valid_stride
+            torch.Tensor,  # diffusion_trajectory_stride_norm
+            Optional[torch.Tensor],  # near_past_xyyaw_stride_norm
+            int,  # past_len_ds
+            int,  # future_len_ds
+    ]:
+        """과거를 사용하지 않고 현재~미래 구간만 stride 다운샘플합니다."""
+        B, Pnn, one_plus_T, _ = diffusion_trajectory.shape
+        if one_plus_T != 1 + future_len:
+            raise ValueError(
+                f"[FeasibleProjector] diffusion_trajectory.shape[2]={one_plus_T} "
+                f"!= 1 + future_len={1 + future_len}")
+
+        # 현재~미래 유효 마스크만 추출
+        cur_future_valid = near_past_cur_future_valid[:, :, -(
+            1 + future_len):].to(torch.bool)  # shape: (B, Pnn, 1+future_len)
+
+        # 역정규화 궤적 다운샘플
+        unnorm_diffusion_trajectory_stride = unnorm_diffusion_trajectory[:, :,
+                                                                         sample_idx_local, :]  # shape: (B, Pnn, 1+T_ds, 4)
+        unnorm_near_past_xyyaw_stride: Optional[torch.Tensor] = None
+
+        # 정규화 궤적 다운샘플
+        diffusion_trajectory_stride_norm = diffusion_trajectory[:, :,
+                                                                sample_idx_local, :]  # shape: (B, Pnn, 1+T_ds, 4)
+        near_past_xyyaw_stride_norm: Optional[torch.Tensor] = None
+
+        # 유효 마스크도 동일 index 로 다운샘플
+        near_past_cur_future_valid_stride = cur_future_valid[:, :,
+                                                             sample_idx_local]  # shape: (B, Pnn, 1+T_ds)
+
+        past_len_ds: int = 0
+
+        return (
+            unnorm_diffusion_trajectory_stride,
+            unnorm_near_past_xyyaw_stride,
+            near_past_cur_future_valid_stride,
+            diffusion_trajectory_stride_norm,
+            near_past_xyyaw_stride_norm,
+            past_len_ds,
+            future_len_ds,
+        )
+
+    # 추가
+    def build_downsampled_feasible_inputs(
+        self,
+        diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4) 정규화 현재+미래
+        near_past: Optional[
+            torch.Tensor],  # shape: (B, Pnn, past_len, 11) 또는 None
+        near_past_cur_future_valid: torch.
+        Tensor,  # shape: (B, Pnn, time_len=1+past_len+T) bool
+        unnorm_diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
+        unnorm_near_past_xyyaw: Optional[
+            torch.Tensor],  # shape: (B, Pnn, past_len, 4) 또는 None
+        stride_step: int,
+    ) -> Tuple[
+            torch.
+            Tensor,  # unnorm_diffusion_trajectory_stride # shape: (B, Pnn, 1+T_ds, 4)
+            Optional[
+                torch.
+                Tensor],  # unnorm_near_past_xyyaw_stride # shape: (B, Pnn, past_len_ds, 4) or None
+            torch.
+            Tensor,  # near_past_cur_future_valid_stride # shape: (B, Pnn, past_len_ds+1+T_ds)
+            torch.
+            Tensor,  # diffusion_trajectory_stride_norm # shape: (B, Pnn, 1+T_ds, 4)
+            Optional[
+                torch.
+                Tensor],  # near_past_xyyaw_stride_norm # shape: (B, Pnn, past_len_ds, 4) or None
+            int,  # past_len_ds
+            int,  # future_len_ds
+    ]:
+        """FeasibleProjector용 다운샘플링 궤적/마스크를 구성하는 메인 함수.
+
+        흐름:
+            1) 과거 길이(past_len), 미래 길이(future_len)를 계산합니다.
+            2) config + past_len 으로 과거 사용 여부(use_past)를 정합니다.
+            3) use_past 에 따라 stride index 를 만들고,
+            4) 정규화/역정규화 궤적 + 유효 마스크에 같은 index 를 적용합니다.
+        """
+        device: torch.device = diffusion_trajectory.device
+
+        # 1) 과거/미래 길이 계산
+        past_len, future_len, _ = self._infer_past_future_lengths_for_downsample(
+            diffusion_trajectory=diffusion_trajectory,  # shape: (B, Pnn, 1+T, 4)
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # shape: (B, Pnn, 1+past_len+T)
+        )
+
+        # 2) config + past_len 으로 과거 사용 여부 결정
+        use_past: bool = self._decide_use_past_for_downsample(
+            past_len=past_len,
+            near_past=near_past,
+            unnorm_near_past_xyyaw=unnorm_near_past_xyyaw,
+        )
+
+        if use_past:
+            assert near_past is not None
+            assert unnorm_near_past_xyyaw is not None
+
+            # 3-a) 과거+현재+미래 전체 타임라인용 stride index 계산
+            """
+            sample_idx_full: shape (K,)
+            past_len_ds: int
+            future_len_ds: int
+            """
+            (sample_idx_full, past_len_ds,
+             future_len_ds) = self._build_stride_indices_with_past(
+                 past_len=past_len,
+                 future_len=future_len,
+                 stride_step=stride_step,
+                 device=device,
+             )
+
+            # 4-a) 전체 타임라인 기준으로 다운샘플 적용
+            return self._downsample_with_past(
+                diffusion_trajectory=diffusion_trajectory, # (B, Pnn, 1+T, 4)
+                near_past=near_past, # (B, Pnn, past_len, 11)
+                near_past_cur_future_valid=near_past_cur_future_valid, # (B, Pnn, time_len)
+                unnorm_diffusion_trajectory=unnorm_diffusion_trajectory, # (B, Pnn, 1+T, 4)
+                unnorm_near_past_xyyaw=unnorm_near_past_xyyaw, # (B, Pnn, past_len, 4)
+                sample_idx_full=sample_idx_full, # (K,)
+                past_len_ds=past_len_ds, # int
+                future_len_ds=future_len_ds, # int
+            )
+
+        # 3-b) 과거 미사용: 현재~미래(1+T) 구간만 사용하는 stride index 계산
+        (sample_idx_local, future_len_ds) = self._build_stride_indices_without_past(
+            future_len=future_len,
+            stride_step=stride_step,
+            device=device,
+        )
+
+        # 4-b) 현재~미래 구간만 다운샘플 적용
+        return self._downsample_without_past(
+            diffusion_trajectory=diffusion_trajectory,
+            near_past_cur_future_valid=near_past_cur_future_valid,
+            unnorm_diffusion_trajectory=unnorm_diffusion_trajectory,
+            sample_idx_local=sample_idx_local,
+            future_len_ds=future_len_ds,
+            future_len=future_len,
+        )
+
+    # 추가
+    def upsample_future_controls_from_stride(
+        self,
+        unnorm_seg_body_control_stride: torch.
+        Tensor,  # (B, Pnn, segment_len_ds, 3)
+        past_len_ds: int,
+        future_len_ds: int,
+        future_len_full: int,
+        stride_step: int,
+    ) -> torch.Tensor:
+        """서브샘플링된 세그먼트 제어를 원래 future_len 길이로 선형 업샘플링합니다.
+
+        Args:
+            unnorm_seg_body_control_stride:
+                (B, Pnn, segment_len_ds, 3)
+                과거~현재~미래 또는 현재~미래 전체에 대한 서브샘플링 세그먼트 제어.
+            past_len_ds:
+                다운샘플 후 과거 세그먼트 개수.
+                (use_past_for_feasible=False 인 경우 0)
+            future_len_ds:
+                다운샘플 후 미래 세그먼트 개수.
+            future_len_full:
+                원래 미래 세그먼트 개수(T). (예: 80)
+            stride_step:
+                시간 index 기준 다운샘플링 간격.
+
+        Returns:
+            (B, Pnn, future_len_full, 3)
+                현재~미래 구간(base dt 해상도)의 제어 시퀀스.
+        """
+        B, Pnn, segment_len_ds, _ = unnorm_seg_body_control_stride.shape
+
+        # 미래 부분만 추출
+        start_future_idx: int = int(past_len_ds)
+        if segment_len_ds < start_future_idx + future_len_ds:
+            raise ValueError(
+                "[FeasibleProjector] segment_len_ds 와 (past_len_ds, future_len_ds) 조합이 일치하지 않습니다."
+            )
+        # (B, Pnn, future_len_ds, 3)
+        coarse_future_control = unnorm_seg_body_control_stride[:, :,
+                                                               start_future_idx:
+                                                               start_future_idx
+                                                               +
+                                                               future_len_ds, :]
+
+        # stride_step == 1 이면 다운샘플링이 없으므로 그대로 사용
+        if stride_step == 1:
+            if future_len_ds != future_len_full:
+                raise ValueError(
+                    "[FeasibleProjector] stride_step==1 인데 "
+                    f"future_len_ds={future_len_ds} 와 future_len_full={future_len_full} 이 다릅니다."
+                )
+            return coarse_future_control  # (B, Pnn, future_len_full, 3)
+
+        # stride_step > 1: 선형 업샘플링 필요
+        B_flat: int = B * Pnn
+        _, _, n_coarse, _ = coarse_future_control.shape
+        if n_coarse != future_len_ds:
+            raise ValueError(
+                "[FeasibleProjector] coarse_future_control 길이와 future_len_ds 가 일치하지 않습니다."
+            )
+
+        if n_coarse <= 1:
+            # coarse 값이 1개뿐이면 모든 future 시점에 동일한 제어를 복사
+            return coarse_future_control.expand(B, Pnn, future_len_full, 3)
+
+        # (B*Pnn, 3, n_coarse) 로 변환 후 1D linear interpolate
+        controls_flat = coarse_future_control.reshape(
+            B_flat, n_coarse, 3).permute(0, 2, 1)  # (B*Pnn, 3, n_coarse)
+
+        # align_corners=True:
+        #   index 0 ↔ 첫 미래 세그먼트, index n_coarse-1 ↔ 마지막 미래 세그먼트
+        upsampled_flat = F.interpolate(
+            controls_flat, # (B*Pnn, 3, n_coarse)
+            size=future_len_full,
+            mode="linear",
+            align_corners=True,
+        )  # (B*Pnn, 3, future_len_full)
+
+        upsampled = upsampled_flat.permute(0, 2, 1).reshape(
+            B, Pnn, future_len_full, 3)  # (B, Pnn, future_len_full, 3)
+        return upsampled
+
+    # 추가
+    def get_feasible_stride_params(
+        self,
+        future_len: int,
+    ) -> Tuple[int, float, int, int]:
+        """FeasibleProjector용 다운샘플링 간격과 SG 윈도 길이를 계산합니다.
+
+        Args:
+            future_len: 미래 노드 개수 T. (예: 80)
+
+        Returns:
+            stride_step: 정수 스트라이드 (1이면 다운샘플링 없음).
+            dt_for_savgol: SG 필터에 넘길 샘플 간 시간 간격 [초].
+            max_window_len_xy: x,y 좌표에 사용할 최대 윈도 길이(샘플 수).
+            max_window_len_yaw: yaw에 사용할 최대 윈도 길이(샘플 수).
+        """
+
+        # FeasibleProjector 내부에서 사용하는 base dt (원래 타임스텝, 예: 0.1s)
+        base_dt: float = float(self.constraints_h_params.dt)
+
+        # 사용자가 원하는 다운샘플 간격(초). 없으면 base_dt 그대로 사용.
+        desired_dt: float = float(
+            getattr(self.config, "feasible_stride_dt", base_dt))
+        # base_dt 보다 작게 들어오면 의미가 없으니 최소 base_dt로 클램프
+        if desired_dt < base_dt:
+            desired_dt = base_dt
+
+        # index 기준 스트라이드 = 원하는 시간 간격 / base_dt
+        stride_step: int = max(1, int(round(desired_dt / base_dt)))
+        dt_for_savgol: float = base_dt * float(stride_step)
+
+        # "보고 싶은 시간 길이"를 초 단위로 고정해 두고,
+        # stride에 맞게 샘플 개수를 다시 계산한다.
+        default_window_xy: int = int(
+            getattr(self.config, "feasible_sg_max_window_len_xy", 11))
+        default_window_yaw: int = int(
+            getattr(self.config, "feasible_sg_max_window_len_yaw", 7))
+        window_time_xy: float = base_dt * float(default_window_xy)
+        window_time_yaw: float = base_dt * float(default_window_yaw)
+
+        max_window_len_xy: int = max(1,
+                                     int(round(window_time_xy / dt_for_savgol)))
+        max_window_len_yaw: int = max(
+            1, int(round(window_time_yaw / dt_for_savgol)))
+
+        # SG 필터 특성상 홀수 길이 강제
+        if max_window_len_xy % 2 == 0:
+            max_window_len_xy += 1
+        if max_window_len_yaw % 2 == 0:
+            max_window_len_yaw += 1
+
+        # 너무 큰 창은 실제 시퀀스 길이보다 약간만 크게 제한
+        max_allow_window: int = future_len + 1
+        max_window_len_xy = min(max_window_len_xy, max_allow_window)
+        max_window_len_yaw = min(max_window_len_yaw, max_allow_window)
+
+        # 현재 설계에서는 "현재 → 마지막 미래 노드"가 항상 포함되고
+        # 그 사이가 등간격이 되어야 하므로
+        # stride_step 이 future_len 을 정확히 나누지 못하면 에러로 알려준다.
+        if future_len % stride_step != 0:
+            raise ValueError(
+                "[FeasibleProjector] future_len="
+                f"{future_len} 이(가) stride_step={stride_step} 로 나누어 떨어지지 않습니다. "
+                "config.feasible_stride_dt 를 조정해서 future_len % stride_step == 0 이 되도록 해 주세요."
+            )
+
+        return stride_step, dt_for_savgol, max_window_len_xy, max_window_len_yaw
+
     # ----------------------------
     # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
     # ----------------------------

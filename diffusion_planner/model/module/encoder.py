@@ -40,6 +40,7 @@ def profile_block(name: str,
     elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
     print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
 
+
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
@@ -570,7 +571,8 @@ class Encoder(nn.Module):
                 enabled=self.config.profile_feasible,
                 device_type=device_type,
         ):
-            ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
+            ego_past = inputs[
+                "ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
             if not self.config.use_vel_input:
                 ego_past[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
             ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
@@ -641,7 +643,8 @@ class Encoder(nn.Module):
             static_mask: (B, static_objects_num)
             static_pos: (B, static_objects_num, 8)
             """
-            encoding_static, static_mask, static_pos = self.static_encoder(static)
+            encoding_static, static_mask, static_pos = self.static_encoder(
+                static)
             """
             encoding_lanes: (B, lane_num, hidden_dim)
             lanes_mask: (B, lane_num)
@@ -660,14 +663,14 @@ class Encoder(nn.Module):
             """
             encoding_input = torch.cat(
                 [encoding_agents_chunk, encoding_static, encoding_lanes], dim=1)
-            encoding_mask = torch.cat([agents_chunk_mask, static_mask, lanes_mask],
-                                      dim=1).reshape(-1)
+            encoding_mask = torch.cat(
+                [agents_chunk_mask, static_mask, lanes_mask], dim=1).reshape(-1)
             encoding_pos = torch.cat([agents_chunk_pos, static_pos, lane_pos],
                                      dim=1).reshape(B * self.token_num, -1)
 
             # 결합 후 실제 길이
-            token_num_actual = encoding_agents_chunk.size(1) + encoding_static.size(
-                1) + encoding_lanes.size(1)
+            token_num_actual = encoding_agents_chunk.size(
+                1) + encoding_static.size(1) + encoding_lanes.size(1)
             # (선택) 방어적 체크
             assert token_num_actual == self.token_num, \
                 f"token_num mismatch: expected {self.token_num}, got {token_num_actual}"
@@ -678,9 +681,10 @@ class Encoder(nn.Module):
             scale = self.pos_scale.to(dtype=encoding_input.dtype,
                                       device=encoding_input.device)
             encoding_pos = scale * pos_valid
-            encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim),
-                                              device=encoding_input.device,
-                                              dtype=encoding_input.dtype)
+            encoding_pos_result = torch.zeros(
+                (B * self.token_num, self.hidden_dim),
+                device=encoding_input.device,
+                dtype=encoding_input.dtype)
             # encoding_pos_result: (B * token_num, hidden_dim)
             encoding_pos_result[
                 ~encoding_mask] = encoding_pos  # Fill in valid parts
@@ -704,7 +708,8 @@ class Encoder(nn.Module):
                  encoding_lanes, lanes_mask, agent_route_lane_order)
             if not self.config.use_pram:
                 near_agents_route_lane_emb = self._zero_with_touch(
-                    near_agents_route_lane_emb, self.npc_route_encoder.parameters())
+                    near_agents_route_lane_emb,
+                    self.npc_route_encoder.parameters())
                 route_known_mask = torch.zeros_like(route_known_mask).bool()
 
             encoder_outputs[

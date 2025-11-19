@@ -185,6 +185,10 @@ def get_args():
                         type=float,
                         help='decoder drop out rate',
                         default=0.1)
+    parser.add_argument('--feasible_stride_dt',
+                        type=float,
+                        help='feasible_stride_dt',
+                        default=0.1)
 
     parser.add_argument('--device',
                         type=str,
