@@ -1659,6 +1659,9 @@ class FeasibleProjector(nn.Module):
             eta: float, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """라디얼(벡터) STE-clip."""
         v_max = v_max.to(dtype=vx_b.dtype, device=vx_b.device)
+        # 추가하자: 시간축(T)이 있는 경우 v_max 를 (B,Pnn,1) 로 확장해 T에 브로드캐스트
+        if v_max.dim() == vx_b.dim() - 1:
+            v_max = v_max.unsqueeze(-1)  # (B,Pnn,1)
         speed = torch.sqrt(vx_b * vx_b + vy_b * vy_b + eps)  # (B,Pnn)
         s_hard = torch.clamp(v_max / speed.clamp_min(eps), max=1.0)  # (B,Pnn)
         vx_h, vy_h = s_hard * vx_b, s_hard * vy_b  # (B,Pnn)
@@ -1711,6 +1714,10 @@ class FeasibleProjector(nn.Module):
         w_allow (보행자)     = min( a_lat_max/|v|, w_abs_max )   # 제자리 회전 허용
         """
         speed = torch.sqrt(vx_b * vx_b + vy_b * vy_b + eps)  # (B,Pnn)
+        if a_lat_max.dim() == speed.dim() - 1:
+            a_lat_max = a_lat_max.unsqueeze(-1)  # (B,Pnn,1)
+            R_min = R_min.unsqueeze(-1)  # (B,Pnn,1)
+            omega_abs_max = omega_abs_max.unsqueeze(-1)  # (B,Pnn,1)
         allow_lat = a_lat_max / (speed + eps)  # (B,Pnn)
         allow_R = speed / (R_min + eps)  # (B,Pnn)
         allow_abs = omega_abs_max
@@ -1718,6 +1725,12 @@ class FeasibleProjector(nn.Module):
         # 비홀로노믹이면 R_min 항 포함, 보행자는 제외
         allow_nonh = torch.minimum(torch.minimum(allow_lat, allow_R), allow_abs)
         allow_holo = torch.minimum(allow_lat, allow_abs)
+
+        # 추가하자: is_nonholonomic 을 시간축으로 확장
+        if is_nonholonomic.dim() == allow_nonh.dim() - 1:
+            is_nonholonomic = is_nonholonomic.unsqueeze(-1).expand_as(
+                allow_nonh)
+
         allow = torch.where(is_nonholonomic, allow_nonh, allow_holo)  # (B,Pnn)
 
         # forward: hard clamp, backward: band-weighted surrogate (allow는 detach)
