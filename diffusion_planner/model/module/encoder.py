@@ -8,6 +8,38 @@ from flash_attn.bert_padding import unpad_input, pad_input
 # ==== (encoder.py 상단 import 근처에 추가) ====
 from typing import Tuple  # 이미 있으면 중복 추가 불필요
 
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
+
+@contextmanager
+def profile_block(name: str,
+                  enabled: bool = True,
+                  device_type: str = "cuda") -> Iterator[None]:
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
+
+    Args:
+        name: 출력에 사용할 블록 이름.
+        enabled: False 이면 아무 것도 하지 않고 그냥 통과.
+        device_type: "cuda" 인 경우, GPU 연산 정합을 위해 앞/뒤에 synchronize 호출.
+    """
+    if not enabled:
+        # 아무 것도 하지 않고 블록만 실행
+        yield
+        return
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time: float = time.perf_counter()
+
+    yield  # 실제 코드 실행
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
+
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
@@ -532,148 +564,154 @@ class Encoder(nn.Module):
                 - 'ego_fut_global':  [B, H]
         """
         # ego
-        ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
-        if not self.config.use_vel_input:
-            ego_past[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
-        ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
-        # (B ,future_len= 80, 11)
-        planner_future_11_dim = inputs["planner_future_11_dim"]
-        # agents
-        # (B, A, V=21, D=11)
-        neighbors = inputs["neighbor_agents_past"]
-        if not self.config.use_vel_input:
-            neighbors[:, :, :, 4:6] = 0.0  # vx, vy 0으로 설정
+        device_type = inputs["ego_agent_past"].device.type
+        with profile_block(
+                "DiT.forward",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            ego_past = inputs["ego_agent_past"]  # (B, V=21, D=11) -> (B, 1, V, D)
+            if not self.config.use_vel_input:
+                ego_past[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
+            ego_past = ego_past.unsqueeze(1)  # Add a dimension for P
+            # (B ,future_len= 80, 11)
+            planner_future_11_dim = inputs["planner_future_11_dim"]
+            # agents
+            # (B, A, V=21, D=11)
+            neighbors = inputs["neighbor_agents_past"]
+            if not self.config.use_vel_input:
+                neighbors[:, :, :, 4:6] = 0.0  # vx, vy 0으로 설정
 
-        # static objects
-        # (B, P, D_static)
-        static = inputs["static_objects"]
+            # static objects
+            # (B, P, D_static)
+            static = inputs["static_objects"]
 
-        # vector maps
-        # (B, L, lane_len, D_lane)
-        lanes = inputs["lanes"]
-        # ( B, L, 1) 속도 제한
-        lanes_speed_limit = inputs["lanes_speed_limit"]
-        # (B, L, 1) 속도 제한 여부
-        lanes_has_speed_limit = inputs["lanes_has_speed_limit"]
-        # (B, Pnn, lane_num) # -1: route가 아님
-        agent_route_lane_order = inputs["agent_route_lane_order"]
+            # vector maps
+            # (B, L, lane_len, D_lane)
+            lanes = inputs["lanes"]
+            # ( B, L, 1) 속도 제한
+            lanes_speed_limit = inputs["lanes_speed_limit"]
+            # (B, L, 1) 속도 제한 여부
+            lanes_has_speed_limit = inputs["lanes_has_speed_limit"]
+            # (B, Pnn, lane_num) # -1: route가 아님
+            agent_route_lane_order = inputs["agent_route_lane_order"]
 
-        B = neighbors.shape[0]
-        future_len: int = planner_future_11_dim.shape[1]
-        if self.training:
-            # ---------------------- 1) M_i 샘플링 ---------------------- #
-            prefix_lengths = self._sample_uniform_prefix_lengths(
-                batch_size=B,
-                max_future_len=future_len,
-                device=planner_future_11_dim.device,
-            )  # (B,)
-            known_mask = self._build_known_mask_from_lengths(
-                prefix_lengths,
-                max_future_len=future_len)  # (B, future_len) True=조건 제공
+            B = neighbors.shape[0]
+            future_len: int = planner_future_11_dim.shape[1]
+            if self.training:
+                # ---------------------- 1) M_i 샘플링 ---------------------- #
+                prefix_lengths = self._sample_uniform_prefix_lengths(
+                    batch_size=B,
+                    max_future_len=future_len,
+                    device=planner_future_11_dim.device,
+                )  # (B,)
+                known_mask = self._build_known_mask_from_lengths(
+                    prefix_lengths,
+                    max_future_len=future_len)  # (B, future_len) True=조건 제공
 
-            # ---------------------- 2) 잘라 + 패딩 ---------------------- #
-            ego_future_trajectory = self._truncate_and_pad_ego_future_for_encoder(
-                planner_future_11_dim,
-                known_mask)  # (B, future_len, 11)  길이 유지, 마스크는 내부에서 활용됨
-        else:
-            # TODO: "using" ego_agent_next_11_dim 도 해보자.
-            ego_future_trajectory = planner_future_11_dim
-            if ego_future_trajectory is None:
-                ego_future_trajectory = torch.zeros((B, future_len, 11),
-                                                    device=ego_past.device,
-                                                    dtype=ego_past.dtype)
-        if not self.config.use_vel_input:
-            ego_future_trajectory[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
-        # ---------------------- 3) 인코딩 ---------------------- #
-        # ego_fut_global: (B, hidden_dim)
-        """
-        # encoding_agents_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, hidden_dim)
-        # agents_chunk_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
-        # agents_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 8)
-        # ego_fut_global: (B, hidden_dim)
-        """
-        (encoding_agents_chunk, agents_chunk_mask, agents_chunk_pos,
-         ego_fut_global) = self.agents_encoder(ego_past, neighbors,
-                                               ego_future_trajectory)
-        if not self.config.use_pram:
-            ego_fut_global = self._zero_with_touch(ego_fut_global,
-                                                   self._ego_fut_params())
-        """
-        encoding_static: (B, static_objects_num, hidden_dim)
-        static_mask: (B, static_objects_num)
-        static_pos: (B, static_objects_num, 8)
-        """
-        encoding_static, static_mask, static_pos = self.static_encoder(static)
-        """
-        encoding_lanes: (B, lane_num, hidden_dim)
-        lanes_mask: (B, lane_num)
-        lane_pos: (B, lane_num, 8)
-        """
-        encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
-            lanes, lanes_speed_limit, lanes_has_speed_limit)
+                # ---------------------- 2) 잘라 + 패딩 ---------------------- #
+                ego_future_trajectory = self._truncate_and_pad_ego_future_for_encoder(
+                    planner_future_11_dim,
+                    known_mask)  # (B, future_len, 11)  길이 유지, 마스크는 내부에서 활용됨
+            else:
+                # TODO: "using" ego_agent_next_11_dim 도 해보자.
+                ego_future_trajectory = planner_future_11_dim
+                if ego_future_trajectory is None:
+                    ego_future_trajectory = torch.zeros((B, future_len, 11),
+                                                        device=ego_past.device,
+                                                        dtype=ego_past.dtype)
+            if not self.config.use_vel_input:
+                ego_future_trajectory[:, :, 4:6] = 0.0  # vx, vy 0으로 설정
+            # ---------------------- 3) 인코딩 ---------------------- #
+            # ego_fut_global: (B, hidden_dim)
+            """
+            # encoding_agents_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, hidden_dim)
+            # agents_chunk_mask: (B, agents_num * past_cur_chunk_num + future_chunk_num)
+            # agents_chunk_pos : (B, agents_num * past_cur_chunk_num + future_chunk_num, 8)
+            # ego_fut_global: (B, hidden_dim)
+            """
+            (encoding_agents_chunk, agents_chunk_mask, agents_chunk_pos,
+             ego_fut_global) = self.agents_encoder(ego_past, neighbors,
+                                                   ego_future_trajectory)
+            if not self.config.use_pram:
+                ego_fut_global = self._zero_with_touch(ego_fut_global,
+                                                       self._ego_fut_params())
+            """
+            encoding_static: (B, static_objects_num, hidden_dim)
+            static_mask: (B, static_objects_num)
+            static_pos: (B, static_objects_num, 8)
+            """
+            encoding_static, static_mask, static_pos = self.static_encoder(static)
+            """
+            encoding_lanes: (B, lane_num, hidden_dim)
+            lanes_mask: (B, lane_num)
+            lane_pos: (B, lane_num, 8)
+            """
+            encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
+                lanes, lanes_speed_limit, lanes_has_speed_limit)
 
-        # ---------------------- 4) 포지션 임베딩 결합 ---------------------- #
-        """
-token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_objects_num + lane_num
-        encoding_input: (B, token_num, hidden_dim)
-        encoding_pos: (B * token_num, 8)
-        encoding_mask: (B * token_num)
+            # ---------------------- 4) 포지션 임베딩 결합 ---------------------- #
+            """
+    token_num = (agents_num * past_cur_chunk_num + future_chunk_num) + static_objects_num + lane_num
+            encoding_input: (B, token_num, hidden_dim)
+            encoding_pos: (B * token_num, 8)
+            encoding_mask: (B * token_num)
+    
+            """
+            encoding_input = torch.cat(
+                [encoding_agents_chunk, encoding_static, encoding_lanes], dim=1)
+            encoding_mask = torch.cat([agents_chunk_mask, static_mask, lanes_mask],
+                                      dim=1).reshape(-1)
+            encoding_pos = torch.cat([agents_chunk_pos, static_pos, lane_pos],
+                                     dim=1).reshape(B * self.token_num, -1)
 
-        """
-        encoding_input = torch.cat(
-            [encoding_agents_chunk, encoding_static, encoding_lanes], dim=1)
-        encoding_mask = torch.cat([agents_chunk_mask, static_mask, lanes_mask],
-                                  dim=1).reshape(-1)
-        encoding_pos = torch.cat([agents_chunk_pos, static_pos, lane_pos],
-                                 dim=1).reshape(B * self.token_num, -1)
+            # 결합 후 실제 길이
+            token_num_actual = encoding_agents_chunk.size(1) + encoding_static.size(
+                1) + encoding_lanes.size(1)
+            # (선택) 방어적 체크
+            assert token_num_actual == self.token_num, \
+                f"token_num mismatch: expected {self.token_num}, got {token_num_actual}"
+            # encoding_pos: (on_token_num, hidden_dim)
+            pos_valid = self.pos_emb(encoding_pos[~encoding_mask])
+            pos_valid = pos_valid.to(dtype=encoding_input.dtype,
+                                     device=encoding_input.device)
+            scale = self.pos_scale.to(dtype=encoding_input.dtype,
+                                      device=encoding_input.device)
+            encoding_pos = scale * pos_valid
+            encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim),
+                                              device=encoding_input.device,
+                                              dtype=encoding_input.dtype)
+            # encoding_pos_result: (B * token_num, hidden_dim)
+            encoding_pos_result[
+                ~encoding_mask] = encoding_pos  # Fill in valid parts
 
-        # 결합 후 실제 길이
-        token_num_actual = encoding_agents_chunk.size(1) + encoding_static.size(
-            1) + encoding_lanes.size(1)
-        # (선택) 방어적 체크
-        assert token_num_actual == self.token_num, \
-            f"token_num mismatch: expected {self.token_num}, got {token_num_actual}"
-        # encoding_pos: (on_token_num, hidden_dim)
-        pos_valid = self.pos_emb(encoding_pos[~encoding_mask])
-        pos_valid = pos_valid.to(dtype=encoding_input.dtype,
-                                 device=encoding_input.device)
-        scale = self.pos_scale.to(dtype=encoding_input.dtype,
-                                  device=encoding_input.device)
-        encoding_pos = scale * pos_valid
-        encoding_pos_result = torch.zeros((B * self.token_num, self.hidden_dim),
-                                          device=encoding_input.device,
-                                          dtype=encoding_input.dtype)
-        # encoding_pos_result: (B * token_num, hidden_dim)
-        encoding_pos_result[
-            ~encoding_mask] = encoding_pos  # Fill in valid parts
+            # (B, token_num, hidden_dim)
+            encoding_input = encoding_input + encoding_pos_result.reshape(
+                B, self.token_num, -1)
+            # get encoding_input_lanes from encoding_input
+            # (B, lane_num, hidden_dim)
+            encoder_outputs = {}
+            encoding_tokens, encoding_mask = self.fusion(
+                encoding_input, encoding_mask.reshape(B, self.token_num))
+            encoder_outputs[
+                "encoding"] = encoding_tokens  # (B, token_num, hidden_dim)
+            encoder_outputs["encoding_mask"] = encoding_mask  # (B, token_num)
+            encoder_outputs["ego_fut_global"] = ego_fut_global
+            encoding_lanes = encoding_input[:, -encoding_lanes.size(
+                1):, :]  # (B, lane_num, hidden_dim)
+            (near_agents_route_lane_emb,
+             route_known_mask) = self._get_near_agents_route_lane_emb(
+                 encoding_lanes, lanes_mask, agent_route_lane_order)
+            if not self.config.use_pram:
+                near_agents_route_lane_emb = self._zero_with_touch(
+                    near_agents_route_lane_emb, self.npc_route_encoder.parameters())
+                route_known_mask = torch.zeros_like(route_known_mask).bool()
 
-        # (B, token_num, hidden_dim)
-        encoding_input = encoding_input + encoding_pos_result.reshape(
-            B, self.token_num, -1)
-        # get encoding_input_lanes from encoding_input
-        # (B, lane_num, hidden_dim)
-        encoder_outputs = {}
-        encoding_tokens, encoding_mask = self.fusion(
-            encoding_input, encoding_mask.reshape(B, self.token_num))
-        encoder_outputs[
-            "encoding"] = encoding_tokens  # (B, token_num, hidden_dim)
-        encoder_outputs["encoding_mask"] = encoding_mask  # (B, token_num)
-        encoder_outputs["ego_fut_global"] = ego_fut_global
-        encoding_lanes = encoding_input[:, -encoding_lanes.size(
-            1):, :]  # (B, lane_num, hidden_dim)
-        (near_agents_route_lane_emb,
-         route_known_mask) = self._get_near_agents_route_lane_emb(
-             encoding_lanes, lanes_mask, agent_route_lane_order)
-        if not self.config.use_pram:
-            near_agents_route_lane_emb = self._zero_with_touch(
-                near_agents_route_lane_emb, self.npc_route_encoder.parameters())
-            route_known_mask = torch.zeros_like(route_known_mask).bool()
-
-        encoder_outputs[
-            "near_agents_route_lane_emb"] = near_agents_route_lane_emb  # (B, Pnn, hidden_dim)
-        encoder_outputs[
-            "route_known_mask"] = route_known_mask  # (B, Pnn) True=해당 에이전트가 유효 route
-        return encoder_outputs
+            encoder_outputs[
+                "near_agents_route_lane_emb"] = near_agents_route_lane_emb  # (B, Pnn, hidden_dim)
+            encoder_outputs[
+                "route_known_mask"] = route_known_mask  # (B, Pnn) True=해당 에이전트가 유효 route
+            return encoder_outputs
 
     def _get_near_agents_route_lane_emb(
         self,
