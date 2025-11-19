@@ -213,6 +213,7 @@ class FeasibleProjector(nn.Module):
         )
         self._sg_pos_cache_cap: int = 2048  # 필요시 조절
         self.enable_profile: bool = False
+        self.use_batch_integration = self.config.use_batch_integration  # 추가 필요
         self.constraints_h_params = _ConstraintHParams(
             dt=0.1,
             eps=1e-6,
@@ -277,29 +278,30 @@ class FeasibleProjector(nn.Module):
         if self.use_feasible_train:
             # 상태 인코더(현재 노드 X_prev: (x,y,cos,sin))
             self.state_prev_encoder = nn.Sequential(
-                nn.LayerNorm(4),          # (B,Pnn,segment_len,4)
-                nn.Linear(4, self._Dx),         # 추가: 4 → 16
+                nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
+                nn.Linear(4, self._Dx),  # 추가: 4 → 16
                 nn.GELU(),
                 nn.Linear(self._Dx, self._Dx),  # 추가: 16 → 16 (= self._Dx)
             )
             self.state_fut_encoder = nn.Sequential(
-                nn.LayerNorm(4),          # (B,Pnn,segment_len,4)
-                nn.Linear(4, self._Dx),         # 추가: 4 → 16
+                nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
+                nn.Linear(4, self._Dx),  # 추가: 4 → 16
                 nn.GELU(),
                 nn.Linear(self._Dx, self._Dx),  # 추가: 16 → 16 (= self._Dx)
             )
             self.control_adapter = nn.Sequential(
-                nn.LayerNorm(3),          # (B,Pnn,segment_len,3)
-                nn.Linear(3, self._Du),   # 추가: 3 → 8 (= self._Du)
+                nn.LayerNorm(3),  # (B,Pnn,segment_len,3)
+                nn.Linear(3, self._Du),  # 추가: 3 → 8 (= self._Du)
                 nn.GELU(),
             )
 
             # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
             self.trunk_compressor = nn.Sequential(
                 nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, 3* self._Dc),   # 추가: hidden_dim → 64 (중간 폭 축소)
+                nn.Linear(hidden_dim,
+                          3 * self._Dc),  # 추가: hidden_dim → 64 (중간 폭 축소)
                 nn.GELU(),
-                nn.Linear(3* self._Dc, self._Dc),     # 추가: 64 → 8 (= self._Dc)
+                nn.Linear(3 * self._Dc, self._Dc),  # 추가: 64 → 8 (= self._Dc)
             )
 
             # ------------------------------
@@ -316,8 +318,7 @@ class FeasibleProjector(nn.Module):
             self._dilations: List[int] = [1, 2]  # 추가: 4블록→2블록
             self.tcn_depth = len(self._dilations)  # 추가: 현재는 2
             self.tcn_pre_lns = nn.ModuleList(  # 추가: 블록 수만큼 LayerNorm
-                [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)]
-            )
+                [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
 
             # depthwise conv (C 채널, groups=C)
             def _same_pad(k: int, d: int) -> int:
@@ -361,6 +362,157 @@ class FeasibleProjector(nn.Module):
             b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
             with torch.no_grad():
                 self.gate_mlp[-1].bias.fill_(b_init)
+
+    # ----------------------------
+    # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
+    # ----------------------------
+    def _apply_constraints_batch(
+        self,
+        vx_b_raw: torch.Tensor,  # (B, Pnn, T)  바디 기준 x속도
+        vy_b_raw: torch.Tensor,  # (B, Pnn, T)  바디 기준 y속도
+        omega_raw: torch.Tensor,  # (B, Pnn, T)  요각속도
+        key_to_limit_bp: Dict[str, torch.Tensor],
+        #   v_max/a_max/.../is_nonholonomic, 각 (B, Pnn)
+        hp: _ConstraintHParams,
+        slip_epsilon: float = 0.10,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """S0, S1, S3 제약을 시간축 전체에 한 번에 적용한다.
+
+        - 입력 속도/각속도 시퀀스 (B, Pnn, T)에 대해
+          같은 규칙(S0/S1/S3)을 모든 시간에 동시에 적용한다.
+        - S2(가속도/각가속도 증분 제한)는 여기서는 아예 사용하지 않는다.
+        """
+        if not self.use_feasible_filter:
+            # 필터를 끄면 그대로 통과
+            return vx_b_raw, vy_b_raw, omega_raw
+
+        # (S0) 비홀로노믹: y방향 속도 거의 0으로 유지
+        vx_after, vy_after = self._apply_S0_nonholonomic_ste(
+            vx_b=vx_b_raw,  # (B,Pnn,T)
+            vy_b=vy_b_raw,  # (B,Pnn,T)
+            slip_epsilon=slip_epsilon,
+            eta=hp.eta_slip,
+            eps=hp.eps,
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # (B,Pnn)
+        )
+
+        # (S1) 최대 속도 제한
+        vx_after, vy_after = self._apply_S1_speed_limit_ste(
+            vx_b=vx_after,  # (B,Pnn,T)
+            vy_b=vy_after,  # (B,Pnn,T)
+            v_max=key_to_limit_bp["v_max"],  # (B,Pnn)
+            eta=hp.eta_speed,
+            eps=hp.eps,
+        )
+
+        # (S3) 속도-연동 요각속도 제한
+        omega_after = self._apply_S3_omega_clip_ste(
+            vx_b=vx_after,  # (B,Pnn,T)
+            vy_b=vy_after,  # (B,Pnn,T)
+            omega=omega_raw,  # (B,Pnn,T)
+            a_lat_max=key_to_limit_bp["a_lat_max"],  # (B,Pnn)
+            R_min=key_to_limit_bp["R_min"],  # (B,Pnn)
+            omega_abs_max=key_to_limit_bp["omega_abs_max"],  # (B,Pnn)
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # (B,Pnn)
+            eta=hp.eta_yaw,
+            eps=hp.eps,
+        )
+
+        return vx_after, vy_after, omega_after  # 모두 (B,Pnn,T)
+
+    # ----------------------------
+    # [NEW] 시간축 전체 배치 중점 적분 (cumsum 기반)
+    # ----------------------------
+    def _integrate_midpoint_batch(
+        self,
+        unnorm_near_current_state: torch.
+        Tensor,  # (B, Pnn, 4)  [x0, y0, cos0, sin0]
+        vx_b_seq: torch.Tensor,  # (B, Pnn, T)  바디 기준 x속도 시퀀스
+        vy_b_seq: torch.Tensor,  # (B, Pnn, T)  바디 기준 y속도 시퀀스
+        omega_seq: torch.Tensor,  # (B, Pnn, T)  요각속도 시퀀스
+        hp: _ConstraintHParams,
+    ) -> Dict[str, torch.Tensor]:
+        """시간축 전체에 대해 '중점 적분'을 한 번에 수행한다.
+
+        - 각 구간 k 에 대해,
+          yaw_k 에서 시작해서 yaw_k + w_k*dt 까지 회전한다고 보고
+          중간 각(yaw_mid)을 이용해 세계 좌표 속도를 계산한다.
+        - 이 세계 좌표 속도를 dt만큼 계속 더해 가며 위치를 만든다.
+        - 모든 계산을 시간축에 대해 cumsum 으로 처리하므로,
+          python for 루프 없이 한 번에 연산한다.
+        """
+        B, Pnn, T = vx_b_seq.shape  # T = future_len
+        device = vx_b_seq.device
+        dtype = vx_b_seq.dtype
+
+        dt: float = hp.dt
+        eps: float = hp.eps
+
+        # 초기 위치/자세 (노드 0)
+        x0 = unnorm_near_current_state[..., 0]  # (B,Pnn)
+        y0 = unnorm_near_current_state[..., 1]  # (B,Pnn)
+        cos0 = unnorm_near_current_state[..., 2]  # (B,Pnn)
+        sin0 = unnorm_near_current_state[..., 3]  # (B,Pnn)
+
+        # yaw0 (라디안) 복원
+        yaw0 = torch.atan2(sin0, cos0)  # (B,Pnn)
+
+        # 각속도 적분: Δθ_k = w_k * dt
+        dtheta_seq = omega_seq * dt  # (B,Pnn,T)
+
+        # 누적합: sum_{j<=k} Δθ_j
+        dtheta_prefix = torch.cumsum(dtheta_seq, dim=2)  # (B,Pnn,T)
+
+        # 각 구간 시작 각도 yaw_k = yaw0 + sum_{j<k} Δθ_j  (exclusive cumsum)
+        zero_pad = torch.zeros_like(dtheta_seq[..., :1])  # (B,Pnn,1)
+        dtheta_exclusive = torch.cat(
+            [zero_pad, dtheta_prefix[..., :-1]],
+            dim=2,
+        )  # (B,Pnn,T)
+        yaw_start = yaw0.unsqueeze(-1) + dtheta_exclusive  # (B,Pnn,T)
+
+        # 중점/종단 각도
+        yaw_mid = yaw_start + 0.5 * dtheta_seq  # (B,Pnn,T)
+        yaw_next = yaw_start + dtheta_seq  # (B,Pnn,T)
+
+        cos_mid = torch.cos(yaw_mid)  # (B,Pnn,T)
+        sin_mid = torch.sin(yaw_mid)  # (B,Pnn,T)
+
+        # 세계 기준 중점 속도
+        vwx_mid = cos_mid * vx_b_seq - sin_mid * vy_b_seq  # (B,Pnn,T)
+        vwy_mid = sin_mid * vx_b_seq + cos_mid * vy_b_seq  # (B,Pnn,T)
+
+        # dt 만큼 이동량
+        dx_seq = vwx_mid * dt  # (B,Pnn,T)
+        dy_seq = vwy_mid * dt  # (B,Pnn,T)
+
+        # 누적합으로 위치 만들기
+        x_cumsum = torch.cumsum(dx_seq, dim=2)  # (B,Pnn,T)
+        y_cumsum = torch.cumsum(dy_seq, dim=2)  # (B,Pnn,T)
+
+        x_next = x0.unsqueeze(-1) + x_cumsum  # (B,Pnn,T)
+        y_next = y0.unsqueeze(-1) + y_cumsum  # (B,Pnn,T)
+
+        # 최종 yaw(k+1) → cos/sin
+        cos_next = torch.cos(yaw_next)  # (B,Pnn,T)
+        sin_next = torch.sin(yaw_next)  # (B,Pnn,T)
+
+        # 수치 오차 보정용 정규화
+        norm_cs = torch.sqrt(cos_next * cos_next + sin_next * sin_next +
+                             eps)  # (B,Pnn,T)
+        cos_next = cos_next / norm_cs
+        sin_next = sin_next / norm_cs
+
+        key_to_all_states: Dict[str, torch.Tensor] = {
+            "x_next": x_next,  # (B,Pnn,T)
+            "y_next": y_next,  # (B,Pnn,T)
+            "cos_next": cos_next,  # (B,Pnn,T)
+            "sin_next": sin_next,  # (B,Pnn,T)
+            "vx_after": vx_b_seq,  # (B,Pnn,T)
+            "vy_after": vy_b_seq,  # (B,Pnn,T)
+            "omega_after": omega_seq,  # (B,Pnn,T)
+        }
+        return key_to_all_states
 
     # 추가: 시간축 다항 기저(Φ)와 Gram 행렬(Φ^TΦ의 k별 분해)을 미리 만드는 함수
     def _sg_build_design_matrix_and_gram(
@@ -1788,7 +1940,7 @@ class FeasibleProjector(nn.Module):
     # ============================
     # [REFACTORED] 본체: Filter + Integrate
     # ============================
-    def filter_and_integrate(
+    def _filter_and_integrate_sequential(
             self,
             unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
             near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
@@ -1796,8 +1948,8 @@ class FeasibleProjector(nn.Module):
         Tensor,  # (B, Pnn, future_len, 3)
             near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self._assert_cur_future_valid_mask(near_cur_future_valid,
-                                           context="filter_and_integrate")
+        # self._assert_cur_future_valid_mask(near_cur_future_valid,
+        #                                    context="filter_and_integrate")
         B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
         device = unnorm_cur_future_seg_body_control.device
         dtype = unnorm_cur_future_seg_body_control.dtype
@@ -1891,6 +2043,119 @@ class FeasibleProjector(nn.Module):
         return self._assemble_outputs(key_to_all_states, vx_b_raw, vy_b_raw,
                                       omega_raw, near_cur_future_valid)
 
+    # 지우개: 아래 기존 filter_and_integrate 본문 전체를 대체합니다.
+    # def filter_and_integrate(...):
+    #     (기존 step-by-step for 루프 구현)
+    #     ...
+
+    # ----------------------------
+    # [MOD] 경로 선택용 래퍼
+    # ----------------------------
+    def filter_and_integrate(
+            self,
+            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
+            unnorm_cur_future_seg_body_control: torch.
+        Tensor,  # (B, Pnn, future_len, 3)
+            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Filter + Integrate 최상위 래퍼.
+
+        - 공통으로 유효 마스크 형태를 한 번 확인하고,
+        - 설정(self.use_batch_integration)에 따라
+            * False: 기존 step-by-step + S2 버전 사용
+            * True : 시간축 완전 배치 + S2 미사용 버전 사용
+        """
+        self._assert_cur_future_valid_mask(
+            near_cur_future_valid,
+            context="filter_and_integrate",
+        )
+
+        if not self.use_batch_integration:
+            # 기존 방식 유지 (S2 포함, for 루프)
+            return self._filter_and_integrate_sequential(
+                unnorm_near_current_state=unnorm_near_current_state,
+                near_cur_future_valid=near_cur_future_valid,
+                unnorm_cur_future_seg_body_control=
+                unnorm_cur_future_seg_body_control,
+                near_class_one_hot=near_class_one_hot,
+            )
+
+        # 추가하자: 시간축 완전 배치 버전 (S2 미사용)
+        return self._filter_and_integrate_batch(
+            unnorm_near_current_state=unnorm_near_current_state,
+            near_cur_future_valid=near_cur_future_valid,
+            unnorm_cur_future_seg_body_control=
+            unnorm_cur_future_seg_body_control,
+            near_class_one_hot=near_class_one_hot,
+        )
+
+    # ----------------------------
+    # [NEW PATH] 시간축 완전 배치 버전 (S2 미사용)
+    # ----------------------------
+    def _filter_and_integrate_batch(
+            self,
+            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
+            unnorm_cur_future_seg_body_control: torch.
+        Tensor,  # (B, Pnn, future_len, 3)
+            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """시간축 전체를 한 번에 처리하는 배치 버전.
+
+        - S2(가속/각가속 증분 제한)는 사용하지 않는다.
+        - S0/S1/S3만 vx,vy,omega 시퀀스에 배치로 적용한다.
+        - yaw 및 위치는 cumsum 기반 중점 적분으로 계산한다.
+        """
+        B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
+        device = unnorm_cur_future_seg_body_control.device
+        dtype = unnorm_cur_future_seg_body_control.dtype
+
+        if future_len == 0:
+            raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
+
+        if self.detach_state_and_u_for_ctrl_losses:
+            unnorm_near_current_state = unnorm_near_current_state.detach()
+
+        # per-agent 제한값 (v_max, a_lat_max, R_min, ...)
+        key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
+            near_class_one_hot,
+            device=device,
+            dtype=dtype,
+        )
+
+        # (B,Pnn,future_len)
+        vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
+            unnorm_cur_future_seg_body_control)
+
+        # 시간축 전체에 S0/S1/S3 배치 적용 (S2는 미사용)
+        """ 3개 모두 (B,Pnn,future_len) 반환"""
+        vx_b_after, vy_b_after, omega_after = self._apply_constraints_batch(
+            vx_b_raw=vx_b_raw,  # (B,Pnn,T)
+            vy_b_raw=vy_b_raw,  # (B,Pnn,T)
+            omega_raw=omega_raw,  # (B,Pnn,T)
+            key_to_limit_bp=key_to_limit_bp,
+            hp=self.constraints_h_params,
+            slip_epsilon=0.1,
+        )
+
+        # 중점 적분을 시간축 전체에 대해 배치로 수행
+        key_to_all_states = self._integrate_midpoint_batch(
+            unnorm_near_current_state=unnorm_near_current_state,  # (B,Pnn,4)
+            vx_b_seq=vx_b_after,  # (B,Pnn,T)
+            vy_b_seq=vy_b_after,  # (B,Pnn,T)
+            omega_seq=omega_after,  # (B,Pnn,T)
+            hp=self.constraints_h_params,
+        )
+
+        return self._assemble_outputs(
+            key_to_all_states=key_to_all_states,
+            vx_b_raw=vx_b_raw,
+            vy_b_raw=vy_b_raw,
+            omega_raw=omega_raw,
+            near_cur_future_valid=near_cur_future_valid,
+        )
+
     # ================================================================
     # [REFACTOR] Savitzky–Golay 유틸들 (모두 torch-only, 미분 가능)
     # ================================================================
@@ -1934,9 +2199,9 @@ class FeasibleProjector(nn.Module):
 
     def _compute_world_linear_velocity_via_sg(
         self,
-        x: torch.Tensor,              # (B, Pnn, point_len)
-        y: torch.Tensor,              # (B, Pnn, point_len)
-        points_valid: torch.Tensor,   # (B, Pnn, point_len) bool
+        x: torch.Tensor,  # (B, Pnn, point_len)
+        y: torch.Tensor,  # (B, Pnn, point_len)
+        points_valid: torch.Tensor,  # (B, Pnn, point_len) bool
         *,
         dt: float,
         polyorder: int,
@@ -1973,8 +2238,8 @@ class FeasibleProjector(nn.Module):
         )  # (B, Pnn, point_len, 2)
 
         velocities_stack = self._sg_derivative_multi_for_points(
-            sequences_points=positions_stack,      # (B,Pnn,point_len,2)
-            points_valid=points_valid,             # (B,Pnn,point_len)
+            sequences_points=positions_stack,  # (B,Pnn,point_len,2)
+            points_valid=points_valid,  # (B,Pnn,point_len)
             dt=dt,
             polyorder=polyorder,
             max_window_length=max_window_len_xy,
