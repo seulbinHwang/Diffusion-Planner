@@ -204,14 +204,8 @@ class FeasibleProjector(nn.Module):
         # --- [NEW] Savitzky–Golay 커널 캐시(LRU) ---
         # key: (W, polyorder, deriv_order, dt, dtype, device)
         # val: torch.Tensor of shape (1, 1, W)
-        self._sg_kernel_cache: "OrderedDict[Tuple[int, int, int, float, torch.dtype, torch.device], torch.Tensor]" = OrderedDict(
-        )
-        self._sg_kernel_cache_cap: int = 256  # 필요시 조절(메모리-속도 트레이드오프)
         # [추가 요망] SG 위치별(one‑sided/중앙) 가중치 캐시(LRU)
         # key: (W, polyorder, deriv_order, m, dt, dtype, device)  → val: (W,) weights
-        self._sg_pos_cache: "OrderedDict[Tuple[int, int, int, int, float, torch.dtype, torch.device], torch.Tensor]" = OrderedDict(
-        )
-        self._sg_pos_cache_cap: int = 2048  # 필요시 조절
         self.enable_profile: bool = False
         self.use_batch_integration = self.config.use_batch_integration  # 추가 필요
         self.constraints_h_params = _ConstraintHParams(
