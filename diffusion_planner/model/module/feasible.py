@@ -875,8 +875,6 @@ class FeasibleProjector(nn.Module):
         # 사용자가 원하는 다운샘플 간격(초). 없으면 base_dt 그대로 사용.
         desired_dt: float = float(
             getattr(self.config, "feasible_stride_dt", base_dt))
-        print("desired_dt:", desired_dt)
-        raise NotImplementedError()
         # base_dt 보다 작게 들어오면 의미가 없으니 최소 base_dt로 클램프
         if desired_dt < base_dt:
             desired_dt = base_dt
