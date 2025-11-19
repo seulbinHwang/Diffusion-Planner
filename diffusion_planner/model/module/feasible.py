@@ -1646,6 +1646,11 @@ class FeasibleProjector(nn.Module):
         """S0: v_y hard-clip(+STE). 보행자 제외."""
         limit = torch.full_like(vy_b, float(slip_epsilon))  # (B,Pnn)
         vy_new = self._ste_scalar_clip(vy_b, limit, eta, eps)  # (B,Pnn)
+
+        # ★ 추가: 시간축이 있을 때 에이전트 마스크를 시간축으로 확장
+        if is_nonholonomic.dim() == vy_b.dim() - 1:
+            # is_nonholonomic: (B,Pnn) -> (B,Pnn,1) -> (B,Pnn,T)
+            is_nonholonomic = is_nonholonomic.unsqueeze(-1).expand_as(vy_b)
         vy_out = torch.where(is_nonholonomic, vy_new, vy_b)
         return vx_b, vy_out
 
