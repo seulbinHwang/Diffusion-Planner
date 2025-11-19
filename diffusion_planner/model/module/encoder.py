@@ -566,7 +566,7 @@ class Encoder(nn.Module):
         # ego
         device_type = inputs["ego_agent_past"].device.type
         with profile_block(
-                "DiT.forward",
+                "encoder.forward",
                 enabled=self.config.profile_feasible,
                 device_type=device_type,
         ):
