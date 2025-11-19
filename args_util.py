@@ -176,7 +176,7 @@ def get_args():
     parser.add_argument('--prefetch_factor',
                         type=int,
                         help='number of warm up',
-                        default=4)
+                        default=6)
     parser.add_argument('--encoder_drop_path_rate',
                         type=float,
                         help='encoder drop out rate',
