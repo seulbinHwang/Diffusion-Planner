@@ -97,5 +97,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "feasible_full_time_gpu_2_exp_A" \
   --batch_size 1536 \
+  --profile_feasible false \
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
