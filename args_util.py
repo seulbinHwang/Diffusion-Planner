@@ -125,7 +125,9 @@ def get_args():
     parser.add_argument('--profile_feasible', default=True, type=boolean)
     parser.add_argument('--use_vel_input', default=False, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
-    parser.add_argument('--use_integration_trajectory', default=False, type=boolean)
+    parser.add_argument('--use_integration_trajectory',
+                        default=False,
+                        type=boolean)
     parser.add_argument('--use_guidance', default=False, type=boolean)
     parser.add_argument('--use_feasible_blend', default=False, type=boolean)
     parser.add_argument('--use_', default=False, type=boolean)

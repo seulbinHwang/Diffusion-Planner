@@ -321,7 +321,8 @@ class Decoder(nn.Module):
             return xt_sequence
 
         # cond_last_mask: (B, Pnn)  → True 인 위치만 cond-last 사용
-        cond_last_mask = torch.isfinite(cond_last_pos_norm).all(dim=-1)
+        cond_last_mask = torch.isfinite(cond_last_pos_norm).all(dim=-1) \
+                         & (cond_last_pos_norm.ne(0).sum(dim=-1) > 0)
 
         if not cond_last_mask.any().item():
             return xt_sequence
@@ -441,7 +442,6 @@ class Decoder(nn.Module):
     def _apply_feasible_blend_with_feasible_projection(
             self,
             xt_sequence: torch.Tensor,  # shape: (B, Pnn, time_len, 4)  
-            near_current_xyyaw: torch.Tensor,  # shape: (B, Pnn, 4)  
             near_past_cur_future_valid: torch.
         Tensor,  # shape: (B, Pnn, time_len_total) bool  
             cond_last_mask: torch.Tensor,  # shape: (B, Pnn) bool  
@@ -467,27 +467,28 @@ class Decoder(nn.Module):
         future_len: int = int(self._future_len)
 
         # FeasibleProjector 적분 결과 (미래 T 프레임) 가져오기
+        # integrated_future: (B, Pnn, future_len, 4) 또는 None
         integrated_future = self._get_latest_feasible_integrated_trajectory_future(
             batch_size=batch_size,
             predicted_neighbor_num=predicted_neighbor_num,
             future_len=future_len,
-            reference_tensor_for_device=xt_sequence,
-        )  # (B, Pnn, T, 4) 또는 None
+            reference_tensor_for_device=xt_sequence, # shape: (B, Pnn, 80 or 81, 4)
+        ) 
         if integrated_future is None:
             return xt_sequence
 
-        # xt_sequence 에서 "미래" 부분만 (B, Pnn, T, 4) 형태로 뽑기
+        # xt_sequence 에서 "미래" 부분만 (B, Pnn, future_len, 4) 형태로 뽑기
         if self.config.use_current_input:
-            # xt_sequence: (B, Pnn, 1+T, 4)  -> 미래만 사용
+            # xt_sequence: (B, Pnn, 1+future_len, 4)  -> 미래만 사용
             if time_len != future_len + 1:
                 # time_len 이 다르면 안전하게 스킵
                 return xt_sequence
-            xt_future = xt_sequence[:, :, 1:, :]  # (B, Pnn, T, 4)
+            xt_future = xt_sequence[:, :, 1:, :]  # (B, Pnn, future_len, 4)
         else:
-            # xt_sequence: (B, Pnn, T, 4) 가 바로 미래 궤적
+            # xt_sequence: (B, Pnn, future_len, 4) 가 바로 미래 궤적
             if time_len != future_len:
                 return xt_sequence
-            xt_future = xt_sequence  # (B, Pnn, T, 4)
+            xt_future = xt_sequence  # (B, Pnn, future_len, 4)
 
         # near_past_cur_future_valid 에서 "현재+미래" 마스크만 추출
         if near_past_cur_future_valid.shape[-1] < (future_len + 1):
@@ -497,7 +498,7 @@ class Decoder(nn.Module):
         future_valid = near_cur_future_valid[:, :, 1:]  # (B, Pnn, T)
 
         # 유효한 미래 타임스텝만 섞기 위해 마스크 생성
-        mix_mask = future_valid.unsqueeze(-1).to(  # (B, Pnn, T, 1)  
+        mix_valid_mask = future_valid.unsqueeze(-1).to(  # (B, Pnn, T, 1)  
             dtype=xt_future.dtype)
 
         # cond-last 를 쓴 에이전트는 마지막 프레임(T-1)을 섞지 않도록 보호
@@ -505,13 +506,13 @@ class Decoder(nn.Module):
             cond_last_mask_expanded = cond_last_mask.unsqueeze(-1).unsqueeze(
                 -1)  # (B, Pnn, 1, 1)
             # 마지막 타임스텝에 대해서만 cond-last=True 인 곳은 0 으로 만든다.
-            mix_mask[:, :, -1:, :] = mix_mask[:, :, -1:, :] * (
-                (~cond_last_mask_expanded).to(mix_mask.dtype))
+            mix_valid_mask[:, :, -1:, :] = mix_valid_mask[:, :, -1:, :] * (
+                (~cond_last_mask_expanded).to(mix_valid_mask.dtype))
 
         # β 를 (B, Pnn, T, 1) 로 브로드캐스트
         beta_broadcast = feasible_blend_beta_scalar.view(1, 1, 1,
                                                          1)  # (1,1,1,1)
-        beta_mask = beta_broadcast * mix_mask  # (B, Pnn, T, 1)
+        beta_mask = beta_broadcast * mix_valid_mask  # (B, Pnn, T, 1)
 
         # 실제로 섞기: x_new = (1-β) * x_t + β * Π(x_t)
         integrated_future = integrated_future.to(dtype=xt_future.dtype,
@@ -739,10 +740,9 @@ class Decoder(nn.Module):
                     )
 
                     if feasible_blend_beta_scalar.detach().item() > 0.0:
+                        # xt_sequence: (B, Pnn, time_len, 4)
                         xt_sequence = self._apply_feasible_blend_with_feasible_projection(
                             xt_sequence=xt_sequence,  # (B, Pnn, time_len, 4)  
-                            near_current_xyyaw=
-                            near_current_xyyaw,  # (B, Pnn, 4)  
                             near_past_cur_future_valid=
                             near_past_cur_future_valid,  # (B, Pnn, time_len_total) bool  
                             cond_last_mask=cond_last_mask,  # (B, Pnn) bool  
