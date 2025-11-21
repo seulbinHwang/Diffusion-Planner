@@ -2,7 +2,8 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from nuplan.common.actor_state.vehicle_parameters import VehicleParameters, get_pacifica_parameters
+from nuplan.common.actor_state.vehicle_parameters import VehicleParameters, \
+    get_pacifica_parameters
 
 ego_size = [get_pacifica_parameters().length, get_pacifica_parameters().width]
 
@@ -15,7 +16,7 @@ def batch_signed_distance_rect(rect1, rect2):
     '''
     rect1: [B, 4, 2]
     rect2: [B, 4, 2]
-    
+
     return [B] (signed distance between two rectangles)
     '''
     B, _, _ = rect1.shape
@@ -52,7 +53,7 @@ def batch_signed_distance_rect(rect1, rect2):
 def center_rect_to_points(rect):
     '''
     rect: [B, 6] (x, y, cos_h, sin_h, l, w)
-    
+
     return [B, 4, 2] (4 points of the rectangle)
     '''
 
@@ -131,23 +132,15 @@ def collision_guidance_fn(x, t, cond, inputs, *args, **kwargs) -> torch.Tensor:
     clip_distances = torch.maximum(1 - distances / CLIP_DISTANCE,
                                    torch.tensor(0.0, device=distances.device))
 
-    # reward = -(torch.sum(clip_distances[clip_distances > 1]) / (torch.sum(
-    #     (clip_distances[clip_distances > 1].detach() > 0).float()) + 1e-5) +
-    #            torch.sum(clip_distances[clip_distances <= 1]) / (torch.sum(
-    #                (clip_distances[clip_distances <= 1].detach() > 0).float()) +
-    #                                                              1e-5)).exp()
+    reward = -(torch.sum(clip_distances[clip_distances > 1]) / (torch.sum(
+        (clip_distances[clip_distances > 1].detach() > 0).float()) + 1e-5) +
+               torch.sum(clip_distances[clip_distances <= 1]) / (torch.sum(
+                   (clip_distances[clip_distances <= 1].detach() > 0).float()) +
+                                                                 1e-5)).exp()
 
-    reward_a = (
-        torch.sum(clip_distances[clip_distances > 1]) / (torch.sum(
-            (clip_distances[clip_distances > 1].detach() > 0).float()) + 1e-5) +
-        torch.sum(clip_distances[clip_distances <= 1]) / (torch.sum(
-            (clip_distances[clip_distances <= 1].detach() > 0).float()) + 1e-5))
-    reward = -reward_a.exp()
-
-    x_aux = torch.autograd.grad(reward.sum(),
-                                x,
-                                retain_graph=True,
-                                allow_unused=True)[0][:, 0, :, :2]  # [B, T, 2]
+    x_aux = \
+    torch.autograd.grad(reward.sum(), x, retain_graph=True, allow_unused=True)[
+        0][:, 0, :, :2]  # [B, T, 2]
 
     T += 1
     x_mat = torch.einsum(
@@ -159,7 +152,9 @@ def collision_guidance_fn(x, t, cond, inputs, *args, **kwargs) -> torch.Tensor:
     # x_aux = torch.cat([x_aux[:, :5], torch.zeros_like(x_aux[:, 5:])], dim=1)
 
     x_aux = torch.stack([
-        torch.einsum("bt,it->bi", x_aux[..., 0], torch.tril((-torch.linspace(0, 1, T, device=x.device)).exp().unsqueeze(0).repeat(T, 1))) * 0,
+        torch.einsum("bt,it->bi", x_aux[..., 0], torch.tril(
+            (-torch.linspace(0, 1, T, device=x.device)).exp().unsqueeze(
+                0).repeat(T, 1))) * 0,
         F.conv1d(
             F.pad(x_aux[:, None, :, 1], (10, 10), mode='replicate'),
             torch.ones(1, 1, 21, device=x.device) * \

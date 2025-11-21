@@ -367,7 +367,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (15.0, 15.0)
-    dpi: int = 400
+    dpi: int = 100
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -2173,7 +2173,7 @@ def draw_world_model_to_png(
         "58a9e2ba05555824"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
     draw_token_list: List[str] = [
-        "f476b2c85dd7508c"
+        "1be4dfd6d2f852a9"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
 
     # draw_token_list = None

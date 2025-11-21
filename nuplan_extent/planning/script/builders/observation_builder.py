@@ -27,34 +27,34 @@ def build_observations(observation_cfg: DictConfig,
         #     observation_cfg.checkpoint_path, model=torch_module_wrapper
         # ).model
 
-        # 추가: PL 체크포인트 우선 시도, 실패(KeyError) 시 순수 state_dict로 폴백
-        try:  # 추가
-            lmw = LightningModuleWrapper.load_from_checkpoint(  # 추가
+        # : PL 체크포인트 우선 시도, 실패(KeyError) 시 순수 state_dict로 폴백
+        try:
+            lmw = LightningModuleWrapper.load_from_checkpoint(
                 observation_cfg.checkpoint_path,
                 model=torch_module_wrapper,
-                strict=False)  # 추가
-            model = lmw.model  # 추가
-        except KeyError as e:  # 추가
-            if "pytorch-lightning_version" not in str(e):  # 추가
-                raise  # 추가
-            # 순수 state_dict(.pth 등) 로딩 폴백  # 추가
+                strict=False)
+            model = lmw.model
+        except KeyError as e:
+            if "pytorch-lightning_version" not in str(e):
+                raise
+            # 순수 state_dict(.pth 등) 로딩 폴백
             ckpt = torch.load(observation_cfg.checkpoint_path,
-                              map_location="cpu")  # 추가
-            state = ckpt.get("state_dict", ckpt)  # 추가
+                              map_location="cpu")
+            state = ckpt.get("state_dict", ckpt)
 
-            # 접두사 정리: 'model.' / 'module.' 제거  # 추가
-            new_state = {}  # 추가
-            for k, v in state.items():  # 추가
-                nk = k  # 추가
-                if nk.startswith("model."):  # 추가
-                    nk = nk[len("model."):]  # 추가
-                if nk.startswith("module."):  # 추가
-                    nk = nk[len("module."):]  # 추가
-                new_state[nk] = v  # 추가
+            # 접두사 정리: 'model.' / 'module.' 제거
+            new_state = {}
+            for k, v in state.items():
+                nk = k
+                if nk.startswith("model."):
+                    nk = nk[len("model."):]
+                if nk.startswith("module."):
+                    nk = nk[len("module."):]
+                new_state[nk] = v
 
             missing, unexpected = torch_module_wrapper.load_state_dict(
-                new_state, strict=False)  # 추가
-            model = torch_module_wrapper  # 추가
+                new_state, strict=False)
+            model = torch_module_wrapper
 
         # Remove config elements that are redundant to MLPlanner
         config = observation_cfg.copy()

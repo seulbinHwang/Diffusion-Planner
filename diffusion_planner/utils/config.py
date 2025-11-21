@@ -2,11 +2,12 @@ import json
 import torch
 
 from diffusion_planner.utils.normalizer import StateNormalizer, ObservationNormalizer
+from diffusion_planner.model.guidance.guidance_wrapper import GuidanceWrapper
 
 
 class Config:
 
-    def __init__(self, args_file, guidance_fn):
+    def __init__(self, args_file):
         with open(args_file, 'r') as f:
             args_dict = json.load(f)
 
@@ -24,4 +25,8 @@ class Config:
         route_lanes : 12
         route_lanes_speed_limit : 1
         """
-        self.guidance_fn = guidance_fn
+        if self.use_guidance:
+            if not self.use_feasible:
+                raise ValueError(
+                    "use_guidance가 True이면, use_feasible도 True여야 합니다.")
+            self.guidance_fn = GuidanceWrapper()

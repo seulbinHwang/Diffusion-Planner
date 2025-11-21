@@ -86,11 +86,6 @@ class Decoder(nn.Module):
         self.dit = DiT(
             config=config,
             sde=self._sde,
-            # route_encoder=RouteEncoder(
-            #     config.route_num,
-            #     config.lane_len,
-            #     drop_path_rate=config.encoder_drop_path_rate,
-            #     hidden_dim=config.hidden_dim),
             depth=config.decoder_depth,
             output_dim=output_dim,  # x, y, cos, sin
             hidden_dim=config.hidden_dim,
@@ -276,6 +271,263 @@ class Decoder(nn.Module):
             dim=-1)  # [B, pnn, time_len + future_len] bool
         return near_past_cur_future_valid
 
+    def _reshape_xt_with_current_state(
+            self,
+            xt: torch.Tensor,  # shape: (B, Pnn, flattened_dim)
+            batch_size: int,
+            predicted_neighbor_num: int,
+            near_current_xyyaw: torch.Tensor  # shape: (B, Pnn, 4)
+    ) -> torch.Tensor:
+        """샘플 xt 를 (B, Pnn, 1+T, 4) 모양으로 펼치고
+        '현재 상태 프레임'을 맨 앞에 올바르게 넣어주는 메서드.
+
+        - use_current_input=True  인 경우: xt 안에 이미 현재+미래가 다 들어 있어서
+          모양만 (B, Pnn, 1+T, 4) 로 바꿔주고 0번째 프레임을 현재 상태로 덮어쓴다.
+        - use_current_input=False 인 경우: xt 안에는 미래 T프레임만 있고,
+          0번째 프레임은 나중 단계에서 따로 채운다고 생각하고 모양만 (B, Pnn, T, 4) 로 만든다.
+        """
+        if self.config.use_current_input:
+            # xt_reshaped: (B, Pnn, 1+T, 4)
+            xt_reshaped = xt.reshape(
+                batch_size,
+                predicted_neighbor_num,
+                1 + self._future_len,
+                4,
+            )
+            xt_reshaped[:, :, 0, :] = near_current_xyyaw  # 현재 상태 주입 (B,Pnn,4)
+        else:
+            # xt_reshaped: (B, Pnn, T, 4)
+            xt_reshaped = xt.reshape(
+                batch_size,
+                predicted_neighbor_num,
+                self._future_len,
+                4,
+            )
+        return xt_reshaped
+
+    def _inject_last_position_condition_if_available(
+            self,
+            xt_sequence: torch.Tensor,  # shape: (B, Pnn, time_len, 4)
+            cond_last_pos_norm: torch.Tensor,  # shape: (B, Pnn, 4)
+    ) -> torch.Tensor:
+        """마지막 프레임에 '목표 위치' 정보가 있을 경우에만
+        그 위치로 덮어써 주는 메서드.
+
+        - cond_last_pos_norm 에 유효한 값이 없으면 아무 것도 하지 않는다.
+        - cond_last_pos_norm 에서 NaN / 0 벡터는 '조건 없음' 으로 취급할 수 있다.
+        """
+        # cond_last_pos_norm 안에 하나라도 finite 값이 있나 확인
+        if not torch.isfinite(cond_last_pos_norm).any():
+            return xt_sequence
+
+        # cond_last_mask: (B, Pnn)  → True 인 위치만 cond-last 사용
+        cond_last_mask = torch.isfinite(cond_last_pos_norm).all(dim=-1)
+
+        if not cond_last_mask.any().item():
+            return xt_sequence
+
+        # last_frame: (B, Pnn, 4)
+        last_frame = xt_sequence[:, :, -1, :]
+        # src: (B, Pnn, 4), xt_sequence 와 dtype/device 맞추기
+        src = _cast_like(cond_last_pos_norm, xt_sequence)
+        # cond_last_mask True 인 위치만 src 로 덮어쓰기
+        last_frame = torch.where(cond_last_mask.unsqueeze(-1), src, last_frame)
+        xt_sequence[:, :, -1, :] = last_frame
+        return xt_sequence
+
+    def _project_future_yaw_to_unit_circle(
+            self,
+            xt_sequence: torch.Tensor,  # shape: (B, Pnn, time_len, 4)
+    ) -> torch.Tensor:
+        """각 프레임의 (cos, sin) 부분이 길이 1 이 되도록
+        단위원 위로 다시 정리해 주는 메서드.
+
+        - yaw 벡터가 (0,0)에 가까운 경우를 대비해서 작은 epsilon 으로 나눗셈을 안정화한다.
+        """
+        # yaw_direction: (B, Pnn, time_len, 2)
+        yaw_direction = xt_sequence[:, :, :, 2:4]
+
+        # yaw_norm: (B, Pnn, time_len, 1)
+        yaw_norm = torch.linalg.norm(
+            yaw_direction,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1e-6)
+
+        # 정규화된 yaw 를 다시 써 넣기
+        xt_sequence[:, :, :,
+                    2:4] = yaw_direction / yaw_norm  # (B,Pnn,time_len,2)
+        return xt_sequence
+
+    def _compute_feasible_blend_beta(
+            self,
+            diffusion_time_step: torch.Tensor,  # shape: () or (1,)  
+            reference_tensor_for_device: torch.
+        Tensor,  # shape: (B, Pnn, time_len, 4)  
+    ) -> torch.Tensor:  # shape: ()
+        """DPM-Solver가 넘겨주는 현재 시간 t 로 prox-snap 비율 β(t)를 계산하는 함수.  
+
+        - t 값이 클 때(초반, 노이즈 많을 때)는 β=0 으로 두고 아무 것도 하지 않는다.  
+        - t 값이 threshold 이하(후반, 노이즈가 거의 빠진 구간)에서만 β를 0→β_max 로 서서히 키운다.  
+        - β_max, 지수 p 는 config 에서 읽어오되, 없으면 기본값(0.1, 1.0)을 쓴다.  
+        """
+
+        # 학습 때 쓰던 threshold 그대로 재사용 (예: 0.30)
+        t_threshold: float = float(
+            getattr(self.config, "feasible_learn_noise_thresh", 0.3))
+        if t_threshold <= 0.0:
+            return reference_tensor_for_device.new_tensor(0.0)
+
+        beta_max: float = float(getattr(self.config, "prox_snap_beta_max", 0.1))
+        beta_power: float = float(
+            getattr(self.config, "prox_snap_beta_power", 1.0))
+        if beta_max <= 0.0:
+            return reference_tensor_for_device.new_tensor(0.0)
+
+        # diffusion_time_step: t (shape: () or (1,))
+        t_value: torch.Tensor = diffusion_time_step.detach().float()
+        if t_value.dim() > 0:
+            # 여러 값이 들어와도 첫 번째 값만 사용 (배치 전체가 같은 t 를 쓰기 때문)
+            t_value = t_value.view(-1)[0]
+
+        # s(t) = clip( (t_th - t) / t_th, 0, 1 )
+        safe_t_threshold: float = max(t_threshold, 1e-6)
+        s_raw: torch.Tensor = (t_threshold - t_value) / safe_t_threshold
+        s_clamped: torch.Tensor = torch.clamp(s_raw, 0.0, 1.0)
+
+        beta_value: torch.Tensor = beta_max * (s_clamped**beta_power)
+        beta_value = beta_value.to(
+            dtype=reference_tensor_for_device.dtype,
+            device=reference_tensor_for_device.device,
+        )
+        return beta_value
+
+    def _get_latest_feasible_integrated_trajectory_future(
+        self,
+        batch_size: int,
+        predicted_neighbor_num: int,
+        future_len: int,
+        reference_tensor_for_device: torch.
+        Tensor,  # shape: (B, Pnn, time_len, 4)  
+    ) -> Optional[torch.Tensor]:  # returns: (B, Pnn, future_len, 4) or None
+        """DiT가 방금 저장해 둔 FeasibleProjector 적분 결과를 꺼내오는 메서드.  
+
+        - 학습/추론 공통으로 self.dit.dit_returns.integrated_trajectory 에 저장된 값을 사용한다.  
+        - shape 이나 배치 크기가 안 맞으면 None 을 돌려서 prox-snap 을 건너뛴다.  
+        """
+        dit_returns = getattr(self.dit, "dit_returns", None)
+        if dit_returns is None:
+            return None
+
+        integrated_future = getattr(dit_returns, "integrated_trajectory",
+                                    None)  # (B, Pnn, T, 4)
+        if integrated_future is None:
+            return None
+        if integrated_future.dim() != 4 or integrated_future.shape[-1] != 4:
+            return None
+
+        B_f, Pnn_f, T_f, _ = integrated_future.shape
+        if B_f != batch_size or Pnn_f != predicted_neighbor_num:
+            return None
+        if T_f != future_len:
+            # future_len 이 다르면 섞을 수 없으니 안전하게 스킵
+            return None
+
+        return integrated_future.to(  # shape: (B, Pnn, future_len, 4)  
+            dtype=reference_tensor_for_device.dtype,
+            device=reference_tensor_for_device.device,
+        )
+
+    def _apply_feasible_blend_with_feasible_projection(
+            self,
+            xt_sequence: torch.Tensor,  # shape: (B, Pnn, time_len, 4)  
+            near_current_xyyaw: torch.Tensor,  # shape: (B, Pnn, 4)  
+            near_past_cur_future_valid: torch.
+        Tensor,  # shape: (B, Pnn, time_len_total) bool  
+            cond_last_mask: torch.Tensor,  # shape: (B, Pnn) bool  
+            feasible_blend_beta_scalar: torch.Tensor,  # shape: ()  
+    ) -> torch.Tensor:  # shape: (B, Pnn, time_len, 4)
+        """현재 샘플 궤적과 FeasibleProjector 적분 궤적을 β 비율로 섞어 주는 메서드.  
+
+        동작 요약:  
+            1) DiT 가 저장해 둔 integrated_trajectory (미래 T 프레임)을 가져온다.  
+            2) 현재 xt_sequence 에서 '미래 부분'만 잘라서 (B, Pnn, T, 4) 로 맞춘다.  
+            3) near_past_cur_future_valid 로 유효한 미래 타임스텝만 골라서,  
+               x_new = (1-β) * x_t + β * Π(x_t) 형태로 섞는다.  
+            4) cond-last 가 있는 에이전트는 마지막 프레임(T-1)은 보호한다(β=0).  
+        """
+        # β==0 이면 아무 것도 하지 않고 바로 반환
+        if feasible_blend_beta_scalar.detach().item() <= 0.0:
+            return xt_sequence
+
+        if not getattr(self.config, "use_feasible", False):
+            return xt_sequence
+
+        batch_size, predicted_neighbor_num, time_len, _ = xt_sequence.shape
+        future_len: int = int(self._future_len)
+
+        # FeasibleProjector 적분 결과 (미래 T 프레임) 가져오기
+        integrated_future = self._get_latest_feasible_integrated_trajectory_future(
+            batch_size=batch_size,
+            predicted_neighbor_num=predicted_neighbor_num,
+            future_len=future_len,
+            reference_tensor_for_device=xt_sequence,
+        )  # (B, Pnn, T, 4) 또는 None
+        if integrated_future is None:
+            return xt_sequence
+
+        # xt_sequence 에서 "미래" 부분만 (B, Pnn, T, 4) 형태로 뽑기
+        if self.config.use_current_input:
+            # xt_sequence: (B, Pnn, 1+T, 4)  -> 미래만 사용
+            if time_len != future_len + 1:
+                # time_len 이 다르면 안전하게 스킵
+                return xt_sequence
+            xt_future = xt_sequence[:, :, 1:, :]  # (B, Pnn, T, 4)
+        else:
+            # xt_sequence: (B, Pnn, T, 4) 가 바로 미래 궤적
+            if time_len != future_len:
+                return xt_sequence
+            xt_future = xt_sequence  # (B, Pnn, T, 4)
+
+        # near_past_cur_future_valid 에서 "현재+미래" 마스크만 추출
+        if near_past_cur_future_valid.shape[-1] < (future_len + 1):
+            return xt_sequence
+        near_cur_future_valid = near_past_cur_future_valid[:, :, -(
+            future_len + 1):]  # (B, Pnn, 1+T)
+        future_valid = near_cur_future_valid[:, :, 1:]  # (B, Pnn, T)
+
+        # 유효한 미래 타임스텝만 섞기 위해 마스크 생성
+        mix_mask = future_valid.unsqueeze(-1).to(  # (B, Pnn, T, 1)  
+            dtype=xt_future.dtype)
+
+        # cond-last 를 쓴 에이전트는 마지막 프레임(T-1)을 섞지 않도록 보호
+        if cond_last_mask is not None and cond_last_mask.any():
+            cond_last_mask_expanded = cond_last_mask.unsqueeze(-1).unsqueeze(
+                -1)  # (B, Pnn, 1, 1)
+            # 마지막 타임스텝에 대해서만 cond-last=True 인 곳은 0 으로 만든다.
+            mix_mask[:, :, -1:, :] = mix_mask[:, :, -1:, :] * (
+                (~cond_last_mask_expanded).to(mix_mask.dtype))
+
+        # β 를 (B, Pnn, T, 1) 로 브로드캐스트
+        beta_broadcast = feasible_blend_beta_scalar.view(1, 1, 1,
+                                                         1)  # (1,1,1,1)
+        beta_mask = beta_broadcast * mix_mask  # (B, Pnn, T, 1)
+
+        # 실제로 섞기: x_new = (1-β) * x_t + β * Π(x_t)
+        integrated_future = integrated_future.to(dtype=xt_future.dtype,
+                                                 device=xt_future.device)
+        new_future = (
+            1.0 - beta_mask
+        ) * xt_future + beta_mask * integrated_future  # (B, Pnn, T, 4)
+
+        # xt_sequence 에 다시 써 넣기
+        if self.config.use_current_input:
+            xt_sequence[:, :, 1:, :] = new_future
+        else:
+            xt_sequence[:, :, :, :] = new_future
+
+        return xt_sequence
+
     def forward(self, encoder_outputs, inputs):
         """
         Diffusion decoder process.
@@ -452,32 +704,60 @@ class Decoder(nn.Module):
                                              device=xT.device)
 
             def initial_state_constraint(xt, t, step):
-                if self.config.use_current_input:
-                    xt = xt.reshape(B, Pnn, 1 + self._future_len, 4)
-                    xt[:, :, 0, :] = near_current_xyyaw
-                else:
-                    xt = xt.reshape(B, Pnn, self._future_len, 4)
+                """DPM-Solver 중간 단계에서
+                - 현재 상태를 0번째 프레임에 강제로 고정하고
+                - (있다면) 마지막 프레임을 목표 위치로 덮어쓰고
+                - (저노이즈 구간에서는) FeasibleProjector 적분 궤적과 살짝 섞고
+                - 마지막으로 모든 프레임의 yaw(cos,sin)를 단위원에 다시 올려주는 함수.
+                """
+                # 1단계: xt 를 (B, Pnn, time_len, 4) 로 펴고 현재 상태 주입
+                # xt_sequence: (B, Pnn, 1+T, 4) 또는 (B, Pnn, T, 4)
+                xt_sequence = self._reshape_xt_with_current_state(
+                    xt=xt,
+                    batch_size=B,
+                    predicted_neighbor_num=Pnn,
+                    near_current_xyyaw=near_current_xyyaw,  # (B, Pnn, 4)
+                )
 
-                # cond-last injection (있을 때만)
-                if torch.isfinite(cond_last_pos_norm).any():
-                    cond_last_mask = torch.isfinite(cond_last_pos_norm).all(
-                        dim=-1)  # (B,Pnn)
-                    if cond_last_mask.any().item():
-                        last = xt[:, :, -1, :]  # (B,Pnn,4)
-                        src = _cast_like(cond_last_pos_norm, xt)
-                        last = torch.where(cond_last_mask.unsqueeze(-1), src,
-                                           last)
-                        xt[:, :, -1, :] = last
+                # 2단계: cond-last 정보가 있으면 마지막 프레임에 주입
+                # xt_sequence: (B, Pnn, time_len, 4)
+                xt_sequence = self._inject_last_position_condition_if_available(
+                    xt_sequence=xt_sequence,
+                    cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
+                )
 
-                # --- add: unit‑circle projection for future frames only ---
-                # yaw 단위원 투영 (미래 전 프레임)
-                yaw = xt[:, :, :, 2:4]  # (B, Pnn, T, 2)
-                norm = torch.linalg.norm(yaw, dim=-1, keepdim=True).clamp_min(
-                    1e-6)  # (B, Pnn, T, 1)
-                xt[:, :, :, 2:4] = yaw / norm  # (B, Pnn, T, 2)
-                # ---------------------------------------------------------
+                # 3단계: 저노이즈 구간에서만 FeasibleProjector 적분 궤적과 prox-snap 섞기
+                #   - t > t_threshold  : β(t) = 0  → 아무 것도 하지 않음
+                #   - t <= t_threshold : β(t) ∈ (0, β_max] 로 올라가며 점점 더 많이 섞음
+                if self.config.use_feasible_blend:
+                    assert self.config.use_feasible, \
+                        "use_feasible_blend 옵션은 use_feasible 이 켜져 있을 때만 동작합니다."
+                    feasible_blend_beta_scalar = self._compute_feasible_blend_beta(
+                        diffusion_time_step=t,  # shape: () or (1,)  
+                        reference_tensor_for_device=
+                        xt_sequence,  # (B, Pnn, time_len, 4)  
+                    )
 
-                return xt.reshape(B, Pnn, -1)
+                    if feasible_blend_beta_scalar.detach().item() > 0.0:
+                        xt_sequence = self._apply_feasible_blend_with_feasible_projection(
+                            xt_sequence=xt_sequence,  # (B, Pnn, time_len, 4)  
+                            near_current_xyyaw=
+                            near_current_xyyaw,  # (B, Pnn, 4)  
+                            near_past_cur_future_valid=
+                            near_past_cur_future_valid,  # (B, Pnn, time_len_total) bool  
+                            cond_last_mask=cond_last_mask,  # (B, Pnn) bool  
+                            feasible_blend_beta_scalar=
+                            feasible_blend_beta_scalar,  # ()  
+                        )
+
+                # 4단계: yaw(cos,sin)를 단위원에 다시 투영
+                #   - prox-snap 으로 섞은 뒤에 한 번 더 정규화해 준다.
+                # xt_sequence: (B, Pnn, time_len, 4)
+                xt_sequence = self._project_future_yaw_to_unit_circle(
+                    xt_sequence=xt_sequence,)
+
+                # 마지막에 다시 (B, Pnn, flattened_dim) 으로 압축
+                return xt_sequence.reshape(B, Pnn, -1)
 
             x0 = dpm_sampler(
                 self.dit,
@@ -525,7 +805,8 @@ class Decoder(nn.Module):
                         },
                         "inputs": inputs,
                         "observation_normalizer": self._observation_normalizer,
-                        "state_normalizer": self._state_normalizer
+                        "state_normalizer": self._state_normalizer,
+                        "config": self.config,
                     },
                     "guidance_scale":
                         0.5,
@@ -558,90 +839,6 @@ class Decoder(nn.Module):
                     "integrated_trajectory"] = unnorm_integrated_trajectory  # (B, Pnn, (1 + T) , 4)
             return_["score"] = unnorm_x0  # (B, Pnn, (1 + T) , 4)
             return return_
-
-
-class RouteEncoder(nn.Module):
-
-    def __init__(self,
-                 route_num,
-                 lane_len,
-                 drop_path_rate=0.3,
-                 hidden_dim=192,
-                 tokens_mlp_dim=32,
-                 channels_mlp_dim=64):
-        super().__init__()
-
-        self._channel = channels_mlp_dim
-
-        self.channel_pre_project = Mlp(in_features=4,
-                                       hidden_features=channels_mlp_dim,
-                                       out_features=channels_mlp_dim,
-                                       act_layer=nn.GELU,
-                                       drop=0.)
-        self.token_pre_project = Mlp(in_features=route_num * lane_len,
-                                     hidden_features=tokens_mlp_dim,
-                                     out_features=tokens_mlp_dim,
-                                     act_layer=nn.GELU,
-                                     drop=0.)
-
-        self.Mixer = MixerBlock(tokens_mlp_dim, channels_mlp_dim,
-                                drop_path_rate)
-
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-        self.emb_project = Mlp(in_features=channels_mlp_dim,
-                               hidden_features=hidden_dim,
-                               out_features=hidden_dim,
-                               act_layer=nn.GELU,
-                               drop=drop_path_rate)
-
-    def forward(self, x):
-        '''
-        x: B, P, V, D # (B, P=25, V=20, D=12)
-        '''
-        # only x and x->x' vector, no boundary, no speed limit, no traffic light
-        x = x[..., :4]  # (B, P, V, 4)
-
-        B, P, V, _ = x.shape
-        """
-        mask_v: (B, P, V) -> True if all 4 values are 0 # (점이 없는 경우)
-        mask_p: (B, P) -> True if all V values are 0 # (차선이 없는 경우)
-        mask_b: (B) -> True if all P values are 0 # (route lanes가 없는 경우)
-        """
-        mask_v = torch.sum(torch.ne(x[..., :4], 0), dim=-1).to(x.device) == 0
-        mask_p = torch.sum(~mask_v, dim=-1) == 0
-        mask_b = torch.sum(~mask_p, dim=-1) == 0
-        x = x.view(B, P * V, -1)  # (B, P * V, 4)
-
-        valid_indices = ~mask_b.view(-1)  # (B)
-        x = x[valid_indices]  # (B`, P * V, 4)
-        """
-        token
-            - P (route lane 차선 수) * V(차선 당 점의 수) = 25 * 20 = 500 
-            - channel_pre_project: -> (B`, P * V, C) where C is channels_mlp_dim
-        channel
-            - 4 (x, y, dx, dy)
-            - token_pre_project: -> (B`, C, T) where T is tokens_mlp_dim
-        """
-        x = self.channel_pre_project(
-            x)  # (B`, P * V, C) where C is channels_mlp_dim
-        x = x.permute(0, 2, 1)  # (B`, C, P=25 * V=20)
-        x = self.token_pre_project(x)  # (B`, C, T) where T is tokens_mlp_dim
-        x = x.permute(0, 2, 1)  # (B`, T, C) # (8, 32, 64)
-        x = self.Mixer(x)
-        # x.shape: (B`, T, C) # (8, 32, 64)
-
-        x = x.float().mean(dim=1).to(x.dtype)
-        # x.shape: (B`, C) # (8, 64)
-
-        x = self.emb_project(self.norm(x))
-        # x.shape: (B`, D=192)
-
-        # ★ FIX: 결과 버퍼를 x(dtype/device)에 맞춰 생성
-        x_result = torch.zeros((B, x.shape[-1]), device=x.device, dtype=x.dtype)
-        x_result[valid_indices] = x  # dtype 충돌 없이 안전
-        return_ = x_result.view(B, -1)
-        # return_.shape: (B, D=192)
-        return return_
 
 
 from dataclasses import dataclass, asdict
@@ -978,7 +1175,7 @@ class DiT(nn.Module):
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
 
-    # 추가: stride 기반 down/up 샘플링을 통합한 새 파이프라인
+    # : stride 기반 down/up 샘플링을 통합한 새 파이프라인
     def _feasible_projection_core(
             self,
             diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
@@ -1126,11 +1323,11 @@ class DiT(nn.Module):
             # (B, Pnn, future_len, 3)
             unnorm_fut_seg_body_control = self.feasible_projector.upsample_future_controls_from_stride(
                 unnorm_seg_body_control_stride=
-                unnorm_seg_body_control_stride_ref, # (B, Pnn, segment_len_ds, 3)
-                past_len_ds=past_len_ds, # int
-                future_len_ds=future_len_ds, # int
-                future_len_full=future_len, # int
-                stride_step=stride_step, # int
+                unnorm_seg_body_control_stride_ref,  # (B, Pnn, segment_len_ds, 3)
+                past_len_ds=past_len_ds,  # int
+                future_len_ds=future_len_ds,  # int
+                future_len_full=future_len,  # int
+                stride_step=stride_step,  # int
             )
             # --- (5) 제약 기반 필터 + 적분 ---
             near_cur_future_valid = near_past_cur_future_valid[:, :, -(

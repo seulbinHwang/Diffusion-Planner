@@ -2,13 +2,13 @@ from copy import copy, deepcopy
 import torch
 
 from diffusion_planner.utils.train_utils import openjson
-from pathlib import Path  # 추가
-try:  # 추가
-    from hydra.utils import to_absolute_path  # 추가
-except Exception:  # 추가
+from pathlib import Path
+try:
+    from hydra.utils import to_absolute_path
+except Exception:
 
-    def to_absolute_path(path: str) -> str:  # 추가
-        return str(Path(path).expanduser().resolve())  # 추가
+    def to_absolute_path(path: str) -> str:
+        return str(Path(path).expanduser().resolve())
 
 
 class StateNormalizer:
@@ -32,8 +32,8 @@ class StateNormalizer:
     def from_json2(cls, args_dict):
         # args_dict["normalization_file_path"]: "normalization.json"
         path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")  # 추가
-        data = openjson(to_absolute_path(path_str))  # 추가
+                                 "normalization.json")
+        data = openjson(to_absolute_path(path_str))
         mean = [[data["neighbor"]["mean"]]
                ] * args_dict["predicted_neighbor_num"]
         std = [[data["neighbor"]["std"]]] * args_dict["predicted_neighbor_num"]
@@ -88,8 +88,8 @@ class ObservationNormalizer:
     @classmethod
     def from_json2(cls, args_dict):
         path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")  # 추가
-        data = openjson(to_absolute_path(path_str))  # 추가
+                                 "normalization.json")
+        data = openjson(to_absolute_path(path_str))
 
         ndt = {}
         for k, v in data.items():

@@ -1223,7 +1223,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         # (T, 4) # 길이: Pnn 중, 실제로 궤적 생성한 대상들만.
         diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
-        # 추가
+
         diff_token_to_np_int_traj_wrt_ego: Dict[str, np.ndarray] = {}
         diff_token_to_np_int_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
 
@@ -1257,7 +1257,7 @@ class WorldModelLogReplay(AbstractMLAgents):
                 1:, :]  # (T, 4)
             diff_token_to_np_gen_traj_11_wrt_ego[
                 token] = np_gen_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
-            # 추가
+
             diff_token_to_np_int_traj_wrt_ego[
                 token] = future_np_int_traj_wrt_ego[1:, :]  # (T, 4)
             diff_token_to_np_int_traj_11_wrt_ego[
@@ -1265,7 +1265,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             self._diffusion_agents[token] = self._agents[token]
         ### 디버깅용 ###
         self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego  # (1+T, 11)  # TODO: 속도는 잘못된 값이 들어가 있음.
-        # 추가
+
         self._draw_infos.diff_token_to_np_int_traj_11_wrt_ego = diff_token_to_np_int_traj_11_wrt_ego  # (1+T, 11) TODO: 속도는 잘못된 값이 들어가 있음.
 
         diffusion_tokens_dist_order, _ = self._compute_sorted_distances(

@@ -203,10 +203,10 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         return target_agents_mask
 
     def get_features_from_scenario(
-            self, scenario: "AbstractScenario") -> WorldModelFeature:  # 추가
-        """시뮬레이션 전용 빌더입니다. 학습/오프라인 전처리 경로에서 호출되면 에러를 냅니다."""  # 추가
-        raise NotImplementedError(  # 추가
+            self, scenario: "AbstractScenario") -> WorldModelFeature:
+        """시뮬레이션 전용 빌더입니다. 학습/오프라인 전처리 경로에서 호출되면 에러를 냅니다."""
+        raise NotImplementedError(
             "[WorldModelFeatureBuilder] get_features_from_scenario is not implemented. "
             "This builder is intended for simulation-only. "
             "If you need scenario-based preprocessing, implement this method to "
-            "extract features directly from the scenario.")  # 추가
+            "extract features directly from the scenario.")
