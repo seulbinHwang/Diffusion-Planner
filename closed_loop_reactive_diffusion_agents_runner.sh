@@ -28,6 +28,8 @@ CUSTOM_ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base_custom
 # get_args()에 넘길 CLI를 정의 (실행 시점에 바꾸고 싶은 값들)
 # ※ normalizer 경로는 존재하는 실제 파일로! (절대경로 권장)
 ARGS_FOR_GET_ARGS=(
+  --use_feasible_dl false
+  --use_feasible_filter false
   --use_integration_trajectory true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )

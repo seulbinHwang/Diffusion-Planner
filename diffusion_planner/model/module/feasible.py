@@ -17,6 +17,9 @@ Number = Union[float, int]
 ArrayLike = Union[np.ndarray, List[Number], Tuple[Number, ...]]
 import torch
 from torch import Tensor
+
+torch.set_printoptions(sci_mode=False, precision=6)
+
 from typing import Tuple
 # feasible.py 최상단 import 근처
 from collections import OrderedDict
@@ -200,7 +203,7 @@ class FeasibleProjector(nn.Module):
                     omega_max_abs_radps=0.9,
                 ),
         }
-
+        self.do_print = False
         # ------------------------------
         # 아키텍처 하이퍼파라미터(고정 폭)
         # ------------------------------
@@ -1452,7 +1455,19 @@ class FeasibleProjector(nn.Module):
             sin_mid=sin_mid,  # (B, Pnn, segment_len)
             seg_valid=seg_valid,  # (B, Pnn, segment_len)
         )  # (B, Pnn, segment_len, 3)
-
+        if self.do_print:
+            unnorm_seg_body_control_deg_yaw = torch.rad2deg(
+                unnorm_seg_body_control[..., 2]).unsqueeze(-1)
+            unnorm_seg_body_control_new = torch.cat(
+                [unnorm_seg_body_control[..., :2], unnorm_seg_body_control_deg_yaw],
+                dim=-1,
+            )  # (B, Pnn, segment_len, 3)  [v_x^b, v_y^b, w(deg)]
+            unnorm_seg_body_control_new = torch.round(
+                unnorm_seg_body_control_new * 10) / 10
+            print("unnorm_seg_body_control_new.shape:",
+                  unnorm_seg_body_control_new[:, 14, :, :].shape)
+            print("unnorm_seg_body_control_new[14]:",
+                  unnorm_seg_body_control_new[:, 14, :, :])
         return unnorm_seg_body_control
 
     # <추가하자>
@@ -2475,6 +2490,48 @@ class FeasibleProjector(nn.Module):
             * False: 기존 step-by-step + S2 버전 사용
             * True : 시간축 완전 배치 + S2 미사용 버전 사용
         """
+        if self.do_print:
+            target_idx = 14
+
+            unnorm_near_current_yaw = torch.atan2(
+                unnorm_near_current_state[:, :, 3],
+                unnorm_near_current_state[:, :, 2],
+            )
+            unnorm_near_current_deg_yaw = torch.rad2deg(
+                unnorm_near_current_yaw).unsqueeze(-1)
+            unnorm_near_current_xy = unnorm_near_current_state[:, :, :2]
+            unnorm_near_current_state_new = torch.cat(
+                [
+                    unnorm_near_current_xy,
+                    unnorm_near_current_deg_yaw,
+                ],
+                dim=-1,
+            )
+            unnorm_near_current_state_new = torch.round(
+                unnorm_near_current_state_new * 10) / 10
+
+            print("unnorm_near_current_state_new:",
+                  unnorm_near_current_state_new[:, target_idx].shape)
+            print("unnorm_near_current_state_new:",
+                  unnorm_near_current_state_new[:, target_idx])
+
+            unnorm_cur_future_seg_body_control_deg_yaw = torch.rad2deg(
+                unnorm_cur_future_seg_body_control[:, :, :, 2]).unsqueeze(-1)
+            unnorm_cur_future_seg_body_control_xy = unnorm_cur_future_seg_body_control[:, :, :, :
+                                                                                       2]
+            unnorm_cur_future_seg_body_control_new = torch.cat(
+                [
+                    unnorm_cur_future_seg_body_control_xy,
+                    unnorm_cur_future_seg_body_control_deg_yaw,
+                ],
+                dim=-1,
+            )
+            unnorm_cur_future_seg_body_control_new = torch.round(
+                unnorm_cur_future_seg_body_control_new * 10) / 10
+            print("unnorm_cur_future_seg_body_control_new.shape:",
+                  unnorm_cur_future_seg_body_control_new[:, target_idx, :, :].shape)
+            print("unnorm_cur_future_seg_body_control_new:",
+                  unnorm_cur_future_seg_body_control_new[:, target_idx, :, :])
         self._assert_cur_future_valid_mask(
             near_cur_future_valid,
             context="filter_and_integrate",
@@ -2489,15 +2546,40 @@ class FeasibleProjector(nn.Module):
                 unnorm_cur_future_seg_body_control,
                 near_class_one_hot=near_class_one_hot,
             )
-
+        if self.do_print:
+            print("near_cur_future_valid:",
+                  near_cur_future_valid[:, target_idx, :].shape)
+            print("near_cur_future_valid:", near_cur_future_valid[:, target_idx, :])
         # 추가하자: 시간축 완전 배치 버전 (S2 미사용)
-        return self._filter_and_integrate_batch(
+        unnorm_integrated_trajectory, unnorm_control_constraint_diff = self._filter_and_integrate_batch(
             unnorm_near_current_state=unnorm_near_current_state,
             near_cur_future_valid=near_cur_future_valid,
             unnorm_cur_future_seg_body_control=
             unnorm_cur_future_seg_body_control,
             near_class_one_hot=near_class_one_hot,
         )
+        if self.do_print:
+            unnorm_integrated_trajectory_deg_yaw = torch.rad2deg(
+                torch.atan2(
+                    unnorm_integrated_trajectory[:, :, :, 3],
+                    unnorm_integrated_trajectory[:, :, :, 2],
+                )).unsqueeze(-1)
+            unnorm_integrated_trajectory_xy = unnorm_integrated_trajectory[:, :, :, :
+                                                                           2]
+            unnorm_integrated_trajectory_new = torch.cat(
+                [
+                    unnorm_integrated_trajectory_xy,
+                    unnorm_integrated_trajectory_deg_yaw,
+                ],
+                dim=-1,
+            )
+            unnorm_integrated_trajectory_new = torch.round(
+                unnorm_integrated_trajectory_new * 10) / 10
+            print("unnorm_integrated_trajectory_new:",
+                  unnorm_integrated_trajectory_new[:, target_idx, :, :].shape)
+            print("unnorm_integrated_trajectory_new:",
+                  unnorm_integrated_trajectory_new[:, target_idx, :, :])
+        return unnorm_integrated_trajectory, unnorm_control_constraint_diff
 
     # ----------------------------
     # [NEW PATH] 시간축 완전 배치 버전 (S2 미사용)
@@ -2693,6 +2775,25 @@ class FeasibleProjector(nn.Module):
             # (B,Pnn,past_len+1+future_len) bool
         )
         unnorm_points_xyyaw = point_len_inputs.unnorm_points_xyyaw  # (B,Pnn,point_len,4)
+        if self.do_print:
+            unnorm_points_deg_yaw = torch.rad2deg(
+                torch.atan2(
+                    unnorm_points_xyyaw[:, :, :, 3],
+                    unnorm_points_xyyaw[:, :, :, 2],
+                )).unsqueeze(-1)
+            unnorm_points_xy = unnorm_points_xyyaw[:, :, :, :2]
+            unnorm_points_xyyaw_new = torch.cat(
+                [
+                    unnorm_points_xy,
+                    unnorm_points_deg_yaw,
+                ],
+                dim=-1,
+            )
+            unnorm_points_xyyaw_new = torch.round(unnorm_points_xyyaw_new * 10) / 10
+            print("unnorm_points_xyyaw_new.shape:",
+                  unnorm_points_xyyaw_new[:, 14, :, :].shape)
+            print("unnorm_points_xyyaw_new:", unnorm_points_xyyaw_new[:, 14, :, :])
+
         points_valid = point_len_inputs.points_valid  # (B,Pnn,point_len) bool
         B, Pnn, point_len, _ = unnorm_points_xyyaw.shape
 
@@ -2727,6 +2828,24 @@ class FeasibleProjector(nn.Module):
         unnorm_points_world_control = self._mask_and_stack_world_controls(
             v_x=v_x, v_y=v_y, yaw_rate=yaw_rate,
             points_valid=points_valid)  # (B,Pnn,point_len,3)
+        if self.do_print:
+            unnorm_points_world_control_deg_yaw = torch.rad2deg(
+                unnorm_points_world_control[:, :, :, 2:3])
+            unnorm_points_world_control_xy = unnorm_points_world_control[:, :, :, :
+                                                                         2]
+            unnorm_points_world_control_new = torch.cat(
+                [
+                    unnorm_points_world_control_xy,
+                    unnorm_points_world_control_deg_yaw,
+                ],
+                dim=-1,
+            )
+            unnorm_points_world_control_new = torch.round(
+                unnorm_points_world_control_new * 10) / 10
+            print("unnorm_points_world_control_new.shape:",
+                  unnorm_points_world_control_new[:, 14, :, :].shape)
+            print("unnorm_points_world_control_new:",
+                  unnorm_points_world_control_new[:, 14, :, :])
         return unnorm_points_world_control
 
     def _compute_yaw_rate_via_sg(
@@ -3403,45 +3522,86 @@ class FeasibleProjector(nn.Module):
     def _savgol_finite_difference_multi(
         self,
         sequence_multi_channel: torch.Tensor,  # (N, T, C)
+        valid_mask_bT: torch.Tensor,  # (N, T) bool
         dt: float,
     ) -> torch.Tensor:
-        """여러 값이 한 줄에 모여 있을 때, 가장 단순한 방식으로 시간 변화량을 구하는 함수.
+        """여러 값이 한 줄에 모여 있을 때, mask 를 고려해서
+        가장 단순한 방식으로 시간 변화량을 구하는 함수.
 
-        - 시간축을 따라 앞뒤 값의 차이를 이용해서 "대략적인 속도"를 계산한다.
-        - 창 기반 보간(SG)을 적용하기 전에 기본값(폴백)으로 먼저 만들어 둔다.
-          나중에 SG가 더 좋은 값을 구할 수 있는 위치에서만 이 값을 덮어쓴다.
-
-        Args:
-            sequence_multi_channel: (N, T, C)
-                N개의 row(예: B*Pnn)에 대해, 길이 T인 시퀀스가 C개 채널로 모여 있는 텐서.
-            dt: float
-                샘플 간 시간 간격(초). 예: 0.1
-
-        Returns:
-            torch.Tensor: (N, T, C)
-                각 채널에 대해 유한 차분으로 계산한 시간 미분값.
+        - 중심 시점이 invalid 이면 항상 0.
+        - 중심이 valid 인 경우에만 이웃을 보고,
+          - 양옆 모두 valid → 중앙 차분
+          - 한쪽만 valid → 해당 방향 전/후방 차분
+          - 양옆 모두 invalid → 0
         """
         num_rows, sequence_length, num_channels = sequence_multi_channel.shape  # (N, T, C)
-
         derivative_fd = torch.zeros_like(sequence_multi_channel)  # (N, T, C)
 
-        if sequence_length >= 3:
-            # 가운데 구간: 중앙 차분
-            derivative_fd[:, 1:-1, :] = (sequence_multi_channel[:, 2:, :] -
-                                         sequence_multi_channel[:, :-2, :]) / (
-                                             2.0 * dt)
-            # 맨 앞/뒤: 전방/후방 차분
-            derivative_fd[:, 0, :] = (sequence_multi_channel[:, 1, :] -
-                                      sequence_multi_channel[:, 0, :]) / dt
-            derivative_fd[:, -1, :] = (sequence_multi_channel[:, -1, :] -
-                                       sequence_multi_channel[:, -2, :]) / dt
-        elif sequence_length == 2:
-            # 길이가 2일 때는 두 점의 차이를 그대로 양 끝에 복사
-            derivative_fd[:, :, :] = (sequence_multi_channel[:, 1:2, :] -
-                                      sequence_multi_channel[:, 0:1, :]) / dt
-        else:
-            # 길이가 1 이하이면 변화량이 없다고 보고 0 유지
-            derivative_fd.zero_()
+        if sequence_length <= 1:
+            # 길이 0~1이면 변화량을 정의하기 애매하므로 그냥 0 유지
+            return derivative_fd
+
+        valid = valid_mask_bT.to(torch.bool)  # (N, T)
+
+        # --- 길이 2인 특수 케이스 ---
+        if sequence_length == 2:
+            center_pair_valid = (valid[:, 0] & valid[:, 1]).unsqueeze(
+                -1)  # (N,1)
+            diff = (sequence_multi_channel[:, 1, :] -
+                    sequence_multi_channel[:, 0, :]) / dt  # (N, C)
+            diff = diff * center_pair_valid  # invalid 포함되면 0
+            derivative_fd[:, 0, :] = diff
+            derivative_fd[:, 1, :] = diff
+            return derivative_fd
+
+        # --- 길이 >= 3인 일반 케이스 ---
+
+        # 1) 맨 앞(t=0): 앞은 없고, 오른쪽(t=1)만 본다.
+        center0 = valid[:, 0]
+        right0 = valid[:, 1]
+        edge0_valid = (center0 & right0).unsqueeze(-1)  # (N,1)
+        diff0 = (sequence_multi_channel[:, 1, :] -
+                 sequence_multi_channel[:, 0, :]) / dt  # (N,C)
+        derivative_fd[:, 0, :] = diff0 * edge0_valid
+
+        # 2) 맨 뒤(t=T-1): 오른쪽은 없고, 왼쪽(t=T-2)만 본다.
+        centerL = valid[:, sequence_length - 1]
+        leftL = valid[:, sequence_length - 2]
+        edgeL_valid = (centerL & leftL).unsqueeze(-1)  # (N,1)
+        diffL = (
+            sequence_multi_channel[:, sequence_length - 1, :] -
+            sequence_multi_channel[:, sequence_length - 2, :]) / dt  # (N,C)
+        derivative_fd[:, sequence_length - 1, :] = diffL * edgeL_valid
+
+        # 3) 내부 구간(t=1..T-2): 중앙/전방/후방 차분 조합
+        center = valid[:, 1:-1]  # (N, T-2)
+        left = valid[:, :-2]  # (N, T-2)
+        right = valid[:, 2:]  # (N, T-2)
+
+        both = center & left & right
+        only_left = center & left & (~right)
+        only_right = center & (~left) & right
+        # center 가 False 인 곳은 위 셋 다 False → derivative 0 유지
+
+        both_f = both.unsqueeze(-1).to(
+            sequence_multi_channel.dtype)  # (N,T-2,1)
+        only_left_f = only_left.unsqueeze(-1).to(sequence_multi_channel.dtype)
+        only_right_f = only_right.unsqueeze(-1).to(sequence_multi_channel.dtype)
+
+        # 중앙 차분: (t+1 - t-1) / (2dt)
+        central_diff = (sequence_multi_channel[:, 2:, :] -
+                        sequence_multi_channel[:, :-2, :]) / (2.0 * dt
+                                                             )  # (N,T-2,C)
+        # 후방 차분: (t - t-1) / dt
+        backward_diff = (sequence_multi_channel[:, 1:-1, :] -
+                         sequence_multi_channel[:, :-2, :]) / dt  # (N,T-2,C)
+        # 전방 차분: (t+1 - t) / dt
+        forward_diff = (sequence_multi_channel[:, 2:, :] -
+                        sequence_multi_channel[:, 1:-1, :]) / dt  # (N,T-2,C)
+
+        derivative_fd[:, 1:-1, :] = (both_f * central_diff +
+                                     only_left_f * backward_diff +
+                                     only_right_f * forward_diff)
 
         return derivative_fd  # (N, T, C)
 
@@ -3576,20 +3736,17 @@ class FeasibleProjector(nn.Module):
         P_plus_one = power_per_k.shape[-1]
 
         # (1) 시퀀스를 창 단위로 펼치기
-        #     (N, T, C) → (N*C, T) → pad+unfold → (N, T, W, C)
-        sequence_flat = sequence_multi_channel.reshape(
-            num_rows * num_channels, sequence_length)  # (N*C, T)
-        sequence_padded = F.pad(
-            sequence_flat,
-            (half_window, half_window),
-            mode="constant",
-            value=0.0,
-        )  # (N*C, T + 2*half_window)
-        sequence_window_flat = sequence_padded.unfold(
-            dimension=-1,
-            size=window_length,
-            step=1,
-        )  # (N*C, T, W)
+        sequence_flat = sequence_multi_channel.permute(0, 2, 1).contiguous()
+        sequence_flat = sequence_flat.reshape(num_rows * num_channels,
+                                              sequence_length)  # (N*C, T)
+
+        sequence_padded = F.pad(sequence_flat, (half_window, half_window),
+                                mode="constant",
+                                value=0.0)
+        sequence_window_flat = sequence_padded.unfold(dimension=-1,
+                                                      size=window_length,
+                                                      step=1)  # (N*C, T, W)
+
         sequence_window = sequence_window_flat.view(
             num_rows, num_channels, sequence_length,
             window_length).permute(0, 2, 3, 1)  # (N, T, W, C)
@@ -3643,14 +3800,18 @@ class FeasibleProjector(nn.Module):
         num_rows, sequence_length, dim_p1, _ = A_all.shape  # (N, T, P+1, P+1)
         _, _, num_channels, _ = b_all.shape  # (N, T, C, P+1)
 
-        min_samples = int(polyorder) + 1
+        min_samples = int(polyorder) + 2
 
         # 기본값은 유한 차분으로 깔아두고, 좋은 위치만 SG로 덮어쓰기
         derivative_out = fd_derivative.clone()  # (N, T, C)
 
         # SG를 적용할 수 있는 위치(데이터가 충분하고, 중심이 유효한 곳)
         good_mask = (valid_count >= min_samples) & valid_center_mask  # (N, T)
-
+        # [추가] 맨 앞/맨 뒤 몇 개 시점은 SG를 아예 쓰지 않음 (FD/0만 사용)
+        edge_margin: int = 2  # 필요하면 2로 늘려도 됨
+        if sequence_length > 2 * edge_margin:
+            good_mask[:, :edge_margin] = False
+            good_mask[:, -edge_margin:] = False
         if not good_mask.any():
             # SG로 풀 곳이 하나도 없으면, 유한 차분 + 중심 마스크만 적용하고 반환
             derivative_out = torch.where(
@@ -3744,7 +3905,8 @@ class FeasibleProjector(nn.Module):
 
         # 0) 유한 차분 기본값
         fd_derivative = self._savgol_finite_difference_multi(
-            sequence_multi_channel=seq_bTC,
+            sequence_multi_channel=seq_bTC,  # (N,T,C)
+            valid_mask_bT=valid_bT,  # (N,T) bool
             dt=dt,
         )  # (N, T, C)
 
