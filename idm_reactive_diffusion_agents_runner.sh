@@ -59,38 +59,37 @@ CHALLENGE="closed_loop_reactive_diffusion_agents" # e.g., "closed_loop_reactive_
 # nuplan/planning/script/experiments/simulation/closed_loop_reactive_agents.yaml
 
 BRANCH_NAME=CHALLENGE
-ARGS_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
-PLANNER_CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/model.pth
-CKPT_FILE=/home/user/PycharmProjects/Diffusion-Planner/checkpoints/npc_model.pth
+
 
 if [ "$SPLIT" == "val14" ]; then
     SCENARIO_BUILDER="nuplan"
 else
     SCENARIO_BUILDER="nuplan_challenge"
 fi
+SPLIT="val14_mini"  # e.g., "val14"
 echo "Processing $CKPT_FILE..."
-FILENAME=$(basename "$CKPT_FILE") # FILENAME: model.pth
-FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: model
+FILENAME=$(basename "$CKPT_FILE") # FILENAME: npc_model.pth
+FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: npc_model
+
 # $ARGS_FILE /home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
-python nuplan_extent/planning/script/run_simulation.py \
+
+stdbuf -oL -eL python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \
-    planner=$PLANNER \
-    +callback=simulation_feature_video_callback \
-    planner.diffusion_planner.config.args_file=$ARGS_FILE \
-    planner.diffusion_planner.ckpt_path=$PLANNER_CKPT_FILE \
     observation.model_config.config.args_file=$ARGS_FILE \
+    +callback=simulation_feature_video_callback \
     observation.model_config.ckpt_path=$CKPT_FILE \
     observation.model_config.feature_builders.0.config.args_file=$ARGS_FILE \
     observation.checkpoint_path=$CKPT_FILE \
     scenario_builder=$SCENARIO_BUILDER \
     scenario_filter=$SPLIT \
-    experiment_uid=$PLANNER/$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
+    experiment_uid=$SPLIT/$BRANCH_NAME/${FILENAME_WITHOUT_EXTENSION}_$(date "+%Y-%m-%d-%H-%M-%S") \
     verbose=true \
-    worker=ray_distributed \
-    worker.threads_per_node=128 \
+    worker=sequential \
     distributed_mode='SINGLE_NODE' \
-    number_of_gpus_allocated_per_simulation=0.15 \
+    number_of_gpus_allocated_per_simulation=1. \
     enable_simulation_progress_bar=true \
-    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments.simulation, pkg://nuplan_extent.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://diffusion_planner.config, pkg://nuplan.planning.script.config.common, pkg://nuplan.planning.script.experiments  ]"
+    hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan_extent.planning.script.config.common, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://nuplan.planning.script.config.common , pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments ]"
+
+#    worker.threads_per_node=128 \

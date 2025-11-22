@@ -48,11 +48,13 @@ def feasible_guidance_fn(
         config,
     )
 
-    # 아직 너무 이른 단계라서 가이던스를 완전히 끄는 경우
     if torch.all(guidance_strength == 0):
-        batch_size: int = x_dit.shape[0]
-        return torch.zeros(batch_size, device=x_dit.device,
-                           dtype=x_dit.dtype)  # (B,)
+        y = x_dit.sum(dim=(1, 2, 3)) * 0.0
+        # 디버그용 (문제 없으면 나중에 지워도 됨)
+        assert y.requires_grad, \
+            "feasible_guidance_fn 출력이 x_dit에 대한 gradient를 가지지 않습니다."
+        # x_dit에 의존하는 0 텐서 (B,)
+        return y
 
     # projection 비용 / 제약 위반 비용에 쓸 유효 시간 마스크 만들기
 
@@ -98,6 +100,10 @@ def feasible_guidance_fn(
 
     # DPM 쪽에서는 '로그 확률'처럼 쓰기 때문에, 비용의 부호를 반대로 돌려서 넘겨준다.
     log_probability_like = -total_feasible_cost  # (B,)
+
+    # 디버그용 (문제 없으면 나중에 지워도 됨)
+    assert log_probability_like.requires_grad, \
+        "feasible_guidance_fn 출력이 x_dit에 대한 gradient를 가지지 않습니다."
 
     return log_probability_like
 

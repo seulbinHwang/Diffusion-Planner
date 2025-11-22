@@ -7,7 +7,7 @@ from diffusion_planner.model.guidance.guidance_wrapper import GuidanceWrapper
 
 class Config:
 
-    def __init__(self, args_file):
+    def __init__(self, args_file, guidance_fn=None):
         with open(args_file, 'r') as f:
             args_dict = json.load(f)
 

@@ -321,11 +321,17 @@ def model_wrapper(
         """
         Compute the gradient of the classifier, i.e. nabla_{x} log p_t(cond | x_t).
         """
-        with torch.enable_grad():
-            x_in = x.detach().requires_grad_(True)
-            log_prob = classifier_fn(x_in, t_input, condition,
-                                     **classifier_kwargs)
-            return torch.autograd.grad(log_prob.sum(), x_in)[0]
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                # x_in = x.detach().requires_grad_(True)
+                x_in = x.clone().detach().requires_grad_(True)
+
+                assert x_in.requires_grad, \
+                    " cond_grad_fn 출력이 x에 대한 gradient를 가지지 않습니다."
+                # x_dit에 의존하는 0 텐서 (B,)
+                log_prob = classifier_fn(x_in, t_input, condition,
+                                         **classifier_kwargs)
+                return torch.autograd.grad(log_prob.sum(), x_in)[0]
 
     def model_fn(x, t_continuous):
         """

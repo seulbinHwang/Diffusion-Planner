@@ -137,7 +137,7 @@ class FeasibleProjector(nn.Module):
     def __init__(self,
                  config,
                  hidden_dim: int,
-                 use_feasible_train: bool = True,
+                 use_feasible_dl: bool = True,
                  use_feasible_filter: bool = True):
         """Control Correction Network 본체 모듈 정의.
 
@@ -147,7 +147,7 @@ class FeasibleProjector(nn.Module):
         """
         super().__init__()
         self.config = config
-        self.use_feasible_train = use_feasible_train
+        self.use_feasible_dl = use_feasible_dl
         self.use_feasible_filter = use_feasible_filter
         # --- [NEW] Savitzky–Golay 커널 캐시(LRU) ---
         # key: (W, polyorder, deriv_order, dt, dtype, device)
@@ -171,7 +171,7 @@ class FeasibleProjector(nn.Module):
         self.constraints: Dict[ActorClass, DynamicLimits] = {
             ActorClass.PEDESTRIAN:
                 DynamicLimits(
-                    v_max_mps=8.0,
+                    v_max_mps=2.0,
                     v_max_kmph=28.8,
                     a_max_mps2=6.0,
                     alpha_max_radps2=8.0,
@@ -217,93 +217,92 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # Encoders (시간축 보존, 채널만 변환)
         # ------------------------------
-        if self.use_feasible_train:
-            # 상태 인코더(현재 노드 X_prev: (x,y,cos,sin))
-            self.state_prev_encoder = nn.Sequential(
-                nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
-                nn.Linear(4, self._Dx),  #: #4 → 16
-                nn.GELU(),
-                nn.Linear(self._Dx, self._Dx),  #: 16 → 16 (= self._Dx)
-            )
-            self.state_fut_encoder = nn.Sequential(
-                nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
-                nn.Linear(4, self._Dx),  #: 4 → 16
-                nn.GELU(),
-                nn.Linear(self._Dx, self._Dx),  # : 16 → 16 (= self._Dx)
-            )
-            self.control_adapter = nn.Sequential(
-                nn.LayerNorm(3),  # (B,Pnn,segment_len,3)
-                nn.Linear(3, self._Du),  # : 3 → 8 (= self._Du)
-                nn.GELU(),
-            )
+        # if self.use_feasible_dl:
+        # 상태 인코더(현재 노드 X_prev: (x,y,cos,sin))
+        self.state_prev_encoder = nn.Sequential(
+            nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
+            nn.Linear(4, self._Dx),  #: #4 → 16
+            nn.GELU(),
+            nn.Linear(self._Dx, self._Dx),  #: 16 → 16 (= self._Dx)
+        )
+        self.state_fut_encoder = nn.Sequential(
+            nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
+            nn.Linear(4, self._Dx),  #: 4 → 16
+            nn.GELU(),
+            nn.Linear(self._Dx, self._Dx),  # : 16 → 16 (= self._Dx)
+        )
+        self.control_adapter = nn.Sequential(
+            nn.LayerNorm(3),  # (B,Pnn,segment_len,3)
+            nn.Linear(3, self._Du),  # : 3 → 8 (= self._Du)
+            nn.GELU(),
+        )
 
-            # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
-            self.trunk_compressor = nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim,
-                          3 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
-                nn.GELU(),
-                nn.Linear(3 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
-            )
+        # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
+        self.trunk_compressor = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 3 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
+            nn.GELU(),
+            nn.Linear(3 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
+        )
 
-            # ------------------------------
-            # Stem (채널 정렬)
-            # ------------------------------
-            self.stem_norm = nn.LayerNorm(self._Din)
-            self.stem_fc = nn.Linear(self._Din, self._C)
-            self.stem_act = nn.GELU()
+        # ------------------------------
+        # Stem (채널 정렬)
+        # ------------------------------
+        self.stem_norm = nn.LayerNorm(self._Din)
+        self.stem_fc = nn.Linear(self._Din, self._C)
+        self.stem_act = nn.GELU()
 
-            # ------------------------------
-            # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
-            # ------------------------------
-            self._kernel_size: int = 7
-            self._dilations: List[int] = [1, 2]  #: 4블록→2블록
-            self.tcn_depth = len(self._dilations)  # : 현재는 2
-            self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
-                [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
+        # ------------------------------
+        # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
+        # ------------------------------
+        self._kernel_size: int = 7
+        self._dilations: List[int] = [1, 2]  #: 4블록→2블록
+        self.tcn_depth = len(self._dilations)  # : 현재는 2
+        self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
+            [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
 
-            # depthwise conv (C 채널, groups=C)
-            def _same_pad(k: int, d: int) -> int:
-                return d * (k // 2)
+        # depthwise conv (C 채널, groups=C)
+        def _same_pad(k: int, d: int) -> int:
+            return d * (k // 2)
 
-            self.tcn_dw = nn.ModuleList([
-                nn.Conv1d(in_channels=self._C,
-                          out_channels=self._C,
-                          kernel_size=self._kernel_size,
-                          padding=_same_pad(self._kernel_size, d),
-                          dilation=d,
-                          groups=self._C,
-                          bias=False) for d in self._dilations
-            ])
-            # pointwise 1x1 (시간축 보존, 채널 결합)
-            self.tcn_linear = nn.ModuleList(
-                [nn.Linear(self._C, self._C) for _ in range(self.tcn_depth)])
+        self.tcn_dw = nn.ModuleList([
+            nn.Conv1d(in_channels=self._C,
+                      out_channels=self._C,
+                      kernel_size=self._kernel_size,
+                      padding=_same_pad(self._kernel_size, d),
+                      dilation=d,
+                      groups=self._C,
+                      bias=False) for d in self._dilations
+        ])
+        # pointwise 1x1 (시간축 보존, 채널 결합)
+        self.tcn_linear = nn.ModuleList(
+            [nn.Linear(self._C, self._C) for _ in range(self.tcn_depth)])
 
-            # ------------------------------
-            # Head & Gate
-            # ------------------------------
-            # 잔차 초안 ΔU_raw
-            self.head = nn.Sequential(
-                nn.Linear(self._C, self._C),
-                nn.GELU(),
-                nn.Linear(self._C, 3),
-            )
-            # 마지막 Linear 0-init → 초기엔 U_ref ≈ U_base
-            nn.init.zeros_(self.head[-1].weight)
-            nn.init.zeros_(self.head[-1].bias)
-            gate_hidden_dim = 32
-            # 소프트 게이트 s = softplus(MLP_g(Z_s))
-            self.gate_mlp = nn.Sequential(
-                nn.LayerNorm(self._C),
-                nn.Linear(self._C, gate_hidden_dim),
-                nn.GELU(),
-                nn.Linear(gate_hidden_dim, 3),
-            )
-            # gate 초기 스케일 s0 설정(보수적으로)
-            s0 = 0.05
-            b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
-            with torch.no_grad():
-                self.gate_mlp[-1].bias.fill_(b_init)
+        # ------------------------------
+        # Head & Gate
+        # ------------------------------
+        # 잔차 초안 ΔU_raw
+        self.head = nn.Sequential(
+            nn.Linear(self._C, self._C),
+            nn.GELU(),
+            nn.Linear(self._C, 3),
+        )
+        # 마지막 Linear 0-init → 초기엔 U_ref ≈ U_base
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+        gate_hidden_dim = 32
+        # 소프트 게이트 s = softplus(MLP_g(Z_s))
+        self.gate_mlp = nn.Sequential(
+            nn.LayerNorm(self._C),
+            nn.Linear(self._C, gate_hidden_dim),
+            nn.GELU(),
+            nn.Linear(gate_hidden_dim, 3),
+        )
+        # gate 초기 스케일 s0 설정(보수적으로)
+        s0 = 0.05
+        b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
+        with torch.no_grad():
+            self.gate_mlp[-1].bias.fill_(b_init)
 
     def _infer_past_future_lengths_for_downsample(
             self,
@@ -3318,7 +3317,7 @@ class FeasibleProjector(nn.Module):
             u_ref: (B, Pnn, segment_len, 3)
                 입력 seg_body_control 에 대한 보정 제어.
         """
-        if not self.use_feasible_train:
+        if not self.use_feasible_dl:
             return seg_body_control
 
         # 1) forward에서 사용할 포인트 궤적 + 노드 유효 마스크 준비

@@ -116,21 +116,20 @@ def get_args():
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--use_feasible', default=True, type=boolean)
-    parser.add_argument('--use_feasible_train', default=True, type=boolean)
-    parser.add_argument('--use_feasible_filter', default=True, type=boolean)
+    parser.add_argument('--use_feasible_dl', default=False, type=boolean)
+    parser.add_argument('--use_feasible_filter', default=False, type=boolean)
     parser.add_argument('--use_past_for_feasible', default=True, type=boolean)
-    parser.add_argument('--use_batch_integration', default=True, type=boolean)
+    parser.add_argument('--use_batch_integration', default=False, type=boolean)
     parser.add_argument('--use_current_input', default=True, type=boolean)
     parser.add_argument('--use_huber_loss', default=True, type=boolean)
-    parser.add_argument('--profile_feasible', default=True, type=boolean)
+    parser.add_argument('--profile_feasible', default=False, type=boolean)
     parser.add_argument('--use_vel_input', default=False, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
     parser.add_argument('--use_integration_trajectory',
-                        default=False,
+                        default=True,
                         type=boolean)
     parser.add_argument('--use_guidance', default=False, type=boolean)
     parser.add_argument('--use_feasible_blend', default=False, type=boolean)
-    parser.add_argument('--use_', default=False, type=boolean)
 
     # parser.add_argument(
     #     '--pin-mem',

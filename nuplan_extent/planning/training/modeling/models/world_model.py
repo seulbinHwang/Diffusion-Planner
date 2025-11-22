@@ -67,7 +67,7 @@ class WorldModel(TorchModuleWrapper):
         :param features: A dictionary of the required features.
         """
         inputs: Dict[str, Optional[torch.Tensor]] = features.to_tensor_dict()
-        with torch.inference_mode():
+        with torch.no_grad():
             with amp_context_for_infer():
                 _, outputs = self._planner(inputs)
         """

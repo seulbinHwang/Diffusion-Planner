@@ -37,12 +37,12 @@ from hydra.core.global_hydra import GlobalHydra
 # [필수] 시뮬레이션 결과 최상위 폴더
 # - 설명: 이 폴더 아래에 여러 실험 폴더가 있고, 각 실험 폴더 안에 `.nuboard` 파일이 있어야 합니다.
 # - 예시: "/data/nuplan-v1.1/exp/exp/simulation/closed_loop_nonreactive_agents/diffusion_planner/val14/diffusion_planner_release/model_2025-01-25-18-29-09"
-HOME_DIR="/media/user/E" #"/home/user"
-PROJECTS_FOLDER="projects"
+HOME_DIR= "/home/user/"#"/media/user/E" #"/home/user"
+PROJECTS_FOLDER="PycharmProjects"#"projects"
 PROJECTS_DIR=f"{HOME_DIR}/{PROJECTS_FOLDER}"
-
+HOME_DIR = "/home/user/nuplan"
 # RESULT_FOLDER: str = "/home/user/nuplan/exp/simulation/log_replay_reactive_diffusion_agents/val14/CHALLENGE/npc_model_2025-09-15-09-51-36"
-RESULT_FOLDER: str = f"{HOME_DIR}/exp/simulation/log_replay_reactive_diffusion_agents/val14/CHALLENGE/npc_model_2025-09-15-13-29-31"
+RESULT_FOLDER: str = f"{HOME_DIR}/exp/simulation/log_replay_reactive_diffusion_agents/val14_mini/CHALLENGE/npc_model_2025-11-22-13-33-30"
 
 # [필수] nuPlan/데이터/맵/실험 경로 환경변수
 # - NUPLAN_DEVKIT_ROOT: nuplan-devkit 저장소의 **로컬 절대 경로**

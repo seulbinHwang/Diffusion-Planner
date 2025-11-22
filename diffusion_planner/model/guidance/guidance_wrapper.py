@@ -48,9 +48,6 @@ class GuidanceWrapper:
         """
         energy = 0
 
-        state_normalizer = kwargs["state_normalizer"]
-        observation_normalizer = kwargs["observation_normalizer"]
-
         B, P, _ = x_in.shape
         model = kwargs["model"]
         model_condition = kwargs["model_condition"]
@@ -59,6 +56,9 @@ class GuidanceWrapper:
         # x_fix : (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         # x_fix = model(x_in, t_input, **model_condition).detach() - x_in.detach()
         x_fix = model(x_in, t_input, **model_condition) - x_in
+
+        assert x_fix.requires_grad, \
+            " GuidanceWrapper 입력이 x_in에 대한 gradient를 가지지 않습니다."
         feasible_returns = model.dit_returns
         kwargs[
             "integrated_trajectory"] = feasible_returns.integrated_trajectory  # (B,Pnn,T,4)
@@ -74,7 +74,9 @@ class GuidanceWrapper:
         # x_dit : (B, Pnn, T, 4) or (B, Pnn, (1+T), 4)
         # x_dit = state_normalizer.inverse(x_dit.reshape(B, P, -1, 4))
         x_dit = x_dit.reshape(B, P, -1, 4)  # 정규화된 상태 그대로 guidance_fn 에 넘김
-
+        assert x_dit.requires_grad, \
+            "GuidanceWrapper 출력이 x_dit에 대한 gradient를 가지지 않습니다."
+        # x_dit에 의존하는 0 텐서 (B,)
         # TODO: 안 써서, 주석 처리함
         # kwargs["inputs"] = observation_normalizer.inverse(kwargs["inputs"])
 

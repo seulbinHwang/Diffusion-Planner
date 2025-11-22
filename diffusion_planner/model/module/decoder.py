@@ -472,8 +472,9 @@ class Decoder(nn.Module):
             batch_size=batch_size,
             predicted_neighbor_num=predicted_neighbor_num,
             future_len=future_len,
-            reference_tensor_for_device=xt_sequence, # shape: (B, Pnn, 80 or 81, 4)
-        ) 
+            reference_tensor_for_device=
+            xt_sequence,  # shape: (B, Pnn, 80 or 81, 4)
+        )
         if integrated_future is None:
             return xt_sequence
 
@@ -809,7 +810,8 @@ class Decoder(nn.Module):
                         "config": self.config,
                     },
                     "guidance_scale":
-                        0.5,
+                        1.0,
+                    # 0.5,
                     "guidance_type":
                         "classifier"
                         if self._guidance_fn is not None else "uncond"
@@ -828,6 +830,7 @@ class Decoder(nn.Module):
                 ],
                                dim=2)  # (B,Pnn,1+T,4)
             unnorm_x0 = self._state_normalizer.inverse(x0)  # (B,Pnn,1+T,4)
+            unnorm_x0[near_current_mask] = 0.0
             if self.config.use_feasible:
                 integrated_trajectory = self.dit.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
                 integrated_trajectory = torch.cat(
@@ -835,6 +838,7 @@ class Decoder(nn.Module):
                     dim=2)  # (B,Pnn,1+T,4)
                 unnorm_integrated_trajectory = self._state_normalizer.inverse(
                     integrated_trajectory)  # (B,Pnn,1+T,4)
+                unnorm_integrated_trajectory[near_current_mask] = 0.0
                 return_[
                     "integrated_trajectory"] = unnorm_integrated_trajectory  # (B, Pnn, (1 + T) , 4)
             return_["score"] = unnorm_x0  # (B, Pnn, (1 + T) , 4)
@@ -872,7 +876,7 @@ class DiT(nn.Module):
         self.final_hidden_tokens = None
         if self.config.use_feasible:
             self.feasible_projector = FeasibleProjector(
-                self.config, hidden_dim, self.config.use_feasible_train,
+                self.config, hidden_dim, self.config.use_feasible_dl,
                 self.config.use_feasible_filter)
             self.feasible_projector.enable_profile = self.config.profile_feasible
 
@@ -1351,11 +1355,17 @@ class DiT(nn.Module):
             # 정규화해서 DiTReturns 로 저장
             integrated_trajectory = self.config.state_normalizer(
                 unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
+            near_future_mask = near_cur_future_valid[:, :,
+                                                     1:]  # (B, Pnn, future_len) bool
+            integrated_trajectory = integrated_trajectory.masked_fill(
+                ~near_future_mask.unsqueeze(-1), 0.0)
 
             temp_dict = {"seg_body_control": unnorm_control_constraint_diff}
             temp_dict = self.config.observation_normalizer(temp_dict)
             control_constraint_diff = temp_dict[
                 "seg_body_control"]  # (B, Pnn, future_len, 3)
+            control_constraint_diff = control_constraint_diff.masked_fill(
+                ~near_future_mask.unsqueeze(-1), 0.0)
 
             self.dit_returns = DiTReturns(
                 integrated_trajectory=integrated_trajectory,

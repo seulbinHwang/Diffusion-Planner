@@ -1109,7 +1109,7 @@ class WorldModelAgents(AbstractMLAgents):
             # future_traj_wrt_ego: (T, 4)
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
             if np.allclose(future_traj_wrt_ego, 0.0):
-                raise ValueError("future_traj_wrt_ego 값이 전부 0. 입니다.")
+                raise ValueError(f"future_traj_wrt_ego for token {token} is all zeros.")
             agent_xyyaw = diff_token_to_global_xyyaw[token]
             future_traj_wrt_npc_center = transform_trajectory(
                 future_traj_wrt_ego, ego_rear_axle_xy, ego_yaw,
@@ -1324,6 +1324,7 @@ class WorldModelAgents(AbstractMLAgents):
 
         self._diffusion_agents = {}
         for idx, token in enumerate(neighbor_token_dist_order):
+
             neighbor_agent_current = neighbor_agents_past[idx, 0]  # (11)
             # neighbor_agent_current: (11) -> (T, 11)
             np_gen_traj_11_wrt_ego = np.tile(
@@ -1337,7 +1338,7 @@ class WorldModelAgents(AbstractMLAgents):
             future_np_traj_wrt_ego = future_np_trajs_wrt_ego[
                 idx, :, :]  # (1+T, 4)
             np_gen_traj_11_wrt_ego[:, :4] = future_np_traj_wrt_ego  # (1+T, 11)
-            np_traj_sum = future_np_traj_wrt_ego.sum()  # (T, 4) 의 합
+            np_traj_sum = future_np_traj_wrt_ego.sum()  # (1+T, 4) 의 합
 
             future_np_int_traj_wrt_ego = future_np_int_trajs_wrt_ego[
                 idx, :, :]  # (1+T, 4)

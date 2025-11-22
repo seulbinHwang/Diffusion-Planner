@@ -367,7 +367,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (15.0, 15.0)
-    dpi: int = 100
+    dpi: int = 400
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -499,7 +499,7 @@ class DrawingOptions:
     DIFF_future_gt_3_dim_token_color: str = BRIGHT_CYAN
     DIFF_future_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
     ############################################
-    DIFF_draw_diff_future_all_gt_3_dim: bool = False
+    DIFF_draw_diff_future_all_gt_3_dim: bool = True
     DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
     DIFF_draw_diff_future_all_gt_3_dim_token: bool = False
@@ -742,6 +742,8 @@ def draw_lane_boundaries(
                     agent_route_lane_order[agent_idx])
         agent_route_lane_order = np.array(
             filtered_agent_route_lane_order)  # (filtered_agent_num, lane_num)
+        if agent_route_lane_order.shape[0] == 0:
+            agent_route_lane_order = None
     else:
         agent_route_lane_order = None
     eps = options.invalid_eps
@@ -773,8 +775,12 @@ def draw_lane_boundaries(
         # =============== 에이전트 경로 차선 경계 강조 그리기 [시작] ===============
         if agent_route_lane_order is not None:
             # TODO: 지금은 모든 에이전트를 같은 색으로 표시중. 개별 색상 지정 가능하도록 개선 필요.
-            agent_route_a_lane_order = agent_route_lane_order[:,
-                                                              idx]  # (filtered_agent_num,)
+            try:
+                agent_route_a_lane_order = agent_route_lane_order[:,
+                                                                  idx]  # (filtered_agent_num,)
+            except:
+                raise ValueError(f"agent_route_lane_order shape {agent_route_lane_order.shape} incompatible with lane idx {idx} "
+                                 f"agent_route_lane_order: ,{agent_route_lane_order} ")
             has_route_mask = (agent_route_a_lane_order != -1)  # True면 경로에 포함
             if np.any(has_route_mask):
                 color = CYAN
@@ -2173,9 +2179,10 @@ def draw_world_model_to_png(
         "58a9e2ba05555824"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
     draw_token_list: List[str] = [
-        "1be4dfd6d2f852a9"
-    ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"]
-
+        "f476b2c85dd7508c"
+    ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"] # d6ff7e795dd051ac
+    # draw_token_list = ["d6ff7e795dd051ac"]
+    # draw_token_list = ["d4cf79e23b2754c0"]
     # draw_token_list = None
     draw_option = options or DrawingOptions()
 

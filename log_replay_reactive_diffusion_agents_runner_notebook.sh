@@ -28,11 +28,6 @@ CUSTOM_ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base_custom
 # get_args()에 넘길 CLI를 정의 (실행 시점에 바꾸고 싶은 값들)
 # ※ normalizer 경로는 존재하는 실제 파일로! (절대경로 권장)
 ARGS_FOR_GET_ARGS=(
-  --use_feasible true
-  --use_feasible_train false
-  --use_feasible_filter true
-  --use_past_for_feasible false
-  --use_vel_input false
   --use_integration_trajectory true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )
@@ -79,12 +74,6 @@ FILENAME_WITHOUT_EXTENSION="${FILENAME%.*}" # FILENAME_WITHOUT_EXTENSION: npc_mo
 # $ARGS_FILE /home/user/PycharmProjects/Diffusion-Planner/checkpoints/args.json
 # $SCENARIO_BUILDER nuplan_challenge
 # $SPLIT test14-random
-
-# nuplan_extent.planning.script.config.simulation
-# nuplan_extent/planning/script/config/simulation/callback/simulation_feature_video_callback.yaml
-
-# nuplan_extent.planning.script.experiments.simulation/  log_replay_reactive_diffusion_agents.yaml
-# 달라진점: simulation ("log_replay_reactive_diffusion_agents") / observation
 
 stdbuf -oL -eL python nuplan_extent/planning/script/run_simulation.py \
     +simulation=$CHALLENGE \

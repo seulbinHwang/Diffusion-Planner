@@ -377,17 +377,22 @@ class DataProcessor(object):
              all_frame_agents_types, self.num_agents, present_static_feature,
              static_objects_types, self.num_static, self.max_pedestrians,
              self.max_bicycles, anchor_ego_state)
+
+        neighbor_agents_past, _, neighbor_indices = \
+            self._filter_agents_within_radius(neighbor_agents_past,
+                                              None, neighbor_indices)
         """
+        
         neighbor_agents_track_id: np.ndarray, (agent_num,) # -1 for padding
         token_to_id: Dict[str, int]
         """
-        id_to_token = {v: k for k, v in token_to_id.items()}
-        neighbor_agents_track_token: List[Optional[str]] = []
-        for track_id in neighbor_agents_track_id:
-            if track_id == -1:
-                neighbor_agents_track_token.append(None)
-            else:
-                neighbor_agents_track_token.append(id_to_token[track_id])
+        # id_to_token = {v: k for k, v in token_to_id.items()}
+        # neighbor_agents_track_token: List[Optional[str]] = []
+        # for track_id in neighbor_agents_track_id:
+        #     if track_id == -1:
+        #         neighbor_agents_track_token.append(None)
+        #     else:
+        #         neighbor_agents_track_token.append(id_to_token[track_id])
         ###################3
         # 현재 프레임의 트래킹 컨테이너로부터, 선별된 neighbor들의 track token 추출
         neighbor_track_token: List[Optional[str]] = get_neighbor_track_tokens(
@@ -396,19 +401,15 @@ class DataProcessor(object):
             neighbor_indices=neighbor_indices,
             agents_num=self.num_agents,
         )
-        assert len(neighbor_agents_track_token) == len(
-            neighbor_track_token
-        ) == 32, f"Two track token lists have different lengths: {len(neighbor_agents_track_token)} != {len(neighbor_track_token)}"
-
-        for t1, t2 in zip(neighbor_agents_track_token, neighbor_track_token):
-            assert t1 == t2, f"Two track token lists do not match: {t1} != {t2}"
+        # assert len(neighbor_agents_track_token) == len(
+        #     neighbor_track_token
+        # ) == 32, f"Two track token lists have different lengths: {len(neighbor_agents_track_token)} != {len(neighbor_track_token)}"
+        #
+        # for t1, t2 in zip(neighbor_agents_track_token, neighbor_track_token):
+        #     assert t1 == t2, f"Two track token lists do not match: {t1} != {t2}"
         #####################
         # neighbor_agents_past, neighbor_agents_track_token = \
         #     self._filter_agents_within_radius2(neighbor_agents_past, neighbor_agents_track_token)
-
-        neighbor_agents_past, _, neighbor_indices = \
-            self._filter_agents_within_radius(neighbor_agents_past,
-                                              None, neighbor_indices)
         '''
         Map
         '''
@@ -477,7 +478,7 @@ class DataProcessor(object):
         # neighbor_agents_track_token: List[Optional[str]], (agent_num,)
         # neighbor_token_id: List[Optional[int]], (agent_num,)
         neighbor_token_id = []
-        for track_token in neighbor_agents_track_token:
+        for track_token in neighbor_track_token:
             if track_token is None:
                 neighbor_token_id.append(None)
             else:
@@ -512,7 +513,7 @@ class DataProcessor(object):
         # data: Dict[str, torch.Tensor]
         data = convert_to_model_inputs(data, device, squeeze)
         data[
-            "neighbor_track_token"] = neighbor_agents_track_token  # List[Optional[str]], (agent_num,)
+            "neighbor_track_token"] = neighbor_track_token  # List[Optional[str]], (agent_num,)
         # 변환 후에도 안전하게 보정
         if "agent_route_lane_order" in data:
             data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
