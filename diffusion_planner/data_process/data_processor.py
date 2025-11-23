@@ -492,12 +492,16 @@ class DataProcessor(object):
         neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
                                                                 iteration +
                                                                 self.
-                                                                num_future_poses, :]  # (agents_num, future_len, 3)
+                                                                num_future_poses, :]
+        # (agents_num, future_len, 3)
+        neighbor_agents_past = neighbor_agents_past[:,
+                                                    -21:]  # (agent_num, time_len, 11)
+        # neighbor_agents_past = self.zero_out_random_time_prefix(neighbor_agents_past)
 
         data = {
             "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
             "neighbor_agents_past":
-                neighbor_agents_past[:, -21:],  # (agent_num, time_len, 11)
+                neighbor_agents_past,  # (agent_num, time_len, 11)
             "neighbor_future_gt_3_dim":
                 neighbor_future_gt_3_dim,  # (num_agents, future_len, 3)
             "neighbor_future_all_gt_3_dim":
@@ -519,6 +523,36 @@ class DataProcessor(object):
             data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
                 torch.int64)
         return data
+
+    @staticmethod
+    def zero_out_random_time_prefix(
+            neighbor_agents_past: np.ndarray) -> np.ndarray:
+        """주어진 neighbor_agents_past 텐서에서
+        (agent_num, time_len, feature_dim) 형태를 가정하고,
+        0 ~ time_len-1 사이에서 랜덤 target을 뽑아
+        neighbor_agents_past[:, :target, :8] 구간을 0으로 만드는 함수.
+
+        Args:
+            neighbor_agents_past (np.ndarray):
+                입력 텐서. shape = (num_agents, time_len, 11)
+
+        Returns:
+            np.ndarray:
+                특정 시간 구간을 0으로 채운 텐서. shape 동일.
+        """
+        num_agents, time_len, feature_dim = neighbor_agents_past.shape
+
+        # 0부터 time_len-1 사이 랜덤 target 선택
+        target: int = np.random.randint(0, time_len // 2)
+        print("target:", target)
+
+        # 복사본을 만들어 수정 (원본을 바꾸고 싶으면 copy 제거)
+        modified_past: np.ndarray = neighbor_agents_past.copy()
+
+        # 첫 8개 feature만 0으로 세팅
+        modified_past[:, :target, :5] = 0.0
+
+        return modified_past
 
     @staticmethod
     def _get_agents_past_cur_mask_np(

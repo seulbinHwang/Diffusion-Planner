@@ -31,6 +31,35 @@ from typing import NamedTuple
 import time
 from contextlib import contextmanager
 from typing import Iterator
+import torch
+
+
+def compute_cond_last_mask(cond_last_pos: torch.Tensor) -> torch.Tensor:
+    """마지막 위치 조건(cond_last_pos)이 '실제로 존재하는지'를 판단하는 마스크를 만든다.
+
+    Args:
+        cond_last_pos: 마지막 위치 조건 텐서.
+            shape: (batch_size, num_agents, D)
+            - 유효한 goal이면 finite(real 숫자) + 0-벡터가 아닌 값
+            - goal이 없으면:
+                - NaN / inf 로 채우거나, 또는
+                - (0, 0, 0, 0) 같은 0-벡터 sentinel 로 표현된다고 가정
+
+    Returns:
+        cond_last_mask: shape (batch_size, num_agents) 의 bool 텐서.
+            - True  : 유효한 goal이 존재함
+            - False : goal이 없거나, 값이 비정상(NaN/inf) 이거나, 0-벡터 sentinel 인 경우
+    """
+    # 1) 값이 유한한지 (NaN/inf 아닌지)
+    is_finite: torch.Tensor = torch.isfinite(cond_last_pos).all(
+        dim=-1)  # (B, Pnn)
+
+    # 2) 완전한 0-벡터가 아닌지
+    #    (필요하면 여기서 eps 기준으로 바꿀 수도 있음: (cond_last_pos.abs() > eps).any(dim=-1))
+    is_non_zero: torch.Tensor = cond_last_pos.ne(0).any(dim=-1)  # (B, Pnn)
+
+    cond_last_mask: torch.Tensor = is_finite & is_non_zero
+    return cond_last_mask
 
 
 @contextmanager
@@ -305,36 +334,33 @@ class Decoder(nn.Module):
             )
         return xt_reshaped
 
+    @staticmethod
     def _inject_last_position_condition_if_available(
-            self,
-            xt_sequence: torch.Tensor,  # shape: (B, Pnn, time_len, 4)
-            cond_last_pos_norm: torch.Tensor,  # shape: (B, Pnn, 4)
+        xt: torch.Tensor,  # (B, Pnn, T, C) 정도라고 가정
+        cond_last_pos: Optional[torch.Tensor]  # (B, Pnn, C_pos)
     ) -> torch.Tensor:
-        """마지막 프레임에 '목표 위치' 정보가 있을 경우에만
-        그 위치로 덮어써 주는 메서드.
+        """cond_last_pos가 유효한 샘플에만 마지막 프레임 위치를 덮어쓴다."""
+        if cond_last_pos is None:
+            return xt
 
-        - cond_last_pos_norm 에 유효한 값이 없으면 아무 것도 하지 않는다.
-        - cond_last_pos_norm 에서 NaN / 0 벡터는 '조건 없음' 으로 취급할 수 있다.
-        """
-        # cond_last_pos_norm 안에 하나라도 finite 값이 있나 확인
-        if not torch.isfinite(cond_last_pos_norm).any():
-            return xt_sequence
+        cond_last_mask: torch.Tensor = compute_cond_last_mask(
+            cond_last_pos)  # (B, Pnn)
 
-        # cond_last_mask: (B, Pnn)  → True 인 위치만 cond-last 사용
-        cond_last_mask = torch.isfinite(cond_last_pos_norm).all(dim=-1) \
-                         & (cond_last_pos_norm.ne(0).sum(dim=-1) > 0)
+        # cond_last_mask == True 인 애들만 마지막 프레임에 cond_last_pos를 주입
+        # 예시: 마지막 프레임의 (x, y)만 덮어쓴다면
+        xt_last = xt[..., -1, :]  # (B, Pnn, C)
+        new_last = xt_last.clone()
 
-        if not cond_last_mask.any().item():
-            return xt_sequence
+        # cond_last_pos의 (x, y)만 사용한다고 가정
+        new_last_xy = cond_last_pos[..., :2]  # (B, Pnn, 2)
+        new_last[..., :2] = torch.where(
+            cond_last_mask[..., None],  # (B, Pnn, 1)
+            new_last_xy,
+            xt_last[..., :2],
+        )
 
-        # last_frame: (B, Pnn, 4)
-        last_frame = xt_sequence[:, :, -1, :]
-        # src: (B, Pnn, 4), xt_sequence 와 dtype/device 맞추기
-        src = _cast_like(cond_last_pos_norm, xt_sequence)
-        # cond_last_mask True 인 위치만 src 로 덮어쓰기
-        last_frame = torch.where(cond_last_mask.unsqueeze(-1), src, last_frame)
-        xt_sequence[:, :, -1, :] = last_frame
-        return xt_sequence
+        xt[..., -1, :] = new_last
+        return xt
 
     def _project_future_yaw_to_unit_circle(
             self,
@@ -696,8 +722,7 @@ class Decoder(nn.Module):
                 cond_last_pos = cond_last_pos_norm
 
             if cond_last_pos is not None:
-                cond_last_mask = torch.isfinite(cond_last_pos).all(
-                    dim=-1)  # [B, Pnn]
+                cond_last_mask = compute_cond_last_mask(cond_last_pos)
             else:
                 # (B, Pnn) # True 이면 last pose 정보가 있다는 뜻
                 cond_last_mask = torch.zeros(B,
@@ -724,8 +749,8 @@ class Decoder(nn.Module):
                 # 2단계: cond-last 정보가 있으면 마지막 프레임에 주입
                 # xt_sequence: (B, Pnn, time_len, 4)
                 xt_sequence = self._inject_last_position_condition_if_available(
-                    xt_sequence=xt_sequence,
-                    cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
+                    xt=xt_sequence,
+                    cond_last_pos=cond_last_pos_norm,  # (B, Pnn, 4)
                 )
 
                 # 3단계: 저노이즈 구간에서만 FeasibleProjector 적분 궤적과 prox-snap 섞기
@@ -1114,7 +1139,11 @@ class DiT(nn.Module):
                     cross_mask=cross_mask  # [B, N_c]
                 )
                 x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
-            self.final_hidden_tokens = x.detach().clone().float()  # (B, Pnn, H)
+            if self.config.feasible_grad_to_dit:
+                self.final_hidden_tokens = x.float()
+            else:
+                self.final_hidden_tokens = x.detach().clone().float(
+                )  # (B, Pnn, H)
             # [V2 - END]
             # --- ✅ PRAM‑v2: 9단계 최종 보정 + 최종 투영(= FinalLayer 완전 대체) ---
             x = apply_pram_v2_final_layer(
@@ -1143,27 +1172,36 @@ class DiT(nn.Module):
             # CURRENT DEFAULT OPTION: "x_start"
             # x: (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
             if self.config.use_feasible:
-                x_for_feasible_detach: torch.Tensor = x.detach().float(
-                )  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
-                near_current_xyyaw_detach: torch.Tensor = near_current_xyyaw.detach(
-                ).float()  # (B, Pnn, 4)
-                near_past_cur_future_valid_detach: torch.Tensor = near_past_cur_future_valid.detach(
-                )
+                if self.config.feasible_grad_to_dit:
+                    x_for_feasible = x.float()  # (B,Pnn, T*4 or (1+T)*4)
+                    near_current_xyyaw_for_feasible = near_current_xyyaw.float(
+                    )  # (B,Pnn,4)
+                    near_past_cur_future_valid_for_feasible = near_past_cur_future_valid
+                else:
+                    x_for_feasible = x.detach().float(
+                    )  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
+                    near_current_xyyaw_for_feasible = near_current_xyyaw.detach(
+                    ).float()  # (B, Pnn, 4)
+                    near_past_cur_future_valid_for_feasible = near_past_cur_future_valid.detach(
+                    )
                 # DiT.forward (model_type == "x_start" 분기 내부)
                 if getattr(self.config, "use_current_input", True):
                     # x: (B, Pnn, (1+T)*4) → 이미 현재 프레임 포함
-                    diffusion_trajectory = x_for_feasible_detach.reshape(
+                    diffusion_trajectory = x_for_feasible.reshape(
                         B, Pnn, -1, 4).contiguous()  # (B,Pnn,1+T,4)
-                    diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_detach
+                    diffusion_trajectory[:, :,
+                                         0, :] = near_current_xyyaw_for_feasible
                 else:
                     # x: (B, Pnn, T*4) → 현재 프레임을 앞에 붙여서 1+T로 맞춤
                     diffusion_trajectory = torch.cat(
                         [
-                            near_current_xyyaw_detach.unsqueeze(2),
-                            x_for_feasible_detach.reshape(B, Pnn, -1, 4)
+                            near_current_xyyaw_for_feasible.unsqueeze(2),
+                            x_for_feasible.reshape(B, Pnn, -1, 4)
                         ],
                         dim=2).contiguous()  # (B,Pnn,1+T,4)
                 t_threshold = self.config.feasible_learn_noise_thresh  # 0.30
+                if not self.config.use_direct_loss:
+                    t_threshold = 1.
                 low_t_mask = (diffusion_time <= t_threshold)  # [B]  True=저노이즈
 
                 # (B, Pnn, T, 4) -> (B, Pnn, T*4)
@@ -1171,10 +1209,25 @@ class DiT(nn.Module):
                 self._feasible_projection(
                     diffusion_trajectory,
                     near_class_one_hot,
-                    near_past_cur_future_valid_detach,
+                    near_past_cur_future_valid_for_feasible,
                     near_past,  # [B, pnn, past_len=(time_len - 1), 11]
                     low_t_mask,  # [B]  True=저노이즈
                 )
+                if not self.training and not self.config.use_direct_loss:
+                    integrated_trajectory = self.dit_returns.integrated_trajectory  # (B, Pnn, T, 4)
+                    if self.config.use_current_input:
+                        x = torch.cat(
+                            [
+                                near_current_xyyaw_for_feasible.unsqueeze(
+                                    2),  # (
+                                integrated_trajectory
+                            ],
+                            dim=2)  # (B, Pnn, 1+T, 4)
+                    else:
+                        x = integrated_trajectory  # (B,Pnn,T,4)
+                    # x: (B, Pnn, T, 4) or (B, Pnn, (1+T), 4) -> (B, Pnn, T*4) or (B, Pnn, (1+T)*4)
+                    x = x.reshape(B, Pnn, -1)
+                    return x
             return x  # (B, Pnn, T * 4) or (B, Pnn, (1+T) * 4)
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
@@ -1402,7 +1455,7 @@ class DiT(nn.Module):
           "unused parameter" 에러 가능성을 줄일 수 있습니다.
         """
         # 학습이 아니거나, low‑t 마스크가 없으면 기존 전체 경로 유지
-        if (not self.training) or (feasible_low_t_mask is None):
+        if feasible_low_t_mask is None:
             self._feasible_projection_core(
                 diffusion_trajectory,
                 near_class_one_hot,

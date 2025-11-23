@@ -366,8 +366,8 @@ class DrawingOptions:
     """
     background_color: str = BLACK
     show_axis: bool = False
-    fig_size: Tuple[float, float] = (15.0, 15.0)
-    dpi: int = 400
+    fig_size: Tuple[float, float] = (13.0, 13.0)
+    dpi: int = 200 #400
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -442,7 +442,7 @@ class DrawingOptions:
     ######### [NEIGHBOR] #########
     ########### [NEIGHBOR] PAST ##################
     NEI_draw_neighbor_past: bool = True  # check
-    NEI_draw_neighbor_only_current: bool = True  # check
+    NEI_draw_neighbor_only_current: bool = False  # check
     NEI_draw_velocity_arrow: bool = False  # check
     NEI_draw_velocity_text: bool = False  # check
     NEI_vel_text_y_offset: float = 0.5

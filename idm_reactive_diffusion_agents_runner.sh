@@ -28,9 +28,10 @@ CUSTOM_ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base_custom
 # get_args()에 넘길 CLI를 정의 (실행 시점에 바꾸고 싶은 값들)
 # ※ normalizer 경로는 존재하는 실제 파일로! (절대경로 권장)
 ARGS_FOR_GET_ARGS=(
-  --use_feasible_dl false
-  --use_feasible_filter false
+  --use_feasible_dl true
+  --use_feasible_filter true
   --use_integration_trajectory true
+  --use_feasible_blend true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )
 
@@ -93,5 +94,3 @@ stdbuf -oL -eL python nuplan_extent/planning/script/run_simulation.py \
     number_of_gpus_allocated_per_simulation=1. \
     enable_simulation_progress_bar=true \
     hydra.searchpath="[pkg://nuplan_extent.planning.script.experiments, pkg://nuplan_extent.planning.script.config.simulation, pkg://nuplan_extent.planning.script.config.common, pkg://nuplan.planning.script.config.simulation.observation, pkg://diffusion_planner.config.scenario_filter, pkg://nuplan.planning.script.config.common , pkg://diffusion_planner.config, pkg://nuplan.planning.script.experiments ]"
-
-#    worker.threads_per_node=128 \

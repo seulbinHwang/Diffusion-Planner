@@ -119,6 +119,9 @@ def train_epoch(data_loader,
                 float(max(1, total_update_steps - 1)))
             w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
                 progress)
+            if not args.use_direct_loss:
+                w_dir = 0.0
+                w_int = 1.
 
             # <추가하자> 에폭 평균으로 보고하기 위해 loss dict에 저장(이 값들을 나중에 lr/*로 로그)
             loss["feasible_progress"] = float(progress)

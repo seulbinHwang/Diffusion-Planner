@@ -174,7 +174,7 @@ class FeasibleProjector(nn.Module):
         self.constraints: Dict[ActorClass, DynamicLimits] = {
             ActorClass.PEDESTRIAN:
                 DynamicLimits(
-                    v_max_mps=2.0,
+                    v_max_mps=8.0,
                     v_max_kmph=28.8,
                     a_max_mps2=6.0,
                     alpha_max_radps2=8.0,
@@ -215,7 +215,7 @@ class FeasibleProjector(nn.Module):
         self._eps: float = 1e-6
 
         # [추가 필요] L_integration 경로 차단용 플래그 (state, u_base detach)
-        self.detach_state_and_u_for_ctrl_losses: bool = True  # 필요
+        self.detach_u_for_ctrl_losses: bool = True  # 필요
 
         # ------------------------------
         # Encoders (시간축 보존, 채널만 변환)
@@ -1459,7 +1459,10 @@ class FeasibleProjector(nn.Module):
             unnorm_seg_body_control_deg_yaw = torch.rad2deg(
                 unnorm_seg_body_control[..., 2]).unsqueeze(-1)
             unnorm_seg_body_control_new = torch.cat(
-                [unnorm_seg_body_control[..., :2], unnorm_seg_body_control_deg_yaw],
+                [
+                    unnorm_seg_body_control[..., :2],
+                    unnorm_seg_body_control_deg_yaw
+                ],
                 dim=-1,
             )  # (B, Pnn, segment_len, 3)  [v_x^b, v_y^b, w(deg)]
             unnorm_seg_body_control_new = torch.round(
@@ -1755,9 +1758,7 @@ class FeasibleProjector(nn.Module):
         seg_mask, seg_mask_1 = self._build_segment_mask(points_valid)
         seg_mask_1 = seg_mask_1.to(u_base.dtype)
 
-        if self.detach_state_and_u_for_ctrl_losses:
-            x_prev = x_prev.detach()
-            x_fut = x_fut.detach()
+        if self.detach_u_for_ctrl_losses:
             u_base_in = (u_base.detach()) * seg_mask_1
         else:
             u_base_in = u_base * seg_mask_1
@@ -1767,7 +1768,7 @@ class FeasibleProjector(nn.Module):
         feat_u = self.control_adapter(u_base_in)  # (B,Pnn,segment_len,32)
         # dit_final_hidden_tokens: (B,Pnn,H)
         # trunk: (B,Pnn,64)
-        trunk = self.trunk_compressor(dit_final_hidden_tokens.detach())
+        trunk = self.trunk_compressor(dit_final_hidden_tokens)
         trunk_rep = trunk.unsqueeze(2).expand(-1, -1, x_prev.size(2),
                                               -1)  # (B,Pnn,segment_len,64)
 
@@ -2381,8 +2382,6 @@ class FeasibleProjector(nn.Module):
         if future_len == 0:
             raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
             # 맨 앞에 추가
-        if self.detach_state_and_u_for_ctrl_losses:
-            unnorm_near_current_state = unnorm_near_current_state.detach()
         """ key_to_limit_bp
         Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn) 
 
@@ -2528,8 +2527,10 @@ class FeasibleProjector(nn.Module):
             )
             unnorm_cur_future_seg_body_control_new = torch.round(
                 unnorm_cur_future_seg_body_control_new * 10) / 10
-            print("unnorm_cur_future_seg_body_control_new.shape:",
-                  unnorm_cur_future_seg_body_control_new[:, target_idx, :, :].shape)
+            print(
+                "unnorm_cur_future_seg_body_control_new.shape:",
+                unnorm_cur_future_seg_body_control_new[:,
+                                                       target_idx, :, :].shape)
             print("unnorm_cur_future_seg_body_control_new:",
                   unnorm_cur_future_seg_body_control_new[:, target_idx, :, :])
         self._assert_cur_future_valid_mask(
@@ -2549,7 +2550,8 @@ class FeasibleProjector(nn.Module):
         if self.do_print:
             print("near_cur_future_valid:",
                   near_cur_future_valid[:, target_idx, :].shape)
-            print("near_cur_future_valid:", near_cur_future_valid[:, target_idx, :])
+            print("near_cur_future_valid:",
+                  near_cur_future_valid[:, target_idx, :])
         # 추가하자: 시간축 완전 배치 버전 (S2 미사용)
         unnorm_integrated_trajectory, unnorm_control_constraint_diff = self._filter_and_integrate_batch(
             unnorm_near_current_state=unnorm_near_current_state,
@@ -2604,9 +2606,6 @@ class FeasibleProjector(nn.Module):
 
         if future_len == 0:
             raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
-
-        if self.detach_state_and_u_for_ctrl_losses:
-            unnorm_near_current_state = unnorm_near_current_state.detach()
 
         # per-agent 제한값 (v_max, a_lat_max, R_min, ...)
         key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
@@ -2789,10 +2788,12 @@ class FeasibleProjector(nn.Module):
                 ],
                 dim=-1,
             )
-            unnorm_points_xyyaw_new = torch.round(unnorm_points_xyyaw_new * 10) / 10
+            unnorm_points_xyyaw_new = torch.round(
+                unnorm_points_xyyaw_new * 10) / 10
             print("unnorm_points_xyyaw_new.shape:",
                   unnorm_points_xyyaw_new[:, 14, :, :].shape)
-            print("unnorm_points_xyyaw_new:", unnorm_points_xyyaw_new[:, 14, :, :])
+            print("unnorm_points_xyyaw_new:", unnorm_points_xyyaw_new[:,
+                                                                      14, :, :])
 
         points_valid = point_len_inputs.points_valid  # (B,Pnn,point_len) bool
         B, Pnn, point_len, _ = unnorm_points_xyyaw.shape
@@ -3991,7 +3992,6 @@ class FeasibleProjector(nn.Module):
         else:
             w_int = w_int_max
         return w_dir, w_int, w_const
-
 
     # ================================================================
     # [추가] (B,Pnn,point_len, C) 형태를 멀티 채널 SG에 넘겨주는 헬퍼
