@@ -599,6 +599,12 @@ class Encoder(nn.Module):
             agent_route_lane_order = inputs["agent_route_lane_order"]
 
             B = neighbors.shape[0]
+            # TODO : 임시 테스트
+            self.neglect_route_encoding = False
+            if not self.training and self.neglect_route_encoding:
+                agent_route_lane_order = torch.full_like(agent_route_lane_order,
+                                                         fill_value=-1)
+
             future_len: int = planner_future_11_dim.shape[1]
             if self.training:
                 # ---------------------- 1) M_i 샘플링 ---------------------- #
@@ -703,6 +709,7 @@ class Encoder(nn.Module):
             encoder_outputs["ego_fut_global"] = ego_fut_global
             encoding_lanes = encoding_input[:, -encoding_lanes.size(
                 1):, :]  # (B, lane_num, hidden_dim)
+
             (near_agents_route_lane_emb,
              route_known_mask) = self._get_near_agents_route_lane_emb(
                  encoding_lanes, lanes_mask, agent_route_lane_order)
@@ -735,8 +742,9 @@ class Encoder(nn.Module):
         """
             route_lanes:       (B, Pnn, route_num, H)
             route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
-
-        near_agents_route_lane_emb: (B, Pnn, H)
+        Returns:
+            near_agents_route_lane_emb: (B, Pnn, H)
+            route_known_mask : (B, Pnn) True=해당 에이전트가 유효 route
         """
         B = encoding_lanes.shape[0]
         if self.training and self.route_order_drop_prob > 0.0:

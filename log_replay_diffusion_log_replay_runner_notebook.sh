@@ -29,11 +29,6 @@ CUSTOM_ARGS_FILE="${PROJECTS_DIR}/Diffusion-Planner/checkpoints/args_base_custom
 # ※ normalizer 경로는 존재하는 실제 파일로! (절대경로 권장)
 ARGS_FOR_GET_ARGS=(
   --use_feasible true
-  --use_feasible_dl false
-  --use_feasible_filter true
-  --use_past_for_feasible false
-  --use_vel_input false
-  --use_integration_trajectory true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )
 

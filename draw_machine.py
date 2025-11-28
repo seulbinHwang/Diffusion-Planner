@@ -31,6 +31,262 @@ BRIGHT_CYAN = "#40FFFF"  # neighbor_future_gt_3_dim
 CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim) # ego_future_gt_11_dim
 
 
+@dataclass
+class DrawingOptions:
+    """렌더링 옵션 모음.
+
+    Attributes
+    ----------
+    EGO_draw_ego_past : bool
+        ego_agent_past(21, 11) 시퀀스 렌더링 여부.
+    draw_neighbor_past : bool
+        neighbor_agents_past(agent_num, 21, 11) 시퀀스 렌더링 여부.
+    EGO_draw_ego_agent_next_11_dim : bool
+        ego_agent_next_11_dim(interpol_num, 11) 예측 궤적 렌더링 여부.
+    EGO_draw_planner_future_11_dim : bool
+        planner_future_11_dim(80, 11) GT 미래 궤적 렌더링 여부.
+    draw_lane_boundaries : bool
+        차선 좌/우 경계(LANE) 렌더링 여부(실선 #2d3ea7).
+    draw_lane_centerline : bool
+        차선 센터라인(BASELINE_PATHS) 점선 렌더링 여부(신호색상 반영).
+    DIFF_draw_diff_future_gen_traj : bool
+        token_to_future_traj_wrt_ego의 각 시점 화살표(길이 고정 2 m) 렌더링 여부.
+
+    COMMON_vel_arrow_len_m : float
+        속도/방향 화살표의 고정 길이 [m]. 기본 2.0.
+    COMMON_heading_line_scale : float
+        헤딩선 길이 비율(사각형 길이 * COMMON_heading_line_scale).
+
+    background_color : str
+        축/그림 배경색.
+    show_axis : bool
+        좌표축 눈금/테두리 표시 여부.
+    fig_size : Tuple[float, float]
+        matplotlib figure 크기 (inch).
+    dpi : int
+        저장 해상도(dpi).
+    margin_m : float
+        자동 범위 계산 시 여백 [m].
+    equal_aspect : bool
+        축 비율 1:1 유지 여부.
+
+    invalid_eps : float
+        invalid 판정 시 0으로 간주할 허용오차(기본 0.0).
+        - agent: 앞 8차원이 모두 |value| ≤ invalid_eps 이면 invalid
+        - lanes: 앞 8차원이 모두 |value| ≤ invalid_eps 이면 invalid
+        - token: 앞 4차원이 모두 |value| ≤ invalid_eps 이면 invalid
+    """
+    background_color: str = BLACK
+    show_axis: bool = False
+    fig_size: Tuple[float, float] = (13.0, 13.0)
+    dpi: int = 400
+    margin_m: float = 5.0
+    equal_aspect: bool = True
+    invalid_eps: float = 0.0
+
+    COMMON_vel_arrow_len_m: float = 5.0
+    COMMON_heading_line_scale: float = 0.5
+
+    ######## LANES ########
+    LANE_draw_lane_boundaries: bool = True  # check
+    LANE_boundary_width: float = 1.
+    LANE_draw_lane_centerline: bool = True  # check
+    LANE_draw_npc_agent_route: bool = True
+    LANE_draw_vel_limit: bool = True
+    LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
+    LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
+    LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
+
+    LANE_speed_color: str = PURPLE  # 번호 텍스트 색 # 청록색
+    LANE_speed_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
+
+    LANE_signal_colors = {
+        0: GREEN,  # 녹색(신호등 초록)
+        1: ORANGE,  # 노란색(신호등 노랑)
+        2: RED,  # 진한 빨간색(신호등 빨강)
+        3: GRAY,  # 회색(청회색)
+    }
+    LANE_AGENT_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
+
+    ######### [EGO] ##############
+    ########### [EGO] PAST ##################
+    EGO_draw_ego_past: bool = True  # check
+    EGO_draw_ego_only_current: bool = True  # check
+    EGO_past_style = {
+        "fill_color": WHITE,  # 흰색
+        "line_color": GRAY,  # 회색
+        "line_width": 0.4,
+        "fill_alpha_current": 0.8,
+    }
+    EGO_draw_ego_past_vel: bool = True  # check
+
+    ##############################
+    ########### [EGO] FUTURE PLANNER NEXT STATE ##################
+    EGO_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+
+    EGO_draw_ego_agent_next_11_dim: bool = False
+    EGO_next_11_dim_style = {
+        "line_color": LIGHT_CYAN,
+        "line_width": 0.4,
+        "velocity_line_color": LIGHT_CYAN,
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    EGO_draw_ego_agent_next_11_vel: bool = False
+    ###################################################
+    ########### [EGO] FUTURE PLANNER ##################
+    EGO_draw_planner_future_11_dim: bool = True  # check
+    EGO_planner_future_11_style = {
+        "line_color": PALE_CYAN,
+        "line_width": 1.4,
+        "velocity_line_color": PALE_CYAN,
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    EGO_draw_planner_velocity: bool = True  # check
+    ########## [EGO] FUTURE EGO GT 11 ##########
+    EGO_draw_ego_future_gt_11_dim: bool = False
+    EGO_future_gt_11_style = {
+        "line_color": CYAN,
+        "line_width": 0.2,
+        "velocity_line_color": CYAN,
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    EGO_draw_future_11_velocity: bool = False  # check
+    ######################################
+
+    ######### [NEIGHBOR] #########
+    ########### [NEIGHBOR] PAST ##################
+    NEI_draw_neighbor_past: bool = True  # check
+    NEI_draw_neighbor_only_current: bool = True  # check
+    NEI_draw_velocity_arrow: bool = False  # check
+    NEI_draw_velocity_text: bool = True  # check
+    NEI_vel_text_y_offset: float = 0.5
+    NEI_vel_text_color = CYAN
+    NEI_vel_text_fontsize = 5
+
+    NEI_neighbor_style = {
+        "vehicles": {
+            "fill_color": LIME,  # 연두색(라임 그린)
+            "fill_alpha": 0.5,
+            "line_color": LIME,  # 연두색(라임 그린)
+            "line_width": 0.2,
+            "velocity_line_color": LIME,  # 연두색(라임 그린)
+            "velocity_line_width": 0.2,
+        },
+        "pedestrians": {
+            "fill_color": LIGHTBLUE,
+            "fill_alpha": 0.5,
+            "line_color": LIGHTBLUE,
+            "line_width": 0.2,
+            "velocity_line_color": LIGHTBLUE,
+            "velocity_line_width": 0.2,
+        },
+        "bicycles": {
+            "fill_color": ORANGE,
+            "fill_alpha": 0.5,
+            "line_color": ORANGE,
+            "line_width": 0.2,
+            "velocity_line_color": ORANGE,
+            "velocity_line_width": 0.2,
+        },
+    }
+    NEI_draw_past_token: bool = False
+    NEI_past_token_place_offset_m: float = 0.5
+    NEI_past_token_color: str = CYAN  # TODO
+    NEI_past_token_fontsize: int = 5
+    ########### [NEIGHBOR] PAST OUTPUT ##################
+    NEI_draw_neighbor_past_output = False
+    NEI_neighbor_past_output_style = {
+        "line_color": ORANGE,  # 주황색 # TODO
+        "line_width": 0.2,
+    }
+    NEI_draw_neighbor_past_output_vel = False
+    NEI_neighbor_past_output_vel_offset_m = 0.3
+    NEI_neighbor_past_output_vel_fontsize = 2
+    NEI_neighbor_past_output_token_fontsize = 2
+    ########################
+    ######### [NEIGHBOR] FUTURE GT #############
+    DIFF_draw_diff_future_gt_3_dim: bool = False
+    DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+    DIFF_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
+    DIFF_draw_diff_future_gt_3_dim_token: bool = False
+    DIFF_future_gt_3_dim_text_offset_m: float = 0.  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
+    DIFF_future_gt_3_dim_token_color: str = BRIGHT_CYAN
+    DIFF_future_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
+    ############################################
+    DIFF_draw_diff_future_all_gt_3_dim: bool = True
+    DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
+    DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
+    DIFF_draw_diff_future_all_gt_3_dim_token: bool = False
+    DIFF_future_all_gt_3_dim_text_offset_m: float = 0.
+    DIFF_future_all_gt_3_dim_token_color: str = BRIGHT_CYAN
+    DIFF_future_all_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
+    ######## [NEIGHBOR] FUTURE OUTPUT ##########
+    DIFF_draw_diff_future_gen_traj: bool = True
+    DIFF_draw_diff_future_gen_traj_token: bool = False
+    DIFF_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    DIFF_future_gen_traj_point_marker: str = "o"
+    DIFF_future_gen_traj_point_marker_size: float = 0.8
+    DIFF_future_gen_traj_arrow_len_m: float = 1.0
+    DIFF_future_gen_style = {
+        "line_color": WHITE,  # 빨간색(밝은 빨강)
+        "token_color": WHITE,  # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": WHITE,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    DIFF_draw_diff_future_gen_traj_vel: bool = False
+
+    DIFF_draw_diff_future_int_traj_11: bool = True
+    DIFF_future_int_style = {
+        "line_color": RED,  # 빨간색(밝은 빨강)
+        "token_color": RED,  # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    DIFF_draw_diff_future_int_traj_11_vel: bool = False
+
+    DIFF_draw_diff_future_int_traj_to_be: bool = False
+    DIFF_future_slip_style = {
+        "line_color": ORANGE,  # 빨간색(밝은 빨강)
+        "token_color": ORANGE,  # 빨간색(밝은 빨강)
+        "line_width": 1.4,
+        "velocity_line_color": ORANGE,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    DIFF_draw_diff_future_int_traj_to_be_vel: bool = False
+
+    DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
+
+    ########################
+    DIFF_draw_diff_future_gen_refined_traj: bool = True
+    DIFF_future_gen_refined_style = {
+        "line_color": RED,  # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    DIFF_draw_future_gen_refined_velocity: bool = True
+    DIFF_future_gen_refined_velocity_offset_m: float = 0.3
+    DIFF_future_gen_refined_velocity_font_size = 5
+    DIFF_future_gen_refined_token_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)
+    DIFF_new_waypoint_vel_text_y_offset_m = 1.
+    DIFF_new_waypoint_vel_token_x_offset_m = 1.
+
+    DIFF_new_waypoint_style = {
+        "line_color": ORANGE,  # 주황색
+        "line_width": 0.2,
+    }
+    ###################
+
+
 # [ADD]
 def _collect_valid_xy_from_input_data(
     input_data: WorldModelFeature,
@@ -319,252 +575,6 @@ def draw_neighbor_future_gt_3_dim(
 # =============================================================================
 
 
-@dataclass
-class DrawingOptions:
-    """렌더링 옵션 모음.
-
-    Attributes
-    ----------
-    EGO_draw_ego_past : bool
-        ego_agent_past(21, 11) 시퀀스 렌더링 여부.
-    draw_neighbor_past : bool
-        neighbor_agents_past(agent_num, 21, 11) 시퀀스 렌더링 여부.
-    EGO_draw_ego_agent_next_11_dim : bool
-        ego_agent_next_11_dim(interpol_num, 11) 예측 궤적 렌더링 여부.
-    EGO_draw_planner_future_11_dim : bool
-        planner_future_11_dim(80, 11) GT 미래 궤적 렌더링 여부.
-    draw_lane_boundaries : bool
-        차선 좌/우 경계(LANE) 렌더링 여부(실선 #2d3ea7).
-    draw_lane_centerline : bool
-        차선 센터라인(BASELINE_PATHS) 점선 렌더링 여부(신호색상 반영).
-    DIFF_draw_diff_future_gen_traj : bool
-        token_to_future_traj_wrt_ego의 각 시점 화살표(길이 고정 2 m) 렌더링 여부.
-
-    COMMON_vel_arrow_len_m : float
-        속도/방향 화살표의 고정 길이 [m]. 기본 2.0.
-    COMMON_heading_line_scale : float
-        헤딩선 길이 비율(사각형 길이 * COMMON_heading_line_scale).
-
-    background_color : str
-        축/그림 배경색.
-    show_axis : bool
-        좌표축 눈금/테두리 표시 여부.
-    fig_size : Tuple[float, float]
-        matplotlib figure 크기 (inch).
-    dpi : int
-        저장 해상도(dpi).
-    margin_m : float
-        자동 범위 계산 시 여백 [m].
-    equal_aspect : bool
-        축 비율 1:1 유지 여부.
-
-    invalid_eps : float
-        invalid 판정 시 0으로 간주할 허용오차(기본 0.0).
-        - agent: 앞 8차원이 모두 |value| ≤ invalid_eps 이면 invalid
-        - lanes: 앞 8차원이 모두 |value| ≤ invalid_eps 이면 invalid
-        - token: 앞 4차원이 모두 |value| ≤ invalid_eps 이면 invalid
-    """
-    background_color: str = BLACK
-    show_axis: bool = False
-    fig_size: Tuple[float, float] = (13.0, 13.0)
-    dpi: int = 200 #400
-    margin_m: float = 5.0
-    equal_aspect: bool = True
-    invalid_eps: float = 0.0
-
-    COMMON_vel_arrow_len_m: float = 5.0
-    COMMON_heading_line_scale: float = 0.5
-
-    ######## LANES ########
-    LANE_draw_lane_boundaries: bool = True  # check
-    LANE_boundary_width: float = 1.
-    LANE_draw_lane_centerline: bool = True  # check
-    LANE_draw_npc_agent_route: bool = True
-    LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
-    LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
-    LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
-    LANE_signal_colors = {
-        0: GREEN,  # 녹색(신호등 초록)
-        1: ORANGE,  # 노란색(신호등 노랑)
-        2: RED,  # 진한 빨간색(신호등 빨강)
-        3: GRAY,  # 회색(청회색)
-    }
-    LANE_AGENT_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
-
-    ######### [EGO] ##############
-    ########### [EGO] PAST ##################
-    EGO_draw_ego_past: bool = True  # check
-    EGO_draw_ego_only_current: bool = True  # check
-    EGO_past_style = {
-        "fill_color": WHITE,  # 흰색
-        "line_color": GRAY,  # 회색
-        "line_width": 0.4,
-        "fill_alpha_current": 0.8,
-    }
-    EGO_draw_ego_past_vel: bool = False  # check
-
-    ##############################
-    ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
-
-    EGO_draw_ego_agent_next_11_dim: bool = False
-    EGO_next_11_dim_style = {
-        "line_color": LIGHT_CYAN,
-        "line_width": 0.4,
-        "velocity_line_color": LIGHT_CYAN,
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-    EGO_draw_ego_agent_next_11_vel: bool = False
-    ###################################################
-    ########### [EGO] FUTURE PLANNER ##################
-    EGO_draw_planner_future_11_dim: bool = True  # check
-    EGO_planner_future_11_style = {
-        "line_color": PALE_CYAN,
-        "line_width": 1.4,
-        "velocity_line_color": PALE_CYAN,
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-    EGO_draw_planner_velocity: bool = False  # check
-    ########## [EGO] FUTURE EGO GT 11 ##########
-    EGO_draw_ego_future_gt_11_dim: bool = False
-    EGO_future_gt_11_style = {
-        "line_color": CYAN,
-        "line_width": 0.2,
-        "velocity_line_color": CYAN,
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-    EGO_draw_future_11_velocity: bool = False  # check
-    ######################################
-
-    ######### [NEIGHBOR] #########
-    ########### [NEIGHBOR] PAST ##################
-    NEI_draw_neighbor_past: bool = True  # check
-    NEI_draw_neighbor_only_current: bool = False  # check
-    NEI_draw_velocity_arrow: bool = False  # check
-    NEI_draw_velocity_text: bool = False  # check
-    NEI_vel_text_y_offset: float = 0.5
-    NEI_vel_text_color = CYAN
-    NEI_vel_text_fontsize = 2
-
-    NEI_neighbor_style = {
-        "vehicles": {
-            "fill_color": LIME,  # 연두색(라임 그린)
-            "fill_alpha": 0.5,
-            "line_color": LIME,  # 연두색(라임 그린)
-            "line_width": 0.2,
-            "velocity_line_color": LIME,  # 연두색(라임 그린)
-            "velocity_line_width": 0.2,
-        },
-        "pedestrians": {
-            "fill_color": LIGHTBLUE,
-            "fill_alpha": 0.5,
-            "line_color": LIGHTBLUE,
-            "line_width": 0.2,
-            "velocity_line_color": LIGHTBLUE,
-            "velocity_line_width": 0.2,
-        },
-        "bicycles": {
-            "fill_color": ORANGE,
-            "fill_alpha": 0.5,
-            "line_color": ORANGE,
-            "line_width": 0.2,
-            "velocity_line_color": ORANGE,
-            "velocity_line_width": 0.2,
-        },
-    }
-    NEI_draw_past_token: bool = False
-    NEI_past_token_place_offset_m: float = 0.5
-    NEI_past_token_color: str = CYAN  # TODO
-    NEI_past_token_fontsize: int = 5
-    ########### [NEIGHBOR] PAST OUTPUT ##################
-    NEI_draw_neighbor_past_output = False
-    NEI_neighbor_past_output_style = {
-        "line_color": ORANGE,  # 주황색 # TODO
-        "line_width": 0.2,
-    }
-    NEI_draw_neighbor_past_output_vel = False
-    NEI_neighbor_past_output_vel_offset_m = 0.3
-    NEI_neighbor_past_output_vel_fontsize = 2
-    NEI_neighbor_past_output_token_fontsize = 2
-    ########################
-    ######### [NEIGHBOR] FUTURE GT #############
-    DIFF_draw_diff_future_gt_3_dim: bool = False
-    DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
-    DIFF_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
-    DIFF_draw_diff_future_gt_3_dim_token: bool = False
-    DIFF_future_gt_3_dim_text_offset_m: float = 0.  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
-    DIFF_future_gt_3_dim_token_color: str = BRIGHT_CYAN
-    DIFF_future_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
-    ############################################
-    DIFF_draw_diff_future_all_gt_3_dim: bool = True
-    DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
-    DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
-    DIFF_draw_diff_future_all_gt_3_dim_token: bool = False
-    DIFF_future_all_gt_3_dim_text_offset_m: float = 0.
-    DIFF_future_all_gt_3_dim_token_color: str = BRIGHT_CYAN
-    DIFF_future_all_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
-    ######## [NEIGHBOR] FUTURE OUTPUT ##########
-    DIFF_draw_diff_future_gen_traj: bool = True
-    DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
-    DIFF_future_gen_traj_point_marker: str = "o"
-    DIFF_future_gen_traj_point_marker_size: float = 0.8
-    DIFF_future_gen_traj_arrow_len_m: float = 1.0
-    DIFF_future_gen_style = {
-        "line_color": WHITE,  # 빨간색(밝은 빨강)
-        "token_color": WHITE,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
-        "velocity_line_color": WHITE,  # 빨간색(밝은 빨강)
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-
-    DIFF_draw_diff_future_int_traj_11: bool = True
-    DIFF_future_int_style = {
-        "line_color": RED,  # 빨간색(밝은 빨강)
-        "token_color": RED,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
-        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-
-    DIFF_draw_diff_future_int_traj_to_be: bool = False
-    DIFF_future_slip_style = {
-        "line_color": ORANGE,  # 빨간색(밝은 빨강)
-        "token_color": ORANGE,  # 빨간색(밝은 빨강)
-        "line_width": 1.4,
-        "velocity_line_color": ORANGE,  # 빨간색(밝은 빨강)
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-
-    DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
-
-    ########################
-    DIFF_draw_diff_future_gen_refined_traj: bool = False
-    DIFF_future_gen_refined_style = {
-        "line_color": PALE_CYAN,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
-        "velocity_line_color": PALE_CYAN,  # 빨간색(밝은 빨강)
-        "velocity_line_alpha": 0.8,
-        "velocity_line_width": 0.4,
-    }
-    DIFF_draw_future_gen_refined_velocity: bool = True
-    DIFF_future_gen_refined_velocity_offset_m: float = 0.3
-    DIFF_future_gen_refined_velocity_font_size = 2
-    DIFF_future_gen_refined_token_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)
-    DIFF_new_waypoint_vel_text_y_offset_m = 1.
-    DIFF_new_waypoint_vel_token_x_offset_m = 1.
-
-    DIFF_new_waypoint_style = {
-        "line_color": ORANGE,  # 주황색
-        "line_width": 0.2,
-    }
-    ###################
 
 
 # =============================================================================
@@ -639,8 +649,11 @@ def add_velocity_arrow(ax: plt.Axes,
                        length_m: float,
                        line_color: str,
                        line_width: float,
+                       t: int,
                        line_alpha: Optional[float] = None,
-                       zorder: int = 15) -> None:
+                       zorder: int = 15,
+                       text_y_offset: float = 0.5,
+                       vel_text_fontsize: int = 5) -> None:
     """속도/방향 벡터로 '길이 고정' 화살표를 그림."""
     mag = float(np.hypot(vx, vy))
     if mag < 1e-6:
@@ -660,6 +673,25 @@ def add_velocity_arrow(ax: plt.Axes,
             shrinkA=0.0,
             shrinkB=0.0,
         ))
+    if t % 20 == 0:
+        offset = 5
+    else:
+        offset = 3
+    if t % 10 != 0:
+        return
+    # [추가] 속도 크기 텍스트(km/h) - 모든 과거 지점
+    speed_kmh = float(np.hypot(vx, vy)) * 3.6
+    ax.text(
+        x,  # 점 위쪽에 표기
+        y + text_y_offset * offset,
+        f"{speed_kmh:.1f}",
+        color=line_color,
+        fontsize=vel_text_fontsize,
+        ha="center",
+        va="bottom",
+        zorder=30,
+        clip_on=True,  # tight 저장 시 bbox 폭주 방지
+    )
 
 
 def infer_agent_class(one_hot: Array) -> str:
@@ -720,7 +752,7 @@ def collect_valid_xy_for_bounds(
 
 def draw_lane_boundaries(
     ax: plt.Axes,
-    lanes: Array,
+    lanes: Array,  # (lane_num, lane_len, 12)
     agent_route_lane_order: Optional[Array],  # (agent_num, lane_num)
     options: DrawingOptions,
     draw_token_int_list: Optional[List[int]] = None,
@@ -779,8 +811,9 @@ def draw_lane_boundaries(
                 agent_route_a_lane_order = agent_route_lane_order[:,
                                                                   idx]  # (filtered_agent_num,)
             except:
-                raise ValueError(f"agent_route_lane_order shape {agent_route_lane_order.shape} incompatible with lane idx {idx} "
-                                 f"agent_route_lane_order: ,{agent_route_lane_order} ")
+                raise ValueError(
+                    f"agent_route_lane_order shape {agent_route_lane_order.shape} incompatible with lane idx {idx} "
+                    f"agent_route_lane_order: ,{agent_route_lane_order} ")
             has_route_mask = (agent_route_a_lane_order != -1)  # True면 경로에 포함
             if np.any(has_route_mask):
                 color = CYAN
@@ -805,7 +838,9 @@ def draw_lane_boundaries(
 
 def draw_lane_centerlines(
     ax: plt.Axes,
-    lanes: Array,
+    lanes: Array,  # (lane_num, lane_len, 12)
+    lanes_speed_limit: Array,  #  (lane_num, 1)
+    lanes_has_speed_limit: Array,  # (lane_num, 1)
     options: DrawingOptions,
     agent_route_lane_order: Optional[Array] = None,  # (agent_num, lane_num)
     draw_token_int_list: Optional[List[int]] = None,
@@ -818,6 +853,8 @@ def draw_lane_centerlines(
         - 기존 로직 유지: 차선 센터라인을 **점선**으로 그림.
         - 양 끝점이 모두 유효한 구간만 선분을 그림.
         - 색은 lane의 signal(0~3: green/yellow/red/unknown)에 따라 사용.
+        - (추가) options.LANE_draw_vel_limit=True 이고 lanes_has_speed_limit이 True인 차선에는
+          해당 lanes_speed_limit 값을 km/h로 변환하여 센터라인 위에 숫자를 표시.
 
     2) agent_route_lane_order is not None:
         - 센터라인 **선을 그리지 않음**.
@@ -851,6 +888,14 @@ def draw_lane_centerlines(
         agent_route_lane_order = None
     eps = options.invalid_eps
     lane_num = lanes.shape[0]
+
+    # 추가: 속도 제한 텍스트를 그릴지 여부 플래그
+    use_speed_limit_label = (
+        agent_route_lane_order is None
+        and options.LANE_draw_vel_limit
+        and (lanes_speed_limit is not None)
+        and (lanes_has_speed_limit is not None)
+    )
 
     # ────────────── (B) 텍스트 표기 모드 ──────────────
     if agent_route_lane_order is not None:
@@ -904,13 +949,28 @@ def draw_lane_centerlines(
         return  # 텍스트 모드에서는 선을 그리지 않음
 
     # ────────────── (A) 기존 점선 센터라인 모드 ──────────────
-    for lane_i in lanes:  # (lane_len, 12)
+    for lane_idx, lane_i in enumerate(lanes):  # 추가: enumerate로 lane_idx 사용
         center = lane_i[:, 0:2]
         signals = lane_i[:, 8:12]
         valid = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)  # (lane_len,)
 
         if center.shape[0] < 2:
             continue
+
+        # 추가: 이 lane에 속도 제한 정보가 있는지 확인
+        has_speed_limit = False  # 추가
+        speed_kmh = None  # 추가
+        if use_speed_limit_label:  # 추가
+            flag_val = lanes_has_speed_limit[lane_idx]  # 추가
+            if np.ndim(flag_val) > 0:  # 추가
+                flag_val = flag_val[0]  # 추가
+            if bool(flag_val):  # 추가
+                has_speed_limit = True  # 추가
+                speed_val = lanes_speed_limit[lane_idx]  # 추가
+                if np.ndim(speed_val) > 0:  # 추가
+                    speed_val = speed_val[0]  # 추가
+                # m/s 로 들어왔다고 가정하고 km/h 로 변환  # 추가
+                speed_kmh = float(speed_val) * 3.6  # 추가
 
         state_idx = np.argmax(signals, axis=1)  # (lane_len,)
         for j in range(center.shape[0] - 1):
@@ -923,6 +983,28 @@ def draw_lane_centerlines(
                     linewidth=1.2,
                     linestyle=(0, (4, 4)),
                     zorder=2)
+
+        # 추가: 속도 제한이 있는 lane이면 센터라인 중간쯤에 숫자(km/h)를 표시
+        if use_speed_limit_label and has_speed_limit and (speed_kmh is not None):  # 추가
+            valid_indices = np.nonzero(valid)[0]  # 추가
+            if valid_indices.size > 0:  # 추가
+                mid_idx = int(valid_indices[len(valid_indices) // 2])  # 추가
+                px, py = float(center[mid_idx, 0]), float(center[mid_idx, 1])  # 추가
+                if has_speed_limit and (speed_kmh is not None):  # 추가
+                    label = f"{speed_kmh:.1f}"  # 예: "50.0" km/h  # 추가
+                else:  # 추가
+                    label = "none"  # 속도 제한이 없는 도로  # 추가
+                ax.text(
+                    px,
+                    py,
+                    label,  # 소수 첫째 자리까지 km/h로 표시  # 추가
+                    color=options.LANE_speed_color,  # 추가
+                    fontsize=options.LANE_speed_fontsize,  # 추가
+                    ha="center",
+                    va="center",
+                    zorder=3,
+                )  # 추가
+
 
 
 def draw_neighbor_past(ax: plt.Axes,
@@ -993,7 +1075,8 @@ def draw_neighbor_past(ax: plt.Axes,
                     length_m=options.COMMON_vel_arrow_len_m,
                     line_color=neighbor_cls_style["velocity_line_color"],
                     line_width=neighbor_cls_style["velocity_line_width"],
-                    zorder=7 if t == current_t else 4)
+                    zorder=7 if t == current_t else 4,
+                    t=t)
             if options.NEI_draw_velocity_text:
                 if t % 2 == 0:
                     offset = 2
@@ -1100,7 +1183,8 @@ def draw_ego_past(ax: plt.Axes, ego_agent_past: Array,
                                length_m=options.COMMON_vel_arrow_len_m,
                                line_color=options.EGO_past_style["line_color"],
                                line_width=options.EGO_past_style["line_width"],
-                               zorder=22 if t == current_t else 9)
+                               zorder=22 if t == current_t else 9,
+                               t=t)
 
 
 def draw_ego_agent_next_11_dim(ax: plt.Axes, ego_agent_next_11_dim: Array,
@@ -1127,6 +1211,7 @@ def draw_ego_agent_next_11_dim(ax: plt.Axes, ego_agent_next_11_dim: Array,
             options,
             mode=options.EGO_future_traj_draw_mode,
             zorder=24,
+            draw_velocity=options.EGO_draw_ego_agent_next_11_vel,
         )
 
 
@@ -1154,7 +1239,7 @@ def draw_planner_future_11_dim(ax: plt.Axes, planner_future_11_dim: Array,
             options,
             mode=options.EGO_future_traj_draw_mode,
             zorder=24,
-        )
+            draw_velocity=options.EGO_draw_planner_velocity)
 
 
 def draw_ego_future_gt_11_dim(ax: plt.Axes, ego_future_gt_11_dim: Array,
@@ -1182,6 +1267,7 @@ def draw_ego_future_gt_11_dim(ax: plt.Axes, ego_future_gt_11_dim: Array,
             options,
             mode=options.EGO_future_traj_draw_mode,
             zorder=24,
+            draw_velocity=options.EGO_draw_future_11_velocity,
         )
 
 
@@ -1262,23 +1348,13 @@ def draw_diff_future_gen_refined_traj(
                         zorder=24,
                     )
                     if options.DIFF_draw_future_gen_refined_velocity:
-                        # add_velocity_arrow(
-                        #     ax,
-                        #     x,
-                        #     y,
-                        #     vx,
-                        #     vy,
-                        #     length_m=options.COMMON_vel_arrow_len_m,
-                        #     line_color=options.DIFF_future_gen_refined_style["velocity_line_color"],
-                        #     line_width=options.DIFF_future_gen_refined_style["velocity_line_width"],
-                        #     line_alpha=options.DIFF_future_gen_refined_style["velocity_line_alpha"],
-                        #     zorder=24,
-                        # )
                         speed_kmh = float(np.hypot(vx, vy)) * 3.6
-                        if t % 2 == 0:
+                        if t % 20 == 0:
                             offset = 5
                         else:
                             offset = 3
+                        if t % 10 != 0:
+                            continue
                         ax.text(
                             x,
                             y +
@@ -1364,6 +1440,7 @@ def draw_diff_future_gen_refined_traj(
                     line_width=options.DIFF_new_waypoint_style["line_width"],
                     line_alpha=1.0,
                     zorder=28,
+                    t=0,
                 )
                 # [추가] 속도 크기 텍스트(km/h) - next waypoint 1점 (색: 주황)
                 speed_kmh = float(np.hypot(vx, vy)) * 3.6
@@ -1462,16 +1539,20 @@ def draw_token_trajectory_rects_unfilled(
             zorder=zorder,
         )
         if draw_velocity is True:
-            add_velocity_arrow(ax,
-                               x,
-                               y,
-                               vx,
-                               vy,
-                               length_m=options.COMMON_vel_arrow_len_m,
-                               line_color=style["velocity_line_color"],
-                               line_width=style["velocity_line_width"],
-                               line_alpha=style["velocity_line_alpha"],
-                               zorder=zorder)
+            # draw_token_trajectory_rects_unfilled
+            add_velocity_arrow(
+                ax,
+                x,
+                y,
+                vx,
+                vy,
+                length_m=options.COMMON_vel_arrow_len_m,
+                line_color=style["velocity_line_color"],
+                line_width=style["velocity_line_width"],
+                line_alpha=style["velocity_line_alpha"],
+                zorder=zorder,
+                t=t,
+            )
 
         if first_valid_xy is None:
             first_valid_xy = (x, y)
@@ -1480,13 +1561,15 @@ def draw_token_trajectory_rects_unfilled(
 
 
 def draw_token_trajectory_non_rects(
-    ax: plt.Axes,
-    traj_11: Array,
-    style: Dict[str, Any],
-    options: DrawingOptions,
-    mode: str,
-    zorder: int,
-) -> Optional[Tuple[float, float]]:
+        ax: plt.Axes,
+        traj_11: Array,
+        style: Dict[str, Any],
+        options: DrawingOptions,
+        mode: str,
+        zorder: int,
+        draw_velocity: bool = False,
+        text_y_offset: float = 0.5,
+        vel_text_fontsize: int = 2) -> Optional[Tuple[float, float]]:
     if traj_11 is None or traj_11.size == 0:
         return None
     if traj_11.ndim != 2 or traj_11.shape[1] != 11:
@@ -1495,14 +1578,35 @@ def draw_token_trajectory_non_rects(
     eps = options.invalid_eps
     first_valid_xy: Optional[Tuple[float, float]] = None
     traj = traj_11[:, :4]  # (future_len, 4)
+    vx = traj_11[:, 4]  # (future_len)
+    vy = traj_11[:, 4]  # (future_len)
     future_len = traj.shape[0]
     for t in range(future_len):
         row = traj[t]  # (4,) = [x, y, cos, sin]
         if not is_valid_token_row(row, eps):
             continue
-
         x, y = float(row[0]), float(row[1])
         c, s = float(row[2]), float(row[3])
+
+        if draw_velocity:
+            if t % 20 == 0:
+                offset = 5
+            else:
+                offset = 3
+            if t % 10 == 0:
+                # [추가] 속도 크기 텍스트(km/h) - 모든 과거 지점
+                speed_kmh = float(np.hypot(vx[t], vy[t])) * 3.6
+                ax.text(
+                    x,  # 점 위쪽에 표기
+                    y + text_y_offset * offset,
+                    f"{speed_kmh:.1f}",
+                    color=style["line_color"],
+                    fontsize=vel_text_fontsize,
+                    ha="center",
+                    va="bottom",
+                    zorder=30,
+                    clip_on=True,  # tight 저장 시 bbox 폭주 방지
+                )
 
         if mode == "arrow":
             # 방향 벡터 (c, s)를 정규화하여 고정 길이(옵션) 화살표
@@ -1516,6 +1620,7 @@ def draw_token_trajectory_non_rects(
                 line_color=style["line_color"],
                 line_width=style["line_width"],
                 zorder=zorder,
+                t=t,
             )
         elif mode == "point":
             # 점만 표시(방향 정보 사용하지 않음)
@@ -1560,6 +1665,7 @@ def draw_traj_dict_as_unfilled_rects(
     annotate_token: bool = False,
     annotate_fontsize: Optional[int] = None,
     annotate_offset: float = 0.0,
+    draw_velocity: bool = False,
 ) -> None:
     """Dict[str, (T,11)]를 '속 빈 사각형'으로 렌더링하고 필요 시 토큰 라벨을 추가.
 
@@ -1589,6 +1695,7 @@ def draw_traj_dict_as_unfilled_rects(
             style=style,
             options=options,
             zorder=zorder,
+            draw_velocity=draw_velocity,
         )
         if annotate_token and (first_xy is not None):
             fx, fy = first_xy
@@ -1615,6 +1722,7 @@ def draw_traj_dict_as_non_square(
     annotate_token: bool = False,
     annotate_fontsize: Optional[int] = None,
     annotate_offset: float = 0.0,
+    draw_velocity: bool = False,
 ) -> None:
     """토큰 기준 미래 포즈를 '화살표(방향 포함)' 또는 '점(방향 미사용)'으로 그림.
 
@@ -1650,12 +1758,15 @@ def draw_traj_dict_as_non_square(
     for idx, (token, traj_11) in enumerate(token_to_traj_11.items()):  # [ADD]
         if draw_token_list is not None and token not in draw_token_list:
             continue
-        first_xy = draw_token_trajectory_non_rects(ax,
-                                                   traj_11,
-                                                   style,
-                                                   options,
-                                                   mode,
-                                                   zorder=20)
+        first_xy = draw_token_trajectory_non_rects(
+            ax,
+            traj_11,
+            style,
+            options,
+            mode,
+            zorder=20,
+            draw_velocity=draw_velocity,
+        )
         if annotate_token and (first_xy is not None):
             fx, fy = first_xy
             ax.text(
@@ -1715,6 +1826,7 @@ def draw_diff_future_traj_w_square(
                 annotate_fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
                 annotate_offset=options.
                 DIFF_future_gen_trak_token_text_y_offset_m,
+                draw_velocity=options.DIFF_draw_diff_future_gen_traj_vel,
             )
 
         if options.DIFF_draw_diff_future_int_traj_11:
@@ -1726,6 +1838,7 @@ def draw_diff_future_traj_w_square(
                 zorder=24,
                 draw_token_list=draw_token_list,
                 annotate_token=False,
+                draw_velocity=options.DIFF_draw_diff_future_int_traj_11_vel,
             )
 
         if options.DIFF_draw_diff_future_int_traj_to_be:
@@ -1737,6 +1850,7 @@ def draw_diff_future_traj_w_square(
                 zorder=23,
                 draw_token_list=draw_token_list,
                 annotate_token=False,
+                draw_velocity=options.DIFF_draw_diff_future_int_traj_to_be_vel,
             )
 
     elif options.DIFF_future_traj_draw_mode in ["arrow", "point", "line"]:
@@ -1923,6 +2037,7 @@ def draw_neighbor_past_output(
                     line_width=line_width,
                     line_alpha=1.0,
                     zorder=20 if t == current_t else 18,
+                    t=t,
                 )
                 # [추가] 속도 크기 텍스트(km/h) - 모든 히스토리 지점
                 speed_kmh = float(np.hypot(vx, vy)) * 3.6
@@ -2140,7 +2255,10 @@ def draw_lane(
         draw_option: 렌더링 옵션.
         draw_token_list: 특정 에이전트 토큰만 텍스트 표기하고 싶을 때 사용. None이면 전체.
     """
-    lanes = input_data.get("lanes")
+    lanes = input_data.get("lanes")  # (lane_num, lane_len, 12)
+    lanes_speed_limit = input_data.get("lanes_speed_limit")  # (lane_num, 1)
+    lanes_has_speed_limit = input_data.get(
+        "lanes_has_speed_limit")  # (lane_num, 1)
     # : Optional[Array] # (agent_num, lane_num)
     agent_route_lane_order: Optional[Array] = input_data.get(
         "agent_route_lane_order", None)
@@ -2161,6 +2279,8 @@ def draw_lane(
         draw_lane_centerlines(
             ax,
             lanes,
+            lanes_speed_limit,
+            lanes_has_speed_limit,
             draw_option,
             agent_route_lane_order=agent_route_lane_order,
             # agent_K_route_lane_order,
@@ -2181,8 +2301,8 @@ def draw_world_model_to_png(
     draw_token_list: List[str] = [
         "f476b2c85dd7508c"
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"] # d6ff7e795dd051ac
-    # draw_token_list = ["d6ff7e795dd051ac"]
-    # draw_token_list = ["d4cf79e23b2754c0"]
+    # draw_token_list = ["d6ff7e795dd051ac"] # aee2dbe7e9245b23
+    # draw_token_list = ["8f85cc67cb005921"]
     # draw_token_list = None
     draw_option = options or DrawingOptions()
 

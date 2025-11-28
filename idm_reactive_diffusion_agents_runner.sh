@@ -31,7 +31,6 @@ ARGS_FOR_GET_ARGS=(
   --use_feasible_dl true
   --use_feasible_filter true
   --use_integration_trajectory true
-  --use_feasible_blend true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )
 
@@ -65,7 +64,7 @@ BRANCH_NAME=CHALLENGE
 
 
 if [ "$SPLIT" == "val14" ]; then
-    SCENARIO_BUILDER="nuplan"
+    SCENARIO_BUILDER="nuplan_custom"
 else
     SCENARIO_BUILDER="nuplan_challenge"
 fi

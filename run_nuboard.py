@@ -41,8 +41,9 @@ HOME_DIR= "/home/user/"#"/media/user/E" #"/home/user"
 PROJECTS_FOLDER="PycharmProjects"#"projects"
 PROJECTS_DIR=f"{HOME_DIR}/{PROJECTS_FOLDER}"
 HOME_DIR = "/home/user/nuplan"
-# RESULT_FOLDER: str = "/home/user/nuplan/exp/simulation/log_replay_reactive_diffusion_agents/val14/CHALLENGE/npc_model_2025-09-15-09-51-36"
-RESULT_FOLDER: str = f"{HOME_DIR}/exp/simulation/log_replay_reactive_diffusion_agents/val14_mini/CHALLENGE/npc_model_2025-11-22-13-33-30"
+# RESULT_FOLDER: str = "/home/user/nuplan/exp/simulation/log_replay_reactive_diffusion_agents/val14/CHALLENGE/npc_model_2025-11-26-12-41-40"
+RESULT_FOLDER: str = f"{HOME_DIR}/exp/simulation/closed_loop_reactive_diffusion_agents/val14_mini/CHALLENGE/npc_model_2025-11-26-12-45-59"
+# RESULT_FOLDER: str = f"{HOME_DIR}/exp/simulation/log_replay_reactive_diffusion_agents/val14_mini/CHALLENGE/npc_model_2025-11-26-12-41-40"
 
 # [필수] nuPlan/데이터/맵/실험 경로 환경변수
 # - NUPLAN_DEVKIT_ROOT: nuplan-devkit 저장소의 **로컬 절대 경로**
