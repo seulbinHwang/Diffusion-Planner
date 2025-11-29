@@ -702,8 +702,8 @@ if __name__ == "__main__":
 
     # 4) 시나리오 빌더
     map_version = "nuplan-maps-v1.0"
-    builder = NuPlanScenarioBuilder(args.data_path,
-                                    args.map_path,
+    builder = NuPlanScenarioBuilder(args.data_path, # "/media/user/E/dataset/nuplan-v1.1/splits/trainval"
+                                    args.map_path, # "/media/user/E/dataset/maps"
                                     sensor_root=None,
                                     db_files=None,
                                     map_version=map_version)

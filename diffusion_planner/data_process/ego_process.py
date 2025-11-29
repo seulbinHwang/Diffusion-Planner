@@ -13,8 +13,9 @@ from diffusion_planner.data_process.utils import convert_absolute_quantities_to_
 from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 
 
-def get_ego_past_array_from_scenario(scenario: NuPlanScenario, num_past_poses,
-                                     past_time_horizon):
+def get_ego_past_array_from_scenario(scenario: NuPlanScenario,
+                                     num_past_poses: int,
+                                     past_time_horizon: float):
 
     current_ego_state = scenario.initial_ego_state
 

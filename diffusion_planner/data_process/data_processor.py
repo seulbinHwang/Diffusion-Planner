@@ -5,13 +5,16 @@ import matplotlib
 matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
+from nuplan.common.maps.nuplan_map.nuplan_map import NuPlanMap
 import math
 import copy
 import os
 import torch
+from nuplan.common.maps.maps_datatypes import TrafficLightStatusData
 from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from typing import Dict, Tuple, Union, List, Optional
 from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.actor_state.ego_state import EgoState
 import draw_machine
 # matplotlib 설정 추가
 plt.rcParams['figure.max_open_warning'] = 0  # 경고 메시지 비활성화
@@ -324,8 +327,8 @@ class DataProcessor(object):
     def observation_adapter(self,
                             iteration: int,
                             history_buffer,
-                            traffic_light_data,
-                            map_api,
+                            traffic_light_data: List[TrafficLightStatusData],
+                            map_api: NuPlanMap,
                             route_roadblock_ids: Optional[Dict[str, List[str]]],
                             device='cpu',
                             scenario: Optional[NuPlanScenario] = None,
@@ -421,11 +424,11 @@ class DataProcessor(object):
             route_roadblock_ids = []
         # route_roadblock_ids: List[str] = route_roadblock_correction(
         #     ego_state, map_api, route_roadblock_ids)
-        (coords, traffic_light_data, speed_limit,
-         lane_route) = get_neighbor_vector_set_map(map_api, self._map_features,
-                                                   ego_coords, ego_heading,
-                                                   self._radius,
-                                                   traffic_light_data)
+        # traffic_light_data: Dict[str, LaneSegmentTrafficLightData]
+        (coords, traffic_light_data,
+         speed_limit, lane_route) = get_neighbor_vector_set_map(
+             map_api, self._map_features, ego_coords, ego_heading, self._radius,
+             traffic_light_data)  # List[TrafficLightStatusData]
         # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
 
         if use_route_lanes and self.all_car_token_to_rr_ids is None:
@@ -452,11 +455,19 @@ class DataProcessor(object):
                 self.all_car_token_to_rr_ids, neighbor_track_token)
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
-        vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,
-                                 neighbor_track_token, neighbor_agents_current,
-                                 anchor_ego_state, coords, traffic_light_data,
-                                 speed_limit, lane_route, self._map_features,
-                                 self._max_elements, self._max_points)
+        vector_map = map_process(
+            route_roadblock_ids,
+            car_token_to_rr_ids,
+            neighbor_track_token,
+            neighbor_agents_current,
+            anchor_ego_state,
+            coords,
+            traffic_light_data,  # traffic_light_data: Dict[str, LaneSegmentTrafficLightData]
+            speed_limit,
+            lane_route,
+            self._map_features,
+            self._max_elements,
+            self._max_points)
         # (num_agents, future_len, 3)
         # FOR OPEN-LOOP SIMULATION.
         # neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
@@ -606,7 +617,7 @@ class DataProcessor(object):
         return agents_past_cur_off_p_mask, agents_past_cur_off_mask
 
     # Use for data preprocess
-    def work(self, scenarios):
+    def work(self, scenarios: List[NuPlanScenario]) -> None:
 
         for scenario in tqdm(scenarios):
             map_name = scenario._map_name
@@ -615,7 +626,7 @@ class DataProcessor(object):
             '''
             ego & agents past
             '''
-            ego_state = scenario.initial_ego_state
+            ego_state: EgoState = scenario.initial_ego_state
             ego_coords = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
             ego_heading = ego_state.rear_axle.heading
             anchor_ego_state = np.array([
@@ -623,7 +634,7 @@ class DataProcessor(object):
                 ego_state.rear_axle.heading
             ],
                                         dtype=np.float64)  # shape (3,)
-            # all_frame_ego_feature: np (21, 10) # x, y, theta, vx, vy, width, length
+            # all_frame_ego_feature: np (21, 10) # x, y, theta, vx, vy, width, length, (car, pedestrian, cyclist)
             all_frame_ego_feature, time_stamps_past = get_ego_past_array_from_scenario(
                 scenario, self.num_past_poses, self.past_time_horizon)
 
