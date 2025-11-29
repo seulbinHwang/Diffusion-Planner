@@ -440,13 +440,13 @@ class DataProcessor(object):
                     time_horizon=self.past_time_horizon,
                     num_samples=self.num_past_poses)
             ]
-            sampled_past_observations = past_tracked_objects + [
+            past_cur_tracked_objects = past_tracked_objects + [
                 present_tracked_objects
             ]
             self.all_car_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
                     scenario,
-                    sampled_past_observations,
+                    past_cur_tracked_objects,
                     neighbor_track_token=None)
         elif not use_route_lanes:
             self.all_car_token_to_rr_ids = {}
@@ -634,9 +634,12 @@ class DataProcessor(object):
                 ego_state.rear_axle.heading
             ],
                                         dtype=np.float64)  # shape (3,)
-            # all_frame_ego_feature: np (21, 10) # x, y, theta, vx, vy, width, length, (car, pedestrian, cyclist)
-            all_frame_ego_feature, time_stamps_past = get_ego_past_array_from_scenario(
-                scenario, self.num_past_poses, self.past_time_horizon)
+            # all_frame_ego_feature: np (21, 10)
+            #   x, y, theta, vx, vy, width, length, (car, pedestrian, cyclist)
+            # time_stamps_past: np (21,) #
+            (all_frame_ego_feature,
+             time_stamps_past) = get_ego_past_array_from_scenario(
+                 scenario, self.num_past_poses, self.past_time_horizon)
 
             present_tracked_objects: TrackedObjects = scenario.initial_tracked_objects.tracked_objects
             past_tracked_objects: List[TrackedObjects] = [
@@ -646,13 +649,13 @@ class DataProcessor(object):
                     time_horizon=self.past_time_horizon,
                     num_samples=self.num_past_poses)
             ]
-            sampled_past_observations = past_tracked_objects + [
+            past_cur_tracked_objects = past_tracked_objects + [
                 present_tracked_objects
             ]
             # all_frame_agents_feature: List[np.ndarray], (frame_agents_num, 8) # frame_agents_num 길이가 가변적
             # all_frame_agents_types:  List[List[TrackedObjectType]]
             all_frame_agents_feature, all_frame_agents_types, _ = \
-                sampled_tracked_objects_to_array_list(sampled_past_observations)
+                sampled_tracked_objects_to_array_list(past_cur_tracked_objects)
             # present_static_feature: np.ndarray, (len(static_obj), 5)
             # static_objects_types: List[TrackedObjectType]
             (present_static_feature, static_objects_types
@@ -691,7 +694,7 @@ class DataProcessor(object):
             # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
             car_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                    scenario, sampled_past_observations, neighbor_track_token)
+                    scenario, past_cur_tracked_objects, neighbor_track_token)
 
             (coords, traffic_light_data, speed_limit,
              lane_route) = get_neighbor_vector_set_map(map_api,

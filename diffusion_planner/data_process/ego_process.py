@@ -1,6 +1,6 @@
 import numpy as np
 import numpy.typing as npt
-from typing import List, Tuple
+from typing import List, Tuple, Generator
 
 from nuplan.common.actor_state.state_representation import TimePoint
 from nuplan.common.actor_state.ego_state import EgoState
@@ -13,23 +13,27 @@ from diffusion_planner.data_process.utils import convert_absolute_quantities_to_
 from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 
 
-def get_ego_past_array_from_scenario(scenario: NuPlanScenario,
-                                     num_past_poses: int,
-                                     past_time_horizon: float):
+def get_ego_past_array_from_scenario(
+        scenario: NuPlanScenario, num_past_poses: int,
+        past_time_horizon: float) -> Tuple[np.ndarray, np.ndarray]:
 
-    current_ego_state = scenario.initial_ego_state
+    current_ego_state: EgoState = scenario.initial_ego_state
 
-    past_ego_states = scenario.get_ego_past_trajectory(
-        iteration=0, num_samples=num_past_poses, time_horizon=past_time_horizon)
+    past_ego_states: Generator[EgoState, None,
+                               None] = scenario.get_ego_past_trajectory(
+                                   iteration=0,
+                                   num_samples=num_past_poses,
+                                   time_horizon=past_time_horizon)
     # list(past_ego_states): List[EgoState]
     sampled_past_ego_states: List[EgoState] = list(past_ego_states) + [
         current_ego_state
     ]
-    # past_ego_states_array: np (21, 10)
-    past_ego_states_array = sampled_past_ego_states_to_array(
+    # past_cur_ego_array: np (21, 10)
+    #  x, y, theta, vx, vy, width, length, (car, pedestrian, cyclist)
+    past_cur_ego_array = sampled_past_ego_states_to_array(
         sampled_past_ego_states)
 
-    past_time_stamps = list(
+    past_time_stamps: List[TimePoint] = list(
         scenario.get_past_timestamps(
             iteration=0,
             num_samples=num_past_poses,
@@ -37,46 +41,51 @@ def get_ego_past_array_from_scenario(scenario: NuPlanScenario,
 
     def sampled_past_timestamps_to_array(
             past_time_stamps: List[TimePoint]) -> npt.NDArray[np.float32]:
-        flat = [t.time_us for t in past_time_stamps]
-        return np.array(flat, dtype=np.int64)
+        flat: List[int] = [t.time_us for t in past_time_stamps]
+        return np.array(flat, dtype=np.int64)  # shape: (21)
 
+    # past_time_stamps_array: np (21,)
     past_time_stamps_array = sampled_past_timestamps_to_array(past_time_stamps)
 
-    return past_ego_states_array, past_time_stamps_array
+    return past_cur_ego_array, past_time_stamps_array
 
 
 def sampled_past_ego_states_to_array(
-        past_ego_states: List[EgoState]) -> npt.NDArray[np.float32]:
+        past_ego_states: List[EgoState]) -> npt.NDArray[np.float32]:  # (21, 10)
     # 원래 있던 함수임
-    output = np.zeros((len(past_ego_states), 10), dtype=np.float64)
-    for i in range(0, len(past_ego_states), 1):
-        output[i, EgoInternalIndex.x()] = past_ego_states[i].center.x
-        output[i, EgoInternalIndex.y()] = past_ego_states[i].center.y
-        output[i,
-               EgoInternalIndex.heading()] = past_ego_states[i].center.heading
+    past_cur_num = len(past_ego_states)
+    past_cur_ego_array = np.zeros((past_cur_num, 10), dtype=np.float64)
+    for time_i in range(0, past_cur_num, 1):
+        past_cur_ego_array[
+            time_i, EgoInternalIndex.x()] = past_ego_states[time_i].center.x
+        past_cur_ego_array[
+            time_i, EgoInternalIndex.y()] = past_ego_states[time_i].center.y
+        heading_ = past_ego_states[time_i].center.heading
+        past_cur_ego_array[time_i, EgoInternalIndex.heading()] = heading_
         # --- 자차좌표계 → 세계좌표계 속도 변환: 회전만 적용 ---
         v_local = past_ego_states[
-            i].dynamic_car_state.center_velocity_2d  # body-frame velocity
-        he = float(past_ego_states[i].center.heading)
+            time_i].dynamic_car_state.center_velocity_2d  # body-frame velocity
+        he = float(heading_)
         c, s = np.cos(he), np.sin(he)
         vx_w = c * float(v_local.x) - s * float(v_local.y)
         vy_w = s * float(v_local.x) + c * float(v_local.y)
-        output[i, EgoInternalIndex.vx()] = vx_w
-        output[i, EgoInternalIndex.vy()] = vy_w
-        # output[i, EgoInternalIndex.ax(
-        # )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.x
-        # output[i, EgoInternalIndex.ay(
-        # )] = past_ego_states[i].dynamic_car_state.rear_axle_acceleration_2d.y
+        past_cur_ego_array[time_i, EgoInternalIndex.vx()] = vx_w
+        past_cur_ego_array[time_i, EgoInternalIndex.vy()] = vy_w
+        # past_cur_ego_array[time_i, EgoInternalIndex.ax(
+        # )] = past_ego_states[time_i].dynamic_car_state.rear_axle_acceleration_2d.x
+        # past_cur_ego_array[time_i, EgoInternalIndex.ay(
+        # )] = past_ego_states[time_i].dynamic_car_state.rear_axle_acceleration_2d.y
 
-        output[i,
-               EgoInternalIndex.ax()] = past_ego_states[i].car_footprint.width
-        output[i,
-               EgoInternalIndex.ay()] = past_ego_states[i].car_footprint.length
-        output[i, 7:10] = [
+        past_cur_ego_array[
+            time_i,
+            EgoInternalIndex.ax()] = past_ego_states[time_i].car_footprint.width
+        past_cur_ego_array[time_i, EgoInternalIndex.ay(
+        )] = past_ego_states[time_i].car_footprint.length
+        past_cur_ego_array[time_i, 7:10] = [
             1, 0, 0
         ]  # one-hot encoding for agent type (car, pedestrian, cyclist)
 
-    return output
+    return past_cur_ego_array
 
 
 def sampled_future_ego_states_to_array(
