@@ -562,45 +562,76 @@ def _select_token_and_ordered_npc_route_indices(
 
 def get_neighbor_track_tokens(
     present_tracked_objects: TrackedObjects,
-    neighbor_indices: Union[Sequence[int], np.ndarray],
+    agents_cur_frame_indices: Union[Sequence[int], np.ndarray],
     agents_num: int,
     object_types: Optional[Sequence[TrackedObjectType]] = None,
 ) -> List[Optional[str]]:
-    """현재 프레임에서 선별된 이웃의 `track_token`을, 에이전트 슬롯 순서대로 반환합니다.
+    """현재 프레임에서 선택된 이웃 에이전트들의 `track_token` 리스트를 만든다.
 
     개요
-    - `agent_past_process(...)`가 반환한 `neighbor_indices`는
-      "현재 프레임(=리스트의 마지막 프레임)의 에이전트 배열"의 **행 인덱스**입니다.
-    - 같은 현재 프레임의 `TrackedObjects`에서 `VEHICLE/PEDESTRIAN/BICYCLE`만
-      `_extract_agent_array`와 동일한 순서로 나열해두면,
-      `neighbor_indices[k]` → 해당 행의 `TrackedObject.track_token`으로 1:1 매핑할 수 있습니다.
-    - 반환 리스트 길이는 항상 `agents_num`이며, 유효한 이웃보다 슬롯이 많으면 나머지는 `None`으로 채웁니다.
+    ----
+    이 함수는 다음 두 정보를 합쳐서,
+    **“이웃 에이전트 슬롯 순서에 맞는 track_token 리스트”**를 만들어 줍니다.
+
+    1) `present_tracked_objects`
+        - 현재 프레임에서 감지된 모든 객체 묶음입니다.
+        - 여기서 차량/보행자/자전거 등 관심 있는 타입만 추려,
+          내부적으로 “에이전트 배열”을 만들었다고 가정합니다.
+        - 이때의 순서는 `_extract_agent_array` 에서 사용한 것과 동일합니다
+          (즉, 같은 타입 필터 순서로 정렬됨).
+
+    2) `agents_cur_frame_indices`
+        - `agent_past_process` 가 선택한 이웃 에이전트의
+          “현재 프레임 기준 행 인덱스” 목록입니다.
+        - 길이 K(≤ agents_num) 인 정수 시퀀스이며,
+          이 순서가 곧 이웃 에이전트 슬롯 순서가 됩니다.
+
+    이 함수는,
+    - 현재 프레임에서 관심 타입 에이전트들을 순서대로 나열한 뒤
+    - `agents_cur_frame_indices[k]` 를 이용해 해당 행의 `track_token` 을 꺼내
+      `neighbor_track_token[k]` 에 채워 넣습니다.
+    - 슬롯 개수 `agents_num` 만큼의 리스트를 항상 반환하며,
+      인덱스 범위를 벗어나거나 매핑할 수 없는 경우에는 `None` 으로 채웁니다.
 
     Args:
-        present_tracked_objects:
-            - 현재 프레임의 관측. `TrackedObjects` 또는 `DetectionsTracks`(또는 `tracked_objects` 속성 보유형).
-        neighbor_indices:
-            - 모양: **(K, )**, `int` 인덱스. `agent_past_process`의 `sorted_cur_neighbor_indices`.
-            - 이 순서가 곧 `neighbor_agents_past`의 행 순서(거리 오름차순 등)입니다.
-        agents_num:
-            - 최종 슬롯 개수. 반환 리스트 길이가 됩니다.
-        object_types:
-            - 필터링할 타입. 기본은 `[VEHICLE, PEDESTRIAN, BICYCLE]`.
-              `_extract_agent_array`와 동일해야 인덱스 정합이 보장됩니다.
+        present_tracked_objects (TrackedObjects):
+            현재 프레임의 감지 결과.
+            여러 타입의 객체를 포함할 수 있으며,
+            내부에서 `get_tracked_objects_of_types(object_types)` 로
+            관심 타입만 추려 사용합니다.
+        agents_cur_frame_indices (Union[Sequence[int], np.ndarray]):
+            - shape: (K,)
+            - 이웃 에이전트들이 현재 프레임 에이전트 배열에서 차지하는 행 인덱스들.
+            - `agent_past_process` 의 `agents_cur_frame_indices` 를 그대로 넘겨 사용합니다.
+        agents_num (int):
+            - 출력할 이웃 슬롯의 개수입니다.
+            - 반환되는 리스트 길이가 됩니다.
+        object_types (Optional[Sequence[TrackedObjectType]]):
+            - 필터링할 객체 타입 목록입니다.
+            - 기본값은 `(VEHICLE, PEDESTRIAN, BICYCLE)` 이며,
+              `_extract_agent_array` 에서 사용한 타입 순서와 동일해야
+              인덱스 매핑이 올바르게 유지됩니다.
 
     Returns:
         List[Optional[str]]:
             - 길이: `agents_num`
-            - 각 원소는 해당 슬롯의 `track_token`(문자열). 비어 있으면 `None`.
+            - 각 원소는 해당 이웃 슬롯에 대응하는 `track_token` (문자열) 이거나,
+              매핑할 수 없을 때는 `None` 입니다.
+            - `agents_cur_frame_indices` 가 `None` 이면
+              길이 `agents_num` 의 `[None, None, ...]` 리스트를 반환합니다.
+
+    Raises:
+        ValueError:
+            - `agents_num` 이 음수인 경우.
 
     Notes:
-        - 인덱스 범위를 벗어나거나 타입 불일치로 매핑이 안 되면 `None`을 넣습니다.
-        - `neighbor_indices` 길이가 `agents_num`보다 길 경우, 앞 `agents_num`개만 사용합니다.
+        - `agents_cur_frame_indices` 의 길이가 `agents_num` 보다 길면,
+          앞에서부터 `agents_num` 개까지만 사용합니다.
+        - 현재 프레임에서 관심 타입으로 필터링한 에이전트 개수를 `M` 이라 할 때,
+          인덱스가 `0 <= idx < M` 범위를 벗어나면 해당 슬롯은 `None` 으로 남습니다.
     """
     if agents_num < 0:
         raise ValueError(f"`agents_num`은 음수가 될 수 없습니다. got {agents_num}")
-
-    tracked_objects = present_tracked_objects
 
     # `_extract_agent_array`와 동일한 타입 필터 순서 유지
     if object_types is None:
@@ -611,23 +642,26 @@ def get_neighbor_track_tokens(
         )
 
     # 현재 프레임에서 관심 타입만 '그 순서 그대로' 나열
+    # current_agents: List[TrackedObject], 길이 = M
     current_agents: List[
-        TrackedObject] = tracked_objects.get_tracked_objects_of_types(
+        TrackedObject] = present_tracked_objects.get_tracked_objects_of_types(
             object_types)  # type: ignore[assignment]
+    # tokens_in_present_order: (M,) — 관심 타입 에이전트들의 track_token 문자열
     tokens_in_present_order: List[str] = [
         str(agent.track_token) for agent in current_agents
-    ]  # (M,)
+    ]
 
-    # 반환 버퍼 준비
+    # 반환 버퍼 준비: 길이 = agents_num
     neighbor_track_token: List[Optional[str]] = [None] * int(agents_num)
 
-    # neighbor_indices 정규화(int list)
-    if neighbor_indices is None:
+    # agents_cur_frame_indices 정규화(int list)
+    if agents_cur_frame_indices is None:
         return neighbor_track_token
     # numpy, list, tuple 등 모두 int 리스트로 캐스팅
+    # idx_list: List[int], 길이 = K
     idx_list: List[int] = list(
         map(int,
-            np.asarray(neighbor_indices).reshape(-1).tolist()))
+            np.asarray(agents_cur_frame_indices).reshape(-1).tolist()))
 
     # 앞에서부터 agents_num개만 매핑
     max_fill = min(len(idx_list), agents_num)
@@ -640,6 +674,7 @@ def get_neighbor_track_tokens(
             neighbor_track_token[slot_idx] = None
 
     return neighbor_track_token
+
 
 
 # 시나리오 전체 horizon(초) 계산: 시작~끝 타임스탬프 차이
@@ -1054,22 +1089,79 @@ def get_npc_route_roadblock_ids2(
 # =====================
 # 1. Ego, agent, static coordination transformation
 # =====================
-def _local_to_local_transforms(global_states1, global_states2):
-    """
-    Converts the global_states1' local coordinates to global_states2's local coordinates.
-    """
+def _local_to_local_transforms(
+        global_states1: np.ndarray,  # (N, 3) = [x1, y1, heading1] ...
+        global_states2: np.ndarray,  # (3,)   = [x_ref, y_ref, heading_ref]
+) -> np.ndarray:
+    """한 좌표계 기준의 포즈 집합을, 다른 좌표계 기준으로 한 번에 변환하는 함수.
 
+    이 함수는 다음과 같이 동작합니다.
+
+    - `global_states2`:
+      · 새로운 기준 좌표계(로컬 프레임)의 포즈 [x, y, heading] 입니다.
+    - `global_states1`:
+      · 예전 기준(세계 좌표계라고 가정)에서 표현된 포즈들의 집합입니다.
+      · 각 행이 하나의 포즈 [x, y, heading] 입니다.
+
+    절차:
+        1. `global_states2`로부터 3x3 변환행렬(포즈 → 동차변환)을 만든다.
+        2. 이를 역행렬로 뒤집어, "세계 → 새로운 로컬 프레임" 변환행렬을 얻는다.
+        3. `global_states1`의 각 포즈에 대해서도 3x3 변환행렬을 만든다.
+        4. (2)의 행렬을 (3)에 왼쪽에서 곱해, 모두 새로운 로컬 좌표계 기준으로 변환한다.
+
+    결과적으로,
+    - 입력으로 주어진 여러 포즈의 변환행렬 묶음이
+      "새 기준 좌표계에서 본 포즈"로 바뀐 형태로 반환됩니다.
+
+    Args:
+        global_states1 (np.ndarray):
+            - shape: (N, 3)
+            - 각 행: [x, y, heading] (예: 세계 좌표계 기준 포즈들).
+        global_states2 (np.ndarray):
+            - shape: (3,)
+            - 기준이 될 포즈 [x_ref, y_ref, heading_ref].
+
+    Returns:
+        np.ndarray:
+            - shape: (N, 3, 3)
+            - 각 원소는 `global_states1`의 각 포즈를
+              `global_states2` 기준 로컬 프레임으로 본 3x3 변환행렬입니다.
+    """
+    # local_xform: (3, 3) — 기준 포즈(global_states2)에 대한 동차 변환행렬
     local_xform = _state_se2_array_to_transform_matrix(global_states2)
+    # local_xform_inv: (3, 3) — 기준 포즈의 역변환(세계→로컬)
     local_xform_inv = np.linalg.inv(local_xform)
 
+    # transforms: (N, 3, 3) — global_states1 의 각 포즈에 대한 변환행렬
     transforms = _state_se2_array_to_transform_matrix_batch(global_states1)
 
+    # (N, 3, 3) — 새 로컬 프레임 기준으로 재표현된 변환행렬들
     transforms = np.matmul(local_xform_inv, transforms)
     return transforms
 
 
-def _state_se2_array_to_transform_matrix(input_data):
+def _state_se2_array_to_transform_matrix(
+        input_data: np.ndarray,  # (3,) = [x, y, heading]
+) -> np.ndarray:  # (3, 3)
+    """단일 SE(2) 상태 [x, y, heading] 을 3x3 동차 변환행렬로 바꾸는 함수.
 
+    행렬 구조:
+        [[ cos(h), -sin(h), x ],
+         [ sin(h),  cos(h), y ],
+         [   0   ,    0   , 1 ]]
+
+    이 행렬을 점 [x', y', 1]^T 에 곱하면, 회전+평행이동이 한 번에 적용됩니다.
+
+    Args:
+        input_data (np.ndarray):
+            - shape: (3,)
+            - [x, y, heading] (라디안).
+
+    Returns:
+        np.ndarray:
+            - shape: (3, 3)
+            - 주어진 포즈를 표현하는 2D SE(2) 동차 변환행렬.
+    """
     x: float = float(input_data[0])
     y: float = float(input_data[1])
     h: float = float(input_data[2])
@@ -1077,17 +1169,37 @@ def _state_se2_array_to_transform_matrix(input_data):
     cosine = np.cos(h)
     sine = np.sin(h)
 
+    # (3, 3)
     return np.array([[cosine, -sine, x], [sine, cosine, y], [0.0, 0.0, 1.0]])
 
 
-def _state_se2_array_to_transform_matrix_batch(input_data):
+def _state_se2_array_to_transform_matrix_batch(
+        input_data: np.ndarray,  # (N, 3) = [[x1, y1, h1], ..., [xN, yN, hN]]
+) -> np.ndarray:  # (N, 3, 3)
+    """여러 개의 [x, y, heading] 포즈를 한 번에 3x3 변환행렬 묶음으로 바꾸는 함수.
 
-    # Transform the incoming coordinates so transformation can be done with a simple matrix multiply.
-    #
-    # [x1, y1, phi1]  => [x1, y1, cos1, sin1, 1]
-    # [x2, y2, phi2]     [x2, y2, cos2, sin2, 1]
-    # ...          ...
-    # [xn, yn, phiN]     [xn, yn, cosN, sinN, 1]
+    이 함수는 각 행이 [x, y, heading] 인 2D 포즈 배열을 입력받아,
+    각 포즈마다 SE(2) 동차 변환행렬을 만들어 (N, 3, 3) 형태로 반환합니다.
+
+    내부 아이디어:
+        1. 각 포즈를 [x, y, cos(h), sin(h), 1] 형태로 확장한다.
+        2. 미리 준비된 `reshaping_array` (5x9) 를 곱해,
+           [c, -s, x, s, c, y, 0, 0, 1] 형태의 행(길이 9)을 만든다.
+        3. 이를 (3, 3) 으로 reshape 하면, 개별 변환행렬이 완성된다.
+        4. 이런 행을 N개 쌓아 (N, 3, 3) 배열을 얻는다.
+
+    Args:
+        input_data (np.ndarray):
+            - shape: (N, 3)
+            - 각 행: [x, y, heading] (라디안).
+
+    Returns:
+        np.ndarray:
+            - shape: (N, 3, 3)
+            - 각 원소는 해당 행 포즈에 대한 동차 변환행렬입니다.
+    """
+    # input_data: (N, 3) = [x, y, heading]
+    # processed_input: (N, 5) = [x, y, cos(h), sin(h), 1]
     processed_input = np.column_stack((
         input_data[:, 0],
         input_data[:, 1],
@@ -1096,7 +1208,7 @@ def _state_se2_array_to_transform_matrix_batch(input_data):
         np.ones_like(input_data[:, 0]),
     ))
 
-    # See below for reshaping example
+    # reshaping_array: (5, 9)
     reshaping_array = np.array([
         [0, 0, 1, 0, 0, 0, 0, 0, 0],
         [0, 0, 0, 0, 0, 1, 0, 0, 0],
@@ -1104,148 +1216,431 @@ def _state_se2_array_to_transform_matrix_batch(input_data):
         [0, -1, 0, 1, 0, 0, 0, 0, 0],
         [0, 0, 0, 0, 0, 0, 0, 0, 1],
     ])
-    # Builds the transform matrix
-    # First computes the components of each transform as rows of a Nx9 array, and then reshapes to a Nx3x3 array
-    # Below is outlined how the Nx9 representation looks like (s1 and c1 are cos1 and sin1)
-    # [x1, y1, c1, s1, 1]  => [c1, -s1, x1, s1, c1, y1, 0, 0, 1]  =>  [[c1, -s1, x1], [s1, c1, y1], [0, 0, 1]]
-    # [x2, y2, c2, s2, 1]     [c2, -s2, x2, s2, c2, y2, 0, 0, 1]  =>  [[c2, -s2, x2], [s2, c2, y2], [0, 0, 1]]
-    # ...          ...
-    # [xn, yn, cN, sN, 1]     [cN, -sN, xN, sN, cN, yN, 0, 0, 1]
+    # processed_input @ reshaping_array: (N, 9)
+    # → 각 행이 [c, -s, x, s, c, y, 0, 0, 1] 꼴이 되고,
+    #   이를 (N, 3, 3) 으로 reshape 하면 변환행렬 세트가 됨.
     return (processed_input @ reshaping_array).reshape(-1, 3, 3)
 
 
-def _transform_matrix_to_state_se2_array_batch(input_data):
-    """
-    Converts a Nx3x3 batch transformation matrix into a Nx3 array of [x, y, heading] rows.
-    :param input_data: The 3x3 transformation matrix.
-    :return: The converted array.
-    """
+def _transform_matrix_to_state_se2_array_batch(
+        input_data: np.ndarray,  # (N, 3, 3)
+) -> np.ndarray:  # (N, 3)
+    """여러 개의 3x3 변환 행렬을 [x, y, heading] 형태의 포즈 배열로 되돌리는 함수.
 
-    # Picks the entries, the third column will be overwritten with the headings [x, y, _]
+    이 함수는 SE(2) 동차 변환행렬 묶음(회전+이동 정보를 가진 3x3 행렬들)을 입력으로 받아,
+    각 행렬에 대해 다음 정보를 추출합니다.
+
+    - x: 3번째 열의 x 성분 (translation x)
+    - y: 3번째 열의 y 성분 (translation y)
+    - heading: 회전 행렬의 첫 번째 열로부터 atan2를 사용해 추출한 각도
+
+    즉, 다음과 같은 과정을 거칩니다.
+
+    1. 각 3x3 행렬의 첫 번째 열을 모아서
+       [cos(heading), sin(heading), _] 꼴의 벡터들을 만든다.
+    2. 이로부터 `atan2(sin, cos)` 계산으로 heading(라디안)을 구한다.
+    3. 원래 변환행렬의 3번째 열(translation [x, y, 1])에 대해,
+       마지막 요소를 heading 값으로 덮어써 [x, y, heading] 형태로 만든다.
+
+    Args:
+        input_data (np.ndarray):
+            - shape: (N, 3, 3)
+            - 각 [i, :, :] 는 하나의 SE(2) 동차 변환행렬입니다.
+
+    Returns:
+        np.ndarray:
+            - shape: (N, 3)
+            - 각 행은 [x, y, heading] 형태의 포즈를 나타냅니다.
+    """
+    # first_columns: (N, 3) — 각 변환행렬의 첫 번째 열 [cos, sin, 0]
     first_columns = input_data[:, :, 0].reshape(-1, 3)
+    # angles: (N,) — atan2(sin, cos) 로부터 구한 heading
     angles = np.arctan2(first_columns[:, 1], first_columns[:, 0])
 
+    # result: (N, 3) — 원래는 3번째 열 [x, y, 1] 이었음
     result = input_data[:, :, 2]
+    # 마지막 성분을 heading 으로 덮어써 [x, y, heading] 으로 만듦
     result[:, 2] = angles
 
     return result
 
 
-def _global_state_se2_array_to_local(global_states, local_state):
-    """
-    Transforms the StateSE2 in array from to the frame of reference in local_frame.
+def _global_state_se2_array_to_local(
+    global_states: np.ndarray,  # (N, 3) = [x_world, y_world, heading_world]
+    local_state: np.ndarray,  # (3,)   = [x_ref, y_ref, heading_ref]
+) -> np.ndarray:  # (N, 3) = [x_local, y_local, heading_local]
+    """여러 점의 [x, y, heading]을 기준 포즈(local_state) 기준 로컬 좌표계로 변환한다.
 
-    :param global_states: A array of Nx3, where the columns are [x, y, heading].
-    :param local_state: A array of [x, y, h] of the frame to which to transform.
-    :return: The transformed coordinates.
-    """
+    개념적으로 이 함수는
+    - `global_states` : 세계(월드) 좌표계 기준의 포즈들 집합
+    - `local_state`   : “새 기준 좌표계”가 될 포즈(예: ego 차량의 현재 포즈)
+    를 받아서, 각 포즈를 `local_state` 기준으로 보았을 때의
+    로컬 좌표 [x_local, y_local, heading_local] 로 바꿔 줍니다.
 
+    처리 순서:
+        1. `local_state`로부터 3x3 변환 행렬(세계 → 로컬 프레임)을 만든다.
+        2. `global_states`의 각 [x, y, heading]을 3x3 동차 변환행렬로 바꾼다.
+        3. (1)의 역행렬을 (2)에 곱해, 모든 포즈를 로컬 좌표계 기준으로 재표현한다.
+        4. 변환된 3x3 행렬 묶음을 다시 [x, y, heading] 형식의 배열로 되돌린다.
+
+    Args:
+        global_states (np.ndarray):
+            - shape: (N, 3)
+            - 각 행: [x_world, y_world, heading_world]
+              (세계 좌표계 기준 포즈들).
+        local_state (np.ndarray):
+            - shape: (3,)
+            - [x_ref, y_ref, heading_ref]
+              로컬 좌표계의 기준이 되는 포즈(예: ego 포즈).
+
+    Returns:
+        np.ndarray:
+            - shape: (N, 3)
+            - 각 행: [x_local, y_local, heading_local]
+              · `local_state`를 원점/기준으로 하는 좌표계 기준 포즈입니다.
+    """
+    # local_xform: (3, 3) — 기준 포즈(local_state)에 대한 동차 변환행렬 (world→기준)
     local_xform = _state_se2_array_to_transform_matrix(local_state)
+    # local_xform_inv: (3, 3) — 기준 포즈의 역변환 (기준→world) 의 역 → (world→local)
     local_xform_inv = np.linalg.inv(local_xform)
 
+    # transforms: (N, 3, 3) — 각 global_state 를 world 기준 변환행렬로 표현
     transforms = _state_se2_array_to_transform_matrix_batch(global_states)
 
+    # transforms: (N, 3, 3) — world 기준 포즈들을 local_state 기준 로컬 프레임으로 변환
     transforms = np.matmul(local_xform_inv, transforms)
 
+    # output: (N, 3) — [x_local, y_local, heading_local]
     output = _transform_matrix_to_state_se2_array_batch(transforms)
 
     return output
 
 
-def _global_velocity_to_local(velocity, anchor_heading):
+def _global_velocity_to_local(
+    velocity: np.ndarray,  # (N, 2) = [vx_world, vy_world]
+    anchor_heading: float,  # 스칼라 heading(rad) 또는 브로드캐스트 가능한 값
+) -> np.ndarray:  # (N, 2) = [vx_local, vy_local]
+    """월드 좌표계 기준 속도 벡터를 ego(또는 기준 heading) 좌표계 기준 속도로 회전 변환한다.
+
+    이 함수는 2D 속도 벡터 [vx, vy] (세계 좌표계 기준)를,
+    기준 차량(ego)의 heading(방향각)을 기준으로 회전시켜
+    ego 좌표계 기준 속도 [vx_local, vy_local] 로 바꾸어 줍니다.
+
+    변환 방식:
+        - 기준 heading = θ 라 할 때,
+          · vx_local = vx * cos(θ) + vy * sin(θ)
+          · vy_local = vy * cos(θ) - vx * sin(θ)
+
+    직관적으로,
+    - 세계 기준으로 측정된 속도를,
+    - ego 차량이 바라보는 방향을 x축으로 하는 좌표계로 "돌려서" 표현한다고 보면 됩니다.
+
+    Args:
+        velocity (np.ndarray):
+            - shape: (N, 2)
+            - 각 행: [vx_world, vy_world] (세계 좌표계 기준 속도).
+        anchor_heading (float):
+            - 기준이 되는 heading 값(rad).
+            - 보통 ego 차량의 heading 을 넣어 사용합니다.
+            - 스칼라이지만, 넘파이 브로드캐스팅 덕분에 벡터화 연산이 가능합니다.
+
+    Returns:
+        np.ndarray:
+            - shape: (N, 2)
+            - 각 행: [vx_local, vy_local]
+            - 기준 heading 좌표계(ego 기준)로 회전된 속도 벡터입니다.
+    """
+    # velocity_x: (N,) — ego 기준 x 방향 속도
     velocity_x = velocity[:, 0] * np.cos(
         anchor_heading) + velocity[:, 1] * np.sin(anchor_heading)
+    # velocity_y: (N,) — ego 기준 y 방향 속도
     velocity_y = velocity[:, 1] * np.cos(
         anchor_heading) - velocity[:, 0] * np.sin(anchor_heading)
 
+    # (N, 2) 로 스택
     return np.stack([velocity_x, velocity_y], axis=-1)
 
 
-def convert_absolute_quantities_to_relative(
-        agent_state,  # (N, _)
-        ego_state,  # (3,)
-        agent_type='ego'):
+def _build_ego_pose_from_state(
+        ego_cur_pose_np: np.ndarray,  # (3,)
+) -> np.ndarray:  # (3,)
+    """EgoState 배열에서 ego 기준 좌표 변환에 사용할 [x, y, heading] 벡터를 만든다.
+
+    이 함수는 ego_cur_pose_np 배열에서
+    - x 좌표
+    - y 좌표
+    - heading(방향, rad 단위)
+    세 값을 뽑아서, 부동소수 형태의 1차원 벡터로 만들어준다.
+
+    Args:
+        ego_cur_pose_np (np.ndarray):
+            - shape: (3,)
+            - [x_ego, y_ego, heading_ego] 를 담고 있는 배열.
+
+    Returns:
+        np.ndarray:
+            - shape: (3,)
+            - [x_ego, y_ego, heading_ego] 를 float64 타입으로 담은 벡터.
     """
-    Converts the agent or ego history to ego-centric coordinates.
-    :param agent_state: The agent states to convert, in the AgentInternalIndex schema.
-    :param ego_state: The ego state to convert, in the EgoInternalIndex schema.
-    :return: The converted states, in AgentInternalIndex schema.
-    """
+    # ego_pose: (3,) = [x_ego, y_ego, heading_ego]
     ego_pose = np.array(
         [
-            float(ego_state[EgoInternalIndex.x()]),
-            float(ego_state[EgoInternalIndex.y()]),
-            float(ego_state[EgoInternalIndex.heading()]),
+            float(ego_cur_pose_np[EgoInternalIndex.x()]),
+            float(ego_cur_pose_np[EgoInternalIndex.y()]),
+            float(ego_cur_pose_np[EgoInternalIndex.heading()]),
         ],
         dtype=np.float64,
     )
+    return ego_pose
+
+
+def _convert_ego_history_to_relative(
+        agent_state: np.ndarray,  # (time_num, state_dim_ego=10)
+        ego_pose: np.ndarray,  # (3,)
+) -> np.ndarray:  # (time_num, state_dim_ego+1=11)
+    """ego(자차) 궤적을 월드 좌표계에서 ego 기준 상대 좌표계로 변환한다.
+
+    이고의 과거~현재 상태 시퀀스를 받아서,
+    - 위치/방향: ego 기준 좌표계로 변환
+    - heading: cos, sin 두 값으로 나누어 저장
+    - 속도: 월드 기준 속도를 ego 기준 속도로 회전 변환
+    - 차량 크기/타입(one-hot) 등 뒤쪽 값은 그대로 복사
+
+    최종적으로 원래보다 차원이 1 늘어난 (N, state_dim+1) 형태의 배열을 만든다.
+
+    Args:
+        agent_state (np.ndarray):
+            - shape: (time_num, state_dim_ego=10)
+            - ego 과거+현재 궤적 (월드 좌표계).
+        ego_pose (np.ndarray):
+            - shape: (3,)
+            - [x_ego, y_ego, heading_ego] (월드 좌표계 기준 현재 ego 상태).
+
+    Returns:
+        np.ndarray:
+            - shape: (time_num, state_dim_ego+1=11)
+            - ego 기준 상대 좌표계로 변환된 ego 궤적.
+    """
+    # agent_state: (time_num, state_dim_ego=10)
+    time_num, state_dim = agent_state.shape
+
+    # new_agent_state: (time_num, state_dim_ego+1=11)
+    new_agent_state = np.zeros((agent_state.shape[0], state_dim + 1),
+                               dtype=np.float64)
+
+    # 크기/타입 등 뒤쪽 항목 복사
+    new_agent_state[:, 6:] = agent_state[:, 5:]
+
+    # agent_global_poses: (time_num, 3) = [x, y, heading]
+    agent_global_poses = agent_state[:, [
+        EgoInternalIndex.x(),
+        EgoInternalIndex.y(),
+        EgoInternalIndex.heading()
+    ]]  # (N, 3)
+
+    # transforms: (time_num, 3, 3)  — 월드→ego 변환 행렬
+    # agent_global_poses: (time_num, 3), 절대 좌표계 기준 값
+    # ego_pose # (3,) : 절대 좌표계 기준 값
+    transforms = _local_to_local_transforms(agent_global_poses, ego_pose)
+
+    # transformed_poses: (time_num, 3) — ego 좌표계 기준 [x, y, heading]
+    transformed_poses = _transform_matrix_to_state_se2_array_batch(
+        transforms)  # transformed_poses: ego 좌표계 기준 값
+
+    # 위치/방향(→cos,sin) 갱신
+    new_agent_state[:, EgoInternalIndex.x()] = transformed_poses[:, 0]
+    new_agent_state[:, EgoInternalIndex.y()] = transformed_poses[:, 1]
+    new_agent_state[:, 2] = np.cos(transformed_poses[:, 2])
+    new_agent_state[:, 3] = np.sin(transformed_poses[:, 2])
+
+    # --- velocity (world -> anchor ego frame) ---
+    # agent_global_velocities: (time_num, 2) = [vx_world, vy_world]
+    agent_global_velocities = agent_state[:, [
+        EgoInternalIndex.vx(), EgoInternalIndex.vy()
+    ]]
+
+    # transformed_velocities: (time_num, 2) = [vx_ego, vy_ego]
+    transformed_velocities = _global_velocity_to_local(agent_global_velocities,
+                                                       ego_pose[-1])
+
+    new_agent_state[:, 4] = transformed_velocities[:, 0]
+    new_agent_state[:, 5] = transformed_velocities[:, 1]
+
+    return new_agent_state
+
+
+def _convert_agent_states_to_relative(
+        agent_state: np.ndarray,  # (N, state_dim_agent)
+        ego_pose: np.ndarray,  # (3,)
+) -> np.ndarray:  # (N, state_dim_agent)
+    """주변 에이전트(차량/보행자/자전거)의 상태를 ego 기준 상대 좌표계로 변환한다.
+
+    월드 좌표계 기준으로 기록된 주변 에이전트들의 상태에서
+    - 위치 (x, y)
+    - 방향 (heading)
+    - 속도 (vx, vy)
+    만 이고 기준 좌표계로 바꿔준다.
+
+    나머지 값들(차량 크기, 기타 특성)은 그대로 유지하며,
+    입력 배열을 in-place 로 수정한 뒤 반환한다.
+
+    Args:
+        agent_state (np.ndarray):
+            - shape: (N, state_dim_agent)
+                [track_id, vx, vy, heading, width, length, x, y]
+            - 주변 에이전트 상태 배열.
+              스키마는 AgentInternalIndex 를 따른다.
+        ego_pose (np.ndarray):
+            - shape: (3,)
+            - [x_ego, y_ego, heading_ego] (월드 좌표계 기준 현재 ego 상태).
+
+    Returns:
+        np.ndarray:
+            - shape: (N, state_dim_agent)
+                - [track_id, vx, vy, heading, width, length, x, y]
+            - 위치/방향/속도가 ego 기준으로 바뀐 에이전트 상태 배열.
+    """
+    # agent_global_poses: (N, 3) = [x, y, heading]
+    agent_global_poses = agent_state[:, [
+        AgentInternalIndex.x(),
+        AgentInternalIndex.y(),
+        AgentInternalIndex.heading()
+    ]]
+
+    # agent_global_velocities: (N, 2) = [vx_world, vy_world]
+    agent_global_velocities = agent_state[:, [
+        AgentInternalIndex.vx(
+        ), AgentInternalIndex.vy()
+    ]]
+
+    # transformed_poses: (N, 3) = [x_ego, y_ego, heading_ego]
+    transformed_poses = _global_state_se2_array_to_local(
+        agent_global_poses, ego_pose)
+
+    # transformed_velocities: (N, 2) = [vx_ego, vy_ego]
+    transformed_velocities = _global_velocity_to_local(agent_global_velocities,
+                                                       ego_pose[-1])
+
+    # 위치/방향/속도 갱신 (in-place)
+    agent_state[:, AgentInternalIndex.x()] = transformed_poses[:, 0]
+    agent_state[:, AgentInternalIndex.y()] = transformed_poses[:, 1]
+    agent_state[:, AgentInternalIndex.heading()] = transformed_poses[:, 2]
+    agent_state[:, AgentInternalIndex.vx()] = transformed_velocities[:, 0]
+    agent_state[:, AgentInternalIndex.vy()] = transformed_velocities[:, 1]
+
+    return agent_state
+
+
+def _convert_static_states_to_relative(
+        agent_state: np.ndarray,  # (N, state_dim_static)
+        ego_pose: np.ndarray,  # (3,)
+) -> np.ndarray:  # (N, state_dim_static)
+    """정적 객체(표지판, 배리어 등)의 위치/방향을 ego 기준 상대 좌표계로 변환한다.
+
+    정적 객체의 상태 배열에서 앞의 세 값
+    - x 좌표
+    - y 좌표
+    - heading(방향)
+    만 ego 기준 좌표계로 변환하고, 나머지 값(크기 등)은 그대로 둔다.
+
+    입력 배열을 in-place 로 수정한 뒤 반환한다.
+
+    Args:
+        agent_state (np.ndarray):
+            - shape: (N, state_dim_static)
+            - 정적 객체 상태 배열. 앞 3차원이 [x, y, heading].
+        ego_pose (np.ndarray):
+            - shape: (3,)
+            - [x_ego, y_ego, heading_ego] (월드 좌표계 기준 현재 ego 상태).
+
+    Returns:
+        np.ndarray:
+            - shape: (N, state_dim_static)
+            - 위치/방향이 ego 기준으로 바뀐 정적 객체 상태 배열.
+    """
+    # agent_global_poses: (N, 3) = [x, y, heading]
+    agent_global_poses = agent_state[:, [0, 1, 2]]
+
+    # transformed_poses: (N, 3) = [x_ego, y_ego, heading_ego]
+    transformed_poses = _global_state_se2_array_to_local(
+        agent_global_poses, ego_pose)
+
+    # 위치/방향 갱신 (in-place)
+    agent_state[:, 0] = transformed_poses[:, 0]
+    agent_state[:, 1] = transformed_poses[:, 1]
+    agent_state[:, 2] = transformed_poses[:, 2]
+
+    return agent_state
+
+
+def convert_absolute_quantities_to_relative(
+    agent_state: np.ndarray,  # (N, state_dim)
+    ego_cur_pose_np: np.ndarray,  # (3,)
+    agent_type: str = 'ego',
+) -> np.ndarray:
+    """월드 좌표계 기준 상태들을 **ego(자차) 기준 상대 좌표계**로 변환하는 함수.
+
+    이 함수는 세 가지 경우를 처리합니다.
+
+    1) agent_type == 'ego'
+        - 입력: 이고(자차)의 과거/현재 궤적 (월드 좌표계) # (num_frames, 10)
+            - x, y, heading, vx, vy, width, length, (car, pedestrian, cyclist)
+        - 출력: 이고 기준으로 다시 표현된 궤적 # (num_frames, 11)
+          (위치/방향/속도는 ego 기준, 차체 크기와 타입(one-hot)은 그대로 유지)
+        - 결과 shape: (N, original_dim + 1)
+          · heading → cos, sin 두 차원으로 나뉘면서 1차원 증가
+
+    2) agent_type == 'agent'
+        - 입력: 주변 에이전트(차량/보행자/자전거 등)의 상태 (월드 좌표계)
+            - [track_id, vx, vy, heading, width, length, x, y]
+        - 출력: 이고 기준 상대 좌표계로 변환된 에이전트 상태
+          · 위치/방향/속도만 ego 기준으로 바뀌고, 나머지는 그대로 유지
+        - in-place 방식으로 `agent_state`를 수정 후 반환
+
+    3) agent_type == 'static'
+        - 입력: 정적 객체(표지판, 배리어 등)의 상태 (월드 좌표계)
+          · [x, y, heading] + 크기 등
+        - 출력: 이고 기준 상대 좌표계로 변환된 정적 객체 상태
+          · 위치/방향만 ego 기준으로 바뀜
+
+    Args:
+        agent_state (np.ndarray):
+            - shape: (N, state_dim)
+            - 변환 대상 상태 배열.
+              · ego 모드: 이고 궤적
+              · agent 모드: 주변 동적 객체(에이전트)
+              · static 모드: 정적 객체
+        ego_cur_pose_np (np.ndarray):
+            - shape: (3,)
+            - [x_ego, y_ego, heading_ego] (월드 좌표계 기준 이고 현재 상태)
+        agent_type (str, optional):
+            - 'ego'   : 이고 궤적 변환 모드
+            - 'agent' : 동적 에이전트 변환 모드
+            - 'static': 정적 객체 변환 모드
+
+    Returns:
+        np.ndarray:
+            - 변환된 상태 배열.
+            - 'ego' 모드: shape (N, state_dim + 1)
+                - x, y, cos, sin, vx, vy, width, length, (car, pedestrian, cyclist)
+            - 'agent' 모드: shape (N, state_dim) (in-place 수정)
+                - [track_id, vx, vy, heading, width, length, x, y]
+            - 'static' 모드: shape (N, state_dim) (in-place 수정)
+    """
+    # ego_pose: (3,) = [x_ego, y_ego, heading_ego]
+    ego_pose = _build_ego_pose_from_state(ego_cur_pose_np)
 
     if agent_type == 'ego':
-        time_num, state_dim = agent_state.shape
-        new_agent_state = np.zeros((agent_state.shape[0], state_dim + 1),
-                                   dtype=np.float64)
-        new_agent_state[:, 6:] = agent_state[:, 5:]
-        agent_global_poses = agent_state[:, [
-            EgoInternalIndex.x(),
-            EgoInternalIndex.y(),
-            EgoInternalIndex.heading()
-        ]]  # (N, 3)
-        # agent_global_poses, ego_pose: 절대 좌표계 기준 값
-        transforms = _local_to_local_transforms(agent_global_poses, ego_pose)
-        transformed_poses = _transform_matrix_to_state_se2_array_batch(
-            transforms)  # transformed_poses: ego 좌표계 기준 값
-        new_agent_state[:, EgoInternalIndex.x()] = transformed_poses[:, 0]
-        new_agent_state[:, EgoInternalIndex.y()] = transformed_poses[:, 1]
-        new_agent_state[:, 2] = np.cos(transformed_poses[:, 2])
-        new_agent_state[:, 3] = np.sin(transformed_poses[:, 2])
+        # (time_num, state_dim_ego+1=11)
+        agent_state = _convert_ego_history_to_relative(agent_state, ego_pose)
 
-        # local vel,acc to local
-        # agent_local_vel: 자차량 좌표계 기준 속도 벡터
-        # agent_local_vel = agent_state[:, [
-        #     EgoInternalIndex.vx(), EgoInternalIndex.vy()
-        # ]]
-        # agent_local_vel = np.expand_dims(np.concatenate(
-        #     (agent_local_vel, np.zeros(
-        #         (agent_local_vel.shape[0], 1))), axis=-1),
-        #                                  axis=-1)
-        # transformed_vel = np.matmul(transforms,
-        #                             agent_local_vel).squeeze(axis=-1)
-        # --- velocity (world -> anchor ego frame) ---
-        agent_global_velocities = agent_state[:, [
-            EgoInternalIndex.vx(), EgoInternalIndex.vy()
-        ]]
-        transformed_velocities = _global_velocity_to_local(
-            agent_global_velocities, ego_pose[-1])
-
-        new_agent_state[:, 4] = transformed_velocities[:, 0]
-        new_agent_state[:, 5] = transformed_velocities[:, 1]
-        agent_state = new_agent_state
     elif agent_type == 'agent':
-        agent_global_poses = agent_state[:, [
-            AgentInternalIndex.x(),
-            AgentInternalIndex.y(),
-            AgentInternalIndex.heading()
-        ]]
-        agent_global_velocities = agent_state[:, [
-            AgentInternalIndex.vx(
-            ), AgentInternalIndex.vy()
-        ]]
-        transformed_poses = _global_state_se2_array_to_local(
-            agent_global_poses, ego_pose)
-        transformed_velocities = _global_velocity_to_local(
-            agent_global_velocities, ego_pose[-1])
-        agent_state[:, AgentInternalIndex.x()] = transformed_poses[:, 0]
-        agent_state[:, AgentInternalIndex.y()] = transformed_poses[:, 1]
-        agent_state[:, AgentInternalIndex.heading()] = transformed_poses[:, 2]
-        agent_state[:, AgentInternalIndex.vx()] = transformed_velocities[:, 0]
-        agent_state[:, AgentInternalIndex.vy()] = transformed_velocities[:, 1]
+        # (N, state_dim_agent)
+        agent_state = _convert_agent_states_to_relative(agent_state, ego_pose)
+
     elif agent_type == 'static':
-        agent_global_poses = agent_state[:, [0, 1, 2]]
-        transformed_poses = _global_state_se2_array_to_local(
-            agent_global_poses, ego_pose)
-        agent_state[:, 0] = transformed_poses[:, 0]
-        agent_state[:, 1] = transformed_poses[:, 1]
-        agent_state[:, 2] = transformed_poses[:, 2]
+        # (N, state_dim_static)
+        agent_state = _convert_static_states_to_relative(agent_state, ego_pose)
 
     return agent_state
 
