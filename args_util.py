@@ -80,6 +80,7 @@ def get_args():
                         help='number of static objects',
                         default=5)
 
+
     parser.add_argument('--lane_len',
                         type=int,
                         help='number of lane point',
@@ -135,6 +136,8 @@ def get_args():
     parser.add_argument('--profile_feasible', default=False, type=boolean)
     parser.add_argument('--use_vel_input', default=False, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
+    parser.add_argument('--use_route_lanes', default=True, type=boolean)
+    parser.add_argument('--use_ego_plan', default=True, type=boolean)
     parser.add_argument('--use_integration_trajectory',
                         default=True,
                         type=boolean)

@@ -1,6 +1,7 @@
 import numpy as np
 from collections import deque
 from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, List, Tuple, Optional
 
 from nuplan.common.actor_state.ego_state import EgoState
 from nuplan.common.actor_state.state_representation import StateSE2
@@ -22,9 +23,9 @@ class BreadthFirstSearchRoadBlock:
     """
 
     def __init__(self,
-                 start_roadblock_id: int,
+                 start_roadblock_id: str,
                  map_api: Optional[AbstractMap],
-                 forward_search: str = True):
+                 forward_search: bool = True):
         """
         Constructor of BreadthFirstSearchRoadBlock class
         :param start_roadblock_id: roadblock id where graph starts
@@ -253,105 +254,134 @@ def get_current_roadblock_candidates(
     )
 
 
-def route_roadblock_correction(
-    ego_state: EgoState,
+from typing import Dict, List, Tuple, Optional
+
+
+def _build_route_roadblocks_dict(
     map_api: AbstractMap,
     route_roadblock_ids: List[str],
-    search_depth_backward: int = 15,
-    search_depth_forward: int = 30,
-    remove_route_loops_flag: bool = True,
-) -> List[str]:
-    """
-    지도상의 roadblock 그래프를 이용해 경로 roadblock ID 시퀀스를 '현실적인 연결성'을
-    갖도록 보정합니다. 시작점이 경로 밖인 경우 연결 경로를 앞에 붙이고, 경로 중간의
-    끊긴 부분은 BFS로 중간 노드를 삽입하며, 필요 시 끝부분 루프(자기 교차)는 제거합니다.
-
-    알고리즘 개요(세 가지 Fix):
-        Fix 1) 시작점 보정:
-            - 현재 차량이 올라탄 것으로 추정되는 roadblock(후보들)을 찾습니다.
-            - 현재 roadblock이 경로에 없다면,
-              · 역방향 BFS(시작=경로 첫 노드, 목표=시작 후보들, 깊이=search_depth_backward)로
-                연결 경로를 찾아 **앞에 붙임**. 실패 시
-              · 정방향 BFS(시작=현재 roadblock, 목표=경로 선두 몇 개, 깊이=search_depth_forward)로
-                닿은 지점 이전을 잘라내고 **앞에 붙임**.
-        Fix 2) 연결성 보강:
-            - 인접 노드 쌍 (i, i+1)에 대해 실제로 incoming 연결이 없으면,
-              정방향 BFS(깊이=search_depth_forward)로 중간 경로를 찾아
-              양 끝을 제외한 **중간 노드**들만 (i, i+1) 사이에 삽입.
-        Fix 3) 루프 제거(옵션):
-            - `remove_route_loops_flag=True`면, 교차 면적이 큰
-              roadblock connector를 만나기 전까지만 남기고 **뒤를 잘라냄**.
+) -> Dict[str, RoadBlockGraphEdgeMapObject]:
+    """주어진 ID 리스트를 이용해, 실제 도로 조각 객체 딕셔너리를 만든다.
 
     Args:
-        ego_state (EgoState): 보정 기준이 되는 현재 차량 상태(ego 또는 NPC 대용).
-        map_api (AbstractMap): 지도 API 핸들.
-        route_roadblock_ids (List[str]): 보정 전 route roadblock ID 시퀀스.
-        search_depth_backward (int): 역방향 BFS 최대 깊이.
-        search_depth_forward (int): 정방향 BFS 최대 깊이.
-        remove_route_loops_flag (bool): True면 끝부분 루프를 제거.
+        map_api: nuPlan 맵 API.
+        route_roadblock_ids: 경로를 구성하는 roadblock ID 리스트.
 
     Returns:
-        List[str]: 보정된 route roadblock ID 시퀀스.
-
-    Notes:
-        - BFS는 깊이 제한으로 국소 탐색만 수행하므로 계산량이 제어됩니다.
-        - `_extract_near_agents`에서 NPC 경로 보정에 사용할 때는
-          `remove_route_loops_flag=False`로 호출하여 루프 제거를 생략합니다
-          (겹침 판정 등에 활용하기 위함).
-        - 시작 roadblock 추정은 헤딩/거리 임계값(π/4, 3m)과 1m 근방 후보 검색을 사용합니다.
+        Dict[str, RoadBlockGraphEdgeMapObject]:
+            - key: roadblock id
+            - value: 해당 id에 해당하는 RoadBlock 또는 RoadBlockConnector 객체
     """
-
-    route_roadblock_dict = {}
+    route_roadblock_dict: Dict[str, RoadBlockGraphEdgeMapObject] = {}
     for id_ in route_roadblock_ids:
         block = map_api.get_map_object(id_, SemanticMapLayer.ROADBLOCK)
         block = block or map_api.get_map_object(
             id_, SemanticMapLayer.ROADBLOCK_CONNECTOR)
         route_roadblock_dict[id_] = block
+    return route_roadblock_dict
 
+
+def _fix_route_start_offroute(
+    ego_state: EgoState,
+    map_api: AbstractMap,
+    route_roadblocks: List[RoadBlockGraphEdgeMapObject],
+    route_roadblock_ids: List[str],
+    route_roadblocks_dict: Dict[str, RoadBlockGraphEdgeMapObject],
+    search_depth_backward: int,
+    search_depth_forward: int,
+) -> Tuple[List[RoadBlockGraphEdgeMapObject], List[str]]:
+    """경로의 '시작 지점'이 실제 ego 위치와 어긋나 있을 때 앞부분을 보정한다.
+
+    아이디어:
+        1) 먼저 ego 가 지금 어느 도로 조각 위에 있는지 추정한다.
+           (headings, 거리 등을 이용해 후보들을 찾음)
+        2) ego 가 올라탄 도로 조각이 기존 경로에 없다면:
+            - (1안) 경로의 가장 첫 도로에서 ego 쪽으로 거슬러 올라가는 연결을 찾는다.
+                   → 찾으면 그 연결을 경로 앞에 붙인다.
+            - (2안) 실패하면, ego 쪽에서 기존 경로의 앞부분 쪽으로 이어지는 짧은 경로를 찾는다.
+                   → 찾은 지점 이전의 경로는 버리고, ego→경로 연결을 앞에 붙인다.
+
+    이렇게 해서:
+        - 차량이 실제로 있는 위치에서부터 경로가 자연스럽게 이어지도록
+          경로 앞부분을 한 번 정리해 준다.
+    """
+    # ego 가 올라탄 도로 조각 및 후보들
     starting_block, starting_block_candidates = get_current_roadblock_candidates(
-        ego_state, map_api, route_roadblock_dict)
-    starting_block_ids = [
-        roadblock.id for roadblock in starting_block_candidates
-    ]
+        ego_state, map_api, route_roadblocks_dict)
+    starting_block_ids = [rb.id for rb in starting_block_candidates]
 
-    route_roadblocks = list(route_roadblock_dict.values())
-    route_roadblock_ids = list(route_roadblock_dict.keys())
+    # 이미 경로 안에 있으면 아무 것도 하지 않음
+    if starting_block.id in route_roadblock_ids:
+        return route_roadblocks, route_roadblock_ids
 
-    # Fix 1: when agent starts off-route
-    if starting_block.id not in route_roadblock_ids:
-        # Backward search if current roadblock not in route
-        graph_search = BreadthFirstSearchRoadBlock(route_roadblock_ids[0],
-                                                   map_api,
-                                                   forward_search=False)
-        (path, path_id), path_found = graph_search.search(
-            starting_block_ids, max_depth=search_depth_backward)
+    # --- 1단계: 경로 첫 도로에서 ego 쪽으로 거슬러 올라가 보기 (뒤에서부터 잇기) ---
+    graph_search = BreadthFirstSearchRoadBlock(route_roadblock_ids[0],
+                                               map_api,
+                                               forward_search=False)
+    (path,
+     path_id), path_found = graph_search.search(starting_block_ids,
+                                                max_depth=search_depth_backward)
 
-        if path_found:
-            route_roadblocks[:0] = path[:-1]
-            route_roadblock_ids[:0] = path_id[:-1]
+    if path_found and path:
+        # path = [경로 첫 도로 ... ego 쪽 도로] 이므로,
+        # 이미 경로에 포함된 첫 도로(path[-1])는 제외하고 나머지를 앞에 붙인다.
+        route_roadblocks[:0] = path[:-1]
+        route_roadblock_ids[:0] = path_id[:-1]
+        return route_roadblocks, route_roadblock_ids
 
-        else:
-            # Forward search to any route roadblock
-            graph_search = BreadthFirstSearchRoadBlock(starting_block.id,
-                                                       map_api,
-                                                       forward_search=True)
-            (path, path_id), path_found = graph_search.search(
-                route_roadblock_ids[:3], max_depth=search_depth_forward)
+    # --- 2단계: ego 쪽에서 기존 경로 앞부분 쪽으로 이어지는 길 찾기 (앞에서부터 잇기) ---
+    graph_search = BreadthFirstSearchRoadBlock(starting_block.id,
+                                               map_api,
+                                               forward_search=True)
+    (path,
+     path_id), path_found = graph_search.search(route_roadblock_ids[:3],
+                                                max_depth=search_depth_forward)
 
-            if path_found:
-                end_roadblock_idx = np.argmax(
-                    np.array(route_roadblock_ids) == path_id[-1])
+    if path_found and path and path_id:
+        # path 의 마지막 id 가 기존 경로 어디에 닿았는지 찾기
+        end_roadblock_idx = int(
+            np.argmax(np.array(route_roadblock_ids) == path_id[-1]))
 
-                route_roadblocks = route_roadblocks[end_roadblock_idx + 1:]
-                route_roadblock_ids = route_roadblock_ids[end_roadblock_idx +
-                                                          1:]
+        # 닿기 전까지의 기존 경로는 버리고, 그 뒤부터 유지
+        route_roadblocks = route_roadblocks[end_roadblock_idx + 1:]
+        route_roadblock_ids = route_roadblock_ids[end_roadblock_idx + 1:]
 
-                route_roadblocks[:0] = path
-                route_roadblock_ids[:0] = path_id
+        # ego→경로 연결 path 를 맨 앞에 붙인다
+        route_roadblocks[:0] = path
+        route_roadblock_ids[:0] = path_id
 
-    # Fix 2: check if roadblocks are linked, search for links if not
-    roadblocks_to_append = {}
+    return route_roadblocks, route_roadblock_ids
+
+
+def _fix_disconnected_route_segments(
+    map_api: AbstractMap,
+    route_roadblocks: List[RoadBlockGraphEdgeMapObject],
+    route_roadblock_ids: List[str],
+    search_depth_forward: int,
+) -> Tuple[List[RoadBlockGraphEdgeMapObject], List[str]]:
+    """경로 중간에 '뜬 구간(도로가 직접 맞닿지 않는 구간)'이 있으면,
+    그 사이를 메워 줄 중간 도로 조각들을 찾아 끼워 넣는다.
+
+    예를 들어,
+        [A, B, C] 라는 경로가 있을 때
+        실제 지도에서는 A → X → Y → B → C 이렇게 이어져야 한다면,
+        여기서 X, Y 를 자동으로 찾아 A 와 B 사이에 삽입하는 식이다.
+
+    알고리즘:
+        1) 인접한 두 도로 조각 (i, i+1)에 대해
+           - i+1 이 i 를 '이전 도로'로 갖고 있는지(incoming 연결) 확인한다.
+           - 있으면 이미 지도상으로 붙어 있으므로 통과.
+        2) 없다면, i 에서 i+1 로 이어지는 짧은 경로를 한 번 더 찾아본다.
+           - 찾은 경로 길이가 3 이상이면, 양 끝(i, i+1)을 제외한 중간 조각들만
+             "끼워 넣을 후보"로 기록한다.
+        3) 모든 쌍에 대해 후보를 모은 뒤,
+           기록해 둔 위치에 중간 조각들을 실제로 삽입한다.
+    """
+    roadblocks_to_append: Dict[int, Tuple[List[RoadBlockGraphEdgeMapObject],
+                                          List[str]]] = {}
+
     for i in range(len(route_roadblocks) - 1):
+        # 다음 도로 조각이 현재 도로를 incoming edge 로 갖는지 확인
         next_incoming_block_ids = [
             _roadblock.id
             for _roadblock in route_roadblocks[i + 1].incoming_edges
@@ -361,29 +391,169 @@ def route_roadblock_correction(
         if is_incoming:
             continue
 
+        # 직접 붙어 있지 않다면, 사이를 메울 수 있는 짧은 경로 탐색
         graph_search = BreadthFirstSearchRoadBlock(route_roadblock_ids[i],
                                                    map_api,
                                                    forward_search=True)
         (path, path_id), path_found = graph_search.search(
             route_roadblock_ids[i + 1], max_depth=search_depth_forward)
 
+        # path: [i, ..., i+1] 이므로, 중간 조각은 path[1:-1]
         if path_found and path and len(path) >= 3:
-            path, path_id = path[1:-1], path_id[1:-1]
-            roadblocks_to_append[i] = (path, path_id)
+            mid_path = path[1:-1]
+            mid_ids = path_id[1:-1]
+            roadblocks_to_append[i] = (mid_path, mid_ids)
 
-    # append missing intermediate roadblocks
+    # 실제 삽입 (앞에서부터 삽입하면 인덱스가 밀리므로 offset 사용)
     offset = 1
-    for i, (path, path_id) in roadblocks_to_append.items():
-        route_roadblocks[i + offset:i + offset] = path
-        route_roadblock_ids[i + offset:i + offset] = path_id
-        offset += len(path)
+    for i, (mid_path, mid_ids) in roadblocks_to_append.items():
+        route_roadblocks[i + offset:i + offset] = mid_path
+        route_roadblock_ids[i + offset:i + offset] = mid_ids
+        offset += len(mid_path)
 
-    # Fix 3: cut route-loops
-    if remove_route_loops_flag:
-        route_roadblocks, route_roadblock_ids = remove_route_loops(
-            route_roadblocks, route_roadblock_ids)
+    return route_roadblocks, route_roadblock_ids
 
-    return route_roadblock_ids
+
+def _maybe_remove_loops(
+    route_roadblocks: List[RoadBlockGraphEdgeMapObject],
+    route_roadblock_ids: List[str],
+    remove_route_loops_flag: bool,
+) -> Tuple[List[RoadBlockGraphEdgeMapObject], List[str]]:
+    """옵션에 따라 경로 끝부분의 '빙글빙글 도는 루프'를 잘라낸다.
+
+    - remove_route_loops_flag 가 False 이면 아무 작업도 하지 않는다.
+    - True 이면 remove_route_loops(...)를 호출해
+      교차면적이 큰 루프 구간 이후를 잘라낸다.
+    """
+    if not remove_route_loops_flag:
+        return route_roadblocks, route_roadblock_ids
+
+    # remove_route_loops 는 (route_roadblocks, route_roadblock_ids) 를 반환
+    route_roadblocks, route_roadblock_ids = remove_route_loops(
+        route_roadblocks, route_roadblock_ids)
+    return route_roadblocks, route_roadblock_ids
+
+
+def route_roadblock_correction(
+    ego_state: EgoState,
+    map_api: AbstractMap,
+    route_roadblock_ids: List[str],
+    search_depth_backward: int = 15,
+    search_depth_forward: int = 30,
+    remove_route_loops_flag: bool = True,
+) -> List[str]:
+    """주어진 roadblock ID 시퀀스를
+    실제 차량이 달릴 수 있는 '자연스러운 경로'에 가깝게 다듬는다.
+
+    이 함수가 하는 일은, 한마디로 말하면
+    **"지도 위에 흩어져 있는 도로 조각 ID 목록을,
+    끊기지 않고 앞뒤가 자연스럽게 이어지는 경로로 정리"**하는 것이다.
+
+    구체적으로는 세 가지 문제를 순서대로 손본다.
+
+    1) 시작점이 어긋난 경우(차량이 경로 밖에서 시작하는 경우) 앞부분 보정
+       -------------------------------------------------------------------
+       - 먼저 ego(또는 NPC)가 지금 어느 도로 조각 위에 서 있는지 추정한다.
+       - 그 도로 조각이 원래 경로에 없다면,
+         1. 경로의 가장 앞 도로에서 ego 쪽으로 거꾸로 따라 올라가며
+            이어지는 도로들을 찾는다.
+            · 찾으면 그 도로들을 경로 앞에 붙여서 "ego → 경로"가 이어지도록 한다.
+         2. 실패하면 이번엔 ego 쪽에서 기존 경로의 앞부분 쪽으로
+            짧은 연결 경로를 찾아본다.
+            · 연결 지점 이전의 오래된 경로는 버리고,
+              ego → 연결 지점까지의 경로를 앞에 붙인다.
+
+       이렇게 해서, “현재 위치에서부터 경로가 시작되는 느낌”이 되도록
+       출발 부분을 한 번 정리한다.
+
+    2) 중간에 끊긴 구간 메우기
+       ------------------------
+       - 경로 안에서 연달아 나오는 두 도로 조각 (A, B)을 살펴보며,
+         실제 지도에서도 A 바로 다음에 B 로 진입 가능한지 확인한다.
+       - 만약 둘 사이에 직접적인 이어짐이 없다면,
+         지도에서 A 에서 출발해 B 에 도달하는 짧은 도로열을 다시 찾아보고,
+         그 중간 조각들만 A와 B 사이에 끼워 넣는다.
+       - 예를 들면, 경로가 [A, B, C] 인데
+         실제론 A → X → Y → B → C 여야 한다면,
+         X, Y 를 자동으로 찾아 A 와 B 사이에 넣는 식이다.
+
+       이 과정을 거치면, 경로 중간에 순간이동하는 느낌 없이
+       한 조각에서 다음 조각으로 자연스럽게 이어진다.
+
+    3) 끝부분에서 빙글빙글 도는 루프 잘라내기(선택)
+       --------------------------------------------
+       - 어떤 시나리오에서는 경로가 뒤쪽에서 자기 자신과 크게 겹치며
+         "빙글빙글 도는 구간" 이 생길 수 있다.
+       - `remove_route_loops_flag=True` 이면,
+         이런 루프 구간을 찾아 그 지점 이후를 잘라낸다.
+       - False 로 두면 루프를 그대로 둔다
+         (예: NPC의 전체 이동 궤적을 보고 싶을 때).
+
+    Args:
+        ego_state:
+            - 현재 차량(ego 또는 NPC)의 상태.
+            - 이 위치를 기준으로 "경로가 어디서 시작해야 자연스러운지" 를 계산한다.
+        map_api:
+            - nuPlan 지도 API 핸들.
+        route_roadblock_ids: List[str]
+            - 보정 전 경로를 이루는 roadblock id 리스트.
+        search_depth_backward:
+            - ego 기준 앞부분을 보정할 때,
+              경로의 첫 roadblock 쪽으로 최대 몇 단계까지 거슬러 올라갈지(대략적인 깊이 제한).
+        search_depth_forward:
+            - 중간 연결/앞부분 보정 시,
+              앞으로 얼마나 짧은 경로까지 탐색할지(깊이 제한).
+        remove_route_loops_flag:
+            - True 이면 끝부분 루프를 잘라낸다.
+            - False 이면 그대로 둔다.
+
+    Returns:
+        List[str]:
+            - 보정이 끝난 후의 roadblock id 시퀀스.
+            - 항상 입력과 같은 형식의 리스트이며,
+              길이는 짧아지거나 길어질 수 있다.
+    """
+    # 1) id → roadblock 객체 매핑 준비
+    route_roadblocks_dict: Dict[
+        str, RoadBlockGraphEdgeMapObject] = _build_route_roadblocks_dict(
+            map_api=map_api,
+            route_roadblock_ids=route_roadblock_ids,
+        )
+
+    # dict 는 삽입 순서를 보존하므로, 원래 경로 순서 그대로 리스트화
+    route_roadblocks: List[RoadBlockGraphEdgeMapObject] = list(
+        route_roadblocks_dict.values())
+    route_roadblock_ids_ordered: List[str] = list(route_roadblocks_dict.keys())
+
+    # 2) 시작점 보정 (ego 가 경로 바깥에서 시작할 가능성 처리)
+    route_roadblocks, route_roadblock_ids_ordered = _fix_route_start_offroute(
+        ego_state=ego_state,
+        map_api=map_api,
+        route_roadblocks=route_roadblocks,
+        route_roadblock_ids=route_roadblock_ids_ordered,
+        route_roadblocks_dict=route_roadblocks_dict,
+        search_depth_backward=search_depth_backward,
+        search_depth_forward=search_depth_forward,
+    )
+
+    # 3) 경로 중간 끊긴 구간 메우기
+    route_roadblocks, route_roadblock_ids_ordered = \
+        _fix_disconnected_route_segments(
+            map_api=map_api,
+            route_roadblocks=route_roadblocks,
+            route_roadblock_ids=route_roadblock_ids_ordered,
+            search_depth_forward=search_depth_forward,
+        )
+
+    # 4) 필요 시 루프 제거
+    route_roadblocks, route_roadblock_ids_ordered = _maybe_remove_loops(
+        route_roadblocks=route_roadblocks,
+        route_roadblock_ids=route_roadblock_ids_ordered,
+        remove_route_loops_flag=remove_route_loops_flag,
+    )
+
+    # 최종 결과: id 리스트만 반환
+    return route_roadblock_ids_ordered
 
 
 def remove_route_loops(

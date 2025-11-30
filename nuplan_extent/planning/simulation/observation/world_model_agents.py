@@ -459,8 +459,8 @@ class WorldModelAgents(AbstractMLAgents):
         self._initialize_open_loop_detection_types(open_loop_detections_types)
         self._radius = radius
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
-        self.use_route_lanes = True
-        self.use_ego_plan = True
+        self.use_route_lanes = self.config.use_route_lanes
+        self.use_ego_plan = self.config.use_ego_plan
 
     def _initialize_open_loop_detection_types(
             self, open_loop_detections: List[str]) -> None:
@@ -878,7 +878,6 @@ class WorldModelAgents(AbstractMLAgents):
             # 시나리오가 끝나고도 계속 진행했을 때 최종적으로 도달해야 하는 포즈 (존재하지 않을 수도 있음)
             mission_goal=self._scenario.get_mission_goal(),
             # (x, y, yaw) 의 StateSE2
-            route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
             map_api=self._scenario.map_api,
             scenario=self._scenario,
             # 전문 운전자(ground truth)의 실제 마지막 상태 (항상 존재)

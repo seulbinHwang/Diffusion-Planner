@@ -63,7 +63,7 @@ class DataProcessor(object):
         self.init_future_tracked_objects_array_list: Optional[List[
             np.ndarray]] = None
         self._init_token_to_id: Optional[Dict[str, int]] = None
-        self._map_features = [
+        self._map_elements = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
         self._max_elements = {
@@ -306,13 +306,43 @@ class DataProcessor(object):
             past_cur_time_np,  # Optional[np.ndarray] # shape (T,)
         )
 
+    def _prepare_car_token_to_rr_ids_oa(
+        self,
+        scenario: NuPlanScenario,
+        use_route_lanes: bool = False,
+        neighbor_track_token: Optional[List[str]] = None,
+    ) -> Dict[str, Optional[List[str]]]:
+        if use_route_lanes and self.all_car_token_to_rr_ids is None:
+            present_tracked_objects: TrackedObjects \
+                = scenario.initial_tracked_objects.tracked_objects
+            past_tracked_objects: List[TrackedObjects] = [
+                tracked_objects.tracked_objects
+                for tracked_objects in scenario.get_past_tracked_objects(
+                    iteration=0,
+                    time_horizon=self.past_time_horizon,
+                    num_samples=self.num_past_poses)
+            ]
+            past_cur_tracked_objects = past_tracked_objects + [
+                present_tracked_objects
+            ]
+            self.all_car_token_to_rr_ids: Dict[
+                str, Optional[List[str]]] = get_npc_route_roadblock_ids(
+                    scenario,
+                    past_cur_tracked_objects,
+                    neighbor_track_token=None)
+        elif not use_route_lanes:
+            self.all_car_token_to_rr_ids = {}
+        car_token_to_rr_ids: Dict[
+            str, Optional[List[str]]] = self._get_car_token_to_rr_ids(
+                self.all_car_token_to_rr_ids, neighbor_track_token)
+        return car_token_to_rr_ids
+
     # Use for inference
     def observation_adapter(self,
                             iteration: int,
                             history_buffer: SimulationHistoryBuffer,
                             traffic_light_data: List[TrafficLightStatusData],
                             map_api: NuPlanMap,
-                            route_roadblock_ids: Optional[Dict[str, List[str]]],
                             device='cpu',
                             scenario: Optional[NuPlanScenario] = None,
                             use_route_lanes: bool = False,
@@ -387,56 +417,28 @@ class DataProcessor(object):
             ego_cur_pose_np=ego_cur_pose_np,
             filter_radius=self._filter_radius,
         )
-
-        ###################3
-        # 현재 프레임의 트래킹 컨테이너로부터, 선별된 neighbor들의 track token 추출
-        current_observation: Observation = observation_buffer[-1]
-        neighbor_track_token: List[Optional[str]] = get_neighbor_track_tokens(
-            present_tracked_objects=current_observation.tracked_objects,
-            agents_cur_frame_indices=agents_cur_frame_indices,
-            agents_num=self.max_agent_num,
+        ###################
+        (
+            route_roadblock_ids,
+            elements_to_object_polylines,
+            elements_to_traffic_light,
+            speed_limit_dict,
+            lanes_roadblock_id_list,
+        ) = self._prepare_map(
+            scenario=scenario,
+            ego_state=ego_state,
+            ego_point2d=ego_point2d,
+            ego_heading=ego_heading,
+            map_api=map_api,
+            traffic_light_data=traffic_light_data,
         )
-        '''
-        Map
-        '''
-        # Simply fixing disconnected routes without pre-searching for reference lines
-        if route_roadblock_ids and route_roadblock_ids != ['']:
-            route_roadblock_ids: List[str] = route_roadblock_correction(
-                ego_state, map_api, list(route_roadblock_ids))
-        else:
-            route_roadblock_ids = []
-        # route_roadblock_ids: List[str] = route_roadblock_correction(
-        #     ego_state, map_api, route_roadblock_ids)
-        # traffic_light_data: Dict[str, LaneSegmentTrafficLightData]
-        (coords, traffic_light_data,
-         speed_limit, lane_route) = get_neighbor_vector_set_map(
-             map_api, self._map_features, ego_point2d, ego_heading,
-             self._filter_radius,
-             traffic_light_data)  # List[TrafficLightStatusData]
-        # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
 
-        if use_route_lanes and self.all_car_token_to_rr_ids is None:
-            present_tracked_objects: TrackedObjects = scenario.initial_tracked_objects.tracked_objects
-            past_tracked_objects: List[TrackedObjects] = [
-                tracked_objects.tracked_objects
-                for tracked_objects in scenario.get_past_tracked_objects(
-                    iteration=0,
-                    time_horizon=self.past_time_horizon,
-                    num_samples=self.num_past_poses)
-            ]
-            past_cur_tracked_objects = past_tracked_objects + [
-                present_tracked_objects
-            ]
-            self.all_car_token_to_rr_ids: Dict[
-                str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                    scenario,
-                    past_cur_tracked_objects,
-                    neighbor_track_token=None)
-        elif not use_route_lanes:
-            self.all_car_token_to_rr_ids = {}
-        car_token_to_rr_ids: Dict[
-            str, Optional[List[str]]] = self._get_car_token_to_rr_ids(
-                self.all_car_token_to_rr_ids, neighbor_track_token)
+        car_token_to_rr_ids = self._prepare_car_token_to_rr_ids_oa(
+            scenario=scenario,
+            use_route_lanes=use_route_lanes,
+            neighbor_track_token=neighbor_track_token,
+        )
+
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         vector_map = map_process(
@@ -445,11 +447,11 @@ class DataProcessor(object):
             neighbor_track_token,
             neighbor_agents_current,
             ego_cur_pose_np,
-            coords,
-            traffic_light_data,  # traffic_light_data: Dict[str, LaneSegmentTrafficLightData]
-            speed_limit,
-            lane_route,
-            self._map_features,
+            elements_to_object_polylines,
+            elements_to_traffic_light,  # elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData]
+            speed_limit_dict,
+            lanes_roadblock_id_list,
+            self._map_elements,
             self._max_elements,
             self._max_points)
         # (num_agents, future_len, 3)
@@ -721,6 +723,78 @@ class DataProcessor(object):
             past_cur_tracked_objects,  # Optional[List[TrackedObjects]]
         )
 
+    def _prepare_map(
+        self,
+        scenario: NuPlanScenario,
+        ego_state: EgoState,
+        ego_point2d: Point2D,
+        ego_heading: float,
+        map_api: NuPlanMap,
+        traffic_light_data: Optional[List[TrafficLightStatusData]] = None,
+    ):
+        """지도 관련 입력(route/차선/신호/속도제한)을 한 번에 준비하는 공통 유틸.
+
+        공통 흐름:
+          1) 시나리오의 route_roadblock_ids 를 가져와 끊어진 구간을 보정한다.
+          2) ego 주변의 차선/경계/신호/속도제한 정보를 get_neighbor_vector_set_map 으로 뽑는다.
+             - 온라인(inference) 경로: 외부에서 넘어온 traffic_light_data 사용
+             - 오프라인(work) 경로: traffic_light_data 가 None 이므로 iteration=0 기준으로 자체 조회
+
+        Args:
+            scenario: nuPlan 시나리오 객체.
+            ego_state: 현재 ego 상태 (rear_axle 기준).
+            ego_point2d: ego 위치 (x, y).
+            ego_heading: ego 진행 방향(rad).
+            map_api: NuPlanMap 인스턴스.
+            traffic_light_data:
+                - observation_adapter 경로: 현재 시점의 신호등 리스트를 그대로 전달
+                - work 경로: None → 시나리오 0번 iteration 에서 조회
+
+        Returns:
+            Tuple[
+                route_roadblock_ids,
+                elements_to_object_polylines,
+                elements_to_traffic_light,
+                speed_limit_dict,
+                lanes_roadblock_id_list,
+            ]
+        """
+        # 1) route roadblock 보정
+        route_roadblock_ids = scenario.get_route_roadblock_ids()
+        if route_roadblock_ids != ['']:
+            route_roadblock_ids = route_roadblock_correction(
+                ego_state, map_api, list(route_roadblock_ids))
+        else:
+            route_roadblock_ids = []
+
+        # 2) 신호등 데이터 준비
+        if traffic_light_data is None:
+            traffic_light_data = list(
+                scenario.get_traffic_light_status_at_iteration(0))
+
+        # 3) ego 주변 차선/경계/신호/속도제한 추출
+        (
+            elements_to_object_polylines,
+            elements_to_traffic_light,
+            speed_limit_dict,
+            lanes_roadblock_id_list,
+        ) = get_neighbor_vector_set_map(
+            map_api,
+            self._map_elements,
+            ego_point2d,
+            ego_heading,
+            self._filter_radius,
+            traffic_light_data,
+        )
+
+        return (
+            route_roadblock_ids,
+            elements_to_object_polylines,
+            elements_to_traffic_light,
+            speed_limit_dict,
+            lanes_roadblock_id_list,
+        )
+
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
 
@@ -799,40 +873,36 @@ class DataProcessor(object):
             assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
                 f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
 
-            neighbor_track_token: List[
-                Optional[str]] = get_neighbor_track_tokens(
-                    present_tracked_objects=present_tracked_objects,
-                    agents_cur_frame_indices=agents_cur_frame_indices,
-                    agents_num=self.max_agent_num,
-                )
             # (agent_num, 11)
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
             '''
             Map
             '''
-            route_roadblock_ids = scenario.get_route_roadblock_ids()
-            traffic_light_data = list(
-                scenario.get_traffic_light_status_at_iteration(0))
-            if route_roadblock_ids != ['']:
-                route_roadblock_ids = route_roadblock_correction(
-                    ego_state, map_api, route_roadblock_ids)
+            (
+                route_roadblock_ids,
+                elements_to_object_polylines,
+                elements_to_traffic_light,
+                speed_limit_dict,
+                lanes_roadblock_id_list,
+            ) = self._prepare_map(
+                scenario=scenario,
+                ego_state=ego_state,
+                ego_point2d=ego_point2d,
+                ego_heading=ego_heading,
+                map_api=map_api,
+                # traffic_light_data=None  → iteration 0 기준으로 내부에서 가져옴
+            )
             # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
             car_token_to_rr_ids: Dict[
                 str, Optional[List[str]]] = get_npc_route_roadblock_ids(
                     scenario, past_cur_tracked_objects, neighbor_track_token)
 
-            (coords, traffic_light_data, speed_limit,
-             lane_route) = get_neighbor_vector_set_map(map_api,
-                                                       self._map_features,
-                                                       ego_point2d, ego_heading,
-                                                       self._filter_radius,
-                                                       traffic_light_data)
-            vector_map = map_process(route_roadblock_ids, car_token_to_rr_ids,
-                                     neighbor_track_token,
-                                     neighbor_agents_current, ego_cur_pose_np,
-                                     coords, traffic_light_data, speed_limit,
-                                     lane_route, self._map_features,
-                                     self._max_elements, self._max_points)
+            vector_map = map_process(
+                route_roadblock_ids, car_token_to_rr_ids, neighbor_track_token,
+                neighbor_agents_current, ego_cur_pose_np,
+                elements_to_object_polylines, elements_to_traffic_light,
+                speed_limit_dict, lanes_roadblock_id_list, self._map_elements,
+                self._max_elements, self._max_points)
 
             # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
             try:

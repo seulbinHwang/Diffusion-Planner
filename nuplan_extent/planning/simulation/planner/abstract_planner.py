@@ -1,5 +1,24 @@
 from typing import List, Optional, Dict
+from collections import defaultdict
+from typing import Dict, List
 
+import shapely.geometry as geom
+
+from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.maps.abstract_map import AbstractMap, MapObject
+from nuplan.common.maps.maps_datatypes import SemanticMapLayer, VectorLayer
+from nuplan.common.maps.nuplan_map.nuplan_map import NuPlanMap
+from collections import defaultdict
+from typing import Dict, List
+
+import numpy as np
+import shapely.geometry as geom
+from shapely import affinity
+
+from nuplan.common.actor_state.state_representation import Point2D
+from nuplan.common.maps.abstract_map import AbstractMap, MapObject
+from nuplan.common.maps.maps_datatypes import SemanticMapLayer, VectorLayer
+from nuplan.common.maps.nuplan_map.nuplan_map import NuPlanMap
 from dataclasses import dataclass
 from nuplan.common.actor_state.state_representation import StateSE2
 from nuplan.common.maps.abstract_map import AbstractMap
@@ -17,8 +36,6 @@ class HorizonPlannerInitialization:
     This class represents required data to initialize a planner.
     """
 
-    # The state which was achieved by expert driver in a scenario
-    route_roadblock_ids: List[str]  # Roadblock ids comprising goal route
     # The mission goal which commonly is not achievable in a single scenario
     mission_goal: StateSE2
     map_api: AbstractMap  # The API towards maps.

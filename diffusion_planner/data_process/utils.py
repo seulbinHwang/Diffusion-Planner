@@ -250,18 +250,41 @@ def _prefer_rr_on_conflict(
 
 
 def _map_object_to_geometry(obj: MapObject) -> Optional[geom.base.BaseGeometry]:
-    """MapObject로부터 Shapely 기하를 얻는다.
+    """맵 객체(MapObject)에서 도형(점/선/면) 정보를 꺼내는 작은 도우미 함수.
 
-    우선순위:
-        1) obj.polygon 이 존재하면 그대로 사용
-        2) obj.baseline_path.discrete_path 가 있으면 LineString으로 구성
-        3) 둘 다 없으면 None
+    이 함수는 나중에
+    `get_directional_proximal_map_objects` 같은 곳에서
+    “이 물체가 내가 만든 영역과 겹치는지”를 확인하기 위해,
+    맵 객체를 Shapely에서 이해할 수 있는 도형으로 바꿔주는 역할을 한다.
+
+    동작 규칙
+    --------
+    1) 먼저 `obj.polygon` 이 있는지 확인한다.
+       - 예: 도로 묶음(roadblock), 교차로, 횡단보도 등은 보통 폴리곤(면)으로 제공된다.
+       - 있으면 그대로 돌려준다.
+         · 반환 도형 예시: Polygon
+
+    2) 폴리곤이 없다면, 차선처럼 “중심선 polyline” 형태를 갖고 있는지 본다.
+       - `obj.baseline_path.discrete_path` 가 있는 경우:
+         · 이 안에는 (x, y, heading) 형태의 점들이 순서대로 들어있다고 보면 된다.
+           - 길이: N
+           - 좌표 배열로 바꾸면 개념적으로 (N, 2) 모양
+         · 이 점들로 Shapely LineString 을 만들어 반환한다.
+           - N >= 2 인 경우에만 선(LineString)으로 만들고,
+           - N == 1 이면 점(Point)으로 반환한다.
+
+    3) 위 두 가지 경우 모두 아니면, 공개된 속성만으로는 모양을 알 수 없으므로
+       `None` 을 돌려준다.
 
     Args:
-        obj (MapObject): NuPlan 맵 객체.
+        obj (MapObject):
+            - NuPlan 맵에서 가져온 아무 종류의 맵 객체.
+            - 예: 차선, 차선연결, 도로묶음, 교차로 등.
 
     Returns:
-        Optional[geom.base.BaseGeometry]: Shapely Polygon/LineString/Point 등. 없으면 None.
+        Optional[geom.base.BaseGeometry]:
+            - Polygon / LineString / Point 같은 Shapely 도형 객체.
+            - 도형 정보를 만들 수 없을 때는 `None`.
     """
     # 1) 다각형이 있는 타입(예: Lane, RoadBlock, Connector 등)
     polygon = getattr(obj, "polygon", None)
@@ -271,6 +294,7 @@ def _map_object_to_geometry(obj: MapObject) -> Optional[geom.base.BaseGeometry]:
     # 2) 차선류 등: baseline_path → LineString
     baseline_path = getattr(obj, "baseline_path", None)
     if baseline_path is not None and hasattr(baseline_path, "discrete_path"):
+        # pts: 길이 = N, 각 원소 = (x, y)  → 개념적 shape: (N, 2)
         pts = [(n.x, n.y) for n in baseline_path.discrete_path]
         if len(pts) >= 2:
             return geom.LineString(pts)
@@ -288,55 +312,325 @@ def get_directional_proximal_map_objects(
     radius: float,
     layers: List[SemanticMapLayer],
 ) -> Dict[SemanticMapLayer, List[MapObject]]:
-    """heading 방향으로 회전된 정사각형(변=2*radius) 내부와 교차하는 객체를 조회한다.
+    """ego 진행 방향을 기준으로 회전된 정사각형 안에 걸치는 맵 객체를 조회한다.
 
-    구현 방식(공개 API 기반):
-        1) 먼저 R' = radius * sqrt(2) 로 키운 축정렬 AABB로 coarse 후보를
-           `get_proximal_map_objects`로 가져온다.
-        2) Shapely로 heading만큼 회전시킨 정사각형 패치를 만들고,
-           각 MapObject의 기하(Polygon 또는 LineString)와 교차하는 것만 남긴다.
+    이 함수는 NuPlanMap 의 :meth:`get_proximal_map_objects` 와 비슷하지만,
+    패치 모양이 다르다.
+
+    - 기존: point 를 중심으로 한 **가로·세로 방향 정사각형**
+        · [x - radius, x + radius] × [y - radius, y + radius]
+    - 이 함수: point 를 중심으로 한 **ego heading 방향에 맞춰 회전된 정사각형**
+        · 한 변 길이: 2 * radius
+        · 한 변이 ego heading 과 평행, 다른 변은 그에 수직
+
+    포함 기준
+    ----------
+    각 레이어의 모든 객체에 대해, 객체의 도형(geometry)이
+    회전된 정사각형과 `intersects` 인지 검사한다.
+
+    Shapely 의 `intersects` 는
+    “도형이 서로 **한 점이라도 겹치면** True” 이므로, 아래 경우 모두 포함된다.
+
+    * 정사각형 안에 완전히 들어온 경우
+    * 정사각형 모서리에 살짝 걸치는 경우
+    * 거의 밖에 있지만, 일부 꼭짓점이나 변이 정사각형에 닿는 경우
+
+    내부 동작 흐름
+    --------------
+    1) 지원 레이어 확인
+        - `map_api.get_available_map_objects()` 로 실제 지원 레이어 목록을 가져온다.
+        - 요청한 `layers` 중 지원되지 않는 레이어가 있으면 assert 로 바로 실패시킨다.
+
+    2) 회전 전 정사각형 패치 생성 (축에 정렬된 네모)
+        - x 방향 범위: [point.x - radius, point.x + radius]
+        - y 방향 범위: [point.y - radius, point.y + radius]
+        - 이 범위로 shapely 의 `geom.box(...)` 를 사용해 네모(Polygon)를 만든다.
+          · `patch`: Polygon, 모양 = 축에 정렬된 정사각형
+          · 개념적 shape: 직사각형 이지만, 여기서는 항상 정사각형
+            - 한 변 길이 = 2 * radius
+
+    3) ego heading 기준으로 정사각형 회전
+        - heading(라디안) → degree 로 변환: `angle_deg = heading * 180 / π`
+        - `affinity.rotate(patch, angle_deg, origin=(point.x, point.y))` 호출
+            · origin 을 ego 위치로 지정해서,
+              정사각형이 ego 위치를 중심으로 회전하게 만든다.
+        - 결과:
+            · `rotated_patch`: Polygon
+            · 한 변은 ego 진행 방향과 평행,
+              나머지 한 변은 그에 정확히 수직
+
+    4) 레이어별로 geometry ∩ rotated_patch 검사
+        - 여기서부터는 NuPlanMap 구체 구현에 의존하므로
+          `map_api` 가 `NuPlanMap` 인지 확인 후 캐스팅한다.
+        - 각 레이어에 대해:
+            a) `layer_df = map_api._get_vector_map_layer(layer)` 로
+               해당 레이어의 벡터 데이터를 가져온다.
+               · `layer_df["geometry"]`: 각 행의 도형(Polygon 등), shape ≈ (num_objects,)
+            b) `mask = layer_df["geometry"].intersects(rotated_patch)` 로
+               각 도형이 회전된 정사각형과 겹치는지 계산한다.
+               · `mask`: pandas Series(bool), shape: (num_objects,)
+                   - True  → 정사각형과 최소 한 점이라도 겹침
+                   - False → 전혀 안 겹침
+            c) `map_object_ids = layer_df.loc[mask]["fid"]` 로
+               겹치는 행들의 id 를 뽑는다.
+            d) `map_api.get_map_object(fid, layer)` 를 사용해
+               실제 `MapObject` 인스턴스를 얻는다.
+               이렇게 얻은 객체들을 리스트로 모아 `object_map[layer]` 에 저장한다.
+
+    자료 구조 / shape 정리
+    ----------------------
+    입력
+      - map_api (AbstractMap):
+          · 실제로는 NuPlanMap 인스턴스여야 한다.
+          · 그렇지 않으면 TypeError 를 일으킨다.
+
+      - point (Point2D):
+          · ego 위치 (x, y), 단위 m
+
+      - heading (float):
+          · ego 진행 방향(라디안)
+
+      - radius (float):
+          · 회전된 정사각형 한 변의 절반 길이 [m]
+          · 정사각형 전체 크기 = (2 * radius) × (2 * radius)
+
+      - layers (List[SemanticMapLayer]):
+          · 예: [SemanticMapLayer.LANE, SemanticMapLayer.ROADBLOCK]
+
+    중간 변수
+      - patch: geom.Polygon
+          · 축에 정렬된 정사각형
+          · 좌표 범위: x ∈ [x-radius, x+radius], y ∈ [y-radius, y+radius]
+
+      - rotated_patch: geom.Polygon
+          · ego heading 에 따라 회전된 정사각형
+          · patch 와 꼭짓점 좌표는 같지만, 회전된 상태
+
+      - layer_df: VectorLayer (실제로는 GeoDataFrame)
+          · 각 레이어의 벡터 데이터
+          · `layer_df["geometry"]`: 각 객체의 도형, 길이 ≈ num_objects
+
+      - mask: pandas.Series[bool]
+          · shape: (num_objects,)
+          · True 인 인덱스는 rotated_patch 와 교차하는 객체
+
+    출력
+      - object_map: Dict[SemanticMapLayer, List[MapObject]]
+          · key: 입력으로 넘긴 각 레이어
+          · value: 해당 레이어에서 “회전된 정사각형과 조금이라도 겹치는” MapObject 리스트
+          · 각 리스트 길이 = 해당 레이어에서 조건을 만족하는 객체 수
 
     Args:
-        map_api (AbstractMap): 맵 API(NuPlanMap 등).
-        point (Point2D): [m] 패치 중심 좌표.
-        radius (float): [m] 회전 정사각형의 반변 길이(= 한 변의 절반).
-        heading (float): [rad] 패치 회전 각. 0이면 세계 좌표 x축 정렬.
-        layers (List[SemanticMapLayer]): 조회할 레이어 목록.
+        map_api (AbstractMap):
+            NuPlanMap 인스턴스여야 한다(내부 벡터 레이어 접근 필요).
+        point (Point2D):
+            정사각형 중심이 될 ego 위치 (x, y).
+        heading (float):
+            ego 진행 방향 (라디안).
+        radius (float):
+            정사각형 한 변의 절반 길이 [m].
+        layers (List[SemanticMapLayer]):
+            조회할 레이어 목록.
 
     Returns:
-        Dict[SemanticMapLayer, List[MapObject]]: 레이어별 교차 객체 목록.
+        Dict[SemanticMapLayer, List[MapObject]]:
+            레이어별로, 회전된 정사각형과 조금이라도 겹치는 MapObject 들을 모은 딕셔너리.
+
+    Raises:
+        TypeError:
+            - map_api 가 NuPlanMap 타입이 아닐 때.
+        AssertionError:
+            - 요청한 레이어 중 현재 맵에서 지원하지 않는 레이어가 있을 때.
     """
-    supported_layers = map_api.get_available_map_objects()
-    unsupported = [ly for ly in layers if ly not in supported_layers]
-    assert len(unsupported) == 0, (
-        f"Object representation for layer(s): {unsupported} is unavailable")
+    if not isinstance(map_api, NuPlanMap):
+        raise TypeError(
+            f"`get_directional_proximal_map_objects` 는 NuPlanMap 전용입니다. "
+            f"받은 타입: {type(map_api)!r}")
 
-    # (1) AABB(축정렬) 기반 coarse 후보 조회: 회전 정사각형을 항상 포함하도록 R' = R * sqrt(2)
-    coarse_radius = float(radius) * math.sqrt(2.0)
-    coarse_candidates = map_api.get_proximal_map_objects(
-        point, coarse_radius, layers)
+    # 1) 지원 레이어 확인
+    supported_layers: List[
+        SemanticMapLayer] = map_api.get_available_map_objects()
+    unsupported_layers: List[SemanticMapLayer] = [
+        layer for layer in layers if layer not in supported_layers
+    ]
+    assert len(unsupported_layers) == 0, (
+        f"Object representation for layer(s): {unsupported_layers} is unavailable"
+    )
 
-    # (2) 회전된 정사각형 패치 생성
+    # 2) 회전 전 축정렬 정사각형 생성
     x_min, x_max = point.x - radius, point.x + radius
     y_min, y_max = point.y - radius, point.y + radius
-    rotated_patch = geom.box(x_min, y_min, x_max, y_max)
-    rotated_patch = affinity.rotate(rotated_patch,
-                                    math.degrees(heading),
-                                    origin=(point.x, point.y))
+    patch: geom.Polygon = geom.box(x_min, y_min, x_max, y_max)
 
-    # (3) 실제 교차 여부로 필터링
-    filtered: Dict[SemanticMapLayer, List[MapObject]] = defaultdict(list)
+    # 3) ego heading 기준으로 정사각형 회전 (deg 단위 필요)
+    angle_deg: float = float(heading) * 180.0 / np.pi
+    rotated_patch: geom.Polygon = affinity.rotate(
+        patch,
+        angle_deg,
+        origin=(point.x, point.y),
+    )
+
+    object_map: Dict[SemanticMapLayer, List[MapObject]] = defaultdict(list)
+
+    # 4) 각 레이어에서 rotated_patch 와 intersects 인 객체만 선택
     for layer in layers:
-        objs = coarse_candidates.get(layer, [])
-        for obj in objs:
-            shape = _map_object_to_geometry(obj)
-            if shape is None:
-                # 공개 속성으로 기하를 얻을 수 없는 타입은 보수적으로 스킵(축정렬 결과만으로는 방향성 보장 불가)
-                continue
-            if shape.intersects(rotated_patch):
-                filtered[layer].append(obj)
+        # VectorLayer 는 GeoDataFrame 과 비슷한 구조라고 보면 된다.
+        layer_df = map_api._get_vector_map_layer(layer)
 
-    return filtered
+        # geometry 컬럼과 회전된 정사각형의 "겹침 여부"를 벡터화해서 계산
+        # mask: (num_objects,) bool
+        mask = layer_df["geometry"].intersects(rotated_patch)
+
+        # mask 가 True 인 행들의 fid 를 가져온다.
+        map_object_ids = layer_df.loc[mask]["fid"]
+
+        # fid 로 실제 MapObject 인스턴스를 생성
+        object_map[layer] = [
+            map_api.get_map_object(map_object_id, layer)
+            for map_object_id in map_object_ids
+        ]
+
+    return object_map
+
+
+def get_circular_proximal_map_objects(
+    map_api: AbstractMap,
+    point: Point2D,
+    radius: float,
+    layers: List[SemanticMapLayer],
+) -> Dict[SemanticMapLayer, List[MapObject]]:
+    """원(동그라미) 반경 안에 *조금이라도 걸치는* 맵 객체들을 레이어별로 모아준다.
+
+    이 함수는 NuPlanMap 의 :meth:`get_proximal_map_objects` 와 비슷하지만,
+    **축에 정렬된 네모** 대신 **원 모양 영역**을 기준으로 객체를 찾는다.
+
+    - 기존: point 를 중심으로 한 네모 영역
+        · x ∈ [point.x - radius, point.x + radius]
+        · y ∈ [point.y - radius, point.y + radius]
+    - 이 함수: point 를 중심으로 한 **원(반지름 radius)**
+
+    포함 기준
+    ----------
+    각 레이어의 모든 객체에 대해, 그 객체의 도형(geometry)이
+    이 원과 shapely 의 `intersects` 여부를 체크한다.
+
+    - `intersects(...)` 가 True 인 경우:
+        · 원 안에 완전히 들어온 경우
+        · 원 경계에 살짝 걸친 경우
+        · 객체 대부분은 밖에 있지만 일부 모서리/변만 원에 닿는 경우
+      모두 **포함**된다.
+
+    내부 동작 순서
+    --------------
+    1) 입력 맵 타입 확인
+        - `map_api` 가 실제로 NuPlanMap 인스턴스인지 확인한다.
+          (내부 벡터 레이어에 접근해야 하므로 필수)
+
+    2) 지원 레이어 검증
+        - `map_api.get_available_map_objects()` 로 현재 맵에서 지원하는 레이어 목록을 얻는다.
+        - 요청한 `layers` 중 지원하지 않는 레이어가 있으면 `assert` 로 바로 실패시킨다.
+
+    3) 원(원판) 도형 생성
+        - 중심점: `center = geom.Point(point.x, point.y)`
+        - 원 도형: `patch = center.buffer(radius)`
+          · `patch` 는 Shapely Polygon 이고, 원을 다각형으로 근사한 결과.
+          · 개념적으로는 “반지름이 radius 인 원”이라고 보면 된다.
+
+    4) 레이어별 geometry ∩ 원 검사
+        - 각 레이어에 대해:
+            a) `layer_df = map_api._get_vector_map_layer(layer)`
+               · NuPlan 내부의 벡터 레이어(GeoDataFrame 유사 구조) 조회
+               · `layer_df["geometry"]` 컬럼에는 각 행의 도형(Polygon 등)이 들어 있음
+                 - shape: (num_objects,)
+            b) `mask = layer_df["geometry"].intersects(patch)`
+               · `mask`: 길이 (num_objects,) 의 bool Series
+               · True  → 해당 geometry 가 원과 한 점이라도 겹친다
+               · False → 전혀 겹치지 않는다
+            c) `map_object_ids = layer_df.loc[mask]["fid"]`
+               · 원과 겹치는 객체들의 id(fId)만 추출
+            d) 각 id 에 대해 `map_api.get_map_object(fid, layer)` 를 호출하여
+               실제 `MapObject` 인스턴스를 만들고 리스트에 담는다.
+        - 이렇게 만들어진 리스트를 `object_map[layer]` 에 저장한다.
+
+    자료 구조 / shape 정리
+    ----------------------
+    입력
+      - map_api (AbstractMap):
+          · 실제 타입: NuPlanMap (아니면 TypeError 발생)
+      - point (Point2D):
+          · ego 위치 (x, y), 단위 m
+      - radius (float):
+          · 원의 반지름 [m]
+      - layers (List[SemanticMapLayer]):
+          · 예: [SemanticMapLayer.LANE, SemanticMapLayer.ROADBLOCK]
+
+    중간 변수
+      - center: shapely.geometry.Point
+          · (point.x, point.y)
+      - patch: shapely.geometry.Polygon
+          · `center.buffer(radius)` 로 만든 원 모양 영역
+      - layer_df: VectorLayer (GeoDataFrame 비슷)
+          · `layer_df["geometry"]`: 길이 = num_objects
+      - mask: pandas.Series(bool)
+          · shape: (num_objects,)
+          · True 인 인덱스만 원과 겹치는 객체
+
+    출력
+      - object_map: Dict[SemanticMapLayer, List[MapObject]]
+          · key: 입력으로 받은 각 레이어
+          · value: 해당 레이어에서 원과 조금이라도 겹치는 맵 객체 리스트
+
+    Args:
+        map_api (AbstractMap):
+            NuPlanMap 인스턴스여야 한다. (내부 벡터 레이어 접근 필요)
+        point (Point2D):
+            원의 중심이 될 포인트 (x, y).
+        radius (float):
+            원의 반경 [m].
+        layers (List[SemanticMapLayer]):
+            조회할 레이어 목록.
+
+    Returns:
+        Dict[SemanticMapLayer, List[MapObject]]:
+            레이어별로, 중심 원과 한 점이라도 겹치는 MapObject 들을 모은 딕셔너리.
+
+    Raises:
+        TypeError:
+            - map_api 가 NuPlanMap 타입이 아닐 때.
+        AssertionError:
+            - 요청한 레이어 중 지원되지 않는 레이어가 있을 때.
+    """
+    # 1) 요청 레이어가 실제로 지원되는지 확인
+    supported_layers: List[
+        SemanticMapLayer] = map_api.get_available_map_objects()
+    unsupported_layers: List[SemanticMapLayer] = [
+        layer for layer in layers if layer not in supported_layers
+    ]
+    assert len(unsupported_layers) == 0, (
+        f"Object representation for layer(s): {unsupported_layers} is unavailable"
+    )
+
+    # 2) 원(패치) 생성: 중심은 point, 반경은 radius
+    center: geom.Point = geom.Point(point.x, point.y)
+    patch: geom.Polygon = center.buffer(radius)
+
+    object_map: Dict[SemanticMapLayer, List[MapObject]] = defaultdict(list)
+
+    # 3) 각 레이어에서, 원과 intersects 인 geometry 만 선택
+    for layer in layers:
+        layer_df = map_api._get_vector_map_layer(layer)
+
+        # geometry 가 원(patch)와 한 점이라도 겹치는 행만 선택
+        # mask: (num_objects,) bool
+        mask = layer_df["geometry"].intersects(patch)
+        map_object_ids = layer_df.loc[mask]["fid"]
+
+        object_map[layer] = [
+            map_api.get_map_object(map_object_id, layer)
+            for map_object_id in map_object_ids
+        ]
+
+    return object_map
 
 
 def build_agent_route_lane_order(
