@@ -577,7 +577,7 @@ def _pad_agent_states_with_zeros_w_token(
     return pad_agent_trajectories
 
 
-def _process_ego_past_states(
+def build_ego_past_feature(
         past_cur_ego_world_10: np.ndarray,  # (num_frames, 10)
         ego_cur_pose_np: np.ndarray,  # (3,)
 ) -> np.ndarray:  # (num_frames, 11)
@@ -874,74 +874,82 @@ def _build_present_static_feature_6(
     return present_static_feature_6
 
 
-def _select_neighbor_agents_and_build_past(
+from typing import Optional, List, Tuple  # 이미 있으면 중복 import는 제거해도 OK
+
+
+def _compute_valid_sorted_indices(
     all_frame_np_agents_local: np.
     ndarray,  # (num_frames, current_agents_num, 9)
-    current_agent_types_list: List[
-        TrackedObjectType],  # 길이 = current_agents_num
-    agents_states_dim: int,
-    max_agent_num: int,
-    max_pedestrians: int,
-    max_bicycles: int,
-) -> Tuple[np.ndarray, np.ndarray, List[int]]:
-    """이고 기준 에이전트 텐서에서, 가까운 에이전트들을 선택하여
-    고정 크기 이웃 궤적 텐서를 구성한다.
-
-    이 함수는 이미 ego 기준으로 정규화된 에이전트 시퀀스
-    (`all_frame_np_agents_local`)에서, **어떤 에이전트를 몇 개 선택해서
-    (K, num_frames, 11) 형태의 이웃 궤적 텐서를 만들지**를 결정합니다.
-    여기서 K는 실제로 선택된 에이전트 수이며, `K ≤ max_agent_num` 입니다.
-
-    선택 알고리즘은 기존과 동일하게:
-      1) 현재 프레임에서 ego 와의 거리 오름차순 정렬
-      2) 타입별 분리(보행자/자전거/차량)
-      3) 보행자→자전거→차량 순으로 타입별 상한 적용
-      4) 최종 선택 집합을 거리 기준으로 다시 정렬
-    을 수행합니다.
-
-    단, 출력 텐서 첫 번째 축은 항상 `max_agent_num`이 아니라
-    **실제 선택된 개수 K**로 맞춥니다.
-    (=> 실제 에이전트 수가 `max_agent_num`보다 적으면 패딩 행을 만들지 않음)
+    filter_radius: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """filter_radius 를 적용한 뒤, ego와의 거리 기준으로 에이전트 인덱스를 정렬한다.
 
     Args:
-        all_frame_np_agents_local (np.ndarray):
+        all_frame_np_agents_local:
             - shape: (num_frames, current_agents_num, 9)
-            - [x, y, cos(heading), sin(heading), vx, vy, width, length, id]
-        current_agent_types_list (List[TrackedObjectType]):
-            - 길이: current_agents_num
-            - 현재 프레임의 에이전트 타입 리스트.
-        agents_states_dim (int):
-            - 동적 상태 차원 수(=8).
-        max_agent_num (int):
-            - 최대로 선택할 이웃 에이전트 슬롯 수(상한).
-        max_pedestrians (int):
-            - 선택할 보행자의 최대 수.
-        max_bicycles (int):
-            - 선택할 자전거의 최대 수.
+        filter_radius:
+            - None 이 아니면, ego 기준 거리 <= filter_radius 인 에이전트만 사용.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, List[int]]:
-            - neighbor_agents_past:
-                · shape: (K, num_frames, 11)  # K ≤ max_agent_num
-                · [x, y, cos, sin, vx, vy, width, length, id, onehot_vehicle, onehot_ped, onehot_bike]
-            - neighbors_id:
-                · shape: (K,)
-                · 각 슬롯에 대응되는 track_id.
-            - agents_cur_frame_indices:
-                · 길이: K
-                · 선택된 에이전트들의 “현재 프레임 기준 인덱스” 리스트.
+        sorted_cur_agent_indices:
+            - shape: (M,)  # M = 유효 에이전트 수
+            - ego 로부터 가까운 순서대로 정렬된 현재 프레임 인덱스.
+        dist_from_cur_agent_to_ego:
+            - shape: (current_agents_num,)
+            - 각 에이전트의 ego 기준 2D 거리.
     """
-    num_frames: int = all_frame_np_agents_local.shape[0]
-
-    # dist_from_cur_agent_to_ego: (current_agents_num,)
+    # 현재 프레임(마지막 프레임 기준)에서 ego까지의 거리: (current_agents_num,)
     dist_from_cur_agent_to_ego = np.linalg.norm(
         all_frame_np_agents_local[-1, :, :2], axis=-1)
 
-    # sorted_cur_agent_indices: (current_agents_num,) # 거리 기준 오름차순
-    sorted_cur_agent_indices = np.argsort(dist_from_cur_agent_to_ego)
+    current_agents_num: int = all_frame_np_agents_local.shape[1]
 
-    ##################
-    # ── 타입별 거리 오름차순 인덱스 수집 ───────────────────────────
+    # filter_radius 내의 에이전트만 후보로 사용
+    if filter_radius is not None:
+        valid_mask = dist_from_cur_agent_to_ego <= float(filter_radius)
+        valid_indices = np.nonzero(valid_mask)[0]  # (M,)
+    else:
+        valid_indices = np.arange(current_agents_num,
+                                  dtype=int)  # (current_agents_num,)
+
+    if valid_indices.size == 0:
+        # 유효한 에이전트가 하나도 없는 경우
+        return np.zeros((0,), dtype=int), dist_from_cur_agent_to_ego
+
+    # 유효한 에이전트들만 뽑아서 거리 기준 정렬
+    dist_valid = dist_from_cur_agent_to_ego[valid_indices]  # (M,)
+    order_local = np.argsort(dist_valid)  # (M,)
+    sorted_cur_agent_indices = valid_indices[order_local]  # (M,)
+
+    return sorted_cur_agent_indices, dist_from_cur_agent_to_ego
+
+
+def _select_indices_with_type_cap(
+        sorted_cur_agent_indices: np.ndarray,  # (M,)
+        current_agent_types_list: List[TrackedObjectType],
+        max_agent_num: int,
+        max_pedestrians: int,
+        max_bicycles: int,
+        dist_from_cur_agent_to_ego: np.ndarray,  # (current_agents_num,)
+) -> np.ndarray:
+    """보행자/자전거 상한을 적용하여 에이전트를 선택한다.
+
+    절차:
+        1) sorted_cur_agent_indices 를 타입별로 세 그룹으로 나눈다.
+           - 보행자 / 자전거 / 차량
+        2) 보행자 → 자전거 → 차량 순으로 슬롯을 채우되,
+           각각 max_pedestrians / max_bicycles / 나머지 로 상한을 둔다.
+        3) 최종 선택 집합을 ego-거리 기준으로 다시 정렬하고,
+           max_agent_num 개까지 사용한다.
+
+    Returns:
+        agents_cur_frame_indices:
+            - shape: (K,), K ≤ max_agent_num
+    """
+    if max_agent_num <= 0:
+        return np.zeros((0,), dtype=int)
+
+    # 타입별로 거리 오름차순 리스트 분리
     ped_sorted_indices = [
         idx for idx in sorted_cur_agent_indices
         if current_agent_types_list[idx] == TrackedObjectType.PEDESTRIAN
@@ -955,8 +963,7 @@ def _select_neighbor_agents_and_build_past(
         if current_agent_types_list[idx] == TrackedObjectType.VEHICLE
     ]
 
-    # ── 보행자/자전거 상한 적용(하드 캡) ────────────────────────────
-    # agent_num을 넘지 않도록 캡 자체도 안전하게 제한
+    # 보행자/자전거 상한 적용 (max_agent_num을 넘지 않도록)
     ped_cap = min(max_pedestrians, max_agent_num)
     sel_peds = ped_sorted_indices[:ped_cap]
 
@@ -964,102 +971,301 @@ def _select_neighbor_agents_and_build_past(
     bike_cap = min(max_bicycles, remain)
     sel_bikes = bike_sorted_indices[:bike_cap]
 
-    # ── 남는 슬롯은 차량으로 채움(차량은 상한 없음) ───────────────
     remain -= len(sel_bikes)
     sel_vehs = vehicle_sorted_indices[:max(0, remain)]
 
+    # 1차 선택 결과
     selected_indices = sel_peds + sel_bikes + sel_vehs
 
-    # 전역 거리 기준으로 다시 정렬하고 agent_num으로 클립
-    # agents_cur_frame_indices: 길이 K(≤ max_agent_num)
-    agents_cur_frame_indices = sorted(
-        selected_indices,
-        key=lambda idx: dist_from_cur_agent_to_ego[idx],
-    )[:max_agent_num]
+    if not selected_indices:
+        return np.zeros((0,), dtype=int)
 
-    # 실제 선택된 에이전트 수 K
-    K = len(agents_cur_frame_indices)
+    # 최종 후보를 ego-거리 기준으로 다시 정렬 후 max_agent_num 까지만 사용
+    agents_cur_frame_indices = np.array(
+        sorted(
+            selected_indices,
+            key=lambda idx: dist_from_cur_agent_to_ego[idx],
+        )[:max_agent_num],
+        dtype=int,
+    )
+    return agents_cur_frame_indices
 
-    if K == 0:
-        # 선택된 에이전트가 없으면 0 크기 텐서 반환
-        neighbor_agents_past = np.zeros(
-            (0, num_frames, agents_states_dim + 3), dtype=np.float32)
+
+def _build_neighbor_vectors(
+        all_frame_np_agents_local: np.
+    ndarray,  # (num_frames, current_agents_num, 9)
+        current_agent_types_list: List[TrackedObjectType],
+        agents_states_dim: int,
+        agents_cur_frame_indices: np.ndarray,  # (chosen_agent_num,)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """선택된 에이전트 인덱스들에 대해, 한 번에 이웃 궤적 벡터와 track_id 벡터를 만든다.
+
+    입력 텐서 구조
+    --------------
+    - all_frame_np_agents_local: (T, N, 9)
+        · T: num_frames (과거 + 현재 시점 수)
+        · N: 현재 프레임에서 살아남은 에이전트 수
+        · 채널: x, y, cos(heading), sin(heading), vx, vy, width, length, id
+
+    - current_agent_types_list: 길이 N 의 리스트.
+        · 각 인덱스 i 에 대해 TrackedObjectType.VEHICLE / PEDESTRIAN / BICYCLE 중 하나.
+
+    - agents_cur_frame_indices: (K,)
+        · 현재 프레임(마지막 시점 T-1)의 에이전트 배열에서
+          “이웃으로 선택된 행 인덱스” 들.
+        · 이 순서가 곧 출력 텐서의 에이전트 축 순서가 된다.
+
+    알고리즘 개요
+    -------------
+    1) 동적 상태 8차원 복사 (완전 벡터화)
+        - 후보 텐서에서 선택된 인덱스만 골라 (T, K, 8) 로 뽑은 뒤,
+          축을 바꿔 (K, T, 8) 로 만든다.
+        - 이걸 neighbor_agents_past[:, :, :8] 에 그대로 넣는다.
+
+    2) track_id 추출 (벡터화)
+        - 현재 프레임 T-1 에서 선택된 인덱스의 id 채널(8)을
+          한 번에 뽑아서 neighbors_id (K,) 로 만든다.
+
+    3) 타입 one-hot 생성 (부분 벡터화 + 브로드캐스트)
+        - current_agent_types_list 를 numpy 배열로 만든 후,
+          agents_cur_frame_indices 로 인덱싱해 길이 K 의 neighbors_types 배열을 만든다.
+        - neighbors_types == VEHICLE / PEDESTRIAN / BICYCLE 로
+          boolean mask 세 개를 만든 다음,
+          type_one_hot[mask, col] = 1.0 방식으로 한 번에 채운다.
+        - 마지막으로 (K, 3) → (K, 1, 3) 로 늘리고
+          시간축(T) 방향으로 브로드캐스트 해서 neighbor_agents_past[:, :, 8:] 에 넣는다.
+
+
+    Args:
+        all_frame_np_agents_local:
+            이웃 후보 에이전트들의 ego 기준 과거+현재 시퀀스.
+            - shape: (num_frames, current_agents_num, 9)
+        current_agent_types_list:
+            - 길이: current_agents_num
+            - 각 에이전트 인덱스에 대응하는 TrackedObjectType 값.
+        agents_states_dim:
+            - 동적 상태 차원 수 (=8).
+        agents_cur_frame_indices:
+            - shape: (chosen_agent_num,)
+            - 현재 프레임에서 선택된 에이전트 행 인덱스들.
+
+    Returns:
+        neighbor_agents_past:
+            - shape: (chosen_agent_num, num_frames, 11)
+            - [x, y, cos, sin, vx, vy, width, length,
+               track_id, onehot_vehicle, onehot_ped, onehot_bike]
+        neighbors_id:
+            - shape: (chosen_agent_num,)
+            - 각 이웃 에이전트의 track_id (현재 프레임 기준).
+    """
+    num_frames: int = all_frame_np_agents_local.shape[0]
+    agents_cur_frame_indices = np.asarray(agents_cur_frame_indices, dtype=int)
+    chosen_agent_num: int = int(agents_cur_frame_indices.shape[0])
+
+    if chosen_agent_num == 0:
+        neighbor_agents_past = np.zeros((0, num_frames, agents_states_dim + 3),
+                                        dtype=np.float32)
         neighbors_id = np.zeros((0,), dtype=np.float32)
-        return neighbor_agents_past, neighbors_id, agents_cur_frame_indices
+        return neighbor_agents_past, neighbors_id
 
-    # neighbor_agents_past: (K, num_frames, 11)
+    eight_ = agents_states_dim
+
+    # 1) 동적 상태 8차원 배치 추출 및 축 재배치
+    # (T, N, 9) → (T, chosen_agent_num, 8) → (chosen_agent_num, T, 8)
+    dynamic_states: np.ndarray = all_frame_np_agents_local[:,
+                                                           agents_cur_frame_indices, :
+                                                           eight_].transpose(
+                                                               1, 0, 2)
+
+    # 출력 텐서 초기화
     neighbor_agents_past = np.zeros(
-        (K, num_frames, agents_states_dim + 3),
+        (chosen_agent_num, num_frames, agents_states_dim + 3),
         dtype=np.float32,
     )
-    # neighbors_id: (K,)
-    neighbors_id = -np.ones((K,), dtype=np.float32)
+    neighbor_agents_past[:, :, :eight_] = dynamic_states
 
-    ##################
+    # 2) track_id 벡터 배치 추출 (현재 프레임 = 마지막 프레임 기준)
+    # shape: (chosen_agent_num,)
+    neighbors_id = all_frame_np_agents_local[-1, agents_cur_frame_indices,
+                                             eight_].astype(np.float32)
 
-    # Populate the final agents array with the selected agents' features
-    for sort_idx, cur_neighbor_idx in enumerate(agents_cur_frame_indices):
-        # neighbor_agents_past: (K, num_frames, 11)
-        # all_frame_np_agents_local: (num_frames, current_agents_num, 9)
-        eight_ = agents_states_dim
-        neighbor_agents_past[
-            sort_idx, :, :
-            eight_] = all_frame_np_agents_local[:, cur_neighbor_idx, :eight_]
-        neighbors_id[sort_idx] = all_frame_np_agents_local[-1, cur_neighbor_idx,
-                                                           eight_]
-        if current_agent_types_list[
-                cur_neighbor_idx] == TrackedObjectType.VEHICLE:
-            neighbor_agents_past[sort_idx, :, eight_:] = [1, 0, 0]  # VEHICLE
-        elif current_agent_types_list[
-                cur_neighbor_idx] == TrackedObjectType.PEDESTRIAN:
-            neighbor_agents_past[sort_idx, :, eight_:] = [0, 1, 0]  # PEDESTRIAN
-        else:  # TrackedObjectType.BICYCLE
-            neighbor_agents_past[sort_idx, :, eight_:] = [0, 0, 1]  # BICYCLE
+    # 3) 타입 one-hot (chosen_agent_num, 3) 생성 → (chosen_agent_num, T, 3) 브로드캐스트
+    type_one_hot = np.zeros((chosen_agent_num, 3), dtype=np.float32)
 
-    return neighbor_agents_past, neighbors_id, agents_cur_frame_indices
+    # current_agent_types_list 를 배열로 바꾸고, 선택된 인덱스만 추출
+    # neighbors_types: shape (chosen_agent_num,), dtype=object (TrackedObjectType 인스턴스들)
+    neighbors_types = np.asarray(current_agent_types_list,
+                                 dtype=object)[agents_cur_frame_indices]
 
+    veh_mask = neighbors_types == TrackedObjectType.VEHICLE
+    ped_mask = neighbors_types == TrackedObjectType.PEDESTRIAN
+    bike_mask = neighbors_types == TrackedObjectType.BICYCLE
+
+    # 각 타입별 column에 1 할당 (행 단위로 일괄 처리)
+    type_one_hot[veh_mask, 0] = 1.0
+    type_one_hot[ped_mask, 1] = 1.0
+    type_one_hot[bike_mask, 2] = 1.0
+
+    # (chosen_agent_num, 3) → (chosen_agent_num, 1, 3) 로 늘려서 시간축(T)에 브로드캐스트
+    # → (chosen_agent_num, T, 3)
+    neighbor_agents_past[:, :, eight_:] = type_one_hot[:, None, :]
+
+    return neighbor_agents_past, neighbors_id
+
+
+def _select_neighbor_agents_and_build_past(
+    all_frame_np_agents_local: np.
+    ndarray,  # (num_frames, current_agents_num, 9)
+    current_agent_types_list: List[
+        TrackedObjectType],  # 길이 = current_agents_num
+    agents_states_dim: int,
+    max_agent_num: int,
+    max_pedestrians: Optional[int],
+    max_bicycles: Optional[int],
+    filter_radius: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """이고 기준 에이전트 텐서에서, 가까운 에이전트들을 선택하여
+    이웃 궤적 텐서를 구성한다.
+
+    특징:
+        - `max_agent_num` 은 상한(최대 개수)만 의미한다. 실제 선택 수 chosen_agent_num ≤ max_agent_num.
+        - `max_pedestrians` 또는 `max_bicycles` 가 None 이면
+          타입 상한을 모두 끄고, 거리 기준으로만 가까운 순서대로 선택한다.
+        - `filter_radius` 가 주어지면, ego 로부터 그 거리 안에 있는 에이전트만
+          후보로 사용한다(그 밖은 완전히 무시).
+
+    Returns:
+        neighbor_agents_past: (chosen_agent_num, num_frames, 11)
+        agents_cur_frame_indices: shape chosen_agent_num (현재 프레임 기준 인덱스)
+        neighbors_id:         (chosen_agent_num,)
+    """
+    num_frames: int = all_frame_np_agents_local.shape[0]
+
+    # 0) radius 필터 + 거리 기준 정렬된 인덱스 계산
+    """
+        sorted_cur_agent_indices: shape: (M,)  # M = 유효 에이전트 수
+            - ego 로부터 가까운 순서대로 정렬된 현재 프레임 인덱스.
+        dist_from_cur_agent_to_ego: shape: (current_agents_num,)
+            - 각 에이전트의 ego 기준 2D 거리.
+    """
+    sorted_cur_agent_indices, dist_from_cur_agent_to_ego = \
+        _compute_valid_sorted_indices(
+            all_frame_np_agents_local=all_frame_np_agents_local, # (num_frames, current_agents_num, 9)
+            filter_radius=filter_radius,
+        )
+
+    # 유효한 후보가 없거나, max_agent_num 이 0 이하인 경우
+    if sorted_cur_agent_indices.size == 0 or max_agent_num <= 0:
+        neighbor_agents_past = np.zeros((0, num_frames, agents_states_dim + 3),
+                                        dtype=np.float32)
+        neighbors_id = np.zeros((0,), dtype=np.float32)
+        return neighbor_agents_past, neighbors_id, []
+
+    # 1) 타입 상한을 끄는 경우: 거리 기준으로만 선택
+    if (max_pedestrians is None) or (max_bicycles is None):
+        # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ max_agent_num
+        agents_cur_frame_indices = sorted_cur_agent_indices[:max_agent_num]
+    else:
+        # 2) 타입 상한을 적용하는 경우
+        # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ max_agent_num
+        agents_cur_frame_indices = _select_indices_with_type_cap(
+            sorted_cur_agent_indices=sorted_cur_agent_indices,
+            current_agent_types_list=current_agent_types_list,
+            max_agent_num=max_agent_num,
+            max_pedestrians=max_pedestrians,
+            max_bicycles=max_bicycles,
+            dist_from_cur_agent_to_ego=dist_from_cur_agent_to_ego,
+        )
+
+    # 실제 선택된 에이전트 수 chosen_agent_num
+    chosen_agent_num = int(agents_cur_frame_indices.shape[0])
+    if chosen_agent_num == 0:
+        neighbor_agents_past = np.zeros((0, num_frames, agents_states_dim + 3),
+                                        dtype=np.float32)
+        neighbors_id = np.zeros((0,), dtype=np.float32)
+        return neighbor_agents_past, np.array([], dtype=int), neighbors_id
+
+    # 3) 선택된 인덱스로부터 최종 텐서 구성
+    """
+        neighbor_agents_past: shape: (chosen_agent_num, num_frames, 11)
+            - [x, y, cos, sin, vx, vy, width, length,
+               track_id, onehot_vehicle, onehot_ped, onehot_bike]
+        neighbors_id: shape: (chosen_agent_num,)
+            - 각 이웃 에이전트의 track_id (현재 프레임 기준).
+    """
+    neighbor_agents_past, neighbors_id = _build_neighbor_vectors(
+        all_frame_np_agents_local=
+        all_frame_np_agents_local,  # (num_frames, current_agents_num, 9)
+        current_agent_types_list=current_agent_types_list,
+        agents_states_dim=agents_states_dim,
+        agents_cur_frame_indices=agents_cur_frame_indices,  # (chosen_agent_num,)
+    )
+
+    # numpy → List[int]
+    agents_cur_frame_indices_list: List[int] = list(
+        map(int,
+            np.asarray(agents_cur_frame_indices).tolist()))
+    agents_cur_frame_indices = np.asarray(agents_cur_frame_indices_list,
+                                          dtype=int)  # (K,)
+    return neighbor_agents_past, agents_cur_frame_indices, neighbors_id
+
+
+from typing import Optional  # 이미 있을 가능성 높음
 
 
 def _build_static_objects(
     present_static_feature_6: np.ndarray,  # (cur_static_num, 6)
     static_types_list: List[TrackedObjectType],  # 길이 = cur_static_num
-    num_static: int,
+    max_static_num: int,
+    filter_radius: Optional[float] = None,
 ) -> np.ndarray:
-    """정적 객체 정보를 거리 기준으로 정렬하고, 타입 one-hot 을 붙여 고정 크기 배열로 만든다.
+    """정적 객체 정보를 거리 기준으로 정렬하고, 타입 one-hot 을 붙여 배열로 만든다.
 
-    - 이고와의 거리가 가까운 순서로 최대 `num_static` 개를 선택한다.
-    - 각 객체에 대해 [x, y, cos, sin, width, length, type_one_hot(4)] 을 구성한다.
-
-    Args:
-        present_static_feature_6 (np.ndarray):
-            - shape: (cur_static_num, 6)
-            - [x, y, cos(heading), sin(heading), width, length]
-        static_types_list (List[TrackedObjectType]):
-            - 길이: cur_static_num
-        num_static (int):
-            - 출력 정적 객체 슬롯 개수.
+    - 이고와의 거리를 기준으로 가까운 순서로 최대 `max_static_num` 개 선택.
+    - `filter_radius` 가 주어지면, ego 기준 거리 <= filter_radius 인 것만 후보.
+    - 실제 개수가 max_static_num 이하이면 zero-padding 없이 그 개수만 반환.
 
     Returns:
-        np.ndarray:
-            - shape: (num_static, 10)
-            - [x, y, cos, sin, width, length, onehot_CZONE, onehot_BARRIER,
-               onehot_CONE, onehot_GENERIC]
+        static_objects: (K, 10), K = min(유효 정적 객체 수, max_static_num)
     """
-    # static_objects: (num_static, 10)
-    static_objects = np.zeros(
-        (num_static, present_static_feature_6.shape[-1] + 4),
-        dtype=np.float32,
-    )
-    # static_distance_to_ego: (cur_static_num,)
+    cur_static_num = int(present_static_feature_6.shape[0])
+
+    if cur_static_num == 0 or max_static_num <= 0:
+        return np.zeros((0, present_static_feature_6.shape[-1] + 4),
+                        dtype=np.float32)
+
+    # ego 기준 거리
     static_distance_to_ego = np.linalg.norm(
         present_static_feature_6[:, :2],
         axis=-1,
+    )  # (cur_static_num,)
+
+    # filter_radius 적용
+    if filter_radius is not None:
+        valid_mask = static_distance_to_ego <= float(filter_radius)
+        valid_indices = np.nonzero(valid_mask)[0]
+    else:
+        valid_indices = np.arange(cur_static_num, dtype=int)
+
+    if valid_indices.size == 0:
+        return np.zeros((0, present_static_feature_6.shape[-1] + 4),
+                        dtype=np.float32)
+
+    # 유효 객체들 안에서 거리 기준 오름차순
+    dist_valid = static_distance_to_ego[valid_indices]
+    order_local = np.argsort(dist_valid)
+    sorted_indices = valid_indices[order_local]
+
+    # 실제 사용할 개수 K
+    K = min(len(sorted_indices), max_static_num)
+
+    static_objects = np.zeros(
+        (K, present_static_feature_6.shape[-1] + 4),
+        dtype=np.float32,
     )
-    # static_indices: (<= num_static,)
-    static_indices = list(np.argsort(static_distance_to_ego))[:num_static]
     six_ = present_static_feature_6.shape[-1]
 
-    for i, j in enumerate(static_indices):
+    for i, j in enumerate(sorted_indices[:K]):
         static_objects[i, :six_] = present_static_feature_6[j, :six_]
         if static_types_list[j] == TrackedObjectType.CZONE_SIGN:
             static_objects[i, six_:] = [1, 0, 0, 0]
@@ -1072,91 +1278,192 @@ def _build_static_objects(
 
     return static_objects
 
-def agent_past_process(
-    past_cur_ego_world_10: np.ndarray,
-    past_cur_agents_world_8_list: List[np.ndarray],
-    past_cur_agents_types_list: List[List[TrackedObjectType]],
-    max_agent_num: int,
-    present_static_feat_5: np.ndarray,
-    static_types_list: List[TrackedObjectType],
-    num_static: int,
-    max_pedestrians: int,
-    max_bicycles: int,
-    ego_cur_pose_np: np.ndarray,
-) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """과거+현재 이고/에이전트/정적 객체 정보를 모델 입력용으로 가공하는 핵심 전처리 함수.
 
-    여기서 `max_agent_num` 은
-    - “항상 이 크기로 패딩하라”는 뜻이 아니라
-    - **최대로 이만큼까지 에이전트를 쓴다**는 상한 역할만 합니다.
+def build_static_feature(
+    present_static_feat_5: np.ndarray,  # (cur_static_num, 5)
+    static_types_list: List[TrackedObjectType],  # 길이 = cur_static_num
+    max_static_num: int,
+    ego_cur_pose_np: np.ndarray,  # (3,)
+    filter_radius: Optional[float] = None,
+) -> np.ndarray:
+    """현재 프레임의 정적 객체들을 ego 기준 좌표계로 변환하고,
+    가까운 순으로 최대 max_static_num 개까지만 선택한다.
 
-    따라서:
-        - 실제 장면 내 선택된 에이전트 수를 K 라 하면, 항상 K ≤ max_agent_num 이고,
-        - 이웃 궤적 텐서와 ID 벡터의 첫 축은 K 입니다
-          (max_agent_num 보다 작으면 패딩 row를 만들지 않음).
+    처리 순서
+    ----------
+    1) `present_static_feat_5` (월드 좌표계)를
+       `_build_present_static_feature_6` 를 이용해 ego 기준으로 변환:
+       - 입력: [x, y, heading, width, length]
+       - 출력: [x, y, cos(heading), sin(heading), width, length]
+       → shape: (cur_static_num, 6)
+
+    2) `_build_static_objects` 를 호출해,
+       - ego와의 2D 거리,
+       - `filter_radius`,
+       - `max_static_num`
+       을 기준으로 정적 객체를 선택하고 타입 one-hot 을 붙인다.
+       - 최종 출력: (K, 10)
+         · [x, y, cos, sin, width, length,
+            onehot_CZONE, onehot_BARRIER, onehot_CONE, onehot_GENERIC]
+         · K = min(유효 정적 객체 수, max_static_num)
+
+    Args:
+        present_static_feat_5:
+            - shape: (cur_static_num, 5)
+            - [x, y, heading, width, length] (월드 좌표계)
+        static_types_list:
+            - 길이: cur_static_num
+            - 각 정적 객체의 타입 (TrackedObjectType).
+        max_static_num:
+            - 선택할 정적 객체 수의 상한값.
+            - 실제 K는 K ≤ max_static_num.
+        ego_cur_pose_np:
+            - shape: (3,), [x_ego, y_ego, yaw_ego]
+        filter_radius:
+            - None 이 아니면 ego 기준 거리 <= filter_radius 인 정적 객체만 후보.
+            - None 이면 거리 제한 없음.
 
     Returns:
-        Tuple[
-            Optional[np.ndarray],  # ego_agent_past: (num_frames, 11) 또는 None
-            np.ndarray,            # neighbor_agents_past: (K, num_frames, 11)
-            np.ndarray,            # agents_cur_frame_indices: shape (K,)
-            np.ndarray,            # static_objects: (num_static, 10)
-            np.ndarray,            # neighbors_id: (K,)
-        ]
+        np.ndarray:
+            - static_objects
+            - shape: (K, 10)
+            - [x, y, cos, sin, width, length,
+               onehot_CZONE, onehot_BARRIER, onehot_CONE, onehot_GENERIC]
     """
-    agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, length, width
-
-    # 1) 이고 궤적 처리
-    ego_agent_past = _process_ego_past_states(
-        past_cur_ego_world_10=past_cur_ego_world_10,
+    # (cur_static_num, 6)
+    present_static_feature_6 = _build_present_static_feature_6(
+        present_static_feat_5=present_static_feat_5,
         ego_cur_pose_np=ego_cur_pose_np,
     )
 
-    current_agent_types_list: List[
-        TrackedObjectType] = past_cur_agents_types_list[-1]
+    static_objects = _build_static_objects(
+        present_static_feature_6=present_static_feature_6,
+        static_types_list=static_types_list,
+        max_static_num=max_static_num,
+        filter_radius=filter_radius,
+    )
+    return static_objects
 
-    # 2) 에이전트 궤적 (ego-relative 3D) 구성
+
+def build_neighbor_past_feature(
+    past_cur_agents_world_8_list: List[np.ndarray],
+    past_cur_agents_types_list: List[List[TrackedObjectType]],
+    max_agent_num: int,
+    ego_cur_pose_np: np.ndarray,  # (3,)
+    max_pedestrians: Optional[int],
+    max_bicycles: Optional[int],
+token_to_id: Dict[str, int],
+    filter_radius: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """이웃 에이전트의 과거+현재 궤적을 ego 기준으로 변환하고,
+    가까운 에이전트들만 골라 (K, T, 11) 텐서로 만든다.
+
+    개념 요약
+    --------
+    1) `past_cur_agents_world_8_list` 를 이용해, 각 프레임에서
+       [track_id, vx, vy, heading, width, length, x, y] 상태를 ego 기준으로 변환한다.
+       → `build_agents_past_ego_frame_array` 로 (T, N, 9) 텐서 생성
+         · T: num_frames, N: 현재 프레임에서 ego 기준 존재 여부 필터링 후 남는 에이전트 수
+         · 채널: [x, y, cos(h), sin(h), vx, vy, width, length, id]
+
+    2) 현재 프레임(T-1) 기준으로,
+       - ego와의 거리,
+       - 타입(차량/보행자/자전거),
+       - 옵션으로 `filter_radius`,
+       - 옵션으로 `max_pedestrians`, `max_bicycles`
+       를 이용해 어떤 에이전트를 K개까지 선택할지 결정한다.
+       → `_select_neighbor_agents_and_build_past` 호출
+
+       · `max_pedestrians` 또는 `max_bicycles` 가 None 이면:
+         → 타입은 무시하고, 단순히 거리 가까운 순으로 `max_agent_num` 개까지 선택.
+       · 둘 다 정수면:
+         → 보행자/자전거 상한 적용 후, 차량으로 나머지 채움.
+
+       · `filter_radius` 가 주어지면:
+         → ego 기준 거리 <= filter_radius 인 에이전트만 후보.
+
+    3) 선택된 에이전트들에 대해서만
+       (K, T, 11) 텐서를 만든다.
+       · 앞 8차원: [x, y, cos, sin, vx, vy, width, length]
+       · 뒤 3차원: 타입 one-hot (vehicle, pedestrian, bicycle)
+       · K ≤ max_agent_num (실제 장면에 따라 K는 매번 달라질 수 있음)
+
+    Args:
+        past_cur_agents_world_8_list:
+            - 길이: num_frames
+            - 각 원소 shape: (frame_agents_num, 8)
+            - [track_id, vx, vy, heading, width, length, x, y] (월드 좌표계)
+        past_cur_agents_types_list:
+            - 길이: num_frames
+            - 각 프레임에서 에이전트 타입 리스트 (TrackedObjectType).
+            - 현재 프레임(마지막 원소)의 타입 정보를 사용.
+        max_agent_num:
+            - 선택할 이웃 에이전트 수의 상한값.
+            - 실제 선택 수 K 는 K ≤ max_agent_num.
+        ego_cur_pose_np:
+            - shape: (3,), [x_ego, y_ego, yaw_ego]
+            - ego 현재 포즈.
+        max_pedestrians:
+            - None 이면 타입 상한 미사용 (거리 순으로만 선택).
+            - 정수면 보행자 최대 개수 상한.
+        max_bicycles:
+            - None 이면 타입 상한 미사용 (거리 순으로만 선택).
+            - 정수면 자전거 최대 개수 상한.
+        filter_radius:
+            - None 이 아니면 ego 기준 거리 <= filter_radius 인 에이전트만 후보.
+            - None 이면 거리 제한 없음.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - neighbor_agents_past:
+                · shape: (K, num_frames, 11)
+                · K = 선택된 이웃 수 (K ≤ max_agent_num)
+                · [x, y, cos, sin, vx, vy, width, length, id,
+                   onehot_vehicle, onehot_ped, onehot_bike]
+            - agents_cur_frame_indices:
+                · shape: (K,)
+                · 현재 프레임(마지막 프레임)의 에이전트 배열에서의 행 인덱스.
+                · get_neighbor_track_tokens 에서 track_token 매핑에 사용.
+            - neighbors_id:
+                · shape: (K,)
+                · 각 이웃의 track_id (마지막 프레임 기준 id 값).
+    """
+    agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, width, length
+
+    # 현재 프레임의 타입 정보 (길이 = current_agents_num)
+    current_agent_types_list = past_cur_agents_types_list[-1]
+
+    # (num_frames, current_agents_num, 9)
     all_frame_np_agents_local = build_agents_past_ego_frame_array(
         past_cur_agents_world_8_list=past_cur_agents_world_8_list,
         ego_cur_pose_np=ego_cur_pose_np,
         agents_states_dim=agents_states_dim,
     )
 
-    # 3) 정적 객체 6차원 표현 구성
-    present_static_feature_6 = _build_present_static_feature_6(
-        present_static_feat_5=present_static_feat_5,
-        ego_cur_pose_np=ego_cur_pose_np,
-    )
-
-    # 4) 가까운 에이전트 선택 및 neighbor 텐서 구성 (여기서 K ≤ agent_num으로 clip)
-    (
-        neighbor_agents_past,   # (K, num_frames, 11)
-        neighbors_id,           # (K,)
-        agents_cur_frame_indices,  # List[int], 길이 K
-    ) = _select_neighbor_agents_and_build_past(
-        all_frame_np_agents_local=all_frame_np_agents_local,
-        current_agent_types_list=current_agent_types_list,
-        agents_states_dim=agents_states_dim,
-        max_agent_num=max_agent_num,
-        max_pedestrians=max_pedestrians,
-        max_bicycles=max_bicycles,
-    )
-
-    # 5) 정적 객체 최종 텐서 구성
-    static_objects = _build_static_objects(
-        present_static_feature_6=present_static_feature_6,
-        static_types_list=static_types_list,
-        num_static=num_static,
-    )
-
-    return (
-        ego_agent_past,
-        neighbor_agents_past,
-        np.asarray(agents_cur_frame_indices),
-        static_objects,
-        neighbors_id,
-    )
-
+    # 필터/타입 상한/거리 기준으로 이웃 선택 + (K, T, 11) 텐서 구성
+    """
+    neighbor_agents_past: (chosen_agent_num, num_frames, 11)
+    agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
+    neighbors_id:         (chosen_agent_num,)
+    """
+    neighbor_agents_past, agents_cur_frame_indices, neighbors_id = \
+        _select_neighbor_agents_and_build_past(
+            all_frame_np_agents_local=all_frame_np_agents_local,
+            current_agent_types_list=current_agent_types_list,
+            agents_states_dim=agents_states_dim,
+            max_agent_num=max_agent_num,
+            max_pedestrians=max_pedestrians,
+            max_bicycles=max_bicycles,
+            filter_radius=filter_radius,
+        )
+    id_to_token = {v: k for k, v in token_to_id.items()}
+    neighbor_agents_track_token: List[Optional[str]] = []
+    for track_id in neighbors_id:
+        if track_id == -1:
+            neighbor_agents_track_token.append(None)
+        else:
+            neighbor_agents_track_token.append(id_to_token[track_id])
+    return neighbor_agents_past, agents_cur_frame_indices, neighbor_agents_track_token
 
 
 def agent_future_process(

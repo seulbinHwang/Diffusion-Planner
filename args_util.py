@@ -62,12 +62,20 @@ def get_args():
                         type=int,
                         help='number of agents',
                         default=32)
+    parser.add_argument('--max_agent_num',
+                        type=int,
+                        help='number of agents',
+                        default=128)
 
     parser.add_argument('--static_objects_state_dim',
                         type=int,
                         help='state dim for static objects',
                         default=10)
     parser.add_argument('--static_objects_num',
+                        type=int,
+                        help='number of static objects',
+                        default=5)
+    parser.add_argument('--max_static_num',
                         type=int,
                         help='number of static objects',
                         default=5)
