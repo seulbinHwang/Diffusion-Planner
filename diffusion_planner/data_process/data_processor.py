@@ -215,102 +215,6 @@ class DataProcessor(object):
             json.dump(stats, f, indent=2)
         os.replace(tmp_path, out_path)
 
-    def _filter_agents_within_radius(
-        self,
-        neighbor_agents_past: Optional[np.ndarray],
-        neighbor_future_gt_3_dim: Optional[np.ndarray] = None,
-        agents_cur_frame_indices: Optional[Union[np.ndarray, List[int]]] = None
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-        """ego 중심 정사각형 영역(가로·세로 2*radius)으로 에이전트를 클리핑하고,
-        대응하는 `agents_cur_frame_indices`도 함께 마스킹합니다.
-
-        판정 규칙:
-            - 마지막 시점의 상대좌표 (x, y)에 대해  |x| <= r  AND  |y| <= r  이면 영역 내부(True)
-
-        Args:
-            neighbor_agents_past (np.ndarray):
-                - shape: (agent_num, Tp, 11)
-                - 상대 좌표계 과거 에이전트 시퀀스.
-            neighbor_future_gt_3_dim (Optional[np.ndarray], optional):
-                - shape: (agent_num, Tf, 3)
-                - 상대 좌표계 미래 에이전트 시퀀스. 기본값 None.
-            agents_cur_frame_indices (Optional[Union[np.ndarray, List[int]]], optional):
-                - shape: (N,) (N은 agent_num 이하)
-                - 현재 프레임의 트래킹 객체 리스트에서 각 에이전트가 가리키는 인덱스.
-
-        Returns:
-            Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-                - filtered_neighbor_agents_past:   (agent_num, Tp, 11)
-                  영역 밖 에이전트는 0으로 채움(개수 고정).
-                - filtered_neighbor_agents_future: (agent_num, Tf, 3) 또는 None
-                  입력이 None이 아니면 동일 규칙으로 0 마스킹.
-                - filtered_neighbor_indices:       (N`,) # N`는 N 이하
-                  입력 `agents_cur_frame_indices`가 주어진 경우에만 반환하며,
-                  똑같이 거리 판정에 따라, 벗어나는 에이전트는 데이터에서 지운다.
-
-        Notes:
-            - 본 함수는 개수를 유지하는 **마스킹** 방식입니다(압축 X).
-        """
-        # 마지막 시점 상대 좌표 (agent_num, 2)  ← ego 기준이므로 ego는 정중앙(0,0)
-        cur_xy = neighbor_agents_past[:, -1, :2]  # (agent_num, 2)
-
-        # 정사각형 내부 판정: |x| <= r AND |y| <= r  → (agent_num,)
-        mask_x = np.abs(cur_xy[:, 0]) <= self._radius  # (agent_num,)
-        mask_y = np.abs(cur_xy[:, 1]) <= self._radius  # (agent_num,)
-        mask = mask_x & mask_y  # (agent_num,), True=정사각형 내부(유효)
-
-        # 브로드캐스팅을 위한 차원 확장: (agent_num, 1, 1)
-        mask_expanded = mask[:, None, None]
-
-        # 정사각형 바깥 에이전트는 전체 시퀀스를 0으로 만듦(개수는 고정)
-        # filtered_neighbor_agents_past: (agent_num, Tp, 11)
-        filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
-
-        filtered_neighbor_agents_future = None
-        if neighbor_future_gt_3_dim is not None:
-            # filtered_neighbor_agents_future: (agent_num, Tf, 3)
-            filtered_neighbor_agents_future = neighbor_future_gt_3_dim * mask_expanded
-        # Indices 마스킹 (옵션)
-        filtered_neighbor_indices: Optional[np.ndarray] = None
-        if agents_cur_frame_indices is not None:
-            agents_cur_frame_indices = np.array(
-                agents_cur_frame_indices)  # (N,) # N은 agent_num 이하
-            N_len_mask = mask[:len(agents_cur_frame_indices)]  # (N,)
-            filtered_neighbor_indices = agents_cur_frame_indices[
-                N_len_mask]  # (N`,) # N`는 N 이하
-
-        return filtered_neighbor_agents_past, filtered_neighbor_agents_future, filtered_neighbor_indices
-
-    def _filter_agents_within_radius2(
-        self,
-        neighbor_agents_past: np.ndarray,
-        neighbor_agents_track_token: List[Optional[str]],
-    ) -> Tuple[np.ndarray, List[Optional[str]]]:
-        # 마지막 시점 상대 좌표 (agent_num, 2)  ← ego 기준이므로 ego는 정중앙(0,0)
-        cur_xy = neighbor_agents_past[:, -1, :2]  # (agent_num, 2)
-
-        # 정사각형 내부 판정: |x| <= r AND |y| <= r  → (agent_num,)
-        mask_x = np.abs(cur_xy[:, 0]) <= self._radius  # (agent_num,)
-        mask_y = np.abs(cur_xy[:, 1]) <= self._radius  # (agent_num,)
-        mask = mask_x & mask_y  # (agent_num,), True=정사각형 내부(유효)
-
-        # 브로드캐스팅을 위한 차원 확장: (agent_num, 1, 1)
-        mask_expanded = mask[:, None, None]
-
-        # 정사각형 바깥 에이전트는 전체 시퀀스를 0으로 만듦(개수는 고정)
-        # filtered_neighbor_agents_past: (agent_num, Tp, 11)
-        filtered_neighbor_agents_past = neighbor_agents_past * mask_expanded
-
-        filtered_neighbor_agents_track_token: List[Optional[str]] = []
-        for i, m in enumerate(mask):
-            if m:
-                filtered_neighbor_agents_track_token.append(
-                    neighbor_agents_track_token[i])
-            else:
-                filtered_neighbor_agents_track_token.append(None)
-
-        return filtered_neighbor_agents_past, filtered_neighbor_agents_track_token
-
     def _get_car_token_to_rr_ids(
         self, all_car_token_to_rr_ids: Dict[str, Optional[List[str]]],
         neighbor_track_token: List[Optional[str]]
@@ -390,7 +294,8 @@ class DataProcessor(object):
             past_cur_ego_world_10 = sampled_ego_objects_to_array_list(
                 ego_state_buffer)
             past_cur_time_np = None
-
+        assert past_cur_ego_world_10.shape[0] == self.num_past_poses + 1, \
+            f"Expected past_cur_ego_world_10 shape[0] == {self.num_past_poses + 1}, got {past_cur_ego_world_10.shape[0]}"
         return (
             ego_state,  # EgoState
             ego_point2d,  # Point2D
@@ -458,10 +363,10 @@ class DataProcessor(object):
              past_cur_agents_types_list, self.num_agents, present_static_feat_5,
              static_types_list, self.num_static, self.max_pedestrians,
              self.max_bicycles, ego_cur_pose_np)
-
-        neighbor_agents_past, _, agents_cur_frame_indices = \
-            self._filter_agents_within_radius(neighbor_agents_past,
-                                              None, agents_cur_frame_indices)
+        ego_time_len = ego_agent_past.shape[0]
+        neighbor_time_len = neighbor_agents_past.shape[0]
+        assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
+            f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
         """
         
         neighbors_id: np.ndarray, (agent_num,) # -1 for padding
@@ -574,12 +479,10 @@ class DataProcessor(object):
                                                                 self.
                                                                 num_future_poses, :]
         # (agents_num, future_len, 3)
-        neighbor_agents_past = neighbor_agents_past[:,
-                                                    -21:]  # (agent_num, time_len, 11)
         # neighbor_agents_past = self.zero_out_random_time_prefix(neighbor_agents_past)
 
         data = {
-            "ego_agent_past": ego_agent_past[-21:],  # (time_len, 11)
+            "ego_agent_past": ego_agent_past,  # (time_len, 11)
             "neighbor_agents_past":
                 neighbor_agents_past,  # (agent_num, time_len, 11)
             "neighbor_future_gt_3_dim":
@@ -853,10 +756,10 @@ class DataProcessor(object):
                  past_cur_agents_types_list, self.num_agents,
                  present_static_feat_5, static_types_list, self.num_static,
                  self.max_pedestrians, self.max_bicycles, ego_cur_pose_np)
-
-            neighbor_agents_past, _, agents_cur_frame_indices = \
-                self._filter_agents_within_radius(neighbor_agents_past,
-                                                 None, agents_cur_frame_indices)
+            ego_time_len = ego_agent_past.shape[0]
+            neighbor_time_len = neighbor_agents_past.shape[0]
+            assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
+                f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
             neighbor_track_token: List[
                 Optional[str]] = get_neighbor_track_tokens(
                     present_tracked_objects=present_tracked_objects,

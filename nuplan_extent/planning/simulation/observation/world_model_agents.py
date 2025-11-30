@@ -898,6 +898,11 @@ class WorldModelAgents(AbstractMLAgents):
                                      planner_future_11_dim)
         # WorldModelFeatureBuilder.get_features_from_simulation
         # from nuplan_extent/planning/training/preprocessing/feature_builders/world_model_feature_builder.py
+        """
+to_feature_tensor: numpy → torch.Tensor (shape 그대로)
+to_device: 텐서를 GPU/CPU 디바이스로 이동 (shape 그대로)
+collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
+        """
         model_input_key_to_value: Dict[
             str, AbstractModelFeature] = self._model_loader.build_features(
                 current_input, initialization)

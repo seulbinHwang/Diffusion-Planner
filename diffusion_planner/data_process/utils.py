@@ -676,7 +676,6 @@ def get_neighbor_track_tokens(
     return neighbor_track_token
 
 
-
 # 시나리오 전체 horizon(초) 계산: 시작~끝 타임스탬프 차이
 def _scenario_total_horizon_s(scn: AbstractScenario) -> float:
     """
