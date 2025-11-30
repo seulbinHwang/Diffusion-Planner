@@ -1352,11 +1352,11 @@ def build_neighbor_past_feature(
     ego_cur_pose_np: np.ndarray,  # (3,)
     max_pedestrians: Optional[int],
     max_bicycles: Optional[int],
-token_to_id: Dict[str, int],
+    token_to_id: Dict[str, int],
     filter_radius: Optional[float] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """이웃 에이전트의 과거+현재 궤적을 ego 기준으로 변환하고,
-    가까운 에이전트들만 골라 (K, T, 11) 텐서로 만든다.
+    가까운 에이전트들만 골라 (chosen_agent_num, T, 11) 텐서로 만든다.
 
     개념 요약
     --------
@@ -1383,10 +1383,10 @@ token_to_id: Dict[str, int],
          → ego 기준 거리 <= filter_radius 인 에이전트만 후보.
 
     3) 선택된 에이전트들에 대해서만
-       (K, T, 11) 텐서를 만든다.
+       (chosen_agent_num, T, 11) 텐서를 만든다.
        · 앞 8차원: [x, y, cos, sin, vx, vy, width, length]
        · 뒤 3차원: 타입 one-hot (vehicle, pedestrian, bicycle)
-       · K ≤ max_agent_num (실제 장면에 따라 K는 매번 달라질 수 있음)
+       · chosen_agent_num ≤ max_agent_num (실제 장면에 따라 K는 매번 달라질 수 있음)
 
     Args:
         past_cur_agents_world_8_list:
@@ -1399,7 +1399,7 @@ token_to_id: Dict[str, int],
             - 현재 프레임(마지막 원소)의 타입 정보를 사용.
         max_agent_num:
             - 선택할 이웃 에이전트 수의 상한값.
-            - 실제 선택 수 K 는 K ≤ max_agent_num.
+            - 실제 선택 수 chosen_agent_num 는 chosen_agent_num ≤ max_agent_num.
         ego_cur_pose_np:
             - shape: (3,), [x_ego, y_ego, yaw_ego]
             - ego 현재 포즈.
@@ -1416,17 +1416,17 @@ token_to_id: Dict[str, int],
     Returns:
         Tuple[np.ndarray, np.ndarray, np.ndarray]:
             - neighbor_agents_past:
-                · shape: (K, num_frames, 11)
-                · K = 선택된 이웃 수 (K ≤ max_agent_num)
+                · shape: (chosen_agent_num, num_frames, 11)
+                · chosen_agent_num = 선택된 이웃 수 (chosen_agent_num ≤ max_agent_num)
                 · [x, y, cos, sin, vx, vy, width, length, id,
                    onehot_vehicle, onehot_ped, onehot_bike]
             - agents_cur_frame_indices:
-                · shape: (K,)
+                · shape: (chosen_agent_num,)
                 · 현재 프레임(마지막 프레임)의 에이전트 배열에서의 행 인덱스.
                 · get_neighbor_track_tokens 에서 track_token 매핑에 사용.
-            - neighbors_id:
-                · shape: (K,)
-                · 각 이웃의 track_id (마지막 프레임 기준 id 값).
+            - neighbor_track_token:
+                · shape: (chosen_agent_num,)
+                · 선택된 이웃 에이전트들의 track_token 리스트.
     """
     agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, width, length
 
@@ -1440,7 +1440,7 @@ token_to_id: Dict[str, int],
         agents_states_dim=agents_states_dim,
     )
 
-    # 필터/타입 상한/거리 기준으로 이웃 선택 + (K, T, 11) 텐서 구성
+    # 필터/타입 상한/거리 기준으로 이웃 선택 + (chosen_agent_num, T, 11) 텐서 구성
     """
     neighbor_agents_past: (chosen_agent_num, num_frames, 11)
     agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
@@ -1457,13 +1457,13 @@ token_to_id: Dict[str, int],
             filter_radius=filter_radius,
         )
     id_to_token = {v: k for k, v in token_to_id.items()}
-    neighbor_agents_track_token: List[Optional[str]] = []
+    neighbor_track_token: List[str] = []
     for track_id in neighbors_id:
         if track_id == -1:
-            neighbor_agents_track_token.append(None)
+            raise ValueError("Neighbor agent has invalid track_id -1.")
         else:
-            neighbor_agents_track_token.append(id_to_token[track_id])
-    return neighbor_agents_past, agents_cur_frame_indices, neighbor_agents_track_token
+            neighbor_track_token.append(id_to_token[track_id])
+    return neighbor_agents_past, agents_cur_frame_indices, neighbor_track_token
 
 
 def agent_future_process(

@@ -356,24 +356,23 @@ class DataProcessor(object):
             _,
         ) = self._get_past_cur_agents_feature(
             observation_buffer=observation_buffer)
-
         """
         neighbor_agents_past: (chosen_agent_num, num_frames, 11)
         agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
-        neighbors_id:         (chosen_agent_num,)
+        neighbor_track_token: List[str] (chosen_agent_num,)
         """
         # 2) neighbor 과거 궤적 (K, T, 11) + 인덱스/ID
-        neighbor_agents_past, agents_cur_frame_indices, neighbors_id = \
-            build_neighbor_past_feature(
-                past_cur_agents_world_8_list=past_cur_agents_world_8_list,
-                past_cur_agents_types_list=past_cur_agents_types_list,
-                max_agent_num=self.max_agent_num,
-                ego_cur_pose_np=ego_cur_pose_np,
-                max_pedestrians=self.max_pedestrians,
-                max_bicycles=self.max_bicycles,
-                token_to_id=token_to_id,
-                filter_radius=self._filter_radius,
-            )
+        (neighbor_agents_past, agents_cur_frame_indices,
+         neighbor_track_token) = build_neighbor_past_feature(
+             past_cur_agents_world_8_list=past_cur_agents_world_8_list,
+             past_cur_agents_types_list=past_cur_agents_types_list,
+             max_agent_num=self.max_agent_num,
+             ego_cur_pose_np=ego_cur_pose_np,
+             max_pedestrians=self.max_pedestrians,
+             max_bicycles=self.max_bicycles,
+             token_to_id=token_to_id,
+             filter_radius=self._filter_radius,
+         )
 
         ego_time_len = ego_agent_past.shape[0]
         neighbor_time_len = neighbor_agents_past.shape[
@@ -471,7 +470,7 @@ class DataProcessor(object):
                 iteration=0,
                 future_time_horizon=scenario_duration,
                 num_samples=num_samples)
-        # neighbor_agents_track_token: List[Optional[str]], (agent_num,)
+        # neighbor_track_token: List[Optional[str]], (agent_num,)
         # neighbor_token_id: List[Optional[int]], (agent_num,)
         neighbor_token_id = []
         for track_token in neighbor_track_token:
@@ -717,7 +716,7 @@ class DataProcessor(object):
             past_cur_agents_types_list,  # List[List[TrackedObjectType]],
             present_static_feat_5,  # np.ndarray, (len(static_obj), 5)
             static_types_list,  # List[TrackedObjectType],
-            token_to_id, # Dict[str, int],
+            token_to_id,  # Dict[str, int],
             present_tracked_objects,  # Optional[TrackedObjects],
             past_cur_tracked_objects,  # Optional[List[TrackedObjects]]
         )
@@ -768,18 +767,23 @@ class DataProcessor(object):
                 present_tracked_objects,
                 past_cur_tracked_objects,
             ) = self._get_past_cur_agents_feature(scenario=scenario)
-
+            """
+            neighbor_agents_past: (chosen_agent_num, num_frames, 11)
+            agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
+            neighbor_track_token: List[str] (chosen_agent_num,)
+            """
             # 2) neighbor 과거 궤적
-            neighbor_agents_past, agents_cur_frame_indices, neighbors_id = \
-                build_neighbor_past_feature(
-                    past_cur_agents_world_8_list=past_cur_agents_world_8_list,
-                    past_cur_agents_types_list=past_cur_agents_types_list,
-                    max_agent_num=self.max_agent_num,
-                    ego_cur_pose_np=ego_cur_pose_np,
-                    max_pedestrians=self.max_pedestrians,
-                    max_bicycles=self.max_bicycles,
-                    filter_radius=self._filter_radius,
-                )
+            (neighbor_agents_past, agents_cur_frame_indices,
+             neighbor_track_token) = build_neighbor_past_feature(
+                 past_cur_agents_world_8_list=past_cur_agents_world_8_list,
+                 past_cur_agents_types_list=past_cur_agents_types_list,
+                 max_agent_num=self.max_agent_num,
+                 ego_cur_pose_np=ego_cur_pose_np,
+                 max_pedestrians=self.max_pedestrians,
+                 max_bicycles=self.max_bicycles,
+                 token_to_id=token_to_id,
+                 filter_radius=self._filter_radius,
+             )
 
             # 3) static 객체
             static_objects = build_static_feature(
