@@ -11,6 +11,15 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
+from typing import List, Tuple
+import numpy as np
+import numpy.typing as npt
+from nuplan.common.actor_state.ego_state import EgoState
+from nuplan.planning.training.preprocessing.utils.agents_preprocessing import EgoInternalIndex
+from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
+
+from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
+from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 
 
 def get_ego_past_array_from_scenario(
@@ -89,79 +98,166 @@ def sampled_past_ego_states_to_array(
 
 
 def sampled_future_ego_states_to_array(
-        future_ego_states: List[EgoState]) -> npt.NDArray[np.float32]:
-    """ 내가 만든거
+        future_ego_states: List[EgoState]) -> npt.NDArray[np.float64]:
+    """미래 ego 상태 리스트를 “월드 좌표계 기준 10차원 배열”로 바꾼다.
 
-    Convert future ego states to a numpy array.
+    이 함수는 시나리오에서 가져온 여러 개의 미래 ego 상태(EgoState)를
+    한 줄짜리 숫자 배열로 정리해준다. 나중에 다른 함수에서
+    ego 기준 좌표계로 바꾸기 전에, “월드 기준 원본 값”을 담는 역할이다.
+
+    각 시점마다 다음과 같은 값들을 담는다.
+
+    - 위치 : x, y                   (월드 좌표)
+    - 방향 : heading                (라디안, 월드 기준)
+    - 속도 : vx, vy                 (월드 좌표 기준 속도, ego 바디속도를 회전해서 구함)
+    - 차체 크기 : width, length
+    - 타입 one-hot : [1, 0, 0]      (항상 차량이라고 가정: car=1, ped=0, bike=0)
 
     Args:
-        future_ego_states: List of future ego states.
+        future_ego_states (List[EgoState]):
+            - 길이: future_len
+            - 각 원소는 한 시점의 ego 상태(EgoState).
 
     Returns:
-        Array of shape (T, 10) with elements
-        [x, y, heading, vx, vy, width, length].
+        np.ndarray:
+            - fut_ego_world_10
+            - shape: (future_len, 10)
+            - 열 순서:
+                [x, y, heading, vx, vy, width, length, car, pedestrian, cyclist]
+            - dtype: float64
     """
+    future_len: int = len(future_ego_states)
+    # fut_ego_world_10: (future_len, 10)
+    fut_ego_world_10 = np.zeros((future_len, 10), dtype=np.float64)
 
-    output = np.zeros((len(future_ego_states), 10), dtype=np.float64)
-    for i in range(len(future_ego_states)):
-        output[i, EgoInternalIndex.x()] = future_ego_states[i].center.x
-        output[i, EgoInternalIndex.y()] = future_ego_states[i].center.y
-        output[i,
-               EgoInternalIndex.heading()] = future_ego_states[i].center.heading
+    for time_i in range(future_len):
+        # 위치 (x, y)
+        fut_ego_world_10[
+            time_i, EgoInternalIndex.x()] = future_ego_states[time_i].center.x
+        fut_ego_world_10[
+            time_i, EgoInternalIndex.y()] = future_ego_states[time_i].center.y
+
+        # 방향 heading (월드 좌표 기준)
+        fut_ego_world_10[time_i, EgoInternalIndex.heading(
+        )] = future_ego_states[time_i].center.heading
+
         # --- 자차좌표계 → 세계좌표계 속도 변환: 회전만 적용 ---
+        # v_local: Ego body-frame 속도 (vx_body, vy_body)
         v_local = future_ego_states[
-            i].dynamic_car_state.center_velocity_2d  # body-frame velocity
-        he = float(future_ego_states[i].center.heading)
+            time_i].dynamic_car_state.center_velocity_2d  # body-frame velocity
+        he = float(future_ego_states[time_i].center.heading)
         c, s = np.cos(he), np.sin(he)
         vx_w = c * float(v_local.x) - s * float(v_local.y)
         vy_w = s * float(v_local.x) + c * float(v_local.y)
-        output[i, EgoInternalIndex.vx()] = vx_w
-        output[i, EgoInternalIndex.vy()] = vy_w
-        output[i,
-               EgoInternalIndex.ax()] = future_ego_states[i].car_footprint.width
-        output[
-            i,
-            EgoInternalIndex.ay()] = future_ego_states[i].car_footprint.length
-        output[i, 7:10] = [
-            1, 0, 0
-        ]  # one-hot encoding for agent type (car, pedestrian, cyclist)
-    return output
+        fut_ego_world_10[time_i, EgoInternalIndex.vx()] = vx_w
+        fut_ego_world_10[time_i, EgoInternalIndex.vy()] = vy_w
+
+        # 차체 크기 (width, length)
+        fut_ego_world_10[time_i, EgoInternalIndex.ax(
+        )] = future_ego_states[time_i].car_footprint.width
+        fut_ego_world_10[time_i, EgoInternalIndex.ay(
+        )] = future_ego_states[time_i].car_footprint.length
+
+        # 타입 one-hot (car, pedestrian, cyclist) = (1, 0, 0)
+        fut_ego_world_10[time_i, 7:10] = [1, 0, 0]
+
+    return fut_ego_world_10
 
 
 def get_ego_future_array_from_scenario(
-    scenario: NuPlanScenario, current_ego_state: EgoState,
-    num_future_poses: int, future_time_horizon: float
+    scenario: NuPlanScenario,
+    current_ego_state: EgoState,
+    num_future_poses: int,
+    future_time_horizon: float,
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """Return ego future states in ego-centric coordinates with rich features.
+    """시나리오에서 ego의 미래 궤적을 가져와,
+    ego 기준 좌표계로 변환한 결과를 (T,3) / (T,11) 두 가지 형태로 돌려준다.
 
-    The returned array has shape (T, 11) where each element consists of
-    [x, y, cos(yaw), sin(yaw), vx, vy, width, length, one_hot(3)].
+    전체 흐름
+    ----------
+    1) nuPlan 시나리오에서, 현재 ego 상태 기준
+       `num_future_poses`, `future_time_horizon` 조건에 맞게
+       미래 ego 상태들을 가져온다.
+       - future_ego_states: List[EgoState], 길이 T
+
+    2) `sampled_future_ego_states_to_array` 로
+       각 시점을 10차원 월드 좌표 배열로 바꾼다.
+       - fut_ego_world_10: shape (T, 10)
+         · [x, y, heading, vx, vy, width, length, one-hot(3)]
+
+    3) 현재 ego 포즈(current_ego_state.rear_axle)를
+       [x_ego, y_ego, yaw_ego] 형태의 벡터로 만든다.
+       - ego_cur_pose_np: shape (3,)
+
+    4) `convert_absolute_quantities_to_relative(..., 'ego')` 를 호출해
+       월드 좌표 기반의 10차원 배열을 ego 기준 좌표계로 바꾸면서
+       heading 을 cos, sin 두 값으로 풀어 1차원을 늘린다.
+       - fut_ego_local_11: shape (T, 11), dtype float32
+         · [x, y, cos(yaw), sin(yaw), vx, vy, width, length, one-hot(3)]
+
+    5) x, y 값으로부터 heading 을 다시 뽑아 (단순 arctan2 사용)
+       (T, 3) = [x, y, heading] 형태의 간단한 궤적도 만들어서 함께 반환한다.
+       - fut_ego_local_xyh: shape (T, 3)
+
+    Args:
+        scenario (NuPlanScenario):
+            nuPlan 시나리오 객체.
+        current_ego_state (EgoState):
+            현재 ego 상태. (보통 initial_ego_state 또는 시뮬레이터의 현재 상태)
+        num_future_poses (int):
+            몇 개의 미래 시점을 샘플링할지 (T 값).
+        future_time_horizon (float):
+            현재부터 몇 초 뒤까지를 커버할지 [초].
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - fut_ego_local_xyh:
+                · shape: (T, 3)
+                · 각 행: [x_ego, y_ego, heading_ego] (ego 기준 좌표계)
+                · dtype: float32
+            - fut_ego_local_11:
+                · shape: (T, 11)
+                · 각 행:
+                    [x, y, cos(yaw), sin(yaw), vx, vy,
+                     width, length, onehot_car, onehot_ped, onehot_bike]
+                · dtype: float32
     """
-    # List[EgoState]
-    future_trajectory_absolute_states = scenario.get_ego_future_trajectory(
+    # future_ego_states: List[EgoState], 길이 T
+    future_ego_states = scenario.get_ego_future_trajectory(
         iteration=0,
         num_samples=num_future_poses,
         time_horizon=future_time_horizon)
-    # future_states_array: (T, 10)
-    future_states_array = sampled_future_ego_states_to_array(
-        list(future_trajectory_absolute_states))
 
-    anchor_ego_state = np.array([
-        current_ego_state.rear_axle.x,
-        current_ego_state.rear_axle.y,
-        current_ego_state.rear_axle.heading,
-    ],
-                                dtype=np.float64)
-    # future_states_array: (T, 10) -> (T, 11)
-    future_states_array = convert_absolute_quantities_to_relative(
-        future_states_array, anchor_ego_state, 'ego').astype(np.float32)
+    # fut_ego_world_10: (T, 10)
+    fut_ego_world_10 = sampled_future_ego_states_to_array(
+        list(future_ego_states))
 
-    # Get all future poses of the ego relative to the ego coordinate system
-    future_trajectory_relative_poses = convert_absolute_to_relative_poses(
-        current_ego_state.rear_axle,
-        [state.rear_axle for state in future_trajectory_absolute_states])
+    # ego_cur_pose_np: (3,) = [x_ego, y_ego, yaw_ego] (월드 좌표계)
+    ego_cur_pose_np = np.array(
+        [
+            current_ego_state.rear_axle.x,
+            current_ego_state.rear_axle.y,
+            current_ego_state.rear_axle.heading,
+        ],
+        dtype=np.float64,
+    )
 
-    return future_trajectory_relative_poses, future_states_array
+    # fut_ego_local_11: (T, 11)  ← 'ego' 모드로 상대 좌표 변환 후 float32
+    fut_ego_local_11 = convert_absolute_quantities_to_relative(
+        fut_ego_world_10, ego_cur_pose_np, 'ego').astype(np.float32)
+
+    # fut_ego_local_xy: (T, 2)  ← x,y 만 분리
+    fut_ego_local_xy = fut_ego_local_11[:, :2]
+
+    # fut_ego_local_heading: (T,)  ← x,y 에서 heading 추출 (현재 구현 그대로 유지)
+    fut_ego_local_heading = np.arctan2(fut_ego_local_xy,
+                                       fut_ego_local_xy)  # (T,) 로 브로드캐스트 결과 사용
+
+    # fut_ego_local_xyh: (T, 3) = [x, y, heading]
+    fut_ego_local_xyh = np.concatenate(
+        [fut_ego_local_xy, fut_ego_local_heading[:, None]], axis=-1)
+
+    return fut_ego_local_xyh, fut_ego_local_11
 
 
 def calculate_additional_ego_states(ego_agent_past, time_stamp):

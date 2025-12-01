@@ -120,13 +120,13 @@ def ego_local_traj3_to_global(
 
 def get_npc_route_roadblock_ids(
     scenario: NuPlanScenario,
-    sampled_past_observations: List[TrackedObjects],
-    neighbor_track_token: Optional[List[Optional[str]]],  # 길이 = agent_num
+    past_cur_tracked_objects: List[TrackedObjects],
+    neighbor_track_token: Optional[List[str]],  # 길이 = chosen_agent_num
     horizon=20.,
 ) -> Dict[str, List[str]]:
     """
-    get_future_tracked_objects를 이용해 한 번에 궤적을 수집하고,
-    get_roadblock_ids_from_trajectory로 연결성 기반 ID 시퀀스를 추출합니다.
+    get_future_tracked_objects 를 이용해 한 번에 궤적을 수집하고,
+    get_roadblock_ids_from_trajectory 로 연결성 기반 ID 시퀀스를 추출합니다.
     """
 
     # iteration=0 시점부터 시나리오 끝까지 future 트랙 객체를 한줄로 가져옴
@@ -139,18 +139,19 @@ def get_npc_route_roadblock_ids(
         neighbor_track_token_set = {}
     else:
         allow_all_token = False
-        neighbor_track_token_set = set(
-            [str(t) for t in neighbor_track_token if t is not None])
+        neighbor_track_token_set = set([str(t) for t in neighbor_track_token])
         if not neighbor_track_token_set:
             return {}
-    trajectories: Dict[str, List[SimpleNamespace]] = defaultdict(list)
-    first_pose: Dict[str, SimpleNamespace] = {}
+
     future_observations: List[TrackedObjects] = []
     for dets in scenario.get_future_tracked_objects(0, horizon, num_samples):
         future_observations.append(dets.tracked_objects)
     past_future_observations: List[TrackedObjects] = []
-    past_future_observations.extend(sampled_past_observations)
+    past_future_observations.extend(past_cur_tracked_objects)
     past_future_observations.extend(future_observations)
+
+    token_to_state_list: Dict[str, List[SimpleNamespace]] = defaultdict(list)
+    first_pose: Dict[str, SimpleNamespace] = {}
     for tracked_objects in past_future_observations:
         # tracked_objects: TrackedObjects
         for obj in tracked_objects:
@@ -168,28 +169,28 @@ def get_npc_route_roadblock_ids(
             if first_pose.get(token, None) is None:
                 first_pose[token] = pseudo_ego
 
-            trajectories[token].append(pseudo_ego)
+            token_to_state_list[token].append(pseudo_ego)
 
     # 2) 연결성 기반 roadblock ID 추출
-    result: Dict[str, List[str]] = {}
-    for token, pseudo_ego_states in trajectories.items():
-        if not pseudo_ego_states:
-            result[token] = []
-            continue
-        # 덕 타이핑: pseudo_ego_states[*].rear_axle.point 만 참조됨
-        rb_ids: List[str] = get_roadblock_ids_from_trajectory(
-            scenario.map_api, pseudo_ego_states)
-        if len(rb_ids) == 0:
-            result[token] = []
+    car_token_to_rb_ids_list: Dict[str, List[str]] = {}
+    for token, states_list in token_to_state_list.items():
+        if not states_list:
+            raise RuntimeError(
+                f"Internal error: token_to_state_list[{token}] is empty.")
+        # 덕 타이핑: states_list[*].rear_axle.point 만 참조됨
+        rb_ids_list: List[str] = get_roadblock_ids_from_trajectory(
+            scenario.map_api, states_list)
+        if len(rb_ids_list) == 0:
+            car_token_to_rb_ids_list[token] = []
             continue
         corrected_ids = route_roadblock_correction(
             first_pose[token],
             scenario.map_api,
-            rb_ids,
+            rb_ids_list,
         )
 
-        result[token] = corrected_ids
-    return result
+        car_token_to_rb_ids_list[token] = corrected_ids
+    return car_token_to_rb_ids_list
 
 
 def _prefer_rr_on_conflict(
@@ -1704,7 +1705,7 @@ def _convert_ego_history_to_relative(
     Args:
         agent_state (np.ndarray):
             - shape: (time_num, state_dim_ego=10)
-            - ego 과거+현재 궤적 (월드 좌표계).
+            - ego seq 궤적 (월드 좌표계).
         ego_pose (np.ndarray):
             - shape: (3,)
             - [x_ego, y_ego, heading_ego] (월드 좌표계 기준 현재 ego 상태).

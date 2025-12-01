@@ -21,7 +21,8 @@ import draw_machine
 # matplotlib 설정 추가
 plt.rcParams['figure.max_open_warning'] = 0  # 경고 메시지 비활성화
 matplotlib.rcParams['figure.max_open_warning'] = 0
-
+from nuplan.planning.training.preprocessing.feature_builders.vector_builder_utils import (
+    MapObjectPolylines, LaneSegmentTrafficLightData)
 from diffusion_planner.data_process.roadblock_utils import route_roadblock_correction
 from diffusion_planner.data_process.agent_process import (
     build_ego_past_feature,
@@ -30,7 +31,6 @@ from diffusion_planner.data_process.agent_process import (
     sampled_tracked_objects_to_array_list,
     sampled_ego_objects_to_array_list,
     sampled_static_objects_to_array_list,
-    agent_future_process,
     agent_future_all_process,
 )
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
@@ -60,19 +60,17 @@ class DataProcessor(object):
         self._filter_radius = 150  # [m] query radius scope relative to the current pose.
         self.all_car_token_to_rr_ids: Optional[Dict[str,
                                                     Optional[List[str]]]] = None
-        self.init_future_tracked_objects_array_list: Optional[List[
-            np.ndarray]] = None
-        self._init_token_to_id: Optional[Dict[str, int]] = None
+        self.init_cur_fut_agents_world_8_list: Optional[List[np.ndarray]] = None
         self._map_elements = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
-        self._max_elements = {
+        self._map_max_elements = {
             'LANE': config.lane_num,
             'LEFT_BOUNDARY': config.lane_num,
             'RIGHT_BOUNDARY': config.lane_num,
             'ROUTE_LANES': config.route_num
         }  # maximum number of elements to extract per feature layer.
-        self._max_points = {
+        self._map_points_num = {
             'LANE': config.lane_len,
             'LEFT_BOUNDARY': config.lane_len,
             'RIGHT_BOUNDARY': config.lane_len,
@@ -217,17 +215,14 @@ class DataProcessor(object):
         os.replace(tmp_path, out_path)
 
     def _get_car_token_to_rr_ids(
-        self, all_car_token_to_rr_ids: Dict[str, Optional[List[str]]],
-        neighbor_track_token: List[Optional[str]]
-    ) -> Dict[str, Optional[List[str]]]:
+        self,
+        all_car_token_to_rr_ids: Dict[str, Optional[List[str]]],
+        neighbor_track_token: List[str]  # len = chosen_agent_num
+    ) -> Dict[str, List[str]]:  # len = chosen_car_num
         car_token_to_rr_ids: Dict[str, Optional[List[str]]] = {}
         for token in neighbor_track_token:
-            if token is None:
-                continue
             if token in all_car_token_to_rr_ids:
                 car_token_to_rr_ids[token] = all_car_token_to_rr_ids[token]
-            else:
-                car_token_to_rr_ids[token] = None
         return car_token_to_rr_ids
 
     def _get_past_cur_ego_feature(
@@ -306,12 +301,12 @@ class DataProcessor(object):
             past_cur_time_np,  # Optional[np.ndarray] # shape (T,)
         )
 
-    def _prepare_car_token_to_rr_ids_oa(
+    def _prepare_car_token_to_rr_ids(
         self,
         scenario: NuPlanScenario,
         use_route_lanes: bool = False,
         neighbor_track_token: Optional[List[str]] = None,
-    ) -> Dict[str, Optional[List[str]]]:
+    ) -> Dict[str, List[str]]:
         if use_route_lanes and self.all_car_token_to_rr_ids is None:
             present_tracked_objects: TrackedObjects \
                 = scenario.initial_tracked_objects.tracked_objects
@@ -326,16 +321,48 @@ class DataProcessor(object):
                 present_tracked_objects
             ]
             self.all_car_token_to_rr_ids: Dict[
-                str, Optional[List[str]]] = get_npc_route_roadblock_ids(
+                str, List[str]] = get_npc_route_roadblock_ids(
                     scenario,
                     past_cur_tracked_objects,
                     neighbor_track_token=None)
         elif not use_route_lanes:
             self.all_car_token_to_rr_ids = {}
-        car_token_to_rr_ids: Dict[
-            str, Optional[List[str]]] = self._get_car_token_to_rr_ids(
-                self.all_car_token_to_rr_ids, neighbor_track_token)
+        # len = chosen_car_num
+        car_token_to_rr_ids: Dict[str,
+                                  List[str]] = self._get_car_token_to_rr_ids(
+                                      self.all_car_token_to_rr_ids,
+                                      neighbor_track_token)
         return car_token_to_rr_ids
+
+    def _get_cur_fut_agents_world_8_list(
+        self,
+        scenario: NuPlanScenario,
+        do_inference: bool,
+    ):
+        if do_inference:
+            if self.init_cur_fut_agents_world_8_list is None:
+                scenario_duration: float = scenario.duration_s.time_s + self.future_time_horizon
+                num_samples = int(scenario_duration * 10.0)
+                """
+                self.init_cur_fut_agents_world_8_list: List[np.ndarray]
+                    - 길이: 1 + num_samples
+                    - 각 원소 shape: (frame_agents_num_t, 8)
+                """
+                (self.init_cur_fut_agents_world_8_list,
+                 _) = self._get_future_tracked_objects_array_list(
+                     scenario,
+                     iteration=0,
+                     future_time_horizon=scenario_duration,
+                     num_samples=num_samples)
+
+            # 깊은 복사 후, 선택 에이전트들만 뽑아서 ego 기준으로 변환
+            cur_fut_agents_world_8_list = copy.deepcopy(
+                self.init_cur_fut_agents_world_8_list)
+        else:
+            (cur_fut_agents_world_8_list,
+             _) = self._get_future_tracked_objects_array_list(scenario,
+                                                              iteration=0)
+        return cur_fut_agents_world_8_list
 
     # Use for inference
     def observation_adapter(self,
@@ -389,10 +416,11 @@ class DataProcessor(object):
         """
         neighbor_agents_past: (chosen_agent_num, num_frames, 11)
         agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
+        neighbors_id: np.ndarray (chosen_agent_num,) (에이전트 ID)
         neighbor_track_token: List[str] (chosen_agent_num,)
         """
         # 2) neighbor 과거 궤적 (K, T, 11) + 인덱스/ID
-        (neighbor_agents_past, agents_cur_frame_indices,
+        (neighbor_agents_past, agents_cur_frame_indices, neighbors_id,
          neighbor_track_token) = build_neighbor_past_feature(
              past_cur_agents_world_8_list=past_cur_agents_world_8_list,
              past_cur_agents_types_list=past_cur_agents_types_list,
@@ -409,6 +437,25 @@ class DataProcessor(object):
             1]  # (K, T, 11) 이므로 axis=1
         assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
             f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
+        """
+        - neighbor_future_gt_3_dim:
+            · shape: (chosen_agent_num, Tf, 3)
+        - neighbor_future_all_gt_3_dim:
+            · shape: (chosen_agent_num, 1 + Tf_all, 3)
+        """
+        cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
+            scenario, do_inference=True)
+
+        # neighbor_future_all_gt_3_dim: (chosen_agent_num, 1 + Tf_all, 3)
+        neighbor_future_all_gt_3_dim = agent_future_all_process(
+            ego_cur_pose_np, cur_fut_agents_world_8_list, neighbors_id)
+
+        # neighbor_future_gt_3_dim: (chosen_agent_num, 1+Tf, 3)
+        neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
+                                                                iteration +
+                                                                self.
+                                                                num_future_poses, :]
+
         # 3) static 객체 (K_static, 10)
         static_objects = build_static_feature(
             present_static_feat_5=present_static_feat_5,
@@ -417,10 +464,20 @@ class DataProcessor(object):
             ego_cur_pose_np=ego_cur_pose_np,
             filter_radius=self._filter_radius,
         )
+        data = {
+            "ego_agent_past": ego_agent_past,  # (time_len, 11)
+            "neighbor_agents_past":
+                neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
+            "neighbor_future_gt_3_dim":
+                neighbor_future_gt_3_dim,  # (chosen_agent_num, 1+ future_len, 3)
+            "neighbor_future_all_gt_3_dim":
+                neighbor_future_all_gt_3_dim,  # (chosen_agent_num, 1+ future_all_len, 3)
+            "static_objects": static_objects,  # (chosen_static_num, 10)
+        }
         ###################
         (
             route_roadblock_ids,
-            elements_to_object_polylines,
+            elements_to_obj_polylines,
             elements_to_traffic_light,
             speed_limit_dict,
             lanes_roadblock_id_list,
@@ -432,77 +489,30 @@ class DataProcessor(object):
             map_api=map_api,
             traffic_light_data=traffic_light_data,
         )
-
-        car_token_to_rr_ids = self._prepare_car_token_to_rr_ids_oa(
-            scenario=scenario,
-            use_route_lanes=use_route_lanes,
-            neighbor_track_token=neighbor_track_token,
-        )
+        # len = chosen_car_num
+        car_token_to_rr_ids: Dict[
+            str, List[str]] = self._prepare_car_token_to_rr_ids(
+                scenario=scenario,
+                use_route_lanes=use_route_lanes,
+                neighbor_track_token=neighbor_track_token,
+            )
 
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         vector_map = map_process(
             route_roadblock_ids,
-            car_token_to_rr_ids,
+            car_token_to_rr_ids,  # len = chosen_car_num
             neighbor_track_token,
             neighbor_agents_current,
             ego_cur_pose_np,
-            elements_to_object_polylines,
+            elements_to_obj_polylines,
             elements_to_traffic_light,  # elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData]
             speed_limit_dict,
             lanes_roadblock_id_list,
             self._map_elements,
-            self._max_elements,
-            self._max_points)
-        # (num_agents, future_len, 3)
-        # FOR OPEN-LOOP SIMULATION.
-        # neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
-        #     scenario, ego_cur_pose_np, neighbor_agents_past, agents_cur_frame_indices,
-        #     iteration)  # (num_agents, future_len, 3)
-        # FOR CLOSED-LOOP SIMULATION.
+            self._map_max_elements,
+            self._map_points_num)
 
-        if self.init_future_tracked_objects_array_list is None:
-            scenario_duration: float = scenario.duration_s.time_s + self.future_time_horizon
-            num_samples = int(scenario_duration * 10.)
-            # future_tracked_objects_array_list: List[ np.ndarray ((frame_agents_num, 8)) ]
-            # 길이: 1 + num_future_poses
-            # frame_agents_num: 각 프레임마다 다름
-            self.init_future_tracked_objects_array_list, self._init_token_to_id = self._get_future_tracked_objects_array_list(
-                scenario,
-                iteration=0,
-                future_time_horizon=scenario_duration,
-                num_samples=num_samples)
-        # neighbor_track_token: List[Optional[str]], (agent_num,)
-        # neighbor_token_id: List[Optional[int]], (agent_num,)
-        neighbor_token_id = []
-        for track_token in neighbor_track_token:
-            if track_token is None:
-                neighbor_token_id.append(None)
-            else:
-                neighbor_token_id.append(self._init_token_to_id[track_token])
-        # (agents_num, 1 + Tf = future_all_len, 3)
-        init_future_tracked_objects_array_list = copy.deepcopy(
-            self.init_future_tracked_objects_array_list)
-        neighbor_future_all_gt_3_dim = agent_future_all_process(
-            ego_cur_pose_np, init_future_tracked_objects_array_list,
-            neighbor_token_id)
-        neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
-                                                                iteration +
-                                                                self.
-                                                                num_future_poses, :]
-        # (agents_num, future_len, 3)
-        # neighbor_agents_past = self.zero_out_random_time_prefix(neighbor_agents_past)
-
-        data = {
-            "ego_agent_past": ego_agent_past,  # (time_len, 11)
-            "neighbor_agents_past":
-                neighbor_agents_past,  # (agent_num, time_len, 11)
-            "neighbor_future_gt_3_dim":
-                neighbor_future_gt_3_dim,  # (num_agents, future_len, 3)
-            "neighbor_future_all_gt_3_dim":
-                neighbor_future_all_gt_3_dim,  # (num_agents, future_all_len, 3)
-            "static_objects": static_objects
-        }
         if "agent_route_lane_order" in vector_map:
             aro = vector_map["agent_route_lane_order"]
             if isinstance(aro, np.ndarray) and aro.dtype != np.int64:
@@ -513,7 +523,7 @@ class DataProcessor(object):
         data = convert_to_model_inputs(data, device, squeeze)
         # agent
         data[
-            "neighbor_track_token"] = neighbor_track_token  # List[Optional[str]], (agent_num,)
+            "neighbor_track_token"] = neighbor_track_token  # List[str], (chosen_agent_num,)
         # 변환 후에도 안전하게 보정
         if "agent_route_lane_order" in data:
             data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
@@ -731,7 +741,9 @@ class DataProcessor(object):
         ego_heading: float,
         map_api: NuPlanMap,
         traffic_light_data: Optional[List[TrafficLightStatusData]] = None,
-    ):
+    ) -> Tuple[List[str], Dict[str, MapObjectPolylines], Dict[
+            str, LaneSegmentTrafficLightData], Dict[str, np.ndarray],
+               List[str]]:
         """지도 관련 입력(route/차선/신호/속도제한)을 한 번에 준비하는 공통 유틸.
 
         공통 흐름:
@@ -749,15 +761,6 @@ class DataProcessor(object):
             traffic_light_data:
                 - observation_adapter 경로: 현재 시점의 신호등 리스트를 그대로 전달
                 - work 경로: None → 시나리오 0번 iteration 에서 조회
-
-        Returns:
-            Tuple[
-                route_roadblock_ids,
-                elements_to_object_polylines,
-                elements_to_traffic_light,
-                speed_limit_dict,
-                lanes_roadblock_id_list,
-            ]
         """
         # 1) route roadblock 보정
         route_roadblock_ids = scenario.get_route_roadblock_ids()
@@ -773,8 +776,23 @@ class DataProcessor(object):
                 scenario.get_traffic_light_status_at_iteration(0))
 
         # 3) ego 주변 차선/경계/신호/속도제한 추출
+        """
+    1. elements_to_obj_polylines: Dict[str, MapObjectPolylines],
+       - 키: 맵 요소 이름 문자열 "LANE", "LEFT_BOUNDARY", "RIGHT_BOUNDARY", "CROSSWALK", ...
+       - 값: 해당 요소를 이루는 점들의 모음(MapObjectPolylines)
+    - 내부 구조: [num_elements, num_points_i, 2]
+    2. elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData],
+       - 키: 맵 요소 이름 문자열(현재 "LANE"만 사용)
+       - 값: 해당 요소에 대응되는 신호등 상태 정보 (LaneSegmentTrafficLightData)
+            - 내부 구조: (num_lanes, 4) one-hot
+    3. speed_limit_dict: Dict[str, np.ndarray],
+       - "lane_has_speed_limit": (num_lanes,), bool
+       - "lane_speed_limit": (num_lanes,), float32
+    4. lanes_roadblock_id_list: List[str],
+       - 각 차선이 속한 도로 묶음(roadblock) ID 리스트 (길이 = num_lanes)
+        """
         (
-            elements_to_object_polylines,
+            elements_to_obj_polylines,
             elements_to_traffic_light,
             speed_limit_dict,
             lanes_roadblock_id_list,
@@ -789,7 +807,7 @@ class DataProcessor(object):
 
         return (
             route_roadblock_ids,
-            elements_to_object_polylines,
+            elements_to_obj_polylines,
             elements_to_traffic_light,
             speed_limit_dict,
             lanes_roadblock_id_list,
@@ -814,6 +832,15 @@ class DataProcessor(object):
                 past_cur_ego_world_10=past_cur_ego_world_10,
                 ego_cur_pose_np=ego_cur_pose_np,
             )
+            '''
+            ego & agents future
+            ego_future_gt_3_dim : rear axle x,y, ~~~ (future_len, 3)
+            planner_future_11_dim : center x,y, ~~~ (future_len, 11)
+            '''
+            (ego_future_gt_3_dim,
+             ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
+                 scenario, ego_state, self.num_future_poses,
+                 self.future_time_horizon)
             """
             - past_cur_agents_world_8_list: List[np.ndarray]
                 · 길이: num_frames
@@ -844,10 +871,11 @@ class DataProcessor(object):
             """
             neighbor_agents_past: (chosen_agent_num, num_frames, 11)
             agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
+            neighbors_id: np.ndarray (chosen_agent_num,) (에이전트 ID)
             neighbor_track_token: List[str] (chosen_agent_num,)
             """
             # 2) neighbor 과거 궤적
-            (neighbor_agents_past, agents_cur_frame_indices,
+            (neighbor_agents_past, agents_cur_frame_indices, neighbors_id,
              neighbor_track_token) = build_neighbor_past_feature(
                  past_cur_agents_world_8_list=past_cur_agents_world_8_list,
                  past_cur_agents_types_list=past_cur_agents_types_list,
@@ -859,6 +887,22 @@ class DataProcessor(object):
                  filter_radius=self._filter_radius,
              )
 
+            ego_time_len = ego_agent_past.shape[0]
+            neighbor_time_len = neighbor_agents_past.shape[1]
+            assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
+                f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
+
+            # (num_agents, future_len, 3)
+            # cur_fut_agents_world_8_list: List[ np.ndarray ((frame_agents_num, 8)) ]
+            # 길이: 1 + num_future_poses
+            # frame_agents_num: 각 프레임마다 다름
+            cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
+                scenario, do_inference=False)
+
+            # neighbor_future_gt_3_dim: (num_agents, 1+future_len, 3)
+            neighbor_future_gt_3_dim = agent_future_all_process(
+                ego_cur_pose_np, cur_fut_agents_world_8_list, neighbors_id)
+
             # 3) static 객체
             static_objects = build_static_feature(
                 present_static_feat_5=present_static_feat_5,
@@ -868,19 +912,24 @@ class DataProcessor(object):
                 filter_radius=self._filter_radius,
             )
 
-            ego_time_len = ego_agent_past.shape[0]
-            neighbor_time_len = neighbor_agents_past.shape[1]
-            assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
-                f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
-
-            # (agent_num, 11)
-            neighbor_agents_current = neighbor_agents_past[:, -1, :]
+            input_data = {
+                "ego_agent_past":
+                    ego_agent_past,  # (chosen_agent_num, time_len, 11)
+                "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
+                "ego_future_gt_11_dim":
+                    ego_future_gt_11_dim,  # (future_len, 11)
+                "neighbor_agents_past":
+                    neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
+                "neighbor_future_gt_3_dim":
+                    neighbor_future_gt_3_dim,  # (chosen_agent_num, 1+future_len, 3)
+                "static_objects": static_objects,  # (chosen_static_num, 10)
+            }
             '''
             Map
             '''
             (
                 route_roadblock_ids,
-                elements_to_object_polylines,
+                elements_to_obj_polylines,
                 elements_to_traffic_light,
                 speed_limit_dict,
                 lanes_roadblock_id_list,
@@ -892,17 +941,19 @@ class DataProcessor(object):
                 map_api=map_api,
                 # traffic_light_data=None  → iteration 0 기준으로 내부에서 가져옴
             )
-            # # 길아: agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
-            car_token_to_rr_ids: Dict[
-                str, Optional[List[str]]] = get_npc_route_roadblock_ids(
-                    scenario, past_cur_tracked_objects, neighbor_track_token)
-
+            # 길이 : agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
+            car_token_to_rr_ids: Dict[str,
+                                      List[str]] = get_npc_route_roadblock_ids(
+                                          scenario, past_cur_tracked_objects,
+                                          neighbor_track_token)
+            # (agent_num, 11)
+            neighbor_agents_current = neighbor_agents_past[:, -1, :]
             vector_map = map_process(
                 route_roadblock_ids, car_token_to_rr_ids, neighbor_track_token,
                 neighbor_agents_current, ego_cur_pose_np,
-                elements_to_object_polylines, elements_to_traffic_light,
+                elements_to_obj_polylines, elements_to_traffic_light,
                 speed_limit_dict, lanes_roadblock_id_list, self._map_elements,
-                self._max_elements, self._max_points)
+                self._map_max_elements, self._map_points_num)
 
             # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
             try:
@@ -929,56 +980,13 @@ class DataProcessor(object):
                 print(
                     f"[Warn] stats collection failed for {map_name}_{token}: {_e}"
                 )
-            '''
-            ego & agents future
-            ego_future_gt_3_dim : rear axle x,y, ~~~
-            planner_future_11_dim : center x,y, ~~~
-            '''
-            (ego_future_gt_3_dim,
-             ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
-                 scenario, ego_state, self.num_future_poses,
-                 self.future_time_horizon)
-            Tf, Df = ego_future_gt_11_dim.shape
-            assert Tf == self.num_future_poses, (
-                "Ego agent future states should have T time steps")
-            assert Df == 11, (
-                "Ego agent future states should have 11 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, agent type)"
-            )
-            neighbor_future_gt_3_dim = self._get_neighbor_future_gt_3_dim(
-                scenario, ego_cur_pose_np, neighbor_agents_past,
-                agents_cur_frame_indices)  # (num_agents, future_len, 3)
-            '''
-            ego current
-            
-            
-            '''
-            # ego_agent_past: (T, 11)
-            # TODO:ego_current_state 14 차원으로 나옴
-            ego_current_state = calculate_additional_ego_states(
-                ego_agent_past, past_cur_time_np)
-            T, D = ego_agent_past.shape
-            assert T == self.num_past_poses + 1, "Ego agent past states should have T+1 time steps"
-            assert D == 11, "Ego agent past states should have 8 dimensions (x, y, cos(yaw), sin(yaw), v_x, v_y, width, length)"
+
             # gather data
-            input_data = {
+            chore_data = {
                 "map_name": map_name,
                 "token": token,
-                "ego_current_state": ego_current_state,  # (10,) # TODO
-                ############ SAME AS INFERENCE ############
-                "ego_agent_past": ego_agent_past,  # (time_len, 11) # DONE
-                "neighbor_agents_past":
-                    neighbor_agents_past,  # (num_agents, time_len, 11) # DONE
-                "static_objects": static_objects,  # (num_static, 5) # TODO
-                ############################################
-                ############ LEARNING ONLY #################
-                # TODO: ego_future_gt_3_dim 의 shape이 (0,) 인 경우가 있음. (왜 그런지는 모르겠음)
-                "ego_future_gt_3_dim":
-                    ego_future_gt_3_dim,  # rear_axle x,y # (future_len, 3) # DONE
-                "ego_future_gt_11_dim":
-                    ego_future_gt_11_dim,  # center x,y # (future_len, 11) # DONE
-                "neighbor_future_gt_3_dim":
-                    neighbor_future_gt_3_dim,  # (num_agents, future_len, 3) # DONE
             }
+            input_data.update(chore_data)
             ############################################
             # [ADD] 저장 전 안전 보정 (훈련용 npz)
             aro = vector_map.get("agent_route_lane_order", None)
@@ -1007,13 +1015,52 @@ class DataProcessor(object):
         future_time_horizon: Optional[float] = None,
         num_samples: Optional[int] = None,
     ) -> Tuple[List[np.ndarray], Dict[str, int]]:
+        """현재 시점부터 일정 시간 동안의 모든 에이전트 상태를
+        프레임별 배열 리스트로 뽑아낸다.
+
+        하는 일 요약
+        -------------
+        1) 주어진 iteration 에서
+           - 현재 프레임의 TrackedObjects
+           - 그 이후 future_time_horizon 동안, num_samples 개의 미래 TrackedObjects
+           를 가져온다.
+
+        2) `sampled_tracked_objects_to_array_list` 를 통해,
+           각 프레임을 (frame_agents_num, 8) 형태의 배열로 바꾼다.
+           - 각 행: [track_id, vx, vy, heading, width, length, x, y]
+           - 프레임마다 에이전트 수(frame_agents_num)는 달라질 수 있다.
+           - 리스트 순서는 [현재, t+1, t+2, ...] 시간 순서.
+
+        3) 동시에, track_token(문자열)을 일관된 정수 ID 로 바꿔주는
+           token_to_id 매핑 사전도 함께 만든다.
+
+        Args:
+            iteration (int, optional):
+                기준이 되는 현재 step 인덱스(0 기반).
+            future_time_horizon (Optional[float], optional):
+                현재 이후로 몇 초까지 볼 것인지. None 이면 self.future_time_horizon 사용.
+            num_samples (Optional[int], optional):
+                몇 개의 미래 프레임을 뽑을지. None 이면 self.num_future_poses 사용.
+
+        Returns:
+            Tuple[List[np.ndarray], Dict[str, int]]:
+                - cur_fut_agents_world_8_list: List[np.ndarray]
+                    · 길이: 1 + num_samples
+                    · 각 원소 shape: (frame_agents_num_t, 8)
+                      [track_id, vx, vy, heading, width, length, x, y]
+                    · 리스트 순서: [현재, t+1, t+2, ...]
+                - token_to_id: Dict[str, int]
+                    · 전체 프레임에서 등장한 track_token → 정수 ID 매핑 사전.
+        """
         present_tracked_objects: TrackedObjects = scenario.get_tracked_objects_at_iteration(
             iteration).tracked_objects
+
         if future_time_horizon is None:
             future_time_horizon = self.future_time_horizon
         if num_samples is None:
             num_samples = self.num_future_poses
 
+        # 미래 프레임들의 TrackedObjects 리스트
         future_tracked_objects: List[TrackedObjects] = [
             tracked_objects.tracked_objects
             for tracked_objects in scenario.get_future_tracked_objects(
@@ -1022,38 +1069,18 @@ class DataProcessor(object):
                 num_samples=num_samples)
         ]
 
+        # [현재] + [미래들] 을 하나의 시퀀스로 합친다.
         sampled_future_observations: List[TrackedObjects] = [
             present_tracked_objects
         ] + future_tracked_objects
 
-        # future_tracked_objects_array_list: List[ np.ndarray ((frame_agents_num, 8)) ]
-        # 길이: 1 + num_future_poses
-        # frame_agents_num: 각 프레임마다 다름
-        (future_tracked_objects_array_list, _, token_to_id
+        # cur_fut_agents_world_8_list: List[np.ndarray]
+        #   - 각 원소: (frame_agents_num, 8)
+        # token_to_id: Dict[str, int]
+        (cur_fut_agents_world_8_list, _, token_to_id
         ) = sampled_tracked_objects_to_array_list(sampled_future_observations)
-        return future_tracked_objects_array_list, token_to_id
 
-    def _get_neighbor_future_gt_3_dim(
-        self,
-        scenario: NuPlanScenario,
-        ego_cur_pose_np: np.ndarray,  # (3,)
-        neighbor_agents_past: np.ndarray,  # (num_agents, Tp, 11)
-        agents_cur_frame_indices: Union[np.ndarray, List[int]],
-        iteration: int = 0,
-    ) -> np.ndarray:  # (num_agents, Tf, 3)
-        # future_tracked_objects_array_list: List[ np.ndarray ((frame_agents_num, 8)) ]
-        # 길이: 1 + num_future_poses
-        # frame_agents_num: 각 프레임마다 다름
-        future_tracked_objects_array_list, token_to_id = self._get_future_tracked_objects_array_list(
-            scenario, iteration)
-        # neighbor_future_gt_3_dim: (num_agents, future_len, 3)
-        neighbor_future_gt_3_dim = agent_future_process(
-            ego_cur_pose_np, future_tracked_objects_array_list,
-            self.max_agent_num, agents_cur_frame_indices)
-        # _, neighbor_future_gt_3_dim, _ = \
-        #     self._filter_agents_within_radius(neighbor_agents_past,
-        #                                       neighbor_future_gt_3_dim)
-        return neighbor_future_gt_3_dim
+        return cur_fut_agents_world_8_list, token_to_id
 
     def save_to_disk(self, dir, data):
         os.makedirs(dir, exist_ok=True)
