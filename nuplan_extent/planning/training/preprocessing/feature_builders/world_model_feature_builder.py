@@ -14,7 +14,7 @@ from nuplan.planning.training.preprocessing.feature_builders.abstract_feature_bu
 from nuplan_extent.planning.training.preprocessing.features.world_model import WorldModelFeature
 from diffusion_planner.utils.config import Config
 from diffusion_planner.data_process.data_processor import DataProcessor
-from diffusion_planner.data_process.utils import convert_to_model_inputs
+from diffusion_planner.data_process.utils import convert_data_dict_to_device_tensors
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
 
 
@@ -127,7 +127,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         model_inputs.pop("neighbor_track_token")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model_inputs: Dict[str,
-                           torch.Tensor] = convert_to_model_inputs(model_inputs,
+                           torch.Tensor] = convert_data_dict_to_device_tensors(model_inputs,
                                                                    device,
                                                                    squeeze=True)
         self.unnormalized_features = model_inputs.copy()

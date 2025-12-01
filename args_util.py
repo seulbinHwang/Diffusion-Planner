@@ -92,7 +92,7 @@ def get_args():
     parser.add_argument('--lane_num',
                         type=int,
                         help='number of lanes',
-                        default=100)
+                        default=250)
 
     parser.add_argument('--route_len',
                         type=int,
@@ -143,6 +143,7 @@ def get_args():
                         type=boolean)
     parser.add_argument('--use_guidance', default=False, type=boolean)
     parser.add_argument('--use_feasible_blend', default=False, type=boolean)
+    parser.add_argument('--make_statistics_when_caching', default=False, type=boolean)
 
     # parser.add_argument(
     #     '--pin-mem',

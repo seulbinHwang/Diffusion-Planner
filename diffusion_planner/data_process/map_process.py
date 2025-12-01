@@ -6,53 +6,7 @@ Categories:
     1. Get lanes, speed limit, traffic light and lane's roadblock ids
     2. Get maps array for model input
 """
-from typing import Dict, List, Optional, Tuple
-import numpy as np
 
-from nuplan.planning.training.preprocessing.feature_builders.vector_builder_utils import (
-    MapObjectPolylines,
-    LaneSegmentTrafficLightData,
-    VectorFeatureLayer,
-)
-from typing import Dict, List, Optional, Tuple
-import numpy as np
-
-from nuplan.planning.training.preprocessing.feature_builders.vector_builder_utils import (
-    MapObjectPolylines,
-    LaneSegmentTrafficLightData,
-    VectorFeatureLayer,
-)
-
-from diffusion_planner.data_process.utils import (
-    vector_set_coordinates_to_local_frame,
-    _select_token_and_ordered_npc_route_indices,
-)
-from diffusion_planner.data_process.utils import (
-    vector_set_coordinates_to_local_frame,
-    _select_token_and_ordered_npc_route_indices,
-)
-from typing import List, Dict, Tuple, Set, Optional
-import numpy as np
-from shapely import LineString
-
-from nuplan.common.actor_state.state_representation import Point2D
-from nuplan.common.maps.abstract_map import AbstractMap, MapObject
-from nuplan.common.maps.nuplan_map.utils import \
-    get_distance_between_map_object_and_point
-from nuplan.common.maps.maps_datatypes import TrafficLightStatusData, \
-    SemanticMapLayer
-from nuplan.planning.training.preprocessing.feature_builders.vector_builder_utils import (
-    MapObjectPolylines, VectorFeatureLayer, LaneSegmentLaneIDs,
-    VectorFeatureLayerMapping, LaneSegmentTrafficLightData,
-    get_traffic_light_encoding, get_map_object_polygons)
-
-from diffusion_planner.data_process.utils import \
-    vector_set_coordinates_to_local_frame, \
-    _select_token_and_ordered_npc_route_indices, \
-    get_directional_proximal_map_objects, get_circular_proximal_map_objects
-
-from typing import List, Dict, Optional, Tuple
-import numpy as np
 from typing import List, Dict, Tuple, Set, Optional
 import numpy as np
 from shapely import LineString
@@ -666,11 +620,10 @@ def _interpolate_points(line, num_point):
     return new_line
 
 
-
-
 def _select_lanes_by_ego_distance_to_keep(
     ego_pose: np.ndarray,  # (3,) = [ego_x, ego_y, ego_heading]
-    feature_coords: List[np.ndarray],  # 길이 = lane_num, 각 원소: (num_points_i, 2)
+    feature_coords: List[
+        np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
     map_max_elements: int,
 ) -> Tuple[List[int], int]:
     """ego 와의 거리 기준으로 lane 인덱스를 정렬하고, 유지할 인덱스만 골라낸다.
@@ -686,7 +639,7 @@ def _select_lanes_by_ego_distance_to_keep(
             ego 현재 상태 [x, y, heading]. shape = (3,).
         feature_coords (List[np.ndarray]):
             각 차선 중심선 좌표 리스트.
-            - 길이: lane_num
+            - 길이: chosen_lane_num
             - 각 원소 shape: (num_points_i, 2)
         map_max_elements (int):
             유지할 수 있는 lane 의 최대 개수.
@@ -698,11 +651,11 @@ def _select_lanes_by_ego_distance_to_keep(
                 길이 = chosen_lane_num.
             - chosen_lane_num:
                 실제로 사용할 lane 개수.
-                = min(lane_num, map_max_elements)
+                = min(chosen_lane_num, map_max_elements)
     """
-    lane_num: int = len(feature_coords)
+    chosen_lane_num: int = len(feature_coords)
 
-    if lane_num == 0 or map_max_elements <= 0:
+    if chosen_lane_num == 0 or map_max_elements <= 0:
         return [], 0
 
     # 각 lane 과 ego 사이의 최소 거리 계산
@@ -717,7 +670,7 @@ def _select_lanes_by_ego_distance_to_keep(
     sorted_items: List[Tuple[int, float]] = sorted(distance_map.items(),
                                                    key=lambda item: item[1])
 
-    chosen_lane_num: int = min(lane_num, map_max_elements)
+    chosen_lane_num: int = min(chosen_lane_num, map_max_elements)
     selected_lane_indices: List[int] = [
         lane_index for lane_index, _ in sorted_items[:chosen_lane_num]
     ]
@@ -828,16 +781,17 @@ def _initialize_lane_attribute_arrays(
 def _fill_lane_arrays_for_selected_lanes(
         selected_lane_indices: List[int],  # 길이 = chosen_lane_num
         feature_coords: List[
-            np.ndarray],  # 길이 = lane_num, 각 원소: (num_points_i, 2)
+            np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
         left_boundary: List[
-            np.ndarray],  # 길이 = lane_num, 각 원소: (num_points_i, 2)
+            np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
         right_boundary: List[
-            np.ndarray],  # 길이 = lane_num, 각 원소: (num_points_i, 2)
-        lanes_roadblock_id_list: List[str],  # 길이 = lane_num
-        lane_has_speed_limit: np.ndarray,  # (lane_num,)
-        lane_speed_limit: np.ndarray,  # (lane_num,)
+            np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
+        lanes_roadblock_id_list: List[str],  # 길이 = chosen_lane_num
+        lane_has_speed_limit: np.ndarray,  # (chosen_lane_num,)
+        lane_speed_limit: np.ndarray,  # (chosen_lane_num,)
         feature_tl_data: Optional[List[
-            np.ndarray]],  # 길이 = lane_num, 각 원소: (num_points_i, dim) 또는 None
+            np.
+            ndarray]],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, dim) 또는 None
         map_points_num: int,
         chosen_center_xy: np.ndarray,  # (chosen_lane_num, map_points_num, 2)
         left_array: np.ndarray,  # (chosen_lane_num, map_points_num, 2)
@@ -871,7 +825,7 @@ def _fill_lane_arrays_for_selected_lanes(
         lanes_roadblock_id_list (List[str]):
             각 lane 이 속한 roadblock id 리스트.
         lane_has_speed_limit, lane_speed_limit (np.ndarray):
-            lane 전체에 대한 속도제한 유무/값. shape: (lane_num,).
+            lane 전체에 대한 속도제한 유무/값. shape: (chosen_lane_num,).
         feature_tl_data (Optional[List[np.ndarray]]):
             lane 별 신호 상태 리스트. 각 원소 shape: (num_points_i, dim) 또는 None.
         map_points_num (int):
@@ -916,7 +870,7 @@ def _fill_lane_arrays_for_selected_lanes(
             # (map_points_num, traffic_light_encoding_dim) 이라고 가정
             lanes_point_tl_array[out_idx] = feature_tl_data[src_idx]
 
-    return chosen_lanes_rb_id_list # len: chosen_lane_num
+    return chosen_lanes_rb_id_list  # len: chosen_lane_num
 
 
 def _prune_route_by_connectivity(route_roadblock_ids: List[str],
@@ -943,113 +897,198 @@ def _prune_route_by_connectivity(route_roadblock_ids: List[str],
     return pruned_route_roadblock_ids
 
 
-def _lane_polyline_process(polylines, left_boundary, right_boundary, avails,
-                           traffic_light):
-    dim = 12
-    new_polylines = np.zeros(shape=(polylines.shape[0], polylines.shape[1],
-                                    dim),
-                             dtype=np.float32)
+def _lane_polyline_process(
+    polylines: np.ndarray,  # shape: (chosen_lane_num, lane_len, 2)
+    left_boundary: np.ndarray,  # shape: (chosen_lane_num, lane_len, 2)
+    right_boundary: np.ndarray,  # shape: (chosen_lane_num, lane_len, 2)
+    lane_xy_valid_mask: np.ndarray,  # shape: (chosen_lane_num, lane_len)
+    traffic_light: np.ndarray,  # shape: (chosen_lane_num, lane_len, 4)
+) -> np.ndarray:  # shape: (chosen_lane_num, lane_len, 12)
+    """차선 폴리라인과 좌우 경계선, 신호 정보를 한 번에 벡터로 합친다.
 
-    for i in range(polylines.shape[0]):
-        if avails[i][0]:
-            polyline = polylines[i]
-            polyline_vector = polyline[1:] - polyline[:-1]
-            polyline_vector = np.insert(polyline_vector,
-                                        polyline_vector.shape[0],
-                                        0,
-                                        axis=0)
+    각 차선의 한 점에 대해 다음 값을 이어 붙여 길이 12 벡터를 만든다.
 
-            if np.linalg.norm(left_boundary[i, -1] -
-                              polyline[0]) < np.linalg.norm(left_boundary[i,
-                                                                          0] -
-                                                            polyline[0]):
-                left_boundary[i] = np.flip(left_boundary[i], axis=0)
+    - 현재 점 위치 (x, y)
+    - 이전 점과의 차이 벡터 (간단한 진행 방향 정보)
+    - 왼쪽 경계선까지의 상대 위치 (left - center)
+    - 오른쪽 경계선까지의 상대 위치 (right - center)
+    - 신호등 one-hot (길이 4)
 
-            if np.linalg.norm(right_boundary[i, -1] -
-                              polyline[0]) < np.linalg.norm(right_boundary[i,
-                                                                           0] -
-                                                            polyline[0]):
-                right_boundary[i] = np.flip(right_boundary[i], axis=0)
+    Args:
+        polylines: 차선 중심선 좌표.
+            shape = (chosen_lane_num, lane_len, 2).
+        left_boundary: 왼쪽 경계선 좌표.
+            shape = (chosen_lane_num, lane_len, 2).
+        right_boundary: 오른쪽 경계선 좌표.
+            shape = (chosen_lane_num, lane_len, 2).
+        lane_xy_valid_mask: 유효 포인트 마스크.
+            shape = (chosen_lane_num, lane_len).
+            lane_xy_valid_mask[i, 0] 이 False 이면 i 번째 차선 전체를 패딩으로 간주한다.
+        traffic_light: 신호등 상태 one-hot.
+            shape = (chosen_lane_num, lane_len, 4).
 
-            polyline_to_left = left_boundary[i] - polyline
-            polyline_to_right = right_boundary[i] - polyline
+    Returns:
+        np.ndarray: 차선 벡터 표현.
+            shape = (chosen_lane_num, lane_len, 12), dtype = float32.
+    """
+    dim: int = 12  # 각 포인트의 특성 길이
+    chosen_lane_num: int = polylines.shape[0]
+    lane_len: int = polylines.shape[1]
+    # new_polylines: (chosen_lane_num, lane_len, 12)
+    new_polylines: np.ndarray = np.zeros(
+        shape=(chosen_lane_num, lane_len, dim),
+        dtype=np.float32,
+    )
+    for lane_i in range(chosen_lane_num):
+        # 이 lane 이 전부 패딩이면 건너뜀
+        if not bool(lane_xy_valid_mask[lane_i][0]):
+            continue
 
-            new_polylines[i] = np.concatenate([
-                polyline, polyline_vector, polyline_to_left, polyline_to_right,
-                traffic_light[i]
+        # polyline: (lane_len, 2)
+        polyline: np.ndarray = polylines[lane_i]
+
+        # 이웃 점 차이 벡터: (lane_len, 2)
+        polyline_vector: np.ndarray = polyline[
+            1:] - polyline[:-1]  # (lane_len-1, 2)
+        polyline_vector = np.insert(
+            polyline_vector,
+            lane_len - 1,
+            0.0,
+            axis=0,
+        )  # (lane_len, 2), 마지막 한 점에 0 벡터 추가
+
+        # 좌우 경계선 방향이 중심선 시작점과 가깝도록 정렬
+        # left_boundary[lane_i]: (lane_len, 2)
+        if np.linalg.norm(left_boundary[lane_i, -1] -
+                          polyline[0]) < np.linalg.norm(left_boundary[lane_i,
+                                                                      0] -
+                                                        polyline[0]):
+            left_boundary[lane_i] = np.flip(left_boundary[lane_i], axis=0)
+
+        # right_boundary[lane_i]: (lane_len, 2)
+        if np.linalg.norm(right_boundary[lane_i, -1] -
+                          polyline[0]) < np.linalg.norm(right_boundary[lane_i,
+                                                                       0] -
+                                                        polyline[0]):
+            right_boundary[lane_i] = np.flip(right_boundary[lane_i], axis=0)
+
+        # polyline_to_left/right: (lane_len, 2)
+        polyline_to_left: np.ndarray = left_boundary[lane_i] - polyline
+        polyline_to_right: np.ndarray = right_boundary[lane_i] - polyline
+
+        # traffic_light[lane_i]: (lane_len, 4)
+        # concat 결과: (lane_len, 2+2+2+2+4=12)
+        new_polylines[lane_i] = np.concatenate(
+            [
+                polyline,
+                polyline_vector,
+                polyline_to_left,
+                polyline_to_right,
+                traffic_light[lane_i],
             ],
-                                              axis=-1)
+            axis=-1,
+        )
 
     return new_polylines
 
 
-def _compute_lane_on_npc_routes(
-        car_token_to_rr_ids: Dict[
-            str, List[str]],  # 길이 chosen_car_num
-        chosen_lanes_rb_id_list: List[str],  # 길이 chosen_lane_num
+def _build_mask_for_token(
+    npc_route_ids_list: List[str],
+    chosen_lanes_rb_id_list: List[str],  # len: chosen_lane_num
+    chosen_lanes_rb_id_set: Set[str],
+) -> List[bool]:
+    """단일 토큰(차량)에 대해, 어떤 차선이 그 차량 경로 위에 있는지 True/False 리스트로 만든다.
+
+    동작 요약
+    ----------
+    1) npc_route_ids_list (해당 차량의 roadblock 시퀀스) 중에서,
+       실제 차선 목록(chosen_lanes_rb_id_list)에 존재하는 것만 추린다.
+    2) 그 roadblock 들이 서로 끊기지 않는 연속 구간이 되도록
+       `_prune_route_by_connectivity` 로 한 번 더 정리한다.
+    3) 최종적으로, chosen_lanes_rb_id_list 를 순회하면서
+       각 roadblock id 가 “정리된 경로 집합” 안에 있는지 검사한다.
+       → [True, False, ...] 형태의 리스트 반환.
+
+    Args:
+        npc_route_ids_list (Optional[List[str]]):
+            - 해당 차량의 roadblock id 시퀀스.
+            - None 이면 경로 정보가 없다고 보고 전부 False 로 처리.
+        chosen_lanes_rb_id_list (List[str]):
+            - 현재 샘플에서 사용 중인 lane 들의 roadblock id 리스트.
+            - 길이 = chosen_lane_num.
+        chosen_lanes_rb_id_set (Set[str]):
+            - 위 리스트를 집합으로 만든 것 (빠른 포함 검사용).
+
+    Returns:
+        List[bool]:
+            - 길이 = chosen_lane_num
+            - j번째 값이 True 이면, chosen_lanes_rb_id_list[j] 가
+              이 차량의 “연속성이 보장된” 경로에 포함된 roadblock 이라는 뜻.
+    """
+    # chosen_lanes_rb_id_list 안에 실제 존재하는 후보만 필터링
+    npc_route_ids_in_chosen_set: Set[str] = {
+        npc_a_route_id for npc_a_route_id in npc_route_ids_list
+        if npc_a_route_id in chosen_lanes_rb_id_set
+    }
+
+    # 연속 구간 보정
+    ongoing_npc_rrb_ids_in_chosen: List[str] = _prune_route_by_connectivity(
+        npc_route_ids_list, npc_route_ids_in_chosen_set)
+    ongoing_npc_rrb_ids_in_chosen_set: Set[str] = set(
+        ongoing_npc_rrb_ids_in_chosen)
+
+    # 각 lane 의 roadblock id 가 보정된 경로 집합 안에 있는지 검사
+    chosen_lanes_npc_route_mask = [
+        rb_id in ongoing_npc_rrb_ids_in_chosen_set
+        for rb_id in chosen_lanes_rb_id_list
+    ]
+    return chosen_lanes_npc_route_mask
+
+
+def _compute_car_token_to_chosen_lanes_route_mask(
+        car_token_to_rr_ids: Dict[str, List[str]],  # 길이: chosen_car_num
+        chosen_lanes_rb_id_list: List[str],  # 길이: chosen_lane_num
 ) -> Dict[str, List[bool]]:
     """토큰별 NPC 경로가 현재 추출된 차선(chosen_lanes_rb_id_list)에 포함되는지 불리언 마스크로 반환한다.
 
-    각 토큰의 경로(RoadBlock ID 시퀀스)를 현재 샘플에서 추출된 lane의 roadblock id 리스트
-    `chosen_lanes_rb_id_list`에 대하여 멤버십으로 투영한다. 연결성 보정을 위해
-    `_prune_route_by_connectivity`를 사용하여 연속 구간만 유지한다.
+    각 차량 토큰에 대해,
+    - 그 차량의 경로(RoadBlock ID 시퀀스)와
+    - 현재 샘플에서 사용 중인 차선들의 roadblock id 리스트(chosen_lanes_rb_id_list)를 비교하여,
+
+    “각 차선이 이 차량의 경로 위에 있는지”를 True/False 리스트로 만들어 준다.
+    연결성 보정을 위해 `_prune_route_by_connectivity` 를 사용해
+    경로가 끊기지 않는 연속 구간만 유지한다.
 
     Args:
         car_token_to_rr_ids (Dict[str, List[str]]):
-            키 = 토큰(str), 값 = 보정된 RoadBlock ID 시퀀스(List[str]).
-            길이  chosen_car_num
+            - 키: 차량 토큰 문자열
+            - 값: 해당 차량의 roadblock id 시퀀스(List[str]).
+            - 길이 = chosen_car_num.
         chosen_lanes_rb_id_list (List[str]):
-            길이 <= lane_num. 현재 샘플에서 추출된 lane들의 roadblock id(거리 순 정렬).
+            - 길이 = chosen_lane_num.
+            - 현재 샘플에서 사용 중인 lane 들의 roadblock id (ego 기준 가까운 순 정렬).
 
     Returns:
         Dict[str, List[bool]]:
-            `token_to_lane_on_routes`. 키=토큰, 값=길이  <= lane_num의 불리언 리스트.
-            각 j에 대해 chosen_lanes_rb_id_list[j]가 해당 토큰의 보정 경로에 포함되면 True.
-
-    Notes:
-        - 시간 복잡도 절감을 위해 `chosen_lanes_rb_id_list`는 집합으로 변환 후 멤버십 체크.
-        - 연결성 보정은 `_prune_route_by_connectivity(route_ids, ids_in_lane_set)` 호출.
+            - `car_token_to_chosen_lanes_route_mask`.
+            - 각 키(차량 토큰)에 대해 값은 길이 chosen_lane_num 의 True/False 리스트.
+              · j번째 값이 True 이면, chosen_lanes_rb_id_list[j] 가
+                해당 차량의 보정된 경로에 포함된 roadblock 임을 의미.
     """
-    from typing import Dict, List, Optional, Set
+    chosen_lanes_rb_id_set: Set[str] = set(chosen_lanes_rb_id_list)
+    car_token_to_chosen_lanes_route_mask: Dict[str, List[bool]] = {}
 
-    def _build_mask_for_token(
-        npc_route_ids: Optional[List[str]],
-        chosen_lanes_rb_id_list: List[str], # len: chosen_lane_num
-        chosen_lanes_rb_id_set: Set[str],
-    ) -> List[bool]:
-        """단일 토큰에 대한 lane 포함 마스크를 생성한다.
+    for chosen_car_token, npc_route_ids_list in car_token_to_rr_ids.items():
+        # npc_route_ids_list: List[str]
+        # chosen_lanes_npc_route_mask
+        car_token_to_chosen_lanes_route_mask[
+            chosen_car_token] = _build_mask_for_token(
+                npc_route_ids_list,
+                chosen_lanes_rb_id_list,
+                chosen_lanes_rb_id_set,
+            )
 
-        Args:
-            npc_route_ids (Optional[List[str]]): 보정된 NPC 경로 ID 시퀀스(가변 길이) 또는 None.
-            chosen_lanes_rb_id_list (List[str]): 길이 <= lane_num. 현재 샘플 lane의 roadblock ID.
-            chosen_lanes_rb_id_set (Set[str]): `chosen_lanes_rb_id_list`의 집합 표현.
-
-        Returns:
-            List[bool]: 길이 = len(chosen_lanes_rb_id_list). 포함 여부 불리언 마스크.
-        """
-        chosen_lane_num: int = len(chosen_lanes_rb_id_list) # len: chosen_lane_num
-        if npc_route_ids is None:
-            return [False] * chosen_lane_num
-
-        # chosen_lanes_rb_id_list 안에 실제 존재하는 후보만 필터링
-        candidate_ids_in_lane: Set[str] = {
-            rid for rid in npc_route_ids if rid in chosen_lanes_rb_id_set
-        }
-        # 연속 구간 보정
-        pruned_route_ids_list: List[str] = _prune_route_by_connectivity(
-            npc_route_ids, candidate_ids_in_lane)
-        pruned_route_ids_set: Set[str] = set(pruned_route_ids_list)
-        a = [route in pruned_route_ids_set for route in chosen_lanes_rb_id_list]
-        return a
-
-    chosen_lanes_rb_id_set: Set[str] = set(chosen_lanes_rb_id_list) # len: chosen_lane_num
-    car_token_to_lane_on_routes: Dict[str, List[bool]] = {}
-    # car_token_to_rr_ids: (Dict[str, List[str]]) len: chosen_car_num
-    for chosen_car_token, npc_route_ids in car_token_to_rr_ids.items():
-        # npc_route_ids: Optional[List[str]]
-        car_token_to_lane_on_routes[chosen_car_token] = _build_mask_for_token(
-            npc_route_ids, chosen_lanes_rb_id_list, chosen_lanes_rb_id_set)
-    return car_token_to_lane_on_routes
+    return car_token_to_chosen_lanes_route_mask
 
 
 """
@@ -1173,7 +1212,7 @@ def _build_lane_core_arrays(
          최대 `map_max_elements["LANE"]` 개까지만 남긴다.
        - 결과:
          · selected_lane_indices: 실제 사용할 lane 인덱스 리스트
-         · chosen_lane_num: 실제 lane 개수 (= min(lane_num, map_max_elements["LANE"]))
+         · chosen_lane_num: 실제 lane 개수 (= min(chosen_lane_num, map_max_elements["LANE"]))
 
     3) 출력 배열 생성
        - `_initialize_lane_geometry_arrays` 로 중심선/왼쪽/오른쪽 경계선 배열 생성
@@ -1220,7 +1259,7 @@ def _build_lane_core_arrays(
             f"Size between feature coords and traffic light data inconsistent: "
             f"{len(feature_coords)}, {len(feature_tl_data)}")
 
-    # 속도제한 1차원 배열 (lane_num,)
+    # 속도제한 1차원 배열 (chosen_lane_num,)
     lane_has_speed_limit: np.ndarray = speed_limit_dict["lane_has_speed_limit"]
     lane_speed_limit: np.ndarray = speed_limit_dict["lane_speed_limit"]
 
@@ -1300,35 +1339,35 @@ def _build_lane_core_arrays(
 def _build_lane_route_and_npc_masks(
     route_roadblock_ids: List[str],
     chosen_lanes_rb_id_list: List[str],  # 길이 ≈ chosen_lane_num
-    car_token_to_rr_ids: Dict[str, List[str]], # 길이: chosen_car_num
+    car_token_to_rr_ids: Dict[str, List[str]],  # 길이: chosen_car_num
 ) -> Tuple[
-        List[bool],  # lane_on_route
-        Dict[str, List[bool]],  # car_token_to_lane_on_routes
+        List[bool],  # chosen_lanes_route_mask # 길이 ≈ chosen_lane_num
+        Dict[str, List[bool]],  # car_token_to_chosen_lanes_route_mask
 ]:
     """전체 route·NPC 경로와 LANE 을 비교해 포함 여부 마스크를 만든다.
 
     이 함수는 “각 차선이 어디에 속하는지”를 두 가지 관점에서 표시해 준다.
 
-    1) 전체 route 기준 (lane_on_route)
+    1) 전체 route 기준 (chosen_lanes_route_mask)
        - 시나리오의 전체 경로(route_roadblock_ids)와
          각 차선이 속한 roadblock id(chosen_lanes_rb_id_list)를 비교한다.
        - 먼저, route 안에 실제로 등장하는 roadblock 만 뽑아내고,
          `_prune_route_by_connectivity` 로 “중간에 끊기지 않는 연속 구간”만 남긴다.
        - 그 후, chosen_lanes_rb_id_list 를 순회하면서
          해당 roadblock 이 “연속된 route 구간 안에 있는지”를 검사한다.
-         → True/False 리스트가 lane_on_route.
+         → True/False 리스트가 chosen_lanes_route_mask.
 
          예:
              route_roadblock_ids  = [A, B, C, D, E]
              chosen_lanes_rb_id_list          = [X, B, C, Y]
 
              pruned_route_roadblock_ids = [B, C]
-             → lane_on_route = [False, True, True, False]
+             → chosen_lanes_route_mask = [False, True, True, False]
 
-    2) NPC(다른 차량) 경로 기준 (car_token_to_lane_on_routes)
+    2) NPC(다른 차량) 경로 기준 (car_token_to_chosen_lanes_route_mask)
        - 각 차량의 경로 car_token_to_rr_ids[chosen_car_token] 과 chosen_lanes_rb_id_list 를 비교해,
          “이 차선이 그 차량의 경로 위에 있는지” True/False 로 표시한다.
-       - 내부에서 `_compute_lane_on_npc_routes` 를 사용한다.
+       - 내부에서 `_compute_car_token_to_chosen_lanes_route_mask` 를 사용한다.
          · 이 함수 안에서 chosen_lanes_rb_id_list 를 집합으로 만든 뒤,
            차량 경로와 겹치는 부분만 골라 연결이 끊기지 않도록 보정한다.
 
@@ -1343,168 +1382,173 @@ def _build_lane_route_and_npc_masks(
 
     Returns:
         Tuple[List[bool], Dict[str, List[bool]]]:
-            - lane_on_route:
-                · 길이 = len(chosen_lanes_rb_id_list)
+            - chosen_lanes_route_mask:
+                · 길이 = chosen_lane_num
                 · 각 원소가 True 이면 해당 차선이 전체 route 중 일부에 해당.
-            - car_token_to_lane_on_routes:
+            - car_token_to_chosen_lanes_route_mask:
                 · 키: 차량 토큰
                 · 값: 길이 = len(chosen_lanes_rb_id_list) 인 True/False 리스트
                   - j번째 값이 True 이면, chosen_lanes_rb_id_list[j] 가
                     해당 차량 경로에 포함된 roadblock 임을 뜻함.
     """
     # 1) route 와 LANE 의 roadblock id 를 비교해, 실제 route 위에 있는 LANE 만 찾는다.
-    lane_on_route: List[bool] = []
-    pruned_lane_roadblock_ids: List[str] = [
-        route for route in route_roadblock_ids
-        if route in chosen_lanes_rb_id_list
+    chosen_lanes_route_mask: List[bool] = []
+    rrb_ids_in_chosen_lane: List[str] = [
+        a_route_rb_id for a_route_rb_id in route_roadblock_ids
+        if a_route_rb_id in chosen_lanes_rb_id_list
     ]
     # 연속되지 않는 부분은 잘라낸다.
-    pruned_route_roadblock_ids: List[str] = _prune_route_by_connectivity(
-        route_roadblock_ids, set(pruned_lane_roadblock_ids))
+    ongoing_rrb_ids_in_chosen_lane: List[str] = _prune_route_by_connectivity(
+        route_roadblock_ids, set(rrb_ids_in_chosen_lane))
 
-    for route in chosen_lanes_rb_id_list:
-        lane_on_route.append(route in pruned_route_roadblock_ids)
+    for a_chosen_lane_rb_id in chosen_lanes_rb_id_list:
+        chosen_lanes_route_mask.append(
+            a_chosen_lane_rb_id in ongoing_rrb_ids_in_chosen_lane)
 
     # 2) 각 차량 경로 기준으로, 어떤 LANE 이 그 차의 경로 위에 있는지 표시한다.
-    car_token_to_lane_on_routes: Dict[str,
-                                      List[bool]] = _compute_lane_on_npc_routes(
-                                          car_token_to_rr_ids,
-                                          chosen_lanes_rb_id_list)
+    car_token_to_chosen_lanes_route_mask: Dict[
+        str, List[bool]] = _compute_car_token_to_chosen_lanes_route_mask(
+            car_token_to_rr_ids, chosen_lanes_rb_id_list)
 
-    return lane_on_route, car_token_to_lane_on_routes
+    return chosen_lanes_route_mask, car_token_to_chosen_lanes_route_mask
 
 
 def _prepare_array_output_and_lane_info(
     map_elements_to_list_array: Dict[str, List[np.ndarray]],
     map_elements: List[
-        str],  # ['LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES']
-    ego_cur_pose_np: np.ndarray,  # (3,)
+        str],  # 예: ['LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES']
+    ego_cur_pose_np: np.ndarray,  # shape: (3,)
     speed_limit_dict: Dict[str, np.ndarray],
-    lanes_roadblock_id_list: List[str],  # 길이 = num_lanes
+    lanes_roadblock_id_list: List[str],  # len = num_lanes
     route_roadblock_ids: List[str],
-    car_token_to_rr_ids: Dict[str, List[str]], # 길이: chosen_car_num
+    car_token_to_rr_ids: Dict[str, List[str]],  # len = chosen_car_num
     map_max_elements: Dict[str, int],
     map_points_num: Dict[str, int],
 ) -> Tuple[
-        Dict[str, np.ndarray],  # array_output
-        List[bool],  # lane_on_route
-        np.ndarray,  # lane_speed_limit_array   (max_lane_num, 1)
-        np.ndarray,  # lane_has_speed_limit_array (max_lane_num, 1)
-        Dict[str, List[bool]],  # car_token_to_lane_on_routes
+        Dict[str, np.ndarray],  # map_elements_to_array
+        List[bool],  # chosen_lanes_route_mask
+        np.ndarray,  # lane_speed_limit_array        shape: (chosen_lane_num, 1)
+        np.ndarray,  # lane_has_speed_limit_array    shape: (chosen_lane_num, 1)
+        Dict[str, List[bool]],  # car_token_to_chosen_lanes_route_mask
 ]:
-    """좌표/신호 리스트를 바탕으로 array_output 과 차선 관련 보조 정보를 만든다.
+    """맵 폴리라인/신호 리스트를 고정 크기 배열(dict)과 보조 정보들로 정리한다.
 
-    이 함수는 “폴리라인/신호 정보를 순수 넘파이 리스트”로 풀어 놓은
-    `map_elements_to_list_array` 를 입력으로 받아,
+    한 번에 하기엔 복잡한 맵 처리 과정을, “배열 만들기 단계”까지 담당하는 함수라고 보면 된다.
 
-    크게 두 단계로 나뉜다.
+    동작 요약
+    --------
+    1) LANE 처리
+       - `_build_lane_core_arrays` 로
+         · ego 기준으로 가까운 차선만 고르고
+         · 포인트 수를 `map_points_num["LANE"]` 로 맞추고
+         · 좌표/유효마스크/신호/속도제한/roadblock id 를 모두 배열로 만든다.
+       - `_build_lane_route_and_npc_masks` 로
+         · 각 차선이 전체 route 위에 있는지 (chosen_lanes_route_mask)
+         · 각 차량 토큰별로, 각 차선이 그 차량 경로 위에 있는지
+           (car_token_to_chosen_lanes_route_mask) 를 계산한다.
+       - 왼쪽/오른쪽 경계선 좌표는 이미 ego 기준 좌표계이므로
+         `"vector_set_map.coords.LEFT_BOUNDARY"`, `"RIGHT_BOUNDARY"` 키에 저장한다.
 
-    1) LANE 전용 처리
-        - `_prepare_lane_feature_arrays` 에서
-          중심선/경계선/속도제한/route 연관 정보를 모두 계산한다.
-        - LEFT/RIGHT_BOUNDARY 는 여기서 ego 기준 좌표계로 변환하고,
-          array_output["vector_set_map.coords.LEFT_BOUNDARY"],
-          array_output["vector_set_map.coords.RIGHT_BOUNDARY"] 에 저장한다.
+    2) 그 외 feature(LANE, ROUTE_LANES 등) 처리
+       - LANE 에 대해서는
+         `chosen_center_xy`(차선 중심선)와 `lane_xy_valid_mask` 를 ego 기준 좌표계로 바꿔
+         `"vector_set_map.coords.LANE"` / `"vector_set_map.availabilities.LANE"` 로 저장한다.
+       - ROUTE_LANES 등 다른 feature 이름도 같은 방식으로
+         좌표/마스크/신호를 `"vector_set_map.*.<feature_name>"` 형식의 키에 채운다.
+       - LANE 에서 계산한 `chosen_center_xy`, `lane_xy_valid_mask`, `tl_data` 를 재사용하므로
+         실제 연산은 LANE 한 번만 수행되고 나머지는 복사/좌표계 변환만 이뤄진다.
 
-    2) 나머지 feature 공통 처리
-        - LANE 을 포함한 feature_name 에 대해
-            coords 를 ego 기준 좌표계로 변환하고,
-            array_output["vector_set_map.coords.<feature_name>"] 와
-            availabilities, traffic_light_data 를 채운다.
-        - LANE 에서 계산된 coords/lane_xy_valid_mask/tl_data 를
-            이후 feature(LANE, ROUTE_LANES 등)에 그대로 재사용하는 부분도 유지한다.
     Args:
-        map_elements_to_list_array (Dict[str, List[np.ndarray]]):
-            · "coords.LANE" -> [ (P_0, 2), (P_1, 2), ... ] len = num_lanes
-            · "traffic_light_data.LANE" -> [ (P_0, 4), ... ] len = num_lanes
-        map_elements (List[str]): # ['LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES']
-            처리할 feature 이름 리스트.
-        ego_cur_pose_np (np.ndarray):
-            ego 현재 상태 [x, y, heading], shape = (3,).
-        speed_limit_dict (Dict[str, np.ndarray]):
-            차선 속도제한 정보 딕셔너리.
+        map_elements_to_list_array:
+            - `"coords.LANE"`, `"coords.LEFT_BOUNDARY"` 등 문자열 키로
+              각 feature 에 대한 좌표 리스트를 담은 dict.
+            - 예: "coords.LANE" → [ (P0, 2), (P1, 2), ... ] 길이 = num_lanes.
+        map_elements:
+            - 처리할 맵 feature 이름 리스트.
+            - 예: ["LANE", "LEFT_BOUNDARY", "RIGHT_BOUNDARY", "ROUTE_LANES"].
+        ego_cur_pose_np:
+            - 현재 ego 상태 [x, y, heading], shape = (3,).
+        speed_limit_dict:
+            - 차선 속도제한 정보 dict.
             - "lane_has_speed_limit": (num_lanes,)
-            - "lane_speed_limit": (num_lanes,)
-        lanes_roadblock_id_list (List[str]):
-            각 차선이 속한 도로 묶음 ID 리스트.
-        route_roadblock_ids (List[str]):
-            전체 route 를 구성하는 roadblock ID 시퀀스.
-        car_token_to_rr_ids (Dict[str, Optional[List[str]]]):
-            차량 토큰 → roadblock ID 시퀀스 . # 길이: chosen_car_num
-        map_max_elements (Dict[str, int]):
-            feature별 최대 요소 개수.
-        map_points_num (Dict[str, int]):
-            feature별 최대 포인트 개수.
+            - "lane_speed_limit": (num_lanes,).
+        lanes_roadblock_id_list:
+            - 각 차선이 속한 roadblock id 리스트, 길이 = num_lanes.
+        route_roadblock_ids:
+            - 전체 route 를 구성하는 roadblock id 시퀀스.
+        car_token_to_rr_ids:
+            - 차량 토큰 → 그 차량의 route roadblock id 시퀀스.
+        map_max_elements:
+            - feature 별 최대 요소 개수. 예: {"LANE": lane_num, ...}.
+        map_points_num:
+            - feature 별 고정 포인트 수. 예: {"LANE": lane_len, ...}.
 
     Returns:
-        Tuple[...]:
-            - array_output (Dict[str, np.ndarray]):
-                · "vector_set_map.coords.<feature_name>"
-                · "vector_set_map.availabilities.<feature_name>"
-                · "vector_set_map.traffic_light_data.<feature_name>"
-                를 포함하는 배열 딕셔너리.
-            - lane_on_route (List[bool]):
-                각 차선이 전체 route 위에 있는지 여부.
-            - lane_speed_limit_array (np.ndarray):
-                (max_lane_num, 1), 각 차선 속도제한 값.
-            - lane_has_speed_limit_array (np.ndarray):
-                (max_lane_num, 1), 각 차선 속도제한 존재 여부.
-            - car_token_to_lane_on_routes (Dict[str, List[bool]]):
-                차량 토큰별로, 각 차선이 그 차량 경로 위에 있는지 여부 리스트.
+        Tuple[
+            map_elements_to_array,
+            chosen_lanes_route_mask,
+            lane_speed_limit_array,
+            lane_has_speed_limit_array,
+            car_token_to_chosen_lanes_route_mask,
+        ]
+        - map_elements_to_array:
+            `"vector_set_map.coords.<feature_name>"`,
+            `"vector_set_map.availabilities.<feature_name>"`,
+            `"vector_set_map.traffic_light_data.<feature_name>"` 등을 포함하는 dict.
+        - chosen_lanes_route_mask:
+            각 차선이 전체 route 위에 있는지 여부 리스트 (길이 = chosen_lane_num).
+        - lane_speed_limit_array:
+            선택된 차선의 속도제한 값(m/s), shape = (chosen_lane_num, 1).
+        - lane_has_speed_limit_array:
+            선택된 차선이 실제 속도제한을 가지는지 여부, shape = (chosen_lane_num, 1).
+        - car_token_to_chosen_lanes_route_mask:
+            차량 토큰별로, 각 차선이 그 차량 경로 위에 있는지 여부 리스트.
     """
-    array_output: Dict[str, np.ndarray] = {}
-    lane_on_route: List[bool] = []
+    map_elements_to_array: Dict[str, np.ndarray] = {}
+    chosen_lanes_route_mask: List[bool] = []
 
-    # 이후 LANE 처리에서 값이 채워짐
-    lane_has_speed_limit_array: Optional[np.ndarray] = None  # (max_lane_num, 1)
-    lane_speed_limit_array: Optional[np.ndarray] = None  # (max_lane_num, 1)
-    car_token_to_lane_on_routes: Dict[str, List[bool]] = {}
+    lane_has_speed_limit_array: Optional[
+        np.ndarray] = None  # shape: (chosen_lane_num, 1)
+    lane_speed_limit_array: Optional[
+        np.ndarray] = None  # shape: (chosen_lane_num, 1)
+    car_token_to_chosen_lanes_route_mask: Dict[str, List[bool]] = {}
 
-    # 신호 one-hot 차원 (보통 4)
     traffic_light_encoding_dim: int = LaneSegmentTrafficLightData.encoding_dim()
 
-    # LANE 기준으로 chosen_center_xy / lane_xy_valid_mask / tl_data 를 한 번 만든 뒤,
-    # 이후 feature에서도 그대로 재사용(원래 구현과 동일한 흐름 유지).
     chosen_center_xy: Optional[
-        np.ndarray] = None  # (max_lane_num, map_points_num, 2)
+        np.ndarray] = None  # shape: (chosen_lane_num, lane_len, 2)
     lane_xy_valid_mask: Optional[
-        np.ndarray] = None  # (max_lane_num, map_points_num)
+        np.ndarray] = None  # shape: (chosen_lane_num, lane_len)
     tl_data: Optional[
-        np.ndarray] = None  # (max_lane_num, map_points_num, 4) 또는 None
+        np.ndarray] = None  # shape: (chosen_lane_num, lane_len, 4) 또는 None
 
-    for feature_name in map_elements:  # ['LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES']
+    for feature_name in map_elements:
         coords_key: str = f"coords.{feature_name}"
-        """
-        map_elements_to_list_array (Dict[str, List[np.ndarray]]):
-            · "coords.LANE" -> [ (P_0, 2), (P_1, 2), ... ] len = num_lanes
-            · "traffic_light_data.LANE" -> [ (P_0, 4), ... ] len = num_lanes
-        """
         if coords_key not in map_elements_to_list_array:
-            # 이 feature는 현재 샘플에서 존재하지 않음
             continue
 
-        feature_coords: List[np.ndarray] = map_elements_to_list_array[
-            coords_key]  # 각 원소: (num_points_i, 2)
+        # feature_coords: List[(num_points_i, 2)]
+        feature_coords: List[
+            np.ndarray] = map_elements_to_list_array[coords_key]
         tl_key: str = f"traffic_light_data.{feature_name}"
         feature_tl_data: Optional[List[np.ndarray]] = (
-            map_elements_to_list_array[tl_key] if tl_key
-            in map_elements_to_list_array else None)  # (num_points_i, 4)
+            map_elements_to_list_array[tl_key]
+            if tl_key in map_elements_to_list_array else None)
 
         if feature_name == "LANE":
             (
-                chosen_center_xy,  # (max_lane_num, map_points_num["LANE"], 2)
-                lane_xy_valid_mask,  # (max_lane_num, map_points_num["LANE"])
-                tl_data,  # (max_lane_num, map_points_num["LANE"], 4) 또는 None
-                left_coords_local,  # (max_lane_num, map_points_num["LANE"], 2)
-                right_coords_local,  # (max_lane_num, map_points_num["LANE"], 2)
-                lane_speed_limit_array,  # (max_lane_num, 1)
-                lane_has_speed_limit_array,  # (max_lane_num, 1)
-                chosen_lanes_rb_id_list,  # List[str]
+                chosen_center_xy,  # (chosen_lane_num, map_points_num["LANE"], 2)
+                lane_xy_valid_mask,  # (chosen_lane_num, map_points_num["LANE"])
+                tl_data,  # (chosen_lane_num, map_points_num["LANE"], 4) 또는 None
+                left_coords_local,  # (chosen_lane_num, map_points_num["LANE"], 2)
+                right_coords_local,  # (chosen_lane_num, map_points_num["LANE"], 2)
+                lane_speed_limit_array,  # (chosen_lane_num, 1)
+                lane_has_speed_limit_array,  # (chosen_lane_num, 1)
+                chosen_lanes_rb_id_list,  # List[str], len = chosen_lane_num
             ) = _build_lane_core_arrays(
                 ego_cur_pose_np=ego_cur_pose_np,
-                feature_coords=feature_coords,  # List[(num_points, 2)]
+                feature_coords=feature_coords,
                 feature_tl_data=feature_tl_data,
-                # List[(num_points, 4)] 또는 None
                 speed_limit_dict=speed_limit_dict,
                 lanes_roadblock_id_list=lanes_roadblock_id_list,
                 map_elements_to_list_array=map_elements_to_list_array,
@@ -1513,298 +1557,222 @@ def _prepare_array_output_and_lane_info(
                 traffic_light_encoding_dim=traffic_light_encoding_dim,
             )
 
-            # route 기준 / NPC 기준 포함 여부 마스크 계산
-            lane_on_route, car_token_to_lane_on_routes = _build_lane_route_and_npc_masks(
-                route_roadblock_ids=route_roadblock_ids,  # List[str]
-                chosen_lanes_rb_id_list=
-                chosen_lanes_rb_id_list,  # List[str] # len: chosen_lane_num
+            # route/NPC 기준 포함 여부 마스크
+            (
+                chosen_lanes_route_mask,
+                car_token_to_chosen_lanes_route_mask,
+            ) = _build_lane_route_and_npc_masks(
+                route_roadblock_ids=route_roadblock_ids,
+                chosen_lanes_rb_id_list=chosen_lanes_rb_id_list,
                 car_token_to_rr_ids=car_token_to_rr_ids,
             )
 
-            # LANE 경계선 좌표를 array_output에 저장
-            array_output[
+            map_elements_to_array[
                 "vector_set_map.coords.LEFT_BOUNDARY"] = left_coords_local
-            array_output[
+            map_elements_to_array[
                 "vector_set_map.coords.RIGHT_BOUNDARY"] = right_coords_local
 
-        elif feature_name == "LEFT_BOUNDARY" or feature_name == "RIGHT_BOUNDARY":
-            # LANE 처리에서 이미 LEFT/RIGHT_BOUNDARY 를 채웠으므로 여기서는 건너뜀
+        elif feature_name in ("LEFT_BOUNDARY", "RIGHT_BOUNDARY"):
+            # LANE 처리에서 이미 채웠으므로 여기서는 건너뜀
             continue
 
-        # 이하 부분은 원래 코드에서 LANE / ROUTE_LANES 등에 대해 공통으로 수행하던 처리.
-        # chosen_center_xy / lane_xy_valid_mask / tl_data 는 LANE 처리에서 만들어진 값을 그대로 재사용한다.
-        # (ROUTE_LANES에 대해서도 동일한 방식으로 쓰이지만, 실제 최종 출력에는
-        #  vector_set_map.coords.ROUTE_LANES 를 직접 사용하지 않으므로
-        #  기존 구현과 완전히 동일한 동작을 유지한다.)
-
-        # coords_local: (max_lane_num, map_points_num, 2)
+        # LANE / ROUTE_LANES 등에 대해 공통으로 수행되는 좌표/마스크/신호 채우기
         coords_local: np.ndarray = vector_set_coordinates_to_local_frame(
             coords=chosen_center_xy,  # type: ignore[arg-type]
             avails=lane_xy_valid_mask,  # type: ignore[arg-type]
             anchor_state=ego_cur_pose_np,
         )
 
-        array_output[f"vector_set_map.coords.{feature_name}"] = coords_local
-        array_output[
+        map_elements_to_array[
+            f"vector_set_map.coords.{feature_name}"] = coords_local
+        map_elements_to_array[
             f"vector_set_map.availabilities.{feature_name}"] = lane_xy_valid_mask  # type: ignore[arg-type]
 
         if tl_data is not None:
-            array_output[
+            map_elements_to_array[
                 f"vector_set_map.traffic_light_data.{feature_name}"] = tl_data
 
-    # LANE 이 반드시 포함된다는 가정은 기존 코드와 동일하게 유지
+    # LANE 이 반드시 포함된다는 기존 가정 유지
     assert lane_has_speed_limit_array is not None
     assert lane_speed_limit_array is not None
 
     return (
-        array_output,
-        lane_on_route,
+        map_elements_to_array,
+        chosen_lanes_route_mask,
         lane_speed_limit_array,
         lane_has_speed_limit_array,
-        car_token_to_lane_on_routes,
+        car_token_to_chosen_lanes_route_mask,
     )
 
 
-def _build_vector_map_output_from_arrays(
-    array_output: Dict[str, np.ndarray],
-    map_elements: List[str],
-    neighbor_track_token: List[Optional[str]],
-    neighbor_agents_current: np.ndarray,
-    map_max_elements: Dict[str, int],
-    lane_on_route: List[bool],
-    lane_speed_limit_array: np.ndarray,
-    lane_has_speed_limit_array: np.ndarray,
-    car_token_to_lane_on_routes: Dict[str, List[bool]],
-) -> Dict[str, np.ndarray]:
-    """array_output과 보조 정보들을 사용해 최종 vector_map_output 을 만든다.
+def _build_lane_vector_and_agent_route_order(
+    map_elements_to_array: Dict[str, np.ndarray],
+    neighbor_track_token: List[str],  # 길이: chosen_agent_num
+    neighbor_agents_current: np.ndarray,  # shape: (chosen_agent_num, 11)
+    car_token_to_chosen_lanes_route_mask: Dict[str, List[bool]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """LANE 차선 벡터(feature 12차원)와 에이전트별 차선 순서 행렬을 만든다.
 
-    이 함수는 앞 단계에서 준비된 `array_output`과
-    차선 관련 보조 정보(lane_on_route, lane_speed_limit_array 등)를 이용해
-    실제 모델 입력으로 쓸 수 있는 최종 맵 특징들을 만든다.
-
-    크게 두 부분으로 나뉜다.
-
-    1) 차선 벡터 특징 만들기 (LANE)
-        - 입력:
-            · polylines:
-                array_output["vector_set_map.coords.LANE"]
-                shape: (lane_num, lane_len, 2)
-            · left_boundary:
-                array_output["vector_set_map.coords.LEFT_BOUNDARY"]
-                shape: (lane_num, lane_len, 2)
-            · right_boundary:
-                array_output["vector_set_map.coords.RIGHT_BOUNDARY"]
-                shape: (lane_num, lane_len, 2)
-            · traffic_light_state:
-                array_output["vector_set_map.traffic_light_data.LANE"]
-                shape: (lane_num, lane_len, 4)
-            · lane_xy_valid_mask:
-                array_output["vector_set_map.availabilities.LANE"]
-                shape: (lane_num, lane_len)
-
-        - `_lane_polyline_process` 호출로
-          각 차선을 구성하는 점에 대해 다음을 모두 합친 벡터를 만든다.
-            · 현재 점 위치 (x, y)
-            · 이전 점과의 차이 (간단한 방향 정보)
-            · 왼쪽 경계선과의 상대 위치
-            · 오른쪽 경계선과의 상대 위치
-            · 해당 점의 신호등 상태(0/1 값 4개)
-
-        - 결과:
-            vector_map_lanes: (lane_num, lane_len, 12)
-
-        - `_select_token_and_ordered_npc_route_indices` 호출로
-          각 에이전트(차량)의 경로와 차선의 연결 관계를 숫자로 표현한다.
-            · agent_route_lane_order: (agent_num, lane_num)
-              - 값이 -1 이면: 해당 에이전트의 경로에 없는 차선
-              - 0, 1, 2, ... 이면: 경로 위에서 몇 번째에 위치하는 차선인지
-
-    2) route_lanes 만들기 (ROUTE_LANES)
-        - lane_on_route 리스트를 사용해
-          실제 전체 route 위에 있는 차선들만 뽑아낸다.
-        - 최대 개수는 map_max_elements["ROUTE_LANES"] 로 제한한다.
-
-        - 입력:
-            · vector_map_lanes: (lane_num, lane_len, 12)
-            · lane_speed_limit_array: (lane_num, 1)
-            · lane_has_speed_limit_array: (lane_num, 1)
-            · lane_on_route: 길이 lane_num 의 True/False 리스트
-
-        - 출력:
-            · vector_map_route_lanes:
-                shape: (max_route_num, lane_len, 12)
-            · route_lanes_speed_limit:
-                shape: (max_route_num, 1)
-            · route_lanes_has_speed_limit:
-                shape: (max_route_num, 1)
-
-    최종 반환 딕셔너리 구조
-    ----------------------
-    - "lanes": vector_map_lanes
-        · shape: (lane_num, lane_len, 12)
-    - "lanes_speed_limit": lane_speed_limit_array
-        · shape: (lane_num, 1)
-    - "lanes_has_speed_limit": lane_has_speed_limit_array
-        · shape: (lane_num, 1)
-    - "route_lanes": vector_map_route_lanes
-        · shape: (route_num, lane_len, 12)
-    - "route_lanes_speed_limit": route_lanes_speed_limit
-        · shape: (route_num, 1)
-    - "route_lanes_has_speed_limit": route_lanes_has_speed_limit
-        · shape: (route_num, 1)
-    - "agent_route_lane_order": agent_route_lane_order
-        · shape: (agent_num, lane_num), dtype: np.int64
+    하는 일
+    -------
+    1) `map_elements_to_array` 에서 LANE 관련 배열들을 꺼낸다.
+       - 중심선 좌표, 좌/우 경계선, 신호 one-hot, 유효 마스크.
+    2) `_lane_polyline_process` 를 호출해
+       각 포인트마다 (위치, 이전점과의 차이, 좌/우 경계까지의 상대 위치, 신호 상태)를
+       이어붙인 길이 12 벡터를 만든다.
+       → 결과: `vector_map_lanes` shape = (lane_num, lane_len, 12)
+    3) `_select_token_and_ordered_npc_route_indices` 를 사용해
+       - 각 에이전트별로, “경로 위에 있는 차선들”을
+         ego 기준 거리 순으로 정렬하고 랭크를 부여한다.
+       → 결과: `agent_route_lane_order` shape = (agent_num, lane_num)
 
     Args:
-        array_output (Dict[str, np.ndarray]):
-            `_prepare_array_output_and_lane_info` 에서 만들어진
-            좌표/마스크/신호 배열 딕셔너리.
-        map_elements (List[str]):
-            처리할 feature 이름 리스트.
-        neighbor_track_token (List[Optional[str]]):
-            길이 = agent_num.
-            각 위치에 해당 에이전트의 토큰 문자열 또는 None.
-        neighbor_agents_current (np.ndarray):
-            현재 시점의 이웃 에이전트 상태 배열.
-            shape = (agent_num, 11)
-            - 마지막 차원 11은 위치/속도/크기/타입 등을 담고 있음.
-        map_max_elements (Dict[str, int]):
-            각 feature 별로 최대 요소 개수 설정.
-        lane_on_route (List[bool]):
-            길이 lane_num. True 이면 해당 차선이 전체 route 위에 있는 차선.
-        lane_speed_limit_array (np.ndarray):
-            shape: (lane_num, 1), dtype: np.float32.
-        lane_has_speed_limit_array (np.ndarray):
-            shape: (lane_num, 1), dtype: np.bool_.
-        car_token_to_lane_on_routes (Dict[str, List[bool]]):
-            - 키: 차량 토큰
-            - 값: 길이 lane_num 의 True/False 리스트.
+        map_elements_to_array:
+            - `"vector_set_map.coords.LANE"`: (lane_num, lane_len, 2)
+            - `"vector_set_map.coords.LEFT_BOUNDARY"`: (lane_num, lane_len, 2)
+            - `"vector_set_map.coords.RIGHT_BOUNDARY"`: (lane_num, lane_len, 2)
+            - `"vector_set_map.traffic_light_data.LANE"`: (lane_num, lane_len, 4)
+            - `"vector_set_map.availabilities.LANE"`: (lane_num, lane_len)
+        neighbor_track_token:
+            - 에이전트 슬롯별 track_token, 길이 = agent_num.
+        neighbor_agents_current:
+            - 현재 프레임 이웃 에이전트 상태.
+            - shape = (agent_num, 11).
+        car_token_to_chosen_lanes_route_mask:
+            - 차량 토큰별로, 각 차선이 해당 차량 경로 위에 있는지 여부 리스트.
 
     Returns:
-        Dict[str, np.ndarray]:
-            최종 vector 맵 정보를 담은 딕셔너리.
-            위 “최종 반환 딕셔너리 구조” 참조.
+        Tuple[np.ndarray, np.ndarray]:
+            - vector_map_lanes:
+                차선 벡터 표현. shape = (lane_num, lane_len, 12).
+            - agent_route_lane_order:
+                에이전트별 차선 순서 랭크 행렬. shape = (agent_num, lane_num), dtype=int64.
     """
-    vector_map_lanes: np.ndarray
-    vector_map_route_lanes: np.ndarray
-    route_lanes_speed_limit: np.ndarray
-    route_lanes_has_speed_limit: np.ndarray
-    agent_route_lane_order: np.ndarray
+    # polylines: (lane_num, lane_len, 2)
+    polylines: np.ndarray = map_elements_to_array["vector_set_map.coords.LANE"]
+    # left/right_boundary: (lane_num, lane_len, 2)
+    left_boundary: np.ndarray = map_elements_to_array[
+        "vector_set_map.coords.LEFT_BOUNDARY"]
+    right_boundary: np.ndarray = map_elements_to_array[
+        "vector_set_map.coords.RIGHT_BOUNDARY"]
+    # traffic_light_state: (lane_num, lane_len, 4)
+    traffic_light_state: np.ndarray = map_elements_to_array[
+        "vector_set_map.traffic_light_data.LANE"]
+    # lane_xy_valid_mask: (lane_num, lane_len)
+    lane_xy_valid_mask: np.ndarray = map_elements_to_array[
+        "vector_set_map.availabilities.LANE"]
 
-    for feature_name in map_elements:
-        if feature_name == "LANE":
-            polylines = array_output[
-                "vector_set_map.coords.LANE"]  # (lane_num, lane_len, 2)
-            left_boundary = array_output[
-                "vector_set_map.coords.LEFT_BOUNDARY"]  # (lane_num, lane_len, 2)
-            right_boundary = array_output[
-                "vector_set_map.coords.RIGHT_BOUNDARY"]  # (lane_num, lane_len, 2)
-            traffic_light_state = array_output[
-                "vector_set_map.traffic_light_data.LANE"]  # (lane_num, lane_len, 4)
-            lane_xy_valid_mask = array_output[
-                "vector_set_map.availabilities.LANE"]  # (lane_num, lane_len)
+    # (1) 차선 벡터 특징(12차원) 만들기
+    vector_map_lanes: np.ndarray = _lane_polyline_process(
+        polylines=polylines,
+        left_boundary=left_boundary,
+        right_boundary=right_boundary,
+        avails=lane_xy_valid_mask,
+        traffic_light=traffic_light_state,
+    )  # shape: (lane_num, lane_len, 12)
 
-            # 차선 벡터 특징(길이 12)를 만든다.
-            vector_map_lanes = _lane_polyline_process(
-                polylines,
-                left_boundary,
-                right_boundary,
-                lane_xy_valid_mask,
-                traffic_light_state,
-            )  # (lane_num, lane_len, 12)
+    # (2) 에이전트별 route 차선 순서 행렬 만들기
+    agent_route_lane_order: np.ndarray = _select_token_and_ordered_npc_route_indices(
+        car_token_to_chosen_lanes_route_mask,
+        neighbor_track_token,
+        neighbor_agents_current,
+        vector_map_lanes,
+    )  # shape: (agent_num, lane_num)
 
-            # agent_route_lane_order: (agent_num, lane_num)
-            agent_route_lane_order = _select_token_and_ordered_npc_route_indices(
-                car_token_to_lane_on_routes,
-                neighbor_track_token,
-                neighbor_agents_current,
-                vector_map_lanes,
-                map_max_elements["ROUTE_LANES"],
-            )
-            if isinstance(agent_route_lane_order, np.ndarray):
-                if agent_route_lane_order.dtype != np.int64:
-                    agent_route_lane_order = agent_route_lane_order.astype(
-                        np.int64)
-            else:
-                agent_route_lane_order = np.asarray(agent_route_lane_order,
-                                                    dtype=np.int64)
+    # 타입 통일: int64
+    if agent_route_lane_order.dtype != np.int64:
+        agent_route_lane_order = agent_route_lane_order.astype(np.int64)
 
-        elif feature_name == "ROUTE_LANES":
-            loc = 0
-            # route 위의 차선만 따로 모은다.
-            vector_map_route_lanes = np.zeros(
-                (
-                    map_max_elements["ROUTE_LANES"],
-                    vector_map_lanes.shape[-2],
-                    vector_map_lanes.shape[-1],
-                ),
-                dtype=np.float32,
-            )
-            route_lanes_speed_limit = np.zeros(
-                (map_max_elements["ROUTE_LANES"], 1),
-                dtype=np.float32,
-            )
-            route_lanes_has_speed_limit = np.zeros(
-                (map_max_elements["ROUTE_LANES"], 1),
-                dtype=np.bool_,
-            )
-
-            for i in range(len(lane_on_route)):
-                if lane_on_route[i] is True:
-                    vector_map_route_lanes[loc] = vector_map_lanes[i]
-                    route_lanes_speed_limit[loc] = lane_speed_limit_array[i]
-                    route_lanes_has_speed_limit[
-                        loc] = lane_has_speed_limit_array[i]
-                    loc += 1
-                if loc == map_max_elements["ROUTE_LANES"]:
-                    break
-        else:
-            # 그 외 feature들은 여기서는 추가 후처리 없음
-            pass
-
-    vector_map_output: Dict[str, np.ndarray] = {
-        "lanes": vector_map_lanes,  # (lane_num, lane_len, 12)
-        "lanes_speed_limit": lane_speed_limit_array,  # (lane_num, 1)
-        "lanes_has_speed_limit": lane_has_speed_limit_array,  # (lane_num, 1)
-        "route_lanes": vector_map_route_lanes,  # (route_num, lane_len, 12)
-        "route_lanes_speed_limit": route_lanes_speed_limit,  # (route_num, 1)
-        "route_lanes_has_speed_limit":
-            route_lanes_has_speed_limit,  # (route_num, 1)
-        "agent_route_lane_order":
-            agent_route_lane_order,  # (agent_num, lane_num)
-    }
-    return vector_map_output
-"""
-Module: Map Data Preprocessing Functions
-Description: This module contains functions for Map related data processing.
-
-Categories:
-    1. Get lanes, speed limit, traffic light and lane's roadblock ids
-    2. Get maps array for model input
-"""
+    return vector_map_lanes, agent_route_lane_order
 
 
-"""
-        route_roadblock_ids: List[str],
-        car_token_to_rr_ids: Dict[str, List[str]],  # 길이: chosen_car_num
-        neighbor_track_token: List[str],  # 길이: chosen_agent_num
-        neighbor_agents_current,  # # (chosen_agent_num, 11)
-        ego_cur_pose_np: np.ndarray, # (3)
-        elements_to_obj_polylines: Dict[str, MapObjectPolylines],
-        elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData],
-        speed_limit_dict:Dict[str, np.ndarray],
-        lanes_roadblock_id_list: List[str],
-"""
+def _build_route_lane_vectors(
+        vector_map_lanes: np.ndarray,  # shape: (lane_num, lane_len, 12)
+        chosen_lanes_route_mask: List[bool],  # 길이 = lane_num
+        lane_speed_limit_array: np.ndarray,  # shape: (lane_num, 1)
+        lane_has_speed_limit_array: np.ndarray,  # shape: (lane_num, 1)
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """전체 차선 벡터에서 “route 위에 있는 차선들”만 골라 route_lanes 배열을 만든다.
 
+    이 함수는 이미 만들어진 차선 벡터들(`vector_map_lanes`)과
+    “이 차선이 route 위에 있는지”를 나타내는 불리언 리스트를 받아서,
 
+    - route 위에 있는 차선들만 순서대로 골라
+      `route_lanes` 배열을 만들고
+    - 그 차선들의 속도제한 값/존재 여부 배열도 함께 만든다.
+
+    Args:
+        vector_map_lanes:
+            모든 차선의 벡터 표현.
+            shape = (lane_num, lane_len, 12).
+        chosen_lanes_route_mask:
+            각 차선이 route 위에 있는지 여부.
+            길이 = lane_num.
+        lane_speed_limit_array:
+            모든 차선의 속도제한 값(m/s).
+            shape = (lane_num, 1).
+        lane_has_speed_limit_array:
+            모든 차선의 속도제한 존재 여부.
+            shape = (lane_num, 1).
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - vector_map_route_lanes:
+                route 위에 있는 차선들만 모은 배열.
+                shape = (route_lane_num, lane_len, 12).
+            - route_lanes_speed_limit:
+                route 위에 있는 차선들의 속도제한 값.
+                shape = (route_lane_num, 1).
+            - route_lanes_has_speed_limit:
+                route 위에 있는 차선들의 속도제한 존재 여부.
+                shape = (route_lane_num, 1).
+    """
+    if vector_map_lanes.size == 0:
+        # 차선 자체가 없는 경우: 모두 0 크기 배열 반환
+        vector_map_route_lanes = np.zeros((0, 0, 12), dtype=np.float32)
+        route_lanes_speed_limit = np.zeros((0, 1), dtype=np.float32)
+        route_lanes_has_speed_limit = np.zeros((0, 1), dtype=np.bool_)
+        return vector_map_route_lanes, route_lanes_speed_limit, route_lanes_has_speed_limit
+
+    lane_num: int = int(vector_map_lanes.shape[0])
+    lane_len: int = int(vector_map_lanes.shape[1])
+    lane_feat_dim: int = int(vector_map_lanes.shape[2])
+
+    if len(chosen_lanes_route_mask) != lane_num:
+        raise ValueError(
+            f"chosen_lanes_route_mask 길이({len(chosen_lanes_route_mask)})와 "
+            f"lane_num({lane_num})이 다릅니다.")
+
+    # route 위에 있는 lane 인덱스만 골라냄
+    route_lane_indices: List[int] = [
+        idx for idx, is_on_route in enumerate(chosen_lanes_route_mask)
+        if is_on_route
+    ]
+    route_lane_num: int = len(route_lane_indices)
+
+    # route 전용 배열 생성
+    vector_map_route_lanes: np.ndarray = np.zeros(
+        (route_lane_num, lane_len, lane_feat_dim), dtype=np.float32)
+    route_lanes_speed_limit: np.ndarray = np.zeros((route_lane_num, 1),
+                                                   dtype=np.float32)
+    route_lanes_has_speed_limit: np.ndarray = np.zeros((route_lane_num, 1),
+                                                       dtype=np.bool_)
+
+    # 실제 route 상에 있는 lane 들만 복사
+    for loc, lane_idx in enumerate(route_lane_indices):
+        vector_map_route_lanes[loc] = vector_map_lanes[lane_idx]
+        route_lanes_speed_limit[loc] = lane_speed_limit_array[lane_idx]
+        route_lanes_has_speed_limit[loc] = lane_has_speed_limit_array[lane_idx]
+
+    return vector_map_route_lanes, route_lanes_speed_limit, route_lanes_has_speed_limit
 
 
 def map_process(
     route_roadblock_ids: List[str],
     car_token_to_rr_ids: Dict[str, List[str]],  # 길이: chosen_car_num
     neighbor_track_token: List[str],  # 길이: chosen_agent_num
-    neighbor_agents_current: np.ndarray,  # (agent_num, 11)
-    ego_cur_pose_np: np.ndarray,  # (3,)
+    neighbor_agents_current: np.ndarray,  # shape: (agent_num, 11)
+    ego_cur_pose_np: np.ndarray,  # shape: (3,)
     elements_to_obj_polylines: Dict[str, MapObjectPolylines],
     elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData],
     speed_limit_dict: Dict[str, np.ndarray],
@@ -1813,92 +1781,85 @@ def map_process(
     map_max_elements: Dict[str, int],
     map_points_num: Dict[str, int],
 ) -> Dict[str, np.ndarray]:
-    """ego 주변 벡터 맵 원시 데이터(route/차선/신호/속도제한)를 모델 입력용 넘파이 배열로 가공한다.
+    """지도 관련 원시 정보(route/차선/신호/속도제한)를 모델 입력용 넘파이 배열로 가공한다.
 
-    이 함수는 여러 단계의 처리를 한 곳에서 묶어주는 “상위 조립 함수”이다.
-    입력은 nuplan 스타일의 폴리라인/신호/속도제한 정보들이고,
-    출력은 학습/추론 모델에서 바로 사용할 수 있는 고정 크기 배열들이다.
+    크게 세 단계로 나뉜다.
 
-    주요 인자 모양
-    --------------
-    - route_roadblock_ids: List[str]
-        · ego 의 전체 경로를 이루는 도로 묶음 ID 시퀀스.
-    - car_token_to_rr_ids: Dict[str, [List[str]]] # 길이 chosen_car_num
-        · 키: 차량 토큰 문자열
-        · 값: 해당 차량 경로의 도로 묶음 ID 리스트.
-    - neighbor_track_token: List[[str]]
-        · 길이: chosen_agent_num
-        · 각 위치에 현재 고려 중인 에이전트의 토큰.
-    - neighbor_agents_current: np.ndarray
-        · shape: (agent_num, 11)
-        · 각 행은 한 에이전트의 현재 상태 벡터.
-    - ego_cur_pose_np: np.ndarray
-        · shape: (3,)
-        · [ego_x, ego_y, ego_heading]
-    - elements_to_obj_polylines:
-        · feature 이름 → MapObjectPolylines
-    - elements_to_traffic_light:
-        · feature 이름 → LaneSegmentTrafficLightData
-    - speed_limit_dict:
-        · "lane_has_speed_limit": (num_lanes,)
-        · "lane_speed_limit": (num_lanes,)
-    - lanes_roadblock_id_list:
-        · 길이 = num_lanes. 각 차선이 속한 도로 묶음 ID.
-    - map_elements:
-        · 처리할 feature 이름 리스트.
-    - map_max_elements:
-        · feature 이름 → 최대 요소 개수.
-    - map_points_num:
-        · feature 이름 → 한 요소당 최대 점 개수.
+    1) 폴리라인/신호 raw 데이터 → 리스트(dict)
+       - `_build_list_array_data_from_polylines`:
+         MapObjectPolylines / LaneSegmentTrafficLightData 를
+         순수 넘파이 배열 리스트 구조로 바꾼다.
+         예) "coords.LANE" → [ (P0, 2), (P1, 2), ... ].
+
+    2) 리스트 → 고정 크기 배열 + 보조 정보
+       - `_prepare_array_output_and_lane_info`:
+         · LANE 에 대해서는 ego 기준으로 가까운 차선만 고르고
+           포인트 수를 맞춘 뒤, 좌표/마스크/신호/속도제한/roadblock id 를
+           모두 배열로 만든다.
+         · 각 차선이 route 위에 있는지 여부,
+           각 차량 경로와의 포함 여부도 함께 계산한다.
+         · 그 외 feature 들도 ego 기준 좌표계로 변환해
+           `"vector_set_map.*.<feature_name>"` 표준 키 아래에 넣는다.
+
+    3) 차선/route 벡터와 에이전트별 route 순서 행렬 생성
+       - `_build_lane_vector_and_agent_route_order`:
+         차선 폴리라인 + 경계선 + 신호를 묶어 (lane_num, lane_len, 12) 벡터로 만들고,
+         에이전트별 lane 순서 랭크 행렬 (agent_num, lane_num)을 만든다.
+       - `_build_route_lane_vectors`:
+         route 위에 있는 차선만 골라 별도의 route_lanes 배열과
+         그에 대응하는 속도제한 정보를 만든다.
+
+    Args:
+        route_roadblock_ids:
+            - 전체 route 를 이루는 roadblock id 시퀀스.
+        car_token_to_rr_ids:
+            - 차량 토큰 → 해당 차량의 roadblock id 시퀀스.
+        neighbor_track_token:
+            - 이웃 에이전트 slot 순서에 맞는 track_token 리스트.
+        neighbor_agents_current:
+            - 현재 프레임 이웃 에이전트 상태. shape = (agent_num, 11).
+        ego_cur_pose_np:
+            - ego 현재 상태 [x, y, heading]. shape = (3,).
+        elements_to_obj_polylines:
+            - feature 이름 → MapObjectPolylines.
+        elements_to_traffic_light:
+            - feature 이름 → LaneSegmentTrafficLightData.
+        speed_limit_dict:
+            - "lane_has_speed_limit": (num_lanes,)
+            - "lane_speed_limit": (num_lanes,).
+        lanes_roadblock_id_list:
+            - 각 차선이 속한 roadblock id 리스트. 길이 = num_lanes.
+        map_elements:
+            - 사용할 feature 이름 리스트.
+        map_max_elements:
+            - feature 별 최대 요소 개수.
+        map_points_num:
+            - feature 별 고정 포인트 수.
 
     Returns:
         Dict[str, np.ndarray]:
-            최종 벡터 맵 정보 딕셔너리.
             - "lanes": (lane_num, lane_len, 12)
             - "lanes_speed_limit": (lane_num, 1)
             - "lanes_has_speed_limit": (lane_num, 1)
-            - "route_lanes": (route_num, lane_len, 12)
-            - "route_lanes_speed_limit": (route_num, 1)
-            - "route_lanes_has_speed_limit": (route_num, 1)
-            - "agent_route_lane_order": (agent_num, lane_num), np.int64
+            - "route_lanes": (route_lane_num, lane_len, 12)
+            - "route_lanes_speed_limit": (route_lane_num, 1)
+            - "route_lanes_has_speed_limit": (route_lane_num, 1)
+            - "agent_route_lane_order": (agent_num, lane_num), dtype=int64.
     """
-    """ _build_list_array_data_from_polylines
-    1) 폴리라인/신호 데이터 → 순수 넘파이 리스트로 풀기
-        - `elements_to_obj_polylines`, `elements_to_traffic_light` 에서
-          MapObjectPolylines / LaneSegmentTrafficLightData 를 꺼내서
-          순수 넘파이 배열 리스트로 바꾼다.
-        - 결과:
-            map_elements_to_list_array:
-                · "coords.LANE" -> [ (P_0, 2), (P_1, 2), ... ] len = num_lanes
-                · "traffic_light_data.LANE" -> [ (P_0, 4), ... ] len = num_lanes
-    """
-    map_elements_to_list_array: Dict[str, List[np.ndarray]] = (
-        _build_list_array_data_from_polylines(
+    # 1) MapObjectPolylines / LaneSegmentTrafficLightData → 순수 넘파이 리스트로 변환
+    map_elements_to_list_array: Dict[
+        str, List[np.ndarray]] = _build_list_array_data_from_polylines(
             elements_to_obj_polylines=elements_to_obj_polylines,
             elements_to_traffic_light=elements_to_traffic_light,
-        ))
-    """ map_elements_to_list_array
-    2) 좌표계 변환 + 크기 정리 + 차선 관련 보조 정보 계산
-            각 feature 별 좌표를 ego 기준 좌표계로 바꾸고,
-            최대 개수/최대 길이에 맞춰 잘라내거나 채워 넣는다.
-        - 특히 LANE에 대해:
-            · `_convert_lane_to_fixed_size` 로
-                (max_lane_num, map_points_num, 2) 형태의 고정 크기 배열로 만든다.
-            · 차선별 속도 제한 값/유무 배열을 만든다.
-            · 전체 route 와의 겹침을 보고 lane_on_route(True/False 리스트)를 만든다.
-            · 각 차량의 경로와 lane 목록을 비교해
-              car_token_to_lane_on_routes 를 만든다.
-        - 이 작업은 `_prepare_array_output_and_lane_info` 가 담당한다.
-        - 결과:
-            array_output, lane_on_route, lane_speed_limit_array,
-            lane_has_speed_limit_array, car_token_to_lane_on_routes
-    """
+        )
+
+    # 2) 리스트 → 고정 크기 배열 dict + 보조 정보 계산
     (
-        array_output,
-        lane_on_route,
+        map_elements_to_array,
+        chosen_lanes_route_mask,
         lane_speed_limit_array,
         lane_has_speed_limit_array,
-        car_token_to_lane_on_routes,
+        car_token_to_chosen_lanes_route_mask,
     ) = _prepare_array_output_and_lane_info(
         map_elements_to_list_array=map_elements_to_list_array,
         map_elements=map_elements,
@@ -1910,29 +1871,38 @@ def map_process(
         map_max_elements=map_max_elements,
         map_points_num=map_points_num,
     )
-    """
-    3) 최종 vector 맵 출력 구성
-        - `array_output` 과 2단계에서 계산한 보조 정보들을 이용해
-          최종 vector 맵 딕셔너리를 만든다.
-        - 주요 결과:
-            · lanes: (lane_num, lane_len, 12)
-            · route_lanes: (route_num, lane_len, 12)
-            · lanes_speed_limit, lanes_has_speed_limit
-            · route_lanes_speed_limit, route_lanes_has_speed_limit
-            · agent_route_lane_order: (agent_num, lane_num)
-        - 이 작업은 `_build_vector_map_output_from_arrays` 가 담당한다.
-    """
-    vector_map_output: Dict[str, np.ndarray] = (
-        _build_vector_map_output_from_arrays(
-            array_output=array_output,
-            map_elements=map_elements,
-            neighbor_track_token=neighbor_track_token,
-            neighbor_agents_current=neighbor_agents_current,
-            map_max_elements=map_max_elements,
-            lane_on_route=lane_on_route,
-            lane_speed_limit_array=lane_speed_limit_array,
-            lane_has_speed_limit_array=lane_has_speed_limit_array,
-            car_token_to_lane_on_routes=car_token_to_lane_on_routes,
-        ))
 
+    # 3-1) 차선 벡터 + 에이전트별 route lane 순서 행렬
+    vector_map_lanes, agent_route_lane_order = _build_lane_vector_and_agent_route_order(
+        map_elements_to_array=map_elements_to_array,
+        neighbor_track_token=neighbor_track_token,
+        neighbor_agents_current=neighbor_agents_current,
+        car_token_to_chosen_lanes_route_mask=
+        car_token_to_chosen_lanes_route_mask,
+    )
+
+    # 3-2) route 위에 있는 lane 들만 뽑아 route_lanes 벡터 구성
+    (
+        vector_map_route_lanes,
+        route_lanes_speed_limit,
+        route_lanes_has_speed_limit,
+    ) = _build_route_lane_vectors(
+        vector_map_lanes=vector_map_lanes,
+        chosen_lanes_route_mask=chosen_lanes_route_mask,
+        lane_speed_limit_array=lane_speed_limit_array,
+        lane_has_speed_limit_array=lane_has_speed_limit_array,
+    )
+
+    vector_map_output: Dict[str, np.ndarray] = {
+        "lanes": vector_map_lanes,  # (lane_num, lane_len, 12)
+        "lanes_speed_limit": lane_speed_limit_array,  # (lane_num, 1)
+        "lanes_has_speed_limit": lane_has_speed_limit_array,  # (lane_num, 1)
+        "route_lanes": vector_map_route_lanes,  # (route_lane_num, lane_len, 12)
+        "route_lanes_speed_limit":
+            route_lanes_speed_limit,  # (route_lane_num, 1)
+        "route_lanes_has_speed_limit":
+            route_lanes_has_speed_limit,  # (route_lane_num, 1)
+        "agent_route_lane_order":
+            agent_route_lane_order,  # (agent_num, lane_num)
+    }
     return vector_map_output

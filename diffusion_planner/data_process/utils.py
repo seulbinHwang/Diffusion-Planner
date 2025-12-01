@@ -635,224 +635,273 @@ def get_circular_proximal_map_objects(
 
 
 def build_agent_route_lane_order(
-    npc_route_indices: List[
-        List[int]],  #  # 길이: agent_num, 원소: List[int] (길이 가변적)
-    lane_num: Optional[int] = None,
+    npc_route_on_chosen_lane_idx_list: List[
+        List[int]],  # 길이: chosen_agent_num, 각 원소 길이 가변
+    chosen_lane_num: int,
     dtype: np.dtype = np.int32,
-) -> np.ndarray:  # (agent_num, lane_num)
-    """NPC별로 선택된 route 차선 인덱스(npc_route_indices)를 기준으로,
-    각 에이전트에 대해 '가까운 차선 순서'를 정수 랭크로 기록한 행렬을 생성합니다.
+) -> np.ndarray:  # shape: (chosen_agent_num, chosen_lane_num)
+    """에이전트별로 '경로 위에서 가까운 순으로 선택된 차선 인덱스'를
+    2차원 행렬 형태로 정리한다.
 
-    규칙:
-        - 한 에이전트의 npc_route_indices[i] 가 [5, 2, 7] 이라면,
-          해당 에이전트 행에서 lane 5→0, lane 2→1, lane 7→2 로 표기합니다.
-        - 그 에이전트의 route가 아닌 차선은 -1로 표기합니다.
-        - npc_route_indices[i] 안에 중복 인덱스가 있으면 최초 등장에만 랭크를 부여합니다.
+    이 함수는 이미 **거리 기준으로 정렬**된 차선 인덱스 리스트를 받아,
+    각 에이전트에 대해 다음 규칙으로 랭크를 부여한다.
+
+    규칙(에이전트 i 기준)
+    --------------------
+    - `npc_route_on_chosen_lane_idx_list[i]` 에는
+      이 에이전트가 사용하는 차선 인덱스가
+      [가까운 차선, 그 다음, ...] 순서로 들어있다.
+        예: [5, 2, 7]  이면
+            · lane 5 → rank 0
+            · lane 2 → rank 1
+            · lane 7 → rank 2
+    - 같은 lane 인덱스가 여러 번 등장하면,
+      **가장 처음 등장한 위치만** 랭크를 부여한다.
+      · 예: [2, 5, 2, 7]  → lane 2 는 한 번만 취급
+    - 이 에이전트가 사용하지 않는 차선(lane)은 -1 로 남겨둔다.
+
+    구현 아이디어
+    -------------
+    1) 최종 결과 배열을 -1 로 초기화한다.
+       - `agent_route_lane_order`: shape = (chosen_agent_num, chosen_lane_num)
+
+    2) 각 에이전트에 대해:
+       - Python 리스트를 넘파이 배열로 바꾼다. shape = (L,)
+       - 음수 인덱스 / 범위 밖 인덱스가 있으면 즉시 에러를 낸다.
+       - `np.unique(..., return_index=True)` 를 이용해
+         **처음 등장 위치 기준**으로 중복을 제거한다.
+         (unique 값 자체는 정렬되지만, 첫 등장 위치 인덱스를 다시 정렬해
+          원래 순서를 복원한다.)
+       - 유일한 lane 인덱스 배열에 대해
+         [0, 1, 2, ...] 랭크를 만들어 한 번에 대입한다.
 
     Args:
-        npc_route_indices (List[List[int]]):
-            - 길이: agent_num
-            - 각 원소는 해당 에이전트가 선택한 '가까운 순' 차선 인덱스 리스트
-              (예: [lane_idx_0, lane_idx_1, ...]).
-        lane_num (Optional[int], optional):
-            - 전체 차선 개수. 지정하지 않으면 npc_route_indices 전체에서
-              등장한 최대 인덱스의 +1로 유추합니다.
-              (모든 리스트가 비어 있으면 0으로 처리)
-        dtype (np.dtype, optional):
-            - 반환 행렬의 dtype. 기본값 np.int32.
+        npc_route_on_chosen_lane_idx_list:
+            - 길이: chosen_agent_num
+            - 각 원소: 한 에이전트가 경로로 사용하는 차선 인덱스 리스트
+              (이미 "가까운 순서"로 정렬되어 있다고 가정).
+        chosen_lane_num:
+            - 전체 고려하는 차선 개수.
+            - 모든 인덱스는 0 이상, chosen_lane_num 미만이어야 한다.
+        dtype:
+            - 반환 배열의 dtype (기본값: np.int32).
 
     Returns:
         np.ndarray:
-            - `agent_route_lane_order`, shape = (agent_num, lane_num), dtype = `dtype`
-            - 각 [i, j] 원소는:
-                · j번 차선이 에이전트 i의 npc_route에서 가까운 순서로 몇 번째인지(0,1,2,...)를 나타냄
-                · 해당 에이전트의 route가 아니면 -1
-
-    Raises:
-        ValueError: npc_route_indices에 음수 인덱스가 있거나,
-                    lane_num 유추 후 범위를 벗어나는 인덱스가 발견된 경우.
-
-    Examples:
-        >>> npc_route_indices = [[5, 2, 7], [1, 0]]
-        >>> arr = build_agent_route_lane_order(npc_route_indices, lane_num=8)
-        >>> # arr[0]: lane 5->0, lane 2->1, lane 7->2, 나머지 -1
-        >>> # arr[1]: lane 1->0, lane 0->1, 나머지 -1
+            - `agent_route_lane_order`
+            - shape: (chosen_agent_num, chosen_lane_num)
+            - 각 [i, j] 값:
+                · j번째 차선이 에이전트 i의 route 상에서 가까운 순서일 때
+                  0, 1, 2, ... 랭크 값
+                · 그 에이전트의 route에 없는 차선이면 -1
     """
-    agent_num: int = len(npc_route_indices)
+    chosen_agent_num: int = len(npc_route_on_chosen_lane_idx_list)
 
-    # lane_num 미지정 시, 등장한 최대 인덱스 기반으로 유추
-    if lane_num is None:
-        max_idx = -1
-        for idx_list in npc_route_indices:
-            if any(i < 0 for i in idx_list):
-                raise ValueError("npc_route_indices에 음수 인덱스가 포함되어 있습니다.")
-            if idx_list:
-                max_idx = max(max_idx, max(idx_list))
-        lane_num = max_idx + 1 if max_idx >= 0 else 0
+    # 결과 행렬 초기화: (chosen_agent_num, chosen_lane_num)
+    agent_route_lane_order: np.ndarray = np.full(
+        (chosen_agent_num, chosen_lane_num),
+        -1,
+        dtype=dtype,
+    )
 
-    # 기본값 -1로 초기화
-    agent_route_lane_order = np.full((agent_num, lane_num), -1, dtype=dtype)
+    # 에이전트가 없거나 차선이 없으면 바로 반환
+    if chosen_agent_num == 0 or chosen_lane_num == 0:
+        return agent_route_lane_order
 
-    # 에이전트별로 가까운 순서 랭크 부여
-    for agent_i, lane_list in enumerate(npc_route_indices):
-        seen = set()
-        rank = 0
-        for lane_idx in lane_list:
-            if lane_idx < 0:
-                raise ValueError(f"음수 인덱스가 발견되었습니다: {lane_idx}")
-            if lane_idx >= lane_num:
-                raise ValueError(
-                    f"lane_idx {lane_idx} 가 lane_num={lane_num} 범위를 벗어났습니다.")
-            if lane_idx in seen:
-                continue
-            agent_route_lane_order[agent_i, lane_idx] = rank
-            seen.add(lane_idx)
-            rank += 1
+    for agent_i, route_on_chosen_lane_idx in enumerate(
+            npc_route_on_chosen_lane_idx_list):
+        # 이 에이전트는 route 상에 차선이 없는 경우
+        if not route_on_chosen_lane_idx:
+            continue
+
+        # lane_idx_list: (L,)
+        lane_idx_list: np.ndarray = np.asarray(route_on_chosen_lane_idx,
+                                               dtype=int)
+
+        # 범위 체크 (벡터화)
+        if np.any(lane_idx_list < 0):
+            bad_idx: int = int(lane_idx_list[lane_idx_list < 0][0])
+            raise ValueError(f"음수 인덱스가 발견되었습니다: {bad_idx}")
+        if np.any(lane_idx_list >= chosen_lane_num):
+            bad_idx = int(lane_idx_list[lane_idx_list >= chosen_lane_num][0])
+            raise ValueError(
+                f"lane_idx {bad_idx} 가 chosen_lane_num={chosen_lane_num} 범위를 벗어났습니다."
+            )
+
+        # 중복 제거 (첫 등장 순서 유지)
+        # unique_vals: (M,), first_indices: (M,)
+        unique_vals, first_indices = np.unique(lane_idx_list, return_index=True)
+        # 원래 등장 순서대로 정렬
+        order: np.ndarray = np.argsort(first_indices)  # (M,)
+        unique_lane_idx: np.ndarray = unique_vals[order]  # (M,)
+
+        # 랭크 벡터: [0, 1, 2, ...] shape: (M,)
+        ranks: np.ndarray = np.arange(unique_lane_idx.shape[0], dtype=dtype)
+
+        # 한 번에 대입
+        agent_route_lane_order[agent_i, unique_lane_idx] = ranks
 
     return agent_route_lane_order
+
+
+def _lane_min_dist_order(
+        lanes_xy: np.ndarray,  # shape: (chosen_lane_num, lane_len, 2)
+        neighbor_current_xy: np.ndarray,  # shape: (2,)
+) -> np.ndarray:  # shape: (chosen_lane_num,)
+    """에이전트 위치에서 각 차선까지의 최소 거리를 계산해, 가까운 순으로 정렬된 인덱스를 만든다.
+
+    Args:
+        lanes_xy:
+            차선 폴리라인 좌표.
+            shape = (chosen_lane_num, lane_len, 2).
+        neighbor_current_xy:
+            에이전트 현재 위치 [x, y].
+            shape = (2,).
+
+    Returns:
+        np.ndarray:
+            lane 인덱스가 "에이전트와 가까운 순"으로 정렬된 배열.
+            shape = (chosen_lane_num,).
+    """
+    # diff: (chosen_lane_num, lane_len, 2)
+    diff: np.ndarray = lanes_xy - neighbor_current_xy[None, None, :]
+    # dists: (chosen_lane_num, lane_len)
+    dists: np.ndarray = np.linalg.norm(diff, axis=-1)
+    # min_dists: (chosen_lane_num,)
+    min_dists: np.ndarray = np.min(dists, axis=1)
+    # 가까운 순 정렬 인덱스 반환
+    return np.argsort(min_dists)
+
+
+def _select_lanes_by_order(
+        chosen_lane_dist_order: np.ndarray,  # shape: (chosen_lane_num,)
+        chosen_lanes_route_mask_arr: np.ndarray,  # shape: (chosen_lane_num,)
+) -> List[int]:
+    """거리 순 정렬 결과와 True/False 마스크를 이용해,
+    “경로 위에 있는 차선” 인덱스만 골라낸다.
+
+    제한 없이(True인 차선은 모두 사용) 선택한다.
+
+    Args:
+        chosen_lane_dist_order:
+            에이전트와의 최소 거리 기준으로 정렬된 lane 인덱스.
+            shape = (chosen_lane_num,).
+        chosen_lanes_route_mask_arr:
+            해당 lane 이 그 차량의 경로 위에 있는지 여부.
+            shape = (chosen_lane_num,).
+
+    Returns:
+        List[int]:
+            경로 위에 있는 lane 인덱스 리스트.
+            가까운 순으로 정렬되어 있다.
+    """
+    route_on_chosen_lane_idx: List[int] = []
+    for lane_idx in chosen_lane_dist_order:
+        if chosen_lanes_route_mask_arr[lane_idx]:
+            route_on_chosen_lane_idx.append(int(lane_idx))
+
+    return route_on_chosen_lane_idx
 
 
 def _select_token_and_ordered_npc_route_indices(
-    car_token_to_lane_on_routes: Dict[
-        str, List[bool]],  # 길이 <= agent_num (키 개수). 각 값: 길이 lane_num
-    neighbor_track_token: List[Optional[str]],  # 길이 = agent_num
-    neighbor_agents_current: np.
-    ndarray,  # shape: (agent_num, 11) → x=[:,0], y=[:,1]
-    vector_map_lanes: np.ndarray,  # shape: (lane_num, P, D) → 좌표는 [:, :, :2]
-    route_num: int,
-) -> np.ndarray:  # (agent_num, lane_num)
+    car_token_to_chosen_lanes_route_mask: Dict[
+        str, List[bool]],  # 길이: chosen_car_num / 값: 길이 = chosen_lane_num
+    neighbor_track_token: List[str],  # 길이: chosen_agent_num
+    neighbor_agents_current: np.ndarray,  # shape: (chosen_agent_num, 11)
+    vector_map_lanes: np.ndarray,  # shape: (chosen_lane_num, lane_len, D)
+) -> np.ndarray:  # shape: (chosen_agent_num, chosen_lane_num)
+    """토큰별 "경로 위 차선" 정보를 이용해 에이전트×차선 랭크 행렬을 만든다.
 
-    from typing import List
+    한 에이전트에 대해 하는 일
+    --------------------------
+    1) 자신의 차량 토큰으로 `chosen_lanes_route_mask` 를 가져온다.
+       - 길이 = chosen_lane_num, bool 리스트
+       - True 인 lane 만 이 에이전트의 경로 위에 있는 차선이다.
 
-    # ────────────── 보조 함수: 입력 검증 ──────────────
+    2) `vector_map_lanes` 에서 좌표 부분만 꺼내고(lanes_xy),
+       현재 에이전트 위치(neighbor_current_xy)와의 최소 거리 기준으로
+       lane 인덱스를 가까운 순서로 정렬한다.
+       - `_lane_min_dist_order` 사용
+       - shape = (chosen_lane_num,)
 
-    # ────────────── 보조 함수: 각 에이전트 ↔ lane 최소거리 정렬 ──────────────
-    def _lane_min_dist_order(lanes_xy: np.ndarray,
-                             agent_xy: np.ndarray) -> np.ndarray:
-        """lane을 에이전트와의 최소거리 기준으로 정렬한 인덱스 반환.
+    3) 정렬된 인덱스에서 `chosen_lanes_route_mask` 가 True 인 것만 골라
+       "이 에이전트 입장에서 가까운 route 차선" 리스트를 만든다.
+       - `_select_lanes_by_order` 사용
+       - 예: [2, 5, 7]
 
-        Args:
-            lanes_xy (np.ndarray): shape=(lane_num, P, 2) lane 폴리라인 좌표.
-            agent_xy (np.ndarray): shape=(2,) 에이전트 현재 위치.
+    4) 모든 에이전트에 대해 위 과정을 반복해
+       `npc_route_on_chosen_lane_idx_list` (에이전트별 lane 인덱스 리스트들)를 만들고,
+       마지막에 `build_agent_route_lane_order(...)` 를 호출해
+       (chosen_agent_num, chosen_lane_num) 랭크 행렬로 정리한다.
 
-        Returns:
-            np.ndarray: shape=(lane_num,) 최소거리 오름차순 lane 인덱스 배열.
-        """
-        diff = lanes_xy - agent_xy[None, None, :]  # (lane_num, P, 2)
-        dists = np.linalg.norm(diff, axis=-1)  # (lane_num, P)
-        min_dists = np.min(dists, axis=1)  # (lane_num,)
-        return np.argsort(min_dists)  # (lane_num,)
-
-    # ────────────── 보조 함수: 가까운 순으로 True lane만 최대 K 선택 ──────────────
-    def _select_lanes_by_order(
-        lane_dist_order: np.ndarray,
-        lane_on_routes_mask: np.ndarray,
-        max_pick: int,
-    ) -> List[int]:
-        """정렬 순서대로 True인 lane만 최대 `max_pick`개 선택한다.
-
-        Args:
-            lane_dist_order (np.ndarray): shape=(lane_num,) 정렬된 lane 인덱스.
-            lane_on_routes_mask (np.ndarray): shape<=(lane_num,) bool 마스크.
-            max_pick (int): 최대 선택 개수.
-
-        Returns:
-            List[int]: 선택된 lane 인덱스 리스트(길이 ≤ max_pick).
-        """
-        selected: List[int] = []
-        # print(f"len(lane_dist_order): {len(lane_dist_order)}, len(lane_on_routes_mask): {len(lane_on_routes_mask)}")
-        for lane_idx in lane_dist_order:
-            if lane_idx >= len(lane_on_routes_mask):
-                continue
-            if lane_on_routes_mask[lane_idx]:
-                selected.append(int(lane_idx))
-                if len(selected) >= max_pick:
-                    break
-        return selected
-
-    """토큰별 '경로 위 차선'을 가까운 순으로 최대 `route_num`개 뽑아 랭크 행렬을 만든다.
-
-    절차(에이전트 i에 대해):
-      1) lane 폴리라인과 에이전트 현재 위치 간 최소거리로 **lane**을 가까운→먼 순으로 정렬
-      2) 그 순서대로 `car_token_to_lane_on_routes[token][lane_idx]`가 True인 lane만
-         최대 `route_num`개 선택하여 `npc_route_indices[i] = [lane_idx0, lane_idx1, ...]`
-      3) 모든 에이전트 i에 대해 위 작업 후 `build_agent_route_lane_order`로
-         (agent_num, lane_num) 랭크 행렬을 생성(해당 에이전트의 route가 아니면 -1)
-
-    Args:
-        car_token_to_lane_on_routes (Dict[str, List[bool]]):
-            길이 = agent_num 보다 작거나 같음 . 키=토큰, 값=길이 lane_num의 불리언 마스크.
-        neighbor_track_token (List[Optional[str]]):
-            길이 = agent_num. 에이전트 토큰(없으면 None).
-        neighbor_agents_current (np.ndarray):
-            shape = (agent_num, 11). 현재 프레임의 이웃 에이전트 상태(ego 기준).
-            - x = [:, 0], y = [:, 1] 만 사용.
-        vector_map_lanes (np.ndarray):
-            shape = (lane_num, P, D). lane 폴리라인. 좌표는 [:, :, :2] 사용.
-        route_num (int):
-            각 에이전트에 대해 선택할 최대 차선 개수(0 < route_num < lane_num).
+    최종 결과
+    --------
+    - 반환값 `agent_route_lane_order[i, j]`:
+        · 에이전트 i 에 대해 j번째 lane 이
+          route 상에서 얼마나 "앞 순서"에 있는지(0,1,2,...)를 나타낸다.
+        · 해당 에이전트가 사용하지 않는 lane 은 -1 이다.
 
     Returns:
         np.ndarray:
-            `agent_route_lane_order`, shape = (agent_num, lane_num), dtype = np.int32.
-            - [i, j] = 에이전트 i에서 lane j의 "가까운 True 차선 순위(0,1,2,...)".
-            - 해당 에이전트의 route가 아니면 -1.
-
-    Raises:
-        ValueError: 입력 길이/shape가 올바르지 않거나 `route_num` 제약 위반 시.
-
-    Notes:
-        - `neighbor_track_token`과 `neighbor_agents_current`는 **ego와 가까운 순**이라 가정.
-        - 거리 계산은 lane 폴리라인의 모든 점과의 최소거리(유클리드) 기준.
+            - `agent_route_lane_order`
+            - shape: (chosen_agent_num, chosen_lane_num)
+            - dtype: np.int32 (기본)
     """
-    # ────────────── 메인 ──────────────
-    agent_num = neighbor_agents_current.shape[0]
-    lane_num = int(vector_map_lanes.shape[0])
-    lanes_xy = vector_map_lanes[:, :, :2]  # (lane_num, P, 2)
+    chosen_agent_num: int = int(neighbor_agents_current.shape[0])
+    chosen_lane_num: int = int(vector_map_lanes.shape[0])
 
-    npc_route_indices: List[List[int]] = [
-    ]  # 길이: agent_num, 원소: List[int] (길이 가변적)
+    # lanes_xy: (chosen_lane_num, lane_len, 2)
+    lanes_xy: np.ndarray = vector_map_lanes[:, :, :2]
 
-    for agent_idx in range(agent_num):
-        selected: List[int] = []
+    # npc_route_on_chosen_lane_idx_list:
+    #   길이 = chosen_agent_num, 각 원소: 선택된 lane 인덱스 리스트
+    npc_route_on_chosen_lane_idx_list: List[List[int]] = []
 
-        token = neighbor_track_token[agent_idx]  # Optional[str]
-        if token is None:
-            lane_on_routes = [False] * lane_num
-        else:
-            # car_token_to_lane_on_routes (Dict[str, List[bool]])
-            lane_on_routes = car_token_to_lane_on_routes.get(
-                token, [False] * lane_num)
+    for agent_idx in range(chosen_agent_num):
+        token: str = neighbor_track_token[agent_idx]
 
-        # (1) 경로가 전혀 없으면 건너뜀
-        lane_on_routes_arr = np.asarray(lane_on_routes,
-                                        dtype=bool)  # (lane_num,)
-        if lane_on_routes_arr.sum() == 0:
-            npc_route_indices.append(selected)
+        # 각 차량 토큰에 대한 "route 위 차선" 마스크 (길이 = chosen_lane_num)
+        chosen_lanes_route_mask: List[bool] = \
+            car_token_to_chosen_lanes_route_mask[token]
+
+        # chosen_lanes_route_mask_arr: (chosen_lane_num,)
+        chosen_lanes_route_mask_arr: np.ndarray = np.asarray(
+            chosen_lanes_route_mask,
+            dtype=bool,
+        )
+
+        # 이 에이전트 경로 위에 있는 차선이 하나도 없으면 빈 리스트
+        if chosen_lanes_route_mask_arr.sum() == 0:
+            npc_route_on_chosen_lane_idx_list.append([])
             continue
-        valid_len = len(lane_on_routes)
-        if valid_len == 0:
-            npc_route_indices.append([])
-            continue
-        # (2) 가까운 lane 정렬
-        agent_xy = neighbor_agents_current[agent_idx, :2]  # (2,)
-        lane_dist_order = _lane_min_dist_order(
-            lanes_xy[:valid_len],
-            agent_xy)  # shape=(lane_num,) 최소거리 오름차순 lane 인덱스 배열.
 
-        # (3) 정렬 순으로 True lane만 최대 route_num개 선택
-        selected = _select_lanes_by_order(lane_dist_order, lane_on_routes_arr,
-                                          route_num)
+        # neighbor_current_xy: (2,)
+        neighbor_current_xy: np.ndarray = neighbor_agents_current[agent_idx, :2]
 
-        npc_route_indices.append(selected)
+        # chosen_lane_dist_order: (chosen_lane_num,)
+        chosen_lane_dist_order: np.ndarray = _lane_min_dist_order(
+            lanes_xy=lanes_xy,
+            neighbor_current_xy=neighbor_current_xy,
+        )
 
-    # 반환 길이 검증
-    assert len(npc_route_indices) == agent_num, \
-        f"npc_route_indices 길이({len(npc_route_indices)}) != agent_num({agent_num})"
-    # (agent_num, lane_num)
-    agent_route_lane_order = build_agent_route_lane_order(npc_route_indices,
-                                                          lane_num=lane_num)
-    return agent_route_lane_order
+        # 경로 위(True)인 lane 전부 선택 (가까운 순으로)
+        route_on_chosen_lane_idx: List[int] = _select_lanes_by_order(
+            chosen_lane_dist_order=chosen_lane_dist_order,
+            chosen_lanes_route_mask_arr=chosen_lanes_route_mask_arr,
+        )
+        npc_route_on_chosen_lane_idx_list.append(route_on_chosen_lane_idx)
+
+    # 에이전트 수와 길이 정합성 체크
+    assert len(npc_route_on_chosen_lane_idx_list) == chosen_agent_num, (
+        f"npc_route_on_chosen_lane_idx_list 길이({len(npc_route_on_chosen_lane_idx_list)}) "
+        f"!= chosen_agent_num({chosen_agent_num})")
+
+    # (chosen_agent_num, chosen_lane_num)
+    agent_route_lane_order: np.ndarray = build_agent_route_lane_order(
+        npc_route_on_chosen_lane_idx_list=npc_route_on_chosen_lane_idx_list,
+        chosen_lane_num=chosen_lane_num,
+    )
+    return agent_route_lane_order.astype(np.int64)
 
 
 def get_neighbor_track_tokens(
@@ -2040,24 +2089,34 @@ import numpy as np
 import torch
 
 
-def convert_to_model_inputs(data: Mapping[str, Any], device: Union[torch.device,
-                                                                   str],
-                            squeeze: bool) -> Dict[str, torch.Tensor]:
+def convert_data_dict_to_device_tensors(
+    data: Mapping[str, Any],
+    device: Union[torch.device, str],
+    squeeze: bool,
+) -> Dict[str, torch.Tensor]:
     """
-    딕셔너리 값을 torch.Tensor로 변환합니다.
+    파이썬/NumPy 기반 딕셔너리를 모델 입력용 torch.Tensor 딕셔너리로 변환한다.
 
-    규칙
-    - bool 계열은 torch.bool 유지
-    - 그 외 수치형은 torch.float32로 캐스팅
-    - squeeze=False 이면 배치 차원(앞쪽) 1을 추가
+    기능 요약
+    --------
+    - 값이 이미 torch.Tensor 인 경우: 다시 만들지 않고 .to(device, dtype) 만 호출
+    - NumPy 배열: from_numpy 로 래핑 후 float32 또는 bool 로 캐스팅
+    - 파이썬 스칼라/리스트: torch.as_tensor(...) 로 생성
+    - squeeze=False 인 경우: 앞쪽에 배치 차원 1개를 추가(unsqueeze(0))
+    - 키가 "agent_route_lane_order" 인 텐서는 항상 torch.int64 로 맞춤
 
     Args:
-        data: {키: 값} 형태. 값은 torch.Tensor / np.ndarray / 파이썬 스칼라/리스트 모두 허용
-        device: 배치 후 올릴 디바이스 (예: "cuda:0", torch.device("cpu"))
-        squeeze: False면 앞쪽에 차원 하나 unsqueeze(0)
+        data:
+            키-값 딕셔너리.
+            값은 torch.Tensor / np.ndarray / 파이썬 수치/리스트 등을 허용한다.
+        device:
+            텐서를 올릴 디바이스. (예: "cuda:0", torch.device("cpu"))
+        squeeze:
+            False 이면, 모든 텐서 앞에 배치 차원 1을 추가한다.
 
     Returns:
-        키별 torch.Tensor 딕셔너리
+        Dict[str, torch.Tensor]:
+            각 키에 대응하는 torch.Tensor 로 구성된 딕셔너리.
     """
     out: Dict[str, torch.Tensor] = {}
 
@@ -2076,9 +2135,11 @@ def convert_to_model_inputs(data: Mapping[str, Any], device: Union[torch.device,
                     t = t.to(dtype=torch.bool)
             else:
                 # 수치형은 float32로
-                t = torch.from_numpy(v).to(device=device,
-                                           dtype=torch.float32,
-                                           non_blocking=True)
+                t = torch.from_numpy(v).to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
 
         # 3) 파이썬 bool 스칼라
         elif isinstance(v, (bool, np.bool_)):
@@ -2090,6 +2151,9 @@ def convert_to_model_inputs(data: Mapping[str, Any], device: Union[torch.device,
 
         if not squeeze:
             t = t.unsqueeze(0)
+
+        if k == "agent_route_lane_order":
+            t = t.to(torch.int64)
 
         out[k] = t
 

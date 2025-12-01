@@ -35,7 +35,7 @@ from diffusion_planner.data_process.agent_process import (
 )
 from diffusion_planner.data_process.map_process import get_neighbor_vector_set_map, map_process
 from diffusion_planner.data_process.ego_process import get_ego_past_array_from_scenario, get_ego_future_array_from_scenario, calculate_additional_ego_states
-from diffusion_planner.data_process.utils import convert_to_model_inputs, get_npc_route_roadblock_ids, get_neighbor_track_tokens
+from diffusion_planner.data_process.utils import convert_data_dict_to_device_tensors, get_npc_route_roadblock_ids, get_neighbor_track_tokens
 # [ADDED] 통계 저장용
 import json
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
@@ -76,20 +76,6 @@ class DataProcessor(object):
             'RIGHT_BOUNDARY': config.lane_len,
             'ROUTE_LANES': config.route_len
         }  # maximum number of points per feature to extract per feature layer.
-        # wandb 사용 여부를 한 곳에서만 판단
-        # if getattr(config, "use_wandb", True) and wandb.run is None:
-        #     # 컨트롤러 run id를 같은 group 으로 묶어 두면 대시보드가 깔끔
-        #     wandb.init(
-        #         project=getattr(config, "wandb_project", "Diffusion-Planner"),
-        #         entity=getattr(config, "wandb_entity", None),
-        #         group=getattr(config, "wandb_group", None),  # ← 컨트롤러 ID
-        #         job_type="preprocess-worker",
-        #         name=f"-worker-{os.getpid()}",
-        #         mode=getattr(config, "wandb_mode", "online"),
-        #         reinit=True,  # fork 안전
-        #         settings=wandb.Settings(start_method="fork"),
-        #     )
-        # self._wandb_enabled = wandb.run is not None
 
     # [ADDED] 통계 유틸 함수들
     # =========================
@@ -464,7 +450,7 @@ class DataProcessor(object):
             ego_cur_pose_np=ego_cur_pose_np,
             filter_radius=self._filter_radius,
         )
-        data = {
+        key_to_array = {
             "ego_agent_past": ego_agent_past,  # (time_len, 11)
             "neighbor_agents_past":
                 neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
@@ -499,7 +485,7 @@ class DataProcessor(object):
 
         # (agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
-        vector_map = map_process(
+        map_key_to_array = map_process(
             route_roadblock_ids,
             car_token_to_rr_ids,  # len = chosen_car_num
             neighbor_track_token,
@@ -512,23 +498,15 @@ class DataProcessor(object):
             self._map_elements,
             self._map_max_elements,
             self._map_points_num)
-
-        if "agent_route_lane_order" in vector_map:
-            aro = vector_map["agent_route_lane_order"]
-            if isinstance(aro, np.ndarray) and aro.dtype != np.int64:
-                vector_map["agent_route_lane_order"] = aro.astype(np.int64)
-        # data: Dict[str, np.ndarray]
-        data.update(vector_map)
-        # data: Dict[str, torch.Tensor]
-        data = convert_to_model_inputs(data, device, squeeze)
+        # key_to_array: Dict[str, np.ndarray]
+        key_to_array.update(map_key_to_array)
+        # key_to_array: Dict[str, torch.Tensor]
+        key_to_array = convert_data_dict_to_device_tensors(
+            key_to_array, device, squeeze)
         # agent
-        data[
+        key_to_array[
             "neighbor_track_token"] = neighbor_track_token  # List[str], (chosen_agent_num,)
-        # 변환 후에도 안전하게 보정
-        if "agent_route_lane_order" in data:
-            data["agent_route_lane_order"] = data["agent_route_lane_order"].to(
-                torch.int64)
-        return data
+        return key_to_array
 
     @staticmethod
     def zero_out_random_time_prefix(
@@ -818,7 +796,7 @@ class DataProcessor(object):
 
         for scenario in tqdm(scenarios):
             map_name = scenario._map_name
-            token = scenario.token
+            scenario_token = scenario.token
             map_api = scenario.map_api
             '''
             ego & agents past
@@ -912,7 +890,7 @@ class DataProcessor(object):
                 filter_radius=self._filter_radius,
             )
 
-            input_data = {
+            key_to_array = {
                 "ego_agent_past":
                     ego_agent_past,  # (chosen_agent_num, time_len, 11)
                 "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
@@ -948,19 +926,25 @@ class DataProcessor(object):
                                           neighbor_track_token)
             # (agent_num, 11)
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
-            vector_map = map_process(
+            map_key_to_array = map_process(
                 route_roadblock_ids, car_token_to_rr_ids, neighbor_track_token,
                 neighbor_agents_current, ego_cur_pose_np,
                 elements_to_obj_polylines, elements_to_traffic_light,
                 speed_limit_dict, lanes_roadblock_id_list, self._map_elements,
                 self._map_max_elements, self._map_points_num)
-
+            key_to_array.update(map_key_to_array)
+            # gather data
+            chore_data = {
+                "map_name": map_name,
+                "token": scenario_token,
+            }
+            key_to_array.update(chore_data)
             # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
-            try:
+            if self.config.make_statistics_when_caching:
                 veh_cnt, ped_cnt, bic_cnt = self._count_valid_neighbors_by_type(
                     neighbor_agents_past=neighbor_agents_past)
                 ratio_percent, mean_speed_kmh = self._compute_lane_speed_stats(
-                    vector_map)
+                    map_key_to_array)
                 stats_payload = {
                     "vehicle_count":
                         int(veh_cnt),
@@ -974,37 +958,21 @@ class DataProcessor(object):
                     "mean_speed_limit_kmh": (None if mean_speed_kmh is None else
                                              float(mean_speed_kmh)),
                 }
-                self._save_sample_stats_json(map_name, token, stats_payload)
-            except Exception as _e:
-                # 통계 수집이 실패해도 전처리 전체는 계속 진행
-                print(
-                    f"[Warn] stats collection failed for {map_name}_{token}: {_e}"
-                )
+                self._save_sample_stats_json(map_name, scenario_token,
+                                             stats_payload)
 
-            # gather data
-            chore_data = {
-                "map_name": map_name,
-                "token": token,
-            }
-            input_data.update(chore_data)
             ############################################
-            # [ADD] 저장 전 안전 보정 (훈련용 npz)
-            aro = vector_map.get("agent_route_lane_order", None)
-            if isinstance(aro, np.ndarray) and aro.dtype != np.int64:
-                vector_map["agent_route_lane_order"] = aro.astype(np.int64)
-            input_data.update(vector_map)
+            self.save_to_disk(self._save_dir, key_to_array)
 
-            # 디버깅용 그림 그리기
-            save_dir = os.path.join(self._save_dir, "debug_vis")
-            save_path = os.path.join(save_dir, f"{map_name}_{token}.png")
-            os.makedirs(save_dir, exist_ok=True)
-            # if self._wandb_enabled or self.config.save_image:
-
-            self.save_to_disk(self._save_dir, input_data)
             if self.config.save_image:
-                print("Visualizing scenario:", map_name, token)
-                input_data["token_to_future_traj_wrt_ego"] = None,
-                draw_machine.draw_world_model_to_png(input_data,
+                # 디버깅용 그림 그리기
+                save_dir = os.path.join(self._save_dir, "debug_vis")
+                save_path = os.path.join(save_dir,
+                                         f"{map_name}_{scenario_token}.png")
+                os.makedirs(save_dir, exist_ok=True)
+                print("Visualizing scenario:", map_name, scenario_token)
+                key_to_array["token_to_future_traj_wrt_ego"] = None
+                draw_machine.draw_world_model_to_png(key_to_array,
                                                      output_data=None,
                                                      save_path=save_path)
 
@@ -1082,7 +1050,45 @@ class DataProcessor(object):
 
         return cur_fut_agents_world_8_list, token_to_id
 
-    def save_to_disk(self, dir, data):
+    def save_to_disk(self, dir: str, data: Dict[str, np.ndarray]) -> None:
+        """샘플 데이터를 안전하게 디스크에 저장한다(.npz, 원자적 저장 방식).
+
+        이 함수는 한 시나리오에서 만들어진 모든 넘파이 배열과 메타 정보를
+        하나의 `.npz` 파일로 저장한다. 저장 과정에서 **부분만 써진 깨진 파일**이
+        남지 않도록, 항상 임시 파일(`.tmp`)에 먼저 쓴 뒤 최종 파일명으로 교체한다.
+
+        파일 이름 규칙
+        -------------
+        - 최종 경로:
+            `<dir>/<map_name>_<token>.npz`
+        - 예:
+            >>> dir = "/tmp/nuplan_cache"
+            >>> data["map_name"] = "us_ma"
+            >>> data["token"] = "abcd1234"
+            → "/tmp/nuplan_cache/us_ma_abcd1234.npz"
+
+        저장 방식(알고리즘)
+        ------------------
+        1) 저장 폴더가 없다면 `os.makedirs(dir, exist_ok=True)` 로 만든다.
+        2) 최종 파일 경로를 `<dir>/<map_name>_<token>.npz` 로 만든다.
+        4) 임시 파일에 `np.savez` 로 모든 데이터를 쓴 뒤:
+           - `f.flush()` 로 버퍼를 비우고
+           - `os.fsync(f.fileno())` 로 디스크에 강제로 기록한다.
+        5) 모든 것이 성공하면 `os.replace(tmp_path, final_path)` 로
+           임시 파일을 최종 파일 이름으로 한 번에 교체한다.
+           → 이 순간만 파일이 바뀌므로, 중간 상태의 깨진 파일이 보이지 않는다.
+        6) 도중에 예외가 나면:
+           - 최종 파일은 건드리지 않고
+           - 남아 있을 수 있는 임시 파일만 지운 뒤 예외를 다시 올린다.
+
+        Args:
+            dir (str):
+                - npz 파일을 저장할 디렉터리 경로.
+                - 존재하지 않으면 내부에서 자동으로 생성한다.
+            data (Dict[str, np.ndarray]):
+                - 저장할 키-값 딕셔너리.
+
+        """
         os.makedirs(dir, exist_ok=True)
         final_path = f"{dir}/{data['map_name']}_{data['token']}.npz"
         tmp_path = final_path + ".tmp"

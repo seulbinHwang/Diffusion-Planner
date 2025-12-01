@@ -2303,7 +2303,7 @@ def draw_world_model_to_png(
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"] # d6ff7e795dd051ac
     # draw_token_list = ["d6ff7e795dd051ac"] # aee2dbe7e9245b23
     # draw_token_list = ["8f85cc67cb005921"]
-    # draw_token_list = None
+    draw_token_list = None
     draw_option = options or DrawingOptions()
 
     # 1) Figure/Axes
