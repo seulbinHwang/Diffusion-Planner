@@ -113,7 +113,7 @@ def get_args():
                         type=str)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
-    parser.add_argument('--num_workers', default=8, type=int)
+    parser.add_argument('--num_workers', default=6, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--use_feasible', default=True, type=boolean)
     parser.add_argument('--use_feasible_dl', default=True, type=boolean)
@@ -182,7 +182,7 @@ def get_args():
     parser.add_argument('--prefetch_factor',
                         type=int,
                         help='number of warm up',
-                        default=6)
+                        default=4)
     parser.add_argument('--encoder_drop_path_rate',
                         type=float,
                         help='encoder drop out rate',
