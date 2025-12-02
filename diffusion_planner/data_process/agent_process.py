@@ -433,218 +433,227 @@ def _filter_agents_array_w_id(
 
 def _pad_agent_states(
     all_frame_cur_exists_agents: List[
-        np.ndarray],  # len = num_frames, 각 원소 shape: (current_agents_num, 8)
+        np.ndarray],  # len = num_frames, 각 원소 shape: (current_agents_num_t, 8)
     reverse: bool,
 ) -> List[np.ndarray]:  # len = num_frames, 각 원소 shape: (current_agents_num, 8)
-    """프레임마다 빠지는 에이전트를 **이전 상태로 채우며** 궤적을 이어주는 함수.
+    """프레임마다 빠지는 에이전트를 0으로 채우면서, 에이전트 순서를 기준 프레임에 맞춘다.
 
-    여러 시점에 걸쳐 등장하는 에이전트들의 상태가 있을 때,
-    기준 프레임에 존재하는 에이전트만을 대상으로,
-    각 시점에서 값이 사라진 에이전트는 **가장 가까운 과거(또는 미래) 상태**로 채워 넣습니다.
-
-    예시(시간이 과거→현재 방향일 때):
-        - t1: a1, a2, a3
-        - t2: a1, a3 만 존재
-
-        → t2에서 a2가 사라졌으므로,
-          t2의 a2 상태는 t1 시점의 a2 상태로 복사하여 채웁니다.
-
-    `reverse=True` 를 주면 시간 방향을 뒤집어서,
-    “가장 최근 상태를 기준으로 과거 쪽을 채우는” 방식으로 동작합니다.
-
-    **행(에이전트) 순서에 대한 설명**
-
-    - 기준 프레임 선택:
-      · `reverse=False` 인 경우: 리스트의 첫 번째 프레임이 기준(t=0).
-      · `reverse=True` 인 경우: 리스트를 뒤집은 뒤 첫 번째 프레임이 기준(가장 최근 시점).
-
-    - 기준 프레임에서:
-      · 기준 프레임 배열의 각 행(에이전트)을 위에서부터 읽으며,
-        그 순서대로 `track_id → 기준 행 인덱스` 매핑(`key_frame_id_to_row`)을 만든다.
-      · 따라서 **기준 프레임의 행 순서가 이후 모든 프레임에서 “정답 순서”가 된다.**
-
-    - 다른 프레임들에서:
-      · 각 프레임의 입력 배열 `(current_agents_num_t, 8)` 을 위에서부터 순회하면서,
-        각 행의 `track_id` 를 기준 프레임의 `key_frame_id_to_row` 에서 찾아,
-        해당 에이전트가 기준 프레임에서 차지하는 행 위치에 복사한다.
-      · 즉, 현재 프레임에서의 등장 순서와 상관없이,
-        **기준 프레임에서의 행 순서에 맞춰 재배열**된다.
-      · 기준 프레임에 없는 `track_id` 는 매핑이 없으므로 사용되지 않는다.
-
-    결국, 반환 리스트의 각 원소 `(current_agents_num, 8)` 에서:
-        - `current_agents_num` 과 행 순서는 **기준 프레임의 에이전트 순서와 완전히 동일**하고,
-        - 모든 시점에서 같은 순서·같은 개수를 유지하도록 패딩/복사가 이루어진다.
+    간단한 규칙:
+        - 기준 프레임(현재 프레임 기준)에서 살아 있는 에이전트 집합을 고정한다.
+        - 각 시점마다:
+            · 해당 시점에 관측된 에이전트는 그 값으로 채우고
+            · 관측되지 않은 에이전트는 [0, 0, ..., 0] 으로 둔다.
+        - 모든 프레임의 행 개수/순서는 기준 프레임과 같다.
 
     Args:
         all_frame_cur_exists_agents (List[np.ndarray]):
             - 길이: num_frames
             - 각 원소 shape: (current_agents_num_t, 8)
-              (단, 이 함수가 끝난 후에는 모든 프레임에서 같은 current_agents_num 으로 맞춰집니다.)
-            - 각 행은 한 에이전트에 해당하고, 열은
-              [track_id, vx, vy, heading, width, length, x, y] 입니다.
+              [track_id, vx, vy, heading, width, length, x, y]
         reverse (bool):
-            - False:
-                · 리스트의 첫 번째 프레임을 기준(t=0)으로 보고, 이후 시점으로 진행하며 패딩합니다.
-            - True:
-                · 리스트를 뒤집어서 마지막 프레임을 기준으로 보고, 과거 방향으로 패딩한 뒤 다시 뒤집습니다.
+            - True 이면 리스트를 뒤집어서 마지막 프레임을 기준으로 사용한다.
 
     Returns:
         List[np.ndarray]:
             - 길이: num_frames
             - 각 원소 shape: (current_agents_num, 8)
-            - 모든 프레임에서 같은 에이전트 순서와 개수를 유지하며,
-              중간에 사라진 구간은 이전(또는 이후) 상태로 채운 결과입니다.
-            - 모든 프레임의 행 순서와 개수는 **기준 프레임의 행 순서/개수와 동일**합니다.
+              기준 프레임 에이전트 순서로 정렬되고, 없는 시점은 0으로 채워진 배열.
     """
     track_id_idx = AgentInternalIndex.track_token()
+
+    # 시간 방향 뒤집기 (현재 프레임을 기준 프레임으로 쓰기 위해)
     if reverse:
         all_frame_cur_exists_agents = all_frame_cur_exists_agents[::-1]
 
-    # key_frame_agents: (current_agents_num, 8)  — 기준 프레임
-    key_frame_agents = all_frame_cur_exists_agents[0]
+    if len(all_frame_cur_exists_agents) == 0:
+        return all_frame_cur_exists_agents
 
+    # 기준 프레임: (current_agents_num, 8)
+    key_frame_agents: np.ndarray = all_frame_cur_exists_agents[0]
+    current_agents_num: int = int(key_frame_agents.shape[0])
+    feature_dim: int = int(key_frame_agents.shape[1])
+
+    if current_agents_num == 0:
+        # 에이전트가 아예 없으면 그대로 반환
+        return all_frame_cur_exists_agents
+
+    # 기준 프레임에서 track_id → 행 인덱스 매핑
     key_frame_id_to_row: Dict[int, int] = {}
     for cur_agent_idx, agent_id in enumerate(key_frame_agents[:, track_id_idx]):
         key_frame_id_to_row[int(agent_id)] = cur_agent_idx
 
-    # current_state: (current_agents_num, 8)
-    """
-    t = -1에 있었는데, t= -2에 없어진 agent의 경우, t=-2에 t=-1의 state로 padding
-    """
-    current_state = np.zeros(
-        (key_frame_agents.shape[0], key_frame_agents.shape[1]),
-        dtype=np.float64)
-    for time_idx in range(len(all_frame_cur_exists_agents)):
-        # frame_cur_exists_agents: (agents_num_t, 8)
-        frame_cur_exists_agents = all_frame_cur_exists_agents[time_idx]
+    # 기준 프레임의 id 벡터 (shape: (current_agents_num,))
+    key_frame_ids: np.ndarray = key_frame_agents[:, track_id_idx].copy()
 
-        # Update current frame
+    new_all_frame_cur_exists_agents: List[np.ndarray] = []
+
+    for time_idx in range(len(all_frame_cur_exists_agents)):
+        # frame_cur_exists_agents: (current_agents_num_t, 8)
+        frame_cur_exists_agents: np.ndarray = all_frame_cur_exists_agents[
+            time_idx]
+
+        # frame_state: (current_agents_num, 8), 처음엔 전부 0
+        frame_state: np.ndarray = np.zeros(
+            (current_agents_num, feature_dim),
+            dtype=np.float64,
+        )
+
+        # track_id 칸은 기준 프레임 id 로 채워 둔다.
+        frame_state[:, track_id_idx] = key_frame_ids
+
+        # 현재 프레임에서 실제로 관측된 에이전트만 해당 행 위치에 복사
         for agent_row_idx in range(frame_cur_exists_agents.shape[0]):
-            # frame_cur_exists_agents: (agents_num_t, 8)
             agent_id = int(frame_cur_exists_agents[agent_row_idx, track_id_idx])
+            if agent_id not in key_frame_id_to_row:
+                # 기준 프레임에 없는 id 는 이웃 후보가 아니므로 무시
+                continue
             key_frame_row: int = key_frame_id_to_row[agent_id]
-            current_state[key_frame_row, :] = frame_cur_exists_agents[
+            frame_state[key_frame_row, :] = frame_cur_exists_agents[
                 agent_row_idx, :]
 
-        # Save current state (복사본 저장)
-        all_frame_cur_exists_agents[time_idx] = current_state.copy()
+        new_all_frame_cur_exists_agents.append(frame_state)
 
+    # 시간 방향을 다시 원래대로 복원
     if reverse:
-        all_frame_cur_exists_agents = all_frame_cur_exists_agents[::-1]
+        new_all_frame_cur_exists_agents = new_all_frame_cur_exists_agents[::-1]
 
-    return all_frame_cur_exists_agents
+    return new_all_frame_cur_exists_agents
 
 
 def _pad_agent_states_with_zeros_w_id(
-        cur_fut_chosen_agents_local_8_list: List[
-            np.
-            ndarray],  # len = num_frames_all, 각 원소: (frame_save_agents_num_t, 8)
+        cur_fut_chosen_agents_local_8_list:
+    List[
+        np.
+        ndarray],  # 길이: num_frames_all, 각 원소 shape: (frame_save_agents_num_t, 8)
         neighbor_token_id: np.ndarray,  # shape: (chosen_agent_num,)
+        neighbor_types_one_hot: Optional[
+            np.ndarray] = None,  # shape: (chosen_agent_num, 3) 또는 None
 ) -> np.ndarray:
-    """선택된 이웃 토큰(neighbor_token_id)에 대해,
-    전체 시간 구간의 (x, y, heading) 궤적을 고정된 크기의 텐서로 채운다.
+    """선택된 이웃 토큰에 대해, 시간 전체 구간의 궤적을 고정 크기 텐서로 채운다.
 
-    목표 모양
-    ----------
-    - 출력: cur_fut_chosen_agents_xyh
-        · shape: (chosen_agent_num, num_frames_all, 3)
-        · 첫 축: 이웃 에이전트 슬롯 (neighbor_token_id 순서와 동일)
-        · 두 번째 축: 시간 (현재 포함, 미래까지 1+Tf_all)
-        · 세 번째 축: [x, y, heading] (ego 기준)
-
-    처리 순서
-    ----------
-    1) neighbor_token_id 길이 = chosen_agent_num 를 기준으로,
-       · (chosen_agent_num, num_frames_all, 3) 짜리 0 텐서를 미리 만든다.
-
-    2) 각 시점(timestep_idx)에 대해:
-       - cur_fut_chosen_agents_local_8_list[t] 의 shape: (frame_save_agents_num_t, 8)
-         · 여기서 8채널 = [track_id, vx, vy, heading, width, length, x, y]
-       - 이 프레임의 track_id 목록(frame_ids) 과 neighbor_token_id 의
-         공통 원소를 `np.intersect1d` 로 찾는다.
-         · inter: 공통 track_id 값들
-         · idx_frame: inter 가 frame_ids 에서 나타나는 위치 인덱스들
-         · idx_neighbors: inter 가 neighbor_token_id 에서 나타나는 위치 인덱스들
-
-    3) idx_frame 로 (x,y,heading)을 한 번에 모으고,
-       idx_neighbors 를 이용해 출력 텐서의 해당 행에 값을 채운다.
-       - 즉, neighbor_token_id 의 순서가 에이전트 축의 기준이 되며,
-         프레임에 존재하지 않는 에이전트는 그대로 0으로 남는다.
+    각 시점에서 관측된 에이전트의 상태는 해당 슬롯에 그대로 넣고,
+    관측되지 않은 시점은 0으로 둔다. 타입 one-hot은 시간축 전체에 복사한다.
 
     Args:
         cur_fut_chosen_agents_local_8_list (List[np.ndarray]):
             - 길이: num_frames_all
             - 각 원소 shape: (frame_save_agents_num_t, 8)
-              [track_id, vx, vy, heading, width, length, x, y]
-              (이미 ego 기준 상대 좌표계로 변환된 상태).
+              [track_id, vx, vy, heading, width, length, x, y] (ego 기준)
         neighbor_token_id (np.ndarray):
             - shape: (chosen_agent_num,)
-            - 선택된 이웃 에이전트들의 track_id 배열.
+            - 이웃 에이전트의 track_id 배열.
+        neighbor_types_one_hot (Optional[np.ndarray]):
+            - shape: (chosen_agent_num, 3)
+            - [onehot_vehicle, onehot_ped, onehot_bike]
+            - None 이면 타입 one-hot은 모두 0으로 둔다.
 
     Returns:
-        np.ndarray:
-            - cur_fut_chosen_agents_xyh
-            - shape: (chosen_agent_num, num_frames_all, 3)
-            - 각 값: ego 기준 [x, y, heading]
+         np.ndarray:
+            - cur_fut_chosen_agents_full_11:
+                · shape: (chosen_agent_num, num_frames_all, 11)
+                · [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
     """
     track_id_idx = AgentInternalIndex.track_token()
+    vx_idx = AgentInternalIndex.vx()
+    vy_idx = AgentInternalIndex.vy()
+    heading_idx = AgentInternalIndex.heading()
+    width_idx = AgentInternalIndex.width()
+    length_idx = AgentInternalIndex.length()
     x_idx = AgentInternalIndex.x()
     y_idx = AgentInternalIndex.y()
-    heading_idx = AgentInternalIndex.heading()
 
-    chosen_agent_num = len(neighbor_token_id)
-    cur_future_all_len = len(cur_fut_chosen_agents_local_8_list)
+    # neighbor_token_id: (chosen_agent_num,)
+    chosen_agent_num: int = int(neighbor_token_id.shape[0])
+    # cur_fut_chosen_agents_local_8_list 길이: num_frames_all
+    cur_future_all_len: int = len(cur_fut_chosen_agents_local_8_list)
 
-    # 출력 버퍼: (chosen_agent_num, num_frames_all, 3)
-    cur_fut_chosen_agents_xyh = np.zeros(
-        (chosen_agent_num, cur_future_all_len, 3),
+    # 출력 버퍼 (모두 0으로 초기화)
+
+    # cur_fut_chosen_agents_full_11: (chosen_agent_num, num_frames_all, 11)
+    cur_fut_chosen_agents_full_11: np.ndarray = np.zeros(
+        (chosen_agent_num, cur_future_all_len, 11),
         dtype=np.float32,
     )
 
-    # 이웃이 하나도 없으면 바로 반환
     if chosen_agent_num == 0:
-        return cur_fut_chosen_agents_xyh
+        return cur_fut_chosen_agents_full_11
 
-    # 각 시점 프레임에 대해 한 번씩만 처리 (프레임 길이가 가변이므로 이 루프는 필요)
+    # 타입 one-hot: (chosen_agent_num, 3) → (chosen_agent_num, 1, 3) → 시간축 브로드캐스트
+    if neighbor_types_one_hot is not None:
+        # neighbor_types_one_hot: (chosen_agent_num, 3)
+        neighbor_types_one_hot = neighbor_types_one_hot.astype(np.float32,
+                                                               copy=False)
+        # cur_fut_chosen_agents_full_11[:, :, 8:11]: (chosen_agent_num, num_frames_all, 3)
+        cur_fut_chosen_agents_full_11[:, :,
+                                      8:] = neighbor_types_one_hot[:, None, :]
+
+    # 각 시점 프레임 처리
     for timestep_idx, frame_chosen_agents_local_8 in enumerate(
             cur_fut_chosen_agents_local_8_list):
-        # frame_chosen_agents_local_8: (frame_chosen_agents_num_t, 8) 혹은 (0, 8)
-        if len(frame_chosen_agents_local_8) == 0:
+        # frame_chosen_agents_local_8: (frame_chosen_agents_num_t, 8) 또는 (0, 8)
+        if frame_chosen_agents_local_8.shape[0] == 0:
             continue
 
-        # 현재 프레임의 에이전트 track_id들: (frame_chosen_agents_num_t,)
-        frame_ids = frame_chosen_agents_local_8[:,
-                                                track_id_idx].astype(np.float32,
-                                                                     copy=False)
-        # frame_ids 와 neighbor_token_id 의 공통 원소 및 위치 인덱스
-        """
-        예시:
-            frame_ids        = [10, 20, 30, 40]
-            neighbor_token_id = [30, 50, 10]
+        # 현재 프레임의 track_id 들: (frame_chosen_agents_num_t,)
+        frame_ids: np.ndarray = frame_chosen_agents_local_8[:,
+                                                            track_id_idx].astype(
+                                                                np.float32,
+                                                                copy=False)
 
-            inter         = [10, 30]
-            idx_frame     = [0, 2]   # inter[0]=10 은 frame_ids[0], inter[1]=30 은 frame_ids[2]
-            idx_neighbors = [2, 0]   # inter[0]=10 은 neighbor_token_id[2], inter[1]=30 은 neighbor_token_id[0]
-        """
+        # frame_ids 와 neighbor_token_id 의 공통 원소 및 위치
+        # inter: 공통 track_id 값들 (길이 M)
+        # idx_frame: frame_ids 에서의 인덱스 (shape: (M,))
+        # idx_neighbors: neighbor_token_id 에서의 인덱스 (shape: (M,))
         inter, idx_frame, idx_neighbors = np.intersect1d(
-            frame_ids,  # (frame_chosen_agents_num_t,)
-            neighbor_token_id,  # (chosen_agent_num,)
+            frame_ids,
+            neighbor_token_id.astype(np.float32, copy=False),
             assume_unique=False,
             return_indices=True,
         )
         if inter.size == 0:
             continue
 
-        # 해당 행의 (x, y, heading) 한 번에 수집: shape (M, 3)
-        xyh = frame_chosen_agents_local_8[
-            idx_frame][:, [x_idx, y_idx, heading_idx]].astype(np.float32,
+        # 선택된 행만 모으기
+        # frame_selected: (M, 8)
+        frame_selected: np.ndarray = frame_chosen_agents_local_8[idx_frame]
+
+        # 위치/각도: (M,)
+        x_local: np.ndarray = frame_selected[:, x_idx].astype(np.float32,
                                                               copy=False)
+        y_local: np.ndarray = frame_selected[:, y_idx].astype(np.float32,
+                                                              copy=False)
+        heading_local: np.ndarray = frame_selected[:, heading_idx].astype(
+            np.float32, copy=False)
 
-        # neighbor_token_id 상의 위치(idx_neighbors)를 그대로 행 인덱스로 사용
-        # → (chosen_agent_num, num_frames_all, 3) 중 해당 에이전트/시점 위치에 채움
-        cur_fut_chosen_agents_xyh[idx_neighbors, timestep_idx, :] = xyh
+        # 속도/크기: (M,)
+        vx_local: np.ndarray = frame_selected[:, vx_idx].astype(np.float32,
+                                                                copy=False)
+        vy_local: np.ndarray = frame_selected[:, vy_idx].astype(np.float32,
+                                                                copy=False)
+        width_local: np.ndarray = frame_selected[:,
+                                                 width_idx].astype(np.float32,
+                                                                   copy=False)
+        length_local: np.ndarray = frame_selected[:,
+                                                  length_idx].astype(np.float32,
+                                                                     copy=False)
 
-    return cur_fut_chosen_agents_xyh
+        # ---- (2) full 11차원 채우기: [x, y, cos, sin, vx, vy, w, h, one_hot(3)] ----
+        # cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx, :8]: (M, 8)
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx, 0] = x_local
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx, 1] = y_local
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx,
+                                      2] = np.cos(heading_local)
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx,
+                                      3] = np.sin(heading_local)
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx, 4] = vx_local
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx, 5] = vy_local
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx,
+                                      6] = width_local
+        cur_fut_chosen_agents_full_11[idx_neighbors, timestep_idx,
+                                      7] = length_local
+        # 8:11 (one_hot)은 위에서 시간축 전체에 이미 채워져 있음
+
+    return cur_fut_chosen_agents_full_11
 
 
 def build_ego_past_feature(
@@ -683,70 +692,66 @@ def build_ego_past_feature(
 
 def _convert_all_frames_agents_to_ego_local(
         all_frame_cur_exists_agents: List[
-            np.ndarray],  # len = num_frames, 각 원소: (current_agents_num, 8)
+            np.ndarray],  # len = num_frames, 각 원소: (current_agents_num_t, 8)
         ego_cur_pose_np: np.ndarray,  # (3,)
 ) -> List[np.ndarray]:
-    """패딩된 에이전트 상태들을 모두 ego 기준 상대 좌표계로 변환한다.
+    """각 프레임의 에이전트 상태를 먼저 ego 기준으로 바꾸고,
+    이후에 프레임별 크기를 맞춰준다.
 
     처리 단계:
-        1) `_pad_agent_states` 로 모든 프레임에서 같은 에이전트 집합/순서를 맞춘다.
-        2) 각 프레임의 (world) 상태를 `convert_absolute_quantities_to_relative(..., 'agent')`
-           로 ego 기준 상대 좌표계로 변환한다.
+        1) 각 시점의 (world) 에이전트 상태를 개별적으로 ego 기준으로 변환.
+           - 입력: (current_agents_num_t, 8)
+           - 출력: (current_agents_num_t, 8)  (좌표계만 변경)
+        2) `_pad_agent_states` 를 이용해
+           - 기준 프레임 에이전트 집합/순서에 맞춰
+           - 없는 시점은 0으로 채운다.
 
     Args:
         all_frame_cur_exists_agents (List[np.ndarray]):
             - 길이: num_frames
-            - 각 원소 shape: (current_agents_num, 8)
-            - [track_id, vx, vy, heading, width, length, x, y]
+            - 각 원소 shape: (current_agents_num_t, 8)
+              [track_id, vx, vy, heading, width, length, x, y]
+              (월드 좌표계 기준)
         ego_cur_pose_np (np.ndarray):
-            - shape: (3,), [x_ego, y_ego, yaw_ego]
+            - shape: (3,)
+            - [x_ego, y_ego, yaw_ego]
 
     Returns:
         List[np.ndarray]:
             - 길이: num_frames
             - 각 원소 shape: (current_agents_num, 8)
-            - 모든 프레임이 ego 기준 상대 좌표계로 변환된 에이전트 상태.
+              ego 기준 좌표계이며, 기준 프레임 에이전트 순서를 따른다.
+              관측이 없는 시점은 0으로 채워진다.
     """
-    # 1) 프레임별로 에이전트 집합/순서를 기준 프레임에 맞춰 패딩
-    # all_frame_cur_exists_agents: len = num_frames,
-    #   각 원소 shape: (current_agents_num, 8)
-    all_frame_cur_exists_agents = _pad_agent_states(all_frame_cur_exists_agents,
-                                                    reverse=True)
-
-    # 에이전트가 하나도 없는 경우 그대로 반환
-    if len(all_frame_cur_exists_agents
-          ) == 0 or all_frame_cur_exists_agents[0].shape[0] == 0:
+    # 에이전트가 없으면 그대로 반환
+    if len(all_frame_cur_exists_agents) == 0:
         return all_frame_cur_exists_agents
 
-    num_frames: int = len(all_frame_cur_exists_agents)
-    current_agents_num: int = all_frame_cur_exists_agents[0].shape[0]
+    all_frame_cur_exists_agents_local_world: List[np.ndarray] = []
 
-    # 2) (프레임, 에이전트) 축을 하나로 합쳐서 배치 변환
-    # stacked_agents: (num_frames, current_agents_num, 8)
-    stacked_agents: np.ndarray = np.stack(all_frame_cur_exists_agents, axis=0)
-    # flat_agents: (num_frames * current_agents_num, 8)
-    flat_agents: np.ndarray = stacked_agents.reshape(-1,
-                                                     stacked_agents.shape[-1])
+    for frame_agents_world_8 in all_frame_cur_exists_agents:
+        # frame_agents_world_8: (current_agents_num_t, 8)
+        if frame_agents_world_8.shape[0] == 0:
+            # 관측이 아예 없는 프레임은 0 배열 유지
+            all_frame_cur_exists_agents_local_world.append(
+                np.zeros_like(frame_agents_world_8, dtype=np.float64))
+            continue
 
-    # 한 번에 ego 기준으로 좌표계 변환
-    # flat_agents_local: (num_frames * current_agents_num, 8)
-    flat_agents_local: np.ndarray = convert_absolute_quantities_to_relative(
-        flat_agents,
-        ego_cur_pose_np,  # (3,)
-        'agent',
+        # 복사본을 만들어 좌표계를 변환 (shape: (current_agents_num_t, 8))
+        frame_agents_world_8_copy = frame_agents_world_8.astype(np.float64,
+                                                                copy=True)
+        frame_agents_local_8 = convert_absolute_quantities_to_relative(
+            frame_agents_world_8_copy,
+            ego_cur_pose_np,
+            'agent',
+        )
+        all_frame_cur_exists_agents_local_world.append(frame_agents_local_8)
+
+    # 기준 프레임에 맞춰 에이전트 개수/순서를 고정하고, 없는 시점은 0 유지
+    all_frame_cur_exists_agents_local: List[np.ndarray] = _pad_agent_states(
+        all_frame_cur_exists_agents=all_frame_cur_exists_agents_local_world,
+        reverse=True,
     )
-
-    # 다시 (num_frames, current_agents_num, 8)로 복원
-    all_frame_cur_exists_agents_local_3d: np.ndarray = flat_agents_local.reshape(
-        num_frames,
-        current_agents_num,
-        flat_agents_local.shape[-1],
-    )
-
-    # 호출부와 타입 호환을 위해 프레임 단위 리스트로 분리
-    all_frame_cur_exists_agents_local: List[np.ndarray] = [
-        all_frame_cur_exists_agents_local_3d[i] for i in range(num_frames)
-    ]
 
     return all_frame_cur_exists_agents_local
 
@@ -1548,71 +1553,82 @@ def build_neighbor_past_feature(
 
 
 def agent_future_all_process(
-    ego_cur_pose_np: np.ndarray,  # shape: (3,) = [x_ego, y_ego, yaw_ego]
-    cur_fut_agents_world_8_list: List[
-        np.ndarray],  # len = 1+Tf, 각 원소: (frame_agents_num, 8)
-    neighbor_token_id: np.ndarray,  # shape: (chosen_agent_num,)
-) -> np.ndarray:  # 반환: (chosen_agent_num, 1+Tf_all, 3)
-    """선택된 이웃 에이전트들에 대해, 현재+미래 전체 구간의 (x, y, heading) 궤적을 만든다.
+        ego_cur_pose_np: np.ndarray,  # shape: (3,) = [x_ego, y_ego, yaw_ego]
+        cur_fut_agents_world_8_list: List[
+            np.ndarray],  # 길이: 1+Tf_all, 각 원소 shape: (frame_agents_num_t, 8)
+        neighbor_token_id: np.ndarray,  # shape: (chosen_agent_num,)
+        neighbor_agents_past: Optional[
+            np.ndarray] = None,  # (chosen_agent_num, Tp, 11) 또는 None
+) -> np.ndarray:
+    """선택된 이웃 에이전트에 대해, 현재+미래 전체 구간의 궤적을 3차원/11차원 둘 다 만든다.
 
-    전체 흐름
-    ----------
-    1) `_filter_agents_array_w_id`:
-        - cur_fut_agents_world_8_list 에서
-          neighbor_token_id 에 해당하는 에이전트만 남긴다.
-        - 프레임마다 결과 shape:
-            · (frame_save_agents_num_t, 8)
-            · 여기서 8채널 = [track_id, vx, vy, heading, width, length, x, y]
-        - 리스트 길이: num_frames_all = 1 + Tf_all
-          (현재 + 전체 미래)
-
-    2) `convert_absolute_quantities_to_relative(..., 'agent')`:
-        - 각 프레임의 에이전트 상태를
-          월드 좌표계 → ego 기준 상대 좌표계로 변환한다.
-        - 여전히 (frame_save_agents_num_t, 8) 형태이지만
-          값이 ego 기준 좌표로 바뀐다.
-
-    3) `_pad_agent_states_with_zeros_w_id`:
-        - neighbor_token_id 순서를 '행 순서' 로 삼고,
-          각 프레임에서 존재하는 에이전트는 그 행에 (x, y, heading)을 채운다.
-        - 프레임에 없는 에이전트는 그대로 0으로 남긴다.
-        - 최종 결과:
-            · cur_fut_chosen_agents_xyh: np.ndarray
-              shape: (chosen_agent_num, 1 + Tf_all, 3)
-              채널: [x_ego, y_ego, heading_ego]
+    흐름:
+        1) track_id 로 원하는 에이전트만 골라서 프레임별 리스트로 만든다.
+        2) 각 프레임을 ego 기준 좌표계로 변환한다.
+        3) 시간-에이전트 고정 크기 텐서로 채우되, 관측 없는 시점은 0으로 둔다.
+        4) 타입 one-hot 은 neighbor_agents_past 에서 가져와 시간축 전체에 복사한다.
 
     Args:
+        ego_cur_pose_np (np.ndarray):
+            - shape: (3,)
+            - [x_ego, y_ego, yaw_ego]
         cur_fut_agents_world_8_list (List[np.ndarray]):
-            - 길이: 1 + Tf_all
+            - 길이: num_frames_all = 1 + Tf_all
             - 각 원소 shape: (frame_agents_num_t, 8)
-              [track_id, vx, vy, heading, width, length, x, y] (월드 좌표계).
+              [track_id, vx, vy, heading, width, length, x, y] (월드 좌표계)
         neighbor_token_id (np.ndarray):
             - shape: (chosen_agent_num,)
-            - 선택된 이웃 에이전트들의 track_id 배열.
+            - 선택된 이웃 에이전트의 track_id 배열.
+        neighbor_agents_past (Optional[np.ndarray]):
+            - shape: (chosen_agent_num, Tp, 11)
+              과거 이웃 궤적 텐서. 마지막 3차원에 타입 one-hot 이 들어있다.
+              None 이면 미래 쪽 타입 one-hot 은 0으로 둔다.
 
     Returns:
-        np.ndarray:
-            - cur_fut_chosen_agents_xyh
-            - shape: (chosen_agent_num, 1 + Tf_all, 3)
-            - 각 축 의미:
-                · 첫 축: 선택된 에이전트 슬롯
-                · 두 번째 축: [현재, 미래1, 미래2, ...] 시간 순서
-                · 세 번째 축: [x, y, heading] (ego 기준)
+        np.ndarray
+            - cur_fut_chosen_agents_full_11:
+                · shape: (chosen_agent_num, num_frames_all, 11)
+                · [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
     """
-    # len: num_frames_all, 각 원소: (frame_save_agents_num_t, 8)
-    cur_fut_chosen_agents_world_8_list = _filter_agents_array_w_id(
-        cur_fut_agents_world_8_list, neighbor_token_id)
+    # 1) track_id 기준으로 원하는 에이전트만 남기기
+    # cur_fut_chosen_agents_world_8_list:
+    #   길이: num_frames_all, 각 원소 shape: (frame_save_agents_num_t, 8)
+    cur_fut_chosen_agents_world_8_list: List[
+        np.ndarray] = _filter_agents_array_w_id(
+            cur_fut_agents_world_8_list,
+            neighbor_token_id,
+        )
 
-    # 각 프레임을 ego 기준 좌표계로 변환
+    # 2) 각 프레임을 ego 기준 좌표계로 변환
     cur_fut_chosen_agents_local_8_list: List[np.ndarray] = []
     for frame_chosen_agents_world_8 in cur_fut_chosen_agents_world_8_list:
-        # frame_chosen_agents_world_8: (frame_agents_num_t, 8)
-        # → [track_id, vx, vy, heading, width, length, x, y] (ego 기준) 로 변환
-        cur_fut_chosen_agents_local_8_list.append(
-            convert_absolute_quantities_to_relative(frame_chosen_agents_world_8,
-                                                    ego_cur_pose_np, 'agent'))
+        # frame_chosen_agents_world_8: (frame_save_agents_num_t, 8)
+        # → [track_id, vx, vy, heading, width, length, x, y] (ego 기준) 으로 변환
+        frame_local_8: np.ndarray = convert_absolute_quantities_to_relative(
+            frame_chosen_agents_world_8,
+            ego_cur_pose_np,
+            'agent',
+        )
+        cur_fut_chosen_agents_local_8_list.append(frame_local_8)
 
-    # 최종 (chosen_agent_num, 1 + Tf_all, 3) 텐서 생성
-    cur_fut_chosen_agents_xyh = _pad_agent_states_with_zeros_w_id(
-        cur_fut_chosen_agents_local_8_list, neighbor_token_id)
-    return cur_fut_chosen_agents_xyh
+    # 3) 타입 one-hot 준비 (neighbor_agents_past 가 있을 때만)
+    neighbor_types_one_hot: Optional[np.ndarray] = None
+    if neighbor_agents_past is not None and neighbor_agents_past.size > 0:
+        # neighbor_agents_past: (chosen_agent_num, Tp, 11)
+        # 타입 one-hot 은 마지막 차원 8:11
+        # neighbor_types_one_hot: (chosen_agent_num, 3)
+        neighbor_types_one_hot = neighbor_agents_past[:, -1,
+                                                      8:11].astype(np.float32,
+                                                                   copy=False)
+
+    # 4) 시간축 패딩 + xyh / full_11 텐서 만들기
+    """
+    cur_fut_chosen_agents_full_11: (chosen_agent_num, num_frames_all, 11)
+    """
+    cur_fut_chosen_agents_full_11 = _pad_agent_states_with_zeros_w_id(
+        cur_fut_chosen_agents_local_8_list=cur_fut_chosen_agents_local_8_list,
+        neighbor_token_id=neighbor_token_id,
+        neighbor_types_one_hot=neighbor_types_one_hot,
+    )
+
+    return cur_fut_chosen_agents_full_11
