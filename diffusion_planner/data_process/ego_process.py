@@ -252,7 +252,8 @@ def get_ego_future_array_from_scenario(
     fut_ego_local_sin_yaw = fut_ego_local_11[:, 3]
 
     # fut_ego_local_heading: (T,)  ← x,y 에서 heading 추출 (현재 구현 그대로 유지)
-    fut_ego_local_heading = np.arctan2(fut_ego_local_sin_yaw, fut_ego_local_cos_yaw)
+    fut_ego_local_heading = np.arctan2(fut_ego_local_sin_yaw,
+                                       fut_ego_local_cos_yaw)
 
     # fut_ego_local_xyh: (T, 3) = [x, y, heading]
     fut_ego_local_xyh = np.concatenate(

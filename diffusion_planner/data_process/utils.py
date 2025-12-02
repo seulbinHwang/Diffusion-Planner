@@ -885,8 +885,9 @@ def _select_token_and_ordered_npc_route_indices(
 
         # 경로 위(True)인 lane 전부 선택 (가까운 순으로)
         route_on_chosen_lane_idx: List[int] = _select_lanes_by_order(
-            chosen_lane_dist_order=chosen_lane_dist_order, # (chosen_lane_num,)
-            chosen_lanes_route_mask_arr=chosen_lanes_route_mask_arr, # (chosen_lane_num,)
+            chosen_lane_dist_order=chosen_lane_dist_order,  # (chosen_lane_num,)
+            chosen_lanes_route_mask_arr=
+            chosen_lanes_route_mask_arr,  # (chosen_lane_num,)
         )
         npc_route_on_chosen_lane_idx_list.append(route_on_chosen_lane_idx)
 

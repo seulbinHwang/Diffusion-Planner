@@ -324,6 +324,7 @@ class DataProcessor(object):
     def _get_cur_fut_agents_world_8_list(
         self,
         scenario: NuPlanScenario,
+        token_to_id: Dict[str, int],
         do_inference: bool,
     ):
         if do_inference:
@@ -338,6 +339,7 @@ class DataProcessor(object):
                 (self.init_cur_fut_agents_world_8_list,
                  _) = self._get_future_tracked_objects_array_list(
                      scenario,
+                     token_to_id=token_to_id,
                      iteration=0,
                      future_time_horizon=scenario_duration,
                      num_samples=num_samples)
@@ -347,8 +349,8 @@ class DataProcessor(object):
                 self.init_cur_fut_agents_world_8_list)
         else:
             (cur_fut_agents_world_8_list,
-             _) = self._get_future_tracked_objects_array_list(scenario,
-                                                              iteration=0)
+             _) = self._get_future_tracked_objects_array_list(
+                 scenario, token_to_id=token_to_id, iteration=0)
         return cur_fut_agents_world_8_list
 
     # Use for inference
@@ -431,7 +433,7 @@ class DataProcessor(object):
             · shape: (chosen_agent_num, 1 + Tf_all, 3)
         """
         cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
-            scenario, do_inference=True)
+            scenario, token_to_id, do_inference=True)
 
         # neighbor_future_all_gt_3_dim: (chosen_agent_num, 1 + Tf_all, 3)
         neighbor_future_all_gt_3_dim = agent_future_all_process(
@@ -875,7 +877,7 @@ class DataProcessor(object):
             # 길이: 1 + num_future_poses
             # frame_agents_num: 각 프레임마다 다름
             cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
-                scenario, do_inference=False)
+                scenario, token_to_id, do_inference=False)
 
             # neighbor_future_gt_3_dim: (num_agents, 1+future_len, 3)
             neighbor_future_gt_3_dim = agent_future_all_process(
@@ -970,8 +972,7 @@ class DataProcessor(object):
             if self.config.save_image:
                 # 디버깅용 그림 그리기
                 save_dir = os.path.join(self._save_dir, "debug_vis")
-                save_path = os.path.join(save_dir,
-                                         f"{final_file_name}.png")
+                save_path = os.path.join(save_dir, f"{final_file_name}.png")
                 os.makedirs(save_dir, exist_ok=True)
                 print("Visualizing scenario:", save_path)
                 key_to_array["token_to_future_traj_wrt_ego"] = None
@@ -982,6 +983,7 @@ class DataProcessor(object):
     def _get_future_tracked_objects_array_list(
         self,
         scenario: NuPlanScenario,
+        token_to_id: Dict[str, int],
         iteration: int = 0,
         future_time_horizon: Optional[float] = None,
         num_samples: Optional[int] = None,
@@ -1037,7 +1039,8 @@ class DataProcessor(object):
             for tracked_objects in scenario.get_future_tracked_objects(
                 iteration=iteration,
                 time_horizon=future_time_horizon,
-                num_samples=num_samples)
+                num_samples=num_samples,
+            )
         ]
 
         # [현재] + [미래들] 을 하나의 시퀀스로 합친다.
@@ -1048,12 +1051,14 @@ class DataProcessor(object):
         # cur_fut_agents_world_8_list: List[np.ndarray]
         #   - 각 원소: (frame_agents_num, 8)
         # token_to_id: Dict[str, int]
-        (cur_fut_agents_world_8_list, _, token_to_id
-        ) = sampled_tracked_objects_to_array_list(sampled_future_observations)
+        (cur_fut_agents_world_8_list, _,
+         token_to_id) = sampled_tracked_objects_to_array_list(
+             sampled_future_observations, token_to_id)
 
         return cur_fut_agents_world_8_list, token_to_id
 
-    def save_to_disk(self, dir: str, final_file_name: str, data: Dict[str, np.ndarray]) -> None:
+    def save_to_disk(self, dir: str, final_file_name: str,
+                     data: Dict[str, np.ndarray]) -> None:
         """샘플 데이터를 안전하게 디스크에 저장한다(.npz, 원자적 저장 방식).
 
         이 함수는 한 시나리오에서 만들어진 모든 넘파이 배열과 메타 정보를

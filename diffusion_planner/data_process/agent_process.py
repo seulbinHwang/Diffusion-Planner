@@ -105,6 +105,7 @@ def _extract_agent_array(
 
 def sampled_tracked_objects_to_array_list(
     tracked_objects_list: List[Union[TrackedObjects, DetectionsTracks]],
+    token_to_id: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[np.ndarray], List[List[TrackedObjectType]], Dict[str, int]]:
     """여러 시점의 감지 결과를 프레임별 에이전트 배열 리스트로 바꾸는 함수.
 
@@ -149,8 +150,8 @@ def sampled_tracked_objects_to_array_list(
     past_cur_agents_types_list: List[List[TrackedObjectType]] = []
 
     # track_token(문자열) → int ID
-    token_to_id: Dict[str, int] = {}
-
+    if token_to_id is None:
+        token_to_id: Dict[str, int] = {}
     for timestep_idx in range(len(tracked_objects_list)):
         # 현재 시점의 원시 감지 결과
         if type(tracked_objects_list[timestep_idx]) == DetectionsTracks:
@@ -975,7 +976,8 @@ def _compute_valid_sorted_indices(
 
     # filter_radius 내의 에이전트만 후보로 사용
     if filter_radius is not None:
-        valid_mask = dist_from_cur_agent_to_ego <= float(filter_radius) # (current_agents_num,)
+        valid_mask = dist_from_cur_agent_to_ego <= float(
+            filter_radius)  # (current_agents_num,)
         valid_indices = np.nonzero(valid_mask)[0]  # (M,)
     else:
         valid_indices = np.arange(current_agents_num,
@@ -1063,7 +1065,9 @@ def _select_indices_with_type_cap(
 def _build_neighbor_vectors(
         all_frame_np_agents_local: np.
     ndarray,  # (num_frames, current_agents_num, 9)
-        current_agent_types_list: List[TrackedObjectType], # List[TrackedObjectType],  # 길이 = current_agents_num
+        current_agent_types_list:
+    List[
+        TrackedObjectType],  # List[TrackedObjectType],  # 길이 = current_agents_num
         agents_states_dim: int,
         agents_cur_frame_indices: np.ndarray,  # (chosen_agent_num,)
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1242,7 +1246,8 @@ def _select_neighbor_agents_and_build_past(
         # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ max_agent_num
         agents_cur_frame_indices = _select_indices_with_type_cap(
             sorted_cur_agent_indices=sorted_cur_agent_indices,
-            current_agent_types_list=current_agent_types_list, # List[TrackedObjectType],  # 길이 = current_agents_num
+            current_agent_types_list=
+            current_agent_types_list,  # List[TrackedObjectType],  # 길이 = current_agents_num
             max_agent_num=max_agent_num,
             max_pedestrians=max_pedestrians,
             max_bicycles=max_bicycles,
@@ -1268,7 +1273,8 @@ def _select_neighbor_agents_and_build_past(
     neighbor_agents_past, neighbors_id = _build_neighbor_vectors(
         all_frame_np_agents_local=
         all_frame_np_agents_local,  # (num_frames, current_agents_num, 9)
-        current_agent_types_list=current_agent_types_list, # List[TrackedObjectType],  # 길이 = current_agents_num
+        current_agent_types_list=
+        current_agent_types_list,  # List[TrackedObjectType],  # 길이 = current_agents_num
         agents_states_dim=agents_states_dim,
         agents_cur_frame_indices=agents_cur_frame_indices,  # (chosen_agent_num,)
     )
