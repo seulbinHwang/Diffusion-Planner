@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export CUDA_LAUNCH_BLOCKING=1
 
 export PYTHONUNBUFFERED=1
 
@@ -57,11 +58,13 @@ echo "[Preflight] Done."
 #    --no-progress
 #echo "Finish downloading processed dataset"
 
-#export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 LOG_DIR=/mnt/nuplan/logs/$RUN_ID
 mkdir -p "$LOG_DIR"
+
+#export CUDA_VISIBLE_DEVICES=2,3
+
 
 # 디버그: 파이썬/CPP 스택, NCCL 조기실패
 export TORCH_SHOW_CPP_STACKTRACES=1
@@ -73,7 +76,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # CPU에서 돌아가는 연산(전처리, 일부 텐서 연산, BLAS 등)의 스레드 수를 컨트롤해서, GPU 학습 중 CPU 과도한 스레드 난립 방지
 printf "[ENV] %-28s %s\n" "OMP_NUM_THREADS:"            "${OMP_NUM_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
-DEBUG_LOG=0   # 1: 상세 디버그, 0: 일반 학습
+DEBUG_LOG=1   # 1: 상세 디버그, 0: 일반 학습
 
 if (( DEBUG_LOG )); then
   export NCCL_DEBUG=INFO
@@ -94,11 +97,11 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --port 23002 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "feasible_full_time_gpu_2_grad_flow_exp_B" \
-  --batch_size 1792 \
+  --name "feasible_full_time_gpu_2_grad_flow_no_direct_loss_exp_B" \
+  --batch_size 1024 \
   --seed 7777 \
   --sampler_epoch_offset 1000 \
 --feasible_grad_to_dit true \
+--use_direct_loss false \
 --profile_feasible false \
   "$@"
-#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
