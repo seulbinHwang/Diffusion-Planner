@@ -61,11 +61,11 @@ def get_args():
     parser.add_argument('--agent_num',
                         type=int,
                         help='number of agents',
-                        default=32)
+                        default=448)
     parser.add_argument('--max_agent_num',
                         type=int,
                         help='number of agents',
-                        default=128)
+                        default=448)
 
     parser.add_argument('--static_objects_state_dim',
                         type=int,
@@ -143,19 +143,6 @@ def get_args():
                         type=boolean)
     parser.add_argument('--use_guidance', default=False, type=boolean)
     parser.add_argument('--use_feasible_blend', default=False, type=boolean)
-    parser.add_argument('--make_statistics_when_caching', default=False, type=boolean)
-
-    # parser.add_argument(
-    #     '--pin-mem',
-    #     action='store_true',
-    #     help=
-    #     'Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.'
-    # )
-    # parser.add_argument('--no-pin-mem',
-    #                     action='store_false',
-    #                     dest='pin_mem',
-    #                     help='')
-    # parser.set_defaults(pin_mem=True)
 
     # Training
     parser.add_argument('--seed',
@@ -260,6 +247,52 @@ def get_args():
                         help='use ddp or not')
     parser.add_argument('--port', default='22323', type=str, help='port')
 
+    # caching
+    parser.add_argument(
+        '--scenarios_cache_in',  # 2) 불러올 파일
+        type=str,
+        default='scenarios_cache.pkl',  #None,
+        help='미리 저장해둔 시나리오 *.pkl 경로 (지정 시 DB 로딩 건너뜀)',
+    )
+    parser.add_argument(
+        '--scenarios_cache_out',  # 1) 저장할 파일
+        type=str,
+        default=None,  #'scenarios_cache.pkl',
+        help='새로 추출한 시나리오를 저장할 *.pkl 경로',
+    )
+    parser.add_argument('--data_path',
+                        default='/data/nuplan-v1.1/trainval',
+                        type=str,
+                        help='path to raw data')
+    parser.add_argument('--map_path',
+                        default='/data/nuplan-v1.1/maps',
+                        type=str,
+                        help='path to map data')
+    parser.add_argument('--save_path',
+                        default='./cache',
+                        type=str,
+                        help='path to save processed data')
+    parser.add_argument('--scenarios_per_type',
+                        type=int,
+                        default=None,
+                        help='number of scenarios per type')
+    parser.add_argument('--total_scenarios',
+                        type=int,
+                        default=1,
+                        help='limit total number of scenarios')
+    parser.add_argument('--shuffle_scenarios',
+                        type=bool,
+                        default=False,
+                        help='shuffle scenarios')
+    parser.add_argument('--reset_save_path',
+                        type=bool,
+                        default=False,
+                        help='shuffle scenarios')
+    parser.add_argument('--save_image',
+                        type=bool,
+                        default=True,
+                        help='shuffle scenarios')
+    parser.add_argument('--make_statistics_when_caching', default=False, type=boolean)
     args = parser.parse_args()
     if not args.use_direct_loss:
         assert not args.use_guidance and not args.use_feasible_blend, \

@@ -5,7 +5,8 @@ from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon, FancyArrowPatch
+from matplotlib.patches import Polygon, FancyArrowPatch, Circle
+
 from matplotlib.colors import to_rgba
 
 Array = np.ndarray
@@ -111,7 +112,7 @@ class DrawingOptions:
     ######### [EGO] ##############
     ########### [EGO] PAST ##################
     EGO_draw_ego_past: bool = True  # check
-    EGO_draw_ego_only_current: bool = True  # check
+    EGO_draw_ego_only_current: bool = False  # check
     EGO_past_style = {
         "fill_color": WHITE,  # 흰색
         "line_color": GRAY,  # 회색
@@ -119,10 +120,14 @@ class DrawingOptions:
         "fill_alpha_current": 0.8,
     }
     EGO_draw_ego_past_vel: bool = True  # check
-
+    # NEW: ego 주변 반경 원 옵션
+    EGO_draw_radius_circle: bool = True         # ego 주변 원을 그릴지 여부
+    EGO_radius_circle_m: float = 150.0           # 원 반지름 [m]
+    EGO_radius_circle_edge_color: str = RED      # 원 테두리 색
+    EGO_radius_circle_line_width: float = 0.8    # 원 테두리 두께
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    EGO_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = False
     EGO_next_11_dim_style = {
@@ -145,7 +150,7 @@ class DrawingOptions:
     }
     EGO_draw_planner_velocity: bool = True  # check
     ########## [EGO] FUTURE EGO GT 11 ##########
-    EGO_draw_ego_future_gt_11_dim: bool = False
+    EGO_draw_ego_future_gt_11_dim: bool = True
     EGO_future_gt_11_style = {
         "line_color": CYAN,
         "line_width": 0.2,
@@ -159,9 +164,9 @@ class DrawingOptions:
     ######### [NEIGHBOR] #########
     ########### [NEIGHBOR] PAST ##################
     NEI_draw_neighbor_past: bool = True  # check
-    NEI_draw_neighbor_only_current: bool = True  # check
+    NEI_draw_neighbor_only_current: bool = False  # check
     NEI_draw_velocity_arrow: bool = False  # check
-    NEI_draw_velocity_text: bool = True  # check
+    NEI_draw_velocity_text: bool = False  # check
     NEI_vel_text_y_offset: float = 0.5
     NEI_vel_text_color = CYAN
     NEI_vel_text_fontsize = 5
@@ -209,14 +214,21 @@ class DrawingOptions:
     ########################
     ######### [NEIGHBOR] FUTURE GT #############
     DIFF_draw_diff_future_gt_3_dim: bool = False
+    # NEW: neighbor_future_gt_3_dim (numpy 버전) on/off
+    DIFF_draw_diff_np_future_gt_3_dim: bool = True
     DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
+
+    # NEW: GT 3차원 궤적 그리기 모드 ("point" / "line" / "arrow")
+    DIFF_future_gt_3_dim_draw_mode: str = "line"
+    DIFF_future_gt_3_dim_line_width: float = 0.8
+    DIFF_future_gt_3_dim_arrow_len_m: float = 1.0
+
     DIFF_draw_diff_future_gt_3_dim_token: bool = False
     DIFF_future_gt_3_dim_text_offset_m: float = 0.  # 번호 텍스트를 포인트 옆으로 얼마나 띄울지(미터)
     DIFF_future_gt_3_dim_token_color: str = BRIGHT_CYAN
     DIFF_future_gt_3_dim_token_fontsize: int = 4  # 에이전트 번호 텍스트 폰트 크기
     ############################################
-    DIFF_draw_diff_future_all_gt_3_dim: bool = True
     DIFF_future_all_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_all_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
     DIFF_draw_diff_future_all_gt_3_dim_token: bool = False
@@ -519,56 +531,181 @@ def is_valid_future_row_xyyaw(row3: Array, eps: float) -> bool:
         raise ValueError("neighbor_agents_future의 마지막 차원은 3이어야 합니다.")
     return bool((abs(float(row3[0])) > eps) or (abs(float(row3[1])) > eps))
 
-
 def draw_neighbor_future_gt_3_dim(
-        ax: plt.Axes,
-        diff_token_to_future_gt_3_dim: Dict[str, Array],
-        options,
-        draw_token_list: Optional[List[str]] = None) -> None:
+    ax: plt.Axes,
+    diff_token_to_future_gt_3_dim: Dict[str, Array],
+    options: DrawingOptions,
+    draw_token_list: Optional[List[str]] = None,
+) -> None:
+    """이웃 차량의 GT 미래 궤적(토큰별 [x, y, yaw] 시퀀스)을 그린다.
+
+    모드별 동작
+    -----------
+    - "point":
+        각 (x, y)를 독립된 점('x' 마커)으로 그림. (현재 동작과 동일)
+    - "line":
+        유효한 점들끼리 앞뒤 순서대로 선으로 이어 그림.
+    - "arrow":
+        각 (x, y)에서 yaw 방향으로 고정 길이 화살표를 그림.
+        (길이: options.DIFF_future_gt_3_dim_arrow_len_m)
+
+    Args:
+        ax:
+            Matplotlib 축 객체.
+        diff_token_to_future_gt_3_dim:
+            key = track_token(str),
+            value = shape (T, 3) 의 배열. 각 행은 [x, y, yaw].
+        options:
+            DrawingOptions. invalid_eps, 색상/선두께/모드 설정을 사용한다.
+        draw_token_list:
+            특정 토큰만 그릴 때 사용하는 필터 리스트. None이면 전체 토큰을 그림.
     """
-    # Dict[str, np.ndarray] # len : valid_agent_num
+    eps: float = options.invalid_eps
+    draw_mode: str = options.DIFF_future_gt_3_dim_draw_mode
 
-    neighbor_future_gt_3_dim (agent_num, future_len, 3=[x,y,yaw])를
-    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..agent_num-1)를 흰색으로 표기.
+    if draw_mode not in ("point", "line", "arrow"):
+        raise ValueError(
+            f"지원하지 않는 DIFF_future_gt_3_dim_draw_mode 값입니다: {draw_mode!r}. "
+            f"'point', 'line', 'arrow' 중 하나여야 합니다."
+        )
 
-    규칙:
-      - invalid: |x|<=eps and |y|<=eps → 스킵
-      - 마커: 흰색 'x', 선 없음
-      - 라벨: 첫 점이 유효할 때만 표시
-    """
-
-    eps = options.invalid_eps
     for track_token, future_gt_3_dim in diff_token_to_future_gt_3_dim.items():
+        # future_gt_3_dim: (T, 3)
         if draw_token_list is not None and track_token not in draw_token_list:
             continue
-        future_len = future_gt_3_dim.shape[0]
-        # 모든 유효 포인트를 x마커로 그리기
+
+        if future_gt_3_dim.ndim != 2 or future_gt_3_dim.shape[1] != 3:
+            raise ValueError(
+                f"future_gt_3_dim 의 shape 은 (T, 3) 이어야 합니다. got {future_gt_3_dim.shape}"
+            )
+
+        future_len: int = int(future_gt_3_dim.shape[0])
+
+        # 선 모드일 때 인접 포인트 연결을 위한 이전 점 저장용
+        prev_xy: Optional[Tuple[float, float]] = None
+
         for t in range(future_len):
-            row = future_gt_3_dim[t]
+            row: Array = future_gt_3_dim[t]  # shape: (3,) = [x, y, yaw]
             if not is_valid_future_row_xyyaw(row, eps):
                 continue
-            x, y = float(row[0]), float(row[1])
-            ax.plot(x,
-                    y,
-                    marker='x',
-                    markersize=options.DIFF_future_gt_3_dim_marker_size,
-                    linestyle='None',
-                    color=options.DIFF_future_gt_3_dim_COLOR,
-                    zorder=26)
-        # 첫 점 라벨(유효할 때만)
-        if options.DIFF_draw_diff_future_gt_3_dim_token:
-            first = future_gt_3_dim[0]
-            if is_valid_future_row_xyyaw(first, eps):
-                fx, fy = float(first[0]), float(first[1])
-                ax.text(fx + options.DIFF_future_gt_3_dim_text_offset_m,
-                        fy + options.DIFF_future_gt_3_dim_text_offset_m,
-                        str(track_token)[:5],
-                        color=options.DIFF_future_gt_3_dim_token_color,
-                        fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
-                        ha='left',
-                        va='bottom',
-                        zorder=30)
 
+            x: float = float(row[0])
+            y: float = float(row[1])
+            yaw: float = float(row[2])
+
+            if draw_mode == "point":
+                # 점 모드: 기존 동작 유지
+                ax.plot(
+                    x,
+                    y,
+                    marker="x",
+                    markersize=options.DIFF_future_gt_3_dim_marker_size,
+                    linestyle="None",
+                    color=options.DIFF_future_gt_3_dim_COLOR,
+                    zorder=26,
+                )
+
+            elif draw_mode == "line":
+                # 선 모드: 인접 유효 점끼리 선으로 연결
+                if prev_xy is not None:
+                    px, py = prev_xy
+                    ax.plot(
+                        [px, x],
+                        [py, y],
+                        linestyle="-",
+                        linewidth=options.DIFF_future_gt_3_dim_line_width,
+                        color=options.DIFF_future_gt_3_dim_COLOR,
+                        zorder=26,
+                    )
+                prev_xy = (x, y)
+
+            elif draw_mode == "arrow":
+                # 화살표 모드: yaw 로부터 단위 방향 벡터 계산 후 고정 길이 화살표
+                cos_yaw: float = float(np.cos(yaw))
+                sin_yaw: float = float(np.sin(yaw))
+
+                add_velocity_arrow(
+                    ax=ax,
+                    x=x,
+                    y=y,
+                    vx=cos_yaw,
+                    vy=sin_yaw,
+                    length_m=options.DIFF_future_gt_3_dim_arrow_len_m,
+                    line_color=options.DIFF_future_gt_3_dim_COLOR,
+                    line_width=options.DIFF_future_gt_3_dim_line_width,
+                    line_alpha=None,
+                    zorder=26,
+                    t=t,
+                )
+
+        # 첫 점 라벨(유효할 때만)
+        if options.DIFF_draw_diff_future_gt_3_dim_token and future_len > 0:
+            first: Array = future_gt_3_dim[0]  # shape: (3,)
+            if is_valid_future_row_xyyaw(first, eps):
+                fx: float = float(first[0])
+                fy: float = float(first[1])
+                ax.text(
+                    fx + options.DIFF_future_gt_3_dim_text_offset_m,
+                    fy + options.DIFF_future_gt_3_dim_text_offset_m,
+                    str(track_token)[:5],
+                    color=options.DIFF_future_gt_3_dim_token_color,
+                    fontsize=options.DIFF_future_gt_3_dim_token_fontsize,
+                    ha="left",
+                    va="bottom",
+                    zorder=30,
+                )
+
+
+def _build_diff_token_to_future_gt_3_dim_from_neighbor_np(
+    neighbor_future_gt_3_dim: Array,          # shape: (chosen_agent_num, T, 3)
+    neighbor_track_token: List[str],          # 길이: chosen_agent_num
+) -> Dict[str, Array]:
+    """neighbor_future_gt_3_dim 배열을 토큰 딕셔너리 형태로 바꾼다.
+
+    이 함수는
+    - 각 에이전트 인덱스 i에 대해
+      neighbor_track_token[i] 를 key 로,
+      neighbor_future_gt_3_dim[i] (shape: (T, 3)) 를 value 로 쓰는
+      `diff_token_to_future_gt_3_dim` 딕셔너리를 만들어준다.
+
+    단, 길이나 모양이 맞지 않으면 바로 예외를 발생시켜
+    잘못된 입력을 조기에 잡는다.
+
+    Args:
+        neighbor_future_gt_3_dim (np.ndarray):
+            shape = (chosen_agent_num, T, 3).
+            각 행 = 한 에이전트의 [x, y, yaw] 시퀀스.
+        neighbor_track_token (List[str]):
+            길이 = chosen_agent_num.
+            각 에이전트에 대응되는 track_token 문자열 리스트.
+
+    Returns:
+        Dict[str, np.ndarray]:
+            key   = track_token (문자열),
+            value = 해당 에이전트의 future_gt_3_dim 배열 (shape: (T, 3)).
+    """
+    arr: Array = np.asarray(neighbor_future_gt_3_dim)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        raise ValueError(
+            f"`neighbor_future_gt_3_dim`은 (chosen_agent_num, T, 3) 이어야 합니다. "
+            f"got {arr.shape}"
+        )
+
+    chosen_agent_num: int = int(arr.shape[0])
+    if len(neighbor_track_token) != chosen_agent_num:
+        raise ValueError(
+            f"`neighbor_track_token` 길이({len(neighbor_track_token)})와 "
+            f"`neighbor_future_gt_3_dim`의 첫 축({chosen_agent_num}) 이 다릅니다."
+        )
+
+    diff_token_to_future_gt_3_dim: Dict[str, Array] = {}
+    for agent_idx in range(chosen_agent_num):
+        token: str = neighbor_track_token[agent_idx]
+        # value: shape = (T, 3)
+        future_gt_3_dim_agent: Array = arr[agent_idx]
+        diff_token_to_future_gt_3_dim[token] = future_gt_3_dim_agent
+
+    return diff_token_to_future_gt_3_dim
 
 # =============================================================================
 # 옵션/스타일
@@ -1270,6 +1407,36 @@ def draw_ego_future_gt_11_dim(ax: plt.Axes, ego_future_gt_11_dim: Array,
             draw_velocity=options.EGO_draw_future_11_velocity,
         )
 
+def draw_ego_radius_circle(
+    ax: plt.Axes,
+    draw_option: DrawingOptions,
+) -> None:
+    """ego 를 원점(0,0)으로 보고, 그 주변에 빨간색 테두리 원을 그린다.
+
+    이 그림은 "ego 기준 좌표"라고 가정하고,
+    ego 위치를 (0, 0) 라고 보고 그 자리 중심으로 원을 그린다.
+
+    Args:
+        ax: Matplotlib 축 객체.
+        draw_option: 원을 그릴지 여부와 반경/색/두께 정보가 들어 있는 옵션.
+    """
+    # 옵션이 꺼져 있으면 아무 것도 그리지 않음
+    if not draw_option.EGO_draw_radius_circle:
+        return
+
+    radius_m: float = float(draw_option.EGO_radius_circle_m)
+
+    # 중심: (0, 0), 반지름: radius_m
+    circle: Circle = Circle(
+        (0.0, 0.0),                      # 중심 좌표 (ego 기준 좌표계)
+        radius_m,                        # 반지름 [m]
+        fill=False,                      # 안은 비우고
+        edgecolor=draw_option.EGO_radius_circle_edge_color,
+        linewidth=draw_option.EGO_radius_circle_line_width,
+        linestyle="--",
+        zorder=3,                        # 차선(1~2) 위, 차량(5~) 아래 정도
+    )
+    ax.add_patch(circle)
 
 # [Add]
 def draw_diff_future_gen_refined_traj(
@@ -1939,6 +2106,7 @@ def save_figure_to_png(fig: plt.Figure, save_path: str) -> None:
     """Figure를 PNG로 저장하고 Figure를 닫음."""
     plt.savefig(save_path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
+    print("[SUCCESS] Saved figure to:", save_path)
 
 
 # =============================================================================
@@ -2137,56 +2305,6 @@ def draw_neighbor_past_all(ax: plt.Axes,
                                   draw_option)
 
 
-def draw_diff_future_all_gt_3_dim(
-        ax: plt.Axes,
-        diff_token_to_future_all_gt_3_dim: Dict[str, Array],
-        options: DrawingOptions,
-        draw_token_list: Optional[List[str]] = None) -> None:
-    """near_future_all_gt_3_dim (Pnn, future_all_len, 3=[x,y,yaw])를
-    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..Pnn-1)를 흰색으로 표기.
-
-    규칙:
-      - invalid: |x|<=eps and |y|<=eps → 스킵
-      - 마커: 흰색 'x', 선 없음
-      - 라벨: 첫 점이 유효할 때만 표시
-    """
-
-    eps = options.invalid_eps
-    for track_token, future_all_gt_3_dim in diff_token_to_future_all_gt_3_dim.items(
-    ):
-        if draw_token_list is not None:
-            if track_token not in draw_token_list:
-                continue
-        future_all_len = future_all_gt_3_dim.shape[0]  # (future_all_len, 3)
-        # 모든 유효 포인트를 x마커로 그리기
-        for t in range(future_all_len):
-            row = future_all_gt_3_dim[t]
-            if not is_valid_future_row_xyyaw(row, eps):
-                continue
-            x, y = float(row[0]), float(row[1])
-            ax.plot(x,
-                    y,
-                    marker='x',
-                    markersize=options.DIFF_future_all_gt_3_dim_marker_size,
-                    linestyle='None',
-                    color=options.DIFF_future_all_gt_3_dim_COLOR,
-                    zorder=26)
-        # 첫 점 라벨(유효할 때만)
-        if options.DIFF_draw_diff_future_all_gt_3_dim_token:
-            first = future_all_gt_3_dim[0]
-            if is_valid_future_row_xyyaw(first, eps):
-                fx, fy = float(first[0]), float(first[1])
-                ax.text(
-                    fx + options.DIFF_future_all_gt_3_dim_text_offset_m,
-                    fy + options.DIFF_future_all_gt_3_dim_text_offset_m,
-                    str(track_token)[:5],
-                    color=options.DIFF_future_all_gt_3_dim_token_color,
-                    fontsize=options.DIFF_future_all_gt_3_dim_token_fontsize,
-                    ha='left',
-                    va='bottom',
-                    zorder=30)
-
-
 def draw_neighbor_future_all(ax: plt.Axes,
                              input_data: WorldModelFeature,
                              output_data: Optional[Dict[str, Any]],
@@ -2195,10 +2313,58 @@ def draw_neighbor_future_all(ax: plt.Axes,
     ### [NEIGHBOR FUTURE GT] ###
     diff_token_to_future_gt_3_dim = input_data.get(
         "diff_token_to_future_gt_3_dim", None)
-    if draw_option.DIFF_draw_diff_future_gt_3_dim and (
+
+    # NEW: numpy 버전 neighbor_future_gt_3_dim 사용
+    neighbor_future_gt_3_dim: Optional[Array] = input_data.get(
+        "neighbor_future_gt_3_dim", None
+    )
+    neighbor_track_token: Optional[List[str]] = input_data.get(
+        "neighbor_track_token", None
+    )
+
+    if draw_option.DIFF_draw_diff_np_future_gt_3_dim:
+        # 설정 충돌 방지: 둘 다 True면 에러
+        if draw_option.DIFF_draw_diff_future_gt_3_dim:
+            raise ValueError(
+                "DIFF_draw_diff_np_future_gt_3_dim=True 인 경우 "
+                "DIFF_draw_diff_future_gt_3_dim 는 반드시 False 여야 합니다."
+            )
+        if neighbor_future_gt_3_dim is None:
+            raise ValueError(
+                "DIFF_draw_diff_np_future_gt_3_dim=True 인데 "
+                "`neighbor_future_gt_3_dim` 이 input_data 에 없습니다."
+            )
+        if neighbor_track_token is None:
+            raise ValueError(
+                "DIFF_draw_diff_np_future_gt_3_dim=True 인데 "
+                "`neighbor_track_token` 이 input_data 에 없습니다."
+            )
+
+        # numpy (agent_num, T, 3) + track_token 리스트 → dict[str, (T,3)]
+        diff_token_to_future_gt_3_dim_from_np: Dict[str, Array] = (
+            _build_diff_token_to_future_gt_3_dim_from_neighbor_np(
+                neighbor_future_gt_3_dim=neighbor_future_gt_3_dim,
+                neighbor_track_token=neighbor_track_token,
+            )
+        )
+
+        draw_neighbor_future_gt_3_dim(
+            ax,
+            diff_token_to_future_gt_3_dim_from_np,
+            draw_option,
+            draw_token_list,
+        )
+
+    # 기존 dict 버전 사용하는 경우
+    elif draw_option.DIFF_draw_diff_future_gt_3_dim and (
             diff_token_to_future_gt_3_dim is not None):
-        draw_neighbor_future_gt_3_dim(ax, diff_token_to_future_gt_3_dim,
-                                      draw_option, draw_token_list)
+        draw_neighbor_future_gt_3_dim(
+            ax,
+            diff_token_to_future_gt_3_dim,
+            draw_option,
+            draw_token_list,
+        )
+
     ### [NEIGHBOR FUTURE OUTPUT] ###
     diff_token_to_np_gen_traj_11_wrt_ego = output_data.get(
         "diff_token_to_np_gen_traj_11_wrt_ego", None)
@@ -2210,24 +2376,7 @@ def draw_neighbor_future_all(ax: plt.Axes,
                                    diff_token_to_np_int_traj_wrt_ego,
                                    diff_token_to_np_int_traj_11_wrt_ego,
                                    draw_option, draw_token_list)
-    # 최종 출력물
-    diff_token_to_interp_np_traj_wrt_ego = output_data.get(
-        "diff_token_to_interp_np_traj_wrt_ego", None)
-    diff_token_to_next_wp_wrt_ego = output_data.get(
-        "diff_token_to_next_wp_wrt_ego", None)
-    if draw_option.DIFF_draw_diff_future_gen_refined_traj:
-        draw_diff_future_gen_refined_traj(ax,
-                                          diff_token_to_interp_np_traj_wrt_ego,
-                                          draw_option,
-                                          diff_token_to_next_wp_wrt_ego,
-                                          draw_token_list)
-    diff_token_to_future_all_gt_3_dim = input_data.get(
-        "diff_token_to_future_all_gt_3_dim", None)  # (future_all_len, 3)
-    if draw_option.DIFF_draw_diff_future_all_gt_3_dim and (
-            diff_token_to_future_all_gt_3_dim is not None):
-        draw_diff_future_all_gt_3_dim(ax, diff_token_to_future_all_gt_3_dim,
-                                      draw_option, draw_token_list)
-    ########################################
+
 
 
 def draw_neighbor(ax: plt.Axes,
@@ -2312,6 +2461,8 @@ def draw_world_model_to_png(
     #########################################
     draw_lane(ax, input_data, draw_option, draw_token_list)
     draw_ego(ax, input_data, draw_option)
+    # NEW: ego 주변 반경 원
+    draw_ego_radius_circle(ax, draw_option)
     draw_neighbor(ax, input_data, output_data, draw_option, draw_token_list)
     #########################################
 

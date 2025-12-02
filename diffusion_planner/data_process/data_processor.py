@@ -188,6 +188,7 @@ class DataProcessor(object):
             token: 시나리오 토큰
             stats: 저장할 통계 딕셔너리
         """
+        print("self._save_dir:", self._save_dir)
         if not self._save_dir:
             return
         os.makedirs(self._save_dir, exist_ok=True)
@@ -870,7 +871,6 @@ class DataProcessor(object):
             assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
                 f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
 
-            # (num_agents, future_len, 3)
             # cur_fut_agents_world_8_list: List[ np.ndarray ((frame_agents_num, 8)) ]
             # 길이: 1 + num_future_poses
             # frame_agents_num: 각 프레임마다 다름
@@ -962,18 +962,21 @@ class DataProcessor(object):
                                              stats_payload)
 
             ############################################
-            self.save_to_disk(self._save_dir, key_to_array)
+            final_file_name = f"{key_to_array['map_name']}_{key_to_array['token']}"
 
+            self.save_to_disk(self._save_dir, final_file_name, key_to_array)
+            key_to_array[
+                "neighbor_track_token"] = neighbor_track_token  # List[str], (chosen_agent_num,)
             if self.config.save_image:
                 # 디버깅용 그림 그리기
                 save_dir = os.path.join(self._save_dir, "debug_vis")
                 save_path = os.path.join(save_dir,
-                                         f"{map_name}_{scenario_token}.png")
+                                         f"{final_file_name}.png")
                 os.makedirs(save_dir, exist_ok=True)
-                print("Visualizing scenario:", map_name, scenario_token)
+                print("Visualizing scenario:", save_path)
                 key_to_array["token_to_future_traj_wrt_ego"] = None
                 draw_machine.draw_world_model_to_png(key_to_array,
-                                                     output_data=None,
+                                                     output_data={},
                                                      save_path=save_path)
 
     def _get_future_tracked_objects_array_list(
@@ -1050,7 +1053,7 @@ class DataProcessor(object):
 
         return cur_fut_agents_world_8_list, token_to_id
 
-    def save_to_disk(self, dir: str, data: Dict[str, np.ndarray]) -> None:
+    def save_to_disk(self, dir: str, final_file_name: str, data: Dict[str, np.ndarray]) -> None:
         """샘플 데이터를 안전하게 디스크에 저장한다(.npz, 원자적 저장 방식).
 
         이 함수는 한 시나리오에서 만들어진 모든 넘파이 배열과 메타 정보를
@@ -1074,7 +1077,7 @@ class DataProcessor(object):
         4) 임시 파일에 `np.savez` 로 모든 데이터를 쓴 뒤:
            - `f.flush()` 로 버퍼를 비우고
            - `os.fsync(f.fileno())` 로 디스크에 강제로 기록한다.
-        5) 모든 것이 성공하면 `os.replace(tmp_path, final_path)` 로
+        5) 모든 것이 성공하면 `os.replace(tmp_path, final_file_name)` 로
            임시 파일을 최종 파일 이름으로 한 번에 교체한다.
            → 이 순간만 파일이 바뀌므로, 중간 상태의 깨진 파일이 보이지 않는다.
         6) 도중에 예외가 나면:
@@ -1089,11 +1092,15 @@ class DataProcessor(object):
                 - 저장할 키-값 딕셔너리.
 
         """
+        final_path_npz = f"{final_file_name}.npz"
+        final_path = f"{dir}/{final_path_npz}"
+
         os.makedirs(dir, exist_ok=True)
-        final_path = f"{dir}/{data['map_name']}_{data['token']}.npz"
         tmp_path = final_path + ".tmp"
 
         try:
+            print("!!!!!!!!!!![TRY] NPZ saved to:", final_path)
+
             # 1) 임시 파일에 먼저 완전히 기록
             with open(tmp_path, "wb") as f:
                 np.savez(f, **data)
@@ -1102,7 +1109,6 @@ class DataProcessor(object):
 
             # 2) 원자적 치환(부분 파일이 최종 경로에 나타나지 않음)
             os.replace(tmp_path, final_path)
-
         except Exception:
             # 실패 시 임시파일만 제거(최종 파일은 손대지 않음)
             if os.path.exists(tmp_path):

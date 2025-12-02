@@ -1,6 +1,6 @@
 # ==== CPU-ONLY & THREADING GUARD (must be first) ==============================
 import os as _os
-
+import args_util
 # ---- GPU 완전 차단 ----
 _os.environ["CUDA_VISIBLE_DEVICES"] = ""
 _os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
@@ -297,7 +297,7 @@ def _plot_and_save_histograms(
 
 
 # [추가] 전역 CPU 고정값(기본 128). 환경변수 DP_MAX_CPUS로 덮어쓰기 가능
-DP_MAX_CPUS = int(os.environ.get("DP_MAX_CPUS", "96"))
+# DP_MAX_CPUS = int(os.environ.get("DP_MAX_CPUS", "96"))
 
 # [추가] 과다 스레딩 방지(각 워커 프로세스 내부 스레드 1로 고정)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -324,7 +324,7 @@ def available_cpu_count() -> int:
     1) Linux & Python 3.9+ : os.sched_getaffinity(0)
     2) 그 외 : os.cpu_count()  (fallback)
     """
-    return DP_MAX_CPUS
+    # return DP_MAX_CPUS
     try:
         return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
         print(f"Available CPUs: {return_}")  # 디버그용
@@ -567,101 +567,10 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Data Processing')
-    parser.add_argument(
-        '--scenarios_cache_in',  # 2) 불러올 파일
-        type=str,
-        default='scenarios_cache.pkl',  #None,
-        help='미리 저장해둔 시나리오 *.pkl 경로 (지정 시 DB 로딩 건너뜀)',
-    )
-    parser.add_argument(
-        '--scenarios_cache_out',  # 1) 저장할 파일
-        type=str,
-        default=None,  #'scenarios_cache.pkl',
-        help='새로 추출한 시나리오를 저장할 *.pkl 경로',
-    )
-    parser.add_argument('--data_path',
-                        default='/data/nuplan-v1.1/trainval',
-                        type=str,
-                        help='path to raw data')
-    parser.add_argument('--map_path',
-                        default='/data/nuplan-v1.1/maps',
-                        type=str,
-                        help='path to map data')
-    parser.add_argument('--save_path',
-                        default='./cache',
-                        type=str,
-                        help='path to save processed data')
-    parser.add_argument('--scenarios_per_type',
-                        type=int,
-                        default=None,
-                        help='number of scenarios per type')
-    parser.add_argument('--total_scenarios',
-                        type=int,
-                        default=10,
-                        help='limit total number of scenarios')
-    parser.add_argument('--shuffle_scenarios',
-                        type=bool,
-                        default=False,
-                        help='shuffle scenarios')
-    parser.add_argument('--reset_save_path',
-                        type=bool,
-                        default=False,
-                        help='shuffle scenarios')
-    parser.add_argument('--agent_num',
-                        type=int,
-                        default=448,
-                        help='number of agents')
-    parser.add_argument('--static_objects_num',
-                        type=int,
-                        default=5,
-                        help='number of static objects')
-    parser.add_argument('--lane_len',
-                        type=int,
-                        default=20,
-                        help='number of lane point')
-    parser.add_argument('--lane_num',
-                        type=int,
-                        default=100,
-                        help='number of lanes')
-    parser.add_argument('--route_len',
-                        type=int,
-                        default=20,
-                        help='number of route lane point')
-    parser.add_argument('--route_num',
-                        type=int,
-                        default=25,
-                        help='number of route lanes')
-    # ────── WandB 옵션 추가 ──────
-    parser.add_argument('--use_wandb', default=False, type=boolean)
-    parser.add_argument('--save_image', default=False, type=boolean)
+    args = args_util.get_args()
 
-    parser.add_argument('--wandb_project',
-                        type=str,
-                        default='Diffusion-Planner',
-                        help='wandb project')
-    parser.add_argument('--wandb_entity',
-                        type=str,
-                        default=None,
-                        help='wandb entity (team or user)')
-    parser.add_argument('--name',
-                        type=str,
-                        help='log name (default: "diffusion-planner-training")',
-                        default="test_0727")  # npc_current_state_aug_0.5
-    # (인자 정의는 동일)
-    args = parser.parse_args()
     sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
-    if args.use_wandb:
-        os.environ["WANDB_MODE"] = "online" if args.use_wandb else "offline"
-        ctrl_run = wandb.init(
-            project=args.wandb_project,
-            name=args.name,
-            entity=args.wandb_entity,
-            settings=wandb.Settings(start_method="fork"),
-        )
-    else:
-        ctrl_run = None
-    args.wandb_group = ctrl_run.id if ctrl_run else None
+    ctrl_run = None
     # 1) 저장 폴더
     if args.reset_save_path:
         # 기존 폴더 삭제 후 새로 생성
@@ -670,7 +579,7 @@ if __name__ == "__main__":
             if ans == 'y':
                 shutil.rmtree(args.save_path)
                 print(f"Removed existing save path: {args.save_path}")
-
+    print("save_path:", args.save_path)
     os.makedirs(args.save_path, exist_ok=True)
 
     # 2) 이미 생성된 .npz 확인
@@ -774,9 +683,10 @@ if __name__ == "__main__":
     print(f"Saved {len(npz_files)} .npz file names")
 
     # 집계 & 히스토그램 저장
-    stats = _load_all_sample_stats(args.save_path)
-    save_path = os.path.join(args.save_path, "histograms")
-    os.makedirs(save_path, exist_ok=True)
-    hist_png = os.path.join(args.save_path, "dataset_statistics_histograms.png")
-    _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-world model")
-    print(f"Saved histogram PNG: {hist_png}")
+    if args.make_statistics_when_caching:
+        stats = _load_all_sample_stats(args.save_path)
+        save_path = os.path.join(args.save_path, "histograms")
+        os.makedirs(save_path, exist_ok=True)
+        hist_png = os.path.join(save_path, "dataset_statistics_histograms.png")
+        _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-world model")
+        print(f"Saved histogram PNG: {hist_png}")
