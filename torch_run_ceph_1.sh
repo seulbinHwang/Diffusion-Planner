@@ -99,5 +99,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --batch_size 1792 \
   --profile_feasible false \
   --use_vel_input true \
+  --resume_model_from_wandb latest \
   "$@"
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
