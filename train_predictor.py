@@ -449,7 +449,7 @@ def model_training(args):
 	    인덱스→파일 경로 매핑을 제공
 	•	__len__은 샘플 개수(목록 길이) 를, 
 	    __getitem__(idx)는 idx번째 npz를 로드해서 
-	        agent_num, predicted_neighbor_num, future_len에 맞게 필요 채널만 잘라 
+	        max_agent_num, predicted_neighbor_num, future_len에 맞게 필요 채널만 잘라 
 	        모델이 기대하는 튜플(batch 항목 순서 고정) 로 반환
 	•	즉, DataLoader/DistributedSampler가 순회할 단일 샘플 로더를 정의해 주는 역할이며, 
 	    셔플·분산 분배는 Sampler가 담당
@@ -458,7 +458,7 @@ def model_training(args):
         args.train_set,  # "/mnt/nuplan/dataset/processed"
         args.
         train_set_list,  # "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
-        args.agent_num,
+        args.max_agent_num,
         args.predicted_neighbor_num,
         args.future_len)
     """ DistributedSampler

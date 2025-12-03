@@ -52,7 +52,7 @@ class DataProcessor(object):
         self.future_time_horizon = 8  # [seconds]
         self.num_future_poses = 10 * self.future_time_horizon
 
-        self.max_agent_num = config.max_agent_num
+        self.caching_max_agent_num = config.caching_max_agent_num
         self.max_static_num = config.max_static_num
         # [변경] 타입별 상한 신설: 보행자/자전거
         self.max_pedestrians = None  #getattr(config, "max_pedestrians", 7)  #128)
@@ -188,7 +188,6 @@ class DataProcessor(object):
             token: 시나리오 토큰
             stats: 저장할 통계 딕셔너리
         """
-        print("self._save_dir:", self._save_dir)
         if not self._save_dir:
             return
         os.makedirs(self._save_dir, exist_ok=True)
@@ -413,7 +412,7 @@ class DataProcessor(object):
          neighbor_track_token) = build_neighbor_past_feature(
              past_cur_agents_world_8_list=past_cur_agents_world_8_list,
              past_cur_agents_types_list=past_cur_agents_types_list,
-             max_agent_num=self.max_agent_num,
+             caching_max_agent_num=self.caching_max_agent_num,
              ego_cur_pose_np=ego_cur_pose_np,
              max_pedestrians=self.max_pedestrians,
              max_bicycles=self.max_bicycles,
@@ -508,7 +507,7 @@ class DataProcessor(object):
                 neighbor_track_token=neighbor_track_token,
             )
 
-        # (agent_num, 11)
+        # (max_agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         map_key_to_array = map_process(
             route_roadblock_ids,
@@ -537,7 +536,7 @@ class DataProcessor(object):
     def zero_out_random_time_prefix(
             neighbor_agents_past: np.ndarray) -> np.ndarray:
         """주어진 neighbor_agents_past 텐서에서
-        (agent_num, time_len, feature_dim) 형태를 가정하고,
+        (max_agent_num, time_len, feature_dim) 형태를 가정하고,
         0 ~ time_len-1 사이에서 랜덤 target을 뽑아
         neighbor_agents_past[:, :target, :8] 구간을 0으로 만드는 함수.
 
@@ -565,8 +564,9 @@ class DataProcessor(object):
 
     def _merge_and_interpolate_neighbor_11dim(
             self,
-            neighbor_agents_past: np.ndarray,  # (agent_num, Tp, 11)
-            neighbor_future_with_current_11: np.ndarray,  # (agent_num, Tf, 11)
+            neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
+            neighbor_future_with_current_11: np.
+        ndarray,  # (max_agent_num, Tf, 11)
     ) -> Tuple[np.ndarray, np.ndarray]:
         """neighbor 과거/현재 궤적과 현재/미래 궤적을 이어 붙인 뒤,
         중간에 구멍이 뚫린 구간만 자연스럽게 채워준다.
@@ -597,27 +597,27 @@ class DataProcessor(object):
 
         Args:
             neighbor_agents_past (np.ndarray):
-                - shape: (agent_num, Tp, 11)
+                - shape: (max_agent_num, Tp, 11)
                 - 각 agent의 과거~현재 궤적.
             neighbor_future_with_current_11 (np.ndarray):
-                - shape: (agent_num, Tf, 11)
+                - shape: (max_agent_num, Tf, 11)
                 - 각 agent의 현재~미래 궤적.
                 - 인덱스 0이 현재 프레임이라고 가정한다.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]:
                 - new_neighbor_agents_past:
-                    · shape: (agent_num, Tp, 11)
+                    · shape: (max_agent_num, Tp, 11)
                     · 구멍이 채워진 과거~현재 궤적.
                 - new_neighbor_future_with_current_11:
-                    · shape: (agent_num, Tf, 11)
+                    · shape: (max_agent_num, Tf, 11)
                     · 구멍이 채워진 현재~미래 궤적.
         """
         # 기본 shape 검사
         if neighbor_agents_past.ndim != 3 or neighbor_future_with_current_11.ndim != 3:
             raise ValueError(
                 f"`neighbor_agents_past` / `neighbor_future_with_current_11`는 "
-                f"(agent_num, time_len, 11) 형태여야 합니다. "
+                f"(max_agent_num, time_len, 11) 형태여야 합니다. "
                 f"got {neighbor_agents_past.shape}, {neighbor_future_with_current_11.shape}"
             )
 
@@ -634,41 +634,41 @@ class DataProcessor(object):
                 "neighbor_agents_past 와 neighbor_future_with_current_11 의 agent 축 크기가 다릅니다."
             )
 
-        agent_num: int = neighbor_agents_past.shape[0]
+        max_agent_num: int = neighbor_agents_past.shape[0]
         past_len: int = neighbor_agents_past.shape[1]
         future_len: int = neighbor_future_with_current_11.shape[1]
 
         # agent 가 하나도 없거나, future 길이가 0이면 그냥 반환
-        if agent_num == 0 or future_len == 0:
+        if max_agent_num == 0 or future_len == 0:
             return neighbor_agents_past, neighbor_future_with_current_11
 
-        # (agent_num, Tf-1, 11)  — future 쪽의 "현재 프레임"(인덱스 0) 제거
+        # (max_agent_num, Tf-1, 11)  — future 쪽의 "현재 프레임"(인덱스 0) 제거
         neighbor_future_wo_current: np.ndarray = neighbor_future_with_current_11[:,
                                                                                  1:, :]
 
-        # full_traj_11: (agent_num, T_full, 11)
+        # full_traj_11: (max_agent_num, T_full, 11)
         #   T_full = past_len + (future_len - 1)
         full_traj_11: np.ndarray = np.concatenate(
             [neighbor_agents_past, neighbor_future_wo_current], axis=1)
 
-        # full_off_p_mask: (agent_num, T_full)  — True: 해당 프레임이 "빈 프레임"
-        # full_off_mask:   (agent_num,)        — True: 해당 agent 전체가 모두 빈 값
+        # full_off_p_mask: (max_agent_num, T_full)  — True: 해당 프레임이 "빈 프레임"
+        # full_off_mask:   (max_agent_num,)        — True: 해당 agent 전체가 모두 빈 값
         full_off_p_mask, full_off_mask = self._get_agents_past_cur_mask_np(
             full_traj_11)
-        # full_valid_mask: (agent_num, T_full)  — True: 앞 8차원 중 하나라도 0이 아닌 프레임
+        # full_valid_mask: (max_agent_num, T_full)  — True: 앞 8차원 중 하나라도 0이 아닌 프레임
         full_valid_mask: np.ndarray = ~full_off_p_mask
 
-        # full_traj_interp: (agent_num, T_full, 11)  — 보간 결과를 쌓을 버퍼
+        # full_traj_interp: (max_agent_num, T_full, 11)  — 보간 결과를 쌓을 버퍼
         full_traj_interp: np.ndarray = full_traj_11.astype(np.float32,
                                                            copy=True)
 
         # width, length 를 위한 "현재 프레임" 크기 저장
-        # cur_size: (agent_num, 2)  — [width_now, length_now]
+        # cur_size: (max_agent_num, 2)  — [width_now, length_now]
         cur_size: np.ndarray = neighbor_agents_past[:, past_len - 1,
                                                     6:8].astype(np.float32,
                                                                 copy=False)
 
-        for agent_idx in range(agent_num):
+        for agent_idx in range(max_agent_num):
             # 이 agent 가 전 프레임에서 모두 0이면 스킵
             if full_off_mask[agent_idx]:
                 continue
@@ -744,10 +744,10 @@ class DataProcessor(object):
             full_traj_interp[agent_idx, valid_after, 8:11] = type_vec
 
         # 다시 과거/현재 구간과 현재/미래 구간으로 잘라서 반환
-        # new_neighbor_agents_past: (agent_num, past_len, 11)
+        # new_neighbor_agents_past: (max_agent_num, past_len, 11)
         new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :past_len, :]
 
-        # new_neighbor_future_with_current_11: (agent_num, future_len, 11)
+        # new_neighbor_future_with_current_11: (max_agent_num, future_len, 11)
         #   · full_traj 기준 인덱스 past_len-1 이 "현재 프레임"에 해당
         new_neighbor_future_with_current_11: np.ndarray = full_traj_interp[:,
                                                                            past_len
@@ -1081,7 +1081,7 @@ class DataProcessor(object):
              neighbor_track_token) = build_neighbor_past_feature(
                  past_cur_agents_world_8_list=past_cur_agents_world_8_list,
                  past_cur_agents_types_list=past_cur_agents_types_list,
-                 max_agent_num=self.max_agent_num,
+                 caching_max_agent_num=self.caching_max_agent_num,
                  ego_cur_pose_np=ego_cur_pose_np,
                  max_pedestrians=self.max_pedestrians,
                  max_bicycles=self.max_bicycles,
@@ -1159,12 +1159,12 @@ class DataProcessor(object):
                 map_api=map_api,
                 # traffic_light_data=None  → iteration 0 기준으로 내부에서 가져옴
             )
-            # 길이 : agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
+            # 길이 : max_agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
             car_token_to_rr_ids: Dict[str,
                                       List[str]] = get_npc_route_roadblock_ids(
                                           scenario, past_cur_tracked_objects,
                                           neighbor_track_token)
-            # (agent_num, 11)
+            # (max_agent_num, 11)
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
             map_key_to_array = map_process(
                 route_roadblock_ids, car_token_to_rr_ids, neighbor_track_token,

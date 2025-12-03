@@ -44,8 +44,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         target_track_token: List[Optional[str]]  # len: agents_num
     ) -> Dict[str, np.ndarray]:
         neighbor_agents_past = self.unnormalized_features[
-            "neighbor_agents_past"]  # (agent_num, time_len, 11)
-        neighbor_current_xy = neighbor_agents_past[:, -1, :2]  # (agent_num, 2)
+            "neighbor_agents_past"]  # (max_agent_num, time_len, 11)
+        neighbor_current_xy = neighbor_agents_past[:, -1, :2]  # (max_agent_num, 2)
         token_to_current_xy = {}
         for idx, token in enumerate(target_track_token):
             if token is None:
@@ -72,7 +72,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         diff_token_to_future_gt_3_dim: Dict[str,
                                             np.ndarray] = {}  # (future_len, 3)
         neighbor_future_gt_3_dim = self.unnormalized_features.get(
-            "neighbor_future_gt_3_dim", None)  # (agent_num, future_len, 3)
+            "neighbor_future_gt_3_dim", None)  # (max_agent_num, future_len, 3)
         if neighbor_future_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
                 if token is not None:
@@ -81,7 +81,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                             idx]  # (future_len, 3)
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_all_gt_3_dim",
-            None)  # (agent_num, future_all_len, 3)
+            None)  # (max_agent_num, future_all_len, 3)
         diff_token_to_future_all_gt_3_dim: Dict[str, np.ndarray] = {}
         if neighbor_future_all_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
@@ -92,7 +92,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                         token] = future_all_gt_3_dim
         # diff_token_to_agents_past: Dict[str, np.ndarray] = {}  # (time_len, 11)
         neighbor_agents_past = self.unnormalized_features[
-            "neighbor_agents_past"]  # (agent_num, time_len, 11)
+            "neighbor_agents_past"]  # (max_agent_num, time_len, 11)
 
         self.unnormalized_features[
             "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
@@ -122,7 +122,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         # (future_len, 11)
         model_inputs[
             "planner_future_11_dim"] = current_input.planner_future_11_dim
-        # # List[Optional[str]], (agent_num,)
+        # # List[Optional[str]], (max_agent_num,)
         neighbor_track_token = model_inputs["neighbor_track_token"]
         model_inputs.pop("neighbor_track_token")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -140,10 +140,10 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         model_inputs = self.observation_normalizer(model_inputs)
         """
         input
-            - neighbor_track_token :  List[Optional[str]], (agent_num,)
+            - neighbor_track_token :  List[Optional[str]], (max_agent_num,)
             - diffusion_agents_tokens: List[str], (valid_agent_num) maxlen=Pnn
         output
-            - target_agents_mask: np.ndarray, (agent_num,) bool
+            - target_agents_mask: np.ndarray, (max_agent_num,) bool
         """
         target_agents_mask = self._get_target_agents_mask(
             neighbor_track_token, current_input.diffusion_agents_tokens)
@@ -153,7 +153,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)
             neighbor_agents_past=model_inputs[
-                "neighbor_agents_past"],  # (agent_num, time_len, 11)
+                "neighbor_agents_past"],  # (max_agent_num, time_len, 11)
             static_objects=model_inputs[
                 "static_objects"],  # (static_objects_num, 10)
             lanes=model_inputs["lanes"],  # (lane_num, lane_len, 12)
@@ -168,8 +168,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             route_lanes_has_speed_limit=model_inputs[
                 "route_lanes_has_speed_limit"],  # (route_num, 1)
             agent_route_lane_order=model_inputs[
-                "agent_route_lane_order"],  # (agent_num, 1)
-            target_agents_mask=target_agents_mask,  # (agent_num,) bool
+                "agent_route_lane_order"],  # (max_agent_num, 1)
+            target_agents_mask=target_agents_mask,  # (max_agent_num,) bool
             ego_agent_next_11_dim=model_inputs[
                 "ego_agent_next_11_dim"],  # (interpol_num, 11)
             planner_future_11_dim=model_inputs["planner_future_11_dim"]
@@ -182,21 +182,21 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     ) -> Optional[np.ndarray]:
         """
         input
-            - neighbor_track_token :  List[Optional[str]], (agent_num,)
+            - neighbor_track_token :  List[Optional[str]], (max_agent_num,)
             - diffusion_agents_tokens: List[str], (valid_agent_num) maxlen=Pnn
         output
-            - target_agents_mask: np.ndarray, (agent_num,) bool
+            - target_agents_mask: np.ndarray, (max_agent_num,) bool
         """
-        agent_num = len(neighbor_track_token)
+        max_agent_num = len(neighbor_track_token)
 
-        target_agents_mask = np.zeros((agent_num,), dtype=bool)
+        target_agents_mask = np.zeros((max_agent_num,), dtype=bool)
         if diffusion_agents_tokens is None:
             target_agents_mask[:self._config.predicted_neighbor_num] = True
             return target_agents_mask
 
         assert isinstance(neighbor_track_token, list)
 
-        for idx in range(agent_num):
+        for idx in range(max_agent_num):
             if neighbor_track_token[idx] in diffusion_agents_tokens:
                 target_agents_mask[idx] = True
         return target_agents_mask

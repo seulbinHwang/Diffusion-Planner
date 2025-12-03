@@ -11,6 +11,76 @@ from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.model.module.feasible import FeasibleProjector
 # =====================================================================
 
+from typing import Dict, Tuple
+import torch
+from torch import nn
+from typing import Tuple
+...
+from diffusion_planner.model.module.feasible import FeasibleProjector
+# =====================================================================
+
+
+def _prepare_batch_for_device(
+    batch: Dict[str, torch.Tensor],
+    device: str,
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """배치 dict를 GPU/CPU로 옮기고, 입력/정답을 구분해 준다.
+
+    이 함수는 Dataset에서 넘어온 배치(dict)를 한 번에 원하는 장치로 옮기고,
+    그중에서 정답 역할을 하는 텐서만 outputs로 분리한다.
+
+    Args:
+        batch:
+            Dataset에서 온 배치.
+            각 값의 대략적인 형태는 다음과 같다.
+            - "ego_agent_past"            : (B, time_len, 11)
+            - "ego_future_gt_3_dim"       : (B, 1 + future_len, 3)
+            - "neighbor_agents_past"      : (B, max_agent_num, time_len, 11)
+            - "lanes"                     : (B, lane_num, lane_len, 12)
+            - "lanes_speed_limit"         : (B, lane_num, 1)
+            - "lanes_has_speed_limit"     : (B, lane_num, 1)
+            - "route_lanes"               : (B, route_lane_num, route_len, 12)
+            - "route_lanes_speed_limit"   : (B, route_lane_num, 1)
+            - "route_lanes_has_speed_limit": (B, route_lane_num, 1)
+            - "static_objects"            : (B, max_static_num, 10)
+            - "near_future_gt_3_dim"      : (B, Pnn, future_len, 3)
+            - "planner_future_11_dim"     : (B, future_len, 11)
+            - "agent_route_lane_order"    : (B, Pnn, lane_num)
+        device:
+            텐서를 옮길 대상 장치. 예: "cuda:0", "cpu" 등.
+
+    Returns:
+        inputs:
+            모델 forward에 바로 넣을 입력 텐서 dict.
+            (정답 텐서를 제외한 나머지 키/값, shape는 위와 동일하게 (B, ...) 구조)
+        outputs:
+            정답 텐서 dict.
+            - "ego_future_gt_3_dim"  : (B, 1 + future_len, 3)
+            - "near_future_gt_3_dim" : (B, Pnn, future_len, 3)
+    """
+    # 1) 배치 전체를 장치로 이동
+    batch_on_device: Dict[str, torch.Tensor] = {
+        key: tensor.to(device, non_blocking=True)
+        for key, tensor in batch.items()
+    }
+
+    # 2) dtype 특수 처리: route lane order는 항상 long 형으로 맞춘다.
+    if "agent_route_lane_order" in batch_on_device:
+        # (B, Pnn, lane_num)
+        batch_on_device["agent_route_lane_order"] = batch_on_device[
+            "agent_route_lane_order"].long()
+
+    # 3) 정답 키만 outputs로 분리
+    target_keys = {"ego_future_gt_3_dim", "near_future_gt_3_dim"}
+    outputs: Dict[str, torch.Tensor] = {}
+
+    for key in list(batch_on_device.keys()):
+        if key in target_keys:
+            outputs[key] = batch_on_device.pop(key)
+
+    inputs: Dict[str, torch.Tensor] = batch_on_device
+    return inputs, outputs
+
 
 def train_epoch(data_loader,
                 model,
@@ -35,40 +105,12 @@ def train_epoch(data_loader,
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
-            # prepare data
-            inputs = {
-                "ego_agent_past":
-                    batch[0].to(args.device, non_blocking=True),
-                # "ego_current_state":
-                #     batch[1].to(args.device),
-                "neighbor_agents_past":
-                    batch[3].to(args.device, non_blocking=True),
-                "lanes":
-                    batch[4].to(args.device, non_blocking=True),
-                "lanes_speed_limit":
-                    batch[5].to(args.device, non_blocking=True),
-                "lanes_has_speed_limit":
-                    batch[6].to(args.device, non_blocking=True),
-                "route_lanes":
-                    batch[7].to(args.device, non_blocking=True),
-                "route_lanes_speed_limit":
-                    batch[8].to(args.device, non_blocking=True),
-                "route_lanes_has_speed_limit":
-                    batch[9].to(args.device, non_blocking=True),
-                "static_objects":
-                    batch[10].to(args.device, non_blocking=True),
-                "planner_future_11_dim":
-                    batch[12].to(args.device, non_blocking=True),
-                "agent_route_lane_order":
-                    batch[13].to(args.device,
-                                 dtype=torch.long,
-                                 non_blocking=True),
-            }
-
-            ego_future_gt_3_dim = batch[2].to(args.device, non_blocking=True)
-            near_future_gt_3_dim = batch[11].to(
-                args.device,
-                non_blocking=True)  # (B, predicted_neighbor_num, future_len, 3)
+            inputs, outputs = _prepare_batch_for_device(batch, args.device)
+            # ego_future_gt_3_dim: (B, 1 + future_len, 3)
+            ego_future_gt_3_dim = outputs["ego_future_gt_3_dim"]
+            # near_future_gt_3_dim: (B, predicted_neighbor_num, future_len, 3)
+            near_future_gt_3_dim = outputs["near_future_gt_3_dim"]
+            # ================================================
             # Normalize to ego-centric
             if isinstance(aug, StatePerturbation):
                 inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(

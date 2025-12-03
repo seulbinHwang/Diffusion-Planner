@@ -20,7 +20,7 @@ import torch
 class WorldModelFeature(AbstractModelFeature):
     ########### SAME AS LEARNING INPUT ###########
     ego_agent_past: FeatureDataType  # (time_len, 11)
-    neighbor_agents_past: FeatureDataType  # (agent_num, time_len, 11)
+    neighbor_agents_past: FeatureDataType  # (max_agent_num, time_len, 11)
     static_objects: FeatureDataType  # (static_objects_num, 10)
     ################################################
     ########### SAME AS LEARNING INPUT ###########
@@ -31,10 +31,10 @@ class WorldModelFeature(AbstractModelFeature):
     route_lanes_speed_limit: Optional[FeatureDataType]  # (route_num, 1)
     route_lanes_has_speed_limit: Optional[FeatureDataType]  # (route_num, 1)
     agent_route_lane_order: Optional[
-        FeatureDataType]  # (agent_num, lane_num) # -1 if not on route
+        FeatureDataType]  # (max_agent_num, lane_num) # -1 if not on route
     ################################################
     ################ inference only ################
-    target_agents_mask: Optional[FeatureDataType]  # (agent_num,) bool
+    target_agents_mask: Optional[FeatureDataType]  # (max_agent_num,) bool
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
     planner_future_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
@@ -194,7 +194,7 @@ class WorldModelFeature(AbstractModelFeature):
         Note:
             대표적인 텐서 shape 예시(배치 차원 포함):
             - "ego_agent_past": (B, time_len, 11)
-            - "neighbor_agents_past": (B, agent_num, time_len, 11)
+            - "neighbor_agents_past": (B, max_agent_num, time_len, 11)
             - "static_objects": (B, static_objects_num, 10)
             - "lanes": (B, lane_num, lane_len, 12)
             - "lanes_speed_limit": (B, lane_num, 1)
@@ -202,8 +202,8 @@ class WorldModelFeature(AbstractModelFeature):
             - "route_lanes": (B, route_num, lane_len, 12) or None
             - "route_lanes_speed_limit": (B, route_num, 1) or None
             - "route_lanes_has_speed_limit": (B, route_num, 1) or None
-            - "agent_route_lane_order": (B, agent_num, lane_num) or None
-            - "target_agents_mask": (B, agent_num) or None
+            - "agent_route_lane_order": (B, max_agent_num, lane_num) or None
+            - "target_agents_mask": (B, max_agent_num) or None
             - "near_route_lanes": (B, Pnn, lane_len, 12) or None
             - "near_route_lanes_speed_limit": (B, Pnn, 1) or None
             - "near_route_lanes_has_speed_limit": (B, Pnn, 1) or None

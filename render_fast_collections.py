@@ -389,7 +389,7 @@ def draw_lane_centerlines_fast(
     *,
     signal_colors: Dict[int, str],
     draw_agent_route_lane_order: bool,
-    agent_route_lane_order: Optional[npt.NDArray[np.int64]] = None,  # (agent_num, lane_num)
+    agent_route_lane_order: Optional[npt.NDArray[np.int64]] = None,  # (max_agent_num, lane_num)
     draw_token_int_list: Optional[List[int]] = None,
     label_stride: int = 4,
     route_label_color: str = "#00FFFF",  # CYAN
@@ -420,7 +420,7 @@ def draw_lane_centerlines_fast(
         · [:, :, 4:6]  : left offset (dx, dy)
         · [:, :, 6:8]  : right offset (dx, dy)
         · [:, :, 8:12] : signal one-hot [green, yellow, red, unknown]
-    agent_route_lane_order : (agent_num, lane_num) int
+    agent_route_lane_order : (max_agent_num, lane_num) int
         · 값 >=0: 해당 agent가 이 lane을 경로에 포함, 값은 "가까운 순서 랭크"
         · 값 <0: 경로에 포함되지 않음
 
@@ -694,7 +694,7 @@ def draw_future_points_scatter_fast(
 
 def draw_neighbor_past_fast(
     ax: plt.Axes,
-    neighbor_agents_past: ND_f32,                    # (agent_num, T, 11)
+    neighbor_agents_past: ND_f32,                    # (max_agent_num, T, 11)
     options,                                          # DrawingOptions
     draw_token_int_list: Optional[List[int]] = None,
 ) -> None:
@@ -717,7 +717,7 @@ def draw_neighbor_past_fast(
         return
 
     invalid_eps = float(options.invalid_eps)
-    agent_num, time_len, feat_dim = neighbor_agents_past.shape
+    max_agent_num, time_len, feat_dim = neighbor_agents_past.shape
     assert feat_dim == 11, "neighbor_agents_past의 마지막 차원은 11이어야 합니다."
     current_t = time_len - 1
 
@@ -742,7 +742,7 @@ def draw_neighbor_past_fast(
     }
 
     # agent 루프 (그림 수를 줄이기 위해 데이터만 수집)
-    for agent_idx in range(agent_num):
+    for agent_idx in range(max_agent_num):
         track = neighbor_agents_past[agent_idx]                  # (T,11)
         # draw_all_time = True이면 모든 시점, False면 현재 시점만(원본과 동일)
         draw_all_time = not (draw_token_int_list and agent_idx not in draw_token_int_list)
@@ -861,7 +861,7 @@ def annotate_neighbor_indices_for_past_fast(
     if neighbor_agents_past is None or neighbor_agents_past.size == 0:
         return
     invalid_eps = float(options.invalid_eps)
-    agent_num, time_len, feat_dim = neighbor_agents_past.shape
+    max_agent_num, time_len, feat_dim = neighbor_agents_past.shape
     assert feat_dim == 11
     current_t = time_len - 1
 

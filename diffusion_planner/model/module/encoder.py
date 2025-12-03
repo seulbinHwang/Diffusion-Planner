@@ -391,7 +391,7 @@ class Encoder(nn.Module):
         self.npc_route_encoder = NearAgentsRouteLaneEncoder(
             hidden_dim=config.hidden_dim, attn_drop_p=0.0)
         self.token_num = (1 * self.agents_encoder.future_chunk_num) + (
-            (1 + config.agent_num) * self.agents_encoder.past_cur_chunk_num
+            (1 + config.max_agent_num) * self.agents_encoder.past_cur_chunk_num
         ) + config.static_objects_num + config.lane_num
 
         self.fusion = FusionEncoder(
@@ -2163,14 +2163,14 @@ class AgentFusionEncoder(nn.Module):
     def forward(self, ego_past_current, npc_past_current, ego_future):
         '''
         ego_past_current: (B, 1, time_len, 11)
-        npc_past_current: (B, agent_num, time_len, 11)
+        npc_past_current: (B, max_agent_num, time_len, 11)
         ego_future: (B, future_len, 11)
 
         (x, y, cos, sin, vx, vy, w, l, type(3)
         '''
         assert self.future_len == ego_future.shape[1], \
             f"ego_future.shape[1] should be {self.future_len}, but got {ego_future.shape[1]}"
-        # (B, agents_num=1+agent_num, time_len, D)
+        # (B, agents_num=1+max_agent_num, time_len, D)
         agents_past_current = torch.cat([ego_past_current, npc_past_current],
                                         dim=1)
         B, agents_num, time_len, _ = agents_past_current.shape

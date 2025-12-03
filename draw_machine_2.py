@@ -83,18 +83,18 @@ def _collect_valid_xy_from_input_data(
     neigh = input_data.get("neighbor_agents_past")
     if neigh is not None and neigh.size > 0:
         valid_mask = np.any(np.abs(neigh[:, :, :8]) > eps,
-                            axis=2)  # (agent_num, T)
+                            axis=2)  # (max_agent_num, T)
         if np.any(valid_mask):
             xy = neigh[:, :, 0:2][valid_mask]
             xs_local.extend(xy[:, 0].tolist())
             ys_local.extend(xy[:, 1].tolist())
 
-    # neighbor future points: (agent_num, future_len, 3) -> (x,y)만 사용
+    # neighbor future points: (max_agent_num, future_len, 3) -> (x,y)만 사용
     neigh_fut = input_data.get("neighbor_future_gt_3_dim")
     if neigh_fut is not None and neigh_fut.size > 0:
         if neigh_fut.ndim != 3 or neigh_fut.shape[-1] != 3:
             raise ValueError(
-                "neighbor_agents_future는 (agent_num, future_len, 3) 이어야 합니다.")
+                "neighbor_agents_future는 (max_agent_num, future_len, 3) 이어야 합니다.")
         valid_mask = (np.abs(neigh_fut[..., 0]) > eps) | (np.abs(
             neigh_fut[..., 1]) > eps)  # (A, T)
         if np.any(valid_mask):
@@ -272,8 +272,8 @@ def draw_neighbor_future_gt_3_dim(
     """
     # Dict[str, np.ndarray] # len : valid_agent_num
 
-    neighbor_future_gt_3_dim (agent_num, future_len, 3=[x,y,yaw])를
-    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..agent_num-1)를 흰색으로 표기.
+    neighbor_future_gt_3_dim (max_agent_num, future_len, 3=[x,y,yaw])를
+    흰색 'x' 마커로 그리고, 각 에이전트의 첫 점 근처에 인덱스(0..max_agent_num-1)를 흰색으로 표기.
 
     규칙:
       - invalid: |x|<=eps and |y|<=eps → 스킵
@@ -328,7 +328,7 @@ class DrawingOptions:
     EGO_draw_ego_past : bool
         ego_agent_past(21, 11) 시퀀스 렌더링 여부.
     draw_neighbor_past : bool
-        neighbor_agents_past(agent_num, 21, 11) 시퀀스 렌더링 여부.
+        neighbor_agents_past(max_agent_num, 21, 11) 시퀀스 렌더링 여부.
     EGO_draw_ego_agent_next_11_dim : bool
         ego_agent_next_11_dim(interpol_num, 11) 예측 궤적 렌더링 여부.
     EGO_draw_planner_future_11_dim : bool
@@ -743,7 +743,7 @@ def collect_valid_xy_for_bounds(
 def draw_lane_boundaries(
     ax: plt.Axes,
     lanes: Array,
-    agent_route_lane_order: Optional[Array],  # (agent_num, lane_num)
+    agent_route_lane_order: Optional[Array],  # (max_agent_num, lane_num)
     options: DrawingOptions,
     draw_token_int_list: Optional[List[int]] = None,
 ) -> None:
@@ -829,7 +829,7 @@ def draw_lane_centerlines(
     ax: plt.Axes,
     lanes: Array,
     options: DrawingOptions,
-    agent_route_lane_order: Optional[Array] = None,  # (agent_num, lane_num)
+    agent_route_lane_order: Optional[Array] = None,  # (max_agent_num, lane_num)
     draw_token_int_list: Optional[List[int]] = None,
 ) -> None:
     """센터라인을 점선으로 그리거나, agent_route_lane_order가 주어지면 에이전트-차선 매핑을 텍스트로 표기한다.
@@ -863,7 +863,7 @@ def draw_lane_centerlines(
     options : DrawingOptions
         그리기 옵션(색/두께/간격 등).
     agent_route_lane_order : Optional[np.ndarray]
-        shape = (agent_num, lane_num), 각 [i, j] = 해당 에이전트 i에게서
+        shape = (max_agent_num, lane_num), 각 [i, j] = 해당 에이전트 i에게서
         차선 j의 '가까운 순서 랭크(0,1,2,...)'; 경로에 없으면 -1.
     """
     if lanes is None or lanes.size == 0:
@@ -890,8 +890,8 @@ def draw_lane_centerlines(
             lane_point_valid_mask = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)
 
             # 이 차선을 자신의 경로에 포함하는 모든 agent i와 그 rank
-            # agent_route_lane_order: (agent_num, lane_num),
-            ranks_j: Array = agent_route_lane_order[:, lane_idx]  # (agent_num,)
+            # agent_route_lane_order: (max_agent_num, lane_num),
+            ranks_j: Array = agent_route_lane_order[:, lane_idx]  # (max_agent_num,)
             valid_agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # (K,)
             if valid_agent_idxs.size == 0:
                 continue
@@ -955,12 +955,12 @@ def draw_neighbor_past(ax: plt.Axes,
     if neighbor_agents_past is None or neighbor_agents_past.size == 0:
         return
     eps = options.invalid_eps
-    agent_num, time_len, feat_dim = neighbor_agents_past.shape
+    max_agent_num, time_len, feat_dim = neighbor_agents_past.shape
     if feat_dim != 11:
         raise ValueError("neighbor_agents_past의 마지막 차원은 11이어야 합니다.")
     current_t = time_len - 1
 
-    for agent_idx in range(agent_num):
+    for agent_idx in range(max_agent_num):
         if (draw_token_int_list
                 is not None) and (agent_idx not in draw_token_int_list
                                  ) or options.NEI_draw_neighbor_only_current:
@@ -1040,20 +1040,20 @@ def draw_neighbor_past(ax: plt.Axes,
 def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
     Optional[str]], neighbor_agents_past: Array,
                                        options: DrawingOptions) -> None:
-    """neighbor_agents_past (agent_num, T=21, 11)의 '현재 상태'(마지막 스텝) 근처에
-    에이전트 인덱스(0..agent_num-1)를 흰색 텍스트로 표기.
+    """neighbor_agents_past (max_agent_num, T=21, 11)의 '현재 상태'(마지막 스텝) 근처에
+    에이전트 인덱스(0..max_agent_num-1)를 흰색 텍스트로 표기.
     - invalid 스텝은 스킵
     """
     if neighbor_agents_past is None or neighbor_agents_past.size == 0:
         return
     if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[-1] != 11:
         raise ValueError(
-            "neighbor_agents_past의 shape은 (agent_num, 21, 11) 이어야 합니다.")
+            "neighbor_agents_past의 shape은 (max_agent_num, 21, 11) 이어야 합니다.")
 
     eps = options.invalid_eps
-    agent_num, time_len, feat_dim = neighbor_agents_past.shape
+    max_agent_num, time_len, feat_dim = neighbor_agents_past.shape
     current_t = time_len - 1
-    for agent_idx in range(agent_num):
+    for agent_idx in range(max_agent_num):
         track_token = neighbor_track_token[agent_idx]
         row = neighbor_agents_past[agent_idx, current_t]  # (11,)
         if not is_valid_agent_row(row, eps):
@@ -2187,7 +2187,7 @@ def draw_lane(
         draw_token_list: 특정 에이전트 토큰만 텍스트 표기하고 싶을 때 사용. None이면 전체.
     """
     lanes = input_data.get("lanes")
-    # : Optional[Array] # (agent_num, lane_num)
+    # : Optional[Array] # (max_agent_num, lane_num)
     agent_route_lane_order: Optional[Array] = input_data.get(
         "agent_route_lane_order", None)
     draw_token_int_list: Optional[List[int]] = get_agent_idx_from_tokens(

@@ -1194,7 +1194,7 @@ def get_npc_route_roadblock_ids2(
 
         Args:
             neighbor_track_token (List[Optional[str]]):
-                길이 = agent_num. 토큰 또는 None.
+                길이 = max_agent_num. 토큰 또는 None.
 
         Returns:
             Set[str]: 후보 토큰 집합.
@@ -1266,7 +1266,7 @@ def get_npc_route_roadblock_ids2(
         scenario (NuPlanScenario):
             NuPlan 시나리오 객체.
         neighbor_track_token (List[Optional[str]]):
-            길이 = `agent_num`. 각 슬롯에 NPC의 `track_token`(없으면 `None`).
+            길이 = `max_agent_num`. 각 슬롯에 NPC의 `track_token`(없으면 `None`).
 
     Returns:
         car_token_to_rr_ids
@@ -1274,7 +1274,7 @@ def get_npc_route_roadblock_ids2(
             키 = 토큰(str).
             값 = 해당 NPC의 **보정된** RoadBlock id 시퀀스(List[str]) 또는 `None`
             (미추출 시).
-            길이 : agent_num 중, 자동차 토큰 개수.
+            길이 : max_agent_num 중, 자동차 토큰 개수.
 
     Raises:
         ValueError: 동일 프레임에서 RoadBlock과 RoadBlock‑Connector가 동시에

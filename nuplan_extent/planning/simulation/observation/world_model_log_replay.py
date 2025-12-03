@@ -971,7 +971,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             use_route_lanes=self.use_route_lanes)
         traffic_light_data = self._scenario.get_traffic_light_status_at_iteration(
             iteration.index)
-        # target_agents_mask: np.ndarray, (agent_num,) bool
+        # target_agents_mask: np.ndarray, (max_agent_num,) bool
         # diffusion_agents_tokens: List[str] # len: valid diffusion agent num
         diffusion_agents_tokens = None  #list(self._diffusion_agents.keys())
         current_input = PlannerInput(iteration, history, traffic_light_data,
@@ -986,10 +986,10 @@ class WorldModelLogReplay(AbstractMLAgents):
         model_input_key_to_unnorm_value: Dict[
             str, np.ndarray] = self._model_loader.feature_builders[
                 0].unnormalized_features
-        # neighbor_token_dist_order: len = agent_num
+        # neighbor_token_dist_order: len = max_agent_num
         neighbor_token_dist_order: List[
             Optional[str]] = model_input_key_to_unnorm_value[
-                "neighbor_track_token"]  # (agent_num, )
+                "neighbor_track_token"]  # (max_agent_num, )
         diff_token_to_future_gt_3_dim: Dict[
             str, np.ndarray] = model_input_key_to_unnorm_value[
                 "diff_token_to_future_gt_3_dim"]  # Dict[str, np.ndarray] # len : valid_agent_num
@@ -1017,7 +1017,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             # x, y, cos, sin, vx, vy, width, length, is_vehicle, 0, 0
             planner_future_11_dim[:, :7] = 0.0
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
-        # neighbor_token_dist_order: List[Optional[str]] # len = agent_num
+        # neighbor_token_dist_order: List[Optional[str]] # len = max_agent_num
         # diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] # len : valid_agent_num
         (model_input_key_to_value, neighbor_token_dist_order,
          diff_token_to_future_gt_3_dim,
@@ -1192,9 +1192,9 @@ class WorldModelLogReplay(AbstractMLAgents):
     def _get_token_to_np_traj_wrt_ego(
         self,
         model_inputs: AbstractModelFeature,
-        neighbor_token_dist_order: List[Optional[str]],  # len == agent_num
+        neighbor_token_dist_order: List[Optional[str]],  # len == max_agent_num
         neighbor_agents_past: np.ndarray
-        # (agent_num, time_len, 11)
+        # (max_agent_num, time_len, 11)
     ) -> Tuple[Dict[str, np.ndarray], List[str]]:
         """
         Returns:
@@ -1374,7 +1374,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         model_input_key_to_value: Dict[str, AbstractModelFeature],
         iteration: SimulationIteration,
         next_iteration: SimulationIteration,
-        neighbor_token_dist_order: List[Optional[str]],  # len == agent_num,
+        neighbor_token_dist_order: List[Optional[str]],  # len == max_agent_num,
         diff_token_to_future_gt_3_dim: Dict[
             str, np.ndarray],  # len : valid_agent_num # (future_len, 3)
         neighbor_agents_past: np.ndarray  # (agents_num, time_len, 11)

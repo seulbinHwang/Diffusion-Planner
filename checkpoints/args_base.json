@@ -2,7 +2,7 @@
     "future_len": 80,
     "time_len": 21,
     "agent_state_dim": 11,
-    "agent_num": 32,
+    "max_agent_num": 32,
     "static_objects_state_dim": 10,
     "static_objects_num": 5,
     "lane_len": 20,

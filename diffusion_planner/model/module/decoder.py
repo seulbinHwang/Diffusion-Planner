@@ -212,8 +212,8 @@ class Decoder(nn.Module):
 
     def _get_near_past_current_infos(
         self,
-        target_agents_mask: Optional[torch.Tensor],  # [B, agent_num] bool
-        neighbor_agents_past: torch.Tensor,  # [B, agent_num, time_len, 11]
+        target_agents_mask: Optional[torch.Tensor],  # [B, max_agent_num] bool
+        neighbor_agents_past: torch.Tensor,  # [B, max_agent_num, time_len, 11]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -221,14 +221,14 @@ class Decoder(nn.Module):
             near_past_current_mask: [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
             near_class_one_hot: [B, pnn, 3]  one-hot class vector
         """
-        # neighbor_agents_past_mask : [B, agent_num, time_len] bool # True=무효 점
+        # neighbor_agents_past_mask : [B, max_agent_num, time_len] bool # True=무효 점
         neighbor_agents_past_mask = torch.sum(
             torch.ne(neighbor_agents_past,
-                     0), dim=-1) == 0  # (B, agent_num, time_len)
+                     0), dim=-1) == 0  # (B, max_agent_num, time_len)
 
         neighbor_agents_class_one_hot = neighbor_agents_past[
-            ..., 0, 8:11]  # (B, agent_num, 3)
-        # 마지막 타임스텝만 추출: [B, agent_num, 4]
+            ..., 0, 8:11]  # (B, max_agent_num, 3)
+        # 마지막 타임스텝만 추출: [B, max_agent_num, 4]
 
         if target_agents_mask is None:
             # near_past_current, near_past_current_mask,
@@ -241,29 +241,29 @@ class Decoder(nn.Module):
                                                                _predicted_neighbor_num, :]  # [B, pnn, 3]
 
         else:
-            B, agent_num, time_len, D11 = neighbor_agents_past.shape
+            B, max_agent_num, time_len, D11 = neighbor_agents_past.shape
             # near_past_current:
             near_past_current = torch.zeros(
-                (B, agent_num, time_len, D11),
+                (B, max_agent_num, time_len, D11),
                 dtype=neighbor_agents_past.dtype,
                 device=neighbor_agents_past.device,
             )
             near_past_current_mask = torch.ones(
-                (B, agent_num, time_len),
+                (B, max_agent_num, time_len),
                 dtype=neighbor_agents_past_mask.dtype,
                 device=neighbor_agents_past_mask.device,
             )  # True=빈 슬롯(무효 에이전트)
             near_class_one_hot = torch.zeros(
-                (B, agent_num, 3),
+                (B, max_agent_num, 3),
                 dtype=neighbor_agents_class_one_hot.dtype,
                 device=neighbor_agents_class_one_hot.device,
             )
 
             # 마스크가 True인 “그 자리”에 값 대입 (슬롯 유지)
-            # near_past_current: [B, agent_num, time_len, 11]
+            # near_past_current: [B, max_agent_num, time_len, 11]
             near_past_current[target_agents_mask] = neighbor_agents_past[
                 target_agents_mask]
-            # near_past_current_mask : [B, agent_num, time_len]  True=빈 슬롯(무효 점)
+            # near_past_current_mask : [B, max_agent_num, time_len]  True=빈 슬롯(무효 점)
             near_past_current_mask[
                 target_agents_mask] = neighbor_agents_past_mask[
                     target_agents_mask]
@@ -593,13 +593,13 @@ class Decoder(nn.Module):
         # near_current_xyyaw: [B, pnn, 4]  (x, y, cos(yaw), sin(yaw))
         # near_current_mask: [B, pnn]  True=빈 슬롯(무효 에이전트)
         neighbor_agents_past = inputs[
-            "neighbor_agents_past"]  # [B, agent_num, time_len, 11]
+            "neighbor_agents_past"]  # [B, max_agent_num, time_len, 11]
         (near_past_current, near_past_current_mask,
          near_class_one_hot) = self._get_near_past_current_infos(
              target_agents_mask=inputs.get("target_agents_mask",
-                                           None),  # [B, agent_num] bool
+                                           None),  # [B, max_agent_num] bool
              neighbor_agents_past=
-             neighbor_agents_past,  # [B, agent_num, time_len, 11]
+             neighbor_agents_past,  # [B, max_agent_num, time_len, 11]
          )
         near_past = near_past_current[:, :, :-1, :].detach(
         )  # [B, pnn, past_len=(time_len - 1), 11]

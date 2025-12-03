@@ -1625,7 +1625,7 @@ def _build_lane_vector_and_agent_route_order(
     3) `_select_token_and_ordered_npc_route_indices` 를 사용해
        - 각 에이전트별로, “경로 위에 있는 차선들”을
          ego 기준 거리 순으로 정렬하고 랭크를 부여한다.
-       → 결과: `agent_route_lane_order` shape = (agent_num, lane_num)
+       → 결과: `agent_route_lane_order` shape = (max_agent_num, lane_num)
 
     Args:
         map_elements_to_processed_array:
@@ -1635,10 +1635,10 @@ def _build_lane_vector_and_agent_route_order(
             - `"vector_set_map.traffic_light_data.LANE"`: (lane_num, lane_len, 4)
             - `"vector_set_map.availabilities.LANE"`: (lane_num, lane_len)
         neighbor_track_token:
-            - 에이전트 슬롯별 track_token, 길이 = agent_num.
+            - 에이전트 슬롯별 track_token, 길이 = max_agent_num.
         neighbor_agents_current:
             - 현재 프레임 이웃 에이전트 상태.
-            - shape = (agent_num, 11).
+            - shape = (max_agent_num, 11).
         - car_token_to_chosen_lanes_route_mask:  Dict[str, List[bool]]
             차량 토큰별로, 각 차선이 그 차량 경로 위에 있는지 여부 리스트.
             key의 개수: chosen_car_num,
@@ -1650,7 +1650,7 @@ def _build_lane_vector_and_agent_route_order(
             - vector_map_lanes:
                 차선 벡터 표현. shape = (lane_num, lane_len, 12).
             - agent_route_lane_order:
-                에이전트별 차선 순서 랭크 행렬. shape = (agent_num, lane_num), dtype=int64.
+                에이전트별 차선 순서 랭크 행렬. shape = (max_agent_num, lane_num), dtype=int64.
     """
     # polylines: (lane_num, lane_len, 2)
     polylines: np.ndarray = map_elements_to_processed_array[
@@ -1682,7 +1682,7 @@ def _build_lane_vector_and_agent_route_order(
         neighbor_track_token,
         neighbor_agents_current,
         vector_map_lanes,
-    )  # shape: (agent_num, lane_num)
+    )  # shape: (max_agent_num, lane_num)
 
     # 타입 통일: int64
     if agent_route_lane_order.dtype != np.int64:
@@ -1776,7 +1776,7 @@ def map_process(
     route_roadblock_ids: List[str],
     car_token_to_rr_ids: Dict[str, List[str]],  # 길이: chosen_car_num
     neighbor_track_token: List[str],  # 길이: chosen_agent_num
-    neighbor_agents_current: np.ndarray,  # shape: (agent_num, 11)
+    neighbor_agents_current: np.ndarray,  # shape: (max_agent_num, 11)
     ego_cur_pose_np: np.ndarray,  # shape: (3,)
     elements_to_obj_polylines: Dict[str, MapObjectPolylines],
     elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData],
@@ -1798,7 +1798,7 @@ def map_process(
         neighbor_track_token:
             - 이웃 에이전트 slot 순서에 맞는 track_token 리스트.
         neighbor_agents_current:
-            - 현재 프레임 이웃 에이전트 상태. shape = (agent_num, 11).
+            - 현재 프레임 이웃 에이전트 상태. shape = (max_agent_num, 11).
         ego_cur_pose_np:
             - ego 현재 상태 [x, y, heading]. shape = (3,).
         elements_to_obj_polylines:
@@ -1825,7 +1825,7 @@ def map_process(
             - "route_lanes": (route_lane_num, lane_len, 12)
             - "route_lanes_speed_limit": (route_lane_num, 1)
             - "route_lanes_has_speed_limit": (route_lane_num, 1)
-            - "agent_route_lane_order": (agent_num, lane_num), dtype=int64.
+            - "agent_route_lane_order": (max_agent_num, lane_num), dtype=int64.
     """
     """ _build_list_array_data_from_polylines
     1) 폴리라인/신호 raw 데이터 → Dict[str, List[np.ndarray]]
@@ -1865,7 +1865,7 @@ def map_process(
     )
     """ _build_lane_vector_and_agent_route_order
          차선 폴리라인 + 경계선 + 신호를 묶어 (lane_num, lane_len, 12) 벡터로 만들고,
-         에이전트별 route lane 순서 랭크 행렬 (agent_num, lane_num)을 만든다.
+         에이전트별 route lane 순서 랭크 행렬 (max_agent_num, lane_num)을 만든다.
     """
     (vector_map_lanes,
      agent_route_lane_order) = _build_lane_vector_and_agent_route_order(
@@ -1900,6 +1900,6 @@ def map_process(
         "route_lanes_has_speed_limit":
             route_lanes_has_speed_limit,  # (route_lane_num, 1)
         "agent_route_lane_order":
-            agent_route_lane_order,  # (agent_num, lane_num)
+            agent_route_lane_order,  # (max_agent_num, lane_num)
     }
     return vector_map_output

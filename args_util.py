@@ -58,11 +58,16 @@ def get_args():
                         type=int,
                         help='past state dim for agents',
                         default=11)
-    parser.add_argument('--agent_num',
+    parser.add_argument('--max_agent_num',
                         type=int,
                         help='number of agents',
                         default=448)
-    parser.add_argument('--max_agent_num',
+    parser.add_argument('--predicted_neighbor_num',
+                        type=int,
+                        help='number of neighbor agents to predict',
+                        default=448)
+
+    parser.add_argument('--caching_max_agent_num',
                         type=int,
                         help='number of agents',
                         default=448)
@@ -90,6 +95,10 @@ def get_args():
                         help='state dim for lane point',
                         default=12)
     parser.add_argument('--lane_num',
+                        type=int,
+                        help='number of lanes',
+                        default=250)
+    parser.add_argument('--max_use_lane_num',
                         type=int,
                         help='number of lanes',
                         default=250)
@@ -231,11 +240,6 @@ def get_args():
                         choices=['score', 'x_start'],
                         default='x_start')
 
-    # decoder
-    parser.add_argument('--predicted_neighbor_num',
-                        type=int,
-                        help='number of neighbor agents to predict',
-                        default=32)
 
     parser.add_argument('--use_wandb', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)
