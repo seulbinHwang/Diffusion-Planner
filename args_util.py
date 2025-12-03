@@ -117,7 +117,7 @@ def get_args():
     parser.add_argument('--route_num',
                         type=int,
                         help='number of route lanes',
-                        default=125)
+                        default=250)
 
     # DataLoader parameters
     parser.add_argument('--augment_prob',

@@ -1208,7 +1208,6 @@ class DataProcessor(object):
                 save_dir = os.path.join(self._save_dir, "debug_vis")
                 save_path = os.path.join(save_dir, f"{final_file_name}.png")
                 os.makedirs(save_dir, exist_ok=True)
-                print("Visualizing scenario:", save_path)
                 key_to_array["token_to_future_traj_wrt_ego"] = None
                 draw_machine.draw_world_model_to_png(key_to_array,
                                                      output_data={},
@@ -1338,7 +1337,6 @@ class DataProcessor(object):
         tmp_path = final_path + ".tmp"
 
         try:
-            print("!!!!!!!!!!![TRY] NPZ saved to:", final_path)
 
             # 1) 임시 파일에 먼저 완전히 기록
             with open(tmp_path, "wb") as f:
