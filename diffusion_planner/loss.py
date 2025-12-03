@@ -59,7 +59,8 @@ def _build_half_life_weights(
         - 브로드캐스트를 위해 (1,1,future_len)로 반환합니다.
     """
     # future_len: (future_len,) = [dt_s, 2*dt_s, ..., future_len*dt_s]
-    future_len = torch.arange(1, future_len + 1, device=device, dtype=dtype) * float(dt_s)  # [future_len]
+    future_len = torch.arange(1, future_len + 1, device=device,
+                              dtype=dtype) * float(dt_s)  # [future_len]
     # w: (future_len,) = 0.5 ** (future_len / half_life_s)
     w = torch.pow(0.5, future_len / float(half_life_s))  # [future_len]
     return w.view(1, 1, future_len)  # [1, 1, future_len]
@@ -433,6 +434,20 @@ def _forward_model_with_autocast(
     Args:
         model: 학습 중인 모델.
         norm_inputs: 정규화된 관측 dict.
+            ego_agent_past : (B, time_len, 11) #
+            ego_future_gt_3_dim : (B, future_len, 3)
+            neighbor_agents_past : (B, agent_num, time_len, 11) #
+            lanes : (B, lane_num, lane_len, 12) #
+            lanes_speed_limit : (B, lane_num, 1) #
+            lanes_has_speed_limit : (B, lane_num, 1) #
+            route_lanes : (B, route_num, route_len, 12)
+            route_lanes_speed_limit : (B, route_num, 1)
+            route_lanes_has_speed_limit : (B, route_num, 1)
+            static_objects : (B, static_num, 10) #
+            near_future_gt_3_dim: (B, Pnn, future_len, 3)
+            planner_future_11_dim: (B, future_len, 11) #
+            agent_route_lane_order: (B, agent_num, lane_num)
+
         near_future_valid: (B, Pnn, future_len) 미래 유효 마스크.
         near_cur_future_norm_xT: (B, Pnn, 1+future_len, 4) 현재+미래 x_T.
         batch_diffusion_time: (B,) diffusion 시간.
@@ -444,7 +459,8 @@ def _forward_model_with_autocast(
     merged_inputs: Dict[str, torch.Tensor] = {
         **norm_inputs,
         "near_future_valid": near_future_valid,  # (B, Pnn, future_len)
-        "near_cur_future_norm_xT": near_cur_future_norm_xT,  # (B, Pnn, 1+future_len, 4)
+        "near_cur_future_norm_xT":
+            near_cur_future_norm_xT,  # (B, Pnn, 1+future_len, 4)
         "diffusion_time": batch_diffusion_time,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, Pnn, 4)
     }
@@ -796,12 +812,13 @@ def diffusion_loss_func(
 
     # 모델 forward + decoder_output 생성
     decoder_output: Dict[str, torch.Tensor] = _forward_model_with_autocast(
-        model=model, #
-        norm_inputs=norm_inputs, #
-        near_future_valid=near_future_valid, # (B, Pnn, future_len)
-        near_cur_future_norm_xT=near_cur_future_norm_xT, # (B, Pnn, 1+future_len, 4)
-        batch_diffusion_time=batch_diffusion_time, # (B,)
-        cond_last_pos_norm=cond_last_pos_norm, # (B, Pnn, 4)
+        model=model,  #
+        norm_inputs=norm_inputs,  #
+        near_future_valid=near_future_valid,  # (B, Pnn, future_len)
+        near_cur_future_norm_xT=
+        near_cur_future_norm_xT,  # (B, Pnn, 1+future_len, 4)
+        batch_diffusion_time=batch_diffusion_time,  # (B,)
+        cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
     )
 
     # score: (B, Pnn, future_len, 4)
@@ -816,10 +833,10 @@ def diffusion_loss_func(
     dpm_loss: torch.Tensor = _compute_dpm_loss(
         args=args,
         model_type=model_type,
-        score=score, # (B, Pnn, future_len, 4)
-        std=std, # (B, 1, 1, 1)
-        random_noise=random_noise, # (B, Pnn, future_len, 4)
-        near_future_norm_gt=near_future_norm_gt, # (B, Pnn, future_len, 4)
+        score=score,  # (B, Pnn, future_len, 4)
+        std=std,  # (B, 1, 1, 1)
+        random_noise=random_noise,  # (B, Pnn, future_len, 4)
+        near_future_norm_gt=near_future_norm_gt,  # (B, Pnn, future_len, 4)
     )
 
     # 시간 가중치(w_t) 생성
@@ -836,9 +853,9 @@ def diffusion_loss_func(
 
     # neighbor_prediction_loss (스칼라)
     loss_val: torch.Tensor = _aggregate_weighted_loss(
-        per_step_loss=dpm_loss, # (B, Pnn, future_len)
-        valid_mask=near_future_valid, # (B, Pnn, future_len)
-        w_t=w_t, # (1, 1, future_len)
+        per_step_loss=dpm_loss,  # (B, Pnn, future_len)
+        valid_mask=near_future_valid,  # (B, Pnn, future_len)
+        w_t=w_t,  # (1, 1, future_len)
         eps=1e-6,
     )
     loss_dict["neighbor_prediction_loss"] = loss_val
