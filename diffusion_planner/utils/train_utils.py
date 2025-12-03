@@ -6,6 +6,7 @@ import io
 import os
 import json
 from pickle import UnpicklingError
+from typing import Dict, Tuple, Optional, List
 
 
 def openjson(path):
@@ -37,9 +38,36 @@ def set_seed(CUR_SEED):
     torch.backends.cudnn.benchmark = False
 
 
-def get_epoch_mean_loss(epoch_loss):
+def get_epoch_mean_loss(
+        epoch_loss_dict_list: List[Dict[str,
+                                        torch.Tensor]]) -> Dict[str, float]:
+    """한 에폭 동안 step별 loss 딕셔너리 리스트에서, key별 평균 값을 계산한다.
+
+    사용 예:
+        - train_epoch 안에서 매 step마다 loss 딕셔너리(예: {"loss": tensor(0.5), "integration_loss": tensor(0.1), ...})
+          를 epoch_loss_dict_list 리스트에 append 해 놓고,
+        - 에폭 끝에서 이 함수를 호출하면 각 key마다 스칼라 평균값을 돌려준다.
+
+    Args:
+        epoch_loss_dict_list (List[Dict[str, torch.Tensor]]):
+            - 길이: num_steps (에폭 내 step 수).
+            - 각 원소: step별 loss 딕셔너리.
+              · 예: {"loss": tensor(...), "neighbor_prediction_loss": tensor(...), ...}
+              · 각 value 는 보통 shape=() 인 스칼라 텐서이지만,
+                int/float 형태로 들어와도 처리 가능하다.
+
+    Returns:
+        Dict[str, float]:
+            - key: loss 이름 (예: "loss", "neighbor_prediction_loss", "integration_loss_xy" 등)
+            - value: 한 에폭 동안 해당 key에 대한 평균 스칼라 값.
+
+    Note:
+        - 내부에서 key별로 [step0, step1, ...] 리스트를 만든 뒤,
+          np.mean(np.array(values)) 로 평균을 구한다.
+        - 텐서는 value.item() 으로 float 로 변환해서 저장한다.
+    """
     epoch_mean_loss = {}
-    for current_loss in epoch_loss:
+    for current_loss in epoch_loss_dict_list:
         for key, value in current_loss.items():
             if key in epoch_mean_loss:
                 epoch_mean_loss[key].append(
@@ -50,6 +78,7 @@ def get_epoch_mean_loss(epoch_loss):
                 ]
 
     for key, values in epoch_mean_loss.items():
+        # values: List[float]  → np.array(values).shape = (num_steps,)
         epoch_mean_loss[key] = np.mean(np.array(values))
 
     return epoch_mean_loss
