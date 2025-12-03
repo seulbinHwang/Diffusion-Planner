@@ -443,10 +443,6 @@ def get_directional_proximal_map_objects(
         AssertionError:
             - 요청한 레이어 중 현재 맵에서 지원하지 않는 레이어가 있을 때.
     """
-    if not isinstance(map_api, NuPlanMap):
-        raise TypeError(
-            f"`get_directional_proximal_map_objects` 는 NuPlanMap 전용입니다. "
-            f"받은 타입: {type(map_api)!r}")
 
     # 1) 지원 레이어 확인
     supported_layers: List[

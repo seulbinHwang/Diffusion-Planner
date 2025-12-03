@@ -80,7 +80,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (13.0, 13.0)
-    dpi: int = 400
+    dpi: int = 600
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -93,7 +93,7 @@ class DrawingOptions:
     LANE_boundary_width: float = 1.
     LANE_draw_lane_centerline: bool = True  # check
     LANE_draw_npc_agent_route: bool = True
-    LANE_draw_vel_limit: bool = True
+    LANE_draw_vel_limit: bool = False
     LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
     LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
@@ -119,7 +119,7 @@ class DrawingOptions:
         "line_width": 0.4,
         "fill_alpha_current": 0.8,
     }
-    EGO_draw_ego_past_vel: bool = True  # check
+    EGO_draw_ego_past_vel: bool = False  # check
     # NEW: ego 주변 반경 원 옵션
     EGO_draw_radius_circle: bool = True         # ego 주변 원을 그릴지 여부
     EGO_radius_circle_m: float = 150.0           # 원 반지름 [m]
@@ -197,10 +197,10 @@ class DrawingOptions:
             "velocity_line_width": 0.2,
         },
     }
-    NEI_draw_past_token: bool = False
+    NEI_draw_past_token: bool = True
     NEI_past_token_place_offset_m: float = 0.5
     NEI_past_token_color: str = CYAN  # TODO
-    NEI_past_token_fontsize: int = 5
+    NEI_past_token_fontsize: int = 3
     ########### [NEIGHBOR] PAST OUTPUT ##################
     NEI_draw_neighbor_past_output = False
     NEI_neighbor_past_output_style = {
@@ -1215,10 +1215,12 @@ def draw_neighbor_past(ax: plt.Axes,
                     zorder=7 if t == current_t else 4,
                     t=t)
             if options.NEI_draw_velocity_text:
-                if t % 2 == 0:
-                    offset = 2
+                if t % 20 == 0:
+                    offset = 5
                 else:
-                    offset = 1
+                    offset = 3
+                if t % 10 != 0:
+                    continue
                 # [추가] 속도 크기 텍스트(km/h) - 모든 과거 지점
                 speed_kmh = float(np.hypot(vx, vy)) * 3.6
                 ax.text(
@@ -1259,7 +1261,7 @@ def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
         x, y = float(row[0]), float(row[1])
         ax.text(x + options.NEI_past_token_place_offset_m,
                 y + options.NEI_past_token_place_offset_m,
-                str(track_token)[:5],
+                str(track_token),#[:5],
                 color=options.NEI_past_token_color,
                 fontsize=options.NEI_past_token_fontsize,
                 ha='left',
@@ -2452,7 +2454,19 @@ def draw_world_model_to_png(
     ]  # ["1be4dfd6d2f852a9", "f476b2c85dd7508c", "88dbeb62be085df7"] # d6ff7e795dd051ac
     # draw_token_list = ["d6ff7e795dd051ac"] # aee2dbe7e9245b23
     # draw_token_list = ["8f85cc67cb005921"]
+    draw_token_list = ["725916938b635a6a", "6c229171ce82522f",
+                       "301f25e8eec059c8", "2045120275235b70","4a5c4367c1a05eec",
+                       "f476b2c85dd7508c", "79628c71e7235e74", "88dbeb62be085df7",
+                       "323efed07e795031", "5f0cde9b72c74a8a", "2e3b8f4c16485428"
+                       "9a43610571815b5c",
+                       "3aef014a6b26521e", "7d1c247dedfe562d", "994e1d789d9f55f6",
+                       "cacdd4aaa39a5463", "4d5baf8fab3551f0",
+                       "15927b42cd1a52d5", "a70597f8077d5853",
+                       ]
     draw_token_list = None
+
+
+
     draw_option = options or DrawingOptions()
 
     # 1) Figure/Axes
