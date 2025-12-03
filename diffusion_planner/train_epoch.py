@@ -268,12 +268,22 @@ def _apply_augmentation(
         Tuple[inputs, ego_future_gt_3_dim, near_future_gt_3_dim]:
             augmentation 이 반영된 새 텐서들.
     """
+
     if isinstance(aug, StatePerturbation):
         inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(
             inputs, ego_future_gt_3_dim, near_future_gt_3_dim)
 
     if isinstance(aug, NPCStatePerturbation):
         inputs, near_future_gt_3_dim = aug(inputs, near_future_gt_3_dim, args)
+    # augmentation 과정에서 값이 바뀌었더라도,
+    # 원래 패딩이었던 위치는 다시 전부 0으로 되돌린다.
+    # augmentation 전에 패딩 위치 기억 (B, A, Tf, 1)
+    pad_mask_near: torch.Tensor = (near_future_gt_3_dim == 0).all(
+        dim=-1, keepdim=True
+    )
+    near_future_gt_3_dim = near_future_gt_3_dim.masked_fill(
+        pad_mask_near, 0.0
+    )
 
     return inputs, ego_future_gt_3_dim, near_future_gt_3_dim
 

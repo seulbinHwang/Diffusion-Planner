@@ -472,15 +472,20 @@ class DiffusionPlannerCollate:
         target_len1: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """(N_i, M_i) 배열들을 (B, target_len0, target_len1)로 0 패딩한다.
+        """(N_i, M_i) 배열들을 (B, target_len0, target_len1)로 패딩.
 
-        대표 예:
-          - "agent_route_lane_order":
-              각 샘플 shape = (chosen_agent_num, chosen_lane_num)
-              → 배치: (B, data_max_agent_num, data_max_lane_num)
+        현재는 agent_route_lane_order에만 사용됨.
+        - npz 안에서는: -1 = not in route, 0.. = rank
+        - 여기서 새로 생기는 패딩도 -1로 맞춰줘야 Encoder 로직과 일관됨.
         """
         batch_size: int = len(batch)
-        out = torch.zeros((batch_size, target_len0, target_len1), dtype=dtype)
+        # 🔴 기존: out = torch.zeros(...)
+        # ✅ 수정: -1로 채워서 패딩 = "route 없음"으로 명시
+        out = torch.full(
+            (batch_size, target_len0, target_len1),
+            fill_value=-1,
+            dtype=dtype,
+        )
 
         for b_idx, sample in enumerate(batch):
             arr = sample[key]
@@ -489,6 +494,7 @@ class DiffusionPlannerCollate:
             if n0 <= 0 or n1 <= 0:
                 continue
             out[b_idx, :n0, :n1] = torch.as_tensor(arr[:n0, :n1], dtype=dtype)
+
         return out
 
     # ------------------------------------------------------------------

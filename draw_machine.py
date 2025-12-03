@@ -2108,7 +2108,6 @@ def save_figure_to_png(fig: plt.Figure, save_path: str) -> None:
     """Figure를 PNG로 저장하고 Figure를 닫음."""
     plt.savefig(save_path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
-    print("[SUCCESS] Saved figure to:", save_path)
 
 
 # =============================================================================

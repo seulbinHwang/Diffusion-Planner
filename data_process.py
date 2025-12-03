@@ -14,7 +14,7 @@ _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 # PyTorch intra/inter-op 스레드 환경변수 (있으면 import 시점에 반영)
 _os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")  # inter-op
 _os.environ.setdefault("TORCH_NUM_THREADS", "1")          # intra-op
-
+import time
 # ---- 멀티프로세싱은 spawn으로 (fork로 인한 상태 상속 이슈 회피) ----
 try:
     import multiprocessing as _mp
@@ -533,7 +533,6 @@ def get_filter_parameters(num_scenarios_per_type=None,
             remove_invalid_goals, shuffle, ego_start_speed_threshold,
             ego_stop_speed_threshold, speed_noise_tolerance)
 
-
 def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
     """
     한 시나리오를 처리할 때 사용되는 함수.
@@ -566,11 +565,14 @@ def process_single_scenario(config_and_scenario: Tuple[Any, Any]) -> None:
         raise
 
 
-if __name__ == "__main__":
-    args = args_util.get_args()
+# ====================== main()용 헬퍼 함수들 ======================
 
-    sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
-    ctrl_run = None
+def prepare_save_path(args: argparse.Namespace) -> None:
+    """캐시 파일을 저장할 폴더를 준비한다.
+
+    Args:
+        args (argparse.Namespace): 커맨드라인 인자. args.save_path를 사용한다.
+    """
     # 1) 저장 폴더
     if args.reset_save_path:
         # 기존 폴더 삭제 후 새로 생성
@@ -582,8 +584,18 @@ if __name__ == "__main__":
     print("save_path:", args.save_path)
     os.makedirs(args.save_path, exist_ok=True)
 
+
+def get_processed_npz_set(args: argparse.Namespace) -> Set[str]:
+    """이미 생성된 .npz 파일 목록을 읽어 집합으로 만든다.
+
+    Args:
+        args (argparse.Namespace): 커맨드라인 인자. args.save_path를 사용한다.
+
+    Returns:
+        Set[str]: 이미 처리된 샘플 ID 집합. 원소 개수 = 저장된 .npz 개수.
+    """
+    processed: Set[str] = set()
     # 2) 이미 생성된 .npz 확인
-    processed = set()
     with os.scandir(args.save_path) as it:
         for entry in it:
             name = entry.name
@@ -591,12 +603,23 @@ if __name__ == "__main__":
             if name.endswith('.npz'):
                 # replace 대신 슬라이싱: 조금 더 빠름
                 processed.add(name[:-4])
+    return processed
 
+
+def load_train_log_names(args: argparse.Namespace) -> List[str]:
+    """학습에 사용할 로그 이름 리스트를 읽고, 깨진 DB 로그는 제외한다.
+
+    Args:
+        args (argparse.Namespace): 커맨드라인 인자. args.data_path를 사용한다.
+
+    Returns:
+        List[str]: 최종적으로 사용할 로그 이름 리스트.
+    """
     # 3) 학습에 쓸 로그 이름 읽기
     with open('./nuplan_train.json', encoding="utf-8") as f:
-        log_names = json.load(f)
+        log_names: List[str] = json.load(f)
 
-    # 3-1) 깨진 로그 목록 읽어 제외  ### NEW
+    # 3-1) 깨진 로그 목록 읽어 제외
     from pathlib import Path
     bad_db_path = os.path.join(args.data_path, "bad_db.json")
     if os.path.exists(bad_db_path):
@@ -609,13 +632,29 @@ if __name__ == "__main__":
     else:
         print("bad_db.json이 없어 모든 로그를 사용합니다.")
 
+    return log_names
+
+
+def build_scenarios_from_args(args: argparse.Namespace,
+                              log_names: List[str]) -> List[Any]:
+    """설정과 로그 이름을 이용해 nuPlan 시나리오 리스트를 만든다.
+
+    Args:
+        args (argparse.Namespace): 커맨드라인 인자.
+        log_names (List[str]): 사용할 로그 이름 리스트.
+
+    Returns:
+        List[Any]: 로딩된 시나리오 객체 리스트. 길이 = 전체 시나리오 개수.
+    """
     # 4) 시나리오 빌더
     map_version = "nuplan-maps-v1.0"
-    builder = NuPlanScenarioBuilder(args.data_path, # "/media/user/E/dataset/nuplan-v1.1/splits/trainval"
-                                    args.map_path, # "/media/user/E/dataset/maps"
-                                    sensor_root=None,
-                                    db_files=None,
-                                    map_version=map_version)
+    builder = NuPlanScenarioBuilder(
+        args.data_path,  # "/media/user/E/dataset/nuplan-v1.1/splits/trainval"
+        args.map_path,   # "/media/user/E/dataset/maps"
+        sensor_root=None,
+        db_files=None,
+        map_version=map_version,
+    )
     scenario_filter = ScenarioFilter(*get_filter_parameters(
         args.scenarios_per_type,
         args.total_scenarios,
@@ -636,57 +675,167 @@ if __name__ == "__main__":
     # scenarios = builder.get_scenarios(scenario_filter, loader_pool)  # 내부에서 병렬 로딩
     print(f"Total scenarios: {len(scenarios)}")
     loader_pool._executor.shutdown(wait=True)
+    return list(scenarios)
 
-    proc_pool = SingleMachineParallelExecutor(use_process_pool=True,
-                                              max_workers=available_cpu_count())
 
+def create_proc_pool() -> SingleMachineParallelExecutor:
+    """시나리오 캐싱에 사용할 프로세스 풀을 만든다.
+
+    Returns:
+        SingleMachineParallelExecutor: use_process_pool=True 로 만든 실행기.
+    """
+    proc_pool = SingleMachineParallelExecutor(
+        use_process_pool=True,
+        max_workers=available_cpu_count(),
+    )
+    return proc_pool
+
+
+def compute_remaining_scenarios(
+    scenarios: List[Any],
+    processed: Set[str],
+) -> List[Any]:
+    """이미 처리된 시나리오를 제외하고 남은 시나리오 목록을 만든다.
+
+    Args:
+        scenarios (List[Any]): 전체 시나리오 리스트. 길이 = 전체 시나리오 수.
+        processed (Set[str]): 이미 처리된 `<map>_<token>` ID 집합.
+
+    Returns:
+        List[Any]: 새로 처리해야 할 시나리오 리스트.
+    """
     #######
     # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
     print(f"processed: {len(processed)}")
     # 6-1) ID → 시나리오 객체 매핑
-    scenario_id_map = {f"{s._map_name}_{s.token}": s for s in scenarios}
+    scenario_id_map: Dict[str, Any] = {
+        f"{s._map_name}_{s.token}": s for s in scenarios
+    }
     # 6-2) processed와 차집합 연산
     remaining_ids = scenario_id_map.keys() - processed
     # 6-3) 최종 리스트
-    remaining = [scenario_id_map[token] for token in remaining_ids]
+    remaining: List[Any] = [scenario_id_map[token] for token in remaining_ids]
     remaining = remaining
     print(f"Remaining to process: {len(remaining)}")
+    return remaining
 
-    # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시 ──────────────────────
+
+def run_parallel_caching(
+    remaining: List[Any],
+    args: argparse.Namespace,
+    proc_pool: SingleMachineParallelExecutor,
+) -> None:
+    """남은 시나리오들을 병렬로 캐싱하고, 전체 진행률과 ETA를 출력한다.
+
+    Args:
+        remaining (List[Any]): 새로 처리해야 할 시나리오 리스트.
+        args (argparse.Namespace): 커맨드라인 인자. vars(args)를 그대로 넘긴다.
+        proc_pool (SingleMachineParallelExecutor): 프로세스 풀 실행기.
+    """
+    # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시
     if remaining:
-        # 전체 배치 개수
-        cfg_dict = vars(args)  # Namespace -> dict (pickle friendly)
+        cfg_dict = vars(args)
+        total = len(remaining)
 
-        # map: iterable 인자들을 “열” 단위로 넘긴다.
-        # 1st iterable  → remaining 시나리오들
-        # 2nd iterable  → cfg_dict 를 시나리오 수 만큼 반복
+        # 전체 진행률 계산용
+        start_ts = time.time()
+        # 1% 단위로만 찍기 (최소 1개)
+        log_every = max(1, total // 100)
+
+        print(f"[CACHE] start: {total:,} scenarios to process")
+
         try:
             results = proc_pool.map(
                 Task(run_scenario),
                 remaining,
-                [cfg_dict] * len(remaining),
-                verbose=True,  # tqdm 진행률 표시
+                [cfg_dict] * total,
+                verbose=False,  # ✅ 내부 tqdm 끄기
             )
-            # 결과 소비(예외 전파용) ─ 이미 _map 내부에서 tqdm 으로 진행률 출력
-            for _ in results:
-                pass
+
+            def _fmt_hhmm(sec: float) -> str:
+                """초 단위를 '00h00m' 형태 문자열로 바꾼다."""
+                if not (sec > 0):
+                    return "--:--"
+                h = int(sec // 3600)
+                m = int((sec % 3600) // 60)
+                return f"{h:02d}h{m:02d}m"
+
+            # ✅ 완료된 시나리오 수 기준으로 전체 진행률 출력
+            for i, _ in enumerate(results, start=1):
+                # 1% 단위 / 처음 / 끝에서만 찍기 → 로그 과하지 않게
+                if i == 1 or i == total or i % log_every == 0:
+                    now = time.time()
+                    elapsed = now - start_ts
+                    done_ratio = i / total
+                    speed = i / elapsed if elapsed > 0 else 0.0
+                    remain = total - i
+                    eta_sec = remain / speed if speed > 0 else 0.0
+
+                    print(
+                        f"[CACHE] {i:,}/{total:,} "
+                        f"({done_ratio*100:5.1f}%) | "
+                        f"elapsed {_fmt_hhmm(elapsed)}, "
+                        f"ETA {_fmt_hhmm(eta_sec)}"
+                    )
+
         finally:
             proc_pool._executor.shutdown(wait=True)
     else:
         print("새로 처리할 시나리오가 없습니다.")
-    if ctrl_run is not None:
-        ctrl_run.finish()
-    # 8) 결과 파일 목록 저장(동일)  ───────────────────────────
+
+
+def save_npz_index(args: argparse.Namespace) -> None:
+    """저장된 .npz 파일 이름 리스트를 json으로 저장한다.
+
+    Args:
+        args (argparse.Namespace): 커맨드라인 인자. args.save_path를 사용한다.
+    """
+    # 8) 결과 파일 목록 저장(동일)
     npz_files = [f for f in os.listdir(args.save_path) if f.endswith('.npz')]
     with open('./diffusion_planner_training.json', 'w') as jf:
         json.dump(npz_files, jf, indent=4)
     print(f"Saved {len(npz_files)} .npz file names")
 
+
+def maybe_save_statistics(args: argparse.Namespace) -> None:
+    """통계 플래그가 켜져 있으면 히스토그램 이미지를 생성해 저장한다.
+
+    Args:
+        args (argparse.Namespace): 커맨드라인 인자. args.save_path와 플래그를 사용한다.
+    """
     # 집계 & 히스토그램 저장
     if args.make_statistics_when_caching:
         stats = _load_all_sample_stats(args.save_path)
         save_path = os.path.join(args.save_path, "histograms")
         os.makedirs(save_path, exist_ok=True)
         hist_png = os.path.join(save_path, "dataset_statistics_histograms.png")
-        _plot_and_save_histograms(stats, hist_png, title_prefix="Diffusion-world model")
+        _plot_and_save_histograms(
+            stats, hist_png, title_prefix="Diffusion-world model")
         print(f"Saved histogram PNG: {hist_png}")
+
+
+def main() -> None:
+    """data_process.py의 전체 흐름을 단계별로 실행한다."""
+    args = args_util.get_args()
+
+    sf.get_scenarios_from_log_file = safe_get_scenarios_from_log_file
+    ctrl_run = None
+
+    prepare_save_path(args)
+    processed = get_processed_npz_set(args)
+    log_names = load_train_log_names(args)
+    scenarios = build_scenarios_from_args(args, log_names)
+    proc_pool = create_proc_pool()
+    remaining = compute_remaining_scenarios(scenarios, processed)
+    run_parallel_caching(remaining, args, proc_pool)
+
+    if ctrl_run is not None:
+        ctrl_run.finish()
+
+    save_npz_index(args)
+    maybe_save_statistics(args)
+
+
+if __name__ == "__main__":
+    main()
+

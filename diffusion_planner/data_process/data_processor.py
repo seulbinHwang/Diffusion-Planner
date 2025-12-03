@@ -1,6 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 import matplotlib
+import time
 
 matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
@@ -156,8 +157,12 @@ class DataProcessor(object):
         speed_mps: np.ndarray = vector_map_output[
             'lanes_speed_limit']  # (lane_num, 1) float
 
-        # 유효 차선 판정: 모든 성분이 0인 행은 패딩으로 간주
-        lanes_valid_mask = (np.abs(lanes).sum(axis=(1, 2)) > 0)  # (lane_num,)
+
+        # 유효 차선 판정:
+        #   - 앞 8채널(x, y, vec, left/right 등)이 전부 0이면 패딩으로 간주
+        #   - 즉, lanes[..., :8]의 모든 값이 0인 lane 은 무시
+        lanes_front8: np.ndarray = lanes[..., :8]  # (lane_num, lane_len, 8)
+        lanes_valid_mask = (np.abs(lanes_front8).sum(axis=(1, 2)) > 0)  # (lane_num,)
         if lanes_valid_mask.sum() == 0:
             return 0.0, None
 
@@ -558,7 +563,7 @@ class DataProcessor(object):
         modified_past: np.ndarray = neighbor_agents_past.copy()
 
         # 첫 8개 feature만 0으로 세팅
-        modified_past[:, :target, :5] = 0.0
+        modified_past[:, :target, :8] = 0.0
 
         return modified_past
 
@@ -1007,8 +1012,13 @@ class DataProcessor(object):
 
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
+        # ✅ 시나리오가 여러 개일 때만 tqdm 사용
+        if len(scenarios) > 1:
+            iterator = tqdm(scenarios)
+        else:
+            iterator = scenarios
 
-        for scenario in tqdm(scenarios):
+        for scenario in iterator:
             map_name = scenario._map_name
             scenario_token = scenario.token
             map_api = scenario.map_api
