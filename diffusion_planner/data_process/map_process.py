@@ -1889,7 +1889,6 @@ def map_process(
         lane_speed_limit_array=lane_speed_limit_array,
         lane_has_speed_limit_array=lane_has_speed_limit_array,
     )
-
     vector_map_output: Dict[str, np.ndarray] = {
         "lanes": vector_map_lanes,  # (lane_num, lane_len, 12)
         "lanes_speed_limit": lane_speed_limit_array,  # (lane_num, 1)
@@ -1900,6 +1899,6 @@ def map_process(
         "route_lanes_has_speed_limit":
             route_lanes_has_speed_limit,  # (route_lane_num, 1)
         "agent_route_lane_order":
-            agent_route_lane_order,  # (max_agent_num, lane_num)
+            agent_route_lane_order,  # (chosen_agent_num, chosen_lane_num)
     }
     return vector_map_output

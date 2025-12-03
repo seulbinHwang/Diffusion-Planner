@@ -6,6 +6,8 @@ import args_util
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
+from typing import Any, Callable, Dict
+
 # --- sanity check: env vars that must be ints ---
 # def _fix_int_env(name: str, default: Optional[int] = None):
 #     v = os.environ.get(name)
@@ -348,6 +350,297 @@ def build_adamw_with_param_groups(
     return optim, extra_nwd
 
 
+from typing import Any, Dict, List
+import torch
+
+
+class DiffusionPlannerCollate:
+    """DiffusionPlannerData 샘플들을 배치 텐서로 묶는 collate_fn.
+
+    각 샘플마다 아래 상한이 적용된 상태로 .npz에 저장되어 있다.
+      - agent 수   ≤ caching_max_agent_num
+      - lane 수    ≤ lane_num
+      - route 수   ≤ route_num
+      - static 수  ≤ max_static_num
+
+    하지만 샘플마다 실제 개수는 다를 수 있으므로, 한 배치 안에서는
+
+        - data_max_agent_num  = max_i neighbor_agents_past_i.shape[0]
+        - data_max_lane_num   = max_i lanes_i.shape[0]
+        - data_max_route_num  = max_i route_lanes_i.shape[0]
+        - data_max_static_num = max_i static_objects_i.shape[0]
+
+    으로 실제 최대 길이를 구한 뒤, 그 길이에 맞춰 0으로 패딩해서 고정 shape 배치를 만든다.
+
+    최종 shape 예:
+      - neighbor_agents_past         : (B, data_max_agent_num, time_len, 11)
+      - near_future_gt_3_dim         : (B, data_max_agent_num, future_len, 3)
+      - static_objects               : (B, data_max_static_num, 10)
+      - lanes / lanes_*              : (B, data_max_lane_num, lane_len, ·)
+      - route_lanes / route_lanes_*  : (B, data_max_route_num, route_len, ·)
+      - agent_route_lane_order       : (B, data_max_agent_num, data_max_lane_num)
+
+    이때, real_* 값이 config 상한
+      - caching_max_agent_num / lane_num / route_num / max_static_num
+    을 초과하면 바로 예외를 발생시켜, 캐싱/학습 설정 불일치를 빨리 발견할 수 있게 한다.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.caching_max_agent_num: int = int(args.caching_max_agent_num)
+        self.lane_num: int = int(args.lane_num)
+        self.route_num: int = int(args.route_num)
+        self.max_static_num: int = int(args.max_static_num)
+
+    # ------------------------------------------------------------------
+    # 1) 고정 shape 텐서들(이미 모든 샘플에서 shape 동일) 스택하는 도우미
+    # ------------------------------------------------------------------
+    def _stack_fixed(
+        self,
+        batch: List[Dict[str, Any]],
+        key: str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """모든 샘플에서 shape가 같은 키를 단순히 (B, ...)로 쌓는다.
+
+        Args:
+            batch: 샘플 dict 리스트. 길이 = B.
+            key:   예: "ego_agent_past".
+            dtype: torch.float32 / torch.int64 / torch.bool 등.
+
+        Returns:
+            stacked: 텐서, shape = (B, *sample_shape)
+        """
+        # sample_shape: (T, D) 같은 뒷부분. B 차원만 앞에 새로 붙는다.
+        return torch.stack(
+            [torch.as_tensor(sample[key], dtype=dtype) for sample in batch],
+            dim=0,
+        )
+
+    # ------------------------------------------------------------------
+    # 2) (N_i, ...) 형태를 (B, target_len, ...)으로 패딩하는 도우미
+    # ------------------------------------------------------------------
+    def _pad_first_dim_to(
+        self,
+        batch: List[Dict[str, Any]],
+        key: str,
+        target_len: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """(N_i, ...) 배열들을 (B, target_len, ...) 텐서로 0 패딩한다.
+
+        Args:
+            batch:
+                샘플 dict 리스트. 길이 = B.
+            key:
+                예: "neighbor_agents_past", "lanes", "static_objects".
+            target_len:
+                배치 차원 뒤 첫 번째 축 길이. 예: data_max_agent_num.
+            dtype:
+                출력 텐서 dtype.
+
+        Returns:
+            padded:
+                shape = (B, target_len, *rest_shape)
+                · rest_shape 는 첫 샘플의 arr.shape[1:] 과 동일.
+        """
+        batch_size: int = len(batch)
+        if batch_size == 0:
+            return torch.zeros((0, target_len), dtype=dtype)
+
+        first_arr = batch[0][key]
+        rest_shape = first_arr.shape[1:]  # 예: (time_len, 11)
+        out_shape = (batch_size, target_len, *rest_shape)
+        padded = torch.zeros(out_shape, dtype=dtype)
+
+        for b_idx, sample in enumerate(batch):
+            arr = sample[key]
+            n_i = min(arr.shape[0], target_len)
+            if n_i <= 0:
+                continue
+            padded[b_idx, :n_i, ...] = torch.as_tensor(arr[:n_i], dtype=dtype)
+
+        return padded
+
+    # ------------------------------------------------------------------
+    # 3) (N_i, M_i) 형태를 (B, target0, target1)으로 패딩하는 도우미
+    # ------------------------------------------------------------------
+    def _pad_two_dims_to(
+        self,
+        batch: List[Dict[str, Any]],
+        key: str,
+        target_len0: int,
+        target_len1: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """(N_i, M_i) 배열들을 (B, target_len0, target_len1)로 0 패딩한다.
+
+        대표 예:
+          - "agent_route_lane_order":
+              각 샘플 shape = (chosen_agent_num, chosen_lane_num)
+              → 배치: (B, data_max_agent_num, data_max_lane_num)
+        """
+        batch_size: int = len(batch)
+        out = torch.zeros((batch_size, target_len0, target_len1), dtype=dtype)
+
+        for b_idx, sample in enumerate(batch):
+            arr = sample[key]
+            n0 = min(arr.shape[0], target_len0)
+            n1 = min(arr.shape[1], target_len1)
+            if n0 <= 0 or n1 <= 0:
+                continue
+            out[b_idx, :n0, :n1] = torch.as_tensor(arr[:n0, :n1], dtype=dtype)
+        return out
+
+    # ------------------------------------------------------------------
+    # 4) collate 본체
+    # ------------------------------------------------------------------
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """단일 샘플 dict 리스트를 고정 길이 배치 텐서 dict로 변환한다.
+
+        Args:
+            batch:
+                DiffusionPlannerData 에서 나온 샘플 dict 리스트. 길이 = B.
+
+        Returns:
+            Dict[str, torch.Tensor]:
+                key 별로 배치 차원(B)이 앞에 붙은 텐서 묶음.
+        """
+        batch_size: int = len(batch)
+        if batch_size == 0:
+            raise ValueError("빈 batch가 들어왔습니다.")
+
+        # === (1) 실제 배치에서의 최대 길이(real_*) 계산 ====================
+        data_max_agent_num = max(
+            sample["neighbor_agents_past"].shape[0] for sample in batch)
+        data_max_lane_num = max(sample["lanes"].shape[0] for sample in batch)
+        data_max_route_num = max(
+            sample["route_lanes"].shape[0] for sample in batch)
+        data_max_static_num = max(
+            sample["static_objects"].shape[0] for sample in batch)
+
+        # === (2) config 상한과 일치하는지 빠르게 체크 ======================
+        if data_max_agent_num > self.caching_max_agent_num:
+            raise ValueError(
+                f"배치 내 agent 수(data_max_agent_num={data_max_agent_num})가 "
+                f"caching_max_agent_num={self.caching_max_agent_num} 를 초과했습니다.")
+        if data_max_lane_num > self.lane_num:
+            raise ValueError(
+                f"배치 내 lane 수(data_max_lane_num={data_max_lane_num})가 "
+                f"lane_num={self.lane_num} 를 초과했습니다.")
+        if data_max_route_num > self.route_num:
+            raise ValueError(
+                f"배치 내 route 수(data_max_route_num={data_max_route_num})가 "
+                f"route_num={self.route_num} 를 초과했습니다.")
+        if data_max_static_num > self.max_static_num:
+            raise ValueError(
+                f"배치 내 static 수(data_max_static_num={data_max_static_num})가 "
+                f"max_static_num={self.max_static_num} 를 초과했습니다.")
+
+        # === (3) 고정 길이 텐서들 쌓기 =====================================
+        ego_agent_past = self._stack_fixed(
+            batch,
+            key="ego_agent_past",
+            dtype=torch.float32,  # (B, time_len, 11)
+        )
+        ego_future_gt_3_dim = self._stack_fixed(
+            batch,
+            key="ego_future_gt_3_dim",
+            dtype=torch.float32,  # (B, future_len, 3)
+        )
+        planner_future_11_dim = self._stack_fixed(
+            batch,
+            key="planner_future_11_dim",
+            dtype=torch.float32,  # (B, future_len, 11)
+        )
+
+        # === (4) agent / static / lane / route 축 패딩 ======================
+        neighbor_agents_past = self._pad_first_dim_to(
+            batch,
+            key="neighbor_agents_past",
+            target_len=data_max_agent_num,
+            dtype=torch.float32,  # (B, data_max_agent_num, time_len, 11)
+        )
+        near_future_gt_3_dim = self._pad_first_dim_to(
+            batch,
+            key="near_future_gt_3_dim",
+            target_len=data_max_agent_num,
+            dtype=torch.float32,  # (B, data_max_agent_num, future_len, 3)
+        )
+        static_objects = self._pad_first_dim_to(
+            batch,
+            key="static_objects",
+            target_len=data_max_static_num,
+            dtype=torch.float32,  # (B, data_max_static_num, 10)
+        )
+
+        lanes = self._pad_first_dim_to(
+            batch,
+            key="lanes",
+            target_len=data_max_lane_num,
+            dtype=torch.float32,  # (B, data_max_lane_num, lane_len, 12)
+        )
+        lanes_speed_limit = self._pad_first_dim_to(
+            batch,
+            key="lanes_speed_limit",
+            target_len=data_max_lane_num,
+            dtype=torch.float32,  # (B, data_max_lane_num, 1)
+        )
+        lanes_has_speed_limit = self._pad_first_dim_to(
+            batch,
+            key="lanes_has_speed_limit",
+            target_len=data_max_lane_num,
+            dtype=torch.bool,  # (B, data_max_lane_num, 1)
+        )
+
+        route_lanes = self._pad_first_dim_to(
+            batch,
+            key="route_lanes",
+            target_len=data_max_route_num,
+            dtype=torch.float32,  # (B, data_max_route_num, route_len, 12)
+        )
+        route_lanes_speed_limit = self._pad_first_dim_to(
+            batch,
+            key="route_lanes_speed_limit",
+            target_len=data_max_route_num,
+            dtype=torch.float32,  # (B, data_max_route_num, 1)
+        )
+        route_lanes_has_speed_limit = self._pad_first_dim_to(
+            batch,
+            key="route_lanes_has_speed_limit",
+            target_len=data_max_route_num,
+            dtype=torch.bool,  # (B, data_max_route_num, 1)
+        )
+
+        agent_route_lane_order = self._pad_two_dims_to(
+            batch,
+            key="agent_route_lane_order",
+            target_len0=data_max_agent_num,
+            target_len1=data_max_lane_num,
+            dtype=torch.int64,  # (B, data_max_agent_num, data_max_lane_num)
+        )
+
+        # === (5) dict 구성 (for문으로 깔끔하게) ============================
+        batch_out: Dict[str, torch.Tensor] = {}
+        for k, v in [
+            ("ego_agent_past", ego_agent_past),
+            ("ego_future_gt_3_dim", ego_future_gt_3_dim),
+            ("neighbor_agents_past", neighbor_agents_past),
+            ("lanes", lanes),
+            ("lanes_speed_limit", lanes_speed_limit),
+            ("lanes_has_speed_limit", lanes_has_speed_limit),
+            ("route_lanes", route_lanes),
+            ("route_lanes_speed_limit", route_lanes_speed_limit),
+            ("route_lanes_has_speed_limit", route_lanes_has_speed_limit),
+            ("static_objects", static_objects),
+            ("near_future_gt_3_dim", near_future_gt_3_dim),
+            ("planner_future_11_dim", planner_future_11_dim),
+            ("agent_route_lane_order", agent_route_lane_order),
+        ]:
+            batch_out[k] = v
+
+        return batch_out
+
+
 def model_training(args):
     best_loss = float('inf')
     torch.cuda.empty_cache()
@@ -458,8 +751,6 @@ def model_training(args):
         args.train_set,  # "/mnt/nuplan/dataset/processed"
         args.
         train_set_list,  # "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
-        args.max_agent_num,
-        args.predicted_neighbor_num,
         args.future_len)
     """ DistributedSampler
 	•	전체 데이터 인덱스를 전역으로 섞고(shuffle=True),
@@ -510,7 +801,9 @@ def model_training(args):
         prefetch_factor=args.prefetch_factor,
         pin_memory=args.pin_mem,
         persistent_workers=True,  # 에폭이 바뀌어도 워커 유지
-        drop_last=True)
+        drop_last=True,
+        collate_fn=DiffusionPlannerCollate(args),  # ← 변동 길이 패딩
+    )
     ############## [LR (2) ] T: 총 업데이트 스텝 수 (유지 대상) 구하기 ####################
     """ total_step_of_this_epoch
     floor( (샘플러가 이 랭크에 준 샘플 수) / (batch_size_per_rank) ).

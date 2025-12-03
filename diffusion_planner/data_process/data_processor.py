@@ -434,8 +434,8 @@ class DataProcessor(object):
         cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
             scenario, token_to_id, do_inference=True)
 
-        # neighbor_future_all_gt_11_dim: (chosen_agent_num, 1 + Tf_all, 11)
-        neighbor_future_all_gt_11_dim = agent_future_all_process(
+        # neighbor_cur_fut_all_gt_11_dim: (chosen_agent_num, 1 + Tf_all, 11)
+        neighbor_cur_fut_all_gt_11_dim = agent_future_all_process(
             ego_cur_pose_np=ego_cur_pose_np,
             cur_fut_agents_world_8_list=cur_fut_agents_world_8_list,
             neighbor_token_id=neighbors_id,
@@ -444,15 +444,15 @@ class DataProcessor(object):
 
         # [추가] past + 전체 future 를 합친 뒤, 중간 빈 프레임 보간
         #   neighbor_agents_past: (chosen_agent_num, Tp, 11)
-        #   neighbor_future_all_gt_11_dim: (chosen_agent_num, 1 + Tf_all, 11)
+        #   neighbor_future_all_gt_11_dim: (chosen_agent_num, Tf_all, 11)
         neighbor_agents_past, neighbor_future_all_gt_11_dim = \
             self._merge_and_interpolate_neighbor_11dim(
                 neighbor_agents_past=neighbor_agents_past,
-                neighbor_future_with_current_11=neighbor_future_all_gt_11_dim,
+                neighbor_cur_fut_gt_11_dim=neighbor_cur_fut_all_gt_11_dim,
             )
 
         # 11차원 전체 궤적에서 앞 3차원만 추출
-        # neighbor_future_all_gt_3_dim: (chosen_agent_num, 1 + Tf_all, 3)
+        # neighbor_future_all_gt_3_dim: (chosen_agent_num, Tf_all, 3)
         neighbor_future_all_gt_3_dim = neighbor_future_all_gt_11_dim[:, :, :3]
 
         # 현재 iteration 기준으로 원하는 future 구간만 잘라서 사용
@@ -479,9 +479,9 @@ class DataProcessor(object):
             "neighbor_agents_past":
                 neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
             "neighbor_future_gt_3_dim":
-                neighbor_future_gt_3_dim,  # (chosen_agent_num, 1+ future_len, 3)
+                neighbor_future_gt_3_dim,  # (chosen_agent_num, future_len, 3)
             "neighbor_future_all_gt_3_dim":
-                neighbor_future_all_gt_3_dim,  # (chosen_agent_num, 1+ future_all_len, 3)
+                neighbor_future_all_gt_3_dim,  # (chosen_agent_num, future_all_len, 3)
             "static_objects": static_objects,  # (chosen_static_num, 10)
         }
         ###################
@@ -565,8 +565,7 @@ class DataProcessor(object):
     def _merge_and_interpolate_neighbor_11dim(
             self,
             neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
-            neighbor_future_with_current_11: np.
-        ndarray,  # (max_agent_num, Tf, 11)
+            neighbor_cur_fut_gt_11_dim: np.ndarray,  # (max_agent_num, Tf, 11)
     ) -> Tuple[np.ndarray, np.ndarray]:
         """neighbor 과거/현재 궤적과 현재/미래 궤적을 이어 붙인 뒤,
         중간에 구멍이 뚫린 구간만 자연스럽게 채워준다.
@@ -574,7 +573,7 @@ class DataProcessor(object):
         동작 방식(한 agent 기준)
         ----------------------
         1) 과거~현재 궤적(neighbor_agents_past)과
-           현재~미래 궤적(neighbor_future_with_current_11)을
+           현재~미래 궤적(neighbor_cur_fut_gt_11_dim)을
            시간 순서대로 한 줄로 붙인다.
            - 두 배열 모두 "현재 프레임"을 포함하므로
              future 쪽의 현재 프레임(인덱스 0)은 한 번 빼고 붙인다.
@@ -599,7 +598,7 @@ class DataProcessor(object):
             neighbor_agents_past (np.ndarray):
                 - shape: (max_agent_num, Tp, 11)
                 - 각 agent의 과거~현재 궤적.
-            neighbor_future_with_current_11 (np.ndarray):
+            neighbor_cur_fut_gt_11_dim (np.ndarray):
                 - shape: (max_agent_num, Tf, 11)
                 - 각 agent의 현재~미래 궤적.
                 - 인덱스 0이 현재 프레임이라고 가정한다.
@@ -614,37 +613,36 @@ class DataProcessor(object):
                     · 구멍이 채워진 현재~미래 궤적.
         """
         # 기본 shape 검사
-        if neighbor_agents_past.ndim != 3 or neighbor_future_with_current_11.ndim != 3:
+        if neighbor_agents_past.ndim != 3 or neighbor_cur_fut_gt_11_dim.ndim != 3:
             raise ValueError(
-                f"`neighbor_agents_past` / `neighbor_future_with_current_11`는 "
+                f"`neighbor_agents_past` / `neighbor_cur_fut_gt_11_dim`는 "
                 f"(max_agent_num, time_len, 11) 형태여야 합니다. "
-                f"got {neighbor_agents_past.shape}, {neighbor_future_with_current_11.shape}"
+                f"got {neighbor_agents_past.shape}, {neighbor_cur_fut_gt_11_dim.shape}"
             )
 
         if neighbor_agents_past.shape[
-                -1] != 11 or neighbor_future_with_current_11.shape[-1] != 11:
+                -1] != 11 or neighbor_cur_fut_gt_11_dim.shape[-1] != 11:
             raise ValueError(
                 f"두 입력의 마지막 차원은 11이어야 합니다. "
-                f"got {neighbor_agents_past.shape[-1]}, {neighbor_future_with_current_11.shape[-1]}"
+                f"got {neighbor_agents_past.shape[-1]}, {neighbor_cur_fut_gt_11_dim.shape[-1]}"
             )
 
-        if neighbor_agents_past.shape[
-                0] != neighbor_future_with_current_11.shape[0]:
+        if neighbor_agents_past.shape[0] != neighbor_cur_fut_gt_11_dim.shape[0]:
             raise ValueError(
-                "neighbor_agents_past 와 neighbor_future_with_current_11 의 agent 축 크기가 다릅니다."
+                "neighbor_agents_past 와 neighbor_cur_fut_gt_11_dim 의 agent 축 크기가 다릅니다."
             )
 
         max_agent_num: int = neighbor_agents_past.shape[0]
         past_len: int = neighbor_agents_past.shape[1]
-        future_len: int = neighbor_future_with_current_11.shape[1]
+        future_len: int = neighbor_cur_fut_gt_11_dim.shape[1]
 
         # agent 가 하나도 없거나, future 길이가 0이면 그냥 반환
         if max_agent_num == 0 or future_len == 0:
-            return neighbor_agents_past, neighbor_future_with_current_11
+            return neighbor_agents_past, neighbor_cur_fut_gt_11_dim
 
         # (max_agent_num, Tf-1, 11)  — future 쪽의 "현재 프레임"(인덱스 0) 제거
-        neighbor_future_wo_current: np.ndarray = neighbor_future_with_current_11[:,
-                                                                                 1:, :]
+        neighbor_future_wo_current: np.ndarray = neighbor_cur_fut_gt_11_dim[:,
+                                                                            1:, :]
 
         # full_traj_11: (max_agent_num, T_full, 11)
         #   T_full = past_len + (future_len - 1)
@@ -750,9 +748,7 @@ class DataProcessor(object):
         # new_neighbor_future_with_current_11: (max_agent_num, future_len, 11)
         #   · full_traj 기준 인덱스 past_len-1 이 "현재 프레임"에 해당
         new_neighbor_future_with_current_11: np.ndarray = full_traj_interp[:,
-                                                                           past_len
-                                                                           -
-                                                                           1:, :]
+                                                                           past_len:, :]
 
         return new_neighbor_agents_past, new_neighbor_future_with_current_11
 
@@ -1100,8 +1096,8 @@ class DataProcessor(object):
             cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
                 scenario, token_to_id, do_inference=False)
 
-            # neighbor_future_gt_11_dim: (chosen_agent_num, 1+future_len, 11)
-            neighbor_future_gt_11_dim = agent_future_all_process(
+            # neighbor_cur_fut_gt_11_dim: (chosen_agent_num, 1+future_len, 11)
+            neighbor_cur_fut_gt_11_dim = agent_future_all_process(
                 ego_cur_pose_np=ego_cur_pose_np,
                 cur_fut_agents_world_8_list=cur_fut_agents_world_8_list,
                 neighbor_token_id=neighbors_id,
@@ -1110,15 +1106,15 @@ class DataProcessor(object):
 
             # [추가] past + future 를 합쳐서 중간 빈 프레임 보간
             #   neighbor_agents_past: (chosen_agent_num, Tp, 11)
-            #   neighbor_future_gt_11_dim: (chosen_agent_num, 1+future_len, 11)
+            #   neighbor_future_gt_11_dim: (chosen_agent_num, future_len, 11)
             neighbor_agents_past, neighbor_future_gt_11_dim = \
                 self._merge_and_interpolate_neighbor_11dim(
                     neighbor_agents_past=neighbor_agents_past,
-                    neighbor_future_with_current_11=neighbor_future_gt_11_dim,
+                    neighbor_cur_fut_gt_11_dim=neighbor_cur_fut_gt_11_dim,
                 )
 
             # 보간이 끝난 11차원 궤적에서 앞 3차원만 사용
-            # neighbor_future_gt_3_dim: (chosen_agent_num, 1+future_len, 3)
+            # neighbor_future_gt_3_dim: (chosen_agent_num, future_len, 3)
             neighbor_future_gt_3_dim = neighbor_future_gt_11_dim[:, :, 0:3]
 
             # 3) static 객체
@@ -1139,7 +1135,7 @@ class DataProcessor(object):
                 "neighbor_agents_past":
                     neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
                 "neighbor_future_gt_3_dim":
-                    neighbor_future_gt_3_dim,  # (chosen_agent_num, 1+future_len, 3)
+                    neighbor_future_gt_3_dim,  # (chosen_agent_num, future_len, 3)
                 "static_objects": static_objects,  # (chosen_static_num, 10)
             }
             '''

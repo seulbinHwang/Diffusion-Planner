@@ -71,7 +71,10 @@ def get_args():
                         type=int,
                         help='number of agents',
                         default=448)
-
+    parser.add_argument('--do_not_clip',
+                        default=True,
+                        type=boolean,
+                        help='True이면 neighbor/lanes/route_lanes 축 클리핑을 수행하지 않음')
     parser.add_argument('--static_objects_state_dim',
                         type=int,
                         help='state dim for static objects',
@@ -114,7 +117,7 @@ def get_args():
     parser.add_argument('--route_num',
                         type=int,
                         help='number of route lanes',
-                        default=25)
+                        default=125)
 
     # DataLoader parameters
     parser.add_argument('--augment_prob',

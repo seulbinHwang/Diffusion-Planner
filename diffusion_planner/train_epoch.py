@@ -11,72 +11,201 @@ from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.model.module.feasible import FeasibleProjector
 # =====================================================================
 
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
+import argparse
+
 import torch
 from torch import nn
 from typing import Tuple
 ...
 from diffusion_planner.model.module.feasible import FeasibleProjector
+
+
 # =====================================================================
+def _move_batch_to_device(
+    batch: Dict[str, torch.Tensor],
+    device: str,
+) -> Dict[str, torch.Tensor]:
+    """배치 dict의 모든 텐서를 지정한 device 로 옮긴다.
+
+    Args:
+        batch: DataLoader 에서 온 배치 dict. 각 값은 torch.Tensor.
+        device: "cuda:0", "cpu" 등.
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            동일 key 를 가지되, 텐서가 모두 device 상에 놓인 dict.
+    """
+    return {
+        key: tensor.to(device, non_blocking=True)
+        for key, tensor in batch.items()
+    }
+
+
+def _clip_input_axes_by_args(
+    batch_on_device: Dict[str, torch.Tensor],
+    args: argparse.Namespace,
+) -> None:
+    """모델 설정 상한에 맞춰 입력 텐서들의 agent / lane 축을 in-place 로 자른다.
+
+    처리 규칙 (do_not_clip=False 일 때만 적용):
+      - neighbor_agents_past      : agent 축 → args.max_agent_num
+      - lanes / lanes_*           : lane  축 → args.max_use_lane_num
+      - route_lanes / route_lanes_* : lane 축 → args.max_use_lane_num
+      - agent_route_lane_order    : (agent, lane) 축 → (args.predicted_neighbor_num, args.max_use_lane_num)
+
+    route_lanes / static_objects 는 do_not_clip=True 이면 그대로 둔다.
+    """
+    # 전역 스위치: True 이면 어떤 클리핑도 수행하지 않는다.
+    if getattr(args, "do_not_clip", False):
+        return
+
+    # ---- neighbor_agents_past: (B, A, T, 11) → A ≤ max_agent_num ----
+    max_agent_num = int(getattr(args, "max_agent_num", 0))
+    if "neighbor_agents_past" in batch_on_device and max_agent_num > 0:
+        neighbor_agents_past = batch_on_device["neighbor_agents_past"]
+        if neighbor_agents_past.dim() == 4:
+            keep_agents = min(max_agent_num, neighbor_agents_past.shape[1])
+            batch_on_device["neighbor_agents_past"] = \
+                neighbor_agents_past[:, :keep_agents, :, :]
+
+    # ---- lanes / lanes_* : lane 축 → max_use_lane_num ----
+    max_use_lane_num = int(getattr(args, "max_use_lane_num", 0))
+    if "lanes" in batch_on_device and max_use_lane_num > 0:
+        lanes = batch_on_device["lanes"]
+        if lanes.dim() == 4:
+            keep_lanes = min(max_use_lane_num, lanes.shape[1])
+            if keep_lanes < lanes.shape[1]:
+                batch_on_device["lanes"] = lanes[:, :keep_lanes, :, :]
+                if "lanes_speed_limit" in batch_on_device:
+                    batch_on_device["lanes_speed_limit"] = \
+                        batch_on_device["lanes_speed_limit"][:, :keep_lanes, :]
+                if "lanes_has_speed_limit" in batch_on_device:
+                    batch_on_device["lanes_has_speed_limit"] = \
+                        batch_on_device["lanes_has_speed_limit"][:, :keep_lanes, :]
+
+    # ---- route_lanes / route_lanes_* : lane 축 → max_use_lane_num ----
+    if "route_lanes" in batch_on_device and max_use_lane_num > 0:
+        route_lanes = batch_on_device["route_lanes"]
+        if route_lanes.dim() == 4:
+            keep_route_lanes = min(max_use_lane_num, route_lanes.shape[1])
+            if keep_route_lanes < route_lanes.shape[1]:
+                batch_on_device["route_lanes"] = \
+                    route_lanes[:, :keep_route_lanes, :, :]
+                if "route_lanes_speed_limit" in batch_on_device:
+                    batch_on_device["route_lanes_speed_limit"] = \
+                        batch_on_device["route_lanes_speed_limit"][:, :keep_route_lanes, :]
+                if "route_lanes_has_speed_limit" in batch_on_device:
+                    batch_on_device["route_lanes_has_speed_limit"] = \
+                        batch_on_device["route_lanes_has_speed_limit"][:, :keep_route_lanes, :]
+
+    # ---- agent_route_lane_order: (B, A_c, L_c) → (A', L') ----
+    predicted_neighbor_num = int(getattr(args, "predicted_neighbor_num", 0))
+    if "agent_route_lane_order" in batch_on_device:
+        arl = batch_on_device["agent_route_lane_order"]
+        if arl.dim() == 3:
+            bsz, c_agent, c_lane = arl.shape
+            # agent 축은 predicted_neighbor_num 까지만 사용
+            keep_agents_for_route = c_agent
+            if predicted_neighbor_num > 0:
+                keep_agents_for_route = min(predicted_neighbor_num, c_agent)
+
+            # lane 축은 위에서 자른 lanes 의 lane 수와 맞춘다.
+            lane_dim_input = c_lane
+            if "lanes" in batch_on_device:
+                lane_dim_input = batch_on_device["lanes"].shape[1]
+            keep_lanes_for_route = min(
+                max_use_lane_num or lane_dim_input,
+                lane_dim_input,
+            )
+
+            batch_on_device["agent_route_lane_order"] = \
+                arl[:, :keep_agents_for_route, :keep_lanes_for_route]
+
+
+def _clip_targets_by_predicted_neighbors(
+    outputs: Dict[str, torch.Tensor],
+    args: argparse.Namespace,
+) -> None:
+    """정답 텐서 중 neighbor 축(predicted_neighbor_num)만 자른다.
+
+    현재는 near_future_gt_3_dim 만 처리한다.
+      - near_future_gt_3_dim: (B, A_c, Tf, 3) → A_c ≤ predicted_neighbor_num
+
+    do_not_clip=True 이면 아무 것도 자르지 않는다.
+    """
+    if getattr(args, "do_not_clip", False):
+        return
+
+    if "near_future_gt_3_dim" not in outputs:
+        return
+
+    predicted_neighbor_num = int(getattr(args, "predicted_neighbor_num", 0))
+    near_future_gt_3_dim = outputs["near_future_gt_3_dim"]
+    if near_future_gt_3_dim.dim() != 4 or predicted_neighbor_num <= 0:
+        return
+
+    # (B, A_c, Tf, 3) → (B, A', Tf, 3)
+    keep_agents = min(predicted_neighbor_num, near_future_gt_3_dim.shape[1])
+    outputs["near_future_gt_3_dim"] = \
+        near_future_gt_3_dim[:, :keep_agents, :, :]
 
 
 def _prepare_batch_for_device(
     batch: Dict[str, torch.Tensor],
     device: str,
+    args: Optional[argparse.Namespace] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """배치 dict를 GPU/CPU로 옮기고, 입력/정답을 구분해 준다.
+    """배치 dict를 GPU/CPU로 옮기고, 모델 상한에 맞게 축을 잘라 입력/정답을 나눈다.
 
-    이 함수는 Dataset에서 넘어온 배치(dict)를 한 번에 원하는 장치로 옮기고,
-    그중에서 정답 역할을 하는 텐서만 outputs로 분리한다.
+    이 함수는 DataLoader에서 넘어온 배치를:
 
-    Args:
-        batch:
-            Dataset에서 온 배치.
-            각 값의 대략적인 형태는 다음과 같다.
-            - "ego_agent_past"            : (B, time_len, 11)
-            - "ego_future_gt_3_dim"       : (B, 1 + future_len, 3)
-            - "neighbor_agents_past"      : (B, max_agent_num, time_len, 11)
-            - "lanes"                     : (B, lane_num, lane_len, 12)
-            - "lanes_speed_limit"         : (B, lane_num, 1)
-            - "lanes_has_speed_limit"     : (B, lane_num, 1)
-            - "route_lanes"               : (B, route_lane_num, route_len, 12)
-            - "route_lanes_speed_limit"   : (B, route_lane_num, 1)
-            - "route_lanes_has_speed_limit": (B, route_lane_num, 1)
-            - "static_objects"            : (B, max_static_num, 10)
-            - "near_future_gt_3_dim"      : (B, Pnn, future_len, 3)
-            - "planner_future_11_dim"     : (B, future_len, 11)
-            - "agent_route_lane_order"    : (B, Pnn, lane_num)
-        device:
-            텐서를 옮길 대상 장치. 예: "cuda:0", "cpu" 등.
+      1) 지정한 device 로 옮기고,
+      2) 모델 설정 상한(max_agent_num, predicted_neighbor_num, max_use_lane_num)에 맞춰
+         agent / lane 관련 축만 앞쪽에서 잘라 준 뒤,
+      3) 정답 텐서(ego_future_gt_3_dim, near_future_gt_3_dim)를 따로 분리한다.
 
-    Returns:
-        inputs:
-            모델 forward에 바로 넣을 입력 텐서 dict.
-            (정답 텐서를 제외한 나머지 키/값, shape는 위와 동일하게 (B, ...) 구조)
-        outputs:
-            정답 텐서 dict.
-            - "ego_future_gt_3_dim"  : (B, 1 + future_len, 3)
-            - "near_future_gt_3_dim" : (B, Pnn, future_len, 3)
+    전제: collate_fn(DiffusionPlannerCollate)에서 이미
+      - neighbor_agents_past         : (B, data_max_agent_num, time_len, 11)
+      - near_future_gt_3_dim         : (B, data_max_agent_num, future_len, 3)
+      - static_objects               : (B, data_max_static_num, 10)
+      - lanes / lanes_*              : (B, data_max_lane_num, lane_len, ·)
+      - route_lanes / route_lanes_*  : (B, data_max_route_num, route_len, ·)
+      - agent_route_lane_order       : (B, data_max_agent_num, data_max_lane_num)
+    형태로 패딩이 끝난 상태라고 가정한다.
+
+    여기서는 (do_not_clip=False 인 경우에만)
+      - neighbor_agents_past / near_future_gt_3_dim: agent 축 → max_agent_num / predicted_neighbor_num
+      - lanes / lanes_*                            : lane  축 → max_use_lane_num
+      - route_lanes / route_lanes_*                : lane  축 → max_use_lane_num
+      - agent_route_lane_order                     : (agent, lane) 축 → (predicted_neighbor_num, max_use_lane_num)
+      - static_objects                              : 그대로 유지
+
+    를 수행한다.
     """
-    # 1) 배치 전체를 장치로 이동
-    batch_on_device: Dict[str, torch.Tensor] = {
-        key: tensor.to(device, non_blocking=True)
-        for key, tensor in batch.items()
-    }
+    # 1) device 로 옮기기
+    batch_on_device: Dict[str,
+                          torch.Tensor] = _move_batch_to_device(batch, device)
 
     # 2) dtype 특수 처리: route lane order는 항상 long 형으로 맞춘다.
     if "agent_route_lane_order" in batch_on_device:
-        # (B, Pnn, lane_num)
         batch_on_device["agent_route_lane_order"] = batch_on_device[
             "agent_route_lane_order"].long()
 
-    # 3) 정답 키만 outputs로 분리
+    # 3) 입력 텐서들의 agent / lane 축을 모델 상한에 맞게 자르기
+    if args is not None:
+        _clip_input_axes_by_args(batch_on_device, args)
+
+    # 4) 정답 키만 outputs 로 분리
     target_keys = {"ego_future_gt_3_dim", "near_future_gt_3_dim"}
     outputs: Dict[str, torch.Tensor] = {}
-
     for key in list(batch_on_device.keys()):
         if key in target_keys:
             outputs[key] = batch_on_device.pop(key)
+
+    # 5) 정답 중 neighbor 축(predicted_neighbor_num)만 안쪽에서 추가 클리핑
+    if args is not None:
+        _clip_targets_by_predicted_neighbors(outputs, args)
 
     inputs: Dict[str, torch.Tensor] = batch_on_device
     return inputs, outputs
@@ -105,7 +234,8 @@ def train_epoch(data_loader,
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
-            inputs, outputs = _prepare_batch_for_device(batch, args.device)
+            inputs, outputs = _prepare_batch_for_device(batch, args.device,
+                                                        args)
             # ego_future_gt_3_dim: (B, 1 + future_len, 3)
             ego_future_gt_3_dim = outputs["ego_future_gt_3_dim"]
             # near_future_gt_3_dim: (B, predicted_neighbor_num, future_len, 3)

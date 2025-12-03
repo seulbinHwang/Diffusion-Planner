@@ -231,7 +231,6 @@ def get_ego_future_array_from_scenario(
     # fut_ego_world_10: (T, 10)
     fut_ego_world_10 = sampled_future_ego_states_to_array(
         list(future_ego_states))
-
     # ego_cur_pose_np: (3,) = [x_ego, y_ego, yaw_ego] (월드 좌표계)
     ego_cur_pose_np = np.array(
         [
@@ -245,7 +244,6 @@ def get_ego_future_array_from_scenario(
     # fut_ego_local_11: (T, 11)  ← 'ego' 모드로 상대 좌표 변환 후 float32
     fut_ego_local_11 = convert_absolute_quantities_to_relative(
         fut_ego_world_10, ego_cur_pose_np, 'ego').astype(np.float32)
-
     # fut_ego_local_xy: (T, 2)  ← x,y 만 분리
     fut_ego_local_xy = fut_ego_local_11[:, :2]
     fut_ego_local_cos_yaw = fut_ego_local_11[:, 2]
@@ -258,7 +256,6 @@ def get_ego_future_array_from_scenario(
     # fut_ego_local_xyh: (T, 3) = [x, y, heading]
     fut_ego_local_xyh = np.concatenate(
         [fut_ego_local_xy, fut_ego_local_heading[:, None]], axis=-1)
-
     return fut_ego_local_xyh, fut_ego_local_11
 
 
