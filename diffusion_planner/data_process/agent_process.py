@@ -804,9 +804,10 @@ def _pack_ego_local_agents(
         empty_mask = (np.abs(frame_non_id).sum(axis=-1) == 0.0)
 
         # heading: (current_agents_num,)
-        heading = frame_cur_exists_agents_local[
-            :, AgentInternalIndex.heading()
-        ].squeeze()
+        # ※ squeeze() 쓰지 말고, 항상 1차원 배열로 유지
+        heading = frame_cur_exists_agents_local[:, AgentInternalIndex.heading()]
+        heading = heading.astype(np.float64, copy=False).reshape(-1)  # (current_agents_num,)
+
         # cos_heading, sin_heading: (current_agents_num,)
         cos_heading = np.cos(heading)
         sin_heading = np.sin(heading)
