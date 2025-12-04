@@ -82,11 +82,11 @@ def get_args():
     parser.add_argument('--static_objects_num',
                         type=int,
                         help='number of static objects',
-                        default=5)
+                        default=50)
     parser.add_argument('--max_static_num',
                         type=int,
                         help='number of static objects',
-                        default=5)
+                        default=50)
 
 
     parser.add_argument('--lane_len',
