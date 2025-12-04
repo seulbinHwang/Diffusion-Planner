@@ -2,7 +2,7 @@
 # This script runs the data processing and then cleans the generated dataset.
 
 # [추가] 96코어 고정 및 내부 스레드 1로 제한
-export DP_MAX_CPUS=96
+export DP_MAX_CPUS=128
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -23,7 +23,7 @@ echo "Step 1: Running data processing..."
 NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
 NUPLAN_MAP_PATH="/media/user/E/dataset/maps"
 # 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
-TRAIN_SET_NAME="processed_route_with_many"
+TRAIN_SET_NAME="processed_many"
 TRAIN_SET_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
