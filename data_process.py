@@ -1,6 +1,8 @@
 # ==== CPU-ONLY & THREADING GUARD (must be first) ==============================
 import os as _os
 import args_util
+from typing import Dict, List, Union
+
 # ---- GPU 완전 차단 ----
 _os.environ["CUDA_VISIBLE_DEVICES"] = ""
 _os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
@@ -60,7 +62,9 @@ except Exception:
 
 
 import os
-
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 import argparse
 import json
@@ -171,124 +175,192 @@ def _load_all_sample_stats(save_dir: str) -> Dict[str, List[float]]:
     }
 
 
+def _int_bin_edges(data: np.ndarray) -> np.ndarray:
+    """정수형 데이터 히스토그램용 bin 경계값을 계산한다.
+
+    Args:
+        data (np.ndarray): shape (N,), 정수/실수 값이 들어 있는 1차원 배열.
+
+    Returns:
+        np.ndarray: shape (K,), 막대 경계값 1차원 배열.
+    """
+    if data.size == 0:
+        # shape (2,)
+        return np.array([-0.5, 0.5], dtype=float)
+    vmin = max(0, int(np.floor(np.nanmin(data))))
+    vmax = int(np.ceil(np.nanmax(data)))
+    if vmax < vmin:
+        vmax = vmin
+    # 정수 중앙에 막대가 오도록 -0.5, +0.5 간격
+    # shape (K,)
+    return np.arange(vmin - 0.5, vmax + 1.5, 1.0)
+
+
+def _auto_continuous_edges(data: np.ndarray, max_bins: int = 50) -> np.ndarray:
+    """연속값 데이터에 대해 자동으로 bin 경계값을 계산한다.
+
+    Args:
+        data (np.ndarray): shape (N,), 실수 값이 들어 있는 1차원 배열.
+        max_bins (int): 최대 bin 개수.
+
+    Returns:
+        np.ndarray: shape (K,), 막대 경계값 1차원 배열.
+    """
+    # shape (M,), NaN/무한대 제거
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return np.array([0.0, 1.0])
+    dmin, dmax = float(np.min(data)), float(np.max(data))
+    if not np.isfinite(dmin) or not np.isfinite(dmax):
+        return np.array([0.0, 1.0])
+    if dmax <= dmin:
+        eps = 1.0 if dmax == 0 else abs(dmax) * 0.1
+        return np.array([dmin - eps, dmax + eps])
+
+    q25, q75 = np.percentile(data, [25, 75])
+    iqr = q75 - q25
+    n = data.size
+    if iqr > 0:
+        bw = 2.0 * iqr * (n ** (-1.0 / 3.0))
+    else:
+        sd = np.std(data)
+        bw = 3.5 * sd * (n ** (-1.0 / 3.0)) if sd > 0 else (dmax - dmin) / 10.0
+    bw = max(bw, (dmax - dmin) / 100.0)  # 너무 촘촘/빈약 방지
+
+    nbins = int(np.ceil((dmax - dmin) / bw))
+    nbins = max(5, min(nbins, max_bins))
+    # shape (K,)
+    return np.linspace(dmin, dmax, nbins + 1)
+
+
+def _hist(
+    ax: plt.Axes,
+    data: Union[List[float], np.ndarray],
+    title: str,
+    xlabel: str,
+    bins: Union[int, str] = "auto",
+    integer_bins: bool = False,
+) -> None:
+    """하나의 히스토그램을 그리고, y축을 % 단위로 맞춘다.
+
+    Args:
+        ax (plt.Axes): 히스토그램을 그릴 축 객체.
+        data (List[float] | np.ndarray): shape (N,), 원본 데이터.
+        title (str): 그래프 제목.
+        xlabel (str): x축 라벨.
+        bins (int | str): bin 개수 또는 모드 문자열("auto" 등).
+        integer_bins (bool): 정수형 bin을 사용할지 여부.
+                             True인 경우 x축 눈금이 항상 정수가 되도록 설정한다.
+    """
+    # shape (N,)
+    data = np.asarray(data, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        ax.text(0.5, 0.5, "No Data", ha="center", va="center")
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Percentage of samples (%)")
+        ax.grid(True, alpha=0.3)
+        return
+
+    # y축을 %로: 각 샘플에 100/N 가중치
+    # weights shape (N,)
+    weights = np.full_like(data, 100.0 / data.size, dtype=float)
+
+    # bin 엣지 결정
+    if integer_bins:
+        # 정수 개수용 bin → x축 눈금도 정수만 나오도록 설정
+        edges = _int_bin_edges(data)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    else:
+        if isinstance(bins, int):
+            # 명시적 bin 개수 → 엣지 균등 분할
+            dmin, dmax = float(np.min(data)), float(np.max(data))
+            if dmax <= dmin:
+                edges = np.array([dmin - 0.5, dmax + 0.5])
+            else:
+                # shape (bins+1,)
+                edges = np.linspace(dmin, dmax, bins + 1)
+        else:
+            # 'auto' 등 문자열 → 직접 엣지 계산
+            edges = _auto_continuous_edges(data)
+
+    ax.hist(data, bins=edges, weights=weights)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Percentage of samples (%)")
+    ax.grid(True, alpha=0.3)
+
+
 def _plot_and_save_histograms(
     stats: Dict[str, List[float]],
     out_path: str,
     title_prefix: str = "Dataset Statistics",
 ) -> None:
-    """수집된 리스트로 5개 히스토그램을 그리고 하나의 PNG로 저장한다.
-    - y축: % (전체 대비 비율)
-    - vehicle/pedestrian/bicycle: 정수 구간(bin)
-    - bins='auto' 대신 가중치 지원되는 **엣지 직접 계산** 사용
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import MaxNLocator
+    """5개의 히스토그램을 한 그림에 그린 뒤 PNG 파일로 저장한다.
 
+    - vehicle/pedestrian/bicycle 는 개수 히스토그램이고,
+      이 세 개 그래프의 x축 눈금은 항상 정수 값만 사용된다.
+    - 나머지 두 그래프는 비율(%)과 속도(km/h)를 표시한다.
+
+    Args:
+        stats (Dict[str, List[float]]): 각 항목별 값 리스트.
+            - "vehicle_count": List[float], 길이 N
+            - "pedestrian_count": List[float], 길이 N
+            - "bicycle_count": List[float], 길이 N
+            - "lane_speed_limit_ratio_percent": List[float], 길이 N
+            - "mean_speed_limit_kmh": List[float], 길이 N
+        out_path (str): PNG를 저장할 파일 경로.
+        title_prefix (str): 각 서브플롯 제목 앞에 붙일 문자열.
+    """
     fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+    # axes shape (6,)
     axes = axes.ravel()
 
-    def _int_bin_edges(data: np.ndarray) -> np.ndarray:
-        """정수형 데이터용 bin edges(정수 중앙에 막대가 오도록 -0.5, +0.5 간격)."""
-        if data.size == 0:
-            return np.array([-0.5, 0.5], dtype=float)
-        vmin = max(0, int(np.floor(np.nanmin(data))))
-        vmax = int(np.ceil(np.nanmax(data)))
-        if vmax < vmin:
-            vmax = vmin
-        return np.arange(vmin - 0.5, vmax + 1.5, 1.0)
-
-    def _auto_continuous_edges(data: np.ndarray, max_bins: int = 50) -> np.ndarray:
-        """가중치 지원을 위해 '엣지'를 직접 만들기(Freedman–Diaconis 유사)."""
-        data = data[np.isfinite(data)]
-        if data.size == 0:
-            return np.array([0.0, 1.0])
-        dmin, dmax = float(np.min(data)), float(np.max(data))
-        if not np.isfinite(dmin) or not np.isfinite(dmax):
-            return np.array([0.0, 1.0])
-        if dmax <= dmin:
-            eps = 1.0 if dmax == 0 else abs(dmax) * 0.1
-            return np.array([dmin - eps, dmax + eps])
-
-        q25, q75 = np.percentile(data, [25, 75])
-        iqr = q75 - q25
-        n = data.size
-        if iqr > 0:
-            bw = 2.0 * iqr * (n ** (-1.0 / 3.0))
-        else:
-            sd = np.std(data)
-            bw = 3.5 * sd * (n ** (-1.0 / 3.0)) if sd > 0 else (dmax - dmin) / 10.0
-        bw = max(bw, (dmax - dmin) / 100.0)  # 너무 촘촘/빈약 방지
-
-        nbins = int(np.ceil((dmax - dmin) / bw))
-        nbins = max(5, min(nbins, max_bins))
-        return np.linspace(dmin, dmax, nbins + 1)
-
-    def _hist(ax, data, title, xlabel, bins="auto", integer_bins=False):
-        data = np.asarray(data, dtype=float)
-        data = data[np.isfinite(data)]
-        if data.size == 0:
-            ax.text(0.5, 0.5, "No Data", ha="center", va="center")
-            ax.set_title(title)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel("Percentage of samples (%)")
-            ax.grid(True, alpha=0.3)
-            return
-
-        # y축을 %로: 각 샘플에 100/N 가중치
-        weights = np.full_like(data, 100.0 / data.size, dtype=float)
-
-        # bin 엣지 결정
-        if integer_bins:
-            edges = _int_bin_edges(data)
-            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
-        else:
-            if isinstance(bins, int):
-                # 명시적 bin 개수 → 엣지 균등 분할
-                dmin, dmax = float(np.min(data)), float(np.max(data))
-                if dmax <= dmin:
-                    edges = np.array([dmin - 0.5, dmax + 0.5])
-                else:
-                    edges = np.linspace(dmin, dmax, bins + 1)
-            else:
-                # 'auto' 등 문자열 → 직접 엣지 계산
-                edges = _auto_continuous_edges(data)
-
-        ax.hist(data, bins=edges, weights=weights)
-        ax.set_title(title)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Percentage of samples (%)")
-        ax.grid(True, alpha=0.3)
-
     # 정수 개수 계열(대수): 정수 bin + % y축
-    _hist(axes[0], stats["vehicle_count"],
-          f"{title_prefix}: Vehicles / sample",
-          "Vehicles per sample",
-          integer_bins=True)
+    _hist(
+        axes[0],
+        stats["vehicle_count"],
+        f"{title_prefix}: Vehicles / sample",
+        "Vehicles per sample",
+        integer_bins=True,
+    )
 
-    _hist(axes[1], stats["pedestrian_count"],
-          f"{title_prefix}: Pedestrians / sample",
-          "Pedestrians per sample",
-          integer_bins=True)
+    _hist(
+        axes[1],
+        stats["pedestrian_count"],
+        f"{title_prefix}: Pedestrians / sample",
+        "Pedestrians per sample",
+        integer_bins=True,
+    )
 
-    _hist(axes[2], stats["bicycle_count"],
-          f"{title_prefix}: Bicycles / sample",
-          "Bicycles per sample",
-          integer_bins=True)
+    _hist(
+        axes[2],
+        stats["bicycle_count"],
+        f"{title_prefix}: Bicycles / sample",
+        "Bicycles per sample",
+        integer_bins=True,
+    )
 
     # 비율(%): 명시적인 bin 개수(20) → 엣지 생성 + % y축
-    _hist(axes[3], stats["lane_speed_limit_ratio_percent"],
-          f"{title_prefix}: % Lanes with speed limit",
-          "% (per sample)",
-          bins=20,
-          integer_bins=False)
+    _hist(
+        axes[3],
+        stats["lane_speed_limit_ratio_percent"],
+        f"{title_prefix}: % Lanes with speed limit",
+        "% (per sample)",
+        bins=20,
+        integer_bins=False,
+    )
 
     # 연속값: 자동 엣지 계산 + % y축
-    _hist(axes[4], stats["mean_speed_limit_kmh"],
-          f"{title_prefix}: Mean speed limit (km/h) on limited lanes",
-          "km/h",
-          bins="auto",   # 내부에서 엣지 직접 계산
-          integer_bins=False)
+    _hist(
+        axes[4],
+        stats["mean_speed_limit_kmh"],
+        f"{title_prefix}: Mean speed limit (km/h) on limited lanes",
+        "km/h",
+        bins="auto",  # 내부에서 엣지 직접 계산
+        integer_bins=False,
+    )
 
     axes[5].axis("off")
     fig.tight_layout()
@@ -577,7 +649,7 @@ def prepare_save_path(args: argparse.Namespace) -> None:
     if args.reset_save_path:
         # 기존 폴더 삭제 후 새로 생성
         if os.path.exists(args.save_path):
-            ans = input("\n[data_process.py] Delete these files? [y/N]: ").strip().lower()
+            ans = input(f"\n[data_process.py] Delete files at '{args.save_path}'? [y/N]: ").strip().lower()
             if ans == 'y':
                 shutil.rmtree(args.save_path)
                 print(f"Removed existing save path: {args.save_path}")
@@ -594,7 +666,7 @@ def get_processed_npz_set(args: argparse.Namespace) -> Set[str]:
     Returns:
         Set[str]: 이미 처리된 샘플 ID 집합. 원소 개수 = 저장된 .npz 개수.
     """
-    processed: Set[str] = set()
+    processed_npz_set: Set[str] = set()
     # 2) 이미 생성된 .npz 확인
     with os.scandir(args.save_path) as it:
         for entry in it:
@@ -602,8 +674,8 @@ def get_processed_npz_set(args: argparse.Namespace) -> Set[str]:
             # .npz 끝나는 것만
             if name.endswith('.npz'):
                 # replace 대신 슬라이싱: 조금 더 빠름
-                processed.add(name[:-4])
-    return processed
+                processed_npz_set.add(name[:-4])
+    return processed_npz_set
 
 
 def load_train_log_names(args: argparse.Namespace) -> List[str]:
@@ -637,7 +709,7 @@ def load_train_log_names(args: argparse.Namespace) -> List[str]:
 
 def build_scenarios_from_args(args: argparse.Namespace,
                               log_names: List[str]) -> List[Any]:
-    """설정과 로그 이름을 이용해 nuPlan 시나리오 리스트를 만든다.
+    """설정과 로그 이름을 이용해, nuPlan 시나리오 리스트를 만든다.
 
     Args:
         args (argparse.Namespace): 커맨드라인 인자.
@@ -693,26 +765,26 @@ def create_proc_pool() -> SingleMachineParallelExecutor:
 
 def compute_remaining_scenarios(
     scenarios: List[Any],
-    processed: Set[str],
+    processed_npz_set: Set[str],
 ) -> List[Any]:
     """이미 처리된 시나리오를 제외하고 남은 시나리오 목록을 만든다.
 
     Args:
         scenarios (List[Any]): 전체 시나리오 리스트. 길이 = 전체 시나리오 수.
-        processed (Set[str]): 이미 처리된 `<map>_<token>` ID 집합.
+        processed_npz_set (Set[str]): 이미 처리된 `<map>_<token>` ID 집합.
 
     Returns:
         List[Any]: 새로 처리해야 할 시나리오 리스트.
     """
     #######
     # 6) 아직 안 한 시나리오만 (차집합 + 한 번만 포맷팅)
-    print(f"processed: {len(processed)}")
+    print(f"processed_npz_set: {len(processed_npz_set)}")
     # 6-1) ID → 시나리오 객체 매핑
     scenario_id_map: Dict[str, Any] = {
         f"{s._map_name}_{s.token}": s for s in scenarios
     }
     # 6-2) processed와 차집합 연산
-    remaining_ids = scenario_id_map.keys() - processed
+    remaining_ids = scenario_id_map.keys() - processed_npz_set
     # 6-3) 최종 리스트
     remaining: List[Any] = [scenario_id_map[token] for token in remaining_ids]
     remaining = remaining
@@ -822,11 +894,11 @@ def main() -> None:
     ctrl_run = None
 
     prepare_save_path(args)
-    processed = get_processed_npz_set(args)
+    processed_npz_set = get_processed_npz_set(args)
     log_names = load_train_log_names(args)
     scenarios = build_scenarios_from_args(args, log_names)
     proc_pool = create_proc_pool()
-    remaining = compute_remaining_scenarios(scenarios, processed)
+    remaining = compute_remaining_scenarios(scenarios, processed_npz_set)
     run_parallel_caching(remaining, args, proc_pool)
 
     if ctrl_run is not None:

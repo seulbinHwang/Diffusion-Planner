@@ -92,8 +92,8 @@ class DrawingOptions:
     LANE_draw_lane_boundaries: bool = True  # check
     LANE_boundary_width: float = 1.
     LANE_draw_lane_centerline: bool = True  # check
-    LANE_draw_npc_agent_route: bool = True
-    LANE_draw_vel_limit: bool = False
+    LANE_draw_npc_agent_route: bool = False
+    LANE_draw_vel_limit: bool = True
     LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
     LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)

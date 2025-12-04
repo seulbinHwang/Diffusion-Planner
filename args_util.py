@@ -264,7 +264,7 @@ def get_args():
     parser.add_argument(
         '--scenarios_cache_out',  # 1) 저장할 파일
         type=str,
-        default=None,  #'scenarios_cache.pkl',
+        default="scenarios_cache.pkl",  #'scenarios_cache.pkl',
         help='새로 추출한 시나리오를 저장할 *.pkl 경로',
     )
     parser.add_argument('--data_path',
@@ -297,9 +297,9 @@ def get_args():
                         help='shuffle scenarios')
     parser.add_argument('--save_image',
                         type=bool,
-                        default=False,
+                        default=True,
                         help='shuffle scenarios')
-    parser.add_argument('--make_statistics_when_caching', default=False, type=boolean)
+    parser.add_argument('--make_statistics_when_caching', default=True, type=boolean)
     args = parser.parse_args()
     if not args.use_direct_loss:
         assert not args.use_guidance and not args.use_feasible_blend, \
