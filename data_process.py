@@ -3,19 +3,12 @@ import os as _os
 import args_util
 from typing import Dict, List, Union
 
-# ---- GPU 완전 차단 ----
-_os.environ["CUDA_VISIBLE_DEVICES"] = ""
-_os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
-_os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 
 # ---- BLAS/OMP 과다 병렬 방지 (각 프로세스가 1스레드만 쓰게) ----
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("MKL_NUM_THREADS", "1")
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 _os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-# PyTorch intra/inter-op 스레드 환경변수 (있으면 import 시점에 반영)
-_os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")  # inter-op
-_os.environ.setdefault("TORCH_NUM_THREADS", "1")          # intra-op
 import time
 # ---- 멀티프로세싱은 spawn으로 (fork로 인한 상태 상속 이슈 회피) ----
 try:
@@ -393,14 +386,10 @@ def run_scenario(
     cfg_dict: Dict  # config 를 dict 로 직렬화한 것 (2nd iterable)
 ) -> None:
     import os
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    os.environ["NVIDIA_VISIBLE_DEVICES"] = ""
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-    os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")
-    os.environ.setdefault("TORCH_NUM_THREADS", "1")
     """
     • 각 워커 프로세스에서 여러 번 호출된다.
     • 최초 호출 시에만 DataProcessor 를 만들어 전역에 저장하고 재사용한다.
@@ -669,7 +658,7 @@ def build_scenarios_from_args(args: argparse.Namespace,
     ))
     # 5) 시나리오 생성
     loader_pool = SingleMachineParallelExecutor(
-        use_process_pool=False, max_workers=available_cpu_count())
+        use_process_pool=True, max_workers=available_cpu_count())
     scenarios = get_or_load_scenarios(
         builder=builder,
         scenario_filter=scenario_filter,
