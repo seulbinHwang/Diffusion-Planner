@@ -328,7 +328,7 @@ def _plot_and_save_histograms(
 
 
 # [추가] 전역 CPU 고정값(기본 128). 환경변수 DP_MAX_CPUS로 덮어쓰기 가능
-DP_MAX_CPUS = int(os.environ.get("DP_MAX_CPUS", "96"))
+DP_MAX_CPUS = int(os.environ.get("DP_MAX_CPUS", "64"))
 
 # [추가] 과다 스레딩 방지(각 워커 프로세스 내부 스레드 1로 고정)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
