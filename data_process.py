@@ -657,7 +657,7 @@ def build_scenarios_from_args(args: argparse.Namespace,
     ))
     # 5) 시나리오 생성
     loader_pool = SingleMachineParallelExecutor(
-        use_process_pool=True, max_workers=available_cpu_count())
+        use_process_pool=False, max_workers=available_cpu_count())
     scenarios = get_or_load_scenarios(
         builder=builder,
         scenario_filter=scenario_filter,
