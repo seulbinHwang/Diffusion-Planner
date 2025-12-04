@@ -4,7 +4,6 @@ import args_util
 from typing import Dict, List, Union
 
 
-# ---- BLAS/OMP 과다 병렬 방지 (각 프로세스가 1스레드만 쓰게) ----
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
 _os.environ.setdefault("MKL_NUM_THREADS", "1")
 _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -680,7 +679,7 @@ def create_proc_pool() -> SingleMachineParallelExecutor:
         SingleMachineParallelExecutor: use_process_pool=True 로 만든 실행기.
     """
     proc_pool = SingleMachineParallelExecutor(
-        use_process_pool=False,
+        use_process_pool=True,
         max_workers=available_cpu_count(),
     )
     return proc_pool
