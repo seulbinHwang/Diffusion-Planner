@@ -1015,6 +1015,7 @@ class DataProcessor(object):
         # ✅ 시나리오가 여러 개일 때만 tqdm 사용
         if len(scenarios) > 1:
             iterator = tqdm(scenarios)
+            print("len(scenarios):", len(scenarios))
         else:
             iterator = scenarios
 
