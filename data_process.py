@@ -823,6 +823,7 @@ def run_parallel_caching(
                 [cfg_dict] * total,
                 verbose=False,  # ✅ 내부 tqdm 끄기
             )
+            print("len(results):", len(results))
 
             def _fmt_hhmm(sec: float) -> str:
                 """초 단위를 '00h00m' 형태 문자열로 바꾼다."""

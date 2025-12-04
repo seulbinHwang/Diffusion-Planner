@@ -1017,7 +1017,6 @@ class DataProcessor(object):
             iterator = tqdm(scenarios)
         else:
             iterator = scenarios
-        print("len(scenarios):", len(scenarios))
 
         for scenario in iterator:
             map_name = scenario._map_name
