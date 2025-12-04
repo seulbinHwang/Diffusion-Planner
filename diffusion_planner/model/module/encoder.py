@@ -932,15 +932,25 @@ class Encoder(nn.Module):
                                    torch.Tensor]) -> Dict[str, torch.Tensor]:
         """인코더 전방 패스(무작위 길이 M만큼 ego 미래를 조건으로 사용하는 버전).
 
-        입력 딕셔너리 예시:
-            - ego_agent_past:           (B, time_len, 11)
-            - planner_future_11_dim:    (B, future_len, 11)
-            - neighbor_agents_past:     (B, A, time_len, 11)
-            - static_objects:           (B, P, D_static)
-            - lanes:                    (B, L, lane_len, 12)
-            - lanes_speed_limit:        (B, L, 1)
-            - lanes_has_speed_limit:    (B, L, 1)
-            - agent_route_lane_order:   (B, Pnn, L)
+        입력 딕셔너리
+            ego_agent_past : (B, time_len, 11) #
+            ego_future_gt_3_dim : (B, future_len, 3)
+            neighbor_agents_past : (B, agent_num, time_len, 11) #
+            lanes : (B, lane_num, lane_len, 12) #
+            lanes_speed_limit : (B, lane_num, 1) #
+            lanes_has_speed_limit : (B, lane_num, 1) #
+            route_lanes : (B, route_num, route_len, 12)
+            route_lanes_speed_limit : (B, route_num, 1)
+            route_lanes_has_speed_limit : (B, route_num, 1)
+            static_objects : (B, static_num, 10) #
+            near_future_gt_3_dim: (B, Pnn, future_len, 3)
+            planner_future_11_dim: (B, future_len, 11) #
+            agent_route_lane_order: (B, agent_num, lane_num)
+
+            near_future_valid: (B, Pnn, future_len) 미래 유효 마스크.
+            near_cur_future_norm_xT: (B, Pnn, 1+future_len, 4) 현재+미래 x_T.
+            batch_diffusion_time: (B,) diffusion 시간.
+            cond_last_pos_norm: (B, Pnn, 4) cond 용 마지막 위치.
 
         처리 흐름:
             1) 입력 텐서 정리 및 속도 채널(vx, vy) 0 세팅(옵션).

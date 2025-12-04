@@ -271,13 +271,10 @@ class Decoder(nn.Module):
                 target_agents_mask] = neighbor_agents_class_one_hot[
                     target_agents_mask]  #
             # TODO: 임시 -> _predicted_neighbor_num 에 대한 의존성 타파?
-            near_past_current = near_past_current[:, :self.
-                                                  _predicted_neighbor_num]  # [B, pnn, time_len, 11]
-            near_class_one_hot = near_class_one_hot[:, :self.
-                                                    _predicted_neighbor_num, :]  # [B, pnn, 3]
+            near_past_current = near_past_current[:, :predicted_agents_num]  # [B, pnn, time_len, 11]
+            near_class_one_hot = near_class_one_hot[:, :predicted_agents_num, :]  # [B, pnn, 3]
             # near_past_current_mask : [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
-            near_past_current_mask = near_past_current_mask[:, :self.
-                                                            _predicted_neighbor_num]
+            near_past_current_mask = near_past_current_mask[:, :predicted_agents_num]
 
         return near_past_current, near_past_current_mask, near_class_one_hot
 
@@ -593,6 +590,7 @@ class Decoder(nn.Module):
         near_future_gt_3_dim: Optional[torch.Tensor] = inputs.get(
             "near_future_gt_3_dim", None
         )  # (B, Pnn, future_len, 3) 또는 None
+
         predicted_agents_num: Optional[int] = (
             int(near_future_gt_3_dim.shape[1])
             if near_future_gt_3_dim is not None
@@ -663,14 +661,14 @@ class Decoder(nn.Module):
         )  # (B, Pnn, 4)
 
         return (
-            near_past,
-            near_current_xyyaw,
-            near_current_mask,
-            near_past_cur_future_valid,
-            near_class_one_hot,
-            cond_last_pos_norm,
-            batch_size,
-            predicted_neighbor_num,
+            near_past, # (B, Pnn, past_len, 11)
+            near_current_xyyaw, # (B, Pnn, 4)
+            near_current_mask, # (B, Pnn)
+            near_past_cur_future_valid, # (B, Pnn, time_len + future_len)
+            near_class_one_hot, # (B, Pnn, 3)
+            cond_last_pos_norm, # (B, Pnn, 4)
+            batch_size, # int
+            predicted_neighbor_num, # int
         )
 
     def _unpack_encoder_outputs(
@@ -684,7 +682,7 @@ class Decoder(nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """encoder_outputs dict 에서 디코더가 쓰는 텐서들을 꺼낸다.
+        """ encoder_outputs dict 에서 디코더가 쓰는 텐서들을 꺼낸다.
 
         Args:
             encoder_outputs: Encoder 단계에서 만들어진 출력 dict.
@@ -1113,7 +1111,30 @@ class Decoder(nn.Module):
 
         Args:
             encoder_outputs: Encoder 에서 나온 출력 dict.
+                - "encoding":                  (B, token_num, hidden_dim)
+                - "encoding_mask":             (B, token_num)
+                - "ego_fut_global":            (B, hidden_dim)
+                - "near_agents_route_lane_emb":(B, Pnn, hidden_dim)
+                - "route_known_mask":          (B, Pnn)
             inputs: DataLoader 에서 온 배치 dict.
+                ego_agent_past : (B, time_len, 11) #
+                ego_future_gt_3_dim : (B, future_len, 3)
+                neighbor_agents_past : (B, agent_num, time_len, 11) #
+                lanes : (B, lane_num, lane_len, 12) #
+                lanes_speed_limit : (B, lane_num, 1) #
+                lanes_has_speed_limit : (B, lane_num, 1) #
+                route_lanes : (B, route_num, route_len, 12)
+                route_lanes_speed_limit : (B, route_num, 1)
+                route_lanes_has_speed_limit : (B, route_num, 1)
+                static_objects : (B, static_num, 10) #
+                near_future_gt_3_dim: (B, Pnn, future_len, 3)
+                planner_future_11_dim: (B, future_len, 11) #
+                agent_route_lane_order: (B, agent_num, lane_num)
+
+                near_future_valid: (B, Pnn, future_len) 미래 유효 마스크.
+                near_cur_future_norm_xT: (B, Pnn, 1+future_len, 4) 현재+미래 x_T.
+                batch_diffusion_time: (B,) diffusion 시간.
+                cond_last_pos_norm: (B, Pnn, 4) cond 용 마지막 위치.
 
         Returns:
             Dict[str, torch.Tensor]: 최소한 "score" 키를 가지며,
