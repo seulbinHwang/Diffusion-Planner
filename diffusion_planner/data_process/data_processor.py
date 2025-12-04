@@ -1013,12 +1013,12 @@ class DataProcessor(object):
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
         # ✅ 시나리오가 여러 개일 때만 tqdm 사용
-        if len(scenarios) > 1:
-            iterator = tqdm(scenarios)
-        else:
-            iterator = scenarios
+        # if len(scenarios) > 1:
+        #     iterator = tqdm(scenarios)
+        # else:
+        #     iterator = scenarios
 
-        for scenario in iterator:
+        for scenario in scenarios:
             map_name = scenario._map_name
             scenario_token = scenario.token
             map_api = scenario.map_api
