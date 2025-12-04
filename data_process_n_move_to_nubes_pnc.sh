@@ -2,7 +2,7 @@
 # This script runs the data processing and then cleans the generated dataset.
 
 # [추가] 96코어 고정 및 내부 스레드 1로 제한
-export DP_MAX_CPUS=64
+export DP_MAX_CPUS=32
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -30,7 +30,7 @@ TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 # Run the data processing script
 # This is the command from data_process_pnc.sh
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
-taskset -c 0-63 \
+taskset -c 0-31 \
 python data_process.py \
   --data_path "$NUPLAN_DATA_PATH" \
   --map_path "$NUPLAN_MAP_PATH" \
