@@ -791,8 +791,83 @@ def compute_remaining_scenarios(
     print(f"Remaining to process: {len(remaining)}")
     return remaining
 
-
 def run_parallel_caching(
+    remaining: List[Any],
+    args: argparse.Namespace,
+    proc_pool: SingleMachineParallelExecutor,
+) -> None:
+    """남은 시나리오들을 병렬로 캐싱하고, 전체 진행률과 ETA를 출력한다.
+
+    SingleMachineParallelExecutor.map 대신
+    submit + as_completed 를 써서
+    각 시나리오가 끝날 때마다 바로 진행률을 찍는다.
+    """
+    if not remaining:
+        print("새로 처리할 시나리오가 없습니다.")
+        return
+
+    cfg_dict = vars(args)
+    total = len(remaining)
+
+    start_ts = time.time()
+    # 0.1% 단위로 로그 (최소 1개)
+    log_every = max(1, total // 1000)
+
+    print(f"[CACHE] start: {total:,} scenarios to process")
+
+    # 각 future -> 시나리오 ID 매핑 (에러 메시지용)
+    future_to_id: Dict[Any, str] = {}
+
+    # 1) 모든 작업을 한 번에 submit
+    for scn in remaining:
+        scen_id = f"{scn._map_name}_{scn.token}"
+        fut = proc_pool.submit(Task(run_scenario), scn, cfg_dict)
+        future_to_id[fut] = scen_id
+
+    try:
+        done = 0
+
+        # 2) 끝나는 작업부터 하나씩 받아서 진행률 출력
+        for fut in as_completed(future_to_id):
+            scen_id = future_to_id[fut]
+
+            # 내부 예외를 여기서 다시 꺼내서 확인
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"[ERROR] scenario failed: {scen_id} ({e})")
+                # 예전 map()처럼, 하나라도 실패하면 전체 중단
+                raise
+
+            done += 1
+
+            # 0.1% 단위 / 처음 / 마지막만 출력
+            if done == 1 or done == total or done % log_every == 0:
+                now = time.time()
+                elapsed = now - start_ts
+                speed = done / elapsed if elapsed > 0 else 0.0
+                remain = total - done
+                eta_sec = remain / speed if speed > 0 else 0.0
+
+                def _fmt_hhmm(sec: float) -> str:
+                    if not (sec > 0):
+                        return "--:--"
+                    h = int(sec // 3600)
+                    m = int((sec % 3600) // 60)
+                    return f"{h:02d}h{m:02d}m"
+
+                print(
+                    f"[CACHE] {done:,}/{total:,} "
+                    f"({done * 100 / total:5.1f}%) | "
+                    f"elapsed {_fmt_hhmm(elapsed)}, "
+                    f"ETA {_fmt_hhmm(eta_sec)}"
+                )
+    finally:
+        # 기존 코드와 동일하게 풀 정리
+        proc_pool._executor.shutdown(wait=True)
+
+
+def run_parallel_caching2(
     remaining: List[Any],
     args: argparse.Namespace,
     proc_pool: SingleMachineParallelExecutor,
