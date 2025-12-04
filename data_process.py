@@ -691,7 +691,7 @@ def create_proc_pool() -> SingleMachineParallelExecutor:
         SingleMachineParallelExecutor: use_process_pool=True 로 만든 실행기.
     """
     proc_pool = SingleMachineParallelExecutor(
-        use_process_pool=True,
+        use_process_pool=False,
         max_workers=available_cpu_count(),
     )
     return proc_pool
