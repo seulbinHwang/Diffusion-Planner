@@ -812,7 +812,7 @@ def run_parallel_caching(
         # 전체 진행률 계산용
         start_ts = time.time()
         # 1% 단위로만 찍기 (최소 1개)
-        log_every = max(1, total // 100)
+        log_every = max(1, total // 1000)
 
         print(f"[CACHE] start: {total:,} scenarios to process")
 
