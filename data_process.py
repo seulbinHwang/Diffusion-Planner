@@ -835,6 +835,7 @@ def run_parallel_caching(
 
             # ✅ 완료된 시나리오 수 기준으로 전체 진행률 출력
             for i, _ in enumerate(results, start=1):
+                print("i:", i)
                 # 1% 단위 / 처음 / 끝에서만 찍기 → 로그 과하지 않게
                 if i == 1 or i == total or i % log_every == 0:
                     now = time.time()
