@@ -88,6 +88,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import json
+from typing import Sequence
+
+def run_scenario_batch(
+    scn_list: Sequence[Any],
+    cfg_dict: Dict,
+) -> None:
+    """
+    하나의 워커 프로세스가 여러 시나리오를 한 번에 처리하도록 하는 배치 함수.
+    """
+    import os
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    global _PROCESSOR, _CFG_NS
+
+    if _PROCESSOR is None:
+        _CFG_NS = argparse.Namespace(**cfg_dict)
+        _PROCESSOR = DataProcessor(_CFG_NS)
+
+    # 한 번에 여러 개 처리
+    _PROCESSOR.work(list(scn_list))
 
 
 def _load_all_sample_stats(save_dir: str) -> Dict[str, List[float]]:
@@ -713,7 +736,7 @@ def compute_remaining_scenarios(
     print(f"Remaining to process: {len(remaining)}")
     return remaining
 
-def run_parallel_caching(
+def run_parallel_caching2(
     remaining: List[Any],
     args: argparse.Namespace,
     proc_pool: SingleMachineParallelExecutor,
@@ -787,72 +810,70 @@ def run_parallel_caching(
     finally:
         # 기존 코드와 동일하게 풀 정리
         proc_pool._executor.shutdown(wait=True)
-
-
-def run_parallel_caching2(
+def run_parallel_caching(
     remaining: List[Any],
     args: argparse.Namespace,
     proc_pool: SingleMachineParallelExecutor,
 ) -> None:
-    """남은 시나리오들을 병렬로 캐싱하고, 전체 진행률과 ETA를 출력한다.
-
-    Args:
-        remaining (List[Any]): 새로 처리해야 할 시나리오 리스트.
-        args (argparse.Namespace): 커맨드라인 인자. vars(args)를 그대로 넘긴다.
-        proc_pool (SingleMachineParallelExecutor): 프로세스 풀 실행기.
-    """
-    # 7) 배치 단위로 병렬 처리 + 실시간 완료율 표시
-    if remaining:
-        cfg_dict = vars(args)
-        total = len(remaining)
-
-        # 전체 진행률 계산용
-        start_ts = time.time()
-        # 1% 단위로만 찍기 (최소 1개)
-        log_every = max(1, total // 1000)
-
-        print(f"[CACHE] start: {total:,} scenarios to process")
-
-        try:
-            results = proc_pool.map(
-                Task(run_scenario),
-                remaining,
-                [cfg_dict] * total,
-                verbose=False,  # ✅ 내부 tqdm 끄기
-            )
-            print("len(results):", len(results))
-
-            def _fmt_hhmm(sec: float) -> str:
-                """초 단위를 '00h00m' 형태 문자열로 바꾼다."""
-                if not (sec > 0):
-                    return "--:--"
-                h = int(sec // 3600)
-                m = int((sec % 3600) // 60)
-                return f"{h:02d}h{m:02d}m"
-
-            # ✅ 완료된 시나리오 수 기준으로 전체 진행률 출력
-            for i, _ in enumerate(results, start=1):
-                print("i:", i)
-                # 1% 단위 / 처음 / 끝에서만 찍기 → 로그 과하지 않게
-                if i == 1 or i == total or i % log_every == 0:
-                    now = time.time()
-                    elapsed = now - start_ts
-                    done_ratio = i / total
-                    speed = i / elapsed if elapsed > 0 else 0.0
-                    remain = total - i
-                    eta_sec = remain / speed if speed > 0 else 0.0
-
-                    print(
-                        f"[CACHE] {i:,}/{total:,} "
-                        f"({done_ratio*100:5.1f}%) | "
-                        f"elapsed {_fmt_hhmm(elapsed)}, "
-                        f"ETA {_fmt_hhmm(eta_sec)}"
-                    )
-
-        finally:
-            proc_pool._executor.shutdown(wait=True)
-    else:
+    if not remaining:
         print("새로 처리할 시나리오가 없습니다.")
+        return
+
+    cfg_dict = vars(args)
+    total = len(remaining)
+
+    # ✅ 워커당 처리할 시나리오 수 (튜닝 포인트: 4~16 정도 시도)
+    batch_size = 8
+
+    # [scn, scn, ...] -> [[scn0..7], [scn8..15], ...] 식으로 배치 나누기
+    batches: List[List[Any]] = [
+        remaining[i:i + batch_size]
+        for i in range(0, total, batch_size)
+    ]
+
+    print(f"[CACHE] start: {total:,} scenarios, "
+          f"{len(batches)} batches (batch_size={batch_size})")
+
+    start_ts = time.time()
+    future_to_batch_size: Dict[Any, int] = {}
+
+    for batch in batches:
+        fut = proc_pool.submit(Task(run_scenario_batch), batch, cfg_dict)
+        future_to_batch_size[fut] = len(batch)
+
+    done = 0
+    log_every = max(1, total // 3000)
+
+    def _fmt_hhmm(sec: float) -> str:
+        if not (sec > 0):
+            return "--:--"
+        h = int(sec // 3600)
+        m = int((sec % 3600) // 60)
+        return f"{h:02d}h{m:02d}m"
+
+    try:
+        from concurrent.futures import as_completed
+
+        for fut in as_completed(future_to_batch_size):
+            batch_n = future_to_batch_size[fut]
+            fut.result()  # 예외 발생 시 여기서 터짐
+            done += batch_n
+
+            if done == 1 or done == total or done % log_every == 0:
+                now = time.time()
+                elapsed = now - start_ts
+                speed = done / elapsed if elapsed > 0 else 0.0
+                remain = total - done
+                eta_sec = remain / speed if speed > 0 else 0.0
+
+                print(
+                    f"[CACHE] {done:,}/{total:,} "
+                    f"({done * 100 / total:5.1f}%) | "
+                    f"elapsed {_fmt_hhmm(elapsed)}, "
+                    f"ETA {_fmt_hhmm(eta_sec)}"
+                )
+    finally:
+        proc_pool._executor.shutdown(wait=True)
 
 
 def save_npz_index(args: argparse.Namespace) -> None:
