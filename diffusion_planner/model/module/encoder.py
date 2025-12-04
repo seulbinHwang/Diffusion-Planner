@@ -1088,12 +1088,14 @@ class Encoder(nn.Module):
         route_known_mask = (~near_route_lanes_mask).any(
             dim=-1)  # (B, Pnn) True=known
         return near_agents_route_lane_emb, route_known_mask
+
     @staticmethod
     def build_route_lane_tensors_from_order(
-        encoding_lanes: torch.Tensor,   # (B, lane_num, hidden_dim)
-        lanes_mask: torch.Tensor,       # (B, lane_num)  # True=pad
-        agent_route_lane_order: torch.Tensor,  # (B, Pnn, lane_num)  # -1=not in route, 0..=rank
-        route_num: int,                 # 더 이상 사용하지 않지만, 호출 호환성 유지를 위해 남겨둠
+        encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
+        lanes_mask: torch.Tensor,  # (B, lane_num)  # True=pad
+        agent_route_lane_order: torch.
+        Tensor,  # (B, Pnn, lane_num)  # -1=not in route, 0..=rank
+        route_num: int,  # 더 이상 사용하지 않지만, 호출 호환성 유지를 위해 남겨둠
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """에이전트별 route 순서(agent_route_lane_order)에 따라 lane 전체를 정렬한다.
 
@@ -1130,9 +1132,11 @@ class Encoder(nn.Module):
         # lane 이 아예 없는 극단 상황 방어
         if lane_num == 0:
             near_route_lanes = encoding_lanes.new_zeros(B, Pnn, 0, hidden_dim)
-            near_route_lanes_mask = torch.ones(
-                B, Pnn, 0, dtype=torch.bool, device=encoding_lanes.device
-            )
+            near_route_lanes_mask = torch.ones(B,
+                                               Pnn,
+                                               0,
+                                               dtype=torch.bool,
+                                               device=encoding_lanes.device)
             return near_route_lanes, near_route_lanes_mask
 
         # 기본 순위 텐서: (B, Pnn, lane_num)
@@ -1159,9 +1163,7 @@ class Encoder(nn.Module):
         # ---- lane_num 개 전부를 “순위 낮은 것부터” 정렬 ----
         # vals: (B, Pnn, lane_num)  정렬된 순위 값
         # sorted_idx: (B, Pnn, lane_num)  정렬 후의 lane 인덱스
-        vals, sorted_idx = torch.sort(order_for_sort,
-                                      dim=-1,
-                                      descending=False)
+        vals, sorted_idx = torch.sort(order_for_sort, dim=-1, descending=False)
 
         # 실제로 route 에 있는 lane 인지 여부 (BIG 이 아니면 True)
         # route_lane_valid_mask: (B, Pnn, lane_num)
@@ -1170,13 +1172,11 @@ class Encoder(nn.Module):
         # ---- encoding_lanes 에서 정렬된 순서대로 뽑기 ----
         # encoding_lanes_: (B, 1, lane_num, hidden_dim) -> (B, Pnn, lane_num, hidden_dim)
         encoding_lanes_ = encoding_lanes.unsqueeze(1).expand(
-            B, Pnn, lane_num, hidden_dim
-        )
+            B, Pnn, lane_num, hidden_dim)
 
         # gather_idx_H: (B, Pnn, lane_num, hidden_dim)
-        gather_idx_H = sorted_idx.unsqueeze(-1).expand(
-            B, Pnn, lane_num, hidden_dim
-        )
+        gather_idx_H = sorted_idx.unsqueeze(-1).expand(B, Pnn, lane_num,
+                                                       hidden_dim)
 
         # near_route_lanes: (B, Pnn, lane_num, hidden_dim)
         near_route_lanes = torch.gather(encoding_lanes_, 2, gather_idx_H)
@@ -1197,7 +1197,6 @@ class Encoder(nn.Module):
         near_route_lanes = near_route_lanes * (1.0 - mask_f)
 
         return near_route_lanes, near_route_lanes_mask
-
 
 
 class SelfAttentionBlock(nn.Module):

@@ -525,7 +525,6 @@ class DiTBlock(nn.Module):
         Returns:
             torch.Tensor: [B,Pnn,D]
         """
-        B, Pnn, D = x.shape
         # ------ SA ------
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
         y = self.norm1(x)  # [B,Pnn,D]

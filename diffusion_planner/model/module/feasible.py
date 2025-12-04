@@ -203,7 +203,7 @@ class FeasibleProjector(nn.Module):
                     omega_max_abs_radps=0.9,
                 ),
         }
-        self.do_print = False
+
         # ------------------------------
         # 아키텍처 하이퍼파라미터(고정 폭)
         # ------------------------------
@@ -1455,22 +1455,6 @@ class FeasibleProjector(nn.Module):
             sin_mid=sin_mid,  # (B, Pnn, segment_len)
             seg_valid=seg_valid,  # (B, Pnn, segment_len)
         )  # (B, Pnn, segment_len, 3)
-        if self.do_print:
-            unnorm_seg_body_control_deg_yaw = torch.rad2deg(
-                unnorm_seg_body_control[..., 2]).unsqueeze(-1)
-            unnorm_seg_body_control_new = torch.cat(
-                [
-                    unnorm_seg_body_control[..., :2],
-                    unnorm_seg_body_control_deg_yaw
-                ],
-                dim=-1,
-            )  # (B, Pnn, segment_len, 3)  [v_x^b, v_y^b, w(deg)]
-            unnorm_seg_body_control_new = torch.round(
-                unnorm_seg_body_control_new * 10) / 10
-            print("unnorm_seg_body_control_new.shape:",
-                  unnorm_seg_body_control_new[:, 14, :, :].shape)
-            print("unnorm_seg_body_control_new[14]:",
-                  unnorm_seg_body_control_new[:, 14, :, :])
         return unnorm_seg_body_control
 
     # <추가하자>
@@ -2489,50 +2473,7 @@ class FeasibleProjector(nn.Module):
             * False: 기존 step-by-step + S2 버전 사용
             * True : 시간축 완전 배치 + S2 미사용 버전 사용
         """
-        if self.do_print:
-            target_idx = 14
 
-            unnorm_near_current_yaw = torch.atan2(
-                unnorm_near_current_state[:, :, 3],
-                unnorm_near_current_state[:, :, 2],
-            )
-            unnorm_near_current_deg_yaw = torch.rad2deg(
-                unnorm_near_current_yaw).unsqueeze(-1)
-            unnorm_near_current_xy = unnorm_near_current_state[:, :, :2]
-            unnorm_near_current_state_new = torch.cat(
-                [
-                    unnorm_near_current_xy,
-                    unnorm_near_current_deg_yaw,
-                ],
-                dim=-1,
-            )
-            unnorm_near_current_state_new = torch.round(
-                unnorm_near_current_state_new * 10) / 10
-
-            print("unnorm_near_current_state_new:",
-                  unnorm_near_current_state_new[:, target_idx].shape)
-            print("unnorm_near_current_state_new:",
-                  unnorm_near_current_state_new[:, target_idx])
-
-            unnorm_cur_future_seg_body_control_deg_yaw = torch.rad2deg(
-                unnorm_cur_future_seg_body_control[:, :, :, 2]).unsqueeze(-1)
-            unnorm_cur_future_seg_body_control_xy = unnorm_cur_future_seg_body_control[:, :, :, :
-                                                                                       2]
-            unnorm_cur_future_seg_body_control_new = torch.cat(
-                [
-                    unnorm_cur_future_seg_body_control_xy,
-                    unnorm_cur_future_seg_body_control_deg_yaw,
-                ],
-                dim=-1,
-            )
-            unnorm_cur_future_seg_body_control_new = torch.round(
-                unnorm_cur_future_seg_body_control_new * 10) / 10
-            print(
-                "unnorm_cur_future_seg_body_control_new.shape:",
-                unnorm_cur_future_seg_body_control_new[:,
-                                                       target_idx, :, :].shape)
-            print("unnorm_cur_future_seg_body_control_new:",
-                  unnorm_cur_future_seg_body_control_new[:, target_idx, :, :])
         self._assert_cur_future_valid_mask(
             near_cur_future_valid,
             context="filter_and_integrate",
@@ -2547,11 +2488,6 @@ class FeasibleProjector(nn.Module):
                 unnorm_cur_future_seg_body_control,
                 near_class_one_hot=near_class_one_hot,
             )
-        if self.do_print:
-            print("near_cur_future_valid:",
-                  near_cur_future_valid[:, target_idx, :].shape)
-            print("near_cur_future_valid:",
-                  near_cur_future_valid[:, target_idx, :])
         # 추가하자: 시간축 완전 배치 버전 (S2 미사용)
         unnorm_integrated_trajectory, unnorm_control_constraint_diff = self._filter_and_integrate_batch(
             unnorm_near_current_state=unnorm_near_current_state,
@@ -2560,27 +2496,6 @@ class FeasibleProjector(nn.Module):
             unnorm_cur_future_seg_body_control,
             near_class_one_hot=near_class_one_hot,
         )
-        if self.do_print:
-            unnorm_integrated_trajectory_deg_yaw = torch.rad2deg(
-                torch.atan2(
-                    unnorm_integrated_trajectory[:, :, :, 3],
-                    unnorm_integrated_trajectory[:, :, :, 2],
-                )).unsqueeze(-1)
-            unnorm_integrated_trajectory_xy = unnorm_integrated_trajectory[:, :, :, :
-                                                                           2]
-            unnorm_integrated_trajectory_new = torch.cat(
-                [
-                    unnorm_integrated_trajectory_xy,
-                    unnorm_integrated_trajectory_deg_yaw,
-                ],
-                dim=-1,
-            )
-            unnorm_integrated_trajectory_new = torch.round(
-                unnorm_integrated_trajectory_new * 10) / 10
-            print("unnorm_integrated_trajectory_new:",
-                  unnorm_integrated_trajectory_new[:, target_idx, :, :].shape)
-            print("unnorm_integrated_trajectory_new:",
-                  unnorm_integrated_trajectory_new[:, target_idx, :, :])
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff
 
     # ----------------------------
@@ -2774,27 +2689,6 @@ class FeasibleProjector(nn.Module):
             # (B,Pnn,past_len+1+future_len) bool
         )
         unnorm_points_xyyaw = point_len_inputs.unnorm_points_xyyaw  # (B,Pnn,point_len,4)
-        if self.do_print:
-            unnorm_points_deg_yaw = torch.rad2deg(
-                torch.atan2(
-                    unnorm_points_xyyaw[:, :, :, 3],
-                    unnorm_points_xyyaw[:, :, :, 2],
-                )).unsqueeze(-1)
-            unnorm_points_xy = unnorm_points_xyyaw[:, :, :, :2]
-            unnorm_points_xyyaw_new = torch.cat(
-                [
-                    unnorm_points_xy,
-                    unnorm_points_deg_yaw,
-                ],
-                dim=-1,
-            )
-            unnorm_points_xyyaw_new = torch.round(
-                unnorm_points_xyyaw_new * 10) / 10
-            print("unnorm_points_xyyaw_new.shape:",
-                  unnorm_points_xyyaw_new[:, 14, :, :].shape)
-            print("unnorm_points_xyyaw_new:", unnorm_points_xyyaw_new[:,
-                                                                      14, :, :])
-
         points_valid = point_len_inputs.points_valid  # (B,Pnn,point_len) bool
         B, Pnn, point_len, _ = unnorm_points_xyyaw.shape
 
@@ -2829,24 +2723,6 @@ class FeasibleProjector(nn.Module):
         unnorm_points_world_control = self._mask_and_stack_world_controls(
             v_x=v_x, v_y=v_y, yaw_rate=yaw_rate,
             points_valid=points_valid)  # (B,Pnn,point_len,3)
-        if self.do_print:
-            unnorm_points_world_control_deg_yaw = torch.rad2deg(
-                unnorm_points_world_control[:, :, :, 2:3])
-            unnorm_points_world_control_xy = unnorm_points_world_control[:, :, :, :
-                                                                         2]
-            unnorm_points_world_control_new = torch.cat(
-                [
-                    unnorm_points_world_control_xy,
-                    unnorm_points_world_control_deg_yaw,
-                ],
-                dim=-1,
-            )
-            unnorm_points_world_control_new = torch.round(
-                unnorm_points_world_control_new * 10) / 10
-            print("unnorm_points_world_control_new.shape:",
-                  unnorm_points_world_control_new[:, 14, :, :].shape)
-            print("unnorm_points_world_control_new:",
-                  unnorm_points_world_control_new[:, 14, :, :])
         return unnorm_points_world_control
 
     def _compute_yaw_rate_via_sg(
