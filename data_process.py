@@ -24,39 +24,6 @@ try:
 except Exception:
     pass
 
-# ---- PyTorch 초기화: CPU 기본 + 스레드 수 고정 + inter-op 재설정 노옵화 ----
-try:
-    import torch as _torch
-    if hasattr(_torch, "set_default_device"):
-        _torch.set_default_device("cpu")
-    if hasattr(_torch.backends, "cudnn"):
-        _torch.backends.cudnn.enabled = False
-
-    # 초기에 한 번만 낮은 스레드 수로 고정
-    try:
-        if hasattr(_torch, "set_num_threads"):
-            _torch.set_num_threads(1)             # intra-op
-        if hasattr(_torch, "set_num_interop_threads"):
-            _torch.set_num_interop_threads(1)     # inter-op
-    except Exception:
-        # 이미 풀 시작 이후면 여기서도 에러가 날 수 있으니 무시
-        pass
-
-    # 이후 어떤 모듈이 set_num_interop_threads(...)를 다시 호출해도 무시되게 노옵 패치
-    try:
-        _orig_set_interop = getattr(_torch, "set_num_interop_threads", None)
-        if callable(_orig_set_interop):
-            def _noop_set_num_interop_threads(*args, **kwargs):
-                # 재설정 시도 무시(크래시 방지)
-                return None
-            _torch.set_num_interop_threads = _noop_set_num_interop_threads
-    except Exception:
-        pass
-
-    print(f"[CPU-ONLY] CUDA_VISIBLE_DEVICES={_os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}, "
-          f"torch.cuda.is_available()={_torch.cuda.is_available()}")
-except Exception:
-    pass
 # ================================================================================
 
 
@@ -378,16 +345,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("BLIS_NUM_THREADS", "1")
 
-# [추가] PyTorch 내부 스레드 제한(모듈 임포트 시 1로 고정)
-try:
-    import torch as _torch_threads
-    if hasattr(_torch_threads, "set_num_threads"):
-        _torch_threads.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
-    if hasattr(_torch_threads, "set_num_interop_threads"):
-        _torch_threads.set_num_interop_threads(int(os.environ.get("TORCH_NUM_INTEROP_THREADS", "1")))
-except Exception:
-    pass
-
 
 def available_cpu_count() -> int:
     """
@@ -444,29 +401,6 @@ def run_scenario(
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
     os.environ.setdefault("TORCH_NUM_INTEROP_THREADS", "1")
     os.environ.setdefault("TORCH_NUM_THREADS", "1")
-    try:
-        import torch
-        if hasattr(torch, "set_default_device"):
-            torch.set_default_device("cpu")
-        if hasattr(torch.backends, "cudnn"):
-            torch.backends.cudnn.enabled = False
-        try:
-            if hasattr(torch, "set_num_threads"):
-                torch.set_num_threads(1)
-            if hasattr(torch, "set_num_interop_threads"):
-                torch.set_num_interop_threads(1)
-        except Exception:
-            pass
-        try:
-            _orig = getattr(torch, "set_num_interop_threads", None)
-            if callable(_orig):
-                def _noop_set_num_interop_threads(*args, **kwargs):
-                    return None
-                torch.set_num_interop_threads = _noop_set_num_interop_threads
-        except Exception:
-            pass
-    except Exception:
-        pass
     """
     • 각 워커 프로세스에서 여러 번 호출된다.
     • 최초 호출 시에만 DataProcessor 를 만들어 전역에 저장하고 재사용한다.
