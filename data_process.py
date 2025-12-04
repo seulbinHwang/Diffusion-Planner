@@ -745,7 +745,7 @@ def run_parallel_caching(
 
     start_ts = time.time()
     # 0.1% 단위로 로그 (최소 1개)
-    log_every = max(1, total // 1000)
+    log_every = max(1, total // 3000)
 
     print(f"[CACHE] start: {total:,} scenarios to process")
 
