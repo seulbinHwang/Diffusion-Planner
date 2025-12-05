@@ -350,9 +350,5 @@ def get_args():
             "use_direct_loss가 False인 경우, feasible_grad_to_dit는 True여야 합니다."
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
-    if getattr(args, "use_deepspeed", False):
-        args.deepspeed_config = build_deepspeed_config(args)
-    else:
-        args.deepspeed_config = None
 
     return args
