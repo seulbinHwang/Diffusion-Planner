@@ -1,5 +1,7 @@
 import argparse
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
+import os
+from typing import Any, Dict
 
 
 def boolean(v):
@@ -223,19 +225,42 @@ def get_args():
     parser.add_argument('--delete_wb_weight_when_running',
                         default=False,
                         type=boolean)
-    # ➕ [ADD] DeepSpeed / ZeRO-2 관련 옵션
-    parser.add_argument(
-        '--use_deepspeed',
-        default=True,
-        type=boolean,
-        help='True이면 DeepSpeed ZeRO-2로 optimizer state를 분산 저장해서 GPU 메모리를 줄입니다.')
-    parser.add_argument(
-        '--deepspeed_config',
-        default=None,
-        type=str,
-        help=
-        'DeepSpeed 설정 JSON 파일 경로 (zero_optimization.stage=2로 설정해야 ZeRO-2가 켜집니다).'
-    )
+
+    # ===== DeepSpeed / ZeRO-2 관련 설정 =====
+    parser.add_argument("--use_deepspeed",
+                        type=boolean,
+                        default=False,
+                        help="DeepSpeed ZeRO-2로 학습할지 여부")
+
+    parser.add_argument("--grad_accum_steps",
+                        type=int,
+                        default=1,
+                        help="optimizer.step 한 번 전에 몇 step을 모아서 사용할지")
+
+    parser.add_argument("--max_grad_norm",
+                        type=float,
+                        default=5.0,
+                        help="gradient clipping 기준값")
+
+    parser.add_argument("--zero_offload_optimizer",
+                        type=boolean,
+                        default=False,
+                        help="ZeRO-2 옵티마 상태를 CPU 메모리로 일부 옮겨서 GPU 메모리를 더 아낄지 여부")
+
+    parser.add_argument("--ds_steps_per_print",
+                        type=int,
+                        default=100,
+                        help="DeepSpeed가 내부 로그를 몇 step마다 출력할지")
+
+    parser.add_argument("--ds_allgather_bucket_size",
+                        type=float,
+                        default=2e8,
+                        help="ZeRO allgather bucket 크기(바이트 단위)")
+
+    parser.add_argument("--ds_reduce_bucket_size",
+                        type=float,
+                        default=2e8,
+                        help="ZeRO reduce-scatter bucket 크기(바이트 단위)")
     # Model
     parser.add_argument('--encoder_depth',
                         type=int,
@@ -325,5 +350,9 @@ def get_args():
             "use_direct_loss가 False인 경우, feasible_grad_to_dit는 True여야 합니다."
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
+    if getattr(args, "use_deepspeed", False):
+        args.deepspeed_config = build_deepspeed_config(args)
+    else:
+        args.deepspeed_config = None
 
     return args

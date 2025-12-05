@@ -8,29 +8,6 @@ os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
 from typing import Any, Callable, Dict
 
-# --- sanity check: env vars that must be ints ---
-# def _fix_int_env(name: str, default: Optional[int] = None):
-#     v = os.environ.get(name)
-#     if v is None:
-#         return
-#     try:
-#         int(str(v).strip())
-#     except Exception:
-#         msg = f"[WARN] invalid {name}={v!r}"
-#         if default is None:
-#             os.environ.pop(name, None)
-#             print(msg + " -> unset")
-#         else:
-#             os.environ[name] = str(int(default))
-#             print(msg + f" -> set {name}={default}")
-#
-# for _k,_d in [
-#     ("CUDA_DEVICE_MAX_CONNECTIONS", 32),
-#     ("TORCH_NCCL_ASYNC_ERROR_HANDLING", 1),
-#     ("OMP_NUM_THREADS", 8),
-# ]:
-#     _fix_int_env(_k, _d)
-
 # deprecated 키는 사용 금지
 os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
 
@@ -64,6 +41,7 @@ from diffusion_planner.utils.dataset import DiffusionPlannerData
 from diffusion_planner.utils import ddp
 import time
 from diffusion_planner.train_epoch import train_epoch
+import os
 
 import math
 
@@ -72,6 +50,138 @@ try:
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
+
+
+def build_deepspeed_config(args: argparse.Namespace,
+                           current_global_batch: int) -> Dict[str, Any]:
+    """args 값을 조합해서 DeepSpeed ZeRO-2 설정 dict를 만든다.
+
+    처리 흐름:
+      1) WORLD_SIZE(프로세스 수)를 읽어서, GPU 한 장당 미니배치 크기를 정한다.
+      2) args.grad_accum_steps, args.max_grad_norm 같은 값을 읽어서
+         한 번에 얼마나 gradient를 모을지, 얼마나 잘라낼지 결정한다.
+      3) ZeRO-2 단계(stage=2)를 켜고,
+         · gradient와 옵티마 상태를 GPU끼리 나눠 들도록 설정한다.
+      4) 필요하면 zero_offload_optimizer 를 써서
+         옵티마 상태 일부를 CPU 메모리로 옮겨 GPU 메모리를 더 아낀다.
+
+    이렇게 만든 ds_config dict는 train_predictor.py에서
+    deepspeed.initialize(..., config=ds_config) 에 그대로 넘겨서 사용한다.
+    """
+    # --- 1) world_size 계산 (torchrun이 넘겨준 값 우선 사용) ---
+    world_size_str = os.environ.get("WORLD_SIZE")
+    if world_size_str is not None:
+        try:
+            world_size = max(1, int(world_size_str))
+        except ValueError:
+            world_size = 1
+    else:
+        world_size = int(getattr(args, "world_size", 1))
+        if world_size <= 0:
+            world_size = 1
+    micro_batch_size = max(1, current_global_batch // world_size)
+
+    # --- 3) args에서 세부 설정값 읽기 ---
+    """ grad_accum_steps
+    실질 배치 크기 = micro_batch_size * world_size * grad_accum_steps 
+    
+    grad_accum_steps 커지면 좋은 점 (배치 사이즈를 키우는 것과 같은 효과)
+    
+    batch size를 키우는 것에 비해, grad_accum_steps를 키우는 것의 단점
+      - 학습 속도가 느리다.
+    """
+    grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
+    max_grad_norm = float(getattr(args, "max_grad_norm", 1.0))
+
+
+    zero_offload_optimizer = bool(getattr(args, "zero_offload_optimizer",
+                                          False))
+    """
+    allgather_bucket_size : 
+        weight 조각들을 다른 GPU에서 가져올 때
+        한 번에 얼마나 큰 묶음으로 모아서 보내고 받을지 크기.
+    reduce_bucket_size
+        기울기 값을 여러 GPU에서 합칠 때 한 번에 묶는 크기.
+        
+    둘 다 크게 설정할수록
+        통신 횟수 ↓
+        한 번에 처리하는 메모리 ↑ (피크 메모리 조금 증가 가능)
+    """
+    allgather_bucket_size = float(getattr(args, "ds_allgather_bucket_size",
+                                          2e8))
+    reduce_bucket_size = float(getattr(args, "ds_reduce_bucket_size", 2e8))
+
+    steps_per_print = int(getattr(args, "ds_steps_per_print", 100))
+
+    # --- 4) ZeRO-2 중심 DeepSpeed 설정 dict ---
+    """        
+        stage: 2 -> ZeRO 단계 2.
+            기울기와 옵티마 상태를 GPU 사이에 나눠 들고,
+            weight 자체는 여전히 GPU마다 풀 복사본을 유지하는 단계.
+            
+        allgather_partitions: True
+            “기울기/옵티마 나누고 모으는 방식”을 미세하게 조절하는 옵션
+            True
+            False
+                “나눠진 기울기/옵티마를 꽤 자주 전체 형태로 모아서 쓰는 쪽”
+        
+        allgather_bucket_size: 
+            weight 조각들을 다른 GPU에서 가져올 때
+            한 번에 얼마나 큰 묶음으로 모아서 보내고 받을지 크기.
+        
+        reduce_scatter: True
+        
+            기울기를 각 GPU에서 계산한 뒤
+            합치고 다시 나누는 과정을 한 번에 처리하는 모드.
+            기울기 통신 비용을 줄이기 위한 방식이라고 보면 된다.
+        
+        reduce_bucket_size: reduce_bucket_size
+                    기울기 값을 여러 GPU에서 합칠 때 한 번에 묶는 크기.
+        
+        overlap_comm: True
+        
+            통신(다른 GPU와 데이터 주고받기)과
+            연산(다음 레이어 계산)을 가능한 한 동시에 진행하도록 시도한다.
+        
+        속도 향상을 노리는 옵션.
+        
+        contiguous_gradients: True
+        
+            기울기 텐서들을 메모리 상에서 연속된 큰 덩어리로 재배치한다.
+            
+            이렇게 하면 통신이나 클리핑 같은 작업에서
+            여러 텐서를 따로따로 다루지 않아도 되어서 효율이 좋아진다.
+    """
+    ds_config: Dict[str, Any] = {
+        "train_micro_batch_size_per_gpu": micro_batch_size,
+        "gradient_accumulation_steps": grad_accum_steps,
+        "gradient_clipping": max_grad_norm,
+        "fp16": {
+            "enabled": False,
+        },
+        "bf16": {
+            "enabled": False,
+        },
+        "zero_optimization": {
+            "stage": 2,  # ZeRO-2
+            "allgather_partitions": True,
+            "allgather_bucket_size": allgather_bucket_size,
+            "reduce_scatter": True,
+            "reduce_bucket_size": reduce_bucket_size,
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+        },
+        "steps_per_print": steps_per_print,
+    }
+
+    # 옵티마 상태를 CPU로 일부 넘겨서 GPU 메모리를 더 줄이고 싶을 때
+    if zero_offload_optimizer:
+        ds_config["zero_optimization"]["offload_optimizer"] = {
+            "device": "cpu",
+            "pin_memory": True,
+        }
+
+    return ds_config
 
 
 # === [NEW] LR auto-scaling (root scale for Adam/AdamW) ======================
@@ -696,16 +806,14 @@ def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
     이 함수는 두 가지 모드를 지원한다.
       - use_deepspeed=True  인 경우:
         torchrun 이 미리 넣어준 환경변수(RANK, WORLD_SIZE, LOCAL_RANK)를 그대로 읽어서
-        · global_rank : 전체 프로세스 중에서 내 번호
+        · global_rank : 전체 학습 프로세스 중에서 내 번호
         · world_size  : 전체 프로세스 개수
-        · rank        : 이 노드에서 내가 사용할 GPU 번호
+        · rank        : 이 학습 노드(프로세스)에서 내가 사용할 GPU 번호
         를 정하고, 해당 GPU 로 장치를 고정한다.
       - use_deepspeed=False 인 경우:
         기존 ddp.ddp_setup_universal() 을 호출해서 위와 같은 값을 계산하고,
         PyTorch 기본 분산 통신 설정까지 한 번에 마친다.
 
-    global_rank 는 “전체 학습 작업 안에서 내 순번”이고,
-    rank 는 “이 노드에서 실제로 사용하는 GPU 인덱스”라서 서로 다를 수 있다.
     마지막으로, DeepSpeed 모드일 때는 기존 PyTorch 체크포인트 방식과 섞어 쓰지 못하므로
     그 조합이 들어오면 바로 예외를 던져서 이상한 상태로 실행되지 않도록 막는다.
     """
@@ -743,7 +851,7 @@ def _scale_learning_rate_and_epochs(
     args: argparse.Namespace,
     world_size: int,
 ) -> Tuple[int, int]:
-    """글로벌 배치 크기에 맞춰 학습률과 학습 epoch 수를 자동 조정한다.
+    """글로벌 배치 크기에 맞춰, 학습률과 학습 epoch 수를 자동 조정한다.
 
     한 번의 업데이트에서 사용하는 샘플 수(글로벌 배치 크기)가 커지면,
     · 한 번 업데이트가 더 안정적으로 되지만
@@ -1080,21 +1188,20 @@ def _build_model_optimizer_scheduler(
     use_deepspeed: bool,
     total_step_of_all_epoch: int,
     warmup_steps: int,
+    current_global_batch: int,
 ) -> Tuple[nn.Module, Optional[ModelEma], optim.Optimizer, Any]:
     """모델, EMA, 옵티마이저, 스케줄러를 한 번에 준비한다.
 
     처리 흐름은 다음과 같다.
       1) Diffusion_Planner 모델을 만들고, rank 에 해당하는 GPU 또는 CPU 로 옮긴다.
-         이때 각 파라미터 텐서의 shape는 계층 종류에 따라
-         (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW) 등 다양하다.
       2) use_deepspeed 가 False 이고 args.ddp 가 True 이면,
          모델을 PyTorch 기본 분산 래퍼(DDP)로 감싸서
-         여러 GPU가 같은 모델 복사본을 들고 gradient를 나눠 가지도록 만든다.
+         여러 GPU가 같은 모델 복사본을 들고 gradient를 각자 가지도록 만든다.
       3) EMA를 켜면, 모델과 똑같은 구조의 복사본을 하나 더 두고
          매 step마다 천천히 따라가게 해서, 나중에 더 안정적인 결과를 평가할 수 있게 한다.
       4) build_adamw_with_param_groups 로 가중치 묶음을 나누고
          AdamW 계열 옵티마이저를 만든다. 파라미터 그룹 안의 "params" 리스트에는
-         위에서 언급한 다양한 shape의 텐서들이 들어간다.
+         다양한 shape의 텐서들이 들어간다.
       5) build_pytorch_warmup_cosine_scheduler 로
          전체 step 수(total_step_of_all_epoch)와 warmup_steps 에 맞는
          “처음에는 천천히 올리고, 이후에는 서서히 줄이는” 학습률 스케줄을 만든다.
@@ -1111,6 +1218,7 @@ def _build_model_optimizer_scheduler(
         use_deepspeed: DeepSpeed 모드 사용 여부.
         total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
         warmup_steps: 워밍업 step 수.
+        current_global_batch : 현재 글로벌 배치 크기.
 
     Returns:
         diffusion_planner: Diffusion_Planner 또는 DeepSpeed/DDP 래핑된 모델.
@@ -1160,10 +1268,10 @@ def _build_model_optimizer_scheduler(
         eta_min=0.2 * args.learning_rate,
     )
 
-    # DeepSpeed로 래핑 (ZeRO-2는 config JSON에서 stage=2로 설정)
+    # ➕ [ADD] DeepSpeed 엔진으로 래핑 (ZeRO-2 설정은 build_deepspeed_config 로 생성)
     if use_deepspeed:
         import deepspeed  # use_deepspeed=True일 때만 import
-        ds_config = getattr(args, "deepspeed_config", None)
+        ds_config = build_deepspeed_config(args, current_global_batch)
         diffusion_planner, optimizer, _, scheduler = deepspeed.initialize(
             model=diffusion_planner,
             model_parameters=base_model.parameters(),
@@ -1744,6 +1852,7 @@ def model_training(args: argparse.Namespace) -> None:
          use_deepspeed=use_deepspeed,
          total_step_of_all_epoch=total_step_of_all_epoch,
          warmup_steps=warmup_steps,
+         current_global_batch=current_global_batch,
      )
 
     # 11) 체크포인트 재개
@@ -1795,117 +1904,275 @@ def model_training(args: argparse.Namespace) -> None:
     )
 
 
-if __name__ == "__main__":
+def _validate_wandb_resume_args(args: argparse.Namespace) -> None:
+    """W&B에서 체크포인트를 받아올 때 필요한 기본 인자들을 점검한다.
 
+    처리 내용:
+      - args.resume_model_from_wandb 가 'latest' 인지 확인한다.
+      - args.name 이 비어 있지 않은지 확인한다.
+    둘 중 하나라도 조건을 만족하지 않으면 바로 ValueError 를 던져서
+    잘못된 설정으로 내려받기를 시도하지 않도록 막는다.
+    """
+    # resume_model_from_wandb 가 "latest"가 아니면 에러를 발생시킵니다.
+    if args.resume_model_from_wandb not in ['latest']:
+        raise ValueError("args.resume_model_from_wandb must be 'latest.")
+    if not args.name:
+        raise ValueError(
+            "args.name must be provided to resume from a wandb artifact.")
+
+
+def _resolve_wandb_artifact_config(
+    args: argparse.Namespace,) -> Tuple[str, str, str]:
+    """재개하려는 W&B 아티팩트의 이름과 파일 이름을 결정한다.
+
+    Args:
+        args: argparse.Namespace
+            - args.resume_model_from_wandb (str): 'latest' 또는 'best' 등을 기대.
+            - args.name (str): 실험 이름. 컬렉션 이름의 접두사로 사용된다.
+
+    Returns:
+        resume_alias: str
+            - 실제로 사용할 별칭. 예: 'latest', 'best'.
+        collection_name: str
+            - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
+        checkpoint_filename: str
+            - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+    """
+    resume_alias = args.resume_model_from_wandb
+    if resume_alias == 'best':
+        collection_name = f"{args.name}_best-model"
+        checkpoint_filename = "best.pth"
+    else:  # 'latest' 또는 'v10'과 같은 특정 버전을 처리합니다.
+        collection_name = f"{args.name}_latest-model"
+        checkpoint_filename = "latest.pth"
+    return resume_alias, collection_name, checkpoint_filename
+
+
+def _get_wandb_entity_and_project_for_resume(
+    args: argparse.Namespace,) -> Tuple[str, str]:
+    """W&B에서 아티팩트를 가져오기 위해 entity / project 정보를 얻는다.
+
+    처리 내용:
+      - 임시 W&B Run 을 하나 만든 뒤,
+        그 Run 에서 entity, project 값을 읽고 바로 종료한다.
+      - 이때 args.name 은 임시 Run 이름에만 사용되며,
+        모델 학습용 Run 과는 별개이다.
+
+    Returns:
+        entity: str
+            - 예: 'jksg01019-naver-labs'
+        project: str
+            - 예: 'Diffusion-Planner'
+    """
+    temp_run_for_context = wandb.init(
+        project="Diffusion-Planner",
+        name=f"temp_api_run_{args.name}",
+        job_type="api_access",
+    )
+    entity = temp_run_for_context.entity
+    project = temp_run_for_context.project
+    temp_run_for_context.finish()
+    return entity, project
+
+
+def _download_wandb_checkpoint_to_local(
+    api: wandb.Api,
+    entity: str,
+    project: str,
+    collection_name: str,
+    resume_alias: str,
+    checkpoint_filename: str,
+) -> str:
+    """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다.
+
+    처리 흐름:
+      1) f"{entity}/{project}/{collection_name}:{resume_alias}" 경로로 아티팩트를 찾는다.
+      2) 원본 Run 의 config 에서 'save_path' 를 읽어, 그 경로를 기준 디렉터리로 사용한다.
+      3) 동일한 이름의 파일(checkpoint_filename)이 이미 있으면 지우고,
+         다시 다운로드 받아 덮어쓴다.
+      4) 다운로드가 끝나면, save_path 안에서 checkpoint_filename 이 실제로 존재하는지 확인한다.
+         - 없다면 os.listdir(save_path) 로 파일 목록(list[str])을 찍어주고
+           FileNotFoundError 를 던진다.
+      5) 마지막으로 model_path 의 상위 디렉터리(체크포인트가 들어 있는 폴더 절대경로)를
+         반환한다.
+
+    Args:
+        api: wandb.Api 인스턴스.
+        entity: W&B entity 이름.
+        project: W&B project 이름.
+        collection_name: 모델 컬렉션 이름. 예: f"{args.name}_latest-model".
+        resume_alias: 사용할 아티팩트 별칭. 예: 'latest', 'best'.
+        checkpoint_filename: 내려받을 파일 이름. 예: 'latest.pth'.
+
+    Returns:
+        save_path: str
+            - latest.pth / best.pth 가 들어 있는 디렉터리의 절대경로.
+    """
+    artifact_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
+    print(f"아티팩트 경로에서 가져오는 중: {artifact_path}")
+    # Public API를 통해 아티팩트 객체를 가져옵니다.
+    artifact = api.artifact(artifact_path, type='model')
+
+    # 이 아티팩트를 생성한 원본 Run을 가져옵니다.
+    source_run = artifact.logged_by()
+
+    # 원본 Run의 config에서 save_path를 가져옵니다.
+    if 'save_path' not in source_run.config:
+        raise ValueError("원본 Run의 config에 'save_path'가 없습니다.")
+
+    save_path = source_run.config['save_path']
+    print(f"원본 Run의 config에서 save_path를 찾았습니다: {save_path}")
+    os.makedirs(save_path, exist_ok=True)
+
+    # 다운로드될 체크포인트 파일의 전체 경로를 지정합니다.
+    target_file_path = os.path.join(save_path, checkpoint_filename)
+
+    # 만약 해당 경로에 파일이 이미 존재하면, 덮어쓰기를 위해 삭제합니다.
+    if os.path.exists(target_file_path):
+        print(f"기존 파일 '{target_file_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
+        os.remove(target_file_path)
+
+    # 아티팩트 파일을 다운로드하기 위해 임시 Run이 필요합니다.
+    download_run = wandb.init(
+        project=project,
+        name=f"resume_run_download_{collection_name}",
+        resume="allow",
+    )
+    # 현재 Run에서 사용할 아티팩트를 지정합니다.
+    artifact_for_download = download_run.use_artifact(artifact,
+                                                      aliases=[resume_alias])
+    # 원본 save_path에 아티팩트 파일을 다운로드합니다.
+    artifact_for_download.download(root=save_path)
+    download_run.finish()
+    print(f"아티팩트 '{artifact_path}'을(를) {save_path}에 다운로드했습니다.")
+
+    # 다운로드된 체크포인트의 전체 경로를 설정합니다.
+    model_path = os.path.join(save_path, checkpoint_filename)
+    if not os.path.exists(model_path):
+        downloaded_files = os.listdir(save_path)  # shape: (N,) list[str]
+        raise FileNotFoundError(
+            f"다운로드된 아티팩트 디렉터리에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: {save_path}. "
+            f"사용 가능한 파일: {downloaded_files}")
+
+    # save_path: latest.pth / best.pth 가 들어 있는 디렉터리
+    save_path = os.path.dirname(os.path.abspath(model_path))
+    return save_path
+
+
+def _prepare_args_and_wandb_resume() -> argparse.Namespace:
+    """명령행 인자를 읽고, 필요하다면 W&B 아티팩트에서 체크포인트를 내려받아 args를 보정한다.
+
+    처리 흐름:
+      2) args.resume_model_from_wandb 가 설정되지 않았다면 그대로 반환한다.
+      3) 설정된 경우
+         - _validate_wandb_resume_args() 로 기본 인자 검사를 하고
+         - wandb.Api() 를 만든 뒤
+         - _resolve_wandb_artifact_config() 으로 컬렉션/파일 이름을 정하고
+         - _get_wandb_entity_and_project_for_resume() 로 entity, project 를 얻고
+         - _download_wandb_checkpoint_to_local() 로 체크포인트를 내려받는다.
+      4) 내려받은 디렉터리 경로를 args.resume_local_path_model_path 에 저장해
+         이후 model_training() 의 resume 로직이 그대로 동작하도록 만든다.
+
+    Returns:
+        args: argparse.Namespace
+            - 체크포인트를 쓰지 않을 때는 원본 get_args() 결과와 동일.
+            - W&B에서 내려받기를 한 경우에는
+              args.resume_local_path_model_path 가 실제 디렉터리 경로로 채워진 상태.
+    """
     args = args_util.get_args()
 
-    if args.resume_model_from_wandb:
-        # resume_model_from_wandb 가 "latest"가 아니면 에러를 발생시킵니다.
-        if args.resume_model_from_wandb not in ['latest']:
-            raise ValueError("args.resume_model_from_wandb must be 'latest.")
-        if not args.name:
-            raise ValueError(
-                "args.name must be provided to resume from a wandb artifact.")
+    if not args.resume_model_from_wandb:
+        return args
+
+    _validate_wandb_resume_args(args)
+    print(
+        f"Resuming from wandb artifact: {args.name}:{args.resume_model_from_wandb}"
+    )
+
+    api = wandb.Api()
+
+    try:
+        """
+        resume_alias : str
+            - 실제로 사용할 별칭. 예: 'latest', 'best'.
+        collection_name : str
+            - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
+        checkpoint_filename : str
+            - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+        """
+        resume_alias, collection_name, checkpoint_filename = \
+            _resolve_wandb_artifact_config(args)
+        """
+        entity: str 예: 'jksg01019-naver-labs'
+        project: str 예: 'Diffusion-Planner'
+        """
+        entity, project = _get_wandb_entity_and_project_for_resume(args)
+
+        save_path = _download_wandb_checkpoint_to_local(
+            api=api,
+            entity=entity,
+            project=project,
+            collection_name=collection_name,
+            resume_alias=resume_alias,
+            checkpoint_filename=checkpoint_filename,
+        )
+        args.resume_local_path_model_path = save_path
 
         print(
-            f"Resuming from wandb artifact: {args.name}:{args.resume_model_from_wandb}"
+            f"아티팩트를 {save_path}에 다운로드했습니다. 체크포인트에서 학습을 재개합니다: {args.resume_local_path_model_path}"
         )
+    except Exception as e:
+        print(f"W&B에서 재개하는 동안 오류 발생: {e}")
+        # 오류 발생 시 임시 Run이 종료되도록 보장합니다.
+        if wandb.run:
+            wandb.finish()
+        raise e
 
-        # W&B Public API를 사용하여 아티팩트와 원본 Run의 config를 가져옵니다.
-        api = wandb.Api()
+    return args
 
-        try:
-            # resume_model_from_wandb 값('best', 'latest' 등)에 따라 컬렉션과 파일 이름을 결정합니다.
-            resume_alias = args.resume_model_from_wandb
-            if resume_alias == 'best':
-                collection_name = f"{args.name}_best-model"
-                checkpoint_filename = "best.pth"
-            else:  # 'latest' 또는 'v10'과 같은 특정 버전을 처리합니다.
-                collection_name = f"{args.name}_latest-model"
-                checkpoint_filename = "latest.pth"
 
-            # Public API를 사용해 아티팩트를 가져오려면 entity와 project 정보가 필요합니다.
-            # 임시 Run을 생성하여 컨텍스트(entity, project)를 얻어옵니다.
-            temp_run_for_context = wandb.init(project="Diffusion-Planner",
-                                              name=f"temp_api_run_{args.name}",
-                                              job_type="api_access")
-            # wandb.run.entity: jksg01019-naver-labs
-            # wandb.run.project: Diffusion-Planner
-            entity = temp_run_for_context.entity
-            project = temp_run_for_context.project
-            temp_run_for_context.finish()
+def _set_distributed_flag_from_env(args: argparse.Namespace) -> None:
+    """환경변수 WORLD_SIZE를 읽어 args.distributed 플래그를 설정한다.
 
-            artifact_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
-            print(f"아티팩트 경로에서 가져오는 중: {artifact_path}")
-            # Public API를 통해 아티팩트 객체를 가져옵니다.
-            artifact = api.artifact(artifact_path, type='model')
-
-            # 이 아티팩트를 생성한 원본 Run을 가져옵니다.
-            source_run = artifact.logged_by()
-
-            # 원본 Run의 config에서 save_path를 가져옵니다.
-            if 'save_path' in source_run.config:
-                save_path = source_run.config['save_path']
-                print(f"원본 Run의 config에서 save_path를 찾았습니다: {save_path}")
-                os.makedirs(save_path, exist_ok=True)
-
-                # 다운로드될 체크포인트 파일의 전체 경로를 지정합니다.
-                target_file_path = os.path.join(save_path, checkpoint_filename)
-
-                # 만약 해당 경로에 파일이 이미 존재하면, 덮어쓰기를 위해 삭제합니다.
-                if os.path.exists(target_file_path):
-                    print(f"기존 파일 '{target_file_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
-                    os.remove(target_file_path)
-
-                # 아티팩트 파일을 다운로드하기 위해 임시 Run이 필요합니다.
-                download_run = wandb.init(
-                    project=project,
-                    name=f"resume_run_download_{args.name}",
-                    resume="allow")
-                # 현재 Run에서 사용할 아티팩트를 지정합니다.
-                artifact_for_download = download_run.use_artifact(
-                    artifact, aliases=[resume_alias])
-                # 원본 save_path에 아티팩트 파일을 다운로드합니다.
-                artifact_for_download.download(root=save_path)
-                download_run.finish()
-                print(f"아티팩트 '{artifact_path}'을(를) {save_path}에 다운로드했습니다.")
-
-                # 다운로드된 체크포인트의 전체 경로를 설정합니다.
-                model_path = os.path.join(save_path, checkpoint_filename)
-                if not os.path.exists(model_path):
-                    downloaded_files = os.listdir(save_path)
-                    raise FileNotFoundError(
-                        f"다운로드된 아티팩트 디렉터리에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: {save_path}. "
-                        f"사용 가능한 파일: {downloaded_files}")
-                save_path = os.path.dirname(os.path.abspath(model_path))
-                args.resume_local_path_model_path = save_path
-
-                print(
-                    f"아티팩트를 {save_path}에 다운로드했습니다. 체크포인트에서 학습을 재개합니다: {args.resume_local_path_model_path}"
-                )
-            else:
-                raise ValueError("원본 Run의 config에 'save_path'가 없습니다.")
-
-        except Exception as e:
-            print(f"W&B에서 재개하는 동안 오류 발생: {e}")
-            # 오류 발생 시 임시 Run이 종료되도록 보장합니다.
-            if wandb.run:
-                wandb.finish()
-            raise e
-
+    WORLD_SIZE 가 존재하면
+      - WORLD_SIZE > 1 이면 여러 프로세스를 쓰는 분산 학습으로 보고 True,
+      - 그렇지 않으면 False 로 둔다.
+    WORLD_SIZE 가 없으면 단일 프로세스 학습으로 간주하고 False 를 넣는다.
+    """
     if 'WORLD_SIZE' in os.environ:
         args.distributed = int(os.environ['WORLD_SIZE']) > 1
     else:
         args.distributed = False
+
+
+def main() -> None:
+    """train_predictor 진입점.
+
+    처리 순서:
+      1) 명령행 인자를 읽고(args_util.get_args), 필요 시 W&B 아티팩트에서
+         체크포인트 파일(latest.pth 등)을 내려받아 args.resume_local_path_model_path 를 채운다.
+      2) 환경변수 WORLD_SIZE 를 기준으로 args.distributed 를 설정해,
+         이후 ddp 설정이 올바르게 동작하도록 만든다.
+      3) model_training(args) 를 호출해 전체 학습 파이프라인을 수행하고,
+         예외가 발생하면 rank 정보를 찍고 전체 스택을 출력한다.
+    """
+    args = _prepare_args_and_wandb_resume()
+    _set_distributed_flag_from_env(args)
 
     # Run
     try:
         model_training(args)
     except BaseException:
         rank = int(os.environ.get("RANK", -1))
-        print(f"\n[rank{rank}] Unhandled exception (printing full traceback):",
-              file=sys.stderr,
-              flush=True)
+        print(
+            f"\n[rank{rank}] Unhandled exception (printing full traceback):",
+            file=sys.stderr,
+            flush=True,
+        )
         traceback.print_exc()  # <-- 표준에러로 자세한 스택
         sys.stderr.flush()
         raise
+
+
+if __name__ == "__main__":
+    main()

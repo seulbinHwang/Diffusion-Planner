@@ -10,8 +10,7 @@ from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.model.module.feasible import FeasibleProjector
 # =====================================================================
-
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Any
 import argparse
 
 import torch
@@ -422,7 +421,6 @@ def _compute_loss_dict(
 
     return loss_dict
 
-
 def _backward_and_step(
     loss_dict: Dict[str, torch.Tensor],
     model: nn.Module,
@@ -437,7 +435,7 @@ def _backward_and_step(
             - "loss" 키에 최종 scalar 손실 텐서가 들어 있는 dict.
               · loss_dict["loss"]의 shape: ()  스칼라 텐서.
         model:
-            학습 중인 모델.  # shape: (모델 파라미터 개수에 따라 자유)
+            학습 중인 모델.
             - 일반 모드: nn.Module 또는 DDP 래퍼.
             - ZeRO-2 모드: deepspeed.DeepSpeedEngine.
         optimizer:
@@ -447,6 +445,7 @@ def _backward_and_step(
         args:
             학습 설정/상태 Namespace.
             - args.use_deepspeed: True이면 DeepSpeed 엔진을 사용한다.
+            - args.max_grad_norm: 기울기 클리핑 기준값. 0 이하이면 클리핑 안 함.
 
     Returns:
         float:
@@ -459,21 +458,110 @@ def _backward_and_step(
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False)) \
         and hasattr(model, "backward") and hasattr(model, "step")
 
+    # 한 곳에서만 클리핑 기준을 정한다.
+    max_grad_norm: float = float(getattr(args, "max_grad_norm", 0.0))
+
     if use_deepspeed:
         # DeepSpeed 엔진을 사용하는 경우:
-        # 1) model.backward(loss)로 분산/혼합정밀 포함해 역전파 수행
-        # 2) 필요하면 엔진 쪽 gradient norm 클리핑
-        # 3) model.step()이 optimizer.step() + lr_scheduler.step()까지 처리
+        # gradient_clipping 값은 build_deepspeed_config()에서
+        # ds_config["gradient_clipping"] = max_grad_norm 으로 넘어간다.
+        # 여기서는 따로 clip_grad_norm을 호출하지 않는다.
+        """ model.backward(loss_tensor) # deepseed 전용 역전파
+        각 GPU가 자기 배치에 대한 기울기를 먼저 계산한다.
+            GPU0: g0(W1), g0(W2), g0(W3), g0(W4)
+            GPU1: g1(W1), g1(W2), g1(W3), g1(W4)
+        여기까진 “각자 전체 기울기를 한 번씩 계산했다”고 보면 된다.
+            (이 단계는 ZeRO-2라도 어쩔 수 없이 한 번 거치는 단계)
+
+        2. 그 다음 “기울기를 나누고 합치는 통신 단계”가 들어간다.
+        
+           * GPU0와 GPU1이 서로 기울기 조각을 주고받아서:
+        
+             * GPU0는 W1, W2에 대한
+               **(g0 + g1)의 합**만 남기고 W3, W4에 대한 기울기는 버린다.
+             * GPU1은 W3, W4에 대한
+               **(g0 + g1)의 합**만 남기고 W1, W2에 대한 기울기는 버린다.
+        
+           즉, **최종적으로**:
+        
+           * GPU0: (합쳐진 기울기) g(W1), g(W2) 만 보관
+           * GPU1: (합쳐진 기울기) g(W3), g(W4) 만 보관
+        
+           → 이게 “기울기를 GPU 사이에 나눠서 가진다”는 뜻이다.
+           (옵티마 상태도 비슷하게 “나눠서 저장”한다.)
+
+# algather_partitions = False 일 때
+    1. GPU0, GPU1이 각각 **자기 배치에 대해 전체 기울기**를 계산 (g0, g1).
+    
+    2. GPU0와 GPU1이 통신해서:
+       * **먼저 전체 기울기를 서로 합친다.**
+         * 결과적으로 GPU0, GPU1 둘 다
+           * g_sum(W1), g_sum(W2), g_sum(W3), g_sum(W4)
+             를 잠깐씩 다 들고 있을 수 있다.
+       * 그 다음,
+         * “나는 W1,W2만 쥐고 있을게” / “나는 W3,W4만 쥐고 있을게” 식으로
+           기울기와 옵티마 상태를 다시 나누고 정리.
+    
+       → 즉, **중간에 “모든 기울기 합본을 한 번씩 다 들고 있는 순간”이 있을 수 있다.**
+       그래서 메모리 사용량 관점에서 조금 덜 효율적인 쪽.
+
+# allgather_partitions = True 일 때
+    2. 그런데 여기서는, **“전체 합본을 두 군데 다 오래 들고 있게 만들지 않고”**
+       바로 “나눠진 형태” 위주로 유지하려고 한다.
+    
+       예를 들어 개념적으로는:
+    
+       * 단계 1: GPU0/1이 서로 기울기를 교환하면서,
+    
+         * GPU0는 W1,W2 부분에 대한 `g0+g1`만 남기고,
+         * GPU1은 W3,W4 부분에 대한 `g0+g1`만 남긴다.
+       * 이때 “모든 파라미터에 대한 합본”을 각 GPU가 오래 들고 있는 순간을 줄이고,
+         * 바로 “나눠진 합본”만 남기는 쪽으로 통신을 설계하는 것.
+    
+       → 실제 구현은 더 복잡하지만,
+       **“합친 전체 기울기를 각 GPU가 길게 들고 있지 않는다”**는 방향으로 생각하면 된다.
+        """
         model.backward(loss_tensor)
-        if hasattr(model, "clip_grad_norm"):
-            # DeepSpeedEngine.clip_grad_norm는 내부 파라미터 shard 기준으로 norm을 계산한다.
-            model.clip_grad_norm(max_norm=10.0)
+        """ model.step()
+3. 옵티마 단계에서:
+   * GPU0는 자신이 가진 파라미터에 대해서만 갱신
+     * W1, W2 를 g(W1), g(W2) 와 자기 쪽 옵티마 상태를 써서 업데이트
+   * GPU1은 W3, W4 를 자기 쪽 기울기/옵티마로 업데이트
+
+4. 업데이트가 끝나면,
+   * GPU0와 GPU1이 서로 **업데이트된 W1~W4 전체를 다시 맞춘다**.
+     (브로드캐스트 혹은 비슷한 방식으로 동기화)
+   * 그래서 **step이 끝난 후에는** 다시
+     * GPU0: W1~W4 전체 최신 버전
+     * GPU1: W1~W4 전체 최신 버전
+
+        """
         model.step()
     else:
         # 일반 PyTorch / DDP 모드
+        """ loss_tensor.backward()
+이때 DDP가 **파라미터별 gradient가 만들어지는 순간마다 후크를 걸어** 다음을 수행:
+
+* GPU0는 자기 gradient `g0`를 가지고 있음.
+* GPU1는 자기 gradient `g1`를 가지고 있음.
+* PyTorch DDP 내부에서:
+  * 각 파라미터마다
+    `g_avg = (g0 + g1) / 2` 를 만들기 위해
+    GPU0와 GPU1이 서로 값을 주고받고, 더하고, 나눔.
+* 그 결과:
+  * GPU0의 해당 파라미터 gradient = `g_avg`
+  * GPU1의 해당 파라미터 gradient = `g_avg`
+즉, **backward가 끝났을 때, 두 GPU의 gradient는 완전히 동일**하게 맞춰져 있음.
+이 과정이 이 설정에서 **가장 큰 통신 비용**이야.        
+        """
         loss_tensor.backward()
-        # 모든 파라미터의 gradient L2 norm을 10.0으로 클리핑
-        nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        """
+        아래 3줄 코드에서는 GPU끼리 통신하지 않음.
+        """
+        # max_grad_norm > 0 일 때만 클리핑 수행
+        if max_grad_norm > 0.0:
+            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
         # 스케줄러 / 옵티마이저 스텝
         scheduler.step()
         optimizer.step()
@@ -648,10 +736,19 @@ def train_epoch(
             args._global_update_step += 1
 
     # --- 에폭 평균 손실 계산 ---
+    """ epoch_mean_loss (각 GPU마다 계산해 둠)
+    {"loss": 0.42, "neighbor_prediction_loss": 0.3, ...}
+    """
     epoch_mean_loss: Dict[str,
                           float] = get_epoch_mean_loss(epoch_loss_dict_list)
 
     if args.ddp:
+        """ ddp.reduce_and_average_losses
+            두 GPU가 서로 값을 더해서 합을 만든 뒤(world_size로 나눔)
+            → 모든 GPU가 동일한 평균 값을 가지게 함
+        통신하는 내용
+            스칼라 몇 개밖에 안 되는 작은 숫자
+        """
         epoch_mean_loss = ddp.reduce_and_average_losses(
             epoch_mean_loss,
             torch.device(args.device),
