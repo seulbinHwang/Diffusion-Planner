@@ -320,38 +320,73 @@ def build_adamw_with_param_groups(
     lr: float,
     weight_decay: float,
     include_seed_params: bool = True,
-use_8bit_optimizer: bool = False,
-):
+    use_8bit_optimizer: bool = False,
+) -> Tuple[optim.Optimizer, List[str]]:
+    """AdamW 옵티마이저와 파라미터 그룹을 만드는 헬퍼 함수.
+
+    이 함수는 모델을 훑어서
+      1) 감쇠를 적용할 가중치
+      2) 감쇠를 적용하지 않을 가중치(편향, 정규화 계층, 토큰/위치 임베딩 등)
+    를 자동으로 나눈 뒤, 한 번에 AdamW 옵티마이저를 만들어 준다.
+
+    Args:
+        model: 학습할 모델 객체(nn.Module). 내부 파라미터 텐서의 예시는
+            - 선형 계층 weight: (out_dim, in_dim)
+            - 선형 계층 bias / LayerNorm weight: (dim,)
+            - 컨볼루션 weight: (C_out, C_in, kH, kW) 와 같은 형태.
+        lr: 기준 학습률. 각 파라미터 그룹의 "lr"와 "lr_max"에 동일하게 들어간다.
+        weight_decay: 가중치 감쇠 값. 감쇠를 적용할 그룹에만 사용된다.
+        include_seed_params: seeds/ego_fut_seeds 같은 학습용 토큰 파라미터를
+            감쇠 제외 목록에 포함할지 여부.
+        use_8bit_optimizer: True이면 8비트 AdamW(bnb.AdamW8bit)를 사용한다.
+
+    Returns:
+        Tuple[optim.Optimizer, List[str]]:
+            - optim: AdamW 또는 8비트 AdamW 옵티마이저 인스턴스.
+              내부 파라미터 그룹의 각 원소는
+                · "params": List[Tensor]  (각 텐서 shape 예: (out_dim, in_dim), (dim,) 등)
+                · "weight_decay": float
+                · "lr": float
+                · "lr_max": float
+                · "wd_max": float
+              와 같은 키를 가진다.
+            - extra_nwd: 감쇠를 적용하지 않을 파라미터 이름 목록.
     """
-    - timm의 param_groups_weight_decay를 사용해 bias/Norm/1D 자동 no-decay
-    - 위 discover 함수로 찾은 토큰/포지션 파라미터 추가 no-decay
-    - Optimizer에는 전역 WD=0.0 (그룹에 이미 들어감)
-    """
-    # 토큰/포지션 추가 no-decay 수집
+    # extra_nwd: List[str], 감쇠 제외로 추가할 파라미터 이름들
     extra_nwd = discover_extra_no_weight_decay_names(
         model, include_seed_params=include_seed_params)
 
-    # 그룹 생성 (timm 헬퍼)
+    # param_groups: List[Dict[str, Any]]
+    #   각 그룹은 "params" 리스트 안에 다양한 shape의 파라미터 텐서를 가진다.
+    #   예) Linear weight: (out_dim, in_dim), LayerNorm weight: (dim,), conv weight: (C_out, C_in, kH, kW)
     param_groups = param_groups_weight_decay(
         model,
         weight_decay=weight_decay,
         no_weight_decay_list=extra_nwd,
     )
-    # 공통 LR 부여
+
+    # 공통 LR / 기준값 부여
     for g in param_groups:
-        g["lr"] = lr  # η_max(B)
-        g["lr_max"] = float(lr)  # 기준 LR(스케줄 시작 시점)
-        g["wd_max"] = float(g.get("weight_decay", 0.0))  # 그룹별 기준 WD
+        g["lr"] = lr  # η_max(B): 현재 배치에서의 최대 학습률
+        g["lr_max"] = float(lr)  # 스케줄 시작 시 기준 학습률
+        g["wd_max"] = float(g.get("weight_decay", 0.0))  # 그룹별 기준 감쇠 값
+
     if use_8bit_optimizer:
+        # 8비트 AdamW: 내부 모멘트 텐서는 8비트 정수로 저장되지만,
+        #   파라미터 텐서 shape는 그대로 유지된다.
         optim = bnb.optim.AdamW8bit(  # type: ignore[attr-defined]
             param_groups,
             lr=lr,
             weight_decay=0.0,
         )
     else:
-        # 최종 옵티마이저 (전역 WD는 0.0로 중복 방지)
+        # 최종 옵티마이저 (전역 WD는 0.0로 두고, 그룹별 WD만 사용)
         try:
-            optim = torch.optim.AdamW(param_groups, fused=True, weight_decay=0.0)
+            optim = torch.optim.AdamW(
+                param_groups,
+                fused=True,
+                weight_decay=0.0,
+            )
         except (TypeError, RuntimeError):
             optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
 
@@ -655,19 +690,82 @@ class DiffusionPlannerCollate:
         return batch_out
 
 
-def model_training(args):
-    best_loss = float('inf')
-    torch.cuda.empty_cache()
-    # init ddp
-    """
-    global_rank (int) : 훈련 전체 프로세스에서 내 등번호 (샘플러 분배, 로깅 분기 등에 사용)
-    rank (int) : 이 노드에서 내가 사용할 CUDA 디바이스 인덱스 (DDP device_ids=[rank]에 그대로 들어감)
-        - global_rank와 rank는 우리의 경우 같음.
-    """
-    global_rank, rank, _ = ddp.ddp_setup_universal(True, args)
-    world_size = ddp.get_world_size()
+def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
+    """여러 GPU를 쓸 때 필요한 분산 학습 환경을 준비하고, 내 위치 정보를 정리한다.
 
-    ########  [LR (1) ] 학습률 선형 스케일링 =========================
+    이 함수는 두 가지 모드를 지원한다.
+      - use_deepspeed=True  인 경우:
+        torchrun 이 미리 넣어준 환경변수(RANK, WORLD_SIZE, LOCAL_RANK)를 그대로 읽어서
+        · global_rank : 전체 프로세스 중에서 내 번호
+        · world_size  : 전체 프로세스 개수
+        · rank        : 이 노드에서 내가 사용할 GPU 번호
+        를 정하고, 해당 GPU 로 장치를 고정한다.
+      - use_deepspeed=False 인 경우:
+        기존 ddp.ddp_setup_universal() 을 호출해서 위와 같은 값을 계산하고,
+        PyTorch 기본 분산 통신 설정까지 한 번에 마친다.
+
+    global_rank 는 “전체 학습 작업 안에서 내 순번”이고,
+    rank 는 “이 노드에서 실제로 사용하는 GPU 인덱스”라서 서로 다를 수 있다.
+    마지막으로, DeepSpeed 모드일 때는 기존 PyTorch 체크포인트 방식과 섞어 쓰지 못하므로
+    그 조합이 들어오면 바로 예외를 던져서 이상한 상태로 실행되지 않도록 막는다.
+    """
+    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
+
+    if use_deepspeed:
+        # torchrun이 설정한 환경변수만 사용해서 rank/world_size를 계산한다.
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            global_rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            rank = int(os.environ.get("LOCAL_RANK", 0))
+        else:
+            # 단일 프로세스 fallback
+            global_rank = 0
+            world_size = 1
+            rank = 0
+        if args.device.startswith('cuda'):
+            torch.cuda.set_device(rank)
+    else:
+        # 기존 DDP 초기화 흐름과 동일
+        global_rank, rank, _ = ddp.ddp_setup_universal(True, args)
+        world_size = ddp.get_world_size()
+
+    # DeepSpeed + 기존 PyTorch 체크포인트 조합은 현재 지원하지 않는다.
+    if use_deepspeed and args.resume_local_path_model_path is not None:
+        if global_rank == 0:
+            raise RuntimeError(
+                "[TODO] use_deepspeed=True인 경우, 기존 PyTorch 체크포인트 기반 resume는 지원하지 않습니다. "
+                "DeepSpeed의 자체 체크포인트 기능을 사용하시기 바랍니다.")
+
+    return global_rank, rank, world_size, use_deepspeed
+
+
+def _scale_learning_rate_and_epochs(
+    args: argparse.Namespace,
+    world_size: int,
+) -> Tuple[int, int]:
+    """글로벌 배치 크기에 맞춰 학습률과 학습 epoch 수를 자동 조정한다.
+
+    한 번의 업데이트에서 사용하는 샘플 수(글로벌 배치 크기)가 커지면,
+    · 한 번 업데이트가 더 안정적으로 되지만
+    · 전체 업데이트 횟수(스텝 수)는 줄어든다.
+    이 함수는 이런 변화에 맞게 두 가지를 같이 조정한다.
+
+      1) 학습률(lr)을 글로벌 배치 비율에 따라 키운다.
+         배치가 커질수록 한 번에 더 많은 정보를 보니,
+         한 스텝에서 조금 더 크게 움직여도 안정적이라는 가정이다.
+      2) 전체 epoch 수를 줄이거나 늘려서,
+         “전체 업데이트 스텝 수”가 기준 세팅과 비슷하도록 맞춘다.
+         이렇게 하면 배치 크기를 바꿔도 학습 양이 너무 많아지거나
+         너무 적어지지 않도록 균형을 맞출 수 있다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        world_size: 전체 프로세스 개수. (GPU 개수 기준)
+
+    Returns:
+        BASE_GLOBAL_BATCH: 기준이 되는 글로벌 배치 크기(예: 2048).
+        current_global_batch: 현재 설정에서 실제로 사용되는 글로벌 배치 크기.
+    """
     BASE_GLOBAL_BATCH = 2048  # 기존 기준 글로벌 배치
     BASE_LR = args.learning_rate  # 기존 기준 LR (Adam/AdamW)
 
@@ -675,31 +773,41 @@ def model_training(args):
     current_global_batch = _effective_global_batch(args.batch_size, world_size)
     scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
     args.learning_rate = BASE_LR * scale
-    ################################################################
-    ########  [LR (2) ] epoch scaling (keep total steps constant) ########
-    # - 앵커 에폭은 "현재 args.train_epochs"를 기준(기본 500)
-    EPOCH_BETA = 1
-    base_epochs_anchor = int(args.train_epochs)  # 500
+
+    # 전체 학습 epoch 수를 글로벌 배치에 맞게 조정
+    EPOCH_BETA = 1.0
+    base_epochs_anchor = int(args.train_epochs)  # 예: 360
 
     scaled_epochs = _auto_scale_train_epochs(
         base_global_batch=BASE_GLOBAL_BATCH,  # B_0 = 2048
-        base_epochs=base_epochs_anchor,  # E_0 = 500
+        base_epochs=base_epochs_anchor,  # E_0 = 360
         current_global_batch=current_global_batch,  # B = 실제 글로벌 배치
-        beta=EPOCH_BETA,  # 1
-        clamp_min=max(1, args.warm_up_epoch + 1),  # warmup 안전
-        clamp_max=None,  # 필요하면 예: 2000 등
+        beta=EPOCH_BETA,
+        clamp_min=max(1, args.warm_up_epoch + 1),
+        clamp_max=None,
     )
     args.train_epochs = int(scaled_epochs)
-    train_epochs = args.train_epochs
 
+    return BASE_GLOBAL_BATCH, current_global_batch
+
+
+def _prepare_save_path_and_dump_args(
+    args: argparse.Namespace,
+    global_rank: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    """체크포인트/로그를 저장할 경로를 만들고, args.json을 기록한다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        global_rank: 전체 프로세스 기준 번호.
+
+    Returns:
+        save_path: rank 0에서 만든 저장 경로. 나머지 rank는 None.
+        time_str: 디렉터리 이름에 사용한 시간 문자열. rank 0에서만 유효.
+    """
     if global_rank == 0:
-        """
-    •	rank 0 프로세스에서만, 재개 경로가 있으면 그 경로를 save_path로 쓰고, 없으면 save_dir/training_log/name/현재시각/ 폴더를 새로 만들고 save_path로 설정합니다.
-	•	args를 딕셔너리로 변환하되 StateNormalizer, ObservationNormalizer는 .to_dict()로 바꿔 넣습니다.
-	•	그 딕셔너리를 save_path/args.json에 JSON으로 저장합니다.
-        """
         if args.resume_local_path_model_path is not None:
-            # resume_local_path_model_path: ./training_log/npc_aug_n_ego_past/2025-08-06-07:23:04/
+            # resume_local_path_model_path: ./training_log/.../2025-08-06-07:23:04/
             save_path = args.resume_local_path_model_path
             # 폴더명 자체가 타임스탬프이므로 그대로 재사용
             time_str = os.path.basename(
@@ -711,129 +819,252 @@ def model_training(args):
             time_str = datetime.now().strftime("%Y-%m-%d-%H-%M")
             save_path = f"{args.save_dir}/training_log/{args.name}/{time_}/"
             os.makedirs(save_path, exist_ok=True)
+
         args.save_path = save_path
-        # Save args
+
+        # StateNormalizer / ObservationNormalizer는 dict로 변환해서 저장
         args_dict = vars(args)
         args_dict = {
-            k:
-                v if not isinstance(v, (StateNormalizer, ObservationNormalizer))
-                else v.to_dict() for k, v in args_dict.items()
+            k: (v if not isinstance(v, (StateNormalizer, ObservationNormalizer))
+                else v.to_dict()) for k, v in args_dict.items()
         }
 
         from mmengine.fileio import dump
-        dump(args_dict,
-             os.path.join(save_path, 'args.json'),
-             file_format='json',
-             indent=4)
+        dump(
+            args_dict,
+            os.path.join(save_path, 'args.json'),
+            file_format='json',
+            indent=4,
+        )
     else:
         save_path = None
         args.save_path = None
+        time_str = None
 
-    # set seed
-    set_seed(args.seed + global_rank)
-    # Enable anomaly detection to trace NaN/Inf origins during training
-    # torch.autograd.set_detect_anomaly(True)
+    return save_path, time_str
 
-    # training parameters
-    batch_size = args.batch_size
 
-    # set up data loaders
+def _build_augmentation(args: argparse.Namespace,) -> Optional[object]:
+    """ego / npc 궤적에 사용할 데이터 증가(augmentation) 객체를 만든다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+
+    Returns:
+        aug: StatePerturbation 또는 NPCStatePerturbation, 사용 안 하면 None.
+    """
     if args.use_ego_data_augment and args.use_npc_data_augment:
         raise ValueError(
             "You cannot use both ego and npc data augmentation at the same time. "
         )
+
     if args.use_ego_data_augment:
-        aug = StatePerturbation(augment_prob=args.augment_prob,
-                                device=args.device)
+        aug = StatePerturbation(
+            augment_prob=args.augment_prob,
+            device=args.device,
+        )
     elif args.use_npc_data_augment:
-        aug = NPCStatePerturbation(augment_prob=args.augment_prob,
-                                   device=args.device)
+        aug = NPCStatePerturbation(
+            augment_prob=args.augment_prob,
+            device=args.device,
+        )
     else:
         aug = None
-    """ DiffusionPlannerData
-	•	학습에 쓸 샘플 목록을 읽고( JSON 경로 ), 
-	    **데이터 루트 디렉터리( npz 위치 )**와 함께 
-	    인덱스→파일 경로 매핑을 제공
-	•	__len__은 샘플 개수(목록 길이) 를, 
-	    __getitem__(idx)는 idx번째 npz를 로드해서 
-	        max_agent_num, predicted_neighbor_num, future_len에 맞게 필요 채널만 잘라 
-	        모델이 기대하는 튜플(batch 항목 순서 고정) 로 반환
-	•	즉, DataLoader/DistributedSampler가 순회할 단일 샘플 로더를 정의해 주는 역할이며, 
-	    셔플·분산 분배는 Sampler가 담당
-    """
-    train_set = DiffusionPlannerData(
-        args.train_set,  # "/mnt/nuplan/dataset/processed"
-        args.
-        train_set_list,  # "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
-        args.future_len)
-    """ DistributedSampler
-	•	전체 데이터 인덱스를 전역으로 섞고(shuffle=True),
-	•	월드 크기(num_replicas=전체 프로세스 수)만큼 균등 분할한 뒤,
-	•	현재 프로세스(rank=global_rank)에 해당하는 부분만 DataLoader에 넘겨줍니다.
-	    - rank * num_samples : (rank+1)*num_samples 슬라이스 반환 규칙이 있다.
-	•	그래서 GPU마다 겹치지 않는 샘플만 보게 되고, 
-	        set_epoch() 호출 시 에폭마다 다시 전역 셔플되어 분배가 바뀝니다.
-    """
-    train_sampler = DistributedSampler(train_set,
-                                       num_replicas=ddp.get_world_size(),
-                                       rank=global_rank,
-                                       shuffle=True,
-                                       seed=args.seed)
-    ################################################################
-    ######## [LR (3) ] T_w,0  (warmup_steps_at_B0) 구하기 = 배치 B_0에서의 워밍업 스텝 수 ##############
-    # (배치 B_0에서의 에폭당 스텝 수 * 워밍업 에폭 수(args.warm_up_epoch))
-    total_data_num = len(train_set)
-    steps_per_epoch_at_B0 = math.ceil(
-        total_data_num / float(BASE_GLOBAL_BATCH))  # B_0=2048에서의 epoch당 스텝 수
-    warmup_steps_at_B0 = steps_per_epoch_at_B0 * args.warm_up_epoch
-    batch_ratio = current_global_batch / float(BASE_GLOBAL_BATCH)
-    ####### T_w(B) (warmup_steps) 구하기 : 배치 B에서의 워밍업 스텝 수 ##############
-    WARMUP_SCALE_EXP = 0.5
-    # : warmup_steps
-    warmup_steps = math.ceil(warmup_steps_at_B0 *
-                             batch_ratio**WARMUP_SCALE_EXP)  # B에서의 워밍업 스텝 수
-    ###########################################################
-    """ DataLoader
-•	무엇을 하냐: 
-        DistributedSampler가 넘겨준 인덱스 순서대로
-            DiffusionPlannerData에서 데이터를 읽어와, 
-        이 랭크의 배치 크기(batch_size // world_size)로 배치들을 만들어 GPU로 전달
-•	어떻게 빠르게 읽냐: 
-        num_workers 만큼 백그라운드 워커로 병렬 로딩, 
-        prefetch_factor로 미리 읽기, 
-        pin_memory=True로 고정 메모리 사용, 
-        persistent_workers=True로 에폭 간 워커 유지.
-•	배치 정합: 
-        drop_last=True라서 마지막 불완전 배치는 버려져, 모든 랭크가 동일 스텝 수를 가집니다.
 
+    return aug
+
+
+def _build_dataset_and_sampler(
+    args: argparse.Namespace,
+    world_size: int,
+    global_rank: int,
+) -> Tuple[DiffusionPlannerData, DistributedSampler]:
+    """학습용 Dataset과 DistributedSampler를 만든다.
+
+    DiffusionPlannerData 는
+      - 학습에 쓸 파일 목록(JSON)을 읽고
+      - 각 항목에 대응하는 npz 파일을 열어서
+      - 하나의 샘플을 이름 기반 dict로 돌려준다.
+        예: "ego_agent_past": (time_len, 11),
+            "neighbor_agents_past": (agent_num, time_len, 11),
+            "lanes": (lane_num, lane_len, 12) 등.
+
+    DistributedSampler 는 전체 샘플 인덱스를
+      - world_size 개만큼 나누고
+      - 각 rank(global_rank)에 서로 다른 구간을 배정해서
+        여러 GPU가 겹치지 않는 데이터를 보게 만든다.
+    이렇게 하면 모든 GPU가 동시에 다른 샘플을 보면서도,
+    한 epoch 안에서 전체 데이터가 고르게 사용되도록 맞출 수 있다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        world_size: 전체 프로세스 개수.
+        global_rank: 전체 프로세스 기준 번호.
+
+    Returns:
+        train_set: DiffusionPlannerData 인스턴스.
+        train_sampler: 각 rank에 샘플을 나눠주는 DistributedSampler.
     """
+    # train_set 내부에서 개별 샘플은 npz를 읽어 (agent, lane 등) 배열을
+    #   모델 입력 shape에 맞는 Tensor로 바꿔준다. (예: (time_len, 11), (A, T, 11) 등)
+    train_set = DiffusionPlannerData(
+        args.train_set,  # 예: "/mnt/nuplan/dataset/processed"
+        args.train_set_list,  # 예: diffusion_planner_training.json
+        args.future_len,
+    )
+
+    train_sampler = DistributedSampler(
+        train_set,
+        num_replicas=world_size,
+        rank=global_rank,
+        shuffle=True,
+        seed=args.seed,
+    )
+
+    return train_set, train_sampler
+
+
+def _compute_warmup_steps(
+    args: argparse.Namespace,
+    BASE_GLOBAL_BATCH: int,
+    current_global_batch: int,
+    total_data_num: int,
+) -> Tuple[int, int]:
+    """워밍업(epoch 수와 배치 크기)에 맞춰 워밍업 step 수를 계산한다.
+
+    여기서 워밍업은 “처음 몇 step 동안은 학습률을 서서히 올리다가,
+    어느 시점 이후부터 본래 학습률로 쓰자”는 개념이다.
+    너무 이른 단계부터 큰 학습률을 쓰면 값이 튀거나 발산하기 쉬워서,
+    초반에는 조금씩 적응시키는 완충 구간을 둔다.
+
+    계산 순서는 다음과 같다.
+      1) 기준 배치 크기(BASE_GLOBAL_BATCH)에서
+         · 한 epoch에 몇 step이 나오는지
+         · 워밍업 epoch 수(args.warm_up_epoch)를 곱해
+           “기준 환경에서의 총 워밍업 step 수(warmup_steps_at_B0)”를 정한다.
+      2) 현재 글로벌 배치(current_global_batch)가 기준보다 크거나 작을 수 있으므로,
+         배치 비율에 따라 워밍업 step 수도 함께 스케일링한다.
+         배치가 커지면 한 epoch당 step이 줄어들기 때문에,
+         워밍업을 너무 길게 또는 너무 짧게 가져가지 않도록 조정하는 목적이다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        BASE_GLOBAL_BATCH: 기준 글로벌 배치 크기.
+        current_global_batch: 현재 글로벌 배치 크기.
+        total_data_num: 전체 학습 샘플 수.
+
+    Returns:
+        warmup_steps_at_B0: 기준 배치 크기에서의 워밍업 step 수.
+        warmup_steps: 현재 배치 크기에서의 워밍업 step 수.
+    """
+    # 기준 배치 B_0에서의 epoch당 step 수
+    steps_per_epoch_at_B0 = math.ceil(total_data_num / float(BASE_GLOBAL_BATCH))
+    warmup_steps_at_B0 = steps_per_epoch_at_B0 * args.warm_up_epoch
+
+    batch_ratio = current_global_batch / float(BASE_GLOBAL_BATCH)
+    WARMUP_SCALE_EXP = 0.5
+    warmup_steps = math.ceil(warmup_steps_at_B0 * batch_ratio**WARMUP_SCALE_EXP)
+
+    return warmup_steps_at_B0, warmup_steps
+
+
+def _build_train_loader(
+    args: argparse.Namespace,
+    train_set: DiffusionPlannerData,
+    train_sampler: DistributedSampler,
+    batch_size: int,
+    world_size: int,
+) -> DataLoader:
+    """분산 학습에 맞는 DataLoader를 만든다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        train_set: 학습용 DiffusionPlannerData.
+        train_sampler: rank별로 인덱스를 나누는 DistributedSampler.
+        batch_size: 전체 글로벌 배치 크기.
+        world_size: 전체 프로세스 개수.
+
+    Returns:
+        train_loader: 각 step마다 배치 dict를 반환하는 DataLoader.
+                      각 배치의 텐서는 (B, ·) shape를 가진다.
+    """
+    # 각 rank가 보는 per-rank 배치 크기
+    batch_size_per_rank = batch_size // world_size
+
     train_loader = DataLoader(
         train_set,  # DiffusionPlannerData
         sampler=train_sampler,  # DistributedSampler
-        batch_size=batch_size // ddp.get_world_size(),
+        batch_size=batch_size_per_rank,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=args.pin_mem,
         persistent_workers=True,  # 에폭이 바뀌어도 워커 유지
         drop_last=True,
-        collate_fn=DiffusionPlannerCollate(args),  # ← 변동 길이 패딩
+        collate_fn=DiffusionPlannerCollate(args),  # 배치 텐서 shape 맞춤
     )
-    ############## [LR (2) ] T: 총 업데이트 스텝 수 (유지 대상) 구하기 ####################
-    """ total_step_of_this_epoch
-    floor( (샘플러가 이 랭크에 준 샘플 수) / (batch_size_per_rank) ).
+    return train_loader
+
+
+def _compute_schedule_info(
+    args: argparse.Namespace,
+    train_loader: DataLoader,
+    world_size: int,
+) -> Tuple[int, int, int, int]:
+    """step 수와 글로벌 배치 크기, 에폭당 샘플 수를 계산한다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        train_loader: 학습용 DataLoader.
+        world_size: 전체 프로세스 개수.
+
+    Returns:
+        total_step_of_this_epoch: 한 epoch에서의 step 수.
+        total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
+        global_batch_size: 실제 글로벌 배치 크기.
+        samples_this_epoch: 한 epoch 동안 처리되는 샘플 개수.
     """
     total_step_of_this_epoch = len(train_loader)
     total_step_of_all_epoch = args.train_epochs * total_step_of_this_epoch
-    ################################################################################
-    # 실제 글로벌 배치 크기(정확)
-    world_size = ddp.get_world_size()
+
     bs_per_rank = args.batch_size // world_size
     global_batch_size = bs_per_rank * world_size
-    # 에폭당 처리 샘플 수 (drop_last이므로 len(loader)*global_batch_size)
     samples_this_epoch = total_step_of_this_epoch * global_batch_size
+
+    return (
+        total_step_of_this_epoch,
+        total_step_of_all_epoch,
+        global_batch_size,
+        samples_this_epoch,
+    )
+
+
+def _print_schedule_summary(
+    global_rank: int,
+    train_set_len: int,
+    BASE_GLOBAL_BATCH: int,
+    current_global_batch: int,
+    args: argparse.Namespace,
+    train_loader: DataLoader,
+    total_step_of_all_epoch: int,
+    warmup_steps_at_B0: int,
+    warmup_steps: int,
+) -> None:
+    """rank 0에서 데이터/스케줄 정보를 한 번 출력한다.
+
+    Args:
+        global_rank: 전체 프로세스 기준 번호.
+        train_set_len: 학습 샘플 개수.
+        BASE_GLOBAL_BATCH: 기준 글로벌 배치 크기.
+        current_global_batch: 현재 글로벌 배치 크기.
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        train_loader: 학습용 DataLoader.
+        total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
+        warmup_steps_at_B0: 기준 배치에서의 워밍업 step 수.
+        warmup_steps: 현재 배치에서의 워밍업 step 수.
+    """
     if global_rank == 0:
         print("==========[Learning HYPERPARAMETER INFO]===============")
-        print("Dataset Prepared: {} train data\n".format(len(train_set)))
+        print(f"Dataset Prepared: {train_set_len} train data\n")
         print(f"[Schedule] B0={BASE_GLOBAL_BATCH}, B={current_global_batch}, "
               f"eta_max={args.learning_rate:.3e}, "
               f"E(B)={args.train_epochs}, "
@@ -842,105 +1073,160 @@ def model_training(args):
               f"Tw0={warmup_steps_at_B0}, Tw(B)={warmup_steps}")
         print("=====================================================")
 
-    if args.ddp:
-        """
-•	모든 DDP 프로세스를 이 지점에서 멈춰 세우고, 모든 맴버이 도착할 때까지 기다립니다.
-•	그래서 앞 단계 작업(로깅, 저장, 초기화 등)이 전 프로세스에서 끝난 뒤 다음 코드로 함께 진행하게 합니다.
-        """
-        torch.distributed.barrier()
 
-    # set up model
+def _build_model_optimizer_scheduler(
+    args: argparse.Namespace,
+    rank: int,
+    use_deepspeed: bool,
+    total_step_of_all_epoch: int,
+    warmup_steps: int,
+) -> Tuple[nn.Module, Optional[ModelEma], optim.Optimizer, Any]:
+    """모델, EMA, 옵티마이저, 스케줄러를 한 번에 준비한다.
+
+    처리 흐름은 다음과 같다.
+      1) Diffusion_Planner 모델을 만들고, rank 에 해당하는 GPU 또는 CPU 로 옮긴다.
+         이때 각 파라미터 텐서의 shape는 계층 종류에 따라
+         (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW) 등 다양하다.
+      2) use_deepspeed 가 False 이고 args.ddp 가 True 이면,
+         모델을 PyTorch 기본 분산 래퍼(DDP)로 감싸서
+         여러 GPU가 같은 모델 복사본을 들고 gradient를 나눠 가지도록 만든다.
+      3) EMA를 켜면, 모델과 똑같은 구조의 복사본을 하나 더 두고
+         매 step마다 천천히 따라가게 해서, 나중에 더 안정적인 결과를 평가할 수 있게 한다.
+      4) build_adamw_with_param_groups 로 가중치 묶음을 나누고
+         AdamW 계열 옵티마이저를 만든다. 파라미터 그룹 안의 "params" 리스트에는
+         위에서 언급한 다양한 shape의 텐서들이 들어간다.
+      5) build_pytorch_warmup_cosine_scheduler 로
+         전체 step 수(total_step_of_all_epoch)와 warmup_steps 에 맞는
+         “처음에는 천천히 올리고, 이후에는 서서히 줄이는” 학습률 스케줄을 만든다.
+      6) use_deepspeed 가 True 이면,
+         위에서 만든 모델·옵티마이저·스케줄러를 DeepSpeed 엔진으로 한 번 더 감싼다.
+         이때 DeepSpeed는 설정 파일(ds_config)에 따라
+         · 옵티마 상태를 여러 GPU에 나누어 들거나
+         · 일부를 CPU 쪽으로 옮기는 등의 메모리 최적화를 대신 처리한다.
+         DDP 모드에서는 이런 분할 없이, 각 GPU가 모델과 옵티마 상태를 그대로 들고 간다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        rank: 이 노드에서 사용할 GPU 인덱스.
+        use_deepspeed: DeepSpeed 모드 사용 여부.
+        total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
+        warmup_steps: 워밍업 step 수.
+
+    Returns:
+        diffusion_planner: Diffusion_Planner 또는 DeepSpeed/DDP 래핑된 모델.
+        model_ema: EMA 추적용 모델 래퍼. 사용하지 않으면 None.
+        optimizer: AdamW 또는 8bit AdamW 옵티마이저.
+        scheduler: PyTorch warmup + cosine + hold 스케줄러.
+    """
+    # diffusion_planner.parameters(): 각 파라미터 텐서는
+    #   (out_dim, in_dim) 또는 (dim,) 등 모델 구조에 따라 다양한 shape를 가진다.
     diffusion_planner = Diffusion_Planner(args)
     diffusion_planner = diffusion_planner.to(rank if args.device ==
                                              'cuda' else args.device)
 
-    if args.ddp:
-        """
-•	이 줄은 현재 모델을 “분산 학습용 모델”로 바꿉니다.
-    •	이 프로세스가 사용할 GPU 번호를 지정하고, 그 GPU에 모델을 올립니다.
-•	backward() 이후 
-        모든 프로세스의 그라디언트를 자동으로 합/평균(ALL-REDUCE) 해서 
-            각 프로세스가 같은 그라디언트를 갖게 합니다.
-•	optimizer.step()은 각 프로세스에서 동일하게 실행되지만, 
-        파라미터가 항상 동일하게 유지됩니다(초기 파라미터 방송, 버퍼/파라미터 동기화 포함).
-•	코드에서 원본 모델에 접근할 땐 ddp.get_model(...).module 형태로 씁니다.
-
-요약: 한 프로세스-한 GPU로 모델을 배치하고, 역전파 때 자동 동기화까지 처리하는 래퍼입니다.
-        """
+    # DeepSpeed를 쓸 때는 torch.nn.parallel.DDP 래퍼는 사용하지 않는다.
+    if args.ddp and (not use_deepspeed):
         diffusion_planner = DDP(diffusion_planner, device_ids=[rank])
-    model_ema = None
+
+    model_ema: Optional[ModelEma] = None
     if args.use_ema:
-        " 현재 모델을 깊은 복사해서 EMA용 모델(model_ema.ema)을 만듭니다. "
+        # model_ema.ema.parameters(): 원본 모델 파라미터와 같은 shape
         model_ema = ModelEma(
             diffusion_planner,
             decay=0.999,
             device=args.device,
         )
-    # --- build param groups with correct no-decay (timm helper) ---
-    base_model = ddp.get_model(diffusion_planner, args.ddp)
-    """ build_adamw_with_param_groups
-•	무엇을 하냐: 모델 파라미터를 두 묶음으로 나눠 AdamW 옵티마이저를 만듭니다.
-        1.	weight decay(가중치 감쇠) 적용 묶음(일반 가중치)
-        2.	감쇠 제외 묶음
-            (bias, LayerNorm/Norm 계열, 토큰·포지션 파라미터(seeds/ego_fut_seeds 포함))
-•	어떻게 세팅하냐: 각 묶음에 같은 학습률을 넣되, 
-        감쇠 적용 여부만 다르게 해서 옵티마이저를 만들고,
-        함께 감쇠 제외 목록(extra_nwd) 도 돌려줍니다.
-•	왜 이렇게 하냐: 
-        weight decay는 행렬 가중치엔 유익하지만, 
-        bias/Norm/임베딩(토큰·포지션) 같은 값에 걸면 표현력이 줄거나 수렴이 흔들릴 수 있어요. 
-        그래서 **“감쇠로 과적합 억제”**와 **“중요 파라미터 보존”**을 동시에 잡기 위해
-        이런 파라미터 그룹화로 옵티마이저를 만드는 거예요.
-    """
+
+    # DDP를 쓴 경우에만 래퍼를 벗겨서 실제 모듈 기준으로 param_group을 만든다.
+    base_model = ddp.get_model(diffusion_planner, args.ddp and
+                               (not use_deepspeed))
+
     optimizer, extra_nwd = build_adamw_with_param_groups(
         model=base_model,
         lr=args.learning_rate,
-        weight_decay=args.weight_decay,  # 1e-2
+        weight_decay=args.weight_decay,  # 예: 1e-2
         include_seed_params=True,
-        # ← seeds/ego_fut_seeds도 no-decay에 포함(원치 않으면 False)
-        use_8bit_optimizer=getattr(args, "use_8bit_optimizer", False),
     )
-    # ↓↓↓ 여기 추가 (스케줄러 생성/step 이전) ↓↓↓
+
+    # param_groups[i]["params"] 리스트 안에는 다양한 shape의 파라미터 텐서들이 들어 있다.
     for pg in optimizer.param_groups:
-        pg.setdefault("lr_max", float(pg["lr"]))  # η_max(B)
-        pg.setdefault("wd_max", float(pg.get("weight_decay",
-                                             0.0)))  # 그룹별 WD 기준값
-    # ↑↑↑
-    ############## [LR (4) ] 선형 워밍업 -> 코사인 디케이 (스케쥴) ##########################
-    # pseudo_total_update_steps = 110000
-    scheduler = build_pytorch_warmup_cosine_scheduler(optimizer,
-                                                      total_step_of_all_epoch,
-                                                      warmup_steps,
-                                                      eta_min=0.2 *
-                                                      args.learning_rate)
-    # if warmup_steps > 0:
-    #     scheduler.step()  # 초기 LR을 warmup 첫 값으로 세팅
+        pg.setdefault("lr_max", float(pg["lr"]))  # 기준 LR
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))  # 기준 WD
+
+    scheduler = build_pytorch_warmup_cosine_scheduler(
+        optimizer,
+        total_step_of_all_epoch,
+        warmup_steps,
+        eta_min=0.2 * args.learning_rate,
+    )
+
+    # DeepSpeed로 래핑 (ZeRO-2는 config JSON에서 stage=2로 설정)
+    if use_deepspeed:
+        import deepspeed  # use_deepspeed=True일 때만 import
+        ds_config = getattr(args, "deepspeed_config", None)
+        diffusion_planner, optimizer, _, scheduler = deepspeed.initialize(
+            model=diffusion_planner,
+            model_parameters=base_model.parameters(),
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            config=ds_config,
+        )
+
+    return diffusion_planner, model_ema, optimizer, scheduler
+
+
+def _maybe_resume_from_checkpoint(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+    global_rank: int,
+    train_epochs: int,
+) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+           Optional[str], int, bool]:
+    """체크포인트가 지정된 경우 모델/옵티마 상태를 불러와서 이어 학습한다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        diffusion_planner: 현재 학습 중인 모델.
+        optimizer: 옵티마이저.
+        scheduler: 학습률 스케줄러.
+        model_ema: EMA 래퍼 또는 None.
+        global_rank: 전체 프로세스 기준 번호.
+        train_epochs: 스케일링 후의 전체 epoch 수.
+
+    Returns:
+        diffusion_planner: (필요 시) 체크포인트에서 로드한 가중치가 적용된 모델.
+        optimizer: 로드된 옵티마이저 상태.
+        scheduler: 로드된 스케줄러 상태.
+        model_ema: 로드된 EMA 상태.
+        init_epoch: 재개 시 시작할 epoch 인덱스.
+        wandb_id: wandb run id. 없으면 None.
+        train_epochs: (필요 시) 재조정된 전체 epoch 수.
+        allow_val_change: wandb config 값 변경 허용 여부.
+    """
     allow_val_change = False
+
     if args.resume_local_path_model_path is not None:
         print(f"Model loaded from {args.resume_local_path_model_path}")
-        """
-•	체크포인트 재개: 
-        resume_model(<path>, ...)을 호출해 
-        <path>/latest.pth에서 모델 가중치, 옵티마이저 상태, 스케줄러 상태, 
-        시작 에폭, W&B id, EMA 가중치를 불러옵니다.
-•	EMA 세팅: 
-        불러온 EMA 가중치를 eval()로 두고 requires_grad=False로 고정합니다.
-•	반환/대입: 
-        복구된 객체들을 (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id, model_ema)
-        에 덮어써 이후 학습을 바로 이어갑니다.
-        """
+
         (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
-         model_ema) = resume_model(args.resume_local_path_model_path,
-                                   diffusion_planner, optimizer, scheduler,
-                                   model_ema, args.device)
-        # ↓↓↓ 여기 추가 (resume이 optimizer를 교체했으므로 보강) ↓↓↓
+         model_ema) = resume_model(
+             args.resume_local_path_model_path,
+             diffusion_planner,
+             optimizer,
+             scheduler,
+             model_ema,
+             args.device,
+         )
+
+        # resume 후에도 wd_max / lr_max 기본값이 유지되도록 보강
         for pg in optimizer.param_groups:
-            pg.setdefault("lr_max", float(pg["lr"]))  # η_max(B)
-            pg.setdefault("wd_max", float(pg.get("weight_decay",
-                                                 0.0)))  # 그룹별 WD 기준값
-        # ↑↑↑
-        # --- [NEW] If resumed, ensure total epochs > init_epoch ------------------
-        # 재개 시 총 에폭이 초기 에폭보다 작거나 같으면 최소 1epoch 더 돌도록 보정
+            pg.setdefault("lr_max", float(pg["lr"]))
+            pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
+
+        # 재개 시 총 epoch 수가 init_epoch보다 작지 않도록 보정
         if args.train_epochs <= init_epoch:
             old = int(args.train_epochs)
             args.train_epochs = int(init_epoch) + 1
@@ -949,177 +1235,403 @@ def model_training(args):
                     f"[ADJUST] scaled train_epochs ({old}) <= init_epoch ({init_epoch}). "
                     f"Bumping to {args.train_epochs}.")
 
-        # (로컬 변수도 갱신하여 아래 스케줄러/루프에서 동일 값 사용)
         train_epochs = int(args.train_epochs)
+
         if args.resume_model_from_wandb:
             allow_val_change = True
     else:
         init_epoch = 0
         wandb_id = None
 
-    # logger
-    wandb_logger = Logger(args.name,
-                          args.notes,
-                          args,
-                          wandb_resume_id=wandb_id,
-                          save_path=save_path,
-                          rank=global_rank,
-                          allow_val_change=allow_val_change)
+    return (
+        diffusion_planner,
+        optimizer,
+        scheduler,
+        model_ema,
+        init_epoch,
+        wandb_id,
+        train_epochs,
+        allow_val_change,
+    )
+
+
+def _setup_logger_and_purge(
+    args: argparse.Namespace,
+    save_path: Optional[str],
+    global_rank: int,
+    wandb_id: Optional[str],
+    allow_val_change: bool,
+) -> Logger:
+    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리한다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        save_path: 체크포인트 저장 경로.
+        global_rank: 전체 프로세스 기준 번호.
+        wandb_id: 재개 시 사용할 wandb run id.
+        allow_val_change: wandb config 값 변경 허용 여부.
+
+    Returns:
+        wandb_logger: TensorBoardLogger 래퍼.
+    """
+    wandb_logger = Logger(
+        args.name,
+        args.notes,
+        args,
+        wandb_resume_id=wandb_id,
+        save_path=save_path,
+        rank=global_rank,
+        allow_val_change=allow_val_change,
+    )
+
     if global_rank == 0 and args.remove_existing_wb_weight:
         api = wandb.Api()
-
-        # 현재 run의 entity / project
         entity = wandb.run.entity
         project = wandb.run.project
 
-        # 우리가 새로 만들 컬렉션 이름 (time_str는 앞에서 한 번 계산됨)
         purge_collection(api, entity, project, f"{args.name}_latest-model")
         purge_collection(api, entity, project, f"{args.name}_best-model")
+
     if args.ddp:
         torch.distributed.barrier()
 
-    # begin training
+    return wandb_logger
+
+
+def _train_one_epoch(
+    epoch: int,
+    train_epochs: int,
+    train_loader: DataLoader,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    args: argparse.Namespace,
+    model_ema: Optional[ModelEma],
+    aug: Optional[object],
+) -> Tuple[Dict[str, float], float, float]:
+    """하나의 epoch 동안 학습을 실행하고, 손실과 걸린 시간을 계산한다.
+
+    Args:
+        epoch: 현재 epoch 인덱스(0 기반).
+        train_epochs: 전체 epoch 수.
+        train_loader: 학습용 DataLoader. 배치 텐서는 (B, ·) shape.
+        diffusion_planner: 학습 중인 모델(nn.Module 또는 DDP/DeepSpeed 래퍼).
+        optimizer: 옵티마이저.
+        scheduler: 학습률 스케줄러.
+        args: 학습 설정.
+        model_ema: EMA 래퍼 또는 None.
+        aug: augmentation 객체(StatePerturbation/NPCStatePerturbation 등) 또는 None.
+
+    Returns:
+        train_loss: key별 epoch 평균 손실 딕셔너리. 각 값은 scalar float.
+        train_total_loss: 최종 합 손실 scalar float.
+        epoch_time_sec: 해당 epoch에 걸린 시간(초).
+    """
+    # train_epoch 안에서 각 step 배치 텐서는 대략
+    #   ego_agent_past: (B, T_past, 11)
+    #   neighbor_agents_past: (B, A, T_past, 11)
+    #   lanes: (B, L, lane_len, 12)
+    #   static_objects: (B, S, 10)
+    #   near_future_gt_3_dim: (B, A, T_future, 3)
+    # 와 같은 shape로 사용된다.
+    if args.ddp and ddp.get_rank() == 0:
+        print(f"Epoch {epoch + 1}/{train_epochs}")
+
+    epoch_t0 = time.perf_counter()
+
+    train_loss, train_total_loss = train_epoch(
+        train_loader,
+        diffusion_planner,
+        optimizer,
+        args,
+        model_ema,
+        scheduler,
+        aug,
+    )
+
+    if args.device.startswith('cuda'):
+        torch.cuda.empty_cache()
+
+    if args.ddp:
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+    epoch_time_sec = time.perf_counter() - epoch_t0
+    return train_loss, train_total_loss, epoch_time_sec
+
+
+def _log_and_save_on_rank0(
+    epoch: int,
+    args: argparse.Namespace,
+    train_loss: Dict[str, float],
+    train_total_loss: float,
+    lr_dict: Dict[str, float],
+    metrics: Dict[str, float],
+    wandb_logger: Logger,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+    save_path: Optional[str],
+    time_str: Optional[str],
+    best_loss: float,
+    global_rank: int,
+) -> float:
+    """rank 0에서 epoch 로그를 기록하고, 필요 시 체크포인트와 아티팩트를 저장한다.
+
+    이 함수는 “대표 프로세스(rank 0)”에서만 다음 일을 한다.
+      1) metrics 딕셔너리를 TensorBoard/W&B 로 보낸다.
+         여기에는
+           · train_loss/로 시작하는 손실 값들 (각 key는 scalar float)
+           · lr/로 시작하는 학습률 관련 값들
+           · speed/로 시작하는 속도 정보(초당 샘플 수, 배치 수 등)
+         이 포함된다.
+      2) 지정한 저장 주기(args.save_utd)에 맞는 epoch라면,
+         save_model() 을 호출해 현재 모델 상태를 파일(latest.pth, 필요 시 best.pth)로 남긴다.
+         이 파일에는
+           · 모델 가중치 텐서들 (shape 예: (out_dim, in_dim), (dim,) 등)
+           · 옵티마 상태, 스케줄러 상태, EMA 상태
+           · 현재 epoch, 손실, wandb run id
+         가 함께 저장된다.
+      3) W&B 아티팩트로도 최신(latest) / 최고(best) 모델 파일을 올리고,
+         옵션에 따라 오래된 버전은 정리한다.
+         이렇게 하면 여러 실험을 돌릴 때,
+         웹 대시보드에서 어떤 시점의 모델이 어떤 성능이었는지 쉽게 추적할 수 있다.
+
+    Args:
+        epoch: 현재 epoch 인덱스(0 기반).
+        args: 학습 설정.
+        train_loss: key별 epoch 평균 손실 딕셔너리.
+        train_total_loss: 최종 합 손실 scalar float.
+        lr_dict: 학습률 및 부가 값 딕셔너리. 값은 scalar float.
+        metrics: wandb에 기록할 전체 metric 딕셔너리.
+        wandb_logger: TensorBoardLogger 래퍼.
+        diffusion_planner: 학습 중인 모델.
+        optimizer: 옵티마이저.
+        scheduler: 학습률 스케줄러.
+        model_ema: EMA 래퍼 또는 None.
+        save_path: 체크포인트 저장 경로.
+        time_str: run 식별용 시간 문자열.
+        best_loss: 현재까지의 best loss 값.
+        global_rank: 전체 프로세스 기준 번호.
+
+    Returns:
+        best_loss: 업데이트된 best loss 값.
+    """
+    if global_rank != 0:
+        return best_loss
+
+    wandb_logger.log_metrics(metrics, step=epoch + 1)
+
+    if (epoch + 1) % args.save_utd != 1:
+        return best_loss
+
+    save_best = False
+    if train_total_loss < best_loss:
+        best_loss = train_total_loss
+        save_best = True
+
+    # diffusion_planner.state_dict() 안 파라미터 텐서 shape:
+    #   Linear weight: (out_dim, in_dim)
+    #   LayerNorm weight: (dim,)
+    #   conv 등은 구조에 맞는 (C_out, C_in, ...) 형태
+    save_model(
+        diffusion_planner,
+        optimizer,
+        scheduler,
+        save_path,
+        epoch,
+        train_total_loss,
+        wandb_logger.id,
+        model_ema.ema if model_ema is not None else None,
+        save_best,
+    )
+    print(f"Model saved in {save_path}\n")
+
+    latest_coll = f"{args.name}_latest-model"
+    latest_art = wandb.Artifact(
+        name=latest_coll,
+        type="model",
+        metadata={
+            "time_str": time_str,
+            "epoch": epoch + 1,
+            "loss": train_total_loss,
+        },
+    )
+    # latest.pth: torch.save로 저장된 dict. 내부 텐서 shape는 위 state_dict 설명과 동일.
+    latest_art.add_file(os.path.join(save_path, "latest.pth"))
+    wandb.log_artifact(latest_art, aliases=["latest"])
+    latest_art.wait()
+
+    if args.delete_wb_weight_when_running:
+        api = wandb.Api()
+        entity = wandb.run.entity
+        project = wandb.run.project
+        current = api.artifact(f"{entity}/{project}/{latest_coll}:latest")
+        for v in api.artifacts("model", f"{entity}/{project}/{latest_coll}"):
+            if v.id != current.id:
+                v.delete()
+
+    if save_best:
+        best_coll = f"{args.name}_best-model"
+        best_art = wandb.Artifact(
+            name=best_coll,
+            type="model",
+            metadata={
+                "time_str": time_str,
+                "epoch": epoch + 1,
+                "loss": train_total_loss,
+            },
+        )
+        best_art.add_file(os.path.join(save_path, "best.pth"))
+        wandb.log_artifact(best_art, aliases=["best"])
+        best_art.wait()
+
+        if args.delete_wb_weight_when_running:
+            entity = wandb.run.entity
+            project = wandb.run.project
+            current = api.artifact(f"{entity}/{project}/{best_coll}:best")
+            for v in api.artifacts("model", f"{entity}/{project}/{best_coll}"):
+                if v.id != current.id:
+                    v.delete()
+
+    return best_loss
+
+
+def _run_training_loop(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+    train_loader: DataLoader,
+    train_sampler: DistributedSampler,
+    wandb_logger: Logger,
+    save_path: Optional[str],
+    time_str: Optional[str],
+    best_loss: float,
+    global_rank: int,
+    train_epochs: int,
+    init_epoch: int,
+    samples_this_epoch: int,
+    global_batch_size: int,
+    aug: Optional[object],
+) -> float:
+    """전체 epoch 루프를 돌면서 학습, 로깅, 저장을 수행한다.
+
+    Args:
+        args: 학습 설정.
+        diffusion_planner: 학습 중인 모델.
+        optimizer: 옵티마이저.
+        scheduler: 학습률 스케줄러.
+        model_ema: EMA 래퍼 또는 None.
+        train_loader: 학습용 DataLoader. 배치 텐서는 (B, ·) shape.
+        train_sampler: DistributedSampler.
+        wandb_logger: TensorBoardLogger 래퍼.
+        save_path: 체크포인트 저장 경로.
+        time_str: run 식별용 시간 문자열.
+        best_loss: 현재까지의 best loss 값.
+        global_rank: 전체 프로세스 기준 번호.
+        train_epochs: 전체 epoch 수.
+        init_epoch: 재개 시작 epoch 인덱스.
+        samples_this_epoch: 한 epoch당 처리 샘플 수.
+        global_batch_size: 실제 글로벌 배치 크기.
+        aug: augmentation 객체 또는 None.
+
+    Returns:
+        best_loss: 학습 종료 시의 best loss 값.
+    """
     for epoch in range(init_epoch, train_epochs):
-        # scheduler.step()
-        if global_rank == 0:
-            print(f"Epoch {epoch+1}/{train_epochs}")
-        epoch_t0 = time.perf_counter()
-        train_loss, train_total_loss = train_epoch(
-            train_loader,  # DataLoader
-            diffusion_planner,
-            optimizer,
-            args,
-            model_ema,
-            scheduler,
-            aug)
-        if args.device.startswith('cuda'):
-            torch.cuda.empty_cache()
-        # === [추가] 에폭 종료 시간 & 에폭 속도 계산 ===
-        if args.ddp:
-            torch.cuda.synchronize()
-            torch.distributed.barrier()
-        epoch_time_sec = time.perf_counter() - epoch_t0
+        # 1) 한 epoch 학습
+        train_loss, train_total_loss, epoch_time_sec = _train_one_epoch(
+            epoch=epoch,
+            train_epochs=train_epochs,
+            train_loader=train_loader,
+            diffusion_planner=diffusion_planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            args=args,
+            model_ema=model_ema,
+            aug=aug,
+        )
 
+        # 2) epoch당 처리 속도 계산
         epoch_sps = samples_this_epoch / max(epoch_time_sec, 1e-9)
-        ###########################
-        if global_rank == 0:
-            lr_dict = {'lr': optimizer.param_groups[0]['lr']}
 
-            # <추가하자> 에폭 평균으로 집계된 feasible weight/progress를 lr/* 아래에 함께 기록
-            for k in ("feasible_progress", "feasible_w_dir", "feasible_w_int",
-                      "feasible_w_const"):
-                if k in train_loss:  # train_loss는 get_epoch_mean_loss() 결과
-                    lr_dict[k] = train_loss[k]  # 예: lr/feasible_w_dir 로 기록됨
+        # 3) lr_dict / metrics 구성
+        lr_dict: Dict[str, float] = {'lr': optimizer.param_groups[0]['lr']}
+        for k in (
+                "feasible_progress",
+                "feasible_w_dir",
+                "feasible_w_int",
+                "feasible_w_const",
+        ):
+            if k in train_loss:
+                lr_dict[k] = train_loss[k]
 
-            metrics = {
-                **{
-                    f"train_loss/{k}": v for k, v in train_loss.items()
-                },
-                **{
-                    f"lr/{k}": v for k, v in lr_dict.items()
-                },
-                "speed/epoch_time_sec": epoch_time_sec,
-                "speed/epoch_samples_per_sec": epoch_sps,
-                "speed/epoch_batches": len(train_loader),
-                "speed/global_batch_size": global_batch_size,
-            }
-            wandb_logger.log_metrics(metrics, step=epoch + 1)
+        # metrics 값들은 모두 scalar float
+        metrics: Dict[str, float] = {
+            **{
+                f"train_loss/{k}": v for k, v in train_loss.items()
+            },
+            **{
+                f"lr/{k}": v for k, v in lr_dict.items()
+            },
+            "speed/epoch_time_sec": epoch_time_sec,
+            "speed/epoch_samples_per_sec": epoch_sps,
+            "speed/epoch_batches": len(train_loader),
+            "speed/global_batch_size": global_batch_size,
+        }
 
-            if (epoch + 1) % args.save_utd == 1:
-                save_best = False
-                if train_total_loss < best_loss:
-                    best_loss = train_total_loss
-                    save_best = True
-                # save model at the end of epoch
-                save_model(diffusion_planner, optimizer, scheduler, save_path,
-                           epoch, train_total_loss, wandb_logger.id,
-                           model_ema.ema if model_ema is not None else None,
-                           save_best)
-                print(f"Model saved in {save_path}\n")
-                # ── latest-model 아티팩트 (매번 덮어쓰기) ──
-                # save_path = f"{args.save_dir}/training_log/{args.name}/{time}/"
-                # f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth'
-                latest_coll = f"{args.name}_latest-model"
-                latest_art = wandb.Artifact(
-                    name=latest_coll,  # latest-model 라는 이름의 데이터 묶음
-                    type="model",  # "dataset" 이 될수도 있음
-                    metadata={
-                        "time_str": time_str,
-                        "epoch": epoch + 1,
-                        "loss": train_total_loss
-                    })
-                # 로컬에 저장된 latest.pth 파일을 담아 넣는 동작
-                latest_art.add_file(os.path.join(save_path, "latest.pth"))
-                """
-이 상자(Artifact)를 W&B 서버로 전송하고, ["latest"]라는 별명을 붙여 줘요.
-별명을 쓰면, 다음에 다시 “latest”라는 이름으로 덮어써 가며 하나의 모델만 관리할 수 있습니다.
-                """
-                wandb.log_artifact(latest_art, aliases=["latest"])
-                latest_art.wait()  # 업로드 완료 보장
+        # 4) rank 0에서 로그 및 체크포인트/아티팩트 저장
+        best_loss = _log_and_save_on_rank0(
+            epoch=epoch,
+            args=args,
+            train_loss=train_loss,
+            train_total_loss=train_total_loss,
+            lr_dict=lr_dict,
+            metrics=metrics,
+            wandb_logger=wandb_logger,
+            diffusion_planner=diffusion_planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            model_ema=model_ema,
+            save_path=save_path,
+            time_str=time_str,
+            best_loss=best_loss,
+            global_rank=global_rank,
+        )
 
-                if args.delete_wb_weight_when_running:
-                    # 이전 버전 삭제
-                    api = wandb.Api()
-                    # wandb.run.entity: jksg01019-naver-labs
-                    # wandb.run.project: Diffusion-Planner
-                    entity = wandb.run.entity
-                    project = wandb.run.project
-                    # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
-
-                    current = api.artifact(
-                        f"{entity}/{project}/{latest_coll}:latest")
-
-                    # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                    for v in api.artifacts("model",
-                                           f"{entity}/{project}/{latest_coll}"):
-                        if v.id != current.id:
-                            v.delete()
-                # ── best-model 아티팩트 (조건부 덮어쓰기) ──
-                if save_best:
-                    best_coll = f"{args.name}_best-model"
-                    best_art = wandb.Artifact(name=best_coll,
-                                              type="model",
-                                              metadata={
-                                                  "time_str": time_str,
-                                                  "epoch": epoch + 1,
-                                                  "loss": train_total_loss
-                                              })
-                    best_art.add_file(os.path.join(save_path, "best.pth"))
-                    wandb.log_artifact(best_art, aliases=["best"])
-                    best_art.wait()  # 업로드 완료 보장
-
-                    # 이전 버전 삭제
-                    if args.delete_wb_weight_when_running:
-                        entity = wandb.run.entity
-                        project = wandb.run.project
-                        # ':latest' alias로 가져오면 방금 올린 버전이 리턴됩니다
-                        current = api.artifact(
-                            f"{entity}/{project}/{best_coll}:best")
-
-                        # 3) 모든 버전 목록 중, 이 버전이 아닌 나머지를 삭제
-                        for v in api.artifacts(
-                                "model", f"{entity}/{project}/{best_coll}"):
-                            if v.id != current.id:
-                                v.delete()
-
-        # scheduler.step()
+        # 5) 다음 epoch 를 위한 sampler seed 변경
         train_sampler.set_epoch(epoch + 1 + args.sampler_epoch_offset)
 
-    # ── 모든 훈련 종료 후 정리 ─
-    torch.distributed.barrier()  # ① 모든 rank의 학습 루프 종료 동기화
+    return best_loss
 
-    # ② 모든 rank에서 wandb 종료 (사용 시)
+
+def _finalize_training_cleanup(
+    args: argparse.Namespace,
+    global_rank: int,
+    wandb_logger: Logger,
+) -> None:
+    """학습이 끝난 뒤, 분산 동기화와 wandb/TensorBoard/로컬 파일 정리를 수행한다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        global_rank: 전체 프로세스 기준 번호.
+        wandb_logger: TensorBoardLogger 래퍼.
+    """
+    # 모든 rank에서 학습 루프가 끝날 때까지 대기
+    torch.distributed.barrier()
+
     if args.use_wandb:
         wandb.finish()
         if global_rank == 0:
-            wandb_logger.finish()  # TensorBoard Logger의 writer.close() 호출
+            wandb_logger.finish()
 
-    torch.distributed.barrier()  # ③ 모든 rank의 wandb 종료 동기화
+    torch.distributed.barrier()
 
-    # ④ Rank 0에서만 로컬 파일 정리
     if global_rank == 0 and args.save_path:
         print("[CLEANUP] 훈련 종료 후 로컬 체크포인트 및 로그 정리 시작")
-        # TensorBoard 로그·체크포인트 일괄 삭제
         for f in ["latest.pth", "best.pth", "args.json"]:
             p = os.path.join(args.save_path, f)
             try:
@@ -1138,6 +1650,149 @@ def model_training(args):
             print(f"[CLEANUP] 디렉터리 없음 (이미 삭제됨): {tb_dir}")
         except Exception as e:
             print(f"[CLEANUP] 디렉터리 삭제 오류: {tb_dir}, {e}")
+
+
+def model_training(args: argparse.Namespace) -> None:
+    """전체 학습 파이프라인을 실행하는 상위 함수.
+
+    - 분산 설정/학습률 스케일링
+    - Dataset / DataLoader 준비
+    - 모델 / 옵티마이저 / 스케줄러 / EMA 준비
+    - 체크포인트 재개 및 로깅 설정
+    - epoch 루프 실행과 최종 정리
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+    """
+    best_loss: float = float('inf')
+    torch.cuda.empty_cache()
+
+    # 1) 분산 초기화 및 rank 정보
+    global_rank, rank, world_size, use_deepspeed = _init_distributed(args)
+
+    # 2) 글로벌 배치 크기에 따라 학습률 / epoch 수 스케일링
+    BASE_GLOBAL_BATCH, current_global_batch = _scale_learning_rate_and_epochs(
+        args,
+        world_size,
+    )
+    train_epochs: int = args.train_epochs
+
+    # 3) save_path / args.json 준비
+    save_path, time_str = _prepare_save_path_and_dump_args(args, global_rank)
+
+    # 4) seed 고정
+    set_seed(args.seed + global_rank)
+
+    # 5) augmentation, Dataset, Sampler
+    batch_size = args.batch_size
+    aug = _build_augmentation(args)
+    # train_epoch 내부에서 args를 통해 augmentation이 사용되므로 aug는 실제로는
+    #   train_epoch 인자로만 전달되고, 배치 텐서 shape는 (B, ·)로 유지된다.
+    _ = aug  # 형식상 참조 (실제 로직은 기존과 동일하게 train_epoch에서 사용)
+
+    train_set, train_sampler = _build_dataset_and_sampler(
+        args,
+        world_size,
+        global_rank,
+    )
+
+    # 6) warmup step 계산
+    warmup_steps_at_B0, warmup_steps = _compute_warmup_steps(
+        args=args,
+        BASE_GLOBAL_BATCH=BASE_GLOBAL_BATCH,
+        current_global_batch=current_global_batch,
+        total_data_num=len(train_set),
+    )
+
+    # 7) DataLoader 및 step/샘플 수 정보
+    train_loader = _build_train_loader(
+        args,
+        train_set,
+        train_sampler,
+        batch_size,
+        world_size,
+    )
+    (total_step_of_this_epoch, total_step_of_all_epoch, global_batch_size,
+     samples_this_epoch) = _compute_schedule_info(
+         args=args,
+         train_loader=train_loader,
+         world_size=world_size,
+     )
+
+    # 8) rank 0에서 스케줄 요약 출력
+    _print_schedule_summary(
+        global_rank=global_rank,
+        train_set_len=len(train_set),
+        BASE_GLOBAL_BATCH=BASE_GLOBAL_BATCH,
+        current_global_batch=current_global_batch,
+        args=args,
+        train_loader=train_loader,
+        total_step_of_all_epoch=total_step_of_all_epoch,
+        warmup_steps_at_B0=warmup_steps_at_B0,
+        warmup_steps=warmup_steps,
+    )
+
+    # 9) DDP인 경우, 모델 생성 전 barrier
+    if args.ddp and not use_deepspeed:
+        torch.distributed.barrier()
+
+    # 10) 모델 / EMA / 옵티마이저 / 스케줄러 준비
+    (diffusion_planner, model_ema, optimizer,
+     scheduler) = _build_model_optimizer_scheduler(
+         args=args,
+         rank=rank,
+         use_deepspeed=use_deepspeed,
+         total_step_of_all_epoch=total_step_of_all_epoch,
+         warmup_steps=warmup_steps,
+     )
+
+    # 11) 체크포인트 재개
+    (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
+     train_epochs, allow_val_change) = _maybe_resume_from_checkpoint(
+         args=args,
+         diffusion_planner=diffusion_planner,
+         optimizer=optimizer,
+         scheduler=scheduler,
+         model_ema=model_ema,
+         global_rank=global_rank,
+         train_epochs=train_epochs,
+     )
+
+    # 12) 로거 설정 및 이전 아티팩트 정리
+    wandb_logger = _setup_logger_and_purge(
+        args=args,
+        save_path=save_path,
+        global_rank=global_rank,
+        wandb_id=wandb_id,
+        allow_val_change=allow_val_change,
+    )
+
+    best_loss = _run_training_loop(
+        args=args,
+        diffusion_planner=diffusion_planner,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        model_ema=model_ema,
+        train_loader=train_loader,
+        train_sampler=train_sampler,
+        wandb_logger=wandb_logger,
+        save_path=save_path,
+        time_str=time_str,
+        best_loss=best_loss,
+        global_rank=global_rank,
+        train_epochs=train_epochs,
+        init_epoch=init_epoch,
+        samples_this_epoch=samples_this_epoch,
+        global_batch_size=global_batch_size,
+        aug=aug,
+    )
+
+    # 14) 학습 종료 후 정리
+    _finalize_training_cleanup(
+        args=args,
+        global_rank=global_rank,
+        wandb_logger=wandb_logger,
+    )
 
 
 if __name__ == "__main__":

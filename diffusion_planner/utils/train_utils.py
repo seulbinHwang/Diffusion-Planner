@@ -131,7 +131,6 @@ def resume_model(path: str, model, optimizer, scheduler, ema, device):
         # 8bit ↔ 32bit AdamW 같이 타입이 바뀐 경우에도 여기로 온다.
         print(f"no pretrained optimizer found or optimizer state mismatch: {e}")
 
-
     # load schedule
     try:
         scheduler.load_state_dict(ckpt['schedule'])

@@ -88,7 +88,6 @@ def get_args():
                         help='number of static objects',
                         default=50)
 
-
     parser.add_argument('--lane_len',
                         type=int,
                         help='number of lane point',
@@ -173,8 +172,7 @@ def get_args():
         '--use_8bit_optimizer',
         default=True,
         type=boolean,
-        help='True이면 AdamW 옵티마이저 상태를 8비트로 저장해 GPU 메모리 사용을 줄입니다.'
-    )
+        help='True이면 AdamW 옵티마이저 상태를 8비트로 저장해 GPU 메모리 사용을 줄입니다.')
 
     parser.add_argument('--train_epochs',
                         type=int,
@@ -225,7 +223,19 @@ def get_args():
     parser.add_argument('--delete_wb_weight_when_running',
                         default=False,
                         type=boolean)
-
+    # ➕ [ADD] DeepSpeed / ZeRO-2 관련 옵션
+    parser.add_argument(
+        '--use_deepspeed',
+        default=True,
+        type=boolean,
+        help='True이면 DeepSpeed ZeRO-2로 optimizer state를 분산 저장해서 GPU 메모리를 줄입니다.')
+    parser.add_argument(
+        '--deepspeed_config',
+        default=None,
+        type=str,
+        help=
+        'DeepSpeed 설정 JSON 파일 경로 (zero_optimization.stage=2로 설정해야 ZeRO-2가 켜집니다).'
+    )
     # Model
     parser.add_argument('--encoder_depth',
                         type=int,
@@ -248,7 +258,6 @@ def get_args():
                         help='type of diffusion model [x_start, score]',
                         choices=['score', 'x_start'],
                         default='x_start')
-
 
     parser.add_argument('--use_wandb', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)
@@ -305,7 +314,9 @@ def get_args():
                         type=bool,
                         default=False,
                         help='shuffle scenarios')
-    parser.add_argument('--make_statistics_when_caching', default=True, type=boolean)
+    parser.add_argument('--make_statistics_when_caching',
+                        default=True,
+                        type=boolean)
     args = parser.parse_args()
     if not args.use_direct_loss:
         assert not args.use_guidance and not args.use_feasible_blend, \

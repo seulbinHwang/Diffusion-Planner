@@ -755,6 +755,7 @@ def _convert_all_frames_agents_to_ego_local(
 
     return all_frame_cur_exists_agents_local
 
+
 def _pack_ego_local_agents(
     all_frame_cur_exists_agents_local: List[
         np.ndarray],  # len = num_frames, 각: (current_agents_num, 8)
@@ -792,7 +793,8 @@ def _pack_ego_local_agents(
     for past_idx in range(len(all_frame_cur_exists_agents_local)):
         # frame_cur_exists_agents_local: (current_agents_num, 8)
         #   [track_id, vx, vy, heading, width, length, x, y]
-        frame_cur_exists_agents_local = all_frame_cur_exists_agents_local[past_idx]
+        frame_cur_exists_agents_local = all_frame_cur_exists_agents_local[
+            past_idx]
 
         # --- 패딩 row(관측 없는 프레임) 마스크 계산 -------------------
         # frame_non_id: (current_agents_num, 8)
@@ -806,7 +808,8 @@ def _pack_ego_local_agents(
         # heading: (current_agents_num,)
         # ※ squeeze() 쓰지 말고, 항상 1차원 배열로 유지
         heading = frame_cur_exists_agents_local[:, AgentInternalIndex.heading()]
-        heading = heading.astype(np.float64, copy=False).reshape(-1)  # (current_agents_num,)
+        heading = heading.astype(np.float64, copy=False).reshape(
+            -1)  # (current_agents_num,)
 
         # cos_heading, sin_heading: (current_agents_num,)
         cos_heading = np.cos(heading)
@@ -819,45 +822,50 @@ def _pack_ego_local_agents(
 
         # x
         all_frame_np_agents_local[
-            past_idx, :, 0
-        ] = frame_cur_exists_agents_local[:, AgentInternalIndex.x()].squeeze()
+            past_idx, :, 0] = frame_cur_exists_agents_local[:,
+                                                            AgentInternalIndex.
+                                                            x()].squeeze()
         # y
         all_frame_np_agents_local[
-            past_idx, :, 1
-        ] = frame_cur_exists_agents_local[:, AgentInternalIndex.y()].squeeze()
+            past_idx, :, 1] = frame_cur_exists_agents_local[:,
+                                                            AgentInternalIndex.
+                                                            y()].squeeze()
         # cos(heading)
         all_frame_np_agents_local[past_idx, :, 2] = cos_heading
         # sin(heading)
         all_frame_np_agents_local[past_idx, :, 3] = sin_heading
         # vx
         all_frame_np_agents_local[
-            past_idx, :, 4
-        ] = frame_cur_exists_agents_local[:, AgentInternalIndex.vx()].squeeze()
+            past_idx, :, 4] = frame_cur_exists_agents_local[:,
+                                                            AgentInternalIndex.
+                                                            vx()].squeeze()
         # vy
         all_frame_np_agents_local[
-            past_idx, :, 5
-        ] = frame_cur_exists_agents_local[:, AgentInternalIndex.vy()].squeeze()
+            past_idx, :, 5] = frame_cur_exists_agents_local[:,
+                                                            AgentInternalIndex.
+                                                            vy()].squeeze()
         # width
         all_frame_np_agents_local[
-            past_idx, :, 6
-        ] = frame_cur_exists_agents_local[:, AgentInternalIndex.width()].squeeze()
+            past_idx, :, 6] = frame_cur_exists_agents_local[:,
+                                                            AgentInternalIndex.
+                                                            width()].squeeze()
         # length
         all_frame_np_agents_local[
-            past_idx, :, 7
-        ] = frame_cur_exists_agents_local[:, AgentInternalIndex.length()].squeeze()
+            past_idx, :, 7] = frame_cur_exists_agents_local[:,
+                                                            AgentInternalIndex.
+                                                            length()].squeeze()
         # id (track_token)
         all_frame_np_agents_local[
-            past_idx, :, 8
-        ] = frame_cur_exists_agents_local[
-            :, AgentInternalIndex.track_token()
-        ].squeeze()
+            past_idx, :,
+            8] = frame_cur_exists_agents_local[:,
+                                               AgentInternalIndex.track_token(
+                                               )].squeeze()
 
         # (선택 사항) 완전히 all-zero 패딩을 원하면, 아래 한 줄을 켜서
         # 빈 row 의 track_id 도 0으로 만들 수 있다.
         # all_frame_np_agents_local[past_idx, empty_mask, 8] = 0.0
 
     return all_frame_np_agents_local
-
 
 
 def build_agents_past_ego_frame_array(

@@ -157,12 +157,12 @@ class DataProcessor(object):
         speed_mps: np.ndarray = vector_map_output[
             'lanes_speed_limit']  # (lane_num, 1) float
 
-
         # 유효 차선 판정:
         #   - 앞 8채널(x, y, vec, left/right 등)이 전부 0이면 패딩으로 간주
         #   - 즉, lanes[..., :8]의 모든 값이 0인 lane 은 무시
         lanes_front8: np.ndarray = lanes[..., :8]  # (lane_num, lane_len, 8)
-        lanes_valid_mask = (np.abs(lanes_front8).sum(axis=(1, 2)) > 0)  # (lane_num,)
+        lanes_valid_mask = (np.abs(lanes_front8).sum(axis=(1, 2))
+                            > 0)  # (lane_num,)
         if lanes_valid_mask.sum() == 0:
             return 0.0, None
 

@@ -1435,8 +1435,8 @@ class DiT(nn.Module):
         # 5) DiT 블록 반복
         for block_index, block in enumerate(self.blocks):
             pram_mods = compute_pram_v2_modulations_for_block(
-                composer_out=composer_out, #
-                time_out=time_out, # (B, 1, H)
+                composer_out=composer_out,  #
+                time_out=time_out,  # (B, 1, H)
                 path_scalars=self.pram_v2_block_path_scalars,
                 block_index=block_index,
                 batch_size=B,
@@ -1624,7 +1624,6 @@ class DiT(nn.Module):
         # 학습 중이거나 direct loss 를 쓰는 경우: x 그대로 사용
         return x
 
-
     def _compute_near_current_valid_and_mask(
         self,
         near_past_cur_future_valid: torch.Tensor,
@@ -1653,7 +1652,6 @@ class DiT(nn.Module):
         # near_current_mask: (B, Pnn)  True=무효(패딩)
         near_current_mask: torch.Tensor = ~near_current_valid
         return near_cur_future_valid, near_current_mask
-
 
     def forward(
             self,

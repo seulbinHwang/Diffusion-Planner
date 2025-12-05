@@ -278,12 +278,9 @@ def _apply_augmentation(
     # augmentation 과정에서 값이 바뀌었더라도,
     # 원래 패딩이었던 위치는 다시 전부 0으로 되돌린다.
     # augmentation 전에 패딩 위치 기억 (B, A, Tf, 1)
-    pad_mask_near: torch.Tensor = (near_future_gt_3_dim == 0).all(
-        dim=-1, keepdim=True
-    )
-    near_future_gt_3_dim = near_future_gt_3_dim.masked_fill(
-        pad_mask_near, 0.0
-    )
+    pad_mask_near: torch.Tensor = (near_future_gt_3_dim == 0).all(dim=-1,
+                                                                  keepdim=True)
+    near_future_gt_3_dim = near_future_gt_3_dim.masked_fill(pad_mask_near, 0.0)
 
     return inputs, ego_future_gt_3_dim, near_future_gt_3_dim
 
@@ -431,35 +428,55 @@ def _backward_and_step(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler,
+    args: argparse.Namespace,
 ) -> float:
     """역전파/그래디언트 클리핑/스케줄러/옵티마이저 업데이트를 한 번 수행한다.
 
     Args:
         loss_dict:
-            - "loss_dict" 키에 최종 scalar 손실 텐서가 들어 있는 dict.
+            - "loss" 키에 최종 scalar 손실 텐서가 들어 있는 dict.
+              · loss_dict["loss"]의 shape: ()  스칼라 텐서.
         model:
-            학습 중인 모델(nn.Module 또는 DDP 래퍼).
+            학습 중인 모델.  # shape: (모델 파라미터 개수에 따라 자유)
+            - 일반 모드: nn.Module 또는 DDP 래퍼.
+            - ZeRO-2 모드: deepspeed.DeepSpeedEngine.
         optimizer:
-            torch.optim.Optimizer 인스턴스.
+            torch.optim.Optimizer 또는 DeepSpeed가 감싼 Optimizer.
         scheduler:
-            학습률 스케줄러. step() 을 1 스텝 호출한다.
+            학습률 스케줄러. 일반 모드에서만 직접 step()을 호출한다.
+        args:
+            학습 설정/상태 Namespace.
+            - args.use_deepspeed: True이면 DeepSpeed 엔진을 사용한다.
 
     Returns:
         float:
-            loss_dict["loss_dict"].item() 값 (logging 용).
+            loss_dict["loss"].item() 값 (logging 용).
     """
     # total_loss는 scalar float 값
     total_loss: float = float(loss_dict["loss"].item())
+    loss_tensor: torch.Tensor = loss_dict["loss"]
 
-    # 역전파
-    loss_dict["loss"].backward()
+    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False)) \
+        and hasattr(model, "backward") and hasattr(model, "step")
 
-    # 그래디언트 클리핑
-    nn.utils.clip_grad_norm_(model.parameters(), 10.0)
-
-    # 스케줄러 / 옵티마이저 스텝
-    scheduler.step()
-    optimizer.step()
+    if use_deepspeed:
+        # DeepSpeed 엔진을 사용하는 경우:
+        # 1) model.backward(loss)로 분산/혼합정밀 포함해 역전파 수행
+        # 2) 필요하면 엔진 쪽 gradient norm 클리핑
+        # 3) model.step()이 optimizer.step() + lr_scheduler.step()까지 처리
+        model.backward(loss_tensor)
+        if hasattr(model, "clip_grad_norm"):
+            # DeepSpeedEngine.clip_grad_norm는 내부 파라미터 shard 기준으로 norm을 계산한다.
+            model.clip_grad_norm(max_norm=10.0)
+        model.step()
+    else:
+        # 일반 PyTorch / DDP 모드
+        loss_tensor.backward()
+        # 모든 파라미터의 gradient L2 norm을 10.0으로 클리핑
+        nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+        # 스케줄러 / 옵티마이저 스텝
+        scheduler.step()
+        optimizer.step()
 
     return total_loss
 
@@ -490,7 +507,9 @@ def _update_ema_if_needed(ema: Optional[object], model: nn.Module) -> None:
             현재 학습 중인 모델. ema.update(model) 의 인자로 사용된다.
     """
     if ema is not None:
-        ema.update(model)
+        # DDP / DeepSpeed 래퍼가 씌워져 있으면 .module을 사용해 실제 모듈 기준으로 EMA를 업데이트한다.
+        src_model: nn.Module = getattr(model, "module", model)
+        ema.update(src_model)
 
 
 # =====================================================================
@@ -591,25 +610,15 @@ def train_epoch(
                 args.observation_normalizer(inputs)
 
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
-            optimizer.zero_grad(set_to_none=True)
+            if getattr(args, "use_deepspeed", False) and hasattr(
+                    model, "zero_grad"):
+                # DeepSpeedEngine.zero_grad()를 사용해서 분산 그라디언트 버퍼를 비운다.
+                model.zero_grad()
+            else:
+                optimizer.zero_grad(set_to_none=True)
 
             # marginal_prob 함수 핸들 얻기
             sde_marginal_prob = ddp.get_model(model, args.ddp).sde.marginal_prob
-
-            # diffusion 손실 계산
-            loss_dict: Dict[str, torch.Tensor] = {}
-            loss_dict, _ = diffusion_loss_func(
-                args,
-                model,
-                norm_inputs,
-                sde_marginal_prob,
-                near_future_gt_4_dim,
-                near_future_mask,
-                args.state_normalizer,
-                loss_dict,
-                args.diffusion_model_type,
-                args.observation_normalizer,
-            )
             loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
                 loss_dict=loss_dict,
                 args=args,
@@ -623,8 +632,8 @@ def train_epoch(
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                args=args,
             )
-
             # 6) WD warmdown, EMA 업데이트
             _apply_weight_decay_warmdown(optimizer)
             _update_ema_if_needed(ema, model)
