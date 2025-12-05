@@ -246,6 +246,7 @@ from typing import List, Set
 import torch
 import torch.nn as nn
 from timm.optim.optim_factory import param_groups_weight_decay
+import bitsandbytes as bnb
 
 # 토큰/포지션 계열에서 자주 쓰는 속성 이름들(모듈의 attribute로 존재하는 nn.Parameter)
 _TOKEN_POS_ATTRS = (
@@ -319,6 +320,7 @@ def build_adamw_with_param_groups(
     lr: float,
     weight_decay: float,
     include_seed_params: bool = True,
+use_8bit_optimizer: bool = False,
 ):
     """
     - timm의 param_groups_weight_decay를 사용해 bias/Norm/1D 자동 no-decay
@@ -340,12 +342,18 @@ def build_adamw_with_param_groups(
         g["lr"] = lr  # η_max(B)
         g["lr_max"] = float(lr)  # 기준 LR(스케줄 시작 시점)
         g["wd_max"] = float(g.get("weight_decay", 0.0))  # 그룹별 기준 WD
-
-    # 최종 옵티마이저 (전역 WD는 0.0로 중복 방지)
-    try:
-        optim = torch.optim.AdamW(param_groups, fused=True, weight_decay=0.0)
-    except (TypeError, RuntimeError):
-        optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
+    if use_8bit_optimizer:
+        optim = bnb.optim.AdamW8bit(  # type: ignore[attr-defined]
+            param_groups,
+            lr=lr,
+            weight_decay=0.0,
+        )
+    else:
+        # 최종 옵티마이저 (전역 WD는 0.0로 중복 방지)
+        try:
+            optim = torch.optim.AdamW(param_groups, fused=True, weight_decay=0.0)
+        except (TypeError, RuntimeError):
+            optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
 
     return optim, extra_nwd
 
@@ -890,6 +898,7 @@ def model_training(args):
         weight_decay=args.weight_decay,  # 1e-2
         include_seed_params=True,
         # ← seeds/ego_fut_seeds도 no-decay에 포함(원치 않으면 False)
+        use_8bit_optimizer=getattr(args, "use_8bit_optimizer", False),
     )
     # ↓↓↓ 여기 추가 (스케줄러 생성/step 이전) ↓↓↓
     for pg in optimizer.param_groups:
