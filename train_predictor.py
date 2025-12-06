@@ -1254,6 +1254,7 @@ def _build_model_optimizer_scheduler(
         lr=args.learning_rate,
         weight_decay=args.weight_decay,  # 예: 1e-2
         include_seed_params=True,
+        use_8bit_optimizer=getattr(args, "use_8bit_optimizer", False),
     )
 
     # param_groups[i]["params"] 리스트 안에는 다양한 shape의 파라미터 텐서들이 들어 있다.

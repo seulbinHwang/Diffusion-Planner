@@ -40,36 +40,36 @@ fi
 #echo "[Preflight] Done."
 # ----------------------------------------------------
 
-echo "Start downloading diffusion_planner_training.json"
-nubescli download \
-    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
-    "$TRAIN_SET_LIST_PATH" \
-    --no-progress
-echo "Finish downloading diffusion_planner_training.json"
-echo "Start downloading processed dataset"
-
-# 병렬 작업 수 설정 (최대 32개)
-
-NUM_CPUS="$(nproc)"
-MAX_JOBS=$(( NUM_CPUS / 2 ))
-
-# 혹시 코어가 1개일 때 0 되지 않도록 방지
-if [ "$MAX_JOBS" -lt 1 ]; then
-  MAX_JOBS=1
-fi
-
-echo "NUM_CPUS = $NUM_CPUS, MAX_JOBS = $MAX_JOBS"
-
-echo "Using $NUM_JOBS parallel jobs for download"
-
-nubescli dir-download \
-    "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
-    "$TRAIN_SET_PATH" \
-    -j "$MAX_JOBS" \
-    -s \
-    --no-progress
-
-echo "Finish downloading processed dataset"
+#echo "Start downloading diffusion_planner_training.json"
+#nubescli download \
+#    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
+#    "$TRAIN_SET_LIST_PATH" \
+#    --no-progress
+#echo "Finish downloading diffusion_planner_training.json"
+#echo "Start downloading processed dataset"
+#
+## 병렬 작업 수 설정 (최대 32개)
+#
+#NUM_CPUS="$(nproc)"
+#MAX_JOBS=$(( NUM_CPUS / 2 ))
+#
+## 혹시 코어가 1개일 때 0 되지 않도록 방지
+#if [ "$MAX_JOBS" -lt 1 ]; then
+#  MAX_JOBS=1
+#fi
+#
+#echo "NUM_CPUS = $NUM_CPUS, MAX_JOBS = $MAX_JOBS"
+#
+#echo "Using $NUM_JOBS parallel jobs for download"
+#
+#nubescli dir-download \
+#    "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
+#    "$TRAIN_SET_PATH" \
+#    -j "$MAX_JOBS" \
+#    -s \
+#    --no-progress
+#
+#echo "Finish downloading processed dataset"
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 
 RUN_ID=$(date +%Y%m%d-%H%M%S)
