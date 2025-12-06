@@ -92,7 +92,7 @@ def save_model(model, optimizer, scheduler, save_path, epoch, train_loss,
     save_model = {
         'epoch': epoch + 1,
         'model': model.state_dict(),
-        'ema_state_dict': ema.state_dict(),
+        'ema_state_dict': ema.state_dict() if ema is not None else None,
         'optimizer': optimizer.state_dict(),
         'schedule': scheduler.state_dict(),
         'loss': train_loss,

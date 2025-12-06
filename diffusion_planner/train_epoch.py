@@ -698,17 +698,34 @@ def train_epoch(
                 args.observation_normalizer(inputs)
 
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
-            if getattr(args, "use_deepspeed", False) and hasattr(
-                    model, "zero_grad"):
-                # DeepSpeedEngine.zero_grad()를 사용해서 분산 그라디언트 버퍼를 비운다.
+            if getattr(args, "use_deepspeed", False) and hasattr(model,
+                                                                 "zero_grad"):
                 model.zero_grad()
             else:
                 optimizer.zero_grad(set_to_none=True)
 
-            # marginal_prob 함수 핸들 얻기
-            sde_marginal_prob = ddp.get_model(model, args.ddp).sde.marginal_prob
+            # base_model: DDP/DeepSpeed 래퍼 벗긴 실제 모델
+            base_model = ddp.get_model(model, args.ddp)
+            sde_marginal_prob = base_model.sde.marginal_prob
+
+            # 5-1) diffusion 기본 loss 계산 (neighbor / integration / constraint 등)
+            raw_loss_dict: Dict[str, torch.Tensor] = {}
+            raw_loss_dict, _ = diffusion_loss_func(
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs,
+                marginal_prob=sde_marginal_prob,
+                near_future_gt_4_dim=near_future_gt_4_dim,
+                near_future_mask=near_future_mask,
+                state_normalizer=args.state_normalizer,
+                loss_dict=raw_loss_dict,
+                model_type=base_model.sde.model_type,  # 보통 "x_start" 또는 "score"
+                observation_normalizer=args.observation_normalizer,
+            )
+
+            # 5-2) feasible weight 로 최종 loss 합성
             loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
-                loss_dict=loss_dict,
+                loss_dict=raw_loss_dict,
                 args=args,
                 model=model,
                 norm_inputs=norm_inputs,

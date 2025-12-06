@@ -45,7 +45,9 @@ class DiffusionPlannerData(Dataset):
             - chosen_static_num <= max_static_num
         """
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
-
+        if data is None:
+            # 이 샘플은 건너뛰고, DataLoader가 다시 뽑도록 예외를 던지거나
+            raise IndexError(f"Corrupted sample at index {idx}")
         # 최종으로 내보낼 key 목록
         output_keys: List[str] = [
             "ego_agent_past",
