@@ -14,15 +14,15 @@ TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 ###################################
 #
 # ---------------- Preflight clean-up ----------------
-echo "[Preflight] Cleaning previous artifacts..."
-#
-# 1) 학습 리스트 JSON 삭제
-if [ -f "$TRAIN_SET_LIST_PATH" ]; then
-  echo " - Removing $TRAIN_SET_LIST_PATH"
-  rm -f "$TRAIN_SET_LIST_PATH"
-else
-  echo " - No existing training list to remove."
-fi
+#echo "[Preflight] Cleaning previous artifacts..."
+##
+## 1) 학습 리스트 JSON 삭제
+#if [ -f "$TRAIN_SET_LIST_PATH" ]; then
+#  echo " - Removing $TRAIN_SET_LIST_PATH"
+#  rm -f "$TRAIN_SET_LIST_PATH"
+#else
+#  echo " - No existing training list to remove."
+#fi
 
 # 2) processed 디렉터리 내용물 전부 삭제(숨김 포함), 디렉터리는 유지
 #if [ -d "$TRAIN_SET_PATH" ]; then
