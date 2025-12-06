@@ -10,33 +10,45 @@ except Exception:
     def to_absolute_path(path: str) -> str:
         return str(Path(path).expanduser().resolve())
 
-
 class StateNormalizer:
 
     def __init__(self, mean, std):
-        self.mean = torch.as_tensor(mean)  # (10, 1, 4)
-        # to float32
-        self.mean = self.mean.float()
-        self.std = torch.as_tensor(std)  # (10, 1, 4)
-        self.std = self.std.float()
+        # mean, std 는 결국 (1, 1, 4) 로 맞춰서 저장
+        mean_t = torch.as_tensor(mean).float()
+        std_t = torch.as_tensor(std).float()
+
+        # 1D [4] 나 2D [1,4] 등이 들어와도 무조건 (1,1,4)로 reshape
+        if mean_t.ndim == 1:          # (4,)
+            mean_t = mean_t.view(1, 1, -1)
+            std_t = std_t.view(1, 1, -1)
+        elif mean_t.ndim == 2:        # (1,4) 같은 경우
+            mean_t = mean_t.view(1, mean_t.size(0), mean_t.size(1))
+            std_t = std_t.view(1, std_t.size(0), std_t.size(1))
+        # (1,1,4) 로 이미 들어온 경우는 그대로 사용
+
+        self.mean = mean_t   # (1,1,4)
+        self.std = std_t     # (1,1,4)
 
     @classmethod
     def from_json(cls, args):
         data = openjson(args.normalization_file_path)
+        # ❌ 옛 코드: [[...]] * args.predicted_neighbor_num
+        # mean = [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
+        # std  = [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
 
-        mean = [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
-        std = [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
+        # ✅ neighbor 한 개에 대한 통계만 사용 (shape: (4,))
+        mean = data["neighbor"]["mean"]
+        std = data["neighbor"]["std"]
         return cls(mean, std)
 
     @classmethod
     def from_json2(cls, args_dict):
-        # args_dict["normalization_file_path"]: "normalization.json"
-        path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")
+        path_str = args_dict.get("normalization_file_path", "normalization.json")
         data = openjson(to_absolute_path(path_str))
-        mean = [[data["neighbor"]["mean"]]
-               ] * args_dict["predicted_neighbor_num"]
-        std = [[data["neighbor"]["std"]]] * args_dict["predicted_neighbor_num"]
+
+        # 마찬가지로 predicted_neighbor_num 은 무시
+        mean = data["neighbor"]["mean"]
+        std = data["neighbor"]["std"]
         return cls(mean, std)
 
     def __call__(self, data):
