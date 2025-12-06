@@ -170,6 +170,7 @@ def build_deepspeed_config(args: argparse.Namespace,
             "reduce_bucket_size": reduce_bucket_size,
             "overlap_comm": True,
             "contiguous_gradients": True,
+            "zero_allow_untested_optimizer": True,  # 🔴 이 줄 추가
         },
         "steps_per_print": steps_per_print,
     }
