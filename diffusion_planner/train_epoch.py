@@ -719,7 +719,7 @@ def train_epoch(
                 near_future_mask=near_future_mask,
                 state_normalizer=args.state_normalizer,
                 loss_dict=raw_loss_dict,
-                model_type=base_model.sde.model_type,  # 보통 "x_start" 또는 "score"
+                model_type=args.diffusion_model_type,  # 보통 "x_start" 또는 "score"
                 observation_normalizer=args.observation_normalizer,
             )
 
