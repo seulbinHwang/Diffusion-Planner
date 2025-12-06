@@ -232,7 +232,11 @@ class Decoder(nn.Module):
         # 마지막 타임스텝만 추출: [B, max_agent_num, 4]
 
         if target_agents_mask is None:
-            assert predicted_agents_num is not None, "predicted_agents_num must be provided if target_agents_mask is None"
+            if predicted_agents_num is None:
+                raise ValueError(
+                    "predicted_agents_num is None. "
+                    "near_future_gt_3_dim이 없으면 config.predicted_neighbor_num을 설정해야 합니다."
+                )
             # near_past_current, near_past_current_mask,
             near_past_current = neighbor_agents_past[:, :
                                                      predicted_agents_num]  # [B, pnn, time_len, 11]
@@ -600,9 +604,11 @@ class Decoder(nn.Module):
         near_future_gt_3_dim: Optional[torch.Tensor] = inputs.get(
             "near_future_gt_3_dim", None)  # (B, Pnn, future_len, 3) 또는 None
 
-        predicted_agents_num: Optional[int] = (int(
-            near_future_gt_3_dim.shape[1]) if near_future_gt_3_dim is not None
-                                               else None)
+        predicted_agents_num: Optional[int] = (
+            int(near_future_gt_3_dim.shape[
+                    1]) if near_future_gt_3_dim is not None
+            else getattr(self, "_predicted_neighbor_num", None)
+        )
 
         target_agents_mask: Optional[torch.Tensor] = inputs.get(
             "target_agents_mask", None)  # (B, max_agent_num) bool 또는 None
