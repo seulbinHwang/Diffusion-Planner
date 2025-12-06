@@ -63,7 +63,7 @@ def _build_half_life_weights(
                               dtype=dtype) * float(dt_s)  # [future_len]
     # w: (future_len,) = 0.5 ** (future_len / half_life_s)
     w = torch.pow(0.5, future_len / float(half_life_s))  # [future_len]
-    return w.view(1, 1, future_len)  # [1, 1, future_len]
+    return w.view(1, 1, -1)  # [1, 1, future_len]
 
 
 # ----------------------------------------------------------------------------
