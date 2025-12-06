@@ -641,18 +641,22 @@ class DataProcessor(object):
         past_len: int = neighbor_agents_past.shape[1]
         future_len: int = neighbor_cur_fut_gt_11_dim.shape[1]
 
-        # agent 가 하나도 없거나, future 길이가 0이면 그냥 반환
-        if max_agent_num == 0 or future_len == 0:
+        # future 프레임이 아예 없으면 그대로 반환
+        if future_len == 0:
             return neighbor_agents_past, neighbor_cur_fut_gt_11_dim
 
-        # (max_agent_num, Tf-1, 11)  — future 쪽의 "현재 프레임"(인덱스 0) 제거
-        neighbor_future_wo_current: np.ndarray = neighbor_cur_fut_gt_11_dim[:,
-                                                                            1:, :]
+        # current(0번) 프레임은 항상 한 번 제거
+        neighbor_future_wo_current = neighbor_cur_fut_gt_11_dim[
+            :, 1:, :]  # (..., 80, 11)
 
-        # full_traj_11: (max_agent_num, T_full, 11)
-        #   T_full = past_len + (future_len - 1)
-        full_traj_11: np.ndarray = np.concatenate(
-            [neighbor_agents_past, neighbor_future_wo_current], axis=1)
+        # 에이전트가 0명이면 보간 없이 바로 반환 (time_len = 80 유지)
+        if max_agent_num == 0:
+            return neighbor_agents_past, neighbor_future_wo_current
+
+        # ↓ 아래는 기존 로직에서 neighbor_future_wo_current만 사용
+        full_traj_11 = np.concatenate(
+            [neighbor_agents_past, neighbor_future_wo_current], axis=1
+        )
 
         # full_off_p_mask: (max_agent_num, T_full)  — True: 해당 프레임이 "빈 프레임"
         # full_off_mask:   (max_agent_num,)        — True: 해당 agent 전체가 모두 빈 값
@@ -752,8 +756,7 @@ class DataProcessor(object):
 
         # new_neighbor_future_with_current_11: (max_agent_num, future_len, 11)
         #   · full_traj 기준 인덱스 past_len-1 이 "현재 프레임"에 해당
-        new_neighbor_future_with_current_11: np.ndarray = full_traj_interp[:,
-                                                                           past_len:, :]
+        new_neighbor_future_with_current_11 = full_traj_interp[:, past_len:, :]
 
         return new_neighbor_agents_past, new_neighbor_future_with_current_11
 
