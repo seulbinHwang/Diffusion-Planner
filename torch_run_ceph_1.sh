@@ -112,7 +112,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "feasible_full_time_use_vel_gpu_2_exp_A" \
-  --batch_size 128 \
+  --batch_size 256 \
   --profile_feasible false \
   --use_vel_input false \
   --use_deepspeed true \
