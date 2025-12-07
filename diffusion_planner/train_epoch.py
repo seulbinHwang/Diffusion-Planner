@@ -267,6 +267,11 @@ def _apply_augmentation(
         Tuple[inputs, ego_future_gt_3_dim, near_future_gt_3_dim]:
             augmentation 이 반영된 새 텐서들.
     """
+    # ✅ augmentation 전에 패딩 위치를 미리 기억해 둔다.  # shape: (B, A, Tf, 1)
+    pad_mask_near: torch.Tensor = (near_future_gt_3_dim == 0).all(
+        dim=-1,
+        keepdim=True,
+    )
 
     if isinstance(aug, StatePerturbation):
         inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(
@@ -274,11 +279,9 @@ def _apply_augmentation(
 
     if isinstance(aug, NPCStatePerturbation):
         inputs, near_future_gt_3_dim = aug(inputs, near_future_gt_3_dim, args)
+
     # augmentation 과정에서 값이 바뀌었더라도,
     # 원래 패딩이었던 위치는 다시 전부 0으로 되돌린다.
-    # augmentation 전에 패딩 위치 기억 (B, A, Tf, 1)
-    pad_mask_near: torch.Tensor = (near_future_gt_3_dim == 0).all(dim=-1,
-                                                                  keepdim=True)
     near_future_gt_3_dim = near_future_gt_3_dim.masked_fill(pad_mask_near, 0.0)
 
     return inputs, ego_future_gt_3_dim, near_future_gt_3_dim
@@ -379,7 +382,7 @@ def _compute_loss_dict(
                 - constraint_diff_vx_b / constraint_diff_vy_b / constraint_diff_yaw_rate
 
             <diffusion_loss_func 출력 후 _compute_loss_dict 가 추가하는 항목>
-            - feasible_progress / feasible_w_dir / feasible_w_int / feasible_w_const :
+            - learn_progress / direct_loss_weight / int_loss_weight / const_loss_weight :
                 진행도 및 가중치 기록용 텐서
             - loss_dict : 최종 합 손실 텐서.
 
@@ -397,15 +400,15 @@ def _compute_loss_dict(
         w_int = 1.0
 
     # 진행도/가중치 기록(평균 로그용)
-    loss_dict["feasible_progress"] = torch.tensor(
+    loss_dict["learn_progress"] = torch.tensor(
         float(progress), device=next(model.parameters()).device)
-    loss_dict["feasible_w_dir"] = torch.tensor(float(w_dir),
+    loss_dict["direct_loss_weight"] = torch.tensor(float(w_dir),
                                                device=next(
                                                    model.parameters()).device)
-    loss_dict["feasible_w_int"] = torch.tensor(float(w_int),
+    loss_dict["int_loss_weight"] = torch.tensor(float(w_int),
                                                device=next(
                                                    model.parameters()).device)
-    loss_dict["feasible_w_const"] = torch.tensor(float(w_const),
+    loss_dict["const_loss_weight"] = torch.tensor(float(w_const),
                                                  device=next(
                                                      model.parameters()).device)
 
@@ -420,6 +423,7 @@ def _compute_loss_dict(
     loss_dict["loss"] = w_dir * l_dir + w_int * l_int + w_const * l_con
 
     return loss_dict
+
 
 def _backward_and_step(
     loss_dict: Dict[str, torch.Tensor],
@@ -698,8 +702,8 @@ def train_epoch(
                 args.observation_normalizer(inputs)
 
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
-            if getattr(args, "use_deepspeed", False) and hasattr(model,
-                                                                 "zero_grad"):
+            if getattr(args, "use_deepspeed", False) and hasattr(
+                    model, "zero_grad"):
                 model.zero_grad()
             else:
                 optimizer.zero_grad(set_to_none=True)

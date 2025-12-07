@@ -605,10 +605,8 @@ class Decoder(nn.Module):
             "near_future_gt_3_dim", None)  # (B, Pnn, future_len, 3) 또는 None
 
         predicted_agents_num: Optional[int] = (
-            int(near_future_gt_3_dim.shape[
-                    1]) if near_future_gt_3_dim is not None
-            else getattr(self, "_predicted_neighbor_num", None)
-        )
+            int(near_future_gt_3_dim.shape[1]) if near_future_gt_3_dim
+            is not None else getattr(self, "_predicted_neighbor_num", None))
 
         target_agents_mask: Optional[torch.Tensor] = inputs.get(
             "target_agents_mask", None)  # (B, max_agent_num) bool 또는 None

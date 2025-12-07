@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 from diffusion_planner.utils.train_utils import openjson, opendata
 from typing import Dict, Any, List  # ← 추가
 
+
 def _fix_legacy_neighbor_future_len_bug(
     arr,
     expected_future_len: int,
@@ -102,8 +103,7 @@ class DiffusionPlannerData(Dataset):
             # 🔧 [임시 버그 패치] neighbor_future_gt_3_dim 길이 보정
             if out_key == "near_future_gt_3_dim":
                 value = _fix_legacy_neighbor_future_len_bug(
-                    value, self._future_len
-                )
+                    value, self._future_len)
 
             if out_key == "agent_route_lane_order":
                 value = value.astype("int64")

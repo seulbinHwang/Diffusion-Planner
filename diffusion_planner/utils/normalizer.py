@@ -10,6 +10,7 @@ except Exception:
     def to_absolute_path(path: str) -> str:
         return str(Path(path).expanduser().resolve())
 
+
 class StateNormalizer:
 
     def __init__(self, mean, std):
@@ -18,16 +19,16 @@ class StateNormalizer:
         std_t = torch.as_tensor(std).float()
 
         # 1D [4] 나 2D [1,4] 등이 들어와도 무조건 (1,1,4)로 reshape
-        if mean_t.ndim == 1:          # (4,)
+        if mean_t.ndim == 1:  # (4,)
             mean_t = mean_t.view(1, 1, -1)
             std_t = std_t.view(1, 1, -1)
-        elif mean_t.ndim == 2:        # (1,4) 같은 경우
+        elif mean_t.ndim == 2:  # (1,4) 같은 경우
             mean_t = mean_t.view(1, mean_t.size(0), mean_t.size(1))
             std_t = std_t.view(1, std_t.size(0), std_t.size(1))
         # (1,1,4) 로 이미 들어온 경우는 그대로 사용
 
-        self.mean = mean_t   # (1,1,4)
-        self.std = std_t     # (1,1,4)
+        self.mean = mean_t  # (1,1,4)
+        self.std = std_t  # (1,1,4)
 
     @classmethod
     def from_json(cls, args):
@@ -43,7 +44,8 @@ class StateNormalizer:
 
     @classmethod
     def from_json2(cls, args_dict):
-        path_str = args_dict.get("normalization_file_path", "normalization.json")
+        path_str = args_dict.get("normalization_file_path",
+                                 "normalization.json")
         data = openjson(to_absolute_path(path_str))
 
         # 마찬가지로 predicted_neighbor_num 은 무시
