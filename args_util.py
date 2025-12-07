@@ -73,6 +73,16 @@ def get_args():
                         type=int,
                         help='number of agents',
                         default=448)
+    parser.add_argument('--center_crop_radius_m',
+                        type=float,
+                        help='center_crop_radius_m',
+                        default=-1.0)
+    parser.add_argument('--center_crop_mode',
+                        type=str,
+                        choices=['none', 'npc', 'ego'],
+                        default='none',
+                        help='center crop 기준: none / npc / ego 중 하나만 선택')
+
     parser.add_argument('--do_not_clip',
                         default=True,
                         type=boolean,

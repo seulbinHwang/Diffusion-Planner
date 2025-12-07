@@ -6,8 +6,8 @@ import args_util
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
-from typing import Any, Callable, Dict,  List
-
+from typing import Any, Callable, Dict, List
+import numpy as np
 # deprecated 키는 사용 금지
 os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
 
@@ -513,6 +513,9 @@ def build_adamw_with_param_groups(
                 · "wd_max": float
               와 같은 키를 가진다.
             - extra_nwd: 감쇠를 적용하지 않을 파라미터 이름 목록.
+
+    TODO
+        - 특정 모듈의 lr을 조절할 수 있는 기능 추가 고려
     """
     # extra_nwd: List[str], 감쇠 제외로 추가할 파라미터 이름들
     extra_nwd = discover_extra_no_weight_decay_names(
@@ -555,47 +558,620 @@ def build_adamw_with_param_groups(
     return optim, extra_nwd
 
 
-
-
 class DiffusionPlannerCollate:
     """DiffusionPlannerData 샘플들을 배치 텐서로 묶는 collate_fn.
 
-    각 샘플마다 아래 상한이 적용된 상태로 .npz에 저장되어 있다.
-      - agent 수   ≤ caching_max_agent_num
-      - lane 수    ≤ lane_num
-      - route 수   ≤ route_num
-      - static 수  ≤ max_static_num
-
-    하지만 샘플마다 실제 개수는 다를 수 있으므로, 한 배치 안에서는
-
-        - data_max_agent_num  = max_i neighbor_agents_past_i.shape[0]
-        - data_max_lane_num   = max_i lanes_i.shape[0]
-        - data_max_route_num  = max_i route_lanes_i.shape[0]
-        - data_max_static_num = max_i static_objects_i.shape[0]
-
-    으로 실제 최대 길이를 구한 뒤, 그 길이에 맞춰 0으로 패딩해서 고정 shape 배치를 만든다.
-
-    최종 shape 예:
-      - neighbor_agents_past         : (B, data_max_agent_num, time_len, 11)
-      - near_future_gt_3_dim         : (B, data_max_agent_num, future_len, 3)
-      - static_objects               : (B, data_max_static_num, 10)
-      - lanes / lanes_*              : (B, data_max_lane_num, lane_len, ·)
-      - route_lanes / route_lanes_*  : (B, data_max_route_num, route_len, ·)
-      - agent_route_lane_order       : (B, data_max_agent_num, data_max_lane_num)
-
-    이때, real_* 값이 config 상한
-      - caching_max_agent_num / lane_num / route_num / max_static_num
-    을 초과하면 바로 예외를 발생시켜, 캐싱/학습 설정 불일치를 빨리 발견할 수 있게 한다.
+    각 샘플은 agent / lane / route / static 개수에 상한이 걸려 있고,
+    이 collate_fn 은
+      1) (선택) 중심 기준 거리 크로핑
+      2) 배치 내 최대 길이 계산
+      3) 그 길이에 맞춰 0 패딩
+    순서로 고정 shape 배치를 만든다.
     """
 
     def __init__(self, args: argparse.Namespace) -> None:
+        """collate 설정을 초기화한다.
+
+        Args:
+            args (argparse.Namespace):
+                - caching_max_agent_num (int)
+                - lane_num (int)
+                - route_num (int)
+                - max_static_num (int)
+                - center_crop_radius_m (float, 선택)
+                - center_crop_mode (str, 'npc' / 'ego' / 'none')
+        """
         self.caching_max_agent_num: int = int(args.caching_max_agent_num)
         self.lane_num: int = int(args.lane_num)
         self.route_num: int = int(args.route_num)
         self.max_static_num: int = int(args.max_static_num)
 
+        # 중심 기준 크로핑 옵션
+        # - center_crop_radius_m <= 0: 크로핑 사용 안 함
+        # - center_crop_mode: "npc" → 임의 NPC 1대를 기준, "ego" → ego 기준
+        self.center_crop_radius_m: float = float(
+            getattr(args, "center_crop_radius_m", 0.0))
+        self.center_crop_mode: str = str(
+            getattr(args, "center_crop_mode", "none")).lower()
+
     # ------------------------------------------------------------------
-    # 1) 고정 shape 텐서들(이미 모든 샘플에서 shape 동일) 스택하는 도우미
+    # 0) 크로핑 여부 판단
+    # ------------------------------------------------------------------
+    def _should_center_crop(self) -> bool:
+        """중심 기준 크로핑을 쓸지 여부를 반환한다.
+
+        Returns:
+            bool: True면 크로핑을 적용한다.
+        """
+        return (self.center_crop_radius_m > 0.0 and
+                self.center_crop_mode in ("npc", "ego"))
+
+    # ------------------------------------------------------------------
+    # 0-1) 샘플별 개수 통계 계산
+    # ------------------------------------------------------------------
+    def _compute_object_lengths(
+        self,
+        batch: List[Dict[str,
+                         Any]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """각 샘플의 agent / lane / static 개수를 모은다.
+
+        Args:
+            batch (List[Dict[str, Any]]):
+                길이 B 리스트, 각 원소는 단일 샘플 dict.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                - agent_len_arr: (B,), 각 샘플의 agent 수
+                - lane_len_arr: (B,), 각 샘플의 lane 수
+                - static_len_arr: (B,), 각 샘플의 static 수
+        """
+        agent_len_arr = np.array(
+            [sample["neighbor_agents_past"].shape[0] for sample in batch],
+            dtype=np.int64,
+        )
+        lane_len_arr = np.array(
+            [sample["lanes"].shape[0] for sample in batch],
+            dtype=np.int64,
+        )
+        static_len_arr = np.array(
+            [sample["static_objects"].shape[0] for sample in batch],
+            dtype=np.int64,
+        )
+        return agent_len_arr, lane_len_arr, static_len_arr
+
+    # ------------------------------------------------------------------
+    # 0-2) 최대 개수 및 lane_len 계산
+    # ------------------------------------------------------------------
+    def _compute_max_counts_and_lane_len(
+        self,
+        batch: List[Dict[str, Any]],
+        agent_len_arr: np.ndarray,
+        lane_len_arr: np.ndarray,
+        static_len_arr: np.ndarray,
+    ) -> Tuple[int, int, int, int]:
+        """배치 안에서 agent / lane / static 최대 개수와 lane_len을 계산한다.
+
+        Args:
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            agent_len_arr (np.ndarray): (B,) agent 개수.
+            lane_len_arr (np.ndarray): (B,) lane 개수.
+            static_len_arr (np.ndarray): (B,) static 개수.
+
+        Returns:
+            Tuple[int, int, int, int]:
+                - max_agent_num: 배치 내 최대 agent 수
+                - max_lane_num: 배치 내 최대 lane 수
+                - max_static_num: 배치 내 최대 static 수
+                - lane_len: lane 한 개당 점 개수
+        """
+        batch_size: int = len(batch)
+        max_agent_num: int = int(agent_len_arr.max()) if batch_size > 0 else 0
+        max_lane_num: int = int(lane_len_arr.max()) if batch_size > 0 else 0
+        max_static_num: int = (int(static_len_arr.max())
+                               if batch_size > 0 else 0)
+        lane_len: int = (batch[0]["lanes"].shape[1] if max_lane_num > 0 else 0)
+        return max_agent_num, max_lane_num, max_static_num, lane_len
+
+    # ------------------------------------------------------------------
+    # 0-3) ego / 중심 좌표 계산
+    # ------------------------------------------------------------------
+    def _build_ego_and_center_xy(
+        self,
+        batch: List[Dict[str, Any]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """ego 현재 위치와 초기 중심 좌표를 만든다.
+
+        Args:
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - ego_xy: (B, 2) ego 현재 위치
+                - center_xy: (B, 2) 초기 중심(ego와 동일)
+        """
+        ego_xy = np.stack(
+            [sample["ego_agent_past"][-1, 0:2] for sample in batch],
+            axis=0,
+        ).astype(np.float32)  # (B, 2)
+        center_xy = ego_xy.copy()  # (B, 2)
+        return ego_xy, center_xy
+
+    # ------------------------------------------------------------------
+    # 0-4) 큰 좌표 배열 만들기 (batch 연산용)
+    # ------------------------------------------------------------------
+    def _build_positions_arrays(
+        self,
+        batch: List[Dict[str, Any]],
+        agent_len_arr: np.ndarray,
+        lane_len_arr: np.ndarray,
+        static_len_arr: np.ndarray,
+        max_agent_num: int,
+        max_lane_num: int,
+        max_static_num: int,
+        lane_len: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """agent / lane / static 좌표를 큰 배열로 모은다.
+
+        Args:
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            agent_len_arr (np.ndarray): (B,) agent 개수.
+            lane_len_arr (np.ndarray): (B,) lane 개수.
+            static_len_arr (np.ndarray): (B,) static 개수.
+            max_agent_num (int): 배치 내 최대 agent 수.
+            max_lane_num (int): 배치 내 최대 lane 수.
+            max_static_num (int): 배치 내 최대 static 수.
+            lane_len (int): lane 한 개당 점 개수.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                - agents_xy: (B, max_agent_num, 2)
+                - lanes_xy: (B, max_lane_num, lane_len, 2)
+                - static_xy: (B, max_static_num, 2)
+        """
+        batch_size: int = len(batch)
+
+        agents_xy = np.zeros((batch_size, max_agent_num, 2),
+                             dtype=np.float32)  # (B, max_agent_num, 2)
+        for b_idx, sample in enumerate(batch):
+            real_agent_num = int(agent_len_arr[b_idx])
+            if real_agent_num > 0:
+                agents_xy[b_idx, :real_agent_num, :] = sample[
+                    "neighbor_agents_past"][real_agent_num * 0:real_agent_num,
+                                            -1, 0:2]
+
+        lanes_xy = np.zeros((batch_size, max_lane_num, lane_len, 2),
+                            dtype=np.float32)  # (B, max_lane_num, lane_len, 2)
+        for b_idx, sample in enumerate(batch):
+            real_lane_num = int(lane_len_arr[b_idx])
+            if real_lane_num > 0:
+                lanes_xy[b_idx, :real_lane_num, :, :] = sample[
+                    "lanes"][:real_lane_num, :, 0:2]
+
+        static_xy = np.zeros((batch_size, max_static_num, 2),
+                             dtype=np.float32)  # (B, max_static_num, 2)
+        for b_idx, sample in enumerate(batch):
+            real_static_num = int(static_len_arr[b_idx])
+            if real_static_num > 0:
+                static_xy[b_idx, :real_static_num, :] = sample[
+                    "static_objects"][real_static_num * 0:real_static_num, 0:2]
+
+        return agents_xy, lanes_xy, static_xy
+
+    # ------------------------------------------------------------------
+    # 0-5) agent 유효 마스크
+    # ------------------------------------------------------------------
+    def _build_agent_valid_mask(
+        self,
+        agent_len_arr: np.ndarray,
+        max_agent_num: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """실제 agent 위치가 있는 칸을 표시하는 마스크를 만든다.
+
+        Args:
+            agent_len_arr (np.ndarray): (B,) 각 샘플 agent 수.
+            max_agent_num (int): 배치 내 최대 agent 수.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - agent_valid_mask: (B, max_agent_num) True=해당 칸에 agent 있음
+                - has_any_agent_mask: (B,) True=해당 샘플에 agent 하나 이상
+        """
+        batch_size: int = agent_len_arr.shape[0]
+        if max_agent_num > 0:
+            idx = np.arange(max_agent_num)[None, :]  # (1, max_agent_num)
+            agent_valid_mask = idx < agent_len_arr[:,
+                                                   None]  # (B, max_agent_num)
+        else:
+            agent_valid_mask = np.zeros((batch_size, 0), dtype=bool)
+        has_any_agent_mask = agent_len_arr > 0  # (B,)
+        return agent_valid_mask, has_any_agent_mask
+
+    # ------------------------------------------------------------------
+    # 0-6) 중심을 NPC 기준으로 바꿀지 결정
+    # ------------------------------------------------------------------
+    def _maybe_update_center_by_npc(
+        self,
+        center_xy: np.ndarray,  # (B, 2)
+        agents_xy: np.ndarray,  # (B, max_agent_num, 2)
+        agent_len_arr: np.ndarray,  # (B,)
+        agent_valid_mask: np.ndarray,  # (B, max_agent_num)
+        max_agent_num: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """mode가 'npc'일 때, 랜덤 NPC 한 대를 중심으로 바꾼다.
+
+        Args:
+            center_xy (np.ndarray): (B, 2) 기존 중심 좌표.
+            agents_xy (np.ndarray): (B, max_agent_num, 2) agent 현재 위치.
+            agent_len_arr (np.ndarray): (B,) 각 샘플 agent 수.
+            agent_valid_mask (np.ndarray): (B, max_agent_num) True=유효 위치.
+            max_agent_num (int): 배치 내 최대 agent 수.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - center_xy_new: (B, 2) 새 중심 좌표.
+                - center_agent_idx: (B,) 샘플마다 선택된 중심 agent 인덱스.
+        """
+        batch_size: int = agent_len_arr.shape[0]
+        has_any_agent_mask = agent_len_arr > 0  # (B,)
+        center_agent_idx = np.zeros(batch_size, dtype=np.int64)
+
+        if self.center_crop_mode != "npc" or max_agent_num <= 0:
+            return center_xy, center_agent_idx
+
+        rand_vals = np.random.rand(batch_size, max_agent_num).astype(
+            np.float32)  # (B, max_agent_num)
+        rand_vals[~agent_valid_mask] = -1.0
+
+        center_agent_idx = rand_vals.argmax(axis=1)  # (B,)
+        center_npc_xy = agents_xy[
+            np.arange(batch_size),
+            np.clip(center_agent_idx, 0, max_agent_num - 1),
+        ]  # (B, 2)
+
+        center_xy_new = center_xy.copy()
+        center_xy_new[has_any_agent_mask, :] = center_npc_xy[
+            has_any_agent_mask, :]
+        return center_xy_new, center_agent_idx
+
+    # ------------------------------------------------------------------
+    # 0-7-1) agent keep 마스크 계산
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 0-7-1) agent keep 마스크 계산
+    # ------------------------------------------------------------------
+    def _compute_keep_agent_mask(
+        self,
+        center_xy: np.ndarray,          # (B, 2)
+        agents_xy: np.ndarray,          # (B, max_agent_num, 2)
+        agent_len_arr: np.ndarray,      # (B,)
+        max_agent_num: int,
+        agent_valid_mask: np.ndarray,   # (B, max_agent_num)
+    ) -> np.ndarray:
+        """중심 기준 거리로 agent 를 남길지 여부를 계산한다.
+
+        동작 요약:
+          1) 각 agent 의 현재 위치와 중심 좌표(center_xy) 사이의 거리^2 을 계산한다.
+          2) 거리^2 <= (반경 K)^2 인 agent 만 True 로 표시한다.
+          3) agent_valid_mask 가 False 인 자리는 무조건 False 로 둔다.
+
+        즉, “중심에서 K m 안에 실제로 존재하는 agent만 남긴다”는 규칙을
+        배치 단위로 한 번에 적용하는 함수이다.
+
+        Args:
+            center_xy (np.ndarray):
+                - shape: (B, 2)
+                - 각 배치에서 기준이 되는 점(ego 또는 임의 NPC)의 x,y.
+            agents_xy (np.ndarray):
+                - shape: (B, max_agent_num, 2)
+                - 각 배치에서 agent 현재 위치의 x,y.
+                - 실제 agent 수보다 큰 부분은 0 으로 채워져 있음.
+            agent_len_arr (np.ndarray):
+                - shape: (B,)
+                - 각 샘플의 실제 agent 수.
+            max_agent_num (int):
+                - 배치 전체에서 가장 많은 agent 개수.
+            agent_valid_mask (np.ndarray):
+                - shape: (B, max_agent_num)
+                - True 이면 해당 자리에는 실제 agent 가 있고,
+                  False 이면 패딩(없는 자리).
+
+        Returns:
+            np.ndarray:
+                - keep_agent_mask
+                - shape: (B, max_agent_num)
+                - True 인 위치의 agent 만 이후에 남기고,
+                  False 인 agent 는 잘라낸다.
+        """
+        batch_size: int = agent_len_arr.shape[0]
+        if max_agent_num <= 0:
+            return np.zeros((batch_size, 0), dtype=bool)
+
+        radius_sq: float = float(self.center_crop_radius_m) ** 2
+
+        # diff_agent: (B, max_agent_num, 2)
+        diff_agent = agents_xy - center_xy[:, None, :]
+        # dist2_agent: (B, max_agent_num)
+        dist2_agent = (diff_agent ** 2).sum(axis=-1)
+
+        # 유효한 자리 + 반경 안에 있는 agent 만 남김
+        keep_agent_mask = agent_valid_mask & (dist2_agent <= radius_sq)
+        return keep_agent_mask
+
+
+    # ------------------------------------------------------------------
+    # 0-7-2) lane keep 마스크 계산
+    # ------------------------------------------------------------------
+    def _compute_keep_lane_mask(
+        self,
+        center_xy: np.ndarray,  # (B, 2)
+        lanes_xy: np.ndarray,  # (B, max_lane_num, lane_len, 2)
+        lane_len_arr: np.ndarray,  # (B,)
+        max_lane_num: int,
+    ) -> np.ndarray:
+        """중심 기준 거리로 lane 을 남길지 여부를 계산한다.
+
+        동작 요약:
+          1) lane 하나는 여러 점으로 이루어진 선이다.
+             · lanes_xy[b, l, p, :] 가 "l번째 lane 의 p번째 점" 좌표.
+          2) 각 lane 에 대해, 모든 점과 중심 사이 거리^2 을 구한다.
+          3) 그 중 "가장 가까운 점의 거리^2" 이 (반경 K)^2 이하이면
+             그 lane 을 keep=True 로 표시한다.
+
+        Args:
+            center_xy (np.ndarray):
+                - shape: (B, 2)
+                - 각 배치에서 기준이 되는 점(ego 또는 NPC)의 x,y.
+            lanes_xy (np.ndarray):
+                - shape: (B, max_lane_num, lane_len, 2)
+                - lane 의 각 점 위치 x,y.
+                - 실제 lane 수보다 큰 부분은 0 으로 채워져 있음.
+            lane_len_arr (np.ndarray):
+                - shape: (B,)
+                - 각 샘플의 실제 lane 수.
+            max_lane_num (int):
+                - 배치 전체에서 가장 많은 lane 개수.
+
+        Returns:
+            np.ndarray:
+                - keep_lane_mask
+                - shape: (B, max_lane_num)
+                - True 인 lane 은 그대로 유지하고,
+                  False 인 lane 은 이후 슬라이스에서 제거된다.
+        """
+        batch_size: int = lane_len_arr.shape[0]
+        if max_lane_num <= 0:
+            return np.zeros((batch_size, 0), dtype=bool)
+
+        radius_sq: float = float(self.center_crop_radius_m)**2
+
+        lane_valid_mask = (np.arange(max_lane_num)[None, :]
+                           < lane_len_arr[:, None])  # (B, max_lane_num)
+        diff_lane = lanes_xy - center_xy[:, None,
+                                         None, :]  # (B, max_lane_num, lane_len, 2)
+        dist2_lane = (diff_lane**2).sum(axis=-1)  # (B, max_lane_num, lane_len)
+        min_dist2_lane = dist2_lane.min(axis=-1)  # (B, max_lane_num)
+        keep_lane_mask = lane_valid_mask & (min_dist2_lane <= radius_sq)
+        return keep_lane_mask
+
+    # ------------------------------------------------------------------
+    # 0-7-3) static keep 마스크 계산
+    # ------------------------------------------------------------------
+    def _compute_keep_static_mask(
+        self,
+        center_xy: np.ndarray,  # (B, 2)
+        static_xy: np.ndarray,  # (B, max_static_num, 2)
+        static_len_arr: np.ndarray,  # (B,)
+        max_static_num: int,
+    ) -> np.ndarray:
+        """중심 기준 거리로 static object 를 남길지 여부를 계산한다.
+
+        동작 요약:
+          1) 각 static object 의 위치와 중심 좌표 사이의 거리^2 을 계산한다.
+          2) 거리^2 <= (반경 K)^2 인 static 만 keep=True 로 표시한다.
+          3) 실제 static 이 없는 칸은 False 로 남는다.
+
+        Args:
+            center_xy (np.ndarray):
+                - shape: (B, 2)
+                - 각 배치에서 기준이 되는 점의 x,y.
+            static_xy (np.ndarray):
+                - shape: (B, max_static_num, 2)
+                - 각 static 의 위치 x,y.
+                - 실제 개수보다 큰 부분은 0 으로 채워져 있음.
+            static_len_arr (np.ndarray):
+                - shape: (B,)
+                - 각 샘플의 실제 static 수.
+            max_static_num (int):
+                - 배치 전체에서 가장 많은 static 개수.
+
+        Returns:
+            np.ndarray:
+                - keep_static_mask
+                - shape: (B, max_static_num)
+                - True 인 static 만 이후에 남기고,
+                  False 인 static 은 잘라낸다.
+        """
+        batch_size: int = static_len_arr.shape[0]
+        if max_static_num <= 0:
+            return np.zeros((batch_size, 0), dtype=bool)
+
+        radius_sq: float = float(self.center_crop_radius_m)**2
+
+        static_valid_mask = (np.arange(max_static_num)[None, :]
+                             < static_len_arr[:, None])  # (B, max_static_num)
+        diff_static = static_xy - center_xy[:,
+                                            None, :]  # (B, max_static_num, 2)
+        dist2_static = (diff_static**2).sum(axis=-1)  # (B, max_static_num)
+        keep_static_mask = static_valid_mask & (dist2_static <= radius_sq)
+        return keep_static_mask
+
+    # ------------------------------------------------------------------
+    # 0-8) keep 마스크를 샘플 dict에 적용 (얇은 for 루프)
+    # ------------------------------------------------------------------
+    def _apply_keep_masks_to_batch(
+        self,
+        batch: List[Dict[str, Any]],
+        agent_len_arr: np.ndarray,
+        lane_len_arr: np.ndarray,
+        static_len_arr: np.ndarray,
+        keep_agent_mask: np.ndarray,
+        keep_lane_mask: np.ndarray,
+        keep_static_mask: np.ndarray,
+    ) -> None:
+        """계산된 keep 마스크를 이용해 각 샘플 dict를 잘라낸다.
+
+        Args:
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            agent_len_arr (np.ndarray): (B,) agent 수.
+            lane_len_arr (np.ndarray): (B,) lane 수.
+            static_len_arr (np.ndarray): (B,) static 수.
+            keep_agent_mask (np.ndarray): (B, max_agent_num) agent keep 마스크.
+            keep_lane_mask (np.ndarray): (B, max_lane_num) lane keep 마스크.
+            keep_static_mask (np.ndarray): (B, max_static_num) static keep 마스크.
+        """
+        batch_size: int = len(batch)
+        for b_idx in range(batch_size):
+            sample = batch[b_idx]
+
+            # 1) agent / future
+            if int(agent_len_arr[b_idx]) > 0:
+                keep_agent_idx = np.nonzero(keep_agent_mask[b_idx])[0]
+                sample["neighbor_agents_past"] = sample["neighbor_agents_past"][
+                    keep_agent_idx]
+                sample["near_future_gt_3_dim"] = sample["near_future_gt_3_dim"][
+                    keep_agent_idx]
+
+            # 2) lane 관련 + route_lanes 계열
+            if int(lane_len_arr[b_idx]) > 0:
+                keep_lane_idx = np.nonzero(keep_lane_mask[b_idx])[0]
+                sample["lanes"] = sample["lanes"][keep_lane_idx]
+                sample["lanes_speed_limit"] = sample["lanes_speed_limit"][
+                    keep_lane_idx]
+                sample["lanes_has_speed_limit"] = sample[
+                    "lanes_has_speed_limit"][keep_lane_idx]
+
+                if "route_lanes" in sample:
+                    sample["route_lanes"] = sample["route_lanes"][keep_lane_idx]
+                if "route_lanes_speed_limit" in sample:
+                    sample["route_lanes_speed_limit"] = sample[
+                        "route_lanes_speed_limit"][keep_lane_idx]
+                if "route_lanes_has_speed_limit" in sample:
+                    sample["route_lanes_has_speed_limit"] = sample[
+                        "route_lanes_has_speed_limit"][keep_lane_idx]
+
+            # 3) agent_route_lane_order (행: agent, 열: lane)
+            if int(agent_len_arr[b_idx]) > 0 and int(lane_len_arr[b_idx]) > 0:
+                keep_agent_idx = np.nonzero(keep_agent_mask[b_idx])[0]
+                keep_lane_idx = np.nonzero(keep_lane_mask[b_idx])[0]
+                aro = sample["agent_route_lane_order"]  # (A_i, L_i)
+                sample["agent_route_lane_order"] = aro[np.ix_(
+                    keep_agent_idx, keep_lane_idx)]
+
+            # 4) static_objects
+            if int(static_len_arr[b_idx]) > 0:
+                keep_static_idx = np.nonzero(keep_static_mask[b_idx])[0]
+                sample["static_objects"] = sample["static_objects"][
+                    keep_static_idx]
+
+    # ------------------------------------------------------------------
+    # 0) 중심 기준 배치 크로핑 (배치 연산 + 얇은 for 루프)
+    # ------------------------------------------------------------------
+    def _center_crop_batch_batched(
+        self,
+        batch: List[Dict[str, Any]],
+    ) -> None:
+        """배치 전체를 한 번에 보고, 중심 기준 K m 안의 토큰만 남긴다.
+
+        무거운 계산은 모두 numpy 배열 기반 배치 연산으로 처리하고,
+        마지막에 샘플별 슬라이싱만 for 루프에서 수행한다.
+        """
+        batch_size: int = len(batch)
+        if batch_size == 0:
+            return
+
+        agent_len_arr, lane_len_arr, static_len_arr = \
+            self._compute_object_lengths(batch)
+        (
+            max_agent_num,
+            max_lane_num,
+            max_static_num,
+            lane_len,
+        ) = self._compute_max_counts_and_lane_len(
+            batch=batch,
+            agent_len_arr=agent_len_arr,
+            lane_len_arr=lane_len_arr,
+            static_len_arr=static_len_arr,
+        )
+        # center_xy: (B, 2) 초기 중심(ego와 동일)
+        _, center_xy = self._build_ego_and_center_xy(batch)
+        """
+            - agents_xy: (B, max_agent_num, 2)
+            - lanes_xy: (B, max_lane_num, lane_len, 2)
+            - static_xy: (B, max_static_num, 2)
+        """
+        agents_xy, lanes_xy, static_xy = self._build_positions_arrays(
+            batch=batch,
+            agent_len_arr=agent_len_arr,
+            lane_len_arr=lane_len_arr,
+            static_len_arr=static_len_arr,
+            max_agent_num=max_agent_num,
+            max_lane_num=max_lane_num,
+            max_static_num=max_static_num,
+            lane_len=lane_len,
+        )
+        """
+            - agent_valid_mask: (B, max_agent_num) True=해당 칸에 agent 있음
+        """
+        agent_valid_mask, _ = self._build_agent_valid_mask(
+            agent_len_arr=agent_len_arr, # (B,)
+            max_agent_num=max_agent_num, # int
+        )
+        """
+            - center_xy: (B, 2) 새 중심 좌표.
+            - center_agent_idx: (B,) 샘플마다 선택된 중심 agent 인덱스.
+        """
+        center_xy, center_agent_idx = self._maybe_update_center_by_npc(
+            center_xy=center_xy, # (B, 2)
+            agents_xy=agents_xy, # (B, max_agent_num, 2)
+            agent_len_arr=agent_len_arr, # (B,)
+            agent_valid_mask=agent_valid_mask, # (B, max_agent_num)
+            max_agent_num=max_agent_num, # int
+        )
+        # keep_agent_mask: (B, max_agent_num)
+        keep_agent_mask = self._compute_keep_agent_mask(
+            center_xy=center_xy,
+            agents_xy=agents_xy,
+            agent_len_arr=agent_len_arr,
+            max_agent_num=max_agent_num,
+            agent_valid_mask=agent_valid_mask,
+        )
+        # keep_lane_mask: (B, max_lane_num)
+        keep_lane_mask = self._compute_keep_lane_mask(
+            center_xy=center_xy,
+            lanes_xy=lanes_xy,
+            lane_len_arr=lane_len_arr,
+            max_lane_num=max_lane_num,
+        )
+        # keep_static_mask: (B, max_static_num)
+        keep_static_mask = self._compute_keep_static_mask(
+            center_xy=center_xy,
+            static_xy=static_xy,
+            static_len_arr=static_len_arr,
+            max_static_num=max_static_num,
+        )
+
+        self._apply_keep_masks_to_batch(
+            batch=batch,
+            agent_len_arr=agent_len_arr,
+            lane_len_arr=lane_len_arr,
+            static_len_arr=static_len_arr,
+            keep_agent_mask=keep_agent_mask, # (B, max_agent_num)
+            keep_lane_mask=keep_lane_mask, # (B, max_lane_num)
+            keep_static_mask=keep_static_mask, # (B, max_static_num)
+        )
+
+    # ------------------------------------------------------------------
+    # 1) 고정 shape 텐서들 스택
     # ------------------------------------------------------------------
     def _stack_fixed(
         self,
@@ -603,24 +1179,23 @@ class DiffusionPlannerCollate:
         key: str,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """모든 샘플에서 shape가 같은 키를 단순히 (B, ...)로 쌓는다.
+        """모든 샘플에서 shape가 같은 키를 (B, ...) 텐서로 쌓는다.
 
         Args:
-            batch: 샘플 dict 리스트. 길이 = B.
-            key:   예: "ego_agent_past".
-            dtype: torch.float32 / torch.int64 / torch.bool 등.
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            key (str): 예: "ego_agent_past".
+            dtype (torch.dtype): 출력 dtype.
 
         Returns:
-            stacked: 텐서, shape = (B, *sample_shape)
+            torch.Tensor: shape (B, *sample_shape)
         """
-        # sample_shape: (T, D) 같은 뒷부분. B 차원만 앞에 새로 붙는다.
         return torch.stack(
             [torch.as_tensor(sample[key], dtype=dtype) for sample in batch],
             dim=0,
         )
 
     # ------------------------------------------------------------------
-    # 2) (N_i, ...) 형태를 (B, target_len, ...)으로 패딩하는 도우미
+    # 2) (N_i, ...) → (B, target_len, ...) 패딩
     # ------------------------------------------------------------------
     def _pad_first_dim_to(
         self,
@@ -629,22 +1204,16 @@ class DiffusionPlannerCollate:
         target_len: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """(N_i, ...) 배열들을 (B, target_len, ...) 텐서로 0 패딩한다.
+        """샘플마다 길이가 다른 1D 축을 (B, target_len, ...)으로 0 패딩한다.
 
         Args:
-            batch:
-                샘플 dict 리스트. 길이 = B.
-            key:
-                예: "neighbor_agents_past", "lanes", "static_objects".
-            target_len:
-                배치 차원 뒤 첫 번째 축 길이. 예: data_max_agent_num.
-            dtype:
-                출력 텐서 dtype.
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            key (str): 예: "neighbor_agents_past".
+            target_len (int): 두 번째 축 길이.
+            dtype (torch.dtype): 출력 dtype.
 
         Returns:
-            padded:
-                shape = (B, target_len, *rest_shape)
-                · rest_shape 는 첫 샘플의 arr.shape[1:] 과 동일.
+            torch.Tensor: shape (B, target_len, *rest_shape)
         """
         batch_size: int = len(batch)
         if batch_size == 0:
@@ -658,14 +1227,14 @@ class DiffusionPlannerCollate:
         for b_idx, sample in enumerate(batch):
             arr = sample[key]
             n_i = min(arr.shape[0], target_len)
-            if n_i <= 0:
-                continue
-            padded[b_idx, :n_i, ...] = torch.as_tensor(arr[:n_i], dtype=dtype)
+            if n_i > 0:
+                padded[b_idx, :n_i, ...] = torch.as_tensor(arr[:n_i],
+                                                           dtype=dtype)
 
         return padded
 
     # ------------------------------------------------------------------
-    # 3) (N_i, M_i) 형태를 (B, target0, target1)으로 패딩하는 도우미
+    # 3) (N_i, M_i) → (B, target0, target1) 패딩
     # ------------------------------------------------------------------
     def _pad_two_dims_to(
         self,
@@ -675,15 +1244,12 @@ class DiffusionPlannerCollate:
         target_len1: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """(N_i, M_i) 배열들을 (B, target_len0, target_len1)로 패딩.
+        """샘플마다 (행,열) 길이가 다른 배열을 (B, target0, target1)으로 패딩한다.
 
-        현재는 agent_route_lane_order에만 사용됨.
-        - npz 안에서는: -1 = not in route, 0.. = rank
-        - 여기서 새로 생기는 패딩도 -1로 맞춰줘야 Encoder 로직과 일관됨.
+        현재는 agent_route_lane_order에 사용하며,
+        패딩 구간은 -1로 채워서 "연결 없음"을 뜻하게 한다.
         """
         batch_size: int = len(batch)
-        # 🔴 기존: out = torch.zeros(...)
-        # ✅ 수정: -1로 채워서 패딩 = "route 없음"으로 명시
         out = torch.full(
             (batch_size, target_len0, target_len1),
             fill_value=-1,
@@ -694,31 +1260,31 @@ class DiffusionPlannerCollate:
             arr = sample[key]
             n0 = min(arr.shape[0], target_len0)
             n1 = min(arr.shape[1], target_len1)
-            if n0 <= 0 or n1 <= 0:
-                continue
-            out[b_idx, :n0, :n1] = torch.as_tensor(arr[:n0, :n1], dtype=dtype)
+            if n0 > 0 and n1 > 0:
+                out[b_idx, :n0, :n1] = torch.as_tensor(arr[:n0, :n1],
+                                                       dtype=dtype)
 
         return out
 
     # ------------------------------------------------------------------
-    # 4) collate 본체
+    # 4-1) 배치 내 최대 길이 계산
     # ------------------------------------------------------------------
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """단일 샘플 dict 리스트를 고정 길이 배치 텐서 dict로 변환한다.
+    def _compute_batch_max_lengths(
+        self,
+        batch: List[Dict[str, Any]],
+    ) -> Tuple[int, int, int, int]:
+        """배치 안에서 agent / lane / route / static 최대 개수를 계산한다.
 
         Args:
-            batch:
-                DiffusionPlannerData 에서 나온 샘플 dict 리스트. 길이 = B.
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
 
         Returns:
-            Dict[str, torch.Tensor]:
-                key 별로 배치 차원(B)이 앞에 붙은 텐서 묶음.
+            Tuple[int, int, int, int]:
+                - data_max_agent_num
+                - data_max_lane_num
+                - data_max_route_num
+                - data_max_static_num
         """
-        batch_size: int = len(batch)
-        if batch_size == 0:
-            raise ValueError("빈 batch가 들어왔습니다.")
-
-        # === (1) 실제 배치에서의 최대 길이(real_*) 계산 ====================
         data_max_agent_num = max(
             sample["neighbor_agents_past"].shape[0] for sample in batch)
         data_max_lane_num = max(sample["lanes"].shape[0] for sample in batch)
@@ -726,8 +1292,34 @@ class DiffusionPlannerCollate:
             sample["route_lanes"].shape[0] for sample in batch)
         data_max_static_num = max(
             sample["static_objects"].shape[0] for sample in batch)
+        return (
+            data_max_agent_num,
+            data_max_lane_num,
+            data_max_route_num,
+            data_max_static_num,
+        )
 
-        # === (2) config 상한과 일치하는지 빠르게 체크 ======================
+    # ------------------------------------------------------------------
+    # 4-2) 상한과의 정합성 체크
+    # ------------------------------------------------------------------
+    def _check_length_limits(
+        self,
+        data_max_agent_num: int,
+        data_max_lane_num: int,
+        data_max_route_num: int,
+        data_max_static_num: int,
+    ) -> None:
+        """배치 최대 개수가 설정된 상한을 넘지 않는지 확인한다.
+
+        Args:
+            data_max_agent_num (int): 배치 내 최대 agent 수.
+            data_max_lane_num (int): 배치 내 최대 lane 수.
+            data_max_route_num (int): 배치 내 최대 route 수.
+            data_max_static_num (int): 배치 내 최대 static 수.
+
+        Raises:
+            ValueError: 상한을 넘는 경우.
+        """
         if data_max_agent_num > self.caching_max_agent_num:
             raise ValueError(
                 f"배치 내 agent 수(data_max_agent_num={data_max_agent_num})가 "
@@ -745,7 +1337,29 @@ class DiffusionPlannerCollate:
                 f"배치 내 static 수(data_max_static_num={data_max_static_num})가 "
                 f"max_static_num={self.max_static_num} 를 초과했습니다.")
 
-        # === (3) 고정 길이 텐서들 쌓기 =====================================
+    # ------------------------------------------------------------------
+    # 4-3) 패딩 포함 전체 배치 텐서 구성
+    # ------------------------------------------------------------------
+    def _build_padded_batch(
+        self,
+        batch: List[Dict[str, Any]],
+        data_max_agent_num: int,
+        data_max_lane_num: int,
+        data_max_route_num: int,
+        data_max_static_num: int,
+    ) -> Dict[str, torch.Tensor]:
+        """최대 길이에 맞춰 텐서를 쌓고 패딩해서 최종 배치 dict를 만든다.
+
+        Args:
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            data_max_agent_num (int): 최대 agent 수.
+            data_max_lane_num (int): 최대 lane 수.
+            data_max_route_num (int): 최대 route 수.
+            data_max_static_num (int): 최대 static 수.
+
+        Returns:
+            Dict[str, torch.Tensor]: key마다 (B, ·) shape 텐서.
+        """
         ego_agent_past = self._stack_fixed(
             batch,
             key="ego_agent_past",
@@ -762,7 +1376,6 @@ class DiffusionPlannerCollate:
             dtype=torch.float32,  # (B, future_len, 11)
         )
 
-        # === (4) agent / static / lane / route 축 패딩 ======================
         neighbor_agents_past = self._pad_first_dim_to(
             batch,
             key="neighbor_agents_past",
@@ -828,7 +1441,6 @@ class DiffusionPlannerCollate:
             dtype=torch.int64,  # (B, data_max_agent_num, data_max_lane_num)
         )
 
-        # === (5) dict 구성 (for문으로 깔끔하게) ============================
         batch_out: Dict[str, torch.Tensor] = {}
         for k, v in [
             ("ego_agent_past", ego_agent_past),
@@ -847,6 +1459,46 @@ class DiffusionPlannerCollate:
         ]:
             batch_out[k] = v
 
+        return batch_out
+
+    # ------------------------------------------------------------------
+    # 4) collate 본체
+    # ------------------------------------------------------------------
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """단일 샘플 dict 리스트를 (B, ·) 텐서 dict로 변환한다.
+
+        Args:
+            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+
+        Returns:
+            Dict[str, torch.Tensor]: key마다 batch 차원을 앞에 둔 텐서들.
+        """
+        if len(batch) == 0:
+            raise ValueError("빈 batch가 들어왔습니다.")
+
+        if self._should_center_crop():
+            self._center_crop_batch_batched(batch)
+
+        (
+            data_max_agent_num,
+            data_max_lane_num,
+            data_max_route_num,
+            data_max_static_num,
+        ) = self._compute_batch_max_lengths(batch)
+        self._check_length_limits(
+            data_max_agent_num=data_max_agent_num,
+            data_max_lane_num=data_max_lane_num,
+            data_max_route_num=data_max_route_num,
+            data_max_static_num=data_max_static_num,
+        )
+
+        batch_out = self._build_padded_batch(
+            batch=batch,
+            data_max_agent_num=data_max_agent_num,
+            data_max_lane_num=data_max_lane_num,
+            data_max_route_num=data_max_route_num,
+            data_max_static_num=data_max_static_num,
+        )
         return batch_out
 
 
