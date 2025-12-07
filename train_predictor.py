@@ -6,7 +6,7 @@ import args_util
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict,  List
 
 # deprecated 키는 사용 금지
 os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -555,8 +555,6 @@ def build_adamw_with_param_groups(
     return optim, extra_nwd
 
 
-from typing import Any, Dict, List
-import torch
 
 
 class DiffusionPlannerCollate:
@@ -2169,7 +2167,7 @@ def _run_training_loop(
         integration_loss_dict = {}
         constraint_loss_dict = {}
         loss_dict = {}
-        for k, v in train_loss:
+        for k, v in train_loss.items():
             if k == "learn_progress":
                 info_dict[k] = v
             elif k in ("direct_loss_weight", "int_loss_weight",
