@@ -1171,20 +1171,20 @@ def _compute_schedule_info(
         total_step_of_this_epoch: 한 epoch에서의 step 수.
         total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
         global_batch_size: 실제 글로벌 배치 크기.
-        samples_this_epoch: 한 epoch 동안 처리되는 샘플 개수.
+        data_num_in_a_epoch: 한 epoch 동안 처리되는 샘플 개수.
     """
     total_step_of_this_epoch = len(train_loader)
     total_step_of_all_epoch = args.train_epochs * total_step_of_this_epoch
 
     bs_per_rank = args.batch_size // world_size
     global_batch_size = bs_per_rank * world_size
-    samples_this_epoch = total_step_of_this_epoch * global_batch_size
+    data_num_in_a_epoch = total_step_of_this_epoch * global_batch_size
 
     return (
         total_step_of_this_epoch,
         total_step_of_all_epoch,
         global_batch_size,
-        samples_this_epoch,
+        data_num_in_a_epoch,
     )
 
 
@@ -2103,7 +2103,7 @@ def _run_training_loop(
     global_rank: int,
     train_epochs: int,
     init_epoch: int,
-    samples_this_epoch: int,
+    data_num_in_a_epoch: int,
     global_batch_size: int,
     aug: Optional[object],
 ) -> float:
@@ -2124,13 +2124,14 @@ def _run_training_loop(
         global_rank: 전체 프로세스 기준 번호.
         train_epochs: 전체 epoch 수.
         init_epoch: 재개 시작 epoch 인덱스.
-        samples_this_epoch: 한 epoch당 처리 샘플 수.
+        data_num_in_a_epoch: 한 epoch당 처리 샘플 수.
         global_batch_size: 실제 글로벌 배치 크기.
         aug: augmentation 객체 또는 None.
 
     Returns:
         best_loss: 학습 종료 시의 best loss 값.
     """
+    elapsed_training_time = 0.0
     for epoch in range(init_epoch, train_epochs):
         # 1) 한 epoch 학습
         train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
@@ -2144,9 +2145,9 @@ def _run_training_loop(
             model_ema=model_ema,
             aug=aug,
         )
-
+        elapsed_training_time += epoch_elapsed_time_sec
         # 2) epoch당 처리 속도 계산
-        data_process_per_sec = samples_this_epoch / max(epoch_elapsed_time_sec,
+        data_process_per_sec = data_num_in_a_epoch / max(epoch_elapsed_time_sec,
                                                         1e-9)
         """ train_loss: Dict[str, float]
         <diffusion_loss_func 가 출력해주는 loss_dict>
@@ -2207,6 +2208,7 @@ def _run_training_loop(
         speed_info = {
             "epoch_elapsed_time_sec": epoch_elapsed_time_sec,
             "data_process_per_sec": data_process_per_sec,
+            "elapsed_training_time": elapsed_training_time,
         }
         metrics: Dict[str, float] = {}
         # add "info_dict/" prefix
@@ -2395,7 +2397,7 @@ def model_training(args: argparse.Namespace) -> None:
         world_size,
     )
     (total_step_of_this_epoch, total_step_of_all_epoch, global_batch_size,
-     samples_this_epoch) = _compute_schedule_info(
+     data_num_in_a_epoch) = _compute_schedule_info(
          args=args,
          train_loader=train_loader,
          world_size=world_size,
@@ -2471,7 +2473,7 @@ def model_training(args: argparse.Namespace) -> None:
         global_rank=global_rank,
         train_epochs=train_epochs,
         init_epoch=init_epoch,
-        samples_this_epoch=samples_this_epoch,
+        data_num_in_a_epoch=data_num_in_a_epoch,
         global_batch_size=global_batch_size,
         aug=aug,
     )
