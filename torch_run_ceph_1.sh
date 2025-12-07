@@ -111,7 +111,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
  --port 23001 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "feasible_full_time_use_vel_gpu_2_exp_A" \
+  --name "many_test_gpu_2_exp_A" \
   --batch_size 128 \
   --profile_feasible false \
   --use_vel_input false \
