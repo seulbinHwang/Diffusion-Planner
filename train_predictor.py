@@ -197,7 +197,7 @@ def _auto_scale_train_epochs(
     base_global_batch: int,  # B_0 = 2048
     base_epochs: int,  # E_0 = 500
     current_global_batch: int,  # B = 실제 글로벌 배치
-    beta: float = 1.,
+    beta: float = 0.4,
     clamp_min: Optional[int] = 1,
     clamp_max: Optional[int] = None,
 ) -> int:
@@ -922,6 +922,8 @@ def _scale_learning_rate_and_epochs(
     # DataLoader가 실제로 사용할 글로벌 배치(정수 배수)로 계산
     current_global_batch = _effective_global_batch(args.batch_size, world_size)
     scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
+    # scale 의 최소값을 1로 고정해서, 배치 작아질 때는 LR 감소 없음
+    scale = max(1.0, scale)
     args.learning_rate = BASE_LR * scale
 
     # 전체 학습 epoch 수를 글로벌 배치에 맞게 조정
