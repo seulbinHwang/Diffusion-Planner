@@ -2017,39 +2017,28 @@ def _log_and_save_on_rank0(
     best_loss: float,
     global_rank: int,
 ) -> float:
-    """rank 0에서 epoch 로그를 기록하고, 필요 시 체크포인트와 아티팩트를 저장한다.
-
-    DeepSpeed 모드와 일반(PyTorch/DDP) 모드를 나눠서 처리한다.
-      - use_deepspeed=True:
-        · DeepSpeed 엔진의 save_checkpoint(...) 를 호출해서
-          ZeRO-2 상태까지 포함한 checkpoint 를 저장하고,
-        · 같은 디렉터리에 latest.pth / best.pth 메타 파일도 함께 만든다.
-        · 그런 뒤, 해당 폴더/파일을 W&B 아티팩트로 업로드한다.
-      - use_deepspeed=False:
-        · 기존 PyTorch save_model() 로 latest.pth / best.pth 를 저장하고,
-        · 동일 파일을 W&B 아티팩트(latest / best)로 업로드한다.
-    """
     if global_rank != 0:
         return best_loss
 
-    # 1) W&B / TensorBoard 로그
+    # 1) 메트릭 로그
     wandb_logger.log_metrics(metrics, step=epoch + 1)
 
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
-    if (epoch + 1) % int(args.save_utd) != 1:
+    save_interval: int = max(1, int(getattr(args, "save_utd", 1)))
+    # 예: save_interval=1 → 매 epoch 저장, 5 → 5 epoch마다 저장
+    if (epoch + 1) % save_interval != 0:
         return best_loss
 
-    # 3) best 갱신 여부 판단
+    # 3) best 갱신 여부
     save_best = False
     if train_total_loss < best_loss:
         best_loss = train_total_loss
         save_best = True
 
-    # 4) 모드별로 실제 체크포인트 저장 (로컬)
+    # 4) 로컬 체크포인트 저장
     if use_deepspeed:
-        # DeepSpeedEngine 에게 직접 저장을 맡긴다.
         _save_deepspeed_checkpoint_for_epoch(
             diffusion_planner=diffusion_planner,
             save_path=save_path,
@@ -2062,7 +2051,6 @@ def _log_and_save_on_rank0(
         )
         print(f"[DeepSpeed] Checkpoint saved in {save_path}\n")
     else:
-        # PyTorch / DDP 기존 경로
         save_model(
             diffusion_planner,
             optimizer,
@@ -2076,7 +2064,7 @@ def _log_and_save_on_rank0(
         )
         print(f"Model saved in {save_path}\n")
 
-    # 5) 로컬 저장 후 W&B 아티팩트 업로드 (rank 0 전용)
+    # 5) W&B 아티팩트 업로드
     _log_wandb_checkpoint_artifacts(
         args=args,
         save_path=save_path,
@@ -2262,24 +2250,23 @@ def _finalize_training_cleanup(
     global_rank: int,
     wandb_logger: Logger,
 ) -> None:
-    """학습이 끝난 뒤, 분산 동기화와 wandb/TensorBoard/로컬 파일 정리를 수행한다.
+    """학습이 끝난 뒤, 분산 동기화와 wandb/TensorBoard/로컬 파일 정리를 수행한다."""
+    # 1) 분산 학습일 때만 barrier 호출
+    if ddp.is_dist_avail_and_initialized():
+        torch.distributed.barrier()
 
-    Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        global_rank: 전체 프로세스 기준 번호.
-        wandb_logger: TensorBoardLogger 래퍼.
-    """
-    # 모든 rank에서 학습 루프가 끝날 때까지 대기
-    torch.distributed.barrier()
-
-    if args.use_wandb:
+    # 2) W&B / TensorBoard 종료
+    if args.use_wandb and wandb.run is not None:
         wandb.finish()
-        if global_rank == 0:
-            wandb_logger.finish()
+    if global_rank == 0:
+        wandb_logger.finish()
 
-    torch.distributed.barrier()
+    if ddp.is_dist_avail_and_initialized():
+        torch.distributed.barrier()
 
-    if global_rank == 0 and args.save_path:
+    # 3) 로컬 체크포인트/로그 삭제는 옵션으로만 수행
+    if (global_rank == 0 and args.save_path and
+            getattr(args, "cleanup_local_artifacts_after_train", False)):
         print("[CLEANUP] 훈련 종료 후 로컬 체크포인트 및 로그 정리 시작")
         for f in ["latest.pth", "best.pth", "args.json"]:
             p = os.path.join(args.save_path, f)
@@ -2565,40 +2552,12 @@ def _download_wandb_checkpoint_to_local(
     resume_alias: str,
     checkpoint_filename: str,
 ) -> str:
-    """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다.
-
-    처리 흐름:
-      1) f"{entity}/{project}/{collection_name}:{resume_alias}" 경로로 아티팩트를 찾는다.
-      2) 원본 Run 의 config 에서 'save_path' 를 읽어, 그 경로를 기준 디렉터리로 사용한다.
-      3) 동일한 이름의 파일(checkpoint_filename)이 이미 있으면 지우고,
-         다시 다운로드 받아 덮어쓴다.
-      4) 다운로드가 끝나면, save_path 안에서 checkpoint_filename 이 실제로 존재하는지 확인한다.
-         - 없다면 os.listdir(save_path) 로 파일 목록(list[str])을 찍어주고
-           FileNotFoundError 를 던진다.
-      5) 마지막으로 model_path 의 상위 디렉터리(체크포인트가 들어 있는 폴더 절대경로)를
-         반환한다.
-
-    Args:
-        api: wandb.Api 인스턴스.
-        entity: W&B entity 이름. 예: 'jksg01019-naver-labs'.
-        project: W&B project 이름. 예: 'Diffusion-Planner'.
-        collection_name: 모델 컬렉션 이름. 예: f"{args.name}_latest-model".
-        resume_alias: 사용할 아티팩트 별칭. 예: 'latest', 'best'.
-        checkpoint_filename: 내려받을 파일 이름. 예: 'latest.pth'.
-
-    Returns:
-        save_path: str
-            - latest.pth / best.pth 가 들어 있는 디렉터리의 절대경로.
-    """
+    """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다."""
     artifact_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
     print(f"아티팩트 경로에서 가져오는 중: {artifact_path}")
-    # Public API를 통해 아티팩트 객체를 가져옵니다.
     artifact = api.artifact(artifact_path, type='model')
 
-    # 이 아티팩트를 생성한 원본 Run을 가져옵니다.
     source_run = artifact.logged_by()
-
-    # 원본 Run의 config에서 save_path를 가져옵니다.
     if 'save_path' not in source_run.config:
         raise ValueError("원본 Run의 config에 'save_path'가 없습니다.")
 
@@ -2606,38 +2565,66 @@ def _download_wandb_checkpoint_to_local(
     print(f"원본 Run의 config에서 save_path를 찾았습니다: {save_path}")
     os.makedirs(save_path, exist_ok=True)
 
-    # 다운로드될 체크포인트 파일의 전체 경로를 지정합니다.
     target_file_path = os.path.join(save_path, checkpoint_filename)
-
-    # 만약 해당 경로에 파일이 이미 존재하면, 덮어쓰기를 위해 삭제합니다.
     if os.path.exists(target_file_path):
         print(f"기존 파일 '{target_file_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
         os.remove(target_file_path)
 
-    # 아티팩트 파일을 다운로드하기 위해 임시 Run이 필요합니다.
-    download_run = wandb.init(
-        project=project,
-        name=f"resume_run_download_{collection_name}",
-        resume="allow",
-    )
-    # 현재 Run에서 사용할 아티팩트를 지정합니다.
-    artifact_for_download = download_run.use_artifact(artifact,
-                                                      aliases=[resume_alias])
-    # 원본 save_path에 아티팩트 파일을 다운로드합니다.
-    artifact_for_download.download(root=save_path)
-    download_run.finish()
-    print(f"아티팩트 '{artifact_path}'을(를) {save_path}에 다운로드했습니다.")
+    # rank 0만 별도 run을 만들어서 use_artifact 호출
+    rank_str = os.environ.get("RANK", "0")
+    try:
+        rank = int(rank_str)
+    except ValueError:
+        rank = 0
 
-    # 다운로드된 체크포인트의 전체 경로를 설정합니다.
-    model_path = os.path.join(save_path, checkpoint_filename)
-    if not os.path.exists(model_path):
-        downloaded_files = os.listdir(save_path)  # shape: (N,) list[str]
+    download_run = None
+    if rank == 0:
+        download_run = wandb.init(
+            project=project,
+            name=f"resume_run_download_{collection_name}",
+            resume="allow",
+        )
+        artifact_for_download = download_run.use_artifact(
+            artifact,
+            aliases=[resume_alias],
+        )
+    else:
+        # 다른 rank는 그냥 Artifact 객체로 다운로드만 수행
+        artifact_for_download = artifact
+
+    artifact_dir = artifact_for_download.download(root=save_path)
+    if download_run is not None:
+        download_run.finish()
+
+    print(f"아티팩트 '{artifact_path}'을(를) {artifact_dir}에 다운로드했습니다.")
+
+    # 1) checkpoint 파일을 save_path 루트로 복사
+    src_ckpt_path = os.path.join(artifact_dir, checkpoint_filename)
+    if os.path.exists(src_ckpt_path):
+        shutil.copy2(src_ckpt_path, target_file_path)
+
+    # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
+    for tag in ("latest", "best"):
+        src_dir = os.path.join(artifact_dir, tag)
+        if os.path.isdir(src_dir):
+            dst_dir = os.path.join(save_path, tag)
+            if os.path.isdir(dst_dir):
+                shutil.rmtree(dst_dir)
+            shutil.copytree(src_dir, dst_dir)
+
+    if not os.path.exists(target_file_path):
+        downloaded_files = []
+        if os.path.isdir(artifact_dir):
+            for root, dirs, files in os.walk(artifact_dir):
+                for name in files:
+                    rel = os.path.relpath(os.path.join(root, name),
+                                          artifact_dir)
+                    downloaded_files.append(rel)
         raise FileNotFoundError(
-            f"다운로드된 아티팩트 디렉터리에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: {save_path}. "
-            f"사용 가능한 파일: {downloaded_files}")
+            f"다운로드된 아티팩트에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: "
+            f"artifact_dir={artifact_dir}. 예시 파일들: {downloaded_files[:10]}")
 
-    # save_path: latest.pth / best.pth 가 들어 있는 디렉터리
-    save_path = os.path.dirname(os.path.abspath(model_path))
+    # save_path: latest.pth / best.pth, DeepSpeed latest/best 디렉터리가 들어 있는 루트
     return save_path
 
 
