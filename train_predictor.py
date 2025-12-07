@@ -350,6 +350,7 @@ def purge_collection(api, entity, project, coll_name):
 
     print(f"[PURGE] {coll_name}: 삭제 완료 {deleted_count}개, 실패 {failed_count}개")
 
+
 def _prune_old_wandb_artifact_versions(
     collection_name: str,
     alias: str,
@@ -399,10 +400,7 @@ def _prune_old_wandb_artifact_versions(
                     f"[PRUNE] {collection_name}: 이전 버전 {art.id} 삭제 실패 - {str(e)}"
                 )
     except Exception as e:
-        print(
-            f"[PRUNE] {collection_name}: 버전 정리 중 오류 발생 - {str(e)}"
-        )
-
+        print(f"[PRUNE] {collection_name}: 버전 정리 중 오류 발생 - {str(e)}")
 
 
 # --- put this in a utils file or near your optimizer build code ---
@@ -1898,6 +1896,7 @@ def _train_one_epoch(
     epoch_time_sec = time.perf_counter() - epoch_t0
     return train_loss, train_total_loss, epoch_time_sec
 
+
 def _log_wandb_checkpoint_artifacts(
     args: argparse.Namespace,
     save_path: Optional[str],
@@ -2003,6 +2002,7 @@ def _log_wandb_checkpoint_artifacts(
             alias="best",
         )
 
+
 def _log_and_save_on_rank0(
     epoch: int,
     args: argparse.Namespace,
@@ -2087,7 +2087,6 @@ def _log_and_save_on_rank0(
     )
 
     return best_loss
-
 
 
 def _run_training_loop(
