@@ -2131,7 +2131,7 @@ def _run_training_loop(
     Returns:
         best_loss: 학습 종료 시의 best loss 값.
     """
-    elapsed_training_time = 0.0
+    elapsed_training_time_hour = 0.0
     for epoch in range(init_epoch, train_epochs):
         # 1) 한 epoch 학습
         train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
@@ -2145,10 +2145,10 @@ def _run_training_loop(
             model_ema=model_ema,
             aug=aug,
         )
-        elapsed_training_time += epoch_elapsed_time_sec
+        elapsed_training_time_hour += epoch_elapsed_time_sec / 3600.0
         # 2) epoch당 처리 속도 계산
-        data_process_per_sec = data_num_in_a_epoch / max(epoch_elapsed_time_sec,
-                                                        1e-9)
+        data_process_per_sec = data_num_in_a_epoch / max(
+            epoch_elapsed_time_sec, 1e-9)
         """ train_loss: Dict[str, float]
         <diffusion_loss_func 가 출력해주는 loss_dict>
             - neighbor_prediction_loss : 이웃 예측 손실 텐서
@@ -2208,7 +2208,7 @@ def _run_training_loop(
         speed_info = {
             "epoch_elapsed_time_sec": epoch_elapsed_time_sec,
             "data_process_per_sec": data_process_per_sec,
-            "elapsed_training_time": elapsed_training_time,
+            "elapsed_training_time_hour": elapsed_training_time_hour,
         }
         metrics: Dict[str, float] = {}
         # add "info_dict/" prefix
@@ -2240,7 +2240,7 @@ def _run_training_loop(
             epoch=epoch,
             args=args,
             train_total_loss=train_total_loss,
-            metrics=metrics, # Dict[str, float]
+            metrics=metrics,  # Dict[str, float]
             wandb_logger=wandb_logger,
             diffusion_planner=diffusion_planner,
             optimizer=optimizer,
