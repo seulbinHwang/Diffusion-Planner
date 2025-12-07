@@ -1845,7 +1845,7 @@ def _train_one_epoch(
     Returns:
         train_loss: key별 epoch 평균 손실 딕셔너리. 각 값은 scalar float.
         train_total_loss: 최종 합 손실 scalar float.
-        epoch_time_sec: 해당 epoch에 걸린 시간(초).
+        epoch_elapsed_time_sec: 해당 epoch에 걸린 시간(초).
     """
     # train_epoch 안에서 각 step 배치 텐서는 대략
     #   ego_agent_past: (B, T_past, 11)
@@ -1893,8 +1893,8 @@ def _train_one_epoch(
         torch.cuda.synchronize()
         torch.distributed.barrier()
 
-    epoch_time_sec = time.perf_counter() - epoch_t0
-    return train_loss, train_total_loss, epoch_time_sec
+    epoch_elapsed_time_sec = time.perf_counter() - epoch_t0
+    return train_loss, train_total_loss, epoch_elapsed_time_sec
 
 
 def _log_wandb_checkpoint_artifacts(
@@ -2133,7 +2133,7 @@ def _run_training_loop(
     """
     for epoch in range(init_epoch, train_epochs):
         # 1) 한 epoch 학습
-        train_loss, train_total_loss, epoch_time_sec = _train_one_epoch(
+        train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
             epoch=epoch,
             train_epochs=train_epochs,
             train_loader=train_loader,
@@ -2146,7 +2146,8 @@ def _run_training_loop(
         )
 
         # 2) epoch당 처리 속도 계산
-        epoch_sps = samples_this_epoch / max(epoch_time_sec, 1e-9)
+        data_process_per_sec = samples_this_epoch / max(epoch_elapsed_time_sec,
+                                                        1e-9)
         """ train_loss: Dict[str, float]
         <diffusion_loss_func 가 출력해주는 loss_dict>
             - neighbor_prediction_loss : 이웃 예측 손실 텐서
@@ -2165,7 +2166,13 @@ def _run_training_loop(
         - loss_dict : 최종 합 손실 텐서.
         """
         # 3) lr_dict / metrics 구성
-        info_dict: Dict[str, float] = {'lr': optimizer.param_groups[0]['lr']}
+        info_dict: Dict[str, float] = {
+            'lr': optimizer.param_groups[0]['lr'],
+            "total_train_epochs": train_epochs,
+            "batch_num_in_epoch": len(train_loader),
+            "total_batch_num_of_all_epochs": train_epochs * len(train_loader),
+            "global_batch_size": global_batch_size,
+        }
         weight_dict = {}
         direct_loss_dict = {}
         integration_loss_dict = {}
@@ -2198,10 +2205,8 @@ def _run_training_loop(
                        "integration_loss", "constraint_loss"):
                 loss_dict[k] = v
         speed_info = {
-            "epoch_time_sec": epoch_time_sec,
-            "epoch_samples_per_sec": epoch_sps,
-            "epoch_batches": len(train_loader),
-            "global_batch_size": global_batch_size,
+            "epoch_elapsed_time_sec": epoch_elapsed_time_sec,
+            "data_process_per_sec": data_process_per_sec,
         }
         metrics: Dict[str, float] = {}
         # add "info_dict/" prefix
@@ -2226,14 +2231,14 @@ def _run_training_loop(
         metrics.update({f"loss_dict/{k}": v for k, v in loss_dict.items()})
 
         # add "speed_info/" prefix
-        metrics.update({f"spped_info/{k}": v for k, v in speed_info.items()})
+        metrics.update({f"speed_info/{k}": v for k, v in speed_info.items()})
 
         # 4) rank 0에서 로그 및 체크포인트/아티팩트 저장
         best_loss = _log_and_save_on_rank0(
             epoch=epoch,
             args=args,
             train_total_loss=train_total_loss,
-            metrics=metrics,
+            metrics=metrics, # Dict[str, float]
             wandb_logger=wandb_logger,
             diffusion_planner=diffusion_planner,
             optimizer=optimizer,
