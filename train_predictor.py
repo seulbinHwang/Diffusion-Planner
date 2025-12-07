@@ -840,12 +840,12 @@ class DiffusionPlannerCollate:
     # 0-7-1) agent keep 마스크 계산
     # ------------------------------------------------------------------
     def _compute_keep_agent_mask(
-        self,
-        center_xy: np.ndarray,          # (B, 2)
-        agents_xy: np.ndarray,          # (B, max_agent_num, 2)
-        agent_len_arr: np.ndarray,      # (B,)
-        max_agent_num: int,
-        agent_valid_mask: np.ndarray,   # (B, max_agent_num)
+            self,
+            center_xy: np.ndarray,  # (B, 2)
+            agents_xy: np.ndarray,  # (B, max_agent_num, 2)
+            agent_len_arr: np.ndarray,  # (B,)
+            max_agent_num: int,
+            agent_valid_mask: np.ndarray,  # (B, max_agent_num)
     ) -> np.ndarray:
         """중심 기준 거리로 agent 를 남길지 여부를 계산한다.
 
@@ -886,17 +886,16 @@ class DiffusionPlannerCollate:
         if max_agent_num <= 0:
             return np.zeros((batch_size, 0), dtype=bool)
 
-        radius_sq: float = float(self.center_crop_radius_m) ** 2
+        radius_sq: float = float(self.center_crop_radius_m)**2
 
         # diff_agent: (B, max_agent_num, 2)
         diff_agent = agents_xy - center_xy[:, None, :]
         # dist2_agent: (B, max_agent_num)
-        dist2_agent = (diff_agent ** 2).sum(axis=-1)
+        dist2_agent = (diff_agent**2).sum(axis=-1)
 
         # 유효한 자리 + 반경 안에 있는 agent 만 남김
         keep_agent_mask = agent_valid_mask & (dist2_agent <= radius_sq)
         return keep_agent_mask
-
 
     # ------------------------------------------------------------------
     # 0-7-2) lane keep 마스크 계산
@@ -1123,19 +1122,19 @@ class DiffusionPlannerCollate:
             - agent_valid_mask: (B, max_agent_num) True=해당 칸에 agent 있음
         """
         agent_valid_mask, _ = self._build_agent_valid_mask(
-            agent_len_arr=agent_len_arr, # (B,)
-            max_agent_num=max_agent_num, # int
+            agent_len_arr=agent_len_arr,  # (B,)
+            max_agent_num=max_agent_num,  # int
         )
         """
             - center_xy: (B, 2) 새 중심 좌표.
             - center_agent_idx: (B,) 샘플마다 선택된 중심 agent 인덱스.
         """
         center_xy, center_agent_idx = self._maybe_update_center_by_npc(
-            center_xy=center_xy, # (B, 2)
-            agents_xy=agents_xy, # (B, max_agent_num, 2)
-            agent_len_arr=agent_len_arr, # (B,)
-            agent_valid_mask=agent_valid_mask, # (B, max_agent_num)
-            max_agent_num=max_agent_num, # int
+            center_xy=center_xy,  # (B, 2)
+            agents_xy=agents_xy,  # (B, max_agent_num, 2)
+            agent_len_arr=agent_len_arr,  # (B,)
+            agent_valid_mask=agent_valid_mask,  # (B, max_agent_num)
+            max_agent_num=max_agent_num,  # int
         )
         # keep_agent_mask: (B, max_agent_num)
         keep_agent_mask = self._compute_keep_agent_mask(
@@ -1165,9 +1164,9 @@ class DiffusionPlannerCollate:
             agent_len_arr=agent_len_arr,
             lane_len_arr=lane_len_arr,
             static_len_arr=static_len_arr,
-            keep_agent_mask=keep_agent_mask, # (B, max_agent_num)
-            keep_lane_mask=keep_lane_mask, # (B, max_lane_num)
-            keep_static_mask=keep_static_mask, # (B, max_static_num)
+            keep_agent_mask=keep_agent_mask,  # (B, max_agent_num)
+            keep_lane_mask=keep_lane_mask,  # (B, max_lane_num)
+            keep_static_mask=keep_static_mask,  # (B, max_static_num)
         )
 
     # ------------------------------------------------------------------
