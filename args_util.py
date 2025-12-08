@@ -176,6 +176,51 @@ def get_args():
                         type=int,
                         help='fix random sampler_epoch_offset',
                         default=0)
+
+    # ===== 새 학습 파이프라인(Stage 1/2/3) 설정 =====
+    parser.add_argument(
+        '--stage1_ratio',
+        type=float,
+        default=0.65,
+        help='전체 업데이트 step 중 Stage1 비율')
+    parser.add_argument(
+        '--stage2_ratio',
+        type=float,
+        default=0.25,
+        help='전체 업데이트 step 중 Stage2 비율')
+    parser.add_argument(
+        '--stage3_ratio',
+        type=float,
+        default=0.10,
+        help='전체 업데이트 step 중 Stage3 비율')
+    parser.add_argument(
+        '--stage2_lr_scale',
+        type=float,
+        default=0.3333,
+        help='Stage2/3 기본 학습률 비율 (Stage1 lr * 이 값)')
+    parser.add_argument(
+        '--stage3_encoder_local_lr_scale',
+        type=float,
+        default=0.1,
+        help='Stage3에서 로컬 인코더(Group A) 추가 축소 비율')
+    # --- Stage별 batch size (global 기준) ---
+    parser.add_argument(
+        '--stage1_batch_size',
+        type=int,
+        default=None,
+        help='Stage1에서 사용할 global batch size. None이면 batch_size와 동일')
+    parser.add_argument(
+        '--stage2_batch_size',
+        type=int,
+        default=None,
+        help='Stage2에서 사용할 global batch size. None이면 batch_size와 동일')
+    parser.add_argument(
+        '--stage3_batch_size',
+        type=int,
+        default=None,
+        help='Stage3에서 사용할 global batch size. None이면 batch_size와 동일')
+
+
     parser.add_argument('--weight_decay',
                         type=float,
                         default=1e-2,
@@ -353,6 +398,13 @@ def get_args():
                         default=True,
                         type=boolean)
     args = parser.parse_args()
+    # Stage별 batch size 기본값 세팅 (미지정 시 전역 batch_size 재사용)
+    if args.stage1_batch_size is None:
+        args.stage1_batch_size = args.batch_size
+    if args.stage2_batch_size is None:
+        args.stage2_batch_size = args.batch_size
+    if args.stage3_batch_size is None:
+        args.stage3_batch_size = args.batch_size
     if not args.use_direct_loss:
         assert not args.use_guidance and not args.use_feasible_blend, \
             "use_direct_loss가 False인 경우, use_guidance와 use_feasible_blend는 모두 False여야 합니다."

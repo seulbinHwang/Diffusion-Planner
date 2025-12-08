@@ -33,14 +33,18 @@ from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from requests.exceptions import HTTPError
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
-from diffusion_planner.utils.lr_schedule import CosineAnnealingWarmUpRestarts, build_pytorch_warmup_cosine_scheduler
+from diffusion_planner.utils.lr_schedule import (
+    CosineAnnealingWarmUpRestarts,
+    build_pytorch_warmup_cosine_scheduler,
+    build_stagewise_warmup_cosine_scheduler,
+)
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.utils.dataset import DiffusionPlannerData
 from diffusion_planner.utils import ddp
 import time
-from diffusion_planner.train_epoch import train_epoch
+from diffusion_planner.train_epoch import train_epoch, _get_stage_for_step
 import os
 
 import math
@@ -192,7 +196,6 @@ def _effective_global_batch(batch_size: int, world_size: int) -> int:
     return per_rank * world_size  # drop_last 정합 반영
 
 
-# === [NEW] Epoch auto-scaling by global batch ===============================
 def _auto_scale_train_epochs(
     base_global_batch: int,  # B_0 = 2048
     base_epochs: int,  # E_0 = 500
@@ -477,6 +480,93 @@ def discover_extra_no_weight_decay_names(
     return sorted(extra)
 
 
+def _maybe_split_param_groups_by_stage(
+    model: nn.Module,
+    param_groups: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Diffusion_Planner일 때 Encoder/Decoder 역할 기준으로 param_group 을 쪼갠다.
+
+    원래 param_groups_weight_decay(...)가 만든 그룹은
+    단순히 weight_decay 유무 관점에서만 나뉘어 있다.
+    이 함수는 여기에 한 번 더 규칙을 얹어서
+
+      - encoder_local  (Group A: 로컬 인코더)
+      - encoder_global (Group B: 글로벌 인코더)
+      - decoder        (Group C: 디코더)
+      - others         (그 외 나머지)
+
+    네 그룹 중 하나로 묶이도록 param_group을 다시 나눈다.
+    이후 Stage1/2/3에서 그룹별로 다른 학습률 비율을 주기 위해 사용된다.
+
+    Args:
+        model: 학습할 모델 객체.
+            Diffusion_Planner 인스턴스인 경우에만 Stage 그룹 분할을 적용한다.
+            그 외 모델 타입이면 param_groups 를 그대로 반환한다.
+        param_groups: timm.param_groups_weight_decay(...) 가 돌려준 파라미터 그룹 리스트.
+            각 원소는 딕셔너리이며
+              - "params": List[nn.Parameter]
+                * Linear weight: (out_dim, in_dim)
+                * bias / LayerNorm weight: (dim,)
+                * Conv weight: (C_out, C_in, kH, kW)
+              - "weight_decay": float
+              - "lr": float
+            같은 정보를 가진다.
+
+    Returns:
+        List[Dict[str, Any]]:
+            Stage 역할별로 쪼개진 새로운 파라미터 그룹 리스트.
+            각 그룹 딕셔너리에는 기존 키에 더해
+              - "stage_group": str
+                * "encoder_local" / "encoder_global" / "decoder" / "others"
+            가 추가된다.
+            Diffusion_Planner 가 아닐 때는 원래 param_groups 를 그대로 돌려준다.
+    """
+
+    if not isinstance(model, Diffusion_Planner):
+        return param_groups
+
+    try:
+        local_ids = {id(p) for p in model.iter_group_encoder_local_parameters()}
+        global_ids = {
+            id(p) for p in model.iter_group_encoder_global_parameters()
+        }
+        decoder_ids = {id(p) for p in model.iter_group_decoder_parameters()}
+    except AttributeError:
+        return param_groups
+
+    new_param_groups: List[Dict[str, Any]] = []
+
+    for group in param_groups:
+        grouped_params: Dict[str, List[nn.Parameter]] = {
+            "encoder_local": [],
+            "encoder_global": [],
+            "decoder": [],
+            "others": [],
+        }
+        for param in group["params"]:
+            pid = id(param)
+            if pid in local_ids:
+                grouped_params["encoder_local"].append(param)
+            elif pid in global_ids:
+                grouped_params["encoder_global"].append(param)
+            elif pid in decoder_ids:
+                grouped_params["decoder"].append(param)
+            else:
+                grouped_params["others"].append(param)
+
+        for stage_group_name, params_list in grouped_params.items():
+            if not params_list:
+                continue
+            new_group: Dict[str, Any] = {
+                key: value for key, value in group.items() if key != "params"
+            }
+            new_group["params"] = params_list
+            new_group["stage_group"] = stage_group_name
+            new_param_groups.append(new_group)
+
+    return new_param_groups or param_groups
+
+
 def build_adamw_with_param_groups(
     model: nn.Module,
     lr: float,
@@ -484,78 +574,125 @@ def build_adamw_with_param_groups(
     include_seed_params: bool = True,
     use_8bit_optimizer: bool = False,
 ) -> Tuple[optim.Optimizer, List[str]]:
-    """AdamW 옵티마이저와 파라미터 그룹을 만드는 헬퍼 함수.
+    """AdamW(또는 AdamW8bit) 옵티마이저와 파라미터 그룹을 한 번에 만든다.
 
-    이 함수는 모델을 훑어서
-      1) 감쇠를 적용할 가중치
-      2) 감쇠를 적용하지 않을 가중치(편향, 정규화 계층, 토큰/위치 임베딩 등)
-    를 자동으로 나눈 뒤, 한 번에 AdamW 옵티마이저를 만들어 준다.
+    처리 순서는 다음과 같다.
+
+      1) discover_extra_no_weight_decay_names(...) 로
+         토큰/위치 임베딩, seed 토큰 등을 찾아서 감쇠 제외 목록(extra_nwd)을 만든다.
+      2) timm.param_groups_weight_decay(...) 를 호출해
+         weight_decay 를 적용할 그룹 / 적용하지 않을 그룹으로 나눈다.
+         각 그룹의 "params" 리스트 안에는
+           - Linear weight: (out_dim, in_dim)
+           - bias / Norm 계층 weight: (dim,)
+           - Conv weight: (C_out, C_in, kH, kW)
+         와 같은 nn.Parameter 들이 들어 있다.
+      3) Diffusion_Planner 인 경우
+         _maybe_split_param_groups_by_stage(...) 를 통해
+         각 그룹 (WD를 적용할 그룹 & 적용하지 않을 그룹) 에 "stage_group" 키를 붙여
+         encoder_local / encoder_global / decoder / others 로 나눈다.
+      4) 각 그룹 (WD를 적용할 그룹 & 적용하지 않을 그룹) 에
+         - "lr"     : Stage1 기준 학습률(lr)
+         - "lr_max" : 나중에 스케줄러가 사용할 기준 lr
+         - "wd_max" : 기준 weight_decay
+         - "lr_scale": Stage1 기준 비율(초기값 1.0)
+         을 세팅한다.
+      5) use_8bit_optimizer 플래그에 따라
+         - bitsandbytes.optim.AdamW8bit
+         - 또는 torch.optim.AdamW
+         인스턴스를 생성한다.
 
     Args:
-        model: 학습할 모델 객체(nn.Module). 내부 파라미터 텐서의 예시는
-            - 선형 계층 weight: (out_dim, in_dim)
-            - 선형 계층 bias / LayerNorm weight: (dim,)
-            - 컨볼루션 weight: (C_out, C_in, kH, kW) 와 같은 형태.
-        lr: 기준 학습률. 각 파라미터 그룹의 "lr"와 "lr_max"에 동일하게 들어간다.
-        weight_decay: 가중치 감쇠 값. 감쇠를 적용할 그룹에만 사용된다.
-        include_seed_params: seeds/ego_fut_seeds 같은 학습용 토큰 파라미터를
-            감쇠 제외 목록에 포함할지 여부.
-        use_8bit_optimizer: True이면 8비트 AdamW(bnb.AdamW8bit)를 사용한다.
+        model: 학습 대상 모델(nn.Module).
+            .named_parameters() 를 통해 파라미터 텐서를 순회할 수 있어야 한다.
+        lr: Stage1 기준 학습률. param_group["lr"]와 ["lr_max"]에 사용된다.
+        weight_decay: 감쇠 값. 감쇠를 적용할 그룹의 "weight_decay"에 들어간다.
+        include_seed_params: True 이면
+            seeds/ego_fut_seeds 같은 학습용 쿼리 토큰도 감쇠 제외 목록에 포함한다.
+        use_8bit_optimizer: True 이면 bitsandbytes.AdamW8bit 를 사용한다.
+            이때도 PyTorch AdamW 와 동일하게
+            Iterable[Tensor] 또는 Iterable[Dict[str, Any]] 형태의
+            params/param_groups 를 넘길 수 있다.
 
     Returns:
         Tuple[optim.Optimizer, List[str]]:
-            - optim: AdamW 또는 8비트 AdamW 옵티마이저 인스턴스.
-              내부 파라미터 그룹의 각 원소는
-                · "params": List[Tensor]  (각 텐서 shape 예: (out_dim, in_dim), (dim,) 등)
-                · "weight_decay": float
-                · "lr": float
-                · "lr_max": float
-                · "wd_max": float
-              와 같은 키를 가진다.
-            - extra_nwd: 감쇠를 적용하지 않을 파라미터 이름 목록.
-
-    TODO
-        - 특정 모듈의 lr을 조절할 수 있는 기능 추가 고려
+            - optimizer:
+                · torch.optim.AdamW 또는 bnb.optim.AdamW8bit 인스턴스.
+                · 내부 param_groups[*]["params"] 리스트에는
+                  (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW) 등의
+                  shape 를 가진 파라미터 텐서들이 들어 있다.
+            - extra_nwd:
+                discover_extra_no_weight_decay_names(...) 로 찾은
+                감쇠 제외 파라미터 이름 목록.
     """
     # extra_nwd: List[str], 감쇠 제외로 추가할 파라미터 이름들
     extra_nwd = discover_extra_no_weight_decay_names(
         model, include_seed_params=include_seed_params)
-
-    # param_groups: List[Dict[str, Any]]
-    #   각 그룹은 "params" 리스트 안에 다양한 shape의 파라미터 텐서를 가진다.
-    #   예) Linear weight: (out_dim, in_dim), LayerNorm weight: (dim,), conv weight: (C_out, C_in, kH, kW)
-    param_groups = param_groups_weight_decay(
+    """ param_groups : List[Dict[str, Any]] # 길이 2 
+    decay 거는 그룹
+        param_groups[0] == {
+            "params": [p0, p1, p2, ..., pN],  # nn.Parameter 리스트
+            "weight_decay": 1e-2,            # args.weight_decay
+        }
+    decay 안 거는 그룹
+        param_groups[1] == {
+            "params": [q0, q1, q2, ..., qM],  # nn.Parameter 리스트
+            "weight_decay": 0.0,              # decay 안 거는 그룹
+        }    
+    """
+    param_groups: List[Dict[str, Any]] = param_groups_weight_decay(
         model,
         weight_decay=weight_decay,
         no_weight_decay_list=extra_nwd,
     )
-
-    # 공통 LR / 기준값 부여
-    for g in param_groups:
-        g["lr"] = lr  # η_max(B): 현재 배치에서의 최대 학습률
-        g["lr_max"] = float(lr)  # 스케줄 시작 시 기준 학습률
-        g["wd_max"] = float(g.get("weight_decay", 0.0))  # 그룹별 기준 감쇠 값
+    # Stage 그룹으로 세분화
+    """ param_groups : List[Dict[str, Any]] # 최대 2(원래 그룹 수) × 4(stage_group 수) = 최대 8개
+    
+    decay 거는 그룹 VS 안 거는 그룹 각각에 대해
+        - encoder_local / encoder_global / decoder / others 로 나뉘어짐
+        
+예
+    param_groups[0] == {
+        "params": [...],           # decay + encoder_local
+        "weight_decay": 1e-2,
+        "stage_group": "encoder_local",
+    }
+    
+    param_groups[1] == {
+        "params": [...],           # decay + encoder_global
+        "weight_decay": 1e-2,
+        "stage_group": "encoder_global",
+    }
+    """
+    param_groups: List[Dict[str, Any]] = _maybe_split_param_groups_by_stage(
+        model, param_groups)
+    # Stage1 기준 lr, wd, lr_scale 초기화
+    for group in param_groups:
+        # group: Dict[str, Any]
+        group["lr"] = lr
+        # stage_group 키가 없으면 → "others" 로 넣음
+        group.setdefault("stage_group", "others")
+        group["lr_max"] = float(lr)
+        group["wd_max"] = float(group.get("weight_decay", 0.0))
+        group.setdefault("lr_scale", 1.0)
 
     if use_8bit_optimizer:
-        # 8비트 AdamW: 내부 모멘트 텐서는 8비트 정수로 저장되지만,
-        #   파라미터 텐서 shape는 그대로 유지된다.
-        optim = bnb.optim.AdamW8bit(  # type: ignore[attr-defined]
+        optim_inst = bnb.optim.AdamW8bit(  # type: ignore[name-defined]
             param_groups,
             lr=lr,
             weight_decay=0.0,
         )
     else:
-        # 최종 옵티마이저 (전역 WD는 0.0로 두고, 그룹별 WD만 사용)
         try:
-            optim = torch.optim.AdamW(
+            optim_inst = torch.optim.AdamW(
                 param_groups,
                 fused=True,
                 weight_decay=0.0,
             )
         except (TypeError, RuntimeError):
-            optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
+            optim_inst = torch.optim.AdamW(param_groups, weight_decay=0.0)
 
-    return optim, extra_nwd
+    return optim_inst, extra_nwd
 
 
 class DiffusionPlannerCollate:
@@ -1538,58 +1675,179 @@ def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
     return global_rank, rank, world_size, use_deepspeed
 
 
+def _scale_lr_by_batch(
+    base_lr: float,
+    global_batch: int,
+    base_global_batch: int,
+) -> float:
+    """글로벌 배치 크기에 따라 학습률을 스케일링한다.
+
+    기본 아이디어:
+      - 기준 배치(base_global_batch)에서의 lr를 base_lr로 두고,
+      - 실제 배치(global_batch)에 대해
+        scale = sqrt(global_batch / base_global_batch) 를 곱해 조정한다.
+      - scale 이 1보다 작아지면 1로 올려서,
+        배치가 줄어들 때는 lr를 줄이지 않도록 막는다.
+
+    Args:
+        base_lr:
+            - shape: ()
+            - 기준이 되는 학습률 값. 예: Stage1/2/3에서 정한 base max lr.
+        global_batch:
+            - shape: ()
+            - 현재 설정에서 실제로 사용할 글로벌 배치 크기.
+        base_global_batch:
+            - shape: ()
+            - 기준이 되는 글로벌 배치 크기(예: 2048).
+
+    Returns:
+        float:
+            - shape: ()
+            - 배치 크기를 반영해 조정된 학습률 값.
+    """
+    if global_batch <= 0 or base_global_batch <= 0:
+        return float(base_lr)
+
+    scale: float = math.sqrt(float(global_batch) / float(base_global_batch))
+    scale = max(1.0, scale)
+    return float(base_lr) * scale
+
+
 def _scale_learning_rate_and_epochs(
     args: argparse.Namespace,
     world_size: int,
 ) -> Tuple[int, int]:
-    """글로벌 배치 크기에 맞춰, 학습률과 학습 epoch 수를 자동 조정한다.
+    """Stage1/2/3 기준으로 학습률과 epoch 수를 한 번에 정리한다.
 
-    한 번의 업데이트에서 사용하는 샘플 수(글로벌 배치 크기)가 커지면,
-    · 한 번 업데이트가 더 안정적으로 되지만
-    · 전체 업데이트 횟수(스텝 수)는 줄어든다.
-    이 함수는 이런 변화에 맞게 두 가지를 같이 조정한다.
+    처리 순서:
+      1) base_epochs_anchor = int(args.train_epochs)를 Stage 비율
+         (stage1_ratio/2_ratio/3_ratio)로 나눠, Stage별 base epoch 수를 만든다.
+      2) Stage별 글로벌 배치 크기를 계산한다.
+         · stageX_global_batch = _effective_global_batch(stageX_batch_size, world_size)
+      3) 각 Stage마다 _auto_scale_train_epochs(...) 를 적용해
+         base epoch → 실제 사용할 epoch 수로 바꾼다.
+      4) BASE_LR(사용자가 넣어준 learning_rate)와 Stage 비율을 곱해
+         Stage별 base max lr (stage1/2/3)을 만든 뒤,
+         기존 lr 스케일링 로직(sqrt(global_batch / BASE_GLOBAL_BATCH), 최소 1.0)을
+         그대로 적용해 최종 Stage별 max lr을 구한다.
+      5) optimizer 기본 lr과 lr_max 기준이 되는 args.learning_rate는
+         Stage1의 최종 max lr로 덮어쓴다.
 
-      1) 학습률(lr)을 글로벌 배치 비율에 따라 키운다.
-         배치가 커질수록 한 번에 더 많은 정보를 보니,
-         한 스텝에서 조금 더 크게 움직여도 안정적이라는 가정이다.
-      2) 전체 epoch 수를 줄이거나 늘려서,
-         “전체 업데이트 스텝 수”가 기준 세팅과 비슷하도록 맞춘다.
-         이렇게 하면 배치 크기를 바꿔도 학습 양이 너무 많아지거나
-         너무 적어지지 않도록 균형을 맞출 수 있다.
-
-    Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        world_size: 전체 프로세스 개수. (GPU 개수 기준)
+    이렇게 하면:
+      - train_epochs는 Stage1/2/3 epoch 합으로 자동 조정되고,
+      - args._stage{1,2,3}_epochs / _stage{1,2,3}_global_batch /
+        _stage{1,2,3}_max_lr 가 모두 채워져서
+        이후 Stage 스케줄과 LR 스케줄러에서 사용할 수 있다.
 
     Returns:
-        BASE_GLOBAL_BATCH: 기준이 되는 글로벌 배치 크기(예: 2048).
-        current_global_batch: 현재 설정에서 실제로 사용되는 글로벌 배치 크기.
+        Tuple[int, int]:
+            - BASE_GLOBAL_BATCH: 기준 글로벌 배치 크기(예: 2048).
+            - stage1_global_batch: Stage1에서 실제로 사용할 글로벌 배치 크기.
     """
-    BASE_GLOBAL_BATCH = 2048  # 기존 기준 글로벌 배치
-    BASE_LR = args.learning_rate  # 기존 기준 LR (Adam/AdamW)
+    BASE_GLOBAL_BATCH: int = 2048
 
-    # DataLoader가 실제로 사용할 글로벌 배치(정수 배수)로 계산
-    current_global_batch = _effective_global_batch(args.batch_size, world_size)
-    scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
-    # scale 의 최소값을 1로 고정해서, 배치 작아질 때는 LR 감소 없음
-    scale = max(1.0, scale)
-    args.learning_rate = BASE_LR * scale
+    # 1) Stage 비율 정규화
+    r1 = max(0.0, float(getattr(args, "stage1_ratio", 0.65)))
+    r2 = max(0.0, float(getattr(args, "stage2_ratio", 0.25)))
+    r3 = max(0.0, float(getattr(args, "stage3_ratio", 0.10)))
+    s = r1 + r2 + r3
+    if s <= 0.0:
+        r1, r2, r3 = 1.0, 0.0, 0.0
+    else:
+        r1, r2, r3 = r1 / s, r2 / s, r3 / s
 
-    # 전체 학습 epoch 수를 글로벌 배치에 맞게 조정
-    EPOCH_BETA = 1.0
-    base_epochs_anchor = int(args.train_epochs)  # 예: 360
+    # 2) 기본 epoch(anchor)를 Stage 비율로 나누기
+    base_epochs_anchor: int = int(args.train_epochs)
+    stage1_base_epochs: int = max(1, int(round(base_epochs_anchor * r1)))
+    stage2_base_epochs: int = max(0, int(round(base_epochs_anchor * r2)))
+    stage3_base_epochs: int = max(
+        0, base_epochs_anchor - stage1_base_epochs - stage2_base_epochs)
+    if stage3_base_epochs <= 0:
+        stage3_base_epochs = 1
 
-    scaled_epochs = _auto_scale_train_epochs(
-        base_global_batch=BASE_GLOBAL_BATCH,  # B_0 = 2048
-        base_epochs=base_epochs_anchor,  # E_0 = 360
-        current_global_batch=current_global_batch,  # B = 실제 글로벌 배치
+    # 3) Stage별 글로벌 배치 (DDP 정합 반영)
+    stage1_global_batch: int = _effective_global_batch(
+        int(getattr(args, "stage1_batch_size", args.batch_size)),
+        world_size,
+    )
+    stage2_global_batch: int = _effective_global_batch(
+        int(getattr(args, "stage2_batch_size", args.batch_size)),
+        world_size,
+    )
+    stage3_global_batch: int = _effective_global_batch(
+        int(getattr(args, "stage3_batch_size", args.batch_size)),
+        world_size,
+    )
+
+    args._stage1_global_batch = int(stage1_global_batch)
+    args._stage2_global_batch = int(stage2_global_batch)
+    args._stage3_global_batch = int(stage3_global_batch)
+
+    # 4) Stage별 epoch 자동 스케일링
+    EPOCH_BETA: float = 1.0
+    stage1_epochs: int = _auto_scale_train_epochs(
+        base_global_batch=BASE_GLOBAL_BATCH,
+        base_epochs=stage1_base_epochs,
+        current_global_batch=stage1_global_batch,
         beta=EPOCH_BETA,
-        clamp_min=max(1, args.warm_up_epoch + 1),
+        clamp_min=max(1, args.warm_up_epoch + 1),  # warmup 이후 최소 1 epoch 보장
         clamp_max=None,
     )
-    args.train_epochs = int(scaled_epochs)
+    stage2_epochs: int = _auto_scale_train_epochs(
+        base_global_batch=BASE_GLOBAL_BATCH,
+        base_epochs=stage2_base_epochs,
+        current_global_batch=stage2_global_batch,
+        beta=EPOCH_BETA,
+        clamp_min=1,
+        clamp_max=None,
+    )
+    stage3_epochs: int = _auto_scale_train_epochs(
+        base_global_batch=BASE_GLOBAL_BATCH,
+        base_epochs=stage3_base_epochs,
+        current_global_batch=stage3_global_batch,
+        beta=EPOCH_BETA,
+        clamp_min=1,
+        clamp_max=None,
+    )
 
-    return BASE_GLOBAL_BATCH, current_global_batch
+    args._stage1_epochs = int(stage1_epochs)
+    args._stage2_epochs = int(stage2_epochs)
+    args._stage3_epochs = int(stage3_epochs)
+    args.train_epochs = int(stage1_epochs + stage2_epochs + stage3_epochs)
+
+    BASE_LR: float = float(args.learning_rate)
+    # 5) Stage별 base max lr (사용자 기준 비율)
+    stage1_max_lr_base: float = BASE_LR * 1.0
+    stage2_max_lr_rate: float = float(getattr(
+        args, "stage2_lr_scale", 0.3333))  # Stage2 max lr 비율 (기본 1/3)
+    stage2_max_lr_base: float = BASE_LR * stage2_max_lr_rate
+    stage3_max_lr_base: float = BASE_LR * 0.25  # Stage3 max lr 비율 1/4
+
+    # 6) Stage별 글로벌 배치에 맞게 lr 스케일링
+    stage1_max_lr: float = _scale_lr_by_batch(
+        base_lr=stage1_max_lr_base,
+        global_batch=stage1_global_batch,
+        base_global_batch=BASE_GLOBAL_BATCH,
+    )
+    stage2_max_lr: float = _scale_lr_by_batch(
+        base_lr=stage2_max_lr_base,
+        global_batch=stage2_global_batch,
+        base_global_batch=BASE_GLOBAL_BATCH,
+    )
+    stage3_max_lr: float = _scale_lr_by_batch(
+        base_lr=stage3_max_lr_base,
+        global_batch=stage3_global_batch,
+        base_global_batch=BASE_GLOBAL_BATCH,
+    )
+
+    args._stage1_max_lr = float(stage1_max_lr)
+    args._stage2_max_lr = float(stage2_max_lr)
+    args._stage3_max_lr = float(stage3_max_lr)
+
+    # optimizer 기본 lr과 lr_max 기준은 Stage1 max lr를 사용
+    args.learning_rate = float(stage1_max_lr)
+
+    return BASE_GLOBAL_BATCH, stage1_global_batch
 
 
 def _prepare_save_path_and_dump_args(
@@ -1790,7 +2048,7 @@ def _build_train_loader(
                       각 배치의 텐서는 (B, ·) shape를 가진다.
     """
     # 각 rank가 보는 per-rank 배치 크기
-    batch_size_per_rank = batch_size // world_size
+    batch_size_per_rank = max(1, batch_size // max(1, world_size))
 
     train_loader = DataLoader(
         train_set,  # DiffusionPlannerData
@@ -1824,7 +2082,7 @@ def _compute_schedule_info(
         global_batch_size: 실제 글로벌 배치 크기.
         data_num_in_a_epoch: 한 epoch 동안 처리되는 샘플 개수.
     """
-    total_step_of_this_epoch = len(train_loader)
+
     total_step_of_all_epoch = args.train_epochs * total_step_of_this_epoch
 
     bs_per_rank = args.batch_size // world_size
@@ -1885,39 +2143,62 @@ def _build_model_optimizer_scheduler(
 ) -> Tuple[nn.Module, Optional[ModelEma], optim.Optimizer, Any]:
     """모델, EMA, 옵티마이저, 스케줄러를 한 번에 준비한다.
 
-    처리 흐름은 다음과 같다.
-      1) Diffusion_Planner 모델을 만들고, rank 에 해당하는 GPU 또는 CPU 로 옮긴다.
-      2) use_deepspeed 가 False 이고 args.ddp 가 True 이면,
-         모델을 PyTorch 기본 분산 래퍼(DDP)로 감싸서
-         여러 GPU가 같은 모델 복사본을 들고 gradient를 각자 가지도록 만든다.
-      3) EMA를 켜면, 모델과 똑같은 구조의 복사본을 하나 더 두고
-         매 step마다 천천히 따라가게 해서, 나중에 더 안정적인 결과를 평가할 수 있게 한다.
-      4) build_adamw_with_param_groups 로 가중치 묶음을 나누고
-         AdamW 계열 옵티마이저를 만든다. 파라미터 그룹 안의 "params" 리스트에는
-         다양한 shape의 텐서들이 들어간다.
-      5) build_pytorch_warmup_cosine_scheduler 로
-         전체 step 수(total_step_of_all_epoch)와 warmup_steps 에 맞는
-         “처음에는 천천히 올리고, 이후에는 서서히 줄이는” 학습률 스케줄을 만든다.
-      6) use_deepspeed 가 True 이면,
-         위에서 만든 모델·옵티마이저·스케줄러를 DeepSpeed 엔진으로 한 번 더 감싼다.
-         이때 DeepSpeed는 설정 파일(ds_config)에 따라
-         · 옵티마 상태를 여러 GPU에 나누어 들거나
-         · 일부를 CPU 쪽으로 옮기는 등의 메모리 최적화를 대신 처리한다.
-         DDP 모드에서는 이런 분할 없이, 각 GPU가 모델과 옵티마 상태를 그대로 들고 간다.
+    전체 흐름은 다음과 같다.
+
+      1) Diffusion_Planner 모델을 만들고
+         - args.device 가 "cuda" 이면 rank 에 해당하는 GPU 로
+         - 아니면 지정된 CPU/기타 장치로 옮긴다.
+         각 파라미터 텐서는 계층에 따라
+           * Linear weight: (out_dim, in_dim)
+           * LayerNorm weight/bias: (dim,)
+           * Conv weight: (C_out, C_in, kH, kW)
+         와 같은 shape 를 가진다.
+      2) use_deepspeed=False 이고 args.ddp=True 이면
+         torch.nn.parallel.DistributedDataParallel(DDP) 로 래핑한다.
+      3) args.use_ema=True 이면 timm.utils.ModelEma 를 생성해
+         원본 모델과 동일한 구조의 EMA 복사본을 만든다.
+         EMA 쪽 파라미터도 위와 같은 shape 를 가진다.
+      4) ddp.get_model(...) 로 DDP 래퍼를 벗겨 “실제 모델”을 얻은 뒤,
+         build_adamw_with_param_groups(...) 로
+         - encoder_local / encoder_global / decoder / others 그룹을 포함하는
+           AdamW 계열 옵티마이저를 생성한다.
+      5) build_pytorch_warmup_cosine_scheduler(...) 로
+         총 step 수(total_step_of_all_epoch)와 warmup_steps 에 맞는
+         워밍업 + 코사인 감소 학습률 스케줄러를 만든다.
+      6) use_deepspeed=True 인 경우
+         build_deepspeed_config(...) 에서 만든 설정 dict 와 함께
+         deepspeed.initialize(...) 를 호출해
+         모델/옵티마이저/스케줄러를 DeepSpeedEngine 으로 다시 감싼다.
+         이때 내부 파라미터 텐서 shape 는 원본 모델과 동일하다.
 
     Args:
         args: 학습 설정이 들어 있는 argparse.Namespace.
-        rank: 이 노드에서 사용할 GPU 인덱스.
+        rank: 이 프로세스에서 사용할 GPU 인덱스. (use_deepspeed=False 일 때만 의미 있음)
         use_deepspeed: DeepSpeed 모드 사용 여부.
         total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
-        warmup_steps: 워밍업 step 수.
-        current_global_batch : 현재 글로벌 배치 크기.
+        warmup_steps: 학습 초기에 사용할 워밍업 step 수.
+        current_global_batch: 현재 설정에서의 글로벌 배치 크기.
+            DeepSpeed 설정(build_deepspeed_config) 을 만들 때 사용된다.
 
     Returns:
-        diffusion_planner: Diffusion_Planner 또는 DeepSpeed/DDP 래핑된 모델.
-        model_ema: EMA 추적용 모델 래퍼. 사용하지 않으면 None.
-        optimizer: AdamW 또는 8bit AdamW 옵티마이저.
-        scheduler: PyTorch warmup + cosine + hold 스케줄러.
+        diffusion_planner:
+            - use_deepspeed=False:
+                · Diffusion_Planner 또는 DDP 래핑된 nn.Module.
+            - use_deepspeed=True:
+                · deepspeed.DeepSpeedEngine 인스턴스.
+        model_ema:
+            timm.utils.ModelEma 래퍼. args.use_ema=False 이면 None.
+        optimizer:
+            - use_deepspeed=False:
+                · torch.optim.AdamW 또는 bnb.optim.AdamW8bit.
+              각 param_group 의 "params" 리스트 안에는
+              (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW) 등 shape 를 가진
+              파라미터 텐서가 들어 있다.
+            - use_deepspeed=True:
+              deepspeed.initialize(...) 가 반환한 옵티마이저.
+        scheduler:
+            - PyTorch warmup+cosine 스케줄러 인스턴스 또는
+            - DeepSpeedEngine 이 감싸고 있는 스케줄러 객체.
     """
     # diffusion_planner.parameters(): 각 파라미터 텐서는
     #   (out_dim, in_dim) 또는 (dim,) 등 모델 구조에 따라 다양한 shape를 가진다.
@@ -1949,19 +2230,45 @@ def _build_model_optimizer_scheduler(
         include_seed_params=True,
         use_8bit_optimizer=getattr(args, "use_8bit_optimizer", False),
     )
-
     # param_groups[i]["params"] 리스트 안에는 다양한 shape의 파라미터 텐서들이 들어 있다.
     for pg in optimizer.param_groups:
         pg.setdefault("lr_max", float(pg["lr"]))  # 기준 LR
         pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))  # 기준 WD
 
-    scheduler = build_pytorch_warmup_cosine_scheduler(
-        optimizer,
-        total_step_of_all_epoch,
-        warmup_steps,
-        eta_min=0.2 * args.learning_rate,
-    )
+    # Stage별 step / max lr 정보가 준비되어 있으면 Stage-aware 스케줄러를 사용하고,
+    # 아니면 기존 warmup+cosine 스케줄러로 fallback 한다.
+    use_stagewise: bool = all(
+        hasattr(args, name) for name in (
+            "_stage1_total_steps",
+            "_stage2_total_steps",
+            "_stage3_total_steps",
+            "_stage1_max_lr",
+            "_stage2_max_lr",
+            "_stage3_max_lr",
+            "_total_update_steps",
+        ))
 
+    if use_stagewise:
+        total_updates: int = int(
+            getattr(args, "_total_update_steps", total_step_of_all_epoch))
+        scheduler = build_stagewise_warmup_cosine_scheduler(
+            optimizer=optimizer,
+            total_update_steps=total_updates,
+            stage1_total_steps=int(args._stage1_total_steps),
+            stage2_total_steps=int(args._stage2_total_steps),
+            stage3_total_steps=int(args._stage3_total_steps),
+            warmup_steps=int(warmup_steps),
+            stage1_max_lr=float(args._stage1_max_lr),
+            stage2_max_lr=float(args._stage2_max_lr),
+            stage3_max_lr=float(args._stage3_max_lr),
+        )
+    else:
+        scheduler = build_pytorch_warmup_cosine_scheduler(
+            optimizer,
+            total_step_of_all_epoch,
+            warmup_steps,
+            eta_min=0.2 * args.learning_rate,
+        )
     # ➕ [ADD] DeepSpeed 엔진으로 래핑 (ZeRO-2 설정은 build_deepspeed_config 로 생성)
     if use_deepspeed:
         import deepspeed  # use_deepspeed=True일 때만 import
@@ -2728,13 +3035,239 @@ def _log_and_save_on_rank0(
     return best_loss
 
 
+def _build_stage_train_loader_and_stats(
+    args: argparse.Namespace,
+    train_set: DiffusionPlannerData,
+    train_sampler: DistributedSampler,
+    world_size: int,
+) -> Tuple[int, int, DataLoader, int, int, int]:
+    """현재 Stage 기준으로 DataLoader와 epoch 통계를 만든다.
+
+    처리 순서:
+      1) _get_stage_for_step(...) 으로 전역 스텝에서 현재 Stage 번호를 구한다.
+      2) _get_stage_batch_size(...) 로 이 Stage에서 쓸 global batch size 를 정한다.
+      3) _setup_stage1_center_crop_in_args(...) 로 Stage1에서는 center crop 을 켜고,
+         Stage2/3 에서는 끈다.
+      4) _build_train_loader(...) 로 DataLoader 를 만들고,
+         · total_step_of_this_epoch = len(train_loader)
+         · batch_size_per_rank     = stage_batch_size / world_size
+         · global_batch_size       = batch_size_per_rank * world_size
+         · data_num_in_a_epoch     = total_step_of_this_epoch * global_batch_size
+         를 계산한다.
+
+    Args:
+        args: 학습 설정/상태 Namespace.
+        train_set: DiffusionPlannerData. len(train_set) = 전체 샘플 수.
+        train_sampler: DistributedSampler. 각 rank 에 서로 다른 인덱스를 배정한다.
+        world_size: 전체 프로세스(또는 GPU) 개수.
+
+    Returns:
+        stage_now: int
+            현재 전역 스텝에서 사용할 Stage 번호 (1/2/3).
+        stage_batch_size: int
+            이 Stage 에서 사용할 global batch size.
+        train_loader: DataLoader
+            각 step 에서
+              - batch: Dict[str, Tensor], 각 Tensor shape: (B, ·)
+            를 반환하는 DataLoader.
+        total_step_of_this_epoch: int
+            이번 epoch 의 step 수 = len(train_loader).
+        global_batch_size_effective: int
+            실제 한 step 에서 처리되는 샘플 수 (DDP world_size 를 고려한 값).
+        data_num_in_a_epoch: int
+            한 epoch 전체에서 처리되는 샘플 수.
+    """
+    # 1) 현재 Stage 번호와 Stage별 global batch size 결정
+    stage_now: int = _get_stage_for_step(args)
+    stage_batch_size: int = _get_stage_batch_size(args, stage_now)
+
+    # 2) Stage1 에서만 center crop 활성화
+    _setup_stage1_center_crop_in_args(
+        args=args,
+        stage=stage_now,
+    )
+
+    # 3) Stage별 batch size 로 DataLoader 생성
+    train_loader: DataLoader = _build_train_loader(
+        args=args,
+        train_set=train_set,
+        train_sampler=train_sampler,
+        batch_size=stage_batch_size,
+        world_size=world_size,
+    )
+
+    total_step_of_this_epoch: int = len(train_loader)
+    batch_size_per_rank: int = max(1, stage_batch_size // max(1, world_size))
+    global_batch_size_effective: int = batch_size_per_rank * max(1, world_size)
+    data_num_in_a_epoch: int = total_step_of_this_epoch * global_batch_size_effective
+
+    return (
+        stage_now,
+        stage_batch_size,
+        train_loader,
+        total_step_of_this_epoch,
+        global_batch_size_effective,
+        data_num_in_a_epoch,
+    )
+
+
+def _build_epoch_metrics(
+    train_loss: Dict[str, float],
+    optimizer: optim.Optimizer,
+    train_epochs: int,
+    stage_batch_size: int,
+    total_step_of_this_epoch: int,
+    global_batch_size_effective: int,
+    stage_now: int,
+    epoch_elapsed_time_sec: float,
+    elapsed_training_time_hour: float,
+    data_num_in_a_epoch: int,
+) -> Dict[str, float]:
+    """한 epoch 에서 얻은 loss + 속도 정보로 W&B/TensorBoard metrics dict를 만든다.
+
+    입력 값들:
+      - train_loss:
+          diffusion_loss_func + _compute_loss_dict 결과의 평균값 딕셔너리.
+          예:
+            · "loss": 0.42
+            · "neighbor_prediction_loss": 0.30
+            · "integration_loss": 0.10
+            · "constraint_loss": 0.02
+            · "learn_progress": 0.87
+            · "direct_loss_weight": 0.3, ...
+      - optimizer.param_groups[0]["lr"]:
+          첫 번째 파라미터 그룹의 현재 학습률. shape: () 스칼라.
+      - total_step_of_this_epoch:
+          len(train_loader). 한 epoch 동안의 step 수.
+      - global_batch_size_effective:
+          한 step 에서 실제로 처리되는 샘플 수 (global batch).
+      - epoch_elapsed_time_sec:
+          해당 epoch 에 걸린 시간(초). shape: () 스칼라 float.
+      - elapsed_training_time_hour:
+          지금까지 누적 학습 시간(시간 단위). shape: () 스칼라 float.
+
+    반환되는 metrics 구조:
+      - "info_dict/*"       : lr, epoch 수, batch 크기, Stage 번호 등 정보성 값
+      - "weight_dict/*"     : direct/int/const loss weight 들
+      - "direct_loss_dict/*": XY / yaw / early 항목별 direct loss
+      - "integration_loss_dict/*": XY / yaw / early 항목별 integration loss
+      - "constraint_loss_dict/*": 속도/yaw 제약 관련 손실
+      - "loss_dict/*"       : neighbor/integration/constraint/total loss
+      - "speed_info/*"      : epoch 시간, 초당 처리 샘플 수, 누적 학습 시간
+
+    Args:
+        train_loss: 손실 항목별 평균 값 딕셔너리. 각 값은 float.
+        optimizer: 옵티마이저. param_groups[0]["lr"] 를 사용한다.
+        train_epochs: 전체 epoch 수.
+        stage_batch_size: 이번 Stage 에서 사용한 global batch size.
+        total_step_of_this_epoch: 한 epoch 안의 step 수.
+        global_batch_size_effective: 한 step 에서 실제 처리된 샘플 수.
+        stage_now: 현재 Stage 번호 (1/2/3).
+        epoch_elapsed_time_sec: 이번 epoch 에 걸린 시간(초).
+        elapsed_training_time_hour: 지금까지 누적 학습 시간(시간 단위).
+        data_num_in_a_epoch: 이번 epoch 전체에서 처리된 샘플 수.
+
+    Returns:
+        metrics: W&B/TensorBoard 에 바로 넣을 수 있는 flat dict.
+                 key 는 "info_dict/...", "loss_dict/..." 와 같이 prefix 가 붙는다.
+    """
+    # 1) 기본 정보(info_dict)
+    current_lr: float = float(optimizer.param_groups[0]["lr"])
+    data_process_per_sec: float = data_num_in_a_epoch / max(
+        epoch_elapsed_time_sec, 1e-9)
+
+    info_dict: Dict[str, float] = {
+        "lr":
+            current_lr,
+        "total_train_epochs":
+            float(train_epochs),
+        "stage_batch_size_arg":
+            float(stage_batch_size),
+        "batch_num_in_epoch":
+            float(total_step_of_this_epoch),
+        "total_batch_num_of_all_epochs":
+            float(train_epochs * total_step_of_this_epoch),
+        "global_batch_size":
+            float(global_batch_size_effective),
+        "current_stage":
+            float(stage_now),
+    }
+
+    # 2) 손실 그룹별 딕셔너리 분리
+    weight_dict: Dict[str, float] = {}
+    direct_loss_dict: Dict[str, float] = {}
+    integration_loss_dict: Dict[str, float] = {}
+    constraint_loss_dict: Dict[str, float] = {}
+    loss_dict: Dict[str, float] = {}
+
+    for k, v in train_loss.items():
+        if k == "learn_progress":
+            info_dict[k] = float(v)
+        elif k in ("direct_loss_weight", "int_loss_weight",
+                   "const_loss_weight"):
+            weight_dict[k] = float(v)
+        elif k in (
+                "neighbor_prediction_loss_xy",
+                "neighbor_prediction_loss_yaw",
+                "neighbor_prediction_loss_xy_early",
+                "neighbor_prediction_loss_yaw_early",
+        ):
+            direct_loss_dict[k] = float(v)
+        elif k in (
+                "integration_loss_xy",
+                "integration_loss_yaw",
+                "integration_loss_xy_early",
+                "integration_loss_yaw_early",
+        ):
+            integration_loss_dict[k] = float(v)
+        elif k in (
+                "constraint_diff_vx_b",
+                "constraint_diff_vy_b",
+                "constraint_diff_yaw_rate",
+        ):
+            constraint_loss_dict[k] = float(v)
+        elif k in (
+                "loss_dict",
+                "neighbor_prediction_loss",
+                "integration_loss",
+                "constraint_loss",
+        ):
+            loss_dict[k] = float(v)
+
+    # 3) 속도/시간 정보
+    speed_info: Dict[str, float] = {
+        "epoch_elapsed_time_sec": float(epoch_elapsed_time_sec),
+        "data_process_per_sec": float(data_process_per_sec),
+        "elapsed_training_time_hour": float(elapsed_training_time_hour),
+    }
+
+    # 4) prefix 를 붙여 하나의 flat dict 로 합치기
+    metrics: Dict[str, float] = {}
+    metrics.update({f"info_dict/{k}": v for k, v in info_dict.items()})
+    metrics.update({f"weight_dict/{k}": v for k, v in weight_dict.items()})
+    metrics.update({
+        f"direct_loss_dict/{k}": v for k, v in direct_loss_dict.items()
+    })
+    metrics.update({
+        f"integration_loss_dict/{k}": v
+        for k, v in integration_loss_dict.items()
+    })
+    metrics.update({
+        f"constraint_loss_dict/{k}": v for k, v in constraint_loss_dict.items()
+    })
+    metrics.update({f"loss_dict/{k}": v for k, v in loss_dict.items()})
+    metrics.update({f"speed_info/{k}": v for k, v in speed_info.items()})
+
+    return metrics
+
+
 def _run_training_loop(
     args: argparse.Namespace,
     diffusion_planner: nn.Module,
     optimizer: optim.Optimizer,
     scheduler: Any,
     model_ema: Optional[ModelEma],
-    train_loader: DataLoader,
+    train_set: DiffusionPlannerData,
     train_sampler: DistributedSampler,
     wandb_logger: Logger,
     save_path: Optional[str],
@@ -2742,37 +3275,62 @@ def _run_training_loop(
     global_rank: int,
     train_epochs: int,
     init_epoch: int,
-    data_num_in_a_epoch: int,
-    global_batch_size: int,
+    world_size: int,
     aug: Optional[object],
 ) -> float:
-    """전체 epoch 루프를 돌면서 학습, 로깅, 저장을 수행한다.
+    """전체 epoch 루프를 돌면서 학습, 로깅, 저장까지 한 번에 수행한다.
+
+    Epoch 단위 처리 흐름:
+      1) _build_stage_train_loader_and_stats(...) 로
+         - 현재 Stage 번호(stage_now)
+         - Stage별 global batch size(stage_batch_size)
+         - 이 값들로 만든 DataLoader(train_loader)
+         - 이번 epoch 의 step 수 / 처리 샘플 수
+         를 계산한다.
+      2) _train_one_epoch(...) 로
+         - train_loader 전체를 돌며 모델 학습
+         - train_loss(dict), train_total_loss(float), 걸린 시간(초)를 얻는다.
+      3) _build_epoch_metrics(...) 로
+         - lr / Stage / batch 크기 / 손실 / 속도 정보를 한 dict 로 정리한다.
+      4) _log_and_save_on_rank0(...) 로
+         - rank 0 에서만 W&B/TensorBoard 로깅과 checkpoint 저장을 수행한다.
+      5) train_sampler.set_epoch(...) 로
+         - 다음 epoch 에서 데이터 셔플 seed 를 바꿔준다.
 
     Args:
-        args: 학습 설정.
-        diffusion_planner: 학습 중인 모델.
-        optimizer: 옵티마이저.
+        args: 학습 설정/상태 Namespace.
+        diffusion_planner: 학습 중인 모델(nn.Module 또는 DDP/DeepSpeed 래퍼).
+        optimizer: 옵티마이저(AdamW/AdamW8bit 또는 DeepSpeed 내부 옵티마이저).
         scheduler: 학습률 스케줄러.
-        model_ema: EMA 래퍼 또는 None.
-        train_loader: 학습용 DataLoader. 배치 텐서는 (B, ·) shape.
-        train_sampler: DistributedSampler.
-        wandb_logger: TensorBoardLogger 래퍼.
-        save_path: 체크포인트 저장 경로.
-        time_str: run 식별용 시간 문자열.
-        best_loss: 현재까지의 best loss 값.
-        global_rank: 전체 프로세스 기준 번호.
-        train_epochs: 전체 epoch 수.
-        init_epoch: 재개 시작 epoch 인덱스.
-        data_num_in_a_epoch: 한 epoch당 처리 샘플 수.
-        global_batch_size: 실제 글로벌 배치 크기.
-        aug: augmentation 객체 또는 None.
+        model_ema: EMA 래퍼(ModelEma 등) 또는 None.
+        train_set: DiffusionPlannerData. len(train_set) = 전체 샘플 수.
+        train_sampler: DistributedSampler. 각 rank 에 다른 데이터 구간을 배정.
+        wandb_logger: TensorBoardLogger 래퍼. W&B/TensorBoard 기록용.
+        save_path: 체크포인트 저장 경로. None 이면 저장하지 않는다.
+        best_loss: 지금까지의 최소 train_total_loss 값.
+        global_rank: 전체 프로세스 기준 rank(0 이면 주 로그/저장 담당).
+        train_epochs: 전체 학습 epoch 수.
+        init_epoch: 재개 시 시작할 epoch 인덱스(0 기반).
+        world_size: 전체 프로세스 개수(DDP/DeepSpeed world_size).
+        aug: 데이터 증강 객체(StatePerturbation/NPCStatePerturbation) 또는 None.
 
     Returns:
-        best_loss: 학습 종료 시의 best loss 값.
+        best_loss: 학습 종료 시점까지의 최소 train_total_loss 값.
     """
-    elapsed_training_time_hour = 0.0
+    elapsed_training_time_hour: float = 0.0
+
     for epoch in range(init_epoch, train_epochs):
-        # 1) 한 epoch 학습
+        # 0) 현재 Stage 번호 / batch size / DataLoader / 통계 계산
+        (stage_now, stage_batch_size, train_loader, total_step_of_this_epoch,
+         global_batch_size_effective,
+         data_num_in_a_epoch) = _build_stage_train_loader_and_stats(
+             args=args,
+             train_set=train_set,
+             train_sampler=train_sampler,
+             world_size=world_size,
+         )
+
+        # 1) 한 epoch 학습 (각 step 배치 텐서 shape: (B, ·))
         train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
             epoch=epoch,
             train_epochs=train_epochs,
@@ -2785,101 +3343,27 @@ def _run_training_loop(
             aug=aug,
         )
         elapsed_training_time_hour += epoch_elapsed_time_sec / 3600.0
-        # 2) epoch당 처리 속도 계산
-        data_process_per_sec = data_num_in_a_epoch / max(
-            epoch_elapsed_time_sec, 1e-9)
-        """ train_loss: Dict[str, float]
-        <diffusion_loss_func 가 출력해주는 loss_dict>
-            - neighbor_prediction_loss : 이웃 예측 손실 텐서
-            - integration_loss : 통합 손실 텐서
-            - constraint_loss : 제약 손실 텐서
 
-            - neighbor_prediction_loss_xy / integration_loss_xy
-            - neighbor_prediction_loss_yaw / integration_loss_yaw
-            - neighbor_prediction_loss_xy_early / integration_loss_xy_early
-            - neighbor_prediction_loss_yaw_early / integration_loss_yaw_early
-            - constraint_diff_vx_b / constraint_diff_vy_b / constraint_diff_yaw_rate
+        # 2) metrics dict 구성
+        metrics: Dict[str, float] = _build_epoch_metrics(
+            train_loss=train_loss,
+            optimizer=optimizer,
+            train_epochs=train_epochs,
+            stage_batch_size=stage_batch_size,
+            total_step_of_this_epoch=total_step_of_this_epoch,
+            global_batch_size_effective=global_batch_size_effective,
+            stage_now=stage_now,
+            epoch_elapsed_time_sec=epoch_elapsed_time_sec,
+            elapsed_training_time_hour=elapsed_training_time_hour,
+            data_num_in_a_epoch=data_num_in_a_epoch,
+        )
 
-        <diffusion_loss_func 출력 후 _compute_loss_dict 가 추가하는 항목>
-        - learn_progress / direct_loss_weight / int_loss_weight / const_loss_weight :
-            진행도 및 가중치 기록용 텐서
-        - loss_dict : 최종 합 손실 텐서.
-        """
-        # 3) lr_dict / metrics 구성
-        info_dict: Dict[str, float] = {
-            'lr': optimizer.param_groups[0]['lr'],
-            "total_train_epochs": train_epochs,
-            "batch_num_in_epoch": len(train_loader),
-            "total_batch_num_of_all_epochs": train_epochs * len(train_loader),
-            "global_batch_size": global_batch_size,
-        }
-        weight_dict = {}
-        direct_loss_dict = {}
-        integration_loss_dict = {}
-        constraint_loss_dict = {}
-        loss_dict = {}
-        for k, v in train_loss.items():
-            if k == "learn_progress":
-                info_dict[k] = v
-            elif k in ("direct_loss_weight", "int_loss_weight",
-                       "const_loss_weight"):
-                weight_dict[k] = v
-            elif k in (
-                    "neighbor_prediction_loss_xy",
-                    "neighbor_prediction_loss_yaw",
-                    "neighbor_prediction_loss_xy_early",
-                    "neighbor_prediction_loss_yaw_early",
-            ):
-                direct_loss_dict[k] = v
-            elif k in ("integration_loss_xy", "integration_loss_yaw",
-                       "integration_loss_xy_early",
-                       "integration_loss_yaw_early"):
-                integration_loss_dict[k] = v
-            elif k in (
-                    "constraint_diff_vx_b",
-                    "constraint_diff_vy_b",
-                    "constraint_diff_yaw_rate",
-            ):
-                constraint_loss_dict[k] = v
-            elif k in ("loss_dict", "neighbor_prediction_loss",
-                       "integration_loss", "constraint_loss"):
-                loss_dict[k] = v
-        speed_info = {
-            "epoch_elapsed_time_sec": epoch_elapsed_time_sec,
-            "data_process_per_sec": data_process_per_sec,
-            "elapsed_training_time_hour": elapsed_training_time_hour,
-        }
-        metrics: Dict[str, float] = {}
-        # add "info_dict/" prefix
-        metrics.update({f"info_dict/{k}": v for k, v in info_dict.items()})
-        # add "weight_dict/" prefix
-        metrics.update({f"weight_dict/{k}": v for k, v in weight_dict.items()})
-        # add "direct_loss_dict/" prefix
-        metrics.update({
-            f"direct_loss_dict/{k}": v for k, v in direct_loss_dict.items()
-        })
-        # add "integration_loss_dict/" prefix
-        metrics.update({
-            f"integration_loss_dict/{k}": v
-            for k, v in integration_loss_dict.items()
-        })
-        # add "constraint_loss_dict/" prefix
-        metrics.update({
-            f"constraint_loss_dict/{k}": v
-            for k, v in constraint_loss_dict.items()
-        })
-        # add "loss_dict/" prefix
-        metrics.update({f"loss_dict/{k}": v for k, v in loss_dict.items()})
-
-        # add "speed_info/" prefix
-        metrics.update({f"speed_info/{k}": v for k, v in speed_info.items()})
-
-        # 4) rank 0에서 로그 및 체크포인트/아티팩트 저장
+        # 3) rank 0에서 로그 및 checkpoint/아티팩트 저장
         best_loss = _log_and_save_on_rank0(
             epoch=epoch,
             args=args,
             train_total_loss=train_total_loss,
-            metrics=metrics,  # Dict[str, float]
+            metrics=metrics,
             wandb_logger=wandb_logger,
             diffusion_planner=diffusion_planner,
             optimizer=optimizer,
@@ -2890,7 +3374,7 @@ def _run_training_loop(
             global_rank=global_rank,
         )
 
-        # 5) 다음 epoch 를 위한 sampler seed 변경
+        # 4) 다음 epoch 를 위한 sampler seed 변경
         train_sampler.set_epoch(epoch + 1 + args.sampler_epoch_offset)
 
     return best_loss
@@ -2942,36 +3426,370 @@ def _finalize_training_cleanup(
 def _init_or_restore_global_update_step(
     args: argparse.Namespace,
     init_epoch: int,
-    total_step_of_this_epoch: int,
 ) -> None:
     """전역 스텝 카운터(_global_update_step)를 초기화하거나 재설정한다.
 
     w_dir / w_int / w_const 같은 가중치 스케줄은
     args._global_update_step 값을 기준으로 진행도를 계산한다.
+
     이 함수는
       - 처음 학습을 시작할 때는 0에서 시작하고,
-      - 체크포인트에서 재개할 때는 이미 끝낸 epoch 수만큼
-        스텝을 미리 더해 둔다.
+      - 체크포인트에서 재개할 때는 init_epoch(이미 끝난 epoch 수)를 기준으로
+        지금까지 진행된 전체 step 수를 추정해서 _global_update_step에 넣어 준다.
+
+    여기서 step 수는 _setup_stage_schedule 에서 계산한
+      - args._stage1_total_steps
+      - args._stage2_total_steps
+      - args._stage3_total_steps
+    와
+      - args._stage1_epochs / _stage2_epochs / _stage3_epochs
+    를 이용해, Stage별 "epoch당 step 수"를 구한 뒤
+
+      [예]
+        · Stage1: s1_steps_per_epoch = _stage1_total_steps / _stage1_epochs
+        · Stage2: s2_steps_per_epoch = _stage2_total_steps / _stage2_epochs
+        · Stage3: s3_steps_per_epoch = _stage3_total_steps / _stage3_epochs
+
+    init_epoch 개의 epoch가
+      - Stage1 몇 개,
+      - Stage2 몇 개,
+      - Stage3 몇 개인지 나눠서
+    총 step 수를 합산하는 방식으로 계산한다.
 
     Args:
-        args: 학습 설정/상태 Namespace. 내부에 `_global_update_step` 속성을 추가한다.
+        args: 학습 설정/상태 Namespace.
+              내부에 `_global_update_step`, `_stage{1,2,3}_epochs`,
+              `_stage{1,2,3}_total_steps`, `_total_update_steps` 등이
+              이미(_setup_stage_schedule 호출을 통해) 채워져 있다고 가정한다.
         init_epoch: 이번 run 이 시작될 epoch 인덱스(0 기준).
-        total_step_of_this_epoch: 한 epoch 안의 배치 수. 스칼라 정수.  # shape: ()
+                    = 지금까지 이미 끝낸 epoch 수.
 
     Returns:
         None
     """
-    # 이미 외부에서 명시적으로 세팅한 값이 있으면 건드리지 않는다.
+    # 이미 밖에서 명시적으로 세팅해 둔 경우 건드리지 않는다.
     if hasattr(args, "_global_update_step"):
         return
 
+    # 처음 시작하는 학습이면 0에서 출발
     if init_epoch <= 0:
-        # 처음 학습 시작일 때
         args._global_update_step = 0
+        return
+
+    # Stage 스케줄 정보가 없는 경우에는 대략적인 평균으로만 추정
+    total_updates: int = int(getattr(args, "_total_update_steps", 0))
+    s1_epochs: int = int(getattr(args, "_stage1_epochs", 0))
+    s2_epochs: int = int(getattr(args, "_stage2_epochs", 0))
+    s3_epochs: int = int(getattr(args, "_stage3_epochs", 0))
+
+    s1_total: int = int(getattr(args, "_stage1_total_steps", 0))
+    s2_total: int = int(getattr(args, "_stage2_total_steps", 0))
+    s3_total: int = int(getattr(args, "_stage3_total_steps", 0))
+
+    if total_updates <= 0 or (s1_total + s2_total + s3_total) <= 0:
+        # 방어용 fallback:
+        #  - Stage 정보가 없으면, "전체 step을 epoch 수로 골고루 나눠졌다"고 가정
+        #  - init_epoch 비율에 맞춰 대략적인 진행도만 맞춰둔다.
+        if total_updates > 0 and int(getattr(args, "train_epochs", 0)) > 0:
+            avg_steps_per_epoch = float(total_updates) / float(
+                max(1, int(args.train_epochs)))
+            approx_steps = int(round(float(init_epoch) * avg_steps_per_epoch))
+            args._global_update_step = max(0, min(approx_steps, total_updates))
+        else:
+            # 진짜 정보가 없으면 그냥 0에서 다시 시작
+            args._global_update_step = 0
+        return
+
+    def _steps_per_epoch(total_steps: int, epochs: int) -> int:
+        if epochs <= 0:
+            return 0
+        # _setup_stage_schedule 에서 이미
+        #   stage_total_steps = stage_epochs * steps_per_epoch
+        # 형태로 계산했으므로, 정수 나눗셈으로 정확히 떨어진다.
+        return int(total_steps) // int(epochs)
+
+    s1_spe: int = _steps_per_epoch(s1_total, s1_epochs)
+    s2_spe: int = _steps_per_epoch(s2_total, s2_epochs)
+    s3_spe: int = _steps_per_epoch(s3_total, s3_epochs)
+
+    # init_epoch 개의 epoch가 Stage1/2/3에 각각 얼마나 걸쳐 있는지 계산
+    epochs_left: int = int(init_epoch)
+    done_steps: int = 0
+
+    # 1) Stage1에서 끝난 epoch 수
+    e1 = min(epochs_left, max(0, s1_epochs))
+    done_steps += e1 * s1_spe
+    epochs_left -= e1
+
+    # 2) Stage2에서 끝난 epoch 수
+    e2 = min(epochs_left, max(0, s2_epochs))
+    done_steps += e2 * s2_spe
+    epochs_left -= e2
+
+    # 3) Stage3에서 끝난 epoch 수
+    e3 = min(epochs_left, max(0, s3_epochs))
+    done_steps += e3 * s3_spe
+
+    # 안전하게 전체 step 수 안으로 클램프
+    done_steps = max(0, min(done_steps, total_updates))
+    args._global_update_step = int(done_steps)
+
+
+def _setup_stage1_center_crop_in_args(
+    args: argparse.Namespace,
+    stage: int,
+) -> None:
+    """현재 Stage 번호에 따라 center crop을 Stage1에서만 켜거나 끈다.
+
+    동작 요약:
+      * 최초 한 번만, 사용자가 넘긴 center_crop_radius_m / center_crop_mode 값을
+        Stage1 설정으로 내부에 백업해 둔다.
+      * stage == 1 이면 이 백업 값을 다시 args.center_crop_* 에 넣어서
+        DiffusionPlannerCollate 가 기존 방식대로 중심 크로핑을 사용하게 한다.
+      * stage != 1 (Stage2/3)이면 center_crop_radius_m <= 0, mode='none' 으로 바꿔서
+        DiffusionPlannerCollate._should_center_crop() 이 항상 False 가 되도록 한다.
+
+    Args:
+        args (argparse.Namespace):
+            전체 학습 설정이 들어 있는 객체.
+            이 함수가 center_crop_radius_m, center_crop_mode 값을 in-place 로 수정한다.
+        stage (int):
+            현재 Stage 번호. 1이면 crop을 켜고, 나머지(Stage2/3)에서는 끈다.
+
+    Returns:
+        None
+    """
+    # 최초 한 번만 Stage1용 크로핑 설정을 백업해 둔다.
+    if not hasattr(args, "_stage1_center_crop_radius_m"):
+        args._stage1_center_crop_radius_m = float(
+            getattr(args, "center_crop_radius_m", -1.0))
+        args._stage1_center_crop_mode = str(
+            getattr(args, "center_crop_mode", "none")).lower()
+
+    if stage == 1:
+        # Stage1: 사용자가 지정한 크로핑 설정을 그대로 사용
+        args.center_crop_radius_m = float(args._stage1_center_crop_radius_m)
+        args.center_crop_mode = str(args._stage1_center_crop_mode).lower()
     else:
-        # 예: init_epoch=5, total_step=100 이면 500 step 만큼 이미 지난 것으로 본다.
-        args._global_update_step = int(init_epoch) * int(
-            total_step_of_this_epoch)
+        # Stage2/3: 크로핑 완전히 비활성화
+        # radius <= 0 이거나 mode="none" 이면 DiffusionPlannerCollate._should_center_crop() 이 False가 된다.
+        args.center_crop_radius_m = -1.0
+        args.center_crop_mode = "none"
+
+
+def _get_stage_batch_size(
+    args: argparse.Namespace,
+    stage: int,
+) -> int:
+    """현재 Stage 번호에 맞는 전체 배치 크기를 돌려준다.
+
+    Stage 번호(1, 2, 3)에 따라 args.stage1/2/3_batch_size 값을 골라 쓰고,
+    값이 없거나 0 이하면 기본 batch_size 로 대신한다.
+
+    Args:
+        args (argparse.Namespace): 학습 설정 전체가 들어 있는 객체.
+        stage (int): 사용할 Stage 번호 (1, 2, 3 중 하나라고 가정).
+
+    Returns:
+        int: global batch size.
+             이 값은 DataLoader를 만들 때 world_size로 나눠
+             rank별 batch size를 정할 때 사용된다.
+    """
+    base_bs: int = int(getattr(args, "batch_size", 1))
+
+    if stage <= 1:
+        raw_bs = int(getattr(args, "stage1_batch_size", base_bs))
+    elif stage == 2:
+        raw_bs = int(getattr(args, "stage2_batch_size", base_bs))
+    else:
+        raw_bs = int(getattr(args, "stage3_batch_size", base_bs))
+
+    if raw_bs <= 0:
+        raw_bs = base_bs
+
+    return raw_bs
+
+
+def _get_stage_global_batch_from_args(
+    args: argparse.Namespace,
+    stage_bs_attr: str,
+    cached_attr: str,
+    world_size: int,
+) -> int:
+    """Stage별 배치 설정과 world_size를 이용해 글로벌 배치 크기를 계산한다.
+
+    동작 순서:
+      1) args.cached_attr 에 이미 저장된 글로벌 배치 값이 있으면 그대로 쓴다.
+      2) 없거나 0 이하면
+         · args.stage_bs_attr (예: stage1_batch_size) 를 읽고,
+           값이 없으면 args.batch_size 를 대신 사용한다.
+         · _effective_global_batch(...) 로 DDP 정합이 맞는 글로벌 배치
+           (shape: ()) 를 계산한다.
+      3) 계산된 글로벌 배치 값을 args.cached_attr 에 다시 저장한다.
+
+    Args:
+        args (argparse.Namespace):
+            전체 학습 설정이 들어 있는 객체.
+        stage_bs_attr (str):
+            Stage별 배치 크기가 들어 있는 속성 이름.
+            예: "stage1_batch_size", "stage2_batch_size".
+        cached_attr (str):
+            계산된 글로벌 배치를 캐시해 둘 내부 속성 이름.
+            예: "_stage1_global_batch".
+        world_size (int):
+            전체 프로세스(GPU) 개수. shape: ().
+
+    Returns:
+        int:
+            글로벌 배치 크기. shape: ().
+            최소 1 이상이 되도록 보정된다.
+    """
+    gb: int = int(getattr(args, cached_attr, 0))
+    if gb <= 0:
+        bs: int = int(
+            getattr(args, stage_bs_attr, getattr(args, "batch_size", 1)))
+        gb = _effective_global_batch(bs, world_size)
+        setattr(args, cached_attr, int(gb))
+    return max(1, int(gb))
+
+
+def _estimate_steps_per_epoch(
+    train_set_len: int,
+    global_batch: int,
+) -> int:
+    """전체 샘플 수와 글로벌 배치 크기로 epoch당 step 수를 근사한다.
+
+    DataLoader(drop_last=True)를 가정하고,
+      steps_per_epoch ≈ floor(train_set_len / global_batch)
+    형태로 계산한다. 너무 작은 값이 나와도 학습이 진행되도록
+    최소 1 step 은 보장한다.
+
+    Args:
+        train_set_len (int):
+            전체 학습 샘플 개수. shape: ().
+        global_batch (int):
+            글로벌 배치 크기. shape: ().
+
+    Returns:
+        int:
+            한 epoch 에서 사용할 step 수. shape: ().
+    """
+    if global_batch <= 0:
+        return max(1, int(train_set_len))
+    return max(1, int(train_set_len) // int(global_batch))
+
+
+def _setup_stage_schedule(
+    args: argparse.Namespace,
+    train_set_len: int,
+    world_size: int,
+) -> Tuple[int, int, int, int]:
+    """Stage1/2/3 epoch 수와 글로벌 배치에 맞춰 전체 update step 수와 경계를 계산한다.
+
+    처리 순서:
+      1) _scale_learning_rate_and_epochs(...)에서 미리 계산해 둔
+         Stage별 epoch 수(_stage1/2/3_epochs)를 읽는다.
+      2) Stage별 글로벌 배치 크기를 다시 확인하거나(없으면 계산),
+         train_set_len 을 이용해 Stage별 epoch당 step 수를 근사한다.
+      3) Stage별 총 step 수를 계산하고,
+         이를 누적해 전체 update step 수(total_update_steps)와
+         Stage1/2 경계 step(_stage1_end_step, _stage2_end_step)을 만든다.
+      4) 계산된 값은 args에 저장해 이후
+         - _get_stage_for_step (Stage 전환)
+         - 진행도(progress) 계산
+         - LR 스케줄러
+         에서 공통으로 사용한다.
+
+    Args:
+        args (argparse.Namespace):
+            - _stage1_epochs / _stage2_epochs / _stage3_epochs
+            - stage1_batch_size / stage2_batch_size / stage3_batch_size
+            등이 이미 채워져 있어야 한다.
+        train_set_len (int):
+            전체 학습 샘플 개수. shape: ().
+        world_size (int):
+            전체 프로세스(GPU) 개수. shape: ().
+
+    Returns:
+        Tuple[int, int, int, int]:
+            - total_update_steps (int): 전체 학습 동안의 총 update step 수.
+            - stage1_total_steps (int): Stage1 구간에서의 step 수.
+            - stage2_total_steps (int): Stage2 구간에서의 step 수.
+            - stage3_total_steps (int): Stage3 구간에서의 step 수.
+    """
+    # 1) Stage별 epoch 수
+    stage1_epochs: int = int(getattr(args, "_stage1_epochs", 0))
+    stage2_epochs: int = int(getattr(args, "_stage2_epochs", 0))
+    stage3_epochs: int = int(getattr(args, "_stage3_epochs", 0))
+
+    if stage1_epochs <= 0 and stage2_epochs <= 0 and stage3_epochs <= 0:
+        # 방어 코드: 정보가 없으면 전체를 Stage1로 취급
+        stage1_epochs = int(getattr(args, "train_epochs", 1))
+        stage2_epochs = 0
+        stage3_epochs = 0
+        args._stage1_epochs = stage1_epochs
+        args._stage2_epochs = stage2_epochs
+        args._stage3_epochs = stage3_epochs
+
+    # 2) Stage별 글로벌 배치 (미리 계산된 값이 있으면 재사용)
+    stage1_global_batch: int = _get_stage_global_batch_from_args(
+        args=args,
+        stage_bs_attr="stage1_batch_size",
+        cached_attr="_stage1_global_batch",
+        world_size=world_size,
+    )
+    stage2_global_batch: int = _get_stage_global_batch_from_args(
+        args=args,
+        stage_bs_attr="stage2_batch_size",
+        cached_attr="_stage2_global_batch",
+        world_size=world_size,
+    )
+    stage3_global_batch: int = _get_stage_global_batch_from_args(
+        args=args,
+        stage_bs_attr="stage3_batch_size",
+        cached_attr="_stage3_global_batch",
+        world_size=world_size,
+    )
+
+    # 3) Stage별 epoch당 step 수 근사
+    s1_steps_per_epoch: int = _estimate_steps_per_epoch(
+        train_set_len=train_set_len,
+        global_batch=stage1_global_batch,
+    )
+    s2_steps_per_epoch: int = _estimate_steps_per_epoch(
+        train_set_len=train_set_len,
+        global_batch=stage2_global_batch,
+    )
+    s3_steps_per_epoch: int = _estimate_steps_per_epoch(
+        train_set_len=train_set_len,
+        global_batch=stage3_global_batch,
+    )
+
+    # 4) Stage별 총 step 수
+    stage1_total_steps: int = int(stage1_epochs) * int(s1_steps_per_epoch)
+    stage2_total_steps: int = int(stage2_epochs) * int(s2_steps_per_epoch)
+    stage3_total_steps: int = int(stage3_epochs) * int(s3_steps_per_epoch)
+
+    total_updates: int = max(
+        1, stage1_total_steps + stage2_total_steps + stage3_total_steps)
+
+    stage1_end: int = min(stage1_total_steps, total_updates)
+    stage2_end: int = min(stage1_end + stage2_total_steps, total_updates)
+
+    # 5) args에 결과 저장
+    args._total_update_steps = int(total_updates)
+    args._stage1_end_step = int(stage1_end)
+    args._stage2_end_step = int(stage2_end)
+    args._stage1_total_steps = int(stage1_total_steps)
+    args._stage2_total_steps = int(stage2_total_steps)
+    args._stage3_total_steps = int(stage3_total_steps)
+
+    return (
+        total_updates,
+        stage1_total_steps,
+        stage2_total_steps,
+        stage3_total_steps,
+    )
 
 
 def model_training(args: argparse.Namespace) -> None:
@@ -2992,8 +3810,8 @@ def model_training(args: argparse.Namespace) -> None:
     # 1) 분산 초기화 및 rank 정보
     global_rank, rank, world_size, use_deepspeed = _init_distributed(args)
 
-    # 2) 글로벌 배치 크기에 따라 학습률 / epoch 수 스케일링
-    BASE_GLOBAL_BATCH, current_global_batch = _scale_learning_rate_and_epochs(
+    # 2) Stage별 글로벌 배치/epoch/lr 스케일링
+    BASE_GLOBAL_BATCH, stage1_global_batch = _scale_learning_rate_and_epochs(
         args,
         world_size,
     )
@@ -3006,70 +3824,50 @@ def model_training(args: argparse.Namespace) -> None:
     set_seed(args.seed + global_rank)
 
     # 5) augmentation, Dataset, Sampler
-    batch_size = args.batch_size
     aug = _build_augmentation(args)
-    # train_epoch 내부에서 args를 통해 augmentation이 사용되므로 aug는 실제로는
-    #   train_epoch 인자로만 전달되고, 배치 텐서 shape는 (B, ·)로 유지된다.
-    _ = aug  # 형식상 참조 (실제 로직은 기존과 동일하게 train_epoch에서 사용)
+    _ = aug  # 형식상 참조
 
     train_set, train_sampler = _build_dataset_and_sampler(
         args,
         world_size,
         global_rank,
     )
-
-    # 6) warmup step 계산
+    # 6) Stage1 기준 warmup step 계산
     warmup_steps_at_B0, warmup_steps = _compute_warmup_steps(
         args=args,
         BASE_GLOBAL_BATCH=BASE_GLOBAL_BATCH,
-        current_global_batch=current_global_batch,
+        current_global_batch=stage1_global_batch,
         total_data_num=len(train_set),
     )
 
-    # 7) DataLoader 및 step/샘플 수 정보
-    train_loader = _build_train_loader(
-        args,
-        train_set,
-        train_sampler,
-        batch_size,
-        world_size,
-    )
-    (total_step_of_this_epoch, total_step_of_all_epoch, global_batch_size,
-     data_num_in_a_epoch) = _compute_schedule_info(
-         args=args,
-         train_loader=train_loader,
-         world_size=world_size,
-     )
-
-    # 8) rank 0에서 스케줄 요약 출력
-    _print_schedule_summary(
-        global_rank=global_rank,
-        train_set_len=len(train_set),
-        BASE_GLOBAL_BATCH=BASE_GLOBAL_BATCH,
-        current_global_batch=current_global_batch,
+    # 7) Stage1/2/3 전체 step 수 및 경계 계산
+    (
+        total_update_steps,
+        stage1_total_steps,
+        stage2_total_steps,
+        stage3_total_steps,
+    ) = _setup_stage_schedule(
         args=args,
-        train_loader=train_loader,
-        total_step_of_all_epoch=total_step_of_all_epoch,
-        warmup_steps_at_B0=warmup_steps_at_B0,
-        warmup_steps=warmup_steps,
+        train_set_len=len(train_set),
+        world_size=world_size,
     )
 
-    # 9) DDP인 경우, 모델 생성 전 barrier
+    # 10) DDP인 경우, 모델 생성 전 barrier
     if args.ddp and not use_deepspeed:
         torch.distributed.barrier()
 
-    # 10) 모델 / EMA / 옵티마이저 / 스케줄러 준비
+    # 11) 모델 / EMA / 옵티마이저 / 스케줄러 준비
     (diffusion_planner, model_ema, optimizer,
      scheduler) = _build_model_optimizer_scheduler(
          args=args,
          rank=rank,
          use_deepspeed=use_deepspeed,
-         total_step_of_all_epoch=total_step_of_all_epoch,
+         total_step_of_all_epoch=total_update_steps,
          warmup_steps=warmup_steps,
-         current_global_batch=current_global_batch,
+         current_global_batch=stage1_global_batch,
      )
 
-    # 11) 체크포인트 재개
+    # 12) 체크포인트 재개
     (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
      train_epochs, allow_val_change) = _maybe_resume_from_checkpoint(
          args=args,
@@ -3079,16 +3877,16 @@ def model_training(args: argparse.Namespace) -> None:
          model_ema=model_ema,
          global_rank=global_rank,
          train_epochs=train_epochs,
-         use_deepspeed=use_deepspeed,  # ✅ 추가
+         use_deepspeed=use_deepspeed,
      )
-    # 11-1) 재개 시 global step 복원 (w_dir / w_int / w_const 스케줄 연속성 보장)
+
+    # 12-1) 재개 시 global step 복원 (w_dir / w_int / w_const 스케줄 연속성 보장)
     _init_or_restore_global_update_step(
         args=args,
         init_epoch=init_epoch,
-        total_step_of_this_epoch=total_step_of_this_epoch,
     )
 
-    # 12) 로거 설정 및 이전 아티팩트 정리
+    # 13) 로거 설정 및 이전 아티팩트 정리
     wandb_logger = _setup_logger_and_purge(
         args=args,
         save_path=save_path,
@@ -3097,13 +3895,14 @@ def model_training(args: argparse.Namespace) -> None:
         allow_val_change=allow_val_change,
     )
 
+    # 14) epoch 루프 실행
     best_loss = _run_training_loop(
         args=args,
         diffusion_planner=diffusion_planner,
         optimizer=optimizer,
         scheduler=scheduler,
         model_ema=model_ema,
-        train_loader=train_loader,
+        train_set=train_set,
         train_sampler=train_sampler,
         wandb_logger=wandb_logger,
         save_path=save_path,
@@ -3111,12 +3910,11 @@ def model_training(args: argparse.Namespace) -> None:
         global_rank=global_rank,
         train_epochs=train_epochs,
         init_epoch=init_epoch,
-        data_num_in_a_epoch=data_num_in_a_epoch,
-        global_batch_size=global_batch_size,
+        world_size=world_size,
         aug=aug,
     )
 
-    # 14) 학습 종료 후 정리
+    # 15) 학습 종료 후 정리
     _finalize_training_cleanup(
         args=args,
         global_rank=global_rank,

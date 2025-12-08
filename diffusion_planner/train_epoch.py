@@ -210,6 +210,229 @@ def _prepare_batch_for_device(
     return inputs, outputs
 
 
+def _get_stage_for_step(args: argparse.Namespace) -> int:
+    """현재 전역 스텝에 따라 사용할 Stage 번호를 계산한다.
+
+    전역 스텝은 학습 중 전체 업데이트 횟수를 0부터 센 값이다.
+    이 값과 미리 계산해 둔 경계 스텝을 비교해서 Stage1/2/3을 나눈다.
+
+    사용되는 값:
+        - args._global_update_step (int):
+            지금까지 진행된 전체 update step 수.
+        - args._stage1_end_step (int):
+            Stage1 이 끝나는 step 인덱스 (해당 값은 Stage1에 포함되지 않음).
+        - args._stage2_end_step (int):
+            Stage2 가 끝나는 step 인덱스 (해당 값은 Stage2에 포함되지 않음).
+        - args._total_update_steps (int):
+            전체 학습 동안 사용할 총 update step 수.
+
+    구간 정의(0 기반 step):
+        - 0 <= step < _stage1_end_step         → Stage 1
+        - _stage1_end_step <= step < _stage2_end_step → Stage 2
+        - _stage2_end_step <= step < _total_update_steps → Stage 3
+
+    Args:
+        args: 학습 설정과 상태를 담고 있는 Namespace.
+
+    Returns:
+        int: 현재 step 에서 사용할 Stage 번호 (1, 2, 3 중 하나).
+    """
+    cur_step: int = int(getattr(args, "_global_update_step", 0))
+    stage1_end: int = int(getattr(args, "_stage1_end_step", 0))
+    stage2_end: int = int(getattr(args, "_stage2_end_step", 0))
+    total_steps: int = int(getattr(args, "_total_update_steps", 0))
+
+    if total_steps <= 0 or stage2_end <= 0:
+        return 1
+
+    if cur_step < stage1_end:
+        return 1
+    if cur_step < stage2_end:
+        return 2
+    return 3
+
+
+def _get_stage_group_lr_scales(
+    stage: int,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
+    """현재 Stage에서 각 파라미터 그룹에 곱해 줄 학습률 비율을 만든다.
+
+    그룹 의미(build_adamw_with_param_groups 에서 붙인 stage_group):
+        - "encoder_local"  : Group A (로컬 인코더)
+        - "encoder_global" : Group B (Fusion 등, 여러 객체를 함께 보는 인코더)
+        - "decoder"        : Group C (디코더 + PRAM/Feasible)
+        - "others"         : 그 외 나머지
+
+    정책:
+        * Stage 1:
+            - 모든 그룹 lr_scale = 1.0
+              (Stage1 max lr를 그대로 사용)
+        * Stage 2:
+            - encoder_local: freeze → lr_scale = 0.0
+            - 나머지(encoder_global / decoder / others): lr_scale = 1.0
+              (Stage2 max lr는 Stage1 대비 0.333배 정도로
+               LR 스케줄러에서 이미 줄어든 값을 사용)
+        * Stage 3:
+            - encoder_local: decoder 계열보다 더 작게 → lr_scale = stage3_encoder_local_lr_scale
+            - 나머지(encoder_global / decoder / others): lr_scale = 1.0
+
+    Args:
+        stage (int): 현재 Stage 번호 (1, 2, 3).
+        args (argparse.Namespace):
+            - stage3_encoder_local_lr_scale (float):
+                Stage3에서 로컬 인코더 그룹에만 추가로 줄일 비율.
+
+    Returns:
+        Dict[str, float]: 그룹 이름 → lr_scale 값.
+            예: {"encoder_local": 0.0, "encoder_global": 1.0, ...}
+    """
+    s3_local: float = float(getattr(args, "stage3_encoder_local_lr_scale", 0.1))
+
+    if stage <= 1:
+        return {
+            "encoder_local": 1.0,
+            "encoder_global": 1.0,
+            "decoder": 1.0,
+            "others": 1.0,
+        }
+    elif stage == 2:
+        # Stage2: 로컬 인코더만 freeze, 나머지는 Stage2 max lr 그대로 사용
+        return {
+            "encoder_local": 0.0,
+            "encoder_global": 1.0,
+            "decoder": 1.0,
+            "others": 1.0,
+        }
+    else:
+        # Stage3:
+        #   - encoder_local: Stage3 max lr * s3_local
+        #   - 나머지: Stage3 max lr 그대로 사용
+        return {
+            "encoder_local": s3_local,
+            "encoder_global": 1.0,
+            "decoder": 1.0,
+            "others": 1.0,
+        }
+
+
+def _update_model_stage_and_lr_scale(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+) -> None:
+    """현재 전역 스텝에 맞춰 Stage 전환과 그룹별 lr_scale 값을 갱신한다.
+
+    동작 요약:
+        1) _get_stage_for_step(...) 으로 이번 스텝에 사용할 Stage(1/2/3)를 구한다.
+        2) Stage 번호가 이전과 다르면
+           - model.set_stage(stage)를 호출해 Encoder 쪽 freeze/unfreeze 를 반영한다.
+           - optimizer.param_groups[*]["lr_scale"] 에
+             해당 Stage 에 맞는 비율을 다시 써 넣는다.
+
+    주의:
+        - model 은 DDP/DeepSpeed 래퍼일 수 있으므로,
+          실제 모듈은 getattr(model, "module", model) 로 꺼낸다.
+        - Diffusion_Planner.set_stage(...) 안에서는
+          Encoder 로컬 인코더 파라미터의 requires_grad 를 조정한다.
+          Decoder 쪽은 항상 requires_grad=True 로 유지된다.
+        - lr_scale 값은 _apply_stage_lr_scale_to_optimizer(...) 가
+          scheduler.step() 이후에 실제 lr 에 곱해 사용하는 값이다.
+
+    Args:
+        model: 학습 중인 모델(nn.Module 또는 DDP/DeepSpeed 래퍼).
+        optimizer: torch.optim.Optimizer 인스턴스.
+            각 param_group 에 "stage_group" 키가 있어야 하고,
+            여기에 "encoder_local"/"encoder_global"/"decoder"/"others" 중 하나가 들어간다.
+        args: 학습 설정/상태 Namespace.
+            - _global_update_step
+            - _stage1_end_step / _stage2_end_step
+            - stage2_lr_scale / stage3_encoder_local_lr_scale
+            - _current_stage (내부적으로 현재 Stage 번호를 저장).
+    """
+    new_stage: int = _get_stage_for_step(args)
+    old_stage: int = int(getattr(args, "_current_stage", 0))
+
+    if new_stage == old_stage:
+        return
+
+    base_model: nn.Module = getattr(model, "module", model)
+    if hasattr(base_model, "set_stage"):
+        base_model.set_stage(new_stage)
+
+    args._current_stage = int(new_stage)
+
+    scales: Dict[str, float] = _get_stage_group_lr_scales(new_stage, args)
+    for group in optimizer.param_groups:
+        group_name: str = str(group.get("stage_group", "others"))
+        lr_scale: float = float(
+            scales.get(group_name, scales.get("others", 1.0)))
+        group["lr_scale"] = lr_scale
+
+
+def _apply_stage_lr_scale_for_deepspeed(
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+) -> None:
+    """DeepSpeed 엔진 사용 시에도 Stage별 lr_scale을 실제 lr 값에 반영한다.
+
+    동작 요약:
+      1) model 이 DeepSpeedEngine 이면 model.optimizer 를 우선 사용한다.
+      2) 그렇지 않으면 인자로 넘어온 optimizer 를 사용한다.
+      3) 선택된 옵티마이저에 대해 _apply_stage_lr_scale_to_optimizer(...) 를 호출한다.
+
+    주의:
+        - DeepSpeedEngine.step() 안에서 이미 scheduler.step() 이 호출된 뒤이므로,
+          여기서의 lr_scale 적용은 "다음 step부터" 사용할 lr 값에 반영된다.
+          일반 PyTorch 경로와 비교하면 한 step 정도 시점 차이는 있지만,
+          Stage1/2/3 구간별 lr 비율 자체는 동일하게 유지된다.
+    """
+    ds_optimizer: Optional[torch.optim.Optimizer] = None
+
+    # 1) DeepSpeedEngine 내부 optimizer(model.optimizer)가 있으면 우선 사용
+    inner_optimizer: Any = getattr(model, "optimizer", None)
+    if inner_optimizer is not None and hasattr(inner_optimizer, "param_groups"):
+        ds_optimizer = inner_optimizer  # type: ignore[assignment]
+    elif optimizer is not None and hasattr(optimizer, "param_groups"):
+        # fallback: 인자로 넘어온 optimizer 사용
+        ds_optimizer = optimizer
+
+    if ds_optimizer is None:
+        # optimizer 정보를 찾을 수 없으면 조용히 패스
+        return
+
+    _apply_stage_lr_scale_to_optimizer(ds_optimizer)  # type: ignore[arg-type]
+
+
+def _apply_stage_lr_scale_to_optimizer(
+    optimizer: torch.optim.Optimizer,) -> None:
+    """param_group 의 lr 값에 lr_scale 을 곱해, Stage 반영 최종 lr 로 만든다.
+
+    사용 시점:
+        - scheduler.step() 이 각 그룹의 "기본 lr" 을 갱신한 뒤
+        - 그 값에 param_group["lr_scale"] 을 곱해 Stage2/3 비율을 반영하기 위해 호출한다.
+
+    전제:
+        - optimizer.param_groups[*]["lr"] : 현재 스케줄러가 정한 기본 lr (스칼라).
+        - optimizer.param_groups[*]["lr_scale"] : Stage/그룹별 비율(0.0 ~ 1.0 이상).
+
+    처리:
+        - lr_scale == 1.0 인 그룹은 그대로 두고,
+        - 그 외 그룹은 lr ← lr * lr_scale 로 덮어쓴다.
+
+    Args:
+        optimizer: torch.optim.Optimizer 인스턴스.
+            각 param_group 의 "params" 리스트 안에는
+            다양한 shape 의 파라미터 텐서들
+            (예: (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW)) 이 들어있다.
+    """
+    for group in optimizer.param_groups:
+        lr_scale: float = float(group.get("lr_scale", 1.0))
+        if lr_scale == 1.0:
+            continue
+        group["lr"] = group["lr"] * lr_scale
+
+
 # =====================================================================
 # 아래부터 train_epoch 내부를 역할별 함수로 분리
 # =====================================================================
@@ -221,20 +444,32 @@ def _init_global_step_and_total_updates(
 ) -> int:
     """전역 스텝 상태를 초기화하고, 전체 업데이트 스텝 수를 계산한다.
 
+    우선 순서:
+      1) Stage 스케줄 설정(_setup_stage_schedule)에서
+         이미 전체 step 수(args._total_update_steps)를 계산해둔 경우
+         그 값을 그대로 사용한다.
+      2) 그 값이 없다면, 이전 방식대로
+         train_epochs * batch_num_in_epoch 를 이용해 근사한다.
+
     Args:
         args:
             학습 설정/상태를 담고 있는 Namespace.
-            - train_epochs: 전체 학습 epoch 수.
             - _global_update_step: 없으면 0으로 새로 만든다.
+            - _total_update_steps: 있으면 전체 step 수로 사용.
         batch_num_in_epoch:
             현재 epoch에서 배치 개수. len(data_loader).
 
     Returns:
         int:
-            batch_num_in_all_epoch = train_epochs * batch_num_in_epoch (최소 1).
+            전체 학습 동안의 총 update step 수.
     """
     if not hasattr(args, "_global_update_step"):
         args._global_update_step = 0
+
+    total_updates_from_stage: int = int(getattr(args, "_total_update_steps", 0))
+    if total_updates_from_stage > 0:
+        return total_updates_from_stage
+
     batch_num_in_all_epoch: int = max(
         1,
         int(args.train_epochs) * int(batch_num_in_epoch))
@@ -347,51 +582,37 @@ def _compute_loss_dict(
     loss_dict: Dict[str, torch.Tensor],
     args: argparse.Namespace,
     model: nn.Module,
-    norm_inputs: Dict[str, torch.Tensor],
     batch_num_in_all_epoch: int,
 ) -> Dict[str, torch.Tensor]:
     """diffusion 손실과 feasible 가중합까지 포함한 loss_dict dict 를 계산한다.
 
+    여기서 batch_num_in_all_epoch 인자는
+    이제 "전체 update step 수"를 뜻한다고 보면 된다.
+    (_setup_stage_schedule 에서 계산된 args._total_update_steps 를 넘겨주는 용도)
+
     Args:
+        loss_dict:
+            diffusion_loss_func 가 채운 기본 손실 딕셔너리.
         args:
-            - _global_update_step: 현재까지 진행된 전체 스텝 수.
-            - train_epochs 등은 batch_num_in_all_epoch 계산에 이미 반영되어 있음.
+            - _global_update_step: 지금까지 진행된 전체 step 수.
         model:
             학습 중인 모델(nn.Module 또는 DDP 래퍼).
         norm_inputs:
             관측값 정규화가 적용된 입력 dict. 각 텐서 shape: (B, ...).
-        near_future_gt_4_dim:
-            - shape: (B, agent_num, future_len, 4)
-            - [x, y, cos(yaw), sin(yaw)].
-        near_future_mask:
-            - shape: (B, agent_num, future_len)
-            - True 인 위치는 완전히 비어 있는 프레임.
+        batch_num_in_all_epoch:
+            전체 update step 수. 보통 args._total_update_steps 값을 그대로 사용한다.
 
     Returns:
         loss_dict:
-            - 다양한 부분 손실과 최종 합(loss_dict["loss"])를 담은 dict.
-            <diffusion_loss_func 가 출력해주는 loss_dict>
-                - neighbor_prediction_loss : 이웃 예측 손실 텐서
-                - integration_loss : 통합 손실 텐서
-                - constraint_loss : 제약 손실 텐서
-
-                - neighbor_prediction_loss_xy / integration_loss_xy
-                - neighbor_prediction_loss_yaw / integration_loss_yaw
-                - neighbor_prediction_loss_xy_early / integration_loss_xy_early
-                - neighbor_prediction_loss_yaw_early / integration_loss_yaw_early
-                - constraint_diff_vx_b / constraint_diff_vy_b / constraint_diff_yaw_rate
-
-            <diffusion_loss_func 출력 후 _compute_loss_dict 가 추가하는 항목>
-            - learn_progress / direct_loss_weight / int_loss_weight / const_loss_weight :
-                진행도 및 가중치 기록용 텐서
-            - loss_dict : 최종 합 손실 텐서.
-
+            진행도/가중치/최종 loss("loss")까지 포함된 dict.
     """
 
-    # 진행도 0~1 계산
+    total_steps_for_progress: int = max(1, int(batch_num_in_all_epoch))
+
+    # 진행도 0~1 계산 (0 step → 0, 마지막 step 근처 → 1)
     progress: float = min(
         1.0,
-        args._global_update_step / float(max(1, batch_num_in_all_epoch - 1)),
+        args._global_update_step / float(max(1, total_steps_for_progress - 1)),
     )
     w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(progress)
 
@@ -400,20 +621,13 @@ def _compute_loss_dict(
         w_int = 1.0
 
     # 진행도/가중치 기록(평균 로그용)
-    loss_dict["learn_progress"] = torch.tensor(
-        float(progress), device=next(model.parameters()).device)
-    loss_dict["direct_loss_weight"] = torch.tensor(float(w_dir),
-                                               device=next(
-                                                   model.parameters()).device)
-    loss_dict["int_loss_weight"] = torch.tensor(float(w_int),
-                                               device=next(
-                                                   model.parameters()).device)
-    loss_dict["const_loss_weight"] = torch.tensor(float(w_const),
-                                                 device=next(
-                                                     model.parameters()).device)
+    device = next(model.parameters()).device
+    loss_dict["learn_progress"] = torch.tensor(float(progress), device=device)
+    loss_dict["direct_loss_weight"] = torch.tensor(float(w_dir), device=device)
+    loss_dict["int_loss_weight"] = torch.tensor(float(w_int), device=device)
+    loss_dict["const_loss_weight"] = torch.tensor(float(w_const), device=device)
 
     # 개별 손실이 없을 수도 있으니 기본값 0 텐서로 처리
-    device = norm_inputs["ego_agent_past"].device
     l_dir = loss_dict.get("neighbor_prediction_loss",
                           torch.tensor(0.0, device=device))
     l_int = loss_dict.get("integration_loss", torch.tensor(0.0, device=device))
@@ -432,28 +646,45 @@ def _backward_and_step(
     scheduler,
     args: argparse.Namespace,
 ) -> float:
-    """역전파/그래디언트 클리핑/스케줄러/옵티마이저 업데이트를 한 번 수행한다.
+    """손실에 대해 역전파를 수행하고, 한 번의 optimizer step 을 끝낸다.
+
+    크게 두 가지 경우를 나눠 처리한다.
+
+    1) DeepSpeed 엔진 사용 시 (use_deepspeed=True):
+        - model.backward(loss) 를 호출해 DeepSpeed가 관리하는 방식으로
+          기울기 계산과 통신을 진행한다.
+        - model.step() 을 호출해 내부 옵티마이저, 스케줄러, grad clipping 을 처리한다.
+        - 이 경우 Stage별 lr_scale 은 build_deepspeed_config 의
+          gradient_clipping, lr_scheduler 설정에 의존한다.
+
+    2) 일반 PyTorch / DDP 사용 시:
+        - loss.backward() 로 기울기를 계산한다.
+        - args.max_grad_norm > 0 일 때 nn.utils.clip_grad_norm_ 로
+          모든 파라미터에 대해 클리핑을 적용한다.
+        - scheduler.step() 으로 각 param_group 의 기본 lr 을 갱신한다.
+        - _apply_stage_lr_scale_to_optimizer(...) 로
+          그룹별 lr_scale 을 곱해 최종 lr 을 만든다.
+        - optimizer.step() 으로 파라미터를 한 스텝 업데이트한다.
 
     Args:
         loss_dict:
-            - "loss" 키에 최종 scalar 손실 텐서가 들어 있는 dict.
-              · loss_dict["loss"]의 shape: ()  스칼라 텐서.
+            "loss" 키를 포함하는 손실 딕셔너리.
+            loss_dict["loss"] 텐서 shape: () (스칼라).
         model:
             학습 중인 모델.
             - 일반 모드: nn.Module 또는 DDP 래퍼.
-            - ZeRO-2 모드: deepspeed.DeepSpeedEngine.
+            - DeepSpeed 모드: deepspeed.DeepSpeedEngine.
         optimizer:
-            torch.optim.Optimizer 또는 DeepSpeed가 감싼 Optimizer.
+            torch.optim.Optimizer 인스턴스.
         scheduler:
-            학습률 스케줄러. 일반 모드에서만 직접 step()을 호출한다.
+            학습률 스케줄러 객체. 일반 모드에서만 step() 을 직접 호출한다.
         args:
             학습 설정/상태 Namespace.
-            - args.use_deepspeed: True이면 DeepSpeed 엔진을 사용한다.
-            - args.max_grad_norm: 기울기 클리핑 기준값. 0 이하이면 클리핑 안 함.
+            - use_deepspeed (bool)
+            - max_grad_norm (float)
 
     Returns:
-        float:
-            loss_dict["loss"].item() 값 (logging 용).
+        float: loss_dict["loss"].item() 값 (로깅용 스칼라).
     """
     # total_loss는 scalar float 값
     total_loss: float = float(loss_dict["loss"].item())
@@ -526,6 +757,11 @@ def _backward_and_step(
        **“합친 전체 기울기를 각 GPU가 길게 들고 있지 않는다”**는 방향으로 생각하면 된다.
         """
         model.backward(loss_tensor)
+
+        _apply_stage_lr_scale_for_deepspeed(
+            model=model,
+            optimizer=optimizer,
+        )
         """ model.step()
 3. 옵티마 단계에서:
    * GPU0는 자신이 가진 파라미터에 대해서만 갱신
@@ -566,8 +802,10 @@ def _backward_and_step(
         if max_grad_norm > 0.0:
             nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
-        # 스케줄러 / 옵티마이저 스텝
+        # 1) 스케줄러로 기본 lr 갱신
         scheduler.step()
+        # 2) Stage/그룹별 lr_scale 적용
+        _apply_stage_lr_scale_to_optimizer(optimizer)
         optimizer.step()
 
     return total_loss
@@ -618,38 +856,51 @@ def train_epoch(
 ) -> Tuple[Dict[str, float], float]:
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행한다.
 
-    처리 순서:
-      1) 모델을 train 모드로 두고, DDP 사용 시 CUDA 동기화.
-      2) 전체 업데이트 스텝 수(batch_num_in_all_epoch)를 계산해 진행도(progress) 기준을 잡는다.
-      3) 각 배치에 대해
-         - device 로 이동 및 상한 클리핑(_prepare_batch_for_device)
-         - augmentation, near future mask/ near future 4차원 궤적 생성
-         - 관측 normalization 
-         - diffusion 손실 / feasible 손실 합성
-         - 역전파, optimizer/scheduler step, EMA 업데이트
-         - 배치별 loss 를 epoch_loss_dict_list 리스트에 모은다.
-      4) epoch 종료 후, 배치별 loss 를 평균(get_epoch_mean_loss).
-      5) DDP 사용 시 rank 0 기준으로 평균 후 출력/반환.
+    처리 흐름:
+        1) 모델을 train 모드로 두고, DDP 사용 시 CUDA 동기화.
+        2) 현재 전역 스텝 값에 맞춰 Stage / lr_scale 을 한 번 초기화한다.
+        3) 전체 업데이트 스텝 수(batch_num_in_all_epoch)를 계산한다.
+        4) 각 배치에 대해 다음 순서를 수행한다.
+            a) _update_model_stage_and_lr_scale(...) 로
+               Stage1→2→3 전환 시점에 맞춰 Encoder freeze + lr_scale 갱신.
+            b) _prepare_batch_for_device(...) 로
+               배치를 device 로 옮기고, agent/lane 축을 상한에 맞게 자름.
+               · ego_future_gt_3_dim: (B, future_len, 3)
+               · near_future_gt_3_dim: (B, agent_num, future_len, 3)
+            c) _apply_augmentation(...) 으로 ego / neighbor 궤적에 증강 적용.
+            d) _build_near_future_4dim_and_mask(...) 로
+               (x, y, yaw) → (x, y, cos, sin) + mask 생성.
+            e) args.observation_normalizer(...) 로 입력을 정규화.
+            f) diffusion_loss_func(...) 로 기본 손실(neighbor / integration / constraint 등) 계산.
+            g) _compute_loss_dict(...) 으로 진행도에 따라
+               direct / integration / constraint 가중치를 섞어 최종 loss 만들기.
+            h) _backward_and_step(...) 으로 역전파 + optimizer/scheduler step 수행.
+            i) _apply_weight_decay_warmdown(...) 으로 lr 비율에 맞춰 weight_decay 보정.
+            j) _update_ema_if_needed(...) 로 EMA 모델이 있을 경우 한 스텝 업데이트.
+            k) loss_dict 를 epoch_loss_dict_list 에 모으고,
+               args._global_update_step 을 1 증가시킨다.
+        5) get_epoch_mean_loss(...) 로 배치별 loss 를 평균낸다.
+        6) DDP 사용 시 ddp.reduce_and_average_losses(...) 로
+           rank 0 기준 전체 평균을 계산한다.
 
     Args:
-        data_loader:
-            PyTorch DataLoader. 각 요소는 collate_fn 이 만든 배치 dict.
-        model:
-            학습 중인 모델(nn.Module 또는 DDP 래퍼).
-        optimizer:
-            torch.optim.Optimizer 인스턴스.
-        args:
-            학습 설정/상태 Namespace.
-        ema:
-            EMA 래퍼(ModelEma 등) 또는 None.
-        scheduler:
-            학습률 스케줄러. 배치마다 step() 이 호출된다.
-        aug:
-            StatePerturbation 또는 NPCStatePerturbation, 또는 None.
+        data_loader: PyTorch DataLoader.
+            각 요소는 collate_fn(DiffusionPlannerCollate)이 만든
+            배치 dict (key: str, value: Tensor) 이다.
+        model: 학습 중인 모델(nn.Module 또는 DDP/DeepSpeed 래퍼).
+        optimizer: torch.optim.Optimizer 인스턴스.
+        args: 학습 설정/상태 Namespace.
+        ema: timm.utils.ModelEma 와 같은 EMA 래퍼 또는 None.
+        scheduler: 학습률 스케줄러 객체.
+        aug: StatePerturbation 또는 NPCStatePerturbation, 또는 None.
 
     Returns:
-        - epoch_mean_loss: 손실 항목별 평균 dict. ( Dict[str, float] )
-        - epoch_mean_loss["loss"]: 최종 스칼라 손실 값. float
+        Tuple[Dict[str, float], float]:
+            - epoch_mean_loss:
+                손실 항목별 평균 값 딕셔너리.
+                예: {"loss": 0.42, "neighbor_prediction_loss": 0.3, ...}
+            - epoch_mean_loss["loss"]:
+                최종 학습 손실 스칼라(float).
     """
     epoch_loss_dict_list: List[Dict[str, torch.Tensor]] = []
 
@@ -658,14 +909,30 @@ def train_epoch(
     if args.ddp:
         torch.cuda.synchronize()
 
-    # 전체 업데이트 스텝 수 설정 및 global step 초기화 보장
-    batch_num_in_all_epoch: int = _init_global_step_and_total_updates(
-        args,
-        batch_num_in_epoch=len(data_loader),
+    # ✅ 1) 현재 전역 step에 맞춰 Stage / lr_scale 한 번만 정리
+    _update_model_stage_and_lr_scale(
+        model=model,
+        optimizer=optimizer,
+        args=args,
     )
+
+    # ✅ 2) 진행도(progress) 계산에 사용할 전체 update step 수 결정
+    #    - Stage 스케줄에서 미리 계산된 값이 있으면 그대로 사용
+    #    - 없으면 과거 방식대로 train_epochs * len(data_loader) 로 근사
+    total_update_steps: int = int(getattr(args, "_total_update_steps", 0))
+    if total_update_steps <= 0:
+        total_update_steps = max(
+            1,
+            int(args.train_epochs) * max(1, len(data_loader)),
+        )
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
+            _update_model_stage_and_lr_scale(
+                model=model,
+                optimizer=optimizer,
+                args=args,
+            )
             # 1) device 이동 + 상한 클리핑 + 정답 분리
             inputs, outputs = _prepare_batch_for_device(
                 batch,
@@ -732,8 +999,7 @@ def train_epoch(
                 loss_dict=raw_loss_dict,
                 args=args,
                 model=model,
-                norm_inputs=norm_inputs,
-                batch_num_in_all_epoch=batch_num_in_all_epoch,
+                batch_num_in_all_epoch=total_update_steps,
             )
 
             total_loss: float = _backward_and_step(
