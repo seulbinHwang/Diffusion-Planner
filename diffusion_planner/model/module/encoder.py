@@ -405,6 +405,45 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Linear(8, config.hidden_dim)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
 
+
+    def iter_encoder_local_parameters(self) -> Iterator[nn.Parameter]:
+        """로컬 인코더(Group A)에 속한 파라미터들을 순서대로 돌려줍니다.
+
+        로컬 인코더는 개별 차량, 정적 물체, 차선, 위치 임베딩 등을 읽는 부분입니다.
+        """
+        local_modules = [
+            self.agents_encoder,
+            self.static_encoder,
+            self.lane_encoder,
+        ]
+        for module in local_modules:
+            for param in module.parameters():
+                # param: (out_dim, in_dim) 또는 (dim,) 형태의 계층 파라미터
+                yield param
+
+        for param in self.pos_emb.parameters():
+            # param: (hidden_dim, 8) 또는 (hidden_dim,)
+            yield param
+
+        # pos_scale: shape () 스칼라 파라미터
+        yield self.pos_scale
+
+    def iter_encoder_global_parameters(self) -> Iterator[nn.Parameter]:
+        """글로벌 인코더(Group B)에 속한 파라미터들을 순서대로 돌려줍니다.
+
+        글로벌 인코더는 여러 객체를 합쳐 장면 전체를 요약하는 부분입니다.
+        """
+        global_modules = [
+            self.fusion,
+            self.npc_route_encoder,
+        ]
+        for module in global_modules:
+            if module is None:
+                continue
+            for param in module.parameters():
+                # param: (out_dim, in_dim) 또는 (dim,)
+                yield param
+
     def _zero_with_touch(self, ref: torch.Tensor,
                          params: Iterable[torch.nn.Parameter]) -> torch.Tensor:
         """ref와 같은 shape의 0 텐서를 반환하되, 주어진 파라미터들을 0계수로 터치해
