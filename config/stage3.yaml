@@ -1,9 +1,9 @@
 # configs/stage3.yaml
-name: dp_world_model
+name: stage_test
 stage_name: stage3_full_unfreeze_finetune
 
 batch_size: 256
-train_epochs: 36 #360              # 234 + 90 + 36
+train_epochs: 1 #36 #360              # 234 + 90 + 36
 
 # Stage3: Stage1 max lr의 1/4에서 시작 → 1/5 근처까지 감소
 learning_rate: 1.25e-4         # ≈ 5e-4 / 4
