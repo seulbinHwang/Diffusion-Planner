@@ -2,6 +2,7 @@ import argparse
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
 import os
 from typing import Any, Dict
+from mmengine.fileio import load as mmengine_load  # stage config 로딩용
 
 
 def boolean(v):
@@ -13,6 +14,63 @@ def boolean(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
+
+def _override_args_with_stage_config(args: argparse.Namespace) -> argparse.Namespace:
+    """stage_config_path에 지정된 json/yaml 파일을 읽어 args 값을 덮어쓴다.
+
+    이 함수는 "한 번의 학습(run)을 하나의 stage 설정 파일로 제어"하기 위한 역할을 한다.
+    stage_config_path가 비어 있으면 아무 것도 하지 않고 그대로 돌려주고,
+    지정되어 있으면 해당 파일을 로드해서 args 안의 값을 덮어쓴다.
+
+    동작 규칙:
+      * 파일 최상단이 dict 이면 그대로 사용하고,
+        {"args": {...}} 형태이면 내부 args dict만 꺼내서 쓴다.
+      * 파일 안에 있는 key들은 모두 args의 속성으로 복사한다.
+        - 이미 존재하는 key  → 값 덮어쓰기 (override 로그 출력)
+        - 존재하지 않는 key → 새 속성으로 추가 (unknown key 로그 출력)
+
+    Args:
+        args (argparse.Namespace):
+            - argparse로 파싱된 원본 인자 객체.
+            - 이 함수 안에서 in-place로 수정되며,
+              config_dict: Dict[str, Any]  # json/yaml에서 읽은 일반적인 키-값 매핑
+              overrides: Dict[str, Any]    # 실제로 덮어쓸 키-값 집합
+
+    Returns:
+        argparse.Namespace:
+            - stage_config_path가 설정되지 않은 경우: 입력으로 받은 args 그대로.
+            - stage_config_path가 유효한 파일인 경우:
+              파일 내용으로 값이 덮어쓰기된 동일 args 객체.
+    """
+    # 우선순위: stage_config_path > stage_config
+    stage_config_path = getattr(args, "stage_config_path", None)
+
+    if not stage_config_path:
+        return args
+
+    config_path = os.path.expanduser(stage_config_path)
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"stage_config_path로 지정한 파일을 찾을 수 없습니다: {config_path}"
+        )
+
+    config_dict: Dict[str, Any] = mmengine_load(config_path)
+    if not isinstance(config_dict, dict):
+        raise TypeError(
+            f"stage 설정 파일은 dict 형태여야 합니다. type={type(config_dict)}"
+        )
+
+    overrides: Dict[str, Any] = config_dict.get("args", config_dict)
+
+    for key, value in overrides.items():
+        if hasattr(args, key):
+            print(f"[StageConfig] override: {key}={value!r}", flush=True)
+        else:
+            print(f"[StageConfig] unknown key 추가: {key}={value!r}", flush=True)
+        setattr(args, key, value)
+
+    print(f"[StageConfig] '{config_path}' 적용 완료.", flush=True)
+    return args
 
 
 def get_args():
@@ -36,7 +94,16 @@ def get_args():
         type=str,
         help='wandb artifact version to resume from (e.g., "latest")',
         default=None)
-
+    parser.add_argument(
+        '--resume_model_only',
+        type=boolean,
+        default=False,
+        help=(
+            "True이면 체크포인트에서 모델(또는 EMA) 파라미터만 불러오고, "
+            "optimizer / scheduler / EMA 상태, epoch, wandb run 은 모두 새로 시작합니다. "
+            "즉, pretrained weight 로만 초기화된 새 학습 run 으로 동작합니다."
+        ),
+    )
     # Data
     parser.add_argument('--train_set',
                         type=str,
@@ -130,6 +197,28 @@ def get_args():
                         help='number of route lanes',
                         default=250)
 
+    parser.add_argument('--p_sat',
+                        type=float,
+                        help='p_sat',
+                        default=0.6)
+    parser.add_argument('--w_dir',
+                        type=float,
+                        help='w_dir',
+                        default=1.0)
+    parser.add_argument('--w_int_min',
+                        type=float,
+                        help='w_int_min',
+                        default=0.05)
+    parser.add_argument('--w_int_max',
+                        type=float,
+                        help='w_int_max',
+                        default=2.0)
+    parser.add_argument('--w_const',
+                        type=float,
+                        help='w_const',
+                        default=0.04)
+
+
     # DataLoader parameters
     parser.add_argument('--augment_prob',
                         type=float,
@@ -202,10 +291,70 @@ def get_args():
                         type=float,
                         help='learning rate (default: 5e-4)',
                         default=5e-4)
+    parser.add_argument(
+        '--min_learning_rate',
+        type=float,
+        default=None,
+        help='cosine 스케줄에서 사용할 최소 learning rate. '
+             'None이면 max lr의 0.2배를 사용합니다.',
+    )
+
     parser.add_argument('--warm_up_epoch',
                         type=int,
                         help='number of warm up',
                         default=10)
+    # ===== Stage config / LR scheduler / 모듈 그룹 설정 =====
+    parser.add_argument(
+        '--stage_config_path',
+        type=str,
+        default=None,
+        help='단일 stage 학습 설정이 들어 있는 json/yaml 파일 경로.',
+    )
+    parser.add_argument(
+        '--lr_scheduler_type',
+        type=str,
+        choices=['cosine', 'uniform'],
+        default='cosine',
+        help='learning rate 스케줄 형태 ("cosine" 또는 "uniform").',
+    )
+
+    parser.add_argument(
+        '--use_lr_warmup',
+        type=boolean,
+        default=True,
+        help='True이면 학습 초기에 learning rate 선형 warmup을 사용합니다.',
+    )
+
+
+    parser.add_argument(
+        '--freeze_encoder_local',
+        type=boolean,
+        default=False,
+        help='True이면 encoder_local(Group A)을 학습에서 제외합니다.',
+    )
+
+    parser.add_argument(
+        '--encoder_local_lr_scale',
+        type=float,
+        default=1.0,
+        help='encoder_local(Group A)에 곱해질 lr 배율 (예: 0.1).',
+    )
+
+    parser.add_argument(
+        '--encoder_global_lr_scale',
+        type=float,
+        default=1.0,
+        help='encoder_global(Group B)에 곱해질 lr 배율.',
+    )
+
+    parser.add_argument(
+        '--decoder_lr_scale',
+        type=float,
+        default=1.0,
+        help='decoder(Group C)에 곱해질 lr 배율.',
+    )
+
+
     parser.add_argument('--prefetch_factor',
                         type=int,
                         help='number of warm up',
@@ -338,21 +487,23 @@ def get_args():
                         default=1,
                         help='limit total number of scenarios')
     parser.add_argument('--shuffle_scenarios',
-                        type=bool,
+                        type=boolean,
                         default=False,
                         help='shuffle scenarios')
     parser.add_argument('--reset_save_path',
-                        type=bool,
+                        type=boolean,
                         default=False,
                         help='shuffle scenarios')
     parser.add_argument('--save_image',
-                        type=bool,
+                        type=boolean,
                         default=False,
                         help='shuffle scenarios')
     parser.add_argument('--make_statistics_when_caching',
                         default=True,
                         type=boolean)
     args = parser.parse_args()
+    # ★ stage config(json/yaml)로 CLI 인자 덮어쓰기
+    args = _override_args_with_stage_config(args)
     if not args.use_direct_loss:
         assert not args.use_guidance and not args.use_feasible_blend, \
             "use_direct_loss가 False인 경우, use_guidance와 use_feasible_blend는 모두 False여야 합니다."

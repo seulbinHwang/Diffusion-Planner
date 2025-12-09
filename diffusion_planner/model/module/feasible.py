@@ -23,7 +23,7 @@ torch.set_printoptions(sci_mode=False, precision=6)
 from typing import Tuple
 # feasible.py 최상단 import 근처
 from collections import OrderedDict
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Any
 
 # <추가하자>
 from typing import NamedTuple
@@ -3847,7 +3847,7 @@ class FeasibleProjector(nn.Module):
 
     @classmethod
     def loss_weights_by_progress(cls,
-                                 progress: float) -> Tuple[float, float, float]:
+                                 progress: float, args: Any) -> Tuple[float, float, float]:
         """손실 가중치 스케줄러.
 
         Args:
@@ -3857,17 +3857,12 @@ class FeasibleProjector(nn.Module):
             Tuple[float, float, float]: (w_direct, w_integration, w_constraint)
         """
         p = float(max(0.0, min(1.0, progress)))
-        # Constants
-        p_sat = 0.60
-        w_dir = 1.00
-        w_int_min, w_int_max = 0.05, 2.00
-        w_const = 0.02
         # piecewise-linear for integration weight
-        if p <= p_sat:
-            w_int = w_int_min + (w_int_max - w_int_min) * (p / p_sat)
+        if p <= args.p_sat:
+            w_int = args.w_int_min + (args.w_int_max - args.w_int_min) * (p / args.p_sat)
         else:
-            w_int = w_int_max
-        return w_dir, w_int, w_const
+            w_int = args.w_int_max
+        return args.w_dir, w_int, args.w_const
 
     # ================================================================
     # [추가] (B,Pnn,point_len, C) 형태를 멀티 채널 SG에 넘겨주는 헬퍼

@@ -12,41 +12,6 @@ class Diffusion_Planner(nn.Module):
         super().__init__()
         self.encoder = Diffusion_Planner_Encoder(config)
         self.decoder = Diffusion_Planner_Decoder(config)
-        # 현재 학습 Stage (1, 2, 3). 기본은 Stage1.
-        self._training_stage: int = 1
-
-    @property
-    def training_stage(self) -> int:
-        """현재 학습 Stage 번호를 돌려줍니다.
-
-        Returns:
-            int: 1, 2, 3 중 하나.
-        """
-        return self._training_stage
-
-    def set_stage(self, stage: int) -> None:
-        """학습 Stage를 설정하고, 로컬 인코더 얼림 여부를 바꿉니다.
-
-        Stage 규칙:
-            - 1: Encoder/Decoder 전부 학습.
-            - 2: 로컬 인코더(Group A)만 얼리고 나머지는 학습.
-            - 3: 다시 전부 학습. (학습률 차이는 optimizer에서 처리)
-        """
-        if stage not in (1, 2, 3):
-            raise ValueError(f"stage는 1, 2, 3 중 하나여야 합니다. 받은 값: {stage}")
-
-        self._training_stage = int(stage)
-
-        # 기본값: 전 파라미터 학습 가능
-        for param in self.parameters():
-            param.requires_grad_(True)
-
-        # Stage2: 로컬 인코더만 freeze
-        if stage == 2:
-            encoder_core: Encoder = self.encoder.encoder
-            if hasattr(encoder_core, "iter_encoder_local_parameters"):
-                for param in encoder_core.iter_encoder_local_parameters():
-                    param.requires_grad_(False)
 
     def iter_group_encoder_local_parameters(self) -> Iterator[nn.Parameter]:
         """로컬 인코더(Group A) 파라미터 이터레이터를 돌려줍니다."""

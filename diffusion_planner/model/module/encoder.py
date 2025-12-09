@@ -405,7 +405,6 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Linear(8, config.hidden_dim)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
 
-
     def iter_encoder_local_parameters(self) -> Iterator[nn.Parameter]:
         """로컬 인코더(Group A)에 속한 파라미터들을 순서대로 돌려줍니다.
 

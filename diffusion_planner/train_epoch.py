@@ -393,24 +393,23 @@ def _compute_loss_dict(
         1.0,
         args._global_update_step / float(max(1, batch_num_in_all_epoch - 1)),
     )
-    w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(progress)
+    w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(progress, args)
 
     if not args.use_direct_loss:
         w_dir = 0.0
         w_int = 1.0
 
     # 진행도/가중치 기록(평균 로그용)
-    loss_dict["learn_progress"] = torch.tensor(
-        float(progress), device=next(model.parameters()).device)
-    loss_dict["direct_loss_weight"] = torch.tensor(float(w_dir),
+    loss_dict["learn_progress"] = torch.tensor(float(progress),
                                                device=next(
                                                    model.parameters()).device)
+    loss_dict["direct_loss_weight"] = torch.tensor(
+        float(w_dir), device=next(model.parameters()).device)
     loss_dict["int_loss_weight"] = torch.tensor(float(w_int),
-                                               device=next(
-                                                   model.parameters()).device)
-    loss_dict["const_loss_weight"] = torch.tensor(float(w_const),
-                                                 device=next(
-                                                     model.parameters()).device)
+                                                device=next(
+                                                    model.parameters()).device)
+    loss_dict["const_loss_weight"] = torch.tensor(
+        float(w_const), device=next(model.parameters()).device)
 
     # 개별 손실이 없을 수도 있으니 기본값 0 텐서로 처리
     device = norm_inputs["ego_agent_past"].device

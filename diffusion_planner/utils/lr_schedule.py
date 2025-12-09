@@ -81,3 +81,40 @@ def build_pytorch_warmup_cosine_scheduler(
         scheduler = hold
 
     return scheduler
+
+
+def build_pytorch_warmup_constant_scheduler(
+    optimizer: Optimizer,
+    total_update_steps: int,
+    warmup_steps: int,
+) -> torch.optim.lr_scheduler._LRScheduler:
+    """선형 워밍업 이후, 학습률을 일정하게 유지하는 스케줄러를 만든다.
+
+    Args:
+        optimizer: 학습에 사용할 옵티마이저.
+        total_update_steps: 전체 업데이트 스텝 수. (현재 구현에서는 사용하지 않지만, 인터페이스 통일용)
+        warmup_steps: 앞에서 몇 스텝 동안 선형으로 learning rate를 올릴지.
+
+    Returns:
+        torch.optim.lr_scheduler._LRScheduler: PyTorch 스케줄러 객체.
+    """
+    _ = total_update_steps  # 시그니처 맞추기용, 현재 로직에서는 사용하지 않는다.
+
+    if warmup_steps > 0:
+        warmup = LinearLR(
+            optimizer,
+            start_factor=1.0 / max(1, warmup_steps),
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        hold = MultiplicativeLR(optimizer, lr_lambda=lambda step: 1.0)
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup, hold],
+            milestones=[warmup_steps],
+        )
+    else:
+        # 워밍업 없이 바로 고정 lr
+        scheduler = MultiplicativeLR(optimizer, lr_lambda=lambda step: 1.0)
+
+    return scheduler

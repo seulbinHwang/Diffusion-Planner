@@ -10,6 +10,10 @@ from typing import Any, Callable, Dict, List
 import numpy as np
 # deprecated 키는 사용 금지
 os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+from collections import defaultdict
+
+from typing import Optional, Dict, Any
+import io
 
 # TensorFloat-32(TF32) 연산을 허용하여
 #   - Ampere(A100 등) GPU에서 matmul/cuDNN 연산을 FP32보다 빠르게 처리하고
@@ -33,7 +37,11 @@ from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from requests.exceptions import HTTPError
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
 from diffusion_planner.utils.normalizer import ObservationNormalizer, StateNormalizer
-from diffusion_planner.utils.lr_schedule import CosineAnnealingWarmUpRestarts, build_pytorch_warmup_cosine_scheduler
+from diffusion_planner.utils.lr_schedule import (
+    build_pytorch_warmup_cosine_scheduler,
+    build_pytorch_warmup_constant_scheduler,
+)
+
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.data_augmentation import StatePerturbation
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
@@ -477,85 +485,317 @@ def discover_extra_no_weight_decay_names(
     return sorted(extra)
 
 
+# 바뀜
+def _set_requires_grad_for_encoder_local(
+    model: nn.Module,
+    requires_grad: bool,
+) -> None:
+    """encoder_local(Group A) 파라미터들의 requires_grad 값을 일괄 변경한다.
+
+    Args:
+        model: Diffusion_Planner 또는 래핑된 모델(DDP/DeepSpeed 상관 없음).
+        requires_grad: True 이면 학습 가능, False 이면 고정.
+    """
+    if not hasattr(model, "iter_group_encoder_local_parameters"):
+        return
+
+    for param in model.iter_group_encoder_local_parameters():
+        if isinstance(param, nn.Parameter):
+            param.requires_grad_(requires_grad)
+
+
+def _build_param_role_mapping(model: nn.Module,) -> Dict[int, str]:
+    """모델 파라미터 id → 역할 이름(encoder_local/global/decoder/default) 매핑을 만든다.
+
+    Diffusion_Planner 처럼
+      - iter_group_encoder_local_parameters()
+      - iter_group_encoder_global_parameters()
+      - iter_group_decoder_parameters()
+    메서드를 제공하는 모델을 가정하고, 각 이터레이터에서 반환되는 파라미터에
+    역할 이름을 붙인다.
+
+    Args:
+        model (nn.Module):
+            - Diffusion_Planner 또는 동일한 인터페이스를 가진 모델.
+            - 각 이터레이터는 nn.Parameter 텐서를 yield 한다.
+              예: (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW).
+
+    Returns:
+        Dict[int, str]:
+            - key: 파라미터 객체의 id(id(param)).
+            - value: "encoder_local" / "encoder_global" / "decoder" / "default" 중 하나.
+              "default"는 이 함수 내부에서는 직접 채우지 않고,
+              이후 단계에서 역할을 못 찾은 파라미터에 대해 사용된다.
+    """
+    param_int_id_to_role_name_str: Dict[int, str] = {}
+
+    # Group A: encoder_local
+    if hasattr(model, "iter_group_encoder_local_parameters"):
+        for p in model.iter_group_encoder_local_parameters():
+            if isinstance(p, nn.Parameter):
+                param_int_id_to_role_name_str[id(p)] = "encoder_local"
+
+    # Group B: encoder_global
+    if hasattr(model, "iter_group_encoder_global_parameters"):
+        for p in model.iter_group_encoder_global_parameters():
+            if isinstance(p, nn.Parameter):
+                param_int_id_to_role_name_str[id(p)] = "encoder_global"
+
+    # Group C: decoder
+    if hasattr(model, "iter_group_decoder_parameters"):
+        for p in model.iter_group_decoder_parameters():
+            if isinstance(p, nn.Parameter):
+                param_int_id_to_role_name_str[id(p)] = "decoder"
+
+    return param_int_id_to_role_name_str
+
+
+def _build_param_groups_with_roles(
+    base_param_groups: List[Dict[str, Any]],
+    param_int_id_to_role_name_str: Dict[int, str],
+    lr: float,
+    role_lr_scale: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """역할별 lr 배율을 적용한 AdamW param_group 리스트를 만든다.
+
+    timm.param_groups_weight_decay 로 만든 기본 그룹(base_param_groups)을 받아서,
+    각 그룹 안의 파라미터를 역할별로 다시 나누고 역할별 lr_scale 을 곱한다.
+
+    Args:
+        base_param_groups (List[Dict[str, Any]]):
+            - timm.param_groups_weight_decay 가 만든 기본 그룹들.
+            - 각 원소 g 에 대해:
+                g["params"]: List[nn.Parameter]
+                    · Linear weight: (out_dim, in_dim)
+                    · bias/Norm weight: (dim,)
+                    · Conv weight: (C_out, C_in, kH, kW)
+                g["weight_decay"]: float
+        param_int_id_to_role_name_str (Dict[int, str]):
+            - _build_param_role_mapping 에서 만든 파라미터 id → 역할 이름 매핑.
+        lr (float):
+            - Stage 기준 학습률(Decoder/기본 그룹 기준).
+        weight_decay (float):
+            - 가중치 감쇠 값. decay 그룹에만 적용된다.
+        role_lr_scale (Dict[str, float]):
+            - 역할별 lr 배율.
+            - key: "encoder_local" / "encoder_global" / "decoder" / "default"
+            - value: lr에 곱해줄 배율.
+
+    Returns:
+        List[Dict[str, Any]]:
+            - 최종 AdamW param_group 리스트.
+            - 각 그룹 딕셔너리에는
+                · "params": List[nn.Parameter]
+                · "weight_decay": float
+                · "lr": float
+                · "lr_max": float
+                · "wd_max": float
+              필드가 포함된다.
+    """
+    final_param_groups: List[Dict[str, Any]] = []
+
+    default_scale: float = float(role_lr_scale.get("default", 1.0))
+
+    for base_pg in base_param_groups:
+        wd_value: float = float(base_pg.get("weight_decay", 0.0))
+        # params_in_base: [nn.Parameter], 각 텐서 shape는 레이어 종류에 따라 다름.
+        params_in_base: List[nn.Parameter] = [
+            p for p in base_pg["params"] if p.requires_grad
+        ]
+        if not params_in_base:
+            continue
+
+        # 역할별로 파라미터를 다시 나눈다.
+        buckets: Dict[str, List[nn.Parameter]] = defaultdict(list)
+        for p in params_in_base:
+            role = param_int_id_to_role_name_str.get(id(p), "default")
+            buckets[role].append(p)
+
+        for role, params_in_role in buckets.items():
+            if not params_in_role:
+                continue
+            scale: float = float(role_lr_scale.get(role, default_scale))
+            lr_role: float = lr * scale
+            pg: Dict[str, Any] = {
+                "params": params_in_role,
+                "weight_decay": wd_value,
+                "lr": lr_role,
+                "lr_max": float(lr_role),
+                "wd_max": float(wd_value),
+            }
+            final_param_groups.append(pg)
+
+    return final_param_groups
+
+
+def _build_fallback_param_groups(
+    base_param_groups: List[Dict[str, Any]],
+    lr: float,
+) -> List[Dict[str, Any]]:
+    """역할 정보를 찾지 못한 경우 timm 기본 그룹을 그대로 사용하는 fallback을 만든다.
+
+    역할 매핑이 비어 있거나 iter_group_* 인터페이스가 없는 모델에서도
+    학습이 가능하도록, timm.param_groups_weight_decay 결과를
+    그대로 AdamW param_group 형식으로 옮긴다.
+
+    Args:
+        base_param_groups (List[Dict[str, Any]]):
+            - timm.param_groups_weight_decay 가 만든 그룹들.
+        lr (float):
+            - 기준 학습률.
+
+    Returns:
+        List[Dict[str, Any]]:
+            - "lr_max" / "wd_max" 필드가 채워진 param_group 리스트.
+    """
+    final_param_groups: List[Dict[str, Any]] = []
+
+    for base_pg in base_param_groups:
+        wd_value: float = float(base_pg.get("weight_decay", 0.0))
+        params_in_base: List[nn.Parameter] = [
+            p for p in base_pg["params"] if p.requires_grad
+        ]
+        if not params_in_base:
+            continue
+        pg: Dict[str, Any] = {
+            "params": params_in_base,
+            "weight_decay": wd_value,
+            "lr": lr,
+            "lr_max": float(lr),
+            "wd_max": float(wd_value),
+        }
+        final_param_groups.append(pg)
+
+    return final_param_groups
+
+
+# 변경
 def build_adamw_with_param_groups(
     model: nn.Module,
     lr: float,
     weight_decay: float,
     include_seed_params: bool = True,
     use_8bit_optimizer: bool = False,
+    role_lr_scale: Optional[Dict[str, float]] = None,
 ) -> Tuple[optim.Optimizer, List[str]]:
-    """AdamW 옵티마이저와 파라미터 그룹을 만드는 헬퍼 함수.
+    """역할별 lr 배율이 반영된 AdamW(또는 8bit AdamW) 옵티마이저를 생성한다.
 
-    이 함수는 모델을 훑어서
-      1) 감쇠를 적용할 가중치
-      2) 감쇠를 적용하지 않을 가중치(편향, 정규화 계층, 토큰/위치 임베딩 등)
-    를 자동으로 나눈 뒤, 한 번에 AdamW 옵티마이저를 만들어 준다.
+    전체 흐름은 다음과 같다.
+
+    1) discover_extra_no_weight_decay_names 로
+       토큰/포지션 계열 파라미터 이름(extra_nwd)을 찾아 weight decay에서 제외한다.
+    2) timm.param_groups_weight_decay 를 호출해,
+       - weight_decay를 적용할 그룹
+       - 적용하지 않을 그룹
+       으로 1차 그룹(base_param_groups)을 만든다.
+       이때 각 그룹의 "params" 리스트 안에는
+         · (out_dim, in_dim) shaped Linear weight
+         · (dim,) shaped bias / Norm weight
+         · (C_out, C_in, kH, kW) shaped Conv weight
+       와 같은 텐서들이 들어 있다.
+    3) Diffusion_Planner 가 제공하는
+       iter_group_encoder_local_parameters / iter_group_encoder_global_parameters /
+       iter_group_decoder_parameters 를 사용해
+       각 파라미터를 역할 이름("encoder_local"/"encoder_global"/"decoder"/"default")
+       으로 매핑한다.
+    4) role_lr_scale 에 따라 역할별 lr 배율을 곱해
+       최종 param_group 리스트를 만든다.
+       - 각 그룹에는 "lr", "lr_max", "weight_decay", "wd_max" 가 포함된다.
+    5) use_8bit_optimizer 플래그에 따라
+       - bnb.optim.AdamW8bit 또는
+       - torch.optim.AdamW
+       인스턴스를 생성한다. 전역 weight_decay 는 0.0 로 두고,
+       그룹별 weight_decay 만 사용한다.
 
     Args:
-        model: 학습할 모델 객체(nn.Module). 내부 파라미터 텐서의 예시는
-            - 선형 계층 weight: (out_dim, in_dim)
-            - 선형 계층 bias / LayerNorm weight: (dim,)
-            - 컨볼루션 weight: (C_out, C_in, kH, kW) 와 같은 형태.
-        lr: 기준 학습률. 각 파라미터 그룹의 "lr"와 "lr_max"에 동일하게 들어간다.
-        weight_decay: 가중치 감쇠 값. 감쇠를 적용할 그룹에만 사용된다.
-        include_seed_params: seeds/ego_fut_seeds 같은 학습용 토큰 파라미터를
-            감쇠 제외 목록에 포함할지 여부.
-        use_8bit_optimizer: True이면 8비트 AdamW(bnb.AdamW8bit)를 사용한다.
+        model (nn.Module):
+            - 학습 대상 모델.
+            - Diffusion_Planner 처럼 encoder_local/global/decoder 그룹 이터레이터를
+              제공하는 경우 역할별 lr 제어가 적용된다.
+        lr (float):
+            - 기준 학습률.
+            - 역할별 lr_scale 은 이 값에 곱해진다.
+        weight_decay (float):
+            - 가중치 감쇠 값.
+        include_seed_params (bool):
+            - seeds/ego_fut_seeds 같은 학습 쿼리 토큰을
+              no_weight_decay 목록에 포함할지 여부.
+        use_8bit_optimizer (bool):
+            - True 이면 bitsandbytes의 AdamW8bit 를 사용한다.
+        role_lr_scale (Optional[Dict[str, float]]):
+            - 역할별 lr 배율.
+            - key: "encoder_local", "encoder_global", "decoder", "default"
+            - value: lr 배율 (예: 0.1, 1.0 등).
 
     Returns:
         Tuple[optim.Optimizer, List[str]]:
-            - optim: AdamW 또는 8비트 AdamW 옵티마이저 인스턴스.
-              내부 파라미터 그룹의 각 원소는
-                · "params": List[Tensor]  (각 텐서 shape 예: (out_dim, in_dim), (dim,) 등)
-                · "weight_decay": float
-                · "lr": float
-                · "lr_max": float
-                · "wd_max": float
-              와 같은 키를 가진다.
-            - extra_nwd: 감쇠를 적용하지 않을 파라미터 이름 목록.
-
-    TODO
-        - 특정 모듈의 lr을 조절할 수 있는 기능 추가 고려
+            - optimizer:
+                · torch.optim.AdamW 또는 bnb.optim.AdamW8bit 인스턴스.
+                · optimizer.param_groups[i]["params"] 리스트 안에는
+                  다양한 shape 의 nn.Parameter 텐서들이 들어 있다.
+            - extra_nwd:
+                · discover_extra_no_weight_decay_names 로 찾은
+                  no_weight_decay 파라미터 이름 목록.
     """
-    # extra_nwd: List[str], 감쇠 제외로 추가할 파라미터 이름들
+    # 1) weight decay 에서 제외할 파라미터 이름 목록
     extra_nwd = discover_extra_no_weight_decay_names(
-        model, include_seed_params=include_seed_params)
+        model,
+        include_seed_params=include_seed_params,
+    )
 
-    # param_groups: List[Dict[str, Any]]
-    #   각 그룹은 "params" 리스트 안에 다양한 shape의 파라미터 텐서를 가진다.
-    #   예) Linear weight: (out_dim, in_dim), LayerNorm weight: (dim,), conv weight: (C_out, C_in, kH, kW)
-    param_groups = param_groups_weight_decay(
+    # 2) timm 기본 규칙으로 1차 그룹 생성
+    # List[Dict[str]]
+    base_param_groups = param_groups_weight_decay(
         model,
         weight_decay=weight_decay,
         no_weight_decay_list=extra_nwd,
     )
 
-    # 공통 LR / 기준값 부여
-    for g in param_groups:
-        g["lr"] = lr  # η_max(B): 현재 배치에서의 최대 학습률
-        g["lr_max"] = float(lr)  # 스케줄 시작 시 기준 학습률
-        g["wd_max"] = float(g.get("weight_decay", 0.0))  # 그룹별 기준 감쇠 값
+    role_lr_scale = role_lr_scale or {}
 
+    # 3) 파라미터 id → 역할 매핑
+    param_int_id_to_role_name_str: Dict[int,
+                                        str] = _build_param_role_mapping(model)
+
+    # 4) 역할별 lr 배율이 반영된 최종 그룹 생성
+    final_param_groups = _build_param_groups_with_roles(
+        base_param_groups=base_param_groups,
+        param_int_id_to_role_name_str=param_int_id_to_role_name_str,
+        lr=lr,
+        role_lr_scale=role_lr_scale,
+    )
+
+    # 5) 역할 정보를 하나도 못 찾은 경우에는 timm 기본 그룹 그대로 사용
+    if not final_param_groups:
+        final_param_groups = _build_fallback_param_groups(
+            base_param_groups=base_param_groups,
+            lr=lr,
+        )
+
+    # 6) 옵티마이저 생성
     if use_8bit_optimizer:
-        # 8비트 AdamW: 내부 모멘트 텐서는 8비트 정수로 저장되지만,
-        #   파라미터 텐서 shape는 그대로 유지된다.
-        optim = bnb.optim.AdamW8bit(  # type: ignore[attr-defined]
-            param_groups,
+        # 8비트 AdamW: 모멘트 텐서를 8bit 로 저장하지만,
+        #   파라미터 텐서 shape는 (out_dim, in_dim), (dim,) 등 그대로 유지된다.
+        optim_obj = bnb.optim.AdamW8bit(  # type: ignore[attr-defined]
+            final_param_groups,
             lr=lr,
             weight_decay=0.0,
         )
     else:
-        # 최종 옵티마이저 (전역 WD는 0.0로 두고, 그룹별 WD만 사용)
+        # 전역 WD는 0.0 으로 두고, 그룹별 WD만 사용
         try:
-            optim = torch.optim.AdamW(
-                param_groups,
+            optim_obj = torch.optim.AdamW(
+                final_param_groups,
                 fused=True,
                 weight_decay=0.0,
             )
         except (TypeError, RuntimeError):
-            optim = torch.optim.AdamW(param_groups, weight_decay=0.0)
+            optim_obj = torch.optim.AdamW(
+                final_param_groups,
+                weight_decay=0.0,
+            )
 
-    return optim, extra_nwd
+    return optim_obj, extra_nwd
 
 
 class DiffusionPlannerCollate:
@@ -1565,24 +1805,29 @@ def _scale_learning_rate_and_epochs(
         BASE_GLOBAL_BATCH: 기준이 되는 글로벌 배치 크기(예: 2048).
         current_global_batch: 현재 설정에서 실제로 사용되는 글로벌 배치 크기.
     """
-    BASE_GLOBAL_BATCH = 2048  # 기존 기준 글로벌 배치
-    BASE_LR = args.learning_rate  # 기존 기준 LR (Adam/AdamW)
+    BASE_GLOBAL_BATCH = 2048  # 기준 글로벌 배치
+    base_lr: float = float(args.learning_rate)
+    base_min_lr = getattr(args, "min_learning_rate", None)
 
     # DataLoader가 실제로 사용할 글로벌 배치(정수 배수)로 계산
     current_global_batch = _effective_global_batch(args.batch_size, world_size)
-    scale = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
-    # scale 의 최소값을 1로 고정해서, 배치 작아질 때는 LR 감소 없음
-    scale = max(1.0, scale)
-    args.learning_rate = BASE_LR * scale
+
+    # 배치가 커질수록 lr를 키우되, 작아지는 경우는 그대로 둔다.
+    scale_factor = math.sqrt(current_global_batch / float(BASE_GLOBAL_BATCH))
+    scale_factor = max(1.0, scale_factor)
+
+    args.learning_rate = base_lr * scale_factor
+    if base_min_lr is not None:
+        args.min_learning_rate = float(base_min_lr) * scale_factor
 
     # 전체 학습 epoch 수를 글로벌 배치에 맞게 조정
     EPOCH_BETA = 1.0
-    base_epochs_anchor = int(args.train_epochs)  # 예: 360
+    base_epochs_anchor: int = int(args.train_epochs)
 
     scaled_epochs = _auto_scale_train_epochs(
-        base_global_batch=BASE_GLOBAL_BATCH,  # B_0 = 2048
-        base_epochs=base_epochs_anchor,  # E_0 = 360
-        current_global_batch=current_global_batch,  # B = 실제 글로벌 배치
+        base_global_batch=BASE_GLOBAL_BATCH,
+        base_epochs=base_epochs_anchor,
+        current_global_batch=current_global_batch,
         beta=EPOCH_BETA,
         clamp_min=max(1, args.warm_up_epoch + 1),
         clamp_max=None,
@@ -1595,7 +1840,7 @@ def _scale_learning_rate_and_epochs(
 def _prepare_save_path_and_dump_args(
     args: argparse.Namespace,
     global_rank: int,
-) -> Tuple[Optional[str], Optional[str]]:
+) -> Optional[str]:
     """체크포인트/로그를 저장할 경로를 만들고, args.json을 기록한다.
 
     Args:
@@ -1604,10 +1849,11 @@ def _prepare_save_path_and_dump_args(
 
     Returns:
         save_path: rank 0에서 만든 저장 경로. 나머지 rank는 None.
-        time_str: 디렉터리 이름에 사용한 시간 문자열. rank 0에서만 유효.
     """
     if global_rank == 0:
-        if args.resume_local_path_model_path is not None:
+        # TODO: resume_local_path_model_path 이 None이 아니더라도, save_path 를 별도로 저장할 수 있게 구현해야한다?
+        #  그럴려면 save_path가 None도 가능하게끔 코드 수정이 필요
+        if args.resume_local_path_model_path is not None and args.save_dir is None:
             # resume_local_path_model_path: ./training_log/.../2025-08-06-07:23:04/
             save_path = args.resume_local_path_model_path
             # 폴더명 자체가 타임스탬프이므로 그대로 재사용
@@ -1642,7 +1888,7 @@ def _prepare_save_path_and_dump_args(
         args.save_path = None
         time_str = None
 
-    return save_path, time_str
+    return save_path
 
 
 def _build_augmentation(args: argparse.Namespace,) -> Optional[object]:
@@ -1733,23 +1979,11 @@ def _compute_warmup_steps(
 ) -> Tuple[int, int]:
     """워밍업(epoch 수와 배치 크기)에 맞춰 워밍업 step 수를 계산한다.
 
-    여기서 워밍업은 “처음 몇 step 동안은 학습률을 서서히 올리다가,
-    어느 시점 이후부터 본래 학습률로 쓰자”는 개념이다.
-    너무 이른 단계부터 큰 학습률을 쓰면 값이 튀거나 발산하기 쉬워서,
-    초반에는 조금씩 적응시키는 완충 구간을 둔다.
-
-    계산 순서는 다음과 같다.
-      1) 기준 배치 크기(BASE_GLOBAL_BATCH)에서
-         · 한 epoch에 몇 step이 나오는지
-         · 워밍업 epoch 수(args.warm_up_epoch)를 곱해
-           “기준 환경에서의 총 워밍업 step 수(warmup_steps_at_B0)”를 정한다.
-      2) 현재 글로벌 배치(current_global_batch)가 기준보다 크거나 작을 수 있으므로,
-         배치 비율에 따라 워밍업 step 수도 함께 스케일링한다.
-         배치가 커지면 한 epoch당 step이 줄어들기 때문에,
-         워밍업을 너무 길게 또는 너무 짧게 가져가지 않도록 조정하는 목적이다.
+    use_lr_warmup 이 False 이거나 warm_up_epoch <= 0 이면
+    워밍업 없이 바로 본 학습률을 사용한다.
 
     Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
+        args: 학습 설정 Namespace.
         BASE_GLOBAL_BATCH: 기준 글로벌 배치 크기.
         current_global_batch: 현재 글로벌 배치 크기.
         total_data_num: 전체 학습 샘플 수.
@@ -1758,13 +1992,21 @@ def _compute_warmup_steps(
         warmup_steps_at_B0: 기준 배치 크기에서의 워밍업 step 수.
         warmup_steps: 현재 배치 크기에서의 워밍업 step 수.
     """
+    # 바뀜
+    use_warmup: bool = bool(getattr(args, "use_lr_warmup", True))
+    warm_up_epoch: int = int(getattr(args, "warm_up_epoch", 0))
+
+    if (not use_warmup) or warm_up_epoch <= 0:
+        return 0, 0
+
     # 기준 배치 B_0에서의 epoch당 step 수
     steps_per_epoch_at_B0 = math.ceil(total_data_num / float(BASE_GLOBAL_BATCH))
-    warmup_steps_at_B0 = steps_per_epoch_at_B0 * args.warm_up_epoch
+    warmup_steps_at_B0 = steps_per_epoch_at_B0 * warm_up_epoch
 
     batch_ratio = current_global_batch / float(BASE_GLOBAL_BATCH)
     WARMUP_SCALE_EXP = 0.5
-    warmup_steps = math.ceil(warmup_steps_at_B0 * batch_ratio**WARMUP_SCALE_EXP)
+    warmup_steps = math.ceil(warmup_steps_at_B0 *
+                             (batch_ratio**WARMUP_SCALE_EXP))
 
     return warmup_steps_at_B0, warmup_steps
 
@@ -1875,6 +2117,205 @@ def _print_schedule_summary(
         print("=====================================================")
 
 
+def _create_diffusion_planner_and_ema(
+    args: argparse.Namespace,
+    rank: int,
+    use_deepspeed: bool,
+) -> Tuple[nn.Module, Optional[ModelEma], nn.Module]:
+    """Diffusion_Planner, EMA, base_model(DDP unwrap)을 한 번에 만든다.
+
+    처리 순서:
+      1) Diffusion_Planner(args) 로 원본 모델을 만들고,
+         rank 또는 args.device 로 to() 호출한다.
+      2) DDP 모드이면 torch.nn.parallel.DistributedDataParallel 로 래핑한다.
+      3) use_ema=True 이면 timm.utils.ModelEma 로 EMA 복사본을 만든다.
+      4) ddp.get_model(...) 로 DDP/DeepSpeed 래퍼를 벗긴 실제 모듈(base_model)을 얻는다.
+
+    Args:
+        args (argparse.Namespace):
+            - device(str): "cuda" 또는 "cpu" 등.
+            - ddp(bool): DDP 사용 여부.
+            - use_ema(bool): EMA 사용 여부.
+        rank (int):
+            - 이 프로세스에서 사용할 GPU 인덱스.  # shape: ()
+        use_deepspeed (bool):
+            - DeepSpeed 모드 사용 여부. True 이면 DDP 래퍼를 만들지 않는다.
+
+    Returns:
+        Tuple[nn.Module, Optional[ModelEma], nn.Module]:
+            - diffusion_planner:
+                · 원본 모델 또는 DDP/DeepSpeed 래핑된 모델.
+            - model_ema:
+                · EMA 래퍼 또는 None.
+            - base_model:
+                · ddp.get_model 으로 래퍼를 벗긴 실제 nn.Module.
+                  base_model.parameters() 텐서들의 shape 는
+                  레이어 종류에 따라 (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW) 등이다.
+    """
+    diffusion_planner = Diffusion_Planner(args)
+    device = rank if args.device == 'cuda' else args.device
+    diffusion_planner = diffusion_planner.to(device)
+
+    # DeepSpeed를 쓸 때는 torch.nn.parallel.DDP 래퍼는 사용하지 않는다.
+    if args.ddp and (not use_deepspeed):
+        diffusion_planner = DDP(diffusion_planner, device_ids=[rank])
+
+    model_ema: Optional[ModelEma] = None
+    if args.use_ema:
+        model_ema = ModelEma(
+            diffusion_planner,
+            decay=0.999,
+            device=args.device,
+        )
+
+    # DDP를 쓴 경우에만 래퍼를 벗겨서 실제 모듈 기준으로 param_group을 만든다.
+    base_model = ddp.get_model(
+        diffusion_planner,
+        args.ddp and (not use_deepspeed),
+    )
+    return diffusion_planner, model_ema, base_model
+
+
+def _build_optimizer_with_roles_from_args(
+    base_model: nn.Module,
+    args: argparse.Namespace,
+) -> optim.Optimizer:
+    """Group A/B/C lr 배율과 freeze 설정을 반영한 AdamW 옵티마이저를 만든다.
+
+    처리 순서:
+      1) freeze_encoder_local 이 True 이면
+         Group A(encoder_local) 파라미터들의 requires_grad 를 False 로 바꿔
+         옵티마이저에서 완전히 제외한다.
+      2) encoder_local_lr_scale / encoder_global_lr_scale / decoder_lr_scale / default
+         값을 읽어 role_lr_scale 딕셔너리를 구성한다.
+      3) build_adamw_with_param_groups(...) 를 호출해
+         역할별 lr 배율이 반영된 AdamW(또는 8bit AdamW)를 만든다.
+      4) 각 param_group 에
+         - "lr_max": 기준 학습률
+         - "wd_max": 기준 weight_decay
+         필드를 채워 이후 WD warmdown 에서 사용할 수 있도록 한다.
+
+    Args:
+        base_model (nn.Module):
+            - ddp.get_model 으로 래퍼가 벗겨진 실제 모델.
+            - iter_group_encoder_local_parameters / iter_group_encoder_global_parameters /
+              iter_group_decoder_parameters 메서드를 제공해야 Group A/B/C 제어가 적용된다.
+        args (argparse.Namespace):
+            - learning_rate (float)
+            - weight_decay (float)
+            - use_8bit_optimizer (bool)
+            - freeze_encoder_local (bool)
+            - encoder_local_lr_scale (float)
+            - encoder_global_lr_scale (float)
+            - decoder_lr_scale (float)
+
+    Returns:
+        optim.Optimizer:
+            - torch.optim.AdamW 또는 bnb.optim.AdamW8bit 옵티마이저.
+            - optimizer.param_groups[i]["params"] 리스트 안에는
+              다양한 shape의 nn.Parameter 텐서들이 들어 있다.
+    """
+    # 1) Group A freeze (Stage2 에서 encoder_local 고정)
+    if bool(getattr(args, "freeze_encoder_local", False)):
+        _set_requires_grad_for_encoder_local(
+            model=base_model,
+            requires_grad=False,
+        )
+
+    # 2) 역할별 lr 스케일 설정
+    role_lr_scale: Dict[str, float] = {
+        "encoder_local": float(getattr(args, "encoder_local_lr_scale", 1.0)),
+        "encoder_global": float(getattr(args, "encoder_global_lr_scale", 1.0)),
+        "decoder": float(getattr(args, "decoder_lr_scale", 1.0)),
+        "default": 1.0,
+    }
+    # 변경
+    optimizer, _ = build_adamw_with_param_groups(
+        model=base_model,
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,  # 예: 1e-2
+        include_seed_params=True,
+        use_8bit_optimizer=getattr(args, "use_8bit_optimizer", False),
+        role_lr_scale=role_lr_scale,
+    )
+
+    # 각 param_group 에 기준 lr, wd 기록
+    for pg in optimizer.param_groups:
+        pg.setdefault("lr_max", float(pg["lr"]))  # 기준 LR (역할별로 다를 수 있음)
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))  # 기준 WD
+
+    return optimizer
+
+
+def _build_scheduler_from_args(
+    args: argparse.Namespace,
+    optimizer: optim.Optimizer,
+    total_step_of_all_epoch: int,
+    warmup_steps: int,
+) -> Any:
+    """lr_scheduler_type / use_lr_warmup 설정에 맞는 스케줄러를 생성한다.
+
+    처리 규칙:
+      - lr_scheduler_type == "cosine":
+          · build_pytorch_warmup_cosine_scheduler 사용
+          · eta_min 은
+            · min_learning_rate 가 설정되어 있으면 그 값,
+            · 아니면 0.2 * learning_rate 를 사용한다.
+      - lr_scheduler_type == "uniform":
+          · build_pytorch_warmup_constant_scheduler 사용
+          · 워밍업 이후에는 lr 을 계속 유지한다.
+      - use_lr_warmup == False 이면 warmup_steps 를 0 으로 보고 동작한다.
+
+    Args:
+        args (argparse.Namespace):
+            - lr_scheduler_type (str): "cosine" 또는 "uniform".
+            - use_lr_warmup (bool): 워밍업 사용 여부.
+            - min_learning_rate (Optional[float]): cosine 스케줄에서 최소 lr.
+            - learning_rate (float): 기준 lr.
+        optimizer (optim.Optimizer):
+            - param_groups[*] 안에 "lr" 필드가 있는 옵티마이저.
+        total_step_of_all_epoch (int):
+            - 전체 학습 동안 scheduler.step() 이 호출될 총 step 수.  # shape: ()
+        warmup_steps (int):
+            - 기준 배치에서 계산된 워밍업 step 수.  # shape: ()
+
+    Returns:
+        Any:
+            - torch.optim.lr_scheduler._LRScheduler 또는 DeepSpeed가 감싼 스케줄러.
+    """
+    scheduler_type: str = str(getattr(args, "lr_scheduler_type",
+                                      "cosine")).lower()
+    use_lr_warmup: bool = bool(getattr(args, "use_lr_warmup", True))
+    warmup_steps_for_scheduler: int = warmup_steps if use_lr_warmup else 0
+
+    if scheduler_type == "uniform":
+        # 선형 워밍업 후, lr 고정
+        scheduler = build_pytorch_warmup_constant_scheduler(
+            optimizer=optimizer,
+            total_update_steps=total_step_of_all_epoch,
+            warmup_steps=warmup_steps_for_scheduler,
+        )
+    elif scheduler_type == "cosine":
+        # 선형 워밍업 + 코사인 디케이 + 꼬리 hold
+        min_lr_cfg = getattr(args, "min_learning_rate", None)
+        if min_lr_cfg is None:
+            eta_min = 0.2 * float(args.learning_rate)
+        else:
+            eta_min = float(min_lr_cfg)
+
+        scheduler = build_pytorch_warmup_cosine_scheduler(
+            optimizer=optimizer,
+            total_update_steps=total_step_of_all_epoch,
+            warmup_steps=warmup_steps_for_scheduler,
+            eta_min=eta_min,
+        )
+    else:
+        raise ValueError(f"지원하지 않는 lr_scheduler_type 입니다: {scheduler_type}")
+
+    return scheduler
+
+
+# 변경
 def _build_model_optimizer_scheduler(
     args: argparse.Namespace,
     rank: int,
@@ -1885,84 +2326,71 @@ def _build_model_optimizer_scheduler(
 ) -> Tuple[nn.Module, Optional[ModelEma], optim.Optimizer, Any]:
     """모델, EMA, 옵티마이저, 스케줄러를 한 번에 준비한다.
 
-    처리 흐름은 다음과 같다.
-      1) Diffusion_Planner 모델을 만들고, rank 에 해당하는 GPU 또는 CPU 로 옮긴다.
-      2) use_deepspeed 가 False 이고 args.ddp 가 True 이면,
-         모델을 PyTorch 기본 분산 래퍼(DDP)로 감싸서
-         여러 GPU가 같은 모델 복사본을 들고 gradient를 각자 가지도록 만든다.
-      3) EMA를 켜면, 모델과 똑같은 구조의 복사본을 하나 더 두고
-         매 step마다 천천히 따라가게 해서, 나중에 더 안정적인 결과를 평가할 수 있게 한다.
-      4) build_adamw_with_param_groups 로 가중치 묶음을 나누고
-         AdamW 계열 옵티마이저를 만든다. 파라미터 그룹 안의 "params" 리스트에는
-         다양한 shape의 텐서들이 들어간다.
-      5) build_pytorch_warmup_cosine_scheduler 로
-         전체 step 수(total_step_of_all_epoch)와 warmup_steps 에 맞는
-         “처음에는 천천히 올리고, 이후에는 서서히 줄이는” 학습률 스케줄을 만든다.
-      6) use_deepspeed 가 True 이면,
-         위에서 만든 모델·옵티마이저·스케줄러를 DeepSpeed 엔진으로 한 번 더 감싼다.
-         이때 DeepSpeed는 설정 파일(ds_config)에 따라
-         · 옵티마 상태를 여러 GPU에 나누어 들거나
-         · 일부를 CPU 쪽으로 옮기는 등의 메모리 최적화를 대신 처리한다.
-         DDP 모드에서는 이런 분할 없이, 각 GPU가 모델과 옵티마 상태를 그대로 들고 간다.
+    전체 파이프라인에서 이 함수는 "실제 학습에 쓰일 객체 4개"를 만들어준다.
+
+    구성 요소:
+      * diffusion_planner:
+          - Diffusion_Planner(args) 로 만든 모델.
+          - DDP/DeepSpeed 에 의해 래핑된 상태일 수 있다.
+      * model_ema:
+          - args.use_ema=True 인 경우 timm.utils.ModelEma 로 만든 EMA 복사본.
+          - EMA 파라미터 텐서 shape 는 원본과 동일 (예: (out_dim, in_dim), (dim,) 등).
+      * optimizer:
+          - AdamW 또는 8bit AdamW(bnb.AdamW8bit).
+          - Group A/B/C(encoder_local/global/decoder) 별 lr 배율과 freeze 설정을 반영한다.
+          - param_groups[*]["params"] 리스트에는 다양한 shape의 nn.Parameter 가 들어 있다.
+      * scheduler:
+          - lr_scheduler_type / use_lr_warmup 에 따라
+            · warmup + cosine + hold
+            · 또는 warmup + constant 를 구현한 스케줄러.
 
     Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        rank: 이 노드에서 사용할 GPU 인덱스.
-        use_deepspeed: DeepSpeed 모드 사용 여부.
-        total_step_of_all_epoch: 전체 학습 동안의 총 step 수.
-        warmup_steps: 워밍업 step 수.
-        current_global_batch : 현재 글로벌 배치 크기.
+        args (argparse.Namespace):
+            - 모델/학습 하이퍼파라미터와 DeepSpeed/DDP/EMA 설정을 포함한 Namespace.
+        rank (int):
+            - 이 프로세스에서 사용할 GPU 인덱스.  # shape: ()
+        use_deepspeed (bool):
+            - DeepSpeed 모드 사용 여부.
+        total_step_of_all_epoch (int):
+            - 전체 학습 동안의 총 step 수(T).  # shape: ()
+        warmup_steps (int):
+            - 기준 배치 크기에서 계산된 워밍업 step 수.  # shape: ()
+        current_global_batch (int):
+            - 현재 설정에서의 글로벌 배치 크기(B).  # shape: ()
 
     Returns:
-        diffusion_planner: Diffusion_Planner 또는 DeepSpeed/DDP 래핑된 모델.
-        model_ema: EMA 추적용 모델 래퍼. 사용하지 않으면 None.
-        optimizer: AdamW 또는 8bit AdamW 옵티마이저.
-        scheduler: PyTorch warmup + cosine + hold 스케줄러.
+        Tuple[nn.Module, Optional[ModelEma], optim.Optimizer, Any]:
+            - diffusion_planner:
+                · nn.Module 또는 DeepSpeed/ DDP 래퍼.
+            - model_ema:
+                · ModelEma 또는 None.
+            - optimizer:
+                · AdamW 또는 AdamW8bit.
+            - scheduler:
+                · PyTorch lr 스케줄러 또는 DeepSpeed 엔진 내 스케줄러 핸들.
     """
-    # diffusion_planner.parameters(): 각 파라미터 텐서는
-    #   (out_dim, in_dim) 또는 (dim,) 등 모델 구조에 따라 다양한 shape를 가진다.
-    diffusion_planner = Diffusion_Planner(args)
-    diffusion_planner = diffusion_planner.to(rank if args.device ==
-                                             'cuda' else args.device)
-
-    # DeepSpeed를 쓸 때는 torch.nn.parallel.DDP 래퍼는 사용하지 않는다.
-    if args.ddp and (not use_deepspeed):
-        diffusion_planner = DDP(diffusion_planner, device_ids=[rank])
-
-    model_ema: Optional[ModelEma] = None
-    if args.use_ema:
-        # model_ema.ema.parameters(): 원본 모델 파라미터와 같은 shape
-        model_ema = ModelEma(
-            diffusion_planner,
-            decay=0.999,
-            device=args.device,
-        )
-
-    # DDP를 쓴 경우에만 래퍼를 벗겨서 실제 모듈 기준으로 param_group을 만든다.
-    base_model = ddp.get_model(diffusion_planner, args.ddp and
-                               (not use_deepspeed))
-
-    optimizer, extra_nwd = build_adamw_with_param_groups(
-        model=base_model,
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,  # 예: 1e-2
-        include_seed_params=True,
-        use_8bit_optimizer=getattr(args, "use_8bit_optimizer", False),
+    # 1) 모델/EMA/base_model 생성
+    diffusion_planner, model_ema, base_model = _create_diffusion_planner_and_ema(
+        args=args,
+        rank=rank,
+        use_deepspeed=use_deepspeed,
     )
 
-    # param_groups[i]["params"] 리스트 안에는 다양한 shape의 파라미터 텐서들이 들어 있다.
-    for pg in optimizer.param_groups:
-        pg.setdefault("lr_max", float(pg["lr"]))  # 기준 LR
-        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))  # 기준 WD
-
-    scheduler = build_pytorch_warmup_cosine_scheduler(
-        optimizer,
-        total_step_of_all_epoch,
-        warmup_steps,
-        eta_min=0.2 * args.learning_rate,
+    # 2) 역할별 lr 배율 및 freeze 설정을 반영한 optimizer 생성
+    optimizer = _build_optimizer_with_roles_from_args(
+        base_model=base_model,
+        args=args,
     )
 
-    # ➕ [ADD] DeepSpeed 엔진으로 래핑 (ZeRO-2 설정은 build_deepspeed_config 로 생성)
+    # 3) lr 스케줄러 구성 (cosine / uniform + warmup)
+    scheduler = _build_scheduler_from_args(
+        args=args,
+        optimizer=optimizer,
+        total_step_of_all_epoch=total_step_of_all_epoch,
+        warmup_steps=warmup_steps,
+    )
+
+    # 4) DeepSpeed 엔진으로 래핑 (ZeRO-2 설정은 build_deepspeed_config 로 생성)
     if use_deepspeed:
         import deepspeed  # use_deepspeed=True일 때만 import
         ds_config = build_deepspeed_config(args, current_global_batch)
@@ -1975,10 +2403,6 @@ def _build_model_optimizer_scheduler(
         )
 
     return diffusion_planner, model_ema, optimizer, scheduler
-
-
-from typing import Optional, Dict, Any
-import io
 
 
 def _write_deepspeed_meta_checkpoint_files(
@@ -2039,31 +2463,54 @@ def _save_deepspeed_checkpoint_for_epoch(
     use_deepspeed: bool,
     save_best: bool,
 ) -> None:
-    """DeepSpeed 엔진일 때 한 epoch 단위로 checkpoint를 저장한다.
+    """DeepSpeed 엔진일 때 한 epoch 끝에서 전체 학습 상태를 체크포인트로 저장한다.
+
+    이 함수는 PyTorch 단일 .pth 파일이 아니라, DeepSpeed 전용 폴더 구조를 사용한다.
+    한 번 호출될 때 다음 두 가지를 동시에 처리한다.
+
+    1) DeepSpeedEngine.save_checkpoint(...)
+       - 모델 파라미터, 옵티마이저 상태, 스케줄러 상태를
+         `save_path/latest/`(또는 `save_path/best/`) 아래에 나눠 저장한다.
+       - 내부적으로 각 mp_rank_* 디렉터리에 rank별 텐서가 들어간다.
+         · 예: weight 텐서: (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW) 등.
+
+    2) 얇은 메타 파일(latest.pth / best.pth) 작성
+       - epoch: int, 다음에 학습을 이어갈 epoch 인덱스.  # shape: ()
+       - loss: float, 이번 epoch 전체 train_total_loss.  # shape: ()
+       - wandb_id: str 또는 None, 이어서 사용할 W&B run id.
+       - is_deepspeed: bool, DeepSpeed 포맷임을 나타내는 플래그.
+       이 정보만 담은 작은 dict 를 save_path 루트에 latest.pth / best.pth 로 남긴다.
 
     Args:
-        diffusion_planner:
-            deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
-            내부 파라미터 텐서 shape 는
-              - 선형 weight: (out_dim, in_dim)
-              - LayerNorm weight: (dim,)
-              - conv weight: (C_out, C_in, kH, kW)
-            등 모델 구조에 따라 다양하다.
-        save_path:
-            체크포인트 디렉터리 경로. None 이면 아무 것도 하지 않는다.
-        epoch:
-            현재 epoch 인덱스(0 기반).  # shape: ()
-        train_total_loss:
-            해당 epoch 전체 손실 값.   # shape: ()
-        wandb_run_id:
-            현재 W&B run ID. 없으면 None.
-        model_ema:
-            EMA 래퍼(ModelEma 등). 없으면 None.
-        use_deepspeed:
-            DeepSpeed 모드 사용 여부.
-        save_best:
-            이번 epoch 가 지금까지의 best 인지 여부.
-            True 이면 tag="best" 로도 한 번 더 저장한다.
+        diffusion_planner (torch.nn.Module):
+            - deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
+            - diffusion_planner.save_checkpoint(...) 를 통해 rank별 파라미터 텐서들을
+              `mp_rank_XX_model_states.pt` 형식으로 저장한다.
+        save_path (Optional[str]):
+            - 체크포인트 루트 디렉터리 경로.
+            - 예: ".../training_log/실험이름/2025-09-21-13:25:45".
+            - None 이면 아무 것도 하지 않고 바로 반환한다.
+        epoch (int):
+            - 현재 epoch 인덱스(0부터 시작). 메타 정보에는 epoch+1 로 저장된다.  # shape: ()
+        train_total_loss (float):
+            - 이번 epoch 의 전체 train loss 스칼라 값.  # shape: ()
+        wandb_run_id (Optional[str]):
+            - 이 체크포인트와 연결할 W&B run id. 없으면 None.
+        model_ema (Optional[ModelEma]):
+            - EMA 래퍼. 존재하면 model_ema.ema.state_dict() 를 client_state["ema_state_dict"]
+              로 함께 저장한다.
+              · 각 텐서 shape: 원본 모델 파라미터와 동일
+                (예: (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW)).
+        use_deepspeed (bool):
+            - True 일 때만 DeepSpeed 체크포인트 저장을 수행한다.
+            - False 이면 아무 작업 없이 반환한다.
+        save_best (bool):
+            - True 이면 이번 epoch 가 현재까지의 best 로 간주하고,
+              "latest" 뿐 아니라 "best" tag 로도 한 번 더 저장한다.
+
+    Returns:
+        None:
+            - 이 함수는 파일 시스템에만 영향을 주고, 값을 반환하지 않는다.
     """
     if (not use_deepspeed) or save_path is None:
         return
@@ -2284,11 +2731,778 @@ def _load_pytorch_checkpoint_into_deepspeed(
 
     return init_epoch, wandb_id
 
-
     # ✅ W&B / 사람이 보는 용도의 얇은 latest.pth / best.pth도 같이 작성
     # best 여부는 이 함수 안에서는 판단할 수 없으니,
     # 바깥에서 save_best를 같이 넘겨서 호출하도록 설계할 수도 있지만
     # 여기서는 "메타 latest.pth"만 쓰고, best는 PyTorch 경로에서만 관리해도 된다.
+
+
+def _update_deepspeed_optimizer_param_group_meta(
+    diffusion_planner: nn.Module,) -> None:
+    """DeepSpeed 엔진 내부 옵티마이저 param_group 메타 정보를 보정한다.
+
+    DeepSpeed 모드에서는
+      - diffusion_planner.optimizer.param_groups[*]["lr"]
+      - diffusion_planner.optimizer.param_groups[*]["weight_decay"]
+    값들만 채워져 있는 경우가 있어, 이후 WD warmdown 등의 처리를 위해
+    각 그룹에
+      - "lr_max": 기준 학습률 (shape: ())
+      - "wd_max": 기준 weight decay (shape: ())
+    필드를 추가로 넣어 준다.
+
+    Args:
+        diffusion_planner (nn.Module):
+            - deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
+            - diffusion_planner.optimizer.param_groups 는
+              각 그룹별로 "params": List[nn.Parameter] 를 가진다.
+              각 파라미터 텐서 shape 는 (out_dim, in_dim), (dim,),
+              (C_out, C_in, kH, kW) 등 계층 종류에 따라 다양하다.
+    """
+    if not hasattr(diffusion_planner, "optimizer"):
+        return
+
+    for pg in diffusion_planner.optimizer.param_groups:
+        pg.setdefault("lr_max", float(pg["lr"]))
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
+
+
+def _resume_from_deepspeed_checkpoint_format(
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    ckpt_dir: str,
+    global_rank: int,
+    load_optimizer_states: bool = True,
+    load_lr_scheduler_states: bool = True,
+) -> Tuple[int, Optional[str], Optional[ModelEma]]:
+    """DeepSpeed 형식(checkpoint 디렉터리 구조)으로 저장된 체크포인트를 로드한다.
+
+    처리 흐름:
+      1) diffusion_planner.load_checkpoint(ckpt_dir, tag="latest", ...) 를 호출해
+         엔진 내부의 모델/옵티마이저/스케줄러 상태를 복원한다.
+         - load_optimizer_states / load_lr_scheduler_states 가 False 이면
+           모델(및 EMA)만 읽고 optimizer/scheduler 상태는 그대로 둔다.
+      2) client_state 딕셔너리에서
+         - epoch (shape: ())
+         - wandb_id (str 또는 None)
+         - ema_state_dict (있다면 EMA 모델 파라미터 state_dict)
+         를 꺼낸다.
+      3) model_ema 가 있을 경우 ema_state_dict 를 EMA 모델에 load_state_dict 하고,
+         eval 모드 + requires_grad=False 로 고정한다.
+      4) diffusion_planner.optimizer.param_groups 에 "lr_max"/"wd_max" 필드를 채워준다.
+
+    Args:
+        diffusion_planner (nn.Module):
+            deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        ckpt_dir (str):
+            DeepSpeed checkpoint 가 들어 있는 디렉터리 경로.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 주요 로그를 출력한다.
+        load_optimizer_states (bool):
+            True 이면 optimizer 상태까지 같이 불러온다.
+            False 이면 모델/EMA만 복원하고 optimizer 상태는 그대로 둔다.
+        load_lr_scheduler_states (bool):
+            True 이면 scheduler 상태까지 같이 불러온다.
+            False 이면 scheduler 상태는 그대로 둔다.
+
+    Returns:
+        Tuple[int, Optional[str], Optional[ModelEma]]:
+            - init_epoch: 재개 시작 epoch 인덱스(0 기반). shape: ()
+            - wandb_id: W&B run id 또는 None.
+            - model_ema: EMA 상태가 복원된 ModelEma (또는 원래 None).
+    """
+    try:
+        load_path, client_state = diffusion_planner.load_checkpoint(
+            ckpt_dir,
+            tag="latest",
+            load_optimizer_states=load_optimizer_states,
+            load_lr_scheduler_states=load_lr_scheduler_states,
+        )
+    except TypeError:
+        # 오래된 DeepSpeed 버전(해당 인자 미지원) 대비 fallback
+        load_path, client_state = diffusion_planner.load_checkpoint(
+            ckpt_dir,
+            tag="latest",
+        )
+
+    if global_rank == 0:
+        print(f"[DeepSpeed] load_checkpoint returned path={load_path}, "
+              f"client_state keys={list((client_state or {}).keys())}")
+
+    client_state = client_state or {}
+    init_epoch: int = int(client_state.get("epoch", 0))
+    wandb_id: Optional[str] = client_state.get("wandb_id", None)
+
+    # EMA 복원
+    ema_state_dict = client_state.get("ema_state_dict", None)
+    if (model_ema is not None) and (ema_state_dict is not None):
+        try:
+            ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
+            ema_model.load_state_dict(ema_state_dict, strict=False)
+            ema_model.eval()
+            for p in ema_model.parameters():
+                p.requires_grad_(False)
+            if global_rank == 0:
+                print("[DeepSpeed] EMA state load done")
+        except Exception as e:
+            if global_rank == 0:
+                print(f"[DeepSpeed] EMA state load 실패: {e}")
+    # === [NEW] model-only 모드에서는 base model도 EMA weight로 초기화 ===
+    # load_optimizer_states=False & load_lr_scheduler_states=False 라면
+    # resume_model_only=True에서 호출된 경우로 볼 수 있다.
+    prefer_ema_for_model_only = (not load_optimizer_states) and (not load_lr_scheduler_states)
+    if prefer_ema_for_model_only and (ema_state_dict is not None):
+        try:
+            base_model: nn.Module = getattr(diffusion_planner, "module", diffusion_planner)
+            incompatible = base_model.load_state_dict(ema_state_dict, strict=False)
+            if global_rank == 0:
+                if getattr(incompatible, "missing_keys", None):
+                    print(f"[DeepSpeed] model-only(EMA) missing_keys: {incompatible.missing_keys}")
+                if getattr(incompatible, "unexpected_keys", None):
+                    print(f"[DeepSpeed] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}")
+                print("[DeepSpeed] model-only resume: base model initialized from EMA weights")
+        except Exception as e:
+            if global_rank == 0:
+                print(f"[DeepSpeed] EMA→base_model 초기화 실패: {e}")
+    # DeepSpeed 엔진 내부 옵티마 param_group 메타 보정
+    _update_deepspeed_optimizer_param_group_meta(diffusion_planner)
+
+    return init_epoch, wandb_id, model_ema
+
+
+def _resume_deepspeed_from_pytorch_checkpoint(
+    ckpt_dir: str,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    args: argparse.Namespace,
+    global_rank: int,
+) -> Tuple[int, Optional[str], Optional[ModelEma]]:
+    """PyTorch latest.pth 를 읽어 DeepSpeed 엔진 내부 모델/EMA만 채운다.
+
+    사용 상황:
+      - 이전 학습은 PyTorch/DDP 로 진행되어 latest.pth 한 개만 존재하고,
+      - 현재는 DeepSpeed 모드로 전환해서 그 가중치부터 계속 학습하고 싶을 때.
+
+    처리 흐름:
+      1) _load_pytorch_checkpoint_into_deepspeed(...) 를 호출해
+         base_model(state_dict)와 EMA 모델을 DeepSpeed 엔진 내부에 채운다.
+      2) epoch / wandb_id 를 받아 init_epoch / wandb_id 로 사용한다.
+      3) diffusion_planner.optimizer.param_groups 에 "lr_max"/"wd_max" 필드를 채워준다.
+
+    Args:
+        ckpt_dir (str):
+            - latest.pth 가 들어 있는 PyTorch 체크포인트 디렉터리.
+        diffusion_planner (nn.Module):
+            - deepspeed.DeepSpeedEngine 인스턴스.
+        model_ema (Optional[ModelEma]):
+            - EMA 래퍼 또는 None.
+        args (argparse.Namespace):
+            - device(str) 정보를 포함하며, torch.load map_location 에 사용된다.
+        global_rank (int):
+            - 전체 프로세스 기준 rank. 로그 출력에 사용된다.
+
+    Returns:
+        Tuple[int, Optional[str], Optional[ModelEma]]:
+            - init_epoch: 재개 시작 epoch 인덱스(0 기반). shape: ()
+            - wandb_id: W&B run id 또는 None.
+            - model_ema: EMA 상태가 복원된 ModelEma (또는 원래 None).
+    """
+    init_epoch, wandb_id = _load_pytorch_checkpoint_into_deepspeed(
+        ckpt_dir=ckpt_dir,
+        diffusion_planner=diffusion_planner,
+        model_ema=model_ema,
+        device=args.device,
+        global_rank=global_rank,
+    )
+
+    # DeepSpeed 옵티마이저 param_group 메타 보정
+    _update_deepspeed_optimizer_param_group_meta(diffusion_planner)
+
+    return init_epoch, wandb_id, model_ema
+
+
+def _resume_from_pytorch_checkpoint(
+    ckpt_dir: str,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+    device: str,
+) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+           Optional[str]]:
+    """기존 PyTorch/DDP 형식 latest.pth 를 그대로 불러와서 학습을 재개한다.
+
+    처리 흐름:
+      1) diffusion_planner, optimizer, scheduler, init_epoch, wandb_id, model_ema =
+         resume_model(ckpt_dir, ...) 를 호출해
+         - 모델 파라미터
+         - 옵티마이저 상태
+         - 스케줄러 상태
+         - EMA 상태
+         를 한 번에 복원한다.
+      2) optimizer.param_groups[*] 에 대해
+         - "lr_max": 기준 학습률 (shape: ())
+         - "wd_max": 기준 weight_decay (shape: ())
+         를 채워 이후 WD warmdown 에서 사용할 수 있게 한다.
+
+    Args:
+        ckpt_dir (str):
+            - latest.pth 가 들어 있는 PyTorch 체크포인트 디렉터리.
+        diffusion_planner (nn.Module):
+            - nn.Module 또는 DDP 래핑된 모델.
+        optimizer (optim.Optimizer):
+            - AdamW/AdamW8bit 옵티마이저.
+        scheduler (Any):
+            - 학습률 스케줄러 객체.
+        model_ema (Optional[ModelEma]):
+            - EMA 래퍼 또는 None.
+        device (str):
+            - "cuda" / "cpu" 등. resume_model 내부에서 map_location 에 사용된다.
+
+    Returns:
+        Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int, Optional[str]]:
+            - diffusion_planner: 복원된 모델.
+            - optimizer: 복원된 옵티마이저.
+            - scheduler: 복원된 스케줄러.
+            - model_ema: 복원된 EMA 또는 None.
+            - init_epoch: 재개 시작 epoch 인덱스(0 기반). shape: ()
+            - wandb_id: W&B run id 또는 None.
+    """
+    (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
+     model_ema) = resume_model(
+         ckpt_dir,
+         diffusion_planner,
+         optimizer,
+         scheduler,
+         model_ema,
+         device,
+     )
+
+    # resume 후에도 wd_max / lr_max 기본값이 유지되도록 보강
+    for pg in optimizer.param_groups:
+        pg.setdefault("lr_max", float(pg["lr"]))
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
+
+    return diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id
+
+
+def _select_pytorch_checkpoint_path_for_model_only(ckpt_dir: str) -> str:
+    """model-only 로딩에 사용할 latest.pth 또는 best.pth 경로를 고른다.
+
+    우선순위:
+      1) ckpt_dir/latest.pth 가 있으면 그 경로를 사용한다.
+      2) 없으면 ckpt_dir/best.pth 를 시도한다.
+      3) 둘 다 없으면 FileNotFoundError 를 발생시킨다.
+
+    Args:
+        ckpt_dir (str):
+            PyTorch 체크포인트가 들어 있는 디렉터리 경로.
+
+    Returns:
+        str:
+            실제로 torch.load 에 사용할 체크포인트 파일 경로.
+    """
+    ckpt_path = os.path.join(ckpt_dir, "latest.pth")
+    if os.path.exists(ckpt_path):
+        return ckpt_path
+
+    alt_ckpt_path = os.path.join(ckpt_dir, "best.pth")
+    if os.path.exists(alt_ckpt_path):
+        return alt_ckpt_path
+
+    raise FileNotFoundError(
+        f"PyTorch 체크포인트 latest.pth / best.pth 를 찾을 수 없습니다: {ckpt_dir}")
+
+
+def _load_pytorch_checkpoint_dict_for_model_only(
+    ckpt_path: str,
+    device: str,
+) -> Dict[str, Any]:
+    """model-only 로딩용 PyTorch 체크포인트 파일을 dict 로 읽어온다.
+
+    Args:
+        ckpt_path (str):
+            latest.pth 또는 best.pth 전체 경로.
+        device (str):
+            "cuda" / "cuda:0" / "cpu" 등. torch.load map_location 에 사용된다.
+
+    Returns:
+        Dict[str, Any]:
+            torch.load 로 읽은 체크포인트 dict.
+            - ckpt["model"]: 모델 state_dict (각 value 텐서 shape는
+              (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW) 등).
+            - ckpt["ema_state_dict"] (선택): EMA state_dict.
+    """
+    map_location = "cpu" if device.startswith("cuda") else device
+    ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location=map_location)
+    return ckpt
+
+
+def _choose_state_dict_for_model_only(
+    ckpt: Dict[str, Any],) -> Tuple[Dict[str, torch.Tensor], str]:
+    """EMA state 가 있으면 EMA를, 없으면 model state 를 선택한다.
+
+    Args:
+        ckpt (Dict[str, Any]):
+            torch.load 로 읽어온 체크포인트 dict.
+
+    Returns:
+        Tuple[Dict[str, torch.Tensor], str]:
+            - state_like:
+                모델에 실제로 넣을 state_dict.
+            - source_name:
+                "EMA" 또는 "model" 문자열. 로그용.
+    """
+    raw_model_state: Dict[str, torch.Tensor] = ckpt.get("model", ckpt)
+    raw_ema_state: Optional[Dict[str, torch.Tensor]] = ckpt.get(
+        "ema_state_dict", None)
+
+    if raw_ema_state is not None and isinstance(
+            raw_ema_state, dict) and len(raw_ema_state) > 0:
+        return raw_ema_state, "EMA"
+    else:
+        return raw_model_state, "model"
+
+
+def _strip_or_add_module_prefix_for_model_only(
+    src_state: Dict[str, torch.Tensor],
+    want_module_prefix: bool,
+) -> Dict[str, torch.Tensor]:
+    """state_dict 키에 "module." 접두사를 붙이거나 떼는 작은 도우미 함수.
+
+    DDP/DeepSpeed 래핑 여부에 따라
+    - 모델 쪽 키는 "module.xxx" 또는 "xxx" 형태일 수 있고,
+    - 체크포인트 쪽 키도 두 형태 중 하나일 수 있다.
+    이 함수는 원하는 형태(want_module_prefix)에 맞춰
+    키 문자열만 정리해 새 dict를 만들어 준다.
+
+    Args:
+        src_state (Dict[str, torch.Tensor]):
+            체크포인트에서 가져온 state_dict.
+            각 value 텐서의 shape 는 레이어 종류에 따라
+              (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등 다양할 수 있다.
+        want_module_prefix (bool):
+            True  이면 모든 키가 "module." 으로 시작하도록 맞춘다.
+            False 이면 "module." 으로 시작하는 키는 접두사를 떼고,
+            나머지는 그대로 둔다.
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            키 문자열만 정리된 새 state_dict.
+    """
+    new_state: Dict[str, torch.Tensor] = {}
+    for k, v in src_state.items():
+        if want_module_prefix:
+            # 이미 "module." 로 시작하면 그대로, 아니면 앞에 붙인다.
+            new_k = k if k.startswith("module.") else f"module.{k}"
+        else:
+            # "module." 로 시작하면 떼고, 아니면 그대로 둔다.
+            new_k = k[7:] if k.startswith("module.") else k
+        new_state[new_k] = v
+    return new_state
+
+
+def _align_state_dict_keys_to_base_model_for_model_only(
+    state_like: Dict[str, torch.Tensor],
+    base_model: nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """base_model.state_dict() 와 키 형태(module. prefix 유무)를 맞춘 state_dict 를 만든다.
+
+    DeepSpeed/DDP 래핑 여부에 따라
+      - 현재 모델 키는 "module.xxx" 또는 "xxx" 형태일 수 있고,
+      - ckpt 키도 "module.xxx" 또는 "xxx" 형태일 수 있다.
+    이 함수는 두 쪽의 키 패턴을 비교해서,
+    필요한 경우 "module." 접두사를 붙이거나 떼서
+    base_model.load_state_dict(...) 에 바로 넣을 수 있는 state_dict 로 맞춰준다.
+
+    Args:
+        state_like (Dict[str, torch.Tensor]):
+            ckpt 에서 선택한 state_dict.
+            각 value 텐서는 레이어에 따라
+              (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등의 shape 를 가진다.
+        base_model (nn.Module):
+            실제 파라미터를 가진 nn.Module (DDP 래퍼를 벗긴 모델).
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            base_model.load_state_dict(...) 에 바로 사용할 수 있는 state_dict.
+    """
+    current_keys = list(base_model.state_dict().keys())
+    ckpt_keys = list(state_like.keys())
+
+    has_module_in_ckpt = all(k.startswith("module.") for k in ckpt_keys)
+    has_module_in_model = all(k.startswith("module.") for k in current_keys)
+
+    # ckpt: module.* / 모델: 평범한 키 → prefix 제거
+    if has_module_in_ckpt and (not has_module_in_model):
+        return _strip_or_add_module_prefix_for_model_only(
+            state_like,
+            want_module_prefix=False,
+        )
+    # ckpt: 평범한 키 / 모델: module.* → prefix 추가
+    elif (not has_module_in_ckpt) and has_module_in_model:
+        return _strip_or_add_module_prefix_for_model_only(
+            state_like,
+            want_module_prefix=True,
+        )
+    else:
+        # 둘 다 module.* 이거나, 둘 다 평범한 키인 경우 그대로 사용
+        return state_like
+
+
+def _load_state_dict_into_base_and_ema_model_only(
+    state_dict: Dict[str, torch.Tensor],
+    source_name: str,
+    base_model: nn.Module,
+    model_ema: Optional[ModelEma],
+    ckpt_path: str,
+    global_rank: int,
+) -> Optional[ModelEma]:
+    """선택된 state_dict 를 base_model 과 EMA 모델에 주입하고 로그를 남긴다.
+
+    처리 순서:
+      1) base_model.load_state_dict(..., strict=False) 로 파라미터 로드.
+      2) global_rank==0 인 경우 missing_keys / unexpected_keys 를 출력.
+      3) model_ema 가 있으면 base_model.state_dict() 로 EMA 모델도 초기화하고,
+         eval 모드 + requires_grad=False 로 고정한다.
+
+    Args:
+        state_dict (Dict[str, torch.Tensor]):
+            base_model.load_state_dict 에 넣을 state_dict.
+        source_name (str):
+            "EMA" 또는 "model". 어떤 state 를 사용했는지 로그용.
+        base_model (nn.Module):
+            실제 파라미터를 가진 nn.Module.
+            base_model.state_dict() 의 각 텐서는
+              (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등 shape 를 가진다.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        ckpt_path (str):
+            사용한 체크포인트 파일 경로. 로그용.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 로그를 출력한다.
+
+    Returns:
+        Optional[ModelEma]:
+            EMA 상태가 덮어써진 model_ema (또는 원래 None).
+    """
+    incompatible = base_model.load_state_dict(state_dict, strict=False)
+    if global_rank == 0:
+        print(f"[ModelOnly<Pytorch>] {source_name} state_dict 로 모델 파라미터 로드 완료 "
+              f"(ckpt_path={ckpt_path})")
+        if getattr(incompatible, "missing_keys", None):
+            print(
+                f"[ModelOnly<Pytorch>] missing_keys: {incompatible.missing_keys}"
+            )
+        if getattr(incompatible, "unexpected_keys", None):
+            print(
+                f"[ModelOnly<Pytorch>] unexpected_keys: {incompatible.unexpected_keys}"
+            )
+
+    # EMA 객체도 있으면 base_model 과 동일한 파라미터로 맞춰준다.
+    if model_ema is not None:
+        try:
+            ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
+            ema_incompatible = ema_model.load_state_dict(
+                base_model.state_dict(),
+                strict=False,
+            )
+            ema_model.eval()
+            for p in ema_model.parameters():
+                # 각 파라미터 텐서 shape: (out_dim, in_dim), (hidden_dim,), ...
+                p.requires_grad_(False)
+            if global_rank == 0:
+                if getattr(ema_incompatible, "missing_keys", None):
+                    print(
+                        f"[ModelOnly<Pytorch>] EMA missing_keys: {ema_incompatible.missing_keys}"
+                    )
+                if getattr(ema_incompatible, "unexpected_keys", None):
+                    print(
+                        f"[ModelOnly<Pytorch>] EMA unexpected_keys: {ema_incompatible.unexpected_keys}"
+                    )
+                print("[ModelOnly<Pytorch>] EMA state 동기화 완료")
+        except Exception as e:
+            if global_rank == 0:
+                print(f"[ModelOnly<Pytorch>] EMA state 동기화 실패: {e}")
+
+    return model_ema
+
+
+def _load_model_and_ema_state_only_from_pytorch_checkpoint(
+    ckpt_dir: str,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    device: str,
+    global_rank: int,
+) -> Optional[ModelEma]:
+    """PyTorch latest.pth 에서 모델/EMA 파라미터만 불러와 새 학습을 시작할 때 사용한다.
+
+    전체 흐름:
+      1) ckpt_dir 안에서 latest.pth 또는 best.pth 경로를 고른다.
+      2) 선택한 파일을 torch.load 로 읽어 체크포인트 dict 를 얻는다.
+      3) EMA state_dict 가 있으면 EMA를, 없으면 model state_dict 를 선택한다.
+      4) base_model(state_dict) 의 키 형태와 맞도록 module. prefix 를 조정한다.
+      5) base_model.load_state_dict(...) 로 파라미터를 주입하고,
+         model_ema 가 있으면 base_model.state_dict() 로 EMA도 초기화한다.
+
+    Args:
+        ckpt_dir (str):
+            latest.pth / best.pth 가 들어 있는 디렉터리 경로.
+        diffusion_planner (nn.Module):
+            현재 학습에 사용할 모델 또는 DDP 래퍼.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        device (str):
+            "cuda" / "cpu" 등. torch.load 의 map_location 에 사용된다.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 로그를 출력한다.
+
+    Returns:
+        Optional[ModelEma]:
+            EMA 상태가 덮어써진 model_ema (또는 원래 None).
+    """
+    ckpt_path: str = _select_pytorch_checkpoint_path_for_model_only(ckpt_dir)
+    ckpt: Dict[str, Any] = _load_pytorch_checkpoint_dict_for_model_only(
+        ckpt_path=ckpt_path,
+        device=device,
+    )
+
+    # base_model: 실제 nn.Module (DDP 래퍼 벗겨진 상태)
+    base_model: nn.Module = getattr(diffusion_planner, "module",
+                                    diffusion_planner)
+
+    state_like, source_name = _choose_state_dict_for_model_only(ckpt)
+    state_dict = _align_state_dict_keys_to_base_model_for_model_only(
+        state_like=state_like,
+        base_model=base_model,
+    )
+
+    model_ema = _load_state_dict_into_base_and_ema_model_only(
+        state_dict=state_dict,
+        source_name=source_name,
+        base_model=base_model,
+        model_ema=model_ema,
+        ckpt_path=ckpt_path,
+        global_rank=global_rank,
+    )
+    return model_ema
+
+
+def _resume_from_checkpoint_with_deepspeed(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    ckpt_dir: str,
+    global_rank: int,
+    resume_model_only: bool,
+) -> Tuple[nn.Module, Optional[ModelEma], int, Optional[str]]:
+    """DeepSpeed 모드에서 ckpt_dir 기준으로 모델/EMA를 불러온다.
+
+    처리 규칙:
+      - ckpt_dir 이 DeepSpeed 전용 디렉터리 구조이면
+        _resume_from_deepspeed_checkpoint_format(...) 을 사용한다.
+        · resume_model_only=False → optimizer/scheduler 상태까지 함께 복원.
+        · resume_model_only=True  → optimizer/scheduler 는 건드리지 않고,
+          모델/EMA만 로드한다.
+      - ckpt_dir 이 PyTorch latest.pth 형식이면
+        _resume_deepspeed_from_pytorch_checkpoint(...) 를 사용해
+        모델/EMA를 불러온다. (optimizer/scheduler는 그대로)
+
+      - resume_model_only=True 인 경우:
+        · init_epoch=0, wandb_id=None 으로 돌려준다.
+      - resume_model_only=False 인 경우:
+        · ckpt 에서 읽은 init_epoch / wandb_id 를 그대로 사용한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 Namespace. device 정보 등을 포함한다.
+        diffusion_planner (nn.Module):
+            deepspeed.DeepSpeedEngine 또는 DDP 래퍼가 씌워진 모델.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        ckpt_dir (str):
+            체크포인트 디렉터리 경로.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 상세 로그를 출력한다.
+        resume_model_only (bool):
+            True 이면 모델/EMA 파라미터만 불러오는 모드.
+
+    Returns:
+        Tuple[nn.Module, Optional[ModelEma], int, Optional[str]]:
+            - diffusion_planner: 모델/EMA 로딩이 반영된 모델.
+            - model_ema: EMA 상태가 복원된 ModelEma 또는 None.
+            - init_epoch: 재개 시작 epoch 인덱스. resume_model_only=True 이면 0.
+            - wandb_id: 이어서 사용할 W&B run id 또는 None.
+    """
+    if _is_deepspeed_checkpoint_dir(ckpt_dir):
+        init_epoch_loaded, wandb_id_loaded, model_ema = \
+            _resume_from_deepspeed_checkpoint_format(
+                diffusion_planner=diffusion_planner,
+                model_ema=model_ema,
+                ckpt_dir=ckpt_dir,
+                global_rank=global_rank,
+                load_optimizer_states=not resume_model_only,
+                load_lr_scheduler_states=not resume_model_only,
+            )
+    else:
+        # PyTorch latest.pth → DeepSpeed 엔진으로 로드 (모델/EMA만)
+        init_epoch_loaded, wandb_id_loaded, model_ema = \
+            _resume_deepspeed_from_pytorch_checkpoint(
+                ckpt_dir=ckpt_dir,
+                diffusion_planner=diffusion_planner,
+                model_ema=model_ema,
+                args=args,
+                global_rank=global_rank,
+            )
+
+    if resume_model_only:
+        init_epoch = 0
+        wandb_id = None
+    else:
+        init_epoch = init_epoch_loaded
+        wandb_id = wandb_id_loaded
+
+    return diffusion_planner, model_ema, init_epoch, wandb_id
+
+
+def _resume_from_checkpoint_with_pytorch(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+    ckpt_dir: str,
+    global_rank: int,
+    resume_model_only: bool,
+) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+           Optional[str]]:
+    """일반 PyTorch/DDP 모드에서 ckpt_dir 기준으로 모델/옵티마를 불러온다.
+
+    처리 규칙:
+      - resume_model_only=True:
+          · _load_model_and_ema_state_only_from_pytorch_checkpoint(...) 를 사용해
+            모델/EMA 파라미터만 불러온다.
+          · optimizer / scheduler 상태는 그대로 둔다.
+          · init_epoch=0, wandb_id=None 으로 돌려준다.
+      - resume_model_only=False:
+          · _resume_from_pytorch_checkpoint(...) 로
+            모델/optimizer/scheduler/EMA/epoch/wandb_id 를 모두 복원한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 Namespace. device 정보 포함.
+        diffusion_planner (nn.Module):
+            현재 학습 중인 모델 또는 DDP 래퍼.
+        optimizer (optim.Optimizer):
+            AdamW 또는 8bit AdamW 옵티마이저.
+        scheduler (Any):
+            학습률 스케줄러 객체.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        ckpt_dir (str):
+            PyTorch latest.pth / best.pth 가 들어 있는 디렉터리 경로.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 상세 로그 출력.
+        resume_model_only (bool):
+            True 이면 모델/EMA 파라미터만 불러오는 모드.
+
+    Returns:
+        Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int, Optional[str]]:
+            - diffusion_planner: 복원된 모델.
+            - optimizer: 복원된(또는 기존) 옵티마이저.
+            - scheduler: 복원된(또는 기존) 스케줄러.
+            - model_ema: EMA 상태가 복원된 ModelEma 또는 None.
+            - init_epoch: 재개 시작 epoch 인덱스. model-only 이면 0.
+            - wandb_id: 이어서 사용할 W&B run id 또는 None.
+    """
+    if resume_model_only:
+        # 모델(또는 EMA) weight만 불러오고 optimizer/scheduler 는 그대로 유지
+        model_ema = _load_model_and_ema_state_only_from_pytorch_checkpoint(
+            ckpt_dir=ckpt_dir,
+            diffusion_planner=diffusion_planner,
+            model_ema=model_ema,
+            device=args.device,
+            global_rank=global_rank,
+        )
+        init_epoch = 0
+        wandb_id = None
+        return diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id
+
+    # 전체 상태 복원 (기존 PyTorch 경로)
+    (diffusion_planner, optimizer, scheduler, model_ema, init_epoch,
+     wandb_id) = _resume_from_pytorch_checkpoint(
+         ckpt_dir=ckpt_dir,
+         diffusion_planner=diffusion_planner,
+         optimizer=optimizer,
+         scheduler=scheduler,
+         model_ema=model_ema,
+         device=args.device,
+     )
+    return diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id
+
+
+def _finalize_train_epochs_and_wandb_after_resume(
+    args: argparse.Namespace,
+    init_epoch: int,
+    resume_model_only: bool,
+    global_rank: int,
+) -> Tuple[int, bool]:
+    """체크포인트 로드 이후 train_epochs 와 allow_val_change 값을 최종 결정한다.
+
+    처리 규칙:
+      - resume_model_only=True:
+          · epoch 정보는 모두 무시하고,
+            args.train_epochs 를 그대로 사용한다.
+          · allow_val_change=False 로 둔다 (새 run 개념).
+      - resume_model_only=False:
+          · init_epoch 가 이미 지난 epoch 수이므로,
+            args.train_epochs <= init_epoch 이면 init_epoch+1 로 늘린다.
+          · args.resume_model_from_wandb 가 설정되어 있으면
+            allow_val_change=True 로 W&B config 변경을 허용한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 Namespace.
+        init_epoch (int):
+            체크포인트에서 읽어온 재개 시작 epoch 인덱스(0 기반).
+        resume_model_only (bool):
+            True 이면 model-only 재시작 모드.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 로그를 출력한다.
+
+    Returns:
+        Tuple[int, bool]:
+            - train_epochs: 최종 사용할 train_epochs 값.
+            - allow_val_change: W&B config 변경 허용 여부.
+    """
+    allow_val_change: bool = False
+
+    if resume_model_only:
+        # model-only 재시작: epoch 정보는 모두 무시하고 config 값 그대로 사용
+        train_epochs = int(args.train_epochs)
+        return train_epochs, allow_val_change
+
+    # 기존 full-resume 경로: init_epoch 를 기준으로 train_epochs 보정
+    if args.train_epochs <= init_epoch:
+        old = int(args.train_epochs)
+        args.train_epochs = int(init_epoch) + 1
+        if global_rank == 0:
+            print(
+                f"[ADJUST] scaled train_epochs ({old}) <= init_epoch ({init_epoch}). "
+                f"Bumping to {args.train_epochs}.")
+    train_epochs = int(args.train_epochs)
+
+    # W&B 아티팩트에서 재개하는 경우 config 값 변경 허용
+    if args.resume_model_from_wandb:
+        allow_val_change = True
+
+    return train_epochs, allow_val_change
+
+
 def _maybe_resume_from_checkpoint(
     args: argparse.Namespace,
     diffusion_planner: nn.Module,
@@ -2300,119 +3514,112 @@ def _maybe_resume_from_checkpoint(
     use_deepspeed: bool,
 ) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
            Optional[str], int, bool]:
-    """체크포인트가 지정된 경우 모델/옵티마/스케줄러/EMA 상태를 불러와서 이어 학습한다.
+    """로컬 또는 W&B에서 지정한 체크포인트가 있으면 학습 상태를 복원한다.
 
-    분기:
-      - use_deepspeed=False:
-        · 기존 resume_model() 로 PyTorch latest.pth 를 그대로 불러온다.
-      - use_deepspeed=True:
-        · 먼저 ckpt_dir 가 DeepSpeed 형식인지 확인한다.
-          * DeepSpeed 형식이면 engine.load_checkpoint(...) 를 사용.
-          * 아니라면 PyTorch latest.pth 로 보고
-            _load_pytorch_checkpoint_into_deepspeed(...) 로
-            내부 모듈(및 EMA)만 채운 뒤, 옵티마/스케줄러는 새로 시작한다.
+    이 함수는 "재개할 체크포인트가 있는지"를 먼저 확인한 뒤,
+    상황에 따라 다음과 같이 동작한다.
 
-    EMA:
-      - DeepSpeed load_checkpoint 를 쓸 때는 client_state['ema_state_dict'] 에
-        EMA 상태를 같이 넣어두고, 여기서 model_ema 에 다시 복원한다.
-      - PyTorch ckpt 를 DeepSpeed 로 읽을 때도 ckpt['ema_state_dict'] 를 사용해
-        EMA 를 가능한 한 그대로 살린다.
+      * resume_model_only=False (기존 resume 모드):
+        - DeepSpeed 모드 + DeepSpeed 형식 디렉터리:
+            · 모델/옵티마이저/스케줄러/EMA/epoch/wandb_id 를 모두 복원.
+        - DeepSpeed 모드 + PyTorch latest.pth:
+            · 모델/EMA 를 불러오고, epoch/wandb_id 를 사용해 계속 진행
+              (옵티마이저/스케줄러는 새 상태로 시작).
+        - 일반 PyTorch/DDP 모드:
+            · resume_model(...) 을 통해 모델/옵티마이저/스케줄러/EMA/epoch/wandb_id 복원.
+
+      * resume_model_only=True (model-only 재시작 모드):
+        - 어떤 형식이든 모델/EMA 파라미터만 불러오고,
+          optimizer/scheduler/epoch/wandb_id 는 모두 새로 시작한다.
+          · DeepSpeed: load_optimizer_states=False, load_lr_scheduler_states=False 로 로드.
+          · PyTorch: _load_model_and_ema_state_only_from_pytorch_checkpoint(...) 사용.
+        - init_epoch=0, train_epochs 는 config 값 그대로 사용.
+        - wandb_id=None, allow_val_change=False 로 처리한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 및 resume 관련 인자를 담고 있는 Namespace.
+        diffusion_planner (nn.Module):
+            현재 학습 중인 모델 또는 DeepSpeed/ DDP 래퍼.
+        optimizer (optim.Optimizer):
+            AdamW 또는 8bit AdamW 옵티마이저.
+        scheduler (Any):
+            학습률 스케줄러 인스턴스.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 주요 로그를 출력한다.
+        train_epochs (int):
+            현재까지 설정된 전체 학습 epoch 수. shape: ().
+        use_deepspeed (bool):
+            DeepSpeed 모드 사용 여부.
+
+    Returns:
+        Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+              Optional[str], int, bool]:
+            - diffusion_planner:
+                체크포인트를 반영한 모델(DeepSpeed/ DDP 래퍼 포함 가능).
+            - optimizer:
+                재개된 옵티마이저 또는 기존 옵티마이저.
+            - scheduler:
+                재개된 스케줄러 또는 기존 스케줄러.
+            - model_ema:
+                EMA 상태가 복원된 ModelEma 또는 None.
+            - init_epoch:
+                재개 시작 epoch 인덱스(0 기반). model-only 모드에서는 0.
+            - wandb_id:
+                이어서 사용할 W&B run id 또는 None.
+            - train_epochs:
+                최종 train_epochs 값.
+            - allow_val_change:
+                W&B config 값을 바꿔도 되는지 여부.
     """
-    allow_val_change = False
+    resume_model_only: bool = bool(getattr(args, "resume_model_only", False))
 
     if args.resume_local_path_model_path is not None:
-        ckpt_dir = args.resume_local_path_model_path
+        ckpt_dir: str = args.resume_local_path_model_path
         print(f"Model loaded from {ckpt_dir}")
 
+        # -------- DeepSpeed 경로 --------
         if use_deepspeed and hasattr(diffusion_planner, "load_checkpoint"):
-            # ✅ 1) 먼저 DeepSpeed 형식인지 확인
-            if _is_deepspeed_checkpoint_dir(ckpt_dir):
-                # ---- DeepSpeed 전용 로드 경로 ----
-                load_path, client_state = diffusion_planner.load_checkpoint(
-                    ckpt_dir,
-                    tag="latest",
-                )
-                if global_rank == 0:
-                    print(
-                        f"[DeepSpeed] load_checkpoint returned path={load_path}, "
-                        f"client_state keys={list((client_state or {}).keys())}"
-                    )
-
-                client_state = client_state or {}
-                init_epoch = int(client_state.get("epoch", 0))
-                wandb_id = client_state.get("wandb_id", None)
-
-                # EMA 복원
-                ema_state_dict = client_state.get("ema_state_dict", None)
-                if (model_ema is not None) and (ema_state_dict is not None):
-                    try:
-                        ema_model: nn.Module = getattr(model_ema, "ema",
-                                                       model_ema)
-                        ema_model.load_state_dict(ema_state_dict, strict=False)
-                        ema_model.eval()
-                        for p in ema_model.parameters():
-                            p.requires_grad_(False)
-                        if global_rank == 0:
-                            print("[DeepSpeed] EMA state load done")
-                    except Exception as e:
-                        if global_rank == 0:
-                            print(f"[DeepSpeed] EMA state load 실패: {e}")
-
-                # DeepSpeed 엔진 내부 옵티마이저 그룹에도 lr_max / wd_max 보정
-                if hasattr(diffusion_planner, "optimizer"):
-                    for pg in diffusion_planner.optimizer.param_groups:
-                        pg.setdefault("lr_max", float(pg["lr"]))
-                        pg.setdefault("wd_max",
-                                      float(pg.get("weight_decay", 0.0)))
-            else:
-                # ---- PyTorch ckpt 를 DeepSpeed 엔진으로 불러오는 경로 ----
-                init_epoch, wandb_id = _load_pytorch_checkpoint_into_deepspeed(
-                    ckpt_dir=ckpt_dir,
+            diffusion_planner, model_ema, init_epoch, wandb_id = \
+                _resume_from_checkpoint_with_deepspeed(
+                    args=args,
                     diffusion_planner=diffusion_planner,
                     model_ema=model_ema,
-                    device=args.device,
+                    ckpt_dir=ckpt_dir,
                     global_rank=global_rank,
+                    resume_model_only=resume_model_only,
                 )
 
-                # DeepSpeed 옵티마이저 param_group 기본값 보정
-                if hasattr(diffusion_planner, "optimizer"):
-                    for pg in diffusion_planner.optimizer.param_groups:
-                        pg.setdefault("lr_max", float(pg["lr"]))
-                        pg.setdefault("wd_max",
-                                      float(pg.get("weight_decay", 0.0)))
+        # -------- 일반 PyTorch / DDP 경로 --------
         else:
-            # ✅ 기존 PyTorch / DDP 복원 경로
-            (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
-             model_ema) = resume_model(
-                 ckpt_dir,
-                 diffusion_planner,
-                 optimizer,
-                 scheduler,
-                 model_ema,
-                 args.device,
+            (diffusion_planner, optimizer, scheduler, model_ema, init_epoch,
+             wandb_id) = _resume_from_checkpoint_with_pytorch(
+                 args=args,
+                 diffusion_planner=diffusion_planner,
+                 optimizer=optimizer,
+                 scheduler=scheduler,
+                 model_ema=model_ema,
+                 ckpt_dir=ckpt_dir,
+                 global_rank=global_rank,
+                 resume_model_only=resume_model_only,
              )
 
-            # resume 후에도 wd_max / lr_max 기본값이 유지되도록 보강
-            for pg in optimizer.param_groups:
-                pg.setdefault("lr_max", float(pg["lr"]))
-                pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
+        # -------- train_epochs / allow_val_change 최종 결정 --------
+        train_epochs, allow_val_change = _finalize_train_epochs_and_wandb_after_resume(
+            args=args,
+            init_epoch=init_epoch,
+            resume_model_only=resume_model_only,
+            global_rank=global_rank,
+        )
 
-        # 재개 시 총 epoch 수가 init_epoch보다 작지 않도록 보정
-        if args.train_epochs <= init_epoch:
-            old = int(args.train_epochs)
-            args.train_epochs = int(init_epoch) + 1
-            if global_rank == 0:
-                print(
-                    f"[ADJUST] scaled train_epochs ({old}) <= init_epoch ({init_epoch}). "
-                    f"Bumping to {args.train_epochs}.")
-
-        train_epochs = int(args.train_epochs)
-
-        if args.resume_model_from_wandb:
-            allow_val_change = True
     else:
+        # 체크포인트 지정이 전혀 없는 경우: 완전 새 학습
         init_epoch = 0
         wandb_id = None
+        train_epochs = int(args.train_epochs)
+        allow_val_change = False
 
     return (
         diffusion_planner,
@@ -2668,6 +3875,75 @@ def _log_and_save_on_rank0(
     best_loss: float,
     global_rank: int,
 ) -> float:
+    """rank 0 프로세스에서만 로그 기록과 체크포인트 저장을 담당한다.
+
+    전체 학습 루프(_run_training_loop) 안에서 한 epoch가 끝날 때마다 호출되며,
+    다음과 같은 일을 **오직 global_rank == 0 일 때만** 수행한다.
+
+    1) metric 로깅
+       - metrics 딕셔너리의 값들을 wandb_logger.log_metrics(...) 로 한 번에 기록한다.
+         · metrics[key] 값은 모두 스칼라(float)라고 가정한다.
+         · 주요 값: "loss_dict/loss", "info_dict/lr", "speed_info/data_process_per_sec" 등.
+
+    2) 저장 주기 판단
+       - args.save_utd (예: 1, 5) 를 읽어서
+         `(epoch + 1) % save_utd == 0` 인 epoch 에서만 체크포인트를 저장한다.
+         · save_utd = 1 이면 매 epoch 저장.
+         · save_utd = 5 이면 5 epoch마다 한 번 저장.
+
+    3) best loss 갱신 여부 판단
+       - train_total_loss 가 현재 best_loss 보다 작으면
+         · best_loss 를 새 값으로 교체하고,
+         · save_best=True 로 표시해 best.pth 도 함께 갱신하도록 만든다.
+
+    4) 로컬 체크포인트 저장
+       - use_deepspeed=True 이면:
+         · _save_deepspeed_checkpoint_for_epoch(...) 을 호출해
+           DeepSpeed 포맷(latest / best tag + meta 파일)으로 저장한다.
+       - use_deepspeed=False 이면:
+         · diffusion_planner, optimizer, scheduler, EMA 를
+           diffusion_planner.utils.train_utils.save_model(...) 로
+           PyTorch latest.pth / best.pth 로 저장한다.
+
+    5) W&B 아티팩트 업로드
+       - _log_wandb_checkpoint_artifacts(...) 를 호출해
+         방금 저장한 latest.pth / best.pth (및 DeepSpeed 폴더)를
+         W&B 아티팩트로 올린다.
+
+    Args:
+        epoch (int):
+            - 현재 epoch 인덱스(0 기반).  # shape: ()
+        args (argparse.Namespace):
+            - 학습 설정과 save_utd, use_deepspeed, use_wandb 등을 포함한 Namespace.
+        train_total_loss (float):
+            - 이번 epoch 의 전체 train loss 스칼라 값.  # shape: ()
+        metrics (Dict[str, float]):
+            - "info_dict/*", "loss_dict/*", "speed_info/*" 등 prefix 가 붙은
+              로그용 값들을 담은 딕셔너리. 각 value 는 float 스칼라.
+        wandb_logger (Logger):
+            - W&B + TensorBoard 로 metrics 를 기록하는 로거.
+        diffusion_planner (nn.Module):
+            - 학습 중인 모델 또는 DeepSpeed/ DDP 래퍼.
+        optimizer (optim.Optimizer):
+            - AdamW/AdamW8bit 옵티마이저.
+        scheduler (Any):
+            - 학습률 스케줄러 객체. state_dict() 호출을 지원한다고 가정.
+        model_ema (Optional[ModelEma]):
+            - EMA 래퍼. PyTorch 체크포인트 저장 시 ema.ema.state_dict() 도 같이 저장한다.
+        save_path (Optional[str]):
+            - 체크포인트가 저장될 루트 디렉터리. None 이면 저장을 건너뛴다.
+        best_loss (float):
+            - 지금까지의 최소 train_total_loss 값.  # shape: ()
+        global_rank (int):
+            - 전체 프로세스 기준 rank. 0 이 아닐 경우 이 함수는 아무 것도 하지 않고
+              best_loss 를 그대로 돌려준다.
+
+    Returns:
+        float:
+            - 업데이트된 best_loss 값.
+              · 이번 epoch 손실이 더 작으면 새 값으로 교체된 값.
+              · 그렇지 않으면 입력과 동일한 값.
+    """
     if global_rank != 0:
         return best_loss
 
@@ -2728,6 +4004,226 @@ def _log_and_save_on_rank0(
     return best_loss
 
 
+def _build_epoch_info_dict_for_logging(
+    optimizer: optim.Optimizer,
+    train_epochs: int,
+    train_loader: DataLoader,
+    global_batch_size: int,
+) -> Dict[str, float]:
+    """한 epoch에 대한 기본 정보(info_dict)를 만든다.
+
+    포함되는 값:
+      - lr: 현재 학습률. optimizer.param_groups[0]["lr"]  # shape: ()
+      - total_train_epochs: 전체 epoch 수.  # shape: ()
+      - batch_num_in_epoch: 이번 epoch의 배치 개수(len(train_loader)).  # shape: ()
+      - total_batch_num_of_all_epochs: 전체 학습 동안의 총 배치 수.  # shape: ()
+      - global_batch_size: 한 step에서 처리되는 샘플 수.  # shape: ()
+
+    Args:
+        optimizer (optim.Optimizer):
+            - AdamW 또는 8bit AdamW 옵티마이저.
+        train_epochs (int):
+            - 전체 학습 epoch 수.  # shape: ()
+        train_loader (DataLoader):
+            - 한 epoch 동안 순회할 DataLoader. len(train_loader)는 배치 수.  # shape: ()
+        global_batch_size (int):
+            - 실제 글로벌 배치 크기.  # shape: ()
+
+    Returns:
+        Dict[str, float]:
+            - info_dict용 key/value 쌍. 값들은 모두 스칼라(float로 해석 가능한 숫자).
+    """
+    info_dict: Dict[str, float] = {
+        "lr": optimizer.param_groups[0]["lr"],
+        "total_train_epochs": train_epochs,
+        "batch_num_in_epoch": len(train_loader),
+        "total_batch_num_of_all_epochs": train_epochs * len(train_loader),
+        "global_batch_size": global_batch_size,
+    }
+    return info_dict
+
+
+def _split_train_loss_for_logging(
+    train_loss: Dict[str, float],
+    info_dict: Dict[str, float],
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float], Dict[
+        str, float], Dict[str, float]]:
+    """train_loss dict를 로그용 하위 딕셔너리들로 나눈다.
+
+    입력:
+      - train_loss:
+          diffusion_loss_func + _compute_loss_dict 에서 나온 손실 항목 모음.
+          각 value는 스칼라 텐서 .item() 결과 또는 float 값이다.  # shape: ()
+
+    처리 규칙:
+      - "learn_progress" 항목은 info_dict 에 그대로 추가.
+      - 가중치 관련 키는 weight_dict 로,
+      - direct loss / integration loss / constraint loss / 전체 loss 계열은
+        각각 별도 dict로 분리한다.
+
+    Args:
+        train_loss (Dict[str, float]):
+            - 손실 항목 이름 → 값(스칼라) 딕셔너리.
+        info_dict (Dict[str, float]):
+            - 기본 info_dict. "learn_progress" 키가 있으면 여기에 추가된다.
+
+    Returns:
+        Tuple[Dict[str, float], Dict[str, float], Dict[str, float],
+              Dict[str, float], Dict[str, float]]:
+            - weight_dict: direct/int/const loss weight 항목들.
+            - direct_loss_dict: neighbor_prediction_* direct loss 항목들.
+            - integration_loss_dict: integration_* loss 항목들.
+            - constraint_loss_dict: constraint_* loss 항목들.
+            - loss_dict: neighbor/integration/constraint/loss_dict 합산용 항목들.
+    """
+    weight_dict: Dict[str, float] = {}
+    direct_loss_dict: Dict[str, float] = {}
+    integration_loss_dict: Dict[str, float] = {}
+    constraint_loss_dict: Dict[str, float] = {}
+    loss_dict: Dict[str, float] = {}
+
+    for k, v in train_loss.items():
+        if k == "learn_progress":
+            info_dict[k] = v
+        elif k in ("direct_loss_weight", "int_loss_weight",
+                   "const_loss_weight"):
+            weight_dict[k] = v
+        elif k in (
+                "neighbor_prediction_loss_xy",
+                "neighbor_prediction_loss_yaw",
+                "neighbor_prediction_loss_xy_early",
+                "neighbor_prediction_loss_yaw_early",
+        ):
+            direct_loss_dict[k] = v
+        elif k in (
+                "integration_loss_xy",
+                "integration_loss_yaw",
+                "integration_loss_xy_early",
+                "integration_loss_yaw_early",
+        ):
+            integration_loss_dict[k] = v
+        elif k in (
+                "constraint_diff_vx_b",
+                "constraint_diff_vy_b",
+                "constraint_diff_yaw_rate",
+        ):
+            constraint_loss_dict[k] = v
+        elif k in (
+                "loss_dict",
+                "neighbor_prediction_loss",
+                "integration_loss",
+                "constraint_loss",
+        ):
+            loss_dict[k] = v
+
+    return weight_dict, direct_loss_dict, integration_loss_dict, constraint_loss_dict, loss_dict
+
+
+def _build_speed_info_for_logging(
+    epoch_elapsed_time_sec: float,
+    data_num_in_a_epoch: int,
+    elapsed_training_time_hour: float,
+) -> Dict[str, float]:
+    """속도/시간 관련 로그용 딕셔너리를 만든다.
+
+    계산 내용:
+      - epoch_elapsed_time_sec: 이번 epoch에 걸린 시간(초).  # shape: ()
+      - data_process_per_sec: 초당 처리 샘플 수
+            = data_num_in_a_epoch / max(epoch_elapsed_time_sec, 1e-9).  # shape: ()
+      - elapsed_training_time_hour: 지금까지 누적 학습 시간(시간 단위).  # shape: ()
+
+    Args:
+        epoch_elapsed_time_sec (float):
+            - 이번 epoch 에 걸린 시간(초).  # shape: ()
+        data_num_in_a_epoch (int):
+            - 이번 epoch에서 처리된 샘플 수.  # shape: ()
+        elapsed_training_time_hour (float):
+            - 이전 epoch까지의 누적 학습 시간(시간 단위).  # shape: ()
+
+    Returns:
+        Dict[str, float]:
+            - speed_info 딕셔너리. 각 값은 스칼라 float.
+    """
+    data_process_per_sec: float = data_num_in_a_epoch / max(
+        epoch_elapsed_time_sec, 1e-9)
+    speed_info: Dict[str, float] = {
+        "epoch_elapsed_time_sec": epoch_elapsed_time_sec,
+        "data_process_per_sec": data_process_per_sec,
+        "elapsed_training_time_hour": elapsed_training_time_hour,
+    }
+    return speed_info
+
+
+def _build_flat_metrics_dict_for_logging(
+    info_dict: Dict[str, float],
+    weight_dict: Dict[str, float],
+    direct_loss_dict: Dict[str, float],
+    integration_loss_dict: Dict[str, float],
+    constraint_loss_dict: Dict[str, float],
+    loss_dict: Dict[str, float],
+    speed_info: Dict[str, float],
+) -> Dict[str, float]:
+    """여러 그룹의 딕셔너리를 prefix를 붙인 단일 metrics dict로 합친다.
+
+    입력 딕셔너리들의 값은 모두 스칼라(float)라고 가정하고,
+    key 앞에는 아래와 같은 prefix를 붙여 평탄한(flat) 형태로 만든다.
+
+      - "info_dict/"       + key
+      - "weight_dict/"     + key
+      - "direct_loss_dict/"+ key
+      - "integration_loss_dict/" + key
+      - "constraint_loss_dict/"  + key
+      - "loss_dict/"       + key
+      - "speed_info/"      + key
+
+    Args:
+        info_dict (Dict[str, float]):
+            - lr, epoch 정보, 진행도 등 정보성 값.
+        weight_dict (Dict[str, float]):
+            - direct/int/const loss weight 들.
+        direct_loss_dict (Dict[str, float]):
+            - neighbor_prediction_* 계열 direct loss 값들.
+        integration_loss_dict (Dict[str, float]):
+            - integration_* 계열 loss 값들.
+        constraint_loss_dict (Dict[str, float]):
+            - constraint_* 계열 loss 값들.
+        loss_dict (Dict[str, float]):
+            - neighbor_prediction_loss / integration_loss / constraint_loss / loss_dict 등.
+        speed_info (Dict[str, float]):
+            - epoch_elapsed_time_sec / data_process_per_sec / elapsed_training_time_hour.
+
+    Returns:
+        Dict[str, float]:
+            - W&B / TensorBoard 에 바로 쓸 수 있는 flat metrics dict.
+              각 value는 스칼라 float.
+    """
+    metrics: Dict[str, float] = {}
+
+    # add "info_dict/" prefix
+    metrics.update({f"info_dict/{k}": v for k, v in info_dict.items()})
+    # add "weight_dict/" prefix
+    metrics.update({f"weight_dict/{k}": v for k, v in weight_dict.items()})
+    # add "direct_loss_dict/" prefix
+    metrics.update({
+        f"direct_loss_dict/{k}": v for k, v in direct_loss_dict.items()
+    })
+    # add "integration_loss_dict/" prefix
+    metrics.update({
+        f"integration_loss_dict/{k}": v
+        for k, v in integration_loss_dict.items()
+    })
+    # add "constraint_loss_dict/" prefix
+    metrics.update({
+        f"constraint_loss_dict/{k}": v for k, v in constraint_loss_dict.items()
+    })
+    # add "loss_dict/" prefix
+    metrics.update({f"loss_dict/{k}": v for k, v in loss_dict.items()})
+    # add "speed_info/" prefix
+    metrics.update({f"speed_info/{k}": v for k, v in speed_info.items()})
+
+    return metrics
+
+
 def _run_training_loop(
     args: argparse.Namespace,
     diffusion_planner: nn.Module,
@@ -2746,31 +4242,74 @@ def _run_training_loop(
     global_batch_size: int,
     aug: Optional[object],
 ) -> float:
-    """전체 epoch 루프를 돌면서 학습, 로깅, 저장을 수행한다.
+    """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다.
+
+    처리 흐름:
+      1) epoch = init_epoch 부터 train_epochs-1 까지 순회하면서,
+         각 epoch마다 _train_one_epoch(...) 를 호출해
+         - train_loss (Dict[str, float])
+         - train_total_loss (float)
+         - epoch_elapsed_time_sec (float)
+         를 얻는다. 이때 train_loader에서 나오는 배치 텐서는 모두 (B, ·) shape 이다.
+      2) 한 epoch에 대해
+         - data_num_in_a_epoch / epoch_elapsed_time_sec 로
+           data_process_per_sec 를 구하고,
+         - 누적 학습 시간(elapsed_training_time_hour)을 시간 단위로 업데이트한다.
+      3) optimizer / train_loss / 속도 정보를 이용해
+         - info_dict (학습률, epoch 수, 배치 수, 글로벌 배치 크기, 진행도 등)
+         - weight_dict / direct_loss_dict / integration_loss_dict /
+           constraint_loss_dict / loss_dict
+         - speed_info (epoch_elapsed_time_sec, data_process_per_sec,
+           elapsed_training_time_hour)
+         를 구성한 뒤,
+         prefix("info_dict/", "loss_dict/" 등)을 붙여 하나의 metrics dict 로 합친다.
+      4) rank 0 프로세스에서만 _log_and_save_on_rank0(...) 을 호출해
+         - W&B / TensorBoard 로 metrics 를 기록하고,
+         - 주기적으로 checkpoint 를 저장하며,
+         - best_loss 를 갱신한다.
+      5) 각 epoch 마지막에는 train_sampler.set_epoch(...) 를 호출해
+         다음 epoch에서 DistributedSampler의 셔플 시드를 바꾸어 준다.
 
     Args:
-        args: 학습 설정.
-        diffusion_planner: 학습 중인 모델.
-        optimizer: 옵티마이저.
-        scheduler: 학습률 스케줄러.
-        model_ema: EMA 래퍼 또는 None.
-        train_loader: 학습용 DataLoader. 배치 텐서는 (B, ·) shape.
-        train_sampler: DistributedSampler.
-        wandb_logger: TensorBoardLogger 래퍼.
-        save_path: 체크포인트 저장 경로.
-        time_str: run 식별용 시간 문자열.
-        best_loss: 현재까지의 best loss 값.
-        global_rank: 전체 프로세스 기준 번호.
-        train_epochs: 전체 epoch 수.
-        init_epoch: 재개 시작 epoch 인덱스.
-        data_num_in_a_epoch: 한 epoch당 처리 샘플 수.
-        global_batch_size: 실제 글로벌 배치 크기.
-        aug: augmentation 객체 또는 None.
+        args (argparse.Namespace):
+            - 학습 설정 / 상태를 포함한 Namespace.
+        diffusion_planner (nn.Module):
+            - 학습 중인 모델 또는 DDP/DeepSpeed 래퍼.
+        optimizer (optim.Optimizer):
+            - AdamW/AdamW8bit 옵티마이저.
+        scheduler (Any):
+            - lr 스케줄러 객체. train_epoch 내부에서 step()이 호출된다.
+        model_ema (Optional[ModelEma]):
+            - EMA 추적용 래퍼 또는 None.
+        train_loader (DataLoader):
+            - 각 요소가 (B, ·) shape 텐서 dict인 배치를 반환하는 DataLoader.
+        train_sampler (DistributedSampler):
+            - 분산 환경에서 rank별 샘플 인덱스를 관리하는 Sampler.
+        wandb_logger (Logger):
+            - W&B + TensorBoard 로깅 담당 래퍼.
+        save_path (Optional[str]):
+            - checkpoint 를 저장할 디렉터리 경로. None 이면 저장하지 않음.
+        best_loss (float):
+            - 지금까지의 최소 train_total_loss 값.  # shape: ()
+        global_rank (int):
+            - 전체 프로세스 기준 rank. 0 이면 로그/저장 담당.
+        train_epochs (int):
+            - 전체 학습 epoch 수.  # shape: ()
+        init_epoch (int):
+            - 재개 시 시작할 epoch 인덱스(0 기반).  # shape: ()
+        data_num_in_a_epoch (int):
+            - 한 epoch 동안 처리되는 샘플 수.  # shape: ()
+        global_batch_size (int):
+            - 실제 글로벌 배치 크기 (한 step당 샘플 수).  # shape: ()
+        aug (Optional[object]):
+            - StatePerturbation / NPCStatePerturbation 또는 None.
 
     Returns:
-        best_loss: 학습 종료 시의 best loss 값.
+        float:
+            - 학습 종료 시점까지의 최소 train_total_loss(best_loss) 값.  # shape: ()
     """
-    elapsed_training_time_hour = 0.0
+    elapsed_training_time_hour: float = 0.0
+
     for epoch in range(init_epoch, train_epochs):
         # 1) 한 epoch 학습
         train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
@@ -2784,95 +4323,48 @@ def _run_training_loop(
             model_ema=model_ema,
             aug=aug,
         )
+
+        # 누적 학습 시간 업데이트 (시간 단위)
         elapsed_training_time_hour += epoch_elapsed_time_sec / 3600.0
+
         # 2) epoch당 처리 속도 계산
-        data_process_per_sec = data_num_in_a_epoch / max(
-            epoch_elapsed_time_sec, 1e-9)
-        """ train_loss: Dict[str, float]
-        <diffusion_loss_func 가 출력해주는 loss_dict>
-            - neighbor_prediction_loss : 이웃 예측 손실 텐서
-            - integration_loss : 통합 손실 텐서
-            - constraint_loss : 제약 손실 텐서
+        # data_process_per_sec: float, 초당 처리 샘플 수.  # shape: ()
+        speed_info: Dict[str, float] = _build_speed_info_for_logging(
+            epoch_elapsed_time_sec=epoch_elapsed_time_sec,
+            data_num_in_a_epoch=data_num_in_a_epoch,
+            elapsed_training_time_hour=elapsed_training_time_hour,
+        )
 
-            - neighbor_prediction_loss_xy / integration_loss_xy
-            - neighbor_prediction_loss_yaw / integration_loss_yaw
-            - neighbor_prediction_loss_xy_early / integration_loss_xy_early
-            - neighbor_prediction_loss_yaw_early / integration_loss_yaw_early
-            - constraint_diff_vx_b / constraint_diff_vy_b / constraint_diff_yaw_rate
+        # 3-1) lr / epoch / 배치 관련 info_dict 구성
+        info_dict: Dict[str, float] = _build_epoch_info_dict_for_logging(
+            optimizer=optimizer,
+            train_epochs=train_epochs,
+            train_loader=train_loader,
+            global_batch_size=global_batch_size,
+        )
 
-        <diffusion_loss_func 출력 후 _compute_loss_dict 가 추가하는 항목>
-        - learn_progress / direct_loss_weight / int_loss_weight / const_loss_weight :
-            진행도 및 가중치 기록용 텐서
-        - loss_dict : 최종 합 손실 텐서.
-        """
-        # 3) lr_dict / metrics 구성
-        info_dict: Dict[str, float] = {
-            'lr': optimizer.param_groups[0]['lr'],
-            "total_train_epochs": train_epochs,
-            "batch_num_in_epoch": len(train_loader),
-            "total_batch_num_of_all_epochs": train_epochs * len(train_loader),
-            "global_batch_size": global_batch_size,
-        }
-        weight_dict = {}
-        direct_loss_dict = {}
-        integration_loss_dict = {}
-        constraint_loss_dict = {}
-        loss_dict = {}
-        for k, v in train_loss.items():
-            if k == "learn_progress":
-                info_dict[k] = v
-            elif k in ("direct_loss_weight", "int_loss_weight",
-                       "const_loss_weight"):
-                weight_dict[k] = v
-            elif k in (
-                    "neighbor_prediction_loss_xy",
-                    "neighbor_prediction_loss_yaw",
-                    "neighbor_prediction_loss_xy_early",
-                    "neighbor_prediction_loss_yaw_early",
-            ):
-                direct_loss_dict[k] = v
-            elif k in ("integration_loss_xy", "integration_loss_yaw",
-                       "integration_loss_xy_early",
-                       "integration_loss_yaw_early"):
-                integration_loss_dict[k] = v
-            elif k in (
-                    "constraint_diff_vx_b",
-                    "constraint_diff_vy_b",
-                    "constraint_diff_yaw_rate",
-            ):
-                constraint_loss_dict[k] = v
-            elif k in ("loss_dict", "neighbor_prediction_loss",
-                       "integration_loss", "constraint_loss"):
-                loss_dict[k] = v
-        speed_info = {
-            "epoch_elapsed_time_sec": epoch_elapsed_time_sec,
-            "data_process_per_sec": data_process_per_sec,
-            "elapsed_training_time_hour": elapsed_training_time_hour,
-        }
-        metrics: Dict[str, float] = {}
-        # add "info_dict/" prefix
-        metrics.update({f"info_dict/{k}": v for k, v in info_dict.items()})
-        # add "weight_dict/" prefix
-        metrics.update({f"weight_dict/{k}": v for k, v in weight_dict.items()})
-        # add "direct_loss_dict/" prefix
-        metrics.update({
-            f"direct_loss_dict/{k}": v for k, v in direct_loss_dict.items()
-        })
-        # add "integration_loss_dict/" prefix
-        metrics.update({
-            f"integration_loss_dict/{k}": v
-            for k, v in integration_loss_dict.items()
-        })
-        # add "constraint_loss_dict/" prefix
-        metrics.update({
-            f"constraint_loss_dict/{k}": v
-            for k, v in constraint_loss_dict.items()
-        })
-        # add "loss_dict/" prefix
-        metrics.update({f"loss_dict/{k}": v for k, v in loss_dict.items()})
+        # 3-2) train_loss 항목들을 목적별 딕셔너리로 분리
+        (
+            weight_dict,
+            direct_loss_dict,
+            integration_loss_dict,
+            constraint_loss_dict,
+            loss_dict,
+        ) = _split_train_loss_for_logging(
+            train_loss=train_loss,
+            info_dict=info_dict,
+        )
 
-        # add "speed_info/" prefix
-        metrics.update({f"speed_info/{k}": v for k, v in speed_info.items()})
+        # 3-3) flat metrics dict 구성
+        metrics: Dict[str, float] = _build_flat_metrics_dict_for_logging(
+            info_dict=info_dict,
+            weight_dict=weight_dict,
+            direct_loss_dict=direct_loss_dict,
+            integration_loss_dict=integration_loss_dict,
+            constraint_loss_dict=constraint_loss_dict,
+            loss_dict=loss_dict,
+            speed_info=speed_info,
+        )
 
         # 4) rank 0에서 로그 및 체크포인트/아티팩트 저장
         best_loss = _log_and_save_on_rank0(
@@ -3000,7 +4492,7 @@ def model_training(args: argparse.Namespace) -> None:
     train_epochs: int = args.train_epochs
 
     # 3) save_path / args.json 준비
-    save_path, time_str = _prepare_save_path_and_dump_args(args, global_rank)
+    save_path = _prepare_save_path_and_dump_args(args, global_rank)
 
     # 4) seed 고정
     set_seed(args.seed + global_rank)
@@ -3059,6 +4551,7 @@ def model_training(args: argparse.Namespace) -> None:
         torch.distributed.barrier()
 
     # 10) 모델 / EMA / 옵티마이저 / 스케줄러 준비
+    # 변경
     (diffusion_planner, model_ema, optimizer,
      scheduler) = _build_model_optimizer_scheduler(
          args=args,
@@ -3141,7 +4634,7 @@ def _validate_wandb_resume_args(args: argparse.Namespace) -> None:
             "args.name must be provided to resume from a wandb artifact.")
 
 
-def _resolve_wandb_artifact_config(
+def _determine_wandb_artifact_config(
     args: argparse.Namespace,) -> Tuple[str, str, str]:
     """재개하려는 W&B 아티팩트의 이름과 파일 이름을 결정한다.
 
@@ -3287,7 +4780,7 @@ def _prepare_args_and_wandb_resume() -> argparse.Namespace:
       3) 설정된 경우
          - _validate_wandb_resume_args() 로 기본 인자 검사를 하고
          - wandb.Api() 를 만든 뒤
-         - _resolve_wandb_artifact_config() 으로 컬렉션/파일 이름을 정하고
+         - _determine_wandb_artifact_config() 으로 컬렉션/파일 이름을 정하고
          - _get_wandb_entity_and_project_for_resume() 로 entity, project 를 얻고
          - _download_wandb_checkpoint_to_local() 로 체크포인트를 내려받는다.
       4) 내려받은 디렉터리 경로를 args.resume_local_path_model_path 에 저장해
@@ -3321,7 +4814,7 @@ def _prepare_args_and_wandb_resume() -> argparse.Namespace:
             - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
         """
         resume_alias, collection_name, checkpoint_filename = \
-            _resolve_wandb_artifact_config(args)
+            _determine_wandb_artifact_config(args)
         """
         entity: str 예: 'jksg01019-naver-labs'
         project: str 예: 'Diffusion-Planner'
