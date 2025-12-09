@@ -3846,8 +3846,8 @@ class FeasibleProjector(nn.Module):
         return derivative_out  # (N,T,C)
 
     @classmethod
-    def loss_weights_by_progress(cls,
-                                 progress: float, args: Any) -> Tuple[float, float, float]:
+    def loss_weights_by_progress(cls, progress: float,
+                                 args: Any) -> Tuple[float, float, float]:
         """손실 가중치 스케줄러.
 
         Args:
@@ -3859,7 +3859,8 @@ class FeasibleProjector(nn.Module):
         p = float(max(0.0, min(1.0, progress)))
         # piecewise-linear for integration weight
         if p <= args.p_sat:
-            w_int = args.w_int_min + (args.w_int_max - args.w_int_min) * (p / args.p_sat)
+            w_int = args.w_int_min + (args.w_int_max -
+                                      args.w_int_min) * (p / args.p_sat)
         else:
             w_int = args.w_int_max
         return args.w_dir, w_int, args.w_const

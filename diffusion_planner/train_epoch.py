@@ -393,7 +393,8 @@ def _compute_loss_dict(
         1.0,
         args._global_update_step / float(max(1, batch_num_in_all_epoch - 1)),
     )
-    w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(progress, args)
+    w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
+        progress, args)
 
     if not args.use_direct_loss:
         w_dir = 0.0

@@ -2851,17 +2851,26 @@ def _resume_from_deepspeed_checkpoint_format(
     # === [NEW] model-only 모드에서는 base model도 EMA weight로 초기화 ===
     # load_optimizer_states=False & load_lr_scheduler_states=False 라면
     # resume_model_only=True에서 호출된 경우로 볼 수 있다.
-    prefer_ema_for_model_only = (not load_optimizer_states) and (not load_lr_scheduler_states)
+    prefer_ema_for_model_only = (not load_optimizer_states) and (
+        not load_lr_scheduler_states)
     if prefer_ema_for_model_only and (ema_state_dict is not None):
         try:
-            base_model: nn.Module = getattr(diffusion_planner, "module", diffusion_planner)
-            incompatible = base_model.load_state_dict(ema_state_dict, strict=False)
+            base_model: nn.Module = getattr(diffusion_planner, "module",
+                                            diffusion_planner)
+            incompatible = base_model.load_state_dict(ema_state_dict,
+                                                      strict=False)
             if global_rank == 0:
                 if getattr(incompatible, "missing_keys", None):
-                    print(f"[DeepSpeed] model-only(EMA) missing_keys: {incompatible.missing_keys}")
+                    print(
+                        f"[DeepSpeed] model-only(EMA) missing_keys: {incompatible.missing_keys}"
+                    )
                 if getattr(incompatible, "unexpected_keys", None):
-                    print(f"[DeepSpeed] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}")
-                print("[DeepSpeed] model-only resume: base model initialized from EMA weights")
+                    print(
+                        f"[DeepSpeed] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}"
+                    )
+                print(
+                    "[DeepSpeed] model-only resume: base model initialized from EMA weights"
+                )
         except Exception as e:
             if global_rank == 0:
                 print(f"[DeepSpeed] EMA→base_model 초기화 실패: {e}")

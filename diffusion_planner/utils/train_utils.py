@@ -84,6 +84,7 @@ def get_epoch_mean_loss(
 
     return epoch_mean_loss
 
+
 def save_model(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -169,6 +170,7 @@ def save_model(
         # fileio.put(f.getvalue(), f'{save_path}/model_epoch_{epoch+1}_trainloss_{train_loss:.4f}.pth')
         fileio.put(f.getvalue(), f"{save_path}/latest.pth")
 
+
 def resume_model(
     path: str,
     model: torch.nn.Module,
@@ -176,7 +178,8 @@ def resume_model(
     scheduler: Any,
     ema: Optional[Any],
     device: str,
-) -> Tuple[torch.nn.Module, torch.optim.Optimizer, Any, int, Optional[str], Optional[Any]]:
+) -> Tuple[torch.nn.Module, torch.optim.Optimizer, Any, int, Optional[str],
+           Optional[Any]]:
     """저장된 latest.pth 체크포인트를 읽어서 모델/옵티마이저/스케줄러/EMA 상태를 복원한다.
 
     이 함수는 `save_model(...)` 이 만든 PyTorch 체크포인트를 기준으로 동작한다.
