@@ -3015,6 +3015,8 @@ class StaticFusionEncoder(nn.Module):
             for p in self.projection.parameters():
                 touch = touch + p.view(-1)[:1].sum()
             static_encoding = static_encoding + touch * 0.0
+        print("static_encoding.shape:", static_encoding.shape)
+        print("static_objects_num: ", static_objects_num)
         static_encoding = static_encoding.reshape(
             B, static_objects_num, -1)  # (B, static_objects_num, hidden_dim)
         mask_p = mask_p.reshape(B,
