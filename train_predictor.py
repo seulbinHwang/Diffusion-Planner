@@ -2536,16 +2536,16 @@ def _save_deepspeed_checkpoint_for_epoch(
     )
 
 
-def _is_deepspeed_checkpoint_dir(ckpt_dir: str) -> bool:
+def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
     """주어진 경로가 DeepSpeed checkpoint 디렉터리인지 대략 판별한다.
 
     규칙(간단한 휴리스틱):
-      - ckpt_dir 안에 tag 디렉터리("latest" 또는 "best")가 있고
+      - save_path 안에 tag 디렉터리("latest" 또는 "best")가 있고
       - 그 안에 "mp_rank_" 로 시작하는 하위 디렉터리가 있으면
         DeepSpeed 가 저장한 구조라고 본다.
 
     Args:
-        ckpt_dir:
+        save_path:
             체크포인트 루트 디렉터리 경로.
 
     Returns:
@@ -2553,8 +2553,8 @@ def _is_deepspeed_checkpoint_dir(ckpt_dir: str) -> bool:
             True  → DeepSpeed 형식으로 저장된 디렉터리라고 판단.
             False → PyTorch 단일 .pth 형식이라고 보고 처리한다.
     """
-    latest_tag_dir = os.path.join(ckpt_dir, "latest")
-    best_tag_dir = os.path.join(ckpt_dir, "best")
+    latest_tag_dir = os.path.join(save_path, "latest")
+    best_tag_dir = os.path.join(save_path, "best")
 
     for tag_dir in (latest_tag_dir, best_tag_dir):
         if not os.path.isdir(tag_dir):
@@ -2571,7 +2571,7 @@ def _is_deepspeed_checkpoint_dir(ckpt_dir: str) -> bool:
 
 
 def _load_pytorch_checkpoint_into_deepspeed(
-    ckpt_dir: str,
+    save_path: str,
     diffusion_planner: nn.Module,
     model_ema: Optional[ModelEma],
     device: str,
@@ -2584,7 +2584,7 @@ def _load_pytorch_checkpoint_into_deepspeed(
       - 지금은 DeepSpeed 모드로 전환해서 그 가중치부터 이어서 학습하고 싶을 때.
 
     처리 흐름:
-      1) ckpt_dir/latest.pth 를 torch.load 로 읽는다.
+      1) save_path/latest.pth 를 torch.load 로 읽는다.
       2) ckpt['model'] (또는 ckpt 전체)을 base_model(state_dict 구조와 맞게)로 맞춘다.
          - DDP 에서 저장된 "module.*" prefix 가 있으면 자동으로 제거한다.
       3) base_model.load_state_dict(..., strict=False) 로 파라미터를 채운다.
@@ -2592,7 +2592,7 @@ def _load_pytorch_checkpoint_into_deepspeed(
       5) epoch / wandb_id 를 꺼내서 반환한다.
 
     Args:
-        ckpt_dir:
+        save_path:
             PyTorch latest.pth 가 들어 있는 디렉터리 경로.
         diffusion_planner:
             DeepSpeedEngine 인스턴스. 내부에 .module 로 실제 모델이 있다.
@@ -2608,7 +2608,7 @@ def _load_pytorch_checkpoint_into_deepspeed(
             - init_epoch: 재개 시작 epoch 인덱스.
             - wandb_id : ckpt 에 저장된 W&B run id (없으면 None).
     """
-    ckpt_path = os.path.join(ckpt_dir, "latest.pth")
+    ckpt_path = os.path.join(save_path, "latest.pth")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"PyTorch latest.pth 를 찾을 수 없습니다: {ckpt_path}")
 
@@ -2745,7 +2745,7 @@ def _update_deepspeed_optimizer_param_group_meta(
 def _resume_from_deepspeed_checkpoint_format(
     diffusion_planner: nn.Module,
     model_ema: Optional[ModelEma],
-    ckpt_dir: str,
+    save_path: str,
     global_rank: int,
     load_optimizer_states: bool = True,
     load_lr_scheduler_states: bool = True,
@@ -2753,7 +2753,7 @@ def _resume_from_deepspeed_checkpoint_format(
     """DeepSpeed 형식(checkpoint 디렉터리 구조)으로 저장된 체크포인트를 로드한다.
 
     처리 흐름:
-      1) diffusion_planner.load_checkpoint(ckpt_dir, tag="latest", ...) 를 호출해
+      1) diffusion_planner.load_checkpoint(save_path, tag="latest", ...) 를 호출해
          엔진 내부의 모델/옵티마이저/스케줄러 상태를 복원한다.
          - load_optimizer_states / load_lr_scheduler_states 가 False 이면
            모델(및 EMA)만 읽고 optimizer/scheduler 상태는 그대로 둔다.
@@ -2771,7 +2771,7 @@ def _resume_from_deepspeed_checkpoint_format(
             deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
         model_ema (Optional[ModelEma]):
             EMA 래퍼 또는 None.
-        ckpt_dir (str):
+        save_path (str):
             DeepSpeed checkpoint 가 들어 있는 디렉터리 경로.
         global_rank (int):
             전체 프로세스 기준 rank. 0 일 때만 주요 로그를 출력한다.
@@ -2790,7 +2790,7 @@ def _resume_from_deepspeed_checkpoint_format(
     """
     try:
         load_path, client_state = diffusion_planner.load_checkpoint(
-            ckpt_dir,
+            save_path,
             tag="latest",
             load_optimizer_states=load_optimizer_states,
             load_lr_scheduler_states=load_lr_scheduler_states,
@@ -2798,7 +2798,7 @@ def _resume_from_deepspeed_checkpoint_format(
     except TypeError:
         # 오래된 DeepSpeed 버전(해당 인자 미지원) 대비 fallback
         load_path, client_state = diffusion_planner.load_checkpoint(
-            ckpt_dir,
+            save_path,
             tag="latest",
         )
 
@@ -2827,6 +2827,7 @@ def _resume_from_deepspeed_checkpoint_format(
     # === [NEW] model-only 모드에서는 base model도 EMA weight로 초기화 ===
     # load_optimizer_states=False & load_lr_scheduler_states=False 라면
     # resume_model_only=True에서 호출된 경우로 볼 수 있다.
+    # TODO: ema 를 model weight로 불러오고 싶은 경우가 언제인지 명확히 규정필요
     prefer_ema_for_model_only = (not load_optimizer_states) and (
         not load_lr_scheduler_states)
     if prefer_ema_for_model_only and (ema_state_dict is not None):
@@ -2857,7 +2858,7 @@ def _resume_from_deepspeed_checkpoint_format(
 
 
 def _resume_deepspeed_from_pytorch_checkpoint(
-    ckpt_dir: str,
+    save_path: str,
     diffusion_planner: nn.Module,
     model_ema: Optional[ModelEma],
     args: argparse.Namespace,
@@ -2876,7 +2877,7 @@ def _resume_deepspeed_from_pytorch_checkpoint(
       3) diffusion_planner.optimizer.param_groups 에 "lr_max"/"wd_max" 필드를 채워준다.
 
     Args:
-        ckpt_dir (str):
+        save_path (str):
             - latest.pth 가 들어 있는 PyTorch 체크포인트 디렉터리.
         diffusion_planner (nn.Module):
             - deepspeed.DeepSpeedEngine 인스턴스.
@@ -2894,7 +2895,7 @@ def _resume_deepspeed_from_pytorch_checkpoint(
             - model_ema: EMA 상태가 복원된 ModelEma (또는 원래 None).
     """
     init_epoch, wandb_id = _load_pytorch_checkpoint_into_deepspeed(
-        ckpt_dir=ckpt_dir,
+        save_path=save_path,
         diffusion_planner=diffusion_planner,
         model_ema=model_ema,
         device=args.device,
@@ -2908,7 +2909,7 @@ def _resume_deepspeed_from_pytorch_checkpoint(
 
 
 def _resume_from_pytorch_checkpoint(
-    ckpt_dir: str,
+    save_path: str,
     diffusion_planner: nn.Module,
     optimizer: optim.Optimizer,
     scheduler: Any,
@@ -2920,7 +2921,7 @@ def _resume_from_pytorch_checkpoint(
 
     처리 흐름:
       1) diffusion_planner, optimizer, scheduler, init_epoch, wandb_id, model_ema =
-         resume_model(ckpt_dir, ...) 를 호출해
+         resume_model(save_path, ...) 를 호출해
          - 모델 파라미터
          - 옵티마이저 상태
          - 스케줄러 상태
@@ -2932,7 +2933,7 @@ def _resume_from_pytorch_checkpoint(
          를 채워 이후 WD warmdown 에서 사용할 수 있게 한다.
 
     Args:
-        ckpt_dir (str):
+        save_path (str):
             - latest.pth 가 들어 있는 PyTorch 체크포인트 디렉터리.
         diffusion_planner (nn.Module):
             - nn.Module 또는 DDP 래핑된 모델.
@@ -2956,7 +2957,7 @@ def _resume_from_pytorch_checkpoint(
     """
     (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
      model_ema) = resume_model(
-         ckpt_dir,
+         save_path,
          diffusion_planner,
          optimizer,
          scheduler,
@@ -3218,7 +3219,7 @@ def _load_state_dict_into_base_and_ema_model_only(
 
 
 def _load_model_and_ema_state_only_from_pytorch_checkpoint(
-    ckpt_dir: str,
+    save_path: str,
     diffusion_planner: nn.Module,
     model_ema: Optional[ModelEma],
     device: str,
@@ -3227,7 +3228,7 @@ def _load_model_and_ema_state_only_from_pytorch_checkpoint(
     """PyTorch latest.pth 에서 모델/EMA 파라미터만 불러와 새 학습을 시작할 때 사용한다.
 
     전체 흐름:
-      1) ckpt_dir 안에서 latest.pth 또는 best.pth 경로를 고른다.
+      1) save_path 안에서 latest.pth 또는 best.pth 경로를 고른다.
       2) 선택한 파일을 torch.load 로 읽어 체크포인트 dict 를 얻는다.
       3) EMA state_dict 가 있으면 EMA를, 없으면 model state_dict 를 선택한다.
       4) base_model(state_dict) 의 키 형태와 맞도록 module. prefix 를 조정한다.
@@ -3235,7 +3236,7 @@ def _load_model_and_ema_state_only_from_pytorch_checkpoint(
          model_ema 가 있으면 base_model.state_dict() 로 EMA도 초기화한다.
 
     Args:
-        ckpt_dir (str):
+        save_path (str):
             latest.pth / best.pth 가 들어 있는 디렉터리 경로.
         diffusion_planner (nn.Module):
             현재 학습에 사용할 모델 또는 DDP 래퍼.
@@ -3250,7 +3251,7 @@ def _load_model_and_ema_state_only_from_pytorch_checkpoint(
         Optional[ModelEma]:
             EMA 상태가 덮어써진 model_ema (또는 원래 None).
     """
-    ckpt_path: str = _select_pytorch_checkpoint_path_for_model_only(ckpt_dir)
+    ckpt_path: str = _select_pytorch_checkpoint_path_for_model_only(save_path)
     ckpt: Dict[str, Any] = _load_pytorch_checkpoint_dict_for_model_only(
         ckpt_path=ckpt_path,
         device=device,
@@ -3281,19 +3282,18 @@ def _resume_from_checkpoint_with_deepspeed(
     args: argparse.Namespace,
     diffusion_planner: nn.Module,
     model_ema: Optional[ModelEma],
-    ckpt_dir: str,
     global_rank: int,
     resume_model_only: bool,
 ) -> Tuple[nn.Module, Optional[ModelEma], int, Optional[str]]:
-    """DeepSpeed 모드에서 ckpt_dir 기준으로 모델/EMA를 불러온다.
+    """DeepSpeed 모드에서 args.save_path 기준으로 모델/EMA를 불러온다.
 
     처리 규칙:
-      - ckpt_dir 이 DeepSpeed 전용 디렉터리 구조이면
+      - args.save_path 이 DeepSpeed 전용 디렉터리 구조이면
         _resume_from_deepspeed_checkpoint_format(...) 을 사용한다.
         · resume_model_only=False → optimizer/scheduler 상태까지 함께 복원.
         · resume_model_only=True  → optimizer/scheduler 는 건드리지 않고,
           모델/EMA만 로드한다.
-      - ckpt_dir 이 PyTorch latest.pth 형식이면
+      - args.save_path 이 PyTorch latest.pth 형식이면
         _resume_deepspeed_from_pytorch_checkpoint(...) 를 사용해
         모델/EMA를 불러온다. (optimizer/scheduler는 그대로)
 
@@ -3309,8 +3309,6 @@ def _resume_from_checkpoint_with_deepspeed(
             deepspeed.DeepSpeedEngine 또는 DDP 래퍼가 씌워진 모델.
         model_ema (Optional[ModelEma]):
             EMA 래퍼 또는 None.
-        ckpt_dir (str):
-            체크포인트 디렉터리 경로.
         global_rank (int):
             전체 프로세스 기준 rank. 0 일 때만 상세 로그를 출력한다.
         resume_model_only (bool):
@@ -3323,12 +3321,12 @@ def _resume_from_checkpoint_with_deepspeed(
             - init_epoch: 재개 시작 epoch 인덱스. resume_model_only=True 이면 0.
             - wandb_id: 이어서 사용할 W&B run id 또는 None.
     """
-    if _is_deepspeed_checkpoint_dir(ckpt_dir):
+    if _is_deepspeed_checkpoint_dir(args.save_path):
         init_epoch_loaded, wandb_id_loaded, model_ema = \
             _resume_from_deepspeed_checkpoint_format(
                 diffusion_planner=diffusion_planner,
                 model_ema=model_ema,
-                ckpt_dir=ckpt_dir,
+                save_path=args.save_path,
                 global_rank=global_rank,
                 load_optimizer_states=not resume_model_only,
                 load_lr_scheduler_states=not resume_model_only,
@@ -3337,7 +3335,7 @@ def _resume_from_checkpoint_with_deepspeed(
         # PyTorch latest.pth → DeepSpeed 엔진으로 로드 (모델/EMA만)
         init_epoch_loaded, wandb_id_loaded, model_ema = \
             _resume_deepspeed_from_pytorch_checkpoint(
-                ckpt_dir=ckpt_dir,
+                save_path=args.save_path,
                 diffusion_planner=diffusion_planner,
                 model_ema=model_ema,
                 args=args,
@@ -3360,12 +3358,12 @@ def _resume_from_checkpoint_with_pytorch(
     optimizer: optim.Optimizer,
     scheduler: Any,
     model_ema: Optional[ModelEma],
-    ckpt_dir: str,
+    save_path: str,
     global_rank: int,
     resume_model_only: bool,
 ) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
            Optional[str]]:
-    """일반 PyTorch/DDP 모드에서 ckpt_dir 기준으로 모델/옵티마를 불러온다.
+    """일반 PyTorch/DDP 모드에서 save_path 기준으로 모델/옵티마를 불러온다.
 
     처리 규칙:
       - resume_model_only=True:
@@ -3388,7 +3386,7 @@ def _resume_from_checkpoint_with_pytorch(
             학습률 스케줄러 객체.
         model_ema (Optional[ModelEma]):
             EMA 래퍼 또는 None.
-        ckpt_dir (str):
+        save_path (str):
             PyTorch latest.pth / best.pth 가 들어 있는 디렉터리 경로.
         global_rank (int):
             전체 프로세스 기준 rank. 0 일 때만 상세 로그 출력.
@@ -3407,7 +3405,7 @@ def _resume_from_checkpoint_with_pytorch(
     if resume_model_only:
         # 모델(또는 EMA) weight만 불러오고 optimizer/scheduler 는 그대로 유지
         model_ema = _load_model_and_ema_state_only_from_pytorch_checkpoint(
-            ckpt_dir=ckpt_dir,
+            save_path=save_path,
             diffusion_planner=diffusion_planner,
             model_ema=model_ema,
             device=args.device,
@@ -3420,7 +3418,7 @@ def _resume_from_checkpoint_with_pytorch(
     # 전체 상태 복원 (기존 PyTorch 경로)
     (diffusion_planner, optimizer, scheduler, model_ema, init_epoch,
      wandb_id) = _resume_from_pytorch_checkpoint(
-         ckpt_dir=ckpt_dir,
+         save_path=save_path,
          diffusion_planner=diffusion_planner,
          optimizer=optimizer,
          scheduler=scheduler,
@@ -3558,9 +3556,8 @@ def _maybe_resume_from_checkpoint(
     """
     resume_model_only: bool = bool(getattr(args, "resume_model_only", False))
 
-    if args.resume_local_path_model_path is not None:
-        ckpt_dir: str = args.resume_local_path_model_path
-        print(f"Model loaded from {ckpt_dir}")
+    if args.resume_wandb_model_name is not None:
+        print(f"Model loaded from {args.save_path}")
 
         # -------- DeepSpeed 경로 --------
         if use_deepspeed and hasattr(diffusion_planner, "load_checkpoint"):
@@ -3569,7 +3566,6 @@ def _maybe_resume_from_checkpoint(
                     args=args,
                     diffusion_planner=diffusion_planner,
                     model_ema=model_ema,
-                    ckpt_dir=ckpt_dir,
                     global_rank=global_rank,
                     resume_model_only=resume_model_only,
                 )
@@ -3583,7 +3579,7 @@ def _maybe_resume_from_checkpoint(
                  optimizer=optimizer,
                  scheduler=scheduler,
                  model_ema=model_ema,
-                 ckpt_dir=ckpt_dir,
+                 save_path=args.save_path,
                  global_rank=global_rank,
                  resume_model_only=resume_model_only,
              )
@@ -4667,6 +4663,12 @@ def _download_wandb_checkpoint_to_local(
     checkpoint_filename: str,
 ) -> None:
     """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다."""
+    # rank 0만 별도 run을 만들어서 use_artifact 호출
+    rank_str = os.environ.get("RANK", "0")
+    try:
+        rank = int(rank_str)
+    except ValueError:
+        rank = 0
     """
     resume_alias : str
         - 실제로 사용할 별칭. 예: 'latest', 'best'.
@@ -4699,13 +4701,6 @@ def _download_wandb_checkpoint_to_local(
         )
         args.save_path = past_save_path
     os.makedirs(past_save_path, exist_ok=True)
-
-    # rank 0만 별도 run을 만들어서 use_artifact 호출
-    rank_str = os.environ.get("RANK", "0")
-    try:
-        rank = int(rank_str)
-    except ValueError:
-        rank = 0
 
     # target_local_ckpt_path: ./training_log/.../2025-12-06-06:56:58/latest.pth
     target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
@@ -4797,22 +4792,55 @@ def _download_wandb_checkpoint_to_local(
         print(f"rank {rank}에서 이미 다운로드된 체크포인트를 확인했습니다: {target_local_ckpt_path}")
 
 
-def _get_save_path(
-    args: argparse.Namespace,
-    global_rank: int,
-) -> None:
-    experiment_is_same = args.name == args.past_name
-    save_path = None
+def _get_save_path(args: argparse.Namespace, global_rank: int) -> None:
+    """실험 이름과 past_name을 기준으로 save_path를 만들고, 모든 rank에 공유한다.
+
+    동작 요약:
+      * (stage1 처럼) 새로운 실험(name != past_name)인 경우
+        - rank 0에서만 새로운 디렉터리를 만들고
+          예: {args.save_dir}/training_log/{args.name}/{YYYY-MM-DD-HH:MM:SS}/
+        - 그 경로를 torch.distributed.broadcast_object_list 로 모든 rank에 전파한다.
+      * (같은 실험을 이어서 학습하는) name == past_name 인 경우
+        - 여기서는 save_path를 정하지 않고(None 유지)
+        - 이후 W&B 아티팩트에서 가져온 past_save_path를 args.save_path에 채운다.
+      * 분산이 초기화되어 있지 않은(single GPU / single process) 경우
+        - rank 0 로직만 실행되고, broadcast는 생략된다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 및 실험 설정이 들어 있는 argparse 인자 모음.
+            - name (str): 현재 stage에서 사용할 실험 이름.
+            - past_name (str): 이전 stage 실험 이름. 다른 stage의 weight를 재사용할 때 사용.
+            - save_dir (str): training_log 루트 디렉터리 상위 경로.
+            - save_path (Optional[str]): 이 함수 안에서 최종 로그/체크포인트 경로로 설정된다.
+        global_rank (int):
+            DDP에서 현재 프로세스의 global rank.
+            - 0: 메인 프로세스. 디렉터리 생성 및 초기 save_path 결정 담당.
+            - >0: rank 0이 만든 save_path를 broadcast로 전달받기만 한다.
+
+    Returns:
+        None:
+            args.save_path를 in-place로 수정하고, 모든 rank에서 동일한 값을 갖도록 만든다.
+    """
+    past_name: str = getattr(args, "past_name", "")
+    experiment_is_same: bool = bool(past_name) and (args.name == past_name)
+
+    save_path: Optional[str] = None
     if global_rank == 0:
         if experiment_is_same:
-            assert args.resume_wandb_model_name is not None, (
-                "args.resume_wandb_model_name must be set when resuming the same experiment."
-            )
+            # 동일 실험 계속 학습: save_path는 나중에 W&B에서 past_save_path로 채움
+            save_path = None
         else:
-            time_ = datetime.now()
-            time_ = time_.strftime("%Y-%m-%d-%H:%M:%S")
-            save_path = f"{args.save_dir}/training_log/{args.name}/{time_}/"
+            time_str = datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
+            save_path = f"{args.save_dir}/training_log/{args.name}/{time_str}/"
             os.makedirs(save_path, exist_ok=True)
+
+    # DDP / 멀티 GPU에서 rank0가 만든 save_path를 모든 rank에 공유
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        obj_list = [save_path]
+        torch.distributed.broadcast_object_list(obj_list, src=0)
+        save_path = obj_list[0]
+
     args.save_path = save_path
 
 
@@ -4827,14 +4855,14 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
          - _determine_wandb_artifact_config() 으로 컬렉션/파일 이름을 정하고
          - _get_wandb_entity_and_project_for_resume() 로 entity, project 를 얻고
          - _download_wandb_checkpoint_to_local() 로 체크포인트를 내려받는다.
-      4) 내려받은 디렉터리 경로를 args.resume_local_path_model_path 에 저장해
+      4) 내려받은 디렉터리 경로를 args.save_path 에 저장해
          이후 model_training() 의 resume 로직이 그대로 동작하도록 만든다.
 
     Returns:
         args: argparse.Namespace
             - 체크포인트를 쓰지 않을 때는 원본 get_args() 결과와 동일.
             - W&B에서 내려받기를 한 경우에는
-              args.resume_local_path_model_path 가 실제 디렉터리 경로로 채워진 상태.
+              args.save_path 가 실제 디렉터리 경로로 채워진 상태.
     """
 
     if not args.resume_wandb_model_name:
@@ -4897,7 +4925,7 @@ def main() -> None:
 
     처리 순서:
       1) 명령행 인자를 읽고(args_util.get_args), 필요 시 W&B 아티팩트에서
-         체크포인트 파일(latest.pth 등)을 내려받아 args.resume_local_path_model_path 를 채운다.
+         체크포인트 파일(latest.pth 등)을 내려받아 args.save_path 를 채운다.
       2) 환경변수 WORLD_SIZE 를 기준으로 args.distributed 를 설정해,
          이후 ddp 설정이 올바르게 동작하도록 만든다.
       3) model_training(args) 를 호출해 전체 학습 파이프라인을 수행하고,

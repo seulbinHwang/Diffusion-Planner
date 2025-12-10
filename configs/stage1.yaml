@@ -1,5 +1,5 @@
 # configs/stage1.yaml
-name: stage_test
+name: stage1
 
 batch_size: 2048
 train_epochs: 1 #234           # 전체 360 중 약 65%
