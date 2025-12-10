@@ -1939,6 +1939,8 @@ def _scale_learning_rate_and_epochs(
         BASE_GLOBAL_BATCH: 기준이 되는 글로벌 배치 크기(예: 2048).
         current_global_batch: 현재 설정에서 실제로 사용되는 글로벌 배치 크기.
     """
+    ################ effective warm up epoch ################
+    warm_up_epoch: int = min(int(args.warm_up_epoch), args.train_epochs)
     BASE_GLOBAL_BATCH = 2048  # 기준 글로벌 배치
     base_lr: float = float(args.learning_rate)
     base_min_lr = getattr(args, "min_learning_rate", None)
@@ -1966,7 +1968,10 @@ def _scale_learning_rate_and_epochs(
         clamp_min=1,
         clamp_max=None,
     )
+    scale_epoch_factor = scaled_epochs / float(args.train_epochs)
     args.train_epochs = int(scaled_epochs)
+    args.warm_up_epoch = int(warm_up_epoch * scale_epoch_factor)
+
 
     return BASE_GLOBAL_BATCH, current_global_batch
 
@@ -2104,7 +2109,6 @@ def _compute_warmup_steps(
     """
     # 바뀜
     use_warmup: bool = bool(getattr(args, "use_lr_warmup", True))
-    warm_up_epoch: int = int(getattr(args, "warm_up_epoch", 0))
 
     if (not use_warmup) or warm_up_epoch <= 0:
         return 0, 0
@@ -4596,8 +4600,6 @@ def model_training(
         args,
         world_size,
     )
-    train_epochs: int = args.train_epochs
-
     # 4) seed 고정
     set_seed(args.seed + global_rank)
 
