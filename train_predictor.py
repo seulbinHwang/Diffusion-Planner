@@ -4055,6 +4055,7 @@ def _log_and_save_on_rank0(
               · 그렇지 않으면 입력과 동일한 값.
     """
     if global_rank != 0:
+        print(f"[Rank {global_rank}] Skipping logging and saving.\n")
         return best_loss
 
     # 1) 메트릭 로그
@@ -4089,7 +4090,6 @@ def _log_and_save_on_rank0(
             save_best=save_best,
         )
         print(f"[DeepSpeed] Checkpoint saved in {args.save_path}\n")
-        raise NotImplementedError("W&B Deepspeed checkpoint saving not implemented yet.")
     else:
         save_model(
             diffusion_planner,
