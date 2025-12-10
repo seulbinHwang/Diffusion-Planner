@@ -1,7 +1,7 @@
 # configs/stage1.yaml
 name: stage1_test
 
-batch_size: 4
+batch_size: 8
 train_epochs: 1 #234           # 전체 360 중 약 65%
 
 learning_rate: 5.0e-4
