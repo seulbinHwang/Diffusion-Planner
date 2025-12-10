@@ -2094,34 +2094,26 @@ def _compute_warmup_steps(
 ) -> Tuple[int, int]:
     """워밍업(epoch 수와 배치 크기)에 맞춰 워밍업 step 수를 계산한다.
 
-    use_lr_warmup 이 False 이거나 warm_up_epoch <= 0 이면
-    워밍업 없이 바로 본 학습률을 사용한다.
-
-    Args:
-        args: 학습 설정 Namespace.
-        BASE_GLOBAL_BATCH: 기준 글로벌 배치 크기.
-        current_global_batch: 현재 글로벌 배치 크기.
-        total_data_num: 전체 학습 샘플 수.
-
-    Returns:
-        warmup_steps_at_B0: 기준 배치 크기에서의 워밍업 step 수.
-        warmup_steps: 현재 배치 크기에서의 워밍업 step 수.
+    여기서는 이미 `_scale_learning_rate_and_epochs`에서
+    args.warm_up_epoch 가 현재 설정에 맞게 스케일된 상태라고 가정한다.
+    따라서, warm_up_epoch "만큼의 epoch" 동안 워밍업이 유지되도록
+    step 수를 직접 계산한다.
     """
-    # 바뀜
     use_warmup: bool = bool(getattr(args, "use_lr_warmup", True))
     warm_up_epoch: int = int(getattr(args, "warm_up_epoch", 0))
 
     if (not use_warmup) or warm_up_epoch <= 0:
         return 0, 0
 
-    # 기준 배치 B_0에서의 epoch당 step 수
+    # 기준 배치 B0에서의 epoch당 step 수 (로그용)
     steps_per_epoch_at_B0 = math.ceil(total_data_num / float(BASE_GLOBAL_BATCH))
     warmup_steps_at_B0 = steps_per_epoch_at_B0 * warm_up_epoch
 
-    batch_ratio = current_global_batch / float(BASE_GLOBAL_BATCH)
-    WARMUP_SCALE_EXP = 0.5
-    warmup_steps = math.ceil(warmup_steps_at_B0 *
-                             (batch_ratio**WARMUP_SCALE_EXP))
+    # 현재 글로벌 배치에서의 epoch당 step 수
+    steps_per_epoch_current = math.ceil(total_data_num / float(current_global_batch))
+
+    # warm_up_epoch 만큼의 epoch 동안 워밍업이 지속되도록 step 수를 정의
+    warmup_steps = steps_per_epoch_current * warm_up_epoch
 
     return warmup_steps_at_B0, warmup_steps
 
