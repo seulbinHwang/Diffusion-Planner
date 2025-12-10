@@ -62,6 +62,9 @@ class DiffusionPlannerData(Dataset):
         - "planner_future_11_dim"    : (future_len, 11)
         - "agent_route_lane_order"   : (chosen_agent_num, chosen_lane_num)
 
+
+
+
         # 참고
             - chosen_agent_num <= caching_max_agent_num
             - chosen_lane_num <= lane_num
