@@ -2534,7 +2534,8 @@ def _write_deepspeed_meta_checkpoint_files(
     engine.save_checkpoint(..., tag="latest"/"best") 에 의해 따로 저장된다.
     """
     if save_path is None:
-        return
+        raise ValueError(f"_write_deepspeed_meta_checkpoint_files 에는 "
+                         f"유효한 save_path 가 필요합니다.")
 
     meta_dict: Dict[str, Any] = {
         "epoch": int(epoch + 1),
@@ -2620,10 +2621,10 @@ def _save_deepspeed_checkpoint_for_epoch(
             - 이 함수는 파일 시스템에만 영향을 주고, 값을 반환하지 않는다.
     """
     if (not use_deepspeed) or save_path is None:
-        return
+        raise ValueError(f"_save_deepspeed_checkpoint_for_epoch 는 "
+                         f"use_deepspeed=True 및 유효한 save_path 가 필요합니다.")
     if not hasattr(diffusion_planner, "save_checkpoint"):
-        # DeepSpeedEngine 이 아니면 그냥 패스
-        return
+        raise ValueError(f"diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
 
     # EMA 상태 dict 준비 (없으면 None)
     ema_state_dict: Optional[Dict[str, Any]] = None
@@ -2643,17 +2644,24 @@ def _save_deepspeed_checkpoint_for_epoch(
     }
 
     # ✅ 실제 파라미터/옵티마/스케줄러 상태 저장 (latest 태그)
+    """
+    모델 파라미터/옵티마 상태/스케줄러 상태
+    추가 정보(client_state: 에폭, loss, wandb id 등)
+    
+    """
+    # ERROR
+    tag_latest = f"latest_epoch-{epoch + 1:06d}"
     diffusion_planner.save_checkpoint(
         save_dir=save_path,
-        tag="latest",
+        tag=tag_latest,
         client_state=client_state,
     )
-
+    tag_best = f"best_epoch-{epoch + 1:06d}"
     # ✅ best 인 경우 best 태그도 별도로 저장해 둔다.
     if save_best:
         diffusion_planner.save_checkpoint(
             save_dir=save_path,
-            tag="best",
+            tag=tag_best,
             client_state=client_state,
         )
 
@@ -4081,6 +4089,7 @@ def _log_and_save_on_rank0(
             save_best=save_best,
         )
         print(f"[DeepSpeed] Checkpoint saved in {args.save_path}\n")
+        raise NotImplementedError("W&B Deepspeed checkpoint saving not implemented yet.")
     else:
         save_model(
             diffusion_planner,
