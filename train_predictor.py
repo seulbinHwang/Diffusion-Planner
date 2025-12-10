@@ -2620,12 +2620,13 @@ def _save_deepspeed_checkpoint_for_epoch(
         None:
             - 이 함수는 파일 시스템에만 영향을 주고, 값을 반환하지 않는다.
     """
+    print("a")
     if (not use_deepspeed) or save_path is None:
         raise ValueError(f"_save_deepspeed_checkpoint_for_epoch 는 "
                          f"use_deepspeed=True 및 유효한 save_path 가 필요합니다.")
     if not hasattr(diffusion_planner, "save_checkpoint"):
         raise ValueError(f"diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
-
+    print("b")
     # EMA 상태 dict 준비 (없으면 None)
     ema_state_dict: Optional[Dict[str, Any]] = None
     if model_ema is not None:
@@ -2635,7 +2636,7 @@ def _save_deepspeed_checkpoint_for_epoch(
         except Exception:
             # 혹시 .ema 가 없는 커스텀 EMA 일 경우를 위한 fallback
             ema_state_dict = model_ema.state_dict()
-
+    print("c")
     client_state: Dict[str, Any] = {
         "epoch": int(epoch + 1),
         "loss": float(train_total_loss),
@@ -2656,6 +2657,7 @@ def _save_deepspeed_checkpoint_for_epoch(
         tag=tag_latest,
         client_state=client_state,
     )
+    print("d")
     tag_best = f"best_epoch-{epoch + 1:06d}"
     # ✅ best 인 경우 best 태그도 별도로 저장해 둔다.
     if save_best:
@@ -4069,6 +4071,7 @@ def _log_and_save_on_rank0(
 
     # 첫 epoch(=epoch 0)은 무조건 저장, 그 이후에는 save_utd 주기로 저장
     if (not is_first_epoch) and ((epoch + 1) % save_interval != 0):
+        print("Skipping checkpoint save for this epoch.\n")
         return best_loss
 
     # 3) best 갱신 여부
