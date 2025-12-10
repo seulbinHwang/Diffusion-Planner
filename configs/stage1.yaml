@@ -8,7 +8,7 @@ learning_rate: 5.0e-4
 min_learning_rate: 1.6667e-4  # Stage1 max lr의 1/3 정도
 
 # Stage1: 작은 장면 + 중심 NPC 기준 100m
-center_crop_radius_m: 100.0
+center_crop_radius_m: 150.0
 center_crop_mode: npc       # 랜덤 NPC 하나 기준
 
 # Group 설정: 전부 같이 학습
