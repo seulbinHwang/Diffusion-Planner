@@ -1,6 +1,5 @@
 # configs/stage2.yaml
 name: stage_test
-stage_name: stage2_full_context_freeze_encoder_local
 
 batch_size: 1024
 train_epochs: 1 #90 #324               # 234(Stage1) + 90(Stage2)
@@ -9,9 +8,10 @@ train_epochs: 1 #90 #324               # 234(Stage1) + 90(Stage2)
 learning_rate: 1.6667e-4        # ≈ 5e-4 / 3
 min_learning_rate: 1.25e-4      # ≈ 5e-4 / 4
 
-# Stage2: ego 기준 150m full context
-center_crop_radius_m: 150.0
-center_crop_mode: ego
+# Stage2
+center_crop_radius_m: -1.
+center_crop_mode: none
+do_not_clip: true
 
 # Group 설정:
 #  - encoder_local(Group A): freeze
@@ -27,6 +27,6 @@ warm_up_epoch: 5
 p_sat: 0.3
 
 resume_local_path_model_path: null
-# Stage2는 shell에서 --resume_model_from_wandb latest 로 지정해서 시작
-resume_model_from_wandb: latest
+# Stage2는 shell에서 --resume_wandb_model_name latest 로 지정해서 시작
+resume_wandb_model_name: latest
 resume_model_only: true

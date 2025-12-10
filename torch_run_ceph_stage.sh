@@ -79,7 +79,7 @@ STAGE3_CFG="configs/stage3.yaml"
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "stage_123" \
-  --resume_model_from_wandb latest \
+  --resume_wandb_model_name latest \
   --stage_config_path "${STAGE2_CFG}" \
   --use_deepspeed true \
   --use_8bit_optimizer true \
@@ -97,7 +97,7 @@ STAGE3_CFG="configs/stage3.yaml"
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "stage_123" \
-  --resume_model_from_wandb latest \
+  --resume_wandb_model_name latest \
   --stage_config_path "${STAGE3_CFG}" \
   --use_deepspeed true \
   --use_8bit_optimizer true \

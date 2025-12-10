@@ -1,6 +1,5 @@
 # configs/stage3.yaml
 name: stage_test
-stage_name: stage3_full_unfreeze_finetune
 
 batch_size: 256
 train_epochs: 1 #36 #360              # 234 + 90 + 36
@@ -10,8 +9,9 @@ learning_rate: 1.25e-4         # ≈ 5e-4 / 4
 min_learning_rate: 1.0e-4      # ≈ 5e-4 / 5
 
 # Stage3도 ego 기준 150m full context 유지
-center_crop_radius_m: 150.0
-center_crop_mode: ego
+center_crop_radius_m: -1.
+center_crop_mode: none
+do_not_clip: true
 
 # Group 설정:
 #  - 모든 모듈 unfreeze
@@ -27,6 +27,6 @@ warm_up_epoch: 3
 p_sat: 0.1
 
 resume_local_path_model_path: null
-# Stage3도 shell에서 --resume_model_from_wandb latest 로 시작
-resume_model_from_wandb: latest
+# Stage3도 shell에서 --resume_wandb_model_name latest 로 시작
+resume_wandb_model_name: latest
 resume_model_only: true

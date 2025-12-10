@@ -1,6 +1,5 @@
 # configs/stage1.yaml
 name: stage_test
-stage_name: stage1_small_scene_npc_center
 
 batch_size: 2048
 train_epochs: 1 #234           # 전체 360 중 약 65%
@@ -25,4 +24,4 @@ warm_up_epoch: 10
 
 # 명시적으로 없음(기본값 사용)
 resume_local_path_model_path: null
-resume_model_from_wandb: null
+resume_wandb_model_name: null

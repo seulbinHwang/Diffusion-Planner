@@ -85,12 +85,16 @@ def get_args():
                         type=str,
                         help='save dir for model ckpt',
                         default=".")
+    parser.add_argument('--past_name',
+                        type=str,
+                        help='prev name for model ckpt',
+                        default=None)
     parser.add_argument('--resume_local_path_model_path',
                         type=str,
                         help='path to resume model',
                         default=None)
     parser.add_argument(
-        '--resume_model_from_wandb',
+        '--resume_wandb_model_name',
         type=str,
         help='wandb artifact version to resume from (e.g., "latest")',
         default=None)

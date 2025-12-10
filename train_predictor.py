@@ -11,7 +11,7 @@ import numpy as np
 # deprecated 키는 사용 금지
 os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
 from collections import defaultdict
-
+from datetime import datetime
 from typing import Optional, Dict, Any
 import io
 
@@ -1837,7 +1837,7 @@ def _scale_learning_rate_and_epochs(
     return BASE_GLOBAL_BATCH, current_global_batch
 
 
-def _prepare_save_path_and_dump_args(
+def _dump_args(
     args: argparse.Namespace,
     global_rank: int,
 ) -> Optional[str]:
@@ -1851,24 +1851,6 @@ def _prepare_save_path_and_dump_args(
         save_path: rank 0에서 만든 저장 경로. 나머지 rank는 None.
     """
     if global_rank == 0:
-        # TODO: resume_local_path_model_path 이 None이 아니더라도, save_path 를 별도로 저장할 수 있게 구현해야한다?
-        #  그럴려면 save_path가 None도 가능하게끔 코드 수정이 필요
-        if args.resume_local_path_model_path is not None and args.save_dir is None:
-            # resume_local_path_model_path: ./training_log/.../2025-08-06-07:23:04/
-            save_path = args.resume_local_path_model_path
-            # 폴더명 자체가 타임스탬프이므로 그대로 재사용
-            time_str = os.path.basename(
-                os.path.normpath(args.resume_local_path_model_path))
-        else:
-            from datetime import datetime
-            time_ = datetime.now()
-            time_ = time_.strftime("%Y-%m-%d-%H:%M:%S")
-            time_str = datetime.now().strftime("%Y-%m-%d-%H-%M")
-            save_path = f"{args.save_dir}/training_log/{args.name}/{time_}/"
-            os.makedirs(save_path, exist_ok=True)
-
-        args.save_path = save_path
-
         # StateNormalizer / ObservationNormalizer는 dict로 변환해서 저장
         args_dict = vars(args)
         args_dict = {
@@ -1879,16 +1861,10 @@ def _prepare_save_path_and_dump_args(
         from mmengine.fileio import dump
         dump(
             args_dict,
-            os.path.join(save_path, 'args.json'),
+            os.path.join(args.save_path, 'args.json'),
             file_format='json',
             indent=4,
         )
-    else:
-        save_path = None
-        args.save_path = None
-        time_str = None
-
-    return save_path
 
 
 def _build_augmentation(args: argparse.Namespace,) -> Optional[object]:
@@ -3470,7 +3446,7 @@ def _finalize_train_epochs_and_wandb_after_resume(
       - resume_model_only=False:
           · init_epoch 가 이미 지난 epoch 수이므로,
             args.train_epochs <= init_epoch 이면 init_epoch+1 로 늘린다.
-          · args.resume_model_from_wandb 가 설정되어 있으면
+          · args.resume_wandb_model_name 가 설정되어 있으면
             allow_val_change=True 로 W&B config 변경을 허용한다.
 
     Args:
@@ -3506,7 +3482,7 @@ def _finalize_train_epochs_and_wandb_after_resume(
     train_epochs = int(args.train_epochs)
 
     # W&B 아티팩트에서 재개하는 경우 config 값 변경 허용
-    if args.resume_model_from_wandb:
+    if args.resume_wandb_model_name:
         allow_val_change = True
 
     return train_epochs, allow_val_change
@@ -3519,7 +3495,6 @@ def _maybe_resume_from_checkpoint(
     scheduler: Any,
     model_ema: Optional[ModelEma],
     global_rank: int,
-    train_epochs: int,
     use_deepspeed: bool,
 ) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
            Optional[str], int, bool]:
@@ -3558,8 +3533,6 @@ def _maybe_resume_from_checkpoint(
             EMA 래퍼 또는 None.
         global_rank (int):
             전체 프로세스 기준 rank. 0 일 때만 주요 로그를 출력한다.
-        train_epochs (int):
-            현재까지 설정된 전체 학습 epoch 수. shape: ().
         use_deepspeed (bool):
             DeepSpeed 모드 사용 여부.
 
@@ -3644,7 +3617,6 @@ def _maybe_resume_from_checkpoint(
 
 def _setup_logger_and_purge(
     args: argparse.Namespace,
-    save_path: Optional[str],
     global_rank: int,
     wandb_id: Optional[str],
     allow_val_change: bool,
@@ -3653,7 +3625,6 @@ def _setup_logger_and_purge(
 
     Args:
         args: 학습 설정이 들어 있는 argparse.Namespace.
-        save_path: 체크포인트 저장 경로.
         global_rank: 전체 프로세스 기준 번호.
         wandb_id: 재개 시 사용할 wandb run id.
         allow_val_change: wandb config 값 변경 허용 여부.
@@ -3666,7 +3637,7 @@ def _setup_logger_and_purge(
         args.notes,
         args,
         wandb_resume_id=wandb_id,
-        save_path=save_path,
+        save_path=args.save_path,
         rank=global_rank,
         allow_val_change=allow_val_change,
     )
@@ -3766,7 +3737,6 @@ def _train_one_epoch(
 
 def _log_wandb_checkpoint_artifacts(
     args: argparse.Namespace,
-    save_path: Optional[str],
     epoch: int,
     train_total_loss: float,
     save_best: bool,
@@ -3782,7 +3752,6 @@ def _log_wandb_checkpoint_artifacts(
 
     Args:
         args: 학습 설정이 담긴 Namespace.
-        save_path: 체크포인트가 저장된 로컬 폴더 경로. None이면 아무 것도 하지 않는다.
         epoch: 현재 epoch 인덱스(0부터 시작). 기록용으로만 사용한다.
         train_total_loss: 이번 epoch의 전체 손실 값.
         save_best: best.pth를 새로 갱신했는지 여부.
@@ -3791,7 +3760,7 @@ def _log_wandb_checkpoint_artifacts(
     Returns:
         None: 파일 업로드만 수행한다.
     """
-    if save_path is None:
+    if args.save_path is None:
         return
     if not getattr(args, "use_wandb", False):
         return
@@ -3800,7 +3769,7 @@ def _log_wandb_checkpoint_artifacts(
         return
 
     # 디렉터리 이름에서 대략적인 시간 문자열을 뽑아서 메타데이터에 남긴다.
-    base_dir_name = os.path.basename(os.path.normpath(save_path))
+    base_dir_name = os.path.basename(os.path.normpath(args.save_path))
     time_str_meta = base_dir_name.replace(":", "-")
 
     # ── latest-model 아티팩트 (매번 덮어쓰기) ──
@@ -3815,13 +3784,13 @@ def _log_wandb_checkpoint_artifacts(
         },
     )
 
-    latest_pth = os.path.join(save_path, "latest.pth")
+    latest_pth = os.path.join(args.save_path, "latest.pth")
     if os.path.exists(latest_pth):
         latest_art.add_file(latest_pth)
 
     # DeepSpeed라면 latest 태그 디렉터리도 같이 넣어준다.
     if use_deepspeed:
-        latest_tag_dir = os.path.join(save_path, "latest")
+        latest_tag_dir = os.path.join(args.save_path, "latest")
         if os.path.isdir(latest_tag_dir):
             # 아티팩트 안에서도 "latest/" 이름 그대로 보이도록 고정
             latest_art.add_dir(latest_tag_dir, name="latest")
@@ -3851,12 +3820,12 @@ def _log_wandb_checkpoint_artifacts(
         },
     )
 
-    best_pth = os.path.join(save_path, "best.pth")
+    best_pth = os.path.join(args.save_path, "best.pth")
     if os.path.exists(best_pth):
         best_art.add_file(best_pth)
 
     if use_deepspeed:
-        best_tag_dir = os.path.join(save_path, "best")
+        best_tag_dir = os.path.join(args.save_path, "best")
         if os.path.isdir(best_tag_dir):
             best_art.add_dir(best_tag_dir, name="best")
 
@@ -3880,7 +3849,6 @@ def _log_and_save_on_rank0(
     optimizer: optim.Optimizer,
     scheduler: Any,
     model_ema: Optional[ModelEma],
-    save_path: Optional[str],
     best_loss: float,
     global_rank: int,
 ) -> float:
@@ -3939,8 +3907,6 @@ def _log_and_save_on_rank0(
             - 학습률 스케줄러 객체. state_dict() 호출을 지원한다고 가정.
         model_ema (Optional[ModelEma]):
             - EMA 래퍼. PyTorch 체크포인트 저장 시 ema.ema.state_dict() 도 같이 저장한다.
-        save_path (Optional[str]):
-            - 체크포인트가 저장될 루트 디렉터리. None 이면 저장을 건너뛴다.
         best_loss (float):
             - 지금까지의 최소 train_total_loss 값.  # shape: ()
         global_rank (int):
@@ -3977,7 +3943,7 @@ def _log_and_save_on_rank0(
     if use_deepspeed:
         _save_deepspeed_checkpoint_for_epoch(
             diffusion_planner=diffusion_planner,
-            save_path=save_path,
+            save_path=args.save_path,
             epoch=epoch,
             train_total_loss=train_total_loss,
             wandb_run_id=wandb_logger.id,
@@ -3985,25 +3951,24 @@ def _log_and_save_on_rank0(
             use_deepspeed=use_deepspeed,
             save_best=save_best,
         )
-        print(f"[DeepSpeed] Checkpoint saved in {save_path}\n")
+        print(f"[DeepSpeed] Checkpoint saved in {args.save_path}\n")
     else:
         save_model(
             diffusion_planner,
             optimizer,
             scheduler,
-            save_path,
+            args.save_path,
             epoch,
             train_total_loss,
             wandb_logger.id,
             model_ema.ema if model_ema is not None else None,
             save_best,
         )
-        print(f"Model saved in {save_path}\n")
+        print(f"Model saved in {args.save_path}\n")
 
     # 5) W&B 아티팩트 업로드
     _log_wandb_checkpoint_artifacts(
         args=args,
-        save_path=save_path,
         epoch=epoch,
         train_total_loss=train_total_loss,
         save_best=save_best,
@@ -4242,7 +4207,6 @@ def _run_training_loop(
     train_loader: DataLoader,
     train_sampler: DistributedSampler,
     wandb_logger: Logger,
-    save_path: Optional[str],
     best_loss: float,
     global_rank: int,
     train_epochs: int,
@@ -4296,8 +4260,6 @@ def _run_training_loop(
             - 분산 환경에서 rank별 샘플 인덱스를 관리하는 Sampler.
         wandb_logger (Logger):
             - W&B + TensorBoard 로깅 담당 래퍼.
-        save_path (Optional[str]):
-            - checkpoint 를 저장할 디렉터리 경로. None 이면 저장하지 않음.
         best_loss (float):
             - 지금까지의 최소 train_total_loss 값.  # shape: ()
         global_rank (int):
@@ -4386,7 +4348,6 @@ def _run_training_loop(
             optimizer=optimizer,
             scheduler=scheduler,
             model_ema=model_ema,
-            save_path=save_path,
             best_loss=best_loss,
             global_rank=global_rank,
         )
@@ -4475,7 +4436,13 @@ def _init_or_restore_global_update_step(
             total_step_of_this_epoch)
 
 
-def model_training(args: argparse.Namespace) -> None:
+def model_training(
+    args: argparse.Namespace,
+    global_rank: int,
+    rank: int,
+    world_size: int,
+    use_deepspeed: bool,
+) -> None:
     """전체 학습 파이프라인을 실행하는 상위 함수.
 
     - 분산 설정/학습률 스케일링
@@ -4489,9 +4456,8 @@ def model_training(args: argparse.Namespace) -> None:
     """
     best_loss: float = float('inf')
     torch.cuda.empty_cache()
-
-    # 1) 분산 초기화 및 rank 정보
-    global_rank, rank, world_size, use_deepspeed = _init_distributed(args)
+    # 3) save_path / args.json 준비
+    _dump_args(args, global_rank)
 
     # 2) 글로벌 배치 크기에 따라 학습률 / epoch 수 스케일링
     BASE_GLOBAL_BATCH, current_global_batch = _scale_learning_rate_and_epochs(
@@ -4499,9 +4465,6 @@ def model_training(args: argparse.Namespace) -> None:
         world_size,
     )
     train_epochs: int = args.train_epochs
-
-    # 3) save_path / args.json 준비
-    save_path = _prepare_save_path_and_dump_args(args, global_rank)
 
     # 4) seed 고정
     set_seed(args.seed + global_rank)
@@ -4580,7 +4543,6 @@ def model_training(args: argparse.Namespace) -> None:
          scheduler=scheduler,
          model_ema=model_ema,
          global_rank=global_rank,
-         train_epochs=train_epochs,
          use_deepspeed=use_deepspeed,  # ✅ 추가
      )
     # 11-1) 재개 시 global step 복원 (w_dir / w_int / w_const 스케줄 연속성 보장)
@@ -4593,7 +4555,6 @@ def model_training(args: argparse.Namespace) -> None:
     # 12) 로거 설정 및 이전 아티팩트 정리
     wandb_logger = _setup_logger_and_purge(
         args=args,
-        save_path=save_path,
         global_rank=global_rank,
         wandb_id=wandb_id,
         allow_val_change=allow_val_change,
@@ -4608,7 +4569,6 @@ def model_training(args: argparse.Namespace) -> None:
         train_loader=train_loader,
         train_sampler=train_sampler,
         wandb_logger=wandb_logger,
-        save_path=save_path,
         best_loss=best_loss,
         global_rank=global_rank,
         train_epochs=train_epochs,
@@ -4630,17 +4590,17 @@ def _validate_wandb_resume_args(args: argparse.Namespace) -> None:
     """W&B에서 체크포인트를 받아올 때 필요한 기본 인자들을 점검한다.
 
     처리 내용:
-      - args.resume_model_from_wandb 가 'latest' 인지 확인한다.
-      - args.name 이 비어 있지 않은지 확인한다.
+      - args.resume_wandb_model_name 가 'latest' 인지 확인한다.
+      - args.past_name 이 비어 있지 않은지 확인한다.
     둘 중 하나라도 조건을 만족하지 않으면 바로 ValueError 를 던져서
     잘못된 설정으로 내려받기를 시도하지 않도록 막는다.
     """
-    # resume_model_from_wandb 가 "latest"가 아니면 에러를 발생시킵니다.
-    if args.resume_model_from_wandb not in ['latest']:
-        raise ValueError("args.resume_model_from_wandb must be 'latest.")
-    if not args.name:
+    # resume_wandb_model_name 가 "latest"가 아니면 에러를 발생시킵니다.
+    if args.resume_wandb_model_name not in ['latest']:
+        raise ValueError("args.resume_wandb_model_name must be 'latest.")
+    if not args.past_name:
         raise ValueError(
-            "args.name must be provided to resume from a wandb artifact.")
+            "args.past_name must be provided to resume from a wandb artifact.")
 
 
 def _determine_wandb_artifact_config(
@@ -4649,23 +4609,23 @@ def _determine_wandb_artifact_config(
 
     Args:
         args: argparse.Namespace
-            - args.resume_model_from_wandb (str): 'latest' 또는 'best' 등을 기대.
-            - args.name (str): 실험 이름. 컬렉션 이름의 접두사로 사용된다.
+            - args.resume_wandb_model_name (str): 'latest' 또는 'best' 등을 기대.
+            - args.past_name (str): 실험 이름. 컬렉션 이름의 접두사로 사용된다.
 
     Returns:
         resume_alias: str
             - 실제로 사용할 별칭. 예: 'latest', 'best'.
         collection_name: str
-            - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
+            - W&B 상에서 모델 묶음 이름. 예: f"{args.past_name}_latest-model".
         checkpoint_filename: str
             - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
-    resume_alias = args.resume_model_from_wandb
+    resume_alias = args.resume_wandb_model_name
     if resume_alias == 'best':
-        collection_name = f"{args.name}_best-model"
+        collection_name = f"{args.past_name}_best-model"
         checkpoint_filename = "best.pth"
     else:  # 'latest' 또는 'v10'과 같은 특정 버전을 처리합니다.
-        collection_name = f"{args.name}_latest-model"
+        collection_name = f"{args.past_name}_latest-model"
         checkpoint_filename = "latest.pth"
     return resume_alias, collection_name, checkpoint_filename
 
@@ -4698,30 +4658,47 @@ def _get_wandb_entity_and_project_for_resume(
 
 
 def _download_wandb_checkpoint_to_local(
+    args: argparse.Namespace,
     api: wandb.Api,
     entity: str,
     project: str,
     collection_name: str,
     resume_alias: str,
     checkpoint_filename: str,
-) -> str:
+) -> None:
     """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다."""
-    artifact_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
-    print(f"아티팩트 경로에서 가져오는 중: {artifact_path}")
-    artifact = api.artifact(artifact_path, type='model')
+    """
+    resume_alias : str
+        - 실제로 사용할 별칭. 예: 'latest', 'best'.
+    collection_name : str
+        - W&B 상에서 모델 묶음 이름. 예: f"{args.past_name}_latest-model".
+    checkpoint_filename : str
+        - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+    """
+    """
+    entity: str 예: 'jksg01019-naver-labs'
+    project: str 예: 'Diffusion-Planner'
+    """
+    artifact_wandb_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
+    print(f"아티팩트 경로에서 가져오는 중: {artifact_wandb_path}")
+    artifact = api.artifact(artifact_wandb_path, type='model')
 
     source_run = artifact.logged_by()
     if 'save_path' not in source_run.config:
         raise ValueError("원본 Run의 config에 'save_path'가 없습니다.")
 
-    save_path = source_run.config['save_path']
-    print(f"원본 Run의 config에서 save_path를 찾았습니다: {save_path}")
-    os.makedirs(save_path, exist_ok=True)
-
-    target_file_path = os.path.join(save_path, checkpoint_filename)
-    if os.path.exists(target_file_path):
-        print(f"기존 파일 '{target_file_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
-        os.remove(target_file_path)
+    # "./training_log/feasible_full_time_use_vel_gpu_2_exp_A/2025-12-06-06:56:58/"
+    past_save_path = source_run.config['save_path']
+    print(f"원본 Run의 config에서 save_path를 찾았습니다: {past_save_path}")
+    if args.save_path is None:  #
+        experiment_is_same = args.name == args.past_name
+        assert experiment_is_same, (
+            "args.save_path가 None인 경우, args.name과 args.past_name이 같아야 합니다.")
+        assert args.resume_wandb_model_name is not None, (
+            "args.resume_wandb_model_name must be set when resuming the same experiment."
+        )
+        args.save_path = past_save_path
+    os.makedirs(past_save_path, exist_ok=True)
 
     # rank 0만 별도 run을 만들어서 use_artifact 호출
     rank_str = os.environ.get("RANK", "0")
@@ -4730,62 +4707,120 @@ def _download_wandb_checkpoint_to_local(
     except ValueError:
         rank = 0
 
-    download_run = None
+    # target_local_ckpt_path: ./training_log/.../2025-12-06-06:56:58/latest.pth
+    target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
     if rank == 0:
         download_run = wandb.init(
             project=project,
-            name=f"resume_run_download_{collection_name}",
+            name=
+            f"resume_run_download_{collection_name}",  # f"{args.name}_latest-model".
             resume="allow",
         )
         artifact_for_download = download_run.use_artifact(
             artifact,
-            aliases=[resume_alias],
+            aliases=[resume_alias],  # resume_alias: latest / best
         )
-    else:
-        # 다른 rank는 그냥 Artifact 객체로 다운로드만 수행
-        artifact_for_download = artifact
 
-    artifact_dir = artifact_for_download.download(root=save_path)
-    if download_run is not None:
+        # artifact_dir_past = past_save_path (폴더 경로) : 예전에 저장했던 곳에 그대로 저장.
+        """
+        save_path: ./training_log/.../2025-12-06-06:56:58/
+        artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+        """
+        artifact_dir_past = artifact_for_download.download(root=past_save_path)
         download_run.finish()
 
-    print(f"아티팩트 '{artifact_path}'을(를) {artifact_dir}에 다운로드했습니다.")
+        print(
+            f"아티팩트 '{artifact_wandb_path}'을(를) {artifact_dir_past}에 다운로드했습니다.")
 
-    # 1) checkpoint 파일을 save_path 루트로 복사
-    src_ckpt_path = os.path.join(artifact_dir, checkpoint_filename)
-    if os.path.exists(src_ckpt_path):
-        shutil.copy2(src_ckpt_path, target_file_path)
+        # 1) checkpoint 파일을 past_save_path 루트로 복사
+        """
+        checkpoint_filename: 'latest.pth' 또는 'best.pth'
+        src_ckpt_path_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/latest.pth
+        target_local_ckpt_path: ./training_log/.../2025-12-06-06:56:58/latest.pth
+        """
 
-    # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
-    for tag in ("latest", "best"):
-        src_dir = os.path.join(artifact_dir, tag)
-        if os.path.isdir(src_dir):
-            dst_dir = os.path.join(save_path, tag)
-            if os.path.isdir(dst_dir):
-                shutil.rmtree(dst_dir)
-            shutil.copytree(src_dir, dst_dir)
+        if os.path.exists(target_local_ckpt_path):
+            print(f"기존 파일 '{target_local_ckpt_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
+            os.remove(target_local_ckpt_path)
+        src_ckpt_path_past = os.path.join(artifact_dir_past,
+                                          checkpoint_filename)
+        if os.path.exists(src_ckpt_path_past):
+            shutil.copy2(src_ckpt_path_past, target_local_ckpt_path)
+            print(
+                f"체크포인트 파일을 복사했습니다: {src_ckpt_path_past} -> {target_local_ckpt_path}"
+            )
 
-    if not os.path.exists(target_file_path):
-        downloaded_files = []
-        if os.path.isdir(artifact_dir):
-            for root, dirs, files in os.walk(artifact_dir):
-                for name in files:
-                    rel = os.path.relpath(os.path.join(root, name),
-                                          artifact_dir)
-                    downloaded_files.append(rel)
-        raise FileNotFoundError(
-            f"다운로드된 아티팩트에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: "
-            f"artifact_dir={artifact_dir}. 예시 파일들: {downloaded_files[:10]}")
+        # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
+        for tag in ("latest", "best"):
+            """
+            artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+            artifact_tag_dir_past : ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/latest/
+            save_path_tag_dir : ./training_log/.../2025-12-06-06:56:58/latest/
+            """
+            artifact_tag_dir_past = os.path.join(artifact_dir_past, tag)
+            if os.path.isdir(artifact_tag_dir_past):
+                save_path_tag_dir = os.path.join(args.save_path, tag)
+                if os.path.isdir(save_path_tag_dir):
+                    shutil.rmtree(save_path_tag_dir)
+                shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
+                print("DeepSpeed 체크포인트 디렉터리를 복사했습니다: "
+                      f"{artifact_tag_dir_past} -> {save_path_tag_dir}")
 
-    # save_path: latest.pth / best.pth, DeepSpeed latest/best 디렉터리가 들어 있는 루트
-    return save_path
+        if not os.path.exists(target_local_ckpt_path):
+            downloaded_files = []
+            # artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+            if os.path.isdir(artifact_dir_past):
+                for root, dirs, files in os.walk(artifact_dir_past):
+                    for name in files:
+                        rel = os.path.relpath(os.path.join(root, name),
+                                              artifact_dir_past)
+                        downloaded_files.append(rel)
+            raise FileNotFoundError(
+                f"다운로드된 아티팩트에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: "
+                f"artifact_dir_past={artifact_dir_past}. 예시 파일들: {downloaded_files[:10]}"
+            )
+    else:
+        # rank 0이 다운로드해서 파일이 생길 때까지 대기
+        print(
+            f"rank {rank}는 다운로드하지 않고, 체크포인트 생성 대기 중: {target_local_ckpt_path}")
+        waited_seconds = 0
+        max_wait_seconds = 600  # 10분 정도 대기 (필요하면 조정)
+
+        while not os.path.exists(target_local_ckpt_path):
+            if waited_seconds >= max_wait_seconds:
+                raise TimeoutError(
+                    f"rank 0이 {max_wait_seconds}초 안에 체크포인트를 준비하지 못했습니다: {target_local_ckpt_path}"
+                )
+            time.sleep(1)
+            waited_seconds += 1
+
+        print(f"rank {rank}에서 이미 다운로드된 체크포인트를 확인했습니다: {target_local_ckpt_path}")
 
 
-def _prepare_args_and_wandb_resume() -> argparse.Namespace:
+def _get_save_path(
+    args: argparse.Namespace,
+    global_rank: int,
+) -> None:
+    experiment_is_same = args.name == args.past_name
+    save_path = None
+    if global_rank == 0:
+        if experiment_is_same:
+            assert args.resume_wandb_model_name is not None, (
+                "args.resume_wandb_model_name must be set when resuming the same experiment."
+            )
+        else:
+            time_ = datetime.now()
+            time_ = time_.strftime("%Y-%m-%d-%H:%M:%S")
+            save_path = f"{args.save_dir}/training_log/{args.name}/{time_}/"
+            os.makedirs(save_path, exist_ok=True)
+    args.save_path = save_path
+
+
+def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
     """명령행 인자를 읽고, 필요하다면 W&B 아티팩트에서 체크포인트를 내려받아 args를 보정한다.
 
     처리 흐름:
-      2) args.resume_model_from_wandb 가 설정되지 않았다면 그대로 반환한다.
+      2) args.resume_wandb_model_name 가 설정되지 않았다면 그대로 반환한다.
       3) 설정된 경우
          - _validate_wandb_resume_args() 로 기본 인자 검사를 하고
          - wandb.Api() 를 만든 뒤
@@ -4801,14 +4836,13 @@ def _prepare_args_and_wandb_resume() -> argparse.Namespace:
             - W&B에서 내려받기를 한 경우에는
               args.resume_local_path_model_path 가 실제 디렉터리 경로로 채워진 상태.
     """
-    args = args_util.get_args()
 
-    if not args.resume_model_from_wandb:
-        return args
+    if not args.resume_wandb_model_name:
+        return
 
     _validate_wandb_resume_args(args)
     print(
-        f"Resuming from wandb artifact: {args.name}:{args.resume_model_from_wandb}"
+        f"Resuming from wandb artifact: {args.past_name}:{args.resume_wandb_model_name}"
     )
 
     api = wandb.Api()
@@ -4830,7 +4864,8 @@ def _prepare_args_and_wandb_resume() -> argparse.Namespace:
         """
         entity, project = _get_wandb_entity_and_project_for_resume(args)
 
-        save_path = _download_wandb_checkpoint_to_local(
+        _download_wandb_checkpoint_to_local(
+            args,
             api=api,
             entity=entity,
             project=project,
@@ -4838,19 +4873,9 @@ def _prepare_args_and_wandb_resume() -> argparse.Namespace:
             resume_alias=resume_alias,
             checkpoint_filename=checkpoint_filename,
         )
-        args.resume_local_path_model_path = save_path
 
-        print(
-            f"아티팩트를 {save_path}에 다운로드했습니다. 체크포인트에서 학습을 재개합니다: {args.resume_local_path_model_path}"
-        )
     except Exception as e:
-        print(f"W&B에서 재개하는 동안 오류 발생: {e}")
-        # 오류 발생 시 임시 Run이 종료되도록 보장합니다.
-        if wandb.run:
-            wandb.finish()
-        raise e
-
-    return args
+        raise RuntimeError(f"W&B 아티팩트에서 체크포인트를 내려받는 중 오류가 발생했습니다: {e}") from e
 
 
 def _set_distributed_flag_from_env(args: argparse.Namespace) -> None:
@@ -4878,12 +4903,19 @@ def main() -> None:
       3) model_training(args) 를 호출해 전체 학습 파이프라인을 수행하고,
          예외가 발생하면 rank 정보를 찍고 전체 스택을 출력한다.
     """
-    args = _prepare_args_and_wandb_resume()
+    # 1) 분산 초기화 및 rank 정보
+    args = args_util.get_args()
+    global_rank, rank, world_size, use_deepspeed = _init_distributed(args)
+    _get_save_path(
+        args=args,
+        global_rank=global_rank,
+    )
+    _prepare_wandb_resume(args)
     _set_distributed_flag_from_env(args)
 
     # Run
     try:
-        model_training(args)
+        model_training(args, global_rank, rank, world_size, use_deepspeed)
     except BaseException:
         rank = int(os.environ.get("RANK", -1))
         print(
