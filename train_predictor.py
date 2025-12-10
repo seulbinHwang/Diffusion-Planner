@@ -4056,14 +4056,16 @@ def _log_and_save_on_rank0(
               · 이번 epoch 손실이 더 작으면 새 값으로 교체된 값.
               · 그렇지 않으면 입력과 동일한 값.
     """
-    if global_rank != 0:
+    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
+
+    if (not use_deepspeed) and (global_rank != 0):
         print(f"[Rank {global_rank}] Skipping logging and saving.\n")
         return best_loss
 
     # 1) 메트릭 로그
-    wandb_logger.log_metrics(metrics, step=epoch + 1)
+    if global_rank == 0:
+        wandb_logger.log_metrics(metrics, step=epoch + 1)
 
-    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
     save_interval: int = max(1, int(getattr(args, "save_utd", 1)))
@@ -4105,16 +4107,19 @@ def _log_and_save_on_rank0(
             model_ema.ema if model_ema is not None else None,
             save_best,
         )
-        print(f"Model saved in {args.save_path}\n")
+        if global_rank == 0:
+            print(f"Model saved in {args.save_path}\n")
+
 
     # 5) W&B 아티팩트 업로드
-    _log_wandb_checkpoint_artifacts(
-        args=args,
-        epoch=epoch,
-        train_total_loss=train_total_loss,
-        save_best=save_best,
-        use_deepspeed=use_deepspeed,
-    )
+    if global_rank == 0:
+        _log_wandb_checkpoint_artifacts(
+            args=args,
+            epoch=epoch,
+            train_total_loss=train_total_loss,
+            save_best=save_best,
+            use_deepspeed=use_deepspeed,
+        )
 
     return best_loss
 
