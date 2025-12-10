@@ -1955,7 +1955,7 @@ def _scale_learning_rate_and_epochs(
         args.min_learning_rate = float(base_min_lr) * scale_factor
 
     # 전체 학습 epoch 수를 글로벌 배치에 맞게 조정
-    EPOCH_BETA = 1.0
+    EPOCH_BETA = 0.4
     base_epochs_anchor: int = int(args.train_epochs)
 
     scaled_epochs = _auto_scale_train_epochs(
@@ -1963,7 +1963,7 @@ def _scale_learning_rate_and_epochs(
         base_epochs=base_epochs_anchor,
         current_global_batch=current_global_batch,
         beta=EPOCH_BETA,
-        clamp_min=max(1, args.warm_up_epoch + 1),
+        clamp_min=1,
         clamp_max=None,
     )
     args.train_epochs = int(scaled_epochs)
