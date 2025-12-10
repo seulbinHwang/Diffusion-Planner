@@ -664,10 +664,6 @@ def train_epoch(
         batch_num_in_epoch=len(data_loader),
     )
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
-        for batch in data_epoch:
-            if args._global_update_step >= 1:
-                print(f"Global step: {args._global_update_step}")
-                break
             # 1) device 이동 + 상한 클리핑 + 정답 분리
             inputs, outputs = _prepare_batch_for_device(
                 batch,
