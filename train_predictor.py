@@ -2570,7 +2570,7 @@ def _save_deepspeed_checkpoint_for_epoch(
     model_ema: Optional[ModelEma],
     use_deepspeed: bool,
     save_best: bool,
-) -> None:
+) -> Tuple[str, str]:
     """DeepSpeed 엔진일 때 한 epoch 끝에서 전체 학습 상태를 체크포인트로 저장한다.
 
     이 함수는 PyTorch 단일 .pth 파일이 아니라, DeepSpeed 전용 폴더 구조를 사용한다.
@@ -2620,13 +2620,11 @@ def _save_deepspeed_checkpoint_for_epoch(
         None:
             - 이 함수는 파일 시스템에만 영향을 주고, 값을 반환하지 않는다.
     """
-    print("a")
     if (not use_deepspeed) or save_path is None:
         raise ValueError(f"_save_deepspeed_checkpoint_for_epoch 는 "
                          f"use_deepspeed=True 및 유효한 save_path 가 필요합니다.")
     if not hasattr(diffusion_planner, "save_checkpoint"):
         raise ValueError(f"diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
-    print("b")
     # EMA 상태 dict 준비 (없으면 None)
     ema_state_dict: Optional[Dict[str, Any]] = None
     if model_ema is not None:
@@ -2636,7 +2634,6 @@ def _save_deepspeed_checkpoint_for_epoch(
         except Exception:
             # 혹시 .ema 가 없는 커스텀 EMA 일 경우를 위한 fallback
             ema_state_dict = model_ema.state_dict()
-    print("c")
     client_state: Dict[str, Any] = {
         "epoch": int(epoch + 1),
         "loss": float(train_total_loss),
@@ -2657,7 +2654,6 @@ def _save_deepspeed_checkpoint_for_epoch(
         tag=tag_latest,
         client_state=client_state,
     )
-    print("d")
     tag_best = f"best_epoch-{epoch + 1:06d}"
     # ✅ best 인 경우 best 태그도 별도로 저장해 둔다.
     if save_best:
@@ -2675,6 +2671,7 @@ def _save_deepspeed_checkpoint_for_epoch(
         wandb_run_id=wandb_run_id,
         save_best=save_best,
     )
+    return tag_latest, tag_best
 
 
 def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
@@ -3878,6 +3875,8 @@ def _log_wandb_checkpoint_artifacts(
     train_total_loss: float,
     save_best: bool,
     use_deepspeed: bool,
+        tag_latest: Optional[str],
+        tag_best: Optional[str],
 ) -> None:
     """한 epoch가 끝난 뒤 로컬 체크포인트를 W&B 아티팩트로 올린다.
 
@@ -3927,12 +3926,12 @@ def _log_wandb_checkpoint_artifacts(
 
     # DeepSpeed라면 latest 태그 디렉터리도 같이 넣어준다.
     if use_deepspeed:
-        latest_tag_dir = os.path.join(args.save_path, "latest")
+        latest_tag_dir = os.path.join(args.save_path, tag_latest)
         if os.path.isdir(latest_tag_dir):
             # 아티팩트 안에서도 "latest/" 이름 그대로 보이도록 고정
-            latest_art.add_dir(latest_tag_dir, name="latest")
+            latest_art.add_dir(latest_tag_dir, name=tag_latest)
 
-    wandb.log_artifact(latest_art, aliases=["latest"])
+    wandb.log_artifact(latest_art, aliases=[tag_latest])
     latest_art.wait()  # 업로드 완료 보장
 
     # 학습 도중 이전 버전들을 지우고 싶을 때
@@ -3962,11 +3961,11 @@ def _log_wandb_checkpoint_artifacts(
         best_art.add_file(best_pth)
 
     if use_deepspeed:
-        best_tag_dir = os.path.join(args.save_path, "best")
+        best_tag_dir = os.path.join(args.save_path, tag_best)
         if os.path.isdir(best_tag_dir):
-            best_art.add_dir(best_tag_dir, name="best")
+            best_art.add_dir(best_tag_dir, name=tag_best)
 
-    wandb.log_artifact(best_art, aliases=["best"])
+    wandb.log_artifact(best_art, aliases=[tag_best])
     best_art.wait()
 
     if getattr(args, "delete_wb_weight_when_running", False):
@@ -4084,7 +4083,7 @@ def _log_and_save_on_rank0(
 
     # 4) 로컬 체크포인트 저장
     if use_deepspeed:
-        _save_deepspeed_checkpoint_for_epoch(
+        tag_latest, tag_best = _save_deepspeed_checkpoint_for_epoch(
             diffusion_planner=diffusion_planner,
             save_path=args.save_path,
             epoch=epoch,
@@ -4096,6 +4095,7 @@ def _log_and_save_on_rank0(
         )
         print(f"[DeepSpeed] Checkpoint saved in {args.save_path}\n")
     else:
+        tag_latest = tag_best = None
         save_model(
             diffusion_planner,
             optimizer,
@@ -4119,6 +4119,7 @@ def _log_and_save_on_rank0(
             train_total_loss=train_total_loss,
             save_best=save_best,
             use_deepspeed=use_deepspeed,
+            tag_latest=tag_latest, tag_best=tag_best
         )
 
     return best_loss
