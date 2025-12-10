@@ -2109,6 +2109,7 @@ def _compute_warmup_steps(
     """
     # 바뀜
     use_warmup: bool = bool(getattr(args, "use_lr_warmup", True))
+    warm_up_epoch: int = int(getattr(args, "warm_up_epoch", 0))
 
     if (not use_warmup) or warm_up_epoch <= 0:
         return 0, 0
