@@ -2669,11 +2669,12 @@ class AgentFusionEncoder(nn.Module):
         # on_all: (on_all_time_num, channels_mlp_dim)
         on_all = self.channel_pre_project(on_all)
         # on_agents_past_cur: (agents_past_cur_on_num, time_len, channels_mlp_dim)
+        channels_mlp_dim = on_all.shape[-1]
         on_agents_past_cur = on_all[:on_agents_past_cur_points_num, :].reshape(
-            agents_past_cur_on_num, time_len, -1)
+            agents_past_cur_on_num, time_len, channels_mlp_dim)
         # on_ego_future: (ego_future_on_num, future_len, channels_mlp_dim)
         on_ego_future = on_all[on_agents_past_cur_points_num:, :].reshape(
-            ego_future_on_num, future_len, -1)
+            ego_future_on_num, future_len, channels_mlp_dim)
         """
         token_pre_project = hard split + gated attentional pooling
         """
