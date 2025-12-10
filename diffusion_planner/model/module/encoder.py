@@ -3017,8 +3017,19 @@ class StaticFusionEncoder(nn.Module):
             static_encoding = static_encoding + touch * 0.0
         print("static_encoding.shape:", static_encoding.shape)
         print("static_objects_num: ", static_objects_num)
+        """                                                                                                                                                                                                                                                                                             
+[default1]:static_encoding.shape: torch.Size([0, 192])
+[default1]:static_objects_num:  0                                                
+
+                                                                                                                                                                         [253/50126]
+[default1]:    return forward_call(*args, **kwargs)                                                                                                                                                                                                                                                                                   
+[default1]:  File "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner/model/module/encoder.py", line 3020, in forward                                                                                                                                                                                                           
+[default1]:    static_encoding = static_encoding.reshape(                                                                                                                                                                                                                                                                             
+[default1]:RuntimeError: cannot reshape tensor of 0 elements into shape [1, 0, -1] because the unspecified dimension size -1 can be any value and is ambiguous 
+        """
+        hidden_dim = static_encoding.shape[-1]
         static_encoding = static_encoding.reshape(
-            B, static_objects_num, -1)  # (B, static_objects_num, hidden_dim)
+            B, static_objects_num, hidden_dim)  # (B, static_objects_num, hidden_dim)
         mask_p = mask_p.reshape(B,
                                 static_objects_num)  # (B, static_objects_num)
         return static_encoding, mask_p, static_feature
