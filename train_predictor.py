@@ -851,19 +851,19 @@ class DiffusionPlannerCollate:
     # ------------------------------------------------------------------
     def _compute_object_lengths(
         self,
-        batch: List[Dict[str,
-                         Any]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """각 샘플의 agent / lane / static 개수를 모은다.
+        batch: List[Dict[str, Any]],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """각 샘플의 agent / lane / route_lane / static 개수를 모은다.
 
         Args:
-            batch (List[Dict[str, Any]]):
-                길이 B 리스트, 각 원소는 단일 샘플 dict.
+            batch: 길이 B 리스트, 각 원소는 단일 샘플 dict.
 
         Returns:
-            Tuple[np.ndarray, np.ndarray, np.ndarray]:
-                - agent_len_arr: (B,), 각 샘플의 agent 수
-                - lane_len_arr: (B,), 각 샘플의 lane 수
-                - static_len_arr: (B,), 각 샘플의 static 수
+            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                - agent_len_arr: (B,) 각 샘플의 agent 수
+                - lane_len_arr: (B,) 각 샘플의 lane 수
+                - route_lane_len_arr: (B,) 각 샘플의 route lane 수
+                - static_len_arr: (B,) 각 샘플의 static 수
         """
         agent_len_arr = np.array(
             [sample["neighbor_agents_past"].shape[0] for sample in batch],
@@ -873,11 +873,15 @@ class DiffusionPlannerCollate:
             [sample["lanes"].shape[0] for sample in batch],
             dtype=np.int64,
         )
+        route_lane_len_arr = np.array(
+            [sample["route_lanes"].shape[0] for sample in batch],
+            dtype=np.int64,
+        )
         static_len_arr = np.array(
             [sample["static_objects"].shape[0] for sample in batch],
             dtype=np.int64,
         )
-        return agent_len_arr, lane_len_arr, static_len_arr
+        return agent_len_arr, lane_len_arr, route_lane_len_arr, static_len_arr
 
     # ------------------------------------------------------------------
     # 0-2) 최대 개수 및 lane_len 계산
@@ -887,30 +891,47 @@ class DiffusionPlannerCollate:
         batch: List[Dict[str, Any]],
         agent_len_arr: np.ndarray,
         lane_len_arr: np.ndarray,
+        route_lane_len_arr: np.ndarray,
         static_len_arr: np.ndarray,
-    ) -> Tuple[int, int, int, int]:
-        """배치 안에서 agent / lane / static 최대 개수와 lane_len을 계산한다.
+    ) -> Tuple[int, int, int, int, int, int]:
+        """배치 안에서 agent / lane / route_lane / static 최대 개수와 길이를 계산한다.
 
         Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
-            agent_len_arr (np.ndarray): (B,) agent 개수.
-            lane_len_arr (np.ndarray): (B,) lane 개수.
-            static_len_arr (np.ndarray): (B,) static 개수.
+            batch: 길이 B 샘플 리스트.
+            agent_len_arr: (B,) agent 개수.
+            lane_len_arr: (B,) lane 개수.
+            route_lane_len_arr: (B,) route lane 개수.
+            static_len_arr: (B,) static 개수.
 
         Returns:
-            Tuple[int, int, int, int]:
+            Tuple[int, int, int, int, int, int]:
                 - max_agent_num: 배치 내 최대 agent 수
                 - max_lane_num: 배치 내 최대 lane 수
+                - max_route_lane_num: 배치 내 최대 route lane 수
                 - max_static_num: 배치 내 최대 static 수
                 - lane_len: lane 한 개당 점 개수
+                - route_lane_len: route lane 한 개당 점 개수
         """
         batch_size: int = len(batch)
         max_agent_num: int = int(agent_len_arr.max()) if batch_size > 0 else 0
         max_lane_num: int = int(lane_len_arr.max()) if batch_size > 0 else 0
+        max_route_lane_num: int = (int(route_lane_len_arr.max())
+                                   if batch_size > 0 else 0)
         max_static_num: int = (int(static_len_arr.max())
                                if batch_size > 0 else 0)
+
         lane_len: int = (batch[0]["lanes"].shape[1] if max_lane_num > 0 else 0)
-        return max_agent_num, max_lane_num, max_static_num, lane_len
+        route_lane_len: int = (batch[0]["route_lanes"].shape[1]
+                               if max_route_lane_num > 0 else 0)
+
+        return (
+            max_agent_num,
+            max_lane_num,
+            max_route_lane_num,
+            max_static_num,
+            lane_len,
+            route_lane_len,
+        )
 
     # ------------------------------------------------------------------
     # 0-3) ego / 중심 좌표 계산
@@ -936,6 +957,49 @@ class DiffusionPlannerCollate:
         center_xy = ego_xy.copy()  # (B, 2)
         return ego_xy, center_xy
 
+    def _compute_keep_route_lane_mask(
+        self,
+        center_xy: np.ndarray,  # (B, 2)
+        route_lanes_xy: np.
+        ndarray,  # (B, max_route_lane_num, route_lane_len, 2)
+        route_lane_len_arr: np.ndarray,  # (B,)
+        max_route_lane_num: int,
+    ) -> np.ndarray:
+        """중심 기준 거리로 route lane 을 남길지 여부를 계산한다.
+
+        lane 과 동일한 규칙이지만, route_lanes 만 따로 본다.
+
+        Args:
+            center_xy: (B, 2) 중심 좌표.
+            route_lanes_xy: (B, max_route_lane_num, route_lane_len, 2) route lane 좌표.
+            route_lane_len_arr: (B,) 각 샘플의 route lane 개수.
+            max_route_lane_num: 배치 내 최대 route lane 수.
+
+        Returns:
+            np.ndarray:
+                keep_route_lane_mask: (B, max_route_lane_num)
+        """
+        batch_size: int = route_lane_len_arr.shape[0]
+        if max_route_lane_num <= 0:
+            return np.zeros((batch_size, 0), dtype=bool)
+
+        radius_sq: float = float(self.center_crop_radius_m)**2
+
+        # route_lane_valid_mask: (B, max_route_lane_num)
+        route_lane_valid_mask = (np.arange(max_route_lane_num)[None, :]
+                                 < route_lane_len_arr[:, None])
+
+        # diff_route_lane: (B, max_route_lane_num, route_lane_len, 2)
+        diff_route_lane = route_lanes_xy - center_xy[:, None, None, :]
+        # dist2_route_lane: (B, max_route_lane_num, route_lane_len)
+        dist2_route_lane = (diff_route_lane**2).sum(axis=-1)
+        # min_dist2_route_lane: (B, max_route_lane_num)
+        min_dist2_route_lane = dist2_route_lane.min(axis=-1)
+
+        keep_route_lane_mask = route_lane_valid_mask & (min_dist2_route_lane
+                                                        <= radius_sq)
+        return keep_route_lane_mask
+
     # ------------------------------------------------------------------
     # 0-4) 큰 좌표 배열 만들기 (batch 연산용)
     # ------------------------------------------------------------------
@@ -944,34 +1008,44 @@ class DiffusionPlannerCollate:
         batch: List[Dict[str, Any]],
         agent_len_arr: np.ndarray,
         lane_len_arr: np.ndarray,
+        route_lane_len_arr: np.ndarray,
         static_len_arr: np.ndarray,
         max_agent_num: int,
         max_lane_num: int,
+        max_route_lane_num: int,
         max_static_num: int,
         lane_len: int,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """agent / lane / static 좌표를 큰 배열로 모은다.
+        route_lane_len: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """agent / lane / route_lane / static 좌표를 큰 배열로 모은다.
 
         Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
-            agent_len_arr (np.ndarray): (B,) agent 개수.
-            lane_len_arr (np.ndarray): (B,) lane 개수.
-            static_len_arr (np.ndarray): (B,) static 개수.
-            max_agent_num (int): 배치 내 최대 agent 수.
-            max_lane_num (int): 배치 내 최대 lane 수.
-            max_static_num (int): 배치 내 최대 static 수.
-            lane_len (int): lane 한 개당 점 개수.
+            batch: 길이 B 샘플 리스트.
+            agent_len_arr: (B,) agent 개수.
+            lane_len_arr: (B,) lane 개수.
+            route_lane_len_arr: (B,) route lane 개수.
+            static_len_arr: (B,) static 개수.
+            max_agent_num: 배치 내 최대 agent 수.
+            max_lane_num: 배치 내 최대 lane 수.
+            max_route_lane_num: 배치 내 최대 route lane 수.
+            max_static_num: 배치 내 최대 static 수.
+            lane_len: lane 한 개당 점 개수.
+            route_lane_len: route lane 한 개당 점 개수.
 
         Returns:
-            Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
                 - agents_xy: (B, max_agent_num, 2)
                 - lanes_xy: (B, max_lane_num, lane_len, 2)
+                - route_lanes_xy: (B, max_route_lane_num, route_lane_len, 2)
                 - static_xy: (B, max_static_num, 2)
         """
         batch_size: int = len(batch)
 
-        agents_xy = np.zeros((batch_size, max_agent_num, 2),
-                             dtype=np.float32)  # (B, max_agent_num, 2)
+        # agents_xy: (B, max_agent_num, 2)
+        agents_xy = np.zeros(
+            (batch_size, max_agent_num, 2),
+            dtype=np.float32,
+        )
         for b_idx, sample in enumerate(batch):
             real_agent_num = int(agent_len_arr[b_idx])
             if real_agent_num > 0:
@@ -979,23 +1053,40 @@ class DiffusionPlannerCollate:
                     "neighbor_agents_past"][real_agent_num * 0:real_agent_num,
                                             -1, 0:2]
 
-        lanes_xy = np.zeros((batch_size, max_lane_num, lane_len, 2),
-                            dtype=np.float32)  # (B, max_lane_num, lane_len, 2)
+        # lanes_xy: (B, max_lane_num, lane_len, 2)
+        lanes_xy = np.zeros(
+            (batch_size, max_lane_num, lane_len, 2),
+            dtype=np.float32,
+        )
         for b_idx, sample in enumerate(batch):
             real_lane_num = int(lane_len_arr[b_idx])
             if real_lane_num > 0:
                 lanes_xy[b_idx, :real_lane_num, :, :] = sample[
                     "lanes"][:real_lane_num, :, 0:2]
 
-        static_xy = np.zeros((batch_size, max_static_num, 2),
-                             dtype=np.float32)  # (B, max_static_num, 2)
+        # route_lanes_xy: (B, max_route_lane_num, route_lane_len, 2)
+        route_lanes_xy = np.zeros(
+            (batch_size, max_route_lane_num, route_lane_len, 2),
+            dtype=np.float32,
+        )
+        for b_idx, sample in enumerate(batch):
+            real_route_lane_num = int(route_lane_len_arr[b_idx])
+            if real_route_lane_num > 0:
+                route_lanes_xy[b_idx, :real_route_lane_num, :, :] = sample[
+                    "route_lanes"][:real_route_lane_num, :, 0:2]
+
+        # static_xy: (B, max_static_num, 2)
+        static_xy = np.zeros(
+            (batch_size, max_static_num, 2),
+            dtype=np.float32,
+        )
         for b_idx, sample in enumerate(batch):
             real_static_num = int(static_len_arr[b_idx])
             if real_static_num > 0:
                 static_xy[b_idx, :real_static_num, :] = sample[
                     "static_objects"][real_static_num * 0:real_static_num, 0:2]
 
-        return agents_xy, lanes_xy, static_xy
+        return agents_xy, lanes_xy, route_lanes_xy, static_xy
 
     # ------------------------------------------------------------------
     # 0-5) agent 유효 마스크
@@ -1252,21 +1343,25 @@ class DiffusionPlannerCollate:
         batch: List[Dict[str, Any]],
         agent_len_arr: np.ndarray,
         lane_len_arr: np.ndarray,
+        route_lane_len_arr: np.ndarray,
         static_len_arr: np.ndarray,
         keep_agent_mask: np.ndarray,
         keep_lane_mask: np.ndarray,
+        keep_route_lane_mask: np.ndarray,
         keep_static_mask: np.ndarray,
     ) -> None:
         """계산된 keep 마스크를 이용해 각 샘플 dict를 잘라낸다.
 
         Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
-            agent_len_arr (np.ndarray): (B,) agent 수.
-            lane_len_arr (np.ndarray): (B,) lane 수.
-            static_len_arr (np.ndarray): (B,) static 수.
-            keep_agent_mask (np.ndarray): (B, max_agent_num) agent keep 마스크.
-            keep_lane_mask (np.ndarray): (B, max_lane_num) lane keep 마스크.
-            keep_static_mask (np.ndarray): (B, max_static_num) static keep 마스크.
+            batch: 길이 B 샘플 리스트.
+            agent_len_arr: (B,) agent 수.
+            lane_len_arr: (B,) lane 수.
+            route_lane_len_arr: (B,) route lane 수.
+            static_len_arr: (B,) static 수.
+            keep_agent_mask: (B, max_agent_num) agent keep 마스크.
+            keep_lane_mask: (B, max_lane_num) lane keep 마스크.
+            keep_route_lane_mask: (B, max_route_lane_num) route lane keep 마스크.
+            keep_static_mask: (B, max_static_num) static keep 마스크.
         """
         batch_size: int = len(batch)
         for b_idx in range(batch_size):
@@ -1280,7 +1375,7 @@ class DiffusionPlannerCollate:
                 sample["near_future_gt_3_dim"] = sample["near_future_gt_3_dim"][
                     keep_agent_idx]
 
-            # 2) lane 관련 + route_lanes 계열
+            # 2) lane 관련 (superset)
             if int(lane_len_arr[b_idx]) > 0:
                 keep_lane_idx = np.nonzero(keep_lane_mask[b_idx])[0]
                 sample["lanes"] = sample["lanes"][keep_lane_idx]
@@ -1289,16 +1384,21 @@ class DiffusionPlannerCollate:
                 sample["lanes_has_speed_limit"] = sample[
                     "lanes_has_speed_limit"][keep_lane_idx]
 
+            # 2-1) route_lanes 관련 (lanes 와 독립 마스크)
+            if int(route_lane_len_arr[b_idx]) > 0:
+                keep_route_lane_idx = np.nonzero(keep_route_lane_mask[b_idx])[0]
+
                 if "route_lanes" in sample:
-                    sample["route_lanes"] = sample["route_lanes"][keep_lane_idx]
+                    sample["route_lanes"] = sample["route_lanes"][
+                        keep_route_lane_idx]
                 if "route_lanes_speed_limit" in sample:
                     sample["route_lanes_speed_limit"] = sample[
-                        "route_lanes_speed_limit"][keep_lane_idx]
+                        "route_lanes_speed_limit"][keep_route_lane_idx]
                 if "route_lanes_has_speed_limit" in sample:
                     sample["route_lanes_has_speed_limit"] = sample[
-                        "route_lanes_has_speed_limit"][keep_lane_idx]
+                        "route_lanes_has_speed_limit"][keep_route_lane_idx]
 
-            # 3) agent_route_lane_order (행: agent, 열: lane)
+            # 3) agent_route_lane_order (행: agent, 열: lane → lanes 기준)
             if int(agent_len_arr[b_idx]) > 0 and int(lane_len_arr[b_idx]) > 0:
                 keep_agent_idx = np.nonzero(keep_agent_mask[b_idx])[0]
                 keep_lane_idx = np.nonzero(keep_lane_mask[b_idx])[0]
@@ -1321,42 +1421,60 @@ class DiffusionPlannerCollate:
     ) -> None:
         """배치 전체를 한 번에 보고, 중심 기준 K m 안의 토큰만 남긴다.
 
-        무거운 계산은 모두 numpy 배열 기반 배치 연산으로 처리하고,
+        무거운 계산은 numpy 배치 연산으로 처리하고,
         마지막에 샘플별 슬라이싱만 for 루프에서 수행한다.
         """
         batch_size: int = len(batch)
         if batch_size == 0:
             return
 
-        agent_len_arr, lane_len_arr, static_len_arr = \
-            self._compute_object_lengths(batch)
+        (
+            agent_len_arr,
+            lane_len_arr,
+            route_lane_len_arr,
+            static_len_arr,
+        ) = self._compute_object_lengths(batch)
+
         (
             max_agent_num,
             max_lane_num,
+            max_route_lane_num,
             max_static_num,
             lane_len,
+            route_lane_len,
         ) = self._compute_max_counts_and_lane_len(
             batch=batch,
             agent_len_arr=agent_len_arr,
             lane_len_arr=lane_len_arr,
+            route_lane_len_arr=route_lane_len_arr,
             static_len_arr=static_len_arr,
         )
+
         # center_xy: (B, 2) 초기 중심(ego와 동일)
         _, center_xy = self._build_ego_and_center_xy(batch)
         """
             - agents_xy: (B, max_agent_num, 2)
             - lanes_xy: (B, max_lane_num, lane_len, 2)
+            - route_lanes_xy: (B, max_route_lane_num, route_lane_len, 2)
             - static_xy: (B, max_static_num, 2)
         """
-        agents_xy, lanes_xy, static_xy = self._build_positions_arrays(
+        (
+            agents_xy,
+            lanes_xy,
+            route_lanes_xy,
+            static_xy,
+        ) = self._build_positions_arrays(
             batch=batch,
             agent_len_arr=agent_len_arr,
             lane_len_arr=lane_len_arr,
+            route_lane_len_arr=route_lane_len_arr,
             static_len_arr=static_len_arr,
             max_agent_num=max_agent_num,
             max_lane_num=max_lane_num,
+            max_route_lane_num=max_route_lane_num,
             max_static_num=max_static_num,
             lane_len=lane_len,
+            route_lane_len=route_lane_len,
         )
         """
             - agent_valid_mask: (B, max_agent_num) True=해당 칸에 agent 있음
@@ -1376,6 +1494,8 @@ class DiffusionPlannerCollate:
             agent_valid_mask=agent_valid_mask,  # (B, max_agent_num)
             max_agent_num=max_agent_num,  # int
         )
+        _ = center_agent_idx  # 사용하지 않는 값이지만 shape: (B,)
+
         # keep_agent_mask: (B, max_agent_num)
         keep_agent_mask = self._compute_keep_agent_mask(
             center_xy=center_xy,
@@ -1391,6 +1511,13 @@ class DiffusionPlannerCollate:
             lane_len_arr=lane_len_arr,
             max_lane_num=max_lane_num,
         )
+        # keep_route_lane_mask: (B, max_route_lane_num)
+        keep_route_lane_mask = self._compute_keep_route_lane_mask(
+            center_xy=center_xy,
+            route_lanes_xy=route_lanes_xy,
+            route_lane_len_arr=route_lane_len_arr,
+            max_route_lane_num=max_route_lane_num,
+        )
         # keep_static_mask: (B, max_static_num)
         keep_static_mask = self._compute_keep_static_mask(
             center_xy=center_xy,
@@ -1403,9 +1530,11 @@ class DiffusionPlannerCollate:
             batch=batch,
             agent_len_arr=agent_len_arr,
             lane_len_arr=lane_len_arr,
+            route_lane_len_arr=route_lane_len_arr,
             static_len_arr=static_len_arr,
             keep_agent_mask=keep_agent_mask,  # (B, max_agent_num)
             keep_lane_mask=keep_lane_mask,  # (B, max_lane_num)
+            keep_route_lane_mask=keep_route_lane_mask,  # (B, max_route_lane_num)
             keep_static_mask=keep_static_mask,  # (B, max_static_num)
         )
 
@@ -1744,22 +1873,14 @@ class DiffusionPlannerCollate:
 def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
     """여러 GPU를 쓸 때 필요한 분산 학습 환경을 준비하고, 내 위치 정보를 정리한다.
 
-    이 함수는 두 가지 모드를 지원한다.
-      - use_deepspeed=True  인 경우:
-        torchrun 이 미리 넣어준 환경변수(RANK, WORLD_SIZE, LOCAL_RANK)를 그대로 읽어서
-        · global_rank : 전체 학습 프로세스 중에서 내 번호
-        · world_size  : 전체 프로세스 개수
-        · rank        : 이 학습 노드(프로세스)에서 내가 사용할 GPU 번호
-        를 정하고, 해당 GPU 로 장치를 고정한다.
-      - use_deepspeed=False 인 경우:
-        기존 ddp.ddp_setup_universal() 을 호출해서 위와 같은 값을 계산하고,
-        PyTorch 기본 분산 통신 설정까지 한 번에 마친다.
+    DeepSpeed를 쓰는 경우에도 torch.distributed를 미리 초기화해 두어서
+    _get_save_path() 안의 broadcast가 항상 동작하도록 만든다.
     """
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
 
     if use_deepspeed:
         # torchrun이 설정한 환경변수만 사용해서 rank/world_size를 계산한다.
-        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
             global_rank = int(os.environ["RANK"])
             world_size = int(os.environ["WORLD_SIZE"])
             rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1768,8 +1889,21 @@ def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
             global_rank = 0
             world_size = 1
             rank = 0
-        if args.device.startswith('cuda'):
+
+        if args.device.startswith("cuda"):
             torch.cuda.set_device(rank)
+
+        # ✅ DeepSpeed에서도 torch.distributed를 미리 초기화
+        #    → _get_save_path의 broadcast_object_list가 항상 동작
+        if (world_size > 1 and torch.distributed.is_available() and
+                not torch.distributed.is_initialized()):
+            backend = "nccl" if args.device.startswith("cuda") else "gloo"
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method="env://",
+                world_size=world_size,
+                rank=global_rank,
+            )
     else:
         # 기존 DDP 초기화 흐름과 동일
         global_rank, rank, _ = ddp.ddp_setup_universal(True, args)
@@ -3925,8 +4059,10 @@ def _log_and_save_on_rank0(
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
     save_interval: int = max(1, int(getattr(args, "save_utd", 1)))
-    # 예: save_interval=1 → 매 epoch 저장, 5 → 5 epoch마다 저장
-    if (epoch + 1) % save_interval != 0:
+    is_first_epoch: bool = (epoch == 0)
+
+    # 첫 epoch(=epoch 0)은 무조건 저장, 그 이후에는 save_utd 주기로 저장
+    if (not is_first_epoch) and ((epoch + 1) % save_interval != 0):
         return best_loss
 
     # 3) best 갱신 여부
