@@ -1,5 +1,5 @@
 # configs/stage2.yaml
-name: stage2_test
+name: stage2_test1
 past_name: stage1_test1
 
 batch_size: 8 #512

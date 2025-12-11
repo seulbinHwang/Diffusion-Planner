@@ -5004,7 +5004,7 @@ def _download_wandb_checkpoint_to_local(
         # artifact_dir_past = past_save_path (폴더 경로) : 예전에 저장했던 곳에 그대로 저장.
         """
         save_path: ./training_log/.../2025-12-06-06:56:58/
-        artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+        artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts
         """
         artifacts_root = os.path.join(past_save_path, "artifacts")
         artifact_dir_past = artifact_for_download.download(root=artifacts_root)
@@ -5014,11 +5014,11 @@ def _download_wandb_checkpoint_to_local(
             f"FYI, past_save_path: {past_save_path}"
         )
         download_run.finish()
-        raise NotImplementedError("WandB checkpoint download test 필요")
+
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
         checkpoint_filename: 'latest.pth' 또는 'best.pth'
-        src_ckpt_path_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/latest.pth
+        src_ckpt_path_past: ./training_log/.../2025-12-06-06:56:58/artifacts/latest.pth
         target_local_ckpt_path: ./training_log/.../2025-12-06-06:56:58/latest.pth
         """
 
