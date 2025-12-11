@@ -2999,7 +2999,7 @@ def _restore_ema_and_model_from_client_state_for_deepspeed(
     # 1) EMA 객체가 있고, ema_state_dict 가 있으면 EMA 가중치 복원
     if load_ema_for_ema_model:
         assert (model_ema is not None) and (ema_state_dict is not None), \
-            "[DeepSpeed] EMA 모델 복원을 위해서는 model_ema 와 ema_state_dict 가 둘 다 필요합니다."
+            "[DeepSpeed 모델 파라미터 로드]EMA 모델 복원을 위해서는 model_ema 와 ema_state_dict 가 둘 다 필요합니다."
         try:
             ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
             # ema_model.state_dict() 의 각 텐서 shape:
@@ -3009,14 +3009,14 @@ def _restore_ema_and_model_from_client_state_for_deepspeed(
             for p in ema_model.parameters():
                 p.requires_grad_(False)
             if global_rank == 0:
-                print("[DeepSpeed] EMA state load done")
+                print("[DeepSpeed 모델 파라미터 로드]EMA state load done")
         except Exception as e:
             if global_rank == 0:
-                print(f"[DeepSpeed] EMA state load 실패: {e}")
+                print(f"[DeepSpeed 모델 파라미터 로드]EMA state load 실패: {e}")
 
     if load_ema_for_model:
         assert ema_state_dict is not None, \
-            "[DeepSpeed]  EMA→base_model 초기화를 위해서는 ema state_dict 가 필요합니다."
+            "[DeepSpeed 모델 파라미터 로드]  EMA→base_model 초기화를 위해서는 ema state_dict 가 필요합니다."
         try:
             base_model: nn.Module = getattr(diffusion_planner, "module",
                                             diffusion_planner)
@@ -3025,22 +3025,22 @@ def _restore_ema_and_model_from_client_state_for_deepspeed(
             if global_rank == 0:
                 if getattr(incompatible, "missing_keys", None):
                     print(
-                        f"[DeepSpeed] model-only(EMA) missing_keys: {incompatible.missing_keys}"
+                        f"[DeepSpeed 모델 파라미터 로드] model-only(EMA) missing_keys: {incompatible.missing_keys}"
                     )
                 if getattr(incompatible, "unexpected_keys", None):
                     print(
-                        f"[DeepSpeed] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}"
+                        f"[DeepSpeed 모델 파라미터 로드] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}"
                     )
                 print(
-                    "[DeepSpeed] model-only resume: base model initialized from EMA weights"
+                    "[DeepSpeed 모델 파라미터 로드] model-only resume: base model initialized from EMA weights"
                 )
         except Exception as e:
             if global_rank == 0:
                 print(f"... 실패: {e}")
-            raise RuntimeError("[DeepSpeed] model-only 모드에서 "
+            raise RuntimeError("[DeepSpeed 모델 파라미터 로드] model-only 모드에서 "
                                "EMA→base_model 초기화 중 오류 발생") from e
             if global_rank == 0:
-                print(f"[DeepSpeed] EMA→base_model 초기화 실패: {e}")
+                print(f"[DeepSpeed 모델 파라미터 로드] EMA→base_model 초기화 실패: {e}")
 
     return model_ema
 
@@ -3077,7 +3077,7 @@ def _resume_from_deepspeed_checkpoint_format(
 
     if global_rank == 0:
         print(
-            f"[DeepSpeed] load_checkpoint: save_path={save_path}, tag='{tag}'")
+            f"[DeepSpeed 모델 파라미터 로드] load_checkpoint: save_path={save_path}, tag='{tag}'")
 
     # 1) DeepSpeedEngine.load_checkpoint 호출 (신/구 버전 둘 다 지원)
     load_path, client_state = _load_deepspeed_checkpoint_with_compat(
@@ -3089,7 +3089,7 @@ def _resume_from_deepspeed_checkpoint_format(
     )
 
     if global_rank == 0:
-        print(f"[DeepSpeed] load_checkpoint returned path={load_path}, "
+        print(f"[DeepSpeed 모델 파라미터 로드] load_checkpoint returned path={load_path}, "
               f"client_state keys={list((client_state or {}).keys())}")
 
     # client_state 가 None 인 경우에도 이후 로직이 동일하게 동작하도록 빈 dict 로 대체
@@ -3818,7 +3818,7 @@ def _maybe_resume_from_checkpoint(
     resume_model_only: bool = bool(getattr(args, "resume_model_only", False))
 
     if args.resume_wandb_model_name is not None:
-        print(f"Model loaded from {args.save_path}")
+        print(f"[모델 파라미터 로드] Model loaded from {args.save_path}")
 
         # -------- DeepSpeed 경로 --------
         if use_deepspeed and hasattr(diffusion_planner, "load_checkpoint"):
@@ -4951,7 +4951,7 @@ def _download_wandb_checkpoint_to_local(
     project: str 예: 'Diffusion-Planner'
     """
     artifact_wandb_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
-    print(f"아티팩트 경로에서 가져오는 중: {artifact_wandb_path}")
+    print(f"[WANDB->로컬] 아티팩트 경로에서 가져오는 중: {artifact_wandb_path}")
     artifact = api.artifact(artifact_wandb_path, type='model')
 
     source_run = artifact.logged_by()
@@ -4960,7 +4960,7 @@ def _download_wandb_checkpoint_to_local(
 
     # "./training_log/feasible_full_time_use_vel_gpu_2_exp_A/2025-12-06-06:56:58/"
     past_save_path = source_run.config['save_path']
-    print(f"원본 Run의 config에서 save_path를 찾았습니다: {past_save_path}")
+    print(f"[WANDB->로컬] 원본 Run의 config에서 save_path를 찾았습니다: {past_save_path}")
     if args.save_path is None:  #
         experiment_is_same = args.name == args.past_name
         assert experiment_is_same, (
@@ -4996,7 +4996,7 @@ def _download_wandb_checkpoint_to_local(
         download_run.finish()
 
         print(
-            f"아티팩트 '{artifact_wandb_path}'을(를) {artifact_dir_past}에 다운로드했습니다.")
+            f"[WANDB->로컬] 아티팩트 '{artifact_wandb_path}'을(를) {artifact_dir_past}에 다운로드했습니다.")
 
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
@@ -5006,18 +5006,18 @@ def _download_wandb_checkpoint_to_local(
         """
 
         if os.path.exists(target_local_ckpt_path):
-            print(f"기존 파일 '{target_local_ckpt_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
+            print(f"[로컬->로컬] 기존 파일 '{target_local_ckpt_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
             os.remove(target_local_ckpt_path)
         src_ckpt_path_past = os.path.join(artifact_dir_past,
                                           checkpoint_filename)
         if os.path.exists(src_ckpt_path_past):
             shutil.copy2(src_ckpt_path_past, target_local_ckpt_path)
             print(
-                f"체크포인트 파일을 복사했습니다: {src_ckpt_path_past} -> {target_local_ckpt_path}"
+                f"[로컬->로컬] 체크포인트 파일을 복사했습니다: {src_ckpt_path_past} -> {target_local_ckpt_path}"
             )
         else:
             raise FileNotFoundError(
-                f"다운로드된 아티팩트에서 체크포인트 파일을 찾을 수 없습니다: {src_ckpt_path_past}")
+                f"[로컬->로컬] 다운로드된 아티팩트에서 체크포인트 파일을 찾을 수 없습니다: {src_ckpt_path_past}")
 
         # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
         for tag in ("latest", "best"):
@@ -5052,7 +5052,7 @@ def _download_wandb_checkpoint_to_local(
             if os.path.isdir(save_path_tag_dir):
                 shutil.rmtree(save_path_tag_dir)
             shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
-            print("DeepSpeed 체크포인트 디렉터리를 복사했습니다: "
+            print("[로컬->로컬] DeepSpeed 체크포인트 디렉터리를 복사했습니다: "
                   f"{artifact_tag_dir_past} -> {save_path_tag_dir}")
 
         if not os.path.exists(target_local_ckpt_path):
@@ -5065,7 +5065,7 @@ def _download_wandb_checkpoint_to_local(
                                               artifact_dir_past)
                         downloaded_files.append(rel)
             raise FileNotFoundError(
-                f"다운로드된 아티팩트에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: "
+                f"[로컬->로컬] 다운로드된 아티팩트에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: "
                 f"artifact_dir_past={artifact_dir_past}. 예시 파일들: {downloaded_files[:10]}"
             )
     else:
