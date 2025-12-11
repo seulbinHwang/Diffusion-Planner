@@ -177,7 +177,6 @@ def resume_model(
     optimizer: torch.optim.Optimizer,
     scheduler: Any,
     ema: Optional[Any],
-    device: str,
 ) -> Tuple[torch.nn.Module, torch.optim.Optimizer, Any, int, Optional[str],
            Optional[Any]]:
     """저장된 latest.pth 체크포인트를 읽어서 모델/옵티마이저/스케줄러/EMA 상태를 복원한다.
