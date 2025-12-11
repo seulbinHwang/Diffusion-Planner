@@ -4983,23 +4983,31 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
         f"Resuming from wandb artifact: {args.past_name}:{args.resume_wandb_model_name}"
     )
 
-    api = wandb.Api()
 
+    """
+    resume_alias : str
+        - 실제로 사용할 별칭. 예: 'latest', 'best'.
+    collection_name : str
+        - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
+    checkpoint_filename : str
+        - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+    """
+    resume_alias, collection_name, checkpoint_filename = \
+        _determine_wandb_artifact_config(args)
+    if getattr(args, "save_path", None) is not None:
+        local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
+        if os.path.exists(local_ckpt_path):
+            print(
+                f"[WANDB->local] found existing local checkpoint: {local_ckpt_path} "
+                f"(alias={resume_alias}), skip wandb download."
+            )
+            return
+    """
+    entity: str 예: 'jksg01019-naver-labs'
+    project: str 예: 'Diffusion-Planner'
+    """
+    api = wandb.Api()
     try:
-        """
-        resume_alias : str
-            - 실제로 사용할 별칭. 예: 'latest', 'best'.
-        collection_name : str
-            - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
-        checkpoint_filename : str
-            - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
-        """
-        resume_alias, collection_name, checkpoint_filename = \
-            _determine_wandb_artifact_config(args)
-        """
-        entity: str 예: 'jksg01019-naver-labs'
-        project: str 예: 'Diffusion-Planner'
-        """
         entity, project = _get_wandb_entity_and_project_for_resume(args)
 
         _download_wandb_checkpoint_to_local(
