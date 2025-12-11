@@ -60,6 +60,29 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
 except Exception:
     pass
+import _hashlib
+import hashlib
+from typing import Iterable
+from wandb.sdk.lib import hashutil as wandb_hashutil
+
+
+def md5_file_hasher_no_mmap(*paths: str) -> _hashlib.HASH:
+    """Ceph 환경에서 mmap(SIGBUS) 피하기 위한 W&B용 MD5 해시 함수."""
+    md5_hash: _hashlib.HASH = wandb_hashutil._md5()
+
+    for path in sorted(map(str, paths)):
+        with open(path, "rb") as file_obj:
+            while True:
+                chunk: bytes = file_obj.read(wandb_hashutil._CHUNKSIZE)
+                if not chunk:
+                    break
+                md5_hash.update(chunk)
+
+    return md5_hash
+
+
+# W&B 내부 해시 함수 갈아끼우기 (mmap 사용 금지)
+wandb_hashutil._md5_file_hasher = md5_file_hasher_no_mmap  # type: ignore[attr-defined]
 
 
 def build_deepspeed_config(args: argparse.Namespace,
