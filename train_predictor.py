@@ -1994,7 +1994,7 @@ def _scale_learning_rate_and_epochs(
         clamp_max=None,
     )
     scale_epoch_factor = scaled_epochs / float(args.train_epochs)
-    args.train_epochs = int(scaled_epochs)
+    args.train_epochs = 2 #int(scaled_epochs)
     args.warm_up_epoch = int(warm_up_epoch * scale_epoch_factor)
 
     return BASE_GLOBAL_BATCH, current_global_batch
