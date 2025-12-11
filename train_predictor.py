@@ -5015,6 +5015,7 @@ def _download_wandb_checkpoint_to_local(
             f"FYI, past_save_path: {past_save_path}"
         )
         download_run.finish()
+        raise NotImplementedError("WandB checkpoint download test 필요")
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
         checkpoint_filename: 'latest.pth' 또는 'best.pth'
