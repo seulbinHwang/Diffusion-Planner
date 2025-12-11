@@ -53,17 +53,17 @@ STAGE3_CFG="configs/stage3.yaml"
 ########################################
 # Stage 1: 작은 장면 + end-to-end pretrain
 ########################################
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" \
- --redirects 3 --tee "$TEE" \
- train_predictor.py \
- --port 23001 \
-  --train_set "$TRAIN_SET_PATH"/ \
-  --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --stage_config_path "${STAGE1_CFG}" \
-  --use_deepspeed true \
-  --use_8bit_optimizer true \
-  "$@"
+#"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
+#--nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" \
+# --redirects 3 --tee "$TEE" \
+# train_predictor.py \
+# --port 23001 \
+#  --train_set "$TRAIN_SET_PATH"/ \
+#  --train_set_list "$TRAIN_SET_LIST_PATH" \
+#  --stage_config_path "${STAGE1_CFG}" \
+#  --use_deepspeed true \
+#  --use_8bit_optimizer true \
+#  "$@"
 
 
 ########################################
