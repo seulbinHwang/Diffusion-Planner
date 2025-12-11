@@ -3854,11 +3854,11 @@ def _log_wandb_checkpoint_artifacts(
         latest_art.add_file(latest_pth)
 
     # DeepSpeed라면 latest 태그 디렉터리도 같이 넣어준다.
-    if use_deepspeed:
-        latest_tag_dir = os.path.join(args.save_path, tag_latest)
-        if os.path.isdir(latest_tag_dir):
-            # 아티팩트 안에서도 "latest/" 이름 그대로 보이도록 고정
-            latest_art.add_dir(latest_tag_dir, name=tag_latest)
+    # if use_deepspeed:
+    #     latest_tag_dir = os.path.join(args.save_path, tag_latest)
+    #     if os.path.isdir(latest_tag_dir):
+    #         # 아티팩트 안에서도 "latest/" 이름 그대로 보이도록 고정
+    #         latest_art.add_dir(latest_tag_dir, name=tag_latest)
 
     wandb.log_artifact(latest_art, aliases=[tag_latest])
     latest_art.wait()  # 업로드 완료 보장
@@ -3889,10 +3889,10 @@ def _log_wandb_checkpoint_artifacts(
     if os.path.exists(best_pth):
         best_art.add_file(best_pth)
 
-    if use_deepspeed:
-        best_tag_dir = os.path.join(args.save_path, tag_best)
-        if os.path.isdir(best_tag_dir):
-            best_art.add_dir(best_tag_dir, name=tag_best)
+    # if use_deepspeed:
+    #     best_tag_dir = os.path.join(args.save_path, tag_best)
+    #     if os.path.isdir(best_tag_dir):
+    #         best_art.add_dir(best_tag_dir, name=tag_best)
 
     wandb.log_artifact(best_art, aliases=[tag_best])
     best_art.wait()
