@@ -4990,9 +4990,6 @@ def _download_wandb_checkpoint_to_local(
     target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
     if rank == 0:
         os.makedirs(past_save_path, exist_ok=True)
-        print("CWD:", os.getcwd())
-        print("abs past_save_path:", os.path.abspath(past_save_path))
-        raise NotImplementedError("Wandb resume not tested yet.")
         download_run = wandb.init(
             project=project,
             name=
@@ -5011,8 +5008,6 @@ def _download_wandb_checkpoint_to_local(
         """
         # TODO: 아래코드가 -> past_save_path 에 이미 파일이 있으면, 어떻게 되려나? 덮어쓰려나?
         artifacts_root = os.path.join(past_save_path, "artifacts")
-        os.makedirs(artifacts_root, exist_ok=True)
-
         artifact_dir_past = artifact_for_download.download(root=artifacts_root)
 
         print(
@@ -5076,7 +5071,7 @@ def _download_wandb_checkpoint_to_local(
             shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
             print("[local->local] COpy DeepSpeed checkpoint directory: "
                   f"artifact_tag_dir_past   {artifact_tag_dir_past} -> save_path_tag_dir  {save_path_tag_dir}")
-
+            raise NotImplementedError("DeepSpeed checkpoint 복사 테스트 필요")
         if not os.path.exists(target_local_ckpt_path):
             downloaded_files = []
             # artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
