@@ -3773,7 +3773,7 @@ def _maybe_resume_from_checkpoint(
     use_deepspeed: bool,
 ) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
            Optional[str], int, bool]:
-    """로컬 또는 W&B에서 지정한 체크포인트가 있으면 학습 상태를 복원한다.
+    """local 또는 W&B에서 지정한 체크포인트가 있으면 학습 상태를 복원한다.
 
     이 함수는 "재개할 체크포인트가 있는지"를 먼저 확인한 뒤,
     상황에 따라 다음과 같이 동작한다.
@@ -4017,7 +4017,7 @@ def _log_wandb_checkpoint_artifacts(
     tag_latest: Optional[str],
     tag_best: Optional[str],
 ) -> None:
-    """한 epoch가 끝난 뒤 로컬 체크포인트를 W&B 아티팩트로 올린다.
+    """한 epoch가 끝난 뒤 local 체크포인트를 W&B 아티팩트로 올린다.
 
     - PyTorch/DDP 학습:
       latest.pth / best.pth 파일만 아티팩트에 담는다.
@@ -4148,7 +4148,7 @@ def _log_and_save(
          · best_loss 를 새 값으로 교체하고,
          · save_best=True 로 표시해 best.pth 도 함께 갱신하도록 만든다.
 
-    4) 로컬 체크포인트 저장
+    4) local 체크포인트 저장
        - use_deepspeed=True 이면:
          · _save_deepspeed_checkpoint_for_epoch(...) 을 호출해
            DeepSpeed 포맷(latest / best tag + meta 파일)으로 저장한다.
@@ -4219,7 +4219,7 @@ def _log_and_save(
         best_loss = train_total_loss
         save_best = True
 
-    # 4) 로컬 체크포인트 저장
+    # 4) local 체크포인트 저장
     if use_deepspeed:
         tag_latest, tag_best = _save_deepspeed_checkpoint_for_epoch(
             diffusion_planner=diffusion_planner,
@@ -4646,7 +4646,7 @@ def _finalize_training_cleanup(
     global_rank: int,
     wandb_logger: Logger,
 ) -> None:
-    """학습이 끝난 뒤, 분산 동기화와 wandb/TensorBoard/로컬 파일 정리를 수행한다."""
+    """학습이 끝난 뒤, 분산 동기화와 wandb/TensorBoard/local 파일 정리를 수행한다."""
     # 1) 분산 학습일 때만 barrier 호출
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
@@ -4660,10 +4660,10 @@ def _finalize_training_cleanup(
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
 
-    # 3) 로컬 체크포인트/로그 삭제는 옵션으로만 수행
+    # 3) local 체크포인트/로그 삭제는 옵션으로만 수행
     if (global_rank == 0 and args.save_path and
             getattr(args, "cleanup_local_artifacts_after_train", False)):
-        print("[CLEANUP] 훈련 종료 후 로컬 체크포인트 및 로그 정리 시작")
+        print("[CLEANUP] 훈련 종료 후 local 체크포인트 및 로그 정리 시작")
         for f in ["latest.pth", "best.pth", "args.json"]:
             p = os.path.join(args.save_path, f)
             try:
@@ -4899,7 +4899,7 @@ def _determine_wandb_artifact_config(
         collection_name: str
             - W&B 상에서 모델 묶음 이름. 예: f"{args.past_name}_latest-model".
         checkpoint_filename: str
-            - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+            - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
     resume_alias = args.resume_wandb_model_name
     if resume_alias == 'best':
@@ -4960,27 +4960,27 @@ def _download_wandb_checkpoint_to_local(
     collection_name : str
         - W&B 상에서 모델 묶음 이름. 예: f"{args.past_name}_latest-model".
     checkpoint_filename : str
-        - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+        - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
     """
     entity: str 예: 'jksg01019-naver-labs'
     project: str 예: 'Diffusion-Planner'
     """
     artifact_wandb_path = f"{entity}/{project}/{collection_name}:{resume_alias}"
-    print(f"[WANDB->로컬] 아티팩트 경로에서 가져오는 중: {artifact_wandb_path}")
+    print(f"[WANDB->local] loading from artifact_wandb_path: {artifact_wandb_path}")
     artifact = api.artifact(artifact_wandb_path, type='model')
 
     source_run = artifact.logged_by()
     if 'save_path' not in source_run.config:
-        raise ValueError("원본 Run의 config에 'save_path'가 없습니다.")
+        raise ValueError("NO save path in WANDB run config")
 
     # "./training_log/feasible_full_time_use_vel_gpu_2_exp_A/2025-12-06-06:56:58/"
     past_save_path = source_run.config['save_path']
-    print(f"[WANDB->로컬] 원본 Run의 config에서 save_path를 찾았습니다: {past_save_path}")
+    print(f"[WANDB->local] find save_path in WANDB run config past_save_path: {past_save_path}")
     if args.save_path is None:  #
         experiment_is_same = args.name == args.past_name
         assert experiment_is_same, (
-            "args.save_path가 None인 경우, args.name과 args.past_name이 같아야 합니다.")
+            "args.save_path None -> , args.name과 args.past_name should be same.")
         assert args.resume_wandb_model_name is not None, (
             "args.resume_wandb_model_name must be set when resuming the same experiment."
         )
@@ -5012,7 +5012,7 @@ def _download_wandb_checkpoint_to_local(
         download_run.finish()
 
         print(
-            f"[WANDB->로컬] 아티팩트 '{artifact_wandb_path}'을(를) {artifact_dir_past}에 다운로드했습니다. 참고, past_save_path: {past_save_path}")
+            f"[WANDB->local] artifact_wandb_path '{artifact_wandb_path}'-> artifact_dir_past {artifact_dir_past} [download]. FYI, past_save_path: {past_save_path}")
 
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
@@ -5022,18 +5022,18 @@ def _download_wandb_checkpoint_to_local(
         """
 
         if os.path.exists(target_local_ckpt_path):
-            print(f"[로컬->로컬] 기존 파일 '{target_local_ckpt_path}'가 존재하여 삭제하고 새로 다운로드합니다.")
+            print(f"[local->local] target_local_ckpt_path '{target_local_ckpt_path}' already exist so delete and re download .")
             os.remove(target_local_ckpt_path)
         src_ckpt_path_past = os.path.join(artifact_dir_past,
                                           checkpoint_filename)
         if os.path.exists(src_ckpt_path_past):
             shutil.copy2(src_ckpt_path_past, target_local_ckpt_path)
             print(
-                f"[로컬->로컬] 체크포인트 파일을 복사했습니다: {src_ckpt_path_past} -> {target_local_ckpt_path}"
+                f"[local->local] copy checkpoint: src_ckpt_path_past {src_ckpt_path_past} -> target_local_ckpt_path {target_local_ckpt_path}"
             )
         else:
             raise FileNotFoundError(
-                f"[로컬->로컬] 다운로드된 아티팩트에서 체크포인트 파일을 찾을 수 없습니다: {src_ckpt_path_past}")
+                f"[local->local] cannot find checkpoint in downloaded artifact src_ckpt_path_past: {src_ckpt_path_past}")
 
         # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
         for tag in ("latest", "best"):
@@ -5068,8 +5068,8 @@ def _download_wandb_checkpoint_to_local(
             if os.path.isdir(save_path_tag_dir):
                 shutil.rmtree(save_path_tag_dir)
             shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
-            print("[로컬->로컬] DeepSpeed 체크포인트 디렉터리를 복사했습니다: "
-                  f"{artifact_tag_dir_past} -> {save_path_tag_dir}")
+            print("[local->local] COpy DeepSpeed checkpoint directory: "
+                  f"artifact_tag_dir_past   {artifact_tag_dir_past} -> save_path_tag_dir  {save_path_tag_dir}")
 
         if not os.path.exists(target_local_ckpt_path):
             downloaded_files = []
@@ -5081,25 +5081,25 @@ def _download_wandb_checkpoint_to_local(
                                               artifact_dir_past)
                         downloaded_files.append(rel)
             raise FileNotFoundError(
-                f"[로컬->로컬] 다운로드된 아티팩트에서 '{checkpoint_filename}'을(를) 찾을 수 없습니다: "
-                f"artifact_dir_past={artifact_dir_past}. 예시 파일들: {downloaded_files[:10]}"
+                f"[local->local] cannot find checkpoint_filename   '{checkpoint_filename}' from downloaded artifact: "
+                f"artifact_dir_past={artifact_dir_past}. example files: {downloaded_files[:10]}"
             )
     else:
         # rank 0이 다운로드해서 파일이 생길 때까지 대기
         print(
-            f"rank {rank}는 다운로드하지 않고, 체크포인트 생성 대기 중: {target_local_ckpt_path}")
+            f"rank {rank} is waiting for creating checkpoint: target_local_ckpt_path {target_local_ckpt_path}")
         waited_seconds = 0
         max_wait_seconds = 600  # 10분 정도 대기 (필요하면 조정)
 
         while not os.path.exists(target_local_ckpt_path):
             if waited_seconds >= max_wait_seconds:
                 raise TimeoutError(
-                    f"rank 0이 {max_wait_seconds}초 안에 체크포인트를 준비하지 못했습니다: {target_local_ckpt_path}"
+                    f"rank 0이 {max_wait_seconds}second fail: target_local_ckpt_path {target_local_ckpt_path}"
                 )
             time.sleep(1)
             waited_seconds += 1
 
-        print(f"rank {rank}에서 이미 다운로드된 체크포인트를 확인했습니다: {target_local_ckpt_path}")
+        print(f"rank {rank}에서 이미 다운로드된 체크포인트를 확인했습니다: target_local_ckpt_path {target_local_ckpt_path}")
 
 
 def _get_save_path(args: argparse.Namespace, global_rank: int) -> None:
@@ -5192,7 +5192,7 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
         collection_name : str
             - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
         checkpoint_filename : str
-            - 로컬에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+            - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
         """
         resume_alias, collection_name, checkpoint_filename = \
             _determine_wandb_artifact_config(args)
