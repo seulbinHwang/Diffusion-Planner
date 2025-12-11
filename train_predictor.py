@@ -5006,7 +5006,6 @@ def _download_wandb_checkpoint_to_local(
         save_path: ./training_log/.../2025-12-06-06:56:58/
         artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
         """
-        # TODO: 아래코드가 -> past_save_path 에 이미 파일이 있으면, 어떻게 되려나? 덮어쓰려나?
         artifacts_root = os.path.join(past_save_path, "artifacts")
         artifact_dir_past = artifact_for_download.download(root=artifacts_root)
 
