@@ -4896,31 +4896,7 @@ def _determine_wandb_artifact_config(
     return resume_alias, collection_name, checkpoint_filename
 
 
-def _get_wandb_entity_and_project_for_resume(
-    args: argparse.Namespace,) -> Tuple[str, str]:
-    """W&B에서 아티팩트를 가져오기 위해 entity / project 정보를 얻는다.
 
-    처리 내용:
-      - 임시 W&B Run 을 하나 만든 뒤,
-        그 Run 에서 entity, project 값을 읽고 바로 종료한다.
-      - 이때 args.name 은 임시 Run 이름에만 사용되며,
-        모델 학습용 Run 과는 별개이다.
-
-    Returns:
-        entity: str
-            - 예: 'jksg01019-naver-labs'
-        project: str
-            - 예: 'Diffusion-Planner'
-    """
-    temp_run_for_context = wandb.init(
-        project="Diffusion-Planner",
-        name=f"temp_api_run_{args.name}",
-        job_type="api_access",
-    )
-    entity = temp_run_for_context.entity
-    project = temp_run_for_context.project
-    temp_run_for_context.finish()
-    return entity, project
 
 
 def _download_wandb_checkpoint_to_local(
@@ -4980,29 +4956,11 @@ def _download_wandb_checkpoint_to_local(
     target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
     if rank == 0:
         os.makedirs(past_save_path, exist_ok=True)
-        download_run = wandb.init(
-            project=project,
-            name=
-            f"resume_run_download_{collection_name}",  # f"{args.name}_latest-model".
-            resume="allow",
-        )
-        artifact_for_download = download_run.use_artifact(
-            artifact,
-            aliases=[resume_alias],  # resume_alias: latest / best
-        )
-
-        # artifact_dir_past = past_save_path (폴더 경로) : 예전에 저장했던 곳에 그대로 저장.
-        """
-        save_path: ./training_log/.../2025-12-06-06:56:58/
-        artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts
-        """
         artifacts_root = os.path.join(past_save_path, "artifacts")
-        artifact_dir_past = artifact_for_download.download(root=artifacts_root)
-
+        artifact_dir_past = artifact.download(root=artifacts_root)
         print(
-            f"[WANDB->local] artifact_wandb_path '{artifact_wandb_path}' -> artifact_dir_past {artifact_dir_past} [download]. "
+            f"[WANDB->local] {artifact_wandb_path} -> {artifact_dir_past} [download]. "
             f"FYI, past_save_path: {past_save_path}")
-        download_run.finish()
 
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
@@ -5205,8 +5163,8 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
     project: str 예: 'Diffusion-Planner'
     """
     try:
-        entity, project = _get_wandb_entity_and_project_for_resume(args)
-
+        entity = args.entity
+        project = args.project
         _download_wandb_checkpoint_to_local(
             args,
             api=api,
