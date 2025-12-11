@@ -56,6 +56,8 @@ import math
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", line_buffering=True)
 except Exception:
     pass
 
@@ -5010,7 +5012,7 @@ def _download_wandb_checkpoint_to_local(
         download_run.finish()
 
         print(
-            f"[WANDB->로컬] 아티팩트 '{artifact_wandb_path}'을(를) {artifact_dir_past}에 다운로드했습니다.")
+            f"[WANDB->로컬] 아티팩트 '{artifact_wandb_path}'을(를) {artifact_dir_past}에 다운로드했습니다. 참고, past_save_path: {past_save_path}")
 
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
