@@ -3018,7 +3018,8 @@ class StaticFusionEncoder(nn.Module):
             static_encoding = static_encoding + touch * 0.0
         hidden_dim = static_encoding.shape[-1]
         static_encoding = static_encoding.reshape(
-            B, static_objects_num, hidden_dim)  # (B, static_objects_num, hidden_dim)
+            B, static_objects_num,
+            hidden_dim)  # (B, static_objects_num, hidden_dim)
         mask_p = mask_p.reshape(B,
                                 static_objects_num)  # (B, static_objects_num)
         return static_encoding, mask_p, static_feature

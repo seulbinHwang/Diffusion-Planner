@@ -1972,7 +1972,6 @@ def _scale_learning_rate_and_epochs(
     args.train_epochs = int(scaled_epochs)
     args.warm_up_epoch = int(warm_up_epoch * scale_epoch_factor)
 
-
     return BASE_GLOBAL_BATCH, current_global_batch
 
 
@@ -2110,7 +2109,8 @@ def _compute_warmup_steps(
     warmup_steps_at_B0 = steps_per_epoch_at_B0 * warm_up_epoch
 
     # 현재 글로벌 배치에서의 epoch당 step 수
-    steps_per_epoch_current = math.ceil(total_data_num / float(current_global_batch))
+    steps_per_epoch_current = math.ceil(total_data_num /
+                                        float(current_global_batch))
 
     # warm_up_epoch 만큼의 epoch 동안 워밍업이 지속되도록 step 수를 정의
     warmup_steps = steps_per_epoch_current * warm_up_epoch
@@ -2624,7 +2624,8 @@ def _save_deepspeed_checkpoint_for_epoch(
         raise ValueError(f"_save_deepspeed_checkpoint_for_epoch 는 "
                          f"use_deepspeed=True 및 유효한 save_path 가 필요합니다.")
     if not hasattr(diffusion_planner, "save_checkpoint"):
-        raise ValueError(f"diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
+        raise ValueError(
+            f"diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
     # EMA 상태 dict 준비 (없으면 None)
     ema_state_dict: Optional[Dict[str, Any]] = None
     if model_ema is not None:
@@ -2880,79 +2881,129 @@ def _update_deepspeed_optimizer_param_group_meta(
         pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
 
 
-def _resume_from_deepspeed_checkpoint_format(
-    diffusion_planner: nn.Module,
-    model_ema: Optional[ModelEma],
-    save_path: str,
-    global_rank: int,
-    load_optimizer_states: bool = True,
-    load_lr_scheduler_states: bool = True,
-) -> Tuple[int, Optional[str], Optional[ModelEma]]:
-    """DeepSpeed 형식(checkpoint 디렉터리 구조)으로 저장된 체크포인트를 로드한다.
-
-    처리 흐름:
-      1) diffusion_planner.load_checkpoint(save_path, tag="latest", ...) 를 호출해
-         엔진 내부의 모델/옵티마이저/스케줄러 상태를 복원한다.
-         - load_optimizer_states / load_lr_scheduler_states 가 False 이면
-           모델(및 EMA)만 읽고 optimizer/scheduler 상태는 그대로 둔다.
-      2) client_state 딕셔너리에서
-         - epoch (shape: ())
-         - wandb_id (str 또는 None)
-         - ema_state_dict (있다면 EMA 모델 파라미터 state_dict)
-         를 꺼낸다.
-      3) model_ema 가 있을 경우 ema_state_dict 를 EMA 모델에 load_state_dict 하고,
-         eval 모드 + requires_grad=False 로 고정한다.
-      4) diffusion_planner.optimizer.param_groups 에 "lr_max"/"wd_max" 필드를 채워준다.
+def _select_latest_like_tag(save_path: str) -> str:
+    """DeepSpeed 체크포인트 루트에서 'latest'가 들어간 하위 폴더 이름을 고른다.
 
     Args:
-        diffusion_planner (nn.Module):
-            deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
-        model_ema (Optional[ModelEma]):
-            EMA 래퍼 또는 None.
-        save_path (str):
-            DeepSpeed checkpoint 가 들어 있는 디렉터리 경로.
-        global_rank (int):
-            전체 프로세스 기준 rank. 0 일 때만 주요 로그를 출력한다.
-        load_optimizer_states (bool):
-            True 이면 optimizer 상태까지 같이 불러온다.
-            False 이면 모델/EMA만 복원하고 optimizer 상태는 그대로 둔다.
-        load_lr_scheduler_states (bool):
-            True 이면 scheduler 상태까지 같이 불러온다.
-            False 이면 scheduler 상태는 그대로 둔다.
+        save_path (str): 체크포인트 루트 디렉터리 경로.
 
     Returns:
-        Tuple[int, Optional[str], Optional[ModelEma]]:
-            - init_epoch: 재개 시작 epoch 인덱스(0 기반). shape: ()
-            - wandb_id: W&B run id 또는 None.
-            - model_ema: EMA 상태가 복원된 ModelEma (또는 원래 None).
+        str: tag로 사용할 폴더 이름. 후보가 없으면 기본값 'latest'.
+
+    Raises:
+        RuntimeError: 디렉터리 목록을 읽는 도중 OS 오류가 발생한 경우.
+    """
+    tag: str = "latest"
+    if os.path.isdir(save_path):
+        try:
+            candidate_tags = [
+                d for d in os.listdir(save_path)
+                if os.path.isdir(os.path.join(save_path, d)) and "latest" in d
+            ]
+        except OSError as e:
+            raise RuntimeError(
+                f"[DeepSpeed] 체크포인트 디렉터리 목록을 읽는 중 오류 발생: {save_path}, {e}"
+            ) from e
+
+        if candidate_tags:
+            # 이름에 'latest'가 들어간 폴더들 중 정렬 기준 첫 번째 사용
+            tag = sorted(candidate_tags)[0]
+
+    return tag
+
+
+def _load_deepspeed_checkpoint_with_compat(
+    diffusion_planner: nn.Module,
+    save_path: str,
+    tag: str,
+    load_optimizer_states: bool,
+    load_lr_scheduler_states: bool,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """DeepSpeedEngine.load_checkpoint 를 버전 차이를 고려해 호출한다.
+
+    Args:
+        diffusion_planner (nn.Module): DeepSpeed 엔진 객체.
+        save_path (str): 체크포인트 루트 디렉터리 경로.
+        tag (str): 불러올 태그(폴더) 이름. 예: 'latest_epoch-000010'.
+        load_optimizer_states (bool): 옵티마 상태를 함께 불러올지 여부.
+        load_lr_scheduler_states (bool): 스케줄러 상태를 함께 불러올지 여부.
+
+    Returns:
+        Tuple[str, Optional[Dict[str, Any]]]:
+            - load_path (str): 실제로 사용된 체크포인트 디렉터리 경로.
+            - client_state (Optional[Dict[str, Any]]): epoch, loss, wandb_id,
+              ema_state_dict 등을 담는 작은 상태 dict. 없으면 None.
     """
     try:
+        """
+load_path: str
+    실제로 로드에 사용된 체크포인트 디렉터리 경로.
+    보통 save_path/tag 에 해당하는 문자열 
+    (예: /.../training_log/.../latest_epoch-000010)
+
+client_state: Optional[Dict[str, Any]]
+    save_checkpoint 때 넘겨준 client_state 그대로 돌아온 dict.
+    epoch, loss, wandb_id, ema_state_dict 가 그 안에 들어있음
+    ( client_state 내용을 포함한 메타 정보를 별도의 
+    체크포인트 파일(예: mp_rank_00_model_states.pt 안의 딕셔너리 키)로 같이 저장해 둔다. )
+        """
         load_path, client_state = diffusion_planner.load_checkpoint(
             save_path,
-            tag="latest",
+            tag=tag,
             load_optimizer_states=load_optimizer_states,
             load_lr_scheduler_states=load_lr_scheduler_states,
         )
     except TypeError:
         # 오래된 DeepSpeed 버전(해당 인자 미지원) 대비 fallback
+        raise TypeError("사용 중인 DeepSpeed 버전이 너무 오래되었습니다. "
+                        "최신 버전으로 업그레이드해 주세요.")
         load_path, client_state = diffusion_planner.load_checkpoint(
             save_path,
-            tag="latest",
+            tag=tag,
         )
+    return load_path, client_state
 
-    if global_rank == 0:
-        print(f"[DeepSpeed] load_checkpoint returned path={load_path}, "
-              f"client_state keys={list((client_state or {}).keys())}")
 
-    client_state = client_state or {}
-    init_epoch: int = int(client_state.get("epoch", 0))
-    wandb_id: Optional[str] = client_state.get("wandb_id", None)
+def _restore_ema_and_model_from_client_state_for_deepspeed(
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    client_state: Dict[str, Any],
+    global_rank: int,
+    load_ema_for_model: bool,
+    load_ema_for_ema_model: bool,
+) -> Optional[ModelEma]:
+    """client_state 정보를 이용해 EMA와 (필요하다면) 모델 가중치를 복원한다.
 
-    # EMA 복원
-    ema_state_dict = client_state.get("ema_state_dict", None)
-    if (model_ema is not None) and (ema_state_dict is not None):
+    Args:
+        diffusion_planner (nn.Module): DeepSpeed 엔진 객체.
+        model_ema (Optional[ModelEma]): EMA 래퍼. 없으면 None.
+        client_state (Dict[str, Any]): 체크포인트에 저장된 작은 상태 dict.
+            - client_state.get("ema_state_dict"): Dict[str, Tensor]
+              각 텐서의 shape 는 원본 모델 파라미터와 동일
+              (예: (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등).
+
+            save_checkpoint 때 넘겨준 client_state 그대로 돌아온 dict.
+            epoch, loss, wandb_id, ema_state_dict 가 그 안에 들어있음
+            ( client_state 내용을 포함한 메타 정보를 별도의
+            체크포인트 파일(예: mp_rank_00_model_states.pt 안의 딕셔너리 키)로 같이 저장해 둔다. )
+
+        global_rank (int): 전역 rank. 0일 때만 로그를 출력한다.
+
+    Returns:
+        Optional[ModelEma]: EMA 상태가 반영된 ModelEma 또는 None.
+    """
+    ema_state_dict: Optional[Dict[str, Any]] = client_state.get(
+        "ema_state_dict", None)
+
+    # 1) EMA 객체가 있고, ema_state_dict 가 있으면 EMA 가중치 복원
+    if load_ema_for_ema_model:
+        assert (model_ema is not None) and (ema_state_dict is not None), \
+            "[DeepSpeed] EMA 모델 복원을 위해서는 model_ema 와 ema_state_dict 가 둘 다 필요합니다."
         try:
             ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
+            # ema_model.state_dict() 의 각 텐서 shape:
+            #   (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW) 등
             ema_model.load_state_dict(ema_state_dict, strict=False)
             ema_model.eval()
             for p in ema_model.parameters():
@@ -2962,13 +3013,10 @@ def _resume_from_deepspeed_checkpoint_format(
         except Exception as e:
             if global_rank == 0:
                 print(f"[DeepSpeed] EMA state load 실패: {e}")
-    # === [NEW] model-only 모드에서는 base model도 EMA weight로 초기화 ===
-    # load_optimizer_states=False & load_lr_scheduler_states=False 라면
-    # resume_model_only=True에서 호출된 경우로 볼 수 있다.
-    # TODO: ema 를 model weight로 불러오고 싶은 경우가 언제인지 명확히 규정필요
-    prefer_ema_for_model_only = (not load_optimizer_states) and (
-        not load_lr_scheduler_states)
-    if prefer_ema_for_model_only and (ema_state_dict is not None):
+
+    if load_ema_for_model:
+        assert ema_state_dict is not None, \
+            "[DeepSpeed]  EMA→base_model 초기화를 위해서는 ema state_dict 가 필요합니다."
         try:
             base_model: nn.Module = getattr(diffusion_planner, "module",
                                             diffusion_planner)
@@ -2988,7 +3036,77 @@ def _resume_from_deepspeed_checkpoint_format(
                 )
         except Exception as e:
             if global_rank == 0:
+                print(f"... 실패: {e}")
+            raise RuntimeError("[DeepSpeed] model-only 모드에서 "
+                               "EMA→base_model 초기화 중 오류 발생") from e
+            if global_rank == 0:
                 print(f"[DeepSpeed] EMA→base_model 초기화 실패: {e}")
+
+    return model_ema
+
+
+def _resume_from_deepspeed_checkpoint_format(
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    save_path: str,
+    global_rank: int,
+    load_optimizer_states: bool = True,
+    load_lr_scheduler_states: bool = True,
+    load_ema_for_model: bool = True,
+    load_ema_for_ema_model: bool = True,
+) -> Tuple[int, Optional[str], Optional[ModelEma]]:
+    """DeepSpeed 형식으로 저장된 체크포인트를 읽어와 학습을 이어갈 준비를 한다.
+
+    Args:
+        diffusion_planner (nn.Module): DeepSpeed 엔진 객체.
+        model_ema (Optional[ModelEma]): EMA 래퍼. 없으면 None.
+        save_path (str): 체크포인트 루트 디렉터리 경로.
+        global_rank (int): 전역 rank. 0일 때만 로그를 출력한다.
+        load_optimizer_states (bool): 옵티마 상태를 함께 불러올지 여부.
+        load_lr_scheduler_states (bool): 스케줄러 상태를 함께 불러올지 여부.
+
+    Returns:
+        Tuple[int, Optional[str], Optional[ModelEma]]:
+            - init_epoch (int): 재개할 epoch 인덱스(0 기반).
+            - wandb_id (Optional[str]): 이어서 사용할 W&B run id 또는 None.
+            - model_ema (Optional[ModelEma]): EMA 상태가 반영된 EMA 래퍼 또는 None.
+    """
+    # 0) tag 자동 선택: save_path 하위 폴더 중 이름에 "latest"가 포함된 디렉터리들 중
+    #    정렬 기준 첫 번째 것을 tag로 사용. 없으면 기본값 "latest".
+    tag: str = _select_latest_like_tag(save_path)
+
+    if global_rank == 0:
+        print(
+            f"[DeepSpeed] load_checkpoint: save_path={save_path}, tag='{tag}'")
+
+    # 1) DeepSpeedEngine.load_checkpoint 호출 (신/구 버전 둘 다 지원)
+    load_path, client_state = _load_deepspeed_checkpoint_with_compat(
+        diffusion_planner=diffusion_planner,
+        save_path=save_path,
+        tag=tag,
+        load_optimizer_states=load_optimizer_states,
+        load_lr_scheduler_states=load_lr_scheduler_states,
+    )
+
+    if global_rank == 0:
+        print(f"[DeepSpeed] load_checkpoint returned path={load_path}, "
+              f"client_state keys={list((client_state or {}).keys())}")
+
+    # client_state 가 None 인 경우에도 이후 로직이 동일하게 동작하도록 빈 dict 로 대체
+    client_state = client_state or {}
+    init_epoch: int = int(client_state.get("epoch", 0))
+    wandb_id: Optional[str] = client_state.get("wandb_id", None)
+
+    # EMA 및 (필요 시) base model 복원
+    model_ema = _restore_ema_and_model_from_client_state_for_deepspeed(
+        diffusion_planner=diffusion_planner,
+        model_ema=model_ema,
+        client_state=client_state,
+        global_rank=global_rank,
+        load_ema_for_model=load_ema_for_model,
+        load_ema_for_ema_model=load_ema_for_ema_model,
+    )
+
     # DeepSpeed 엔진 내부 옵티마 param_group 메타 보정
     _update_deepspeed_optimizer_param_group_meta(diffusion_planner)
 
@@ -3468,8 +3586,13 @@ def _resume_from_checkpoint_with_deepspeed(
                 global_rank=global_rank,
                 load_optimizer_states=not resume_model_only,
                 load_lr_scheduler_states=not resume_model_only,
+                load_ema_for_model=args.load_ema_for_model,
+                load_ema_for_ema_model=args.load_ema_for_ema_model,
             )
     else:
+        raise ValueError(
+            "The save_path does not contain a valid DeepSpeed checkpoint directory."
+        )
         # PyTorch latest.pth → DeepSpeed 엔진으로 로드 (모델/EMA만)
         init_epoch_loaded, wandb_id_loaded, model_ema = \
             _resume_deepspeed_from_pytorch_checkpoint(
@@ -3875,8 +3998,8 @@ def _log_wandb_checkpoint_artifacts(
     train_total_loss: float,
     save_best: bool,
     use_deepspeed: bool,
-        tag_latest: Optional[str],
-        tag_best: Optional[str],
+    tag_latest: Optional[str],
+    tag_best: Optional[str],
 ) -> None:
     """한 epoch가 끝난 뒤 로컬 체크포인트를 W&B 아티팩트로 올린다.
 
@@ -3975,7 +4098,7 @@ def _log_wandb_checkpoint_artifacts(
         )
 
 
-def _log_and_save_on_rank0(
+def _log_and_save(
     epoch: int,
     args: argparse.Namespace,
     train_total_loss: float,
@@ -4065,7 +4188,6 @@ def _log_and_save_on_rank0(
     if global_rank == 0:
         wandb_logger.log_metrics(metrics, step=epoch + 1)
 
-
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
     save_interval: int = max(1, int(getattr(args, "save_utd", 1)))
     is_first_epoch: bool = (epoch == 0)
@@ -4110,17 +4232,15 @@ def _log_and_save_on_rank0(
         if global_rank == 0:
             print(f"Model saved in {args.save_path}\n")
 
-
     # 5) W&B 아티팩트 업로드
     if global_rank == 0:
-        _log_wandb_checkpoint_artifacts(
-            args=args,
-            epoch=epoch,
-            train_total_loss=train_total_loss,
-            save_best=save_best,
-            use_deepspeed=use_deepspeed,
-            tag_latest=tag_latest, tag_best=tag_best
-        )
+        _log_wandb_checkpoint_artifacts(args=args,
+                                        epoch=epoch,
+                                        train_total_loss=train_total_loss,
+                                        save_best=save_best,
+                                        use_deepspeed=use_deepspeed,
+                                        tag_latest=tag_latest,
+                                        tag_best=tag_best)
 
     return best_loss
 
@@ -4383,7 +4503,7 @@ def _run_training_loop(
            elapsed_training_time_hour)
          를 구성한 뒤,
          prefix("info_dict/", "loss_dict/" 등)을 붙여 하나의 metrics dict 로 합친다.
-      4) rank 0 프로세스에서만 _log_and_save_on_rank0(...) 을 호출해
+      4) rank 0 프로세스에서만 _log_and_save(...) 을 호출해
          - W&B / TensorBoard 로 metrics 를 기록하고,
          - 주기적으로 checkpoint 를 저장하며,
          - best_loss 를 갱신한다.
@@ -4485,7 +4605,7 @@ def _run_training_loop(
         )
 
         # 4) rank 0에서 로그 및 체크포인트/아티팩트 저장
-        best_loss = _log_and_save_on_rank0(
+        best_loss = _log_and_save(
             epoch=epoch,
             args=args,
             train_total_loss=train_total_loss,
@@ -4849,11 +4969,11 @@ def _download_wandb_checkpoint_to_local(
             "args.resume_wandb_model_name must be set when resuming the same experiment."
         )
         args.save_path = past_save_path
-    os.makedirs(past_save_path, exist_ok=True)
 
     # target_local_ckpt_path: ./training_log/.../2025-12-06-06:56:58/latest.pth
     target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
     if rank == 0:
+        os.makedirs(past_save_path, exist_ok=True)
         download_run = wandb.init(
             project=project,
             name=
@@ -4870,6 +4990,8 @@ def _download_wandb_checkpoint_to_local(
         save_path: ./training_log/.../2025-12-06-06:56:58/
         artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
         """
+        # TODO: 아래코드가 -> past_save_path 에 이미 파일이 있으면, 어떻게 되려나? 덮어쓰려나?
+
         artifact_dir_past = artifact_for_download.download(root=past_save_path)
         download_run.finish()
 
@@ -4893,6 +5015,9 @@ def _download_wandb_checkpoint_to_local(
             print(
                 f"체크포인트 파일을 복사했습니다: {src_ckpt_path_past} -> {target_local_ckpt_path}"
             )
+        else:
+            raise FileNotFoundError(
+                f"다운로드된 아티팩트에서 체크포인트 파일을 찾을 수 없습니다: {src_ckpt_path_past}")
 
         # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
         for tag in ("latest", "best"):
@@ -4901,14 +5026,34 @@ def _download_wandb_checkpoint_to_local(
             artifact_tag_dir_past : ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/latest/
             save_path_tag_dir : ./training_log/.../2025-12-06-06:56:58/latest/
             """
-            artifact_tag_dir_past = os.path.join(artifact_dir_past, tag)
-            if os.path.isdir(artifact_tag_dir_past):
-                save_path_tag_dir = os.path.join(args.save_path, tag)
-                if os.path.isdir(save_path_tag_dir):
-                    shutil.rmtree(save_path_tag_dir)
-                shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
-                print("DeepSpeed 체크포인트 디렉터리를 복사했습니다: "
-                      f"{artifact_tag_dir_past} -> {save_path_tag_dir}")
+            """
+            artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+            안에서, 이름에 tag가 포함된 서브 폴더를 찾는다.
+            예: latest_epoch-000001, best_epoch-000010 등
+            """
+            if not os.path.isdir(artifact_dir_past):
+                continue
+
+            # tag 문자열이 포함된 서브 디렉터리들 후보
+            candidate_dirs = [
+                d for d in os.listdir(artifact_dir_past) if
+                os.path.isdir(os.path.join(artifact_dir_past, d)) and tag in d
+            ]
+            if not candidate_dirs:
+                continue
+
+            # 첫 번째(정렬 기준) 후보를 최종 tag 디렉터리 이름으로 사용
+            chosen_dir_name = sorted(candidate_dirs)[0]
+
+            artifact_tag_dir_past = os.path.join(artifact_dir_past,
+                                                 chosen_dir_name)
+            save_path_tag_dir = os.path.join(args.save_path, chosen_dir_name)
+
+            if os.path.isdir(save_path_tag_dir):
+                shutil.rmtree(save_path_tag_dir)
+            shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
+            print("DeepSpeed 체크포인트 디렉터리를 복사했습니다: "
+                  f"{artifact_tag_dir_past} -> {save_path_tag_dir}")
 
         if not os.path.exists(target_local_ckpt_path):
             downloaded_files = []

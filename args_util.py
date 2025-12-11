@@ -382,6 +382,8 @@ def get_args():
                         default='cuda')
 
     parser.add_argument('--use_ema', default=True, type=boolean)
+    parser.add_argument('--load_ema_for_model', default=True, type=boolean)
+    parser.add_argument('--load_ema_for_ema_model', default=True, type=boolean)
     parser.add_argument('--remove_existing_wb_weight',
                         default=False,
                         type=boolean)
