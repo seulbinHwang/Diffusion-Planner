@@ -3797,6 +3797,104 @@ def _train_one_epoch(
     epoch_elapsed_time_sec = time.perf_counter() - epoch_t0
     return train_loss, train_total_loss, epoch_elapsed_time_sec
 
+TEMP_WANDB_ROOT_DIR: str = "/mnt/temp_wandb"
+
+
+def _copy_file_to_temp_wandb(
+    src_file_path: str,
+    temp_root_dir: str,
+    dst_file_name: Optional[str] = None,
+) -> Optional[str]:
+    """W&B 업로드 전에 원본 파일을 로컬 임시 디렉터리로 복사한다.
+
+    Ceph(/mnt/nuplan) 경로에 있는 파일이라도
+    /mnt/temp_wandb 아래로 복사한 뒤,
+    W&B에는 이 로컬 경로만 넘기기 위한 용도다.
+
+    Args:
+        src_file_path (str):
+            원본 파일 경로.
+        temp_root_dir (str):
+            로컬 임시 루트 디렉터리 경로. 예: "/mnt/temp_wandb/latest".
+        dst_file_name (Optional[str]):
+            임시 디렉터리 안에서 사용할 파일 이름.
+            None이면 src_file_path의 basename을 그대로 사용한다.
+
+    Returns:
+        Optional[str]:
+            복사된 로컬 파일의 전체 경로.
+            복사 중 오류가 나면 None을 반환하고, 호출 측에서 건너뛰도록 한다.
+    """
+    if not os.path.exists(src_file_path):
+        print(f"[W&B TEMP] source file not found, skip copy: {src_file_path}")
+        return None
+
+    os.makedirs(temp_root_dir, exist_ok=True)
+
+    if dst_file_name is None:
+        dst_file_name = os.path.basename(src_file_path)
+
+    dst_file_path: str = os.path.join(temp_root_dir, dst_file_name)
+
+    try:
+        shutil.copy2(src_file_path, dst_file_path)
+        return dst_file_path
+    except Exception as copy_err:
+        print(
+            f"[W&B TEMP] file copy failed: {src_file_path} -> {dst_file_path}, "
+            f"error={copy_err}"
+        )
+        return None
+
+
+def _copy_dir_to_temp_wandb(
+    src_dir_path: str,
+    temp_root_dir: str,
+    dst_dir_name: Optional[str] = None,
+) -> Optional[str]:
+    """W&B 업로드 전에 원본 디렉터리를 로컬 임시 디렉터리로 복사한다.
+
+    DeepSpeed 체크포인트 디렉터리 같이
+    여러 파일로 이루어진 폴더를 그대로 W&B에 올리고 싶지만,
+    Ceph 경로를 직접 넘기고 싶지 않을 때 사용한다.
+
+    Args:
+        src_dir_path (str):
+            원본 디렉터리 경로.
+        temp_root_dir (str):
+            로컬 임시 루트 디렉터리 경로. 예: "/mnt/temp_wandb/latest".
+        dst_dir_name (Optional[str]):
+            임시 디렉터리 안에서 사용할 디렉터리 이름.
+            None이면 src_dir_path의 basename을 그대로 사용한다.
+
+    Returns:
+        Optional[str]:
+            복사된 로컬 디렉터리의 전체 경로.
+            복사 중 오류가 나면 None을 반환하고, 호출 측에서 건너뛰도록 한다.
+    """
+    if not os.path.isdir(src_dir_path):
+        print(f"[W&B TEMP] source dir not found, skip copy: {src_dir_path}")
+        return None
+
+    os.makedirs(temp_root_dir, exist_ok=True)
+
+    if dst_dir_name is None:
+        dst_dir_name = os.path.basename(src_dir_path)
+
+    dst_dir_path: str = os.path.join(temp_root_dir, dst_dir_name)
+
+    try:
+        # 이미 있으면 깨끗하게 지우고 다시 만든다.
+        if os.path.exists(dst_dir_path):
+            shutil.rmtree(dst_dir_path)
+        shutil.copytree(src_dir_path, dst_dir_path)
+        return dst_dir_path
+    except Exception as copy_err:
+        print(
+            f"[W&B TEMP] dir copy failed: {src_dir_path} -> {dst_dir_path}, "
+            f"error={copy_err}"
+        )
+        return None
 
 def _log_wandb_checkpoint_artifacts(
     args: argparse.Namespace,
@@ -3815,15 +3913,8 @@ def _log_wandb_checkpoint_artifacts(
       latest.pth / best.pth 파일과 함께
       DeepSpeed가 만든 latest/ best 폴더(파라미터, 옵티마 포함)도 같이 올린다.
 
-    Args:
-        args: 학습 설정이 담긴 Namespace.
-        epoch: 현재 epoch 인덱스(0부터 시작). 기록용으로만 사용한다.
-        train_total_loss: 이번 epoch의 전체 손실 값.
-        save_best: best.pth를 새로 갱신했는지 여부.
-        use_deepspeed: DeepSpeed 모드 사용 여부.
-
-    Returns:
-        None: 파일 업로드만 수행한다.
+    W&B에는 항상 /mnt/temp_wandb 아래의 로컬 복사본 경로만 넘긴다.
+    업로드가 끝나면 /mnt/temp_wandb 전체를 삭제한다.
     """
     if args.save_path is None:
         return
@@ -3833,75 +3924,158 @@ def _log_wandb_checkpoint_artifacts(
         # W&B 런이 없으면 업로드 불가
         return
 
+    # ───────────────────────────────────────────────────────────
+    #  임시 로컬 디렉터리(/mnt/temp_wandb) 준비
+    #   - DDP라도 global_rank==0에서만 이 함수가 호출된다고 가정
+    #   - 매 호출마다 깨끗하게 날리고 새로 만든 뒤, 마지막에 정리
+    # ───────────────────────────────────────────────────────────
+    temp_root_dir: str = TEMP_WANDB_ROOT_DIR
+    try:
+        if os.path.isdir(temp_root_dir):
+            shutil.rmtree(temp_root_dir, ignore_errors=True)
+        os.makedirs(temp_root_dir, exist_ok=True)
+    except Exception as e:
+        # 임시 디렉터리를 만들 수 없으면 그냥 원래 로직으로 Ceph 경로를 넘긴다.
+        print(
+            f"[W&B TEMP] failed to prepare temp root dir '{temp_root_dir}', "
+            f"fallback to direct upload. error={e}"
+        )
+        temp_root_dir = ""  # 아래에서 temp 사용 여부 분기용
+
     # 디렉터리 이름에서 대략적인 시간 문자열을 뽑아서 메타데이터에 남긴다.
     base_dir_name = os.path.basename(os.path.normpath(args.save_path))
     time_str_meta = base_dir_name.replace(":", "-")
 
-    # ── latest-model 아티팩트 (매번 덮어쓰기) ──
-    latest_coll = f"{args.name}_latest-model"
-    latest_art = wandb.Artifact(
-        name=latest_coll,
-        type="model",
-        metadata={
-            "time_str": time_str_meta,
-            "epoch": epoch + 1,
-            "loss": float(train_total_loss),
-        },
-    )
-
-    latest_pth = os.path.join(args.save_path, "latest.pth")
-    if os.path.exists(latest_pth):
-        latest_art.add_file(latest_pth)
-
-    # DeepSpeed라면 latest 태그 디렉터리도 같이 넣어준다.
-    if use_deepspeed:
-        latest_tag_dir = os.path.join(args.save_path, tag_latest)
-        if os.path.isdir(latest_tag_dir):
-            # 아티팩트 안에서도 "latest/" 이름 그대로 보이도록 고정
-            latest_art.add_dir(latest_tag_dir, name=tag_latest)
-
-    wandb.log_artifact(latest_art, aliases=[tag_latest])
-    latest_art.wait()  # 업로드 완료 보장
-
-    # 학습 도중 이전 버전들을 지우고 싶을 때
-    if getattr(args, "delete_wb_weight_when_running", False):
-        _prune_old_wandb_artifact_versions(
-            collection_name=latest_coll,
-            alias="latest",
+    try:
+        # ── latest-model 아티팩트 (매번 덮어쓰기) ──
+        latest_coll = f"{args.name}_latest-model"
+        latest_art = wandb.Artifact(
+            name=latest_coll,
+            type="model",
+            metadata={
+                "time_str": time_str_meta,
+                "epoch": epoch + 1,
+                "loss": float(train_total_loss),
+            },
         )
 
-    # ── best-model 아티팩트 (새 best일 때만 갱신) ──
-    if not save_best:
-        return
-
-    best_coll = f"{args.name}_best-model"
-    best_art = wandb.Artifact(
-        name=best_coll,
-        type="model",
-        metadata={
-            "time_str": time_str_meta,
-            "epoch": epoch + 1,
-            "loss": float(train_total_loss),
-        },
-    )
-
-    best_pth = os.path.join(args.save_path, "best.pth")
-    if os.path.exists(best_pth):
-        best_art.add_file(best_pth)
-
-    if use_deepspeed:
-        best_tag_dir = os.path.join(args.save_path, tag_best)
-        if os.path.isdir(best_tag_dir):
-            best_art.add_dir(best_tag_dir, name=tag_best)
-
-    wandb.log_artifact(best_art, aliases=[tag_best])
-    best_art.wait()
-
-    if getattr(args, "delete_wb_weight_when_running", False):
-        _prune_old_wandb_artifact_versions(
-            collection_name=best_coll,
-            alias="best",
+        # latest용 임시 서브 디렉터리: /mnt/temp_wandb/latest
+        temp_latest_root_dir: Optional[str] = (
+            os.path.join(temp_root_dir, "latest") if temp_root_dir else None
         )
+
+        # 1) latest.pth 파일
+        latest_pth = os.path.join(args.save_path, "latest.pth")
+        if os.path.exists(latest_pth):
+            if temp_latest_root_dir is not None:
+                local_latest_pth = _copy_file_to_temp_wandb(
+                    src_file_path=latest_pth,
+                    temp_root_dir=temp_latest_root_dir,
+                    dst_file_name="latest.pth",
+                )
+                if local_latest_pth is not None:
+                    latest_art.add_file(local_latest_pth)
+            else:
+                # temp 디렉터리 준비 실패 시에는 기존 경로를 그대로 사용
+                latest_art.add_file(latest_pth)
+
+        # 2) DeepSpeed라면 latest 태그 디렉터리도 같이 넣어준다.
+        if use_deepspeed and tag_latest is not None:
+            latest_tag_dir = os.path.join(args.save_path, tag_latest)
+            if os.path.isdir(latest_tag_dir):
+                if temp_latest_root_dir is not None:
+                    local_latest_tag_dir = _copy_dir_to_temp_wandb(
+                        src_dir_path=latest_tag_dir,
+                        temp_root_dir=temp_latest_root_dir,
+                        dst_dir_name=tag_latest,
+                    )
+                    if local_latest_tag_dir is not None:
+                        # 아티팩트 안에서도 "tag_latest/" 이름 그대로 보이도록 고정
+                        latest_art.add_dir(local_latest_tag_dir,
+                                           name=tag_latest)
+                else:
+                    latest_art.add_dir(latest_tag_dir, name=tag_latest)
+
+        wandb.log_artifact(latest_art, aliases=["latest" if tag_latest is None else tag_latest])
+        latest_art.wait()  # 업로드 완료 보장
+
+        # 학습 도중 이전 버전들을 지우고 싶을 때
+        if getattr(args, "delete_wb_weight_when_running", False):
+            _prune_old_wandb_artifact_versions(
+                collection_name=latest_coll,
+                alias="latest",
+            )
+
+        # ── best-model 아티팩트 (새 best일 때만 갱신) ──
+        if not save_best:
+            return
+
+        best_coll = f"{args.name}_best-model"
+        best_art = wandb.Artifact(
+            name=best_coll,
+            type="model",
+            metadata={
+                "time_str": time_str_meta,
+                "epoch": epoch + 1,
+                "loss": float(train_total_loss),
+            },
+        )
+
+        # best용 임시 서브 디렉터리: /mnt/temp_wandb/best
+        temp_best_root_dir: Optional[str] = (
+            os.path.join(temp_root_dir, "best") if temp_root_dir else None
+        )
+
+        # 1) best.pth 파일
+        best_pth = os.path.join(args.save_path, "best.pth")
+        if os.path.exists(best_pth):
+            if temp_best_root_dir is not None:
+                local_best_pth = _copy_file_to_temp_wandb(
+                    src_file_path=best_pth,
+                    temp_root_dir=temp_best_root_dir,
+                    dst_file_name="best.pth",
+                )
+                if local_best_pth is not None:
+                    best_art.add_file(local_best_pth)
+            else:
+                best_art.add_file(best_pth)
+
+        # 2) DeepSpeed라면 best 태그 디렉터리도 같이 넣어준다.
+        if use_deepspeed and tag_best is not None:
+            best_tag_dir = os.path.join(args.save_path, tag_best)
+            if os.path.isdir(best_tag_dir):
+                if temp_best_root_dir is not None:
+                    local_best_tag_dir = _copy_dir_to_temp_wandb(
+                        src_dir_path=best_tag_dir,
+                        temp_root_dir=temp_best_root_dir,
+                        dst_dir_name=tag_best,
+                    )
+                    if local_best_tag_dir is not None:
+                        best_art.add_dir(local_best_tag_dir, name=tag_best)
+                else:
+                    best_art.add_dir(best_tag_dir, name=tag_best)
+
+        wandb.log_artifact(best_art, aliases=["best" if tag_best is None else tag_best])
+        best_art.wait()
+
+        if getattr(args, "delete_wb_weight_when_running", False):
+            _prune_old_wandb_artifact_versions(
+                collection_name=best_coll,
+                alias="best",
+            )
+
+    finally:
+        # ─────────────────────────────────────────────────────
+        #  업로드가 끝나면 /mnt/temp_wandb 전체를 정리
+        # ─────────────────────────────────────────────────────
+        if temp_root_dir:
+            try:
+                shutil.rmtree(temp_root_dir, ignore_errors=True)
+                print(f"[W&B TEMP] removed temp dir: {temp_root_dir}")
+            except Exception as e:
+                print(
+                    f"[W&B TEMP] failed to remove temp dir '{temp_root_dir}': {e}"
+                )
 
 
 def _log_and_save(
