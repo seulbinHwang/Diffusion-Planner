@@ -5007,13 +5007,16 @@ def _download_wandb_checkpoint_to_local(
         artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
         """
         # TODO: 아래코드가 -> past_save_path 에 이미 파일이 있으면, 어떻게 되려나? 덮어쓰려나?
+        artifacts_root = os.path.join(past_save_path, "artifacts")
+        os.makedirs(artifacts_root, exist_ok=True)
 
-        artifact_dir_past = artifact_for_download.download(root=past_save_path)
-        download_run.finish()
+        artifact_dir_past = artifact_for_download.download(root=artifacts_root)
 
         print(
-            f"[WANDB->local] artifact_wandb_path '{artifact_wandb_path}'-> artifact_dir_past {artifact_dir_past} [download]. FYI, past_save_path: {past_save_path}")
-
+            f"[WANDB->local] artifact_wandb_path '{artifact_wandb_path}' -> artifact_dir_past {artifact_dir_past} [download]. "
+            f"FYI, past_save_path: {past_save_path}"
+        )
+        download_run.finish()
         # 1) checkpoint 파일을 past_save_path 루트로 복사
         """
         checkpoint_filename: 'latest.pth' 또는 'best.pth'
