@@ -1,8 +1,8 @@
 # configs/stage3.yaml
-name: stage3
-past_name: stage2
+name: stage3_test
+past_name: stage2_test
 
-batch_size: 256
+batch_size: 8
 train_epochs: 1 #36 #360              # 234 + 90 + 36
 
 # Stage3: Stage1 max lr의 1/4에서 시작 → 1/5 근처까지 감소
