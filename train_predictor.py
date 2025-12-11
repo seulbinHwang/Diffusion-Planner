@@ -2674,13 +2674,13 @@ def _save_deepspeed_checkpoint_for_epoch(
     )
     return tag_latest, tag_best
 
-
 def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
     """주어진 경로가 DeepSpeed checkpoint 디렉터리인지 대략 판별한다.
 
     규칙(간단한 휴리스틱):
-      - save_path 안에 tag 디렉터리("latest" 또는 "best")가 있고
-      - 그 안에 "mp_rank_" 로 시작하는 하위 디렉터리가 있으면
+      - save_path 하위 폴더들 중 이름에 "latest" 또는 "best" 가 들어가는
+        디렉터리를 찾고
+      - 그 디렉터리 안에 "mp_rank_" 로 시작하는 하위 파일/디렉터리가 있으면
         DeepSpeed 가 저장한 구조라고 본다.
 
     Args:
@@ -2692,12 +2692,25 @@ def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
             True  → DeepSpeed 형식으로 저장된 디렉터리라고 판단.
             False → PyTorch 단일 .pth 형식이라고 보고 처리한다.
     """
-    latest_tag_dir = os.path.join(save_path, "latest")
-    best_tag_dir = os.path.join(save_path, "best")
+    if not os.path.isdir(save_path):
+        return False
 
-    for tag_dir in (latest_tag_dir, best_tag_dir):
-        if not os.path.isdir(tag_dir):
-            continue
+    try:
+        # save_path 하위의 1차 자식 디렉터리 목록
+        top_children = os.listdir(save_path)
+    except OSError:
+        return False
+
+    # 이름에 "latest" 또는 "best" 가 들어가는 하위 디렉터리만 후보로 사용
+    candidate_tag_dirs = []
+    for name in sorted(top_children):
+        if ("latest" in name) or ("best" in name):
+            full = os.path.join(save_path, name)
+            if os.path.isdir(full):
+                candidate_tag_dirs.append(full)
+
+    # 후보 tag 디렉터리들 중 하나라도 mp_rank_* 를 포함하면 DeepSpeed 형식으로 판단
+    for tag_dir in candidate_tag_dirs:
         try:
             children = os.listdir(tag_dir)
         except OSError:
@@ -2706,6 +2719,7 @@ def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
             # 예: mp_rank_00_model_states.pt, mp_rank_00/
             if name.startswith("mp_rank_"):
                 return True
+
     return False
 
 
