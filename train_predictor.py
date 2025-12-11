@@ -5039,12 +5039,12 @@ def _download_wandb_checkpoint_to_local(
         # 2) DeepSpeed용 latest / best 디렉터리도 있으면 같이 복사
         for tag in ("latest", "best"):
             """
-            artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
-            artifact_tag_dir_past : ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/latest/
+            artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/
+            artifact_tag_dir_past : ./training_log/.../2025-12-06-06:56:58/artifacts/latest/
             save_path_tag_dir : ./training_log/.../2025-12-06-06:56:58/latest/
             """
             """
-            artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+            artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/
             안에서, 이름에 tag가 포함된 서브 폴더를 찾는다.
             예: latest_epoch-000001, best_epoch-000010 등
             """
@@ -5074,7 +5074,7 @@ def _download_wandb_checkpoint_to_local(
             raise NotImplementedError("DeepSpeed checkpoint 복사 테스트 필요")
         if not os.path.exists(target_local_ckpt_path):
             downloaded_files = []
-            # artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/model-xxxxx/
+            # artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/
             if os.path.isdir(artifact_dir_past):
                 for root, dirs, files in os.walk(artifact_dir_past):
                     for name in files:
