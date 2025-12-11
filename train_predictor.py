@@ -2969,10 +2969,10 @@ client_state: Optional[Dict[str, Any]]
             load_optimizer_states=load_optimizer_states,
             load_lr_scheduler_states=load_lr_scheduler_states,
         )
+        print("[DeepSpeed LOAD CHECKPOINT] upload success with optimizer and scheduler states")
     except TypeError:
         # 오래된 DeepSpeed 버전(해당 인자 미지원) 대비 fallback
-        raise TypeError("사용 중인 DeepSpeed 버전이 너무 오래되었습니다. "
-                        "최신 버전으로 업그레이드해 주세요.")
+        raise TypeError("The DeepSpeed version you are using is too old. Please upgrade to the latest version.")
         load_path, client_state = diffusion_planner.load_checkpoint(
             save_path,
             tag=tag,
@@ -3015,7 +3015,7 @@ def _restore_ema_and_model_from_client_state_for_deepspeed(
     # 1) EMA 객체가 있고, ema_state_dict 가 있으면 EMA 가중치 복원
     if load_ema_for_ema_model:
         assert (model_ema is not None) and (ema_state_dict is not None), \
-            "[DeepSpeed 모델 파라미터 로드]EMA 모델 복원을 위해서는 model_ema 와 ema_state_dict 가 둘 다 필요합니다."
+            "[DeepSpeed LOAD MODEL PARAM] Restoring an EMA model requires both `model_ema` and `ema_state_dict`."
         try:
             ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
             # ema_model.state_dict() 의 각 텐서 shape:
@@ -3025,14 +3025,14 @@ def _restore_ema_and_model_from_client_state_for_deepspeed(
             for p in ema_model.parameters():
                 p.requires_grad_(False)
             if global_rank == 0:
-                print("[DeepSpeed 모델 파라미터 로드]EMA state load done")
+                print("[DeepSpeed LOAD MODEL PARAM]EMA state load done")
         except Exception as e:
             if global_rank == 0:
-                print(f"[DeepSpeed 모델 파라미터 로드]EMA state load 실패: {e}")
+                print(f"[DeepSpeed LOAD MODEL PARAM]EMA state load FAIL: {e}")
 
     if load_ema_for_model:
         assert ema_state_dict is not None, \
-            "[DeepSpeed 모델 파라미터 로드]  EMA→base_model 초기화를 위해서는 ema state_dict 가 필요합니다."
+            "[DeepSpeed LOAD MODEL PARAM] Initializing EMA → base_model requires an EMA `state_dict`."
         try:
             base_model: nn.Module = getattr(diffusion_planner, "module",
                                             diffusion_planner)
@@ -3041,22 +3041,21 @@ def _restore_ema_and_model_from_client_state_for_deepspeed(
             if global_rank == 0:
                 if getattr(incompatible, "missing_keys", None):
                     print(
-                        f"[DeepSpeed 모델 파라미터 로드] model-only(EMA) missing_keys: {incompatible.missing_keys}"
+                        f"[DeepSpeed LOAD MODEL PARAM] model-only(EMA) missing_keys: {incompatible.missing_keys}"
                     )
                 if getattr(incompatible, "unexpected_keys", None):
                     print(
-                        f"[DeepSpeed 모델 파라미터 로드] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}"
+                        f"[DeepSpeed LOAD MODEL PARAM] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}"
                     )
                 print(
-                    "[DeepSpeed 모델 파라미터 로드] model-only resume: base model initialized from EMA weights"
+                    "[DeepSpeed LOAD MODEL PARAM] model-only resume: base model initialized from EMA weights"
                 )
         except Exception as e:
             if global_rank == 0:
                 print(f"... 실패: {e}")
-            raise RuntimeError("[DeepSpeed 모델 파라미터 로드] model-only 모드에서 "
-                               "EMA→base_model 초기화 중 오류 발생") from e
+            raise RuntimeError("[DeepSpeed LOAD MODEL PARAM] Error occurred during EMA → base_model initialization in model-only mode.") from e
             if global_rank == 0:
-                print(f"[DeepSpeed 모델 파라미터 로드] EMA→base_model 초기화 실패: {e}")
+                print(f"[DeepSpeed LOAD MODEL PARAM] EMA→base_model 초기화 실패: {e}")
 
     return model_ema
 
@@ -3093,7 +3092,7 @@ def _resume_from_deepspeed_checkpoint_format(
 
     if global_rank == 0:
         print(
-            f"[DeepSpeed 모델 파라미터 로드] load_checkpoint: save_path={save_path}, tag='{tag}'")
+            f"[DeepSpeed LOAD MODEL PARAM] load_checkpoint: save_path={save_path}, tag='{tag}'")
 
     # 1) DeepSpeedEngine.load_checkpoint 호출 (신/구 버전 둘 다 지원)
     load_path, client_state = _load_deepspeed_checkpoint_with_compat(
@@ -3105,7 +3104,7 @@ def _resume_from_deepspeed_checkpoint_format(
     )
 
     if global_rank == 0:
-        print(f"[DeepSpeed 모델 파라미터 로드] load_checkpoint returned path={load_path}, "
+        print(f"[DeepSpeed LOAD MODEL PARAM] load_checkpoint returned load_path={load_path}, "
               f"client_state keys={list((client_state or {}).keys())}")
 
     # client_state 가 None 인 경우에도 이후 로직이 동일하게 동작하도록 빈 dict 로 대체
@@ -3450,7 +3449,7 @@ def _load_state_dict_into_base_and_ema_model_only(
     """
     incompatible = base_model.load_state_dict(state_dict, strict=False)
     if global_rank == 0:
-        print(f"[ModelOnly<Pytorch>] {source_name} state_dict 로 모델 파라미터 로드 완료 "
+        print(f"[ModelOnly<Pytorch>] {source_name} state_dict 로 LOAD MODEL PARAM 완료 "
               f"(ckpt_path={ckpt_path})")
         if getattr(incompatible, "missing_keys", None):
             print(
@@ -3834,7 +3833,7 @@ def _maybe_resume_from_checkpoint(
     resume_model_only: bool = bool(getattr(args, "resume_model_only", False))
 
     if args.resume_wandb_model_name is not None:
-        print(f"[모델 파라미터 로드] Model loaded from {args.save_path}")
+        print(f"[LOAD MODEL PARAM] Model loaded from {args.save_path}")
 
         # -------- DeepSpeed 경로 --------
         if use_deepspeed and hasattr(diffusion_planner, "load_checkpoint"):
@@ -5071,7 +5070,6 @@ def _download_wandb_checkpoint_to_local(
             shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
             print("[local->local] COpy DeepSpeed checkpoint directory: "
                   f"artifact_tag_dir_past   {artifact_tag_dir_past} -> save_path_tag_dir  {save_path_tag_dir}")
-            raise NotImplementedError("DeepSpeed checkpoint 복사 테스트 필요")
         if not os.path.exists(target_local_ckpt_path):
             downloaded_files = []
             # artifact_dir_past: ./training_log/.../2025-12-06-06:56:58/artifacts/
