@@ -1,6 +1,6 @@
 # configs/stage3.yaml
-name: stage3_test1
-past_name: stage2_test1
+name: stage3_test3
+past_name: stage2_test3
 
 batch_size: 8
 train_epochs: 1 #36 #360              # 234 + 90 + 36
