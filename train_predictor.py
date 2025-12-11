@@ -5189,6 +5189,7 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
     checkpoint_filename : str
         - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
+    api = wandb.Api()
     resume_alias, collection_name, checkpoint_filename = \
         _determine_wandb_artifact_config(args)
     if getattr(args, "save_path", None) is not None:
@@ -5203,7 +5204,6 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
     entity: str 예: 'jksg01019-naver-labs'
     project: str 예: 'Diffusion-Planner'
     """
-    api = wandb.Api()
     try:
         entity, project = _get_wandb_entity_and_project_for_resume(args)
 
