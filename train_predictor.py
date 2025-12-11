@@ -4990,6 +4990,9 @@ def _download_wandb_checkpoint_to_local(
     target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
     if rank == 0:
         os.makedirs(past_save_path, exist_ok=True)
+        print("CWD:", os.getcwd())
+        print("abs past_save_path:", os.path.abspath(past_save_path))
+        raise NotImplementedError("Wandb resume not tested yet.")
         download_run = wandb.init(
             project=project,
             name=
