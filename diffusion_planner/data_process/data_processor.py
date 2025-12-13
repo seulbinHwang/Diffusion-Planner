@@ -458,8 +458,12 @@ class DataProcessor(object):
 
         # 11차원 전체 궤적에서 앞 3차원만 추출
         # neighbor_future_all_gt_3_dim: (chosen_agent_num, Tf_all, 3)
-        neighbor_future_all_gt_3_dim = neighbor_future_all_gt_11_dim[:, :, :3]
-
+        yaw = np.arctan2(neighbor_future_all_gt_11_dim[:, :, 3],
+                         neighbor_future_all_gt_11_dim[:, :, 2])
+        neighbor_future_all_gt_3_dim = np.stack(
+            [neighbor_future_all_gt_11_dim[:, :, 0],
+             neighbor_future_all_gt_11_dim[:, :, 1],
+             yaw], axis=-1)
         # 현재 iteration 기준으로 원하는 future 구간만 잘라서 사용
         # neighbor_future_gt_3_dim: (chosen_agent_num, Tf, 3)
         neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
@@ -638,7 +642,7 @@ class DataProcessor(object):
             )
 
         max_agent_num: int = neighbor_agents_past.shape[0]
-        past_len: int = neighbor_agents_past.shape[1]
+        time_len: int = neighbor_agents_past.shape[1]
         future_len: int = neighbor_cur_fut_gt_11_dim.shape[1]
 
         # future 프레임이 아예 없으면 그대로 반환
@@ -670,7 +674,7 @@ class DataProcessor(object):
 
         # width, length 를 위한 "현재 프레임" 크기 저장
         # cur_size: (max_agent_num, 2)  — [width_now, length_now]
-        cur_size: np.ndarray = neighbor_agents_past[:, past_len - 1,
+        cur_size: np.ndarray = neighbor_agents_past[:, time_len - 1,
                                                     6:8].astype(np.float32,
                                                                 copy=False)
 
@@ -750,12 +754,12 @@ class DataProcessor(object):
             full_traj_interp[agent_idx, valid_after, 8:11] = type_vec
 
         # 다시 과거/현재 구간과 현재/미래 구간으로 잘라서 반환
-        # new_neighbor_agents_past: (max_agent_num, past_len, 11)
-        new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :past_len, :]
+        # new_neighbor_agents_past: (max_agent_num, time_len, 11)
+        new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :time_len, :]
 
         # new_neighbor_future_with_current_11: (max_agent_num, future_len, 11)
-        #   · full_traj 기준 인덱스 past_len-1 이 "현재 프레임"에 해당
-        new_neighbor_future_with_current_11 = full_traj_interp[:, past_len:, :]
+        #   · full_traj 기준 인덱스 time_len-1 이 "현재 프레임"에 해당
+        new_neighbor_future_with_current_11 = full_traj_interp[:, time_len:, :]
 
         return new_neighbor_agents_past, new_neighbor_future_with_current_11
 
@@ -1127,8 +1131,12 @@ class DataProcessor(object):
 
             # 보간이 끝난 11차원 궤적에서 앞 3차원만 사용
             # neighbor_future_gt_3_dim: (chosen_agent_num, future_len, 3)
-            neighbor_future_gt_3_dim = neighbor_future_gt_11_dim[:, :, 0:3]
-
+            yaw = np.arctan2(neighbor_future_gt_11_dim[:, :, 3],
+                             neighbor_future_gt_11_dim[:, :, 2])
+            neighbor_future_gt_3_dim = np.stack(
+                [neighbor_future_gt_11_dim[:, :, 0],
+                 neighbor_future_gt_11_dim[:, :, 1],
+                 yaw], axis=-1)
             # 3) static 객체
             static_objects = build_static_feature(
                 present_static_feat_5=present_static_feat_5,

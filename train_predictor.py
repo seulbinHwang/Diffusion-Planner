@@ -188,6 +188,13 @@ def build_deepspeed_config(args: argparse.Namespace,
         "train_micro_batch_size_per_gpu": micro_batch_size,
         "gradient_accumulation_steps": grad_accum_steps,
         "gradient_clipping": max_grad_norm,
+        "torch_autocast": {
+        "enabled": True,
+        # 둘 중 하나 선택:
+        "dtype": "bfloat16",   # 또는 "float16"
+        # (선택) 이 목록을 안 주면 DeepSpeed 기본 목록을 씀 :contentReference[oaicite:1]{index=1}
+        # "lower_precision_safe_modules": ["torch.nn.Linear", "torch.nn.Conv2d"],
+    },
         "fp16": {
             "enabled": False,
         },
