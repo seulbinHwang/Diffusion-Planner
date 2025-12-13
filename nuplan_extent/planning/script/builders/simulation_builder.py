@@ -73,6 +73,10 @@ def build_simulations(
     metric_engines_map = {}
     if cfg.run_metric:
         logger.info('Building metric engines...')
+        """
+        cfg.simulation_metric
+        nuplan/planning/script/config/common/simulation_metric/simulation_closed_loop_reactive_agents.yaml
+        """
         metric_engines_map = build_metrics_engines(cfg=cfg, scenarios=scenarios)
         logger.info('Building metric engines...DONE')
     else:
@@ -89,7 +93,7 @@ def build_simulations(
                 raise KeyError(
                     'Planner not specified in config. Please specify a planner using "planner" field.'
                 )
-
+            # List[AbstractPlanner]
             planners = build_planners(cfg.planner, scenario)
         else:
             planners = pre_built_planners
@@ -129,7 +133,7 @@ def build_simulations(
                 ego_controller=ego_controller,
                 scenario=scenario,
             )
-            """
+            """ 시나리오 1개 = 시뮬레이션 1개마다 있는 콜백
             callbacks: 
                 simulation_feature_video_callback
                 simulation_nuboard_video_callback
@@ -141,7 +145,7 @@ def build_simulations(
                 simulation_setup=simulation_setup,
                 callback=MultiCallback(callbacks + stateful_callbacks),
                 simulation_history_buffer_duration=cfg.
-                simulation_history_buffer_duration,
+                simulation_history_buffer_duration, # 2s # default_simulation.yaml
             )
             simulations.append(SimulationRunner(simulation, planner))
 

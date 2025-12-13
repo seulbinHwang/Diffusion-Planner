@@ -87,7 +87,7 @@ def run_simulation(
     # Construct simulations
     if isinstance(planners, AbstractPlanner):
         planners = [planners]
-
+    # List[SimulationRunner]
     runners = build_simulations(
         cfg=cfg,
         worker=common_builder.worker,

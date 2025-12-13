@@ -2583,7 +2583,6 @@ def _save_deepspeed_checkpoint_for_epoch(
     추가 정보(client_state: 에폭, loss, wandb id 등)
     
     """
-    # ERROR
     tag_latest = f"latest_epoch-{epoch + 1:06d}"
     diffusion_planner.save_checkpoint(
         save_dir=save_path,

@@ -102,13 +102,7 @@ class Simulation:
         self._is_simulation_running = True
 
     def initialize(self) -> PlannerInitialization:
-        """
-        Initialize the simulation
-         - Initialize Planner with goals and maps
-        :return data needed for planner initialization.
-        """
         self.reset()
-
         # Initialize history from scenario
         self._history_buffer = SimulationHistoryBuffer.initialize_from_scenario(
             self._history_buffer_size, self._scenario,
@@ -120,13 +114,6 @@ class Simulation:
         # Add the current state into the history buffer
         self._history_buffer.append(self._ego_controller.get_state(),
                                     self._observations.get_observation())
-
-        # if hasattr(self._scenario, 'get_npc_route_roadblock_ids'):
-        #     npc_route_roadblock_ids = self._scenario.get_npc_route_roadblock_ids(
-        #     )
-        # else:
-        #     npc_route_roadblock_ids = None
-        # Return the planner initialization structure for this simulation
         return PlannerInitialization(
             route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
             mission_goal=self._scenario.get_mission_goal(),
