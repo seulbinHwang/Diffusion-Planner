@@ -4329,7 +4329,7 @@ def _split_train_loss_for_logging(
         ):
             constraint_loss_dict[k] = v
         elif k in (
-                "loss_dict",
+                "loss",
                 "neighbor_prediction_loss",
                 "integration_loss",
                 "constraint_loss",

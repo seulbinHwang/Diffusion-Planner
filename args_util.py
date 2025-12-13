@@ -275,7 +275,7 @@ def get_args():
                         help='AdamW weight decay for decayed params')
     parser.add_argument(
         '--use_8bit_optimizer',
-        default=True,
+        default=False,
         type=boolean,
         help='True이면 AdamW 옵티마이저 상태를 8비트로 저장해 GPU 메모리 사용을 줄입니다.')
 
