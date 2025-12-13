@@ -1,5 +1,5 @@
 # configs/stage1.yaml
-name: stage1_w_const_0.02
+name: stage1_w_const_0.02_no_8_bit_opt
 
 batch_size: 480 # 512
 train_epochs: 234 #234           # 전체 360 중 약 65%
