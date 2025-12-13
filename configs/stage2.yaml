@@ -1,6 +1,6 @@
 # configs/stage2.yaml
-name: stage2_test5
-past_name: stage1_test5
+name: stage2_w_const_0.02
+past_name: stage1_w_const_0.02
 
 batch_size: 8 #512
 train_epochs: 1 #90 #324               # 234(Stage1) + 90(Stage2)

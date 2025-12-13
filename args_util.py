@@ -220,7 +220,7 @@ def get_args():
     parser.add_argument('--w_const',
                         type=float,
                         help='w_const',
-                        default=0.04)
+                        default=0.02)
 
 
     # DataLoader parameters
