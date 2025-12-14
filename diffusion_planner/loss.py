@@ -428,6 +428,7 @@ def _forward_model_with_autocast(
         near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
         batch_diffusion_time: torch.Tensor,  # (B,)
         cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)
+use_deepspeed: bool,
 ) -> Dict[str, torch.Tensor]:
     """모델 입력 dict 를 만들고 AMP 로 forward 를 수행한다.
 
@@ -464,8 +465,16 @@ def _forward_model_with_autocast(
         "diffusion_time": batch_diffusion_time,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, Pnn, 4)
     }
-    with torch.autocast("cuda", dtype=AMP_DTYPE):
-        _, decoder_output = model(merged_inputs)
+    is_ds_engine = hasattr(model, "backward") and hasattr(model,
+                                                          "step") and hasattr(
+        model, "module")
+
+    if use_deepspeed:
+        assert is_ds_engine, "use_deepspeed=True 인데 model 이 DS engine 아님"
+        _, decoder_output = model(merged_inputs)  # DS가 torch_autocast로 처리
+    else:
+        with torch.autocast("cuda", dtype=AMP_DTYPE):
+            _, decoder_output = model(merged_inputs)
     return decoder_output  # decoder_output["score"], ["integrated_trajectory"], ...
 
 
@@ -819,6 +828,7 @@ def diffusion_loss_func(
         near_cur_future_norm_xT,  # (B, Pnn, 1+future_len, 4)
         batch_diffusion_time=batch_diffusion_time,  # (B,)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
+        use_deepspeed= getattr(args, "use_deepspeed", False),
     )
 
     # score: (B, Pnn, future_len, 4)
