@@ -297,6 +297,31 @@ class DrawingOptions:
         "line_width": 0.2,
     }
     ###################
+    ######## ROAD SAFETY (stop sign / speed bump / crosswalk) ########
+    SAFETY_draw_stop_sign_points: bool = True
+    SAFETY_draw_speed_bump_points: bool = True
+    SAFETY_draw_crosswalk_points: bool = True
+
+    SAFETY_stop_sign_line_color: str = RED
+    SAFETY_stop_sign_line_width: float = 0.8
+    SAFETY_stop_sign_text: str = "stop_sign"
+    SAFETY_stop_sign_text_color: str = RED
+    SAFETY_stop_sign_text_fontsize: int = 5
+
+    SAFETY_speed_bump_line_color: str = ORANGE
+    SAFETY_speed_bump_line_width: float = 0.8
+    SAFETY_speed_bump_text: str = "speed_bump"
+    SAFETY_speed_bump_text_color: str = ORANGE
+    SAFETY_speed_bump_text_fontsize: int = 5
+
+    SAFETY_crosswalk_line_color: str = WHITE
+    SAFETY_crosswalk_line_width: float = 0.8
+    SAFETY_crosswalk_text: str = "crosswalk"
+    SAFETY_crosswalk_text_color: str = WHITE
+    SAFETY_crosswalk_text_fontsize: int = 5
+
+    SAFETY_polygon_zorder: int = 4
+    SAFETY_text_zorder: int = 5
 
 
 # [ADD]
@@ -369,6 +394,28 @@ def _collect_valid_xy_from_input_data(
             xy = neigh_fut[..., :2][valid_mask]  # (K, 2)
             xs_local.extend(xy[:, 0].tolist())
             ys_local.extend(xy[:, 1].tolist())
+    # road safety polygons:
+    # - stop_sign_points / speed_bump_points / crosswalk_points
+    # - shape: (N, P, 2)
+    for road_safety_key in ("stop_sign_points", "speed_bump_points",
+                            "crosswalk_points"):
+        road_safety_points = input_data.get(road_safety_key)
+        if road_safety_points is None:
+            continue
+        road_safety_points = np.asarray(road_safety_points)  # (N, P, 2)
+        if road_safety_points.size == 0:
+            continue
+        if road_safety_points.ndim != 3 or road_safety_points.shape[-1] != 2:
+            raise ValueError(
+                f"{road_safety_key} shape는 (N, P, 2) 이어야 합니다. got {road_safety_points.shape}"
+            )
+
+        # 유효 점만 bounds에 반영 (한 점이라도 |.| > eps 이면 유효)
+        valid_mask = np.any(np.abs(road_safety_points) > eps, axis=2)  # (N, P)
+        if np.any(valid_mask):
+            valid_xy = road_safety_points[valid_mask]  # (K, 2)
+            xs_local.extend(valid_xy[:, 0].tolist())
+            ys_local.extend(valid_xy[:, 1].tolist())
 
     return xs_local, ys_local
 
@@ -757,6 +804,236 @@ def add_polygon(
             zorder=zorder,
             joinstyle="miter",
         ))
+
+def _is_valid_road_safety_polygon_points(
+    polygon_points: Array,  # (P, 2)
+    eps: float,
+) -> bool:
+    """도로 안전 다각형 점들이 유효한지 확인한다.
+
+    Args:
+        polygon_points (np.ndarray): 모양이 (P, 2) 인 점 배열.
+        eps (float): 0으로 볼 허용 오차.
+
+    Returns:
+        bool: 한 점이라도 |값|이 eps 보다 크면 True.
+    """
+    polygon_points = np.asarray(polygon_points)  # (P, 2)
+    if polygon_points.ndim != 2 or polygon_points.shape[1] != 2:
+        raise ValueError(
+            f"polygon_points shape는 (P, 2) 이어야 합니다. got {polygon_points.shape}"
+        )
+    return bool(np.any(np.abs(polygon_points) > eps))
+
+
+def _compute_polygon_center_xy(
+    polygon_points: Array,  # (P, 2)
+) -> Tuple[float, float]:
+    """다각형의 가운데 위치를 간단히 계산한다.
+
+    이 함수는 다각형의 점들을 평균내서 가운데 좌표로 사용한다.
+    (정확한 무게중심이 아니라, 라벨을 찍기 위한 '대략 중앙' 용도다.)
+
+    Args:
+        polygon_points (np.ndarray): 모양이 (P, 2) 인 점 배열.
+
+    Returns:
+        Tuple[float, float]: (center_x, center_y)
+    """
+    polygon_points = np.asarray(polygon_points)  # (P, 2)
+    if polygon_points.ndim != 2 or polygon_points.shape[1] != 2:
+        raise ValueError(
+            f"polygon_points shape는 (P, 2) 이어야 합니다. got {polygon_points.shape}"
+        )
+    center_xy: Array = polygon_points.mean(axis=0)  # (2,)
+    return float(center_xy[0]), float(center_xy[1])
+
+
+def draw_road_safety_polygons_with_text(
+    ax: plt.Axes,
+    road_safety_points: Array,  # (N, P, 2)
+    label_text: str,
+    line_color: str,
+    line_width: float,
+    text_color: str,
+    text_fontsize: int,
+    options: DrawingOptions,
+    zorder: int,
+) -> None:
+    """도로 안전 다각형을 테두리만 그리고, 가운데에 글씨를 적는다.
+
+    Args:
+        ax (plt.Axes): Matplotlib 축 객체.
+        road_safety_points (np.ndarray): 모양이 (N, P, 2) 인 점 배열.
+            - N: 다각형 개수
+            - P: 한 다각형을 이루는 점 개수
+        label_text (str): 가운데에 적을 글씨.
+        line_color (str): 테두리 색.
+        line_width (float): 테두리 두께.
+        text_color (str): 글씨 색.
+        text_fontsize (int): 글씨 크기.
+        options (DrawingOptions): invalid_eps 등을 쓰기 위한 옵션.
+        zorder (int): 그리기 순서.
+    """
+    road_safety_points = np.asarray(road_safety_points)  # (N, P, 2)
+    if road_safety_points.size == 0:
+        return
+    if road_safety_points.ndim != 3 or road_safety_points.shape[-1] != 2:
+        raise ValueError(
+            f"road_safety_points shape는 (N, P, 2) 이어야 합니다. got {road_safety_points.shape}"
+        )
+
+    eps: float = float(options.invalid_eps)
+    num_polygons: int = int(road_safety_points.shape[0])
+    for poly_idx in range(num_polygons):
+        polygon_points: Array = road_safety_points[poly_idx]  # (P, 2)
+        if not _is_valid_road_safety_polygon_points(polygon_points, eps):
+            continue
+
+        # 다각형 테두리(속은 비움)
+        add_polygon(
+            ax=ax,
+            corners_xy=polygon_points,  # (P, 2)
+            edge_color=line_color,
+            line_width=line_width,
+            fill_color=None,
+            fill_alpha=None,
+            zorder=zorder,
+        )
+
+        # 가운데 텍스트
+        center_x, center_y = _compute_polygon_center_xy(polygon_points)
+        ax.text(
+            center_x,
+            center_y,
+            label_text,
+            color=text_color,
+            fontsize=text_fontsize,
+            ha="center",
+            va="center",
+            zorder=options.SAFETY_text_zorder,
+            clip_on=True,
+        )
+
+
+def draw_stop_sign_points(
+    ax: plt.Axes,
+    stop_sign_points: Optional[Array],  # (N, P, 2)
+    options: DrawingOptions,
+) -> None:
+    """stop_sign_points 다각형을 빨간 테두리로 그린다.
+
+    Args:
+        ax (plt.Axes): Matplotlib 축 객체.
+        stop_sign_points (Optional[np.ndarray]): 모양이 (N, P, 2) 인 점 배열.
+        options (DrawingOptions): 색/두께/글씨 크기 옵션.
+    """
+    if not options.SAFETY_draw_stop_sign_points:
+        return
+    if stop_sign_points is None:
+        return
+    stop_sign_points = np.asarray(stop_sign_points)  # (N, P, 2)
+    if stop_sign_points.size == 0:
+        return
+
+    draw_road_safety_polygons_with_text(
+        ax=ax,
+        road_safety_points=stop_sign_points,
+        label_text=options.SAFETY_stop_sign_text,
+        line_color=options.SAFETY_stop_sign_line_color,
+        line_width=options.SAFETY_stop_sign_line_width,
+        text_color=options.SAFETY_stop_sign_text_color,
+        text_fontsize=options.SAFETY_stop_sign_text_fontsize,
+        options=options,
+        zorder=options.SAFETY_polygon_zorder,
+    )
+
+
+def draw_speed_bump_points(
+    ax: plt.Axes,
+    speed_bump_points: Optional[Array],  # (N, P, 2)
+    options: DrawingOptions,
+) -> None:
+    """speed_bump_points 다각형을 주황 테두리로 그린다.
+
+    Args:
+        ax (plt.Axes): Matplotlib 축 객체.
+        speed_bump_points (Optional[np.ndarray]): 모양이 (N, P, 2) 인 점 배열.
+        options (DrawingOptions): 색/두께/글씨 크기 옵션.
+    """
+    if not options.SAFETY_draw_speed_bump_points:
+        return
+    if speed_bump_points is None:
+        return
+    speed_bump_points = np.asarray(speed_bump_points)  # (N, P, 2)
+    if speed_bump_points.size == 0:
+        return
+
+    draw_road_safety_polygons_with_text(
+        ax=ax,
+        road_safety_points=speed_bump_points,
+        label_text=options.SAFETY_speed_bump_text,
+        line_color=options.SAFETY_speed_bump_line_color,
+        line_width=options.SAFETY_speed_bump_line_width,
+        text_color=options.SAFETY_speed_bump_text_color,
+        text_fontsize=options.SAFETY_speed_bump_text_fontsize,
+        options=options,
+        zorder=options.SAFETY_polygon_zorder,
+    )
+
+
+def draw_crosswalk_points(
+    ax: plt.Axes,
+    crosswalk_points: Optional[Array],  # (N, P, 2)
+    options: DrawingOptions,
+) -> None:
+    """crosswalk_points 다각형을 흰색 테두리로 그린다.
+
+    Args:
+        ax (plt.Axes): Matplotlib 축 객체.
+        crosswalk_points (Optional[np.ndarray]): 모양이 (N, P, 2) 인 점 배열.
+        options (DrawingOptions): 색/두께/글씨 크기 옵션.
+    """
+    if not options.SAFETY_draw_crosswalk_points:
+        return
+    if crosswalk_points is None:
+        return
+    crosswalk_points = np.asarray(crosswalk_points)  # (N, P, 2)
+    if crosswalk_points.size == 0:
+        return
+
+    draw_road_safety_polygons_with_text(
+        ax=ax,
+        road_safety_points=crosswalk_points,
+        label_text=options.SAFETY_crosswalk_text,
+        line_color=options.SAFETY_crosswalk_line_color,
+        line_width=options.SAFETY_crosswalk_line_width,
+        text_color=options.SAFETY_crosswalk_text_color,
+        text_fontsize=options.SAFETY_crosswalk_text_fontsize,
+        options=options,
+        zorder=options.SAFETY_polygon_zorder,
+    )
+
+
+def draw_road_safety(
+    ax: plt.Axes,
+    input_data: WorldModelFeature,
+    options: DrawingOptions,
+) -> None:
+    """stop/speed_bump/crosswalk 다각형을 input_data에서 찾아 그린다.
+
+    Args:
+        ax (plt.Axes): Matplotlib 축 객체.
+        input_data (Dict[str, np.ndarray]): draw_world_model_to_png 로 들어오는 입력 dict.
+        options (DrawingOptions): 색/두께/글씨 크기 옵션.
+    """
+    stop_sign_points = input_data.get("stop_sign_points", None)  # (N, P, 2)
+    speed_bump_points = input_data.get("speed_bump_points", None)  # (N, P, 2)
+    crosswalk_points = input_data.get("crosswalk_points", None)  # (N, P, 2)
+
+    draw_stop_sign_points(ax, stop_sign_points, options)
+    draw_speed_bump_points(ax, speed_bump_points, options)
+    draw_crosswalk_points(ax, crosswalk_points, options)
 
 
 def add_heading_line(ax: plt.Axes,
@@ -2473,6 +2750,7 @@ def draw_world_model_to_png(
 
     #########################################
     draw_lane(ax, input_data, draw_option, draw_token_list)
+    draw_road_safety(ax, input_data, draw_option)
     draw_ego(ax, input_data, draw_option)
     # NEW: ego 주변 반경 원
     draw_ego_radius_circle(ax, draw_option)
