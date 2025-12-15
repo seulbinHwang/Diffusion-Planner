@@ -1178,7 +1178,7 @@ class DataProcessor(object):
 
             key_to_array = {
                 "ego_agent_past":
-                    ego_agent_past,  # (chosen_agent_num, time_len, 11)
+                    ego_agent_past,  # (time_len, 11)
                 "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
                 "ego_future_gt_11_dim":
                     ego_future_gt_11_dim,  # (future_len, 11)
