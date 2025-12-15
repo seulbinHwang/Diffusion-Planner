@@ -55,6 +55,9 @@ class DataProcessor(object):
         self.num_future_poses = 10 * self.future_time_horizon
 
         self.caching_max_agent_num = config.caching_max_agent_num
+        self.max_agent_num = config.max_agent_num
+
+        self.caching_max_static_num = config.caching_max_static_num
         self.max_static_num = config.max_static_num
         # [변경] 타입별 상한 신설: 보행자/자전거
         self.max_pedestrians = None  #getattr(config, "max_pedestrians", 7)  #128)
@@ -66,17 +69,23 @@ class DataProcessor(object):
         self._map_elements = [
             'LANE', 'LEFT_BOUNDARY', 'RIGHT_BOUNDARY', 'ROUTE_LANES'
         ]  # name of map features to be extracted.
-        self._map_max_elements = {
-            'LANE': config.lane_num,
-            'LEFT_BOUNDARY': config.lane_num,
-            'RIGHT_BOUNDARY': config.lane_num,
-            'ROUTE_LANES': config.route_num
+        self._caching_max_map_elements = {
+            'LANE': config.caching_max_lane_num,
+            'LEFT_BOUNDARY': config.caching_max_lane_num,
+            'RIGHT_BOUNDARY': config.caching_max_lane_num,
+            'ROUTE_LANES': config.caching_max_lane_num
+        }  # maximum number of elements to extract per feature layer.
+        self._max_map_elements = {
+            'LANE': config.max_lane_num,
+            'LEFT_BOUNDARY': config.max_lane_num,
+            'RIGHT_BOUNDARY': config.max_lane_num,
+            'ROUTE_LANES': config.max_lane_num
         }  # maximum number of elements to extract per feature layer.
         self._map_points_num = {
             'LANE': config.lane_len,
             'LEFT_BOUNDARY': config.lane_len,
             'RIGHT_BOUNDARY': config.lane_len,
-            'ROUTE_LANES': config.route_len
+            'ROUTE_LANES': config.lane_len
         }  # maximum number of points per feature to extract per feature layer.
 
     # [ADDED] 통계 유틸 함수들
@@ -418,12 +427,12 @@ class DataProcessor(object):
          neighbor_track_token) = build_neighbor_past_feature(
              past_cur_agents_world_8_list=past_cur_agents_world_8_list,
              past_cur_agents_types_list=past_cur_agents_types_list,
-             caching_max_agent_num=self.caching_max_agent_num,
+             max_agent_num=self.max_agent_num,
              ego_cur_pose_np=ego_cur_pose_np,
              max_pedestrians=self.max_pedestrians,
              max_bicycles=self.max_bicycles,
              token_to_id=token_to_id,
-             filter_radius=self._filter_radius,
+             filter_radius=None,
          )
 
         ego_time_len = ego_agent_past.shape[0]
@@ -536,7 +545,7 @@ class DataProcessor(object):
             speed_limit_dict,
             lanes_roadblock_id_list,
             self._map_elements,
-            self._map_max_elements,
+            self._max_map_elements,
             self._map_points_num)
         # key_to_array: Dict[str, np.ndarray]
         key_to_array.update(map_key_to_array)
@@ -1122,7 +1131,7 @@ class DataProcessor(object):
              neighbor_track_token) = build_neighbor_past_feature(
                  past_cur_agents_world_8_list=past_cur_agents_world_8_list,
                  past_cur_agents_types_list=past_cur_agents_types_list,
-                 caching_max_agent_num=self.caching_max_agent_num,
+                 max_agent_num=self.caching_max_agent_num,
                  ego_cur_pose_np=ego_cur_pose_np,
                  max_pedestrians=self.max_pedestrians,
                  max_bicycles=self.max_bicycles,
@@ -1171,14 +1180,13 @@ class DataProcessor(object):
             static_objects = build_static_feature(
                 present_static_feat_5=present_static_feat_5,
                 static_types_list=static_types_list,
-                max_static_num=self.max_static_num,
+                max_static_num=self.caching_max_static_num,
                 ego_cur_pose_np=ego_cur_pose_np,
                 filter_radius=self._filter_radius,
             )
 
             key_to_array = {
-                "ego_agent_past":
-                    ego_agent_past,  # (time_len, 11)
+                "ego_agent_past": ego_agent_past,  # (time_len, 11)
                 "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
                 "ego_future_gt_11_dim":
                     ego_future_gt_11_dim,  # (future_len, 11)
@@ -1222,7 +1230,7 @@ class DataProcessor(object):
                 neighbor_agents_current, ego_cur_pose_np,
                 elements_to_obj_polylines, elements_to_traffic_light,
                 speed_limit_dict, lanes_roadblock_id_list, self._map_elements,
-                self._map_max_elements, self._map_points_num)
+                self._caching_max_map_elements, self._map_points_num)
             key_to_array.update(map_key_to_array)
             # gather data
             chore_data = {

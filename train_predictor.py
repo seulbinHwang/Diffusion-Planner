@@ -189,12 +189,12 @@ def build_deepspeed_config(args: argparse.Namespace,
         "gradient_accumulation_steps": grad_accum_steps,
         "gradient_clipping": max_grad_norm,
         "torch_autocast": {
-        "enabled": True,
-        # 둘 중 하나 선택:
-        "dtype": "bfloat16",   # 또는 "float16"
-        # (선택) 이 목록을 안 주면 DeepSpeed 기본 목록을 씀 :contentReference[oaicite:1]{index=1}
-        # "lower_precision_safe_modules": ["torch.nn.Linear", "torch.nn.Conv2d"],
-    },
+            "enabled": True,
+            # 둘 중 하나 선택:
+            "dtype": "bfloat16",  # 또는 "float16"
+            # (선택) 이 목록을 안 주면 DeepSpeed 기본 목록을 씀 :contentReference[oaicite:1]{index=1}
+            # "lower_precision_safe_modules": ["torch.nn.Linear", "torch.nn.Conv2d"],
+        },
         "fp16": {
             "enabled": False,
         },
@@ -847,16 +847,14 @@ class DiffusionPlannerCollate:
         Args:
             args (argparse.Namespace):
                 - caching_max_agent_num (int)
-                - lane_num (int)
-                - route_num (int)
-                - max_static_num (int)
+                - caching_max_lane_num (int)
+                - caching_max_static_num (int)
                 - center_crop_radius_m (float, 선택)
                 - center_crop_mode (str, 'npc' / 'ego' / 'none')
         """
         self.caching_max_agent_num: int = int(args.caching_max_agent_num)
-        self.lane_num: int = int(args.lane_num)
-        self.route_num: int = int(args.route_num)
-        self.max_static_num: int = int(args.max_static_num)
+        self.caching_max_lane_num: int = int(args.caching_max_lane_num)
+        self.caching_max_static_num: int = int(args.caching_max_static_num)
 
         # 중심 기준 크로핑 옵션
         # - center_crop_radius_m <= 0: 크로핑 사용 안 함
@@ -940,7 +938,7 @@ class DiffusionPlannerCollate:
                 - max_agent_num: 배치 내 최대 agent 수
                 - max_lane_num: 배치 내 최대 lane 수
                 - max_route_lane_num: 배치 내 최대 route lane 수
-                - max_static_num: 배치 내 최대 static 수
+                - caching_max_static_num: 배치 내 최대 static 수
                 - lane_len: lane 한 개당 점 개수
                 - route_lane_len: route lane 한 개당 점 개수
         """
@@ -1724,18 +1722,19 @@ class DiffusionPlannerCollate:
             raise ValueError(
                 f"배치 내 agent 수(data_max_agent_num={data_max_agent_num})가 "
                 f"caching_max_agent_num={self.caching_max_agent_num} 를 초과했습니다.")
-        if data_max_lane_num > self.lane_num:
+        if data_max_lane_num > self.caching_max_lane_num:
             raise ValueError(
                 f"배치 내 lane 수(data_max_lane_num={data_max_lane_num})가 "
-                f"lane_num={self.lane_num} 를 초과했습니다.")
-        if data_max_route_num > self.route_num:
+                f"caching_max_lane_num={self.caching_max_lane_num} 를 초과했습니다.")
+        if data_max_route_num > self.caching_max_lane_num:
             raise ValueError(
                 f"배치 내 route 수(data_max_route_num={data_max_route_num})가 "
-                f"route_num={self.route_num} 를 초과했습니다.")
-        if data_max_static_num > self.max_static_num:
+                f"caching_max_lane_num={self.caching_max_lane_num} 를 초과했습니다.")
+        if data_max_static_num > self.caching_max_static_num:
             raise ValueError(
                 f"배치 내 static 수(data_max_static_num={data_max_static_num})가 "
-                f"max_static_num={self.max_static_num} 를 초과했습니다.")
+                f"caching_max_static_num={self.caching_max_static_num} 를 초과했습니다."
+            )
 
     # ------------------------------------------------------------------
     # 4-3) 패딩 포함 전체 배치 텐서 구성
@@ -3307,13 +3306,10 @@ def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
 
     # tag 디렉터리 안에서 *_model_states.pt 중 첫 번째를 찾는 방식
     candidates = [
-        f for f in os.listdir(tag_dir)
-        if f.endswith("_model_states.pt")
+        f for f in os.listdir(tag_dir) if f.endswith("_model_states.pt")
     ]
     if not candidates:
-        raise FileNotFoundError(
-            f"No *_model_states.pt found in {tag_dir}"
-        )
+        raise FileNotFoundError(f"No *_model_states.pt found in {tag_dir}")
 
     mp_rank_str = sorted(candidates)[0]  # 보통 mp_rank_00_model_states.pt
     ckpt_path = os.path.join(tag_dir, mp_rank_str)
@@ -3803,6 +3799,7 @@ def _train_one_epoch(
     epoch_elapsed_time_sec = time.perf_counter() - epoch_t0
     return train_loss, train_total_loss, epoch_elapsed_time_sec
 
+
 TEMP_WANDB_ROOT_DIR: str = "/mnt/temp_wandb"
 
 
@@ -3848,8 +3845,7 @@ def _copy_file_to_temp_wandb(
     except Exception as copy_err:
         print(
             f"[W&B TEMP] file copy failed: {src_file_path} -> {dst_file_path}, "
-            f"error={copy_err}"
-        )
+            f"error={copy_err}")
         return None
 
 
@@ -3896,11 +3892,10 @@ def _copy_dir_to_temp_wandb(
         shutil.copytree(src_dir_path, dst_dir_path)
         return dst_dir_path
     except Exception as copy_err:
-        print(
-            f"[W&B TEMP] dir copy failed: {src_dir_path} -> {dst_dir_path}, "
-            f"error={copy_err}"
-        )
+        print(f"[W&B TEMP] dir copy failed: {src_dir_path} -> {dst_dir_path}, "
+              f"error={copy_err}")
         return None
+
 
 def _log_wandb_checkpoint_artifacts(
     args: argparse.Namespace,
@@ -3942,10 +3937,8 @@ def _log_wandb_checkpoint_artifacts(
         os.makedirs(temp_root_dir, exist_ok=True)
     except Exception as e:
         # 임시 디렉터리를 만들 수 없으면 그냥 원래 로직으로 Ceph 경로를 넘긴다.
-        print(
-            f"[W&B TEMP] failed to prepare temp root dir '{temp_root_dir}', "
-            f"fallback to direct upload. error={e}"
-        )
+        print(f"[W&B TEMP] failed to prepare temp root dir '{temp_root_dir}', "
+              f"fallback to direct upload. error={e}")
         temp_root_dir = ""  # 아래에서 temp 사용 여부 분기용
 
     # 디렉터리 이름에서 대략적인 시간 문자열을 뽑아서 메타데이터에 남긴다.
@@ -3966,9 +3959,8 @@ def _log_wandb_checkpoint_artifacts(
         )
 
         # latest용 임시 서브 디렉터리: /mnt/temp_wandb/latest
-        temp_latest_root_dir: Optional[str] = (
-            os.path.join(temp_root_dir, "latest") if temp_root_dir else None
-        )
+        temp_latest_root_dir: Optional[str] = (os.path.join(
+            temp_root_dir, "latest") if temp_root_dir else None)
 
         # 1) latest.pth 파일
         latest_pth = os.path.join(args.save_path, "latest.pth")
@@ -4002,7 +3994,9 @@ def _log_wandb_checkpoint_artifacts(
                 else:
                     latest_art.add_dir(latest_tag_dir, name=tag_latest)
 
-        wandb.log_artifact(latest_art, aliases=["latest" if tag_latest is None else tag_latest])
+        wandb.log_artifact(
+            latest_art,
+            aliases=["latest" if tag_latest is None else tag_latest])
         latest_art.wait()  # 업로드 완료 보장
 
         # 학습 도중 이전 버전들을 지우고 싶을 때
@@ -4028,9 +4022,8 @@ def _log_wandb_checkpoint_artifacts(
         )
 
         # best용 임시 서브 디렉터리: /mnt/temp_wandb/best
-        temp_best_root_dir: Optional[str] = (
-            os.path.join(temp_root_dir, "best") if temp_root_dir else None
-        )
+        temp_best_root_dir: Optional[str] = (os.path.join(
+            temp_root_dir, "best") if temp_root_dir else None)
 
         # 1) best.pth 파일
         best_pth = os.path.join(args.save_path, "best.pth")
@@ -4061,7 +4054,8 @@ def _log_wandb_checkpoint_artifacts(
                 else:
                     best_art.add_dir(best_tag_dir, name=tag_best)
 
-        wandb.log_artifact(best_art, aliases=["best" if tag_best is None else tag_best])
+        wandb.log_artifact(best_art,
+                           aliases=["best" if tag_best is None else tag_best])
         best_art.wait()
 
         if getattr(args, "delete_wb_weight_when_running", False):
@@ -4902,9 +4896,6 @@ def _determine_wandb_artifact_config(
     return resume_alias, collection_name, checkpoint_filename
 
 
-
-
-
 def _download_wandb_checkpoint_to_local(
     args: argparse.Namespace,
     api: wandb.Api,
@@ -5143,8 +5134,6 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
     print(
         f"Resuming from wandb artifact: {args.past_name}:{args.resume_wandb_model_name}"
     )
-
-
     """
     resume_alias : str
         - 실제로 사용할 별칭. 예: 'latest', 'best'.
@@ -5161,8 +5150,7 @@ def _prepare_wandb_resume(args: argparse.Namespace,) -> None:
         if os.path.exists(local_ckpt_path):
             print(
                 f"[WANDB->local] found existing local checkpoint: {local_ckpt_path} "
-                f"(alias={resume_alias}), skip wandb download."
-            )
+                f"(alias={resume_alias}), skip wandb download.")
             return
     """
     entity: str 예: 'jksg01019-naver-labs'

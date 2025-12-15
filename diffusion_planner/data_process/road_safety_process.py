@@ -173,7 +173,6 @@ def extract_crosswalk_points(
     return np.stack(sampled_list, axis=0)
 
 
-
 def extract_stop_sign_points(
         scenario: NuPlanScenario,
         ego_cur_pose_np: np.ndarray,  # (3,)

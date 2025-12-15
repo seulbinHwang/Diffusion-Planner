@@ -1027,7 +1027,7 @@ def _compute_valid_sorted_indices(
 def _select_indices_with_type_cap(
         sorted_cur_agent_indices: np.ndarray,  # (M,)
         current_agent_types_list: List[TrackedObjectType],
-        caching_max_agent_num: int,
+        max_agent_num: int,
         max_pedestrians: int,
         max_bicycles: int,
         dist_from_cur_agent_to_ego: np.ndarray,  # (current_agents_num,)
@@ -1040,13 +1040,13 @@ def _select_indices_with_type_cap(
         2) 보행자 → 자전거 → 차량 순으로 슬롯을 채우되,
            각각 max_pedestrians / max_bicycles / 나머지 로 상한을 둔다.
         3) 최종 선택 집합을 ego-거리 기준으로 다시 정렬하고,
-           caching_max_agent_num 개까지 사용한다.
+           max_agent_num 개까지 사용한다.
 
     Returns:
         agents_cur_frame_indices:
-            - shape: (K,), K ≤ caching_max_agent_num
+            - shape: (K,), K ≤ max_agent_num
     """
-    if caching_max_agent_num <= 0:
+    if max_agent_num <= 0:
         return np.zeros((0,), dtype=int)
 
     # 타입별로 거리 오름차순 리스트 분리
@@ -1064,28 +1064,28 @@ def _select_indices_with_type_cap(
     ]
 
     # 보행자/자전거 상한 적용 (max_agent_num을 넘지 않도록)
-    ped_cap = min(max_pedestrians, caching_max_agent_num)
+    ped_cap = min(max_pedestrians, max_agent_num)
     sel_peds = ped_sorted_indices[:ped_cap]
 
-    remain = caching_max_agent_num - len(sel_peds)
+    remain = max_agent_num - len(sel_peds)
     bike_cap = min(max_bicycles, remain)
     sel_bikes = bike_sorted_indices[:bike_cap]
 
     remain -= len(sel_bikes)
     sel_vehs = vehicle_sorted_indices[:max(0, remain)]
 
-    # 1차 선택 결과
+    # 1차 선택 결과_select_neighbor_agents_and_build_past
     selected_indices = sel_peds + sel_bikes + sel_vehs
 
     if not selected_indices:
         return np.zeros((0,), dtype=int)
 
-    # 최종 후보를 ego-거리 기준으로 다시 정렬 후 caching_max_agent_num 까지만 사용
+    # 최종 후보를 ego-거리 기준으로 다시 정렬 후 max_agent_num 까지만 사용
     agents_cur_frame_indices = np.array(
         sorted(
             selected_indices,
             key=lambda idx: dist_from_cur_agent_to_ego[idx],
-        )[:caching_max_agent_num],
+        )[:max_agent_num],
         dtype=int,
     )
     return agents_cur_frame_indices
@@ -1221,7 +1221,7 @@ def _select_neighbor_agents_and_build_past(
     current_agent_types_list: List[
         TrackedObjectType],  # 길이 = current_agents_num
     agents_states_dim: int,
-    caching_max_agent_num: int,
+    max_agent_num: int,
     max_pedestrians: Optional[int],
     max_bicycles: Optional[int],
     filter_radius: Optional[float] = None,
@@ -1230,7 +1230,7 @@ def _select_neighbor_agents_and_build_past(
     이웃 궤적 텐서를 구성한다.
 
     특징:
-        - `caching_max_agent_num` 은 상한(최대 개수)만 의미한다. 실제 선택 수 chosen_agent_num ≤ caching_max_agent_num.
+        - `max_agent_num` 은 상한(최대 개수)만 의미한다. 실제 선택 수 chosen_agent_num ≤ max_agent_num.
         - `max_pedestrians` 또는 `max_bicycles` 가 None 이면
           타입 상한을 모두 끄고, 거리 기준으로만 가까운 순서대로 선택한다.
         - `filter_radius` 가 주어지면, ego 로부터 그 거리 안에 있는 에이전트만
@@ -1256,8 +1256,8 @@ def _select_neighbor_agents_and_build_past(
             filter_radius=filter_radius,
         )
 
-    # 유효한 후보가 없거나, caching_max_agent_num 이 0 이하인 경우
-    if sorted_cur_agent_indices.size == 0 or caching_max_agent_num <= 0:
+    # 유효한 후보가 없거나, max_agent_num 이 0 이하인 경우
+    if sorted_cur_agent_indices.size == 0 or max_agent_num <= 0:
         neighbor_agents_past = np.zeros(
             (0, num_frames, agents_states_dim + 3),
             dtype=np.float32,
@@ -1268,17 +1268,16 @@ def _select_neighbor_agents_and_build_past(
 
     # 1) 타입 상한을 끄는 경우: 거리 기준으로만 선택
     if (max_pedestrians is None) or (max_bicycles is None):
-        # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ caching_max_agent_num
-        agents_cur_frame_indices = sorted_cur_agent_indices[:
-                                                            caching_max_agent_num]
+        # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ max_agent_num
+        agents_cur_frame_indices = sorted_cur_agent_indices[:max_agent_num]
     else:
         # 2) 타입 상한을 적용하는 경우
-        # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ caching_max_agent_num
+        # agents_cur_frame_indices: shape: (chosen_agent_num,), chosen_agent_num ≤ max_agent_num
         agents_cur_frame_indices = _select_indices_with_type_cap(
             sorted_cur_agent_indices=sorted_cur_agent_indices,
             current_agent_types_list=
             current_agent_types_list,  # List[TrackedObjectType],  # 길이 = current_agents_num
-            caching_max_agent_num=caching_max_agent_num,
+            max_agent_num=max_agent_num,
             max_pedestrians=max_pedestrians,
             max_bicycles=max_bicycles,
             dist_from_cur_agent_to_ego=dist_from_cur_agent_to_ego,
@@ -1456,7 +1455,7 @@ def build_static_feature(
 def build_neighbor_past_feature(
     past_cur_agents_world_8_list: List[np.ndarray],
     past_cur_agents_types_list: List[List[TrackedObjectType]],
-    caching_max_agent_num: int,
+    max_agent_num: int,
     ego_cur_pose_np: np.ndarray,  # (3,)
     max_pedestrians: Optional[int],
     max_bicycles: Optional[int],
@@ -1483,7 +1482,7 @@ def build_neighbor_past_feature(
        → `_select_neighbor_agents_and_build_past` 호출
 
        · `max_pedestrians` 또는 `max_bicycles` 가 None 이면:
-         → 타입은 무시하고, 단순히 거리 가까운 순으로 `caching_max_agent_num` 개까지 선택.
+         → 타입은 무시하고, 단순히 거리 가까운 순으로 `max_agent_num` 개까지 선택.
        · 둘 다 정수면:
          → 보행자/자전거 상한 적용 후, 차량으로 나머지 채움.
 
@@ -1494,7 +1493,7 @@ def build_neighbor_past_feature(
        (chosen_agent_num, T, 11) 텐서를 만든다.
        · 앞 8차원: [x, y, cos, sin, vx, vy, width, length]
        · 뒤 3차원: 타입 one-hot (vehicle, pedestrian, bicycle)
-       · chosen_agent_num ≤ caching_max_agent_num (실제 장면에 따라 K는 매번 달라질 수 있음)
+       · chosen_agent_num ≤ max_agent_num (실제 장면에 따라 K는 매번 달라질 수 있음)
 
     Args:
         past_cur_agents_world_8_list:
@@ -1505,9 +1504,9 @@ def build_neighbor_past_feature(
             - 길이: num_frames
             - 각 프레임에서 에이전트 타입 리스트 (TrackedObjectType).
             - 현재 프레임(마지막 원소)의 타입 정보를 사용.
-        caching_max_agent_num:
+        max_agent_num:
             - 선택할 이웃 에이전트 수의 상한값.
-            - 실제 선택 수 chosen_agent_num 는 chosen_agent_num ≤ caching_max_agent_num.
+            - 실제 선택 수 chosen_agent_num 는 chosen_agent_num ≤ max_agent_num.
         ego_cur_pose_np:
             - shape: (3,), [x_ego, y_ego, yaw_ego]
             - ego 현재 포즈.
@@ -1525,7 +1524,7 @@ def build_neighbor_past_feature(
         Tuple[np.ndarray, np.ndarray, np.ndarray]:
             - neighbor_agents_past:
                 · shape: (chosen_agent_num, num_frames, 11)
-                · chosen_agent_num = 선택된 이웃 수 (chosen_agent_num ≤ caching_max_agent_num)
+                · chosen_agent_num = 선택된 이웃 수 (chosen_agent_num ≤ max_agent_num)
                 · [x, y, cos, sin, vx, vy, width, length, id,
                    onehot_vehicle, onehot_ped, onehot_bike]
             - agents_cur_frame_indices:
@@ -1562,7 +1561,7 @@ def build_neighbor_past_feature(
             all_frame_np_agents_local=all_frame_np_agents_local,
             current_agent_types_list=current_agent_types_list,
             agents_states_dim=agents_states_dim,
-            caching_max_agent_num=caching_max_agent_num,
+            max_agent_num=max_agent_num,
             max_pedestrians=max_pedestrians,
             max_bicycles=max_bicycles,
             filter_radius=filter_radius,

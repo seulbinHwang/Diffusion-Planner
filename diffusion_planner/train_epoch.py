@@ -50,9 +50,9 @@ def _clip_input_axes_by_args(
 
     처리 규칙 (do_not_clip=False 일 때만 적용):
       - neighbor_agents_past      : agent 축 → args.max_agent_num
-      - lanes / lanes_*           : lane  축 → args.max_use_lane_num
-      - route_lanes / route_lanes_* : lane 축 → args.max_use_lane_num
-      - agent_route_lane_order    : (agent, lane) 축 → (args.predicted_neighbor_num, args.max_use_lane_num)
+      - lanes / lanes_*           : lane  축 → args.max_lane_num
+      - route_lanes / route_lanes_* : lane 축 → args.max_lane_num
+      - agent_route_lane_order    : (agent, lane) 축 → (args.predicted_neighbor_num, args.max_lane_num)
     """
     if getattr(args, "do_not_clip", False):
         return
@@ -67,13 +67,13 @@ def _clip_input_axes_by_args(
             batch_on_device["neighbor_agents_past"] = \
                 neighbor_agents_past[:, :keep_agents, :, :]
 
-    # ---- lanes / lanes_* : lane 축 → max_use_lane_num ----
-    max_use_lane_num = int(getattr(args, "max_use_lane_num", 0))
-    if "lanes" in batch_on_device and max_use_lane_num > 0:
+    # ---- lanes / lanes_* : lane 축 → max_lane_num ----
+    max_lane_num = int(args.max_lane_num)
+    if "lanes" in batch_on_device and max_lane_num > 0:
         lanes = batch_on_device["lanes"]
         if lanes.dim() == 4:
             # lanes: (B, L_c, lane_len, 12)
-            keep_lanes = min(max_use_lane_num, lanes.shape[1])
+            keep_lanes = min(max_lane_num, lanes.shape[1])
             if keep_lanes < lanes.shape[1]:
                 batch_on_device["lanes"] = lanes[:, :keep_lanes, :, :]
                 if "lanes_speed_limit" in batch_on_device:
@@ -85,12 +85,12 @@ def _clip_input_axes_by_args(
                     batch_on_device["lanes_has_speed_limit"] = \
                         batch_on_device["lanes_has_speed_limit"][:, :keep_lanes, :]
 
-    # ---- route_lanes / route_lanes_* : lane 축 → max_use_lane_num ----
-    if "route_lanes" in batch_on_device and max_use_lane_num > 0:
+    # ---- route_lanes / route_lanes_* : lane 축 → max_lane_num ----
+    if "route_lanes" in batch_on_device and max_lane_num > 0:
         route_lanes = batch_on_device["route_lanes"]
         if route_lanes.dim() == 4:
             # route_lanes: (B, R_c, route_len, 12)
-            keep_route_lanes = min(max_use_lane_num, route_lanes.shape[1])
+            keep_route_lanes = min(max_lane_num, route_lanes.shape[1])
             if keep_route_lanes < route_lanes.shape[1]:
                 batch_on_device["route_lanes"] = \
                     route_lanes[:, :keep_route_lanes, :, :]
@@ -120,7 +120,7 @@ def _clip_input_axes_by_args(
                 # lanes: (B, L', lane_len, 12)
                 lane_dim_input = batch_on_device["lanes"].shape[1]
             keep_lanes_for_route = min(
-                max_use_lane_num or lane_dim_input,
+                max_lane_num or lane_dim_input,
                 lane_dim_input,
             )
 
@@ -174,9 +174,9 @@ def _prepare_batch_for_device(
 
     여기서는 (do_not_clip=False 인 경우에만)
       - neighbor_agents_past / near_future_gt_3_dim: agent 축 → max_agent_num / predicted_neighbor_num
-      - lanes / lanes_*                            : lane  축 → max_use_lane_num
-      - route_lanes / route_lanes_*                : lane  축 → max_use_lane_num
-      - agent_route_lane_order                     : (agent, lane) 축 → (predicted_neighbor_num, max_use_lane_num)
+      - lanes / lanes_*                            : lane  축 → max_lane_num
+      - route_lanes / route_lanes_*                : lane  축 → max_lane_num
+      - agent_route_lane_order                     : (agent, lane) 축 → (predicted_neighbor_num, max_lane_num)
       - static_objects                              : 그대로 유지
 
     를 수행한다.

@@ -1095,15 +1095,15 @@ class Encoder(nn.Module):
         Tensor,  # (B, Pnn, lane_num)  -1=not in route
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # agent_route_lane_order: (B, Pnn, lane_num)
-        # -1: route가 아님 # agent당 유효한 route의 최대 수는 최대 route_num 개임. (즉, route_num 이하임) # route_num <= lane_num 항상
+        # -1: route가 아님 # agent당 유효한 route의 최대 수는 최대 max_lane_num 개임. (즉, max_lane_num 이하임) # max_lane_num <= lane_num 항상
 
         (near_route_lanes,
          near_route_lanes_mask) = self.build_route_lane_tensors_from_order(
              encoding_lanes, lanes_mask, agent_route_lane_order,
-             self.config.route_num)
+             self.config.max_lane_num)
         """
-            near_route_lanes:       (B, Pnn, route_num, H)
-            near_route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
+            near_route_lanes:       (B, Pnn, max_lane_num, H)
+            near_route_lanes_mask:  (B, Pnn, max_lane_num)  # True=pad(무효)
         Returns:
             near_agents_route_lane_emb: (B, Pnn, H)
             route_known_mask : (B, Pnn) True=해당 에이전트가 유효 route

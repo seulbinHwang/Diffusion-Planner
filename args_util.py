@@ -15,7 +15,9 @@ def boolean(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
-def _override_args_with_stage_config(args: argparse.Namespace) -> argparse.Namespace:
+
+def _override_args_with_stage_config(
+        args: argparse.Namespace) -> argparse.Namespace:
     """stage_config_path에 지정된 json/yaml 파일을 읽어 args 값을 덮어쓴다.
 
     이 함수는 "한 번의 학습(run)을 하나의 stage 설정 파일로 제어"하기 위한 역할을 한다.
@@ -51,14 +53,11 @@ def _override_args_with_stage_config(args: argparse.Namespace) -> argparse.Names
     config_path = os.path.expanduser(stage_config_path)
     if not os.path.isfile(config_path):
         raise FileNotFoundError(
-            f"stage_config_path로 지정한 파일을 찾을 수 없습니다: {config_path}"
-        )
+            f"stage_config_path로 지정한 파일을 찾을 수 없습니다: {config_path}")
 
     config_dict: Dict[str, Any] = mmengine_load(config_path)
     if not isinstance(config_dict, dict):
-        raise TypeError(
-            f"stage 설정 파일은 dict 형태여야 합니다. type={type(config_dict)}"
-        )
+        raise TypeError(f"stage 설정 파일은 dict 형태여야 합니다. type={type(config_dict)}")
 
     overrides: Dict[str, Any] = config_dict.get("args", config_dict)
 
@@ -102,11 +101,9 @@ def get_args():
         '--resume_model_only',
         type=boolean,
         default=False,
-        help=(
-            "True이면 체크포인트에서 모델(또는 EMA) 파라미터만 불러오고, "
-            "optimizer / scheduler / EMA 상태, epoch, wandb run 은 모두 새로 시작합니다. "
-            "즉, pretrained weight 로만 초기화된 새 학습 run 으로 동작합니다."
-        ),
+        help=("True이면 체크포인트에서 모델(또는 EMA) 파라미터만 불러오고, "
+              "optimizer / scheduler / EMA 상태, epoch, wandb run 은 모두 새로 시작합니다. "
+              "즉, pretrained weight 로만 초기화된 새 학습 run 으로 동작합니다."),
     )
     # Data
     parser.add_argument('--train_set',
@@ -131,6 +128,10 @@ def get_args():
                         type=int,
                         help='past state dim for agents',
                         default=11)
+    parser.add_argument('--caching_max_agent_num',
+                        type=int,
+                        help='number of agents',
+                        default=448)
     parser.add_argument('--max_agent_num',
                         type=int,
                         help='number of agents',
@@ -138,11 +139,6 @@ def get_args():
     parser.add_argument('--predicted_neighbor_num',
                         type=int,
                         help='number of neighbor agents to predict',
-                        default=448)
-
-    parser.add_argument('--caching_max_agent_num',
-                        type=int,
-                        help='number of agents',
                         default=448)
     parser.add_argument('--center_crop_radius_m',
                         type=float,
@@ -162,7 +158,7 @@ def get_args():
                         type=int,
                         help='state dim for static objects',
                         default=10)
-    parser.add_argument('--static_objects_num',
+    parser.add_argument('--caching_max_static_num',
                         type=int,
                         help='number of static objects',
                         default=50)
@@ -170,7 +166,6 @@ def get_args():
                         type=int,
                         help='number of static objects',
                         default=50)
-
     parser.add_argument('--lane_len',
                         type=int,
                         help='number of lane point',
@@ -179,40 +174,20 @@ def get_args():
                         type=int,
                         help='state dim for lane point',
                         default=12)
-    parser.add_argument('--lane_num',
+    parser.add_argument('--caching_max_lane_num',
                         type=int,
                         help='number of lanes',
                         default=250)
-    parser.add_argument('--max_use_lane_num',
+    parser.add_argument('--max_lane_num',
                         type=int,
                         help='number of lanes',
                         default=250)
-
-    parser.add_argument('--route_len',
-                        type=int,
-                        help='number of route lane point',
-                        default=20)
     parser.add_argument('--safety_len',
                         type=int,
                         help='number of route lane point',
                         default=10)
-    parser.add_argument('--route_state_dim',
-                        type=int,
-                        help='state dim for route lane point',
-                        default=12)
-    parser.add_argument('--route_num',
-                        type=int,
-                        help='number of route lanes',
-                        default=250)
-
-    parser.add_argument('--p_sat',
-                        type=float,
-                        help='p_sat',
-                        default=0.6)
-    parser.add_argument('--w_dir',
-                        type=float,
-                        help='w_dir',
-                        default=1.0)
+    parser.add_argument('--p_sat', type=float, help='p_sat', default=0.6)
+    parser.add_argument('--w_dir', type=float, help='w_dir', default=1.0)
     parser.add_argument('--w_int_min',
                         type=float,
                         help='w_int_min',
@@ -221,11 +196,7 @@ def get_args():
                         type=float,
                         help='w_int_max',
                         default=2.0)
-    parser.add_argument('--w_const',
-                        type=float,
-                        help='w_const',
-                        default=0.02)
-
+    parser.add_argument('--w_const', type=float, help='w_const', default=0.02)
 
     # DataLoader parameters
     parser.add_argument('--augment_prob',
@@ -304,7 +275,7 @@ def get_args():
         type=float,
         default=None,
         help='cosine 스케줄에서 사용할 최소 learning rate. '
-             'None이면 max lr의 0.2배를 사용합니다.',
+        'None이면 max lr의 0.2배를 사용합니다.',
     )
 
     parser.add_argument('--warm_up_epoch',
@@ -333,7 +304,6 @@ def get_args():
         help='True이면 학습 초기에 learning rate 선형 warmup을 사용합니다.',
     )
 
-
     parser.add_argument(
         '--freeze_encoder_local',
         type=boolean,
@@ -361,7 +331,6 @@ def get_args():
         default=1.0,
         help='decoder(Group C)에 곱해질 lr 배율.',
     )
-
 
     parser.add_argument('--prefetch_factor',
                         type=int,
