@@ -23,6 +23,10 @@ class WorldModelFeature(AbstractModelFeature):
     neighbor_agents_past: FeatureDataType  # (max_agent_num, time_len, 11)
     static_objects: FeatureDataType  # (static_objects_num, 10)
     ################################################
+    stop_sign_points: FeatureDataType # (stop_sign_num, safety_len, 3)
+    speed_bump_points: FeatureDataType # (speed_bump_num, safety_len, 3)
+    crosswalk_points: FeatureDataType # (crosswalk_num, safety_len, 3)
+    #####################################
     ########### SAME AS LEARNING INPUT ###########
     lanes: FeatureDataType  # (lane_num, lane_len, 12)
     lanes_speed_limit: FeatureDataType  # (lane_num, 1)
@@ -38,6 +42,7 @@ class WorldModelFeature(AbstractModelFeature):
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
     planner_future_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
+    #########################
 
     ################################################
 
@@ -48,6 +53,9 @@ class WorldModelFeature(AbstractModelFeature):
             neighbor_agents_past=to_tensor(
                 self.neighbor_agents_past).contiguous(),
             static_objects=to_tensor(self.static_objects).contiguous(),
+            stop_sign_points=to_tensor(self.stop_sign_points).contiguous(),
+            speed_bump_points=to_tensor(self.speed_bump_points).contiguous(),
+            crosswalk_points=to_tensor(self.crosswalk_points).contiguous(),
             lanes=to_tensor(self.lanes).contiguous(),
             lanes_speed_limit=to_tensor(self.lanes_speed_limit).contiguous(),
             lanes_has_speed_limit=to_tensor(
@@ -76,6 +84,9 @@ class WorldModelFeature(AbstractModelFeature):
             neighbor_agents_past=to_tensor(
                 self.neighbor_agents_past).to(device=device),
             static_objects=to_tensor(self.static_objects).to(device=device),
+            stop_sign_points=to_tensor(self.stop_sign_points).to(device=device),
+            speed_bump_points=to_tensor(self.speed_bump_points).to(device=device),
+            crosswalk_points=to_tensor(self.crosswalk_points).to(device=device),
             lanes=to_tensor(self.lanes).to(device=device),
             lanes_speed_limit=to_tensor(
                 self.lanes_speed_limit).to(device=device),
@@ -117,6 +128,9 @@ class WorldModelFeature(AbstractModelFeature):
             neighbor_agents_past=default_collate(
                 [b.neighbor_agents_past for b in batch]),
             static_objects=default_collate([b.static_objects for b in batch]),
+            stop_sign_points=default_collate([b.stop_sign_points for b in batch]),
+            speed_bump_points=default_collate([b.speed_bump_points for b in batch]),
+            crosswalk_points=default_collate([b.crosswalk_points for b in batch]),
             lanes=default_collate([b.lanes for b in batch]),
             lanes_speed_limit=default_collate(
                 [b.lanes_speed_limit for b in batch]),
@@ -150,6 +164,9 @@ class WorldModelFeature(AbstractModelFeature):
                     ego_agent_past=self.ego_agent_past[i],  # DONE
                     neighbor_agents_past=self.neighbor_agents_past[i],  # DONE
                     static_objects=self.static_objects[i],
+                    stop_sign_points=self.stop_sign_points[i],
+                    speed_bump_points=self.speed_bump_points[i],
+                    crosswalk_points=self.crosswalk_points[i],
                     lanes=self.lanes[i],  # DONE
                     lanes_speed_limit=self.lanes_speed_limit[i],
                     lanes_has_speed_limit=self.lanes_has_speed_limit[i],

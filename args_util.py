@@ -508,7 +508,7 @@ def get_args():
                         help='shuffle scenarios')
     parser.add_argument('--save_image',
                         type=boolean,
-                        default=False,
+                        default=True,
                         help='shuffle scenarios')
     parser.add_argument('--make_statistics_when_caching',
                         default=True,

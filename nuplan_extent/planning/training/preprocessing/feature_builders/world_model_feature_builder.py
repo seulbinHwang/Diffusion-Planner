@@ -106,6 +106,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             initialization: HorizonPlannerInitialization) -> WorldModelFeature:
         history_buffer: SimulationHistoryBuffer = current_input.history
         traffic_light_data = list(current_input.traffic_light_data)
+
         model_inputs: Dict[
             str, torch.Tensor] = self.data_processor.observation_adapter(
                 current_input.iteration.index,
