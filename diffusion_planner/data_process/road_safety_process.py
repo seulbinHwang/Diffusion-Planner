@@ -173,36 +173,6 @@ def extract_crosswalk_points(
     return np.stack(sampled_list, axis=0)
 
 
-def extract_speed_bump_points(
-        scenario: NuPlanScenario,
-        ego_cur_pose_np: np.ndarray,  # (3,),
-        safety_len: int,
-        radius: Optional[float] = None) -> np.ndarray:
-    """
-    자차 주변 혹은 전체 과속방지턱을 등간격 점으로 반환한다.
-
-    Args:
-        scenario (NuPlanScenario): 대상 시나리오.
-        ego_cur_pose_np (Tuple[float, float, float]): (x, y, yaw_rad) 자차 포즈.
-        radius (Optional[float]): 관심 반경. None이면 전부 반환.
-
-    Returns:
-        np.ndarray: 모양이 (N, 20, 2) 인 자차 기준 과속방지턱 점들.
-    """
-    map_api = scenario.map_api
-    polygons = _load_polygons_from_layer(map_api, "speed_bumps")
-
-    sampled_list: List[np.ndarray] = []
-    for polygon in polygons:
-        sampled = _sample_polygon_boundary(polygon, safety_len)
-        if _is_within_radius(sampled, ego_cur_pose_np, radius):
-            ego_points = _to_ego_coordinates(sampled, ego_cur_pose_np)
-            sampled_list.append(ego_points)
-
-    if not sampled_list:
-        return np.zeros((0, safety_len, 2))
-    return np.stack(sampled_list, axis=0)
-
 
 def extract_stop_sign_points(
         scenario: NuPlanScenario,

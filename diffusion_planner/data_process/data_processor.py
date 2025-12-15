@@ -40,7 +40,7 @@ from diffusion_planner.data_process.utils import convert_data_dict_to_device_ten
 # [ADDED] 통계 저장용
 import json
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
-from diffusion_planner.data_process.road_safety_process import extract_stop_sign_points, extract_speed_bump_points, extract_crosswalk_points
+from diffusion_planner.data_process.road_safety_process import extract_stop_sign_points, extract_crosswalk_points
 
 
 class DataProcessor(object):
@@ -1035,12 +1035,6 @@ class DataProcessor(object):
             self.config.safety_len,
             self._filter_radius,
         )
-        speed_bump_points = extract_speed_bump_points(
-            scenario,
-            ego_cur_pose_np,
-            self.config.safety_len,
-            self._filter_radius,
-        )
         crosswalk_points = extract_crosswalk_points(
             scenario,
             ego_cur_pose_np,
@@ -1048,7 +1042,6 @@ class DataProcessor(object):
             self._filter_radius,
         )
         key_to_road_safety["stop_sign_points"] = stop_sign_points
-        key_to_road_safety["speed_bump_points"] = speed_bump_points
         key_to_road_safety["crosswalk_points"] = crosswalk_points
         return key_to_road_safety
 
