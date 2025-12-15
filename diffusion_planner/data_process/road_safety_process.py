@@ -12,8 +12,6 @@ from nuplan.common.actor_state.state_representation import Point2D
 from nuplan.common.maps.maps_datatypes import SemanticMapLayer, StopLineType
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 
-NUM_SAMPLED_POINTS: int = 20
-
 
 def _to_polygon(shape: Polygon | MultiPolygon) -> Polygon:
     """
@@ -32,9 +30,10 @@ def _to_polygon(shape: Polygon | MultiPolygon) -> Polygon:
     return shape
 
 
-def _sample_polygon_boundary(polygon: Polygon,
-                             num_samples: int = NUM_SAMPLED_POINTS
-                            ) -> np.ndarray:
+def _sample_polygon_boundary(
+    polygon: Polygon,
+    num_samples: int,
+) -> np.ndarray:
     """
     다각형 외곽을 따라 등간격으로 점을 만든다.
 
@@ -133,9 +132,11 @@ def _extract_polygons_from_objects(objects: Iterable) -> List[Polygon]:
     return polygons
 
 
-def extract_crosswalk_points(scenario: NuPlanScenario,
-                             ego_cur_pose_np: np.ndarray, # (3,),
-                             radius: Optional[float] = None) -> np.ndarray:
+def extract_crosswalk_points(
+        scenario: NuPlanScenario,
+        ego_cur_pose_np: np.ndarray,  # (3,),
+        safety_len: int,
+        radius: Optional[float] = None) -> np.ndarray:
     """
     자차 주변 혹은 전체 크로스워크를 등간격 점으로 반환한다.
 
@@ -162,19 +163,21 @@ def extract_crosswalk_points(scenario: NuPlanScenario,
 
     sampled_list: List[np.ndarray] = []
     for polygon in polygons:
-        sampled = _sample_polygon_boundary(polygon)
+        sampled = _sample_polygon_boundary(polygon, safety_len)
         if _is_within_radius(sampled, ego_cur_pose_np, radius):
             ego_points = _to_ego_coordinates(sampled, ego_cur_pose_np)
             sampled_list.append(ego_points)
 
     if not sampled_list:
-        return np.zeros((0, NUM_SAMPLED_POINTS, 2))
+        return np.zeros((0, safety_len, 2))
     return np.stack(sampled_list, axis=0)
 
 
-def extract_speed_bump_points(scenario: NuPlanScenario,
-                              ego_cur_pose_np: np.ndarray, # (3,),
-                              radius: Optional[float] = None) -> np.ndarray:
+def extract_speed_bump_points(
+        scenario: NuPlanScenario,
+        ego_cur_pose_np: np.ndarray,  # (3,),
+        safety_len: int,
+        radius: Optional[float] = None) -> np.ndarray:
     """
     자차 주변 혹은 전체 과속방지턱을 등간격 점으로 반환한다.
 
@@ -191,19 +194,21 @@ def extract_speed_bump_points(scenario: NuPlanScenario,
 
     sampled_list: List[np.ndarray] = []
     for polygon in polygons:
-        sampled = _sample_polygon_boundary(polygon)
+        sampled = _sample_polygon_boundary(polygon, safety_len)
         if _is_within_radius(sampled, ego_cur_pose_np, radius):
             ego_points = _to_ego_coordinates(sampled, ego_cur_pose_np)
             sampled_list.append(ego_points)
 
     if not sampled_list:
-        return np.zeros((0, NUM_SAMPLED_POINTS, 2))
+        return np.zeros((0, safety_len, 2))
     return np.stack(sampled_list, axis=0)
 
 
-def extract_stop_sign_points(scenario: NuPlanScenario,
-                             ego_cur_pose_np: np.ndarray, # (3,)
-                             radius: Optional[float] = None) -> np.ndarray:
+def extract_stop_sign_points(
+        scenario: NuPlanScenario,
+        ego_cur_pose_np: np.ndarray,  # (3,)
+        safety_len: int,
+        radius: Optional[float] = None) -> np.ndarray:
     """
     자차 주변 혹은 전체 정지표지 정지선을 등간격 점으로 반환한다.
 
@@ -238,11 +243,11 @@ def extract_stop_sign_points(scenario: NuPlanScenario,
 
     sampled_list: List[np.ndarray] = []
     for polygon in polygons:
-        sampled = _sample_polygon_boundary(polygon)
+        sampled = _sample_polygon_boundary(polygon, safety_len)
         if _is_within_radius(sampled, ego_cur_pose_np, radius):
             ego_points = _to_ego_coordinates(sampled, ego_cur_pose_np)
             sampled_list.append(ego_points)
 
     if not sampled_list:
-        return np.zeros((0, NUM_SAMPLED_POINTS, 2))
+        return np.zeros((0, safety_len, 2))
     return np.stack(sampled_list, axis=0)

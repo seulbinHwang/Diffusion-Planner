@@ -1023,30 +1023,34 @@ class DataProcessor(object):
             lanes_roadblock_id_list,
         )
 
-    def _get_road_safety_features(self, scenario: NuPlanScenario,
-                                  ego_cur_pose_np:np.ndarray,
-                                  ) -> Dict[str, np.ndarray]:
+    def _get_road_safety_features(
+        self,
+        scenario: NuPlanScenario,
+        ego_cur_pose_np: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
         key_to_road_safety = {}
         stop_sign_points = extract_stop_sign_points(
             scenario,
             ego_cur_pose_np,
+            self.config.safety_len,
             self._filter_radius,
         )
         speed_bump_points = extract_speed_bump_points(
             scenario,
             ego_cur_pose_np,
+            self.config.safety_len,
             self._filter_radius,
         )
         crosswalk_points = extract_crosswalk_points(
             scenario,
             ego_cur_pose_np,
+            self.config.safety_len,
             self._filter_radius,
         )
         key_to_road_safety["stop_sign_points"] = stop_sign_points
         key_to_road_safety["speed_bump_points"] = speed_bump_points
         key_to_road_safety["crosswalk_points"] = crosswalk_points
         return key_to_road_safety
-        
 
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
@@ -1193,10 +1197,9 @@ class DataProcessor(object):
             }
             key_to_road_safety = self._get_road_safety_features(
                 scenario=scenario,
-            ego_cur_pose_np=ego_cur_pose_np,
+                ego_cur_pose_np=ego_cur_pose_np,
             )
             key_to_array.update(key_to_road_safety)
-            
             '''
             Map
             '''
