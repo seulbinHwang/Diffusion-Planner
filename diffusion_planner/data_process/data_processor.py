@@ -40,6 +40,7 @@ from diffusion_planner.data_process.utils import convert_data_dict_to_device_ten
 # [ADDED] 통계 저장용
 import json
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
+from diffusion_planner.data_process.road_safety_process import extract_stop_sign_points, extract_speed_bump_points, extract_crosswalk_points
 
 
 class DataProcessor(object):
@@ -460,10 +461,11 @@ class DataProcessor(object):
         # neighbor_future_all_gt_3_dim: (chosen_agent_num, Tf_all, 3)
         yaw = np.arctan2(neighbor_future_all_gt_11_dim[:, :, 3],
                          neighbor_future_all_gt_11_dim[:, :, 2])
-        neighbor_future_all_gt_3_dim = np.stack(
-            [neighbor_future_all_gt_11_dim[:, :, 0],
-             neighbor_future_all_gt_11_dim[:, :, 1],
-             yaw], axis=-1)
+        neighbor_future_all_gt_3_dim = np.stack([
+            neighbor_future_all_gt_11_dim[:, :, 0],
+            neighbor_future_all_gt_11_dim[:, :, 1], yaw
+        ],
+                                                axis=-1)
         # 현재 iteration 기준으로 원하는 future 구간만 잘라서 사용
         # neighbor_future_gt_3_dim: (chosen_agent_num, Tf, 3)
         neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
@@ -493,6 +495,11 @@ class DataProcessor(object):
                 neighbor_future_all_gt_3_dim,  # (chosen_agent_num, future_all_len, 3)
             "static_objects": static_objects,  # (chosen_static_num, 10)
         }
+        key_to_road_safety = self._get_road_safety_features(
+            scenario=scenario,
+            ego_cur_pose_np=ego_cur_pose_np,
+        )
+        key_to_array.update(key_to_road_safety)
         ###################
         (
             route_roadblock_ids,
@@ -1016,6 +1023,31 @@ class DataProcessor(object):
             lanes_roadblock_id_list,
         )
 
+    def _get_road_safety_features(self, scenario: NuPlanScenario,
+                                  ego_cur_pose_np:np.ndarray,
+                                  ) -> Dict[str, np.ndarray]:
+        key_to_road_safety = {}
+        stop_sign_points = extract_stop_sign_points(
+            scenario,
+            ego_cur_pose_np,
+            self._filter_radius,
+        )
+        speed_bump_points = extract_speed_bump_points(
+            scenario,
+            ego_cur_pose_np,
+            self._filter_radius,
+        )
+        crosswalk_points = extract_crosswalk_points(
+            scenario,
+            ego_cur_pose_np,
+            self._filter_radius,
+        )
+        key_to_road_safety["stop_sign_points"] = stop_sign_points
+        key_to_road_safety["speed_bump_points"] = speed_bump_points
+        key_to_road_safety["crosswalk_points"] = crosswalk_points
+        return key_to_road_safety
+        
+
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
         # ✅ 시나리오가 여러 개일 때만 tqdm 사용
@@ -1133,10 +1165,11 @@ class DataProcessor(object):
             # neighbor_future_gt_3_dim: (chosen_agent_num, future_len, 3)
             yaw = np.arctan2(neighbor_future_gt_11_dim[:, :, 3],
                              neighbor_future_gt_11_dim[:, :, 2])
-            neighbor_future_gt_3_dim = np.stack(
-                [neighbor_future_gt_11_dim[:, :, 0],
-                 neighbor_future_gt_11_dim[:, :, 1],
-                 yaw], axis=-1)
+            neighbor_future_gt_3_dim = np.stack([
+                neighbor_future_gt_11_dim[:, :, 0],
+                neighbor_future_gt_11_dim[:, :, 1], yaw
+            ],
+                                                axis=-1)
             # 3) static 객체
             static_objects = build_static_feature(
                 present_static_feat_5=present_static_feat_5,
@@ -1158,6 +1191,12 @@ class DataProcessor(object):
                     neighbor_future_gt_3_dim,  # (chosen_agent_num, future_len, 3)
                 "static_objects": static_objects,  # (chosen_static_num, 10)
             }
+            key_to_road_safety = self._get_road_safety_features(
+                scenario=scenario,
+            ego_cur_pose_np=ego_cur_pose_np,
+            )
+            key_to_array.update(key_to_road_safety)
+            
             '''
             Map
             '''

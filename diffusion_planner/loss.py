@@ -422,13 +422,13 @@ def _normalize_futures_and_build_xT(
 
 
 def _forward_model_with_autocast(
-        model: nn.Module,
-        norm_inputs: Dict[str, torch.Tensor],
-        near_future_valid: torch.Tensor,  # (B, Pnn, future_len)
-        near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
-        batch_diffusion_time: torch.Tensor,  # (B,)
-        cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)
-use_deepspeed: bool,
+    model: nn.Module,
+    norm_inputs: Dict[str, torch.Tensor],
+    near_future_valid: torch.Tensor,  # (B, Pnn, future_len)
+    near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
+    batch_diffusion_time: torch.Tensor,  # (B,)
+    cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)
+    use_deepspeed: bool,
 ) -> Dict[str, torch.Tensor]:
     """모델 입력 dict 를 만들고 AMP 로 forward 를 수행한다.
 
@@ -465,9 +465,8 @@ use_deepspeed: bool,
         "diffusion_time": batch_diffusion_time,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, Pnn, 4)
     }
-    is_ds_engine = hasattr(model, "backward") and hasattr(model,
-                                                          "step") and hasattr(
-        model, "module")
+    is_ds_engine = hasattr(model, "backward") and hasattr(
+        model, "step") and hasattr(model, "module")
 
     if use_deepspeed:
         assert is_ds_engine, "use_deepspeed=True 인데 model 이 DS engine 아님"
@@ -828,7 +827,7 @@ def diffusion_loss_func(
         near_cur_future_norm_xT,  # (B, Pnn, 1+future_len, 4)
         batch_diffusion_time=batch_diffusion_time,  # (B,)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
-        use_deepspeed= getattr(args, "use_deepspeed", False),
+        use_deepspeed=getattr(args, "use_deepspeed", False),
     )
 
     # score: (B, Pnn, future_len, 4)
