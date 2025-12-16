@@ -33,6 +33,8 @@ PALE_CYAN = "#BFFFFF"  # 미래 궤적 refined 예측 값 # EGO Planner 궤적 �
 LIGHT_CYAN = "#80FFFF"  # 미래 궤적 refined state 값 # EGO Planner 궤적 next state 값
 BRIGHT_CYAN = "#40FFFF"  # neighbor_future_gt_3_dim
 CYAN = "#00FFFF"  # 미래 궤적 GT 예측 값 (11 dim) # ego_future_gt_11_dim
+DARK_BROWN = "#7B3F00"  # 고동색(짙은 갈색)
+YELLOW = "#FFFF00"      # 노란색(주황색 아님)
 
 
 @dataclass
@@ -111,7 +113,33 @@ class DrawingOptions:
         3: GRAY,  # 회색(청회색)
     }
     LANE_AGENT_index_fontsize: int = 10  # 에이전트 번호 텍스트 폰트 크기
+    # ===== lane_type 기반 경계 색 =====
+    LANE_surface_street_boundary_color: str = DARK_BROWN
+    LANE_bike_lane_boundary_color: str = ORANGE
+    LANE_undefined_lane_boundary_color: str = SILVER
 
+    # ===== 차선 선(road_line) 표현용 =====
+    LANE_line_white_color: str = WHITE
+    LANE_line_yellow_color: str = YELLOW
+    LANE_broken_linestyle: Any = (0, (4, 4))  # 점선 패턴
+    LANE_solid_linestyle: str = "-"
+    LANE_double_line_sep_m: float = 0.20  # 이중선 간격(미터)
+
+    # ===== road_edge =====
+    ROAD_draw_road_edge: bool = True
+    ROAD_road_edge_color: str = RED
+    ROAD_road_edge_marker_size: float = 8.0
+    ROAD_road_edge_line_width: float = 0.8
+    ROAD_road_edge_zorder: int = 3
+
+    # ===== driveway =====
+    DRIVEWAY_draw_driveway: bool = True
+    DRIVEWAY_line_color: str = WHITE
+    DRIVEWAY_line_width: float = 0.8
+    DRIVEWAY_text: str = "driveway"
+    DRIVEWAY_text_color: str = WHITE
+    DRIVEWAY_text_fontsize: int = 5
+    DRIVEWAY_polygon_zorder: int = 4
     ######### [EGO] ##############
     ########### [EGO] PAST ##################
     EGO_draw_ego_past: bool = True  # check
@@ -420,6 +448,22 @@ def _collect_valid_xy_from_input_data(
         valid_mask = np.any(np.abs(road_safety_points) > eps, axis=2)  # (N, P)
         if np.any(valid_mask):
             valid_xy = road_safety_points[valid_mask]  # (K, 2)
+            xs_local.extend(valid_xy[:, 0].tolist())
+            ys_local.extend(valid_xy[:, 1].tolist())
+    # road_edge / driveway: shape (N, P, 2)
+    for key in ("road_edge", "driveway"):
+        pts = input_data.get(key)
+        if pts is None:
+            continue
+        pts = np.asarray(pts)  # (N,P,2)
+        if pts.size == 0:
+            continue
+        if pts.ndim != 3 or pts.shape[-1] != 2:
+            raise ValueError(f"{key} shape는 (N, P, 2) 이어야 합니다. got {pts.shape}")
+
+        valid_mask = np.any(np.abs(pts) > eps, axis=2)  # (N,P)
+        if np.any(valid_mask):
+            valid_xy = pts[valid_mask]  # (K,2)
             xs_local.extend(valid_xy[:, 0].tolist())
             ys_local.extend(valid_xy[:, 1].tolist())
 
@@ -1201,7 +1245,374 @@ def collect_valid_xy_for_bounds(
 # =============================================================================
 # 레이어별 드로잉 함수 (invalid 스킵 포함)
 # =============================================================================
+from dataclasses import dataclass
 
+
+def _lane_type_one_hot_to_color(
+    lane_type_row4: Optional[Array],  # shape: (4,)
+    options: DrawingOptions,
+) -> str:
+    """lane_type(4,) 값으로 차선 경계 색을 고른다.
+
+    Args:
+        lane_type_row4: shape (4,). [FREEWAY, SURFACE_STREET, BIKE_LANE, UNDEFINED] one-hot.
+        options: DrawingOptions.
+
+    Returns:
+        color: 선택된 색 문자열.
+    """
+    if lane_type_row4 is None:
+        return options.LANE_lane_boundary_color
+
+    lane_type_row4 = np.asarray(lane_type_row4).reshape(-1)  # shape: (4,)
+    if lane_type_row4.shape[0] != 4:
+        return options.LANE_lane_boundary_color
+
+    if float(np.sum(np.abs(lane_type_row4))) == 0.0:
+        idx = 3  # UNDEFINED
+    else:
+        idx = int(np.argmax(lane_type_row4))
+
+    if idx == 0:   # FREEWAY
+        return options.LANE_lane_boundary_color
+    if idx == 1:   # SURFACE_STREET
+        return options.LANE_surface_street_boundary_color
+    if idx == 2:   # BIKE_LANE
+        return options.LANE_bike_lane_boundary_color
+    return options.LANE_undefined_lane_boundary_color
+
+
+def _line_type_one_hot_to_index_10(
+    line_type_row10: Array,  # shape: (10,)
+) -> int:
+    """left/right_line_type(10,) one-hot에서 가장 큰 인덱스를 고른다.
+
+    Args:
+        line_type_row10: shape (10,).
+
+    Returns:
+        idx: 0..9
+    """
+    line_type_row10 = np.asarray(line_type_row10).reshape(-1)  # shape: (10,)
+    if line_type_row10.shape[0] != 10:
+        raise ValueError(f"line_type shape는 (10,) 이어야 합니다. got {line_type_row10.shape}")
+
+    if float(np.sum(np.abs(line_type_row10))) == 0.0:
+        return 8  # UNKNOWN
+    return int(np.argmax(line_type_row10))
+
+
+@dataclass(frozen=True)
+class _LaneBoundaryDrawPlan:
+    """차선 경계 1쪽을 어떻게 그릴지 정리한 값들."""
+    draw: bool
+    color: str
+    is_double: bool
+    inner_linestyle: Any
+    outer_linestyle: Any
+
+
+def _make_lane_boundary_draw_plan(
+    line_type_row10: Optional[Array],  # shape: (10,) or None
+    default_color: str,
+    options: DrawingOptions,
+) -> _LaneBoundaryDrawPlan:
+    """left/right_line_type에 따라 점선/실선/이중선/색을 결정한다.
+
+    규칙:
+      - None: 원래처럼(default) 그림
+      - UNKNOWN(8): 원래처럼(default) 그림
+      - INVALID(9): 안 그림
+      - 나머지 8종: 타입에 맞게 색(흰/노란) + 점선/실선 + 이중선 반영
+
+    Args:
+        line_type_row10: shape (10,) 또는 None.
+        default_color: UNKNOWN/None일 때 쓸 기본 색.
+        options: DrawingOptions.
+
+    Returns:
+        plan: 그리기 계획(_LaneBoundaryDrawPlan).
+    """
+    # 기본(원래처럼)
+    default_plan = _LaneBoundaryDrawPlan(
+        draw=True,
+        color=default_color,
+        is_double=False,
+        inner_linestyle=options.LANE_solid_linestyle,
+        outer_linestyle=options.LANE_solid_linestyle,
+    )
+
+    if line_type_row10 is None:
+        return default_plan
+
+    idx = _line_type_one_hot_to_index_10(line_type_row10)
+
+    # INVALID
+    if idx == 9:
+        return _LaneBoundaryDrawPlan(
+            draw=False,
+            color=default_color,
+            is_double=False,
+            inner_linestyle=options.LANE_solid_linestyle,
+            outer_linestyle=options.LANE_solid_linestyle,
+        )
+
+    # UNKNOWN
+    if idx == 8:
+        return default_plan
+
+    # 타입별 매핑
+    # 0: BROKEN_SINGLE_WHITE
+    # 1: SOLID_SINGLE_WHITE
+    # 2: SOLID_DOUBLE_WHITE
+    # 3: BROKEN_SINGLE_YELLOW
+    # 4: BROKEN_DOUBLE_YELLOW
+    # 5: SOLID_SINGLE_YELLOW
+    # 6: SOLID_DOUBLE_YELLOW
+    # 7: PASSING_DOUBLE_YELLOW
+    if idx in (0, 1, 2):
+        line_color = options.LANE_line_white_color
+    else:
+        line_color = options.LANE_line_yellow_color
+
+    if idx in (0, 3):
+        # broken single
+        return _LaneBoundaryDrawPlan(
+            draw=True,
+            color=line_color,
+            is_double=False,
+            inner_linestyle=options.LANE_broken_linestyle,
+            outer_linestyle=options.LANE_broken_linestyle,
+        )
+
+    if idx in (1, 5):
+        # solid single
+        return _LaneBoundaryDrawPlan(
+            draw=True,
+            color=line_color,
+            is_double=False,
+            inner_linestyle=options.LANE_solid_linestyle,
+            outer_linestyle=options.LANE_solid_linestyle,
+        )
+
+    if idx in (2, 6):
+        # solid double
+        return _LaneBoundaryDrawPlan(
+            draw=True,
+            color=line_color,
+            is_double=True,
+            inner_linestyle=options.LANE_solid_linestyle,
+            outer_linestyle=options.LANE_solid_linestyle,
+        )
+
+    if idx == 4:
+        # broken double yellow
+        return _LaneBoundaryDrawPlan(
+            draw=True,
+            color=line_color,
+            is_double=True,
+            inner_linestyle=options.LANE_broken_linestyle,
+            outer_linestyle=options.LANE_broken_linestyle,
+        )
+
+    # PASSING_DOUBLE_YELLOW
+    # "차선 쪽(안쪽)은 점선, 바깥쪽은 실선"으로 표현
+    return _LaneBoundaryDrawPlan(
+        draw=True,
+        color=line_color,
+        is_double=True,
+        inner_linestyle=options.LANE_broken_linestyle,
+        outer_linestyle=options.LANE_solid_linestyle,
+    )
+
+
+def _compute_inward_normal_for_segment(
+    boundary_p0: Array,  # shape: (2,)
+    boundary_p1: Array,  # shape: (2,)
+    center_p0: Array,    # shape: (2,)
+    center_p1: Array,    # shape: (2,)
+) -> Array:
+    """선분의 법선 방향 중 '차선 중심 쪽'을 향하는 단위 벡터를 만든다.
+
+    Args:
+        boundary_p0: 경계 선분 시작점, shape (2,)
+        boundary_p1: 경계 선분 끝점, shape (2,)
+        center_p0: 중심 선분 시작점, shape (2,)
+        center_p1: 중심 선분 끝점, shape (2,)
+
+    Returns:
+        inward_normal: shape (2,) 단위 벡터
+    """
+    seg = (boundary_p1 - boundary_p0).astype(np.float32)  # shape: (2,)
+    seg_len = float(np.hypot(seg[0], seg[1]))
+    if seg_len < 1e-6:
+        return np.array([0.0, 0.0], dtype=np.float32)
+
+    # 한쪽 법선
+    normal = np.array([-seg[1], seg[0]], dtype=np.float32) / seg_len  # shape: (2,)
+
+    boundary_mid = 0.5 * (boundary_p0 + boundary_p1)  # shape: (2,)
+    center_mid = 0.5 * (center_p0 + center_p1)        # shape: (2,)
+    to_center = (center_mid - boundary_mid).astype(np.float32)  # shape: (2,)
+
+    if float(np.dot(normal, to_center)) < 0.0:
+        normal = -normal
+    return normal
+
+
+def _draw_single_line_segment(
+    ax: plt.Axes,
+    p0: Array,  # shape: (2,)
+    p1: Array,  # shape: (2,)
+    color: str,
+    line_width: float,
+    linestyle: Any,
+    zorder: int,
+) -> None:
+    """선분 1개를 실선/점선으로 그린다."""
+    ax.plot(
+        [float(p0[0]), float(p1[0])],
+        [float(p0[1]), float(p1[1])],
+        color=color,
+        linewidth=line_width,
+        linestyle=linestyle,
+        zorder=zorder,
+    )
+
+
+def _draw_double_line_segment(
+    ax: plt.Axes,
+    p0: Array,  # shape: (2,)
+    p1: Array,  # shape: (2,)
+    inward_normal: Array,  # shape: (2,)
+    sep_m: float,
+    color: str,
+    line_width: float,
+    inner_linestyle: Any,
+    outer_linestyle: Any,
+    zorder: int,
+) -> None:
+    """이중선을 '안쪽(차선 쪽)' / '바깥쪽' 두 줄로 그린다."""
+    half = 0.5 * float(sep_m)
+    shift = inward_normal.astype(np.float32) * half  # shape: (2,)
+
+    p0_in = p0 + shift
+    p1_in = p1 + shift
+    p0_out = p0 - shift
+    p1_out = p1 - shift
+
+    _draw_single_line_segment(ax, p0_in, p1_in, color, line_width, inner_linestyle, zorder)
+    _draw_single_line_segment(ax, p0_out, p1_out, color, line_width, outer_linestyle, zorder)
+
+
+def draw_road_edge_points(
+    ax: plt.Axes,
+    road_edge: Optional[Array],        # shape: (E, safety_len=10, 2)
+    road_edge_type: Optional[Array],   # shape: (E, 3)
+    options: DrawingOptions,
+) -> None:
+    """road_edge를 빨간색 점들로 그린다.
+
+    - road_edge: (E,10,2) 점들
+    - road_edge_type: (E,3) one-hot
+      * UNKNOWN -> 'o'
+      * BOUNDARY -> '*'
+      * MEDIAN -> 'x'
+
+    Args:
+        ax: Matplotlib 축.
+        road_edge: shape (E,10,2)
+        road_edge_type: shape (E,3)
+        options: 색/크기 옵션.
+    """
+    if not options.ROAD_draw_road_edge:
+        return
+    if road_edge is None:
+        return
+
+    road_edge = np.asarray(road_edge)  # (E,10,2)
+    if road_edge.size == 0:
+        return
+    if road_edge.ndim != 3 or road_edge.shape[-1] != 2:
+        raise ValueError(f"road_edge shape는 (E,10,2) 이어야 합니다. got {road_edge.shape}")
+
+    E = int(road_edge.shape[0])
+
+    if road_edge_type is not None:
+        road_edge_type = np.asarray(road_edge_type)  # (E,3)
+        if road_edge_type.ndim != 2 or road_edge_type.shape != (E, 3):
+            raise ValueError(
+                f"road_edge_type shape는 (E,3) 이어야 합니다. got {road_edge_type.shape}, E={E}"
+            )
+
+    eps = float(options.invalid_eps)
+
+    for i in range(E):
+        pts = road_edge[i]  # (10,2)
+        valid_mask = np.any(np.abs(pts) > eps, axis=1)  # (10,)
+        if not np.any(valid_mask):
+            continue
+
+        if road_edge_type is None:
+            type_idx = 0
+        else:
+            row3 = road_edge_type[i].reshape(-1)  # (3,)
+            type_idx = int(np.argmax(row3)) if float(np.sum(np.abs(row3))) > 0.0 else 0
+
+        marker = "o"
+        if type_idx == 1:
+            marker = "*"
+        elif type_idx == 2:
+            marker = "x"
+
+        xy = pts[valid_mask]  # (K,2)
+        ax.scatter(
+            xy[:, 0],
+            xy[:, 1],
+            marker=marker,
+            s=float(options.ROAD_road_edge_marker_size),
+            linewidths=float(options.ROAD_road_edge_line_width),
+            edgecolors=options.ROAD_road_edge_color,
+            facecolors="none",
+            zorder=int(options.ROAD_road_edge_zorder),
+        )
+
+
+def draw_driveway_points(
+    ax: plt.Axes,
+    driveway: Optional[Array],  # shape: (D, safety_len=10, 2)
+    options: DrawingOptions,
+) -> None:
+    """driveway를 흰색 테두리 다각형으로 그리고, 가운데에 'driveway' 글씨를 적는다.
+
+    Args:
+        ax: Matplotlib 축.
+        driveway: shape (D,10,2)
+        options: 색/두께/글씨 옵션.
+    """
+    if not options.DRIVEWAY_draw_driveway:
+        return
+    if driveway is None:
+        return
+
+    driveway = np.asarray(driveway)  # (D,10,2)
+    if driveway.size == 0:
+        return
+    if driveway.ndim != 3 or driveway.shape[-1] != 2:
+        raise ValueError(f"driveway shape는 (D,10,2) 이어야 합니다. got {driveway.shape}")
+
+    # 기존 안전 폴리곤 함수 재사용(테두리 + 중앙 텍스트)
+    draw_road_safety_polygons_with_text(
+        ax=ax,
+        road_safety_points=driveway,
+        label_text=options.DRIVEWAY_text,
+        line_color=options.DRIVEWAY_line_color,
+        line_width=options.DRIVEWAY_line_width,
+        text_color=options.DRIVEWAY_text_color,
+        text_fontsize=options.DRIVEWAY_text_fontsize,
+        options=options,
+        zorder=options.DRIVEWAY_polygon_zorder,
+    )
 
 def draw_lane_boundaries(
     ax: plt.Axes,
@@ -1209,84 +1620,180 @@ def draw_lane_boundaries(
     agent_route_lane_order: Optional[Array],  # (max_agent_num, lane_num)
     options: DrawingOptions,
     draw_token_int_list: Optional[List[int]] = None,
+    lane_type: Optional[Array] = None,        # (lane_num, 4)
+    left_line_type: Optional[Array] = None,   # (lane_num, 10)
+    right_line_type: Optional[Array] = None,  # (lane_num, 10)
 ) -> None:
-    """좌/우 차선 경계를 실선으로 그림(양 끝점 모두 valid일 때만 선분을 그림).
+    """차선 좌/우 경계를 그린다.
 
-    (lane_num, lane_len, 12)
+    입력 shape
+      - lanes: (L, T, 12)
+      - lane_type: (L, 4)  (선택)
+      - left_line_type/right_line_type: (L, 10) (선택)
+
+    동작 요약
+      - lane_type이 있으면 경계 기본 색을 lane 종류에 맞게 바꿈
+      - left/right_line_type이 있으면 흰/노란 + 점선/실선 + 이중선까지 반영
+      - UNKNOWN이면 원래처럼 그리고, INVALID면 그리지 않음
     """
     if lanes is None or lanes.size == 0:
         return
-    if draw_token_int_list is not None and agent_route_lane_order is not None and options.LANE_draw_npc_agent_route and options.LANE_npc_agent_route_draw_mode == "lane":
-        """
-        extract draw token int agent from agent_route_lane_order.
-        """
+
+    # route highlight 필터링(기존 로직 유지)
+    if (
+        draw_token_int_list is not None
+        and agent_route_lane_order is not None
+        and options.LANE_draw_npc_agent_route
+        and options.LANE_npc_agent_route_draw_mode == "lane"
+    ):
         filtered_agent_route_lane_order = []
         for agent_idx in range(agent_route_lane_order.shape[0]):
             if agent_idx in draw_token_int_list:
-                filtered_agent_route_lane_order.append(
-                    agent_route_lane_order[agent_idx])
-        agent_route_lane_order = np.array(
-            filtered_agent_route_lane_order)  # (filtered_agent_num, lane_num)
+                filtered_agent_route_lane_order.append(agent_route_lane_order[agent_idx])
+        agent_route_lane_order = np.array(filtered_agent_route_lane_order)
         if agent_route_lane_order.shape[0] == 0:
             agent_route_lane_order = None
     else:
         agent_route_lane_order = None
-    eps = options.invalid_eps
-    for idx, lane_i in enumerate(lanes):  # (lane_len, 12)
-        center = lane_i[:, 0:2]
-        left_vec = lane_i[:, 4:6]
-        right_vec = lane_i[:, 6:8]
-        valid = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)  # (lane_len,)
+
+    L = int(lanes.shape[0])
+    eps = float(options.invalid_eps)
+
+    # shape 체크(있을 때만)
+    if lane_type is not None:
+        lane_type = np.asarray(lane_type)
+        if lane_type.ndim != 2 or lane_type.shape != (L, 4):
+            raise ValueError(f"lane_type shape는 (lane_num,4) 이어야 합니다. got {lane_type.shape}, L={L}")
+
+    if left_line_type is not None:
+        left_line_type = np.asarray(left_line_type)
+        if left_line_type.ndim != 2 or left_line_type.shape != (L, 10):
+            raise ValueError(f"left_line_type shape는 (lane_num,10) 이어야 합니다. got {left_line_type.shape}, L={L}")
+
+    if right_line_type is not None:
+        right_line_type = np.asarray(right_line_type)
+        if right_line_type.ndim != 2 or right_line_type.shape != (L, 10):
+            raise ValueError(f"right_line_type shape는 (lane_num,10) 이어야 합니다. got {right_line_type.shape}, L={L}")
+
+    for idx, lane_i in enumerate(lanes):  # lane_i: (lane_len, 12)
+        center = lane_i[:, 0:2]      # (T,2)
+        left_vec = lane_i[:, 4:6]    # (T,2)
+        right_vec = lane_i[:, 6:8]   # (T,2)
+        valid = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)  # (T,)
 
         if center.shape[0] < 2:
             continue
-        color = options.LANE_lane_boundary_color
+
+        # lane_type 기반 기본 색
+        lane_type_row4 = lane_type[idx] if lane_type is not None else None
+        base_color = _lane_type_one_hot_to_color(lane_type_row4, options)
+
+        # left/right line 계획
+        left_plan = _make_lane_boundary_draw_plan(
+            left_line_type[idx] if left_line_type is not None else None,
+            default_color=base_color,
+            options=options,
+        )
+        right_plan = _make_lane_boundary_draw_plan(
+            right_line_type[idx] if right_line_type is not None else None,
+            default_color=base_color,
+            options=options,
+        )
 
         for j in range(center.shape[0] - 1):
             if not (valid[j] and valid[j + 1]):
                 continue
-            l0 = center[j] + left_vec[j]
-            l1 = center[j + 1] + left_vec[j + 1]
-            r0 = center[j] + right_vec[j]
-            r1 = center[j + 1] + right_vec[j + 1]
-            ax.plot([l0[0], l1[0]], [l0[1], l1[1]],
-                    color=color,
-                    linewidth=options.LANE_boundary_width,
-                    zorder=1)
-            ax.plot([r0[0], r1[0]], [r0[1], r1[1]],
-                    color=color,
-                    linewidth=options.LANE_boundary_width,
-                    zorder=1)
-        # =============== 에이전트 경로 차선 경계 강조 그리기 [시작] ===============
+
+            c0 = center[j]
+            c1 = center[j + 1]
+            l0 = c0 + left_vec[j]
+            l1 = c1 + left_vec[j + 1]
+            r0 = c0 + right_vec[j]
+            r1 = c1 + right_vec[j + 1]
+
+            # left
+            if left_plan.draw:
+                if left_plan.is_double:
+                    inward_n = _compute_inward_normal_for_segment(l0, l1, c0, c1)  # (2,)
+                    _draw_double_line_segment(
+                        ax=ax,
+                        p0=l0,
+                        p1=l1,
+                        inward_normal=inward_n,
+                        sep_m=float(options.LANE_double_line_sep_m),
+                        color=left_plan.color,
+                        line_width=float(options.LANE_boundary_width),
+                        inner_linestyle=left_plan.inner_linestyle,
+                        outer_linestyle=left_plan.outer_linestyle,
+                        zorder=1,
+                    )
+                else:
+                    _draw_single_line_segment(
+                        ax=ax,
+                        p0=l0,
+                        p1=l1,
+                        color=left_plan.color,
+                        line_width=float(options.LANE_boundary_width),
+                        linestyle=left_plan.inner_linestyle,
+                        zorder=1,
+                    )
+
+            # right
+            if right_plan.draw:
+                if right_plan.is_double:
+                    inward_n = _compute_inward_normal_for_segment(r0, r1, c0, c1)  # (2,)
+                    _draw_double_line_segment(
+                        ax=ax,
+                        p0=r0,
+                        p1=r1,
+                        inward_normal=inward_n,
+                        sep_m=float(options.LANE_double_line_sep_m),
+                        color=right_plan.color,
+                        line_width=float(options.LANE_boundary_width),
+                        inner_linestyle=right_plan.inner_linestyle,
+                        outer_linestyle=right_plan.outer_linestyle,
+                        zorder=1,
+                    )
+                else:
+                    _draw_single_line_segment(
+                        ax=ax,
+                        p0=r0,
+                        p1=r1,
+                        color=right_plan.color,
+                        line_width=float(options.LANE_boundary_width),
+                        linestyle=right_plan.inner_linestyle,
+                        zorder=1,
+                    )
+
+        # ===== 기존 route 강조(필요 시) =====
         if agent_route_lane_order is not None:
-            # TODO: 지금은 모든 에이전트를 같은 색으로 표시중. 개별 색상 지정 가능하도록 개선 필요.
             try:
-                agent_route_a_lane_order = agent_route_lane_order[:,
-                                                                  idx]  # (filtered_agent_num,)
-            except:
+                agent_route_a_lane_order = agent_route_lane_order[:, idx]  # (filtered_agent_num,)
+            except Exception:
                 raise ValueError(
-                    f"agent_route_lane_order shape {agent_route_lane_order.shape} incompatible with lane idx {idx} "
-                    f"agent_route_lane_order: ,{agent_route_lane_order} ")
-            has_route_mask = (agent_route_a_lane_order != -1)  # True면 경로에 포함
+                    f"agent_route_lane_order shape {agent_route_lane_order.shape} incompatible with lane idx {idx}"
+                )
+            has_route_mask = (agent_route_a_lane_order != -1)
             if np.any(has_route_mask):
                 color = CYAN
-                # 유효한 인접 포인트 구간만 강조 라인으로 그림
                 for j in range(center.shape[0] - 1):
                     if not (valid[j] and valid[j + 1]):
                         continue
-                    l0 = center[j] + left_vec[j]
-                    l1 = center[j + 1] + left_vec[j + 1]
-                    r0 = center[j] + right_vec[j]
-                    r1 = center[j + 1] + right_vec[j + 1]
-                    ax.plot([l0[0], l1[0]], [l0[1], l1[1]],
-                            color=color,
-                            linewidth=options.LANE_boundary_width,
-                            zorder=2)
-                    ax.plot([r0[0], r1[0]], [r0[1], r1[1]],
-                            color=color,
-                            linewidth=options.LANE_boundary_width,
-                            zorder=2)
-        # =============== 에이전트 경로 차선 경계 강조 그리기 [끝] ===============
+                    c0 = center[j]
+                    c1 = center[j + 1]
+                    l0 = c0 + left_vec[j]
+                    l1 = c1 + left_vec[j + 1]
+                    r0 = c0 + right_vec[j]
+                    r1 = c1 + right_vec[j + 1]
+
+                    # line_type이 INVALID면 route도 그리지 않음
+                    if left_plan.draw:
+                        ax.plot([l0[0], l1[0]], [l0[1], l1[1]],
+                                color=color, linewidth=options.LANE_boundary_width, zorder=2)
+                    if right_plan.draw:
+                        ax.plot([r0[0], r1[0]], [r0[1], r1[1]],
+                                color=color, linewidth=options.LANE_boundary_width, zorder=2)
+
 
 
 def draw_lane_centerlines(
@@ -1504,7 +2011,9 @@ def draw_neighbor_past(
                 "fill_alpha"] if t == current_t else None
             # NEW: 현재 시점만 neighbor_role에 따라 테두리 색 변경
             edge_color = neighbor_cls_style["line_color"]
+            line_width = neighbor_cls_style["line_width"]
             if t == current_t:
+                line_width = 0.6
                 edge_color = _get_neighbor_edge_color_for_current_t(
                     agent_idx=agent_idx,
                     neighbor_role=neighbor_role,
@@ -1516,7 +2025,7 @@ def draw_neighbor_past(
                 ax,
                 corners,
                 edge_color=edge_color,  # CHANGED
-                line_width=neighbor_cls_style["line_width"],
+                line_width=line_width,
                 fill_color=fill_color,
                 fill_alpha=fill_alpha,
                 zorder=5 if t == current_t else 4,
@@ -2809,6 +3318,20 @@ def draw_world_model_to_png(
 
     #########################################
     draw_lane(ax, input_data, draw_option, draw_token_list)
+
+    # [ADD] road_edge / driveway
+    draw_road_edge_points(
+        ax=ax,
+        road_edge=input_data.get("road_edge", None),
+        road_edge_type=input_data.get("road_edge_type", None),
+        options=draw_option,
+    )
+    draw_driveway_points(
+        ax=ax,
+        driveway=input_data.get("driveway", None),
+        options=draw_option,
+    )
+
     draw_road_safety(ax, input_data, draw_option)
     draw_ego(ax, input_data, draw_option)
     # NEW: ego 주변 반경 원

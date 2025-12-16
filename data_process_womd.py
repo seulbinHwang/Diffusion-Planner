@@ -1,4 +1,4 @@
-# data_process.py
+
 import multiprocessing as mp
 import os
 import pickle
@@ -6,18 +6,41 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-import argparse
+from collections import Counter
+import draw_machine
+import traceback
 import signal
 import faulthandler
 import time
 import sys  # 추가
 import contextlib
 import multiprocessing.pool as mppool
+_LOG_ENABLED = True          # 메인 프로세스는 기본 출력
+_LOGGER_PID_VAL = None       # multiprocessing.Value (pid 저장)
+def _ping() -> str:
+    return f"ping pid={os.getpid()}"
+def _claim_logger_if_needed() -> None:
+    """처음 일을 시작한 워커 1개만 로거로 '선점'해서 출력하도록 함."""
+    global _LOG_ENABLED
+    if _LOGGER_PID_VAL is None:
+        _LOG_ENABLED = True
+        return
+
+    with _LOGGER_PID_VAL.get_lock():
+        if _LOGGER_PID_VAL.value == 0:
+            _LOGGER_PID_VAL.value = os.getpid()
+
+    _LOG_ENABLED = (_LOGGER_PID_VAL.value == os.getpid())
+
 _WORKER_STOP_EVENT = None  # 추가 (spawn 워커에서 init으로 채움)
 
 
 def _log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {msg}", flush=True)
+    if not _LOG_ENABLED:
+        return
+    print(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {msg}",
+          file=sys.stderr, flush=True)
+
 
 
 import numpy as np
@@ -28,7 +51,6 @@ from tqdm import tqdm
 from waymo_open_dataset.protos import scenario_pb2
 import math
 import args_util
-import draw_machine
 import contextlib
 import multiprocessing.pool as mppool
 import time
@@ -160,17 +182,41 @@ def wrap_angle(angle: torch.Tensor,
 # 설정값 (요구사항 고정)
 # =========================
 
+
 SPLITS: Tuple[str, ...] = ("training", "validation", "testing")
 
-TIME_LEN: int = 21  # 20(past) + 1(current)
-FUTURE_LEN: int = 80  # 8초(0.1s 간격)
+# args_util.py에서 주입받는 길이들(워커 init에서 설정됨)
+TIME_LEN: int = 0
+FUTURE_LEN: int = 0
+SAFETY_LEN: int = 0
+LANE_LEN: int = 0
+
 DT_SEC: float = 0.1
-
-SAFETY_LEN: int = 10  # stop/crosswalk/speed_bump 포인트 수
-LANE_LEN: int = 10  # lane 샘플 포인트 수
-
 EPS: float = 1e-6
 
+
+def _set_womd_lengths_from_args(args: Any) -> None:
+    """args_util.py 인자에서 길이 관련 설정을 가져와 전역 변수에 주입합니다."""
+    global TIME_LEN, FUTURE_LEN, SAFETY_LEN, LANE_LEN
+    TIME_LEN = int(getattr(args, "time_len"))
+    FUTURE_LEN = int(getattr(args, "future_len"))
+    SAFETY_LEN = int(getattr(args, "safety_len"))
+    LANE_LEN = int(getattr(args, "lane_len"))
+
+    if TIME_LEN <= 0 or FUTURE_LEN <= 0 or SAFETY_LEN <= 0 or LANE_LEN <= 0:
+        raise ValueError(
+            f"Invalid lengths: time_len={TIME_LEN}, future_len={FUTURE_LEN}, "
+            f"safety_len={SAFETY_LEN}, lane_len={LANE_LEN}"
+        )
+
+
+def _require_womd_lengths_initialized() -> None:
+    """워커 init에서 길이값이 세팅되었는지 확인합니다."""
+    if TIME_LEN <= 0 or FUTURE_LEN <= 0 or SAFETY_LEN <= 0 or LANE_LEN <= 0:
+        raise RuntimeError(
+            "WOMD lengths are not initialized. "
+            "Make sure Pool initializer calls _set_womd_lengths_from_args()."
+        )
 
 # =========================
 # 데이터 구조 (맵 파싱용)
@@ -183,6 +229,8 @@ class LaneInfo:
     left_boundary_feature_ids: List[int]
     right_boundary_feature_ids: List[int]
     speed_limit_mph: float
+    lane_type: int  # ✅ 추가: lane의 큰 분류(고속도로/일반도로/자전거/미정)
+
 
 
 @dataclass(frozen=True)
@@ -191,8 +239,25 @@ class ParsedMap:
     stop_sign_xy_global: List[np.ndarray]  # each shape: (2,)
     crosswalk_polygons_xy_global: List[np.ndarray]  # each shape: (M,2)
     speed_bump_polygons_xy_global: List[np.ndarray]
+
+    # ✅ 추가: driveway polygon (각각 (M,2))
+    driveway_polygons_xy_global: List[np.ndarray]
+
     lanes: List[LaneInfo]
+
+    # boundary (road_line / road_edge) polyline
     boundary_polylines_xy_global: Dict[int, np.ndarray]  # id -> shape: (K,2)
+
+    # ✅ 추가: boundary id가 road_line인지 road_edge인지 구분
+    boundary_id_to_kind: Dict[int, str]  # id -> "road_line" or "road_edge"
+
+    # ✅ 추가: road_line / road_edge 타입(정수 enum) 저장
+    road_line_type_by_id: Dict[int, int]  # road_line id -> type int
+    road_edge_type_by_id: Dict[int, int]  # road_edge id -> type int
+
+    # ✅ 추가: road_edge id 목록(road_edge 출력용)
+    road_edge_ids: List[int]
+
 
 
 # =========================
@@ -205,6 +270,310 @@ def ensure_dir(path: Path) -> None:
         path: 만들고 싶은 폴더 경로
     """
     path.mkdir(parents=True, exist_ok=True)
+
+def _proto_points_to_xy_array(points: Iterable[Any]) -> np.ndarray:
+    """proto의 점 목록을 (N,2) numpy 배열로 바꿉니다.
+
+    Args:
+        points: 각 원소가 x, y 값을 가진 점들의 목록(반복 가능한 형태)
+
+    Returns:
+        xy: shape (N,2) float32
+    """
+    points_list = [(float(p.x), float(p.y)) for p in points]
+    if len(points_list) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    return np.asarray(points_list, dtype=np.float32)  # shape (N,2)
+
+
+def lane_type_value_to_one_hot_4(lane_type_value: int) -> np.ndarray:
+    """차선의 큰 종류를 4칸짜리 0/1 벡터로 바꿉니다.
+
+    출력 순서(4칸):
+        0: FREEWAY
+        1: SURFACE_STREET
+        2: BIKE_LANE
+        3: UNDEFINED
+
+    Args:
+        lane_type_value: Waymo map proto의 lane.type 값(정수)
+
+    Returns:
+        one_hot: shape (4,) float32
+    """
+    # one_hot: np.ndarray, shape (4,)
+    one_hot = np.zeros((4,), dtype=np.float32)
+
+    # Waymo map.proto(또는 tf.Example 문서)에서 일반적으로 쓰이는 값:
+    # 0: TYPE_UNDEFINED
+    # 1: TYPE_FREEWAY
+    # 2: TYPE_SURFACE_STREET
+    # 3: TYPE_BIKE_LANE
+    if lane_type_value == 1:
+        one_hot[0] = 1.0
+    elif lane_type_value == 2:
+        one_hot[1] = 1.0
+    elif lane_type_value == 3:
+        one_hot[2] = 1.0
+    else:
+        one_hot[3] = 1.0
+    return one_hot
+
+
+def road_line_type_value_to_one_hot_10(
+    road_line_type_value: int,
+    has_line: bool,
+) -> np.ndarray:
+    """차선 경계 '선'의 종류를 10칸짜리 0/1 벡터로 바꿉니다.
+
+    출력 순서(10칸):
+        0: BROKEN_SINGLE_WHITE
+        1: SOLID_SINGLE_WHITE
+        2: SOLID_DOUBLE_WHITE
+        3: BROKEN_SINGLE_YELLOW
+        4: BROKEN_DOUBLE_YELLOW
+        5: SOLID_SINGLE_YELLOW
+        6: SOLID_DOUBLE_YELLOW
+        7: PASSING_DOUBLE_YELLOW
+        8: UNKNOWN
+        9: INVALID (해당 방향 선이 아예 없는 경우)
+
+    Args:
+        road_line_type_value: Waymo map proto의 road_line.type 값(정수)
+        has_line: True면 "선이 있다", False면 "선이 없다(=INVALID)"로 처리
+
+    Returns:
+        one_hot: shape (10,) float32
+    """
+    # one_hot: np.ndarray, shape (10,)
+    one_hot = np.zeros((10,), dtype=np.float32)
+
+    if not has_line:
+        one_hot[9] = 1.0
+        return one_hot
+
+    # Waymo map.proto에서 일반적으로 쓰이는 값:
+    # 0: TYPE_UNKNOWN
+    # 1..8: 각 선 종류
+    mapping = {
+        1: 0,  # BROKEN_SINGLE_WHITE
+        2: 1,  # SOLID_SINGLE_WHITE
+        3: 2,  # SOLID_DOUBLE_WHITE
+        4: 3,  # BROKEN_SINGLE_YELLOW
+        5: 4,  # BROKEN_DOUBLE_YELLOW
+        6: 5,  # SOLID_SINGLE_YELLOW
+        7: 6,  # SOLID_DOUBLE_YELLOW
+        8: 7,  # PASSING_DOUBLE_YELLOW
+        0: 8,  # UNKNOWN
+    }
+    idx = mapping.get(int(road_line_type_value), 8)  # 모르는 값은 UNKNOWN
+    one_hot[idx] = 1.0
+    return one_hot
+
+
+def road_edge_type_value_to_one_hot_3(road_edge_type_value: int) -> np.ndarray:
+    """road_edge의 종류를 3칸짜리 0/1 벡터로 바꿉니다.
+
+    출력 순서(3칸):
+        0: TYPE_UNKNOWN
+        1: TYPE_ROAD_EDGE_BOUNDARY
+        2: TYPE_ROAD_EDGE_MEDIAN
+
+    Args:
+        road_edge_type_value: Waymo map proto의 road_edge.type 값(정수)
+
+    Returns:
+        one_hot: shape (3,) float32
+    """
+    # one_hot: np.ndarray, shape (3,)
+    one_hot = np.zeros((3,), dtype=np.float32)
+
+    # 보통 값:
+    # 0: UNKNOWN
+    # 1: BOUNDARY
+    # 2: MEDIAN
+    if road_edge_type_value == 1:
+        one_hot[1] = 1.0
+    elif road_edge_type_value == 2:
+        one_hot[2] = 1.0
+    else:
+        one_hot[0] = 1.0
+    return one_hot
+
+
+def _choose_road_line_type_for_lane_side(
+    boundary_feature_ids: List[int],
+    boundary_id_to_kind: Dict[int, str],
+    road_line_type_by_id: Dict[int, int],
+) -> Tuple[int, bool]:
+    """lane의 한쪽(왼쪽/오른쪽)에서 '대표 선 종류'를 하나 고릅니다.
+
+    처리 규칙(한 lane의 한쪽에 boundary_feature_id가 여러 개 있을 수 있어서 필요):
+    1) boundary_feature_id 중 "road_line"인 것만 후보로 모읍니다.
+    2) 후보가 하나도 없으면 => has_line=False (INVALID)
+    3) 후보가 있는데, UNKNOWN(0) 말고 다른 값이 있으면:
+       - UNKNOWN이 아닌 값들 중 "가장 많이 나온 값"을 대표로 씁니다.
+    4) 후보가 전부 UNKNOWN(0)이면 => 대표값=0, has_line=True (UNKNOWN)
+
+    Args:
+        boundary_feature_ids: lane의 왼쪽 또는 오른쪽 boundary_feature_id 목록
+        boundary_id_to_kind: boundary id가 road_line인지 road_edge인지 구분하는 dict
+        road_line_type_by_id: road_line id -> road_line.type(정수) dict
+
+    Returns:
+        chosen_type_value: 대표 road_line.type 값(정수). 선이 없으면 0
+        has_line: True면 선이 있음, False면 선이 없음(INVALID)
+    """
+    # 후보 타입들: List[int]
+    candidate_types: List[int] = []
+    for fid in boundary_feature_ids:
+        if boundary_id_to_kind.get(int(fid), "") != "road_line":
+            continue
+        if int(fid) not in road_line_type_by_id:
+            continue
+        candidate_types.append(int(road_line_type_by_id[int(fid)]))
+
+    if len(candidate_types) == 0:
+        return 0, False  # 선이 아예 없음(INVALID)
+
+    non_unknown = [t for t in candidate_types if t != 0]
+    if len(non_unknown) == 0:
+        return 0, True  # 선은 있는데 타입을 모름(UNKNOWN)
+
+    # 가장 많이 나온 값 선택(동점이면 Counter가 먼저 본 것 기준으로 안정적으로 뽑힘)
+    chosen = Counter(non_unknown).most_common(1)[0][0]
+    return int(chosen), True
+
+
+def build_lane_type_one_hot_array(lanes: List[LaneInfo]) -> np.ndarray:
+    """lane 목록을 (lane_num, 4) lane_type 배열로 만듭니다.
+
+    Args:
+        lanes: LaneInfo 리스트
+
+    Returns:
+        lane_type: shape (lane_num, 4) float32
+    """
+    lane_num = len(lanes)
+    lane_type = np.zeros((lane_num, 4), dtype=np.float32)  # shape (L,4)
+    for i, lane in enumerate(lanes):
+        lane_type[i] = lane_type_value_to_one_hot_4(int(lane.lane_type))
+    return lane_type
+
+
+def build_lane_line_type_arrays(
+    lanes: List[LaneInfo],
+    boundary_id_to_kind: Dict[int, str],
+    road_line_type_by_id: Dict[int, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """각 lane의 왼쪽/오른쪽 선 종류를 (lane_num,10)으로 만듭니다.
+
+    Args:
+        lanes: LaneInfo 리스트
+        boundary_id_to_kind: boundary id -> "road_line"/"road_edge"
+        road_line_type_by_id: road_line id -> road_line.type 값
+
+    Returns:
+        left_line_type: shape (lane_num, 10) float32
+        right_line_type: shape (lane_num, 10) float32
+    """
+    lane_num = len(lanes)
+
+    left_line_type = np.zeros((lane_num, 10), dtype=np.float32)   # shape (L,10)
+    right_line_type = np.zeros((lane_num, 10), dtype=np.float32)  # shape (L,10)
+
+    for i, lane in enumerate(lanes):
+        left_type_value, left_has_line = _choose_road_line_type_for_lane_side(
+            boundary_feature_ids=lane.left_boundary_feature_ids,
+            boundary_id_to_kind=boundary_id_to_kind,
+            road_line_type_by_id=road_line_type_by_id,
+        )
+        right_type_value, right_has_line = _choose_road_line_type_for_lane_side(
+            boundary_feature_ids=lane.right_boundary_feature_ids,
+            boundary_id_to_kind=boundary_id_to_kind,
+            road_line_type_by_id=road_line_type_by_id,
+        )
+
+        left_line_type[i] = road_line_type_value_to_one_hot_10(
+            road_line_type_value=int(left_type_value),
+            has_line=bool(left_has_line),
+        )
+        right_line_type[i] = road_line_type_value_to_one_hot_10(
+            road_line_type_value=int(right_type_value),
+            has_line=bool(right_has_line),
+        )
+
+    return left_line_type, right_line_type
+
+
+def build_road_edge_points_and_types(
+    road_edge_ids: List[int],
+    boundary_polylines_xy_global: Dict[int, np.ndarray],
+    road_edge_type_by_id: Dict[int, int],
+    ego_xy_global: np.ndarray,  # shape (2,)
+    ego_yaw_global: float,
+    safety_len: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """road_edge를 (점들, 타입)으로 캐싱용 배열로 만듭니다.
+
+    - road_edge는 "점들의 줄"로 주어지므로, 전체 길이를 따라 같은 간격으로 safety_len개 점을 뽑습니다.
+    - 좌표는 ego 기준으로 바꿉니다.
+
+    Args:
+        road_edge_ids: road_edge feature id 목록
+        boundary_polylines_xy_global: boundary id -> polyline (K,2)
+        road_edge_type_by_id: road_edge id -> type 값(정수)
+        ego_xy_global: ego 전역 위치, shape (2,)
+        ego_yaw_global: ego 전역 방향(라디안)
+        safety_len: 출력 점 개수(요구사항: 10)
+
+    Returns:
+        road_edge_points: shape (n_road_edge, safety_len, 2) float32
+        road_edge_type: shape (n_road_edge, 3) float32 (one-hot)
+    """
+    n_road_edge = len(road_edge_ids)
+    road_edge_points = np.zeros((n_road_edge, safety_len, 2), dtype=np.float32)  # (E,10,2)
+    road_edge_type = np.zeros((n_road_edge, 3), dtype=np.float32)               # (E,3)
+
+    for i, edge_id in enumerate(road_edge_ids):
+        poly_xy_g = boundary_polylines_xy_global.get(
+            int(edge_id), np.zeros((0, 2), dtype=np.float32)
+        )  # shape (K,2)
+
+        poly_xy_l = transform_points_global_to_ego_local(
+            poly_xy_g, ego_xy_global, ego_yaw_global
+        )  # shape (K,2)
+
+        sampled = resample_polyline_equal_distance(
+            poly_xy_l, num_samples=safety_len, closed=False
+        )  # shape (safety_len,2)
+
+        road_edge_points[i] = sampled
+        edge_type_value = int(road_edge_type_by_id.get(int(edge_id), 0))
+        road_edge_type[i] = road_edge_type_value_to_one_hot_3(edge_type_value)
+
+    return road_edge_points, road_edge_type
+
+
+def _extract_driveway_polygon_xy_global(driveway_msg: Any) -> np.ndarray:
+    """driveway 메시지에서 (M,2) polygon 점들을 뽑습니다.
+
+    데이터/버전에 따라 내부 필드명이 약간 다를 수 있어,
+    polygon이 있으면 polygon을 우선 사용하고,
+    없으면 polyline을 대체로 사용합니다.
+
+    Args:
+        driveway_msg: mf.driveway (proto 메시지)
+
+    Returns:
+        polygon_xy: shape (M,2) float32
+    """
+    if hasattr(driveway_msg, "polygon") and len(getattr(driveway_msg, "polygon")) > 0:
+        return _proto_points_to_xy_array(getattr(driveway_msg, "polygon"))
+    if hasattr(driveway_msg, "polyline") and len(getattr(driveway_msg, "polyline")) > 0:
+        return _proto_points_to_xy_array(getattr(driveway_msg, "polyline"))
+    return np.zeros((0, 2), dtype=np.float32)
+
 
 
 def list_tfrecord_files(split_dir: Path) -> List[Path]:
@@ -979,8 +1348,11 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
     - stop_sign 위치 수집
     - crosswalk polygon 수집
     - speed_bump polygon 수집
-    - lane 중심선 + boundary feature id + 속도제한 수집
+    - driveway polygon 수집
+    - lane 중심선 + boundary feature id + 속도제한 + lane_type 수집
     - boundary(road_line/road_edge) polyline을 id->점들 형태로 모음
+    - road_line/road_edge 타입을 id->정수로 모음
+    - road_edge id 목록을 따로 저장(road_edge 출력용)
 
     Args:
         scenario: Scenario proto
@@ -991,49 +1363,64 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
     stop_sign_xy_global: List[np.ndarray] = []
     crosswalk_polygons_xy_global: List[np.ndarray] = []
     speed_bump_polygons_xy_global: List[np.ndarray] = []
+    driveway_polygons_xy_global: List[np.ndarray] = []
+
     lanes: List[LaneInfo] = []
+
     boundary_polylines_xy_global: Dict[int, np.ndarray] = {}
+    boundary_id_to_kind: Dict[int, str] = {}
+
+    road_line_type_by_id: Dict[int, int] = {}
+    road_edge_type_by_id: Dict[int, int] = {}
+    road_edge_ids: List[int] = []
 
     for mf in scenario.map_features:
         feature_type = mf.WhichOneof("feature_data")
 
         if feature_type == "stop_sign":
             pos = mf.stop_sign.position
-            stop_sign_xy_global.append(
-                np.array([pos.x, pos.y], dtype=np.float32))
+            stop_sign_xy_global.append(np.array([pos.x, pos.y], dtype=np.float32))
 
         elif feature_type == "crosswalk":
-            polygon_xy = np.array([[p.x, p.y] for p in mf.crosswalk.polygon],
-                                  dtype=np.float32)
+            polygon_xy = _proto_points_to_xy_array(mf.crosswalk.polygon)  # (M,2)
             crosswalk_polygons_xy_global.append(polygon_xy)
 
         elif feature_type == "speed_bump":
-            polygon_xy = np.array([[p.x, p.y] for p in mf.speed_bump.polygon],
-                                  dtype=np.float32)
+            polygon_xy = _proto_points_to_xy_array(mf.speed_bump.polygon)  # (M,2)
             speed_bump_polygons_xy_global.append(polygon_xy)
 
+        elif feature_type == "driveway":
+            polygon_xy = _extract_driveway_polygon_xy_global(mf.driveway)  # (M,2)
+            driveway_polygons_xy_global.append(polygon_xy)
+
         elif feature_type == "road_line":
-            poly_xy = np.array([[p.x, p.y] for p in mf.road_line.polyline],
-                               dtype=np.float32)
+            poly_xy = _proto_points_to_xy_array(mf.road_line.polyline)  # (K,2)
             if poly_xy.shape[0] >= 1:
-                boundary_polylines_xy_global[int(mf.id)] = poly_xy
+                fid = int(mf.id)
+                boundary_polylines_xy_global[fid] = poly_xy
+                boundary_id_to_kind[fid] = "road_line"
+                # road_line.type이 없을 수도 있어 안전하게 getattr 사용
+                road_line_type_by_id[fid] = int(getattr(mf.road_line, "type", 0))
 
         elif feature_type == "road_edge":
-            poly_xy = np.array([[p.x, p.y] for p in mf.road_edge.polyline],
-                               dtype=np.float32)
+            poly_xy = _proto_points_to_xy_array(mf.road_edge.polyline)  # (K,2)
             if poly_xy.shape[0] >= 1:
-                boundary_polylines_xy_global[int(mf.id)] = poly_xy
+                fid = int(mf.id)
+                boundary_polylines_xy_global[fid] = poly_xy
+                boundary_id_to_kind[fid] = "road_edge"
+                road_edge_ids.append(fid)
+                road_edge_type_by_id[fid] = int(getattr(mf.road_edge, "type", 0))
 
         elif feature_type == "lane":
-            centerline_xy = np.array([[p.x, p.y] for p in mf.lane.polyline],
-                                     dtype=np.float32)
-            left_ids = [
-                int(seg.boundary_feature_id) for seg in mf.lane.left_boundaries
-            ]
-            right_ids = [
-                int(seg.boundary_feature_id) for seg in mf.lane.right_boundaries
-            ]
-            speed_limit_mph = float(mf.lane.speed_limit_mph)
+            centerline_xy = _proto_points_to_xy_array(mf.lane.polyline)  # (P,2)
+
+            left_ids = [int(seg.boundary_feature_id) for seg in mf.lane.left_boundaries]
+            right_ids = [int(seg.boundary_feature_id) for seg in mf.lane.right_boundaries]
+
+            speed_limit_mph = float(getattr(mf.lane, "speed_limit_mph", 0.0))
+
+            # lane.type이 없을 수도 있어 getattr로 보호
+            lane_type_value = int(getattr(mf.lane, "type", 0))
 
             lanes.append(
                 LaneInfo(
@@ -1042,14 +1429,21 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                     left_boundary_feature_ids=left_ids,
                     right_boundary_feature_ids=right_ids,
                     speed_limit_mph=speed_limit_mph,
-                ))
+                    lane_type=lane_type_value,
+                )
+            )
 
     return ParsedMap(
         stop_sign_xy_global=stop_sign_xy_global,
         crosswalk_polygons_xy_global=crosswalk_polygons_xy_global,
         speed_bump_polygons_xy_global=speed_bump_polygons_xy_global,
+        driveway_polygons_xy_global=driveway_polygons_xy_global,
         lanes=lanes,
         boundary_polylines_xy_global=boundary_polylines_xy_global,
+        boundary_id_to_kind=boundary_id_to_kind,
+        road_line_type_by_id=road_line_type_by_id,
+        road_edge_type_by_id=road_edge_type_by_id,
+        road_edge_ids=road_edge_ids,
     )
 
 
@@ -1259,6 +1653,23 @@ def build_lane_arrays(
     return lanes_arr, lanes_speed_limit, lanes_has_speed_limit, lane_light
 
 
+def get_womd_track_token(track: Any) -> str:
+    """트랙(에이전트 1개)을 구분하는 고유 문자열을 얻습니다.
+
+    - WOMD에서는 트랙을 구분하는 고유 값으로 track.id(숫자)를 제공합니다.
+    - 따라서 이 함수는 track.id를 정수로 바꾼 뒤, 문자열로 바꾼 값만 반환합니다.
+    - 다른 값은 보지 않고, 조합도 하지 않습니다.
+
+    Args:
+        track: scenario.tracks의 원소(트랙 1개)
+
+    Returns:
+        token: track.id를 문자열로 바꾼 값
+    """
+    if hasattr(track, "id"):
+        return str(int(getattr(track, "id")))
+    return ""
+
 # =========================
 # 시나리오 -> pkl dict 만들기
 # =========================
@@ -1280,6 +1691,7 @@ def build_cache_dict_for_scenario(
         - neighbor_shape: (A,3) float32  [length,width,height] 평균
         - neighbor_agents_past: (A,21,11) float32
         - neighbor_future_gt_3_dim: (A,80,3) float32
+        - neighbor_track_token: List[str] (길이 A)
 
         - stop_sign_points: (Ns,10,2) float32
         - crosswalk_points: (Nc,10,2) float32
@@ -1290,12 +1702,25 @@ def build_cache_dict_for_scenario(
         - lanes_has_speed_limit: (L,1) bool
         - lane_light: (L,4) float32
 
+        lane_type: (L,4) float32
+
+        left_line_type: (L,10) float32
+
+        right_lane_type: (L,10) float32
+
+        road_edge: (E,10,2) float32
+
+        road_edge_type: (E,3) float32
+
+        driveway: (D,10,2) float32
+
     Args:
         scenario: Scenario proto
 
     Returns:
         cache_dict: pickle로 저장할 dict
     """
+    _require_womd_lengths_initialized()
     track_key_to_array = decode_tracks_and_roles_from_scenario(scenario)
 
     object_id_all = track_key_to_array["object_id"]  # (N,)
@@ -1426,8 +1851,11 @@ def build_cache_dict_for_scenario(
                                     dtype=np.float32)  # (A,21,11)
     neighbor_future_gt_3_dim = np.zeros((agent_num, FUTURE_LEN, 3),
                                         dtype=np.float32)  # (A,80,3)
+    neighbor_track_token: List[str] = [""] * agent_num  # ✅ 추가: 길이 A
 
     for out_i, tr_i in enumerate(neighbor_indices):
+        neighbor_track_token[out_i] = get_womd_track_token(scenario.tracks[tr_i])  # ✅ 추가
+
         neighbor_id[out_i] = object_id_all[tr_i]
         neighbor_role[out_i, 0] = bool(role_interest_all[tr_i])
         neighbor_role[out_i, 1] = bool(role_predict_all[tr_i])
@@ -1504,6 +1932,29 @@ def build_cache_dict_for_scenario(
         ego_yaw_global=ego_yaw_global,
         lane_len=LANE_LEN,
     )
+    lane_type = build_lane_type_one_hot_array(parsed_map.lanes)  # (L,4)
+
+    left_line_type, right_line_type = build_lane_line_type_arrays(
+        lanes=parsed_map.lanes,
+        boundary_id_to_kind=parsed_map.boundary_id_to_kind,
+        road_line_type_by_id=parsed_map.road_line_type_by_id,
+    )  # (L,10), (L,10)
+
+    road_edge, road_edge_type = build_road_edge_points_and_types(
+        road_edge_ids=parsed_map.road_edge_ids,
+        boundary_polylines_xy_global=parsed_map.boundary_polylines_xy_global,
+        road_edge_type_by_id=parsed_map.road_edge_type_by_id,
+        ego_xy_global=ego_xy_global,
+        ego_yaw_global=ego_yaw_global,
+        safety_len=SAFETY_LEN,
+    )  # (E,10,2), (E,3)
+
+    driveway = build_polygon_points(
+        parsed_map.driveway_polygons_xy_global,
+        ego_xy_global,
+        ego_yaw_global,
+        SAFETY_LEN,
+    )  # (D,10,2)
 
     cache_dict: Dict[str, Any] = {
         "scenario_id": str(scenario.scenario_id),
@@ -1516,6 +1967,7 @@ def build_cache_dict_for_scenario(
         "neighbor_shape": neighbor_shape,  # (A,3)
         "neighbor_agents_past": neighbor_agents_past,  # (A,21,11)
         "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,  # (A,80,3)
+        "neighbor_track_token": neighbor_track_token,  # ✅ 추가: List[str], 길이 A
         "stop_sign_points": stop_sign_points,  # (Ns,10,2)
         "crosswalk_points": crosswalk_points,  # (Nc,10,2)
         "speed_bump_points": speed_bump_points,  # (Nb,10,2)
@@ -1523,6 +1975,17 @@ def build_cache_dict_for_scenario(
         "lanes_speed_limit": lanes_speed_limit,  # (L,1)
         "lanes_has_speed_limit": lanes_has_speed_limit,  # (L,1)
         "lane_light": lane_light,  # (L,4)
+        # ✅ 추가 캐싱
+        "lane_type": lane_type,  # (L,4)
+        "left_line_type": left_line_type,  # (L,10)
+
+        # 요구사항 이름이 right_lane_type로 되어 있어서 key는 그렇게 저장
+        "right_lane_type": right_line_type,  # (L,10)
+
+        "road_edge": road_edge,  # (E,10,2)
+        "road_edge_type": road_edge_type,  # (E,3)
+
+        "driveway": driveway,  # (D,10,2)
     }
     return cache_dict
 
@@ -1532,10 +1995,10 @@ def build_cache_dict_for_scenario(
 # =========================
 def process_one_tfrecord_file(
     tfrecord_path: str,
-    args,
     split: str,
     caching_dir: str,
     overwrite: bool,
+    save_image: bool,
 ) -> Tuple[str, int, int, int, str]:
     """TFRecord 파일 1개를 읽어서, 안에 들어있는 시나리오들을 캐싱합니다.
 
@@ -1552,8 +2015,11 @@ def process_one_tfrecord_file(
     """
     if _WORKER_STOP_EVENT is not None and _WORKER_STOP_EVENT.is_set():
         return tfrecord_path, 0, 0, 0, "ABORTED_BY_USER"
+    _claim_logger_if_needed()
     _log(f"START file={tfrecord_path} split={split}")
     t0 = time.perf_counter()
+    last_hb = time.monotonic()
+    hb_sec = 10.0  # 10초마다 한 줄
     processed = 0
     skipped = 0
     failed = 0
@@ -1622,9 +2088,20 @@ def process_one_tfrecord_file(
             if split == "validation" and out_tfrecord_path is not None:
                 with tf.io.TFRecordWriter(out_tfrecord_path.as_posix()) as w:
                     w.write(record_bytes)
+            # 10초마다 진행상황 1줄 출력(로거로 선점된 워커만)
+            now = time.monotonic()
+            if now - last_hb >= hb_sec:
+                elapsed = time.perf_counter() - t0
+                _log(
+                    f"PROGRESS file={tfrecord_p.name} rec={k+1} "
+                    f"processed={processed} skipped={skipped} failed={failed} "
+                    f"elapsed={elapsed:.1f}s"
+                )
+                last_hb = now
 
             processed += 1
-            if args.save_image:
+            if save_image:
+
                 # 디버깅용 그림 그리기
                 save_dir = os.path.join(out_split_dir, "debug_vis")
                 save_path = os.path.join(save_dir, f"{scenario_id}.png")
@@ -1634,23 +2111,28 @@ def process_one_tfrecord_file(
                                                      output_data={},
                                                      save_path=save_path)
         except Exception as e:
+
             failed += 1
+            _log(
+                f"[FAIL] scenario_id={scenario_id if 'scenario_id' in locals() else 'unknown'} err={repr(e)}")
+            _log(traceback.format_exc())
             message = f"FAILED: {repr(e)}"
 
     return tfrecord_path, processed, skipped, failed, message
 
 
-def _worker_init(stop_event) -> None:
-    """spawn 워커 초기화: SIGINT 무시 + SIGTERM 즉시 종료 + stop_event 등록"""
-    global _WORKER_STOP_EVENT
+def _worker_init(stop_event, logger_pid_val, args) -> None:
+    global _WORKER_STOP_EVENT, _LOG_ENABLED, _LOGGER_PID_VAL
     _WORKER_STOP_EVENT = stop_event
+    _LOGGER_PID_VAL = logger_pid_val
+    _LOG_ENABLED = False
+
+    # ✅ args에서 길이 설정 주입
+    _set_womd_lengths_from_args(args)
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))  # terminate 시 즉시 종료
-
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     faulthandler.enable()
-    _log("worker init done")
-
 
 # =========================
 # split 전체 캐싱
@@ -1694,23 +2176,29 @@ def cache_all_splits(
 
             process_one_tfrecord_file_fn = partial(
                 process_one_tfrecord_file,
-                args=args,
                 split=split,
                 caching_dir=caching_dir.as_posix(),
                 overwrite=overwrite,
+                save_image=bool(args.save_image),
             )
-
             pool: Optional[mppool.Pool] = None
             results: List[Tuple[str, int, int, int, str]] = []
             tfrecord_paths = [p.as_posix() for p in tfrecord_files]
 
             try:
+                logger_pid_val = ctx.Value('i', 0)  # 0이면 아직 아무도 로거 선점 안 함
                 pool = ctx.Pool(
                     processes=num_workers,
                     initializer=_worker_init,
-                    initargs=(stop_event,),
+                    initargs=(stop_event, logger_pid_val, args),
                 )
                 pool_ref["pool"] = pool
+                try:
+                    msg = pool.apply_async(_ping).get(timeout=10)
+                    _log(f"WORKER READY: {msg}")
+                except Exception as e:
+                    _log(
+                        f"WORKER NOT READY (likely importing TF/torch/etc): {repr(e)}")
 
                 iterator = pool.imap_unordered(
                     process_one_tfrecord_file_fn,
