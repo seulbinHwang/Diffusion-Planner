@@ -169,7 +169,7 @@ def get_args():
     parser.add_argument('--lane_len',
                         type=int,
                         help='number of lane point',
-                        default=20)
+                        default=10)
     parser.add_argument('--lane_state_dim',
                         type=int,
                         help='state dim for lane point',
@@ -447,6 +447,21 @@ def get_args():
         default="scenarios_cache.pkl",  #'scenarios_cache.pkl',
         help='새로 추출한 시나리오를 저장할 *.pkl 경로',
     )
+    parser.add_argument('--womd_data_path',
+                        default="/home/user/womd_v1_3",
+                        type=str,
+                        help='path to raw data')
+    parser.add_argument("--overwrite_womd_cache",
+                        type=str,
+                        default="false",
+                        help="true/false")
+    parser.add_argument(
+        "--womd_splits",
+        type=str,
+        default="training,validation,testing",
+        help="예: training,validation (콤마로 구분)",
+    )
+
     parser.add_argument('--data_path',
                         default='/data/nuplan-v1.1/trainval',
                         type=str,

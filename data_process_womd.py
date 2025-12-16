@@ -1,0 +1,1802 @@
+# data_process.py
+import multiprocessing as mp
+import os
+import pickle
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+import argparse
+import signal
+import faulthandler
+import time
+import sys  # 추가
+import contextlib
+import multiprocessing.pool as mppool
+_WORKER_STOP_EVENT = None  # 추가 (spawn 워커에서 init으로 채움)
+
+
+def _log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {msg}", flush=True)
+
+
+import numpy as np
+import tensorflow as tf
+import torch
+from scipy.interpolate import interp1d
+from tqdm import tqdm
+from waymo_open_dataset.protos import scenario_pb2
+import math
+import args_util
+import draw_machine
+import contextlib
+import multiprocessing.pool as mppool
+import time
+
+
+def _terminate_pool_hard(
+    pool: Optional[mppool.Pool],
+    timeout_sec: float = 3.0,
+) -> None:
+    """Pool을 Ctrl+C 시 '확실하게' 종료합니다.
+
+    1) pool.terminate()로 SIGTERM 전송
+    2) timeout_sec 동안 join 시도
+    3) 아직 살아있는 워커는 SIGKILL로 강제 종료
+
+    Args:
+        pool: multiprocessing Pool (None이면 무시)
+        timeout_sec: SIGTERM 후 기다릴 최대 시간(초)
+    """
+    if pool is None:
+        return
+
+    # 1) SIGTERM
+    with contextlib.suppress(Exception):
+        pool.terminate()
+
+    procs = getattr(pool, "_pool", None) or []
+    deadline = time.monotonic() + float(timeout_sec)
+
+    # 2) 일정 시간 기다리기
+    for proc in procs:
+        remaining = max(0.0, deadline - time.monotonic())
+        with contextlib.suppress(Exception):
+            proc.join(timeout=remaining)
+
+    # 3) 남아있으면 SIGKILL
+    for proc in procs:
+        if proc.is_alive():
+            # Python 3.7+ : Process.kill() 지원
+            with contextlib.suppress(Exception):
+                proc.kill()
+            # kill()이 없거나 실패한 환경 대비
+            if proc.is_alive():
+                with contextlib.suppress(Exception):
+                    os.kill(proc.pid, signal.SIGKILL)
+
+    # 마무리 join (짧게)
+    for proc in procs:
+        with contextlib.suppress(Exception):
+            proc.join(timeout=1.0)
+
+def _join_pool_soft(
+    pool: Optional[mppool.Pool],
+    timeout_sec: float = 10.0,
+) -> bool:
+    """pool.close() 이후 워커들이 timeout 안에 종료되는지 기다립니다.
+
+    Args:
+        pool: multiprocessing Pool
+        timeout_sec: 기다릴 최대 시간(초)
+
+    Returns:
+        모두 종료되면 True, 일부라도 살아있으면 False
+    """
+    if pool is None:
+        return True
+    procs = getattr(pool, "_pool", None) or []
+    deadline = time.monotonic() + float(timeout_sec)
+    for proc in procs:
+        remaining = max(0.0, deadline - time.monotonic())
+        with contextlib.suppress(Exception):
+            proc.join(timeout=remaining)
+    return not any(p.is_alive() for p in procs)
+
+
+def _install_main_signal_handlers(
+    stop_event: Any,
+    pool_ref: Dict[str, Optional[mppool.Pool]],
+    grace_sec: float = 12.0,
+) -> Tuple[Dict[int, Any], Dict[str, Any]]:
+    """메인에서 Ctrl+C를 '확실히' 잡아서 stop_event로 전파 + 단계적 종료를 수행합니다.
+
+    - Ctrl+C 1회: stop_event set -> 우아한 종료(워커가 체크 지점에서 빠져나오게)
+    - Ctrl+C 2회: 즉시 워커 강제 종료(SIGKILL 포함) 후 종료
+    """
+    state: Dict[str, Any] = {"count": 0, "deadline": None, "grace_sec": float(grace_sec)}
+    old = {
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+    }
+
+    def _handler(signum: int, frame: Any) -> None:
+        state["count"] += 1
+        stop_event.set()
+
+        if state["deadline"] is None:
+            state["deadline"] = time.monotonic() + state["grace_sec"]
+
+        pool = pool_ref.get("pool", None)
+
+        if state["count"] == 1:
+            _log("Ctrl+C 감지 -> stop_event 전파(우아한 종료 시도). 한 번 더 누르면 즉시 강제 종료합니다.")
+            if pool is not None:
+                with contextlib.suppress(Exception):
+                    pool.close()
+            return
+
+        _log("Ctrl+C 2회 감지 -> 워커 강제 종료(SIGKILL 포함) 후 즉시 종료합니다.")
+        _terminate_pool_hard(pool, timeout_sec=1.0)
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+    # 환경에 따라 block syscall에서 더 잘 빠져나오게
+    with contextlib.suppress(Exception):
+        signal.siginterrupt(signal.SIGINT, True)
+        signal.siginterrupt(signal.SIGTERM, True)
+
+    return old, state
+
+def wrap_angle(angle: torch.Tensor,
+               min_val: float = -math.pi,
+               max_val: float = math.pi) -> torch.Tensor:
+    return min_val + (angle + max_val) % (max_val - min_val)
+
+
+# =========================
+# 설정값 (요구사항 고정)
+# =========================
+
+SPLITS: Tuple[str, ...] = ("training", "validation", "testing")
+
+TIME_LEN: int = 21  # 20(past) + 1(current)
+FUTURE_LEN: int = 80  # 8초(0.1s 간격)
+DT_SEC: float = 0.1
+
+SAFETY_LEN: int = 10  # stop/crosswalk/speed_bump 포인트 수
+LANE_LEN: int = 10  # lane 샘플 포인트 수
+
+EPS: float = 1e-6
+
+
+# =========================
+# 데이터 구조 (맵 파싱용)
+# =========================
+@dataclass(frozen=True)
+class LaneInfo:
+    """차선 1개에 대한 원본 정보 묶음."""
+    lane_id: int
+    centerline_xy_global: np.ndarray  # shape: (P, 2), float32/float64
+    left_boundary_feature_ids: List[int]
+    right_boundary_feature_ids: List[int]
+    speed_limit_mph: float
+
+
+@dataclass(frozen=True)
+class ParsedMap:
+    """시나리오 맵을 필요한 형태로 미리 모아둔 결과."""
+    stop_sign_xy_global: List[np.ndarray]  # each shape: (2,)
+    crosswalk_polygons_xy_global: List[np.ndarray]  # each shape: (M,2)
+    speed_bump_polygons_xy_global: List[np.ndarray]
+    lanes: List[LaneInfo]
+    boundary_polylines_xy_global: Dict[int, np.ndarray]  # id -> shape: (K,2)
+
+
+# =========================
+# 기본 유틸
+# =========================
+def ensure_dir(path: Path) -> None:
+    """폴더가 없으면 생성합니다.
+
+    Args:
+        path: 만들고 싶은 폴더 경로
+    """
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def list_tfrecord_files(split_dir: Path) -> List[Path]:
+    """split 폴더 안의 모든 tfrecord 파일을 모읍니다.
+
+    파일 확장자가 다양할 수 있어서(예: .tfrecord, .tfrecords, .gz),
+    "파일"이면 모두 대상으로 잡되, 폴더는 제외합니다.
+
+    Args:
+        split_dir: 예) /home/user/womd_v1_3/scenario/training
+
+    Returns:
+        tfrecord 파일 경로 리스트
+    """
+    all_paths: List[Path] = sorted(
+        [p for p in split_dir.glob("*") if p.is_file()])
+    return all_paths
+
+
+def guess_tfrecord_compression(file_path: Path) -> str:
+    """tfrecord 파일의 압축 여부를 파일명으로 추정합니다.
+
+    Args:
+        file_path: tfrecord 파일 경로
+
+    Returns:
+        TensorFlow TFRecordDataset에 넣을 compression_type 문자열.
+        - ".gz" 로 끝나면 "GZIP"
+        - 아니면 "" (압축 없음)
+    """
+    if file_path.name.endswith(".gz"):
+        return "GZIP"
+    return ""
+
+
+def parse_scenario_from_bytes(record_bytes: bytes) -> scenario_pb2.Scenario:
+    """TFRecord의 한 레코드(bytes)를 Scenario proto로 변환합니다.
+
+    Args:
+        record_bytes: TFRecord에서 꺼낸 1개 레코드의 raw bytes
+
+    Returns:
+        Scenario proto 객체
+    """
+    scenario = scenario_pb2.Scenario()
+    scenario.ParseFromString(record_bytes)
+    return scenario
+
+
+# =========================
+# 좌표 변환 (ego 기준)
+# =========================
+def transform_points_global_to_ego_local(
+    points_xy_global: np.ndarray,  # shape: (..., 2)
+    ego_xy_global: np.ndarray,  # shape: (2,)
+    ego_yaw_global: float,
+) -> np.ndarray:
+    """전역 좌표계의 (x,y) 점들을 ego 기준 좌표계로 바꿉니다.
+
+    변환 규칙:
+    1) ego 위치를 원점으로 만들기 위해 (point - ego_pos)를 합니다.
+    2) ego가 바라보는 방향이 +x가 되도록, -ego_yaw 만큼 회전합니다.
+
+    Args:
+        points_xy_global: 전역 좌표계 점들, 마지막 차원은 (x,y)
+        ego_xy_global: ego의 전역 위치 (x,y)
+        ego_yaw_global: ego의 전역 yaw (라디안)
+
+    Returns:
+        ego 기준 좌표계 점들, shape은 입력과 같고 마지막 차원은 (x,y)
+    """
+    # points_xy_global: np.ndarray, shape (..., 2)
+    # ego_xy_global: np.ndarray, shape (2,)
+    delta_xy = points_xy_global - ego_xy_global  # shape (..., 2)
+
+    cos_yaw = float(np.cos(ego_yaw_global))
+    sin_yaw = float(np.sin(ego_yaw_global))
+
+    # local_x =  dx*cos + dy*sin
+    # local_y = -dx*sin + dy*cos
+    local_x = delta_xy[..., 0] * cos_yaw + delta_xy[..., 1] * sin_yaw
+    local_y = -delta_xy[..., 0] * sin_yaw + delta_xy[..., 1] * cos_yaw
+
+    out = np.stack([local_x, local_y], axis=-1).astype(np.float32)
+    return out
+
+
+def transform_vectors_global_to_ego_local(
+    vectors_xy_global: np.ndarray,  # shape: (..., 2)
+    ego_yaw_global: float,
+) -> np.ndarray:
+    """전역 좌표계의 (vx,vy) 같은 '방향/속도 벡터'를 ego 기준으로 바꿉니다.
+
+    점 변환과 달리, 벡터는 위치 이동(빼기)을 하지 않고 회전만 합니다.
+
+    Args:
+        vectors_xy_global: 전역 좌표계 벡터들, 마지막 차원은 (x,y)
+        ego_yaw_global: ego의 전역 yaw (라디안)
+
+    Returns:
+        ego 기준 좌표계 벡터들, shape은 입력과 같고 마지막 차원은 (x,y)
+    """
+    # vectors_xy_global: np.ndarray, shape (..., 2)
+    cos_yaw = float(np.cos(ego_yaw_global))
+    sin_yaw = float(np.sin(ego_yaw_global))
+
+    local_x = vectors_xy_global[..., 0] * cos_yaw + vectors_xy_global[
+        ..., 1] * sin_yaw
+    local_y = -vectors_xy_global[..., 0] * sin_yaw + vectors_xy_global[
+        ..., 1] * cos_yaw
+
+    out = np.stack([local_x, local_y], axis=-1).astype(np.float32)
+    return out
+
+
+def wrap_angle_np(angles_rad: np.ndarray) -> np.ndarray:
+    """각도(rad)를 [-pi, pi) 범위로 정리합니다.
+
+    Args:
+        angles_rad: 각도 배열 (어떤 shape이든 가능)
+
+    Returns:
+        같은 shape의 각도 배열 (float32)
+    """
+    wrapped = (angles_rad + np.pi) % (2.0 * np.pi) - np.pi
+    return wrapped.astype(np.float32)
+
+
+def wrap_angle_with_repo_fn(angles_rad: np.ndarray) -> np.ndarray:
+    """레포에 있는 wrap_angle(torch 기반)을 이용해 각도를 정리합니다.
+
+    Args:
+        angles_rad: 각도 배열 (shape 자유)
+
+    Returns:
+        [-pi, pi) 범위로 정리된 각도 (float32)
+    """
+    # angles_rad_t: torch.Tensor, shape same as angles_rad
+    angles_rad_t = torch.from_numpy(angles_rad.astype(np.float32))
+    wrapped_t = wrap_angle(angles_rad_t)
+    return wrapped_t.numpy().astype(np.float32)
+
+
+# =========================
+# 보간(빈 프레임 채우기)
+# =========================
+def interpolate_linear_sequence(
+        values: np.ndarray,  # shape: (T, D)
+        valid_mask: np.ndarray,  # shape: (T,)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """유효한 시점들 사이의 빈 칸을 '직선으로' 채웁니다.
+
+    규칙(요구사항 그대로):
+    - 유효한 값이 2개 이상이면:
+      - 첫 유효 시점 ~ 마지막 유효 시점 사이를 직선으로 연결해 채웁니다.
+      - 그 구간만 유효(True)로 표시하고, 구간 밖은 0으로 둡니다.
+    - 유효한 값이 1개뿐이면:
+      - 그 시점만 채우고 나머지는 0으로 둡니다.
+    - 유효한 값이 0개면:
+      - 전부 0으로 둡니다.
+
+    Args:
+        values: (T,D) 값 배열
+        valid_mask: (T,) 유효 여부
+
+    Returns:
+        filled_values: (T,D) 채워진 결과 (float32)
+        filled_valid_mask: (T,) 채워진 구간을 True로 표시한 마스크
+    """
+    # values: np.ndarray, shape (T, D)
+    # valid_mask: np.ndarray, shape (T,)
+    time_len = int(values.shape[0])
+    out = np.zeros_like(values, dtype=np.float32)  # shape (T, D)
+    out_valid = np.zeros((time_len,), dtype=bool)  # shape (T,)
+
+    valid_indices = np.where(valid_mask)[0]  # shape (K,)
+    if valid_indices.size == 0:
+        return out, out_valid
+
+    if valid_indices.size == 1:
+        t = int(valid_indices[0])
+        out[t] = values[t].astype(np.float32)
+        out_valid[t] = True
+        return out, out_valid
+
+    t_start = int(valid_indices[0])
+    t_end = int(valid_indices[-1])
+
+    # 유효 지점들만 모아서 (시간 -> 값) 직선으로 잇기
+    f = interp1d(valid_indices, values[valid_mask], axis=0, kind="linear")
+    t_in = np.arange(t_start, t_end + 1,
+                     dtype=np.int64)  # shape (t_end-t_start+1,)
+    out[t_start:t_end + 1] = f(t_in).astype(np.float32)
+    out_valid[t_start:t_end + 1] = True
+    return out, out_valid
+
+
+def interpolate_linear_angle(
+        angles_rad: np.ndarray,  # shape: (T,)
+        valid_mask: np.ndarray,  # shape: (T,)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """각도 시계열의 빈 칸을 직선으로 채웁니다.
+
+    각도는 -pi~pi 경계에서 값이 '튀는' 문제가 생길 수 있어서,
+    유효한 구간만 뽑아 "자연스럽게 이어지도록" 각도를 먼저 이어준 뒤(끊김 완화),
+    직선으로 채웁니다.
+
+    Args:
+        angles_rad: (T,) 각도 배열 (라디안)
+        valid_mask: (T,) 유효 여부
+
+    Returns:
+        filled_angles: (T,) 채워진 각도 (float32)
+        filled_valid_mask: (T,) 채워진 구간을 True로 표시한 마스크
+    """
+    # angles_rad: np.ndarray, shape (T,)
+    time_len = int(angles_rad.shape[0])
+    out = np.zeros((time_len,), dtype=np.float32)  # shape (T,)
+    out_valid = np.zeros((time_len,), dtype=bool)  # shape (T,)
+
+    valid_indices = np.where(valid_mask)[0]
+    if valid_indices.size == 0:
+        return out, out_valid
+
+    if valid_indices.size == 1:
+        t = int(valid_indices[0])
+        out[t] = float(angles_rad[t])
+        out_valid[t] = True
+        return out, out_valid
+
+    t_start = int(valid_indices[0])
+    t_end = int(valid_indices[-1])
+
+    # 유효한 각도들만 "이어붙이기" (경계 튐 완화)
+    valid_angles = angles_rad[valid_mask].astype(np.float32)  # shape (K,)
+    valid_angles_unwrapped = np.unwrap(valid_angles).astype(np.float32)
+
+    f = interp1d(valid_indices, valid_angles_unwrapped, axis=0, kind="linear")
+    t_in = np.arange(t_start, t_end + 1,
+                     dtype=np.int64)  # shape (t_end-t_start+1,)
+    out[t_start:t_end + 1] = f(t_in).astype(np.float32)
+    out_valid[t_start:t_end + 1] = True
+
+    # 보기 좋게 [-pi,pi)로 정리 (레포 함수 사용)
+    out = wrap_angle_with_repo_fn(out)
+    return out, out_valid
+
+
+# =========================
+# 에이전트(ego/neighbor) 특징 만들기
+# =========================
+def make_agent_type_one_hot(object_type_minus1: int) -> np.ndarray:
+    """에이전트 타입을 one-hot(3개)로 만듭니다.
+
+    매핑 규칙:
+    - 0: VEHICLE
+    - 1: PEDESTRIAN
+    - 2: CYCLIST
+    그 외는 [0,0,0]으로 둡니다.
+
+    Args:
+        object_type_minus1: scenario Track의 object_type에서 1을 뺀 값
+
+    Returns:
+        one_hot: shape (3,), float32
+    """
+    # one_hot: np.ndarray, shape (3,)
+    one_hot = np.zeros((3,), dtype=np.float32)
+    if object_type_minus1 == 0:
+        one_hot[0] = 1.0
+    elif object_type_minus1 == 1:
+        one_hot[1] = 1.0
+    elif object_type_minus1 == 2:
+        one_hot[2] = 1.0
+    return one_hot
+
+
+def build_time_indices(
+    current_time_index: int,
+    num_total_steps: int,
+    desired_past_len: int,
+    desired_future_len: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """시나리오의 시간 인덱스를 '원하는 길이'에 맞게 정리합니다.
+
+    - 과거: (desired_past_len)개, 마지막은 현재(current_time_index)
+    - 미래: (desired_future_len)개, 현재는 제외하고 current_time_index+1부터 시작
+
+    WOMD는 보통 과거가 1초(11개)만 있어서, 2초(21개)를 만들려면
+    앞쪽 10개는 -1(없음)으로 둡니다.
+
+    Args:
+        current_time_index: 시나리오의 현재 시점 인덱스
+        num_total_steps: 전체 스텝 수(보통 91)
+        desired_past_len: 원하는 과거 길이(21)
+        desired_future_len: 원하는 미래 길이(80)
+
+    Returns:
+        past_indices: shape (desired_past_len,), 없으면 -1
+        future_indices: shape (desired_future_len,), 없으면 -1
+    """
+    available_hist = current_time_index + 1
+    missing_hist = max(0, desired_past_len - available_hist)
+
+    past_indices = -np.ones(
+        (desired_past_len,), dtype=np.int64)  # shape (time_len,)
+    for i in range(desired_past_len):
+        scenario_idx = i - missing_hist
+        if 0 <= scenario_idx <= current_time_index and scenario_idx < num_total_steps:
+            past_indices[i] = scenario_idx
+
+    future_indices = -np.ones(
+        (desired_future_len,), dtype=np.int64)  # shape (future_len,)
+    for j in range(desired_future_len):
+        scenario_idx = current_time_index + 1 + j
+        if 0 <= scenario_idx < num_total_steps:
+            future_indices[j] = scenario_idx
+
+    return past_indices, future_indices
+
+
+def gather_agent_sequence_by_indices(
+    agent_idx: int,
+    time_indices: np.ndarray,  # shape: (T,), -1이면 없음
+    pos_xy_local_all: np.ndarray,  # shape: (N, S, 2)
+    vel_xy_local_all: np.ndarray,  # shape: (N, S, 2)
+    yaw_local_all: np.ndarray,  # shape: (N, S)
+    width_length_all: np.ndarray,  # shape: (N, S, 2)  (width, length)
+    valid_all: np.ndarray,  # shape: (N, S)
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """원하는 시간 인덱스들만 뽑아서 (x,y, yaw, v, w/l, valid)를 만듭니다.
+
+    Args:
+        agent_idx: 에이전트 인덱스
+        time_indices: (T,) 시간 인덱스 배열 (-1은 데이터 없음)
+        pos_xy_local_all: (N,S,2) ego 기준 위치
+        vel_xy_local_all: (N,S,2) ego 기준 속도
+        yaw_local_all: (N,S) ego 기준 yaw
+        width_length_all: (N,S,2) (width,length)
+        valid_all: (N,S) 유효 여부
+
+    Returns:
+        pos_xy_seq: (T,2)
+        vel_xy_seq: (T,2)
+        yaw_seq: (T,)
+        width_length_seq: (T,2)
+        valid_seq: (T,)
+    """
+    time_len = int(time_indices.shape[0])
+
+    pos_xy_seq = np.zeros((time_len, 2), dtype=np.float32)  # shape (T,2)
+    vel_xy_seq = np.zeros((time_len, 2), dtype=np.float32)  # shape (T,2)
+    yaw_seq = np.zeros((time_len,), dtype=np.float32)  # shape (T,)
+    width_length_seq = np.zeros((time_len, 2), dtype=np.float32)  # shape (T,2)
+    valid_seq = np.zeros((time_len,), dtype=bool)  # shape (T,)
+
+    for t_out, t_in in enumerate(time_indices.tolist()):
+        if t_in < 0:
+            continue
+        pos_xy_seq[t_out] = pos_xy_local_all[agent_idx, t_in]  # (2,)
+        vel_xy_seq[t_out] = vel_xy_local_all[agent_idx, t_in]  # (2,)
+        yaw_seq[t_out] = yaw_local_all[agent_idx, t_in]  # ()
+        width_length_seq[t_out] = width_length_all[agent_idx, t_in]  # (2,)
+        valid_seq[t_out] = bool(valid_all[agent_idx, t_in])
+
+    return pos_xy_seq, vel_xy_seq, yaw_seq, width_length_seq, valid_seq
+
+
+def pack_agent_features_11(
+        pos_xy: np.ndarray,  # shape: (T,2)
+        vel_xy: np.ndarray,  # shape: (T,2)
+        yaw_rad: np.ndarray,  # shape: (T,)
+        width_length: np.ndarray,  # shape: (T,2) (width,length)
+        agent_one_hot: np.ndarray,  # shape: (3,)
+        valid_mask: np.ndarray,  # shape: (T,)
+) -> np.ndarray:
+    """요구사항의 11차원 포맷으로 묶습니다.
+
+    [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
+
+    Args:
+        pos_xy: (T,2) 위치(ego 기준)
+        vel_xy: (T,2) 속도(ego 기준)
+        yaw_rad: (T,) yaw(ego 기준)
+        width_length: (T,2) (width,length)
+        agent_one_hot: (3,) 타입 one-hot
+        valid_mask: (T,) 유효 여부(유효한 구간만 채움)
+
+    Returns:
+        feat_11: (T,11) float32
+    """
+    time_len = int(pos_xy.shape[0])
+
+    feat_11 = np.zeros((time_len, 11), dtype=np.float32)  # shape (T,11)
+    if not np.any(valid_mask):
+        return feat_11
+
+    cos_yaw = np.cos(yaw_rad).astype(np.float32)  # shape (T,)
+    sin_yaw = np.sin(yaw_rad).astype(np.float32)  # shape (T,)
+
+    # 유효한 구간만 채움
+    idx = valid_mask
+    feat_11[idx, 0:2] = pos_xy[idx]
+    feat_11[idx, 2] = cos_yaw[idx]
+    feat_11[idx, 3] = sin_yaw[idx]
+    feat_11[idx, 4:6] = vel_xy[idx]
+    feat_11[idx, 6:8] = width_length[idx]  # width, length
+    feat_11[idx, 8:11] = agent_one_hot[None, :].repeat(int(idx.sum()), axis=0)
+    return feat_11
+
+
+def pack_agent_future_3(
+        pos_xy: np.ndarray,  # shape: (T,2)
+        yaw_rad: np.ndarray,  # shape: (T,)
+        valid_mask: np.ndarray,  # shape: (T,)
+) -> np.ndarray:
+    """요구사항의 미래 GT 3차원 포맷으로 묶습니다.
+
+    [x, y, heading]
+
+    Args:
+        pos_xy: (T,2) 위치(ego 기준)
+        yaw_rad: (T,) heading(ego 기준)
+        valid_mask: (T,) 유효 여부
+
+    Returns:
+        feat_3: (T,3) float32
+    """
+    time_len = int(pos_xy.shape[0])
+    feat_3 = np.zeros((time_len, 3), dtype=np.float32)  # shape (T,3)
+    if not np.any(valid_mask):
+        return feat_3
+
+    idx = valid_mask
+    feat_3[idx, 0:2] = pos_xy[idx]
+    feat_3[idx, 2] = yaw_rad[idx]
+    return feat_3
+
+
+def build_interpolated_agent_traj(
+    pos_xy_raw: np.ndarray,  # shape: (T,2)
+    vel_xy_raw: np.ndarray,  # shape: (T,2)
+    yaw_raw: np.ndarray,  # shape: (T,)
+    width_length_raw: np.ndarray,  # shape: (T,2)
+    valid_raw: np.ndarray,  # shape: (T,)
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(x,y, v, yaw, width/length) 시계열을 보간 규칙에 맞게 정리합니다.
+
+    Args:
+        pos_xy_raw: (T,2) 원본 위치 (없는 곳은 0)
+        vel_xy_raw: (T,2) 원본 속도 (없는 곳은 0)
+        yaw_raw: (T,) 원본 yaw (없는 곳은 0)
+        width_length_raw: (T,2) 원본 (width,length)
+        valid_raw: (T,) 유효 여부
+
+    Returns:
+        pos_xy: (T,2) 보간 후 위치
+        vel_xy: (T,2) 보간 후 속도
+        yaw: (T,) 보간 후 yaw
+        width_length: (T,2) 보간 후 (width,length)
+        valid_mask: (T,) 보간으로 채워진 구간 True
+    """
+    # pos_xy: (T,2)
+    pos_xy, valid_filled = interpolate_linear_sequence(pos_xy_raw, valid_raw)
+    vel_xy, _ = interpolate_linear_sequence(vel_xy_raw, valid_raw)
+    width_length, _ = interpolate_linear_sequence(width_length_raw, valid_raw)
+
+    # yaw: (T,)
+    yaw, valid_filled_yaw = interpolate_linear_angle(yaw_raw, valid_raw)
+
+    # 위치/각도 보간 구간이 다르면 이상하므로, 둘 다 True인 곳만 최종 valid로 사용
+    valid_mask = np.logical_and(valid_filled, valid_filled_yaw)  # shape (T,)
+    return pos_xy, vel_xy, yaw, width_length, valid_mask
+
+
+# =========================
+# 트랙/역할 디코딩
+# =========================
+
+
+def _track_states_to_numpy(
+    track: Any,
+    num_steps: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Track 1개의 states를 numpy로 빠르게 변환합니다.
+
+    Args:
+        track: scenario.tracks의 원소 (proto Track)
+        num_steps: 시나리오의 전체 step 수 (보통 91)
+
+    Returns:
+        states_9: (S, 9) float32
+            [center_x, center_y, center_z, length, width, height, heading, v_x, v_y]
+        valid: (S,) bool
+    """
+    track_states = track.states
+    n = len(track_states)
+
+    # (S,9)/(S,) 기본값은 0/False로 패딩
+    states_9 = np.zeros((num_steps, 9), dtype=np.float32)
+    valid = np.zeros((num_steps,), dtype=bool)
+    if n == 0:
+        return states_9, valid
+
+    # 한 번의 리스트 컴프리헨션으로 (n, 10) = 9개 상태 + valid(0/1)을 같이 만들기
+    # -> 내부 for문에서 states[i,t,k]를 9번 찍는 것보다 보통 더 빠릅니다.
+    packed_10 = np.asarray(
+        [
+            (
+                float(st.center_x),
+                float(st.center_y),
+                float(st.center_z),
+                float(st.length),
+                float(st.width),
+                float(st.height),
+                float(st.heading),
+                float(st.velocity_x),
+                float(st.velocity_y),
+                float(st.valid),  # bool -> 0.0/1.0
+            ) for st in track_states
+        ],
+        dtype=np.float32,
+    )  # shape: (n, 10)
+
+    # 혹시 track마다 states 길이가 다를 수 있어 안전하게 min으로
+    m = min(n, num_steps)
+    states_9[:m] = packed_10[:m, :9]
+    valid[:m] = packed_10[:m, 9] != 0.0
+    return states_9, valid
+
+
+def decode_tracks_and_roles_from_scenario(
+    scenario: scenario_pb2.Scenario,) -> Dict[str, np.ndarray]:
+    """Scenario proto에서 트랙(에이전트) 정보와 역할 정보를 numpy로 뽑습니다.
+
+    Returns:
+        key_to_array:
+            object_id: (N,) int64
+            object_type: (N,) int32  (track.object_type - 1)
+            states: (N,S,9) float32
+            valid: (N,S) bool
+            role_interest: (N,) bool
+            role_predict: (N,) bool
+            ego_index: (1,) int64
+    """
+    tracks = scenario.tracks
+    num_tracks = len(tracks)
+    num_steps = len(tracks[0].states) if num_tracks > 0 else 0
+
+    object_id = np.zeros((num_tracks,), dtype=np.int64)
+    object_type = np.zeros((num_tracks,), dtype=np.int32)
+    states = np.zeros((num_tracks, num_steps, 9), dtype=np.float32)
+    valid = np.zeros((num_tracks, num_steps), dtype=bool)
+
+    # 역할 정보(셋 membership은 O(1))
+    predict_track_indices = {
+        rp.track_index for rp in scenario.tracks_to_predict
+    }
+    interest_object_ids = {int(x) for x in scenario.objects_of_interest}
+
+    role_interest = np.zeros((num_tracks,), dtype=bool)
+    role_predict = np.zeros((num_tracks,), dtype=bool)
+
+    for i, tr in enumerate(tracks):
+        object_id[i] = int(tr.id)
+        object_type[i] = int(tr.object_type) - 1
+
+        role_predict[i] = i in predict_track_indices
+        role_interest[i] = int(tr.id) in interest_object_ids
+
+        # ✅ 핵심: (t loop) 제거하고 트랙 단위로 한 번에 채움
+        states_i, valid_i = _track_states_to_numpy(tr, num_steps)
+        states[i] = states_i
+        valid[i] = valid_i
+
+    key_to_array: Dict[str, np.ndarray] = {
+        "object_id": object_id,  # (N,)
+        "object_type": object_type,  # (N,)
+        "states": states,  # (N,S,9)
+        "valid": valid,  # (N,S)
+        "role_interest": role_interest,  # (N,)
+        "role_predict": role_predict,  # (N,)
+        "ego_index": np.array([int(scenario.sdc_track_index)],
+                              dtype=np.int64),  # (1,)
+    }
+    return key_to_array
+
+
+def compute_ego_pose_at_current(
+    scenario: scenario_pb2.Scenario,
+    track_dict: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, float, float]:
+    """현재 시점의 ego 위치/방향을 구합니다.
+
+    Args:
+        scenario: Scenario proto
+        track_dict: decode_tracks_and_roles_from_scenario 출력
+
+    Returns:
+        ego_xy_global: (2,) float32
+        ego_yaw_global: float
+        ego_z_global: float
+    """
+    ego_idx = int(track_dict["ego_index"][0])
+    current_t = int(scenario.current_time_index)
+
+    # states: (N,S,9)
+    ego_state = track_dict["states"][ego_idx, current_t]  # shape (9,)
+    ego_xy = ego_state[0:2].astype(np.float32)  # shape (2,)
+    ego_yaw = float(ego_state[6])
+    ego_z = float(ego_state[2])
+    return ego_xy, ego_yaw, ego_z
+
+
+# =========================
+# 교통 신호(차선 신호) 파싱
+# =========================
+def lane_signal_state_to_one_hot(state_value: int) -> np.ndarray:
+    """WOMD의 lane signal state 값을 4차원 one-hot으로 바꿉니다.
+
+    출력 one-hot 순서:
+        [GO, CAUTION, STOP, UNKNOWN]
+
+    Args:
+        state_value: TrafficSignalLaneState.State (정수)
+
+    Returns:
+        one_hot: (4,) float32
+    """
+    # 참고: state_value는 map_pb2.TrafficSignalLaneState.State 값이 들어옵니다.
+    # 여기서는 '큰 분류'만 사용합니다.
+    go_states = {3, 6}  # ARROW_GO(3), GO(6)
+    caution_states = {2, 5,
+                      8}  # ARROW_CAUTION(2), CAUTION(5), FLASHING_CAUTION(8)
+    stop_states = {1, 4, 7}  # ARROW_STOP(1), STOP(4), FLASHING_STOP(7)
+    unknown_states = {0}  # UNKNOWN(0)
+
+    one_hot = np.zeros((4,), dtype=np.float32)
+    if state_value in go_states:
+        one_hot[0] = 1.0
+    elif state_value in caution_states:
+        one_hot[1] = 1.0
+    elif state_value in stop_states:
+        one_hot[2] = 1.0
+    elif state_value in unknown_states:
+        one_hot[3] = 1.0
+    else:
+        # 혹시 모르는 값은 UNKNOWN 처리
+        one_hot[3] = 1.0
+    return one_hot
+
+
+def extract_lane_signals_at_current(
+    scenario: scenario_pb2.Scenario,) -> Dict[int, np.ndarray]:
+    """현재 시점의 차선 신호를 lane_id -> one-hot(4)로 뽑습니다.
+
+    Args:
+        scenario: Scenario proto
+
+    Returns:
+        lane_id_to_light: lane_id(int) -> one_hot(4,) float32
+    """
+    lane_id_to_light: Dict[int, np.ndarray] = {}
+    current_t = int(scenario.current_time_index)
+
+    if len(scenario.dynamic_map_states) <= current_t:
+        return lane_id_to_light
+
+    dyn = scenario.dynamic_map_states[current_t]
+    for lane_state in dyn.lane_states:
+        lane_id = int(lane_state.lane)
+        state_value = int(lane_state.state)
+        lane_id_to_light[lane_id] = lane_signal_state_to_one_hot(state_value)
+
+    return lane_id_to_light
+
+
+# =========================
+# 맵 파싱 + 샘플링
+# =========================
+def polyline_length(points_xy: np.ndarray) -> float:
+    """폴리라인(점들의 줄)의 전체 길이를 계산합니다.
+
+    Args:
+        points_xy: (N,2) 점들
+
+    Returns:
+        길이(float)
+    """
+    if points_xy.shape[0] < 2:
+        return 0.0
+    diffs = points_xy[1:] - points_xy[:-1]  # shape (N-1,2)
+    seg_lens = np.linalg.norm(diffs, axis=1)  # shape (N-1,)
+    return float(seg_lens.sum())
+
+
+def resample_polyline_equal_distance(
+    points_xy: np.ndarray,  # shape: (N,2)
+    num_samples: int,
+    closed: bool,
+) -> np.ndarray:
+    """점들의 줄(또는 닫힌 다각형)을 '같은 간격'으로 num_samples개 점으로 만듭니다.
+
+    - points_xy가 1개뿐이면 그 점을 반복합니다.
+    - 길이가 0에 가깝다면 첫 점을 반복합니다.
+    - closed=True이면 마지막에서 첫 점으로 이어진다고 보고 둘레를 따라 샘플링합니다.
+
+    Args:
+        points_xy: (N,2) 입력 점들
+        num_samples: 뽑을 점 개수
+        closed: 닫힌 모양인지 여부
+
+    Returns:
+        sampled: (num_samples,2) float32
+    """
+    if points_xy.shape[0] == 0:
+        return np.zeros((num_samples, 2), dtype=np.float32)
+
+    if points_xy.shape[0] == 1:
+        return np.repeat(points_xy.astype(np.float32),
+                         repeats=num_samples,
+                         axis=0)
+
+    if closed:
+        # 닫힌 모양이면 끝에 첫 점을 붙여서 둘레를 만듭니다.
+        if not np.allclose(points_xy[0], points_xy[-1]):
+            points_xy = np.vstack([points_xy, points_xy[0]])  # shape (N+1,2)
+
+    diffs = points_xy[1:] - points_xy[:-1]  # shape (M,2)
+    seg_lens = np.linalg.norm(diffs, axis=1)  # shape (M,)
+    total_len = float(seg_lens.sum())
+
+    if total_len < EPS:
+        return np.repeat(points_xy[:1].astype(np.float32),
+                         repeats=num_samples,
+                         axis=0)
+
+    cum_len = np.concatenate([[0.0], np.cumsum(seg_lens)])  # shape (M+1,)
+
+    if closed:
+        # 닫힌 모양은 시작점 중복을 피하려고 endpoint=False
+        target = np.linspace(0.0,
+                             total_len,
+                             num_samples,
+                             endpoint=False,
+                             dtype=np.float32)
+    else:
+        target = np.linspace(0.0,
+                             total_len,
+                             num_samples,
+                             endpoint=True,
+                             dtype=np.float32)
+
+    # 각 target이 어느 구간에 속하는지 찾기
+    seg_idx = np.searchsorted(cum_len, target, side="right") - 1
+    seg_idx = np.clip(seg_idx, 0, len(seg_lens) - 1)  # shape (num_samples,)
+
+    seg_start = points_xy[seg_idx]  # shape (num_samples,2)
+    seg_vec = diffs[seg_idx]  # shape (num_samples,2)
+    seg_len = seg_lens[seg_idx]  # shape (num_samples,)
+
+    alpha = (target - cum_len[seg_idx]) / np.maximum(
+        seg_len, EPS)  # shape (num_samples,)
+    sampled = seg_start + seg_vec * alpha[:, None]  # shape (num_samples,2)
+    return sampled.astype(np.float32)
+
+
+def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
+    """Scenario의 map_features를 요구사항에 맞게 필요한 것만 모읍니다.
+
+    여기서 하는 일:
+    - stop_sign 위치 수집
+    - crosswalk polygon 수집
+    - speed_bump polygon 수집
+    - lane 중심선 + boundary feature id + 속도제한 수집
+    - boundary(road_line/road_edge) polyline을 id->점들 형태로 모음
+
+    Args:
+        scenario: Scenario proto
+
+    Returns:
+        ParsedMap
+    """
+    stop_sign_xy_global: List[np.ndarray] = []
+    crosswalk_polygons_xy_global: List[np.ndarray] = []
+    speed_bump_polygons_xy_global: List[np.ndarray] = []
+    lanes: List[LaneInfo] = []
+    boundary_polylines_xy_global: Dict[int, np.ndarray] = {}
+
+    for mf in scenario.map_features:
+        feature_type = mf.WhichOneof("feature_data")
+
+        if feature_type == "stop_sign":
+            pos = mf.stop_sign.position
+            stop_sign_xy_global.append(
+                np.array([pos.x, pos.y], dtype=np.float32))
+
+        elif feature_type == "crosswalk":
+            polygon_xy = np.array([[p.x, p.y] for p in mf.crosswalk.polygon],
+                                  dtype=np.float32)
+            crosswalk_polygons_xy_global.append(polygon_xy)
+
+        elif feature_type == "speed_bump":
+            polygon_xy = np.array([[p.x, p.y] for p in mf.speed_bump.polygon],
+                                  dtype=np.float32)
+            speed_bump_polygons_xy_global.append(polygon_xy)
+
+        elif feature_type == "road_line":
+            poly_xy = np.array([[p.x, p.y] for p in mf.road_line.polyline],
+                               dtype=np.float32)
+            if poly_xy.shape[0] >= 1:
+                boundary_polylines_xy_global[int(mf.id)] = poly_xy
+
+        elif feature_type == "road_edge":
+            poly_xy = np.array([[p.x, p.y] for p in mf.road_edge.polyline],
+                               dtype=np.float32)
+            if poly_xy.shape[0] >= 1:
+                boundary_polylines_xy_global[int(mf.id)] = poly_xy
+
+        elif feature_type == "lane":
+            centerline_xy = np.array([[p.x, p.y] for p in mf.lane.polyline],
+                                     dtype=np.float32)
+            left_ids = [
+                int(seg.boundary_feature_id) for seg in mf.lane.left_boundaries
+            ]
+            right_ids = [
+                int(seg.boundary_feature_id) for seg in mf.lane.right_boundaries
+            ]
+            speed_limit_mph = float(mf.lane.speed_limit_mph)
+
+            lanes.append(
+                LaneInfo(
+                    lane_id=int(mf.id),
+                    centerline_xy_global=centerline_xy,
+                    left_boundary_feature_ids=left_ids,
+                    right_boundary_feature_ids=right_ids,
+                    speed_limit_mph=speed_limit_mph,
+                ))
+
+    return ParsedMap(
+        stop_sign_xy_global=stop_sign_xy_global,
+        crosswalk_polygons_xy_global=crosswalk_polygons_xy_global,
+        speed_bump_polygons_xy_global=speed_bump_polygons_xy_global,
+        lanes=lanes,
+        boundary_polylines_xy_global=boundary_polylines_xy_global,
+    )
+
+
+def build_stop_sign_points(
+    stop_sign_xy_global: List[np.ndarray],
+    ego_xy_global: np.ndarray,
+    ego_yaw_global: float,
+    safety_len: int,
+) -> np.ndarray:
+    """stop sign 위치를 (n_stop_sign, safety_len, 2)로 만듭니다.
+
+    WOMD에서는 stop sign이 점 1개로 표현되므로,
+    그 점을 safety_len번 복사합니다.
+
+    Args:
+        stop_sign_xy_global: stop sign 점들의 리스트 (각각 (2,))
+        ego_xy_global: ego 전역 위치 (2,)
+        ego_yaw_global: ego 전역 yaw
+        safety_len: 출력 점 개수(10)
+
+    Returns:
+        stop_sign_points: (n_stop_sign, safety_len, 2) float32 (ego 기준)
+    """
+    n = len(stop_sign_xy_global)
+    out = np.zeros((n, safety_len, 2), dtype=np.float32)  # shape (n,10,2)
+    for i, xy in enumerate(stop_sign_xy_global):
+        # xy_local: (2,)
+        xy_local = transform_points_global_to_ego_local(xy[None, :],
+                                                        ego_xy_global,
+                                                        ego_yaw_global)[0]
+        out[i] = np.repeat(xy_local[None, :], repeats=safety_len, axis=0)
+    return out
+
+
+def build_polygon_points(
+    polygons_xy_global: List[np.ndarray],  # each (M,2)
+    ego_xy_global: np.ndarray,
+    ego_yaw_global: float,
+    safety_len: int,
+) -> np.ndarray:
+    """polygon 리스트를 (n_poly, safety_len, 2)로 바꿉니다.
+
+    요구사항대로 polygon을 둘레를 따라 같은 간격으로 safety_len개로 쪼갭니다.
+
+    Args:
+        polygons_xy_global: polygon 꼭짓점 리스트 (각각 (M,2))
+        ego_xy_global: ego 전역 위치 (2,)
+        ego_yaw_global: ego 전역 yaw
+        safety_len: 출력 점 개수(10)
+
+    Returns:
+        points: (n_poly, safety_len, 2) float32 (ego 기준)
+    """
+    n = len(polygons_xy_global)
+    out = np.zeros((n, safety_len, 2), dtype=np.float32)  # shape (n,10,2)
+
+    for i, poly_xy in enumerate(polygons_xy_global):
+        # poly_xy: (M,2)
+        if poly_xy.shape[0] == 0:
+            continue
+
+        # 먼저 ego 기준으로 바꾼 뒤, 그 좌표에서 샘플링합니다.
+        poly_local = transform_points_global_to_ego_local(
+            poly_xy, ego_xy_global, ego_yaw_global)  # (M,2)
+        sampled = resample_polyline_equal_distance(poly_local,
+                                                   num_samples=safety_len,
+                                                   closed=True)  # (10,2)
+        out[i] = sampled
+
+    return out
+
+
+def nearest_points_vectors(
+        centers_xy: np.ndarray,  # shape: (L,2)
+        boundary_xy: np.ndarray,  # shape: (K,2)
+) -> np.ndarray:
+    """center 점 각각에 대해 boundary에서 가장 가까운 점을 찾아 (boundary-center) 벡터를 만듭니다.
+
+    Args:
+        centers_xy: (L,2) 중심선 점들
+        boundary_xy: (K,2) 경계선 점들
+
+    Returns:
+        vecs: (L,2) (가까운 boundary점 - center점)
+    """
+    lane_len = int(centers_xy.shape[0])
+    if boundary_xy.shape[0] == 0:
+        return np.zeros((lane_len, 2), dtype=np.float32)
+
+    vecs = np.zeros((lane_len, 2), dtype=np.float32)  # shape (L,2)
+    for i in range(lane_len):
+        c = centers_xy[i]  # (2,)
+        diffs = boundary_xy - c[None, :]  # (K,2)
+        d2 = np.sum(diffs * diffs, axis=1)  # (K,)
+        j = int(np.argmin(d2))
+        vecs[i] = boundary_xy[j] - c
+    return vecs
+
+
+def build_lane_arrays(
+    lanes: List[LaneInfo],
+    boundary_polylines_xy_global: Dict[int, np.ndarray],
+    lane_id_to_light: Dict[int, np.ndarray],
+    ego_xy_global: np.ndarray,
+    ego_yaw_global: float,
+    lane_len: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """차선 정보를 요구사항의 lanes 포맷으로 만듭니다.
+
+    lanes: (lane_num, lane_len=10, 12)
+        0-1  : center (x,y)
+        2-3  : center vector (dx,dy)
+        4-5  : left boundary vector (dx,dy)
+        6-7  : right boundary vector (dx,dy)
+        8-11 : lane light one-hot [GO, CAUTION, STOP, UNKNOWN]
+
+    + lanes_speed_limit: (lane_num,1) m/s
+    + lanes_has_speed_limit: (lane_num,1) bool
+    + lane_light: (lane_num,4) float32
+
+    Args:
+        lanes: LaneInfo 리스트
+        boundary_polylines_xy_global: boundary feature id -> polyline (K,2)
+        lane_id_to_light: lane_id -> one_hot(4,)
+        ego_xy_global: ego 전역 위치
+        ego_yaw_global: ego 전역 yaw
+        lane_len: 차선 샘플 포인트 수(10)
+
+    Returns:
+        lanes_arr: (lane_num, lane_len, 12) float32
+        lanes_speed_limit: (lane_num, 1) float32 (m/s)
+        lanes_has_speed_limit: (lane_num, 1) bool
+        lane_light: (lane_num, 4) float32
+    """
+    lane_num = len(lanes)
+
+    lanes_arr = np.zeros((lane_num, lane_len, 12),
+                         dtype=np.float32)  # (L,10,12)
+    lanes_speed_limit = np.zeros((lane_num, 1), dtype=np.float32)  # (L,1)
+    lanes_has_speed_limit = np.zeros((lane_num, 1), dtype=bool)  # (L,1)
+    lane_light = np.zeros((lane_num, 4), dtype=np.float32)  # (L,4)
+
+    for i, lane in enumerate(lanes):
+        # 1) centerline 샘플링
+        center_xy_g = lane.centerline_xy_global  # (P,2)
+        center_xy_l = transform_points_global_to_ego_local(
+            center_xy_g, ego_xy_global, ego_yaw_global)  # (P,2)
+        center_sampled = resample_polyline_equal_distance(
+            center_xy_l, num_samples=lane_len, closed=False)  # (10,2)
+
+        # 2) center vector (dx,dy)
+        center_vec = np.zeros((lane_len, 2), dtype=np.float32)  # (10,2)
+        center_vec[:-1] = center_sampled[1:] - center_sampled[:-1]  # (9,2)
+        center_vec[-1] = 0.0
+
+        # 3) left/right boundary 점들 모아서 local로 변환
+        left_points_list: List[np.ndarray] = []
+        for fid in lane.left_boundary_feature_ids:
+            if fid in boundary_polylines_xy_global:
+                left_points_list.append(boundary_polylines_xy_global[fid])
+
+        right_points_list: List[np.ndarray] = []
+        for fid in lane.right_boundary_feature_ids:
+            if fid in boundary_polylines_xy_global:
+                right_points_list.append(boundary_polylines_xy_global[fid])
+
+        if len(left_points_list) > 0:
+            left_xy_g = np.concatenate(left_points_list,
+                                       axis=0).astype(np.float32)  # (K,2)
+            left_xy_l = transform_points_global_to_ego_local(
+                left_xy_g, ego_xy_global, ego_yaw_global)
+        else:
+            left_xy_l = np.zeros((0, 2), dtype=np.float32)
+
+        if len(right_points_list) > 0:
+            right_xy_g = np.concatenate(right_points_list,
+                                        axis=0).astype(np.float32)  # (K,2)
+            right_xy_l = transform_points_global_to_ego_local(
+                right_xy_g, ego_xy_global, ego_yaw_global)
+        else:
+            right_xy_l = np.zeros((0, 2), dtype=np.float32)
+
+        left_vec = nearest_points_vectors(center_sampled, left_xy_l)  # (10,2)
+        right_vec = nearest_points_vectors(center_sampled, right_xy_l)  # (10,2)
+
+        # 4) lane light
+        light = lane_id_to_light.get(lane.lane_id,
+                                     np.array([0, 0, 0, 1],
+                                              dtype=np.float32))  # (4,)
+        lane_light[i] = light
+        lanes_arr[i, :, 8:12] = light[None, :].repeat(lane_len, axis=0)
+
+        # 5) 속도제한(m/s)
+        if lane.speed_limit_mph > 0.0:
+            lanes_has_speed_limit[i, 0] = True
+            lanes_speed_limit[i, 0] = float(lane.speed_limit_mph) * 0.44704
+        else:
+            lanes_has_speed_limit[i, 0] = False
+            lanes_speed_limit[i, 0] = 0.0
+
+        # 6) 최종 lanes 채우기
+        lanes_arr[i, :, 0:2] = center_sampled
+        lanes_arr[i, :, 2:4] = center_vec
+        lanes_arr[i, :, 4:6] = left_vec
+        lanes_arr[i, :, 6:8] = right_vec
+
+    return lanes_arr, lanes_speed_limit, lanes_has_speed_limit, lane_light
+
+
+# =========================
+# 시나리오 -> pkl dict 만들기
+# =========================
+def build_cache_dict_for_scenario(
+    scenario: scenario_pb2.Scenario,) -> Dict[str, Any]:
+    """Scenario 1개를 요구사항 포맷의 dict로 바꿉니다.
+
+    이 dict가 그대로 pickle로 저장됩니다.
+
+    Returns dict keys(요구사항):
+        - scenario_id: str
+        - ego_agent_past: (21,11) float32
+        - ego_future_gt_3_dim: (80,3) float32
+        - ego_future_gt_11_dim: (80,11) float32
+
+        - neighbor_role: (A,2) bool
+        - neighbor_id: (A,) int64
+        - neighbor_z: (A,) float32
+        - neighbor_shape: (A,3) float32  [length,width,height] 평균
+        - neighbor_agents_past: (A,21,11) float32
+        - neighbor_future_gt_3_dim: (A,80,3) float32
+
+        - stop_sign_points: (Ns,10,2) float32
+        - crosswalk_points: (Nc,10,2) float32
+        - speed_bump_points: (Nb,10,2) float32
+
+        - lanes: (L,10,12) float32
+        - lanes_speed_limit: (L,1) float32
+        - lanes_has_speed_limit: (L,1) bool
+        - lane_light: (L,4) float32
+
+    Args:
+        scenario: Scenario proto
+
+    Returns:
+        cache_dict: pickle로 저장할 dict
+    """
+    track_key_to_array = decode_tracks_and_roles_from_scenario(scenario)
+
+    object_id_all = track_key_to_array["object_id"]  # (N,)
+    object_type_all = track_key_to_array["object_type"]  # (N,)
+    states_all = track_key_to_array["states"]  # (N,S,9)
+    valid_all = track_key_to_array["valid"]  # (N,S)
+    role_interest_all = track_key_to_array["role_interest"]  # (N,)
+    role_predict_all = track_key_to_array["role_predict"]  # (N,)
+
+    ego_idx = int(track_key_to_array["ego_index"][0])
+    current_t = int(scenario.current_time_index)
+    num_tracks = int(states_all.shape[0])
+    num_steps = int(states_all.shape[1])
+
+    ego_xy_global, ego_yaw_global, ego_z_global = compute_ego_pose_at_current(
+        scenario, track_key_to_array)
+
+    # -------------------------
+    # 모든 트랙을 ego 좌표계로 미리 변환
+    # -------------------------
+    pos_xy_global_all = states_all[:, :, 0:2]  # shape (N,S,2)
+    vel_xy_global_all = states_all[:, :, 7:9]  # shape (N,S,2)
+    yaw_global_all = states_all[:, :, 6]  # shape (N,S)
+    z_global_all = states_all[:, :, 2]  # shape (N,S)
+
+    # local 변환
+    pos_xy_local_all = transform_points_global_to_ego_local(
+        pos_xy_global_all, ego_xy_global, ego_yaw_global)  # (N,S,2)
+    vel_xy_local_all = transform_vectors_global_to_ego_local(
+        vel_xy_global_all, ego_yaw_global)  # (N,S,2)
+
+    # heading은 ego_yaw 기준으로 상대값
+    yaw_local_all = wrap_angle_np(yaw_global_all - ego_yaw_global)  # (N,S)
+
+    # width/length: 요구사항 11차원에서 (width, length) 순서
+    width_all = states_all[:, :, 4]  # (N,S)
+    length_all = states_all[:, :, 3]  # (N,S)
+    width_length_all = np.stack([width_all, length_all],
+                                axis=-1).astype(np.float32)  # (N,S,2)
+
+    # z는 ego 기준으로 상대값으로 저장
+    z_rel_all = (z_global_all - ego_z_global).astype(np.float32)  # (N,S)
+
+    # one-hot 타입 미리 생성
+    one_hot_all = np.zeros((num_tracks, 3), dtype=np.float32)  # (N,3)
+    for i in range(num_tracks):
+        one_hot_all[i] = make_agent_type_one_hot(int(object_type_all[i]))
+
+    # ego는 무조건 VEHICLE로 고정
+    one_hot_all[ego_idx] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    # -------------------------
+    # time index 구성
+    # -------------------------
+    past_indices, future_indices = build_time_indices(
+        current_time_index=current_t,
+        num_total_steps=num_steps,
+        desired_past_len=TIME_LEN,
+        desired_future_len=FUTURE_LEN,
+    )
+
+    # -------------------------
+    # ego: past/future 만들기
+    # -------------------------
+    ego_p_pos, ego_p_vel, ego_p_yaw, ego_p_wl, ego_p_valid = gather_agent_sequence_by_indices(
+        agent_idx=ego_idx,
+        time_indices=past_indices,
+        pos_xy_local_all=pos_xy_local_all,
+        vel_xy_local_all=vel_xy_local_all,
+        yaw_local_all=yaw_local_all,
+        width_length_all=width_length_all,
+        valid_all=valid_all,
+    )
+    ego_p_pos_i, ego_p_vel_i, ego_p_yaw_i, ego_p_wl_i, ego_p_valid_i = build_interpolated_agent_traj(
+        ego_p_pos, ego_p_vel, ego_p_yaw, ego_p_wl, ego_p_valid)
+    ego_agent_past = pack_agent_features_11(
+        pos_xy=ego_p_pos_i,
+        vel_xy=ego_p_vel_i,
+        yaw_rad=ego_p_yaw_i,
+        width_length=ego_p_wl_i,
+        agent_one_hot=one_hot_all[ego_idx],
+        valid_mask=ego_p_valid_i,
+    )  # (21,11)
+
+    ego_f_pos, ego_f_vel, ego_f_yaw, ego_f_wl, ego_f_valid = gather_agent_sequence_by_indices(
+        agent_idx=ego_idx,
+        time_indices=future_indices,
+        pos_xy_local_all=pos_xy_local_all,
+        vel_xy_local_all=vel_xy_local_all,
+        yaw_local_all=yaw_local_all,
+        width_length_all=width_length_all,
+        valid_all=valid_all,
+    )
+    ego_f_pos_i, ego_f_vel_i, ego_f_yaw_i, ego_f_wl_i, ego_f_valid_i = build_interpolated_agent_traj(
+        ego_f_pos, ego_f_vel, ego_f_yaw, ego_f_wl, ego_f_valid)
+
+    ego_future_gt_3_dim = pack_agent_future_3(
+        pos_xy=ego_f_pos_i,
+        yaw_rad=ego_f_yaw_i,
+        valid_mask=ego_f_valid_i,
+    )  # (80,3)
+
+    ego_future_gt_11_dim = pack_agent_features_11(
+        pos_xy=ego_f_pos_i,
+        vel_xy=ego_f_vel_i,
+        yaw_rad=ego_f_yaw_i,
+        width_length=ego_f_wl_i,
+        agent_one_hot=one_hot_all[ego_idx],
+        valid_mask=ego_f_valid_i,
+    )  # (80,11)
+
+    # -------------------------
+    # neighbors: 현재 시점에 존재하는(agent valid at current)만
+    # -------------------------
+    is_valid_now = valid_all[:, current_t]  # (N,)
+    neighbor_indices = [
+        i for i in range(num_tracks) if (i != ego_idx and bool(is_valid_now[i]))
+    ]
+    agent_num = len(neighbor_indices)
+
+    neighbor_role = np.zeros((agent_num, 2),
+                             dtype=bool)  # (A,2) [interest, predict]
+    neighbor_id = np.zeros((agent_num,), dtype=np.int64)  # (A,)
+    neighbor_z = np.zeros((agent_num,), dtype=np.float32)  # (A,)
+    neighbor_shape = np.zeros((agent_num, 3),
+                              dtype=np.float32)  # (A,3) [length,width,height]
+    neighbor_agents_past = np.zeros((agent_num, TIME_LEN, 11),
+                                    dtype=np.float32)  # (A,21,11)
+    neighbor_future_gt_3_dim = np.zeros((agent_num, FUTURE_LEN, 3),
+                                        dtype=np.float32)  # (A,80,3)
+
+    for out_i, tr_i in enumerate(neighbor_indices):
+        neighbor_id[out_i] = object_id_all[tr_i]
+        neighbor_role[out_i, 0] = bool(role_interest_all[tr_i])
+        neighbor_role[out_i, 1] = bool(role_predict_all[tr_i])
+        neighbor_z[out_i] = float(z_rel_all[tr_i, current_t])
+
+        # shape 평균: states[...,3:6] = [length,width,height]
+        valid_mask_full = valid_all[tr_i]  # (S,)
+        if np.any(valid_mask_full):
+            shape_vals = states_all[tr_i, valid_mask_full, 3:6]  # (K,3)
+            neighbor_shape[out_i] = shape_vals.mean(axis=0).astype(np.float32)
+        else:
+            neighbor_shape[out_i] = 0.0
+
+        # past 11-dim
+        p_pos, p_vel, p_yaw, p_wl, p_valid = gather_agent_sequence_by_indices(
+            agent_idx=tr_i,
+            time_indices=past_indices,
+            pos_xy_local_all=pos_xy_local_all,
+            vel_xy_local_all=vel_xy_local_all,
+            yaw_local_all=yaw_local_all,
+            width_length_all=width_length_all,
+            valid_all=valid_all,
+        )
+        p_pos_i, p_vel_i, p_yaw_i, p_wl_i, p_valid_i = build_interpolated_agent_traj(
+            p_pos, p_vel, p_yaw, p_wl, p_valid)
+        neighbor_agents_past[out_i] = pack_agent_features_11(
+            pos_xy=p_pos_i,
+            vel_xy=p_vel_i,
+            yaw_rad=p_yaw_i,
+            width_length=p_wl_i,
+            agent_one_hot=one_hot_all[tr_i],
+            valid_mask=p_valid_i,
+        )
+
+        # future 3-dim
+        f_pos, f_vel, f_yaw, f_wl, f_valid = gather_agent_sequence_by_indices(
+            agent_idx=tr_i,
+            time_indices=future_indices,
+            pos_xy_local_all=pos_xy_local_all,
+            vel_xy_local_all=vel_xy_local_all,
+            yaw_local_all=yaw_local_all,
+            width_length_all=width_length_all,
+            valid_all=valid_all,
+        )
+        f_pos_i, _, f_yaw_i, _, f_valid_i = build_interpolated_agent_traj(
+            f_pos, f_vel, f_yaw, f_wl, f_valid)
+        neighbor_future_gt_3_dim[out_i] = pack_agent_future_3(
+            pos_xy=f_pos_i,
+            yaw_rad=f_yaw_i,
+            valid_mask=f_valid_i,
+        )
+
+    # -------------------------
+    # map: stop/crosswalk/speed_bump/lanes
+    # -------------------------
+    parsed_map = parse_map_from_scenario(scenario)
+    lane_id_to_light = extract_lane_signals_at_current(scenario)
+
+    stop_sign_points = build_stop_sign_points(parsed_map.stop_sign_xy_global,
+                                              ego_xy_global, ego_yaw_global,
+                                              SAFETY_LEN)
+    crosswalk_points = build_polygon_points(
+        parsed_map.crosswalk_polygons_xy_global, ego_xy_global, ego_yaw_global,
+        SAFETY_LEN)
+    speed_bump_points = build_polygon_points(
+        parsed_map.speed_bump_polygons_xy_global, ego_xy_global, ego_yaw_global,
+        SAFETY_LEN)
+
+    lanes_arr, lanes_speed_limit, lanes_has_speed_limit, lane_light = build_lane_arrays(
+        lanes=parsed_map.lanes,
+        boundary_polylines_xy_global=parsed_map.boundary_polylines_xy_global,
+        lane_id_to_light=lane_id_to_light,
+        ego_xy_global=ego_xy_global,
+        ego_yaw_global=ego_yaw_global,
+        lane_len=LANE_LEN,
+    )
+
+    cache_dict: Dict[str, Any] = {
+        "scenario_id": str(scenario.scenario_id),
+        "ego_agent_past": ego_agent_past,  # (21,11)
+        "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (80,3)
+        "ego_future_gt_11_dim": ego_future_gt_11_dim,  # (80,11)
+        "neighbor_role": neighbor_role,  # (A,2) bool
+        "neighbor_id": neighbor_id,  # (A,)
+        "neighbor_z": neighbor_z,  # (A,)
+        "neighbor_shape": neighbor_shape,  # (A,3)
+        "neighbor_agents_past": neighbor_agents_past,  # (A,21,11)
+        "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,  # (A,80,3)
+        "stop_sign_points": stop_sign_points,  # (Ns,10,2)
+        "crosswalk_points": crosswalk_points,  # (Nc,10,2)
+        "speed_bump_points": speed_bump_points,  # (Nb,10,2)
+        "lanes": lanes_arr,  # (L,10,12)
+        "lanes_speed_limit": lanes_speed_limit,  # (L,1)
+        "lanes_has_speed_limit": lanes_has_speed_limit,  # (L,1)
+        "lane_light": lane_light,  # (L,4)
+    }
+    return cache_dict
+
+
+# =========================
+# TFRecord 파일 1개 처리(멀티프로세스 워커)
+# =========================
+def process_one_tfrecord_file(
+    tfrecord_path: str,
+    args,
+    split: str,
+    caching_dir: str,
+    overwrite: bool,
+) -> Tuple[str, int, int, int, str]:
+    """TFRecord 파일 1개를 읽어서, 안에 들어있는 시나리오들을 캐싱합니다.
+
+    병렬 처리를 위해 "파일 단위"로 처리합니다.
+
+    Args:
+        tfrecord_path: 입력 tfrecord 경로
+        split: training/validation/testing
+        caching_dir: /home/user/womd_v1_3/cache
+        overwrite: True면 이미 pkl이 있어도 다시 만듭니다.
+
+    Returns:
+        (tfrecord_path, processed, skipped, failed, message)
+    """
+    if _WORKER_STOP_EVENT is not None and _WORKER_STOP_EVENT.is_set():
+        return tfrecord_path, 0, 0, 0, "ABORTED_BY_USER"
+    _log(f"START file={tfrecord_path} split={split}")
+    t0 = time.perf_counter()
+    processed = 0
+    skipped = 0
+    failed = 0
+    message = "OK"
+
+    tfrecord_p = Path(tfrecord_path)  # /path/to/split_xx.tfrecords
+    caching_p = Path(caching_dir)  # /home/user/womd_v1_3/cache
+
+    out_split_dir = caching_p / split  # e.g. /home/user/womd_v1_3/cache/training
+    ensure_dir(out_split_dir)
+
+    out_validation_split_dir: Optional[Path] = None
+    if split == "validation":
+        out_validation_split_dir = caching_p / "validation_tfrecords_splitted"
+        ensure_dir(
+            out_validation_split_dir
+        )  # e.g. /home/user/womd_v1_3/cache/validation_tfrecords_splitted
+
+    compression_type = guess_tfrecord_compression(tfrecord_p)
+    dataset = tf.data.TFRecordDataset(
+        tfrecord_p.as_posix(),
+        compression_type=compression_type,
+        num_parallel_reads=1,
+    )
+    _log("TFRecordDataset created")
+
+    for k, record in enumerate(dataset):
+        # ✅ Ctrl+C 요청 들어오면 워커도 가능한 빨리 빠져나오기
+        if _WORKER_STOP_EVENT is not None and _WORKER_STOP_EVENT.is_set():
+            message = "ABORTED_BY_USER"
+            break
+        try:
+            if k == 0:
+                _log("FIRST record fetched (before numpy())")
+            record_bytes = record.numpy()
+            if k == 0:
+                _log("FIRST record -> numpy done")
+            scenario = parse_scenario_from_bytes(record_bytes)
+            scenario_id = str(scenario.scenario_id)
+            if processed == 0:
+                _log(f"FIRST scenario parsed id={scenario_id}")
+
+            out_pkl_path = out_split_dir / f"{scenario_id}.pkl"  # e.g. /home/user/womd_v1_3/cache/training/xxxx.pkl
+            out_tfrecord_path = None
+            if out_validation_split_dir is not None:
+                out_tfrecord_path = out_validation_split_dir / f"{scenario_id}.tfrecords"  # e.g. /home/user/womd_v1_3/cache/validation_tfrecords_splitted/xxxx.tfrecords
+
+            # 이미 있으면 skip (overwrite=False일 때)
+            if (not overwrite) and out_pkl_path.exists():
+                # validation split tfrecords도 같이 요구되므로, 그건 없으면 만들어줌
+                if split == "validation" and out_tfrecord_path is not None and (
+                        not out_tfrecord_path.exists()):
+                    with tf.io.TFRecordWriter(
+                            out_tfrecord_path.as_posix()) as w:
+                        w.write(record_bytes)
+                skipped += 1
+                continue
+            if _WORKER_STOP_EVENT is not None and _WORKER_STOP_EVENT.is_set():
+                message = "ABORTED_BY_USER"
+                break
+            cache_dict = build_cache_dict_for_scenario(scenario)
+            with open(out_pkl_path, "wb") as f:
+                pickle.dump(cache_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+            if processed == 0:
+                _log(f"FIRST pkl written: {out_pkl_path}")
+            if split == "validation" and out_tfrecord_path is not None:
+                with tf.io.TFRecordWriter(out_tfrecord_path.as_posix()) as w:
+                    w.write(record_bytes)
+
+            processed += 1
+            if args.save_image:
+                # 디버깅용 그림 그리기
+                save_dir = os.path.join(out_split_dir, "debug_vis")
+                save_path = os.path.join(save_dir, f"{scenario_id}.png")
+                os.makedirs(save_dir, exist_ok=True)
+                cache_dict["token_to_future_traj_wrt_ego"] = None
+                draw_machine.draw_world_model_to_png(cache_dict,
+                                                     output_data={},
+                                                     save_path=save_path)
+        except Exception as e:
+            failed += 1
+            message = f"FAILED: {repr(e)}"
+
+    return tfrecord_path, processed, skipped, failed, message
+
+
+def _worker_init(stop_event) -> None:
+    """spawn 워커 초기화: SIGINT 무시 + SIGTERM 즉시 종료 + stop_event 등록"""
+    global _WORKER_STOP_EVENT
+    _WORKER_STOP_EVENT = stop_event
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))  # terminate 시 즉시 종료
+
+    faulthandler.enable()
+    _log("worker init done")
+
+
+# =========================
+# split 전체 캐싱
+# =========================
+def cache_all_splits(
+    args,
+    data_path: str,
+    num_workers: int,
+    overwrite: bool,
+    splits: Tuple[str, ...] = SPLITS,
+) -> None:
+    dataset_p = Path(data_path)
+    scenario_dir = dataset_p / "scenario"
+    caching_dir = dataset_p / "cache"
+    ensure_dir(caching_dir)
+
+    ctx = mp.get_context("spawn")
+    stop_event = ctx.Event()
+
+    # 메인 시그널 핸들링(1회: graceful, 2회: hard kill)
+    pool_ref: Dict[str, Optional[mppool.Pool]] = {"pool": None}
+    old_handlers, shutdown_state = _install_main_signal_handlers(
+        stop_event=stop_event,
+        pool_ref=pool_ref,
+        grace_sec=12.0,  # 워커가 stop_event 보고 빠져나올 시간(필요하면 늘리기)
+    )
+
+    try:
+        for split in splits:
+            split_input_dir = scenario_dir / split
+            split_output_dir = caching_dir / split
+            ensure_dir(split_output_dir)
+
+            if split == "validation":
+                ensure_dir(caching_dir / "validation_tfrecords_splitted")
+
+            tfrecord_files: List[Path] = list_tfrecord_files(split_input_dir)
+            if len(tfrecord_files) == 0:
+                print(f"[WARN] No files found: {split_input_dir}")
+                continue
+
+            process_one_tfrecord_file_fn = partial(
+                process_one_tfrecord_file,
+                args=args,
+                split=split,
+                caching_dir=caching_dir.as_posix(),
+                overwrite=overwrite,
+            )
+
+            pool: Optional[mppool.Pool] = None
+            results: List[Tuple[str, int, int, int, str]] = []
+            tfrecord_paths = [p.as_posix() for p in tfrecord_files]
+
+            try:
+                pool = ctx.Pool(
+                    processes=num_workers,
+                    initializer=_worker_init,
+                    initargs=(stop_event,),
+                )
+                pool_ref["pool"] = pool
+
+                iterator = pool.imap_unordered(
+                    process_one_tfrecord_file_fn,
+                    tfrecord_paths,
+                    chunksize=1,
+                )
+
+                # 무기한 block 대신 timeout polling (Ctrl+C 반응성 확보)
+                pbar = tqdm(total=len(tfrecord_paths), desc=f"cache-{split}")
+                try:
+                    while True:
+                        if stop_event.is_set():
+                            deadline = shutdown_state.get("deadline", None)
+                            if deadline is not None and time.monotonic() > float(deadline):
+                                _log("grace 기간 초과 -> 워커 강제 종료(SIGKILL 포함)합니다.")
+                                _terminate_pool_hard(pool, timeout_sec=1.0)
+                                raise SystemExit(130)
+
+                        try:
+                            res = iterator.next(timeout=0.5)
+                        except mp.TimeoutError:
+                            continue
+                        except StopIteration:
+                            break
+
+                        results.append(res)
+                        pbar.update(1)
+                finally:
+                    pbar.close()
+
+                # 정리
+                with contextlib.suppress(Exception):
+                    pool.close()
+
+                if not _join_pool_soft(pool, timeout_sec=8.0):
+                    _terminate_pool_hard(pool, timeout_sec=1.0)
+
+                pool_ref["pool"] = None
+
+                # Ctrl+C로 stop_event가 켜졌다면 여기서 종료
+                if stop_event.is_set():
+                    raise SystemExit(130)
+
+            except KeyboardInterrupt:
+                # 혹시라도 KeyboardInterrupt로 들어오는 환경 대비
+                stop_event.set()
+                _log("KeyboardInterrupt -> 워커 종료 후 종료합니다.")
+                _terminate_pool_hard(pool, timeout_sec=1.0)
+                raise SystemExit(130)
+
+            except Exception:
+                stop_event.set()
+                _terminate_pool_hard(pool, timeout_sec=1.0)
+                raise
+
+            # 실패 요약 출력 (기존 로직 유지)
+            num_failed_files = sum(1 for _, _, _, failed, _ in results if failed > 0)
+            if num_failed_files > 0:
+                print(f"[WARN] split={split} failed_files={num_failed_files}/{len(results)}")
+                for tfp, processed, skipped, failed, msg in results:
+                    if failed > 0:
+                        print(f"  - {tfp} | processed={processed} skipped={skipped} failed={failed} | {msg}")
+
+    finally:
+        # 시그널 핸들러 원복
+        with contextlib.suppress(Exception):
+            signal.signal(signal.SIGINT, old_handlers[signal.SIGINT])
+            signal.signal(signal.SIGTERM, old_handlers[signal.SIGTERM])
+
+
+
+# =========================
+# CLI
+# =========================
+def _str2bool(v: str) -> bool:
+    return v.lower() in ("1", "true", "t", "yes", "y")
+
+
+if __name__ == "__main__":
+    args = args_util.get_args()
+    splits = tuple(
+        [s.strip() for s in args.womd_splits.split(",") if len(s.strip()) > 0])
+    cache_all_splits(
+        args,
+        data_path=args.womd_data_path,
+        num_workers=int(args.num_workers),
+        overwrite=_str2bool(args.overwrite_womd_cache),
+        splits=splits,
+    )

@@ -4,7 +4,7 @@ import argparse, json, sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-import args_util  # get_args()를 사용
+import args_util
 
 EXCLUDE_KEYS = {"state_normalizer", "observation_normalizer"}
 

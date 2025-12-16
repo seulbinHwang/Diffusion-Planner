@@ -13,6 +13,9 @@ Array = np.ndarray
 WorldModelFeature = Dict[str, Array]
 TokenTrajDict = Dict[str, Array]  # value: (future_len, 4) with [x, y, cos, sin]
 
+
+SILVER = "#C0C0C0"  # 은색 (interest)
+GOLD = "#FFD700"    # 금색 (predict)
 BLACK = "#000000"
 PURPLE = "#E6E6FA"
 RED = "#D50000"
@@ -322,6 +325,9 @@ class DrawingOptions:
 
     SAFETY_polygon_zorder: int = 4
     SAFETY_text_zorder: int = 5
+    # NEW: neighbor_role에 따른 현재 프레임 테두리 색
+    NEI_role_interest_edge_color: str = SILVER
+    NEI_role_predict_edge_color: str = GOLD
 
 
 # [ADD]
@@ -1120,6 +1126,39 @@ def is_valid_agent_row(row11: Array, eps: float) -> bool:
     """
     return bool(np.any(np.abs(row11[..., :8]) > eps))
 
+def _get_neighbor_edge_color_for_current_t(
+    agent_idx: int,
+    neighbor_role: Optional[Array],  # shape: (A,2) bool, [interest, predict]
+    default_edge_color: str,
+    options: DrawingOptions,
+) -> str:
+    """현재 시점에서 neighbor_role에 따라 테두리 색을 결정한다.
+
+    우선순위:
+      - predict(True)  -> GOLD
+      - interest(True) -> SILVER
+      - 그 외          -> default_edge_color
+    """
+    if neighbor_role is None:
+        return default_edge_color
+
+    role_arr = np.asarray(neighbor_role)
+    if role_arr.ndim != 2 or role_arr.shape[1] < 2:
+        return default_edge_color
+
+    if agent_idx < 0 or agent_idx >= role_arr.shape[0]:
+        return default_edge_color
+
+    is_interest = bool(role_arr[agent_idx, 0])
+    is_predict = bool(role_arr[agent_idx, 1])
+
+    # 둘 다 True일 수 있으면 predict를 우선(금색이 더 눈에 띄고, 일반적으로 "예측 대상" 강조)
+    if is_predict:
+        return options.NEI_role_predict_edge_color
+    if is_interest:
+        return options.NEI_role_interest_edge_color
+    return default_edge_color
+
 
 def is_valid_lane_point(point12: Array, eps: float) -> bool:
     """차선 포인트(12,)가 **유효**하면 True.
@@ -1421,10 +1460,13 @@ def draw_lane_centerlines(
 
 
 
-def draw_neighbor_past(ax: plt.Axes,
-                       neighbor_agents_past: Array,
-                       options: DrawingOptions,
-                       draw_token_int_list: Optional[List[int]] = None) -> None:
+def draw_neighbor_past(
+    ax: plt.Axes,
+    neighbor_agents_past: Array,
+    options: DrawingOptions,
+    neighbor_role: Optional[Array] = None,  # NEW: (A,2) bool
+    draw_token_int_list: Optional[List[int]] = None,
+) -> None:
     """이웃 에이전트 과거 시퀀스를 클래스별 색상으로 그림. invalid 스텝은 스킵."""
     if neighbor_agents_past is None or neighbor_agents_past.size == 0:
         return
@@ -1460,25 +1502,36 @@ def draw_neighbor_past(ax: plt.Axes,
                 "fill_color"] if t == current_t else None
             fill_alpha = neighbor_cls_style[
                 "fill_alpha"] if t == current_t else None
-
+            # NEW: 현재 시점만 neighbor_role에 따라 테두리 색 변경
+            edge_color = neighbor_cls_style["line_color"]
+            if t == current_t:
+                edge_color = _get_neighbor_edge_color_for_current_t(
+                    agent_idx=agent_idx,
+                    neighbor_role=neighbor_role,
+                    default_edge_color=neighbor_cls_style["line_color"],
+                    options=options,
+                )
             corners = oriented_box_corners(x, y, c, s, L, W)
-            add_polygon(ax,
-                        corners,
-                        edge_color=neighbor_cls_style["line_color"],
-                        line_width=neighbor_cls_style["line_width"],
-                        fill_color=fill_color,
-                        fill_alpha=fill_alpha,
-                        zorder=5 if t == current_t else 4)
-            add_heading_line(ax,
-                             x,
-                             y,
-                             c,
-                             s,
-                             nominal_length=L *
-                             options.COMMON_heading_line_scale,
-                             color=neighbor_cls_style["line_color"],
-                             line_width=neighbor_cls_style["line_width"],
-                             zorder=6 if t == current_t else 4)
+            add_polygon(
+                ax,
+                corners,
+                edge_color=edge_color,  # CHANGED
+                line_width=neighbor_cls_style["line_width"],
+                fill_color=fill_color,
+                fill_alpha=fill_alpha,
+                zorder=5 if t == current_t else 4,
+            )
+            add_heading_line(
+                ax,
+                x,
+                y,
+                c,
+                s,
+                nominal_length=L * options.COMMON_heading_line_scale,
+                color=edge_color,  # CHANGED
+                line_width=neighbor_cls_style["line_width"],
+                zorder=6 if t == current_t else 4,
+            )
             if options.NEI_draw_velocity_arrow and t == current_t:
                 add_velocity_arrow(
                     ax,
@@ -2565,8 +2618,14 @@ def draw_neighbor_past_all(ax: plt.Axes,
                                                is not None):
         draw_token_int_list: Optional[List[int]] = get_agent_idx_from_tokens(
             draw_token_list, input_data.get("neighbor_track_token", None))
-        draw_neighbor_past(ax, neighbor_agents_past, draw_option,
-                           draw_token_int_list)
+        neighbor_role = input_data.get("neighbor_role", None)  # NEW
+        draw_neighbor_past(
+            ax,
+            neighbor_agents_past,
+            draw_option,
+            neighbor_role=neighbor_role,  # NEW
+            draw_token_int_list=draw_token_int_list,
+        )
         # List[Optional[str]]
         neighbor_track_token = input_data.get("neighbor_track_token", None)
         if draw_option.NEI_draw_past_token and neighbor_track_token is not None:
