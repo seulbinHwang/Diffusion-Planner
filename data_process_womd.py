@@ -1,4 +1,3 @@
-
 import multiprocessing as mp
 import os
 import pickle
@@ -15,10 +14,15 @@ import time
 import sys  # 추가
 import contextlib
 import multiprocessing.pool as mppool
-_LOG_ENABLED = True          # 메인 프로세스는 기본 출력
-_LOGGER_PID_VAL = None       # multiprocessing.Value (pid 저장)
+
+_LOG_ENABLED = True  # 메인 프로세스는 기본 출력
+_LOGGER_PID_VAL = None  # multiprocessing.Value (pid 저장)
+
+
 def _ping() -> str:
     return f"ping pid={os.getpid()}"
+
+
 def _claim_logger_if_needed() -> None:
     """처음 일을 시작한 워커 1개만 로거로 '선점'해서 출력하도록 함."""
     global _LOG_ENABLED
@@ -32,6 +36,7 @@ def _claim_logger_if_needed() -> None:
 
     _LOG_ENABLED = (_LOGGER_PID_VAL.value == os.getpid())
 
+
 _WORKER_STOP_EVENT = None  # 추가 (spawn 워커에서 init으로 채움)
 
 
@@ -39,8 +44,8 @@ def _log(msg: str) -> None:
     if not _LOG_ENABLED:
         return
     print(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {msg}",
-          file=sys.stderr, flush=True)
-
+          file=sys.stderr,
+          flush=True)
 
 
 import numpy as np
@@ -102,6 +107,7 @@ def _terminate_pool_hard(
         with contextlib.suppress(Exception):
             proc.join(timeout=1.0)
 
+
 def _join_pool_soft(
     pool: Optional[mppool.Pool],
     timeout_sec: float = 10.0,
@@ -136,7 +142,11 @@ def _install_main_signal_handlers(
     - Ctrl+C 1회: stop_event set -> 우아한 종료(워커가 체크 지점에서 빠져나오게)
     - Ctrl+C 2회: 즉시 워커 강제 종료(SIGKILL 포함) 후 종료
     """
-    state: Dict[str, Any] = {"count": 0, "deadline": None, "grace_sec": float(grace_sec)}
+    state: Dict[str, Any] = {
+        "count": 0,
+        "deadline": None,
+        "grace_sec": float(grace_sec)
+    }
     old = {
         signal.SIGINT: signal.getsignal(signal.SIGINT),
         signal.SIGTERM: signal.getsignal(signal.SIGTERM),
@@ -152,7 +162,8 @@ def _install_main_signal_handlers(
         pool = pool_ref.get("pool", None)
 
         if state["count"] == 1:
-            _log("Ctrl+C 감지 -> stop_event 전파(우아한 종료 시도). 한 번 더 누르면 즉시 강제 종료합니다.")
+            _log(
+                "Ctrl+C 감지 -> stop_event 전파(우아한 종료 시도). 한 번 더 누르면 즉시 강제 종료합니다.")
             if pool is not None:
                 with contextlib.suppress(Exception):
                     pool.close()
@@ -172,6 +183,7 @@ def _install_main_signal_handlers(
 
     return old, state
 
+
 def wrap_angle(angle: torch.Tensor,
                min_val: float = -math.pi,
                max_val: float = math.pi) -> torch.Tensor:
@@ -181,7 +193,6 @@ def wrap_angle(angle: torch.Tensor,
 # =========================
 # 설정값 (요구사항 고정)
 # =========================
-
 
 SPLITS: Tuple[str, ...] = ("training", "validation", "testing")
 
@@ -206,8 +217,7 @@ def _set_womd_lengths_from_args(args: Any) -> None:
     if TIME_LEN <= 0 or FUTURE_LEN <= 0 or SAFETY_LEN <= 0 or LANE_LEN <= 0:
         raise ValueError(
             f"Invalid lengths: time_len={TIME_LEN}, future_len={FUTURE_LEN}, "
-            f"safety_len={SAFETY_LEN}, lane_len={LANE_LEN}"
-        )
+            f"safety_len={SAFETY_LEN}, lane_len={LANE_LEN}")
 
 
 def _require_womd_lengths_initialized() -> None:
@@ -215,8 +225,8 @@ def _require_womd_lengths_initialized() -> None:
     if TIME_LEN <= 0 or FUTURE_LEN <= 0 or SAFETY_LEN <= 0 or LANE_LEN <= 0:
         raise RuntimeError(
             "WOMD lengths are not initialized. "
-            "Make sure Pool initializer calls _set_womd_lengths_from_args()."
-        )
+            "Make sure Pool initializer calls _set_womd_lengths_from_args().")
+
 
 # =========================
 # 데이터 구조 (맵 파싱용)
@@ -230,7 +240,6 @@ class LaneInfo:
     right_boundary_feature_ids: List[int]
     speed_limit_mph: float
     lane_type: int  # ✅ 추가: lane의 큰 분류(고속도로/일반도로/자전거/미정)
-
 
 
 @dataclass(frozen=True)
@@ -259,7 +268,6 @@ class ParsedMap:
     road_edge_ids: List[int]
 
 
-
 # =========================
 # 기본 유틸
 # =========================
@@ -270,6 +278,7 @@ def ensure_dir(path: Path) -> None:
         path: 만들고 싶은 폴더 경로
     """
     path.mkdir(parents=True, exist_ok=True)
+
 
 def _proto_points_to_xy_array(points: Iterable[Any]) -> np.ndarray:
     """proto의 점 목록을 (N,2) numpy 배열로 바꿉니다.
@@ -479,7 +488,7 @@ def build_lane_line_type_arrays(
     """
     lane_num = len(lanes)
 
-    left_line_type = np.zeros((lane_num, 10), dtype=np.float32)   # shape (L,10)
+    left_line_type = np.zeros((lane_num, 10), dtype=np.float32)  # shape (L,10)
     right_line_type = np.zeros((lane_num, 10), dtype=np.float32)  # shape (L,10)
 
     for i, lane in enumerate(lanes):
@@ -532,21 +541,20 @@ def build_road_edge_points_and_types(
         road_edge_type: shape (n_road_edge, 3) float32 (one-hot)
     """
     n_road_edge = len(road_edge_ids)
-    road_edge_points = np.zeros((n_road_edge, safety_len, 2), dtype=np.float32)  # (E,10,2)
-    road_edge_type = np.zeros((n_road_edge, 3), dtype=np.float32)               # (E,3)
+    road_edge_points = np.zeros((n_road_edge, safety_len, 2),
+                                dtype=np.float32)  # (E,10,2)
+    road_edge_type = np.zeros((n_road_edge, 3), dtype=np.float32)  # (E,3)
 
     for i, edge_id in enumerate(road_edge_ids):
         poly_xy_g = boundary_polylines_xy_global.get(
-            int(edge_id), np.zeros((0, 2), dtype=np.float32)
-        )  # shape (K,2)
+            int(edge_id), np.zeros((0, 2), dtype=np.float32))  # shape (K,2)
 
         poly_xy_l = transform_points_global_to_ego_local(
-            poly_xy_g, ego_xy_global, ego_yaw_global
-        )  # shape (K,2)
+            poly_xy_g, ego_xy_global, ego_yaw_global)  # shape (K,2)
 
         sampled = resample_polyline_equal_distance(
-            poly_xy_l, num_samples=safety_len, closed=False
-        )  # shape (safety_len,2)
+            poly_xy_l, num_samples=safety_len,
+            closed=False)  # shape (safety_len,2)
 
         road_edge_points[i] = sampled
         edge_type_value = int(road_edge_type_by_id.get(int(edge_id), 0))
@@ -568,12 +576,13 @@ def _extract_driveway_polygon_xy_global(driveway_msg: Any) -> np.ndarray:
     Returns:
         polygon_xy: shape (M,2) float32
     """
-    if hasattr(driveway_msg, "polygon") and len(getattr(driveway_msg, "polygon")) > 0:
+    if hasattr(driveway_msg, "polygon") and len(getattr(driveway_msg,
+                                                        "polygon")) > 0:
         return _proto_points_to_xy_array(getattr(driveway_msg, "polygon"))
-    if hasattr(driveway_msg, "polyline") and len(getattr(driveway_msg, "polyline")) > 0:
+    if hasattr(driveway_msg, "polyline") and len(
+            getattr(driveway_msg, "polyline")) > 0:
         return _proto_points_to_xy_array(getattr(driveway_msg, "polyline"))
     return np.zeros((0, 2), dtype=np.float32)
-
 
 
 def list_tfrecord_files(split_dir: Path) -> List[Path]:
@@ -851,46 +860,91 @@ def make_agent_type_one_hot(object_type_minus1: int) -> np.ndarray:
     return one_hot
 
 
+def get_num_steps_from_scenario(scenario: Any) -> int:
+    """시나리오의 “전체 시간 길이(step 수)”를 안전하게 구합니다.
+
+    어떤 시나리오는 track마다 길이가 다를 수 있습니다.
+    그래서 한 트랙(track0 등)의 길이에 기대면 전체가 잘릴 수 있습니다.
+    이 함수는 다음 순서로 전체 길이를 정합니다.
+
+    1) 시나리오에 timestamps_seconds가 있으면 그 길이를 사용
+    2) 없으면 모든 트랙의 states 길이 중 “가장 긴 길이”를 사용
+    3) 그래도 0이면 에러
+
+    Args:
+        scenario: WOMD 시나리오 객체
+
+    Returns:
+        num_steps: 전체 step 수(정수)
+
+    Raises:
+        ValueError: step 수를 0으로밖에 구할 수 없을 때
+    """
+    timestamps = getattr(scenario, "timestamps_seconds", None)
+    if timestamps is not None:
+        num_steps = int(len(timestamps))
+        if num_steps > 0:
+            return num_steps
+
+    tracks = getattr(scenario, "tracks", [])
+    if len(tracks) > 0:
+        lengths = [int(len(getattr(tr, "states", []))) for tr in tracks]
+        num_steps = int(max(lengths)) if len(lengths) > 0 else 0
+        if num_steps > 0:
+            return num_steps
+
+    raise ValueError("Scenario has zero steps (invalid WOMD record).")
+
+
 def build_time_indices(
     current_time_index: int,
     num_total_steps: int,
     desired_past_len: int,
     desired_future_len: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """시나리오의 시간 인덱스를 '원하는 길이'에 맞게 정리합니다.
+    """현재 시점을 기준으로 “최근 과거 / 바로 다음 미래” 인덱스를 만듭니다.
 
-    - 과거: (desired_past_len)개, 마지막은 현재(current_time_index)
-    - 미래: (desired_future_len)개, 현재는 제외하고 current_time_index+1부터 시작
-
-    WOMD는 보통 과거가 1초(11개)만 있어서, 2초(21개)를 만들려면
-    앞쪽 10개는 -1(없음)으로 둡니다.
+    이 함수는 과거 인덱스의 “끝이 항상 현재 시점”이 되도록 만듭니다.
+    예를 들어 현재가 10이고 과거 길이가 5면, [6,7,8,9,10]처럼 “최근 구간”을 씁니다.
+    데이터가 부족한 앞쪽은 -1로 채웁니다.
 
     Args:
-        current_time_index: 시나리오의 현재 시점 인덱스
-        num_total_steps: 전체 스텝 수(보통 91)
-        desired_past_len: 원하는 과거 길이(21)
-        desired_future_len: 원하는 미래 길이(80)
+        current_time_index: 현재 시점 인덱스(정수)
+        num_total_steps: 전체 시점 개수(정수)
+        desired_past_len: 과거 길이(TIME_LEN)
+        desired_future_len: 미래 길이(FUTURE_LEN)
 
     Returns:
-        past_indices: shape (desired_past_len,), 없으면 -1
-        future_indices: shape (desired_future_len,), 없으면 -1
+        past_indices: shape (desired_past_len,), dtype int64. 없으면 -1.
+        future_indices: shape (desired_future_len,), dtype int64. 없으면 -1.
     """
-    available_hist = current_time_index + 1
-    missing_hist = max(0, desired_past_len - available_hist)
+    current_t = int(current_time_index)
+    num_steps = int(num_total_steps)
+    past_len = int(desired_past_len)
+    future_len = int(desired_future_len)
 
-    past_indices = -np.ones(
-        (desired_past_len,), dtype=np.int64)  # shape (time_len,)
-    for i in range(desired_past_len):
-        scenario_idx = i - missing_hist
-        if 0 <= scenario_idx <= current_time_index and scenario_idx < num_total_steps:
-            past_indices[i] = scenario_idx
-
+    past_indices = -np.ones((past_len,), dtype=np.int64)  # shape (past_len,)
     future_indices = -np.ones(
-        (desired_future_len,), dtype=np.int64)  # shape (future_len,)
-    for j in range(desired_future_len):
-        scenario_idx = current_time_index + 1 + j
-        if 0 <= scenario_idx < num_total_steps:
-            future_indices[j] = scenario_idx
+        (future_len,), dtype=np.int64)  # shape (future_len,)
+
+    if num_steps <= 0:
+        return past_indices, future_indices
+
+    current_t = max(0, min(current_t, num_steps - 1))
+
+    # 과거: "끝이 current_t"가 되도록 최근 구간 선택
+    start_past = max(0, current_t - past_len + 1)
+    selected_past = np.arange(start_past, current_t + 1,
+                              dtype=np.int64)  # shape (K,)
+    past_indices[-selected_past.shape[0]:] = selected_past
+
+    # 미래: current_t+1부터 채우고 부족분은 -1 유지
+    start_future = current_t + 1
+    end_future = min(num_steps, start_future + future_len)
+    if start_future < num_steps:
+        future_indices[:(end_future - start_future)] = np.arange(start_future,
+                                                                 end_future,
+                                                                 dtype=np.int64)
 
     return past_indices, future_indices
 
@@ -1106,36 +1160,40 @@ def _track_states_to_numpy(
 
 
 def decode_tracks_and_roles_from_scenario(
-    scenario: scenario_pb2.Scenario,) -> Dict[str, np.ndarray]:
-    """Scenario proto에서 트랙(에이전트) 정보와 역할 정보를 numpy로 뽑습니다.
+    scenario: Any,) -> Dict[str, np.ndarray]:
+    """시나리오에서 트랙(에이전트) 정보와 역할 정보를 numpy로 뽑습니다.
+
+    이 함수는 시나리오의 전체 시간 길이를 먼저 안전하게 구한 뒤,
+    모든 트랙을 동일한 길이(num_steps)로 맞춰서 배열로 만듭니다.
+    어떤 트랙이 더 짧으면 뒤는 0/False로 채워집니다.
 
     Returns:
         key_to_array:
-            object_id: (N,) int64
-            object_type: (N,) int32  (track.object_type - 1)
-            states: (N,S,9) float32
-            valid: (N,S) bool
-            role_interest: (N,) bool
-            role_predict: (N,) bool
-            ego_index: (1,) int64
+            object_id: shape (N,), int64
+            object_type: shape (N,), int32  (track.object_type - 1)
+            states: shape (N,S,9), float32
+            valid: shape (N,S), bool
+            role_interest: shape (N,), bool
+            role_predict: shape (N,), bool
+            ego_index: shape (1,), int64
     """
     tracks = scenario.tracks
-    num_tracks = len(tracks)
-    num_steps = len(tracks[0].states) if num_tracks > 0 else 0
+    num_tracks = int(len(tracks))
+    num_steps = get_num_steps_from_scenario(scenario)
 
-    object_id = np.zeros((num_tracks,), dtype=np.int64)
-    object_type = np.zeros((num_tracks,), dtype=np.int32)
-    states = np.zeros((num_tracks, num_steps, 9), dtype=np.float32)
-    valid = np.zeros((num_tracks, num_steps), dtype=bool)
+    object_id = np.zeros((num_tracks,), dtype=np.int64)  # shape (N,)
+    object_type = np.zeros((num_tracks,), dtype=np.int32)  # shape (N,)
+    states = np.zeros((num_tracks, num_steps, 9),
+                      dtype=np.float32)  # shape (N,S,9)
+    valid = np.zeros((num_tracks, num_steps), dtype=bool)  # shape (N,S)
 
-    # 역할 정보(셋 membership은 O(1))
     predict_track_indices = {
         rp.track_index for rp in scenario.tracks_to_predict
     }
     interest_object_ids = {int(x) for x in scenario.objects_of_interest}
 
-    role_interest = np.zeros((num_tracks,), dtype=bool)
-    role_predict = np.zeros((num_tracks,), dtype=bool)
+    role_interest = np.zeros((num_tracks,), dtype=bool)  # shape (N,)
+    role_predict = np.zeros((num_tracks,), dtype=bool)  # shape (N,)
 
     for i, tr in enumerate(tracks):
         object_id[i] = int(tr.id)
@@ -1144,48 +1202,101 @@ def decode_tracks_and_roles_from_scenario(
         role_predict[i] = i in predict_track_indices
         role_interest[i] = int(tr.id) in interest_object_ids
 
-        # ✅ 핵심: (t loop) 제거하고 트랙 단위로 한 번에 채움
         states_i, valid_i = _track_states_to_numpy(tr, num_steps)
         states[i] = states_i
         valid[i] = valid_i
 
-    key_to_array: Dict[str, np.ndarray] = {
-        "object_id": object_id,  # (N,)
-        "object_type": object_type,  # (N,)
-        "states": states,  # (N,S,9)
-        "valid": valid,  # (N,S)
-        "role_interest": role_interest,  # (N,)
-        "role_predict": role_predict,  # (N,)
-        "ego_index": np.array([int(scenario.sdc_track_index)],
-                              dtype=np.int64),  # (1,)
+    return {
+        "object_id": object_id,
+        "object_type": object_type,
+        "states": states,
+        "valid": valid,
+        "role_interest": role_interest,
+        "role_predict": role_predict,
+        "ego_index": np.array([int(scenario.sdc_track_index)], dtype=np.int64),
     }
-    return key_to_array
+
+
+def require_valid_ego_at_current(valid_all: np.ndarray, ego_idx: int,
+                                 current_t: int) -> None:
+    """현재 시점에서 ego가 유효한지 확인합니다.
+
+    ego가 현재 프레임에서 유효하지 않으면, 좌표계 기준(ego 위치/방향)이 잘못 잡혀서
+    이후에 만들어지는 모든 값이 “조용히” 틀어질 수 있습니다.
+    그래서 이런 경우는 바로 에러로 중단시키는 게 안전합니다.
+
+    Args:
+        valid_all: shape (N,S), bool. 각 트랙의 각 시점 유효 여부
+        ego_idx: ego 트랙 인덱스
+        current_t: 현재 시점 인덱스
+
+    Raises:
+        ValueError: ego가 현재 시점에서 유효하지 않거나, 인덱스가 범위를 벗어날 때
+    """
+    # valid_all: np.ndarray, shape (N,S)
+    if valid_all.ndim != 2:
+        raise ValueError(
+            f"valid_all must be 2D (N,S). got shape={valid_all.shape}")
+
+    n, s = int(valid_all.shape[0]), int(valid_all.shape[1])
+    if not (0 <= ego_idx < n) or not (0 <= current_t < s):
+        raise ValueError(
+            f"Index out of range: ego_idx={ego_idx}/{n}, t={current_t}/{s}")
+
+    if not bool(valid_all[ego_idx, current_t]):
+        raise ValueError(
+            f"Ego invalid at current frame: ego_idx={ego_idx}, t={current_t}")
 
 
 def compute_ego_pose_at_current(
-    scenario: scenario_pb2.Scenario,
+    scenario: Any,
     track_dict: Dict[str, np.ndarray],
 ) -> Tuple[np.ndarray, float, float]:
     """현재 시점의 ego 위치/방향을 구합니다.
 
+    반환되는 ego 위치/방향은 이후 모든 좌표 변환의 기준이 됩니다.
+    그래서 ego가 현재 시점에서 유효하지 않으면 즉시 에러로 중단합니다.
+
     Args:
-        scenario: Scenario proto
-        track_dict: decode_tracks_and_roles_from_scenario 출력
+        scenario: WOMD 시나리오 객체
+        track_dict: decode_tracks_and_roles_from_scenario의 결과
 
     Returns:
-        ego_xy_global: (2,) float32
+        ego_xy_global: shape (2,), float32
         ego_yaw_global: float
         ego_z_global: float
     """
     ego_idx = int(track_dict["ego_index"][0])
     current_t = int(scenario.current_time_index)
 
-    # states: (N,S,9)
+    valid_all = track_dict["valid"]  # shape (N,S)
+    require_valid_ego_at_current(valid_all, ego_idx, current_t)
+
     ego_state = track_dict["states"][ego_idx, current_t]  # shape (9,)
     ego_xy = ego_state[0:2].astype(np.float32)  # shape (2,)
     ego_yaw = float(ego_state[6])
     ego_z = float(ego_state[2])
     return ego_xy, ego_yaw, ego_z
+
+
+def is_valid_polygon_xy(points_xy: np.ndarray, min_points: int = 3) -> bool:
+    """polygon 점 목록이 “의미 있게” 존재하는지 검사합니다.
+
+    점이 너무 적으면(예: 0개, 1개, 2개) polygon이라고 보기 어렵고,
+    이런 값이 캐시에 들어가면 이후 단계에서 전부 0으로 된 결과가 생겨서
+    데이터가 더러워질 수 있습니다.
+
+    Args:
+        points_xy: shape (M,2), float32. polygon의 점 목록
+        min_points: 최소 점 개수(기본 3)
+
+    Returns:
+        True면 저장할 가치가 있는 polygon, False면 버립니다.
+    """
+    # points_xy: np.ndarray, shape (M,2)
+    if points_xy.ndim != 2 or points_xy.shape[1] != 2:
+        return False
+    return int(points_xy.shape[0]) >= int(min_points)
 
 
 # =========================
@@ -1379,19 +1490,25 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
 
         if feature_type == "stop_sign":
             pos = mf.stop_sign.position
-            stop_sign_xy_global.append(np.array([pos.x, pos.y], dtype=np.float32))
+            stop_sign_xy_global.append(
+                np.array([pos.x, pos.y], dtype=np.float32))
 
         elif feature_type == "crosswalk":
-            polygon_xy = _proto_points_to_xy_array(mf.crosswalk.polygon)  # (M,2)
-            crosswalk_polygons_xy_global.append(polygon_xy)
+            polygon_xy = _proto_points_to_xy_array(
+                mf.crosswalk.polygon)  # shape (M,2)
+            if is_valid_polygon_xy(polygon_xy, min_points=3):
+                crosswalk_polygons_xy_global.append(polygon_xy)
 
         elif feature_type == "speed_bump":
-            polygon_xy = _proto_points_to_xy_array(mf.speed_bump.polygon)  # (M,2)
-            speed_bump_polygons_xy_global.append(polygon_xy)
-
+            polygon_xy = _proto_points_to_xy_array(
+                mf.speed_bump.polygon)  # shape (M,2)
+            if is_valid_polygon_xy(polygon_xy, min_points=3):
+                speed_bump_polygons_xy_global.append(polygon_xy)
         elif feature_type == "driveway":
-            polygon_xy = _extract_driveway_polygon_xy_global(mf.driveway)  # (M,2)
-            driveway_polygons_xy_global.append(polygon_xy)
+            polygon_xy = _extract_driveway_polygon_xy_global(
+                mf.driveway)  # shape (M,2)
+            if is_valid_polygon_xy(polygon_xy, min_points=3):
+                driveway_polygons_xy_global.append(polygon_xy)
 
         elif feature_type == "road_line":
             poly_xy = _proto_points_to_xy_array(mf.road_line.polyline)  # (K,2)
@@ -1400,7 +1517,8 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                 boundary_polylines_xy_global[fid] = poly_xy
                 boundary_id_to_kind[fid] = "road_line"
                 # road_line.type이 없을 수도 있어 안전하게 getattr 사용
-                road_line_type_by_id[fid] = int(getattr(mf.road_line, "type", 0))
+                road_line_type_by_id[fid] = int(getattr(mf.road_line, "type",
+                                                        0))
 
         elif feature_type == "road_edge":
             poly_xy = _proto_points_to_xy_array(mf.road_edge.polyline)  # (K,2)
@@ -1409,13 +1527,21 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                 boundary_polylines_xy_global[fid] = poly_xy
                 boundary_id_to_kind[fid] = "road_edge"
                 road_edge_ids.append(fid)
-                road_edge_type_by_id[fid] = int(getattr(mf.road_edge, "type", 0))
+                road_edge_type_by_id[fid] = int(getattr(mf.road_edge, "type",
+                                                        0))
 
         elif feature_type == "lane":
-            centerline_xy = _proto_points_to_xy_array(mf.lane.polyline)  # (P,2)
+            centerline_xy = _proto_points_to_xy_array(
+                mf.lane.polyline)  # shape (P,2)
+            if centerline_xy.shape[0] == 0:
+                continue
 
-            left_ids = [int(seg.boundary_feature_id) for seg in mf.lane.left_boundaries]
-            right_ids = [int(seg.boundary_feature_id) for seg in mf.lane.right_boundaries]
+            left_ids = [
+                int(seg.boundary_feature_id) for seg in mf.lane.left_boundaries
+            ]
+            right_ids = [
+                int(seg.boundary_feature_id) for seg in mf.lane.right_boundaries
+            ]
 
             speed_limit_mph = float(getattr(mf.lane, "speed_limit_mph", 0.0))
 
@@ -1430,8 +1556,7 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                     right_boundary_feature_ids=right_ids,
                     speed_limit_mph=speed_limit_mph,
                     lane_type=lane_type_value,
-                )
-            )
+                ))
 
     return ParsedMap(
         stop_sign_xy_global=stop_sign_xy_global,
@@ -1445,6 +1570,32 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
         road_edge_type_by_id=road_edge_type_by_id,
         road_edge_ids=road_edge_ids,
     )
+
+
+def atomic_pickle_dump(obj: Any, out_path: Path) -> None:
+    """pickle 파일을 “깨지지 않게” 저장합니다.
+
+    저장 중에 프로세스가 죽으면, 파일이 중간까지만 써진 상태로 남을 수 있습니다.
+    그러면 다음 실행에서 그 파일을 읽다가 오류가 나거나, 더 나쁘게는 조용히 잘못 읽힐 수 있습니다.
+
+    이 함수는
+    1) 임시 파일에 먼저 끝까지 저장하고
+    2) 디스크에 실제로 기록되도록 강제로 한 번 밀어넣은 다음
+    3) 마지막에 이름만 바꿔서(out_path로 교체) “완성된 파일만 보이게” 합니다.
+
+    Args:
+        obj: 저장할 파이썬 객체
+        out_path: 최종 pkl 경로
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+
+    with open(tmp_path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(tmp_path, out_path)
 
 
 def build_stop_sign_points(
@@ -1670,6 +1821,7 @@ def get_womd_track_token(track: Any) -> str:
         return str(int(getattr(track, "id")))
     return ""
 
+
 # =========================
 # 시나리오 -> pkl dict 만들기
 # =========================
@@ -1854,7 +2006,8 @@ def build_cache_dict_for_scenario(
     neighbor_track_token: List[str] = [""] * agent_num  # ✅ 추가: 길이 A
 
     for out_i, tr_i in enumerate(neighbor_indices):
-        neighbor_track_token[out_i] = get_womd_track_token(scenario.tracks[tr_i])  # ✅ 추가
+        neighbor_track_token[out_i] = get_womd_track_token(
+            scenario.tracks[tr_i])  # ✅ 추가
 
         neighbor_id[out_i] = object_id_all[tr_i]
         neighbor_role[out_i, 0] = bool(role_interest_all[tr_i])
@@ -1981,10 +2134,8 @@ def build_cache_dict_for_scenario(
 
         # 요구사항 이름이 right_lane_type로 되어 있어서 key는 그렇게 저장
         "right_lane_type": right_line_type,  # (L,10)
-
         "road_edge": road_edge,  # (E,10,2)
         "road_edge_type": road_edge_type,  # (E,3)
-
         "driveway": driveway,  # (D,10,2)
     }
     return cache_dict
@@ -2081,8 +2232,7 @@ def process_one_tfrecord_file(
                 message = "ABORTED_BY_USER"
                 break
             cache_dict = build_cache_dict_for_scenario(scenario)
-            with open(out_pkl_path, "wb") as f:
-                pickle.dump(cache_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+            atomic_pickle_dump(cache_dict, out_pkl_path)
             if processed == 0:
                 _log(f"FIRST pkl written: {out_pkl_path}")
             if split == "validation" and out_tfrecord_path is not None:
@@ -2092,11 +2242,9 @@ def process_one_tfrecord_file(
             now = time.monotonic()
             if now - last_hb >= hb_sec:
                 elapsed = time.perf_counter() - t0
-                _log(
-                    f"PROGRESS file={tfrecord_p.name} rec={k+1} "
-                    f"processed={processed} skipped={skipped} failed={failed} "
-                    f"elapsed={elapsed:.1f}s"
-                )
+                _log(f"PROGRESS file={tfrecord_p.name} rec={k+1} "
+                     f"processed={processed} skipped={skipped} failed={failed} "
+                     f"elapsed={elapsed:.1f}s")
                 last_hb = now
 
             processed += 1
@@ -2114,7 +2262,8 @@ def process_one_tfrecord_file(
 
             failed += 1
             _log(
-                f"[FAIL] scenario_id={scenario_id if 'scenario_id' in locals() else 'unknown'} err={repr(e)}")
+                f"[FAIL] scenario_id={scenario_id if 'scenario_id' in locals() else 'unknown'} err={repr(e)}"
+            )
             _log(traceback.format_exc())
             message = f"FAILED: {repr(e)}"
 
@@ -2133,6 +2282,7 @@ def _worker_init(stop_event, logger_pid_val, args) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     faulthandler.enable()
+
 
 # =========================
 # split 전체 캐싱
@@ -2198,7 +2348,8 @@ def cache_all_splits(
                     _log(f"WORKER READY: {msg}")
                 except Exception as e:
                     _log(
-                        f"WORKER NOT READY (likely importing TF/torch/etc): {repr(e)}")
+                        f"WORKER NOT READY (likely importing TF/torch/etc): {repr(e)}"
+                    )
 
                 iterator = pool.imap_unordered(
                     process_one_tfrecord_file_fn,
@@ -2212,7 +2363,8 @@ def cache_all_splits(
                     while True:
                         if stop_event.is_set():
                             deadline = shutdown_state.get("deadline", None)
-                            if deadline is not None and time.monotonic() > float(deadline):
+                            if deadline is not None and time.monotonic(
+                            ) > float(deadline):
                                 _log("grace 기간 초과 -> 워커 강제 종료(SIGKILL 포함)합니다.")
                                 _terminate_pool_hard(pool, timeout_sec=1.0)
                                 raise SystemExit(130)
@@ -2255,19 +2407,23 @@ def cache_all_splits(
                 raise
 
             # 실패 요약 출력 (기존 로직 유지)
-            num_failed_files = sum(1 for _, _, _, failed, _ in results if failed > 0)
+            num_failed_files = sum(
+                1 for _, _, _, failed, _ in results if failed > 0)
             if num_failed_files > 0:
-                print(f"[WARN] split={split} failed_files={num_failed_files}/{len(results)}")
+                print(
+                    f"[WARN] split={split} failed_files={num_failed_files}/{len(results)}"
+                )
                 for tfp, processed, skipped, failed, msg in results:
                     if failed > 0:
-                        print(f"  - {tfp} | processed={processed} skipped={skipped} failed={failed} | {msg}")
+                        print(
+                            f"  - {tfp} | processed={processed} skipped={skipped} failed={failed} | {msg}"
+                        )
 
     finally:
         # 시그널 핸들러 원복
         with contextlib.suppress(Exception):
             signal.signal(signal.SIGINT, old_handlers[signal.SIGINT])
             signal.signal(signal.SIGTERM, old_handlers[signal.SIGTERM])
-
 
 
 # =========================

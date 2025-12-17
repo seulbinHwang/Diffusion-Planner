@@ -590,52 +590,47 @@ class DataProcessor(object):
     def _merge_and_interpolate_neighbor_11dim(
             self,
             neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
-            neighbor_cur_fut_gt_11_dim: np.ndarray,  # (max_agent_num, Tf, 11)
+            neighbor_cur_fut_gt_11_dim: np.
+        ndarray,  # (max_agent_num, Tf, 11)  # 0번이 현재
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """neighbor 과거/현재 궤적과 현재/미래 궤적을 이어 붙인 뒤,
-        중간에 구멍이 뚫린 구간만 자연스럽게 채워준다.
+        """neighbor 과거/현재와 현재/미래를 이어 붙인 뒤, 중간 빈 프레임만 자연스럽게 채운다.
 
         동작 방식(한 agent 기준)
         ----------------------
-        1) 과거~현재 궤적(neighbor_agents_past)과
-           현재~미래 궤적(neighbor_cur_fut_gt_11_dim)을
+        1) 과거~현재(neighbor_agents_past)와 현재~미래(neighbor_cur_fut_gt_11_dim)를
            시간 순서대로 한 줄로 붙인다.
-           - 두 배열 모두 "현재 프레임"을 포함하므로
-             future 쪽의 현재 프레임(인덱스 0)은 한 번 빼고 붙인다.
-        2) 이렇게 합쳐진 궤적에서
-           x, y, 방향(cos, sin), 속도(vx, vy)가 전부 0인 프레임은
+           - 두 배열 모두 "현재 프레임"을 포함하므로,
+             future 쪽의 0번(현재)은 제거하고 붙인다.
+
+        2) 합쳐진 궤적에서, x/y/방향(cos,sin)/속도(vx,vy)가 전부 0인 프레임은
            "비어 있는 프레임"이라고 본다.
-           앞뒤에는 값이 있는데 가운데만 비어 있으면,
-           앞 점과 뒤 점을 직선으로 이은다고 생각하고
-           그 사이 프레임들의 x, y, 방향(cos, sin), 속도(vx, vy)를
-           시간 비율에 맞게 중간값으로 채운다.
-        3) 차의 폭/길이(width, length)는 보간하지 않고,
-           현재 프레임에서의 값 하나만 가져와서
-           값이 채워진 모든 프레임에 그대로 복사한다.
-           (비어 있는 프레임은 0으로 둔다.)
-        4) agent 종류를 나타내는 one-hot(type, 8~10번 채널)은
-           한 번이라도 관측된 값을 대표값으로 골라,
+           앞뒤는 값이 있는데 가운데만 비어 있으면,
+           앞 점과 뒤 점을 직선으로 잇는다고 생각하고
+           그 사이 프레임들의 x/y/방향/속도를 중간값으로 채운다.
+
+        3) width/length는 보간하지 않는다.
+           대신, 각 agent에 대해 과거~현재 구간에서 관측된 width/length 값들을 모아
+           정렬했을 때 가운데 값(중간값) 하나를 대표값으로 뽑고,
+           값이 채워진(유효한) 모든 프레임에 그 대표값을 그대로 복사한다.
+           (유효하지 않은 프레임은 0으로 둔다.)
+
+        4) 타입 one-hot(8~10)은 한 번이라도 관측된 값을 대표값으로 골라,
            값이 채워진 프레임에만 동일하게 붙인다.
-        5) 맨 앞/맨 뒤처럼, 한쪽이라도 이웃 점이 없는 비어 있는 구간은
+
+        5) 맨 앞/맨 뒤처럼 한쪽이라도 이웃 점이 없는 비어 있는 구간은
            그대로 0으로 남겨 둔다.
 
         Args:
             neighbor_agents_past (np.ndarray):
-                - shape: (max_agent_num, Tp, 11)
-                - 각 agent의 과거~현재 궤적.
+                shape: (max_agent_num, Tp, 11)
             neighbor_cur_fut_gt_11_dim (np.ndarray):
-                - shape: (max_agent_num, Tf, 11)
-                - 각 agent의 현재~미래 궤적.
-                - 인덱스 0이 현재 프레임이라고 가정한다.
+                shape: (max_agent_num, Tf, 11)
+                인덱스 0이 현재 프레임이라고 가정한다.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]:
-                - new_neighbor_agents_past:
-                    · shape: (max_agent_num, Tp, 11)
-                    · 구멍이 채워진 과거~현재 궤적.
-                - new_neighbor_future_with_current_11:
-                    · shape: (max_agent_num, Tf, 11)
-                    · 구멍이 채워진 현재~미래 궤적.
+                - new_neighbor_agents_past: shape (max_agent_num, Tp, 11)
+                - new_neighbor_future_11:  shape (max_agent_num, Tf-1, 11)  # 현재 제외
         """
         # 기본 shape 검사
         if neighbor_agents_past.ndim != 3 or neighbor_cur_fut_gt_11_dim.ndim != 3:
@@ -644,140 +639,125 @@ class DataProcessor(object):
                 f"(max_agent_num, time_len, 11) 형태여야 합니다. "
                 f"got {neighbor_agents_past.shape}, {neighbor_cur_fut_gt_11_dim.shape}"
             )
-
         if neighbor_agents_past.shape[
                 -1] != 11 or neighbor_cur_fut_gt_11_dim.shape[-1] != 11:
             raise ValueError(
                 f"두 입력의 마지막 차원은 11이어야 합니다. "
                 f"got {neighbor_agents_past.shape[-1]}, {neighbor_cur_fut_gt_11_dim.shape[-1]}"
             )
-
         if neighbor_agents_past.shape[0] != neighbor_cur_fut_gt_11_dim.shape[0]:
             raise ValueError(
                 "neighbor_agents_past 와 neighbor_cur_fut_gt_11_dim 의 agent 축 크기가 다릅니다."
             )
 
-        max_agent_num: int = neighbor_agents_past.shape[0]
-        time_len: int = neighbor_agents_past.shape[1]
-        future_len: int = neighbor_cur_fut_gt_11_dim.shape[1]
+        max_agent_num: int = int(neighbor_agents_past.shape[0])
+        time_len: int = int(neighbor_agents_past.shape[1])  # Tp
+        future_len: int = int(neighbor_cur_fut_gt_11_dim.shape[1])  # Tf
 
         # future 프레임이 아예 없으면 그대로 반환
         if future_len == 0:
             return neighbor_agents_past, neighbor_cur_fut_gt_11_dim
 
         # current(0번) 프레임은 항상 한 번 제거
-        neighbor_future_wo_current = neighbor_cur_fut_gt_11_dim[:,
-                                                                1:, :]  # (..., 80, 11)
+        # neighbor_future_wo_current: (max_agent_num, Tf-1, 11)
+        neighbor_future_wo_current: np.ndarray = neighbor_cur_fut_gt_11_dim[:,
+                                                                            1:, :]
 
-        # 에이전트가 0명이면 보간 없이 바로 반환 (time_len = 80 유지)
+        # 에이전트가 0명이면 보간 없이 바로 반환
         if max_agent_num == 0:
             return neighbor_agents_past, neighbor_future_wo_current
 
-        # ↓ 아래는 기존 로직에서 neighbor_future_wo_current만 사용
-        full_traj_11 = np.concatenate(
+        # full_traj_11: (max_agent_num, Tp + (Tf-1), 11)
+        full_traj_11: np.ndarray = np.concatenate(
             [neighbor_agents_past, neighbor_future_wo_current], axis=1)
 
+        # (1) size 대표값을 먼저 계산 (기본: 과거~현재만 사용)
+        # stable_size: (max_agent_num, 2) = [width_rep, length_rep]
+        stable_size: np.ndarray = self._estimate_stable_neighbor_sizes(
+            full_traj_11=full_traj_11,
+            past_len=time_len,
+            use_future=False,  # 필요하면 True로 바꿀 수 있음
+        )
+
+        # 마스크 계산
         # full_off_p_mask: (max_agent_num, T_full)  — True: 해당 프레임이 "빈 프레임"
         # full_off_mask:   (max_agent_num,)        — True: 해당 agent 전체가 모두 빈 값
         full_off_p_mask, full_off_mask = self._get_agents_past_cur_mask_np(
             full_traj_11)
-        # full_valid_mask: (max_agent_num, T_full)  — True: 앞 8차원 중 하나라도 0이 아닌 프레임
-        full_valid_mask: np.ndarray = ~full_off_p_mask
+        full_valid_mask: np.ndarray = ~full_off_p_mask  # (max_agent_num, T_full)
 
-        # full_traj_interp: (max_agent_num, T_full, 11)  — 보간 결과를 쌓을 버퍼
+        # 보간 결과 버퍼
+        # full_traj_interp: (max_agent_num, T_full, 11)
         full_traj_interp: np.ndarray = full_traj_11.astype(np.float32,
                                                            copy=True)
 
-        # width, length 를 위한 "현재 프레임" 크기 저장
-        # cur_size: (max_agent_num, 2)  — [width_now, length_now]
-        cur_size: np.ndarray = neighbor_agents_past[:, time_len - 1,
-                                                    6:8].astype(np.float32,
-                                                                copy=False)
-
+        # (2) x/y/cos/sin/vx/vy 만 "중간 구멍" 보간
         for agent_idx in range(max_agent_num):
-            # 이 agent 가 전 프레임에서 모두 0이면 스킵
             if full_off_mask[agent_idx]:
                 continue
 
-            # valid 프레임 인덱스 (앞 8차원 중 하나라도 0이 아니면 valid)
-            # agent_valid_idx: (K,)
             agent_valid_idx: np.ndarray = np.nonzero(
                 full_valid_mask[agent_idx])[0]
             if agent_valid_idx.size <= 1:
-                # 유효 프레임이 0 또는 1개뿐이면 채울 구간이 없음
                 continue
 
             first_valid: int = int(agent_valid_idx[0])
             last_valid: int = int(agent_valid_idx[-1])
 
-            # first_valid ~ last_valid 사이에 "빈 프레임"이 하나도 없으면
-            # (즉, 완전히 연속이면) 위치/속도 보간은 굳이 할 필요 없음.
-            #   - 이 경우엔 아래 width/length, type 채우기만 수행.
+            # 중간에 빈 프레임이 있을 때만 보간 수행
             if last_valid - first_valid + 1 > agent_valid_idx.size:
-                # 선형 보간용 x축(프레임 인덱스)
-                # xs: (K,)
-                xs: np.ndarray = agent_valid_idx.astype(np.float64)
-                # seg_idx: (seg_len,)  — first_valid ~ last_valid 전체 구간
-                seg_idx: np.ndarray = np.arange(
-                    first_valid,
-                    last_valid + 1,
-                    dtype=np.float64,
-                )
+                xs: np.ndarray = agent_valid_idx.astype(np.float64)  # (K,)
+                seg_idx: np.ndarray = np.arange(first_valid,
+                                                last_valid + 1,
+                                                dtype=np.float64)
 
-                # 앞 6차원(x, y, cos, sin, vx, vy)에 대해서만 값 채우기
                 for dim_idx in range(6):
-                    # ys: (K,)  — valid 프레임에서의 원래 값들
                     ys: np.ndarray = full_traj_11[agent_idx, agent_valid_idx,
                                                   dim_idx].astype(np.float64,
                                                                   copy=False)
-
-                    # interp_vals: (seg_len,)  — first_valid~last_valid 구간의 채워진 값
                     interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    full_traj_interp[
-                        agent_idx,
-                        first_valid:last_valid + 1,
-                        dim_idx,
-                    ] = interp_vals.astype(np.float32)
+                    full_traj_interp[agent_idx, first_valid:last_valid + 1,
+                                     dim_idx] = interp_vals.astype(np.float32,
+                                                                   copy=False)
 
-            # 보간 결과를 기준으로 "유효 프레임" 다시 계산
-            #   - 동적 6차원(x, y, cos, sin, vx, vy) 중 하나라도 0이 아니면 유효
-            # valid_after: (T_full,)
+            # 타입 one-hot(8~10)은 한 agent당 하나로 고정해서 유효 프레임에만 채움
             valid_after: np.ndarray = (np.abs(
-                full_traj_interp[agent_idx, :, :6]) > 0).any(axis=1)
+                full_traj_interp[agent_idx, :, :6])
+                                       > 0).any(axis=1)  # (T_full,)
 
-            # width, length(6,7)는 보간하지 않고,
-            # 각 agent의 "현재 프레임" 값으로 고정해서, 유효 프레임에만 채운다.
-            full_traj_interp[agent_idx, :, 6:8] = 0.0
-            full_traj_interp[agent_idx, valid_after,
-                             6:8] = cur_size[agent_idx][None, :]
-
-            # 타입 one-hot(8~10)은 한 agent당 하나의 값으로 고정해서,
-            # 유효 프레임에만 다시 채운다.
-            # type_candidates: (T_full, 3)
-            type_candidates: np.ndarray = full_traj_11[agent_idx, :, 8:11]
+            type_candidates: np.ndarray = full_traj_11[agent_idx, :,
+                                                       8:11]  # (T_full, 3)
             type_valid_mask: np.ndarray = (np.abs(type_candidates).sum(axis=1)
                                            > 0)
 
             if np.any(type_valid_mask):
-                # 첫 번째 유효 타입을 대표 타입으로 사용
-                # type_vec: (3,)
                 type_vec: np.ndarray = type_candidates[type_valid_mask][
-                    0].astype(np.float32, copy=False)
+                    0].astype(np.float32, copy=False)  # (3,)
             else:
                 type_vec = np.zeros((3,), dtype=np.float32)
 
             full_traj_interp[agent_idx, :, 8:11] = 0.0
             full_traj_interp[agent_idx, valid_after, 8:11] = type_vec
 
-        # 다시 과거/현재 구간과 현재/미래 구간으로 잘라서 반환
-        # new_neighbor_agents_past: (max_agent_num, time_len, 11)
+        # (3) 마지막에 width/length를 "대표값"으로 통일해서 채움
+        # valid_after_all: (max_agent_num, T_full)
+        valid_after_all: np.ndarray = (np.abs(full_traj_interp[:, :, :6])
+                                       > 0).any(axis=-1)
+
+        full_traj_interp = self._fill_width_length_with_representative_size(
+            traj_11=full_traj_interp,
+            valid_mask=valid_after_all,
+            rep_size=stable_size,
+        )
+
+        # 과거/현재와 미래로 다시 분리
+        # new_neighbor_agents_past: (max_agent_num, Tp, 11)
         new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :time_len, :]
 
-        # new_neighbor_future_with_current_11: (max_agent_num, future_len, 11)
-        #   · full_traj 기준 인덱스 time_len-1 이 "현재 프레임"에 해당
-        new_neighbor_future_with_current_11 = full_traj_interp[:, time_len:, :]
+        # new_neighbor_future_11: (max_agent_num, Tf-1, 11)  # 현재 제외
+        new_neighbor_future_11: np.ndarray = full_traj_interp[:, time_len:, :]
 
-        return new_neighbor_agents_past, new_neighbor_future_with_current_11
+        return new_neighbor_agents_past, new_neighbor_future_11
 
     @staticmethod
     def _get_agents_past_cur_mask_np(
@@ -1275,6 +1255,179 @@ class DataProcessor(object):
                 draw_machine.draw_world_model_to_png(key_to_array,
                                                      output_data={},
                                                      save_path=save_path)
+
+    @staticmethod
+    def _estimate_stable_neighbor_sizes(
+        full_traj_11: np.ndarray,  # shape: (N, T_full, 11)
+        past_len: int,
+        *,
+        use_future: bool = False,
+        eps: float = 1e-3,
+        width_max: float = 20.0,
+        length_max: float = 60.0,
+    ) -> np.ndarray:  # shape: (N, 2)
+        """이웃 에이전트별 width/length 대표값(하나)을 만든다.
+
+        배경
+        ----
+        nuPlan의 박스 width/length는 프레임마다 조금씩 흔들릴 수 있다.
+        그런데 실제 물체의 크기는 시간에 따라 바뀌지 않는 값이므로,
+        여러 프레임을 보고 "대표 크기" 하나를 만든 뒤 시간축 전체에 쓰는 편이 안정적이다.
+
+        이 함수가 하는 일
+        -----------------
+        - 각 에이전트(i)에 대해, 여러 프레임에서 관측된 width/length를 모은다.
+        - 그 중에서 "쓸 만한 값"만 남긴 뒤,
+          정렬했을 때 가운데 값(중간값)을 대표값으로 선택한다.
+          (한두 번 튀는 값이 있어도 평균보다 덜 흔들리기 때문)
+
+        "쓸 만한 값" 조건
+        ----------------
+        1) 해당 프레임이 패딩이 아님:
+           - [x, y, cos, sin, vx, vy] 중 하나라도 0이 아니면 패딩이 아니라고 본다.
+        2) width > eps, length > eps
+        3) 너무 큰 값은 버린다:
+           - width <= width_max, length <= length_max
+
+        시간 구간 선택
+        ------------
+        - use_future=False:
+            과거~현재(past_len 프레임)만 보고 대표값을 만든다.
+            (실제로 미래가 없는 환경과 맞추려면 이게 더 안전하다.)
+        - use_future=True:
+            과거~현재~미래 전체(full_traj_11 전체 프레임)를 보고 대표값을 만든다.
+            (완전 오프라인에서 더 많이 평균내고 싶을 때 선택)
+
+        값이 하나도 없을 때(예외 처리)
+        ----------------------------
+        - 위 조건을 통과한 width/length가 하나도 없다면,
+          과거~현재의 마지막 프레임(현재 프레임)의 width/length를 fallback으로 쓴다.
+          그것마저 0이면 결과도 0으로 남는다.
+
+        Args:
+            full_traj_11 (np.ndarray):
+                shape = (N, T_full, 11)
+                [x, y, cos, sin, vx, vy, width, length, onehot(3)]
+            past_len (int):
+                shape 관점에서 과거~현재 길이.
+                full_traj_11[:, :past_len, :] 구간이 과거~현재라고 본다.
+            use_future (bool):
+                True면 미래까지 포함해서 대표 크기를 만든다.
+            eps (float):
+                0에 매우 가까운 값들을 "없는 값"으로 보기 위한 기준.
+            width_max (float):
+                말도 안 되게 큰 width를 버리기 위한 상한.
+            length_max (float):
+                말도 안 되게 큰 length를 버리기 위한 상한.
+
+        Returns:
+            np.ndarray:
+                shape = (N, 2)
+                각 에이전트의 [width_rep, length_rep] (float32).
+        """
+        if full_traj_11.ndim != 3 or full_traj_11.shape[-1] != 11:
+            raise ValueError(
+                f"`full_traj_11` shape는 (N, T, 11)이어야 합니다. got {full_traj_11.shape}"
+            )
+        if past_len <= 0 or past_len > full_traj_11.shape[1]:
+            raise ValueError(
+                f"`past_len`은 1 이상이며 T_full 이하이어야 합니다. got past_len={past_len}, T_full={full_traj_11.shape[1]}"
+            )
+
+        N: int = int(full_traj_11.shape[0])
+        T_full: int = int(full_traj_11.shape[1])
+
+        # 대표값 계산에 사용할 구간 길이
+        T_src: int = T_full if use_future else int(past_len)
+
+        # src_traj: (N, T_src, 11)
+        src_traj: np.ndarray = full_traj_11[:, :T_src, :]
+
+        # 패딩이 아닌 프레임 마스크: (N, T_src)
+        #  - [x, y, cos, sin, vx, vy] 중 하나라도 0이 아니면 True
+        dynamic_valid: np.ndarray = (np.abs(src_traj[:, :, :6])
+                                     > eps).any(axis=-1)
+
+        # size: (N, T_src, 2) = [width, length]
+        size: np.ndarray = src_traj[:, :, 6:8]
+
+        # size 값이 "쓸 만한지" 마스크: (N, T_src)
+        size_valid: np.ndarray = ((size[:, :, 0] > eps) &
+                                  (size[:, :, 1] > eps) &
+                                  (size[:, :, 0] <= float(width_max)) &
+                                  (size[:, :, 1] <= float(length_max)) &
+                                  dynamic_valid)
+
+        # fallback: 현재 프레임(과거~현재의 마지막) size
+        # fallback_size: (N, 2)
+        fallback_size: np.ndarray = full_traj_11[:, past_len - 1,
+                                                 6:8].astype(np.float32,
+                                                             copy=False)
+
+        # out: (N, 2)
+        out: np.ndarray = fallback_size.copy()
+
+        # 에이전트별로 대표값(중간값) 계산
+        for i in range(N):
+            # valid_vals: (K, 2)  K는 유효 샘플 개수(가변)
+            valid_vals: np.ndarray = size[i][size_valid[i]]
+            if valid_vals.shape[0] == 0:
+                continue
+            # 중간값(정렬했을 때 가운데 값): (2,)
+            out[i] = np.median(valid_vals, axis=0).astype(np.float32,
+                                                          copy=False)
+
+        return out.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _fill_width_length_with_representative_size(
+            traj_11: np.ndarray,  # shape: (N, T, 11)
+            valid_mask: np.ndarray,  # shape: (N, T)
+            rep_size: np.ndarray,  # shape: (N, 2)
+    ) -> np.ndarray:
+        """width/length 채널(6:8)을 대표값으로 통일해서 넣는다.
+
+        이 함수가 하는 일
+        -----------------
+        - traj_11의 width/length 채널을 먼저 대표값으로 채운다.
+        - 그 다음 valid_mask가 False인 프레임은 width/length를 0으로 만든다.
+          (즉, "유효한 프레임에서만" size가 존재하도록 맞춘다.)
+
+        Args:
+            traj_11 (np.ndarray):
+                shape = (N, T, 11)
+                [x, y, cos, sin, vx, vy, width, length, onehot(3)]
+            valid_mask (np.ndarray):
+                shape = (N, T)
+                True면 유효 프레임, False면 패딩/무효 프레임이라고 본다.
+            rep_size (np.ndarray):
+                shape = (N, 2)
+                각 에이전트의 [width_rep, length_rep].
+
+        Returns:
+            np.ndarray:
+                shape = (N, T, 11)
+                width/length가 대표값으로 통일된 traj_11 (입력을 직접 수정하고 그대로 반환).
+        """
+        if traj_11.ndim != 3 or traj_11.shape[-1] != 11:
+            raise ValueError(
+                f"`traj_11` shape는 (N, T, 11)이어야 합니다. got {traj_11.shape}")
+        if valid_mask.shape != traj_11.shape[:2]:
+            raise ValueError(
+                f"`valid_mask` shape는 (N, T)이어야 합니다. got {valid_mask.shape}, expected {traj_11.shape[:2]}"
+            )
+        if rep_size.shape != (traj_11.shape[0], 2):
+            raise ValueError(
+                f"`rep_size` shape는 (N, 2)이어야 합니다. got {rep_size.shape}, expected {(traj_11.shape[0], 2)}"
+            )
+
+        # 대표 size를 모든 프레임에 채우고, 유효 마스크로 무효 프레임은 0 처리
+        # traj_11[:, :, 6:8]: (N, T, 2)
+        traj_11[:, :, 6:8] = rep_size[:, None, :].astype(traj_11.dtype,
+                                                         copy=False)
+        traj_11[:, :, 6:8] *= valid_mask[:, :, None].astype(traj_11.dtype,
+                                                            copy=False)
+        return traj_11
 
     def _get_future_tracked_objects_array_list(
         self,
