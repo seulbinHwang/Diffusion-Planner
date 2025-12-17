@@ -93,14 +93,22 @@ class DrawingOptions:
     COMMON_heading_line_scale: float = 0.5
 
     ######## LANES ########
+
     LANE_draw_lane_boundaries: bool = True  # check
     LANE_boundary_width: float = 1.
-    LANE_draw_lane_centerline: bool = False  # check
+    LANE_draw_lane_centerline: bool = True  # check
     LANE_draw_npc_agent_route: bool = False
     LANE_draw_vel_limit: bool = True
     LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
     LANE_route_agent_index_color: str = CYAN  # 번호 텍스트 색 # 청록색
     LANE_lane_boundary_color = PURPLE  # 남색(인디고 계열)
+
+    # ===== lane_type 기반 센터라인 색(디버그 시각화용) =====
+    LANE_freeway_centerline_color: str = PURPLE
+    LANE_surface_street_centerline_color: str = CYAN
+    LANE_bike_lane_centerline_color: str = GREEN
+    LANE_undefined_centerline_color: str = SILVER
+
 
     LANE_speed_color: str = PURPLE  # 번호 텍스트 색 # 청록색
     LANE_speed_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
@@ -123,6 +131,12 @@ class DrawingOptions:
     LANE_broken_linestyle: Any = (0, (4, 4))  # 점선 패턴
     LANE_solid_linestyle: str = "-"
     LANE_double_line_sep_m: float = 0.20  # 이중선 간격(미터)
+
+    # ===== lane_type 색을 '바탕선'으로 먼저 그릴지 =====
+    LANE_draw_lane_type_underlay: bool = True
+    LANE_lane_type_underlay_width: float = 2.4
+    LANE_lane_type_underlay_zorder: int = 0
+    LANE_lane_marking_zorder: int = 1
 
     # ===== road_edge =====
     ROAD_draw_road_edge: bool = True
@@ -1244,6 +1258,97 @@ def collect_valid_xy_for_bounds(
 from dataclasses import dataclass
 
 
+def _lane_type_one_hot_to_index_4(
+        lane_type_row4: Optional[Array],  # shape: (4,)
+) -> int:
+    """차선 종류를 나타내는 4칸짜리 값을 0~3 정수로 바꾼다.
+
+    이 함수는 차선 종류가 들어있는 (4,) 배열을 받아서,
+    가장 값이 큰 위치를 "차선 종류"로 봅니다.
+
+    값이 전부 0인 경우도 있을 수 있는데,
+    그때는 "미정(UNDEFINED)"으로 처리합니다.
+
+    Args:
+        lane_type_row4 (Optional[np.ndarray]):
+            shape = (4,).
+            값의 의미/순서:
+            - 0: FREEWAY
+            - 1: SURFACE_STREET
+            - 2: BIKE_LANE
+            - 3: UNDEFINED
+            None이면 UNDEFINED로 처리합니다.
+
+    Returns:
+        int:
+            0~3 중 하나.
+            - 0: FREEWAY
+            - 1: SURFACE_STREET
+            - 2: BIKE_LANE
+            - 3: UNDEFINED
+    """
+    if lane_type_row4 is None:
+        return 3  # UNDEFINED
+
+    lane_type_arr: Array = np.asarray(lane_type_row4).reshape(-1)  # shape: (4,)
+    if lane_type_arr.shape[0] != 4:
+        return 3  # 형식이 이상하면 UNDEFINED로 안전 처리
+
+    if float(np.sum(np.abs(lane_type_arr))) == 0.0:
+        return 3  # 전부 0이면 UNDEFINED
+
+    return int(np.argmax(lane_type_arr))
+
+
+def _lane_type_index_to_centerline_color(
+    lane_type_idx: int,
+    options: DrawingOptions,
+) -> str:
+    """차선 종류 인덱스(0~3)를 센터라인에 쓸 색으로 바꾼다.
+
+    Args:
+        lane_type_idx (int):
+            0~3 값.
+            - 0: FREEWAY
+            - 1: SURFACE_STREET
+            - 2: BIKE_LANE
+            - 3: UNDEFINED
+        options (DrawingOptions):
+            색 설정을 가져오기 위한 옵션 객체.
+
+    Returns:
+        str:
+            matplotlib에서 쓸 색 문자열.
+    """
+    if lane_type_idx == 0:
+        return options.LANE_freeway_centerline_color
+    if lane_type_idx == 1:
+        return options.LANE_surface_street_centerline_color
+    if lane_type_idx == 2:
+        return options.LANE_bike_lane_centerline_color
+    return options.LANE_undefined_centerline_color
+
+
+def _lane_type_row4_to_centerline_color(
+    lane_type_row4: Optional[Array],  # shape: (4,)
+    options: DrawingOptions,
+) -> str:
+    """(4,) 차선 종류 값을 센터라인 색으로 바로 바꾼다.
+
+    Args:
+        lane_type_row4 (Optional[np.ndarray]):
+            shape = (4,). 차선 종류 정보.
+        options (DrawingOptions):
+            색 설정을 가져오기 위한 옵션 객체.
+
+    Returns:
+        str:
+            센터라인에 쓸 색 문자열.
+    """
+    lane_type_idx: int = _lane_type_one_hot_to_index_4(lane_type_row4)
+    return _lane_type_index_to_centerline_color(lane_type_idx, options)
+
+
 def _lane_type_one_hot_to_color(
     lane_type_row4: Optional[Array],  # shape: (4,)
     options: DrawingOptions,
@@ -1505,6 +1610,15 @@ def _draw_double_line_segment(
                               outer_linestyle, zorder)
 
 
+"""
+python womd_cache_debug_stats.py \
+  --cache_dir /home/user/womd_v1_3/cache \
+  --splits training \
+  --max_scenarios_per_split 2000
+
+"""
+
+
 def draw_road_edge_points(
     ax: plt.Axes,
     road_edge: Optional[Array],  # shape: (E, safety_len=10, 2)
@@ -1695,7 +1809,9 @@ def draw_lane_boundaries(
 
         # lane_type 기반 기본 색
         lane_type_row4 = lane_type[idx] if lane_type is not None else None
-        base_color = _lane_type_one_hot_to_color(lane_type_row4, options)
+        base_color: str = options.LANE_lane_boundary_color
+
+        # base_color = _lane_type_one_hot_to_color(lane_type_row4, options)
 
         # left/right line 계획
         left_plan = _make_lane_boundary_draw_plan(
@@ -1812,107 +1928,122 @@ def draw_lane_boundaries(
 
 
 def draw_lane_centerlines(
-    ax: plt.Axes,
-    lanes: Array,  # (lane_num, lane_len, 12)
-    lanes_speed_limit: Array,  #  (lane_num, 1)
-    lanes_has_speed_limit: Array,  # (lane_num, 1)
-    options: DrawingOptions,
-    agent_route_lane_order: Optional[Array] = None,  # (max_agent_num, lane_num)
-    draw_token_int_list: Optional[List[int]] = None,
+        ax: plt.Axes,
+        lanes: Array,  # (lane_num, lane_len, 12)
+        lanes_speed_limit: Array,  #  (lane_num, 1)
+        lanes_has_speed_limit: Array,  # (lane_num, 1)
+        options: DrawingOptions,
+        agent_route_lane_order: Optional[
+            Array] = None,  # (max_agent_num, lane_num)
+        draw_token_int_list: Optional[List[int]] = None,
+        lane_type: Optional[Array] = None,  # (lane_num, 4) or None
 ) -> None:
-    """센터라인을 점선으로 그리거나, agent_route_lane_order가 주어지면 에이전트-차선 매핑을 텍스트로 표기한다.
+    """차선 센터라인을 그린다.
 
-    동작 모드
-    ----------
-    1) agent_route_lane_order is None:
-        - 기존 로직 유지: 차선 센터라인을 **점선**으로 그림.
-        - 양 끝점이 모두 유효한 구간만 선분을 그림.
-        - 색은 lane의 signal(0~3: green/yellow/red/unknown)에 따라 사용.
-        - (추가) options.LANE_draw_vel_limit=True 이고 lanes_has_speed_limit이 True인 차선에는
-          해당 lanes_speed_limit 값을 km/h로 변환하여 센터라인 위에 숫자를 표시.
+    이 함수는 2가지 모드를 지원합니다.
 
-    2) agent_route_lane_order is not None:
-        - 센터라인 **선을 그리지 않음**.
-        - 각 차선 j의 모든 유효 포인트 위치에 대해,
-          agent_route_lane_order[:, j] != -1 인 모든 에이전트 i에 대해
-          텍스트 **"i:rank"** 를 그 위치에 표기.
-          (rank = agent_route_lane_order[i, j])
-        - 동일 위치에 여러 텍스트가 겹치지 않도록, 세로로 약간(offset) 띄워서 적층.
+    1) 텍스트 모드(agent_route_lane_order가 사용되는 경우)
+        - 센터라인 선은 그리지 않고,
+        - 차선 위에 에이전트-차선 매핑 정보를 글씨로 표시합니다.
+        (기존 동작 유지)
 
-    Args
-    ----
-    ax : plt.Axes
-        Matplotlib 축.
-    lanes : np.ndarray
-        shape = (lane_num, lane_len, 12)
-        · 0-1: centerline (x,y)
-        · 2-3: centerline diff (dx,dy)
-        · 4-5: left boundary vector (dx,dy)
-        · 6-7: right boundary vector (dx,dy)
-        · 8-11: signal one-hot [green, yellow, red, unknown]
-    options : DrawingOptions
-        그리기 옵션(색/두께/간격 등).
-    agent_route_lane_order : Optional[np.ndarray]
-        shape = (max_agent_num, lane_num), 각 [i, j] = 해당 에이전트 i에게서
-        차선 j의 '가까운 순서 랭크(0,1,2,...)'; 경로에 없으면 -1.
+    2) 센터라인 선 모드(일반 모드)
+        - 기존에는 "신호 상태"에 따라 색을 바꿨습니다.
+        - 이제는 "차선 종류(lane_type)"에 따라 센터라인 색을 바꿉니다.
+          즉, FREEWAY/SURFACE_STREET/BIKE_LANE/UNDEFINED를
+          센터라인 색만 보고 구분할 수 있습니다.
+
+        - lane_type이 입력으로 없으면(=None) 기존처럼 신호 색을 사용합니다.
+
+    Args:
+        ax (plt.Axes):
+            Matplotlib 축 객체.
+        lanes (np.ndarray):
+            shape = (lane_num, lane_len, 12)
+            · 0-1: centerline (x,y)
+            · 2-3: centerline diff (dx,dy)
+            · 4-5: left boundary vector (dx,dy)
+            · 6-7: right boundary vector (dx,dy)
+            · 8-11: signal one-hot [green, yellow, red, unknown]
+        lanes_speed_limit (np.ndarray):
+            shape = (lane_num, 1). 속도 제한(있으면 m/s).
+        lanes_has_speed_limit (np.ndarray):
+            shape = (lane_num, 1). 속도 제한이 있는지 여부(bool).
+        options (DrawingOptions):
+            그리기 옵션.
+        agent_route_lane_order (Optional[np.ndarray]):
+            shape = (max_agent_num, lane_num).
+            텍스트 모드에서만 사용.
+        draw_token_int_list (Optional[List[int]]):
+            텍스트 모드에서 특정 에이전트만 표시할 때 사용.
+        lane_type (Optional[np.ndarray]):
+            shape = (lane_num, 4).
+            센터라인 색을 차선 종류로 바꾸기 위해 사용.
+            None이면 기존처럼 신호 색을 사용합니다.
     """
     if lanes is None or lanes.size == 0:
         return
-    if not (options.LANE_draw_npc_agent_route == True and
+
+    # route 텍스트 모드 조건(기존 로직 유지)
+    if not (options.LANE_draw_npc_agent_route is True and
             options.LANE_npc_agent_route_draw_mode == "centerline"):
         agent_route_lane_order = None
-    eps = options.invalid_eps
-    lane_num = lanes.shape[0]
 
-    # 추가: 속도 제한 텍스트를 그릴지 여부 플래그
-    use_speed_limit_label = (agent_route_lane_order is None and
-                             options.LANE_draw_vel_limit and
-                             (lanes_speed_limit is not None) and
-                             (lanes_has_speed_limit is not None))
+    eps: float = float(options.invalid_eps)
+    lane_num: int = int(lanes.shape[0])
+
+    # lane_type shape 체크(있을 때만)
+    lane_type_arr: Optional[Array] = None
+    if lane_type is not None:
+        lane_type_arr = np.asarray(lane_type)
+        if lane_type_arr.ndim != 2 or lane_type_arr.shape != (lane_num, 4):
+            raise ValueError(
+                f"lane_type shape는 (lane_num,4) 이어야 합니다. got {lane_type_arr.shape}, lane_num={lane_num}"
+            )
+
+    # 속도 제한 텍스트 표시 여부(기존 유지)
+    use_speed_limit_label: bool = (agent_route_lane_order is None and
+                                   options.LANE_draw_vel_limit and
+                                   (lanes_speed_limit is not None) and
+                                   (lanes_has_speed_limit is not None))
 
     # ────────────── (B) 텍스트 표기 모드 ──────────────
     if agent_route_lane_order is not None:
-        if draw_token_int_list is None:
-            draw_all = True
-        else:
-            draw_all = False
-        vstep = 0.3  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
+        draw_all: bool = (draw_token_int_list is None)
+        vstep: float = 0.3  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
 
-        # 각 차선 lane_idx 순회
         for lane_idx in range(lane_num):
-            lane_j = lanes[lane_idx]  # (lane_len, 12)
-            lane_j_center = lane_j[:, 0:2]  # (lane_len, 2)
-            # (lane_len,)
-            lane_point_valid_mask = np.any(np.abs(lane_j[:, :8]) > eps, axis=1)
+            lane_j: Array = lanes[lane_idx]  # shape: (lane_len, 12)
+            lane_j_center: Array = lane_j[:, 0:2]  # shape: (lane_len, 2)
 
-            # 이 차선을 자신의 경로에 포함하는 모든 agent i와 그 rank
-            # agent_route_lane_order: (max_agent_num, lane_num),
+            lane_point_valid_mask: Array = np.any(np.abs(lane_j[:, :8]) > eps,
+                                                  axis=1)  # shape: (lane_len,)
+
             ranks_j: Array = agent_route_lane_order[:,
-                                                    lane_idx]  # (max_agent_num,)
-            valid_agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # (K,)
+                                                    lane_idx]  # shape: (max_agent_num,)
+            valid_agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # shape: (K,)
             if valid_agent_idxs.size == 0:
                 continue
 
-            # 유효 포인트마다 텍스트 찍기
-            # (여러 agent가 있으면 위로 살짝씩 띄워서 겹침 완화)
             for point_idx in range(lane_j_center.shape[0]):
                 if point_idx % 4 != 0:
                     continue
-                if not lane_point_valid_mask[point_idx]:
+                if not bool(lane_point_valid_mask[point_idx]):
                     continue
-                point_x, point_y = float(lane_j_center[point_idx, 0]), float(
-                    lane_j_center[point_idx, 1])
-                for count, agent_idx in enumerate(valid_agent_idxs):
+
+                point_x: float = float(lane_j_center[point_idx, 0])
+                point_y: float = float(lane_j_center[point_idx, 1])
+
+                for count, agent_idx in enumerate(valid_agent_idxs.tolist()):
                     if (not draw_all) and (agent_idx
                                            not in draw_token_int_list):
                         continue
-                    rank_ij = int(ranks_j[int(agent_idx)])
-                    # label = f"{int(agent_idx)}--{rank_ij}"  # "에이전트인덱스:해당차선랭크"
-                    label = f"{rank_ij}"  # "에이전트인덱스:해당차선랭크"
-                    # label = f"{int(agent_idx)}"  # "에이전트인덱스"
+                    rank_ij: int = int(ranks_j[int(agent_idx)])
+                    label: str = f"{rank_ij}"
+
                     ax.text(
                         point_x,
-                        point_y + vstep * count,  # 위로 살짝씩 쌓기
+                        point_y + vstep * float(count),
                         label,
                         color=options.LANE_route_agent_index_color,
                         fontsize=options.LANE_AGENT_index_fontsize,
@@ -1922,64 +2053,89 @@ def draw_lane_centerlines(
                     )
         return  # 텍스트 모드에서는 선을 그리지 않음
 
-    # ────────────── (A) 기존 점선 센터라인 모드 ──────────────
-    for lane_idx, lane_i in enumerate(lanes):  # 추가: enumerate로 lane_idx 사용
-        center = lane_i[:, 0:2]
-        signals = lane_i[:, 8:12]
-        valid = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)  # (lane_len,)
+    # ────────────── (A) 센터라인 선 모드 ──────────────
+    for lane_idx, lane_i in enumerate(lanes):
+        center: Array = lane_i[:, 0:2]  # shape: (lane_len, 2)
+        signals: Array = lane_i[:, 8:12]  # shape: (lane_len, 4) (fallback용)
+        valid_mask: Array = np.any(np.abs(lane_i[:, :8]) > eps,
+                                   axis=1)  # shape: (lane_len,)
 
         if center.shape[0] < 2:
             continue
 
-        # 추가: 이 lane에 속도 제한 정보가 있는지 확인
-        has_speed_limit = False  # 추가
-        speed_kmh = None  # 추가
-        if use_speed_limit_label:  # 추가
-            flag_val = lanes_has_speed_limit[lane_idx]  # 추가
-            if np.ndim(flag_val) > 0:  # 추가
-                flag_val = flag_val[0]  # 추가
-            if bool(flag_val):  # 추가
-                has_speed_limit = True  # 추가
-                speed_val = lanes_speed_limit[lane_idx]  # 추가
-                if np.ndim(speed_val) > 0:  # 추가
-                    speed_val = speed_val[0]  # 추가
-                # m/s 로 들어왔다고 가정하고 km/h 로 변환  # 추가
-                speed_kmh = float(speed_val) * 3.6  # 추가
+        # (1) 이 lane의 센터라인 색 결정
+        # - lane_type이 있으면: 차선 종류 색
+        # - 없으면: 기존처럼 신호 색
+        lane_center_color_by_type: Optional[str] = None
+        if lane_type_arr is not None:
+            lane_type_row4: Array = lane_type_arr[lane_idx]  # shape: (4,)
+            lane_center_color_by_type = _lane_type_row4_to_centerline_color(
+                lane_type_row4=lane_type_row4,
+                options=options,
+            )
 
-        state_idx = np.argmax(signals, axis=1)  # (lane_len,)
+        # (2) 속도 제한 텍스트 준비(기존 유지)
+        has_speed_limit: bool = False
+        speed_kmh: Optional[float] = None
+        if use_speed_limit_label:
+            flag_val = lanes_has_speed_limit[lane_idx]
+            if np.ndim(flag_val) > 0:
+                flag_val = flag_val[0]
+            if bool(flag_val):
+                has_speed_limit = True
+                speed_val = lanes_speed_limit[lane_idx]
+                if np.ndim(speed_val) > 0:
+                    speed_val = speed_val[0]
+                speed_kmh = float(speed_val) * 3.6  # m/s -> km/h
+
+        # (3) 선분 그리기
+        # lane_type이 없을 때만 신호 색을 쓰기 위해 state_idx 계산
+        state_idx: Optional[Array] = None
+        if lane_center_color_by_type is None:
+            state_idx = np.argmax(signals, axis=1)  # shape: (lane_len,)
+
         for j in range(center.shape[0] - 1):
-            if not (valid[j] and valid[j + 1]):
+            if not (bool(valid_mask[j]) and bool(valid_mask[j + 1])):
                 continue
-            c0, c1 = center[j], center[j + 1]
-            color = options.LANE_signal_colors.get(int(state_idx[j]), GRAY)
-            ax.plot([c0[0], c1[0]], [c0[1], c1[1]],
-                    color=color,
-                    linewidth=1.2,
-                    linestyle=(0, (4, 4)),
-                    zorder=2)
 
-        # 추가: 속도 제한이 있는 lane이면 센터라인 중간쯤에 숫자(km/h)를 표시
+            c0: Array = center[j]  # shape: (2,)
+            c1: Array = center[j + 1]  # shape: (2,)
+
+            if lane_center_color_by_type is not None:
+                color: str = lane_center_color_by_type
+            else:
+                color = options.LANE_signal_colors.get(int(
+                    state_idx[j]), GRAY)  # type: ignore[index]
+
+            ax.plot(
+                [float(c0[0]), float(c1[0])],
+                [float(c0[1]), float(c1[1])],
+                color=color,
+                linewidth=1.2,
+                linestyle=(0, (4, 4)),
+                zorder=2,
+            )
+
+        # (4) 속도 제한 텍스트(기존 유지)
         if use_speed_limit_label and has_speed_limit and (speed_kmh
-                                                          is not None):  # 추가
-            valid_indices = np.nonzero(valid)[0]  # 추가
-            if valid_indices.size > 0:  # 추가
-                mid_idx = int(valid_indices[len(valid_indices) // 2])  # 추가
-                px, py = float(center[mid_idx, 0]), float(center[mid_idx,
-                                                                 1])  # 추가
-                if has_speed_limit and (speed_kmh is not None):  # 추가
-                    label = f"{speed_kmh:.1f}"  # 예: "50.0" km/h  # 추가
-                else:  # 추가
-                    label = "none"  # 속도 제한이 없는 도로  # 추가
+                                                          is not None):
+            valid_indices: Array = np.nonzero(valid_mask)[0]  # shape: (K,)
+            if valid_indices.size > 0:
+                mid_idx: int = int(valid_indices[len(valid_indices) // 2])
+                px: float = float(center[mid_idx, 0])
+                py: float = float(center[mid_idx, 1])
+                label: str = f"{speed_kmh:.1f}"
+
                 ax.text(
                     px,
                     py,
-                    label,  # 소수 첫째 자리까지 km/h로 표시  # 추가
-                    color=options.LANE_speed_color,  # 추가
-                    fontsize=options.LANE_speed_fontsize,  # 추가
+                    label,
+                    color=options.LANE_speed_color,
+                    fontsize=options.LANE_speed_fontsize,
                     ha="center",
                     va="center",
                     zorder=3,
-                )  # 추가
+                )
 
 
 def draw_neighbor_past(
@@ -3301,6 +3457,7 @@ def draw_lane(
             draw_option,
             agent_route_lane_order=agent_route_lane_order,
             draw_token_int_list=draw_token_int_list,
+            lane_type=lane_type,  # ✅ 추가
         )
 
 

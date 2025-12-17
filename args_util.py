@@ -458,7 +458,7 @@ def get_args():
     parser.add_argument(
         "--womd_splits",
         type=str,
-        default="training,validation,testing",
+        default="training",#,validation,testing",
         help="예: training,validation (콤마로 구분)",
     )
 
@@ -472,6 +472,10 @@ def get_args():
                         help='path to map data')
     parser.add_argument('--save_path',
                         default='./cache',
+                        type=str,
+                        help='path to save processed data')
+    parser.add_argument('--save_folder',
+                        default='cache_name_should_be_set',
                         type=str,
                         help='path to save processed data')
     parser.add_argument('--scenarios_per_type',

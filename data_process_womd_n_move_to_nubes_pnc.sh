@@ -18,23 +18,16 @@ echo "Step 1: Running data processing..."
 
 # Configuration from data_process_pnc.sh
 # You can modify these paths if needed.
-NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
-NUPLAN_MAP_PATH="/media/user/E/dataset/maps"
+WOMD_DATA_ROOT="/home/user/womd_v1_3"
 # 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
-TRAIN_SET_NAME="processed_nuplan_final"
+TRAIN_SET_NAME="processed_womd_final"
 TRAIN_SET_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
-TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
 # This is the command from data_process_pnc.sh
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
 taskset -c 0-95 \
-python data_process.py \
-  --data_path "$NUPLAN_DATA_PATH" \
-  --map_path "$NUPLAN_MAP_PATH" \
-  --save_path "$TRAIN_SET_PATH" \
-  --total_scenarios 1000000 \
-  --reset_save_path False
+python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" --save_folder "$TRAIN_SET_NAME" --num_workers 96
 
 echo "Data processing finished."
 echo "---------------------------------"
@@ -62,7 +55,5 @@ nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
                     "$TRAIN_SET_PATH" \
                     -e -j 64
 
-nubescli upload labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
-                    /media/user/E/projects/Diffusion-Planner/diffusion_planner_training.json
 echo "Upload complete."
 echo "Pipeline finished successfully."

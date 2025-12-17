@@ -4,19 +4,39 @@ import argparse
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 import matplotlib.pyplot as plt
 
 
+# =========================
+# Label dictionaries (EN)
+# =========================
+LINE_TYPE_INDEX_TO_NAME_EN: List[str] = [
+    "0: BROKEN_SINGLE_WHITE",
+    "1: SOLID_SINGLE_WHITE",
+    "2: SOLID_DOUBLE_WHITE",
+    "3: BROKEN_SINGLE_YELLOW",
+    "4: BROKEN_DOUBLE_YELLOW",
+    "5: SOLID_SINGLE_YELLOW",
+    "6: SOLID_DOUBLE_YELLOW",
+    "7: PASSING_DOUBLE_YELLOW",
+    "8: UNKNOWN",
+    "9: INVALID(no line)",
+]
+
+
 @dataclass
 class _RunningMeanRatio:
-    """여러 시나리오에서 비율을 평균 내기 위한 누적기.
+    """Running mean accumulator for per-scenario category ratios.
 
-    같은 종류의 항목(예: lane_type)을 시나리오마다 '비율'로 만든 뒤,
-    그 비율을 시나리오 단위로 평균내고 싶을 때 사용한다.
-    (즉, 항목이 많은 시나리오가 과하게 영향 주지 않도록 한다.)
+    For each scenario, we convert category counts into ratios and accumulate them.
+    This prevents scenarios with many items from dominating the final average.
+
+    Attributes:
+        sum_ratio: shape (K,) float64, accumulated ratios.
+        scenario_count: number of scenarios that contributed.
     """
     sum_ratio: np.ndarray  # shape: (K,)
     scenario_count: int
@@ -29,24 +49,24 @@ class _RunningMeanRatio:
         )
 
     def update_with_counts(self, counts: np.ndarray) -> None:
-        """counts를 비율로 바꾼 뒤 평균 누적기에 더한다.
+        """Convert counts to ratio and add to the running sum.
 
         Args:
-            counts: shape (K,) 각 칸은 해당 종류의 '개수'
+            counts: shape (K,) int-like. Each bin is the count for a category.
         """
         counts = np.asarray(counts).reshape(-1)  # shape: (K,)
         total = int(np.sum(counts))
         if total <= 0:
             return
-        ratio = (counts.astype(np.float64) / float(total))  # shape: (K,)
+        ratio = counts.astype(np.float64) / float(total)  # shape: (K,)
         self.sum_ratio += ratio
         self.scenario_count += 1
 
     def mean(self) -> np.ndarray:
-        """누적된 비율의 평균을 반환한다.
+        """Return mean ratio over scenarios.
 
         Returns:
-            mean_ratio: shape (K,)
+            mean_ratio: shape (K,) float64
         """
         if self.scenario_count <= 0:
             return np.zeros_like(self.sum_ratio, dtype=np.float64)
@@ -54,31 +74,16 @@ class _RunningMeanRatio:
 
 
 def _load_cache_pkl(pkl_path: Path) -> Dict[str, Any]:
-    """캐시 pkl 파일 1개를 읽어 딕셔너리로 반환한다.
-
-    Args:
-        pkl_path: 읽을 pkl 파일 경로.
-
-    Returns:
-        cache_dict: pkl 안에 저장된 딕셔너리.
-    """
+    """Load one cache pkl and return as a dict."""
     with pkl_path.open("rb") as f:
         obj = pickle.load(f)
     if not isinstance(obj, dict):
-        raise ValueError(f"pkl 내용이 dict가 아닙니다: {pkl_path}")
+        raise ValueError(f"PKL content is not a dict: {pkl_path}")
     return obj
 
 
 def _safe_argmax_row(row: np.ndarray, default_index: int) -> int:
-    """row가 전부 0이면 default_index를, 아니면 가장 큰 값의 칸 번호를 반환한다.
-
-    Args:
-        row: shape (K,)
-        default_index: 전부 0일 때 돌려줄 칸 번호
-
-    Returns:
-        index: 0..K-1
-    """
+    """Return argmax index, or default_index if the row is all zeros."""
     row = np.asarray(row).reshape(-1)  # shape: (K,)
     if float(np.sum(np.abs(row))) == 0.0:
         return int(default_index)
@@ -86,18 +91,18 @@ def _safe_argmax_row(row: np.ndarray, default_index: int) -> int:
 
 
 def compute_neighbor_role_counts(neighbor_role: np.ndarray) -> np.ndarray:
-    """neighbor_role을 4가지 경우로 나눠 개수를 센다.
+    """Count neighbor roles into 4 buckets.
 
-    4가지 경우(순서 고정):
-        0: 둘 다 아님(interest=False, predict=False)
-        1: 관심만(interest=True,  predict=False)
-        2: 예측만(interest=False, predict=True)
-        3: 둘 다(interest=True,  predict=True)
+    Bucket order:
+        0: none (interest=False, predict=False)
+        1: interest_only (interest=True,  predict=False)
+        2: predict_only  (interest=False, predict=True)
+        3: both          (interest=True,  predict=True)
 
     Args:
-        neighbor_role: shape (A, 2) bool 배열.
-            - [:,0] = 관심 표시
-            - [:,1] = 예측 표시
+        neighbor_role: shape (A, 2) bool array.
+            - [:,0] = interest flag
+            - [:,1] = predict flag
 
     Returns:
         counts: shape (4,) int64
@@ -128,17 +133,13 @@ def compute_neighbor_role_counts(neighbor_role: np.ndarray) -> np.ndarray:
 
 
 def compute_lane_type_counts(lane_type: np.ndarray) -> np.ndarray:
-    """lane_type(4칸 표시)를 세어서 종류별 개수를 만든다.
+    """Count lane_type one-hot rows into 4 categories.
 
-    lane_type의 각 행은 한 차선을 뜻한다.
-    4칸 중 1이 들어있는 칸이 그 차선의 종류다.
-    (혹시 전부 0이면 '미정(UNDEFINED)'으로 본다.)
-
-    종류 순서(순서 고정):
+    Category order:
         0: FREEWAY
         1: SURFACE_STREET
         2: BIKE_LANE
-        3: UNDEFINED
+        3: UNDEFINED (also used if all-zero)
 
     Args:
         lane_type: shape (L,4)
@@ -160,10 +161,9 @@ def compute_lane_type_counts(lane_type: np.ndarray) -> np.ndarray:
 
 
 def compute_line_type_counts(line_type: np.ndarray) -> np.ndarray:
-    """left/right_line_type(10칸 표시)를 세어서 종류별 개수를 만든다.
+    """Count left/right line type (10-dim one-hot) into 10 categories.
 
-    10칸 중 1이 들어있는 칸이 해당 선의 종류다.
-    (혹시 전부 0이면 'UNKNOWN(8번 칸)'으로 본다.)
+    If a row is all-zero, it is treated as UNKNOWN (index 8).
 
     Args:
         line_type: shape (L,10)
@@ -185,9 +185,9 @@ def compute_line_type_counts(line_type: np.ndarray) -> np.ndarray:
 
 
 def compute_road_edge_type_counts(road_edge_type: np.ndarray) -> np.ndarray:
-    """road_edge_type(3칸 표시)를 세어서 종류별 개수를 만든다.
+    """Count road_edge_type (3-dim one-hot) into 3 categories.
 
-    종류 순서(순서 고정):
+    Category order:
         0: UNKNOWN
         1: BOUNDARY
         2: MEDIAN
@@ -216,20 +216,15 @@ def _save_bar_png(
     labels: Sequence[str],
     title: str,
     save_path: Path,
+    x_label: str = "Category",
+    y_label: str = "Mean ratio",
 ) -> None:
-    """값들을 막대 그래프로 그려 PNG로 저장한다.
-
-    Args:
-        values: shape (K,) 값 배열(보통 0~1 비율).
-        labels: 막대 이름 리스트(길이 K).
-        title: 그래프 제목.
-        save_path: 저장할 png 경로.
-    """
+    """Save bar chart to PNG (English only)."""
     v = np.asarray(values).reshape(-1)  # shape: (K,)
     if len(labels) != int(v.shape[0]):
-        raise ValueError("labels 길이와 values 길이가 다릅니다.")
+        raise ValueError("labels length must match values length.")
 
-    fig = plt.figure(figsize=(10.0, 4.0), dpi=200)
+    fig = plt.figure(figsize=(12.0, 4.8), dpi=200)
     ax = fig.add_subplot(111)
     x = np.arange(len(labels), dtype=np.int64)  # shape: (K,)
 
@@ -237,6 +232,8 @@ def _save_bar_png(
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=30, ha="right")
     ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
     ax.set_ylim(0.0, max(1.0, float(np.max(v)) * 1.2))
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,22 +248,13 @@ def analyze_cache_dir(
     max_scenarios_per_split: int,
     out_dir: Path,
 ) -> None:
-    """캐시 폴더를 훑어서 타입/역할 분포를 평균으로 계산하고 그래프를 저장한다.
-
-    Args:
-        cache_dir: 예) /home/user/womd_v1_3/cache
-        splits: 예) ["training", "validation"]
-        max_scenarios_per_split: split마다 최대 몇 개 pkl까지 볼지
-        out_dir: 결과 png를 저장할 폴더
-    """
-    # 평균(시나리오 단위) 누적기들
+    """Analyze cached pkls and save English-only summary plots."""
     role_mean = _RunningMeanRatio.create(num_bins=4)
     lane_type_mean = _RunningMeanRatio.create(num_bins=4)
     left_line_mean = _RunningMeanRatio.create(num_bins=10)
     right_line_mean = _RunningMeanRatio.create(num_bins=10)
     road_edge_mean = _RunningMeanRatio.create(num_bins=3)
 
-    # 전체 개수 합(“아예 0인지”를 보기 좋게)
     role_sum = np.zeros((4,), dtype=np.int64)
     lane_type_sum = np.zeros((4,), dtype=np.int64)
     left_line_sum = np.zeros((10,), dtype=np.int64)
@@ -287,19 +275,16 @@ def analyze_cache_dir(
         for pkl_path in pkl_paths:
             cache_dict = _load_cache_pkl(pkl_path)
 
-            # --- neighbor_role ---
             if "neighbor_role" in cache_dict:
                 counts = compute_neighbor_role_counts(cache_dict["neighbor_role"])
                 role_sum += counts
                 role_mean.update_with_counts(counts)
 
-            # --- lane_type ---
             if "lane_type" in cache_dict:
                 counts = compute_lane_type_counts(cache_dict["lane_type"])
                 lane_type_sum += counts
                 lane_type_mean.update_with_counts(counts)
 
-            # --- left/right line type ---
             if "left_line_type" in cache_dict:
                 counts = compute_line_type_counts(cache_dict["left_line_type"])
                 left_line_sum += counts
@@ -310,7 +295,6 @@ def analyze_cache_dir(
                 right_line_sum += counts
                 right_line_mean.update_with_counts(counts)
 
-            # --- road_edge_type ---
             if "road_edge_type" in cache_dict:
                 counts = compute_road_edge_type_counts(cache_dict["road_edge_type"])
                 road_edge_sum += counts
@@ -320,7 +304,7 @@ def analyze_cache_dir(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 텍스트 요약(콘솔)
+    # Console summary (English)
     print(f"[INFO] analyzed_scenarios={total_seen}")
     print(f"[SUM] neighbor_role={role_sum.tolist()} (none, interest_only, predict_only, both)")
     print(f"[SUM] lane_type={lane_type_sum.tolist()} (FREEWAY, SURFACE_STREET, BIKE_LANE, UNDEFINED)")
@@ -328,36 +312,46 @@ def analyze_cache_dir(
     print(f"[SUM] left_line_type={left_line_sum.tolist()} (0..9)")
     print(f"[SUM] right_line_type={right_line_sum.tolist()} (0..9)")
 
-    # 평균 비율 그래프 저장
+    # Save mean-ratio plots (English titles)
     _save_bar_png(
         values=role_mean.mean(),
         labels=["none", "interest_only", "predict_only", "both"],
-        title="neighbor_role 평균 비율(시나리오 단위 평균)",
+        title="Neighbor role: mean ratio (scenario-wise average)",
         save_path=out_dir / "neighbor_role_mean_ratio.png",
+        x_label="Role",
+        y_label="Mean ratio",
     )
     _save_bar_png(
         values=lane_type_mean.mean(),
         labels=["FREEWAY", "SURFACE_STREET", "BIKE_LANE", "UNDEFINED"],
-        title="lane_type 평균 비율(시나리오 단위 평균)",
+        title="Lane type: mean ratio (scenario-wise average)",
         save_path=out_dir / "lane_type_mean_ratio.png",
+        x_label="Lane type",
+        y_label="Mean ratio",
     )
     _save_bar_png(
         values=left_line_mean.mean(),
-        labels=[str(i) for i in range(10)],
-        title="left_line_type 평균 비율(시나리오 단위 평균)",
+        labels=LINE_TYPE_INDEX_TO_NAME_EN,
+        title="Left line type: mean ratio (scenario-wise average)",
         save_path=out_dir / "left_line_type_mean_ratio.png",
+        x_label="Road line type",
+        y_label="Mean ratio",
     )
     _save_bar_png(
         values=right_line_mean.mean(),
-        labels=[str(i) for i in range(10)],
-        title="right_line_type 평균 비율(시나리오 단위 평균)",
+        labels=LINE_TYPE_INDEX_TO_NAME_EN,
+        title="Right line type: mean ratio (scenario-wise average)",
         save_path=out_dir / "right_line_type_mean_ratio.png",
+        x_label="Road line type",
+        y_label="Mean ratio",
     )
     _save_bar_png(
         values=road_edge_mean.mean(),
         labels=["UNKNOWN", "BOUNDARY", "MEDIAN"],
-        title="road_edge_type 평균 비율(시나리오 단위 평균)",
+        title="Road edge type: mean ratio (scenario-wise average)",
         save_path=out_dir / "road_edge_type_mean_ratio.png",
+        x_label="Road edge type",
+        y_label="Mean ratio",
     )
 
     print(f"[DONE] saved pngs to: {out_dir.as_posix()}")

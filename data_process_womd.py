@@ -1507,7 +1507,7 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
         elif feature_type == "driveway":
             polygon_xy = _extract_driveway_polygon_xy_global(
                 mf.driveway)  # shape (M,2)
-            if is_valid_polygon_xy(polygon_xy, min_points=3):
+            if is_valid_polygon_xy(polygon_xy, min_points=2):
                 driveway_polygons_xy_global.append(polygon_xy)
 
         elif feature_type == "road_line":
@@ -1589,13 +1589,16 @@ def atomic_pickle_dump(obj: Any, out_path: Path) -> None:
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-
-    with open(tmp_path, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-        f.flush()
-        os.fsync(f.fileno())
-
-    os.replace(tmp_path, out_path)
+    try:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, out_path)
+    finally:
+        if tmp_path.exists() and (not out_path.exists()):
+            with contextlib.suppress(Exception):
+                tmp_path.unlink()
 
 
 def build_stop_sign_points(
@@ -2296,7 +2299,7 @@ def cache_all_splits(
 ) -> None:
     dataset_p = Path(data_path)
     scenario_dir = dataset_p / "scenario"
-    caching_dir = dataset_p / "cache"
+    caching_dir = dataset_p / "cache" / args.save_folder
     ensure_dir(caching_dir)
 
     ctx = mp.get_context("spawn")
