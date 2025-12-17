@@ -453,7 +453,7 @@ def get_args():
                         help='path to raw data')
     parser.add_argument("--overwrite_womd_cache",
                         type=str,
-                        default="true",
+                        default="false",
                         help="true/false")
     parser.add_argument(
         "--womd_splits",

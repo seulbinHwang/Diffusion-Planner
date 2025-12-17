@@ -1157,50 +1157,84 @@ def _track_states_to_numpy(
     states_9[:m] = packed_10[:m, :9]
     valid[:m] = packed_10[:m, 9] != 0.0
     return states_9, valid
+from typing import Any, Dict, Set
+import numpy as np
 
 
-def decode_tracks_and_roles_from_scenario(
-    scenario: Any,) -> Dict[str, np.ndarray]:
-    """시나리오에서 트랙(에이전트) 정보와 역할 정보를 numpy로 뽑습니다.
+def _collect_track_indices_to_predict(scenario: Any, num_tracks: int) -> Set[int]:
+    """tracks_to_predict에서 'tracks 인덱스'들을 안전하게 모읍니다.
 
-    이 함수는 시나리오의 전체 시간 길이를 먼저 안전하게 구한 뒤,
-    모든 트랙을 동일한 길이(num_steps)로 맞춰서 배열로 만듭니다.
-    어떤 트랙이 더 짧으면 뒤는 0/False로 채워집니다.
+    Args:
+        scenario: WOMD scenario 객체.
+        num_tracks: scenario.tracks의 길이.
 
     Returns:
-        key_to_array:
-            object_id: shape (N,), int64
-            object_type: shape (N,), int32  (track.object_type - 1)
-            states: shape (N,S,9), float32
-            valid: shape (N,S), bool
-            role_interest: shape (N,), bool
-            role_predict: shape (N,), bool
-            ego_index: shape (1,), int64
+        track_indices: tracks 인덱스들의 집합.
+    """
+    track_indices: Set[int] = set()
+    for rp in getattr(scenario, "tracks_to_predict", []):
+        idx = int(getattr(rp, "track_index"))
+        if 0 <= idx < num_tracks:
+            track_indices.add(idx)
+    return track_indices
+
+
+def _collect_track_indices_of_interest(scenario: Any, num_tracks: int) -> Set[int]:
+    """objects_of_interest에서 'tracks 인덱스'들을 안전하게 모읍니다.
+
+    Waymo Motion 문서에 따르면 objects_of_interest는 tracks 필드에 대한 인덱스입니다. :contentReference[oaicite:1]{index=1}
+
+    Args:
+        scenario: WOMD scenario 객체.
+        num_tracks: scenario.tracks의 길이.
+
+    Returns:
+        interest_indices: tracks 인덱스들의 집합.
+    """
+    interest_indices: Set[int] = set()
+    for x in getattr(scenario, "objects_of_interest", []):
+        idx = int(x)
+        if 0 <= idx < num_tracks:
+            interest_indices.add(idx)
+    return interest_indices
+
+
+def decode_tracks_and_roles_from_scenario(scenario: Any) -> Dict[str, np.ndarray]:
+    """Scenario에서 트랙 정보와 role(interest/predict)을 numpy로 만듭니다.
+
+    - tracks_to_predict: tracks 안의 인덱스 :contentReference[oaicite:2]{index=2}
+    - objects_of_interest: tracks 안의 인덱스 :contentReference[oaicite:3]{index=3}
+
+    Returns:
+        object_id: (N,) int64
+        object_type: (N,) int32
+        states: (N,S,9) float32
+        valid: (N,S) bool
+        role_interest: (N,) bool
+        role_predict: (N,) bool
+        ego_index: (1,) int64
     """
     tracks = scenario.tracks
     num_tracks = int(len(tracks))
     num_steps = get_num_steps_from_scenario(scenario)
 
-    object_id = np.zeros((num_tracks,), dtype=np.int64)  # shape (N,)
-    object_type = np.zeros((num_tracks,), dtype=np.int32)  # shape (N,)
-    states = np.zeros((num_tracks, num_steps, 9),
-                      dtype=np.float32)  # shape (N,S,9)
-    valid = np.zeros((num_tracks, num_steps), dtype=bool)  # shape (N,S)
+    object_id = np.zeros((num_tracks,), dtype=np.int64)                 # (N,)
+    object_type = np.zeros((num_tracks,), dtype=np.int32)               # (N,)
+    states = np.zeros((num_tracks, num_steps, 9), dtype=np.float32)     # (N,S,9)
+    valid = np.zeros((num_tracks, num_steps), dtype=bool)               # (N,S)
 
-    predict_track_indices = {
-        rp.track_index for rp in scenario.tracks_to_predict
-    }
-    interest_object_ids = {int(x) for x in scenario.objects_of_interest}
+    predict_track_indices = _collect_track_indices_to_predict(scenario, num_tracks)
+    interest_track_indices = _collect_track_indices_of_interest(scenario, num_tracks)
 
-    role_interest = np.zeros((num_tracks,), dtype=bool)  # shape (N,)
-    role_predict = np.zeros((num_tracks,), dtype=bool)  # shape (N,)
+    role_interest = np.zeros((num_tracks,), dtype=bool)  # (N,)
+    role_predict = np.zeros((num_tracks,), dtype=bool)   # (N,)
 
     for i, tr in enumerate(tracks):
         object_id[i] = int(tr.id)
         object_type[i] = int(tr.object_type) - 1
 
-        role_predict[i] = i in predict_track_indices
-        role_interest[i] = int(tr.id) in interest_object_ids
+        role_predict[i] = (i in predict_track_indices)
+        role_interest[i] = (i in interest_track_indices)
 
         states_i, valid_i = _track_states_to_numpy(tr, num_steps)
         states[i] = states_i
@@ -1215,6 +1249,8 @@ def decode_tracks_and_roles_from_scenario(
         "role_predict": role_predict,
         "ego_index": np.array([int(scenario.sdc_track_index)], dtype=np.int64),
     }
+
+
 
 
 def require_valid_ego_at_current(valid_all: np.ndarray, ego_idx: int,
@@ -1696,10 +1732,130 @@ def nearest_points_vectors(
         vecs[i] = boundary_xy[j] - c
     return vecs
 
+def _collect_road_line_boundary_points_local(
+    boundary_feature_ids: List[int],
+    boundary_polylines_xy_global: Dict[int, np.ndarray],
+    boundary_id_to_kind: Dict[int, str],
+    ego_xy_global: np.ndarray,  # shape: (2,)
+    ego_yaw_global: float,
+) -> np.ndarray:
+    """lane 한쪽(왼쪽/오른쪽)에 해당하는 road_line 점들을 ego 기준으로 모읍니다.
+
+    이 함수는 "road_edge(연석 등)"는 완전히 제외하고,
+    "road_line(차선 페인트 선)"에 해당하는 점들만 모읍니다.
+
+    Args:
+        boundary_feature_ids: lane의 한쪽에 연결된 boundary feature id 목록
+        boundary_polylines_xy_global: boundary id -> polyline 점들, shape (K,2)
+        boundary_id_to_kind: boundary id -> "road_line" 또는 "road_edge"
+        ego_xy_global: ego 전역 위치, shape (2,)
+        ego_yaw_global: ego 전역 yaw (라디안)
+
+    Returns:
+        points_local: shape (K,2) float32
+            - road_line 점들을 전부 모아 ego 기준 좌표계로 바꾼 결과
+            - road_line이 하나도 없으면 shape (0,2)
+    """
+    points_list: List[np.ndarray] = []
+
+    for fid in boundary_feature_ids:
+        fid_int = int(fid)
+
+        if boundary_id_to_kind.get(fid_int, "") != "road_line":
+            continue
+
+        poly_xy_g = boundary_polylines_xy_global.get(fid_int, None)
+        if poly_xy_g is None:
+            continue
+        if poly_xy_g.ndim != 2 or poly_xy_g.shape[1] != 2 or poly_xy_g.shape[0] == 0:
+            continue
+
+        points_list.append(poly_xy_g.astype(np.float32))  # shape: (Ki,2)
+
+    if len(points_list) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+
+    points_xy_global = np.concatenate(points_list, axis=0).astype(np.float32)  # shape: (K,2)
+    points_xy_local = transform_points_global_to_ego_local(
+        points_xy_global, ego_xy_global, ego_yaw_global
+    )  # shape: (K,2)
+    return points_xy_local
+
+
+def _align_boundary_points_to_center_indices(
+    center_xy: np.ndarray,  # shape: (lane_len,2)
+    boundary_xy: np.ndarray,  # shape: (K,2)
+    max_valid_dist_m: float = 6.0,
+    center_index_window: int = 2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """중심선의 각 점(j)에 대응되는 경계선 점(j)을 고릅니다.
+
+    핵심 아이디어는 NuPlan처럼 "center[j]와 boundary[j]를 대응"시키는 것입니다.
+    다만 WOMD는 경계선이 부분적으로만 있을 수 있으니,
+    다음 규칙으로 '없는 구간'을 0 벡터로 처리합니다.
+
+    처리 규칙:
+    1) 중심선은 (lane_len,2)로 이미 샘플링되어 있다고 가정합니다.
+    2) boundary_xy는 road_line 점들의 모음입니다(순서/연결 여부는 신뢰하지 않습니다).
+    3) boundary 점마다 "가장 가까운 center 인덱스"를 구해둡니다.
+    4) center[j]에서는, 그 j 주변(center_index_window 범위)으로 분류된 boundary 점들만 후보로 씁니다.
+       - 이렇게 하면 lane의 다른 구간에 있는 점을 '우연히 가까워서' 끌어오는 것을 줄일 수 있습니다.
+    5) 후보 중 가장 가까운 점이 max_valid_dist_m보다 멀면
+       - 그 j 위치에는 경계가 없다고 보고 boundary_aligned[j] = center[j]로 둡니다.
+       - 그러면 (boundary_aligned - center)가 (0,0)이 됩니다.
+
+    Args:
+        center_xy: 중심선 점들, shape (lane_len,2)
+        boundary_xy: road_line 점들, shape (K,2)
+        max_valid_dist_m: 이 거리보다 멀면 "경계가 없다"고 판단(보수적으로 6m 권장)
+        center_index_window: center 인덱스 기준 후보를 고를 때 허용하는 인덱스 차이(기본 ±2)
+
+    Returns:
+        boundary_aligned: shape (lane_len,2) float32
+            - 각 j에 대응되는 경계선 점
+            - 없다고 판단되면 center[j]와 동일(그래서 벡터는 0)
+        valid_mask: shape (lane_len,) bool
+            - True면 그 j에서 경계점을 찾았고, False면 못 찾았다는 뜻
+    """
+    lane_len = int(center_xy.shape[0])
+
+    boundary_aligned = center_xy.astype(np.float32).copy()  # shape: (lane_len,2)
+    valid_mask = np.zeros((lane_len,), dtype=bool)  # shape: (lane_len,)
+
+    if boundary_xy.ndim != 2 or boundary_xy.shape[1] != 2 or boundary_xy.shape[0] == 0:
+        return boundary_aligned, valid_mask
+
+    # boundary 점마다 가장 가까운 center 인덱스 구하기
+    # d2_bc: (K, lane_len)
+    diffs_bc = boundary_xy[:, None, :] - center_xy[None, :, :]  # shape: (K,lane_len,2)
+    d2_bc = np.sum(diffs_bc * diffs_bc, axis=-1)  # shape: (K,lane_len)
+    nearest_center_idx = np.argmin(d2_bc, axis=1).astype(np.int64)  # shape: (K,)
+
+    win = int(center_index_window)
+    max_d2 = float(max_valid_dist_m) ** 2
+
+    for j in range(lane_len):
+        # "이 center[j] 주변 구간"으로 보이는 boundary 점만 후보로 사용
+        mask = np.abs(nearest_center_idx - int(j)) <= win  # shape: (K,)
+        if not bool(np.any(mask)):
+            continue
+
+        cand = boundary_xy[mask]  # shape: (M,2)
+        # center[j]에 가장 가까운 후보 선택
+        diffs = cand - center_xy[j][None, :]  # shape: (M,2)
+        d2 = np.sum(diffs * diffs, axis=1)  # shape: (M,)
+        m = int(np.argmin(d2))
+        if float(d2[m]) <= max_d2:
+            boundary_aligned[j] = cand[m].astype(np.float32)  # shape: (2,)
+            valid_mask[j] = True
+
+    return boundary_aligned, valid_mask
+
 
 def build_lane_arrays(
     lanes: List[LaneInfo],
     boundary_polylines_xy_global: Dict[int, np.ndarray],
+    boundary_id_to_kind: Dict[int, str],
     lane_id_to_light: Dict[int, np.ndarray],
     ego_xy_global: np.ndarray,
     ego_yaw_global: float,
@@ -1714,15 +1870,18 @@ def build_lane_arrays(
         6-7  : right boundary vector (dx,dy)
         8-11 : lane light one-hot [GO, CAUTION, STOP, UNKNOWN]
 
-    + lanes_speed_limit: (lane_num,1) m/s
-    + lanes_has_speed_limit: (lane_num,1) bool
-    + lane_light: (lane_num,4) float32
+    중요한 변경점:
+    - 왼쪽/오른쪽 경계 벡터는 road_edge를 제외하고 "road_line만" 사용합니다.
+    - 경계선이 lane의 일부 구간에만 존재할 수 있으므로,
+      각 center[j]에 대응되는 boundary[j]를 찾되,
+      너무 멀면 해당 j는 "경계가 없다"고 보고 벡터를 (0,0)으로 둡니다.
 
     Args:
         lanes: LaneInfo 리스트
         boundary_polylines_xy_global: boundary feature id -> polyline (K,2)
+        boundary_id_to_kind: boundary id -> "road_line"/"road_edge"
         lane_id_to_light: lane_id -> one_hot(4,)
-        ego_xy_global: ego 전역 위치
+        ego_xy_global: ego 전역 위치, shape (2,)
         ego_yaw_global: ego 전역 yaw
         lane_len: 차선 샘플 포인트 수(10)
 
@@ -1734,63 +1893,74 @@ def build_lane_arrays(
     """
     lane_num = len(lanes)
 
-    lanes_arr = np.zeros((lane_num, lane_len, 12),
-                         dtype=np.float32)  # (L,10,12)
-    lanes_speed_limit = np.zeros((lane_num, 1), dtype=np.float32)  # (L,1)
-    lanes_has_speed_limit = np.zeros((lane_num, 1), dtype=bool)  # (L,1)
-    lane_light = np.zeros((lane_num, 4), dtype=np.float32)  # (L,4)
+    lanes_arr = np.zeros((lane_num, lane_len, 12), dtype=np.float32)  # shape: (L,10,12)
+    lanes_speed_limit = np.zeros((lane_num, 1), dtype=np.float32)  # shape: (L,1)
+    lanes_has_speed_limit = np.zeros((lane_num, 1), dtype=bool)  # shape: (L,1)
+    lane_light = np.zeros((lane_num, 4), dtype=np.float32)  # shape: (L,4)
+
+    # "경계가 없으면 멀리 있는 점을 끌어오지 않기" 위한 기준
+    max_valid_dist_m = 6.0
+    center_index_window = 2
 
     for i, lane in enumerate(lanes):
-        # 1) centerline 샘플링
-        center_xy_g = lane.centerline_xy_global  # (P,2)
+        # 1) centerline 샘플링 (ego 기준)
+        center_xy_g = lane.centerline_xy_global  # shape: (P,2)
         center_xy_l = transform_points_global_to_ego_local(
-            center_xy_g, ego_xy_global, ego_yaw_global)  # (P,2)
+            center_xy_g, ego_xy_global, ego_yaw_global
+        )  # shape: (P,2)
         center_sampled = resample_polyline_equal_distance(
-            center_xy_l, num_samples=lane_len, closed=False)  # (10,2)
+            center_xy_l, num_samples=lane_len, closed=False
+        )  # shape: (lane_len,2)
 
         # 2) center vector (dx,dy)
-        center_vec = np.zeros((lane_len, 2), dtype=np.float32)  # (10,2)
-        center_vec[:-1] = center_sampled[1:] - center_sampled[:-1]  # (9,2)
+        center_vec = np.zeros((lane_len, 2), dtype=np.float32)  # shape: (lane_len,2)
+        center_vec[:-1] = center_sampled[1:] - center_sampled[:-1]  # shape: (lane_len-1,2)
         center_vec[-1] = 0.0
 
-        # 3) left/right boundary 점들 모아서 local로 변환
-        left_points_list: List[np.ndarray] = []
-        for fid in lane.left_boundary_feature_ids:
-            if fid in boundary_polylines_xy_global:
-                left_points_list.append(boundary_polylines_xy_global[fid])
+        # 3) 왼쪽/오른쪽 road_line 점들을 ego 기준으로 모으기
+        left_points_local = _collect_road_line_boundary_points_local(
+            boundary_feature_ids=lane.left_boundary_feature_ids,
+            boundary_polylines_xy_global=boundary_polylines_xy_global,
+            boundary_id_to_kind=boundary_id_to_kind,
+            ego_xy_global=ego_xy_global,
+            ego_yaw_global=ego_yaw_global,
+        )  # shape: (K_left,2)
 
-        right_points_list: List[np.ndarray] = []
-        for fid in lane.right_boundary_feature_ids:
-            if fid in boundary_polylines_xy_global:
-                right_points_list.append(boundary_polylines_xy_global[fid])
+        right_points_local = _collect_road_line_boundary_points_local(
+            boundary_feature_ids=lane.right_boundary_feature_ids,
+            boundary_polylines_xy_global=boundary_polylines_xy_global,
+            boundary_id_to_kind=boundary_id_to_kind,
+            ego_xy_global=ego_xy_global,
+            ego_yaw_global=ego_yaw_global,
+        )  # shape: (K_right,2)
 
-        if len(left_points_list) > 0:
-            left_xy_g = np.concatenate(left_points_list,
-                                       axis=0).astype(np.float32)  # (K,2)
-            left_xy_l = transform_points_global_to_ego_local(
-                left_xy_g, ego_xy_global, ego_yaw_global)
-        else:
-            left_xy_l = np.zeros((0, 2), dtype=np.float32)
+        # 4) center[j]에 대응되는 boundary[j] 만들기 (없으면 center[j]로 둬서 벡터=0)
+        left_boundary_aligned, _ = _align_boundary_points_to_center_indices(
+            center_xy=center_sampled,
+            boundary_xy=left_points_local,
+            max_valid_dist_m=max_valid_dist_m,
+            center_index_window=center_index_window,
+        )  # shape: (lane_len,2)
 
-        if len(right_points_list) > 0:
-            right_xy_g = np.concatenate(right_points_list,
-                                        axis=0).astype(np.float32)  # (K,2)
-            right_xy_l = transform_points_global_to_ego_local(
-                right_xy_g, ego_xy_global, ego_yaw_global)
-        else:
-            right_xy_l = np.zeros((0, 2), dtype=np.float32)
+        right_boundary_aligned, _ = _align_boundary_points_to_center_indices(
+            center_xy=center_sampled,
+            boundary_xy=right_points_local,
+            max_valid_dist_m=max_valid_dist_m,
+            center_index_window=center_index_window,
+        )  # shape: (lane_len,2)
 
-        left_vec = nearest_points_vectors(center_sampled, left_xy_l)  # (10,2)
-        right_vec = nearest_points_vectors(center_sampled, right_xy_l)  # (10,2)
+        left_vec = (left_boundary_aligned - center_sampled).astype(np.float32)  # shape: (lane_len,2)
+        right_vec = (right_boundary_aligned - center_sampled).astype(np.float32)  # shape: (lane_len,2)
 
-        # 4) lane light
-        light = lane_id_to_light.get(lane.lane_id,
-                                     np.array([0, 0, 0, 1],
-                                              dtype=np.float32))  # (4,)
+        # 5) lane light
+        light = lane_id_to_light.get(
+            lane.lane_id,
+            np.array([0, 0, 0, 1], dtype=np.float32),
+        )  # shape: (4,)
         lane_light[i] = light
         lanes_arr[i, :, 8:12] = light[None, :].repeat(lane_len, axis=0)
 
-        # 5) 속도제한(m/s)
+        # 6) 속도제한(m/s)
         if lane.speed_limit_mph > 0.0:
             lanes_has_speed_limit[i, 0] = True
             lanes_speed_limit[i, 0] = float(lane.speed_limit_mph) * 0.44704
@@ -1798,7 +1968,7 @@ def build_lane_arrays(
             lanes_has_speed_limit[i, 0] = False
             lanes_speed_limit[i, 0] = 0.0
 
-        # 6) 최종 lanes 채우기
+        # 7) 최종 lanes 채우기
         lanes_arr[i, :, 0:2] = center_sampled
         lanes_arr[i, :, 2:4] = center_vec
         lanes_arr[i, :, 4:6] = left_vec
@@ -2083,6 +2253,7 @@ def build_cache_dict_for_scenario(
     lanes_arr, lanes_speed_limit, lanes_has_speed_limit, lane_light = build_lane_arrays(
         lanes=parsed_map.lanes,
         boundary_polylines_xy_global=parsed_map.boundary_polylines_xy_global,
+        boundary_id_to_kind=parsed_map.boundary_id_to_kind,  # ✅ 추가
         lane_id_to_light=lane_id_to_light,
         ego_xy_global=ego_xy_global,
         ego_yaw_global=ego_yaw_global,

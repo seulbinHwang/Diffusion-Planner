@@ -610,14 +610,151 @@ def get_neighbor_vector_set_map(
 # =====================
 # 2. Get maps array for model input
 # =====================
-def _interpolate_points(line, num_point):
-    line = LineString(line)
-    new_line = np.concatenate([
-        line.interpolate(d).coords._coords
-        for d in np.linspace(0, line.length, num_point)
-    ])
+from typing import Optional
+import numpy as np
 
-    return new_line
+
+def _sanitize_polyline_xy(
+    polyline_xy: np.ndarray,  # (N, 2)
+    eps: float = 1e-6,
+) -> np.ndarray:  # (M, 2)
+    """점 목록에서 '문제가 될 수 있는 점'을 정리합니다.
+
+    하는 일
+    -------
+    1) NaN/inf 같은 값이 섞인 점은 제거합니다.
+    2) 바로 직전 점과 거의 같은 점(너무 가까운 점)은 제거합니다.
+       (이런 점들이 있으면, 나중에 '선 따라간 거리' 계산이 꼬일 수 있습니다.)
+
+    Args:
+        polyline_xy (np.ndarray):
+            점 좌표 배열.
+            shape: (N, 2)
+        eps (float):
+            "거의 같다"라고 볼 거리 기준값.
+
+    Returns:
+        np.ndarray:
+            정리된 점 좌표 배열.
+            shape: (M, 2)
+
+    Raises:
+        ValueError: 입력 shape이 (N, 2)가 아니면 발생합니다.
+    """
+    if polyline_xy.ndim != 2 or polyline_xy.shape[1] != 2:
+        raise ValueError(f"polyline_xy shape은 (N, 2)여야 합니다. got {polyline_xy.shape}")
+
+    if polyline_xy.size == 0:
+        return polyline_xy.reshape((0, 2))
+
+    # (N,) - 두 좌표가 모두 유한한 값이면 True
+    finite_mask: np.ndarray = np.isfinite(polyline_xy).all(axis=1)
+    cleaned: np.ndarray = polyline_xy[finite_mask]
+
+    if cleaned.shape[0] <= 1:
+        return cleaned
+
+    # 연속 중복 제거: 이전 점과 너무 가까우면 버림
+    # diffs: (M-1,)
+    diffs: np.ndarray = np.linalg.norm(cleaned[1:] - cleaned[:-1], axis=1)
+    keep_mask: np.ndarray = np.concatenate([np.array([True]), diffs > eps], axis=0)
+    cleaned = cleaned[keep_mask]
+
+    return cleaned
+
+
+def _resample_polyline_evenly(
+    polyline_xy: np.ndarray,  # (N, 2)
+    num_points: int,
+    eps: float = 1e-6,
+) -> np.ndarray:  # (num_points, 2)
+    """점 목록을 '선 따라간 거리 기준'으로 등간격 num_points개로 다시 뽑습니다.
+
+    핵심 아이디어
+    ------------
+    - 점들을 선으로 이었다고 생각하고,
+      시작점에서부터 선을 따라 이동한 거리(누적 거리)를 만듭니다.
+    - 그 누적 거리 위에서, 0 ~ 전체 길이 사이를 num_points등분한 지점들을 잡고,
+      x좌표와 y좌표를 각각 보간해서 새 점들을 만듭니다.
+
+    예외 처리
+    --------
+    - 점이 0개면: (num_points, 2) 크기의 0 배열을 돌려줍니다.
+    - 점이 1개거나, 전체 길이가 거의 0이면:
+      같은 점을 num_points번 반복해서 돌려줍니다.
+
+    Args:
+        polyline_xy (np.ndarray):
+            점 좌표 배열.
+            shape: (N, 2)
+        num_points (int):
+            만들 점 개수.
+        eps (float):
+            "길이가 거의 0"인지 판단하는 기준값.
+
+    Returns:
+        np.ndarray:
+            등간격으로 다시 뽑힌 점 좌표 배열.
+            shape: (num_points, 2)
+    """
+    if num_points < 0:
+        raise ValueError(f"num_points는 0 이상이어야 합니다. got {num_points}")
+    if num_points == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+
+    polyline_xy = np.asarray(polyline_xy, dtype=np.float64)
+    polyline_xy = _sanitize_polyline_xy(polyline_xy, eps=eps)
+
+    n: int = int(polyline_xy.shape[0])
+    if n == 0:
+        return np.zeros((num_points, 2), dtype=np.float64)
+    if n == 1:
+        return np.repeat(polyline_xy[:1], repeats=num_points, axis=0).astype(np.float64, copy=False)
+
+    # 선분 길이와 누적 거리 계산
+    # seg: (n-1, 2)
+    seg: np.ndarray = polyline_xy[1:] - polyline_xy[:-1]
+    # seg_len: (n-1,)
+    seg_len: np.ndarray = np.linalg.norm(seg, axis=1)
+
+    # cum_dist: (n,)
+    cum_dist: np.ndarray = np.concatenate([np.array([0.0], dtype=np.float64), np.cumsum(seg_len)], axis=0)
+    total_len: float = float(cum_dist[-1])
+
+    if total_len <= eps:
+        return np.repeat(polyline_xy[:1], repeats=num_points, axis=0).astype(np.float64, copy=False)
+
+    # target_dist: (num_points,)
+    target_dist: np.ndarray = np.linspace(0.0, total_len, num_points, dtype=np.float64)
+
+    # x, y 각각 보간
+    x_new: np.ndarray = np.interp(target_dist, cum_dist, polyline_xy[:, 0])
+    y_new: np.ndarray = np.interp(target_dist, cum_dist, polyline_xy[:, 1])
+
+    # (num_points, 2)
+    return np.stack([x_new, y_new], axis=1).astype(np.float64, copy=False)
+
+
+def _interpolate_points(
+    line: np.ndarray,      # (N, 2)
+    num_point: int,
+) -> np.ndarray:          # (num_point, 2)
+    """기존 코드 호환을 위해 이름만 유지한 래퍼 함수입니다.
+
+    - 기존 코드가 `_interpolate_points(...)`를 호출하는 구조를 유지하면서,
+      내부 구현만 numpy 기반 등간격 점 뽑기로 바꿉니다.
+
+    Args:
+        line (np.ndarray):
+            점 좌표 배열. shape: (N, 2)
+        num_point (int):
+            만들 점 개수.
+
+    Returns:
+        np.ndarray:
+            등간격 점 좌표 배열. shape: (num_point, 2)
+    """
+    return _resample_polyline_evenly(polyline_xy=line, num_points=num_point)
 
 
 def _select_lanes_by_ego_distance_to_keep(
@@ -1690,54 +1827,20 @@ def _build_lane_vector_and_agent_route_order(
 
     return vector_map_lanes, agent_route_lane_order
 
-
 def _build_route_lane_vectors(
-        vector_map_lanes: np.ndarray,  # shape: (lane_num, lane_len, 12)
-        chosen_lanes_route_mask: List[bool],  # 길이 = lane_num
-        lane_speed_limit_array: np.ndarray,  # shape: (lane_num, 1)
-        lane_has_speed_limit_array: np.ndarray,  # shape: (lane_num, 1)
+    vector_map_lanes: np.ndarray,                 # (lane_num, lane_len, 12)
+    chosen_lanes_route_mask: List[bool],          # len = lane_num
+    lane_speed_limit_array: np.ndarray,           # (lane_num, 1)
+    lane_has_speed_limit_array: np.ndarray,       # (lane_num, 1)
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """전체 차선 벡터에서 “route 위에 있는 차선들”만 골라 route_lanes 배열을 만든다.
+    """route 위에 있는 차선만 골라 route_lanes 관련 배열을 만듭니다.
 
-    이 함수는 이미 만들어진 차선 벡터들(`vector_map_lanes`)과
-    “이 차선이 route 위에 있는지”를 나타내는 불리언 리스트를 받아서,
-
-    - route 위에 있는 차선들만 순서대로 골라
-      `route_lanes` 배열을 만들고
-    - 그 차선들의 속도제한 값/존재 여부 배열도 함께 만든다.
-
-    Args:
-        vector_map_lanes:
-            모든 차선의 벡터 표현.
-            shape = (lane_num, lane_len, 12).
-        chosen_lanes_route_mask:
-            각 차선이 route 위에 있는지 여부.
-            길이 = lane_num.
-        lane_speed_limit_array:
-            모든 차선의 속도제한 값(m/s).
-            shape = (lane_num, 1).
-        lane_has_speed_limit_array:
-            모든 차선의 속도제한 존재 여부.
-            shape = (lane_num, 1).
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray]:
-            - vector_map_route_lanes:
-                route 위에 있는 차선들만 모은 배열.
-                shape = (route_lane_num, lane_len, 12).
-            - route_lanes_speed_limit:
-                route 위에 있는 차선들의 속도제한 값.
-                shape = (route_lane_num, 1).
-            - route_lanes_has_speed_limit:
-                route 위에 있는 차선들의 속도제한 존재 여부.
-                shape = (route_lane_num, 1).
+    Returns shape를 항상 일정한 규칙으로 유지합니다.
+    - route_lane_num == 0이면:
+      route_lanes shape = (0, lane_len, 12)
     """
-    if vector_map_lanes.size == 0:
-        # 차선 자체가 없는 경우: 모두 0 크기 배열 반환
-        vector_map_route_lanes = np.zeros((0, 0, 12), dtype=np.float32)
-        route_lanes_speed_limit = np.zeros((0, 1), dtype=np.float32)
-        route_lanes_has_speed_limit = np.zeros((0, 1), dtype=np.bool_)
-        return vector_map_route_lanes, route_lanes_speed_limit, route_lanes_has_speed_limit
+    if vector_map_lanes.ndim != 3 or vector_map_lanes.shape[-1] != 12:
+        raise ValueError(f"vector_map_lanes shape은 (lane_num, lane_len, 12)여야 합니다. got {vector_map_lanes.shape}")
 
     lane_num: int = int(vector_map_lanes.shape[0])
     lane_len: int = int(vector_map_lanes.shape[1])
@@ -1745,25 +1848,17 @@ def _build_route_lane_vectors(
 
     if len(chosen_lanes_route_mask) != lane_num:
         raise ValueError(
-            f"chosen_lanes_route_mask 길이({len(chosen_lanes_route_mask)})와 "
-            f"lane_num({lane_num})이 다릅니다.")
+            f"chosen_lanes_route_mask 길이({len(chosen_lanes_route_mask)})와 lane_num({lane_num})이 다릅니다."
+        )
 
-    # route 위에 있는 lane 인덱스만 골라냄
-    route_lane_indices: List[int] = [
-        idx for idx, is_on_route in enumerate(chosen_lanes_route_mask)
-        if is_on_route
-    ]
+    # route lane 인덱스
+    route_lane_indices: List[int] = [i for i, on_route in enumerate(chosen_lanes_route_mask) if on_route]
     route_lane_num: int = len(route_lane_indices)
 
-    # route 전용 배열 생성
-    vector_map_route_lanes: np.ndarray = np.zeros(
-        (route_lane_num, lane_len, lane_feat_dim), dtype=np.float32)
-    route_lanes_speed_limit: np.ndarray = np.zeros((route_lane_num, 1),
-                                                   dtype=np.float32)
-    route_lanes_has_speed_limit: np.ndarray = np.zeros((route_lane_num, 1),
-                                                       dtype=np.bool_)
+    vector_map_route_lanes: np.ndarray = np.zeros((route_lane_num, lane_len, lane_feat_dim), dtype=np.float32)
+    route_lanes_speed_limit: np.ndarray = np.zeros((route_lane_num, 1), dtype=np.float32)
+    route_lanes_has_speed_limit: np.ndarray = np.zeros((route_lane_num, 1), dtype=np.bool_)
 
-    # 실제 route 상에 있는 lane 들만 복사
     for loc, lane_idx in enumerate(route_lane_indices):
         vector_map_route_lanes[loc] = vector_map_lanes[lane_idx]
         route_lanes_speed_limit[loc] = lane_speed_limit_array[lane_idx]

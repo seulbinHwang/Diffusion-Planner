@@ -88,6 +88,74 @@ class DataProcessor(object):
             'ROUTE_LANES': config.lane_len
         }  # maximum number of points per feature to extract per feature layer.
 
+    @staticmethod
+    def _normalize_cos_sin_in_traj_11(
+        traj_11: np.ndarray,          # shape: (N, T, 11)
+        valid_mask: np.ndarray,       # shape: (N, T), True면 유효 프레임
+        *,
+        eps: float = 1e-6,
+        cos_index: int = 2,
+        sin_index: int = 3,
+    ) -> np.ndarray:
+        """(cos, sin) 채널을 "진짜 cos/sin"처럼 보이도록 길이를 1로 맞춥니다.
+
+        왜 필요한가
+        ----------
+        중간 프레임을 채우는 과정에서 cos/sin을 숫자 그대로 선형으로 섞으면,
+        (cos, sin)이 단위원 위(길이 1)에 있지 않을 수 있습니다.
+        그러면 모델 입장에서 "방향 정보"가 애매해질 수 있습니다.
+
+        이 함수는 다음 규칙으로 정리합니다.
+        1) valid_mask=True 인 프레임만 처리합니다.
+        2) (cos^2 + sin^2)의 제곱근이 eps보다 크면,
+           cos와 sin을 그 길이로 나눠서 길이를 1로 맞춥니다.
+        3) 길이가 너무 작으면(=방향 정보가 사실상 없는 경우),
+           해당 프레임의 cos/sin을 0으로 둡니다.
+        4) valid_mask=False 인 프레임은 cos/sin을 0으로 둡니다.
+
+        Args:
+            traj_11 (np.ndarray):
+                shape (N, T, 11)
+            valid_mask (np.ndarray):
+                shape (N, T)
+            eps (float):
+                0 나누기 방지용 작은 값
+            cos_index (int):
+                cos 채널 인덱스(기본 2)
+            sin_index (int):
+                sin 채널 인덱스(기본 3)
+
+        Returns:
+            np.ndarray:
+                shape (N, T, 11)
+                traj_11을 직접 수정한 뒤 그대로 반환합니다.
+        """
+        if traj_11.ndim != 3 or traj_11.shape[-1] != 11:
+            raise ValueError(f"`traj_11` shape는 (N, T, 11)이어야 합니다. got {traj_11.shape}")
+        if valid_mask.shape != traj_11.shape[:2]:
+            raise ValueError(
+                f"`valid_mask` shape는 (N, T)이어야 합니다. got {valid_mask.shape}, expected {traj_11.shape[:2]}"
+            )
+
+        cos_v = traj_11[:, :, cos_index]  # (N, T)
+        sin_v = traj_11[:, :, sin_index]  # (N, T)
+
+        # norm: (N, T)
+        norm = np.sqrt(cos_v * cos_v + sin_v * sin_v)
+
+        # 나눗셈 안전장치
+        norm_safe = np.where(norm > eps, norm, 1.0)
+
+        cos_unit = cos_v / norm_safe
+        sin_unit = sin_v / norm_safe
+
+        # valid_mask=True 이고 norm>eps 인 곳만 (cos_unit, sin_unit) 사용
+        good = valid_mask & (norm > eps)
+
+        traj_11[:, :, cos_index] = np.where(good, cos_unit, 0.0).astype(traj_11.dtype, copy=False)
+        traj_11[:, :, sin_index] = np.where(good, sin_unit, 0.0).astype(traj_11.dtype, copy=False)
+        return traj_11
+
     # [ADDED] 통계 유틸 함수들
     # =========================
     @staticmethod
@@ -748,6 +816,10 @@ class DataProcessor(object):
             traj_11=full_traj_interp,
             valid_mask=valid_after_all,
             rep_size=stable_size,
+        )
+        full_traj_interp = self._normalize_cos_sin_in_traj_11(
+            traj_11=full_traj_interp,
+            valid_mask=valid_after_all,
         )
 
         # 과거/현재와 미래로 다시 분리
