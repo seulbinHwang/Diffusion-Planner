@@ -27,7 +27,7 @@ TRAIN_SET_PATH="${WOMD_DATA_ROOT}/scenario/${TRAIN_SET_NAME}"
 # This is the command from data_process_pnc.sh
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
 taskset -c 0-47 \
-python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" --save_folder "$TRAIN_SET_NAME" --num_workers 1 \
+python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" --save_folder "$TRAIN_SET_NAME" --num_workers 48 \
  --overwrite_womd_cache false \
  --save_image false
 
