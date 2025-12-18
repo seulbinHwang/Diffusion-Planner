@@ -82,7 +82,7 @@ python preprocess.py \
   --scenarios_cache_in my_scenarios.pkl
 
 """
-# data_process.py (상단 import 아래 어울리는 곳)
+# data_process.py (상단 import 아래 어울리는 곳)E
 import matplotlib
 
 matplotlib.use("Agg")

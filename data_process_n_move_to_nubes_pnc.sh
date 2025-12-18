@@ -2,7 +2,7 @@
 # This script runs the data processing and then cleans the generated dataset.
 
 # [추가] 96코어 고정 및 내부 스레드 1로 제한
-export DP_MAX_CPUS=96
+export DP_MAX_CPUS=48
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -28,13 +28,14 @@ TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 # Run the data processing script
 # This is the command from data_process_pnc.sh
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
-taskset -c 0-95 \
+taskset -c 0-47 \
 python data_process.py \
   --data_path "$NUPLAN_DATA_PATH" \
   --map_path "$NUPLAN_MAP_PATH" \
   --save_path "$TRAIN_SET_PATH" \
   --total_scenarios 1000000 \
-  --reset_save_path False
+  --reset_save_path False \
+  --save_image false
 
 echo "Data processing finished."
 echo "---------------------------------"
@@ -60,7 +61,7 @@ echo "Step 3: Uploading processed data..."
 
 nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
                     "$TRAIN_SET_PATH" \
-                    -e -j 64
+                    -e -j 48
 
 nubescli upload labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
                     /media/user/E/projects/Diffusion-Planner/diffusion_planner_training.json
