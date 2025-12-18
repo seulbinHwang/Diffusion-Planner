@@ -53,16 +53,16 @@ class DataProcessor(object):
         self.num_past_poses = 10 * self.past_time_horizon
         self.future_time_horizon = 8  # [seconds]
         self.num_future_poses = 10 * self.future_time_horizon
-
+        self.set_coord_as_center = config.set_coord_as_center
         self.caching_max_agent_num = config.caching_max_agent_num
         self.max_agent_num = config.max_agent_num
-
+        self._use_filter_radius, self._filter_radius = self._read_filter_radius_settings_from_config(
+            config)
         self.caching_max_static_num = config.caching_max_static_num
         self.max_static_num = config.max_static_num
         # [변경] 타입별 상한 신설: 보행자/자전거
         self.max_pedestrians = None  #getattr(config, "max_pedestrians", 7)  #128)
         self.max_bicycles = None  #getattr(config, "max_bicycles", 3)  #64)
-        self._filter_radius = 150  # [m] query radius scope relative to the current pose.
         self.all_car_token_to_rr_ids: Optional[Dict[str,
                                                     Optional[List[str]]]] = None
         self.init_cur_fut_agents_world_8_list: Optional[List[np.ndarray]] = None
@@ -87,6 +87,152 @@ class DataProcessor(object):
             'RIGHT_BOUNDARY': config.lane_len,
             'ROUTE_LANES': config.lane_len
         }  # maximum number of points per feature to extract per feature layer.
+
+    def _get_map_query_radius_m(self) -> float:
+        """지도/도로시설(정지표지, 횡단보도 등)을 조회할 때 사용할 반경(m)을 반환합니다.
+
+        이 반경은 '필터링을 켜고/끄는 옵션(use_filter_radius)'과 성격이 다릅니다.
+
+        - use_filter_radius 는 '에이전트/정적 객체를 거리로 잘라낼지'를 제어합니다.
+        - 하지만 지도/도로시설은 반경이 없으면 가져오는 데이터가 너무 커져서
+          속도/메모리 문제가 생길 수 있습니다.
+
+        그래서 지도/도로시설 조회 반경은 use_filter_radius 와 무관하게
+        항상 filter_radius 값을 그대로 사용하도록 분리합니다.
+
+        Returns:
+            float:
+                meter 단위 지도/도로시설 조회 반경.
+        """
+        return float(self._filter_radius)
+    @staticmethod
+    def _read_filter_radius_settings_from_config(config: object) -> Tuple[bool, float]:
+        """config에서 필터링 설정(use_filter_radius, filter_radius)을 읽습니다.
+
+        이 클래스는 오직 config에 아래 두 값이 "명시적으로 존재"할 때만 동작하도록 강제합니다.
+          - use_filter_radius (bool)
+          - filter_radius (float, meter)
+
+        둘 중 하나라도 없으면, 잘못된 설정으로 조용히 다른 기본값을 쓰는 일을 막기 위해
+        즉시 에러를 내고 중단합니다.
+
+        Args:
+            config: args_util.get_args()가 반환한 인자 객체(보통 argparse.Namespace)
+
+        Returns:
+            Tuple[bool, float]:
+                - use_filter_radius: bool
+                - filter_radius_m: float (meter)
+
+        Raises:
+            RuntimeError: use_filter_radius 또는 filter_radius가 config에 없을 때
+        """
+        missing: List[str] = []
+        if not hasattr(config, "use_filter_radius"):
+            missing.append("use_filter_radius")
+        if not hasattr(config, "filter_radius"):
+            missing.append("filter_radius")
+
+        if len(missing) > 0:
+            raise RuntimeError(
+                "필수 설정이 config에 없습니다. "
+                "args_util.py에 `--use_filter_radius`와 `--filter_radius`를 반드시 선언해야 합니다. "
+                f"missing={missing}"
+            )
+
+        use_filter_radius = bool(getattr(config, "use_filter_radius"))
+        filter_radius_m = float(getattr(config, "filter_radius"))
+        return use_filter_radius, filter_radius_m
+
+    def _get_effective_filter_radius_m(self) -> Optional[float]:
+        """현재 설정(use_filter_radius)에 따라 실제로 사용할 반경을 반환합니다.
+
+        - use_filter_radius=True: filter_radius(m)를 반환합니다.
+        - use_filter_radius=False: None을 반환해서, 호출 측에서 필터링을 건너뛰게 합니다.
+
+        Returns:
+            Optional[float]:
+                - float: meter 단위 반경
+                - None: 필터링을 하지 않음
+        """
+        if bool(self._use_filter_radius):
+            return float(self._filter_radius)
+        return None
+
+
+    @staticmethod
+    def _adjust_ego_future_outputs_to_center_frame(
+            ego_state: EgoState,
+            ego_future_gt_3_dim: np.ndarray,  # shape: (T, 3)
+            ego_future_gt_11_dim: np.ndarray,  # shape: (T, 11)
+            *,
+            set_coord_as_center: bool,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """ego 미래 궤적 출력이 rear axle 기준일 때, center 기준으로 x,y만 보정한다.
+
+        왜 필요한가
+        ----------
+        `work()`에서는 ego 미래 궤적을 만들 때 `get_ego_future_array_from_scenario(...)`를 쓰는데,
+        이 함수는 내부에서 “현재 ego의 rear axle”을 기준점으로 잡아 ego 로컬 좌표로 바꿉니다.
+
+        그런데 `set_coord_as_center=True`를 켜면,
+        `work()`/`observation_adapter()`에서 다른 대부분의 좌표계 기반 출력들은
+        "현재 ego center"를 기준점으로 쓰도록 바꾸게 됩니다.
+        그러면 ego 미래만 기준점이 달라져서 데이터가 섞이게 됩니다.
+
+        그래서 이 함수는 ego 미래 궤적의 x,y에 대해서만,
+        rear axle 기준 → center 기준으로 원점을 옮기는 상수 보정을 합니다.
+
+        보정 내용
+        --------
+        - 현재 시점에서 (center - rear_axle) 위치 차이를 구합니다. (월드 좌표)
+        - 그 벡터를 “현재 ego heading 축” 기준 로컬 좌표로 돌려서 offset_local = [dx, dy]를 얻습니다.
+        - rear axle 기준 로컬 좌표로 표현된 미래 궤적 x,y에서 offset_local을 빼면,
+          center 기준 로컬 좌표가 됩니다.
+        - heading/cos/sin/vx/vy는 “원점 이동”과 무관하므로 건드리지 않습니다.
+
+        Args:
+            ego_state (EgoState):
+                현재 ego 상태.
+            ego_future_gt_3_dim (np.ndarray):
+                shape: (T, 3)
+                [x, y, yaw] 형태의 ego 미래 궤적(ego 로컬 좌표계).
+            ego_future_gt_11_dim (np.ndarray):
+                shape: (T, 11)
+                [x, y, cos, sin, vx, vy, width, length, onehot(3)] 형태의 ego 미래 궤적.
+            set_coord_as_center (bool):
+                True면 center 기준으로 보정, False면 입력 그대로 반환.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                (ego_future_gt_3_dim, ego_future_gt_11_dim)
+                - 둘 다 입력 배열을 **in-place로** 수정한 뒤 그대로 반환합니다.
+        """
+        if not set_coord_as_center:
+            return ego_future_gt_3_dim, ego_future_gt_11_dim
+
+        # (1) 월드 좌표에서 rear_axle -> center 변위
+        dx_world: float = float(ego_state.center.x - ego_state.rear_axle.x)
+        dy_world: float = float(ego_state.center.y - ego_state.rear_axle.y)
+
+        # (2) 현재 heading 기준 로컬 좌표로 회전 (world -> ego heading frame)
+        heading: float = float(
+            ego_state.rear_axle.heading)  # center.heading와 사실상 동일
+        c: float = float(np.cos(heading))
+        s: float = float(np.sin(heading))
+
+        # local = R^T * world,  R = [[c, -s],[s, c]]
+        offset_x_local: float = dx_world * c + dy_world * s
+        offset_y_local: float = -dx_world * s + dy_world * c
+
+        # (3) rear axle 기준 로컬 좌표에서 center 기준 로컬 좌표로 원점 이동
+        #     new_xy = old_xy - offset_local
+        ego_future_gt_3_dim[:, 0] -= offset_x_local
+        ego_future_gt_3_dim[:, 1] -= offset_y_local
+        ego_future_gt_11_dim[:, 0] -= offset_x_local
+        ego_future_gt_11_dim[:, 1] -= offset_y_local
+
+        return ego_future_gt_3_dim, ego_future_gt_11_dim
 
     @staticmethod
     def _normalize_cos_sin_in_traj_11(
@@ -303,78 +449,57 @@ class DataProcessor(object):
         self,
         scenario: Optional[NuPlanScenario] = None,
         history_buffer: Optional[SimulationHistoryBuffer] = None,
-    ) -> Tuple[EgoState, Point2D, float, np.ndarray, np.ndarray,
-               Optional[np.ndarray]]:
+        *,
+        set_coord_as_center: bool = False,
+    ) -> Tuple[EgoState, Point2D, float, np.ndarray, np.ndarray, Optional[np.ndarray]]:
         """시나리오 또는 history buffer 에서 ego 궤적을 공통 포맷으로 추출한다.
 
-        Args:
-            scenario (Optional[NuPlanScenario]):
-                - 오프라인 전처리용 시나리오. (캐싱용)
-                - history_buffer 가 None 일 때만 사용.
-            history_buffer (Optional[SimulationHistoryBuffer]):
-                - 온라인 / inference 용 history buffer.
-                - scenario 가 None 일 때만 사용.
-
-        Returns:
-            Tuple[
-                EgoState,
-                Point2D,
-                float,
-                np.ndarray,          # ego_cur_pose_np, shape (3,)
-                np.ndarray,          # past_cur_ego_world_10, shape (T, 10)
-                Optional[np.ndarray] # past_cur_time_np, shape (T,) 또는 None
-            ]
+        (중간 설명은 기존 docstring 유지하되, 아래 한 줄만 추가 개념으로 보면 됩니다)
+        - set_coord_as_center=True 이면:
+          ego 기준 좌표 변환의 기준점을 rear axle이 아니라 ego center로 잡습니다.
+          즉, ego_point2d / ego_heading / ego_cur_pose_np 가 center 기준으로 설정됩니다.
         """
-        # 둘 다 None 이거나 둘 다 존재하면 에러
         if (scenario is None and history_buffer is None) or \
            (scenario is not None and history_buffer is not None):
             raise ValueError("scenario 또는 history_buffer 중 정확히 하나만 전달해야 합니다.")
 
-        # 공통: 현재 ego 상태
         if scenario is not None:
             ego_state: EgoState = scenario.initial_ego_state
         else:
-            ego_state = history_buffer.current_state[
-                0]  # type: ignore[union-attr]
+            ego_state = history_buffer.current_state[0]  # type: ignore[union-attr]
 
-        ego_point2d = Point2D(ego_state.rear_axle.x, ego_state.rear_axle.y)
-        ego_heading: float = ego_state.rear_axle.heading
-        ego_cur_pose_np = np.array(
-            [
-                ego_state.rear_axle.x, ego_state.rear_axle.y,
-                ego_state.rear_axle.heading
-            ],
-            dtype=np.float64,
-        )  # shape: (3,)
+        # ✅ 기준점 선택: rear_axle(default) vs center
+        if set_coord_as_center:
+            ref = ego_state.center
+        else:
+            ref = ego_state.rear_axle
 
-        # 분기: 시나리오 기반 (오프라인) vs history_buffer 기반 (온라인)
+        ego_point2d = Point2D(ref.x, ref.y)
+        ego_heading: float = float(ref.heading)
+        ego_cur_pose_np = np.array([ref.x, ref.y, ref.heading], dtype=np.float64)  # shape: (3,)
+
         if scenario is not None:
-            # past_cur_ego_world_10: np.ndarray, shape (T, 10)
-            # past_cur_time_np:      np.ndarray, shape (T,)
-            (past_cur_ego_world_10,
-             past_cur_time_np) = get_ego_past_array_from_scenario(
-                 scenario,
-                 self.num_past_poses,
-                 self.past_time_horizon,
-             )
+            (past_cur_ego_world_10, past_cur_time_np) = get_ego_past_array_from_scenario(
+                scenario,
+                self.num_past_poses,
+                self.past_time_horizon,
+            )
         else:
             ego_state_buffer: Deque[EgoState] = history_buffer.ego_state_buffer
-            # past_cur_ego_world_10: np.ndarray, shape (T, 10)
-            # x, y, heading, vx, vy, width, length, (car, pedestrian, cyclist)
-            past_cur_ego_world_10 = sampled_ego_objects_to_array_list(
-                ego_state_buffer)
+            past_cur_ego_world_10 = sampled_ego_objects_to_array_list(ego_state_buffer)
             past_cur_time_np = None
+
         assert past_cur_ego_world_10.shape[0] == self.num_past_poses + 1, \
             f"Expected past_cur_ego_world_10 shape[0] == {self.num_past_poses + 1}, got {past_cur_ego_world_10.shape[0]}"
-        return (
-            ego_state,  # EgoState
-            ego_point2d,  # Point2D
-            ego_heading,  # float
-            ego_cur_pose_np,  # np.ndarray, shape (3,)
-            past_cur_ego_world_10,  # np.ndarray, shape (T, 10)
-            past_cur_time_np,  # Optional[np.ndarray] # shape (T,)
-        )
 
+        return (
+            ego_state,
+            ego_point2d,
+            ego_heading,
+            ego_cur_pose_np,
+            past_cur_ego_world_10,
+            past_cur_time_np,
+        )
     def _prepare_car_token_to_rr_ids(
         self,
         scenario: NuPlanScenario,
@@ -441,22 +566,25 @@ class DataProcessor(object):
         return cur_fut_agents_world_8_list
 
     # Use for inference
-    def observation_adapter(self,
-                            iteration: int,
-                            history_buffer: SimulationHistoryBuffer,
-                            traffic_light_data: List[TrafficLightStatusData],
-                            map_api: NuPlanMap,
-                            device='cpu',
-                            scenario: Optional[NuPlanScenario] = None,
-                            use_route_lanes: bool = False,
-                            squeeze=False) -> Dict[str, torch.Tensor]:
-        '''
-        ego
-        '''
+    def observation_adapter(
+        self,
+        iteration: int,
+        history_buffer: SimulationHistoryBuffer,
+        traffic_light_data: List[TrafficLightStatusData],
+        map_api: NuPlanMap,
+        device='cpu',
+        scenario: Optional[NuPlanScenario] = None,
+        use_route_lanes: bool = False,
+        squeeze: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+
         (ego_state, ego_point2d, ego_heading, ego_cur_pose_np,
          past_cur_ego_world_10,
-         _) = self._get_past_cur_ego_feature(history_buffer=history_buffer)
-        # 1) ego 과거 궤적 (T, 11)
+         _) = self._get_past_cur_ego_feature(
+             history_buffer=history_buffer,
+             set_coord_as_center=self.set_coord_as_center,
+         )
+
         ego_agent_past = build_ego_past_feature(
             past_cur_ego_world_10=past_cur_ego_world_10,
             ego_cur_pose_np=ego_cur_pose_np,
@@ -565,7 +693,7 @@ class DataProcessor(object):
             static_types_list=static_types_list,
             max_static_num=self.max_static_num,
             ego_cur_pose_np=ego_cur_pose_np,
-            filter_radius=self._filter_radius,
+            filter_radius=self._get_effective_filter_radius_m(),
         )
         key_to_array = {
             "ego_agent_past": ego_agent_past,  # (time_len, 11)
@@ -885,8 +1013,6 @@ class DataProcessor(object):
         return agents_past_cur_off_p_mask.astype(
             bool), agents_past_cur_off_mask.astype(bool)
 
-        return agents_past_cur_off_p_mask, agents_past_cur_off_mask
-
     def _get_past_cur_agents_feature(
         self,
         scenario: Optional[NuPlanScenario] = None,
@@ -1077,7 +1203,7 @@ class DataProcessor(object):
             self._map_elements,
             ego_point2d,
             ego_heading,
-            self._filter_radius,
+            self._get_map_query_radius_m(),
             traffic_light_data,
         )
 
@@ -1099,13 +1225,13 @@ class DataProcessor(object):
             scenario,
             ego_cur_pose_np,
             self.config.safety_len,
-            self._filter_radius,
+            self._get_map_query_radius_m(),
         )
         crosswalk_points = extract_crosswalk_points(
             scenario,
             ego_cur_pose_np,
             self.config.safety_len,
-            self._filter_radius,
+            self._get_map_query_radius_m(),
         )
         key_to_road_safety["stop_sign_points"] = stop_sign_points
         key_to_road_safety["crosswalk_points"] = crosswalk_points
@@ -1113,37 +1239,36 @@ class DataProcessor(object):
 
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
-        # ✅ 시나리오가 여러 개일 때만 tqdm 사용
-        # if len(scenarios) > 1:
-        #     iterator = tqdm(scenarios)
-        # else:
-        #     iterator = scenarios
-
         for scenario in scenarios:
             map_name = scenario._map_name
             scenario_token = scenario.token
             map_api = scenario.map_api
-            '''
-            ego & agents past
-            '''
+
             (ego_state, ego_point2d, ego_heading, ego_cur_pose_np,
              past_cur_ego_world_10,
              past_cur_time_np) = self._get_past_cur_ego_feature(
-                 scenario=scenario)
-            # 1) ego 과거 궤적
+                 scenario=scenario,
+                 set_coord_as_center=self.set_coord_as_center,
+             )
+
             ego_agent_past = build_ego_past_feature(
                 past_cur_ego_world_10=past_cur_ego_world_10,
                 ego_cur_pose_np=ego_cur_pose_np,
             )
-            '''
-            ego & agents future
-            ego_future_gt_3_dim : rear axle x,y, ~~~ (future_len, 3)
-            planner_future_11_dim : center x,y, ~~~ (future_len, 11)
-            '''
+
             (ego_future_gt_3_dim,
              ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
-                 scenario, ego_state, self.num_future_poses,
-                 self.future_time_horizon)
+                 scenario, ego_state, self.num_future_poses, self.future_time_horizon
+             )
+
+            # ✅ ego_future는 내부가 rear axle 기준이므로, center 기준이면 x,y만 원점 보정
+            ego_future_gt_3_dim, ego_future_gt_11_dim = self._adjust_ego_future_outputs_to_center_frame(
+                ego_state=ego_state,
+                ego_future_gt_3_dim=ego_future_gt_3_dim,
+                ego_future_gt_11_dim=ego_future_gt_11_dim,
+                set_coord_as_center=self.set_coord_as_center,
+            )
+
             """
             - past_cur_agents_world_8_list: List[np.ndarray]
                 · 길이: num_frames
@@ -1186,15 +1311,15 @@ class DataProcessor(object):
             # 2) neighbor 과거 궤적
             (neighbor_agents_past, agents_cur_frame_indices, neighbors_id,
              neighbor_track_token) = build_neighbor_past_feature(
-                 past_cur_agents_world_8_list=past_cur_agents_world_8_list,
-                 past_cur_agents_types_list=past_cur_agents_types_list,
-                 max_agent_num=self.caching_max_agent_num,
-                 ego_cur_pose_np=ego_cur_pose_np,
-                 max_pedestrians=self.max_pedestrians,
-                 max_bicycles=self.max_bicycles,
-                 token_to_id=token_to_id,
-                 filter_radius=self._filter_radius,
-             )
+                past_cur_agents_world_8_list=past_cur_agents_world_8_list,
+                past_cur_agents_types_list=past_cur_agents_types_list,
+                max_agent_num=self.caching_max_agent_num,
+                ego_cur_pose_np=ego_cur_pose_np,
+                max_pedestrians=self.max_pedestrians,
+                max_bicycles=self.max_bicycles,
+                token_to_id=token_to_id,
+                filter_radius=self._get_effective_filter_radius_m(),
+            )
 
             ego_time_len = ego_agent_past.shape[0]
             neighbor_time_len = neighbor_agents_past.shape[1]
@@ -1239,7 +1364,7 @@ class DataProcessor(object):
                 static_types_list=static_types_list,
                 max_static_num=self.caching_max_static_num,
                 ego_cur_pose_np=ego_cur_pose_np,
-                filter_radius=self._filter_radius,
+                filter_radius=self._get_effective_filter_radius_m(),
             )
 
             key_to_array = {

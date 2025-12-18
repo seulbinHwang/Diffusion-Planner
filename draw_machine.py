@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -109,7 +108,6 @@ class DrawingOptions:
     LANE_surface_street_centerline_color: str = CYAN
     LANE_bike_lane_centerline_color: str = GREEN
     LANE_undefined_centerline_color: str = SILVER
-
 
     LANE_speed_color: str = PURPLE  # 번호 텍스트 색 # 청록색
     LANE_speed_fontsize: int = 5  # 에이전트 번호 텍스트 폰트 크기
@@ -397,7 +395,8 @@ def _collect_valid_xy_from_input_data(
     lanes = input_data.get("lanes")
     if lanes is not None and np.asarray(lanes).size > 0:
         lanes_arr: Array = np.asarray(lanes)  # (lane_num, lane_len, 12)
-        valid_mask = np.any(np.abs(lanes_arr[:, :, :8]) > eps, axis=2)  # (lane_num, lane_len)
+        valid_mask = np.any(np.abs(lanes_arr[:, :, :8]) > eps,
+                            axis=2)  # (lane_num, lane_len)
         centers = lanes_arr[:, :, 0:2]
         lefts = centers + lanes_arr[:, :, 4:6]
         rights = centers + lanes_arr[:, :, 6:8]
@@ -411,7 +410,6 @@ def _collect_valid_xy_from_input_data(
             ys_local.extend(l_valid[:, 1].tolist())
             xs_local.extend(r_valid[:, 0].tolist())
             ys_local.extend(r_valid[:, 1].tolist())
-
 
     # ego past, ego pred, ego future
     for key in ("ego_agent_past", "ego_agent_next_11_dim",
@@ -444,14 +442,16 @@ def _collect_valid_xy_from_input_data(
             raise ValueError(
                 "neighbor_agents_future는 (max_agent_num, future_len, 3) 이어야 합니다."
             )
-        valid_mask = (np.abs(neigh_fut_arr[..., 0]) > eps) | (np.abs(neigh_fut_arr[..., 1]) > eps)  # (A, T)
+        valid_mask = (np.abs(neigh_fut_arr[..., 0]) > eps) | (np.abs(
+            neigh_fut_arr[..., 1]) > eps)  # (A, T)
         if np.any(valid_mask):
             xy = neigh_fut_arr[..., :2][valid_mask]  # (K, 2)
             xs_local.extend(xy[:, 0].tolist())
             ys_local.extend(xy[:, 1].tolist())
 
     # road safety polygons: shape (N, P, 2)
-    for road_safety_key in ("stop_sign_points", "speed_bump_points", "crosswalk_points"):
+    for road_safety_key in ("stop_sign_points", "speed_bump_points",
+                            "crosswalk_points"):
         road_safety_points = input_data.get(road_safety_key)
         if road_safety_points is None:
             continue
@@ -486,7 +486,6 @@ def _collect_valid_xy_from_input_data(
             ys_local.extend(valid_xy[:, 1].tolist())
 
     return xs_local, ys_local
-
 
 
 # [ADD]
@@ -1409,66 +1408,207 @@ def _line_type_one_hot_to_index_10(
     return int(np.argmax(line_type_row10))
 
 
+from typing import Literal
+
+
 @dataclass(frozen=True)
 class _LaneBoundaryDrawPlan:
-    """차선 경계 1쪽을 어떻게 그릴지 정리한 값들."""
+    """차선 경계(왼쪽 또는 오른쪽)를 어떤 방식으로 그릴지 정리한 설정값.
+
+    Attributes:
+        draw (bool):
+            True면 그리기, False면 그리지 않는다.
+        draw_mode (Literal["line", "marker"]):
+            - "line": 선(실선/점선/이중선)으로 그림
+            - "marker": 점(마커)으로 찍어서 그림
+        color (str):
+            선/점의 색.
+        marker (Optional[str]):
+            draw_mode="marker"일 때 사용할 점 모양.
+            예) "o", "*", "x"
+        is_double (bool):
+            draw_mode="line"일 때만 의미가 있다.
+            True면 이중선(두 줄)로 그린다.
+        inner_linestyle (Any):
+            draw_mode="line"이고 이중선인 경우, 차선 안쪽 줄 스타일.
+        outer_linestyle (Any):
+            draw_mode="line"이고 이중선인 경우, 차선 바깥쪽 줄 스타일.
+    """
     draw: bool
+    draw_mode: Literal["line", "marker"]
     color: str
+    marker: Optional[str]
     is_double: bool
     inner_linestyle: Any
     outer_linestyle: Any
 
 
+def _normalize_line_type_row_to_road_line10_and_road_edge3(
+        line_type_row: Array,  # shape: (10,) or (13,)
+) -> Tuple[Array, Array]:
+    """left/right_line_type 한 줄을 (road line 10칸, road edge 3칸)으로 정리한다.
+
+    이 프로젝트에서는 left/right_line_type이 보통 길이 13으로 들어오며,
+    의미를 아래처럼 나눠서 해석한다고 가정합니다.
+
+    - 앞 10칸: 차선 선(흰색/노란색, 실선/점선, 단선/이중선 등) 종류
+    - 뒤  3칸: 도로 가장자리(road edge) 종류
+        · [UNKNOWN, BOUNDARY, MEDIAN] 순서라고 가정
+
+    예전 데이터처럼 길이 10으로 들어오는 경우도 있을 수 있어서,
+    그때는 "road edge는 없다"고 보고 뒤 3칸을 전부 0으로 채워 반환합니다.
+
+    Args:
+        line_type_row (np.ndarray):
+            shape = (13,) 또는 (10,).
+            한 차선의 한쪽 경계 타입 정보를 담고 있다.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - road_line_row10: shape = (10,)
+            - road_edge_row3: shape = (3,)
+    """
+    arr: Array = np.asarray(line_type_row).reshape(-1)  # shape: (N,)
+
+    if arr.shape[0] == 10:
+        road_line_row10: Array = arr.astype(np.float32)  # shape: (10,)
+        road_edge_row3: Array = np.zeros((3,), dtype=np.float32)  # shape: (3,)
+        return road_line_row10, road_edge_row3
+
+    if arr.shape[0] == 13:
+        road_line_row10 = arr[:10].astype(np.float32)  # shape: (10,)
+        road_edge_row3 = arr[10:].astype(np.float32)  # shape: (3,)
+        return road_line_row10, road_edge_row3
+
+    raise ValueError(
+        f"line_type_row는 shape (10,) 또는 (13,) 이어야 합니다. got {arr.shape}")
+
+
+def _road_edge_row3_to_marker(
+        road_edge_row3: Array,  # shape: (3,)
+) -> str:
+    """road edge 타입(3칸)을 보고 점 모양(marker)을 고른다.
+
+    규칙:
+    - BOUNDARY  -> "*" (별표 모양 점)
+    - MEDIAN    -> "x" (엑스 모양 점)
+    - UNKNOWN   -> "o" (동그라미 점)
+
+    Args:
+        road_edge_row3 (np.ndarray):
+            shape = (3,)
+            [UNKNOWN, BOUNDARY, MEDIAN] 순서라고 가정한다.
+
+    Returns:
+        str:
+            matplotlib marker 문자열("o", "*", "x" 중 하나)
+    """
+    arr: Array = np.asarray(road_edge_row3).reshape(-1)  # shape: (3,)
+    if arr.shape[0] != 3:
+        raise ValueError(f"road_edge_row3 shape는 (3,) 이어야 합니다. got {arr.shape}")
+
+    if float(np.sum(np.abs(arr))) == 0.0:
+        idx: int = 0  # 전부 0이면 UNKNOWN으로 안전 처리
+    else:
+        idx = int(np.argmax(arr))
+
+    if idx == 1:  # BOUNDARY
+        return "*"
+    if idx == 2:  # MEDIAN
+        return "x"
+    return "o"  # UNKNOWN
+
+
 def _make_lane_boundary_draw_plan(
-    line_type_row10: Optional[Array],  # shape: (10,) or None
+    line_type_row: Optional[Array],  # shape: (13,) or (10,) or None
     default_color: str,
     options: DrawingOptions,
 ) -> _LaneBoundaryDrawPlan:
-    """left/right_line_type에 따라 점선/실선/이중선/색을 결정한다.
+    """left/right_line_type에 따라 차선 경계를 '선' 또는 '점'으로 그릴지 결정한다.
 
-    규칙:
-      - None: 원래처럼(default) 그림
-      - UNKNOWN(8): 원래처럼(default) 그림
-      - INVALID(9): 안 그림
-      - 나머지 8종: 타입에 맞게 색(흰/노란) + 점선/실선 + 이중선 반영
+    이번 변경의 핵심 규칙
+    --------------------
+    1) left/right_line_type이 (13,)인 경우:
+       - 뒤 3칸(road edge)이 0이 아니면 → road edge로 보고 "점"으로 찍는다.
+         · BOUNDARY -> '*'
+         · MEDIAN   -> 'x'
+         · UNKNOWN  -> 'o'
+       - 이 때 색은 road edge 전용 색(options.ROAD_road_edge_color)을 사용한다.
+
+    2) 앞 10칸(기존 road line)만 의미가 있는 경우:
+       - INVALID(기존 규칙의 '무효')이면 그리지 않는다.
+       - UNKNOWN(기존 규칙의 '알 수 없음')이면 이제 "선"이 아니라 'o' 점으로 찍는다.
+       - 나머지는 기존처럼 흰/노란 + 실선/점선 + 단선/이중선 규칙으로 선을 그린다.
 
     Args:
-        line_type_row10: shape (10,) 또는 None.
-        default_color: UNKNOWN/None일 때 쓸 기본 색.
-        options: DrawingOptions.
+        line_type_row (Optional[np.ndarray]):
+            shape = (13,) 또는 (10,) 또는 None.
+        default_color (str):
+            타입이 없거나(또는 UNKNOWN을 road line로 해석할 때) 기본으로 쓸 색.
+        options (DrawingOptions):
+            색/두께/패턴 등의 설정값.
 
     Returns:
-        plan: 그리기 계획(_LaneBoundaryDrawPlan).
+        _LaneBoundaryDrawPlan:
+            실제 그리기 방식(선/점), 색, 스타일 정보를 담은 값.
     """
-    # 기본(원래처럼)
+    # 기본(기존처럼): 단선 실선 + default_color
     default_plan = _LaneBoundaryDrawPlan(
         draw=True,
+        draw_mode="line",
         color=default_color,
+        marker=None,
         is_double=False,
         inner_linestyle=options.LANE_solid_linestyle,
         outer_linestyle=options.LANE_solid_linestyle,
     )
 
-    if line_type_row10 is None:
+    if line_type_row is None:
         return default_plan
 
-    idx = _line_type_one_hot_to_index_10(line_type_row10)
+    road_line_row10, road_edge_row3 = _normalize_line_type_row_to_road_line10_and_road_edge3(
+        line_type_row=line_type_row)
 
-    # INVALID
-    if idx == 9:
+    # (A) road edge가 존재하면 → 점으로 표시(별표/엑스/동그라미)
+    if float(np.sum(np.abs(road_edge_row3))) > 0.0:
         return _LaneBoundaryDrawPlan(
-            draw=False,
-            color=default_color,
+            draw=True,
+            draw_mode="marker",
+            color=options.ROAD_road_edge_color,
+            marker=_road_edge_row3_to_marker(road_edge_row3),
             is_double=False,
             inner_linestyle=options.LANE_solid_linestyle,
             outer_linestyle=options.LANE_solid_linestyle,
         )
 
-    # UNKNOWN
-    if idx == 8:
-        return default_plan
+    # (B) 기존 road line(10칸) 규칙으로 처리
+    idx10: int = _line_type_one_hot_to_index_10(road_line_row10)
 
-    # 타입별 매핑
+    # INVALID
+    if idx10 == 9:
+        return _LaneBoundaryDrawPlan(
+            draw=False,
+            draw_mode="line",
+            color=default_color,
+            marker=None,
+            is_double=False,
+            inner_linestyle=options.LANE_solid_linestyle,
+            outer_linestyle=options.LANE_solid_linestyle,
+        )
+
+    # UNKNOWN: 이번 요청대로 'o' 점으로 표시
+    if idx10 == 8:
+        return _LaneBoundaryDrawPlan(
+            draw=True,
+            draw_mode="marker",
+            color=default_color,
+            marker="o",
+            is_double=False,
+            inner_linestyle=options.LANE_solid_linestyle,
+            outer_linestyle=options.LANE_solid_linestyle,
+        )
+
+    # 나머지(0~7): 기존 매핑 유지
     # 0: BROKEN_SINGLE_WHITE
     # 1: SOLID_SINGLE_WHITE
     # 2: SOLID_DOUBLE_WHITE
@@ -1477,59 +1617,129 @@ def _make_lane_boundary_draw_plan(
     # 5: SOLID_SINGLE_YELLOW
     # 6: SOLID_DOUBLE_YELLOW
     # 7: PASSING_DOUBLE_YELLOW
-    if idx in (0, 1, 2):
-        line_color = options.LANE_line_white_color
+    if idx10 in (0, 1, 2):
+        line_color: str = options.LANE_line_white_color
     else:
         line_color = options.LANE_line_orange_color
 
-    if idx in (0, 3):
+    if idx10 in (0, 3):
         # broken single
         return _LaneBoundaryDrawPlan(
             draw=True,
+            draw_mode="line",
             color=line_color,
+            marker=None,
             is_double=False,
             inner_linestyle=options.LANE_broken_linestyle,
             outer_linestyle=options.LANE_broken_linestyle,
         )
 
-    if idx in (1, 5):
+    if idx10 in (1, 5):
         # solid single
         return _LaneBoundaryDrawPlan(
             draw=True,
+            draw_mode="line",
             color=line_color,
+            marker=None,
             is_double=False,
             inner_linestyle=options.LANE_solid_linestyle,
             outer_linestyle=options.LANE_solid_linestyle,
         )
 
-    if idx in (2, 6):
+    if idx10 in (2, 6):
         # solid double
         return _LaneBoundaryDrawPlan(
             draw=True,
+            draw_mode="line",
             color=line_color,
+            marker=None,
             is_double=True,
             inner_linestyle=options.LANE_solid_linestyle,
             outer_linestyle=options.LANE_solid_linestyle,
         )
 
-    if idx == 4:
+    if idx10 == 4:
         # broken double yellow
         return _LaneBoundaryDrawPlan(
             draw=True,
+            draw_mode="line",
             color=line_color,
+            marker=None,
             is_double=True,
             inner_linestyle=options.LANE_broken_linestyle,
             outer_linestyle=options.LANE_broken_linestyle,
         )
 
-    # PASSING_DOUBLE_YELLOW
+    # PASSING_DOUBLE_YELLOW:
     # "차선 쪽(안쪽)은 점선, 바깥쪽은 실선"으로 표현
     return _LaneBoundaryDrawPlan(
         draw=True,
+        draw_mode="line",
         color=line_color,
+        marker=None,
         is_double=True,
         inner_linestyle=options.LANE_broken_linestyle,
         outer_linestyle=options.LANE_solid_linestyle,
+    )
+
+
+def _draw_lane_boundary_points(
+    ax: plt.Axes,
+    boundary_xy: Array,  # shape: (T, 2)
+    point_drawable: Array,  # shape: (T,)
+    marker: str,
+    edge_color: str,
+    marker_size: float,
+    edge_line_width: float,
+    zorder: int,
+) -> None:
+    """차선 경계를 '점(마커)'으로 찍어서 그린다.
+
+    선이 아니라 점으로 표현해야 하는 타입(예: road edge, unknown)일 때 사용한다.
+
+    Args:
+        ax (plt.Axes):
+            Matplotlib 축 객체.
+        boundary_xy (np.ndarray):
+            shape = (T, 2). 각 시점의 경계 좌표들.
+        point_drawable (np.ndarray):
+            shape = (T,) bool.
+            True인 위치만 점으로 찍는다.
+        marker (str):
+            점 모양("o", "*", "x" 등).
+        edge_color (str):
+            점 테두리 색.
+        marker_size (float):
+            scatter의 s 값(점 크기).
+        edge_line_width (float):
+            점 테두리 두께.
+        zorder (int):
+            그리기 순서.
+    """
+    bxy: Array = np.asarray(boundary_xy)  # shape: (T, 2)
+    ok: Array = np.asarray(point_drawable).astype(bool).reshape(
+        -1)  # shape: (T,)
+
+    if bxy.ndim != 2 or bxy.shape[1] != 2:
+        raise ValueError(f"boundary_xy shape는 (T,2) 이어야 합니다. got {bxy.shape}")
+    if ok.ndim != 1 or ok.shape[0] != bxy.shape[0]:
+        raise ValueError(
+            f"point_drawable shape는 (T,) 이어야 합니다. got {ok.shape}, T={bxy.shape[0]}"
+        )
+
+    if not np.any(ok):
+        return
+
+    xy: Array = bxy[ok]  # shape: (K, 2)
+    ax.scatter(
+        xy[:, 0],
+        xy[:, 1],
+        marker=marker,
+        s=float(marker_size),
+        linewidths=float(edge_line_width),
+        edgecolors=edge_color,
+        facecolors="none",
+        zorder=int(zorder),
     )
 
 
@@ -1640,8 +1850,8 @@ def is_valid_xy_point(
 
 
 def _compute_unit_normal_for_segment(
-    p0: Array,  # shape: (2,)
-    p1: Array,  # shape: (2,)
+        p0: Array,  # shape: (2,)
+        p1: Array,  # shape: (2,)
 ) -> Array:
     """선분(p0->p1)에 수직인 '단위 방향'을 만든다.
 
@@ -1665,12 +1875,9 @@ def _compute_unit_normal_for_segment(
         return np.array([0.0, 0.0], dtype=np.float32)
 
     # 한쪽 수직 방향(좌/우 중 한쪽) 선택
-    normal: Array = np.array([-seg[1], seg[0]], dtype=np.float32) / seg_len  # (2,)
+    normal: Array = np.array([-seg[1], seg[0]],
+                             dtype=np.float32) / seg_len  # (2,)
     return normal
-
-
-
-
 
 
 def draw_road_edge_points(
@@ -1785,6 +1992,7 @@ def draw_driveway_points(
         zorder=options.DRIVEWAY_polygon_zorder,
     )
 
+
 def _compute_boundary_vector_point_valid_mask(
     boundary_vec: Array,  # shape: (T, 2)
     eps: float,
@@ -1818,7 +2026,8 @@ def _compute_boundary_vector_point_valid_mask(
     """
     boundary_vec_arr: Array = np.asarray(boundary_vec)  # (T, 2)
     if boundary_vec_arr.ndim != 2 or boundary_vec_arr.shape[1] != 2:
-        raise ValueError(f"boundary_vec shape는 (T, 2) 이어야 합니다. got {boundary_vec_arr.shape}")
+        raise ValueError(
+            f"boundary_vec shape는 (T, 2) 이어야 합니다. got {boundary_vec_arr.shape}")
 
     T: int = int(boundary_vec_arr.shape[0])
     if not skip_zero_vector:
@@ -1828,8 +2037,8 @@ def _compute_boundary_vector_point_valid_mask(
 
 
 def _compute_consecutive_segment_drawable_mask(
-    lane_point_valid_mask: Array,      # shape: (T,)
-    boundary_point_valid_mask: Array,  # shape: (T,)
+        lane_point_valid_mask: Array,  # shape: (T,)
+        boundary_point_valid_mask: Array,  # shape: (T,)
 ) -> Array:
     """연속된 두 점(i, i+1)을 선으로 이을 수 있는지에 대한 True/False 배열을 만든다.
 
@@ -1851,14 +2060,15 @@ def _compute_consecutive_segment_drawable_mask(
         np.ndarray: shape (T-1,) bool.
             i번째 값이 True면 (i -> i+1) 선분을 그릴 수 있다.
     """
-    lane_ok: Array = np.asarray(lane_point_valid_mask).astype(bool).reshape(-1)       # (T,)
-    bound_ok: Array = np.asarray(boundary_point_valid_mask).astype(bool).reshape(-1)  # (T,)
+    lane_ok: Array = np.asarray(lane_point_valid_mask).astype(bool).reshape(
+        -1)  # (T,)
+    bound_ok: Array = np.asarray(boundary_point_valid_mask).astype(
+        bool).reshape(-1)  # (T,)
 
     if lane_ok.shape[0] != bound_ok.shape[0]:
         raise ValueError(
             f"lane_point_valid_mask와 boundary_point_valid_mask의 길이가 같아야 합니다. "
-            f"got {lane_ok.shape[0]} vs {bound_ok.shape[0]}"
-        )
+            f"got {lane_ok.shape[0]} vs {bound_ok.shape[0]}")
 
     T: int = int(lane_ok.shape[0])
     if T < 2:
@@ -1869,9 +2079,9 @@ def _compute_consecutive_segment_drawable_mask(
 
 def _draw_lane_boundary_segments_with_plan(
     ax: plt.Axes,
-    center_xy: Array,           # shape: (T, 2)
-    boundary_xy: Array,         # shape: (T, 2)
-    segment_drawable: Array,    # shape: (T-1,)
+    center_xy: Array,  # shape: (T, 2)
+    boundary_xy: Array,  # shape: (T, 2)
+    segment_drawable: Array,  # shape: (T-1,)
     plan: _LaneBoundaryDrawPlan,
     options: DrawingOptions,
     zorder: int,
@@ -1899,9 +2109,10 @@ def _draw_lane_boundary_segments_with_plan(
     if not plan.draw:
         return
 
-    cxy: Array = np.asarray(center_xy)    # (T, 2)
+    cxy: Array = np.asarray(center_xy)  # (T, 2)
     bxy: Array = np.asarray(boundary_xy)  # (T, 2)
-    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(-1)  # (T-1,)
+    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(
+        -1)  # (T-1,)
 
     if cxy.ndim != 2 or cxy.shape[1] != 2:
         raise ValueError(f"center_xy shape는 (T,2) 이어야 합니다. got {cxy.shape}")
@@ -1914,10 +2125,10 @@ def _draw_lane_boundary_segments_with_plan(
 
     seg_indices: Array = np.nonzero(seg_ok)[0]  # (K,)
     for j in seg_indices.tolist():
-        c0: Array = cxy[j].astype(np.float32)       # (2,)
-        c1: Array = cxy[j + 1].astype(np.float32)   # (2,)
-        p0: Array = bxy[j].astype(np.float32)       # (2,)
-        p1: Array = bxy[j + 1].astype(np.float32)   # (2,)
+        c0: Array = cxy[j].astype(np.float32)  # (2,)
+        c1: Array = cxy[j + 1].astype(np.float32)  # (2,)
+        p0: Array = bxy[j].astype(np.float32)  # (2,)
+        p1: Array = bxy[j + 1].astype(np.float32)  # (2,)
 
         if plan.is_double:
             inward_n: Array = _compute_inward_normal_for_segment(
@@ -1952,8 +2163,8 @@ def _draw_lane_boundary_segments_with_plan(
 
 def _draw_lane_boundary_highlight_segments(
     ax: plt.Axes,
-    boundary_xy: Array,        # shape: (T, 2)
-    segment_drawable: Array,   # shape: (T-1,)
+    boundary_xy: Array,  # shape: (T, 2)
+    segment_drawable: Array,  # shape: (T-1,)
     color: str,
     line_width: float,
     zorder: int,
@@ -1972,7 +2183,8 @@ def _draw_lane_boundary_highlight_segments(
         zorder (int): 그리기 순서.
     """
     bxy: Array = np.asarray(boundary_xy)  # (T, 2)
-    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(-1)  # (T-1,)
+    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(
+        -1)  # (T-1,)
 
     if bxy.ndim != 2 or bxy.shape[1] != 2:
         raise ValueError(f"boundary_xy shape는 (T,2) 이어야 합니다. got {bxy.shape}")
@@ -1983,8 +2195,8 @@ def _draw_lane_boundary_highlight_segments(
 
     seg_indices: Array = np.nonzero(seg_ok)[0]  # (K,)
     for j in seg_indices.tolist():
-        p0: Array = bxy[j]       # (2,)
-        p1: Array = bxy[j + 1]   # (2,)
+        p0: Array = bxy[j]  # (2,)
+        p1: Array = bxy[j + 1]  # (2,)
         ax.plot(
             [float(p0[0]), float(p1[0])],
             [float(p0[1]), float(p1[1])],
@@ -1994,25 +2206,32 @@ def _draw_lane_boundary_highlight_segments(
         )
 
 
-
 def draw_lane_boundaries(
-    ax: plt.Axes,
-    lanes: Array,  # (lane_num, lane_len, 12)
-    agent_route_lane_order: Optional[Array],  # (max_agent_num, lane_num)
-    options: DrawingOptions,
-    draw_token_int_list: Optional[List[int]] = None,
-    lane_type: Optional[Array] = None,  # (lane_num, 4)
-    left_line_type: Optional[Array] = None,  # (lane_num, 10)
-    right_line_type: Optional[Array] = None,  # (lane_num, 10)
+        ax: plt.Axes,
+        lanes: Array,  # (lane_num, lane_len, 12)
+        agent_route_lane_order: Optional[Array],  # (max_agent_num, lane_num)
+        options: DrawingOptions,
+        draw_token_int_list: Optional[List[int]] = None,
+        lane_type: Optional[Array] = None,  # (lane_num, 4)
+        left_line_type: Optional[
+            Array] = None,  # (lane_num, 13) or (lane_num, 10)
+        right_line_type: Optional[
+            Array] = None,  # (lane_num, 13) or (lane_num, 10)
 ) -> None:
     """차선 좌/우 경계를 그린다.
 
     추가 규칙(이번 수정의 핵심)
     --------------------------
     - left_vec/right_vec의 (dx,dy)가 (0,0)이면 "해당 시점에는 경계가 없음"으로 본다.
-    - 경계선은 연속된 두 점을 이을 때,
-      양 끝점 모두 (dx,dy)가 유효한 경우에만 선분을 그린다.
-      즉, 경계가 끊기는 구간은 선도 끊어진다.
+    - 경계선을 선분으로 그릴 때는,
+      연속된 두 점 모두 "차선 포인트 유효 + 경계 벡터 유효"일 때만 그린다.
+      그래서 경계가 끊기는 구간은 선도 끊어진다.
+
+    - left/right_line_type이 (L,13)으로 확장되면서,
+      특정 타입은 선이 아니라 점으로 찍어서 표시한다.
+      · road edge boundary -> '*'
+      · road edge median   -> 'x'
+      · unknown            -> 'o'
     """
     if lanes is None or np.asarray(lanes).size == 0:
         return
@@ -2047,17 +2266,19 @@ def draw_lane_boundaries(
 
     if left_line_type is not None:
         left_line_type = np.asarray(left_line_type)
-        if left_line_type.ndim != 2 or left_line_type.shape != (L, 10):
+        if left_line_type.ndim != 2 or left_line_type.shape[
+                0] != L or left_line_type.shape[1] not in (10, 13):
             raise ValueError(
-                f"left_line_type shape는 (lane_num,10) 이어야 합니다. got {left_line_type.shape}, L={L}"
-            )
+                f"left_line_type shape는 (lane_num,13) 또는 (lane_num,10) 이어야 합니다. "
+                f"got {left_line_type.shape}, L={L}")
 
     if right_line_type is not None:
         right_line_type = np.asarray(right_line_type)
-        if right_line_type.ndim != 2 or right_line_type.shape != (L, 10):
+        if right_line_type.ndim != 2 or right_line_type.shape[
+                0] != L or right_line_type.shape[1] not in (10, 13):
             raise ValueError(
-                f"right_line_type shape는 (lane_num,10) 이어야 합니다. got {right_line_type.shape}, L={L}"
-            )
+                f"right_line_type shape는 (lane_num,13) 또는 (lane_num,10) 이어야 합니다. "
+                f"got {right_line_type.shape}, L={L}")
 
     boundary_vec_eps: float = float(options.LANE_boundary_vector_invalid_eps)
     skip_zero_boundary_vec: bool = True
@@ -2065,11 +2286,12 @@ def draw_lane_boundaries(
     for idx in range(L):
         lane_i: Array = lanes_arr[idx]  # (T, 12)
 
-        center: Array = lane_i[:, 0:2]      # (T, 2)
-        left_vec: Array = lane_i[:, 4:6]    # (T, 2)  [dx, dy]
-        right_vec: Array = lane_i[:, 6:8]   # (T, 2)  [dx, dy]
+        center: Array = lane_i[:, 0:2]  # (T, 2)
+        left_vec: Array = lane_i[:, 4:6]  # (T, 2)  [dx, dy]
+        right_vec: Array = lane_i[:, 6:8]  # (T, 2)  [dx, dy]
 
-        lane_point_valid: Array = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)  # (T,)
+        lane_point_valid: Array = np.any(np.abs(lane_i[:, :8]) > eps,
+                                         axis=1)  # (T,)
 
         T: int = int(center.shape[0])
         if T < 2:
@@ -2077,36 +2299,34 @@ def draw_lane_boundaries(
 
         # (A) "경계가 실제로 존재하는 점" True/False 배열 만들기
         left_boundary_point_valid: Array = _compute_boundary_vector_point_valid_mask(
-            boundary_vec=left_vec,                 # (T, 2)
+            boundary_vec=left_vec,  # (T, 2)
             eps=boundary_vec_eps,
             skip_zero_vector=skip_zero_boundary_vec,
         )  # (T,)
 
         right_boundary_point_valid: Array = _compute_boundary_vector_point_valid_mask(
-            boundary_vec=right_vec,                # (T, 2)
+            boundary_vec=right_vec,  # (T, 2)
             eps=boundary_vec_eps,
             skip_zero_vector=skip_zero_boundary_vec,
         )  # (T,)
 
-        # (B) 실제로 그릴 "선분" True/False 배열 만들기 (연속된 두 점이 다 유효해야 선분 그림)
+        # (B) 실제로 그릴 "선분" True/False 배열 만들기
         left_segment_drawable: Array = _compute_consecutive_segment_drawable_mask(
-            lane_point_valid_mask=lane_point_valid,            # (T,)
-            boundary_point_valid_mask=left_boundary_point_valid # (T,)
+            lane_point_valid_mask=lane_point_valid,  # (T,)
+            boundary_point_valid_mask=left_boundary_point_valid  # (T,)
         )  # (T-1,)
 
         right_segment_drawable: Array = _compute_consecutive_segment_drawable_mask(
-            lane_point_valid_mask=lane_point_valid,             # (T,)
-            boundary_point_valid_mask=right_boundary_point_valid # (T,)
+            lane_point_valid_mask=lane_point_valid,  # (T,)
+            boundary_point_valid_mask=right_boundary_point_valid  # (T,)
         )  # (T-1,)
 
-        # (C) 실제 경계 좌표 계산 (무효 점은 어차피 선분에서 제외됨)
-        left_xy: Array = center + left_vec    # (T, 2)
+        # (C) 실제 경계 좌표 계산
+        left_xy: Array = center + left_vec  # (T, 2)
         right_xy: Array = center + right_vec  # (T, 2)
 
-        # lane_type 기반 기본 색(기존 유지: 현재 코드에서는 base_color 고정)
-        lane_type_row4 = lane_type[idx] if lane_type is not None else None
+        # lane_type 기반 기본 색(현 코드 유지)
         base_color: str = options.LANE_lane_boundary_color
-        # base_color = _lane_type_one_hot_to_color(lane_type_row4, options)
 
         # left/right line 계획
         left_plan: _LaneBoundaryDrawPlan = _make_lane_boundary_draw_plan(
@@ -2120,31 +2340,62 @@ def draw_lane_boundaries(
             options=options,
         )
 
-        # (D) 경계 그리기 (여기서부터가 실제 변경 효과가 나는 부분)
-        _draw_lane_boundary_segments_with_plan(
-            ax=ax,
-            center_xy=center,                 # (T, 2)
-            boundary_xy=left_xy,              # (T, 2)
-            segment_drawable=left_segment_drawable,  # (T-1,)
-            plan=left_plan,
-            options=options,
-            zorder=1,
-        )
+        # (D) 경계 그리기: 선(line) 또는 점(marker)
+        if left_plan.draw and left_plan.draw_mode == "marker":
+            point_drawable: Array = (lane_point_valid &
+                                     left_boundary_point_valid)  # (T,)
+            _draw_lane_boundary_points(
+                ax=ax,
+                boundary_xy=left_xy,  # (T,2)
+                point_drawable=point_drawable,  # (T,)
+                marker=str(left_plan.marker or "o"),
+                edge_color=left_plan.color,
+                marker_size=float(options.ROAD_road_edge_marker_size),
+                edge_line_width=float(options.ROAD_road_edge_line_width),
+                zorder=1,
+            )
+        else:
+            _draw_lane_boundary_segments_with_plan(
+                ax=ax,
+                center_xy=center,  # (T, 2)
+                boundary_xy=left_xy,  # (T, 2)
+                segment_drawable=left_segment_drawable,  # (T-1,)
+                plan=left_plan,
+                options=options,
+                zorder=1,
+            )
 
-        _draw_lane_boundary_segments_with_plan(
-            ax=ax,
-            center_xy=center,                  # (T, 2)
-            boundary_xy=right_xy,              # (T, 2)
-            segment_drawable=right_segment_drawable,  # (T-1,)
-            plan=right_plan,
-            options=options,
-            zorder=1,
-        )
+        if right_plan.draw and right_plan.draw_mode == "marker":
+            point_drawable: Array = (lane_point_valid &
+                                     right_boundary_point_valid)  # (T,)
+            _draw_lane_boundary_points(
+                ax=ax,
+                boundary_xy=right_xy,  # (T,2)
+                point_drawable=point_drawable,  # (T,)
+                marker=str(right_plan.marker or "o"),
+                edge_color=right_plan.color,
+                marker_size=float(options.ROAD_road_edge_marker_size),
+                edge_line_width=float(options.ROAD_road_edge_line_width),
+                zorder=1,
+            )
+        else:
+            _draw_lane_boundary_segments_with_plan(
+                ax=ax,
+                center_xy=center,  # (T, 2)
+                boundary_xy=right_xy,  # (T, 2)
+                segment_drawable=right_segment_drawable,  # (T-1,)
+                plan=right_plan,
+                options=options,
+                zorder=1,
+            )
 
         # ===== 기존 route 강조(필요 시) =====
+        # 점(marker) 모드에서는 route 강조선을 그려도 의미가 애매해서,
+        # 기존처럼 "선(line)일 때만" 강조를 유지한다.
         if agent_route_lane_order is not None:
             try:
-                agent_route_a_lane_order = agent_route_lane_order[:, idx]  # (filtered_agent_num,)
+                agent_route_a_lane_order = agent_route_lane_order[:,
+                                                                  idx]  # (filtered_agent_num,)
             except Exception:
                 raise ValueError(
                     f"agent_route_lane_order shape {agent_route_lane_order.shape} incompatible with lane idx {idx}"
@@ -2154,8 +2405,7 @@ def draw_lane_boundaries(
             if np.any(has_route_mask):
                 highlight_color: str = CYAN
 
-                # line_type이 INVALID면(route도) 그리지 않음 + (dx,dy) 무효점도 동일하게 제외
-                if left_plan.draw:
+                if left_plan.draw and left_plan.draw_mode == "line":
                     _draw_lane_boundary_highlight_segments(
                         ax=ax,
                         boundary_xy=left_xy,  # (T, 2)
@@ -2165,7 +2415,7 @@ def draw_lane_boundaries(
                         zorder=2,
                     )
 
-                if right_plan.draw:
+                if right_plan.draw and right_plan.draw_mode == "line":
                     _draw_lane_boundary_highlight_segments(
                         ax=ax,
                         boundary_xy=right_xy,  # (T, 2)
@@ -2175,6 +2425,72 @@ def draw_lane_boundaries(
                         zorder=2,
                     )
 
+
+def _signal_rows4_to_state_indices(
+        signals_rowwise: Array,  # shape: (T, 4)
+) -> Array:
+    """신호 상태(4칸)를 0~3 정수로 바꾼 배열을 만든다.
+
+    lanes의 signal 값은 한 시점마다 길이 4짜리 배열로 들어온다고 가정한다.
+    (예: [green, yellow, red, unknown] 순서)
+
+    이 함수는 각 시점의 4칸 중 "값이 가장 큰 위치"를 상태로 고른다.
+    다만 어떤 시점은 4칸이 전부 0일 수 있는데,
+    그 경우는 "알 수 없음(unknown)"으로 보고 3을 넣는다.
+
+    Args:
+        signals_rowwise (np.ndarray):
+            shape = (T, 4)
+            T는 차선 포인트 개수.
+
+    Returns:
+        np.ndarray:
+            shape = (T,)
+            각 원소는 0~3.
+    """
+    arr: Array = np.asarray(signals_rowwise)  # (T, 4)
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise ValueError(
+            f"signals_rowwise shape는 (T,4) 이어야 합니다. got {arr.shape}")
+
+    row_sum: Array = np.sum(np.abs(arr), axis=1)  # (T,)
+    idx: Array = np.argmax(arr, axis=1).astype(np.int64)  # (T,)
+    idx = np.where(row_sum > 0.0, idx, 3).astype(np.int64)  # (T,)
+    return idx
+
+
+def _choose_lane_centerline_color(
+    signal_state_idx: int,
+    lane_type_color: Optional[str],
+    options: DrawingOptions,
+) -> str:
+    """센터라인 색을 고른다(신호등이 lane_type보다 우선).
+
+    우선순위:
+    1) 신호등이 green/yellow/red(0/1/2)이면 그 색을 사용한다.
+    2) 신호등이 unknown(3)이면,
+       lane_type 색이 있으면 lane_type 색을 사용한다.
+    3) 둘 다 없으면 unknown 색(회색)을 사용한다.
+
+    Args:
+        signal_state_idx (int):
+            0~3 값. (0: green, 1: yellow, 2: red, 3: unknown)
+        lane_type_color (Optional[str]):
+            lane_type이 있을 때 미리 계산해 둔 센터라인 색.
+        options (DrawingOptions):
+            신호등 색 테이블(options.LANE_signal_colors)을 사용한다.
+
+    Returns:
+        str:
+            matplotlib에서 쓸 색 문자열.
+    """
+    if int(signal_state_idx) in (0, 1, 2):
+        return options.LANE_signal_colors.get(int(signal_state_idx), GRAY)
+
+    if lane_type_color is not None:
+        return lane_type_color
+
+    return options.LANE_signal_colors.get(3, GRAY)
 
 
 def draw_lane_centerlines(
@@ -2190,20 +2506,21 @@ def draw_lane_centerlines(
 ) -> None:
     """차선 센터라인을 그린다.
 
-    이 함수는 2가지 모드를 지원합니다.
-
+    모드
+    ----
     1) 텍스트 모드(agent_route_lane_order가 사용되는 경우)
         - 센터라인 선은 그리지 않고,
-        - 차선 위에 에이전트-차선 매핑 정보를 글씨로 표시합니다.
+        - 차선 위에 에이전트-차선 매핑 정보를 글씨로 표시한다.
         (기존 동작 유지)
 
     2) 센터라인 선 모드(일반 모드)
-        - 기존에는 "신호 상태"에 따라 색을 바꿨습니다.
-        - 이제는 "차선 종류(lane_type)"에 따라 센터라인 색을 바꿉니다.
-          즉, FREEWAY/SURFACE_STREET/BIKE_LANE/UNDEFINED를
-          센터라인 색만 보고 구분할 수 있습니다.
+        - 이번 수정으로 우선순위가 다음처럼 바뀐다.
+          (신호등 색이 lane_type보다 우선)
 
-        - lane_type이 입력으로 없으면(=None) 기존처럼 신호 색을 사용합니다.
+          1) 신호등이 green/yellow/red이면 → 신호등 색
+          2) 신호등이 unknown이면
+             lane_type이 있으면 → lane_type 색
+             lane_type이 없으면 → unknown(회색)
 
     Args:
         ax (plt.Axes):
@@ -2211,25 +2528,20 @@ def draw_lane_centerlines(
         lanes (np.ndarray):
             shape = (lane_num, lane_len, 12)
             · 0-1: centerline (x,y)
-            · 2-3: centerline diff (dx,dy)
-            · 4-5: left boundary vector (dx,dy)
-            · 6-7: right boundary vector (dx,dy)
-            · 8-11: signal one-hot [green, yellow, red, unknown]
+            · 8-11: signal 값(4칸)
         lanes_speed_limit (np.ndarray):
-            shape = (lane_num, 1). 속도 제한(있으면 m/s).
+            shape = (lane_num, 1)
         lanes_has_speed_limit (np.ndarray):
-            shape = (lane_num, 1). 속도 제한이 있는지 여부(bool).
+            shape = (lane_num, 1)
         options (DrawingOptions):
             그리기 옵션.
         agent_route_lane_order (Optional[np.ndarray]):
-            shape = (max_agent_num, lane_num).
             텍스트 모드에서만 사용.
         draw_token_int_list (Optional[List[int]]):
             텍스트 모드에서 특정 에이전트만 표시할 때 사용.
         lane_type (Optional[np.ndarray]):
             shape = (lane_num, 4).
-            센터라인 색을 차선 종류로 바꾸기 위해 사용.
-            None이면 기존처럼 신호 색을 사용합니다.
+            신호등이 unknown일 때만 센터라인 색의 후보로 사용된다.
     """
     if lanes is None or lanes.size == 0:
         return
@@ -2260,18 +2572,18 @@ def draw_lane_centerlines(
     # ────────────── (B) 텍스트 표기 모드 ──────────────
     if agent_route_lane_order is not None:
         draw_all: bool = (draw_token_int_list is None)
-        vstep: float = 0.3  # 같은 위치에 여러 개 쌓을 때 세로 간격(미터)
+        vstep: float = 0.3
 
         for lane_idx in range(lane_num):
-            lane_j: Array = lanes[lane_idx]  # shape: (lane_len, 12)
-            lane_j_center: Array = lane_j[:, 0:2]  # shape: (lane_len, 2)
+            lane_j: Array = lanes[lane_idx]  # (lane_len, 12)
+            lane_j_center: Array = lane_j[:, 0:2]  # (lane_len, 2)
 
             lane_point_valid_mask: Array = np.any(np.abs(lane_j[:, :8]) > eps,
-                                                  axis=1)  # shape: (lane_len,)
+                                                  axis=1)  # (lane_len,)
 
             ranks_j: Array = agent_route_lane_order[:,
-                                                    lane_idx]  # shape: (max_agent_num,)
-            valid_agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]  # shape: (K,)
+                                                    lane_idx]  # (max_agent_num,)
+            valid_agent_idxs: Array = np.nonzero(ranks_j >= 0)[0]
             if valid_agent_idxs.size == 0:
                 continue
 
@@ -2301,30 +2613,31 @@ def draw_lane_centerlines(
                         va="bottom",
                         zorder=3,
                     )
-        return  # 텍스트 모드에서는 선을 그리지 않음
+        return
 
     # ────────────── (A) 센터라인 선 모드 ──────────────
     for lane_idx, lane_i in enumerate(lanes):
-        center: Array = lane_i[:, 0:2]  # shape: (lane_len, 2)
-        signals: Array = lane_i[:, 8:12]  # shape: (lane_len, 4) (fallback용)
-        valid_mask: Array = np.any(np.abs(lane_i[:, :8]) > eps,
-                                   axis=1)  # shape: (lane_len,)
+        center: Array = lane_i[:, 0:2]  # (lane_len, 2)
+        signals: Array = lane_i[:, 8:12]  # (lane_len, 4)
+        valid_mask: Array = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)
 
         if center.shape[0] < 2:
             continue
 
-        # (1) 이 lane의 센터라인 색 결정
-        # - lane_type이 있으면: 차선 종류 색
-        # - 없으면: 기존처럼 신호 색
-        lane_center_color_by_type: Optional[str] = None
+        # lane_type 색(있으면 미리 계산)
+        lane_type_color: Optional[str] = None
         if lane_type_arr is not None:
-            lane_type_row4: Array = lane_type_arr[lane_idx]  # shape: (4,)
-            lane_center_color_by_type = _lane_type_row4_to_centerline_color(
+            lane_type_row4: Array = lane_type_arr[lane_idx]  # (4,)
+            lane_type_color = _lane_type_row4_to_centerline_color(
                 lane_type_row4=lane_type_row4,
                 options=options,
             )
 
-        # (2) 속도 제한 텍스트 준비(기존 유지)
+        # 신호 상태 index(항상 계산) — 신호가 unknown인지 판단하려고 필요
+        signal_state_idx: Array = _signal_rows4_to_state_indices(
+            signals)  # (lane_len,)
+
+        # 속도 제한 텍스트 준비(기존 유지)
         has_speed_limit: bool = False
         speed_kmh: Optional[float] = None
         if use_speed_limit_label:
@@ -2336,26 +2649,21 @@ def draw_lane_centerlines(
                 speed_val = lanes_speed_limit[lane_idx]
                 if np.ndim(speed_val) > 0:
                     speed_val = speed_val[0]
-                speed_kmh = float(speed_val) * 3.6  # m/s -> km/h
+                speed_kmh = float(speed_val) * 3.6
 
-        # (3) 선분 그리기
-        # lane_type이 없을 때만 신호 색을 쓰기 위해 state_idx 계산
-        state_idx: Optional[Array] = None
-        if lane_center_color_by_type is None:
-            state_idx = np.argmax(signals, axis=1)  # shape: (lane_len,)
-
+        # 선분 그리기: "신호 색 우선"
         for j in range(center.shape[0] - 1):
             if not (bool(valid_mask[j]) and bool(valid_mask[j + 1])):
                 continue
 
-            c0: Array = center[j]  # shape: (2,)
-            c1: Array = center[j + 1]  # shape: (2,)
+            c0: Array = center[j]
+            c1: Array = center[j + 1]
 
-            if lane_center_color_by_type is not None:
-                color: str = lane_center_color_by_type
-            else:
-                color = options.LANE_signal_colors.get(int(
-                    state_idx[j]), GRAY)  # type: ignore[index]
+            color: str = _choose_lane_centerline_color(
+                signal_state_idx=int(signal_state_idx[j]),
+                lane_type_color=lane_type_color,
+                options=options,
+            )
 
             ax.plot(
                 [float(c0[0]), float(c1[0])],
@@ -2366,10 +2674,10 @@ def draw_lane_centerlines(
                 zorder=2,
             )
 
-        # (4) 속도 제한 텍스트(기존 유지)
+        # 속도 제한 텍스트(기존 유지)
         if use_speed_limit_label and has_speed_limit and (speed_kmh
                                                           is not None):
-            valid_indices: Array = np.nonzero(valid_mask)[0]  # shape: (K,)
+            valid_indices: Array = np.nonzero(valid_mask)[0]
             if valid_indices.size > 0:
                 mid_idx: int = int(valid_indices[len(valid_indices) // 2])
                 px: float = float(center[mid_idx, 0])
@@ -3666,18 +3974,22 @@ def draw_lane(
         draw_token_list: 특정 에이전트 토큰만 텍스트 표기하고 싶을 때 사용. None이면 전체.
     """
     lanes = input_data.get("lanes")  # (lane_num, lane_len, 12) or None
-    lanes_speed_limit = input_data.get("lanes_speed_limit")       # (lane_num, 1) or None
-    lanes_has_speed_limit = input_data.get("lanes_has_speed_limit")  # (lane_num, 1) or None
+    lanes_speed_limit = input_data.get(
+        "lanes_speed_limit")  # (lane_num, 1) or None
+    lanes_has_speed_limit = input_data.get(
+        "lanes_has_speed_limit")  # (lane_num, 1) or None
 
-    lane_type = input_data.get("lane_type", None)          # (lane_num, 4) or None
-    left_line_type = input_data.get("left_line_type", None)  # (lane_num, 10) or None
-    right_line_type = input_data.get("right_lane_type", None)  # (lane_num, 10) or None
+    lane_type = input_data.get("lane_type", None)  # (lane_num, 4) or None
+    left_line_type = input_data.get("left_line_type",
+                                    None)  # (lane_num, 10) or None
+    right_line_type = input_data.get("right_line_type",
+                                     None)  # (lane_num, 10) or None
 
-    agent_route_lane_order: Optional[Array] = input_data.get("agent_route_lane_order", None)  # (A, lane_num) or None
+    agent_route_lane_order: Optional[Array] = input_data.get(
+        "agent_route_lane_order", None)  # (A, lane_num) or None
 
     draw_token_int_list: Optional[List[int]] = get_agent_idx_from_tokens(
-        draw_token_list, input_data.get("neighbor_track_token", None)
-    )
+        draw_token_list, input_data.get("neighbor_track_token", None))
 
     # (A) 기존 lanes 기반: 경계 + 센터라인
     if draw_option.LANE_draw_lane_boundaries:
@@ -3703,7 +4015,6 @@ def draw_lane(
             draw_token_int_list=draw_token_int_list,
             lane_type=lane_type,
         )
-
 
 
 # [Add]
