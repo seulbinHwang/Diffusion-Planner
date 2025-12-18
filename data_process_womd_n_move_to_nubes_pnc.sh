@@ -21,14 +21,15 @@ echo "Step 1: Running data processing..."
 WOMD_DATA_ROOT="/media/user/E/dataset/womd_v1_3"
 # 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
 TRAIN_SET_NAME="processed_womd_final"
-TRAIN_SET_PATH="${WOMD_DATA_ROOT}/scenario/${TRAIN_SET_NAME}"
+SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 
 # Run the data processing script
 # This is the command from data_process_pnc.sh
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
 taskset -c 0-47 \
-python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" --save_folder "$TRAIN_SET_NAME" --num_workers 48 \
+python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" --num_workers 48 \
  --overwrite_womd_cache false \
+ --save_path "$SAVE_PATH" \
  --save_image false
 
 echo "Data processing finished."
@@ -36,7 +37,7 @@ echo "---------------------------------"
 echo "Step 2: Uploading processed data..."
 
 nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
-                    "$TRAIN_SET_PATH" \
+                    "$SAVE_PATH" \
                     -e -j 48
 
 echo "Upload complete."

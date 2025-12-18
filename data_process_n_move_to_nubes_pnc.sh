@@ -22,7 +22,7 @@ NUPLAN_DATA_PATH="/media/user/E/dataset/nuplan-v1.1/splits/trainval"
 NUPLAN_MAP_PATH="/media/user/E/dataset/maps"
 # 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
 TRAIN_SET_NAME="processed_nuplan_final"
-TRAIN_SET_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
+SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
 # Run the data processing script
@@ -32,7 +32,7 @@ taskset -c 0-47 \
 python data_process.py \
   --data_path "$NUPLAN_DATA_PATH" \
   --map_path "$NUPLAN_MAP_PATH" \
-  --save_path "$TRAIN_SET_PATH" \
+  --save_path "$SAVE_PATH" \
   --total_scenarios 1000000 \
   --reset_save_path False \
   --save_image false
@@ -49,10 +49,10 @@ DATA_LIST_PATH="./diffusion_planner_training.json"
 chmod +x clean_bad_npz.py
 
 # Run the cleaning script.
-# The --data_dir corresponds to TRAIN_SET_PATH, and --data_list is the generated JSON file.
+# The --data_dir corresponds to SAVE_PATH, and --data_list is the generated JSON file.
 # 파이썬으로 호출하는 게 가장 안전 (chmod 불필요)
 python ./clean_bad_npz.py \
-  --data_dir "$TRAIN_SET_PATH" \
+  --data_dir "$SAVE_PATH" \
   --data_list "$DATA_LIST_PATH"
 
 echo "Cleaning finished."
@@ -60,7 +60,7 @@ echo "---------------------------------"
 echo "Step 3: Uploading processed data..."
 
 nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
-                    "$TRAIN_SET_PATH" \
+                    "$SAVE_PATH" \
                     -e -j 48
 
 nubescli upload labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \

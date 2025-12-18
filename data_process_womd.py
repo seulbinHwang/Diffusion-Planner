@@ -4179,6 +4179,61 @@ def update_and_maybe_print_cache_progress(
         f"scen/s {scen_per_sec:.2f}"
     )
 
+from pathlib import Path
+from typing import Any
+
+
+def _require_save_path_args(args: Any) -> None:
+    """save_path 인자가 반드시 제공되었는지 검사합니다.
+
+    이 스크립트는 결과 캐시(.npz)를 저장할 루트 폴더를
+    오직 `--save_path` 인자에서만 받도록 강제합니다.
+
+    - save_folder 같은 '추가 폴더 이름' 인자는 사용하지 않습니다.
+    - save_path가 비어 있거나 기본값처럼 보이는 값이면, 실수로 다른 위치에 저장되는 걸 막기 위해
+      즉시 에러를 냅니다.
+
+    Args:
+        args: args_util.get_args()가 반환한 인자 객체(보통 argparse.Namespace)
+
+    Raises:
+        RuntimeError: save_path가 없거나, 비어 있거나, 기본값("./cache")인 경우
+    """
+    if not hasattr(args, "save_path"):
+        raise RuntimeError(
+            "필수 인자가 args에 없습니다: save_path. "
+            "data_process_womd.py는 반드시 `--save_path <OUTPUT_DIR>` 를 받아야 합니다."
+        )
+
+    save_path = str(getattr(args, "save_path")).strip()
+    if save_path == "":
+        raise RuntimeError(
+            "`--save_path`가 비어 있습니다. 출력 폴더를 반드시 지정해야 합니다."
+        )
+
+    # args_util.py 기본값(현재 ./cache)을 사실상 '미지정'으로 간주해서 막습니다.
+    # 정말 ./cache에 저장하고 싶으면, 의도적으로 다른 경로로 바꾸거나 이 체크를 제거하세요.
+    if save_path == "./cache":
+        raise RuntimeError(
+            "`--save_path`가 기본값('./cache')입니다. "
+            "실수 방지를 위해 data_process_womd.py에서는 기본 저장 위치를 허용하지 않습니다. "
+            "원하는 출력 폴더를 `--save_path`로 명시해 주세요."
+        )
+
+
+def _get_cache_root_dir_from_args(args: Any) -> Path:
+    """save_path를 Path로 정규화해서 반환합니다.
+
+    Args:
+        args: args_util.get_args() 결과
+
+    Returns:
+        cache_root_dir: 캐시 출력 루트 폴더 경로(Path)
+    """
+    _require_save_path_args(args)
+    return Path(str(getattr(args, "save_path"))).expanduser()
+
+
 # =========================
 # split 전체 캐싱
 # =========================
@@ -4191,7 +4246,8 @@ def cache_all_splits(
 ) -> None:
     dataset_p = Path(data_path)
     scenario_dir = dataset_p / "scenario"
-    caching_dir = dataset_p / "cache" / args.save_folder
+    # ✅ 출력 루트는 오직 save_path만 사용
+    caching_dir = _get_cache_root_dir_from_args(args)
     ensure_dir(caching_dir)
 
     ctx = mp.get_context("spawn")
@@ -4351,6 +4407,8 @@ def _str2bool(v: str) -> bool:
 if __name__ == "__main__":
     args = args_util.get_args()
     _require_filter_radius_args(args)
+    _require_save_path_args(args)  # ✅ 추가: save_path 강제
+
 
     splits = tuple(
         [s.strip() for s in args.womd_splits.split(",") if len(s.strip()) > 0])

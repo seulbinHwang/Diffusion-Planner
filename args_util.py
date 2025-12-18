@@ -488,10 +488,6 @@ def get_args():
                         default='./cache',
                         type=str,
                         help='path to save processed data')
-    parser.add_argument('--save_folder',
-                        default='cache_name_should_be_set',
-                        type=str,
-                        help='path to save processed data')
     parser.add_argument('--scenarios_per_type',
                         type=int,
                         default=None,
