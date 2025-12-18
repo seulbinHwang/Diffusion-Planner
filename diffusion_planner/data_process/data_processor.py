@@ -90,8 +90,8 @@ class DataProcessor(object):
 
     @staticmethod
     def _normalize_cos_sin_in_traj_11(
-        traj_11: np.ndarray,          # shape: (N, T, 11)
-        valid_mask: np.ndarray,       # shape: (N, T), True면 유효 프레임
+        traj_11: np.ndarray,  # shape: (N, T, 11)
+        valid_mask: np.ndarray,  # shape: (N, T), True면 유효 프레임
         *,
         eps: float = 1e-6,
         cos_index: int = 2,
@@ -131,7 +131,8 @@ class DataProcessor(object):
                 traj_11을 직접 수정한 뒤 그대로 반환합니다.
         """
         if traj_11.ndim != 3 or traj_11.shape[-1] != 11:
-            raise ValueError(f"`traj_11` shape는 (N, T, 11)이어야 합니다. got {traj_11.shape}")
+            raise ValueError(
+                f"`traj_11` shape는 (N, T, 11)이어야 합니다. got {traj_11.shape}")
         if valid_mask.shape != traj_11.shape[:2]:
             raise ValueError(
                 f"`valid_mask` shape는 (N, T)이어야 합니다. got {valid_mask.shape}, expected {traj_11.shape[:2]}"
@@ -152,8 +153,12 @@ class DataProcessor(object):
         # valid_mask=True 이고 norm>eps 인 곳만 (cos_unit, sin_unit) 사용
         good = valid_mask & (norm > eps)
 
-        traj_11[:, :, cos_index] = np.where(good, cos_unit, 0.0).astype(traj_11.dtype, copy=False)
-        traj_11[:, :, sin_index] = np.where(good, sin_unit, 0.0).astype(traj_11.dtype, copy=False)
+        traj_11[:, :, cos_index] = np.where(good, cos_unit,
+                                            0.0).astype(traj_11.dtype,
+                                                        copy=False)
+        traj_11[:, :, sin_index] = np.where(good, sin_unit,
+                                            0.0).astype(traj_11.dtype,
+                                                        copy=False)
         return traj_11
 
     # [ADDED] 통계 유틸 함수들

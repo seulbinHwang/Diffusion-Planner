@@ -642,7 +642,8 @@ def _sanitize_polyline_xy(
         ValueError: 입력 shape이 (N, 2)가 아니면 발생합니다.
     """
     if polyline_xy.ndim != 2 or polyline_xy.shape[1] != 2:
-        raise ValueError(f"polyline_xy shape은 (N, 2)여야 합니다. got {polyline_xy.shape}")
+        raise ValueError(
+            f"polyline_xy shape은 (N, 2)여야 합니다. got {polyline_xy.shape}")
 
     if polyline_xy.size == 0:
         return polyline_xy.reshape((0, 2))
@@ -657,7 +658,8 @@ def _sanitize_polyline_xy(
     # 연속 중복 제거: 이전 점과 너무 가까우면 버림
     # diffs: (M-1,)
     diffs: np.ndarray = np.linalg.norm(cleaned[1:] - cleaned[:-1], axis=1)
-    keep_mask: np.ndarray = np.concatenate([np.array([True]), diffs > eps], axis=0)
+    keep_mask: np.ndarray = np.concatenate([np.array([True]), diffs > eps],
+                                           axis=0)
     cleaned = cleaned[keep_mask]
 
     return cleaned
@@ -709,7 +711,8 @@ def _resample_polyline_evenly(
     if n == 0:
         return np.zeros((num_points, 2), dtype=np.float64)
     if n == 1:
-        return np.repeat(polyline_xy[:1], repeats=num_points, axis=0).astype(np.float64, copy=False)
+        return np.repeat(polyline_xy[:1], repeats=num_points,
+                         axis=0).astype(np.float64, copy=False)
 
     # 선분 길이와 누적 거리 계산
     # seg: (n-1, 2)
@@ -718,14 +721,20 @@ def _resample_polyline_evenly(
     seg_len: np.ndarray = np.linalg.norm(seg, axis=1)
 
     # cum_dist: (n,)
-    cum_dist: np.ndarray = np.concatenate([np.array([0.0], dtype=np.float64), np.cumsum(seg_len)], axis=0)
+    cum_dist: np.ndarray = np.concatenate(
+        [np.array([0.0], dtype=np.float64),
+         np.cumsum(seg_len)], axis=0)
     total_len: float = float(cum_dist[-1])
 
     if total_len <= eps:
-        return np.repeat(polyline_xy[:1], repeats=num_points, axis=0).astype(np.float64, copy=False)
+        return np.repeat(polyline_xy[:1], repeats=num_points,
+                         axis=0).astype(np.float64, copy=False)
 
     # target_dist: (num_points,)
-    target_dist: np.ndarray = np.linspace(0.0, total_len, num_points, dtype=np.float64)
+    target_dist: np.ndarray = np.linspace(0.0,
+                                          total_len,
+                                          num_points,
+                                          dtype=np.float64)
 
     # x, y 각각 보간
     x_new: np.ndarray = np.interp(target_dist, cum_dist, polyline_xy[:, 0])
@@ -736,9 +745,9 @@ def _resample_polyline_evenly(
 
 
 def _interpolate_points(
-    line: np.ndarray,      # (N, 2)
+    line: np.ndarray,  # (N, 2)
     num_point: int,
-) -> np.ndarray:          # (num_point, 2)
+) -> np.ndarray:  # (num_point, 2)
     """기존 코드 호환을 위해 이름만 유지한 래퍼 함수입니다.
 
     - 기존 코드가 `_interpolate_points(...)`를 호출하는 구조를 유지하면서,
@@ -1827,11 +1836,12 @@ def _build_lane_vector_and_agent_route_order(
 
     return vector_map_lanes, agent_route_lane_order
 
+
 def _build_route_lane_vectors(
-    vector_map_lanes: np.ndarray,                 # (lane_num, lane_len, 12)
-    chosen_lanes_route_mask: List[bool],          # len = lane_num
-    lane_speed_limit_array: np.ndarray,           # (lane_num, 1)
-    lane_has_speed_limit_array: np.ndarray,       # (lane_num, 1)
+        vector_map_lanes: np.ndarray,  # (lane_num, lane_len, 12)
+        chosen_lanes_route_mask: List[bool],  # len = lane_num
+        lane_speed_limit_array: np.ndarray,  # (lane_num, 1)
+        lane_has_speed_limit_array: np.ndarray,  # (lane_num, 1)
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """route 위에 있는 차선만 골라 route_lanes 관련 배열을 만듭니다.
 
@@ -1840,7 +1850,9 @@ def _build_route_lane_vectors(
       route_lanes shape = (0, lane_len, 12)
     """
     if vector_map_lanes.ndim != 3 or vector_map_lanes.shape[-1] != 12:
-        raise ValueError(f"vector_map_lanes shape은 (lane_num, lane_len, 12)여야 합니다. got {vector_map_lanes.shape}")
+        raise ValueError(
+            f"vector_map_lanes shape은 (lane_num, lane_len, 12)여야 합니다. got {vector_map_lanes.shape}"
+        )
 
     lane_num: int = int(vector_map_lanes.shape[0])
     lane_len: int = int(vector_map_lanes.shape[1])
@@ -1852,12 +1864,17 @@ def _build_route_lane_vectors(
         )
 
     # route lane 인덱스
-    route_lane_indices: List[int] = [i for i, on_route in enumerate(chosen_lanes_route_mask) if on_route]
+    route_lane_indices: List[int] = [
+        i for i, on_route in enumerate(chosen_lanes_route_mask) if on_route
+    ]
     route_lane_num: int = len(route_lane_indices)
 
-    vector_map_route_lanes: np.ndarray = np.zeros((route_lane_num, lane_len, lane_feat_dim), dtype=np.float32)
-    route_lanes_speed_limit: np.ndarray = np.zeros((route_lane_num, 1), dtype=np.float32)
-    route_lanes_has_speed_limit: np.ndarray = np.zeros((route_lane_num, 1), dtype=np.bool_)
+    vector_map_route_lanes: np.ndarray = np.zeros(
+        (route_lane_num, lane_len, lane_feat_dim), dtype=np.float32)
+    route_lanes_speed_limit: np.ndarray = np.zeros((route_lane_num, 1),
+                                                   dtype=np.float32)
+    route_lanes_has_speed_limit: np.ndarray = np.zeros((route_lane_num, 1),
+                                                       dtype=np.bool_)
 
     for loc, lane_idx in enumerate(route_lane_indices):
         vector_map_route_lanes[loc] = vector_map_lanes[lane_idx]

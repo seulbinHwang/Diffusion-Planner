@@ -805,26 +805,35 @@ def _pack_ego_local_agents(
 
     for t in range(num_frames):
         # frame_cur_exists_agents_local: (N, 8)
-        frame_cur_exists_agents_local: np.ndarray = all_frame_cur_exists_agents_local[t]
+        frame_cur_exists_agents_local: np.ndarray = all_frame_cur_exists_agents_local[
+            t]
 
         # empty_mask: (N,)
         # - track_id 를 제외한 나머지가 전부 0이면 "관측 없는 패딩 row"로 본다.
-        frame_non_id = frame_cur_exists_agents_local.astype(np.float64, copy=False).copy()
+        frame_non_id = frame_cur_exists_agents_local.astype(np.float64,
+                                                            copy=False).copy()
         frame_non_id[:, track_id_idx] = 0.0
         empty_mask: np.ndarray = (np.abs(frame_non_id).sum(axis=-1) == 0.0)
 
         # heading: (N,)
-        heading = frame_cur_exists_agents_local[:, heading_idx].astype(np.float64, copy=False).reshape(-1)
+        heading = frame_cur_exists_agents_local[:, heading_idx].astype(
+            np.float64, copy=False).reshape(-1)
         cos_heading = np.cos(heading)
         sin_heading = np.sin(heading)
 
         # (N,) 동적 값들
-        x_local = frame_cur_exists_agents_local[:, x_idx].astype(np.float64, copy=False).reshape(-1)
-        y_local = frame_cur_exists_agents_local[:, y_idx].astype(np.float64, copy=False).reshape(-1)
-        vx_local = frame_cur_exists_agents_local[:, vx_idx].astype(np.float64, copy=False).reshape(-1)
-        vy_local = frame_cur_exists_agents_local[:, vy_idx].astype(np.float64, copy=False).reshape(-1)
-        width_local = frame_cur_exists_agents_local[:, width_idx].astype(np.float64, copy=False).reshape(-1)
-        length_local = frame_cur_exists_agents_local[:, length_idx].astype(np.float64, copy=False).reshape(-1)
+        x_local = frame_cur_exists_agents_local[:, x_idx].astype(
+            np.float64, copy=False).reshape(-1)
+        y_local = frame_cur_exists_agents_local[:, y_idx].astype(
+            np.float64, copy=False).reshape(-1)
+        vx_local = frame_cur_exists_agents_local[:, vx_idx].astype(
+            np.float64, copy=False).reshape(-1)
+        vy_local = frame_cur_exists_agents_local[:, vy_idx].astype(
+            np.float64, copy=False).reshape(-1)
+        width_local = frame_cur_exists_agents_local[:, width_idx].astype(
+            np.float64, copy=False).reshape(-1)
+        length_local = frame_cur_exists_agents_local[:, length_idx].astype(
+            np.float64, copy=False).reshape(-1)
 
         # ✅ 패딩 row는 8개 채널 전부 0으로 고정
         cos_heading[empty_mask] = 0.0
@@ -845,9 +854,9 @@ def _pack_ego_local_agents(
         all_frame_np_agents_local[t, :, 5] = vy_local
         all_frame_np_agents_local[t, :, 6] = width_local
         all_frame_np_agents_local[t, :, 7] = length_local
-        all_frame_np_agents_local[t, :, 8] = frame_cur_exists_agents_local[:, track_id_idx].astype(
-            np.float64, copy=False
-        ).reshape(-1)
+        all_frame_np_agents_local[
+            t, :, 8] = frame_cur_exists_agents_local[:, track_id_idx].astype(
+                np.float64, copy=False).reshape(-1)
 
     return all_frame_np_agents_local
 

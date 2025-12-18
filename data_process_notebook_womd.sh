@@ -7,4 +7,4 @@ export WOMD_DATA_ROOT="/home/user/womd_v1_3"
 
 ###################################
 
-python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT"
+python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" --save_folder "old"
