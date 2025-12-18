@@ -95,9 +95,9 @@ class DrawingOptions:
     LANE_boundary_vector_invalid_eps: float = 0.0
     ######## LANES ########
 
-    LANE_draw_lane_boundaries: bool = False  # check
+    LANE_draw_lane_boundaries: bool = True  # check
     LANE_boundary_width: float = 1.
-    LANE_draw_lane_centerline: bool = False  # check
+    LANE_draw_lane_centerline: bool = True  # check
     LANE_draw_npc_agent_route: bool = False
     LANE_draw_vel_limit: bool = True
     LANE_npc_agent_route_draw_mode: str = "lane"  # "centerline" / "lane"
