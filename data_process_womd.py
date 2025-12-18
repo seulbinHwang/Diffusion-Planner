@@ -3937,6 +3937,247 @@ def _worker_init(stop_event, logger_pid_val, args) -> None:
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     faulthandler.enable()
 
+from dataclasses import dataclass
+from typing import Tuple
+import time
+from tqdm import tqdm
+
+
+@dataclass
+class CacheProgress:
+    """메인 프로세스에서 캐싱 진행 상황을 누적해서 관리하는 상태 묶음입니다.
+
+    이 스크립트는 워커가 tfrecord 파일 1개를 통째로 처리하고,
+    메인 프로세스는 그 결과를 파일 단위로 받습니다.
+
+    그래서 진행률(%)과 ETA는 "파일 개수 기준"으로 정확하게 계산하고,
+    추가로 "시나리오 개수(레코드 개수)"는 파일 결과(processed/skipped/failed)를
+    누적해서 같이 보여줍니다.
+
+    Attributes:
+        split: 현재 처리 중인 split 이름 (예: "training")
+        total_files: 전체 tfrecord 파일 개수
+        start_ts: 진행 시작 시각(time.monotonic() 기준)
+        log_every_files: 몇 개 파일마다 한 번씩 진행 로그를 찍을지(대략적인 빈도)
+        min_print_interval_sec: 로그가 너무 자주 찍히는 걸 막기 위한 최소 시간 간격(초)
+
+        done_files: 완료된 tfrecord 파일 수(성공/실패 상관없이 “결과를 받은” 파일)
+        scenarios_created: 새로 npz를 만든 시나리오 수(processed 누적)
+        scenarios_skipped: 이미 npz가 있어서 건너뛴 시나리오 수(skipped 누적)
+        scenarios_failed: 처리 중 예외가 난 시나리오 수(failed 누적)
+
+        last_print_ts: 마지막으로 진행 로그를 찍은 시각(time.monotonic())
+    """
+    split: str
+    total_files: int
+    start_ts: float
+    log_every_files: int
+    min_print_interval_sec: float = 5.0
+
+    done_files: int = 0
+    scenarios_created: int = 0
+    scenarios_skipped: int = 0
+    scenarios_failed: int = 0
+
+    last_print_ts: float = 0.0
+
+
+def _format_hhmm(seconds: float) -> str:
+    """초 단위 시간을 '00h00m' 형태로 바꿔서 보기 좋게 만듭니다.
+
+    Args:
+        seconds: 초 단위 시간(실수 가능)
+
+    Returns:
+        '00h00m' 형태 문자열.
+        seconds가 0 이하이거나 계산이 어렵다면 '--:--'를 반환합니다.
+    """
+    sec = float(seconds)
+    if not (sec > 0.0):
+        return "--:--"
+    hours = int(sec // 3600.0)
+    minutes = int((sec % 3600.0) // 60.0)
+    return f"{hours:02d}h{minutes:02d}m"
+
+
+def _compute_eta_seconds(done: int, total: int, elapsed_sec: float) -> float:
+    """현재 속도를 기준으로 남은 시간을 초 단위로 추정합니다.
+
+    Args:
+        done: 완료된 개수
+        total: 전체 개수
+        elapsed_sec: 경과 시간(초)
+
+    Returns:
+        남은 시간(초). 추정이 불가능하면 0.0을 반환합니다.
+    """
+    done_i = int(done)
+    total_i = int(total)
+    elapsed = float(elapsed_sec)
+
+    if total_i <= 0 or done_i <= 0:
+        return 0.0
+    if done_i >= total_i:
+        return 0.0
+    if not (elapsed > 0.0):
+        return 0.0
+
+    speed = float(done_i) / elapsed  # files/sec
+    if not (speed > 0.0):
+        return 0.0
+
+    remain = total_i - done_i
+    return float(remain) / speed
+
+
+def _should_print_progress(
+    done: int,
+    total: int,
+    log_every: int,
+    now_ts: float,
+    last_print_ts: float,
+    min_interval_sec: float,
+) -> bool:
+    """진행 로그를 지금 찍을지 여부를 결정합니다.
+
+    너무 많은 로그가 찍히면 보기 어려워지므로,
+    아래 조건 중 하나를 만족할 때만 찍습니다.
+
+    - 첫 결과(done==1)
+    - 마지막(done==total)
+    - log_every 간격마다(예: 0.1% 정도 간격)
+    - 단, 위 조건을 만족해도 min_interval_sec보다 너무 빠르면 잠깐 기다립니다.
+      (마지막 로그는 무조건 찍습니다.)
+
+    Args:
+        done: 현재 완료 개수
+        total: 전체 개수
+        log_every: 몇 개마다 찍을지
+        now_ts: 현재 시각(time.monotonic())
+        last_print_ts: 마지막 출력 시각(time.monotonic())
+        min_interval_sec: 최소 출력 간격(초)
+
+    Returns:
+        출력하면 True, 아니면 False
+    """
+    done_i = int(done)
+    total_i = int(total)
+    every = max(1, int(log_every))
+
+    if total_i <= 0:
+        return False
+
+    if done_i <= 1:
+        return True
+    if done_i >= total_i:
+        return True
+    if done_i % every != 0:
+        return False
+
+    # 너무 빠른 연속 출력 방지
+    if float(now_ts - last_print_ts) < float(min_interval_sec):
+        return False
+    return True
+
+
+def _print_cache_line(line: str) -> None:
+    """tqdm 진행바가 깨지지 않게 한 줄 로그를 출력합니다.
+
+    Args:
+        line: 출력할 한 줄 문자열
+    """
+    # tqdm 환경에서도 줄바꿈 출력이 깔끔하도록 tqdm.write 사용
+    tqdm.write(line)
+    try:
+        # tqdm.write는 내부적으로 flush를 하지만, 로그 파일로 리다이렉트할 때를 대비해 한 번 더.
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def print_cache_start(
+    progress: CacheProgress,
+    num_workers: int,
+    overwrite: bool,
+    caching_dir: str,
+) -> None:
+    """split 캐싱 시작 시점에 '총량'과 설정을 한 번 출력합니다.
+
+    Args:
+        progress: 진행 상태(초기화된 상태)
+        num_workers: 워커 프로세스 수
+        overwrite: overwrite 여부
+        caching_dir: 캐시 저장 루트 폴더 경로(문자열)
+    """
+    _print_cache_line(
+        f"[CACHE] start split={progress.split}: "
+        f"{progress.total_files:,} tfrecord files "
+        f"(workers={int(num_workers)}, overwrite={bool(overwrite)}) | "
+        f"out={caching_dir}"
+    )
+
+
+def update_and_maybe_print_cache_progress(
+    progress: CacheProgress,
+    file_result: Tuple[str, int, int, int, str],
+) -> None:
+    """tfrecord 파일 1개 처리 결과를 누적하고, 필요할 때 진행 로그를 출력합니다.
+
+    Args:
+        progress: 누적 상태
+        file_result: process_one_tfrecord_file()의 반환값
+            (tfrecord_path, processed, skipped, failed, message)
+            - processed/skipped/failed는 "시나리오 개수"입니다.
+    """
+    _, processed, skipped, failed, _ = file_result
+
+    progress.done_files += 1
+    progress.scenarios_created += int(processed)
+    progress.scenarios_skipped += int(skipped)
+    progress.scenarios_failed += int(failed)
+
+    now_ts = time.monotonic()
+    elapsed = float(now_ts - progress.start_ts)
+    eta_sec = _compute_eta_seconds(
+        done=progress.done_files,
+        total=progress.total_files,
+        elapsed_sec=elapsed,
+    )
+
+    if not _should_print_progress(
+        done=progress.done_files,
+        total=progress.total_files,
+        log_every=progress.log_every_files,
+        now_ts=now_ts,
+        last_print_ts=progress.last_print_ts,
+        min_interval_sec=progress.min_print_interval_sec,
+    ):
+        return
+
+    progress.last_print_ts = now_ts
+
+    pct = 0.0
+    if progress.total_files > 0:
+        pct = 100.0 * float(progress.done_files) / float(progress.total_files)
+
+    # 시나리오 처리량(속도)도 같이 보여주면 전체 시간 감이 빨리 옵니다.
+    scenarios_seen = int(progress.scenarios_created + progress.scenarios_skipped + progress.scenarios_failed)
+    scen_per_sec = float(scenarios_seen) / elapsed if elapsed > 0.0 else 0.0
+
+    eta_str = "--:--" if progress.done_files >= progress.total_files else _format_hhmm(eta_sec)
+
+    _print_cache_line(
+        f"[CACHE] {progress.split} "
+        f"{progress.done_files:,}/{progress.total_files:,} "
+        f"({pct:5.1f}%) | "
+        f"elapsed {_format_hhmm(elapsed)}, "
+        f"ETA {eta_str} | "
+        f"scenarios seen {scenarios_seen:,} "
+        f"(new {progress.scenarios_created:,}, "
+        f"skip {progress.scenarios_skipped:,}, "
+        f"fail {progress.scenarios_failed:,}) | "
+        f"scen/s {scen_per_sec:.2f}"
+    )
 
 # =========================
 # split 전체 캐싱
@@ -3989,6 +4230,21 @@ def cache_all_splits(
             results: List[Tuple[str, int, int, int, str]] = []
             tfrecord_paths = [p.as_posix() for p in tfrecord_files]
 
+            # ✅ [추가] split 단위 진행률(파일 기준 %/ETA + 시나리오 누적량) 초기화/시작 로그
+            progress = CacheProgress(
+                split=str(split),
+                total_files=int(len(tfrecord_paths)),
+                start_ts=time.monotonic(),
+                log_every_files=max(1, int(len(tfrecord_paths)) // 3000),  # data_process.py의 감도(0.1% 수준)와 유사
+                min_print_interval_sec=5.0,  # 너무 잦은 출력 방지(필요하면 10~30으로 늘려도 됨)
+                last_print_ts=time.monotonic(),
+            )
+            print_cache_start(
+                progress=progress,
+                num_workers=int(num_workers),
+                overwrite=bool(overwrite),
+                caching_dir=caching_dir.as_posix(),
+            )
             try:
                 logger_pid_val = ctx.Value('i', 0)  # 0이면 아직 아무도 로거 선점 안 함
                 pool = ctx.Pool(
@@ -4032,6 +4288,11 @@ def cache_all_splits(
 
                         results.append(res)
                         pbar.update(1)
+                        # ✅ [추가] 파일 1개 결과를 누적하고, 종종 [CACHE] 진행 로그 출력
+                        update_and_maybe_print_cache_progress(
+                            progress=progress,
+                            file_result=res,
+                        )
                 finally:
                     pbar.close()
 
