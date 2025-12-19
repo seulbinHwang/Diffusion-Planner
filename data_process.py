@@ -359,7 +359,6 @@ def _plot_and_save_histograms(
 
 
 # [추가] 전역 CPU 고정값(기본 128). 환경변수 DP_MAX_CPUS로 덮어쓰기 가능
-DP_MAX_CPUS = int(os.environ.get("DP_MAX_CPUS", "48"))
 
 # [추가] 과다 스레딩 방지(각 워커 프로세스 내부 스레드 1로 고정)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -368,25 +367,12 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("BLIS_NUM_THREADS", "1")
 
-
-def available_cpu_count() -> int:
+def get_executor_workers(args: argparse.Namespace) -> int:
+    """SingleMachineParallelExecutor에서 사용할 worker 수를 결정합니다.
+    우선순위: CLI의 --num_workers 값을 그대로 사용합니다.
     """
-    컨테이너/호스트 어디서 실행해도
-    현재 프로세스에 **실제로 할당된 논리 CPU 개수**를 반환.
-    1) Linux & Python 3.9+ : os.sched_getaffinity(0)
-    2) 그 외 : os.cpu_count()  (fallback)
-    """
-    print("Determining available CPU count...:", DP_MAX_CPUS)
-    return DP_MAX_CPUS
-    try:
-        return_ = len(os.sched_getaffinity(0))  # 현재 프로세스에 할당된 CPU 개수
-        print(f"Available CPUs: {return_}")  # 디버그용
-        return return_  # cgroup cpuset 존중
-    except AttributeError:
-        print("Using os.cpu_count() as fallback for CPU count.")
-        return_ = os.cpu_count()  # 전체 CPU 개수
-        print(f"Total CPUs: {return_}")  # 디버그용
-        return return_ or 1  # 최소 1
+    n = int(getattr(args, "num_workers", 0) or 0)
+    return max(1, n)
 
 
 import shutil
@@ -689,7 +675,7 @@ def build_scenarios_from_args(args: argparse.Namespace,
     ))
     # 5) 시나리오 생성
     loader_pool = SingleMachineParallelExecutor(
-        use_process_pool=False, max_workers=available_cpu_count())
+        use_process_pool=False, max_workers=get_executor_workers(args))
     scenarios = get_or_load_scenarios(
         builder=builder,
         scenario_filter=scenario_filter,
@@ -704,18 +690,12 @@ def build_scenarios_from_args(args: argparse.Namespace,
     return list(scenarios)
 
 
-def create_proc_pool() -> SingleMachineParallelExecutor:
-    """시나리오 캐싱에 사용할 프로세스 풀을 만든다.
-
-    Returns:
-        SingleMachineParallelExecutor: use_process_pool=True 로 만든 실행기.
-    """
+def create_proc_pool(args: argparse.Namespace) -> SingleMachineParallelExecutor:
     proc_pool = SingleMachineParallelExecutor(
         use_process_pool=True,
-        max_workers=available_cpu_count(),
+        max_workers=get_executor_workers(args),
     )
     return proc_pool
-
 
 def compute_remaining_scenarios(
     scenarios: List[Any],
@@ -819,6 +799,7 @@ def run_parallel_caching2(
     finally:
         # 기존 코드와 동일하게 풀 정리
         proc_pool._executor.shutdown(wait=True)
+
 def run_parallel_caching(
     remaining: List[Any],
     args: argparse.Namespace,
@@ -926,7 +907,7 @@ def main() -> None:
     processed_npz_set = get_processed_npz_set(args)
     log_names = load_train_log_names(args)
     scenarios = build_scenarios_from_args(args, log_names)
-    proc_pool = create_proc_pool()
+    proc_pool = create_proc_pool(args)
     remaining = compute_remaining_scenarios(scenarios, processed_npz_set)
     run_parallel_caching(remaining, args, proc_pool)
 
