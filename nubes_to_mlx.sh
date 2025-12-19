@@ -10,6 +10,8 @@ RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
 TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 NUBES_NUPLAN_FOLDER_NAME="processed_nuplan_final_150"
+NUBES_WOMD_FOLDER_NAME="processed_womd_final_150"
+NUBES_WOMD_SPLIT_NAME="training"
 ###################################
 #
 # ---------------- Preflight clean-up ----------------
@@ -47,6 +49,15 @@ nubescli dir-download \
     -s \
     --no-progress
 echo "[END] Nuplan dataset / NUBES -> PVC "
+
+echo "[Start] WOMD dataset / NUBES -> PVC "
+nubescli dir-download \
+    labs-mlops/ad/research/pnc/hsb/dataset/${NUBES_NUPLAN_FOLDER_NAME} \
+    "$TRAIN_SET_PATH" \
+    -j "$(nproc)" \
+    -s \
+    --no-progress
+echo "[END] WOMD dataset / NUBES -> PVC "
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 

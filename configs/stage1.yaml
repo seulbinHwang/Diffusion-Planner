@@ -1,7 +1,7 @@
 # configs/stage1.yaml
 name: stage1_w_const_0.02_no_8_bit_opt
 
-batch_size: 360 # 512
+batch_size: 1024 # 512
 train_epochs: 234 #234           # 전체 360 중 약 65%
 
 learning_rate: 5.0e-4

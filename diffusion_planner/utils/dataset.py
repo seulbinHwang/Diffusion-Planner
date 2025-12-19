@@ -31,13 +31,14 @@ def _fix_legacy_neighbor_future_len_bug(
 
 class DiffusionPlannerData(Dataset):
 
-    def __init__(self, data_dir, data_list):
+    def __init__(self, data_dir, data_list, future_len):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
         """
         self.data_dir = data_dir
         self.data_list = openjson(data_list)
+        self._future_len = future_len
 
     def __len__(self):
         return len(self.data_list)
@@ -74,6 +75,7 @@ class DiffusionPlannerData(Dataset):
         if data is None:
             # 이 샘플은 건너뛰고, DataLoader가 다시 뽑도록 예외를 던지거나
             raise IndexError(f"Corrupted sample at index {idx}")
+        # 🔧 [임시 버그 패치] 구버전 캐시의 neighbor_future_gt_3_dim off-by-one 보정
         output_keys: List[str] = [
             "ego_agent_past",
             "ego_future_gt_3_dim",
@@ -102,9 +104,9 @@ class DiffusionPlannerData(Dataset):
             value = data[src_key]
 
             # 🔧 [임시 버그 패치] neighbor_future_gt_3_dim 길이 보정
-            # if out_key == "near_future_gt_3_dim":
-            #     value = _fix_legacy_neighbor_future_len_bug(
-            #         value, self._future_len)
+            if out_key == "near_future_gt_3_dim":
+                value = _fix_legacy_neighbor_future_len_bug(
+                    value, self._future_len)
 
             if out_key == "agent_route_lane_order":
                 value = value.astype("int64")

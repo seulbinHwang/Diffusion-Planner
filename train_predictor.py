@@ -2102,6 +2102,7 @@ def _build_dataset_and_sampler(
     train_set = DiffusionPlannerData(
         args.train_set,  # 예: "/mnt/nuplan/dataset/processed"
         args.train_set_list,  # 예: diffusion_planner_training.json
+        args.future_len,
     )
 
     train_sampler = DistributedSampler(
