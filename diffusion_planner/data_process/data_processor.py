@@ -1710,44 +1710,6 @@ class DataProcessor(object):
 
     def save_to_disk(self, dir: str, final_file_name: str,
                      data: Dict[str, np.ndarray]) -> None:
-        """샘플 데이터를 안전하게 디스크에 저장한다(.npz, 원자적 저장 방식).
-
-        이 함수는 한 시나리오에서 만들어진 모든 넘파이 배열과 메타 정보를
-        하나의 `.npz` 파일로 저장한다. 저장 과정에서 **부분만 써진 깨진 파일**이
-        남지 않도록, 항상 임시 파일(`.tmp`)에 먼저 쓴 뒤 최종 파일명으로 교체한다.
-
-        파일 이름 규칙
-        -------------
-        - 최종 경로:
-            `<dir>/<map_name>_<token>.npz`
-        - 예:
-            >>> dir = "/tmp/nuplan_cache"
-            >>> data["map_name"] = "us_ma"
-            >>> data["token"] = "abcd1234"
-            → "/tmp/nuplan_cache/us_ma_abcd1234.npz"
-
-        저장 방식(알고리즘)
-        ------------------
-        1) 저장 폴더가 없다면 `os.makedirs(dir, exist_ok=True)` 로 만든다.
-        2) 최종 파일 경로를 `<dir>/<map_name>_<token>.npz` 로 만든다.
-        4) 임시 파일에 `np.savez` 로 모든 데이터를 쓴 뒤:
-           - `f.flush()` 로 버퍼를 비우고
-           - `os.fsync(f.fileno())` 로 디스크에 강제로 기록한다.
-        5) 모든 것이 성공하면 `os.replace(tmp_path, final_file_name)` 로
-           임시 파일을 최종 파일 이름으로 한 번에 교체한다.
-           → 이 순간만 파일이 바뀌므로, 중간 상태의 깨진 파일이 보이지 않는다.
-        6) 도중에 예외가 나면:
-           - 최종 파일은 건드리지 않고
-           - 남아 있을 수 있는 임시 파일만 지운 뒤 예외를 다시 올린다.
-
-        Args:
-            dir (str):
-                - npz 파일을 저장할 디렉터리 경로.
-                - 존재하지 않으면 내부에서 자동으로 생성한다.
-            data (Dict[str, np.ndarray]):
-                - 저장할 키-값 딕셔너리.
-
-        """
         final_path_npz = f"{final_file_name}.npz"
         final_path = f"{dir}/{final_path_npz}"
 
@@ -1755,17 +1717,16 @@ class DataProcessor(object):
         tmp_path = final_path + ".tmp"
 
         try:
-
-            # 1) 임시 파일에 먼저 완전히 기록
+            # 1) 임시 파일에 먼저 완전히 기록 (✅ 압축 저장)
             with open(tmp_path, "wb") as f:
-                np.savez(f, **data)
+                np.savez_compressed(f, **data)  # <- 여기만 변경
                 f.flush()
-                os.fsync(f.fileno())  # 디스크 동기화(리눅스에서 유효)
+                os.fsync(f.fileno())
 
-            # 2) 원자적 치환(부분 파일이 최종 경로에 나타나지 않음)
+            # 2) 원자적 치환
             os.replace(tmp_path, final_path)
+
         except Exception:
-            # 실패 시 임시파일만 제거(최종 파일은 손대지 않음)
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)

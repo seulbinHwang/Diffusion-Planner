@@ -15,5 +15,5 @@ python data_process.py \
 --map_path $NUPLAN_MAP_PATH \
 --save_path $TRAIN_SET_PATH \
 --total_scenarios 12 \
---save_image true
+--save_image false
 
