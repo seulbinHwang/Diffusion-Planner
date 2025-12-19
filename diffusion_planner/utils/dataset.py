@@ -5,40 +5,16 @@ from diffusion_planner.utils.train_utils import openjson, opendata
 from typing import Dict, Any, List  # ← 추가
 
 
-def _fix_legacy_neighbor_future_len_bug(
-    arr,
-    expected_future_len: int,
-):
-    """구버전 캐시의 (N, future_len+1, 3) → (N, future_len, 3) 보정용 임시 함수."""
-    if not hasattr(arr, "shape") or not hasattr(arr, "ndim"):
-        return arr
-    if arr.ndim != 3:
-        return arr
-
-    _, time_len, _ = arr.shape
-
-    # 이미 정상 길이면 그대로
-    if time_len == expected_future_len:
-        return arr
-
-    # 옛날 버그: 현재+미래 81프레임(= future_len+1)으로 저장된 경우
-    if time_len == expected_future_len + 1:
-        return arr[:, 1:, :]  # 0번째(현재) frame 버리고 미래 future_len개만 사용
-
-    # 그 외 이상한 길이는 건드리지 않음 (문제 있으면 그대로 에러 나게 둠)
-    return arr
-
 
 class DiffusionPlannerData(Dataset):
 
-    def __init__(self, data_dir, data_list, future_len):
+    def __init__(self, data_dir, data_list):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
         """
         self.data_dir = data_dir
         self.data_list = openjson(data_list)
-        self._future_len = future_len
 
     def __len__(self):
         return len(self.data_list)
@@ -102,12 +78,6 @@ class DiffusionPlannerData(Dataset):
         for out_key in output_keys:
             src_key = rename_source_map.get(out_key, out_key)
             value = data[src_key]
-
-            # 🔧 [임시 버그 패치] neighbor_future_gt_3_dim 길이 보정
-            if out_key == "near_future_gt_3_dim":
-                value = _fix_legacy_neighbor_future_len_bug(
-                    value, self._future_len)
-
             if out_key == "agent_route_lane_order":
                 value = value.astype("int64")
 
