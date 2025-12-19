@@ -169,7 +169,7 @@ def get_args():
     parser.add_argument('--lane_len',
                         type=int,
                         help='number of lane point',
-                        default=10)
+                        default=20)
     parser.add_argument('--lane_state_dim',
                         type=int,
                         help='state dim for lane point',
