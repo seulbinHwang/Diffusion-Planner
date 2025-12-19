@@ -52,7 +52,7 @@ echo "[END] Nuplan dataset / NUBES -> PVC "
 
 echo "[Start] WOMD dataset / NUBES -> PVC "
 nubescli dir-download \
-    labs-mlops/ad/research/pnc/hsb/dataset/${NUBES_NUPLAN_FOLDER_NAME} \
+    labs-mlops/ad/research/pnc/hsb/dataset/${NUBES_WOMD_FOLDER_NAME0}/${NUBES_WOMD_SPLIT_NAME} \
     "$TRAIN_SET_PATH" \
     -j "$(nproc)" \
     -s \
