@@ -440,9 +440,12 @@ def run_scenario(
                     f"{file_name}: invalid npz (size={ok_size}, npz={ok_npz})")
 
     except Exception:
-        # ── 4) 오류 발생 시 불완전 파일 제거 후 예외 전파 ──────
+        # 최종/임시 파일 모두 정리
+        tmp_path = final_filepath + ".tmp"
         if os.path.exists(final_filepath):
             os.remove(final_filepath)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         raise
 
 
@@ -895,6 +898,15 @@ def maybe_save_statistics(args: argparse.Namespace) -> None:
             stats, hist_png, title_prefix="Diffusion-world model")
         print(f"Saved histogram PNG: {hist_png}")
 
+def cleanup_npz_tmp(save_path: str) -> None:
+    if not os.path.isdir(save_path):
+        return
+    for name in os.listdir(save_path):
+        if name.endswith(".npz.tmp"):  # save_to_disk가 만드는 형태
+            try:
+                os.remove(os.path.join(save_path, name))
+            except Exception:
+                pass
 
 def main() -> None:
     """data_process.py의 전체 흐름을 단계별로 실행한다."""
@@ -904,6 +916,7 @@ def main() -> None:
     ctrl_run = None
 
     prepare_save_path(args)
+    cleanup_npz_tmp(args.save_path)
     processed_npz_set = get_processed_npz_set(args)
     log_names = load_train_log_names(args)
     scenarios = build_scenarios_from_args(args, log_names)

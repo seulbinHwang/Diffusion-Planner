@@ -5,6 +5,8 @@ import time
 
 matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
+import contextlib
+
 from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanScenario
 from nuplan.common.maps.nuplan_map.nuplan_map import NuPlanMap
 from nuplan.planning.simulation.history.simulation_history_buffer import SimulationHistoryBuffer
@@ -1708,28 +1710,23 @@ class DataProcessor(object):
 
         return cur_fut_agents_world_8_list, token_to_id
 
+
     def save_to_disk(self, dir: str, final_file_name: str,
                      data: Dict[str, np.ndarray]) -> None:
-        final_path_npz = f"{final_file_name}.npz"
-        final_path = f"{dir}/{final_path_npz}"
-
-        os.makedirs(dir, exist_ok=True)
+        final_path = f"{dir}/{final_file_name}.npz"
         tmp_path = final_path + ".tmp"
 
+        os.makedirs(dir, exist_ok=True)
+
         try:
-            # 1) 임시 파일에 먼저 완전히 기록 (✅ 압축 저장)
             with open(tmp_path, "wb") as f:
-                np.savez_compressed(f, **data)  # <- 여기만 변경
+                np.savez_compressed(f, **data)
                 f.flush()
                 os.fsync(f.fileno())
-
-            # 2) 원자적 치환
             os.replace(tmp_path, final_path)
 
-        except Exception:
-            if os.path.exists(tmp_path):
-                try:
+        except BaseException:  # ✅ Ctrl+C(KeyboardInterrupt)도 여기로 들어옴
+            with contextlib.suppress(Exception):
+                if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-                except:
-                    pass
             raise
