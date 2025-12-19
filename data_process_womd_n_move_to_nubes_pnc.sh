@@ -20,7 +20,7 @@ echo "Step 1: Running data processing..."
 # You can modify these paths if needed.
 WOMD_DATA_ROOT="/media/user/E/dataset/womd_v1_3"
 # 공통 경로 변수 (한 곳만 바꾸면 전체에 반영됨)
-TRAIN_SET_NAME="processed_womd_final"
+TRAIN_SET_NAME="processed_womd_final_150"
 SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 
 # Run the data processing script
