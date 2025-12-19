@@ -2,6 +2,14 @@
 import os as _os
 import args_util
 from typing import Dict, List, Union
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=".*invalid value encountered in cast.*",
+    category=RuntimeWarning,
+    module=r"nuplan\.common\.maps\.nuplan_map\.utils",
+)
 
 
 _os.environ.setdefault("OMP_NUM_THREADS", "1")
