@@ -3752,36 +3752,40 @@ def build_cache_dict_for_scenario(
 
     cache_dict: Dict[str, Any] = {
         "scenario_id": str(scenario.scenario_id),
-        "ego_agent_past": ego_agent_past,  # (21,11)
-        "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (80,3)
-        "ego_future_gt_11_dim": ego_future_gt_11_dim,  # (80,11)
+
+        "ego_agent_past": ego_agent_past,  # (21,11)  # womd
+        "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (80,3)  # womd
+        "ego_future_gt_11_dim": ego_future_gt_11_dim,  # (80,11)  # womd
 
         "neighbor_role": neighbor_role,  # (A,2) bool
         "neighbor_id": neighbor_id,  # (A,)
         "neighbor_z": neighbor_z,  # (A,)
 
         "neighbor_shape": neighbor_shape,  # (A,3)
-        "neighbor_agents_past": neighbor_agents_past,  # (A,21,11)
-        "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,  # (A,80,3)
+
+        "neighbor_agents_past": neighbor_agents_past,  # (A,21,11)  # womd
+        "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,  # (A,80,3)  # womd
+
         "neighbor_track_token": neighbor_track_token,  # ✅ 추가: List[str], 길이 A
 
-        "stop_sign_points": stop_sign_points,  # (Ns,10,2)
-        "crosswalk_points": crosswalk_points,  # (Nc,10,2)
-        "speed_bump_points": speed_bump_points,  # (Nb,10,2)
+        "stop_sign_points": stop_sign_points,  # (Ns,10,2)  # womd
+        "crosswalk_points": crosswalk_points,  # (Nc,10,2)  # womd
+        "speed_bump_points": speed_bump_points,  # (Nb,10,2)  # womd
+        "driveway": driveway,  # (D,10,2) # womd
 
-        "lanes": lanes_arr,  # (L,10,12)
-        "lanes_speed_limit": lanes_speed_limit,  # (L,1)
-        "lanes_has_speed_limit": lanes_has_speed_limit,  # (L,1)
+        "lanes": lanes_arr,  # (L,10,12)  # womd
+        "lanes_speed_limit": lanes_speed_limit,  # (L,1) # womd
+        "lanes_has_speed_limit": lanes_has_speed_limit,  # (L,1) # womd
         "lane_light": lane_light,  # (L,4)
-        # ✅ 추가 캐싱
+        # ✅ 추가 캐싱ㅇ
         "lane_type": lane_type,  # (L,4)
-        "left_line_type": left_line_type,  # (L,10)
+        "left_line_type": left_line_type,  # (L,13)
 
         # 요구사항 이름이 right_lne_type로 되어 있어서 key는 그렇게 저장
-        "right_line_type": right_line_type,  # (L,10)
+        "right_line_type": right_line_type,  # (L,13)
+
         "road_edge": road_edge,  # (E,10,2)
         "road_edge_type": road_edge_type,  # (E,3)
-        "driveway": driveway,  # (D,10,2)
     }
     return cache_dict
 

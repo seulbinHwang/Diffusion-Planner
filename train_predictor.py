@@ -852,10 +852,6 @@ class DiffusionPlannerCollate:
                 - center_crop_radius_m (float, 선택)
                 - center_crop_mode (str, 'npc' / 'ego' / 'none')
         """
-        self.caching_max_agent_num: int = int(args.caching_max_agent_num)
-        self.caching_max_lane_num: int = int(args.caching_max_lane_num)
-        self.caching_max_static_num: int = int(args.caching_max_static_num)
-
         # 중심 기준 크로핑 옵션
         # - center_crop_radius_m <= 0: 크로핑 사용 안 함
         # - center_crop_mode: "npc" → 임의 NPC 1대를 기준, "ego" → ego 기준
@@ -1445,128 +1441,6 @@ class DiffusionPlannerCollate:
     # ------------------------------------------------------------------
     # 0) 중심 기준 배치 크로핑 (배치 연산 + 얇은 for 루프)
     # ------------------------------------------------------------------
-    def _center_crop_batch_batched(
-        self,
-        batch: List[Dict[str, Any]],
-    ) -> None:
-        """배치 전체를 한 번에 보고, 중심 기준 K m 안의 토큰만 남긴다.
-
-        무거운 계산은 numpy 배치 연산으로 처리하고,
-        마지막에 샘플별 슬라이싱만 for 루프에서 수행한다.
-        """
-        batch_size: int = len(batch)
-        if batch_size == 0:
-            return
-
-        (
-            agent_len_arr,
-            lane_len_arr,
-            route_lane_len_arr,
-            static_len_arr,
-        ) = self._compute_object_lengths(batch)
-
-        (
-            max_agent_num,
-            max_lane_num,
-            max_route_lane_num,
-            max_static_num,
-            lane_len,
-            route_lane_len,
-        ) = self._compute_max_counts_and_lane_len(
-            batch=batch,
-            agent_len_arr=agent_len_arr,
-            lane_len_arr=lane_len_arr,
-            route_lane_len_arr=route_lane_len_arr,
-            static_len_arr=static_len_arr,
-        )
-
-        # center_xy: (B, 2) 초기 중심(ego와 동일)
-        _, center_xy = self._build_ego_and_center_xy(batch)
-        """
-            - agents_xy: (B, max_agent_num, 2)
-            - lanes_xy: (B, max_lane_num, lane_len, 2)
-            - route_lanes_xy: (B, max_route_lane_num, route_lane_len, 2)
-            - static_xy: (B, max_static_num, 2)
-        """
-        (
-            agents_xy,
-            lanes_xy,
-            route_lanes_xy,
-            static_xy,
-        ) = self._build_positions_arrays(
-            batch=batch,
-            agent_len_arr=agent_len_arr,
-            lane_len_arr=lane_len_arr,
-            route_lane_len_arr=route_lane_len_arr,
-            static_len_arr=static_len_arr,
-            max_agent_num=max_agent_num,
-            max_lane_num=max_lane_num,
-            max_route_lane_num=max_route_lane_num,
-            max_static_num=max_static_num,
-            lane_len=lane_len,
-            route_lane_len=route_lane_len,
-        )
-        """
-            - agent_valid_mask: (B, max_agent_num) True=해당 칸에 agent 있음
-        """
-        agent_valid_mask, _ = self._build_agent_valid_mask(
-            agent_len_arr=agent_len_arr,  # (B,)
-            max_agent_num=max_agent_num,  # int
-        )
-        """
-            - center_xy: (B, 2) 새 중심 좌표.
-            - center_agent_idx: (B,) 샘플마다 선택된 중심 agent 인덱스.
-        """
-        center_xy, center_agent_idx = self._maybe_update_center_by_npc(
-            center_xy=center_xy,  # (B, 2)
-            agents_xy=agents_xy,  # (B, max_agent_num, 2)
-            agent_len_arr=agent_len_arr,  # (B,)
-            agent_valid_mask=agent_valid_mask,  # (B, max_agent_num)
-            max_agent_num=max_agent_num,  # int
-        )
-        _ = center_agent_idx  # 사용하지 않는 값이지만 shape: (B,)
-
-        # keep_agent_mask: (B, max_agent_num)
-        keep_agent_mask = self._compute_keep_agent_mask(
-            center_xy=center_xy,
-            agents_xy=agents_xy,
-            agent_len_arr=agent_len_arr,
-            max_agent_num=max_agent_num,
-            agent_valid_mask=agent_valid_mask,
-        )
-        # keep_lane_mask: (B, max_lane_num)
-        keep_lane_mask = self._compute_keep_lane_mask(
-            center_xy=center_xy,
-            lanes_xy=lanes_xy,
-            lane_len_arr=lane_len_arr,
-            max_lane_num=max_lane_num,
-        )
-        # keep_route_lane_mask: (B, max_route_lane_num)
-        keep_route_lane_mask = self._compute_keep_route_lane_mask(
-            center_xy=center_xy,
-            route_lanes_xy=route_lanes_xy,
-            route_lane_len_arr=route_lane_len_arr,
-            max_route_lane_num=max_route_lane_num,
-        )
-        # keep_static_mask: (B, max_static_num)
-        keep_static_mask = self._compute_keep_static_mask(
-            center_xy=center_xy,
-            static_xy=static_xy,
-            static_len_arr=static_len_arr,
-            max_static_num=max_static_num,
-        )
-
-        self._apply_keep_masks_to_batch(
-            batch=batch,
-            agent_len_arr=agent_len_arr,
-            lane_len_arr=lane_len_arr,
-            route_lane_len_arr=route_lane_len_arr,
-            static_len_arr=static_len_arr,
-            keep_agent_mask=keep_agent_mask,  # (B, max_agent_num)
-            keep_lane_mask=keep_lane_mask,  # (B, max_lane_num)
-            keep_route_lane_mask=keep_route_lane_mask,  # (B, max_route_lane_num)
-            keep_static_mask=keep_static_mask,  # (B, max_static_num)
-        )
 
     # ------------------------------------------------------------------
     # 1) 고정 shape 텐서들 스택
@@ -1664,202 +1538,1186 @@ class DiffusionPlannerCollate:
 
         return out
 
-    # ------------------------------------------------------------------
-    # 4-1) 배치 내 최대 길이 계산
-    # ------------------------------------------------------------------
-    def _compute_batch_max_lengths(
-        self,
-        batch: List[Dict[str, Any]],
-    ) -> Tuple[int, int, int, int]:
-        """배치 안에서 agent / lane / route / static 최대 개수를 계산한다.
+
+
+
+    _FIXED_STACK_KEYS: Tuple[str, ...] = (
+        "ego_agent_past",
+        "ego_future_gt_3_dim",
+        "planner_future_11_dim",
+        "ego_agent_past_is_valid",
+        "ego_future_gt_is_valid",
+    )
+
+    def _is_collatable_value(self, value: Any) -> bool:
+        """이 값이 collate 대상(텐서로 묶을 수 있는 값)인지 빠르게 판별합니다.
+
+        이 함수의 목적
+        ------------
+        collate 단계에서는 "배치 텐서로 묶을 수 있는 값"만 모아야 안전합니다.
+        예를 들어 문자열(str), dict 같은 값까지 같이 묶으려 하면 학습 코드에서
+        `.to(device)` 같은 처리가 깨질 수 있습니다.
+
+        허용하는 값의 형태
+        ----------------
+        - None (데이터가 없는 경우. 이 경우는 0 padding으로 처리할 수 있습니다)
+        - torch.Tensor
+        - numpy.ndarray
+        - 숫자 스칼라(int/float/bool, numpy scalar 포함)
+        - 숫자 리스트/튜플(예: [1,2,3] 같은 값)  # np.asarray로 변환 가능하다고 가정
 
         Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
+            value: 샘플 dict 안의 어떤 값.
 
         Returns:
-            Tuple[int, int, int, int]:
-                - data_max_agent_num
-                - data_max_lane_num
-                - data_max_route_num
-                - data_max_static_num
+            bool:
+                - True: 텐서로 묶어서 반환 가능한 값
+                - False: collate 결과에 넣지 않는 값(예: 문자열 등)
         """
-        data_max_agent_num = max(
-            sample["neighbor_agents_past"].shape[0] for sample in batch)
-        data_max_lane_num = max(sample["lanes"].shape[0] for sample in batch)
-        data_max_route_num = max(
-            sample["route_lanes"].shape[0] for sample in batch)
-        data_max_static_num = max(
-            sample["static_objects"].shape[0] for sample in batch)
-        return (
-            data_max_agent_num,
-            data_max_lane_num,
-            data_max_route_num,
-            data_max_static_num,
-        )
+        if value is None:
+            return True
+        if isinstance(value, torch.Tensor):
+            return True
+        if isinstance(value, np.ndarray):
+            return True
+        if isinstance(value, (bool, int, float, np.number)):
+            return True
+        if isinstance(value, (list, tuple)):
+            # 숫자 리스트/튜플일 가능성이 높으므로 허용
+            return True
+        return False
 
-    # ------------------------------------------------------------------
-    # 4-2) 상한과의 정합성 체크
-    # ------------------------------------------------------------------
-    def _check_length_limits(
-        self,
-        data_max_agent_num: int,
-        data_max_lane_num: int,
-        data_max_route_num: int,
-        data_max_static_num: int,
-    ) -> None:
-        """배치 최대 개수가 설정된 상한을 넘지 않는지 확인한다.
+    def _get_value_shape(self, value: Any) -> Tuple[int, ...]:
+        """입력 값의 shape를 튜플로 얻습니다.
 
         Args:
-            data_max_agent_num (int): 배치 내 최대 agent 수.
-            data_max_lane_num (int): 배치 내 최대 lane 수.
-            data_max_route_num (int): 배치 내 최대 route 수.
-            data_max_static_num (int): 배치 내 최대 static 수.
+            value:
+                - torch.Tensor 또는 numpy.ndarray 또는 숫자 리스트/튜플/스칼라.
 
-        Raises:
-            ValueError: 상한을 넘는 경우.
+        Returns:
+            Tuple[int, ...]:
+                - 예: (A, T, 11), (L, P, 2), (A, L), (T,), ()(스칼라)
         """
-        if data_max_agent_num > self.caching_max_agent_num:
-            raise ValueError(
-                f"배치 내 agent 수(data_max_agent_num={data_max_agent_num})가 "
-                f"caching_max_agent_num={self.caching_max_agent_num} 를 초과했습니다.")
-        if data_max_lane_num > self.caching_max_lane_num:
-            raise ValueError(
-                f"배치 내 lane 수(data_max_lane_num={data_max_lane_num})가 "
-                f"caching_max_lane_num={self.caching_max_lane_num} 를 초과했습니다.")
-        if data_max_route_num > self.caching_max_lane_num:
-            raise ValueError(
-                f"배치 내 route 수(data_max_route_num={data_max_route_num})가 "
-                f"caching_max_lane_num={self.caching_max_lane_num} 를 초과했습니다.")
-        if data_max_static_num > self.caching_max_static_num:
-            raise ValueError(
-                f"배치 내 static 수(data_max_static_num={data_max_static_num})가 "
-                f"caching_max_static_num={self.caching_max_static_num} 를 초과했습니다."
+        if isinstance(value, torch.Tensor):
+            return tuple(int(x) for x in value.shape)
+        if isinstance(value, np.ndarray):
+            return tuple(int(x) for x in value.shape)
+
+        # 리스트/튜플/스칼라 등: numpy로 shape만 확인
+        arr = np.asarray(value)
+        return tuple(int(x) for x in arr.shape)
+
+    def _choose_output_dtype(self, value: Any) -> torch.dtype:
+        """배치 텐서를 만들 때 사용할 dtype을 결정합니다.
+
+        규칙(속도/안정성 목적)
+        -------------------
+        - 입력이 float 계열이면: torch.float32 로 통일 (float64 방지)
+        - bool은: torch.bool 유지
+        - 정수는: torch dtype 그대로 유지(보통 int64)
+
+        Args:
+            value:
+                - None이 아닌 샘플 값(배치 내 최소 1개는 실제 값이 있어야 dtype을 정할 수 있음)
+
+        Returns:
+            torch.dtype:
+                - 출력 텐서의 dtype
+        """
+        t = torch.as_tensor(value)
+        if t.is_floating_point():
+            return torch.float32
+        return t.dtype
+
+    def _collect_batch_keys(self, batch: List[Dict[str, Any]]) -> List[str]:
+        """배치 안에 등장한 key를 모아 collate 대상으로 삼을 key 목록을 만듭니다.
+
+        중요한 점
+        --------
+        - 특정 key 이름을 나열해서 하드코딩하지 않습니다.
+        - 배치 dict에 들어온 key를 전부 대상으로 삼습니다.
+        - 다만, 텐서로 묶기 어려운 값(예: str)은 제외합니다.
+        - 어떤 샘플에서는 None이고 다른 샘플에서는 실제 배열인 key도 있을 수 있어서,
+          None도 일단 포함시킨 뒤 "배치 전체가 None인 key"만 최종적으로 제외합니다.
+
+        Args:
+            batch:
+                - 길이 B인 샘플 dict 리스트.
+
+        Returns:
+            List[str]:
+                - collate 대상으로 삼을 key 목록(중복 제거, 등장 순서 최대한 유지)
+        """
+        seen = set()
+        keys: List[str] = []
+
+        for sample in batch:
+            for k, v in sample.items():
+                if k in seen:
+                    continue
+                if self._is_collatable_value(v):
+                    seen.add(k)
+                    keys.append(k)
+
+        # 5개 고정 key는 "배치 첫 샘플에 없더라도" 우선순위로 앞에 두고 싶으면,
+        # 아래 로직이 도움이 됩니다. (데이터에 실제로 없으면 최종 단계에서 자동 제외됨)
+        fixed_front: List[str] = []
+        for k in self._FIXED_STACK_KEYS:
+            if k in seen and k in keys:
+                fixed_front.append(k)
+
+        # fixed_front가 이미 keys 안에 있으니, 순서만 fixed가 앞에 오도록 재정렬
+        if fixed_front:
+            rest = [k for k in keys if k not in fixed_front]
+            return fixed_front + rest
+
+        return keys
+
+    def _stack_fixed_key(self, values: List[Any]) -> Optional[torch.Tensor]:
+        """(고정 길이 key) 배치 텐서를 stack으로 바로 만듭니다.
+
+        이 함수가 담당하는 경우
+        ----------------------
+        - ego_agent_past
+        - ego_future_gt_3_dim
+        - planner_future_11_dim
+        - ego_agent_past_is_valid
+        - ego_future_gt_is_valid
+
+        위 5개는 "모든 샘플에서 길이가 항상 동일"하다는 전제이므로
+        max length를 찾거나 0 padding으로 늘릴 필요가 없습니다.
+
+        단, 값이 None일 수도 있으므로:
+        - 배치 안에 실제 값이 하나라도 있으면 그 shape를 기준으로
+          None인 샘플은 0으로 채운 텐서를 만들어 stack합니다.
+        - 배치 전체가 None이면 None을 반환해서 상위에서 key 자체를 제외합니다.
+
+        Args:
+            values:
+                - 길이 B 리스트
+                - 각 원소는 ndarray/tensor 또는 None
+
+        Returns:
+            Optional[torch.Tensor]:
+                - 성공 시: shape (B, *S) 텐서
+                - 전부 None이면: None
+        """
+        batch_size = int(len(values))
+        non_none_idx = [i for i, v in enumerate(values) if v is not None]
+        if not non_none_idx:
+            return None
+
+        ref_value = values[non_none_idx[0]]
+        assert ref_value is not None
+
+        out_dtype = self._choose_output_dtype(ref_value)
+        ref_shape = self._get_value_shape(ref_value)  # 예: (T_past, 11)
+
+        # non-None 값들의 shape가 동일한지 검사 (고정 key이므로 같아야 정상)
+        for i in non_none_idx[1:]:
+            v = values[i]
+            assert v is not None
+            if self._get_value_shape(v) != ref_shape:
+                raise ValueError(
+                    f"[Collate] 고정 key인데 shape가 샘플마다 다릅니다. "
+                    f"ref_shape={ref_shape}, got={self._get_value_shape(v)}"
+                )
+
+        # (B, *ref_shape)
+        out = torch.zeros((batch_size, *ref_shape), dtype=out_dtype)
+
+        # 값이 있는 샘플만 복사 (None은 0 그대로)
+        for b_idx in non_none_idx:
+            v = values[b_idx]
+            assert v is not None
+            out[b_idx] = torch.as_tensor(v, dtype=out_dtype)
+
+        return out
+
+    def _pad_and_stack_variable_key(self, values: List[Any]) -> Optional[torch.Tensor]:
+        """(가변 길이 key) 배치 내 최대 shape를 기준으로 0 padding 배치 텐서를 만듭니다.
+
+        처리 방식(핵심)
+        -------------
+        - key 이름을 보고 분기하지 않습니다.
+        - 값이 ndarray/tensor 라면 그 shape를 보고,
+          배치 내에서 각 차원별 최대값(max)을 구해 큰 텐서를 한 번만 만들고,
+          샘플 값은 "앞쪽부터" 그대로 복사합니다.
+        - padding 영역은 전부 0 입니다.
+          (bool이면 False, float이면 0.0, int면 0)
+
+        이 로직이 자연스럽게 커버하는 예시 shape
+        ----------------------------------------
+        - neighbor_agents_past:        (A_i, T_past, 11)  -> (B, A_max, T_past, 11)
+        - near_future_gt_3_dim:        (A_i, T_fut, 3)    -> (B, A_max, T_fut, 3)
+        - lanes:                       (L_i, P_lane, 12) -> (B, L_max, P_max, 12)
+        - lanes_len_is_valid:          (L_i, P_lane)      -> (B, L_max, P_max)
+        - agent_route_lane_order:      (A_i, L_i)         -> (B, A_max, L_max)
+        - road_edge:                   (E_i, P_edge, 2)   -> (B, E_max, P_max, 2)
+        - stop_sign_points:            (S_i, P, 2)        -> (B, S_max, P_max, 2)
+        - 그리고 그 외 "첫 번째 축이 개수"인 모든 값들
+
+        None 처리
+        --------
+        - 어떤 샘플에서 None이면 그 샘플은 전부 0으로 남습니다.
+        - 배치 전체가 None이면 None을 반환해서 상위에서 key 자체를 제외합니다.
+
+        Args:
+            values:
+                - 길이 B 리스트
+                - 각 원소는 ndarray/tensor 또는 None
+
+        Returns:
+            Optional[torch.Tensor]:
+                - 성공 시: shape (B, *max_shape)
+                - 전부 None이면: None
+        """
+        batch_size = int(len(values))
+        non_none_idx = [i for i, v in enumerate(values) if v is not None]
+        if not non_none_idx:
+            return None
+
+        ref_value = values[non_none_idx[0]]
+        assert ref_value is not None
+
+        out_dtype = self._choose_output_dtype(ref_value)
+        ref_shape = self._get_value_shape(ref_value)
+        ndim = int(len(ref_shape))
+
+        # max_shape 계산: 배치 내 각 차원별 최대 크기
+        max_shape = list(ref_shape)
+        all_same_shape = True
+
+        for i in non_none_idx[1:]:
+            v = values[i]
+            assert v is not None
+            shape_i = self._get_value_shape(v)
+            if len(shape_i) != ndim:
+                raise ValueError(
+                    f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. "
+                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}"
+                )
+            if shape_i != tuple(ref_shape):
+                all_same_shape = False
+            for d in range(ndim):
+                if int(shape_i[d]) > int(max_shape[d]):
+                    max_shape[d] = int(shape_i[d])
+
+        # (빠른 경로) None도 없고, 모든 shape가 동일하면 stack이 제일 빠름
+        if all_same_shape and (len(non_none_idx) == batch_size):
+            # shape: (B, *ref_shape)
+            return torch.stack(
+                [torch.as_tensor(v, dtype=out_dtype) for v in values], dim=0
             )
 
-    # ------------------------------------------------------------------
-    # 4-3) 패딩 포함 전체 배치 텐서 구성
-    # ------------------------------------------------------------------
-    def _build_padded_batch(
+        # 일반 경로: 0 padding 텐서 만들고 값 복사
+        # out shape: (B, *max_shape)
+        out = torch.zeros((batch_size, *max_shape), dtype=out_dtype)
+
+        for b_idx in non_none_idx:
+            v = values[b_idx]
+            assert v is not None
+            t = torch.as_tensor(v, dtype=out_dtype)
+
+            if ndim == 0:
+                # 스칼라: out[b_idx]에 바로 대입
+                out[b_idx] = t
+                continue
+
+            # 각 차원별로 실제 길이만큼만 복사
+            # 예: t.shape == (A_i, T, 11) 이면 slice(0,A_i), slice(0,T), slice(0,11)
+            slices = tuple(slice(0, int(s)) for s in t.shape)
+            out[(b_idx, *([slice(None)] * 0))]  # (형태 힌트용; 실제론 아래 라인만으로 충분)
+
+            out[(b_idx, *slices)] = t[slices]
+
+        return out
+
+    def _build_collated_batch_tensors(
         self,
         batch: List[Dict[str, Any]],
-        data_max_agent_num: int,
-        data_max_lane_num: int,
-        data_max_route_num: int,
-        data_max_static_num: int,
     ) -> Dict[str, torch.Tensor]:
-        """최대 길이에 맞춰 텐서를 쌓고 패딩해서 최종 배치 dict를 만든다.
+        """배치(dict 리스트)를 최종 배치 텐서(dict)로 변환합니다.
+
+        핵심 규칙(요청사항 그대로)
+        ------------------------
+        1) 고정 5개 key:
+           - ego_agent_past
+           - ego_future_gt_3_dim
+           - planner_future_11_dim
+           - ego_agent_past_is_valid
+           - ego_future_gt_is_valid
+           → 길이가 항상 같다고 가정하고 "바로 stack"합니다. (max 길이 계산/패딩 없음)
+
+        2) 그 외 모든 key:
+           → key 이름을 하드코딩하지 않고,
+              각 key별로 배치 내 최대 shape를 계산한 뒤 0 padding 배치 텐서를 만듭니다.
+
+        3) None 처리:
+           - 일부 샘플이 None이면 해당 샘플은 0으로 남습니다.
+           - 배치 전체가 None인 key는 결과 dict에 넣지 않습니다.
 
         Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
-            data_max_agent_num (int): 최대 agent 수.
-            data_max_lane_num (int): 최대 lane 수.
-            data_max_route_num (int): 최대 route 수.
-            data_max_static_num (int): 최대 static 수.
+            batch:
+                - 길이 B 샘플 dict 리스트
 
         Returns:
-            Dict[str, torch.Tensor]: key마다 (B, ·) shape 텐서.
+            Dict[str, torch.Tensor]:
+                - 각 key마다 (B, ...) 형태 텐서
         """
-        ego_agent_past = self._stack_fixed(
-            batch,
-            key="ego_agent_past",
-            dtype=torch.float32,  # (B, time_len, 11)
-        )
-        ego_future_gt_3_dim = self._stack_fixed(
-            batch,
-            key="ego_future_gt_3_dim",
-            dtype=torch.float32,  # (B, future_len, 3)
-        )
-        planner_future_11_dim = self._stack_fixed(
-            batch,
-            key="planner_future_11_dim",
-            dtype=torch.float32,  # (B, future_len, 11)
-        )
+        batch_size = int(len(batch))
+        if batch_size <= 0:
+            raise ValueError("빈 batch가 들어왔습니다.")
 
-        neighbor_agents_past = self._pad_first_dim_to(
-            batch,
-            key="neighbor_agents_past",
-            target_len=data_max_agent_num,
-            dtype=torch.float32,  # (B, data_max_agent_num, time_len, 11)
-        )
-        near_future_gt_3_dim = self._pad_first_dim_to(
-            batch,
-            key="near_future_gt_3_dim",
-            target_len=data_max_agent_num,
-            dtype=torch.float32,  # (B, data_max_agent_num, future_len, 3)
-        )
-        static_objects = self._pad_first_dim_to(
-            batch,
-            key="static_objects",
-            target_len=data_max_static_num,
-            dtype=torch.float32,  # (B, data_max_static_num, 10)
-        )
-
-        lanes = self._pad_first_dim_to(
-            batch,
-            key="lanes",
-            target_len=data_max_lane_num,
-            dtype=torch.float32,  # (B, data_max_lane_num, lane_len, 12)
-        )
-        lanes_speed_limit = self._pad_first_dim_to(
-            batch,
-            key="lanes_speed_limit",
-            target_len=data_max_lane_num,
-            dtype=torch.float32,  # (B, data_max_lane_num, 1)
-        )
-        lanes_has_speed_limit = self._pad_first_dim_to(
-            batch,
-            key="lanes_has_speed_limit",
-            target_len=data_max_lane_num,
-            dtype=torch.bool,  # (B, data_max_lane_num, 1)
-        )
-
-        route_lanes = self._pad_first_dim_to(
-            batch,
-            key="route_lanes",
-            target_len=data_max_route_num,
-            dtype=torch.float32,  # (B, data_max_route_num, route_len, 12)
-        )
-        route_lanes_speed_limit = self._pad_first_dim_to(
-            batch,
-            key="route_lanes_speed_limit",
-            target_len=data_max_route_num,
-            dtype=torch.float32,  # (B, data_max_route_num, 1)
-        )
-        route_lanes_has_speed_limit = self._pad_first_dim_to(
-            batch,
-            key="route_lanes_has_speed_limit",
-            target_len=data_max_route_num,
-            dtype=torch.bool,  # (B, data_max_route_num, 1)
-        )
-
-        agent_route_lane_order = self._pad_two_dims_to(
-            batch,
-            key="agent_route_lane_order",
-            target_len0=data_max_agent_num,
-            target_len1=data_max_lane_num,
-            dtype=torch.int64,  # (B, data_max_agent_num, data_max_lane_num)
-        )
+        keys = self._collect_batch_keys(batch)
 
         batch_out: Dict[str, torch.Tensor] = {}
-        for k, v in [
-            ("ego_agent_past", ego_agent_past),
-            ("ego_future_gt_3_dim", ego_future_gt_3_dim),
-            ("neighbor_agents_past", neighbor_agents_past),
-            ("lanes", lanes),
-            ("lanes_speed_limit", lanes_speed_limit),
-            ("lanes_has_speed_limit", lanes_has_speed_limit),
-            ("route_lanes", route_lanes),
-            ("route_lanes_speed_limit", route_lanes_speed_limit),
-            ("route_lanes_has_speed_limit", route_lanes_has_speed_limit),
-            ("static_objects", static_objects),
-            ("near_future_gt_3_dim", near_future_gt_3_dim),
-            ("planner_future_11_dim", planner_future_11_dim),
-            ("agent_route_lane_order", agent_route_lane_order),
-        ]:
-            batch_out[k] = v
+
+        # 1) 고정 5개 key 먼저 처리
+        for k in self._FIXED_STACK_KEYS:
+            if k not in keys:
+                continue
+            values = [sample.get(k, None) for sample in batch]  # 길이 B
+            t = self._stack_fixed_key(values)
+            if t is not None:
+                batch_out[k] = t
+
+        # 2) 나머지 key 전부: key 이름을 몰라도 동일 로직으로 처리
+        fixed_set = set(self._FIXED_STACK_KEYS)
+        for k in keys:
+            if k in fixed_set:
+                continue
+            values = [sample.get(k, None) for sample in batch]  # 길이 B
+
+            # 배치 전체가 None이면 skip
+            if all(v is None for v in values):
+                continue
+
+            t = self._pad_and_stack_variable_key(values)
+            if t is not None:
+                batch_out[k] = t
 
         return batch_out
 
+    def _as_bool_1d(
+        self,
+        mask: Any,
+        expected_len: int,
+    ) -> Optional[np.ndarray]:
+        """입력 마스크를 (expected_len,) bool 배열로 안전 변환합니다.
+
+        이 함수가 필요한 이유
+        --------------------
+        validity key는 데이터가 없으면 None일 수 있고,
+        또 어떤 실수로 shape가 어긋난 값이 들어올 수도 있습니다.
+        그럴 때 바로 예외를 내기보다, "안전하게 None 처리"해서
+        나머지 crop 로직은 계속 돌도록 만드는 목적입니다.
+
+        Args:
+            mask: 원본 마스크 값. None 또는 numpy 배열/리스트 형태.
+            expected_len: 기대하는 길이. shape: (expected_len,)
+
+        Returns:
+            Optional[np.ndarray]:
+                - 정상 변환 시: np.ndarray(dtype=bool), shape (expected_len,)
+                - 변환 불가/None이면: None
+        """
+        if mask is None:
+            return None
+        arr = np.asarray(mask)
+        if arr.ndim != 1:
+            return None
+        if int(arr.shape[0]) != int(expected_len):
+            return None
+        return arr.astype(bool)
+
+    def _as_bool_2d(
+        self,
+        mask: Any,
+        expected_shape: Tuple[int, int],
+    ) -> Optional[np.ndarray]:
+        """입력 마스크를 expected_shape=(N,P) bool 배열로 안전 변환합니다.
+
+        Args:
+            mask: 원본 마스크 값. None 또는 numpy 배열/리스트 형태.
+            expected_shape: (N, P)
+                - N: 객체 개수
+                - P: 한 객체를 이루는 점 개수
+
+        Returns:
+            Optional[np.ndarray]:
+                - 정상 변환 시: np.ndarray(dtype=bool), shape (N, P)
+                - 변환 불가/None이면: None
+        """
+        if mask is None:
+            return None
+        arr = np.asarray(mask)
+        if arr.ndim != 2:
+            return None
+        if (int(arr.shape[0]) != int(expected_shape[0])) or (int(arr.shape[1]) != int(expected_shape[1])):
+            return None
+        return arr.astype(bool)
+
+    def _slice_first_dim_inplace(
+        self,
+        sample: Dict[str, Any],
+        keys: List[str],
+        keep_idx: np.ndarray,  # shape: (K,)
+    ) -> None:
+        """sample의 여러 key를 첫 번째 축 기준으로 같은 인덱스로 같이 자릅니다.
+
+        Args:
+            sample: 단일 샘플 dict.
+            keys: 같이 잘라야 하는 key 목록.
+            keep_idx: 남길 인덱스. shape: (K,)
+        """
+        for k in keys:
+            if k not in sample:
+                continue
+            v = sample.get(k, None)
+            if v is None:
+                continue
+            sample[k] = np.asarray(v)[keep_idx]
+
+    def _sort_indices_by_distance(
+        self,
+        keep_idx: np.ndarray,      # shape: (K,)
+        dist2_all: np.ndarray,     # shape: (N,)
+    ) -> np.ndarray:
+        """keep_idx를 '가까운 순'으로 재정렬합니다.
+
+        Args:
+            keep_idx: 남길 인덱스. shape: (K,)
+            dist2_all: 전체 객체의 거리^2 배열. shape: (N,)
+
+        Returns:
+            sorted_keep_idx: 가까운 순으로 정렬된 keep_idx. shape: (K,)
+        """
+        if keep_idx.size <= 1:
+            return keep_idx
+        d = dist2_all[keep_idx]  # (K,)
+        order = np.argsort(d, kind="mergesort")
+        return keep_idx[order].astype(np.int64)
+
+    def _keep_indices_from_points_xy(
+        self,
+        points_xy: np.ndarray,             # shape: (N, 2)
+        center_xy: np.ndarray,             # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+        object_valid_1d: Optional[np.ndarray],  # shape: (N,)
+    ) -> np.ndarray:
+        """(N,2) 점 기준으로 반경 안에 들어오는 객체 인덱스를 만듭니다.
+
+        규칙
+        ----
+        - 각 점의 (x,y)와 center_xy 사이 거리^2 <= radius_sq 이면 keep
+        - object_valid_1d가 있으면 False인 객체는 무조건 제외
+        - 반환 인덱스는 "가까운 순"으로 정렬해서 돌려줍니다.
+
+        Args:
+            points_xy: shape (N,2)
+            center_xy: shape (2,)
+            radius_sq: 반경^2 (스칼라)
+            invalid_fill: invalid를 멀리 보내기 위한 큰 값
+            object_valid_1d: shape (N,) 또는 None
+
+        Returns:
+            keep_idx: shape (K,), dtype int64
+        """
+        n = int(points_xy.shape[0])
+        if n <= 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        pts = np.asarray(points_xy, dtype=np.float32)  # (N,2)
+        diff = pts - center_xy[None, :]                # (N,2)
+        dist2 = (diff * diff).sum(axis=-1)             # (N,)
+
+        if object_valid_1d is not None:
+            dist2 = np.where(object_valid_1d, dist2, invalid_fill)
+
+        keep_mask = dist2 <= np.float32(radius_sq)
+        keep_idx = np.nonzero(keep_mask)[0].astype(np.int64)
+        return self._sort_indices_by_distance(keep_idx, dist2)
+
+    def _keep_indices_from_polyline_xy(
+        self,
+        poly_xy: np.ndarray,              # shape: (N, P, 2)
+        center_xy: np.ndarray,            # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+        point_valid_2d: Optional[np.ndarray],   # shape: (N, P)
+        object_valid_1d: Optional[np.ndarray],  # shape: (N,)
+    ) -> np.ndarray:
+        """(N,P,2) 선/영역 형태에서 반경 안에 들어오는 객체 인덱스를 만듭니다.
+
+        규칙
+        ----
+        - 한 객체는 P개의 점으로 이루어져 있다고 보고,
+          그 중 center_xy에 가장 가까운 점의 거리^2이 radius_sq 이하이면 keep
+        - point_valid_2d가 있으면 False인 점은 거리 계산에서 제외(매우 멀리 취급)
+        - point_valid_2d가 없으면, (x,y) 둘 다 0인 점을 "없는 점"으로 보고 제외
+        - object_valid_1d가 있으면 False인 객체는 무조건 제외
+        - 반환 인덱스는 "가까운 순"으로 정렬해서 돌려줍니다.
+
+        Args:
+            poly_xy: shape (N,P,2)
+            center_xy: shape (2,)
+            radius_sq: 반경^2
+            invalid_fill: invalid를 멀리 보내기 위한 큰 값
+            point_valid_2d: shape (N,P) 또는 None
+            object_valid_1d: shape (N,) 또는 None
+
+        Returns:
+            keep_idx: shape (K,), dtype int64
+        """
+        n = int(poly_xy.shape[0])
+        if n <= 0:
+            return np.zeros((0,), dtype=np.int64)
+        p = int(poly_xy.shape[1])
+        if p <= 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        pts = np.asarray(poly_xy, dtype=np.float32)          # (N,P,2)
+        diff = pts - center_xy[None, None, :]                # (N,P,2)
+        dist2_pts = (diff * diff).sum(axis=-1)               # (N,P)
+
+        if point_valid_2d is None:
+            fallback_valid = np.any(np.abs(pts) > 0.0, axis=-1)     # (N,P)
+            dist2_pts = np.where(fallback_valid, dist2_pts, invalid_fill)
+        else:
+            dist2_pts = np.where(point_valid_2d, dist2_pts, invalid_fill)
+
+        min_dist2 = dist2_pts.min(axis=-1)  # (N,)
+
+        if object_valid_1d is not None:
+            min_dist2 = np.where(object_valid_1d, min_dist2, invalid_fill)
+
+        keep_mask = min_dist2 <= np.float32(radius_sq)
+        keep_idx = np.nonzero(keep_mask)[0].astype(np.int64)
+        return self._sort_indices_by_distance(keep_idx, min_dist2)
+
+    def _compute_center_xy_for_sample(
+        self,
+        sample: Dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        """샘플에서 중심점(center_xy)을 계산합니다.
+
+        규칙
+        ----
+        - 기본은 ego 기준:
+            center_xy = ego_agent_past[-1, 0:2]  # shape (2,)
+        - center_crop_mode == "npc" 이면:
+            neighbor_agents_is_valid==True인 agent들 중 하나를 랜덤 선택해
+            center_xy = neighbor_agents_past[selected, -1, 0:2]
+          유효 agent가 없으면 ego 기준으로 fallback 합니다.
+
+        Args:
+            sample: 단일 샘플 dict.
+
+        Returns:
+            Optional[np.ndarray]:
+                - 성공 시: center_xy, shape (2,), dtype float32
+                - ego 좌표를 뽑을 수 없으면: None
+        """
+        ego_past = sample.get("ego_agent_past", None)
+        if ego_past is None:
+            return None
+
+        ego_past_arr = np.asarray(ego_past)
+        if ego_past_arr.ndim < 2 or int(ego_past_arr.shape[0]) <= 0:
+            return None
+
+        ego_xy = np.asarray(ego_past_arr[-1, 0:2], dtype=np.float32)  # (2,)
+        center_xy = ego_xy
+
+        if self.center_crop_mode != "npc":
+            return center_xy
+
+        neighbor_past = sample.get("neighbor_agents_past", None)
+        if neighbor_past is None:
+            return center_xy
+
+        neighbor_past_arr = np.asarray(neighbor_past)
+        if neighbor_past_arr.ndim < 3 or int(neighbor_past_arr.shape[0]) <= 0:
+            return center_xy
+
+        a = int(neighbor_past_arr.shape[0])
+        neighbor_valid_1d = self._as_bool_1d(sample.get("neighbor_agents_is_valid", None), expected_len=a)
+        if neighbor_valid_1d is None:
+            candidate_idx = np.arange(a, dtype=np.int64)
+        else:
+            candidate_idx = np.nonzero(neighbor_valid_1d)[0].astype(np.int64)
+
+        if int(candidate_idx.shape[0]) <= 0:
+            return center_xy
+
+        chosen = int(candidate_idx[np.random.randint(int(candidate_idx.shape[0]))])
+        center_xy = np.asarray(neighbor_past_arr[chosen, -1, 0:2], dtype=np.float32)
+        return center_xy
+
+    def _crop_poly_object_group_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,          # shape (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+        points_key: str,
+        is_valid_key: str,
+    ) -> None:
+        """(N,P,2) + (N,) 형태인 지도/영역 요소를 반경 기준으로 crop 합니다.
+
+        예:
+          - stop_sign_points / stop_sign_is_valid
+          - crosswalk_points / crosswalk_is_valid
+          - speed_bump_points / speed_bump_is_valid
+          - driveway_points / driveway_is_valid
+
+        Args:
+            sample: 단일 샘플 dict.
+            center_xy: shape (2,)
+            radius_sq: 반경^2
+            invalid_fill: invalid를 멀리 보내기 위한 큰 값
+            points_key: 예) "crosswalk_points"
+            is_valid_key: 예) "crosswalk_is_valid"
+        """
+        pts = sample.get(points_key, None)
+        if pts is None:
+            return
+        pts_arr = np.asarray(pts)
+        if pts_arr.ndim != 3:
+            return
+        n = int(pts_arr.shape[0])
+        if n <= 0:
+            return
+
+        obj_valid_1d = self._as_bool_1d(sample.get(is_valid_key, None), expected_len=n)
+        keep_idx = self._keep_indices_from_polyline_xy(
+            poly_xy=np.asarray(pts_arr, dtype=np.float32),
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            point_valid_2d=None,
+            object_valid_1d=obj_valid_1d,
+        )
+        self._slice_first_dim_inplace(sample, keys=[points_key, is_valid_key], keep_idx=keep_idx)
+
+    def _crop_road_edge_group_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,          # shape (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> None:
+        """road_edge 관련 key들을 반경 기준으로 함께 crop 합니다.
+
+        함께 자르는 key
+        --------------
+        - road_edge: shape (E, safety_len, 2)
+        - road_edge_type: shape (E, 3)
+        - road_edge_is_valid: shape (E,) (존재하면 같이)
+
+        Args:
+            sample: 단일 샘플 dict.
+            center_xy: shape (2,)
+            radius_sq: 반경^2
+            invalid_fill: invalid를 멀리 보내기 위한 큰 값
+        """
+        road_edge = sample.get("road_edge", None)
+        if road_edge is None:
+            return
+
+        road_edge_arr = np.asarray(road_edge)
+        if road_edge_arr.ndim != 3:
+            return
+        e = int(road_edge_arr.shape[0])
+        if e <= 0:
+            return
+
+        road_edge_valid_1d = self._as_bool_1d(sample.get("road_edge_is_valid", None), expected_len=e)
+
+        keep_idx = self._keep_indices_from_polyline_xy(
+            poly_xy=np.asarray(road_edge_arr, dtype=np.float32),
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            point_valid_2d=None,
+            object_valid_1d=road_edge_valid_1d,
+        )
+        self._slice_first_dim_inplace(
+            sample,
+            keys=["road_edge", "road_edge_type", "road_edge_is_valid"],
+            keep_idx=keep_idx,
+        )
+
+    def _crop_agent_route_lane_order_inplace(
+        self,
+        sample: Dict[str, Any],
+        keep_agent_idx: Optional[np.ndarray],
+        keep_lane_idx: Optional[np.ndarray],
+    ) -> None:
+        """agent_route_lane_order를 (행=agent, 열=lane) 기준으로 동시에 crop 합니다.
+
+        Args:
+            sample: 단일 샘플 dict.
+            keep_agent_idx: shape (K_a,) 또는 None (None이면 agent는 유지)
+            keep_lane_idx: shape (K_l,) 또는 None (None이면 lane은 유지)
+        """
+        aro = sample.get("agent_route_lane_order", None)
+        if aro is None:
+            return
+
+        aro_arr = np.asarray(aro)
+        if aro_arr.ndim != 2:
+            return
+
+        if keep_agent_idx is None:
+            keep_agent_idx_eff = np.arange(int(aro_arr.shape[0]), dtype=np.int64)
+        else:
+            keep_agent_idx_eff = keep_agent_idx.astype(np.int64)
+
+        if keep_lane_idx is None:
+            keep_lane_idx_eff = np.arange(int(aro_arr.shape[1]), dtype=np.int64)
+        else:
+            keep_lane_idx_eff = keep_lane_idx.astype(np.int64)
+
+        sample["agent_route_lane_order"] = aro_arr[np.ix_(keep_agent_idx_eff, keep_lane_idx_eff)]
+
+        # agent_route_lane_order_is_valid 는 (agent 축)만 맞추면 됨
+        aro_valid = sample.get("agent_route_lane_order_is_valid", None)
+        if aro_valid is not None:
+            aro_valid_arr = np.asarray(aro_valid)
+            if aro_valid_arr.ndim == 1 and int(aro_valid_arr.shape[0]) == int(keep_agent_idx_eff.shape[0]):
+                # 이미 앞에서 agent 기준으로 잘려져 들어온 경우라면 그대로 둔다.
+                return
+            if aro_valid_arr.ndim == 1 and int(aro_valid_arr.shape[0]) >= int(keep_agent_idx_eff.max(initial=-1) + 1):
+                sample["agent_route_lane_order_is_valid"] = aro_valid_arr[keep_agent_idx_eff]
+
+    def _build_center_crop_constants(self) -> Tuple[float, np.float32]:
+        """center crop에 필요한 상수들을 한 번에 만든다.
+
+        Args:
+            없음
+
+        Returns:
+            Tuple[float, np.float32]:
+                - radius_sq: float, 반경의 제곱(= (center_crop_radius_m)^2). shape: ()
+                - invalid_fill: np.float32, invalid를 멀리 보내기 위한 매우 큰 값. shape: ()
+        """
+        radius_sq: float = float(self.center_crop_radius_m) ** 2
+        invalid_fill: np.float32 = np.float32(1.0e12)
+        return radius_sq, invalid_fill
+
+    def _crop_agents_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,  # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> Optional[np.ndarray]:
+        """Agent 기준으로 crop 하고, agent 관련 의존 key들도 같이 자른다.
+
+        기준/의존 관계
+        ------------
+        - 기준: neighbor_agents_past (현재 위치: neighbor_agents_past[:, -1, 0:2])
+        - 같이 자름:
+            neighbor_agents_past
+            near_future_gt_3_dim
+            neighbor_agents_past_is_valid
+            neighbor_agents_is_valid
+            neighbor_future_gt_is_valid
+            agent_route_lane_order_is_valid  (agent 축과 길이 맞추기)
+
+        Args:
+            sample: 단일 샘플 dict
+            center_xy: 중심 좌표, shape (2,)
+            radius_sq: 반경^2, shape ()
+            invalid_fill: invalid 마스킹용 큰 값, shape ()
+
+        Returns:
+            Optional[np.ndarray]:
+                - keep_agent_idx: np.ndarray(int64), shape (K_a,)
+                - agent 정보를 못 자르면 None
+        """
+        neighbor_past = sample.get("neighbor_agents_past", None)
+        if neighbor_past is None:
+            return None
+
+        neighbor_past_arr = np.asarray(neighbor_past)
+        if neighbor_past_arr.ndim < 3:
+            return None
+
+        a = int(neighbor_past_arr.shape[0])
+        if a <= 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        agents_xy = np.asarray(neighbor_past_arr[:, -1, 0:2], dtype=np.float32)  # (A,2)
+        neighbor_valid_1d = self._as_bool_1d(
+            sample.get("neighbor_agents_is_valid", None),
+            expected_len=a,
+        )
+
+        keep_agent_idx = self._keep_indices_from_points_xy(
+            points_xy=agents_xy,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            object_valid_1d=neighbor_valid_1d,
+        )
+
+        self._slice_first_dim_inplace(
+            sample,
+            keys=[
+                "neighbor_agents_past",
+                "near_future_gt_3_dim",
+                "neighbor_agents_past_is_valid",
+                "neighbor_agents_is_valid",
+                "neighbor_future_gt_is_valid",
+                "agent_route_lane_order_is_valid",
+            ],
+            keep_idx=keep_agent_idx,
+        )
+        return keep_agent_idx
+
+    def _crop_lanes_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,  # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> Optional[np.ndarray]:
+        """Lane 기준으로 crop 하고, lane 관련 의존 key들도 같이 자른다.
+
+        기준/의존 관계
+        ------------
+        - 기준: lanes (좌표: lanes[:, :, 0:2])
+        - 같이 자름:
+            lanes
+            lanes_speed_limit
+            lanes_has_speed_limit
+            lane_type
+            left_line_type
+            right_line_type
+            lanes_len_is_valid
+            lanes_is_valid
+
+        Args:
+            sample: 단일 샘플 dict
+            center_xy: 중심 좌표, shape (2,)
+            radius_sq: 반경^2, shape ()
+            invalid_fill: invalid 마스킹용 큰 값, shape ()
+
+        Returns:
+            Optional[np.ndarray]:
+                - keep_lane_idx: np.ndarray(int64), shape (K_l,)
+                - lanes를 못 자르면 None
+        """
+        lanes = sample.get("lanes", None)
+        if lanes is None:
+            return None
+
+        lanes_arr = np.asarray(lanes)
+        if lanes_arr.ndim < 3:
+            return None
+
+        l = int(lanes_arr.shape[0])
+        if l <= 0:
+            return np.zeros((0,), dtype=np.int64)
+
+        lane_len = int(lanes_arr.shape[1])
+        lanes_xy = np.asarray(lanes_arr[:, :, 0:2], dtype=np.float32)  # (L, lane_len, 2)
+
+        lanes_len_is_valid_2d = self._as_bool_2d(
+            sample.get("lanes_len_is_valid", None),
+            expected_shape=(l, lane_len),
+        )
+        lanes_is_valid_1d = self._as_bool_1d(
+            sample.get("lanes_is_valid", None),
+            expected_len=l,
+        )
+
+        keep_lane_idx = self._keep_indices_from_polyline_xy(
+            poly_xy=lanes_xy,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            point_valid_2d=lanes_len_is_valid_2d,
+            object_valid_1d=lanes_is_valid_1d,
+        )
+
+        self._slice_first_dim_inplace(
+            sample,
+            keys=[
+                "lanes",
+                "lanes_speed_limit",
+                "lanes_has_speed_limit",
+                "lane_type",
+                "left_line_type",
+                "right_line_type",
+                "lanes_len_is_valid",
+                "lanes_is_valid",
+            ],
+            keep_idx=keep_lane_idx,
+        )
+        return keep_lane_idx
+
+    def _crop_route_lanes_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,  # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> None:
+        """Route lane 기준으로 crop 하고, route lane 관련 의존 key들을 같이 자른다.
+
+        기준/의존 관계
+        ------------
+        - 기준: route_lanes (좌표: route_lanes[:, :, 0:2])
+        - 같이 자름:
+            route_lanes
+            route_lanes_speed_limit
+            route_lanes_has_speed_limit
+            route_lanes_len_is_valid
+            route_lanes_is_valid
+
+        Args:
+            sample: 단일 샘플 dict
+            center_xy: 중심 좌표, shape (2,)
+            radius_sq: 반경^2, shape ()
+            invalid_fill: invalid 마스킹용 큰 값, shape ()
+        """
+        route_lanes = sample.get("route_lanes", None)
+        if route_lanes is None:
+            return
+
+        route_arr = np.asarray(route_lanes)
+        if route_arr.ndim < 3:
+            return
+
+        r = int(route_arr.shape[0])
+        if r <= 0:
+            return
+
+        route_len = int(route_arr.shape[1])
+        route_xy = np.asarray(route_arr[:, :, 0:2], dtype=np.float32)  # (R, route_len, 2)
+
+        route_len_is_valid_2d = self._as_bool_2d(
+            sample.get("route_lanes_len_is_valid", None),
+            expected_shape=(r, route_len),
+        )
+        route_is_valid_1d = self._as_bool_1d(
+            sample.get("route_lanes_is_valid", None),
+            expected_len=r,
+        )
+
+        keep_route_idx = self._keep_indices_from_polyline_xy(
+            poly_xy=route_xy,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            point_valid_2d=route_len_is_valid_2d,
+            object_valid_1d=route_is_valid_1d,
+        )
+
+        self._slice_first_dim_inplace(
+            sample,
+            keys=[
+                "route_lanes",
+                "route_lanes_speed_limit",
+                "route_lanes_has_speed_limit",
+                "route_lanes_len_is_valid",
+                "route_lanes_is_valid",
+            ],
+            keep_idx=keep_route_idx,
+        )
+
+    def _crop_static_objects_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,  # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> None:
+        """Static object 기준으로 crop 하고, static 관련 의존 key들을 같이 자른다.
+
+        기준/의존 관계
+        ------------
+        - 기준: static_objects (좌표: static_objects[:, 0:2])
+        - 같이 자름:
+            static_objects
+            static_objects_is_valid
+
+        Args:
+            sample: 단일 샘플 dict
+            center_xy: 중심 좌표, shape (2,)
+            radius_sq: 반경^2, shape ()
+            invalid_fill: invalid 마스킹용 큰 값, shape ()
+        """
+        static_objects = sample.get("static_objects", None)
+        if static_objects is None:
+            return
+
+        static_arr = np.asarray(static_objects)
+        if static_arr.ndim < 2:
+            return
+
+        s = int(static_arr.shape[0])
+        if s <= 0:
+            return
+
+        static_xy = np.asarray(static_arr[:, 0:2], dtype=np.float32)  # (S,2)
+        static_valid_1d = self._as_bool_1d(
+            sample.get("static_objects_is_valid", None),
+            expected_len=s,
+        )
+
+        keep_static_idx = self._keep_indices_from_points_xy(
+            points_xy=static_xy,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            object_valid_1d=static_valid_1d,
+        )
+
+        self._slice_first_dim_inplace(
+            sample,
+            keys=["static_objects", "static_objects_is_valid"],
+            keep_idx=keep_static_idx,
+        )
+
+    def _crop_safety_and_map_objects_inplace(
+        self,
+        sample: Dict[str, Any],
+        center_xy: np.ndarray,  # shape: (2,)
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> None:
+        """Stop/Crosswalk/SpeedBump/Driveway/RoadEdge 그룹을 한 번에 crop 한다.
+
+        Args:
+            sample: 단일 샘플 dict
+            center_xy: 중심 좌표, shape (2,)
+            radius_sq: 반경^2, shape ()
+            invalid_fill: invalid 마스킹용 큰 값, shape ()
+        """
+        # (N,P,2) + (N,) 쌍들
+        self._crop_poly_object_group_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            points_key="stop_sign_points",
+            is_valid_key="stop_sign_is_valid",
+        )
+        self._crop_poly_object_group_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            points_key="crosswalk_points",
+            is_valid_key="crosswalk_is_valid",
+        )
+        self._crop_poly_object_group_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            points_key="speed_bump_points",
+            is_valid_key="speed_bump_is_valid",
+        )
+        self._crop_poly_object_group_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+            points_key="driveway_points",
+            is_valid_key="driveway_is_valid",
+        )
+
+        # road_edge (+ type + (있으면) road_edge_is_valid)
+        self._crop_road_edge_group_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+        )
+
+    def _center_crop_one_sample_inplace(
+        self,
+        sample: Dict[str, Any],
+        radius_sq: float,
+        invalid_fill: np.float32,
+    ) -> None:
+        """샘플 1개를 center 기준 거리로 crop 하는 전체 절차를 수행한다.
+
+        Args:
+            sample: 단일 샘플 dict
+            radius_sq: 반경^2, shape ()
+            invalid_fill: invalid 마스킹용 큰 값, shape ()
+        """
+        center_xy = self._compute_center_xy_for_sample(sample)
+        if center_xy is None:
+            return
+
+        keep_agent_idx = self._crop_agents_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+        )
+        keep_lane_idx = self._crop_lanes_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+        )
+
+        self._crop_route_lanes_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+        )
+        self._crop_static_objects_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+        )
+        self._crop_safety_and_map_objects_inplace(
+            sample=sample,
+            center_xy=center_xy,
+            radius_sq=radius_sq,
+            invalid_fill=invalid_fill,
+        )
+
+        # (행=agent, 열=lane) 동시 crop
+        self._crop_agent_route_lane_order_inplace(
+            sample=sample,
+            keep_agent_idx=keep_agent_idx,
+            keep_lane_idx=keep_lane_idx,
+        )
+
+    def _center_crop_batch_batched(
+        self,
+        batch: List[Dict[str, Any]],
+    ) -> None:
+        """배치 샘플들을 중심점(center_xy) 기준 거리로 crop 합니다.
+
+        - batch는 샘플마다 (agent/lane/route/static 개수)가 달라 완전 벡터화가 이득이 크지 않아,
+          샘플 단위 루프는 유지하되, 각 샘플 안에서 계산은 numpy 연산으로 처리합니다.
+        """
+        if not batch:
+            return
+
+        radius_sq, invalid_fill = self._build_center_crop_constants()
+
+        for sample in batch:
+            self._center_crop_one_sample_inplace(
+                sample=sample,
+                radius_sq=radius_sq,
+                invalid_fill=invalid_fill,
+            )
     # ------------------------------------------------------------------
     # 4) collate 본체
     # ------------------------------------------------------------------
@@ -1878,26 +2736,7 @@ class DiffusionPlannerCollate:
         if self._should_center_crop():
             self._center_crop_batch_batched(batch)
 
-        (
-            data_max_agent_num,
-            data_max_lane_num,
-            data_max_route_num,
-            data_max_static_num,
-        ) = self._compute_batch_max_lengths(batch)
-        self._check_length_limits(
-            data_max_agent_num=data_max_agent_num,
-            data_max_lane_num=data_max_lane_num,
-            data_max_route_num=data_max_route_num,
-            data_max_static_num=data_max_static_num,
-        )
-
-        batch_out = self._build_padded_batch(
-            batch=batch,
-            data_max_agent_num=data_max_agent_num,
-            data_max_lane_num=data_max_lane_num,
-            data_max_route_num=data_max_route_num,
-            data_max_static_num=data_max_static_num,
-        )
+        batch_out = self._build_collated_batch_tensors(batch)
         return batch_out
 
 

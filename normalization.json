@@ -50,6 +50,31 @@
     "route_lanes_speed_limit": {
         "mean": [0],
         "std": [20]
+    },
+    "stop_sign_points" : {
+        "mean": [10, 0],
+        "std": [20, 20]
+
+    },
+        "crosswalk_points" : {
+        "mean": [10, 0],
+        "std": [20, 20]
+
+    },
+    "speed_bump_points" : {
+        "mean": [10, 0],
+        "std": [20, 20]
+
+    },
+        "driveway_points" : {
+        "mean": [10, 0],
+        "std": [20, 20]
+
+    },
+            "road_edge" : {
+        "mean": [10, 0],
+        "std": [20, 20]
+
     }
-  }
+}
   

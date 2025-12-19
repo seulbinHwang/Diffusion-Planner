@@ -107,8 +107,10 @@ class DataProcessor(object):
                 meter 단위 지도/도로시설 조회 반경.
         """
         return float(self._filter_radius)
+
     @staticmethod
-    def _read_filter_radius_settings_from_config(config: object) -> Tuple[bool, float]:
+    def _read_filter_radius_settings_from_config(
+            config: object) -> Tuple[bool, float]:
         """config에서 필터링 설정(use_filter_radius, filter_radius)을 읽습니다.
 
         이 클래스는 오직 config에 아래 두 값이 "명시적으로 존재"할 때만 동작하도록 강제합니다.
@@ -139,8 +141,7 @@ class DataProcessor(object):
             raise RuntimeError(
                 "필수 설정이 config에 없습니다. "
                 "args_util.py에 `--use_filter_radius`와 `--filter_radius`를 반드시 선언해야 합니다. "
-                f"missing={missing}"
-            )
+                f"missing={missing}")
 
         use_filter_radius = bool(getattr(config, "use_filter_radius"))
         filter_radius_m = float(getattr(config, "filter_radius"))
@@ -161,14 +162,13 @@ class DataProcessor(object):
             return float(self._filter_radius)
         return None
 
-
     @staticmethod
     def _adjust_ego_future_outputs_to_center_frame(
-            ego_state: EgoState,
-            ego_future_gt_3_dim: np.ndarray,  # shape: (T, 3)
-            ego_future_gt_11_dim: np.ndarray,  # shape: (T, 11)
-            *,
-            set_coord_as_center: bool,
+        ego_state: EgoState,
+        ego_future_gt_3_dim: np.ndarray,  # shape: (T, 3)
+        ego_future_gt_11_dim: np.ndarray,  # shape: (T, 11)
+        *,
+        set_coord_as_center: bool,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """ego 미래 궤적 출력이 rear axle 기준일 때, center 기준으로 x,y만 보정한다.
 
@@ -453,7 +453,8 @@ class DataProcessor(object):
         history_buffer: Optional[SimulationHistoryBuffer] = None,
         *,
         set_coord_as_center: bool = False,
-    ) -> Tuple[EgoState, Point2D, float, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[EgoState, Point2D, float, np.ndarray, np.ndarray,
+               Optional[np.ndarray]]:
         """시나리오 또는 history buffer 에서 ego 궤적을 공통 포맷으로 추출한다.
 
         (중간 설명은 기존 docstring 유지하되, 아래 한 줄만 추가 개념으로 보면 됩니다)
@@ -468,7 +469,8 @@ class DataProcessor(object):
         if scenario is not None:
             ego_state: EgoState = scenario.initial_ego_state
         else:
-            ego_state = history_buffer.current_state[0]  # type: ignore[union-attr]
+            ego_state = history_buffer.current_state[
+                0]  # type: ignore[union-attr]
 
         # ✅ 기준점 선택: rear_axle(default) vs center
         if set_coord_as_center:
@@ -478,17 +480,20 @@ class DataProcessor(object):
 
         ego_point2d = Point2D(ref.x, ref.y)
         ego_heading: float = float(ref.heading)
-        ego_cur_pose_np = np.array([ref.x, ref.y, ref.heading], dtype=np.float64)  # shape: (3,)
+        ego_cur_pose_np = np.array([ref.x, ref.y, ref.heading],
+                                   dtype=np.float64)  # shape: (3,)
 
         if scenario is not None:
-            (past_cur_ego_world_10, past_cur_time_np) = get_ego_past_array_from_scenario(
-                scenario,
-                self.num_past_poses,
-                self.past_time_horizon,
-            )
+            (past_cur_ego_world_10,
+             past_cur_time_np) = get_ego_past_array_from_scenario(
+                 scenario,
+                 self.num_past_poses,
+                 self.past_time_horizon,
+             )
         else:
             ego_state_buffer: Deque[EgoState] = history_buffer.ego_state_buffer
-            past_cur_ego_world_10 = sampled_ego_objects_to_array_list(ego_state_buffer)
+            past_cur_ego_world_10 = sampled_ego_objects_to_array_list(
+                ego_state_buffer)
             past_cur_time_np = None
 
         assert past_cur_ego_world_10.shape[0] == self.num_past_poses + 1, \
@@ -502,6 +507,7 @@ class DataProcessor(object):
             past_cur_ego_world_10,
             past_cur_time_np,
         )
+
     def _prepare_car_token_to_rr_ids(
         self,
         scenario: NuPlanScenario,
@@ -581,8 +587,7 @@ class DataProcessor(object):
     ) -> Dict[str, torch.Tensor]:
 
         (ego_state, ego_point2d, ego_heading, ego_cur_pose_np,
-         past_cur_ego_world_10,
-         _) = self._get_past_cur_ego_feature(
+         past_cur_ego_world_10, _) = self._get_past_cur_ego_feature(
              history_buffer=history_buffer,
              set_coord_as_center=self.set_coord_as_center,
          )
@@ -1260,8 +1265,8 @@ class DataProcessor(object):
 
             (ego_future_gt_3_dim,
              ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
-                 scenario, ego_state, self.num_future_poses, self.future_time_horizon
-             )
+                 scenario, ego_state, self.num_future_poses,
+                 self.future_time_horizon)
 
             # ✅ ego_future는 내부가 rear axle 기준이므로, center 기준이면 x,y만 원점 보정
             ego_future_gt_3_dim, ego_future_gt_11_dim = self._adjust_ego_future_outputs_to_center_frame(
@@ -1270,7 +1275,6 @@ class DataProcessor(object):
                 ego_future_gt_11_dim=ego_future_gt_11_dim,
                 set_coord_as_center=self.set_coord_as_center,
             )
-
             """
             - past_cur_agents_world_8_list: List[np.ndarray]
                 · 길이: num_frames
@@ -1313,15 +1317,15 @@ class DataProcessor(object):
             # 2) neighbor 과거 궤적
             (neighbor_agents_past, agents_cur_frame_indices, neighbors_id,
              neighbor_track_token) = build_neighbor_past_feature(
-                past_cur_agents_world_8_list=past_cur_agents_world_8_list,
-                past_cur_agents_types_list=past_cur_agents_types_list,
-                max_agent_num=self.caching_max_agent_num,
-                ego_cur_pose_np=ego_cur_pose_np,
-                max_pedestrians=self.max_pedestrians,
-                max_bicycles=self.max_bicycles,
-                token_to_id=token_to_id,
-                filter_radius=self._get_effective_filter_radius_m(),
-            )
+                 past_cur_agents_world_8_list=past_cur_agents_world_8_list,
+                 past_cur_agents_types_list=past_cur_agents_types_list,
+                 max_agent_num=self.caching_max_agent_num,
+                 ego_cur_pose_np=ego_cur_pose_np,
+                 max_pedestrians=self.max_pedestrians,
+                 max_bicycles=self.max_bicycles,
+                 token_to_id=token_to_id,
+                 filter_radius=self._get_effective_filter_radius_m(),
+             )
 
             ego_time_len = ego_agent_past.shape[0]
             neighbor_time_len = neighbor_agents_past.shape[1]
@@ -1710,7 +1714,6 @@ class DataProcessor(object):
              sampled_future_observations, token_to_id)
 
         return cur_fut_agents_world_8_list, token_to_id
-
 
     def save_to_disk(self, dir: str, final_file_name: str,
                      data: Dict[str, np.ndarray]) -> None:
