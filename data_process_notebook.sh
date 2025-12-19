@@ -7,7 +7,7 @@ export NUPLAN_DATA_ROOT="/home/user/nuplan/dataset" #"REPLACE_WITH_DATA_DIR"  # 
 NUPLAN_DATA_PATH="${NUPLAN_DATA_ROOT}/nuplan-v1.1/splits/trainval" # nuplan training data path (e.g., "/data/nuplan-v1.1/trainval")
 NUPLAN_MAP_PATH="${NUPLAN_DATA_ROOT}/maps" # nuplan map path (e.g., "/data/nuplan-v1.1/maps")
 
-TRAIN_SET_PATH="${NUPLAN_DATA_ROOT}/processed" # preprocess training data
+TRAIN_SET_PATH="${NUPLAN_DATA_ROOT}/processed_compressed" # preprocess training data
 ###################################
 
 python data_process.py \
