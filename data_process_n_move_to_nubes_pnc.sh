@@ -11,6 +11,8 @@ export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export BLIS_NUM_THREADS=1
 # ----------------------------------------------
+# ✅ 스크립트(현재 쉘) 자체를 CPUSET에 고정 → 이후 실행되는 하위 작업들도 그대로 따라감
+taskset -cp "${CPUSET}" $$ >/dev/null
 
 echo "[NUPLAN] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
 
