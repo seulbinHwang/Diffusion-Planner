@@ -2,8 +2,8 @@
 set -e
 
 # ---------------- CPU 분리 설정 ----------------
-CPUSET="0-47"
-NUM_CPUS=48
+CPUSET="0-55"
+NUM_CPUS=56
 
 export DP_MAX_CPUS=${NUM_CPUS}
 export OMP_NUM_THREADS=1
