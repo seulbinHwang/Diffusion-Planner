@@ -37,22 +37,26 @@ class DiffusionPlannerData(Dataset):
         output_keys: List[str] = [
             "ego_agent_past", # (time_len, 11)
             "ego_future_gt_3_dim", # (future_len, 3)
+
             "neighbor_agents_past", # (chosen_agent_num, time_len, 11)
+            "static_objects",  # (chosen_static_num, 10)
+
+            "stop_sign_points", # (stop_sign_num, safety_len, 2)
+            "crosswalk_points", # (crosswalk_num, safety_len, 2)
+
             "lanes", # (chosen_lane_num, lane_len, 12)
             "lanes_speed_limit", # (chosen_lane_num, 1)
             "lanes_has_speed_limit", # (chosen_lane_num, 1)
             "route_lanes", # (chosen_route_lane_num, route_len, 12)
             "route_lanes_speed_limit", # (chosen_route_lane_num, 1)
             "route_lanes_has_speed_limit", # (chosen_route_lane_num, 1)
-            "static_objects", # (chosen_static_num, 10)
             "near_future_gt_3_dim", # (chosen_agent_num, future_len, 3)
-            "planner_future_11_dim", # (future_len, 11)
-            "agent_route_lane_order", # (chosen_agent_num, chosen_lane_num)
+            "agent_route_lane_order",  # (chosen_agent_num, chosen_lane_num)
         ]
 
         new_key_to_npz_key: Dict[str, str] = {
+            "planner_future_11_dim": "ego_future_gt_11_dim",  # (future_len, 11)
             "near_future_gt_3_dim": "neighbor_future_gt_3_dim", # (chosen_agent_num, future_len, 3)
-            "planner_future_11_dim": "ego_future_gt_11_dim", # (future_len, 11)
         }
 
         sample: Dict[str, Any] = {}

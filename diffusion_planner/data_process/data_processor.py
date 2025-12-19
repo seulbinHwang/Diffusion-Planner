@@ -1409,6 +1409,7 @@ class DataProcessor(object):
                                           neighbor_track_token)
             # (max_agent_num, 11)
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
+
             map_key_to_array = map_process(
                 route_roadblock_ids, car_token_to_rr_ids, neighbor_track_token,
                 neighbor_agents_current, ego_cur_pose_np,
