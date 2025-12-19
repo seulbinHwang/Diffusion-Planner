@@ -9,8 +9,7 @@ export PYTHONUNBUFFERED=1
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
 TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
-TRAIN_SET_NAME="processed_route_with_small"
-TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
+NUBES_NUPLAN_FOLDER_NAME="processed_nuplan_final_150"
 ###################################
 #
 # ---------------- Preflight clean-up ----------------
@@ -40,22 +39,14 @@ echo "[Preflight] Cleaning previous artifacts..."
 
 echo "[Preflight] Done."
 # ----------------------------------------------------
-
-#echo "Start downloading diffusion_planner_training.json"
-#nubescli download \
-#    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_JSON_PATH}/diffusion_planner_training.json \
-#    "$TRAIN_SET_LIST_PATH" \
-#    --no-progress
-#echo "Finish downloading diffusion_planner_training.json"
-
-#echo "Start downloading processed dataset"
+echo "[Start] Nuplan dataset / NUBES -> PVC "
 nubescli dir-download \
-    labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME} \
+    labs-mlops/ad/research/pnc/hsb/dataset/${NUBES_NUPLAN_FOLDER_NAME} \
     "$TRAIN_SET_PATH" \
     -j "$(nproc)" \
     -s \
     --no-progress
-#echo "Finish downloading processed dataset"
+echo "[END] Nuplan dataset / NUBES -> PVC "
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3 #,4,5,6,7
 

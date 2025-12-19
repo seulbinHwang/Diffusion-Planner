@@ -74,7 +74,6 @@ class DiffusionPlannerData(Dataset):
         if data is None:
             # 이 샘플은 건너뛰고, DataLoader가 다시 뽑도록 예외를 던지거나
             raise IndexError(f"Corrupted sample at index {idx}")
-        # 🔧 [임시 버그 패치] 구버전 캐시의 neighbor_future_gt_3_dim off-by-one 보정
         output_keys: List[str] = [
             "ego_agent_past",
             "ego_future_gt_3_dim",
