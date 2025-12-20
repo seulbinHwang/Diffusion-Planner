@@ -860,6 +860,132 @@ class DiffusionPlannerCollate:
         self.center_crop_mode: str = str(
             getattr(args, "center_crop_mode", "none")).lower()
 
+    def _get_special_padding_category_spec(
+            self,
+            key: str,
+    ) -> Optional[Tuple[int, int]]:
+        """특정 key에 대해, '패딩을 어떤 카테고리로 채울지' 규칙을 돌려줍니다.
+
+        이 함수가 필요한 이유
+        --------------------
+        lane_type / left_line_type / right_line_type 같은 값은
+        보통 (카테고리 개수)만큼의 길이를 가진 벡터(대부분 one-hot)로 들어옵니다.
+
+        그런데 패딩을 전부 0으로 채우면,
+        나중에 argmax 같은 방식으로 카테고리를 뽑을 때
+        "전부 0 → 0번 카테고리"로 잘못 해석될 수 있습니다.
+
+        그래서 아래 key들만은 패딩을 0이 아니라
+        '모름/미정'에 해당하는 카테고리로 채우도록 규칙을 따로 둡니다.
+
+        Args:
+            key (str):
+                샘플 dict의 key 이름. shape: ()
+
+        Returns:
+            Optional[Tuple[int, int]]:
+                - (unknown_category_index, num_categories)
+                - lane_type: (3, 4)  -> (L, 4)에서 마지막(3번)을 1로 채움
+                - left/right_line_type: (11, 13) -> (L, 13)에서 11번을 1로 채움
+                - 그 외 key는 None
+        """
+        key_str = str(key)
+        if key_str == "lane_type":
+            return 3, 4
+        if key_str in ("left_line_type", "right_line_type"):
+            return 11, 13
+        return None
+
+    def _infer_max_lane_num_from_batch(
+            self,
+            batch: List[Dict[str, Any]],
+    ) -> int:
+        """배치에서 'lane 개수의 최대값'을 안전하게 구합니다.
+
+        이 함수가 필요한 이유
+        --------------------
+        lane_type / line_type 같은 값이 어떤 샘플에서는 None일 수 있습니다.
+        그런데 그 샘플의 lanes 개수는 클 수 있어서,
+        단순히 non-None 값들만 보고 max 길이를 정하면
+        lanes 텐서와 lane_type 텐서의 lane 차원이 달라질 수 있습니다.
+
+        그래서 lane 관련 key들은 lane 차원을 항상 lanes 기준으로 맞추기 위해
+        batch 전체의 lanes.shape[0] 최대값을 구합니다.
+
+        Args:
+            batch (List[Dict[str, Any]]):
+                - 길이 B의 샘플 dict 리스트.
+
+        Returns:
+            int:
+                - max_lane_num: 배치 내 lanes의 첫 번째 축 최대값. shape: ()
+        """
+        max_lane_num: int = 0
+        for sample in batch:
+            lanes_value = sample.get("lanes", None)
+            if lanes_value is None:
+                continue
+            lanes_arr = np.asarray(lanes_value)
+            if lanes_arr.ndim >= 1:
+                max_lane_num = max(max_lane_num, int(lanes_arr.shape[0]))
+        return int(max_lane_num)
+
+    def _build_default_padded_tensor_for_key(
+            self,
+            key: str,
+            out_shape: Tuple[int, ...],
+            dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """key 성격에 맞는 '기본 패딩 텐서'를 만듭니다.
+
+        기본 규칙
+        --------
+        - 대부분의 key: 0으로 채운 텐서를 만듭니다.
+        - lane_type: (…, 4) 형태라면 마지막 축에서 3번 인덱스만 1로 채웁니다.
+            즉, [0,0,0,1] 형태의 "미정" one-hot 패딩입니다.
+        - left_line_type / right_line_type: (…, 13) 형태라면 마지막 축에서 11번만 1로 채웁니다.
+            즉, "선은 있으나 타입 모름" one-hot 패딩입니다.
+
+        주의
+        ----
+        - 만약 어떤 이유로 one-hot 형태가 아니라 (…, ) 라벨 형태로 들어온다면,
+          그 경우는 텐서 전체를 unknown 카테고리 숫자(예: 3, 11)로 채웁니다.
+
+        Args:
+            key (str):
+                샘플 dict의 key 이름. shape: ()
+            out_shape (Tuple[int, ...]):
+                출력 텐서 shape.
+                예:
+                  - lane_type: (B, L_max, 4)
+                  - left_line_type: (B, L_max, 13)
+            dtype (torch.dtype):
+                출력 텐서 dtype.
+
+        Returns:
+            torch.Tensor:
+                out: out_shape 그대로의 텐서.
+        """
+        spec = self._get_special_padding_category_spec(key)
+        if spec is None:
+            return torch.zeros(out_shape, dtype=dtype)
+
+        unknown_index, num_categories = int(spec[0]), int(spec[1])
+
+        # out_shape가 충분히 길고, 마지막 축이 카테고리 개수와 맞으면 one-hot 패딩
+        if len(out_shape) >= 2 and int(out_shape[-1]) == int(num_categories):
+            out = torch.zeros(out_shape, dtype=dtype)
+            if 0 <= unknown_index < num_categories:
+                out[..., unknown_index] = torch.as_tensor(1, dtype=dtype)
+            return out
+
+        # one-hot이 아니라 라벨 형태(예: (B, L_max))로 들어오는 경우를 대비한 fallback
+        if len(out_shape) >= 2:
+            return torch.full(out_shape, fill_value=unknown_index, dtype=dtype)
+
+        # 기대 형태가 너무 이상하면 안전하게 0으로
+        return torch.zeros(out_shape, dtype=dtype)
+
     # ------------------------------------------------------------------
     # 0) 크로핑 여부 판단
     # ------------------------------------------------------------------
@@ -1892,25 +2018,37 @@ class DiffusionPlannerCollate:
         return out
 
     def _pad_and_stack_variable_key_for_named_key(
-        self,
-        key: str,
-        values: List[Any],
+            self,
+            key: str,
+            values: List[Any],
+            batch: List[Dict[str, Any]],
     ) -> Optional[torch.Tensor]:
         """(가변 길이 key) 배치 내 최대 shape 기준으로 padding 후 쌓습니다. validity면 bool로 강제합니다.
 
-        규칙
-        ----
-        - key가 "*_is_valid"면 dtype을 torch.bool로 강제합니다.
-          * 입력이 int(0/1)이어도 torch.bool로 변환되어 False/True가 됩니다.
-        - padding은 기본값 0(=False) 입니다.
-        - 단, agent_route_lane_order는 여기로 오지 않는다고 가정합니다.
-          (별도 -1 패딩 함수로 처리)
+        추가로 반영된 규칙
+        ----------------
+        1) lane_type (shape: (lane_num, 4))
+           - 패딩을 0으로 하면 "전부 0 → 0번 카테고리"로 잘못 해석될 수 있습니다.
+           - 그래서 패딩 기본값을 (0,0,0,1)로 둡니다. (index 3이 1인 one-hot)
+
+        2) left_line_type / right_line_type (shape: (lane_num, 13))
+           - 패딩을 0으로 하면 특정 선 타입(0번)으로 잘못 해석될 수 있습니다.
+           - 그래서 패딩 기본값을 index 11이 1인 one-hot로 둡니다.
+             (선은 있으나 타입을 모름)
+
+        3) lane 관련 key는 lanes의 최대 lane_num에 맞춰 첫 번째 축 길이를 보정합니다.
+           - 어떤 샘플에서 lane_type이 None이라도,
+             lanes 개수는 클 수 있어서 lane 차원이 어긋나지 않게 보강합니다.
 
         Args:
-            key (str): key 이름. shape: ()
+            key (str):
+                key 이름. shape: ()
             values (List[Any]):
                 - 길이 B 리스트
                 - 각 원소는 ndarray/tensor 또는 None
+            batch (List[Dict[str, Any]]):
+                - 원본 샘플 dict 리스트(길이 B).
+                - lanes 개수 등을 참고하기 위해 사용합니다.
 
         Returns:
             Optional[torch.Tensor]:
@@ -1925,8 +2063,8 @@ class DiffusionPlannerCollate:
         ref_value = values[non_none_idx[0]]
         assert ref_value is not None
 
-        out_dtype: torch.dtype = self._choose_output_dtype_for_key(
-            key, ref_value)
+        out_dtype: torch.dtype = self._choose_output_dtype_for_key(key,
+                                                                   ref_value)
         ref_shape: Tuple[int, ...] = self._get_value_shape(ref_value)
         ndim: int = int(len(ref_shape))
 
@@ -1937,26 +2075,47 @@ class DiffusionPlannerCollate:
             v = values[i]
             assert v is not None
             shape_i = self._get_value_shape(v)
+
             if len(shape_i) != ndim:
                 raise ValueError(
                     f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. key={key}, "
-                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}")
+                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}"
+                )
+
             if shape_i != ref_shape:
                 all_same_shape = False
+
             for d in range(ndim):
                 if int(shape_i[d]) > int(max_shape[d]):
                     max_shape[d] = int(shape_i[d])
 
-        # 빠른 경로: None도 없고 shape도 동일
-        if all_same_shape and (len(non_none_idx) == batch_size):
+        # ✅ lane_type / line_type 계열은 lanes 최대 lane_num에 맞춰 첫 축을 보정
+        special_spec = self._get_special_padding_category_spec(key)
+        if special_spec is not None and ndim >= 1:
+            max_lane_num_from_lanes: int = self._infer_max_lane_num_from_batch(
+                batch)
+            if max_lane_num_from_lanes > int(max_shape[0]):
+                max_shape[0] = int(max_lane_num_from_lanes)
+
+        # 빠른 경로: 패딩이 전혀 필요 없으면 stack
+        # (special_spec가 있어도 max_shape가 ref_shape와 같으면 패딩 영역이 없으므로 stack 가능)
+        if all_same_shape and (len(non_none_idx) == batch_size) and (
+                tuple(max_shape) == tuple(ref_shape)):
             return torch.stack(
                 [torch.as_tensor(v, dtype=out_dtype) for v in values],
                 dim=0,
             )
 
         # out: shape (B, *max_shape)
-        out = torch.zeros((batch_size, *max_shape), dtype=out_dtype)
+        out_shape: Tuple[int, ...] = (batch_size,
+                                      *tuple(int(x) for x in max_shape))
+        out: torch.Tensor = self._build_default_padded_tensor_for_key(
+            key=key,
+            out_shape=out_shape,
+            dtype=out_dtype,
+        )
 
+        # 값 복사 (있는 샘플만 앞쪽부터 채움)
         for b_idx in non_none_idx:
             v = values[b_idx]
             assert v is not None
@@ -2123,7 +2282,7 @@ class DiffusionPlannerCollate:
                 batch_out[k] = self._pad_and_stack_agent_route_lane_order(batch)
                 continue
 
-            t = self._pad_and_stack_variable_key_for_named_key(k, values)
+            t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
             batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
 
         return batch_out
