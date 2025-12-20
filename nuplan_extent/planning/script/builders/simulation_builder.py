@@ -145,7 +145,7 @@ def build_simulations(
                 simulation_setup=simulation_setup,
                 callback=MultiCallback(callbacks + stateful_callbacks),
                 simulation_history_buffer_duration=cfg.
-                simulation_history_buffer_duration, # 2s # default_simulation.yaml
+                simulation_history_buffer_duration,  # 2s # default_simulation.yaml
             )
             simulations.append(SimulationRunner(simulation, planner))
 

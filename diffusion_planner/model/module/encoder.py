@@ -825,6 +825,9 @@ class Encoder(nn.Module):
         lanes: torch.Tensor,  # (B, L, lane_len, D_lane)
         lanes_speed_limit: torch.Tensor,  # (B, L, 1)
         lanes_has_speed_limit: torch.Tensor,  # (B, L, 1)
+        lane_type: Optional[torch.Tensor],  # (B, L, 4)
+        left_line_type: Optional[torch.Tensor],  # (B, L, 13)
+        right_line_type: Optional[torch.Tensor],  # (B, L, 13)
     ) -> Tuple[
             torch.Tensor,  # encoding_agents_chunk: (B, N_agents_tok, H)
             torch.Tensor,  # agents_chunk_mask:     (B, N_agents_tok)
@@ -886,7 +889,8 @@ class Encoder(nn.Module):
         lane_pos:       (B, lane_num, 8)
         """
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
-            lanes, lanes_speed_limit, lanes_has_speed_limit)
+            lanes, lanes_speed_limit, lanes_has_speed_limit, lane_type,
+            left_line_type, right_line_type)
 
         return (
             encoding_agents_chunk,
@@ -1157,6 +1161,9 @@ class Encoder(nn.Module):
                 lanes=lanes,
                 lanes_speed_limit=lanes_speed_limit,
                 lanes_has_speed_limit=lanes_has_speed_limit,
+                lane_type=lane_type,
+                left_line_type=left_line_type,
+                right_line_type=right_line_type,
             )
 
             # ---- (4) Fusion 입력 토큰 + 위치 임베딩 구성 ----
@@ -3173,8 +3180,14 @@ class LaneFusionEncoder(nn.Module):
         self.unknown_speed_emb = nn.Embedding(1, channels_mlp_dim)
         self.traffic_emb = nn.Linear(4, channels_mlp_dim)
         nn.init.normal_(self.traffic_emb.weight, std=0.02)
+        self.lane_type_emb = nn.Linear(4, channels_mlp_dim)
+        nn.init.normal_(self.lane_type_emb.weight, std=0.02)
+        self.left_line_type_emb = nn.Linear(13, channels_mlp_dim)
+        nn.init.normal_(self.left_line_type_emb.weight, std=0.02)
+        self.right_line_type_emb = nn.Linear(13, channels_mlp_dim)
+        nn.init.normal_(self.right_line_type_emb.weight, std=0.02)
 
-        self.channel_pre_project = Mlp(in_features=8,
+        self.channel_pre_project = Mlp(in_features=10,
                                        hidden_features=channels_mlp_dim,
                                        out_features=channels_mlp_dim,
                                        act_layer=nn.GELU,
@@ -3213,7 +3226,18 @@ class LaneFusionEncoder(nn.Module):
         lane_feature = torch.cat([lane_xyyaw, lane_type], dim=-1)
         return lane_feature
 
-    def forward(self, lanes, lanes_speed_limit, lanes_has_speed_limit):
+    def forward(
+            self,
+            lanes,
+            lanes_speed_limit,
+            lanes_has_speed_limit,
+            lane_type: Optional[
+                torch.Tensor],  # (B, lane_num, 4) # CHECK: 내가 추가한 부분
+            left_line_type: Optional[
+                torch.Tensor],  # (B, lane_num, 13) # CHECK: 내가 추가한 부분
+            right_line_type: Optional[
+                torch.Tensor],  # (B, lane_num, 13) # CHECK: 내가 추가한 부분
+    ):
         '''
         lanes: B, lane_num, lane_len, D (x, y, x'-x, y'-y, x_left-x, y_left-y, x_right-x, y_right-y, traffic(4))
         lanes_speed_limit: B, lane_num, 1
@@ -3227,6 +3251,28 @@ class LaneFusionEncoder(nn.Module):
 
         traffic = lanes[:, :, 0, 8:]  # (B, lane_num, 4)
         lanes = lanes[..., :8]  # (B, lane_num, lane_len, 8)
+        ###########
+        """ # CHECK: 내가 추가한 부분
+        left_is_valid: (B, lane_num, lane_len)
+            4,5 번쨰 값이 전부 0. 이 아니면 -> left_is_valid = True
+        right_is_valid: (B, lane_num, lane_len)
+            6,7 번쨰 값이 전부 0. 이 아니면 -> right_is_valid = True
+        """
+        # CHECK: 내가 추가한 부분
+        left_is_valid = torch.sum(torch.ne(lanes[..., 4:6], 0),
+                                  dim=-1) != 0  # (B, lane_num, lane_len)
+        right_is_valid = torch.sum(torch.ne(lanes[..., 6:8], 0),
+                                   dim=-1) != 0  # (B, lane_num, lane_len)
+        """
+        lanes : (B, lane_num, lane_len, 8) -> (B, lane_num, lane_len, 8 + 2 (left_is_valid, right_is_valid))
+        """
+        # CHECK: 내가 추가한 부분
+        lanes = torch.cat([
+            lanes,
+            left_is_valid.unsqueeze(-1).to(lanes.dtype),
+            right_is_valid.unsqueeze(-1).to(lanes.dtype)
+        ],
+                          dim=-1)  # (B, lane_num, lane_len, 10)
 
         lane_pos = lanes[:, :, int(self._lane_len /
                                    2), :4].clone()  # (B, lane_num, 4)
@@ -3237,7 +3283,8 @@ class LaneFusionEncoder(nn.Module):
         mask_v = torch.sum(torch.ne(lanes[..., :8], 0),
                            dim=-1).to(lanes.device) == 0
         mask_p = torch.sum(~mask_v, dim=-1) == 0
-        lanes = lanes.reshape(B * lane_num, lane_len, -1)
+        lanes = lanes.reshape(B * lane_num, lane_len,
+                              -1)  # (B*lane_num, lane_len, 10)
 
         valid_indices = ~mask_p.reshape(-1)
 
@@ -3315,6 +3362,23 @@ class LaneFusionEncoder(nn.Module):
             traffic)  # Traffic light embedding for valid data
 
         lanes = lanes + speed_limit_embedding + traffic_light_embedding
+        # CHECK: 내가 추가한 부분
+        lane_type = lane_type.reshape(B * lane_num, -1)  # (B*lane_num, 4)
+        left_line_type = left_line_type.reshape(B * lane_num,
+                                                -1)  # (B*lane_num, 13)
+        right_line_type = right_line_type.reshape(B * lane_num,
+                                                  -1)  # (B*lane_num, 13)
+        lane_type = lane_type[valid_indices]  # (num_valid, 4)
+        left_line_type = left_line_type[valid_indices]  # (num_valid, 13)
+        right_line_type = right_line_type[valid_indices]  # (num_valid, 13)
+        lane_type_embedding = self.lane_type_emb(
+            lane_type)  # (num_valid, channel)
+        left_line_type_embedding = self.left_line_type_emb(
+            left_line_type)  # (num_valid, channel)
+        right_line_type_embedding = self.right_line_type_emb(
+            right_line_type)  # (num_valid, channel)
+        lanes = lanes + lane_type_embedding + left_line_type_embedding + right_line_type_embedding  # (num_valid, channel)
+        # CHECK: 내가 추가한 부분
         lanes = self.emb_project(self.norm(lanes))
 
         out_dtype = lanes.dtype

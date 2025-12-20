@@ -385,12 +385,9 @@ def global_to_local(coords_global: np.ndarray, yaw_global: np.ndarray,
     return np.concatenate([coords_local, cos_l, sin_l], axis=1)
 
 
-def transform_trajectory(
-    future_traj_wrt_ego: np.ndarray,
-    ego_anchor_xy: np.ndarray,
-    ego_yaw: float,
-    agent_xyyaw: np.ndarray
-) -> np.ndarray:
+def transform_trajectory(future_traj_wrt_ego: np.ndarray,
+                         ego_anchor_xy: np.ndarray, ego_yaw: float,
+                         agent_xyyaw: np.ndarray) -> np.ndarray:
     """ego 기준 로컬 궤적을, 각 agent의 로컬 좌표계 궤적으로 변환합니다.
 
     중요한 점
@@ -422,7 +419,6 @@ def transform_trajectory(
     veh_center_xy = agent_xyyaw[:2]
     veh_yaw = float(agent_xyyaw[2])
     return global_to_local(coords_g, yaw_g, veh_center_xy, veh_yaw)
-
 
 
 def convert_center_to_rear_axle(traj_center: np.ndarray,
@@ -488,10 +484,10 @@ class WorldModelAgents(AbstractMLAgents):
         self._planner_step_gap_s = self._step_interval_us / 1e6  # [s]
         self.use_route_lanes = self.config.use_route_lanes
         self.use_ego_plan = self.config.use_ego_plan
-        set_coord_as_center: bool = bool(getattr(self.config, "set_coord_as_center", False))
+        set_coord_as_center: bool = bool(
+            getattr(self.config, "set_coord_as_center", False))
         self._ego_ref_point: Literal["rear_axle", "center"] = (
-            "center" if set_coord_as_center else "rear_axle"
-        )
+            "center" if set_coord_as_center else "rear_axle")
 
     def _get_ego_reference_se2(self, ego_state: EgoState) -> StateSE2:
         """현재 설정된 ego 기준점(rear axle 또는 center)의 포즈를 반환합니다.
@@ -539,7 +535,8 @@ class WorldModelAgents(AbstractMLAgents):
                 [x_global, y_global, yaw_global]
         """
         ref: StateSE2 = self._get_ego_reference_se2(ego_state)
-        out: npt.NDArray[np.floating] = np.array([ref.x, ref.y, ref.heading], dtype=dtype)
+        out: npt.NDArray[np.floating] = np.array([ref.x, ref.y, ref.heading],
+                                                 dtype=dtype)
         assert out.shape == (3,), f"Expected shape (3,), got {out.shape}"
         return out
 
@@ -563,11 +560,11 @@ class WorldModelAgents(AbstractMLAgents):
                 - yaw: float (rad)
         """
         ref: StateSE2 = self._get_ego_reference_se2(ego_state)
-        xy: npt.NDArray[np.floating] = np.array([ref.x, ref.y], dtype=dtype)  # shape (2,)
+        xy: npt.NDArray[np.floating] = np.array([ref.x, ref.y],
+                                                dtype=dtype)  # shape (2,)
         yaw: float = float(ref.heading)
         assert xy.shape == (2,), f"Expected shape (2,), got {xy.shape}"
         return xy, yaw
-
 
     def _initialize_open_loop_detection_types(
             self, open_loop_detections: List[str]) -> None:
@@ -670,6 +667,7 @@ class WorldModelAgents(AbstractMLAgents):
             ped_rate=ped_rate,
             dt=dt,
         )
+
     def _compute_sorted_distances(
         self, ego_state: EgoState, token_to_agent: Dict[str, Agent]
     ) -> tuple[list[str], npt.NDArray[np.float64]]:
@@ -693,7 +691,8 @@ class WorldModelAgents(AbstractMLAgents):
         if len(token_to_agent) == 0:
             return [], np.empty((0,), dtype=np.float64)
 
-        tokens: list[str] = list(token_to_agent.keys())  # len(tokens) == len(distances)
+        tokens: list[str] = list(
+            token_to_agent.keys())  # len(tokens) == len(distances)
 
         agents_xy: npt.NDArray[np.float32] = np.array(
             [token_to_agent[token].center.point.array for token in tokens],
@@ -702,16 +701,16 @@ class WorldModelAgents(AbstractMLAgents):
 
         ego_ref: StateSE2 = self._get_ego_reference_se2(ego_state)
         ego_xy: npt.NDArray[np.float32] = np.expand_dims(
-            ego_ref.point.array, axis=0
-        ).astype(np.float32)  # shape (1, 2)
+            ego_ref.point.array, axis=0).astype(np.float32)  # shape (1, 2)
 
-        distances: npt.NDArray[np.float64] = cdist(ego_xy, agents_xy).flatten()  # shape (N,)
-        sorted_indices: npt.NDArray[np.int64] = np.argsort(distances)  # shape (N,)
+        distances: npt.NDArray[np.float64] = cdist(
+            ego_xy, agents_xy).flatten()  # shape (N,)
+        sorted_indices: npt.NDArray[np.int64] = np.argsort(
+            distances)  # shape (N,)
 
         sorted_tokens: list[str] = [tokens[i] for i in sorted_indices]
         sorted_distances: npt.NDArray[np.float64] = distances[sorted_indices]
         return sorted_tokens, sorted_distances
-
 
     def _filter_diffusion_agents(self, ego_state: EgoState) -> None:
         """ego 기준으로 diffusion 대상 에이전트를 선별한다.
@@ -850,6 +849,7 @@ class WorldModelAgents(AbstractMLAgents):
             InterpolatableState] = next_ego_trajectory.get_state_at_times(
                 next_state_interpol_time_points)
         return interp_next_ego_states
+
     def _interpolated_state_to_local_np(
             self, interp_next_ego_state: List[InterpolatableState],
             current_ego_state: EgoState) -> npt.NDArray[np.float32]:
@@ -863,8 +863,7 @@ class WorldModelAgents(AbstractMLAgents):
         """
         interpol_num = len(interp_next_ego_state)
         interpol_abs_next_ego: npt.NDArray[np.float64] = np.zeros(
-            (interpol_num, 10), dtype=np.float64
-        )  # shape (T, 10)
+            (interpol_num, 10), dtype=np.float64)  # shape (T, 10)
         interpol_abs_next_ego[:, 7] = 1  # is vehicle
 
         for i, state in enumerate(interp_next_ego_state):
@@ -886,12 +885,10 @@ class WorldModelAgents(AbstractMLAgents):
 
         # ✅ [변경] anchor를 rear axle 고정이 아니라 "현재 설정된 ego 기준점"으로 사용
         anchor: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-            current_ego_state, dtype=np.float32
-        )  # shape (3,)
+            current_ego_state, dtype=np.float32)  # shape (3,)
 
         interp_next_ego_11_dim = convert_absolute_quantities_to_relative(
-            interpol_abs_next_ego, anchor, 'ego'
-        )
+            interpol_abs_next_ego, anchor, 'ego')
         return interp_next_ego_11_dim.astype(np.float32)
 
     def _from_ego_fut_traj_to_np(
@@ -900,15 +897,16 @@ class WorldModelAgents(AbstractMLAgents):
         """미래 ego 궤적을 diffusion planner 입력 배열로 변환한다."""
         planner_future_11_dim = None
         if ego_future_trajectory is not None:
-            future_states: List[EgoState] = list(ego_future_trajectory.get_sampled_trajectory())
+            future_states: List[EgoState] = list(
+                ego_future_trajectory.get_sampled_trajectory())
             future_states = future_states[1:]  # remove current
             valid_future_len = len(future_states)
             assert valid_future_len <= self.config.future_len, \
                 f"미래 상태 개수({valid_future_len})가 config.future_len({self.config.future_len})보다 큽니다."
 
             global_ego_fut_traj_10: npt.NDArray[np.float64] = np.zeros(
-                (self.config.future_len, 10), dtype=np.float64
-            )  # shape (future_len, 10)
+                (self.config.future_len, 10),
+                dtype=np.float64)  # shape (future_len, 10)
 
             for i, state in enumerate(future_states):
                 global_ego_fut_traj_10[i, 0] = state.center.x
@@ -928,13 +926,12 @@ class WorldModelAgents(AbstractMLAgents):
                 global_ego_fut_traj_10[i, 7] = 1  # is vehicle
 
             # ✅ [변경] anchor를 rear axle 고정이 아니라 "현재 설정된 ego 기준점"으로 사용
-            anchor: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-                current_ego_state, dtype=np.float32
-            )  # shape (3,)
+            anchor: npt.NDArray[
+                np.floating] = self._get_ego_reference_global_xyyaw(
+                    current_ego_state, dtype=np.float32)  # shape (3,)
 
             planner_future_11_dim = convert_absolute_quantities_to_relative(
-                global_ego_fut_traj_10, anchor, 'ego'
-            )  # shape (future_len, 11)
+                global_ego_fut_traj_10, anchor, 'ego')  # shape (future_len, 11)
 
             planner_future_11_dim[valid_future_len:, :] = 0.0
             planner_future_11_dim = planner_future_11_dim.astype(np.float32)
@@ -1204,8 +1201,8 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
 
         # ✅ [변경] ego 기준점(원점)을 rear axle 고정이 아니라, 설정값에 따름
         ego_anchor_xy, ego_yaw = self._get_ego_reference_global_xy_and_yaw(
-            self._ego_anchor_state, dtype=np.float64
-        )  # ego_anchor_xy: (2,), ego_yaw: float
+            self._ego_anchor_state,
+            dtype=np.float64)  # ego_anchor_xy: (2,), ego_yaw: float
 
         ########## TO DRAW ##########
         diff_token_to_interp_np_traj_wrt_ego: Dict[str,
@@ -1218,7 +1215,8 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             # future_traj_wrt_ego: (T, 4)
             # future_traj_wrt_ego 값이 전부 0. 이면 무시
             if np.allclose(future_traj_wrt_ego, 0.0):
-                raise ValueError(f"future_traj_wrt_ego for token {token} is all zeros.")
+                raise ValueError(
+                    f"future_traj_wrt_ego for token {token} is all zeros.")
             agent_xyyaw = diff_token_to_global_xyyaw[token]
             # ✅ 여기서 ego_anchor_xy가 center인지 rear axle인지가 "글로벌 변환의 평행이동"을 결정
             future_traj_wrt_npc_center = transform_trajectory(
@@ -1508,9 +1506,9 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
          diffusion_tokens_dist_order) = self._get_token_to_np_traj_wrt_ego(
              model_inputs, neighbor_token_dist_order, neighbor_agents_past)
 
-        cur_ego_global_xyyaw: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-            self._ego_anchor_state, dtype=np.float64
-        )  # shape (3,)
+        cur_ego_global_xyyaw: npt.NDArray[
+            np.floating] = self._get_ego_reference_global_xyyaw(
+                self._ego_anchor_state, dtype=np.float64)  # shape (3,)
         # Dict[str, np.ndarray] # (token, (3,)) # 현재 시점의 위치/방향
         diff_token_to_global_xyyaw = self._get_diff_token_to_cur_xyyaw(
             diffusion_tokens_dist_order)

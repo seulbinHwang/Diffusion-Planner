@@ -427,7 +427,6 @@ def transform_trajectory(
     return global_to_local(coords_g, yaw_g, veh_center_xy, veh_yaw)
 
 
-
 def convert_center_to_rear_axle(traj_center: np.ndarray,
                                 rear_wheelbase: float) -> np.ndarray:
     """
@@ -492,8 +491,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         set_coord_as_center: bool = bool(
             getattr(self.config, "set_coord_as_center", False))
         self._ego_ref_point: Literal["rear_axle", "center"] = (
-            "center" if set_coord_as_center else "rear_axle"
-        )
+            "center" if set_coord_as_center else "rear_axle")
 
     def _get_ego_reference_se2(self, ego_state: EgoState) -> StateSE2:
         """현재 설정된 ego 기준점의 위치/방향을 반환합니다.
@@ -522,10 +520,10 @@ class WorldModelLogReplay(AbstractMLAgents):
         return ego_state.rear_axle
 
     def _get_ego_reference_global_xyyaw(
-            self,
-            ego_state: EgoState,
-            *,
-            dtype: np.dtype = np.float64,
+        self,
+        ego_state: EgoState,
+        *,
+        dtype: np.dtype = np.float64,
     ) -> npt.NDArray[np.floating]:
         """ego 기준점의 글로벌 [x, y, yaw]를 numpy 배열로 반환합니다.
 
@@ -547,10 +545,10 @@ class WorldModelLogReplay(AbstractMLAgents):
         return out
 
     def _get_ego_reference_global_xy_and_yaw(
-            self,
-            ego_state: EgoState,
-            *,
-            dtype: np.dtype = np.float64,
+        self,
+        ego_state: EgoState,
+        *,
+        dtype: np.dtype = np.float64,
     ) -> Tuple[npt.NDArray[np.floating], float]:
         """ego 기준점의 글로벌 위치(x,y)와 방향(yaw)을 따로 반환합니다.
 
@@ -815,10 +813,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         return next_ego_plans
 
     def _preprocess_next_ego_plans(
-            self,
-            next_ego_plans: List[EgoState],
-            current_ego_state: EgoState
-    ) -> npt.NDArray[np.float32]:
+            self, next_ego_plans: List[EgoState],
+            current_ego_state: EgoState) -> npt.NDArray[np.float32]:
         """ego 미래 상태들을 diffusion planner 입력 배열로 변환합니다.
 
         Returns:
@@ -829,8 +825,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         """
         interpol_num = len(next_ego_plans)
 
-        absolute: npt.NDArray[np.float64] = np.zeros((interpol_num, 10),
-                                                     dtype=np.float64)  # shape (T, 10)
+        absolute: npt.NDArray[np.float64] = np.zeros(
+            (interpol_num, 10), dtype=np.float64)  # shape (T, 10)
         absolute[:, 7] = 1  # is vehicle
 
         for i, state in enumerate(next_ego_plans):
@@ -851,20 +847,16 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         # ✅ [핵심 변경] anchor를 rear axle 고정이 아니라 "설정된 ego 기준점"으로 사용
         anchor: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-            current_ego_state, dtype=np.float32
-        )  # shape (3,)
+            current_ego_state, dtype=np.float32)  # shape (3,)
 
-        relative: np.ndarray = convert_absolute_quantities_to_relative(absolute,
-                                                                       anchor,
-                                                                       'ego')  # shape (T, 11)
+        relative: np.ndarray = convert_absolute_quantities_to_relative(
+            absolute, anchor, 'ego')  # shape (T, 11)
         assert relative.shape == (interpol_num, 11)
         return relative.astype(np.float32)
 
     def _preprocess_ego_future_traj(
-            self,
-            ego_future_trajectory: InterpolatedTrajectory,
-            current_ego_state: EgoState
-    ) -> npt.NDArray[np.float32]:
+            self, ego_future_trajectory: InterpolatedTrajectory,
+            current_ego_state: EgoState) -> npt.NDArray[np.float32]:
         """미래 ego 궤적을 diffusion planner 입력 배열로 변환합니다."""
         future_states: List[EgoState] = list(
             ego_future_trajectory.get_sampled_trajectory())
@@ -892,12 +884,10 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         # ✅ [핵심 변경] anchor 기준점 통일
         anchor: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-            current_ego_state, dtype=np.float32
-        )  # shape (3,)
+            current_ego_state, dtype=np.float32)  # shape (3,)
 
-        relative: np.ndarray = convert_absolute_quantities_to_relative(absolute,
-                                                                       anchor,
-                                                                       'ego')  # shape (T, 11)
+        relative: np.ndarray = convert_absolute_quantities_to_relative(
+            absolute, anchor, 'ego')  # shape (T, 11)
         relative[future_len_plus_1:, :] = 0.0
         return relative.astype(np.float32)
 
@@ -925,10 +915,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         return interp_next_ego_states
 
     def _interpolated_state_to_local_np(
-            self,
-            interp_next_ego_state: List[InterpolatableState],
-            current_ego_state: EgoState
-    ) -> npt.NDArray[np.float32]:
+            self, interp_next_ego_state: List[InterpolatableState],
+            current_ego_state: EgoState) -> npt.NDArray[np.float32]:
         """보간된 ego 미래 상태들을 로컬 입력 배열로 변환합니다."""
         interpol_num = len(interp_next_ego_state)
 
@@ -954,12 +942,10 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         # ✅ [핵심 변경] anchor 기준점 통일
         anchor: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-            current_ego_state, dtype=np.float32
-        )  # shape (3,)
+            current_ego_state, dtype=np.float32)  # shape (3,)
 
         interp_next_ego_11_dim = convert_absolute_quantities_to_relative(
-            interpol_abs_next_ego, anchor, 'ego'
-        )  # (T, 11)
+            interpol_abs_next_ego, anchor, 'ego')  # (T, 11)
         return interp_next_ego_11_dim.astype(np.float32)
 
     def from_next_ego_state_to_traj_np(
@@ -982,10 +968,8 @@ class WorldModelLogReplay(AbstractMLAgents):
         return interp_next_ego_11_dim
 
     def _from_ego_fut_traj_to_np(
-            self,
-            ego_future_trajectory: InterpolatedTrajectory,
-            current_ego_state: EgoState
-    ) -> Optional[npt.NDArray[np.float32]]:
+            self, ego_future_trajectory: InterpolatedTrajectory,
+            current_ego_state: EgoState) -> Optional[npt.NDArray[np.float32]]:
         """미래 ego 궤적을 diffusion planner 입력 배열로 변환합니다."""
         planner_future_11_dim = None
         if ego_future_trajectory is None:
@@ -1000,8 +984,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             f"미래 상태 개수({valid_future_len})가 config.future_len({self.config.future_len})보다 큽니다."
 
         global_ego_fut_traj_10: npt.NDArray[np.float64] = np.zeros(
-            (self.config.future_len, 10), dtype=np.float64
-        )  # (future_len, 10)
+            (self.config.future_len, 10), dtype=np.float64)  # (future_len, 10)
 
         for i, state in enumerate(future_states):
             global_ego_fut_traj_10[i, 0] = state.center.x
@@ -1022,12 +1005,10 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         # ✅ [핵심 변경] anchor 기준점 통일
         anchor: npt.NDArray[np.floating] = self._get_ego_reference_global_xyyaw(
-            current_ego_state, dtype=np.float32
-        )  # shape (3,)
+            current_ego_state, dtype=np.float32)  # shape (3,)
 
         planner_future_11_dim = convert_absolute_quantities_to_relative(
-            global_ego_fut_traj_10, anchor, 'ego'
-        )  # (future_len, 11)
+            global_ego_fut_traj_10, anchor, 'ego')  # (future_len, 11)
 
         planner_future_11_dim[valid_future_len:, :] = 0.0
         return planner_future_11_dim.astype(np.float32)
@@ -1238,7 +1219,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         return position, current_agent.center.heading
 
     def _compute_sorted_distances(
-            self, ego_state: EgoState, token_to_agent: Dict[str, Agent]
+        self, ego_state: EgoState, token_to_agent: Dict[str, Agent]
     ) -> tuple[list[str], npt.NDArray[np.float64]]:
         """ego와 각 agent 사이의 거리를 계산해 정렬된 결과를 반환합니다.
 
@@ -1267,11 +1248,10 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         ego_ref: StateSE2 = self._get_ego_reference_se2(ego_state)
         ego_xy: npt.NDArray[np.float32] = np.expand_dims(
-            ego_ref.point.array, axis=0
-        ).astype(np.float32)  # shape (1, 2)
+            ego_ref.point.array, axis=0).astype(np.float32)  # shape (1, 2)
 
-        distances: npt.NDArray[np.float64] = cdist(ego_xy,
-                                                   agents_xy).flatten()  # shape (N,)
+        distances: npt.NDArray[np.float64] = cdist(
+            ego_xy, agents_xy).flatten()  # shape (N,)
         sorted_indices: npt.NDArray[np.int64] = np.argsort(
             distances)  # shape (N,)
 
@@ -1430,17 +1410,18 @@ class WorldModelLogReplay(AbstractMLAgents):
 
         # ✅ [핵심 변경] ego 로컬 좌표의 원점을 rear axle 고정이 아니라, 설정된 기준점으로 통일
         ego_anchor_xy, ego_yaw = self._get_ego_reference_global_xy_and_yaw(
-            self._ego_anchor_state, dtype=np.float64
-        )  # ego_anchor_xy: (2,), ego_yaw: float
+            self._ego_anchor_state,
+            dtype=np.float64)  # ego_anchor_xy: (2,), ego_yaw: float
 
         ########## TO DRAW ##########
-        diff_token_to_interp_np_traj_wrt_ego: Dict[
-            str, np.ndarray] = {}  # (1+T, 11)
+        diff_token_to_interp_np_traj_wrt_ego: Dict[str,
+                                                   np.ndarray] = {}  # (1+T, 11)
         #############################
 
         diff_token_to_interpol_traj: Dict[str, AbstractTrajectory] = {}
 
-        for token, future_traj_wrt_ego in diff_token_to_np_gen_traj_wrt_ego.items():
+        for token, future_traj_wrt_ego in diff_token_to_np_gen_traj_wrt_ego.items(
+        ):
             if np.allclose(future_traj_wrt_ego, 0.0):
                 raise ValueError("future_traj_wrt_ego 값이 전부 0. 입니다.")
 
@@ -1457,50 +1438,42 @@ class WorldModelLogReplay(AbstractMLAgents):
             self_history: Deque[Agent] = diffusion_token_to_agent_history[token]
             future_trajectory = InterpolatedTrajectory(
                 trajectory=self.outputs_to_trajectory(
-                    future_traj_wrt_npc_center, self_history, sim_step_gap_s
-                )
-            )
+                    future_traj_wrt_npc_center, self_history, sim_step_gap_s))
             diff_token_to_interpol_traj[token] = future_trajectory
 
             ########## TO DRAW ##########
             diff_token_to_interp_np_traj_wrt_ego[
                 token] = self._get_rel_future_arrays_to_draw(
-                future_trajectory, cur_ego_global_xyyaw
-            )
+                    future_trajectory, cur_ego_global_xyyaw)
             #############################
 
         self._draw_infos.diff_token_to_interp_np_traj_wrt_ego = diff_token_to_interp_np_traj_wrt_ego
         return diff_token_to_interpol_traj
 
-    def infer_model(
-            self,
-            model_input_key_to_value: Dict[str, AbstractModelFeature],
-            iteration: SimulationIteration,
-            next_iteration: SimulationIteration,
-            neighbor_token_dist_order: List[Optional[str]],
-            diff_token_to_future_gt_3_dim: Dict[str, np.ndarray],
-            neighbor_agents_past: np.ndarray
-    ) -> None:
+    def infer_model(self, model_input_key_to_value: Dict[str,
+                                                         AbstractModelFeature],
+                    iteration: SimulationIteration,
+                    next_iteration: SimulationIteration,
+                    neighbor_token_dist_order: List[Optional[str]],
+                    diff_token_to_future_gt_3_dim: Dict[str, np.ndarray],
+                    neighbor_agents_past: np.ndarray) -> None:
         model_inputs: AbstractModelFeature = model_input_key_to_value[
             "world_model_feature"]
 
         (diff_token_to_np_gen_traj_wrt_ego,
          diffusion_tokens_dist_order) = self._get_token_to_np_traj_wrt_ego(
-            model_inputs, neighbor_token_dist_order, neighbor_agents_past
-        )
+             model_inputs, neighbor_token_dist_order, neighbor_agents_past)
 
         # ✅ [핵심 변경] ego 로컬/글로벌 변환에 쓰는 기준점을 통일
         cur_ego_global_xyyaw: npt.NDArray[
             np.floating] = self._get_ego_reference_global_xyyaw(
-            self._ego_anchor_state, dtype=np.float64
-        )  # shape (3,)
+                self._ego_anchor_state, dtype=np.float64)  # shape (3,)
 
         diff_token_to_global_xyyaw = self._get_diff_token_to_cur_xyyaw(
             diffusion_tokens_dist_order)
 
         diffusion_token_to_agent_history = get_token_to_history(
-            self.observation_buffer, iteration, diffusion_tokens_dist_order
-        )
+            self.observation_buffer, iteration, diffusion_tokens_dist_order)
 
         self._get_diff_token_to_np_history_to_draw(
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)

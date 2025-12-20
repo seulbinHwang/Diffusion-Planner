@@ -1,4 +1,5 @@
 from __future__ import annotations
+from diffusion_planner.utils.validity import add_validity_keys_inplace
 
 from typing import Dict, Type, Optional, List
 import numpy as np
@@ -45,7 +46,8 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     ) -> Dict[str, np.ndarray]:
         neighbor_agents_past = self.unnormalized_features[
             "neighbor_agents_past"]  # (max_agent_num, time_len, 11)
-        neighbor_current_xy = neighbor_agents_past[:, -1, :2]  # (max_agent_num, 2)
+        neighbor_current_xy = neighbor_agents_past[:,
+                                                   -1, :2]  # (max_agent_num, 2)
         token_to_current_xy = {}
         for idx, token in enumerate(target_track_token):
             if token is None:
@@ -115,66 +117,73 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                 initialization.map_api,
                 scenario=initialization.scenario,
                 use_route_lanes=initialization.use_route_lanes,
-                squeeze=True)
-        # (interpol_num, 11)
+                squeeze=True,
+            )
 
+        # (interpol_num, 11)
         model_inputs[
             "ego_agent_next_11_dim"] = current_input.ego_agent_next_11_dim
         # (future_len, 11)
         model_inputs[
             "planner_future_11_dim"] = current_input.planner_future_11_dim
-        # # List[Optional[str]], (max_agent_num,)
+
+        # List[Optional[str]], (max_agent_num,)
         neighbor_track_token = model_inputs["neighbor_track_token"]
         model_inputs.pop("neighbor_track_token")
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model_inputs: Dict[str,
-                           torch.Tensor] = convert_data_dict_to_device_tensors(model_inputs,
-                                                                   device,
-                                                                   squeeze=True)
-        self.unnormalized_features = model_inputs.copy()
-        for key in self.unnormalized_features:
-            # torch -> numpy
-            self.unnormalized_features[key] = self.unnormalized_features[
-                key].cpu().numpy()
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_inputs = convert_data_dict_to_device_tensors(model_inputs,
+                                                           device,
+                                                           squeeze=True)
+
+        # ✅ (핵심) validity key 추가: simulation 경로는 None을 섞으면 위험하니 skip 사용
+        add_validity_keys_inplace(model_inputs, missing_policy="skip")
+
+        # unnormalized_features 저장 (torch -> numpy)
+        self.unnormalized_features = {}
+        for key, value in model_inputs.items():
+            # value: torch.Tensor, shape는 key마다 다름
+            self.unnormalized_features[key] = value.detach().cpu().numpy()
+
         self.unnormalized_features[
             "neighbor_track_token"] = neighbor_track_token
+
+        # normalize
         model_inputs = self.observation_normalizer(model_inputs)
-        """
-        input
-            - neighbor_track_token :  List[Optional[str]], (max_agent_num,)
-            - diffusion_agents_tokens: List[str], (valid_agent_num) maxlen=Pnn
-        output
-            - target_agents_mask: np.ndarray, (max_agent_num,) bool
-        """
+
+        # target agent mask 계산
         target_agents_mask = self._get_target_agents_mask(
-            neighbor_track_token, current_input.diffusion_agents_tokens)
+            neighbor_track_token,
+            current_input.diffusion_agents_tokens,
+        )
         self._post_process_unnormalized_features(neighbor_track_token,
                                                  target_agents_mask)
 
         world_model_feature = WorldModelFeature(
             ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)
-            neighbor_agents_past=model_inputs[
-                "neighbor_agents_past"],  # (max_agent_num, time_len, 11)
-            static_objects=model_inputs[
-                "static_objects"],  # (static_objects_num, 10)
+            neighbor_agents_past=model_inputs["neighbor_agents_past"],
+            # (max_agent_num, time_len, 11)
+            static_objects=model_inputs["static_objects"],
+            # (static_objects_num, 10)
             lanes=model_inputs["lanes"],  # (lane_num, lane_len, 12)
-            lanes_speed_limit=model_inputs[
-                "lanes_speed_limit"],  # (lane_num, 1)
-            lanes_has_speed_limit=model_inputs[
-                "lanes_has_speed_limit"],  # (lane_num, 1)
-            route_lanes=model_inputs[
-                "route_lanes"],  # (route_num, lane_len, 12)
-            route_lanes_speed_limit=model_inputs[
-                "route_lanes_speed_limit"],  # (route_num, 1)
+            lanes_speed_limit=model_inputs["lanes_speed_limit"],
+            # (lane_num, 1)
+            lanes_has_speed_limit=model_inputs["lanes_has_speed_limit"],
+            # (lane_num, 1)
+            route_lanes=model_inputs["route_lanes"],
+            # (route_num, lane_len, 12)
+            route_lanes_speed_limit=model_inputs["route_lanes_speed_limit"],
+            # (route_num, 1)
             route_lanes_has_speed_limit=model_inputs[
                 "route_lanes_has_speed_limit"],  # (route_num, 1)
-            agent_route_lane_order=model_inputs[
-                "agent_route_lane_order"],  # (max_agent_num, 1)
+            agent_route_lane_order=model_inputs["agent_route_lane_order"],
+            # (max_agent_num, 1)
             target_agents_mask=target_agents_mask,  # (max_agent_num,) bool
-            ego_agent_next_11_dim=model_inputs[
-                "ego_agent_next_11_dim"],  # (interpol_num, 11)
-            planner_future_11_dim=model_inputs["planner_future_11_dim"]
-        )  # (future_len, 11)
+            ego_agent_next_11_dim=model_inputs["ego_agent_next_11_dim"],
+            # (interpol_num, 11)
+            planner_future_11_dim=model_inputs["planner_future_11_dim"],
+            # (future_len, 11)
+        )
         return world_model_feature
 
     def _get_target_agents_mask(

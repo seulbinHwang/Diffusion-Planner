@@ -3471,9 +3471,9 @@ def build_cache_dict_for_scenario(
 
         lane_type: (L,4) float32
 
-        left_line_type: (L,10) float32
+        left_line_type: (L,13) float32
 
-        right_line_type: (L,10) float32
+        right_line_type: (L,13) float32
 
         road_edge: (E,10,2) float32
 
