@@ -1123,12 +1123,12 @@ class Encoder(nn.Module):
                 lane_type,  # (B, L, 4) or None
                 left_line_type,  # (B, L, 13) or None
                 right_line_type,  # (B, L, 13) or None
-                stop_sign_points,  # (stop_sign_num, safety_len, 2) or None
-                crosswalk_points,  #  (crosswalk_num, safety_len, 2) or None
-                speed_bump_points,  #  (speed_bump_num, safety_len, 2) or None
-                driveway_points,  # (driveway_num, safety_len, 2) or None
-                road_edge,  # (road_edge_num, safety_len, 2) or None
-                road_edge_type,  # (road_edge_num, safety_len, 3) or None
+                stop_sign_points,  # (B, stop_sign_num, safety_len, 2) or None
+                crosswalk_points,  #  (B, crosswalk_num, safety_len, 2) or None
+                speed_bump_points,  #  (B, speed_bump_num, safety_len, 2) or None
+                driveway_points,  # (B, driveway_num, safety_len, 2) or None
+                road_edge,  # (B, road_edge_num, safety_len, 2) or None
+                road_edge_type,  # (B, road_edge_num, 3) or None
                 B,
                 future_len,
             ) = self._prepare_encoder_inputs(inputs)
@@ -3153,6 +3153,23 @@ class StaticFusionEncoder(nn.Module):
         return static_feature
 
 
+class RoadSafetyFusionEncoder(nn.Module):
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+            self,
+            stop_sign_points: Optional[torch.Tensor],  # (B, Ns, safety_len, 2)
+            crosswalk_points: Optional[torch.Tensor],  # (B, Nc, safety_len, 2)
+            speed_bump_points: Optional[torch.Tensor],  # (B, Nb, safety_len, 2)
+            driveway_points: Optional[torch.Tensor],  # (B, Nd, safety_len, 2)
+            road_edge: Optional[torch.Tensor],  # (B, Ne, safety_len, 2)
+            road_edge_type: Optional[torch.Tensor],  # (B, Ne, 4)
+    ):
+        return encoding_road_safety, road_safety_mask, road_safety_pos
+
+
 class LaneFusionEncoder(nn.Module):
 
     def __init__(self,
@@ -3252,13 +3269,13 @@ class LaneFusionEncoder(nn.Module):
         traffic = lanes[:, :, 0, 8:]  # (B, lane_num, 4)
         lanes = lanes[..., :8]  # (B, lane_num, lane_len, 8)
         ###########
-        """ # CHECK: 내가 추가한 부분
+        """ # CHECK: 내가 추가한 부분 
         left_is_valid: (B, lane_num, lane_len)
             4,5 번쨰 값이 전부 0. 이 아니면 -> left_is_valid = True
         right_is_valid: (B, lane_num, lane_len)
             6,7 번쨰 값이 전부 0. 이 아니면 -> right_is_valid = True
         """
-        # CHECK: 내가 추가한 부분
+        # CHECK: 내가 추가한 부분 시작
         left_is_valid = torch.sum(torch.ne(lanes[..., 4:6], 0),
                                   dim=-1) != 0  # (B, lane_num, lane_len)
         right_is_valid = torch.sum(torch.ne(lanes[..., 6:8], 0),
@@ -3266,7 +3283,7 @@ class LaneFusionEncoder(nn.Module):
         """
         lanes : (B, lane_num, lane_len, 8) -> (B, lane_num, lane_len, 8 + 2 (left_is_valid, right_is_valid))
         """
-        # CHECK: 내가 추가한 부분
+        # CHECK: 내가 추가한 부분 끝
         lanes = torch.cat([
             lanes,
             left_is_valid.unsqueeze(-1).to(lanes.dtype),
@@ -3362,7 +3379,7 @@ class LaneFusionEncoder(nn.Module):
             traffic)  # Traffic light embedding for valid data
 
         lanes = lanes + speed_limit_embedding + traffic_light_embedding
-        # CHECK: 내가 추가한 부분
+        # CHECK: 내가 추가한 부분 시작
         lane_type = lane_type.reshape(B * lane_num, -1)  # (B*lane_num, 4)
         left_line_type = left_line_type.reshape(B * lane_num,
                                                 -1)  # (B*lane_num, 13)
@@ -3378,7 +3395,7 @@ class LaneFusionEncoder(nn.Module):
         right_line_type_embedding = self.right_line_type_emb(
             right_line_type)  # (num_valid, channel)
         lanes = lanes + lane_type_embedding + left_line_type_embedding + right_line_type_embedding  # (num_valid, channel)
-        # CHECK: 내가 추가한 부분
+        # CHECK: 내가 추가한 부분 끝
         lanes = self.emb_project(self.norm(lanes))
 
         out_dtype = lanes.dtype

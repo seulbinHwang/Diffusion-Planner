@@ -1,7 +1,8 @@
 from __future__ import annotations
 from diffusion_planner.utils.validity import add_validity_keys_inplace
 
-from typing import Dict, Type, Optional, List
+from dataclasses import fields as dataclass_fields
+from typing import Any, Dict, Type, Optional, List
 import numpy as np
 
 import torch
@@ -81,6 +82,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                     diff_token_to_future_gt_3_dim[
                         token] = neighbor_future_gt_3_dim[
                             idx]  # (future_len, 3)
+
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_all_gt_3_dim",
             None)  # (max_agent_num, future_all_len, 3)
@@ -88,24 +90,117 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         if neighbor_future_all_gt_3_dim is not None:
             for idx, token in enumerate(target_track_token):
                 if token is not None:
-                    # (future_all_len, 3)
-                    future_all_gt_3_dim = neighbor_future_all_gt_3_dim[idx]
+                    future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
+                        idx]  # (future_all_len, 3)
                     diff_token_to_future_all_gt_3_dim[
                         token] = future_all_gt_3_dim
-        # diff_token_to_agents_past: Dict[str, np.ndarray] = {}  # (time_len, 11)
+
         neighbor_agents_past = self.unnormalized_features[
             "neighbor_agents_past"]  # (max_agent_num, time_len, 11)
 
         self.unnormalized_features[
-            "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
+            "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim
         self.unnormalized_features[
-            "diff_token_to_future_all_gt_3_dim"] = diff_token_to_future_all_gt_3_dim  # Dict[str, np.ndarray] # len : valid_agent_num
+            "diff_token_to_future_all_gt_3_dim"] = diff_token_to_future_all_gt_3_dim
         self.unnormalized_features[
-            "neighbor_agents_past"] = neighbor_agents_past  # Dict[str, np.ndarray] # len : valid_agent_num
+            "neighbor_agents_past"] = neighbor_agents_past
+
+    def _get_model_input_value_for_world_model_field(
+        self,
+        model_inputs: Dict[str, torch.Tensor],
+        field_name: str,
+    ) -> Any:
+        """WorldModelFeature 필드에 해당하는 값을 model_inputs에서 찾아 반환합니다.
+
+        대부분의 경우는 `field_name == model_inputs의 key`라서 그대로 꺼내면 됩니다.
+        다만 일부 데이터는 같은 의미인데도 key 이름이 바뀌어 들어오는 경우가 있어,
+        그런 필드는 "후보 key 목록"을 순서대로 확인해 첫 번째로 찾은 값을 사용합니다.
+
+        예시:
+        - driveway_points 필드는 상황에 따라 model_inputs에
+          "driveway_points"로 들어오기도 하고, "driveway"로 들어오기도 합니다.
+          이 경우 둘 중 먼저 존재하는 key의 텐서를 사용합니다.
+
+        Args:
+            model_inputs: 전처리 및 normalize 이후의 입력 딕셔너리.
+                value는 torch.Tensor이며 shape는 key마다 다릅니다.
+                예)
+                - ego_agent_past: (time_len, 11)
+                - lanes: (lane_num, lane_len, 12)
+                - ego_agent_past_is_valid: (time_len,) bool
+            field_name: WorldModelFeature dataclass의 필드명.
+
+        Returns:
+            Any:
+                - model_inputs에서 값을 찾으면 해당 값(torch.Tensor 등)
+                - 못 찾으면 None
+        """
+        key_candidates_by_field: Dict[str, List[str]] = {
+            # validity.py 에서도 driveway는 ["driveway_points", "driveway"] 순으로 확인합니다.
+            "driveway_points": ["driveway_points", "driveway"],
+        }
+
+        candidates = key_candidates_by_field.get(field_name, [field_name])
+        for key in candidates:
+            if key in model_inputs:
+                return model_inputs[key]
+        return None
+
+    def _build_world_model_feature_kwargs(
+        self,
+        model_inputs: Dict[str, torch.Tensor],
+        target_agents_mask: Optional[np.ndarray],
+    ) -> Dict[str, Any]:
+        """WorldModelFeature 생성에 필요한 모든 필드 값을 dict로 구성합니다.
+
+        이 함수의 목표는 다음과 같습니다.
+        1) WorldModelFeature에 새 필드가 추가되더라도,
+           get_features_from_simulation 쪽에서 "필드 누락"이 생기지 않게 합니다.
+        2) builder가 만들 수 없는 값은 None으로 채워서,
+           WorldModelFeature 인스턴스가 항상 "모든 필드"를 가지게 합니다.
+
+        동작 규칙:
+        - WorldModelFeature dataclass에 정의된 모든 필드를 순회합니다.
+        - 각 필드에 대해:
+          * builder가 직접 만든 값(예: target_agents_mask)이 있으면 그 값을 사용
+          * 아니면 model_inputs에서 같은 이름의 key를 찾고,
+            필요한 경우 후보 key(예: driveway_points vs driveway)도 확인합니다.
+          * 끝까지 못 찾으면 None을 넣습니다.
+
+        Args:
+            model_inputs: normalize 이후의 입력 딕셔너리. value: torch.Tensor.
+            target_agents_mask: (max_agent_num,) bool 형태의 numpy 배열 또는 None.
+
+        Returns:
+            Dict[str, Any]:
+                WorldModelFeature(**kwargs)에 바로 넣을 수 있는 매핑.
+                값은 torch.Tensor / np.ndarray / None 중 하나입니다.
+        """
+        overrides: Dict[str, Any] = {
+            # target_agents_mask: (max_agent_num,) bool
+            "target_agents_mask": target_agents_mask,
+        }
+
+        feature_kwargs: Dict[str, Any] = {}
+        for field in dataclass_fields(WorldModelFeature):
+            field_name = field.name
+            if field_name in overrides:
+                feature_kwargs[field_name] = overrides[field_name]
+                continue
+
+            feature_kwargs[
+                field_name] = self._get_model_input_value_for_world_model_field(
+                    model_inputs=model_inputs,
+                    field_name=field_name,
+                )
+
+        return feature_kwargs
 
     def get_features_from_simulation(
-            self, current_input: PlannerInput,
-            initialization: HorizonPlannerInitialization) -> WorldModelFeature:
+        self,
+        current_input: PlannerInput,
+        initialization: HorizonPlannerInitialization,
+    ) -> WorldModelFeature:
         history_buffer: SimulationHistoryBuffer = current_input.history
         traffic_light_data = list(current_input.traffic_light_data)
 
@@ -136,13 +231,12 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                                                            device,
                                                            squeeze=True)
 
-        # ✅ (핵심) validity key 추가: simulation 경로는 None을 섞으면 위험하니 skip 사용
+        # (핵심) validity key 추가: simulation 경로는 None을 섞으면 위험하니 skip 사용
         add_validity_keys_inplace(model_inputs, missing_policy="skip")
 
         # unnormalized_features 저장 (torch -> numpy)
         self.unnormalized_features = {}
         for key, value in model_inputs.items():
-            # value: torch.Tensor, shape는 key마다 다름
             self.unnormalized_features[key] = value.detach().cpu().numpy()
 
         self.unnormalized_features[
@@ -159,36 +253,18 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         self._post_process_unnormalized_features(neighbor_track_token,
                                                  target_agents_mask)
 
-        world_model_feature = WorldModelFeature(
-            ego_agent_past=model_inputs["ego_agent_past"],  # (time_len, 11)
-            neighbor_agents_past=model_inputs["neighbor_agents_past"],
-            # (max_agent_num, time_len, 11)
-            static_objects=model_inputs["static_objects"],
-            # (static_objects_num, 10)
-            lanes=model_inputs["lanes"],  # (lane_num, lane_len, 12)
-            lanes_speed_limit=model_inputs["lanes_speed_limit"],
-            # (lane_num, 1)
-            lanes_has_speed_limit=model_inputs["lanes_has_speed_limit"],
-            # (lane_num, 1)
-            route_lanes=model_inputs["route_lanes"],
-            # (route_num, lane_len, 12)
-            route_lanes_speed_limit=model_inputs["route_lanes_speed_limit"],
-            # (route_num, 1)
-            route_lanes_has_speed_limit=model_inputs[
-                "route_lanes_has_speed_limit"],  # (route_num, 1)
-            agent_route_lane_order=model_inputs["agent_route_lane_order"],
-            # (max_agent_num, 1)
-            target_agents_mask=target_agents_mask,  # (max_agent_num,) bool
-            ego_agent_next_11_dim=model_inputs["ego_agent_next_11_dim"],
-            # (interpol_num, 11)
-            planner_future_11_dim=model_inputs["planner_future_11_dim"],
-            # (future_len, 11)
+        # WorldModelFeature의 "모든 필드"를 채워서 생성
+        world_model_feature_kwargs = self._build_world_model_feature_kwargs(
+            model_inputs=model_inputs,
+            target_agents_mask=target_agents_mask,
         )
+        world_model_feature = WorldModelFeature(**world_model_feature_kwargs)
         return world_model_feature
 
     def _get_target_agents_mask(
-            self, neighbor_track_token: List[Optional[str]],
-            diffusion_agents_tokens: Optional[List[str]]
+        self,
+        neighbor_track_token: List[Optional[str]],
+        diffusion_agents_tokens: Optional[List[str]],
     ) -> Optional[np.ndarray]:
         """
         input

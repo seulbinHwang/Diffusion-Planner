@@ -213,6 +213,47 @@ class WorldModelFeature(AbstractModelFeature):
     planner_future_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
 
     #########################
+    ######## validity ########
+    # diffusion_planner/utils/validity.py 의 build_validity_key_dict()가 만드는
+    # 모든 `~~~_is_valid` 키를 그대로 필드로 반영합니다.
+
+    ego_agent_past_is_valid: Optional[
+        FeatureDataType] = None  # (time_len,) bool
+    ego_future_gt_is_valid: Optional[
+        FeatureDataType] = None  # (future_len,) bool
+
+    neighbor_agents_past_is_valid: Optional[
+        FeatureDataType] = None  # (max_agent_num, time_len) bool
+    neighbor_agents_is_valid: Optional[
+        FeatureDataType] = None  # (max_agent_num,) bool
+    neighbor_future_gt_is_valid: Optional[
+        FeatureDataType] = None  # (max_agent_num,) bool
+
+    stop_sign_is_valid: Optional[
+        FeatureDataType] = None  # (stop_sign_num,) bool
+    crosswalk_is_valid: Optional[
+        FeatureDataType] = None  # (crosswalk_num,) bool
+    speed_bump_is_valid: Optional[
+        FeatureDataType] = None  # (speed_bump_num,) bool
+    driveway_is_valid: Optional[FeatureDataType] = None  # (driveway_num,) bool
+
+    lanes_len_is_valid: Optional[
+        FeatureDataType] = None  # (lane_num, lane_len) bool
+    lanes_is_valid: Optional[FeatureDataType] = None  # (lane_num,) bool
+
+    static_objects_is_valid: Optional[
+        FeatureDataType] = None  # (static_objects_num,) bool
+
+    route_lanes_len_is_valid: Optional[
+        FeatureDataType] = None  # (route_num, lane_len) bool
+    route_lanes_is_valid: Optional[FeatureDataType] = None  # (route_num,) bool
+
+    agent_route_lane_order_is_valid: Optional[
+        FeatureDataType] = None  # (max_agent_num,) bool
+    road_edge_is_valid: Optional[
+        FeatureDataType] = None  # (chosen_edge_num,) bool
+
+    #########################
 
     def to_feature_tensor(self) -> WorldModelFeature:
         """모든 필드를 torch.Tensor로 변환해 반환합니다.
@@ -233,7 +274,8 @@ class WorldModelFeature(AbstractModelFeature):
             - lanes: (lane_num, lane_len, 12)
             - static_objects: (static_objects_num, 10) or None
             - driveway_points: (driveway_num, safety_len, 2) or None
-            - road_edge_type: (chosen_edge_num, 3) or None
+            - ego_agent_past_is_valid: (time_len,) bool or None
+            - lanes_is_valid: (lane_num,) bool or None
         """
         tensor_dict: Dict[str, Any] = {}
         for field in dataclass_fields(type(self)):
@@ -265,6 +307,7 @@ class WorldModelFeature(AbstractModelFeature):
             - lanes: (B, lane_num, lane_len, 12)
             - static_objects: (B, static_objects_num, 10) or None
             - road_edge: (B, chosen_edge_num, safety_len, 2) or None
+            - lanes_len_is_valid: (B, lane_num, lane_len) bool or None
         """
         tensor_dict: Dict[str, Any] = {}
         for field in dataclass_fields(type(self)):
