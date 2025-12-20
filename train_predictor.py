@@ -2075,28 +2075,34 @@ class DiffusionPlannerCollate:
 
         return out
 
+
     def _build_collated_batch_tensors(
             self,
             batch: List[Dict[str, Any]],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Optional[torch.Tensor]]:
         """배치(dict 리스트)를 최종 배치 텐서(dict)로 변환합니다.
 
         추가 규칙
         --------
+        - 어떤 key가 배치 내에서 전부 None이면:
+            · 기존: key 자체를 batch_out에서 제거
+            · 변경: batch_out[key] = None 으로 유지
         - "*_is_valid" 류 key는 입력이 int(0/1) 이 섞여 있어도 출력 dtype을 torch.bool로 강제합니다.
 
         Args:
             batch (List[Dict[str, Any]]): 길이 B 샘플 dict 리스트
 
         Returns:
-            Dict[str, torch.Tensor]: 각 key마다 (B, ...) 텐서
+            Dict[str, Optional[torch.Tensor]]:
+                - 텐서로 만들 수 있으면 torch.Tensor
+                - 배치 전체가 None이면 해당 key의 value는 None
         """
         batch_size: int = int(len(batch))
         if batch_size <= 0:
             raise ValueError("빈 batch가 들어왔습니다.")
 
         keys: List[str] = self._collect_batch_keys(batch)
-        batch_out: Dict[str, torch.Tensor] = {}
+        batch_out: Dict[str, Optional[torch.Tensor]] = {}
 
         # 1) 고정 5개 key
         for k in self._FIXED_STACK_KEYS:
@@ -2104,8 +2110,8 @@ class DiffusionPlannerCollate:
                 continue
             values = [sample.get(k, None) for sample in batch]
             t = self._stack_fixed_key_for_named_key(k, values)
-            if t is not None:
-                batch_out[k] = t
+            # ✅ 전부 None이면 key를 빼지 말고 None으로 유지
+            batch_out[k] = t  # t: torch.Tensor 또는 None
 
         # 2) 나머지 key
         fixed_set = set(self._FIXED_STACK_KEYS)
@@ -2113,18 +2119,21 @@ class DiffusionPlannerCollate:
             if k in fixed_set:
                 continue
 
-            # agent_route_lane_order는 -1 padding 전용 처리
-            if k == "agent_route_lane_order":
-                batch_out[k] = self._pad_and_stack_agent_route_lane_order(batch)
+            values = [sample.get(k, None) for sample in batch]
+
+            # ✅ 전부 None이면 key를 빼지 말고 None으로 유지
+            if all(v is None for v in values):
+                batch_out[k] = None
                 continue
 
-            values = [sample.get(k, None) for sample in batch]
-            if all(v is None for v in values):
+            # agent_route_lane_order는 -1 padding 전용 처리
+            if k == "agent_route_lane_order":
+                batch_out[k] = self._pad_and_stack_agent_route_lane_order(
+                    batch)
                 continue
 
             t = self._pad_and_stack_variable_key_for_named_key(k, values)
-            if t is not None:
-                batch_out[k] = t
+            batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
 
         return batch_out
 
@@ -2988,14 +2997,16 @@ class DiffusionPlannerCollate:
     # ------------------------------------------------------------------
     # 4) collate 본체
     # ------------------------------------------------------------------
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def __call__(
+        self,
+        batch: List[Dict[str, Any]],
+    ) -> Dict[str, Optional[torch.Tensor]]:
         """단일 샘플 dict 리스트를 (B, ·) 텐서 dict로 변환한다.
 
-        Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 리스트.
-
         Returns:
-            Dict[str, torch.Tensor]: key마다 batch 차원을 앞에 둔 텐서들.
+            Dict[str, Optional[torch.Tensor]]:
+                - 텐서로 만들 수 있는 key는 torch.Tensor
+                - 배치 전체가 None인 key는 None
         """
         if len(batch) == 0:
             raise ValueError("빈 batch가 들어왔습니다.")
@@ -3003,8 +3014,7 @@ class DiffusionPlannerCollate:
         if self._should_center_crop():
             self._center_crop_batch_batched(batch)
 
-        batch_out = self._build_collated_batch_tensors(batch)
-        return batch_out
+        return self._build_collated_batch_tensors(batch)
 
 
 def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
