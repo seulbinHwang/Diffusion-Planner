@@ -18,7 +18,9 @@ from torch import nn
 from typing import Tuple
 ...
 from diffusion_planner.model.module.feasible import FeasibleProjector
-
+from typing import Dict, List
+import argparse
+import torch
 # =====================================================================
 
 
@@ -42,90 +44,238 @@ def _move_batch_to_device(
     }
 
 
+def _clip_axis1_for_key_inplace(
+    batch_on_device: Dict[str, torch.Tensor],
+    key: str,
+    keep_len: int,
+) -> None:
+    """배치 텐서에서 '두 번째 축(axis=1)' 길이를 keep_len으로 안전하게 줄입니다.
+
+    왜 필요한가
+    ----------
+    어떤 그룹의 "개수"를 줄일 때(예: agent 수, lane 수),
+    그 그룹과 짝으로 움직여야 하는 *_is_valid 텐서도 같은 개수로 줄지 않으면
+    이후 연산에서 shape가 안 맞아서 오류가 나거나, 마스크가 엉뚱한 객체를 가리킬 수 있습니다.
+
+    동작 규칙
+    --------
+    - batch_on_device에 key가 없으면 아무 것도 하지 않습니다.
+    - keep_len <= 0이면 아무 것도 하지 않습니다.
+    - 텐서 차원이 2 미만이면(axis=1이 없으면) 아무 것도 하지 않습니다.
+    - 이미 axis=1 길이가 keep_len 이하이면 아무 것도 하지 않습니다.
+    - 위 조건을 통과하면, 해당 텐서를 [:, :keep_len, ...] 형태로 잘라서 다시 넣습니다.
+
+    Args:
+        batch_on_device (Dict[str, torch.Tensor]):
+            배치 dict. 각 텐서는 보통 (B, N, ...) 형태입니다.
+            예:
+              - neighbor_agents_is_valid: (B, A)
+              - lanes_is_valid: (B, L)
+              - lanes_len_is_valid: (B, L, P)
+        key (str):
+            자를 대상 key 이름.
+        keep_len (int):
+            axis=1에서 남길 길이.
+            예: agent를 A'개만 남기면 keep_len=A'
+
+    Returns:
+        None
+    """
+    if keep_len <= 0:
+        return
+    if key not in batch_on_device:
+        return
+
+    t = batch_on_device[key]
+    if not isinstance(t, torch.Tensor):
+        return
+    if t.dim() < 2:
+        return
+
+    current_len = int(t.shape[1])
+    if keep_len >= current_len:
+        return
+
+    # t: (B, N, ...) -> (B, keep_len, ...)
+    batch_on_device[key] = t[:, :keep_len, ...]
+
+
+def _clip_axis1_for_keys_inplace(
+    batch_on_device: Dict[str, torch.Tensor],
+    keys: List[str],
+    keep_len: int,
+) -> None:
+    """여러 key에 대해 axis=1 길이를 동일하게 맞춰 안전하게 줄입니다.
+
+    Args:
+        batch_on_device (Dict[str, torch.Tensor]):
+            배치 dict.
+        keys (List[str]):
+            함께 길이를 맞춰 잘라야 하는 key 목록.
+        keep_len (int):
+            axis=1에서 남길 길이.
+
+    Returns:
+        None
+    """
+    for k in keys:
+        _clip_axis1_for_key_inplace(batch_on_device=batch_on_device,
+                                    key=k,
+                                    keep_len=keep_len)
+
+
 def _clip_input_axes_by_args(
     batch_on_device: Dict[str, torch.Tensor],
     args: argparse.Namespace,
 ) -> None:
     """모델 설정 상한에 맞춰 입력 텐서들의 agent / lane 축을 in-place 로 자른다.
 
+    추가로 하는 일(중요)
+    -------------------
+    아래 4개 그룹에서 "개수"를 줄일 때,
+    같이 움직여야 하는 *_is_valid 키들도 같은 개수로 함께 줄여서
+    나중에 shape 불일치가 생기지 않도록 맞춘다.
+
     처리 규칙 (do_not_clip=False 일 때만 적용):
-      - neighbor_agents_past      : agent 축 → args.max_agent_num
-      - lanes / lanes_*           : lane  축 → args.max_lane_num
-      - route_lanes / route_lanes_* : lane 축 → args.max_lane_num
-      - agent_route_lane_order    : (agent, lane) 축 → (args.predicted_neighbor_num, args.max_lane_num)
+      - neighbor_agents_past           : agent 축 → args.max_agent_num
+        + neighbor_agents_past_is_valid / neighbor_agents_is_valid / neighbor_future_gt_is_valid 도 agent 축을 같이 자름
+      - lanes / lanes_*                : lane  축 → args.max_lane_num
+        + lanes_len_is_valid / lanes_is_valid 도 lane 축을 같이 자름
+      - route_lanes / route_lanes_*    : lane 축 → args.max_lane_num
+        + route_lanes_len_is_valid / route_lanes_is_valid 도 lane 축을 같이 자름
+      - agent_route_lane_order         : (agent, lane) 축 → (args.predicted_neighbor_num, args.max_lane_num)
+        + agent_route_lane_order_is_valid 도 agent 축을 predicted_neighbor_num 기준으로 같이 자름
     """
     if getattr(args, "do_not_clip", False):
         return
 
-    # ---- neighbor_agents_past: (B, A, T, 11) → A ≤ max_agent_num ----
+    # ------------------------------------------------------------------
+    # 1) neighbor_agents_past: (B, A, T, 11) → A ≤ max_agent_num
+    # ------------------------------------------------------------------
     max_agent_num = int(getattr(args, "max_agent_num", 0))
     if "neighbor_agents_past" in batch_on_device and max_agent_num > 0:
         neighbor_agents_past = batch_on_device["neighbor_agents_past"]
         if neighbor_agents_past.dim() == 4:
             # neighbor_agents_past: (B, A_c, T, 11)
-            keep_agents = min(max_agent_num, neighbor_agents_past.shape[1])
-            batch_on_device["neighbor_agents_past"] = \
-                neighbor_agents_past[:, :keep_agents, :, :]
+            keep_agents = min(int(max_agent_num),
+                              int(neighbor_agents_past.shape[1]))
 
-    # ---- lanes / lanes_* : lane 축 → max_lane_num ----
-    max_lane_num = int(args.max_lane_num)
+            # 본 텐서
+            _clip_axis1_for_key_inplace(batch_on_device, "neighbor_agents_past",
+                                        keep_agents)
+
+            # agent 그룹과 함께 움직여야 하는 is_valid들 (axis=1이 agent 축인 형태를 기대)
+            _clip_axis1_for_keys_inplace(
+                batch_on_device=batch_on_device,
+                keys=[
+                    "neighbor_agents_past_is_valid",  # 예: (B, A, T) 또는 (B, A, T, 1)
+                    "neighbor_agents_is_valid",  # 예: (B, A)
+                    "neighbor_future_gt_is_valid",  # 예: (B, A, Tf) 또는 (B, A, Tf, 1)
+                ],
+                keep_len=keep_agents,
+            )
+
+    # ------------------------------------------------------------------
+    # 2) lanes / lanes_*: lane 축 → max_lane_num
+    # ------------------------------------------------------------------
+    max_lane_num = int(getattr(args, "max_lane_num", 0))
     if "lanes" in batch_on_device and max_lane_num > 0:
         lanes = batch_on_device["lanes"]
         if lanes.dim() == 4:
             # lanes: (B, L_c, lane_len, 12)
-            keep_lanes = min(max_lane_num, lanes.shape[1])
-            if keep_lanes < lanes.shape[1]:
+            keep_lanes = min(int(max_lane_num), int(lanes.shape[1]))
+            if keep_lanes < int(lanes.shape[1]):
                 batch_on_device["lanes"] = lanes[:, :keep_lanes, :, :]
-                if "lanes_speed_limit" in batch_on_device:
-                    # (B, L_c, 1)
-                    batch_on_device["lanes_speed_limit"] = \
-                        batch_on_device["lanes_speed_limit"][:, :keep_lanes, :]
-                if "lanes_has_speed_limit" in batch_on_device:
-                    # (B, L_c, 1)
-                    batch_on_device["lanes_has_speed_limit"] = \
-                        batch_on_device["lanes_has_speed_limit"][:, :keep_lanes, :]
 
-    # ---- route_lanes / route_lanes_* : lane 축 → max_lane_num ----
+                if "lanes_speed_limit" in batch_on_device:
+                    # (B, L_c, 1) -> (B, keep_lanes, 1)
+                    _clip_axis1_for_key_inplace(batch_on_device,
+                                                "lanes_speed_limit", keep_lanes)
+                if "lanes_has_speed_limit" in batch_on_device:
+                    # (B, L_c, 1) -> (B, keep_lanes, 1)
+                    _clip_axis1_for_key_inplace(batch_on_device,
+                                                "lanes_has_speed_limit",
+                                                keep_lanes)
+
+                # lanes 그룹 is_valid도 같이 자르기
+                _clip_axis1_for_keys_inplace(
+                    batch_on_device=batch_on_device,
+                    keys=[
+                        "lanes_len_is_valid",  # 예: (B, L, lane_len) 또는 (B, L, lane_len, 1)
+                        "lanes_is_valid",  # 예: (B, L)
+                    ],
+                    keep_len=keep_lanes,
+                )
+
+    # ------------------------------------------------------------------
+    # 3) route_lanes / route_lanes_*: lane 축 → max_lane_num
+    # ------------------------------------------------------------------
     if "route_lanes" in batch_on_device and max_lane_num > 0:
         route_lanes = batch_on_device["route_lanes"]
         if route_lanes.dim() == 4:
             # route_lanes: (B, R_c, route_len, 12)
-            keep_route_lanes = min(max_lane_num, route_lanes.shape[1])
-            if keep_route_lanes < route_lanes.shape[1]:
-                batch_on_device["route_lanes"] = \
-                    route_lanes[:, :keep_route_lanes, :, :]
-                if "route_lanes_speed_limit" in batch_on_device:
-                    # (B, R_c, 1)
-                    batch_on_device["route_lanes_speed_limit"] = \
-                        batch_on_device["route_lanes_speed_limit"][:, :keep_route_lanes, :]
-                if "route_lanes_has_speed_limit" in batch_on_device:
-                    # (B, R_c, 1)
-                    batch_on_device["route_lanes_has_speed_limit"] = \
-                        batch_on_device["route_lanes_has_speed_limit"][:, :keep_route_lanes, :]
+            keep_route_lanes = min(int(max_lane_num), int(route_lanes.shape[1]))
+            if keep_route_lanes < int(route_lanes.shape[1]):
+                batch_on_device[
+                    "route_lanes"] = route_lanes[:, :keep_route_lanes, :, :]
 
-    # ---- agent_route_lane_order: (B, A_c, L_c) → (A', L') ----
+                if "route_lanes_speed_limit" in batch_on_device:
+                    # (B, R_c, 1) -> (B, keep_route_lanes, 1)
+                    _clip_axis1_for_key_inplace(batch_on_device,
+                                                "route_lanes_speed_limit",
+                                                keep_route_lanes)
+                if "route_lanes_has_speed_limit" in batch_on_device:
+                    # (B, R_c, 1) -> (B, keep_route_lanes, 1)
+                    _clip_axis1_for_key_inplace(batch_on_device,
+                                                "route_lanes_has_speed_limit",
+                                                keep_route_lanes)
+
+                # route_lanes 그룹 is_valid도 같이 자르기
+                _clip_axis1_for_keys_inplace(
+                    batch_on_device=batch_on_device,
+                    keys=[
+                        "route_lanes_len_is_valid",  # 예: (B, R, route_len) 또는 (B, R, route_len, 1)
+                        "route_lanes_is_valid",  # 예: (B, R)
+                    ],
+                    keep_len=keep_route_lanes,
+                )
+
+    # ------------------------------------------------------------------
+    # 4) agent_route_lane_order: (B, A_c, L_c) → (A', L')
+    # ------------------------------------------------------------------
     predicted_neighbor_num = int(getattr(args, "predicted_neighbor_num", 0))
     if "agent_route_lane_order" in batch_on_device:
         arl = batch_on_device["agent_route_lane_order"]
         if arl.dim() == 3:
             # arl: (B, A_c, L_c)
-            bsz, c_agent, c_lane = arl.shape
+            _, c_agent, c_lane = arl.shape
 
-            keep_agents_for_route = c_agent
+            keep_agents_for_route = int(c_agent)
             if predicted_neighbor_num > 0:
-                keep_agents_for_route = min(predicted_neighbor_num, c_agent)
+                keep_agents_for_route = min(int(predicted_neighbor_num),
+                                            int(c_agent))
 
-            lane_dim_input = c_lane
-            if "lanes" in batch_on_device:
+            lane_dim_input = int(c_lane)
+            if "lanes" in batch_on_device and batch_on_device["lanes"].dim(
+            ) >= 2:
                 # lanes: (B, L', lane_len, 12)
-                lane_dim_input = batch_on_device["lanes"].shape[1]
-            keep_lanes_for_route = min(
-                max_lane_num or lane_dim_input,
-                lane_dim_input,
-            )
+                lane_dim_input = int(batch_on_device["lanes"].shape[1])
 
-            batch_on_device["agent_route_lane_order"] = \
-                arl[:, :keep_agents_for_route, :keep_lanes_for_route]
+            # max_lane_num이 0이면 lane_dim_input을 그대로 사용
+            lane_cap = int(max_lane_num) if int(max_lane_num) > 0 else int(
+                lane_dim_input)
+            keep_lanes_for_route = min(int(lane_cap), int(lane_dim_input))
+
+            batch_on_device[
+                "agent_route_lane_order"] = arl[:, :keep_agents_for_route, :
+                                                keep_lanes_for_route]
+
+            # agent_route_lane_order_is_valid: 보통 (B, A) 형태로 agent 축만 맞추면 됨
+            _clip_axis1_for_key_inplace(
+                batch_on_device=batch_on_device,
+                key="agent_route_lane_order_is_valid",
+                keep_len=keep_agents_for_route,
+            )
 
 
 def _clip_targets_by_predicted_neighbors(

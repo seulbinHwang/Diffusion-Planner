@@ -1673,6 +1673,63 @@ class DiffusionPlannerCollate:
 
         return keys
 
+    def _stack_fixed_key_for_named_key(
+            self,
+            key: str,
+            values: List[Any],
+    ) -> Optional[torch.Tensor]:
+        """(고정 길이 key) 배치 텐서를 stack으로 바로 만듭니다. validity면 bool로 강제합니다.
+
+        동작
+        ----
+        - ref_shape: 첫 번째 non-None 샘플 shape를 기준으로 (B, *ref_shape) 텐서를 만듭니다.
+        - None인 샘플은 0/False로 남습니다.
+        - key가 "*_is_valid"면 dtype을 torch.bool로 강제합니다.
+          (입력이 int(0/1)이어도 자동으로 False/True로 변환됩니다)
+
+        Args:
+            key (str): key 이름. shape: ()
+            values (List[Any]):
+                - 길이 B 리스트
+                - 각 원소는 ndarray/tensor 또는 None
+
+        Returns:
+            Optional[torch.Tensor]:
+                - 성공 시: shape (B, *S)
+                - 전부 None이면: None
+        """
+        batch_size: int = int(len(values))
+        non_none_idx = [i for i, v in enumerate(values) if v is not None]
+        if not non_none_idx:
+            return None
+
+        ref_value = values[non_none_idx[0]]
+        assert ref_value is not None
+
+        out_dtype: torch.dtype = self._choose_output_dtype_for_key(key,
+                                                                   ref_value)
+        ref_shape: Tuple[int, ...] = self._get_value_shape(ref_value)
+
+        # 고정 key이므로 shape가 다르면 에러
+        for i in non_none_idx[1:]:
+            v = values[i]
+            assert v is not None
+            if self._get_value_shape(v) != ref_shape:
+                raise ValueError(
+                    f"[Collate] 고정 key인데 shape가 샘플마다 다릅니다. "
+                    f"key={key}, ref_shape={ref_shape}, got={self._get_value_shape(v)}"
+                )
+
+        # out: shape (B, *ref_shape)
+        out = torch.zeros((batch_size, *ref_shape), dtype=out_dtype)
+
+        for b_idx in non_none_idx:
+            v = values[b_idx]
+            assert v is not None
+            out[b_idx] = torch.as_tensor(v, dtype=out_dtype)
+
+        return out
+
     def _stack_fixed_key(self, values: List[Any]) -> Optional[torch.Tensor]:
         """(고정 길이 key) 배치 텐서를 stack으로 바로 만듭니다.
 
@@ -1731,6 +1788,191 @@ class DiffusionPlannerCollate:
             v = values[b_idx]
             assert v is not None
             out[b_idx] = torch.as_tensor(v, dtype=out_dtype)
+
+        return out
+
+    def _pad_and_stack_agent_route_lane_order(
+            self,
+            batch: List[Dict[str, Any]],
+    ) -> torch.Tensor:
+        """agent_route_lane_order를 (B, A_max, L_max) 텐서로 만들고 -1로 패딩합니다.
+
+        이 key는 (agent, lane) 2차원 관계를 담고 있어서,
+        다른 key들과 달리 "없는 값"을 0이 아니라 **-1**로 채워야 합니다.
+
+        처리 규칙
+        --------
+        1) 각 샘플에서 아래 값들을 보고 배치 최대 크기를 정합니다.
+           - agent 수(A_i):
+               * neighbor_agents_past.shape[0] (있으면)
+               * 또는 agent_route_lane_order.shape[0] (있으면)
+           - lane 수(L_i):
+               * lanes.shape[0] (있으면)
+               * 또는 agent_route_lane_order.shape[1] (있으면)
+        2) 출력 텐서 shape:
+           - (B, A_max, L_max)
+        3) 패딩 값:
+           - 전부 -1
+           - 샘플 값이 None이면 그 샘플 전체가 -1로 유지됩니다.
+        4) dtype:
+           - torch.int64 (인덱스/순서 용도로 안전하게 고정)
+
+        Args:
+            batch (List[Dict[str, Any]]):
+                - 길이 B의 샘플 dict 리스트.
+
+        Returns:
+            torch.Tensor:
+                - shape: (B, A_max, L_max)
+                - dtype: torch.int64
+                - padding: -1
+        """
+        batch_size: int = int(len(batch))
+
+        # 배치 최대 agent/lane 개수 계산
+        max_agent_num: int = 0
+        max_lane_num: int = 0
+
+        for sample in batch:
+            # agent 수 후보
+            agent_num_candidate: int = 0
+            neighbor_past = sample.get("neighbor_agents_past", None)
+            if neighbor_past is not None:
+                neighbor_past_arr = np.asarray(neighbor_past)
+                if neighbor_past_arr.ndim >= 1:
+                    agent_num_candidate = max(agent_num_candidate,
+                                              int(neighbor_past_arr.shape[0]))
+
+            # lane 수 후보
+            lane_num_candidate: int = 0
+            lanes = sample.get("lanes", None)
+            if lanes is not None:
+                lanes_arr = np.asarray(lanes)
+                if lanes_arr.ndim >= 1:
+                    lane_num_candidate = max(lane_num_candidate,
+                                             int(lanes_arr.shape[0]))
+
+            # aro 자체 shape도 참고 (neighbor/lanes가 None일 수도 있으므로)
+            aro = sample.get("agent_route_lane_order", None)
+            if aro is not None:
+                aro_arr = np.asarray(aro)
+                if aro_arr.ndim == 2:
+                    agent_num_candidate = max(agent_num_candidate,
+                                              int(aro_arr.shape[0]))
+                    lane_num_candidate = max(lane_num_candidate,
+                                             int(aro_arr.shape[1]))
+
+            max_agent_num = max(max_agent_num, agent_num_candidate)
+            max_lane_num = max(max_lane_num, lane_num_candidate)
+
+        # (B, A_max, L_max) 를 -1로 초기화
+        out = torch.full(
+            (batch_size, max_agent_num, max_lane_num),
+            fill_value=-1,
+            dtype=torch.int64,
+        )
+
+        # 값 복사 (있는 샘플만 앞쪽부터 채움)
+        for b_idx, sample in enumerate(batch):
+            aro = sample.get("agent_route_lane_order", None)
+            if aro is None:
+                continue
+
+            aro_arr = np.asarray(aro)
+            if aro_arr.ndim != 2:
+                continue
+
+            a_i: int = min(int(aro_arr.shape[0]), max_agent_num)
+            l_i: int = min(int(aro_arr.shape[1]), max_lane_num)
+
+            if a_i <= 0 or l_i <= 0:
+                continue
+
+            out[b_idx, :a_i, :l_i] = torch.as_tensor(
+                aro_arr[:a_i, :l_i],
+                dtype=torch.int64,
+            )
+
+        return out
+
+    def _pad_and_stack_variable_key_for_named_key(
+            self,
+            key: str,
+            values: List[Any],
+    ) -> Optional[torch.Tensor]:
+        """(가변 길이 key) 배치 내 최대 shape 기준으로 padding 후 쌓습니다. validity면 bool로 강제합니다.
+
+        규칙
+        ----
+        - key가 "*_is_valid"면 dtype을 torch.bool로 강제합니다.
+          * 입력이 int(0/1)이어도 torch.bool로 변환되어 False/True가 됩니다.
+        - padding은 기본값 0(=False) 입니다.
+        - 단, agent_route_lane_order는 여기로 오지 않는다고 가정합니다.
+          (별도 -1 패딩 함수로 처리)
+
+        Args:
+            key (str): key 이름. shape: ()
+            values (List[Any]):
+                - 길이 B 리스트
+                - 각 원소는 ndarray/tensor 또는 None
+
+        Returns:
+            Optional[torch.Tensor]:
+                - 성공 시: shape (B, *max_shape)
+                - 전부 None이면: None
+        """
+        batch_size: int = int(len(values))
+        non_none_idx = [i for i, v in enumerate(values) if v is not None]
+        if not non_none_idx:
+            return None
+
+        ref_value = values[non_none_idx[0]]
+        assert ref_value is not None
+
+        out_dtype: torch.dtype = self._choose_output_dtype_for_key(key,
+                                                                   ref_value)
+        ref_shape: Tuple[int, ...] = self._get_value_shape(ref_value)
+        ndim: int = int(len(ref_shape))
+
+        max_shape = list(ref_shape)
+        all_same_shape: bool = True
+
+        for i in non_none_idx[1:]:
+            v = values[i]
+            assert v is not None
+            shape_i = self._get_value_shape(v)
+            if len(shape_i) != ndim:
+                raise ValueError(
+                    f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. key={key}, "
+                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}"
+                )
+            if shape_i != ref_shape:
+                all_same_shape = False
+            for d in range(ndim):
+                if int(shape_i[d]) > int(max_shape[d]):
+                    max_shape[d] = int(shape_i[d])
+
+        # 빠른 경로: None도 없고 shape도 동일
+        if all_same_shape and (len(non_none_idx) == batch_size):
+            return torch.stack(
+                [torch.as_tensor(v, dtype=out_dtype) for v in values],
+                dim=0,
+            )
+
+        # out: shape (B, *max_shape)
+        out = torch.zeros((batch_size, *max_shape), dtype=out_dtype)
+
+        for b_idx in non_none_idx:
+            v = values[b_idx]
+            assert v is not None
+            t = torch.as_tensor(v, dtype=out_dtype)
+
+            if ndim == 0:
+                out[b_idx] = t
+                continue
+
+            slices = tuple(slice(0, int(s)) for s in t.shape)
+            out[(b_idx, *slices)] = t[slices]
 
         return out
 
@@ -1834,70 +2076,95 @@ class DiffusionPlannerCollate:
         return out
 
     def _build_collated_batch_tensors(
-        self,
-        batch: List[Dict[str, Any]],
+            self,
+            batch: List[Dict[str, Any]],
     ) -> Dict[str, torch.Tensor]:
         """배치(dict 리스트)를 최종 배치 텐서(dict)로 변환합니다.
 
-        핵심 규칙(요청사항 그대로)
-        ------------------------
-        1) 고정 5개 key:
-           - ego_agent_past
-           - ego_future_gt_3_dim
-           - planner_future_11_dim
-           - ego_agent_past_is_valid
-           - ego_future_gt_is_valid
-           → 길이가 항상 같다고 가정하고 "바로 stack"합니다. (max 길이 계산/패딩 없음)
-
-        2) 그 외 모든 key:
-           → key 이름을 하드코딩하지 않고,
-              각 key별로 배치 내 최대 shape를 계산한 뒤 0 padding 배치 텐서를 만듭니다.
-
-        3) None 처리:
-           - 일부 샘플이 None이면 해당 샘플은 0으로 남습니다.
-           - 배치 전체가 None인 key는 결과 dict에 넣지 않습니다.
+        추가 규칙
+        --------
+        - "*_is_valid" 류 key는 입력이 int(0/1) 이 섞여 있어도 출력 dtype을 torch.bool로 강제합니다.
 
         Args:
-            batch:
-                - 길이 B 샘플 dict 리스트
+            batch (List[Dict[str, Any]]): 길이 B 샘플 dict 리스트
 
         Returns:
-            Dict[str, torch.Tensor]:
-                - 각 key마다 (B, ...) 형태 텐서
+            Dict[str, torch.Tensor]: 각 key마다 (B, ...) 텐서
         """
-        batch_size = int(len(batch))
+        batch_size: int = int(len(batch))
         if batch_size <= 0:
             raise ValueError("빈 batch가 들어왔습니다.")
 
-        keys = self._collect_batch_keys(batch)
-
+        keys: List[str] = self._collect_batch_keys(batch)
         batch_out: Dict[str, torch.Tensor] = {}
 
-        # 1) 고정 5개 key 먼저 처리
+        # 1) 고정 5개 key
         for k in self._FIXED_STACK_KEYS:
             if k not in keys:
                 continue
-            values = [sample.get(k, None) for sample in batch]  # 길이 B
-            t = self._stack_fixed_key(values)
+            values = [sample.get(k, None) for sample in batch]
+            t = self._stack_fixed_key_for_named_key(k, values)
             if t is not None:
                 batch_out[k] = t
 
-        # 2) 나머지 key 전부: key 이름을 몰라도 동일 로직으로 처리
+        # 2) 나머지 key
         fixed_set = set(self._FIXED_STACK_KEYS)
         for k in keys:
             if k in fixed_set:
                 continue
-            values = [sample.get(k, None) for sample in batch]  # 길이 B
 
-            # 배치 전체가 None이면 skip
+            # agent_route_lane_order는 -1 padding 전용 처리
+            if k == "agent_route_lane_order":
+                batch_out[k] = self._pad_and_stack_agent_route_lane_order(batch)
+                continue
+
+            values = [sample.get(k, None) for sample in batch]
             if all(v is None for v in values):
                 continue
 
-            t = self._pad_and_stack_variable_key(values)
+            t = self._pad_and_stack_variable_key_for_named_key(k, values)
             if t is not None:
                 batch_out[k] = t
 
         return batch_out
+
+    def _is_validity_key_name(self, key: str) -> bool:
+        """key 이름이 validity 마스크인지 빠르게 판별합니다.
+
+        규칙
+        ----
+        - key가 "_is_valid" 로 끝나면 validity 마스크로 봅니다.
+          예) ego_agent_past_is_valid, lanes_len_is_valid, lanes_is_valid, ...
+
+        Args:
+            key (str): sample dict의 key 이름. shape: ()
+
+        Returns:
+            bool:
+                - True: validity 마스크 key
+                - False: 그 외 key
+        """
+        return str(key).endswith("_is_valid")
+
+    def _choose_output_dtype_for_key(self, key: str, value: Any) -> torch.dtype:
+        """특정 key에 대해, collate 출력 dtype을 결정합니다.
+
+        핵심 규칙
+        --------
+        - "*_is_valid" 류 key는 입력이 int(0/1) 이 섞여 있어도 **항상 torch.bool**로 강제합니다.
+        - 그 외 key는 기존 규칙을 그대로 사용합니다.
+          (float -> float32, 나머지 -> 입력 dtype 유지)
+
+        Args:
+            key (str): sample dict의 key 이름. shape: ()
+            value (Any): None이 아닌 샘플 값(배치에서 dtype 기준으로 삼을 값)
+
+        Returns:
+            torch.dtype: 출력 텐서 dtype
+        """
+        if self._is_validity_key_name(key):
+            return torch.bool
+        return self._choose_output_dtype(value)
 
     def _as_bool_1d(
         self,
