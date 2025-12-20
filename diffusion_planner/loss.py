@@ -10,19 +10,30 @@ AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
 def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
-    """Ensure ``tensor`` has no NaN or Inf values.
+    """tensor에 NaN/Inf가 있는지 확인합니다.
+
+    주의
+    ----
+    bool/int 텐서는 NaN/Inf라는 개념이 없어서,
+    이런 텐서에는 검사를 하지 않고 그대로 통과시킵니다.
 
     Args:
-        name: Name of the tensor for logging.
-        tensor: Tensor to validate.
+        name (str): 로그에 찍을 텐서 이름.
+        tensor (torch.Tensor): 검사할 텐서.
 
     Returns:
-        The original tensor if it contains only finite values.
+        torch.Tensor:
+            - float/complex 텐서면 NaN/Inf가 없는지 확인 후 그대로 반환합니다.
+            - bool/int 텐서면 검사 없이 그대로 반환합니다.
 
     Raises:
-        ValueError: If NaN or Inf values are detected in the tensor.
+        ValueError:
+            float/complex 텐서에서 NaN 또는 Inf가 발견되면 발생합니다.
     """
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+    if not (torch.is_floating_point(tensor) or torch.is_complex(tensor)):
+        return tensor
+
+    if not torch.isfinite(tensor).all():
         msg = f"{name} contains NaN or Inf values"
         logging.error(msg)
         raise ValueError(msg)
@@ -31,39 +42,33 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
 
 # [add] ----------------------------------------------------------------------
 def _build_half_life_weights(
-    future_len: int,  # 80
+    future_len: int,
     *,
     dt_s: float = 0.1,
     half_life_s: float = 2.0,
     device: torch.device,
-    dtype: torch.dtype,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """half-life 기반 시간 가중치 텐서를 생성합니다.
-
-    각 시간 스텝 j(0-index)에 대해 t_j = (j+1)*dt_s 로 두고,
-    w_j = 0.5 ** (t_j / half_life_s) 로 정의합니다.
-    예) half_life_s=2.0이면, 2초→1/2, 4초→1/4, 8초→1/16.
+    """시간이 멀어질수록 가중치를 줄이는 (1,1,T) 텐서를 만든다.
 
     Args:
-        future_len (int): 미래 스텝 수(프레임 수).
-        dt_s (float): 프레임 간 시간 간격(초). 기본 0.1초.
-        half_life_s (float): half-life(초).
-        device (torch.device): 출력 텐서가 위치할 디바이스.
-        dtype (torch.dtype): 출력 텐서 dtype.
+        future_len (int): 미래 프레임 수 T.
+        dt_s (float): 프레임 간 시간 간격(초).
+        half_life_s (float): 이 시간이 지나면 가중치가 절반이 되도록 만드는 기준 시간(초).
+        device (torch.device): 출력 텐서 디바이스.
+        dtype (torch.dtype): 출력 dtype. 기본은 float32.
 
     Returns:
-        torch.Tensor: (1, 1, future_len) 모양의 가중치 텐서.  # shape: [1, 1, future_len]
-
-    Note:
-        - 시간축은 [dt_s, 2*dt_s, ..., future_len*dt_s].
-        - 브로드캐스트를 위해 (1,1,future_len)로 반환합니다.
+        torch.Tensor:
+            시간 가중치 텐서. shape: (1, 1, future_len)
     """
-    # future_len: (future_len,) = [dt_s, 2*dt_s, ..., future_len*dt_s]
-    future_len = torch.arange(1, future_len + 1, device=device,
-                              dtype=dtype) * float(dt_s)  # [future_len]
-    # w: (future_len,) = 0.5 ** (future_len / half_life_s)
-    w = torch.pow(0.5, future_len / float(half_life_s))  # [future_len]
-    return w.view(1, 1, -1)  # [1, 1, future_len]
+    # t: (T,) = [dt, 2*dt, ..., T*dt]
+    t = torch.arange(1, future_len + 1, device=device,
+                     dtype=torch.float32) * float(dt_s)
+    # w: (T,) = 0.5 ** (t / half_life)
+    w = torch.pow(torch.tensor(0.5, device=device, dtype=torch.float32),
+                  t / float(half_life_s))
+    return w.to(dtype=dtype).view(1, 1, -1)
 
 
 # ----------------------------------------------------------------------------
@@ -209,31 +214,30 @@ def _compute_xy_yaw_losses(
 
 # [ADD] ----------------------------------------------------------------------
 def _masked_weighted_mse_from_diff(
-    diff: torch.Tensor,  # (B, P, T, 3)
-    valid_mask: torch.Tensor,  # (B, P, T)  (1=valid)
+    diff: torch.Tensor,  # (B, P, T, C)
+    valid_mask: torch.Tensor,  # (B, P, T)
     w_t: torch.Tensor,  # (1, 1, T)
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """마스크·시간가중 MSE(차원 합) 계산.
+    """차이(diff)로부터 마스크/시간가중 MSE를 스칼라로 만든다.
 
     Args:
-        diff: (B, P, T, 3) 차이 텐서. 예) u - Filter_soft(u).detach()
-        valid_mask: (B, P, T) 유효 마스크 (True/1=유효)
-        w_t: (1, 1, T) half-life 기반 시간 가중치
-        eps: 분모 보호용 epsilon
+        diff (torch.Tensor): shape (B, P, T, C)
+        valid_mask (torch.Tensor): shape (B, P, T)
+        w_t (torch.Tensor): shape (1, 1, T)
+        eps (float): 분모 보호용 작은 값
 
     Returns:
-        스칼라 손실 (torch.Tensor, shape=[])
+        torch.Tensor: 스칼라 손실 텐서. shape=[]
     """
-    # (B, P, T, C) -> (B, P, T)
-    squared = (diff**2).sum(dim=-1)
-    valid_f = valid_mask.to(dtype=squared.dtype)
+    diff_f = diff.float()  # float32
+    squared = (diff_f**2).sum(dim=-1)  # (B,P,T)
+    valid_f = (valid_mask > 0).float()  # (B,P,T)
+    w_f = w_t.float()  # (1,1,T)
 
-    weighted = squared * w_t  # (B, P, T)
-    denom = (valid_f * w_t).sum().clamp_min(eps)  # 스칼라
-
-    loss_val = (weighted * valid_f).sum() / denom
-    return loss_val
+    weighted = squared * w_f
+    denom = (valid_f * w_f).sum().clamp_min(eps)
+    return (weighted * valid_f).sum() / denom
 
 
 # ----------------------------------------------------------------------------
@@ -555,27 +559,33 @@ def _compute_dpm_loss(
 
 def _aggregate_weighted_loss(
     per_step_loss: torch.Tensor,  # (B, Pnn, T)
-    valid_mask: torch.Tensor,  # (B, Pnn, T) bool 또는 float
+    valid_mask: torch.Tensor,  # (B, Pnn, T) bool 또는 0/1
     w_t: torch.Tensor,  # (1, 1, T)
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """시간 가중치와 유효 마스크를 써서 (B,P,T) 손실을 스칼라로 합친다.
+    """시간 가중치와 유효 마스크로 (B,P,T) 손실을 스칼라로 합친다.
+
+    구현 안정성
+    ----------
+    AMP(bfloat16) 환경에서는 합(sum)이나 분모 계산이 거칠어질 수 있어서,
+    이 함수 내부 계산은 float32로 올려서 진행합니다.
 
     Args:
-        per_step_loss: (B, Pnn, T) 위치별 손실.
-        valid_mask: (B, Pnn, T) 유효 프레임 마스크.
-        w_t: (1, 1, T) 시간 가중치.
-        eps: 분모 보호용 작은 값.
+        per_step_loss (torch.Tensor): shape (B, Pnn, T)
+        valid_mask (torch.Tensor): shape (B, Pnn, T)
+        w_t (torch.Tensor): shape (1, 1, T)
+        eps (float): 분모 보호용 작은 값
 
     Returns:
-        scalar_loss: 스칼라 손실 텐서 (shape=[]).
+        torch.Tensor: 스칼라 손실 텐서. shape=[]
     """
-    # per_step_loss, valid_mask, w_t : 모두 (B,P,T) 브로드캐스트 호환
-    valid_f: torch.Tensor = valid_mask.to(dtype=per_step_loss.dtype)
-    weighted: torch.Tensor = per_step_loss * w_t  # (B, Pnn, T)
-    denom: torch.Tensor = (valid_f * w_t).sum().clamp_min(eps)  # 스칼라
-    scalar_loss: torch.Tensor = (weighted * valid_f).sum() / denom
-    return scalar_loss
+    loss_f = per_step_loss.float()  # (B,P,T) float32
+    valid_f = (valid_mask > 0).float()  # (B,P,T) float32
+    w_f = w_t.float()  # (1,1,T) float32
+
+    weighted = loss_f * w_f  # (B,P,T)
+    denom = (valid_f * w_f).sum().clamp_min(eps)  # scalar
+    return (weighted * valid_f).sum() / denom
 
 
 def _compute_integration_and_constraint_losses(
@@ -590,77 +600,64 @@ def _compute_integration_and_constraint_losses(
            Optional[torch.Tensor]]:
     """통합 궤적/제어 편차 기반 보조 손실을 계산한다.
 
+    내부 계산은 float32로 수행해서 수치 불안정 가능성을 줄입니다.
+
     Args:
-        args: args.use_feasible_dl 사용.
-        decoder_output: 모델 decoder 출력 dict.
-        near_future_norm_gt: (B, Pnn, T, 4) 미래 GT (정규화).
-        near_future_valid: (B, Pnn, T) 미래 유효 마스크.
-        low_t_mask_bt: (B, 1, 1) 저노이즈 배치 마스크.
-        w_t: (1, 1, T) 시간 가중치.
-        base_loss: neighbor_prediction_loss 와 같은 dtype/device 기준.
+        near_future_norm_gt: (B, Pnn, T, 4)
+        near_future_valid: (B, Pnn, T)
+        low_t_mask_bt: (B, 1, 1)
+        w_t: (1, 1, T)
 
     Returns:
-        integration_loss_val: 통합 궤적 손실 스칼라.
-        constraint_loss_val: 제어 제약 손실 스칼라.
-        integrated_trajectory: (B, Pnn, T, 4) 또는 None.
-        control_constraint_diff: (B, Pnn, T, 3) 또는 None.
+        integration_loss_val: 스칼라, float32
+        constraint_loss_val: 스칼라, float32
+        integrated_trajectory: (B, Pnn, T, 4) 또는 None
+        control_constraint_diff: (B, Pnn, T, 3) 또는 None
     """
-    # valid_low: (B, Pnn, T)
-    valid_low: torch.Tensor = near_future_valid & low_t_mask_bt
-    valid_low_f: torch.Tensor = valid_low.float()
+    valid_low = near_future_valid & low_t_mask_bt  # (B,P,T) bool
+    valid_low_f = valid_low.float()
+
+    integrated_trajectory: Optional[torch.Tensor] = None
+    control_constraint_diff: Optional[torch.Tensor] = None
 
     # --- L_integration ---
     if "integrated_trajectory" in decoder_output and getattr(
             args, "use_feasible_dl", False):
-        # integrated_trajectory_full: (B, Pnn, 1+T, 4)
-        integrated_trajectory_full: torch.Tensor = _require_finite(
+        integrated_full = _require_finite(
             "decoder_output['integrated_trajectory']",
             decoder_output["integrated_trajectory"],
-        )
-        # integrated_trajectory: (B, Pnn, T, 4)
-        integrated_trajectory: torch.Tensor = integrated_trajectory_full[:, :,
-                                                                         1:, :]
+        )  # (B,P,1+T,4)
+        integrated_trajectory = integrated_full[:, :, 1:, :]  # (B,P,T,4)
 
-        # integration_loss: (B, Pnn, T)
-        integration_loss: torch.Tensor = torch.sum(
-            (integrated_trajectory - near_future_norm_gt)**2,
-            dim=-1,
-        )
-        # weighted_integration: (B, Pnn, T)
-        weighted_integration: torch.Tensor = integration_loss * w_t
-        denom_low: torch.Tensor = (valid_low_f * w_t).sum().clamp_min(1e-6)
-        integration_loss_val: torch.Tensor = \
-            (weighted_integration * valid_low_f).sum() / denom_low
+        # per_step: (B,P,T) float32
+        diff = (integrated_trajectory - near_future_norm_gt).float()
+        per_step = (diff**2).sum(dim=-1)
+
+        w_f = w_t.float()
+        denom = (valid_low_f * w_f).sum().clamp_min(1e-6)
+        integration_loss_val = (per_step * w_f * valid_low_f).sum() / denom
     else:
-        integrated_trajectory = None
-        integration_loss_val = torch.zeros(
-            (),
-            device=base_loss.device,
-            dtype=base_loss.dtype,
-        )
+        integration_loss_val = torch.zeros((),
+                                           device=base_loss.device,
+                                           dtype=torch.float32)
 
     # --- L_constraint ---
     if "control_constraint_diff" in decoder_output and getattr(
             args, "use_feasible_dl", False):
-        control_constraint_diff_full: torch.Tensor = _require_finite(
+        control_constraint_diff = _require_finite(
             "decoder_output['control_constraint_diff']",
             decoder_output["control_constraint_diff"],
-        )  # (B, P, T, 3)
+        )  # (B,P,T,3)
 
-        constraint_loss_val: torch.Tensor = _masked_weighted_mse_from_diff(
-            control_constraint_diff_full,  # (B, Pnn, T, 3)
-            valid_low,  # (B, Pnn, T)
-            w_t,  # (1, 1, T)
+        constraint_loss_val = _masked_weighted_mse_from_diff(
+            control_constraint_diff,
+            valid_low,
+            w_t,
         )
-        control_constraint_diff: Optional[
-            torch.Tensor] = control_constraint_diff_full
     else:
-        control_constraint_diff = None
-        constraint_loss_val = torch.zeros(
-            (),
-            device=integration_loss_val.device,
-            dtype=integration_loss_val.dtype,
-        )
+        constraint_loss_val = torch.zeros((),
+                                          device=base_loss.device,
+                                          dtype=torch.float32)
 
     return integration_loss_val, constraint_loss_val, integrated_trajectory, control_constraint_diff
 
@@ -857,7 +854,7 @@ def diffusion_loss_func(
         dt_s=time_step_s,
         half_life_s=half_life_s,
         device=dpm_loss.device,
-        dtype=dpm_loss.dtype,
+        dtype=torch.float32,
     )
 
     # neighbor_prediction_loss (스칼라)

@@ -1538,9 +1538,6 @@ class DiffusionPlannerCollate:
 
         return out
 
-
-
-
     _FIXED_STACK_KEYS: Tuple[str, ...] = (
         "ego_agent_past",
         "ego_future_gt_3_dim",
@@ -1674,9 +1671,9 @@ class DiffusionPlannerCollate:
         return keys
 
     def _stack_fixed_key_for_named_key(
-            self,
-            key: str,
-            values: List[Any],
+        self,
+        key: str,
+        values: List[Any],
     ) -> Optional[torch.Tensor]:
         """(고정 길이 key) 배치 텐서를 stack으로 바로 만듭니다. validity면 bool로 강제합니다.
 
@@ -1706,8 +1703,8 @@ class DiffusionPlannerCollate:
         ref_value = values[non_none_idx[0]]
         assert ref_value is not None
 
-        out_dtype: torch.dtype = self._choose_output_dtype_for_key(key,
-                                                                   ref_value)
+        out_dtype: torch.dtype = self._choose_output_dtype_for_key(
+            key, ref_value)
         ref_shape: Tuple[int, ...] = self._get_value_shape(ref_value)
 
         # 고정 key이므로 shape가 다르면 에러
@@ -1777,8 +1774,7 @@ class DiffusionPlannerCollate:
             if self._get_value_shape(v) != ref_shape:
                 raise ValueError(
                     f"[Collate] 고정 key인데 shape가 샘플마다 다릅니다. "
-                    f"ref_shape={ref_shape}, got={self._get_value_shape(v)}"
-                )
+                    f"ref_shape={ref_shape}, got={self._get_value_shape(v)}")
 
         # (B, *ref_shape)
         out = torch.zeros((batch_size, *ref_shape), dtype=out_dtype)
@@ -1792,8 +1788,8 @@ class DiffusionPlannerCollate:
         return out
 
     def _pad_and_stack_agent_route_lane_order(
-            self,
-            batch: List[Dict[str, Any]],
+        self,
+        batch: List[Dict[str, Any]],
     ) -> torch.Tensor:
         """agent_route_lane_order를 (B, A_max, L_max) 텐서로 만들고 -1로 패딩합니다.
 
@@ -1896,9 +1892,9 @@ class DiffusionPlannerCollate:
         return out
 
     def _pad_and_stack_variable_key_for_named_key(
-            self,
-            key: str,
-            values: List[Any],
+        self,
+        key: str,
+        values: List[Any],
     ) -> Optional[torch.Tensor]:
         """(가변 길이 key) 배치 내 최대 shape 기준으로 padding 후 쌓습니다. validity면 bool로 강제합니다.
 
@@ -1929,8 +1925,8 @@ class DiffusionPlannerCollate:
         ref_value = values[non_none_idx[0]]
         assert ref_value is not None
 
-        out_dtype: torch.dtype = self._choose_output_dtype_for_key(key,
-                                                                   ref_value)
+        out_dtype: torch.dtype = self._choose_output_dtype_for_key(
+            key, ref_value)
         ref_shape: Tuple[int, ...] = self._get_value_shape(ref_value)
         ndim: int = int(len(ref_shape))
 
@@ -1944,8 +1940,7 @@ class DiffusionPlannerCollate:
             if len(shape_i) != ndim:
                 raise ValueError(
                     f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. key={key}, "
-                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}"
-                )
+                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}")
             if shape_i != ref_shape:
                 all_same_shape = False
             for d in range(ndim):
@@ -1976,7 +1971,8 @@ class DiffusionPlannerCollate:
 
         return out
 
-    def _pad_and_stack_variable_key(self, values: List[Any]) -> Optional[torch.Tensor]:
+    def _pad_and_stack_variable_key(
+            self, values: List[Any]) -> Optional[torch.Tensor]:
         """(가변 길이 key) 배치 내 최대 shape를 기준으로 0 padding 배치 텐서를 만듭니다.
 
         처리 방식(핵심)
@@ -2035,10 +2031,8 @@ class DiffusionPlannerCollate:
             assert v is not None
             shape_i = self._get_value_shape(v)
             if len(shape_i) != ndim:
-                raise ValueError(
-                    f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. "
-                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}"
-                )
+                raise ValueError(f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. "
+                                 f"ref_ndim={ndim}, got_ndim={len(shape_i)}")
             if shape_i != tuple(ref_shape):
                 all_same_shape = False
             for d in range(ndim):
@@ -2049,8 +2043,7 @@ class DiffusionPlannerCollate:
         if all_same_shape and (len(non_none_idx) == batch_size):
             # shape: (B, *ref_shape)
             return torch.stack(
-                [torch.as_tensor(v, dtype=out_dtype) for v in values], dim=0
-            )
+                [torch.as_tensor(v, dtype=out_dtype) for v in values], dim=0)
 
         # 일반 경로: 0 padding 텐서 만들고 값 복사
         # out shape: (B, *max_shape)
@@ -2075,10 +2068,9 @@ class DiffusionPlannerCollate:
 
         return out
 
-
     def _build_collated_batch_tensors(
-            self,
-            batch: List[Dict[str, Any]],
+        self,
+        batch: List[Dict[str, Any]],
     ) -> Dict[str, Optional[torch.Tensor]]:
         """배치(dict 리스트)를 최종 배치 텐서(dict)로 변환합니다.
 
@@ -2128,8 +2120,7 @@ class DiffusionPlannerCollate:
 
             # agent_route_lane_order는 -1 padding 전용 처리
             if k == "agent_route_lane_order":
-                batch_out[k] = self._pad_and_stack_agent_route_lane_order(
-                    batch)
+                batch_out[k] = self._pad_and_stack_agent_route_lane_order(batch)
                 continue
 
             t = self._pad_and_stack_variable_key_for_named_key(k, values)
@@ -2230,15 +2221,16 @@ class DiffusionPlannerCollate:
         arr = np.asarray(mask)
         if arr.ndim != 2:
             return None
-        if (int(arr.shape[0]) != int(expected_shape[0])) or (int(arr.shape[1]) != int(expected_shape[1])):
+        if (int(arr.shape[0]) != int(expected_shape[0])) or (int(
+                arr.shape[1]) != int(expected_shape[1])):
             return None
         return arr.astype(bool)
 
     def _slice_first_dim_inplace(
-        self,
-        sample: Dict[str, Any],
-        keys: List[str],
-        keep_idx: np.ndarray,  # shape: (K,)
+            self,
+            sample: Dict[str, Any],
+            keys: List[str],
+            keep_idx: np.ndarray,  # shape: (K,)
     ) -> None:
         """sample의 여러 key를 첫 번째 축 기준으로 같은 인덱스로 같이 자릅니다.
 
@@ -2256,9 +2248,9 @@ class DiffusionPlannerCollate:
             sample[k] = np.asarray(v)[keep_idx]
 
     def _sort_indices_by_distance(
-        self,
-        keep_idx: np.ndarray,      # shape: (K,)
-        dist2_all: np.ndarray,     # shape: (N,)
+            self,
+            keep_idx: np.ndarray,  # shape: (K,)
+            dist2_all: np.ndarray,  # shape: (N,)
     ) -> np.ndarray:
         """keep_idx를 '가까운 순'으로 재정렬합니다.
 
@@ -2276,12 +2268,12 @@ class DiffusionPlannerCollate:
         return keep_idx[order].astype(np.int64)
 
     def _keep_indices_from_points_xy(
-        self,
-        points_xy: np.ndarray,             # shape: (N, 2)
-        center_xy: np.ndarray,             # shape: (2,)
-        radius_sq: float,
-        invalid_fill: np.float32,
-        object_valid_1d: Optional[np.ndarray],  # shape: (N,)
+            self,
+            points_xy: np.ndarray,  # shape: (N, 2)
+            center_xy: np.ndarray,  # shape: (2,)
+            radius_sq: float,
+            invalid_fill: np.float32,
+            object_valid_1d: Optional[np.ndarray],  # shape: (N,)
     ) -> np.ndarray:
         """(N,2) 점 기준으로 반경 안에 들어오는 객체 인덱스를 만듭니다.
 
@@ -2306,8 +2298,8 @@ class DiffusionPlannerCollate:
             return np.zeros((0,), dtype=np.int64)
 
         pts = np.asarray(points_xy, dtype=np.float32)  # (N,2)
-        diff = pts - center_xy[None, :]                # (N,2)
-        dist2 = (diff * diff).sum(axis=-1)             # (N,)
+        diff = pts - center_xy[None, :]  # (N,2)
+        dist2 = (diff * diff).sum(axis=-1)  # (N,)
 
         if object_valid_1d is not None:
             dist2 = np.where(object_valid_1d, dist2, invalid_fill)
@@ -2317,13 +2309,13 @@ class DiffusionPlannerCollate:
         return self._sort_indices_by_distance(keep_idx, dist2)
 
     def _keep_indices_from_polyline_xy(
-        self,
-        poly_xy: np.ndarray,              # shape: (N, P, 2)
-        center_xy: np.ndarray,            # shape: (2,)
-        radius_sq: float,
-        invalid_fill: np.float32,
-        point_valid_2d: Optional[np.ndarray],   # shape: (N, P)
-        object_valid_1d: Optional[np.ndarray],  # shape: (N,)
+            self,
+            poly_xy: np.ndarray,  # shape: (N, P, 2)
+            center_xy: np.ndarray,  # shape: (2,)
+            radius_sq: float,
+            invalid_fill: np.float32,
+            point_valid_2d: Optional[np.ndarray],  # shape: (N, P)
+            object_valid_1d: Optional[np.ndarray],  # shape: (N,)
     ) -> np.ndarray:
         """(N,P,2) 선/영역 형태에서 반경 안에 들어오는 객체 인덱스를 만듭니다.
 
@@ -2354,12 +2346,12 @@ class DiffusionPlannerCollate:
         if p <= 0:
             return np.zeros((0,), dtype=np.int64)
 
-        pts = np.asarray(poly_xy, dtype=np.float32)          # (N,P,2)
-        diff = pts - center_xy[None, None, :]                # (N,P,2)
-        dist2_pts = (diff * diff).sum(axis=-1)               # (N,P)
+        pts = np.asarray(poly_xy, dtype=np.float32)  # (N,P,2)
+        diff = pts - center_xy[None, None, :]  # (N,P,2)
+        dist2_pts = (diff * diff).sum(axis=-1)  # (N,P)
 
         if point_valid_2d is None:
-            fallback_valid = np.any(np.abs(pts) > 0.0, axis=-1)     # (N,P)
+            fallback_valid = np.any(np.abs(pts) > 0.0, axis=-1)  # (N,P)
             dist2_pts = np.where(fallback_valid, dist2_pts, invalid_fill)
         else:
             dist2_pts = np.where(point_valid_2d, dist2_pts, invalid_fill)
@@ -2419,7 +2411,9 @@ class DiffusionPlannerCollate:
             return center_xy
 
         a = int(neighbor_past_arr.shape[0])
-        neighbor_valid_1d = self._as_bool_1d(sample.get("neighbor_agents_is_valid", None), expected_len=a)
+        neighbor_valid_1d = self._as_bool_1d(sample.get(
+            "neighbor_agents_is_valid", None),
+                                             expected_len=a)
         if neighbor_valid_1d is None:
             candidate_idx = np.arange(a, dtype=np.int64)
         else:
@@ -2428,14 +2422,16 @@ class DiffusionPlannerCollate:
         if int(candidate_idx.shape[0]) <= 0:
             return center_xy
 
-        chosen = int(candidate_idx[np.random.randint(int(candidate_idx.shape[0]))])
-        center_xy = np.asarray(neighbor_past_arr[chosen, -1, 0:2], dtype=np.float32)
+        chosen = int(candidate_idx[np.random.randint(int(
+            candidate_idx.shape[0]))])
+        center_xy = np.asarray(neighbor_past_arr[chosen, -1, 0:2],
+                               dtype=np.float32)
         return center_xy
 
     def _crop_poly_object_group_inplace(
         self,
         sample: Dict[str, Any],
-        center_xy: np.ndarray,          # shape (2,)
+        center_xy: np.ndarray,  # shape (2,)
         radius_sq: float,
         invalid_fill: np.float32,
         points_key: str,
@@ -2467,7 +2463,8 @@ class DiffusionPlannerCollate:
         if n <= 0:
             return
 
-        obj_valid_1d = self._as_bool_1d(sample.get(is_valid_key, None), expected_len=n)
+        obj_valid_1d = self._as_bool_1d(sample.get(is_valid_key, None),
+                                        expected_len=n)
         keep_idx = self._keep_indices_from_polyline_xy(
             poly_xy=np.asarray(pts_arr, dtype=np.float32),
             center_xy=center_xy,
@@ -2476,12 +2473,14 @@ class DiffusionPlannerCollate:
             point_valid_2d=None,
             object_valid_1d=obj_valid_1d,
         )
-        self._slice_first_dim_inplace(sample, keys=[points_key, is_valid_key], keep_idx=keep_idx)
+        self._slice_first_dim_inplace(sample,
+                                      keys=[points_key, is_valid_key],
+                                      keep_idx=keep_idx)
 
     def _crop_road_edge_group_inplace(
         self,
         sample: Dict[str, Any],
-        center_xy: np.ndarray,          # shape (2,)
+        center_xy: np.ndarray,  # shape (2,)
         radius_sq: float,
         invalid_fill: np.float32,
     ) -> None:
@@ -2510,7 +2509,9 @@ class DiffusionPlannerCollate:
         if e <= 0:
             return
 
-        road_edge_valid_1d = self._as_bool_1d(sample.get("road_edge_is_valid", None), expected_len=e)
+        road_edge_valid_1d = self._as_bool_1d(sample.get(
+            "road_edge_is_valid", None),
+                                              expected_len=e)
 
         keep_idx = self._keep_indices_from_polyline_xy(
             poly_xy=np.asarray(road_edge_arr, dtype=np.float32),
@@ -2548,7 +2549,8 @@ class DiffusionPlannerCollate:
             return
 
         if keep_agent_idx is None:
-            keep_agent_idx_eff = np.arange(int(aro_arr.shape[0]), dtype=np.int64)
+            keep_agent_idx_eff = np.arange(int(aro_arr.shape[0]),
+                                           dtype=np.int64)
         else:
             keep_agent_idx_eff = keep_agent_idx.astype(np.int64)
 
@@ -2557,17 +2559,21 @@ class DiffusionPlannerCollate:
         else:
             keep_lane_idx_eff = keep_lane_idx.astype(np.int64)
 
-        sample["agent_route_lane_order"] = aro_arr[np.ix_(keep_agent_idx_eff, keep_lane_idx_eff)]
+        sample["agent_route_lane_order"] = aro_arr[np.ix_(
+            keep_agent_idx_eff, keep_lane_idx_eff)]
 
         # agent_route_lane_order_is_valid 는 (agent 축)만 맞추면 됨
         aro_valid = sample.get("agent_route_lane_order_is_valid", None)
         if aro_valid is not None:
             aro_valid_arr = np.asarray(aro_valid)
-            if aro_valid_arr.ndim == 1 and int(aro_valid_arr.shape[0]) == int(keep_agent_idx_eff.shape[0]):
+            if aro_valid_arr.ndim == 1 and int(aro_valid_arr.shape[0]) == int(
+                    keep_agent_idx_eff.shape[0]):
                 # 이미 앞에서 agent 기준으로 잘려져 들어온 경우라면 그대로 둔다.
                 return
-            if aro_valid_arr.ndim == 1 and int(aro_valid_arr.shape[0]) >= int(keep_agent_idx_eff.max(initial=-1) + 1):
-                sample["agent_route_lane_order_is_valid"] = aro_valid_arr[keep_agent_idx_eff]
+            if aro_valid_arr.ndim == 1 and int(aro_valid_arr.shape[0]) >= int(
+                    keep_agent_idx_eff.max(initial=-1) + 1):
+                sample["agent_route_lane_order_is_valid"] = aro_valid_arr[
+                    keep_agent_idx_eff]
 
     def _build_center_crop_constants(self) -> Tuple[float, np.float32]:
         """center crop에 필요한 상수들을 한 번에 만든다.
@@ -2580,7 +2586,7 @@ class DiffusionPlannerCollate:
                 - radius_sq: float, 반경의 제곱(= (center_crop_radius_m)^2). shape: ()
                 - invalid_fill: np.float32, invalid를 멀리 보내기 위한 매우 큰 값. shape: ()
         """
-        radius_sq: float = float(self.center_crop_radius_m) ** 2
+        radius_sq: float = float(self.center_crop_radius_m)**2
         invalid_fill: np.float32 = np.float32(1.0e12)
         return radius_sq, invalid_fill
 
@@ -2627,7 +2633,8 @@ class DiffusionPlannerCollate:
         if a <= 0:
             return np.zeros((0,), dtype=np.int64)
 
-        agents_xy = np.asarray(neighbor_past_arr[:, -1, 0:2], dtype=np.float32)  # (A,2)
+        agents_xy = np.asarray(neighbor_past_arr[:, -1, 0:2],
+                               dtype=np.float32)  # (A,2)
         neighbor_valid_1d = self._as_bool_1d(
             sample.get("neighbor_agents_is_valid", None),
             expected_len=a,
@@ -2701,7 +2708,8 @@ class DiffusionPlannerCollate:
             return np.zeros((0,), dtype=np.int64)
 
         lane_len = int(lanes_arr.shape[1])
-        lanes_xy = np.asarray(lanes_arr[:, :, 0:2], dtype=np.float32)  # (L, lane_len, 2)
+        lanes_xy = np.asarray(lanes_arr[:, :, 0:2],
+                              dtype=np.float32)  # (L, lane_len, 2)
 
         lanes_len_is_valid_2d = self._as_bool_2d(
             sample.get("lanes_len_is_valid", None),
@@ -2775,7 +2783,8 @@ class DiffusionPlannerCollate:
             return
 
         route_len = int(route_arr.shape[1])
-        route_xy = np.asarray(route_arr[:, :, 0:2], dtype=np.float32)  # (R, route_len, 2)
+        route_xy = np.asarray(route_arr[:, :, 0:2],
+                              dtype=np.float32)  # (R, route_len, 2)
 
         route_len_is_valid_2d = self._as_bool_2d(
             sample.get("route_lanes_len_is_valid", None),
@@ -2994,6 +3003,7 @@ class DiffusionPlannerCollate:
                 radius_sq=radius_sq,
                 invalid_fill=invalid_fill,
             )
+
     # ------------------------------------------------------------------
     # 4) collate 본체
     # ------------------------------------------------------------------
@@ -3125,31 +3135,44 @@ def _scale_learning_rate_and_epochs(
 def _dump_args(
     args: argparse.Namespace,
     global_rank: int,
-) -> Optional[str]:
-    """체크포인트/로그를 저장할 경로를 만들고, args.json을 기록한다.
+) -> None:
+    """체크포인트/로그 디렉터리에 args.json을 기록한다.
+
+    주의:
+    - args는 학습 중에 lr/epoch 등이 스케일링되거나,
+      resume 과정에서 train_epochs가 보정될 수 있다.
+    - 따라서 '최종 args'가 결정된 뒤에 호출하는 것이
+      실제 학습 재현/디버깅에 더 정확하다.
 
     Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        global_rank: 전체 프로세스 기준 번호.
+        args: 학습 설정 Namespace.
+        global_rank: 전역 rank. 0에서만 파일을 쓴다.
 
     Returns:
-        save_path: rank 0에서 만든 저장 경로. 나머지 rank는 None.
+        None
     """
-    if global_rank == 0:
-        # StateNormalizer / ObservationNormalizer는 dict로 변환해서 저장
-        args_dict = vars(args)
-        args_dict = {
-            k: (v if not isinstance(v, (StateNormalizer, ObservationNormalizer))
-                else v.to_dict()) for k, v in args_dict.items()
-        }
+    if global_rank != 0:
+        return
 
-        from mmengine.fileio import dump
-        dump(
-            args_dict,
-            os.path.join(args.save_path, 'args.json'),
-            file_format='json',
-            indent=4,
-        )
+    save_path = getattr(args, "save_path", None)
+    if not save_path:
+        return
+
+    os.makedirs(save_path, exist_ok=True)
+
+    args_dict = vars(args)
+    args_dict = {
+        k: (v if not isinstance(v, (StateNormalizer, ObservationNormalizer))
+            else v.to_dict()) for k, v in args_dict.items()
+    }
+
+    from mmengine.fileio import dump
+    dump(
+        args_dict,
+        os.path.join(save_path, "args.json"),
+        file_format="json",
+        indent=4,
+    )
 
 
 def _build_augmentation(args: argparse.Namespace,) -> Optional[object]:
@@ -3568,6 +3591,72 @@ def _build_scheduler_from_args(
     return scheduler
 
 
+def _distributed_barrier() -> None:
+    """분산 학습 상태라면 모든 프로세스가 같은 지점에서 만나도록 기다린다.
+
+    왜 필요한가?
+    - 여러 프로세스(rank)가 동시에 체크포인트를 저장할 때는,
+      어떤 프로세스는 파일 저장이 끝났고 다른 프로세스는 아직 저장 중일 수 있다.
+    - 이 상태에서 누군가가 'latest.pth 같은 작은 메타 파일'을 먼저 써버리면,
+      겉으로는 저장이 끝난 것처럼 보이지만 실제 체크포인트 폴더는 아직 완성되지 않아
+      재개(resume)나 업로드가 불안정해질 수 있다.
+
+    Returns:
+        None
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _torch_save_to_bytes(obj: Any) -> bytes:
+    """torch.save 결과를 메모리(bytes)로 만든다.
+
+    Args:
+        obj: torch.save로 저장 가능한 객체(예: dict[str, scalar]).
+            - 예) {"epoch": 10, "loss": 1.23, ...}
+
+    Returns:
+        bytes: torch.save 결과 바이트열.
+    """
+    with io.BytesIO() as buff:
+        torch.save(obj, buff)
+        return buff.getvalue()
+
+
+def _atomic_write_bytes(file_path: str, data_bytes: bytes) -> None:
+    """작은 바이너리 데이터를 '깨질 확률을 줄이는 방식'으로 파일에 저장한다.
+
+    구현 방식:
+    - 같은 디렉터리에 임시 파일(tmp)을 먼저 만든다.
+    - tmp에 전체 바이트를 쓰고 flush + fsync 한다.
+    - 마지막에 os.replace로 목표 파일을 한 번에 교체한다.
+      (중간에 죽어도 기존 파일이 반쯤 깨진 상태로 남는 일을 줄인다)
+
+    Args:
+        file_path: 최종 저장 경로. shape: ()
+        data_bytes: 저장할 바이트열. shape: ()
+
+    Returns:
+        None
+    """
+    dir_path = os.path.dirname(file_path)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
+    tmp_path = f"{file_path}.tmp.{os.getpid()}"
+    with open(tmp_path, "wb") as f:
+        f.write(data_bytes)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            # 일부 파일시스템/환경에서 fsync가 실패할 수 있어도,
+            # replace 기반 원자 교체는 계속 진행한다.
+            pass
+
+    os.replace(tmp_path, file_path)
+
+
 def _write_deepspeed_meta_checkpoint_files(
     save_path: Optional[str],
     epoch: int,
@@ -3577,21 +3666,32 @@ def _write_deepspeed_meta_checkpoint_files(
 ) -> None:
     """DeepSpeed 모드용 얇은 메타 체크포인트(latest/best)를 저장한다.
 
-    이 파일은 실제 모델 파라미터/옵티마가 아니라,
+    이 파일은 '실제 모델 가중치/옵티마 상태'가 아니라,
     재개할 때 참고할 작은 정보만 담는다.
 
-    저장 내용:
-      - epoch (int): 다음 학습에 사용할 epoch 인덱스.  # shape: ()
-      - loss (float): 해당 epoch 전체 손실 값.         # shape: ()
-      - wandb_id (str 또는 None): 이어서 쓸 W&B run id.
-      - is_deepspeed (bool): DeepSpeed에서 만든 메타 파일임을 표시.
+    저장 내용(모두 스칼라):
+      - epoch (int): 다음에 시작할 epoch 인덱스. shape: ()
+      - loss (float): 해당 epoch 손실 값. shape: ()
+      - wandb_id (Optional[str]): 이어서 쓸 W&B run id. shape: ()
+      - is_deepspeed (bool): DeepSpeed 메타 파일임을 표시. shape: ()
 
-    DeepSpeed 엔진의 실제 파라미터/옵티마/스케줄러 상태는
-    engine.save_checkpoint(..., tag="latest"/"best") 에 의해 따로 저장된다.
+    주의:
+    - 이 함수는 "rank 0만 호출"되는 것을 전제로 설계하는 것이 안전하다.
+      (모든 rank가 동시에 같은 파일(latest.pth)을 쓰면 파일이 깨질 수 있다)
+
+    Args:
+        save_path: 체크포인트 루트 디렉터리 경로.
+        epoch: 현재 epoch(0부터 시작).
+        train_total_loss: 이번 epoch 손실 스칼라.
+        wandb_run_id: W&B run id 또는 None.
+        save_best: True면 best.pth도 갱신한다.
+
+    Returns:
+        None
     """
     if save_path is None:
-        raise ValueError(f"_write_deepspeed_meta_checkpoint_files 에는 "
-                         f"유효한 save_path 가 필요합니다.")
+        raise ValueError(
+            "_write_deepspeed_meta_checkpoint_files 에는 유효한 save_path 가 필요합니다.")
 
     meta_dict: Dict[str, Any] = {
         "epoch": int(epoch + 1),
@@ -3602,19 +3702,16 @@ def _write_deepspeed_meta_checkpoint_files(
 
     os.makedirs(save_path, exist_ok=True)
 
-    # latest.pth 메타 저장 (dict[str, scalar])
+    data_bytes = _torch_save_to_bytes(meta_dict)
+
+    # latest.pth 메타 저장
     latest_path = os.path.join(save_path, "latest.pth")
-    with io.BytesIO() as buff:
-        torch.save(meta_dict, buff)
-        data_bytes = buff.getvalue()
-    with open(latest_path, "wb") as f:
-        f.write(data_bytes)
+    _atomic_write_bytes(latest_path, data_bytes)
 
     # best 갱신 시 best.pth도 동일 내용으로 덮어쓴다.
     if save_best:
         best_path = os.path.join(save_path, "best.pth")
-        with open(best_path, "wb") as f:
-            f.write(data_bytes)
+        _atomic_write_bytes(best_path, data_bytes)
 
 
 def _save_deepspeed_checkpoint_for_epoch(
@@ -3626,71 +3723,50 @@ def _save_deepspeed_checkpoint_for_epoch(
     model_ema: Optional[ModelEma],
     use_deepspeed: bool,
     save_best: bool,
+    global_rank: int,
 ) -> Tuple[str, str]:
     """DeepSpeed 엔진일 때 한 epoch 끝에서 전체 학습 상태를 체크포인트로 저장한다.
 
-    이 함수는 PyTorch 단일 .pth 파일이 아니라, DeepSpeed 전용 폴더 구조를 사용한다.
-    한 번 호출될 때 다음 두 가지를 동시에 처리한다.
-
-    1) DeepSpeedEngine.save_checkpoint(...)
-       - 모델 파라미터, 옵티마이저 상태, 스케줄러 상태를
-         `save_path/latest/`(또는 `save_path/best/`) 아래에 나눠 저장한다.
-       - 내부적으로 각 mp_rank_* 디렉터리에 rank별 텐서가 들어간다.
-         · 예: weight 텐서: (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW) 등.
-
-    2) 얇은 메타 파일(latest.pth / best.pth) 작성
-       - epoch: int, 다음에 학습을 이어갈 epoch 인덱스.  # shape: ()
-       - loss: float, 이번 epoch 전체 train_total_loss.  # shape: ()
-       - wandb_id: str 또는 None, 이어서 사용할 W&B run id.
-       - is_deepspeed: bool, DeepSpeed 포맷임을 나타내는 플래그.
-       이 정보만 담은 작은 dict 를 save_path 루트에 latest.pth / best.pth 로 남긴다.
+    핵심 규칙
+    --------
+    - DeepSpeedEngine.save_checkpoint(...) 는 각 rank가 자기 파티션을 저장해야 하므로
+      모든 rank가 반드시 호출해야 한다.
+    - 반면, latest.pth / best.pth 같은 작은 메타 파일은
+      모든 rank가 동시에 쓰면 파일이 깨질 수 있으므로 rank 0만 쓴다.
+    - 체크포인트 폴더 저장이 다 끝난 뒤에 meta를 쓰도록 barrier로 순서를 맞춘다.
 
     Args:
-        diffusion_planner (torch.nn.Module):
-            - deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
-            - diffusion_planner.save_checkpoint(...) 를 통해 rank별 파라미터 텐서들을
-              `mp_rank_XX_model_states.pt` 형식으로 저장한다.
-        save_path (Optional[str]):
-            - 체크포인트 루트 디렉터리 경로.
-            - 예: ".../training_log/실험이름/2025-09-21-13:25:45".
-            - None 이면 아무 것도 하지 않고 바로 반환한다.
-        epoch (int):
-            - 현재 epoch 인덱스(0부터 시작). 메타 정보에는 epoch+1 로 저장된다.  # shape: ()
-        train_total_loss (float):
-            - 이번 epoch 의 전체 train loss 스칼라 값.  # shape: ()
-        wandb_run_id (Optional[str]):
-            - 이 체크포인트와 연결할 W&B run id. 없으면 None.
-        model_ema (Optional[ModelEma]):
-            - EMA 래퍼. 존재하면 model_ema.ema.state_dict() 를 client_state["ema_state_dict"]
-              로 함께 저장한다.
-              · 각 텐서 shape: 원본 모델 파라미터와 동일
-                (예: (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW)).
-        use_deepspeed (bool):
-            - True 일 때만 DeepSpeed 체크포인트 저장을 수행한다.
-            - False 이면 아무 작업 없이 반환한다.
-        save_best (bool):
-            - True 이면 이번 epoch 가 현재까지의 best 로 간주하고,
-              "latest" 뿐 아니라 "best" tag 로도 한 번 더 저장한다.
+        diffusion_planner: deepspeed.DeepSpeedEngine 인스턴스를 기대.
+        save_path: 체크포인트 루트 디렉터리.
+        epoch: 현재 epoch 인덱스(0부터).
+        train_total_loss: 이번 epoch 손실 스칼라.
+        wandb_run_id: W&B run id 또는 None.
+        model_ema: EMA 래퍼 또는 None.
+        use_deepspeed: True여야 동작.
+        save_best: best 체크포인트도 저장할지 여부.
+        global_rank: 전역 rank. meta 파일은 global_rank==0에서만 작성.
 
     Returns:
-        None:
-            - 이 함수는 파일 시스템에만 영향을 주고, 값을 반환하지 않는다.
+        Tuple[str, str]:
+            - tag_latest: 이번 epoch의 latest 태그 문자열
+            - tag_best: 이번 epoch의 best 태그 문자열(문자열은 항상 만들지만, save_best=False면 폴더는 안 생길 수 있음)
     """
     if (not use_deepspeed) or save_path is None:
-        raise ValueError(f"_save_deepspeed_checkpoint_for_epoch 는 "
-                         f"use_deepspeed=True 및 유효한 save_path 가 필요합니다.")
+        raise ValueError(
+            "_save_deepspeed_checkpoint_for_epoch 는 use_deepspeed=True 및 유효한 save_path 가 필요합니다."
+        )
     if not hasattr(diffusion_planner, "save_checkpoint"):
         raise ValueError(
-            f"diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
+            "diffusion_planner 는 deepspeed.DeepSpeedEngine 인스턴스여야 합니다.")
+
     # EMA 상태 dict 준비 (없으면 None)
     ema_state_dict: Optional[Dict[str, Any]] = None
     if model_ema is not None:
         try:
-            # timm.ModelEma 는 .ema 가 실제 모델(nn.Module)이다.
             ema_state_dict = model_ema.ema.state_dict()
         except Exception:
-            # 혹시 .ema 가 없는 커스텀 EMA 일 경우를 위한 fallback
             ema_state_dict = model_ema.state_dict()
+
     client_state: Dict[str, Any] = {
         "epoch": int(epoch + 1),
         "loss": float(train_total_loss),
@@ -3698,20 +3774,20 @@ def _save_deepspeed_checkpoint_for_epoch(
         "ema_state_dict": ema_state_dict,
     }
 
-    # ✅ 실제 파라미터/옵티마/스케줄러 상태 저장 (latest 태그)
-    """
-    모델 파라미터/옵티마 상태/스케줄러 상태
-    추가 정보(client_state: 에폭, loss, wandb id 등)
-    
-    """
     tag_latest = f"latest_epoch-{epoch + 1:06d}"
+    tag_best = f"best_epoch-{epoch + 1:06d}"
+
+    # 1) latest 저장: 모든 rank가 호출
     diffusion_planner.save_checkpoint(
         save_dir=save_path,
         tag=tag_latest,
         client_state=client_state,
     )
-    tag_best = f"best_epoch-{epoch + 1:06d}"
-    # ✅ best 인 경우 best 태그도 별도로 저장해 둔다.
+
+    # 모든 rank의 latest 저장 완료까지 대기
+    _distributed_barrier()
+
+    # 2) best 저장: save_best인 경우에만(단, save_best는 모든 rank에서 동일하다고 가정)
     if save_best:
         diffusion_planner.save_checkpoint(
             save_dir=save_path,
@@ -3719,14 +3795,22 @@ def _save_deepspeed_checkpoint_for_epoch(
             client_state=client_state,
         )
 
-    # ✅ W&B / 사람이 보는 용도의 얇은 latest.pth / best.pth 메타 파일도 같이 작성
-    _write_deepspeed_meta_checkpoint_files(
-        save_path=save_path,
-        epoch=epoch,
-        train_total_loss=train_total_loss,
-        wandb_run_id=wandb_run_id,
-        save_best=save_best,
-    )
+    # best 저장 여부와 관계없이 한 번 더 동기화(순서 안정화)
+    _distributed_barrier()
+
+    # 3) meta 파일(latest.pth / best.pth)은 rank 0만 작성
+    if global_rank == 0:
+        _write_deepspeed_meta_checkpoint_files(
+            save_path=save_path,
+            epoch=epoch,
+            train_total_loss=train_total_loss,
+            wandb_run_id=wandb_run_id,
+            save_best=save_best,
+        )
+
+    # meta 파일 작성 완료까지 대기
+    _distributed_barrier()
+
     return tag_latest, tag_best
 
 
@@ -3809,32 +3893,42 @@ def _update_deepspeed_optimizer_param_group_meta(
 
 
 def _select_latest_like_tag(save_path: str) -> str:
-    """DeepSpeed 체크포인트 루트에서 'latest'가 들어간 하위 폴더 이름을 고른다.
+    """DeepSpeed 체크포인트 루트에서 '가장 최신 latest 계열 태그'를 고른다.
+
+    동작 규칙:
+    1) save_path 아래에 'latest'라는 디렉터리가 정확히 있으면 그걸 최우선으로 사용한다.
+       (사람이 심볼릭 링크/복사로 만들어둔 경우를 고려)
+    2) 그 외에는 이름에 "latest"가 들어간 디렉터리들(예: latest_epoch-000010) 중
+       정렬 기준 가장 마지막(=가장 큰 숫자) 것을 선택한다.
+       - epoch를 6자리 0패딩으로 쓰고 있으므로 문자열 정렬로도 최신 선택이 가능하다.
 
     Args:
-        save_path (str): 체크포인트 루트 디렉터리 경로.
+        save_path: 체크포인트 루트 디렉터리.
 
     Returns:
-        str: tag로 사용할 폴더 이름. 후보가 없으면 기본값 'latest'.
-
-    Raises:
-        RuntimeError: 디렉터리 목록을 읽는 도중 OS 오류가 발생한 경우.
+        str: load_checkpoint에 넣을 tag 문자열.
     """
     tag: str = "latest"
-    if os.path.isdir(save_path):
-        try:
-            candidate_tags = [
-                d for d in os.listdir(save_path)
-                if os.path.isdir(os.path.join(save_path, d)) and "latest" in d
-            ]
-        except OSError as e:
-            raise RuntimeError(
-                f"[DeepSpeed] 체크포인트 디렉터리 목록을 읽는 중 오류 발생: {save_path}, {e}"
-            ) from e
+    if not os.path.isdir(save_path):
+        return tag
 
-        if candidate_tags:
-            # 이름에 'latest'가 들어간 폴더들 중 정렬 기준 첫 번째 사용
-            tag = sorted(candidate_tags)[0]
+    try:
+        children = [
+            d for d in os.listdir(save_path)
+            if os.path.isdir(os.path.join(save_path, d))
+        ]
+    except OSError as e:
+        raise RuntimeError(
+            f"[DeepSpeed] 체크포인트 디렉터리 목록을 읽는 중 오류 발생: {save_path}, {e}") from e
+
+    # 1) 정확히 "latest" 디렉터리가 있으면 우선 사용
+    if "latest" in children:
+        return "latest"
+
+    # 2) "latest"가 포함된 태그 디렉터리들 중 가장 최신(정렬 마지막) 선택
+    candidate_tags = [d for d in children if "latest" in d]
+    if candidate_tags:
+        return sorted(candidate_tags)[-1]
 
     return tag
 
@@ -5023,45 +5117,35 @@ def _log_wandb_checkpoint_artifacts(
 ) -> None:
     """한 epoch가 끝난 뒤 local 체크포인트를 W&B 아티팩트로 올린다.
 
-    - PyTorch/DDP 학습:
-      latest.pth / best.pth 파일만 아티팩트에 담는다.
-    - DeepSpeed 학습:
-      latest.pth / best.pth 파일과 함께
-      DeepSpeed가 만든 latest/ best 폴더(파라미터, 옵티마 포함)도 같이 올린다.
+    - PyTorch/DDP 학습: latest.pth / best.pth 파일만 업로드
+    - DeepSpeed 학습: latest.pth / best.pth + DeepSpeed tag 디렉터리도 함께 업로드
 
-    W&B에는 항상 /mnt/temp_wandb 아래의 로컬 복사본 경로만 넘긴다.
-    업로드가 끝나면 /mnt/temp_wandb 전체를 삭제한다.
+    주의:
+    - alias는 DeepSpeed 여부와 무관하게 항상 ["latest"] / ["best"] 로만 붙인다.
+    - epoch 정보는 metadata에 넣으면 충분하므로 alias에 epoch를 포함하지 않는다.
     """
     if args.save_path is None:
         return
     if not getattr(args, "use_wandb", False):
         return
     if not wandb.run:
-        # W&B 런이 없으면 업로드 불가
         return
 
-    # ───────────────────────────────────────────────────────────
-    #  임시 로컬 디렉터리(/mnt/temp_wandb) 준비
-    #   - DDP라도 global_rank==0에서만 이 함수가 호출된다고 가정
-    #   - 매 호출마다 깨끗하게 날리고 새로 만든 뒤, 마지막에 정리
-    # ───────────────────────────────────────────────────────────
     temp_root_dir: str = TEMP_WANDB_ROOT_DIR
     try:
         if os.path.isdir(temp_root_dir):
             shutil.rmtree(temp_root_dir, ignore_errors=True)
         os.makedirs(temp_root_dir, exist_ok=True)
     except Exception as e:
-        # 임시 디렉터리를 만들 수 없으면 그냥 원래 로직으로 Ceph 경로를 넘긴다.
         print(f"[W&B TEMP] failed to prepare temp root dir '{temp_root_dir}', "
               f"fallback to direct upload. error={e}")
-        temp_root_dir = ""  # 아래에서 temp 사용 여부 분기용
+        temp_root_dir = ""
 
-    # 디렉터리 이름에서 대략적인 시간 문자열을 뽑아서 메타데이터에 남긴다.
     base_dir_name = os.path.basename(os.path.normpath(args.save_path))
     time_str_meta = base_dir_name.replace(":", "-")
 
     try:
-        # ── latest-model 아티팩트 (매번 덮어쓰기) ──
+        # ── latest-model ─────────────────────────────────────────
         latest_coll = f"{args.name}_latest-model"
         latest_art = wandb.Artifact(
             name=latest_coll,
@@ -5073,11 +5157,9 @@ def _log_wandb_checkpoint_artifacts(
             },
         )
 
-        # latest용 임시 서브 디렉터리: /mnt/temp_wandb/latest
         temp_latest_root_dir: Optional[str] = (os.path.join(
             temp_root_dir, "latest") if temp_root_dir else None)
 
-        # 1) latest.pth 파일
         latest_pth = os.path.join(args.save_path, "latest.pth")
         if os.path.exists(latest_pth):
             if temp_latest_root_dir is not None:
@@ -5089,10 +5171,8 @@ def _log_wandb_checkpoint_artifacts(
                 if local_latest_pth is not None:
                     latest_art.add_file(local_latest_pth)
             else:
-                # temp 디렉터리 준비 실패 시에는 기존 경로를 그대로 사용
                 latest_art.add_file(latest_pth)
 
-        # 2) DeepSpeed라면 latest 태그 디렉터리도 같이 넣어준다.
         if use_deepspeed and tag_latest is not None:
             latest_tag_dir = os.path.join(args.save_path, tag_latest)
             if os.path.isdir(latest_tag_dir):
@@ -5103,25 +5183,22 @@ def _log_wandb_checkpoint_artifacts(
                         dst_dir_name=tag_latest,
                     )
                     if local_latest_tag_dir is not None:
-                        # 아티팩트 안에서도 "tag_latest/" 이름 그대로 보이도록 고정
                         latest_art.add_dir(local_latest_tag_dir,
                                            name=tag_latest)
                 else:
                     latest_art.add_dir(latest_tag_dir, name=tag_latest)
 
-        wandb.log_artifact(
-            latest_art,
-            aliases=["latest" if tag_latest is None else tag_latest])
-        latest_art.wait()  # 업로드 완료 보장
+        # ✅ alias는 항상 "latest" 하나만
+        wandb.log_artifact(latest_art, aliases=["latest"])
+        latest_art.wait()
 
-        # 학습 도중 이전 버전들을 지우고 싶을 때
         if getattr(args, "delete_wb_weight_when_running", False):
             _prune_old_wandb_artifact_versions(
                 collection_name=latest_coll,
                 alias="latest",
             )
 
-        # ── best-model 아티팩트 (새 best일 때만 갱신) ──
+        # ── best-model ───────────────────────────────────────────
         if not save_best:
             return
 
@@ -5136,11 +5213,9 @@ def _log_wandb_checkpoint_artifacts(
             },
         )
 
-        # best용 임시 서브 디렉터리: /mnt/temp_wandb/best
         temp_best_root_dir: Optional[str] = (os.path.join(
             temp_root_dir, "best") if temp_root_dir else None)
 
-        # 1) best.pth 파일
         best_pth = os.path.join(args.save_path, "best.pth")
         if os.path.exists(best_pth):
             if temp_best_root_dir is not None:
@@ -5154,7 +5229,6 @@ def _log_wandb_checkpoint_artifacts(
             else:
                 best_art.add_file(best_pth)
 
-        # 2) DeepSpeed라면 best 태그 디렉터리도 같이 넣어준다.
         if use_deepspeed and tag_best is not None:
             best_tag_dir = os.path.join(args.save_path, tag_best)
             if os.path.isdir(best_tag_dir):
@@ -5169,8 +5243,8 @@ def _log_wandb_checkpoint_artifacts(
                 else:
                     best_art.add_dir(best_tag_dir, name=tag_best)
 
-        wandb.log_artifact(best_art,
-                           aliases=["best" if tag_best is None else tag_best])
+        # ✅ alias는 항상 "best" 하나만
+        wandb.log_artifact(best_art, aliases=["best"])
         best_art.wait()
 
         if getattr(args, "delete_wb_weight_when_running", False):
@@ -5180,9 +5254,6 @@ def _log_wandb_checkpoint_artifacts(
             )
 
     finally:
-        # ─────────────────────────────────────────────────────
-        #  업로드가 끝나면 /mnt/temp_wandb 전체를 정리
-        # ─────────────────────────────────────────────────────
         if temp_root_dir:
             try:
                 shutil.rmtree(temp_root_dir, ignore_errors=True)
@@ -5309,6 +5380,7 @@ def _log_and_save(
             model_ema=model_ema,
             use_deepspeed=use_deepspeed,
             save_best=save_best,
+            global_rank=global_rank,
         )
         print(f"[DeepSpeed] Checkpoint saved in {args.save_path}\n")
     else:
@@ -5326,7 +5398,6 @@ def _log_and_save(
         )
         if global_rank == 0:
             print(f"Model saved in {args.save_path}\n")
-
     # 5) W&B 아티팩트 업로드
     if global_rank == 0:
         _log_wandb_checkpoint_artifacts(args=args,
@@ -5577,74 +5648,14 @@ def _run_training_loop(
     global_batch_size: int,
     aug: Optional[object],
 ) -> float:
-    """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다.
-
-    처리 흐름:
-      1) epoch = init_epoch 부터 train_epochs-1 까지 순회하면서,
-         각 epoch마다 _train_one_epoch(...) 를 호출해
-         - train_loss (Dict[str, float])
-         - train_total_loss (float)
-         - epoch_elapsed_time_sec (float)
-         를 얻는다. 이때 train_loader에서 나오는 배치 텐서는 모두 (B, ·) shape 이다.
-      2) 한 epoch에 대해
-         - data_num_in_a_epoch / epoch_elapsed_time_sec 로
-           data_process_per_sec 를 구하고,
-         - 누적 학습 시간(elapsed_training_time_hour)을 시간 단위로 업데이트한다.
-      3) optimizer / train_loss / 속도 정보를 이용해
-         - info_dict (학습률, epoch 수, 배치 수, 글로벌 배치 크기, 진행도 등)
-         - weight_dict / direct_loss_dict / integration_loss_dict /
-           constraint_loss_dict / loss_dict
-         - speed_info (epoch_elapsed_time_sec, data_process_per_sec,
-           elapsed_training_time_hour)
-         를 구성한 뒤,
-         prefix("info_dict/", "loss_dict/" 등)을 붙여 하나의 metrics dict 로 합친다.
-      4) rank 0 프로세스에서만 _log_and_save(...) 을 호출해
-         - W&B / TensorBoard 로 metrics 를 기록하고,
-         - 주기적으로 checkpoint 를 저장하며,
-         - best_loss 를 갱신한다.
-      5) 각 epoch 마지막에는 train_sampler.set_epoch(...) 를 호출해
-         다음 epoch에서 DistributedSampler의 셔플 시드를 바꾸어 준다.
-
-    Args:
-        args (argparse.Namespace):
-            - 학습 설정 / 상태를 포함한 Namespace.
-        diffusion_planner (nn.Module):
-            - 학습 중인 모델 또는 DDP/DeepSpeed 래퍼.
-        optimizer (optim.Optimizer):
-            - AdamW/AdamW8bit 옵티마이저.
-        scheduler (Any):
-            - lr 스케줄러 객체. train_epoch 내부에서 step()이 호출된다.
-        model_ema (Optional[ModelEma]):
-            - EMA 추적용 래퍼 또는 None.
-        train_loader (DataLoader):
-            - 각 요소가 (B, ·) shape 텐서 dict인 배치를 반환하는 DataLoader.
-        train_sampler (DistributedSampler):
-            - 분산 환경에서 rank별 샘플 인덱스를 관리하는 Sampler.
-        wandb_logger (Logger):
-            - W&B + TensorBoard 로깅 담당 래퍼.
-        best_loss (float):
-            - 지금까지의 최소 train_total_loss 값.  # shape: ()
-        global_rank (int):
-            - 전체 프로세스 기준 rank. 0 이면 로그/저장 담당.
-        train_epochs (int):
-            - 전체 학습 epoch 수.  # shape: ()
-        init_epoch (int):
-            - 재개 시 시작할 epoch 인덱스(0 기반).  # shape: ()
-        data_num_in_a_epoch (int):
-            - 한 epoch 동안 처리되는 샘플 수.  # shape: ()
-        global_batch_size (int):
-            - 실제 글로벌 배치 크기 (한 step당 샘플 수).  # shape: ()
-        aug (Optional[object]):
-            - StatePerturbation / NPCStatePerturbation 또는 None.
-
-    Returns:
-        float:
-            - 학습 종료 시점까지의 최소 train_total_loss(best_loss) 값.  # shape: ()
-    """
+    """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
     elapsed_training_time_hour: float = 0.0
 
     for epoch in range(init_epoch, train_epochs):
-        # 1) 한 epoch 학습
+        # ✅ (중요) epoch 시작 전에 sampler epoch를 먼저 세팅
+        # - resume(init_epoch>0) 시에도 첫 epoch부터 올바른 shuffle이 나오도록 함
+        train_sampler.set_epoch(epoch + args.sampler_epoch_offset)
+
         train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
             epoch=epoch,
             train_epochs=train_epochs,
@@ -5657,18 +5668,14 @@ def _run_training_loop(
             aug=aug,
         )
 
-        # 누적 학습 시간 업데이트 (시간 단위)
         elapsed_training_time_hour += epoch_elapsed_time_sec / 3600.0
 
-        # 2) epoch당 처리 속도 계산
-        # data_process_per_sec: float, 초당 처리 샘플 수.  # shape: ()
         speed_info: Dict[str, float] = _build_speed_info_for_logging(
             epoch_elapsed_time_sec=epoch_elapsed_time_sec,
             data_num_in_a_epoch=data_num_in_a_epoch,
             elapsed_training_time_hour=elapsed_training_time_hour,
         )
 
-        # 3-1) lr / epoch / 배치 관련 info_dict 구성
         info_dict: Dict[str, float] = _build_epoch_info_dict_for_logging(
             optimizer=optimizer,
             train_epochs=train_epochs,
@@ -5676,7 +5683,6 @@ def _run_training_loop(
             global_batch_size=global_batch_size,
         )
 
-        # 3-2) train_loss 항목들을 목적별 딕셔너리로 분리
         (
             weight_dict,
             direct_loss_dict,
@@ -5688,7 +5694,6 @@ def _run_training_loop(
             info_dict=info_dict,
         )
 
-        # 3-3) flat metrics dict 구성
         metrics: Dict[str, float] = _build_flat_metrics_dict_for_logging(
             info_dict=info_dict,
             weight_dict=weight_dict,
@@ -5699,12 +5704,11 @@ def _run_training_loop(
             speed_info=speed_info,
         )
 
-        # 4) rank 0에서 로그 및 체크포인트/아티팩트 저장
         best_loss = _log_and_save(
             epoch=epoch,
             args=args,
             train_total_loss=train_total_loss,
-            metrics=metrics,  # Dict[str, float]
+            metrics=metrics,
             wandb_logger=wandb_logger,
             diffusion_planner=diffusion_planner,
             optimizer=optimizer,
@@ -5713,9 +5717,6 @@ def _run_training_loop(
             best_loss=best_loss,
             global_rank=global_rank,
         )
-
-        # 5) 다음 epoch 를 위한 sampler seed 변경
-        train_sampler.set_epoch(epoch + 1 + args.sampler_epoch_offset)
 
     return best_loss
 
@@ -5805,36 +5806,23 @@ def model_training(
     world_size: int,
     use_deepspeed: bool,
 ) -> None:
-    """전체 학습 파이프라인을 실행하는 상위 함수.
-
-    - 분산 설정/학습률 스케일링
-    - Dataset / DataLoader 준비
-    - 모델 / 옵티마이저 / 스케줄러 / EMA 준비
-    - 체크포인트 재개 및 로깅 설정
-    - epoch 루프 실행과 최종 정리
-
-    Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-    """
-    best_loss: float = float('inf')
+    """전체 학습 파이프라인을 실행하는 상위 함수."""
+    best_loss: float = float("inf")
     torch.cuda.empty_cache()
-    # 3) save_path / args.json 준비
-    _dump_args(args, global_rank)
 
-    # 2) 글로벌 배치 크기에 따라 학습률 / epoch 수 스케일링
+    # 1) 글로벌 배치 크기에 따라 학습률 / epoch 수 스케일링
     BASE_GLOBAL_BATCH, current_global_batch = _scale_learning_rate_and_epochs(
         args,
         world_size,
     )
-    # 4) seed 고정
+
+    # 2) seed 고정
     set_seed(args.seed + global_rank)
 
-    # 5) augmentation, Dataset, Sampler
+    # 3) augmentation, Dataset, Sampler
     batch_size = args.batch_size
     aug = _build_augmentation(args)
-    # train_epoch 내부에서 args를 통해 augmentation이 사용되므로 aug는 실제로는
-    #   train_epoch 인자로만 전달되고, 배치 텐서 shape는 (B, ·)로 유지된다.
-    _ = aug  # 형식상 참조 (실제 로직은 기존과 동일하게 train_epoch에서 사용)
+    _ = aug
 
     train_set, train_sampler = _build_dataset_and_sampler(
         args,
@@ -5842,7 +5830,7 @@ def model_training(
         global_rank,
     )
 
-    # 6) warmup step 계산
+    # 4) warmup step 계산
     warmup_steps_at_B0, warmup_steps = _compute_warmup_steps(
         args=args,
         BASE_GLOBAL_BATCH=BASE_GLOBAL_BATCH,
@@ -5850,7 +5838,7 @@ def model_training(
         total_data_num=len(train_set),
     )
 
-    # 7) DataLoader 및 step/샘플 수 정보
+    # 5) DataLoader 및 step/샘플 수 정보
     train_loader = _build_train_loader(
         args,
         train_set,
@@ -5865,7 +5853,6 @@ def model_training(
          world_size=world_size,
      )
 
-    # 8) rank 0에서 스케줄 요약 출력
     _print_schedule_summary(
         global_rank=global_rank,
         train_set_len=len(train_set),
@@ -5878,24 +5865,20 @@ def model_training(
         warmup_steps=warmup_steps,
     )
 
-    # 9) DDP인 경우, 모델 생성 전 barrier
     if args.ddp and not use_deepspeed:
         torch.distributed.barrier()
 
-    # 1) 모델/EMA/base_model 생성
     diffusion_planner, model_ema, base_model = _create_diffusion_planner_and_ema(
         args=args,
         rank=rank,
         use_deepspeed=use_deepspeed,
     )
 
-    # 2) 역할별 lr 배율 및 freeze 설정을 반영한 optimizer 생성
     optimizer = _build_optimizer_with_roles_from_args(
         base_model=base_model,
         args=args,
     )
 
-    # 3) lr 스케줄러 구성 (cosine / uniform + warmup)
     scheduler = _build_scheduler_from_args(
         args=args,
         optimizer=optimizer,
@@ -5903,9 +5886,8 @@ def model_training(
         warmup_steps=warmup_steps,
     )
 
-    # 4) DeepSpeed 엔진으로 래핑 (ZeRO-2 설정은 build_deepspeed_config 로 생성)
     if use_deepspeed:
-        import deepspeed  # use_deepspeed=True일 때만 import
+        import deepspeed
         ds_config = build_deepspeed_config(args, current_global_batch)
         diffusion_planner, optimizer, _, scheduler = deepspeed.initialize(
             model=diffusion_planner,
@@ -5915,7 +5897,7 @@ def model_training(
             config=ds_config,
         )
 
-    # 11) 체크포인트 재개
+    # 6) 체크포인트 재개
     (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
      train_epochs, allow_val_change) = _maybe_resume_from_checkpoint(
          args=args,
@@ -5924,16 +5906,18 @@ def model_training(
          scheduler=scheduler,
          model_ema=model_ema,
          global_rank=global_rank,
-         use_deepspeed=use_deepspeed,  # ✅ 추가
+         use_deepspeed=use_deepspeed,
      )
-    # 11-1) 재개 시 global step 복원 (w_dir / w_int / w_const 스케줄 연속성 보장)
+
+    # ✅ (중요) 스케일링 + resume 처리까지 끝난 "최종 args"를 args.json으로 저장
+    _dump_args(args, global_rank)
+
     _init_or_restore_global_update_step(
         args=args,
         init_epoch=init_epoch,
         total_step_of_this_epoch=total_step_of_this_epoch,
     )
 
-    # 12) 로거 설정 및 이전 아티팩트 정리
     wandb_logger = _setup_logger_and_purge(
         args=args,
         global_rank=global_rank,
@@ -5959,7 +5943,6 @@ def model_training(
         aug=aug,
     )
 
-    # 14) 학습 종료 후 정리
     _finalize_training_cleanup(
         args=args,
         global_rank=global_rank,

@@ -439,11 +439,11 @@ class DiffusionPlannerData(Dataset):
         womd_only_keys: List[str] = [
             "speed_bump_points",  # (speed_bump_num, safety_len, 2) # womd  # TODO
             "driveway_points",  # (driveway_num, safety_len, 2) # womd (환경에 따라 driveway라는 이름일 수도 있음) # TODO
-            "lane_type",  # (chosen_lane_num, 4) # womd
-            "left_line_type",  # (chosen_lane_num, 13) # womd
-            "right_line_type",  # (chosen_lane_num, 13) # womd
+            "lane_type",  # (chosen_lane_num, 4) # womd # TODO
+            "left_line_type",  # (chosen_lane_num, 13) # womd # TODO
+            "right_line_type",  # (chosen_lane_num, 13) # womd # TODO
             "road_edge",  # (chosen_edge_num, safety_len, 2) # womd # TODO
-            "road_edge_type",  # (chosen_edge_num, 3) # womd
+            "road_edge_type",  # (chosen_edge_num, 3) # womd # TODO
         ]
 
         npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys
@@ -454,14 +454,20 @@ class DiffusionPlannerData(Dataset):
         }
 
         sample: Dict[str, Any] = {}
-
-        for npz_key in npz_keys:
-            value = data.get(npz_key, None)
-            if value is not None and npz_key == "agent_route_lane_order":
-                value = value.astype("int64")
-            out_key = npz_key_to_new_key.get(npz_key, npz_key)
-            sample[out_key] = value
-
+        try:
+            for npz_key in npz_keys:
+                value = data.get(npz_key, None)
+                if value is not None and npz_key == "agent_route_lane_order":
+                    value = value.astype("int64")
+                out_key = npz_key_to_new_key.get(npz_key, npz_key)
+                sample[out_key] = value
+        finally:
+            # opendata가 np.load(...) 결과(NpzFile)를 반환하므로 닫아주는 게 안전
+            if hasattr(data, "close"):
+                try:
+                    data.close()
+                except Exception:
+                    pass
         # a~n validity key 추가
         _add_validity_keys_inplace(sample)
 

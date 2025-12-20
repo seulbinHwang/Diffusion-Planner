@@ -583,71 +583,156 @@ class Encoder(nn.Module):
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
-            torch.Tensor,  # ego_agent_past: (B, 1, time_len, 11)
-            torch.Tensor,  # planner_future_11_dim: (B, future_len, 11)
-            torch.Tensor,  # neighbor_agents_past: (B, A, time_len, 11)
-            torch.Tensor,  # static_objects: (B, P, D_static)
-            torch.Tensor,  # lanes: (B, L, lane_len, D_lane)
-            torch.Tensor,  # lanes_speed_limit: (B, L, 1)
-            torch.Tensor,  # lanes_has_speed_limit: (B, L, 1)
-            torch.Tensor,  # agent_route_lane_order: (B, Pnn, L)
+            Optional[torch.
+                     Tensor],  # ego_agent_past: (B, 1, time_len, 11) or None
+            Optional[
+                torch.
+                Tensor],  # planner_future_11_dim: (B, future_len, 11) or None
+            Optional[
+                torch.
+                Tensor],  # neighbor_agents_past: (B, A, time_len, 11) or None
+            Optional[torch.Tensor],  # static_objects: (B, P, D_static) or None
+            Optional[torch.Tensor],  # lanes: (B, L, lane_len, D_lane) or None
+            Optional[torch.Tensor],  # lanes_speed_limit: (B, L, 1) or None
+            Optional[torch.Tensor],  # lanes_has_speed_limit: (B, L, 1) or None
+            Optional[torch.
+                     Tensor],  # agent_route_lane_order: (B, Pnn, L) or None
+            Optional[torch.Tensor],  # lane_type: (B, L, 4) or None
+            Optional[torch.Tensor],  # left_line_type: (B, L, 13) or None
+            Optional[torch.Tensor],  # right_line_type: (B, L, 13) or None
+            Optional[
+                torch.
+                Tensor],  # stop_sign_points: (B, Ns, safety_len, 2) or None
+            Optional[
+                torch.
+                Tensor],  # crosswalk_points: (B, Nc, safety_len, 2) or None
+            Optional[
+                torch.
+                Tensor],  # speed_bump_points: (B, Nb, safety_len, 2) or None
+            Optional[torch.
+                     Tensor],  # driveway_points: (B, Nd, safety_len, 2) or None
+            Optional[torch.Tensor],  # road_edge: (B, E, safety_len, 2) or None
+            Optional[torch.Tensor],  # road_edge_type: (B, E, 3) or None
             int,  # B
             int,  # future_len
     ]:
-        """입력 dict에서 인코더가 쓸 텐서들을 꺼내고 모양을 맞춘다.
+        """입력 dict에서 인코더가 쓸 텐서들을 꺼내고 모양을 맞춥니다.
 
-        - ego 과거 궤적은 agent 차원을 하나 추가해 (B, 1, T, 11)로 바꾼다.
-        - 속도 입력을 쓰지 않을 때는 ego/neighbor의 vx, vy를 0으로 만든다.
-        - 평가 모드에서 route encoding을 끄도록 설정되어 있으면, route order를 전부 -1로 채운다.
+        요구사항 반영
+        ------------
+        - **모든 값**을 `inputs.get("key", None)` 방식으로 가져옵니다.
+          즉, 키가 없으면 해당 출력은 `None` 이 됩니다.
+
+        추가 동작
+        --------
+        1) ego 과거 궤적이 존재하면 (B, T, 11) → (B, 1, T, 11)로 바꿉니다.
+        2) 속도 입력을 쓰지 않는 설정이면, 존재하는 텐서에 한해 vx, vy 채널([4:6])을 0으로 만듭니다.
+        3) 평가 모드에서 route encoding을 강제로 무시하도록 켜면,
+           존재하는 `agent_route_lane_order`에 한해 전부 -1로 채웁니다.
 
         Args:
-            inputs:
-                - "ego_agent_past":        (B, time_len, 11)
-                - "planner_future_11_dim": (B, future_len, 11)
-                - "neighbor_agents_past":  (B, A, time_len, 11)
-                - "static_objects":        (B, P, D_static)
-                - "lanes":                 (B, L, lane_len, D_lane)
-                - "lanes_speed_limit":     (B, L, 1)
-                - "lanes_has_speed_limit": (B, L, 1)
-                - "agent_route_lane_order":(B, Pnn, L)
+            inputs (Dict[str, torch.Tensor]):
+                키가 없을 수 있으므로, 모든 키는 optional로 취급합니다.
+                예:
+                    - "ego_agent_past":          (B, time_len, 11)
+                    - "planner_future_11_dim":   (B, future_len, 11)
+                    - "neighbor_agents_past":    (B, A, time_len, 11)
+                    - "static_objects":          (B, P, D_static)
+                    - "lanes":                   (B, L, lane_len, D_lane)
+                    - "lanes_speed_limit":       (B, L, 1)
+                    - "lanes_has_speed_limit":   (B, L, 1)
+                    - "agent_route_lane_order":  (B, Pnn, L)
+                    - "lane_type":               (B, L, 4)
+                    - "left_line_type":          (B, L, 13)
+                    - "right_line_type":         (B, L, 13)
+                    - "stop_sign_points":        (B, Ns, safety_len, 2)
+                    - "crosswalk_points":        (B, Nc, safety_len, 2)
+                    - "speed_bump_points":       (B, Nb, safety_len, 2)
+                    - "driveway_points":         (B, Nd, safety_len, 2)
+                    - "road_edge":               (B, E, safety_len, 2)
+                    - "road_edge_type":          (B, E, 3)
 
         Returns:
-            위 설명과 같은 텐서들 + 배치 크기 B, future_len.
+            Tuple[...]:
+                각 키에 해당하는 텐서(없으면 None) + (B, future_len)
+
+                - B:
+                    우선순위로 배치 크기를 추정합니다.
+                    1) neighbor_agents_past.shape[0]
+                    2) ego_agent_past(before unsqueeze).shape[0]
+                    3) planner_future_11_dim.shape[0]
+                    4) 그 외 전부 None이면 0
+                - future_len:
+                    planner_future_11_dim이 있으면 shape[1], 없으면 0
         """
-        # ego 과거 궤적: (B, time_len, 11) → (B, 1, time_len, 11)
-        ego_agent_past: torch.Tensor = inputs["ego_agent_past"]  # (B, T, 11)
-        if not self.config.use_vel_input:
-            # vx, vy 0 세팅
-            ego_agent_past[:, :, 4:6] = 0.0
-        ego_agent_past = ego_agent_past.unsqueeze(1)  # (B, 1, T, 11)
+        # --- 1) 전부 get(...) 로 가져오기 ---
+        ego_agent_past: Optional[torch.Tensor] = inputs.get(
+            "ego_agent_past", None)  # (B, T, 11) or None
+        planner_future_11_dim: Optional[torch.Tensor] = inputs.get(
+            "planner_future_11_dim", None)  # (B, Tf, 11) or None
+        neighbor_agents_past: Optional[torch.Tensor] = inputs.get(
+            "neighbor_agents_past", None)  # (B, A, T, 11) or None
 
-        # ego 미래 궤적: (B, future_len, 11)
-        planner_future_11_dim: torch.Tensor = inputs["planner_future_11_dim"]
-        future_len: int = int(planner_future_11_dim.shape[1])
+        static_objects: Optional[torch.Tensor] = inputs.get(
+            "static_objects", None)  # (B, P, D_static) or None
+        lanes: Optional[torch.Tensor] = inputs.get(
+            "lanes", None)  # (B, L, lane_len, D_lane) or None
+        lanes_speed_limit: Optional[torch.Tensor] = inputs.get(
+            "lanes_speed_limit", None)  # (B, L, 1) or None
+        lanes_has_speed_limit: Optional[torch.Tensor] = inputs.get(
+            "lanes_has_speed_limit", None)  # (B, L, 1) or None
+        agent_route_lane_order: Optional[torch.Tensor] = inputs.get(
+            "agent_route_lane_order", None)  # (B, Pnn, L) or None
 
-        # neighbor 과거 궤적: (B, A, T, 11)
-        neighbor_agents_past: torch.Tensor = inputs["neighbor_agents_past"]
-        if not self.config.use_vel_input:
-            neighbor_agents_past[:, :, :, 4:6] = 0.0  # vx, vy 0 세팅
+        lane_type: Optional[torch.Tensor] = inputs.get(
+            "lane_type", None)  # (B, L, 4) or None
+        left_line_type: Optional[torch.Tensor] = inputs.get(
+            "left_line_type", None)  # (B, L, 13) or None
+        right_line_type: Optional[torch.Tensor] = inputs.get(
+            "right_line_type", None)  # (B, L, 13) or None
 
-        # 정적 / 맵 / route
-        static_objects: torch.Tensor = inputs[
-            "static_objects"]  # (B, P, D_static)
-        lanes: torch.Tensor = inputs["lanes"]  # (B, L, lane_len, D_lane)
-        lanes_speed_limit: torch.Tensor = inputs[
-            "lanes_speed_limit"]  # (B, L, 1)
-        lanes_has_speed_limit: torch.Tensor = inputs[
-            "lanes_has_speed_limit"]  # (B, L, 1)
-        agent_route_lane_order: torch.Tensor = inputs[
-            "agent_route_lane_order"]  # (B, Pnn, L)
+        stop_sign_points: Optional[torch.Tensor] = inputs.get(
+            "stop_sign_points", None)  # (B, Ns, safety_len, 2) or None
+        crosswalk_points: Optional[torch.Tensor] = inputs.get(
+            "crosswalk_points", None)  # (B, Nc, safety_len, 2) or None
+        speed_bump_points: Optional[torch.Tensor] = inputs.get(
+            "speed_bump_points", None)  # (B, Nb, safety_len, 2) or None
+        driveway_points: Optional[torch.Tensor] = inputs.get(
+            "driveway_points", None)  # (B, Nd, safety_len, 2) or None
 
-        B: int = neighbor_agents_past.shape[0]
+        road_edge: Optional[torch.Tensor] = inputs.get(
+            "road_edge", None)  # (B, E, safety_len, 2) or None
+        road_edge_type: Optional[torch.Tensor] = inputs.get(
+            "road_edge_type", None)  # (B, E, 3) or None
 
-        # (옵션) 평가 모드에서 route encoding 강제 무시
+        # --- 2) ego/neighbor 속도 채널 제거 + ego 차원 맞추기 ---
+        if ego_agent_past is not None:
+            if not self.config.use_vel_input:
+                ego_agent_past[:, :, 4:6] = 0.0  # vx, vy
+            ego_agent_past = ego_agent_past.unsqueeze(1)  # (B, 1, T, 11)
+
+        if neighbor_agents_past is not None:
+            if not self.config.use_vel_input:
+                neighbor_agents_past[:, :, :, 4:6] = 0.0  # vx, vy
+
+        # --- 3) B / future_len 계산(없으면 0) ---
+        future_len: int = int(planner_future_11_dim.shape[1]
+                             ) if planner_future_11_dim is not None else 0
+
+        B: int = 0
+        if neighbor_agents_past is not None:
+            B = int(neighbor_agents_past.shape[0])
+        elif ego_agent_past is not None:
+            B = int(ego_agent_past.shape[0])
+        elif planner_future_11_dim is not None:
+            B = int(planner_future_11_dim.shape[0])
+
+        # --- 4) (옵션) 평가 모드에서 route encoding 강제 무시 ---
         self.neglect_route_encoding = False
-        if not self.training and self.neglect_route_encoding:
-            agent_route_lane_order = torch.full_like(agent_route_lane_order,
-                                                     fill_value=-1)
+        if (not self.training) and bool(self.neglect_route_encoding):
+            if agent_route_lane_order is not None:
+                agent_route_lane_order = torch.full_like(agent_route_lane_order,
+                                                         fill_value=-1)
 
         return (
             ego_agent_past,
@@ -658,6 +743,15 @@ class Encoder(nn.Module):
             lanes_speed_limit,
             lanes_has_speed_limit,
             agent_route_lane_order,
+            lane_type,
+            left_line_type,
+            right_line_type,
+            stop_sign_points,
+            crosswalk_points,
+            speed_bump_points,
+            driveway_points,
+            road_edge,
+            road_edge_type,
             B,
             future_len,
         )
@@ -1022,6 +1116,15 @@ class Encoder(nn.Module):
                 lanes_speed_limit,  # (B, L, 1)
                 lanes_has_speed_limit,  # (B, L, 1)
                 agent_route_lane_order,  # (B, Pnn, L)
+                lane_type,  # (B, L, 4) or None
+                left_line_type,  # (B, L, 13) or None
+                right_line_type,  # (B, L, 13) or None
+                stop_sign_points,  # (stop_sign_num, safety_len, 2) or None
+                crosswalk_points,  #  (crosswalk_num, safety_len, 2) or None
+                speed_bump_points,  #  (speed_bump_num, safety_len, 2) or None
+                driveway_points,  # (driveway_num, safety_len, 2) or None
+                road_edge,  # (road_edge_num, safety_len, 2) or None
+                road_edge_type,  # (road_edge_num, safety_len, 3) or None
                 B,
                 future_len,
             ) = self._prepare_encoder_inputs(inputs)
