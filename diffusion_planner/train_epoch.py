@@ -183,11 +183,7 @@ def _clip_input_axes_by_args(
     arl = batch_on_device.get("agent_route_lane_order", None)
     if isinstance(arl, torch.Tensor) and arl.dim() == 3:
         _, c_agent, c_lane = arl.shape
-        predicted_neighbor_num = int(getattr(args, "predicted_neighbor_num", 0))
-
-        keep_agents_for_route = min(
-            predicted_neighbor_num,
-            int(c_agent)) if predicted_neighbor_num > 0 else int(c_agent)
+        keep_agents_for_route = int(c_agent)
 
         lane_dim_input = int(c_lane)
         lanes_now = batch_on_device.get("lanes", None)
@@ -205,32 +201,6 @@ def _clip_input_axes_by_args(
                                     keep_agents_for_route)
 
 
-def _clip_targets_by_predicted_neighbors(
-    outputs: Dict[str, torch.Tensor],
-    args: argparse.Namespace,
-) -> None:
-    """정답 텐서 중 neighbor 축(predicted_neighbor_num)만 자른다.
-
-    현재는 near_future_gt_3_dim 만 처리한다.
-      - near_future_gt_3_dim: (B, A_c, Tf, 3) → A_c ≤ predicted_neighbor_num
-
-    do_not_clip=True 이면 아무 것도 자르지 않는다.
-    """
-    if getattr(args, "do_not_clip", False):
-        return
-
-    if "near_future_gt_3_dim" not in outputs:
-        return
-
-    predicted_neighbor_num = int(getattr(args, "predicted_neighbor_num", 0))
-    near_future_gt_3_dim = outputs["near_future_gt_3_dim"]
-    if near_future_gt_3_dim.dim() != 4 or predicted_neighbor_num <= 0:
-        return
-
-    # near_future_gt_3_dim: (B, A_c, Tf, 3) → (B, A', Tf, 3)
-    keep_agents = min(predicted_neighbor_num, near_future_gt_3_dim.shape[1])
-    outputs["near_future_gt_3_dim"] = \
-        near_future_gt_3_dim[:, :keep_agents, :, :]
 
 
 def _prepare_batch_for_device(
@@ -250,10 +220,10 @@ def _prepare_batch_for_device(
     형태로 패딩이 끝난 상태라고 가정한다.
 
     여기서는 (do_not_clip=False 인 경우에만)
-      - neighbor_agents_past / near_future_gt_3_dim: agent 축 → max_agent_num / predicted_neighbor_num
+      - neighbor_agents_past / near_future_gt_3_dim: agent 축 → max_agent_num
       - lanes / lanes_*                            : lane  축 → max_lane_num
       - route_lanes / route_lanes_*                : lane  축 → max_lane_num
-      - agent_route_lane_order                     : (agent, lane) 축 → (predicted_neighbor_num, max_lane_num)
+      - agent_route_lane_order                     : (agent, lane) 축 → (, max_lane_num)
       - static_objects                              : 그대로 유지
 
     를 수행한다.
@@ -278,8 +248,6 @@ def _prepare_batch_for_device(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
             outputs[key] = value
 
-    if args is not None:
-        _clip_targets_by_predicted_neighbors(outputs, args)
 
     inputs: Dict[str, Any] = batch_on_device
     return inputs, outputs
@@ -484,7 +452,7 @@ def _validate_batch_shapes_for_loss(
     if a_in < a_pred:
         raise ValueError(
             f"neighbor_agents_past agent 수({a_in}) < near_future_gt_3_dim agent 수({a_pred}). "
-            "보통 predicted_neighbor_num/max_agent_num 설정 또는 collate padding 크기 문제입니다."
+            "보통 /max_agent_num 설정 또는 collate padding 크기 문제입니다."
         )
 
 
