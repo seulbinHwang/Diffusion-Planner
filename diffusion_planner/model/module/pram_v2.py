@@ -42,7 +42,7 @@ class PRAMV2StateTokenEncoder(nn.Module):
         self.mid_dim = hidden_dim // 2 if mid_dim is None else mid_dim
         self.input_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
         self.token_mlp = Mlp(
-            in_features=4,
+            in_features=9,
             hidden_features=self.mid_dim,
             out_features=self.hidden_dim,
             act_layer=nn.GELU,
@@ -53,13 +53,13 @@ class PRAMV2StateTokenEncoder(nn.Module):
             nn.init.zeros_(self.token_mlp.fc2.bias)
 
     @staticmethod
-    def _project_unit_circle(x: torch.Tensor,
+    def _project_unit_circle(x: torch.Tensor, # (..., 9)
                              eps: float = 1e-6) -> torch.Tensor:
         """(cos,sin) → 단위원 정규화. x: [...,4] -> [...,4]"""
         cs = x[..., 2:4]
         norm = torch.linalg.norm(cs, dim=-1, keepdim=True).clamp_min(eps)
         cs = cs / norm
-        return torch.cat([x[..., :2], cs], dim=-1)
+        return torch.cat([x[..., :2], cs, x[..., 4:]], dim=-1) # (...,9)
 
     @staticmethod
     def _mask_zero(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -68,11 +68,15 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     def forward(
         self,
-        near_cur_norm: torch.Tensor,  # [B, Pnn, 4]
+        near_cur_norm: torch.Tensor,  # [B, Pnn, 11] # [x,y,cos,sin,vx,vy,w,l,one_hot(3)]
         near_current_mask: torch.Tensor  # [B, Pnn]
     ) -> torch.Tensor:
         """현재 프레임을 얕게 투영해 state_token_in을 생성."""
-        x = self._project_unit_circle(near_cur_norm)  # [...,4]
+        xy_cos_sin = near_cur_norm[..., 0:4]  # (B, Pnn, 4)
+        width_and_length = near_cur_norm[..., 6:8] # (B, Pnn, 2)
+        one_hot_type = near_cur_norm[..., 8:11] # (B, Pnn, 3)
+        near_cur_norm = torch.cat([xy_cos_sin, width_and_length, one_hot_type], dim=-1) # (B, Pnn, 9)
+        x = self._project_unit_circle(near_cur_norm)  # [...,9]
         x = self.input_norm(x)
         state_token_in = self.token_mlp(x)  # [B,Pnn,D]
         state_token_in = self._mask_zero(state_token_in, near_current_mask)

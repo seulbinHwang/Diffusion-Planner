@@ -210,7 +210,7 @@ class Decoder(nn.Module):
     def _run_dit_training_forward(
             self,
             near_agents_past: Optional[
-                torch.Tensor],  # (B, Pnn, past_len, 11) 또는 None
+                torch.Tensor],  # (B, Pnn, time_len(=past_len+1), 11) 또는 None
             xT_input_flat: torch.Tensor,  # (B, Pnn, F)
             diffusion_time: torch.Tensor,  # (B,)
             scene_encoding_token: torch.Tensor,  # (B, token_num, D)
@@ -227,7 +227,7 @@ class Decoder(nn.Module):
         """훈련 모드에서 DiT를 1회 호출하고 raw 출력(flat)을 얻는다.
 
         Args:
-            near_agents_past: (B, Pnn, past_len, 11) 또는 None
+            near_agents_past: (B, Pnn, time_len(=past_len+1), 11) 또는 None
             xT_input_flat: (B, Pnn, F)
             diffusion_time: (B,)
             scene_encoding_token: (B, token_num, D)
@@ -246,8 +246,8 @@ class Decoder(nn.Module):
                 shape: (B, Pnn, F_out)
         """
         score_flat: torch.Tensor = self.dit(
-            near_agents_past,
             xT_input_flat,  # (B, Pnn, F)
+            near_agents_past,
             diffusion_time,  # (B,)
             scene_encoding_token,  # (B, token_num, D)
             ego_fut_global,  # (B, D)
@@ -290,7 +290,7 @@ class Decoder(nn.Module):
         Pnn: int = predicted_neighbor_num
 
         if self.config.use_past_dit_input:
-            # score_flat: (B, Pnn, (time_len + T) * 4)
+            # score_flat: (B, Pnn, (time_len + future_len) * 4)
             score_seq = score_flat.reshape(
                 B,
                 Pnn,
@@ -1218,7 +1218,7 @@ class Decoder(nn.Module):
         self,
         xT: torch.Tensor,  # (B, Pnn, F)
         near_agents_past: Optional[
-            torch.Tensor],  # (B, Pnn, past_len, 11) 또는 None
+            torch.Tensor],  # (B, Pnn, time_len(=past_len+1), 11) 또는 None
         scene_encoding_token: torch.Tensor,  # (B, token_num, D)
         scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
         ego_fut_global: torch.Tensor,  # (B, D)
@@ -1238,7 +1238,7 @@ class Decoder(nn.Module):
         Args:
             xT: 시작 샘플(flat).
                 shape: (B, Pnn, F)
-            near_agents_past: (B, Pnn, past_len, 11) 또는 None
+            near_agents_past: (B, Pnn, time_len(=past_len+1), 11) 또는 None
             scene_encoding_token: (B, token_num, D)
             scene_encoding_token_mask: (B, token_num)
             ego_fut_global: (B, D)
@@ -1456,7 +1456,7 @@ class Decoder(nn.Module):
         # 2) DiT 1회 호출
         diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
         near_agents_past: Optional[torch.Tensor] = inputs[
-            "near_agents_past"]  # (B,Pnn,past_len,11) 또는 None
+            "near_agents_past"]  # (B,Pnn,time_len(=past_len+1),11) 또는 None
 
         score_flat: torch.Tensor = self._run_dit_training_forward(
             near_agents_past=near_agents_past,
@@ -1549,11 +1549,11 @@ class Decoder(nn.Module):
 
         # 4) dpm_sampler 실행
         near_agents_past: Optional[torch.Tensor] = inputs[
-            "near_agents_past"]  # (B,Pnn,past_len,11) 또는 None
+            "near_agents_past"]  # (B,Pnn,time_len(=past_len+1),11) 또는 None
 
         x0: torch.Tensor = self._run_dpm_sampler_for_inference(
             xT=xT,  # (B,Pnn,F)
-            near_agents_past=near_agents_past,  # (B,Pnn,past_len,11) or None
+            near_agents_past=near_agents_past,  # (B,Pnn,time_len(=past_len+1),11) or None
             scene_encoding_token=scene_encoding_token,
             scene_encoding_token_mask=scene_encoding_token_mask,
             ego_fut_global=ego_fut_global,
@@ -2044,7 +2044,7 @@ class DiT(nn.Module):
             near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
             cross_mask: torch.Tensor,  # (B, token_num)
             route_known_mask: torch.Tensor,  # (B, Pnn)
-            near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+            near_current: torch.Tensor,  # (B, Pnn, 11)
             near_current_mask: torch.Tensor,  # (B, Pnn)
     ) -> torch.Tensor:
         """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행한다.
@@ -2075,9 +2075,9 @@ class DiT(nn.Module):
             route_known_mask (torch.Tensor):
                 경로 유효 여부(True=known).
                 shape: (B, Pnn)
-            near_current_xyyaw (torch.Tensor):
+            near_current (torch.Tensor):
                 현재 프레임 (x, y, cos, sin).
-                shape: (B, Pnn, 4)
+                shape: (B, Pnn, 11)
             near_current_mask (torch.Tensor):
                 현재 프레임 기준 무효 에이전트 마스크(True=패딩).
                 shape: (B, Pnn)
@@ -2107,7 +2107,7 @@ class DiT(nn.Module):
         # 3) state_token_in 준비 (현재 프레임 기반)
         # state_token_in: (B, Pnn, H)
         state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
-            near_cur_norm=near_current_xyyaw.to(x.dtype),  # (B, Pnn, 4)
+            near_cur_norm=near_current.to(x.dtype),  # (B, Pnn, 11)
             near_current_mask=near_current_mask,  # (B, Pnn)
         )
 
@@ -2286,7 +2286,7 @@ class DiT(nn.Module):
             self,
             near_future_norm_xT: torch.
         Tensor,  # (B, Pnn, T*4) or (B, Pnn, (1+T)*4)
-            near_agents_past: Optional[torch.Tensor],  # (B, Pnn, past_len, 11)
+            near_agents_past: torch.Tensor,  # (B, Pnn, time_len(=past_len+1), 11)
             diffusion_time: torch.Tensor,  # (B,)
             cross_c: torch.Tensor,  # (B, token_num, D)
             ego_fut_global: torch.Tensor,  # (B, D)
@@ -2359,14 +2359,14 @@ class DiT(nn.Module):
                 near_past_cur_future_valid=near_past_cur_future_valid
             )
         B, Pnn, _ = near_future_norm_xT.shape  # (B, Pnn, F)
-
-        near_agents_past_xyyaw = near_agents_past[:, :, :, :4] \
-            if near_agents_past is not None else None
+        # time_len(=past_len+1)
+        near_agents_past_xyyaw = near_agents_past[:, :, :, :4]
+        near_current = near_agents_past[:, :, -1, :]  # (B, Pnn, 11)
         device_type: str = near_future_norm_xT.device.type
         if self.config.use_past_dit_input:
             if self.config.use_current_input:
-                near_agents_past_xyyaw = near_agents_past_xyyaw[:, :, :
-                                                                -1, :]  # 현재 제외
+                # near_agents_past_xyyaw: (B, Pnn, past_len, 4)
+                near_agents_past_xyyaw = near_agents_past_xyyaw[:, :, :-1, :]
             # 과거+현재+미래 입력 병합
             near_past_cur_future_norm_xT = torch.cat(
                 [
@@ -2395,7 +2395,7 @@ class DiT(nn.Module):
                 near_agents_route_lane_emb=near_agents_route_lane_emb,
                 cross_mask=cross_mask,
                 route_known_mask=route_known_mask,
-                near_current_xyyaw=near_current_xyyaw,
+                near_current=near_current,
                 near_current_mask=near_current_mask,
             )
 

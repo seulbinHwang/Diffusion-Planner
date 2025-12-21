@@ -43,13 +43,13 @@ def add_near_agents_info_inplace(
     입력에서 기대하는 대표 shape (샘플 1개 기준)
     ----------------------------------------
     - 배치가 없는 형태(학습 데이터 샘플 dict에서 흔함)
-      - neighbor_agents_past: (A, T_past, F)
+      - neighbor_agents_past: (A, time_len, F)
       - neighbor_future_gt_3_dim: (A, T_fut, 3)
       - agent_route_lane_order: (A, L)
       - agent_route_lane_order_is_valid: (A,)
 
     - 배치가 포함된 형태(추론/시뮬레이션에서 B=1로 들어오는 경우를 대비)
-      - neighbor_agents_past: (B, A, T_past, F)
+      - neighbor_agents_past: (B, A, time_len, F)
       - neighbor_future_gt_3_dim: (B, A, T_fut, 3)
       - agent_route_lane_order: (B, A, L)
       - agent_route_lane_order_is_valid: (B, A)
@@ -116,8 +116,8 @@ def _add_near_agents_info_for_one_sample_inplace(
     )
 
     # neighbor_agents_past:
-    # - 배치 없음: (A, T_past, F)
-    # - 배치 있음: (B, A, T_past, F)
+    # - 배치 없음: (A, time_len, F)
+    # - 배치 있음: (B, A, time_len, F)
     sample["near_agents_past"] = _slice_along_dim(
         value=neighbor_agents_past,
         dim=agent_dim,
@@ -181,10 +181,10 @@ def _infer_agent_dim_index_from_neighbor_agents_past(
 
     지원하는 입력 shape
     --------------
-    - 배치 없는 경우: (A, T_past, F)
+    - 배치 없는 경우: (A, time_len, F)
       -> agent 개수 A는 0번째 방향에 있음 (반환값 0)
 
-    - 배치 있는 경우: (B, A, T_past, F)
+    - 배치 있는 경우: (B, A, time_len, F)
       -> agent 개수 A는 1번째 방향에 있음 (반환값 1)
 
     Args:
