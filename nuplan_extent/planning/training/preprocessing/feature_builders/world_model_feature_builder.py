@@ -204,6 +204,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         history_buffer: SimulationHistoryBuffer = current_input.history
         traffic_light_data = list(current_input.traffic_light_data)
 
+
         model_inputs: Dict[
             str, torch.Tensor] = self.data_processor.observation_adapter(
                 current_input.iteration.index,
@@ -231,8 +232,7 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
                                                            device,
                                                            squeeze=True)
 
-        # (핵심) validity key 추가: simulation 경로는 None을 섞으면 위험하니 skip 사용
-        add_validity_keys_inplace(model_inputs, missing_policy="skip")
+        add_validity_keys_inplace(model_inputs, missing_policy="none")
 
         # unnormalized_features 저장 (torch -> numpy)
         self.unnormalized_features = {}

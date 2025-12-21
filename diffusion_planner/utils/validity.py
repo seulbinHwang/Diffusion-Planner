@@ -263,8 +263,8 @@ def build_validity_key_dict(
         )
 
     # ---------- e: neighbor_future_gt_is_valid ----------
-    neighbor_future_3 = _get_first_non_none_value(
-        sample, ["near_future_gt_3_dim", "neighbor_future_gt_3_dim"])
+    neighbor_future_3 = _get_first_non_none_value(sample,
+                                                  ["neighbor_future_gt_3_dim"])
     if neighbor_future_3 is None or (not _is_array_like(neighbor_future_3)):
         _set_or_skip(out, "neighbor_future_gt_is_valid", None)
     else:

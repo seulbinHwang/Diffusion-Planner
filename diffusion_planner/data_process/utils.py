@@ -2082,7 +2082,6 @@ def vector_set_coordinates_to_local_frame(
 # =====================
 from typing import Any, Dict, Mapping, Union
 import numpy as np
-import torch
 from typing import Any, Dict, Mapping, Optional, Sequence
 import torch
 

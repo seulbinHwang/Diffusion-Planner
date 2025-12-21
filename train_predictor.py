@@ -830,6 +830,59 @@ def build_adamw_with_param_groups(
     return optim_obj, extra_nwd
 
 
+def _infer_max_sizes_for_agent_route_lane_order(
+    self,
+    batch: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    """agent_route_lane_order를 패딩하기 위한 (최대 agent 수, 최대 lane 수)를 계산합니다.
+
+    왜 이 함수가 필요한가
+    --------------------
+    agent_route_lane_order는 (행=agent, 열=lane) 관계를 담고 있습니다.
+    현재 로직에서는 agent_route_lane_order의 "행"이
+    neighbor 전체가 아니라 near agent 기준으로 잘려서 들어올 수 있습니다.
+
+    그래서 이 key를 배치로 패딩할 때,
+    agent 축 최대값(max_agent_num)은 neighbor_agents_past 같은 다른 텐서가 아니라
+    **agent_route_lane_order 자체의 행 개수**만 보고 정하는 것이 안전합니다.
+    (그래야 agent_route_lane_order_is_valid 같은 agent 축 마스크와도 길이가 맞습니다.)
+
+    lane 축(max_lane_num)은 lanes.shape[0]와 agent_route_lane_order.shape[1] 중
+    더 큰 값을 사용해, lane 텐서 패딩과도 잘 맞도록 합니다.
+
+    Args:
+        batch (List[Dict[str, Any]]):
+            - 길이 B의 샘플 dict 리스트.
+
+    Returns:
+        Tuple[int, int]:
+            - max_agent_num: shape (), int
+                agent_route_lane_order의 행 수(=agent 수) 최대값.
+            - max_lane_num: shape (), int
+                lanes의 lane 개수 또는 agent_route_lane_order의 열 수 최대값.
+    """
+    max_agent_num: int = 0
+    max_lane_num: int = 0
+
+    for sample in batch:
+        aro = sample.get("agent_route_lane_order", None)
+        if aro is not None:
+            aro_arr = np.asarray(aro)
+            # aro_arr: (A_i, L_i)
+            if aro_arr.ndim == 2:
+                max_agent_num = max(max_agent_num, int(aro_arr.shape[0]))
+                max_lane_num = max(max_lane_num, int(aro_arr.shape[1]))
+
+        lanes = sample.get("lanes", None)
+        if lanes is not None:
+            lanes_arr = np.asarray(lanes)
+            # lanes_arr: (L_i, lane_len, feat) 또는 최소 (L_i, ...)
+            if lanes_arr.ndim >= 1:
+                max_lane_num = max(max_lane_num, int(lanes_arr.shape[0]))
+
+    return int(max_agent_num), int(max_lane_num)
+
+
 class DiffusionPlannerCollate:
     """DiffusionPlannerData 샘플들을 배치 텐서로 묶는 collate_fn.
 
@@ -855,14 +908,15 @@ class DiffusionPlannerCollate:
         # 중심 기준 크로핑 옵션
         # - center_crop_radius_m <= 0: 크로핑 사용 안 함
         # - center_crop_mode: "npc" → 임의 NPC 1대를 기준, "ego" → ego 기준
+        self.args = args
         self.center_crop_radius_m: float = float(
             getattr(args, "center_crop_radius_m", 0.0))
         self.center_crop_mode: str = str(
             getattr(args, "center_crop_mode", "none")).lower()
 
     def _get_special_padding_category_spec(
-            self,
-            key: str,
+        self,
+        key: str,
     ) -> Optional[Tuple[int, int]]:
         """특정 key에 대해, '패딩을 어떤 카테고리로 채울지' 규칙을 돌려줍니다.
 
@@ -897,8 +951,8 @@ class DiffusionPlannerCollate:
         return None
 
     def _infer_max_lane_num_from_batch(
-            self,
-            batch: List[Dict[str, Any]],
+        self,
+        batch: List[Dict[str, Any]],
     ) -> int:
         """배치에서 'lane 개수의 최대값'을 안전하게 구합니다.
 
@@ -931,10 +985,10 @@ class DiffusionPlannerCollate:
         return int(max_lane_num)
 
     def _build_default_padded_tensor_for_key(
-            self,
-            key: str,
-            out_shape: Tuple[int, ...],
-            dtype: torch.dtype,
+        self,
+        key: str,
+        out_shape: Tuple[int, ...],
+        dtype: torch.dtype,
     ) -> torch.Tensor:
         """key 성격에 맞는 '기본 패딩 텐서'를 만듭니다.
 
@@ -1524,8 +1578,8 @@ class DiffusionPlannerCollate:
                 keep_agent_idx = np.nonzero(keep_agent_mask[b_idx])[0]
                 sample["neighbor_agents_past"] = sample["neighbor_agents_past"][
                     keep_agent_idx]
-                sample["near_future_gt_3_dim"] = sample["near_future_gt_3_dim"][
-                    keep_agent_idx]
+                sample["neighbor_future_gt_3_dim"] = sample[
+                    "neighbor_future_gt_3_dim"][keep_agent_idx]
 
             # 2) lane 관련 (superset)
             if int(lane_len_arr[b_idx]) > 0:
@@ -1919,25 +1973,17 @@ class DiffusionPlannerCollate:
     ) -> torch.Tensor:
         """agent_route_lane_order를 (B, A_max, L_max) 텐서로 만들고 -1로 패딩합니다.
 
-        이 key는 (agent, lane) 2차원 관계를 담고 있어서,
-        다른 key들과 달리 "없는 값"을 0이 아니라 **-1**로 채워야 합니다.
+        핵심 규칙(중요)
+        -------------
+        - A_max(최대 agent 수)는 **agent_route_lane_order의 행 개수만** 보고 결정합니다.
 
-        처리 규칙
-        --------
-        1) 각 샘플에서 아래 값들을 보고 배치 최대 크기를 정합니다.
-           - agent 수(A_i):
-               * neighbor_agents_past.shape[0] (있으면)
-               * 또는 agent_route_lane_order.shape[0] (있으면)
-           - lane 수(L_i):
-               * lanes.shape[0] (있으면)
-               * 또는 agent_route_lane_order.shape[1] (있으면)
-        2) 출력 텐서 shape:
-           - (B, A_max, L_max)
-        3) 패딩 값:
-           - 전부 -1
-           - 샘플 값이 None이면 그 샘플 전체가 -1로 유지됩니다.
-        4) dtype:
-           - torch.int64 (인덱스/순서 용도로 안전하게 고정)
+        - L_max(최대 lane 수)는
+          lanes.shape[0] 와 agent_route_lane_order.shape[1] 중 더 큰 값을 사용합니다.
+          (lane 텐서 패딩과 같이 쓰기 쉬운 형태를 유지)
+
+        패딩 값
+        -------
+        - 없는 값은 전부 -1로 채웁니다. (연결/매칭 없음 의미)
 
         Args:
             batch (List[Dict[str, Any]]):
@@ -1945,62 +1991,28 @@ class DiffusionPlannerCollate:
 
         Returns:
             torch.Tensor:
-                - shape: (B, A_max, L_max)
+                - out: shape (B, A_max, L_max)
                 - dtype: torch.int64
                 - padding: -1
         """
         batch_size: int = int(len(batch))
 
-        # 배치 최대 agent/lane 개수 계산
-        max_agent_num: int = 0
-        max_lane_num: int = 0
+        max_agent_num, max_lane_num = self._infer_max_sizes_for_agent_route_lane_order(
+            batch)
 
-        for sample in batch:
-            # agent 수 후보
-            agent_num_candidate: int = 0
-            neighbor_past = sample.get("neighbor_agents_past", None)
-            if neighbor_past is not None:
-                neighbor_past_arr = np.asarray(neighbor_past)
-                if neighbor_past_arr.ndim >= 1:
-                    agent_num_candidate = max(agent_num_candidate,
-                                              int(neighbor_past_arr.shape[0]))
-
-            # lane 수 후보
-            lane_num_candidate: int = 0
-            lanes = sample.get("lanes", None)
-            if lanes is not None:
-                lanes_arr = np.asarray(lanes)
-                if lanes_arr.ndim >= 1:
-                    lane_num_candidate = max(lane_num_candidate,
-                                             int(lanes_arr.shape[0]))
-
-            # aro 자체 shape도 참고 (neighbor/lanes가 None일 수도 있으므로)
-            aro = sample.get("agent_route_lane_order", None)
-            if aro is not None:
-                aro_arr = np.asarray(aro)
-                if aro_arr.ndim == 2:
-                    agent_num_candidate = max(agent_num_candidate,
-                                              int(aro_arr.shape[0]))
-                    lane_num_candidate = max(lane_num_candidate,
-                                             int(aro_arr.shape[1]))
-
-            max_agent_num = max(max_agent_num, agent_num_candidate)
-            max_lane_num = max(max_lane_num, lane_num_candidate)
-
-        # (B, A_max, L_max) 를 -1로 초기화
         out = torch.full(
             (batch_size, max_agent_num, max_lane_num),
             fill_value=-1,
             dtype=torch.int64,
         )
 
-        # 값 복사 (있는 샘플만 앞쪽부터 채움)
         for b_idx, sample in enumerate(batch):
             aro = sample.get("agent_route_lane_order", None)
             if aro is None:
                 continue
 
             aro_arr = np.asarray(aro)
+            # aro_arr: (A_i, L_i)
             if aro_arr.ndim != 2:
                 continue
 
@@ -2018,10 +2030,10 @@ class DiffusionPlannerCollate:
         return out
 
     def _pad_and_stack_variable_key_for_named_key(
-            self,
-            key: str,
-            values: List[Any],
-            batch: List[Dict[str, Any]],
+        self,
+        key: str,
+        values: List[Any],
+        batch: List[Dict[str, Any]],
     ) -> Optional[torch.Tensor]:
         """(가변 길이 key) 배치 내 최대 shape 기준으로 padding 후 쌓습니다. validity면 bool로 강제합니다.
 
@@ -2063,8 +2075,8 @@ class DiffusionPlannerCollate:
         ref_value = values[non_none_idx[0]]
         assert ref_value is not None
 
-        out_dtype: torch.dtype = self._choose_output_dtype_for_key(key,
-                                                                   ref_value)
+        out_dtype: torch.dtype = self._choose_output_dtype_for_key(
+            key, ref_value)
         ref_shape: Tuple[int, ...] = self._get_value_shape(ref_value)
         ndim: int = int(len(ref_shape))
 
@@ -2079,8 +2091,7 @@ class DiffusionPlannerCollate:
             if len(shape_i) != ndim:
                 raise ValueError(
                     f"[Collate] 같은 key인데 ndim이 샘플마다 다릅니다. key={key}, "
-                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}"
-                )
+                    f"ref_ndim={ndim}, got_ndim={len(shape_i)}")
 
             if shape_i != ref_shape:
                 all_same_shape = False
@@ -2099,16 +2110,17 @@ class DiffusionPlannerCollate:
 
         # 빠른 경로: 패딩이 전혀 필요 없으면 stack
         # (special_spec가 있어도 max_shape가 ref_shape와 같으면 패딩 영역이 없으므로 stack 가능)
-        if all_same_shape and (len(non_none_idx) == batch_size) and (
-                tuple(max_shape) == tuple(ref_shape)):
+        if all_same_shape and (len(non_none_idx)
+                               == batch_size) and (tuple(max_shape)
+                                                   == tuple(ref_shape)):
             return torch.stack(
                 [torch.as_tensor(v, dtype=out_dtype) for v in values],
                 dim=0,
             )
 
         # out: shape (B, *max_shape)
-        out_shape: Tuple[int, ...] = (batch_size,
-                                      *tuple(int(x) for x in max_shape))
+        out_shape: Tuple[int,
+                         ...] = (batch_size, *tuple(int(x) for x in max_shape))
         out: torch.Tensor = self._build_default_padded_tensor_for_key(
             key=key,
             out_shape=out_shape,
@@ -2146,7 +2158,7 @@ class DiffusionPlannerCollate:
         이 로직이 자연스럽게 커버하는 예시 shape
         ----------------------------------------
         - neighbor_agents_past:        (A_i, T_past, 11)  -> (B, A_max, T_past, 11)
-        - near_future_gt_3_dim:        (A_i, T_fut, 3)    -> (B, A_max, T_fut, 3)
+        - neighbor_future_gt_3_dim:        (A_i, T_fut, 3)    -> (B, A_max, T_fut, 3)
         - lanes:                       (L_i, P_lane, 12) -> (B, L_max, P_max, 12)
         - lanes_len_is_valid:          (L_i, P_lane)      -> (B, L_max, P_max)
         - agent_route_lane_order:      (A_i, L_i)         -> (B, A_max, L_max)
@@ -2763,7 +2775,7 @@ class DiffusionPlannerCollate:
         - 기준: neighbor_agents_past (현재 위치: neighbor_agents_past[:, -1, 0:2])
         - 같이 자름:
             neighbor_agents_past
-            near_future_gt_3_dim
+            neighbor_future_gt_3_dim
             neighbor_agents_past_is_valid
             neighbor_agents_is_valid
             neighbor_future_gt_is_valid
@@ -2811,7 +2823,7 @@ class DiffusionPlannerCollate:
             sample,
             keys=[
                 "neighbor_agents_past",
-                "near_future_gt_3_dim",
+                "neighbor_future_gt_3_dim",
                 "neighbor_agents_past_is_valid",
                 "neighbor_agents_is_valid",
                 "neighbor_future_gt_is_valid",
@@ -3182,8 +3194,115 @@ class DiffusionPlannerCollate:
 
         if self._should_center_crop():
             self._center_crop_batch_batched(batch)
-
+        self._set_near_agents_info(batch, self.args.predicted_neighbor_num)
         return self._build_collated_batch_tensors(batch)
+
+    def _set_near_agents_info(
+        self,
+        batch: List[Dict[str, Any]],
+        predicted_neighbor_num: int,
+    ) -> None:
+        """각 샘플의 neighbor_agents 중 앞쪽부터 predicted_neighbor_num개를 near로 나눕니다.
+
+        동작 요약
+        --------
+        - neighbor_agents_past의 앞쪽부터 near로 선택합니다.
+        - 선택된 near에 맞춰 아래 값들도 같은 규칙으로 앞쪽을 잘라 near_*를 만듭니다.
+        - 또한 agent_route_lane_order는 (행=agent) 기준으로 near 개수만 남기도록 덮어씁니다.
+          (열=lane 축은 유지)
+
+        입력/출력에서 중요한 shape
+        ------------------------
+        입력(예시):
+          - neighbor_agents_past: shape (A, T_past, 11)
+          - neighbor_future_gt_3_dim: shape (A, T_fut, 3)
+          - agent_route_lane_order: shape (A, L)
+          - agent_route_lane_order_is_valid: shape (A,)
+
+        출력(near_num = min(predicted_neighbor_num, A, 그리고 관련 배열 길이들의 최소값)):
+          - near_agents_past: shape (near_num, T_past, 11)
+          - non_near_agents_past: shape (A - near_num, T_past, 11)
+          - near_future_gt_3_dim: shape (near_num, T_fut, 3)  (입력이 있을 때만 생성)
+          - agent_route_lane_order: shape (near_num, L)       (입력이 있을 때만 덮어씀)
+          - agent_route_lane_order_is_valid: shape (near_num,) (입력이 있을 때만 덮어씀)
+
+        Args:
+            batch (List[Dict[str, Any]]):
+                - 길이 B의 샘플 dict 리스트.
+            predicted_neighbor_num (int):
+                - near로 뽑을 최대 agent 수.
+
+        Returns:
+            None
+        """
+        requested_near_num: int = max(0, int(predicted_neighbor_num))
+
+        for sample in batch:
+            neighbor_agents_past = sample.get("neighbor_agents_past", None)
+            if neighbor_agents_past is None:
+                continue
+
+            neighbor_agents_past_arr = np.asarray(neighbor_agents_past)
+            # neighbor_agents_past_arr: (A, T_past, 11)
+            if neighbor_agents_past_arr.ndim != 3:
+                continue
+
+            a: int = int(neighbor_agents_past_arr.shape[0])
+            near_num: int = min(requested_near_num, a)
+
+            # --- (안정성) 같이 자를 값들의 첫 번째 축 길이도 고려해서 near_num을 한 번 더 맞춥니다 ---
+            neighbor_future_gt_3_dim = sample.get("neighbor_future_gt_3_dim",
+                                                  None)
+            if neighbor_future_gt_3_dim is not None:
+                arr = np.asarray(neighbor_future_gt_3_dim)
+                # arr: (A2, T_fut, 3) 기대
+                if arr.ndim >= 1:
+                    near_num = min(near_num, int(arr.shape[0]))
+
+            agent_route_lane_order = sample.get("agent_route_lane_order", None)
+            if agent_route_lane_order is not None:
+                arr = np.asarray(agent_route_lane_order)
+                # arr: (A4, L) 기대
+                if arr.ndim >= 1:
+                    near_num = min(near_num, int(arr.shape[0]))
+
+            agent_route_lane_order_is_valid = sample.get(
+                "agent_route_lane_order_is_valid", None)
+            if agent_route_lane_order_is_valid is not None:
+                arr = np.asarray(agent_route_lane_order_is_valid)
+                # arr: (A5,) 기대
+                if arr.ndim >= 1:
+                    near_num = min(near_num, int(arr.shape[0]))
+
+            # --- near / non-near 생성 ---
+            sample[
+                "near_agents_past"] = neighbor_agents_past_arr[:near_num, :, :]
+            sample["non_near_agents_past"] = neighbor_agents_past_arr[
+                near_num:, :, :]
+
+            if neighbor_future_gt_3_dim is not None:
+                neighbor_future_gt_3_dim_arr = np.asarray(
+                    neighbor_future_gt_3_dim)
+                # (A2, T_fut, 3) -> (near_num, T_fut, 3)
+                if neighbor_future_gt_3_dim_arr.ndim == 3:
+                    sample["near_future_gt_3_dim"] = \
+                    neighbor_future_gt_3_dim_arr[:near_num, :, :]
+
+            if agent_route_lane_order is not None:
+                agent_route_lane_order_arr = np.asarray(agent_route_lane_order)
+                # (A4, L) -> (near_num, L)
+                if agent_route_lane_order_arr.ndim == 2:
+                    sample["agent_route_lane_order"] = \
+                    agent_route_lane_order_arr[:near_num, :]
+
+            if agent_route_lane_order_is_valid is not None:
+                agent_route_lane_order_is_valid_arr = np.asarray(
+                    agent_route_lane_order_is_valid)
+                # (A5,) -> (near_num,)
+                if agent_route_lane_order_is_valid_arr.ndim == 1:
+                    sample[
+                        "agent_route_lane_order_is_valid"] = agent_route_lane_order_is_valid_arr[:
+                                                                                                 near_num]
 
 
 def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
@@ -5123,7 +5242,7 @@ def _train_one_epoch(
     #   neighbor_agents_past: (B, A, T_past, 11)
     #   lanes: (B, L, lane_len, 12)
     #   static_objects: (B, S, 10)
-    #   near_future_gt_3_dim: (B, A, T_future, 3)
+    #   neighbor_future_gt_3_dim: (B, A, T_future, 3)
     # 와 같은 shape로 사용된다.
     if args.ddp and ddp.get_rank() == 0:
         print(f"Epoch {epoch + 1}/{train_epochs}")

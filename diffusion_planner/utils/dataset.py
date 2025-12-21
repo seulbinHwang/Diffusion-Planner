@@ -174,8 +174,8 @@ class DiffusionPlannerData(Dataset):
             "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd
             "neighbor_agents_past",  # (chosen_agent_num, time_len, 11) # nuplan  # womd
             "neighbor_future_gt_3_dim",  # (chosen_agent_num, future_len, 3) # nuplan # womd
-            "stop_sign_points",  # (stop_sign_num, safety_len, 2) # nuplan  # womd # TODO
-            "crosswalk_points",  # (crosswalk_num, safety_len, 2) # nuplan  # womd # TODO
+            "stop_sign_points",  # (stop_sign_num, safety_len, 2) # nuplan  # womd
+            "crosswalk_points",  # (crosswalk_num, safety_len, 2) # nuplan  # womd
             "lanes",  # (chosen_lane_num, lane_len, 12) # nuplan # womd
             "lanes_speed_limit",  # (chosen_lane_num, 1) # nuplan # womd
             "lanes_has_speed_limit",  # (chosen_lane_num, 1) # nuplan # womd
@@ -190,20 +190,19 @@ class DiffusionPlannerData(Dataset):
         ]
 
         womd_only_keys: List[str] = [
-            "speed_bump_points",  # (speed_bump_num, safety_len, 2) # womd  # TODO
-            "driveway_points",  # (driveway_num, safety_len, 2) # womd (환경에 따라 driveway라는 이름일 수도 있음) # TODO
-            "lane_type",  # (chosen_lane_num, 4) # womd # TODO
-            "left_line_type",  # (chosen_lane_num, 13) # womd # TODO
-            "right_line_type",  # (chosen_lane_num, 13) # womd # TODO
-            "road_edge",  # (chosen_edge_num, safety_len, 2) # womd # TODO
-            "road_edge_type",  # (chosen_edge_num, 3) # womd # TODO
+            "speed_bump_points",  # (speed_bump_num, safety_len, 2) # womd
+            "driveway_points",  # (driveway_num, safety_len, 2) # womd (환경에 따라 driveway라는 이름일 수도 있음)
+            "lane_type",  # (chosen_lane_num, 4) # womd
+            "left_line_type",  # (chosen_lane_num, 13) # womd
+            "right_line_type",  # (chosen_lane_num, 13) # womd
+            "road_edge",  # (chosen_edge_num, safety_len, 2) # womd
+            "road_edge_type",  # (chosen_edge_num, 3) # womd
         ]
 
         npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys
 
         npz_key_to_new_key: Dict[str, str] = {
             "ego_future_gt_11_dim": "planner_future_11_dim",
-            "neighbor_future_gt_3_dim": "near_future_gt_3_dim",
         }
 
         sample: Dict[str, Any] = {}
