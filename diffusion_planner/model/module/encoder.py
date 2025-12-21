@@ -1452,21 +1452,28 @@ class Encoder(nn.Module):
             return encoder_outputs
 
     def _get_near_agents_route_lane_emb(
-        self,
-        encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
-        lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
-        agent_route_lane_order: torch.
-        Tensor,  # (B, Pnn, lane_num)  -1=not in route
+            self,
+            encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
+            lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
+            agent_route_lane_order: torch.Tensor,
+            # (B, Pnn, lane_num)  -1=not in route
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # agent_route_lane_order: (B, Pnn, lane_num)
-        # -1: route가 아님 # agent당 유효한 route의 최대 수는 최대 max_lane_num 개임. (즉, max_lane_num 이하임) # max_lane_num <= lane_num 항상
+        # -1: route가 아님
+
+        route_num: int = int(self.config.route_num)
 
         (near_route_lanes,
          near_route_lanes_mask) = self.build_route_lane_tensors_from_order(
-             encoding_lanes, lanes_mask, agent_route_lane_order)
+            encoding_lanes=encoding_lanes,  # (B, lane_num, H)
+            lanes_mask=lanes_mask,  # (B, lane_num)
+            agent_route_lane_order=agent_route_lane_order,  # (B, Pnn, lane_num)
+            route_num=route_num,  # ★ 핵심: route_num개만 뽑기
+        )
         """
-            near_route_lanes:       (B, Pnn, max_lane_num, H)
-            near_route_lanes_mask:  (B, Pnn, max_lane_num)  # True=pad(무효)
+            near_route_lanes:       (B, Pnn, route_num, H)
+            near_route_lanes_mask:  (B, Pnn, route_num)  # True=pad(무효)
+
         Returns:
             near_agents_route_lane_emb: (B, Pnn, H)
             route_known_mask : (B, Pnn) True=해당 에이전트가 유효 route
@@ -1476,15 +1483,17 @@ class Encoder(nn.Module):
             # route_keep_mask[b] = True면 주어진 order를 사용, False면 "경로 없음"
             route_keep_mask: torch.Tensor = (torch.rand(
                 (B,), device=encoding_lanes.device) >= float(
-                    self.route_order_drop_prob))  # (B,) bool
+                self.route_order_drop_prob))  # (B,) bool
 
             # 샘플 단위 드롭을 실제 텐서에 반영 (전부 패딩 처리)
             (near_route_lanes,
              near_route_lanes_mask) = self._mask_all_routes_like(
-                 near_route_lanes, near_route_lanes_mask, route_keep_mask)
+                near_route_lanes, near_route_lanes_mask, route_keep_mask)
+
         # (B, Pnn, hidden_dim)
         near_agents_route_lane_emb = self.npc_route_encoder(
             near_route_lanes, near_route_lanes_mask)
+
         # (B, Pnn) True=해당 에이전트가 유효 route를 가짐
         route_known_mask = (~near_route_lanes_mask).any(
             dim=-1)  # (B, Pnn) True=known
@@ -1492,107 +1501,190 @@ class Encoder(nn.Module):
 
     @staticmethod
     def build_route_lane_tensors_from_order(
-        encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
-        lanes_mask: torch.Tensor,  # (B, lane_num)  # True=pad
-        agent_route_lane_order: torch.
-        Tensor,  # (B, Pnn, lane_num)  # -1=not in route, 0..=rank
+            encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
+            lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
+            agent_route_lane_order: torch.Tensor,
+            # (B, Pnn, lane_num)  -1=not in route, 0..=rank
+            route_num: int,  # 뽑을 route lane 개수 (고정 출력 길이)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """에이전트별 route 순서(agent_route_lane_order)에 따라 lane 전체를 정렬한다.
+        """에이전트별 route 순서(agent_route_lane_order)에서 앞쪽 route lane만 route_num개 뽑습니다.
 
-        핵심 동작:
-          - route_num 값은 무시하고, lane_num 개 전부를 “순위가 낮은 것부터” 정렬한다.
-          - route에 없는 lane(-1) 이나 pad 된 lane(True)는 맨 뒤로 밀고, 마스크(True)로 표시한다.
+        목적
+        ----
+        기존 구현은 lane_num 전체를 정렬/가져온 뒤에 뒤쪽을 마스크로 버렸습니다.
+        이 함수는 그 낭비를 없애고, **처음부터 route_num개만 선택**해서
+        출력 텐서 크기를 (B, Pnn, route_num, H)로 고정합니다.
+
+        동작 방식(쉽게 설명)
+        -------------------
+        1) 각 lane마다 "route 상의 순서 값"이 있습니다.
+           - 값이 작을수록 더 앞쪽(더 중요한) lane 입니다.
+           - route에 없는 lane은 -1 입니다.
+           - lane 자체가 pad(True)인 lane도 무효입니다.
+
+        2) route에 없거나(-1) pad인 곳은 아주 큰 값(BIG)으로 바꿔서,
+           "앞쪽을 고르는 과정"에서 자동으로 뒤로 밀리게 만듭니다.
+
+        3) 그 다음, 전체 정렬을 하지 않고
+           **가장 작은 값(=가장 앞쪽) route_num개만** 뽑습니다.
+
+        4) 뽑힌 lane 인덱스에 대해서만 gather를 수행해
+           near_route_lanes를 (B, Pnn, route_num, H)로 만듭니다.
+
+        5) 유효하지 않은 위치(=BIG로 뽑힌 것, 또는 pad lane)는 mask=True로 만들고,
+           해당 위치의 값은 0으로 고정합니다.
 
         Args:
-            encoding_lanes:
+            encoding_lanes (torch.Tensor):
                 차선 임베딩.
                 shape: (B, lane_num, hidden_dim)
-            lanes_mask:
+
+            lanes_mask (torch.Tensor):
                 차선 패딩 마스크(True=패딩).
                 shape: (B, lane_num)
-            agent_route_lane_order:
+
+            agent_route_lane_order (torch.Tensor):
                 에이전트별 lane 순위 정보.
                 shape: (B, Pnn, lane_num)
-                - 값 >=0 : route 위에 있는 lane, 숫자가 작을수록 “더 앞쪽/가까운” lane
-                - 값  <0 : route 에 없음(후순위로 밀림)
+                - 값 >= 0 : route 위에 있는 lane, 숫자가 작을수록 더 앞쪽 lane
+                - 값  < 0 : route 에 없음
+
+            route_num (int):
+                각 에이전트에 대해 뽑을 route lane 개수(고정 길이 출력).
 
         Returns:
-            near_route_lanes:
-                에이전트별로 정렬된 lane 임베딩.
-                shape: (B, Pnn, lane_num, hidden_dim)
-            near_route_lanes_mask:
-                위와 같은 위치의 패딩 마스크(True=무효).
-                shape: (B, Pnn, lane_num)
+            Tuple[torch.Tensor, torch.Tensor]:
+                near_route_lanes:
+                    에이전트별 "앞쪽 route lane route_num개" 임베딩.
+                    shape: (B, Pnn, route_num, hidden_dim)
+
+                near_route_lanes_mask:
+                    위와 같은 위치의 패딩 마스크(True=무효).
+                    shape: (B, Pnn, route_num)
         """
         B, lane_num, hidden_dim = encoding_lanes.shape
-        Pnn = agent_route_lane_order.shape[1]
+        Pnn: int = int(agent_route_lane_order.shape[1])
+        route_num_int: int = int(route_num)
 
-        # lane 이 아예 없는 극단 상황 방어
-        if lane_num == 0:
+        # ---- (0) route_num이 0 이하인 경우: 빈 출력 ----
+        if route_num_int <= 0:
             near_route_lanes = encoding_lanes.new_zeros(B, Pnn, 0, hidden_dim)
-            near_route_lanes_mask = torch.ones(B,
-                                               Pnn,
-                                               0,
+            near_route_lanes_mask = torch.ones((B, Pnn, 0),
                                                dtype=torch.bool,
                                                device=encoding_lanes.device)
             return near_route_lanes, near_route_lanes_mask
 
-        # 기본 순위 텐서: (B, Pnn, lane_num)
-        route_lane_order = agent_route_lane_order.to(torch.long)
+        # ---- (1) lane이 아예 없는 극단 상황 방어 ----
+        if lane_num == 0:
+            near_route_lanes = encoding_lanes.new_zeros(B, Pnn, route_num_int,
+                                                        hidden_dim)
+            near_route_lanes_mask = torch.ones((B, Pnn, route_num_int),
+                                               dtype=torch.bool,
+                                               device=encoding_lanes.device)
+            return near_route_lanes, near_route_lanes_mask
 
-        # lanes_mask: (B, lane_num) -> (B, 1, lane_num) -> (B, Pnn, lane_num)
-        lanes_mask_exp = lanes_mask.unsqueeze(1).expand(B, Pnn, lane_num)
+        # ---- (2) dtype 정리 ----
+        # route_lane_order: (B, Pnn, lane_num) [long]
+        route_lane_order: torch.Tensor = agent_route_lane_order.to(torch.long)
 
-        # route 에 실제로 포함되면서 lane 자체도 유효한 위치만 True
+        # lanes_mask: (B, lane_num) [bool]
+        lanes_mask_bool: torch.Tensor = lanes_mask.to(torch.bool)
+
+        # lanes_mask_exp: (B, 1, lane_num) -> (B, Pnn, lane_num)
+        lanes_mask_exp: torch.Tensor = lanes_mask_bool.unsqueeze(1).expand(B,
+                                                                           Pnn,
+                                                                           lane_num)
+
         # valid_route_mask: (B, Pnn, lane_num)
-        valid_route_mask = (route_lane_order >= 0) & (~lanes_mask_exp)
+        # route에 포함(+순서>=0) AND lane 자체도 pad가 아님
+        valid_route_mask: torch.Tensor = (route_lane_order >= 0) & (
+            ~lanes_mask_exp)
 
-        BIG = 2**30  # route에 없거나 pad 인 곳은 아주 큰 값으로 채워서 뒤로 보내기
+        # BIG: 무효한 lane을 뒤로 밀기 위한 아주 큰 값
+        BIG_INT: int = 2 ** 30
+        big_value: torch.Tensor = route_lane_order.new_full((),
+                                                            BIG_INT)  # scalar on same device/dtype
 
         # order_for_sort: (B, Pnn, lane_num)
-        #   - 유효한 위치: 실제 순위 값(0,1,2, ...)
-        #   - 무효한 위치: BIG
-        order_for_sort = torch.where(
-            valid_route_mask,
-            route_lane_order,
-            torch.full_like(route_lane_order, BIG),
+        # 유효: 실제 순서(0,1,2,...) / 무효: BIG
+        order_for_sort: torch.Tensor = torch.where(valid_route_mask,
+                                                   route_lane_order, big_value)
+
+        # ---- (3) 전체 정렬 대신 "앞쪽 route_num개"만 선택 ----
+        k: int = min(route_num_int, lane_num)
+
+        # selected_vals: (B, Pnn, k)
+        # selected_idx : (B, Pnn, k)  lane 인덱스
+        selected_vals, selected_idx = torch.topk(
+            order_for_sort,
+            k=k,
+            dim=-1,
+            largest=False,  # 작은 값이 앞쪽
+            sorted=True,  # 앞쪽부터 정렬된 상태로 반환
         )
 
-        # ---- lane_num 개 전부를 “순위 낮은 것부터” 정렬 ----
-        # vals: (B, Pnn, lane_num)  정렬된 순위 값
-        # sorted_idx: (B, Pnn, lane_num)  정렬 후의 lane 인덱스
-        vals, sorted_idx = torch.sort(order_for_sort, dim=-1, descending=False)
+        # route_lane_valid_mask_k: (B, Pnn, k)  True=유효(=BIG가 아님)
+        route_lane_valid_mask_k: torch.Tensor = selected_vals != big_value
 
-        # 실제로 route 에 있는 lane 인지 여부 (BIG 이 아니면 True)
-        # route_lane_valid_mask: (B, Pnn, lane_num)
-        route_lane_valid_mask = vals != BIG
+        # ---- (4) encoding_lanes에서 선택된 k개만 gather ----
+        # encoding_lanes_expand: (B, 1, lane_num, H) -> (B, Pnn, lane_num, H)
+        encoding_lanes_expand: torch.Tensor = encoding_lanes.unsqueeze(
+            1).expand(B, Pnn, lane_num, hidden_dim)
 
-        # ---- encoding_lanes 에서 정렬된 순서대로 뽑기 ----
-        # encoding_lanes_: (B, 1, lane_num, hidden_dim) -> (B, Pnn, lane_num, hidden_dim)
-        encoding_lanes_ = encoding_lanes.unsqueeze(1).expand(
-            B, Pnn, lane_num, hidden_dim)
+        # gather_idx_H: (B, Pnn, k, H)
+        gather_idx_H: torch.Tensor = selected_idx.unsqueeze(-1).expand(B, Pnn,
+                                                                       k,
+                                                                       hidden_dim)
 
-        # gather_idx_H: (B, Pnn, lane_num, hidden_dim)
-        gather_idx_H = sorted_idx.unsqueeze(-1).expand(B, Pnn, lane_num,
-                                                       hidden_dim)
+        # near_route_lanes_k: (B, Pnn, k, H)
+        near_route_lanes_k: torch.Tensor = torch.gather(encoding_lanes_expand,
+                                                        2, gather_idx_H)
 
-        # near_route_lanes: (B, Pnn, lane_num, hidden_dim)
-        near_route_lanes = torch.gather(encoding_lanes_, 2, gather_idx_H)
+        # ---- (5) lane 마스크도 같은 인덱스로 gather ----
+        # lanes_mask_expand: (B, 1, lane_num) -> (B, Pnn, lane_num)
+        lanes_mask_expand: torch.Tensor = lanes_mask_bool.unsqueeze(1).expand(B,
+                                                                              Pnn,
+                                                                              lane_num)
 
-        # ---- 마스크도 같은 순서로 정렬 ----
-        # lanes_mask_: (B, 1, lane_num) -> (B, Pnn, lane_num)
-        lanes_mask_ = lanes_mask.unsqueeze(1).expand(B, Pnn, lane_num)
-        # gathered_lane_mask: (B, Pnn, lane_num)
-        gathered_lane_mask = torch.gather(lanes_mask_, 2, sorted_idx)
+        # gathered_lane_mask_k: (B, Pnn, k)
+        gathered_lane_mask_k: torch.Tensor = torch.gather(lanes_mask_expand, 2,
+                                                          selected_idx)
 
-        # 최종 마스크:
-        #   - 원래 lane 이 pad 였거나
-        #   - route에 포함되지 않았던 lane 은 True(무효)
-        near_route_lanes_mask = gathered_lane_mask | (~route_lane_valid_mask)
+        # 최종 마스크(선택된 k개에 대해):
+        # - 원래 lane이 pad였거나
+        # - route에 포함되지 않았던 lane(BIG로 들어온 것)은 True(무효)
+        near_route_lanes_mask_k: torch.Tensor = gathered_lane_mask_k | (
+            ~route_lane_valid_mask_k)
 
-        # 무효 위치는 값도 0으로 맞춰주기
-        mask_f = near_route_lanes_mask.unsqueeze(-1).to(near_route_lanes.dtype)
-        near_route_lanes = near_route_lanes * (1.0 - mask_f)
+        # ---- (6) route_num이 lane_num보다 큰 경우를 대비한 패딩(고정 길이 유지) ----
+        if k < route_num_int:
+            pad_len: int = route_num_int - k
+
+            # pad_lanes: (B, Pnn, pad_len, H) = 0
+            pad_lanes: torch.Tensor = near_route_lanes_k.new_zeros(B, Pnn,
+                                                                   pad_len,
+                                                                   hidden_dim)
+
+            # pad_mask: (B, Pnn, pad_len) = True(전부 무효)
+            pad_mask: torch.Tensor = torch.ones((B, Pnn, pad_len),
+                                                dtype=torch.bool,
+                                                device=encoding_lanes.device)
+
+            # near_route_lanes: (B, Pnn, route_num, H)
+            near_route_lanes: torch.Tensor = torch.cat(
+                [near_route_lanes_k, pad_lanes], dim=2)
+
+            # near_route_lanes_mask: (B, Pnn, route_num)
+            near_route_lanes_mask: torch.Tensor = torch.cat(
+                [near_route_lanes_mask_k, pad_mask], dim=2)
+        else:
+            # near_route_lanes: (B, Pnn, route_num, H) where route_num == k
+            near_route_lanes = near_route_lanes_k
+            near_route_lanes_mask = near_route_lanes_mask_k
+
+        # ---- (7) 무효 위치 값은 0으로 고정 ----
+        near_route_lanes = near_route_lanes.masked_fill(
+            near_route_lanes_mask.unsqueeze(-1), 0.0)
 
         return near_route_lanes, near_route_lanes_mask
 
