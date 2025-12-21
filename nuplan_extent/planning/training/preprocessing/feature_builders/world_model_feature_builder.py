@@ -4,6 +4,7 @@ from diffusion_planner.utils.validity import add_validity_keys_inplace
 from dataclasses import fields as dataclass_fields
 from typing import Any, Dict, Type, Optional, List
 import numpy as np
+from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_near_agents_info_inplace
 
 import torch
 
@@ -234,6 +235,10 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
         add_validity_keys_inplace(model_inputs, missing_policy="none")
 
+        add_near_agents_info_inplace(
+            model_inputs,
+            predicted_neighbor_num=self._config.predicted_neighbor_num,
+        )
         # unnormalized_features 저장 (torch -> numpy)
         self.unnormalized_features = {}
         for key, value in model_inputs.items():

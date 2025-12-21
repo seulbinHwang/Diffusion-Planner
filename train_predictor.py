@@ -14,6 +14,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Optional, Dict, Any
 import io
+from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_near_agents_info_inplace
 
 # TensorFloat-32(TF32) 연산을 허용하여
 #   - Ampere(A100 등) GPU에서 matmul/cuDNN 연산을 FP32보다 빠르게 처리하고
@@ -3194,115 +3195,11 @@ class DiffusionPlannerCollate:
 
         if self._should_center_crop():
             self._center_crop_batch_batched(batch)
-        self._set_near_agents_info(batch, self.args.predicted_neighbor_num)
+        add_near_agents_info_inplace(
+            batch,
+            predicted_neighbor_num=self.args.predicted_neighbor_num,
+        )
         return self._build_collated_batch_tensors(batch)
-
-    def _set_near_agents_info(
-        self,
-        batch: List[Dict[str, Any]],
-        predicted_neighbor_num: int,
-    ) -> None:
-        """각 샘플의 neighbor_agents 중 앞쪽부터 predicted_neighbor_num개를 near로 나눕니다.
-
-        동작 요약
-        --------
-        - neighbor_agents_past의 앞쪽부터 near로 선택합니다.
-        - 선택된 near에 맞춰 아래 값들도 같은 규칙으로 앞쪽을 잘라 near_*를 만듭니다.
-        - 또한 agent_route_lane_order는 (행=agent) 기준으로 near 개수만 남기도록 덮어씁니다.
-          (열=lane 축은 유지)
-
-        입력/출력에서 중요한 shape
-        ------------------------
-        입력(예시):
-          - neighbor_agents_past: shape (A, T_past, 11)
-          - neighbor_future_gt_3_dim: shape (A, T_fut, 3)
-          - agent_route_lane_order: shape (A, L)
-          - agent_route_lane_order_is_valid: shape (A,)
-
-        출력(near_num = min(predicted_neighbor_num, A, 그리고 관련 배열 길이들의 최소값)):
-          - near_agents_past: shape (near_num, T_past, 11)
-          - non_near_agents_past: shape (A - near_num, T_past, 11)
-          - near_future_gt_3_dim: shape (near_num, T_fut, 3)  (입력이 있을 때만 생성)
-          - agent_route_lane_order: shape (near_num, L)       (입력이 있을 때만 덮어씀)
-          - agent_route_lane_order_is_valid: shape (near_num,) (입력이 있을 때만 덮어씀)
-
-        Args:
-            batch (List[Dict[str, Any]]):
-                - 길이 B의 샘플 dict 리스트.
-            predicted_neighbor_num (int):
-                - near로 뽑을 최대 agent 수.
-
-        Returns:
-            None
-        """
-        requested_near_num: int = max(0, int(predicted_neighbor_num))
-
-        for sample in batch:
-            neighbor_agents_past = sample.get("neighbor_agents_past", None)
-            if neighbor_agents_past is None:
-                continue
-
-            neighbor_agents_past_arr = np.asarray(neighbor_agents_past)
-            # neighbor_agents_past_arr: (A, T_past, 11)
-            if neighbor_agents_past_arr.ndim != 3:
-                continue
-
-            a: int = int(neighbor_agents_past_arr.shape[0])
-            near_num: int = min(requested_near_num, a)
-
-            # --- (안정성) 같이 자를 값들의 첫 번째 축 길이도 고려해서 near_num을 한 번 더 맞춥니다 ---
-            neighbor_future_gt_3_dim = sample.get("neighbor_future_gt_3_dim",
-                                                  None)
-            if neighbor_future_gt_3_dim is not None:
-                arr = np.asarray(neighbor_future_gt_3_dim)
-                # arr: (A2, T_fut, 3) 기대
-                if arr.ndim >= 1:
-                    near_num = min(near_num, int(arr.shape[0]))
-
-            agent_route_lane_order = sample.get("agent_route_lane_order", None)
-            if agent_route_lane_order is not None:
-                arr = np.asarray(agent_route_lane_order)
-                # arr: (A4, L) 기대
-                if arr.ndim >= 1:
-                    near_num = min(near_num, int(arr.shape[0]))
-
-            agent_route_lane_order_is_valid = sample.get(
-                "agent_route_lane_order_is_valid", None)
-            if agent_route_lane_order_is_valid is not None:
-                arr = np.asarray(agent_route_lane_order_is_valid)
-                # arr: (A5,) 기대
-                if arr.ndim >= 1:
-                    near_num = min(near_num, int(arr.shape[0]))
-
-            # --- near / non-near 생성 ---
-            sample[
-                "near_agents_past"] = neighbor_agents_past_arr[:near_num, :, :]
-            sample["non_near_agents_past"] = neighbor_agents_past_arr[
-                near_num:, :, :]
-
-            if neighbor_future_gt_3_dim is not None:
-                neighbor_future_gt_3_dim_arr = np.asarray(
-                    neighbor_future_gt_3_dim)
-                # (A2, T_fut, 3) -> (near_num, T_fut, 3)
-                if neighbor_future_gt_3_dim_arr.ndim == 3:
-                    sample["near_future_gt_3_dim"] = \
-                    neighbor_future_gt_3_dim_arr[:near_num, :, :]
-
-            if agent_route_lane_order is not None:
-                agent_route_lane_order_arr = np.asarray(agent_route_lane_order)
-                # (A4, L) -> (near_num, L)
-                if agent_route_lane_order_arr.ndim == 2:
-                    sample["agent_route_lane_order"] = \
-                    agent_route_lane_order_arr[:near_num, :]
-
-            if agent_route_lane_order_is_valid is not None:
-                agent_route_lane_order_is_valid_arr = np.asarray(
-                    agent_route_lane_order_is_valid)
-                # (A5,) -> (near_num,)
-                if agent_route_lane_order_is_valid_arr.ndim == 1:
-                    sample[
-                        "agent_route_lane_order_is_valid"] = agent_route_lane_order_is_valid_arr[:
-                                                                                                 near_num]
 
 
 def _init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
