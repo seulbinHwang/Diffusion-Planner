@@ -106,11 +106,15 @@ class Decoder(nn.Module):
         self._sde = VPSDE_linear()
         self._cond_last_prob: float = getattr(config, "cond_last_prob",
                                               0.0)  # 20%
-
-        if self.config.use_current_input:
-            output_dim = (config.future_len + 1) * 4  # x, y, cos, sin
+        if self.config.use_past_dit_input:
+            output_dim = (config.past_len + 1 +
+                          config.future_len) * 4  # x, y, cos, sin
         else:
-            output_dim = (config.future_len) * 4  # x, y, cos, sin
+            if self.config.use_current_input:
+
+                output_dim = (config.future_len + 1) * 4  # x, y, cos, sin
+            else:
+                output_dim = (config.future_len) * 4  # x, y, cos, sin
 
         self.dit = DiT(
             config=config,
@@ -797,7 +801,8 @@ class Decoder(nn.Module):
         )
 
         diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
-        near_agents_past: Optional[torch.Tensor] = inputs["near_agents_past"]  # (B, Pnn, past_len, 11) 또는 None
+        near_agents_past: Optional[torch.Tensor] = inputs[
+            "near_agents_past"]  # (B, Pnn, past_len, 11) 또는 None
         # DiT 호출
         score: torch.Tensor = self.dit(
             near_agents_past,
@@ -995,11 +1000,13 @@ class Decoder(nn.Module):
         near_agents_past: Optional[torch.Tensor] = inputs[
             "near_agents_past"]  # (B, Pnn, past_len, 11) 또는 None
         # DPM-Solver 샘플링
+        # TODO:
         x0: torch.Tensor = dpm_sampler(
             self.dit,
             xT.float(),  # (B, Pnn, F)
             other_model_params={
-                "near_agents_past": near_agents_past,  # (B, Pnn, past_len, 11) 또는 None
+                "near_agents_past":
+                    near_agents_past,  # (B, Pnn, past_len, 11) 또는 None
                 "cross_c": scene_encoding_token,  # (B, token_num, D)
                 "ego_fut_global": ego_fut_global,  # (B, D)
                 "near_agents_route_lane_emb":
@@ -1021,7 +1028,8 @@ class Decoder(nn.Module):
                 "classifier_kwargs": {
                     "model": self.dit,
                     "model_condition": {
-                        "near_agents_past": near_agents_past,
+                        "near_agents_past":
+                            near_agents_past,
                         "cross_c":
                             scene_encoding_token,
                         "ego_fut_global":
@@ -1300,7 +1308,7 @@ class DiT(nn.Module):
 
     def preproj_varlen(
             self,
-            near_cur_future_norm_xT: torch.Tensor,  # (B, Pnn, F=(1+T)*4)
+            near_input_norm_xT: torch.Tensor,  # (B, Pnn, F=(1+T)*4)
             near_current_mask: torch.Tensor,  # (B, Pnn) True=pad(무효 에이전트)
     ) -> torch.Tensor:
         """pre-proj MLP 를 유효 에이전트 토큰에만 적용하는 전처리 함수.
@@ -1309,7 +1317,7 @@ class DiT(nn.Module):
         다시 배치 모양으로 되돌립니다.
 
         Args:
-            near_cur_future_norm_xT (torch.Tensor):
+            near_input_norm_xT (torch.Tensor):
                 정규화된 현재+미래 입력.
                 shape: (B, Pnn, F)  (F=(1+T)*4)
             near_current_mask (torch.Tensor):
@@ -1321,11 +1329,11 @@ class DiT(nn.Module):
                 pre-proj 후 토큰.
                 shape: (B, Pnn, D)
         """
-        B, Pnn, F = near_cur_future_norm_xT.shape  # (B, Pnn, F)
+        B, Pnn, F = near_input_norm_xT.shape  # (B, Pnn, F)
         # unpad_input 은 True=유효 이므로 반전 필요
         attention_mask = (~near_current_mask).to(torch.bool)  # (B, Pnn)
 
-        res = unpad_input(near_cur_future_norm_xT, attention_mask)
+        res = unpad_input(near_input_norm_xT, attention_mask)
         # x_unpad: (T_total, F), indices: (T_total,)
         if len(res) == 4:
             x_unpad, indices, cu_seqlens, max_seqlen = res
@@ -1335,7 +1343,7 @@ class DiT(nn.Module):
 
         if x_unpad.numel() == 0:
             D_out = self.preproj.fc2.out_features
-            zeros = near_cur_future_norm_xT.new_zeros((B, Pnn, D_out))
+            zeros = near_input_norm_xT.new_zeros((B, Pnn, D_out))
             touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
                      (self.preproj.fc1.bias.view(-1)[:1].sum()
                       if self.preproj.fc1.bias is not None else 0) +
@@ -1357,8 +1365,7 @@ class DiT(nn.Module):
 
     def _run_dit_core_with_pram_v2(
             self,
-            near_future_norm_xT: torch.
-        Tensor,  # (B, Pnn, T*4) or (B, Pnn, (1+T)*4)
+            near_input_norm_xT: torch.Tensor,  # (B, Pnn, _*4)
             diffusion_time: torch.Tensor,  # (B,)
             cross_c: torch.Tensor,  # (B, token_num, D)
             ego_fut_global: torch.Tensor,  # (B, D)
@@ -1375,8 +1382,8 @@ class DiT(nn.Module):
         - 모든 블록을 통과한 후 최종 LayerNorm+Linear 로 (T*4) 차원 출력을 만든다.
 
         Args:
-            near_future_norm_xT (torch.Tensor):
-                정규화된 현재+미래 궤적(flatten 형태).
+            near_input_norm_xT (torch.Tensor):
+                정규화된  궤적(flatten 형태).
                 shape: (B, Pnn, F)
             diffusion_time (torch.Tensor):
                 확산 시간 t.
@@ -1408,12 +1415,12 @@ class DiT(nn.Module):
                 DiT 본체 출력 (아직 model_type 보정 전).
                 shape: (B, Pnn, F_out)  (F_out=T*4 또는 (1+T)*4)
         """
-        B, Pnn, _ = near_future_norm_xT.shape  # (B, Pnn, F)
+        B, Pnn, _ = near_input_norm_xT.shape  # (B, Pnn, F)
 
         # 1) pre-proj (varlen)
         # x: (B, Pnn, H)
         x: torch.Tensor = self.preproj_varlen(
-            near_cur_future_norm_xT=near_future_norm_xT,
+            near_input_norm_xT=near_input_norm_xT,
             near_current_mask=near_current_mask,
         )
         # 무효 토큰은 0으로 고정
@@ -1515,7 +1522,7 @@ class DiT(nn.Module):
 
     def _forward_x_start_branch(
         self,
-        x: torch.Tensor,  # (B, Pnn, F_out)
+        x: torch.Tensor,  # (B, Pnn, F_out) (F_out=T*4 또는 (1+T)*4)
         diffusion_time: torch.Tensor,  # (B,)
         near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
         near_past_cur_future_valid: torch.
@@ -1562,6 +1569,12 @@ class DiT(nn.Module):
                 x_start 추정값 또는 feasible 보정 후 궤적(flatten).
                 shape: (B, Pnn, F_out)
         """
+        # TODO : 출력 값의 shape 에 대한 고민 더 필요
+        """
+        <기존>
+            use_current_input 이 True -> 출력값의 shape = (B, Pnn, (1+T)*4)
+            use_current_input 이 False -> 출력값의 shape = (B, Pnn, T*4)
+        """
         # 기본 경로: feasible 을 쓰지 않을 때
         if not self.config.use_feasible:
             return x
@@ -1580,19 +1593,26 @@ class DiT(nn.Module):
                 near_past_cur_future_valid.detach()
 
         # diffusion_trajectory: (B, Pnn, 1+T, 4)
-        if getattr(self.config, "use_current_input", True):
+        if self.config.use_past_dit_input:
+            # x_for_feasible: (B, Pnn,  (past_len + 1+T)*4)
             diffusion_trajectory = x_for_feasible.reshape(
-                B, Pnn, -1, 4).contiguous()  # (B, Pnn, 1+T, 4)
+                B, Pnn, -1, 4).contiguous()[:, :, -(
+                    self._future_len + 1):, :]  # (B, Pnn, 1+T, 4)
             diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_for_feasible
         else:
-            diffusion_trajectory = torch.cat(
-                [
-                    near_current_xyyaw_for_feasible.unsqueeze(
-                        2),  # (B, Pnn, 1, 4)
-                    x_for_feasible.reshape(B, Pnn, -1, 4),  # (B, Pnn, T, 4)
-                ],
-                dim=2,
-            ).contiguous()  # (B, Pnn, 1+T, 4)
+            if self.config.use_current_input:
+                diffusion_trajectory = x_for_feasible.reshape(
+                    B, Pnn, -1, 4).contiguous()  # (B, Pnn, 1+T, 4)
+                diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_for_feasible
+            else:
+                diffusion_trajectory = torch.cat(
+                    [
+                        near_current_xyyaw_for_feasible.unsqueeze(
+                            2),  # (B, Pnn, 1, 4)
+                        x_for_feasible.reshape(B, Pnn, -1, 4),  # (B, Pnn, T, 4)
+                    ],
+                    dim=2,
+                ).contiguous()  # (B, Pnn, 1+T, 4)
 
         # t_threshold 설정
         t_threshold: float = float(self.config.feasible_learn_noise_thresh)
@@ -1666,7 +1686,7 @@ class DiT(nn.Module):
             self,
             near_future_norm_xT: torch.
         Tensor,  # (B, Pnn, T*4) or (B, Pnn, (1+T)*4)
-            near_agents_past: Optional[torch.Tensor], # (B, Pnn, past_len, 11)
+            near_agents_past: Optional[torch.Tensor],  # (B, Pnn, past_len, 11)
             diffusion_time: torch.Tensor,  # (B,)
             cross_c: torch.Tensor,  # (B, token_num, D)
             ego_fut_global: torch.Tensor,  # (B, D)
@@ -1745,16 +1765,20 @@ class DiT(nn.Module):
         device_type: str = near_future_norm_xT.device.type
         if self.config.use_past_dit_input:
             if self.config.use_current_input:
-                near_agents_past_xyyaw = near_agents_past_xyyaw[:, :, :-1, :] # 현재 제외
+                near_agents_past_xyyaw = near_agents_past_xyyaw[:, :, :
+                                                                -1, :]  # 현재 제외
             # 과거+현재+미래 입력 병합
             near_past_cur_future_norm_xT = torch.cat(
                 [
-                    near_agents_past_xyyaw.reshape(B, Pnn, -1),  # (B, Pnn, past_len*4)
+                    near_agents_past_xyyaw.reshape(B, Pnn,
+                                                   -1),  # (B, Pnn, past_len*4)
                     near_future_norm_xT,  # (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
                 ],
                 dim=2,
             )  # (B, Pnn, (past_len + 1+T)*4)
-
+            near_input_norm_xT = near_past_cur_future_norm_xT
+        else:
+            near_input_norm_xT = near_future_norm_xT
 
         # DiT 본체(프리프로젝션+블록+최종 투영)를 프로파일링 블록 안에서 수행
         with profile_block(
@@ -1762,9 +1786,9 @@ class DiT(nn.Module):
                 enabled=self.config.profile_feasible,
                 device_type=device_type,
         ):
-            # x: (B, Pnn, F_out)
+            # x: (B, Pnn, F_out) # (F_out=T*4 또는 (1+T)*4)
             x: torch.Tensor = self._run_dit_core_with_pram_v2(
-                near_future_norm_xT=near_future_norm_xT,
+                near_input_norm_xT=near_input_norm_xT,
                 diffusion_time=diffusion_time,
                 cross_c=cross_c,
                 ego_fut_global=ego_fut_global,
@@ -1782,6 +1806,7 @@ class DiT(nn.Module):
                 diffusion_time=diffusion_time,
             )
         elif self._model_type == "x_start":
+
             return self._forward_x_start_branch(
                 x=x,
                 diffusion_time=diffusion_time,

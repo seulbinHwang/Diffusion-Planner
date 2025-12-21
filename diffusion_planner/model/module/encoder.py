@@ -1345,7 +1345,7 @@ class Encoder(nn.Module):
                 ego_agent_past,  # (B, 1, time_len, 11)
                 planner_future_11_dim,  # (B, future_len, 11)
                 neighbor_agents_past,  # (B, A, time_len, 11)
-                non_near_agents_past, # (B, non_near_A, time_len, 11)
+                non_near_agents_past,  # (B, non_near_A, time_len, 11)
                 static_objects,  # (B, P, D_static)
                 lanes,  # (B, L, lane_len, D_lane)
                 lanes_speed_limit,  # (B, L, 1)
@@ -1394,7 +1394,8 @@ class Encoder(nn.Module):
                 road_safety_pos,  # (B, N_road_safety, 9)
             ) = self._encode_agents_static_lanes(
                 ego_agent_past=ego_agent_past,
-                non_near_agents_past=non_near_agents_past, # (B, non_near_A, time_len, 11)
+                non_near_agents_past=
+                non_near_agents_past,  # (B, non_near_A, time_len, 11)
                 ego_future_trajectory=ego_future_trajectory,
                 static_objects=static_objects,
                 lanes=lanes,
