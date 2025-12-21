@@ -1515,8 +1515,6 @@ class Encoder(nn.Module):
                 shape: (B, Pnn, lane_num)
                 - 값 >=0 : route 위에 있는 lane, 숫자가 작을수록 “더 앞쪽/가까운” lane
                 - 값  <0 : route 에 없음(후순위로 밀림)
-            route_num:
-                더 이상 사용하지 않음. (인터페이스 유지용)
 
         Returns:
             near_route_lanes:

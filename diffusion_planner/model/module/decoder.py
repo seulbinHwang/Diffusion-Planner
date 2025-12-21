@@ -1,5 +1,5 @@
-import math
-import torch
+from functools import partial
+from typing import Callable
 import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
@@ -136,6 +136,214 @@ class Decoder(nn.Module):
     def sde(self):
         return self._sde
 
+    def _build_training_dit_inputs(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        near_current_mask: torch.Tensor,  # (B, Pnn)
+        cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """훈련 모드에서 DiT에 넣을 입력(xT_input)과 현재 프레임(정규화)을 만든다.
+
+        이 함수는 훈련에서 매번 반복되는 전처리를 한 곳에 모아,
+        `_forward_training_mode`를 짧고 읽기 쉽게 만드는 목적입니다.
+
+        처리 흐름:
+            1) inputs["near_cur_future_norm_xT"]에서 현재/미래를 분리합니다.
+            2) config.use_current_input 설정에 따라
+               - 현재+미래를 쓰거나
+               - 미래만 쓰도록 선택합니다.
+            3) (B, Pnn, time, 4) -> (B, Pnn, F) 로 펼칩니다.
+            4) (옵션) 목표점(cond_last_pos_norm)을 마지막 프레임에 주입합니다.
+               - 배치 단위 확률 토글 방식(기존 로직 유지)
+
+        Args:
+            inputs: DataLoader에서 넘어온 배치 dict.
+                - "near_cur_future_norm_xT": (B, Pnn, 1+T, 4)
+            near_current_mask: 현재 프레임 기준 무효 에이전트 마스크.
+                shape: (B, Pnn)  True=무효(패딩)
+            cond_last_pos_norm: 목표점(마지막 위치) 조건(정규화).
+                shape: (B, Pnn, 4)
+            batch_size: 배치 크기 B.
+            predicted_neighbor_num: 이웃 수 Pnn.
+
+        Returns:
+            xT_input_flat:
+                DiT 입력(flatten).
+                - use_current_input=True  -> shape (B, Pnn, (1+T)*4)
+                - use_current_input=False -> shape (B, Pnn, T*4)
+            near_cur_norm_xT:
+                현재 프레임(정규화).
+                shape: (B, Pnn, 4)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+
+        # near_cur_future_norm_xT: (B, Pnn, 1+T, 4)
+        near_cur_future_norm_xT: torch.Tensor = inputs[
+            "near_cur_future_norm_xT"]
+
+        # near_cur_norm_xT: (B, Pnn, 4)
+        near_cur_norm_xT: torch.Tensor = near_cur_future_norm_xT[:, :, 0, :]
+
+        # near_future_norm_xT: (B, Pnn, T, 4)
+        near_future_norm_xT: torch.Tensor = near_cur_future_norm_xT[:, :, 1:, :]
+
+        # xT_input_seq: (B, Pnn, time, 4)
+        if self.config.use_current_input:
+            xT_input_seq: torch.Tensor = near_cur_future_norm_xT
+        else:
+            xT_input_seq = near_future_norm_xT
+
+        # xT_input_flat: (B, Pnn, F)
+        xT_input_flat: torch.Tensor = xT_input_seq.reshape(B, Pnn, -1)
+
+        # 목표점(cond_last_pos_norm)을 학습용으로 일부 배치에서만 마지막 프레임에 주입
+        xT_input_flat, _ = self._maybe_apply_last_pos_condition_training(
+            near_cur_future_norm_xT=xT_input_flat,  # (B, Pnn, F)
+            near_current_mask=near_current_mask,  # (B, Pnn)
+            cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
+        )
+        return xT_input_flat, near_cur_norm_xT
+
+    def _run_dit_training_forward(
+            self,
+            near_agents_past: Optional[
+                torch.Tensor],  # (B, Pnn, past_len, 11) 또는 None
+            xT_input_flat: torch.Tensor,  # (B, Pnn, F)
+            diffusion_time: torch.Tensor,  # (B,)
+            scene_encoding_token: torch.Tensor,  # (B, token_num, D)
+            scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
+            ego_fut_global: torch.Tensor,  # (B, D)
+            near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+            near_past_cur_future_valid: torch.
+        Tensor,  # (B, Pnn, time_len+future_len)
+            route_known_mask: torch.Tensor,  # (B, Pnn)
+            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+            near_cur_norm_xT: torch.Tensor,  # (B, Pnn, 4)
+            near_past: torch.Tensor,  # (B, Pnn, past_len, 11)
+    ) -> torch.Tensor:
+        """훈련 모드에서 DiT를 1회 호출하고 raw 출력(flat)을 얻는다.
+
+        Args:
+            near_agents_past: (B, Pnn, past_len, 11) 또는 None
+            xT_input_flat: (B, Pnn, F)
+            diffusion_time: (B,)
+            scene_encoding_token: (B, token_num, D)
+            scene_encoding_token_mask: (B, token_num)
+            ego_fut_global: (B, D)
+            near_agents_route_lane_emb: (B, Pnn, D)
+            near_past_cur_future_valid: (B, Pnn, time_len+future_len)
+            route_known_mask: (B, Pnn)
+            near_class_one_hot: (B, Pnn, 3)
+            near_cur_norm_xT: (B, Pnn, 4)
+            near_past: (B, Pnn, past_len, 11)
+
+        Returns:
+            score_flat:
+                DiT 출력(flatten).
+                shape: (B, Pnn, F_out)
+        """
+        score_flat: torch.Tensor = self.dit(
+            near_agents_past,
+            xT_input_flat,  # (B, Pnn, F)
+            diffusion_time,  # (B,)
+            scene_encoding_token,  # (B, token_num, D)
+            ego_fut_global,  # (B, D)
+            near_agents_route_lane_emb,  # (B, Pnn, D)
+            near_past_cur_future_valid,  # (B, Pnn, time_len+future_len)
+            scene_encoding_token_mask,  # (B, token_num)
+            route_known_mask,  # (B, Pnn)
+            near_class_one_hot,  # (B, Pnn, 3)
+            near_current_xyyaw=near_cur_norm_xT,  # (B, Pnn, 4)
+            near_past=near_past,  # (B, Pnn, past_len, 11)
+        )
+        _require_finite("decoder_dit_output", score_flat)
+        return score_flat
+
+    def _reshape_training_score_to_sequence(
+        self,
+        score_flat: torch.Tensor,  # (B, Pnn, F_out)
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> torch.Tensor:
+        """훈련 모드에서 DiT 출력(flat)을 (B, Pnn, 1+T, 4) 형태로 바꾼다.
+
+        - use_past_dit_input / use_current_input 설정 조합을 그대로 반영합니다.
+        - 최종적으로 Decoder가 리턴하는 score는 항상 (B, Pnn, 1+T, 4) 형태가 되도록 맞춥니다.
+
+        Args:
+            score_flat: DiT 출력(flat).
+                shape: (B, Pnn, F_out)
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            batch_size: 배치 크기 B.
+            predicted_neighbor_num: 이웃 수 Pnn.
+
+        Returns:
+            score_seq:
+                shape: (B, Pnn, 1+T, 4)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+
+        if self.config.use_past_dit_input:
+            # score_flat: (B, Pnn, (time_len + T) * 4)
+            score_seq = score_flat.reshape(
+                B,
+                Pnn,
+                self.config.time_len + self._future_len,
+                4,
+            )
+            # 마지막 (1+T)만 사용: (B, Pnn, 1+T, 4)
+            score_seq = score_seq[:, :, -(1 + self._future_len):, :]
+            return score_seq
+
+        if self.config.use_current_input:
+            # score_seq: (B, Pnn, 1+T, 4)
+            score_seq = score_flat.reshape(B, Pnn, 1 + self._future_len, 4)
+            return score_seq
+
+        # use_current_input=False 인 경우: DiT 출력은 미래만 (B,Pnn,T,4)
+        score_future = score_flat.reshape(B, Pnn, self._future_len,
+                                          4)  # (B,Pnn,T,4)
+        score_seq = torch.cat(
+            [near_current_xyyaw.unsqueeze(2), score_future],
+            dim=2,
+        )  # (B,Pnn,1+T,4)
+        return score_seq
+
+    def _append_training_feasible_outputs(
+            self,
+            outputs: Dict[str, torch.Tensor],
+            near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+    ) -> None:
+        """훈련 모드에서 feasible 출력(integrated_trajectory 등)을 outputs dict에 추가한다.
+
+        Args:
+            outputs: `_forward_training_mode`가 반환할 dict (in-place 업데이트).
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+
+        Returns:
+            None
+        """
+        if not getattr(self.config, "use_feasible", False):
+            return
+
+        # integrated_trajectory: (B, Pnn, T, 4)
+        integrated_trajectory: torch.Tensor = self.dit.dit_returns.integrated_trajectory
+        integrated_trajectory = torch.cat(
+            [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
+            dim=2,
+        )  # (B, Pnn, 1+T, 4)
+
+        outputs["integrated_trajectory"] = integrated_trajectory
+        outputs[
+            "control_constraint_diff"] = self.dit.dit_returns.control_constraint_diff
+
     # TODO: 점검하기
     def _maybe_apply_last_pos_condition_training(
         self,
@@ -181,8 +389,7 @@ class Decoder(nn.Module):
             return near_cur_future_norm_xT, None
 
         # (1) 적용 가능 위치: 유효 에이전트 & has_goal(목표값이 전부 0 이 아닌)
-        has_goal: torch.Tensor = torch.isfinite(cond_last_pos_norm).all(
-            dim=-1) & (cond_last_pos_norm.ne(0).sum(dim=-1) > 0)  # (B, Pnn)
+        has_goal = compute_cond_last_mask(cond_last_pos_norm)  # (B, Pnn)
         can_apply: torch.Tensor = (~near_current_mask) & has_goal  # (B, Pnn)
 
         # (2) 배치 단일 베르누이 샘플: 약 20% 확률로 전체 적용
@@ -346,29 +553,52 @@ class Decoder(nn.Module):
 
     @staticmethod
     def _inject_last_position_condition_if_available(
-        xt: torch.Tensor,  # (B, Pnn, T, C) 정도라고 가정
-        cond_last_pos: Optional[torch.Tensor]  # (B, Pnn, C_pos)
+            xt: torch.Tensor,  # (B, Pnn, time_len, 4) 정도라고 가정
+            cond_last_pos: Optional[torch.Tensor],  # (B, Pnn, 4) 또는 None
     ) -> torch.Tensor:
-        """cond_last_pos가 유효한 샘플에만 마지막 프레임 위치를 덮어쓴다."""
+        """목표점(cond-last)이 있는 에이전트만 마지막 프레임 위치를 덮어쓴다.
+
+        처리 흐름:
+            1) 목표점 텐서가 없으면(=None) 그대로 반환합니다.
+            2) 목표점 텐서가 있으면 xt와 dtype/device를 맞춥니다.
+               - 샘플링 중 xt dtype이 바뀌는 경우가 있어서, 여기서 한 번 더 안전하게 맞춥니다.
+            3) 목표가 있는 에이전트만 골라 마지막 프레임의 (x, y) 값을 목표로 바꿉니다.
+
+        Args:
+            xt (torch.Tensor): 현재 샘플 시퀀스.
+                shape: (B, Pnn, time_len, 4)
+            cond_last_pos (Optional[torch.Tensor]): 목표점(정규화) 또는 None.
+                - None 또는 shape: (B, Pnn, 4)
+
+        Returns:
+            torch.Tensor:
+                목표점이 있는 에이전트만 마지막 프레임이 보정된 xt.
+                shape: (B, Pnn, time_len, 4)
+        """
         if cond_last_pos is None:
             return xt
 
-        cond_last_mask: torch.Tensor = compute_cond_last_mask(
-            cond_last_pos)  # (B, Pnn)
+        # dtype/device 정합 (중요)
+        cond_last_pos = _cast_like(cond_last_pos, xt)  # (B, Pnn, 4)
 
-        # cond_last_mask == True 인 애들만 마지막 프레임에 cond_last_pos를 주입
-        # 예시: 마지막 프레임의 (x, y)만 덮어쓴다면
-        xt_last = xt[..., -1, :]  # (B, Pnn, C)
+        # cond_last_mask: (B, Pnn)
+        cond_last_mask: torch.Tensor = compute_cond_last_mask(cond_last_pos)
+
+        # xt_last: (B, Pnn, 4)
+        xt_last = xt[..., -1, :]
         new_last = xt_last.clone()
 
-        # cond_last_pos의 (x, y)만 사용한다고 가정
-        new_last_xy = cond_last_pos[..., :2]  # (B, Pnn, 2)
+        # 목표점의 (x, y): (B, Pnn, 2)
+        new_last_xy = cond_last_pos[..., :2]
+
+        # 목표가 있는 에이전트만 마지막 프레임 (x,y) 교체
         new_last[..., :2] = torch.where(
             cond_last_mask[..., None],  # (B, Pnn, 1)
             new_last_xy,
             xt_last[..., :2],
         )
 
+        # in-place 갱신: xt[..., -1, :] shape (B, Pnn, 4)
         xt[..., -1, :] = new_last
         return xt
 
@@ -730,302 +960,319 @@ class Decoder(nn.Module):
             route_known_mask,
         )
 
-    def _forward_training_mode(
+    def _sample_inference_noise(
         self,
-        inputs: Dict[str, torch.Tensor],
-        scene_encoding_token: torch.Tensor,
-        scene_encoding_token_mask: torch.Tensor,
-        ego_fut_global: torch.Tensor,
-        near_agents_route_lane_emb: torch.Tensor,
-        route_known_mask: torch.Tensor,
-        near_past: torch.Tensor,
-        near_current_xyyaw: torch.Tensor,
-        near_current_mask: torch.Tensor,
-        near_past_cur_future_valid: torch.Tensor,
-        near_class_one_hot: torch.Tensor,
-        cond_last_pos_norm: torch.Tensor,
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
         batch_size: int,
         predicted_neighbor_num: int,
-    ) -> Dict[str, torch.Tensor]:
-        """훈련 모드에서 한 배치에 대해 decoder 를 한 번 돌린다.
+    ) -> torch.Tensor:
+        """추론 모드에서 시작점으로 쓸 미래 노이즈 궤적을 만든다.
 
         Args:
-            inputs: DataLoader 에서 온 배치 dict.
-            scene_encoding_token: (B, token_num, D) 장면 토큰.
-            scene_encoding_token_mask: (B, token_num) bool 마스크.
-            ego_fut_global: (B, D) 이고 미래 요약 벡터.
-            near_agents_route_lane_emb: (B, Pnn, D) 이웃+경로 임베딩.
-            route_known_mask: (B, Pnn) bool, 경로 유효 여부.
-            near_past: (B, Pnn, past_len, 11) 이웃 과거 상태.
-            near_current_xyyaw: (B, Pnn, 4) 이웃 현재 상태.
-            near_current_mask: (B, Pnn) True면 이웃이 없는 자리.
-            near_past_cur_future_valid:
-                (B, Pnn, time_len + future_len) 과거+현재+미래 유효 마스크.
-            near_class_one_hot: (B, Pnn, 3) 에이전트 종류 one-hot.
-            cond_last_pos_norm: (B, Pnn, 4) 정규화된 목표 위치.
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
             batch_size: 배치 크기 B.
             predicted_neighbor_num: 이웃 수 Pnn.
 
         Returns:
-            Dict[str, torch.Tensor]: "score" (필수)와
-                "integrated_trajectory", "control_constraint_diff"(옵션)를 포함한 dict.
+            noise:
+                미래 프레임 노이즈.
+                shape: (B, Pnn, T, 4)
         """
-        return_: Dict[str, torch.Tensor] = {}
-
         B: int = batch_size
         Pnn: int = predicted_neighbor_num
-
-        # near_cur_future_norm_xT: (B, Pnn, 1+T, 4)
-        near_cur_future_norm_xT: torch.Tensor = inputs[
-            "near_cur_future_norm_xT"]
-        # near_cur_norm_xT: (B, Pnn, 4) 현재 프레임
-        near_cur_norm_xT: torch.Tensor = near_cur_future_norm_xT[:, :, 0, :]
-        # near_future_norm_xT: (B, Pnn, T, 4)
-        near_future_norm_xT: torch.Tensor = near_cur_future_norm_xT[:, :, 1:, :]
-
-        if self.config.use_current_input:
-            # xT_input: (B, Pnn, 1+T, 4)
-            xT_input: torch.Tensor = near_cur_future_norm_xT
-        else:
-            # xT_input: (B, Pnn, T, 4)
-            xT_input = near_future_norm_xT
-
-        # flatten: (B, Pnn, F)  F = (1+T)*4 또는 T*4
-        xT_input = xT_input.reshape(B, Pnn, -1)
-
-        # cond_last_pos_norm 을 사용해 마지막 프레임을 학습용으로 일부 교체
-        xT_input, _ = self._maybe_apply_last_pos_condition_training(
-            near_cur_future_norm_xT=xT_input,  # (B, Pnn, F)
-            near_current_mask=near_current_mask,  # (B, Pnn)
-            cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
-        )
-
-        diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
-        near_agents_past: Optional[torch.Tensor] = inputs[
-            "near_agents_past"]  # (B, Pnn, past_len, 11) 또는 None
-        # DiT 호출
-        score: torch.Tensor = self.dit(
-            near_agents_past,
-            xT_input,  # (B, Pnn, F)
-            diffusion_time,  # (B,)
-            scene_encoding_token,  # (B, token_num, D)
-            ego_fut_global,  # (B, D)
-            near_agents_route_lane_emb,  # (B, Pnn, D)
-            near_past_cur_future_valid,  # (B, Pnn, time_len+future_len)
-            scene_encoding_token_mask,  # (B, token_num) bool
-            route_known_mask,  # (B, Pnn) bool
-            near_class_one_hot,  # (B, Pnn, 3)
-            near_current_xyyaw=near_cur_norm_xT,  # (B, Pnn, 4)  정규화된 현재
-            near_past=near_past,  # (B, Pnn, past_len, 11)
-        )
-        _require_finite("decoder_dit_output", score)
-        if self.config.use_past_dit_input:
-            # score: (B, Pnn, time_len(=1+past_len)+T, 4)
-            score = score.reshape(B, Pnn,
-                                  self.config.time_len + self._future_len, 4)
-            # score : (B, Pnn, 1+T, 4) 부분만 사용
-            score = score[:, :, -(1 + self._future_len):, :]
-        else:
-            if self.config.use_current_input:
-                # score: (B, Pnn, 1+T, 4)
-                score = score.reshape(B, Pnn, 1 + self._future_len, 4)
-            else:
-                # score: (B, Pnn, T, 4)
-                score = score.reshape(B, Pnn, self._future_len, 4)
-                # 앞에 현재 프레임 붙이기: (B, Pnn, 1+T, 4)
-                score = torch.cat(
-                    [near_current_xyyaw.unsqueeze(2), score],
-                    dim=2,
-                )
-
-        return_["score"] = score  # (B, Pnn, 1+T, 4)
-
-        if self.config.use_feasible:
-            # integrated_trajectory: (B, Pnn, T, 4)
-            integrated_trajectory: torch.Tensor = (
-                self.dit.dit_returns.integrated_trajectory)
-            integrated_trajectory = torch.cat(
-                [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
-                dim=2,
-            )  # (B, Pnn, 1+T, 4)
-            return_["integrated_trajectory"] = integrated_trajectory
-            # control_constraint_diff: (B, Pnn, T, 3)
-            return_["control_constraint_diff"] = (
-                self.dit.dit_returns.control_constraint_diff)
-
-        return return_
-
-    def _forward_inference_mode(
-        self,
-        inputs: Dict[str, torch.Tensor],
-        scene_encoding_token: torch.Tensor,
-        scene_encoding_token_mask: torch.Tensor,
-        ego_fut_global: torch.Tensor,
-        near_agents_route_lane_emb: torch.Tensor,
-        route_known_mask: torch.Tensor,
-        near_past: torch.Tensor,
-        near_current_xyyaw: torch.Tensor,
-        near_current_mask: torch.Tensor,
-        near_past_cur_future_valid: torch.Tensor,
-        near_class_one_hot: torch.Tensor,
-        cond_last_pos_norm: torch.Tensor,
-        batch_size: int,
-        predicted_neighbor_num: int,
-    ) -> Dict[str, torch.Tensor]:
-        """추론/평가 모드에서 한 배치에 대해 decoder 를 한 번 돌린다.
-
-        - 랜덤 노이즈에서 시작해 DPM-Solver로 샘플링.
-        - 중간 단계마다 현재 상태/목표/feasible 보정을 넣는다.
-        - 마지막에 상태 역정규화까지 해서 score 에 넣어준다.
-
-        Args:
-            inputs: DataLoader 에서 온 배치 dict.
-            scene_encoding_token: (B, token_num, D) 장면 토큰.
-            scene_encoding_token_mask: (B, token_num) bool 마스크.
-            ego_fut_global: (B, D) 이고 미래 요약 벡터.
-            near_agents_route_lane_emb: (B, Pnn, D) 이웃+경로 임베딩.
-            route_known_mask: (B, Pnn) bool, 경로 유효 여부.
-            near_past: (B, Pnn, past_len, 11) 이웃 과거 상태.
-            near_current_xyyaw: (B, Pnn, 4) 이웃 현재 상태.
-            near_current_mask: (B, Pnn) True면 이웃이 없는 자리.
-            near_past_cur_future_valid:
-                (B, Pnn, time_len + future_len) 과거+현재+미래 유효 마스크.
-            near_class_one_hot: (B, Pnn, 3) 에이전트 종류 one-hot.
-            cond_last_pos_norm: (B, Pnn, 4) 정규화된 목표 위치.
-            batch_size: 배치 크기 B.
-            predicted_neighbor_num: 이웃 수 Pnn.
-
-        Returns:
-            Dict[str, torch.Tensor]: "score"(필수)와
-                "integrated_trajectory"(옵션)를 포함한 dict.
-        """
-        return_: Dict[str, torch.Tensor] = {}
-
-        B: int = batch_size
-        Pnn: int = predicted_neighbor_num
-
-        # 초기 노이즈 궤적 샘플링
         noise: torch.Tensor = near_current_xyyaw.new_empty(
             (B, Pnn, self._future_len, 4),).normal_(0.0, 0.5)  # (B, Pnn, T, 4)
+        return noise
+
+    def _build_inference_xT_from_noise(
+        self,
+        noise: torch.Tensor,  # (B, Pnn, T, 4)
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> torch.Tensor:
+        """샘플링 시작점 xT(flat)를 만든다.
+
+        - use_current_input=True: (현재 + 미래노이즈) 를 이어 붙여 flatten.
+        - use_current_input=False: 미래노이즈만 flatten.
+
+        Args:
+            noise: (B, Pnn, T, 4)
+            near_current_xyyaw: (B, Pnn, 4)
+            batch_size: B
+            predicted_neighbor_num: Pnn
+
+        Returns:
+            xT:
+                shape:
+                  - use_current_input=True  -> (B, Pnn, (1+T)*4)
+                  - use_current_input=False -> (B, Pnn, T*4)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
 
         if self.config.use_current_input:
-            # xT: (B, Pnn, (1+T)*4)
             xT: torch.Tensor = torch.cat(
                 [
                     near_current_xyyaw[:, :, None, :],  # (B, Pnn, 1, 4)
                     noise,  # (B, Pnn, T, 4)
                 ],
                 dim=2,
-            ).reshape(B, Pnn, -1)
-        else:
-            # xT: (B, Pnn, T*4)
-            xT = noise.reshape(B, Pnn, -1)
+            ).reshape(B, Pnn, -1)  # (B, Pnn, (1+T)*4)
+            return xT
 
-        cond_last_pos: Optional[torch.Tensor] = None
-        # cond_last_pos_norm 안에 유한한 값이 하나라도 있으면 cond-last를 사용
-        if torch.isfinite(cond_last_pos_norm).any():
-            cond_last_pos = cond_last_pos_norm  # (B, Pnn, 4)
+        xT = noise.reshape(B, Pnn, -1)  # (B, Pnn, T*4)
+        return xT
 
-        if cond_last_pos is not None:
-            cond_last_mask: torch.Tensor = compute_cond_last_mask(
-                cond_last_pos)  # (B, Pnn) True=goal 있음
-        else:
-            cond_last_mask = torch.zeros(
-                B,
-                Pnn,
-                dtype=torch.bool,
-                device=xT.device,
-            )  # (B, Pnn)
+    def _build_inference_cond_last_info(
+        self,
+        cond_last_pos_norm: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+        reference_tensor_for_device: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """목표점(cond-last) 텐서와 '목표가 있는 에이전트' 마스크를 만든다.
 
-        def initial_state_constraint(
+        이 함수는 추론(샘플링)에서 목표점 정보를 안전하게 정리하는 역할을 합니다.
+
+        처리 흐름:
+            1) cond_last_pos_norm으로부터 '목표가 실제로 있는지' 마스크를 먼저 만듭니다.
+               - cond_last_mask: (B, Pnn)
+            2) 마스크가 전부 False면(목표가 아무도 없으면),
+               - cond_last_pos는 None으로 내려서 불필요한 텐서 전달을 피합니다.
+            3) 목표가 하나라도 있으면,
+               - cond_last_pos_norm을 샘플 텐서(reference_tensor_for_device)와 같은 dtype/device로 맞춰
+                 cond_last_pos로 반환합니다.
+
+        Args:
+            cond_last_pos_norm (torch.Tensor): 목표점(정규화).
+                shape: (B, Pnn, 4)
+            batch_size (int): 배치 크기 B.
+            predicted_neighbor_num (int): 이웃 수 Pnn.
+            reference_tensor_for_device (torch.Tensor): 결과 텐서의 dtype/device 기준 텐서.
+                shape: 보통 (B, Pnn, F)
+
+        Returns:
+            Tuple[Optional[torch.Tensor], torch.Tensor]:
+                cond_last_pos:
+                    - 목표가 없으면 None
+                    - 목표가 있으면 shape: (B, Pnn, 4)
+                cond_last_mask:
+                    - 목표가 있는 에이전트만 True
+                    - shape: (B, Pnn)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+        assert cond_last_pos_norm.shape[:2] == (B, Pnn), (
+            f"cond_last_pos_norm shape mismatch: got {tuple(cond_last_pos_norm.shape)}, "
+            f"expected (B,Pnn,4)=({B},{Pnn},4)")
+
+        # cond_last_mask: (B, Pnn)
+        cond_last_mask: torch.Tensor = compute_cond_last_mask(
+            cond_last_pos_norm)
+        cond_last_mask = cond_last_mask.to(
+            device=reference_tensor_for_device.device)
+
+        # 목표가 아무도 없으면, 텐서를 들고 다니지 않도록 None 처리
+        if not cond_last_mask.any().item():
+            return None, cond_last_mask
+
+        # 목표가 있으면 dtype/device 정렬해서 전달
+        cond_last_pos: torch.Tensor = _cast_like(
+            cond_last_pos_norm, reference_tensor_for_device)  # (B, Pnn, 4)
+        return cond_last_pos, cond_last_mask
+
+    def _initial_state_constraint(
+            self,
             xt: torch.Tensor,  # (B, Pnn, F)
             t: torch.Tensor,  # () 또는 (1,)
             step: int,
-        ) -> torch.Tensor:
-            """DPM-Solver 중간 단계에서 한 번 호출되는 보정 함수.
+            *,
+            batch_size: int,
+            predicted_neighbor_num: int,
+            near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+            near_past_cur_future_valid: torch.
+        Tensor,  # (B, Pnn, time_len_total)
+            cond_last_pos_norm: Optional[torch.Tensor],  # (B, Pnn, 4) 또는 None
+            cond_last_mask: torch.Tensor,  # (B, Pnn)
+    ) -> torch.Tensor:
+        """샘플링 중간 단계에서 샘플을 '현재/목표/기본 규칙'에 맞게 정리한다.
 
-            - 0번째 프레임을 항상 현재 상태로 맞춰주고
-            - cond-last 정보가 있다면 마지막 프레임에 목표를 덮어쓰고
-            - 저노이즈 구간에서는 feasible 궤적과 조금 섞은 뒤
-            - yaw(cos, sin)을 단위원 위로 다시 정리한다.
+        이 함수는 샘플링이 진행되는 동안 여러 번 호출되며,
+        매번 다음을 수행합니다.
 
-            Args:
-                xt: (B, Pnn, F) 현재 단계의 샘플.
-                t: 현재 시간 값.
-                step: 현재 스텝 번호(사용하지 않지만 시그니처 맞춤용).
+        1) (옵션) 현재 상태 프레임을 강제로 맞춥니다.
+           - use_current_input=True일 때만 현재 프레임이 xt 안에 존재하므로,
+             그 경우 0번째 프레임을 near_current_xyyaw로 덮어씁니다.
+        2) (옵션) 목표점(cond-last)이 있는 에이전트에 대해
+           마지막 프레임의 (x,y)를 목표로 덮어씁니다.
+        3) (옵션) feasible 보정 결과와 일부 섞습니다.
+           - 노이즈가 거의 빠진 구간에서만 섞도록 beta(t)로 조절합니다.
+           - 목표점이 있는 에이전트는 마지막 프레임을 보호합니다.
+        4) (cos, sin)이 단위원(길이 1) 위에 있도록 다시 정리합니다.
 
-            Returns:
-                torch.Tensor: (B, Pnn, F) 보정된 샘플.
-            """
-            # xt_sequence: (B, Pnn, time_len, 4)
-            xt_sequence: torch.Tensor = self._reshape_xt_with_current_state(
-                xt=xt,
-                batch_size=B,
-                predicted_neighbor_num=Pnn,
-                near_current_xyyaw=near_current_xyyaw,  # (B, Pnn, 4)
-            )
+        Args:
+            xt: 현재 단계 샘플(flat).
+                shape: (B, Pnn, F)
+            t: 현재 시간 값.
+                shape: () 또는 (1,)
+            step: 단계 번호(시그니처 맞춤용). 내부 로직에서는 사용하지 않습니다.
+            batch_size: 배치 크기 B.
+            predicted_neighbor_num: 이웃 수 Pnn.
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            near_past_cur_future_valid: 과거~미래 유효 마스크.
+                shape: (B, Pnn, time_len_total)
+            cond_last_pos_norm: 목표점(정규화) 또는 None.
+                - None 또는 shape: (B, Pnn, 4)
+            cond_last_mask: 목표점이 실제로 있는 에이전트 마스크.
+                shape: (B, Pnn)
 
-            # cond-last 정보가 있으면 마지막 프레임에 목표 위치 주입
-            # xt_sequence: (B, Pnn, time_len, 4)
-            xt_sequence = self._inject_last_position_condition_if_available(
-                xt=xt_sequence,
-                cond_last_pos=cond_last_pos_norm,  # (B, Pnn, 4)
-            )
+        Returns:
+            xt_out: 보정 후 flat 샘플.
+                shape: (B, Pnn, F)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
 
-            # 저노이즈 구간에서만 feasible 궤적과 섞기
-            if self.config.use_feasible_blend:
-                assert self.config.use_feasible, (
-                    "use_feasible_blend 옵션은 "
-                    "use_feasible 이 켜져 있을 때만 동작합니다.")
-                feasible_blend_beta_scalar: torch.Tensor = (
-                    self._compute_feasible_blend_beta(
-                        diffusion_time_step=t,  # () 또는 (1,)
-                        reference_tensor_for_device=
-                        xt_sequence,  # (B,Pnn,time_len,4)
-                    ))  # ()
+        # xt_sequence: (B, Pnn, time_len, 4)
+        xt_sequence: torch.Tensor = self._reshape_xt_with_current_state(
+            xt=xt,
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+            near_current_xyyaw=near_current_xyyaw,  # (B, Pnn, 4)
+        )
 
-                if feasible_blend_beta_scalar.detach().item() > 0.0:
-                    xt_sequence = (
-                        self._apply_feasible_blend_with_feasible_projection(
-                            xt_sequence=xt_sequence,  # (B, Pnn, time_len, 4)
-                            near_past_cur_future_valid=(
-                                near_past_cur_future_valid
-                            ),  # (B, Pnn, time_len_total) bool
-                            cond_last_mask=cond_last_mask,  # (B, Pnn)
-                            feasible_blend_beta_scalar=(
-                                feasible_blend_beta_scalar),  # ()
-                        ))
+        # (옵션) 목표점 주입
+        xt_sequence = self._inject_last_position_condition_if_available(
+            xt=xt_sequence,  # (B, Pnn, time_len, 4)
+            cond_last_pos=cond_last_pos_norm,  # (B, Pnn, 4) or None
+        )
 
-            # yaw (cos, sin)을 단위원 위로 다시 정규화
-            xt_sequence = self._project_future_yaw_to_unit_circle(
-                xt_sequence=xt_sequence,)  # (B, Pnn, time_len, 4)
+        # (옵션) feasible 결과와 섞기
+        if getattr(self.config, "use_feasible_blend", False):
+            assert getattr(self.config, "use_feasible", False), (
+                "use_feasible_blend 옵션은 use_feasible 이 켜져 있을 때만 동작합니다.")
 
-            # 다시 평탄화해서 반환: (B, Pnn, F)
-            return xt_sequence.reshape(B, Pnn, -1)
+            beta_scalar: torch.Tensor = self._compute_feasible_blend_beta(
+                diffusion_time_step=t,  # () 또는 (1,)
+                reference_tensor_for_device=xt_sequence,  # (B, Pnn, time_len, 4)
+            )  # shape: ()
 
-        near_agents_past: Optional[torch.Tensor] = inputs[
-            "near_agents_past"]  # (B, Pnn, past_len, 11) 또는 None
-        # DPM-Solver 샘플링
+            if beta_scalar.detach().item() > 0.0:
+                xt_sequence = self._apply_feasible_blend_with_feasible_projection(
+                    xt_sequence=xt_sequence,  # (B, Pnn, time_len, 4)
+                    near_past_cur_future_valid=
+                    near_past_cur_future_valid,  # (B,Pnn,time_len_total)
+                    cond_last_mask=cond_last_mask,  # (B, Pnn)
+                    feasible_blend_beta_scalar=beta_scalar,  # ()
+                )
+
+        # yaw (cos, sin) 정리
+        xt_sequence = self._project_future_yaw_to_unit_circle(
+            xt_sequence=xt_sequence,  # (B, Pnn, time_len, 4)
+        )
+
+        # 다시 flatten: (B, Pnn, F)
+        return xt_sequence.reshape(B, Pnn, -1)
+
+    def _build_inference_correcting_xt_fn(
+        self,
+        batch_size: int,
+        predicted_neighbor_num: int,
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        near_past_cur_future_valid: torch.Tensor,  # (B, Pnn, time_len_total)
+        cond_last_pos_norm: Optional[torch.Tensor],  # (B, Pnn, 4) 또는 None
+        cond_last_mask: torch.Tensor,  # (B, Pnn)
+    ) -> Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]:
+        """샘플링 루프가 요구하는 시그니처(xt,t,step) 형태의 보정 함수를 만든다.
+
+        내부적으로는 self._initial_state_constraint를 사용하고,
+        batch/마스크/현재상태 같은 '고정 정보'는 partial로 미리 묶어서 전달합니다.
+
+        Args:
+            batch_size: B
+            predicted_neighbor_num: Pnn
+            near_current_xyyaw: (B, Pnn, 4)
+            near_past_cur_future_valid: (B, Pnn, time_len_total)
+            cond_last_pos_norm: (B, Pnn, 4) 또는 None
+            cond_last_mask: (B, Pnn)
+
+        Returns:
+            correcting_xt_fn:
+                callable(xt, t, step) -> xt_out
+                xt: (B, Pnn, F), xt_out: (B, Pnn, F)
+        """
+        return partial(
+            self._initial_state_constraint,
+            batch_size=batch_size,
+            predicted_neighbor_num=predicted_neighbor_num,
+            near_current_xyyaw=near_current_xyyaw,
+            near_past_cur_future_valid=near_past_cur_future_valid,
+            cond_last_pos_norm=cond_last_pos_norm,
+            cond_last_mask=cond_last_mask,
+        )
+
+    def _run_dpm_sampler_for_inference(
+        self,
+        xT: torch.Tensor,  # (B, Pnn, F)
+        near_agents_past: Optional[
+            torch.Tensor],  # (B, Pnn, past_len, 11) 또는 None
+        scene_encoding_token: torch.Tensor,  # (B, token_num, D)
+        scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
+        ego_fut_global: torch.Tensor,  # (B, D)
+        near_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+        near_past_cur_future_valid: torch.
+        Tensor,  # (B, Pnn, time_len+future_len)
+        route_known_mask: torch.Tensor,  # (B, Pnn)
+        near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        near_past: torch.Tensor,  # (B, Pnn, past_len, 11)
+        inputs: Dict[str, torch.Tensor],
+        correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
+                                   torch.Tensor],
+    ) -> torch.Tensor:
+        """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다.
+
+        Args:
+            xT: 시작 샘플(flat).
+                shape: (B, Pnn, F)
+            near_agents_past: (B, Pnn, past_len, 11) 또는 None
+            scene_encoding_token: (B, token_num, D)
+            scene_encoding_token_mask: (B, token_num)
+            ego_fut_global: (B, D)
+            near_agents_route_lane_emb: (B, Pnn, D)
+            near_past_cur_future_valid: (B, Pnn, time_len+future_len)
+            route_known_mask: (B, Pnn)
+            near_class_one_hot: (B, Pnn, 3)
+            near_current_xyyaw: (B, Pnn, 4)
+            near_past: (B, Pnn, past_len, 11)
+            inputs: 배치 dict (가이던스 함수에 전달).
+            correcting_xt_fn: callable(xt,t,step)->xt_out
+
+        Returns:
+            x0:
+                샘플링 결과(flat).
+                shape: (B, Pnn, F)
+        """
         x0: torch.Tensor = dpm_sampler(
             self.dit,
             xT.float(),  # (B, Pnn, F)
             other_model_params={
-                "near_agents_past":
-                    near_agents_past,  # (B, Pnn, past_len, 11) 또는 None
-                "cross_c": scene_encoding_token,  # (B, token_num, D)
-                "ego_fut_global": ego_fut_global,  # (B, D)
-                "near_agents_route_lane_emb":
-                    near_agents_route_lane_emb,  # (B, Pnn, D)
-                "near_past_cur_future_valid":
-                    near_past_cur_future_valid,  # (B, Pnn, time_len+future_len)
-                "cross_mask": scene_encoding_token_mask,  # (B, token_num)
-                "route_known_mask": route_known_mask,  # (B, Pnn)
-                "near_class_one_hot": near_class_one_hot,  # (B, Pnn, 3)
-                "near_current_xyyaw": near_current_xyyaw,  # (B, Pnn, 4)
-                "near_past": near_past,  # (B, Pnn, past_len, 11)
+                "near_agents_past": near_agents_past,
+                "cross_c": scene_encoding_token,
+                "ego_fut_global": ego_fut_global,
+                "near_agents_route_lane_emb": near_agents_route_lane_emb,
+                "near_past_cur_future_valid": near_past_cur_future_valid,
+                "cross_mask": scene_encoding_token_mask,
+                "route_known_mask": route_known_mask,
+                "near_class_one_hot": near_class_one_hot,
+                "near_current_xyyaw": near_current_xyyaw,
+                "near_past": near_past,
             },
             dpm_solver_params={
-                "correcting_xt_fn": initial_state_constraint,
+                "correcting_xt_fn": correcting_xt_fn,
             },
             model_wrapper_params={
                 "classifier_fn":
@@ -1066,63 +1313,285 @@ class Decoder(nn.Module):
                     ),
             },
         )
+        return x0
 
-        x0 = x0.to(xT.dtype)
+    def _reshape_inference_x0_to_sequence(
+        self,
+        x0: torch.Tensor,  # (B, Pnn, F)
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> torch.Tensor:
+        """샘플링 결과 x0(flat)를 (B, Pnn, 1+T, 4) 형태로 복원한다.
+
+        Args:
+            x0: 샘플링 결과(flat).
+                shape: (B, Pnn, F)
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            batch_size: B
+            predicted_neighbor_num: Pnn
+
+        Returns:
+            x0_seq:
+                shape: (B, Pnn, 1+T, 4)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
 
         if self.config.use_past_dit_input:
-            # x0: (B, Pnn, (1+past_len)+T, 4)
-            x0 = x0.reshape(
+            x0_seq = x0.reshape(
                 B,
                 Pnn,
                 self.config.time_len + self._future_len,
                 4,
             )
-            # x0 : (B, Pnn, 1+T, 4) 부분만 사용
-            x0 = x0[:, :, -(1 + self._future_len):, :]
-        else:
-            if self.config.use_current_input:
-                # x0: (B, Pnn, (1+T)*4)
-                assert x0.shape == (
-                    B,
-                    Pnn,
-                    (1 + self._future_len) * 4,
-                )
-                x0 = x0.reshape(B, Pnn, -1, 4)  # (B, Pnn, 1+T, 4)
-            else:
-                # x0: (B, Pnn, T*4)
-                assert x0.shape == (B, Pnn, self._future_len * 4)
-                x0 = torch.cat(
-                    [
-                        near_current_xyyaw.unsqueeze(2),  # (B, Pnn, 1, 4)
-                        x0.reshape(B, Pnn, -1, 4),  # (B, Pnn, T, 4)
-                    ],
-                    dim=2,
-                )  # (B, Pnn, 1+T, 4)
+            x0_seq = x0_seq[:, :, -(1 + self._future_len):, :]  # (B,Pnn,1+T,4)
+            return x0_seq
 
-        # 비정규화 궤적
-        unnorm_x0: torch.Tensor = self._state_normalizer.inverse(
-            x0)  # (B, Pnn, 1+T, 4)
-        unnorm_x0[near_current_mask] = 0.0  # 패딩 슬롯은 0으로 정리
+        if self.config.use_current_input:
+            assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
+            x0_seq = x0.reshape(B, Pnn, -1, 4)  # (B,Pnn,1+T,4)
+            return x0_seq
 
-        if self.config.use_feasible:
-            integrated_trajectory: torch.Tensor = (
-                self.dit.dit_returns.integrated_trajectory)  # (B, Pnn, T, 4)
-            integrated_trajectory = torch.cat(
-                [
-                    near_current_xyyaw.unsqueeze(2),  # (B, Pnn, 1, 4)
-                    integrated_trajectory,  # (B, Pnn, T, 4)
-                ],
-                dim=2,
-            )  # (B, Pnn, 1+T, 4)
+        assert x0.shape == (B, Pnn, self._future_len * 4)
+        x0_seq = torch.cat(
+            [
+                near_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
+                x0.reshape(B, Pnn, -1, 4),  # (B,Pnn,T,4)
+            ],
+            dim=2,
+        )  # (B,Pnn,1+T,4)
+        return x0_seq
 
-            unnorm_integrated_trajectory: torch.Tensor = (
-                self._state_normalizer.inverse(integrated_trajectory)
-            )  # (B, Pnn, 1+T, 4)
-            unnorm_integrated_trajectory[near_current_mask] = 0.0
+    def _inverse_normalize_and_cleanup_padding(
+            self,
+            x_norm: torch.Tensor,  # (B, Pnn, 1+T, 4)
+            near_current_mask: torch.Tensor,  # (B, Pnn)
+    ) -> torch.Tensor:
+        """정규화된 궤적을 역정규화하고, 패딩 슬롯은 0으로 정리한다.
 
-            return_["integrated_trajectory"] = unnorm_integrated_trajectory
+        Args:
+            x_norm: 정규화된 궤적.
+                shape: (B, Pnn, 1+T, 4)
+            near_current_mask: True=무효 에이전트.
+                shape: (B, Pnn)
 
-        return_["score"] = unnorm_x0  # (B, Pnn, 1+T, 4)
+        Returns:
+            x_denorm:
+                역정규화된 궤적.
+                shape: (B, Pnn, 1+T, 4)
+        """
+        x_denorm: torch.Tensor = self._state_normalizer.inverse(
+            x_norm)  # (B,Pnn,1+T,4)
+        x_denorm[near_current_mask] = 0.0
+        return x_denorm
+
+    def _append_inference_feasible_outputs(
+            self,
+            outputs: Dict[str, torch.Tensor],
+            near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+            near_current_mask: torch.Tensor,  # (B, Pnn)
+    ) -> None:
+        """추론 모드에서 feasible 출력(integrated_trajectory)을 outputs에 추가한다.
+
+        Args:
+            outputs: 반환 dict (in-place 업데이트).
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            near_current_mask: True=무효 에이전트.
+                shape: (B, Pnn)
+
+        Returns:
+            None
+        """
+        if not getattr(self.config, "use_feasible", False):
+            return
+
+        # integrated_trajectory: (B, Pnn, T, 4)  (정규화 상태)
+        integrated_trajectory: torch.Tensor = self.dit.dit_returns.integrated_trajectory
+        integrated_trajectory = torch.cat(
+            [near_current_xyyaw.unsqueeze(2), integrated_trajectory],
+            dim=2,
+        )  # (B, Pnn, 1+T, 4)
+
+        unnorm_integrated: torch.Tensor = self._state_normalizer.inverse(
+            integrated_trajectory)
+        unnorm_integrated[near_current_mask] = 0.0
+
+        outputs["integrated_trajectory"] = unnorm_integrated
+
+    def _forward_training_mode(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        scene_encoding_token: torch.Tensor,
+        scene_encoding_token_mask: torch.Tensor,
+        ego_fut_global: torch.Tensor,
+        near_agents_route_lane_emb: torch.Tensor,
+        route_known_mask: torch.Tensor,
+        near_past: torch.Tensor,
+        near_current_xyyaw: torch.Tensor,
+        near_current_mask: torch.Tensor,
+        near_past_cur_future_valid: torch.Tensor,
+        near_class_one_hot: torch.Tensor,
+        cond_last_pos_norm: torch.Tensor,
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> Dict[str, torch.Tensor]:
+        """훈련 모드에서 한 배치에 대해 decoder 를 한 번 돌린다."""
+        return_: Dict[str, torch.Tensor] = {}
+
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+
+        # 1) DiT 입력 준비 (flatten + 목표점 주입 옵션)
+        xT_input_flat, near_cur_norm_xT = self._build_training_dit_inputs(
+            inputs=inputs,
+            near_current_mask=near_current_mask,  # (B, Pnn)
+            cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )
+
+        # 2) DiT 1회 호출
+        diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
+        near_agents_past: Optional[torch.Tensor] = inputs[
+            "near_agents_past"]  # (B,Pnn,past_len,11) 또는 None
+
+        score_flat: torch.Tensor = self._run_dit_training_forward(
+            near_agents_past=near_agents_past,
+            xT_input_flat=xT_input_flat,  # (B, Pnn, F)
+            diffusion_time=diffusion_time,  # (B,)
+            scene_encoding_token=scene_encoding_token,  # (B, token_num, D)
+            scene_encoding_token_mask=scene_encoding_token_mask,  # (B, token_num)
+            ego_fut_global=ego_fut_global,  # (B, D)
+            near_agents_route_lane_emb=near_agents_route_lane_emb,  # (B, Pnn, D)
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # (B, Pnn, time_len+future_len)
+            route_known_mask=route_known_mask,  # (B, Pnn)
+            near_class_one_hot=near_class_one_hot,  # (B, Pnn, 3)
+            near_cur_norm_xT=near_cur_norm_xT,  # (B, Pnn, 4)
+            near_past=near_past,  # (B, Pnn, past_len, 11)
+        )
+
+        # 3) (B,Pnn,F_out) -> (B,Pnn,1+T,4)
+        score_seq: torch.Tensor = self._reshape_training_score_to_sequence(
+            score_flat=score_flat,
+            near_current_xyyaw=near_current_xyyaw,  # (B, Pnn, 4)
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )
+        return_["score"] = score_seq
+
+        # 4) feasible 출력 추가(옵션)
+        self._append_training_feasible_outputs(
+            outputs=return_,
+            near_current_xyyaw=near_current_xyyaw,  # (B, Pnn, 4)
+        )
+
+        return return_
+
+    def _forward_inference_mode(
+        self,
+        inputs: Dict[str, torch.Tensor],
+        scene_encoding_token: torch.Tensor,
+        scene_encoding_token_mask: torch.Tensor,
+        ego_fut_global: torch.Tensor,
+        near_agents_route_lane_emb: torch.Tensor,
+        route_known_mask: torch.Tensor,
+        near_past: torch.Tensor,
+        near_current_xyyaw: torch.Tensor,
+        near_current_mask: torch.Tensor,
+        near_past_cur_future_valid: torch.Tensor,
+        near_class_one_hot: torch.Tensor,
+        cond_last_pos_norm: torch.Tensor,
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> Dict[str, torch.Tensor]:
+        """추론/평가 모드에서 한 배치에 대해 decoder 를 한 번 돌린다."""
+        return_: Dict[str, torch.Tensor] = {}
+
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+
+        # 1) 시작 노이즈 및 xT(flat) 생성
+        noise: torch.Tensor = self._sample_inference_noise(
+            near_current_xyyaw=near_current_xyyaw,  # (B,Pnn,4)
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )  # (B,Pnn,T,4)
+
+        xT: torch.Tensor = self._build_inference_xT_from_noise(
+            noise=noise,  # (B,Pnn,T,4)
+            near_current_xyyaw=near_current_xyyaw,  # (B,Pnn,4)
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )  # (B,Pnn,F)
+
+        # 2) 목표점(cond-last) 정보 준비
+        cond_last_pos, cond_last_mask = self._build_inference_cond_last_info(
+            cond_last_pos_norm=cond_last_pos_norm,  # (B,Pnn,4)
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+            reference_tensor_for_device=xT,
+        )
+
+        # 3) 샘플링 단계에서 쓸 보정 함수 만들기(메서드 + partial)
+        correcting_xt_fn = self._build_inference_correcting_xt_fn(
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+            near_current_xyyaw=near_current_xyyaw,  # (B,Pnn,4)
+            near_past_cur_future_valid=
+            near_past_cur_future_valid,  # (B,Pnn,time_total)
+            cond_last_pos_norm=cond_last_pos,  # (B,Pnn,4) or None
+            cond_last_mask=cond_last_mask,  # (B,Pnn)
+        )
+
+        # 4) dpm_sampler 실행
+        near_agents_past: Optional[torch.Tensor] = inputs[
+            "near_agents_past"]  # (B,Pnn,past_len,11) 또는 None
+
+        x0: torch.Tensor = self._run_dpm_sampler_for_inference(
+            xT=xT,  # (B,Pnn,F)
+            near_agents_past=near_agents_past,  # (B,Pnn,past_len,11) or None
+            scene_encoding_token=scene_encoding_token,
+            scene_encoding_token_mask=scene_encoding_token_mask,
+            ego_fut_global=ego_fut_global,
+            near_agents_route_lane_emb=near_agents_route_lane_emb,
+            near_past_cur_future_valid=near_past_cur_future_valid,
+            route_known_mask=route_known_mask,
+            near_class_one_hot=near_class_one_hot,
+            near_current_xyyaw=near_current_xyyaw,
+            near_past=near_past,
+            inputs=inputs,
+            correcting_xt_fn=correcting_xt_fn,
+        )
+
+        # 원래 코드와 동일하게 dtype 맞춤
+        x0 = x0.to(xT.dtype)
+
+        # 5) (B,Pnn,F) -> (B,Pnn,1+T,4) 복원
+        x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
+            x0=x0,
+            near_current_xyyaw=near_current_xyyaw,
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )  # (B,Pnn,1+T,4)
+
+        # 6) 역정규화 및 패딩 정리
+        unnorm_x0: torch.Tensor = self._inverse_normalize_and_cleanup_padding(
+            x_norm=x0_seq_norm,
+            near_current_mask=near_current_mask,
+        )  # (B,Pnn,1+T,4)
+
+        # 7) feasible 출력(옵션)
+        self._append_inference_feasible_outputs(
+            outputs=return_,
+            near_current_xyyaw=near_current_xyyaw,
+            near_current_mask=near_current_mask,
+        )
+
+        return_["score"] = unnorm_x0
         return return_
 
     def forward(
@@ -1375,6 +1844,193 @@ class DiT(nn.Module):
         x = pad_input(x_unpad, indices, B, Pnn)  # (B, Pnn, D)
         return x
 
+    def _select_tensors_for_feasible_projection(
+        self,
+        x: torch.Tensor,  # (B, Pnn, F_out)
+        near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        near_past_cur_future_valid: torch.Tensor,  # (B, Pnn, time_len_total)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """FeasibleProjector에 넣기 전, 텐서의 '그래디언트 유지/차단' 방식을 정한다.
+
+        - feasible_grad_to_dit=True:
+            학습이 가능한 경로를 유지하기 위해 x/near_current를 그대로 사용하고 float32로만 바꿉니다.
+        - feasible_grad_to_dit=False:
+            FeasibleProjector 쪽으로는 학습 신호가 흐르지 않게 detach한 뒤 float32로 바꿉니다.
+
+        Args:
+            x: DiT 본체 출력(flat).
+                shape: (B, Pnn, F_out)
+            near_current_xyyaw: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            near_past_cur_future_valid: 과거~미래 유효 마스크.
+                shape: (B, Pnn, time_len_total)
+
+        Returns:
+            x_for_feasible:
+                shape: (B, Pnn, F_out), dtype=float32
+            near_current_xyyaw_for_feasible:
+                shape: (B, Pnn, 4), dtype=float32
+            near_past_cur_future_valid_for_feasible:
+                shape: (B, Pnn, time_len_total)
+        """
+        if getattr(self.config, "feasible_grad_to_dit", False):
+            x_for_feasible = x.float()
+            near_current_xyyaw_for_feasible = near_current_xyyaw.float()
+            near_past_cur_future_valid_for_feasible = near_past_cur_future_valid
+        else:
+            x_for_feasible = x.detach().float()
+            near_current_xyyaw_for_feasible = near_current_xyyaw.detach().float(
+            )
+            near_past_cur_future_valid_for_feasible = near_past_cur_future_valid.detach(
+            )
+        return (
+            x_for_feasible,
+            near_current_xyyaw_for_feasible,
+            near_past_cur_future_valid_for_feasible,
+        )
+
+    def _build_diffusion_trajectory_for_feasible_projection(
+        self,
+        x_for_feasible: torch.Tensor,  # (B, Pnn, F_out)
+        near_current_xyyaw_for_feasible: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> torch.Tensor:
+        """FeasibleProjector 입력으로 쓸 (현재+미래) 궤적 텐서를 만든다.
+
+        이 함수는 x(flat)를 (B, Pnn, 1+T, 4)로 바꾸고,
+        첫 프레임(현재)을 near_current_xyyaw로 맞춰줍니다.
+
+        Args:
+            x_for_feasible: DiT 출력(flat).
+                shape: (B, Pnn, F_out)
+            near_current_xyyaw_for_feasible: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            batch_size: B
+            predicted_neighbor_num: Pnn
+
+        Returns:
+            diffusion_trajectory:
+                shape: (B, Pnn, 1+T, 4)
+        """
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+
+        # diffusion_trajectory: (B, Pnn, 1+T, 4)
+        if self.config.use_past_dit_input:
+            # x_for_feasible: (B, Pnn, (past_len + 1+T)*4) 같은 형태
+            diffusion_trajectory = (x_for_feasible.reshape(
+                B, Pnn, -1, 4).contiguous()[:, :, -(self._future_len + 1):, :]
+                                   )  # (B, Pnn, 1+T, 4)
+            diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_for_feasible
+            return diffusion_trajectory.contiguous()
+
+        if self.config.use_current_input:
+            diffusion_trajectory = x_for_feasible.reshape(
+                B, Pnn, -1, 4).contiguous()  # (B,Pnn,1+T,4)
+            diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_for_feasible
+            return diffusion_trajectory.contiguous()
+
+        # use_current_input=False: x_for_feasible는 미래만 (B,Pnn,T*4)
+        diffusion_trajectory = torch.cat(
+            [
+                near_current_xyyaw_for_feasible.unsqueeze(2),  # (B,Pnn,1,4)
+                x_for_feasible.reshape(B, Pnn, -1, 4),  # (B,Pnn,T,4)
+            ],
+            dim=2,
+        ).contiguous()  # (B,Pnn,1+T,4)
+        return diffusion_trajectory
+
+    def _compute_feasible_low_t_mask(
+            self,
+            diffusion_time: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        """현재 시간 값으로 'feasible을 돌릴 배치' 마스크를 만든다.
+
+        - diffusion_time이 작을수록(노이즈가 적다고 보는 구간) feasible을 적극 적용합니다.
+        - direct loss를 쓰지 않는 설정에서는 모든 배치에 대해 feasible을 돌리기 위해
+          threshold를 1.0으로 둡니다(기존 로직 유지).
+
+        Args:
+            diffusion_time: 확산 시간.
+                shape: (B,)
+
+        Returns:
+            low_t_mask:
+                feasible을 실제로 실행할 배치만 True.
+                shape: (B,)
+        """
+        t_threshold: float = float(self.config.feasible_learn_noise_thresh)
+        if not getattr(self.config, "use_direct_loss", False):
+            t_threshold = 1.0
+        low_t_mask: torch.Tensor = (diffusion_time <= t_threshold)  # (B,)
+        return low_t_mask
+
+    def _maybe_replace_x_with_integrated_trajectory_for_eval(
+        self,
+        x: torch.Tensor,  # (B, Pnn, F_out)
+        integrated_trajectory: torch.Tensor,  # (B, Pnn, T, 4)
+        near_current_xyyaw_for_feasible: torch.Tensor,  # (B, Pnn, 4)
+        batch_size: int,
+        predicted_neighbor_num: int,
+    ) -> torch.Tensor:
+        """평가 모드에서 integrated_trajectory를 최종 출력으로 쓸지 결정한다.
+
+        기존 규칙(그대로 유지):
+            - training 모드이거나 direct loss 사용 시: x 그대로 반환
+            - 평가 모드 + direct loss 미사용 시:
+                * past_dit_input: x의 과거+현재 부분 + integrated_trajectory를 이어붙여 반환
+                * current_input: 현재 + integrated_trajectory
+                * current_input=False: integrated_trajectory만 반환
+
+        Args:
+            x: DiT 출력(flat).
+                shape: (B, Pnn, F_out)
+            integrated_trajectory: feasible 적분 결과(정규화 상태).
+                shape: (B, Pnn, T, 4)
+            near_current_xyyaw_for_feasible: 현재 상태(정규화).
+                shape: (B, Pnn, 4)
+            batch_size: B
+            predicted_neighbor_num: Pnn
+
+        Returns:
+            x_out:
+                최종 출력(flat).
+                shape: (B, Pnn, F_out)
+        """
+        if self.training or getattr(self.config, "use_direct_loss", False):
+            return x
+
+        B: int = batch_size
+        Pnn: int = predicted_neighbor_num
+
+        if self.config.use_past_dit_input:
+            # x의 과거+현재 부분만 유지한 뒤, 미래를 integrated_trajectory로 교체
+            x_past_cur = (
+                x.reshape(B, Pnn, -1,
+                          4).contiguous()[:, :, :(self.config.past_len + 1), :]
+            )  # (B, Pnn, past_len+1, 4)
+
+            x_new = torch.cat(
+                [x_past_cur, integrated_trajectory],
+                dim=2,
+            )  # (B, Pnn, past_len+1+T, 4)
+
+            return x_new.reshape(B, Pnn, -1)
+
+        if self.config.use_current_input:
+            x_new = torch.cat(
+                [
+                    near_current_xyyaw_for_feasible.unsqueeze(2),  # (B,Pnn,1,4)
+                    integrated_trajectory,  # (B,Pnn,T,4)
+                ],
+                dim=2,
+            )  # (B,Pnn,1+T,4)
+            return x_new.reshape(B, Pnn, -1)
+
+        # use_current_input=False: 미래만 반환
+        return integrated_trajectory.reshape(B, Pnn, -1)
+
     @property
     def model_type(self):
         return self._model_type
@@ -1538,8 +2194,7 @@ class DiT(nn.Module):
 
     def _forward_x_start_branch(
         self,
-        x: torch.
-        Tensor,  # (B, Pnn, F_out) (F_out=T*4 또는 (1+T)*4 또는 (past_len+1+T)*4)
+        x: torch.Tensor,  # (B, Pnn, F_out)
         diffusion_time: torch.Tensor,  # (B,)
         near_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
         near_past_cur_future_valid: torch.
@@ -1549,136 +2204,54 @@ class DiT(nn.Module):
         B: int,
         Pnn: int,
     ) -> torch.Tensor:
-        """model_type 이 'x_start' 인 경우 출력 텐서를 만드는 함수.
-
-        - use_feasible 가 꺼져 있으면 x 를 그대로 반환한다.
-        - use_feasible 가 켜져 있으면
-          - low-t 구간에 대해 FeasibleProjector 를 돌려
-          - integrated_trajectory 를 dit_returns 에 저장하고
-          - 평가 모드에서는 integrated_trajectory 기반 궤적으로 x 를 교체한다.
-
-        Args:
-            x (torch.Tensor):
-                DiT 본체 출력.
-                shape: (B, Pnn, F_out)
-            diffusion_time (torch.Tensor):
-                확산 시간 t.
-                shape: (B,)
-            near_current_xyyaw (torch.Tensor):
-                현재 프레임 상태(x, y, cos, sin).
-                shape: (B, Pnn, 4)
-            near_past_cur_future_valid (torch.Tensor):
-                과거~미래 유효 마스크.
-                shape: (B, Pnn, 1+past_len+future_len)
-            near_past (torch.Tensor):
-                과거 궤적.
-                shape: (B, Pnn, past_len, 11)
-            near_class_one_hot (torch.Tensor):
-                에이전트 종류 one-hot.
-                shape: (B, Pnn, 3)
-            B (int):
-                배치 크기.
-            Pnn (int):
-                에이전트 수.
-
-        Returns:
-            torch.Tensor:
-                x_start 추정값 또는 feasible 보정 후 궤적(flatten).
-                shape: (B, Pnn, F_out)  # (F_out=T*4 또는 (1+T)*4 또는 (past_len+1+T)*4)
-        """
+        """model_type 이 'x_start' 인 경우 출력 텐서를 만드는 함수."""
         # 기본 경로: feasible 을 쓰지 않을 때
-        if not self.config.use_feasible:
+        if not getattr(self.config, "use_feasible", False):
             return x
 
-        # FeasibleProjector 를 위한 분기 (gradient 경로 유지 여부)
-        if self.config.feasible_grad_to_dit:
-            x_for_feasible = x.float()  # (B, Pnn, F_out)
-            near_current_xyyaw_for_feasible = near_current_xyyaw.float(
-            )  # (B,Pnn,4)
-            near_past_cur_future_valid_for_feasible = near_past_cur_future_valid
-        else:
-            x_for_feasible = x.detach().float()  # (B, Pnn, F_out)
-            near_current_xyyaw_for_feasible = near_current_xyyaw.detach().float(
-            )  # (B, Pnn, 4)
-            near_past_cur_future_valid_for_feasible = \
-                near_past_cur_future_valid.detach()
+        # 1) feasible에 넣을 텐서 준비(그래디언트 유지/차단 포함)
+        (
+            x_for_feasible,  # (B,Pnn,F_out) float32
+            near_current_xyyaw_for_feasible,  # (B,Pnn,4) float32
+            near_past_cur_future_valid_for_feasible,  # (B,Pnn,time_len_total)
+        ) = self._select_tensors_for_feasible_projection(
+            x=x,
+            near_current_xyyaw=near_current_xyyaw,
+            near_past_cur_future_valid=near_past_cur_future_valid,
+        )
 
-        # diffusion_trajectory: (B, Pnn, 1+T, 4)
-        if self.config.use_past_dit_input:
-            # x_for_feasible: (B, Pnn,  (past_len + 1+T)*4)
-            diffusion_trajectory = x_for_feasible.reshape(
-                B, Pnn, -1,
-                4).contiguous()[:, :,
-                                -(self._future_len + 1):, :]  # (B, Pnn, 1+T, 4)
-            diffusion_trajectory[:, :, 0, :] = near_current_xyyaw_for_feasible
-        else:
-            if self.config.use_current_input:
-                diffusion_trajectory = x_for_feasible.reshape(
-                    B, Pnn, -1, 4).contiguous()  # (B, Pnn, 1+T, 4)
-                diffusion_trajectory[:, :,
-                                     0, :] = near_current_xyyaw_for_feasible
-            else:
-                diffusion_trajectory = torch.cat(
-                    [
-                        near_current_xyyaw_for_feasible.unsqueeze(
-                            2),  # (B, Pnn, 1, 4)
-                        x_for_feasible.reshape(B, Pnn, -1, 4),  # (B, Pnn, T, 4)
-                    ],
-                    dim=2,
-                ).contiguous()  # (B, Pnn, 1+T, 4)
+        # 2) (현재+미래) 궤적 텐서 만들기: (B,Pnn,1+T,4)
+        diffusion_trajectory: torch.Tensor = self._build_diffusion_trajectory_for_feasible_projection(
+            x_for_feasible=x_for_feasible,
+            near_current_xyyaw_for_feasible=near_current_xyyaw_for_feasible,
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )
 
-        # t_threshold 설정
-        t_threshold: float = float(self.config.feasible_learn_noise_thresh)
-        if not self.config.use_direct_loss:
-            t_threshold = 1.0
-        # low_t_mask: (B,)  True=저노이즈
-        low_t_mask: torch.Tensor = (diffusion_time <= t_threshold)
+        # 3) low-t 마스크 계산
+        low_t_mask: torch.Tensor = self._compute_feasible_low_t_mask(
+            diffusion_time=diffusion_time,  # (B,)
+        )  # (B,)
 
-        # FeasibleProjector 호출 (self.dit_returns 갱신)
+        # 4) FeasibleProjector 실행(dit_returns 갱신)
         self._feasible_projection(
-            diffusion_trajectory=diffusion_trajectory,  # (B, Pnn, 1+T, 4)
-            near_class_one_hot=near_class_one_hot,  # (B, Pnn, 3)
+            diffusion_trajectory=diffusion_trajectory,  # (B,Pnn,1+T,4)
+            near_class_one_hot=near_class_one_hot,  # (B,Pnn,3)
             near_past_cur_future_valid=near_past_cur_future_valid_for_feasible,
-            near_past=near_past,  # (B, Pnn, past_len, 11)
+            near_past=near_past,  # (B,Pnn,past_len,11)
             feasible_low_t_mask=low_t_mask,  # (B,)
         )
 
-        # 평가 모드 + direct loss 미사용이면 integrated_trajectory 로 x 교체
-        if (not self.training) and (not self.config.use_direct_loss):
-            # integrated_trajectory: (B, Pnn, T, 4)
-            integrated_trajectory: torch.Tensor = \
-                self.dit_returns.integrated_trajectory
-            if self.config.use_past_dit_input:
-                # x_new: (B, Pnn, (past_len + 1+T), 4)
-                x_new = x.reshape(
-                    B, Pnn, -1,
-                    4).contiguous()[:, :, :(self.config.past_len +
-                                            1), :]  # (B, Pnn, past_len+1, 4)
-                x_new = torch.cat(
-                    [
-                        x_new,
-                        integrated_trajectory,
-                    ],
-                    dim=2,
-                )  # (B, Pnn, past_len+1+T, 4)
-            else:
-                if self.config.use_current_input:
-                    x_new = torch.cat(
-                        [
-                            near_current_xyyaw_for_feasible.unsqueeze(2),
-                            integrated_trajectory,
-                        ],
-                        dim=2,
-                    )  # (B, Pnn, 1+T, 4)
-                else:
-                    x_new = integrated_trajectory  # (B, Pnn, T, 4)
-
-            # flatten: (B, Pnn, F_out)
-            x_new = x_new.reshape(B, Pnn, -1)
-            return x_new
-
-        # 학습 중이거나 direct loss 를 쓰는 경우: x 그대로 사용
-        return x
+        # 5) 평가 모드에서는 integrated_trajectory로 출력 교체(옵션, 기존 로직 유지)
+        integrated_trajectory: torch.Tensor = self.dit_returns.integrated_trajectory  # (B,Pnn,T,4)
+        x_out: torch.Tensor = self._maybe_replace_x_with_integrated_trajectory_for_eval(
+            x=x,
+            integrated_trajectory=integrated_trajectory,
+            near_current_xyyaw_for_feasible=near_current_xyyaw_for_feasible,
+            batch_size=B,
+            predicted_neighbor_num=Pnn,
+        )
+        return x_out
 
     def _compute_near_current_valid_and_mask(
         self,
