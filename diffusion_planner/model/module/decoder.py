@@ -34,6 +34,86 @@ from typing import Iterator
 import torch
 
 
+def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
+    """입력 마스크를 bool 텐서로 바꿉니다.
+
+    이 함수는 "마스크 의미(예: True=유효, True=패딩)"를 바꾸지 않습니다.
+    단지 dtype만 bool로 통일합니다.
+
+    Args:
+        mask (torch.Tensor):
+            입력 마스크 텐서.
+            - shape: 임의
+            - dtype: bool 또는 0/1 형태의 int/float 텐서일 수 있습니다.
+        threshold (float):
+            float 마스크일 때 True로 볼 기준값.
+            기본은 0.5 입니다.
+
+    Returns:
+        torch.Tensor:
+            bool 마스크 텐서.
+            shape: 입력과 동일
+    """
+    if mask.dtype == torch.bool:
+        return mask
+    if torch.is_floating_point(mask):
+        return mask > float(threshold)
+    return mask != 0
+
+
+def _compute_time_padding_mask_from_state(
+    agent_states: torch.Tensor,  # (B, Pnn, time_len, D)
+    check_dims: int = 8,
+    eps: float = 0.0,
+) -> torch.Tensor:
+    """에이전트 상태 시퀀스에서 '빈 슬롯(패딩)'을 time 축으로 판단하는 마스크를 만듭니다.
+
+    판단 규칙(프레임 단위)
+    ----------------------
+    아래 중 하나라도 만족하면 그 프레임은 패딩(True)으로 봅니다.
+      1) check_dims 범위 안에 NaN/inf가 섞여 있음
+      2) check_dims 범위 값들이 전부 0(또는 eps 이하)로 비어 있음
+
+    Args:
+        agent_states (torch.Tensor):
+            에이전트 상태 시퀀스.
+            shape: (B, Pnn, time_len, D)
+        check_dims (int):
+            패딩 판정에 사용할 마지막 차원 D의 앞부분 길이.
+            보통 (x,y,cos,sin,vx,vy,w,l) 같은 연속값 영역만 체크하려고 8을 사용합니다.
+        eps (float):
+            "전부 0" 판정을 조금 느슨하게 하고 싶을 때 쓰는 값.
+            기본은 0.0 입니다.
+
+    Returns:
+        torch.Tensor:
+            패딩 마스크(True=패딩, False=유효).
+            shape: (B, Pnn, time_len)
+
+    Raises:
+        ValueError:
+            agent_states shape이 4D가 아니면 발생합니다.
+    """
+    if agent_states.dim() != 4:
+        raise ValueError(
+            f"agent_states must be 4D (B,Pnn,time_len,D), got {tuple(agent_states.shape)}"
+        )
+
+    last_dim: int = int(agent_states.size(-1))
+    used_dims: int = int(min(max(check_dims, 1), last_dim))
+
+    state_slice = agent_states[..., :used_dims]  # (B,Pnn,time_len,used_dims)
+
+    # NaN/inf 방어
+    is_finite = torch.isfinite(state_slice).all(dim=-1)  # (B,Pnn,time_len)
+
+    # 0(또는 거의 0) 방어
+    is_non_zero = state_slice.abs().sum(dim=-1) > float(eps)  # (B,Pnn,time_len)
+
+    is_valid = is_finite & is_non_zero  # (B,Pnn,time_len)
+    padding_mask = ~is_valid
+    return padding_mask
+
 def compute_cond_last_mask(cond_last_pos: torch.Tensor) -> torch.Tensor:
     """마지막 위치 조건(cond_last_pos)이 '실제로 존재하는지'를 판단하는 마스크를 만든다.
 
@@ -143,39 +223,35 @@ class Decoder(nn.Module):
         batch_size: int,
         predicted_neighbor_num: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """훈련 모드에서 DiT에 넣을 입력(xT_input)과 현재 프레임(정규화)을 만든다.
-
-        이 함수는 훈련에서 매번 반복되는 전처리를 한 곳에 모아,
-        `_forward_training_mode`를 짧고 읽기 쉽게 만드는 목적입니다.
+        """훈련 모드에서 DiT에 넣을 입력(xT_input_flat)과 현재 프레임(정규화)을 만든다.
 
         처리 흐름:
-            1) inputs["near_cur_future_norm_xT"]에서 현재/미래를 분리합니다.
-            2) config.use_current_input 설정에 따라
-               - 현재+미래를 쓰거나
-               - 미래만 쓰도록 선택합니다.
-            3) (B, Pnn, time, 4) -> (B, Pnn, F) 로 펼칩니다.
-            4) (옵션) 목표점(cond_last_pos_norm)을 마지막 프레임에 주입합니다.
-               - 배치 단위 확률 토글 방식(기존 로직 유지)
+            1) near_cur_future_norm_xT 에서 "미래(노이즈가 섞인 구간)"을 꺼냅니다.
+               - shape: (B, Pnn, future_len, 4)
+            2) near_agents_past 에서 (x, y, cos, sin) 4개 값만 꺼내 과거~현재 시퀀스를 만듭니다.
+               - shape: (B, Pnn, time_len, 4)
+            3) use_past_dit_input=True 이면:
+               - (과거~현재) + (미래) 를 시간축으로 이어서 (past+current+future) 시퀀스를 만들고 flatten 합니다.
+            4) use_past_dit_input=False 이면:
+               - 기존처럼 (현재+미래) 또는 (미래만)으로 flatten 합니다.
+            5) (옵션) 목표점(cond_last_pos_norm)을 일부 배치에서 마지막 프레임에 주입합니다.
 
         Args:
-            inputs: DataLoader에서 넘어온 배치 dict.
-                - "near_cur_future_norm_xT": (B, Pnn, 1+T, 4)
-            near_current_mask: 현재 프레임 기준 무효 에이전트 마스크.
-                shape: (B, Pnn)  True=무효(패딩)
-            cond_last_pos_norm: 목표점(마지막 위치) 조건(정규화).
-                shape: (B, Pnn, 4)
-            batch_size: 배치 크기 B.
-            predicted_neighbor_num: 이웃 수 Pnn.
+            inputs:
+                - "near_cur_future_norm_xT": (B, Pnn, 1+future_len, 4)
+                - "near_agents_past": (B, Pnn, time_len(=past_len+1), 11)  # 가정
+            near_current_mask: (B, Pnn) True=무효(패딩)
+            cond_last_pos_norm: (B, Pnn, 4)
+            batch_size: B
+            predicted_neighbor_num: Pnn
 
         Returns:
             xT_input_flat:
-                DiT 입력(flatten).
-                - use_past_dit_input=True  -> shape (B, Pnn, (time_len+T)*4)
-                - use_current_input=True  -> shape (B, Pnn, (1+T)*4)
-                - use_current_input=False -> shape (B, Pnn, T*4)
+                - use_past_dit_input=True  -> (B, Pnn, (time_len+future_len)*4)
+                - use_current_input=True   -> (B, Pnn, (1+future_len)*4)
+                - use_current_input=False  -> (B, Pnn, (future_len)*4)
             near_cur_norm_xT:
-                현재 프레임(정규화).
-                shape: (B, Pnn, 4)
+                현재 프레임(정규화) (B, Pnn, 4)
         """
         B: int = batch_size
         Pnn: int = predicted_neighbor_num
@@ -184,37 +260,48 @@ class Decoder(nn.Module):
         near_cur_future_norm_xT: torch.Tensor = inputs[
             "near_cur_future_norm_xT"]
 
-        # near_agents_past : (B, Pnn, time_len, 11)
-        near_agents_past = inputs["near_agents_past"]
+        # near_agents_past: (B, Pnn, time_len, 11)
+        near_agents_past: torch.Tensor = inputs["near_agents_past"]
 
-        # near_cur_norm_xT: (B, Pnn, 4)
-        near_cur_norm_xT: torch.Tensor = near_cur_future_norm_xT[:, :, 0, :]
+        # near_agents_past_xyyaw: (B, Pnn, time_len, 4)
+        near_agents_past_xyyaw: torch.Tensor = near_agents_past[..., :4]
 
-        # near_future_norm_xT: (B, Pnn, T, 4)
+        # 미래(노이즈 포함): (B, Pnn, T, 4)
         near_future_norm_xT: torch.Tensor = near_cur_future_norm_xT[:, :, 1:, :]
 
-        # xT_input_seq: (B, Pnn, time, 4)
+        # 현재 프레임(정규화): 과거~현재 시퀀스의 마지막 프레임을 기준으로 잡아 정합성 강화
+        # near_cur_norm_xT: (B, Pnn, 4)
+        near_cur_norm_xT: torch.Tensor = near_agents_past_xyyaw[:, :, -1, :]
+
+        # xT_input_seq 구성
         if self.config.use_past_dit_input:
-            # xT_input_seq : ( time_len + future_len )  전체 사용
+            # dtype/device 정합: concat 전에 맞춰두는 게 안전
+            near_agents_past_xyyaw = _cast_like(near_agents_past_xyyaw,
+                                                near_future_norm_xT)
+
+            # (B, Pnn, time_len + T, 4)
             xT_input_seq: torch.Tensor = torch.cat(
-                [near_agents_past, near_future_norm_xT],
+                [near_agents_past_xyyaw, near_future_norm_xT],
                 dim=2,
-            )  # (B, Pnn, time_len + T, 4)
+            )
         else:
             if self.config.use_current_input:
-                xT_input_seq: torch.Tensor = near_cur_future_norm_xT  # (B, Pnn, 1+T, 4)
+                # (B, Pnn, 1+T, 4)
+                xT_input_seq = near_cur_future_norm_xT
             else:
-                xT_input_seq = near_future_norm_xT  # (B, Pnn, T, 4)
+                # (B, Pnn, T, 4)
+                xT_input_seq = near_future_norm_xT
 
-        # xT_input_flat: (B, Pnn, F)
+        # flatten: (B, Pnn, F)
         xT_input_flat: torch.Tensor = xT_input_seq.reshape(B, Pnn, -1)
 
-        # 목표점(cond_last_pos_norm)을 학습용으로 일부 배치에서만 마지막 프레임에 주입
+        # 목표점(cond_last_pos_norm) 주입 (옵션)
         xT_input_flat, _ = self._maybe_apply_last_pos_condition_training(
             near_cur_future_norm_xT=xT_input_flat,  # (B, Pnn, F)
             near_current_mask=near_current_mask,  # (B, Pnn)
             cond_last_pos_norm=cond_last_pos_norm,  # (B, Pnn, 4)
         )
+
         return xT_input_flat, near_cur_norm_xT
 
     def _run_dit_training_forward(
@@ -754,85 +841,106 @@ class Decoder(nn.Module):
 
         return xt_sequence
 
-    def _prepare_near_trajectories_and_masks(
-        self,
-        inputs: Dict[str, torch.Tensor],
-    ) -> Tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            int,
-            int,
-    ]:
-        """배치 dict에서 이웃 에이전트 관련 공통 텐서를 만들어준다.
 
-        - 이웃 과거/현재 상태
-        - 유효/무효 에이전트 마스크
-        - 과거+현재+미래 유효 프레임 마스크
-        - 에이전트 종류 one-hot
-        - 마지막 목표 위치(cond_last_pos_norm)
+
+    def _prepare_near_trajectories_and_masks(
+            self,
+            inputs: Dict[str, torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+    ]:
+        """배치 dict에서 이웃 에이전트 관련 공통 텐서를 만든다.
+
+        특히 이 함수는 아래 2가지를 더 안전하게 처리합니다.
+          1) near_future_valid dtype이 bool이 아니어도(0/1 float 등) 자동으로 bool로 바꿈
+          2) near_agents_past 안에 NaN/inf가 섞인 경우도 무효(패딩)로 판단하도록 방어
 
         Args:
-            inputs: DataLoader 에서 넘어온 배치 dict.
+            inputs (Dict[str, torch.Tensor]):
+                DataLoader에서 넘어온 배치 dict.
 
         Returns:
-            near_past: (B, Pnn, past_len, 11) 과거 이웃 상태.
-            near_current_xyyaw: (B, Pnn, 4) 현재 이웃 상태 (x, y, cos, sin).
-            near_current_mask: (B, Pnn) True면 해당 위치에 이웃이 없음.
-            near_past_cur_future_valid:
-                (B, Pnn, time_len + future_len) 과거+현재+미래 유효 프레임 마스크.
-            near_class_one_hot: (B, Pnn, 3) 에이전트 종류 one-hot.
-            cond_last_pos_norm:
-                (B, Pnn, 4) 정규화된 마지막 목표 위치(없으면 NaN/0 로 채움).
-            batch_size: 배치 크기 B.
-            predicted_neighbor_num: 이웃 수 Pnn.
+            Tuple:
+                near_past:
+                    (B, Pnn, past_len, 11)
+                near_current_xyyaw:
+                    (B, Pnn, 4)
+                near_current_mask:
+                    (B, Pnn) True면 현재 프레임 기준 무효 에이전트
+                near_past_cur_future_valid:
+                    (B, Pnn, time_len + future_len) bool (True=유효)
+                near_class_one_hot:
+                    (B, Pnn, 3)
+                cond_last_pos_norm:
+                    (B, Pnn, 4)
+                batch_size (int):
+                    B
+                predicted_neighbor_num (int):
+                    Pnn
         """
-        near_agents_past = inputs["near_agents_past"]  # (B, Pnn, time_len, 11)
-        near_past = near_agents_past[:, :, :-1, :].detach(
-        )  # (B, Pnn, past_len, 11)
-        near_current_xyyaw = near_agents_past[:, :, -1, :4]  # (B, Pnn, 4)
-        # 과거+현재+미래 유효 프레임 마스크
+        near_agents_past: torch.Tensor = inputs[
+            "near_agents_past"]  # (B,Pnn,time_len,11)
+
+        # near_past: (B, Pnn, past_len, 11)
+        near_past: torch.Tensor = near_agents_past[:, :, :-1, :].detach()
+
+        # near_current_xyyaw: (B, Pnn, 4)
+        near_current_xyyaw: torch.Tensor = near_agents_past[:, :, -1, :4]
+
+        # near_past_current_mask: (B, Pnn, time_len) True=무효
+        near_past_current_mask: torch.Tensor = _compute_time_padding_mask_from_state(
+            agent_states=near_agents_past,
+            check_dims=8,
+        )
+
+        # near_current_mask: (B, Pnn)
+        near_current_mask: torch.Tensor = near_past_current_mask[:, :, -1]
+
+        # near_future_valid: (B, Pnn, future_len) 또는 None
         near_future_valid: Optional[torch.Tensor] = inputs.get(
-            "near_future_valid", None)  # (B, Pnn, future_len) 또는 None
-        near_past_current_mask = torch.sum(torch.ne(
-            near_agents_past[:, :, :, :8], 0),
-                                           dim=-1) == 0  # (B, pnn, time_len)
-        near_current_mask = near_past_current_mask[:, :, -1]  # (B, Pnn)
-        near_past_cur_future_valid: torch.Tensor = (
-            self._get_near_past_cur_future_valid(
-                near_past_current_mask=
-                near_past_current_mask,  # [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
-                near_future_valid=near_future_valid,
-            ))  # (B, Pnn, time_len + future_len)
-        near_class_one_hot = near_agents_past[:, :, -1, 8:11]  # (B, Pnn, 3)
-        # cond_last_pos_norm 준비
+            "near_future_valid", None)
+        if near_future_valid is not None:
+            near_future_valid = _to_bool_mask(near_future_valid).to(
+                device=near_agents_past.device)
+
+        # near_past_cur_future_valid: (B, Pnn, time_len + future_len) bool
+        near_past_cur_future_valid: torch.Tensor = self._get_near_past_cur_future_valid(
+            near_past_current_mask=near_past_current_mask,
+            near_future_valid=near_future_valid,
+        )
+
+        # near_class_one_hot: (B, Pnn, 3)
+        near_class_one_hot: torch.Tensor = near_agents_past[:, :, -1, 8:11]
+
         batch_size, predicted_neighbor_num, _ = near_current_xyyaw.shape
 
-        if "cond_last_pos_norm" in inputs:
-            cond_last_pos_norm: torch.Tensor = inputs[
-                "cond_last_pos_norm"]  # (B, Pnn, 4)
-        else:
+        # cond_last_pos_norm: (B, Pnn, 4)
+        cond_last_pos_norm: Optional[torch.Tensor] = inputs.get(
+            "cond_last_pos_norm", None)
+        if cond_last_pos_norm is None:
             cond_last_pos_norm = near_current_xyyaw.new_full(
                 (batch_size, predicted_neighbor_num, 4),
                 float("nan"),
-            )  # (B, Pnn, 4)
+            )
 
-        # dtype/device 를 near_current_xyyaw 와 맞춤
-        cond_last_pos_norm = _cast_like(cond_last_pos_norm,
-                                        near_current_xyyaw)  # (B, Pnn, 4)
+        cond_last_pos_norm = _cast_like(cond_last_pos_norm, near_current_xyyaw)
 
         return (
-            near_past,  # (B, Pnn, past_len, 11)
-            near_current_xyyaw,  # (B, Pnn, 4)
-            near_current_mask,  # (B, Pnn)
-            near_past_cur_future_valid,  # (B, Pnn, time_len + future_len)
-            near_class_one_hot,  # (B, Pnn, 3)
-            cond_last_pos_norm,  # (B, Pnn, 4)
-            batch_size,  # int
-            predicted_neighbor_num,  # int
+            near_past,
+            near_current_xyyaw,
+            near_current_mask,
+            near_past_cur_future_valid,
+            near_class_one_hot,
+            cond_last_pos_norm,
+            batch_size,
+            predicted_neighbor_num,
         )
 
     def _unpack_encoder_outputs(
@@ -1454,23 +1562,27 @@ class Decoder(nn.Module):
         B: int = batch_size
         Pnn: int = predicted_neighbor_num
 
-        # 1) 시작 노이즈 및 xT(flat) 생성
+        # 1) 시작 노이즈 생성 (미래만)
         noise: torch.Tensor = self._sample_inference_noise(
             near_current_xyyaw=near_current_xyyaw,  # (B,Pnn,4)
             batch_size=B,
             predicted_neighbor_num=Pnn,
         )  # (B,Pnn,T,4)
-        near_agents_past = input[
-            "near_agents_past"]  # (B,Pnn,time_len(=past_len+1),11)
+
+        # near_agents_past는 inputs에 항상 있다고 가정
+        near_agents_past: torch.Tensor = inputs[
+            "near_agents_past"]  # (B,Pnn,time_len,11)
+
+        # 2) xT(flat) 생성
         xT: torch.Tensor = self._build_inference_xT_from_noise(
             noise=noise,  # (B,Pnn,T,4)
-            near_agents_past=near_agents_past,
+            near_agents_past=near_agents_past,  # (B,Pnn,time_len,11)
             near_current_xyyaw=near_current_xyyaw,  # (B,Pnn,4)
             batch_size=B,
             predicted_neighbor_num=Pnn,
         )  # (B,Pnn,F)
 
-        # 2) 목표점(cond-last) 정보 준비
+        # 3) 목표점(cond-last) 정보 준비
         cond_last_pos, cond_last_mask = self._build_inference_cond_last_info(
             cond_last_pos_norm=cond_last_pos_norm,  # (B,Pnn,4)
             batch_size=B,
@@ -1478,16 +1590,11 @@ class Decoder(nn.Module):
             reference_tensor_for_device=xT,
         )
 
-        # 3) 샘플링 단계에서 쓸 보정 함수 만들기(메서드 + partial)
-
-        # 4) dpm_sampler 실행
-        near_agents_past: Optional[torch.Tensor] = inputs[
-            "near_agents_past"]  # (B,Pnn,time_len(=past_len+1),11) 또는 None
-
+        # 4) 샘플링 중 보정 함수 구성
         correcting_xt_fn = self._build_inference_correcting_xt_fn(
             batch_size=B,
             predicted_neighbor_num=Pnn,
-            near_agents_past=near_agents_past,  # (B,Pnn,time_len, 11)
+            near_agents_past=near_agents_past,  # (B,Pnn,time_len,11)
             near_current_xyyaw=near_current_xyyaw,  # (B,Pnn,4)
             near_past_cur_future_valid=
             near_past_cur_future_valid,  # (B,Pnn,time_total)
@@ -1495,10 +1602,10 @@ class Decoder(nn.Module):
             cond_last_mask=cond_last_mask,  # (B,Pnn)
         )
 
+        # 5) dpm_sampler 실행
         x0: torch.Tensor = self._run_dpm_sampler_for_inference(
             xT=xT,  # (B,Pnn,F)
-            near_agents_past=
-            near_agents_past,  # (B,Pnn,time_len(=past_len+1),11) or None
+            near_agents_past=near_agents_past,  # (B,Pnn,time_len,11)
             scene_encoding_token=scene_encoding_token,
             scene_encoding_token_mask=scene_encoding_token_mask,
             ego_fut_global=ego_fut_global,
@@ -1512,24 +1619,24 @@ class Decoder(nn.Module):
             correcting_xt_fn=correcting_xt_fn,
         )
 
-        # 원래 코드와 동일하게 dtype 맞춤
+        # dtype 맞춤(기존 로직 유지)
         x0 = x0.to(xT.dtype)
 
-        # 5) (B,Pnn,F) -> (B,Pnn,1+T,4) 복원
+        # 6) (B,Pnn,F) -> (B,Pnn,1+T,4)
         x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
             x0=x0,
             near_current_xyyaw=near_current_xyyaw,
             batch_size=B,
             predicted_neighbor_num=Pnn,
-        )  # (B,Pnn,1+T,4)
+        )
 
-        # 6) 역정규화 및 패딩 정리
+        # 7) 역정규화 및 패딩 정리
         unnorm_x0: torch.Tensor = self._inverse_normalize_and_cleanup_padding(
             x_norm=x0_seq_norm,
             near_current_mask=near_current_mask,
-        )  # (B,Pnn,1+T,4)
+        )
 
-        # 7) feasible 출력(옵션)
+        # 8) feasible 출력(옵션)
         self._append_inference_feasible_outputs(
             outputs=return_,
             near_current_xyyaw=near_current_xyyaw,
@@ -1953,7 +2060,7 @@ class DiT(nn.Module):
             # x의 과거+현재 부분만 유지한 뒤, 미래를 integrated_trajectory로 교체
             x_past_cur = (
                 x.reshape(B, Pnn, -1,
-                          4).contiguous()[:, :, :(self.config.past_len + 1), :]
+                          4).contiguous()[:, :, :(self.config.time_len), :]
             )  # (B, Pnn, past_len+1, 4)
 
             x_new = torch.cat(
@@ -1992,108 +2099,82 @@ class DiT(nn.Module):
             near_current: torch.Tensor,  # (B, Pnn, 11)
             near_current_mask: torch.Tensor,  # (B, Pnn)
     ) -> torch.Tensor:
-        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행한다.
+        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다.
 
-        - 현재 유효 에이전트만 pre-proj MLP 를 통과시킨 뒤
-        - PRAM-v2 composer/time 모듈레이션으로 각 블록에 스케일/시프트를 주고
-        - 모든 블록을 통과한 후 최종 LayerNorm+Linear 로 (T*4) 차원 출력을 만든다.
-
-        Args:
-            near_input_norm_xT (torch.Tensor):
-                정규화된  궤적(flatten 형태).
-                shape: (B, Pnn, F)
-            diffusion_time (torch.Tensor):
-                확산 시간 t.
-                shape: (B,)
-            cross_c (torch.Tensor):
-                장면 토큰.
-                shape: (B, token_num, D)
-            ego_fut_global (torch.Tensor):
-                ego 미래 요약 벡터.
-                shape: (B, D)
-            near_agents_route_lane_emb (torch.Tensor):
-                이웃+경로 임베딩.
-                shape: (B, Pnn, D)
-            cross_mask (torch.Tensor):
-                cross 토큰 마스크(True=패딩).
-                shape: (B, token_num)
-            route_known_mask (torch.Tensor):
-                경로 유효 여부(True=known).
-                shape: (B, Pnn)
-            near_current (torch.Tensor):
-                현재 프레임 (x, y, cos, sin).
-                shape: (B, Pnn, 11)
-            near_current_mask (torch.Tensor):
-                현재 프레임 기준 무효 에이전트 마스크(True=패딩).
-                shape: (B, Pnn)
+        추가로 이 구현은 다음을 보장합니다.
+          - cross_c / near_agents_route_lane_emb dtype/device를 x와 맞춰 float32 승격을 방지
+          - cross_mask / route_known_mask / near_current_mask를 bool로 통일
 
         Returns:
             torch.Tensor:
-                DiT 본체 출력 (아직 model_type 보정 전).
-                shape: (B, Pnn, F_out)  (F_out=T*4 또는 (1+T)*4)
+                shape: (B, Pnn, F_out)
         """
-        B, Pnn, _ = near_input_norm_xT.shape  # (B, Pnn, F)
+        B, Pnn, _ = near_input_norm_xT.shape
 
         # 1) pre-proj (varlen)
-        # x: (B, Pnn, H)
         x: torch.Tensor = self.preproj_varlen(
             near_input_norm_xT=near_input_norm_xT,
-            near_current_mask=near_current_mask,
+            near_current_mask=_to_bool_mask(near_current_mask),
         )
-        # 무효 토큰은 0으로 고정
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # (B, Pnn, H)
+        near_current_mask = _to_bool_mask(near_current_mask).to(device=x.device)
+        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # (B,Pnn,H)
+
+        # ★ dtype/device 정렬 (매우 중요: float16/bfloat16 섞이면 float32로 승격될 수 있음)
+        cross_c = _cast_like(cross_c, x)  # (B,token_num,H)
+        near_agents_route_lane_emb = _cast_like(near_agents_route_lane_emb,
+                                                x)  # (B,Pnn,H)
+
+        cross_mask = _to_bool_mask(cross_mask).to(
+            device=x.device)  # 의미는 유지, dtype만 bool
+        route_known_mask = _to_bool_mask(route_known_mask).to(device=x.device)
 
         # 2) timestep embedding
-        # t_embedding: (B, H)
-        t_embedding: torch.Tensor = self.t_embedder(diffusion_time)
-        t_embedding = t_embedding.to(x.dtype)
-        ego_fut_global = ego_fut_global.to(x.dtype)
+        t_embedding: torch.Tensor = self.t_embedder(diffusion_time).to(x.dtype)
+        ego_fut_global = _cast_like(ego_fut_global, x)
 
         # 3) state_token_in 준비 (현재 프레임 기반)
-        # state_token_in: (B, Pnn, H)
         state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
-            near_cur_norm=near_current.to(x.dtype),  # (B, Pnn, 11)
-            near_current_mask=near_current_mask,  # (B, Pnn)
+            near_cur_norm=near_current.to(dtype=x.dtype, device=x.device),
+            # (B,Pnn,11)
+            near_current_mask=near_current_mask,  # (B,Pnn)
         )
 
         # 4) PRAM-v2 composer + time modulation
         composer_out = self.pram_v2_composer(
-            state_token_in=state_token_in,  # (B, Pnn, H)
-            ego_fut_global=ego_fut_global,  # (B, H)
-            near_agents_route_lane_emb=near_agents_route_lane_emb,  # (B,Pnn,H)
-            route_known_mask=route_known_mask,  # (B, Pnn)
+            state_token_in=state_token_in,
+            ego_fut_global=ego_fut_global,
+            near_agents_route_lane_emb=near_agents_route_lane_emb,
+            route_known_mask=route_known_mask,
         )
-        time_out = self.pram_v2_time_mod(t_embedding)  # (B, 1, H) 3종
+        time_out = self.pram_v2_time_mod(t_embedding)  # (B,1,H)
 
         # 5) DiT 블록 반복
         for block_index, block in enumerate(self.blocks):
             pram_mods = compute_pram_v2_modulations_for_block(
-                composer_out=composer_out,  #
-                time_out=time_out,  # (B, 1, H)
+                composer_out=composer_out,
+                time_out=time_out,
                 path_scalars=self.pram_v2_block_path_scalars,
                 block_index=block_index,
                 batch_size=B,
                 predicted_neighbor_num=Pnn,
                 hidden_dim=x.shape[-1],
             )
-            # x: (B, Pnn, H)
             x = block(
                 x=x,
-                cross_c=cross_c,  # (B, token_num, H)
+                cross_c=cross_c,
                 pram_v2_modulations=pram_mods,
-                near_current_mask=near_current_mask,  # (B, Pnn)
-                cross_mask=cross_mask,  # (B, token_num)
+                near_current_mask=near_current_mask,
+                cross_mask=cross_mask,
             )
             x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
 
         # 6) feasible 에서 사용할 최종 hidden 저장
-        if self.config.feasible_grad_to_dit:
-            self.final_hidden_tokens = x.float()  # (B, Pnn, H)
+        if getattr(self.config, "feasible_grad_to_dit", False):
+            self.final_hidden_tokens = x.float()
         else:
-            self.final_hidden_tokens = x.detach().clone().float()  # (B, Pnn, H)
+            self.final_hidden_tokens = x.detach().clone().float()
 
-        # 7) PRAM-v2 최종 레이어 (LN + MLP + 보정)
-        # x: (B, Pnn, F_out)
+        # 7) PRAM-v2 최종 레이어
         x = apply_pram_v2_final_layer(
             x=x,
             composer_out=composer_out,
@@ -2106,7 +2187,6 @@ class DiT(nn.Module):
             ),
         )
 
-        # 마스크 위치는 다시 0으로 정리
         x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)
         return x
 

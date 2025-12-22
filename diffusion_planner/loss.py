@@ -285,11 +285,10 @@ def _build_future_masks_and_current_state(
     # near_future_valid: (B, Pnn, future_len)
     near_future_valid: torch.Tensor = ~near_future_mask
 
-    # neighbor_agents_past: (B, agent_num, time_len, 11)
-    neighbor_agents_past: torch.Tensor = norm_inputs["neighbor_agents_past"]
+    # neighbor_agents_past: (B, Pnn, time_len, 11)
+    near_agents_past: torch.Tensor = norm_inputs["near_agents_past"]
     # near_current_xyyaw_norm: (B, Pnn, 4)  마지막 과거 프레임의 (x, y, cos, sin)
-    near_current_xyyaw_norm: torch.Tensor = neighbor_agents_past[:, :Pnn,
-                                                                 -1, :4]
+    near_current_xyyaw_norm: torch.Tensor = near_agents_past[:, :, -1, :4]
 
     # near_current_mask: (B, Pnn)
     near_current_mask: torch.Tensor = torch.sum(

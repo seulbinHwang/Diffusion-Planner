@@ -38,6 +38,10 @@ else
   mkdir -p "$TRAIN_SET_PATH"
 fi
 
+
+NUBES_JOBS=$(( ( $(nproc) * 4 ) / 5 )); if [ "$NUBES_JOBS" -lt 1 ]; then NUBES_JOBS=1; fi
+echo "[NUBES_JOBS] total_cores=$(nproc), use_cores=${NUBES_JOBS} (4/5)"
+
 ###################################
 # 2) NUBES -> PVC 다운로드
 ###################################
@@ -45,7 +49,7 @@ echo "[DOWNLOAD] Nuplan dataset / NUBES -> PVC [start]"
 nubescli dir-download \
     labs-mlops/ad/research/pnc/hsb/dataset/${NUBES_NUPLAN_FOLDER_NAME} \
     "$TRAIN_SET_PATH" \
-    -j "$(nproc)" \
+    -j "$NUBES_JOBS" \
     -s \
     --no-progress
 echo "[DOWNLOAD] Nuplan dataset / NUBES -> PVC [end]"
@@ -54,7 +58,7 @@ echo "[DOWNLOAD] WOMD dataset / NUBES -> PVC [start]"
 nubescli dir-download \
     labs-mlops/ad/research/pnc/hsb/dataset/${NUBES_WOMD_FOLDER_NAME}/${NUBES_WOMD_SPLIT_NAME} \
     "$TRAIN_SET_PATH" \
-    -j "$(nproc)" \
+    -j "$NUBES_JOBS" \
     -s \
     --no-progress
 echo "[DOWNLOAD] WOMD dataset / NUBES -> PVC [end]"
