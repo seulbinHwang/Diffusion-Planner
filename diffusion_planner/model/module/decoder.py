@@ -101,13 +101,12 @@ class Decoder(nn.Module):
         super().__init__()
         self.config = config
         dpr = config.decoder_drop_path_rate
-        self._predicted_neighbor_num = config.predicted_neighbor_num
         self._future_len: int = config.future_len
         self._sde = VPSDE_linear()
         self._cond_last_prob: float = getattr(config, "cond_last_prob",
                                               0.0)  # 20%
         if self.config.use_past_dit_input:
-            output_dim = (config.past_len + 1 +
+            output_dim = (config.time_len +
                           config.future_len) * 4  # x, y, cos, sin
         else:
             if self.config.use_current_input:
@@ -431,84 +430,6 @@ class Decoder(nn.Module):
         # can_apply: (B, Pnn)
         x_out = x_seq.view(B, Pnn, flat)
         return x_out, can_apply
-
-    def _get_near_past_current_infos(
-        self,
-        target_agents_mask: Optional[torch.Tensor],  # [B, max_agent_num] bool
-        neighbor_agents_past: torch.Tensor,  # [B, max_agent_num, time_len, 11]
-        predicted_agents_num: Optional[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            near_past_current: [B, pnn, time_len, 11]
-            near_past_current_mask: [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
-            near_class_one_hot: [B, pnn, 3]  one-hot class vector
-        """
-        # neighbor_agents_past_mask : [B, max_agent_num, time_len] bool # True=무효 점
-        neighbor_agents_past_mask = torch.sum(
-            torch.ne(neighbor_agents_past,
-                     0), dim=-1) == 0  # (B, max_agent_num, time_len)
-
-        neighbor_agents_class_one_hot = neighbor_agents_past[
-            ..., 0, 8:11]  # (B, max_agent_num, 3)
-        # 마지막 타임스텝만 추출: [B, max_agent_num, 4]
-
-        if target_agents_mask is None:
-            if predicted_agents_num is None:
-                raise ValueError(
-                    "predicted_agents_num is None. "
-                    "near_future_gt_3_dim이 없으면 config.predicted_neighbor_num을 설정해야 합니다."
-                )
-            # near_past_current, near_past_current_mask,
-            near_past_current = neighbor_agents_past[:, :
-                                                     predicted_agents_num]  # [B, pnn, time_len, 11]
-            near_past_current_mask = neighbor_agents_past_mask[:, :
-                                                               predicted_agents_num]  # [B, pnn, time_len]
-
-            near_class_one_hot = neighbor_agents_class_one_hot[:, :
-                                                               predicted_agents_num, :]  # [B, pnn, 3]
-
-        else:
-            B, max_agent_num, time_len, D11 = neighbor_agents_past.shape
-            # near_past_current:
-            near_past_current = torch.zeros(
-                (B, max_agent_num, time_len, D11),
-                dtype=neighbor_agents_past.dtype,
-                device=neighbor_agents_past.device,
-            )
-            near_past_current_mask = torch.ones(
-                (B, max_agent_num, time_len),
-                dtype=neighbor_agents_past_mask.dtype,
-                device=neighbor_agents_past_mask.device,
-            )  # True=빈 슬롯(무효 에이전트)
-            near_class_one_hot = torch.zeros(
-                (B, max_agent_num, 3),
-                dtype=neighbor_agents_class_one_hot.dtype,
-                device=neighbor_agents_class_one_hot.device,
-            )
-
-            # 마스크가 True인 “그 자리”에 값 대입 (슬롯 유지)
-            # near_past_current: [B, max_agent_num, time_len, 11]
-            near_past_current[target_agents_mask] = neighbor_agents_past[
-                target_agents_mask]
-            # near_past_current_mask : [B, max_agent_num, time_len]  True=빈 슬롯(무효 점)
-            near_past_current_mask[
-                target_agents_mask] = neighbor_agents_past_mask[
-                    target_agents_mask]
-
-            near_class_one_hot[
-                target_agents_mask] = neighbor_agents_class_one_hot[
-                    target_agents_mask]  #
-            # TODO: 임시 -> _predicted_neighbor_num 에 대한 의존성 타파?
-            near_past_current = near_past_current[:, :
-                                                  predicted_agents_num]  # [B, pnn, time_len, 11]
-            near_class_one_hot = near_class_one_hot[:, :
-                                                    predicted_agents_num, :]  # [B, pnn, 3]
-            # near_past_current_mask : [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
-            near_past_current_mask = near_past_current_mask[:, :
-                                                            predicted_agents_num]
-
-        return near_past_current, near_past_current_mask, near_class_one_hot
 
     def _get_near_past_cur_future_valid(
         self,
@@ -869,61 +790,27 @@ class Decoder(nn.Module):
             batch_size: 배치 크기 B.
             predicted_neighbor_num: 이웃 수 Pnn.
         """
-        neighbor_agents_past: torch.Tensor = inputs[
-            "neighbor_agents_past"]  # (B, max_agent_num, time_len, 11)
-
-        near_future_gt_3_dim: Optional[torch.Tensor] = inputs.get(
-            "near_future_gt_3_dim", None)  # (B, Pnn, future_len, 3) 또는 None
-
-        predicted_agents_num: Optional[int] = (
-            int(near_future_gt_3_dim.shape[1]) if near_future_gt_3_dim
-            is not None else getattr(self, "_predicted_neighbor_num", None))
-
-        target_agents_mask: Optional[torch.Tensor] = inputs.get(
-            "target_agents_mask", None)  # (B, max_agent_num) bool 또는 None
-
-        # near_past_current: (B, Pnn, time_len, 11)
-        # near_past_current_mask: (B, Pnn, time_len)  True=빈 슬롯
-        # near_class_one_hot: (B, Pnn, 3)
-        (
-            near_past_current,
-            near_past_current_mask,
-            near_class_one_hot,
-        ) = self._get_near_past_current_infos(
-            target_agents_mask=target_agents_mask,
-            neighbor_agents_past=neighbor_agents_past,
-            predicted_agents_num=predicted_agents_num,
-        )
-
-        # 과거 부분만 분리 (마지막 한 프레임은 현재)
-        near_past: torch.Tensor = near_past_current[:, :, :-1, :].detach()
-        # near_past: (B, Pnn, past_len, 11)
-
-        # 현재 포함 xy-yaw 시퀀스
-        near_past_current_xyyaw: torch.Tensor = near_past_current[:, :, :, :4]
-        # near_past_current_xyyaw: (B, Pnn, time_len, 4)
-
-        near_current_xyyaw: torch.Tensor = near_past_current_xyyaw[:, :, -1, :]
-        # near_current_xyyaw: (B, Pnn, 4)
-
-        near_current_mask: torch.Tensor = near_past_current_mask[:, :, -1]
-        # near_current_mask: (B, Pnn)  True=빈 슬롯
-
-        # 나중 모듈에서 쓰기 위해 inputs 에도 넣어둠(기존 로직 유지)
-        inputs["near_current_mask"] = near_current_mask
-
+        near_agents_past = inputs["near_agents_past"]  # (B, Pnn, time_len, 11)
+        near_past = near_agents_past[:, :, :-1, :].detach(
+        )  # (B, Pnn, past_len, 11)
+        near_current_xyyaw = near_agents_past[:, :, -1, :4]  # (B, Pnn, 4)
         # 과거+현재+미래 유효 프레임 마스크
         near_future_valid: Optional[torch.Tensor] = inputs.get(
             "near_future_valid", None)  # (B, Pnn, future_len) 또는 None
+        near_past_current_mask = torch.sum(torch.ne(
+            near_agents_past[:, :, :, :8], 0),
+                                           dim=-1) == 0  # (B, pnn, time_len)
+        near_current_mask = near_past_current_mask[:, :, -1]  # (B, Pnn)
         near_past_cur_future_valid: torch.Tensor = (
             self._get_near_past_cur_future_valid(
-                near_past_current_mask=near_past_current_mask,
+                near_past_current_mask=
+                near_past_current_mask,  # [B, pnn, time_len]  True=빈 슬롯(무효 에이전트)
                 near_future_valid=near_future_valid,
             ))  # (B, Pnn, time_len + future_len)
-
+        near_class_one_hot = near_agents_past[:, :, -1, 8:11]  # (B, Pnn, 3)
+        # cond_last_pos_norm 준비
         batch_size, predicted_neighbor_num, _ = near_current_xyyaw.shape
 
-        # cond_last_pos_norm 준비
         if "cond_last_pos_norm" in inputs:
             cond_last_pos_norm: torch.Tensor = inputs[
                 "cond_last_pos_norm"]  # (B, Pnn, 4)
@@ -1752,7 +1639,7 @@ class Decoder(nn.Module):
             )
 
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)

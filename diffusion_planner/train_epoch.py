@@ -500,7 +500,8 @@ def _apply_augmentation(
             inputs, ego_future_gt_3_dim, near_future_gt_3_dim)
 
     if isinstance(aug, NPCStatePerturbation):
-        inputs, near_future_gt_3_dim = aug(inputs, near_future_gt_3_dim, args)
+        pass # TODO: check
+        # inputs, near_future_gt_3_dim = aug(inputs, near_future_gt_3_dim, args)
 
     # (3) augmentation 이후: 원래 패딩이었던 위치는 다시 0으로 복원
     _restore_padding_values_inplace(inputs, input_pad_masks)

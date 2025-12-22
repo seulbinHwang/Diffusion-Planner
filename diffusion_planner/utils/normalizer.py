@@ -33,9 +33,6 @@ class StateNormalizer:
     @classmethod
     def from_json(cls, args):
         data = openjson(args.normalization_file_path)
-        # ❌ 옛 코드: [[...]] * args.predicted_neighbor_num
-        # mean = [[data["neighbor"]["mean"]]] * args.predicted_neighbor_num
-        # std  = [[data["neighbor"]["std"]]] * args.predicted_neighbor_num
 
         # ✅ neighbor 한 개에 대한 통계만 사용 (shape: (4,))
         mean = data["neighbor"]["mean"]
@@ -48,7 +45,6 @@ class StateNormalizer:
                                  "normalization.json")
         data = openjson(to_absolute_path(path_str))
 
-        # 마찬가지로 predicted_neighbor_num 은 무시
         mean = data["neighbor"]["mean"]
         std = data["neighbor"]["std"]
         return cls(mean, std)
