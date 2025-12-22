@@ -920,6 +920,19 @@ def train_epoch(
             # near_future_mask:    (B, Pnn, future_len)
             near_future_gt_4_dim, near_future_mask = \
                 _build_near_future_4dim_and_mask(near_future_gt_3_dim)
+            ego_future_gt_4_dim = torch.cat(
+                [
+                    ego_future_gt_3_dim,
+                    torch.stack(
+                        [
+                            ego_future_gt_3_dim[..., 2].cos(),
+                            ego_future_gt_3_dim[..., 2].sin(),
+                        ],
+                        dim=-1,
+                    ),
+                ],
+                dim=-1,
+            )  # (B, future_len, 4)
 
             # 4) 관측 정규화
             # norm_inputs: 각 value shape = (B, ...)
@@ -944,6 +957,7 @@ def train_epoch(
                 model=model,
                 norm_inputs=norm_inputs,
                 marginal_prob=sde_marginal_prob,
+                ego_future_gt_4_dim=ego_future_gt_4_dim,
                 near_future_gt_4_dim=near_future_gt_4_dim,
                 near_future_mask=near_future_mask,
                 state_normalizer=args.state_normalizer,

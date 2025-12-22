@@ -957,6 +957,13 @@ class Encoder(nn.Module):
         Returns:
             ego_future_trajectory: (B, future_len, 11)
         """
+        if self.config.do_ego_predict:
+            ego_future_trajectory = torch.zeros(
+                (B, future_len, 11),
+                device=device,
+                dtype=planner_future_11_dim.dtype,
+            )
+            return ego_future_trajectory
         if self.training:
             # (1) M_i 샘플링: (B,)
             prefix_lengths: torch.Tensor = self._sample_uniform_prefix_lengths(
@@ -992,10 +999,87 @@ class Encoder(nn.Module):
 
         return ego_future_trajectory
 
+    from typing import Optional
+    import torch
+
+    class Encoder(nn.Module):
+        # ... 기존 코드 ...
+
+        @staticmethod
+        def _ensure_non_near_agents_past_tensor(
+                ego_agent_past: torch.Tensor,  # (B, 1, T, 11)
+                non_near_agents_past: Optional[torch.Tensor],
+                # (B, A, T, 11) or None
+        ) -> torch.Tensor:
+            """non_near_agents_past를 항상 '텐서' 형태로 보장합니다.
+
+            이 함수는 Encoder에서 AgentFusionEncoder로 넘기는 이웃 에이전트 입력이
+            어떤 경우에도 안전하게 동작하도록 만들기 위한 안전장치입니다.
+
+            동작 규칙:
+                1) non_near_agents_past가 None이면,
+                   (B, 0, T, 11) 모양의 "빈 에이전트 텐서"를 만들어 반환합니다.
+                   이렇게 하면 AgentFusionEncoder 내부의 torch.cat이 항상 성공합니다.
+
+                2) non_near_agents_past가 텐서이면,
+                   ego_agent_past와 배치/시간/특징 차원이 맞는지 확인한 뒤,
+                   device/dtype을 ego_agent_past에 맞춰 반환합니다.
+
+            Args:
+                ego_agent_past (torch.Tensor):
+                    shape: (B, 1, T, 11)
+                    ego의 과거~현재 궤적 입력입니다.
+
+                non_near_agents_past (Optional[torch.Tensor]):
+                    shape: (B, A, T, 11) 또는 None
+                    DiT가 생성 대상으로 삼지 않는(제외된) 나머지 에이전트들의 과거~현재 입력입니다.
+                    A는 0일 수도 있습니다.
+
+            Returns:
+                torch.Tensor:
+                    shape: (B, A, T, 11)
+                    - non_near_agents_past가 None이면 A=0인 빈 텐서
+                    - 아니면 입력 텐서(단, device/dtype 정리됨)
+            """
+            if ego_agent_past.dim() != 4:
+                raise ValueError(
+                    f"ego_agent_past must be (B, 1, T, 11). got {tuple(ego_agent_past.shape)}"
+                )
+            B: int = int(ego_agent_past.shape[0])
+            T: int = int(ego_agent_past.shape[2])
+            D: int = int(ego_agent_past.shape[3])
+            if D != 11:
+                raise ValueError(
+                    f"ego_agent_past last dim must be 11. got {D} (shape={tuple(ego_agent_past.shape)})"
+                )
+
+            # (1) None이면: (B, 0, T, 11) 생성
+            if non_near_agents_past is None:
+                return ego_agent_past.new_zeros((B, 0, T, D))
+
+            # (2) 텐서면 shape 기본 검증
+            if non_near_agents_past.dim() != 4:
+                raise ValueError(
+                    f"non_near_agents_past must be (B, A, T, 11). got {tuple(non_near_agents_past.shape)}"
+                )
+            if int(non_near_agents_past.shape[0]) != B:
+                raise ValueError(
+                    f"non_near_agents_past batch size mismatch. expected B={B}, got {int(non_near_agents_past.shape[0])}"
+                )
+            if int(non_near_agents_past.shape[2]) != T or int(
+                    non_near_agents_past.shape[3]) != D:
+                raise ValueError(
+                    f"non_near_agents_past time/feat mismatch. expected (T={T}, D={D}), got (T={int(non_near_agents_past.shape[2])}, D={int(non_near_agents_past.shape[3])})"
+                )
+
+            # (3) device/dtype을 ego 기준으로 맞춤
+            return non_near_agents_past.to(device=ego_agent_past.device,
+                                           dtype=ego_agent_past.dtype)
+
     def _encode_agents_static_lanes(
         self,
         ego_agent_past: torch.Tensor,  # (B, 1, time_len, 11)
-        non_near_agents_past: torch.Tensor,  # (B, non_near_A, time_len, 11)
+        non_near_agents_past: Optional[torch.Tensor], # (B, A, time_len, 11) or None
         ego_future_trajectory: torch.Tensor,  # (B, future_len, 11)
         static_objects: torch.Tensor,  # (B, P, D_static)
         lanes: torch.Tensor,  # (B, L, lane_len, D_lane)
@@ -1048,6 +1132,11 @@ class Encoder(nn.Module):
         Returns:
             위 각 인코더에서 나오는 토큰/마스크/좌표 텐서들.
         """
+        # ★ 핵심: None이면 (B,0,T,11)로 바꿔서 torch.cat이 항상 되게 만듦
+        non_near_agents_past = self._ensure_non_near_agents_past_tensor(
+            ego_agent_past=ego_agent_past,                  # (B,1,T,11)
+            non_near_agents_past=non_near_agents_past,      # (B,A,T,11) or None
+        )  # -> (B, A, T, 11)  (A는 0 가능)
         # --- agents encoder ---
         """
         encoding_agents_chunk: (B, agents_num * past_cur_chunk_num + future_chunk_num, hidden_dim)

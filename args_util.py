@@ -219,6 +219,7 @@ def get_args():
                         default='normalization.json',
                         help='filepath of normalization.json',
                         type=str)
+    parser.add_argument('--do_ego_predict', default=False, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
     parser.add_argument('--num_workers', default=8, type=int)
