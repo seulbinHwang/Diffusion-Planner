@@ -389,6 +389,16 @@ class Encoder(nn.Module):
             time_gap=self.time_gap,
             time_min=self.time_min,
             time_max=self.time_max)
+        lane_summary_num: int = int(getattr(config, "lane_summary_num", 0))
+        if lane_summary_num > 0:
+            self.lane_summary_pooler = LaneSummaryTokenPooler(
+                hidden_dim=config.hidden_dim,
+                num_seeds=lane_summary_num,
+                attn_drop_p=0.0,
+                out_drop_p=0.0,
+            )
+        else:
+            self.lane_summary_pooler = None
         self.npc_route_encoder = NearAgentsRouteLaneEncoder(
             hidden_dim=config.hidden_dim, attn_drop_p=0.0)
 
@@ -435,12 +445,12 @@ class Encoder(nn.Module):
         global_modules = [
             self.fusion,
             self.npc_route_encoder,
+            self.lane_summary_pooler,
         ]
         for module in global_modules:
             if module is None:
                 continue
             for param in module.parameters():
-                # param: (out_dim, in_dim) 또는 (dim,)
                 yield param
 
     def _zero_with_touch(self, ref: torch.Tensor,
@@ -1120,116 +1130,199 @@ class Encoder(nn.Module):
                 encoding_lanes, lanes_mask, lane_pos, encoding_road_safety,
                 road_safety_mask, road_safety_pos)
 
+    def _add_pos_embedding_to_tokens(
+        self,
+        token_embeddings: torch.Tensor,  # (B, N, H)
+        token_pos: torch.Tensor,         # (B, N, 9)
+        token_mask: torch.Tensor,        # (B, N) True=pad
+    ) -> torch.Tensor:
+        """토큰 임베딩에 위치 정보를 더해줍니다.
+
+        이 함수는 다음을 보장합니다.
+        - 패딩 토큰(mask=True)은 위치 임베딩을 더하지 않습니다.
+        - 유효 토큰(mask=False)만 골라 pos_emb(Linear(9→H))를 적용합니다.
+        - pos_scale(스칼라)을 곱한 뒤 token_embeddings에 더합니다.
+
+        Args:
+            token_embeddings:
+                shape: (B, N, H)
+            token_pos:
+                shape: (B, N, 9)
+                [x,y,cos,sin] + type_onehot(5)
+            token_mask:
+                shape: (B, N)  True=패딩(무효)
+
+        Returns:
+            torch.Tensor:
+                shape: (B, N, H)
+                위치 임베딩이 더해진 토큰 텐서
+        """
+        if token_mask.dtype != torch.bool:
+            token_mask = token_mask.to(torch.bool)
+
+        if token_embeddings.dim() != 3 or token_pos.dim() != 3 or token_mask.dim() != 2:
+            raise ValueError(
+                f"Expected token_embeddings (B,N,H), token_pos (B,N,9), token_mask (B,N). "
+                f"got {tuple(token_embeddings.shape)}, {tuple(token_pos.shape)}, {tuple(token_mask.shape)}"
+            )
+
+        B, N, H = token_embeddings.shape
+        if token_pos.shape != (B, N, 9):
+            raise ValueError(f"token_pos must be (B, N, 9). got {tuple(token_pos.shape)}")
+        if token_mask.shape != (B, N):
+            raise ValueError(f"token_mask must be (B, N). got {tuple(token_mask.shape)}")
+
+        # (B*N,)
+        mask_flat: torch.Tensor = token_mask.reshape(-1)
+        # (B*N, 9)
+        pos_flat: torch.Tensor = token_pos.reshape(B * N, 9)
+
+        # 유효 토큰만 pos_emb 적용
+        if (~mask_flat).any().item():
+            pos_valid: torch.Tensor = self.pos_emb(pos_flat[~mask_flat])  # (N_valid, H)
+            pos_valid = pos_valid.to(dtype=token_embeddings.dtype, device=token_embeddings.device)
+
+            scale: torch.Tensor = self.pos_scale.to(dtype=token_embeddings.dtype, device=token_embeddings.device)
+            pos_valid = scale * pos_valid  # (N_valid, H)
+
+            pos_result_flat: torch.Tensor = torch.zeros(
+                (B * N, H),
+                device=token_embeddings.device,
+                dtype=token_embeddings.dtype,
+            )
+            pos_result_flat[~mask_flat] = pos_valid  # (B*N, H)
+            pos_result = pos_result_flat.view(B, N, H)  # (B,N,H)
+        else:
+            # 유효 토큰이 하나도 없으면 pos_result는 0
+            pos_result = torch.zeros((B, N, H), device=token_embeddings.device, dtype=token_embeddings.dtype)
+
+        return token_embeddings + pos_result
+
+
     def _build_fusion_inputs(
         self,
         encoding_agents_chunk: torch.Tensor,  # (B, N_agents_tok, H)
-        agents_chunk_mask: torch.Tensor,  # (B, N_agents_tok)
-        agents_chunk_pos: torch.Tensor,  # (B, N_agents_tok, 9)
-        encoding_static: torch.Tensor,  # (B, N_static, H)
-        static_mask: torch.Tensor,  # (B, N_static)
-        static_pos: torch.Tensor,  # (B, N_static, 9)
-        encoding_lanes: torch.Tensor,  # (B, N_lanes, H)
-        lanes_mask: torch.Tensor,  # (B, N_lanes)
-        lane_pos: torch.Tensor,  # (B, N_lanes, 9)
-        encoding_road_safety: torch.Tensor,  # (B, N_road_safety, H)
-        road_safety_mask: torch.Tensor,  # (B, N_road_safety)
-        road_safety_pos: torch.Tensor,  # (B, N_road_safety, 9)
+        agents_chunk_mask: torch.Tensor,      # (B, N_agents_tok)
+        agents_chunk_pos: torch.Tensor,       # (B, N_agents_tok, 9)
+        encoding_static: torch.Tensor,        # (B, N_static, H)
+        static_mask: torch.Tensor,            # (B, N_static)
+        static_pos: torch.Tensor,             # (B, N_static, 9)
+        encoding_lanes: torch.Tensor,         # (B, N_lanes, H)
+        lanes_mask: torch.Tensor,             # (B, N_lanes)
+        lane_pos: torch.Tensor,               # (B, N_lanes, 9)
+        encoding_road_safety: torch.Tensor,   # (B, N_road_safety, H)
+        road_safety_mask: torch.Tensor,       # (B, N_road_safety)
+        road_safety_pos: torch.Tensor,        # (B, N_road_safety, 9)
         B: int,
     ) -> Tuple[
-            torch.Tensor,  # encoding_input_with_pos: (B, token_num, H)
-            torch.Tensor,  # encoding_mask_2d:        (B, token_num)
-            torch.Tensor,  # encoding_lanes_with_pos: (B, N_lanes, H)
+        torch.Tensor,  # encoding_input_with_pos: (B, token_num, H)
+        torch.Tensor,  # encoding_mask_2d:        (B, token_num)
+        torch.Tensor,  # encoding_lanes_with_pos: (B, N_lanes, H)  (route-lane용: 전체 lane)
     ]:
-        """agents/static/lanes 토큰을 한 줄로 이어 붙이고, 위치 임베딩을 더한다.
+        """agents/static/lanes/road_safety 토큰을 한 줄로 이어 붙이고, 위치 임베딩을 더합니다.
 
-        - 에이전트 토큰, 정적 토큰, 차선 토큰을 dim=1 방향으로 concat 한다.
-        - 같은 순서로 마스크와 위치 좌표(8차원)도 concat 한다.
-        - 마스크가 False 인 토큰들만 골라 pos_emb(Linear(9→H))를 적용한다.
-        - pos_scale(스칼라)로 스케일 후, 전체 토큰에 더해준다.
+        변경점(핵심)
+        ----------
+        - FusionEncoder에는 lane 토큰 전체(N_lanes개)를 넣지 않고,
+          lane_summary_num개(M개)의 요약 토큰을 만들어 넣을 수 있습니다.
+        - route-lane 인코더(NearAgentsRouteLaneEncoder)는 기존처럼
+          "전체 lane 토큰(원본 N_lanes개)"을 그대로 사용합니다.
+          (agent_route_lane_order가 lane 인덱스를 그대로 쓰기 때문)
 
         Args:
-            encoding_agents_chunk: (B, N_agents_tok, H)
-            agents_chunk_mask:     (B, N_agents_tok)
-            agents_chunk_pos:      (B, N_agents_tok, 9)
-            encoding_static:       (B, N_static, H)
-            static_mask:           (B, N_static)
-            static_pos:            (B, N_static, 9)
-            encoding_lanes:        (B, N_lanes, H)
-            lanes_mask:            (B, N_lanes)
-            lane_pos:              (B, N_lanes, 9)
-            encoding_road_safety: (B, N_road_safety, H)
-            road_safety_mask:     (B, N_road_safety)
-            road_safety_pos:      (B, N_road_safety, 9)
-            B:                     배치 크기
+            encoding_lanes / lanes_mask / lane_pos:
+                - 전체 lane 토큰(원본) 정보입니다.
+                - Fusion 입력에서는 필요하면 요약 토큰으로 바꿉니다.
 
         Returns:
-            encoding_input_with_pos: (B, token_num, H)
-            encoding_mask_2d:        (B, token_num)
-            encoding_lanes_with_pos: (B, N_lanes, H)
+            encoding_input_with_pos:
+                (B, token_num, H)  FusionEncoder로 들어갈 토큰(요약 lane 포함 가능)
+            encoding_mask_2d:
+                (B, token_num)     FusionEncoder용 마스크(True=pad)
+            encoding_lanes_with_pos:
+                (B, N_lanes, H)    route-lane용 "전체 lane 토큰 + pos"
         """
-        # 1) 토큰/마스크/포지션 concat
-        # encoding_input: (B, token_num_actual, H)
-        encoding_input: torch.Tensor = torch.cat([
-            encoding_agents_chunk, encoding_static, encoding_lanes,
-            encoding_road_safety
-        ],
-                                                 dim=1)
-        # encoding_mask_2d: (B, token_num_actual)
+        H: int = int(self.hidden_dim)
+
+        # ------------------------------------------------------------------
+        # (1) route-lane용 "전체 lane 토큰 + pos" 준비
+        #     - lane_summary를 쓰는 경우에만 별도로 계산이 필요합니다.
+        #     - lane_summary를 안 쓰면, 아래에서 Fusion 입력을 만들 때 lane slice로 얻습니다.
+        # ------------------------------------------------------------------
+        use_lane_summary: bool = (self.lane_summary_pooler is not None)
+
+        if use_lane_summary:
+            encoding_lanes_with_pos: torch.Tensor = self._add_pos_embedding_to_tokens(
+                token_embeddings=encoding_lanes,  # (B,N_lanes,H)
+                token_pos=lane_pos,               # (B,N_lanes,9)
+                token_mask=lanes_mask,            # (B,N_lanes)
+            )  # (B, N_lanes, H)
+        else:
+            encoding_lanes_with_pos = None  # 아래에서 slice로 채움
+
+        # ------------------------------------------------------------------
+        # (2) Fusion에 넣을 lane 토큰 결정
+        #     - use_lane_summary=True: (B,M,H) 요약 토큰
+        #     - use_lane_summary=False: (B,N_lanes,H) 원본 lane 토큰
+        # ------------------------------------------------------------------
+        if use_lane_summary:
+            (
+                encoding_lanes_for_fusion,  # (B, M, H)
+                lanes_mask_for_fusion,      # (B, M)
+                lane_pos_for_fusion,        # (B, M, 9)
+            ) = self.lane_summary_pooler(
+                lane_embeddings=encoding_lanes,
+                lane_mask=lanes_mask,
+                lane_pos=lane_pos,
+            )
+        else:
+            encoding_lanes_for_fusion = encoding_lanes
+            lanes_mask_for_fusion = lanes_mask
+            lane_pos_for_fusion = lane_pos
+
+        # ------------------------------------------------------------------
+        # (3) 토큰/마스크/포지션 concat (Fusion용)
+        # ------------------------------------------------------------------
+        encoding_input: torch.Tensor = torch.cat(
+            [encoding_agents_chunk, encoding_static, encoding_lanes_for_fusion, encoding_road_safety],
+            dim=1,
+        )  # (B, token_num, H)
+
         encoding_mask_2d: torch.Tensor = torch.cat(
-            [agents_chunk_mask, static_mask, lanes_mask, road_safety_mask],
-            dim=1)
-        # encoding_pos_2d: (B, token_num_actual, 9)
+            [agents_chunk_mask, static_mask, lanes_mask_for_fusion, road_safety_mask],
+            dim=1,
+        )  # (B, token_num)
+
         encoding_pos_2d: torch.Tensor = torch.cat(
-            [agents_chunk_pos, static_pos, lane_pos, road_safety_pos], dim=1)
+            [agents_chunk_pos, static_pos, lane_pos_for_fusion, road_safety_pos],
+            dim=1,
+        )  # (B, token_num, 9)
 
-        token_num_actual: int = int(encoding_input.size(1))
-
-        H: int = self.hidden_dim
-
-        # 2) 위치 임베딩을 flatten 후 valid 토큰에만 적용
-        # mask_flat: (B * token_num,)
-        mask_flat: torch.Tensor = encoding_mask_2d.reshape(-1)
-        # pos_flat:  (B * token_num, 9)
-        pos_flat: torch.Tensor = encoding_pos_2d.reshape(
-            B * token_num_actual, -1)
-
-        # pos_valid: (N_valid, H)
-        pos_valid: torch.Tensor = self.pos_emb(pos_flat[~mask_flat])
-        pos_valid = pos_valid.to(dtype=encoding_input.dtype,
-                                 device=encoding_input.device)
-
-        scale: torch.Tensor = self.pos_scale.to(
-            dtype=encoding_input.dtype,
-            device=encoding_input.device,
+        # ------------------------------------------------------------------
+        # (4) pos_emb 더하기
+        # ------------------------------------------------------------------
+        encoding_input_with_pos: torch.Tensor = self._add_pos_embedding_to_tokens(
+            token_embeddings=encoding_input,  # (B, token_num, H)
+            token_pos=encoding_pos_2d,        # (B, token_num, 9)
+            token_mask=encoding_mask_2d,      # (B, token_num)
         )
-        pos_valid = scale * pos_valid  # (N_valid, H)
 
-        # encoding_pos_result_flat: (B * token_num, H)
-        encoding_pos_result_flat: torch.Tensor = torch.zeros(
-            (B * token_num_actual, H),
-            device=encoding_input.device,
-            dtype=encoding_input.dtype,
-        )
-        encoding_pos_result_flat[~mask_flat] = pos_valid
+        # ------------------------------------------------------------------
+        # (5) lane_summary를 쓰지 않는 경우: 기존처럼 lane 구간을 slice해서 route-lane용으로 사용
+        # ------------------------------------------------------------------
+        if not use_lane_summary:
+            n_agents = int(encoding_agents_chunk.size(1))
+            n_static = int(encoding_static.size(1))
+            n_lanes = int(encoding_lanes.size(1))
 
-        # encoding_pos_result: (B, token_num, H)
-        encoding_pos_result: torch.Tensor = encoding_pos_result_flat.reshape(
-            B, token_num_actual, H)
+            lane_start = n_agents + n_static
+            lane_end = lane_start + n_lanes
 
-        # 3) 위치 임베딩 더하기
-        encoding_input_with_pos: torch.Tensor = encoding_input + encoding_pos_result  # (B, token_num, H)
+            encoding_lanes_with_pos = encoding_input_with_pos[:, lane_start:lane_end, :]  # (B, N_lanes, H)
 
-        # 4) lane 토큰 부분만 따로 슬라이스
-        # 4) lane 토큰만 정확히 슬라이스 (road_safety가 뒤에 붙어도 안전)
-        n_agents = int(encoding_agents_chunk.size(1))
-        n_static = int(encoding_static.size(1))
-        n_lanes = int(encoding_lanes.size(1))
-        lane_start = n_agents + n_static
-        lane_end = lane_start + n_lanes
-        encoding_lanes_with_pos = encoding_input_with_pos[:, lane_start:
-                                                          lane_end, :]  # (B, N_lanes, H)
-
+        assert encoding_lanes_with_pos is not None
         return encoding_input_with_pos, encoding_mask_2d, encoding_lanes_with_pos
+
 
     def _run_fusion_and_route_encoder(
             self,
@@ -1452,19 +1545,19 @@ class Encoder(nn.Module):
             return encoder_outputs
 
     def _get_near_agents_route_lane_emb(
-            self,
-            encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
-            lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
-            agent_route_lane_order: torch.Tensor,
-            # (B, Pnn, lane_num)  -1=not in route
+        self,
+        encoding_lanes: torch.Tensor,  # (B, lane_num, hidden_dim)
+        lanes_mask: torch.Tensor,  # (B, lane_num)  True=pad
+        agent_route_lane_order: torch.Tensor,
+        # (B, Pnn, lane_num)  -1=not in route
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # agent_route_lane_order: (B, Pnn, lane_num)
         # -1: route가 아님
 
         route_num: int = int(self.config.route_num)
 
-        (near_route_lanes,
-         near_route_lanes_mask) = self.build_route_lane_tensors_from_order(
+        (near_route_lanes, near_route_lanes_mask
+        ) = self.build_route_lane_tensors_from_order(
             encoding_lanes=encoding_lanes,  # (B, lane_num, H)
             lanes_mask=lanes_mask,  # (B, lane_num)
             agent_route_lane_order=agent_route_lane_order,  # (B, Pnn, lane_num)
@@ -1483,12 +1576,12 @@ class Encoder(nn.Module):
             # route_keep_mask[b] = True면 주어진 order를 사용, False면 "경로 없음"
             route_keep_mask: torch.Tensor = (torch.rand(
                 (B,), device=encoding_lanes.device) >= float(
-                self.route_order_drop_prob))  # (B,) bool
+                    self.route_order_drop_prob))  # (B,) bool
 
             # 샘플 단위 드롭을 실제 텐서에 반영 (전부 패딩 처리)
             (near_route_lanes,
              near_route_lanes_mask) = self._mask_all_routes_like(
-                near_route_lanes, near_route_lanes_mask, route_keep_mask)
+                 near_route_lanes, near_route_lanes_mask, route_keep_mask)
 
         # (B, Pnn, hidden_dim)
         near_agents_route_lane_emb = self.npc_route_encoder(
@@ -1591,19 +1684,18 @@ class Encoder(nn.Module):
         lanes_mask_bool: torch.Tensor = lanes_mask.to(torch.bool)
 
         # lanes_mask_exp: (B, 1, lane_num) -> (B, Pnn, lane_num)
-        lanes_mask_exp: torch.Tensor = lanes_mask_bool.unsqueeze(1).expand(B,
-                                                                           Pnn,
-                                                                           lane_num)
+        lanes_mask_exp: torch.Tensor = lanes_mask_bool.unsqueeze(1).expand(
+            B, Pnn, lane_num)
 
         # valid_route_mask: (B, Pnn, lane_num)
         # route에 포함(+순서>=0) AND lane 자체도 pad가 아님
-        valid_route_mask: torch.Tensor = (route_lane_order >= 0) & (
-            ~lanes_mask_exp)
+        valid_route_mask: torch.Tensor = (route_lane_order
+                                          >= 0) & (~lanes_mask_exp)
 
         # BIG: 무효한 lane을 뒤로 밀기 위한 아주 큰 값
-        BIG_INT: int = 2 ** 30
-        big_value: torch.Tensor = route_lane_order.new_full((),
-                                                            BIG_INT)  # scalar on same device/dtype
+        BIG_INT: int = 2**30
+        big_value: torch.Tensor = route_lane_order.new_full(
+            (), BIG_INT)  # scalar on same device/dtype
 
         # order_for_sort: (B, Pnn, lane_num)
         # 유효: 실제 순서(0,1,2,...) / 무효: BIG
@@ -1632,9 +1724,8 @@ class Encoder(nn.Module):
             1).expand(B, Pnn, lane_num, hidden_dim)
 
         # gather_idx_H: (B, Pnn, k, H)
-        gather_idx_H: torch.Tensor = selected_idx.unsqueeze(-1).expand(B, Pnn,
-                                                                       k,
-                                                                       hidden_dim)
+        gather_idx_H: torch.Tensor = selected_idx.unsqueeze(-1).expand(
+            B, Pnn, k, hidden_dim)
 
         # near_route_lanes_k: (B, Pnn, k, H)
         near_route_lanes_k: torch.Tensor = torch.gather(encoding_lanes_expand,
@@ -1642,13 +1733,12 @@ class Encoder(nn.Module):
 
         # ---- (5) lane 마스크도 같은 인덱스로 gather ----
         # lanes_mask_expand: (B, 1, lane_num) -> (B, Pnn, lane_num)
-        lanes_mask_expand: torch.Tensor = lanes_mask_bool.unsqueeze(1).expand(B,
-                                                                              Pnn,
-                                                                              lane_num)
+        lanes_mask_expand: torch.Tensor = lanes_mask_bool.unsqueeze(1).expand(
+            B, Pnn, lane_num)
 
         # gathered_lane_mask_k: (B, Pnn, k)
-        gathered_lane_mask_k: torch.Tensor = torch.gather(lanes_mask_expand, 2,
-                                                          selected_idx)
+        gathered_lane_mask_k: torch.Tensor = torch.gather(
+            lanes_mask_expand, 2, selected_idx)
 
         # 최종 마스크(선택된 k개에 대해):
         # - 원래 lane이 pad였거나
@@ -1661,9 +1751,8 @@ class Encoder(nn.Module):
             pad_len: int = route_num_int - k
 
             # pad_lanes: (B, Pnn, pad_len, H) = 0
-            pad_lanes: torch.Tensor = near_route_lanes_k.new_zeros(B, Pnn,
-                                                                   pad_len,
-                                                                   hidden_dim)
+            pad_lanes: torch.Tensor = near_route_lanes_k.new_zeros(
+                B, Pnn, pad_len, hidden_dim)
 
             # pad_mask: (B, Pnn, pad_len) = True(전부 무효)
             pad_mask: torch.Tensor = torch.ones((B, Pnn, pad_len),
@@ -3945,6 +4034,254 @@ class RoadSafetyFusionEncoder(nn.Module):
             elements_emb, elements_pos4, elements_mask)
         road_safety_pos = self._build_pos9_from_pos4(seed_pos4)
         return seed_emb, seed_mask, road_safety_pos
+
+class LaneSummaryTokenPooler(nn.Module):
+    """많은 lane 토큰을 작은 개수의 '요약 토큰'으로 압축하는 모듈입니다.
+
+    목적
+    ----
+    FusionEncoder는 토큰 수가 많아질수록 계산량이 매우 크게 늘어납니다.
+    lane 토큰은 개수가 큰 편이라 Fusion 전체 비용을 크게 만드는 원인이 될 수 있습니다.
+
+    이 모듈은 lane 토큰(L개)을 직접 Fusion에 넣는 대신,
+    M개(num_seeds)의 요약 토큰으로 압축해서 Fusion에 넣을 수 있게 해줍니다.
+
+    입력 / 출력 모양
+    --------------
+    입력:
+        lane_embeddings: (B, L, H)
+        lane_mask:       (B, L)     True=패딩(무효)
+        lane_pos:        (B, L, 9)  [x,y,cos,sin] + type_onehot(5)
+
+    출력:
+        summary_embeddings: (B, M, H)
+        summary_mask:       (B, M)     True=패딩(무효)
+        summary_pos:        (B, M, 9)
+
+    동작(쉽게 설명)
+    --------------
+    - 학습되는 M개의 "요약 기준 벡터"가 있고,
+      각 요약 기준 벡터가 L개의 lane 토큰을 얼마나 참고할지 가중치를 만든 뒤,
+      가중치로 lane 토큰들을 섞어서 요약 토큰을 만듭니다.
+    - pos(위치/방향)도 같은 가중치로 함께 섞어 만들어 줍니다.
+    - lane이 너무 적으면(유효 lane 수 < M) 뒤쪽 요약 토큰은 패딩 처리합니다.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_seeds: int,
+        ffn_ratio: float = 2.0,
+        attn_drop_p: float = 0.0,
+        out_drop_p: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_dim: int = int(hidden_dim)
+        self.num_seeds: int = int(num_seeds)
+        self.attn_drop_p: float = float(attn_drop_p)
+
+        self.in_norm = nn.LayerNorm(self.hidden_dim)
+
+        # (1, M, H) 학습되는 요약 기준 벡터
+        self.seeds = nn.Parameter(torch.zeros(1, self.num_seeds, self.hidden_dim))
+        nn.init.trunc_normal_(self.seeds, std=0.02)
+
+        # 요약 토큰에 붙는 작은 FFN (게이트 0에서 시작)
+        ffn_hidden = max(32, int(self.hidden_dim * float(ffn_ratio)))
+        self.seed_ffn = nn.Sequential(
+            nn.Linear(self.hidden_dim, ffn_hidden, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ffn_hidden, self.hidden_dim, bias=True),
+        )
+        self.seed_ffn_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # 집합 통계(mean/max) 잔차 게이트(0에서 시작)
+        self.ds_mean_alpha = nn.Parameter(torch.tensor(0.0))
+        self.ds_max_alpha = nn.Parameter(torch.tensor(0.0))
+
+        self.out_norm = nn.LayerNorm(self.hidden_dim)
+        self.out_drop = nn.Dropout(out_drop_p) if out_drop_p > 0 else nn.Identity()
+
+    @staticmethod
+    def _normalize_dir(v: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """방향 벡터를 길이 1로 정규화합니다.
+
+        Args:
+            v: (..., 2)
+            eps: 0으로 나누기 방지용 작은 값
+
+        Returns:
+            (..., 2)  길이 1로 정규화된 방향 벡터
+        """
+        n = torch.sqrt((v * v).sum(dim=-1, keepdim=True) + eps)
+        return v / n
+
+    @staticmethod
+    def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """패딩을 제외한 평균을 계산합니다.
+
+        Args:
+            x: (B, L, H)
+            mask: (B, L) True=패딩(무효)
+
+        Returns:
+            (B, H)
+        """
+        valid = (~mask).to(torch.float32)  # (B,L)
+        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)  # (B,1)
+        return (x * valid.unsqueeze(-1)).sum(dim=1) / denom  # (B,H)
+
+    @staticmethod
+    def _masked_max(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """패딩을 제외한 최댓값을 계산합니다. 전부 패딩이면 0을 반환합니다.
+
+        Args:
+            x: (B, L, H)
+            mask: (B, L) True=패딩(무효)
+
+        Returns:
+            (B, H)
+        """
+        very_neg = (
+            torch.finfo(x.dtype).min
+            if x.dtype in (torch.float16, torch.bfloat16)
+            else -1e30
+        )
+        x2 = x.masked_fill(mask.unsqueeze(-1), very_neg)  # (B,L,H)
+        mx = x2.amax(dim=1)  # (B,H)
+        all_off = mask.all(dim=1)  # (B,)
+        return torch.where(all_off.unsqueeze(-1), torch.zeros_like(mx), mx)
+
+    def _touch_self_parameters(self, ref: torch.Tensor) -> torch.Tensor:
+        """값은 그대로 두고, 파라미터들을 0계수로 살짝 연결합니다(학습 안정용).
+
+        Args:
+            ref: 기준 텐서 (shape 무관)
+
+        Returns:
+            ref와 같은 shape 텐서(값은 같고 그래프만 연결됨)
+        """
+        touch = ref.new_zeros(())
+        for p in self.parameters():
+            touch = touch + p.view(-1)[:1].sum().to(ref.dtype)
+        return ref + touch * 0.0
+
+    def forward(
+        self,
+        lane_embeddings: torch.Tensor,  # (B, L, H)
+        lane_mask: torch.Tensor,        # (B, L) True=pad
+        lane_pos: torch.Tensor,         # (B, L, 9)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """lane 토큰을 M개 요약 토큰으로 압축합니다.
+
+        Args:
+            lane_embeddings:
+                shape: (B, L, H)
+            lane_mask:
+                shape: (B, L)  True=패딩(무효)
+            lane_pos:
+                shape: (B, L, 9)
+                [x,y,cos,sin] + type_onehot(5)
+
+        Returns:
+            summary_embeddings:
+                shape: (B, M, H)
+            summary_mask:
+                shape: (B, M)  True=패딩(무효)
+            summary_pos:
+                shape: (B, M, 9)
+        """
+        if lane_mask.dtype != torch.bool:
+            lane_mask = lane_mask.to(torch.bool)
+
+        B, L, H = lane_embeddings.shape
+        if H != self.hidden_dim:
+            raise ValueError(f"hidden_dim mismatch. got {H}, expected {self.hidden_dim}")
+        if lane_pos.shape != (B, L, 9):
+            raise ValueError(f"lane_pos must be (B, L, 9). got {tuple(lane_pos.shape)}")
+
+        M: int = int(self.num_seeds)
+        device = lane_embeddings.device
+        dtype = lane_embeddings.dtype
+
+        # (A) M==0이면 빈 출력
+        if M <= 0:
+            empty_emb = lane_embeddings.new_zeros(B, 0, H)          # (B,0,H)
+            empty_mask = torch.ones((B, 0), device=device, dtype=torch.bool)  # (B,0)
+            empty_pos = lane_embeddings.new_zeros(B, 0, 9)          # (B,0,9)
+            return empty_emb, empty_mask, empty_pos
+
+        # (B) L==0이면 요약 불가 → 전부 패딩
+        if L == 0:
+            summary_embeddings = lane_embeddings.new_zeros(B, M, H)  # (B,M,H)
+            summary_mask = torch.ones((B, M), device=device, dtype=torch.bool)  # (B,M)
+            summary_pos = lane_embeddings.new_zeros(B, M, 9)  # (B,M,9)
+            summary_embeddings = self._touch_self_parameters(summary_embeddings)
+            return summary_embeddings, summary_mask, summary_pos
+
+        # (C) 입력 정리: 패딩은 0으로 고정하고, 정규화 후 다시 0으로 고정
+        lane_embeddings = lane_embeddings.masked_fill(lane_mask.unsqueeze(-1), 0.0)  # (B,L,H)
+        lane_embeddings = self.in_norm(lane_embeddings)  # (B,L,H)
+        lane_embeddings = lane_embeddings.masked_fill(lane_mask.unsqueeze(-1), 0.0)  # (B,L,H)
+
+        # (D) 요약 가중치 계산: (B,M,L)
+        seeds = self.seeds.to(dtype).expand(B, M, H)  # (B,M,H)
+        logits = torch.einsum("bmh,blh->bml", seeds.float(), lane_embeddings.float())
+        logits = logits / math.sqrt(max(1.0, float(H)))  # (B,M,L)
+
+        if lane_mask.any().item():
+            logits = logits.masked_fill(lane_mask.unsqueeze(1), float("-inf"))
+
+        # 전부 패딩인 배치 softmax NaN 방지
+        all_off = lane_mask.all(dim=1)  # (B,)
+        if all_off.any().item():
+            logits = logits.clone()
+            logits[all_off] = 0.0
+
+        attn = F.softmax(logits, dim=-1)  # (B,M,L) float32
+        if self.attn_drop_p > 0 and self.training:
+            attn = F.dropout(attn, p=self.attn_drop_p)
+
+        # (E) 요약 토큰 생성: (B,M,H)
+        summary_embeddings = torch.einsum(
+            "bml,blh->bmh", attn, lane_embeddings.float()
+        ).to(dtype)  # (B,M,H)
+
+        summary_embeddings = summary_embeddings + self.seed_ffn_alpha.to(dtype) * self.seed_ffn(summary_embeddings)
+
+        # 집합 통계 잔차(게이트 0에서 시작)
+        ds_mean = self._masked_mean(lane_embeddings, lane_mask).to(dtype)  # (B,H)
+        ds_max = self._masked_max(lane_embeddings, lane_mask).to(dtype)    # (B,H)
+        summary_embeddings = summary_embeddings \
+            + self.ds_mean_alpha.to(dtype) * ds_mean.unsqueeze(1) \
+            + self.ds_max_alpha.to(dtype) * ds_max.unsqueeze(1)  # (B,M,H)
+
+        summary_embeddings = self.out_drop(self.out_norm(summary_embeddings))  # (B,M,H)
+
+        # (F) pos(대표 위치/방향)도 같은 가중치로 계산
+        lane_pos4 = lane_pos[..., :4].to(torch.float32)  # (B,L,4)
+        pos_xy = torch.einsum("bml,bld->bmd", attn, lane_pos4[..., :2])  # (B,M,2)
+        pos_dir = torch.einsum("bml,bld->bmd", attn, lane_pos4[..., 2:4])  # (B,M,2)
+        pos_dir = self._normalize_dir(pos_dir)  # (B,M,2)
+        pos4 = torch.cat([pos_xy, pos_dir], dim=-1).to(dtype)  # (B,M,4)
+
+        # type_onehot(5)에서 lane 인덱스(3)만 1로
+        token_type = torch.zeros((B, M, 5), device=device, dtype=dtype)  # (B,M,5)
+        token_type[:, :, 3] = 1.0
+        summary_pos = torch.cat([pos4, token_type], dim=-1)  # (B,M,9)
+
+        # (G) 유효 lane 수가 적으면 뒤쪽 seed는 패딩 처리
+        num_valid = (~lane_mask).sum(dim=1).to(torch.long)  # (B,)
+        active_k = torch.clamp(num_valid, max=M)  # (B,)
+        rank = torch.arange(M, device=device).unsqueeze(0)  # (1,M)
+        seed_active = rank < active_k.unsqueeze(1)  # (B,M)
+        summary_mask = ~seed_active  # (B,M) True=pad
+
+        summary_embeddings = summary_embeddings.masked_fill(summary_mask.unsqueeze(-1), 0.0)
+        summary_pos = summary_pos.masked_fill(summary_mask.unsqueeze(-1), 0.0)
+
+        return summary_embeddings, summary_mask, summary_pos
+
 
 
 class LaneFusionEncoder(nn.Module):

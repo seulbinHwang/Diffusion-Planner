@@ -182,6 +182,10 @@ def get_args():
                         type=int,
                         help='number of lanes',
                         default=250)
+    parser.add_argument('--lane_summary_num',
+                        type=int,
+                        help='number of lanes',
+                        default=100) # 0 이면 요약 안함
     parser.add_argument('--route_num',
                         type=int,
                         help='number of route lanes',

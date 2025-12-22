@@ -201,8 +201,6 @@ def _clip_input_axes_by_args(
                                     keep_agents_for_route)
 
 
-
-
 def _prepare_batch_for_device(
     batch: Dict[str, torch.Tensor],
     device: str,
@@ -247,7 +245,6 @@ def _prepare_batch_for_device(
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
             outputs[key] = value
-
 
     inputs: Dict[str, Any] = batch_on_device
     return inputs, outputs
@@ -452,8 +449,7 @@ def _validate_batch_shapes_for_loss(
     if a_in < a_pred:
         raise ValueError(
             f"neighbor_agents_past agent 수({a_in}) < near_future_gt_3_dim agent 수({a_pred}). "
-            "보통 /max_agent_num 설정 또는 collate padding 크기 문제입니다."
-        )
+            "보통 /max_agent_num 설정 또는 collate padding 크기 문제입니다.")
 
 
 def _apply_augmentation(
