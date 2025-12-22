@@ -882,9 +882,10 @@ class Decoder(nn.Module):
         # target_agents_past: (B, (1+)Pnn, time_len, 11)
         if self.config.do_ego_predict:
             ego_agent_past: torch.Tensor = inputs[
-                "ego_agent_past"]  # (B,1,time_len,11)
+                "ego_agent_past"]  # (B,time_len,11)
             target_agents_past = torch.cat(
-                [ego_agent_past, near_agents_past],
+                [ego_agent_past.unsqueeze(1),  # (B,1,time_len,11)
+                    near_agents_past],
                 dim=1,
             )  # (B, 1+Pnn, time_len, 11)
         else:
@@ -979,7 +980,7 @@ class Decoder(nn.Module):
             "near_agents_route_lane_emb"]  # (B, Pnn, D)
         route_known_mask: torch.Tensor = encoder_outputs[
             "route_known_mask"]  # (B, Pnn) bool
-        if self.args.do_ego_predict:
+        if self.config.do_ego_predict:
             # TODO: 나중에는 ego도 제대로 처리
             ego_route_lane_emb = torch.zeros(
                 (batch_size, 1, near_agents_route_lane_emb.shape[-1]),

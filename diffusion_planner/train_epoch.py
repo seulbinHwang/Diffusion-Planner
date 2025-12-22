@@ -454,8 +454,10 @@ def _validate_batch_shapes_for_loss(
 
 def _apply_augmentation(
     inputs: Dict[str, torch.Tensor],
-    ego_future_gt_3_dim: torch.Tensor,  # (B, Tf, 3)
-    near_future_gt_3_dim: torch.Tensor,  # (B, A, Tf, 3)
+    ego_future_gt_3_dim: torch.Tensor,  #(B, future_len, 3)
+    near_future_gt_3_dim: torch.Tensor,  # (B, Pnn, future_len, 3)
+        ego_future_gt_mask: torch.Tensor,  # (B, future_len)
+        near_future_mask: torch.Tensor,  # (B, Pnn, future_len)
     aug: Optional[StatePerturbation],
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
@@ -489,22 +491,26 @@ def _apply_augmentation(
     input_pad_masks: Dict[
         str, torch.Tensor] = _collect_padding_masks_before_augmentation(inputs)
 
-    ego_future_pad_mask: torch.Tensor = (ego_future_gt_3_dim == 0).all(
-        dim=-1, keepdim=True)  # (B,Tf,1)
-    near_future_pad_mask: torch.Tensor = (near_future_gt_3_dim == 0).all(
-        dim=-1, keepdim=True)  # (B,A,Tf,1)
+    ego_future_pad_mask= ego_future_gt_mask.unsqueeze(-1)  # (B,Tf,1)
+    near_future_pad_mask = near_future_mask.unsqueeze(-1)  # (B,A,Tf,1)
+    assert isinstance(aug, NPCStatePerturbation), "현재 NPCStatePerturbation 만 지원합니다."
+    if args.do_ego_predict:
+        target_future_gt_3_dim = torch.cat(
+            [ego_future_gt_3_dim.unsqueeze(1), near_future_gt_3_dim], dim=1)  # (B, 1 + A, Tf, 3)
+    else:
+        target_future_gt_3_dim = near_future_gt_3_dim  # (B, A, Tf, 3)
+    inputs, target_future_gt_3_dim = aug(inputs, target_future_gt_3_dim, args)
+    if args.do_ego_predict:
+        ego_future_gt_3_dim = target_future_gt_3_dim[
+            :, 0, :, :]  # (B, Tf, 3)
+        # near_future_gt_3_dim = target_future_gt_3_dim[:, 1:, :, :]  # (B, A, Tf, 3)
+    else:
+        near_future_gt_3_dim = target_future_gt_3_dim  # (B, A, Tf, 3)
 
-    # (2) augmentation 수행
-    if isinstance(aug, StatePerturbation):
-        inputs, ego_future_gt_3_dim, near_future_gt_3_dim = aug(
-            inputs, ego_future_gt_3_dim, near_future_gt_3_dim)
-
-    if isinstance(aug, NPCStatePerturbation):
-        pass # TODO: check
-        # inputs, near_future_gt_3_dim = aug(inputs, near_future_gt_3_dim, args)
 
     # (3) augmentation 이후: 원래 패딩이었던 위치는 다시 0으로 복원
     _restore_padding_values_inplace(inputs, input_pad_masks)
+
     ego_future_gt_3_dim = ego_future_gt_3_dim.masked_fill(
         ego_future_pad_mask, 0.0)
     near_future_gt_3_dim = near_future_gt_3_dim.masked_fill(
@@ -899,27 +905,6 @@ def train_epoch(
             )
             # ego_future_gt_3_dim: (B, future_len, 3)
             ego_future_gt_3_dim: torch.Tensor = outputs["ego_future_gt_3_dim"]
-            ego_future_len = ego_future_gt_3_dim.shape[1]
-            assert ego_future_len == args.future_len, \
-                f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
-            # near_future_gt_3_dim: (B, Pnn, future_len, 3)
-            near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
-
-            # 2) augmentation 적용
-            inputs, ego_future_gt_3_dim, near_future_gt_3_dim = \
-                _apply_augmentation(
-                    inputs=inputs,
-                    ego_future_gt_3_dim=ego_future_gt_3_dim,
-                    near_future_gt_3_dim=near_future_gt_3_dim,
-                    aug=aug,
-                    args=args,
-                )
-
-            # 3) near future 4차원 궤적 + mask 생성
-            # near_future_gt_4_dim: (B, Pnn, future_len, 4)
-            # near_future_mask:    (B, Pnn, future_len)
-            near_future_gt_4_dim, near_future_mask = \
-                _build_near_future_4dim_and_mask(near_future_gt_3_dim)
             ego_future_gt_4_dim = torch.cat(
                 [
                     ego_future_gt_3_dim,
@@ -933,6 +918,35 @@ def train_epoch(
                 ],
                 dim=-1,
             )  # (B, future_len, 4)
+            ego_future_len = ego_future_gt_3_dim.shape[1]
+            assert ego_future_len == args.future_len, \
+                f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
+            ego_future_gt_mask = torch.sum(
+                torch.ne(ego_future_gt_3_dim[..., :3], 0),
+                dim=-1,
+            ) == 0  # (B, future_len)
+            # near_future_gt_3_dim: (B, Pnn, future_len, 3)
+            near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
+            # 3) near future 4차원 궤적 + mask 생성
+            # near_future_gt_4_dim: (B, Pnn, future_len, 4)
+            # near_future_mask:    (B, Pnn, future_len)
+            near_future_gt_4_dim, near_future_mask = \
+                _build_near_future_4dim_and_mask(near_future_gt_3_dim)
+            # 2) augmentation 적용
+            # inputs, ego_future_gt_3_dim, near_future_gt_3_dim = \
+            #     _apply_augmentation(
+            #         inputs=inputs,
+            #         ego_future_gt_3_dim=ego_future_gt_3_dim, # (B, future_len, 3)
+            #         near_future_gt_3_dim=near_future_gt_3_dim, # (B, Pnn, future_len, 3)
+            #         ego_future_gt_mask=ego_future_gt_mask, # (B, future_len)
+            #         near_future_mask=near_future_mask, # (B, Pnn, future_len)
+            #         aug=aug,
+            #         args=args,
+            #     )
+
+
+
+
 
             # 4) 관측 정규화
             # norm_inputs: 각 value shape = (B, ...)

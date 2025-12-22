@@ -84,7 +84,7 @@ class NPCStatePerturbation:
             self,
             neighbor_agents_past: torch.
         Tensor,  # (B, max_agent_num, time_len, 11)
-            neighbors_future_all: torch.
+            target_future_gt_3_dim: torch.
         Tensor,  # (B, max_agent_num, future_len, 3)
             aug_neighbor_current: torch.Tensor,  # (B, max_agent_num, 11)
             valid_neighbor_mask: torch.Tensor,  # (B, max_agent_num) bool
@@ -131,7 +131,7 @@ class NPCStatePerturbation:
             # ── 텐서 → numpy (선택 배치) ─────────────────
             a_neighbor_agents_past = neighbor_agents_past[b].cpu().numpy(
             )  # (max_agent_num,T,11)
-            a_neighbors_future_all = neighbors_future_all[b].cpu().numpy(
+            a_neighbors_future_all = target_future_gt_3_dim[b].cpu().numpy(
             )  # (max_agent_num,F,3)
             a_aug_neighbor_current = aug_neighbor_current[b].cpu().numpy(
             )  # (max_agent_num,11)
@@ -295,18 +295,21 @@ class NPCStatePerturbation:
         Get a mask indicating which agents have valid past trajectories.
         Args:
             neighbor_agents_past: (B, max_agent_num, time_len, 11)
+
+            neighbor_agents_past[:, :, -1, :] : 현재 프레임 상태 벡터의
+                11 차원 중 , 앞 8차원(x,y,cos(yaw),sin(yaw),vx,vy,w,l) 이 모두 0. 이면 agent는 무효
         Returns:
             valid_agent_mask: (B, max_agent_num) (bool)
         """
         B, max_agent_num, time_len, C1 = neighbor_agents_past.shape
-        invalid_agent_mask = (neighbor_agents_past == 0).view(
-            B, max_agent_num, time_len * C1).all(dim=2)
-        valid_neighbor_mask = ~invalid_agent_mask  # shape (B, max_agent_num)
+        neighbor_current = neighbor_agents_past[:, :, -1, :]  # (B, max_agent_num, 11)
+        zero_mask = (neighbor_current[:, :, :8] == 0).all(dim=-1)  # (B, max_agent_num) bool
+        valid_neighbor_mask = ~zero_mask  # (B, max_agent_num) bool
         return valid_neighbor_mask
 
     @staticmethod
     def get_healthy_near_future_mask(
-            near_future_all: torch.Tensor,  # (B, Pnn, future_len, 3)
+            near_future_all: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
             num_refine: int,  # self.num_refine
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -385,20 +388,20 @@ class NPCStatePerturbation:
 
     @staticmethod
     def reshape_neighbors_future_all_4_to_3(
-            neighbors_future_all: torch.Tensor) -> torch.Tensor:
+            target_future_gt_3_dim: torch.Tensor) -> torch.Tensor:
         neighbors_future_all_3_dim = torch.zeros(
-            neighbors_future_all.shape[0],
-            neighbors_future_all.shape[1],
-            neighbors_future_all.shape[2],
+            target_future_gt_3_dim.shape[0],
+            target_future_gt_3_dim.shape[1],
+            target_future_gt_3_dim.shape[2],
             3,
-            device=neighbors_future_all.device,
-            dtype=neighbors_future_all.dtype)
+            device=target_future_gt_3_dim.device,
+            dtype=target_future_gt_3_dim.dtype)
 
         # neighbors_future_all_3_dim: (B, max_agent_num, future_len, 3)
-        neighbors_future_all_3_dim[:, :, :, 0:2] = neighbors_future_all[:, :, :,
+        neighbors_future_all_3_dim[:, :, :, 0:2] = target_future_gt_3_dim[:, :, :,
                                                                         0:2]
         neighbors_future_all_3_dim[:, :, :, 2] = torch.atan2(
-            neighbors_future_all[:, :, :, 3], neighbors_future_all[:, :, :, 2])
+            target_future_gt_3_dim[:, :, :, 3], target_future_gt_3_dim[:, :, :, 2])
         return neighbors_future_all_3_dim
 
     def add_accel_yaw_rate_to_near_current(
@@ -441,14 +444,14 @@ class NPCStatePerturbation:
     def __call__(
             self,
             inputs: Dict[str, torch.Tensor],
-            neighbors_future_all: torch.Tensor,
+            target_future_gt_3_dim: torch.Tensor, # (B, one_or_Pnn, future_len, 3)
             args,
             save_plot=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Args:
             inputs:
-                - neighbor_agents_past: (B, max_agent_num, time_len, 11)
-            neighbors_future_all: (B, max_agent_num, future_len, 3)
+                - neighbor_agents_past: (B, (max_agent_num), time_len, 11)
+
         Returns:
             inputs:
                 - neighbor_agents_past: (B, max_agent_num, time_len, 11)
@@ -459,13 +462,12 @@ class NPCStatePerturbation:
         # # (B, max_agent_num, time_len, 11)
         neighbor_agents_past = inputs['neighbor_agents_past']
         B, max_agent_num, time_len, _ = neighbor_agents_past.shape
-        # (B, max_agent_num)
+        # valid_neighbor_mask (B, max_agent_num) (bool)
         valid_neighbor_mask = self.get_valid_neighbor_mask(neighbor_agents_past)
         # (B, Pnn, future_len, 3)
-        near_agents_future = neighbors_future_all[:, :Pnn, :, :]
         # (B, Pnn), (B, Pnn) (bool)
         near_invalid_future_start_idx, healthy_near_future_mask = self.get_healthy_near_future_mask(
-            near_agents_future, self.num_refine)
+            target_future_gt_3_dim, self.num_refine)
         # (B, Pnn, time_len, 11)
         near_agents_past = neighbor_agents_past[:, :Pnn, :, :]
         # (B, Pnn, 4)
@@ -519,10 +521,10 @@ class NPCStatePerturbation:
             aug_neighbor_current[:, :Pnn, :] = aug_near_current
             # neighbor_invalid_future_start_idx (B, max_agent_num) 만들기.
             neighbor_invalid_future_start_idx, _ = self.get_healthy_near_future_mask(
-                neighbors_future_all, self.num_refine)
+                target_future_gt_3_dim, self.num_refine)
             self._debug_visualize_states(
                 neighbor_agents_past.clone().detach(),
-                neighbors_future_all.clone().detach(),
+                target_future_gt_3_dim.clone().detach(),
                 aug_neighbor_current.clone().detach(),
                 valid_neighbor_mask.clone().detach(),
                 neighbor_invalid_future_start_idx.clone().detach(),
@@ -531,19 +533,19 @@ class NPCStatePerturbation:
             )
         """
         neighbor_agents_past: (B, max_agent_num, time_len, 11)
-        neighbors_future_all: (B, max_agent_num, future_len, 3) -> (B, max_agent_num, future_len, 4)
+        target_future_gt_3_dim: (B, max_agent_num, future_len, 3) -> (B, max_agent_num, future_len, 4)
         aug_near_current_w_more: (B, Pnn, 14) -> aug_neighbor_current_w_more (B, max_agent_num, 14)
         near_aug_flag: (B, Pnn) -> neighbor_aug_flag: (B, max_agent_num) (bool)
         """
         #
-        neighbor_agents_past, neighbors_future_all, aug_neighbor_current_w_more, neighbor_aug_flag = \
+        neighbor_agents_past, target_future_gt_3_dim, aug_neighbor_current_w_more, neighbor_aug_flag = \
             self.reorder_neighbors_after_augmentation(
-            neighbor_agents_past, neighbors_future_all, aug_near_current_w_more,
+            neighbor_agents_past, target_future_gt_3_dim, aug_near_current_w_more,
                 valid_neighbor_mask,
             near_aug_flag)
         if save_plot:
             neighbors_future_all_3_dim = self.reshape_neighbors_future_all_4_to_3(
-                neighbors_future_all)
+                target_future_gt_3_dim)
             neighbor_invalid_future_start_idx, _ = self.get_healthy_near_future_mask(
                 neighbors_future_all_3_dim, self.num_refine
             )  # (B, max_agent_num), (B, max_agent_num) (bool)
@@ -562,21 +564,21 @@ class NPCStatePerturbation:
             neighbor_aug_flag, neighbor_agents_past,
             aug_neighbor_current_w_more)
         inputs["neighbor_agents_past"] = neighbor_agents_past
-        # neighbors_future_all: (B, max_agent_num, future_len, 4) -> (B, max_agent_num, future_len, 3)
+        # target_future_gt_3_dim: (B, max_agent_num, future_len, 4) -> (B, max_agent_num, future_len, 3)
         neighbor_agents_current = neighbor_agents_past[:, :,
                                                        -1, :]  # (B, max_agent_num, 11)
-        # neighbors_future_all: (B, max_agent_num, future_len, 4) -> (B, max_agent_num, future_len, 3)
-        neighbors_future_all = self.interpolation_future_trajectory(
-            neighbor_aug_flag, neighbor_agents_current, neighbors_future_all,
+        # target_future_gt_3_dim: (B, max_agent_num, future_len, 4) -> (B, max_agent_num, future_len, 3)
+        target_future_gt_3_dim = self.interpolation_future_trajectory(
+            neighbor_aug_flag, neighbor_agents_current, target_future_gt_3_dim,
             aug_neighbor_current_w_more)
         # near_future: (B, Pnn, future_len, 3)
-        near_future = neighbors_future_all[:, :Pnn, :, :]
+        near_future = target_future_gt_3_dim[:, :Pnn, :, :]
         if save_plot:
             aug_neighbor_current_new = neighbor_agents_past[:, :,
                                                             -1, :]  # (B, Pnn, 11)
             self._debug_visualize_states(
                 neighbor_agents_past.clone().detach(),
-                neighbors_future_all.clone().detach(),
+                target_future_gt_3_dim.clone().detach(),
                 aug_neighbor_current_new.clone().detach(),
                 valid_neighbor_mask.clone().detach(),
                 neighbor_invalid_future_start_idx.clone().detach(),
@@ -756,7 +758,7 @@ class NPCStatePerturbation:
         self,
         neighbor_aug_flag: torch.Tensor,
         neighbor_agents_current: torch.Tensor,
-        neighbors_future_all: torch.Tensor,
+        target_future_gt_3_dim: torch.Tensor,
         ordered_neighbor_current_w_more: Tensor  # (B, max_agent_num, 14)
     ) -> torch.Tensor:
         """
@@ -771,7 +773,7 @@ class NPCStatePerturbation:
                 증강된 현재 NPC 상태.
                 **Shape** – ``(B, max_agent_num, 11)``
                 ``[x, y, cosθ, sinθ, v_x, v_y, a_x, a_y, steer, yaw_rate, padding]``
-            neighbors_future_all (Tensor):
+            target_future_gt_3_dim (Tensor):
                 보간 전 미래 궤적.
                 **Shape** – ``(B, max_agent_num, future_len, 4)``
                 ``[x, y, cosθ, sinθ]`` × future_len
@@ -779,7 +781,7 @@ class NPCStatePerturbation:
 
         Returns:
             Tensor:
-                ``neighbors_future_all`` –
+                ``target_future_gt_3_dim`` –
                 보간이 적용된 미래 궤적.
                 **Shape** – ``(B, max_agent_num, future_len, 3)``
         """
@@ -798,32 +800,32 @@ class NPCStatePerturbation:
         neighbor_aug_flag = neighbor_aug_flag.to(self._device)
         if neighbor_aug_flag.sum() == 0:
             # If no augmentation is needed, return the original future trajectory
-            # neighbors_future_all: (B, max_agent_num, future_len, 4) -> (B , max_agent_num, future_len, 3)
-            neighbors_future_cos = neighbors_future_all[
+            # target_future_gt_3_dim: (B, max_agent_num, future_len, 4) -> (B , max_agent_num, future_len, 3)
+            neighbors_future_cos = target_future_gt_3_dim[
                 ..., 2]  # (B, max_agent_num, future_len)
-            neighbors_future_sin = neighbors_future_all[
+            neighbors_future_sin = target_future_gt_3_dim[
                 ..., 3]  # (B, max_agent_num, future_len)
-            neighbors_future_all = torch.cat(
+            target_future_gt_3_dim = torch.cat(
                 [
-                    neighbors_future_all[..., :2],  # x, y
+                    target_future_gt_3_dim[..., :2],  # x, y
                     torch.atan2(neighbors_future_sin,
                                 neighbors_future_cos)[..., None],  # heading
                 ],
                 dim=-1)
-            return neighbors_future_all
+            return target_future_gt_3_dim
         aug_sel_idx = neighbor_aug_flag.nonzero(
             as_tuple=True)[0]  # (M,)  보정 대상 인덱스
-        neighbors_future_all = neighbors_future_all.to(self._device)
+        target_future_gt_3_dim = target_future_gt_3_dim.to(self._device)
 
         aug_neighbor_agents_current = neighbor_agents_current[
             aug_sel_idx]  # (M, 11)
         aug_neighbor_current_w_more = ordered_neighbor_current_w_more[
             aug_sel_idx]  # (M, 14)
 
-        # neighbors_future_all: (B, max_agent_num, future_len, 4)
+        # target_future_gt_3_dim: (B, max_agent_num, future_len, 4)
         # (B, max_agent_num, future_len, 4) -> (B * max_agent_num, future_len, 4)  -> (B * max_agent_num, future_len, 3)
-        batch_, max_agent_num, future_len, four_dim = neighbors_future_all.shape
-        neighbor_future = neighbors_future_all.reshape(
+        batch_, max_agent_num, future_len, four_dim = target_future_gt_3_dim.shape
+        neighbor_future = target_future_gt_3_dim.reshape(
             batch_ * max_agent_num, future_len,
             four_dim)  # (B * max_agent_num, future_len, 4)
         aug_neighbor_future = neighbor_future[aug_sel_idx]  # (M, future_len, 4)
@@ -1232,7 +1234,7 @@ class NPCStatePerturbation:
     @staticmethod
     def reorder_neighbors_after_augmentation(
         neighbor_agents_past: torch.Tensor,  # (B, max_agent_num, time_len, 11)
-        neighbors_future_all: torch.Tensor,  # (B, max_agent_num, future_len, 3)
+        target_future_gt_3_dim: torch.Tensor,  # (B, max_agent_num, future_len, 3)
         aug_near_current_w_more: torch.Tensor,  # (B, Pnn, 14)
         valid_neighbor_mask: torch.Tensor,  # (B, max_agent_num) (bool)
         near_aug_flag: torch.Tensor,  # (B, Pnn) (bool)
@@ -1246,7 +1248,7 @@ class NPCStatePerturbation:
         # ─── 0. 기본 정보 ──────────────────────────────────────────
         B, Pnn, _ = aug_near_current_w_more.shape
         _, max_agent_num, time_len, _ = neighbor_agents_past.shape
-        _, _, future_len, _ = neighbors_future_all.shape
+        _, _, future_len, _ = target_future_gt_3_dim.shape
         device = neighbor_agents_past.device
         dtype = neighbor_agents_past.dtype
 
@@ -1286,18 +1288,18 @@ class NPCStatePerturbation:
                                      11), dim=1)  # (B,max_agent_num,T,11)
 
         # ─── 4‑B. 미래 궤적(3→4ch) 변환 후 재배열 ───────────────────
-        neighbors_future_all = neighbors_future_all.to(dtype=dtype,
+        target_future_gt_3_dim = target_future_gt_3_dim.to(dtype=dtype,
                                                        device=device)
-        yaw = neighbors_future_all[..., 2]  # (B,max_agent_num,F)
+        yaw = target_future_gt_3_dim[..., 2]  # (B,max_agent_num,F)
         future_4ch = torch.cat(
             [
-                neighbors_future_all[..., :2],  # x,y
+                target_future_gt_3_dim[..., :2],  # x,y
                 torch.cos(yaw).unsqueeze(-1),
                 torch.sin(yaw).unsqueeze(-1)
             ],  # cos,sin
             dim=-1)  # (B,max_agent_num,F,4)
 
-        neighbors_future_all = torch.take_along_dim(
+        target_future_gt_3_dim = torch.take_along_dim(
             future_4ch, idx.expand(-1, -1, future_len,
                                    4), dim=1)  # (B,max_agent_num,F,4)
 
@@ -1323,4 +1325,4 @@ class NPCStatePerturbation:
         aug_neighbor_current_w_more_reordered = torch.take_along_dim(
             aug_neighbor_current_w_more_reordered, order_idx_three, dim=1)
 
-        return neighbor_agents_past, neighbors_future_all, aug_neighbor_current_w_more_reordered, neighbor_aug_flag
+        return neighbor_agents_past, target_future_gt_3_dim, aug_neighbor_current_w_more_reordered, neighbor_aug_flag
