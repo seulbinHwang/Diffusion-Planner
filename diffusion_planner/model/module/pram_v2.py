@@ -69,21 +69,21 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     def forward(
         self,
-        near_cur_norm: torch.
-        Tensor,  # [B, Pnn, 11] # [x,y,cos,sin,vx,vy,w,l,one_hot(3)]
-        near_current_mask: torch.Tensor  # [B, Pnn]
+        target_cur_norm: torch.
+        Tensor,  # [B, (1+)Pnn, 11] # [x,y,cos,sin,vx,vy,w,l,one_hot(3)]
+        target_current_mask: torch.Tensor  # [B, (1+)Pnn]
     ) -> torch.Tensor:
         """현재 프레임을 얕게 투영해 state_token_in을 생성."""
-        xy_cos_sin = near_cur_norm[..., 0:4]  # (B, Pnn, 4)
-        width_and_length = near_cur_norm[..., 6:8]  # (B, Pnn, 2)
-        one_hot_type = near_cur_norm[..., 8:11]  # (B, Pnn, 3)
-        near_cur_norm = torch.cat([xy_cos_sin, width_and_length, one_hot_type],
-                                  dim=-1)  # (B, Pnn, 9)
-        x = self._project_unit_circle(near_cur_norm)  # [...,9]
+        xy_cos_sin = target_cur_norm[..., 0:4]  # (B, (1+)Pnn, 4)
+        width_and_length = target_cur_norm[..., 6:8]  # (B, (1+)Pnn, 2)
+        one_hot_type = target_cur_norm[..., 8:11]  # (B, (1+)Pnn, 3)
+        target_cur_norm = torch.cat([xy_cos_sin, width_and_length, one_hot_type],
+                                  dim=-1)  # (B, (1+)Pnn, 9)
+        x = self._project_unit_circle(target_cur_norm)  # [...,9]
         x = self.input_norm(x)
-        state_token_in = self.token_mlp(x)  # [B,Pnn,D]
-        state_token_in = self._mask_zero(state_token_in, near_current_mask)
-        return state_token_in  # [B,Pnn,D]
+        state_token_in = self.token_mlp(x)  # [B,(1+)Pnn,D]
+        state_token_in = self._mask_zero(state_token_in, target_current_mask)
+        return state_token_in  # [B,(1+)Pnn,D]
 
 
 # -----------------------------
@@ -304,10 +304,10 @@ class PRAMV2Composer(nn.Module):
 
     def forward(
             self,
-            state_token_in: torch.Tensor,  # [B, Pnn, D]
+            state_token_in: torch.Tensor,  # [B, (1+)Pnn, D]
             ego_fut_global: torch.Tensor,  # [B, D]
-            near_agents_route_lane_emb: torch.Tensor,  # [B, Pnn, D]
-            route_known_mask: torch.Tensor,  # [B, Pnn] True=known
+            target_agents_route_lane_emb: torch.Tensor,  # [B, (1+)Pnn, D]
+            route_known_mask: torch.Tensor,  # [B, (1+)Pnn] True=known
     ) -> ComposerOutputs:
         """(요약) state/ego/route → Adapt → (SE/ER/RS) → 혼합 → Δs_base/b_base/logit_g_base.
 
@@ -319,34 +319,34 @@ class PRAMV2Composer(nn.Module):
         """
         1) “입력 요약” 만들기 (한 번만 계산 → 모든 블록 재사용)
         """
-        B, Pnn, D = state_token_in.shape
+        B, one_or_Pnn, D = state_token_in.shape
 
         # ★ 무효 agent 마스크: state_token_in의 D차원이 전부 0이면 무효(True)
-        #    state_known_mask: [B,Pnn] (True=유효), invalid_mask: [B,Pnn,1] (True=무효)
-        state_known_mask = state_token_in.ne(0).any(dim=-1)  # [B,Pnn] True=유효
-        invalid_mask = (~state_known_mask).unsqueeze(-1)  # [B,Pnn,1] True=무효
+        #    state_known_mask: [B,(1+)Pnn] (True=유효), invalid_mask: [B,(1+)Pnn,1] (True=무효)
+        state_known_mask = state_token_in.ne(0).any(dim=-1)  # [B,(1+)Pnn] True=유효
+        invalid_mask = (~state_known_mask).unsqueeze(-1)  # [B,(1+)Pnn,1] True=무효
 
         # --- S 경로 ---
-        S_in = self.in_norm_S(state_token_in)  # [B,Pnn,D]
-        s = self.adapt_S(S_in)  # [B,Pnn,h]
+        S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
+        s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
         s = self.rms_pre(s)
         s = s.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 S 경로 0
 
         # --- R 경로 (route 미제공 0화) ---
-        R_in = self.in_norm_R(near_agents_route_lane_emb)
-        r = self.adapt_R(R_in)  # [B,Pnn,h]
+        R_in = self.in_norm_R(target_agents_route_lane_emb)
+        r = self.adapt_R(R_in)  # [B,(1+)Pnn,h]
         r = self.rms_pre(r)
         r = r.masked_fill((~route_known_mask).unsqueeze(-1), 0.0)
         r = r.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 R 경로도 0
 
         # --- E 경로 (배치 단위 미제공 0화) ---
         ego_known_mask_b = self._is_ego_provided(ego_fut_global)  # [B]
-        E_b = self._broadcast_ego(ego_fut_global, Pnn)  # [B,Pnn,D]
+        E_b = self._broadcast_ego(ego_fut_global, one_or_Pnn)  # [B,(1+)Pnn,D]
         E_in = self.in_norm_E(E_b)
-        e = self.adapt_E(E_in)  # [B,Pnn,h]
+        e = self.adapt_E(E_in)  # [B,(1+)Pnn,h]
         e = self.rms_pre(e)
         e = self._mask_ego_by_batch(e,
-                                    ego_known_mask_b)  # [B,Pnn,h] (미제공 배치는 0)
+                                    ego_known_mask_b)  # [B,(1+)Pnn,h] (미제공 배치는 0)
         e = e.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 E 경로도 0
         """
         2) 쌍곱(상호작용) 특징 만들기 — (SE, ER, RS)
@@ -359,28 +359,28 @@ class PRAMV2Composer(nn.Module):
         3) 쌍곱 포함해 한 덩어리로 묶고 z 만들기 — LN → 작은 MLP
         """
         # --- 혼합 ---
-        X = torch.cat([s, e, r, se, er, rs], dim=-1)  # [B,Pnn,6h]
+        X = torch.cat([s, e, r, se, er, rs], dim=-1)  # [B,(1+)Pnn,6h]
         X = self.mix_norm(X)
-        z = self.mix_mlp(X)  # [B,Pnn,c]
+        z = self.mix_mlp(X)  # [B,(1+)Pnn,c]
         """
         5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
         """
         # --- 헤드 ---
-        delta_scale_base = self.head_delta_scale(z)  # [B,Pnn,H]
-        shift_base = self.head_shift(z)  # [B,Pnn,H]
-        logit_gate_base = self.head_logit_gate(z)  # [B,Pnn,H]
+        delta_scale_base = self.head_delta_scale(z)  # [B,(1+)Pnn,H]
+        shift_base = self.head_shift(z)  # [B,(1+)Pnn,H]
+        logit_gate_base = self.head_logit_gate(z)  # [B,(1+)Pnn,H]
 
         # ★ 최종 출력도 무효 agent에서는 모두 0 보장
         delta_scale_base = delta_scale_base.masked_fill(invalid_mask,
-                                                        0.0)  # [B,Pnn,H]
-        shift_base = shift_base.masked_fill(invalid_mask, 0.0)  # [B,Pnn,H]
+                                                        0.0)  # [B,(1+)Pnn,H]
+        shift_base = shift_base.masked_fill(invalid_mask, 0.0)  # [B,(1+)Pnn,H]
         logit_gate_base = logit_gate_base.masked_fill(invalid_mask,
-                                                      0.0)  # [B,Pnn,H]
+                                                      0.0)  # [B,(1+)Pnn,H]
 
         return ComposerOutputs(
-            delta_scale_base=delta_scale_base,
-            shift_base=shift_base,
-            logit_gate_base=logit_gate_base,
+            delta_scale_base=delta_scale_base, # [B, (1+)Pnn, H]
+            shift_base=shift_base, # [B, (1+)Pnn, H]
+            logit_gate_base=logit_gate_base, # [B, (1+)Pnn, H]
         )
 
 
@@ -511,7 +511,7 @@ def compute_pram_v2_modulations_for_block(
     path_scalars: PRAMV2BlockPathScalars,
     block_index: int,
     batch_size: int,
-    predicted_neighbor_num: int,
+    one_or_Pnn: int,
     hidden_dim: int,
 ) -> Dict[PathName, ModulationTriplet]:
     """블록 b에서 SA/FFN/CA 경로별 최종 모듈레이션(Δs, b, gate)을 합성합니다.
@@ -527,7 +527,7 @@ def compute_pram_v2_modulations_for_block(
         path_scalars: 블록×경로 토글 스칼라 관리자
         block_index:  현재 블록 인덱스(0‑based)
         batch_size:   B (shape 검증용)
-        predicted_neighbor_num: Pnn (shape 검증용)
+        one_or_Pnn: Pnn (shape 검증용)
         hidden_dim:   H (shape 검증용)
 
     Returns:
@@ -536,9 +536,9 @@ def compute_pram_v2_modulations_for_block(
     """
     # ----- shape 정리 -----
     B, Pnn, H = composer_out.delta_scale_base.shape
-    assert B == batch_size and Pnn == predicted_neighbor_num and H == hidden_dim, \
+    assert B == batch_size and Pnn == one_or_Pnn and H == hidden_dim, \
         f"[compute_pram_v2_modulations_for_block] shape mismatch: " \
-        f"got composer_out {composer_out.delta_scale_base.shape}, expected {(batch_size, predicted_neighbor_num, hidden_dim)}"
+        f"got composer_out {composer_out.delta_scale_base.shape}, expected {(batch_size, one_or_Pnn, hidden_dim)}"
 
     device = composer_out.delta_scale_base.device
     dtype = composer_out.delta_scale_base.dtype
