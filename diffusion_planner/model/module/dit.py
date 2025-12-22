@@ -497,12 +497,12 @@ class DiTBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # [B, Pnn, D]
+        x: torch.Tensor,  # [B, (1+)Pnn, D]
         cross_c: torch.Tensor,  # [B, N_c, D]
         pram_v2_modulations: Dict[
             str,
             ModulationTriplet],  # {"SA": ModulationTriplet, "FFN":ModulationTriplet, "CA":ModulationTriplet}
-        near_current_mask: torch.Tensor,  # [B, Pnn] True=pad
+        target_current_mask: torch.Tensor,  # [B, (1+)Pnn] True=pad
         cross_mask: torch.Tensor  # [B, N_c]  True=pad
     ) -> torch.Tensor:
         """PRAM‑v2 주입 경로 포워드.
@@ -515,48 +515,48 @@ class DiTBlock(nn.Module):
           - 마지막: 원본 MLP2 경로는 그대로 유지 (게이트 self.gate_mlp2)
 
         Args:
-            x:                [B,Pnn,D]     입력 토큰
+            x:                [B,(1+)Pnn,D]     입력 토큰
             cross_c:          [B,N_c,D]     컨텍스트 토큰
             pram_v2_modulations:
                                dict{"SA"|"FFN"|"CA" → ModulationTriplet(Δs,b,g)}
-            near_current_mask:[B,Pnn]       True=pad (무효 에이전트)
+            target_current_mask:[B,(1+)Pnn]       True=pad (무효 에이전트)
             cross_mask:       [B,N_c]       True=pad (컨텍스트 패딩)
 
         Returns:
-            torch.Tensor: [B,Pnn,D]
+            torch.Tensor: [B,(1+)Pnn,D]
         """
         # ------ SA ------
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
-        y = self.norm1(x)  # [B,Pnn,D]
-        y_tilde = apply_pram_v2_path_modulation(y, sa_mod)  # [B,Pnn,D]
+        y = self.norm1(x)  # [B,(1+)Pnn,D]
+        y_tilde = apply_pram_v2_path_modulation(y, sa_mod)  # [B,(1+)Pnn,D]
         f_sa = self._self_attn_flash_varlen(y_tilde,
-                                            near_current_mask)  # [B,Pnn,D]
+                                            target_current_mask)  # [B,(1+)Pnn,D]
         x = x + sa_mod.gate.to(dtype=x.dtype,
-                               device=x.device) * f_sa  # [B,Pnn,D]
+                               device=x.device) * f_sa  # [B,(1+)Pnn,D]
 
         # ------ FFN(MLP1) ------
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
-        y = self.norm2(x)  # [B,Pnn,D]
-        y_tilde = apply_pram_v2_path_modulation(y, ffn_mod)  # [B,Pnn,D]
-        f_ffn = self.mlp1(y_tilde)  # [B,Pnn,D]
+        y = self.norm2(x)  # [B,(1+)Pnn,D]
+        y_tilde = apply_pram_v2_path_modulation(y, ffn_mod)  # [B,(1+)Pnn,D]
+        f_ffn = self.mlp1(y_tilde)  # [B,(1+)Pnn,D]
         x = x + ffn_mod.gate.to(dtype=x.dtype,
-                                device=x.device) * f_ffn  # [B,Pnn,D]
+                                device=x.device) * f_ffn  # [B,(1+)Pnn,D]
 
         # ------ CA (Q만 스타일링) ------
         ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
-        y = self.norm3(x)  # [B,Pnn,D]
-        q_styled = apply_pram_v2_path_modulation(y, ca_mod)  # [B,Pnn,D]
+        y = self.norm3(x)  # [B,(1+)Pnn,D]
+        q_styled = apply_pram_v2_path_modulation(y, ca_mod)  # [B,(1+)Pnn,D]
         f_ca = self._cross_attn_flash_varlen(q_styled, cross_c,
-                                             near_current_mask,
-                                             cross_mask)  # [B,Pnn,D]
+                                             target_current_mask,
+                                             cross_mask)  # [B,(1+)Pnn,D]
         # ★ 권장: self.gate_cross 제거, SA/FFN과 동일한 형태
         x = x + ca_mod.gate.to(dtype=x.dtype,
-                               device=x.device) * f_ca  # (B,Pnn,D)
+                               device=x.device) * f_ca  # (B,(1+)Pnn,D)
 
         # ------ 원본 MLP2 경로 유지 ------
         x = x + self.gate_mlp2.to(dtype=x.dtype, device=x.device) * self.mlp2(
             self.norm4(x))
 
         # 무효 에이전트 0‑클램프 (안전)
-        x = x.masked_fill(near_current_mask.unsqueeze(-1), 0.0)  # [B,Pnn,D]
+        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)  # [B,(1+)Pnn,D]
         return x

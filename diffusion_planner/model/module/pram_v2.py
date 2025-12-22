@@ -624,7 +624,7 @@ def style_queries_for_cross_attention(
 
 
 def apply_pram_v2_final_layer(
-    x: torch.Tensor,  # [B, Pnn, H]
+    x: torch.Tensor,  # [B, (1+)Pnn, H]
     composer_out: ComposerOutputs,
     time_out: TimeModulationOutputs,
     final_norm: nn.LayerNorm,  # LN(H) 모듈
@@ -641,31 +641,31 @@ def apply_pram_v2_final_layer(
         out      = Linear(Y~)
 
     Args:
-        x:             [B, Pnn, H]          마지막 블록 출력(hidden)
-        composer_out:  Δs_base / b_base / logit_g_base  (각 [B,Pnn,H])
+        x:             [B, (1+)Pnn, H]          마지막 블록 출력(hidden)
+        composer_out:  Δs_base / b_base / logit_g_base  (각 [B,(1+)Pnn,H])
         time_out:      Δs_time / b_time / logit_g_time  (각 [B,1,H])
         final_norm:    최종 LayerNorm(H)
         out_proj:      최종 선형( H → T*4 )
         final_scalars: (k_final_s, k_final_sh)  # 각 0‑D 텐서 또는 None(미제공 시 1.0)
 
     Returns:
-        x_out: [B, Pnn, T*4]
+        x_out: [B, (1+)Pnn, T*4]
     """
-    B, Pnn, H = x.shape
+    B, one_or_Pnn, H = x.shape
     device, dtype = x.device, x.dtype
 
-    # 시간 모듈레이션 [B,1,H] → [B,Pnn,H]
+    # 시간 모듈레이션 [B,1,H] → [B,(1+)Pnn,H]
     delta_scale_time = time_out.delta_scale_time.to(dtype=dtype,
                                                     device=device).expand(
-                                                        B, Pnn, H)
+                                                        B, one_or_Pnn, H)
     shift_time = time_out.shift_time.to(dtype=dtype,
-                                        device=device).expand(B, Pnn, H)
+                                        device=device).expand(B, one_or_Pnn, H)
 
     # Base
     delta_scale_base = composer_out.delta_scale_base.to(
-        dtype=dtype, device=device)  # [B,Pnn,H]
+        dtype=dtype, device=device)  # [B,(1+)Pnn,H]
     shift_base = composer_out.shift_base.to(dtype=dtype,
-                                            device=device)  # [B,Pnn,H]
+                                            device=device)  # [B,(1+)Pnn,H]
 
     # 최종 스칼라 (미제공 시 1.0)
     if final_scalars is None:
@@ -677,11 +677,11 @@ def apply_pram_v2_final_layer(
         k_final_sh = k_final_sh.to(dtype=dtype, device=device)
 
     # 최종 합성
-    delta_scale_final = delta_scale_time + k_final_s * delta_scale_base  # [B,Pnn,H]
-    shift_final = shift_time + k_final_sh * shift_base  # [B,Pnn,H]
+    delta_scale_final = delta_scale_time + k_final_s * delta_scale_base  # [B,(1+)Pnn,H]
+    shift_final = shift_time + k_final_sh * shift_base  # [B,(1+)Pnn,H]
 
     # LN → (1+Δs) ⊙ · + b → Linear
-    y = final_norm(x)  # [B,Pnn,H]
-    y_tilde = y * (1.0 + delta_scale_final) + shift_final  # [B,Pnn,H]
-    x_out = out_proj(y_tilde)  # [B,Pnn,T*4]
+    y = final_norm(x)  # [B,(1+)Pnn,H]
+    y_tilde = y * (1.0 + delta_scale_final) + shift_final  # [B,(1+)Pnn,H]
+    x_out = out_proj(y_tilde)  # [B,(1+)Pnn,T*4]
     return x_out

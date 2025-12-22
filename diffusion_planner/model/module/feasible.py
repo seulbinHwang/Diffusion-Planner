@@ -310,14 +310,14 @@ class FeasibleProjector(nn.Module):
     def _infer_past_future_lengths_for_downsample(
             self,
             diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
-            near_past_cur_future_valid: torch.
+            target_past_cur_future_valid: torch.
         Tensor,  # shape: (B, Pnn, time_len)
     ) -> Tuple[int, int, int]:
         """다운샘플링에 사용할 과거 길이와 미래 길이를 계산합니다.
 
         Args:
             diffusion_trajectory: 현재+미래 궤적. shape: (B, Pnn, 1+T, 4)
-            near_past_cur_future_valid: 과거~현재~미래 유효 마스크. shape: (B, Pnn, time_len)
+            target_past_cur_future_valid: 과거~현재~미래 유효 마스크. shape: (B, Pnn, time_len)
 
         Returns:
             past_len: 과거 노드 개수.
@@ -325,11 +325,11 @@ class FeasibleProjector(nn.Module):
             time_len: 전체 타임라인 길이.
         """
         B, Pnn, one_plus_T, _ = diffusion_trajectory.shape
-        mask_B, mask_Pnn, time_len = near_past_cur_future_valid.shape
+        mask_B, mask_Pnn, time_len = target_past_cur_future_valid.shape
 
         if (mask_B, mask_Pnn) != (B, Pnn):
             raise ValueError(
-                "[FeasibleProjector] diffusion_trajectory 와 near_past_cur_future_valid 의 "
+                "[FeasibleProjector] diffusion_trajectory 와 target_past_cur_future_valid 의 "
                 f"(B,Pnn)이 다릅니다: (B,Pnn)=({B},{Pnn}), (mask_B,mask_Pnn)=({mask_B},{mask_Pnn})"
             )
 
@@ -350,7 +350,7 @@ class FeasibleProjector(nn.Module):
     def _decide_use_past_for_downsample(
             self,
             past_len: int,
-            near_past: Optional[
+            target_past: Optional[
                 torch.Tensor],  # shape: (B, Pnn, past_len, 11) or None
             unnorm_near_past_xyyaw: Optional[
                 torch.Tensor],  # shape: (B, Pnn, past_len, 4) or None
@@ -369,10 +369,10 @@ class FeasibleProjector(nn.Module):
             use_past = False
 
         if use_past:
-            if near_past is None or unnorm_near_past_xyyaw is None:
+            if target_past is None or unnorm_near_past_xyyaw is None:
                 raise ValueError(
                     "[FeasibleProjector] use_past_for_feasible=True 인데 "
-                    "near_past / unnorm_near_past_xyyaw 가 None 입니다.")
+                    "target_past / unnorm_near_past_xyyaw 가 None 입니다.")
 
         return use_past
 
@@ -440,8 +440,8 @@ class FeasibleProjector(nn.Module):
     def _downsample_with_past(
         self,
         diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
-        near_past: torch.Tensor,  # shape: (B, Pnn, past_len, 11)
-        near_past_cur_future_valid: torch.
+        target_past: torch.Tensor,  # shape: (B, Pnn, past_len, 11)
+        target_past_cur_future_valid: torch.
         Tensor,  # shape: (B, Pnn, past_len+1+T)
         unnorm_diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
         unnorm_near_past_xyyaw: torch.Tensor,  # shape: (B, Pnn, past_len, 4)
@@ -471,7 +471,7 @@ class FeasibleProjector(nn.Module):
             dim=2,
         )  # shape: (B, Pnn, past_len+1+T, 4)
 
-        points_valid_all = near_past_cur_future_valid.to(
+        points_valid_all = target_past_cur_future_valid.to(
             torch.bool)  # shape: (B, Pnn, past_len+1+T)
 
         # stride 적용
@@ -490,7 +490,7 @@ class FeasibleProjector(nn.Module):
                                                                   past_len_ds:, :]  # shape: (B, Pnn, 1+T_ds, 4)
 
         # 정규화 포인트도 동일 index 로 다운샘플
-        near_past_xyyaw = near_past[..., :4]  # shape: (B, Pnn, past_len, 4)
+        near_past_xyyaw = target_past[..., :4]  # shape: (B, Pnn, past_len, 4)
         points_norm_all = torch.cat(
             [near_past_xyyaw, diffusion_trajectory],
             dim=2,
@@ -563,7 +563,7 @@ class FeasibleProjector(nn.Module):
     def _downsample_without_past(
         self,
         diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
-        near_past_cur_future_valid: torch.Tensor,  # shape: (B, Pnn, time_len)
+        target_past_cur_future_valid: torch.Tensor,  # shape: (B, Pnn, time_len)
         unnorm_diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
         sample_idx_local: torch.Tensor,  # shape: (1+T_ds,)
         future_len_ds: int,
@@ -585,7 +585,7 @@ class FeasibleProjector(nn.Module):
                 f"!= 1 + future_len={1 + future_len}")
 
         # 현재~미래 유효 마스크만 추출
-        cur_future_valid = near_past_cur_future_valid[:, :, -(
+        cur_future_valid = target_past_cur_future_valid[:, :, -(
             1 + future_len):].to(torch.bool)  # shape: (B, Pnn, 1+future_len)
 
         # 역정규화 궤적 다운샘플
@@ -617,9 +617,9 @@ class FeasibleProjector(nn.Module):
     def build_downsampled_feasible_inputs(
         self,
         diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4) 정규화 현재+미래
-        near_past: Optional[
+        target_past: Optional[
             torch.Tensor],  # shape: (B, Pnn, past_len, 11) 또는 None
-        near_past_cur_future_valid: torch.
+        target_past_cur_future_valid: torch.
         Tensor,  # shape: (B, Pnn, time_len=1+past_len+T) bool
         unnorm_diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
         unnorm_near_past_xyyaw: Optional[
@@ -654,19 +654,19 @@ class FeasibleProjector(nn.Module):
         # 1) 과거/미래 길이 계산
         past_len, future_len, _ = self._infer_past_future_lengths_for_downsample(
             diffusion_trajectory=diffusion_trajectory,  # shape: (B, Pnn, 1+T, 4)
-            near_past_cur_future_valid=
-            near_past_cur_future_valid,  # shape: (B, Pnn, 1+past_len+T)
+            target_past_cur_future_valid=
+            target_past_cur_future_valid,  # shape: (B, Pnn, 1+past_len+T)
         )
 
         # 2) config + past_len 으로 과거 사용 여부 결정
         use_past: bool = self._decide_use_past_for_downsample(
             past_len=past_len,
-            near_past=near_past,
+            target_past=target_past,
             unnorm_near_past_xyyaw=unnorm_near_past_xyyaw,
         )
 
         if use_past:
-            assert near_past is not None
+            assert target_past is not None
             assert unnorm_near_past_xyyaw is not None
 
             # 3-a) 과거+현재+미래 전체 타임라인용 stride index 계산
@@ -686,9 +686,9 @@ class FeasibleProjector(nn.Module):
             # 4-a) 전체 타임라인 기준으로 다운샘플 적용
             return self._downsample_with_past(
                 diffusion_trajectory=diffusion_trajectory,  # (B, Pnn, 1+T, 4)
-                near_past=near_past,  # (B, Pnn, past_len, 11)
-                near_past_cur_future_valid=
-                near_past_cur_future_valid,  # (B, Pnn, time_len)
+                target_past=target_past,  # (B, Pnn, past_len, 11)
+                target_past_cur_future_valid=
+                target_past_cur_future_valid,  # (B, Pnn, time_len)
                 unnorm_diffusion_trajectory=
                 unnorm_diffusion_trajectory,  # (B, Pnn, 1+T, 4)
                 unnorm_near_past_xyyaw=
@@ -709,7 +709,7 @@ class FeasibleProjector(nn.Module):
         # 4-b) 현재~미래 구간만 다운샘플 적용
         return self._downsample_without_past(
             diffusion_trajectory=diffusion_trajectory,
-            near_past_cur_future_valid=near_past_cur_future_valid,
+            target_past_cur_future_valid=target_past_cur_future_valid,
             unnorm_diffusion_trajectory=unnorm_diffusion_trajectory,
             sample_idx_local=sample_idx_local,
             future_len_ds=future_len_ds,
@@ -1110,7 +1110,7 @@ class FeasibleProjector(nn.Module):
             unnorm_diffusion_trajectory: torch.Tensor,  # (B,Pnn,1+future_len,4)
             unnorm_near_past_xyyaw: Optional[
                 torch.Tensor],  # (B,Pnn,past_len,4) or None
-            near_past_cur_future_valid: torch.
+            target_past_cur_future_valid: torch.
         Tensor,  # (B,Pnn,past_len+1+future_len) bool
     ) -> PointLenInputs:
         """(1) 과거/현재/미래 포인트 결합
@@ -1132,7 +1132,7 @@ class FeasibleProjector(nn.Module):
         """
         B, Pnn, T1_fut, C = unnorm_diffusion_trajectory.shape
         assert C == 4, "xyyaw 마지막 채널은 4여야 합니다."
-        Bv, Pnnv, total_time_len = near_past_cur_future_valid.shape
+        Bv, Pnnv, total_time_len = target_past_cur_future_valid.shape
         assert (Bv, Pnnv) == (B, Pnn), "valid 마스크 (B,Pnn) 불일치"
         if total_time_len < T1_fut:  # T1_fut = 1 + future_len
             raise ValueError("valid 마스크 길이가 (1+future_len)보다 짧습니다.")
@@ -1140,9 +1140,9 @@ class FeasibleProjector(nn.Module):
             past_len = 0
             # point_len = 1 + future_len
             unnorm_points_xyyaw = unnorm_diffusion_trajectory  # (B,Pnn,1+future_len,4)
-            # near_past_cur_future_valid: (B,Pnn,past_len+1+future_len)
+            # target_past_cur_future_valid: (B,Pnn,past_len+1+future_len)
             past_cur_valid = None  # 과거~현재 마스크 없음
-            cur_future_valid = near_past_cur_future_valid[:, :, -T1_fut:].to(
+            cur_future_valid = target_past_cur_future_valid[:, :, -T1_fut:].to(
                 torch.bool)  # (B,Pnn,1+future_len)
             points_valid = cur_future_valid  # (B,Pnn,1+future_len)
             # 현재~미래: True*False* 검증
@@ -1160,7 +1160,7 @@ class FeasibleProjector(nn.Module):
                 [unnorm_near_past_xyyaw, unnorm_diffusion_trajectory],
                 dim=2)  # (B,Pnn,past_len+1+future_len,4)
             # 마스크 분리
-            all_valid = near_past_cur_future_valid.to(
+            all_valid = target_past_cur_future_valid.to(
                 torch.bool)  # (B,Pnn,past_len+1+future_len)
             past_cur_valid = all_valid[..., :time_len]  # (B,Pnn,past_len+1)
             cur_future_valid = all_valid[..., past_len:]  # (B,Pnn,1+future_len)
@@ -1331,7 +1331,7 @@ class FeasibleProjector(nn.Module):
         unnorm_near_past_xyyaw: Optional[
             torch.Tensor],  # (B, Pnn, past_len, 4) or None
         unnorm_points_world_control: torch.Tensor,  # (B, Pnn, point_len, 3)
-        near_past_cur_future_valid: torch.
+        target_past_cur_future_valid: torch.
         Tensor,  # (B, Pnn, time_len(=1+past_len)+future_len) bool
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """중점 제어 계산을 위해
@@ -1352,8 +1352,8 @@ class FeasibleProjector(nn.Module):
             unnorm_diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
             unnorm_near_past_xyyaw=
             unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
-            near_past_cur_future_valid=
-            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len)+future_len)
+            target_past_cur_future_valid=
+            target_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len)+future_len)
         )
         unnorm_points_xyyaw = point_len_inputs.unnorm_points_xyyaw  # (B, Pnn, point_len, 4)
         points_valid = point_len_inputs.points_valid  # (B, Pnn, point_len)
@@ -1375,7 +1375,7 @@ class FeasibleProjector(nn.Module):
         # (B, Pnn, past_len, 4) = [x, y, cos, sin] (과거 구간) 또는 None
         unnorm_points_world_control: torch.Tensor,
         # (B, Pnn, point_len, 3) = [v_x^w, v_y^w, w]  (savgol_filter_for_control 출력)
-        near_past_cur_future_valid: torch.Tensor,
+        target_past_cur_future_valid: torch.Tensor,
         # (B, Pnn, time_len(=1+past_len) + future_len) bool  # 과거~현재~미래 노드 유효 마스크
     ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)  [v_x^b, v_y^b, w]_mid
         """구간 [t_k, t_{k+1})마다 중점(midpoint) 제어 [v_x^b, v_y^b, w]를 계산한다.
@@ -1399,8 +1399,8 @@ class FeasibleProjector(nn.Module):
             unnorm_near_past_xyyaw,  # (B, Pnn, past_len, 4) or None
             unnorm_points_world_control=
             unnorm_points_world_control,  # (B, Pnn, point_len, 3)
-            near_past_cur_future_valid=
-            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
+            target_past_cur_future_valid=
+            target_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
         )
 
         if point_len < 2:
@@ -2664,7 +2664,7 @@ class FeasibleProjector(nn.Module):
         # (B,Pnn,1+future_len,4) = [x, y, cos, sin]
         unnorm_near_past_xyyaw: Optional[torch.Tensor],
         # (B,Pnn,past_len,4) or None
-        near_past_cur_future_valid: torch.Tensor,
+        target_past_cur_future_valid: torch.Tensor,
         # (B,Pnn,past_len+1+future_len) bool
         *,
         dt: float = 0.1,
@@ -2685,7 +2685,7 @@ class FeasibleProjector(nn.Module):
             # (B,Pnn,1+future_len,4)
             unnorm_near_past_xyyaw=unnorm_near_past_xyyaw,
             # (B,Pnn,past_len,4) or None
-            near_past_cur_future_valid=near_past_cur_future_valid,
+            target_past_cur_future_valid=target_past_cur_future_valid,
             # (B,Pnn,past_len+1+future_len) bool
         )
         unnorm_points_xyyaw = point_len_inputs.unnorm_points_xyyaw  # (B,Pnn,point_len,4)
@@ -2811,7 +2811,7 @@ class FeasibleProjector(nn.Module):
     # <추가하자>
     def _infer_forward_lengths_and_validate_base(
         self,
-        near_past_cur_future_valid: torch.
+        target_past_cur_future_valid: torch.
         Tensor,  # (B, Pnn, time_len(=1+past_len) + future_len)
         diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
         seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
@@ -2827,7 +2827,7 @@ class FeasibleProjector(nn.Module):
             valid_all: (B, Pnn, 1+past_len+future_len) bool
             cur_future_valid: (B, Pnn, 1+future_len) bool
         """
-        B, Pnn, total_time_len = near_past_cur_future_valid.shape
+        B, Pnn, total_time_len = target_past_cur_future_valid.shape
         B2, Pnn2, one_plus_future_len, _ = diffusion_trajectory.shape
 
         future_len = one_plus_future_len - 1  # 현재 이후 미래 segment 개수
@@ -2850,7 +2850,7 @@ class FeasibleProjector(nn.Module):
         # <추가하자> 전체 길이 일관성 체크
         if total_time_len != past_len + 1 + future_len:
             raise ValueError(
-                f"[forward] near_past_cur_future_valid.shape[2]={total_time_len} "
+                f"[forward] target_past_cur_future_valid.shape[2]={total_time_len} "
                 f"!= past_len+1+future_len={past_len + 1 + future_len}")
 
         if (B2, Pnn2) != (B, Pnn):
@@ -2861,7 +2861,7 @@ class FeasibleProjector(nn.Module):
         _, _, segment_len, _ = seg_body_control.shape
 
         # 노드 기준 전체 유효 마스크 (bool)
-        valid_all = near_past_cur_future_valid.to(
+        valid_all = target_past_cur_future_valid.to(
             torch.bool)  # (B, Pnn, past_len+1+future_len)
 
         # 현재~미래 구간만 따로 떼서 1*0* 패턴 검증용(cur_future_valid)
@@ -2947,7 +2947,7 @@ class FeasibleProjector(nn.Module):
     # <추가하자>
     def _prepare_forward_points_and_mask(
             self,
-            near_past_cur_future_valid: torch.
+            target_past_cur_future_valid: torch.
         Tensor,  # (B, Pnn, time_len(=1+past_len) + future_len)
             diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
             near_past_xyyaw: Optional[
@@ -2957,7 +2957,7 @@ class FeasibleProjector(nn.Module):
         """forward 에서 사용할 포인트 궤적과 노드 유효 마스크를 준비한다.
 
         Args:
-            near_past_cur_future_valid:
+            target_past_cur_future_valid:
                 (B, Pnn, time_len(=1+past_len) + future_len) bool
                 = [과거 0..past_len-1, 현재, 미래 1..future_len] 노드 유효 마스크.
             diffusion_trajectory:
@@ -2980,7 +2980,7 @@ class FeasibleProjector(nn.Module):
             points_valid:
                 (B, Pnn, 1+segment_len) bool
                 - 과거 없음: 현재~미래 부분(cur_future_valid)
-                - 과거 있음: 과거~현재~미래 전체(near_past_cur_future_valid)
+                - 과거 있음: 과거~현재~미래 전체(target_past_cur_future_valid)
         """
         (
             B,  # int
@@ -2991,8 +2991,8 @@ class FeasibleProjector(nn.Module):
             valid_all,  # (B, Pnn, 1+past_len+future_len)
             cur_future_valid,  # (B, Pnn, 1+future_len)
         ) = self._infer_forward_lengths_and_validate_base(
-            near_past_cur_future_valid=
-            near_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
+            target_past_cur_future_valid=
+            target_past_cur_future_valid,  # (B, Pnn, time_len(=1+past_len) + future_len)
             diffusion_trajectory=
             diffusion_trajectory,  # (B, Pnn, 1+future_len, 4)
             seg_body_control=seg_body_control,  # (B, Pnn, segment_len, 3)
@@ -3277,7 +3277,7 @@ class FeasibleProjector(nn.Module):
 
     def forward(
             self,
-            near_past_cur_future_valid: torch.Tensor,
+            target_past_cur_future_valid: torch.Tensor,
             # (B, Pnn, time_len(=1+past_len) + future_len) bool
             diffusion_trajectory: torch.Tensor,  # (B, Pnn, 1+future_len, 4)
             near_past_xyyaw: Optional[
@@ -3294,7 +3294,7 @@ class FeasibleProjector(nn.Module):
         - 전체 (B,Pnn,segment_len,3) 제어 텐서로 다시 scatter 합니다.
 
         Args:
-            near_past_cur_future_valid:
+            target_past_cur_future_valid:
                 (B, Pnn, time_len(=1+past_len) + future_len) bool
                 과거~현재~미래 노드 유효 마스크.
             diffusion_trajectory:
@@ -3320,7 +3320,7 @@ class FeasibleProjector(nn.Module):
         #    points_trajectory: (B, Pnn, 1+segment_len, 4)
         #    points_valid:      (B, Pnn, 1+segment_len) bool
         points_trajectory, points_valid = self._prepare_forward_points_and_mask(
-            near_past_cur_future_valid=near_past_cur_future_valid,
+            target_past_cur_future_valid=target_past_cur_future_valid,
             diffusion_trajectory=diffusion_trajectory,
             near_past_xyyaw=near_past_xyyaw,
             seg_body_control=seg_body_control,
