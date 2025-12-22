@@ -1276,7 +1276,7 @@ class Decoder(nn.Module):
         inputs: Dict[str, torch.Tensor],
         correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
                                    torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor: # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다.
         Returns:
             x0:
@@ -1342,48 +1342,36 @@ class Decoder(nn.Module):
 
     def _reshape_inference_x0_to_sequence(
         self,
-        x0: torch.Tensor,  # (B, Pnn, F)
-        target_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
+        x0: torch.Tensor, # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+        target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         batch_size: int,
         one_or_Pnn: int,
     ) -> torch.Tensor:
-        """샘플링 결과 x0(flat)를 (B, Pnn, 1+T, 4) 형태로 복원한다.
-
-        Args:
-            x0: 샘플링 결과(flat).
-                shape: (B, Pnn, F)
-            target_current_xyyaw: 현재 상태(정규화).
-                shape: (B, Pnn, 4)
-            batch_size: B
-            one_or_Pnn: Pnn
-
+        """샘플링 결과 x0(flat)를 (B, (1+)Pnn, 1+T, 4) 형태로 복원한다.
         Returns:
             x0_seq:
-                shape: (B, Pnn, 1+T, 4)
+                shape: (B, (1+)Pnn, 1+T, 4)
         """
         B: int = batch_size
-        Pnn: int = one_or_Pnn
-
         if self.config.use_past_dit_input:
             x0_seq = x0.reshape(
                 B,
-                Pnn,
+                one_or_Pnn,
                 self.config.time_len + self._future_len,
                 4,
             )
             x0_seq = x0_seq[:, :, -(1 + self._future_len):, :]  # (B,Pnn,1+T,4)
             return x0_seq
-
         if self.config.use_current_input:
-            assert x0.shape == (B, Pnn, (1 + self._future_len) * 4)
-            x0_seq = x0.reshape(B, Pnn, -1, 4)  # (B,Pnn,1+T,4)
+            assert x0.shape == (B, one_or_Pnn, (1 + self._future_len) * 4)
+            x0_seq = x0.reshape(B, one_or_Pnn, -1, 4)  # (B,Pnn,1+T,4)
             return x0_seq
 
-        assert x0.shape == (B, Pnn, self._future_len * 4)
+        assert x0.shape == (B, one_or_Pnn, self._future_len * 4)
         x0_seq = torch.cat(
             [
                 target_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
-                x0.reshape(B, Pnn, -1, 4),  # (B,Pnn,T,4)
+                x0.reshape(B, one_or_Pnn, -1, 4),  # (B,Pnn,T,4)
             ],
             dim=2,
         )  # (B,Pnn,1+T,4)
@@ -1391,8 +1379,8 @@ class Decoder(nn.Module):
 
     def _inverse_normalize_and_cleanup_padding(
             self,
-            x_norm: torch.Tensor,  # (B, Pnn, 1+T, 4)
-            target_current_mask: torch.Tensor,  # (B, Pnn)
+            x_norm: torch.Tensor,  # (B, (1+)Pnn, 1+T, 4)
+            target_current_mask: torch.Tensor, # (B, (1+)Pnn)
     ) -> torch.Tensor:
         """정규화된 궤적을 역정규화하고, 패딩 슬롯은 0으로 정리한다.
 
@@ -1414,36 +1402,28 @@ class Decoder(nn.Module):
 
     def _append_inference_feasible_outputs(
             self,
-            outputs: Dict[str, torch.Tensor],
-            target_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
-            target_current_mask: torch.Tensor,  # (B, Pnn)
+            outputs: Dict[str, torch.Tensor], #
+            target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> None:
         """추론 모드에서 feasible 출력(integrated_trajectory)을 outputs에 추가한다.
-
-        Args:
-            outputs: 반환 dict (in-place 업데이트).
-            target_current_xyyaw: 현재 상태(정규화).
-                shape: (B, Pnn, 4)
-            target_current_mask: True=무효 에이전트.
-                shape: (B, Pnn)
-
         Returns:
             None
         """
         if not getattr(self.config, "use_feasible", False):
             return
 
-        # integrated_trajectory: (B, Pnn, T, 4)  (정규화 상태)
+        # integrated_trajectory: (B, (1+)Pnn, T, 4)  (정규화 상태)
         integrated_trajectory: torch.Tensor = self.dit.dit_returns.integrated_trajectory
         integrated_trajectory = torch.cat(
             [target_current_xyyaw.unsqueeze(2), integrated_trajectory],
             dim=2,
-        )  # (B, Pnn, 1+T, 4)
+        )  # (B, (1+)Pnn, 1+T, 4)
 
         unnorm_integrated: torch.Tensor = self._state_normalizer.inverse(
             integrated_trajectory)
         unnorm_integrated[target_current_mask] = 0.0
-
+        # (B, (1+)Pnn, 1+T, 4)
         outputs["integrated_trajectory"] = unnorm_integrated
 
     def _forward_training_mode(
@@ -1535,7 +1515,7 @@ class Decoder(nn.Module):
             # (B, (1+)Pnn, time_len, 11)
         target_past: torch.Tensor,
         target_current_xyyaw: torch.Tensor,
-        target_current_mask: torch.Tensor,
+        target_current_mask: torch.Tensor, # (B, (1+)Pnn)
         target_past_cur_future_valid: torch.Tensor,
         target_class_one_hot: torch.Tensor,
         cond_last_pos_norm: torch.Tensor,
@@ -1586,6 +1566,7 @@ class Decoder(nn.Module):
         )
 
         # 5) dpm_sampler 실행
+        # x0: (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         x0: torch.Tensor = self._run_dpm_sampler_for_inference(
             xT=xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
@@ -1605,9 +1586,9 @@ class Decoder(nn.Module):
         # dtype 맞춤(기존 로직 유지)
         x0 = x0.to(xT.dtype)
 
-        # 6) (B,Pnn,F) -> (B,Pnn,1+T,4)
+        # 6) (B,(1+)Pnn,F) -> (B, (1+)Pnn, 1+T, 4)
         x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
-            x0=x0,
+            x0=x0, # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             target_current_xyyaw=target_current_xyyaw,
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
@@ -1615,18 +1596,18 @@ class Decoder(nn.Module):
 
         # 7) 역정규화 및 패딩 정리
         unnorm_x0: torch.Tensor = self._inverse_normalize_and_cleanup_padding(
-            x_norm=x0_seq_norm,
-            target_current_mask=target_current_mask,
+            x_norm=x0_seq_norm, # (B, (1+)Pnn, 1+T, 4)
+            target_current_mask=target_current_mask, # (B, (1+)Pnn)
         )
 
         # 8) feasible 출력(옵션)
         self._append_inference_feasible_outputs(
             outputs=return_,
-            target_current_xyyaw=target_current_xyyaw,
-            target_current_mask=target_current_mask,
+            target_current_xyyaw=target_current_xyyaw, # (B, (1+)Pnn, 4)
+            target_current_mask=target_current_mask, # (B, (1+)Pnn)
         )
 
-        return_["score"] = unnorm_x0
+        return_["score"] = unnorm_x0 # (B, (1+)Pnn, 1+T, 4)
         return return_
 
     def forward(
@@ -1732,7 +1713,7 @@ class Decoder(nn.Module):
                 # (B, (1+)Pnn, time_len, 11)
                 target_past=target_past,
                 target_current_xyyaw=target_current_xyyaw,
-                target_current_mask=target_current_mask,
+                target_current_mask=target_current_mask, # (B, (1+)Pnn)
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 target_class_one_hot=target_class_one_hot,
                 cond_last_pos_norm=cond_last_pos_norm,
