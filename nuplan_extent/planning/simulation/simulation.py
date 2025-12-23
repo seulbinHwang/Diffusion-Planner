@@ -11,6 +11,7 @@ from nuplan.planning.simulation.history.simulation_history_buffer import Simulat
 from nuplan.planning.simulation.planner.abstract_planner import PlannerInput
 from nuplan.planning.simulation.simulation_setup import SimulationSetup
 from nuplan.planning.simulation.trajectory.abstract_trajectory import AbstractTrajectory
+from nuplan_extent.planning.simulation.observation.world_model_agents_w_ego import WorldModelAgentsWEgo
 from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents
 from nuplan_extent.planning.simulation.observation.world_model_log_replay import WorldModelLogReplay
 from nuplan.planning.simulation.planner.abstract_planner import PlannerInitialization
@@ -176,8 +177,9 @@ class Simulation:
 
         # Propagate state
         if next_iteration:
-            self._ego_controller.update_state(iteration, next_iteration,
-                                              ego_state, trajectory)
+            if not isinstance(self._observations, WorldModelAgentsWEgo):
+                self._ego_controller.update_state(iteration, next_iteration,
+                                                  ego_state, trajectory)
             if isinstance(self._observations,
                           (WorldModelAgents, WorldModelLogReplay)):
                 self._observations.update_observation(
@@ -188,6 +190,14 @@ class Simulation:
                                                       self._history_buffer)
         else:
             self._is_simulation_running = False
+        if isinstance(self._observations, WorldModelAgentsWEgo):
+            # TODO: ego_state와 trajectory를 WorldModelAgentsWEgo 에서 가져오도록 수정 필요
+            """
+            ego_state : EgoState
+            trajectory : AbstractTrajectory
+            """
+            self._ego_controller.update_state(iteration, next_iteration,
+                                              ego_state, trajectory)
 
         # Append new state into history buffer
         self._history_buffer.append(self._ego_controller.get_state(),

@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # User Configuration Section
 ###################################
 NUBES_NUPLAN_FOLDER_NAME="processed_nuplan_final_150"
-NUBES_WOMD_FOLDER_NAME="processed_womd_final_150"
+NUBES_WOMD_FOLDER_NAME="processed_womd_final_150_bugfix_1"
 NUBES_WOMD_SPLIT_NAME="training"
 
 TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
