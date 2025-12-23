@@ -600,27 +600,8 @@ class WorldModelAgentsWEgo(AbstractMLAgents):
         }
         self._diffusion_agents = {}
         dynamic_agents: Dict[str, TrackedObject] = sort_dict(unique_agents)
-        self._log_replay_agents = sort_dict(
-            self._get_open_loop_track_objects(0))
         self._agents: Dict[str, TrackedObject] = {
             **dynamic_agents,
-            **self._log_replay_agents
-        }
-
-    def _get_open_loop_track_objects(
-            self, iteration: int) -> Dict[str, TrackedObject]:
-        """
-        Get open-loop tracked objects from scenario.
-        :param iteration: The simulation iteration.
-        :return: A list of TrackedObjects.
-        """
-        detections = self._scenario.get_tracked_objects_at_iteration(iteration)
-        tracked_objects = detections.tracked_objects.get_tracked_objects_of_types(
-            self._open_loop_detections_types)
-        return {
-            tracked_object.track_token: tracked_object
-            for tracked_object in tracked_objects
-            if tracked_object.track_token is not None
         }
 
     # world_model_agents.py  ─ 클래스 내부 헬퍼(스켈레톤): 파라미터 프리셋
@@ -1068,9 +1049,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         self._update_diffusion_agents_observation(iteration, next_iteration,
                                                   history, next_ego_state,
                                                   ego_future_trajectory)
-        self._log_replay_agents = sort_dict(
-            self._get_open_loop_track_objects(next_iteration.index))
-        self._agents = {**self._diffusion_agents, **self._log_replay_agents}
+        self._agents = {**self._diffusion_agents}
         if self._is_vis_features:
             input_data, output_data = self._draw_infos.to_dict()
             draw_machine.draw_world_model_to_png(input_data, output_data,

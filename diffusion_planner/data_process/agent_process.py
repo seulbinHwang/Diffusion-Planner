@@ -968,51 +968,147 @@ def _build_present_static_feature_6(
 
 from typing import Optional, List, Tuple  # 이미 있으면 중복 import는 제거해도 OK
 
+def _filter_out_neighbors_not_present_at_current(
+    neighbor_agents_past: np.ndarray,        # shape: (K, T, 11)
+    agents_cur_frame_indices: np.ndarray,    # shape: (K,)
+    neighbors_id: np.ndarray,                # shape: (K,)
+    *,
+    eps: float = 1e-8,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """현재 프레임에 '실제로 존재하는' 이웃 에이전트만 남긴다.
+
+    여기서 "현재 프레임"은 neighbor_agents_past의 마지막 시간 인덱스(T-1)입니다.
+
+    어떤 이웃이 현재에 존재한다고 볼지(판정 기준)
+    -------------------------------------------
+    - neighbor_agents_past[k, -1, :8] = [x, y, cos, sin, vx, vy, width, length]
+      이 8개 값이 전부 0(또는 0에 매우 가까움)이면,
+      그 이웃은 "현재 프레임에 존재하지 않는다"고 판단합니다.
+    - (주의) 타입 one-hot(마지막 3차원)은 시간 전체에 복사되는 구조라서,
+      타입 값이 0이 아니더라도 동적 상태가 전부 0이면 "없는 에이전트"로 봐야 합니다.
+      그래서 판정은 앞 8차원만 사용합니다.
+
+    이 함수가 필요한 이유
+    --------------------
+    아주 드문 엣지 케이스(업스트림에서 섞인 0-padding 등)로 인해
+    현재 프레임이 전부 0인 이웃이 선택 결과에 들어오면,
+    이후 단계에서 그 이웃이 "전 시간 0"으로 남아버릴 수 있습니다.
+    당신의 의도는 그런 이웃은 결과 텐서에 아예 포함되지 않는 것이므로,
+    여기서 agent 축에서 제거합니다.
+
+    Args:
+        neighbor_agents_past (np.ndarray):
+            shape: (K, T, 11)
+            - K: 선택된 이웃 수
+            - T: 과거+현재 프레임 수
+        agents_cur_frame_indices (np.ndarray):
+            shape: (K,)
+            - 현재 프레임 기준으로 선택된 이웃의 원본 인덱스들
+        neighbors_id (np.ndarray):
+            shape: (K,)
+            - 선택된 이웃들의 track_id
+        eps (float):
+            0과 "거의 0"을 구분하기 위한 작은 값
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray, np.ndarray]:
+            - filtered_neighbor_agents_past: shape (K_valid, T, 11)
+            - filtered_agents_cur_frame_indices: shape (K_valid,)
+            - filtered_neighbors_id: shape (K_valid,)
+    """
+    if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[-1] != 11:
+        raise ValueError(
+            f"`neighbor_agents_past`는 (K, T, 11) shape 이어야 합니다. got {neighbor_agents_past.shape}"
+        )
+    if agents_cur_frame_indices.ndim != 1 or neighbors_id.ndim != 1:
+        raise ValueError(
+            "`agents_cur_frame_indices`와 `neighbors_id`는 1차원 배열이어야 합니다."
+        )
+    if neighbor_agents_past.shape[0] != agents_cur_frame_indices.shape[0] or \
+       neighbor_agents_past.shape[0] != neighbors_id.shape[0]:
+        raise ValueError(
+            "세 입력의 agent 축 길이가 서로 달라서 정렬/필터링이 불가능합니다. "
+            f"K={neighbor_agents_past.shape[0]}, "
+            f"indices={agents_cur_frame_indices.shape[0]}, ids={neighbors_id.shape[0]}"
+        )
+
+    K: int = int(neighbor_agents_past.shape[0])
+    if K == 0:
+        return neighbor_agents_past, agents_cur_frame_indices, neighbors_id
+
+    # current_state_8: (K, 8)
+    current_state_8: np.ndarray = neighbor_agents_past[:, -1, :8]
+
+    # current_present_mask: (K,)
+    # - 현재 프레임에서 8개 값 중 하나라도 0이 아니면 "존재"
+    current_present_mask: np.ndarray = (np.abs(current_state_8) > eps).any(axis=1)
+
+    return (
+        neighbor_agents_past[current_present_mask],
+        agents_cur_frame_indices[current_present_mask],
+        neighbors_id[current_present_mask],
+    )
 
 def _compute_valid_sorted_indices(
-    all_frame_np_agents_local: np.
-    ndarray,  # (num_frames, current_agents_num, 9)
+    all_frame_np_agents_local: np.ndarray,  # shape: (num_frames, current_agents_num, 9)
     filter_radius: Optional[float],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """filter_radius 를 적용한 뒤, ego와의 거리 기준으로 에이전트 인덱스를 정렬한다.
 
+    추가로, "현재 프레임에 존재하지 않는 에이전트(현재 상태가 전부 0)"는
+    후보에서 아예 제외한다.
+
     Args:
         all_frame_np_agents_local:
             - shape: (num_frames, current_agents_num, 9)
+            - 마지막 채널(8)은 track_id
+            - 앞 8채널은 [x, y, cos, sin, vx, vy, width, length]
         filter_radius:
-            - None 이 아니면, ego 기준 거리 <= filter_radius 인 에이전트만 사용.
+            - None 이 아니면, ego 기준 거리 <= filter_radius 인 에이전트만 후보.
 
     Returns:
         sorted_cur_agent_indices:
-            - shape: (M,)  # M = 유효 에이전트 수
+            - shape: (M,)  # M = 유효 후보 수
             - ego 로부터 가까운 순서대로 정렬된 현재 프레임 인덱스.
         dist_from_cur_agent_to_ego:
             - shape: (current_agents_num,)
             - 각 에이전트의 ego 기준 2D 거리.
     """
-    # 현재 프레임(마지막 프레임 기준)에서 ego까지의 거리: (current_agents_num,)
-    dist_from_cur_agent_to_ego = np.linalg.norm(
-        all_frame_np_agents_local[-1, :, :2], axis=-1)
+    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[-1] < 9:
+        raise ValueError(
+            f"`all_frame_np_agents_local`는 (T, N, 9) shape 이어야 합니다. got {all_frame_np_agents_local.shape}"
+        )
 
-    current_agents_num: int = all_frame_np_agents_local.shape[1]
+    # 현재 프레임(마지막 프레임 기준)에서 ego까지의 거리: (current_agents_num,)
+    dist_from_cur_agent_to_ego: np.ndarray = np.linalg.norm(
+        all_frame_np_agents_local[-1, :, :2], axis=-1
+    )
+
+    current_agents_num: int = int(all_frame_np_agents_local.shape[1])
+
+    # (핵심) 현재 프레임 존재 여부 판단: (current_agents_num,)
+    # - [x, y, cos, sin, vx, vy, width, length] 이 전부 0이면 "현재에 없음"
+    eps: float = 1e-8
+    current_state_8: np.ndarray = all_frame_np_agents_local[-1, :, :8]  # (N, 8)
+    present_mask: np.ndarray = (np.abs(current_state_8) > eps).any(axis=1)  # (N,)
 
     # filter_radius 내의 에이전트만 후보로 사용
     if filter_radius is not None:
-        valid_mask = dist_from_cur_agent_to_ego <= float(
-            filter_radius)  # (current_agents_num,)
-        valid_indices = np.nonzero(valid_mask)[0]  # (M,)
+        within_radius = dist_from_cur_agent_to_ego <= float(filter_radius)  # (N,)
+        valid_mask = present_mask & within_radius
     else:
-        valid_indices = np.arange(current_agents_num,
-                                  dtype=int)  # (current_agents_num,)
+        valid_mask = present_mask
+
+    valid_indices: np.ndarray = np.nonzero(valid_mask)[0].astype(int)  # (M,)
 
     if valid_indices.size == 0:
         # 유효한 에이전트가 하나도 없는 경우
         return np.zeros((0,), dtype=int), dist_from_cur_agent_to_ego
 
     # 유효한 에이전트들만 뽑아서 거리 기준 정렬
-    dist_valid = dist_from_cur_agent_to_ego[valid_indices]  # (M,)
-    order_local = np.argsort(dist_valid)  # (M,)
-    sorted_cur_agent_indices = valid_indices[order_local]  # (M,)
+    dist_valid: np.ndarray = dist_from_cur_agent_to_ego[valid_indices]  # (M,)
+    order_local: np.ndarray = np.argsort(dist_valid)  # (M,)
+    sorted_cur_agent_indices: np.ndarray = valid_indices[order_local]  # (M,)
 
     return sorted_cur_agent_indices, dist_from_cur_agent_to_ego
 
@@ -1458,35 +1554,11 @@ def build_neighbor_past_feature(
     """이웃 에이전트의 과거+현재 궤적을 ego 기준으로 변환하고,
     가까운 에이전트들만 골라 (chosen_agent_num, T, 11) 텐서로 만든다.
 
-    개념 요약
-    --------
-    1) `past_cur_agents_world_8_list` 를 이용해, 각 프레임에서
-       [track_id, vx, vy, heading, width, length, x, y] 상태를 ego 기준으로 변환한다.
-       → `build_agents_past_ego_frame_array` 로 (T, N, 9) 텐서 생성
-         · T: num_frames, N: 현재 프레임에서 ego 기준 존재 여부 필터링 후 남는 에이전트 수
-         · 채널: [x, y, cos(h), sin(h), vx, vy, width, length, id]
-
-    2) 현재 프레임(T-1) 기준으로,
-       - ego와의 거리,
-       - 타입(차량/보행자/자전거),
-       - 옵션으로 `filter_radius`,
-       - 옵션으로 `max_pedestrians`, `max_bicycles`
-       를 이용해 어떤 에이전트를 K개까지 선택할지 결정한다.
-       → `_select_neighbor_agents_and_build_past` 호출
-
-       · `max_pedestrians` 또는 `max_bicycles` 가 None 이면:
-         → 타입은 무시하고, 단순히 거리 가까운 순으로 `max_agent_num` 개까지 선택.
-       · 둘 다 정수면:
-         → 보행자/자전거 상한 적용 후, 차량으로 나머지 채움.
-
-       · `filter_radius` 가 주어지면:
-         → ego 기준 거리 <= filter_radius 인 에이전트만 후보.
-
-    3) 선택된 에이전트들에 대해서만
-       (chosen_agent_num, T, 11) 텐서를 만든다.
-       · 앞 8차원: [x, y, cos, sin, vx, vy, width, length]
-       · 뒤 3차원: 타입 one-hot (vehicle, pedestrian, bicycle)
-       · chosen_agent_num ≤ max_agent_num (실제 장면에 따라 K는 매번 달라질 수 있음)
+    추가 보장(중요)
+    -------------
+    - 최종 출력에는 "현재 프레임이 전부 0인 이웃"이 절대 포함되지 않도록,
+      선택 이후 한 번 더 걸러낸다.
+      (아주 드문 데이터 이상/0-padding 혼입 케이스를 확실히 막기 위함)
 
     Args:
         past_cur_agents_world_8_list:
@@ -1495,41 +1567,29 @@ def build_neighbor_past_feature(
             - [track_id, vx, vy, heading, width, length, x, y] (월드 좌표계)
         past_cur_agents_types_list:
             - 길이: num_frames
-            - 각 프레임에서 에이전트 타입 리스트 (TrackedObjectType).
             - 현재 프레임(마지막 원소)의 타입 정보를 사용.
         max_agent_num:
             - 선택할 이웃 에이전트 수의 상한값.
-            - 실제 선택 수 chosen_agent_num 는 chosen_agent_num ≤ max_agent_num.
         ego_cur_pose_np:
             - shape: (3,), [x_ego, y_ego, yaw_ego]
-            - ego 현재 포즈.
-        max_pedestrians:
-            - None 이면 타입 상한 미사용 (거리 순으로만 선택).
-            - 정수면 보행자 최대 개수 상한.
-        max_bicycles:
-            - None 이면 타입 상한 미사용 (거리 순으로만 선택).
-            - 정수면 자전거 최대 개수 상한.
+        max_pedestrians / max_bicycles:
+            - None 이면 타입 상한 미사용, 정수면 타입 상한 적용.
+        token_to_id:
+            - track_token → int ID 매핑
         filter_radius:
             - None 이 아니면 ego 기준 거리 <= filter_radius 인 에이전트만 후보.
-            - None 이면 거리 제한 없음.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
             - neighbor_agents_past:
                 · shape: (chosen_agent_num, num_frames, 11)
-                · chosen_agent_num = 선택된 이웃 수 (chosen_agent_num ≤ max_agent_num)
-                · [x, y, cos, sin, vx, vy, width, length, id,
-                   onehot_vehicle, onehot_ped, onehot_bike]
+                · [x, y, cos, sin, vx, vy, width, length, onehot_vehicle, onehot_ped, onehot_bike]
             - agents_cur_frame_indices:
                 · shape: (chosen_agent_num,)
-                · 현재 프레임(마지막 프레임)의 에이전트 배열에서의 행 인덱스.
-                · get_neighbor_track_tokens 에서 track_token 매핑에 사용.
             - neighbors_id:
                 · shape: (chosen_agent_num,)
-                · 각 이웃 에이전트의 track_id (현재 프레임 기준).
             - neighbor_track_token:
-                · shape: (chosen_agent_num,)
-                · 선택된 이웃 에이전트들의 track_token 리스트.
+                · 길이: chosen_agent_num
     """
     agents_states_dim = 8  # x, y, cos h, sin h, vx, vy, width, length
 
@@ -1543,12 +1603,7 @@ def build_neighbor_past_feature(
         agents_states_dim=agents_states_dim,
     )
 
-    # 필터/타입 상한/거리 기준으로 이웃 선택 + (chosen_agent_num, T, 11) 텐서 구성
-    """
-    neighbor_agents_past: (chosen_agent_num, num_frames, 11)
-    agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
-    neighbors_id:         (chosen_agent_num,)
-    """
+    # 이웃 선택 + (chosen_agent_num, T, 11) 텐서 구성
     neighbor_agents_past, agents_cur_frame_indices, neighbors_id = \
         _select_neighbor_agents_and_build_past(
             all_frame_np_agents_local=all_frame_np_agents_local,
@@ -1559,14 +1614,32 @@ def build_neighbor_past_feature(
             max_bicycles=max_bicycles,
             filter_radius=filter_radius,
         )
-    id_to_token = {v: k for k, v in token_to_id.items()}
+
+    # ✅ (핵심) "현재 프레임이 전부 0"인 이웃이 섞여 들어오면 여기서 제거
+    neighbor_agents_past, agents_cur_frame_indices, neighbors_id = \
+        _filter_out_neighbors_not_present_at_current(
+            neighbor_agents_past=neighbor_agents_past,              # (K, T, 11)
+            agents_cur_frame_indices=agents_cur_frame_indices,      # (K,)
+            neighbors_id=neighbors_id,                              # (K,)
+        )
+
+    # neighbors_id -> track_token 변환
+    id_to_token: Dict[int, str] = {int(v): k for k, v in token_to_id.items()}
+
     neighbor_track_token: List[str] = []
     for track_id in neighbors_id:
-        if track_id == -1:
+        track_id_int: int = int(track_id)
+        if track_id_int == -1:
             raise ValueError("Neighbor agent has invalid track_id -1.")
-        else:
-            neighbor_track_token.append(id_to_token[track_id])
+        if track_id_int not in id_to_token:
+            raise KeyError(
+                f"neighbors_id={track_id_int} 가 token_to_id에 존재하지 않습니다. "
+                "ID 정밀도(특히 float 변환) 또는 token_to_id 갱신 흐름을 점검해 주세요."
+            )
+        neighbor_track_token.append(id_to_token[track_id_int])
+
     return neighbor_agents_past, agents_cur_frame_indices, neighbors_id, neighbor_track_token
+
 
 
 def agent_future_all_process(
