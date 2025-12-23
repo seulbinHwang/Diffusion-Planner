@@ -2061,6 +2061,108 @@ def collect_neighbor_indices_at_current(
     return indices
 
 
+def _compute_valid_mask_from_prefix_nonzero(
+    features: np.ndarray,
+    prefix_dim: int,
+) -> np.ndarray:
+    """마지막 차원의 앞쪽(prefix) 값이 '전부 0인지'로 유효 마스크를 만듭니다.
+
+    규칙:
+      - 마지막 차원(feature_dim) 중 앞 prefix_dim개가 전부 0이면 invalid(False)
+      - 하나라도 0이 아닌 값이 있으면 valid(True)
+
+    예시:
+      - ego_agent_past: (time_len, 11) -> (time_len,) bool
+      - neighbor_agents_past: (A, time_len, 11) -> (A, time_len) bool
+      - lanes: (L, lane_len, 12) -> (L, lane_len) bool
+
+    Args:
+        features: numpy 배열. shape: (..., feature_dim)
+            - 마지막 차원이 feature_dim이어야 합니다.
+        prefix_dim: 마지막 차원에서 앞쪽으로 검사할 길이.
+            - agent feature(11)에서는 보통 8
+            - lane/route feature(12)에서도 보통 8
+            - (x,y,heading) 3차원에서는 3
+
+    Returns:
+        valid_mask: bool 배열. shape: features.shape[:-1]
+    """
+    # features: np.ndarray, shape (..., feature_dim)
+    if features.ndim < 1:
+        raise ValueError(
+            f"features must have at least 1 dim. got shape={features.shape}")
+
+    feature_dim = int(features.shape[-1])
+    k = int(prefix_dim)
+    if k <= 0 or k > feature_dim:
+        raise ValueError(
+            f"prefix_dim must be in [1, feature_dim]. got prefix_dim={k}, feature_dim={feature_dim}"
+        )
+
+    prefix = features[..., :k]  # shape (..., k)
+    # abs_sum: shape (...,)
+    abs_sum = np.sum(np.abs(prefix), axis=-1)
+    valid_mask = abs_sum > 0.0
+    return valid_mask.astype(bool)
+
+def assert_cur_future_valid_mask_np(
+    valid_bpt,
+    *,
+    context: str = "savgol_filter_for_control",
+) -> None:
+    """유효 마스크가 행마다 True*False* (단조 감소)인지 검사합니다(NumPy 버전).
+
+    의미
+    ----
+    시간축을 왼쪽→오른쪽으로 볼 때,
+    한 번 False(무효)가 된 이후에는 다시 True(유효)로 돌아오면 안 됩니다.
+    즉, 각 (b, p) 행이 아래 패턴만 허용됩니다.
+
+      - 허용: [True, True, True, False, False]
+      - 금지: [True, False, True, False]  (중간에 구멍)
+      - 금지: [False, True, True, ...]   (무효였다가 다시 유효)
+
+    Args:
+        valid_bpt (np.ndarray):
+            유효 마스크.
+            shape: (B, Pnn, T1)
+            dtype: bool (또는 0/1 같은 값이면 bool로 해석됨)
+            - True: 유효
+            - False: 무효
+        context (str):
+            에러 메시지에 표시할 호출 위치 문자열.
+
+    Raises:
+        ValueError:
+            0→1 전이(False→True)가 하나라도 발견되면 발생합니다.
+    """
+    v0 = np.asarray(valid_bpt)
+    if v0.ndim != 3:
+        raise ValueError(
+            f"valid_bpt must be (B,Pnn,T1). got shape={v0.shape}")
+
+    B, Pnn, T1 = v0.shape
+    v = v0.astype(np.bool_).reshape(-1, T1).astype(np.int8)  # (B*Pnn, T1)
+
+    # d[t] = v[t+1] - v[t]  ->  (0→1) 이면 +1
+    d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
+    has_01 = (d > 0).any(axis=1)  # (B*Pnn,)
+
+    if np.any(has_01):
+        bad_idx = np.nonzero(has_01)[0]  # (N_bad,)
+        max_show = min(int(bad_idx.size), 8)
+        bad_idx_sample = bad_idx[:max_show]
+
+        b_list = (bad_idx_sample // Pnn).tolist()
+        p_list = (bad_idx_sample % Pnn).tolist()
+
+        raise ValueError(
+            f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*).\n"
+            f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.size)},\n"
+            f"example (b,p)={list(zip(b_list, p_list))}.\n"
+            f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
+        )
+
 def pack_agent_future_3(
         pos_xy: np.ndarray,  # shape: (T,2)
         yaw_rad: np.ndarray,  # shape: (T,)
@@ -3967,6 +4069,14 @@ def build_cache_dict_for_scenario(
         SAFETY_LEN,
     )
 
+    neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
+        neighbor_future_gt_3_dim, prefix_dim=3)
+    neighbor_future_gt_is_valid = np.expand_dims(
+        neighbor_future_gt_is_valid, axis=0)
+    assert_cur_future_valid_mask_np(
+        neighbor_future_gt_is_valid,
+        context=f" - neighbor_future_gt_is_valid",
+    )
     cache_dict: Dict[str, Any] = {
         "scenario_id": str(scenario.scenario_id),
 
