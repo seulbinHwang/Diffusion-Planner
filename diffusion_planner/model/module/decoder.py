@@ -581,12 +581,6 @@ class Decoder(nn.Module):
         target_future_valid: torch.Tensor,  #  (B, (1+) Pnn, future_len) bool
     ) -> torch.Tensor:  # (B, (1+)Pnn, time_len + future_len)
         target_past_current_valid = ~target_past_current_mask  # [B, (1+)pnn, time_len]  True=유효 에이전트
-        self._assert_past_cur_valid_mask(
-            target_past_current_valid,
-            context="_get_target_past_cur_future_valid",)
-        self._assert_cur_future_valid_mask(
-            target_future_valid,
-            context="_get_target_past_cur_future_valid",)
         target_past_cur_future_valid = torch.cat(
             [target_past_current_valid, target_future_valid],
             dim=-1)  # [B, (1+)pnn, time_len + future_len] bool
