@@ -814,9 +814,7 @@ def _build_target_future_tensors_and_masks(
             f"ego_future_gt_4_dim must be (B, future_len, 4). got {tuple(ego_future_gt_4_dim.shape)}, "
             f"expected ({B}, {future_len}, 4)"
         )
-    near_cur_future_valid = ~near_cur_future_mask  # (B, Pnn, future_len)
-    _assert_cur_future_valid_mask(near_cur_future_valid,
-                                  context="_build_target_future_tensors_and_masks")
+
     if near_cur_future_mask.shape != (B, Pnn, 1 + future_len):
 
         raise ValueError(
@@ -966,7 +964,9 @@ def diffusion_loss_func(
 
     # 기본 크기 정보
 
-
+    near_future_valid = ~near_future_mask  # (B, Pnn, future_len)
+    _assert_cur_future_valid_mask(near_future_valid,
+                                  context="_build_target_future_tensors_and_masks")
     # 미래/현재 마스크 및 현재 상태 준비
     # near_future_valid: (B, Pnn, future_len)
     # near_cur_future_mask: (B, Pnn, 1+future_len)
