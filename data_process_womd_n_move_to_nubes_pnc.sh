@@ -20,7 +20,7 @@ echo "[WOMD] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
 echo "Step 1: Running data processing..."
 
 WOMD_DATA_ROOT="/media/user/E/dataset/womd_v1_3"
-TRAIN_SET_NAME="processed_womd_final_150_bugfix_1"
+TRAIN_SET_NAME="processed_womd_final_150_bugfix_2"
 SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
