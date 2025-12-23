@@ -1605,6 +1605,8 @@ class DataProcessor(object):
         key_to_road_safety["crosswalk_points"] = crosswalk_points
         return key_to_road_safety
 
+
+
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
         for scenario in scenarios:
