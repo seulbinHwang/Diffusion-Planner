@@ -827,7 +827,7 @@ def _build_target_future_tensors_and_masks(
     )
 
     # ego_future_gt_11_dim: (B, future_len, 11)
-    ego_future_gt_11_dim: torch.Tensor = norm_inputs["ego_future_gt_11_dim"]
+    ego_future_gt_11_dim: torch.Tensor = norm_inputs["planner_future_11_dim"]
     # ego_agent_past: (B, time_len, 11)
     ego_agent_past: torch.Tensor = norm_inputs["ego_agent_past"]
     # ego_cur_gt_11_dim: (B, 1, 11)
