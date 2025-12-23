@@ -61,66 +61,7 @@ def _compute_valid_mask_from_feat_11(
     return (abs_max > float(eps))
 
 
-def _keep_only_current_connected_valid_block(
-    full_feat_11: np.ndarray,  # shape: (T, 11)
-    current_index: int,
-    enforce_all_invalid_when_current_invalid: bool,
-) -> np.ndarray:
-    """과거~현재~미래를 합친 (T,11)에서, 규칙을 만족하도록 '유효/무효'를 정리합니다.
 
-    처리 목표(요구사항 그대로):
-      1) 현재 점이 무효면:
-         - (enforce_all_invalid_when_current_invalid=True일 때)
-           101개(=T개) 점을 전부 무효로 만듭니다. (전부 0)
-      2) 현재 점이 유효면:
-         - "유효점과 유효점 사이에 무효점이 있으면 안 된다" 규칙을 만족해야 합니다.
-         - 이 규칙을 가장 확실하게 만족시키는 방법은,
-           '현재 시점과 시간적으로 붙어있는(연속된) 유효 구간'만 남기고
-           그 밖의 시점은 전부 0으로 비우는 것입니다.
-         - 결과적으로 유효 구간은 항상 한 덩어리로만 남게 됩니다.
-
-    Args:
-        full_feat_11: (T,11) float32. 과거~현재~미래를 합친 최종 11차원 시계열.
-        current_index: 현재 시점이 full_feat_11에서 몇 번째인지.
-            - past가 (TIME_LEN,)이고 "past의 마지막이 현재"라면 보통 TIME_LEN-1 입니다.
-        enforce_all_invalid_when_current_invalid: True면 현재 무효일 때 전체를 무효(전부 0)로 강제합니다.
-
-    Returns:
-        cleaned_feat_11: (T,11) float32.
-            - 규칙을 만족하도록 정리된 11차원 시계열
-            - 무효 구간은 11차원 전부 0
-    """
-    # full_feat_11: np.ndarray, shape (T, 11)
-    t_total = int(full_feat_11.shape[0])
-    if t_total <= 0:
-        return full_feat_11.astype(np.float32)
-
-    cur = int(current_index)
-    cur = max(0, min(cur, t_total - 1))
-
-    valid_mask = _compute_valid_mask_from_feat_11(full_feat_11)  # shape: (T,)
-
-    # 현재가 무효면: 요구사항에 맞게 전체 무효 처리(또는 안전하게 전체 0)
-    if not bool(valid_mask[cur]):
-        if bool(enforce_all_invalid_when_current_invalid):
-            return np.zeros_like(full_feat_11, dtype=np.float32)
-        # ego는 원래 현재가 무조건 유효여야 하므로, 여기로 들어오면 데이터가 이상한 케이스입니다.
-        # 그래도 downstream에서 깨지지 않게 전체 0으로 처리합니다.
-        return np.zeros_like(full_feat_11, dtype=np.float32)
-
-    # 현재가 유효면:
-    # "현재와 붙어있는 연속 유효 구간"만 남기고 나머지는 전부 0으로 비웁니다.
-    start = cur
-    while start > 0 and bool(valid_mask[start - 1]):
-        start -= 1
-
-    end = cur
-    while end < (t_total - 1) and bool(valid_mask[end + 1]):
-        end += 1
-
-    cleaned = np.zeros_like(full_feat_11, dtype=np.float32)  # shape: (T,11)
-    cleaned[start:end + 1] = full_feat_11[start:end + 1].astype(np.float32)
-    return cleaned
 
 
 def _build_future_3_from_future_11(
@@ -159,6 +100,92 @@ def _build_future_3_from_future_11(
     out[valid_mask, 2] = heading[valid_mask]
     return out
 
+def _apply_current_validity_and_fill_gaps_with_interpolation(
+    pos_xy_raw: np.ndarray,          # shape: (T, 2)
+    vel_xy_raw: np.ndarray,          # shape: (T, 2)
+    yaw_raw: np.ndarray,             # shape: (T,)
+    width_length_raw: np.ndarray,    # shape: (T, 2)
+    valid_raw: np.ndarray,           # shape: (T,)
+    current_index: int,
+    enforce_all_invalid_when_current_invalid: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """현재 시점을 기준으로 유효/무효 규칙을 적용하고, 유효점 사이의 빈 칸을 보간으로 채웁니다.
+
+    이 함수의 목적은 “현재가 유효한 트랙”에 대해서
+    `valid=True`인 시점들 사이에 끼어 있는 `valid=False` 시점들을 그대로 0으로 두지 않고,
+    **직선 보간으로 채워서** “유효-무효-유효” 같은 끊김 패턴이 나오지 않게 만드는 것입니다.
+
+    처리 규칙:
+    1) 현재 시점(current_index)이 무효(valid_raw[current_index]=False)라면
+       - (enforce_all_invalid_when_current_invalid 값과 관계없이)
+         안전하게 전체를 0으로 비우고 valid도 전부 False로 반환합니다.
+       - 이유: 현재가 무효인데 과거/미래에 값이 섞여 있으면 downstream에서 해석이 애매해지고,
+         원치 않는 “점프”가 생기기 쉽습니다.
+
+    2) 현재 시점이 유효라면
+       - valid_raw에서 True로 표시된 시점들을 “실제로 값이 있는 시점”으로 보고,
+         그 사이에 끼어 있는 빈 칸(valid=False)을 보간으로 채웁니다.
+       - 위치/속도/크기(width,length)는 직선 보간,
+         yaw(각도)는 -pi/pi 경계에서 튀지 않도록 한 번 자연스럽게 이어서(unwarp) 보간한 뒤,
+         다시 [-pi, pi) 범위로 정리합니다.
+       - 결과 valid_mask는 “첫 유효 시점 ~ 마지막 유효 시점” 구간이 전부 True가 됩니다.
+         (구간 밖은 False 유지)
+
+    Args:
+        pos_xy_raw: (T,2) 원본 위치 시계열. 무효 시점은 (0,0)일 수 있습니다.
+        vel_xy_raw: (T,2) 원본 속도 시계열.
+        yaw_raw: (T,) 원본 yaw 시계열(rad).
+        width_length_raw: (T,2) 원본 (width, length) 시계열.
+        valid_raw: (T,) 원본 유효 여부.
+        current_index: 현재 시점이 시계열에서 몇 번째인지.
+        enforce_all_invalid_when_current_invalid: 현재가 무효일 때 “전체 무효 처리”를 강제할지.
+            - 현재 구현에서는 안전을 위해 True/False와 상관없이 전체 무효로 반환합니다.
+              (neighbor는 현재 유효한 트랙만 뽑으므로 보통 이 케이스 자체가 발생하지 않습니다.)
+
+    Returns:
+        pos_xy_filled: (T,2) float32. 보간으로 채워진 위치.
+        vel_xy_filled: (T,2) float32. 보간으로 채워진 속도.
+        yaw_filled: (T,) float32. 보간으로 채워진 yaw.
+        width_length_filled: (T,2) float32. 보간으로 채워진 (width,length).
+        valid_filled: (T,) bool. “첫 유효~마지막 유효” 구간은 True.
+    """
+    time_len = int(pos_xy_raw.shape[0])
+
+    pos_xy_out = np.zeros((time_len, 2), dtype=np.float32)          # shape: (T,2)
+    vel_xy_out = np.zeros((time_len, 2), dtype=np.float32)          # shape: (T,2)
+    yaw_out = np.zeros((time_len,), dtype=np.float32)               # shape: (T,)
+    width_length_out = np.zeros((time_len, 2), dtype=np.float32)    # shape: (T,2)
+    valid_out = np.zeros((time_len,), dtype=bool)                   # shape: (T,)
+
+    if time_len == 0:
+        return pos_xy_out, vel_xy_out, yaw_out, width_length_out, valid_out
+
+    cur = int(current_index)
+    cur = max(0, min(cur, time_len - 1))
+
+    # 현재가 무효면: 전체 무효(안전)
+    if not bool(valid_raw.astype(bool)[cur]):
+        # enforce_all_invalid_when_current_invalid 플래그는 유지하되,
+        # 현재가 무효인 케이스는 해석이 애매해서 안전하게 전부 0으로 처리합니다.
+        _ = bool(enforce_all_invalid_when_current_invalid)
+        return pos_xy_out, vel_xy_out, yaw_out, width_length_out, valid_out
+
+    # 현재가 유효면: 유효점 사이의 빈 칸을 보간으로 채움
+    pos_xy_filled, vel_xy_filled, yaw_filled, width_length_filled, valid_filled = build_interpolated_agent_traj(
+        pos_xy_raw=pos_xy_raw,
+        vel_xy_raw=vel_xy_raw,
+        yaw_raw=yaw_raw,
+        width_length_raw=width_length_raw,
+        valid_raw=valid_raw,
+    )
+
+    return (
+        pos_xy_filled.astype(np.float32),
+        vel_xy_filled.astype(np.float32),
+        yaw_filled.astype(np.float32),
+        width_length_filled.astype(np.float32),
+        valid_filled.astype(bool),
+    )
 
 def build_agent_past_future_cache_arrays_from_full_trajectory(
     agent_idx: int,
@@ -174,25 +201,25 @@ def build_agent_past_future_cache_arrays_from_full_trajectory(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """에이전트 1명의 past/future 출력 배열을, '현재 기준 유효 규칙'을 만족하도록 만들어 반환합니다.
 
-    이 함수는 "과거~현재~미래를 합친 전체 길이(T=time_len+future_len)"를 먼저 만들고,
-    그 전체를 기준으로 유효/무효 패턴을 정리한 뒤,
-    마지막에 past / future로 다시 나눠서 반환합니다.
+    이 함수는 과거(past)와 미래(future)를 먼저 하나로 합친 뒤(T=time_len+future_len),
+    아래 규칙을 전체 길이 기준으로 적용하고,
+    마지막에 past / future로 다시 나눠 반환합니다.
 
-    요구사항 반영 규칙:
-      - 현재 점이 무효면:
-          (enforce_all_invalid_when_current_invalid=True일 때)
-          전체 T개 점을 전부 무효(전부 0)로 만듭니다.
-      - 현재 점이 유효면:
-          "유효점과 유효점 사이에 무효점이 있으면 안 된다" 규칙을 만족시키기 위해,
-          현재와 시간적으로 붙어있는(연속된) 유효 구간만 남기고,
-          그 밖은 전부 0으로 비웁니다.
-          결과적으로 유효 구간은 항상 한 덩어리만 남습니다.
+    규칙:
+    1) 현재 시점이 무효라면:
+       - 전체를 전부 무효(전부 0)로 반환합니다.
+         (neighbor는 보통 “현재 유효한 트랙만 뽑기” 때문에 이 케이스가 거의 없어야 합니다.)
 
-    반환은 캐시 포맷에 바로 넣을 수 있도록:
+    2) 현재 시점이 유효라면:
+       - 유효점(True)과 유효점(True) 사이에 끼어 있는 무효점(False)은
+         직선 보간으로 채웁니다.
+       - 그 결과 “유효-무효-유효” 같은 끊김 패턴이 없어집니다.
+       - 첫 유효 이전/마지막 유효 이후 구간은 0(무효)로 유지합니다.
+
+    반환 포맷:
       - past 11차원: (time_len, 11)
       - future 3차원: (future_len, 3)
       - future 11차원: (future_len, 11)
-    을 만들어 돌려줍니다.
 
     Args:
         agent_idx: 대상 트랙 인덱스.
@@ -204,7 +231,7 @@ def build_agent_past_future_cache_arrays_from_full_trajectory(
         width_length_all: (N,S,2)
         valid_all: (N,S)
         agent_one_hot: (3,)
-        enforce_all_invalid_when_current_invalid: True면 현재가 무효일 때 전체를 무효로 강제.
+        enforce_all_invalid_when_current_invalid: 현재가 무효일 때 전체 무효로 처리할지(방어용).
 
     Returns:
         agent_past_11: (time_len,11) float32
@@ -229,25 +256,29 @@ def build_agent_past_future_cache_arrays_from_full_trajectory(
         valid_all=valid_all,
     )
 
-    # full_feat_11_raw: (T,11)
-    full_feat_11_raw = pack_agent_features_11(
-        pos_xy=pos_raw,
-        vel_xy=vel_raw,
-        yaw_rad=yaw_raw,
-        width_length=wl_raw,
-        agent_one_hot=agent_one_hot,
-        valid_mask=valid_raw,
-    ).astype(np.float32)
-
     # 현재는 past의 마지막
     current_index_in_full = max(0, past_len - 1)
 
-    # 규칙 적용(전체 길이 기준으로 먼저 정리)
-    full_feat_11_clean = _keep_only_current_connected_valid_block(
-        full_feat_11=full_feat_11_raw,
+    # ✅ (b) 요구: 유효-무효-유효 패턴이 생기면, 중간 무효를 보간으로 채우기
+    pos_filled, vel_filled, yaw_filled, wl_filled, valid_filled = _apply_current_validity_and_fill_gaps_with_interpolation(
+        pos_xy_raw=pos_raw,                 # (T,2)
+        vel_xy_raw=vel_raw,                 # (T,2)
+        yaw_raw=yaw_raw,                    # (T,)
+        width_length_raw=wl_raw,            # (T,2)
+        valid_raw=valid_raw,                # (T,)
         current_index=int(current_index_in_full),
         enforce_all_invalid_when_current_invalid=bool(enforce_all_invalid_when_current_invalid),
-    ).astype(np.float32)  # shape: (T,11)
+    )
+
+    # full_feat_11_clean: (T,11)
+    full_feat_11_clean = pack_agent_features_11(
+        pos_xy=pos_filled,                  # (T,2)
+        vel_xy=vel_filled,                  # (T,2)
+        yaw_rad=yaw_filled,                 # (T,)
+        width_length=wl_filled,             # (T,2)
+        agent_one_hot=agent_one_hot,        # (3,)
+        valid_mask=valid_filled,            # (T,)
+    ).astype(np.float32)
 
     # past / future 분리
     agent_past_11 = full_feat_11_clean[:past_len].astype(np.float32)  # (time_len,11)
@@ -3856,7 +3887,7 @@ def build_cache_dict_for_scenario(
             width_length_all=width_length_all,
             valid_all=valid_all,
             agent_one_hot=one_hot_all[tr_i],      # (3,)
-            enforce_all_invalid_when_current_invalid=True,  # ✅ 요구사항 a: 현재 무효면 101개 전부 무효
+            enforce_all_invalid_when_current_invalid=False,  # ✅ 요구사항 a: 현재 무효면 101개 전부 무효
         )
 
         neighbor_agents_past[out_i] = n_past_11
