@@ -227,6 +227,7 @@ class DiffusionPlannerData(Dataset):
             - chosen_static_num <= max_static_num
         """
         data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
+        file_name = self.data_list[idx]
         if data is None:
             raise IndexError(f"Corrupted sample at index {idx}")
 
@@ -283,7 +284,7 @@ class DiffusionPlannerData(Dataset):
                     )
                     self.assert_cur_future_valid_mask_np(
                         neighbor_future_gt_is_valid,
-                        context="DiffusionPlannerData.__getitem__",
+                        context=f"{file_name} - neighbor_future_gt_is_valid",
                     )
 
 
