@@ -1168,6 +1168,7 @@ class FeasibleProjector(nn.Module):
             # 검증: 과거~현재(0*1*), 현재~미래(1*0*)
             self._assert_past_cur_valid_mask(
                 past_cur_valid, context="savgol_filter_for_control_past_cur")
+            # ERROR
             self._assert_cur_future_valid_mask(
                 cur_future_valid,
                 context="savgol_filter_for_control_cur_future")
