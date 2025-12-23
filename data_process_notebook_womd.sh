@@ -9,4 +9,5 @@ SAVE_PATH="${WOMD_DATA_ROOT}/processed_womd_final"
 
 python data_process_womd.py --womd_data_path "$WOMD_DATA_ROOT" \
   --save_path "$SAVE_PATH" \
-  --save_image false
+  --save_image false \
+  --num_workers 1

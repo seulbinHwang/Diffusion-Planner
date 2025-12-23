@@ -399,6 +399,94 @@ import contextlib
 import multiprocessing.pool as mppool
 import time
 
+def _get_dead_worker_info_from_pool(
+    pool: Optional[mppool.Pool],
+) -> List[Tuple[int, Optional[int]]]:
+    """Pool 안의 워커들 중 '이미 죽어있는 것'을 찾아서 (pid, exitcode) 목록으로 반환합니다.
+
+    이 함수는 "워커가 살아있는지"만 확인합니다.
+    - 살아있으면 목록에 넣지 않습니다.
+    - 죽어있으면 (pid, exitcode)를 기록합니다.
+      exitcode는 종료 원인을 나타내는데,
+      None이거나 0이 아닐 수도 있습니다(강제 종료/에러 종료 등).
+
+    Args:
+        pool: multiprocessing Pool. None이면 빈 리스트를 반환합니다.
+
+    Returns:
+        dead: List[Tuple[int, Optional[int]]]
+            - 각 원소는 (pid, exitcode)
+            - pid를 알 수 없으면 -1
+    """
+    if pool is None:
+        return []
+
+    procs = getattr(pool, "_pool", None) or []
+    dead: List[Tuple[int, Optional[int]]] = []
+    for p in procs:
+        if p is None:
+            continue
+        # p: multiprocessing.Process 류
+        if not p.is_alive():
+            pid_val = int(p.pid) if p.pid is not None else -1
+            exit_code = p.exitcode  # Optional[int]
+            dead.append((pid_val, exit_code))
+    return dead
+
+
+def _die_all_if_any_worker_dead(
+    pool: Optional[mppool.Pool],
+    stop_event: Any,
+    enabled: bool,
+    exit_code: int = 1,
+) -> None:
+    """enabled=True일 때, 워커가 하나라도 죽어있으면 전체 워커를 즉시 종료합니다.
+
+    목적(쉽게 설명)
+    -------------
+    - 데이터 캐싱처럼 긴 작업에서, 워커 하나가 갑자기 죽으면(메모리 문제/프로세스 크래시 등)
+      남은 워커들이 계속 돌거나 메인이 멈춰서 기다리는 상황이 생길 수 있습니다.
+    - args.die_all=True인 경우에는 이런 상황을 "즉시 전체 종료"로 바꿉니다.
+
+    동작 순서
+    --------
+    1) stop_event가 아직 꺼져 있고(pool이 정상 실행 중) enabled=True이면,
+       pool 안의 워커 목록을 확인합니다.
+    2) 죽은 워커가 발견되면:
+       - stop_event.set() 해서 "나도 멈출 거다"를 표시하고,
+       - _terminate_pool_hard(pool)로 전체 워커를 강제 종료하고,
+       - SystemExit(exit_code)로 메인도 즉시 종료합니다.
+
+    Args:
+        pool: multiprocessing Pool.
+        stop_event: 메인/워커가 공유하는 종료 이벤트.
+        enabled: die_all 기능 사용 여부(args.die_all).
+        exit_code: 종료 코드(기본 1).
+    """
+    if not bool(enabled):
+        return
+    if pool is None:
+        return
+    if stop_event is not None and stop_event.is_set():
+        return
+
+    # pool이 이미 close/terminate 상태라면 감시할 필요 없음
+    pool_state = getattr(pool, "_state", None)
+    if pool_state is not None and pool_state != mppool.RUN:
+        return
+
+    dead = _get_dead_worker_info_from_pool(pool)
+    if len(dead) == 0:
+        return
+
+    # 여기로 왔다는 건 "워커 하나 이상이 죽어있음"
+    if stop_event is not None:
+        stop_event.set()
+
+    _log(f"[die_all] dead worker detected -> {dead}. terminate all workers now.")
+    _terminate_pool_hard(pool, timeout_sec=1.0)
+    raise SystemExit(int(exit_code))
+
 
 def _terminate_pool_hard(
     pool: Optional[mppool.Pool],
@@ -4079,12 +4167,15 @@ def build_cache_dict_for_scenario(
     ego_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
         ego_future_gt_3_dim, prefix_dim=3)
     ego_future_gt_is_valid = np.expand_dims(ego_future_gt_is_valid, axis=0)
+    ego_future_gt_is_valid = np.expand_dims(ego_future_gt_is_valid, axis=0)
+    print("ego_future_gt_is_valid.shape:", ego_future_gt_is_valid.shape)
     assert_cur_future_valid_mask_np(
         ego_future_gt_is_valid,
         context=f" - ego_future_gt_is_valid",
     )
     ego_future_gt_11_is_valid = _compute_valid_mask_from_prefix_nonzero(
         ego_future_gt_11_dim, prefix_dim=8)
+    ego_future_gt_11_is_valid = np.expand_dims(ego_future_gt_11_is_valid, axis=0)
     ego_future_gt_11_is_valid = np.expand_dims(ego_future_gt_11_is_valid, axis=0)
     assert_cur_future_valid_mask_np(
         ego_future_gt_11_is_valid,
@@ -4691,6 +4782,8 @@ def cache_all_splits(
                     _log(
                         f"WORKER NOT READY (likely importing TF/torch/etc): {repr(e)}"
                     )
+                die_all_enabled: bool = bool(getattr(args, "die_all", False))
+
 
                 iterator = pool.imap_unordered(
                     process_one_tfrecord_file_fn,
@@ -4702,6 +4795,14 @@ def cache_all_splits(
                 pbar = tqdm(total=len(tfrecord_paths), desc=f"cache-{split}")
                 try:
                     while True:
+                        # ✅ die_all=True면: 워커가 하나라도 죽었는지 먼저 확인
+                        _die_all_if_any_worker_dead(
+                            pool=pool,
+                            stop_event=stop_event,
+                            enabled=die_all_enabled,
+                            exit_code=1,
+                        )
+
                         if stop_event.is_set():
                             deadline = shutdown_state.get("deadline", None)
                             if deadline is not None and time.monotonic(
@@ -4713,6 +4814,13 @@ def cache_all_splits(
                         try:
                             res = iterator.next(timeout=0.5)
                         except mp.TimeoutError:
+                            # ✅ 기다리는 동안에도 워커가 죽을 수 있으니 한 번 더 체크
+                            _die_all_if_any_worker_dead(
+                                pool=pool,
+                                stop_event=stop_event,
+                                enabled=die_all_enabled,
+                                exit_code=1,
+                            )
                             continue
                         except StopIteration:
                             break

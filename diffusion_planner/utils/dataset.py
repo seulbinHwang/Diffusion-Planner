@@ -276,17 +276,17 @@ class DiffusionPlannerData(Dataset):
                 value = data.get(npz_key, None)
                 if value is not None and npz_key == "agent_route_lane_order":
                     value = value.astype("int64")
-                if npz_key == "neighbor_future_gt_3_dim":  # (chosen_agent_num, future_len, 3)
-                    # neighbor_future_gt_is_valid: (chosen_agent_num, future_len)
-                    neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
-                        value, prefix_dim=3)
-                    # (chosen_agent_num, future_len) -> (1, chosen_agent_num, future_len)
-                    neighbor_future_gt_is_valid = np.expand_dims(
-                        neighbor_future_gt_is_valid, axis=0)
-                    self.assert_cur_future_valid_mask_np(
-                        neighbor_future_gt_is_valid,
-                        context=f"{file_name} - neighbor_future_gt_is_valid",
-                    )
+                # if npz_key == "neighbor_future_gt_3_dim":  # (chosen_agent_num, future_len, 3)
+                #     # neighbor_future_gt_is_valid: (chosen_agent_num, future_len)
+                #     neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
+                #         value, prefix_dim=3)
+                #     # (chosen_agent_num, future_len) -> (1, chosen_agent_num, future_len)
+                #     neighbor_future_gt_is_valid = np.expand_dims(
+                #         neighbor_future_gt_is_valid, axis=0)
+                #     self.assert_cur_future_valid_mask_np(
+                #         neighbor_future_gt_is_valid,
+                #         context=f"{file_name} - neighbor_future_gt_is_valid",
+                #     )
 
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value

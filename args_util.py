@@ -521,6 +521,9 @@ def get_args():
     parser.add_argument('--make_statistics_when_caching',
                         default=True,
                         type=boolean)
+    parser.add_argument('--die_all',
+                        default=True,
+                        type=boolean)
     args = parser.parse_args()
     # ★ stage config(json/yaml)로 CLI 인자 덮어쓰기
     args = _override_args_with_stage_config(args)
