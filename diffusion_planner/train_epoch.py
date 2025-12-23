@@ -907,7 +907,7 @@ def train_epoch(
             ego_future_gt_3_dim: torch.Tensor = outputs["ego_future_gt_3_dim"]
             ego_future_gt_4_dim = torch.cat(
                 [
-                    ego_future_gt_3_dim,
+                    ego_future_gt_3_dim[..., :2],  # (B, future_len, 2)
                     torch.stack(
                         [
                             ego_future_gt_3_dim[..., 2].cos(),
