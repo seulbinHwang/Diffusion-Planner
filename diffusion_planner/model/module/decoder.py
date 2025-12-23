@@ -101,17 +101,20 @@ def _compute_time_padding_mask_from_state(
     last_dim: int = int(target_agents_past.size(-1))
     used_dims: int = int(min(max(check_dims, 1), last_dim))
 
-    state_slice = target_agents_past[..., :used_dims]  # (B,(1+)Pnn,time_len,used_dims)
+    state_slice = target_agents_past[
+        ..., :used_dims]  # (B,(1+)Pnn,time_len,used_dims)
 
     # NaN/inf 방어
     is_finite = torch.isfinite(state_slice).all(dim=-1)  # (B,(1+)Pnn,time_len)
 
     # 0(또는 거의 0) 방어
-    is_non_zero = state_slice.abs().sum(dim=-1) > float(eps)  # (B,(1+)Pnn,time_len)
+    is_non_zero = state_slice.abs().sum(dim=-1) > float(
+        eps)  # (B,(1+)Pnn,time_len)
 
     is_valid = is_finite & is_non_zero  # (B,(1+)Pnn,time_len)
     target_past_current_mask = ~is_valid
     return target_past_current_mask
+
 
 def compute_cond_last_mask(cond_last_pos: torch.Tensor) -> torch.Tensor:
     """마지막 위치 조건(cond_last_pos)이 '실제로 존재하는지'를 판단하는 마스크를 만든다.
@@ -214,7 +217,6 @@ class Decoder(nn.Module):
     def sde(self):
         return self._sde
 
-
     def _build_training_dit_inputs(
         self,
         inputs: Dict[str, torch.Tensor],
@@ -259,10 +261,11 @@ class Decoder(nn.Module):
         target_cur_future_norm_xT: torch.Tensor = inputs[
             "target_cur_future_norm_xT"]
         # (B, (1+)Pnn, time_len, 4)
-        target_agents_past_xyyaw = target_agents_past[..., :4] #
+        target_agents_past_xyyaw = target_agents_past[..., :4]  #
 
         #  (B, (1+)Pnn, T, 4)
-        target_future_norm_xT: torch.Tensor = target_cur_future_norm_xT[:, :, 1:, :]
+        target_future_norm_xT: torch.Tensor = target_cur_future_norm_xT[:, :,
+                                                                        1:, :]
 
         # 현재 프레임(정규화): 과거~현재 시퀀스의 마지막 프레임을 기준으로 잡아 정합성 강화
         # target_cur_xyyaw:  (B, (1+)Pnn, 4)
@@ -272,7 +275,7 @@ class Decoder(nn.Module):
         if self.config.use_past_dit_input:
             # dtype/device 정합: concat 전에 맞춰두는 게 안전
             target_agents_past_xyyaw = _cast_like(target_agents_past_xyyaw,
-                                                target_future_norm_xT)
+                                                  target_future_norm_xT)
 
             # (B, (1+)Pnn, time_len + T, 4)
             # (B, (1+)Pnn, time_len, 4) + (B, (1+)Pnn, T, 4)
@@ -303,7 +306,7 @@ class Decoder(nn.Module):
 
     def _run_dit_training_forward(
             self,
-            target_agents_past:torch.Tensor,  # # (B, (1+)Pnn, time_len, 11)
+            target_agents_past: torch.Tensor,  # # (B, (1+)Pnn, time_len, 11)
             xT_input_flat: torch.Tensor,  # (B, (1+)Pnn, F)
             diffusion_time: torch.Tensor,  # (B,)
             scene_encoding_token: torch.Tensor,  # (B, token_num, D)
@@ -341,7 +344,7 @@ class Decoder(nn.Module):
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self.dit(
             xT_input_flat,  # (B, (1+)Pnn, F)
-            target_agents_past, # # (B, (1+)Pnn, time_len, 11)
+            target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
             diffusion_time,  # (B,)
             scene_encoding_token,  # (B, token_num, D)
             ego_fut_global,  # (B, D)
@@ -357,7 +360,8 @@ class Decoder(nn.Module):
 
     def _reshape_training_score_to_sequence(
         self,
-        score_flat: torch.Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        score_flat: torch.
+        Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         target_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
         batch_size: int,
         one_or_Pnn: int,
@@ -395,7 +399,8 @@ class Decoder(nn.Module):
 
         if self.config.use_current_input:
             # score_seq: (B, Pnn, 1+T, 4)
-            score_seq = score_flat.reshape(B, one_or_Pnn, 1 + self._future_len, 4)
+            score_seq = score_flat.reshape(B, one_or_Pnn, 1 + self._future_len,
+                                           4)
             return score_seq
 
         # use_current_input=False 인 경우: DiT 출력은 미래만 (B,Pnn,T,4)
@@ -429,7 +434,7 @@ class Decoder(nn.Module):
 
         outputs["integrated_trajectory"] = integrated_trajectory
         outputs[
-            "control_constraint_diff"] = self.dit.dit_returns.control_constraint_diff # (B, (1+)Pnn, T, 4)
+            "control_constraint_diff"] = self.dit.dit_returns.control_constraint_diff  # (B, (1+)Pnn, T, 4)
 
     # TODO: 점검하기
     def _maybe_apply_last_pos_condition_training(
@@ -469,19 +474,19 @@ class Decoder(nn.Module):
         assert T_plus1 >= 2, "미래 길이 T는 최소 1 이상이어야 합니다."
         assert cond_last_pos_norm.shape == (B, Pnn,
                                             4), "cond_last_pos_norm shape 불일치"
-        cond_last_pos_norm = _cast_like(cond_last_pos_norm,
-                                        xT_input_flat)
+        cond_last_pos_norm = _cast_like(cond_last_pos_norm, xT_input_flat)
         # cond_last_prob==0 이면 빠르게 종료
         if self._cond_last_prob <= 0.0:
             return xT_input_flat, None
 
         # (1) 적용 가능 위치: 유효 에이전트 & has_goal(목표값이 전부 0 이 아닌)
         has_goal = compute_cond_last_mask(cond_last_pos_norm)  # (B, Pnn)
-        can_apply: torch.Tensor = (~target_current_mask) & has_goal  # (B, (1+)Pnn)
+        can_apply: torch.Tensor = (
+            ~target_current_mask) & has_goal  # (B, (1+)Pnn)
 
         # (2) 배치 단일 베르누이 샘플: 약 20% 확률로 전체 적용
-        batch_toggle: bool = (torch.rand(
-            (), device=xT_input_flat.device).item()
+        batch_toggle: bool = (torch.rand((),
+                                         device=xT_input_flat.device).item()
                               < float(self._cond_last_prob))
 
         if not batch_toggle:
@@ -494,7 +499,7 @@ class Decoder(nn.Module):
             return xT_input_flat, None
 
         x_seq = xT_input_flat.view(B, Pnn, T_plus1,
-                                             4).clone()  # (B, Pnn, 1 + T, 4)
+                                   4).clone()  # (B, Pnn, 1 + T, 4)
 
         # 마지막 프레임만 뽑아서 (B, Pnn, 4) 모양으로 맞춘 뒤 where로 바꿔끼우기
         last = x_seq[:, :, -1, :]  # (B, Pnn, 4)
@@ -507,7 +512,6 @@ class Decoder(nn.Module):
         # can_apply: (B, Pnn)
         x_out = x_seq.view(B, Pnn, flat)
         return x_out, can_apply
-
 
     def _assert_past_cur_valid_mask(
         self,
@@ -760,7 +764,6 @@ class Decoder(nn.Module):
         dit_returns = getattr(self.dit, "dit_returns", None)
         if dit_returns is None:
             return None
-
         """
         # integrated_trajectory : (B, (1+)Pnn, future_len, 4)
         # control_constraint_diff : (B, (1+)Pnn, future_len, 3)
@@ -839,7 +842,8 @@ class Decoder(nn.Module):
                     raise ValueError(
                         "시간 길이가 맞지 않습니다. T_len={}, future_len={}".format(
                             T_len, future_len))
-                xt_future = xt_sequence[:, :, 1:, :]  # (B, (1+)Pnn, future_len, 4)
+                xt_future = xt_sequence[:, :,
+                                        1:, :]  # (B, (1+)Pnn, future_len, 4)
             else:
                 # xt_sequence: (B, (1+)Pnn, future_len, 4) 가 바로 미래 궤적
                 if T_len != future_len:
@@ -890,21 +894,19 @@ class Decoder(nn.Module):
 
         return xt_sequence
 
-
-
     def _prepare_near_trajectories_and_masks(
-            self,
-            inputs: Dict[str, torch.Tensor],
+        self,
+        inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        int,
-        int,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            int,
+            int,
     ]:
         """배치 dict에서 이웃 에이전트 관련 공통 텐서를 만든다.
 
@@ -944,13 +946,14 @@ class Decoder(nn.Module):
             ego_agent_past: torch.Tensor = inputs[
                 "ego_agent_past"]  # (B,time_len,11)
             target_agents_past = torch.cat(
-                [ego_agent_past.unsqueeze(1),  # (B,1,time_len,11)
-                    near_agents_past],
+                [
+                    ego_agent_past.unsqueeze(1),  # (B,1,time_len,11)
+                    near_agents_past
+                ],
                 dim=1,
             )  # (B, 1+Pnn, time_len, 11)
         else:
             target_agents_past = near_agents_past  # (B, Pnn, time_len, 11)
-
 
         # target_past: (B, (1+)Pnn, past_len, 11)
         target_past: torch.Tensor = target_agents_past[:, :, :-1, :].detach()
@@ -960,7 +963,7 @@ class Decoder(nn.Module):
 
         # target_past_current_mask: (B, Pnn, (1+)time_len) True=무효
         target_past_current_mask: torch.Tensor = _compute_time_padding_mask_from_state(
-            target_agents_past=target_agents_past, # (B, (1+)Pnn, time_len, 11)
+            target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             check_dims=8,
         )
 
@@ -992,16 +995,17 @@ class Decoder(nn.Module):
                 float("nan"),
             )
 
-        cond_last_pos_norm = _cast_like(cond_last_pos_norm, target_current_xyyaw)
+        cond_last_pos_norm = _cast_like(cond_last_pos_norm,
+                                        target_current_xyyaw)
 
         return (
-            target_agents_past, # (B, (1+)Pnn, time_len, 11)
-            target_past, # (B, (1+)Pnn, past_len, 11)
-            target_current_xyyaw, # (B, (1+)Pnn, 4)
-            target_current_mask, # (B, (1+)Pnn)
-            target_past_cur_future_valid, # (B, (1+)Pnn, time_len + future_len)
-            target_class_one_hot, # (B, (1+)Pnn, 3)
-            cond_last_pos_norm, # (B, (1+)Pnn, 4)
+            target_agents_past,  # (B, (1+)Pnn, time_len, 11)
+            target_past,  # (B, (1+)Pnn, past_len, 11)
+            target_current_xyyaw,  # (B, (1+)Pnn, 4)
+            target_current_mask,  # (B, (1+)Pnn)
+            target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
+            target_class_one_hot,  # (B, (1+)Pnn, 3)
+            cond_last_pos_norm,  # (B, (1+)Pnn, 4)
             batch_size,
             one_or_Pnn,
         )
@@ -1064,8 +1068,6 @@ class Decoder(nn.Module):
             target_agents_route_lane_emb = near_agents_route_lane_emb  # (B, Pnn, D)
             route_known_mask = route_known_mask  # (B, Pnn)
 
-
-
         # 원래 코드에 있던 shape 체크는 그대로 유지
         assert ego_fut_global.shape == (
             batch_size,
@@ -1095,7 +1097,8 @@ class Decoder(nn.Module):
         """
         B: int = batch_size
         noise: torch.Tensor = target_current_xyyaw.new_empty(
-            (B, one_or_Pnn, self._future_len, 4),).normal_(0.0, 0.5)  # (B, (1+)Pnn, T, 4)
+            (B, one_or_Pnn, self._future_len, 4),).normal_(
+                0.0, 0.5)  # (B, (1+)Pnn, T, 4)
         return noise
 
     def _build_inference_xT_from_noise(
@@ -1105,7 +1108,7 @@ class Decoder(nn.Module):
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         batch_size: int,
         one_or_Pnn: int,
-    ) -> torch.Tensor: # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+    ) -> torch.Tensor:  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         """샘플링 시작점 xT(flat)를 만든다.
 
 
@@ -1201,7 +1204,8 @@ class Decoder(nn.Module):
 
     def _initial_state_constraint(
             self,
-            xt: torch.Tensor,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            xt: torch.
+        Tensor,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             t: torch.Tensor,  # () 또는 (1,)
             step: int,
             *,
@@ -1211,7 +1215,8 @@ class Decoder(nn.Module):
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
             target_past_cur_future_valid: torch.
         Tensor,  # (B, (1+)Pnn, time_len_total)
-            cond_last_pos_norm: Optional[torch.Tensor],  # (B, (1+)Pnn, 4) 또는 None
+            cond_last_pos_norm: Optional[
+                torch.Tensor],  # (B, (1+)Pnn, 4) 또는 None
             cond_last_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> torch.Tensor:
         """샘플링 중간 단계에서 샘플을 '현재/목표/기본 규칙'에 맞게 정리한다.
@@ -1318,7 +1323,6 @@ class Decoder(nn.Module):
             cond_last_mask=cond_last_mask,
         )
 
-
     def _run_dpm_sampler_for_inference(
         self,
         xT: torch.Tensor,  # (B, Pnn, F)
@@ -1337,7 +1341,7 @@ class Decoder(nn.Module):
         inputs: Dict[str, torch.Tensor],
         correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
                                    torch.Tensor],
-    ) -> torch.Tensor: # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+    ) -> torch.Tensor:  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다.
         Returns:
             x0:
@@ -1403,7 +1407,8 @@ class Decoder(nn.Module):
 
     def _reshape_inference_x0_to_sequence(
         self,
-        x0: torch.Tensor, # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+        x0: torch.
+        Tensor,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         batch_size: int,
         one_or_Pnn: int,
@@ -1441,7 +1446,7 @@ class Decoder(nn.Module):
     def _inverse_normalize_and_cleanup_padding(
             self,
             x_norm: torch.Tensor,  # (B, (1+)Pnn, 1+T, 4)
-            target_current_mask: torch.Tensor, # (B, (1+)Pnn)
+            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> torch.Tensor:
         """정규화된 궤적을 역정규화하고, 패딩 슬롯은 0으로 정리한다.
 
@@ -1463,7 +1468,7 @@ class Decoder(nn.Module):
 
     def _append_inference_feasible_outputs(
             self,
-            outputs: Dict[str, torch.Tensor], #
+            outputs: Dict[str, torch.Tensor],  #
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
             target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> None:
@@ -1495,13 +1500,13 @@ class Decoder(nn.Module):
         ego_fut_global: torch.Tensor,
         target_agents_route_lane_emb: torch.Tensor,
         route_known_mask: torch.Tensor,
-            target_agents_past: torch.Tensor, # (B, (1+)Pnn, time_len, 11)
-            target_past: torch.Tensor,
+        target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
+        target_past: torch.Tensor,
         target_current_xyyaw: torch.Tensor,
-        target_current_mask: torch.Tensor, # (B, (1+)Pnn)
+        target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
         target_past_cur_future_valid: torch.Tensor,
         target_class_one_hot: torch.Tensor,
-        cond_last_pos_norm: torch.Tensor, # (B, (1+)Pnn, 4)
+        cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
         batch_size: int,
         one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
@@ -1518,7 +1523,7 @@ class Decoder(nn.Module):
         """
         xT_input_flat, target_cur_xyyaw = self._build_training_dit_inputs(
             inputs=inputs,
-            target_agents_past=target_agents_past, # (B, (1+)Pnn, time_len, 11)
+            target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
@@ -1528,13 +1533,14 @@ class Decoder(nn.Module):
 
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self._run_dit_training_forward(
-            target_agents_past=target_agents_past, # (B, (1+)Pnn, time_len, 11)
+            target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             xT_input_flat=xT_input_flat,  # (B, (1+)Pnn, F)
             diffusion_time=diffusion_time,  # (B,)
             scene_encoding_token=scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask=scene_encoding_token_mask,  # (B, token_num)
             ego_fut_global=ego_fut_global,  # (B, D)
-            target_agents_route_lane_emb=target_agents_route_lane_emb,  # (B, Pnn, D)
+            target_agents_route_lane_emb=
+            target_agents_route_lane_emb,  # (B, Pnn, D)
             target_past_cur_future_valid=
             target_past_cur_future_valid,  # (B, Pnn, time_len+future_len)
             route_known_mask=route_known_mask,  # (B, Pnn)
@@ -1545,12 +1551,13 @@ class Decoder(nn.Module):
 
         # 3) (B,(1+)Pnn,F_out) -> (B,(1+)Pnn,1+T,4)
         score_seq: torch.Tensor = self._reshape_training_score_to_sequence(
-            score_flat=score_flat, # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            score_flat=
+            score_flat,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
         )
-        return_["score"] = score_seq # (B, (1+)Pnn, 1+T, 4)
+        return_["score"] = score_seq  # (B, (1+)Pnn, 1+T, 4)
         """ return_
         score : (B, (1+)Pnn, 1+T, 4)
         "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
@@ -1572,11 +1579,11 @@ class Decoder(nn.Module):
         ego_fut_global: torch.Tensor,
         target_agents_route_lane_emb: torch.Tensor,
         route_known_mask: torch.Tensor,
-            target_agents_past: torch.Tensor,
-            # (B, (1+)Pnn, time_len, 11)
+        target_agents_past: torch.Tensor,
+        # (B, (1+)Pnn, time_len, 11)
         target_past: torch.Tensor,
         target_current_xyyaw: torch.Tensor,
-        target_current_mask: torch.Tensor, # (B, (1+)Pnn)
+        target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
         target_past_cur_future_valid: torch.Tensor,
         target_class_one_hot: torch.Tensor,
         cond_last_pos_norm: torch.Tensor,
@@ -1595,7 +1602,6 @@ class Decoder(nn.Module):
             one_or_Pnn=one_or_Pnn,
         )  # (B,(1+)Pnn,T,4)
 
-
         # 2) xT(flat) 생성
         # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         xT: torch.Tensor = self._build_inference_xT_from_noise(
@@ -1611,7 +1617,8 @@ class Decoder(nn.Module):
             cond_last_pos_norm=cond_last_pos_norm,  # (B,1+Pnn,4)
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
-            reference_tensor_for_device=xT, # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            reference_tensor_for_device=
+            xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         )
 
         # 4) 샘플링 중 보정 함수 구성
@@ -1629,7 +1636,8 @@ class Decoder(nn.Module):
         # 5) dpm_sampler 실행
         # x0: (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         x0: torch.Tensor = self._run_dpm_sampler_for_inference(
-            xT=xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            xT=
+            xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
             scene_encoding_token=scene_encoding_token,
             scene_encoding_token_mask=scene_encoding_token_mask,
@@ -1649,7 +1657,8 @@ class Decoder(nn.Module):
 
         # 6) (B,(1+)Pnn,F) -> (B, (1+)Pnn, 1+T, 4)
         x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
-            x0=x0, # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            x0=
+            x0,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             target_current_xyyaw=target_current_xyyaw,
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
@@ -1657,18 +1666,18 @@ class Decoder(nn.Module):
 
         # 7) 역정규화 및 패딩 정리
         unnorm_x0: torch.Tensor = self._inverse_normalize_and_cleanup_padding(
-            x_norm=x0_seq_norm, # (B, (1+)Pnn, 1+T, 4)
-            target_current_mask=target_current_mask, # (B, (1+)Pnn)
+            x_norm=x0_seq_norm,  # (B, (1+)Pnn, 1+T, 4)
+            target_current_mask=target_current_mask,  # (B, (1+)Pnn)
         )
 
         # 8) feasible 출력(옵션)
         self._append_inference_feasible_outputs(
             outputs=return_,
-            target_current_xyyaw=target_current_xyyaw, # (B, (1+)Pnn, 4)
-            target_current_mask=target_current_mask, # (B, (1+)Pnn)
+            target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
+            target_current_mask=target_current_mask,  # (B, (1+)Pnn)
         )
 
-        return_["score"] = unnorm_x0 # (B, (1+)Pnn, 1+T, 4)
+        return_["score"] = unnorm_x0  # (B, (1+)Pnn, 1+T, 4)
         return return_
 
     def forward(
@@ -1723,7 +1732,8 @@ class Decoder(nn.Module):
             batch_size,
             one_or_Pnn,
         """
-        (   target_agents_past, # (B, (1+)Pnn, time_len, 11)
+        (
+            target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             target_past,  # (B, (1+)Pnn, past_len, 11)
             target_current_xyyaw,  # (B, (1+)Pnn, 4)
             target_current_mask,  # (B, (1+)Pnn)
@@ -1752,13 +1762,14 @@ class Decoder(nn.Module):
                 ego_fut_global=ego_fut_global,
                 target_agents_route_lane_emb=target_agents_route_lane_emb,
                 route_known_mask=route_known_mask,
-                target_agents_past=target_agents_past, # (B, (1+)Pnn, time_len, 11)
+                target_agents_past=
+                target_agents_past,  # (B, (1+)Pnn, time_len, 11)
                 target_past=target_past,
                 target_current_xyyaw=target_current_xyyaw,
-                target_current_mask=target_current_mask, # (B, (1+)Pnn)
+                target_current_mask=target_current_mask,  # (B, (1+)Pnn)
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 target_class_one_hot=target_class_one_hot,
-                cond_last_pos_norm=cond_last_pos_norm, # (B, (1+)Pnn, 4)
+                cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
                 batch_size=batch_size,
                 one_or_Pnn=one_or_Pnn,
             )
@@ -1774,7 +1785,7 @@ class Decoder(nn.Module):
                 # (B, (1+)Pnn, time_len, 11)
                 target_past=target_past,
                 target_current_xyyaw=target_current_xyyaw,
-                target_current_mask=target_current_mask, # (B, (1+)Pnn)
+                target_current_mask=target_current_mask,  # (B, (1+)Pnn)
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 target_class_one_hot=target_class_one_hot,
                 cond_last_pos_norm=cond_last_pos_norm,
@@ -1928,9 +1939,11 @@ class DiT(nn.Module):
 
     def _select_tensors_for_feasible_projection(
         self,
-        x: torch.Tensor, # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-        target_current_xyyaw: torch.Tensor, # (B, (1+)Pnn, 4)
-        target_past_cur_future_valid: torch.Tensor, # (B, (1+)Pnn, 1+past_len+future_len)
+        x: torch.
+        Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+        target_past_cur_future_valid: torch.
+        Tensor,  # (B, (1+)Pnn, 1+past_len+future_len)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """FeasibleProjector에 넣기 전, 텐서의 '그래디언트 유지/차단' 방식을 정한다.
 
@@ -1953,8 +1966,8 @@ class DiT(nn.Module):
             target_past_cur_future_valid_for_feasible = target_past_cur_future_valid
         else:
             x_for_feasible = x.detach().float()
-            target_current_xyyaw_for_feasible = target_current_xyyaw.detach().float(
-            )
+            target_current_xyyaw_for_feasible = target_current_xyyaw.detach(
+            ).float()
             target_past_cur_future_valid_for_feasible = target_past_cur_future_valid.detach(
             )
         return (
@@ -1985,7 +1998,8 @@ class DiT(nn.Module):
         if self.config.use_past_dit_input:
             # x_for_feasible: (B, Pnn, (past_len + 1+T)*4) 같은 형태
             diffusion_trajectory = (x_for_feasible.reshape(
-                B, one_or_Pnn, -1, 4).contiguous()[:, :, -(self._future_len + 1):, :]
+                B, one_or_Pnn, -1, 4).contiguous()[:, :,
+                                                   -(self._future_len + 1):, :]
                                    )  # (B, Pnn, 1+T, 4)
             diffusion_trajectory[:, :, 0, :] = target_current_xyyaw_for_feasible
             return diffusion_trajectory.contiguous()
@@ -1999,7 +2013,8 @@ class DiT(nn.Module):
         # use_current_input=False: x_for_feasible는 미래만 (B,Pnn,T*4)
         diffusion_trajectory = torch.cat(
             [
-                target_current_xyyaw_for_feasible.unsqueeze(2),  # (B,(1+)Pnn,1,4)
+                target_current_xyyaw_for_feasible.unsqueeze(
+                    2),  # (B,(1+)Pnn,1,4)
                 x_for_feasible.reshape(B, one_or_Pnn, -1, 4),  # (B,Pnn,T,4)
             ],
             dim=2,
@@ -2076,7 +2091,8 @@ class DiT(nn.Module):
         if self.config.use_current_input:
             x_new = torch.cat(
                 [
-                    target_current_xyyaw_for_feasible.unsqueeze(2),  # (B,(1+)Pnn,1,4)
+                    target_current_xyyaw_for_feasible.unsqueeze(
+                        2),  # (B,(1+)Pnn,1,4)
                     integrated_trajectory,  # (B,Pnn,T,4)
                 ],
                 dim=2,
@@ -2084,7 +2100,7 @@ class DiT(nn.Module):
             return x_new.reshape(B, one_or_Pnn, -1)
 
         # use_current_input=False: 미래만 반환
-        return integrated_trajectory.reshape(B, one_or_Pnn, -1) # (B,Pnn,T*4)
+        return integrated_trajectory.reshape(B, one_or_Pnn, -1)  # (B,Pnn,T*4)
 
     @property
     def model_type(self):
@@ -2092,7 +2108,8 @@ class DiT(nn.Module):
 
     def _run_dit_core_with_pram_v2(
             self,
-            target_input_norm_xT: torch.Tensor, # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            target_input_norm_xT: torch.
+        Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             diffusion_time: torch.Tensor,  # (B,)
             cross_c: torch.Tensor,  # (B, token_num, D)
             ego_fut_global: torch.Tensor,  # (B, D)
@@ -2101,7 +2118,7 @@ class DiT(nn.Module):
             route_known_mask: torch.Tensor,  # (B, (1+)Pnn)
             target_current: torch.Tensor,  # (B, (1+)Pnn, 11)
             target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
-    ) -> torch.Tensor: # (B, (1+)Pnn, _ * 4)
+    ) -> torch.Tensor:  # (B, (1+)Pnn, _ * 4)
         """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다.
 
         추가로 이 구현은 다음을 보장합니다.
@@ -2112,16 +2129,20 @@ class DiT(nn.Module):
 
         # 1) pre-proj (varlen)
         x: torch.Tensor = self.preproj_varlen(
-            target_input_norm_xT=target_input_norm_xT, # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-            target_current_mask=_to_bool_mask(target_current_mask), #  (B, (1+)Pnn)
+            target_input_norm_xT=
+            target_input_norm_xT,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            target_current_mask=_to_bool_mask(
+                target_current_mask),  #  (B, (1+)Pnn)
         )
-        target_current_mask = _to_bool_mask(target_current_mask).to(device=x.device)
-        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)  # (B,(1+)Pnn,H)
+        target_current_mask = _to_bool_mask(target_current_mask).to(
+            device=x.device)
+        x = x.masked_fill(target_current_mask.unsqueeze(-1),
+                          0.0)  # (B,(1+)Pnn,H)
 
         # ★ dtype/device 정렬 (매우 중요: float16/bfloat16 섞이면 float32로 승격될 수 있음)
         cross_c = _cast_like(cross_c, x)  # (B,token_num,H)
         target_agents_route_lane_emb = _cast_like(target_agents_route_lane_emb,
-                                                x)  # (B,(1+)Pnn,H)
+                                                  x)  # (B,(1+)Pnn,H)
         cross_mask = _to_bool_mask(cross_mask).to(
             device=x.device)  # 의미는 유지, dtype만 bool
         route_known_mask = _to_bool_mask(route_known_mask).to(device=x.device)
@@ -2145,10 +2166,10 @@ class DiT(nn.Module):
             logit_gate_base=logit_gate_base, # [B, (1+)Pnn, H]
         """
         composer_out = self.pram_v2_composer(
-            state_token_in=state_token_in, # (B, (1+)Pnn, H)
+            state_token_in=state_token_in,  # (B, (1+)Pnn, H)
             ego_fut_global=ego_fut_global,
             target_agents_route_lane_emb=target_agents_route_lane_emb,
-            route_known_mask=route_known_mask, # (B, (1+)Pnn)
+            route_known_mask=route_known_mask,  # (B, (1+)Pnn)
         )
         time_out = self.pram_v2_time_mod(t_embedding)  # (B,1,H)
 
@@ -2167,9 +2188,10 @@ class DiT(nn.Module):
             x = block(
                 x=x,  # (B,(1+)Pnn,H)
                 cross_c=cross_c,
-                pram_v2_modulations=pram_mods, # Dict[PathName, ModulationTriplet]
-                target_current_mask=target_current_mask, # (B,(1+)Pnn)
-                cross_mask=cross_mask, # (B, token_num)
+                pram_v2_modulations=
+                pram_mods,  # Dict[PathName, ModulationTriplet]
+                target_current_mask=target_current_mask,  # (B,(1+)Pnn)
+                cross_mask=cross_mask,  # (B, token_num)
             )
             x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
@@ -2181,7 +2203,7 @@ class DiT(nn.Module):
 
         # 7) PRAM-v2 최종 레이어
         x = apply_pram_v2_final_layer(
-            x=x, # (B, (1+)Pnn, H)
+            x=x,  # (B, (1+)Pnn, H)
             composer_out=composer_out,
             time_out=time_out,
             final_norm=self.pram_v2_final_norm,
@@ -2197,7 +2219,8 @@ class DiT(nn.Module):
 
     def _forward_score_branch(
             self,
-            x: torch.Tensor,   # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            x: torch.
+        Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             diffusion_time: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """model_type 이 'score' 인 경우 출력 텐서를 만드는 함수.
@@ -2224,7 +2247,8 @@ class DiT(nn.Module):
 
     def _forward_x_start_branch(
         self,
-        x: torch.Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        x: torch.
+        Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         diffusion_time: torch.Tensor,  # (B,)
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         target_past_cur_future_valid: torch.
@@ -2233,7 +2257,7 @@ class DiT(nn.Module):
         target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
         B: int,
         one_or_Pnn: int,
-    ) -> torch.Tensor: # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+    ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         """model_type 이 'x_start' 인 경우 출력 텐서를 만드는 함수."""
         # 기본 경로: feasible 을 쓰지 않을 때
         if not getattr(self.config, "use_feasible", False):
@@ -2241,13 +2265,14 @@ class DiT(nn.Module):
 
         # 1) feasible에 넣을 텐서 준비(그래디언트 유지/차단 포함)
         (
-            x_for_feasible, # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            x_for_feasible,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             target_current_xyyaw_for_feasible,  # (B,(1+)Pnn,4) float32
             target_past_cur_future_valid_for_feasible,  # (B,(1+)Pnn,time_len_total)
         ) = self._select_tensors_for_feasible_projection(
-            x=x, # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            x=x,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
-            target_past_cur_future_valid=target_past_cur_future_valid, # (B, (1+)Pnn, 1+past_len+future_len)
+            target_past_cur_future_valid=
+            target_past_cur_future_valid,  # (B, (1+)Pnn, 1+past_len+future_len)
         )
 
         # 2) (현재+미래) 궤적 텐서 만들기: (B,(1+)Pnn,1+T,4)
@@ -2267,7 +2292,8 @@ class DiT(nn.Module):
         self._feasible_projection(
             diffusion_trajectory=diffusion_trajectory,  # (B,(1+)Pnn,1+T,4)
             target_class_one_hot=target_class_one_hot,  # (B,(1+)Pnn,3)
-            target_past_cur_future_valid=target_past_cur_future_valid_for_feasible, # (B,(1+)Pnn,time_len_total)
+            target_past_cur_future_valid=
+            target_past_cur_future_valid_for_feasible,  # (B,(1+)Pnn,time_len_total)
             target_past=target_past,  # (B,(1+)Pnn,past_len,11)
             feasible_low_t_mask=low_t_mask,  # (B,)
         )
@@ -2279,7 +2305,8 @@ class DiT(nn.Module):
         # x_out: (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         x_out: torch.Tensor = self._maybe_replace_x_with_integrated_trajectory_for_eval(
             x=x,
-            integrated_trajectory=self.dit_returns.integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
+            integrated_trajectory=self.dit_returns.
+            integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
             target_current_xyyaw_for_feasible=target_current_xyyaw_for_feasible,
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
@@ -2315,24 +2342,23 @@ class DiT(nn.Module):
         target_current_mask: torch.Tensor = ~target_current_valid
         return target_cur_future_valid, target_current_mask
 
-
     def forward(
-            self,
-            target_input_norm_xT: torch.
+        self,
+        target_input_norm_xT: torch.
         Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-            target_agents_past: torch.
+        target_agents_past: torch.
         Tensor,  # (B, (1+)Pnn, time_len(=past_len+1), 11)
-            diffusion_time: torch.Tensor,  # (B,)
-            cross_c: torch.Tensor,  # (B, token_num, D)
-            ego_fut_global: torch.Tensor,  # (B, D)
-            target_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
-            target_past_cur_future_valid: torch.Tensor,
-            # (B, (1+)Pnn, 1+past_len+future_len) bool
-            cross_mask: torch.Tensor,  # (B, token_num)
-            route_known_mask: torch.Tensor,  # (B, (1+)Pnn)
-            target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
-            target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
-    ) -> torch.Tensor: # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        diffusion_time: torch.Tensor,  # (B,)
+        cross_c: torch.Tensor,  # (B, token_num, D)
+        ego_fut_global: torch.Tensor,  # (B, D)
+        target_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+        target_past_cur_future_valid: torch.Tensor,
+        # (B, (1+)Pnn, 1+past_len+future_len) bool
+        cross_mask: torch.Tensor,  # (B, token_num)
+        route_known_mask: torch.Tensor,  # (B, (1+)Pnn)
+        target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
+        target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+    ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         """DiT 전체 forward 를 수행하는 진입점.
 
         순서 개요:
@@ -2384,14 +2410,14 @@ class DiT(nn.Module):
         # model_type 분기
         if self._model_type == "score":
             return self._forward_score_branch(
-                x=x, # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+                x=x,  # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
                 diffusion_time=diffusion_time,
             )
         elif self._model_type == "x_start":
             return self._forward_x_start_branch(
                 x=x,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
                 diffusion_time=diffusion_time,
-                target_current_xyyaw=target_current_xyyaw, # (B, (1+)Pnn, 4)
+                target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 target_past=target_past,
                 target_class_one_hot=target_class_one_hot,
@@ -2408,7 +2434,8 @@ class DiT(nn.Module):
             target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
             target_past_cur_future_valid: torch.Tensor,
             # (B, (1+)Pnn, time_len=1+past_len+future_len) bool
-            target_past: Optional[torch.Tensor],  # (B, (1+)Pnn, past_len, 11) 또는 None
+            target_past: Optional[
+                torch.Tensor],  # (B, (1+)Pnn, past_len, 11) 또는 None
             final_hidden_tokens: torch.Tensor,  # (B, (1+)Pnn, H)
     ) -> None:
         """FeasibleProjector 전체 파이프라인을 한 번에 실행합니다.
@@ -2578,7 +2605,7 @@ class DiT(nn.Module):
             integrated_trajectory = self.config.state_normalizer(
                 unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
             near_future_mask = target_cur_future_valid[:, :,
-                                                     1:]  # (B, Pnn, future_len) bool
+                                                       1:]  # (B, Pnn, future_len) bool
             integrated_trajectory = integrated_trajectory.masked_fill(
                 ~near_future_mask.unsqueeze(-1), 0.0)
 
@@ -2590,8 +2617,10 @@ class DiT(nn.Module):
                 ~near_future_mask.unsqueeze(-1), 0.0)
 
             self.dit_returns = DiTReturns(
-                integrated_trajectory=integrated_trajectory, # (B, (1+)Pnn, future_len, 4)
-                control_constraint_diff=control_constraint_diff, # (B, (1+)Pnn, future_len, 3)
+                integrated_trajectory=
+                integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
+                control_constraint_diff=
+                control_constraint_diff,  # (B, (1+)Pnn, future_len, 3)
             )
 
     # [추가!!!] 학습 시 low‑t 샘플에 대해서만 FeasibleProjector를 돌리는 래퍼
@@ -2626,10 +2655,10 @@ class DiT(nn.Module):
         # 학습이 아니거나, low‑t 마스크가 없으면 기존 전체 경로 유지
         if feasible_low_t_mask is None:
             self._feasible_projection_core(
-                diffusion_trajectory, # (B, (1+)Pnn, 1+future_len, 4)
+                diffusion_trajectory,  # (B, (1+)Pnn, 1+future_len, 4)
                 target_class_one_hot,  # (B, (1+)Pnn, 3)
-                target_past_cur_future_valid, # (B, (1+)Pnn, time_len(=1+past_len) + future_len) bool
-                target_past, # (B, (1+)Pnn, past_len, 11) 또는 None
+                target_past_cur_future_valid,  # (B, (1+)Pnn, time_len(=1+past_len) + future_len) bool
+                target_past,  # (B, (1+)Pnn, past_len, 11) 또는 None
                 self.final_hidden_tokens,
             )
             return
@@ -2691,6 +2720,6 @@ class DiT(nn.Module):
         # 전체 배치 기준으로 다시 dit_returns 업데이트
         self.dit_returns = DiTReturns(
             integrated_trajectory=integrated_all,  # (B, (1+)Pnn, future_len, 4)
-            control_constraint_diff=constraint_all,  #  (B, (1+)Pnn, future_len, 3)
+            control_constraint_diff=
+            constraint_all,  #  (B, (1+)Pnn, future_len, 3)
         )
-

@@ -260,7 +260,7 @@ class DrawingOptions:
     # NEW: neighbor_future_gt_3_dim (numpy 버전) on/off
     DIFF_draw_diff_np_future_gt_3_dim: bool = True
     DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
-    DIFF_future_gt_3_dim_COLOR: str = BRIGHT_CYAN  # 미래 포인트 'x' 마커 크기
+    DIFF_future_gt_3_dim_COLOR: str =  DARK_BROWN  # 미래 포인트 'x' 마커 크기
 
     # NEW: GT 3차원 궤적 그리기 모드 ("point" / "line" / "arrow")
     DIFF_future_gt_3_dim_draw_mode: str = "line"

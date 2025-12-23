@@ -26,6 +26,238 @@ _LOGGER_PID_VAL = None  # multiprocessing.Value (pid 저장)
 _USE_FILTER_RADIUS: bool = True
 _FILTER_RADIUS_M: float = 150.0
 
+from typing import Tuple
+import numpy as np
+
+
+
+def _compute_valid_mask_from_feat_11(
+    feat_11: np.ndarray,  # shape: (T, 11)
+    eps: float = 0.0,
+) -> np.ndarray:
+    """(T,11) 에이전트 시계열에서 각 시점이 '유효한 점'인지 마스크를 만듭니다.
+
+    여기서 유효/무효 판단은 아주 단순하게 합니다.
+    - 해당 시점의 11차원 값이 전부 0이면 -> 무효(False)
+    - 하나라도 0이 아니면 -> 유효(True)
+
+    이 방식은 캐시에 저장되는 최종 11차원 데이터가
+    "무효 시점은 11차원 전부 0"이라는 전제를 갖기 때문에,
+    이후 단계(학습/로딩 등)에서도 같은 기준을 그대로 쓸 수 있습니다.
+
+    Args:
+        feat_11: (T,11) float32. [x,y,cos,sin,vx,vy,width,length,one_hot(3)] 형태.
+        eps: 0과 비교할 때 아주 작은 오차를 무시하고 싶으면 양수로 줄 수 있습니다.
+             (보통은 0.0으로 두면 됩니다)
+
+    Returns:
+        valid_mask: (T,) bool. True면 유효, False면 무효.
+    """
+    # feat_11: np.ndarray, shape (T, 11)
+    if feat_11.ndim != 2 or int(feat_11.shape[1]) != 11:
+        return np.zeros((int(feat_11.shape[0]),), dtype=bool)
+
+    abs_max = np.max(np.abs(feat_11.astype(np.float32)), axis=1)  # shape: (T,)
+    return (abs_max > float(eps))
+
+
+def _keep_only_current_connected_valid_block(
+    full_feat_11: np.ndarray,  # shape: (T, 11)
+    current_index: int,
+    enforce_all_invalid_when_current_invalid: bool,
+) -> np.ndarray:
+    """과거~현재~미래를 합친 (T,11)에서, 규칙을 만족하도록 '유효/무효'를 정리합니다.
+
+    처리 목표(요구사항 그대로):
+      1) 현재 점이 무효면:
+         - (enforce_all_invalid_when_current_invalid=True일 때)
+           101개(=T개) 점을 전부 무효로 만듭니다. (전부 0)
+      2) 현재 점이 유효면:
+         - "유효점과 유효점 사이에 무효점이 있으면 안 된다" 규칙을 만족해야 합니다.
+         - 이 규칙을 가장 확실하게 만족시키는 방법은,
+           '현재 시점과 시간적으로 붙어있는(연속된) 유효 구간'만 남기고
+           그 밖의 시점은 전부 0으로 비우는 것입니다.
+         - 결과적으로 유효 구간은 항상 한 덩어리로만 남게 됩니다.
+
+    Args:
+        full_feat_11: (T,11) float32. 과거~현재~미래를 합친 최종 11차원 시계열.
+        current_index: 현재 시점이 full_feat_11에서 몇 번째인지.
+            - past가 (TIME_LEN,)이고 "past의 마지막이 현재"라면 보통 TIME_LEN-1 입니다.
+        enforce_all_invalid_when_current_invalid: True면 현재 무효일 때 전체를 무효(전부 0)로 강제합니다.
+
+    Returns:
+        cleaned_feat_11: (T,11) float32.
+            - 규칙을 만족하도록 정리된 11차원 시계열
+            - 무효 구간은 11차원 전부 0
+    """
+    # full_feat_11: np.ndarray, shape (T, 11)
+    t_total = int(full_feat_11.shape[0])
+    if t_total <= 0:
+        return full_feat_11.astype(np.float32)
+
+    cur = int(current_index)
+    cur = max(0, min(cur, t_total - 1))
+
+    valid_mask = _compute_valid_mask_from_feat_11(full_feat_11)  # shape: (T,)
+
+    # 현재가 무효면: 요구사항에 맞게 전체 무효 처리(또는 안전하게 전체 0)
+    if not bool(valid_mask[cur]):
+        if bool(enforce_all_invalid_when_current_invalid):
+            return np.zeros_like(full_feat_11, dtype=np.float32)
+        # ego는 원래 현재가 무조건 유효여야 하므로, 여기로 들어오면 데이터가 이상한 케이스입니다.
+        # 그래도 downstream에서 깨지지 않게 전체 0으로 처리합니다.
+        return np.zeros_like(full_feat_11, dtype=np.float32)
+
+    # 현재가 유효면:
+    # "현재와 붙어있는 연속 유효 구간"만 남기고 나머지는 전부 0으로 비웁니다.
+    start = cur
+    while start > 0 and bool(valid_mask[start - 1]):
+        start -= 1
+
+    end = cur
+    while end < (t_total - 1) and bool(valid_mask[end + 1]):
+        end += 1
+
+    cleaned = np.zeros_like(full_feat_11, dtype=np.float32)  # shape: (T,11)
+    cleaned[start:end + 1] = full_feat_11[start:end + 1].astype(np.float32)
+    return cleaned
+
+
+def _build_future_3_from_future_11(
+    future_feat_11: np.ndarray,  # shape: (F, 11)
+) -> np.ndarray:
+    """(F,11) 미래 11차원에서 (F,3) 미래 GT([x,y,heading])를 만듭니다.
+
+    - x, y는 그대로 사용합니다.
+    - heading은 (cos, sin)에서 atan2(sin, cos)로 복원합니다.
+    - 무효 시점은 (0,0,0)으로 유지합니다.
+
+    Args:
+        future_feat_11: (F,11) float32.
+
+    Returns:
+        future_feat_3: (F,3) float32. [x, y, heading]
+    """
+    # future_feat_11: np.ndarray, shape (F, 11)
+    future_len = int(future_feat_11.shape[0])
+    out = np.zeros((future_len, 3), dtype=np.float32)  # shape: (F,3)
+    if future_len == 0:
+        return out
+
+    valid_mask = _compute_valid_mask_from_feat_11(future_feat_11)  # shape: (F,)
+    if not bool(np.any(valid_mask)):
+        return out
+
+    xy = future_feat_11[:, 0:2].astype(np.float32)  # shape: (F,2)
+    cos_yaw = future_feat_11[:, 2].astype(np.float32)  # shape: (F,)
+    sin_yaw = future_feat_11[:, 3].astype(np.float32)  # shape: (F,)
+
+    heading = np.arctan2(sin_yaw, cos_yaw).astype(np.float32)  # shape: (F,)
+    heading = wrap_angle_np(heading)  # [-pi, pi)
+
+    out[valid_mask, 0:2] = xy[valid_mask]
+    out[valid_mask, 2] = heading[valid_mask]
+    return out
+
+
+def build_agent_past_future_cache_arrays_from_full_trajectory(
+    agent_idx: int,
+    past_indices: np.ndarray,  # shape: (time_len,)
+    future_indices: np.ndarray,  # shape: (future_len,)
+    pos_xy_local_all: np.ndarray,  # shape: (N, S, 2)
+    vel_xy_local_all: np.ndarray,  # shape: (N, S, 2)
+    yaw_local_all: np.ndarray,  # shape: (N, S)
+    width_length_all: np.ndarray,  # shape: (N, S, 2)
+    valid_all: np.ndarray,  # shape: (N, S)
+    agent_one_hot: np.ndarray,  # shape: (3,)
+    enforce_all_invalid_when_current_invalid: bool,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """에이전트 1명의 past/future 출력 배열을, '현재 기준 유효 규칙'을 만족하도록 만들어 반환합니다.
+
+    이 함수는 "과거~현재~미래를 합친 전체 길이(T=time_len+future_len)"를 먼저 만들고,
+    그 전체를 기준으로 유효/무효 패턴을 정리한 뒤,
+    마지막에 past / future로 다시 나눠서 반환합니다.
+
+    요구사항 반영 규칙:
+      - 현재 점이 무효면:
+          (enforce_all_invalid_when_current_invalid=True일 때)
+          전체 T개 점을 전부 무효(전부 0)로 만듭니다.
+      - 현재 점이 유효면:
+          "유효점과 유효점 사이에 무효점이 있으면 안 된다" 규칙을 만족시키기 위해,
+          현재와 시간적으로 붙어있는(연속된) 유효 구간만 남기고,
+          그 밖은 전부 0으로 비웁니다.
+          결과적으로 유효 구간은 항상 한 덩어리만 남습니다.
+
+    반환은 캐시 포맷에 바로 넣을 수 있도록:
+      - past 11차원: (time_len, 11)
+      - future 3차원: (future_len, 3)
+      - future 11차원: (future_len, 11)
+    을 만들어 돌려줍니다.
+
+    Args:
+        agent_idx: 대상 트랙 인덱스.
+        past_indices: (time_len,) 과거(현재 포함) 인덱스. 없는 곳은 -1.
+        future_indices: (future_len,) 미래 인덱스. 없는 곳은 -1.
+        pos_xy_local_all: (N,S,2)
+        vel_xy_local_all: (N,S,2)
+        yaw_local_all: (N,S)
+        width_length_all: (N,S,2)
+        valid_all: (N,S)
+        agent_one_hot: (3,)
+        enforce_all_invalid_when_current_invalid: True면 현재가 무효일 때 전체를 무효로 강제.
+
+    Returns:
+        agent_past_11: (time_len,11) float32
+        agent_future_3: (future_len,3) float32
+        agent_future_11: (future_len,11) float32
+    """
+    past_len = int(past_indices.shape[0])
+    future_len = int(future_indices.shape[0])
+
+    # full_indices: (time_len + future_len,)
+    full_indices = np.concatenate([past_indices, future_indices], axis=0).astype(np.int64)
+
+    # 원본 값 뽑기
+    # pos_raw: (T,2), vel_raw: (T,2), yaw_raw: (T,), wl_raw: (T,2), valid_raw: (T,)
+    pos_raw, vel_raw, yaw_raw, wl_raw, valid_raw = gather_agent_sequence_by_indices(
+        agent_idx=int(agent_idx),
+        time_indices=full_indices,
+        pos_xy_local_all=pos_xy_local_all,
+        vel_xy_local_all=vel_xy_local_all,
+        yaw_local_all=yaw_local_all,
+        width_length_all=width_length_all,
+        valid_all=valid_all,
+    )
+
+    # full_feat_11_raw: (T,11)
+    full_feat_11_raw = pack_agent_features_11(
+        pos_xy=pos_raw,
+        vel_xy=vel_raw,
+        yaw_rad=yaw_raw,
+        width_length=wl_raw,
+        agent_one_hot=agent_one_hot,
+        valid_mask=valid_raw,
+    ).astype(np.float32)
+
+    # 현재는 past의 마지막
+    current_index_in_full = max(0, past_len - 1)
+
+    # 규칙 적용(전체 길이 기준으로 먼저 정리)
+    full_feat_11_clean = _keep_only_current_connected_valid_block(
+        full_feat_11=full_feat_11_raw,
+        current_index=int(current_index_in_full),
+        enforce_all_invalid_when_current_invalid=bool(enforce_all_invalid_when_current_invalid),
+    ).astype(np.float32)  # shape: (T,11)
+
+    # past / future 분리
+    agent_past_11 = full_feat_11_clean[:past_len].astype(np.float32)  # (time_len,11)
+    agent_future_11 = full_feat_11_clean[past_len:past_len + future_len].astype(np.float32)  # (future_len,11)
+
+    # future_3 만들기 (future_11 기반)
+    agent_future_3 = _build_future_3_from_future_11(agent_future_11).astype(np.float32)  # (future_len,3)
+
+    return agent_past_11, agent_future_3, agent_future_11
+
 
 def _require_filter_radius_args(args: Any) -> None:
     """args에 필터링 관련 설정이 있는지 확인합니다.
@@ -3458,6 +3690,7 @@ def build_cache_dict_for_scenario(
         - neighbor_shape: (A,3) float32  [length,width,height] 평균
         - neighbor_agents_past: (A,21,11) float32
         - neighbor_future_gt_3_dim: (A,80,3) float32
+        - neighbor_future_gt_11_dim: (A,80,11) float32
         - neighbor_track_token: List[str] (길이 A)
 
         - stop_sign_points: (Ns,10,2) float32
@@ -3552,52 +3785,22 @@ def build_cache_dict_for_scenario(
     # -------------------------
     # ego: past/future 만들기
     # -------------------------
-    ego_p_pos, ego_p_vel, ego_p_yaw, ego_p_wl, ego_p_valid = gather_agent_sequence_by_indices(
+    # -------------------------
+    # ego: past/future 만들기
+    # (과거~현재~미래를 한 번에 이어 붙인 뒤, "유효-무효-유효" 끊김이 없도록 정리)
+    # -------------------------
+    ego_agent_past, ego_future_gt_3_dim, ego_future_gt_11_dim = build_agent_past_future_cache_arrays_from_full_trajectory(
         agent_idx=ego_idx,
-        time_indices=past_indices,
+        past_indices=past_indices,          # (TIME_LEN,)
+        future_indices=future_indices,      # (FUTURE_LEN,)
         pos_xy_local_all=pos_xy_local_all,
         vel_xy_local_all=vel_xy_local_all,
         yaw_local_all=yaw_local_all,
         width_length_all=width_length_all,
         valid_all=valid_all,
+        agent_one_hot=one_hot_all[ego_idx],  # (3,)
+        enforce_all_invalid_when_current_invalid=False,  # ego는 현재가 무조건 유효(위에서 검증)
     )
-    ego_p_pos_i, ego_p_vel_i, ego_p_yaw_i, ego_p_wl_i, ego_p_valid_i = build_interpolated_agent_traj(
-        ego_p_pos, ego_p_vel, ego_p_yaw, ego_p_wl, ego_p_valid)
-    ego_agent_past = pack_agent_features_11(
-        pos_xy=ego_p_pos_i,
-        vel_xy=ego_p_vel_i,
-        yaw_rad=ego_p_yaw_i,
-        width_length=ego_p_wl_i,
-        agent_one_hot=one_hot_all[ego_idx],
-        valid_mask=ego_p_valid_i,
-    )  # (21,11)
-
-    ego_f_pos, ego_f_vel, ego_f_yaw, ego_f_wl, ego_f_valid = gather_agent_sequence_by_indices(
-        agent_idx=ego_idx,
-        time_indices=future_indices,
-        pos_xy_local_all=pos_xy_local_all,
-        vel_xy_local_all=vel_xy_local_all,
-        yaw_local_all=yaw_local_all,
-        width_length_all=width_length_all,
-        valid_all=valid_all,
-    )
-    ego_f_pos_i, ego_f_vel_i, ego_f_yaw_i, ego_f_wl_i, ego_f_valid_i = build_interpolated_agent_traj(
-        ego_f_pos, ego_f_vel, ego_f_yaw, ego_f_wl, ego_f_valid)
-
-    ego_future_gt_3_dim = pack_agent_future_3(
-        pos_xy=ego_f_pos_i,
-        yaw_rad=ego_f_yaw_i,
-        valid_mask=ego_f_valid_i,
-    )  # (80,3)
-
-    ego_future_gt_11_dim = pack_agent_features_11(
-        pos_xy=ego_f_pos_i,
-        vel_xy=ego_f_vel_i,
-        yaw_rad=ego_f_yaw_i,
-        width_length=ego_f_wl_i,
-        agent_one_hot=one_hot_all[ego_idx],
-        valid_mask=ego_f_valid_i,
-    )  # (80,11)
 
     # -------------------------
     # neighbors: 현재 시점에 존재하는(agent valid at current)만
@@ -3619,6 +3822,10 @@ def build_cache_dict_for_scenario(
                                     dtype=np.float32)  # (A,21,11)
     neighbor_future_gt_3_dim = np.zeros((agent_num, FUTURE_LEN, 3),
                                         dtype=np.float32)  # (A,80,3)
+
+    # ✅ 추가: neighbor 미래 11차원도 저장
+    neighbor_future_gt_11_dim = np.zeros((agent_num, FUTURE_LEN, 11),
+                                         dtype=np.float32)  # (A,80,11)
     neighbor_track_token: List[str] = [""] * agent_num  # ✅ 추가: 길이 A
 
     for out_i, tr_i in enumerate(neighbor_indices.tolist()):
@@ -3638,45 +3845,24 @@ def build_cache_dict_for_scenario(
             neighbor_shape[out_i] = shape_vals.mean(axis=0).astype(np.float32)
         else:
             neighbor_shape[out_i] = 0.0
-
-        # past 11-dim
-        p_pos, p_vel, p_yaw, p_wl, p_valid = gather_agent_sequence_by_indices(
+        # past/future: (과거~현재~미래를 한 번에 이어 붙인 뒤 규칙 적용)
+        n_past_11, n_future_3, n_future_11 = build_agent_past_future_cache_arrays_from_full_trajectory(
             agent_idx=tr_i,
-            time_indices=past_indices,
+            past_indices=past_indices,            # (TIME_LEN,)
+            future_indices=future_indices,        # (FUTURE_LEN,)
             pos_xy_local_all=pos_xy_local_all,
             vel_xy_local_all=vel_xy_local_all,
             yaw_local_all=yaw_local_all,
             width_length_all=width_length_all,
             valid_all=valid_all,
-        )
-        p_pos_i, p_vel_i, p_yaw_i, p_wl_i, p_valid_i = build_interpolated_agent_traj(
-            p_pos, p_vel, p_yaw, p_wl, p_valid)
-        neighbor_agents_past[out_i] = pack_agent_features_11(
-            pos_xy=p_pos_i,
-            vel_xy=p_vel_i,
-            yaw_rad=p_yaw_i,
-            width_length=p_wl_i,
-            agent_one_hot=one_hot_all[tr_i],
-            valid_mask=p_valid_i,
+            agent_one_hot=one_hot_all[tr_i],      # (3,)
+            enforce_all_invalid_when_current_invalid=True,  # ✅ 요구사항 a: 현재 무효면 101개 전부 무효
         )
 
-        # future 3-dim
-        f_pos, f_vel, f_yaw, f_wl, f_valid = gather_agent_sequence_by_indices(
-            agent_idx=tr_i,
-            time_indices=future_indices,
-            pos_xy_local_all=pos_xy_local_all,
-            vel_xy_local_all=vel_xy_local_all,
-            yaw_local_all=yaw_local_all,
-            width_length_all=width_length_all,
-            valid_all=valid_all,
-        )
-        f_pos_i, _, f_yaw_i, _, f_valid_i = build_interpolated_agent_traj(
-            f_pos, f_vel, f_yaw, f_wl, f_valid)
-        neighbor_future_gt_3_dim[out_i] = pack_agent_future_3(
-            pos_xy=f_pos_i,
-            yaw_rad=f_yaw_i,
-            valid_mask=f_valid_i,
-        )
+        neighbor_agents_past[out_i] = n_past_11
+        neighbor_future_gt_3_dim[out_i] = n_future_3
+        neighbor_future_gt_11_dim[out_i] = n_future_11
+
 
     # -------------------------
     # map: stop/crosswalk/speed_bump/lanes
@@ -3765,7 +3951,8 @@ def build_cache_dict_for_scenario(
 
         "neighbor_agents_past": neighbor_agents_past,  # (A,21,11)  # womd
         "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,  # (A,80,3)  # womd
-
+        "neighbor_future_gt_11_dim": neighbor_future_gt_11_dim,
+        # ✅ 추가: (A,80,11)
         "neighbor_track_token": neighbor_track_token,  # ✅ 추가: List[str], 길이 A
 
         "stop_sign_points": stop_sign_points,  # (Ns,10,2)  # womd

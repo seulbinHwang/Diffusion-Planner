@@ -90,6 +90,239 @@ class DataProcessor(object):
             'ROUTE_LANES': config.lane_len
         }  # maximum number of points per feature to extract per feature layer.
 
+    @staticmethod
+    def _slice_neighbor_cur_fut_horizon_11dim(
+        neighbor_cur_fut_all_gt_11_dim: np.ndarray,  # shape: (N, T_all, 11)
+        iteration: int,
+        future_len: int,
+    ) -> np.ndarray:
+        """neighbor의 (현재~미래) 전체 시퀀스에서, 특정 iteration 기준으로 (현재+미래) 구간만 고정 길이로 뽑는다.
+
+        이 함수가 필요한 이유
+        ---------------------
+        observation_adapter()에서는 scenario 전체 길이만큼의 (현재~미래) 데이터를 미리 만들어두고,
+        매 step마다 iteration 위치에서 앞으로 future_len 만큼을 잘라서 씁니다.
+
+        그런데 “유효점과 유효점 사이에 무효점이 있으면 안 된다” 규칙을 적용할 때,
+        **현재 step에서 필요한 101개(=past_len + future_len)**만 보고 처리해야 합니다.
+        (멀리 뒤의 미래 프레임이 섞이면, 그 정보 때문에 앞 구간이 잘못 채워질 수 있습니다.)
+
+        그래서 이 함수는:
+        - neighbor_cur_fut_all_gt_11_dim (N, T_all, 11) 에서
+        - [iteration ... iteration + future_len] (총 1+future_len 프레임)
+          을 뽑아서 (N, 1+future_len, 11) 로 반환합니다.
+        - 범위를 벗어나는 프레임은 0으로 패딩합니다.
+
+        Args:
+            neighbor_cur_fut_all_gt_11_dim (np.ndarray):
+                shape: (N, T_all, 11)
+                - N: agent 수
+                - T_all: scenario 전체 타임 길이(현재 포함)
+                - 11: [x, y, cos, sin, vx, vy, width, length, onehot(3)]
+            iteration (int):
+                현재 step 인덱스(0 기반).
+                이 값이 “현재 프레임” 위치라고 가정합니다.
+            future_len (int):
+                “현재 이후”로 몇 프레임을 쓸지 (현재 제외).
+                예: 80 이면 출력 길이는 81(=현재1 + 미래80)
+
+        Returns:
+            np.ndarray:
+                shape: (N, 1 + future_len, 11)
+                - index 0: 현재 프레임
+                - index 1..future_len: 미래 프레임
+                - 부족한 구간은 0으로 채워짐
+        """
+        if neighbor_cur_fut_all_gt_11_dim.ndim != 3 or neighbor_cur_fut_all_gt_11_dim.shape[
+                -1] != 11:
+            raise ValueError(
+                f"`neighbor_cur_fut_all_gt_11_dim` shape는 (N, T_all, 11)이어야 합니다. "
+                f"got {neighbor_cur_fut_all_gt_11_dim.shape}")
+        if iteration < 0:
+            raise ValueError(f"`iteration`은 0 이상이어야 합니다. got {iteration}")
+        if future_len < 0:
+            raise ValueError(f"`future_len`은 0 이상이어야 합니다. got {future_len}")
+
+        N: int = int(neighbor_cur_fut_all_gt_11_dim.shape[0])
+        T_all: int = int(neighbor_cur_fut_all_gt_11_dim.shape[1])
+        out_len: int = int(1 + future_len)
+
+        # out: (N, 1+future_len, 11)
+        out: np.ndarray = np.zeros((N, out_len, 11),
+                                   dtype=neighbor_cur_fut_all_gt_11_dim.dtype)
+
+        start: int = int(iteration)
+        end: int = int(iteration + out_len)
+
+        if start >= T_all:
+            return out
+
+        copy_end: int = int(min(T_all, end))
+        copy_len: int = int(copy_end - start)  # 복사 가능한 길이
+
+        out[:, :copy_len, :] = neighbor_cur_fut_all_gt_11_dim[:,
+                                                              start:copy_end, :]
+        return out
+
+    def _build_neighbor_future_gt_from_past_and_cur_fut_11dim(
+        self,
+        neighbor_agents_past: np.ndarray,  # shape: (N, Tp, 11)
+        neighbor_cur_fut_gt_11_dim: np.
+        ndarray,  # shape: (N, 1+Tf, 11)  (0번이 현재)
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """neighbor의 past와 (현재+미래)를 합쳐서, 규칙을 만족하도록 정리한 뒤 최종 출력들을 만든다.
+
+        반드시 만족해야 하는 규칙(한 agent 기준)
+        --------------------------------------
+        1) 현재 점(past의 마지막)이 무효면:
+           - 101개 전체(과거~현재~미래)가 전부 무효(=전부 0)여야 합니다.
+
+        2) 현재 점이 유효면:
+           - 101개 전체에서 “유효점과 유효점 사이에 무효점”이 있으면 안 됩니다.
+           - 즉, 유효한 프레임들이 중간에 끊기면,
+             그 끊긴 구간을 x/y/cos/sin/vx/vy의 “직선 중간값”으로 채워서
+             유효 구간이 한 덩어리로 이어지게 만듭니다.
+           - 유효 구간 밖(prefix/suffix)은 0으로 둡니다.
+
+        Args:
+            neighbor_agents_past (np.ndarray):
+                shape: (N, Tp, 11)
+                - Tp = time_len (예: 21)
+                - 마지막 index (Tp-1)이 “현재 프레임”
+            neighbor_cur_fut_gt_11_dim (np.ndarray):
+                shape: (N, 1+Tf, 11)
+                - index 0이 “현재 프레임”
+                - index 1..Tf 가 “미래”
+                - Tf = future_len (예: 80)
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                - fixed_neighbor_agents_past: shape (N, Tp, 11)
+                - neighbor_future_gt_11_dim:  shape (N, Tf, 11)  (현재 제외)
+                - neighbor_future_gt_3_dim:   shape (N, Tf, 3)   [x, y, yaw]
+        """
+        fixed_neighbor_agents_past, neighbor_future_gt_11_dim = self._merge_and_interpolate_neighbor_11dim(
+            neighbor_agents_past=neighbor_agents_past,
+            neighbor_cur_fut_gt_11_dim=neighbor_cur_fut_gt_11_dim,
+        )
+
+        # 11 -> 3 (yaw는 cos/sin으로 계산)
+        neighbor_future_gt_3_dim: np.ndarray = self._traj11_to_traj3_yaw(
+            neighbor_future_gt_11_dim)
+
+        return fixed_neighbor_agents_past, neighbor_future_gt_11_dim, neighbor_future_gt_3_dim
+
+    def _enforce_no_invalid_between_valid_in_ego_past(
+        self,
+        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+        *,
+        eps: float = 1e-8,
+    ) -> np.ndarray:
+        """ego_agent_past(과거~현재)만 가지고도 “유효-무효-유효”가 생기지 않게 정리한다.
+
+        observation_adapter()에서는 ego 미래 GT를 출력하지 않기 때문에,
+        past(과거~현재)만으로 규칙을 강제합니다.
+
+        규칙
+        ----
+        - 현재 프레임(=past의 마지막)이 유효일 때:
+          · past 안에서 유효점과 유효점 사이에 무효점(0)이 끼면 안 됩니다.
+          · 그래서 past에서 유효한 프레임들의 첫/마지막 위치를 찾고,
+            그 사이에 비어 있는 프레임이 있으면 x/y/cos/sin/vx/vy를 “직선 중간값”으로 채웁니다.
+          · 유효 구간 밖은 0으로 둡니다.
+
+        - 현재 프레임이 무효면:
+          · 안전하게 past 전체를 0으로 만듭니다.
+            (ego는 보통 항상 존재하지만, 이상 케이스를 막기 위해서입니다.)
+
+        Args:
+            ego_agent_past (np.ndarray):
+                shape: (Tp, 11)
+                Tp는 보통 21 (2초 과거 + 현재)
+            eps (float):
+                0과 아주 가까운 값을 “0”처럼 볼 때 쓰는 기준
+
+        Returns:
+            np.ndarray:
+                shape: (Tp, 11)
+                규칙을 만족하도록 정리된 ego_agent_past (새 배열)
+        """
+        if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
+            raise ValueError(
+                f"`ego_agent_past` shape는 (Tp, 11)이어야 합니다. got {ego_agent_past.shape}"
+            )
+
+        Tp: int = int(ego_agent_past.shape[0])
+        if Tp == 0:
+            return ego_agent_past
+
+        traj: np.ndarray = ego_agent_past.astype(np.float32,
+                                                 copy=True)  # (Tp, 11)
+        current_index: int = Tp - 1
+
+        # valid_mask_1d: (Tp,)
+        valid_mask_1d: np.ndarray = (np.abs(traj[:, :8]) > eps).any(axis=1)
+
+        # 현재가 무효면 past 전체를 0으로
+        if not bool(valid_mask_1d[current_index]):
+            return np.zeros_like(traj)
+
+        valid_idx: np.ndarray = np.nonzero(valid_mask_1d)[0]
+        if valid_idx.size == 0:
+            return np.zeros_like(traj)
+
+        region_mask: np.ndarray = np.zeros((Tp,), dtype=bool)
+
+        if valid_idx.size == 1:
+            region_mask[int(valid_idx[0])] = True
+        else:
+            first_valid: int = int(valid_idx[0])
+            last_valid: int = int(valid_idx[-1])
+            region_mask[first_valid:last_valid + 1] = True
+
+            # 중간 구멍이 있으면 x/y/cos/sin/vx/vy를 채움 (0~5)
+            if last_valid - first_valid + 1 > valid_idx.size:
+                xs: np.ndarray = valid_idx.astype(np.float64)  # (K,)
+                seg_idx: np.ndarray = np.arange(first_valid,
+                                                last_valid + 1,
+                                                dtype=np.float64)
+
+                for dim_idx in range(6):  # 0~5
+                    ys: np.ndarray = traj[valid_idx, dim_idx].astype(np.float64,
+                                                                     copy=False)
+                    interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
+                    traj[first_valid:last_valid + 1,
+                         dim_idx] = interp_vals.astype(np.float32, copy=False)
+
+        # 타입/크기는 “현재 프레임 값”을 대표로 씀
+        type_vec: np.ndarray = traj[current_index,
+                                    8:11].astype(np.float32, copy=False)  # (3,)
+        rep_size: np.ndarray = traj[current_index,
+                                    6:8].astype(np.float32, copy=False)  # (2,)
+
+        # one-hot은 유효 구간에만
+        traj[:, 8:11] = 0.0
+        traj[region_mask, 8:11] = type_vec
+
+        # 유효 구간 밖은 완전 0
+        traj[~region_mask, :] = 0.0
+
+        # width/length 채우기 + cos/sin 정리
+        traj_b: np.ndarray = traj[None, :, :]  # (1, Tp, 11)
+        region_b: np.ndarray = region_mask[None, :]  # (1, Tp)
+        rep_size_b: np.ndarray = rep_size[None, :]  # (1, 2)
+
+        traj_b = self._fill_width_length_with_representative_size(
+            traj_11=traj_b,
+            valid_mask=region_b,
+            rep_size=rep_size_b,
+        )
+        traj_b = self._normalize_cos_sin_in_traj_11(
+            traj_11=traj_b,
+            valid_mask=region_b,
+        )
+        return traj_b[0]  # (Tp, 11)
+
     def _get_map_query_radius_m(self) -> float:
         """지도/도로시설(정지표지, 횡단보도 등)을 조회할 때 사용할 반경(m)을 반환합니다.
 
@@ -597,23 +830,15 @@ class DataProcessor(object):
             ego_cur_pose_np=ego_cur_pose_np,
         )
 
-        #   # Past observations including the current
+        # ✅ (요구조건 c) observation_adapter에서는 ego_agent_past만 출력하므로,
+        #    ego_agent_past 자체에서 “유효-무효-유효”가 생기지 않게 정리
+        ego_agent_past = self._enforce_no_invalid_between_valid_in_ego_past(
+            ego_agent_past=ego_agent_past)
+
+        # Past observations including the current
         observation_buffer: Deque[
             Observation] = history_buffer.observation_buffer
-        """
-        - past_cur_agents_world_8_list: List[np.ndarray]
-            · 길이: num_frames
-            · 각 원소: (frame_agents_num, 8) 열 = ID/속도/방향/크기/위치 
-        - past_cur_agents_types_list: List[List[TrackedObjectType]]
-            · 길이: num_frames
-            · 각 프레임에서 에이전트 타입(차량/보행자/자전거) 리스트
-        - present_static_feat_5: np.ndarray
-            · 모양: (cur_static_num, 5)
-            · [x, y, heading, width, length] (현재 프레임의 정적 객체)
-        - static_types_list: List[TrackedObjectType]
-            · 길이: cur_static_num
-            · 각 정적 객체의 타입 리스트
-        """
+
         (
             past_cur_agents_world_8_list,
             past_cur_agents_types_list,
@@ -624,13 +849,7 @@ class DataProcessor(object):
             _,
         ) = self._get_past_cur_agents_feature(
             observation_buffer=observation_buffer)
-        """
-        neighbor_agents_past: (chosen_agent_num, num_frames, 11)
-        agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
-        neighbors_id: np.ndarray (chosen_agent_num,) (에이전트 ID)
-        neighbor_track_token: List[str] (chosen_agent_num,)
-        """
-        # 2) neighbor 과거 궤적 (K, T, 11) + 인덱스/ID
+
         (neighbor_agents_past, agents_cur_frame_indices, neighbors_id,
          neighbor_track_token) = build_neighbor_past_feature(
              past_cur_agents_world_8_list=past_cur_agents_world_8_list,
@@ -644,20 +863,14 @@ class DataProcessor(object):
          )
 
         ego_time_len = ego_agent_past.shape[0]
-        neighbor_time_len = neighbor_agents_past.shape[
-            1]  # (K, T, 11) 이므로 axis=1
+        neighbor_time_len = neighbor_agents_past.shape[1]
         assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
             f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
-        """
-        - neighbor_future_gt_3_dim:
-            · shape: (chosen_agent_num, Tf, 3)
-        - neighbor_future_all_gt_3_dim:
-            · shape: (chosen_agent_num, 1 + Tf_all, 3)
-        """
+
         cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
             scenario, token_to_id, do_inference=True)
 
-        # neighbor_cur_fut_all_gt_11_dim: (chosen_agent_num, 1 + Tf_all, 11)
+        # (N, 1 + Tf_all, 11)
         neighbor_cur_fut_all_gt_11_dim = agent_future_all_process(
             ego_cur_pose_np=ego_cur_pose_np,
             cur_fut_agents_world_8_list=cur_fut_agents_world_8_list,
@@ -665,36 +878,29 @@ class DataProcessor(object):
             neighbor_agents_past=neighbor_agents_past,
         )
 
-        # [추가] past + 전체 future 를 합친 뒤, 중간 빈 프레임 보간
-        #   neighbor_agents_past: (chosen_agent_num, Tp, 11)
-        #   neighbor_future_all_gt_11_dim: (chosen_agent_num, Tf_all, 11)
-        neighbor_agents_past, neighbor_future_all_gt_11_dim = \
-            self._merge_and_interpolate_neighbor_11dim(
+        # ✅ (요구조건 a) “현재 iteration 기준”으로 (현재+미래 80)만 뽑아서
+        #    (past 21)과 합친 101개 기준으로 규칙을 강제
+        neighbor_cur_fut_horizon_gt_11_dim = self._slice_neighbor_cur_fut_horizon_11dim(
+            neighbor_cur_fut_all_gt_11_dim=neighbor_cur_fut_all_gt_11_dim,
+            iteration=iteration,
+            future_len=self.num_future_poses,
+        )
+
+        # ✅ 규칙 적용 + 최종 neighbor_future_gt_3_dim / neighbor_future_gt_11_dim 생성
+        neighbor_agents_past, neighbor_future_gt_11_dim, neighbor_future_gt_3_dim = \
+            self._build_neighbor_future_gt_from_past_and_cur_fut_11dim(
                 neighbor_agents_past=neighbor_agents_past,
-                neighbor_cur_fut_gt_11_dim=neighbor_cur_fut_all_gt_11_dim,
+                neighbor_cur_fut_gt_11_dim=neighbor_cur_fut_horizon_gt_11_dim,
             )
 
-        # 11차원 전체 궤적에서 앞 3차원만 추출
-        # neighbor_future_all_gt_3_dim: (chosen_agent_num, Tf_all, 3)
-        yaw = np.arctan2(neighbor_future_all_gt_11_dim[:, :, 3],
-                         neighbor_future_all_gt_11_dim[:, :, 2])
-        neighbor_future_all_gt_3_dim = np.stack([
-            neighbor_future_all_gt_11_dim[:, :, 0],
-            neighbor_future_all_gt_11_dim[:, :, 1], yaw
-        ],
-                                                axis=-1)
-        # 현재 iteration 기준으로 원하는 future 구간만 잘라서 사용
-        # neighbor_future_gt_3_dim: (chosen_agent_num, Tf, 3)
-        neighbor_future_gt_3_dim = neighbor_future_all_gt_3_dim[:, iteration:
-                                                                iteration +
-                                                                self.
-                                                                num_future_poses, :]
-        # neighbor_future_gt_11_dim: (chosen_agent_num, Tf, 11)
-        neighbor_future_gt_11_dim = neighbor_future_all_gt_11_dim[:, iteration:
-                                                                  iteration +
-                                                                  self.
-                                                                  num_future_poses, :]
-        # 3) static 객체 (K_static, 10)
+        # (선택) 기존처럼 “전체 길이” future_all도 계속 내보내고 싶다면:
+        # - 여기서는 추가적인 101 규칙 적용이 아니라, raw 변환만 제공합니다.
+        # - shape: (N, Tf_all, 3)
+        neighbor_future_all_gt_11_dim = neighbor_cur_fut_all_gt_11_dim[:,
+                                                                       1:, :]  # 현재(0) 제외
+        neighbor_future_all_gt_3_dim = self._traj11_to_traj3_yaw(
+            neighbor_future_all_gt_11_dim)
+
         static_objects = build_static_feature(
             present_static_feat_5=present_static_feat_5,
             static_types_list=static_types_list,
@@ -702,22 +908,30 @@ class DataProcessor(object):
             ego_cur_pose_np=ego_cur_pose_np,
             filter_radius=self._get_effective_filter_radius_m(),
         )
+
         key_to_array = {
             "ego_agent_past": ego_agent_past,  # (time_len, 11)
-            "neighbor_agents_past":
-                neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
-            "neighbor_future_gt_3_dim":
-                neighbor_future_gt_3_dim,  # (chosen_agent_num, future_len, 3)
-            "neighbor_future_all_gt_3_dim":
-                neighbor_future_all_gt_3_dim,  # (chosen_agent_num, future_all_len, 3)
+            "neighbor_agents_past": neighbor_agents_past,
+            # (chosen_agent_num, time_len, 11)
+
+            # ✅ (요구조건 a) 최종 출력(규칙 적용된) future GT
+            "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,
+            # (chosen_agent_num, future_len, 3)
+            "neighbor_future_gt_11_dim": neighbor_future_gt_11_dim,
+            # (chosen_agent_num, future_len, 11)
+
+            # 기존 키 유지(필요시):
+            "neighbor_future_all_gt_3_dim": neighbor_future_all_gt_3_dim,
+            # (chosen_agent_num, future_all_len, 3)
             "static_objects": static_objects,  # (chosen_static_num, 10)
         }
+
         key_to_road_safety = self._get_road_safety_features(
             scenario=scenario,
             ego_cur_pose_np=ego_cur_pose_np,
         )
         key_to_array.update(key_to_road_safety)
-        ###################
+
         (
             route_roadblock_ids,
             elements_to_obj_polylines,
@@ -732,7 +946,7 @@ class DataProcessor(object):
             map_api=map_api,
             traffic_light_data=traffic_light_data,
         )
-        # len = chosen_car_num
+
         car_token_to_rr_ids: Dict[
             str, List[str]] = self._prepare_car_token_to_rr_ids(
                 scenario=scenario,
@@ -740,29 +954,19 @@ class DataProcessor(object):
                 neighbor_track_token=neighbor_track_token,
             )
 
-        # (max_agent_num, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]
         map_key_to_array = map_process(
-            route_roadblock_ids,
-            car_token_to_rr_ids,  # len = chosen_car_num
-            neighbor_track_token,
-            neighbor_agents_current,
-            ego_cur_pose_np,
-            elements_to_obj_polylines,
-            elements_to_traffic_light,  # elements_to_traffic_light: Dict[str, LaneSegmentTrafficLightData]
-            speed_limit_dict,
-            lanes_roadblock_id_list,
-            self._map_elements,
-            self._max_map_elements,
+            route_roadblock_ids, car_token_to_rr_ids, neighbor_track_token,
+            neighbor_agents_current, ego_cur_pose_np, elements_to_obj_polylines,
+            elements_to_traffic_light, speed_limit_dict,
+            lanes_roadblock_id_list, self._map_elements, self._max_map_elements,
             self._map_points_num)
-        # key_to_array: Dict[str, np.ndarray]
         key_to_array.update(map_key_to_array)
-        # key_to_array: Dict[str, torch.Tensor]
+
         key_to_array = convert_data_dict_to_device_tensors(
             key_to_array, device, squeeze)
-        # agent
-        key_to_array[
-            "neighbor_track_token"] = neighbor_track_token  # List[str], (chosen_agent_num,)
+
+        key_to_array["neighbor_track_token"] = neighbor_track_token
         return key_to_array
 
     @staticmethod
@@ -795,50 +999,187 @@ class DataProcessor(object):
 
         return modified_past
 
-    def _merge_and_interpolate_neighbor_11dim(
-            self,
-            neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
-            neighbor_cur_fut_gt_11_dim: np.
-        ndarray,  # (max_agent_num, Tf, 11)  # 0번이 현재
+    def _merge_and_interpolate_ego_11dim(
+        self,
+        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+        ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
+        *,
+        eps: float = 1e-8,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """neighbor 과거/현재와 현재/미래를 이어 붙인 뒤, 중간 빈 프레임만 자연스럽게 채운다.
+        """ego 과거~현재 + 미래를 합친 뒤, 유효~유효 사이에 무효(0)가 끼지 않게 만든다.
 
-        동작 방식(한 agent 기준)
-        ----------------------
-        1) 과거~현재(neighbor_agents_past)와 현재~미래(neighbor_cur_fut_gt_11_dim)를
-           시간 순서대로 한 줄로 붙인다.
-           - 두 배열 모두 "현재 프레임"을 포함하므로,
-             future 쪽의 0번(현재)은 제거하고 붙인다.
+        - ego는 원래 대부분 "항상 존재"하지만,
+          시나리오 길이가 짧아 미래 끝이 0으로 패딩되는 경우 등이 있어서
+          안전하게 한 번 더 규칙을 강제한다.
 
-        2) 합쳐진 궤적에서, x/y/방향(cos,sin)/속도(vx,vy)가 전부 0인 프레임은
-           "비어 있는 프레임"이라고 본다.
-           앞뒤는 값이 있는데 가운데만 비어 있으면,
-           앞 점과 뒤 점을 직선으로 잇는다고 생각하고
-           그 사이 프레임들의 x/y/방향/속도를 중간값으로 채운다.
-
-        3) width/length는 보간하지 않는다.
-           대신, 각 agent에 대해 과거~현재 구간에서 관측된 width/length 값들을 모아
-           정렬했을 때 가운데 값(중간값) 하나를 대표값으로 뽑고,
-           값이 채워진(유효한) 모든 프레임에 그 대표값을 그대로 복사한다.
-           (유효하지 않은 프레임은 0으로 둔다.)
-
-        4) 타입 one-hot(8~10)은 한 번이라도 관측된 값을 대표값으로 골라,
-           값이 채워진 프레임에만 동일하게 붙인다.
-
-        5) 맨 앞/맨 뒤처럼 한쪽이라도 이웃 점이 없는 비어 있는 구간은
-           그대로 0으로 남겨 둔다.
+        규칙
+        ----
+        - 현재 프레임(=past의 마지막)이 유효일 때만 처리한다.
+        - 전체 101개를 과거→미래로 봤을 때,
+          유효 프레임과 유효 프레임 사이에 무효 프레임이 끼면
+          그 중간을 x/y/cos/sin/vx/vy의 "직선 중간값"으로 채워서
+          연속 유효 구간을 만든다.
+        - 구간 밖(prefix/suffix)은 0으로 둔다.
 
         Args:
-            neighbor_agents_past (np.ndarray):
-                shape: (max_agent_num, Tp, 11)
-            neighbor_cur_fut_gt_11_dim (np.ndarray):
-                shape: (max_agent_num, Tf, 11)
-                인덱스 0이 현재 프레임이라고 가정한다.
+            ego_agent_past (np.ndarray):
+                shape: (Tp, 11)  # Tp=21
+            ego_future_gt_11_dim (np.ndarray):
+                shape: (Tf, 11)  # Tf=80
 
         Returns:
             Tuple[np.ndarray, np.ndarray]:
-                - new_neighbor_agents_past: shape (max_agent_num, Tp, 11)
-                - new_neighbor_future_11:  shape (max_agent_num, Tf-1, 11)  # 현재 제외
+                - new_ego_agent_past: shape (Tp, 11)
+                - new_ego_future_11:  shape (Tf, 11)
+        """
+        if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
+            raise ValueError(
+                f"`ego_agent_past` shape는 (Tp, 11)이어야 합니다. got {ego_agent_past.shape}"
+            )
+        if ego_future_gt_11_dim.ndim != 2 or ego_future_gt_11_dim.shape[
+                -1] != 11:
+            raise ValueError(
+                f"`ego_future_gt_11_dim` shape는 (Tf, 11)이어야 합니다. got {ego_future_gt_11_dim.shape}"
+            )
+
+        Tp: int = int(ego_agent_past.shape[0])
+        Tf: int = int(ego_future_gt_11_dim.shape[0])
+        if Tp == 0 or Tf == 0:
+            return ego_agent_past, ego_future_gt_11_dim
+
+        # full: (Tp+Tf, 11) == (101, 11)
+        full: np.ndarray = np.concatenate(
+            [ego_agent_past, ego_future_gt_11_dim], axis=0).astype(np.float32,
+                                                                   copy=True)
+        T_full: int = int(full.shape[0])
+        current_index: int = Tp - 1
+
+        # 유효 프레임: 앞 8개 중 하나라도 0이 아니면 유효
+        valid_mask_1d: np.ndarray = (np.abs(full[:, :8])
+                                     > eps).any(axis=1)  # (T_full,)
+
+        # 현재가 유효일 때만 규칙(b)을 강제
+        if not bool(valid_mask_1d[current_index]):
+            return ego_agent_past, ego_future_gt_11_dim
+
+        valid_idx: np.ndarray = np.nonzero(valid_mask_1d)[0]  # (K,)
+        if valid_idx.size == 0:
+            return ego_agent_past, ego_future_gt_11_dim
+
+        region_mask: np.ndarray = np.zeros((T_full,), dtype=bool)
+
+        if valid_idx.size == 1:
+            region_mask[int(valid_idx[0])] = True
+        else:
+            first_valid: int = int(valid_idx[0])
+            last_valid: int = int(valid_idx[-1])
+            region_mask[first_valid:last_valid + 1] = True
+
+            # 중간 구멍이 있으면 x/y/cos/sin/vx/vy를 채움
+            if last_valid - first_valid + 1 > valid_idx.size:
+                xs: np.ndarray = valid_idx.astype(np.float64)
+                seg_idx: np.ndarray = np.arange(first_valid,
+                                                last_valid + 1,
+                                                dtype=np.float64)
+
+                for dim_idx in range(6):
+                    ys: np.ndarray = full[valid_idx, dim_idx].astype(np.float64,
+                                                                     copy=False)
+                    interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
+                    full[first_valid:last_valid + 1,
+                         dim_idx] = interp_vals.astype(np.float32, copy=False)
+
+        # type/size는 현재 프레임 값을 대표값으로 쓴다.
+        type_vec: np.ndarray = ego_agent_past[-1,
+                                              8:11].astype(np.float32,
+                                                           copy=False)  # (3,)
+        rep_size: np.ndarray = ego_agent_past[-1,
+                                              6:8].astype(np.float32,
+                                                          copy=False)  # (2,)
+
+        full[:, 8:11] = 0.0
+        full[region_mask, 8:11] = type_vec
+
+        # 구간 밖은 완전히 0으로
+        full[~region_mask, :] = 0.0
+
+        # width/length 채우기 + cos/sin 정리 (배치 함수 재사용을 위해 (1,T,11)로 바꿈)
+        full_b: np.ndarray = full[None, :, :]  # (1, T_full, 11)
+        region_b: np.ndarray = region_mask[None, :]  # (1, T_full)
+        rep_size_b: np.ndarray = rep_size[None, :]  # (1, 2)
+
+        full_b = self._fill_width_length_with_representative_size(
+            traj_11=full_b,
+            valid_mask=region_b,
+            rep_size=rep_size_b,
+        )
+        full_b = self._normalize_cos_sin_in_traj_11(
+            traj_11=full_b,
+            valid_mask=region_b,
+        )
+        full = full_b[0]  # (T_full, 11)
+
+        new_ego_agent_past: np.ndarray = full[:Tp, :]
+        new_ego_future_11: np.ndarray = full[Tp:, :]
+        return new_ego_agent_past, new_ego_future_11
+
+    @staticmethod
+    def _traj11_to_traj3_yaw(traj_11: np.ndarray) -> np.ndarray:
+        """11차원 궤적을 [x, y, yaw] 3차원으로 바꾼다.
+
+        Args:
+            traj_11 (np.ndarray):
+                - (T, 11) 또는 (N, T, 11)
+                - 11차원 = [x, y, cos, sin, vx, vy, width, length, onehot(3)]
+
+        Returns:
+            np.ndarray:
+                - (T, 3) 또는 (N, T, 3)
+                - 3차원 = [x, y, yaw]
+        """
+        if traj_11.ndim == 2:
+            yaw = np.arctan2(traj_11[:, 3], traj_11[:, 2])
+            return np.stack([traj_11[:, 0], traj_11[:, 1], yaw], axis=-1)
+        if traj_11.ndim == 3:
+            yaw = np.arctan2(traj_11[:, :, 3], traj_11[:, :, 2])
+            return np.stack([traj_11[:, :, 0], traj_11[:, :, 1], yaw], axis=-1)
+        raise ValueError(
+            f"`traj_11`은 (T,11) 또는 (N,T,11) 이어야 합니다. got {traj_11.shape}")
+
+    def _merge_and_interpolate_neighbor_11dim(
+        self,
+        neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
+        neighbor_cur_fut_gt_11_dim: np.ndarray,
+        # (max_agent_num, Tf, 11)  # 0번이 현재
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """neighbor 과거/현재와 현재/미래를 이어 붙인 뒤, "중간에 비었다가 다시 살아나는" 문제를 막는다.
+
+        이 함수가 보장하는 규칙(한 agent 기준)
+        -----------------------------------
+        (a) 현재 프레임(=past의 마지막)이 무효라면:
+            - 과거~미래 전체 프레임을 전부 0으로 만든다.
+            - 즉, "현재는 없는데 미래에 갑자기 나타나는" 케이스를 없앤다.
+
+        (b) 현재 프레임이 유효라면:
+            - 전체 시퀀스를 과거→미래로 봤을 때,
+              유효 프레임과 유효 프레임 사이에 무효(0) 프레임이 끼지 않게 만든다.
+            - 방법:
+              1) 전체 시퀀스에서 유효 프레임들의 첫 index(first_valid)와 마지막 index(last_valid)를 찾는다.
+              2) first_valid~last_valid 구간은 "연속 유효 구간"으로 만들고,
+                 그 안에 비어 있던 프레임은 x/y/cos/sin/vx/vy를 직선 중간값으로 채운다.
+              3) 구간 밖(prefix/suffix)은 그대로 0으로 둔다.
+
+        Args:
+            neighbor_agents_past (np.ndarray):
+                shape: (N, Tp, 11)
+            neighbor_cur_fut_gt_11_dim (np.ndarray):
+                shape: (N, Tf, 11)
+                index 0이 "현재"라고 가정한다.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - new_neighbor_agents_past: shape (N, Tp, 11)
+                - new_neighbor_future_11:  shape (N, Tf-1, 11)  # 현재 제외
         """
         # 기본 shape 검사
         if neighbor_agents_past.ndim != 3 or neighbor_cur_fut_gt_11_dim.ndim != 3:
@@ -847,8 +1188,8 @@ class DataProcessor(object):
                 f"(max_agent_num, time_len, 11) 형태여야 합니다. "
                 f"got {neighbor_agents_past.shape}, {neighbor_cur_fut_gt_11_dim.shape}"
             )
-        if neighbor_agents_past.shape[
-                -1] != 11 or neighbor_cur_fut_gt_11_dim.shape[-1] != 11:
+        if neighbor_agents_past.shape[-1] != 11 or \
+                neighbor_cur_fut_gt_11_dim.shape[-1] != 11:
             raise ValueError(
                 f"두 입력의 마지막 차원은 11이어야 합니다. "
                 f"got {neighbor_agents_past.shape[-1]}, {neighbor_cur_fut_gt_11_dim.shape[-1]}"
@@ -859,15 +1200,16 @@ class DataProcessor(object):
             )
 
         max_agent_num: int = int(neighbor_agents_past.shape[0])
-        time_len: int = int(neighbor_agents_past.shape[1])  # Tp
-        future_len: int = int(neighbor_cur_fut_gt_11_dim.shape[1])  # Tf
+        past_len: int = int(neighbor_agents_past.shape[1])  # Tp
+        fut_len_with_current: int = int(
+            neighbor_cur_fut_gt_11_dim.shape[1])  # Tf (0번 포함)
 
         # future 프레임이 아예 없으면 그대로 반환
-        if future_len == 0:
+        if fut_len_with_current == 0:
             return neighbor_agents_past, neighbor_cur_fut_gt_11_dim
 
         # current(0번) 프레임은 항상 한 번 제거
-        # neighbor_future_wo_current: (max_agent_num, Tf-1, 11)
+        # neighbor_future_wo_current: (N, Tf-1, 11)
         neighbor_future_wo_current: np.ndarray = neighbor_cur_fut_gt_11_dim[:,
                                                                             1:, :]
 
@@ -875,69 +1217,88 @@ class DataProcessor(object):
         if max_agent_num == 0:
             return neighbor_agents_past, neighbor_future_wo_current
 
-        # full_traj_11: (max_agent_num, Tp + (Tf-1), 11)
+        # full_traj_11: (N, Tp + (Tf-1), 11)
         full_traj_11: np.ndarray = np.concatenate(
             [neighbor_agents_past, neighbor_future_wo_current], axis=1)
+        T_full: int = int(full_traj_11.shape[1])
+        current_index: int = past_len - 1  # full_traj에서 현재는 past의 마지막
 
-        # (1) size 대표값을 먼저 계산 (기본: 과거~현재만 사용)
-        # stable_size: (max_agent_num, 2) = [width_rep, length_rep]
+        # (1) size 대표값 계산 (기본: 과거~현재만 사용)
+        # stable_size: (N, 2) = [width_rep, length_rep]
         stable_size: np.ndarray = self._estimate_stable_neighbor_sizes(
             full_traj_11=full_traj_11,
-            past_len=time_len,
-            use_future=False,  # 필요하면 True로 바꿀 수 있음
+            past_len=past_len,
+            use_future=False,
         )
 
-        # 마스크 계산
-        # full_off_p_mask: (max_agent_num, T_full)  — True: 해당 프레임이 "빈 프레임"
-        # full_off_mask:   (max_agent_num,)        — True: 해당 agent 전체가 모두 빈 값
-        full_off_p_mask, full_off_mask = self._get_agents_past_cur_mask_np(
-            full_traj_11)
-        full_valid_mask: np.ndarray = ~full_off_p_mask  # (max_agent_num, T_full)
+        # (2) "유효 프레임" 마스크 계산 (앞 8개 값 중 하나라도 0이 아니면 유효)
+        full_off_p_mask, _ = self._get_agents_past_cur_mask_np(full_traj_11)
+        full_valid_mask: np.ndarray = ~full_off_p_mask  # (N, T_full)
 
-        # 보간 결과 버퍼
-        # full_traj_interp: (max_agent_num, T_full, 11)
+        # (3) rule (a): 현재 프레임이 무효면 전체 0
+        current_valid_mask: np.ndarray = full_valid_mask[:,
+                                                         current_index]  # (N,)
+        invalid_agents: np.ndarray = ~current_valid_mask
+
+        # 결과 버퍼
         full_traj_interp: np.ndarray = full_traj_11.astype(np.float32,
                                                            copy=True)
 
-        # (2) x/y/cos/sin/vx/vy 만 "중간 구멍" 보간
+        # 각 agent별 "연속 유효 구간" 마스크
+        # region_mask_all: (N, T_full)
+        region_mask_all: np.ndarray = np.zeros((max_agent_num, T_full),
+                                               dtype=bool)
+
+        # 현재가 무효인 agent는 전부 0으로 만들고 끝
+        if np.any(invalid_agents):
+            full_traj_interp[invalid_agents, :, :] = 0.0
+            # region_mask_all은 그대로 False
+
+        # (4) rule (b): 현재가 유효인 agent는 유효~유효 사이 구멍을 채움
         for agent_idx in range(max_agent_num):
-            if full_off_mask[agent_idx]:
+            if invalid_agents[agent_idx]:
                 continue
 
-            agent_valid_idx: np.ndarray = np.nonzero(
-                full_valid_mask[agent_idx])[0]
-            if agent_valid_idx.size <= 1:
+            agent_valid_idx: np.ndarray = \
+            np.nonzero(full_valid_mask[agent_idx])[0]
+            if agent_valid_idx.size == 0:
+                # (현재는 유효인데 valid_idx가 0인 경우는 거의 없지만, 안전하게 0 처리)
+                full_traj_interp[agent_idx, :, :] = 0.0
                 continue
 
             first_valid: int = int(agent_valid_idx[0])
             last_valid: int = int(agent_valid_idx[-1])
 
-            # 중간에 빈 프레임이 있을 때만 보간 수행
-            if last_valid - first_valid + 1 > agent_valid_idx.size:
-                xs: np.ndarray = agent_valid_idx.astype(np.float64)  # (K,)
-                seg_idx: np.ndarray = np.arange(first_valid,
-                                                last_valid + 1,
-                                                dtype=np.float64)
+            if agent_valid_idx.size == 1:
+                # 유효 프레임이 1개면 "유효-무효-유효" 자체가 성립하지 않으므로 그대로 둠
+                region_mask_all[agent_idx, first_valid] = True
+            else:
+                # first~last를 "연속 유효 구간"으로 선언
+                region_mask_all[agent_idx, first_valid:last_valid + 1] = True
 
-                for dim_idx in range(6):
-                    ys: np.ndarray = full_traj_11[agent_idx, agent_valid_idx,
-                                                  dim_idx].astype(np.float64,
-                                                                  copy=False)
-                    interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    full_traj_interp[agent_idx, first_valid:last_valid + 1,
-                                     dim_idx] = interp_vals.astype(np.float32,
-                                                                   copy=False)
+                # 중간에 빈 프레임이 있을 때만 x/y/cos/sin/vx/vy를 직선 중간값으로 채움
+                if last_valid - first_valid + 1 > agent_valid_idx.size:
+                    xs: np.ndarray = agent_valid_idx.astype(np.float64)  # (K,)
+                    seg_idx: np.ndarray = np.arange(first_valid,
+                                                    last_valid + 1,
+                                                    dtype=np.float64)
 
-            # 타입 one-hot(8~10)은 한 agent당 하나로 고정해서 유효 프레임에만 채움
-            valid_after: np.ndarray = (np.abs(
-                full_traj_interp[agent_idx, :, :6])
-                                       > 0).any(axis=1)  # (T_full,)
+                    for dim_idx in range(6):  # 0~5: [x, y, cos, sin, vx, vy]
+                        ys: np.ndarray = full_traj_11[agent_idx,
+                                                      agent_valid_idx,
+                                                      dim_idx].astype(
+                                                          np.float64,
+                                                          copy=False)
+                        interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
+                        full_traj_interp[agent_idx, first_valid:last_valid + 1,
+                                         dim_idx] = interp_vals.astype(
+                                             np.float32, copy=False)
 
+            # 타입(one-hot)은 agent당 하나로 고정해서 "연속 유효 구간"에만 채움
             type_candidates: np.ndarray = full_traj_11[agent_idx, :,
                                                        8:11]  # (T_full, 3)
             type_valid_mask: np.ndarray = (np.abs(type_candidates).sum(axis=1)
                                            > 0)
-
             if np.any(type_valid_mask):
                 type_vec: np.ndarray = type_candidates[type_valid_mask][
                     0].astype(np.float32, copy=False)  # (3,)
@@ -945,29 +1306,29 @@ class DataProcessor(object):
                 type_vec = np.zeros((3,), dtype=np.float32)
 
             full_traj_interp[agent_idx, :, 8:11] = 0.0
-            full_traj_interp[agent_idx, valid_after, 8:11] = type_vec
+            full_traj_interp[agent_idx, region_mask_all[agent_idx],
+                             8:11] = type_vec
 
-        # (3) 마지막에 width/length를 "대표값"으로 통일해서 채움
-        # valid_after_all: (max_agent_num, T_full)
-        valid_after_all: np.ndarray = (np.abs(full_traj_interp[:, :, :6])
-                                       > 0).any(axis=-1)
+            # 연속 유효 구간 밖은 완전히 0으로
+            full_traj_interp[agent_idx, ~region_mask_all[agent_idx], :] = 0.0
 
+        # (5) width/length를 대표값으로 통일해서 "연속 유효 구간"에만 채움
         full_traj_interp = self._fill_width_length_with_representative_size(
             traj_11=full_traj_interp,
-            valid_mask=valid_after_all,
-            rep_size=stable_size,
+            valid_mask=region_mask_all,  # (N, T_full)
+            rep_size=stable_size,  # (N, 2)
         )
+
+        # (6) cos/sin 길이를 1로 정리 (연속 유효 구간에만 적용)
         full_traj_interp = self._normalize_cos_sin_in_traj_11(
             traj_11=full_traj_interp,
-            valid_mask=valid_after_all,
+            valid_mask=region_mask_all,
         )
 
         # 과거/현재와 미래로 다시 분리
-        # new_neighbor_agents_past: (max_agent_num, Tp, 11)
-        new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :time_len, :]
-
-        # new_neighbor_future_11: (max_agent_num, Tf-1, 11)  # 현재 제외
-        new_neighbor_future_11: np.ndarray = full_traj_interp[:, time_len:, :]
+        new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :past_len, :]
+        new_neighbor_future_11: np.ndarray = full_traj_interp[:,
+                                                              past_len:, :]  # 현재 제외된 미래
 
         return new_neighbor_agents_past, new_neighbor_future_11
 
@@ -1263,36 +1624,31 @@ class DataProcessor(object):
                 ego_cur_pose_np=ego_cur_pose_np,
             )
 
-            (ego_future_gt_3_dim,
-             ego_future_gt_11_dim) = get_ego_future_array_from_scenario(
-                 scenario, ego_state, self.num_future_poses,
-                 self.future_time_horizon)
+            # ─────────────────────────────────────────────
+            # ✅ (요구조건 b) ego: past+future(101) 기반으로 규칙 적용
+            #    그리고 ego_future_gt_3_dim은 “규칙 적용된 11dim”에서 다시 생성
+            # ─────────────────────────────────────────────
+            (_, ego_future_gt_11_dim_raw) = get_ego_future_array_from_scenario(
+                scenario, ego_state, self.num_future_poses,
+                self.future_time_horizon)
 
-            # ✅ ego_future는 내부가 rear axle 기준이므로, center 기준이면 x,y만 원점 보정
+            ego_agent_past, ego_future_gt_11_dim = self._merge_and_interpolate_ego_11dim(
+                ego_agent_past=ego_agent_past,
+                ego_future_gt_11_dim=ego_future_gt_11_dim_raw,
+            )
+
+            # ✅ 3차원은 반드시 “정리된 11차원”에서 다시 만들기
+            ego_future_gt_3_dim = self._traj11_to_traj3_yaw(
+                ego_future_gt_11_dim)
+
+            # ✅ center 기준 옵션이면 x,y 원점 보정
             ego_future_gt_3_dim, ego_future_gt_11_dim = self._adjust_ego_future_outputs_to_center_frame(
                 ego_state=ego_state,
                 ego_future_gt_3_dim=ego_future_gt_3_dim,
                 ego_future_gt_11_dim=ego_future_gt_11_dim,
                 set_coord_as_center=self.set_coord_as_center,
             )
-            """
-            - past_cur_agents_world_8_list: List[np.ndarray]
-                · 길이: num_frames
-                · 각 원소: (frame_agents_num, 8) 열 = ID/속도/방향/크기/위치 
-            - past_cur_agents_types_list: List[List[TrackedObjectType]]
-                · 길이: num_frames
-                · 각 프레임에서 에이전트 타입(차량/보행자/자전거) 리스트
-            - present_static_feat_5: np.ndarray
-                · 모양: (cur_static_num, 5)
-                · [x, y, heading, width, length] (현재 프레임의 정적 객체)
-            - static_types_list: List[TrackedObjectType]
-                · 길이: cur_static_num
-                · 각 정적 객체의 타입 리스트
-            - present_tracked_objects: TrackedObjects
-                · scenario 경로일 때만 유효(현재 프레임의 TrackedObjects)
-            - past_cur_tracked_objects: List[TrackedObjects]
-                · scenario 경로일 때만 유효(과거+현재 TrackedObjects 리스트)
-            """
+
             (
                 past_cur_agents_world_8_list,
                 past_cur_agents_types_list,
@@ -1302,19 +1658,7 @@ class DataProcessor(object):
                 present_tracked_objects,
                 past_cur_tracked_objects,
             ) = self._get_past_cur_agents_feature(scenario=scenario)
-            """
-            neighbor_agents_past: (chosen_agent_num, num_frames, 11)
-            agents_cur_frame_indices: shape (chosen_agent_num) (현재 프레임 기준 인덱스)
-            neighbors_id: np.ndarray (chosen_agent_num,) (에이전트 ID)
-            neighbor_track_token: List[str] (chosen_agent_num,)
-            """
-            """
-            build_neighbor_past_feature
-                build_agents_past_ego_frame_array
-                    _convert_all_frames_agents_to_ego_local
-                        _pad_agent_states
-            """
-            # 2) neighbor 과거 궤적
+
             (neighbor_agents_past, agents_cur_frame_indices, neighbors_id,
              neighbor_track_token) = build_neighbor_past_feature(
                  past_cur_agents_world_8_list=past_cur_agents_world_8_list,
@@ -1332,13 +1676,9 @@ class DataProcessor(object):
             assert ego_time_len == neighbor_time_len == self.num_past_poses + 1, \
                 f"Expected time length {self.num_past_poses + 1}, got ego {ego_time_len}, neighbor {neighbor_time_len}"
 
-            # cur_fut_agents_world_8_list: List[ np.ndarray ((frame_agents_num, 8)) ]
-            # 길이: 1 + num_future_poses
-            # frame_agents_num: 각 프레임마다 다름
             cur_fut_agents_world_8_list = self._get_cur_fut_agents_world_8_list(
                 scenario, token_to_id, do_inference=False)
 
-            # neighbor_cur_fut_gt_11_dim: (chosen_agent_num, 1+future_len, 11)
             neighbor_cur_fut_gt_11_dim = agent_future_all_process(
                 ego_cur_pose_np=ego_cur_pose_np,
                 cur_fut_agents_world_8_list=cur_fut_agents_world_8_list,
@@ -1346,25 +1686,16 @@ class DataProcessor(object):
                 neighbor_agents_past=neighbor_agents_past,
             )
 
-            # [추가] past + future 를 합쳐서 중간 빈 프레임 보간
-            #   neighbor_agents_past: (chosen_agent_num, Tp, 11)
-            #   neighbor_future_gt_11_dim: (chosen_agent_num, future_len, 11)
-            neighbor_agents_past, neighbor_future_gt_11_dim = \
-                self._merge_and_interpolate_neighbor_11dim(
+            # ─────────────────────────────────────────────
+            # ✅ (요구조건 a) neighbor: past+future(101) 기반으로 규칙 적용 후
+            #    neighbor_future_gt_3_dim / neighbor_future_gt_11_dim 최종 생성
+            # ─────────────────────────────────────────────
+            neighbor_agents_past, neighbor_future_gt_11_dim, neighbor_future_gt_3_dim = \
+                self._build_neighbor_future_gt_from_past_and_cur_fut_11dim(
                     neighbor_agents_past=neighbor_agents_past,
                     neighbor_cur_fut_gt_11_dim=neighbor_cur_fut_gt_11_dim,
                 )
 
-            # 보간이 끝난 11차원 궤적에서 앞 3차원만 사용
-            # neighbor_future_gt_3_dim: (chosen_agent_num, future_len, 3)
-            yaw = np.arctan2(neighbor_future_gt_11_dim[:, :, 3],
-                             neighbor_future_gt_11_dim[:, :, 2])
-            neighbor_future_gt_3_dim = np.stack([
-                neighbor_future_gt_11_dim[:, :, 0],
-                neighbor_future_gt_11_dim[:, :, 1], yaw
-            ],
-                                                axis=-1)
-            # 3) static 객체
             static_objects = build_static_feature(
                 present_static_feat_5=present_static_feat_5,
                 static_types_list=static_types_list,
@@ -1376,22 +1707,25 @@ class DataProcessor(object):
             key_to_array = {
                 "ego_agent_past": ego_agent_past,  # (time_len, 11)
                 "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
-                "ego_future_gt_11_dim":
-                    ego_future_gt_11_dim,  # (future_len, 11)
-                "neighbor_agents_past":
-                    neighbor_agents_past,  # (chosen_agent_num, time_len, 11)
-                "neighbor_future_gt_3_dim":
-                    neighbor_future_gt_3_dim,  # (chosen_agent_num, future_len, 3)
+                "ego_future_gt_11_dim": ego_future_gt_11_dim,
+                # (future_len, 11)
+                "neighbor_agents_past": neighbor_agents_past,
+                # (chosen_agent_num, time_len, 11)
+
+                # ✅ (요구조건 a) 최종 출력
+                "neighbor_future_gt_3_dim": neighbor_future_gt_3_dim,
+                # (chosen_agent_num, future_len, 3)
+                "neighbor_future_gt_11_dim": neighbor_future_gt_11_dim,
+                # (chosen_agent_num, future_len, 11)
                 "static_objects": static_objects,  # (chosen_static_num, 10)
             }
+
             key_to_road_safety = self._get_road_safety_features(
                 scenario=scenario,
                 ego_cur_pose_np=ego_cur_pose_np,
             )
             key_to_array.update(key_to_road_safety)
-            '''
-            Map
-            '''
+
             (
                 route_roadblock_ids,
                 elements_to_obj_polylines,
@@ -1404,14 +1738,13 @@ class DataProcessor(object):
                 ego_point2d=ego_point2d,
                 ego_heading=ego_heading,
                 map_api=map_api,
-                # traffic_light_data=None  → iteration 0 기준으로 내부에서 가져옴
             )
-            # 길이 : max_agent_num 보다 작을 수 있음(자동차만 선별했기 때문)
+
             car_token_to_rr_ids: Dict[str,
                                       List[str]] = get_npc_route_roadblock_ids(
                                           scenario, past_cur_tracked_objects,
                                           neighbor_track_token)
-            # (max_agent_num, 11)
+
             neighbor_agents_current = neighbor_agents_past[:, -1, :]
 
             map_key_to_array = map_process(
@@ -1421,13 +1754,13 @@ class DataProcessor(object):
                 speed_limit_dict, lanes_roadblock_id_list, self._map_elements,
                 self._caching_max_map_elements, self._map_points_num)
             key_to_array.update(map_key_to_array)
-            # gather data
+
             chore_data = {
                 "map_name": map_name,
                 "token": scenario_token,
             }
             key_to_array.update(chore_data)
-            # [ADDED] ────────── 샘플별 통계 계산 & 저장 ──────────
+
             if self.config.make_statistics_when_caching:
                 veh_cnt, ped_cnt, bic_cnt = self._count_valid_neighbors_by_type(
                     neighbor_agents_past=neighbor_agents_past)
@@ -1442,21 +1775,18 @@ class DataProcessor(object):
                         int(bic_cnt),
                     "lane_speed_limit_ratio_percent":
                         float(ratio_percent),
-                    # None 은 JSON 으로 null 저장
                     "mean_speed_limit_kmh": (None if mean_speed_kmh is None else
                                              float(mean_speed_kmh)),
                 }
                 self._save_sample_stats_json(map_name, scenario_token,
                                              stats_payload)
 
-            ############################################
             final_file_name = f"{key_to_array['map_name']}_{key_to_array['token']}"
-
             self.save_to_disk(self._save_dir, final_file_name, key_to_array)
-            key_to_array[
-                "neighbor_track_token"] = neighbor_track_token  # List[str], (chosen_agent_num,)
+
+            key_to_array["neighbor_track_token"] = neighbor_track_token
+
             if self.config.save_image:
-                # 디버깅용 그림 그리기
                 save_dir = os.path.join(self._save_dir, "debug_vis")
                 save_path = os.path.join(save_dir, f"{final_file_name}.png")
                 os.makedirs(save_dir, exist_ok=True)

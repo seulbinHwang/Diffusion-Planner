@@ -529,8 +529,8 @@ class DiTBlock(nn.Module):
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
         y = self.norm1(x)  # [B,(1+)Pnn,D]
         y_tilde = apply_pram_v2_path_modulation(y, sa_mod)  # [B,(1+)Pnn,D]
-        f_sa = self._self_attn_flash_varlen(y_tilde,
-                                            target_current_mask)  # [B,(1+)Pnn,D]
+        f_sa = self._self_attn_flash_varlen(
+            y_tilde, target_current_mask)  # [B,(1+)Pnn,D]
         x = x + sa_mod.gate.to(dtype=x.dtype,
                                device=x.device) * f_sa  # [B,(1+)Pnn,D]
 
@@ -558,5 +558,6 @@ class DiTBlock(nn.Module):
             self.norm4(x))
 
         # 무효 에이전트 0‑클램프 (안전)
-        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)  # [B,(1+)Pnn,D]
+        x = x.masked_fill(target_current_mask.unsqueeze(-1),
+                          0.0)  # [B,(1+)Pnn,D]
         return x

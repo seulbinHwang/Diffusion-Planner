@@ -456,8 +456,8 @@ def _apply_augmentation(
     inputs: Dict[str, torch.Tensor],
     ego_future_gt_3_dim: torch.Tensor,  #(B, future_len, 3)
     near_future_gt_3_dim: torch.Tensor,  # (B, Pnn, future_len, 3)
-        ego_future_gt_mask: torch.Tensor,  # (B, future_len)
-        near_future_mask: torch.Tensor,  # (B, Pnn, future_len)
+    ego_future_gt_mask: torch.Tensor,  # (B, future_len)
+    near_future_mask: torch.Tensor,  # (B, Pnn, future_len)
     aug: Optional[StatePerturbation],
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
@@ -491,22 +491,22 @@ def _apply_augmentation(
     input_pad_masks: Dict[
         str, torch.Tensor] = _collect_padding_masks_before_augmentation(inputs)
 
-    ego_future_pad_mask= ego_future_gt_mask.unsqueeze(-1)  # (B,Tf,1)
+    ego_future_pad_mask = ego_future_gt_mask.unsqueeze(-1)  # (B,Tf,1)
     near_future_pad_mask = near_future_mask.unsqueeze(-1)  # (B,A,Tf,1)
-    assert isinstance(aug, NPCStatePerturbation), "현재 NPCStatePerturbation 만 지원합니다."
+    assert isinstance(aug,
+                      NPCStatePerturbation), "현재 NPCStatePerturbation 만 지원합니다."
     if args.do_ego_predict:
         target_future_gt_3_dim = torch.cat(
-            [ego_future_gt_3_dim.unsqueeze(1), near_future_gt_3_dim], dim=1)  # (B, 1 + A, Tf, 3)
+            [ego_future_gt_3_dim.unsqueeze(1), near_future_gt_3_dim],
+            dim=1)  # (B, 1 + A, Tf, 3)
     else:
         target_future_gt_3_dim = near_future_gt_3_dim  # (B, A, Tf, 3)
     inputs, target_future_gt_3_dim = aug(inputs, target_future_gt_3_dim, args)
     if args.do_ego_predict:
-        ego_future_gt_3_dim = target_future_gt_3_dim[
-            :, 0, :, :]  # (B, Tf, 3)
+        ego_future_gt_3_dim = target_future_gt_3_dim[:, 0, :, :]  # (B, Tf, 3)
         # near_future_gt_3_dim = target_future_gt_3_dim[:, 1:, :, :]  # (B, A, Tf, 3)
     else:
         near_future_gt_3_dim = target_future_gt_3_dim  # (B, A, Tf, 3)
-
 
     # (3) augmentation 이후: 원래 패딩이었던 위치는 다시 0으로 복원
     _restore_padding_values_inplace(inputs, input_pad_masks)
@@ -939,10 +939,6 @@ def train_epoch(
             #         aug=aug,
             #         args=args,
             #     )
-
-
-
-
 
             # 4) 관측 정규화
             # norm_inputs: 각 value shape = (B, ...)

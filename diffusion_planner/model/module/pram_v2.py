@@ -77,8 +77,9 @@ class PRAMV2StateTokenEncoder(nn.Module):
         xy_cos_sin = target_cur_norm[..., 0:4]  # (B, (1+)Pnn, 4)
         width_and_length = target_cur_norm[..., 6:8]  # (B, (1+)Pnn, 2)
         one_hot_type = target_cur_norm[..., 8:11]  # (B, (1+)Pnn, 3)
-        target_cur_norm = torch.cat([xy_cos_sin, width_and_length, one_hot_type],
-                                  dim=-1)  # (B, (1+)Pnn, 9)
+        target_cur_norm = torch.cat(
+            [xy_cos_sin, width_and_length, one_hot_type],
+            dim=-1)  # (B, (1+)Pnn, 9)
         x = self._project_unit_circle(target_cur_norm)  # [...,9]
         x = self.input_norm(x)
         state_token_in = self.token_mlp(x)  # [B,(1+)Pnn,D]
@@ -323,8 +324,10 @@ class PRAMV2Composer(nn.Module):
 
         # ★ 무효 agent 마스크: state_token_in의 D차원이 전부 0이면 무효(True)
         #    state_known_mask: [B,(1+)Pnn] (True=유효), invalid_mask: [B,(1+)Pnn,1] (True=무효)
-        state_known_mask = state_token_in.ne(0).any(dim=-1)  # [B,(1+)Pnn] True=유효
-        invalid_mask = (~state_known_mask).unsqueeze(-1)  # [B,(1+)Pnn,1] True=무효
+        state_known_mask = state_token_in.ne(0).any(
+            dim=-1)  # [B,(1+)Pnn] True=유효
+        invalid_mask = (~state_known_mask).unsqueeze(
+            -1)  # [B,(1+)Pnn,1] True=무효
 
         # --- S 경로 ---
         S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
@@ -345,8 +348,8 @@ class PRAMV2Composer(nn.Module):
         E_in = self.in_norm_E(E_b)
         e = self.adapt_E(E_in)  # [B,(1+)Pnn,h]
         e = self.rms_pre(e)
-        e = self._mask_ego_by_batch(e,
-                                    ego_known_mask_b)  # [B,(1+)Pnn,h] (미제공 배치는 0)
+        e = self._mask_ego_by_batch(
+            e, ego_known_mask_b)  # [B,(1+)Pnn,h] (미제공 배치는 0)
         e = e.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 E 경로도 0
         """
         2) 쌍곱(상호작용) 특징 만들기 — (SE, ER, RS)
@@ -378,9 +381,9 @@ class PRAMV2Composer(nn.Module):
                                                       0.0)  # [B,(1+)Pnn,H]
 
         return ComposerOutputs(
-            delta_scale_base=delta_scale_base, # [B, (1+)Pnn, H]
-            shift_base=shift_base, # [B, (1+)Pnn, H]
-            logit_gate_base=logit_gate_base, # [B, (1+)Pnn, H]
+            delta_scale_base=delta_scale_base,  # [B, (1+)Pnn, H]
+            shift_base=shift_base,  # [B, (1+)Pnn, H]
+            logit_gate_base=logit_gate_base,  # [B, (1+)Pnn, H]
         )
 
 

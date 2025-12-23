@@ -11,6 +11,7 @@ from diffusion_planner.utils.train_utils import openjson, opendata
 import numpy as np
 from numpy.typing import NDArray
 
+
 def _get_first_non_none_value(
     sample: Dict[str, Any],
     key_candidates: Sequence[str],
@@ -160,9 +161,9 @@ class DiffusionPlannerData(Dataset):
 
     @staticmethod
     def assert_cur_future_valid_mask_np(
-            valid_bpt: NDArray[np.bool_],
-            *,
-            context: str = "savgol_filter_for_control",
+        valid_bpt: NDArray[np.bool_],
+        *,
+        context: str = "savgol_filter_for_control",
     ) -> None:
         """유효 마스크가 행마다 True*False* (단조 감소)인지 검사합니다(NumPy 버전).
 
@@ -216,6 +217,7 @@ class DiffusionPlannerData(Dataset):
                 f"example (b,p)={list(zip(b_list, p_list))}.\n"
                 f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
             )
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """한 샘플을 이름 기반 dict로 반환한다.
         각 key별 기본 shape는 다음과 같다 (B는 배치에서 묶일 때 앞에 붙는다).
@@ -274,19 +276,17 @@ class DiffusionPlannerData(Dataset):
                 value = data.get(npz_key, None)
                 if value is not None and npz_key == "agent_route_lane_order":
                     value = value.astype("int64")
-                if npz_key == "neighbor_future_gt_3_dim": # (chosen_agent_num, future_len, 3)
+                if npz_key == "neighbor_future_gt_3_dim":  # (chosen_agent_num, future_len, 3)
                     # neighbor_future_gt_is_valid: (chosen_agent_num, future_len)
                     neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
                         value, prefix_dim=3)
                     # (chosen_agent_num, future_len) -> (1, chosen_agent_num, future_len)
                     neighbor_future_gt_is_valid = np.expand_dims(
-                        neighbor_future_gt_is_valid, axis=0
-                    )
+                        neighbor_future_gt_is_valid, axis=0)
                     self.assert_cur_future_valid_mask_np(
                         neighbor_future_gt_is_valid,
                         context=f"{file_name} - neighbor_future_gt_is_valid",
                     )
-
 
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value

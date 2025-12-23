@@ -302,8 +302,10 @@ class NPCStatePerturbation:
             valid_agent_mask: (B, max_agent_num) (bool)
         """
         B, max_agent_num, time_len, C1 = neighbor_agents_past.shape
-        neighbor_current = neighbor_agents_past[:, :, -1, :]  # (B, max_agent_num, 11)
-        zero_mask = (neighbor_current[:, :, :8] == 0).all(dim=-1)  # (B, max_agent_num) bool
+        neighbor_current = neighbor_agents_past[:, :,
+                                                -1, :]  # (B, max_agent_num, 11)
+        zero_mask = (neighbor_current[:, :, :8] == 0).all(
+            dim=-1)  # (B, max_agent_num) bool
         valid_neighbor_mask = ~zero_mask  # (B, max_agent_num) bool
         return valid_neighbor_mask
 
@@ -398,10 +400,11 @@ class NPCStatePerturbation:
             dtype=target_future_gt_3_dim.dtype)
 
         # neighbors_future_all_3_dim: (B, max_agent_num, future_len, 3)
-        neighbors_future_all_3_dim[:, :, :, 0:2] = target_future_gt_3_dim[:, :, :,
-                                                                        0:2]
+        neighbors_future_all_3_dim[:, :, :,
+                                   0:2] = target_future_gt_3_dim[:, :, :, 0:2]
         neighbors_future_all_3_dim[:, :, :, 2] = torch.atan2(
-            target_future_gt_3_dim[:, :, :, 3], target_future_gt_3_dim[:, :, :, 2])
+            target_future_gt_3_dim[:, :, :, 3], target_future_gt_3_dim[:, :, :,
+                                                                       2])
         return neighbors_future_all_3_dim
 
     def add_accel_yaw_rate_to_near_current(
@@ -444,7 +447,8 @@ class NPCStatePerturbation:
     def __call__(
             self,
             inputs: Dict[str, torch.Tensor],
-            target_future_gt_3_dim: torch.Tensor, # (B, one_or_Pnn, future_len, 3)
+            target_future_gt_3_dim: torch.
+        Tensor,  # (B, one_or_Pnn, future_len, 3)
             args,
             save_plot=False) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
@@ -1234,7 +1238,8 @@ class NPCStatePerturbation:
     @staticmethod
     def reorder_neighbors_after_augmentation(
         neighbor_agents_past: torch.Tensor,  # (B, max_agent_num, time_len, 11)
-        target_future_gt_3_dim: torch.Tensor,  # (B, max_agent_num, future_len, 3)
+        target_future_gt_3_dim: torch.
+        Tensor,  # (B, max_agent_num, future_len, 3)
         aug_near_current_w_more: torch.Tensor,  # (B, Pnn, 14)
         valid_neighbor_mask: torch.Tensor,  # (B, max_agent_num) (bool)
         near_aug_flag: torch.Tensor,  # (B, Pnn) (bool)
@@ -1289,7 +1294,7 @@ class NPCStatePerturbation:
 
         # ─── 4‑B. 미래 궤적(3→4ch) 변환 후 재배열 ───────────────────
         target_future_gt_3_dim = target_future_gt_3_dim.to(dtype=dtype,
-                                                       device=device)
+                                                           device=device)
         yaw = target_future_gt_3_dim[..., 2]  # (B,max_agent_num,F)
         future_4ch = torch.cat(
             [
