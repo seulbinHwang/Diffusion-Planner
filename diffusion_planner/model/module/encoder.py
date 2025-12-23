@@ -999,82 +999,76 @@ class Encoder(nn.Module):
 
         return ego_future_trajectory
 
-    from typing import Optional
-    import torch
+    @staticmethod
+    def _ensure_non_near_agents_past_tensor(
+            ego_agent_past: torch.Tensor,  # (B, 1, T, 11)
+            non_near_agents_past: Optional[torch.Tensor],
+            # (B, A, T, 11) or None
+    ) -> torch.Tensor:
+        """non_near_agents_past를 항상 '텐서' 형태로 보장합니다.
 
-    class Encoder(nn.Module):
-        # ... 기존 코드 ...
+        이 함수는 Encoder에서 AgentFusionEncoder로 넘기는 이웃 에이전트 입력이
+        어떤 경우에도 안전하게 동작하도록 만들기 위한 안전장치입니다.
 
-        @staticmethod
-        def _ensure_non_near_agents_past_tensor(
-                ego_agent_past: torch.Tensor,  # (B, 1, T, 11)
-                non_near_agents_past: Optional[torch.Tensor],
-                # (B, A, T, 11) or None
-        ) -> torch.Tensor:
-            """non_near_agents_past를 항상 '텐서' 형태로 보장합니다.
+        동작 규칙:
+            1) non_near_agents_past가 None이면,
+               (B, 0, T, 11) 모양의 "빈 에이전트 텐서"를 만들어 반환합니다.
+               이렇게 하면 AgentFusionEncoder 내부의 torch.cat이 항상 성공합니다.
 
-            이 함수는 Encoder에서 AgentFusionEncoder로 넘기는 이웃 에이전트 입력이
-            어떤 경우에도 안전하게 동작하도록 만들기 위한 안전장치입니다.
+            2) non_near_agents_past가 텐서이면,
+               ego_agent_past와 배치/시간/특징 차원이 맞는지 확인한 뒤,
+               device/dtype을 ego_agent_past에 맞춰 반환합니다.
 
-            동작 규칙:
-                1) non_near_agents_past가 None이면,
-                   (B, 0, T, 11) 모양의 "빈 에이전트 텐서"를 만들어 반환합니다.
-                   이렇게 하면 AgentFusionEncoder 내부의 torch.cat이 항상 성공합니다.
+        Args:
+            ego_agent_past (torch.Tensor):
+                shape: (B, 1, T, 11)
+                ego의 과거~현재 궤적 입력입니다.
 
-                2) non_near_agents_past가 텐서이면,
-                   ego_agent_past와 배치/시간/특징 차원이 맞는지 확인한 뒤,
-                   device/dtype을 ego_agent_past에 맞춰 반환합니다.
+            non_near_agents_past (Optional[torch.Tensor]):
+                shape: (B, A, T, 11) 또는 None
+                DiT가 생성 대상으로 삼지 않는(제외된) 나머지 에이전트들의 과거~현재 입력입니다.
+                A는 0일 수도 있습니다.
 
-            Args:
-                ego_agent_past (torch.Tensor):
-                    shape: (B, 1, T, 11)
-                    ego의 과거~현재 궤적 입력입니다.
+        Returns:
+            torch.Tensor:
+                shape: (B, A, T, 11)
+                - non_near_agents_past가 None이면 A=0인 빈 텐서
+                - 아니면 입력 텐서(단, device/dtype 정리됨)
+        """
+        if ego_agent_past.dim() != 4:
+            raise ValueError(
+                f"ego_agent_past must be (B, 1, T, 11). got {tuple(ego_agent_past.shape)}"
+            )
+        B: int = int(ego_agent_past.shape[0])
+        T: int = int(ego_agent_past.shape[2])
+        D: int = int(ego_agent_past.shape[3])
+        if D != 11:
+            raise ValueError(
+                f"ego_agent_past last dim must be 11. got {D} (shape={tuple(ego_agent_past.shape)})"
+            )
 
-                non_near_agents_past (Optional[torch.Tensor]):
-                    shape: (B, A, T, 11) 또는 None
-                    DiT가 생성 대상으로 삼지 않는(제외된) 나머지 에이전트들의 과거~현재 입력입니다.
-                    A는 0일 수도 있습니다.
+        # (1) None이면: (B, 0, T, 11) 생성
+        if non_near_agents_past is None:
+            return ego_agent_past.new_zeros((B, 0, T, D))
 
-            Returns:
-                torch.Tensor:
-                    shape: (B, A, T, 11)
-                    - non_near_agents_past가 None이면 A=0인 빈 텐서
-                    - 아니면 입력 텐서(단, device/dtype 정리됨)
-            """
-            if ego_agent_past.dim() != 4:
-                raise ValueError(
-                    f"ego_agent_past must be (B, 1, T, 11). got {tuple(ego_agent_past.shape)}"
-                )
-            B: int = int(ego_agent_past.shape[0])
-            T: int = int(ego_agent_past.shape[2])
-            D: int = int(ego_agent_past.shape[3])
-            if D != 11:
-                raise ValueError(
-                    f"ego_agent_past last dim must be 11. got {D} (shape={tuple(ego_agent_past.shape)})"
-                )
+        # (2) 텐서면 shape 기본 검증
+        if non_near_agents_past.dim() != 4:
+            raise ValueError(
+                f"non_near_agents_past must be (B, A, T, 11). got {tuple(non_near_agents_past.shape)}"
+            )
+        if int(non_near_agents_past.shape[0]) != B:
+            raise ValueError(
+                f"non_near_agents_past batch size mismatch. expected B={B}, got {int(non_near_agents_past.shape[0])}"
+            )
+        if int(non_near_agents_past.shape[2]) != T or int(
+                non_near_agents_past.shape[3]) != D:
+            raise ValueError(
+                f"non_near_agents_past time/feat mismatch. expected (T={T}, D={D}), got (T={int(non_near_agents_past.shape[2])}, D={int(non_near_agents_past.shape[3])})"
+            )
 
-            # (1) None이면: (B, 0, T, 11) 생성
-            if non_near_agents_past is None:
-                return ego_agent_past.new_zeros((B, 0, T, D))
-
-            # (2) 텐서면 shape 기본 검증
-            if non_near_agents_past.dim() != 4:
-                raise ValueError(
-                    f"non_near_agents_past must be (B, A, T, 11). got {tuple(non_near_agents_past.shape)}"
-                )
-            if int(non_near_agents_past.shape[0]) != B:
-                raise ValueError(
-                    f"non_near_agents_past batch size mismatch. expected B={B}, got {int(non_near_agents_past.shape[0])}"
-                )
-            if int(non_near_agents_past.shape[2]) != T or int(
-                    non_near_agents_past.shape[3]) != D:
-                raise ValueError(
-                    f"non_near_agents_past time/feat mismatch. expected (T={T}, D={D}), got (T={int(non_near_agents_past.shape[2])}, D={int(non_near_agents_past.shape[3])})"
-                )
-
-            # (3) device/dtype을 ego 기준으로 맞춤
-            return non_near_agents_past.to(device=ego_agent_past.device,
-                                           dtype=ego_agent_past.dtype)
+        # (3) device/dtype을 ego 기준으로 맞춤
+        return non_near_agents_past.to(device=ego_agent_past.device,
+                                       dtype=ego_agent_past.dtype)
 
     def _encode_agents_static_lanes(
         self,
