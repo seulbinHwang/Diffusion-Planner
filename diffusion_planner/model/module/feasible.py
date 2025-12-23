@@ -2593,10 +2593,11 @@ class FeasibleProjector(nn.Module):
             b_list = [(i // Pnn) for i in bad_idx_sample]
             p_list = [(i % Pnn) for i in bad_idx_sample]
             raise ValueError(
-                f"[{context}] near_cur_future_valid가 행 단위 단조 감소(True*False*) 가정에 위배됩니다. "
-                f"0→1 전이가 감지되었습니다. 오류 row 수={int(bad_idx.numel())}, "
-                f"예시 (b,p)={list(zip(b_list, p_list))}. "
-                f"내부 구멍(1→0→1)이나 선행 무효 후 유효(0→1)는 허용되지 않습니다.")
+                f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*). \n"
+                f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.numel())},  \n"
+                f"example (b,p)={list(zip(b_list, p_list))}.  \n"
+                f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
+            )
 
     # 지우개: 예전 `_compute_world_linear_velocity_via_sg` 구현은
     #        x, y를 각각 단일 채널 SG에 넣어 두 번 호출하던 코드입니다.
