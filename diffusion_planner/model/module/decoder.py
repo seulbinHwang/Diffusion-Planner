@@ -508,19 +508,85 @@ class Decoder(nn.Module):
         x_out = x_seq.view(B, Pnn, flat)
         return x_out, can_apply
 
-    def _get_near_past_cur_future_valid(
+
+    def _assert_past_cur_valid_mask(
+        self,
+        valid_bpt: torch.Tensor,
+        context: str = "savgol_filter_for_control_past_cur",
+    ) -> None:
+        """과거~현재(valid_bpt)의 유효 마스크가 행마다 0*1* (단조 증가)인지 검증.
+
+        Args:
+            valid_bpt: (B, Pnn, T1) bool
+            context: 에러 메시지용 위치 정보
+
+        Raises:
+            ValueError: 1→0 전이가 하나라도 있으면(단조 증가 위반) 예외
+        """
+        # <추가하자>
+        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 이어야 합니다."
+        B, Pnn, T1 = valid_bpt.shape
+        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
+        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
+
+        has_10 = (d < 0).any(dim=1)  # 1→0 전이(단조 증가 위반)
+        if has_10.any():
+            bad_idx = torch.nonzero(has_10, as_tuple=False).flatten()
+            max_show = min(int(bad_idx.numel()), 8)
+            sample = bad_idx[:max_show].tolist()
+            b_list = [(i // Pnn) for i in sample]
+            p_list = [(i % Pnn) for i in sample]
+            raise ValueError(
+                f"[{context}] past_cur 유효 마스크는 0*1* 형태여야 합니다(단조 증가). "
+                f"1→0 전이가 감지되었습니다. 오류 row 수={int(bad_idx.numel())}, "
+                f"예시 (b,p)={list(zip(b_list, p_list))}.")
+
+    def _assert_cur_future_valid_mask(
+            self,
+            valid_bpt: torch.Tensor,
+            context: str = "savgol_filter_for_control") -> None:
+        """유효 마스크가 행마다 True*False* (단조 감소)인지 검증.
+
+        Args:
+            valid_bpt: (B, Pnn, T1) bool, 시간 축 마지막.
+            context: 에러 메시지에 표시할 호출 위치 문자열.
+
+        Raises:
+            ValueError: 0→1 전이가 하나라도 발견되면(내부 구멍 또는 선행 무효 후 유효)
+        """
+        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 여야 합니다."
+        B, Pnn, T1 = valid_bpt.shape
+        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
+        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
+        has_01 = (d > 0).any(dim=1)  # 0→1 전이 여부
+        if has_01.any():
+            bad_idx = torch.nonzero(has_01, as_tuple=False).flatten()
+            # 가독성을 위해 일부만 표시
+            max_show = min(int(bad_idx.numel()), 8)
+            bad_idx_sample = bad_idx[:max_show].tolist()
+            # (b,p) 인덱스 매핑
+            b_list = [(i // Pnn) for i in bad_idx_sample]
+            p_list = [(i % Pnn) for i in bad_idx_sample]
+            raise ValueError(
+                f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*). \n"
+                f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.numel())},  \n"
+                f"example (b,p)={list(zip(b_list, p_list))}.  \n"
+                f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
+            )
+
+    def _get_target_past_cur_future_valid(
         self,
         target_past_current_mask: torch.
-        Tensor,  # (B, Pnn, (1+)time_len) True=무효  True=빈 슬롯(무효 에이전트)
-        target_future_valid: Optional[
-            torch.Tensor] = None,  #  (B, (1+) Pnn, future_len) bool
-    ) -> torch.Tensor:  # [B, pnn, 1 + future_len] bool
+        Tensor,  # (B, (1+)Pnn, (1+)time_len) True=무효  True=빈 슬롯(무효 에이전트)
+        target_future_valid: torch.Tensor,  #  (B, (1+) Pnn, future_len) bool
+    ) -> torch.Tensor:  # (B, (1+)Pnn, time_len + future_len)
         target_past_current_valid = ~target_past_current_mask  # [B, (1+)pnn, time_len]  True=유효 에이전트
-        target_current_valid = target_past_current_valid[:, :, -1]  # [B, (1+)pnn]
-
-        if target_future_valid is None:
-            target_future_valid = target_current_valid.unsqueeze(-1).expand(
-                -1, -1, self._future_len)  # [B, (1+)pnn, future_len] bool
+        self._assert_past_cur_valid_mask(
+            target_past_current_valid,
+            context="_get_target_past_cur_future_valid",)
+        self._assert_cur_future_valid_mask(
+            target_future_valid,
+            context="_get_target_past_cur_future_valid",)
         target_past_cur_future_valid = torch.cat(
             [target_past_current_valid, target_future_valid],
             dim=-1)  # [B, (1+)pnn, time_len + future_len] bool
@@ -913,7 +979,7 @@ class Decoder(nn.Module):
             device=target_agents_past.device)
 
         # target_past_cur_future_valid: (B, (1+)Pnn, time_len + future_len) bool
-        target_past_cur_future_valid: torch.Tensor = self._get_near_past_cur_future_valid(
+        target_past_cur_future_valid: torch.Tensor = self._get_target_past_cur_future_valid(
             target_past_current_mask=target_past_current_mask,
             target_future_valid=target_future_valid,
         )
@@ -2256,74 +2322,6 @@ class DiT(nn.Module):
         return target_cur_future_valid, target_current_mask
 
 
-    def _assert_past_cur_valid_mask(
-        self,
-        valid_bpt: torch.Tensor,
-        context: str = "savgol_filter_for_control_past_cur",
-    ) -> None:
-        """과거~현재(valid_bpt)의 유효 마스크가 행마다 0*1* (단조 증가)인지 검증.
-
-        Args:
-            valid_bpt: (B, Pnn, T1) bool
-            context: 에러 메시지용 위치 정보
-
-        Raises:
-            ValueError: 1→0 전이가 하나라도 있으면(단조 증가 위반) 예외
-        """
-        # <추가하자>
-        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 이어야 합니다."
-        B, Pnn, T1 = valid_bpt.shape
-        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
-        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
-
-        has_10 = (d < 0).any(dim=1)  # 1→0 전이(단조 증가 위반)
-        if has_10.any():
-            bad_idx = torch.nonzero(has_10, as_tuple=False).flatten()
-            max_show = min(int(bad_idx.numel()), 8)
-            sample = bad_idx[:max_show].tolist()
-            b_list = [(i // Pnn) for i in sample]
-            p_list = [(i % Pnn) for i in sample]
-            raise ValueError(
-                f"[{context}] past_cur 유효 마스크는 0*1* 형태여야 합니다(단조 증가). "
-                f"1→0 전이가 감지되었습니다. 오류 row 수={int(bad_idx.numel())}, "
-                f"예시 (b,p)={list(zip(b_list, p_list))}.")
-
-
-    # feasible.py 내 FeasibleProjector 클래스 안에 추가
-    def _assert_cur_future_valid_mask(
-            self,
-            valid_bpt: torch.Tensor,
-            context: str = "savgol_filter_for_control") -> None:
-        """유효 마스크가 행마다 True*False* (단조 감소)인지 검증.
-
-        Args:
-            valid_bpt: (B, Pnn, T1) bool, 시간 축 마지막.
-            context: 에러 메시지에 표시할 호출 위치 문자열.
-
-        Raises:
-            ValueError: 0→1 전이가 하나라도 발견되면(내부 구멍 또는 선행 무효 후 유효)
-        """
-        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 여야 합니다."
-        B, Pnn, T1 = valid_bpt.shape
-        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
-        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
-        has_01 = (d > 0).any(dim=1)  # 0→1 전이 여부
-        if has_01.any():
-            bad_idx = torch.nonzero(has_01, as_tuple=False).flatten()
-            # 가독성을 위해 일부만 표시
-            max_show = min(int(bad_idx.numel()), 8)
-            bad_idx_sample = bad_idx[:max_show].tolist()
-            # (b,p) 인덱스 매핑
-            b_list = [(i // Pnn) for i in bad_idx_sample]
-            p_list = [(i % Pnn) for i in bad_idx_sample]
-            raise ValueError(
-                f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*). \n"
-                f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.numel())},  \n"
-                f"example (b,p)={list(zip(b_list, p_list))}.  \n"
-                f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
-            )
-
-
     def forward(
             self,
             target_input_norm_xT: torch.
@@ -2360,15 +2358,6 @@ class DiT(nn.Module):
         target_cur_future_valid :  (B, (1+)Pnn, 1+future_len)
         target_current_mask :  (B, (1+)Pnn)
         """
-        past_cur_valid = target_past_cur_future_valid[..., :21]  # (B,Pnn,past_len+1)
-        cur_future_valid = target_past_cur_future_valid[..., 20:]  # (B,Pnn,1+future_len)
-        # 검증: 과거~현재(0*1*), 현재~미래(1*0*)
-        self._assert_past_cur_valid_mask(
-            past_cur_valid, context="savgol_filter_for_control_past_cur")
-        self._assert_cur_future_valid_mask(
-            cur_future_valid,
-            context="savgol_filter_for_control_cur_future")
-
         target_past = target_agents_past[:, :, :-1, :]  # (B, Pnn, past_len, 11)
         target_cur_future_valid, target_current_mask = \
             self._compute_target_current_valid_and_mask(
