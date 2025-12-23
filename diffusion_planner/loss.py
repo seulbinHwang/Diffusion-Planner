@@ -963,10 +963,6 @@ def diffusion_loss_func(
     norm_inputs = _sanitize_norm_inputs(norm_inputs)
 
     # 기본 크기 정보
-
-    near_future_valid = ~near_future_mask  # (B, Pnn, future_len)
-    _assert_cur_future_valid_mask(near_future_valid,
-                                  context="_build_target_future_tensors_and_masks")
     # 미래/현재 마스크 및 현재 상태 준비
     # near_future_valid: (B, Pnn, future_len)
     # near_cur_future_mask: (B, Pnn, 1+future_len)

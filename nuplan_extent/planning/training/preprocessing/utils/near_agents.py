@@ -138,12 +138,15 @@ def _add_near_agents_info_for_one_sample_inplace(
             # neighbor_future_gt_3_dim:
             # - 배치 없음: (A, T_fut, 3)
             # - 배치 있음: (B, A, T_fut, 3)
+            print("neighbor_future.shape:", neighbor_future.shape)
             sample["near_future_gt_3_dim"] = _slice_along_dim(
                 value=neighbor_future,
                 dim=agent_dim,
                 start=0,
                 end=near_num,
             )
+            print("near_future_gt_3_dim.shape:", sample["near_future_gt_3_dim"].shape)
+            raise RuntimeError("디버그용 에러입니다.")
 
     agent_route_lane_order = sample.get("agent_route_lane_order", None)
     if agent_route_lane_order is not None:

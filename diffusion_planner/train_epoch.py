@@ -921,10 +921,6 @@ def train_epoch(
             ego_future_len = ego_future_gt_3_dim.shape[1]
             assert ego_future_len == args.future_len, \
                 f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
-            ego_future_gt_mask = torch.sum(
-                torch.ne(ego_future_gt_3_dim[..., :3], 0),
-                dim=-1,
-            ) == 0  # (B, future_len)
             # near_future_gt_3_dim: (B, Pnn, future_len, 3)
             near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
             # 3) near future 4차원 궤적 + mask 생성
