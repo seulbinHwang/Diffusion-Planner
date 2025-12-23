@@ -219,9 +219,9 @@ def get_args():
                         default='normalization.json',
                         help='filepath of normalization.json',
                         type=str)
-    parser.add_argument('--do_ego_predict', default=False, type=boolean)
+    parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
-    parser.add_argument('--use_npc_data_augment', default=True, type=boolean)
+    parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
     parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)
@@ -239,7 +239,7 @@ def get_args():
     parser.add_argument('--use_vel_input', default=False, type=boolean)
     parser.add_argument('--use_pram', default=True, type=boolean)
     parser.add_argument('--use_route_lanes', default=True, type=boolean)
-    parser.add_argument('--use_ego_plan', default=True, type=boolean)
+    parser.add_argument('--use_ego_plan', default=False, type=boolean)
     parser.add_argument('--use_integration_trajectory',
                         default=True,
                         type=boolean)
