@@ -118,8 +118,7 @@ class ObservationNormalizer:
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
             for k, v in self._normalization_dict.items():
-                if (k not in data) or (
-                        v is None):  # Check if key `k` exists in `data`
+                if (k not in data) or (data[k] is None):  # Check if key `k` exists in `data`
                     continue
                 mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = (data[k] - v["mean"].to(
