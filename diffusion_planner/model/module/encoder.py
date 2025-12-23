@@ -2936,13 +2936,17 @@ class AgentFusionEncoder(nn.Module):
         on_agents_past_cur_on_chunk_mask: (agents_past_cur_on_num * past_cur_chunk_num)
         """
         assert on_agents_past_cur_off_chunk_mask.dtype == torch.bool
-        agents_past_cur_on_num, past_cur_chunk_num = on_agents_past_cur_chunk.shape[:
-                                                                                    2]
+        agents_past_cur_on_num, past_cur_chunk_num = on_agents_past_cur_chunk.shape[
+            :2]
+        C: int = int(on_agents_past_cur_chunk.shape[-1])  # channels_mlp_dim
+
+        flat_len: int = int(agents_past_cur_on_num * past_cur_chunk_num)
         on_agents_past_cur_chunk = on_agents_past_cur_chunk.reshape(
-            agents_past_cur_on_num * past_cur_chunk_num, self.tokens_mlp_dim,
-            -1)
+            flat_len, self.tokens_mlp_dim, C
+        )
+
         on_agents_past_cur_on_chunk_mask = ~on_agents_past_cur_off_chunk_mask.reshape(
-            -1)
+            -1)  # (flat_len,)
         on_agents_past_cur_on_chunk = on_agents_past_cur_chunk[
             on_agents_past_cur_on_chunk_mask]
         return on_agents_past_cur_on_chunk, on_agents_past_cur_on_chunk_mask
@@ -2963,9 +2967,15 @@ class AgentFusionEncoder(nn.Module):
         """
         assert on_ego_fut_off_chunk_mask.dtype == torch.bool
         ego_future_on_num, future_chunk_num = on_ego_fut_chunk.shape[:2]
+        C: int = int(on_ego_fut_chunk.shape[-1])  # channels_mlp_dim
+
+        flat_len: int = int(ego_future_on_num * future_chunk_num)
         on_ego_fut_chunk = on_ego_fut_chunk.reshape(
-            ego_future_on_num * future_chunk_num, self.tokens_mlp_dim, -1)
-        on_ego_fut_on_chunk_mask = ~on_ego_fut_off_chunk_mask.reshape(-1)
+            flat_len, self.tokens_mlp_dim, C
+        )
+
+        on_ego_fut_on_chunk_mask = ~on_ego_fut_off_chunk_mask.reshape(
+            -1)  # (flat_len,)
         on_ego_fut_on_chunk = on_ego_fut_chunk[on_ego_fut_on_chunk_mask]
         return on_ego_fut_on_chunk, on_ego_fut_on_chunk_mask
 
