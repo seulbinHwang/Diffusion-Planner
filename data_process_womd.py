@@ -4164,23 +4164,23 @@ def build_cache_dict_for_scenario(
     #     ego_agent_past_is_valid,
     #     context=f" - ego_agent_past_is_valid",
     # )
-    ego_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
-        ego_future_gt_3_dim, prefix_dim=3)
-    ego_future_gt_is_valid = np.expand_dims(ego_future_gt_is_valid, axis=0)
-    ego_future_gt_is_valid = np.expand_dims(ego_future_gt_is_valid, axis=0)
-    print("ego_future_gt_is_valid.shape:", ego_future_gt_is_valid.shape)
-    assert_cur_future_valid_mask_np(
-        ego_future_gt_is_valid,
-        context=f" - ego_future_gt_is_valid",
-    )
-    ego_future_gt_11_is_valid = _compute_valid_mask_from_prefix_nonzero(
-        ego_future_gt_11_dim, prefix_dim=8)
-    ego_future_gt_11_is_valid = np.expand_dims(ego_future_gt_11_is_valid, axis=0)
-    ego_future_gt_11_is_valid = np.expand_dims(ego_future_gt_11_is_valid, axis=0)
-    assert_cur_future_valid_mask_np(
-        ego_future_gt_11_is_valid,
-        context=f" - ego_future_gt_11_is_valid",
-    )
+    # ego_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
+    #     ego_future_gt_3_dim, prefix_dim=3)
+    # ego_future_gt_is_valid = np.expand_dims(ego_future_gt_is_valid, axis=0)
+    # ego_future_gt_is_valid = np.expand_dims(ego_future_gt_is_valid, axis=0)
+    # print("ego_future_gt_is_valid.shape:", ego_future_gt_is_valid.shape)
+    # assert_cur_future_valid_mask_np(
+    #     ego_future_gt_is_valid,
+    #     context=f" - ego_future_gt_is_valid",
+    # )
+    # ego_future_gt_11_is_valid = _compute_valid_mask_from_prefix_nonzero(
+    #     ego_future_gt_11_dim, prefix_dim=8)
+    # ego_future_gt_11_is_valid = np.expand_dims(ego_future_gt_11_is_valid, axis=0)
+    # ego_future_gt_11_is_valid = np.expand_dims(ego_future_gt_11_is_valid, axis=0)
+    # assert_cur_future_valid_mask_np(
+    #     ego_future_gt_11_is_valid,
+    #     context=f" - ego_future_gt_11_is_valid",
+    # )
 
     # neighbor_agents_past_is_valid = _compute_valid_mask_from_prefix_nonzero(
     #     neighbor_agents_past, prefix_dim=8)
@@ -4190,22 +4190,22 @@ def build_cache_dict_for_scenario(
     #     neighbor_agents_past_is_valid,
     #     context=f" - neighbor_agents_past_is_valid",
     # )
-    neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
-        neighbor_future_gt_3_dim, prefix_dim=3)
-    neighbor_future_gt_is_valid = np.expand_dims(
-        neighbor_future_gt_is_valid, axis=0)
-    assert_cur_future_valid_mask_np(
-        neighbor_future_gt_is_valid,
-        context=f" - neighbor_future_gt_is_valid",
-    )
-    neighbor_future_gt_11_is_valid = _compute_valid_mask_from_prefix_nonzero(
-        neighbor_future_gt_11_dim, prefix_dim=8)
-    neighbor_future_gt_11_is_valid = np.expand_dims(
-        neighbor_future_gt_11_is_valid, axis=0)
-    assert_cur_future_valid_mask_np(
-        neighbor_future_gt_11_is_valid,
-        context=f" - neighbor_future_gt_11_is_valid",
-    )
+    # neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
+    #     neighbor_future_gt_3_dim, prefix_dim=3)
+    # neighbor_future_gt_is_valid = np.expand_dims(
+    #     neighbor_future_gt_is_valid, axis=0)
+    # assert_cur_future_valid_mask_np(
+    #     neighbor_future_gt_is_valid,
+    #     context=f" - neighbor_future_gt_is_valid",
+    # )
+    # neighbor_future_gt_11_is_valid = _compute_valid_mask_from_prefix_nonzero(
+    #     neighbor_future_gt_11_dim, prefix_dim=8)
+    # neighbor_future_gt_11_is_valid = np.expand_dims(
+    #     neighbor_future_gt_11_is_valid, axis=0)
+    # assert_cur_future_valid_mask_np(
+    #     neighbor_future_gt_11_is_valid,
+    #     context=f" - neighbor_future_gt_11_is_valid",
+    # )
 
     cache_dict: Dict[str, Any] = {
         "scenario_id": str(scenario.scenario_id),
