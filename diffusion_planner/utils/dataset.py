@@ -277,6 +277,7 @@ class DiffusionPlannerData(Dataset):
                     # neighbor_future_gt_is_valid: (chosen_agent_num, future_len)
                     neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
                         value, prefix_dim=3)
+                    neighbor_future_gt_is_valid = neighbor_future_gt_is_valid.unsqueeze(0)  # (chosen_agent_num, future_len, 1)
                     self.assert_cur_future_valid_mask_np(
                         neighbor_future_gt_is_valid,
                         context="DiffusionPlannerData.__getitem__",
