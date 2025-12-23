@@ -2454,54 +2454,51 @@ class AgentFusionEncoder(nn.Module):
         return chunks, invalid_chunk_mask
 
     def _get_on_past_cur_on_chunk_num_sized_agents_type(
-        self,
-        agents_type: torch.Tensor,  # (B, agents_num, 3)
-        agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
-        on_agents_past_cur_on_chunk_mask: torch.
-        Tensor,  # (agents_past_cur_on_num * past_cur_chunk_num)
-        past_cur_chunk_num: int
+            self,
+            agents_type: torch.Tensor,  # (B, agents_num, 3)
+            agents_past_cur_on_mask: torch.Tensor,  # (B * agents_num)
+            on_agents_past_cur_on_chunk_mask: torch.Tensor,
+            # (agents_past_cur_on_num * past_cur_chunk_num)
+            past_cur_chunk_num: int,
     ) -> torch.Tensor:  # (on_past_cur_on_chunk_num, 3)
-        # (B * agents_num, 3)
         B, agents_num = agents_type.shape[:2]
-        agents_type = agents_type.reshape(B * agents_num,
-                                          -1)  # (B * agents_num, 3)
-        # (agents_past_cur_on_num, 3)
-        agents_type = agents_type[agents_past_cur_on_mask]
-        agents_past_cur_on_num = agents_type.shape[0]
-        # (agents_past_cur_on_num, 3) -> (agents_past_cur_on_num, 1, 3)
-        # -> (agents_past_cur_on_num, past_cur_chunk_num, 3)
+        agents_type = agents_type.reshape(B * agents_num, 3)
+        agents_type = agents_type[
+            agents_past_cur_on_mask]  # (agents_past_cur_on_num, 3)
+
+        agents_past_cur_on_num = int(agents_type.shape[0])
         agents_type = agents_type.unsqueeze(1).expand(-1, past_cur_chunk_num,
-                                                      -1)
-        # (agents_past_cur_on_num, past_cur_chunk_num, 3)
-        # -> (agents_past_cur_on_num * past_cur_chunk_num, 3)
+                                                      -1)  # (N, M, 3)
+
+        # ★ FIX: 0원소 케이스에서 -1 금지 → 마지막 차원(3) 명시
         agents_type = agents_type.reshape(
-            agents_past_cur_on_num * past_cur_chunk_num, -1)
-        # (agents_past_cur_on_num * past_cur_chunk_num, 3) -> (on_past_cur_on_chunk_num, 3)
-        agents_type = agents_type[on_agents_past_cur_on_chunk_mask]
+            agents_past_cur_on_num * past_cur_chunk_num, 3)
+
+        agents_type = agents_type[
+            on_agents_past_cur_on_chunk_mask]  # (on_past_cur_on_chunk_num, 3)
         return agents_type
 
     def _get_on_ego_fut_on_chunk_num_sized_ego_fut_type(
-        self,
-        ego_fut_type: torch.Tensor,  # (B, 3)
-        ego_future_on_mask: torch.Tensor,  # (B)
-        on_ego_fut_on_chunk_mask: torch.
-        Tensor,  # (on_ego_fut_on_num * future_chunk_num)
-        future_chunk_num: int
-    ) -> torch.Tensor:
-        # ego_fut_type: (B, 3) -> (ego_future_on_num, 3)
-        ego_fut_type = ego_fut_type[ego_future_on_mask]
-        ego_future_on_num = ego_fut_type.shape[0]
-        # (ego_future_on_num, 3) -> (ego_future_on_num, 1, 3)
-        # -> (ego_future_on_num, future_chunk_num, 3)
+            self,
+            ego_fut_type: torch.Tensor,  # (B, 3)
+            ego_future_on_mask: torch.Tensor,  # (B)
+            on_ego_fut_on_chunk_mask: torch.Tensor,
+            # (ego_future_on_num * future_chunk_num)
+            future_chunk_num: int,
+    ) -> torch.Tensor:  # (on_ego_fut_on_chunk_num, 3)
+        ego_fut_type = ego_fut_type[
+            ego_future_on_mask]  # (ego_future_on_num, 3)
+        ego_future_on_num = int(ego_fut_type.shape[0])
+
         ego_fut_type = ego_fut_type.unsqueeze(1).expand(-1, future_chunk_num,
-                                                        -1)
-        # (ego_future_on_num, future_chunk_num, 3)
-        # -> (ego_future_on_num * future_chunk_num, 3)
+                                                        -1)  # (N, M, 3)
+
+        # ★ FIX: 0원소 케이스에서 -1 금지 → 마지막 차원(3) 명시
         ego_fut_type = ego_fut_type.reshape(
-            ego_future_on_num * future_chunk_num, -1)
-        # (ego_future_on_num * future_chunk_num, 3)
-        # -> (on_ego_fut_on_chunk_num, 3)
-        ego_fut_type = ego_fut_type[on_ego_fut_on_chunk_mask]
+            ego_future_on_num * future_chunk_num, 3)
+
+        ego_fut_type = ego_fut_type[
+            on_ego_fut_on_chunk_mask]  # (on_ego_fut_on_chunk_num, 3)
         return ego_fut_type
 
     def _get_type_embedding(
