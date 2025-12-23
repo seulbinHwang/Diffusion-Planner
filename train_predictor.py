@@ -831,58 +831,6 @@ def build_adamw_with_param_groups(
     return optim_obj, extra_nwd
 
 
-def _infer_max_sizes_for_agent_route_lane_order(
-    self,
-    batch: List[Dict[str, Any]],
-) -> Tuple[int, int]:
-    """agent_route_lane_order를 패딩하기 위한 (최대 agent 수, 최대 lane 수)를 계산합니다.
-
-    왜 이 함수가 필요한가
-    --------------------
-    agent_route_lane_order는 (행=agent, 열=lane) 관계를 담고 있습니다.
-    현재 로직에서는 agent_route_lane_order의 "행"이
-    neighbor 전체가 아니라 near agent 기준으로 잘려서 들어올 수 있습니다.
-
-    그래서 이 key를 배치로 패딩할 때,
-    agent 축 최대값(max_agent_num)은 neighbor_agents_past 같은 다른 텐서가 아니라
-    **agent_route_lane_order 자체의 행 개수**만 보고 정하는 것이 안전합니다.
-    (그래야 agent_route_lane_order_is_valid 같은 agent 축 마스크와도 길이가 맞습니다.)
-
-    lane 축(max_lane_num)은 lanes.shape[0]와 agent_route_lane_order.shape[1] 중
-    더 큰 값을 사용해, lane 텐서 패딩과도 잘 맞도록 합니다.
-
-    Args:
-        batch (List[Dict[str, Any]]):
-            - 길이 B의 샘플 dict 리스트.
-
-    Returns:
-        Tuple[int, int]:
-            - max_agent_num: shape (), int
-                agent_route_lane_order의 행 수(=agent 수) 최대값.
-            - max_lane_num: shape (), int
-                lanes의 lane 개수 또는 agent_route_lane_order의 열 수 최대값.
-    """
-    max_agent_num: int = 0
-    max_lane_num: int = 0
-
-    for sample in batch:
-        aro = sample.get("agent_route_lane_order", None)
-        if aro is not None:
-            aro_arr = np.asarray(aro)
-            # aro_arr: (A_i, L_i)
-            if aro_arr.ndim == 2:
-                max_agent_num = max(max_agent_num, int(aro_arr.shape[0]))
-                max_lane_num = max(max_lane_num, int(aro_arr.shape[1]))
-
-        lanes = sample.get("lanes", None)
-        if lanes is not None:
-            lanes_arr = np.asarray(lanes)
-            # lanes_arr: (L_i, lane_len, feat) 또는 최소 (L_i, ...)
-            if lanes_arr.ndim >= 1:
-                max_lane_num = max(max_lane_num, int(lanes_arr.shape[0]))
-
-    return int(max_agent_num), int(max_lane_num)
-
 
 class DiffusionPlannerCollate:
     """DiffusionPlannerData 샘플들을 배치 텐서로 묶는 collate_fn.
@@ -914,6 +862,58 @@ class DiffusionPlannerCollate:
             getattr(args, "center_crop_radius_m", 0.0))
         self.center_crop_mode: str = str(
             getattr(args, "center_crop_mode", "none")).lower()
+
+    def _infer_max_sizes_for_agent_route_lane_order(
+            self,
+            batch: List[Dict[str, Any]],
+    ) -> Tuple[int, int]:
+        """agent_route_lane_order를 패딩하기 위한 (최대 agent 수, 최대 lane 수)를 계산합니다.
+
+        왜 이 함수가 필요한가
+        --------------------
+        agent_route_lane_order는 (행=agent, 열=lane) 관계를 담고 있습니다.
+        현재 로직에서는 agent_route_lane_order의 "행"이
+        neighbor 전체가 아니라 near agent 기준으로 잘려서 들어올 수 있습니다.
+
+        그래서 이 key를 배치로 패딩할 때,
+        agent 축 최대값(max_agent_num)은 neighbor_agents_past 같은 다른 텐서가 아니라
+        **agent_route_lane_order 자체의 행 개수**만 보고 정하는 것이 안전합니다.
+        (그래야 agent_route_lane_order_is_valid 같은 agent 축 마스크와도 길이가 맞습니다.)
+
+        lane 축(max_lane_num)은 lanes.shape[0]와 agent_route_lane_order.shape[1] 중
+        더 큰 값을 사용해, lane 텐서 패딩과도 잘 맞도록 합니다.
+
+        Args:
+            batch (List[Dict[str, Any]]):
+                - 길이 B의 샘플 dict 리스트.
+
+        Returns:
+            Tuple[int, int]:
+                - max_agent_num: shape (), int
+                    agent_route_lane_order의 행 수(=agent 수) 최대값.
+                - max_lane_num: shape (), int
+                    lanes의 lane 개수 또는 agent_route_lane_order의 열 수 최대값.
+        """
+        max_agent_num: int = 0
+        max_lane_num: int = 0
+
+        for sample in batch:
+            aro = sample.get("agent_route_lane_order", None)
+            if aro is not None:
+                aro_arr = np.asarray(aro)
+                # aro_arr: (A_i, L_i)
+                if aro_arr.ndim == 2:
+                    max_agent_num = max(max_agent_num, int(aro_arr.shape[0]))
+                    max_lane_num = max(max_lane_num, int(aro_arr.shape[1]))
+
+            lanes = sample.get("lanes", None)
+            if lanes is not None:
+                lanes_arr = np.asarray(lanes)
+                # lanes_arr: (L_i, lane_len, feat) 또는 최소 (L_i, ...)
+                if lanes_arr.ndim >= 1:
+                    max_lane_num = max(max_lane_num, int(lanes_arr.shape[0]))
+
+        return int(max_agent_num), int(max_lane_num)
 
     def _get_special_padding_category_spec(
         self,
