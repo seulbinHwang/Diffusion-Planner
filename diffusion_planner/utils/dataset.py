@@ -295,8 +295,9 @@ class DiffusionPlannerData(Dataset):
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value
             if agent_route_lane_order_agent_num is not None:
-                print("agent_route_lane_order_agent_num:", agent_route_lane_order_agent_num,
-                        "neighbor_agents_past_agent_num:", neighbor_agents_past_agent_num)
+                if neighbor_agents_past_agent_num == 165:
+                    print("agent_route_lane_order_agent_num:", agent_route_lane_order_agent_num,
+                            "neighbor_agents_past_agent_num:", neighbor_agents_past_agent_num)
                 assert agent_route_lane_order_agent_num == neighbor_agents_past_agent_num, (
                     f"agent_route_lane_order_agent_num ({agent_route_lane_order_agent_num}) != "
                     f"neighbor_agents_past_agent_num ({neighbor_agents_past_agent_num}) "
