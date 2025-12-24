@@ -342,9 +342,16 @@ class PRAMV2Composer(nn.Module):
         r = r.masked_fill((~route_known_mask).unsqueeze(-1), 0.0)
         # ERROR
         """
-RuntimeError: The size of tensor a (166) must match the size of tensor b (164) at non-singleton dimension 1
+[r.shape]: torch.Size([128, 164, 128]) [invalid_mask.shape]: torch.Size([128, 166, 1])                                                                          
         """
-        print("[r.shape]:", r.shape, "[invalid_mask.shape]:", invalid_mask.shape)
+        print("\n[target_agents_route_lane_emb.shape]:", target_agents_route_lane_emb.shape,
+              "\n[route_known_mask.shape]:", route_known_mask.shape,
+              "\n[state_token_in.shape]:", state_token_in.shape,
+              "\n[r.shape]:", r.shape,
+              "\n[r.shape]:", r.shape,
+              "\n[invalid_mask.shape]:", invalid_mask.shape,
+
+              )
         r = r.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 R 경로도 0
 
         # --- E 경로 (배치 단위 미제공 0화) ---
