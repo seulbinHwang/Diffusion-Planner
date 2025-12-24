@@ -2166,6 +2166,7 @@ class DiT(nn.Module):
             shift_base=shift_base, # [B, (1+)Pnn, H]
             logit_gate_base=logit_gate_base, # [B, (1+)Pnn, H]
         """
+        # ERROR
         composer_out = self.pram_v2_composer(
             state_token_in=state_token_in,  # (B, (1+)Pnn, H)
             ego_fut_global=ego_fut_global,
