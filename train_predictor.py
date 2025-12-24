@@ -2295,11 +2295,11 @@ class DiffusionPlannerCollate:
             else:
                 t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
                 batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
-            agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
-            neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
-            if agent_route_lane_order is not None and neighbor_agents_past is not None:
-                print("[agent_route_lane_order.shape]", agent_route_lane_order.shape,
-                        "[neighbor_agents_past.shape]", neighbor_agents_past.shape)
+        agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
+        neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
+        if agent_route_lane_order is not None and neighbor_agents_past is not None:
+            print("[agent_route_lane_order.shape]", agent_route_lane_order.shape,
+                    "[neighbor_agents_past.shape]", neighbor_agents_past.shape)
         return batch_out
 
     def _is_validity_key_name(self, key: str) -> bool:
