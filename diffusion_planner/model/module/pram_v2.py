@@ -343,10 +343,8 @@ class PRAMV2Composer(nn.Module):
         # ERROR
         """
 RuntimeError: The size of tensor a (166) must match the size of tensor b (164) at non-singleton dimension 1
-[default1]:Exception raised from infer_size_impl at ../aten/src/ATen/ExpandUtils.cpp:31 (most recent call first):
-[default1]:C++ CapturedTraceback:
-[default1]:#4 ?? from /mnt/nuplan/miniforge/envs/diffusion_planner/lib/python3.10/site-packages/torch/lib/libc10.so:545789
         """
+        print("[r.shape]:", r.shape, "[invalid_mask.shape]:", invalid_mask.shape)
         r = r.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 R 경로도 0
 
         # --- E 경로 (배치 단위 미제공 0화) ---
