@@ -1471,12 +1471,6 @@ class Encoder(nn.Module):
              lanes_mask,  # (B, L)
              agent_route_lane_order,  # (B, Pnn, L)
          )
-        print("[encoding_lanes_with_pos.shape]", encoding_lanes_with_pos.shape,
-              "\n[lanes_mask.shape]", lanes_mask.shape,
-              "\n[agent_route_lane_order.shape]", agent_route_lane_order.shape,
-              "\n[near_agents_route_lane_emb.shape]",
-              near_agents_route_lane_emb.shape,
-              "\n[route_known_mask.shape]", route_known_mask.shape)
 
         # PRAM 꺼져 있을 때는 route-lane embedding 도 0으로 처리
         if not self.config.use_pram:

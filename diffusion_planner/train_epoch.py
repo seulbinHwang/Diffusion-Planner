@@ -34,6 +34,14 @@ def _move_batch_to_device(
             batch_on_device[key] = value.to(device, non_blocking=True)
         else:
             batch_on_device[key] = value  # None / metadata 등 유지
+        if key == "agent_route_lane_order":
+            agent_route_lane_order_agent_num = int(
+                batch_on_device[key].shape[1])
+        elif key == "neighbor_agents_past":
+            neighbor_agents_agent_num = int(batch_on_device[key].shape[1])
+        assert agent_route_lane_order_agent_num == neighbor_agents_agent_num, \
+            f"agent_route_lane_order agent num ({agent_route_lane_order_agent_num}) " \
+            f"!= neighbor_agents_past agent num ({neighbor_agents_agent_num})"
     return batch_on_device
 
 
