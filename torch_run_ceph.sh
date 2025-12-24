@@ -51,7 +51,7 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "nuplan_womd" \
-  --batch_size 2048 \
+  --batch_size 1536 \
   --use_deepspeed True \
   --use_ego_plan False
   "$@"
