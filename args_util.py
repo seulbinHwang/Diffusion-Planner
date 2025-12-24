@@ -222,7 +222,7 @@ def get_args():
     parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
-    parser.add_argument('--num_workers', default=6, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)
     parser.add_argument('--use_feasible', default=True, type=boolean)
