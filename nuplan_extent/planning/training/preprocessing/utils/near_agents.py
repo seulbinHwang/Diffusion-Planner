@@ -158,19 +158,7 @@ def _add_near_agents_info_for_one_sample_inplace(
                 start=0,
                 end=near_num,
             )
-    near_agents_past_agent_num = sample['near_agents_past'].shape[agent_dim]
-    near_future_gt_3_dim_agent_num = sample.get('near_future_gt_3_dim', None).shape[agent_dim] if sample.get('near_future_gt_3_dim', None) is not None else None
-    agent_route_lane_order_agent_num = sample.get('agent_route_lane_order', None).shape[agent_dim] if sample.get('agent_route_lane_order', None) is not None else None
-    if near_future_gt_3_dim_agent_num is not None and agent_route_lane_order_agent_num is not None:
-        assert near_num == near_agents_past_agent_num == near_future_gt_3_dim_agent_num == agent_route_lane_order_agent_num, \
-            f"near_num {near_num} != near_agents_past_agent_num {near_agents_past_agent_num} != near_future_gt_3_dim_agent_num {near_future_gt_3_dim_agent_num} != agent_route_lane_order_agent_num {agent_route_lane_order_agent_num}"
-    # print("near_num:", near_num,
-    #       "\n sample['near_agents_past'] shape:", sample['near_agents_past'].shape,
-    #         "\n sample['non_near_agents_past'] shape:", sample['non_near_agents_past'].shape,
-    #       "\n sample['near_future_gt_3_dim'] shape:", sample.get('near_future_gt_3_dim', None).shape if sample.get('near_future_gt_3_dim', None) is not None else None,
-    #         "\n sample['agent_route_lane_order'] shape:", sample.get('agent_route_lane_order', None).shape if sample.get('agent_route_lane_order', None) is not None else None,
-    #         )
-    #
+
 
 
     agent_route_lane_order_is_valid = sample.get("agent_route_lane_order_is_valid", None)
@@ -186,6 +174,20 @@ def _add_near_agents_info_for_one_sample_inplace(
                 start=0,
                 end=near_num,
             )
+    near_agents_past_agent_num = sample['near_agents_past'].shape[agent_dim]
+    near_future_gt_3_dim_agent_num = sample.get('near_future_gt_3_dim', None).shape[agent_dim] if sample.get('near_future_gt_3_dim', None) is not None else None
+    agent_route_lane_order_agent_num = sample.get('agent_route_lane_order', None).shape[agent_dim] if sample.get('agent_route_lane_order', None) is not None else None
+    agent_route_lane_order_is_valid_agent_num = sample.get('agent_route_lane_order_is_valid', None).shape[agent_dim] if sample.get('agent_route_lane_order_is_valid', None) is not None else None
+    if near_future_gt_3_dim_agent_num is not None and agent_route_lane_order_agent_num is not None and agent_route_lane_order_is_valid_agent_num is not None:
+        assert near_num == near_agents_past_agent_num == near_future_gt_3_dim_agent_num ==  agent_route_lane_order_agent_num == agent_route_lane_order_is_valid_agent_num, \
+            f"near_num({near_num}), near_agents_past_agent_num({near_agents_past_agent_num}), near_future_gt_3_dim_agent_num({near_future_gt_3_dim_agent_num}), agent_route_lane_order_agent_num({agent_route_lane_order_agent_num}), agent_route_lane_order_is_valid_agent_num({agent_route_lane_order_is_valid_agent_num}) are not equal"
+    # print("near_num:", near_num,
+    #       "\n sample['near_agents_past'] shape:", sample['near_agents_past'].shape,
+    #         "\n sample['non_near_agents_past'] shape:", sample['non_near_agents_past'].shape,
+    #       "\n sample['near_future_gt_3_dim'] shape:", sample.get('near_future_gt_3_dim', None).shape if sample.get('near_future_gt_3_dim', None) is not None else None,
+    #         "\n sample['agent_route_lane_order'] shape:", sample.get('agent_route_lane_order', None).shape if sample.get('agent_route_lane_order', None) is not None else None,
+    #         )
+    #
 
 
 def _infer_agent_dim_index_from_neighbor_agents_past(
