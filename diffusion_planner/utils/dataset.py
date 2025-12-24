@@ -271,11 +271,14 @@ class DiffusionPlannerData(Dataset):
         }
 
         sample: Dict[str, Any] = {}
+        agent_route_lane_order_agent_num = None
+        neighbor_agents_past_agent_num = None
         try:
             for npz_key in npz_keys:
                 value = data.get(npz_key, None)
                 if value is not None and npz_key == "agent_route_lane_order":
                     value = value.astype("int64")
+                    agent_route_lane_order_agent_num = value.shape[0]
                 # if npz_key == "neighbor_future_gt_3_dim":  # (chosen_agent_num, future_len, 3)
                 #     # neighbor_future_gt_is_valid: (chosen_agent_num, future_len)
                 #     neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
@@ -287,9 +290,16 @@ class DiffusionPlannerData(Dataset):
                 #         neighbor_future_gt_is_valid,
                 #         context=f"{file_name} - neighbor_future_gt_is_valid",
                 #     )
-
+                if value is not None and npz_key == "neighbor_agents_past":
+                    neighbor_agents_past_agent_num = value.shape[0]
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value
+            if agent_route_lane_order_agent_num is not None:
+                assert agent_route_lane_order_agent_num == neighbor_agents_past_agent_num, (
+                    f"agent_route_lane_order_agent_num ({agent_route_lane_order_agent_num}) != "
+                    f"neighbor_agents_past_agent_num ({neighbor_agents_past_agent_num}) "
+                    f"in file {file_name}"
+                )
         finally:
             # opendata가 np.load(...) 결과(NpzFile)를 반환하므로 닫아주는 게 안전
             if hasattr(data, "close"):
