@@ -2000,7 +2000,6 @@ class DiffusionPlannerCollate:
 
         max_agent_num, max_lane_num = self._infer_max_sizes_for_agent_route_lane_order(
             batch)
-        print("max_agent_num for aro:", max_agent_num)
         out = torch.full(
             (batch_size, max_agent_num, max_lane_num),
             fill_value=-1,
@@ -2293,11 +2292,19 @@ class DiffusionPlannerCollate:
             # agent_route_lane_order는 -1 padding 전용 처리
             if k == "agent_route_lane_order":
                 batch_out[k] = self._pad_and_stack_agent_route_lane_order(batch)
-                continue
-
-            t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
-            batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
-
+            else:
+                t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
+                batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
+            agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
+            neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
+            agent_route_lane_order_agent_num = agent_route_lane_order.shape[1] if agent_route_lane_order is not None else 0
+            neighbor_agents_past_agent_num = neighbor_agents_past.shape[1] if neighbor_agents_past is not None else 0
+            if agent_route_lane_order_agent_num != neighbor_agents_past_agent_num:
+                raise ValueError(
+                    f"[Collate] agent_route_lane_order의 agent 수와 neighbor_agents_past의 agent 수가 일치하지 않습니다. "
+                    f"agent_route_lane_order agent num: {agent_route_lane_order_agent_num}, "
+                    f"neighbor_agents_past agent num: {neighbor_agents_past_agent_num}"
+                )
         return batch_out
 
     def _is_validity_key_name(self, key: str) -> bool:
