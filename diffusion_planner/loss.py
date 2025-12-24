@@ -979,8 +979,8 @@ def diffusion_loss_func(
     # near_current_xyyaw_norm: (B, Pnn, 4)
     near_future_valid, near_cur_future_mask, near_current_xyyaw_norm = \
         _build_future_masks_and_current_state(
-            near_future_gt_4_dim,
-            near_future_mask,
+            near_future_gt_4_dim, # (B, Pnn, future_len, 4)
+            near_future_mask, # (B, Pnn, future_len)
             norm_inputs,
         )
     (

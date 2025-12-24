@@ -53,11 +53,20 @@ class StateNormalizer:
         # data: (256, 10, 80, 4)
         # mean, std: (10, 1, 4)
         with torch.amp.autocast(data.device.type, enabled=False):
-            return (data - self.mean.to(data.device)) / self.std.to(data.device)
+            # mask: (256, 10, 80)
+            mask = torch.sum(torch.ne(data, 0), dim=-1) == 0
+            norm_data = (data - self.mean.to(data.device)) / self.std.to(
+                data.device)
+            norm_data[mask] = 0
+            return norm_data
 
     def inverse(self, data):
         with torch.amp.autocast(data.device.type, enabled=False):
-            return data * self.std.to(data.device) + self.mean.to(data.device)
+            mask = torch.sum(torch.ne(data, 0), dim=-1) == 0
+            inv_data = data * self.std.to(data.device) + self.mean.to(
+                data.device)
+            inv_data[mask] = 0
+            return inv_data
 
     def to_dict(self):
         return {
@@ -121,7 +130,11 @@ class ObservationNormalizer:
                 if (k not in data) or (
                         data[k] is None):  # Check if key `k` exists in `data`
                     continue
-                mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
+                if k in ["ego_agent_past", "planner_future_11_dim",
+                    "ego_future_gt_11_dim", "neighbor_agents_past"]:
+                    mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
+                else:
+                    mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = (data[k] - v["mean"].to(
                     data[k].device)) / v["std"].to(data[k].device)
                 norm_data[k][mask] = 0
@@ -142,7 +155,11 @@ class ObservationNormalizer:
             for k, v in self._normalization_dict.items():
                 if (k not in data) or (v is None):
                     continue
-                mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
+                if k in ["ego_agent_past", "planner_future_11_dim",
+                         "ego_future_gt_11_dim", "neighbor_agents_past"]:
+                    mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
+                else:
+                    mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = data[k] * v["std"].to(
                     data[k].device) + v["mean"].to(data[k].device)
                 norm_data[k][mask] = 0

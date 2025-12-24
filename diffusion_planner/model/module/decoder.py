@@ -961,7 +961,7 @@ class Decoder(nn.Module):
         # target_current_xyyaw: (B, (1+)Pnn, 4)
         target_current_xyyaw: torch.Tensor = target_agents_past[:, :, -1, :4]
 
-        # target_past_current_mask: (B, Pnn, (1+)time_len) True=무효
+        # target_past_current_mask: (B, (1+)Pnn, time_len) True=무효
         target_past_current_mask: torch.Tensor = _compute_time_padding_mask_from_state(
             target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             check_dims=8,
@@ -970,6 +970,7 @@ class Decoder(nn.Module):
         # target_current_mask: (B, (1+)Pnn)
         target_current_mask: torch.Tensor = target_past_current_mask[:, :, -1]
 
+
         # target_future_valid: (B, (1 +) Pnn, future_len) 또는 None
         target_future_valid: torch.Tensor = inputs["target_future_valid"]
         target_future_valid = _to_bool_mask(target_future_valid).to(
@@ -977,8 +978,8 @@ class Decoder(nn.Module):
 
         # target_past_cur_future_valid: (B, (1+)Pnn, time_len + future_len) bool
         target_past_cur_future_valid: torch.Tensor = self._get_target_past_cur_future_valid(
-            target_past_current_mask=target_past_current_mask,
-            target_future_valid=target_future_valid,
+            target_past_current_mask=target_past_current_mask, # (B, (1+)Pnn, time_len)
+            target_future_valid=target_future_valid, # (B, (1 +) Pnn, future_len)
         )
 
         # target_class_one_hot: (B, (1+)Pnn, 3)
