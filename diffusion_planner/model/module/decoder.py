@@ -1056,6 +1056,8 @@ class Decoder(nn.Module):
                 [ego_route_lane_emb, near_agents_route_lane_emb],
                 dim=1,
             )  # (B, 1+Pnn, D)
+            print("target_agents_route_lane_emb.shape:", target_agents_route_lane_emb.shape,
+                    "route_known_mask.shape:", route_known_mask.shape)
             ego_known_mask = torch.zeros(
                 (batch_size, 1),
                 dtype=route_known_mask.dtype,

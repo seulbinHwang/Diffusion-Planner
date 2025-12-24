@@ -342,8 +342,14 @@ class PRAMV2Composer(nn.Module):
         r = r.masked_fill((~route_known_mask).unsqueeze(-1), 0.0)
         # ERROR
         """
-[r.shape]: torch.Size([128, 164, 128]) [invalid_mask.shape]: torch.Size([128, 166, 1])                                                                          
-        """
+[target_agents_route_lane_emb.shape]: torch.Size([128, 164, 192])                                                                                               
+[route_known_mask.shape]: torch.Size([128, 164])                                                                                                                
+[state_token_in.shape]: torch.Size([128, 166, 192])                                                                                                             
+[r.shape]: torch.Size([128, 164, 128])                                                                                                                          
+[r.shape]: torch.Size([128, 164, 128])                                                                                                                          
+[invalid_mask.shape]: torch.Size([128, 166, 1])
+
+       """
         print("\n[target_agents_route_lane_emb.shape]:", target_agents_route_lane_emb.shape,
               "\n[route_known_mask.shape]:", route_known_mask.shape,
               "\n[state_token_in.shape]:", state_token_in.shape,
