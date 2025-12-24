@@ -900,7 +900,7 @@ class DiffusionPlannerCollate:
         for sample in batch:
             aro = sample.get("agent_route_lane_order", None)
             if aro is not None:
-                aro_arr = np.asarray(aro)
+                aro_arr = np.asarray(aro) # (agent_num, lane_num)
                 # aro_arr: (A_i, L_i)
                 if aro_arr.ndim == 2:
                     max_agent_num = max(max_agent_num, int(aro_arr.shape[0]))
@@ -908,7 +908,7 @@ class DiffusionPlannerCollate:
 
             lanes = sample.get("lanes", None)
             if lanes is not None:
-                lanes_arr = np.asarray(lanes)
+                lanes_arr = np.asarray(lanes) #
                 # lanes_arr: (L_i, lane_len, feat) 또는 최소 (L_i, ...)
                 if lanes_arr.ndim >= 1:
                     max_lane_num = max(max_lane_num, int(lanes_arr.shape[0]))
@@ -1971,6 +1971,8 @@ class DiffusionPlannerCollate:
     def _pad_and_stack_agent_route_lane_order(
         self,
         batch: List[Dict[str, Any]],
+            max_agent_num: int,
+            max_lane_num: int,
     ) -> torch.Tensor:
         """agent_route_lane_order를 (B, A_max, L_max) 텐서로 만들고 -1로 패딩합니다.
 
@@ -1998,8 +2000,8 @@ class DiffusionPlannerCollate:
         """
         batch_size: int = int(len(batch))
 
-        max_agent_num, max_lane_num = self._infer_max_sizes_for_agent_route_lane_order(
-            batch)
+        # max_agent_num, max_lane_num = self._infer_max_sizes_for_agent_route_lane_order(
+        #     batch)
         out = torch.full(
             (batch_size, max_agent_num, max_lane_num),
             fill_value=-1,
@@ -2288,13 +2290,17 @@ class DiffusionPlannerCollate:
             if all(v is None for v in values):
                 batch_out[k] = None
                 continue
-
-            # agent_route_lane_order는 -1 padding 전용 처리
             if k == "agent_route_lane_order":
-                batch_out[k] = self._pad_and_stack_agent_route_lane_order(batch)
-            else:
-                t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
-                batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
+                continue
+            t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
+            batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
+
+        # agent_route_lane_order는 -1 padding 전용 처리
+        max_agent_num = batch_out["neighbor_agents_past"].shape[1]
+        max_lane_num = batch_out["lanes"].shape[1]
+
+
+        batch_out["agent_route_lane_order"] = self._pad_and_stack_agent_route_lane_order(batch, max_agent_num, max_lane_num)
         agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
         neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
 
@@ -3204,7 +3210,6 @@ class DiffusionPlannerCollate:
             raise NotImplementedError(
                 "현재 구현에서는 center crop을 사용할 수 없습니다.")
             self._center_crop_batch_batched(batch)
-        # GOGO
         add_near_agents_info_inplace(
             batch,
             predicted_neighbor_num=self.args.predicted_neighbor_num,
