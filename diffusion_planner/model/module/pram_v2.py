@@ -340,24 +340,7 @@ class PRAMV2Composer(nn.Module):
         r = self.adapt_R(R_in)  # [B,(1+)Pnn,h]
         r = self.rms_pre(r)
         r = r.masked_fill((~route_known_mask).unsqueeze(-1), 0.0)
-        # ERROR
-        """
-[target_agents_route_lane_emb.shape]: torch.Size([128, 164, 192])                                                                                               
-[route_known_mask.shape]: torch.Size([128, 164])                                                                                                                
-[state_token_in.shape]: torch.Size([128, 166, 192])                                                                                                             
-[r.shape]: torch.Size([128, 164, 128])                                                                                                                          
-[r.shape]: torch.Size([128, 164, 128])                                                                                                                          
-[invalid_mask.shape]: torch.Size([128, 166, 1])
 
-       """
-        print("\n[target_agents_route_lane_emb.shape]:", target_agents_route_lane_emb.shape,
-              "\n[route_known_mask.shape]:", route_known_mask.shape,
-              "\n[state_token_in.shape]:", state_token_in.shape,
-              "\n[r.shape]:", r.shape,
-              "\n[r.shape]:", r.shape,
-              "\n[invalid_mask.shape]:", invalid_mask.shape,
-
-              )
         r = r.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 R 경로도 0
 
         # --- E 경로 (배치 단위 미제공 0화) ---
