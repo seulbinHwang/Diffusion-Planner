@@ -2000,7 +2000,7 @@ class DiffusionPlannerCollate:
 
         max_agent_num, max_lane_num = self._infer_max_sizes_for_agent_route_lane_order(
             batch)
-
+        print("max_agent_num for aro:", max_agent_num)
         out = torch.full(
             (batch_size, max_agent_num, max_lane_num),
             fill_value=-1,
