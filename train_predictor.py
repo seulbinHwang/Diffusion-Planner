@@ -2297,6 +2297,7 @@ class DiffusionPlannerCollate:
                 batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
         agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
         neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
+
         if agent_route_lane_order is not None and neighbor_agents_past is not None:
             agent_route_lane_order_agent_num = agent_route_lane_order.shape[1]
             neighbor_agents_past_agent_num = neighbor_agents_past.shape[1]
@@ -3200,7 +3201,10 @@ class DiffusionPlannerCollate:
             raise ValueError("빈 batch가 들어왔습니다.")
 
         if self._should_center_crop():
+            raise NotImplementedError(
+                "현재 구현에서는 center crop을 사용할 수 없습니다.")
             self._center_crop_batch_batched(batch)
+        # GOGO
         add_near_agents_info_inplace(
             batch,
             predicted_neighbor_num=self.args.predicted_neighbor_num,
