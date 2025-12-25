@@ -2,6 +2,44 @@ from typing import Any, Dict, Tuple
 import torch
 
 
+def build_target_future_tensors_and_masks_for_inference(
+    args,
+    norm_inputs: Dict[str, torch.Tensor],
+):
+    near_agents_past = norm_inputs["near_agents_past"]  # (B, Pnn, time_len, 11)
+    near_agents_current = near_agents_past[:, :, -1, :]  # (B, Pnn, 11)
+    #  near_agents_current_valid: (B, Pnn) 가 필요함. ->  # TODO 만드는 방식 바꾸기
+    near_agents_current_valid = torch.sum(torch.ne(near_agents_current[..., :8],
+                                                   0),
+                                          dim=-1) != 0  # (B, Pnn) True=유효
+    future_len = norm_inputs["planner_future_11_dim"].shape[1]
+    if not args.do_ego_predict:
+        # target_future_valid: (B, Pnn, future_len)  True=유효
+        """ target_future_valid 만드는 법
+        near_agents_current_valid 에서 True인 agent는 미래 예측을 수행하고, (valid=True)
+        False인 agent는 미래 예측을 수행하지 않습니다. (valid=False)
+        """
+        target_future_valid = near_agents_current_valid.unsqueeze(-1).repeat(
+            1, 1, future_len)  # (B, Pnn, future_len)  True=유효
+    else:
+        # target_future_valid: (B, 1 + Pnn, future_len)  True=유효
+        """
+        이번에는 ego를 포함합니다. ego는 항상 유효하다고 가정합니다.
+        """
+        B = norm_inputs["ego_agent_past"].shape[0]
+        ego_current_valid = torch.ones(
+            (B, 1),
+            dtype=near_agents_current_valid.dtype,
+            device=near_agents_current_valid.device)  # (B, 1) True=유효
+        target_agents_current_valid = torch.cat(
+            [ego_current_valid, near_agents_current_valid],
+            dim=1,
+        )  # (B, 1 + Pnn) True=유효
+        target_future_valid = target_agents_current_valid.unsqueeze(-1).repeat(
+            1, 1, future_len)  # (B, 1 + Pnn, future_len)  True=유효
+    return target_future_valid  # (B, (1+)Pnn, future_len)  True=유효
+
+
 def build_target_future_tensors_and_masks(
     args: Any,
     norm_inputs: Dict[str, torch.Tensor],
@@ -14,7 +52,7 @@ def build_target_future_tensors_and_masks(
         torch.Tensor,  # target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
         torch.Tensor,  # target_cur_future_mask: (B, (1+)Pnn, 1 + future_len)
         torch.Tensor,  # target_current_xyyaw_norm: (B, (1+)Pnn, 4)
-        torch.Tensor,  # target_future_valid: (B, (1+)Pnn, future_len)
+        torch.Tensor,  # target_future_valid: (B, (1+)Pnn, future_len) ##
 ]:
     """ego를 예측 대상에 포함할지 여부에 따라, 학습에 쓸 target 텐서/마스크를 만든다.
 

@@ -1189,7 +1189,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         }  # shape (3,)
         return diff_token_to_global_xyyaw
 
-    def _get_diff_token_to_interpol_traj_wrt_ego(
+    def get_diff_token_to_interpol_traj(
             self,
             diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray],  # (T, 4)
             diff_token_to_global_xyyaw: Dict[str, np.ndarray],  # (token, (3,))
@@ -1522,7 +1522,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
         ####################
         # diff_token_to_interpol_traj: Dict[str, AbstractTrajectory]
-        diff_token_to_interpol_traj = self._get_diff_token_to_interpol_traj_wrt_ego(
+        diff_token_to_interpol_traj = self.get_diff_token_to_interpol_traj(
             diff_token_to_np_gen_traj_wrt_ego, diff_token_to_global_xyyaw,
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
         self._update_diffusion_agents(diff_token_to_interpol_traj,

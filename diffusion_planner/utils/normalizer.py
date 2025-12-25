@@ -130,8 +130,10 @@ class ObservationNormalizer:
                 if (k not in data) or (
                         data[k] is None):  # Check if key `k` exists in `data`
                     continue
-                if k in ["ego_agent_past", "planner_future_11_dim",
-                    "ego_future_gt_11_dim", "neighbor_agents_past"]:
+                if k in [
+                        "ego_agent_past", "planner_future_11_dim",
+                        "ego_future_gt_11_dim", "neighbor_agents_past"
+                ]:
                     mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
                 else:
                     mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
@@ -155,8 +157,10 @@ class ObservationNormalizer:
             for k, v in self._normalization_dict.items():
                 if (k not in data) or (v is None):
                     continue
-                if k in ["ego_agent_past", "planner_future_11_dim",
-                         "ego_future_gt_11_dim", "neighbor_agents_past"]:
+                if k in [
+                        "ego_agent_past", "planner_future_11_dim",
+                        "ego_future_gt_11_dim", "neighbor_agents_past"
+                ]:
                     mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
                 else:
                     mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0

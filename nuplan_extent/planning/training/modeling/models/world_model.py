@@ -16,6 +16,7 @@ from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 from diffusion_planner.utils.amp import amp_context_for_infer
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
+from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks_for_inference
 
 
 class WorldModel(TorchModuleWrapper):
@@ -67,6 +68,12 @@ class WorldModel(TorchModuleWrapper):
         :param features: A dictionary of the required features.
         """
         inputs: Dict[str, Optional[torch.Tensor]] = features.to_tensor_dict()
+        inputs[
+            "target_future_valid"] = build_target_future_tensors_and_masks_for_inference(
+                self.config,
+                inputs,
+            )  # (B, (1+)Pnn, future_len)  True=유효
+
         with torch.no_grad():
             with amp_context_for_infer():
                 _, outputs = self._planner(inputs)

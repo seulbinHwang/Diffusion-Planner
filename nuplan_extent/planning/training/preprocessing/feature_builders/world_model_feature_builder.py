@@ -5,7 +5,7 @@ from dataclasses import fields as dataclass_fields
 from typing import Any, Dict, Type, Optional, List
 import numpy as np
 from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_near_agents_info_inplace
-
+from nuplan_extent.planning.training.preprocessing.utils.near_agents import get_near_track_token
 import torch
 
 from nuplan_extent.planning.simulation.planner.abstract_planner import PlannerInput
@@ -59,42 +59,27 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
     def _post_process_unnormalized_features(
             self,
-            neighbor_track_token: List[Optional[str]],  # len: agents_num
-            target_agents_mask: Optional[np.ndarray],  # len: agents_num
+            near_track_token: List[str],  # len: "Pnn 이하의 값"
     ) -> None:
 
-        target_track_token: List[Optional[str]] = []  # len: agents_num
-        for idx, token in enumerate(neighbor_track_token):
-            if token is None:
-                target_track_token.append(None)
-                continue
-            if target_agents_mask[idx]:
-                target_track_token.append(token)
-            else:
-                target_track_token.append(None)
-
-        diff_token_to_future_gt_3_dim: Dict[str,
-                                            np.ndarray] = {}  # (future_len, 3)
+        diff_token_to_future_gt_3_dim: Dict[str, np.ndarray] = {
+        }  # (future_len, 3) # "Pnn 이하의 길이"
         neighbor_future_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_gt_3_dim", None)  # (max_agent_num, future_len, 3)
         if neighbor_future_gt_3_dim is not None:
-            for idx, token in enumerate(target_track_token):
-                if token is not None:
-                    diff_token_to_future_gt_3_dim[
-                        token] = neighbor_future_gt_3_dim[
-                            idx]  # (future_len, 3)
+            for idx, token in enumerate(near_track_token):
+                diff_token_to_future_gt_3_dim[token] = neighbor_future_gt_3_dim[
+                    idx]  # (future_len, 3)
 
         neighbor_future_all_gt_3_dim = self.unnormalized_features.get(
             "neighbor_future_all_gt_3_dim",
-            None)  # (max_agent_num, future_all_len, 3)
+            None)  # (max_agent_num, future_all_len, 3) # "Pnn 이하의 길이"
         diff_token_to_future_all_gt_3_dim: Dict[str, np.ndarray] = {}
         if neighbor_future_all_gt_3_dim is not None:
-            for idx, token in enumerate(target_track_token):
-                if token is not None:
-                    future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
-                        idx]  # (future_all_len, 3)
-                    diff_token_to_future_all_gt_3_dim[
-                        token] = future_all_gt_3_dim
+            for idx, token in enumerate(near_track_token):
+                future_all_gt_3_dim = neighbor_future_all_gt_3_dim[
+                    idx]  # (future_all_len, 3)
+                diff_token_to_future_all_gt_3_dim[token] = future_all_gt_3_dim
 
         neighbor_agents_past = self.unnormalized_features[
             "neighbor_agents_past"]  # (max_agent_num, time_len, 11)
@@ -150,7 +135,6 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     def _build_world_model_feature_kwargs(
         self,
         model_inputs: Dict[str, torch.Tensor],
-        target_agents_mask: Optional[np.ndarray],
     ) -> Dict[str, Any]:
         """WorldModelFeature 생성에 필요한 모든 필드 값을 dict로 구성합니다.
 
@@ -163,24 +147,19 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         동작 규칙:
         - WorldModelFeature dataclass에 정의된 모든 필드를 순회합니다.
         - 각 필드에 대해:
-          * builder가 직접 만든 값(예: target_agents_mask)이 있으면 그 값을 사용
-          * 아니면 model_inputs에서 같은 이름의 key를 찾고,
+          * model_inputs에서 같은 이름의 key를 찾고,
             필요한 경우 후보 key(예: driveway_points vs driveway)도 확인합니다.
           * 끝까지 못 찾으면 None을 넣습니다.
 
         Args:
             model_inputs: normalize 이후의 입력 딕셔너리. value: torch.Tensor.
-            target_agents_mask: (max_agent_num,) bool 형태의 numpy 배열 또는 None.
 
         Returns:
             Dict[str, Any]:
                 WorldModelFeature(**kwargs)에 바로 넣을 수 있는 매핑.
                 값은 torch.Tensor / np.ndarray / None 중 하나입니다.
         """
-        overrides: Dict[str, Any] = {
-            # target_agents_mask: (max_agent_num,) bool
-            "target_agents_mask": target_agents_mask,
-        }
+        overrides: Dict[str, Any] = {}
 
         feature_kwargs: Dict[str, Any] = {}
         for field in dataclass_fields(WorldModelFeature):
@@ -188,13 +167,11 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
             if field_name in overrides:
                 feature_kwargs[field_name] = overrides[field_name]
                 continue
-
             feature_kwargs[
                 field_name] = self._get_model_input_value_for_world_model_field(
                     model_inputs=model_inputs,
                     field_name=field_name,
                 )
-
         return feature_kwargs
 
     def get_features_from_simulation(
@@ -204,7 +181,6 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
     ) -> WorldModelFeature:
         history_buffer: SimulationHistoryBuffer = current_input.history
         traffic_light_data = list(current_input.traffic_light_data)
-
 
         model_inputs: Dict[
             str, torch.Tensor] = self.data_processor.observation_adapter(
@@ -246,46 +222,22 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
 
         self.unnormalized_features[
             "neighbor_track_token"] = neighbor_track_token
+        # "Pnn 이하의 값"
+        near_track_token: List[str] = get_near_track_token(
+            neighbor_track_token, self._config.predicted_neighbor_num)
+        self.unnormalized_features["near_track_token"] = near_track_token
 
         # normalize
         model_inputs = self.observation_normalizer(model_inputs)
 
-        # target agent mask 계산
-        target_agents_mask = self._get_target_agents_mask(
-            neighbor_track_token,
-            current_input.diffusion_agents_tokens,
-        )
-        self._post_process_unnormalized_features(neighbor_track_token,
-                                                 target_agents_mask)
+        # target agent mask 계산 # (max_agent_num,) bool
+        self._post_process_unnormalized_features(near_track_token)
 
         # WorldModelFeature의 "모든 필드"를 채워서 생성
         world_model_feature_kwargs = self._build_world_model_feature_kwargs(
-            model_inputs=model_inputs,
-            target_agents_mask=target_agents_mask,
-        )
+            model_inputs=model_inputs,)
         world_model_feature = WorldModelFeature(**world_model_feature_kwargs)
         return world_model_feature
-
-    def _get_target_agents_mask(
-        self,
-        neighbor_track_token: List[Optional[str]],
-        diffusion_agents_tokens: Optional[List[str]],
-    ) -> Optional[np.ndarray]:
-        """
-        input
-            - neighbor_track_token :  List[Optional[str]], (max_agent_num,)
-            - diffusion_agents_tokens: List[str], (valid_agent_num) maxlen=Pnn
-        output
-            - target_agents_mask: np.ndarray, (max_agent_num,) bool
-        """
-        max_agent_num = len(neighbor_track_token)
-
-        target_agents_mask = np.zeros((max_agent_num,), dtype=bool)
-        if diffusion_agents_tokens is None:
-            target_agents_mask[:self._config.predicted_neighbor_num] = True
-            return target_agents_mask
-
-        assert isinstance(neighbor_track_token, list)
 
         for idx in range(max_agent_num):
             if neighbor_track_token[idx] in diffusion_agents_tokens:

@@ -173,7 +173,8 @@ class WorldModelFeature(AbstractModelFeature):
     ########### SAME AS LEARNING INPUT ###########
     ego_agent_past: FeatureDataType  # (time_len, 11)
     neighbor_agents_past: FeatureDataType  # (max_agent_num, time_len, 11)
-    target_future_valid: FeatureDataType # (B, (1 +) Pnn, future_len)
+    near_agents_past: FeatureDataType  # (Pnn, time_len, 11)4
+    non_near_agents_past: FeatureDataType  # (max_agent_num - Pnn, time_len, 11)
     ########### SAME AS LEARNING INPUT ###########
     lanes: FeatureDataType  # (lane_num, lane_len, 12)
     lanes_speed_limit: FeatureDataType  # (lane_num, 1)
@@ -183,7 +184,7 @@ class WorldModelFeature(AbstractModelFeature):
     route_lanes_has_speed_limit: Optional[
         FeatureDataType] = None  # (route_num, 1)
     agent_route_lane_order: Optional[
-        FeatureDataType] = None  # (max_agent_num, lane_num) # -1 if not on route
+        FeatureDataType] = None  # (Pnn, lane_num) # -1 if not on route
 
     static_objects: Optional[FeatureDataType] = None  # (static_objects_num, 10)
 
@@ -206,8 +207,6 @@ class WorldModelFeature(AbstractModelFeature):
     road_edge_type: Optional[FeatureDataType] = None  # (chosen_edge_num, 3)
     ################################################
     ################ inference only ################
-    target_agents_mask: Optional[
-        FeatureDataType] = None  # (max_agent_num,) bool
     ego_agent_next_11_dim: Optional[
         FeatureDataType] = None  # (interpol_num, 11)
     planner_future_11_dim: Optional[FeatureDataType] = None  # (future_len, 11)
@@ -216,7 +215,6 @@ class WorldModelFeature(AbstractModelFeature):
     ######## validity ########
     # diffusion_planner/utils/validity.py 의 build_validity_key_dict()가 만드는
     # 모든 `~~~_is_valid` 키를 그대로 필드로 반영합니다.
-
     ego_agent_past_is_valid: Optional[
         FeatureDataType] = None  # (time_len,) bool
     ego_future_gt_is_valid: Optional[
@@ -249,7 +247,7 @@ class WorldModelFeature(AbstractModelFeature):
     route_lanes_is_valid: Optional[FeatureDataType] = None  # (route_num,) bool
 
     agent_route_lane_order_is_valid: Optional[
-        FeatureDataType] = None  # (max_agent_num,) bool
+        FeatureDataType] = None  # (Pnn,) bool
     road_edge_is_valid: Optional[
         FeatureDataType] = None  # (chosen_edge_num,) bool
 

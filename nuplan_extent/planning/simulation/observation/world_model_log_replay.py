@@ -1399,7 +1399,7 @@ class WorldModelLogReplay(AbstractMLAgents):
             cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)
         return rel_future_arrays
 
-    def _get_diff_token_to_interpol_traj_wrt_ego(
+    def get_diff_token_to_interpol_traj(
             self,
             diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray],  # (T, 4)
             diff_token_to_global_xyyaw: Dict[str, np.ndarray],  # (token, (3,))
@@ -1478,7 +1478,7 @@ class WorldModelLogReplay(AbstractMLAgents):
         self._get_diff_token_to_np_history_to_draw(
             diffusion_token_to_agent_history, cur_ego_global_xyyaw)
 
-        diff_token_to_interpol_traj = self._get_diff_token_to_interpol_traj_wrt_ego(
+        diff_token_to_interpol_traj = self.get_diff_token_to_interpol_traj(
             diff_token_to_np_gen_traj_wrt_ego,
             diff_token_to_global_xyyaw,
             diffusion_token_to_agent_history,

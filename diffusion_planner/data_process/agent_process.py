@@ -968,10 +968,11 @@ def _build_present_static_feature_6(
 
 from typing import Optional, List, Tuple  # 이미 있으면 중복 import는 제거해도 OK
 
+
 def _filter_out_neighbors_not_present_at_current(
-    neighbor_agents_past: np.ndarray,        # shape: (K, T, 11)
-    agents_cur_frame_indices: np.ndarray,    # shape: (K,)
-    neighbors_id: np.ndarray,                # shape: (K,)
+    neighbor_agents_past: np.ndarray,  # shape: (K, T, 11)
+    agents_cur_frame_indices: np.ndarray,  # shape: (K,)
+    neighbors_id: np.ndarray,  # shape: (K,)
     *,
     eps: float = 1e-8,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1022,8 +1023,7 @@ def _filter_out_neighbors_not_present_at_current(
         )
     if agents_cur_frame_indices.ndim != 1 or neighbors_id.ndim != 1:
         raise ValueError(
-            "`agents_cur_frame_indices`와 `neighbors_id`는 1차원 배열이어야 합니다."
-        )
+            "`agents_cur_frame_indices`와 `neighbors_id`는 1차원 배열이어야 합니다.")
     if neighbor_agents_past.shape[0] != agents_cur_frame_indices.shape[0] or \
        neighbor_agents_past.shape[0] != neighbors_id.shape[0]:
         raise ValueError(
@@ -1041,7 +1041,8 @@ def _filter_out_neighbors_not_present_at_current(
 
     # current_present_mask: (K,)
     # - 현재 프레임에서 8개 값 중 하나라도 0이 아니면 "존재"
-    current_present_mask: np.ndarray = (np.abs(current_state_8) > eps).any(axis=1)
+    current_present_mask: np.ndarray = (np.abs(current_state_8)
+                                        > eps).any(axis=1)
 
     return (
         neighbor_agents_past[current_present_mask],
@@ -1049,8 +1050,10 @@ def _filter_out_neighbors_not_present_at_current(
         neighbors_id[current_present_mask],
     )
 
+
 def _compute_valid_sorted_indices(
-    all_frame_np_agents_local: np.ndarray,  # shape: (num_frames, current_agents_num, 9)
+    all_frame_np_agents_local: np.
+    ndarray,  # shape: (num_frames, current_agents_num, 9)
     filter_radius: Optional[float],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """filter_radius 를 적용한 뒤, ego와의 거리 기준으로 에이전트 인덱스를 정렬한다.
@@ -1074,15 +1077,15 @@ def _compute_valid_sorted_indices(
             - shape: (current_agents_num,)
             - 각 에이전트의 ego 기준 2D 거리.
     """
-    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[-1] < 9:
+    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[
+            -1] < 9:
         raise ValueError(
             f"`all_frame_np_agents_local`는 (T, N, 9) shape 이어야 합니다. got {all_frame_np_agents_local.shape}"
         )
 
     # 현재 프레임(마지막 프레임 기준)에서 ego까지의 거리: (current_agents_num,)
     dist_from_cur_agent_to_ego: np.ndarray = np.linalg.norm(
-        all_frame_np_agents_local[-1, :, :2], axis=-1
-    )
+        all_frame_np_agents_local[-1, :, :2], axis=-1)
 
     current_agents_num: int = int(all_frame_np_agents_local.shape[1])
 
@@ -1090,11 +1093,13 @@ def _compute_valid_sorted_indices(
     # - [x, y, cos, sin, vx, vy, width, length] 이 전부 0이면 "현재에 없음"
     eps: float = 1e-8
     current_state_8: np.ndarray = all_frame_np_agents_local[-1, :, :8]  # (N, 8)
-    present_mask: np.ndarray = (np.abs(current_state_8) > eps).any(axis=1)  # (N,)
+    present_mask: np.ndarray = (np.abs(current_state_8)
+                                > eps).any(axis=1)  # (N,)
 
     # filter_radius 내의 에이전트만 후보로 사용
     if filter_radius is not None:
-        within_radius = dist_from_cur_agent_to_ego <= float(filter_radius)  # (N,)
+        within_radius = dist_from_cur_agent_to_ego <= float(
+            filter_radius)  # (N,)
         valid_mask = present_mask & within_radius
     else:
         valid_mask = present_mask
@@ -1634,12 +1639,10 @@ def build_neighbor_past_feature(
         if track_id_int not in id_to_token:
             raise KeyError(
                 f"neighbors_id={track_id_int} 가 token_to_id에 존재하지 않습니다. "
-                "ID 정밀도(특히 float 변환) 또는 token_to_id 갱신 흐름을 점검해 주세요."
-            )
+                "ID 정밀도(특히 float 변환) 또는 token_to_id 갱신 흐름을 점검해 주세요.")
         neighbor_track_token.append(id_to_token[track_id_int])
 
     return neighbor_agents_past, agents_cur_frame_indices, neighbors_id, neighbor_track_token
-
 
 
 def agent_future_all_process(

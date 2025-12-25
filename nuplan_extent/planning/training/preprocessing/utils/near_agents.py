@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableMapping, Sequence
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, List
 
 import numpy as np
 
@@ -10,9 +10,16 @@ try:
 except Exception:
     torch = None  # type: ignore[assignment]
 
-
 SampleDict = MutableMapping[str, Any]
 SampleOrBatch = Union[SampleDict, Sequence[SampleDict]]
+
+
+def get_near_track_token(
+    neighbor_track_token: List[str],
+    predicted_neighbor_num: int,
+) -> List[str]:
+    near_track_token = neighbor_track_token[:predicted_neighbor_num]
+    return near_track_token
 
 
 def add_near_agents_info_inplace(
@@ -66,7 +73,8 @@ def add_near_agents_info_inplace(
             - 입력 dict(또는 그 리스트) 내용을 그 자리에서 수정만 합니다.
     """
     if isinstance(samples, MutableMapping):
-        _add_near_agents_info_for_one_sample_inplace(samples, predicted_neighbor_num)
+        _add_near_agents_info_for_one_sample_inplace(samples,
+                                                     predicted_neighbor_num)
         return
 
     if not isinstance(samples, Sequence):
@@ -75,7 +83,8 @@ def add_near_agents_info_inplace(
     for sample in samples:
         if not isinstance(sample, MutableMapping):
             continue
-        _add_near_agents_info_for_one_sample_inplace(sample, predicted_neighbor_num)
+        _add_near_agents_info_for_one_sample_inplace(sample,
+                                                     predicted_neighbor_num)
 
 
 def _add_near_agents_info_for_one_sample_inplace(
@@ -101,7 +110,8 @@ def _add_near_agents_info_for_one_sample_inplace(
     if neighbor_agents_past is None:
         return
 
-    agent_dim = _infer_agent_dim_index_from_neighbor_agents_past(neighbor_agents_past)
+    agent_dim = _infer_agent_dim_index_from_neighbor_agents_past(
+        neighbor_agents_past)
     if agent_dim is None:
         # neighbor_agents_past shape가 (A, T, F) 또는 (B, A, T, F) 형태가 아니면 안전하게 스킵
         return
@@ -159,9 +169,8 @@ def _add_near_agents_info_for_one_sample_inplace(
                 end=near_num,
             )
 
-
-
-    agent_route_lane_order_is_valid = sample.get("agent_route_lane_order_is_valid", None)
+    agent_route_lane_order_is_valid = sample.get(
+        "agent_route_lane_order_is_valid", None)
     if agent_route_lane_order_is_valid is not None:
         expected_ndim = 2 if has_batch_dim else 1
         if _get_ndim(agent_route_lane_order_is_valid) == expected_ndim:
@@ -174,14 +183,10 @@ def _add_near_agents_info_for_one_sample_inplace(
                 start=0,
                 end=near_num,
             )
-    near_agents_past_agent_num = sample['near_agents_past'].shape[agent_dim]
-    near_future_gt_3_dim_agent_num = sample.get('near_future_gt_3_dim', None).shape[agent_dim] if sample.get('near_future_gt_3_dim', None) is not None else None
-    agent_route_lane_order_agent_num = sample.get('agent_route_lane_order', None).shape[agent_dim] if sample.get('agent_route_lane_order', None) is not None else None
-    agent_route_lane_order_is_valid_agent_num = sample.get('agent_route_lane_order_is_valid', None).shape[agent_dim] if sample.get('agent_route_lane_order_is_valid', None) is not None else None
+
 
 def _infer_agent_dim_index_from_neighbor_agents_past(
-    neighbor_agents_past: Any,
-) -> Optional[int]:
+    neighbor_agents_past: Any,) -> Optional[int]:
     """neighbor_agents_past에서 "agent 개수"가 들어있는 방향(차원 인덱스)을 추정합니다.
 
     지원하는 입력 shape

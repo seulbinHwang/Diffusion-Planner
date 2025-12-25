@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from diffusion_planner.utils.normalizer import StateNormalizer
 from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks
+
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
@@ -764,9 +765,6 @@ def _assert_cur_future_valid_mask(
             f"example (b,p)={list(zip(b_list, p_list))}.  \n"
             f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
         )
-
-
-
 
 
 def diffusion_loss_func(

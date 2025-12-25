@@ -196,8 +196,9 @@ class Simulation:
             ego_state : EgoState
             trajectory : AbstractTrajectory
             """
-            self._ego_controller.update_state(iteration, next_iteration,
-                                              ego_state, trajectory)
+            self._ego_controller.update_state(
+                iteration, next_iteration, self._observations.updated_ego_state,
+                self._observations.ego_trajectory)
 
         # Append new state into history buffer
         self._history_buffer.append(self._ego_controller.get_state(),
