@@ -589,20 +589,28 @@ class DrawInfos:
         """
         self.model_input_key_to_unnorm_value: Dict[str, np.ndarray] = {}
         """
+        딥러닝 output 값 그대로 # (1+T, 11)
+        """
+        self.ego_np_traj_11_wrt_ego: Optional[np.ndarray] = None
+        """
+        딥러닝 적분 출력값 # (1+T, 11)
+        """
+        self.ego_np_int_traj_11_wrt_ego: Optional[np.ndarray] = None
+        """
         딥러닝 output 값 그대로
         """
         self.diff_token_to_np_gen_traj_11_wrt_ego: Dict[str, np.ndarray] = {
-        }  # (T, 11)
+        }  # (1+T, 11)
         """
         딥러닝 적분 출력값
         """
         self.diff_token_to_np_int_traj_wrt_ego: Dict[str,
                                                      np.ndarray] = {}  # (T, 4)
         """
-        딥러닝 적분 출력삽을 11차원으로 
+        딥러닝 적분 출력을 11차원으로 
         """
         self.diff_token_to_np_int_traj_11_wrt_ego: Dict[str, np.ndarray] = {
-        }  # (T, 11)
+        }  # (1+T, 11)
         """
         history Agent 만든걸 -> (History_len, 11) numpy로 변환한 것들
         npc 미래 궤적 보정 input으로 쓰이는걸 그려보기 위해 저장
@@ -610,7 +618,12 @@ class DrawInfos:
         self.diff_token_to_np_history_wrt_ego: Dict[str, np.ndarray] = {
         }  # (History_len, 11)
         """
-        interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
+            interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
+        """
+        self.ego_interp_np_traj_wrt_ego: Optional[np.ndarray] = None
+        # (1 + Future_len, 11)
+        """
+            interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
         """
         self.diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] = {
         }  # (1 + Future_len, 11)
