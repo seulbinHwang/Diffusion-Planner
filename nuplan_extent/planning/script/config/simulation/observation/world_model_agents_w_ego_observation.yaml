@@ -1,4 +1,4 @@
-_target_: nuplan_extent.planning.simulation.observation.world_model_agents.WorldModelAgents
+_target_: nuplan_extent.planning.simulation.observation.world_model_agents_w_ego.WorldModelAgentsWEgo
 _convert_: 'all'
 
 open_loop_detections_types: ["BARRIER", "CZONE_SIGN", "TRAFFIC_CONE", "GENERIC_OBJECT"]  # Open-loop detections to include #"PEDESTRIAN",

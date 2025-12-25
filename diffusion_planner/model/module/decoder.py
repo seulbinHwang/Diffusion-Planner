@@ -1046,7 +1046,7 @@ class Decoder(nn.Module):
         route_known_mask: torch.Tensor = encoder_outputs[
             "route_known_mask"]  # (B, Pnn) bool
         if self.config.do_ego_predict:
-            # TODO: 나중에는 ego도 제대로 처리
+            # TODO: 나중에는 ego도 제대로 처리 ( _build_target_future_tensors_and_masks 으로 ? )
             ego_route_lane_emb = torch.zeros(
                 (batch_size, 1, near_agents_route_lane_emb.shape[-1]),
                 dtype=near_agents_route_lane_emb.dtype,

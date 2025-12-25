@@ -173,7 +173,7 @@ class WorldModelFeature(AbstractModelFeature):
     ########### SAME AS LEARNING INPUT ###########
     ego_agent_past: FeatureDataType  # (time_len, 11)
     neighbor_agents_past: FeatureDataType  # (max_agent_num, time_len, 11)
-
+    target_future_valid: FeatureDataType # (B, (1 +) Pnn, future_len)
     ########### SAME AS LEARNING INPUT ###########
     lanes: FeatureDataType  # (lane_num, lane_len, 12)
     lanes_speed_limit: FeatureDataType  # (lane_num, 1)
