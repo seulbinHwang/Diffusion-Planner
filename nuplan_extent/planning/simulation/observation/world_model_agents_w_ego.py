@@ -236,6 +236,39 @@ def waypoint_to_numpy10(waypoint: Waypoint,
     assert vector.shape == (10,), f"Expected shape (10,), got {vector.shape}"
     return vector
 
+def ego_state_to_numpy10(ego_state: EgoState,
+                         *,
+                         velocity_fill: float = 0.0
+                         ) -> np.ndarray:
+    center = ego_state.center
+    width = ego_state.car_footprint.width
+    length = ego_state.car_footprint.length
+
+    if ego_state.dynamic_car_state.center_velocity_2d is None:
+        v_x = float(velocity_fill)
+        v_y = float(velocity_fill)
+    else:
+        v_x = float(ego_state.dynamic_car_state.center_velocity_2d.x)
+        v_y = float(ego_state.dynamic_car_state.center_velocity_2d.y)
+
+    vector = np.array(
+        [
+            float(center.x),  # x
+            float(center.y),  # y
+            float(center.heading),  # yaw [rad]
+            v_x,  # v_x [m/s]
+            v_y,  # v_y [m/s]
+            float(width),  # width [m]
+            float(length),  # length [m]
+            1.0,  # constant
+            0.0,  # constant
+            0.0,  # constant
+        ],
+        dtype=np.float64,
+    )
+    # 안전 확인: (10,) 보장
+    assert vector.shape == (10,), f"Expected shape (10,), got {vector.shape}"
+    return vector
 
 def observations_to_agents_buffer(
         observations_buffer: Deque[Observation],
@@ -1189,6 +1222,8 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             # updated_ego_state: EgoState
             updated_ego_state = self.ego_trajectory.get_state_at_time(
                 next_iteration.time_point)
+            self._draw_infos.ego_next_wp_wrt_ego = self._get_new_local_ego_state_array_to_draw(
+                updated_ego_state, cur_ego_global_xyyaw)  # (11)
 
         # [NEW] 1) GT(ego frame) → Global frame 변환
         gt_global: Dict[str, np.ndarray] = {}
@@ -1241,6 +1276,22 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         self._agents = diff_token_to_updated_agent
         self._draw_infos.diff_token_to_next_wp_wrt_ego = diff_token_to_next_wp_wrt_ego
         return updated_ego_state
+
+
+    def _get_new_local_ego_state_array_to_draw(
+            self,
+            updated_ego_state: EgoState,
+            cur_ego_global_xyyaw: np.ndarray  # shape (3,)
+    ):
+        new_ego_state_array = ego_state_to_numpy10(updated_ego_state).reshape(
+            1, -1)  # (1, 10)
+        # new_local_ego_state_array: (1, 11)
+        new_local_ego_state_array = convert_absolute_quantities_to_relative(
+            new_ego_state_array,
+            cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)
+        # (1, 11) -> (11,)
+        new_local_ego_state_array = new_local_ego_state_array.reshape(-1)
+        return new_local_ego_state_array
 
     def _get_new_local_waypoint_array_to_draw(
             self,
@@ -1454,7 +1505,8 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
                 trajectory=self.outputs_to_ego_trajectory(
                     ego_np_gen_traj_wrt_ego, self.ego_state_buffer))
             # TODO: _get_rel_future_arrays_to_draw 이거 고쳐야함
-            self._draw_infos.ego_interp_np_traj_wrt_ego = self._get_rel_future_arrays_to_draw(
+            # (1 + Future_len, 11)
+            self._draw_infos.ego_interp_np_traj_wrt_ego = self._get_ego_rel_future_arrays_to_draw(
                     self.ego_trajectory, cur_ego_global_xyyaw)
 
         # diff_token_to_interpol_traj: Dict[str, AbstractTrajectory]
@@ -1464,6 +1516,24 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         self.updated_ego_state = self._update_diffusion_agents(
             diff_token_to_interpol_traj, next_iteration, cur_ego_global_xyyaw,
             diff_token_to_future_all_gt_3_dim)
+
+    def _get_ego_rel_future_arrays_to_draw(
+            self,
+            future_trajectory: InterpolatedTrajectory,
+            cur_ego_global_xyyaw: np.ndarray,  # shape (3,)
+    ):
+        future_egostates: List[
+            EgoState] = future_trajectory.get_sampled_trajectory()
+        global_future_arrays = [
+            ego_state_to_numpy10(wp) for wp in future_egostates
+        ]  # List[(10,)]
+        global_future_arrays = np.stack(global_future_arrays,
+                                        axis=0)  # (1+T, 10)
+        # rel_future_arrays: (1+T, 11)
+        rel_future_arrays = convert_absolute_quantities_to_relative(
+            global_future_arrays,
+            cur_ego_global_xyyaw)  # cur_ego_global_xyyaw: (3,)
+        return rel_future_arrays
 
     def _infer_model(self, features: FeaturesType) -> TargetsType:
         pass

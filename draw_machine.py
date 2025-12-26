@@ -627,6 +627,12 @@ class DrawInfos:
         """
         self.diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] = {
         }  # (1 + Future_len, 11)
+
+        """
+        interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
+        """
+        self.ego_next_wp_wrt_ego: Optional[np.ndarray] = None # (11,)
+
         """
         interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
         """
