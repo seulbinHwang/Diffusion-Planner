@@ -173,6 +173,7 @@ class DrawingOptions:
     EGO_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = False
+    EGO_draw_diffusion: bool = True 
     EGO_next_11_dim_style = {
         "line_color": LIGHT_CYAN,
         "line_width": 0.4,
@@ -630,6 +631,10 @@ class DrawInfos:
 
         """
         interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
+        
+        EGO_draw_ego_agent_next_11_dim = True일 떄, 
+            EGO_draw_diffusion = True이면, ego_next_wp_wrt_ego 로 그림그리고, (+assert not None)
+            EGO_draw_diffusion = False이면, ego_agent_next_11_dim 로 그림그리자.
         """
         self.ego_next_wp_wrt_ego: Optional[np.ndarray] = None # (11,)
 
@@ -641,6 +646,9 @@ class DrawInfos:
     def to_dict(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         input_data = self.model_input_key_to_unnorm_value
         output_data = {
+            "ego_np_traj_11_wrt_ego":
+                self.ego_np_traj_11_wrt_ego,
+            "ego_np_int_traj_11_wrt_ego": self.ego_np_int_traj_11_wrt_ego,
             "diff_token_to_np_gen_traj_11_wrt_ego":
                 self.diff_token_to_np_gen_traj_11_wrt_ego,
             "diff_token_to_np_int_traj_wrt_ego":
@@ -649,8 +657,12 @@ class DrawInfos:
                 self.diff_token_to_np_int_traj_11_wrt_ego,
             "diff_token_to_np_history_wrt_ego":
                 self.diff_token_to_np_history_wrt_ego,
+            "ego_interp_np_traj_wrt_ego": 
+            self.ego_interp_np_traj_wrt_ego,
             "diff_token_to_interp_np_traj_wrt_ego":
                 self.diff_token_to_interp_np_traj_wrt_ego,
+            "ego_next_wp_wrt_ego":
+                self.ego_next_wp_wrt_ego,
             "diff_token_to_next_wp_wrt_ego":
                 self.diff_token_to_next_wp_wrt_ego,
         }
@@ -3851,11 +3863,17 @@ def get_agent_idx_from_tokens(
 
 
 def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
+             output_data: WorldModelFeature,
              draw_option: DrawingOptions):
     if draw_option.EGO_draw_ego_past:
         draw_ego_past(ax, input_data.get("ego_agent_past"), draw_option)
     if draw_option.EGO_draw_ego_agent_next_11_dim:
-        draw_ego_agent_next_11_dim(ax, input_data.get("ego_agent_next_11_dim"),
+        if draw_option.EGO_draw_diffusion:
+            input_data_ = input_data.get("ego_next_wp_wrt_ego")
+            assert input_data_ is not None
+        else:
+            input_data_ = input_data.get("ego_agent_next_11_dim")
+        draw_ego_agent_next_11_dim(ax, input_data_,
                                    draw_option)
     ### [EGO FUTURE PLANNER] ###
     if draw_option.EGO_draw_planner_future_11_dim:
@@ -4096,7 +4114,7 @@ def draw_world_model_to_png(
     )
 
     draw_road_safety(ax, input_data, draw_option)
-    draw_ego(ax, input_data, draw_option)
+    draw_ego(ax, input_data, output_data, draw_option)
     # NEW: ego 주변 반경 원
     draw_ego_radius_circle(ax, draw_option)
     draw_neighbor(ax, input_data, output_data, draw_option, draw_token_list)
