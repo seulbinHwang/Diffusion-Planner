@@ -3,6 +3,7 @@ import logging
 import pathlib
 from concurrent.futures import Future
 from typing import List, Optional, Union, Tuple
+from nuplan_extent.planning.simulation.observation.world_model_agents_w_ego import WorldModelAgentsWEgo
 from nuplan_extent.planning.simulation.observation.world_model_agents import WorldModelAgents
 from nuplan_extent.planning.simulation.observation.world_model_log_replay import WorldModelLogReplay
 import cv2
@@ -302,7 +303,7 @@ class SimulationFeatureVideoCallback(AbstractCallback):
 
             # 각 스텝의 렌더링 저장 경로를 Planner/Observation에 전달
             if isinstance(setup.observations,
-                          (WorldModelAgents, WorldModelLogReplay)):
+                          (WorldModelAgents, WorldModelLogReplay, WorldModelAgentsWEgo)):
                 setup.observations.set_vis_features(
                     is_vis_features=True,
                     vis_features_path=feature_log_directory /

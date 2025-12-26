@@ -35,25 +35,25 @@ def build_observations(observation_cfg: DictConfig,
                 strict=False)
             model = lmw.model
         except KeyError as e:
-            if "pytorch-lightning_version" not in str(e):
-                raise
-            # 순수 state_dict(.pth 등) 로딩 폴백
-            ckpt = torch.load(observation_cfg.checkpoint_path,
-                              map_location="cpu")
-            state = ckpt.get("state_dict", ckpt)
-
-            # 접두사 정리: 'model.' / 'module.' 제거
-            new_state = {}
-            for k, v in state.items():
-                nk = k
-                if nk.startswith("model."):
-                    nk = nk[len("model."):]
-                if nk.startswith("module."):
-                    nk = nk[len("module."):]
-                new_state[nk] = v
-
-            missing, unexpected = torch_module_wrapper.load_state_dict(
-                new_state, strict=False)
+            # if "pytorch-lightning_version" not in str(e):
+            #     raise
+            # # 순수 state_dict(.pth 등) 로딩 폴백
+            # ckpt = torch.load(observation_cfg.checkpoint_path,
+            #                   map_location="cpu")
+            # state = ckpt.get("state_dict", ckpt)
+            #
+            # # 접두사 정리: 'model.' / 'module.' 제거
+            # new_state = {}
+            # for k, v in state.items():
+            #     nk = k
+            #     if nk.startswith("model."):
+            #         nk = nk[len("model."):]
+            #     if nk.startswith("module."):
+            #         nk = nk[len("module."):]
+            #     new_state[nk] = v
+            #
+            # missing, unexpected = torch_module_wrapper.load_state_dict(
+            #     new_state, strict=False)
             model = torch_module_wrapper
 
         # Remove config elements that are redundant to MLPlanner

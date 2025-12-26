@@ -31,6 +31,7 @@ ARGS_FOR_GET_ARGS=(
   --use_feasible_dl true
   --use_feasible_filter true
   --use_integration_trajectory true
+  --save_image true
   --normalization_file_path "${PROJECTS_DIR}/Diffusion-Planner/normalization.json"
 )
 

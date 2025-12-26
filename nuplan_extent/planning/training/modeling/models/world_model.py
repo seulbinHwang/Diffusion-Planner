@@ -50,13 +50,17 @@ class WorldModel(TorchModuleWrapper):
             else:
                 if "model" in state_dict.keys():
                     state_dict = state_dict['model']
-            # use for ddp
             model_state_dict = {
                 k[len("module."):]: v
                 for k, v in state_dict.items()
                 if k.startswith("module.")
             }
-            self._planner.load_state_dict(model_state_dict)
+            if len(model_state_dict) == 0:
+                state_dict_ = state_dict
+            else:
+                state_dict_ = model_state_dict
+
+            self._planner.load_state_dict(state_dict_)
         else:
             raise RuntimeError("No checkpoint path provided")
 
