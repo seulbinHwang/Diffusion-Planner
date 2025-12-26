@@ -2141,8 +2141,11 @@ def convert_data_dict_to_device_tensors(
         # 3) 파이썬 bool 스칼라
         elif isinstance(v, (bool, np.bool_)):
             t = torch.tensor(v, dtype=torch.bool, device=device)
-
-        # 4) 나머지(리스트/스칼라 등): as_tensor로 한 번에
+        # 4) none type 처리
+        elif v is None:
+            # ego_agent_next_11_dim # planner_future_11_dim
+            continue
+        # 5) 나머지(리스트/스칼라 등): as_tensor로 한 번에
         else:
             t = torch.as_tensor(v, dtype=torch.float32, device=device)
 

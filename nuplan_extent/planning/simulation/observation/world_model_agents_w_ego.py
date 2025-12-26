@@ -842,6 +842,9 @@ class WorldModelAgentsWEgo(AbstractMLAgents):
 
             planner_future_11_dim[valid_future_len:, :] = 0.0
             planner_future_11_dim = planner_future_11_dim.astype(np.float32)
+            if not self.use_ego_plan:
+                # x, y, cos, sin, vx, vy, width, length, is_vehicle, 0, 0
+                planner_future_11_dim[:, :7] = 0.0
 
         return planner_future_11_dim
 
@@ -947,9 +950,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         planner_future_11_dim: Optional[
             np.ndarray] = self._from_ego_fut_traj_to_np(ego_future_trajectory,
                                                         self._ego_anchor_state)
-        if not self.use_ego_plan:
-            # x, y, cos, sin, vx, vy, width, length, is_vehicle, 0, 0
-            planner_future_11_dim[:, :7] = 0.0
+
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # near_track_token_dist_order: List[str] # len = "Pnn 이하의 길이"
         (model_input_key_to_value, near_track_token_dist_order,
@@ -1383,18 +1384,16 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             ego_np_traj_wrt_ego = future_np_trajs_wrt_ego[0, 1:, :]  # (T, 4)
             ego_np_int_traj_wrt_ego = future_np_int_trajs_wrt_ego[
                 0, 1:, :]  # (T, 4)
-
             # ego_agent_current: (11)
             ego_np_traj_11_wrt_ego = np.tile(
                 ego_agent_current,
                 (future_np_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
-            ego_np_traj_11_wrt_ego[:, :4] = future_np_trajs_wrt_ego[
-                0, :, :]  # (1+T, 11)
+            ego_np_traj_11_wrt_ego[1:, :4] = ego_np_traj_wrt_ego  # (1+T, 11)
+
             ego_np_int_traj_11_wrt_ego = np.tile(
                 ego_agent_current,
                 (future_np_int_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
-            ego_np_int_traj_11_wrt_ego[:, :4] = future_np_int_trajs_wrt_ego[
-                0, :, :]  # (1+T, 11)
+            ego_np_int_traj_11_wrt_ego[1: , :4] = ego_np_int_traj_wrt_ego  # (1+T, 11)
 
             # 첫 번째 궤적은 ego 궤적이므로 제외
             future_np_trajs_wrt_ego = future_np_trajs_wrt_ego[
@@ -1474,6 +1473,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             ego_agent_current: np.ndarray,  # (11)
     ) -> None:
         self.updated_ego_state = None
+        self.ego_trajectory = None
         model_inputs: AbstractModelFeature = model_input_key_to_value[
             "world_model_feature"]
         # diff_token_to_np_gen_traj_wrt_ego: Dict[str, np.ndarray] # (T, 4) # "Pnn 이하의 길이"
@@ -1504,7 +1504,6 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             self.ego_trajectory: AbstractTrajectory = InterpolatedTrajectory(
                 trajectory=self.outputs_to_ego_trajectory(
                     ego_np_gen_traj_wrt_ego, self.ego_state_buffer))
-            # TODO: _get_rel_future_arrays_to_draw 이거 고쳐야함
             # (1 + Future_len, 11)
             self._draw_infos.ego_interp_np_traj_wrt_ego = self._get_ego_rel_future_arrays_to_draw(
                 self.ego_trajectory, cur_ego_global_xyyaw)
@@ -1525,7 +1524,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         future_egostates: List[
             EgoState] = future_trajectory.get_sampled_trajectory()
         global_future_arrays = [
-            ego_state_to_numpy10(wp) for wp in future_egostates
+            ego_state_to_numpy10(ego_state) for ego_state in future_egostates
         ]  # List[(10,)]
         global_future_arrays = np.stack(global_future_arrays,
                                         axis=0)  # (1+T, 10)

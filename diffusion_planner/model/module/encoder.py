@@ -769,7 +769,6 @@ class Encoder(nn.Module):
             Optional[torch.Tensor],  # road_edge_is_valid: (B, E) bool or None
             Optional[torch.Tensor],  # road_edge_type: (B, E, 3) or None
             int,  # B
-            int,  # future_len
     ]:
         """입력 dict에서 인코더가 쓸 텐서들을 꺼내고 모양을 맞춥니다.
 
@@ -885,10 +884,6 @@ class Encoder(nn.Module):
             if not self.config.use_vel_input:
                 non_near_agents_past[:, :, :, 4:6] = 0.0  # vx, vy
 
-        # --- 3) B / future_len 계산(없으면 0) ---
-        future_len: int = int(planner_future_11_dim.shape[1]
-                             ) if planner_future_11_dim is not None else 0
-
         B: int = 0
         if neighbor_agents_past is not None:
             B = int(neighbor_agents_past.shape[0])
@@ -929,7 +924,6 @@ class Encoder(nn.Module):
             road_edge_is_valid,
             road_edge_type,
             B,
-            future_len,
         )
 
     def _compute_ego_future_trajectory(
@@ -938,6 +932,7 @@ class Encoder(nn.Module):
         B: int,
         future_len: int,
         device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
         """훈련/추론 모드에 맞게 ego_future_trajectory 를 만든다.
 
@@ -961,7 +956,7 @@ class Encoder(nn.Module):
             ego_future_trajectory = torch.zeros(
                 (B, future_len, 11),
                 device=device,
-                dtype=planner_future_11_dim.dtype,
+                dtype=dtype,
             )
             return ego_future_trajectory
         if self.training:
@@ -990,7 +985,7 @@ class Encoder(nn.Module):
                 ego_future_trajectory = torch.zeros(
                     (B, future_len, 11),
                     device=device,
-                    dtype=planner_future_11_dim.dtype,
+                    dtype=dtype,
                 )
 
         # 속도 입력을 쓰지 않으면 ego 미래의 vx, vy 도 0으로 맞춘다.
@@ -1560,15 +1555,15 @@ class Encoder(nn.Module):
                 road_edge_is_valid,  # (B, road_edge_num) or None
                 road_edge_type,  # (B, road_edge_num, 3) or None
                 B,
-                future_len,
             ) = self._prepare_encoder_inputs(inputs)
-
+            future_len = self.config.future_len
             # ---- (2) ego_future_trajectory 생성 (훈련/추론 모드에 따라) ----
             ego_future_trajectory: torch.Tensor = self._compute_ego_future_trajectory(
                 planner_future_11_dim=planner_future_11_dim,
                 B=B,
                 future_len=future_len,
-                device=planner_future_11_dim.device,
+                device=ego_agent_past.device,
+                dtype=ego_agent_past.dtype,
             )  # (B, future_len, 11)
 
             # ---- (3) agents/static/lanes 인코딩 ----

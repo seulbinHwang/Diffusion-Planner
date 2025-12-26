@@ -829,12 +829,6 @@ class DataProcessor(object):
             past_cur_ego_world_10=past_cur_ego_world_10,
             ego_cur_pose_np=ego_cur_pose_np,
         )
-
-        # ✅ (요구조건 c) observation_adapter에서는 ego_agent_past만 출력하므로,
-        #    ego_agent_past 자체에서 “유효-무효-유효”가 생기지 않게 정리
-        ego_agent_past = self._enforce_no_invalid_between_valid_in_ego_past(
-            ego_agent_past=ego_agent_past)
-
         # Past observations including the current
         observation_buffer: Deque[
             Observation] = history_buffer.observation_buffer
@@ -908,7 +902,6 @@ class DataProcessor(object):
             ego_cur_pose_np=ego_cur_pose_np,
             filter_radius=self._get_effective_filter_radius_m(),
         )
-
         key_to_array = {
             "ego_agent_past": ego_agent_past,  # (time_len, 11)
             "neighbor_agents_past": neighbor_agents_past,
@@ -967,6 +960,7 @@ class DataProcessor(object):
             key_to_array, device, squeeze)
 
         key_to_array["neighbor_track_token"] = neighbor_track_token
+
         return key_to_array
 
     @staticmethod
@@ -1782,6 +1776,17 @@ class DataProcessor(object):
                                              stats_payload)
 
             final_file_name = f"{key_to_array['map_name']}_{key_to_array['token']}"
+            ego_agent_past = key_to_array["ego_agent_past"]  # (time_len, 11)
+            ego_agent_type = ego_agent_past[:, 8:11]  # (time_len, 3)
+            print("ego_agent_type sum all: ",
+                  ego_agent_type.sum(axis=0))  # (3, )
+            ego_future_gt_11_dim = key_to_array[
+                "ego_future_gt_11_dim"]  # (future_len, 11)
+            ego_agent_type_future = ego_future_gt_11_dim[:, 8:
+                                                         11]  # (future_len, 3)
+            print("ego_agent_type_future sum all: ",
+                  ego_agent_type_future.sum(axis=0))  # (3, )
+
             self.save_to_disk(self._save_dir, final_file_name, key_to_array)
 
             key_to_array["neighbor_track_token"] = neighbor_track_token

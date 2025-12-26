@@ -344,8 +344,8 @@ class Decoder(nn.Module):
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self.dit(
             xT_input_flat,  # (B, (1+)Pnn, F)
-            target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
             diffusion_time,  # (B,)
+            target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
             scene_encoding_token,  # (B, token_num, D)
             ego_fut_global,  # (B, D)
             target_agents_route_lane_emb,  # (B, Pnn, D)
@@ -1490,8 +1490,8 @@ class Decoder(nn.Module):
 
         unnorm_integrated: torch.Tensor = self._state_normalizer.inverse(
             integrated_trajectory)
+
         unnorm_integrated[target_current_mask] = 0.0
-        # (B, (1+)Pnn, 1+T, 4)
         outputs["integrated_trajectory"] = unnorm_integrated
 
     def _forward_training_mode(
@@ -1598,6 +1598,7 @@ class Decoder(nn.Module):
         B: int = batch_size
 
         # 1) 시작 노이즈 생성 (미래만)
+
         noise: torch.Tensor = self._sample_inference_noise(
             target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
             batch_size=B,
@@ -2350,9 +2351,9 @@ class DiT(nn.Module):
         self,
         target_input_norm_xT: torch.
         Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        diffusion_time: torch.Tensor,  # (B,)
         target_agents_past: torch.
         Tensor,  # (B, (1+)Pnn, time_len(=past_len+1), 11)
-        diffusion_time: torch.Tensor,  # (B,)
         cross_c: torch.Tensor,  # (B, token_num, D)
         ego_fut_global: torch.Tensor,  # (B, D)
         target_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)

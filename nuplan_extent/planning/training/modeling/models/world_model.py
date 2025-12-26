@@ -76,6 +76,7 @@ class WorldModel(TorchModuleWrapper):
             "target_future_valid"] = build_target_future_tensors_and_masks_for_inference(
                 self.config,
                 inputs,
+            self.config.future_len,
             )  # (B, (1+)Pnn, future_len)  True=유효
 
         with torch.no_grad():
@@ -86,22 +87,11 @@ class WorldModel(TorchModuleWrapper):
             "score" : (B, Pnn, 1+T, 4)
         """
         npc_future_trajectories = outputs["score"]  # (B, Pnn, 1+T, 4)
-        assert npc_future_trajectories.shape == (
-            1,
-            self.config.predicted_neighbor_num,
-            1 + self.config.future_len,
-            4,
-        )
         npc_integrated_trajectories = outputs.get(
             "integrated_trajectory")  # (B, Pnn, 1+T, 4)
+
         if npc_integrated_trajectories is None:
             return npc_future_trajectories, None
-        assert npc_integrated_trajectories.shape == (
-            1,
-            self.config.predicted_neighbor_num,
-            1 + self.config.future_len,
-            4,
-        )
         npc_future_trajectories = npc_future_trajectories.squeeze(
             0)  # (Pnn, 1+T, 4)
         npc_integrated_trajectories = npc_integrated_trajectories.squeeze(

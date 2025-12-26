@@ -64,7 +64,7 @@ class Simulation:
         # of 1.9s. At 21 steps the duration will achieve the target 2s duration.
         a = int(self._simulation_history_buffer_duration /
                 self._scenario.database_interval)
-        self._history_buffer_size = a + 1
+        self._history_buffer_size = a
         self._history_buffer: Optional[SimulationHistoryBuffer] = None
 
         # Flag that keeps track whether simulation is still running
@@ -115,6 +115,7 @@ class Simulation:
         # Add the current state into the history buffer
         self._history_buffer.append(self._ego_controller.get_state(),
                                     self._observations.get_observation())
+
         return PlannerInitialization(
             route_roadblock_ids=self._scenario.get_route_roadblock_ids(),
             mission_goal=self._scenario.get_mission_goal(),
@@ -191,7 +192,6 @@ class Simulation:
         else:
             self._is_simulation_running = False
         if isinstance(self._observations, WorldModelAgentsWEgo):
-            # TODO: ego_state와 trajectory를 WorldModelAgentsWEgo 에서 가져오도록 수정 필요
             """
             ego_state : EgoState
             trajectory : AbstractTrajectory

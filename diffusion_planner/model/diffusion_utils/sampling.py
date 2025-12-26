@@ -27,10 +27,11 @@ def dpm_sampler(model: torch.nn.Module,
             model_fn,
             noise_schedule,
             algorithm_type="dpmsolver++",
-            **dpm_solver_params)  # w.o. dynamic thresholding
+            **dpm_solver_params)  # w.o. dynamic thresholding # correcting_xt_fn
 
         # Steps in [10, 20] can generate quite good samples.
         # And steps = 20 can almost converge.
+        # ERROR
         sample_dpm = dpm_solver.sample(x_T,
                                        steps=diffusion_steps,
                                        order=2,

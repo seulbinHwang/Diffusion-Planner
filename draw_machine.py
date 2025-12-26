@@ -84,7 +84,7 @@ class DrawingOptions:
     background_color: str = BLACK
     show_axis: bool = False
     fig_size: Tuple[float, float] = (13.0, 13.0)
-    dpi: int = 600
+    dpi: int = 300
     margin_m: float = 5.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
@@ -170,11 +170,11 @@ class DrawingOptions:
     EGO_radius_circle_line_width: float = 0.8  # 원 테두리 두께
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    EGO_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
-    EGO_draw_ego_agent_next_11_dim: bool = False
+    EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_draw_diffusion: bool = True
-    EGO_draw_diffusion_mode = "interp"  # "direct" / "integrate" / "interp"
+    EGO_draw_diffusion_mode = "integrate"  # "direct" / "integrate" / "interp"
     EGO_next_11_dim_style = {
         "line_color": LIGHT_CYAN,
         "line_width": 0.4,
@@ -193,7 +193,7 @@ class DrawingOptions:
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
-    EGO_draw_planner_velocity: bool = True  # check
+    EGO_draw_planner_velocity: bool = False  # check
     ########## [EGO] FUTURE EGO GT 11 ##########
     EGO_draw_ego_future_gt_11_dim: bool = True
     EGO_future_gt_11_style = {
@@ -242,7 +242,7 @@ class DrawingOptions:
             "velocity_line_width": 0.2,
         },
     }
-    NEI_draw_past_token: bool = True
+    NEI_draw_past_token: bool = False
     NEI_past_token_place_offset_m: float = 0.5
     NEI_past_token_color: str = CYAN  # TODO
     NEI_past_token_fontsize: int = 3
@@ -258,15 +258,15 @@ class DrawingOptions:
     NEI_neighbor_past_output_token_fontsize = 2
     ########################
     ######### [NEIGHBOR] FUTURE GT #############
-    DIFF_draw_diff_future_gt_3_dim: bool = False
+    DIFF_draw_diff_future_gt_3_dim: bool = True
     # NEW: neighbor_future_gt_3_dim (numpy 버전) on/off
-    DIFF_draw_future_gt_3_dim_wo_token: bool = True
+    DIFF_draw_future_gt_3_dim_wo_token: bool = False
     DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
     DIFF_future_gt_3_dim_COLOR: str = DARK_BROWN  # 미래 포인트 'x' 마커 크기
 
     # NEW: GT 3차원 궤적 그리기 모드 ("point" / "line" / "arrow")
     DIFF_future_gt_3_dim_draw_mode: str = "line"
-    DIFF_future_gt_3_dim_line_width: float = 0.8
+    DIFF_future_gt_3_dim_line_width: float = 0.4
     DIFF_future_gt_3_dim_arrow_len_m: float = 1.0
 
     DIFF_draw_diff_future_gt_3_dim_token: bool = False
@@ -283,14 +283,14 @@ class DrawingOptions:
     ######## [NEIGHBOR] FUTURE OUTPUT ##########
     DIFF_draw_diff_future_gen_traj: bool = True
     DIFF_draw_diff_future_gen_traj_token: bool = False
-    DIFF_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    DIFF_future_traj_draw_mode: str = "line"  # 'rectangle' / 'arrow'/ 'point' / 'line'
     DIFF_future_gen_traj_point_marker: str = "o"
     DIFF_future_gen_traj_point_marker_size: float = 0.8
     DIFF_future_gen_traj_arrow_len_m: float = 1.0
     DIFF_future_gen_style = {
         "line_color": WHITE,  # 빨간색(밝은 빨강)
         "token_color": WHITE,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
+        "line_width": 0.5,
         "velocity_line_color": WHITE,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
@@ -301,7 +301,7 @@ class DrawingOptions:
     DIFF_future_int_style = {
         "line_color": RED,  # 빨간색(밝은 빨강)
         "token_color": RED,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
+        "line_width": 0.6,
         "velocity_line_color": RED,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
@@ -321,11 +321,11 @@ class DrawingOptions:
 
     DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
 
-    DIFF_draw_diff_interp_np_traj_11: bool = True
+    DIFF_draw_diff_interp_np_traj_11: bool = False
     DIFF_future_interp_style = {
         "line_color": GREEN,  # 빨간색(밝은 빨강)
         "token_color": GREEN,  # 빨간색(밝은 빨강)
-        "line_width": 0.2,
+        "line_width": 0.7,
         "velocity_line_color": GREEN,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
@@ -333,7 +333,6 @@ class DrawingOptions:
     DIFF_draw_diff_interp_np_traj_11_vel: bool = False
 
     ########################
-    DIFF_draw_diff_future_gen_refined_traj: bool = True
     DIFF_future_gen_refined_style = {
         "line_color": RED,  # 빨간색(밝은 빨강)
         "line_width": 0.2,
@@ -341,7 +340,6 @@ class DrawingOptions:
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }
-    DIFF_draw_future_gen_refined_velocity: bool = True
     DIFF_future_gen_refined_velocity_offset_m: float = 0.3
     DIFF_future_gen_refined_velocity_font_size = 5
     DIFF_future_gen_refined_token_offset_m: float = 0.3  # y축으로 살짝 아래(미터 단위)
@@ -3706,10 +3704,12 @@ def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
     if draw_option.EGO_draw_ego_agent_next_11_dim:
         if draw_option.EGO_draw_diffusion:
             ego_next_state = output_data.get("ego_next_wp_wrt_ego")
-            assert ego_next_state is not None
+            if ego_next_state is not None:
+                ego_next_state = ego_next_state[None, ...]  # (1, 11)
         else:
             ego_next_state = input_data.get("ego_agent_next_11_dim")
-        draw_ego_agent_next_11_dim(ax, ego_next_state, draw_option)
+        if ego_next_state is not None:
+            draw_ego_agent_next_11_dim(ax, ego_next_state, draw_option)
     ### [EGO FUTURE PLANNER] ###
     if draw_option.EGO_draw_planner_future_11_dim:
         if draw_option.EGO_draw_diffusion:
@@ -3718,20 +3718,24 @@ def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
             elif draw_option.EGO_draw_diffusion_mode == "integrate":
                 ego_future_11_dim = output_data.get(
                     "ego_np_int_traj_11_wrt_ego")
+
             elif draw_option.EGO_draw_diffusion_mode == "interp":
                 ego_future_11_dim = output_data.get(
                     "ego_interp_np_traj_wrt_ego")
+
             else:
                 raise ValueError(
                     f"Unsupported EGO_draw_diffusion_mode: {draw_option.EGO_draw_diffusion_mode}"
                 )
-            assert ego_future_11_dim is not None
         else:
             ego_future_11_dim = input_data.get("planner_future_11_dim", None)
-        draw_planner_future_11_dim(ax, ego_future_11_dim, draw_option)
+        if ego_future_11_dim is not None:
+            draw_planner_future_11_dim(ax, ego_future_11_dim, draw_option)
     ### [EGO FUTURE GT 11] ###
     if draw_option.EGO_draw_ego_future_gt_11_dim:
         data_ = input_data.get("ego_future_gt_11_dim", None)
+        if data_ is None:
+            print("[Warning] draw_ego: 'ego_future_gt_11_dim' is None.")
         draw_ego_future_gt_11_dim(ax, data_, draw_option)
 
 

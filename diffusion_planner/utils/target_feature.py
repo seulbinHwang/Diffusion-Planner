@@ -5,6 +5,7 @@ import torch
 def build_target_future_tensors_and_masks_for_inference(
     args,
     norm_inputs: Dict[str, torch.Tensor],
+    future_len: int,
 ):
     near_agents_past = norm_inputs["near_agents_past"]  # (B, Pnn, time_len, 11)
     near_agents_current = near_agents_past[:, :, -1, :]  # (B, Pnn, 11)
@@ -12,7 +13,6 @@ def build_target_future_tensors_and_masks_for_inference(
     near_agents_current_valid = torch.sum(torch.ne(near_agents_current[..., :8],
                                                    0),
                                           dim=-1) != 0  # (B, Pnn) True=유효
-    future_len = norm_inputs["planner_future_11_dim"].shape[1]
     if not args.do_ego_predict:
         # target_future_valid: (B, Pnn, future_len)  True=유효
         """ target_future_valid 만드는 법

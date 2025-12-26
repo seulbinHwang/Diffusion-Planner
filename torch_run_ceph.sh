@@ -50,6 +50,9 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
+  --resume_wandb_model_name latest \
+  --resume_model_only False \
+  --past_name "nuplan_womd" \
   --name "nuplan_womd" \
   --batch_size 1024 \
   --use_deepspeed True \

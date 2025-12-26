@@ -218,6 +218,10 @@ class WorldModelFeatureBuilder(AbstractFeatureBuilder):
         # unnormalized_features 저장 (torch -> numpy)
         self.unnormalized_features = {}
         for key, value in model_inputs.items():
+            #
+            if value is None:
+                # ego_future_gt_is_valid / speed_bump_is_valid / driveway_is_valid / road_edge_is_valid
+                continue
             self.unnormalized_features[key] = value.detach().cpu().numpy()
 
         self.unnormalized_features[
