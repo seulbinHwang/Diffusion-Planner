@@ -173,7 +173,8 @@ class DrawingOptions:
     EGO_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = False
-    EGO_draw_diffusion: bool = True 
+    EGO_draw_diffusion: bool = True
+    EGO_draw_diffusion_mode = "interp"  # "direct" / "integrate" / "interp"
     EGO_next_11_dim_style = {
         "line_color": LIGHT_CYAN,
         "line_width": 0.4,
@@ -259,9 +260,9 @@ class DrawingOptions:
     ######### [NEIGHBOR] FUTURE GT #############
     DIFF_draw_diff_future_gt_3_dim: bool = False
     # NEW: neighbor_future_gt_3_dim (numpy 버전) on/off
-    DIFF_draw_diff_np_future_gt_3_dim: bool = True
+    DIFF_draw_future_gt_3_dim_wo_token: bool = True
     DIFF_future_gt_3_dim_marker_size: float = 0.4  # 미래 포인트 'x' 마커 크기
-    DIFF_future_gt_3_dim_COLOR: str =  DARK_BROWN  # 미래 포인트 'x' 마커 크기
+    DIFF_future_gt_3_dim_COLOR: str = DARK_BROWN  # 미래 포인트 'x' 마커 크기
 
     # NEW: GT 3차원 궤적 그리기 모드 ("point" / "line" / "arrow")
     DIFF_future_gt_3_dim_draw_mode: str = "line"
@@ -319,6 +320,17 @@ class DrawingOptions:
     DIFF_draw_diff_future_int_traj_to_be_vel: bool = False
 
     DIFF_future_gen_trak_token_text_y_offset_m: float = 0.5
+
+    DIFF_draw_diff_interp_np_traj_11: bool = True
+    DIFF_future_interp_style = {
+        "line_color": GREEN,  # 빨간색(밝은 빨강)
+        "token_color": GREEN,  # 빨간색(밝은 빨강)
+        "line_width": 0.2,
+        "velocity_line_color": GREEN,  # 빨간색(밝은 빨강)
+        "velocity_line_alpha": 0.8,
+        "velocity_line_width": 0.4,
+    }
+    DIFF_draw_diff_interp_np_traj_11_vel: bool = False
 
     ########################
     DIFF_draw_diff_future_gen_refined_traj: bool = True
@@ -605,8 +617,8 @@ class DrawInfos:
         """
         딥러닝 적분 출력값
         """
-        self.diff_token_to_np_int_traj_wrt_ego: Dict[str,
-                                                     np.ndarray] = {}  # (T, 4)
+        self.diff_token_to_np_int_traj_wrt_ego: Dict[str, np.ndarray] = {
+        }  # (1+T, 4)
         """
         딥러닝 적분 출력을 11차원으로 
         """
@@ -620,6 +632,10 @@ class DrawInfos:
         }  # (History_len, 11)
         """
             interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
+            
+        EGO_draw_planner_future_11_dim = True일 떄,
+            EGO_draw_diffusion = True이면, ego_interp_np_traj_wrt_ego 로 그림그리고, (+assert not None)
+            EGO_draw_diffusion = False이면, planner_future_11_dim 로 그림그리자.
         """
         self.ego_interp_np_traj_wrt_ego: Optional[np.ndarray] = None
         # (1 + Future_len, 11)
@@ -628,7 +644,6 @@ class DrawInfos:
         """
         self.diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] = {
         }  # (1 + Future_len, 11)
-
         """
         interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
         
@@ -636,8 +651,7 @@ class DrawInfos:
             EGO_draw_diffusion = True이면, ego_next_wp_wrt_ego 로 그림그리고, (+assert not None)
             EGO_draw_diffusion = False이면, ego_agent_next_11_dim 로 그림그리자.
         """
-        self.ego_next_wp_wrt_ego: Optional[np.ndarray] = None # (11,)
-
+        self.ego_next_wp_wrt_ego: Optional[np.ndarray] = None  # (11,)
         """
         interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
         """
@@ -648,17 +662,18 @@ class DrawInfos:
         output_data = {
             "ego_np_traj_11_wrt_ego":
                 self.ego_np_traj_11_wrt_ego,
-            "ego_np_int_traj_11_wrt_ego": self.ego_np_int_traj_11_wrt_ego,
+            "ego_np_int_traj_11_wrt_ego":
+                self.ego_np_int_traj_11_wrt_ego,
             "diff_token_to_np_gen_traj_11_wrt_ego":
-                self.diff_token_to_np_gen_traj_11_wrt_ego,
+                self.diff_token_to_np_gen_traj_11_wrt_ego,  # (1+T, 11)
             "diff_token_to_np_int_traj_wrt_ego":
-                self.diff_token_to_np_int_traj_wrt_ego,
+                self.diff_token_to_np_int_traj_wrt_ego,  # (1+T, 4)
             "diff_token_to_np_int_traj_11_wrt_ego":
-                self.diff_token_to_np_int_traj_11_wrt_ego,
+                self.diff_token_to_np_int_traj_11_wrt_ego,  # (1+T, 11)
             "diff_token_to_np_history_wrt_ego":
                 self.diff_token_to_np_history_wrt_ego,
-            "ego_interp_np_traj_wrt_ego": 
-            self.ego_interp_np_traj_wrt_ego,
+            "ego_interp_np_traj_wrt_ego":
+                self.ego_interp_np_traj_wrt_ego,
             "diff_token_to_interp_np_traj_wrt_ego":
                 self.diff_token_to_interp_np_traj_wrt_ego,
             "ego_next_wp_wrt_ego":
@@ -3042,204 +3057,6 @@ def draw_ego_radius_circle(
     ax.add_patch(circle)
 
 
-# [Add]
-def draw_diff_future_gen_refined_traj(
-        ax: plt.Axes,
-        diff_token_to_interp_np_traj_wrt_ego: Optional[Dict[str, np.ndarray]],
-        options: DrawingOptions,
-        diff_token_to_next_wp_wrt_ego: Optional[Dict[str, np.ndarray]],
-        draw_token_list: Optional[List[str]] = None) -> None:
-    """토큰별 refined 궤적(연속 다스텝)과 **신규 waypoint(단일 11차원)**를 함께 그린다.
-
-    - refined: DIFF_future_gen_refined_style(빨강)로 연속 박스 + 첫 유효 포인트에 idx(빨강, 아래쪽 오프셋)
-    - new waypoint: options.DIFF_new_waypoint_style(주황) 테두리 박스 + idx(주황, 오른쪽 오프셋)
-
-    Args:
-        ax: Matplotlib 축.
-        diff_token_to_interp_np_traj_wrt_ego: Dict[str, np.ndarray] | None
-            각 value: shape = (1 + future_len, 11)
-            row(11,) = [x, y, cos, sin, vx, vy, length, width, onehot(3,)]
-        options: 렌더링 옵션.
-        diff_token_to_next_wp_wrt_ego: Dict[str, np.ndarray] | None
-            각 value: shape = (11,) (단일 스텝)
-    """
-    if not diff_token_to_interp_np_traj_wrt_ego and not diff_token_to_next_wp_wrt_ego:
-        return
-
-    eps = options.invalid_eps
-
-    # 표시할 토큰 순서: refined의 key 순서 우선, new_waypoint에만 있는 토큰은 뒤에 추가
-    ordered_tokens: List[str] = []
-    if diff_token_to_interp_np_traj_wrt_ego:
-        ordered_tokens.extend(list(diff_token_to_interp_np_traj_wrt_ego.keys()))
-
-    for idx, token in enumerate(ordered_tokens):
-        if draw_token_list is not None and token not in draw_token_list:
-            continue
-        # ── (A) refined 연속 궤적(빨강) ───────────────────────────────
-        if diff_token_to_interp_np_traj_wrt_ego and (
-                token in diff_token_to_interp_np_traj_wrt_ego):
-            interp_np_traj = diff_token_to_interp_np_traj_wrt_ego[
-                token]  # (1+future_len, 11)
-            if interp_np_traj is not None and interp_np_traj.size > 0:
-                seq_len = interp_np_traj.shape[0]
-                label_drawn = False
-                for t in range(seq_len):
-                    row = interp_np_traj[t]  # (11,)
-                    if not is_valid_agent_row(row, eps):
-                        continue
-                    x, y = float(row[0]), float(row[1])
-                    c, s = float(row[2]), float(row[3])
-                    vx, vy = float(row[4]), float(row[5])
-                    W, L = float(row[6]), float(row[7])
-
-                    corners = oriented_box_corners(x, y, c, s, L, W)
-                    add_polygon(
-                        ax,
-                        corners,
-                        edge_color=options.
-                        DIFF_future_gen_refined_style["line_color"],
-                        line_width=options.
-                        DIFF_future_gen_refined_style["line_width"],
-                        fill_color=None,
-                        fill_alpha=None,
-                        zorder=24,
-                    )
-                    add_heading_line(
-                        ax,
-                        x,
-                        y,
-                        c,
-                        s,
-                        nominal_length=L * options.COMMON_heading_line_scale,
-                        color=options.
-                        DIFF_future_gen_refined_style["line_color"],
-                        line_width=options.
-                        DIFF_future_gen_refined_style["line_width"],
-                        zorder=24,
-                    )
-                    if options.DIFF_draw_future_gen_refined_velocity:
-                        speed_kmh = float(np.hypot(vx, vy)) * 3.6
-                        if t % 20 == 0:
-                            offset = 5
-                        else:
-                            offset = 3
-                        if t % 10 != 0:
-                            continue
-                        ax.text(
-                            x,
-                            y +
-                            options.DIFF_future_gen_refined_velocity_offset_m *
-                            offset,
-                            f"{speed_kmh:.1f}",
-                            color=options.
-                            DIFF_future_gen_refined_style["line_color"],
-                            fontsize=options.
-                            DIFF_future_gen_refined_velocity_font_size,
-                            ha="center",
-                            va="bottom",
-                            zorder=25,
-                            clip_on=True,
-                        )
-                    # 첫 유효 포인트에 빨간색 idx(아래쪽 오프셋)
-                    # if not label_drawn:
-                    #     ax.text(
-                    #         x,
-                    #         y - options.DIFF_future_gen_refined_token_offset_m,
-                    #         str(token)[:5],
-                    #         color=options.DIFF_future_gen_refined_style["line_color"],
-                    #         fontsize=options.DIFF_future_gen_refined_velocity_font_size,
-                    #         ha="center",
-                    #         va="top",
-                    #         zorder=25,
-                    #     )
-                    #     label_drawn = True
-
-        # ── (B) 신규 waypoint(주황) ─────────────────────────────────
-        if diff_token_to_next_wp_wrt_ego and (token
-                                              in diff_token_to_next_wp_wrt_ego):
-            wp = diff_token_to_next_wp_wrt_ego[token]  # (11,)
-            if wp is None:
-                continue
-            wp = np.asarray(wp)
-            if wp.ndim == 2:
-                wp = wp.squeeze()
-            if wp.ndim != 1 or wp.shape[0] != 11:
-                raise ValueError(
-                    "token_to_new_waypoint_array의 각 value는 shape (11,) 이어야 합니다."
-                )
-
-            if not is_valid_agent_row(wp, eps):
-                continue
-
-            x, y = float(wp[0]), float(wp[1])
-            c, s = float(wp[2]), float(wp[3])
-            vx, vy = float(wp[4]), float(wp[5])
-            W, L = float(wp[6]), float(wp[7])
-
-            corners_wp = oriented_box_corners(x, y, c, s, L, W)
-            # 테두리만 주황색으로
-            add_polygon(
-                ax,
-                corners_wp,
-                edge_color=options.DIFF_new_waypoint_style["line_color"],
-                line_width=options.DIFF_new_waypoint_style["line_width"],
-                fill_color=None,
-                fill_alpha=None,
-                zorder=28,  # refined(24)보다 위
-            )
-            add_heading_line(
-                ax,
-                x,
-                y,
-                c,
-                s,
-                nominal_length=L * options.COMMON_heading_line_scale,
-                color=options.DIFF_new_waypoint_style["line_color"],
-                line_width=options.DIFF_new_waypoint_style["line_width"],
-                zorder=28,
-            )
-            if options.DIFF_draw_future_gen_refined_velocity:
-                add_velocity_arrow(
-                    ax,
-                    x,
-                    y,
-                    vx,
-                    vy,
-                    length_m=options.COMMON_vel_arrow_len_m,
-                    line_color=options.DIFF_new_waypoint_style["line_color"],
-                    line_width=options.DIFF_new_waypoint_style["line_width"],
-                    line_alpha=1.0,
-                    zorder=28,
-                    t=0,
-                )
-                # [추가] 속도 크기 텍스트(km/h) - next waypoint 1점 (색: 주황)
-                speed_kmh = float(np.hypot(vx, vy)) * 3.6
-                ax.text(
-                    x,
-                    y + options.DIFF_new_waypoint_vel_text_y_offset_m,
-                    f"{speed_kmh:.1f}",
-                    color=options.DIFF_new_waypoint_style["line_color"],
-                    fontsize=options.DIFF_future_gen_refined_velocity_font_size,
-                    ha="center",
-                    va="bottom",
-                    zorder=29,
-                    clip_on=True,
-                )
-
-            # 번호 라벨: 주황색, "오른쪽"으로 살짝 이동
-            # ax.text(
-            #     x + options.DIFF_new_waypoint_vel_token_x_offset_m,
-            #     y,
-            #     str(token)[:5],
-            #     color=options.DIFF_new_waypoint_style["line_color"],
-            #     fontsize=options.DIFF_future_gen_refined_velocity_font_size,
-            #     ha="left",
-            #     va="center",
-            #     zorder=29,
-            # )
-
-
 from typing import Optional, Literal
 
 from typing import Optional, Dict, List, Tuple, Any
@@ -3557,6 +3374,8 @@ def draw_diff_future_traj_w_square(
     diff_token_to_np_gen_traj_11_wrt_ego: Optional[Dict[str, Array]],
     diff_token_to_np_int_traj_wrt_ego: Optional[Dict[str, Array]],
     diff_token_to_np_int_traj_11_wrt_ego: Optional[Dict[str, Array]],
+    diff_token_to_interp_np_traj_wrt_ego: Optional[Dict[
+        str, Array]],  # DIFF_draw_diff_interp_np_traj_11
     options: DrawingOptions,
     draw_token_list: Optional[List[str]] = None,
 ) -> None:
@@ -3623,6 +3442,17 @@ def draw_diff_future_traj_w_square(
                 annotate_token=False,
                 draw_velocity=options.DIFF_draw_diff_future_int_traj_to_be_vel,
             )
+        if options.DIFF_draw_diff_interp_np_traj_11:
+            draw_traj_dict_as_unfilled_rects(
+                ax=ax,
+                token_to_traj_11=diff_token_to_interp_np_traj_wrt_ego,
+                style=options.DIFF_future_interp_style,
+                options=options,
+                zorder=25,
+                draw_token_list=draw_token_list,
+                annotate_token=False,
+                draw_velocity=options.DIFF_draw_diff_interp_np_traj_11_vel,
+            )
 
     elif options.DIFF_future_traj_draw_mode in ["arrow", "point", "line"]:
         if options.DIFF_draw_diff_future_gen_traj:
@@ -3649,6 +3479,13 @@ def draw_diff_future_traj_w_square(
                 ax=ax,
                 token_to_traj_11=diff_token_to_np_int_traj_wrt_ego,
                 style=options.DIFF_future_slip_style,
+                options=options,
+                draw_token_list=draw_token_list)
+        if options.DIFF_draw_diff_interp_np_traj_11:
+            draw_traj_dict_as_non_square(
+                ax=ax,
+                token_to_traj_11=diff_token_to_interp_np_traj_wrt_ego,
+                style=options.DIFF_future_interp_style,
                 options=options,
                 draw_token_list=draw_token_list)
 
@@ -3863,22 +3700,35 @@ def get_agent_idx_from_tokens(
 
 
 def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
-             output_data: WorldModelFeature,
-             draw_option: DrawingOptions):
+             output_data: WorldModelFeature, draw_option: DrawingOptions):
     if draw_option.EGO_draw_ego_past:
         draw_ego_past(ax, input_data.get("ego_agent_past"), draw_option)
     if draw_option.EGO_draw_ego_agent_next_11_dim:
         if draw_option.EGO_draw_diffusion:
-            input_data_ = input_data.get("ego_next_wp_wrt_ego")
-            assert input_data_ is not None
+            ego_next_state = output_data.get("ego_next_wp_wrt_ego")
+            assert ego_next_state is not None
         else:
-            input_data_ = input_data.get("ego_agent_next_11_dim")
-        draw_ego_agent_next_11_dim(ax, input_data_,
-                                   draw_option)
+            ego_next_state = input_data.get("ego_agent_next_11_dim")
+        draw_ego_agent_next_11_dim(ax, ego_next_state, draw_option)
     ### [EGO FUTURE PLANNER] ###
     if draw_option.EGO_draw_planner_future_11_dim:
-        data_ = input_data.get("planner_future_11_dim", None)
-        draw_planner_future_11_dim(ax, data_, draw_option)
+        if draw_option.EGO_draw_diffusion:
+            if draw_option.EGO_draw_diffusion_mode == "direct":
+                ego_future_11_dim = output_data.get("ego_np_traj_11_wrt_ego")
+            elif draw_option.EGO_draw_diffusion_mode == "integrate":
+                ego_future_11_dim = output_data.get(
+                    "ego_np_int_traj_11_wrt_ego")
+            elif draw_option.EGO_draw_diffusion_mode == "interp":
+                ego_future_11_dim = output_data.get(
+                    "ego_interp_np_traj_wrt_ego")
+            else:
+                raise ValueError(
+                    f"Unsupported EGO_draw_diffusion_mode: {draw_option.EGO_draw_diffusion_mode}"
+                )
+            assert ego_future_11_dim is not None
+        else:
+            ego_future_11_dim = input_data.get("planner_future_11_dim", None)
+        draw_planner_future_11_dim(ax, ego_future_11_dim, draw_option)
     ### [EGO FUTURE GT 11] ###
     if draw_option.EGO_draw_ego_future_gt_11_dim:
         data_ = input_data.get("ego_future_gt_11_dim", None)
@@ -3935,17 +3785,17 @@ def draw_neighbor_future_all(ax: plt.Axes,
     neighbor_track_token: Optional[List[str]] = input_data.get(
         "neighbor_track_token", None)
 
-    if draw_option.DIFF_draw_diff_np_future_gt_3_dim:
+    if draw_option.DIFF_draw_future_gt_3_dim_wo_token:
         # 설정 충돌 방지: 둘 다 True면 에러
         if draw_option.DIFF_draw_diff_future_gt_3_dim:
             raise ValueError(
-                "DIFF_draw_diff_np_future_gt_3_dim=True 인 경우 "
+                "DIFF_draw_future_gt_3_dim_wo_token=True 인 경우 "
                 "DIFF_draw_diff_future_gt_3_dim 는 반드시 False 여야 합니다.")
         if neighbor_future_gt_3_dim is None:
-            raise ValueError("DIFF_draw_diff_np_future_gt_3_dim=True 인데 "
+            raise ValueError("DIFF_draw_future_gt_3_dim_wo_token=True 인데 "
                              "`neighbor_future_gt_3_dim` 이 input_data 에 없습니다.")
         if neighbor_track_token is None:
-            raise ValueError("DIFF_draw_diff_np_future_gt_3_dim=True 인데 "
+            raise ValueError("DIFF_draw_future_gt_3_dim_wo_token=True 인데 "
                              "`neighbor_track_token` 이 input_data 에 없습니다.")
 
         # numpy (max_agent_num, T, 3) + track_token 리스트 → dict[str, (T,3)]
@@ -3974,14 +3824,17 @@ def draw_neighbor_future_all(ax: plt.Axes,
 
     ### [NEIGHBOR FUTURE OUTPUT] ###
     diff_token_to_np_gen_traj_11_wrt_ego = output_data.get(
-        "diff_token_to_np_gen_traj_11_wrt_ego", None)
+        "diff_token_to_np_gen_traj_11_wrt_ego", None)  # (1+T, 11)
     diff_token_to_np_int_traj_wrt_ego = output_data.get(
-        "diff_token_to_np_int_traj_wrt_ego", None)
+        "diff_token_to_np_int_traj_wrt_ego", None)  # (1 + future_len, 4)
     diff_token_to_np_int_traj_11_wrt_ego = output_data.get(
-        "diff_token_to_np_int_traj_11_wrt_ego", None)
+        "diff_token_to_np_int_traj_11_wrt_ego", None)  # (1 + future_len, 11)
+    diff_token_to_interp_np_traj_wrt_ego = output_data.get(
+        "diff_token_to_interp_np_traj_wrt_ego", None)  # (1 + future_len, 11)
     draw_diff_future_traj_w_square(ax, diff_token_to_np_gen_traj_11_wrt_ego,
                                    diff_token_to_np_int_traj_wrt_ego,
                                    diff_token_to_np_int_traj_11_wrt_ego,
+                                   diff_token_to_interp_np_traj_wrt_ego,
                                    draw_option, draw_token_list)
 
 

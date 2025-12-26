@@ -236,10 +236,10 @@ def waypoint_to_numpy10(waypoint: Waypoint,
     assert vector.shape == (10,), f"Expected shape (10,), got {vector.shape}"
     return vector
 
+
 def ego_state_to_numpy10(ego_state: EgoState,
                          *,
-                         velocity_fill: float = 0.0
-                         ) -> np.ndarray:
+                         velocity_fill: float = 0.0) -> np.ndarray:
     center = ego_state.center
     width = ego_state.car_footprint.width
     length = ego_state.car_footprint.length
@@ -269,6 +269,7 @@ def ego_state_to_numpy10(ego_state: EgoState,
     # 안전 확인: (10,) 보장
     assert vector.shape == (10,), f"Expected shape (10,), got {vector.shape}"
     return vector
+
 
 def observations_to_agents_buffer(
         observations_buffer: Deque[Observation],
@@ -922,14 +923,15 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             str, np.ndarray] = model_input_key_to_unnorm_value[
                 "diff_token_to_future_all_gt_3_dim"]  # Dict[str, np.ndarray] # len : valid_agent_num
         neighbor_agents_past = model_input_key_to_unnorm_value[
-            "neighbor_agents_past"] # (N, T, 11)
+            "neighbor_agents_past"]  # (N, T, 11)
         neighbor_agents_current = neighbor_agents_past[:, -1, :]  # (N, 11)
         ego_agent_past = model_input_key_to_unnorm_value[
             "ego_agent_past"]  # (T, 11)
         ego_agent_current = ego_agent_past[-1, :]  # (11, )
         self._draw_infos.model_input_key_to_unnorm_value = model_input_key_to_unnorm_value
         return (model_input_key_to_value, near_track_token_dist_order,
-                diff_token_to_future_all_gt_3_dim, neighbor_agents_current, ego_agent_current)
+                diff_token_to_future_all_gt_3_dim, neighbor_agents_current,
+                ego_agent_current)
 
     def _update_diffusion_agents_observation(
             self, iteration: SimulationIteration,
@@ -951,10 +953,10 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         # model_input_key_to_value: Dict[str, AbstractModelFeature]
         # near_track_token_dist_order: List[str] # len = "Pnn 이하의 길이"
         (model_input_key_to_value, near_track_token_dist_order,
-         diff_token_to_future_all_gt_3_dim,
-         neighbor_agents_current, ego_agent_current) = self._get_model_input(iteration, history,
-                                                       interp_next_ego_11_dim,
-                                                       planner_future_11_dim)
+         diff_token_to_future_all_gt_3_dim, neighbor_agents_current,
+         ego_agent_current) = self._get_model_input(iteration, history,
+                                                    interp_next_ego_11_dim,
+                                                    planner_future_11_dim)
 
         # Infer model
         # token_to_future_traj_wrt_ego: ego 좌표계 기준 차량 중심의 값 Dict (T, 4)
@@ -1277,7 +1279,6 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         self._draw_infos.diff_token_to_next_wp_wrt_ego = diff_token_to_next_wp_wrt_ego
         return updated_ego_state
 
-
     def _get_new_local_ego_state_array_to_draw(
             self,
             updated_ego_state: EgoState,
@@ -1353,12 +1354,11 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         return near_current_future_a2, near_future_a3
 
     def _get_token_to_np_traj_wrt_ego(
-        self,
-        model_inputs: AbstractModelFeature,
-        near_track_token_dist_order: List[str],  # len == "Pnn 이하의 길이"
-        neighbor_agents_current: np.ndarray, # (Pnn, 11)
-        ego_agent_current: np.ndarray, # (11,)
-        
+            self,
+            model_inputs: AbstractModelFeature,
+            near_track_token_dist_order: List[str],  # len == "Pnn 이하의 길이"
+            neighbor_agents_current: np.ndarray,  # (Pnn, 11)
+            ego_agent_current: np.ndarray,  # (11,)
     ) -> Tuple[Dict[str, np.ndarray], Optional[np.ndarray]]:
         """
         Returns:
@@ -1385,12 +1385,12 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
                 0, 1:, :]  # (T, 4)
 
             # ego_agent_current: (11)
-            ego_np_traj_11_wrt_ego =  np.tile(
+            ego_np_traj_11_wrt_ego = np.tile(
                 ego_agent_current,
                 (future_np_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
             ego_np_traj_11_wrt_ego[:, :4] = future_np_trajs_wrt_ego[
                 0, :, :]  # (1+T, 11)
-            ego_np_int_traj_11_wrt_ego =  np.tile(
+            ego_np_int_traj_11_wrt_ego = np.tile(
                 ego_agent_current,
                 (future_np_int_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
             ego_np_int_traj_11_wrt_ego[:, :4] = future_np_int_trajs_wrt_ego[
@@ -1407,7 +1407,6 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         else:
             ego_np_traj_wrt_ego = None
             ego_np_int_traj_wrt_ego = None
-
 
         gen_npc_slot_len = future_np_trajs_wrt_ego.shape[0]
         # neighbor_agents_current: (Pnn, 11)
@@ -1456,7 +1455,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
                 token] = np_gen_int_traj_11_wrt_ego  # (1+T, 11) # TODO: 속도는 잘못된 값이 들어가 있음.
 
         ### 디버깅용 ###
-        self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego # (1+T, 11)
+        self._draw_infos.diff_token_to_np_gen_traj_11_wrt_ego = diff_token_to_np_gen_traj_11_wrt_ego  # (1+T, 11)
         self._draw_infos.diff_token_to_np_int_traj_11_wrt_ego = diff_token_to_np_int_traj_11_wrt_ego  # (1+T, 11) TODO: 속도는 잘못된 값이 들어가 있음.
 
         if self.config.use_integration_trajectory:
@@ -1464,15 +1463,15 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         return diff_token_to_np_gen_traj_wrt_ego, ego_np_traj_wrt_ego
 
     def infer_model(
-        self,
-        model_input_key_to_value: Dict[str, AbstractModelFeature],
-        iteration: SimulationIteration,
-        next_iteration: SimulationIteration,
-        near_track_token_dist_order: List[str],  # len == "Pnn 이하의 길이",
-        diff_token_to_future_all_gt_3_dim: Dict[
-            str, np.ndarray],  # len : valid_agent_num,
-        neighbor_agents_current: np.ndarray,  # (agents_num, 11)
-        ego_agent_current: np.ndarray,  # (11)
+            self,
+            model_input_key_to_value: Dict[str, AbstractModelFeature],
+            iteration: SimulationIteration,
+            next_iteration: SimulationIteration,
+            near_track_token_dist_order: List[str],  # len == "Pnn 이하의 길이",
+            diff_token_to_future_all_gt_3_dim: Dict[
+                str, np.ndarray],  # len : valid_agent_num,
+            neighbor_agents_current: np.ndarray,  # (agents_num, 11)
+            ego_agent_current: np.ndarray,  # (11)
     ) -> None:
         self.updated_ego_state = None
         model_inputs: AbstractModelFeature = model_input_key_to_value[
@@ -1482,7 +1481,8 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
         # ego_np_gen_traj_wrt_ego: np.ndarray # (T, 4) or None
         (diff_token_to_np_gen_traj_wrt_ego,
          ego_np_gen_traj_wrt_ego) = self._get_token_to_np_traj_wrt_ego(
-             model_inputs, near_track_token_dist_order, neighbor_agents_current, ego_agent_current)
+             model_inputs, near_track_token_dist_order, neighbor_agents_current,
+             ego_agent_current)
         cur_ego_global_xyyaw: npt.NDArray[
             np.floating] = self._get_ego_reference_global_xyyaw(
                 self._ego_anchor_state, dtype=np.float64)  # shape (3,)
@@ -1507,7 +1507,7 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             # TODO: _get_rel_future_arrays_to_draw 이거 고쳐야함
             # (1 + Future_len, 11)
             self._draw_infos.ego_interp_np_traj_wrt_ego = self._get_ego_rel_future_arrays_to_draw(
-                    self.ego_trajectory, cur_ego_global_xyyaw)
+                self.ego_trajectory, cur_ego_global_xyyaw)
 
         # diff_token_to_interpol_traj: Dict[str, AbstractTrajectory]
         diff_token_to_interpol_traj = self.get_diff_token_to_interpol_traj(
