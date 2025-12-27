@@ -114,6 +114,14 @@ def get_args():
                         type=str,
                         help='data list of train data',
                         default=None)
+    parser.add_argument('--validation_set',
+                        type=str,
+                        help='path to validation data',
+                        default=None)
+    parser.add_argument('--validation_set_list',
+                        type=str,
+                        help='data list of validation data',
+                        default=None)
 
     parser.add_argument('--future_len',
                         type=int,

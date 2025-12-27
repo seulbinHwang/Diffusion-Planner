@@ -253,26 +253,34 @@ def _prepare_batch_for_device(
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
             outputs[key] = value
-    # ego_future_gt_3_dim: (B, future_len, 3)
-    ego_future_gt_3_dim: torch.Tensor = outputs["ego_future_gt_3_dim"]
-    ego_future_gt_4_dim = torch.cat(
-        [
-            ego_future_gt_3_dim[..., :2],  # (B, future_len, 2)
-            torch.stack(
-                [
-                    ego_future_gt_3_dim[..., 2].cos(),
-                    ego_future_gt_3_dim[..., 2].sin(),
-                ],
-                dim=-1,
-            ),
-        ],
-        dim=-1,
-    )  # (B, future_len, 4)
-    ego_future_len = ego_future_gt_3_dim.shape[1]
-    assert ego_future_len == args.future_len, \
-        f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
-    outputs["ego_future_gt_4_dim"] = ego_future_gt_4_dim
-
+            if key == "ego_future_gt_3_dim":
+                # ego_future_gt_3_dim: (B, future_len, 3)
+                ego_future_gt_3_dim: torch.Tensor = value
+                ego_future_gt_4_dim = torch.cat(
+                    [
+                        ego_future_gt_3_dim[..., :2],  # (B, future_len, 2)
+                        torch.stack(
+                            [
+                                ego_future_gt_3_dim[..., 2].cos(),
+                                ego_future_gt_3_dim[..., 2].sin(),
+                            ],
+                            dim=-1,
+                        ),
+                    ],
+                    dim=-1,
+                )  # (B, future_len, 4)
+                ego_future_len = ego_future_gt_3_dim.shape[1]
+                assert ego_future_len == args.future_len, \
+                    f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
+                outputs["ego_future_gt_4_dim"] = ego_future_gt_4_dim
+            elif key == "near_future_gt_3_dim":
+                # 3) near future 4차원 궤적 + mask 생성
+                # near_future_gt_4_dim: (B, Pnn, future_len, 4)
+                # near_future_mask:    (B, Pnn, future_len)
+                near_future_gt_4_dim, near_future_mask = \
+                    _build_near_future_4dim_and_mask(value)
+                outputs["near_future_gt_4_dim"] = near_future_gt_4_dim
+                outputs["near_future_mask"] = near_future_mask
 
 
     inputs: Dict[str, Any] = batch_on_device
@@ -908,13 +916,8 @@ batch_num_in_all_epoch: int,
                 args=args,
             )
             # near_future_gt_3_dim: (B, Pnn, future_len, 3)
-            near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
-            # 3) near future 4차원 궤적 + mask 생성
-            # near_future_gt_4_dim: (B, Pnn, future_len, 4)
-            # near_future_mask:    (B, Pnn, future_len)
-            near_future_gt_4_dim, near_future_mask = \
-                _build_near_future_4dim_and_mask(near_future_gt_3_dim)
             # 2) augmentation 적용
+            # near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
             # inputs, ego_future_gt_3_dim, near_future_gt_3_dim = \
             #     _apply_augmentation(
             #         inputs=inputs,
@@ -957,8 +960,8 @@ batch_num_in_all_epoch: int,
                 norm_inputs=norm_inputs,
                 marginal_prob=sde_marginal_prob,
                 ego_future_gt_4_dim=outputs["ego_future_gt_4_dim"],
-                near_future_gt_4_dim=near_future_gt_4_dim,
-                near_future_mask=near_future_mask,
+                near_future_gt_4_dim=outputs["near_future_gt_4_dim"],
+                near_future_mask=outputs["near_future_mask"],
                 state_normalizer=args.state_normalizer,
                 loss_dict=raw_loss_dict,
                 model_type=args.diffusion_model_type,  # 보통 "x_start" 또는 "score"

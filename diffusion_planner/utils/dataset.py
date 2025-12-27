@@ -149,14 +149,22 @@ def _compute_agent_level_valid_from_future_gt_3(
 
 class DiffusionPlannerData(Dataset):
 
-    def __init__(self, data_dir, data_list, predicted_neighbor_num):
+    def __init__(self, data_dir, data_list, predicted_neighbor_num, role: str = "train"):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
         """
         self.data_dir = data_dir
+        self.data_tfrecords_dir = None
         self.data_list = openjson(data_list)
         self.predicted_neighbor_num = predicted_neighbor_num
+        self.role = role
+        if self.role == "validation":
+            """
+            data_dir: "/mnt/nuplan/dataset/processed_validation"
+            data_tfrecords_dir: "/mnt/nuplan/dataset/processed_validation_tfrecords_splitted"
+            """
+            self.data_tfrecords_dir = data_dir.replace("processed", "processed_validation_tfrecords_splitted")
 
     def __len__(self):
         return len(self.data_list)
@@ -230,11 +238,10 @@ class DiffusionPlannerData(Dataset):
             - chosen_route_lane_num <= route_num
             - chosen_static_num <= max_static_num
         """
-        data = opendata(os.path.join(self.data_dir, self.data_list[idx]))
         file_name = self.data_list[idx]
+        data = opendata(os.path.join(self.data_dir, file_name))
         if data is None:
             raise IndexError(f"Corrupted sample at index {idx}")
-
         both_keys: List[str] = [
             "ego_agent_past",  # (time_len, 11) # nuplan # womd
             "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd
@@ -278,17 +285,6 @@ class DiffusionPlannerData(Dataset):
                 value = data.get(npz_key, None)
                 if value is not None and npz_key == "agent_route_lane_order":
                     value = value.astype("int64")
-                # if npz_key == "neighbor_future_gt_3_dim":  # (chosen_agent_num, future_len, 3)
-                #     # neighbor_future_gt_is_valid: (chosen_agent_num, future_len)
-                #     neighbor_future_gt_is_valid = _compute_valid_mask_from_prefix_nonzero(
-                #         value, prefix_dim=3)
-                #     # (chosen_agent_num, future_len) -> (1, chosen_agent_num, future_len)
-                #     neighbor_future_gt_is_valid = np.expand_dims(
-                #         neighbor_future_gt_is_valid, axis=0)
-                #     self.assert_cur_future_valid_mask_np(
-                #         neighbor_future_gt_is_valid,
-                #         context=f"{file_name} - neighbor_future_gt_is_valid",
-                #     )
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value
         finally:
@@ -304,4 +300,10 @@ class DiffusionPlannerData(Dataset):
             sample,
             predicted_neighbor_num=self.predicted_neighbor_num,
         )
+        if self.role == "validation":
+            tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
+            tfrecord_path = os.path.join(self.data_tfrecords_dir, tfrecord_file_name)
+            if not os.path.exists(tfrecord_path):
+                raise FileNotFoundError(f"TFRecords file not found: {tfrecord_path}")
+            sample["tfrecord_path"] = tfrecord_path
         return sample

@@ -50,7 +50,7 @@ from diffusion_planner.utils import ddp
 import time
 from diffusion_planner.train_epoch import train_epoch
 import os
-
+from eval_predictor import *
 import math
 
 try:
@@ -3392,6 +3392,9 @@ def _build_augmentation(args: argparse.Namespace,) -> Optional[object]:
 
 def _build_dataset_and_sampler(
     args: argparse.Namespace,
+        set_: str,
+        set_list: str,
+role: str,
     world_size: int,
     global_rank: int,
 ) -> Tuple[DiffusionPlannerData, DistributedSampler]:
@@ -3418,26 +3421,27 @@ def _build_dataset_and_sampler(
         global_rank: 전체 프로세스 기준 번호.
 
     Returns:
-        train_set: DiffusionPlannerData 인스턴스.
-        train_sampler: 각 rank에 샘플을 나눠주는 DistributedSampler.
+        data_set: DiffusionPlannerData 인스턴스.
+        data_sampler: 각 rank에 샘플을 나눠주는 DistributedSampler.
     """
-    # train_set 내부에서 개별 샘플은 npz를 읽어 (agent, lane 등) 배열을
+    # data_set 내부에서 개별 샘플은 npz를 읽어 (agent, lane 등) 배열을
     #   모델 입력 shape에 맞는 Tensor로 바꿔준다. (예: (time_len, 11), (A, T, 11) 등)
-    train_set = DiffusionPlannerData(
-        args.train_set,  # 예: "/mnt/nuplan/dataset/processed"
-        args.train_set_list,  # 예: diffusion_planner_training.json
-        args.predicted_neighbor_num
+    data_set = DiffusionPlannerData(
+        set_,  # 예: "/mnt/nuplan/dataset/processed"
+        set_list,  # 예: diffusion_planner_training.json
+        args.predicted_neighbor_num,
+        role
     )
 
-    train_sampler = DistributedSampler(
-        train_set,
+    data_sampler = DistributedSampler(
+        data_set,
         num_replicas=world_size,
         rank=global_rank,
         shuffle=True,
         seed=args.seed,
     )
 
-    return train_set, train_sampler
+    return data_set, data_sampler
 
 
 def _compute_warmup_steps(
@@ -3473,10 +3477,10 @@ def _compute_warmup_steps(
     return warmup_steps_at_B0, warmup_steps
 
 
-def _build_train_loader(
+def _build_data_loader(
     args: argparse.Namespace,
-    train_set: DiffusionPlannerData,
-    train_sampler: DistributedSampler,
+    data_set: DiffusionPlannerData,
+    data_sampler: DistributedSampler,
     batch_size: int,
     world_size: int,
 ) -> DataLoader:
@@ -3484,21 +3488,21 @@ def _build_train_loader(
 
     Args:
         args: 학습 설정이 들어 있는 argparse.Namespace.
-        train_set: 학습용 DiffusionPlannerData.
-        train_sampler: rank별로 인덱스를 나누는 DistributedSampler.
+        data_set: 학습용 DiffusionPlannerData.
+        data_sampler: rank별로 인덱스를 나누는 DistributedSampler.
         batch_size: 전체 글로벌 배치 크기.
         world_size: 전체 프로세스 개수.
 
     Returns:
-        train_loader: 각 step마다 배치 dict를 반환하는 DataLoader.
+        loader: 각 step마다 배치 dict를 반환하는 DataLoader.
                       각 배치의 텐서는 (B, ·) shape를 가진다.
     """
     # 각 rank가 보는 per-rank 배치 크기
     batch_size_per_rank = batch_size // world_size
 
-    train_loader = DataLoader(
-        train_set,  # DiffusionPlannerData
-        sampler=train_sampler,  # DistributedSampler
+    loader = DataLoader(
+        data_set,  # DiffusionPlannerData
+        sampler=data_sampler,  # DistributedSampler
         batch_size=batch_size_per_rank,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
@@ -3507,7 +3511,7 @@ def _build_train_loader(
         drop_last=True,
         collate_fn=DiffusionPlannerCollate(args),  # 배치 텐서 shape 맞춤
     )
-    return train_loader
+    return loader
 
 
 def _compute_schedule_info(
@@ -5543,7 +5547,7 @@ def _log_and_save(
         wandb_logger.log_metrics(metrics, step=epoch + 1)
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
-    save_interval: int = max(1, int(getattr(args, "save_utd", 1)))
+    save_interval: int = max(1, int(args.save_utd))
     is_first_epoch: bool = (epoch == 0)
 
     # 첫 epoch(=epoch 0)은 무조건 저장, 그 이후에는 save_utd 주기로 저장
@@ -5851,6 +5855,7 @@ def _run_training_loop(
     model_ema: Optional[ModelEma],
     train_loader: DataLoader,
     train_sampler: DistributedSampler,
+    validation_loader: DataLoader,
     wandb_logger: Logger,
     best_loss: float,
     global_rank: int,
@@ -5867,6 +5872,7 @@ def _run_training_loop(
         args,
         batch_num_in_epoch=len(train_loader),
     )
+    batch_num_in_one_val_epoch: int = max(1, len(validation_loader))
     for epoch in range(init_epoch, train_epochs):
         # ✅ (중요) epoch 시작 전에 sampler epoch를 먼저 세팅
         # - resume(init_epoch>0) 시에도 첫 epoch부터 올바른 shuffle이 나오도록 함
@@ -5901,11 +5907,11 @@ def _run_training_loop(
         )
 
         (
-            weight_dict,
-            direct_loss_dict,
-            integration_loss_dict,
-            constraint_loss_dict,
-            loss_dict,
+            weight_dict, # Dict[str, float]
+            direct_loss_dict, # Dict[str, float]
+            integration_loss_dict, # Dict[str, float]
+            constraint_loss_dict, # Dict[str, float]
+            loss_dict, # Dict[str, float]
         ) = _split_train_loss_for_logging(
             train_loss=train_loss,
             info_dict=info_dict,
@@ -5920,6 +5926,18 @@ def _run_training_loop(
             loss_dict=loss_dict,
             speed_info=speed_info,
         )
+        # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
+        validation_loss, validation_total_loss, epoch_elapsed_time_sec = validate_one_epoch(
+            epoch=0,
+            total_epochs=1,
+            validation_loader=validation_loader,
+            diffusion_planner=diffusion_planner,
+            args=args,
+            model_ema=model_ema,
+            aug=aug,
+            batch_num_in_one_val_epoch=batch_num_in_one_val_epoch,
+        )
+
 
         best_loss = _log_and_save(
             epoch=epoch,
@@ -5934,7 +5952,6 @@ def _run_training_loop(
             best_loss=best_loss,
             global_rank=global_rank,
         )
-        # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
 
     return best_loss
 
@@ -6041,9 +6058,23 @@ def model_training(
     batch_size = args.batch_size
     aug = _build_augmentation(args)
     _ = aug
-
+    """
+    train_set: DiffusionPlannerData
+    train_sampler: DistributedSampler
+    """
     train_set, train_sampler = _build_dataset_and_sampler(
         args,
+        args.train_set,
+        args.train_set_list,
+        "train",
+        world_size,
+        global_rank,
+    )
+    validation_set, validation_sampler = _build_dataset_and_sampler(
+        args,
+        args.validation_set,
+        args.validation_set_list,
+        "validation",
         world_size,
         global_rank,
     )
@@ -6057,10 +6088,17 @@ def model_training(
     )
 
     # 5) DataLoader 및 step/샘플 수 정보
-    train_loader = _build_train_loader(
+    train_loader = _build_data_loader(
         args,
         train_set,
         train_sampler,
+        batch_size,
+        world_size,
+    )
+    validation_loader = _build_data_loader(
+        args,
+        validation_set,
+        validation_sampler,
         batch_size,
         world_size,
     )
@@ -6150,6 +6188,7 @@ def model_training(
         model_ema=model_ema,
         train_loader=train_loader,
         train_sampler=train_sampler,
+        validation_loader=validation_loader,
         wandb_logger=wandb_logger,
         best_loss=best_loss,
         global_rank=global_rank,
