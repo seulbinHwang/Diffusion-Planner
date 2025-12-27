@@ -482,7 +482,7 @@ def get_args():
     parser.add_argument(
         "--womd_splits",
         type=str,
-        default="training",#,validation,testing",#"
+        default="validation",#,validation,testing",#"
         help="예: training,validation (콤마로 구분)",
     )
 
