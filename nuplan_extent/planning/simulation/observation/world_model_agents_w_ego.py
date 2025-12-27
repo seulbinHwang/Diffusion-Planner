@@ -1393,7 +1393,8 @@ collate([feature]): 배치 차원 B=1 추가 → (…, …) → (1, …, …)
             ego_np_int_traj_11_wrt_ego = np.tile(
                 ego_agent_current,
                 (future_np_int_trajs_wrt_ego.shape[1], 1))  # (1+T, 11)
-            ego_np_int_traj_11_wrt_ego[1: , :4] = ego_np_int_traj_wrt_ego  # (1+T, 11)
+            ego_np_int_traj_11_wrt_ego[
+                1:, :4] = ego_np_int_traj_wrt_ego  # (1+T, 11)
 
             # 첫 번째 궤적은 ego 궤적이므로 제외
             future_np_trajs_wrt_ego = future_np_trajs_wrt_ego[

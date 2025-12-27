@@ -17,6 +17,8 @@ from diffusion_planner.utils.amp import amp_context_for_infer
 from nuplan.planning.simulation.trajectory.interpolated_trajectory import InterpolatedTrajectory
 from nuplan.planning.simulation.planner.ml_planner.transform_utils import transform_predictions_to_states
 from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks_for_inference
+from diffusion_planner.utils.normalizer import ObservationNormalizer, \
+    StateNormalizer
 
 
 class WorldModel(TorchModuleWrapper):
@@ -36,6 +38,7 @@ class WorldModel(TorchModuleWrapper):
             target_builders=target_builders,
         )
         self.config = config
+        self._state_normalizer: StateNormalizer = config.state_normalizer
         self._planner = Diffusion_Planner(config)
         # TODO: eval() 안해도 됨. 다른 곳에서 해줌
         self._planner.eval()
@@ -78,8 +81,11 @@ class WorldModel(TorchModuleWrapper):
             "target_future_valid"] = build_target_future_tensors_and_masks_for_inference(
                 self.config,
                 inputs,
-            self.config.future_len,
+                self.config.future_len,
             )  # (B, (1+)Pnn, future_len)  True=유효
+        target_current_valid = inputs[
+            "target_future_valid"][:, :, 0]  # (B, (1+)Pnn)  True=유효
+        target_current_mask = ~target_current_valid  # (B, (1+)Pnn)  True=무효
 
         with torch.no_grad():
             with amp_context_for_infer():
@@ -89,8 +95,15 @@ class WorldModel(TorchModuleWrapper):
             "score" : (B, Pnn, 1+T, 4)
         """
         npc_future_trajectories = outputs["score"]  # (B, Pnn, 1+T, 4)
+
+        npc_future_trajectories: torch.Tensor = self._state_normalizer.inverse(
+            npc_future_trajectories)  # (B,Pnn,1+T,4)
+        npc_future_trajectories[target_current_mask] = 0.0
         npc_integrated_trajectories = outputs.get(
             "integrated_trajectory")  # (B, Pnn, 1+T, 4)
+        npc_integrated_trajectories: torch.Tensor = self._state_normalizer.inverse(
+            npc_integrated_trajectories)  # (B,Pnn,1+T,4)
+        npc_integrated_trajectories[target_current_mask] = 0.0
 
         if npc_integrated_trajectories is None:
             return npc_future_trajectories, None

@@ -862,6 +862,136 @@ class DiffusionPlannerCollate:
         self.center_crop_mode: str = str(
             getattr(args, "center_crop_mode", "none")).lower()
 
+
+    def _is_string_container_value(self, value: Any) -> bool:
+        """값이 '문자열(또는 문자열 묶음)'인지 판별합니다.
+
+        목적
+        ----
+        배치를 만들 때 숫자/배열 데이터는 torch.Tensor로 묶어야 하지만,
+        문자열(str)은 torch.Tensor로 바꿀 수 없어 에러가 납니다.
+        그래서 문자열은 "그대로 리스트로 모아서" 반환하기 위해 미리 구분합니다.
+
+        문자열로 취급하는 케이스
+        ----------------------
+        1) value가 str(또는 numpy의 문자열 타입)인 경우
+           - 예: "scenario_000123"  # shape: ()
+        2) value가 list/tuple이고, 안의 원소가 전부 str인 경우
+           - 예: ["a", "b"]  # 원소 개수는 샘플마다 다를 수 있음
+        3) value가 numpy 배열이고 dtype이 문자열인 경우
+           - 예: np.array(["a","b"])  # shape: (N,)
+           - 예: np.array("abc")      # shape: ()
+
+        Args:
+            value: 샘플 dict 안의 어떤 값.
+
+        Returns:
+            bool:
+                - True: 문자열(또는 문자열 묶음)
+                - False: 숫자/배열 등(텐서로 묶을 수 있는 쪽)
+        """
+        if value is None:
+            return False
+
+        # 1) 단일 문자열
+        if isinstance(value, (str, np.str_)):
+            return True
+
+        # 2) list/tuple 안이 전부 문자열인 경우
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return False
+            return all(isinstance(x, (str, np.str_)) for x in value)
+
+        # 3) numpy 배열이 문자열 dtype인 경우
+        if isinstance(value, np.ndarray):
+            # dtype.kind:
+            #   'U' unicode string, 'S' byte string, 'O' object
+            if value.dtype.kind in ("U", "S"):
+                return True
+            if value.dtype.kind == "O" and value.size > 0:
+                # object 배열이라도 실제가 문자열이면 문자열로 취급
+                first = value.flat[0]
+                return isinstance(first, (str, np.str_))
+
+        return False
+
+    def _should_return_string_list_for_key(self, key: str, values: List[Any]) -> bool:
+        """특정 key가 '문자열 배치(List[str])'로 반환되어야 하는지 결정합니다.
+
+        규칙
+        ----
+        - values(길이 B) 중 None이 아닌 값들이 전부 문자열 계열이면:
+            -> 이 key는 텐서로 묶지 않고 List[str]로 반환합니다.
+        - 문자열 값과 숫자/배열 값이 섞여 있으면:
+            -> 데이터 자체가 섞인 상태라 이후 로직이 예측 불가능해지므로
+               명확히 에러를 냅니다.
+
+        Args:
+            key (str): 배치 dict의 key 이름. shape: ()
+            values (List[Any]): 길이 B의 샘플 값 목록.
+                - 문자열이면 보통: str (shape: ())
+                - 또는 문자열 묶음(list[str], np.ndarray[str])도 가능
+
+        Returns:
+            bool:
+                - True: 이 key는 List[str]로 반환
+                - False: 이 key는 기존대로 torch.Tensor/None으로 반환
+
+        Raises:
+            ValueError: 문자열 값과 숫자/배열 값이 같은 key에서 섞여 있을 때
+        """
+        non_none = [v for v in values if v is not None]
+        if len(non_none) == 0:
+            return False
+
+        is_str_flags = [self._is_string_container_value(v) for v in non_none]
+        if all(is_str_flags):
+            return True
+
+        if any(is_str_flags) and (not all(is_str_flags)):
+            raise ValueError(
+                f"[Collate] key='{key}' 에 문자열 값과 숫자/배열 값이 섞여 있습니다. "
+                f"한 key는 한 종류로만 들어오게 정리해야 합니다."
+            )
+
+        return False
+
+    def _collate_string_values_to_list(self, values: List[Any]) -> List[str]:
+        """문자열(또는 문자열 묶음)을 배치 단위 List[str]로 모아 반환합니다.
+
+        반환 형태
+        --------
+        - 항상 길이 B의 리스트를 반환합니다.
+        - 각 원소는 str 입니다.
+        - None은 빈 문자열 "" 로 바꿉니다.
+
+        예시
+        ----
+        values = ["a", None, "c"]  -> ["a", "", "c"]
+
+        Args:
+            values (List[Any]):
+                길이 B 리스트.
+                각 원소는 보통 str(shape: ()) 또는 None 입니다.
+
+        Returns:
+            List[str]:
+                길이 B의 문자열 리스트.
+                - length: B
+        """
+        out: List[str] = []
+        for v in values:
+            if v is None:
+                out.append("")
+            elif isinstance(v, (str, np.str_)):
+                out.append(str(v))
+            else:
+                # list[str], np.ndarray[str] 같은 경우도 "문자열 1개"로 만들어 담습니다.
+                # (요구사항이 List[str] 이므로, 샘플 1개당 문자열 1개로 표현)
+                out.append(str(v))
+        return out
+
     def _infer_max_sizes_for_agent_route_lane_order(
             self,
             batch: List[Dict[str, Any]],
@@ -1727,41 +1857,50 @@ class DiffusionPlannerCollate:
     )
 
     def _is_collatable_value(self, value: Any) -> bool:
-        """이 값이 collate 대상(텐서로 묶을 수 있는 값)인지 빠르게 판별합니다.
+        """이 값이 '텐서로 묶을 수 있는 값'인지 판별합니다.
 
-        이 함수의 목적
-        ------------
-        collate 단계에서는 "배치 텐서로 묶을 수 있는 값"만 모아야 안전합니다.
-        예를 들어 문자열(str), dict 같은 값까지 같이 묶으려 하면 학습 코드에서
-        `.to(device)` 같은 처리가 깨질 수 있습니다.
-
-        허용하는 값의 형태
-        ----------------
-        - None (데이터가 없는 경우. 이 경우는 0 padding으로 처리할 수 있습니다)
-        - torch.Tensor
-        - numpy.ndarray
-        - 숫자 스칼라(int/float/bool, numpy scalar 포함)
-        - 숫자 리스트/튜플(예: [1,2,3] 같은 값)  # np.asarray로 변환 가능하다고 가정
+        변경 포인트
+        ----------
+        - 문자열(str) 또는 문자열 배열/리스트는 텐서로 묶을 수 없으므로 False
+          (대신 별도 경로로 List[str]로 모아서 반환합니다)
 
         Args:
             value: 샘플 dict 안의 어떤 값.
 
         Returns:
             bool:
-                - True: 텐서로 묶어서 반환 가능한 값
-                - False: collate 결과에 넣지 않는 값(예: 문자열 등)
+                - True: torch.Tensor로 묶을 수 있는 값
+                - False: 문자열 계열(또는 텐서화 불가 값)
         """
         if value is None:
             return True
+
+        # ✅ 문자열 계열은 텐서로 묶지 않는다.
+        if self._is_string_container_value(value):
+            return False
+
         if isinstance(value, torch.Tensor):
             return True
+
         if isinstance(value, np.ndarray):
+            # numpy 배열도 문자열 dtype이면 제외
+            if value.dtype.kind in ("U", "S"):
+                return False
+            if value.dtype.kind == "O" and value.size > 0 and isinstance(
+                    value.flat[0], (str, np.str_)):
+                return False
             return True
+
         if isinstance(value, (bool, int, float, np.number)):
             return True
+
         if isinstance(value, (list, tuple)):
-            # 숫자 리스트/튜플일 가능성이 높으므로 허용
+            # list/tuple이라도 전부 문자열이면 제외
+            if len(value) > 0 and all(
+                    isinstance(x, (str, np.str_)) for x in value):
+                return False
             return True
+
         return False
 
     def _get_value_shape(self, value: Any) -> Tuple[int, ...]:
@@ -1809,21 +1948,18 @@ class DiffusionPlannerCollate:
     def _collect_batch_keys(self, batch: List[Dict[str, Any]]) -> List[str]:
         """배치 안에 등장한 key를 모아 collate 대상으로 삼을 key 목록을 만듭니다.
 
-        중요한 점
-        --------
-        - 특정 key 이름을 나열해서 하드코딩하지 않습니다.
-        - 배치 dict에 들어온 key를 전부 대상으로 삼습니다.
-        - 다만, 텐서로 묶기 어려운 값(예: str)은 제외합니다.
-        - 어떤 샘플에서는 None이고 다른 샘플에서는 실제 배열인 key도 있을 수 있어서,
-          None도 일단 포함시킨 뒤 "배치 전체가 None인 key"만 최종적으로 제외합니다.
+        변경 포인트
+        ----------
+        - 기존에는 문자열(str)은 제외했는데,
+          이제는 문자열도 "List[str]"로 반환하기 위해 key 목록에 포함합니다.
 
         Args:
             batch:
-                - 길이 B인 샘플 dict 리스트.
+                길이 B의 샘플 dict 리스트.
 
         Returns:
             List[str]:
-                - collate 대상으로 삼을 key 목록(중복 제거, 등장 순서 최대한 유지)
+                collate 대상으로 삼을 key 목록(중복 제거, 등장 순서 최대한 유지)
         """
         seen = set()
         keys: List[str] = []
@@ -1832,18 +1968,18 @@ class DiffusionPlannerCollate:
             for k, v in sample.items():
                 if k in seen:
                     continue
-                if self._is_collatable_value(v):
+
+                # ✅ 텐서로 묶을 수 있거나, 문자열 계열이면 key를 포함
+                if self._is_collatable_value(
+                        v) or self._is_string_container_value(v):
                     seen.add(k)
                     keys.append(k)
 
-        # 5개 고정 key는 "배치 첫 샘플에 없더라도" 우선순위로 앞에 두고 싶으면,
-        # 아래 로직이 도움이 됩니다. (데이터에 실제로 없으면 최종 단계에서 자동 제외됨)
         fixed_front: List[str] = []
         for k in self._FIXED_STACK_KEYS:
             if k in seen and k in keys:
                 fixed_front.append(k)
 
-        # fixed_front가 이미 keys 안에 있으니, 순서만 fixed가 앞에 오도록 재정렬
         if fixed_front:
             rest = [k for k in keys if k not in fixed_front]
             return fixed_front + rest
@@ -2241,41 +2377,40 @@ class DiffusionPlannerCollate:
         return out
 
     def _build_collated_batch_tensors(
-        self,
-        batch: List[Dict[str, Any]],
-    ) -> Dict[str, Optional[torch.Tensor]]:
+            self,
+            batch: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         """배치(dict 리스트)를 최종 배치 텐서(dict)로 변환합니다.
 
-        추가 규칙
-        --------
-        - 어떤 key가 배치 내에서 전부 None이면:
-            · 기존: key 자체를 batch_out에서 제거
-            · 변경: batch_out[key] = None 으로 유지
-        - "*_is_valid" 류 key는 입력이 int(0/1) 이 섞여 있어도 출력 dtype을 torch.bool로 강제합니다.
+        변경 포인트
+        ----------
+        - 문자열(str) 계열 key는 텐서로 만들지 않고 List[str]로 반환합니다.
+          (길이 B, None은 ""로 치환)
+        - 나머지 숫자/배열 key는 기존대로 torch.Tensor 또는 None을 반환합니다.
 
         Args:
             batch (List[Dict[str, Any]]): 길이 B 샘플 dict 리스트
 
         Returns:
-            Dict[str, Optional[torch.Tensor]]:
+            Dict[str, Any]:
                 - 텐서로 만들 수 있으면 torch.Tensor
-                - 배치 전체가 None이면 해당 key의 value는 None
+                - 배치 전체가 None이면 None
+                - 문자열 계열이면 List[str] (length=B)
         """
         batch_size: int = int(len(batch))
         if batch_size <= 0:
             raise ValueError("빈 batch가 들어왔습니다.")
 
         keys: List[str] = self._collect_batch_keys(batch)
-        batch_out: Dict[str, Optional[torch.Tensor]] = {}
+        batch_out: Dict[str, Any] = {}
 
-        # 1) 고정 5개 key
+        # 1) 고정 5개 key (항상 텐서로)
         for k in self._FIXED_STACK_KEYS:
             if k not in keys:
                 continue
             values = [sample.get(k, None) for sample in batch]
             t = self._stack_fixed_key_for_named_key(k, values)
-            # ✅ 전부 None이면 key를 빼지 말고 None으로 유지
-            batch_out[k] = t  # t: torch.Tensor 또는 None
+            batch_out[k] = t  # torch.Tensor 또는 None
 
         # 2) 나머지 key
         fixed_set = set(self._FIXED_STACK_KEYS)
@@ -2285,31 +2420,55 @@ class DiffusionPlannerCollate:
 
             values = [sample.get(k, None) for sample in batch]
 
-            # ✅ 전부 None이면 key를 빼지 말고 None으로 유지
+            # 전부 None이면 None 유지
             if all(v is None for v in values):
                 batch_out[k] = None
                 continue
+
+            # ✅ 문자열 계열이면 List[str]로 반환
+            if self._should_return_string_list_for_key(k, values):
+                batch_out[k] = self._collate_string_values_to_list(values)
+                continue
+
+            # agent_route_lane_order는 마지막에 전용 처리
             if k == "agent_route_lane_order":
                 continue
+
+            # 그 외는 기존 padding+stack 경로
             t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
-            batch_out[k] = t  # 정상 케이스에서는 torch.Tensor가 들어옴
+            batch_out[k] = t  # torch.Tensor 또는 None
 
-        # agent_route_lane_order는 -1 padding 전용 처리
-        max_agent_num = batch_out["neighbor_agents_past"].shape[1]
-        max_lane_num = batch_out["lanes"].shape[1]
-
-
-        batch_out["agent_route_lane_order"] = self._pad_and_stack_agent_route_lane_order(batch, max_agent_num, max_lane_num)
-        agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
+        # 3) agent_route_lane_order는 -1 padding 전용 처리
         neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
+        lanes = batch_out.get("lanes", None)
 
-        if agent_route_lane_order is not None and neighbor_agents_past is not None:
-            agent_route_lane_order_agent_num = agent_route_lane_order.shape[1]
-            neighbor_agents_past_agent_num = neighbor_agents_past.shape[1]
-            assert agent_route_lane_order_agent_num == neighbor_agents_past_agent_num, \
-                f"agent_route_lane_order의 agent 수와 neighbor_agents_past의 agent 수가 \
-                일치하지 않습니다. agent_route_lane_order agent num: {agent_route_lane_order_agent_num}, \
-                neighbor_agents_past agent num: {neighbor_agents_past_agent_num}"
+        if not isinstance(neighbor_agents_past, torch.Tensor):
+            raise ValueError(
+                "[Collate] neighbor_agents_past가 torch.Tensor가 아닙니다. "
+                "문자열 key 처리와 무관하게, 입력 데이터가 깨졌을 가능성이 큽니다.")
+        if not isinstance(lanes, torch.Tensor):
+            raise ValueError("[Collate] lanes가 torch.Tensor가 아닙니다. "
+                             "문자열 key 처리와 무관하게, 입력 데이터가 깨졌을 가능성이 큽니다.")
+
+        max_agent_num = int(neighbor_agents_past.shape[1])  # shape: ()
+        max_lane_num = int(lanes.shape[1])  # shape: ()
+
+        batch_out[
+            "agent_route_lane_order"] = self._pad_and_stack_agent_route_lane_order(
+            batch=batch,
+            max_agent_num=max_agent_num,
+            max_lane_num=max_lane_num,
+        )
+
+        # 간단 정합 체크
+        agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
+        if isinstance(agent_route_lane_order, torch.Tensor):
+            assert int(agent_route_lane_order.shape[1]) == int(
+                neighbor_agents_past.shape[1]), (
+                "agent_route_lane_order의 agent 수와 neighbor_agents_past의 agent 수가 "
+                "일치하지 않습니다."
+            )
+
         return batch_out
 
     def _is_validity_key_name(self, key: str) -> bool:
@@ -3191,24 +3350,21 @@ class DiffusionPlannerCollate:
     # ------------------------------------------------------------------
     # 4) collate 본체
     # ------------------------------------------------------------------
-    def __call__(
-        self,
-        batch: List[Dict[str, Any]],
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        """단일 샘플 dict 리스트를 (B, ·) 텐서 dict로 변환한다.
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """단일 샘플 dict 리스트를 (B, ·) 배치 dict로 변환한다.
 
         Returns:
-            Dict[str, Optional[torch.Tensor]]:
-                - 텐서로 만들 수 있는 key는 torch.Tensor
-                - 배치 전체가 None인 key는 None
+            Dict[str, Any]:
+                - 숫자/배열 값: torch.Tensor 또는 None
+                - 문자열 값: List[str] (length=B)
         """
         if len(batch) == 0:
             raise ValueError("빈 batch가 들어왔습니다.")
 
         if self._should_center_crop():
-            raise NotImplementedError(
-                "현재 구현에서는 center crop을 사용할 수 없습니다.")
-            self._center_crop_batch_batched(batch)
+            raise NotImplementedError("현재 구현에서는 center crop을 사용할 수 없습니다.")
+            # self._center_crop_batch_batched(batch)
+
         return self._build_collated_batch_tensors(batch)
 
 
@@ -5927,15 +6083,15 @@ def _run_training_loop(
             speed_info=speed_info,
         )
         # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
-        validation_loss, validation_total_loss, epoch_elapsed_time_sec = validate_one_epoch(
+        validate_one_epoch(
             epoch=0,
             total_epochs=1,
             validation_loader=validation_loader,
             diffusion_planner=diffusion_planner,
             args=args,
             model_ema=model_ema,
-            aug=aug,
-            batch_num_in_one_val_epoch=batch_num_in_one_val_epoch,
+            batch_num_in_one_val_epoch=batch_num_in_one_val_epoch
+
         )
 
 

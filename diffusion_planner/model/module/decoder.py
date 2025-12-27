@@ -894,7 +894,7 @@ class Decoder(nn.Module):
 
         return xt_sequence
 
-    def _prepare_near_trajectories_and_masks(
+    def _prepare_target_trajectories_and_masks(
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
@@ -1472,7 +1472,6 @@ class Decoder(nn.Module):
             self,
             outputs: Dict[str, torch.Tensor],  #
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
-            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> None:
         """추론 모드에서 feasible 출력(integrated_trajectory)을 outputs에 추가한다.
         Returns:
@@ -1487,12 +1486,7 @@ class Decoder(nn.Module):
             [target_current_xyyaw.unsqueeze(2), integrated_trajectory],
             dim=2,
         )  # (B, (1+)Pnn, 1+T, 4)
-
-        unnorm_integrated: torch.Tensor = self._state_normalizer.inverse(
-            integrated_trajectory)
-
-        unnorm_integrated[target_current_mask] = 0.0
-        outputs["integrated_trajectory"] = unnorm_integrated
+        outputs["integrated_trajectory"] = integrated_trajectory
 
     def _forward_training_mode(
         self,
@@ -1666,21 +1660,13 @@ class Decoder(nn.Module):
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
         )
-
-        # 7) 역정규화 및 패딩 정리
-        unnorm_x0: torch.Tensor = self._inverse_normalize_and_cleanup_padding(
-            x_norm=x0_seq_norm,  # (B, (1+)Pnn, 1+T, 4)
-            target_current_mask=target_current_mask,  # (B, (1+)Pnn)
-        )
-
         # 8) feasible 출력(옵션)
         self._append_inference_feasible_outputs(
             outputs=return_,
             target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
-            target_current_mask=target_current_mask,  # (B, (1+)Pnn)
         )
 
-        return_["score"] = unnorm_x0  # (B, (1+)Pnn, 1+T, 4)
+        return_["score"] = x0_seq_norm  # (B, (1+)Pnn, 1+T, 4)
         return return_
 
     def forward(
@@ -1745,7 +1731,7 @@ class Decoder(nn.Module):
             cond_last_pos_norm,  # (B, (1+)Pnn, 4)
             batch_size,
             one_or_Pnn,
-        ) = self._prepare_near_trajectories_and_masks(inputs)
+        ) = self._prepare_target_trajectories_and_masks(inputs)
         (
             scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask,  # (B, token_num)

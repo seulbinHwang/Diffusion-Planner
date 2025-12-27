@@ -3140,10 +3140,10 @@ class AgentFusionEncoder(nn.Module):
                 "agents_past_current must be (B, A, T, 8) or (B, T, 8).")
 
     def forward(self, ego_agent_past: torch.Tensor,
-                neighbor_agents_past: torch.Tensor, ego_future):
+                non_near_agents_past: torch.Tensor, ego_future):
         '''
         ego_agent_past: (B, 1, time_len, 11)
-        neighbor_agents_past: (B, max_agent_num, time_len, 11)
+        non_near_agents_past: (B, max_agent_num, time_len, 11)
         ego_future: (B, future_len, 11)
 
         (x, y, cos, sin, vx, vy, w, l, type(3)
@@ -3151,7 +3151,7 @@ class AgentFusionEncoder(nn.Module):
         assert self.future_len == ego_future.shape[1], \
             f"ego_future.shape[1] should be {self.future_len}, but got {ego_future.shape[1]}"
         # (B, agents_num=1+max_agent_num, time_len, D)
-        agents_past_current = torch.cat([ego_agent_past, neighbor_agents_past],
+        agents_past_current = torch.cat([ego_agent_past, non_near_agents_past],
                                         dim=1)
         B, agents_num, time_len, _ = agents_past_current.shape
         device = agents_past_current.device

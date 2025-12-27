@@ -3145,6 +3145,125 @@ import os
 import numpy as np
 
 EXCLUDE_KEYS_FOR_NPZ: Tuple[str, ...] = ("scenario_id", "neighbor_track_token")
+from typing import Tuple
+import numpy as np
+
+
+def gather_z_global_at_time(
+    z_global_all: np.ndarray,        # shape: (N, S)
+    track_indices: np.ndarray,       # shape: (A,)
+    time_index: int,
+) -> np.ndarray:
+    """여러 트랙의 '절대 z(전역 좌표계 기준)'를 특정 시점에서 한 번에 뽑아 (A,)로 반환합니다.
+
+    이 함수는 target_z를 "절대 좌표계 기준"으로 만들 때 쓰기 위한 유틸입니다.
+
+    입력으로 들어오는 z_global_all은 WOMD track states의 center_z를 모아둔 값으로,
+    ego 기준으로 빼기(상대화)를 하지 않은 "원본 전역 z"라고 가정합니다.
+
+    안전을 위해 아래를 같이 처리합니다.
+    - track_indices 안에 범위를 벗어난 값이 섞여 있으면 그 위치는 0.0으로 채웁니다.
+    - time_index가 범위를 벗어나면 가능한 범위로 clamp 합니다.
+
+    Args:
+        z_global_all: (N,S) float32/float64.
+            모든 트랙의 모든 시점에 대한 전역 z 값 배열.
+        track_indices: (A,) int64/int32.
+            z를 뽑고 싶은 트랙 인덱스들.
+        time_index: int.
+            z를 뽑을 시점 인덱스.
+
+    Returns:
+        z_global_at_t: (A,) float32.
+            track_indices 순서대로 뽑은 전역 z 값.
+            잘못된 트랙 인덱스는 0.0으로 반환됩니다.
+    """
+    # z_global_all: (N,S)
+    if z_global_all.ndim != 2:
+        raise ValueError(f"z_global_all must be (N,S). got shape={z_global_all.shape}")
+
+    num_tracks = int(z_global_all.shape[0])  # N
+    num_steps = int(z_global_all.shape[1])   # S
+
+    idx = np.asarray(track_indices, dtype=np.int64).reshape(-1)  # shape: (A,)
+    a = int(idx.shape[0])
+
+    if a == 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    t = int(time_index)
+    if num_steps <= 0:
+        return np.zeros((a,), dtype=np.float32)
+    t = max(0, min(t, num_steps - 1))
+
+    out = np.zeros((a,), dtype=np.float32)  # shape: (A,)
+
+    valid = (idx >= 0) & (idx < num_tracks)  # shape: (A,)
+    if bool(np.any(valid)):
+        out[valid] = z_global_all[idx[valid], t].astype(np.float32)  # shape: (A_valid,)
+
+    return out
+
+def build_target_id_and_z_from_ego_and_neighbors(
+    ego_object_id: int,
+    ego_z_value: float,
+    neighbor_object_id: np.ndarray,
+    neighbor_z_value: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """ego 1개와 neighbor 여러 개의 id/z를 같은 순서로 묶어 target_id/target_z를 만듭니다.
+
+    이 스크립트는 원래 ego는 ego_*로 따로 저장되고,
+    neighbor는 neighbor_*로 따로 저장됩니다.
+
+    그런데 어떤 후처리/학습 코드에서는
+    "ego + neighbor를 한 줄로 쭉" 같은 순서로 쓰는 게 편할 때가 있습니다.
+    예를 들면 아래처럼요.
+
+      - target_id: [ego_id, neighbor_id_0, neighbor_id_1, ...]
+      - target_z : [ego_z , neighbor_z_0 , neighbor_z_1 , ...]
+
+    이 함수는 딱 그 형태로 두 배열을 만듭니다.
+
+    주의
+    ----
+    현재 data_process_womd.py의 neighbor_z는
+    "ego보다 얼마나 위/아래인지" (즉 ego 기준 상대값)으로 만들어집니다.
+    그래서 ego의 상대 z는 보통 0.0 입니다.
+
+    Args:
+        ego_object_id: ego의 고유 id(정수).
+        ego_z_value: ego의 z 값(실수).
+            - 현재 코드 기준으로는 보통 0.0(ego 기준 상대값)입니다.
+        neighbor_object_id: (A,) int64. neighbor들의 id 배열.
+        neighbor_z_value: (A,) float32. neighbor들의 z 배열.
+
+    Returns:
+        target_id: (A+1,) int64. 첫 칸은 ego id, 그 뒤는 neighbor id.
+        target_z: (A+1,) float32. 첫 칸은 ego z, 그 뒤는 neighbor z.
+    """
+    neighbor_object_id_arr = np.asarray(neighbor_object_id, dtype=np.int64).reshape(-1)  # shape: (A,)
+    neighbor_z_value_arr = np.asarray(neighbor_z_value, dtype=np.float32).reshape(-1)   # shape: (A,)
+
+    if int(neighbor_object_id_arr.shape[0]) != int(neighbor_z_value_arr.shape[0]):
+        raise ValueError(
+            "neighbor_object_id와 neighbor_z_value의 길이가 다릅니다. "
+            f"id_len={int(neighbor_object_id_arr.shape[0])}, "
+            f"z_len={int(neighbor_z_value_arr.shape[0])}"
+        )
+
+    neighbor_count = int(neighbor_object_id_arr.shape[0])
+
+    target_id = np.empty((neighbor_count + 1,), dtype=np.int64)    # shape: (A+1,)
+    target_z = np.empty((neighbor_count + 1,), dtype=np.float32)   # shape: (A+1,)
+
+    target_id[0] = int(ego_object_id)
+    target_z[0] = float(ego_z_value)
+
+    if neighbor_count > 0:
+        target_id[1:] = neighbor_object_id_arr
+        target_z[1:] = neighbor_z_value_arr
+
+    return target_id, target_z
 
 
 def build_npz_payload_from_cache_dict(
@@ -3982,7 +4101,7 @@ def build_cache_dict_for_scenario(
     width_length_all = np.stack([width_all, length_all],
                                 axis=-1).astype(np.float32)  # (N,S,2)
 
-    # z는 ego 기준으로 상대값으로 저장
+    # z_rel_all: ego 기준 상대 z (필요하면 다른 곳에서 사용 가능)
     z_rel_all = (z_global_all - ego_z_global).astype(np.float32)  # (N,S)
 
     # one-hot 타입 미리 생성
@@ -4084,6 +4203,28 @@ def build_cache_dict_for_scenario(
         neighbor_future_gt_3_dim[out_i] = n_future_3
         neighbor_future_gt_11_dim[out_i] = n_future_11
 
+    # -------------------------
+    # ✅ ego + neighbor를 한 줄로 묶은 target_id / target_z 만들기
+    # -------------------------
+    ego_object_id_value = int(object_id_all[ego_idx])
+
+    # ✅ target_z는 "절대 좌표계(전역) z"로 저장
+    # ego_z_global은 compute_ego_pose_at_current()에서 얻은 전역 z 입니다.
+    ego_z_value_for_target = float(ego_z_global)
+
+    # neighbor들도 현재 시점의 전역 z를 그대로 사용합니다.
+    neighbor_z_value_for_target = gather_z_global_at_time(
+        z_global_all=z_global_all,          # shape: (N,S)
+        track_indices=neighbor_indices,     # shape: (A,)
+        time_index=current_t,
+    )  # shape: (A,)
+
+    target_id, target_z = build_target_id_and_z_from_ego_and_neighbors(
+        ego_object_id=ego_object_id_value,
+        ego_z_value=ego_z_value_for_target,
+        neighbor_object_id=neighbor_id,                 # shape: (A,)
+        neighbor_z_value=neighbor_z_value_for_target,   # shape: (A,)
+    )
 
     # -------------------------
     # map: stop/crosswalk/speed_bump/lanes
@@ -4215,8 +4356,8 @@ def build_cache_dict_for_scenario(
         "ego_future_gt_11_dim": ego_future_gt_11_dim,  # (80,11)  # womd
 
         "neighbor_role": neighbor_role,  # (A,2) bool
-        "neighbor_id": neighbor_id,  # (A,)
-        "neighbor_z": neighbor_z,  # (A,)
+        "target_id": target_id,  # (1+A,) int64. [ego_id, neighbor_id...]
+        "target_z": target_z,    # (1+A,) float32. [ego_z, neighbor_z...]
 
         "neighbor_shape": neighbor_shape,  # (A,3)
 

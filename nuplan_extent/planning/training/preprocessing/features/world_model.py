@@ -382,7 +382,6 @@ class WorldModelFeature(AbstractModelFeature):
     def deserialize(cls, data: Dict[str, Any]) -> WorldModelFeature:
         return WorldModelFeature(**data)
 
-
     def to_tensor_dict(
         self,
         *,

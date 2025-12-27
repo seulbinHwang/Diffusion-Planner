@@ -282,7 +282,6 @@ def _prepare_batch_for_device(
                 outputs["near_future_gt_4_dim"] = near_future_gt_4_dim
                 outputs["near_future_mask"] = near_future_mask
 
-
     inputs: Dict[str, Any] = batch_on_device
 
     return inputs, outputs
@@ -291,9 +290,6 @@ def _prepare_batch_for_device(
 # =====================================================================
 # 아래부터 train_epoch 내부를 역할별 함수로 분리
 # =====================================================================
-
-
-
 
 
 def _as_bool_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -861,7 +857,7 @@ def train_epoch(
     args: argparse.Namespace,
     ema: Optional[object],
     scheduler,
-batch_num_in_all_epoch: int,
+    batch_num_in_all_epoch: int,
     aug: Optional[StatePerturbation] = None,
 ) -> Tuple[Dict[str, float], float]:
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행한다.
@@ -906,7 +902,6 @@ batch_num_in_all_epoch: int,
     if args.ddp:
         torch.cuda.synchronize()
 
-
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
             # 1) device 이동 + 상한 클리핑 + 정답 분리
@@ -942,8 +937,7 @@ batch_num_in_all_epoch: int,
             
             set_to_none=True는 기울기 값을 “0으로 채우기”보다 **아예 비워(None으로 만들기)**에 가까워서, 보통 메모리/속도 면에서 조금 더 유리할 수 있습니다.
             """
-            if args.use_deepspeed and hasattr(
-                    model, "zero_grad"):
+            if args.use_deepspeed and hasattr(model, "zero_grad"):
                 model.zero_grad()
             else:
                 optimizer.zero_grad(set_to_none=True)

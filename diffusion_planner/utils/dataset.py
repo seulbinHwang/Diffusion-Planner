@@ -149,7 +149,11 @@ def _compute_agent_level_valid_from_future_gt_3(
 
 class DiffusionPlannerData(Dataset):
 
-    def __init__(self, data_dir, data_list, predicted_neighbor_num, role: str = "train"):
+    def __init__(self,
+                 data_dir,
+                 data_list,
+                 predicted_neighbor_num,
+                 role: str = "train"):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
@@ -164,7 +168,8 @@ class DiffusionPlannerData(Dataset):
             data_dir: "/mnt/nuplan/dataset/processed_validation"
             data_tfrecords_dir: "/mnt/nuplan/dataset/processed_validation_tfrecords_splitted"
             """
-            self.data_tfrecords_dir = data_dir.replace("processed", "processed_validation_tfrecords_splitted")
+            self.data_tfrecords_dir = data_dir.replace(
+                "processed", "processed_validation_tfrecords_splitted")
 
     def __len__(self):
         return len(self.data_list)
@@ -272,8 +277,15 @@ class DiffusionPlannerData(Dataset):
             "road_edge",  # (chosen_edge_num, safety_len, 2) # womd
             "road_edge_type",  # (chosen_edge_num, 3) # womd
         ]
+        wosac_only_keys = []
+        if self.role == "validation":
+            wosac_only_keys: List[str] = [
+                "target_id",  # (1+A,) int64. [ego_id, neighbor_id...]
+                "target_z"  # (1+A,) float32. [ego_z, neighbor_z...]
+            ]
 
-        npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys
+        npz_keys: List[
+            str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
 
         npz_key_to_new_key: Dict[str, str] = {
             "ego_future_gt_11_dim": "planner_future_11_dim",
@@ -301,9 +313,13 @@ class DiffusionPlannerData(Dataset):
             predicted_neighbor_num=self.predicted_neighbor_num,
         )
         if self.role == "validation":
+            scenario_id = str(os.path.splitext(file_name)[0])
+            sample["scenario_id"] = scenario_id
             tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
-            tfrecord_path = os.path.join(self.data_tfrecords_dir, tfrecord_file_name)
+            tfrecord_path = os.path.join(self.data_tfrecords_dir,
+                                         tfrecord_file_name)
             if not os.path.exists(tfrecord_path):
-                raise FileNotFoundError(f"TFRecords file not found: {tfrecord_path}")
+                raise FileNotFoundError(
+                    f"TFRecords file not found: {tfrecord_path}")
             sample["tfrecord_path"] = tfrecord_path
         return sample

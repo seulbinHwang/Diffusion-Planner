@@ -302,8 +302,9 @@ class SimulationFeatureVideoCallback(AbstractCallback):
             ).index  # int
 
             # 각 스텝의 렌더링 저장 경로를 Planner/Observation에 전달
-            if isinstance(setup.observations,
-                          (WorldModelAgents, WorldModelLogReplay, WorldModelAgentsWEgo)):
+            if isinstance(
+                    setup.observations,
+                (WorldModelAgents, WorldModelLogReplay, WorldModelAgentsWEgo)):
                 setup.observations.set_vis_features(
                     is_vis_features=True,
                     vis_features_path=feature_log_directory /
