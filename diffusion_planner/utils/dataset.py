@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 from torch.utils.data import Dataset
+from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_near_agents_info_inplace
 from diffusion_planner.utils.validity import add_validity_keys_inplace
 from diffusion_planner.utils.train_utils import openjson, opendata
 
@@ -148,13 +149,14 @@ def _compute_agent_level_valid_from_future_gt_3(
 
 class DiffusionPlannerData(Dataset):
 
-    def __init__(self, data_dir, data_list):
+    def __init__(self, data_dir, data_list, predicted_neighbor_num):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
         """
         self.data_dir = data_dir
         self.data_list = openjson(data_list)
+        self.predicted_neighbor_num = predicted_neighbor_num
 
     def __len__(self):
         return len(self.data_list)
@@ -298,4 +300,8 @@ class DiffusionPlannerData(Dataset):
                     pass
         # a~n validity key 추가 (공통 유틸)
         add_validity_keys_inplace(sample, missing_policy="none")
+        add_near_agents_info_inplace(
+            sample,
+            predicted_neighbor_num=self.predicted_neighbor_num,
+        )
         return sample

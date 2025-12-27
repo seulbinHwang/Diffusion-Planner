@@ -37,6 +37,8 @@ class WorldModel(TorchModuleWrapper):
         )
         self.config = config
         self._planner = Diffusion_Planner(config)
+        # TODO: eval() 안해도 됨. 다른 곳에서 해줌
+        self._planner.eval()
         self._ckpt_path = ckpt_path
         self._ema_enabled = enable_ema
         self._step_interval = 0.1  # [s]

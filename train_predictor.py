@@ -14,7 +14,6 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Optional, Dict, Any
 import io
-from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_near_agents_info_inplace
 
 # TensorFloat-32(TF32) 연산을 허용하여
 #   - Ampere(A100 등) GPU에서 matmul/cuDNN 연산을 FP32보다 빠르게 처리하고
@@ -3210,10 +3209,6 @@ class DiffusionPlannerCollate:
             raise NotImplementedError(
                 "현재 구현에서는 center crop을 사용할 수 없습니다.")
             self._center_crop_batch_batched(batch)
-        add_near_agents_info_inplace(
-            batch,
-            predicted_neighbor_num=self.args.predicted_neighbor_num,
-        )
         return self._build_collated_batch_tensors(batch)
 
 
@@ -3431,6 +3426,7 @@ def _build_dataset_and_sampler(
     train_set = DiffusionPlannerData(
         args.train_set,  # 예: "/mnt/nuplan/dataset/processed"
         args.train_set_list,  # 예: diffusion_planner_training.json
+        args.predicted_neighbor_num
     )
 
     train_sampler = DistributedSampler(
@@ -5130,6 +5126,7 @@ def _train_one_epoch(
     args: argparse.Namespace,
     model_ema: Optional[ModelEma],
     aug: Optional[object],
+batch_num_in_all_epoch: int,
 ) -> Tuple[Dict[str, float], float, float]:
     """하나의 epoch 동안 학습을 실행하고, 손실과 걸린 시간을 계산한다.
 
@@ -5185,6 +5182,7 @@ def _train_one_epoch(
         args,
         model_ema,
         scheduler,
+        batch_num_in_all_epoch,
         aug,
     )
 
@@ -5820,6 +5818,30 @@ def _build_flat_metrics_dict_for_logging(
 
     return metrics
 
+def _init_global_step_and_total_updates(
+    args: argparse.Namespace,
+    batch_num_in_epoch: int,
+) -> int:
+    """전역 스텝 상태를 초기화하고, 전체 업데이트 스텝 수를 계산한다.
+
+    Args:
+        args:
+            학습 설정/상태를 담고 있는 Namespace.
+            - train_epochs: 전체 학습 epoch 수.
+            - _global_update_step: 없으면 0으로 새로 만든다.
+        batch_num_in_epoch:
+            현재 epoch에서 배치 개수. len(data_loader).
+
+    Returns:
+        int:
+            batch_num_in_all_epoch = train_epochs * batch_num_in_epoch (최소 1).
+    """
+    if not hasattr(args, "_global_update_step"):
+        args._global_update_step = 0
+    batch_num_in_all_epoch: int = max(
+        1,
+        int(args.train_epochs) * int(batch_num_in_epoch))
+    return batch_num_in_all_epoch
 
 def _run_training_loop(
     args: argparse.Namespace,
@@ -5840,7 +5862,11 @@ def _run_training_loop(
 ) -> float:
     """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
     elapsed_training_time_hour: float = 0.0
-
+    # 전체 업데이트 스텝 수 설정 및 global step 초기화 보장
+    batch_num_in_all_epoch: int = _init_global_step_and_total_updates(
+        args,
+        batch_num_in_epoch=len(train_loader),
+    )
     for epoch in range(init_epoch, train_epochs):
         # ✅ (중요) epoch 시작 전에 sampler epoch를 먼저 세팅
         # - resume(init_epoch>0) 시에도 첫 epoch부터 올바른 shuffle이 나오도록 함
@@ -5856,6 +5882,7 @@ def _run_training_loop(
             args=args,
             model_ema=model_ema,
             aug=aug,
+            batch_num_in_all_epoch=batch_num_in_all_epoch,
         )
 
         elapsed_training_time_hour += epoch_elapsed_time_sec / 3600.0
@@ -5907,6 +5934,7 @@ def _run_training_loop(
             best_loss=best_loss,
             global_rank=global_rank,
         )
+        # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
 
     return best_loss
 
@@ -6099,7 +6127,6 @@ def model_training(
          use_deepspeed=use_deepspeed,
      )
 
-    # ✅ (중요) 스케일링 + resume 처리까지 끝난 "최종 args"를 args.json으로 저장
     _dump_args(args, global_rank)
 
     _init_or_restore_global_update_step(

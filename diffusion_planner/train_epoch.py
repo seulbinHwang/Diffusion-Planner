@@ -253,8 +253,30 @@ def _prepare_batch_for_device(
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
             outputs[key] = value
+    # ego_future_gt_3_dim: (B, future_len, 3)
+    ego_future_gt_3_dim: torch.Tensor = outputs["ego_future_gt_3_dim"]
+    ego_future_gt_4_dim = torch.cat(
+        [
+            ego_future_gt_3_dim[..., :2],  # (B, future_len, 2)
+            torch.stack(
+                [
+                    ego_future_gt_3_dim[..., 2].cos(),
+                    ego_future_gt_3_dim[..., 2].sin(),
+                ],
+                dim=-1,
+            ),
+        ],
+        dim=-1,
+    )  # (B, future_len, 4)
+    ego_future_len = ego_future_gt_3_dim.shape[1]
+    assert ego_future_len == args.future_len, \
+        f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
+    outputs["ego_future_gt_4_dim"] = ego_future_gt_4_dim
+
+
 
     inputs: Dict[str, Any] = batch_on_device
+
     return inputs, outputs
 
 
@@ -263,30 +285,7 @@ def _prepare_batch_for_device(
 # =====================================================================
 
 
-def _init_global_step_and_total_updates(
-    args: argparse.Namespace,
-    batch_num_in_epoch: int,
-) -> int:
-    """전역 스텝 상태를 초기화하고, 전체 업데이트 스텝 수를 계산한다.
 
-    Args:
-        args:
-            학습 설정/상태를 담고 있는 Namespace.
-            - train_epochs: 전체 학습 epoch 수.
-            - _global_update_step: 없으면 0으로 새로 만든다.
-        batch_num_in_epoch:
-            현재 epoch에서 배치 개수. len(data_loader).
-
-    Returns:
-        int:
-            batch_num_in_all_epoch = train_epochs * batch_num_in_epoch (최소 1).
-    """
-    if not hasattr(args, "_global_update_step"):
-        args._global_update_step = 0
-    batch_num_in_all_epoch: int = max(
-        1,
-        int(args.train_epochs) * int(batch_num_in_epoch))
-    return batch_num_in_all_epoch
 
 
 def _as_bool_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -854,6 +853,7 @@ def train_epoch(
     args: argparse.Namespace,
     ema: Optional[object],
     scheduler,
+batch_num_in_all_epoch: int,
     aug: Optional[StatePerturbation] = None,
 ) -> Tuple[Dict[str, float], float]:
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행한다.
@@ -898,11 +898,7 @@ def train_epoch(
     if args.ddp:
         torch.cuda.synchronize()
 
-    # 전체 업데이트 스텝 수 설정 및 global step 초기화 보장
-    batch_num_in_all_epoch: int = _init_global_step_and_total_updates(
-        args,
-        batch_num_in_epoch=len(data_loader),
-    )
+
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
             # 1) device 이동 + 상한 클리핑 + 정답 분리
@@ -911,24 +907,6 @@ def train_epoch(
                 device=args.device,
                 args=args,
             )
-            # ego_future_gt_3_dim: (B, future_len, 3)
-            ego_future_gt_3_dim: torch.Tensor = outputs["ego_future_gt_3_dim"]
-            ego_future_gt_4_dim = torch.cat(
-                [
-                    ego_future_gt_3_dim[..., :2],  # (B, future_len, 2)
-                    torch.stack(
-                        [
-                            ego_future_gt_3_dim[..., 2].cos(),
-                            ego_future_gt_3_dim[..., 2].sin(),
-                        ],
-                        dim=-1,
-                    ),
-                ],
-                dim=-1,
-            )  # (B, future_len, 4)
-            ego_future_len = ego_future_gt_3_dim.shape[1]
-            assert ego_future_len == args.future_len, \
-                f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
             # near_future_gt_3_dim: (B, Pnn, future_len, 3)
             near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
             # 3) near future 4차원 궤적 + mask 생성
@@ -954,7 +932,14 @@ def train_epoch(
                 args.observation_normalizer(inputs)
 
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
-            if getattr(args, "use_deepspeed", False) and hasattr(
+            """
+            이번 배치(batch)를 학습하기 전에, 이전 배치에서 남아있는 기울기(gradient) 값을 깨끗이 지우는 작업
+            
+            (DeepSpeed를 쓰면 optimizer가 모델 내부에 묶여 동작하는 경우가 많아서, “모델에게” 초기화를 맡기는 방식이 맞습니다.)
+            
+            set_to_none=True는 기울기 값을 “0으로 채우기”보다 **아예 비워(None으로 만들기)**에 가까워서, 보통 메모리/속도 면에서 조금 더 유리할 수 있습니다.
+            """
+            if args.use_deepspeed and hasattr(
                     model, "zero_grad"):
                 model.zero_grad()
             else:
@@ -971,7 +956,7 @@ def train_epoch(
                 model=model,
                 norm_inputs=norm_inputs,
                 marginal_prob=sde_marginal_prob,
-                ego_future_gt_4_dim=ego_future_gt_4_dim,
+                ego_future_gt_4_dim=outputs["ego_future_gt_4_dim"],
                 near_future_gt_4_dim=near_future_gt_4_dim,
                 near_future_mask=near_future_mask,
                 state_normalizer=args.state_normalizer,

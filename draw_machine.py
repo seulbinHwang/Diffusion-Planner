@@ -3734,8 +3734,6 @@ def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
     ### [EGO FUTURE GT 11] ###
     if draw_option.EGO_draw_ego_future_gt_11_dim:
         data_ = input_data.get("ego_future_gt_11_dim", None)
-        if data_ is None:
-            print("[Warning] draw_ego: 'ego_future_gt_11_dim' is None.")
         draw_ego_future_gt_11_dim(ax, data_, draw_option)
 
 
