@@ -248,6 +248,7 @@ class DiffusionPlannerData(Dataset):
         if data is None:
             raise IndexError(f"Corrupted sample at index {idx}")
         both_keys: List[str] = [
+            "origin_world_pose",  # (4,)  # nuplan  # womd
             "ego_agent_past",  # (time_len, 11) # nuplan # womd
             "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd
             "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd

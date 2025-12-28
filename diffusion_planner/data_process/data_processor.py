@@ -91,6 +91,62 @@ class DataProcessor(object):
         }  # maximum number of points per feature to extract per feature layer.
 
     @staticmethod
+    def _build_origin_world_pose(
+            ego_cur_pose_np: np.
+        ndarray,  # shape: (3,) = [x_world, y_world, yaw_world]
+    ) -> np.ndarray:
+        """현재 샘플의 “ego 기준 좌표계 원점”이 세계좌표계에서 어디인지 (x, y, cos, sin)으로 만든다.
+
+        우리가 저장하는 대부분의 값은
+        “현재 ego 위치를 (0,0) 원점으로 둔 좌표계(ego 기준 좌표계)”에서 표현됩니다.
+
+        그런데 나중에 이 값을 다시 세계좌표계로 복원하려면,
+        “그 원점이 세계좌표계에서는 어디였는지”가 반드시 필요합니다.
+
+        이 함수는 그 정보를 아래 형태로 만들어 줍니다.
+
+        - origin_world_pose = [x_world, y_world, cos(yaw_world), sin(yaw_world)]
+          shape: (4,)
+
+        여기서 (x_world, y_world, yaw_world)는 입력 `ego_cur_pose_np`에서 가져옵니다.
+        `ego_cur_pose_np`는 이미 코드에서 ego 기준 좌표계 변환의 기준점(원점)으로 쓰는 값이므로,
+        이 값을 그대로 저장하면 “데이터를 만들 때 사용한 기준점”과 완전히 일치합니다.
+
+        Args:
+            ego_cur_pose_np (np.ndarray):
+                shape: (3,)
+                - [x_world, y_world, yaw_world]
+                - 세계좌표계에서의 현재 ego 위치/방향(라디안)
+
+        Returns:
+            np.ndarray:
+                shape: (4,)
+                - [x_world, y_world, cos(yaw_world), sin(yaw_world)]
+                - dtype: float32
+        """
+        if not isinstance(ego_cur_pose_np, np.ndarray):
+            raise TypeError(
+                f"`ego_cur_pose_np`는 np.ndarray 여야 합니다. got {type(ego_cur_pose_np)}"
+            )
+        if ego_cur_pose_np.shape != (3,):
+            raise ValueError(
+                f"`ego_cur_pose_np` shape는 (3,) 이어야 합니다. got {ego_cur_pose_np.shape}"
+            )
+
+        x_world: float = float(ego_cur_pose_np[0])
+        y_world: float = float(ego_cur_pose_np[1])
+        yaw_world: float = float(ego_cur_pose_np[2])
+
+        # origin_world_pose: shape (4,) = [x, y, cos(yaw), sin(yaw)]
+        origin_world_pose: np.ndarray = np.array(
+            [x_world, y_world,
+             np.cos(yaw_world),
+             np.sin(yaw_world)],
+            dtype=np.float32,
+        )
+        return origin_world_pose
+
+    @staticmethod
     def _slice_neighbor_cur_fut_horizon_11dim(
         neighbor_cur_fut_all_gt_11_dim: np.ndarray,  # shape: (N, T_all, 11)
         iteration: int,
@@ -825,6 +881,11 @@ class DataProcessor(object):
              set_coord_as_center=self.set_coord_as_center,
          )
 
+        # ✅ 추가: ego 기준 좌표계 원점의 세계좌표 포즈 저장
+        # origin_world_pose: shape (4,) = [x_world, y_world, cos(yaw), sin(yaw)]
+        origin_world_pose: np.ndarray = self._build_origin_world_pose(
+            ego_cur_pose_np)
+
         ego_agent_past = build_ego_past_feature(
             past_cur_ego_world_10=past_cur_ego_world_10,
             ego_cur_pose_np=ego_cur_pose_np,
@@ -903,6 +964,7 @@ class DataProcessor(object):
             filter_radius=self._get_effective_filter_radius_m(),
         )
         key_to_array = {
+            "origin_world_pose": origin_world_pose,  # (4,)
             "ego_agent_past": ego_agent_past,  # (time_len, 11)
             "neighbor_agents_past": neighbor_agents_past,
             # (chosen_agent_num, time_len, 11)
@@ -1612,6 +1674,10 @@ class DataProcessor(object):
                  scenario=scenario,
                  set_coord_as_center=self.set_coord_as_center,
              )
+            # ✅ 추가: ego 기준 좌표계 원점의 세계좌표 포즈 저장
+            # origin_world_pose: shape (4,) = [x_world, y_world, cos(yaw), sin(yaw)]
+            origin_world_pose: np.ndarray = self._build_origin_world_pose(
+                ego_cur_pose_np)
 
             ego_agent_past = build_ego_past_feature(
                 past_cur_ego_world_10=past_cur_ego_world_10,
@@ -1699,6 +1765,7 @@ class DataProcessor(object):
             )
 
             key_to_array = {
+                "origin_world_pose": origin_world_pose,  # (4,)
                 "ego_agent_past": ego_agent_past,  # (time_len, 11)
                 "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
                 "ego_future_gt_11_dim": ego_future_gt_11_dim,

@@ -3,7 +3,6 @@ import logging
 
 import torch
 import torch.nn as nn
-
 from diffusion_planner.utils.normalizer import StateNormalizer
 from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks
 

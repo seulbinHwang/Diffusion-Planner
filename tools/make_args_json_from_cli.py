@@ -8,6 +8,7 @@ import args_util
 
 EXCLUDE_KEYS = {"state_normalizer", "observation_normalizer"}
 
+
 def ns_to_dict(ns: argparse.Namespace,
                drop_none: bool = True,
                exclude: Optional[Iterable[str]] = None) -> Dict[str, Any]:
@@ -20,20 +21,23 @@ def ns_to_dict(ns: argparse.Namespace,
         d = {k: v for k, v in d.items() if k not in excl}
     return d
 
+
 def dump_json(obj: Dict[str, Any], path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
+
 def parse_cli_for_generator() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="get_args() 값만으로 args_base_custom.json 생성"
-    )
+        description="get_args() 값만으로 args_base_custom.json 생성")
     p.add_argument("--out-json", required=True, help="생성할 JSON 경로")
     # get_args용 인자들은 '--' 뒤에 그대로 붙인다.
-    p.add_argument("rest", nargs=argparse.REMAINDER,
+    p.add_argument("rest",
+                   nargs=argparse.REMAINDER,
                    help="-- 로 구분한 뒤의 get_args용 CLI들")
     return p.parse_args()
+
 
 def main() -> None:
     gen_args = parse_cli_for_generator()
@@ -62,6 +66,7 @@ def main() -> None:
     # 3) 저장
     dump_json(out, gen_args.out_json)
     print(f"[OK] wrote: {gen_args.out_json}")
+
 
 if __name__ == "__main__":
     main()

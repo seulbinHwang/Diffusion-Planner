@@ -2500,6 +2500,58 @@ def require_valid_ego_at_current(valid_all: np.ndarray, ego_idx: int,
         raise ValueError(
             f"Ego invalid at current frame: ego_idx={ego_idx}, t={current_t}")
 
+def build_origin_world_pose(
+    ego_xy_global: np.ndarray,  # shape: (2,)
+    ego_yaw_global: float,
+) -> np.ndarray:
+    """ego의 현재 위치/방향을 "전역 좌표 기준"으로 저장하기 좋은 4차원 벡터로 만듭니다.
+
+    지금 코드에서는 모든 출력이 "ego의 현재 위치를 원점"으로 하는 좌표 기준(ego local)으로 저장됩니다.
+    그런데 학습/후처리에서 가끔
+    "이 local 좌표의 원점이 전역(지도) 기준으로 어디였는지"
+    "local 좌표의 x축이 전역 기준으로 어느 방향이었는지"
+    를 다시 알아야 할 때가 있습니다.
+
+    그래서 ego의 현재 pose를 아래 4개 값으로 저장합니다.
+
+      1) x: 전역 좌표 기준 ego의 x 위치
+      2) y: 전역 좌표 기준 ego의 y 위치
+      3) cos_yaw: 전역 좌표 기준 ego yaw의 cos 값
+      4) sin_yaw: 전역 좌표 기준 ego yaw의 sin 값
+
+    yaw를 각도(rad) 그대로 저장해도 되지만,
+    각도는 -pi/pi 경계에서 값이 튀는 문제가 생기기 쉬워서
+    cos/sin 형태로 저장하면 더 안정적으로 복원할 수 있습니다.
+    (필요하면 나중에 atan2(sin_yaw, cos_yaw)로 yaw를 다시 만들 수 있습니다)
+
+    Args:
+        ego_xy_global: (2,) float32/float64.
+            전역 좌표 기준 ego의 (x, y) 위치.
+        ego_yaw_global: float.
+            전역 좌표 기준 ego의 yaw(라디안).
+
+    Returns:
+        origin_world_pose: (4,) float32.
+            [x, y, cos(yaw), sin(yaw)] 형태의 벡터.
+    """
+    ego_xy = np.asarray(ego_xy_global, dtype=np.float32).reshape(-1)  # shape: (2,)
+    if int(ego_xy.shape[0]) != 2:
+        raise ValueError(
+            "ego_xy_global은 (2,) 형태여야 합니다. "
+            f"got shape={tuple(ego_xy_global.shape)}"
+        )
+
+    yaw = float(ego_yaw_global)
+    cos_yaw = float(np.cos(yaw))
+    sin_yaw = float(np.sin(yaw))
+
+    origin_world_pose = np.zeros((4,), dtype=np.float32)  # shape: (4,)
+    origin_world_pose[0] = ego_xy[0]
+    origin_world_pose[1] = ego_xy[1]
+    origin_world_pose[2] = np.float32(cos_yaw)
+    origin_world_pose[3] = np.float32(sin_yaw)
+    return origin_world_pose
+
 
 def compute_ego_pose_at_current(
     scenario: Any,
@@ -4077,6 +4129,10 @@ def build_cache_dict_for_scenario(
 
     ego_xy_global, ego_yaw_global, ego_z_global = compute_ego_pose_at_current(
         scenario, track_key_to_array)
+    origin_world_pose = build_origin_world_pose(
+        ego_xy_global=ego_xy_global,  # shape: (2,)
+        ego_yaw_global=ego_yaw_global,
+    )  # shape: (4,)
 
     # -------------------------
     # 모든 트랙을 ego 좌표계로 미리 변환
@@ -4350,7 +4406,8 @@ def build_cache_dict_for_scenario(
 
     cache_dict: Dict[str, Any] = {
         "scenario_id": str(scenario.scenario_id),
-
+        "origin_world_pose": origin_world_pose,
+        # (4,) float32. [x,y,cos(yaw),sin(yaw)]
         "ego_agent_past": ego_agent_past,  # (21,11)  # womd
         "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (80,3)  # womd
         "ego_future_gt_11_dim": ego_future_gt_11_dim,  # (80,11)  # womd
