@@ -15,13 +15,29 @@ from typing import List
 
 import torch
 from torch import Tensor
-from torch_geometric.utils import degree
+# from torch_geometric.utils import degree
 from waymo_open_dataset.protos import sim_agents_submission_pb2
 
 
+
 def _unbatch(src: Tensor, batch: Tensor, dim: int = 0) -> List[Tensor]:
-    sizes = degree(batch, dtype=torch.long).tolist()
-    return src.split(sizes, dim)
+    """batch 벡터를 이용해 src를 시나리오 단위로 나눕니다.
+
+    Args:
+        src (Tensor): 나눌 대상 텐서. 예: shape (N, ...) 또는 (..., N, ...)
+        batch (Tensor): 각 원소가 어느 시나리오에 속하는지 나타내는 인덱스. shape (N,)
+        dim (int): src에서 분할할 축. 보통 0.
+
+    Returns:
+        List[Tensor]: 시나리오별로 split된 텐서 리스트. 길이는 (batch.max()+1)
+    """
+    if batch.numel() == 0:
+        return []
+
+    batch_long = batch.to(torch.long)  # shape: (N,)
+    num_groups = int(batch_long.max().item()) + 1  # shape: ()
+    sizes = torch.bincount(batch_long, minlength=num_groups).tolist()  # 길이: num_groups
+    return list(src.split(sizes, dim=dim))
 
 
 def get_scenario_rollouts(

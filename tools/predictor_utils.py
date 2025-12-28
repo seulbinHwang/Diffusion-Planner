@@ -1028,7 +1028,7 @@ def maybe_resume_from_checkpoint(
         print(f"[LOAD MODEL PARAM] Model loaded from {args.save_path}")
 
         # -------- DeepSpeed 경로 --------
-        if use_deepspeed and hasattr(diffusion_planner, "load_checkpoint"):
+        if use_deepspeed and (args.resume_model_only or hasattr(diffusion_planner, "load_checkpoint")):
             diffusion_planner, model_ema, init_epoch, wandb_id = \
                 _resume_from_checkpoint_with_deepspeed(
                     args=args,

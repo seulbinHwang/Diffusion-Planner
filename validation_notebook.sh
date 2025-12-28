@@ -63,9 +63,10 @@ ensure_validation_set_list_json "$VALIDATION_SET_PATH" "$VALIDATION_SET_LIST_PAT
 ###################################
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
-export CUDA_HOME="$CONDA_PREFIX"
+export CUDA_HOME="/usr/local/cuda-12.4"
 export PATH="$CUDA_HOME/bin:$PATH"
 export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 LOG_DIR="${WOMD_PATH}/logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
@@ -98,9 +99,9 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
- validation_predictor.py \
+ eval_predictor.py \
  --port 23001 \
-  --validation_set "$VALIDATION_SET_PATH"/ \
+  --validation_set "$VALIDATION_SET_PATH" \
   --validation_set_list "$VALIDATION_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \

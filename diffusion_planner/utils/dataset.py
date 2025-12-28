@@ -156,6 +156,7 @@ class DiffusionPlannerData(Dataset):
                  role: str = "train"):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
+                "${WOMD_PATH}/processed_womd_final/validation"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
         """
         self.data_dir = data_dir
@@ -165,12 +166,19 @@ class DiffusionPlannerData(Dataset):
         self.role = role
         if self.role == "validation":
             """
-            data_dir: "/mnt/nuplan/dataset/processed_validation"
-            data_tfrecords_dir: "/mnt/nuplan/dataset/processed_validation_tfrecords_splitted"
+            data_dir: 
+                    예 1) "/mnt/nuplan/dataset/validation"
+                    예 2) ${WOMD_PATH}/processed_womd_final/validation
+            self.data_tfrecords_dir: 
+                    예 1) "/mnt/nuplan/dataset/validation_tfrecords_splitted"
+                    예 2) ${WOMD_PATH}/processed_womd_final/validation
+            
+            방식 : data_dir의 마지막 경로명 + "_tfrecords_splitted"를 붙인 경로
             """
-            self.data_tfrecords_dir = data_dir.replace(
-                "processed", "processed_validation_tfrecords_splitted")
-
+            parent_dir = os.path.dirname(self.data_dir) # ${WOMD_PATH}/processed_womd_final
+            last_dir_name = os.path.basename(self.data_dir) # validation
+            self.data_tfrecords_dir = os.path.join(
+                parent_dir, f"{last_dir_name}_tfrecords_splitted") # ${WOMD_PATH}/processed_womd_final/validation_tfrecords_splitted
     def __len__(self):
         return len(self.data_list)
 
