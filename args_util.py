@@ -84,7 +84,7 @@ def get_args():
                         type=str,
                         help='save dir for model ckpt',
                         default=".")
-    parser.add_argument('--past_name',
+    parser.add_argument('--load_name',
                         type=str,
                         help='prev name for model ckpt',
                         default=None)
@@ -193,7 +193,7 @@ def get_args():
     parser.add_argument('--lane_summary_num',
                         type=int,
                         help='number of lanes',
-                        default=100) # 0 이면 요약 안함
+                        default=100)  # 0 이면 요약 안함
     parser.add_argument('--route_num',
                         type=int,
                         help='number of route lanes',
@@ -275,10 +275,8 @@ def get_args():
         '--use_filter_radius',
         default=True,
         type=boolean,
-        help=(
-            "True이면 filter_radius 반경(m) 안의 요소만 남기도록 필터링을 수행합니다. "
-            "False이면 filter_radius 값과 상관없이 필터링을 하지 않습니다."
-        ),
+        help=("True이면 filter_radius 반경(m) 안의 요소만 남기도록 필터링을 수행합니다. "
+              "False이면 filter_radius 값과 상관없이 필터링을 하지 않습니다."),
     )
     parser.add_argument(
         '--use_8bit_optimizer',
@@ -490,7 +488,7 @@ def get_args():
     parser.add_argument(
         "--womd_splits",
         type=str,
-        default="validation",#,validation,testing",#"
+        default="validation",  #,validation,testing",#"
         help="예: training,validation (콤마로 구분)",
     )
 
@@ -529,9 +527,7 @@ def get_args():
     parser.add_argument('--make_statistics_when_caching',
                         default=True,
                         type=boolean)
-    parser.add_argument('--die_all',
-                        default=True,
-                        type=boolean)
+    parser.add_argument('--die_all', default=True, type=boolean)
     args = parser.parse_args()
     # ★ stage config(json/yaml)로 CLI 인자 덮어쓰기
     args = _override_args_with_stage_config(args)

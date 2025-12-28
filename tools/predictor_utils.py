@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from typing import Any, Dict, List, Optional, Tuple
 import os
+import shutil
+import time
 import wandb
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -15,8 +17,1069 @@ import argparse
 import os
 from typing import Any, Dict
 from datetime import datetime
+from torch import optim
+from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
 
 import torch
+
+
+def _select_latest_like_tag(save_path: str) -> str:
+    """DeepSpeed 체크포인트 루트에서 '가장 최신 latest 계열 태그'를 고른다.
+
+    동작 규칙:
+    1) save_path 아래에 'latest'라는 디렉터리가 정확히 있으면 그걸 최우선으로 사용한다.
+       (사람이 심볼릭 링크/복사로 만들어둔 경우를 고려)
+    2) 그 외에는 이름에 "latest"가 들어간 디렉터리들(예: latest_epoch-000010) 중
+       정렬 기준 가장 마지막(=가장 큰 숫자) 것을 선택한다.
+       - epoch를 6자리 0패딩으로 쓰고 있으므로 문자열 정렬로도 최신 선택이 가능하다.
+
+    Args:
+        save_path: 체크포인트 루트 디렉터리.
+
+    Returns:
+        str: load_checkpoint에 넣을 tag 문자열.
+    """
+    tag: str = "latest"
+    if not os.path.isdir(save_path):
+        return tag
+
+    try:
+        children = [
+            d for d in os.listdir(save_path)
+            if os.path.isdir(os.path.join(save_path, d))
+        ]
+    except OSError as e:
+        raise RuntimeError(
+            f"[DeepSpeed] 체크포인트 디렉터리 목록을 읽는 중 오류 발생: {save_path}, {e}") from e
+
+    # 1) 정확히 "latest" 디렉터리가 있으면 우선 사용
+    if "latest" in children:
+        return "latest"
+
+    # 2) "latest"가 포함된 태그 디렉터리들 중 가장 최신(정렬 마지막) 선택
+    candidate_tags = [d for d in children if "latest" in d]
+    if candidate_tags:
+        return sorted(candidate_tags)[-1]
+
+    return tag
+
+
+def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
+    save_path: str,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    global_rank: int,
+) -> Optional[ModelEma]:
+    """DeepSpeed 폴더에서 **모델/EMA 가중치만** 읽어오는 함수.
+
+    이 함수는 optimizer나 스케줄러 상태는 전혀 건드리지 않고,
+    디스크에 저장된 DeepSpeed 체크포인트 폴더에서
+    순수하게 모델 값(가중치)만 불러와 현재 모델에 채워 넣는다.
+
+    사용 의도:
+        * stage1에서 이미 학습한 모델 값을 가져오되,
+          stage2에서는 새로운 학습 설정(optimizer, 학습률 등)을 그대로 쓰고 싶을 때.
+        * encoder_local을 고정(freeze)해서 메모리를 아끼고 싶지만,
+          DeepSpeed의 복잡한 재개(load) 로직은 피하고 싶을 때.
+
+    동작 요약:
+        1) save_path 안에서 "latest"가 들어간 하위 폴더 이름을 고른다.
+           예: latest_epoch-000001
+        2) 그 안의 mp_rank_XX_model_states.pt 파일을 열어
+           저장된 모델 값들을 읽어온다.
+        3) 읽어온 모델 값을 현재 모델(diffusion_planner)에 넣는다.
+        4) EMA 모델이 있으면, 현재 모델 값으로 EMA 모델도 맞춰 준다.
+
+    Args:
+        save_path (str):
+            DeepSpeed 체크포인트가 들어 있는 루트 폴더 경로.
+            예: "./training_log/실험이름/2025-12-10-12:52:12/"
+        diffusion_planner (nn.Module):
+            DeepSpeed로 감싸진 주행 계획 모델 또는 그와 같은 구조의 모델.
+        model_ema (Optional[ModelEma]):
+            EMA(지수 이동 평균)를 추적하는 보조 모델 래퍼.
+            없으면 None.
+        global_rank (int):
+            분산 학습에서 이 프로세스의 전체 순번.
+            주로 로그 출력에만 사용된다.
+
+    Returns:
+        Optional[ModelEma]:
+            모델 값이 동기화된 EMA 래퍼를 돌려준다.
+            EMA를 쓰지 않는 경우에는 원래대로 None을 돌려준다.
+    """
+    tag = _select_latest_like_tag(save_path)
+    tag_dir = os.path.join(save_path, tag)
+
+    # tag 디렉터리 안에서 *_model_states.pt 중 첫 번째를 찾는 방식
+    candidates = [
+        f for f in os.listdir(tag_dir) if f.endswith("_model_states.pt")
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"No *_model_states.pt found in {tag_dir}")
+
+    mp_rank_str = sorted(candidates)[0]  # 보통 mp_rank_00_model_states.pt
+    ckpt_path = os.path.join(tag_dir, mp_rank_str)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    state_like = ckpt.get("ema_state_dict", ckpt["module"])
+
+    base_model: nn.Module = getattr(diffusion_planner, "module",
+                                    diffusion_planner)
+    incompatible = base_model.load_state_dict(state_like, strict=False)
+
+    if global_rank == 0:
+        print(f"[ModelOnly<DeepSpeed>] LOAD MODEL PARAM from {ckpt_path}")
+        if getattr(incompatible, "missing_keys", None):
+            print(
+                f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}"
+            )
+        if getattr(incompatible, "unexpected_keys", None):
+            print(
+                f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}"
+            )
+
+    if model_ema is not None:
+        ema_model = getattr(model_ema, "ema", model_ema)
+        ema_model.load_state_dict(base_model.state_dict(), strict=False)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
+
+    return model_ema
+
+
+def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
+    """주어진 경로가 DeepSpeed checkpoint 디렉터리인지 대략 판별한다.
+
+    규칙(간단한 휴리스틱):
+      - save_path 하위 폴더들 중 이름에 "latest" 또는 "best" 가 들어가는
+        디렉터리를 찾고
+      - 그 디렉터리 안에 "mp_rank_" 로 시작하는 하위 파일/디렉터리가 있으면
+        DeepSpeed 가 저장한 구조라고 본다.
+
+    Args:
+        save_path:
+            체크포인트 루트 디렉터리 경로.
+
+    Returns:
+        bool:
+            True  → DeepSpeed 형식으로 저장된 디렉터리라고 판단.
+            False → PyTorch 단일 .pth 형식이라고 보고 처리한다.
+    """
+    if not os.path.isdir(save_path):
+        return False
+
+    try:
+        # save_path 하위의 1차 자식 디렉터리 목록
+        top_children = os.listdir(save_path)
+    except OSError:
+        return False
+
+    # 이름에 "latest" 또는 "best" 가 들어가는 하위 디렉터리만 후보로 사용
+    candidate_tag_dirs = []
+    for name in sorted(top_children):
+        if ("latest" in name) or ("best" in name):
+            full = os.path.join(save_path, name)
+            if os.path.isdir(full):
+                candidate_tag_dirs.append(full)
+
+    # 후보 tag 디렉터리들 중 하나라도 mp_rank_* 를 포함하면 DeepSpeed 형식으로 판단
+    for tag_dir in candidate_tag_dirs:
+        try:
+            children = os.listdir(tag_dir)
+        except OSError:
+            continue
+        for name in children:
+            # 예: mp_rank_00_model_states.pt, mp_rank_00/
+            if name.startswith("mp_rank_"):
+                return True
+
+    return False
+
+
+def _restore_ema_and_model_from_client_state_for_deepspeed(
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    client_state: Dict[str, Any],
+    global_rank: int,
+    load_ema_for_model: bool,
+    load_ema_for_ema_model: bool,
+) -> Optional[ModelEma]:
+    """client_state 정보를 이용해 EMA와 (필요하다면) 모델 가중치를 복원한다.
+
+    Args:
+        diffusion_planner (nn.Module): DeepSpeed 엔진 객체.
+        model_ema (Optional[ModelEma]): EMA 래퍼. 없으면 None.
+        client_state (Dict[str, Any]): 체크포인트에 저장된 작은 상태 dict.
+            - client_state.get("ema_state_dict"): Dict[str, Tensor]
+              각 텐서의 shape 는 원본 모델 파라미터와 동일
+              (예: (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등).
+
+            save_checkpoint 때 넘겨준 client_state 그대로 돌아온 dict.
+            epoch, loss, wandb_id, ema_state_dict 가 그 안에 들어있음
+            ( client_state 내용을 포함한 메타 정보를 별도의
+            체크포인트 파일(예: mp_rank_00_model_states.pt 안의 딕셔너리 키)로 같이 저장해 둔다. )
+
+        global_rank (int): 전역 rank. 0일 때만 로그를 출력한다.
+
+    Returns:
+        Optional[ModelEma]: EMA 상태가 반영된 ModelEma 또는 None.
+    """
+    ema_state_dict: Optional[Dict[str, Any]] = client_state.get(
+        "ema_state_dict", None)
+
+    # 1) EMA 객체가 있고, ema_state_dict 가 있으면 EMA 가중치 복원
+    if load_ema_for_ema_model:
+        assert (model_ema is not None) and (ema_state_dict is not None), \
+            "[DeepSpeed LOAD MODEL PARAM] Restoring an EMA model requires both `model_ema` and `ema_state_dict`."
+        try:
+            ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
+            # ema_model.state_dict() 의 각 텐서 shape:
+            #   (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW) 등
+            ema_model.load_state_dict(ema_state_dict, strict=False)
+            ema_model.eval()
+            for p in ema_model.parameters():
+                p.requires_grad_(False)
+            if global_rank == 0:
+                print("[DeepSpeed LOAD MODEL PARAM]EMA state load done")
+        except Exception as e:
+            if global_rank == 0:
+                print(f"[DeepSpeed LOAD MODEL PARAM]EMA state load FAIL: {e}")
+
+    if load_ema_for_model:
+        assert ema_state_dict is not None, \
+            "[DeepSpeed LOAD MODEL PARAM] Initializing EMA → base_model requires an EMA `state_dict`."
+        try:
+            base_model: nn.Module = getattr(diffusion_planner, "module",
+                                            diffusion_planner)
+            incompatible = base_model.load_state_dict(ema_state_dict,
+                                                      strict=False)
+            if global_rank == 0:
+                if getattr(incompatible, "missing_keys", None):
+                    print(
+                        f"[DeepSpeed LOAD MODEL PARAM] model-only(EMA) missing_keys: {incompatible.missing_keys}"
+                    )
+                if getattr(incompatible, "unexpected_keys", None):
+                    print(
+                        f"[DeepSpeed LOAD MODEL PARAM] model-only(EMA) unexpected_keys: {incompatible.unexpected_keys}"
+                    )
+                print(
+                    "[DeepSpeed LOAD MODEL PARAM] model-only resume: base model initialized from EMA weights"
+                )
+        except Exception as e:
+            if global_rank == 0:
+                print(f"... 실패: {e}")
+            raise RuntimeError(
+                "[DeepSpeed LOAD MODEL PARAM] Error occurred during EMA → base_model initialization in model-only mode."
+            ) from e
+            if global_rank == 0:
+                print(
+                    f"[DeepSpeed LOAD MODEL PARAM] EMA→base_model 초기화 실패: {e}")
+
+    return model_ema
+
+
+def _update_deepspeed_optimizer_param_group_meta(
+    diffusion_planner: nn.Module,) -> None:
+    """DeepSpeed 엔진 내부 옵티마이저 param_group 메타 정보를 보정한다.
+
+    DeepSpeed 모드에서는
+      - diffusion_planner.optimizer.param_groups[*]["lr"]
+      - diffusion_planner.optimizer.param_groups[*]["weight_decay"]
+    값들만 채워져 있는 경우가 있어, 이후 WD warmdown 등의 처리를 위해
+    각 그룹에
+      - "lr_max": 기준 학습률 (shape: ())
+      - "wd_max": 기준 weight decay (shape: ())
+    필드를 추가로 넣어 준다.
+
+    Args:
+        diffusion_planner (nn.Module):
+            - deepspeed.DeepSpeedEngine 인스턴스를 기대한다.
+            - diffusion_planner.optimizer.param_groups 는
+              각 그룹별로 "params": List[nn.Parameter] 를 가진다.
+              각 파라미터 텐서 shape 는 (out_dim, in_dim), (dim,),
+              (C_out, C_in, kH, kW) 등 계층 종류에 따라 다양하다.
+    """
+    if not hasattr(diffusion_planner, "optimizer"):
+        return
+
+    for pg in diffusion_planner.optimizer.param_groups:
+        pg.setdefault("lr_max", float(pg["lr"]))
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
+
+
+def _resume_from_deepspeed_checkpoint_format(
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    save_path: str,
+    global_rank: int,
+    load_optimizer_states: bool = True,
+    load_lr_scheduler_states: bool = True,
+    load_ema_for_model: bool = True,
+    load_ema_for_ema_model: bool = True,
+) -> Tuple[int, Optional[str], Optional[ModelEma]]:
+    """DeepSpeed 형식으로 저장된 체크포인트를 읽어와 학습을 이어갈 준비를 한다.
+
+    Args:
+        diffusion_planner (nn.Module): DeepSpeed 엔진 객체.
+        model_ema (Optional[ModelEma]): EMA 래퍼. 없으면 None.
+        save_path (str): 체크포인트 루트 디렉터리 경로.
+        global_rank (int): 전역 rank. 0일 때만 로그를 출력한다.
+        load_optimizer_states (bool): 옵티마 상태를 함께 불러올지 여부.
+        load_lr_scheduler_states (bool): 스케줄러 상태를 함께 불러올지 여부.
+
+    Returns:
+        Tuple[int, Optional[str], Optional[ModelEma]]:
+            - init_epoch (int): 재개할 epoch 인덱스(0 기반).
+            - wandb_id (Optional[str]): 이어서 사용할 W&B run id 또는 None.
+            - model_ema (Optional[ModelEma]): EMA 상태가 반영된 EMA 래퍼 또는 None.
+    """
+    # 0) tag 자동 선택: save_path 하위 폴더 중 이름에 "latest"가 포함된 디렉터리들 중
+    #    정렬 기준 첫 번째 것을 tag로 사용. 없으면 기본값 "latest".
+    tag: str = _select_latest_like_tag(save_path)
+
+    if global_rank == 0:
+        print(
+            f"[DeepSpeed LOAD MODEL PARAM] load_checkpoint: save_path={save_path}, tag='{tag}'"
+        )
+
+        # 1) DeepSpeedEngine.load_checkpoint 호출 (신/구 버전 둘 다 지원)
+        """
+load_path: str
+    실제로 로드에 사용된 체크포인트 디렉터리 경로.
+    보통 save_path/tag 에 해당하는 문자열 
+    (예: /.../training_log/.../latest_epoch-000010)
+
+client_state: Optional[Dict[str, Any]]
+    save_checkpoint 때 넘겨준 client_state 그대로 돌아온 dict.
+    epoch, loss, wandb_id, ema_state_dict 가 그 안에 들어있음
+    ( client_state 내용을 포함한 메타 정보를 별도의 
+    체크포인트 파일(예: mp_rank_00_model_states.pt 안의 딕셔너리 키)로 같이 저장해 둔다. )
+        """
+    load_path, client_state = diffusion_planner.load_checkpoint(
+        save_path,
+        tag=tag,
+        load_optimizer_states=load_optimizer_states,
+        load_lr_scheduler_states=load_lr_scheduler_states,
+    )
+
+    if global_rank == 0:
+        print(
+            f"[DeepSpeed LOAD MODEL PARAM] load_checkpoint returned load_path={load_path}, "
+            f"client_state keys={list((client_state or {}).keys())}")
+
+    # client_state 가 None 인 경우에도 이후 로직이 동일하게 동작하도록 빈 dict 로 대체
+    client_state = client_state or {}
+    init_epoch: int = int(client_state.get("epoch", 0))
+    wandb_id: Optional[str] = client_state.get("wandb_id", None)
+
+    # EMA 및 (필요 시) base model 복원
+    model_ema = _restore_ema_and_model_from_client_state_for_deepspeed(
+        diffusion_planner=diffusion_planner,
+        model_ema=model_ema,
+        client_state=client_state,
+        global_rank=global_rank,
+        load_ema_for_model=load_ema_for_model,
+        load_ema_for_ema_model=load_ema_for_ema_model,
+    )
+
+    # DeepSpeed 엔진 내부 옵티마 param_group 메타 보정
+    _update_deepspeed_optimizer_param_group_meta(diffusion_planner)
+
+    return init_epoch, wandb_id, model_ema
+
+
+def _resume_from_checkpoint_with_deepspeed(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    global_rank: int,
+    resume_model_only: bool,
+) -> Tuple[nn.Module, Optional[ModelEma], int, Optional[str]]:
+    """DeepSpeed 모드에서 args.save_path 기준으로 모델/EMA를 불러온다.
+
+    처리 규칙:
+      - args.save_path 이 DeepSpeed 전용 디렉터리 구조이면
+        _resume_from_deepspeed_checkpoint_format(...) 을 사용한다.
+        · resume_model_only=False → optimizer/scheduler 상태까지 함께 복원.
+        · resume_model_only=True  → optimizer/scheduler 는 건드리지 않고,
+          모델/EMA만 로드한다.
+      - args.save_path 이 PyTorch latest.pth 형식이면
+        _resume_deepspeed_from_pytorch_checkpoint(...) 를 사용해
+        모델/EMA를 불러온다. (optimizer/scheduler는 그대로)
+
+      - resume_model_only=True 인 경우:
+        · init_epoch=0, wandb_id=None 으로 돌려준다.
+      - resume_model_only=False 인 경우:
+        · ckpt 에서 읽은 init_epoch / wandb_id 를 그대로 사용한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 Namespace. device 정보 등을 포함한다.
+        diffusion_planner (nn.Module):
+            deepspeed.DeepSpeedEngine 또는 DDP 래퍼가 씌워진 모델.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 상세 로그를 출력한다.
+        resume_model_only (bool):
+            True 이면 모델/EMA 파라미터만 불러오는 모드.
+
+    Returns:
+        Tuple[nn.Module, Optional[ModelEma], int, Optional[str]]:
+            - diffusion_planner: 모델/EMA 로딩이 반영된 모델.
+            - model_ema: EMA 상태가 복원된 ModelEma 또는 None.
+            - init_epoch: 재개 시작 epoch 인덱스. resume_model_only=True 이면 0.
+            - wandb_id: 이어서 사용할 W&B run id 또는 None.
+    """
+    # ✅ 1. model-only + DeepSpeed인 경우: DeepSpeedEngine.load_checkpoint 안 쓴다
+    if resume_model_only:
+        model_ema = _load_model_and_ema_state_only_from_deepspeed_checkpoint(
+            save_path=args.save_path,
+            diffusion_planner=diffusion_planner,
+            model_ema=model_ema,
+            global_rank=global_rank,
+        )
+        init_epoch = 0
+        wandb_id = None
+        return diffusion_planner, model_ema, init_epoch, wandb_id
+    elif _is_deepspeed_checkpoint_dir(args.save_path):
+        init_epoch_loaded, wandb_id_loaded, model_ema = \
+            _resume_from_deepspeed_checkpoint_format(
+                diffusion_planner=diffusion_planner,
+                model_ema=model_ema,
+                save_path=args.save_path,
+                global_rank=global_rank,
+                load_optimizer_states=True,
+                load_lr_scheduler_states=True,
+                load_ema_for_model=args.load_ema_for_model,
+                load_ema_for_ema_model=args.load_ema_for_ema_model,
+            )
+    else:
+        raise ValueError(
+            "The save_path does not contain a valid DeepSpeed checkpoint directory."
+        )
+
+    if resume_model_only:
+        init_epoch = 0
+        wandb_id = None
+    else:
+        init_epoch = init_epoch_loaded
+        wandb_id = wandb_id_loaded
+
+    return diffusion_planner, model_ema, init_epoch, wandb_id
+
+
+def _select_pytorch_checkpoint_path_for_model_only(ckpt_dir: str) -> str:
+    """model-only 로딩에 사용할 latest.pth 또는 best.pth 경로를 고른다.
+
+    우선순위:
+      1) ckpt_dir/latest.pth 가 있으면 그 경로를 사용한다.
+      2) 없으면 ckpt_dir/best.pth 를 시도한다.
+      3) 둘 다 없으면 FileNotFoundError 를 발생시킨다.
+
+    Args:
+        ckpt_dir (str):
+            PyTorch 체크포인트가 들어 있는 디렉터리 경로.
+
+    Returns:
+        str:
+            실제로 torch.load 에 사용할 체크포인트 파일 경로.
+    """
+    ckpt_path = os.path.join(ckpt_dir, "latest.pth")
+    if os.path.exists(ckpt_path):
+        return ckpt_path
+
+    alt_ckpt_path = os.path.join(ckpt_dir, "best.pth")
+    if os.path.exists(alt_ckpt_path):
+        return alt_ckpt_path
+
+    raise FileNotFoundError(
+        f"PyTorch 체크포인트 latest.pth / best.pth 를 찾을 수 없습니다: {ckpt_dir}")
+
+
+def _load_pytorch_checkpoint_dict_for_model_only(
+    ckpt_path: str,
+    device: str,
+) -> Dict[str, Any]:
+    """model-only 로딩용 PyTorch 체크포인트 파일을 dict 로 읽어온다.
+
+    Args:
+        ckpt_path (str):
+            latest.pth 또는 best.pth 전체 경로.
+        device (str):
+            "cuda" / "cuda:0" / "cpu" 등. torch.load map_location 에 사용된다.
+
+    Returns:
+        Dict[str, Any]:
+            torch.load 로 읽은 체크포인트 dict.
+            - ckpt["model"]: 모델 state_dict (각 value 텐서 shape는
+              (out_dim, in_dim), (hidden_dim,), (C_out, C_in, kH, kW) 등).
+            - ckpt["ema_state_dict"] (선택): EMA state_dict.
+    """
+    map_location = "cpu" if device.startswith("cuda") else device
+    ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location=map_location)
+    return ckpt
+
+
+def _choose_state_dict_for_model_only(
+    ckpt: Dict[str, Any],) -> Tuple[Dict[str, torch.Tensor], str]:
+    """EMA state 가 있으면 EMA를, 없으면 model state 를 선택한다.
+
+    Args:
+        ckpt (Dict[str, Any]):
+            torch.load 로 읽어온 체크포인트 dict.
+
+    Returns:
+        Tuple[Dict[str, torch.Tensor], str]:
+            - state_like:
+                모델에 실제로 넣을 state_dict.
+            - source_name:
+                "EMA" 또는 "model" 문자열. 로그용.
+    """
+    raw_model_state: Dict[str, torch.Tensor] = ckpt.get("model", ckpt)
+    raw_ema_state: Optional[Dict[str, torch.Tensor]] = ckpt.get(
+        "ema_state_dict", None)
+
+    if raw_ema_state is not None and isinstance(
+            raw_ema_state, dict) and len(raw_ema_state) > 0:
+        return raw_ema_state, "EMA"
+    else:
+        return raw_model_state, "model"
+
+
+def _strip_or_add_module_prefix_for_model_only(
+    src_state: Dict[str, torch.Tensor],
+    want_module_prefix: bool,
+) -> Dict[str, torch.Tensor]:
+    """state_dict 키에 "module." 접두사를 붙이거나 떼는 작은 도우미 함수.
+
+    DDP/DeepSpeed 래핑 여부에 따라
+    - 모델 쪽 키는 "module.xxx" 또는 "xxx" 형태일 수 있고,
+    - 체크포인트 쪽 키도 두 형태 중 하나일 수 있다.
+    이 함수는 원하는 형태(want_module_prefix)에 맞춰
+    키 문자열만 정리해 새 dict를 만들어 준다.
+
+    Args:
+        src_state (Dict[str, torch.Tensor]):
+            체크포인트에서 가져온 state_dict.
+            각 value 텐서의 shape 는 레이어 종류에 따라
+              (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등 다양할 수 있다.
+        want_module_prefix (bool):
+            True  이면 모든 키가 "module." 으로 시작하도록 맞춘다.
+            False 이면 "module." 으로 시작하는 키는 접두사를 떼고,
+            나머지는 그대로 둔다.
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            키 문자열만 정리된 새 state_dict.
+    """
+    new_state: Dict[str, torch.Tensor] = {}
+    for k, v in src_state.items():
+        if want_module_prefix:
+            # 이미 "module." 로 시작하면 그대로, 아니면 앞에 붙인다.
+            new_k = k if k.startswith("module.") else f"module.{k}"
+        else:
+            # "module." 로 시작하면 떼고, 아니면 그대로 둔다.
+            new_k = k[7:] if k.startswith("module.") else k
+        new_state[new_k] = v
+    return new_state
+
+
+def _align_state_dict_keys_to_base_model_for_model_only(
+    state_like: Dict[str, torch.Tensor],
+    base_model: nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """base_model.state_dict() 와 키 형태(module. prefix 유무)를 맞춘 state_dict 를 만든다.
+
+    DeepSpeed/DDP 래핑 여부에 따라
+      - 현재 모델 키는 "module.xxx" 또는 "xxx" 형태일 수 있고,
+      - ckpt 키도 "module.xxx" 또는 "xxx" 형태일 수 있다.
+    이 함수는 두 쪽의 키 패턴을 비교해서,
+    필요한 경우 "module." 접두사를 붙이거나 떼서
+    base_model.load_state_dict(...) 에 바로 넣을 수 있는 state_dict 로 맞춰준다.
+
+    Args:
+        state_like (Dict[str, torch.Tensor]):
+            ckpt 에서 선택한 state_dict.
+            각 value 텐서는 레이어에 따라
+              (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등의 shape 를 가진다.
+        base_model (nn.Module):
+            실제 파라미터를 가진 nn.Module (DDP 래퍼를 벗긴 모델).
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            base_model.load_state_dict(...) 에 바로 사용할 수 있는 state_dict.
+    """
+    current_keys = list(base_model.state_dict().keys())
+    ckpt_keys = list(state_like.keys())
+
+    has_module_in_ckpt = all(k.startswith("module.") for k in ckpt_keys)
+    has_module_in_model = all(k.startswith("module.") for k in current_keys)
+
+    # ckpt: module.* / 모델: 평범한 키 → prefix 제거
+    if has_module_in_ckpt and (not has_module_in_model):
+        return _strip_or_add_module_prefix_for_model_only(
+            state_like,
+            want_module_prefix=False,
+        )
+    # ckpt: 평범한 키 / 모델: module.* → prefix 추가
+    elif (not has_module_in_ckpt) and has_module_in_model:
+        return _strip_or_add_module_prefix_for_model_only(
+            state_like,
+            want_module_prefix=True,
+        )
+    else:
+        # 둘 다 module.* 이거나, 둘 다 평범한 키인 경우 그대로 사용
+        return state_like
+
+
+def _load_state_dict_into_base_and_ema_model_only(
+    state_dict: Dict[str, torch.Tensor],
+    source_name: str,
+    base_model: nn.Module,
+    model_ema: Optional[ModelEma],
+    ckpt_path: str,
+    global_rank: int,
+) -> Optional[ModelEma]:
+    """선택된 state_dict 를 base_model 과 EMA 모델에 주입하고 로그를 남긴다.
+
+    처리 순서:
+      1) base_model.load_state_dict(..., strict=False) 로 파라미터 로드.
+      2) global_rank==0 인 경우 missing_keys / unexpected_keys 를 출력.
+      3) model_ema 가 있으면 base_model.state_dict() 로 EMA 모델도 초기화하고,
+         eval 모드 + requires_grad=False 로 고정한다.
+
+    Args:
+        state_dict (Dict[str, torch.Tensor]):
+            base_model.load_state_dict 에 넣을 state_dict.
+        source_name (str):
+            "EMA" 또는 "model". 어떤 state 를 사용했는지 로그용.
+        base_model (nn.Module):
+            실제 파라미터를 가진 nn.Module.
+            base_model.state_dict() 의 각 텐서는
+              (out_dim, in_dim), (hidden_dim,),
+              (C_out, C_in, kH, kW) 등 shape 를 가진다.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        ckpt_path (str):
+            사용한 체크포인트 파일 경로. 로그용.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 로그를 출력한다.
+
+    Returns:
+        Optional[ModelEma]:
+            EMA 상태가 덮어써진 model_ema (또는 원래 None).
+    """
+    incompatible = base_model.load_state_dict(state_dict, strict=False)
+    if global_rank == 0:
+        print(
+            f"[ModelOnly<Pytorch>] {source_name} state_dict 로 LOAD MODEL PARAM 완료 "
+            f"(ckpt_path={ckpt_path})")
+        if getattr(incompatible, "missing_keys", None):
+            print(
+                f"[ModelOnly<Pytorch>] missing_keys: {incompatible.missing_keys}"
+            )
+        if getattr(incompatible, "unexpected_keys", None):
+            print(
+                f"[ModelOnly<Pytorch>] unexpected_keys: {incompatible.unexpected_keys}"
+            )
+
+    # EMA 객체도 있으면 base_model 과 동일한 파라미터로 맞춰준다.
+    if model_ema is not None:
+        try:
+            ema_model: nn.Module = getattr(model_ema, "ema", model_ema)
+            ema_incompatible = ema_model.load_state_dict(
+                base_model.state_dict(),
+                strict=False,
+            )
+            ema_model.eval()
+            for p in ema_model.parameters():
+                # 각 파라미터 텐서 shape: (out_dim, in_dim), (hidden_dim,), ...
+                p.requires_grad_(False)
+            if global_rank == 0:
+                if getattr(ema_incompatible, "missing_keys", None):
+                    print(
+                        f"[ModelOnly<Pytorch>] EMA missing_keys: {ema_incompatible.missing_keys}"
+                    )
+                if getattr(ema_incompatible, "unexpected_keys", None):
+                    print(
+                        f"[ModelOnly<Pytorch>] EMA unexpected_keys: {ema_incompatible.unexpected_keys}"
+                    )
+                print("[ModelOnly<Pytorch>] EMA state 동기화 완료")
+        except Exception as e:
+            if global_rank == 0:
+                print(f"[ModelOnly<Pytorch>] EMA state 동기화 실패: {e}")
+
+    return model_ema
+
+
+def _load_model_and_ema_state_only_from_pytorch_checkpoint(
+    save_path: str,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    device: str,
+    global_rank: int,
+) -> Optional[ModelEma]:
+    """PyTorch latest.pth 에서 모델/EMA 파라미터만 불러와 새 학습을 시작할 때 사용한다.
+
+    전체 흐름:
+      1) save_path 안에서 latest.pth 또는 best.pth 경로를 고른다.
+      2) 선택한 파일을 torch.load 로 읽어 체크포인트 dict 를 얻는다.
+      3) EMA state_dict 가 있으면 EMA를, 없으면 model state_dict 를 선택한다.
+      4) base_model(state_dict) 의 키 형태와 맞도록 module. prefix 를 조정한다.
+      5) base_model.load_state_dict(...) 로 파라미터를 주입하고,
+         model_ema 가 있으면 base_model.state_dict() 로 EMA도 초기화한다.
+
+    Args:
+        save_path (str):
+            latest.pth / best.pth 가 들어 있는 디렉터리 경로.
+        diffusion_planner (nn.Module):
+            현재 학습에 사용할 모델 또는 DDP 래퍼.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        device (str):
+            "cuda" / "cpu" 등. torch.load 의 map_location 에 사용된다.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 로그를 출력한다.
+
+    Returns:
+        Optional[ModelEma]:
+            EMA 상태가 덮어써진 model_ema (또는 원래 None).
+    """
+    ckpt_path: str = _select_pytorch_checkpoint_path_for_model_only(save_path)
+    ckpt: Dict[str, Any] = _load_pytorch_checkpoint_dict_for_model_only(
+        ckpt_path=ckpt_path,
+        device=device,
+    )
+
+    # base_model: 실제 nn.Module (DDP 래퍼 벗겨진 상태)
+    base_model: nn.Module = getattr(diffusion_planner, "module",
+                                    diffusion_planner)
+
+    state_like, source_name = _choose_state_dict_for_model_only(ckpt)
+    state_dict = _align_state_dict_keys_to_base_model_for_model_only(
+        state_like=state_like,
+        base_model=base_model,
+    )
+
+    model_ema = _load_state_dict_into_base_and_ema_model_only(
+        state_dict=state_dict,
+        source_name=source_name,
+        base_model=base_model,
+        model_ema=model_ema,
+        ckpt_path=ckpt_path,
+        global_rank=global_rank,
+    )
+    return model_ema
+
+
+def _resume_from_pytorch_checkpoint(
+    save_path: str,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+           Optional[str]]:
+    """기존 PyTorch/DDP 형식 latest.pth 를 그대로 불러와서 학습을 재개한다.
+
+    처리 흐름:
+      1) diffusion_planner, optimizer, scheduler, init_epoch, wandb_id, model_ema =
+         resume_model(save_path, ...) 를 호출해
+         - 모델 파라미터
+         - 옵티마이저 상태
+         - 스케줄러 상태
+         - EMA 상태
+         를 한 번에 복원한다.
+      2) optimizer.param_groups[*] 에 대해
+         - "lr_max": 기준 학습률 (shape: ())
+         - "wd_max": 기준 weight_decay (shape: ())
+         를 채워 이후 WD warmdown 에서 사용할 수 있게 한다.
+
+    Args:
+        save_path (str):
+            - latest.pth 가 들어 있는 PyTorch 체크포인트 디렉터리.
+        diffusion_planner (nn.Module):
+            - nn.Module 또는 DDP 래핑된 모델.
+        optimizer (optim.Optimizer):
+            - AdamW/AdamW8bit 옵티마이저.
+        scheduler (Any):
+            - 학습률 스케줄러 객체.
+        model_ema (Optional[ModelEma]):
+            - EMA 래퍼 또는 None.
+        device (str):
+            - "cuda" / "cpu" 등. resume_model 내부에서 map_location 에 사용된다.
+
+    Returns:
+        Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int, Optional[str]]:
+            - diffusion_planner: 복원된 모델.
+            - optimizer: 복원된 옵티마이저.
+            - scheduler: 복원된 스케줄러.
+            - model_ema: 복원된 EMA 또는 None.
+            - init_epoch: 재개 시작 epoch 인덱스(0 기반). shape: ()
+            - wandb_id: W&B run id 또는 None.
+    """
+    (diffusion_planner, optimizer, scheduler, init_epoch, wandb_id,
+     model_ema) = resume_model(
+         save_path,
+         diffusion_planner,
+         optimizer,
+         scheduler,
+         model_ema,
+     )
+
+    # resume 후에도 wd_max / lr_max 기본값이 유지되도록 보강
+    for pg in optimizer.param_groups:
+        pg.setdefault("lr_max", float(pg["lr"]))
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
+
+    return diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id
+
+
+def _resume_from_checkpoint_with_pytorch(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    model_ema: Optional[ModelEma],
+    save_path: str,
+    global_rank: int,
+    resume_model_only: bool,
+) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+           Optional[str]]:
+    """일반 PyTorch/DDP 모드에서 save_path 기준으로 모델/옵티마를 불러온다.
+
+    처리 규칙:
+      - resume_model_only=True:
+          · _load_model_and_ema_state_only_from_pytorch_checkpoint(...) 를 사용해
+            모델/EMA 파라미터만 불러온다.
+          · optimizer / scheduler 상태는 그대로 둔다.
+          · init_epoch=0, wandb_id=None 으로 돌려준다.
+      - resume_model_only=False:
+          · _resume_from_pytorch_checkpoint(...) 로
+            모델/optimizer/scheduler/EMA/epoch/wandb_id 를 모두 복원한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 Namespace. device 정보 포함.
+        diffusion_planner (nn.Module):
+            현재 학습 중인 모델 또는 DDP 래퍼.
+        optimizer (optim.Optimizer):
+            AdamW 또는 8bit AdamW 옵티마이저.
+        scheduler (Any):
+            학습률 스케줄러 객체.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        save_path (str):
+            PyTorch latest.pth / best.pth 가 들어 있는 디렉터리 경로.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 상세 로그 출력.
+        resume_model_only (bool):
+            True 이면 모델/EMA 파라미터만 불러오는 모드.
+
+    Returns:
+        Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int, Optional[str]]:
+            - diffusion_planner: 복원된 모델.
+            - optimizer: 복원된(또는 기존) 옵티마이저.
+            - scheduler: 복원된(또는 기존) 스케줄러.
+            - model_ema: EMA 상태가 복원된 ModelEma 또는 None.
+            - init_epoch: 재개 시작 epoch 인덱스. model-only 이면 0.
+            - wandb_id: 이어서 사용할 W&B run id 또는 None.
+    """
+    if resume_model_only:
+        # 모델(또는 EMA) weight만 불러오고 optimizer/scheduler 는 그대로 유지
+        model_ema = _load_model_and_ema_state_only_from_pytorch_checkpoint(
+            save_path=save_path,
+            diffusion_planner=diffusion_planner,
+            model_ema=model_ema,
+            device=args.device,
+            global_rank=global_rank,
+        )
+        init_epoch = 0
+        wandb_id = None
+        return diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id
+
+    # 전체 상태 복원 (기존 PyTorch 경로)
+    (diffusion_planner, optimizer, scheduler, model_ema, init_epoch,
+     wandb_id) = _resume_from_pytorch_checkpoint(
+         save_path=save_path,
+         diffusion_planner=diffusion_planner,
+         optimizer=optimizer,
+         scheduler=scheduler,
+         model_ema=model_ema,
+     )
+    return diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id
+
+
+def _finalize_train_epochs_and_wandb_after_resume(
+    args: argparse.Namespace,
+    init_epoch: int,
+    resume_model_only: bool,
+    global_rank: int,
+) -> Tuple[int, bool]:
+    """체크포인트 로드 이후 train_epochs 와 allow_val_change 값을 최종 결정한다.
+
+    처리 규칙:
+      - resume_model_only=True:
+          · epoch 정보는 모두 무시하고,
+            args.train_epochs 를 그대로 사용한다.
+          · allow_val_change=False 로 둔다 (새 run 개념).
+      - resume_model_only=False:
+          · init_epoch 가 이미 지난 epoch 수이므로,
+            args.train_epochs <= init_epoch 이면 init_epoch+1 로 늘린다.
+          · args.resume_wandb_model_name 가 설정되어 있으면
+            allow_val_change=True 로 W&B config 변경을 허용한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 Namespace.
+        init_epoch (int):
+            체크포인트에서 읽어온 재개 시작 epoch 인덱스(0 기반).
+        resume_model_only (bool):
+            True 이면 model-only 재시작 모드.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 로그를 출력한다.
+
+    Returns:
+        Tuple[int, bool]:
+            - train_epochs: 최종 사용할 train_epochs 값.
+            - allow_val_change: W&B config 변경 허용 여부.
+    """
+    allow_val_change: bool = False
+
+    if resume_model_only:
+        # model-only 재시작: epoch 정보는 모두 무시하고 config 값 그대로 사용
+        train_epochs = int(args.train_epochs)
+        return train_epochs, allow_val_change
+
+    # 기존 full-resume 경로: init_epoch 를 기준으로 train_epochs 보정
+    if args.train_epochs <= init_epoch:
+        old = int(args.train_epochs)
+        args.train_epochs = int(init_epoch) + 1
+        if global_rank == 0:
+            print(
+                f"[ADJUST] scaled train_epochs ({old}) <= init_epoch ({init_epoch}). "
+                f"Bumping to {args.train_epochs}.")
+    train_epochs = int(args.train_epochs)
+
+    # W&B 아티팩트에서 재개하는 경우 config 값 변경 허용
+    if args.resume_wandb_model_name:
+        allow_val_change = True
+
+    return train_epochs, allow_val_change
+
+
+def maybe_resume_from_checkpoint(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    optimizer: Optional[optim.Optimizer],
+    scheduler: Optional[Any],
+    model_ema: Optional[ModelEma],
+    global_rank: int,
+    use_deepspeed: bool,
+) -> Tuple[nn.Module, optim.Optimizer, Any, Optional[ModelEma], int,
+           Optional[str], int, bool]:
+    """local 또는 W&B에서 지정한 체크포인트가 있으면 학습 상태를 복원한다.
+
+    이 함수는 "재개할 체크포인트가 있는지"를 먼저 확인한 뒤,
+    상황에 따라 다음과 같이 동작한다.
+
+      * resume_model_only=False (기존 resume 모드):
+        - DeepSpeed 모드 + DeepSpeed 형식 디렉터리:
+            · 모델/옵티마이저/스케줄러/EMA/epoch/wandb_id 를 모두 복원.
+        - DeepSpeed 모드 + PyTorch latest.pth:
+            · 모델/EMA 를 불러오고, epoch/wandb_id 를 사용해 계속 진행
+              (옵티마이저/스케줄러는 새 상태로 시작).
+        - 일반 PyTorch/DDP 모드:
+            · resume_model(...) 을 통해 모델/옵티마이저/스케줄러/EMA/epoch/wandb_id 복원.
+
+      * resume_model_only=True (model-only 재시작 모드):
+        - 어떤 형식이든 모델/EMA 파라미터만 불러오고,
+          optimizer/scheduler/epoch/wandb_id 는 모두 새로 시작한다.
+          · DeepSpeed: load_optimizer_states=False, load_lr_scheduler_states=False 로 로드.
+          · PyTorch: _load_model_and_ema_state_only_from_pytorch_checkpoint(...) 사용.
+        - init_epoch=0, train_epochs 는 config 값 그대로 사용.
+        - wandb_id=None, allow_val_change=False 로 처리한다.
+
+    Args:
+        args (argparse.Namespace):
+            학습 설정 및 resume 관련 인자를 담고 있는 Namespace.
+        diffusion_planner (nn.Module):
+            현재 학습 중인 모델 또는 DeepSpeed/ DDP 래퍼.
+        optimizer (optim.Optimizer):
+            AdamW 또는 8bit AdamW 옵티마이저.
+        scheduler (Any):
+            학습률 스케줄러 인스턴스.
+        model_ema (Optional[ModelEma]):
+            EMA 래퍼 또는 None.
+        global_rank (int):
+            전체 프로세스 기준 rank. 0 일 때만 주요 로그를 출력한다.
+        use_deepspeed (bool):
+            DeepSpeed 모드 사용 여부.
+
+    """
+
+    if args.resume_wandb_model_name is not None:
+        print(f"[LOAD MODEL PARAM] Model loaded from {args.save_path}")
+
+        # -------- DeepSpeed 경로 --------
+        if use_deepspeed and hasattr(diffusion_planner, "load_checkpoint"):
+            diffusion_planner, model_ema, init_epoch, wandb_id = \
+                _resume_from_checkpoint_with_deepspeed(
+                    args=args,
+                    diffusion_planner=diffusion_planner,
+                    model_ema=model_ema,
+                    global_rank=global_rank,
+                    resume_model_only=args.resume_model_only,
+                )
+
+        # -------- 일반 PyTorch / DDP 경로 --------
+        else:
+            assert optimizer is not None and scheduler is not None, \
+                "optimizer 및 scheduler 는 None 이 될 수 없습니다."
+            (diffusion_planner, optimizer, scheduler, model_ema, init_epoch,
+             wandb_id) = _resume_from_checkpoint_with_pytorch(
+                 args=args,
+                 diffusion_planner=diffusion_planner,
+                 optimizer=optimizer,
+                 scheduler=scheduler,
+                 model_ema=model_ema,
+                 save_path=args.save_path,
+                 global_rank=global_rank,
+                 resume_model_only=args.resume_model_only,
+             )
+
+        # -------- train_epochs / allow_val_change 최종 결정 --------
+        train_epochs, allow_val_change = _finalize_train_epochs_and_wandb_after_resume(
+            args=args,
+            init_epoch=init_epoch,
+            resume_model_only=args.resume_model_only,
+            global_rank=global_rank,
+        )
+
+    else:
+        # 체크포인트 지정이 전혀 없는 경우: 완전 새 학습
+        init_epoch = 0
+        wandb_id = None
+        train_epochs = int(args.train_epochs)
+        allow_val_change = False
+
+    return (
+        diffusion_planner,
+        optimizer,
+        scheduler,
+        model_ema,
+        init_epoch,
+        wandb_id,
+        train_epochs,
+        allow_val_change,
+    )
+
 
 def set_distributed_flag_from_env(args: argparse.Namespace) -> None:
     """환경변수 WORLD_SIZE를 읽어 args.distributed 플래그를 설정한다.
@@ -31,14 +1094,139 @@ def set_distributed_flag_from_env(args: argparse.Namespace) -> None:
     else:
         args.distributed = False
 
-def _download_wandb_checkpoint_to_local(
-    args: argparse.Namespace,
-    api: wandb.Api,
-    entity: str,
-    project: str,
-    collection_name: str,
-    resume_alias: str,
+
+def _does_file_exist(file_path: str) -> bool:
+    """주어진 경로에 '파일'이 실제로 존재하는지 확인합니다.
+
+    폴더(디렉터리)가 아니라 "파일"인지까지 확인해서,
+    같은 이름의 폴더가 우연히 있을 때를 안전하게 피합니다.
+
+    Args:
+        file_path (str): 확인할 파일 경로. shape: ()
+
+    Returns:
+        bool:
+            - True: file_path가 존재하고, 그 대상이 파일임
+            - False: 존재하지 않거나, 파일이 아님
+    """
+    if not isinstance(file_path, str) or not file_path:
+        return False
+    return os.path.isfile(file_path)
+
+
+def _find_checkpoint_file_in_latest_or_best_dir(
+    save_path: str,
     checkpoint_filename: str,
+) -> Optional[str]:
+    """save_path 안에서 'latest' 또는 'best' 글자가 들어간 하위 폴더를 찾아,
+    그 폴더 안에 checkpoint_filename 파일이 있으면 그 파일 경로를 돌려줍니다.
+
+    이 함수는 DeepSpeed를 쓸 때,
+    "추가로 생기는 체크포인트 폴더(예: latest_epoch-000001 같은 폴더)가
+    이미 존재하는지"를 확인하는 용도로 사용합니다.
+
+    Args:
+        save_path (str): 상위 저장 폴더 경로. shape: ()
+        checkpoint_filename (str): 하위 폴더 안에서 찾을 파일 이름. shape: ()
+
+    Returns:
+        Optional[str]:
+            - 찾으면: 파일의 전체 경로(str)
+            - 못 찾으면: None
+    """
+    if not isinstance(save_path, str) or not save_path:
+        return None
+    if not os.path.isdir(save_path):
+        return None
+    if not isinstance(checkpoint_filename, str) or not checkpoint_filename:
+        return None
+
+    try:
+        entries = os.listdir(save_path)
+    except OSError:
+        return None
+
+    for entry in entries:
+        entry_path = os.path.join(save_path, entry)
+        if not os.path.isdir(entry_path):
+            continue
+
+        entry_lower = entry.lower()
+        if ("latest" not in entry_lower) and ("best" not in entry_lower):
+            continue
+
+        candidate_ckpt_path = os.path.join(entry_path, checkpoint_filename)
+        if _does_file_exist(candidate_ckpt_path):
+            return candidate_ckpt_path
+
+    return None
+
+
+def _should_skip_wandb_checkpoint_download(
+    args: argparse.Namespace,
+    target_local_ckpt_path: str,
+    checkpoint_filename: str,
+) -> Tuple[bool, str]:
+    """로컬에 이미 필요한 체크포인트가 갖춰져 있으면 W&B 다운로드를 생략할지 판단합니다.
+
+    규칙
+    ----
+    1) args.use_deepspeed == True 인 경우 (AND 조건, 둘 다 만족해야 생략)
+       - (조건 1) target_local_ckpt_path 파일이 이미 존재
+       - (조건 2) args.save_path 아래에 이름에 "latest" 또는 "best"가 들어간 폴더가 있고,
+                 그 폴더 안에 checkpoint_filename 파일이 존재
+
+    2) args.use_deepspeed == False 인 경우
+       - target_local_ckpt_path 파일이 이미 존재하면 생략
+
+    Args:
+        args (argparse.Namespace):
+            - use_deepspeed (bool): DeepSpeed 사용 여부
+            - save_path (Optional[str]): 체크포인트 저장 상위 폴더 경로
+        target_local_ckpt_path (str): 최종 체크포인트 파일 경로. shape: ()
+        checkpoint_filename (str): 체크포인트 파일 이름. shape: ()
+
+    Returns:
+        Tuple[bool, str]:
+            - should_skip (bool): True면 다운로드 생략
+            - reason (str): 로그에 찍기 위한 간단한 이유 설명
+    """
+    has_main_ckpt: bool = _does_file_exist(target_local_ckpt_path)
+    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
+
+    if not use_deepspeed:
+        if has_main_ckpt:
+            return True, "DeepSpeed 미사용: target_local_ckpt_path 파일이 이미 존재합니다."
+        return False, "DeepSpeed 미사용: target_local_ckpt_path 파일이 없습니다."
+
+    # DeepSpeed 사용 시: AND 조건
+    if not has_main_ckpt:
+        return False, "DeepSpeed 사용: (조건 1) target_local_ckpt_path 파일이 없습니다."
+
+    save_path = getattr(args, "save_path", None)
+    if not isinstance(save_path, str) or not save_path:
+        return False, "DeepSpeed 사용: (조건 2) args.save_path가 비어 있어 하위 폴더를 확인할 수 없습니다."
+
+    found_in_tag_dir = _find_checkpoint_file_in_latest_or_best_dir(
+        save_path=save_path,
+        checkpoint_filename=checkpoint_filename,
+    )
+    if found_in_tag_dir is None:
+        return False, ("DeepSpeed 사용: (조건 2) save_path 아래 'latest/best' 폴더 안에서 "
+                       f"'{checkpoint_filename}' 파일을 찾지 못했습니다.")
+
+    return True, ("DeepSpeed 사용: (조건 1) 메인 파일 + (조건 2) 'latest/best' 폴더 안 파일 "
+                  f"둘 다 확인했습니다. (found: {found_in_tag_dir})")
+
+
+def _download_wandb_checkpoint_to_local(
+        args: argparse.Namespace,
+        api: wandb.Api,
+        entity: str,  # 'jksg01019-naver-labs'
+        project: str,  # 'Diffusion-Planner'
+        collection_name: str,  # W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
+        resume_alias: str,  # 'latest'
+        checkpoint_filename: str,  # 'latest.pth'
 ) -> None:
     """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다."""
     # rank 0만 별도 run을 만들어서 use_artifact 호출
@@ -51,9 +1239,7 @@ def _download_wandb_checkpoint_to_local(
     resume_alias : str
         - 실제로 사용할 별칭. 예: 'latest', 'best'.
     collection_name : str
-        - W&B 상에서 모델 묶음 이름. 예: f"{args.past_name}_latest-model".
-    checkpoint_filename : str
-        - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+        - W&B 상에서 모델 묶음 이름. 예: f"{args.load_name}_latest-model".
     """
     """
     entity: str 예: 'jksg01019-naver-labs'
@@ -66,26 +1252,51 @@ def _download_wandb_checkpoint_to_local(
     artifact = api.artifact(artifact_wandb_path, type='model')
 
     source_run = artifact.logged_by()
-    if 'save_path' not in source_run.config:
+    if "save_path" not in source_run.config:
         raise ValueError("NO save path in WANDB run config")
 
     # "./training_log/feasible_full_time_use_vel_gpu_2_exp_A/2025-12-06-06:56:58/"
-    past_save_path = source_run.config['save_path']
+    past_save_path = source_run.config["save_path"]
     print(
         f"[WANDB->local] find save_path in WANDB run config past_save_path: {past_save_path}"
     )
+    experiment_is_same = (args.name == args.load_name)
     if args.save_path is None:  #
-        experiment_is_same = args.name == args.past_name
         assert experiment_is_same, (
-            "args.save_path None -> , args.name과 args.past_name should be same."
+            "args.save_path None -> , args.name과 args.load_name should be same."
         )
         assert args.resume_wandb_model_name is not None, (
             "args.resume_wandb_model_name must be set when resuming the same experiment."
         )
         args.save_path = past_save_path
+    """
+    checkpoint_filename : str
+        - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
+    """
 
     # target_local_ckpt_path: ./training_log/.../2025-12-06-06:56:58/latest.pth
     target_local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
+    """
+    args.use_deepspeed일 떄, 다운로드 생략 조건 (AND 조건임. 둘 다 만족해야함)
+        1) target_local_ckpt_path 가 이미 존재하는 경우
+        2) args.save_path 에 "latest"나 "best" 글자가 들어가있는 디렉터리가 이미 존재하고, 그 안에 checkpoint_filename 파일이 존재하는 경우 (pt)
+    not args.use_deepspeed일 떄, 다운로드 생략 조건
+        1) target_local_ckpt_path 가 이미 존재하는 경우
+    """
+    # =========================
+    # ✅ 다운로드 생략 조건 구현
+    # =========================
+    should_skip, skip_reason = _should_skip_wandb_checkpoint_download(
+        args=args,
+        target_local_ckpt_path=target_local_ckpt_path,
+        checkpoint_filename=checkpoint_filename,
+    )
+    if should_skip:
+        print(f"[WANDB->local] skip download. rank={rank}, "
+              f"target_local_ckpt_path='{target_local_ckpt_path}', "
+              f"checkpoint_filename='{checkpoint_filename}'. "
+              f"reason: {skip_reason}")
+        return
     if rank == 0:
         os.makedirs(past_save_path, exist_ok=True)
         artifacts_root = os.path.join(past_save_path, "artifacts")
@@ -140,6 +1351,10 @@ def _download_wandb_checkpoint_to_local(
             ]
             if not candidate_dirs:
                 continue
+            len_candidate_dirs = len(candidate_dirs)
+            assert len_candidate_dirs == 1, (
+                f"[local->local] expect only one candidate dir for tag '{tag}', "
+                f"but found {len_candidate_dirs} dirs: {candidate_dirs}")
 
             # 첫 번째(정렬 기준) 후보를 최종 tag 디렉터리 이름으로 사용
             chosen_dir_name = sorted(candidate_dirs)[0]
@@ -152,7 +1367,7 @@ def _download_wandb_checkpoint_to_local(
                 shutil.rmtree(save_path_tag_dir)
             shutil.copytree(artifact_tag_dir_past, save_path_tag_dir)
             print(
-                "[local->local] COpy DeepSpeed checkpoint directory: "
+                "[local->local] Copy DeepSpeed checkpoint directory: "
                 f"artifact_tag_dir_past   {artifact_tag_dir_past} -> save_path_tag_dir  {save_path_tag_dir}"
             )
         if not os.path.exists(target_local_ckpt_path):
@@ -189,7 +1404,6 @@ def _download_wandb_checkpoint_to_local(
         )
 
 
-
 def _determine_wandb_artifact_config(
     args: argparse.Namespace,) -> Tuple[str, str, str]:
     """재개하려는 W&B 아티팩트의 이름과 파일 이름을 결정한다.
@@ -197,22 +1411,22 @@ def _determine_wandb_artifact_config(
     Args:
         args: argparse.Namespace
             - args.resume_wandb_model_name (str): 'latest' 또는 'best' 등을 기대.
-            - args.past_name (str): 실험 이름. 컬렉션 이름의 접두사로 사용된다.
+            - args.load_name (str): 실험 이름. 컬렉션 이름의 접두사로 사용된다.
 
     Returns:
         resume_alias: str
             - 실제로 사용할 별칭. 예: 'latest', 'best'.
         collection_name: str
-            - W&B 상에서 모델 묶음 이름. 예: f"{args.past_name}_latest-model".
+            - W&B 상에서 모델 묶음 이름. 예: f"{args.load_name}_latest-model".
         checkpoint_filename: str
             - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
     resume_alias = args.resume_wandb_model_name
     if resume_alias == 'best':
-        collection_name = f"{args.past_name}_best-model"
+        collection_name = f"{args.load_name}_best-model"
         checkpoint_filename = "best.pth"
     else:  # 'latest' 또는 'v10'과 같은 특정 버전을 처리합니다.
-        collection_name = f"{args.past_name}_latest-model"
+        collection_name = f"{args.load_name}_latest-model"
         checkpoint_filename = "latest.pth"
     return resume_alias, collection_name, checkpoint_filename
 
@@ -222,17 +1436,16 @@ def _validate_wandb_resume_args(args: argparse.Namespace) -> None:
 
     처리 내용:
       - args.resume_wandb_model_name 가 'latest' 인지 확인한다.
-      - args.past_name 이 비어 있지 않은지 확인한다.
+      - args.load_name 이 비어 있지 않은지 확인한다.
     둘 중 하나라도 조건을 만족하지 않으면 바로 ValueError 를 던져서
     잘못된 설정으로 내려받기를 시도하지 않도록 막는다.
     """
     # resume_wandb_model_name 가 "latest"가 아니면 에러를 발생시킵니다.
     if args.resume_wandb_model_name not in ['latest']:
         raise ValueError("args.resume_wandb_model_name must be 'latest.")
-    if not args.past_name:
+    if not args.load_name:
         raise ValueError(
-            "args.past_name must be provided to resume from a wandb artifact.")
-
+            "args.load_name must be provided to resume from a wandb artifact.")
 
 
 def prepare_wandb_resume(args: argparse.Namespace,) -> None:
@@ -256,12 +1469,12 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
               args.save_path 가 실제 디렉터리 경로로 채워진 상태.
     """
 
-    if not args.resume_wandb_model_name:
+    if not args.resume_wandb_model_name:  # "latest"
         return
 
     _validate_wandb_resume_args(args)
     print(
-        f"Resuming from wandb artifact: {args.past_name}:{args.resume_wandb_model_name}"
+        f"Resuming from wandb artifact: {args.load_name}:{args.resume_wandb_model_name}"
     )
     """
     resume_alias : str
@@ -274,9 +1487,10 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
     api = wandb.Api()
     resume_alias, collection_name, checkpoint_filename = \
         _determine_wandb_artifact_config(args)
-    if getattr(args, "save_path", None) is not None:
+    if args.save_path is not None:
         local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
-        if os.path.exists(local_ckpt_path):
+        # TODO: DeepSpeed 사용시에는, 어떤 경우에 스킵해도 좋은지 재검토 필요
+        if not args.use_deepspeed and os.path.exists(local_ckpt_path):
             print(
                 f"[WANDB->local] found existing local checkpoint: {local_ckpt_path} "
                 f"(alias={resume_alias}), skip wandb download.")
@@ -288,6 +1502,12 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
     try:
         entity = args.entity
         project = args.project
+        """ 수동으로 다운로드 받는 방법
+        args.name을 args.load_name 과 똑같이 설정한 후, 
+            training_log/args.load_name~~~~/ 디렉터리에
+                latest.pth 를 다운받으면 된다. (not args.use_deepspeed 일 때)
+                latest_epoch-0000xx/ 디렉터리도 같이 복사해야 한다. (args.use_deepspeed 일 때)
+        """
         _download_wandb_checkpoint_to_local(
             args,
             api=api,
@@ -302,15 +1522,15 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
         raise RuntimeError(f"W&B 아티팩트에서 체크포인트를 내려받는 중 오류가 발생했습니다: {e}") from e
 
 
-def get_save_path(args: argparse.Namespace, global_rank: int) -> None:
+def set_save_path(args: argparse.Namespace, global_rank: int) -> None:
     """실험 이름과 past_name을 기준으로 save_path를 만들고, 모든 rank에 공유한다.
 
     동작 요약:
-      * (stage1 처럼) 새로운 실험(name != past_name)인 경우
+      * (stage1 처럼) 새로운 실험(name != load_name)인 경우
         - rank 0에서만 새로운 디렉터리를 만들고
           예: {args.save_dir}/training_log/{args.name}/{YYYY-MM-DD-HH:MM:SS}/
         - 그 경로를 torch.distributed.broadcast_object_list 로 모든 rank에 전파한다.
-      * (같은 실험을 이어서 학습하는) name == past_name 인 경우
+      * (같은 실험을 이어서 학습하는) name == load_name 인 경우
         - 여기서는 save_path를 정하지 않고(None 유지)
         - 이후 W&B 아티팩트에서 가져온 past_save_path를 args.save_path에 채운다.
       * 분산이 초기화되어 있지 않은(single GPU / single process) 경우
@@ -320,7 +1540,7 @@ def get_save_path(args: argparse.Namespace, global_rank: int) -> None:
         args (argparse.Namespace):
             학습 및 실험 설정이 들어 있는 argparse 인자 모음.
             - name (str): 현재 stage에서 사용할 실험 이름.
-            - past_name (str): 이전 stage 실험 이름. 다른 stage의 weight를 재사용할 때 사용.
+            - load_name (str): 이전 stage 실험 이름. 다른 stage의 weight를 재사용할 때 사용.
             - save_dir (str): training_log 루트 디렉터리 상위 경로.
             - save_path (Optional[str]): 이 함수 안에서 최종 로그/체크포인트 경로로 설정된다.
         global_rank (int):
@@ -332,8 +1552,8 @@ def get_save_path(args: argparse.Namespace, global_rank: int) -> None:
         None:
             args.save_path를 in-place로 수정하고, 모든 rank에서 동일한 값을 갖도록 만든다.
     """
-    past_name: str = getattr(args, "past_name", "")
-    experiment_is_same: bool = bool(past_name) and (args.name == past_name)
+    load_name: str = getattr(args, "load_name", "")
+    experiment_is_same: bool = bool(load_name) and (args.name == load_name)
 
     save_path: Optional[str] = None
     if global_rank == 0:
@@ -358,7 +1578,7 @@ def init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
     """여러 GPU를 쓸 때 필요한 분산 학습 환경을 준비하고, 내 위치 정보를 정리한다.
 
     DeepSpeed를 쓰는 경우에도 torch.distributed를 미리 초기화해 두어서
-    get_save_path() 안의 broadcast가 항상 동작하도록 만든다.
+    set_save_path() 안의 broadcast가 항상 동작하도록 만든다.
     """
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
 
@@ -396,14 +1616,17 @@ def init_distributed(args: argparse.Namespace,) -> Tuple[int, int, int, bool]:
     return global_rank, rank, world_size, use_deepspeed
 
 
-def build_deepspeed_inference_config(args: argparse.Namespace) -> Dict[str, Any]:
+def build_deepspeed_inference_config(
+        args: argparse.Namespace) -> Dict[str, Any]:
     """추론용 DeepSpeed 설정 dict를 만든다(학습용 옵션은 제외)."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     world_size = max(1, world_size)
 
     return {
         "dtype": torch.bfloat16,  # 필요하면 torch.float16 로 바꿔도 됨
-        "tensor_parallel": {"tp_size": world_size},  # 여러 GPU에 모델을 나눠 올릴 때
+        "tensor_parallel": {
+            "tp_size": world_size
+        },  # 여러 GPU에 모델을 나눠 올릴 때
         "replace_with_kernel_inject": False,  # 일반 모델이면 보통 꺼두는 게 안전
     }
 
@@ -552,6 +1775,7 @@ def effective_global_batch(batch_size: int, world_size: int) -> int:
     world_size = max(1, int(world_size))
     per_rank = max(1, batch_size // world_size)
     return per_rank * world_size  # drop_last 정합 반영
+
 
 def build_dataset_and_sampler(
     args: argparse.Namespace,

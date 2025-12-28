@@ -52,9 +52,8 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only False \
-  --past_name "nuplan_womd" \
+  --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --batch_size 1024 \
-  --use_deepspeed True \
-  --use_ego_plan False
+  --use_deepspeed True
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

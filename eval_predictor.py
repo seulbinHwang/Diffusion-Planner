@@ -12,9 +12,10 @@ from tools.predictor_utils import (
     create_diffusion_planner_and_ema,
     build_deepspeed_inference_config,
     init_distributed,
-    get_save_path,
+    set_save_path,
     prepare_wandb_resume,
     set_distributed_flag_from_env,
+    maybe_resume_from_checkpoint,
 )
 import args_util
 import os
@@ -90,11 +91,11 @@ def model_validation(
 
     # 6) 체크포인트 재개
     (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
-     train_epochs, allow_val_change) = _maybe_resume_from_checkpoint(
+     train_epochs, allow_val_change) = maybe_resume_from_checkpoint(
          args=args,
          diffusion_planner=diffusion_planner,
-         optimizer=optimizer,
-         scheduler=scheduler,
+         optimizer=None,
+         scheduler=None,
          model_ema=model_ema,
          global_rank=global_rank,
          use_deepspeed=use_deepspeed,
@@ -1368,7 +1369,7 @@ def main() -> None:
     # 1) 분산 초기화 및 rank 정보
     args = args_util.get_args()
     global_rank, rank, world_size, use_deepspeed = init_distributed(args)
-    get_save_path(
+    set_save_path(
         args=args,
         global_rank=global_rank,
     )
