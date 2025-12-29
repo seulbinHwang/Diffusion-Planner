@@ -994,6 +994,105 @@ class Encoder(nn.Module):
 
         return ego_future_trajectory
 
+    def _ensure_static_objects_tensor(
+        self,
+        static_objects: Optional[torch.Tensor],
+        batch_size: int,
+        ref_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """static_objects가 None이어도 정적 물체 인코더가 항상 동작하도록 입력 텐서를 보장합니다.
+
+        학습 데이터에서 정적 물체가 하나도 없는 장면은 `static_objects=None`으로 들어올 수 있습니다.
+        그런데 StaticFusionEncoder는 내부에서 `static_objects.shape`를 바로 사용하므로,
+        None이면 즉시 에러가 납니다.
+
+        이 함수는 None인 경우에도 **정적 물체 인코더가 실제로 실행되도록**
+        (B, P, D_static) 형태의 텐서를 만들어 반환합니다.
+
+        동작 방식(쉽게 설명):
+            1) static_objects가 텐서면:
+               - (B, P, D_static) 모양인지 확인하고,
+               - device가 다르면 ref_tensor의 device로만 옮겨서 그대로 반환합니다.
+
+            2) static_objects가 None이거나, P==0(정말 비어있는 텐서)면:
+               - (B, P, D_static) 텐서를 새로 만듭니다.
+               - P는 가능하면 config.static_num(또는 config.static_objects_num)을 사용하고,
+                 둘 다 없으면 1로 둡니다.
+               - 그중 **첫 번째 물체(인덱스 0)** 를 “정적 물체가 없음”을 나타내는 자리로 사용합니다.
+                 이 토큰이 StaticFusionEncoder 내부 마스크에서 **유효(mask=False)** 로 잡히도록,
+                 [x, y, cos, sin] 중 cos 채널(인덱스 2)에 1.0을 넣습니다.
+                 (나머지 값은 0이라서, 실제 물체와 겹치기 어려운 형태가 됩니다.)
+
+        Args:
+            static_objects (Optional[torch.Tensor]):
+                - shape: (B, P, D_static) 또는 None
+                - D_static은 보통 10이며, 앞 4채널은 [x, y, cos, sin]이라고 가정합니다.
+            batch_size (int):
+                - 배치 크기 B
+            ref_tensor (torch.Tensor):
+                - device/dtype 기준 텐서
+                - 예: encoding_agents_chunk (B, N_agents_tok, H)
+
+        Returns:
+            torch.Tensor:
+                - shape: (B, P, D_static)
+                - static_objects가 None이어도 StaticFusionEncoder에 바로 넣을 수 있는 텐서
+        """
+        B: int = int(batch_size)
+        if B <= 0:
+            raise ValueError(f"batch_size must be > 0. got {B}")
+
+        # D_static: 정적 물체 feature 차원
+        D_static: int = int(getattr(self.config, "static_objects_state_dim"))
+        if D_static < 10:
+            raise ValueError(
+                f"static_objects_state_dim must be >= 10. got {D_static}")
+        static_objects_num = 1
+        # # P(정적 물체 최대 개수): 가능하면 config에서 가져오고, 없으면 1
+        # if hasattr(self.config, "static_num"):
+        #     static_objects_num: int = int(getattr(self.config, "static_num"))
+        # elif hasattr(self.config, "static_objects_num"):
+        #     static_objects_num = int(getattr(self.config, "static_objects_num"))
+        # else:
+        #     static_objects_num = 1
+        #
+        # static_objects_num = max(1, static_objects_num)
+
+        # -------------------------
+        # (1) 입력이 이미 텐서인 경우
+        # -------------------------
+        if static_objects is not None:
+            if static_objects.dim() != 3:
+                raise ValueError(
+                    f"static_objects must be (B, P, D_static). got {tuple(static_objects.shape)}"
+                )
+            if int(static_objects.shape[0]) != B:
+                raise ValueError(
+                    f"static_objects batch size mismatch. expected B={B}, got {int(static_objects.shape[0])}"
+                )
+            if int(static_objects.shape[2]) != D_static:
+                raise ValueError(
+                    f"static_objects last dim mismatch. expected D_static={D_static}, got {int(static_objects.shape[2])}"
+                )
+
+            # (B, P, D_static)
+            if static_objects.device != ref_tensor.device:
+                static_objects = static_objects.to(device=ref_tensor.device)
+            return static_objects
+
+        # -------------------------
+        # (2) None(또는 사실상 비어있음)인 경우: "없음 표시" 입력 생성
+        # -------------------------
+        # placeholder_static_objects: (B, P, D_static)
+        placeholder_static_objects: torch.Tensor = ref_tensor.new_zeros(
+            (B, static_objects_num, D_static))
+
+        # 첫 번째 토큰을 "없음 표시"로 사용하되, 마스크가 False(유효)로 잡히도록 cos=1
+        # x=0, y=0, cos=1, sin=0  (B, )
+        # placeholder_static_objects[:, 0, 2] = 1.0
+
+        return placeholder_static_objects
+
     @staticmethod
     def _ensure_non_near_agents_past_tensor(
         ego_agent_past: torch.Tensor,  # (B, 1, T, 11)
@@ -1152,8 +1251,16 @@ class Encoder(nn.Module):
         static_mask:     (B, static_objects_num)
         static_pos:      (B, static_objects_num, 9)
         """
+        # static_objects가 None일 수도 있으므로, 항상 텐서로 보장해서 넣는다.
+        static_objects_tensor: torch.Tensor = self._ensure_static_objects_tensor(
+            static_objects=static_objects,  # (B, P, D_static) or None
+            batch_size=int(encoding_agents_chunk.shape[0]),  # B
+            ref_tensor=
+            encoding_agents_chunk,  # (B, N_agents_tok, H)  device/dtype 기준
+        )  # (B, P, D_static)
+
         encoding_static, static_mask, static_pos = self.static_encoder(
-            static_objects)
+            static_objects_tensor)
         # --- road safety encoder (입력이 전부 None이면 "빈 토큰"으로 대체) ---
         """
         encoding_road_safety : (B, road_safety_num, hidden_dim)

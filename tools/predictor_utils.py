@@ -1028,7 +1028,8 @@ def maybe_resume_from_checkpoint(
         print(f"[LOAD MODEL PARAM] Model loaded from {args.save_path}")
 
         # -------- DeepSpeed 경로 --------
-        if use_deepspeed and (args.resume_model_only or hasattr(diffusion_planner, "load_checkpoint")):
+        if use_deepspeed and (args.resume_model_only or
+                              hasattr(diffusion_planner, "load_checkpoint")):
             diffusion_planner, model_ema, init_epoch, wandb_id = \
                 _resume_from_checkpoint_with_deepspeed(
                     args=args,
@@ -1154,10 +1155,7 @@ def _find_checkpoint_file_in_latest_or_best_dir(
         entry_lower = entry.lower()
         if ("latest" not in entry_lower) and ("best" not in entry_lower):
             continue
-
-        candidate_ckpt_path = os.path.join(entry_path, checkpoint_filename)
-        if _does_file_exist(candidate_ckpt_path):
-            return candidate_ckpt_path
+        return entry_path
 
     return None
 

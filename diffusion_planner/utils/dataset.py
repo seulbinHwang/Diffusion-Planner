@@ -175,10 +175,13 @@ class DiffusionPlannerData(Dataset):
             
             방식 : data_dir의 마지막 경로명 + "_tfrecords_splitted"를 붙인 경로
             """
-            parent_dir = os.path.dirname(self.data_dir) # ${WOMD_PATH}/processed_womd_final
-            last_dir_name = os.path.basename(self.data_dir) # validation
+            parent_dir = os.path.dirname(
+                self.data_dir)  # ${WOMD_PATH}/processed_womd_final
+            last_dir_name = os.path.basename(self.data_dir)  # validation
             self.data_tfrecords_dir = os.path.join(
-                parent_dir, f"{last_dir_name}_tfrecords_splitted") # ${WOMD_PATH}/processed_womd_final/validation_tfrecords_splitted
+                parent_dir, f"{last_dir_name}_tfrecords_splitted"
+            )  # ${WOMD_PATH}/processed_womd_final/validation_tfrecords_splitted
+
     def __len__(self):
         return len(self.data_list)
 
