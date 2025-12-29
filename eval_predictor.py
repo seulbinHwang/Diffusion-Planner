@@ -1331,6 +1331,110 @@ def _predict_single_rollout(
         # (B, (1+)Pnn, future_len, 4)
         return torch.stack(target_joint_scene, dim=2)
 
+def _predict_rollouts_batched_with_oom_fallback(
+    args: Any,
+    model: nn.Module,
+    norm_inputs: Dict[str, Any],
+    state_normalizer: StateNormalizer,
+    rollout_number: int,
+    requested_rollout_chunk_size: int,
+    base_seed: int,
+    ddp_rank: int,
+) -> torch.Tensor:
+    """rollout을 batch 차원으로 펼쳐 빠르게 예측하되, GPU 메모리가 부족하면 chunk 크기를 자동으로 줄입니다.
+
+    왜 필요한가?
+    ------------
+    rollout을 한 번에 많이 묶을수록(forward 호출 횟수 ↓) 빨라지지만,
+    GPU 메모리가 부족하면 "CUDA out of memory" 오류가 나면서 validation이 중단될 수 있습니다.
+
+    그래서 이 함수는 다음처럼 동작합니다.
+      1) 먼저 requested_rollout_chunk_size로 시도합니다.
+      2) OOM이 나면, chunk 크기를 더 작게 줄여서 다시 시도합니다.
+         예: 32 -> 16 -> 8 -> 4 -> 2 -> 1
+
+    Args:
+        args (Any):
+            args.device, args.ddp 같은 설정을 사용합니다.
+        model (nn.Module):
+            실제 추론 모델(EMA 모델일 수도 있음).
+        norm_inputs (Dict[str, Any]):
+            원래 배치 입력 dict.
+            주요 텐서 예:
+              - ego_agent_past: (B, T_past, 11)
+              - near_agents_past: (B, Pnn, T_past, 11)
+              - origin_world_pose: (B, 4)
+              - target_future_valid: (B, (1+)Pnn, T_fut)
+        state_normalizer (StateNormalizer):
+            정규화된 포즈를 원래 스케일로 되돌리는 inverse(...) 제공 객체.
+        rollout_number (int):
+            전체 rollout 개수 R (예: 32).
+        requested_rollout_chunk_size (int):
+            한 번에 묶어서 처리할 rollout 개수.
+            보통 32가 가장 빠르지만, OOM이면 자동으로 더 줄입니다.
+        base_seed (int):
+            기본 seed.
+        ddp_rank (int):
+            분산 rank. 싱글 프로세스면 0.
+
+    Returns:
+        torch.Tensor:
+            shape: (B, (1+)Pnn, rollout_number, future_len, 4)
+            마지막 4는 (x, y, cos, sin)
+
+    Raises:
+        RuntimeError:
+            chunk_size를 1까지 줄여도 OOM이면 마지막 OOM 에러를 그대로 다시 발생시킵니다.
+    """
+    rollout_number = int(rollout_number)
+    requested_rollout_chunk_size = int(requested_rollout_chunk_size)
+    requested_rollout_chunk_size = max(1, min(requested_rollout_chunk_size, rollout_number))
+
+    # 시도할 chunk 후보들 (중복 제거, 큰 것부터)
+    candidates: List[int] = [requested_rollout_chunk_size]
+    for c in (32, 16, 8, 4, 2, 1):
+        if c <= rollout_number and c not in candidates:
+            candidates.append(c)
+    candidates = sorted(candidates, reverse=True)
+
+    last_oom: Optional[RuntimeError] = None
+
+    for chunk_size in candidates:
+        try:
+            return _predict_rollouts_batched(
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs,
+                state_normalizer=state_normalizer,
+                rollout_number=rollout_number,
+                rollout_chunk_size=int(chunk_size),
+                base_seed=int(base_seed),
+                ddp_rank=int(ddp_rank),
+            )
+        except RuntimeError as e:
+            msg = str(e).lower()
+            is_oom = ("out of memory" in msg) or ("cuda oom" in msg)
+
+            if not is_oom:
+                raise  # OOM이 아니면 그대로 올려서 디버깅 가능하게 합니다.
+
+            last_oom = e
+
+            # OOM 발생 시 캐시 비우고 다음 후보로 재시도
+            if getattr(args, "device", "cuda").startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if _is_main_process_for_logging(args):
+                print(
+                    f"[RolloutBatch] CUDA OOM 발생. rollout_chunk_size={chunk_size} 실패 -> "
+                    f"더 작은 chunk로 재시도합니다."
+                )
+            continue
+
+    # 여기까지 왔다는 것은 후보를 다 써도 실패한 경우
+    assert last_oom is not None
+    raise last_oom
+
 
 def validate_func(
     args: Any,
@@ -1345,20 +1449,37 @@ def validate_func(
 ) -> None:
     """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다.
 
-    요구사항 반영 내용
-    ------------------
-    1) EMA 모델로 inference:
-        - ema가 있으면 ema.ema를 사용합니다.
-    2) rollout_idx마다 다른 예측:
-        - rollout_idx마다 다른 seed를 걸고,
-          그 seed로 torch RNG를 잠깐 분리(fork)해서 모델을 호출합니다.
-        - 이렇게 하면 모델 내부에서 뽑는 랜덤 노이즈가 rollout마다 달라집니다.
+    변경된 핵심(속도 개선)
+    --------------------
+    기존:
+      - rollout 32개를 Python for-loop로 돌면서
+        rollout마다 future_len 스텝 동안 forward를 반복 호출했습니다.
+      - forward 호출 횟수 = 32 * future_len (배치마다)
+
+    변경:
+      - rollout을 batch 차원으로 펼쳐서(B -> B*R),
+        future step마다 forward를 1번만 호출합니다.
+      - forward 호출 횟수 = future_len (배치마다)  # rollout에 대해 32배 감소
+
+    주의(동작 의미)
+    -------------
+    - rollout을 동시에 계산하므로, "서로 다른 rollout"이 나오는 성질은 유지됩니다.
+    - 단, 예전처럼 rollout_idx마다 seed를 완전히 분리한 것과
+      "완전히 동일한 1:1 재현"까지 보장하는 방식은 아닐 수 있습니다.
+      (모델 내부 랜덤 사용 방식에 따라 달라질 수 있습니다.)
+    - 하지만 validation 목적(여러 샘플을 뽑아 minADE/WOSAC 같은 분포 기반 지표 계산)에서는
+      보통 문제가 되지 않고, 속도 이득이 매우 큽니다.
 
     Args:
         args: argparse 인자들.
         model: 원본 모델.
         ema: EMA 래퍼(ModelEma) 또는 None.
         norm_inputs: 정규화된 입력 dict.
+            예:
+              - ego_agent_past: (B, T_past, 11)
+              - near_agents_past: (B, Pnn, T_past, 11)
+              - origin_world_pose: (B, 4)
+        outputs: GT(정답) 궤적 등이 들어 있는 dict.
         state_normalizer: 상태 역정규화용.
         observation_normalizer: (현재 함수 내부에서는 직접 사용하지 않지만, 인터페이스 유지용)
         wosac_metrics: WOSAC metric 업데이트용.
@@ -1367,13 +1488,13 @@ def validate_func(
     Returns:
         None
     """
-    inference_model = _select_inference_model_for_validation(model=model,
-                                                             ema=ema)
+    inference_model = _select_inference_model_for_validation(model=model, ema=ema)
     inference_model.eval()
 
     # norm_inputs 의 각 텐서 NaN/Inf 체크
     norm_inputs = _sanitize_norm_inputs(norm_inputs)
-    # target_future_valid : (B, (1+)Pnn, future_len)  True=유효
+
+    # target_future_valid : (B, (1+)Pnn, future_len)
     target_future_valid = build_target_future_tensors_and_masks_for_inference(
         args,
         norm_inputs,
@@ -1381,38 +1502,39 @@ def validate_func(
     )
     norm_inputs["target_future_valid"] = target_future_valid
 
-    batch_size = norm_inputs["ego_agent_past"].shape[0]
+    ego_agent_past = norm_inputs.get("ego_agent_past", None)
+    if not isinstance(ego_agent_past, torch.Tensor):
+        raise ValueError("norm_inputs['ego_agent_past']가 torch.Tensor가 아닙니다.")
+    batch_size: int = int(ego_agent_past.shape[0])
 
-    ROLLOUT_NUMBER = 32
+    # rollout 설정
+    rollout_number: int = int(getattr(args, "rollout_number", 32))
 
-    # rollout 결과 모으기: 각 원소는 (B, (1+)Pnn, future_len, 4)
-    target_scenario_rollouts_list: List[torch.Tensor] = []
+    # 한 번에 묶을 rollout 개수 (없으면 rollout_number로 = 한 번에 전부)
+    requested_rollout_chunk_size: int = int(
+        getattr(args, "rollout_chunk_size", rollout_number)
+    )
 
+    # seed 구성 (기존 코드의 규칙을 최대한 유지)
     ddp_rank = int(ddp.get_rank()) if getattr(args, "ddp", False) else 0
     base_seed = int(getattr(args, "seed", 0))
 
-    for rollout_idx in range(ROLLOUT_NUMBER):
-        rollout_seed = _make_rollout_seed(
-            base_seed=base_seed,
-            ddp_rank=ddp_rank,
-            rollout_idx=rollout_idx,
-        )
+    # ✅ 핵심: rollout을 batch로 묶어서 빠르게 생성
+    # target_scenario_rollouts_np: (B, (1+)Pnn, rollout_number, future_len, 4)
+    target_scenario_rollouts_np = _predict_rollouts_batched_with_oom_fallback(
+        args=args,
+        model=inference_model,
+        norm_inputs=norm_inputs,
+        state_normalizer=state_normalizer,
+        rollout_number=int(rollout_number),
+        requested_rollout_chunk_size=int(requested_rollout_chunk_size),
+        base_seed=int(base_seed),
+        ddp_rank=int(ddp_rank),
+    )
 
-        # (B, (1+)Pnn, future_len, 4)
-        target_joint_scene = _predict_single_rollout(
-            args=args,
-            model=inference_model,  # ✅ EMA 모델로 forward
-            norm_inputs=norm_inputs,
-            state_normalizer=state_normalizer,
-            rollout_seed=rollout_seed,  # ✅ rollout_idx마다 다른 seed
-        )
-
-        target_scenario_rollouts_list.append(target_joint_scene)
-
-    # (B, (1+)Pnn, ROLLOUT_NUMBER, future_len, 4)
-    target_scenario_rollouts_np = torch.stack(target_scenario_rollouts_list,
-                                              dim=2)
-
+    # -----------------------------
+    # 아래는 기존 metric 계산 흐름 그대로 유지
+    # -----------------------------
     pred_traj = target_scenario_rollouts_np[:, :, :, :, :2]
     pred_traj = pred_traj.reshape(
         pred_traj.shape[0] * pred_traj.shape[1],
@@ -1432,8 +1554,7 @@ def validate_func(
 
     scenario_id: List[str] = norm_inputs["scenario_id"]
     assert isinstance(scenario_id, list), "scenario_id는 List[str] 타입이어야 합니다."
-    assert batch_size == len(
-        scenario_id), "batch_size와 scenario_id 길이가 맞지 않습니다."
+    assert batch_size == len(scenario_id), "batch_size와 scenario_id 길이가 맞지 않습니다."
 
     target_id = norm_inputs["target_id"]  # (B, (1+)Pnn)
     target_id = target_id.reshape(-1)  # [n_agent]
@@ -1441,7 +1562,7 @@ def validate_func(
     one_or_Pnn = target_future_valid.shape[1]
     agent_batch: List[int] = []
     for batch_idx in range(batch_size):
-        agent_batch.extend([batch_idx] * one_or_Pnn)
+        agent_batch.extend([batch_idx] * int(one_or_Pnn))
     agent_batch = torch.tensor(
         agent_batch,
         dtype=torch.long,
@@ -1450,15 +1571,13 @@ def validate_func(
 
     target_z = norm_inputs["target_z"]  # (B, (1+)Pnn)
     target_z = target_z.reshape(-1)  # [n_agent]
-    # target_z: [n_agent] -> [n_agent, n_rollout, n_step] 으로 확장
     target_z = target_z[:, None, None].expand(
         -1,
         pred_traj.shape[1],
         pred_traj.shape[2],
-    ).contiguous()
+    ).contiguous()  # [n_agent, n_rollout, n_step]
 
     device = pred_traj.device
-    # scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts]
     scenario_rollouts = get_scenario_rollouts(
         scenario_id=get_scenario_id_int_tensor(scenario_id, device),
         agent_id=target_id,
@@ -1468,10 +1587,8 @@ def validate_func(
         pred_head=pred_head,
     )
 
-    unnorm_ego_future_gt_4_dim = outputs[
-        "ego_future_gt_4_dim"]  # (B, future_len, 4)
-    unnorm_near_future_gt_4_dim = outputs[
-        "near_future_gt_4_dim"]  # (B, Pnn, future_len, 4)
+    unnorm_ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]  # (B, future_len, 4)
+    unnorm_near_future_gt_4_dim = outputs["near_future_gt_4_dim"]  # (B, Pnn, future_len, 4)
     unnorm_target_future_gt_4_dim = torch.cat(
         [
             unnorm_ego_future_gt_4_dim[:, None, :, :],
@@ -1480,30 +1597,26 @@ def validate_func(
         dim=1,
     )  # (B, (1+)Pnn, future_len, 4)
 
-    # [n_agent, future_len, 4]
     unnorm_target_future_gt_4_dim_flat = unnorm_target_future_gt_4_dim.reshape(
-        -1, unnorm_target_future_gt_4_dim.shape[2],
-        unnorm_target_future_gt_4_dim.shape[3])
+        -1,
+        unnorm_target_future_gt_4_dim.shape[2],
+        unnorm_target_future_gt_4_dim.shape[3],
+    )  # [n_agent, future_len, 4]
 
     unnorm_origin_world_pose = norm_inputs["origin_world_pose"]  # (B, 4)
 
-    # [n_agent, future_len, 4]
     unnorm_target_future_gt_4_dim_world = _covert_from_ego_to_world(
         target_poses=unnorm_target_future_gt_4_dim_flat,
         origin_world_pose=unnorm_origin_world_pose,
     )
 
-    # unnorm_target_future_gt_xy_world: [n_agent, future_len, 2]
-    unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :
-                                                                           2]
+    unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :2]  # [n_agent, future_len, 2]
 
     target_future_valid_flat = torch.any(
         unnorm_target_future_gt_4_dim_flat[:, :, :4] != 0,
         dim=-1,
     )  # [n_agent, future_len]
-    # ✅ 안전장치: min_ade가 pred_traj와 같은 device에 있는지 보장
-    if min_ade.device != pred_traj.device:
-        min_ade.to(pred_traj.device)
+
     min_ade.update(
         pred=pred_traj,  # [n_agent, n_rollout, n_step, 2]
         target=unnorm_target_future_gt_xy_world,  # [n_agent, future_len, 2]
@@ -1511,11 +1624,11 @@ def validate_func(
     )
 
     tfrecord_path = norm_inputs["tfrecord_path"]
-    assert isinstance(tfrecord_path,
-                      list), "tfrecord_path는 List[str] 타입이어야 합니다."
-    assert batch_size == len(
-        tfrecord_path), "batch_size와 tfrecord_path 길이가 맞지 않습니다."
+    assert isinstance(tfrecord_path, list), "tfrecord_path는 List[str] 타입이어야 합니다."
+    assert batch_size == len(tfrecord_path), "batch_size와 tfrecord_path 길이가 맞지 않습니다."
+
     wosac_metrics.update(tfrecord_path, scenario_rollouts)
+
 
 
 def _update_merged_inputs(
@@ -1554,39 +1667,175 @@ def _update_merged_inputs(
     norm_inputs_copy = _transform_origin(norm_inputs_copy, normed_ego_next_pose)
     return norm_inputs_copy
 
+from typing import Any, Dict, List
+
+import torch
+
+
+def _is_rollout_mutable_norm_input_key(key: str) -> bool:
+    """rollout 중에 값이 바뀔 가능성이 큰 key인지 판단합니다.
+
+    목적
+    ----
+    rollout을 만들 때 `norm_inputs`를 복사해야 하는데,
+    모든 텐서를 clone() 하면 큰 지도 텐서(lanes/route_lanes/road_edge 등)까지
+    매 rollout마다 GPU 메모리 복사가 발생해서 시간이 크게 늘어날 수 있습니다.
+
+    그래서 이 함수는 "rollout 동안 실제로 업데이트될 가능성이 큰 key"만 골라냅니다.
+
+    기준(안전한 쪽으로 잡은 규칙)
+    --------------------------
+    - agent의 과거 상태(past) 계열:
+      - ego_agent_past:            shape (B, T_past, 11)
+      - near_agents_past:          shape (B, Pnn, T_past, 11)
+      - non_near_agents_past:      shape (B, Nnn, T_past, 11)
+      - neighbor_agents_past:      shape (B, A,  T_past, 11)
+    - origin 관련:
+      - origin_world_pose 등 "origin"이 들어간 텐서: shape (B, 4) 또는 (B, ...)
+
+    Args:
+        key (str): norm_inputs의 key 문자열. shape: ()
+
+    Returns:
+        bool:
+            - True: rollout 중에 수정될 가능성이 큰 key
+            - False: 보통은 고정(공유해도 안전한) key
+    """
+    key_lower = str(key).lower()
+
+    # 1) 명시적으로 가장 자주 업데이트되는 키들
+    if key_lower in (
+        "ego_agent_past",
+        "near_agents_past",
+        "non_near_agents_past",
+        "neighbor_agents_past",
+    ):
+        return True
+
+    # 2) 이름에 origin이 포함되면, rollout에서 기준 좌표가 갱신될 수 있으므로 clone 후보로 봅니다.
+    if "origin" in key_lower:
+        return True
+
+    # 3) “*_agents_past” 류를 일반화해서 커버(혹시 키 이름이 조금 다른 경우 대비)
+    #    예: some_module_near_agents_past 같은 형태도 잡히게
+    if key_lower.endswith("_agent_past") or key_lower.endswith("_agents_past"):
+        return True
+
+    return False
+
+
+def _collect_rollout_clone_keys(norm_inputs: Dict[str, Any]) -> List[str]:
+    """rollout 복사에서 clone이 필요한 key 목록을 수집합니다.
+
+    Args:
+        norm_inputs (Dict[str, Any]):
+            모델 입력 dict.
+            각 value는 torch.Tensor / list[str] / 숫자 / None 등이 될 수 있습니다.
+
+    Returns:
+        List[str]:
+            clone 대상 key 목록.
+            (리스트 길이는 보통 몇 개 수준으로 유지되는 것을 기대합니다.)
+    """
+    keys_to_clone: List[str] = []
+    for k, v in norm_inputs.items():
+        if not isinstance(v, torch.Tensor):
+            continue
+        if _is_rollout_mutable_norm_input_key(k):
+            keys_to_clone.append(k)
+    return keys_to_clone
+
+
+def _assert_no_shared_tensor_storage_for_keys(
+    original: Dict[str, Any],
+    copied: Dict[str, Any],
+    keys_to_check: List[str],
+) -> None:
+    """선택된 key들에 대해서만, 원본과 복사본이 같은 저장공간을 공유하는지 검사합니다.
+
+    왜 필요한가?
+    ------------
+    전체 key를 대상으로 "저장공간 공유 금지"를 강제하면,
+    이번 최적화(정적 텐서 공유)가 의도적으로 깨집니다.
+
+    그래서 "rollout 중에 바뀔 수 있는 키"만 골라서
+    그 키들만은 반드시 storage가 분리되어 있는지 검사합니다.
+
+    Args:
+        original (Dict[str, Any]): 원본 norm_inputs.
+        copied (Dict[str, Any]): rollout용 복사본.
+        keys_to_check (List[str]): 검사할 key 리스트.
+
+    Raises:
+        AssertionError:
+            - keys_to_check 중 어떤 key가 원본과 복사본이 같은 storage를 공유하면 에러.
+    """
+    for key in keys_to_check:
+        original_value = original.get(key, None)
+        copied_value = copied.get(key, None)
+
+        if not isinstance(original_value, torch.Tensor):
+            continue
+        if not isinstance(copied_value, torch.Tensor):
+            raise AssertionError(
+                f"[copy check] key='{key}' 원본은 Tensor인데 복사본이 Tensor가 아닙니다."
+            )
+
+        original_ptr = _get_tensor_storage_ptr(original_value)
+        copied_ptr = _get_tensor_storage_ptr(copied_value)
+        if int(original_ptr) == int(copied_ptr):
+            raise AssertionError(
+                f"[copy check] key='{key}' 텐서가 같은 저장공간을 공유합니다. "
+                f"(원본/복사 storage ptr 동일)"
+            )
+
 
 def _clone_norm_inputs_for_rollout(
     norm_inputs: Dict[str, Any],
     sanity_check_tensor_storage: bool = False,
 ) -> Dict[str, Any]:
-    """rollout에서 입력 dict를 안전하게 복사합니다.
+    """rollout에서 사용할 norm_inputs를 "필요한 것만 clone" 하여 복사합니다.
 
-    목적은 2가지입니다.
+    기존 방식의 문제
+    --------------
+    rollout마다 dict 안의 모든 torch.Tensor를 clone() 하면,
+    lanes/route_lanes/road_edge처럼 큰 지도 텐서까지 매번 복사됩니다.
+    rollout이 32개면 복사 비용이 32배가 되어, GPU 메모리 복사/할당이 병목이 되기 쉽습니다.
 
-    1) rollout 중에 `norm_inputs_copy`를 계속 수정하더라도,
-       원본 `norm_inputs`가 같이 바뀌지 않게 만들기
-    2) 값이 `torch.Tensor`인 경우에는 실제 메모리까지 새로 만들어서(copy),
-       같은 저장공간을 공유하지 않게 만들기
-
-    복사 규칙:
-        - 값이 torch.Tensor 이면: `clone()`으로 새 텐서를 만듭니다.
-        - 값이 dict/list/tuple 이면: 안쪽 원소까지 재귀적으로 같은 규칙을 적용합니다.
-        - 그 외 타입(int/float/str 등)은: 보통 rollout 중에 수정하지 않으므로 그대로 둡니다.
+    변경된 복사 규칙
+    --------------
+    - dict 자체는 얕게 복사합니다. (out = dict(norm_inputs))
+    - rollout에서 변경될 가능성이 큰 key(ego/near/neighbor past, origin 관련)만 clone() 합니다.
+      - 예: ego_agent_past (B, T_past, 11), near_agents_past (B, Pnn, T_past, 11)
+    - 그 외 큰 정적 텐서(지도/정적 피처)는 원본을 공유합니다(읽기 전용으로 사용한다는 전제).
 
     Args:
-        norm_inputs: 모델 입력 dict.
-        sanity_check_tensor_storage: True이면 최상위 key 기준으로
-            원본 텐서와 복사 텐서가 같은 저장공간을 공유하지 않는지 확인합니다.
+        norm_inputs (Dict[str, Any]): 원본 입력 dict.
+        sanity_check_tensor_storage (bool):
+            True이면, 선택된 clone 대상 키들에 한해서
+            원본과 복사본이 저장공간을 공유하지 않는지 검사합니다.
 
     Returns:
-        rollout_inputs: 복사된 입력 dict.
+        Dict[str, Any]:
+            rollout용 입력 dict.
+            - clone 대상 텐서는 새 메모리
+            - 그 외 텐서는 원본과 같은 객체 참조(공유)
     """
-    rollout_inputs: Dict[str, Any] = {
-        key: _clone_nested_value(value) for key, value in norm_inputs.items()
-    }
+    # 1) dict는 얕게 복사 (키/구조만 새로 만들고 value는 참조 공유)
+    rollout_inputs: Dict[str, Any] = dict(norm_inputs)
 
+    # 2) “rollout 중 변할 가능성이 큰 텐서 key”만 골라 clone
+    keys_to_clone = _collect_rollout_clone_keys(norm_inputs)
+    for k in keys_to_clone:
+        rollout_inputs[k] = _clone_nested_value(norm_inputs[k])
+
+    # 3) 디버그 체크(선택 키만)
     if sanity_check_tensor_storage:
-        _assert_no_shared_tensor_storage(norm_inputs, rollout_inputs)
+        _assert_no_shared_tensor_storage_for_keys(
+            original=norm_inputs,
+            copied=rollout_inputs,
+            keys_to_check=keys_to_clone,
+        )
 
     return rollout_inputs
 
