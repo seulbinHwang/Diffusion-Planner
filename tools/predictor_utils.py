@@ -1815,7 +1815,8 @@ def build_dataset_and_sampler(
         set_,  # 예: "/mnt/nuplan/dataset/processed"
         set_list,  # 예: diffusion_planner_training.json
         args.predicted_neighbor_num,
-        role)
+        role,
+    args.use_data_percent)
 
     data_sampler = DistributedSampler(
         data_set,

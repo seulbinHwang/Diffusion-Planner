@@ -102,7 +102,7 @@ def model_validation(
      )
     args._global_update_step = 0
 
-    min_ade = minADE()
+    min_ade = minADE().to(torch.device(args.device))
     wosac_metrics = WOSACMetrics("val_closed")
 
     run_validation_loop(
@@ -536,8 +536,10 @@ def validation_epoch(
 
     total_batch_steps = int(max(1, batch_num_in_one_val_epoch))
 
+    should_show_progress: bool = _should_show_validation_progress(args)
+
     progress_state: Optional[Dict[str, Any]] = None
-    if _is_main_process_for_logging(args):
+    if should_show_progress:
         progress_state = _init_progress_eta_state(
             args=args,
             total_steps=total_batch_steps,
@@ -545,11 +547,12 @@ def validation_epoch(
         )
 
     with tqdm(
-            data_loader,
-            desc="Validation",
-            unit="batch",
-            total=total_batch_steps,
-            dynamic_ncols=True,
+        data_loader,
+        desc="Validation",
+        unit="batch",
+        total=total_batch_steps,
+        dynamic_ncols=True,
+        disable=(not should_show_progress),
     ) as data_epoch:
         for batch_idx, batch in enumerate(data_epoch, start=1):
             inputs, outputs = _prepare_batch_for_device(
@@ -558,8 +561,7 @@ def validation_epoch(
                 args=args,
             )
 
-            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(
-                inputs)
+            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
 
             validate_func(
                 args=args,
@@ -576,6 +578,7 @@ def validation_epoch(
             if args.ddp:
                 torch.cuda.synchronize()
 
+            # ✅ rank=0 + verbose=True 일 때만, 간단 진행률/ETA 출력
             if progress_state is not None:
                 _maybe_print_progress_eta(
                     state=progress_state,
@@ -589,7 +592,6 @@ def validation_epoch(
     min_ade.reset()
 
     return epoch_wosac_metrics
-
 
 def _select_inference_model_for_validation(
     model: nn.Module,
@@ -1499,7 +1501,9 @@ def validate_func(
         unnorm_target_future_gt_4_dim_flat[:, :, :4] != 0,
         dim=-1,
     )  # [n_agent, future_len]
-
+    # ✅ 안전장치: min_ade가 pred_traj와 같은 device에 있는지 보장
+    if min_ade.device != pred_traj.device:
+        min_ade.to(pred_traj.device)
     min_ade.update(
         pred=pred_traj,  # [n_agent, n_rollout, n_step, 2]
         target=unnorm_target_future_gt_xy_world,  # [n_agent, future_len, 2]

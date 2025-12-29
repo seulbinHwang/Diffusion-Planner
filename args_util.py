@@ -152,6 +152,10 @@ def get_args():
                         type=float,
                         help='center_crop_radius_m',
                         default=-1.0)
+    parser.add_argument('--use_data_percent',
+                        type=float,
+                        help='use_data_percent',
+                        default=-100.0)
     parser.add_argument('--center_crop_mode',
                         type=str,
                         choices=['none', 'npc', 'ego'],
@@ -453,6 +457,7 @@ def get_args():
                         default='x_start')
 
     parser.add_argument('--use_wandb', default=True, type=boolean)
+    parser.add_argument('--verbose', default=True, type=boolean)
     parser.add_argument('--notes', default='', type=str)
     parser.add_argument('--entity', default='jksg01019-naver-labs', type=str)
     parser.add_argument('--project', default='Diffusion-Planner', type=str)

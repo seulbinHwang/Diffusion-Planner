@@ -11,6 +11,175 @@ from diffusion_planner.utils.train_utils import openjson, opendata
 
 import numpy as np
 from numpy.typing import NDArray
+from typing import Any, List, Sequence, Tuple
+import os
+import numpy as np
+
+
+def _normalize_use_data_percent(use_data_percent: Any) -> float:
+    """사용할 비율(%) 값을 0~100 범위로 안전하게 정리합니다.
+
+    이 함수가 필요한 이유
+    --------------------
+    - use_data_percent는 보통 float/int로 들어오지만,
+      실수로 None/문자열 등이 들어오면 계산이 깨질 수 있습니다.
+    - 그래서 "숫자로 바꿀 수 있으면 float로", 아니면 기본값 100.0으로 처리합니다.
+    - 또한 0~100 범위를 벗어나면 안전하게 잘라(clamp)줍니다.
+
+    Args:
+        use_data_percent (Any):
+            사용할 비율 값. 보통 float/int. shape: ()
+
+    Returns:
+        float:
+            0.0 ~ 100.0 범위로 정리된 비율 값. shape: ()
+    """
+    if use_data_percent is None:
+        return 100.0
+
+    try:
+        percent = float(use_data_percent)
+    except (TypeError, ValueError):
+        return 100.0
+
+    # NaN/Inf 방지
+    if not bool(np.isfinite(percent)):
+        return 100.0
+
+    # 0~100 clamp
+    percent = max(0.0, min(100.0, percent))
+    return float(percent)
+
+
+def _compute_keep_count_from_percent(
+    total_count: int,
+    use_data_percent: float,
+) -> int:
+    """전체 개수에서 '앞쪽 N%'만 쓸 때 실제로 남길 개수를 계산합니다.
+
+    규칙
+    ----
+    - 리스트를 섞지 않고 앞에서부터 잘라 쓰는 방식이므로,
+      keep_count개만 남기면 됩니다.
+    - total_count > 0 인데,
+      비율이 너무 작아서 계산 결과가 0이 되면(예: 0.1%),
+      파이프라인이 아예 비는 것을 막기 위해 최소 1개는 남깁니다.
+
+    Args:
+        total_count (int):
+            전체 항목 수. shape: ()
+        use_data_percent (float):
+            사용할 비율(0~100). shape: ()
+
+    Returns:
+        int:
+            남길 항목 수. shape: ()
+            - 0 <= keep_count <= total_count
+            - total_count > 0 이면 keep_count는 최소 1
+    """
+    total = int(total_count)
+    if total <= 0:
+        return 0
+
+    percent = float(use_data_percent)
+
+    # percent가 0이어도 "완전 빈 데이터"로 들어가면 validation 로직이 깨질 가능성이 큼
+    # (metric compute 등). 그래서 최소 1개는 남기도록 처리합니다.
+    if percent <= 0.0:
+        return 1
+
+    keep = int(total * percent / 100.0)
+
+    # 너무 작아서 0이 된 경우 최소 1
+    keep = max(1, keep)
+
+    # 최대는 total
+    keep = min(total, keep)
+    return int(keep)
+
+
+def _select_first_n_percent_items(
+    data_list: Sequence[str],
+    use_data_percent: Any,
+) -> Tuple[List[str], float, int, int]:
+    """리스트를 섞지 않고 '앞쪽 N%'만 남깁니다.
+
+    Args:
+        data_list (Sequence[str]):
+            파일 이름 리스트. length=total_count
+        use_data_percent (Any):
+            사용할 비율(%). shape: ()
+
+    Returns:
+        Tuple[List[str], float, int, int]:
+            (selected_list, normalized_percent, total_count, keep_count)
+            - selected_list: 앞쪽 keep_count개만 남긴 리스트
+            - normalized_percent: 0~100으로 정리된 percent
+            - total_count: 원래 전체 개수
+            - keep_count: 실제로 남긴 개수
+    """
+    total_count = int(len(data_list))
+    normalized_percent = _normalize_use_data_percent(use_data_percent)
+    keep_count = _compute_keep_count_from_percent(total_count, normalized_percent)
+
+    selected_list = list(data_list[:keep_count])
+    return selected_list, float(normalized_percent), total_count, int(keep_count)
+
+
+def _should_print_dataset_subset_info() -> bool:
+    """여러 프로세스로 도는 경우에도 로그를 한 번만 찍도록 판단합니다.
+
+    - torchrun을 쓰면 RANK 환경변수가 들어오는 경우가 많습니다.
+    - 보통 rank 0만 출력하면 로그가 깔끔합니다.
+
+    Returns:
+        bool:
+            - True면 출력
+            - False면 출력 생략
+    """
+    rank_str = os.environ.get("RANK", "0")
+    try:
+        rank = int(rank_str)
+    except ValueError:
+        rank = 0
+    return rank == 0
+
+
+def _print_dataset_subset_info(
+    *,
+    role: str,
+    data_list_path: Any,
+    total_count: int,
+    keep_count: int,
+    use_data_percent: float,
+) -> None:
+    """데이터를 얼마나 줄여서 쓸지 한 줄로 출력합니다.
+
+    Args:
+        role (str):
+            "train" / "validation" 등. shape: ()
+        data_list_path (Any):
+            json 경로(문자열) 또는 그와 비슷한 값. shape: ()
+        total_count (int):
+            전체 항목 수. shape: ()
+        keep_count (int):
+            실제로 사용할 항목 수. shape: ()
+        use_data_percent (float):
+            사용할 비율(정리된 값). shape: ()
+    """
+    if not _should_print_dataset_subset_info():
+        return
+
+    try:
+        list_name = os.path.basename(str(data_list_path))
+    except Exception:
+        list_name = str(data_list_path)
+
+    print(
+        f"[DiffusionPlannerData] role='{role}' | data_list='{list_name}' | "
+        f"total={int(total_count)} | use_percent={float(use_data_percent):.2f}% | "
+        f"using_first={int(keep_count)}"
+    )
 
 
 def _get_first_non_none_value(
@@ -146,41 +315,64 @@ def _compute_agent_level_valid_from_future_gt_3(
     agent_valid = np.any(per_step_valid, axis=-1)
     return agent_valid.astype(bool)
 
-
 class DiffusionPlannerData(Dataset):
 
-    def __init__(self,
-                 data_dir,
-                 data_list,
-                 predicted_neighbor_num,
-                 role: str = "train"):
+    def __init__(
+        self,
+        data_dir,
+        data_list,
+        predicted_neighbor_num,
+        role: str = "train",
+        use_data_percent: float = 100.0,
+    ):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
                 "${WOMD_PATH}/processed_womd_final/validation"
         data_list: "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+
+        use_data_percent:
+            - 전체 data_list 중 앞쪽 N%만 사용할지 결정하는 값입니다. shape: ()
+            - 리스트를 섞지 않고, 시작 지점부터 앞에서부터 잘라서 씁니다.
+            - 예: 10.0 -> 앞 10%만 사용
         """
+        use_data_percent=100.0
         self.data_dir = data_dir
         self.data_tfrecords_dir = None
-        self.data_list = openjson(data_list)
+
+        # 1) json에서 파일 리스트 로드 (순서 유지)
+        loaded_list = openjson(data_list)
+        if not isinstance(loaded_list, list):
+            raise TypeError(
+                f"openjson(data_list) 결과는 list여야 합니다. got type={type(loaded_list)}"
+            )
+
+        # 2) 앞쪽 N%만 남기기 (섞지 않음, 고정)
+        selected_list, normalized_percent, total_count, keep_count = \
+            _select_first_n_percent_items(
+                data_list=loaded_list,
+                use_data_percent=use_data_percent,
+            )
+
+        self.data_list = selected_list
         self.predicted_neighbor_num = predicted_neighbor_num
         self.role = role
+
+        # 3) 어떤 비율로 얼마나 쓰는지 출력
+        _print_dataset_subset_info(
+            role=str(self.role),
+            data_list_path=data_list,
+            total_count=int(total_count),
+            keep_count=int(keep_count),
+            use_data_percent=float(normalized_percent),
+        )
+
+        # 4) validation일 때 tfrecords dir 설정 (기존 로직 유지)
         if self.role == "validation":
-            """
-            data_dir: 
-                    예 1) "/mnt/nuplan/dataset/validation"
-                    예 2) ${WOMD_PATH}/processed_womd_final/validation
-            self.data_tfrecords_dir: 
-                    예 1) "/mnt/nuplan/dataset/validation_tfrecords_splitted"
-                    예 2) ${WOMD_PATH}/processed_womd_final/validation
-            
-            방식 : data_dir의 마지막 경로명 + "_tfrecords_splitted"를 붙인 경로
-            """
-            parent_dir = os.path.dirname(
-                self.data_dir)  # ${WOMD_PATH}/processed_womd_final
-            last_dir_name = os.path.basename(self.data_dir)  # validation
+            parent_dir = os.path.dirname(self.data_dir)
+            last_dir_name = os.path.basename(self.data_dir)
             self.data_tfrecords_dir = os.path.join(
                 parent_dir, f"{last_dir_name}_tfrecords_splitted"
-            )  # ${WOMD_PATH}/processed_womd_final/validation_tfrecords_splitted
+            )
 
     def __len__(self):
         return len(self.data_list)

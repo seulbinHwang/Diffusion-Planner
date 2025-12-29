@@ -13,8 +13,10 @@ except Exception:
 
 import torch
 
+
 # src/smart/metrics/wosac_metrics.py
 class StateNormalizer:
+
     def __init__(self, mean: object, std: object) -> None:
         """상태 벡터(마지막 차원 4개 값)를 정규화/역정규화하는 클래스입니다.
 
@@ -30,7 +32,7 @@ class StateNormalizer:
             ValueError: mean/std의 총 원소 개수가 4가 아니면 발생합니다.
         """
         self.mean = self._to_1d4(mean, name="mean")  # (4,)
-        self.std = self._to_1d4(std, name="std")    # (4,)
+        self.std = self._to_1d4(std, name="std")  # (4,)
 
     @classmethod
     def from_json(cls, args):
@@ -41,7 +43,8 @@ class StateNormalizer:
 
     @classmethod
     def from_json2(cls, args_dict):
-        path_str = args_dict.get("normalization_file_path", "normalization.json")
+        path_str = args_dict.get("normalization_file_path",
+                                 "normalization.json")
         data = openjson(to_absolute_path(path_str))
         mean = data["neighbor"]["mean"]
         std = data["neighbor"]["std"]
@@ -61,7 +64,8 @@ class StateNormalizer:
         Raises:
             ValueError: 총 원소 개수가 4가 아니면 발생합니다.
         """
-        values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)  # (N,)
+        values_t = torch.as_tensor(values,
+                                   dtype=torch.float32).reshape(-1)  # (N,)
         if values_t.numel() != 4:
             raise ValueError(
                 f"{name}는 총 4개 값이어야 합니다. "
@@ -70,7 +74,8 @@ class StateNormalizer:
         return values_t  # (4,)
 
     @staticmethod
-    def _reshape_stats_for_data(stats_1d4: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+    def _reshape_stats_for_data(stats_1d4: torch.Tensor,
+                                data: torch.Tensor) -> torch.Tensor:
         """stats(4,)를 data(...,4)에 맞게 (1, ..., 1, 4) 모양으로 바꿉니다.
 
         Args:
@@ -115,14 +120,15 @@ class StateNormalizer:
             torch.Tensor: 정규화된 텐서, shape (..., 4).
         """
         if data.shape[-1] != 4:
-            raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+            raise ValueError(
+                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
             # mask: (...), 마지막 4개 값이 전부 0인 위치
             mask = self._zero_vector_mask(data)  # (...,)
 
             mean = self._reshape_stats_for_data(self.mean, data)  # (1,...,1,4)
-            std = self._reshape_stats_for_data(self.std, data)    # (1,...,1,4)
+            std = self._reshape_stats_for_data(self.std, data)  # (1,...,1,4)
 
             norm_data = (data - mean) / std  # (..., 4)
             norm_data[mask] = 0
@@ -141,13 +147,14 @@ class StateNormalizer:
             torch.Tensor: 역변환된 텐서, shape (..., 4).
         """
         if data.shape[-1] != 4:
-            raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+            raise ValueError(
+                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
             mask = self._zero_vector_mask(data)  # (...,)
 
             mean = self._reshape_stats_for_data(self.mean, data)  # (1,...,1,4)
-            std = self._reshape_stats_for_data(self.std, data)    # (1,...,1,4)
+            std = self._reshape_stats_for_data(self.std, data)  # (1,...,1,4)
 
             inv_data = data * std + mean  # (..., 4)
             inv_data[mask] = 0
