@@ -39,6 +39,95 @@ from src.smart.metrics import WOSACMetrics, minADE
 from torch import optim
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 
+import os
+from typing import Optional
+import argparse
+import torch
+
+
+def _get_rank_from_env() -> int:
+    """환경변수에서 rank 값을 읽습니다.
+
+    왜 필요한가?
+    ------------
+    process group이 아직 초기화되지 않은 상태에서는
+    torch.distributed.get_rank()를 부르면 에러가 날 수 있습니다.
+    그래서 안전하게 환경변수 RANK를 사용합니다.
+
+    Args:
+        없음
+
+    Returns:
+        int:
+            rank 값. shape: ()
+            - 환경변수에 없으면 0으로 취급합니다.
+    """
+    rank_str = os.environ.get("RANK", "0")
+    try:
+        return int(rank_str)
+    except ValueError:
+        return 0
+
+
+def _is_torch_process_group_initialized() -> bool:
+    """torch.distributed process group이 준비되어 있는지 확인합니다.
+
+    Args:
+        없음
+
+    Returns:
+        bool:
+            - True: torch.distributed 사용 가능 + init_process_group 완료
+            - False: 아직 초기화되지 않음
+    """
+    if not torch.distributed.is_available():
+        return False
+    return bool(torch.distributed.is_initialized())
+
+
+def _maybe_distributed_barrier(
+    args: argparse.Namespace,
+    *,
+    context: str = "",
+) -> None:
+    """가능한 경우에만 torch.distributed.barrier()를 호출합니다.
+
+    왜 필요한가?
+    ------------
+    - args.ddp가 True여도, 실제로 init_process_group가 안 된 경우가 있습니다.
+      (예: torchrun을 쓰지만 nproc=1이고, 코드가 world_size>1일 때만 init하는 경우)
+    - 이 상태에서 barrier를 호출하면 바로 에러가 납니다.
+    - 그래서 "초기화된 경우에만 barrier"를 호출하도록 안전 장치를 둡니다.
+
+    Args:
+        args (argparse.Namespace):
+            args.ddp 값을 참고합니다. shape: ()
+        context (str):
+            로그를 찍을 때 어디서 호출했는지 표시용 문자열. shape: ()
+
+    Returns:
+        None
+    """
+    use_ddp = bool(getattr(args, "ddp", False))
+    if not use_ddp:
+        return
+
+    if not _is_torch_process_group_initialized():
+        # single-process / 비초기화 상태에서는 barrier가 필요 없으므로 스킵합니다.
+        # 너무 시끄럽지 않게 rank0만 1회만 출력합니다.
+        rank = _get_rank_from_env()
+        if rank == 0:
+            warned_flag_name = "_dp_warned_skip_barrier"
+            if not getattr(_maybe_distributed_barrier, warned_flag_name, False):
+                setattr(_maybe_distributed_barrier, warned_flag_name, True)
+                ctx = f" ({context})" if context else ""
+                print(
+                    f"[DDP] process group이 초기화되지 않아 barrier를 건너뜁니다{ctx}."
+                )
+        return
+
+    torch.distributed.barrier()
+
 
 def model_validation(
     args: argparse.Namespace,
@@ -155,6 +244,14 @@ def run_validation_loop(
     # print "epoch_elapsed_time_sec"
     print(f"[Validation] completed in "
           f"{epoch_elapsed_time_sec:.2f} sec.")
+    """epoch_wosac_metrics 를 출력합니다."""
+    if _is_main_process_for_logging(args):
+        print(f"=== Validation Metrics ===")
+        for k, v in epoch_wosac_metrics.items():
+            # v 가 tensor인 경우 item()으로 스칼라 값 추출, float인 경우 그대로 사용
+            value = v.item() if isinstance(v, torch.Tensor) else float(v)
+            print(f"{k}: {value:.6f}")
+
 
 
 def validate_one_epoch(
@@ -192,9 +289,10 @@ torch.cuda.synchronize() : 현재 GPU에서 큐에 쌓인 비동기 연산이 �
 torch.distributed.barrier() :
     모든 rank(프로세스)가 이 지점에 도착할 때까지 서로 기다리게 해서, 어떤 rank만 앞서가거나(예: 저장/로그/다음 epoch) 뒤처지는 상황을 막습니다.
     """
-    if args.ddp:
+    if bool(getattr(args, "ddp", False)) and str(getattr(args, "device", "")).startswith("cuda"):
         torch.cuda.synchronize()
-        torch.distributed.barrier()
+
+    _maybe_distributed_barrier(args, context="validate_one_epoch end")
 
     epoch_elapsed_time_sec = time.perf_counter() - epoch_t0
     return epoch_wosac_metrics, epoch_elapsed_time_sec
@@ -1436,6 +1534,138 @@ def _predict_rollouts_batched_with_oom_fallback(
     raise last_oom
 
 
+def _build_valid_agent_mask_for_wosac(
+    agent_id: torch.Tensor,
+    target_future_valid: torch.Tensor,
+) -> torch.Tensor:
+    """WOSAC 계산에 넣을 "유효 agent"만 고르는 True/False 표시 텐서를 만듭니다.
+
+    왜 필요한가?
+    -------------
+    입력 데이터는 (ego + near agents)를 고정 크기(예: 1+Pnn=128)로 맞추기 위해
+    실제로 존재하지 않는 agent 칸을 0으로 채우는 경우가 많습니다.
+    이때 agent_id=0 같은 값이 그대로 WOSAC로 들어가면,
+    Waymo metric 내부에서 "시나리오에 없는 object_id"로 판단되어 즉시 에러가 납니다.
+
+    동작 규칙(안전한 쪽 기준)
+    ------------------------
+    - agent_id가 0인 경우:
+      - 그 agent가 실제로 존재하는지(target_future_valid에 True가 하나라도 있는지) 확인합니다.
+      - 존재하지 않으면(전부 False면) 패딩으로 보고 제거합니다.
+    - agent_id가 0이 아닌 경우:
+      - 기본적으로 유지합니다.
+
+    Args:
+        agent_id (torch.Tensor):
+            agent의 object_id.
+            shape: (N,)
+            - N = B * (1+Pnn)
+        target_future_valid (torch.Tensor):
+            agent별 미래 구간 유효 여부.
+            shape: (B, 1+Pnn, T)
+            - T = future_len
+
+    Returns:
+        torch.Tensor:
+            WOSAC에 넣어도 되는 agent만 True인 표시 텐서.
+            shape: (N,)
+    """
+    if agent_id.dim() != 1:
+        raise ValueError(
+            f"agent_id는 (N,) 이어야 합니다. 현재 shape={tuple(agent_id.shape)}"
+        )
+    if target_future_valid.dim() != 3:
+        raise ValueError(
+            "target_future_valid는 (B, 1+Pnn, T) 이어야 합니다. "
+            f"현재 shape={tuple(target_future_valid.shape)}"
+        )
+
+    # (B, 1+Pnn, T) -> (B, 1+Pnn) -> (N,)
+    agent_has_any_future: torch.Tensor = torch.any(
+        target_future_valid.to(dtype=torch.bool), dim=-1
+    ).reshape(-1)  # shape: (N,)
+
+    if int(agent_has_any_future.shape[0]) != int(agent_id.shape[0]):
+        raise ValueError(
+            "agent_id의 길이(N)와 target_future_valid에서 펼친 길이가 다릅니다. "
+            f"N(agent_id)={int(agent_id.shape[0])}, "
+            f"N(from target_future_valid)={int(agent_has_any_future.shape[0])}"
+        )
+
+    # 패딩으로 자주 쓰이는 케이스: agent_id == 0 이면서 미래 valid가 전부 False
+    is_padded_zero: torch.Tensor = (agent_id == 0) & (~agent_has_any_future)  # (N,)
+    valid_mask: torch.Tensor = ~is_padded_zero  # (N,)
+
+    return valid_mask
+
+
+def _filter_rollout_tensors_by_agent_mask(
+    agent_id: torch.Tensor,
+    agent_batch: torch.Tensor,
+    pred_traj: torch.Tensor,
+    pred_z: torch.Tensor,
+    pred_head: torch.Tensor,
+    agent_valid_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """agent_valid_mask가 True인 agent만 남기도록 rollout 관련 텐서들을 같이 걸러냅니다.
+
+    Args:
+        agent_id (torch.Tensor):
+            shape: (N,)
+        agent_batch (torch.Tensor):
+            각 agent가 어느 배치(0~B-1)에 속하는지.
+            shape: (N,)
+        pred_traj (torch.Tensor):
+            예측 궤적(x,y).
+            shape: (N, R, T, 2)
+        pred_z (torch.Tensor):
+            예측 높이(z).
+            shape: (N, R, T)
+        pred_head (torch.Tensor):
+            예측 heading(rad).
+            shape: (N, R, T)
+        agent_valid_mask (torch.Tensor):
+            남길 agent는 True.
+            shape: (N,)
+
+    Returns:
+        Tuple[torch.Tensor, ...]:
+            (filtered_agent_id, filtered_agent_batch, filtered_pred_traj,
+             filtered_pred_z, filtered_pred_head)
+
+            - filtered_agent_id:   (N2,)
+            - filtered_agent_batch:(N2,)
+            - filtered_pred_traj:  (N2, R, T, 2)
+            - filtered_pred_z:     (N2, R, T)
+            - filtered_pred_head:  (N2, R, T)
+    """
+    if agent_valid_mask.dim() != 1:
+        raise ValueError(
+            "agent_valid_mask는 (N,) 이어야 합니다. "
+            f"현재 shape={tuple(agent_valid_mask.shape)}"
+        )
+    if int(agent_id.shape[0]) != int(agent_valid_mask.shape[0]):
+        raise ValueError(
+            "agent_id와 agent_valid_mask의 길이가 다릅니다. "
+            f"N(agent_id)={int(agent_id.shape[0])}, "
+            f"N(mask)={int(agent_valid_mask.shape[0])}"
+        )
+
+    # 첫 차원(N)을 기준으로 동일하게 필터링
+    filtered_agent_id = agent_id[agent_valid_mask]
+    filtered_agent_batch = agent_batch[agent_valid_mask]
+    filtered_pred_traj = pred_traj[agent_valid_mask]
+    filtered_pred_z = pred_z[agent_valid_mask]
+    filtered_pred_head = pred_head[agent_valid_mask]
+
+    return (
+        filtered_agent_id,
+        filtered_agent_batch,
+        filtered_pred_traj,
+        filtered_pred_z,
+        filtered_pred_head,
+    )
+
 def validate_func(
     args: Any,
     model: nn.Module,
@@ -1501,7 +1731,6 @@ def validate_func(
         args.future_len,
     )
     norm_inputs["target_future_valid"] = target_future_valid
-
     ego_agent_past = norm_inputs.get("ego_agent_past", None)
     if not isinstance(ego_agent_past, torch.Tensor):
         raise ValueError("norm_inputs['ego_agent_past']가 torch.Tensor가 아닙니다.")
@@ -1578,13 +1807,37 @@ def validate_func(
     ).contiguous()  # [n_agent, n_rollout, n_step]
 
     device = pred_traj.device
+    scenario_id_ = get_scenario_id_int_tensor(scenario_id, device)
+
+    # ---------------------------------------------------------
+    # ✅ WOSAC용: 패딩 agent(object_id=0 등)를 제거하고 rollouts 생성
+    # ---------------------------------------------------------
+    wosac_agent_valid_mask = _build_valid_agent_mask_for_wosac(
+        agent_id=target_id,                 # shape: (N,)
+        target_future_valid=target_future_valid,  # shape: (B, 1+Pnn, T)
+    )
+
+    (
+        wosac_agent_id,
+        wosac_agent_batch,
+        wosac_pred_traj,
+        wosac_pred_z,
+        wosac_pred_head,
+    ) = _filter_rollout_tensors_by_agent_mask(
+        agent_id=target_id,          # (N,)
+        agent_batch=agent_batch,     # (N,)
+        pred_traj=pred_traj,         # (N, R, T, 2)
+        pred_z=target_z,             # (N, R, T)
+        pred_head=pred_head,         # (N, R, T)
+        agent_valid_mask=wosac_agent_valid_mask,  # (N,)
+    )
     scenario_rollouts = get_scenario_rollouts(
         scenario_id=get_scenario_id_int_tensor(scenario_id, device),
-        agent_id=target_id,
-        agent_batch=agent_batch,
-        pred_traj=pred_traj,
-        pred_z=target_z,
-        pred_head=pred_head,
+        agent_id=wosac_agent_id,
+        agent_batch=wosac_agent_batch,
+        pred_traj=wosac_pred_traj,
+        pred_z=wosac_pred_z,
+        pred_head=wosac_pred_head,
     )
 
     unnorm_ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]  # (B, future_len, 4)

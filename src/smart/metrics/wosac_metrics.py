@@ -68,6 +68,39 @@ class WOSACMetrics(Metric):
         config, scenario_file, scenario_rollout, ego_only
     ) -> sim_agents_metrics_pb2.SimAgentMetrics:
         scenario = scenario_pb2.Scenario()
+
+        debug = True
+        first_id = None
+        second_id = None
+
+        dataset = tf.data.TFRecordDataset([scenario_file], compression_type="")
+        for idx, data in enumerate(dataset):
+            tmp = scenario_pb2.Scenario()
+            tmp.ParseFromString(bytes(data.numpy()))
+
+            if idx == 0:
+                scenario.CopyFrom(tmp)  # ✅ 실제 계산에는 "첫 레코드"를 그대로 사용
+                first_id = tmp.scenario_id
+                if not debug:
+                    break  # ✅ 원래처럼 빠르게 끝
+            elif idx == 1:
+                second_id = tmp.scenario_id  # ✅ 두 번째 레코드가 있으면 "샤드 파일" 가능성 매우 큼
+                break
+
+        if debug:
+            rollout_id = getattr(scenario_rollout, "scenario_id", "")
+            print(f"[WOSAC_DEBUG] file={scenario_file}")
+            print(
+                f"[WOSAC_DEBUG] first_id={first_id} second_id={second_id} rollout_id={rollout_id}")
+
+            if second_id is not None:
+                print(
+                    "[WOSAC_DEBUG][WARNING] 이 파일 안에 시나리오가 2개 이상 들어있습니다(샤드일 가능성).")
+
+            if rollout_id and first_id and (rollout_id != first_id):
+                print(
+                    "[WOSAC_DEBUG][ERROR] rollout_id != 파일의 첫 scenario_id 입니다. (정답-예측 매칭이 깨졌을 가능성 큼)")
+
         for data in tf.data.TFRecordDataset([scenario_file], compression_type=""):
             scenario.ParseFromString(bytes(data.numpy()))
             break

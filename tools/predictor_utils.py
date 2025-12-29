@@ -21,6 +21,7 @@ from torch import optim
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
 
 import torch
+from typing import Any, Dict, List, Optional, Tuple, Iterator
 
 
 def _select_latest_like_tag(save_path: str) -> str:
@@ -1767,6 +1768,115 @@ def build_deepspeed_config(args: argparse.Namespace,
 
     return ds_config
 
+class NoPaddingDistributedEvalSampler(torch.utils.data.Sampler[int]):
+    """평가용으로 "패딩/드랍 없이" 데이터 인덱스를 rank별로 나눠주는 도구입니다.
+
+    왜 필요한가
+    ----------
+    PyTorch 기본 DistributedSampler는 데이터 개수가 world_size로 딱 나누어 떨어지지 않으면
+    - (옵션에 따라) 끝을 잘라버리거나(drop),
+    - 또는 몇 개를 복제해서 길이를 맞추는(padding) 동작을 할 수 있습니다.
+
+    평가/추론에서는 샘플이 "하나도 빠지지 않고, 중복도 없이" 정확히 1번씩 처리되어야 하는 경우가 많습니다.
+    그래서 이 클래스는 아래 규칙으로만 인덱스를 나눕니다.
+
+    규칙
+    ----
+    - 전체 인덱스가 [0, 1, 2, ..., N-1]일 때,
+      rank r 는 [r, r+world_size, r+2*world_size, ...] 만 처리합니다.
+      즉, 각 rank는 `indices[rank::world_size]`만 처리합니다.
+    - 추가로 붙이는 인덱스(복제)도 없고, 잘라내는 것도 없습니다.
+
+    반환/shape
+    ---------
+    - __iter__가 만들어내는 인덱스 개수는 rank마다 최대 1개 차이입니다.
+    - 각 rank의 인덱스 리스트 길이: (N_rank,)  # shape: (N_rank,)
+
+    Args:
+        dataset: __len__을 지원하는 Dataset. 전체 길이 N을 가진다고 가정. shape: ()
+        num_replicas: 전체 프로세스 수(world_size). shape: ()
+        rank: 현재 프로세스의 global rank. shape: ()
+        shuffle: True면 epoch마다 같은 규칙으로 섞되, 그래도 "패딩/드랍"은 하지 않습니다.
+        seed: shuffle=True일 때 섞기 시드. shape: ()
+
+    Note:
+        평가에서는 보통 shuffle=False를 권장합니다.
+    """
+
+    def __init__(
+        self,
+        dataset: Any,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = False,
+        seed: int = 0,
+    ) -> None:
+        self.dataset = dataset
+        self.num_replicas = int(max(1, num_replicas))
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(
+                f"rank must be in [0, num_replicas-1]. got rank={self.rank}, num_replicas={self.num_replicas}"
+            )
+
+    def set_epoch(self, epoch: int) -> None:
+        """epoch 값을 저장합니다.
+
+        목적
+        ----
+        - shuffle=True인 경우에만 epoch에 따라 섞이는 순서를 바꾸기 위해 사용합니다.
+        - shuffle=False면 호출되어도 동작에 영향은 없습니다.
+
+        Args:
+            epoch (int): 현재 epoch 번호. shape: ()
+        """
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        """현재 rank가 처리할 인덱스를 순서대로 반환합니다.
+
+        Returns:
+            Iterator[int]:
+                - 이 rank가 처리할 데이터 인덱스 흐름
+                - 총 개수: __len__()와 동일
+        """
+        dataset_size: int = int(len(self.dataset))
+        if dataset_size <= 0:
+            return iter(())
+
+        # shuffle을 쓰지 않으면, 메모리 추가 없이 range로 바로 처리 가능
+        if not self.shuffle:
+            # indices: rank, rank+world_size, rank+2*world_size, ...
+            return iter(range(self.rank, dataset_size, self.num_replicas))
+
+        # shuffle=True: 전체 인덱스를 한 번 섞고, 그 중에서 rank::world_size만 선택
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        # perm: (N,) 형태의 섞인 인덱스
+        perm = torch.randperm(dataset_size, generator=generator).tolist()
+        # 이 rank 몫만 슬라이스 (padding/드랍 없음)
+        per_rank_indices = perm[self.rank:dataset_size:self.num_replicas]
+        return iter(per_rank_indices)
+
+    def __len__(self) -> int:
+        """현재 rank가 처리할 샘플 개수를 반환합니다.
+
+        Returns:
+            int:
+                - 이 rank가 처리할 샘플 개수. shape: ()
+        """
+        dataset_size: int = int(len(self.dataset))
+        if dataset_size <= self.rank:
+            return 0
+        # range(rank, dataset_size, world_size)의 길이
+        return int((dataset_size - self.rank + self.num_replicas - 1) //
+                   self.num_replicas)
+
 
 def effective_global_batch(batch_size: int, world_size: int) -> int:
     """DataLoader가 사용하는 실제 글로벌 배치(DDP 정합)"""
@@ -1782,88 +1892,130 @@ def build_dataset_and_sampler(
     role: str,
     world_size: int,
     global_rank: int,
-) -> Tuple[DiffusionPlannerData, DistributedSampler]:
-    """학습용 Dataset과 DistributedSampler를 만든다.
+) -> Tuple[DiffusionPlannerData, torch.utils.data.Sampler[int]]:
+    """Dataset과 Sampler를 만든다.
 
-    DiffusionPlannerData 는
-      - 학습에 쓸 파일 목록(JSON)을 읽고
-      - 각 항목에 대응하는 npz 파일을 열어서
-      - 하나의 샘플을 이름 기반 dict로 돌려준다.
-        예: "ego_agent_past": (time_len, 11),
-            "neighbor_agents_past": (agent_num, time_len, 11),
-            "lanes": (lane_num, lane_len, 12) 등.
+    변경 목표(평가 시)
+    ----------------
+    - 평가(role이 train이 아닐 때)는
+      1) 샘플 중복 없이
+      2) 샘플 누락 없이
+      각 rank가 자기 몫만 처리하도록 Sampler를 바꾼다.
+      (indices[rank::world_size] 방식)
 
-    DistributedSampler 는 전체 샘플 인덱스를
-      - world_size 개만큼 나누고
-      - 각 rank(global_rank)에 서로 다른 구간을 배정해서
-        여러 GPU가 겹치지 않는 데이터를 보게 만든다.
-    이렇게 하면 모든 GPU가 동시에 다른 샘플을 보면서도,
-    한 epoch 안에서 전체 데이터가 고르게 사용되도록 맞출 수 있다.
+    학습 시
+    ------
+    - 기존 로직(DistributedSampler + shuffle)을 그대로 유지한다.
 
     Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        world_size: 전체 프로세스 개수.
-        global_rank: 전체 프로세스 기준 번호.
+        args: 학습/평가 설정 Namespace.
+        set_: 데이터 루트 경로. shape: ()
+        set_list: 파일 리스트(json) 경로. shape: ()
+        role: "train" 또는 "validation" 등. shape: ()
+        world_size: 전체 프로세스 수. shape: ()
+        global_rank: 현재 프로세스의 global rank. shape: ()
 
     Returns:
-        data_set: DiffusionPlannerData 인스턴스.
-        data_sampler: 각 rank에 샘플을 나눠주는 DistributedSampler.
+        Tuple[DiffusionPlannerData, torch.utils.data.Sampler[int]]:
+            - data_set: DiffusionPlannerData
+            - data_sampler:
+                · train: torch.utils.data.DistributedSampler
+                · eval : NoPaddingDistributedEvalSampler
     """
-    # data_set 내부에서 개별 샘플은 npz를 읽어 (agent, lane 등) 배열을
-    #   모델 입력 shape에 맞는 Tensor로 바꿔준다. (예: (time_len, 11), (A, T, 11) 등)
     data_set = DiffusionPlannerData(
-        set_,  # 예: "/mnt/nuplan/dataset/processed"
-        set_list,  # 예: diffusion_planner_training.json
+        set_,
+        set_list,
         args.predicted_neighbor_num,
         role,
-    args.use_data_percent)
-
-    data_sampler = DistributedSampler(
-        data_set,
-        num_replicas=world_size,
-        rank=global_rank,
-        shuffle=True,
-        seed=args.seed,
+        args.use_data_percent,
     )
 
-    return data_set, data_sampler
+    role_lower = str(role).lower()
+
+    if role_lower == "train":
+        data_sampler = DistributedSampler(
+            data_set,
+            num_replicas=int(max(1, world_size)),
+            rank=int(global_rank),
+            shuffle=True,
+            seed=int(args.seed),
+        )
+        return data_set, data_sampler
+
+    # ✅ eval/validation/test: 패딩/드랍 없는 방식
+    if role_lower == "validation":
+        data_sampler = NoPaddingDistributedEvalSampler(
+            dataset=data_set,
+            num_replicas=int(max(1, world_size)),
+            rank=int(global_rank),
+            shuffle=False,  # 평가에서는 보통 고정 순서 권장
+            seed=int(args.seed),
+        )
+        return data_set, data_sampler
+    raise ValueError(
+        f"Unsupported role for building dataset and sampler: role='{role}'")
+
 
 
 def build_data_loader(
     args: argparse.Namespace,
     data_set: DiffusionPlannerData,
-    data_sampler: DistributedSampler,
+    data_sampler: torch.utils.data.Sampler[int],
     batch_size: int,
     world_size: int,
+    drop_last: Optional[bool] = None,
 ) -> DataLoader:
-    """분산 학습에 맞는 DataLoader를 만든다.
+    """분산 환경에서 DataLoader를 만든다.
+
+    변경 목표(평가 시)
+    ----------------
+    - eval/validation/test에서는 drop_last=False로 두어
+      마지막 남은 샘플이 배치 크기보다 작아도 버리지 않게 한다.
+
+    동작 규칙
+    --------
+    - drop_last 인자를 명시하면 그 값을 그대로 쓴다.
+    - drop_last=None이면:
+        · NoPaddingDistributedEvalSampler 사용 시: drop_last=False
+        · 그 외(학습): drop_last=True
 
     Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        data_set: 학습용 DiffusionPlannerData.
-        data_sampler: rank별로 인덱스를 나누는 DistributedSampler.
-        batch_size: 전체 글로벌 배치 크기.
-        world_size: 전체 프로세스 개수.
+        args: 설정 Namespace.
+        data_set: Dataset.
+        data_sampler: Sampler.
+        batch_size: 전체(global) 배치 크기. shape: ()
+        world_size: 전체 프로세스 수. shape: ()
+        drop_last: 마지막 배치를 버릴지 여부. shape: ()
 
     Returns:
-        loader: 각 step마다 배치 dict를 반환하는 DataLoader.
-                      각 배치의 텐서는 (B, ·) shape를 가진다.
+        DataLoader:
+            각 step마다 배치 dict를 반환.
+            배치 텐서는 보통 (B, ...) shape.
     """
-    # 각 rank가 보는 per-rank 배치 크기
-    batch_size_per_rank = batch_size // world_size
+    world_size_i = int(max(1, world_size))
+    batch_size_per_rank = int(batch_size // world_size_i)
+
+    # 안전장치(원래 코드 구조 유지하면서 0 배치만 방지)
+    if batch_size_per_rank <= 0:
+        batch_size_per_rank = 1
+
+    if drop_last is None:
+        # ✅ eval sampler면 drop_last=False, train이면 drop_last=True
+        drop_last = not isinstance(data_sampler, NoPaddingDistributedEvalSampler)
 
     loader = DataLoader(
-        data_set,  # DiffusionPlannerData
-        sampler=data_sampler,  # DistributedSampler
+        data_set,
+        sampler=data_sampler,
         batch_size=batch_size_per_rank,
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         pin_memory=args.pin_mem,
-        persistent_workers=True,  # 에폭이 바뀌어도 워커 유지
-        drop_last=True,
-        collate_fn=DiffusionPlannerCollate(args),  # 배치 텐서 shape 맞춤
+        persistent_workers=True,
+        drop_last=bool(drop_last),
+        collate_fn=DiffusionPlannerCollate(args),
     )
     return loader
+
 
 
 def create_diffusion_planner_and_ema(
