@@ -1000,12 +1000,14 @@ def _predict_rollouts_batched_one_chunk(
     state_normalizer: Any,
     rollout_repeat: int,
     rng_seed: int,
+batch_size:int,
+one_or_pnn:int,
 ) -> torch.Tensor:
     """rollout을 batch로 펼쳐서(=B*R) 한 번에 autoregressive rollout을 생성합니다.
 
     이 함수가 하는 일
     ----------------
-    - rollout_repeat개 만큼 입력을 복제해서 batch를 (B*R)로 키웁니다.
+    - rollout_repeat 개 만큼 입력을 복제해서 batch를 (B*R)로 키웁니다.
     - future_len 스텝 동안:
         1) 모델 forward 1번으로 (B*R)개 샘플의 다음 스텝 예측을 동시에 얻고,
         2) 그 다음 스텝을 입력 past에 반영(업데이트)하고,
@@ -1044,42 +1046,34 @@ def _predict_rollouts_batched_one_chunk(
     """
     device = torch.device(getattr(args, "device", "cuda"))
 
-    ego_agent_past = norm_inputs.get("ego_agent_past", None)
-    if not isinstance(ego_agent_past, torch.Tensor):
-        raise ValueError("norm_inputs['ego_agent_past']가 torch.Tensor가 아닙니다.")
-    batch_size: int = int(ego_agent_past.shape[0])
 
-    target_future_valid = norm_inputs.get("target_future_valid", None)
-    if not isinstance(target_future_valid, torch.Tensor):
-        raise ValueError(
-            "norm_inputs['target_future_valid']가 torch.Tensor가 아닙니다.")
-    one_or_pnn: int = int(target_future_valid.shape[1])
 
     future_len: int = int(getattr(args, "future_len"))
     rollout_repeat = int(rollout_repeat)
     merged_batch: int = int(batch_size * rollout_repeat)
 
     # (B, ...) -> (B*R, ...)
+    """
+    - ego_agent_past:         (B, T_past, 11)      -> (B*R, T_past, 11)
+    - near_agents_past:       (B, Pnn, T_past, 11) -> (B*R, Pnn, T_past, 11)
+    - target_future_valid:    (B, 1+Pnn, T_fut)    -> (B*R, 1+Pnn, T_fut)
+    - origin_world_pose:      (B, 4)               -> (B*R, 4)
+    - scenario_id(list[str]): 길이 B               -> 길이 B*R
+    """
     norm_inputs_copy: Dict[str, Any] = _expand_norm_inputs_for_rollout_batch(
         norm_inputs=norm_inputs,
         batch_size=batch_size,
         rollout_repeat=rollout_repeat,
     )
-
-    origin_world_pose = norm_inputs_copy.get("origin_world_pose", None)
-    if not isinstance(origin_world_pose, torch.Tensor):
-        raise ValueError(
-            "norm_inputs['origin_world_pose']가 torch.Tensor가 아닙니다.")
-    # origin_world_pose: (B*R, 4)
-    unnorm_origin_world_pose: torch.Tensor = origin_world_pose
+    # unnorm_origin_pose_world: (B*R, 4)
+    unnorm_origin_pose_world = norm_inputs_copy.get("origin_world_pose", None)
 
     # 출력 미리 할당: (B*R, (1+)Pnn, future_len, 4)
     # dtype은 입력 기반으로 맞춥니다.
-    out_dtype = ego_agent_past.dtype
     target_joint_scene_world = torch.empty(
         (merged_batch, one_or_pnn, future_len, 4),
-        device=ego_agent_past.device,
-        dtype=out_dtype,
+        device=unnorm_origin_pose_world.device,
+        dtype=unnorm_origin_pose_world.dtype,
     )
 
     rng_devices = _get_cuda_rng_devices_for_fork_rng(device)
@@ -1110,18 +1104,16 @@ def _predict_rollouts_batched_one_chunk(
                 normed_ego_next_pose = normed_trajectories[:, 0, 1, :]
                 # near: (B*R, Pnn, 4)
                 normed_near_next_pose = normed_trajectories[:, 1:, 1, :]
-
+                # (B*R, (1+)Pnn, 4)
+                normed_target_next_pose = torch.cat(
+                    [normed_ego_next_pose[:, None, :], normed_near_next_pose],
+                    dim=1,
+                )
                 # 입력 업데이트(autoregressive)
                 norm_inputs_copy = _update_merged_inputs(
                     norm_inputs_copy=norm_inputs_copy,
                     normed_ego_next_pose=normed_ego_next_pose,
                     normed_near_next_pose=normed_near_next_pose,
-                )
-
-                # (B*R, (1+)Pnn, 4)
-                normed_target_next_pose = torch.cat(
-                    [normed_ego_next_pose[:, None, :], normed_near_next_pose],
-                    dim=1,
                 )
 
                 # 역정규화: (B*R, (1+)Pnn, 4)
@@ -1133,21 +1125,21 @@ def _predict_rollouts_batched_one_chunk(
                 unnorm_target_next_pose_flat = unnorm_target_next_pose.reshape(
                     -1, 4)
 
-                # world_flat: (N, 4)
-                world_flat = _covert_from_ego_to_world(
-                    target_poses=unnorm_target_next_pose_flat,
-                    origin_world_pose=unnorm_origin_world_pose,  # (B*R, 4)
+                # unnorm_target_next_pose_flat_world: (N, 4), N = (B*R)*(1+Pnn)
+                unnorm_target_next_pose_flat_world = _covert_from_ego_to_world(
+                    target_poses=unnorm_target_next_pose_flat, # (N, 4), N = (B*R)*(1+Pnn)
+                    origin_world_pose=unnorm_origin_pose_world,  # (B*R, 4)
                 )
 
                 # world: (B*R, (1+)Pnn, 4)
-                world_pose = world_flat.reshape(merged_batch, one_or_pnn, 4)
+                unnorm_target_next_pose_world = unnorm_target_next_pose_flat_world.reshape(merged_batch, one_or_pnn, 4)
 
                 # step 저장: target_joint_scene_world[:, :, step_idx, :] = (B*R, (1+)Pnn, 4)
-                target_joint_scene_world[:, :, step_idx, :] = world_pose
+                target_joint_scene_world[:, :, step_idx, :] = unnorm_target_next_pose_world
 
                 # 다음 스텝을 위한 origin 갱신(ego 기준)
-                # unnorm_origin_world_pose: (B*R, 4)
-                unnorm_origin_world_pose = world_pose[:, 0, :]
+                # unnorm_origin_pose_world: (B*R, 4)
+                unnorm_origin_pose_world = unnorm_target_next_pose_world[:, 0, :]
 
     # (B*R, (1+)Pnn, future_len, 4) -> (B, R, (1+)Pnn, future_len, 4)
     target_joint_scene_world = target_joint_scene_world.reshape(
@@ -1214,14 +1206,10 @@ def _predict_rollouts_batched(
     rollout_chunk_size = int(min(rollout_chunk_size, rollout_number))
 
     ego_agent_past = norm_inputs.get("ego_agent_past", None)
-    if not isinstance(ego_agent_past, torch.Tensor):
-        raise ValueError("norm_inputs['ego_agent_past']가 torch.Tensor가 아닙니다.")
-    batch_size: int = int(ego_agent_past.shape[0])
 
+    # target_future_valid: (B, (1+)Pnn, future_len)
     target_future_valid = norm_inputs.get("target_future_valid", None)
-    if not isinstance(target_future_valid, torch.Tensor):
-        raise ValueError(
-            "norm_inputs['target_future_valid']가 torch.Tensor가 아닙니다.")
+    batch_size: int = int(target_future_valid.shape[0])
     one_or_pnn: int = int(target_future_valid.shape[1])
 
     future_len: int = int(getattr(args, "future_len"))
@@ -1252,6 +1240,8 @@ def _predict_rollouts_batched(
             state_normalizer=state_normalizer,
             rollout_repeat=cur,
             rng_seed=int(chunk_seed),
+            batch_size=batch_size,
+            one_or_pnn=one_or_pnn,
         )  # (B, (1+)Pnn, cur, future_len, 4)
 
         out[:, :, start:start + cur, :, :] = chunk_pred
@@ -1288,146 +1278,6 @@ def _make_rollout_seed(
     return int(base_seed) + int(ddp_rank) * 100_000 + int(rollout_idx) * 1_000
 
 
-def _predict_single_rollout(
-    args: Any,
-    model: nn.Module,
-    norm_inputs: Dict[str, torch.Tensor],
-    state_normalizer: StateNormalizer,
-    rollout_seed: int,
-) -> torch.Tensor:
-    """rollout 1개(=미래 future_len 프레임)를 예측해서 world 좌표계 궤적을 만듭니다.
-
-    동작 방식(쉽게 설명)
-    ---------------------
-    - 같은 입력(norm_inputs)이라도, diffusion 샘플링은 내부에서 랜덤 노이즈를 쓰기 때문에
-      seed를 바꾸면 결과가 달라질 수 있습니다.
-    - 그래서 rollout마다 torch RNG를 잠깐 분리(fork)하고,
-      rollout_seed로 고정한 다음 모델을 호출합니다.
-    - 그리고 step별로:
-        1) 모델이 만든 미래 궤적(정규화된 integrated_trajectory)에서 "다음 1스텝"을 꺼냅니다.
-        2) 그 다음 1스텝을 입력 past에 반영해서 입력을 업데이트합니다.
-        3) 예측된 다음 포즈를 world 좌표계로 변환해서 저장합니다.
-    - 이렇게 하면 autoregressive하게 future_len 스텝을 쌓아갑니다.
-
-    Args:
-        args (Any):
-            args.future_len, args.device, args.use_deepspeed 등을 사용합니다.
-        model (nn.Module):
-            실제 inference 모델(EMA 모델일 수도 있음).
-        norm_inputs (Dict[str, torch.Tensor]):
-            정규화된 입력 dict.
-            주요 텐서 예:
-              - ego_agent_past: (B, time_len, 11)
-              - near_agents_past: (B, Pnn, time_len, 11)
-              - origin_world_pose: (B, 4)
-              - target_future_valid: (B, (1+)Pnn, future_len)  (True=유효)
-        state_normalizer (StateNormalizer):
-            정규화 ↔ 원복 변환에 사용합니다.
-        rollout_seed (int):
-            이번 rollout에서 사용할 seed.
-            rollout_idx마다 다르게 넣어줘야 서로 다른 결과를 얻을 수 있습니다.
-
-    Returns:
-        torch.Tensor:
-            world 좌표계 예측 결과.
-            shape: (B, (1+)Pnn, future_len, 4)
-            마지막 4는 (x, y, cos, sin)
-    """
-    device = torch.device(getattr(args, "device", "cuda"))
-    rng_devices = None
-    if device.type == "cuda" and torch.cuda.is_available():
-        device_index = device.index if device.index is not None else torch.cuda.current_device(
-        )
-        rng_devices = [int(device_index)]
-
-    with torch.random.fork_rng(devices=rng_devices, enabled=True):
-        torch.manual_seed(int(rollout_seed))
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(rollout_seed))
-
-        # Dict[str, Any]
-        norm_inputs_copy = _clone_norm_inputs_for_rollout(
-            norm_inputs,
-            sanity_check_tensor_storage=False,
-        )
-
-        # unnorm_origin_world_pose: (B, 4)
-        unnorm_origin_world_pose = norm_inputs_copy["origin_world_pose"]
-
-        target_joint_scene: List[torch.Tensor] = []
-
-        with torch.inference_mode():
-            for step_idx in range(int(args.future_len)):
-                decoder_output = _forward_model_for_validation(
-                    args=args,
-                    model=model,
-                    norm_inputs=norm_inputs_copy,
-                )
-
-                # integrated_trajectory: (B, (1+)Pnn, 1+T, 4)
-                normed_trajectories = decoder_output.get(
-                    "integrated_trajectory")
-                if normed_trajectories is None:
-                    raise KeyError(
-                        "decoder_output에서 'integrated_trajectory'를 찾을 수 없습니다. "
-                        "현재 validate_func는 integrated_trajectory를 사용하도록 구현되어 있습니다."
-                    )
-
-                # (B, 1+T, 4)
-                normed_ego_trajectories = normed_trajectories[:, 0, :, :]
-                # (B, Pnn, 1+T, 4)
-                normed_near_trajectories = normed_trajectories[:, 1:, :, :]
-
-                # 다음 1스텝만 사용
-                normed_ego_next_pose = normed_ego_trajectories[:,
-                                                               1, :]  # (B, 4)
-                normed_near_next_pose = normed_near_trajectories[:, :,
-                                                                 1, :]  # (B, Pnn, 4)
-
-                # 입력 업데이트(autoregressive)
-                norm_inputs_copy = _update_merged_inputs(
-                    norm_inputs_copy=norm_inputs_copy,
-                    normed_ego_next_pose=normed_ego_next_pose,
-                    normed_near_next_pose=normed_near_next_pose,
-                )
-
-                # (B, (1+)Pnn, 4)
-                normed_target_next_pose = torch.cat(
-                    [normed_ego_next_pose[:, None, :], normed_near_next_pose],
-                    dim=1,
-                )
-
-                # 역정규화: (B, (1+)Pnn, 4)
-                unnorm_target_next_pose = state_normalizer.inverse(
-                    normed_target_next_pose)
-
-                # world 변환
-                # (B*(1+)Pnn, 4)
-                unnorm_target_next_pose_flat = unnorm_target_next_pose.reshape(
-                    -1, unnorm_target_next_pose.shape[2])
-
-                # (B*(1+)Pnn, 4)
-                unnorm_target_next_pose_world_flat = _covert_from_ego_to_world(
-                    target_poses=unnorm_target_next_pose_flat,
-                    origin_world_pose=unnorm_origin_world_pose,
-                )
-
-                # (B, (1+)Pnn, 4)
-                unnorm_target_next_pose_world = unnorm_target_next_pose_world_flat.reshape(
-                    unnorm_target_next_pose.shape[0],
-                    unnorm_target_next_pose.shape[1],
-                    unnorm_target_next_pose.shape[2],
-                )
-
-                target_joint_scene.append(unnorm_target_next_pose_world)
-
-                # 다음 스텝 world 기준 origin 갱신 (ego 기준)
-                # unnorm_origin_world_pose: (B, 4)
-                unnorm_origin_world_pose = unnorm_target_next_pose_world[:,
-                                                                         0, :]
-
-        # (B, (1+)Pnn, future_len, 4)
-        return torch.stack(target_joint_scene, dim=2)
 
 def _predict_rollouts_batched_with_oom_fallback(
     args: Any,
@@ -1499,7 +1349,7 @@ def _predict_rollouts_batched_with_oom_fallback(
 
     for chunk_size in candidates:
         try:
-            return _predict_rollouts_batched(
+            a = _predict_rollouts_batched(
                 args=args,
                 model=model,
                 norm_inputs=norm_inputs,
@@ -1509,6 +1359,7 @@ def _predict_rollouts_batched_with_oom_fallback(
                 base_seed=int(base_seed),
                 ddp_rank=int(ddp_rank),
             )
+            return a
         except RuntimeError as e:
             msg = str(e).lower()
             is_oom = ("out of memory" in msg) or ("cuda oom" in msg)
@@ -1732,8 +1583,6 @@ def validate_func(
     )
     norm_inputs["target_future_valid"] = target_future_valid
     ego_agent_past = norm_inputs.get("ego_agent_past", None)
-    if not isinstance(ego_agent_past, torch.Tensor):
-        raise ValueError("norm_inputs['ego_agent_past']가 torch.Tensor가 아닙니다.")
     batch_size: int = int(ego_agent_past.shape[0])
 
     # rollout 설정
@@ -1749,8 +1598,8 @@ def validate_func(
     base_seed = int(getattr(args, "seed", 0))
 
     # ✅ 핵심: rollout을 batch로 묶어서 빠르게 생성
-    # target_scenario_rollouts_np: (B, (1+)Pnn, rollout_number, future_len, 4)
-    target_scenario_rollouts_np = _predict_rollouts_batched_with_oom_fallback(
+    # target_scenario_rollouts_world: (B, (1+)Pnn, rollout_number, future_len, 4)
+    target_scenario_rollouts_world = _predict_rollouts_batched_with_oom_fallback(
         args=args,
         model=inference_model,
         norm_inputs=norm_inputs,
@@ -1764,22 +1613,24 @@ def validate_func(
     # -----------------------------
     # 아래는 기존 metric 계산 흐름 그대로 유지
     # -----------------------------
-    pred_traj = target_scenario_rollouts_np[:, :, :, :, :2]
+    # [n_agent = B * (1+)Pnn, n_rollout, n_step, 2]
+    pred_traj = target_scenario_rollouts_world[:, :, :, :, :2]
     pred_traj = pred_traj.reshape(
         pred_traj.shape[0] * pred_traj.shape[1],
         pred_traj.shape[2],
         pred_traj.shape[3],
         pred_traj.shape[4],
-    )  # [n_agent = B * (1+)Pnn, n_rollout, n_step, 2]
+    )
 
-    pred_head_cos_yaw = target_scenario_rollouts_np[:, :, :, :, 2]
-    pred_head_sin_yaw = target_scenario_rollouts_np[:, :, :, :, 3]
+    pred_head_cos_yaw = target_scenario_rollouts_world[:, :, :, :, 2]
+    pred_head_sin_yaw = target_scenario_rollouts_world[:, :, :, :, 3]
     pred_head = torch.atan2(pred_head_sin_yaw, pred_head_cos_yaw)
+    # [n_agent = B * (1+)Pnn, n_rollout, n_step]
     pred_head = pred_head.reshape(
         pred_head.shape[0] * pred_head.shape[1],
         pred_head.shape[2],
         pred_head.shape[3],
-    )  # [n_agent = B * (1+)Pnn, n_rollout, n_step]
+    )
 
     scenario_id: List[str] = norm_inputs["scenario_id"]
     assert isinstance(scenario_id, list), "scenario_id는 List[str] 타입이어야 합니다."
@@ -1807,7 +1658,6 @@ def validate_func(
     ).contiguous()  # [n_agent, n_rollout, n_step]
 
     device = pred_traj.device
-    scenario_id_ = get_scenario_id_int_tensor(scenario_id, device)
 
     # ---------------------------------------------------------
     # ✅ WOSAC용: 패딩 agent(object_id=0 등)를 제거하고 rollouts 생성
@@ -1839,48 +1689,50 @@ def validate_func(
         pred_z=wosac_pred_z,
         pred_head=wosac_pred_head,
     )
+    tfrecord_path = norm_inputs["tfrecord_path"]
+    assert isinstance(tfrecord_path, list), "tfrecord_path는 List[str] 타입이어야 합니다."
+    assert batch_size == len(tfrecord_path), "batch_size와 tfrecord_path 길이가 맞지 않습니다."
 
+    wosac_metrics.update(tfrecord_path, scenario_rollouts)
+    # ---------------------------------------------------------
     unnorm_ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]  # (B, future_len, 4)
     unnorm_near_future_gt_4_dim = outputs["near_future_gt_4_dim"]  # (B, Pnn, future_len, 4)
+    # (B, (1+)Pnn, future_len, 4)
     unnorm_target_future_gt_4_dim = torch.cat(
         [
             unnorm_ego_future_gt_4_dim[:, None, :, :],
             unnorm_near_future_gt_4_dim,
         ],
         dim=1,
-    )  # (B, (1+)Pnn, future_len, 4)
-
+    )
+    # [n_agent, future_len, 4]
     unnorm_target_future_gt_4_dim_flat = unnorm_target_future_gt_4_dim.reshape(
         -1,
         unnorm_target_future_gt_4_dim.shape[2],
         unnorm_target_future_gt_4_dim.shape[3],
-    )  # [n_agent, future_len, 4]
+    )
 
-    unnorm_origin_world_pose = norm_inputs["origin_world_pose"]  # (B, 4)
+    unnorm_origin_pose_world = norm_inputs["origin_world_pose"]  # (B, 4)
 
+    # unnorm_target_future_gt_4_dim_world: (n_agent, future_len, 4)
     unnorm_target_future_gt_4_dim_world = _covert_from_ego_to_world(
-        target_poses=unnorm_target_future_gt_4_dim_flat,
-        origin_world_pose=unnorm_origin_world_pose,
+        target_poses=unnorm_target_future_gt_4_dim_flat, # [n_agent, future_len, 4]
+        origin_world_pose=unnorm_origin_pose_world, # (B, 4)
     )
 
     unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :2]  # [n_agent, future_len, 2]
 
     target_future_valid_flat = torch.any(
-        unnorm_target_future_gt_4_dim_flat[:, :, :4] != 0,
+        unnorm_target_future_gt_4_dim_flat != 0,
         dim=-1,
     )  # [n_agent, future_len]
-
     min_ade.update(
         pred=pred_traj,  # [n_agent, n_rollout, n_step, 2]
         target=unnorm_target_future_gt_xy_world,  # [n_agent, future_len, 2]
         target_valid=target_future_valid_flat,  # [n_agent, future_len]
     )
 
-    tfrecord_path = norm_inputs["tfrecord_path"]
-    assert isinstance(tfrecord_path, list), "tfrecord_path는 List[str] 타입이어야 합니다."
-    assert batch_size == len(tfrecord_path), "batch_size와 tfrecord_path 길이가 맞지 않습니다."
 
-    wosac_metrics.update(tfrecord_path, scenario_rollouts)
 
 
 
@@ -2601,7 +2453,7 @@ def _covert_from_ego_to_world(
 
     이 함수는 (x, y, cos, sin) 형태의 포즈를 변환합니다.
 
-    - ego_pose는 "ego를 원점(0,0)으로 보는 좌표"에서의 값입니다.
+    - target_poses는 "ego를 원점(0,0)으로 보는 좌표"에서의 값입니다.
     - origin_world_pose는 "ego 원점이 world에서 어디에 있고, 어느 방향을 보고 있는지"를 나타냅니다.
 
     변환 방법은 다음 순서로 진행합니다.
@@ -2641,7 +2493,7 @@ def _covert_from_ego_to_world(
     origin_world_pose_per_agent = _expand_origin_world_pose_for_agents(
         origin_world_pose=origin_world_pose,
         n_agent=n_agent,
-    )  # (N, 4)
+    )  # (N(=B*(1+Pnn), 4)
 
     # origin pose (world)
     origin_xy = origin_world_pose_per_agent[:, 0:2]  # (N, 2)
