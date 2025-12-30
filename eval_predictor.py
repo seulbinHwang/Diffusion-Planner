@@ -1722,10 +1722,15 @@ def validate_func(
 
     unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :2]  # [n_agent, future_len, 2]
 
+    """
+    unnorm_target_future_gt_4_dim_flat 에서, 마지막 4차원(4-dim)의 값이 모두 0인 타임스텝은 유효하지 않은 것으로 간주합니다.
+    
+    target_future_valid_flat: (n_agent, future_len)
+    """
     target_future_valid_flat = torch.any(
         unnorm_target_future_gt_4_dim_flat != 0,
         dim=-1,
-    )  # [n_agent, future_len]
+    ).to(dtype=torch.bool)  # [n_agent, future_len]
     min_ade.update(
         pred=pred_traj,  # [n_agent, n_rollout, n_step, 2]
         target=unnorm_target_future_gt_xy_world,  # [n_agent, future_len, 2]
