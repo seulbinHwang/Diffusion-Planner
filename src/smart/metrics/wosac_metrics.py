@@ -10,7 +10,7 @@
 # disclosure or distribution of this material and related documentation
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
-
+import numpy as np
 import itertools
 import multiprocessing as mp
 import os
@@ -61,6 +61,10 @@ def _assert_scenario_id_matches_rollouts(
     scenario_id_from_file: str = str(getattr(scenario, "scenario_id", ""))
     scenario_id_from_rollouts: str = str(
         getattr(scenario_rollouts, "scenario_id", ""))
+    if not scenario_id_from_file or not scenario_id_from_rollouts:
+        raise ValueError("시나리오 ID가 비어 있습니다. "
+                         f"(파일에서 읽은 ID='{scenario_id_from_file}', "
+                         f"예측 결과 ID='{scenario_id_from_rollouts}')")
 
     if scenario_id_from_file and scenario_id_from_rollouts:
         if scenario_id_from_file != scenario_id_from_rollouts:
@@ -318,7 +322,7 @@ class WOSACMetrics(Metric):
     def _compute_scenario_metrics(
         config,
         scenario_file,
-        scenario_rollout,
+        scenario_rollout, # sim_agents_submission_pb2.ScenarioRollouts
         ego_only,
     ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
         scenario = scenario_pb2.Scenario()
@@ -352,11 +356,13 @@ class WOSACMetrics(Metric):
                 print(
                     "[WOSAC_DEBUG][WARNING] 이 파일 안에 시나리오가 2개 이상 들어있습니다(샤드일 가능성)."
                 )
+                raise RuntimeError("시나리오가 2개 이상 들어있는 파일은 처리할 수 없습니다.")
 
             if rollout_id and first_id and (rollout_id != first_id):
                 print(
                     "[WOSAC_DEBUG][ERROR] rollout_id != 파일의 첫 scenario_id 입니다. (정답-예측 매칭이 깨졌을 가능성 큼)"
                 )
+                raise RuntimeError("rollout_id와 파일의 scenario_id가 다릅니다.")
 
         for data in tf.data.TFRecordDataset([scenario_file],
                                             compression_type=""):

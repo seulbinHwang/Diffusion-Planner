@@ -2080,7 +2080,7 @@ def _update_wosac_metrics_for_validation_batch(
     # scenario_id : List[str] 길이 B
     # [n_scenario, n_str_length]
     # 3) scenario_rollouts 생성 후 metric 업데이트
-    # scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts] # 길이
+    # scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts] # 길이: B (유효 시나리오 수)
     scenario_rollouts = get_scenario_rollouts(
         scenario_id=get_scenario_id_int_tensor(scenario_id, device),
         agent_id=wosac_agent_id,  # (N2,)
