@@ -170,7 +170,7 @@ class DrawingOptions:
     EGO_radius_circle_line_width: float = 0.8  # 원 테두리 두께
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    EGO_future_traj_draw_mode: str = "arrow"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_draw_diffusion: bool = True
@@ -198,7 +198,7 @@ class DrawingOptions:
     EGO_draw_ego_future_gt_11_dim: bool = True
     EGO_future_gt_11_style = {
         "line_color": CYAN,
-        "line_width": 0.2,
+        "line_width": 0.6,
         "velocity_line_color": CYAN,
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
@@ -299,10 +299,10 @@ class DrawingOptions:
 
     DIFF_draw_diff_future_int_traj_11: bool = True
     DIFF_future_int_style = {
-        "line_color": RED,  # 빨간색(밝은 빨강)
-        "token_color": RED,  # 빨간색(밝은 빨강)
-        "line_width": 0.6,
-        "velocity_line_color": RED,  # 빨간색(밝은 빨강)
+        "line_color": LIGHTBLUE,  # 빨간색(밝은 빨강)
+        "token_color": LIGHTBLUE,  # 빨간색(밝은 빨강)
+        "line_width": 0.8,
+        "velocity_line_color": LIGHTBLUE,  # 빨간색(밝은 빨강)
         "velocity_line_alpha": 0.8,
         "velocity_line_width": 0.4,
     }

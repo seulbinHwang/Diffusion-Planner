@@ -19,7 +19,6 @@ from torch import Tensor
 from waymo_open_dataset.protos import sim_agents_submission_pb2
 
 
-
 def _unbatch(src: Tensor, batch: Tensor, dim: int = 0) -> List[Tensor]:
     """batch 벡터를 이용해 src를 시나리오 단위로 나눕니다.
 
@@ -36,7 +35,8 @@ def _unbatch(src: Tensor, batch: Tensor, dim: int = 0) -> List[Tensor]:
 
     batch_long = batch.to(torch.long)  # shape: (N,)
     num_groups = int(batch_long.max().item()) + 1  # shape: ()
-    sizes = torch.bincount(batch_long, minlength=num_groups).tolist()  # 길이: num_groups
+    sizes = torch.bincount(batch_long,
+                           minlength=num_groups).tolist()  # 길이: num_groups
     return list(src.split(sizes, dim=dim))
 
 

@@ -120,10 +120,12 @@ def _select_first_n_percent_items(
     """
     total_count = int(len(data_list))
     normalized_percent = _normalize_use_data_percent(use_data_percent)
-    keep_count = _compute_keep_count_from_percent(total_count, normalized_percent)
+    keep_count = _compute_keep_count_from_percent(total_count,
+                                                  normalized_percent)
 
     selected_list = list(data_list[:keep_count])
-    return selected_list, float(normalized_percent), total_count, int(keep_count)
+    return selected_list, float(normalized_percent), total_count, int(
+        keep_count)
 
 
 def _should_print_dataset_subset_info() -> bool:
@@ -178,8 +180,7 @@ def _print_dataset_subset_info(
     print(
         f"[DiffusionPlannerData] role='{role}' | data_list='{list_name}' | "
         f"total={int(total_count)} | use_percent={float(use_data_percent):.2f}% | "
-        f"using_first={int(keep_count)}"
-    )
+        f"using_first={int(keep_count)}")
 
 
 def _get_first_non_none_value(
@@ -315,6 +316,7 @@ def _compute_agent_level_valid_from_future_gt_3(
     agent_valid = np.any(per_step_valid, axis=-1)
     return agent_valid.astype(bool)
 
+
 class DiffusionPlannerData(Dataset):
 
     def __init__(
@@ -335,7 +337,7 @@ class DiffusionPlannerData(Dataset):
             - 리스트를 섞지 않고, 시작 지점부터 앞에서부터 잘라서 씁니다.
             - 예: 10.0 -> 앞 10%만 사용
         """
-        use_data_percent=100.0
+        use_data_percent = 100.0
         self.data_dir = data_dir
         self.data_tfrecords_dir = None
 
@@ -371,8 +373,7 @@ class DiffusionPlannerData(Dataset):
             parent_dir = os.path.dirname(self.data_dir)
             last_dir_name = os.path.basename(self.data_dir)
             self.data_tfrecords_dir = os.path.join(
-                parent_dir, f"{last_dir_name}_tfrecords_splitted"
-            )
+                parent_dir, f"{last_dir_name}_tfrecords_splitted")
 
     def __len__(self):
         return len(self.data_list)

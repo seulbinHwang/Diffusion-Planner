@@ -220,18 +220,25 @@ class ObservationNormalizer:
         return cls(ndt)
 
     def __call__(self, data):
-        device_type = list(data.values())[0].device.type
+        device_type = "cuda"
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
             for k, v in self._normalization_dict.items():
-                if (k not in data) or (
-                        data[k] is None):  # Check if key `k` exists in `data`
+                if (k not in data) or (v is None) or (data[k] is None):
                     continue
                 if k in [
-                        "ego_agent_past", "planner_future_11_dim",
-                        "ego_future_gt_11_dim", "neighbor_agents_past"
+                        "ego_agent_past",
+                        "planner_future_11_dim",
+                        "neighbor_agents_past",
+                        "near_agents_past",
+                        "non_near_agents_past",
+                        "ego_agent_next_11_dim",
+                        "route_lanes",
+                        "lanes",
                 ]:
                     mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
+                elif k in ["static_objects"]:
+                    mask = torch.sum(torch.ne(data[k][..., :6], 0), dim=-1) == 0
                 else:
                     mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = (data[k] - v["mean"].to(
@@ -245,20 +252,27 @@ class ObservationNormalizer:
             return norm_data
 
     def inverse(self, data: dict) -> dict:
-        device_type = list(data.values())[0].device.type
-
+        device_type = "cuda"
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
 
             # 역정규화도 정의된 키만 수행
             for k, v in self._normalization_dict.items():
-                if (k not in data) or (v is None):
+                if (k not in data) or (v is None) or (data[k] is None):
                     continue
                 if k in [
-                        "ego_agent_past", "planner_future_11_dim",
-                        "ego_future_gt_11_dim", "neighbor_agents_past"
+                        "ego_agent_past",
+                        "planner_future_11_dim",
+                        "neighbor_agents_past",
+                        "near_agents_past",
+                        "non_near_agents_past",
+                        "ego_agent_next_11_dim",
+                        "route_lanes",
+                        "lanes",
                 ]:
                     mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
+                elif k in ["static_objects"]:
+                    mask = torch.sum(torch.ne(data[k][..., :6], 0), dim=-1) == 0
                 else:
                     mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = data[k] * v["std"].to(

@@ -108,5 +108,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --batch_size 2 \
-  --use_deepspeed True
+  --use_deepspeed True \
+  --save_image True
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
