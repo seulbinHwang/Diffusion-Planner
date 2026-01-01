@@ -7,8 +7,8 @@ USER_PATH="/home/user"
 WOMD_PATH="${USER_PATH}/womd_v1_3"
 RUN_PYTHON_PATH="${USER_PATH}/miniforge3/envs/diffusion_planner/bin/python"
 # `~/womd_v1_3/processed_womd_final/validation`
-EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation" 
-EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/testing"
+EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_test.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -107,10 +107,10 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --resume_model_only True \
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
-  --eval_method "validation" \
+  --eval_method "test" \
   --batch_size 2 \
   --use_deepspeed True \
-  --wosac_sub_is_active False \
-  --wosac_metric_is_active True \
+  --wosac_sub_is_active True \
+  --wosac_metric_is_active False \
   --save_image False
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

@@ -1889,7 +1889,7 @@ def build_dataset_and_sampler(
     args: argparse.Namespace,
     set_: str,
     set_list: str,
-    role: str,
+    eval_method: str,
     world_size: int,
     global_rank: int,
 ) -> Tuple[DiffusionPlannerData, torch.utils.data.Sampler[int]]:
@@ -1897,7 +1897,7 @@ def build_dataset_and_sampler(
 
     변경 목표(평가 시)
     ----------------
-    - 평가(role이 train이 아닐 때)는
+    - 평가(eval_method이 train이 아닐 때)는
       1) 샘플 중복 없이
       2) 샘플 누락 없이
       각 rank가 자기 몫만 처리하도록 Sampler를 바꾼다.
@@ -1911,7 +1911,7 @@ def build_dataset_and_sampler(
         args: 학습/평가 설정 Namespace.
         set_: 데이터 루트 경로. shape: ()
         set_list: 파일 리스트(json) 경로. shape: ()
-        role: "train" 또는 "validation" 등. shape: ()
+        eval_method: "train" 또는 "validation" 등. shape: ()
         world_size: 전체 프로세스 수. shape: ()
         global_rank: 현재 프로세스의 global rank. shape: ()
 
@@ -1926,13 +1926,13 @@ def build_dataset_and_sampler(
         set_,
         set_list,
         args.predicted_neighbor_num,
-        role,
+        eval_method,
         args.use_data_percent,
     )
 
-    role_lower = str(role).lower()
+    eval_method_lower = str(eval_method).lower()
 
-    if role_lower == "train":
+    if eval_method_lower == "train":
         data_sampler = DistributedSampler(
             data_set,
             num_replicas=int(max(1, world_size)),
@@ -1943,7 +1943,7 @@ def build_dataset_and_sampler(
         return data_set, data_sampler
 
     # ✅ eval/validation/test: 패딩/드랍 없는 방식
-    if role_lower == "validation":
+    else:
         data_sampler = NoPaddingDistributedEvalSampler(
             dataset=data_set,
             num_replicas=int(max(1, world_size)),
@@ -1953,7 +1953,7 @@ def build_dataset_and_sampler(
         )
         return data_set, data_sampler
     raise ValueError(
-        f"Unsupported role for building dataset and sampler: role='{role}'")
+        f"Unsupported eval_method for building dataset and sampler: eval_method='{eval_method}'")
 
 
 

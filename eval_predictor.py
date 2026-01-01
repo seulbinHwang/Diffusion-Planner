@@ -149,20 +149,20 @@ def model_validation(
     # 3) augmentation, Dataset, Sampler
     batch_size = args.batch_size
     """
-    validation_set: DiffusionPlannerData
+    eval_set: DiffusionPlannerData
     validation_sampler: DistributedSampler
     """
-    validation_set, validation_sampler = build_dataset_and_sampler(
+    eval_set, validation_sampler = build_dataset_and_sampler(
         args,
-        args.validation_set,
-        args.validation_set_list,
-        "validation",
+        args.eval_set,
+        args.eval_set_list,
+        args.eval_method,
         world_size,
         global_rank,
     )
     validation_loader = build_data_loader(
         args,
-        validation_set,
+        eval_set,
         validation_sampler,
         batch_size,
         world_size,
@@ -197,8 +197,9 @@ def model_validation(
 
     min_ade = minADE(is_active=args.min_ade_is_active).to(torch.device(args.device))
     wosac_metrics = WOSACMetrics("val_closed", args.wosac_metric_is_active)
+    save_path = os.path.join(args.save_path, args.eval_method)
     wosac_submission = WOSACSubmission(is_active=args.wosac_sub_is_active,
-                                       save_path=args.save_path,)
+                                       save_path=save_path,)
     run_validation_loop(
         args=args,
         diffusion_planner=diffusion_planner,

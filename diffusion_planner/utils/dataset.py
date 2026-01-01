@@ -149,7 +149,7 @@ def _should_print_dataset_subset_info() -> bool:
 
 def _print_dataset_subset_info(
     *,
-    role: str,
+    eval_method: str,
     data_list_path: Any,
     total_count: int,
     keep_count: int,
@@ -158,7 +158,7 @@ def _print_dataset_subset_info(
     """데이터를 얼마나 줄여서 쓸지 한 줄로 출력합니다.
 
     Args:
-        role (str):
+        eval_method (str):
             "train" / "validation" 등. shape: ()
         data_list_path (Any):
             json 경로(문자열) 또는 그와 비슷한 값. shape: ()
@@ -178,7 +178,7 @@ def _print_dataset_subset_info(
         list_name = str(data_list_path)
 
     print(
-        f"[DiffusionPlannerData] role='{role}' | data_list='{list_name}' | "
+        f"[DiffusionPlannerData] eval_method='{eval_method}' | data_list='{list_name}' | "
         f"total={int(total_count)} | use_percent={float(use_data_percent):.2f}% | "
         f"using_first={int(keep_count)}")
 
@@ -324,7 +324,7 @@ class DiffusionPlannerData(Dataset):
         data_dir,
         data_list,
         predicted_neighbor_num,
-        role: str = "train",
+        eval_method: str = "train",
         use_data_percent: float = 100.0,
     ):
         """
@@ -357,11 +357,11 @@ class DiffusionPlannerData(Dataset):
 
         self.data_list = selected_list
         self.predicted_neighbor_num = predicted_neighbor_num
-        self.role = role
+        self.eval_method = eval_method
 
         # 3) 어떤 비율로 얼마나 쓰는지 출력
         _print_dataset_subset_info(
-            role=str(self.role),
+            eval_method=str(self.eval_method),
             data_list_path=data_list,
             total_count=int(total_count),
             keep_count=int(keep_count),
@@ -369,7 +369,7 @@ class DiffusionPlannerData(Dataset):
         )
 
         # 4) validation일 때 tfrecords dir 설정 (기존 로직 유지)
-        if self.role == "validation":
+        if self.eval_method == "validation":
             parent_dir = os.path.dirname(self.data_dir)
             last_dir_name = os.path.basename(self.data_dir)
             self.data_tfrecords_dir = os.path.join(
@@ -483,7 +483,7 @@ class DiffusionPlannerData(Dataset):
             "road_edge_type",  # (chosen_edge_num, 3) # womd
         ]
         wosac_only_keys = []
-        if self.role == "validation":
+        if self.eval_method == "validation":
             wosac_only_keys: List[str] = [
                 "target_id",  # (1+A,) int64. [ego_id, neighbor_id...]
                 "target_z"  # (1+A,) float32. [ego_z, neighbor_z...]
@@ -517,7 +517,7 @@ class DiffusionPlannerData(Dataset):
             sample,
             predicted_neighbor_num=self.predicted_neighbor_num,
         )
-        if self.role == "validation":
+        if self.eval_method == "validation":
             scenario_id = str(os.path.splitext(file_name)[0])
             sample["scenario_id"] = scenario_id
             tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
