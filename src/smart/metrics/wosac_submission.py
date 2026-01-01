@@ -10,6 +10,7 @@
 # disclosure or distribution of this material and related documentation
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
+import shutil
 
 import tarfile
 from pathlib import Path
@@ -48,9 +49,16 @@ class WOSACSubmission(Metric):
             self.buffer_scenario_rollouts = []
             self.i_file = 0
             save_path = os.path.join(save_path, eval_method)
+            # remove existing save_path directory
+            if os.path.exists(save_path):
+                shutil.rmtree(save_path)
+
+            
             self.submission_dir = Path(os.path.join(save_path, f"wosac_submission"))
+
             # Make directory if it doesn't exist
             self.submission_dir.mkdir(parents=True, exist_ok=True)
+
             self.submission_scenario_id = []
 
             self.data_keys = [

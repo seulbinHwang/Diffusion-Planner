@@ -1050,6 +1050,7 @@ def _predict_rollouts_batched_one_chunk(
     batch_size: int,
     one_or_pnn: int,
     save_image: bool,
+    save_video: bool,
     draw_batch_idx: int = 0,
 ) -> torch.Tensor:
     """rollout을 batch로 펼쳐서(=B*R) 한 번에 autoregressive rollout을 생성합니다.
@@ -1229,6 +1230,8 @@ def _predict_rollouts_batched_one_chunk(
     # (B, (1+)Pnn, R, future_len, 4)
     target_joint_scene_world = target_joint_scene_world.permute(0, 2, 1, 3,
                                                                 4).contiguous()
+    if save_video:
+        draw_machine.make_video_from_all_png(save_dir, draw_scenario_id, new_save_dir=args.save_path)
     return target_joint_scene_world
 
 
@@ -1449,6 +1452,7 @@ def _predict_rollouts_batched(
             batch_size=batch_size,
             one_or_pnn=one_or_pnn,
             save_image=args.save_image and trial == 0,
+            save_video=args.save_video and trial == 0,
         )  # (B, (1+)Pnn, cur, future_len, 4)
 
         out[:, :, start:start + cur, :, :] = chunk_pred
@@ -2420,11 +2424,12 @@ wosac_submission: WOSACSubmission,
         key="scenario_id",
         expected_length=batch_size,
     )
-    tfrecord_path: List[str] = _get_string_list_from_norm_inputs(
-        norm_inputs=norm_inputs,
-        key="tfrecord_path",
-        expected_length=batch_size,
-    )
+    if args.eval_method == "validation":
+        tfrecord_path: List[str] = _get_string_list_from_norm_inputs(
+            norm_inputs=norm_inputs,
+            key="tfrecord_path",
+            expected_length=batch_size,
+        )
     # target_id: (N,) = (B * (1+)Pnn)
     target_id = _get_target_id_flat_from_norm_inputs(norm_inputs)
 
@@ -2532,26 +2537,27 @@ wosac_submission: WOSACSubmission,
         wosac_metrics.update(tfrecord_path, scenario_rollouts)
 
     # 8) minADE 업데이트를 위해 eval_object_ids 준비 (배치마다)
-    eval_object_ids: Optional[torch.Tensor] = None
-    if bool(min_ade.only_eval_targets_to_predict):
-        challenge_type = _get_sim_agents_challenge_type_from_args(args)
-        eval_object_ids = _build_padded_eval_object_ids_tensor_for_batch(
-            tfrecord_path=tfrecord_path,
-            scenario_id=scenario_id,
-            challenge_type=challenge_type,  # ✅ int(...) 제거
-            device=pred_traj.device,
-            pad_value=0,
-        )
+    if min_ade.is_active:
+        eval_object_ids: Optional[torch.Tensor] = None
+        if bool(min_ade.only_eval_targets_to_predict):
+            challenge_type = _get_sim_agents_challenge_type_from_args(args)
+            eval_object_ids = _build_padded_eval_object_ids_tensor_for_batch(
+                tfrecord_path=tfrecord_path,
+                scenario_id=scenario_id,
+                challenge_type=challenge_type,  # ✅ int(...) 제거
+                device=pred_traj.device,
+                pad_value=0,
+            )
 
-    _update_min_ade_for_validation_batch(
-        outputs=outputs,
-        norm_inputs=norm_inputs,
-        pred_traj=pred_traj,
-        agent_batch=agent_batch,
-        target_id=target_id,               # (N,)
-        eval_object_ids=eval_object_ids,   # (B, K) or None
-        min_ade=min_ade,
-    )
+        _update_min_ade_for_validation_batch(
+            outputs=outputs,
+            norm_inputs=norm_inputs,
+            pred_traj=pred_traj,
+            agent_batch=agent_batch,
+            target_id=target_id,               # (N,)
+            eval_object_ids=eval_object_ids,   # (B, K) or None
+            min_ade=min_ade,
+        )
 
 
 # _transform_origin에서 실제로 좌표를 바꾸는 키들(먼저 들어가는 키가 Tensor가 되도록 순서 고정)

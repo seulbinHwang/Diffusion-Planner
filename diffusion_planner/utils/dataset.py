@@ -483,7 +483,7 @@ class DiffusionPlannerData(Dataset):
             "road_edge_type",  # (chosen_edge_num, 3) # womd
         ]
         wosac_only_keys = []
-        if self.eval_method == "validation":
+        if self.eval_method == "validation" or "test":
             wosac_only_keys: List[str] = [
                 "target_id",  # (1+A,) int64. [ego_id, neighbor_id...]
                 "target_z"  # (1+A,) float32. [ego_z, neighbor_z...]
@@ -517,14 +517,15 @@ class DiffusionPlannerData(Dataset):
             sample,
             predicted_neighbor_num=self.predicted_neighbor_num,
         )
-        if self.eval_method == "validation":
+        if self.eval_method == "validation" or "test":
             scenario_id = str(os.path.splitext(file_name)[0])
             sample["scenario_id"] = scenario_id
-            tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
-            tfrecord_path = os.path.join(self.data_tfrecords_dir,
-                                         tfrecord_file_name)
-            if not os.path.exists(tfrecord_path):
-                raise FileNotFoundError(
-                    f"TFRecords file not found: {tfrecord_path}")
-            sample["tfrecord_path"] = tfrecord_path
+            if self.eval_method == "validation":
+                tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
+                tfrecord_path = os.path.join(self.data_tfrecords_dir,
+                                             tfrecord_file_name)
+                if not os.path.exists(tfrecord_path):
+                    raise FileNotFoundError(
+                        f"TFRecords file not found: {tfrecord_path}")
+                sample["tfrecord_path"] = tfrecord_path
         return sample

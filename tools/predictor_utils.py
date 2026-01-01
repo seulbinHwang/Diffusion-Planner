@@ -15,7 +15,8 @@ from timm.utils import ModelEma
 from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 import argparse
 import os
-from typing import Any, Dict
+from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
+
 from datetime import datetime
 from torch import optim
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
@@ -23,6 +24,46 @@ from diffusion_planner.utils.train_utils import set_seed, save_model, resume_mod
 import torch
 from typing import Any, Dict, List, Optional, Tuple, Iterator
 
+
+def setup_logger_and_purge(
+    args: argparse.Namespace,
+    global_rank: int,
+    wandb_id: Optional[str],
+    allow_val_change: bool,
+) -> Logger:
+    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리한다.
+
+    Args:
+        args: 학습 설정이 들어 있는 argparse.Namespace.
+        global_rank: 전체 프로세스 기준 번호.
+        wandb_id: 재개 시 사용할 wandb run id.
+        allow_val_change: wandb config 값 변경 허용 여부.
+
+    Returns:
+        wandb_logger: TensorBoardLogger 래퍼.
+    """
+    wandb_logger = Logger(
+        args.name,
+        args.notes,
+        args,
+        wandb_resume_id=wandb_id,
+        save_path=args.save_path,
+        rank=global_rank,
+        allow_val_change=allow_val_change,
+    )
+
+    if global_rank == 0 and args.remove_existing_wb_weight:
+        api = wandb.Api()
+        entity = wandb.run.entity
+        project = wandb.run.project
+
+        purge_collection(api, entity, project, f"{args.name}_latest-model")
+        purge_collection(api, entity, project, f"{args.name}_best-model")
+
+    if args.ddp:
+        torch.distributed.barrier()
+
+    return wandb_logger
 
 def _select_latest_like_tag(save_path: str) -> str:
     """DeepSpeed 체크포인트 루트에서 '가장 최신 latest 계열 태그'를 고른다.
@@ -1116,10 +1157,10 @@ def _does_file_exist(file_path: str) -> bool:
     return os.path.isfile(file_path)
 
 
-def _find_checkpoint_file_in_latest_or_best_dir(
+def _find_file_name_of_latest_or_best_dir(
     save_path: str,
     checkpoint_filename: str,
-) -> Optional[str]:
+) -> Optional[Tuple[str,str]]:
     """save_path 안에서 'latest' 또는 'best' 글자가 들어간 하위 폴더를 찾아,
     그 폴더 안에 checkpoint_filename 파일이 있으면 그 파일 경로를 돌려줍니다.
 
@@ -1149,22 +1190,37 @@ def _find_checkpoint_file_in_latest_or_best_dir(
         return None
 
     for entry in entries:
+        # entry_path: './training_log/.../2025-12-06-06:56:58/latest_epoch-000001'
+        # entry: 'latest_epoch-000001', 'best_epoch-000010', ...
         entry_path = os.path.join(save_path, entry)
         if not os.path.isdir(entry_path):
             continue
+        """
+        entry_path 에 .pt 확장자의 파일이 1개라도 있는지 확인합니다.(이름 상관없음) 없으면, 다음 항목으로 넘어갑니다.
+        """
+        # entry_path 안에 있는 파일 목록을 얻습니다.
+        try:
+            sub_entries = os.listdir(entry_path)
+        except OSError:
+            continue
+        has_pt_file = any(sub_entry.lower().endswith(".pt") for sub_entry in sub_entries)
+        if not has_pt_file:
+            continue
+
 
         entry_lower = entry.lower()
         if ("latest" not in entry_lower) and ("best" not in entry_lower):
             continue
-        return entry_path
+        return entry_path, entry
 
     return None
 
 
 def _should_skip_wandb_checkpoint_download(
     args: argparse.Namespace,
-    target_local_ckpt_path: str,
-    checkpoint_filename: str,
+    wandb_new_folder_name: str,
+    target_local_ckpt_path: str, # ./training_log/.../2025-12-06-06:56:58/latest.pth
+    checkpoint_filename: str, # 'latest.pth'
 ) -> Tuple[bool, str]:
     """로컬에 이미 필요한 체크포인트가 갖춰져 있으면 W&B 다운로드를 생략할지 판단합니다.
 
@@ -1172,7 +1228,7 @@ def _should_skip_wandb_checkpoint_download(
     ----
     1) args.use_deepspeed == True 인 경우 (AND 조건, 둘 다 만족해야 생략)
        - (조건 1) target_local_ckpt_path 파일이 이미 존재
-       - (조건 2) args.save_path 아래에 이름에 "latest" 또는 "best"가 들어간 폴더가 있고,
+       - (조건 2) args.save_path 아래에 이름에 "latest" 또는 "best" 가 들어간 폴더가 있고,
                  그 폴더 안에 checkpoint_filename 파일이 존재
 
     2) args.use_deepspeed == False 인 경우
@@ -1197,25 +1253,82 @@ def _should_skip_wandb_checkpoint_download(
         if has_main_ckpt:
             return True, "DeepSpeed 미사용: target_local_ckpt_path 파일이 이미 존재합니다."
         return False, "DeepSpeed 미사용: target_local_ckpt_path 파일이 없습니다."
-
-    # DeepSpeed 사용 시: AND 조건
-    if not has_main_ckpt:
-        return False, "DeepSpeed 사용: (조건 1) target_local_ckpt_path 파일이 없습니다."
-
+    
     save_path = getattr(args, "save_path", None)
     if not isinstance(save_path, str) or not save_path:
         return False, "DeepSpeed 사용: (조건 2) args.save_path가 비어 있어 하위 폴더를 확인할 수 없습니다."
 
-    found_in_tag_dir = _find_checkpoint_file_in_latest_or_best_dir(
+    output_: Optional[str] = _find_file_name_of_latest_or_best_dir(
         save_path=save_path,
         checkpoint_filename=checkpoint_filename,
     )
-    if found_in_tag_dir is None:
-        return False, ("DeepSpeed 사용: (조건 2) save_path 아래 'latest/best' 폴더 안에서 "
-                       f"'{checkpoint_filename}' 파일을 찾지 못했습니다.")
+    if output_ is None:
+        return False, ("DeepSpeed 사용: (조건 2) save_path 아래 'latest/best' 이름을 가지면서,"
+                       "안에 .pt 파일이 있는 폴더를 찾지 못했습니다.")
+    # DeepSpeed 사용 시: AND 조건
+    if not has_main_ckpt:
+        return False, "DeepSpeed 사용: (조건 1) target_local_ckpt_path 파일이 없습니다."
+
+    # found_dir_path: './training_log/.../2025-12-06-06:56:58/latest_epoch-000001'
+    # found_in_tag_dir: 'latest_epoch-000001' 또는 'best_epoch-000010' 등
+    # wandb_new_folder_name: 'latest_epoch-000220' 등
+    found_dir_path, found_in_tag_dir = output_
+    if wandb_new_folder_name != found_in_tag_dir:
+        """ 아래 코드 내용
+        found_dir_path 을 삭제한다.
+        save_path 에 있는 checkpoint_filename 도 삭제한다.
+        """
+        shutil.rmtree(found_dir_path, ignore_errors=True)
+        print(f"[CLEANUP] Removed mismatched DeepSpeed checkpoint dir: {found_dir_path}")
+        main_ckpt_path = os.path.join(save_path, checkpoint_filename)
+        try:
+            if _does_file_exist(main_ckpt_path):
+                os.remove(main_ckpt_path)
+                print(f"[CLEANUP] Removed mismatched main checkpoint file: {main_ckpt_path}")
+        except OSError:
+            pass
+        return False, ("DeepSpeed 사용: (조건 2) W&B에서 찾은 폴더 이름과 실제 존재하는 폴더 이름이 다릅니다. "
+                       f"(wandb: {wandb_new_folder_name}, found: {found_in_tag_dir})")
 
     return True, ("DeepSpeed 사용: (조건 1) 메인 파일 + (조건 2) 'latest/best' 폴더 안 파일 "
-                  f"둘 다 확인했습니다. (found: {found_in_tag_dir})")
+                  f"둘 다 확인했습니다.  ( at wandb: {wandb_new_folder_name},  found: {found_in_tag_dir})")
+
+def _extract_first_pt_parent_dir(file_names: list[str]) -> str:
+    """파일 목록에서 첫 번째 .pt 파일의 '상위 폴더 이름'을 뽑습니다.
+
+    동작 방식
+    ----------
+    1) file_names를 앞에서부터 훑습니다.
+    2) ".pt"로 끝나는 항목을 처음 발견하면,
+       그 경로에서 마지막 "/" 앞의 폴더 경로를 가져옵니다.
+       예) "latest_epoch-000220/mp_rank_00_model_states.pt" -> "latest_epoch-000220"
+    3) 상위 폴더가 없으면(예: "latest.pth" 같이 루트에 있는 경우) 에러를 냅니다.
+
+    Args:
+        file_names (list[str]):
+            artifact.files()에서 얻은 파일 경로 리스트. length: (K,)
+
+    Returns:
+        str:
+            첫 번째 .pt 파일의 상위 폴더 이름. shape: ()
+
+    Raises:
+        ValueError:
+            - .pt 파일이 없거나
+            - .pt 파일이 루트에만 있어서 상위 폴더를 못 뽑는 경우
+    """
+    for name in file_names:
+        if not isinstance(name, str):
+            continue
+        if not name.endswith(".pt"):
+            continue
+
+        parent = name.rsplit("/", 1)[0]  # "a/b.pt" -> "a"
+        if parent == name:
+            raise ValueError(f".pt 파일이 루트에만 있습니다: {name}")
+        return parent
+
+    raise ValueError(".pt 파일을 찾지 못했습니다.")
 
 
 def _download_wandb_checkpoint_to_local(
@@ -1251,6 +1364,10 @@ def _download_wandb_checkpoint_to_local(
     artifact = api.artifact(artifact_wandb_path, type='model')
 
     source_run = artifact.logged_by()
+    file_names = [f.name for f in artifact.files()]
+    # wandb_new_folder_name: 'latest_epoch-000220' 등
+    wandb_new_folder_name = _extract_first_pt_parent_dir(file_names)
+
     if "save_path" not in source_run.config:
         raise ValueError("NO save path in WANDB run config")
 
@@ -1287,14 +1404,18 @@ def _download_wandb_checkpoint_to_local(
     # =========================
     should_skip, skip_reason = _should_skip_wandb_checkpoint_download(
         args=args,
-        target_local_ckpt_path=target_local_ckpt_path,
-        checkpoint_filename=checkpoint_filename,
+        wandb_new_folder_name=wandb_new_folder_name,
+        target_local_ckpt_path=target_local_ckpt_path, # ./training_log/.../2025-12-06-06:56:58/latest.pth
+        checkpoint_filename=checkpoint_filename, # 'latest.pth'
     )
     if should_skip:
         print(f"[WANDB->local] skip download. rank={rank}, "
               f"target_local_ckpt_path='{target_local_ckpt_path}', "
               f"checkpoint_filename='{checkpoint_filename}'. "
               f"reason: {skip_reason}")
+        if args.finish_when_no_updated_pt:
+            print("[EXIT] finish_when_no_updated_pt is set. exit now.")
+            exit(0)
         return
     if rank == 0:
         os.makedirs(past_save_path, exist_ok=True)
@@ -1479,7 +1600,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
     resume_alias : str
         - 실제로 사용할 별칭. 예: 'latest', 'best'.
     collection_name : str
-        - W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
+        - W&B 상에서 모델 묶음 이름. 예: f"{args.load_name}_latest-model".
     checkpoint_filename : str
         - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
@@ -1488,7 +1609,6 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
         _determine_wandb_artifact_config(args)
     if args.save_path is not None:
         local_ckpt_path = os.path.join(args.save_path, checkpoint_filename)
-        # TODO: DeepSpeed 사용시에는, 어떤 경우에 스킵해도 좋은지 재검토 필요
         if not args.use_deepspeed and os.path.exists(local_ckpt_path):
             print(
                 f"[WANDB->local] found existing local checkpoint: {local_ckpt_path} "

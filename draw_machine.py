@@ -3983,3 +3983,370 @@ def draw_world_model_to_png(
 
     # 6) 저장
     save_figure_to_png(fig, save_path)
+def _list_sorted_png_frame_paths(save_dir: str) -> List[str]:
+    """폴더 안의 PNG 프레임들을 '숫자 파일명' 기준으로 정렬해 반환합니다.
+
+    이 함수가 하는 일
+    ---------------
+    - save_dir 안에서 확장자가 .png 인 파일을 찾습니다.
+    - 파일명(stem)이 '0', '1', '2' 처럼 숫자로만 된 것만 프레임으로 인정합니다.
+      (예: "0001.png" 도 숫자이므로 포함됩니다.)
+    - 숫자 값 기준으로 오름차순 정렬합니다.
+      (문자열 정렬이 아니라, 2 < 10 < 11 같은 "숫자 정렬"입니다.)
+
+    Args:
+        save_dir (str):
+            프레임 PNG들이 들어있는 폴더 경로. shape: ()
+
+    Returns:
+        List[str]:
+            정렬된 PNG 파일 경로 리스트.
+            각 원소는 파일 경로 문자열이며, 길이는 프레임 개수입니다. shape: (N,)
+
+    Raises:
+        FileNotFoundError:
+            폴더가 없을 때 발생합니다.
+        ValueError:
+            숫자 파일명의 PNG가 하나도 없을 때 발생합니다.
+    """
+    import os
+    from pathlib import Path
+
+    dir_path = Path(save_dir)
+    if not dir_path.exists():
+        raise FileNotFoundError(f"save_dir 폴더가 없습니다: {save_dir}")
+
+    png_paths = []
+    for p in dir_path.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ".png":
+            continue
+        if not p.stem.isdigit():
+            continue
+        png_paths.append(p)
+
+    if len(png_paths) == 0:
+        raise ValueError(
+            f"'{save_dir}' 안에서 숫자 파일명(예: 0.png, 1.png, 2.png ...)의 PNG를 찾지 못했습니다."
+        )
+
+    png_paths.sort(key=lambda x: int(x.stem))
+    return [str(p) for p in png_paths]
+
+
+def _load_png_as_rgb_uint8(
+    png_path: str,
+    target_hw: Optional[Tuple[int, int]],
+) -> np.ndarray:
+    """PNG 한 장을 (H, W, 3) RGB uint8 배열로 읽고, 필요하면 크기를 맞춥니다.
+
+    왜 이 함수가 필요한가?
+    ----------------------
+    - PNG는 (H, W) 흑백이거나, (H, W, 4) RGBA처럼 알파 채널이 있을 수 있습니다.
+    - 영상으로 만들려면 보통 (H, W, 3) RGB 형태가 가장 다루기 쉽습니다.
+    - 프레임마다 크기가 다르면 영상 writer에서 오류가 나기 쉬워서,
+      첫 프레임 크기로 통일합니다.
+
+    Args:
+        png_path (str):
+            읽을 PNG 파일 경로. shape: ()
+        target_hw (Optional[Tuple[int, int]]):
+            (target_h, target_w).
+            - None이면 원본 크기 그대로 사용합니다.
+            - 값이 있으면 해당 크기로 리사이즈합니다. shape: (2,)
+
+    Returns:
+        np.ndarray:
+            shape = (H, W, 3), dtype = uint8
+            RGB 이미지 배열입니다.
+    """
+    from PIL import Image
+
+    with Image.open(png_path) as img:
+        img_rgb = img.convert("RGB")  # (W, H) 기반 내부 포맷이지만 결과는 RGB 3채널
+        if target_hw is not None:
+            target_h, target_w = int(target_hw[0]), int(target_hw[1])
+            # PIL resize는 (W, H) 순서로 받습니다.
+            if (img_rgb.size[0] != target_w) or (img_rgb.size[1] != target_h):
+                img_rgb = img_rgb.resize((target_w, target_h), resample=Image.BILINEAR)
+
+        frame_rgb: np.ndarray = np.asarray(img_rgb, dtype=np.uint8)  # (H, W, 3)
+    return frame_rgb
+
+
+def _get_default_video_fps() -> int:
+    """영상 FPS를 기본값으로 결정합니다.
+
+    이 함수가 하는 일
+    ---------------
+    - 기본 FPS는 10으로 둡니다.
+    - 환경변수 DRAW_MACHINE_VIDEO_FPS 가 있으면 그 값을 우선 사용합니다.
+      (예: export DRAW_MACHINE_VIDEO_FPS=20)
+
+    Returns:
+        int:
+            FPS 값(최소 1). shape: ()
+    """
+    import os
+
+    raw = str(os.environ.get("DRAW_MACHINE_VIDEO_FPS", "")).strip()
+    if raw == "":
+        return 10
+    try:
+        fps = int(raw)
+        return int(max(1, fps))
+    except ValueError:
+        return 10
+
+
+from typing import Tuple
+import numpy as np
+
+
+def _pad_rgb_uint8_frame_to_even_hw(frame_rgb: np.ndarray) -> np.ndarray:
+    """RGB 프레임의 가로/세로 픽셀 수를 '짝수'로 맞춰서 반환합니다.
+
+    이 함수가 필요한 이유
+    --------------------
+    mp4(H.264)로 저장할 때는 영상 프레임의 가로/세로 픽셀 수가
+    둘 다 2로 나눠 떨어져야 하는 경우가 많습니다.
+    (지금처럼 세로가 2275 같은 홀수면 저장이 실패합니다.)
+
+    그래서 이 함수는
+    - 세로(H)가 홀수면: 아래쪽에 검은색 1픽셀 줄을 추가
+    - 가로(W)가 홀수면: 오른쪽에 검은색 1픽셀 줄을 추가
+    해서 (H, W)를 짝수로 만들어 줍니다.
+
+    Args:
+        frame_rgb (np.ndarray):
+            shape = (H, W, 3), dtype = uint8
+            RGB 이미지 프레임입니다.
+
+    Returns:
+        np.ndarray:
+            shape = (H_even, W_even, 3), dtype = uint8
+            가로/세로가 짝수로 맞춰진 RGB 프레임입니다.
+
+    Raises:
+        ValueError:
+            입력 프레임이 (H, W, 3) 형태가 아닐 때 발생합니다.
+    """
+    frame_rgb_arr = np.asarray(frame_rgb)
+
+    if frame_rgb_arr.ndim != 3 or frame_rgb_arr.shape[2] != 3:
+        raise ValueError(
+            f"frame_rgb는 shape (H, W, 3) 이어야 합니다. got {frame_rgb_arr.shape}"
+        )
+
+    if frame_rgb_arr.dtype != np.uint8:
+        frame_rgb_arr = frame_rgb_arr.astype(np.uint8)
+
+    height: int = int(frame_rgb_arr.shape[0])
+    width: int = int(frame_rgb_arr.shape[1])
+
+    pad_h: int = int(height % 2)  # 0 또는 1
+    pad_w: int = int(width % 2)   # 0 또는 1
+
+    if pad_h == 0 and pad_w == 0:
+        return frame_rgb_arr
+
+    padded_frame: np.ndarray = np.pad(
+        frame_rgb_arr,
+        pad_width=((0, pad_h), (0, pad_w), (0, 0)),
+        mode="constant",
+        constant_values=0,  # 검은색
+    )
+    return padded_frame
+
+from typing import List
+import numpy as np
+
+
+def _write_mp4_from_png_frames(
+    frame_paths: List[str],
+    output_mp4_path: str,
+    fps: int,
+) -> None:
+    """PNG 프레임 시퀀스로 MP4 영상을 저장합니다(가로/세로를 짝수로 맞춤).
+
+    핵심 동작
+    --------
+    - 첫 프레임 크기 (H, W)를 기준으로 모든 프레임을 같은 크기로 맞춥니다.
+    - 그 다음, mp4 인코더가 실패하지 않도록 프레임의 (H, W)를 짝수로 만듭니다.
+      (홀수면 아래/오른쪽에 검은색 1픽셀을 추가)
+
+    Args:
+        frame_paths (List[str]):
+            PNG 경로 리스트. 시간 순서대로 정렬되어 있어야 합니다. shape: (N,)
+        output_mp4_path (str):
+            저장할 mp4 파일 경로. shape: ()
+        fps (int):
+            초당 프레임 수. shape: ()
+
+    Raises:
+        RuntimeError:
+            mp4 저장에 필요한 라이브러리/인코더가 없어서 실패할 때 발생합니다.
+    """
+    try:
+        import imageio.v2 as imageio
+    except Exception as e:
+        raise RuntimeError(
+            "mp4 저장을 위해 imageio가 필요합니다. "
+            "설치: pip install imageio imageio-ffmpeg"
+        ) from e
+
+    if len(frame_paths) == 0:
+        raise ValueError("frame_paths가 비어 있습니다. PNG 프레임이 필요합니다.")
+
+    # (1) 첫 프레임으로 기준 크기(H, W) 결정
+    first_frame_rgb: np.ndarray = _load_png_as_rgb_uint8(
+        png_path=frame_paths[0],
+        target_hw=None,
+    )  # shape: (H, W, 3)
+
+    base_h: int = int(first_frame_rgb.shape[0])
+    base_w: int = int(first_frame_rgb.shape[1])
+    target_hw = (base_h, base_w)
+
+    # (2) writer 생성
+    # macro_block_size=1은 "16의 배수로 강제 리사이즈" 같은 걸 피하는 데 도움
+    try:
+        writer = imageio.get_writer(
+            output_mp4_path,
+            fps=int(fps),
+            codec="libx264",
+            quality=8,
+            macro_block_size=1,
+        )
+    except Exception:
+        writer = imageio.get_writer(output_mp4_path, fps=int(fps))
+
+    # (3) 프레임을 읽어서 -> (H,W,3) 맞추고 -> (H,W)를 짝수로 만든 뒤 append
+    with writer:
+        for png_path in frame_paths:
+            frame_rgb: np.ndarray = _load_png_as_rgb_uint8(
+                png_path=png_path,
+                target_hw=target_hw,
+            )  # shape: (base_h, base_w, 3)
+
+            frame_rgb_even: np.ndarray = _pad_rgb_uint8_frame_to_even_hw(
+                frame_rgb
+            )  # shape: (H_even, W_even, 3)
+
+            writer.append_data(frame_rgb_even)
+
+
+
+def _write_gif_from_png_frames(
+    frame_paths: List[str],
+    output_gif_path: str,
+    fps: int,
+) -> None:
+    """PNG 프레임 시퀀스로 GIF 영상을 저장합니다.
+
+    구현 방식
+    --------
+    - mp4와 동일하게 프레임을 한 장씩 읽어서 writer에 바로 추가합니다.
+    - GIF는 보통 프레임 시간(초/프레임)을 duration으로 설정합니다.
+      duration = 1 / fps
+
+    Args:
+        frame_paths (List[str]):
+            PNG 경로 리스트. 시간 순서대로 정렬되어 있어야 합니다. shape: (N,)
+        output_gif_path (str):
+            저장할 gif 파일 경로. shape: ()
+        fps (int):
+            초당 프레임 수. shape: ()
+
+    Raises:
+        RuntimeError:
+            gif 저장에 필요한 라이브러리/플러그인이 없어서 실패할 때 발생합니다.
+    """
+    try:
+        import imageio.v2 as imageio
+    except Exception as e:
+        raise RuntimeError(
+            "gif 저장을 위해 imageio가 필요합니다. 설치: pip install imageio"
+        ) from e
+
+    first_frame = _load_png_as_rgb_uint8(frame_paths[0], target_hw=None)  # (H, W, 3)
+    target_h, target_w = int(first_frame.shape[0]), int(first_frame.shape[1])
+
+    duration_sec = 1.0 / float(max(1, int(fps)))
+
+    # mode="I"는 프레임을 이어붙이는 방식(일반적인 애니메이션 GIF)
+    with imageio.get_writer(output_gif_path, mode="I", duration=duration_sec) as writer:
+        for p in frame_paths:
+            frame = _load_png_as_rgb_uint8(p, target_hw=(target_h, target_w))  # (H, W, 3)
+            writer.append_data(frame)
+
+
+def make_video_from_all_png(save_dir: str, draw_scenario_id: str, new_save_dir: str) -> None:
+    """폴더 내 PNG들을 시간 순서대로 이어서 mp4/gif 영상을 저장합니다.
+
+    전제(입력 폴더 구조)
+    -------------------
+    - save_dir 은 폴더이고, 그 안에 아래처럼 저장되어 있다고 가정합니다.
+
+      0.png, 1.png, 2.png, ...
+      10.png, 11.png, ...
+
+    - 파일명은 "숫자"여야 하며, 이 숫자가 시간 순서를 의미합니다.
+
+    저장 결과
+    --------
+    - mp4:  new_save_dir / f"{draw_scenario_id}.mp4"
+    - gif:  new_save_dir / f"{draw_scenario_id}.gif"
+
+    구현 특징
+    --------
+    - 숫자 기준 정렬(문자열 정렬이 아님)
+    - 프레임 크기가 서로 다르면, 첫 프레임 크기 (H, W)에 맞춰 리사이즈
+    - 프레임을 한 장씩 읽어서 바로 writer에 넣어 메모리 사용을 줄임
+      · 각 프레임 배열 shape = (H, W, 3), dtype=uint8
+
+    Args:
+        save_dir (str):
+            프레임 PNG들이 들어있는 폴더 경로. shape: ()
+        draw_scenario_id (str):
+            저장 파일명에 사용할 시나리오 ID. shape: ()
+
+    Returns:
+        None
+    """
+    import os
+    from pathlib import Path
+
+    frame_paths: List[str] = _list_sorted_png_frame_paths(save_dir)
+    fps: int = _get_default_video_fps()
+
+    out_dir = Path(new_save_dir)
+    out_mp4_path = str(out_dir / f"{draw_scenario_id}.mp4")
+    out_gif_path = str(out_dir / f"{draw_scenario_id}.gif")
+
+    # 같은 이름 파일이 있으면 덮어쓰는 게 자연스러워서, 미리 지우는 방식을 사용합니다.
+    # (writer가 덮어쓰기를 지원하지 않는 환경도 있을 수 있어서 안전 처리)
+    for out_path in (out_mp4_path, out_gif_path):
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception:
+            pass
+
+    _write_mp4_from_png_frames(
+        frame_paths=frame_paths,
+        output_mp4_path=out_mp4_path,
+        fps=int(fps),
+    )
+    _write_gif_from_png_frames(
+        frame_paths=frame_paths,
+        output_gif_path=out_gif_path,
+        fps=int(fps),
+    )
+
+if __name__ == "__main__":
+    save_dir = "/home/user/PycharmProjects/Diffusion-Planner/training_log/nuplan_womd/2025-12-25-05:37:26/debug_vis_1bc8784d42f1b632"
+    draw_scenario_id = "1bc8784d42f1b632"
+    new_save_dir = "/home/user/PycharmProjects/Diffusion-Planner/training_log/nuplan_womd/2025-12-25-05:37:26"
+    make_video_from_all_png(save_dir, draw_scenario_id, new_save_dir)

@@ -48,7 +48,7 @@ from tools.predictor_utils import (
     maybe_resume_from_checkpoint,
 )
 from tools.predictor_utils import (build_dataset_and_sampler, build_data_loader,
-                                   create_diffusion_planner_and_ema)
+                                   create_diffusion_planner_and_ema, setup_logger_and_purge)
 
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
@@ -1289,45 +1289,6 @@ def _save_deepspeed_checkpoint_for_epoch(
     return tag_latest, tag_best
 
 
-def _setup_logger_and_purge(
-    args: argparse.Namespace,
-    global_rank: int,
-    wandb_id: Optional[str],
-    allow_val_change: bool,
-) -> Logger:
-    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리한다.
-
-    Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        global_rank: 전체 프로세스 기준 번호.
-        wandb_id: 재개 시 사용할 wandb run id.
-        allow_val_change: wandb config 값 변경 허용 여부.
-
-    Returns:
-        wandb_logger: TensorBoardLogger 래퍼.
-    """
-    wandb_logger = Logger(
-        args.name,
-        args.notes,
-        args,
-        wandb_resume_id=wandb_id,
-        save_path=args.save_path,
-        rank=global_rank,
-        allow_val_change=allow_val_change,
-    )
-
-    if global_rank == 0 and args.remove_existing_wb_weight:
-        api = wandb.Api()
-        entity = wandb.run.entity
-        project = wandb.run.project
-
-        purge_collection(api, entity, project, f"{args.name}_latest-model")
-        purge_collection(api, entity, project, f"{args.name}_best-model")
-
-    if args.ddp:
-        torch.distributed.barrier()
-
-    return wandb_logger
 
 
 def _train_one_epoch(
@@ -2406,15 +2367,12 @@ def model_training(
         total_step_of_this_epoch=total_step_of_this_epoch,
     )
 
-    wandb_logger = _setup_logger_and_purge(
+    wandb_logger = setup_logger_and_purge(
         args=args,
         global_rank=global_rank,
         wandb_id=wandb_id,
         allow_val_change=allow_val_change,
     )
-
-    min_ade = minADE()
-    wosac_metrics = WOSACMetrics("val_closed")
 
     best_loss = _run_training_loop(
         args=args,
