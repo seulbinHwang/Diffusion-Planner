@@ -197,9 +197,9 @@ def model_validation(
 
     min_ade = minADE(is_active=args.min_ade_is_active).to(torch.device(args.device))
     wosac_metrics = WOSACMetrics("val_closed", args.wosac_metric_is_active)
-    save_path = os.path.join(args.save_path, args.eval_method)
     wosac_submission = WOSACSubmission(is_active=args.wosac_sub_is_active,
-                                       save_path=save_path,)
+                                       save_path=args.save_path,
+                                       eval_method=args.eval_method)
     run_validation_loop(
         args=args,
         diffusion_planner=diffusion_planner,

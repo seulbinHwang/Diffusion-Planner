@@ -31,6 +31,7 @@ class WOSACSubmission(Metric):
     def __init__(
         self, is_active: bool,
         save_path: str,
+            eval_method: str,
     ) -> None:
         super().__init__()
         self.is_active = is_active
@@ -46,7 +47,8 @@ class WOSACSubmission(Metric):
             self.account_name = "h.sb@naverlabs.com"
             self.buffer_scenario_rollouts = []
             self.i_file = 0
-            self.submission_dir = Path(os.path.join(save_path, "wosac_submission"))
+            save_path = os.path.join(save_path, eval_method)
+            self.submission_dir = Path(os.path.join(save_path, f"wosac_submission"))
             # Make directory if it doesn't exist
             self.submission_dir.mkdir(parents=True, exist_ok=True)
             self.submission_scenario_id = []
