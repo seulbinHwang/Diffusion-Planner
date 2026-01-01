@@ -41,7 +41,7 @@ from waymo_open_dataset.utils.sim_agents import submission_specs
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 from src.utils.wosac_utils import get_scenario_id_int_tensor, \
     get_scenario_rollouts
-from src.smart.metrics import WOSACMetrics, minADE
+from src.smart.metrics import WOSACMetrics, minADE, WOSACSubmission
 from torch import optim
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 
@@ -195,15 +195,17 @@ def model_validation(
      )
     args._global_update_step = 0
 
-    min_ade = minADE().to(torch.device(args.device))
-    wosac_metrics = WOSACMetrics("val_closed")
-
+    min_ade = minADE(is_active=args.min_ade_is_active).to(torch.device(args.device))
+    wosac_metrics = WOSACMetrics("val_closed", args.wosac_metric_is_active)
+    wosac_submission = WOSACSubmission(is_active=args.wosac_sub_is_active,
+                                       save_path=args.save_path,)
     run_validation_loop(
         args=args,
         diffusion_planner=diffusion_planner,
         model_ema=model_ema,
         validation_loader=validation_loader,
         wosac_metrics=wosac_metrics,
+        wosac_submission=wosac_submission,
         min_ade=min_ade,
     )
 
@@ -225,6 +227,7 @@ def run_validation_loop(
     model_ema: Optional[ModelEma],
     validation_loader: DataLoader,
     wosac_metrics: WOSACMetrics,
+wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> None:
     """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
@@ -243,6 +246,7 @@ def run_validation_loop(
         model_ema=model_ema,
         batch_num_in_one_val_epoch=batch_num_in_one_val_epoch,
         wosac_metrics=wosac_metrics,
+        wosac_submission=wosac_submission,
         min_ade=min_ade,
     )
     # print "epoch_elapsed_time_sec"
@@ -266,6 +270,7 @@ def validate_one_epoch(
     model_ema: Optional[ModelEma],
     batch_num_in_one_val_epoch: int,
     wosac_metrics: WOSACMetrics,
+wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> Tuple[Dict[str, torch.Tensor], float]:
     if args.ddp and ddp.get_rank() == 0:
@@ -279,6 +284,7 @@ def validate_one_epoch(
         model_ema,
         batch_num_in_one_val_epoch,
         wosac_metrics,
+        wosac_submission,
         min_ade,
     )
     """
@@ -630,6 +636,7 @@ def validation_epoch(
     ema: Optional[ModelEma],
     batch_num_in_one_val_epoch: int,
     wosac_metrics: WOSACMetrics,
+wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> Dict[str, torch.Tensor]:
     model.eval()
@@ -675,6 +682,7 @@ def validation_epoch(
                 state_normalizer=args.state_normalizer,
                 observation_normalizer=args.observation_normalizer,
                 wosac_metrics=wosac_metrics,
+                wosac_submission=wosac_submission,
                 min_ade=min_ade,
             )
 
@@ -688,19 +696,28 @@ def validation_epoch(
                     done_steps=batch_idx,
                     writer=data_epoch.write,
                 )
+    ddp_rank: int = int(ddp.get_rank()) if bool(getattr(args, "ddp",
+                                                        False)) else 0
+    if ddp_rank == 0:
+        if wosac_submission.is_active:
+            wosac_submission.save_sub_file()
+    if wosac_metrics.is_active:
+        epoch_wosac_metrics: Dict[str, torch.Tensor] = wosac_metrics.compute()
+        if min_ade.is_active:
+            epoch_wosac_metrics[
+                "val_closed/ADE_debug/wosac_average_displacement_error_xy"] = (
+                min_ade.compute_wosac_like_average_displacement_error()
+            )
+            epoch_wosac_metrics[
+                "val_closed/ADE_debug/wosac_min_average_displacement_error_xy"] = (
+                min_ade.compute_wosac_like_min_average_displacement_error()
+            )
+            epoch_wosac_metrics["val_closed/min_ADE(custom)"] = min_ade.compute()
+            min_ade.reset()
+        wosac_metrics.reset()
+    else:
+        epoch_wosac_metrics = {}
 
-    epoch_wosac_metrics: Dict[str, torch.Tensor] = wosac_metrics.compute()
-    epoch_wosac_metrics[
-        "val_closed/ADE_debug/wosac_average_displacement_error_xy"] = (
-        min_ade.compute_wosac_like_average_displacement_error()
-    )
-    epoch_wosac_metrics[
-        "val_closed/ADE_debug/wosac_min_average_displacement_error_xy"] = (
-        min_ade.compute_wosac_like_min_average_displacement_error()
-    )
-    epoch_wosac_metrics["val_closed/min_ADE(custom)"] = min_ade.compute()
-    wosac_metrics.reset()
-    min_ade.reset()
 
     return epoch_wosac_metrics
 
@@ -2011,100 +2028,6 @@ def _expand_target_z_to_rollout_grid(
     return target_z_grid
 
 
-def _update_wosac_metrics_for_validation_batch(
-    scenario_id: List[str],
-    tfrecord_path: List[str],
-    target_id: torch.Tensor,
-    agent_batch: torch.Tensor,
-    pred_traj: torch.Tensor,
-    pred_z: torch.Tensor,
-    pred_head: torch.Tensor,
-    target_future_valid: torch.Tensor,
-    wosac_metrics: WOSACMetrics,
-) -> None:
-    """WOSAC metric을 업데이트합니다(패딩 agent 제거 포함).
-
-    중요한 점(패딩 제거)
-    -------------------
-    데이터에 "실제로 없는 agent 자리"가 들어있을 수 있습니다.
-    이런 자리는 보통 object_id가 0이거나, 미래 valid가 전부 False입니다.
-    이 상태로 WOSAC에 넣으면 내부에서 "없는 object_id"로 판단해 에러가 날 수 있어,
-    안전하게 해당 agent를 제거한 뒤 업데이트합니다.
-
-    Shape 요약
-    ---------
-    - scenario_id: List[str], 길이 B
-    - tfrecord_path: List[str], 길이 B
-    - target_id: (N,)  N=B*(1+)Pnn
-    - agent_batch: (N,)
-    - pred_traj: (N, R, T, 2)
-    - pred_z: (N, R, T)
-    - pred_head: (N, R, T)
-    - target_future_valid: (B, (1+)Pnn, T)
-
-    Args:
-        scenario_id (List[str]):
-            길이 B.
-        tfrecord_path (List[str]):
-            길이 B.
-        target_id (torch.Tensor):
-            shape (N,)
-        agent_batch (torch.Tensor):
-            shape (N,)
-        pred_traj (torch.Tensor):
-            shape (N, R, T, 2)
-        pred_z (torch.Tensor):
-            shape (N, R, T)
-        pred_head (torch.Tensor):
-            shape (N, R, T)
-        target_future_valid (torch.Tensor):
-            shape (B, (1+)Pnn, T)
-        wosac_metrics (WOSACMetrics):
-            update(...)를 호출해 누적합니다.
-
-    Returns:
-        None
-    """
-    device = pred_traj.device
-
-    # 1) 패딩 agent 제거 마스크 생성
-    # wosac_agent_valid_mask: (N,) = (B*(1+)Pnn,)
-    wosac_agent_valid_mask = _build_valid_agent_mask_for_wosac(
-        agent_id=target_id,  # (N,)
-        target_future_valid=target_future_valid,  # (B, (1+)Pnn, T)
-    )
-
-    # 2) rollout 텐서들 일괄 필터링
-    (
-        wosac_agent_id,  # (N2,)
-        wosac_agent_batch,  # (N2,)
-        wosac_pred_traj,  # (N2, R, T, 2)
-        wosac_pred_z,  # (N2, R, T)
-        wosac_pred_head,  # (N2, R, T)
-    ) = _filter_rollout_tensors_by_agent_mask(
-        agent_id=target_id,  # (N,)
-        agent_batch=agent_batch,  # (N,)
-        pred_traj=pred_traj,  # (N, R, T, 2)
-        pred_z=pred_z,  # (N, R, T)
-        pred_head=pred_head,  # (N, R, T)
-        agent_valid_mask=wosac_agent_valid_mask,  # (N,)
-    )
-    # scenario_id : List[str] 길이 B
-    # [n_scenario, n_str_length]
-    # 3) scenario_rollouts 생성 후 metric 업데이트
-    # scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts] # 길이: B (유효 시나리오 수)
-    scenario_rollouts = get_scenario_rollouts(
-        scenario_id=get_scenario_id_int_tensor(scenario_id, device),
-        agent_id=wosac_agent_id,  # (N2,)
-        agent_batch=wosac_agent_batch,  # (N2,)
-        pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
-        pred_z=wosac_pred_z,  # (N2, R, T)
-        pred_head=wosac_pred_head,  # (N2, R, T)
-    )
-    wosac_metrics.update(tfrecord_path, scenario_rollouts)
-
-
-
 def _get_sim_agents_challenge_type_from_args(
     args: Any,
 ) -> submission_specs.ChallengeType:
@@ -2408,15 +2331,15 @@ def _update_min_ade_for_validation_batch(
         unnorm_target_future_gt_4_dim_flat != 0,
         dim=-1,
     ).to(dtype=torch.bool)
-
-    min_ade.update(
-        pred=pred_traj,
-        target=unnorm_target_future_gt_xy_world,
-        target_valid=target_future_valid_flat,
-        agent_batch=agent_batch,
-        agent_id=target_id,               # (N,)
-        eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
-    )
+    if min_ade.is_active:
+        min_ade.update(
+            pred=pred_traj,
+            target=unnorm_target_future_gt_xy_world,
+            target_valid=target_future_valid_flat,
+            agent_batch=agent_batch,
+            agent_id=target_id,               # (N,)
+            eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
+        )
 
 
 def validate_func(
@@ -2428,6 +2351,7 @@ def validate_func(
     state_normalizer: StateNormalizer,
     observation_normalizer: ObservationNormalizer,
     wosac_metrics: WOSACMetrics,
+wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> None:
     """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다.
@@ -2511,27 +2435,101 @@ def validate_func(
         device=pred_traj.device,
     )
 
-    # target_z: (N, R, future_len)
+    # pred_z: (N, R, future_len)
     # (N,) = (B * (1+)Pnn)
-    target_z = _expand_target_z_to_rollout_grid(
+    pred_z = _expand_target_z_to_rollout_grid(
         norm_inputs=norm_inputs,
         n_rollout=int(pred_traj.shape[1]),
         n_step=int(pred_traj.shape[2]),
         device=pred_traj.device,
     )
 
-    # 7) WOSAC 업데이트(패딩 agent 제거 포함)
-    _update_wosac_metrics_for_validation_batch(
-        scenario_id=scenario_id,  # List[str], len B
-        tfrecord_path=tfrecord_path,  # List[str], len B
-        target_id=target_id,  # (N,)
-        agent_batch=agent_batch,  # (N,)
-        pred_traj=pred_traj,  # (N, R, future_len, 2)
-        pred_z=target_z,  # (N, R, future_len)
-        pred_head=pred_head,  # (N, R, future_len)
-        target_future_valid=target_future_valid,  # (B, (1+)Pnn, future_len)
-        wosac_metrics=wosac_metrics,
+    device = pred_traj.device
+
+    # 1) 패딩 agent 제거 마스크 생성
+    # wosac_agent_valid_mask: (N,) = (B*(1+)Pnn,)
+    wosac_agent_valid_mask = _build_valid_agent_mask_for_wosac(
+        agent_id=target_id,  # (N,)
+        target_future_valid=target_future_valid,  # (B, (1+)Pnn, T)
     )
+
+    # 2) rollout 텐서들 일괄 필터링
+    (
+        wosac_agent_id,  # (N2,)
+        wosac_agent_batch,  # (N2,)
+        wosac_pred_traj,  # (N2, R, T, 2)
+        wosac_pred_z,  # (N2, R, T)
+        wosac_pred_head,  # (N2, R, T)
+    ) = _filter_rollout_tensors_by_agent_mask(
+        agent_id=target_id,  # (N,)
+        agent_batch=agent_batch,  # (N,)
+        pred_traj=pred_traj,  # (N, R, T, 2)
+        pred_z=pred_z,  # (N, R, T)
+        pred_head=pred_head,  # (N, R, T)
+        agent_valid_mask=wosac_agent_valid_mask,  # (N,)
+    )
+    if wosac_submission.is_active:
+        wosac_submission.update(
+            scenario_id=scenario_id,
+            agent_id=wosac_agent_id,  # (N2,)
+            agent_batch=wosac_agent_batch,  # (N2,)
+            pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
+            pred_z=wosac_pred_z,  # (N2, R, T)
+            pred_head=wosac_pred_head,  # (N2, R, T)
+            global_rank=int(ddp_rank),
+        )
+        """ _gpu_dict_sync
+
+(A) 한 GPU / 동기화가 안 걸린 경우: 각 값이 List[Tensor]
+(B) 여러 GPU에서 결과를 한 번에 모으는 경우: 각 값이 “합쳐진” Tensor
+
+        # compute: 여러 GPU가 서로 데이터를 주고받아 “합쳐진 결과”를 만들려고 한다
+        “각 GPU의 리스트”를 합쳐서 큰 텐서(한 덩어리 데이터) 로 만들어줌"
+
+        싱글 GPU(1개) 일 때는 “서로 모을 상대가 없어서” compute()가 굳이 모으는 과정을 못 하고,
+        그냥 update()로 쌓아둔 그대로인 [텐서] 형태(리스트 안에 1개) 가 남을 수 있습니다.
+        """
+        _gpu_dict_sync = wosac_submission.compute()
+        if int(ddp_rank) == 0:
+            "**0번 프로세스(대표)**만 파일/제출용 결과를 만들도록 제한합니다."
+            for k in _gpu_dict_sync.keys():  # single gpu fix
+                if type(_gpu_dict_sync[k]) is list:
+                    _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
+            """
+            scenario_id [B_total, 16]
+            agent_id [n_ag_total]
+            agent_batch [n_ag_total]
+            pred_traj [n_ag_total, n_rollout, n_step, 2]
+            pred_z [n_ag_total, n_rollout, n_step]
+            pred_head [n_ag_total, n_rollout, n_step]
+
+            scenario_rollouts : List[sim_agents_submission_pb2.ScenarioRollouts]
+                - length: B_total
+            """
+            scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
+            wosac_submission.aggregate_rollouts(scenario_rollouts)
+        """ reset()
+        Metric에 add_state로 등록한 것만 초기화해요
+        그래서 buffer_scenario_rollouts, submission_scenario_id 같은 
+        “파일로 저장하려고 모아두는 버퍼”는 reset으로 안 지워지고 유지됩니다.
+        """
+        wosac_submission.reset()
+
+    # scenario_id : List[str] 길이 B
+    # [n_scenario, n_str_length]
+    # 3) scenario_rollouts 생성 후 metric 업데이트
+    # scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts] # 길이: B (유효 시나리오 수)
+    scenario_rollouts = get_scenario_rollouts(
+        scenario_id=get_scenario_id_int_tensor(scenario_id, device),
+        agent_id=wosac_agent_id,  # (N2,)
+        agent_batch=wosac_agent_batch,  # (N2,)
+        pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
+        pred_z=wosac_pred_z,  # (N2, R, T)
+        pred_head=wosac_pred_head,  # (N2, R, T)
+    )
+    if wosac_metrics.is_active:
+        wosac_metrics.update(tfrecord_path, scenario_rollouts)
+
     # 8) minADE 업데이트를 위해 eval_object_ids 준비 (배치마다)
     eval_object_ids: Optional[torch.Tensor] = None
     if bool(min_ade.only_eval_targets_to_predict):

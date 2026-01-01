@@ -5,9 +5,9 @@ from typing import Optional, Tuple
 
 
 class minADE(Metric):
-    def __init__(self, only_eval_targets_to_predict: bool = True) -> None:
+    def __init__(self,  is_active: bool, only_eval_targets_to_predict: bool = True) -> None:
         super(minADE, self).__init__()
-
+        self.is_active = is_active
         # True이면 "targets_to_predict(ego 포함)"만 평가에 사용합니다.
         # False이면 기존처럼 입력으로 들어온 전체 agent를 평가합니다.
         self.only_eval_targets_to_predict = bool(only_eval_targets_to_predict)

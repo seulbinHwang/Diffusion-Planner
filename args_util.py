@@ -161,7 +161,18 @@ def get_args():
                         choices=['none', 'npc', 'ego'],
                         default='none',
                         help='center crop 기준: none / npc / ego 중 하나만 선택')
-
+    parser.add_argument('--wosac_sub_is_active',
+                        default=False,
+                        type=boolean,
+                        help='True이면 WOSAC 서브미션을 수행함.')
+    parser.add_argument('--min_ade_is_active',
+                        default=False,
+                        type=boolean,
+                        help='True이면 WOSAC 서브미션을 수행함.')
+    parser.add_argument('--wosac_metric_is_active',
+                        default=False,
+                        type=boolean,
+                        help='True이면 WOSAC 서브미션을 수행함.')
     parser.add_argument('--do_not_clip',
                         default=True,
                         type=boolean,
