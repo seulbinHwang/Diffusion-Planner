@@ -50,6 +50,70 @@ from typing import Optional
 import argparse
 import torch
 
+def _get_world_size_from_env() -> int:
+    """환경변수에서 world_size 값을 읽습니다.
+
+    왜 필요한가?
+    ------------
+    torchrun을 --nproc-per-node 1로 실행하면,
+    args.ddp가 True여도 실제로는 프로세스가 1개라서
+    기다림(동기화)이 대부분 의미가 없습니다.
+
+    그래서 WORLD_SIZE 값을 읽어서
+    "정말로 여러 프로세스가 동시에 돌고 있는지"를 판단합니다.
+
+    Args:
+        없음
+
+    Returns:
+        int:
+            world_size 값. shape: ()
+            - 환경변수에 없거나 값이 이상하면 1로 취급합니다.
+    """
+    raw = os.environ.get("WORLD_SIZE", "1")
+    try:
+        world_size = int(str(raw).strip())
+    except ValueError:
+        world_size = 1
+    return int(max(1, world_size))
+
+
+def _should_cuda_synchronize_for_validation(args: argparse.Namespace) -> bool:
+    """Validation에서 torch.cuda.synchronize()가 정말 필요한지 판단합니다.
+
+    목표
+    ----
+    - 프로세스가 1개(world_size=1)면, 대부분은 굳이 기다릴 필요가 없습니다.
+      (게다가 이후에 .cpu() 같은 동작이 있으면 거기서 어차피 기다리게 됩니다)
+    - 프로세스가 2개 이상(world_size>1)일 때만,
+      결과/로그 타이밍이 뒤섞이지 않게 필요한 지점에서만 기다리도록 합니다.
+
+    Args:
+        args (argparse.Namespace):
+            - args.ddp (bool): 분산 모드 플래그
+            - args.device (str): "cuda", "cuda:0", "cpu" 등. shape: ()
+
+    Returns:
+        bool:
+            - True: world_size>1 이고, CUDA를 쓰는 경우 (동기화 수행)
+            - False: 그 외 (동기화 생략)
+            shape: ()
+    """
+    if not bool(getattr(args, "ddp", False)):
+        return False
+
+    if int(_get_world_size_from_env()) <= 1:
+        return False
+
+    device_str = str(getattr(args, "device", ""))
+    if not device_str.startswith("cuda"):
+        return False
+
+    if not torch.cuda.is_available():
+        return False
+
+    return True
+
 
 def _get_rank_from_env() -> int:
     """환경변수에서 rank 값을 읽습니다.
@@ -378,12 +442,10 @@ def _maybe_distributed_barrier(
 ) -> None:
     """가능한 경우에만 torch.distributed.barrier()를 호출합니다.
 
-    왜 필요한가?
-    ------------
-    - args.ddp가 True여도, 실제로 init_process_group가 안 된 경우가 있습니다.
-      (예: torchrun을 쓰지만 nproc=1이고, 코드가 world_size>1일 때만 init하는 경우)
-    - 이 상태에서 barrier를 호출하면 바로 에러가 납니다.
-    - 그래서 "초기화된 경우에만 barrier"를 호출하도록 안전 장치를 둡니다.
+    변경점(핵심)
+    ----------
+    - world_size가 1이면(프로세스 1개) barrier는 의미가 없으므로 바로 건너뜁니다.
+    - world_size가 2 이상일 때만 process group 초기화 여부를 확인하고 barrier를 호출합니다.
 
     Args:
         args (argparse.Namespace):
@@ -394,13 +456,14 @@ def _maybe_distributed_barrier(
     Returns:
         None
     """
+    if int(_get_world_size_from_env()) <= 1:
+        return
+
     use_ddp = bool(getattr(args, "ddp", False))
     if not use_ddp:
         return
 
     if not _is_torch_process_group_initialized():
-        # single-process / 비초기화 상태에서는 barrier가 필요 없으므로 스킵합니다.
-        # 너무 시끄럽지 않게 rank0만 1회만 출력합니다.
         rank = _get_rank_from_env()
         if rank == 0:
             warned_flag_name = "_dp_warned_skip_barrier"
@@ -575,7 +638,6 @@ global_rank: int,
                 value = v.item() if isinstance(v, torch.Tensor) else float(v)
                 print(f"{k}: {value:.6f}")
 
-
 def validate_one_epoch(
     epoch: int,
     total_epochs: int,
@@ -602,25 +664,19 @@ def validate_one_epoch(
         wosac_submission,
         min_ade,
     )
-    """
-CUDA를 쓰는 경우, PyTorch가 캐시로 잡아둔 GPU 메모리(다음 연산 재사용용)를 OS/GPU 쪽에 반납
-메모리 피크를 낮춰 OOM 위험을 줄이려는 목적이지만, 너무 자주 하면 약간의 성능 손해가 날 수 있어요.
-    """
-    if args.device.startswith('cuda'):
+
+    if args.device.startswith("cuda"):
         torch.cuda.empty_cache()
-    """
-torch.cuda.synchronize() : 현재 GPU에서 큐에 쌓인 비동기 연산이 다 끝날 때까지 대기
-torch.distributed.barrier() :
-    모든 rank(프로세스)가 이 지점에 도착할 때까지 서로 기다리게 해서, 어떤 rank만 앞서가거나(예: 저장/로그/다음 epoch) 뒤처지는 상황을 막습니다.
-    """
-    if bool(getattr(args, "ddp", False)) and str(getattr(
-            args, "device", "")).startswith("cuda"):
+
+    # ✅ world_size>1일 때만 동기화
+    if _should_cuda_synchronize_for_validation(args):
         torch.cuda.synchronize()
 
     _maybe_distributed_barrier(args, context="validate_one_epoch end")
 
     epoch_elapsed_time_sec = time.perf_counter() - epoch_t0
     return epoch_wosac_metrics, epoch_elapsed_time_sec
+
 
 
 def _is_main_process_for_logging(args: argparse.Namespace) -> bool:
@@ -1903,6 +1959,82 @@ def _make_rollout_seed(
     # 숫자들은 "겹치지 않게 섞는 용도"이며, 너무 큰 의미는 없습니다.
     return int(base_seed) + int(ddp_rank) * 100_000 + int(rollout_idx) * 1_000
 
+def _get_cached_rollout_chunk_size_for_oom_fallback(
+    args: Any,
+    rollout_number: int,
+    requested_chunk_size: int,
+) -> int:
+    """이번 배치에서 처음 시도할 rollout_chunk_size를 정합니다.
+
+    목적
+    ----
+    rollout을 한 번에 많이 묶으면 빠르지만, GPU 메모리가 부족하면 실패할 수 있습니다.
+    한 번 실패하면 같은 배치를 다시 시도하느라 시간이 크게 늘어납니다.
+
+    그래서 이 함수는:
+    - 예전에 "성공했던 chunk 크기"가 있으면 그 값을 기억했다가,
+      다음 배치에서는 그 값보다 크게 시작하지 않게 합니다.
+    - 이렇게 하면, 실패(메모리 부족)로 인한 재시도가 매 배치마다 반복되는 일을 줄일 수 있습니다.
+
+    Args:
+        args (Any):
+            args 안에 아래 값이 있을 수 있습니다.
+            - args._dp_cached_rollout_chunk_size (선택): 이전 배치에서 성공했던 chunk 크기. shape: ()
+        rollout_number (int):
+            전체 rollout 개수 R. shape: ()
+        requested_chunk_size (int):
+            원래 설정된 chunk 크기. shape: ()
+
+    Returns:
+        int:
+            이번 배치에서 "처음" 시도할 chunk 크기. shape: ()
+            - 1 이상, rollout_number 이하
+            - cached 값이 있으면, requested와 cached 중 작은 값으로 시작합니다.
+    """
+    r = int(max(1, int(rollout_number)))
+    requested = int(max(1, min(int(requested_chunk_size), r)))
+
+    cached_raw = getattr(args, "_dp_cached_rollout_chunk_size", None)
+    if cached_raw is None:
+        return requested
+
+    try:
+        cached = int(cached_raw)
+    except (TypeError, ValueError):
+        return requested
+
+    cached = int(max(1, min(cached, r)))
+    return int(min(requested, cached))
+
+
+def _set_cached_rollout_chunk_size_for_oom_fallback(
+    args: Any,
+    chunk_size: int,
+) -> None:
+    """이번 배치에서 성공한 rollout_chunk_size를 args에 저장합니다.
+
+    목적
+    ----
+    한 번 메모리 부족(OOM)로 실패하면, 같은 배치를 다시 계산해야 해서 시간이 많이 듭니다.
+    그래서 "이번에 성공한 chunk 크기"를 저장해 두고,
+    다음 배치부터는 그 값으로 바로 시작하도록 합니다.
+
+    Args:
+        args (Any):
+            값을 저장할 args 객체. shape: ()
+        chunk_size (int):
+            이번에 실제로 성공한 chunk 크기. shape: ()
+
+    Returns:
+        None
+    """
+    try:
+        setattr(args, "_dp_cached_rollout_chunk_size", int(chunk_size))
+    except Exception:
+        # args가 특이한 객체여서 setattr이 실패해도,
+        # 캐시 저장은 성능 최적화용이므로 실행을 멈추지 않습니다.
+        return
+
 
 def _predict_rollouts_batched_with_oom_fallback(
     args: Any,
@@ -1918,101 +2050,80 @@ def _predict_rollouts_batched_with_oom_fallback(
 ) -> torch.Tensor:
     """rollout을 batch 차원으로 펼쳐 빠르게 예측하되, GPU 메모리가 부족하면 chunk 크기를 자동으로 줄입니다.
 
-    왜 필요한가?
-    ------------
-    rollout을 한 번에 많이 묶을수록(forward 호출 횟수 ↓) 빨라지지만,
-    GPU 메모리가 부족하면 "CUDA out of memory" 오류가 나면서 validation이 중단될 수 있습니다.
-
-    그래서 이 함수는 다음처럼 동작합니다.
-      1) 먼저 requested_rollout_chunk_size로 시도합니다.
-      2) OOM이 나면, chunk 크기를 더 작게 줄여서 다시 시도합니다.
-         예: 32 -> 16 -> 8 -> 4 -> 2 -> 1
-
-    Args:
-        args (Any):
-            args.device, args.ddp 같은 설정을 사용합니다.
-        model (nn.Module):
-            실제 추론 모델(EMA 모델일 수도 있음).
-        norm_inputs (Dict[str, Any]):
-            원래 배치 입력 dict.
-            주요 텐서 예:
-              - ego_agent_past: (B, T_past, 11)
-              - near_agents_past: (B, Pnn, T_past, 11)
-              - origin_world_pose: (B, 4)
-              - target_future_valid: (B, (1+)Pnn, T_fut)
-        state_normalizer (StateNormalizer):
-            정규화된 포즈를 원래 스케일로 되돌리는 inverse(...) 제공 객체.
-        rollout_number (int):
-            전체 rollout 개수 R (예: 32).
-        requested_rollout_chunk_size (int):
-            한 번에 묶어서 처리할 rollout 개수.
-            보통 32가 가장 빠르지만, OOM이면 자동으로 더 줄입니다.
-        base_seed (int):
-            기본 seed.
-        ddp_rank (int):
-            분산 rank. 싱글 프로세스면 0.
+    추가 최적화(중요)
+    --------------
+    - 한 번이라도 성공했던 chunk 크기를 args에 저장해 두고,
+      다음 배치부터는 그 값(또는 그보다 작은 값)으로 바로 시작합니다.
+    - 이렇게 하면 "매 배치마다 32->16->8->..." 같은 실패 재시도가 반복되는 시간을 줄일 수 있습니다.
 
     Returns:
         torch.Tensor:
             shape: (B, (1+)Pnn, rollout_number, future_len, 4)
-            마지막 4는 (x, y, cos, sin)
-
-    Raises:
-        RuntimeError:
-            chunk_size를 1까지 줄여도 OOM이면 마지막 OOM 에러를 그대로 다시 발생시킵니다.
     """
-    rollout_number = int(rollout_number)
-    requested_rollout_chunk_size = int(requested_rollout_chunk_size)
-    requested_rollout_chunk_size = max(
-        1, min(requested_rollout_chunk_size, rollout_number))
+    rollout_number_i = int(rollout_number)
+    rollout_number_i = int(max(1, rollout_number_i))
 
-    # 시도할 chunk 후보들 (중복 제거, 큰 것부터)
-    candidates: List[int] = [requested_rollout_chunk_size]
+    # ✅ 1) 이번 배치에서 "처음 시도할" chunk_size 결정 (캐시 반영)
+    start_chunk_size = _get_cached_rollout_chunk_size_for_oom_fallback(
+        args=args,
+        rollout_number=int(rollout_number_i),
+        requested_chunk_size=int(requested_rollout_chunk_size),
+    )
+    start_chunk_size = int(max(1, min(start_chunk_size, rollout_number_i)))
+
+    # ✅ 2) 시도 후보 만들기: "start_chunk_size"부터 시작해서 더 작은 값만 시도
+    #     (큰 값(예: 32)을 다시 시도해서 또 실패하는 일을 줄이기 위함)
+    candidates: List[int] = [int(start_chunk_size)]
     for c in (32, 16, 8, 4, 2, 1):
-        if c <= rollout_number and c not in candidates:
-            candidates.append(c)
-    candidates = sorted(candidates, reverse=True)
+        if c <= rollout_number_i and c < start_chunk_size and c not in candidates:
+            candidates.append(int(c))
 
     last_oom: Optional[RuntimeError] = None
 
     for chunk_size in candidates:
         try:
-            # (B, (1+)Pnn, rollout_number, future_len, 4)
-            return _predict_rollouts_batched(
+            out = _predict_rollouts_batched(
                 args=args,
                 model=model,
                 norm_inputs=norm_inputs,
                 outputs=outputs,
                 state_normalizer=state_normalizer,
                 observation_normalizer=observation_normalizer,
-                rollout_number=rollout_number,
+                rollout_number=int(rollout_number_i),
                 rollout_chunk_size=int(chunk_size),
                 base_seed=int(base_seed),
                 ddp_rank=int(ddp_rank),
             )
+
+            # ✅ 성공한 chunk_size 저장 → 다음 배치부터는 여기서 바로 시작
+            _set_cached_rollout_chunk_size_for_oom_fallback(
+                args=args,
+                chunk_size=int(chunk_size),
+            )
+            return out
+
         except RuntimeError as e:
             msg = str(e).lower()
             is_oom = ("out of memory" in msg) or ("cuda oom" in msg)
 
             if not is_oom:
-                raise  # OOM이 아니면 그대로 올려서 디버깅 가능하게 합니다.
+                raise
 
             last_oom = e
 
-            # OOM 발생 시 캐시 비우고 다음 후보로 재시도
-            if getattr(args, "device",
-                       "cuda").startswith("cuda") and torch.cuda.is_available():
+            if getattr(args, "device", "cuda").startswith("cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             if _is_main_process_for_logging(args):
                 print(
                     f"[RolloutBatch] CUDA OOM 발생. rollout_chunk_size={chunk_size} 실패 -> "
-                    f"더 작은 chunk로 재시도합니다.")
+                    f"더 작은 chunk로 재시도합니다."
+                )
             continue
 
-    # 여기까지 왔다는 것은 후보를 다 써도 실패한 경우
     assert last_oom is not None
     raise last_oom
+
 
 
 def _build_valid_agent_mask_for_wosac(
@@ -2757,7 +2868,6 @@ def _update_min_ade_for_validation_batch(
             eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
         )
 
-
 def validate_func(
     args: Any,
     model: nn.Module,
@@ -2770,22 +2880,14 @@ def validate_func(
     wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> None:
-    """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다.
-
-    이 함수는 이제 "순서 조립"만 담당합니다.
-    - 어떤 값을 만들고
-    - 어떤 metric을 업데이트할지
-    큰 흐름만 읽히도록 정리했습니다.
-    """
+    """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다."""
     # 1) inference에 쓸 모델 선택 + eval
     inference_model: nn.Module = _prepare_inference_model_for_validation(
         model=model, ema=ema)
 
-    # 2) 입력 텐서 값 정리(NaN/Inf 등) + target_future_valid 붙이기
-    norm_inputs: Dict[str,
-                      Any] = _sanitize_norm_inputs_for_validation(norm_inputs)
+    # 2) 입력 텐서 값 정리 + target_future_valid 붙이기
+    norm_inputs = _sanitize_norm_inputs_for_validation(norm_inputs)
     future_len: int = int(getattr(args, "future_len"))
-    # target_future_valid: (B, (1+)Pnn, T)
     target_future_valid = build_target_future_tensors_and_masks_for_inference(
         args,
         norm_inputs,
@@ -2795,18 +2897,10 @@ def validate_func(
 
     # 3) 배치 크기 및 rollout 설정
     batch_size = _get_batch_size_from_ego_agent_past(norm_inputs)
-    """
-            - rollout_number: R
-            - requested_rollout_chunk_size: 한 번에 묶을 크기(1~R)
-            - base_seed: 기본 seed
-            - ddp_rank: 분산 rank (싱글이면 0)
-    """
-    (rollout_number, requested_rollout_chunk_size, base_seed,
-     ddp_rank) = _get_rollout_settings_for_validation(args)
+    rollout_number, requested_rollout_chunk_size, base_seed, ddp_rank = _get_rollout_settings_for_validation(
+        args)
 
     # 4) rollout 예측 (world 좌표)
-    # (B, (1+)Pnn, R, T, 4)
-    # (B, (1+)Pnn, rollout_number, future_len, 4)
     target_scenario_rollouts_world = _predict_rollouts_batched_with_oom_fallback(
         args=args,
         model=inference_model,
@@ -2821,11 +2915,6 @@ def validate_func(
     )
 
     # 5) metric 입력 형태로 변환
-    """
-    - pred_traj: (N, R, future_len, 2)
-      - N = B * (1+)Pnn
-    - pred_head: (N, R, future_len)
-    """
     pred_traj, pred_head = _build_pred_traj_and_pred_head_from_world_rollouts(
         target_scenario_rollouts_world=target_scenario_rollouts_world)
 
@@ -2841,19 +2930,16 @@ def validate_func(
             key="tfrecord_path",
             expected_length=batch_size,
         )
-    # target_id: (N,) = (B * (1+)Pnn)
-    target_id = _get_target_id_flat_from_norm_inputs(norm_inputs)
 
+    target_id = _get_target_id_flat_from_norm_inputs(norm_inputs)
     one_Pnn = int(target_future_valid.shape[1])  # (1+)Pnn
-    # agent_batch: (N,) = (B * (1+)Pnn)
+
     agent_batch = _build_agent_batch_tensor(
         batch_size=batch_size,
         one_Pnn=one_Pnn,
         device=pred_traj.device,
     )
 
-    # pred_z: (N, R, future_len)
-    # (N,) = (B * (1+)Pnn)
     pred_z = _expand_target_z_to_rollout_grid(
         norm_inputs=norm_inputs,
         n_rollout=int(pred_traj.shape[1]),
@@ -2863,91 +2949,81 @@ def validate_func(
 
     device = pred_traj.device
 
-    # 1) 패딩 agent 제거 마스크 생성
-    # wosac_agent_valid_mask: (N,) = (B*(1+)Pnn,)
+    # 7) WOSAC용 padding agent 제거 + 필터링
     wosac_agent_valid_mask = _build_valid_agent_mask_for_wosac(
-        agent_id=target_id,  # (N,)
-        target_future_valid=target_future_valid,  # (B, (1+)Pnn, T)
+        agent_id=target_id,
+        target_future_valid=target_future_valid,
     )
 
-    # 2) rollout 텐서들 일괄 필터링
     (
-        wosac_agent_id,  # (N2,)
-        wosac_agent_batch,  # (N2,)
-        wosac_pred_traj,  # (N2, R, T, 2)
-        wosac_pred_z,  # (N2, R, T)
-        wosac_pred_head,  # (N2, R, T)
+        wosac_agent_id,      # shape: (N2,)
+        wosac_agent_batch,   # shape: (N2,)
+        wosac_pred_traj,     # shape: (N2, R, T, 2)
+        wosac_pred_z,        # shape: (N2, R, T)
+        wosac_pred_head,     # shape: (N2, R, T)
     ) = _filter_rollout_tensors_by_agent_mask(
-        agent_id=target_id,  # (N,)
-        agent_batch=agent_batch,  # (N,)
-        pred_traj=pred_traj,  # (N, R, T, 2)
-        pred_z=pred_z,  # (N, R, T)
-        pred_head=pred_head,  # (N, R, T)
-        agent_valid_mask=wosac_agent_valid_mask,  # (N,)
+        agent_id=target_id,
+        agent_batch=agent_batch,
+        pred_traj=pred_traj,
+        pred_z=pred_z,
+        pred_head=pred_head,
+        agent_valid_mask=wosac_agent_valid_mask,
     )
+
+    # ✅ (최적화) scenario_rollouts를 "한 번만" 만들기
+    # - world_size==1이면 submission/metrics 모두 같은 scenario_rollouts를 그대로 재사용 가능
+    need_scenario_rollouts: bool = bool(
+        getattr(wosac_submission, "is_active", False) or getattr(wosac_metrics, "is_active", False)
+    )
+    scenario_rollouts: Optional[List[sim_agents_submission_pb2.ScenarioRollouts]] = None
+    if need_scenario_rollouts:
+        scenario_rollouts = get_scenario_rollouts(
+            scenario_id=get_scenario_id_int_tensor(scenario_id, device),
+            agent_id=wosac_agent_id,
+            agent_batch=wosac_agent_batch,
+            pred_traj=wosac_pred_traj,
+            pred_z=wosac_pred_z,
+            pred_head=wosac_pred_head,
+        )
+
+    # 7-1) submission 업데이트
     if wosac_submission.is_active:
         wosac_submission.update(
             scenario_id=scenario_id,
-            agent_id=wosac_agent_id,  # (N2,)
-            agent_batch=wosac_agent_batch,  # (N2,)
-            pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
-            pred_z=wosac_pred_z,  # (N2, R, T)
-            pred_head=wosac_pred_head,  # (N2, R, T)
+            agent_id=wosac_agent_id,
+            agent_batch=wosac_agent_batch,
+            pred_traj=wosac_pred_traj,
+            pred_z=wosac_pred_z,
+            pred_head=wosac_pred_head,
             global_rank=int(ddp_rank),
         )
-        """ _gpu_dict_sync
 
-(A) 한 GPU / 동기화가 안 걸린 경우: 각 값이 List[Tensor]
-(B) 여러 GPU에서 결과를 한 번에 모으는 경우: 각 값이 “합쳐진” Tensor
-
-        # compute: 여러 GPU가 서로 데이터를 주고받아 “합쳐진 결과”를 만들려고 한다
-        “각 GPU의 리스트”를 합쳐서 큰 텐서(한 덩어리 데이터) 로 만들어줌"
-
-        싱글 GPU(1개) 일 때는 “서로 모을 상대가 없어서” compute()가 굳이 모으는 과정을 못 하고,
-        그냥 update()로 쌓아둔 그대로인 [텐서] 형태(리스트 안에 1개) 가 남을 수 있습니다.
-        """
-        _gpu_dict_sync = wosac_submission.compute()
         if int(ddp_rank) == 0:
-            "**0번 프로세스(대표)**만 파일/제출용 결과를 만들도록 제한합니다."
-            for k in _gpu_dict_sync.keys():  # single gpu fix
-                if type(_gpu_dict_sync[k]) is list:
-                    _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
-            """
-            scenario_id [B_total, 16]
-            agent_id [n_ag_total]
-            agent_batch [n_ag_total]
-            pred_traj [n_ag_total, n_rollout, n_step, 2]
-            pred_z [n_ag_total, n_rollout, n_step]
-            pred_head [n_ag_total, n_rollout, n_step]
+            world_size_now: int = int(ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
 
-            scenario_rollouts : List[sim_agents_submission_pb2.ScenarioRollouts]
-                - length: B_total
-            """
-            scenario_rollouts = get_scenario_rollouts(**_gpu_dict_sync)
-            wosac_submission.aggregate_rollouts(scenario_rollouts)
-        """ reset()
-        Metric에 add_state로 등록한 것만 초기화해요
-        그래서 buffer_scenario_rollouts, submission_scenario_id 같은 
-        “파일로 저장하려고 모아두는 버퍼”는 reset으로 안 지워지고 유지됩니다.
-        """
+            # ✅ single GPU(=world_size==1)면, 위에서 만든 scenario_rollouts를 그대로 재사용
+            if int(world_size_now) <= 1:
+                if scenario_rollouts is not None:
+                    wosac_submission.aggregate_rollouts(scenario_rollouts)
+
+            # ✅ multi GPU면 기존 방식 유지(여러 rank 결과를 합친 뒤 rollouts 생성)
+            else:
+                _gpu_dict_sync = wosac_submission.compute()
+                for k in _gpu_dict_sync.keys():
+                    if type(_gpu_dict_sync[k]) is list:
+                        _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
+                scenario_rollouts_all = get_scenario_rollouts(**_gpu_dict_sync)
+                wosac_submission.aggregate_rollouts(scenario_rollouts_all)
+
         wosac_submission.reset()
 
-    # scenario_id : List[str] 길이 B
-    # [n_scenario, n_str_length]
-    # 3) scenario_rollouts 생성 후 metric 업데이트
-    # scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts] # 길이: B (유효 시나리오 수)
-    scenario_rollouts = get_scenario_rollouts(
-        scenario_id=get_scenario_id_int_tensor(scenario_id, device),
-        agent_id=wosac_agent_id,  # (N2,)
-        agent_batch=wosac_agent_batch,  # (N2,)
-        pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
-        pred_z=wosac_pred_z,  # (N2, R, T)
-        pred_head=wosac_pred_head,  # (N2, R, T)
-    )
+    # 7-2) metrics 업데이트
     if wosac_metrics.is_active:
+        if scenario_rollouts is None:
+            raise RuntimeError("wosac_metrics가 active인데 scenario_rollouts가 생성되지 않았습니다.")
         wosac_metrics.update(tfrecord_path, scenario_rollouts)
 
-    # 8) minADE 업데이트를 위해 eval_object_ids 준비 (배치마다)
+    # 8) minADE 업데이트
     if min_ade.is_active:
         eval_object_ids: Optional[torch.Tensor] = None
         if bool(min_ade.only_eval_targets_to_predict):
@@ -2955,7 +3031,7 @@ def validate_func(
             eval_object_ids = _build_padded_eval_object_ids_tensor_for_batch(
                 tfrecord_path=tfrecord_path,
                 scenario_id=scenario_id,
-                challenge_type=challenge_type,  # ✅ int(...) 제거
+                challenge_type=challenge_type,
                 device=pred_traj.device,
                 pad_value=0,
             )
@@ -2965,8 +3041,8 @@ def validate_func(
             norm_inputs=norm_inputs,
             pred_traj=pred_traj,
             agent_batch=agent_batch,
-            target_id=target_id,  # (N,)
-            eval_object_ids=eval_object_ids,  # (B, K) or None
+            target_id=target_id,
+            eval_object_ids=eval_object_ids,
             min_ade=min_ade,
         )
 

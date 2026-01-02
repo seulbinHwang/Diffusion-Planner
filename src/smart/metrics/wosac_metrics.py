@@ -166,7 +166,7 @@ def _get_wosac_tf_num_threads() -> int:
     if t <= 0:
         t = _read_int_env("OMP_NUM_THREADS", 0)
     if t <= 0:
-        t = 5
+        t = 2
 
     return int(max(1, t))
 
