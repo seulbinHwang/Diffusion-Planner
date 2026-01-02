@@ -259,6 +259,7 @@ def _reserve_visualization_budget_if_needed(args: Any) -> bool:
     global _VIS_BUDGET_REACHED_LOCAL
 
     limit = _get_total_save_image_trial_num(args)
+    print("limit:", limit)
     if int(limit) < 0:
         return True
 
@@ -273,6 +274,7 @@ def _reserve_visualization_budget_if_needed(args: Any) -> bool:
 
     try:
         ok = _try_reserve_visualization_slot(counter_path=counter_path, limit=int(limit))
+        print("ok:", ok)
     except Exception:
         ok = False
 
@@ -1267,7 +1269,9 @@ def _predict_rollouts_batched_one_chunk(
     state_normalizer: Any,
     observation_normalizer: ObservationNormalizer,
     rollout_repeat: int,
-    rng_seed: int,
+    rollout_start_idx: int,
+    base_seed: int,
+    ddp_rank: int,
     batch_size: int,
     one_or_pnn: int,
     save_image: bool,
@@ -1276,40 +1280,12 @@ def _predict_rollouts_batched_one_chunk(
 ) -> torch.Tensor:
     """rollout을 batch로 펼쳐서(=B*R) 한 번에 autoregressive rollout을 생성합니다.
 
-    이 함수가 하는 일
-    ----------------
-    - rollout_repeat 개 만큼 입력을 복제해서 batch를 (B*R)로 키웁니다.
-    - future_len 스텝 동안:
-        1) 모델 forward 1번으로 (B*R)개 샘플의 다음 스텝 예측을 동시에 얻고,
-        2) 그 다음 스텝을 입력 past에 반영(업데이트)하고,
-        3) world 좌표로 바꿔서 결과를 저장합니다.
-
-    반환 텐서 shape
-    --------------
-    - 반환: (B, (1+)Pnn, rollout_repeat, future_len, 4)
-      마지막 4는 (x, y, cos, sin)
-
-    Args:
-        args (Any):
-            - args.future_len (int)
-            - args.device (str)
-        model (nn.Module):
-            eval 상태의 inference 모델.
-        norm_inputs (Dict[str, Any]):
-            원래 배치 입력.
-            주요 텐서 예:
-              - ego_agent_past: (B, T_past, 11)
-              - near_agents_past: (B, Pnn, T_past, 11)
-              - origin_world_pose: (B, 4)
-              - target_future_valid: (B, 1+Pnn, future_len)
-        state_normalizer (Any):
-            state_normalizer.inverse(...)를 사용할 수 있어야 합니다.
-            - 입력: (B*R, 1+Pnn, 4)
-            - 출력: (B*R, 1+Pnn, 4)
-        rollout_repeat (int):
-            이번 chunk에서 동시에 만들 rollout 개수 R.
-        rng_seed (int):
-            이 chunk의 랜덤 seed.
+    변경점(중요)
+    -----------
+    - Decoder가 내부에서 noise를 뽑지 않도록 바꾸고,
+      여기서 step_idx / rollout_idx 기반으로 noise를 만들어 inputs에 넣습니다.
+    - 이렇게 하면 rollout_chunk_size가 바뀌어도(예: OOM fallback),
+      같은 rollout 인덱스의 결과가 유지됩니다.
 
     Returns:
         torch.Tensor:
@@ -1319,6 +1295,7 @@ def _predict_rollouts_batched_one_chunk(
     ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]
     norm_ego_future_gt_4_dim = state_normalizer(ego_future_gt_4_dim)
     norm_inputs["ego_future_gt_4_dim"] = norm_ego_future_gt_4_dim
+
     # (B, Pnn, future_len, 4)
     near_future_gt_4_dim = outputs["near_future_gt_4_dim"]
     norm_near_future_gt_4_dim = state_normalizer(near_future_gt_4_dim)
@@ -1330,7 +1307,6 @@ def _predict_rollouts_batched_one_chunk(
     save_image_requested: bool = bool(save_image)
     save_video_requested: bool = bool(save_video)
 
-    # 비디오를 만들려면(프레임이 필요하므로) 이미지 저장도 같이 켭니다.
     want_any_visual: bool = bool(save_image_requested or save_video_requested)
     if want_any_visual:
         allowed = _reserve_visualization_budget_if_needed(args)
@@ -1338,23 +1314,12 @@ def _predict_rollouts_batched_one_chunk(
             save_image = False
             save_video = False
         else:
-            # video=True면 frame이 필요하므로 save_image도 True로 맞춤
             save_image = bool(save_image_requested or save_video_requested)
             save_video = bool(save_video_requested)
 
     if save_image:
-        """
-        draw_scenario_id : str
-        draw_near_target_id : torch.Tensor # (Pnn,)
-        save_dir: str
-        norm_inputs
-            ego_future_gt_4_dim: torch.Tensor # (B, future_len, 4)
-            near_future_gt_4_dim: torch.Tensor # (B< Pnn, future_len, 4)
-        """
         (draw_scenario_id, draw_near_target_id,
          save_dir) = _prepare_data_for_draw(args, norm_inputs, draw_batch_idx)
-
-    device = torch.device(getattr(args, "device", "cuda"))
 
     future_len: int = int(getattr(args, "future_len"))
     rollout_repeat = int(rollout_repeat)
@@ -1366,98 +1331,108 @@ def _predict_rollouts_batched_one_chunk(
         batch_size=batch_size,
         rollout_repeat=rollout_repeat,
     )
+
     # unnorm_origin_pose_world: (B*R, 4)
     unnorm_origin_pose_world = norm_inputs_copy.get("origin_world_pose", None)
 
     # 출력 미리 할당: (B*R, (1+)Pnn, future_len, 4)
-    # dtype은 입력 기반으로 맞춥니다.
     target_joint_scene_world = torch.empty(
         (merged_batch, one_or_pnn, future_len, 4),
         device=unnorm_origin_pose_world.device,
         dtype=unnorm_origin_pose_world.dtype,
     )
 
-    rng_devices = _get_cuda_rng_devices_for_fork_rng(device)
+    with torch.inference_mode():
+        for step_idx in range(future_len):
+            # ✅ (핵심) step_idx + rollout_idx 기반으로 noise를 외부에서 생성해 주입
+            # inference_noise: (B*R, (1+)Pnn, future_len, 4)
+            inference_noise = _build_inference_noise_for_rollout_chunk(
+                reference_tensor=norm_inputs_copy["ego_agent_past"],  # device/dtype 기준
+                batch_size=int(batch_size),
+                one_or_pnn=int(one_or_pnn),
+                future_len=int(future_len),
+                rollout_start_idx=int(rollout_start_idx),
+                rollout_repeat=int(rollout_repeat),
+                base_seed=int(base_seed),
+                ddp_rank=int(ddp_rank),
+                step_idx=int(step_idx),
+                noise_std=0.5,
+            )
+            norm_inputs_copy["inference_noise"] = inference_noise
 
-    with torch.random.fork_rng(devices=rng_devices, enabled=True):
-        torch.manual_seed(int(rng_seed))
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.manual_seed_all(int(rng_seed))
+            decoder_output = _forward_model_for_validation(
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs_copy,
+            )
 
-        with torch.inference_mode():
-            for step_idx in range(future_len):
-                decoder_output = _forward_model_for_validation(
-                    args=args,
-                    model=model,
-                    norm_inputs=norm_inputs_copy,
+            normed_trajectories = decoder_output.get("integrated_trajectory", None)
+            if normed_trajectories is None:
+                raise KeyError(
+                    "decoder_output에서 'integrated_trajectory'를 찾을 수 없습니다. "
+                    "현재 validate_func는 integrated_trajectory를 사용하도록 구현되어 있습니다."
                 )
-                # integrated_trajectory: (B*R, (1+)Pnn, 1+T, 4)
-                normed_trajectories = decoder_output.get(
-                    "integrated_trajectory", None)
-                if normed_trajectories is None:
-                    raise KeyError(
-                        "decoder_output에서 'integrated_trajectory'를 찾을 수 없습니다. "
-                        "현재 validate_func는 integrated_trajectory를 사용하도록 구현되어 있습니다."
-                    )
-                # (B*R, (1+)Pnn, 4)
-                if save_image:
-                    _draw_one_batch_one_rollout(
-                        save_dir=save_dir,
-                        norm_inputs_copy=norm_inputs_copy,
-                        normed_trajectories=normed_trajectories,
-                        state_normalizer=state_normalizer,
-                        observation_normalizer=observation_normalizer,
-                        draw_batch_idx=draw_batch_idx,
-                        step_idx=step_idx,
-                        draw_near_target_id=draw_near_target_id,
-                    )
-                # normed_trajectories : (B*R, (1+)Pnn, 1+T, 4)
-                # ego: (B*R, 4)
-                normed_ego_next_pose = normed_trajectories[:, 0, 1, :]
-                # near: (B*R, Pnn, 4)
-                normed_near_next_pose = normed_trajectories[:, 1:, 1, :]
-                # normed_target_next_pose: (B*R, (1+)Pnn, 4)
-                normed_target_next_pose = torch.cat(
-                    [normed_ego_next_pose[:, None, :], normed_near_next_pose],
-                    dim=1,
-                )
-                # 입력 업데이트(autoregressive)
-                norm_inputs_copy = _update_merged_inputs(
-                    norm_inputs_copy=norm_inputs_copy,
-                    normed_ego_next_pose=normed_ego_next_pose,  # (B*R, 4)
-                    normed_near_next_pose=normed_near_next_pose,
-                    # (B*R, Pnn, 4)
+
+            if save_image:
+                # ✅ draw 경로에서는 inference_noise 같은 큰 텐서를 넘기지 않게 key 제거
+                norm_inputs_for_draw = norm_inputs_copy
+                if "inference_noise" in norm_inputs_for_draw:
+                    norm_inputs_for_draw = dict(norm_inputs_copy)  # 얕은 복사
+                    norm_inputs_for_draw.pop("inference_noise", None)
+
+                _draw_one_batch_one_rollout(
+                    save_dir=save_dir,
+                    norm_inputs_copy=norm_inputs_for_draw,
+                    normed_trajectories=normed_trajectories,
                     state_normalizer=state_normalizer,
                     observation_normalizer=observation_normalizer,
-                )
-                # 역정규화: (B*R, (1+)Pnn, 4)
-                unnorm_target_next_pose = state_normalizer.inverse(
-                    normed_target_next_pose)
-
-                # world 변환을 위해 (B*R*(1+)Pnn, 4)로 펼침
-                # flat: (N, 4), N = (B*R)*(1+Pnn)
-                unnorm_target_next_pose_flat = unnorm_target_next_pose.reshape(
-                    -1, 4)
-
-                # unnorm_target_next_pose_flat_world: (N, 4), N = (B*R)*(1+Pnn)
-                unnorm_target_next_pose_flat_world = _covert_from_ego_to_world(
-                    target_poses=
-                    unnorm_target_next_pose_flat,  # (N, 4), N = (B*R)*(1+Pnn)
-                    origin_world_pose=unnorm_origin_pose_world,  # (B*R, 4)
+                    draw_batch_idx=draw_batch_idx,
+                    step_idx=step_idx,
+                    draw_near_target_id=draw_near_target_id,
                 )
 
-                # world: (B*R, (1+)Pnn, 4)
-                unnorm_target_next_pose_world = unnorm_target_next_pose_flat_world.reshape(
-                    merged_batch, one_or_pnn, 4)
+            # ego: (B*R, 4)
+            normed_ego_next_pose = normed_trajectories[:, 0, 1, :]
+            # near: (B*R, Pnn, 4)
+            normed_near_next_pose = normed_trajectories[:, 1:, 1, :]
 
-                # step 저장: target_joint_scene_world[:, :, step_idx, :] = (B*R, (1+)Pnn, 4)
-                target_joint_scene_world[:, :,
-                                         step_idx, :] = unnorm_target_next_pose_world
+            # normed_target_next_pose: (B*R, (1+)Pnn, 4)
+            normed_target_next_pose = torch.cat(
+                [normed_ego_next_pose[:, None, :], normed_near_next_pose],
+                dim=1,
+            )
 
-                # 다음 스텝을 위한 origin 갱신(ego 기준)
-                # unnorm_origin_pose_world: (B*R, 4)
-                unnorm_origin_pose_world = unnorm_target_next_pose_world[:,
-                                                                         0, :]
+            # 입력 업데이트(autoregressive)
+            norm_inputs_copy = _update_merged_inputs(
+                norm_inputs_copy=norm_inputs_copy,
+                normed_ego_next_pose=normed_ego_next_pose,
+                normed_near_next_pose=normed_near_next_pose,
+                state_normalizer=state_normalizer,
+                observation_normalizer=observation_normalizer,
+            )
+
+            # 역정규화: (B*R, (1+)Pnn, 4)
+            unnorm_target_next_pose = state_normalizer.inverse(normed_target_next_pose)
+
+            # (B*R*(1+)Pnn, 4)
+            unnorm_target_next_pose_flat = unnorm_target_next_pose.reshape(-1, 4)
+
+            # world 변환
+            unnorm_target_next_pose_flat_world = _covert_from_ego_to_world(
+                target_poses=unnorm_target_next_pose_flat,  # (N,4)
+                origin_world_pose=unnorm_origin_pose_world,  # (B*R,4)
+            )
+
+            # (B*R, (1+)Pnn, 4)
+            unnorm_target_next_pose_world = unnorm_target_next_pose_flat_world.reshape(
+                merged_batch, one_or_pnn, 4
+            )
+
+            # 저장
+            target_joint_scene_world[:, :, step_idx, :] = unnorm_target_next_pose_world
+
+            # 다음 스텝 origin 갱신(ego 기준)
+            unnorm_origin_pose_world = unnorm_target_next_pose_world[:, 0, :]
 
     # (B*R, (1+)Pnn, future_len, 4) -> (B, R, (1+)Pnn, future_len, 4)
     target_joint_scene_world = target_joint_scene_world.reshape(
@@ -1468,16 +1443,18 @@ def _predict_rollouts_batched_one_chunk(
         4,
     )
     # (B, (1+)Pnn, R, future_len, 4)
-    target_joint_scene_world = target_joint_scene_world.permute(0, 2, 1, 3,
-                                                                4).contiguous()
-    if save_video:
-        draw_machine.make_video_from_all_png(save_dir,
-                                             draw_scenario_id,
-                                             new_save_dir=args.save_path,
-                                             run_count= args.run_count,
+    target_joint_scene_world = target_joint_scene_world.permute(0, 2, 1, 3, 4).contiguous()
 
-                                             )
+    if save_video:
+        draw_machine.make_video_from_all_png(
+            save_dir,
+            draw_scenario_id,
+            new_save_dir=args.save_path,
+            run_count=args.run_count,
+        )
+
     return target_joint_scene_world
+
 
 
 def _get_ego_future_11(
@@ -1618,35 +1595,11 @@ def _predict_rollouts_batched(
 ) -> torch.Tensor:
     """전체 rollout_number개 rollout을 '배치로 묶어서' 빠르게 예측합니다.
 
-    처리 방식
-    --------
-    - 가능한 한 rollout을 크게 묶을수록(rollout_chunk_size가 클수록) forward 호출이 줄어 빨라집니다.
-    - 다만 GPU 메모리가 부족하면 한 번에 너무 크게 묶는 게 어려울 수 있어,
-      chunk로 나눠서 처리할 수 있게 구성했습니다.
-
-    반환 텐서 shape
-    --------------
-    - (B, (1+)Pnn, rollout_number, future_len, 4)
-
-    Args:
-        args (Any):
-            args.future_len, args.device 등을 사용합니다.
-        model (nn.Module):
-            inference 모델.
-        norm_inputs (Dict[str, Any]):
-            원래 배치 입력.
-        state_normalizer (Any):
-            inverse(...)를 제공해야 합니다.
-        rollout_number (int):
-            전체 rollout 개수(예: 32).
-        rollout_chunk_size (int):
-            한 번에 묶어서 돌릴 rollout 개수.
-            - 보통 32로 두면 가장 빠릅니다.
-            - 메모리 문제가 있으면 16/8로 줄이면 됩니다.
-        base_seed (int):
-            기본 seed.
-        ddp_rank (int):
-            분산 rank. (싱글 프로세스면 0)
+    변경점(중요)
+    -----------
+    - chunk마다 seed를 바꾸는 방식 대신,
+      rollout_idx(전역) + step_idx 기준으로 noise를 외부에서 만들어 넣습니다.
+    - 그래서 OOM fallback으로 chunk_size가 바뀌어도 결과가 유지됩니다.
 
     Returns:
         torch.Tensor:
@@ -1657,15 +1610,12 @@ def _predict_rollouts_batched(
     rollout_chunk_size = int(min(rollout_chunk_size, rollout_number))
 
     ego_agent_past = norm_inputs.get("ego_agent_past", None)
-
-    # target_future_valid: (B, (1+)Pnn, future_len)
     target_future_valid = norm_inputs.get("target_future_valid", None)
+
     batch_size: int = int(target_future_valid.shape[0])
     one_or_pnn: int = int(target_future_valid.shape[1])
-
     future_len: int = int(getattr(args, "future_len"))
 
-    # 출력 미리 할당: (B, (1+)Pnn, rollout_number, future_len, 4)
     out = torch.empty(
         (batch_size, one_or_pnn, rollout_number, future_len, 4),
         device=ego_agent_past.device,
@@ -1677,14 +1627,6 @@ def _predict_rollouts_batched(
     while start < rollout_number:
         cur = int(min(rollout_chunk_size, rollout_number - start))
 
-        # chunk마다 seed를 바꿔서 결과가 서로 다르게 나오도록 합니다.
-        # (원래 코드의 rollout_seed 규칙을 일부 재사용)
-        chunk_seed = _make_rollout_seed(
-            base_seed=int(base_seed),
-            ddp_rank=int(ddp_rank),
-            rollout_idx=int(start),
-        )
-
         chunk_pred = _predict_rollouts_batched_one_chunk(
             args=args,
             model=model,
@@ -1692,8 +1634,10 @@ def _predict_rollouts_batched(
             outputs=outputs,
             state_normalizer=state_normalizer,
             observation_normalizer=observation_normalizer,
-            rollout_repeat=cur,
-            rng_seed=int(chunk_seed),
+            rollout_repeat=int(cur),
+            rollout_start_idx=int(start),
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
             batch_size=batch_size,
             one_or_pnn=one_or_pnn,
             save_image=args.save_image and trial == 0,
@@ -1703,7 +1647,144 @@ def _predict_rollouts_batched(
         out[:, :, start:start + cur, :, :] = chunk_pred
         start += cur
         trial += 1
+
     return out
+
+from typing import Optional
+import torch
+
+
+def _make_rollout_step_seed(
+    base_seed: int,
+    ddp_rank: int,
+    rollout_idx: int,
+    step_idx: int,
+) -> int:
+    """rollout 인덱스 + step 인덱스까지 반영한 seed를 만듭니다.
+
+    Args:
+        base_seed (int):
+            기본 seed 값. shape: ()
+        ddp_rank (int):
+            프로세스 rank. shape: ()
+        rollout_idx (int):
+            전역 rollout 인덱스(0부터). shape: ()
+        step_idx (int):
+            autoregressive step 인덱스(0부터). shape: ()
+
+    Returns:
+        int:
+            이 (rollout_idx, step_idx)에만 대응되는 seed 값. shape: ()
+    """
+    base = _make_rollout_seed(
+        base_seed=int(base_seed),
+        ddp_rank=int(ddp_rank),
+        rollout_idx=int(rollout_idx),
+    )
+    return int(base) + int(step_idx)
+
+
+def _build_inference_noise_for_rollout_chunk(
+    reference_tensor: torch.Tensor,
+    batch_size: int,
+    one_or_pnn: int,
+    future_len: int,
+    rollout_start_idx: int,
+    rollout_repeat: int,
+    base_seed: int,
+    ddp_rank: int,
+    step_idx: int,
+    noise_std: float = 0.5,
+) -> torch.Tensor:
+    """현재 chunk의 (B*R) 배치에 넣을 inference noise를 만듭니다.
+
+    이 함수의 목표는 “chunk_size가 바뀌어도” 같은 (rollout_idx, step_idx)에서는
+    항상 같은 noise가 나오도록 만드는 것입니다.
+
+    생성 규칙
+    --------
+    - 전역 rollout 인덱스 g = rollout_start_idx + r (r=0..R-1)
+    - seed = base_seed + rank + g (기존 규칙 유지) + step_idx
+    - 각 rollout(g)마다 (B, one_or_pnn, future_len, 4) noise를 만들고,
+      이를 (B, R, one_or_pnn, future_len, 4)에 채운 뒤,
+      최종적으로 (B*R, one_or_pnn, future_len, 4)로 펼쳐 반환합니다.
+
+    Args:
+        reference_tensor (torch.Tensor):
+            device/dtype 기준용 텐서.
+            shape: 아무거나 가능 (값은 사용 안 함)
+        batch_size (int):
+            원래 배치 크기 B. shape: ()
+        one_or_pnn (int):
+            (1+Pnn) 크기. shape: ()
+        future_len (int):
+            모델이 한 번에 예측하는 미래 길이. shape: ()
+        rollout_start_idx (int):
+            이번 chunk가 담당하는 전역 rollout 시작 인덱스. shape: ()
+        rollout_repeat (int):
+            이번 chunk의 rollout 개수 R. shape: ()
+        base_seed (int):
+            기본 seed 값. shape: ()
+        ddp_rank (int):
+            프로세스 rank. shape: ()
+        step_idx (int):
+            autoregressive step 인덱스. shape: ()
+        noise_std (float):
+            noise 표준편차. 기본 0.5. shape: ()
+
+    Returns:
+        torch.Tensor:
+            inference_noise 텐서.
+            shape: (B*R, one_or_pnn, future_len, 4)
+    """
+    if int(rollout_repeat) <= 0:
+        raise ValueError(f"rollout_repeat는 1 이상이어야 합니다. rollout_repeat={rollout_repeat}")
+    if int(batch_size) <= 0:
+        raise ValueError(f"batch_size는 1 이상이어야 합니다. batch_size={batch_size}")
+    if int(one_or_pnn) <= 0:
+        raise ValueError(f"one_or_pnn는 1 이상이어야 합니다. one_or_pnn={one_or_pnn}")
+    if int(future_len) <= 0:
+        raise ValueError(f"future_len은 1 이상이어야 합니다. future_len={future_len}")
+
+    device = reference_tensor.device
+    dtype = reference_tensor.dtype
+
+    # noise_stack: (B, R, one_or_pnn, future_len, 4)
+    noise_stack = torch.empty(
+        (int(batch_size), int(rollout_repeat), int(one_or_pnn), int(future_len), 4),
+        device=device,
+        dtype=dtype,
+    )
+
+    gen = torch.Generator(device=device)
+
+    for r in range(int(rollout_repeat)):
+        global_rollout_idx = int(rollout_start_idx) + int(r)
+        seed = _make_rollout_step_seed(
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
+            rollout_idx=int(global_rollout_idx),
+            step_idx=int(step_idx),
+        )
+        gen.manual_seed(int(seed))
+
+        # noise_r: (B, one_or_pnn, future_len, 4)
+        noise_r = torch.randn(
+            (int(batch_size), int(one_or_pnn), int(future_len), 4),
+            device=device,
+            dtype=dtype,
+            generator=gen,
+        ) * float(noise_std)
+
+        noise_stack[:, r, :, :, :] = noise_r
+
+    # (B, R, ...) -> (B*R, ...)
+    return noise_stack.reshape(
+        int(batch_size) * int(rollout_repeat),
+        int(one_or_pnn),
+        int(future_len),
+        4,
+    )
 
 
 def _make_rollout_seed(

@@ -32,7 +32,12 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 import torch
+from typing import Dict
 
+
+def _ensure_tensor_on_ref(noise: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """noise를 ref와 같은 device/dtype으로 맞춥니다."""
+    return noise.to(device=ref.device, dtype=ref.dtype)
 
 def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     """입력 마스크를 bool 텐서로 바꿉니다.
@@ -212,6 +217,55 @@ class Decoder(nn.Module):
 
         # self._guidance_fn = config.guidance_fn
         self._guidance_fn = getattr(config, 'guidance_fn', None)
+
+    def _get_inference_noise_from_inputs(
+            self,
+            inputs: Dict[str, torch.Tensor],
+            batch_size: int,
+            one_or_Pnn: int,
+            target_current_xyyaw: torch.Tensor,
+    ) -> torch.Tensor:
+        """추론 시작에 사용할 noise를 inputs에서 꺼냅니다.
+
+        규칙
+        ----
+        - Decoder는 더 이상 내부에서 noise를 만들지 않습니다.
+        - 반드시 inputs["inference_noise"]가 있어야 합니다.
+
+        Args:
+            inputs (Dict[str, torch.Tensor]):
+                모델 입력 dict.
+                - inference_noise: shape (B, (1+)Pnn, future_len, 4)
+            batch_size (int):
+                B. shape: ()
+            one_or_Pnn (int):
+                (1+Pnn). shape: ()
+            target_current_xyyaw (torch.Tensor):
+                dtype/device 기준 텐서.
+                shape: (B, (1+)Pnn, 4)
+
+        Returns:
+            torch.Tensor:
+                inference noise 텐서.
+                shape: (B, (1+)Pnn, future_len, 4)
+        """
+        noise = inputs.get("inference_noise", None)
+        if noise is None:
+            raise KeyError(
+                "Decoder 추론에는 inputs['inference_noise']가 필요합니다. "
+                "eval 코드에서 (rollout_idx 기준으로 만든 noise)를 넣어 주세요."
+            )
+        if not isinstance(noise, torch.Tensor):
+            raise TypeError("inputs['inference_noise']는 torch.Tensor여야 합니다.")
+
+        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), 4)
+        if tuple(noise.shape) != expected:
+            raise ValueError(
+                "inputs['inference_noise'] shape가 예상과 다릅니다. "
+                f"expected={expected}, got={tuple(noise.shape)}"
+            )
+
+        return _ensure_tensor_on_ref(noise, target_current_xyyaw)
 
     @property
     def sde(self):
@@ -1592,12 +1646,21 @@ class Decoder(nn.Module):
         B: int = batch_size
 
         # 1) 시작 노이즈 생성 (미래만)
-
-        noise: torch.Tensor = self._sample_inference_noise(
-            target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
-            batch_size=B,
-            one_or_Pnn=one_or_Pnn,
-        )  # (B,(1+)Pnn,T,4)
+        # ✅ (변경) 외부에서 만든 noise를 반드시 입력으로 받는다.
+        noise = inputs.get("inference_noise", None)
+        if noise is None:
+            noise: torch.Tensor = self._sample_inference_noise(
+                target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
+                batch_size=B,
+                one_or_Pnn=one_or_Pnn,
+            )  # (B,(1+)Pnn,T,4)
+        else:
+            noise: torch.Tensor = self._get_inference_noise_from_inputs(
+                inputs=inputs,
+                batch_size=int(B),
+                one_or_Pnn=int(one_or_Pnn),
+                target_current_xyyaw=target_current_xyyaw,
+            )  # (B,(1+)Pnn,T,4)
 
         # 2) xT(flat) 생성
         # (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)

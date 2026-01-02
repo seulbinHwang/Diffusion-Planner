@@ -193,7 +193,7 @@ def _sleep_until(target_monotonic: float) -> None:
 def _parse_args() -> argparse.Namespace:
     """입력값(몇 분마다 실행할지 등)을 읽는다."""
     parser = argparse.ArgumentParser(
-        description="validation_notebook.sh를 N분마다 1번씩 실행합니다(겹치면 건너뜀).")
+        description="validation_pnc.sh를 N분마다 1번씩 실행합니다(겹치면 건너뜀).")
     parser.add_argument(
         "--interval_min",
         type=int,
@@ -216,7 +216,7 @@ def _parse_args() -> argparse.Namespace:
         "--script_path",
         type=str,
         default="~/PycharmProjects/Diffusion-Planner/validation_notebook.sh",
-        help="실행할 validation_notebook.sh 경로",
+        help="실행할 validation_pnc.sh 경로",
     )
     return parser.parse_args()
 
@@ -228,7 +228,7 @@ def main() -> int:
         args.conda_path if args.conda_path.strip() != "" else None)
     """
     Path(...)
-        문자열로 된 경로(예: "~/.../validation_notebook.sh")를
+        문자열로 된 경로(예: "~/.../validation_pnc.sh")를
         **“경로 전용 객체”**로 바꿔줘요.
     .expanduser()
         경로에 ~가 있으면 그걸 내 홈 폴더 경로로 바꿔줘요.
