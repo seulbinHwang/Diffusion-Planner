@@ -83,9 +83,22 @@ PY
   unset _DP_VALIDATION_JSON
 }
 
+# ----------------------------
+# Validation "지금 어디쯤" 상태 출력 주기(초)
+# - 0 또는 음수면 출력 안 함
+# ----------------------------
+export DP_VALIDATION_HEARTBEAT_SEC="${DP_VALIDATION_HEARTBEAT_SEC:-60}"
+printf "[ENV] %-28s %s\n" "DP_VALIDATION_HEARTBEAT_SEC:" "${DP_VALIDATION_HEARTBEAT_SEC-<unset>}"
+
+# (선택) WOSAC 내부 진행 출력 주기(초) - 0 또는 음수면 출력 안 함
+export DP_WOSAC_PROGRESS_SEC="${DP_WOSAC_PROGRESS_SEC:-60}"
+printf "[ENV] %-28s %s\n" "DP_WOSAC_PROGRESS_SEC:" "${DP_WOSAC_PROGRESS_SEC-<unset>}"
+
+
 ensure_eval_set_list_json "$EVAL_SET_PATH" "$EVAL_SET_LIST_PATH" "$RUN_PYTHON_PATH"
 
 ###################################
+export PYTHONWARNINGS="ignore::FutureWarning:timm"
 export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1

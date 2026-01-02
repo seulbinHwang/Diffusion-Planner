@@ -16,6 +16,7 @@ from tools.predictor_utils import (
     maybe_resume_from_checkpoint,
     setup_logger_and_purge,
 )
+import threading
 import numpy as np
 import draw_machine
 import args_util
@@ -49,6 +50,198 @@ import os
 from typing import Optional
 import argparse
 import torch
+
+_VALIDATION_HEARTBEAT: Optional["_ValidationHeartbeat"] = None
+
+
+def _read_float_env_safe(env_key: str, default: float) -> float:
+    """환경변수에서 실수 값을 안전하게 읽습니다.
+
+    - 값이 없거나 숫자로 바꿀 수 없으면 default를 사용합니다.
+
+    Args:
+        env_key (str): 읽을 환경변수 이름. shape: ()
+        default (float): 기본값. shape: ()
+
+    Returns:
+        float: 읽어온 값(실패 시 default). shape: ()
+    """
+    raw = os.environ.get(env_key, "")
+    if str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return float(default)
+
+
+def _get_validation_heartbeat_interval_sec(default_sec: float = 60.0) -> float:
+    """검증 중 상태 문장을 몇 초마다 찍을지 결정합니다.
+
+    - DP_VALIDATION_HEARTBEAT_SEC 값을 사용합니다.
+    - 0 이하이면 상태 출력 기능을 끕니다.
+
+    Args:
+        default_sec (float): 기본 주기(초). shape: ()
+
+    Returns:
+        float: 출력 주기(초). 0 이하이면 비활성. shape: ()
+    """
+    v = float(_read_float_env_safe("DP_VALIDATION_HEARTBEAT_SEC", default_sec))
+    return float(v)
+
+
+def _set_validation_batch_progress_in_args(
+    args: argparse.Namespace,
+    batch_idx: int,
+    total_batch_steps: int,
+) -> None:
+    """현재 배치 번호를 args에 기록해, 다른 함수에서도 쉽게 표시할 수 있게 합니다.
+
+    Args:
+        args (argparse.Namespace): 설정 객체. shape: ()
+        batch_idx (int): 현재 배치 번호(1부터). shape: ()
+        total_batch_steps (int): 전체 배치 수. shape: ()
+
+    Returns:
+        None
+    """
+    try:
+        setattr(args, "_dp_val_batch_idx", int(batch_idx))
+        setattr(args, "_dp_val_total_batch_steps", int(total_batch_steps))
+    except Exception:
+        return
+
+
+def _get_validation_batch_progress_tag(args: Any) -> str:
+    """args에 저장된 배치 정보를 사람이 보기 쉬운 문자열로 만듭니다.
+
+    Returns:
+        str: 예) "batch 3/173" 또는 정보가 없으면 "batch ?/?". shape: ()
+    """
+    b = getattr(args, "_dp_val_batch_idx", None)
+    t = getattr(args, "_dp_val_total_batch_steps", None)
+    try:
+        b_i = int(b)
+        t_i = int(t)
+        if b_i > 0 and t_i > 0:
+            return f"batch {b_i}/{t_i}"
+    except Exception:
+        pass
+    return "batch ?/?"
+
+
+class _ValidationHeartbeat:
+    """검증이 오래 걸릴 때도 “아직 실행 중”임을 주기적으로 보여줍니다.
+
+    동작
+    ----
+    - start() 이후 interval_sec마다 한 번,
+      마지막으로 update()로 설정된 stage(현재 단계) 문장을 출력합니다.
+    - stop()을 호출하면 출력이 멈춥니다.
+    """
+
+    def __init__(self, interval_sec: float) -> None:
+        self._interval_sec: float = float(interval_sec)
+        self._start_time_sec: float = float(time.perf_counter())
+        self._stage: str = "시작 준비중"
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        """상태 출력 루프를 시작합니다."""
+        self._thread.start()
+
+    def update(self, stage: str) -> None:
+        """현재 단계 문장을 바꿉니다.
+
+        Args:
+            stage (str): 사람이 읽을 단계 문장. shape: ()
+        """
+        with self._lock:
+            self._stage = str(stage)
+
+    def stop(self) -> None:
+        """상태 출력 루프를 멈춥니다."""
+        self._stop_event.set()
+
+    def _run(self) -> None:
+        while True:
+            if self._stop_event.wait(self._interval_sec):
+                return
+            with self._lock:
+                stage = self._stage
+            elapsed = time.perf_counter() - self._start_time_sec
+            print(f"[HEARTBEAT] {elapsed:.0f}s | {stage}", flush=True)
+
+
+def _start_validation_heartbeat_if_needed(args: argparse.Namespace) -> None:
+    """환경변수 설정이 켜져 있으면 heartbeat를 시작합니다.
+
+    - rank 0(로그를 찍는 프로세스)에서만 시작합니다.
+
+    Args:
+        args (argparse.Namespace): 설정 객체. shape: ()
+
+    Returns:
+        None
+    """
+    global _VALIDATION_HEARTBEAT
+
+    interval_sec = float(_get_validation_heartbeat_interval_sec())
+    if interval_sec <= 0.0:
+        return
+
+    if not _is_main_process_for_logging(args):
+        return
+
+    if _VALIDATION_HEARTBEAT is not None:
+        return
+
+    hb = _ValidationHeartbeat(interval_sec=interval_sec)
+    _VALIDATION_HEARTBEAT = hb
+    hb.start()
+
+
+def _update_validation_heartbeat_stage(args: argparse.Namespace, stage: str) -> None:
+    """heartbeat가 켜져 있으면 현재 단계 문장을 업데이트합니다.
+
+    Args:
+        args (argparse.Namespace): 설정 객체. shape: ()
+        stage (str): 단계 문장. shape: ()
+
+    Returns:
+        None
+    """
+    global _VALIDATION_HEARTBEAT
+    if _VALIDATION_HEARTBEAT is None:
+        return
+    if not _is_main_process_for_logging(args):
+        return
+    _VALIDATION_HEARTBEAT.update(stage)
+
+
+def _stop_validation_heartbeat_if_needed(args: argparse.Namespace) -> None:
+    """heartbeat가 켜져 있으면 종료합니다.
+
+    Args:
+        args (argparse.Namespace): 설정 객체. shape: ()
+
+    Returns:
+        None
+    """
+    global _VALIDATION_HEARTBEAT
+    if _VALIDATION_HEARTBEAT is None:
+        return
+    if not _is_main_process_for_logging(args):
+        return
+
+    try:
+        _VALIDATION_HEARTBEAT.stop()
+    finally:
+        _VALIDATION_HEARTBEAT = None
+
 
 def _get_world_size_from_env() -> int:
     """환경변수에서 world_size 값을 읽습니다.
@@ -486,84 +679,98 @@ def model_validation(
     """전체 학습 파이프라인을 실행하는 상위 함수."""
     torch.cuda.empty_cache()
 
-    # 2) seed 고정
-    set_seed(args.seed + global_rank)
+    _start_validation_heartbeat_if_needed(args)
+    _update_validation_heartbeat_stage(args, "검증 준비중")
 
-    # 3) augmentation, Dataset, Sampler
-    batch_size = args.batch_size
-    """
-    eval_set: DiffusionPlannerData
-    validation_sampler: DistributedSampler
-    """
-    eval_set, validation_sampler = build_dataset_and_sampler(
-        args,
-        args.eval_set,
-        args.eval_set_list,
-        args.eval_method,
-        world_size,
-        global_rank,
-    )
-    validation_loader = build_data_loader(
-        args,
-        eval_set,
-        validation_sampler,
-        batch_size,
-        world_size,
-    )
-    if args.ddp and not use_deepspeed:
-        torch.distributed.barrier()
+    try:
+        # 2) seed 고정
+        set_seed(args.seed + global_rank)
 
-    diffusion_planner, model_ema, base_model = create_diffusion_planner_and_ema(
-        args=args,
-        rank=rank,
-        use_deepspeed=use_deepspeed,
-    )
-    if use_deepspeed:
-        import deepspeed
-        ds_config = build_deepspeed_inference_config(args)
-        ds_engine = deepspeed.init_inference(model=diffusion_planner,
-                                             config=ds_config)
-        diffusion_planner = ds_engine.module  # 이후 diffusion_planner로 그대로 추론
+        _update_validation_heartbeat_stage(args, "데이터 로더 준비중")
 
-    # 6) 체크포인트 재개
-    (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
-     train_epochs, allow_val_change) = maybe_resume_from_checkpoint(
-         args=args,
-         diffusion_planner=diffusion_planner,
-         optimizer=None,
-         scheduler=None,
-         model_ema=model_ema,
-         global_rank=global_rank,
-         use_deepspeed=use_deepspeed,
-     )
-    args._global_update_step = 0
+        # 3) augmentation, Dataset, Sampler
+        batch_size = args.batch_size
+        eval_set, validation_sampler = build_dataset_and_sampler(
+            args,
+            args.eval_set,
+            args.eval_set_list,
+            args.eval_method,
+            world_size,
+            global_rank,
+        )
+        validation_loader = build_data_loader(
+            args,
+            eval_set,
+            validation_sampler,
+            batch_size,
+            world_size,
+        )
+        if args.ddp and not use_deepspeed:
+            torch.distributed.barrier()
 
-    min_ade = minADE(is_active=args.min_ade_is_active).to(
-        torch.device(args.device))
-    wosac_metrics = WOSACMetrics("val_closed", args.wosac_metric_is_active)
-    wosac_submission = WOSACSubmission(is_active=args.wosac_sub_is_active,
-                                       save_path=args.save_path,
-                                       eval_method=args.eval_method)
-    wandb_logger = setup_logger_and_purge(
-        args=args,
-        global_rank=global_rank,
-        wandb_id=None,
-        allow_val_change=allow_val_change,
-    )
+        _update_validation_heartbeat_stage(args, "모델 준비중")
 
-    run_validation_loop(
-        args=args,
-        diffusion_planner=diffusion_planner,
-        model_ema=model_ema,
-        validation_loader=validation_loader,
-        wosac_metrics=wosac_metrics,
-        wosac_submission=wosac_submission,
-        min_ade=min_ade,
-        wandb_logger=wandb_logger,
-        global_rank=global_rank,
-    )
+        diffusion_planner, model_ema, base_model = create_diffusion_planner_and_ema(
+            args=args,
+            rank=rank,
+            use_deepspeed=use_deepspeed,
+        )
+        if use_deepspeed:
+            import deepspeed
+            ds_config = build_deepspeed_inference_config(args)
+            ds_engine = deepspeed.init_inference(model=diffusion_planner,
+                                                 config=ds_config)
+            diffusion_planner = ds_engine.module  # 이후 diffusion_planner로 그대로 추론
 
-    _finalize_eval_cleanup(args, global_rank, wandb_logger)
+        _update_validation_heartbeat_stage(args, "체크포인트 불러오는 중")
+
+        # 6) 체크포인트 재개
+        (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
+         train_epochs, allow_val_change) = maybe_resume_from_checkpoint(
+             args=args,
+             diffusion_planner=diffusion_planner,
+             optimizer=None,
+             scheduler=None,
+             model_ema=model_ema,
+             global_rank=global_rank,
+             use_deepspeed=use_deepspeed,
+         )
+        args._global_update_step = 0
+
+        min_ade = minADE(is_active=args.min_ade_is_active).to(torch.device(args.device))
+        wosac_metrics = WOSACMetrics("val_closed", args.wosac_metric_is_active)
+        wosac_submission = WOSACSubmission(
+            is_active=args.wosac_sub_is_active,
+            save_path=args.save_path,
+            eval_method=args.eval_method,
+        )
+        wandb_logger = setup_logger_and_purge(
+            args=args,
+            global_rank=global_rank,
+            wandb_id=None,
+            allow_val_change=allow_val_change,
+        )
+
+        _update_validation_heartbeat_stage(args, "검증 루프 실행중")
+
+        run_validation_loop(
+            args=args,
+            diffusion_planner=diffusion_planner,
+            model_ema=model_ema,
+            validation_loader=validation_loader,
+            wosac_metrics=wosac_metrics,
+            wosac_submission=wosac_submission,
+            min_ade=min_ade,
+            wandb_logger=wandb_logger,
+            global_rank=global_rank,
+        )
+
+        _update_validation_heartbeat_stage(args, "마무리 정리중")
+        _finalize_eval_cleanup(args, global_rank, wandb_logger)
+
+    finally:
+        _stop_validation_heartbeat_if_needed(args)
+
 
 
 def _finalize_eval_cleanup(
@@ -1035,6 +1242,11 @@ def validation_epoch(
             disable=(not should_show_progress),
     ) as data_epoch:
         for batch_idx, batch in enumerate(data_epoch, start=1):
+            _set_validation_batch_progress_in_args(args, batch_idx, total_batch_steps)
+            _update_validation_heartbeat_stage(
+                args, f"{_get_validation_batch_progress_tag(args)} | 배치 읽는 중"
+            )
+
             inputs, outputs = _prepare_batch_for_device(
                 batch,
                 device=args.device,
@@ -1427,10 +1639,8 @@ def _predict_rollouts_batched_one_chunk(
 
     변경점(중요)
     -----------
-    - Decoder가 내부에서 noise를 뽑지 않도록 바꾸고,
-      여기서 step_idx / rollout_idx 기반으로 noise를 만들어 inputs에 넣습니다.
-    - 이렇게 하면 rollout_chunk_size가 바뀌어도(예: OOM fallback),
-      같은 rollout 인덱스의 결과가 유지됩니다.
+    - 저장 횟수 카운트(visualization budget)는 "그림을 실제로 그리기 직전"에만 올립니다.
+      그래서 OOM으로 실패한 시도(아직 파일을 못 만든 시도)는 카운트를 소비하지 않습니다.
 
     Returns:
         torch.Tensor:
@@ -1447,24 +1657,20 @@ def _predict_rollouts_batched_one_chunk(
     norm_inputs["near_future_gt_4_dim"] = norm_near_future_gt_4_dim
 
     # -----------------------------------------
-    # ✅ 전체 저장 횟수 제한 적용 (멀티 프로세스 합산)
+    # ✅ 저장 요청값은 보관만 하고,
+    #    카운트 증가는 "첫 그림 그리기 직전"에만 수행
     # -----------------------------------------
     save_image_requested: bool = bool(save_image)
     save_video_requested: bool = bool(save_video)
 
-    want_any_visual: bool = bool(save_image_requested or save_video_requested)
-    if want_any_visual:
-        allowed = _reserve_visualization_budget_if_needed(args)
-        if not allowed:
-            save_image = False
-            save_video = False
-        else:
-            save_image = bool(save_image_requested or save_video_requested)
-            save_video = bool(save_video_requested)
+    # 실제로 저장할지 여부는 나중에(첫 forward 성공 후) 결정
+    save_image = False
+    save_video = False
+    vis_slot_checked: bool = False  # 카운트/허용 확인을 딱 1번만 하게 하기 위한 플래그
 
-    if save_image:
-        (draw_scenario_id, draw_near_target_id,
-         save_dir) = _prepare_data_for_draw(args, norm_inputs, draw_batch_idx)
+    draw_scenario_id: str = ""
+    save_dir: str = ""
+    draw_near_target_id: Optional[torch.Tensor] = None  # shape: (Pnn,) 또는 None
 
     future_len: int = int(getattr(args, "future_len"))
     rollout_repeat = int(rollout_repeat)
@@ -1489,7 +1695,6 @@ def _predict_rollouts_batched_one_chunk(
 
     with torch.inference_mode():
         for step_idx in range(future_len):
-            # ✅ (핵심) step_idx + rollout_idx 기반으로 noise를 외부에서 생성해 주입
             # inference_noise: (B*R, (1+)Pnn, future_len, 4)
             inference_noise = _build_inference_noise_for_rollout_chunk(
                 reference_tensor=norm_inputs_copy["ego_agent_past"],  # device/dtype 기준
@@ -1518,8 +1723,32 @@ def _predict_rollouts_batched_one_chunk(
                     "현재 validate_func는 integrated_trajectory를 사용하도록 구현되어 있습니다."
                 )
 
+            # ---------------------------------------------------------
+            # ✅ 여기서 처음으로 '그림을 실제로 그릴 수 있는 상태'가 됐으므로,
+            #    이제서야 1회 카운트를 올릴지 판단합니다.
+            # ---------------------------------------------------------
+            if (not vis_slot_checked) and (save_image_requested or save_video_requested):
+                allowed = _reserve_visualization_budget_if_needed(args)
+                vis_slot_checked = True
+
+                if allowed:
+                    # 비디오를 만들려면 프레임이 필요하므로 이미지 저장도 켭니다.
+                    save_video = bool(save_video_requested)
+                    save_image = bool(save_image_requested or save_video_requested)
+
+                    if save_image:
+                        (draw_scenario_id, draw_near_target_id, save_dir) = _prepare_data_for_draw(
+                            args, norm_inputs, draw_batch_idx
+                        )
+                else:
+                    save_image = False
+                    save_video = False
+
             if save_image:
-                # ✅ draw 경로에서는 inference_noise 같은 큰 텐서를 넘기지 않게 key 제거
+                if draw_near_target_id is None:
+                    raise RuntimeError("save_image=True 인데 draw_near_target_id가 준비되지 않았습니다.")
+
+                # draw 경로에서는 inference_noise 같은 큰 텐서를 넘기지 않게 key 제거
                 norm_inputs_for_draw = norm_inputs_copy
                 if "inference_noise" in norm_inputs_for_draw:
                     norm_inputs_for_draw = dict(norm_inputs_copy)  # 얕은 복사
@@ -1591,6 +1820,8 @@ def _predict_rollouts_batched_one_chunk(
     target_joint_scene_world = target_joint_scene_world.permute(0, 2, 1, 3, 4).contiguous()
 
     if save_video:
+        if save_dir == "" or draw_scenario_id == "":
+            raise RuntimeError("save_video=True 인데 save_dir / draw_scenario_id가 준비되지 않았습니다.")
         draw_machine.make_video_from_all_png(
             save_dir,
             draw_scenario_id,
@@ -2881,11 +3112,15 @@ def validate_func(
     min_ade: minADE,
 ) -> None:
     """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다."""
-    # 1) inference에 쓸 모델 선택 + eval
+    tag = _get_validation_batch_progress_tag(args)
+
+    _update_validation_heartbeat_stage(args, f"{tag} | 모델 선택/준비 중")
+
     inference_model: nn.Module = _prepare_inference_model_for_validation(
         model=model, ema=ema)
 
-    # 2) 입력 텐서 값 정리 + target_future_valid 붙이기
+    _update_validation_heartbeat_stage(args, f"{tag} | 입력 정리 중")
+
     norm_inputs = _sanitize_norm_inputs_for_validation(norm_inputs)
     future_len: int = int(getattr(args, "future_len"))
     target_future_valid = build_target_future_tensors_and_masks_for_inference(
@@ -2895,12 +3130,13 @@ def validate_func(
     )
     norm_inputs["target_future_valid"] = target_future_valid
 
-    # 3) 배치 크기 및 rollout 설정
     batch_size = _get_batch_size_from_ego_agent_past(norm_inputs)
-    rollout_number, requested_rollout_chunk_size, base_seed, ddp_rank = _get_rollout_settings_for_validation(
-        args)
+    rollout_number, requested_rollout_chunk_size, base_seed, ddp_rank = _get_rollout_settings_for_validation(args)
 
-    # 4) rollout 예측 (world 좌표)
+    _update_validation_heartbeat_stage(
+        args, f"{tag} | rollout 예측 중 (rollout={rollout_number})"
+    )
+
     target_scenario_rollouts_world = _predict_rollouts_batched_with_oom_fallback(
         args=args,
         model=inference_model,
@@ -2914,11 +3150,11 @@ def validate_func(
         ddp_rank=int(ddp_rank),
     )
 
-    # 5) metric 입력 형태로 변환
+    _update_validation_heartbeat_stage(args, f"{tag} | rollout 후처리/변환 중")
+
     pred_traj, pred_head = _build_pred_traj_and_pred_head_from_world_rollouts(
         target_scenario_rollouts_world=target_scenario_rollouts_world)
 
-    # 6) WOSAC에 필요한 id / batch / z 준비
     scenario_id: List[str] = _get_string_list_from_norm_inputs(
         norm_inputs=norm_inputs,
         key="scenario_id",
@@ -2932,7 +3168,7 @@ def validate_func(
         )
 
     target_id = _get_target_id_flat_from_norm_inputs(norm_inputs)
-    one_Pnn = int(target_future_valid.shape[1])  # (1+)Pnn
+    one_Pnn = int(target_future_valid.shape[1])
 
     agent_batch = _build_agent_batch_tensor(
         batch_size=batch_size,
@@ -2949,18 +3185,17 @@ def validate_func(
 
     device = pred_traj.device
 
-    # 7) WOSAC용 padding agent 제거 + 필터링
     wosac_agent_valid_mask = _build_valid_agent_mask_for_wosac(
         agent_id=target_id,
         target_future_valid=target_future_valid,
     )
 
     (
-        wosac_agent_id,      # shape: (N2,)
-        wosac_agent_batch,   # shape: (N2,)
-        wosac_pred_traj,     # shape: (N2, R, T, 2)
-        wosac_pred_z,        # shape: (N2, R, T)
-        wosac_pred_head,     # shape: (N2, R, T)
+        wosac_agent_id,
+        wosac_agent_batch,
+        wosac_pred_traj,
+        wosac_pred_z,
+        wosac_pred_head,
     ) = _filter_rollout_tensors_by_agent_mask(
         agent_id=target_id,
         agent_batch=agent_batch,
@@ -2970,13 +3205,12 @@ def validate_func(
         agent_valid_mask=wosac_agent_valid_mask,
     )
 
-    # ✅ (최적화) scenario_rollouts를 "한 번만" 만들기
-    # - world_size==1이면 submission/metrics 모두 같은 scenario_rollouts를 그대로 재사용 가능
     need_scenario_rollouts: bool = bool(
         getattr(wosac_submission, "is_active", False) or getattr(wosac_metrics, "is_active", False)
     )
     scenario_rollouts: Optional[List[sim_agents_submission_pb2.ScenarioRollouts]] = None
     if need_scenario_rollouts:
+        _update_validation_heartbeat_stage(args, f"{tag} | WOSAC 입력 묶는 중")
         scenario_rollouts = get_scenario_rollouts(
             scenario_id=get_scenario_id_int_tensor(scenario_id, device),
             agent_id=wosac_agent_id,
@@ -2986,8 +3220,9 @@ def validate_func(
             pred_head=wosac_pred_head,
         )
 
-    # 7-1) submission 업데이트
     if wosac_submission.is_active:
+        _update_validation_heartbeat_stage(args, f"{tag} | 제출 파일용 데이터 모으는 중")
+
         wosac_submission.update(
             scenario_id=scenario_id,
             agent_id=wosac_agent_id,
@@ -3000,13 +3235,9 @@ def validate_func(
 
         if int(ddp_rank) == 0:
             world_size_now: int = int(ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
-
-            # ✅ single GPU(=world_size==1)면, 위에서 만든 scenario_rollouts를 그대로 재사용
             if int(world_size_now) <= 1:
                 if scenario_rollouts is not None:
                     wosac_submission.aggregate_rollouts(scenario_rollouts)
-
-            # ✅ multi GPU면 기존 방식 유지(여러 rank 결과를 합친 뒤 rollouts 생성)
             else:
                 _gpu_dict_sync = wosac_submission.compute()
                 for k in _gpu_dict_sync.keys():
@@ -3017,14 +3248,18 @@ def validate_func(
 
         wosac_submission.reset()
 
-    # 7-2) metrics 업데이트
     if wosac_metrics.is_active:
         if scenario_rollouts is None:
             raise RuntimeError("wosac_metrics가 active인데 scenario_rollouts가 생성되지 않았습니다.")
+
+        _update_validation_heartbeat_stage(
+            args, f"{tag} | WOSAC 점수 계산 중 (시나리오 {batch_size}개)"
+        )
         wosac_metrics.update(tfrecord_path, scenario_rollouts)
 
-    # 8) minADE 업데이트
     if min_ade.is_active:
+        _update_validation_heartbeat_stage(args, f"{tag} | minADE 계산 중")
+
         eval_object_ids: Optional[torch.Tensor] = None
         if bool(min_ade.only_eval_targets_to_predict):
             challenge_type = _get_sim_agents_challenge_type_from_args(args)
@@ -3045,6 +3280,9 @@ def validate_func(
             eval_object_ids=eval_object_ids,
             min_ade=min_ade,
         )
+
+    _update_validation_heartbeat_stage(args, f"{tag} | 배치 마무리 중")
+
 
 
 # _transform_origin에서 실제로 좌표를 바꾸는 키들(먼저 들어가는 키가 Tensor가 되도록 순서 고정)

@@ -34,6 +34,28 @@ from waymo_open_dataset.protos import scenario_pb2, sim_agents_submission_pb2
 import atexit
 import multiprocessing.pool as mp_pool
 from multiprocessing.pool import Pool as MpPool
+from typing import Any
+
+
+def _compute_scenario_metrics_star(
+    args: Tuple[Any, str, sim_agents_submission_pb2.ScenarioRollouts, bool],
+) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
+    """Pool에서 1개 시나리오 계산을 수행합니다.
+
+    Pool은 함수 입력을 1개 값으로 받는 경우가 많아서,
+    (config, file, rollout, ego_only) 4개를 튜플로 묶어 전달하고,
+    내부에서는 기존 함수를 그대로 호출합니다.
+
+    Args:
+        args (Tuple[Any, str, ScenarioRollouts, bool]):
+            (config, scenario_file, scenario_rollout, ego_only) 묶음. shape: ()
+
+    Returns:
+        Tuple[SimAgentMetrics, Dict[str, float]]:
+            - scenario_metrics: WOSAC 결과
+            - z_only_metrics: z만으로 계산한 추가 결과
+    """
+    return WOSACMetrics._compute_scenario_metrics(*args)
 
 
 def _read_int_env(env_key: str, default: int) -> int:
@@ -912,15 +934,12 @@ class WOSACMetrics(Metric):
             pass
 
     def update(
-        self,
-        scenario_files: List[str],
-        scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
+            self,
+            scenario_files: List[str],
+            scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
     ) -> None:
-
-        # ✅ 현재 배치 크기(= 처리할 시나리오 개수)
         batch_size_now: int = int(len(scenario_rollouts))
 
-        # ✅ Option A 규칙으로 worker 수(P) 계산
         tf_threads: int = int(
             getattr(self, "_tf_num_threads", _get_wosac_tf_num_threads()))
         recommended_p: int = _recommend_wosac_mp_processes(
@@ -928,73 +947,133 @@ class WOSACMetrics(Metric):
             tf_num_threads=tf_threads,
         )
 
-        # 필요하면 환경변수로 mp 자체를 끌 수 있게(안전장치)
-        disable_mp: bool = str(os.environ.get("DP_WOSAC_DISABLE_MP",
-                                              "0")).strip() == "1"
-
+        disable_mp: bool = str(
+            os.environ.get("DP_WOSAC_DISABLE_MP", "0")).strip() == "1"
         use_mp_pool: bool = (not disable_mp) and (recommended_p > 1)
+
+        progress_sec_raw = _read_float_env("DP_WOSAC_PROGRESS_SEC", 60.0)
+        progress_sec: float = float(progress_sec_raw)
+        progress_sec = float(progress_sec)  # 안전
+        if progress_sec <= 0.0:
+            progress_sec = 0.0
+
         print(f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
               f"tf_threads={tf_threads}, "
               f"recommended_p={recommended_p}, "
               f"use_mp_pool={use_mp_pool}, "
-              f"disable_mp={disable_mp} ")
-        # disable_mp가 켜졌으면, 이미 떠 있는 Pool도 정리(원하면)
+              f"disable_mp={disable_mp}", flush=True)
+
         if disable_mp:
             self.close_mp_pool()
 
+        total = int(batch_size_now)
+        start_t = time.perf_counter()
+        last_print_t = start_t
+
+        def _maybe_print(done: int, force: bool = False) -> None:
+            nonlocal last_print_t
+            if progress_sec <= 0.0:
+                return
+            now = time.perf_counter()
+            if force or (now - last_print_t) >= float(
+                    progress_sec) or done >= total:
+                elapsed = now - start_t
+                print(f"[WOSACMetrics] 진행중: {done}/{total} (경과 {elapsed:.0f}s)",
+                      flush=True)
+                last_print_t = now
+
+        _maybe_print(0, force=True)
+
         if use_mp_pool:
-            # ✅ 핵심 변경점:
-            # - Pool을 매 update마다 새로 만들지 않고,
-            # - self._mp_pool로 "재사용"합니다.
             pool = self._get_or_create_mp_pool(
                 min_processes=int(recommended_p),
                 tf_threads=int(tf_threads),
             )
 
-            pool_scenario_metrics = pool.starmap(
-                self._compute_scenario_metrics,
-                zip(
-                    itertools.repeat(self.wosac_config),
-                    scenario_files,
-                    scenario_rollouts,
-                    itertools.repeat(self.ego_only),
-                ),
+            args_iter = zip(
+                itertools.repeat(self.wosac_config),
+                scenario_files,
+                scenario_rollouts,
+                itertools.repeat(self.ego_only),
             )
+
+            done = 0
+            for scenario_metrics, z_only in pool.imap_unordered(
+                    _compute_scenario_metrics_star,
+                    args_iter,
+                    chunksize=1,
+            ):
+                done += 1
+                _maybe_print(done, force=False)
+
+                self.scenario_counter += 1
+                self.metametric += scenario_metrics.metametric
+                self.average_displacement_error += scenario_metrics.average_displacement_error
+                self.linear_speed_likelihood += scenario_metrics.linear_speed_likelihood
+                self.linear_acceleration_likelihood += scenario_metrics.linear_acceleration_likelihood
+                self.angular_speed_likelihood += scenario_metrics.angular_speed_likelihood
+                self.angular_acceleration_likelihood += scenario_metrics.angular_acceleration_likelihood
+                self.distance_to_nearest_object_likelihood += scenario_metrics.distance_to_nearest_object_likelihood
+                self.collision_indication_likelihood += scenario_metrics.collision_indication_likelihood
+                self.time_to_collision_likelihood += scenario_metrics.time_to_collision_likelihood
+                self.distance_to_road_edge_likelihood += scenario_metrics.distance_to_road_edge_likelihood
+                self.offroad_indication_likelihood += scenario_metrics.offroad_indication_likelihood
+                self.min_average_displacement_error += scenario_metrics.min_average_displacement_error
+                self.simulated_collision_rate += scenario_metrics.simulated_collision_rate
+                self.simulated_offroad_rate += scenario_metrics.simulated_offroad_rate
+                self.traffic_light_violation_likelihood += scenario_metrics.traffic_light_violation_likelihood
+                self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
+
+                self.z_only_average_displacement_error += tensor(
+                    float(z_only.get("average_displacement_error_z_only", 0.0))
+                )
+                self.z_only_min_average_displacement_error += tensor(
+                    float(z_only.get("min_average_displacement_error_z_only",
+                                     0.0))
+                )
+
+            _maybe_print(done, force=True)
+
         else:
-            pool_scenario_metrics = []
-            for _scenario, _scenario_rollout in zip(scenario_files,
-                                                    scenario_rollouts):
-                pool_scenario_metrics.append(
-                    self._compute_scenario_metrics(
-                        self.wosac_config,
-                        _scenario,
-                        _scenario_rollout,
-                        self.ego_only,
-                    ))
+            done = 0
+            for _scenario_file, _scenario_rollout in zip(scenario_files,
+                                                         scenario_rollouts):
+                scenario_metrics, z_only = self._compute_scenario_metrics(
+                    self.wosac_config,
+                    _scenario_file,
+                    _scenario_rollout,
+                    self.ego_only,
+                )
+                done += 1
+                _maybe_print(done, force=False)
 
-        for scenario_metrics, z_only in pool_scenario_metrics:
-            self.scenario_counter += 1
-            self.metametric += scenario_metrics.metametric
-            self.average_displacement_error += scenario_metrics.average_displacement_error
-            self.linear_speed_likelihood += scenario_metrics.linear_speed_likelihood
-            self.linear_acceleration_likelihood += scenario_metrics.linear_acceleration_likelihood
-            self.angular_speed_likelihood += scenario_metrics.angular_speed_likelihood
-            self.angular_acceleration_likelihood += scenario_metrics.angular_acceleration_likelihood
-            self.distance_to_nearest_object_likelihood += scenario_metrics.distance_to_nearest_object_likelihood
-            self.collision_indication_likelihood += scenario_metrics.collision_indication_likelihood
-            self.time_to_collision_likelihood += scenario_metrics.time_to_collision_likelihood
-            self.distance_to_road_edge_likelihood += scenario_metrics.distance_to_road_edge_likelihood
-            self.offroad_indication_likelihood += scenario_metrics.offroad_indication_likelihood
-            self.min_average_displacement_error += scenario_metrics.min_average_displacement_error
-            self.simulated_collision_rate += scenario_metrics.simulated_collision_rate
-            self.simulated_offroad_rate += scenario_metrics.simulated_offroad_rate
-            self.traffic_light_violation_likelihood += scenario_metrics.traffic_light_violation_likelihood
-            self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
+                self.scenario_counter += 1
+                self.metametric += scenario_metrics.metametric
+                self.average_displacement_error += scenario_metrics.average_displacement_error
+                self.linear_speed_likelihood += scenario_metrics.linear_speed_likelihood
+                self.linear_acceleration_likelihood += scenario_metrics.linear_acceleration_likelihood
+                self.angular_speed_likelihood += scenario_metrics.angular_speed_likelihood
+                self.angular_acceleration_likelihood += scenario_metrics.angular_acceleration_likelihood
+                self.distance_to_nearest_object_likelihood += scenario_metrics.distance_to_nearest_object_likelihood
+                self.collision_indication_likelihood += scenario_metrics.collision_indication_likelihood
+                self.time_to_collision_likelihood += scenario_metrics.time_to_collision_likelihood
+                self.distance_to_road_edge_likelihood += scenario_metrics.distance_to_road_edge_likelihood
+                self.offroad_indication_likelihood += scenario_metrics.offroad_indication_likelihood
+                self.min_average_displacement_error += scenario_metrics.min_average_displacement_error
+                self.simulated_collision_rate += scenario_metrics.simulated_collision_rate
+                self.simulated_offroad_rate += scenario_metrics.simulated_offroad_rate
+                self.traffic_light_violation_likelihood += scenario_metrics.traffic_light_violation_likelihood
+                self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
 
-            self.z_only_average_displacement_error += tensor(
-                float(z_only.get("average_displacement_error_z_only", 0.0)))
-            self.z_only_min_average_displacement_error += tensor(
-                float(z_only.get("min_average_displacement_error_z_only", 0.0)))
+                self.z_only_average_displacement_error += tensor(
+                    float(z_only.get("average_displacement_error_z_only", 0.0))
+                )
+                self.z_only_min_average_displacement_error += tensor(
+                    float(z_only.get("min_average_displacement_error_z_only",
+                                     0.0))
+                )
+
+            _maybe_print(done, force=True)
 
     def compute(self) -> Dict[str, Tensor]:
         metrics_dict = {}
