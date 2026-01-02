@@ -215,7 +215,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--script_path",
         type=str,
-        default="~/PycharmProjects/Diffusion-Planner/validation_pnc.sh",
+        default="/media/user/E/projects/Diffusion-Planner/validation_pnc.sh",
         help="실행할 validation_pnc.sh 경로",
     )
     return parser.parse_args()
