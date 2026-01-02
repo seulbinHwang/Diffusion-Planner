@@ -149,7 +149,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --eval_method "validation" \
-  --batch_size 2 \
+  --batch_size 1024 \
   --use_deepspeed True \
   --wosac_sub_is_active True \
   --wosac_metric_is_active True \
