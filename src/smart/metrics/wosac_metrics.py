@@ -17,7 +17,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
-
+import time
 import tensorflow as tf
 import waymo_open_dataset.wdl_limited.sim_agents_metrics.metrics as wosac_metrics
 from google.protobuf import text_format
