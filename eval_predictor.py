@@ -138,6 +138,96 @@ def _get_run_count(args: Any) -> int:
     except (TypeError, ValueError):
         return 0
 
+def _safe_remove_file_if_exists(file_path: str) -> bool:
+    """파일이 있으면 지우고, 없으면 조용히 넘어갑니다.
+
+    이 함수가 필요한 이유
+    -------------------
+    - 이전 실행에서 남겨둔 "카운터 파일"이 있으면,
+      다음 실행에서 저장 횟수가 이미 다 찬 것으로 인식될 수 있습니다.
+    - 그래서 프로그램 시작 시점에 파일을 지워서,
+      이번 실행(run_count)의 저장 횟수를 "0부터" 다시 시작하게 합니다.
+
+    Args:
+        file_path (str):
+            지우고 싶은 파일 경로. shape: ()
+
+    Returns:
+        bool:
+            - True: 파일이 실제로 존재해서 삭제한 경우
+            - False: 파일이 없었거나(이미 삭제됨), 파일이 아니거나, 삭제에 실패한 경우
+    """
+    if not isinstance(file_path, str) or file_path.strip() == "":
+        return False
+
+    try:
+        # 파일이 아닌 경우(예: 디렉터리)는 안전하게 건드리지 않습니다.
+        if not os.path.isfile(file_path):
+            return False
+
+        os.remove(file_path)
+        return True
+
+    except FileNotFoundError:
+        # 다른 프로세스가 먼저 지웠을 수도 있으니 정상 케이스로 봅니다.
+        return False
+    except Exception:
+        return False
+
+
+def _purge_visualization_budget_counter_file_at_program_start(
+    args: argparse.Namespace,
+    global_rank: int,
+    world_size: int,
+) -> None:
+    """프로그램 시작 시, 이번 실행(run_count)의 시각화 저장 카운터 파일을 초기화합니다.
+
+    동작 방식
+    --------
+    1) args.save_path / args.eval_method / args.run_count를 이용해
+       이번 실행(run_count)에 해당하는 카운터 파일 경로를 계산합니다.
+       - 파일 예: "{save_path}/.dp_vis_budget_validation_run1.json"
+    2) DDP(멀티 프로세스) 환경에서는 global_rank==0(대표 프로세스)만 삭제합니다.
+       - 여러 프로세스가 동시에 지우거나/만드는 타이밍이 겹치면,
+         오히려 실행 중간에 카운터가 리셋되는 위험이 있습니다.
+    3) 삭제 후, DDP 환경이면 barrier로 모든 프로세스가 "삭제 완료" 이후에만 진행하도록 맞춥니다.
+    4) 로컬 캐시 플래그(_VIS_BUDGET_REACHED_LOCAL)도 False로 되돌려,
+       이번 실행에서 다시 정상적으로 저장 시도를 할 수 있게 합니다.
+
+    Args:
+        args (argparse.Namespace):
+            아래 값들을 사용합니다. (모두 shape: ())
+            - args.save_path (str): 카운터 파일이 있는 폴더
+            - args.eval_method (str): 파일 이름 구분용
+            - args.run_count (int): 파일 이름 구분용
+        global_rank (int):
+            현재 프로세스 rank. shape: ()
+        world_size (int):
+            전체 프로세스 수. shape: ()
+
+    Returns:
+        None
+    """
+    global _VIS_BUDGET_REACHED_LOCAL
+    _VIS_BUDGET_REACHED_LOCAL = False
+
+    counter_path = _get_visualization_budget_counter_path(args)
+    if counter_path is None:
+        return
+
+    # ✅ 대표 프로세스만 삭제 (중간에 리셋되는 레이스 방지)
+    if int(global_rank) == 0:
+        deleted = _safe_remove_file_if_exists(counter_path)
+        if deleted:
+            print(f"[VIS_BUDGET] 기존 카운터 파일 삭제: {counter_path}")
+        else:
+            # 파일이 없거나 삭제 불필요인 경우도 흔하니, 너무 시끄럽지 않게 출력합니다.
+            print(f"[VIS_BUDGET] 카운터 파일 없음(또는 삭제 불필요): {counter_path}")
+
+    # ✅ DDP면 여기서 동기화해서, 모든 rank가 "삭제 이후"에만 진행하도록 보장
+    if int(world_size) > 1 and _is_torch_process_group_initialized():
+        torch.distributed.barrier()
+
 
 def _get_visualization_budget_counter_path(args: Any) -> Optional[str]:
     """이번 실행(run_count)에서 공유할 '카운터 파일' 경로를 만듭니다.
@@ -217,7 +307,6 @@ def _try_reserve_visualization_slot(counter_path: str, limit: int) -> bool:
         return False
 
     os.makedirs(os.path.dirname(counter_path), exist_ok=True)
-
     with open(counter_path, "a+", encoding="utf-8") as f:
         if fcntl is not None:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
@@ -4031,8 +4120,6 @@ def _covert_from_ego_to_world(
     world_pose = torch.where(valid_mask[..., None], world_pose,
                              torch.zeros_like(world_pose))
     return world_pose
-
-
 def main() -> None:
     """train_predictor 진입점.
 
@@ -4047,12 +4134,20 @@ def main() -> None:
     # 1) 분산 초기화 및 rank 정보
     args = args_util.get_args()
     global_rank, rank, world_size, use_deepspeed = init_distributed(args)
+
     set_save_path(
         args=args,
         global_rank=global_rank,
     )
     should_finish = prepare_wandb_resume(args)
     set_distributed_flag_from_env(args)
+
+    # ✅ (추가) 프로그램 시작 시, 이번 run_count 카운터 파일이 있으면 삭제해서 초기화
+    _purge_visualization_budget_counter_file_at_program_start(
+        args=args,
+        global_rank=int(global_rank),
+        world_size=int(world_size),
+    )
 
     # Run
     try:
@@ -4064,7 +4159,7 @@ def main() -> None:
             file=sys.stderr,
             flush=True,
         )
-        traceback.print_exc()  # <-- 표준에러로 자세한 스택
+        traceback.print_exc()
         sys.stderr.flush()
         raise
 

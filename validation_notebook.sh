@@ -127,6 +127,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_video True \
   --finish_when_no_updated_pt True \
   --run_count "$RUN_COUNT" \
-  --total_save_image_trial_num 2
+  --total_save_image_trial_num 1
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
