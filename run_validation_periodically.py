@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_MINIFORGE_CONDA_PATH: str = "~/miniforge3/bin/conda"
+DEFAULT_MINIFORGE_CONDA_PATH: str = "~/miniforge/bin/conda"
 
 
 @dataclass(frozen=True)
