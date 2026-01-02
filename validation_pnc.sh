@@ -86,6 +86,7 @@ PY
 ensure_eval_set_list_json "$EVAL_SET_PATH" "$EVAL_SET_LIST_PATH" "$RUN_PYTHON_PATH"
 
 ###################################
+export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
 # CUDA 경로 자동 설정
