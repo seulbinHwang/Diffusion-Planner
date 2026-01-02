@@ -1472,7 +1472,6 @@ def _download_wandb_checkpoint_to_local(
               f"reason: {skip_reason}")
         if args.finish_when_no_updated_pt:
             print("[EXIT] finish_when_no_updated_pt is set. exit now.")
-
             return True
         return False
     if rank == 0:
@@ -1679,7 +1678,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> bool:
                 f"(alias={resume_alias}), skip wandb download.")
             if args.finish_when_no_updated_pt:
                 print("[EXIT] finish_when_no_updated_pt is set. exit now.")
-                SystemExit(int(0))
+                raise SystemExit(int(0))
             return False
     """
     entity: str 예: 'jksg01019-naver-labs'
@@ -1704,10 +1703,9 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> bool:
             checkpoint_filename=checkpoint_filename,
         )
         if should_finish:
+            print("[EXIT] finish_when_no_updated_pt is set. ")
             # finish code right now.
-            SystemExit(int(0))
-
-
+            raise SystemExit(int(0))
         return should_finish
     except Exception as e:
         raise RuntimeError(f"W&B 아티팩트에서 체크포인트를 내려받는 중 오류가 발생했습니다: {e}") from e
