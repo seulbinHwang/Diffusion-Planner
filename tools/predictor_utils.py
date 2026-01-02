@@ -1679,7 +1679,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> bool:
                 f"(alias={resume_alias}), skip wandb download.")
             if args.finish_when_no_updated_pt:
                 print("[EXIT] finish_when_no_updated_pt is set. exit now.")
-                return True
+                SystemExit(int(0))
             return False
     """
     entity: str 예: 'jksg01019-naver-labs'
