@@ -10,8 +10,28 @@ echo "[INFO] run_count=${RUN_COUNT}"
 USER_PATH="/media/user"
 #WOMD_PATH="${USER_PATH}/womd_v1_3"
 WOMD_PATH="${USER_PATH}/D/dataset"
-RUN_PYTHON_PATH="${USER_PATH}/E/miniforge3/envs/diffusion_planner/bin/python"
 # `~/womd_v1_3/processed_womd_final/validation`
+
+# ✅ conda run으로 들어온 환경의 python을 자동으로 사용
+resolve_python_in_current_env() {
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    echo "${CONDA_PREFIX}/bin/python"
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
+RUN_PYTHON_PATH="$(resolve_python_in_current_env || true)"
+if [[ -z "${RUN_PYTHON_PATH}" ]]; then
+  echo "[ERROR] 현재 환경에서 python을 찾지 못했습니다. (CONDA_PREFIX/ PATH 확인 필요)" >&2
+  exit 1
+fi
+echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
+
 EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final_150_bugfix_1/validation"
 EVAL_SET_LIST_PATH="${USER_PATH}/E/projects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
