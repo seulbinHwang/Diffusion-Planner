@@ -7,12 +7,13 @@ echo "[INFO] run_count=${RUN_COUNT}"
 ###################################
 # User Configuration Section
 ###################################
-USER_PATH="/home/user"
-WOMD_PATH="${USER_PATH}/womd_v1_3"
-RUN_PYTHON_PATH="${USER_PATH}/miniforge3/envs/diffusion_planner/bin/python"
+USER_PATH="/media/user"
+#WOMD_PATH="${USER_PATH}/womd_v1_3"
+WOMD_PATH="${USER_PATH}/D/dataset"
+RUN_PYTHON_PATH="${USER_PATH}/E/miniforge3/envs/diffusion_planner/bin/python"
 # `~/womd_v1_3/processed_womd_final/validation`
-EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation" 
-EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final_150_bugfix_1/validation"
+EVAL_SET_LIST_PATH="${USER_PATH}/E/projects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -78,6 +79,15 @@ if [[ -z "${CUDA_HOME:-}" ]]; then
   fi
 fi
 
+if [[ -n "${CUDA_HOME:-}" && -d "$CUDA_HOME" ]]; then
+  export CUDA_HOME
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  echo "[INFO] CUDA_HOME=$CUDA_HOME"
+else
+  echo "[WARN] CUDA_HOME를 자동으로 찾지 못했습니다. CUDA_HOME를 수동으로 지정해 주세요."
+fi
+
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 LOG_DIR="${WOMD_PATH}/logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
@@ -127,6 +137,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_video True \
   --finish_when_no_updated_pt True \
   --run_count "$RUN_COUNT" \
-  --total_save_image_trial_num 1
+  --total_save_image_trial_num 10
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
