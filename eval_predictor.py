@@ -90,6 +90,195 @@ def _is_torch_process_group_initialized() -> bool:
         return False
     return bool(torch.distributed.is_initialized())
 
+import json
+from typing import Any, Optional
+
+try:
+    import fcntl  # 리눅스/유닉스에서 파일 잠금에 사용
+except ImportError:
+    fcntl = None  # type: ignore
+
+
+_VIS_BUDGET_REACHED_LOCAL: bool = False
+
+
+def _get_total_save_image_trial_num(args: Any) -> int:
+    """전체 시각화 저장 횟수 제한 값을 안전하게 읽습니다.
+
+    Args:
+        args (Any):
+            args.total_save_image_trial_num(int)를 기대합니다.
+
+    Returns:
+        int:
+            - -1: 제한 없음
+            - 0 이상: 허용되는 총 저장 "횟수"
+    """
+    raw = getattr(args, "total_save_image_trial_num", -1)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _get_run_count(args: Any) -> int:
+    """이번 실행(run_count) 값을 안전하게 읽습니다.
+
+    Args:
+        args (Any):
+            args.run_count(int)가 있으면 사용합니다.
+
+    Returns:
+        int:
+            run_count 값. 없거나 이상하면 0.
+    """
+    raw = getattr(args, "run_count", 0)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _get_visualization_budget_counter_path(args: Any) -> Optional[str]:
+    """이번 실행(run_count)에서 공유할 '카운터 파일' 경로를 만듭니다.
+
+    이 파일은 여러 프로세스가 같은 위치를 봐야 하므로,
+    모든 프로세스가 공유하는 폴더(여기서는 args.save_path) 아래에 둡니다.
+
+    Args:
+        args (Any):
+            - args.save_path (str): 저장 폴더
+            - args.eval_method (str): validation/test 등(파일 이름 구분용)
+            - args.run_count (int): 이번 실행 번호(파일 이름 구분용)
+
+    Returns:
+        Optional[str]:
+            카운터 파일 경로.
+            save_path가 없으면 None.
+    """
+    save_path = getattr(args, "save_path", None)
+    if not isinstance(save_path, str) or not save_path:
+        return None
+
+    eval_method = str(getattr(args, "eval_method", "eval"))
+    run_count = _get_run_count(args)
+
+    # run_count마다 파일을 분리 → "이번 실행" 단위로 제한이 적용됨
+    file_name = f".dp_vis_budget_{eval_method}_run{run_count}.json"
+    return os.path.join(save_path, file_name)
+
+
+def _read_count_from_json_text(text: str) -> int:
+    """카운터 파일 내용에서 count 값을 읽습니다.
+
+    Args:
+        text (str):
+            파일에 들어있는 문자열.
+
+    Returns:
+        int:
+            읽은 count. 실패하면 0.
+    """
+    if not isinstance(text, str) or text.strip() == "":
+        return 0
+    try:
+        obj = json.loads(text)
+        value = obj.get("count", 0)
+        return int(value)
+    except Exception:
+        return 0
+
+
+def _try_reserve_visualization_slot(counter_path: str, limit: int) -> bool:
+    """공유 카운터 파일을 이용해 '저장 1회'를 예약합니다.
+
+    동작 방식
+    ----------
+    - counter_path 파일을 열고(없으면 생성),
+    - 잠깐 잠근 뒤(여러 프로세스가 동시에 접근해도 숫자가 꼬이지 않게),
+    - 현재 count를 읽고:
+        * count < limit 이면 count를 1 올리고 True
+        * count >= limit 이면 False
+
+    Args:
+        counter_path (str):
+            카운터 파일 경로.
+        limit (int):
+            허용되는 총 저장 횟수(0 이상).
+
+    Returns:
+        bool:
+            - True: 이번에 저장을 진행해도 됨(예약 성공)
+            - False: 이미 limit을 다 써서 저장 금지
+    """
+    if int(limit) < 0:
+        return True
+    if int(limit) == 0:
+        return False
+
+    os.makedirs(os.path.dirname(counter_path), exist_ok=True)
+
+    with open(counter_path, "a+", encoding="utf-8") as f:
+        if fcntl is not None:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+        f.seek(0)
+        raw = f.read()
+        count = _read_count_from_json_text(raw)
+
+        if int(count) >= int(limit):
+            return False
+
+        new_count = int(count) + 1
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps({"count": new_count}, ensure_ascii=False))
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+
+        return True
+
+
+def _reserve_visualization_budget_if_needed(args: Any) -> bool:
+    """이번에 시각화를 저장해도 되는지 판단하고, 가능하면 1회분을 예약합니다.
+
+    Args:
+        args (Any):
+            - args.total_save_image_trial_num (int): 전체 제한(-1이면 무제한)
+            - args.save_path (str): 카운터 파일을 둘 폴더
+            - args.eval_method (str), args.run_count (int): 카운터 파일 이름 구분용
+
+    Returns:
+        bool:
+            - True: 저장 허용(예약 성공)
+            - False: 저장 금지(제한 초과 또는 설정 문제)
+    """
+    global _VIS_BUDGET_REACHED_LOCAL
+
+    limit = _get_total_save_image_trial_num(args)
+    if int(limit) < 0:
+        return True
+
+    if _VIS_BUDGET_REACHED_LOCAL:
+        return False
+
+    counter_path = _get_visualization_budget_counter_path(args)
+    if counter_path is None:
+        # save_path가 없으면 안전하게 저장을 막습니다(파일 폭증 방지).
+        _VIS_BUDGET_REACHED_LOCAL = True
+        return False
+
+    try:
+        ok = _try_reserve_visualization_slot(counter_path=counter_path, limit=int(limit))
+    except Exception:
+        ok = False
+
+    if not ok:
+        _VIS_BUDGET_REACHED_LOCAL = True
+    return ok
 
 def _maybe_distributed_barrier(
     args: argparse.Namespace,
@@ -1134,6 +1323,25 @@ def _predict_rollouts_batched_one_chunk(
     near_future_gt_4_dim = outputs["near_future_gt_4_dim"]
     norm_near_future_gt_4_dim = state_normalizer(near_future_gt_4_dim)
     norm_inputs["near_future_gt_4_dim"] = norm_near_future_gt_4_dim
+
+    # -----------------------------------------
+    # ✅ 전체 저장 횟수 제한 적용 (멀티 프로세스 합산)
+    # -----------------------------------------
+    save_image_requested: bool = bool(save_image)
+    save_video_requested: bool = bool(save_video)
+
+    # 비디오를 만들려면(프레임이 필요하므로) 이미지 저장도 같이 켭니다.
+    want_any_visual: bool = bool(save_image_requested or save_video_requested)
+    if want_any_visual:
+        allowed = _reserve_visualization_budget_if_needed(args)
+        if not allowed:
+            save_image = False
+            save_video = False
+        else:
+            # video=True면 frame이 필요하므로 save_image도 True로 맞춤
+            save_image = bool(save_image_requested or save_video_requested)
+            save_video = bool(save_video_requested)
+
     if save_image:
         """
         draw_scenario_id : str
@@ -1265,7 +1473,10 @@ def _predict_rollouts_batched_one_chunk(
     if save_video:
         draw_machine.make_video_from_all_png(save_dir,
                                              draw_scenario_id,
-                                             new_save_dir=args.save_path)
+                                             new_save_dir=args.save_path,
+                                             run_count= args.run_count,
+
+                                             )
     return target_joint_scene_world
 
 

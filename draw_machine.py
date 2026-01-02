@@ -4282,7 +4282,10 @@ def _write_gif_from_png_frames(
             writer.append_data(frame)
 
 
-def make_video_from_all_png(save_dir: str, draw_scenario_id: str, new_save_dir: str) -> None:
+def make_video_from_all_png(save_dir: str, draw_scenario_id: str,
+                            new_save_dir: str,
+                            run_count: Optional[int] = None,
+                            ) -> None:
     """폴더 내 PNG들을 시간 순서대로 이어서 mp4/gif 영상을 저장합니다.
 
     전제(입력 폴더 구조)
@@ -4322,8 +4325,12 @@ def make_video_from_all_png(save_dir: str, draw_scenario_id: str, new_save_dir: 
     fps: int = _get_default_video_fps()
 
     out_dir = Path(new_save_dir)
-    out_mp4_path = str(out_dir / f"{draw_scenario_id}.mp4")
-    out_gif_path = str(out_dir / f"{draw_scenario_id}.gif")
+    if run_count is None:
+        out_mp4_path = str(out_dir / f"{draw_scenario_id}.mp4")
+        out_gif_path = str(out_dir / f"{draw_scenario_id}.gif")
+    else:
+        out_mp4_path = str(out_dir / f"{draw_scenario_id}_{run_count}.mp4")
+        out_gif_path = str(out_dir / f"{draw_scenario_id}_{run_count}.gif")
 
     # 같은 이름 파일이 있으면 덮어쓰는 게 자연스러워서, 미리 지우는 방식을 사용합니다.
     # (writer가 덮어쓰기를 지원하지 않는 환경도 있을 수 있어서 안전 처리)

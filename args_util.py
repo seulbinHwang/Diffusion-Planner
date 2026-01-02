@@ -130,6 +130,10 @@ def get_args():
                         type=int,
                         help='number of run_count',
                         default=0)
+    parser.add_argument('--total_save_image_trial_num',
+                        type=int,
+                        help='number of run_count',
+                        default=-1)
     parser.add_argument('--future_len',
                         type=int,
                         help='number of time point',
