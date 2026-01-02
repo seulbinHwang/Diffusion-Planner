@@ -1,9 +1,7 @@
-import argparse
-from diffusion_planner.utils.data_augmentation import StatePerturbation
-from diffusion_planner.utils.dataset import DiffusionPlannerData
+
 from torch.utils.data import DataLoader, DistributedSampler
 from typing import Tuple, Any, Dict, Optional, List, Callable
-import torch
+import wandb
 import torch.nn as nn
 from diffusion_planner.loss import _sanitize_norm_inputs
 from tools.predictor_utils import (
@@ -16,11 +14,12 @@ from tools.predictor_utils import (
     prepare_wandb_resume,
     set_distributed_flag_from_env,
     maybe_resume_from_checkpoint,
+    setup_logger_and_purge,
 )
 import numpy as np
 import draw_machine
 import args_util
-import os
+import shutil
 import sys, faulthandler, traceback
 from diffusion_planner.utils.train_utils import set_seed
 from timm.utils import ModelEma
@@ -38,6 +37,7 @@ from typing import Any, List, Tuple, Optional
 import torch
 from waymo_open_dataset.protos import scenario_pb2
 from waymo_open_dataset.utils.sim_agents import submission_specs
+
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 from src.utils.wosac_utils import get_scenario_id_int_tensor, \
     get_scenario_rollouts
@@ -195,11 +195,19 @@ def model_validation(
      )
     args._global_update_step = 0
 
-    min_ade = minADE(is_active=args.min_ade_is_active).to(torch.device(args.device))
+    min_ade = minADE(is_active=args.min_ade_is_active).to(
+        torch.device(args.device))
     wosac_metrics = WOSACMetrics("val_closed", args.wosac_metric_is_active)
     wosac_submission = WOSACSubmission(is_active=args.wosac_sub_is_active,
                                        save_path=args.save_path,
                                        eval_method=args.eval_method)
+    wandb_logger = setup_logger_and_purge(
+        args=args,
+        global_rank=global_rank,
+        wandb_id=None,
+        allow_val_change=allow_val_change,
+    )
+
     run_validation_loop(
         args=args,
         diffusion_planner=diffusion_planner,
@@ -208,18 +216,40 @@ def model_validation(
         wosac_metrics=wosac_metrics,
         wosac_submission=wosac_submission,
         min_ade=min_ade,
+        wandb_logger=wandb_logger,
+        global_rank=global_rank,
     )
 
-    _finalize_training_cleanup()
+    _finalize_eval_cleanup(args, global_rank, wandb_logger)
 
 
-def _finalize_training_cleanup():
+def _finalize_eval_cleanup(
+    args: argparse.Namespace,
+    global_rank: int,
+    wandb_logger: Logger,
+) -> None:
     # 1) 분산 학습일 때만 barrier 호출
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
 
+    if global_rank == 0:
+        wandb_logger.finish()
+    # 2) W&B / TensorBoard 종료
+    if args.use_wandb and wandb.run is not None:
+        wandb.finish()
+
+
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
+
+    tb_dir = os.path.join(args.save_path, "tb")
+    try:
+        shutil.rmtree(tb_dir)
+        print(f"[CLEANUP] 디렉터리 삭제: {tb_dir}")
+    except FileNotFoundError:
+        print(f"[CLEANUP] 디렉터리 없음 (이미 삭제됨): {tb_dir}")
+    except Exception as e:
+        print(f"[CLEANUP] 디렉터리 삭제 오류: {tb_dir}, {e}")
 
 
 def run_validation_loop(
@@ -228,8 +258,10 @@ def run_validation_loop(
     model_ema: Optional[ModelEma],
     validation_loader: DataLoader,
     wosac_metrics: WOSACMetrics,
-wosac_submission: WOSACSubmission,
+    wosac_submission: WOSACSubmission,
     min_ade: minADE,
+    wandb_logger: Logger,
+global_rank: int,
 ) -> None:
     """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
     elapsed_training_time_hour: float = 0.0
@@ -250,16 +282,18 @@ wosac_submission: WOSACSubmission,
         wosac_submission=wosac_submission,
         min_ade=min_ade,
     )
-    # print "epoch_elapsed_time_sec"
-    print(f"[Validation] completed in "
-          f"{epoch_elapsed_time_sec:.2f} sec.")
-    """epoch_wosac_metrics 를 출력합니다."""
-    if _is_main_process_for_logging(args):
-        print(f"=== Validation Metrics ===")
-        for k, v in epoch_wosac_metrics.items():
-            # v 가 tensor인 경우 item()으로 스칼라 값 추출, float인 경우 그대로 사용
-            value = v.item() if isinstance(v, torch.Tensor) else float(v)
-            print(f"{k}: {value:.6f}")
+    if global_rank == 0:
+        wandb_logger.log_metrics(epoch_wosac_metrics, step=args.run_count)
+        # print "epoch_elapsed_time_sec"
+        print(f"[Validation] completed in "
+              f"{epoch_elapsed_time_sec:.2f} sec.")
+        """epoch_wosac_metrics 를 출력합니다."""
+        if _is_main_process_for_logging(args):
+            print(f"=== Validation Metrics ===")
+            for k, v in epoch_wosac_metrics.items():
+                # v 가 tensor인 경우 item()으로 스칼라 값 추출, float인 경우 그대로 사용
+                value = v.item() if isinstance(v, torch.Tensor) else float(v)
+                print(f"{k}: {value:.6f}")
 
 
 def validate_one_epoch(
@@ -271,7 +305,7 @@ def validate_one_epoch(
     model_ema: Optional[ModelEma],
     batch_num_in_one_val_epoch: int,
     wosac_metrics: WOSACMetrics,
-wosac_submission: WOSACSubmission,
+    wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> Tuple[Dict[str, torch.Tensor], float]:
     if args.ddp and ddp.get_rank() == 0:
@@ -637,7 +671,7 @@ def validation_epoch(
     ema: Optional[ModelEma],
     batch_num_in_one_val_epoch: int,
     wosac_metrics: WOSACMetrics,
-wosac_submission: WOSACSubmission,
+    wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> Dict[str, torch.Tensor]:
     model.eval()
@@ -707,18 +741,16 @@ wosac_submission: WOSACSubmission,
         if min_ade.is_active:
             epoch_wosac_metrics[
                 "val_closed/ADE_debug/wosac_average_displacement_error_xy"] = (
-                min_ade.compute_wosac_like_average_displacement_error()
-            )
+                    min_ade.compute_wosac_like_average_displacement_error())
             epoch_wosac_metrics[
                 "val_closed/ADE_debug/wosac_min_average_displacement_error_xy"] = (
-                min_ade.compute_wosac_like_min_average_displacement_error()
+                    min_ade.compute_wosac_like_min_average_displacement_error())
+            epoch_wosac_metrics["val_closed/min_ADE(custom)"] = min_ade.compute(
             )
-            epoch_wosac_metrics["val_closed/min_ADE(custom)"] = min_ade.compute()
             min_ade.reset()
         wosac_metrics.reset()
     else:
         epoch_wosac_metrics = {}
-
 
     return epoch_wosac_metrics
 
@@ -1231,7 +1263,9 @@ def _predict_rollouts_batched_one_chunk(
     target_joint_scene_world = target_joint_scene_world.permute(0, 2, 1, 3,
                                                                 4).contiguous()
     if save_video:
-        draw_machine.make_video_from_all_png(save_dir, draw_scenario_id, new_save_dir=args.save_path)
+        draw_machine.make_video_from_all_png(save_dir,
+                                             draw_scenario_id,
+                                             new_save_dir=args.save_path)
     return target_joint_scene_world
 
 
@@ -2034,8 +2068,7 @@ def _expand_target_z_to_rollout_grid(
 
 
 def _get_sim_agents_challenge_type_from_args(
-    args: Any,
-) -> submission_specs.ChallengeType:
+    args: Any,) -> submission_specs.ChallengeType:
     """args에서 Sim Agents 평가 규칙 종류를 안전하게 고릅니다.
 
     이 함수가 필요한 이유
@@ -2071,10 +2104,8 @@ def _get_sim_agents_challenge_type_from_args(
     if raw_str in ("scenario_gen", "scenariogen", "scenario", "gen"):
         return submission_specs.ChallengeType.SCENARIO_GEN
 
-    raise ValueError(
-        "challenge_type을 해석할 수 없습니다. "
-        f"raw='{raw}'. 예: 'sim_agents' 또는 'scenario_gen'"
-    )
+    raise ValueError("challenge_type을 해석할 수 없습니다. "
+                     f"raw='{raw}'. 예: 'sim_agents' 또는 'scenario_gen'")
 
 
 def _read_scenario_proto_from_tfrecord(
@@ -2116,16 +2147,15 @@ def _read_scenario_proto_from_tfrecord(
     try:
         import tensorflow as tf
     except ImportError as e:
-        raise ImportError(
-            "Scenario proto를 TFRecord에서 읽으려면 tensorflow가 필요합니다. "
-            "환경에 tensorflow가 설치되어 있는지 확인해 주세요."
-        ) from e
+        raise ImportError("Scenario proto를 TFRecord에서 읽으려면 tensorflow가 필요합니다. "
+                          "환경에 tensorflow가 설치되어 있는지 확인해 주세요.") from e
 
     tfrecord_path = str(tfrecord_path)
     scenario_id = str(scenario_id)
 
     compression_type = "GZIP" if tfrecord_path.endswith(".gz") else ""
-    dataset = tf.data.TFRecordDataset(tfrecord_path, compression_type=compression_type)
+    dataset = tf.data.TFRecordDataset(tfrecord_path,
+                                      compression_type=compression_type)
 
     for raw_record in dataset:
         record_bytes = raw_record.numpy()  # bytes
@@ -2137,8 +2167,7 @@ def _read_scenario_proto_from_tfrecord(
 
     raise ValueError(
         "TFRecord에서 scenario_id를 찾지 못했습니다. "
-        f"tfrecord_path='{tfrecord_path}', scenario_id='{scenario_id}'"
-    )
+        f"tfrecord_path='{tfrecord_path}', scenario_id='{scenario_id}'")
 
 
 @lru_cache(maxsize=4096)
@@ -2224,8 +2253,7 @@ def _build_padded_eval_object_ids_tensor_for_batch(
                 tfrecord_path=str(p),
                 scenario_id=str(sid),
                 challenge_type=challenge_type,
-            )
-        )
+            ))
         eval_id_lists.append(ids)
         if len(ids) > max_k:
             max_k = int(len(ids))
@@ -2243,7 +2271,7 @@ def _build_padded_eval_object_ids_tensor_for_batch(
         if len(ids) == 0:
             continue
         ids_tensor = torch.tensor(ids, device=device, dtype=torch.long)  # (Kb,)
-        out[b_idx, : ids_tensor.numel()] = ids_tensor
+        out[b_idx, :ids_tensor.numel()] = ids_tensor
 
     return out
 
@@ -2253,7 +2281,7 @@ def _update_min_ade_for_validation_batch(
     norm_inputs: Dict[str, Any],
     pred_traj: torch.Tensor,
     agent_batch: torch.Tensor,  # (N,)
-    target_id: torch.Tensor,    # (N,)
+    target_id: torch.Tensor,  # (N,)
     eval_object_ids: Optional[torch.Tensor],  # (B, K) or (K,) or None
     min_ade: minADE,
 ) -> None:
@@ -2302,7 +2330,8 @@ def _update_min_ade_for_validation_batch(
         None
     """
     unnorm_ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]  # (B, T, 4)
-    unnorm_near_future_gt_4_dim = outputs["near_future_gt_4_dim"]  # (B, Pnn, T, 4)
+    unnorm_near_future_gt_4_dim = outputs[
+        "near_future_gt_4_dim"]  # (B, Pnn, T, 4)
 
     # (B, (1+)Pnn, T, 4)
     unnorm_target_future_gt_4_dim = torch.cat(
@@ -2325,11 +2354,12 @@ def _update_min_ade_for_validation_batch(
     # (N, T, 4) (world)
     unnorm_target_future_gt_4_dim_world = _covert_from_ego_to_world(
         target_poses=unnorm_target_future_gt_4_dim_flat,  # (N, T, 4)
-        origin_world_pose=unnorm_origin_pose_world,        # (B, 4)
+        origin_world_pose=unnorm_origin_pose_world,  # (B, 4)
     )
 
     # (N, T, 2)
-    unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :2]
+    unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :
+                                                                           2]
 
     # (N, T)  마지막 4차원이 전부 0이면 그 스텝은 무효
     target_future_valid_flat = torch.any(
@@ -2342,7 +2372,7 @@ def _update_min_ade_for_validation_batch(
             target=unnorm_target_future_gt_xy_world,
             target_valid=target_future_valid_flat,
             agent_batch=agent_batch,
-            agent_id=target_id,               # (N,)
+            agent_id=target_id,  # (N,)
             eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
         )
 
@@ -2356,7 +2386,7 @@ def validate_func(
     state_normalizer: StateNormalizer,
     observation_normalizer: ObservationNormalizer,
     wosac_metrics: WOSACMetrics,
-wosac_submission: WOSACSubmission,
+    wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> None:
     """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다.
@@ -2554,8 +2584,8 @@ wosac_submission: WOSACSubmission,
             norm_inputs=norm_inputs,
             pred_traj=pred_traj,
             agent_batch=agent_batch,
-            target_id=target_id,               # (N,)
-            eval_object_ids=eval_object_ids,   # (B, K) or None
+            target_id=target_id,  # (N,)
+            eval_object_ids=eval_object_ids,  # (B, K) or None
             min_ade=min_ade,
         )
 
@@ -3729,7 +3759,7 @@ def main() -> None:
         args=args,
         global_rank=global_rank,
     )
-    prepare_wandb_resume(args)
+    should_finish = prepare_wandb_resume(args)
     set_distributed_flag_from_env(args)
 
     # Run

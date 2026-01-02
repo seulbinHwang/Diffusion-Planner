@@ -49,7 +49,9 @@ def get_scenario_rollouts(
     pred_head: Tensor,  # [n_agent, n_rollout, n_step]
 ) -> List[sim_agents_submission_pb2.ScenarioRollouts]:
     scenario_id = scenario_id.cpu().numpy()
-    agent_id = _unbatch(agent_id, agent_batch) # list len = n_scenario, each shape [n_agent_in_scenario]
+    agent_id = _unbatch(
+        agent_id,
+        agent_batch)  # list len = n_scenario, each shape [n_agent_in_scenario]
     pred_traj = _unbatch(pred_traj, agent_batch)
     pred_z = _unbatch(pred_z, agent_batch)
     pred_head = _unbatch(pred_head, agent_batch)

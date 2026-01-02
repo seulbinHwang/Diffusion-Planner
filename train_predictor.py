@@ -27,12 +27,10 @@ import sys, faulthandler, traceback
 faulthandler.enable(all_threads=True)
 
 import argparse
-import shutil
 from torch import optim
 from timm.utils import ModelEma
 from torch.utils.data import DataLoader
 import wandb
-from requests.exceptions import HTTPError
 from diffusion_planner.utils.train_utils import set_seed, save_model
 from diffusion_planner.utils.normalizer import ObservationNormalizer
 from tools.predictor_utils import (
@@ -46,9 +44,11 @@ from tools.predictor_utils import (
     effective_global_batch,
     init_distributed,
     maybe_resume_from_checkpoint,
+safe_get_artifacts,
 )
 from tools.predictor_utils import (build_dataset_and_sampler, build_data_loader,
-                                   create_diffusion_planner_and_ema, setup_logger_and_purge)
+                                   create_diffusion_planner_and_ema,
+                                   setup_logger_and_purge)
 
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
@@ -196,58 +196,6 @@ def print_parameter_index_mapping(model):
     print("Parameter index mapping:")
     for idx, (name, _) in enumerate(model.named_parameters()):
         print(f"{idx}: {name}")
-
-
-def safe_get_artifacts(api, type_name, path):
-    try:
-        return list(api.artifacts(type_name, path))
-    except (wandb.errors.CommError, HTTPError) as e:
-        # 404 또는 권한 오류 → 컬렉션이 아직 없다고 판단
-        print(f"[SKIP] '{path}' 컬렉션 없음/권한 문제: {e}")
-        return []
-
-
-def purge_collection(api, entity, project, coll_name):
-    path = f"{entity}/{project}/{coll_name}"
-    versions = safe_get_artifacts(api, "model", path)  # 신규 API 사용
-    if not versions:
-        print(f"[PURGE] {coll_name}: 삭제할 버전이 없습니다.")
-        return
-
-    deleted_count = 0
-    failed_count = 0
-
-    for art in versions:
-        try:
-            # alias가 있는 artifact의 경우 alias를 먼저 제거
-            if hasattr(art, 'aliases') and art.aliases:
-                print(
-                    f"[PURGE] {coll_name}: Artifact {art.id}에 alias가 있어 alias를 먼저 제거합니다: {art.aliases}"
-                )
-                for alias in art.aliases:
-                    try:
-                        art.delete_alias(alias)
-                        print(f"[PURGE] {coll_name}: Alias '{alias}' 제거 완료")
-                    except Exception as alias_err:
-                        print(
-                            f"[PURGE] {coll_name}: Alias '{alias}' 제거 실패: {alias_err}"
-                        )
-
-            # artifact 삭제 시도
-            art.delete()
-            deleted_count += 1
-            print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 완료")
-
-        except Exception as e:
-            failed_count += 1
-            print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 실패 - {str(e)}")
-            # alias가 있는 경우의 오류는 경고로만 처리하고 계속 진행
-            if "due to existing alias" in str(e):
-                print(
-                    f"[PURGE] {coll_name}: Alias로 인한 삭제 실패는 정상적인 상황입니다. 계속 진행합니다."
-                )
-
-    print(f"[PURGE] {coll_name}: 삭제 완료 {deleted_count}개, 실패 {failed_count}개")
 
 
 def _prune_old_wandb_artifact_versions(
@@ -1289,8 +1237,6 @@ def _save_deepspeed_checkpoint_for_epoch(
     return tag_latest, tag_best
 
 
-
-
 def _train_one_epoch(
     epoch: int,
     train_epochs: int,
@@ -2041,8 +1987,6 @@ def _run_training_loop(
     data_num_in_a_epoch: int,
     global_batch_size: int,
     aug: Optional[object],
-    wosac_metrics: WOSACMetrics,
-    min_ade: minADE,
 ) -> float:
     """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
     elapsed_training_time_hour: float = 0.0
@@ -2111,27 +2055,27 @@ def _run_training_loop(
         is_first_epoch: bool = (epoch == 0)
 
         # 첫 epoch(=epoch 0)은 무조건 저장, 그 이후에는 save_utd 주기로 저장
-        if (is_first_epoch) or ((epoch + 1) % save_interval == 0):
-            # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
-            # Dict[str, torch.Tensor]
-            (epoch_wosac_metrics, epoch_elapsed_time_sec) = validate_one_epoch(
-                epoch=0,
-                total_epochs=1,
-                validation_loader=validation_loader,
-                diffusion_planner=diffusion_planner,
-                args=args,
-                model_ema=model_ema,
-                batch_num_in_one_val_epoch=batch_num_in_one_val_epoch,
-                wosac_metrics=wosac_metrics,
-                min_ade=min_ade,
-            )
-            if global_rank == 0:
-                # print "epoch_elapsed_time_sec"
-                print(f"[Validation] Epoch {epoch + 1} completed in "
-                      f"{epoch_elapsed_time_sec:.2f} sec.")
-        else:
-            epoch_wosac_metrics = None
-
+        # if (is_first_epoch) or ((epoch + 1) % save_interval == 0):
+        #     # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
+        #     # Dict[str, torch.Tensor]
+        #     (epoch_wosac_metrics, epoch_elapsed_time_sec) = validate_one_epoch(
+        #         epoch=0,
+        #         total_epochs=1,
+        #         validation_loader=validation_loader,
+        #         diffusion_planner=diffusion_planner,
+        #         args=args,
+        #         model_ema=model_ema,
+        #         batch_num_in_one_val_epoch=batch_num_in_one_val_epoch,
+        #         wosac_metrics=wosac_metrics,
+        #         min_ade=min_ade,
+        #     )
+        #     if global_rank == 0:
+        #         # print "epoch_elapsed_time_sec"
+        #         print(f"[Validation] Epoch {epoch + 1} completed in "
+        #               f"{epoch_elapsed_time_sec:.2f} sec.")
+        # else:
+        #     epoch_wosac_metrics = None
+        epoch_wosac_metrics = None
         best_loss = _log_and_save(
             epoch=epoch,
             args=args,
@@ -2159,12 +2103,12 @@ def _finalize_training_cleanup(
     # 1) 분산 학습일 때만 barrier 호출
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
-
+    if global_rank == 0:
+        wandb_logger.finish()
     # 2) W&B / TensorBoard 종료
     if args.use_wandb and wandb.run is not None:
         wandb.finish()
-    if global_rank == 0:
-        wandb_logger.finish()
+
 
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
@@ -2391,8 +2335,6 @@ def model_training(
         data_num_in_a_epoch=data_num_in_a_epoch,
         global_batch_size=global_batch_size,
         aug=aug,
-        wosac_metrics=wosac_metrics,
-        min_ade=min_ade,
     )
 
     _finalize_training_cleanup(
@@ -2420,7 +2362,7 @@ def main() -> None:
         args=args,
         global_rank=global_rank,
     )
-    prepare_wandb_resume(args)
+    should_finish = prepare_wandb_resume(args)
     set_distributed_flag_from_env(args)
 
     # Run

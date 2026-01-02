@@ -100,23 +100,15 @@ def shutil_which(command_name: str) -> Optional[str]:
     return shutil.which(command_name)
 
 
-def _run_validation_once(cfg: _Config) -> int:
+def _run_validation_once(cfg: _Config, run_count: int) -> int:
     """validation_notebook.sh를 딱 1번 실행한다.
-
-    실행 방식
-    --------
-    - conda run을 사용해서 diffusion_planner 환경에서 실행한다.
-    - 한 번 실행이 끝날 때까지 기다린다.
-      (그래서 동시에 여러 개가 겹쳐 실행되지 않는다)
 
     Args:
         cfg (_Config): 실행 설정값. shape: ()
+        run_count (int): 실제 실행 횟수(1부터 증가). shape: ()
 
     Returns:
-        int:
-            실행 결과 코드.
-            - 0이면 정상 종료
-            - 0이 아니면 중간에 문제가 있었을 가능성이 높음. shape: ()
+        int: 실행 결과 코드. shape: ()
     """
     cmd = [
         str(cfg.conda_exe_path),
@@ -126,9 +118,10 @@ def _run_validation_once(cfg: _Config) -> int:
         cfg.env_name,
         "bash",
         str(cfg.run_sh_path),
+        str(run_count),  # ✅ 실행 횟수 주입
     ]
 
-    print(f"[{_now_string()}] 실행 시작")
+    print(f"[{_now_string()}] 실행 시작 (run_count={run_count})")
     print("  실행 명령:", " ".join(cmd))
 
     try:
@@ -276,13 +269,14 @@ def main() -> int:
 
     start_t = time.monotonic()
     run_index = 0
-
+    actual_run_count = 0  # ✅ "진짜 실행 횟수" (스킵된 시간은 포함 안 함)
     try:
         while True:
             scheduled_t = start_t + float(run_index) * interval_sec
             _sleep_until(scheduled_t)
 
-            _run_validation_once(cfg)
+            actual_run_count += 1
+            _run_validation_once(cfg, actual_run_count)
             # 실행이 오래 걸렸으면, 지나간 횟수는 건너뛰고 다음 시간으로 맞춤
             now_t = time.monotonic()
             run_index = _compute_next_run_index(start_t, interval_sec, now_t)

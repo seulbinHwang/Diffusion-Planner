@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+# (:-0은 “없으면 0”이라는 뜻)
+RUN_COUNT="${1:-0}"
+echo "[INFO] run_count=${RUN_COUNT}"
 ###################################
 # User Configuration Section
 ###################################
@@ -115,4 +119,5 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_image False \
   --save_video False \
   --finish_when_no_updated_pt True \
+  --run_count "$RUN_COUNT" \
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

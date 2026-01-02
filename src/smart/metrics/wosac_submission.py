@@ -27,12 +27,15 @@ from src.utils.wosac_utils import get_scenario_id_int_tensor
 
 log = RankedLogger(__name__, rank_zero_only=False)
 
+
 # smart/metrics/wosac_submission.py
 class WOSACSubmission(Metric):
+
     def __init__(
-        self, is_active: bool,
+        self,
+        is_active: bool,
         save_path: str,
-            eval_method: str,
+        eval_method: str,
     ) -> None:
         super().__init__()
         self.is_active = is_active
@@ -40,10 +43,11 @@ class WOSACSubmission(Metric):
             self.method_name = "DRAFT"
             self.authors = ["Seulbin Hwang"]
             self.affiliation = "NaverLabs"
-            self.description = ("We generate multimodal future trajectories "
-                                "with diffusion and enforce physical plausibility "
-                                "by projecting them into feasible unicycle controls "
-                                "with an infeasible-control penalty.")
+            self.description = (
+                "We generate multimodal future trajectories "
+                "with diffusion and enforce physical plausibility "
+                "by projecting them into feasible unicycle controls "
+                "with an infeasible-control penalty.")
             self.method_link = "not available yet"
             self.account_name = "h.sb@naverlabs.com"
             self.buffer_scenario_rollouts = []
@@ -53,8 +57,8 @@ class WOSACSubmission(Metric):
             if os.path.exists(save_path):
                 shutil.rmtree(save_path)
 
-            
-            self.submission_dir = Path(os.path.join(save_path, f"wosac_submission"))
+            self.submission_dir = Path(
+                os.path.join(save_path, f"wosac_submission"))
 
             # Make directory if it doesn't exist
             self.submission_dir.mkdir(parents=True, exist_ok=True)
@@ -74,12 +78,12 @@ class WOSACSubmission(Metric):
 
     def update(
         self,
-        scenario_id: List[str], # length: B (시나리오 수)
-        agent_id: Tensor, # [n_ag]
-        agent_batch: Tensor, # [n_ag], 각 에이전트가 어느 시나리오에 속하는지 나타내는 인덱스
-        pred_traj: Tensor, # [n_ag, n_rollout, n_step, 2]
-        pred_z: Tensor, # [n_ag, n_rollout, n_step]
-        pred_head: Tensor, # [n_ag, n_rollout, n_step]
+        scenario_id: List[str],  # length: B (시나리오 수)
+        agent_id: Tensor,  # [n_ag]
+        agent_batch: Tensor,  # [n_ag], 각 에이전트가 어느 시나리오에 속하는지 나타내는 인덱스
+        pred_traj: Tensor,  # [n_ag, n_rollout, n_step, 2]
+        pred_z: Tensor,  # [n_ag, n_rollout, n_step]
+        pred_head: Tensor,  # [n_ag, n_rollout, n_step]
         global_rank: int,
     ) -> None:
         """
@@ -93,7 +97,8 @@ class WOSACSubmission(Metric):
         """
         _device = pred_traj.device
         self.agent_id.append(agent_id)
-        self.scenario_id.append(get_scenario_id_int_tensor(scenario_id, _device))
+        self.scenario_id.append(get_scenario_id_int_tensor(
+            scenario_id, _device))
         self.pred_traj.append(pred_traj)
         self.pred_z.append(pred_z)
         self.pred_head.append(pred_head)
@@ -105,7 +110,8 @@ class WOSACSubmission(Metric):
         return {k: getattr(self, k) for k in self.data_keys}
 
     def aggregate_rollouts(
-        self, scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts]
+        self,
+        scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts]
     ) -> None:
         """ GPU 중 한대에서만 실행됩니다.
         같은 scenario_id가 또 들어오면 한 번만 담도록 막습니다.
@@ -136,7 +142,8 @@ class WOSACSubmission(Metric):
 
         log.info(f"Saving wosac submission files to {tar_file_name}")
 
-        shard_files = sorted([p.as_posix() for p in self.submission_dir.glob("*")])
+        shard_files = sorted(
+            [p.as_posix() for p in self.submission_dir.glob("*")])
         with tarfile.open(tar_file_name, "w:gz") as tar:
             for output_filename in shard_files:
                 tar.add(
@@ -148,7 +155,8 @@ class WOSACSubmission(Metric):
     def _save_shard(self) -> None:
         shard_submission = sim_agents_submission_pb2.SimAgentsChallengeSubmission(
             scenario_rollouts=self.buffer_scenario_rollouts,
-            submission_type=sim_agents_submission_pb2.SimAgentsChallengeSubmission.SIM_AGENTS_SUBMISSION,
+            submission_type=sim_agents_submission_pb2.
+            SimAgentsChallengeSubmission.SIM_AGENTS_SUBMISSION,
             account_name=self.account_name,
             unique_method_name=self.method_name,
             authors=self.authors,

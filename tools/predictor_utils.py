@@ -4,7 +4,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 import numpy as np
 import torch
 from typing import Any, Dict, List, Optional, Tuple
-import os
+from requests.exceptions import HTTPError
+
 import shutil
 import time
 import wandb
@@ -24,30 +25,16 @@ from diffusion_planner.utils.train_utils import set_seed, save_model, resume_mod
 import torch
 from typing import Any, Dict, List, Optional, Tuple, Iterator
 
-
 def setup_logger_and_purge(
     args: argparse.Namespace,
     global_rank: int,
     wandb_id: Optional[str],
     allow_val_change: bool,
 ) -> Logger:
-    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리한다.
-
-    Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-        global_rank: 전체 프로세스 기준 번호.
-        wandb_id: 재개 시 사용할 wandb run id.
-        allow_val_change: wandb config 값 변경 허용 여부.
-
-    Returns:
-        wandb_logger: TensorBoardLogger 래퍼.
-    """
+    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리한다."""
     wandb_logger = Logger(
-        args.name,
-        args.notes,
         args,
         wandb_resume_id=wandb_id,
-        save_path=args.save_path,
         rank=global_rank,
         allow_val_change=allow_val_change,
     )
@@ -56,14 +43,73 @@ def setup_logger_and_purge(
         api = wandb.Api()
         entity = wandb.run.entity
         project = wandb.run.project
-
         purge_collection(api, entity, project, f"{args.name}_latest-model")
         purge_collection(api, entity, project, f"{args.name}_best-model")
 
-    if args.ddp:
+    # ✅ 분산이 "실제로 초기화된 경우"에만 barrier 호출
+    if bool(getattr(args, "ddp", False)) and ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
 
     return wandb_logger
+
+
+def purge_collection(api, entity, project, coll_name):
+    """
+    entity/project/coll_name 경로의 해당 컬렉션에 들어있는 아티팩트 버전 목록을 삭제
+
+    jksg01019-naver-labs/Diffusion-Planner/nuplan_womd_latest-model
+    jksg01019-naver-labs/Diffusion-Planner/nuplan_womd_best-model
+    """
+    path = f"{entity}/{project}/{coll_name}"
+    versions = safe_get_artifacts(api, "model", path)  # 신규 API 사용
+    if not versions:
+        print(f"[PURGE] {coll_name}: 삭제할 버전이 없습니다.")
+        return
+
+    deleted_count = 0
+    failed_count = 0
+
+    for art in versions:
+        try:
+            # alias가 있는 artifact의 경우 alias를 먼저 제거
+            if hasattr(art, 'aliases') and art.aliases:
+                print(
+                    f"[PURGE] {coll_name}: Artifact {art.id}에 alias가 있어 alias를 먼저 제거합니다: {art.aliases}"
+                )
+                for alias in art.aliases:
+                    try:
+                        art.delete_alias(alias)
+                        print(f"[PURGE] {coll_name}: Alias '{alias}' 제거 완료")
+                    except Exception as alias_err:
+                        print(
+                            f"[PURGE] {coll_name}: Alias '{alias}' 제거 실패: {alias_err}"
+                        )
+
+            # artifact 삭제 시도
+            art.delete()
+            deleted_count += 1
+            print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 완료")
+
+        except Exception as e:
+            failed_count += 1
+            print(f"[PURGE] {coll_name}: Artifact {art.id} 삭제 실패 - {str(e)}")
+            # alias가 있는 경우의 오류는 경고로만 처리하고 계속 진행
+            if "due to existing alias" in str(e):
+                print(
+                    f"[PURGE] {coll_name}: Alias로 인한 삭제 실패는 정상적인 상황입니다. 계속 진행합니다."
+                )
+
+    print(f"[PURGE] {coll_name}: 삭제 완료 {deleted_count}개, 실패 {failed_count}개")
+
+
+def safe_get_artifacts(api, type_name, path):
+    try:
+        return list(api.artifacts(type_name, path))
+    except (wandb.errors.CommError, HTTPError) as e:
+        # 404 또는 권한 오류 → 컬렉션이 아직 없다고 판단
+        print(f"[SKIP] '{path}' 컬렉션 없음/권한 문제: {e}")
+        return []
+
 
 def _select_latest_like_tag(save_path: str) -> str:
     """DeepSpeed 체크포인트 루트에서 '가장 최신 latest 계열 태그'를 고른다.
@@ -1160,7 +1206,7 @@ def _does_file_exist(file_path: str) -> bool:
 def _find_file_name_of_latest_or_best_dir(
     save_path: str,
     checkpoint_filename: str,
-) -> Optional[Tuple[str,str]]:
+) -> Optional[Tuple[str, str]]:
     """save_path 안에서 'latest' 또는 'best' 글자가 들어간 하위 폴더를 찾아,
     그 폴더 안에 checkpoint_filename 파일이 있으면 그 파일 경로를 돌려줍니다.
 
@@ -1203,10 +1249,10 @@ def _find_file_name_of_latest_or_best_dir(
             sub_entries = os.listdir(entry_path)
         except OSError:
             continue
-        has_pt_file = any(sub_entry.lower().endswith(".pt") for sub_entry in sub_entries)
+        has_pt_file = any(
+            sub_entry.lower().endswith(".pt") for sub_entry in sub_entries)
         if not has_pt_file:
             continue
-
 
         entry_lower = entry.lower()
         if ("latest" not in entry_lower) and ("best" not in entry_lower):
@@ -1217,10 +1263,11 @@ def _find_file_name_of_latest_or_best_dir(
 
 
 def _should_skip_wandb_checkpoint_download(
-    args: argparse.Namespace,
-    wandb_new_folder_name: str,
-    target_local_ckpt_path: str, # ./training_log/.../2025-12-06-06:56:58/latest.pth
-    checkpoint_filename: str, # 'latest.pth'
+        args: argparse.Namespace,
+        wandb_new_folder_name: str,
+        target_local_ckpt_path:
+    str,  # ./training_log/.../2025-12-06-06:56:58/latest.pth
+        checkpoint_filename: str,  # 'latest.pth'
 ) -> Tuple[bool, str]:
     """로컬에 이미 필요한 체크포인트가 갖춰져 있으면 W&B 다운로드를 생략할지 판단합니다.
 
@@ -1253,7 +1300,7 @@ def _should_skip_wandb_checkpoint_download(
         if has_main_ckpt:
             return True, "DeepSpeed 미사용: target_local_ckpt_path 파일이 이미 존재합니다."
         return False, "DeepSpeed 미사용: target_local_ckpt_path 파일이 없습니다."
-    
+
     save_path = getattr(args, "save_path", None)
     if not isinstance(save_path, str) or not save_path:
         return False, "DeepSpeed 사용: (조건 2) args.save_path가 비어 있어 하위 폴더를 확인할 수 없습니다."
@@ -1263,8 +1310,9 @@ def _should_skip_wandb_checkpoint_download(
         checkpoint_filename=checkpoint_filename,
     )
     if output_ is None:
-        return False, ("DeepSpeed 사용: (조건 2) save_path 아래 'latest/best' 이름을 가지면서,"
-                       "안에 .pt 파일이 있는 폴더를 찾지 못했습니다.")
+        return False, (
+            "DeepSpeed 사용: (조건 2) save_path 아래 'latest/best' 이름을 가지면서,"
+            "안에 .pt 파일이 있는 폴더를 찾지 못했습니다.")
     # DeepSpeed 사용 시: AND 조건
     if not has_main_ckpt:
         return False, "DeepSpeed 사용: (조건 1) target_local_ckpt_path 파일이 없습니다."
@@ -1279,19 +1327,27 @@ def _should_skip_wandb_checkpoint_download(
         save_path 에 있는 checkpoint_filename 도 삭제한다.
         """
         shutil.rmtree(found_dir_path, ignore_errors=True)
-        print(f"[CLEANUP] Removed mismatched DeepSpeed checkpoint dir: {found_dir_path}")
+        print(
+            f"[CLEANUP] Removed mismatched DeepSpeed checkpoint dir: {found_dir_path}"
+        )
         main_ckpt_path = os.path.join(save_path, checkpoint_filename)
         try:
             if _does_file_exist(main_ckpt_path):
                 os.remove(main_ckpt_path)
-                print(f"[CLEANUP] Removed mismatched main checkpoint file: {main_ckpt_path}")
+                print(
+                    f"[CLEANUP] Removed mismatched main checkpoint file: {main_ckpt_path}"
+                )
         except OSError:
             pass
-        return False, ("DeepSpeed 사용: (조건 2) W&B에서 찾은 폴더 이름과 실제 존재하는 폴더 이름이 다릅니다. "
-                       f"(wandb: {wandb_new_folder_name}, found: {found_in_tag_dir})")
+        return False, (
+            "DeepSpeed 사용: (조건 2) W&B에서 찾은 폴더 이름과 실제 존재하는 폴더 이름이 다릅니다. "
+            f"(wandb: {wandb_new_folder_name}, found: {found_in_tag_dir})")
 
-    return True, ("DeepSpeed 사용: (조건 1) 메인 파일 + (조건 2) 'latest/best' 폴더 안 파일 "
-                  f"둘 다 확인했습니다.  ( at wandb: {wandb_new_folder_name},  found: {found_in_tag_dir})")
+    return True, (
+        "DeepSpeed 사용: (조건 1) 메인 파일 + (조건 2) 'latest/best' 폴더 안 파일 "
+        f"둘 다 확인했습니다.  ( at wandb: {wandb_new_folder_name},  found: {found_in_tag_dir})"
+    )
+
 
 def _extract_first_pt_parent_dir(file_names: list[str]) -> str:
     """파일 목록에서 첫 번째 .pt 파일의 '상위 폴더 이름'을 뽑습니다.
@@ -1339,7 +1395,7 @@ def _download_wandb_checkpoint_to_local(
         collection_name: str,  # W&B 상에서 모델 묶음 이름. 예: f"{args.name}_latest-model".
         resume_alias: str,  # 'latest'
         checkpoint_filename: str,  # 'latest.pth'
-) -> None:
+) -> bool:
     """지정한 W&B 아티팩트에서 체크포인트 파일을 내려받고, 최종 디렉터리 경로를 돌려준다."""
     # rank 0만 별도 run을 만들어서 use_artifact 호출
     rank_str = os.environ.get("RANK", "0")
@@ -1405,8 +1461,9 @@ def _download_wandb_checkpoint_to_local(
     should_skip, skip_reason = _should_skip_wandb_checkpoint_download(
         args=args,
         wandb_new_folder_name=wandb_new_folder_name,
-        target_local_ckpt_path=target_local_ckpt_path, # ./training_log/.../2025-12-06-06:56:58/latest.pth
-        checkpoint_filename=checkpoint_filename, # 'latest.pth'
+        target_local_ckpt_path=
+        target_local_ckpt_path,  # ./training_log/.../2025-12-06-06:56:58/latest.pth
+        checkpoint_filename=checkpoint_filename,  # 'latest.pth'
     )
     if should_skip:
         print(f"[WANDB->local] skip download. rank={rank}, "
@@ -1415,11 +1472,17 @@ def _download_wandb_checkpoint_to_local(
               f"reason: {skip_reason}")
         if args.finish_when_no_updated_pt:
             print("[EXIT] finish_when_no_updated_pt is set. exit now.")
-            exit(0)
-        return
+            return True
+        return False
     if rank == 0:
         os.makedirs(past_save_path, exist_ok=True)
         artifacts_root = os.path.join(past_save_path, "artifacts")
+        # 이미 artifacts_root 가 있으면, 지우고 다시 받음
+        if os.path.exists(artifacts_root):
+            print(
+                f"[WANDB->local] artifacts_root '{artifacts_root}' already exist so delete and re download ."
+            )
+            shutil.rmtree(artifacts_root)
         artifact_dir_past = artifact.download(root=artifacts_root)
         print(
             f"[WANDB->local] {artifact_wandb_path} -> {artifact_dir_past} [download]. "
@@ -1522,7 +1585,7 @@ def _download_wandb_checkpoint_to_local(
         print(
             f"rank {rank} already checked downloaded checkpoint! : target_local_ckpt_path {target_local_ckpt_path}"
         )
-
+    return False
 
 def _determine_wandb_artifact_config(
     args: argparse.Namespace,) -> Tuple[str, str, str]:
@@ -1568,7 +1631,7 @@ def _validate_wandb_resume_args(args: argparse.Namespace) -> None:
             "args.load_name must be provided to resume from a wandb artifact.")
 
 
-def prepare_wandb_resume(args: argparse.Namespace,) -> None:
+def prepare_wandb_resume(args: argparse.Namespace,) -> bool:
     """명령행 인자를 읽고, 필요하다면 W&B 아티팩트에서 체크포인트를 내려받아 args를 보정한다.
 
     처리 흐름:
@@ -1590,7 +1653,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
     """
 
     if not args.resume_wandb_model_name:  # "latest"
-        return
+        return False
 
     _validate_wandb_resume_args(args)
     print(
@@ -1613,7 +1676,10 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
             print(
                 f"[WANDB->local] found existing local checkpoint: {local_ckpt_path} "
                 f"(alias={resume_alias}), skip wandb download.")
-            return
+            if args.finish_when_no_updated_pt:
+                print("[EXIT] finish_when_no_updated_pt is set. exit now.")
+                return True
+            return False
     """
     entity: str 예: 'jksg01019-naver-labs'
     project: str 예: 'Diffusion-Planner'
@@ -1627,7 +1693,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
                 latest.pth 를 다운받으면 된다. (not args.use_deepspeed 일 때)
                 latest_epoch-0000xx/ 디렉터리도 같이 복사해야 한다. (args.use_deepspeed 일 때)
         """
-        _download_wandb_checkpoint_to_local(
+        should_finish = _download_wandb_checkpoint_to_local(
             args,
             api=api,
             entity=entity,
@@ -1636,7 +1702,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> None:
             resume_alias=resume_alias,
             checkpoint_filename=checkpoint_filename,
         )
-
+        return should_finish
     except Exception as e:
         raise RuntimeError(f"W&B 아티팩트에서 체크포인트를 내려받는 중 오류가 발생했습니다: {e}") from e
 
@@ -1888,6 +1954,7 @@ def build_deepspeed_config(args: argparse.Namespace,
 
     return ds_config
 
+
 class NoPaddingDistributedEvalSampler(torch.utils.data.Sampler[int]):
     """평가용으로 "패딩/드랍 없이" 데이터 인덱스를 rank별로 나눠주는 도구입니다.
 
@@ -2073,8 +2140,8 @@ def build_dataset_and_sampler(
         )
         return data_set, data_sampler
     raise ValueError(
-        f"Unsupported eval_method for building dataset and sampler: eval_method='{eval_method}'")
-
+        f"Unsupported eval_method for building dataset and sampler: eval_method='{eval_method}'"
+    )
 
 
 def build_data_loader(
@@ -2121,7 +2188,8 @@ def build_data_loader(
 
     if drop_last is None:
         # ✅ eval sampler면 drop_last=False, train이면 drop_last=True
-        drop_last = not isinstance(data_sampler, NoPaddingDistributedEvalSampler)
+        drop_last = not isinstance(data_sampler,
+                                   NoPaddingDistributedEvalSampler)
 
     loader = DataLoader(
         data_set,
@@ -2135,7 +2203,6 @@ def build_data_loader(
         collate_fn=DiffusionPlannerCollate(args),
     )
     return loader
-
 
 
 def create_diffusion_planner_and_ema(

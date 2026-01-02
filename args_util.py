@@ -126,7 +126,10 @@ def get_args():
                         type=str,
                         help='data list of validation data',
                         default="validation") # or "test"
-
+    parser.add_argument('--run_count',
+                        type=int,
+                        help='number of run_count',
+                        default=0)
     parser.add_argument('--future_len',
                         type=int,
                         help='number of time point',

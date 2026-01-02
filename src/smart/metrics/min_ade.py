@@ -5,7 +5,10 @@ from typing import Optional, Tuple
 
 
 class minADE(Metric):
-    def __init__(self,  is_active: bool, only_eval_targets_to_predict: bool = True) -> None:
+
+    def __init__(self,
+                 is_active: bool,
+                 only_eval_targets_to_predict: bool = True) -> None:
         super(minADE, self).__init__()
         self.is_active = is_active
         # True이면 "targets_to_predict(ego 포함)"만 평가에 사용합니다.
@@ -17,19 +20,19 @@ class minADE(Metric):
         self.add_state("count", default=tensor(0.0), dist_reduce_fx="sum")
 
         # (1) WOSAC average_displacement_error 방식(시나리오 단위 평균 후 전체 평균)
-        self.add_state(
-            "wosac_like_avg_sum", default=tensor(0.0), dist_reduce_fx="sum"
-        )
+        self.add_state("wosac_like_avg_sum",
+                       default=tensor(0.0),
+                       dist_reduce_fx="sum")
 
         # (2) WOSAC min_average_displacement_error 방식(시나리오 단위 min 후 전체 평균)
-        self.add_state(
-            "wosac_like_min_sum", default=tensor(0.0), dist_reduce_fx="sum"
-        )
+        self.add_state("wosac_like_min_sum",
+                       default=tensor(0.0),
+                       dist_reduce_fx="sum")
 
         # (1)(2)에서 쓰는 “유효 시나리오 개수”
-        self.add_state(
-            "wosac_like_scenario_count", default=tensor(0.0), dist_reduce_fx="sum"
-        )
+        self.add_state("wosac_like_scenario_count",
+                       default=tensor(0.0),
+                       dist_reduce_fx="sum")
 
     @staticmethod
     def _compute_per_agent_per_rollout_ade(
@@ -146,11 +149,12 @@ class minADE(Metric):
 
             # (2) rollout마다 agent 평균 -> rollout 중 최소: scalar
             rollout_means = ade_sid.mean(dim=0)  # (R,)
-            scenario_min = rollout_means.min()   # ()
+            scenario_min = rollout_means.min()  # ()
 
             sum_avg = sum_avg + scenario_avg
             sum_min = sum_min + scenario_min
-            scenario_count = scenario_count + torch.ones((), device=device, dtype=dtype)
+            scenario_count = scenario_count + torch.ones(
+                (), device=device, dtype=dtype)
 
         return sum_avg, sum_min, scenario_count
 
@@ -177,7 +181,8 @@ class minADE(Metric):
                 dtype: torch.bool
                 shape: (N,)
         """
-        if eval_target_mask.dim() != 1 or int(eval_target_mask.shape[0]) != int(n_agent):
+        if eval_target_mask.dim() != 1 or int(
+                eval_target_mask.shape[0]) != int(n_agent):
             raise ValueError(
                 "eval_target_mask는 (N,) 이어야 합니다. "
                 f"expected N={int(n_agent)}, got shape={tuple(eval_target_mask.shape)}"
@@ -219,7 +224,8 @@ class minADE(Metric):
                 dtype: torch.bool
         """
         if agent_id.dim() != 1:
-            raise ValueError(f"agent_id는 (N,) 이어야 합니다. shape={tuple(agent_id.shape)}")
+            raise ValueError(
+                f"agent_id는 (N,) 이어야 합니다. shape={tuple(agent_id.shape)}")
 
         n_agent = int(agent_id.shape[0])
         device = agent_id.device
@@ -227,7 +233,9 @@ class minADE(Metric):
         agent_id_long = agent_id.to(device=device, dtype=torch.long)
 
         if agent_batch is None:
-            agent_batch_long = torch.zeros((n_agent,), device=device, dtype=torch.long)
+            agent_batch_long = torch.zeros((n_agent,),
+                                           device=device,
+                                           dtype=torch.long)
         else:
             if agent_batch.dim() != 1 or int(agent_batch.shape[0]) != n_agent:
                 raise ValueError(
@@ -240,19 +248,18 @@ class minADE(Metric):
         if eval_ids.dim() == 1:
             eval_ids = eval_ids.unsqueeze(0)  # (1, K)
         elif eval_ids.dim() != 2:
-            raise ValueError(
-                "eval_object_ids는 (K,) 또는 (B, K) 이어야 합니다. "
-                f"현재 shape={tuple(eval_object_ids.shape)}"
-            )
+            raise ValueError("eval_object_ids는 (K,) 또는 (B, K) 이어야 합니다. "
+                             f"현재 shape={tuple(eval_object_ids.shape)}")
 
         max_sid = int(agent_batch_long.max().item()) if n_agent > 0 else 0
         if int(eval_ids.shape[0]) <= max_sid:
             raise ValueError(
                 "eval_object_ids의 첫 번째 차원(B)이 agent_batch의 시나리오 인덱스를 커버하지 못합니다. "
-                f"B={int(eval_ids.shape[0])}, max_sid={max_sid}"
-            )
+                f"B={int(eval_ids.shape[0])}, max_sid={max_sid}")
 
-        eval_target_mask = torch.zeros((n_agent,), device=device, dtype=torch.bool)
+        eval_target_mask = torch.zeros((n_agent,),
+                                       device=device,
+                                       dtype=torch.bool)
         unique_scenarios = torch.unique(agent_batch_long)
 
         for sid in unique_scenarios:
@@ -264,20 +271,21 @@ class minADE(Metric):
             if ids_this.numel() == 0:
                 continue
 
-            eval_target_mask[sid_mask] = torch.isin(agent_id_long[sid_mask], ids_this)
+            eval_target_mask[sid_mask] = torch.isin(agent_id_long[sid_mask],
+                                                    ids_this)
 
         return eval_target_mask
 
     def update(
-        self,
-        pred: Tensor,         # (N, R, T, 2)
-        target: Tensor,       # (N, T, 2)
-        target_valid: Tensor, # (N, T)
-        agent_batch: Optional[Tensor] = None,  # (N,)
-        *,
-        agent_id: Optional[Tensor] = None,          # (N,)
-        eval_object_ids: Optional[Tensor] = None,   # (K,) or (B, K)
-        eval_target_mask: Optional[Tensor] = None,  # (N,)
+            self,
+            pred: Tensor,  # (N, R, T, 2)
+            target: Tensor,  # (N, T, 2)
+            target_valid: Tensor,  # (N, T)
+            agent_batch: Optional[Tensor] = None,  # (N,)
+            *,
+            agent_id: Optional[Tensor] = None,  # (N,)
+            eval_object_ids: Optional[Tensor] = None,  # (K,) or (B, K)
+            eval_target_mask: Optional[Tensor] = None,  # (N,)
     ) -> None:
         # (N, R), (N,)
         per_agent_per_rollout_ade, valid_agent_mask = self._compute_per_agent_per_rollout_ade(

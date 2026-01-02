@@ -232,7 +232,8 @@ def _recommend_wosac_mp_processes(
     cpu_fraction = float(_get_wosac_cpu_fraction())
     gpu_proc = int(max(1, _get_gpu_process_count_per_node()))
 
-    raw_p = (float(cpu_cores) * float(cpu_fraction)) / float(gpu_proc) / float(safe_t)
+    raw_p = (float(cpu_cores) *
+             float(cpu_fraction)) / float(gpu_proc) / float(safe_t)
 
     # "대략 규칙"이므로 단순하게 내림 후 최소 1
     p = int(max(1, int(raw_p)))
@@ -304,6 +305,7 @@ def _init_wosac_mp_worker(tf_num_threads: int) -> None:
         None
     """
     _configure_tensorflow_for_wosac(tf_num_threads=int(tf_num_threads))
+
 
 def _get_wosac_mp_maxtasksperchild() -> Optional[int]:
     """Pool worker를 몇 번의 작업 후 새로 갈아끼울지(선택)를 읽습니다.
@@ -517,7 +519,10 @@ class WOSACMetrics(Metric):
     validation metrics based on ground truth trajectory, using waymo_open_dataset api
     """
 
-    def __init__(self, prefix: str, is_active:bool, ego_only: bool = False) -> None:
+    def __init__(self,
+                 prefix: str,
+                 is_active: bool,
+                 ego_only: bool = False) -> None:
         super().__init__()
         self.is_active = is_active
         self.is_mp_init = False
@@ -722,7 +727,7 @@ class WOSACMetrics(Metric):
     def _compute_scenario_metrics(
         config,
         scenario_file,
-        scenario_rollout, # sim_agents_submission_pb2.ScenarioRollouts
+        scenario_rollout,  # sim_agents_submission_pb2.ScenarioRollouts
         ego_only,
     ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
         scenario = scenario_pb2.Scenario()
@@ -730,8 +735,9 @@ class WOSACMetrics(Metric):
         debug = False
         first_id = None
         second_id = None
-        if  debug:
-            dataset = tf.data.TFRecordDataset([scenario_file], compression_type="")
+        if debug:
+            dataset = tf.data.TFRecordDataset([scenario_file],
+                                              compression_type="")
             for idx, data in enumerate(dataset):
                 tmp = scenario_pb2.Scenario()
                 tmp.ParseFromString(bytes(data.numpy()))
@@ -906,9 +912,9 @@ class WOSACMetrics(Metric):
             pass
 
     def update(
-            self,
-            scenario_files: List[str],
-            scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
+        self,
+        scenario_files: List[str],
+        scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
     ) -> None:
 
         # ✅ 현재 배치 크기(= 처리할 시나리오 개수)
@@ -916,25 +922,22 @@ class WOSACMetrics(Metric):
 
         # ✅ Option A 규칙으로 worker 수(P) 계산
         tf_threads: int = int(
-            getattr(self, "_tf_num_threads", _get_wosac_tf_num_threads())
-        )
+            getattr(self, "_tf_num_threads", _get_wosac_tf_num_threads()))
         recommended_p: int = _recommend_wosac_mp_processes(
             batch_size=batch_size_now,
             tf_num_threads=tf_threads,
         )
 
         # 필요하면 환경변수로 mp 자체를 끌 수 있게(안전장치)
-        disable_mp: bool = str(
-            os.environ.get("DP_WOSAC_DISABLE_MP", "0")
-        ).strip() == "1"
+        disable_mp: bool = str(os.environ.get("DP_WOSAC_DISABLE_MP",
+                                              "0")).strip() == "1"
 
         use_mp_pool: bool = (not disable_mp) and (recommended_p > 1)
-        print( f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
-                f"tf_threads={tf_threads}, "
-                f"recommended_p={recommended_p}, "
-                f"use_mp_pool={use_mp_pool}, "
-                f"disable_mp={disable_mp} "
-                 )
+        print(f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
+              f"tf_threads={tf_threads}, "
+              f"recommended_p={recommended_p}, "
+              f"use_mp_pool={use_mp_pool}, "
+              f"disable_mp={disable_mp} ")
         # disable_mp가 켜졌으면, 이미 떠 있는 Pool도 정리(원하면)
         if disable_mp:
             self.close_mp_pool()
@@ -959,15 +962,15 @@ class WOSACMetrics(Metric):
             )
         else:
             pool_scenario_metrics = []
-            for _scenario, _scenario_rollout in zip(scenario_files, scenario_rollouts):
+            for _scenario, _scenario_rollout in zip(scenario_files,
+                                                    scenario_rollouts):
                 pool_scenario_metrics.append(
                     self._compute_scenario_metrics(
                         self.wosac_config,
                         _scenario,
                         _scenario_rollout,
                         self.ego_only,
-                    )
-                )
+                    ))
 
         for scenario_metrics, z_only in pool_scenario_metrics:
             self.scenario_counter += 1
@@ -989,12 +992,9 @@ class WOSACMetrics(Metric):
             self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
 
             self.z_only_average_displacement_error += tensor(
-                float(z_only.get("average_displacement_error_z_only", 0.0))
-            )
+                float(z_only.get("average_displacement_error_z_only", 0.0)))
             self.z_only_min_average_displacement_error += tensor(
-                float(z_only.get("min_average_displacement_error_z_only", 0.0))
-            )
-
+                float(z_only.get("min_average_displacement_error_z_only", 0.0)))
 
     def compute(self) -> Dict[str, Tensor]:
         metrics_dict = {}
