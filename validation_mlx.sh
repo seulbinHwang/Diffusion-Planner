@@ -135,7 +135,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # - env에 이미 값이 있으면 그 값을 그대로 사용
 # - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
 # ----------------------------
-export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-4}"
+export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-8}"
 export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
 
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
@@ -171,7 +171,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --batch_size 1024 \
   --use_deepspeed True \
   --wosac_sub_is_active True \
-  --wosac_metric_is_active True \
+  --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
   --finish_when_no_updated_pt True \
