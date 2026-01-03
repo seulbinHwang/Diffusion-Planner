@@ -9,7 +9,7 @@ echo "[INFO] run_count=${RUN_COUNT}"
 ###################################
 USER_PATH="/mnt/nuplan"
 #WOMD_PATH="${USER_PATH}/womd_v1_3"
-WOMD_PATH="${USER_PATH}/D/dataset"
+WOMD_PATH="${USER_PATH}/dataset"
 # `~/womd_v1_3/processed_womd_final/validation`
 
 # ✅ conda run으로 들어온 환경의 python을 자동으로 사용
