@@ -536,6 +536,15 @@ def validate_wosac_rollouts_or_raise(
         raise ValueError(f"[WOSAC 규칙 위반] scenario_id='{sid}' | {e}") from e
 
 
+def _format_duration_hms(duration_sec: float) -> str:
+    """초 단위 시간을 'Hh Mm Ss' 문자열로 바꿉니다."""
+    total_sec = int(max(0.0, float(duration_sec)))
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    seconds = total_sec % 60
+    return f"{hours}h {minutes:02d}m {seconds:02d}s"
+
+
 class WOSACMetrics(Metric):
     """
     validation metrics based on ground truth trajectory, using waymo_open_dataset api
@@ -934,9 +943,9 @@ class WOSACMetrics(Metric):
             pass
 
     def update(
-            self,
-            scenario_files: List[str],
-            scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
+        self,
+        scenario_files: List[str],
+        scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
     ) -> None:
         batch_size_now: int = int(len(scenario_rollouts))
 
@@ -947,8 +956,8 @@ class WOSACMetrics(Metric):
             tf_num_threads=tf_threads,
         )
 
-        disable_mp: bool = str(
-            os.environ.get("DP_WOSAC_DISABLE_MP", "0")).strip() == "1"
+        disable_mp: bool = str(os.environ.get("DP_WOSAC_DISABLE_MP",
+                                              "0")).strip() == "1"
         use_mp_pool: bool = (not disable_mp) and (recommended_p > 1)
 
         progress_sec_raw = _read_float_env("DP_WOSAC_PROGRESS_SEC", 60.0)
@@ -957,11 +966,13 @@ class WOSACMetrics(Metric):
         if progress_sec <= 0.0:
             progress_sec = 0.0
 
-        print(f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
-              f"tf_threads={tf_threads}, "
-              f"recommended_p={recommended_p}, "
-              f"use_mp_pool={use_mp_pool}, "
-              f"disable_mp={disable_mp}", flush=True)
+        print(
+            f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
+            f"tf_threads={tf_threads}, "
+            f"recommended_p={recommended_p}, "
+            f"use_mp_pool={use_mp_pool}, "
+            f"disable_mp={disable_mp}",
+            flush=True)
 
         if disable_mp:
             self.close_mp_pool()
@@ -975,10 +986,13 @@ class WOSACMetrics(Metric):
             if progress_sec <= 0.0:
                 return
             now = time.perf_counter()
-            if force or (now - last_print_t) >= float(
-                    progress_sec) or done >= total:
+            if force or (now -
+                         last_print_t) >= float(progress_sec) or done >= total:
                 elapsed = now - start_t
-                print(f"[WOSACMetrics] progress: {done}/{total} (elapsed {elapsed:.0f}s)", flush=True)
+                elapsed_str = _format_duration_hms(elapsed)
+                print(
+                    f"[WOSACMetrics] progress: {done}/{total} (elapsed {elapsed_str})",
+                    flush=True)
                 last_print_t = now
 
         _maybe_print(0, force=True)
@@ -1024,19 +1038,18 @@ class WOSACMetrics(Metric):
                 self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
 
                 self.z_only_average_displacement_error += tensor(
-                    float(z_only.get("average_displacement_error_z_only", 0.0))
-                )
+                    float(z_only.get("average_displacement_error_z_only", 0.0)))
                 self.z_only_min_average_displacement_error += tensor(
-                    float(z_only.get("min_average_displacement_error_z_only",
-                                     0.0))
-                )
+                    float(
+                        z_only.get("min_average_displacement_error_z_only",
+                                   0.0)))
 
             _maybe_print(done, force=True)
 
         else:
             done = 0
-            for _scenario_file, _scenario_rollout in zip(scenario_files,
-                                                         scenario_rollouts):
+            for _scenario_file, _scenario_rollout in zip(
+                    scenario_files, scenario_rollouts):
                 scenario_metrics, z_only = self._compute_scenario_metrics(
                     self.wosac_config,
                     _scenario_file,
@@ -1065,12 +1078,11 @@ class WOSACMetrics(Metric):
                 self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
 
                 self.z_only_average_displacement_error += tensor(
-                    float(z_only.get("average_displacement_error_z_only", 0.0))
-                )
+                    float(z_only.get("average_displacement_error_z_only", 0.0)))
                 self.z_only_min_average_displacement_error += tensor(
-                    float(z_only.get("min_average_displacement_error_z_only",
-                                     0.0))
-                )
+                    float(
+                        z_only.get("min_average_displacement_error_z_only",
+                                   0.0)))
 
             _maybe_print(done, force=True)
 

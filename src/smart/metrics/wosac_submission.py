@@ -11,7 +11,7 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 import shutil
-
+import time
 import tarfile
 from pathlib import Path
 from typing import Dict, List
@@ -51,6 +51,23 @@ class WOSACSubmission(Metric):
             self.method_link = "not available yet"
             self.account_name = "h.sb@naverlabs.com"
             self.buffer_scenario_rollouts = []
+            # ----------------------------
+            # 진행 상황(Progress) 출력 설정 (공통: DP_PROGRESS_SEC)
+            # - DP_PROGRESS_SEC <= 0 이면 출력 안 함
+            # ----------------------------
+            self._progress_interval_sec: float = self._read_progress_interval_sec(
+                default_sec=60.0)
+            self._progress_start_time_sec: float = float(time.perf_counter())
+            self._progress_last_print_time_sec: float = float(
+                self._progress_start_time_sec)
+
+            self._progress_total_received: int = 0
+            self._progress_total_duplicates: int = 0
+            self._saved_shard_count: int = 0
+
+            # 중복 scenario 방지용(빠른 조회)
+            self._submission_scenario_id_set = set()
+
             self.i_file = 0
             save_path = os.path.join(save_path, eval_method)
             # remove existing save_path directory
@@ -109,6 +126,70 @@ class WOSACSubmission(Metric):
     def compute(self) -> Dict[str, Tensor]:
         return {k: getattr(self, k) for k in self.data_keys}
 
+    @staticmethod
+    def _read_progress_interval_sec(default_sec: float = 60.0) -> float:
+        """DP_PROGRESS_SEC 환경변수에서 진행 출력 주기(초)를 읽습니다.
+
+        - 값이 없거나 숫자로 변환이 안 되면 default_sec 사용
+        - 0 이하이면 진행 출력 기능을 끕니다.
+
+        Args:
+            default_sec (float): 기본값(초). shape: ()
+
+        Returns:
+            float: 출력 주기(초). shape: ()
+        """
+        raw = os.environ.get("DP_PROGRESS_SEC", "")
+        if str(raw).strip() == "":
+            return float(default_sec)
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            return float(default_sec)
+
+    @staticmethod
+    def _format_duration_hms(duration_sec: float) -> str:
+        """초 단위 시간을 'Hh Mm Ss' 문자열로 바꿉니다."""
+        total_sec = int(max(0.0, float(duration_sec)))
+        hours = total_sec // 3600
+        minutes = (total_sec % 3600) // 60
+        seconds = total_sec % 60
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+
+    def _maybe_print_progress(self, force: bool = False) -> None:
+        """조건이 맞으면 WOSACSubmission 진행 상황을 출력합니다."""
+        interval_sec = float(getattr(self, "_progress_interval_sec", 0.0))
+        if interval_sec <= 0.0:
+            return
+
+        now = float(time.perf_counter())
+        last = float(getattr(self, "_progress_last_print_time_sec", now))
+        if (not force) and ((now - last) < interval_sec):
+            return
+
+        start = float(getattr(self, "_progress_start_time_sec", now))
+        elapsed = now - start
+
+        try:
+            unique_cnt = int(
+                len(getattr(self, "_submission_scenario_id_set", set())))
+        except Exception:
+            unique_cnt = int(len(getattr(self, "submission_scenario_id", [])))
+
+        buffer_cnt = int(len(getattr(self, "buffer_scenario_rollouts", [])))
+        shard_cnt = int(getattr(self, "_saved_shard_count", 0))
+        recv_cnt = int(getattr(self, "_progress_total_received", 0))
+        dup_cnt = int(getattr(self, "_progress_total_duplicates", 0))
+
+        elapsed_str = self._format_duration_hms(elapsed)
+        print(
+            f"[WOSACSubmission] progress: unique={unique_cnt}, buffer={buffer_cnt}, "
+            f"shards_saved={shard_cnt}, received={recv_cnt}, dup_skipped={dup_cnt} "
+            f"(elapsed {elapsed_str})",
+            flush=True,
+        )
+        self._progress_last_print_time_sec = float(now)
+
     def aggregate_rollouts(
         self,
         scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts]
@@ -123,18 +204,28 @@ class WOSACSubmission(Metric):
             저장 후 버퍼를 비웁니다.
         """
         for rollout in scenario_rollouts:
-            if rollout.scenario_id not in self.submission_scenario_id:
-                self.submission_scenario_id.append(rollout.scenario_id)
-                self.buffer_scenario_rollouts.append(rollout)
-                if len(self.buffer_scenario_rollouts) > 300:
-                    self._save_shard()
+            self._progress_total_received += 1
+
+            sid = rollout.scenario_id
+            if sid in self._submission_scenario_id_set:
+                self._progress_total_duplicates += 1
+                continue
+
+            self._submission_scenario_id_set.add(sid)
+            self.submission_scenario_id.append(sid)
+            self.buffer_scenario_rollouts.append(rollout)
+
+            if len(self.buffer_scenario_rollouts) > 300:
+                self._save_shard()
+                self._maybe_print_progress(force=True)
+
+        self._maybe_print_progress(force=False)
 
     def save_sub_file(self) -> None:
         """
         남아있는 버퍼를 먼저 파일 1개로 저장
 
         지금까지 모아둔 제출 데이터를 최종 제출 파일(.tar.gz)로 정리해서 저장
-
         """
         self._save_shard()
         self.i_file = 0
@@ -144,13 +235,32 @@ class WOSACSubmission(Metric):
 
         shard_files = sorted(
             [p.as_posix() for p in self.submission_dir.glob("*")])
+        total = int(len(shard_files))
+
+        interval_sec = float(getattr(self, "_progress_interval_sec", 0.0))
+        tar_start_t = float(time.perf_counter())
+        tar_last_t = float(tar_start_t)
+
         with tarfile.open(tar_file_name, "w:gz") as tar:
-            for output_filename in shard_files:
+            for idx, output_filename in enumerate(shard_files, start=1):
                 tar.add(
                     output_filename,
                     arcname=output_filename + f"-of-{len(shard_files):05d}",
                 )
+
+                if interval_sec > 0.0:
+                    now = float(time.perf_counter())
+                    if (now - tar_last_t) >= interval_sec or idx >= total:
+                        elapsed = now - tar_start_t
+                        elapsed_str = self._format_duration_hms(elapsed)
+                        print(
+                            f"[WOSACSubmission] tar progress: {idx}/{total} (elapsed {elapsed_str})",
+                            flush=True,
+                        )
+                        tar_last_t = now
+
         log.info(f"DONE: Saved wosac submission files to {tar_file_name}")
+        self._maybe_print_progress(force=True)
 
     def _save_shard(self) -> None:
         shard_submission = sim_agents_submission_pb2.SimAgentsChallengeSubmission(
@@ -173,5 +283,9 @@ class WOSACSubmission(Metric):
         log.info(f"Saving wosac submission files to {output_filename}")
         with open(output_filename, "wb") as f:
             f.write(shard_submission.SerializeToString())
+
         self.i_file += 1
+        self._saved_shard_count += 1
         self.buffer_scenario_rollouts = []
+
+        self._maybe_print_progress(force=True)

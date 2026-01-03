@@ -130,6 +130,15 @@ def _get_validation_batch_progress_tag(args: Any) -> str:
     return "batch ?/?"
 
 
+def _format_duration_hms(duration_sec: float) -> str:
+    """초 단위 시간을 'Hh Mm Ss' 문자열로 바꿉니다."""
+    total_sec = int(max(0.0, float(duration_sec)))
+    hours = total_sec // 3600
+    minutes = (total_sec % 3600) // 60
+    seconds = total_sec % 60
+    return f"{hours}h {minutes:02d}m {seconds:02d}s"
+
+
 class _ValidationHeartbeat:
     """검증이 오래 걸릴 때도 “아직 실행 중”임을 주기적으로 보여줍니다.
 
@@ -172,7 +181,8 @@ class _ValidationHeartbeat:
             with self._lock:
                 stage = self._stage
             elapsed = time.perf_counter() - self._start_time_sec
-            print(f"[HEARTBEAT] {elapsed:.0f}s | {stage}", flush=True)
+            elapsed_str = _format_duration_hms(elapsed)
+            print(f"[HEARTBEAT] {elapsed_str} | {stage}", flush=True)
 
 
 def _start_validation_heartbeat_if_needed(args: argparse.Namespace) -> None:
