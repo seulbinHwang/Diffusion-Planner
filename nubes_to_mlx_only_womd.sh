@@ -9,7 +9,7 @@ NUBES_WOMD_SPLIT_NAME="validation"
 NUBES_WOMD_TF_SPLIT_NAME="validation_tfrecords_splitted"
 
 VALIDATION_SET_PATH="/mnt/nuplan/dataset/processed_validation"   # 디렉터리 자체는 유지, 내용만 비움
-VALIDATION_TF_SET_PATH="/mnt/nuplan/dataset/validation_tfrecords_splitted"   # 디렉터리 자체는 유지, 내용만 비움
+VALIDATION_TF_SET_PATH="/mnt/nuplan/dataset/processed_validation_tfrecords_splitted"   # 디렉터리 자체는 유지, 내용만 비움
 VALIDATION_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_validation.json"
 
 ###################################
