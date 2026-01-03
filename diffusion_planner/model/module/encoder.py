@@ -13,64 +13,6 @@ from contextlib import contextmanager
 from typing import Iterator
 
 
-import os
-from typing import Any, Optional
-import torch
-import torch.nn as nn
-
-
-def _pick_tensor_from_hook_output(output: Any) -> Optional[torch.Tensor]:
-    """hook 출력에서 dtype을 확인할 '대표 텐서'를 하나 고릅니다."""
-    if isinstance(output, torch.Tensor):
-        return output
-    if isinstance(output, (tuple, list)) and len(output) > 0 and isinstance(output[0], torch.Tensor):
-        return output[0]
-    return None
-
-
-def attach_once_dtype_hook(module: nn.Module, name: str) -> None:
-    """module의 forward 출력 dtype을 딱 1번만 출력하는 훅을 답니다(출력 후 자동 해제)."""
-    # 중복 설치 방지
-    if getattr(module, "_dp_dtype_hook_installed", False):
-        return
-    setattr(module, "_dp_dtype_hook_installed", True)
-
-    # 멀티 프로세스면 로그가 많이 찍힐 수 있어 rank0만 찍게(원하면 삭제 가능)
-    if os.environ.get("RANK", "0") != "0":
-        return
-
-    handle_box = {"h": None}  # forward hook 제거용
-
-    def _hook(_mod: nn.Module, _inp: Any, out: Any) -> None:
-        t = _pick_tensor_from_hook_output(out)
-        autocast_on = torch.is_autocast_enabled()
-
-        # autocast dtype는 PyTorch 버전에 따라 API가 없을 수 있어 try로 보호
-        autocast_dtype = None
-        if autocast_on and t is not None and t.is_cuda:
-            try:
-                autocast_dtype = torch.get_autocast_gpu_dtype()
-            except Exception:
-                autocast_dtype = None
-
-        if t is None:
-            print(f"[DTYPE_HOOK] {name}: (출력 텐서를 못 찾음) autocast={autocast_on}", flush=True)
-        else:
-            print(
-                f"[DTYPE_HOOK] {name}: out.dtype={t.dtype} | autocast={autocast_on}"
-                + (f" | autocast_dtype={autocast_dtype}" if autocast_dtype is not None else ""),
-                flush=True,
-            )
-
-        # 딱 1번만 찍고 훅 제거
-        h = handle_box["h"]
-        if h is not None:
-            h.remove()
-            handle_box["h"] = None
-
-    handle_box["h"] = module.register_forward_hook(_hook)
-
-
 @contextmanager
 def profile_block(name: str,
                   enabled: bool = True,
@@ -466,9 +408,6 @@ class Encoder(nn.Module):
             drop_path_rate=config.encoder_drop_path_rate,
             depth=config.encoder_depth,
             device=config.device)
-        if os.environ.get("DP_DEBUG_DTYPE_HOOK", "0") == "1":
-            attach_once_dtype_hook(self.fusion.blocks[0].qkv_proj,
-                                   "fusion.blocks[0].qkv_proj")
 
         # position embedding encode
         # [x, y, cos, sin] + type_onehot(5) = 9
