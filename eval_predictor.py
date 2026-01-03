@@ -705,8 +705,8 @@ def model_validation(
             batch_size,
             world_size,
         )
-        if args.ddp and not use_deepspeed:
-            torch.distributed.barrier()
+        _maybe_distributed_barrier(args, context="after build_data_loader")
+
 
         _update_validation_heartbeat_stage(args, "모델 준비중")
 
@@ -1218,8 +1218,8 @@ def validation_epoch(
     min_ade: minADE,
 ) -> Dict[str, torch.Tensor]:
     model.eval()
-    if args.ddp:
-        torch.cuda.synchronize()
+    # if args.ddp:
+    #     torch.cuda.synchronize()
 
     total_batch_steps = int(max(1, batch_num_in_one_val_epoch))
 
@@ -1269,8 +1269,8 @@ def validation_epoch(
                 min_ade=min_ade,
             )
 
-            if args.ddp:
-                torch.cuda.synchronize()
+            # if args.ddp:
+            #     torch.cuda.synchronize()
 
             # ✅ rank=0 + verbose=True 일 때만, 간단 진행률/ETA 출력
             if progress_state is not None:
