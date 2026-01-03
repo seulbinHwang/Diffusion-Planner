@@ -144,7 +144,7 @@ class _ValidationHeartbeat:
     def __init__(self, interval_sec: float) -> None:
         self._interval_sec: float = float(interval_sec)
         self._start_time_sec: float = float(time.perf_counter())
-        self._stage: str = "시작 준비중"
+        self._stage: str = "initializing"
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -680,13 +680,13 @@ def model_validation(
     torch.cuda.empty_cache()
 
     _start_validation_heartbeat_if_needed(args)
-    _update_validation_heartbeat_stage(args, "검증 준비중")
+    _update_validation_heartbeat_stage(args, "preparing validation")
 
     try:
         # 2) seed 고정
         set_seed(args.seed + global_rank)
 
-        _update_validation_heartbeat_stage(args, "데이터 로더 준비중")
+        _update_validation_heartbeat_stage(args, "building data loader")
 
         # 3) augmentation, Dataset, Sampler
         batch_size = args.batch_size
@@ -708,7 +708,7 @@ def model_validation(
         _maybe_distributed_barrier(args, context="after build_data_loader")
 
 
-        _update_validation_heartbeat_stage(args, "모델 준비중")
+        _update_validation_heartbeat_stage(args, "building model")
 
         diffusion_planner, model_ema, base_model = create_diffusion_planner_and_ema(
             args=args,
@@ -722,7 +722,7 @@ def model_validation(
                                                  config=ds_config)
             diffusion_planner = ds_engine.module  # 이후 diffusion_planner로 그대로 추론
 
-        _update_validation_heartbeat_stage(args, "체크포인트 불러오는 중")
+        _update_validation_heartbeat_stage(args, "loading checkpoint")
 
         # 6) 체크포인트 재개
         (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
@@ -751,7 +751,7 @@ def model_validation(
             allow_val_change=allow_val_change,
         )
 
-        _update_validation_heartbeat_stage(args, "검증 루프 실행중")
+        _update_validation_heartbeat_stage(args, "running validation loop")
 
         run_validation_loop(
             args=args,
@@ -765,7 +765,7 @@ def model_validation(
             global_rank=global_rank,
         )
 
-        _update_validation_heartbeat_stage(args, "마무리 정리중")
+        _update_validation_heartbeat_stage(args, "finalizing")
         _finalize_eval_cleanup(args, global_rank, wandb_logger)
 
     finally:
@@ -3114,12 +3114,12 @@ def validate_func(
     """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다."""
     tag = _get_validation_batch_progress_tag(args)
 
-    _update_validation_heartbeat_stage(args, f"{tag} | 모델 선택/준비 중")
+    _update_validation_heartbeat_stage(args, f"{tag} | selecting model")
 
     inference_model: nn.Module = _prepare_inference_model_for_validation(
         model=model, ema=ema)
 
-    _update_validation_heartbeat_stage(args, f"{tag} | 입력 정리 중")
+    _update_validation_heartbeat_stage(args, f"{tag} | preparing inputs")
 
     norm_inputs = _sanitize_norm_inputs_for_validation(norm_inputs)
     future_len: int = int(getattr(args, "future_len"))
@@ -3134,7 +3134,7 @@ def validate_func(
     rollout_number, requested_rollout_chunk_size, base_seed, ddp_rank = _get_rollout_settings_for_validation(args)
 
     _update_validation_heartbeat_stage(
-        args, f"{tag} | rollout 예측 중 (rollout={rollout_number})"
+        args, f"{tag} | predicting rollouts (rollout={rollout_number})"
     )
 
     target_scenario_rollouts_world = _predict_rollouts_batched_with_oom_fallback(
@@ -3150,7 +3150,7 @@ def validate_func(
         ddp_rank=int(ddp_rank),
     )
 
-    _update_validation_heartbeat_stage(args, f"{tag} | rollout 후처리/변환 중")
+    _update_validation_heartbeat_stage(args, f"{tag} | postprocessing rollouts")
 
     pred_traj, pred_head = _build_pred_traj_and_pred_head_from_world_rollouts(
         target_scenario_rollouts_world=target_scenario_rollouts_world)
@@ -3210,7 +3210,7 @@ def validate_func(
     )
     scenario_rollouts: Optional[List[sim_agents_submission_pb2.ScenarioRollouts]] = None
     if need_scenario_rollouts:
-        _update_validation_heartbeat_stage(args, f"{tag} | WOSAC 입력 묶는 중")
+        _update_validation_heartbeat_stage(args, f"{tag} | packaging WOSAC inputs")
         scenario_rollouts = get_scenario_rollouts(
             scenario_id=get_scenario_id_int_tensor(scenario_id, device),
             agent_id=wosac_agent_id,
@@ -3221,7 +3221,7 @@ def validate_func(
         )
 
     if wosac_submission.is_active:
-        _update_validation_heartbeat_stage(args, f"{tag} | 제출 파일용 데이터 모으는 중")
+        _update_validation_heartbeat_stage(args, f"{tag} | collecting data for submission")
 
         wosac_submission.update(
             scenario_id=scenario_id,
@@ -3253,12 +3253,12 @@ def validate_func(
             raise RuntimeError("wosac_metrics가 active인데 scenario_rollouts가 생성되지 않았습니다.")
 
         _update_validation_heartbeat_stage(
-            args, f"{tag} | WOSAC 점수 계산 중 (시나리오 {batch_size}개)"
+            args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})"
         )
         wosac_metrics.update(tfrecord_path, scenario_rollouts)
 
     if min_ade.is_active:
-        _update_validation_heartbeat_stage(args, f"{tag} | minADE 계산 중")
+        _update_validation_heartbeat_stage(args, f"{tag} | computing minADE")
 
         eval_object_ids: Optional[torch.Tensor] = None
         if bool(min_ade.only_eval_targets_to_predict):
@@ -3281,7 +3281,7 @@ def validate_func(
             min_ade=min_ade,
         )
 
-    _update_validation_heartbeat_stage(args, f"{tag} | 배치 마무리 중")
+    _update_validation_heartbeat_stage(args,  f"{tag} | finalizing batch")
 
 
 

@@ -978,8 +978,7 @@ class WOSACMetrics(Metric):
             if force or (now - last_print_t) >= float(
                     progress_sec) or done >= total:
                 elapsed = now - start_t
-                print(f"[WOSACMetrics] 진행중: {done}/{total} (경과 {elapsed:.0f}s)",
-                      flush=True)
+                print(f"[WOSACMetrics] progress: {done}/{total} (elapsed {elapsed:.0f}s)", flush=True)
                 last_print_t = now
 
         _maybe_print(0, force=True)
