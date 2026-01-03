@@ -122,7 +122,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --batch_size 1024 \
   --use_deepspeed True \
   --wosac_sub_is_active True \
-  --wosac_metric_is_active True \
+  --wosac_metric_is_active False \
   --save_image True \
   --save_video True \
   --finish_when_no_updated_pt True \
