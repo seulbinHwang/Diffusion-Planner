@@ -38,7 +38,7 @@ from typing import Any
 
 
 def _compute_scenario_metrics_star(
-    args: Tuple[Any, str, sim_agents_submission_pb2.ScenarioRollouts, bool],
+    args: Tuple[Any, str, sim_agents_submission_pb2.ScenarioRollouts, bool, bool],
 ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
     """Pool에서 1개 시나리오 계산을 수행합니다.
 
@@ -771,6 +771,7 @@ class WOSACMetrics(Metric):
         scenario_file,
         scenario_rollout,  # sim_agents_submission_pb2.ScenarioRollouts
         ego_only,
+            should_validate,
     ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
         scenario = scenario_pb2.Scenario()
 
@@ -827,7 +828,7 @@ class WOSACMetrics(Metric):
             scenario.tracks_to_predict[0].track_index = scenario.sdc_track_index
 
         validate_wosac_rollouts_or_raise(
-            should_validate=config.validate_scenario_rollouts,
+            should_validate=should_validate,
             scenario=scenario,
             scenario_rollouts=scenario_rollout,
             # 이 함수 인자 이름이 scenario_rollout(단수)라서 이렇게 넣는 게 맞아요
@@ -958,7 +959,8 @@ class WOSACMetrics(Metric):
         self,
         scenario_files: List[str],
         scenario_rollouts: List[sim_agents_submission_pb2.ScenarioRollouts],
-    ) -> None:
+            should_validate: bool = True,
+        ) -> None:
         batch_size_now: int = int(len(scenario_rollouts))
 
         tf_threads: int = int(
@@ -1025,6 +1027,7 @@ class WOSACMetrics(Metric):
                 scenario_files,
                 scenario_rollouts,
                 itertools.repeat(self.ego_only),
+                itertools.repeat(should_validate),  # should_validate
             )
 
             done = 0
@@ -1072,6 +1075,7 @@ class WOSACMetrics(Metric):
                     _scenario_file,
                     _scenario_rollout,
                     self.ego_only,
+                    should_validate,
                 )
                 done += 1
                 _maybe_print(done, force=False)

@@ -3369,7 +3369,7 @@ def validate_func(
 
         _update_validation_heartbeat_stage(
             args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})")
-        wosac_metrics.update(tfrecord_path, scenario_rollouts)
+        wosac_metrics.update(tfrecord_path, scenario_rollouts, should_validate=args.validate_scenario_rollouts)
 
     if min_ade.is_active:
         _update_validation_heartbeat_stage(args, f"{tag} | computing minADE")
