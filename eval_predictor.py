@@ -3293,14 +3293,18 @@ def validate_func(
             global_rank=int(ddp_rank),
         )
 
-        if int(ddp_rank) == 0:
-            world_size_now: int = int(ddp.get_world_size(
-            )) if ddp.is_dist_avail_and_initialized() else 1
-            if int(world_size_now) <= 1:
-                if scenario_rollouts is not None:
-                    wosac_submission.aggregate_rollouts(scenario_rollouts)
-            else:
-                _gpu_dict_sync = wosac_submission.compute()
+        world_size_now: int = int(
+            ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
+
+        if world_size_now <= 1:
+            if int(ddp_rank) == 0 and scenario_rollouts is not None:
+                wosac_submission.aggregate_rollouts(scenario_rollouts)
+        else:
+            # ✅ 모든 rank가 같이 호출해야 함 (여기서 분산 통신이 일어남)
+            _gpu_dict_sync = wosac_submission.compute()
+
+            # ✅ 실제로 rollouts를 만들고 파일에 쌓는 건 rank0만
+            if int(ddp_rank) == 0:
                 for k in _gpu_dict_sync.keys():
                     if type(_gpu_dict_sync[k]) is list:
                         _gpu_dict_sync[k] = _gpu_dict_sync[k][0]
