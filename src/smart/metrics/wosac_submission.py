@@ -36,6 +36,7 @@ class WOSACSubmission(Metric):
         is_active: bool,
         save_path: str,
         eval_method: str,
+            global_rank: int
     ) -> None:
         super().__init__()
         self.is_active = is_active
@@ -71,7 +72,7 @@ class WOSACSubmission(Metric):
             self.i_file = 0
             save_path = os.path.join(save_path, eval_method)
             # remove existing save_path directory
-            if os.path.exists(save_path):
+            if global_rank == 0 and os.path.exists(save_path):
                 shutil.rmtree(save_path)
 
             self.submission_dir = Path(

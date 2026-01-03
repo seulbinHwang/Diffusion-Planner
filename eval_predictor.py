@@ -757,6 +757,7 @@ def model_validation(
             is_active=args.wosac_sub_is_active,
             save_path=args.save_path,
             eval_method=args.eval_method,
+            global_rank=global_rank,
         )
         wandb_logger = setup_logger_and_purge(
             args=args,
