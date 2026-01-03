@@ -175,8 +175,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_deepspeed True \
   --wosac_sub_is_active True \
   --wosac_metric_is_active True \
-  --save_image True \
-  --save_video True \
+  --save_image False \
+  --save_video False \
   --finish_when_no_updated_pt True \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1
