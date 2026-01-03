@@ -1813,9 +1813,9 @@ def build_deepspeed_inference_config(
 
     return {
         "dtype": torch.bfloat16,  # 필요하면 torch.float16 로 바꿔도 됨
-        "tensor_parallel": {
-            "tp_size": world_size
-        },  # 여러 GPU에 모델을 나눠 올릴 때
+        # "tensor_parallel": {
+        #     "tp_size": world_size
+        # },  # 여러 GPU에 모델을 나눠 올릴 때
         "replace_with_kernel_inject": False,  # 일반 모델이면 보통 꺼두는 게 안전
     }
 
