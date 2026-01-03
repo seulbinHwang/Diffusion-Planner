@@ -175,6 +175,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_image False \
   --save_video False \
   --finish_when_no_updated_pt True \
+  --validate_scenario_rollouts True \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1
 

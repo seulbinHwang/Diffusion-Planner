@@ -489,6 +489,7 @@ def _assert_scenario_id_matches_rollouts(
 
 
 def validate_wosac_rollouts_or_raise(
+        should_validate: bool,
     scenario: scenario_pb2.Scenario,
     scenario_rollouts: sim_agents_submission_pb2.ScenarioRollouts,
     *,
@@ -524,7 +525,9 @@ def validate_wosac_rollouts_or_raise(
             scenario=scenario,
             scenario_rollouts=scenario_rollouts,
         )
-
+    # ✅ 규칙 검사 OFF면 여기서 종료
+    if not should_validate:
+        return
     try:
         submission_specs.validate_scenario_rollouts(
             scenario_rollouts=scenario_rollouts,
@@ -824,6 +827,7 @@ class WOSACMetrics(Metric):
             scenario.tracks_to_predict[0].track_index = scenario.sdc_track_index
 
         validate_wosac_rollouts_or_raise(
+            should_validate=config.validate_scenario_rollouts,
             scenario=scenario,
             scenario_rollouts=scenario_rollout,
             # 이 함수 인자 이름이 scenario_rollout(단수)라서 이렇게 넣는 게 맞아요

@@ -253,9 +253,11 @@ def get_args():
                         default='normalization.json',
                         help='filepath of normalization.json',
                         type=str)
+    parser.add_argument('--validate_scenario_rollouts', default=True, type=boolean)
     parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
+    parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
     parser.add_argument('--num_workers', default=3, type=int)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)

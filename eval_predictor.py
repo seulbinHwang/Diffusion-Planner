@@ -1660,6 +1660,13 @@ def _predict_rollouts_batched_one_chunk(
        - chunk 시작 시점에 unnorm 입력 dict를 한 번 만들고 계속 유지합니다.
     2) lanes/route_lanes/static_objects 유효 마스크를 한 번 만들고 재사용합니다.
        - _transform_origin 내부의 torch.any(...) 스캔을 줄입니다.
+    3) (추가) time-chunk(N스텝) 방식:
+       - args.rollout_time_chunk_size=N (없으면 1)
+       - 모델은 chunk마다 1번만 실행하고,
+         integrated_trajectory의 1..gap 포즈를 world로 변환해 슬라이스로 저장합니다.
+       - past 업데이트는 gap개를 한 번에 shift+concat 합니다.
+       - 좌표 기준 변환은 gap번째(가장 미래) ego 포즈로 1번만 합니다.
+       - draw는 chunk마다 1장만 저장합니다.
 
     Returns:
         torch.Tensor:
@@ -1730,9 +1737,28 @@ def _predict_rollouts_batched_one_chunk(
         dtype=unnorm_origin_pose_world.dtype,
     )
 
+    # ✅ time-chunk 크기 N (없으면 1)
+    requested_time_chunk_size = int(getattr(args, "rollout_time_chunk_size", 1))
+    requested_time_chunk_size = int(max(1, requested_time_chunk_size))
+
+    ego_agent_past_unnorm = unnorm_inputs_copy.get("ego_agent_past", None)
+    if not isinstance(ego_agent_past_unnorm, torch.Tensor):
+        raise KeyError(
+            "unnorm_inputs_copy에 'ego_agent_past'(torch.Tensor)가 필요합니다.")
+    past_len = int(ego_agent_past_unnorm.shape[1])
+    past_len = int(max(1, past_len))
+
+    # (A) N > past_len 방지: time_chunk_size는 past_len 이하로 제한
+    time_chunk_size = int(min(requested_time_chunk_size, past_len))
+
     with torch.inference_mode():
-        for step_idx in range(future_len):
-            # ✅ step마다 모델 입력용 norm dict는 "unnorm -> norm" 1번만 수행
+        step_start = 0
+        while step_start < future_len:
+            remaining = int(future_len - step_start)
+            gap = int(min(time_chunk_size,
+                          remaining))  # (B) 마지막 chunk는 gap < N 가능
+
+            # ✅ chunk 시작 시점에만 unnorm -> norm 1번
             norm_inputs_copy: Dict[
                 str, Any] = _build_norm_inputs_from_unnorm_inputs(
                     unnorm_inputs_copy=unnorm_inputs_copy,
@@ -1751,7 +1777,7 @@ def _predict_rollouts_batched_one_chunk(
                 rollout_repeat=int(rollout_repeat),
                 base_seed=int(base_seed),
                 ddp_rank=int(ddp_rank),
-                step_idx=int(step_idx),
+                step_idx=int(step_start),  # ✅ chunk 시작 step을 seed에 반영
                 noise_std=0.5,
             )
             norm_inputs_copy["inference_noise"] = inference_noise
@@ -1768,6 +1794,17 @@ def _predict_rollouts_batched_one_chunk(
                 raise KeyError(
                     "decoder_output에서 'integrated_trajectory'를 찾을 수 없습니다. "
                     "현재 validate_func는 integrated_trajectory를 사용하도록 구현되어 있습니다.")
+
+            # integrated_trajectory가 실제로 제공하는 예측 길이 확인(안전)
+            max_pred_step = int(
+                normed_trajectories.shape[2]) - 1  # (1..max_pred_step 가능)
+            if gap > max_pred_step:
+                gap = int(max_pred_step)
+            if gap <= 0:
+                raise RuntimeError(
+                    "integrated_trajectory의 시간 길이가 너무 짧습니다. "
+                    f"integrated_trajectory.shape={tuple(normed_trajectories.shape)}"
+                )
 
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약
@@ -1790,12 +1827,12 @@ def _predict_rollouts_batched_one_chunk(
                     save_image = False
                     save_video = False
 
+            # ✅ draw는 chunk마다 1번만 (step_start 기준으로 파일명 저장)
             if save_image:
                 if draw_near_target_id is None:
                     raise RuntimeError(
                         "save_image=True 인데 draw_near_target_id가 준비되지 않았습니다.")
 
-                # draw 경로에서는 inference_noise 같은 큰 텐서를 넘기지 않게 key 제거
                 norm_inputs_for_draw = norm_inputs_copy
                 if "inference_noise" in norm_inputs_for_draw:
                     norm_inputs_for_draw = dict(norm_inputs_copy)  # 얕은 복사
@@ -1808,57 +1845,69 @@ def _predict_rollouts_batched_one_chunk(
                     state_normalizer=state_normalizer,
                     observation_normalizer=observation_normalizer,
                     draw_batch_idx=draw_batch_idx,
-                    step_idx=step_idx,
+                    step_idx=int(step_start),
                     draw_near_target_id=draw_near_target_id,
                 )
 
-            # ego: (B*R, 4)
-            normed_ego_next_pose = normed_trajectories[:, 0, 1, :]
-            # near: (B*R, Pnn, 4)
-            normed_near_next_pose = normed_trajectories[:, 1:, 1, :]
+            # ---------------------------------------------------------
+            # ✅ chunk의 1..gap 포즈를 한 번에 꺼내서 처리
+            # ---------------------------------------------------------
+            # ego:  (B*R, gap, 4)
+            normed_ego_pose_chunk = normed_trajectories[:, 0, 1:gap + 1, :]
+            # near: (B*R, Pnn, gap, 4)
+            normed_near_pose_chunk = normed_trajectories[:, 1:, 1:gap + 1, :]
 
-            # normed_target_next_pose: (B*R, (1+)Pnn, 4)
-            normed_target_next_pose = torch.cat(
-                [normed_ego_next_pose[:, None, :], normed_near_next_pose],
+            # target: (B*R, (1+)Pnn, gap, 4)
+            normed_target_pose_chunk = torch.cat(
+                [normed_ego_pose_chunk[:, None, :, :], normed_near_pose_chunk],
                 dim=1,
             )
 
-            # ✅ unnorm은 여기서 1번만 만들고(출력 + 입력 업데이트에 같이 사용)
-            # unnorm_target_next_pose: (B*R, (1+)Pnn, 4)
-            unnorm_target_next_pose = state_normalizer.inverse(
-                normed_target_next_pose)
-            unnorm_ego_next_pose = unnorm_target_next_pose[:, 0, :]  # (B*R, 4)
-            unnorm_near_next_pose = unnorm_target_next_pose[:,
-                                                            1:, :]  # (B*R, Pnn, 4)
+            # unnorm: (B*R, (1+)Pnn, gap, 4)
+            unnorm_target_pose_chunk = state_normalizer.inverse(
+                normed_target_pose_chunk)
 
-            # ✅ 입력 업데이트(autoregressive): unnorm에서 past 갱신 + 좌표 변환
-            unnorm_inputs_copy = _update_merged_inputs_unnorm_inplace(
-                unnorm_inputs_copy=unnorm_inputs_copy,
-                unnorm_ego_next_pose=unnorm_ego_next_pose,
-                unnorm_near_next_pose=unnorm_near_next_pose,
-                cached_valid_masks=cached_valid_masks,
-            )
+            # ---------------------------------------------------------
+            # ✅ world 변환 + output 슬라이스 저장 (0.1초 해상도 유지)
+            # ---------------------------------------------------------
+            # (B*R*(1+)Pnn, gap, 4)
+            unnorm_target_pose_chunk_flat = unnorm_target_pose_chunk.reshape(
+                -1, gap, 4)
 
-            # (B*R*(1+)Pnn, 4)
-            unnorm_target_next_pose_flat = unnorm_target_next_pose.reshape(
-                -1, 4)
-
-            # world 변환
-            unnorm_target_next_pose_flat_world = _covert_from_ego_to_world(
-                target_poses=unnorm_target_next_pose_flat,  # (N,4)
+            # (B*R*(1+)Pnn, gap, 4) world
+            unnorm_target_pose_chunk_world_flat = _covert_from_ego_to_world(
+                target_poses=unnorm_target_pose_chunk_flat,
                 origin_world_pose=unnorm_origin_pose_world,  # (B*R,4)
             )
 
-            # (B*R, (1+)Pnn, 4)
-            unnorm_target_next_pose_world = unnorm_target_next_pose_flat_world.reshape(
-                merged_batch, one_or_pnn, 4)
+            # (B*R, (1+)Pnn, gap, 4)
+            unnorm_target_pose_chunk_world = unnorm_target_pose_chunk_world_flat.reshape(
+                merged_batch, one_or_pnn, gap, 4)
 
-            # 저장
-            target_joint_scene_world[:, :,
-                                     step_idx, :] = unnorm_target_next_pose_world
+            # (B*R, (1+)Pnn, future_len, 4) 중 [step_start:step_start+gap]만 채우기
+            target_joint_scene_world[:, :, step_start:step_start +
+                                     gap, :] = unnorm_target_pose_chunk_world
 
-            # 다음 스텝 origin 갱신(ego 기준, world 좌표)
-            unnorm_origin_pose_world = unnorm_target_next_pose_world[:, 0, :]
+            # 다음 chunk를 위한 origin 갱신(ego 기준, world 좌표) - 마지막 스텝만 사용
+            unnorm_origin_pose_world = unnorm_target_pose_chunk_world[:, 0,
+                                                                      -1, :]  # (B*R, 4)
+
+            # ---------------------------------------------------------
+            # ✅ 입력 업데이트: gap개를 한 번에 반영 + 마지막 포즈로 1번만 좌표 변환
+            # ---------------------------------------------------------
+            unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:,
+                                                             0, :, :]  # (B*R, gap, 4)
+            unnorm_near_pose_chunk = unnorm_target_pose_chunk[:,
+                                                              1:, :, :]  # (B*R, Pnn, gap, 4)
+
+            unnorm_inputs_copy = _update_merged_inputs_unnorm_inplace_for_time_chunk(
+                unnorm_inputs_copy=unnorm_inputs_copy,
+                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
+                unnorm_near_pose_chunk=unnorm_near_pose_chunk,
+                cached_valid_masks=cached_valid_masks,
+            )
+
+            step_start += gap
 
     # (B*R, (1+)Pnn, future_len, 4) -> (B, R, (1+)Pnn, future_len, 4)
     target_joint_scene_world = target_joint_scene_world.reshape(
@@ -4166,6 +4215,196 @@ def _pick_cached_mask_if_shape_matches(
         return None
 
     return mask.to(dtype=torch.bool)
+
+
+from typing import Any, Dict, Optional
+import torch
+
+
+def _update_merged_inputs_unnorm_inplace_for_time_chunk(
+    unnorm_inputs_copy: Dict[str, Any],
+    unnorm_ego_pose_chunk: torch.Tensor,  # (B*R, gap, 4)
+    unnorm_near_pose_chunk: torch.Tensor,  # (B*R, Pnn, gap, 4)
+    cached_valid_masks: Optional[Dict[str, torch.Tensor]],
+) -> Dict[str, Any]:
+    """여러 스텝(gap개)을 한 번에 past에 반영하고, 마지막 스텝을 새 기준으로 좌표를 맞춥니다.
+
+    이 함수가 하는 일
+    ---------------
+    기존 방식은 매 스텝마다:
+      - past 1개 갱신
+      - 좌표 기준 변환 1회
+    를 반복했습니다.
+
+    여기서는 gap개 예측 포즈가 이미 준비되어 있다고 가정하고,
+      1) past에서 앞쪽 gap개를 버리고
+      2) 뒤에 gap개를 한 번에 붙이고
+      3) 마지막(gap번째) ego 포즈를 기준으로 좌표 기준 변환을 1번만 수행합니다.
+
+    중요 포인트
+    ----------
+    - past의 11차원 상태 중 (x, y, cos, sin) 4개만 예측값으로 채우고,
+      나머지 값(속도 등)은 "기존 past의 마지막 상태"를 복사해서 유지합니다.
+    - gap은 보통 T_past 이하로 들어오도록(외부에서) 조절하는 것을 권장합니다.
+      그래야 길이를 유지하면서 "앞에서 버리고 뒤에 붙이기"가 자연스럽습니다.
+
+    Args:
+        unnorm_inputs_copy (Dict[str, Any]):
+            현재 시점 기준 입력 dict (원래 단위).
+            주요 텐서 shape:
+              - ego_agent_past:        (B*R, T_past, 11)
+              - near_agents_past:      (B*R, Pnn, T_past, 11)
+              - neighbor_agents_past:  (B*R, Pnn, T_past, 11)
+              - non_near_agents_past:  (B*R, 0,   T_past, 11)  (현재는 0만 허용)
+        unnorm_ego_pose_chunk (torch.Tensor):
+            예측된 ego 포즈 시퀀스(원래 단위, 현재 기준 좌표).
+            shape: (B*R, gap, 4)  # (x, y, cos, sin)
+        unnorm_near_pose_chunk (torch.Tensor):
+            예측된 near agent 포즈 시퀀스(원래 단위, 현재 기준 좌표).
+            shape: (B*R, Pnn, gap, 4)
+        cached_valid_masks (Optional[Dict[str, torch.Tensor]]):
+            큰 지도 텐서(lanes/route_lanes/static_objects) 유효 마스크 캐시.
+
+    Returns:
+        Dict[str, Any]:
+            같은 dict(unnorm_inputs_copy)에 결과를 덮어쓴 뒤 반환합니다.
+    """
+    if not isinstance(unnorm_ego_pose_chunk, torch.Tensor):
+        raise TypeError("unnorm_ego_pose_chunk는 torch.Tensor여야 합니다.")
+    if unnorm_ego_pose_chunk.dim() != 3 or int(
+            unnorm_ego_pose_chunk.shape[-1]) != 4:
+        raise ValueError("unnorm_ego_pose_chunk는 (B*R, gap, 4) 형태여야 합니다. "
+                         f"현재 shape={tuple(unnorm_ego_pose_chunk.shape)}")
+
+    if not isinstance(unnorm_near_pose_chunk, torch.Tensor):
+        raise TypeError("unnorm_near_pose_chunk는 torch.Tensor여야 합니다.")
+    if unnorm_near_pose_chunk.dim() != 4 or int(
+            unnorm_near_pose_chunk.shape[-1]) != 4:
+        raise ValueError("unnorm_near_pose_chunk는 (B*R, Pnn, gap, 4) 형태여야 합니다. "
+                         f"현재 shape={tuple(unnorm_near_pose_chunk.shape)}")
+
+    gap = int(unnorm_ego_pose_chunk.shape[1])
+    if gap <= 0:
+        return unnorm_inputs_copy
+
+    # -------------------------
+    # 1) ego past 업데이트
+    # -------------------------
+    ego_agent_past = unnorm_inputs_copy.get("ego_agent_past", None)
+    if not isinstance(ego_agent_past, torch.Tensor):
+        raise KeyError(
+            "unnorm_inputs_copy에 'ego_agent_past'(torch.Tensor)가 필요합니다.")
+    if ego_agent_past.dim() != 3 or int(ego_agent_past.shape[-1]) != 11:
+        raise ValueError("ego_agent_past는 (B*R, T_past, 11) 형태여야 합니다. "
+                         f"현재 shape={tuple(ego_agent_past.shape)}")
+
+    past_len = int(ego_agent_past.shape[1])
+    if gap > past_len:
+        raise ValueError(
+            "gap이 past_len보다 큽니다. "
+            "외부에서 rollout_time_chunk_size를 past_len 이하로 제한하는 것을 권장합니다. "
+            f"gap={gap}, past_len={past_len}")
+
+    # ego_last: (B*R, 11)
+    ego_last = ego_agent_past[:, -1, :].clone()
+    # ego_chunk_11: (B*R, gap, 11)
+    ego_chunk_11 = ego_last[:, None, :].expand(-1, gap, -1).clone()
+    ego_chunk_11[:, :, 0:4] = unnorm_ego_pose_chunk  # (x,y,cos,sin)
+
+    # (B*R, T_past, 11)
+    unnorm_inputs_copy["ego_agent_past"] = torch.cat(
+        [ego_agent_past[:, gap:, :], ego_chunk_11],
+        dim=1,
+    )
+
+    # -------------------------
+    # 2) near past 업데이트
+    # -------------------------
+    near_agents_past = unnorm_inputs_copy.get("near_agents_past", None)
+    if not isinstance(near_agents_past, torch.Tensor):
+        raise KeyError(
+            "unnorm_inputs_copy에 'near_agents_past'(torch.Tensor)가 필요합니다.")
+    if near_agents_past.dim() != 4 or int(near_agents_past.shape[-1]) != 11:
+        raise ValueError("near_agents_past는 (B*R, Pnn, T_past, 11) 형태여야 합니다. "
+                         f"현재 shape={tuple(near_agents_past.shape)}")
+    if int(near_agents_past.shape[2]) != past_len:
+        raise ValueError(
+            "near_agents_past의 T_past가 ego_agent_past와 다릅니다. "
+            f"ego T_past={past_len}, near T_past={int(near_agents_past.shape[2])}"
+        )
+
+    pnn = int(near_agents_past.shape[1])
+    if int(unnorm_near_pose_chunk.shape[1]) != pnn:
+        raise ValueError(
+            "unnorm_near_pose_chunk의 Pnn이 near_agents_past와 다릅니다. "
+            f"Pnn(past)={pnn}, Pnn(chunk)={int(unnorm_near_pose_chunk.shape[1])}"
+        )
+    if int(unnorm_near_pose_chunk.shape[2]) != gap:
+        raise ValueError(
+            "unnorm_near_pose_chunk의 gap이 unnorm_ego_pose_chunk와 다릅니다. "
+            f"gap(ego)={gap}, gap(near)={int(unnorm_near_pose_chunk.shape[2])}")
+
+    # near_last: (B*R, Pnn, 11)
+    near_last = near_agents_past[:, :, -1, :].clone()
+    # near_chunk_11: (B*R, Pnn, gap, 11)
+    near_chunk_11 = near_last[:, :, None, :].expand(-1, -1, gap, -1).clone()
+    near_chunk_11[:, :, :, 0:4] = unnorm_near_pose_chunk
+
+    unnorm_inputs_copy["near_agents_past"] = torch.cat(
+        [near_agents_past[:, :, gap:, :], near_chunk_11],
+        dim=2,
+    )
+
+    # -------------------------
+    # 3) non-near는 현재 미지원(기존 규칙 유지)
+    # -------------------------
+    non_near_agents_past = unnorm_inputs_copy.get("non_near_agents_past", None)
+    if isinstance(non_near_agents_past, torch.Tensor):
+        assert int(
+            non_near_agents_past.shape[1]) == 0, "현재 non-near agent는 처리하지 않습니다."
+
+    # -------------------------
+    # 4) neighbor past 업데이트 (near와 동일하게 취급)
+    # -------------------------
+    neighbor_agents_past = unnorm_inputs_copy.get("neighbor_agents_past", None)
+    if not isinstance(neighbor_agents_past, torch.Tensor):
+        raise KeyError(
+            "unnorm_inputs_copy에 'neighbor_agents_past'(torch.Tensor)가 필요합니다.")
+    if neighbor_agents_past.dim() != 4 or int(
+            neighbor_agents_past.shape[-1]) != 11:
+        raise ValueError(
+            "neighbor_agents_past는 (B*R, agent_num, T_past, 11) 형태여야 합니다. "
+            f"현재 shape={tuple(neighbor_agents_past.shape)}")
+    if int(neighbor_agents_past.shape[2]) != past_len:
+        raise ValueError(
+            "neighbor_agents_past의 T_past가 ego_agent_past와 다릅니다. "
+            f"ego T_past={past_len}, neighbor T_past={int(neighbor_agents_past.shape[2])}"
+        )
+
+    neighbor_agents_num = int(neighbor_agents_past.shape[1])
+    assert neighbor_agents_num == pnn, "neighbor_agents_past의 agent 수가 near_agents_past와 다릅니다."
+
+    neighbor_last = neighbor_agents_past[:, :, -1, :].clone()  # (B*R, Pnn, 11)
+    neighbor_chunk_11 = neighbor_last[:, :, None, :].expand(-1, -1, gap,
+                                                            -1).clone()
+    neighbor_chunk_11[:, :, :, 0:4] = unnorm_near_pose_chunk
+
+    unnorm_inputs_copy["neighbor_agents_past"] = torch.cat(
+        [neighbor_agents_past[:, :, gap:, :], neighbor_chunk_11],
+        dim=2,
+    )
+
+    # -------------------------
+    # 5) 좌표 기준 변환은 "마지막(gap번째) ego 포즈"로 1번만
+    # -------------------------
+    unnorm_ego_pose_at_last = unnorm_ego_pose_chunk[:, -1, :]  # (B*R, 4)
+    _transform_origin(
+        unnorm_inputs_copy,
+        unnorm_ego_pose_at_last,
+        cached_valid_masks=cached_valid_masks,
+    )
+
+    return unnorm_inputs_copy
 
 
 def _update_merged_inputs_unnorm_inplace(
