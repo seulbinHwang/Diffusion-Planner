@@ -148,6 +148,15 @@ class WOSACSubmission(Metric):
             return float(default_sec)
 
     @staticmethod
+    def _is_rank_zero() -> bool:
+        """현재 프로세스가 rank 0인지 확인합니다.
+
+        torchrun 환경에서는 RANK가 설정됩니다.
+        없으면 단일 프로세스로 보고 rank 0으로 취급합니다.
+        """
+        return str(os.environ.get("RANK", "0")).strip() == "0"
+
+    @staticmethod
     def _format_duration_hms(duration_sec: float) -> str:
         """초 단위 시간을 'Hh Mm Ss' 문자열로 바꿉니다."""
         total_sec = int(max(0.0, float(duration_sec)))
@@ -158,6 +167,8 @@ class WOSACSubmission(Metric):
 
     def _maybe_print_progress(self, force: bool = False) -> None:
         """조건이 맞으면 WOSACSubmission 진행 상황을 출력합니다."""
+        if not self._is_rank_zero():
+            return
         interval_sec = float(getattr(self, "_progress_interval_sec", 0.0))
         if interval_sec <= 0.0:
             return
@@ -253,10 +264,11 @@ class WOSACSubmission(Metric):
                     if (now - tar_last_t) >= interval_sec or idx >= total:
                         elapsed = now - tar_start_t
                         elapsed_str = self._format_duration_hms(elapsed)
-                        print(
-                            f"[WOSACSubmission] tar progress: {idx}/{total} (elapsed {elapsed_str})",
-                            flush=True,
-                        )
+                        if self._is_rank_zero():
+                            print(
+                                f"[WOSACSubmission] tar progress: {idx}/{total} (elapsed {elapsed_str})",
+                                flush=True,
+                            )
                         tar_last_t = now
 
         log.info(f"DONE: Saved wosac submission files to {tar_file_name}")

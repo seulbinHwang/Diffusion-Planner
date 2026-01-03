@@ -544,6 +544,14 @@ def _format_duration_hms(duration_sec: float) -> str:
     seconds = total_sec % 60
     return f"{hours}h {minutes:02d}m {seconds:02d}s"
 
+def _is_rank_zero() -> bool:
+    """현재 프로세스가 rank 0인지 확인합니다.
+
+    torchrun 환경에서는 RANK가 설정됩니다.
+    없으면 단일 프로세스로 보고 rank 0으로 취급합니다.
+    """
+    return str(os.environ.get("RANK", "0")).strip() == "0"
+
 
 class WOSACMetrics(Metric):
     """
@@ -966,13 +974,15 @@ class WOSACMetrics(Metric):
         if progress_sec <= 0.0:
             progress_sec = 0.0
 
-        print(
-            f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
-            f"tf_threads={tf_threads}, "
-            f"recommended_p={recommended_p}, "
-            f"use_mp_pool={use_mp_pool}, "
-            f"disable_mp={disable_mp}",
-            flush=True)
+        if _is_rank_zero():
+            print(
+                f"[WOSACMetrics] update(): batch_size={batch_size_now}, "
+                f"tf_threads={tf_threads}, "
+                f"recommended_p={recommended_p}, "
+                f"use_mp_pool={use_mp_pool}, "
+                f"disable_mp={disable_mp}",
+                flush=True,
+            )
 
         if disable_mp:
             self.close_mp_pool()
@@ -983,6 +993,9 @@ class WOSACMetrics(Metric):
 
         def _maybe_print(done: int, force: bool = False) -> None:
             nonlocal last_print_t
+
+            if not _is_rank_zero():
+                return
             if progress_sec <= 0.0:
                 return
             now = time.perf_counter()
