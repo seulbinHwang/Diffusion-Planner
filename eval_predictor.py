@@ -17,7 +17,7 @@ from tools.predictor_utils import (
 )
 import threading
 import numpy as np
-import draw_machine
+import draw_machine_fast
 import args_util
 import shutil
 import sys, faulthandler, traceback
@@ -2401,7 +2401,7 @@ def _predict_rollouts_batched_one_chunk(
         if save_dir == "" or draw_scenario_id == "":
             raise RuntimeError(
                 "save_video=True 인데 save_dir / draw_scenario_id가 준비되지 않았습니다.")
-        draw_machine.make_video_from_all_png(
+        draw_machine_fast.make_video_from_all_png(
             save_dir,
             draw_scenario_id,
             new_save_dir=args.save_path,
@@ -2529,7 +2529,7 @@ def _draw_one_batch_one_rollout(
         diff_token_to_np_int_traj_11_wrt_ego[f"{target_id}"] = np_int_traj_11
     output_data[
         "diff_token_to_np_int_traj_11_wrt_ego"] = diff_token_to_np_int_traj_11_wrt_ego
-    draw_machine.draw_world_model_to_png(unnorm_inputs_np,
+    draw_machine_fast.draw_world_model_to_png(unnorm_inputs_np,
                                          output_data=output_data,
                                          save_path=os.path.join(
                                              save_dir, f"{step_idx}.png"))

@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple, List, Any
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon, FancyArrowPatch, Circle
+import enum
 
 from matplotlib.colors import to_rgba
 
@@ -905,13 +906,84 @@ def _is_dashed_linestyle(linestyle: Any) -> bool:
         return linestyle not in ("-", "solid", "")
     return False
 
+def _normalize_mpl_capstyle(value: Any) -> str:
+    """Matplotlib capstyle 값을 LineCollection이 받을 수 있는 짧은 문자열로 바꿉니다.
+
+    왜 필요한가?
+    -----------
+    Matplotlib 버전에 따라 rcParams에서 capstyle을 읽으면,
+    - "butt" 같은 문자열이 나올 수도 있고
+    - CapStyle.butt 같은 객체가 나올 수도 있습니다.
+
+    그런데 LineCollection.set_capstyle(...)은
+    "butt", "round", "projecting" 같은 짧은 문자열만 받습니다.
+
+    그래서 이 함수는 어떤 형태로 오든 안전하게 짧은 문자열로 정리합니다.
+
+    Args:
+        value (Any):
+            rcParams에서 읽은 capstyle 값. shape: ()
+
+    Returns:
+        str:
+            "butt" | "round" | "projecting" 중 하나. shape: ()
+            값이 이상하면 기본값 "butt"로 돌려줍니다.
+    """
+    # (1) enum 타입이면 name이 "butt"처럼 깔끔합니다.
+    if isinstance(value, enum.Enum):
+        s = str(value.name)
+    else:
+        s = str(value).strip()
+
+    # (2) "CapStyle.butt" 같은 형태면 마지막 토큰만 남깁니다.
+    if "." in s:
+        s = s.split(".")[-1]
+
+    s = s.strip().lower()
+
+    allowed = {"butt", "round", "projecting"}
+    if s not in allowed:
+        return "butt"
+    return s
+
+
+def _normalize_mpl_joinstyle(value: Any) -> str:
+    """Matplotlib joinstyle 값을 LineCollection이 받을 수 있는 짧은 문자열로 바꿉니다.
+
+    joinstyle도 capstyle과 마찬가지로,
+    rcParams에서 "JoinStyle.miter" 같은 형태로 나오는 경우가 있어
+    LineCollection.set_joinstyle(...)에 그대로 넣으면 실패할 수 있습니다.
+
+    Args:
+        value (Any):
+            rcParams에서 읽은 joinstyle 값. shape: ()
+
+    Returns:
+        str:
+            "miter" | "round" | "bevel" 중 하나. shape: ()
+            값이 이상하면 기본값 "miter"로 돌려줍니다.
+    """
+    if isinstance(value, enum.Enum):
+        s = str(value.name)
+    else:
+        s = str(value).strip()
+
+    if "." in s:
+        s = s.split(".")[-1]
+
+    s = s.strip().lower()
+
+    allowed = {"miter", "round", "bevel"}
+    if s not in allowed:
+        return "miter"
+    return s
 
 def _get_cap_and_join_style_for_linestyle(linestyle: Any) -> Tuple[str, str]:
     """linestyle에 맞는 선 끝 모양(cap)과 꺾임 모양(join)을 고릅니다.
 
-    기존 ax.plot은 rcParams를 따라 자동으로 cap/join 스타일이 결정됩니다.
-    LineCollection으로 바꾸면 이 설정을 명시하지 않을 때 미묘하게 달라질 수 있어서,
-    결과 이미지를 완전히 같게 만들기 위해 rcParams 값을 그대로 적용합니다.
+    이 함수는 rcParams 값을 그대로 쓰되,
+    값이 "CapStyle.butt"처럼 길게 나오는 경우가 있어도
+    LineCollection이 받는 형태("butt")로 정리해서 반환합니다.
 
     Args:
         linestyle (Any):
@@ -922,13 +994,14 @@ def _get_cap_and_join_style_for_linestyle(linestyle: Any) -> Tuple[str, str]:
             (capstyle, joinstyle). shape: (2,)
     """
     if _is_dashed_linestyle(linestyle):
-        capstyle = str(mpl.rcParams["lines.dash_capstyle"])
-        joinstyle = str(mpl.rcParams["lines.dash_joinstyle"])
-        return capstyle, joinstyle
+        cap_raw = mpl.rcParams["lines.dash_capstyle"]
+        join_raw = mpl.rcParams["lines.dash_joinstyle"]
+        return _normalize_mpl_capstyle(cap_raw), _normalize_mpl_joinstyle(join_raw)
 
-    capstyle = str(mpl.rcParams["lines.solid_capstyle"])
-    joinstyle = str(mpl.rcParams["lines.solid_joinstyle"])
-    return capstyle, joinstyle
+    cap_raw = mpl.rcParams["lines.solid_capstyle"]
+    join_raw = mpl.rcParams["lines.solid_joinstyle"]
+    return _normalize_mpl_capstyle(cap_raw), _normalize_mpl_joinstyle(join_raw)
+
 
 
 def _add_line_collection(

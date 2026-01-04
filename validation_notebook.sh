@@ -11,6 +11,27 @@ USER_PATH="/home/user"
 WOMD_PATH="${USER_PATH}/womd_v1_3"
 RUN_PYTHON_PATH="${USER_PATH}/miniforge3/envs/diffusion_planner/bin/python"
 # `~/womd_v1_3/processed_womd_final/validation`
+
+# ✅ conda run으로 들어온 환경의 python을 자동으로 사용
+resolve_python_in_current_env() {
+  if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    echo "${CONDA_PREFIX}/bin/python"
+    return 0
+  fi
+  if command -v python >/dev/null 2>&1; then
+    command -v python
+    return 0
+  fi
+  return 1
+}
+
+RUN_PYTHON_PATH="$(resolve_python_in_current_env || true)"
+if [[ -z "${RUN_PYTHON_PATH}" ]]; then
+  echo "[ERROR] 현재 환경에서 python을 찾지 못했습니다. (CONDA_PREFIX/ PATH 확인 필요)" >&2
+  exit 1
+fi
+echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
+
 EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation" 
 EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
@@ -64,7 +85,18 @@ PY
 
 ensure_eval_set_list_json "$EVAL_SET_PATH" "$EVAL_SET_LIST_PATH" "$RUN_PYTHON_PATH"
 
+
+# ----------------------------
+# 진행 상황 출력 주기(초) (공통)
+# - 0 또는 음수면 heartbeat / WOSACMetrics / WOSACSubmission 진행 출력 모두 끔
+# ----------------------------
+export DP_PROGRESS_SEC="${DP_PROGRESS_SEC:-60}"
+printf "[ENV] %-28s %s\n" "DP_PROGRESS_SEC:" "${DP_PROGRESS_SEC-<unset>}"
+
+
 ###################################
+export PYTHONWARNINGS="ignore::FutureWarning:timm"
+export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
 # CUDA 경로 자동 설정
@@ -78,6 +110,15 @@ if [[ -z "${CUDA_HOME:-}" ]]; then
   fi
 fi
 
+if [[ -n "${CUDA_HOME:-}" && -d "$CUDA_HOME" ]]; then
+  export CUDA_HOME
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+  echo "[INFO] CUDA_HOME=$CUDA_HOME"
+else
+  echo "[WARN] CUDA_HOME를 자동으로 찾지 못했습니다. CUDA_HOME를 수동으로 지정해 주세요."
+fi
+
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 LOG_DIR="${WOMD_PATH}/logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
@@ -89,8 +130,16 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export TORCH_DISABLE_ADDR2LINE=1
 # CUDA 런타임이 한 GPU에서 동시에 유지하는 “연결/큐(=스케줄링 슬롯)”의 상한을 32로 늘려라
 export CUDA_DEVICE_MAX_CONNECTIONS=32
-# CPU에서 돌아가는 연산(전처리, 일부 텐서 연산, BLAS 등)의 스레드 수를 컨트롤해서, GPU 학습 중 CPU 과도한 스레드 난립 방지
-printf "[ENV] %-28s %s\n" "OMP_NUM_THREADS:"            "${OMP_NUM_THREADS-<unset>}"
+# ----------------------------
+# WOSAC(TensorFlow) CPU 튜닝
+# - env에 이미 값이 있으면 그 값을 그대로 사용
+# - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
+# ----------------------------
+export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-2}"
+export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
+
+printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
+printf "[ENV] %-28s %s\n" "DP_WOSAC_CPU_FRACTION:" "${DP_WOSAC_CPU_FRACTION-<unset>}"
 printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
 DEBUG_LOG=1   # 1: 상세 디버그, 0: 일반 학습
 
@@ -119,14 +168,16 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --eval_method "validation" \
-  --batch_size 1024 \
+  --batch_size 2 \
   --use_deepspeed True \
   --wosac_sub_is_active True \
   --wosac_metric_is_active False \
   --save_image True \
   --save_video True \
+  --validate_scenario_rollouts False \
   --finish_when_no_updated_pt True \
   --run_count "$RUN_COUNT" \
-  --total_save_image_trial_num 1
+  --total_save_image_trial_num 1 \
+  --rollout_time_chunk_size 5
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
