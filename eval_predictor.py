@@ -359,6 +359,147 @@ def _is_torch_process_group_initialized() -> bool:
     return bool(torch.distributed.is_initialized())
 
 
+def _get_wosac_submission_tar_path(wosac_submission: WOSACSubmission) -> str:
+    """WOSAC submission tar.gz 파일 경로를 안전하게 얻습니다.
+
+    이 함수가 하는 일
+    ---------------
+    - WOSACSubmission.save_sub_file()은 내부적으로
+      "{submission_dir}.tar.gz" 형태로 압축 파일을 만듭니다.
+    - eval_predictor.py에서 그 규칙을 다시 조립해 경로를 얻습니다.
+      (파일명 규칙을 한 곳에 모아두면, 나중에 경로가 바뀌어도 수정이 쉽습니다.)
+
+    Args:
+        wosac_submission (WOSACSubmission):
+            WOSACSubmission 인스턴스. (shape: ())
+
+    Returns:
+        str:
+            tar.gz 파일 경로 문자열. (shape: ())
+    """
+    submission_dir = getattr(wosac_submission, "submission_dir", None)
+    if submission_dir is None:
+        raise RuntimeError("wosac_submission.submission_dir를 찾을 수 없습니다.")
+    return str(submission_dir) + ".tar.gz"
+
+
+def _upload_wosac_submission_tar_to_wandb(
+    args: argparse.Namespace,
+    tar_file_path: str,
+) -> None:
+    """tar.gz 파일을 W&B artifact로 업로드합니다.
+
+    업로드 규칙(기존 설정 최대 재사용)
+    -------------------------------
+    - 기존 코드가 이미 만들어 둔 wandb.run(현재 실행의 W&B run)을 그대로 사용합니다.
+    - args.use_wandb가 True일 때만 업로드합니다. (기존 코드의 동작과 최대한 일치)
+    - artifact 이름은 "실험이름 + eval_method + wosac-submission"으로 고정해
+      업로드될 때마다 버전이 쌓이도록 합니다.
+    - 업로드가 끝날 때까지 기다렸다가 다음 단계(종료)로 넘어가도록 합니다.
+
+    Args:
+        args (argparse.Namespace):
+            실행 인자. (shape: ())
+        tar_file_path (str):
+            업로드할 tar.gz 파일 경로. (shape: ())
+
+    Returns:
+        None
+    """
+    if not bool(getattr(args, "use_wandb", False)):
+        return
+
+    if wandb.run is None:
+        print("[WANDB] wandb.run이 없어 tar.gz 업로드를 건너뜁니다.", flush=True)
+        return
+
+    if not isinstance(tar_file_path, str) or tar_file_path.strip() == "":
+        print("[WANDB] tar_file_path가 비어 있어 업로드를 건너뜁니다.", flush=True)
+        return
+
+    if not os.path.isfile(tar_file_path):
+        print(f"[WANDB] tar.gz 파일이 존재하지 않습니다: {tar_file_path}", flush=True)
+        return
+
+    eval_method = str(getattr(args, "eval_method", "eval")).strip()
+    run_count_raw = getattr(args, "run_count", None)
+    try:
+        run_count = int(run_count_raw)
+    except Exception:
+        run_count = 0
+
+    # W&B artifact 이름은 고정(name) + 버전(version) 구조라서,
+    # name을 고정해두면 실행마다 버전이 쌓입니다.
+    artifact_name = f"{str(getattr(args, 'name', 'exp'))}_{eval_method}_wosac-submission"
+    artifact_name = artifact_name.replace(" ", "_").replace(os.sep, "_")
+
+    artifact = wandb.Artifact(
+        name=artifact_name,
+        type="submission",
+        metadata={
+            "eval_method": eval_method,
+            "run_count": int(run_count),
+            "save_path": str(getattr(args, "save_path", "")),
+            "file_basename": os.path.basename(tar_file_path),
+        },
+    )
+
+    artifact.add_file(tar_file_path, name=os.path.basename(tar_file_path))
+
+    aliases: List[str] = ["latest", f"run{int(run_count)}"]
+    logged_artifact = wandb.run.log_artifact(artifact, aliases=aliases)
+
+    wait_fn = getattr(logged_artifact, "wait", None)
+    if callable(wait_fn):
+        wait_fn()
+
+    print(f"[WANDB] WOSAC tar.gz 업로드 완료: {tar_file_path}", flush=True)
+
+
+def _finalize_wandb_and_cleanup_tb_dir(
+    args: argparse.Namespace,
+    global_rank: int,
+) -> None:
+    """W&B 종료 및 tb 디렉터리 정리를 수행합니다(대표 프로세스만).
+
+    이 함수가 필요한 이유
+    -------------------
+    - tar.gz 업로드는 wandb.run이 살아있는 상태에서 해야 합니다.
+    - 그래서 기존의 'wandb.finish()'를 너무 일찍 호출하지 않고,
+      업로드가 끝난 뒤 여기서 마무리하는 구조로 정리합니다.
+
+    Args:
+        args (argparse.Namespace):
+            실행 인자. (shape: ())
+        global_rank (int):
+            분산 실행에서 현재 프로세스 순번. (shape: ())
+
+    Returns:
+        None
+    """
+    if int(global_rank) != 0:
+        return
+
+    # 기존 코드와 동일하게: use_wandb=True일 때만 wandb.finish() 호출
+    if bool(getattr(args, "use_wandb", False)) and wandb.run is not None:
+        try:
+            wandb.finish()
+        except Exception as e:
+            print(f"[WANDB] wandb.finish() 중 오류: {e}", flush=True)
+
+    tb_dir = os.path.join(str(getattr(args, "save_path", "")), "tb")
+    if not isinstance(tb_dir, str) or tb_dir.strip() == "":
+        return
+
+    try:
+        shutil.rmtree(tb_dir)
+        print(f"[CLEANUP] 디렉터리 삭제: {tb_dir}", flush=True)
+    except FileNotFoundError:
+        print(f"[CLEANUP] 디렉터리 없음 (이미 삭제됨): {tb_dir}", flush=True)
+    except Exception as e:
+        print(f"[CLEANUP] 디렉터리 삭제 오류: {tb_dir}, {e}", flush=True)
+
+
 import json
 from typing import Any, Optional
 
@@ -1096,42 +1237,45 @@ def model_validation(
         _update_validation_heartbeat_stage(args, "finalizing")
         _finalize_eval_cleanup(args, global_rank, wandb_logger)
         # ✅ tar.gz 생성은 “모든 정리/동기화(barrier)가 끝난 뒤”에 rank0만 수행
-        if int(global_rank) == 0 and bool(
-                getattr(wosac_submission, "is_active", False)):
-            _update_validation_heartbeat_stage(args,
-                                               "creating WOSAC submission tar.gz")
-            wosac_submission.save_sub_file()
+        # ✅ tar.gz 생성은 “모든 정리/동기화(barrier)가 끝난 뒤”에 rank0만 수행
+        if int(global_rank) == 0:
+            if bool(getattr(wosac_submission, "is_active", False)):
+                _update_validation_heartbeat_stage(args,
+                                                   "creating WOSAC submission tar.gz")
+                wosac_submission.save_sub_file()
+
+                tar_file_path = _get_wosac_submission_tar_path(wosac_submission)
+                _update_validation_heartbeat_stage(args,
+                                                   "uploading WOSAC tar.gz to wandb artifact")
+                _upload_wosac_submission_tar_to_wandb(args=args,
+                                                      tar_file_path=tar_file_path)
+
+            # ✅ (WOSAC이 꺼져 있어도) W&B 마무리와 tb 정리는 rank0에서 한 번만 수행
+            _finalize_wandb_and_cleanup_tb_dir(args=args,
+                                               global_rank=int(global_rank))
 
     finally:
         _stop_validation_heartbeat_if_needed(args)
-
 
 def _finalize_eval_cleanup(
     args: argparse.Namespace,
     global_rank: int,
     wandb_logger: Logger,
 ) -> None:
-    # 1) 분산 학습일 때만 barrier 호출
+    # 1) 분산 실행이면 여기서 한 번 모여서, 모두가 validation을 끝낸 뒤 정리로 넘어가게 합니다.
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
 
-    if global_rank == 0:
+    # 2) TensorBoard writer는 rank0만 사용하므로 rank0만 닫습니다.
+    if int(global_rank) == 0:
         wandb_logger.finish()
-    # 2) W&B / TensorBoard 종료
-    if args.use_wandb and wandb.run is not None:
-        wandb.finish()
 
+    # 3) rank0가 writer를 닫을 때까지 다른 rank가 너무 빨리 빠져나가지 않게 한 번 더 맞춥니다.
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
 
-    tb_dir = os.path.join(args.save_path, "tb")
-    try:
-        shutil.rmtree(tb_dir)
-        print(f"[CLEANUP] 디렉터리 삭제: {tb_dir}")
-    except FileNotFoundError:
-        print(f"[CLEANUP] 디렉터리 없음 (이미 삭제됨): {tb_dir}")
-    except Exception as e:
-        print(f"[CLEANUP] 디렉터리 삭제 오류: {tb_dir}, {e}")
+    # ✅ 주의: wandb.finish() / tb_dir 삭제는 여기서 하지 않습니다.
+    #         tar.gz 생성 + 업로드가 끝난 뒤, model_validation 쪽에서 마무리합니다.
 
 
 def run_validation_loop(
