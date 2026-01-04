@@ -13,7 +13,8 @@
 import numpy as np
 
 import itertools
-import multiprocessing as mp
+import torch.multiprocessing as mp
+
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -37,6 +38,84 @@ import atexit
 import multiprocessing.pool as mp_pool
 from multiprocessing.pool import Pool as MpPool
 from typing import Any
+
+def _to_shared_cpu_tensor_for_wosac(value: Tensor) -> Tensor:
+    """WOSAC worker에 넘길 텐서를 'CPU 공유 공간'에 올려서 반환합니다.
+
+    목적
+    ----
+    - worker에 데이터를 전달할 때, 같은 값이 여러 번 복사되면 메모리가 급격히 늘 수 있습니다.
+    - 이 함수는 텐서를 CPU로 옮긴 뒤, 여러 프로세스가 같이 볼 수 있는 공간(공유 공간)에
+      올려서 "한 번만 만들어 공유"되는 형태로 만듭니다.
+
+    처리 내용
+    --------
+    1) GPU 텐서면 CPU로 옮깁니다.
+    2) numpy가 잘 처리하지 못하는 bfloat16이면 float32로 바꿉니다.
+    3) 메모리 모양을 연속(contiguous)으로 맞춥니다.
+    4) 공유 공간에 올립니다.
+
+    Args:
+        value (Tensor):
+            변환할 입력 텐서.
+            - shape: (N, ...)  (예: agent_id: (N2,), pred_traj: (N2, R, T, 2) 등)
+
+    Returns:
+        Tensor:
+            CPU에 있고, 공유 공간에 올라간 텐서.
+            - shape: 입력과 동일
+    """
+    v = value.detach()
+
+    if v.is_cuda:
+        v = v.cpu()
+
+    if v.dtype == torch.bfloat16:
+        v = v.to(dtype=torch.float32)
+
+    if not v.is_contiguous():
+        v = v.contiguous()
+
+    try:
+        # 이미 공유 텐서면 그대로 사용
+        if hasattr(v, "is_shared") and bool(v.is_shared()):
+            return v
+    except Exception:
+        pass
+
+    # 공유 공간으로 이동(여러 프로세스가 같은 데이터를 보게 됨)
+    v.share_memory_()
+    return v
+
+
+def _torch_cpu_tensor_to_numpy_view_for_wosac(value: Tensor) -> np.ndarray:
+    """CPU 텐서를 numpy '뷰(view)'로 바꿉니다(가능하면 복사 없이).
+
+    목적
+    ----
+    - worker 쪽에서 기존 로직(ScenarioRollouts 생성 등)은 numpy 배열을 사용합니다.
+    - 다만 여기서는 "복사본을 만들지 않고" 같은 메모리를 그대로 보게 하고 싶습니다.
+    - CPU 텐서가 연속 메모리라면 .numpy()는 보통 같은 메모리를 그대로 보는 형태로 동작합니다.
+
+    Args:
+        value (Tensor):
+            CPU 텐서.
+            - shape: (A, ...) (예: pred_traj: (A, R, T, 2))
+
+    Returns:
+        np.ndarray:
+            value와 같은 메모리를 보는 numpy 배열.
+            - shape: 입력과 동일
+    """
+    v = value.detach()
+    if v.is_cuda:
+        raise ValueError("value는 CPU 텐서여야 합니다.")
+    if v.dtype == torch.bfloat16:
+        v = v.to(dtype=torch.float32)
+    if not v.is_contiguous():
+        v = v.contiguous()
+    return v.numpy()
+
 
 def _to_cpu_numpy_for_wosac(value: Tensor) -> np.ndarray:
     """torch 텐서를 WOSAC worker로 보내기 좋은 numpy로 바꿉니다.
@@ -75,28 +154,35 @@ def _compute_scenario_metrics_from_raw_star(
         Any,
         str,
         str,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
         bool,
         bool,
     ],
 ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
     """Pool에서 1개 시나리오에 대해 '포장 만들기 + 점수 계산'을 같이 수행합니다.
 
-    Pool은 보통 함수 입력을 1개 값으로 받는 형태가 편해서,
-    필요한 값들을 튜플로 묶어 전달합니다.
+    변경점(핵심)
+    ----------
+    - 기존에는 numpy 배열을 넘겼는데, 그 과정에서 데이터 복사가 늘기 쉬웠습니다.
+    - 이제는 CPU 공유 텐서(torch.Tensor)를 넘기고,
+      worker 안에서 numpy '뷰'로 바꿔 기존 계산을 그대로 돌립니다.
 
     Args:
         args (Tuple[...]):
-            (config, scenario_file, scenario_id, agent_id, pred_traj, pred_z, pred_head, ego_only, should_validate)
-            shape: ()
+            (config, scenario_file, scenario_id,
+             agent_id_cpu, pred_traj_cpu, pred_z_cpu, pred_head_cpu,
+             ego_only, should_validate)
+            - agent_id_cpu:  shape (A,)
+            - pred_traj_cpu: shape (A, R, T, 2)
+            - pred_z_cpu:    shape (A, R, T)
+            - pred_head_cpu: shape (A, R, T)
 
     Returns:
         Tuple[SimAgentMetrics, Dict[str, float]]:
-            - scenario_metrics: WOSAC 결과(숫자들)
-            - z_only_metrics: z만으로 계산한 추가 결과(숫자들)
+            (scenario_metrics, z_only_metrics)
     """
     return WOSACMetrics._compute_scenario_metrics_from_raw(*args)
 
@@ -1132,28 +1218,23 @@ class WOSACMetrics(Metric):
 
     @staticmethod
     def _compute_scenario_metrics_from_raw(
-        config: Any,
-        scenario_file: str,
-        scenario_id: str,
-        agent_id: np.ndarray,   # (A,)
-        pred_traj: np.ndarray,  # (A, R, T, 2)
-        pred_z: np.ndarray,     # (A, R, T)
-        pred_head: np.ndarray,  # (A, R, T)
-        ego_only: bool,
-        should_validate: bool,
+            config: Any,
+            scenario_file: str,
+            scenario_id: str,
+            agent_id: Tensor,  # (A,)
+            pred_traj: Tensor,  # (A, R, T, 2)
+            pred_z: Tensor,  # (A, R, T)
+            pred_head: Tensor,  # (A, R, T)
+            ego_only: bool,
+            should_validate: bool,
     ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
         """worker 안에서 '포장 만들기 + 점수 계산'을 한 번에 수행합니다.
 
-        동작 흐름
-        --------
-        1) raw 배열들로 ScenarioRollouts(포장) 생성
-        2) 기존 로직(_compute_scenario_metrics) 호출해서
-           - 시나리오 proto 읽기
-           - (옵션) ego_only 처리
-           - (옵션) 공식 규칙 검사
-           - WOSAC 점수 계산
-           - z_only 추가 계산
-           까지 끝냅니다.
+        변경점(핵심)
+        ----------
+        - 입력을 numpy가 아니라 CPU 텐서로 받습니다.
+        - 그리고 numpy로 바꿀 때도 "복사본"을 만들지 않고,
+          같은 메모리를 그대로 보는 형태(뷰)로 바꿉니다.
 
         Args:
             config (Any):
@@ -1162,29 +1243,38 @@ class WOSACMetrics(Metric):
                 TFRecord 파일 경로. shape: ()
             scenario_id (str):
                 시나리오 id. shape: ()
-            agent_id (np.ndarray):
+            agent_id (Tensor):
                 object_id 목록. shape: (A,)
-            pred_traj (np.ndarray):
+            pred_traj (Tensor):
                 예측 xy. shape: (A, R, T, 2)
-            pred_z (np.ndarray):
+            pred_z (Tensor):
                 예측 z. shape: (A, R, T)
-            pred_head (np.ndarray):
+            pred_head (Tensor):
                 예측 heading. shape: (A, R, T)
             ego_only (bool):
-                True면 ego만 평가하도록 시나리오를 수정. shape: ()
+                True면 ego만 평가. shape: ()
             should_validate (bool):
-                True면 공식 규칙 검사 수행. shape: ()
+                True면 규칙 검사. shape: ()
 
         Returns:
             Tuple[SimAgentMetrics, Dict[str, float]]:
                 (scenario_metrics, z_only_metrics)
         """
+        agent_id_np = _torch_cpu_tensor_to_numpy_view_for_wosac(
+            agent_id)  # (A,)
+        pred_traj_np = _torch_cpu_tensor_to_numpy_view_for_wosac(
+            pred_traj)  # (A, R, T, 2)
+        pred_z_np = _torch_cpu_tensor_to_numpy_view_for_wosac(
+            pred_z)  # (A, R, T)
+        pred_head_np = _torch_cpu_tensor_to_numpy_view_for_wosac(
+            pred_head)  # (A, R, T)
+
         scenario_rollout = WOSACMetrics._build_scenario_rollouts_from_raw_arrays(
             scenario_id=str(scenario_id),
-            agent_id=agent_id,
-            pred_traj=pred_traj,
-            pred_z=pred_z,
-            pred_head=pred_head,
+            agent_id=agent_id_np,
+            pred_traj=pred_traj_np,
+            pred_z=pred_z_np,
+            pred_head=pred_head_np,
         )
 
         return WOSACMetrics._compute_scenario_metrics(
@@ -1324,10 +1414,26 @@ class WOSACMetrics(Metric):
                 f"sum(sizes)={sum(sizes)}, N2={int(agent_batch_cpu.numel())}"
             )
 
-        agent_id_splits = torch.split(agent_id, sizes, dim=0)        # len=B, each (Ai,)
-        pred_traj_splits = torch.split(pred_traj, sizes, dim=0)      # len=B, each (Ai,R,T,2)
-        pred_z_splits = torch.split(pred_z, sizes, dim=0)            # len=B, each (Ai,R,T)
-        pred_head_splits = torch.split(pred_head, sizes, dim=0)      # len=B, each (Ai,R,T)
+        # (기존 sizes 계산까지는 그대로)
+
+        # ✅ (추가) 큰 텐서 전체를 CPU 공유 텐서로 한 번만 변환
+        agent_id_cpu_shared = _to_shared_cpu_tensor_for_wosac(agent_id)  # (N2,)
+        pred_traj_cpu_shared = _to_shared_cpu_tensor_for_wosac(
+            pred_traj)  # (N2, R, T, 2)
+        pred_z_cpu_shared = _to_shared_cpu_tensor_for_wosac(
+            pred_z)  # (N2, R, T)
+        pred_head_cpu_shared = _to_shared_cpu_tensor_for_wosac(
+            pred_head)  # (N2, R, T)
+
+        # ✅ 공유 텐서를 시나리오 단위로 split (뷰라서 추가 복사 최소)
+        agent_id_splits = torch.split(agent_id_cpu_shared, sizes,
+                                      dim=0)  # len=B, each (Ai,)
+        pred_traj_splits = torch.split(pred_traj_cpu_shared, sizes,
+                                       dim=0)  # len=B, each (Ai,R,T,2)
+        pred_z_splits = torch.split(pred_z_cpu_shared, sizes,
+                                    dim=0)  # len=B, each (Ai,R,T)
+        pred_head_splits = torch.split(pred_head_cpu_shared, sizes,
+                                       dim=0)  # len=B, each (Ai,R,T)
 
         # ------------------------------------------------------------
         # 2) multiprocessing: "포장+점수"를 worker가 수행, 메인은 숫자만 누적
@@ -1358,10 +1464,10 @@ class WOSACMetrics(Metric):
                     self.wosac_config,
                     str(scenario_files[i]),
                     str(scenario_ids[i]),
-                    _to_cpu_numpy_for_wosac(agent_id_splits[i]),
-                    _to_cpu_numpy_for_wosac(pred_traj_splits[i]),
-                    _to_cpu_numpy_for_wosac(pred_z_splits[i]),
-                    _to_cpu_numpy_for_wosac(pred_head_splits[i]),
+                    agent_id_splits[i],
+                    pred_traj_splits[i],
+                    pred_z_splits[i],
+                    pred_head_splits[i],
                     bool(self.ego_only),
                     bool(should_validate),
                 )
@@ -1460,10 +1566,10 @@ class WOSACMetrics(Metric):
                     self.wosac_config,
                     str(scenario_files[i]),
                     str(scenario_ids[i]),
-                    _to_cpu_numpy_for_wosac(agent_id_splits[i]),
-                    _to_cpu_numpy_for_wosac(pred_traj_splits[i]),
-                    _to_cpu_numpy_for_wosac(pred_z_splits[i]),
-                    _to_cpu_numpy_for_wosac(pred_head_splits[i]),
+                    agent_id_splits[i],
+                    pred_traj_splits[i],
+                    pred_z_splits[i],
+                    pred_head_splits[i],
                     bool(self.ego_only),
                     bool(should_validate),
                 )

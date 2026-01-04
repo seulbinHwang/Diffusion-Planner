@@ -3879,7 +3879,6 @@ def validate_func(
 
 
 
-
     if min_ade.is_active:
         _update_validation_heartbeat_stage(args, f"{tag} | computing minADE")
 
