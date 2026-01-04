@@ -135,7 +135,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # - env에 이미 값이 있으면 그 값을 그대로 사용
 # - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
 # ----------------------------
-export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-1}"
+export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-2}"
 export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
 
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
