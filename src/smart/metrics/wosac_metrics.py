@@ -348,7 +348,7 @@ def _get_wosac_mp_maxtasksperchild() -> Optional[int]:
             - None: 교체하지 않음
             - int: 한 worker가 처리할 최대 작업 개수
     """
-    v = int(_read_int_env("DP_WOSAC_MP_MAXTASKS_PER_CHILD", 10))
+    v = int(_read_int_env("DP_WOSAC_MP_MAXTASKS_PER_CHILD", 30))
     if v <= 0:
         return None
     return int(max(1, v))
