@@ -15,25 +15,8 @@ from typing import Any, List, Sequence, Tuple
 import os
 import numpy as np
 
-
 def _normalize_use_data_percent(use_data_percent: Any) -> float:
-    """사용할 비율(%) 값을 0~100 범위로 안전하게 정리합니다.
-
-    이 함수가 필요한 이유
-    --------------------
-    - use_data_percent는 보통 float/int로 들어오지만,
-      실수로 None/문자열 등이 들어오면 계산이 깨질 수 있습니다.
-    - 그래서 "숫자로 바꿀 수 있으면 float로", 아니면 기본값 100.0으로 처리합니다.
-    - 또한 0~100 범위를 벗어나면 안전하게 잘라(clamp)줍니다.
-
-    Args:
-        use_data_percent (Any):
-            사용할 비율 값. 보통 float/int. shape: ()
-
-    Returns:
-        float:
-            0.0 ~ 100.0 범위로 정리된 비율 값. shape: ()
-    """
+    """사용할 비율(%) 값을 0~100 범위로 안전하게 정리합니다."""
     if use_data_percent is None:
         return 100.0
 
@@ -44,6 +27,10 @@ def _normalize_use_data_percent(use_data_percent: Any) -> float:
 
     # NaN/Inf 방지
     if not bool(np.isfinite(percent)):
+        return 100.0
+
+    # ✅ 음수(예: args 기본값 -100.0)는 "미설정"으로 보고 100%로 처리
+    if percent < 0.0:
         return 100.0
 
     # 0~100 clamp
@@ -337,7 +324,6 @@ class DiffusionPlannerData(Dataset):
             - 리스트를 섞지 않고, 시작 지점부터 앞에서부터 잘라서 씁니다.
             - 예: 10.0 -> 앞 10%만 사용
         """
-        use_data_percent = 100.0
         self.data_dir = data_dir
         self.data_tfrecords_dir = None
 
@@ -482,11 +468,11 @@ class DiffusionPlannerData(Dataset):
             "road_edge",  # (chosen_edge_num, safety_len, 2) # womd
             "road_edge_type",  # (chosen_edge_num, 3) # womd
         ]
-        wosac_only_keys = []
-        if self.eval_method == "validation" or "test":
-            wosac_only_keys: List[str] = [
-                "target_id",  # (1+A,) int64. [ego_id, neighbor_id...]
-                "target_z"  # (1+A,) float32. [ego_z, neighbor_z...]
+        wosac_only_keys: List[str] = []
+        if self.eval_method in ("validation", "test"):
+            wosac_only_keys = [
+                "target_id",
+                "target_z",
             ]
 
         npz_keys: List[
@@ -517,7 +503,7 @@ class DiffusionPlannerData(Dataset):
             sample,
             predicted_neighbor_num=self.predicted_neighbor_num,
         )
-        if self.eval_method == "validation" or "test":
+        if self.eval_method in ("validation", "test"):
             scenario_id = str(os.path.splitext(file_name)[0])
             sample["scenario_id"] = scenario_id
             if self.eval_method == "validation":

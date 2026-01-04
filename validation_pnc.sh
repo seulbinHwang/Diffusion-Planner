@@ -95,7 +95,7 @@ printf "[ENV] %-28s %s\n" "DP_PROGRESS_SEC:" "${DP_PROGRESS_SEC-<unset>}"
 
 
 ###################################
-export PYTHONWARNINGS="ignore::FutureWarning:timm"
+export PYTHONWARNINGS="ignore::FutureWarning"
 export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
@@ -136,7 +136,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
 # ----------------------------
 export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-2}"
-export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
+export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.85}"
 
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "DP_WOSAC_CPU_FRACTION:" "${DP_WOSAC_CPU_FRACTION-<unset>}"

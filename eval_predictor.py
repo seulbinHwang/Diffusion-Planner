@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 from torch.utils.data import DataLoader, DistributedSampler
 from typing import Tuple, Any, Dict, Optional, List, Callable
 import wandb

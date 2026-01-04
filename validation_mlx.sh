@@ -95,7 +95,7 @@ printf "[ENV] %-28s %s\n" "DP_PROGRESS_SEC:" "${DP_PROGRESS_SEC-<unset>}"
 
 
 ###################################
-export PYTHONWARNINGS="ignore::FutureWarning:timm"
+export PYTHONWARNINGS="ignore::FutureWarning"
 export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1

@@ -95,7 +95,7 @@ printf "[ENV] %-28s %s\n" "DP_PROGRESS_SEC:" "${DP_PROGRESS_SEC-<unset>}"
 
 
 ###################################
-export PYTHONWARNINGS="ignore::FutureWarning:timm"
+export PYTHONWARNINGS="ignore::FutureWarning"
 export TF_CPP_MIN_LOG_LEVEL=2
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
@@ -175,7 +175,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_image True \
   --save_video True \
   --validate_scenario_rollouts False \
-  --finish_when_no_updated_pt True \
+  --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 5
