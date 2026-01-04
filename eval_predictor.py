@@ -3787,27 +3787,37 @@ def validate_func(
         pred_head=pred_head,
         agent_valid_mask=wosac_agent_valid_mask,
     )
+    # ------------------------------------------------------------
+    # ✅ (변경) submission이 필요할 때만 ScenarioRollouts(포장)를 만듭니다.
+    #     - wosac_metrics 계산은 (C) 방식이면 포장을 worker에서 만들 수 있습니다.
+    # ------------------------------------------------------------
+    need_scenario_rollouts_for_submission: bool = bool(
+        getattr(wosac_submission, "is_active", False)
+    )
 
-    need_scenario_rollouts: bool = bool(
-        getattr(wosac_submission, "is_active", False) or
-        getattr(wosac_metrics, "is_active", False))
     scenario_rollouts: Optional[List[
-        sim_agents_submission_pb2.ScenarioRollouts]] = None
-    if need_scenario_rollouts:
-        _update_validation_heartbeat_stage(args,
-                                           f"{tag} | packaging WOSAC inputs")
+        sim_agents_submission_pb2.ScenarioRollouts
+    ]] = None
+
+    if need_scenario_rollouts_for_submission:
+        _update_validation_heartbeat_stage(args, f"{tag} | packaging WOSAC inputs")
+
         scenario_rollouts = get_scenario_rollouts(
             scenario_id=get_scenario_id_int_tensor(scenario_id, device),
-            agent_id=wosac_agent_id, # (N2,)
-            agent_batch=wosac_agent_batch, # (N2, )
-            pred_traj=wosac_pred_traj, #
-            pred_z=wosac_pred_z,
-            pred_head=wosac_pred_head,
+            agent_id=wosac_agent_id,         # (N2,)
+            agent_batch=wosac_agent_batch,   # (N2,)
+            pred_traj=wosac_pred_traj,       # (N2, R, T, 2)
+            pred_z=wosac_pred_z,             # (N2, R, T)
+            pred_head=wosac_pred_head,       # (N2, R, T)
         )
 
+    # ------------------------------------------------------------
+    # submission 쪽 로직은 기존과 동일 (scenario_rollouts가 있으면 사용)
+    # ------------------------------------------------------------
     if wosac_submission.is_active:
         _update_validation_heartbeat_stage(
-            args, f"{tag} | collecting data for submission")
+            args, f"{tag} | collecting data for submission"
+        )
 
         wosac_submission.update(
             scenario_id=scenario_id,
@@ -3819,17 +3829,14 @@ def validate_func(
             global_rank=int(ddp_rank),
         )
 
-        world_size_now: int = int(
-            ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
+        world_size_now: int = int(ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
 
         if world_size_now <= 1:
             if int(ddp_rank) == 0 and scenario_rollouts is not None:
                 wosac_submission.aggregate_rollouts(scenario_rollouts)
         else:
-            # ✅ 모든 rank가 같이 호출해야 함 (여기서 분산 통신이 일어남)
             _gpu_dict_sync = wosac_submission.compute()
 
-            # ✅ 실제로 rollouts를 만들고 파일에 쌓는 건 rank0만
             if int(ddp_rank) == 0:
                 for k in _gpu_dict_sync.keys():
                     if type(_gpu_dict_sync[k]) is list:
@@ -3839,14 +3846,36 @@ def validate_func(
 
         wosac_submission.reset()
 
+    # ------------------------------------------------------------
+    # ✅ (변경) wosac_metrics는:
+    #   - submission 때문에 이미 포장이 있다면 기존 update()로 재사용
+    #   - 포장이 없다면 (C) 방식: worker에서 포장+점수 계산
+    # ------------------------------------------------------------
     if wosac_metrics.is_active:
-        if scenario_rollouts is None:
-            raise RuntimeError(
-                "wosac_metrics가 active인데 scenario_rollouts가 생성되지 않았습니다.")
-
         _update_validation_heartbeat_stage(
-            args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})")
-        wosac_metrics.update(tfrecord_path, scenario_rollouts, should_validate=args.validate_scenario_rollouts)
+            args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})"
+        )
+
+        if scenario_rollouts is not None:
+            wosac_metrics.update(
+                tfrecord_path,
+                scenario_rollouts,
+                should_validate=args.validate_scenario_rollouts,
+            )
+        else:
+            wosac_metrics.update_from_rollout_tensors(
+                scenario_files=tfrecord_path,     # len=B
+                scenario_ids=scenario_id,         # len=B
+                agent_id=wosac_agent_id,          # (N2,)
+                agent_batch=wosac_agent_batch,    # (N2,)
+                pred_traj=wosac_pred_traj,        # (N2, R, T, 2)
+                pred_z=wosac_pred_z,              # (N2, R, T)
+                pred_head=wosac_pred_head,        # (N2, R, T)
+                should_validate=args.validate_scenario_rollouts,
+            )
+
+
+
 
     if min_ade.is_active:
         _update_validation_heartbeat_stage(args, f"{tag} | computing minADE")

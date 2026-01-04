@@ -28,6 +28,8 @@ from waymo_open_dataset.protos import (
     sim_agents_metrics_pb2,
     sim_agents_submission_pb2,
 )
+import queue as py_queue
+import torch
 from typing import Optional
 from waymo_open_dataset.utils.sim_agents import submission_specs
 from waymo_open_dataset.protos import scenario_pb2, sim_agents_submission_pb2
@@ -35,6 +37,68 @@ import atexit
 import multiprocessing.pool as mp_pool
 from multiprocessing.pool import Pool as MpPool
 from typing import Any
+
+def _to_cpu_numpy_for_wosac(value: Tensor) -> np.ndarray:
+    """torch 텐서를 WOSAC worker로 보내기 좋은 numpy로 바꿉니다.
+
+    이 함수가 하는 일
+    ---------------
+    - multiprocessing worker로 데이터를 보낼 때는, GPU 텐서를 그대로 보내기 어렵습니다.
+      (pickle 과정에서 문제가 나거나, 불필요한 큰 이동이 생길 수 있습니다)
+    - 그래서 텐서를 CPU로 옮긴 뒤 numpy로 바꿉니다.
+    - 단, torch.bfloat16은 numpy 변환이 막히는 경우가 많아서,
+      그 경우만 안전하게 float32로 바꿉니다.
+
+    Args:
+        value (Tensor):
+            변환할 텐서.
+            shape: (N, ...) 또는 빈 텐서도 가능
+
+    Returns:
+        np.ndarray:
+            CPU에 있는 numpy 배열.
+            shape: value와 동일
+    """
+    v = value.detach()
+    if v.is_cuda:
+        v = v.cpu()
+
+    # numpy가 bfloat16을 직접 못 받는 환경 대비
+    if v.dtype == torch.bfloat16:
+        v = v.to(dtype=torch.float32)
+
+    return v.contiguous().numpy()
+
+
+def _compute_scenario_metrics_from_raw_star(
+    args: Tuple[
+        Any,
+        str,
+        str,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        bool,
+        bool,
+    ],
+) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
+    """Pool에서 1개 시나리오에 대해 '포장 만들기 + 점수 계산'을 같이 수행합니다.
+
+    Pool은 보통 함수 입력을 1개 값으로 받는 형태가 편해서,
+    필요한 값들을 튜플로 묶어 전달합니다.
+
+    Args:
+        args (Tuple[...]):
+            (config, scenario_file, scenario_id, agent_id, pred_traj, pred_z, pred_head, ego_only, should_validate)
+            shape: ()
+
+    Returns:
+        Tuple[SimAgentMetrics, Dict[str, float]]:
+            - scenario_metrics: WOSAC 결과(숫자들)
+            - z_only_metrics: z만으로 계산한 추가 결과(숫자들)
+    """
+    return WOSACMetrics._compute_scenario_metrics_from_raw(*args)
 
 
 def _compute_scenario_metrics_star(
@@ -954,6 +1018,485 @@ class WOSACMetrics(Metric):
             self.close_mp_pool()
         except Exception:
             pass
+
+    @staticmethod
+    def _build_scenario_rollouts_from_raw_arrays(
+        scenario_id: str,
+        agent_id: np.ndarray,   # (A,)
+        pred_traj: np.ndarray,  # (A, R, T, 2)
+        pred_z: np.ndarray,     # (A, R, T)
+        pred_head: np.ndarray,  # (A, R, T)
+    ) -> sim_agents_submission_pb2.ScenarioRollouts:
+        """raw 예측 배열들로 ScenarioRollouts(포장)를 1개 시나리오 단위로 만듭니다.
+
+        왜 필요한가?
+        -----------
+        (C) 방식의 핵심은:
+        - 메인 프로세스에서 ScenarioRollouts(큰 포장 객체)를 미리 만들지 않고,
+        - worker가 "시나리오 1개"를 맡아서 포장까지 만든 뒤,
+        - 바로 점수 계산까지 끝내는 것입니다.
+
+        입력/출력 shape
+        -------------
+        - agent_id: (A,)
+        - pred_traj: (A, R, T, 2)  # 마지막 2는 (x, y)
+        - pred_z: (A, R, T)
+        - pred_head: (A, R, T)
+        - 반환: ScenarioRollouts 1개 (scenario_id 포함)
+
+        Args:
+            scenario_id (str):
+                시나리오 id 문자열. shape: ()
+            agent_id (np.ndarray):
+                object_id 목록.
+                shape: (A,)
+            pred_traj (np.ndarray):
+                예측 xy 궤적.
+                shape: (A, R, T, 2)
+            pred_z (np.ndarray):
+                예측 z(높이).
+                shape: (A, R, T)
+            pred_head (np.ndarray):
+                예측 heading(각도).
+                shape: (A, R, T)
+
+        Returns:
+            sim_agents_submission_pb2.ScenarioRollouts:
+                시나리오 1개에 대한 rollouts(포장).
+        """
+        scenario_id = str(scenario_id)
+
+        if pred_traj.ndim != 4 or int(pred_traj.shape[-1]) != 2:
+            raise ValueError(
+                "pred_traj는 (A, R, T, 2) 형태여야 합니다. "
+                f"현재 shape={tuple(pred_traj.shape)}"
+            )
+        a = int(pred_traj.shape[0])
+        r = int(pred_traj.shape[1])
+        t = int(pred_traj.shape[2])
+
+        if agent_id.ndim != 1 or int(agent_id.shape[0]) != a:
+            raise ValueError(
+                "agent_id는 (A,) 이고 pred_traj의 A와 같아야 합니다. "
+                f"A(pred_traj)={a}, agent_id.shape={tuple(agent_id.shape)}"
+            )
+        if pred_z.shape != (a, r, t):
+            raise ValueError(
+                "pred_z는 (A, R, T) 형태여야 합니다. "
+                f"expected={(a, r, t)}, got={tuple(pred_z.shape)}"
+            )
+        if pred_head.shape != (a, r, t):
+            raise ValueError(
+                "pred_head는 (A, R, T) 형태여야 합니다. "
+                f"expected={(a, r, t)}, got={tuple(pred_head.shape)}"
+            )
+
+        joint_scenes: List[sim_agents_submission_pb2.JointScene] = []
+
+        # rollout(R) 단위로 JointScene 생성
+        for i_rollout in range(r):
+            simulated_trajectories: List[
+                sim_agents_submission_pb2.SimulatedTrajectory
+            ] = []
+
+            # agent(A) 단위로 SimulatedTrajectory 생성
+            for i_agent in range(a):
+                obj_id_int = int(agent_id[i_agent])
+
+                # numpy 1D 배열을 그대로 넣어도(반복 필드에 대한 iterable) 동작하는 경우가 많습니다.
+                # 기존 get_scenario_rollouts와 동일한 성격을 유지하기 위해 list 변환을 강제하지 않습니다.
+                traj_xy = pred_traj[i_agent, i_rollout]       # (T, 2)
+                traj_z = pred_z[i_agent, i_rollout]          # (T,)
+                traj_head = pred_head[i_agent, i_rollout]    # (T,)
+
+                simulated_trajectories.append(
+                    sim_agents_submission_pb2.SimulatedTrajectory(
+                        center_x=traj_xy[:, 0],
+                        center_y=traj_xy[:, 1],
+                        center_z=traj_z,
+                        heading=traj_head,
+                        object_id=obj_id_int,
+                    )
+                )
+
+            joint_scenes.append(
+                sim_agents_submission_pb2.JointScene(
+                    simulated_trajectories=simulated_trajectories
+                )
+            )
+
+        return sim_agents_submission_pb2.ScenarioRollouts(
+            joint_scenes=joint_scenes,
+            scenario_id=scenario_id,
+        )
+
+    @staticmethod
+    def _compute_scenario_metrics_from_raw(
+        config: Any,
+        scenario_file: str,
+        scenario_id: str,
+        agent_id: np.ndarray,   # (A,)
+        pred_traj: np.ndarray,  # (A, R, T, 2)
+        pred_z: np.ndarray,     # (A, R, T)
+        pred_head: np.ndarray,  # (A, R, T)
+        ego_only: bool,
+        should_validate: bool,
+    ) -> Tuple[sim_agents_metrics_pb2.SimAgentMetrics, Dict[str, float]]:
+        """worker 안에서 '포장 만들기 + 점수 계산'을 한 번에 수행합니다.
+
+        동작 흐름
+        --------
+        1) raw 배열들로 ScenarioRollouts(포장) 생성
+        2) 기존 로직(_compute_scenario_metrics) 호출해서
+           - 시나리오 proto 읽기
+           - (옵션) ego_only 처리
+           - (옵션) 공식 규칙 검사
+           - WOSAC 점수 계산
+           - z_only 추가 계산
+           까지 끝냅니다.
+
+        Args:
+            config (Any):
+                WOSAC 설정. shape: ()
+            scenario_file (str):
+                TFRecord 파일 경로. shape: ()
+            scenario_id (str):
+                시나리오 id. shape: ()
+            agent_id (np.ndarray):
+                object_id 목록. shape: (A,)
+            pred_traj (np.ndarray):
+                예측 xy. shape: (A, R, T, 2)
+            pred_z (np.ndarray):
+                예측 z. shape: (A, R, T)
+            pred_head (np.ndarray):
+                예측 heading. shape: (A, R, T)
+            ego_only (bool):
+                True면 ego만 평가하도록 시나리오를 수정. shape: ()
+            should_validate (bool):
+                True면 공식 규칙 검사 수행. shape: ()
+
+        Returns:
+            Tuple[SimAgentMetrics, Dict[str, float]]:
+                (scenario_metrics, z_only_metrics)
+        """
+        scenario_rollout = WOSACMetrics._build_scenario_rollouts_from_raw_arrays(
+            scenario_id=str(scenario_id),
+            agent_id=agent_id,
+            pred_traj=pred_traj,
+            pred_z=pred_z,
+            pred_head=pred_head,
+        )
+
+        return WOSACMetrics._compute_scenario_metrics(
+            config,
+            scenario_file,
+            scenario_rollout,
+            ego_only,
+            should_validate,
+        )
+
+    def update_from_rollout_tensors(
+        self,
+        scenario_files: List[str],
+        scenario_ids: List[str],
+        agent_id: Tensor,      # (N2,)
+        agent_batch: Tensor,   # (N2,)
+        pred_traj: Tensor,     # (N2, R, T, 2)
+        pred_z: Tensor,        # (N2, R, T)
+        pred_head: Tensor,     # (N2, R, T)
+        should_validate: bool = True,
+    ) -> None:
+        """(C) 방식으로 WOSAC metric을 업데이트합니다.
+
+        핵심 변화
+        --------
+        - 메인 프로세스에서 ScenarioRollouts(큰 포장 객체) 리스트를 만들지 않습니다.
+        - 대신,
+          1) 배치를 시나리오 단위로 나눕니다.
+          2) 각 시나리오 조각(작은 raw 배열들)을 worker로 보냅니다.
+          3) worker가 포장 만들기 + 점수 계산을 한 번에 끝냅니다.
+          4) 메인은 결과 숫자만 받아 누적합니다.
+
+        기대 효과(이론적으로)
+        -------------------
+        - 메모리 피크 감소: 한꺼번에 많은 포장 객체를 들고 있지 않음
+        - 속도 개선: 포장 만들기 자체도 여러 CPU에서 같이 처리
+        - 큰 객체 이동 감소: protobuf 완성품 대신 raw 배열만 이동
+
+        Args:
+            scenario_files (List[str]):
+                TFRecord 경로 리스트. len = B
+            scenario_ids (List[str]):
+                scenario_id 문자열 리스트. len = B
+            agent_id (Tensor):
+                전체 배치의 agent object_id를 펼친 값(필터 후).
+                shape: (N2,)
+            agent_batch (Tensor):
+                agent_id의 각 원소가 어느 시나리오(0~B-1)에 속하는지.
+                shape: (N2,)
+            pred_traj (Tensor):
+                예측 xy. shape: (N2, R, T, 2)
+            pred_z (Tensor):
+                예측 z. shape: (N2, R, T)
+            pred_head (Tensor):
+                예측 heading. shape: (N2, R, T)
+            should_validate (bool):
+                True면 공식 규칙 검사 수행.
+
+        Returns:
+            None
+        """
+        batch_size_now: int = int(len(scenario_files))
+        if int(len(scenario_ids)) != batch_size_now:
+            raise ValueError(
+                "scenario_files와 scenario_ids 길이가 다릅니다. "
+                f"len(files)={len(scenario_files)}, len(ids)={len(scenario_ids)}"
+            )
+
+        # worker 추천 수(기존 update와 동일 규칙)
+        tf_threads: int = int(
+            getattr(self, "_tf_num_threads", _get_wosac_tf_num_threads())
+        )
+        recommended_p: int = _recommend_wosac_mp_processes(
+            batch_size=batch_size_now,
+            tf_num_threads=tf_threads,
+        )
+
+        disable_mp: bool = str(os.environ.get("DP_WOSAC_DISABLE_MP", "0")).strip() == "1"
+        use_mp_pool: bool = (not disable_mp) and (recommended_p > 1)
+
+        progress_sec_raw = _read_float_env("DP_WOSAC_PROGRESS_SEC", 60.0)
+        progress_sec: float = float(progress_sec_raw)
+        if progress_sec <= 0.0:
+            progress_sec = 0.0
+
+        if _is_rank_zero():
+            print(
+                f"[WOSACMetrics] update_from_rollout_tensors(): batch_size={batch_size_now}, "
+                f"tf_threads={tf_threads}, "
+                f"recommended_p={recommended_p}, "
+                f"use_mp_pool={use_mp_pool}, "
+                f"disable_mp={disable_mp}",
+                flush=True,
+            )
+
+        if disable_mp:
+            self.close_mp_pool()
+
+        total = int(batch_size_now)
+        start_t = time.perf_counter()
+        last_print_t = start_t
+
+        def _maybe_print(done: int, force: bool = False) -> None:
+            nonlocal last_print_t
+            if not _is_rank_zero():
+                return
+            if progress_sec <= 0.0:
+                return
+            now = time.perf_counter()
+            if force or (now - last_print_t) >= float(progress_sec) or done >= total:
+                elapsed_str = _format_duration_hms(now - start_t)
+                print(f"[WOSACMetrics] progress: {done}/{total} (elapsed {elapsed_str})", flush=True)
+                last_print_t = now
+
+        _maybe_print(0, force=True)
+
+        # ------------------------------------------------------------
+        # 1) agent_batch 기준으로 시나리오별 크기(sizes) 계산
+        #    전제: agent_batch는 시나리오 순서대로 정렬되어 있어야 split이 의미가 유지됩니다.
+        # ------------------------------------------------------------
+        agent_batch_cpu = agent_batch.detach().to("cpu", dtype=torch.long)  # (N2,)
+        if agent_batch_cpu.numel() > 1:
+            is_sorted = bool(torch.all(agent_batch_cpu[1:] >= agent_batch_cpu[:-1]))
+            if not is_sorted:
+                raise ValueError(
+                    "agent_batch가 시나리오 순서로 정렬되어 있지 않습니다. "
+                    "현재 방식(split)은 '시나리오별로 연속 구간'이라는 전제가 필요합니다."
+                )
+
+        sizes: List[int] = torch.bincount(
+            agent_batch_cpu, minlength=int(batch_size_now)
+        ).to(dtype=torch.long).tolist()
+
+        if int(sum(sizes)) != int(agent_batch_cpu.numel()):
+            raise ValueError(
+                "시나리오별 sizes 합이 agent_batch 길이와 다릅니다. "
+                f"sum(sizes)={sum(sizes)}, N2={int(agent_batch_cpu.numel())}"
+            )
+
+        agent_id_splits = torch.split(agent_id, sizes, dim=0)        # len=B, each (Ai,)
+        pred_traj_splits = torch.split(pred_traj, sizes, dim=0)      # len=B, each (Ai,R,T,2)
+        pred_z_splits = torch.split(pred_z, sizes, dim=0)            # len=B, each (Ai,R,T)
+        pred_head_splits = torch.split(pred_head, sizes, dim=0)      # len=B, each (Ai,R,T)
+
+        # ------------------------------------------------------------
+        # 2) multiprocessing: "포장+점수"를 worker가 수행, 메인은 숫자만 누적
+        # ------------------------------------------------------------
+        if use_mp_pool:
+            pool = self._get_or_create_mp_pool(
+                min_processes=int(recommended_p),
+                tf_threads=int(tf_threads),
+            )
+
+            # 메모리/큐 폭주를 막기 위해 in-flight 작업 수를 제한합니다.
+            # 기본: worker 수 * 2
+            inflight_limit = int(max(1, int(recommended_p) * 2))
+
+            result_q: py_queue.Queue = py_queue.Queue()
+
+            def _on_success(res: Any) -> None:
+                result_q.put(("ok", res))
+
+            def _on_error(err: BaseException) -> None:
+                result_q.put(("err", err))
+
+            inflight = 0
+            done = 0
+
+            for i in range(total):
+                args = (
+                    self.wosac_config,
+                    str(scenario_files[i]),
+                    str(scenario_ids[i]),
+                    _to_cpu_numpy_for_wosac(agent_id_splits[i]),
+                    _to_cpu_numpy_for_wosac(pred_traj_splits[i]),
+                    _to_cpu_numpy_for_wosac(pred_z_splits[i]),
+                    _to_cpu_numpy_for_wosac(pred_head_splits[i]),
+                    bool(self.ego_only),
+                    bool(should_validate),
+                )
+
+                pool.apply_async(
+                    _compute_scenario_metrics_from_raw_star,
+                    args=(args,),
+                    callback=_on_success,
+                    error_callback=_on_error,
+                )
+                inflight += 1
+
+                # in-flight가 너무 많아지면 결과를 하나 이상 처리하고 진행
+                while inflight >= inflight_limit:
+                    status, payload = result_q.get()
+                    inflight -= 1
+                    if status == "err":
+                        raise payload  # worker 예외를 그대로 전파
+
+                    scenario_metrics, z_only = payload
+                    done += 1
+                    _maybe_print(done, force=False)
+
+                    # 누적(기존 update와 동일)
+                    self.scenario_counter += 1
+                    self.metametric += scenario_metrics.metametric
+                    self.average_displacement_error += scenario_metrics.average_displacement_error
+                    self.linear_speed_likelihood += scenario_metrics.linear_speed_likelihood
+                    self.linear_acceleration_likelihood += scenario_metrics.linear_acceleration_likelihood
+                    self.angular_speed_likelihood += scenario_metrics.angular_speed_likelihood
+                    self.angular_acceleration_likelihood += scenario_metrics.angular_acceleration_likelihood
+                    self.distance_to_nearest_object_likelihood += scenario_metrics.distance_to_nearest_object_likelihood
+                    self.collision_indication_likelihood += scenario_metrics.collision_indication_likelihood
+                    self.time_to_collision_likelihood += scenario_metrics.time_to_collision_likelihood
+                    self.distance_to_road_edge_likelihood += scenario_metrics.distance_to_road_edge_likelihood
+                    self.offroad_indication_likelihood += scenario_metrics.offroad_indication_likelihood
+                    self.min_average_displacement_error += scenario_metrics.min_average_displacement_error
+                    self.simulated_collision_rate += scenario_metrics.simulated_collision_rate
+                    self.simulated_offroad_rate += scenario_metrics.simulated_offroad_rate
+                    self.traffic_light_violation_likelihood += scenario_metrics.traffic_light_violation_likelihood
+                    self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
+
+                    self.z_only_average_displacement_error += tensor(
+                        float(z_only.get("average_displacement_error_z_only", 0.0))
+                    )
+                    self.z_only_min_average_displacement_error += tensor(
+                        float(z_only.get("min_average_displacement_error_z_only", 0.0))
+                    )
+
+            # 남은 결과 모두 수거
+            while inflight > 0:
+                status, payload = result_q.get()
+                inflight -= 1
+                if status == "err":
+                    raise payload
+
+                scenario_metrics, z_only = payload
+                done += 1
+                _maybe_print(done, force=False)
+
+                self.scenario_counter += 1
+                self.metametric += scenario_metrics.metametric
+                self.average_displacement_error += scenario_metrics.average_displacement_error
+                self.linear_speed_likelihood += scenario_metrics.linear_speed_likelihood
+                self.linear_acceleration_likelihood += scenario_metrics.linear_acceleration_likelihood
+                self.angular_speed_likelihood += scenario_metrics.angular_speed_likelihood
+                self.angular_acceleration_likelihood += scenario_metrics.angular_acceleration_likelihood
+                self.distance_to_nearest_object_likelihood += scenario_metrics.distance_to_nearest_object_likelihood
+                self.collision_indication_likelihood += scenario_metrics.collision_indication_likelihood
+                self.time_to_collision_likelihood += scenario_metrics.time_to_collision_likelihood
+                self.distance_to_road_edge_likelihood += scenario_metrics.distance_to_road_edge_likelihood
+                self.offroad_indication_likelihood += scenario_metrics.offroad_indication_likelihood
+                self.min_average_displacement_error += scenario_metrics.min_average_displacement_error
+                self.simulated_collision_rate += scenario_metrics.simulated_collision_rate
+                self.simulated_offroad_rate += scenario_metrics.simulated_offroad_rate
+                self.traffic_light_violation_likelihood += scenario_metrics.traffic_light_violation_likelihood
+                self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
+
+                self.z_only_average_displacement_error += tensor(
+                    float(z_only.get("average_displacement_error_z_only", 0.0))
+                )
+                self.z_only_min_average_displacement_error += tensor(
+                    float(z_only.get("min_average_displacement_error_z_only", 0.0))
+                )
+
+            _maybe_print(done, force=True)
+
+        else:
+            # --------------------------------------------------------
+            # 3) multiprocessing을 안 쓰는 경우: 시나리오를 1개씩 순차 처리
+            #    (그래도 포장을 한꺼번에 만들지 않아서 메모리 피크는 줄어듭니다)
+            # --------------------------------------------------------
+            done = 0
+            for i in range(total):
+                scenario_metrics, z_only = WOSACMetrics._compute_scenario_metrics_from_raw(
+                    self.wosac_config,
+                    str(scenario_files[i]),
+                    str(scenario_ids[i]),
+                    _to_cpu_numpy_for_wosac(agent_id_splits[i]),
+                    _to_cpu_numpy_for_wosac(pred_traj_splits[i]),
+                    _to_cpu_numpy_for_wosac(pred_z_splits[i]),
+                    _to_cpu_numpy_for_wosac(pred_head_splits[i]),
+                    bool(self.ego_only),
+                    bool(should_validate),
+                )
+
+                done += 1
+                _maybe_print(done, force=False)
+
+                self.scenario_counter += 1
+                self.metametric += scenario_metrics.metametric
+                self.average_displacement_error += scenario_metrics.average_displacement_error
+                self.linear_speed_likelihood += scenario_metrics.linear_speed_likelihood
+                self.linear_acceleration_likelihood += scenario_metrics.linear_acceleration_likelihood
+                self.angular_speed_likelihood += scenario_metrics.angular_speed_likelihood
+                self.angular_acceleration_likelihood += scenario_metrics.angular_acceleration_likelihood
+                self.distance_to_nearest_object_likelihood += scenario_metrics.distance_to_nearest_object_likelihood
+                self.collision_indication_likelihood += scenario_metrics.collision_indication_likelihood
+                self.time_to_collision_likelihood += scenario_metrics.time_to_collision_likelihood
+                self.distance_to_road_edge_likelihood += scenario_metrics.distance_to_road_edge_likelihood
+                self.offroad_indication_likelihood += scenario_metrics.offroad_indication_likelihood
+                self.min_average_displacement_error += scenario_metrics.min_average_displacement_error
+                self.simulated_collision_rate += scenario_metrics.simulated_collision_rate
+                self.simulated_offroad_rate += scenario_metrics.simulated_offroad_rate
+                self.traffic_light_violation_likelihood += scenario_metrics.traffic_light_violation_likelihood
+                self.simulated_traffic_light_violation_rate += scenario_metrics.simulated_traffic_light_violation_rate
+
+                self.z_only_average_displacement_error += tensor(
+                    float(z_only.get("average_displacement_error_z_only", 0.0))
+                )
+                self.z_only_min_average_displacement_error += tensor(
+                    float(z_only.get("min_average_displacement_error_z_only", 0.0))
+                )
+
+            _maybe_print(done, force=True)
 
     def update(
         self,
