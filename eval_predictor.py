@@ -386,40 +386,28 @@ def _get_wosac_submission_tar_path(wosac_submission: WOSACSubmission) -> str:
 def _upload_wosac_submission_tar_to_wandb(
     args: argparse.Namespace,
     tar_file_path: str,
-) -> None:
+) -> bool:
     """tar.gz 파일을 W&B artifact로 업로드합니다.
 
-    업로드 규칙(기존 설정 최대 재사용)
-    -------------------------------
-    - 기존 코드가 이미 만들어 둔 wandb.run(현재 실행의 W&B run)을 그대로 사용합니다.
-    - args.use_wandb가 True일 때만 업로드합니다. (기존 코드의 동작과 최대한 일치)
-    - artifact 이름은 "실험이름 + eval_method + wosac-submission"으로 고정해
-      업로드될 때마다 버전이 쌓이도록 합니다.
-    - 업로드가 끝날 때까지 기다렸다가 다음 단계(종료)로 넘어가도록 합니다.
-
-    Args:
-        args (argparse.Namespace):
-            실행 인자. (shape: ())
-        tar_file_path (str):
-            업로드할 tar.gz 파일 경로. (shape: ())
-
     Returns:
-        None
+        bool:
+            - True: 업로드 성공 + 서버 반영(wait 완료)
+            - False: 업로드를 건너뛰었거나(설정/파일 문제), 업로드 실패
     """
     if not bool(getattr(args, "use_wandb", False)):
-        return
+        return False
 
     if wandb.run is None:
         print("[WANDB] wandb.run이 없어 tar.gz 업로드를 건너뜁니다.", flush=True)
-        return
+        return False
 
     if not isinstance(tar_file_path, str) or tar_file_path.strip() == "":
         print("[WANDB] tar_file_path가 비어 있어 업로드를 건너뜁니다.", flush=True)
-        return
+        return False
 
     if not os.path.isfile(tar_file_path):
         print(f"[WANDB] tar.gz 파일이 존재하지 않습니다: {tar_file_path}", flush=True)
-        return
+        return False
 
     eval_method = str(getattr(args, "eval_method", "eval")).strip()
     run_count_raw = getattr(args, "run_count", None)
@@ -428,32 +416,37 @@ def _upload_wosac_submission_tar_to_wandb(
     except Exception:
         run_count = 0
 
-    # W&B artifact 이름은 고정(name) + 버전(version) 구조라서,
-    # name을 고정해두면 실행마다 버전이 쌓입니다.
     artifact_name = f"{str(getattr(args, 'name', 'exp'))}_{eval_method}_wosac-submission"
     artifact_name = artifact_name.replace(" ", "_").replace(os.sep, "_")
 
-    artifact = wandb.Artifact(
-        name=artifact_name,
-        type="submission",
-        metadata={
-            "eval_method": eval_method,
-            "run_count": int(run_count),
-            "save_path": str(getattr(args, "save_path", "")),
-            "file_basename": os.path.basename(tar_file_path),
-        },
-    )
+    try:
+        artifact = wandb.Artifact(
+            name=artifact_name,
+            type="submission",
+            metadata={
+                "eval_method": eval_method,
+                "run_count": int(run_count),
+                "save_path": str(getattr(args, "save_path", "")),
+                "file_basename": os.path.basename(tar_file_path),
+            },
+        )
 
-    artifact.add_file(tar_file_path, name=os.path.basename(tar_file_path))
+        artifact.add_file(tar_file_path, name=os.path.basename(tar_file_path))
 
-    aliases: List[str] = ["latest", f"run{int(run_count)}"]
-    logged_artifact = wandb.run.log_artifact(artifact, aliases=aliases)
+        aliases: List[str] = ["latest", f"run{int(run_count)}"]
+        logged_artifact = wandb.run.log_artifact(artifact, aliases=aliases)
 
-    wait_fn = getattr(logged_artifact, "wait", None)
-    if callable(wait_fn):
-        wait_fn()
+        wait_fn = getattr(logged_artifact, "wait", None)
+        if callable(wait_fn):
+            wait_fn()
 
-    print(f"[WANDB] WOSAC tar.gz 업로드 완료: {tar_file_path}", flush=True)
+        print(f"[WANDB] WOSAC tar.gz 업로드 완료: {tar_file_path}", flush=True)
+        return True
+
+    except Exception as e:
+        print(f"[WANDB][WARNING] WOSAC tar.gz 업로드 실패(로컬 파일 유지): {e}", flush=True)
+        return False
+
 
 
 def _finalize_wandb_and_cleanup_tb_dir(
@@ -1247,8 +1240,25 @@ def model_validation(
                 tar_file_path = _get_wosac_submission_tar_path(wosac_submission)
                 _update_validation_heartbeat_stage(args,
                                                    "uploading WOSAC tar.gz to wandb artifact")
-                _upload_wosac_submission_tar_to_wandb(args=args,
-                                                      tar_file_path=tar_file_path)
+                upload_ok = _upload_wosac_submission_tar_to_wandb(
+                    args=args,
+                    tar_file_path=tar_file_path,
+                )
+
+                if upload_ok:
+                    try:
+                        os.remove(tar_file_path)
+                        print(
+                            f"[CLEANUP] 업로드 성공 → 로컬 tar.gz 삭제: {tar_file_path}",
+                            flush=True)
+                    except FileNotFoundError:
+                        print(
+                            f"[CLEANUP] tar.gz가 이미 없음(삭제 스킵): {tar_file_path}",
+                            flush=True)
+                    except Exception as e:
+                        print(
+                            f"[CLEANUP][WARNING] tar.gz 삭제 실패: {tar_file_path} | {e}",
+                            flush=True)
 
             # ✅ (WOSAC이 꺼져 있어도) W&B 마무리와 tb 정리는 rank0에서 한 번만 수행
             _finalize_wandb_and_cleanup_tb_dir(args=args,

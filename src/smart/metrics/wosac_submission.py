@@ -15,6 +15,7 @@ import time
 import tarfile
 from pathlib import Path
 from typing import Dict, List
+import subprocess
 
 import torch
 from omegaconf import ListConfig
@@ -406,6 +407,195 @@ class WOSACSubmission(Metric):
 
         self._maybe_print_progress(force=False)
 
+    def _try_save_tar_gz_with_pigz(
+        self,
+        tar_file_name: str,
+        shard_files: List[str],
+    ) -> bool:
+        """pigz가 있으면 여러 CPU 코어를 써서 tar.gz를 빠르게 만듭니다.
+
+        이 함수가 하는 일
+        ----------------
+        - tar 파일 내용(어떤 파일들을 어떤 이름으로 묶는지)은 기존과 똑같이 만듭니다.
+        - 다만 마지막 "gzip 압축" 단계에서, 파이썬 기본 gzip(보통 1코어 중심) 대신
+          pigz(여러 코어 동시 사용)를 이용합니다.
+        - pigz가 없거나, 실행 중 문제가 생기면 False를 반환해서
+          호출자가 기존 방식(파이썬 tarfile + gzip)으로 자연스럽게 되돌아가게 합니다.
+
+        환경변수(선택)
+        --------------
+        - DP_USE_PIGZ:
+            "0"이면 pigz 사용을 끕니다. (기본은 사용)
+        - DP_PIGZ_THREADS:
+            pigz가 사용할 코어 수.
+            비어 있으면 os.cpu_count() 값을 사용합니다.
+        - DP_PIGZ_LEVEL:
+            압축 강도(1~9). 비어 있으면 pigz 기본값을 사용합니다.
+
+        Args:
+            tar_file_name (str):
+                최종 tar.gz 파일 경로. shape: ()
+            shard_files (List[str]):
+                tar에 넣을 파일 경로 리스트. length: (N_files,)
+
+        Returns:
+            bool:
+                - True: pigz로 tar.gz 생성 성공. shape: ()
+                - False: pigz를 쓰지 못했거나 실패 → 기존 gzip 방식으로 fallback 필요. shape: ()
+        """
+        use_flag = str(os.environ.get("DP_USE_PIGZ", "1")).strip().lower()
+        if use_flag in ("0", "false", "no", "off"):
+            return False
+
+        pigz_path = shutil.which("pigz")
+        if pigz_path is None:
+            return False
+
+        # 스레드(코어) 수 결정
+        threads = 0
+        raw_threads = str(os.environ.get("DP_PIGZ_THREADS", "")).strip()
+        if raw_threads != "":
+            try:
+                threads = int(raw_threads)
+            except ValueError:
+                threads = 0
+        if threads <= 0:
+            cpu_cnt = os.cpu_count() or 1
+            threads = int(max(1, int(cpu_cnt)))
+        else:
+            threads = int(max(1, int(threads)))
+
+        # 압축 강도(선택)
+        level_opt: Optional[int] = None
+        raw_level = str(os.environ.get("DP_PIGZ_LEVEL", "")).strip()
+        if raw_level != "":
+            try:
+                lv = int(raw_level)
+            except ValueError:
+                lv = 0
+            if 1 <= int(lv) <= 9:
+                level_opt = int(lv)
+
+        cmd: List[str] = [str(pigz_path)]
+        if level_opt is not None:
+            cmd.append(f"-{int(level_opt)}")
+        cmd += ["-p", str(int(threads)), "-c"]
+
+        tmp_path = str(tar_file_name) + ".tmp"
+        succeeded = False
+        proc: Optional[subprocess.Popen] = None
+
+        # tmp가 남아있으면 제거(이전 실패 흔적 등)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+        if self._is_rank_zero():
+            print(
+                f"[WOSACSubmission] pigz 사용: path='{pigz_path}', threads={threads}"
+                + (f", level={level_opt}" if level_opt is not None else ""),
+                flush=True,
+            )
+
+        try:
+            # stdout은 파일로, stdin은 tar 스트림(파이프)로 전달
+            with open(tmp_path, "wb") as out_f:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=out_f,
+                    stderr=subprocess.PIPE,
+                )
+
+                if proc.stdin is None:
+                    raise RuntimeError("pigz stdin이 준비되지 않았습니다.")
+
+                total = int(len(shard_files))
+                interval_sec = float(getattr(self, "_progress_interval_sec", 0.0))
+                tar_start_t = float(time.perf_counter())
+                tar_last_t = float(tar_start_t)
+
+                # tar는 "압축 없이" 만들고, 그 바이트를 pigz stdin으로 흘려보냅니다.
+                try:
+                    with tarfile.open(fileobj=proc.stdin, mode="w|") as tar:
+                        for idx, output_filename in enumerate(shard_files, start=1):
+                            tar.add(
+                                output_filename,
+                                arcname=output_filename + f"-of-{total:05d}",
+                            )
+
+                            # 기존 코드와 동일한 진행 출력
+                            if interval_sec > 0.0:
+                                now = float(time.perf_counter())
+                                if (now - tar_last_t) >= interval_sec or idx >= total:
+                                    elapsed = now - tar_start_t
+                                    elapsed_str = self._format_duration_hms(elapsed)
+                                    if self._is_rank_zero():
+                                        print(
+                                            f"[WOSACSubmission] tar progress: {idx}/{total} (elapsed {elapsed_str})",
+                                            flush=True,
+                                        )
+                                    tar_last_t = now
+                finally:
+                    # tarfile은 외부 fileobj(proc.stdin)를 자동으로 닫지 않는 경우가 많아서,
+                    # 반드시 여기서 닫아줘야 pigz가 EOF를 받고 종료합니다.
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+
+                # pigz 종료 대기 + stderr 수집
+                _, stderr_bytes = proc.communicate()
+                rc = int(proc.returncode or 0)
+                if rc != 0:
+                    err_text = ""
+                    if stderr_bytes:
+                        err_text = stderr_bytes.decode("utf-8", errors="ignore").strip()
+
+                    if self._is_rank_zero():
+                        print(
+                            f"[WOSACSubmission][WARNING] pigz 압축 실패(returncode={rc}). "
+                            "파이썬 gzip 방식으로 되돌립니다."
+                            + (f"\n[pigz stderr]\n{err_text}" if err_text else ""),
+                            flush=True,
+                        )
+                    return False
+
+            # 여기까지 오면 tmp_path에 정상 tar.gz가 만들어짐 → 최종 경로로 교체
+            os.replace(tmp_path, str(tar_file_name))
+            succeeded = True
+            return True
+
+        except Exception as e:
+            # pigz가 중간에 죽었거나, 파일 쓰기 문제 등이 생기면 fallback
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    pass
+
+            if self._is_rank_zero():
+                print(
+                    f"[WOSACSubmission][WARNING] pigz 사용 중 예외 발생: {e}. "
+                    "파이썬 gzip 방식으로 되돌립니다.",
+                    flush=True,
+                )
+            return False
+
+        finally:
+            if not succeeded:
+                try:
+                    if os.path.isfile(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+
     def save_sub_file(self) -> None:
         """
         남아있는 버퍼를 먼저 파일 1개로 저장
@@ -418,10 +608,19 @@ class WOSACSubmission(Metric):
 
         log.info(f"Saving wosac submission files to {tar_file_name}")
 
-        shard_files = sorted(
-            [p.as_posix() for p in self.submission_dir.glob("*")])
+        shard_files = sorted([p.as_posix() for p in self.submission_dir.glob("*")])
         total = int(len(shard_files))
 
+        # ✅ (추가) pigz가 있으면 멀티코어 gzip으로 먼저 시도
+        if self._try_save_tar_gz_with_pigz(
+            tar_file_name=str(tar_file_name),
+            shard_files=list(shard_files),
+        ):
+            log.info(f"DONE: Saved wosac submission files to {tar_file_name}")
+            self._maybe_print_progress(force=True)
+            return
+
+        # ✅ pigz가 없거나 실패하면 기존(파이썬 gzip) 방식 그대로 사용
         interval_sec = float(getattr(self, "_progress_interval_sec", 0.0))
         tar_start_t = float(time.perf_counter())
         tar_last_t = float(tar_start_t)
@@ -447,6 +646,7 @@ class WOSACSubmission(Metric):
 
         log.info(f"DONE: Saved wosac submission files to {tar_file_name}")
         self._maybe_print_progress(force=True)
+
 
     def _save_shard(self) -> None:
         # ✅ 버퍼가 비어 있으면 파일을 만들지 않습니다.
