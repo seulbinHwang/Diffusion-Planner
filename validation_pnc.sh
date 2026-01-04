@@ -136,7 +136,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
 # ----------------------------
 export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-2}"
-export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.7}"
+export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.5}"
 
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "DP_WOSAC_CPU_FRACTION:" "${DP_WOSAC_CPU_FRACTION-<unset>}"
@@ -179,6 +179,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 5 \
-  --use_data_percent 5
+  --use_data_percent 2
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
