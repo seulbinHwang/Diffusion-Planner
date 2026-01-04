@@ -16,7 +16,7 @@ import tarfile
 from pathlib import Path
 from typing import Dict, List
 
-import hydra
+import torch
 from omegaconf import ListConfig
 from torch import Tensor
 from torchmetrics.metric import Metric
@@ -24,23 +24,155 @@ from waymo_open_dataset.protos import sim_agents_submission_pb2
 import os
 from src.utils import RankedLogger
 from src.utils.wosac_utils import get_scenario_id_int_tensor
+from typing import Dict, List, Optional, Set, Tuple
+
+import torch
+from torch import Tensor
+
+
+def _is_distributed_ready() -> bool:
+    """여러 프로세스가 서로 값을 주고받을 준비가 되었는지 확인합니다.
+
+    이 함수가 하는 일
+    ----------------
+    - 여러 GPU를 쓰는 실행에서는, 프로세스(rank)들이 "작은 숫자"를 서로 공유해야 할 때가 있습니다.
+      (여기서는 이번 step에서 각 rank가 처리한 시나리오 개수)
+    - 준비가 안 된 상태에서 통신을 시도하면 즉시 에러가 나므로,
+      통신 가능 여부를 먼저 확인합니다.
+
+    Returns:
+        bool: True이면 값 공유(통신)를 사용할 수 있습니다. shape: ()
+    """
+    if not torch.distributed.is_available():
+        return False
+    return bool(torch.distributed.is_initialized())
+
+
+def _compute_global_scenario_offset_for_this_rank(
+    local_scenario_count: int,
+    device: torch.device,
+) -> int:
+    """이번 step에서 "내 rank 시나리오가 전체에서 몇 번째부터 시작하는지(offset)"를 계산합니다.
+
+    문제 상황(왜 필요한가?)
+    ----------------------
+    - rank마다 이번 step의 batch_size(=시나리오 개수)가 같다고 보장되지 않습니다.
+    - 그런데 기존처럼 `batch_size * rank`로 오프셋을 만들면,
+      마지막 근처에서 rank별 batch_size가 달라지는 순간 "시나리오 번호가 겹치거나 비는" 문제가 생깁니다.
+
+    해결 방식(핵심)
+    --------------
+    - 이번 step에서 각 rank의 local_scenario_count를 전부 모읍니다.
+      예: sizes = [B0, B1, B2, B3]  (길이 = world_size)
+    - 내 rank의 offset은 앞 rank들의 합입니다.
+      offset = B0 + B1 + ... + B(rank-1)
+
+    Args:
+        local_scenario_count (int): 이 rank가 이번 step에서 처리한 시나리오 개수. shape: ()
+        device (torch.device): 통신에 사용할 숫자 텐서를 만들 장치. shape: ()
+            - NCCL(일반적인 multi-GPU)에서는 보통 CUDA 텐서가 안전합니다.
+
+    Returns:
+        int: 내 rank 시나리오가 "전체(모든 rank 합친)"에서 시작하는 위치. shape: ()
+    """
+    safe_local = int(max(0, int(local_scenario_count)))
+
+    if not _is_distributed_ready():
+        return 0
+
+    world_size = int(torch.distributed.get_world_size())
+    rank = int(torch.distributed.get_rank())
+
+    # local_count_tensor: shape (1,)
+    local_count_tensor = torch.tensor([safe_local], device=device, dtype=torch.long)
+
+    # gathered: List[Tensor], length = world_size, 각 텐서는 shape (1,)
+    gathered: List[torch.Tensor] = [
+        torch.zeros_like(local_count_tensor) for _ in range(world_size)
+    ]
+    torch.distributed.all_gather(gathered, local_count_tensor)
+
+    # sizes: length = world_size
+    sizes = [int(t.item()) for t in gathered]
+
+    offset = int(sum(sizes[:rank]))
+    return offset
+
+
+def _apply_global_offset_to_agent_batch(
+    agent_batch: Tensor,
+    local_scenario_count: int,
+) -> Tensor:
+    """agent_batch에 전역 offset을 더해, 여러 rank 결과를 합쳐도 번호가 겹치지 않게 만듭니다.
+
+    Args:
+        agent_batch (Tensor): 각 agent가 "로컬 배치에서 몇 번째 시나리오에 속하는지" 나타내는 값.
+            shape: (n_agent,)
+            - 값 범위는 보통 [0, local_scenario_count-1] 입니다.
+        local_scenario_count (int): 이번 step에서 이 rank의 시나리오 개수(B). shape: ()
+
+    Returns:
+        Tensor: 전역 기준으로 바뀐 agent_batch.
+            shape: (n_agent,)
+            - 값 범위는 보통 [offset, offset + local_scenario_count - 1] 쪽으로 이동합니다.
+    """
+    if not isinstance(agent_batch, torch.Tensor):
+        raise TypeError("agent_batch는 torch.Tensor여야 합니다.")
+    if agent_batch.dim() != 1:
+        raise ValueError(
+            f"agent_batch는 (n_agent,) 이어야 합니다. 현재 shape={tuple(agent_batch.shape)}"
+        )
+
+    offset = _compute_global_scenario_offset_for_this_rank(
+        local_scenario_count=int(local_scenario_count),
+        device=agent_batch.device,
+    )
+    return agent_batch + int(offset)
+
 
 log = RankedLogger(__name__, rank_zero_only=False)
 
 
 # smart/metrics/wosac_submission.py
 class WOSACSubmission(Metric):
+    class WOSACSubmission(Metric):
 
-    def __init__(
-        self,
-        is_active: bool,
-        save_path: str,
-        eval_method: str,
-            global_rank: int
-    ) -> None:
-        super().__init__()
-        self.is_active = is_active
-        if self.is_active:
+        def __init__(
+                self,
+                is_active: bool,
+                save_path: str,
+                eval_method: str,
+                global_rank: int,
+                resume: bool = False,
+                existing_scenario_id_set: Optional[Set[str]] = None,
+                start_shard_index: Optional[int] = None,
+                existing_shard_count: Optional[int] = None,
+        ) -> None:
+            """WOSAC 제출 파일(binproto)을 저장/누적하는 객체를 만듭니다.
+
+            Args:
+                is_active (bool): True면 저장 기능을 켭니다. shape: ()
+                save_path (str): 실험 루트 폴더. shape: ()
+                eval_method (str): "validation" 또는 "test". shape: ()
+                global_rank (int): 현재 프로세스 rank. shape: ()
+                resume (bool): True면 기존 결과를 지우지 않고 이어서 저장합니다. shape: ()
+                existing_scenario_id_set (Optional[Set[str]]):
+                    재개 모드에서 이미 저장된 scenario_id 집합.
+                    - None이면 빈 집합으로 시작합니다.
+                    size: (N_done,) 또는 None
+                start_shard_index (Optional[int]):
+                    재개 모드에서 다음에 쓸 binproto 번호.
+                    - None이면 0부터 시작합니다.
+                    shape: ()
+                existing_shard_count (Optional[int]):
+                    재개 모드에서 이미 존재하는 shard 개수(진행 출력용).
+                    shape: ()
+            """
+            super().__init__()
+            self.is_active = bool(is_active)
+            if not self.is_active:
+                return
+
             self.method_name = "DRAFT"
             self.authors = ["Seulbin Hwang"]
             self.affiliation = "NaverLabs"
@@ -48,40 +180,49 @@ class WOSACSubmission(Metric):
                 "We generate multimodal future trajectories "
                 "with diffusion and enforce physical plausibility "
                 "by projecting them into feasible unicycle controls "
-                "with an infeasible-control penalty.")
+                "with an infeasible-control penalty."
+            )
             self.method_link = "not available yet"
             self.account_name = "h.sb@naverlabs.com"
-            self.buffer_scenario_rollouts = []
-            # ----------------------------
-            # 진행 상황(Progress) 출력 설정 (공통: DP_PROGRESS_SEC)
-            # - DP_PROGRESS_SEC <= 0 이면 출력 안 함
-            # ----------------------------
-            self._progress_interval_sec: float = self._read_progress_interval_sec(
+
+            self.buffer_scenario_rollouts: List[
+                sim_agents_submission_pb2.ScenarioRollouts] = []
+
+            self._progress_interval_sec = self._read_progress_interval_sec(
                 default_sec=60.0)
-            self._progress_start_time_sec: float = float(time.perf_counter())
-            self._progress_last_print_time_sec: float = float(
+            self._progress_start_time_sec = float(time.perf_counter())
+            self._progress_last_print_time_sec = float(
                 self._progress_start_time_sec)
 
-            self._progress_total_received: int = 0
-            self._progress_total_duplicates: int = 0
-            self._saved_shard_count: int = 0
+            self._progress_total_received = 0
+            self._progress_total_duplicates = 0
 
-            # 중복 scenario 방지용(빠른 조회)
-            self._submission_scenario_id_set = set()
+            # ✅ 중복 방지 set 복구(재개 모드에서만 의미가 큼)
+            self._submission_scenario_id_set: Set[str] = set(
+                existing_scenario_id_set or set())
 
-            self.i_file = 0
-            save_path = os.path.join(save_path, eval_method)
-            # remove existing save_path directory
-            if global_rank == 0 and os.path.exists(save_path):
-                shutil.rmtree(save_path)
+            # ✅ 이미 저장된 shard 개수(진행 출력용)
+            self._saved_shard_count = int(existing_shard_count or 0)
+
+            # ✅ 저장 경로 준비
+            save_root = os.path.join(str(save_path), str(eval_method))
+
+            # ✅ 기존 결과 폴더 삭제는 "재개 모드가 아닐 때만"
+            if int(global_rank) == 0 and os.path.exists(save_root) and (
+            not bool(resume)):
+                shutil.rmtree(save_root)
 
             self.submission_dir = Path(
-                os.path.join(save_path, f"wosac_submission"))
-
-            # Make directory if it doesn't exist
+                os.path.join(save_root, "wosac_submission"))
             self.submission_dir.mkdir(parents=True, exist_ok=True)
 
-            self.submission_scenario_id = []
+            # ✅ 다음 파일 번호(00146부터 이어쓰기 등)
+            if bool(resume):
+                self.i_file = int(start_shard_index or 0)
+            else:
+                self.i_file = 0
+
+            self.submission_scenario_id: List[str] = []
 
             self.data_keys = [
                 "scenario_id",
@@ -122,7 +263,12 @@ class WOSACSubmission(Metric):
         self.pred_head.append(pred_head)
 
         batch_size = len(scenario_id)
-        self.agent_batch.append(agent_batch + batch_size * global_rank)
+
+        agent_batch_global = _apply_global_offset_to_agent_batch(
+            agent_batch=agent_batch,  # shape: (n_agent,)
+            local_scenario_count=int(batch_size),  # shape: ()
+        )
+        self.agent_batch.append(agent_batch_global)
 
     def compute(self) -> Dict[str, Tensor]:
         return {k: getattr(self, k) for k in self.data_keys}
@@ -276,6 +422,9 @@ class WOSACSubmission(Metric):
         self._maybe_print_progress(force=True)
 
     def _save_shard(self) -> None:
+        # ✅ 버퍼가 비어 있으면 파일을 만들지 않습니다.
+        if int(len(self.buffer_scenario_rollouts)) == 0:
+            return
         shard_submission = sim_agents_submission_pb2.SimAgentsChallengeSubmission(
             scenario_rollouts=self.buffer_scenario_rollouts,
             submission_type=sim_agents_submission_pb2.

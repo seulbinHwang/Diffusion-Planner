@@ -238,6 +238,15 @@ def get_args():
                         type=float,
                         help='w_int_max',
                         default=2.0)
+    parser.add_argument(
+        "--resume_wosac_submission",
+        default=False,
+        type=boolean,
+        help=(
+            "True이면, validation/test에서 이전 실행으로 만들어진 "
+            "wosac_submission 결과 폴더를 지우지 않고 이어서 저장합니다."
+        ),
+    )
     parser.add_argument('--w_const', type=float, help='w_const', default=0.02)
 
     # DataLoader parameters

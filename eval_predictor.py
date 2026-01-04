@@ -33,7 +33,8 @@ from diffusion_planner.train_epoch import _prepare_batch_for_device
 from diffusion_planner.utils.normalizer import StateNormalizer, ObservationNormalizer
 from waymo_open_dataset.protos import sim_agents_submission_pb2
 from functools import lru_cache
-from typing import Any, List, Tuple, Optional
+from typing import Tuple, Any, Dict, Optional, List, Callable, Set, Sequence
+
 import torch
 from waymo_open_dataset.protos import scenario_pb2
 from waymo_open_dataset.utils.sim_agents import submission_specs
@@ -681,6 +682,306 @@ def _maybe_distributed_barrier(
 
     torch.distributed.barrier()
 
+def _is_resume_wosac_submission_enabled(args: argparse.Namespace) -> bool:
+    """WOSAC submission을 '이어하기' 모드로 돌릴지 여부를 반환합니다.
+
+    Args:
+        args (argparse.Namespace): 실행 인자. shape: ()
+
+    Returns:
+        bool: True이면 이어하기 모드. shape: ()
+    """
+    return bool(getattr(args, "resume_wosac_submission", False))
+
+
+def _get_wosac_submission_dir(save_path: str, eval_method: str) -> str:
+    """WOSAC submission 파일들이 저장되는 폴더 경로를 만듭니다.
+
+    Args:
+        save_path (str): 실험 루트 폴더. shape: ()
+        eval_method (str): "validation" 또는 "test". shape: ()
+
+    Returns:
+        str: 예) "{save_path}/{eval_method}/wosac_submission". shape: ()
+    """
+    return os.path.join(str(save_path), str(eval_method), "wosac_submission")
+
+
+def _extract_binproto_index_from_name(file_name: str) -> Optional[int]:
+    """submission.binproto-xxxxx 파일명에서 숫자(xxxxx)를 뽑습니다.
+
+    Args:
+        file_name (str): 파일명 또는 경로. shape: ()
+
+    Returns:
+        Optional[int]:
+            - 성공: 파일 번호(예: 145). shape: ()
+            - 실패: None
+    """
+    base = os.path.basename(str(file_name))
+    prefix = "submission.binproto-"
+    if not base.startswith(prefix):
+        return None
+    suffix = base[len(prefix):]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def _list_existing_submission_binproto_files(submission_dir: str) -> List[str]:
+    """submission_dir 아래의 submission.binproto-* 파일들을 번호 순으로 정렬해 반환합니다.
+
+    Args:
+        submission_dir (str): wosac_submission 폴더. shape: ()
+
+    Returns:
+        List[str]: 정렬된 파일 경로 리스트. length: (N_files,)
+    """
+    if not os.path.isdir(submission_dir):
+        return []
+
+    items: List[Tuple[int, str]] = []
+    for name in os.listdir(submission_dir):
+        idx = _extract_binproto_index_from_name(name)
+        if idx is None:
+            continue
+        items.append((int(idx), os.path.join(submission_dir, name)))
+
+    items.sort(key=lambda x: x[0])
+    return [p for _, p in items]
+
+
+def _infer_next_submission_shard_index(binproto_paths: Sequence[str]) -> int:
+    """이미 존재하는 binproto 파일들 다음에 저장해야 할 파일 번호를 계산합니다.
+
+    Args:
+        binproto_paths (Sequence[str]): submission.binproto-* 파일 경로들. length: (N_files,)
+
+    Returns:
+        int: 다음에 쓸 파일 번호. shape: ()
+            - 파일이 없으면 0
+            - 예: 마지막이 00145면 146
+    """
+    max_idx: int = -1
+    for p in binproto_paths:
+        idx = _extract_binproto_index_from_name(p)
+        if idx is None:
+            continue
+        if int(idx) > int(max_idx):
+            max_idx = int(idx)
+    return int(max_idx + 1) if max_idx >= 0 else 0
+
+
+def _read_scenario_ids_from_submission_binproto(file_path: str) -> List[str]:
+    """binproto 1개 파일에서 scenario_id 문자열들을 뽑습니다.
+
+    Args:
+        file_path (str): submission.binproto-xxxxx 파일 경로. shape: ()
+
+    Returns:
+        List[str]: scenario_id 목록. length: (N_scenario_in_file,)
+    """
+    msg = sim_agents_submission_pb2.SimAgentsChallengeSubmission()
+    with open(file_path, "rb") as f:
+        raw = f.read()
+    msg.ParseFromString(raw)
+
+    out: List[str] = []
+    for r in msg.scenario_rollouts:
+        sid = str(getattr(r, "scenario_id", "")).strip()
+        if sid:
+            out.append(sid)
+    return out
+
+
+def _load_done_scenario_id_set_from_binproto_files(
+    binproto_paths: Sequence[str],
+) -> Set[str]:
+    """여러 binproto 파일에서 이미 저장된 scenario_id들을 set으로 모읍니다.
+
+    Args:
+        binproto_paths (Sequence[str]): submission.binproto-* 파일 경로들. length: (N_files,)
+
+    Returns:
+        Set[str]: 이미 저장된 scenario_id 집합. size: (N_done,)
+    """
+    done: Set[str] = set()
+    for p in binproto_paths:
+        for sid in _read_scenario_ids_from_submission_binproto(str(p)):
+            done.add(str(sid))
+    return done
+
+
+def _extract_scenario_id_from_npz_name(npz_name: str) -> str:
+    """npz 파일명에서 scenario_id(확장자 제거)를 뽑습니다.
+
+    Args:
+        npz_name (str): 예) "abcd1234.npz". shape: ()
+
+    Returns:
+        str: 예) "abcd1234". shape: ()
+    """
+    base = os.path.basename(str(npz_name))
+    return str(os.path.splitext(base)[0])
+
+
+def _write_filtered_eval_set_list_json(
+    *,
+    original_eval_set_list_path: str,
+    output_eval_set_list_path: str,
+    done_scenario_ids: Set[str],
+) -> Tuple[str, int, int, int]:
+    """eval_set_list(json)에서 이미 처리된 scenario_id를 제거한 새 json을 저장합니다.
+
+    Args:
+        original_eval_set_list_path (str): 원본 json 경로. shape: ()
+        output_eval_set_list_path (str): 저장할 json 경로. shape: ()
+        done_scenario_ids (Set[str]): 이미 처리된 scenario_id set. size: (N_done,)
+
+    Returns:
+        Tuple[str, int, int, int]:
+            (output_path, total_before, total_after, removed_count)
+            - output_path: 새 json 경로. shape: ()
+            - total_before: 원래 항목 수. shape: ()
+            - total_after: 남은 항목 수. shape: ()
+            - removed_count: 제거된 항목 수. shape: ()
+    """
+    with open(original_eval_set_list_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, list):
+        raise TypeError(
+            f"eval_set_list json은 list여야 합니다. type={type(obj)}"
+        )
+
+    original_list: List[str] = [str(x) for x in obj]
+    total_before = int(len(original_list))
+
+    filtered: List[str] = []
+    removed = 0
+    for name in original_list:
+        sid = _extract_scenario_id_from_npz_name(name)
+        if sid in done_scenario_ids:
+            removed += 1
+            continue
+        filtered.append(name)
+
+    os.makedirs(os.path.dirname(output_eval_set_list_path), exist_ok=True)
+    with open(output_eval_set_list_path, "w", encoding="utf-8") as f:
+        json.dump(filtered, f, indent=2, ensure_ascii=False)
+
+    total_after = int(len(filtered))
+    return str(output_eval_set_list_path), total_before, total_after, int(removed)
+
+
+def _broadcast_object_if_possible(obj: Any, src: int = 0) -> Any:
+    """여러 프로세스로 실행 중이면 obj를 src rank에서 다른 rank로 전달합니다.
+
+    Args:
+        obj (Any): 전달할 파이썬 객체. shape: ()
+        src (int): 기준 rank. shape: ()
+
+    Returns:
+        Any: 모든 rank에서 동일해진 객체. shape: ()
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        obj_list = [obj]
+        torch.distributed.broadcast_object_list(obj_list, src=int(src))
+        return obj_list[0]
+    return obj
+
+
+def _prepare_wosac_resume_state_and_filter_eval_list(
+    args: argparse.Namespace,
+    global_rank: int,
+) -> Tuple[Optional[Set[str]], int, int]:
+    """재개 모드일 때만:
+    1) 기존 binproto에서 완료 scenario_id를 읽고
+    2) eval_set_list에서 그 항목을 제거한 새 json을 만들고
+    3) WOSAC 저장 파일 번호(i_file)를 이어서 쓸 값을 계산합니다.
+
+    Args:
+        args (argparse.Namespace): 실행 인자. shape: ()
+        global_rank (int): 현재 프로세스 rank. shape: ()
+
+    Returns:
+        Tuple[Optional[Set[str]], int, int]:
+            (done_scenario_ids, next_i_file, existing_shard_count)
+
+            - done_scenario_ids:
+                rank0이면 Set[str], 그 외 rank는 None.
+                size: (N_done,) 또는 None
+            - next_i_file:
+                다음에 저장해야 할 submission.binproto 번호.
+                shape: ()
+            - existing_shard_count:
+                기존에 존재하는 submission.binproto 파일 개수.
+                shape: ()
+    """
+    if not _is_resume_wosac_submission_enabled(args):
+        return None, 0, 0
+
+    save_path = getattr(args, "save_path", None)
+    eval_method = str(getattr(args, "eval_method", "validation"))
+    eval_set_list_path = str(getattr(args, "eval_set_list", ""))
+
+    if not isinstance(save_path, str) or not save_path:
+        return None, 0, 0
+    if not isinstance(eval_set_list_path, str) or not eval_set_list_path:
+        return None, 0, 0
+
+    submission_dir = _get_wosac_submission_dir(save_path, eval_method)
+
+    # rank0만 디스크를 많이 읽고, 결과만 브로드캐스트
+    done_ids_rank0: Optional[Set[str]] = None
+    next_i_file_rank0: int = 0
+    shard_count_rank0: int = 0
+    new_eval_list_rank0: str = eval_set_list_path
+
+    if int(global_rank) == 0:
+        binproto_paths = _list_existing_submission_binproto_files(submission_dir)
+        shard_count_rank0 = int(len(binproto_paths))
+        next_i_file_rank0 = int(_infer_next_submission_shard_index(binproto_paths))
+
+        if shard_count_rank0 > 0:
+            done_ids_rank0 = _load_done_scenario_id_set_from_binproto_files(binproto_paths)
+
+            # 새 eval_set_list json 경로 (save_path 아래에 남김)
+            out_json_path = os.path.join(
+                str(save_path),
+                str(eval_method),
+                f"diffusion_planner_{eval_method}_remaining_run{int(getattr(args, 'run_count', 0))}.json",
+            )
+
+            new_eval_list_rank0, total_before, total_after, removed = _write_filtered_eval_set_list_json(
+                original_eval_set_list_path=eval_set_list_path,
+                output_eval_set_list_path=out_json_path,
+                done_scenario_ids=done_ids_rank0,
+            )
+
+            print(
+                f"[RESUME_WOSAC] 기존 shard={shard_count_rank0}, next_i_file={next_i_file_rank0} | "
+                f"eval_set_list: {total_before} -> {total_after} (removed={removed})",
+                flush=True,
+            )
+        else:
+            # 재개 모드지만 파일이 없으면, 그냥 원본 리스트 그대로 사용
+            done_ids_rank0 = set()
+            next_i_file_rank0 = 0
+            shard_count_rank0 = 0
+
+    # 모든 rank가 같은 eval_set_list 경로를 쓰도록 맞춤
+    new_eval_list_all = _broadcast_object_if_possible(new_eval_list_rank0, src=0)
+    next_i_file_all = _broadcast_object_if_possible(next_i_file_rank0, src=0)
+    shard_count_all = _broadcast_object_if_possible(shard_count_rank0, src=0)
+
+    args.eval_set_list = str(new_eval_list_all)
+
+    # rank0만 set을 반환 (다른 rank는 None)
+    if int(global_rank) == 0:
+        return done_ids_rank0, int(next_i_file_all), int(shard_count_all)
+    return None, int(next_i_file_all), int(shard_count_all)
+
+
 
 def model_validation(
     args: argparse.Namespace,
@@ -701,6 +1002,13 @@ def model_validation(
 
         _update_validation_heartbeat_stage(args, "building data loader")
 
+        # ✅ (추가) 재개 모드면: 기존 binproto 기반으로 eval_set_list를 필터링하고,
+        #     WOSAC 저장 번호(i_file)도 이어서 쓸 값을 준비합니다.
+        (done_scenario_ids_rank0, resume_next_i_file,
+         resume_existing_shard_count) = _prepare_wosac_resume_state_and_filter_eval_list(
+            args=args,
+            global_rank=int(global_rank),
+        )
         # 3) augmentation, Dataset, Sampler
         batch_size = args.batch_size
         eval_set, validation_sampler = build_dataset_and_sampler(
@@ -758,7 +1066,12 @@ def model_validation(
             save_path=args.save_path,
             eval_method=args.eval_method,
             global_rank=global_rank,
+            resume=bool(getattr(args, "resume_wosac_submission", False)),
+            existing_scenario_id_set=done_scenario_ids_rank0,
+            start_shard_index=int(resume_next_i_file),
+            existing_shard_count=int(resume_existing_shard_count),
         )
+
         wandb_logger = setup_logger_and_purge(
             args=args,
             global_rank=global_rank,
