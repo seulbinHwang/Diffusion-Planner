@@ -3292,6 +3292,7 @@ def validate_func(
 
     device = pred_traj.device
 
+    # wosac_agent_valid_mask: (N,)
     wosac_agent_valid_mask = _build_valid_agent_mask_for_wosac(
         agent_id=target_id,
         target_future_valid=target_future_valid,
@@ -3322,9 +3323,9 @@ def validate_func(
                                            f"{tag} | packaging WOSAC inputs")
         scenario_rollouts = get_scenario_rollouts(
             scenario_id=get_scenario_id_int_tensor(scenario_id, device),
-            agent_id=wosac_agent_id,
-            agent_batch=wosac_agent_batch,
-            pred_traj=wosac_pred_traj,
+            agent_id=wosac_agent_id, # (N2,)
+            agent_batch=wosac_agent_batch, # (N2, )
+            pred_traj=wosac_pred_traj, #
             pred_z=wosac_pred_z,
             pred_head=wosac_pred_head,
         )
