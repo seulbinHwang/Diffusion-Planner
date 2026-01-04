@@ -135,105 +135,104 @@ log = RankedLogger(__name__, rank_zero_only=False)
 
 # smart/metrics/wosac_submission.py
 class WOSACSubmission(Metric):
-    class WOSACSubmission(Metric):
 
-        def __init__(
-                self,
-                is_active: bool,
-                save_path: str,
-                eval_method: str,
-                global_rank: int,
-                resume: bool = False,
-                existing_scenario_id_set: Optional[Set[str]] = None,
-                start_shard_index: Optional[int] = None,
-                existing_shard_count: Optional[int] = None,
-        ) -> None:
-            """WOSAC 제출 파일(binproto)을 저장/누적하는 객체를 만듭니다.
+    def __init__(
+            self,
+            is_active: bool,
+            save_path: str,
+            eval_method: str,
+            global_rank: int,
+            resume: bool = False,
+            existing_scenario_id_set: Optional[Set[str]] = None,
+            start_shard_index: Optional[int] = None,
+            existing_shard_count: Optional[int] = None,
+    ) -> None:
+        """WOSAC 제출 파일(binproto)을 저장/누적하는 객체를 만듭니다.
 
-            Args:
-                is_active (bool): True면 저장 기능을 켭니다. shape: ()
-                save_path (str): 실험 루트 폴더. shape: ()
-                eval_method (str): "validation" 또는 "test". shape: ()
-                global_rank (int): 현재 프로세스 rank. shape: ()
-                resume (bool): True면 기존 결과를 지우지 않고 이어서 저장합니다. shape: ()
-                existing_scenario_id_set (Optional[Set[str]]):
-                    재개 모드에서 이미 저장된 scenario_id 집합.
-                    - None이면 빈 집합으로 시작합니다.
-                    size: (N_done,) 또는 None
-                start_shard_index (Optional[int]):
-                    재개 모드에서 다음에 쓸 binproto 번호.
-                    - None이면 0부터 시작합니다.
-                    shape: ()
-                existing_shard_count (Optional[int]):
-                    재개 모드에서 이미 존재하는 shard 개수(진행 출력용).
-                    shape: ()
-            """
-            super().__init__()
-            self.is_active = bool(is_active)
-            if not self.is_active:
-                return
+        Args:
+            is_active (bool): True면 저장 기능을 켭니다. shape: ()
+            save_path (str): 실험 루트 폴더. shape: ()
+            eval_method (str): "validation" 또는 "test". shape: ()
+            global_rank (int): 현재 프로세스 rank. shape: ()
+            resume (bool): True면 기존 결과를 지우지 않고 이어서 저장합니다. shape: ()
+            existing_scenario_id_set (Optional[Set[str]]):
+                재개 모드에서 이미 저장된 scenario_id 집합.
+                - None이면 빈 집합으로 시작합니다.
+                size: (N_done,) 또는 None
+            start_shard_index (Optional[int]):
+                재개 모드에서 다음에 쓸 binproto 번호.
+                - None이면 0부터 시작합니다.
+                shape: ()
+            existing_shard_count (Optional[int]):
+                재개 모드에서 이미 존재하는 shard 개수(진행 출력용).
+                shape: ()
+        """
+        super().__init__()
+        self.is_active = bool(is_active)
+        if not self.is_active:
+            return
 
-            self.method_name = "DRAFT"
-            self.authors = ["Seulbin Hwang"]
-            self.affiliation = "NaverLabs"
-            self.description = (
-                "We generate multimodal future trajectories "
-                "with diffusion and enforce physical plausibility "
-                "by projecting them into feasible unicycle controls "
-                "with an infeasible-control penalty."
-            )
-            self.method_link = "not available yet"
-            self.account_name = "h.sb@naverlabs.com"
+        self.method_name = "DRAFT"
+        self.authors = ["Seulbin Hwang"]
+        self.affiliation = "NaverLabs"
+        self.description = (
+            "We generate multimodal future trajectories "
+            "with diffusion and enforce physical plausibility "
+            "by projecting them into feasible unicycle controls "
+            "with an infeasible-control penalty."
+        )
+        self.method_link = "not available yet"
+        self.account_name = "h.sb@naverlabs.com"
 
-            self.buffer_scenario_rollouts: List[
-                sim_agents_submission_pb2.ScenarioRollouts] = []
+        self.buffer_scenario_rollouts: List[
+            sim_agents_submission_pb2.ScenarioRollouts] = []
 
-            self._progress_interval_sec = self._read_progress_interval_sec(
-                default_sec=60.0)
-            self._progress_start_time_sec = float(time.perf_counter())
-            self._progress_last_print_time_sec = float(
-                self._progress_start_time_sec)
+        self._progress_interval_sec = self._read_progress_interval_sec(
+            default_sec=60.0)
+        self._progress_start_time_sec = float(time.perf_counter())
+        self._progress_last_print_time_sec = float(
+            self._progress_start_time_sec)
 
-            self._progress_total_received = 0
-            self._progress_total_duplicates = 0
+        self._progress_total_received = 0
+        self._progress_total_duplicates = 0
 
-            # ✅ 중복 방지 set 복구(재개 모드에서만 의미가 큼)
-            self._submission_scenario_id_set: Set[str] = set(
-                existing_scenario_id_set or set())
+        # ✅ 중복 방지 set 복구(재개 모드에서만 의미가 큼)
+        self._submission_scenario_id_set: Set[str] = set(
+            existing_scenario_id_set or set())
 
-            # ✅ 이미 저장된 shard 개수(진행 출력용)
-            self._saved_shard_count = int(existing_shard_count or 0)
+        # ✅ 이미 저장된 shard 개수(진행 출력용)
+        self._saved_shard_count = int(existing_shard_count or 0)
 
-            # ✅ 저장 경로 준비
-            save_root = os.path.join(str(save_path), str(eval_method))
+        # ✅ 저장 경로 준비
+        save_root = os.path.join(str(save_path), str(eval_method))
 
-            # ✅ 기존 결과 폴더 삭제는 "재개 모드가 아닐 때만"
-            if int(global_rank) == 0 and os.path.exists(save_root) and (
-            not bool(resume)):
-                shutil.rmtree(save_root)
+        # ✅ 기존 결과 폴더 삭제는 "재개 모드가 아닐 때만"
+        if int(global_rank) == 0 and os.path.exists(save_root) and (
+        not bool(resume)):
+            shutil.rmtree(save_root)
 
-            self.submission_dir = Path(
-                os.path.join(save_root, "wosac_submission"))
-            self.submission_dir.mkdir(parents=True, exist_ok=True)
+        self.submission_dir = Path(
+            os.path.join(save_root, "wosac_submission"))
+        self.submission_dir.mkdir(parents=True, exist_ok=True)
 
-            # ✅ 다음 파일 번호(00146부터 이어쓰기 등)
-            if bool(resume):
-                self.i_file = int(start_shard_index or 0)
-            else:
-                self.i_file = 0
+        # ✅ 다음 파일 번호(00146부터 이어쓰기 등)
+        if bool(resume):
+            self.i_file = int(start_shard_index or 0)
+        else:
+            self.i_file = 0
 
-            self.submission_scenario_id: List[str] = []
+        self.submission_scenario_id: List[str] = []
 
-            self.data_keys = [
-                "scenario_id",
-                "agent_id",
-                "agent_batch",
-                "pred_traj",
-                "pred_z",
-                "pred_head",
-            ]
-            for k in self.data_keys:
-                self.add_state(k, default=[], dist_reduce_fx="cat")
+        self.data_keys = [
+            "scenario_id",
+            "agent_id",
+            "agent_batch",
+            "pred_traj",
+            "pred_z",
+            "pred_head",
+        ]
+        for k in self.data_keys:
+            self.add_state(k, default=[], dist_reduce_fx="cat")
 
     def update(
         self,
