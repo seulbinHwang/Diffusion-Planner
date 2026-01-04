@@ -234,6 +234,34 @@ class WOSACSubmission(Metric):
         for k in self.data_keys:
             self.add_state(k, default=[], dist_reduce_fx="cat")
 
+    def flush_shards(self) -> None:
+        """버퍼에 남아있는 제출 데이터를 binproto shard 파일로만 저장합니다.
+
+        왜 필요한가?
+        -----------
+        - 여러 GPU(여러 프로세스)로 검증을 돌릴 때는,
+          중간중간 서로 결과를 맞추는 과정(서로 기다리는 지점)이 섞여 있을 수 있습니다.
+        - 이때 tar.gz 만들기처럼 오래 걸리는 파일 묶기 작업을 끼워 넣으면,
+          다른 프로세스가 기다리다가 시간이 너무 길어져 끊길 수 있습니다.
+        - 그래서 이 함수는 “남은 버퍼를 파일 1개로 저장”까지만 빠르게 끝내고,
+          tar.gz 생성은 더 뒤(모든 정리/동기화 이후)로 미루기 위한 용도입니다.
+
+        Returns:
+            None
+        """
+        if not bool(getattr(self, "is_active", False)):
+            return
+
+        # 혹시라도 실수로 다른 rank에서 호출되면 파일이 중복 생성될 수 있으니,
+        # rank 0만 실제 저장을 수행하도록 안전장치를 둡니다.
+        if not self._is_rank_zero():
+            return
+
+        # _save_shard는 내부에서:
+        # - buffer_scenario_rollouts가 비어있으면 아무 것도 하지 않고
+        # - 있으면 submission.binproto-xxxxx 파일 1개를 만들고 버퍼를 비웁니다.
+        self._save_shard()
+
     def update(
         self,
         scenario_id: List[str],  # length: B (시나리오 수)

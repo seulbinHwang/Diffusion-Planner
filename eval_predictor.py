@@ -1095,6 +1095,12 @@ def model_validation(
 
         _update_validation_heartbeat_stage(args, "finalizing")
         _finalize_eval_cleanup(args, global_rank, wandb_logger)
+        # ✅ tar.gz 생성은 “모든 정리/동기화(barrier)가 끝난 뒤”에 rank0만 수행
+        if int(global_rank) == 0 and bool(
+                getattr(wosac_submission, "is_active", False)):
+            _update_validation_heartbeat_stage(args,
+                                               "creating WOSAC submission tar.gz")
+            wosac_submission.save_sub_file()
 
     finally:
         _stop_validation_heartbeat_if_needed(args)
@@ -1607,9 +1613,11 @@ def validation_epoch(
                 )
     ddp_rank: int = int(ddp.get_rank()) if bool(getattr(args, "ddp",
                                                         False)) else 0
+    ddp_rank: int = int(ddp.get_rank()) if bool(
+        getattr(args, "ddp", False)) else 0
     if ddp_rank == 0:
         if wosac_submission.is_active:
-            wosac_submission.save_sub_file()
+            wosac_submission.flush_shards()
     if wosac_metrics.is_active:
         epoch_wosac_metrics: Dict[str, torch.Tensor] = wosac_metrics.compute()
         if min_ade.is_active:
