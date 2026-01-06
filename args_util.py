@@ -188,6 +188,14 @@ def get_args():
                         default=True,
                         type=boolean,
                         help='True이면 neighbor/lanes/route_lanes 축 클리핑을 수행하지 않음')
+    parser.add_argument('--save_inference_data',
+                        default=False,
+                        type=boolean,
+                        help='save_inference_data')
+    parser.add_argument('--rollout_step_count_for_save',
+                        type=int,
+                        help='state dim for static objects',
+                        default=1)
     parser.add_argument('--static_objects_state_dim',
                         type=int,
                         help='state dim for static objects',
@@ -539,6 +547,10 @@ def get_args():
                         type=str,
                         help='path to map data')
     parser.add_argument('--save_path',
+                        default='./cache',
+                        type=str,
+                        help='path to save processed data')
+    parser.add_argument('--save_cache_path',
                         default='./cache',
                         type=str,
                         help='path to save processed data')

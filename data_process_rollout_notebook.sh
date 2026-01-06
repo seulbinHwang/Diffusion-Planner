@@ -7,9 +7,9 @@ echo "[INFO] run_count=${RUN_COUNT}"
 ###################################
 # User Configuration Section
 ###################################
-USER_PATH="/media/user"
-#WOMD_PATH="${USER_PATH}/womd_v1_3"
-WOMD_PATH="${USER_PATH}/D/dataset"
+USER_PATH="/home/user"
+WOMD_PATH="${USER_PATH}/womd_v1_3"
+RUN_PYTHON_PATH="${USER_PATH}/miniforge3/envs/diffusion_planner/bin/python"
 # `~/womd_v1_3/processed_womd_final/validation`
 
 # ✅ conda run으로 들어온 환경의 python을 자동으로 사용
@@ -32,8 +32,8 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation"
+EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -161,24 +161,26 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  eval_predictor.py \
  --port 23001 \
-  --eval_set "$TRAIN_SET_PATH" \
-  --eval_set_list "$TRAIN_SET_LIST_PATH" \
+  --eval_set "$EVAL_SET_PATH" \
+  --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --eval_method "validation" \
-  --batch_size 256 \
+  --batch_size 2 \
   --use_deepspeed True \
   --wosac_sub_is_active True \
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
-  --finish_when_no_updated_pt False \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout" \
+  --save_inference_data True \
+  --rollout_step_count_for_save 1 \
   --validate_scenario_rollouts False \
+  --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 5 \
-  --use_data_percent 2
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

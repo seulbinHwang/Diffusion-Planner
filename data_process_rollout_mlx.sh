@@ -7,9 +7,9 @@ echo "[INFO] run_count=${RUN_COUNT}"
 ###################################
 # User Configuration Section
 ###################################
-USER_PATH="/media/user"
+USER_PATH="/mnt/nuplan"
 #WOMD_PATH="${USER_PATH}/womd_v1_3"
-WOMD_PATH="${USER_PATH}/D/dataset"
+WOMD_PATH="${USER_PATH}/dataset"
 # `~/womd_v1_3/processed_womd_final/validation`
 
 # ✅ conda run으로 들어온 환경의 python을 자동으로 사용
@@ -32,8 +32,8 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed_validation"
+EVAL_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -85,13 +85,13 @@ PY
 
 ensure_eval_set_list_json "$EVAL_SET_PATH" "$EVAL_SET_LIST_PATH" "$RUN_PYTHON_PATH"
 
-
 # ----------------------------
 # 진행 상황 출력 주기(초) (공통)
 # - 0 또는 음수면 heartbeat / WOSACMetrics / WOSACSubmission 진행 출력 모두 끔
 # ----------------------------
 export DP_PROGRESS_SEC="${DP_PROGRESS_SEC:-60}"
 printf "[ENV] %-28s %s\n" "DP_PROGRESS_SEC:" "${DP_PROGRESS_SEC-<unset>}"
+
 
 
 ###################################
@@ -135,8 +135,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # - env에 이미 값이 있으면 그 값을 그대로 사용
 # - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
 # ----------------------------
-export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-3}"
-export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.6}"
+export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-8}"
+export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
 
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "DP_WOSAC_CPU_FRACTION:" "${DP_WOSAC_CPU_FRACTION-<unset>}"
@@ -158,27 +158,28 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  eval_predictor.py \
  --port 23001 \
-  --eval_set "$TRAIN_SET_PATH" \
-  --eval_set_list "$TRAIN_SET_LIST_PATH" \
+  --eval_set "$EVAL_SET_PATH" \
+  --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --eval_method "validation" \
-  --batch_size 256 \
+  --batch_size 1024 \
   --use_deepspeed True \
-  --wosac_sub_is_active True \
+  --wosac_sub_is_active False \
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
-  --finish_when_no_updated_pt False \
-  --validate_scenario_rollouts False \
+--save_path "/mnt/nuplan/dataset/processed_rollout" \
+  --save_inference_data True \
+  --rollout_step_count_for_save 1 \
+  --finish_when_no_updated_pt True \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
-  --rollout_time_chunk_size 5 \
-  --use_data_percent 2
+  --rollout_time_chunk_size 5
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

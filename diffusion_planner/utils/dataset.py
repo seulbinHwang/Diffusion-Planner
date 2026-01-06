@@ -440,8 +440,8 @@ class DiffusionPlannerData(Dataset):
         both_keys: List[str] = [
             "origin_world_pose",  # (4,)  # nuplan  # womd
             "ego_agent_past",  # (time_len, 11) # nuplan # womd
-            "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd
-            "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd
+            "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd # TODO
+            "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd # TODO
             "neighbor_agents_past",  # (chosen_agent_num, time_len, 11) # nuplan  # womd
             "neighbor_future_gt_3_dim",  # (chosen_agent_num, future_len, 3) # nuplan # womd
             "stop_sign_points",  # (stop_sign_num, safety_len, 2) # nuplan  # womd
@@ -503,15 +503,14 @@ class DiffusionPlannerData(Dataset):
             sample,
             predicted_neighbor_num=self.predicted_neighbor_num,
         )
-        if self.eval_method in ("validation", "test"):
-            scenario_id = str(os.path.splitext(file_name)[0])
-            sample["scenario_id"] = scenario_id
-            if self.eval_method == "validation":
-                tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
-                tfrecord_path = os.path.join(self.data_tfrecords_dir,
-                                             tfrecord_file_name)
-                if not os.path.exists(tfrecord_path):
-                    raise FileNotFoundError(
-                        f"TFRecords file not found: {tfrecord_path}")
-                sample["tfrecord_path"] = tfrecord_path
+        scenario_id = str(os.path.splitext(file_name)[0])
+        sample["scenario_id"] = scenario_id
+        if self.eval_method == "validation":
+            tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
+            tfrecord_path = os.path.join(self.data_tfrecords_dir,
+                                         tfrecord_file_name)
+            if not os.path.exists(tfrecord_path):
+                raise FileNotFoundError(
+                    f"TFRecords file not found: {tfrecord_path}")
+            sample["tfrecord_path"] = tfrecord_path
         return sample
