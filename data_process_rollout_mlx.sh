@@ -174,7 +174,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
---save_path "/mnt/nuplan/dataset/processed_rollout" \
+--save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
   --rollout_step_count_for_save 1 \
   --finish_when_no_updated_pt True \

@@ -176,7 +176,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
-  --rollout_step_count_for_save 1 \
+  --rollout_step_count_for_save 3 \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
