@@ -177,7 +177,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_image False \
   --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout" \
-  --save_inference_data True \
+  --save_inference_data False \
   --rollout_step_count_for_save 1 \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \

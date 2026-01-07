@@ -9,7 +9,6 @@ echo "[INFO] run_count=${RUN_COUNT}"
 ###################################
 USER_PATH="/mnt/nuplan"
 #WOMD_PATH="${USER_PATH}/womd_v1_3"
-WOMD_PATH="${USER_PATH}/dataset"
 # `~/womd_v1_3/processed_womd_final/validation`
 
 # ✅ conda run으로 들어온 환경의 python을 자동으로 사용
@@ -32,10 +31,10 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-EVAL_SET_PATH="${WOMD_PATH}/processed_validation"
-EVAL_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_validation.json"
+TRAIN_SET_PATH="${USER_PATH}/dataset/processed"
+TRAIN_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_training.json"
 ###################################
-# If validation list json is missing, create it from *.npz in EVAL_SET_PATH
+# If validation list json is missing, create it from *.npz in TRAIN_SET_PATH
 ###################################
 ensure_eval_set_list_json() {
   local validation_dir="$1"
@@ -48,7 +47,7 @@ ensure_eval_set_list_json() {
   fi
 
   if [[ ! -d "$validation_dir" ]]; then
-    echo "[ERROR] EVAL_SET_PATH does not exist or is not a directory: $validation_dir" >&2
+    echo "[ERROR] TRAIN_SET_PATH does not exist or is not a directory: $validation_dir" >&2
     return 1
   fi
 
@@ -83,7 +82,8 @@ PY
   unset _DP_VALIDATION_JSON
 }
 
-ensure_eval_set_list_json "$EVAL_SET_PATH" "$EVAL_SET_LIST_PATH" "$RUN_PYTHON_PATH"
+ensure_eval_set_list_json "$TRAIN_SET_PATH" "$TRAIN_SET_LIST_PATH" "$RUN_PYTHON_PATH"
+
 
 # ----------------------------
 # 진행 상황 출력 주기(초) (공통)
@@ -91,7 +91,6 @@ ensure_eval_set_list_json "$EVAL_SET_PATH" "$EVAL_SET_LIST_PATH" "$RUN_PYTHON_PA
 # ----------------------------
 export DP_PROGRESS_SEC="${DP_PROGRESS_SEC:-60}"
 printf "[ENV] %-28s %s\n" "DP_PROGRESS_SEC:" "${DP_PROGRESS_SEC-<unset>}"
-
 
 
 ###################################
@@ -161,13 +160,13 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  eval_predictor.py \
  --port 23001 \
-  --eval_set "$EVAL_SET_PATH" \
-  --eval_set_list "$EVAL_SET_LIST_PATH" \
+  --eval_set "$TRAIN_SET_PATH" \
+  --eval_set_list "$TRAIN_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
-  --eval_method "validation" \
+  --eval_method "train" \
   --batch_size 1024 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
@@ -175,7 +174,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_image False \
   --save_video False \
 --save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
-  --save_inference_data True \
+  --save_inference_data False \
   --rollout_step_count_for_save 1 \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
