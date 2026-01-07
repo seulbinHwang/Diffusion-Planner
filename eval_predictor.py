@@ -2822,9 +2822,9 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
             a_inputs_copy_dict
         )
         npz_payload_dict = _remove_invalid_data(npz_payload_dict)
-        print(f"=================================={final_file_name}")
-        for k, v in npz_payload_dict.items():
-            print("  Saving key:", k, "shape/type:", (v.shape if isinstance(v, np.ndarray) else type(v)))
+        # print(f"=================================={final_file_name}")
+        # for k, v in npz_payload_dict.items():
+        #     print("  Saving key:", k, "shape/type:", (v.shape if isinstance(v, np.ndarray) else type(v)))
         try:
             with open(tmp_path, "wb") as f:
                 np.savez_compressed(f, **npz_payload_dict)
