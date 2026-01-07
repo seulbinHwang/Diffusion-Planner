@@ -432,6 +432,9 @@ class DiffusionPlannerData(Dataset):
             - chosen_lane_num <= lane_num
             - chosen_route_lane_num <= route_num
             - chosen_static_num <= max_static_num
+
+        womd 추가 : scenario_id /
+
         """
         file_name = self.data_list[idx]
         data = opendata(os.path.join(self.data_dir, file_name))

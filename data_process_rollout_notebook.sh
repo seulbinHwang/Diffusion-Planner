@@ -169,7 +169,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --eval_method "train" \
-  --batch_size 1 \
+  --batch_size 2 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \
@@ -177,7 +177,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
-  --rollout_step_count_for_save 3 \
+  --rollout_step_count_for_save 1 \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
