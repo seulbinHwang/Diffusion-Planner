@@ -170,6 +170,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --name "nuplan_womd" \
   --eval_method "train" \
   --batch_size 2 \
+  --use_wandb False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \

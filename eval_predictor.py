@@ -2792,9 +2792,10 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
             near_future_gt_4_np
         )
         a_inputs_copy_dict["neighbor_future_gt_3_dim"] = neighbor_future_gt_3_dim
-        # draw_near_target_id = np.arange(len(neighbor_future_gt_3_dim))  # ((1+)Pnn)
+        draw_near_target_id = np.arange(len(neighbor_future_gt_3_dim))  # ((1+)Pnn)
         # draw_near_target_id np to tensor
         # draw_near_target_id_tensor = torch.from_numpy(draw_near_target_id).to(torch.int64)
+        #
         # scenario_id = str(a_inputs_copy_dict["scenario_id"])
         # save_dir = os.path.join(dir, f"debug_vis_{scenario_id}")
         # os.makedirs(save_dir, exist_ok=True)
@@ -2807,7 +2808,7 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
         #     step_idx=int(step_count),
         #     draw_near_target_id=draw_near_target_id_tensor,
         # )
-
+        # debug_vis_us-nv-las-vegas-strip_3ee876a7a6c654f0
         # ✅ step_count를 파일명에 포함해 덮어쓰기 방지
         final_file_name = _build_inference_npz_file_name(
             scenario_id=str(a_inputs_copy_dict["scenario_id"]),
@@ -2821,6 +2822,9 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
             a_inputs_copy_dict
         )
         npz_payload_dict = _remove_invalid_data(npz_payload_dict)
+        print(f"=================================={final_file_name}")
+        for k, v in npz_payload_dict.items():
+            print("  Saving key:", k, "shape/type:", (v.shape if isinstance(v, np.ndarray) else type(v)))
         try:
             with open(tmp_path, "wb") as f:
                 np.savez_compressed(f, **npz_payload_dict)
