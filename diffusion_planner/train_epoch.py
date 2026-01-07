@@ -269,6 +269,13 @@ def _prepare_batch_for_device(
                     ],
                     dim=-1,
                 )  # (B, future_len, 4)
+                # ego_future_mask: (B, future_len)
+                ego_future_mask: torch.Tensor = torch.sum(
+                    torch.ne(ego_future_gt_3_dim[..., :3], 0),
+                    dim=-1,
+                ) == 0
+                ego_future_gt_4_dim[ego_future_mask] = 0.0
+
                 ego_future_len = ego_future_gt_3_dim.shape[1]
                 assert ego_future_len == args.future_len, \
                     f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
@@ -283,7 +290,6 @@ def _prepare_batch_for_device(
                 outputs["near_future_mask"] = near_future_mask
 
     inputs: Dict[str, Any] = batch_on_device
-
     return inputs, outputs
 
 

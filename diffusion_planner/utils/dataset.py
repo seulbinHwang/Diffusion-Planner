@@ -440,8 +440,8 @@ class DiffusionPlannerData(Dataset):
         both_keys: List[str] = [
             "origin_world_pose",  # (4,)  # nuplan  # womd
             "ego_agent_past",  # (time_len, 11) # nuplan # womd
-            "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd # TODO
-            "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd # TODO
+            "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd
+            "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd
             "neighbor_agents_past",  # (chosen_agent_num, time_len, 11) # nuplan  # womd
             "neighbor_future_gt_3_dim",  # (chosen_agent_num, future_len, 3) # nuplan # womd
             "stop_sign_points",  # (stop_sign_num, safety_len, 2) # nuplan  # womd
@@ -452,7 +452,7 @@ class DiffusionPlannerData(Dataset):
         ]
 
         nuplan_only_keys: List[str] = [
-            "static_objects",  # (chosen_static_num, 10) # nuplan
+            "static_objects", #check # (chosen_static_num, 10) # nuplan
             "route_lanes",  # (chosen_route_lane_num, route_len, 12) # nuplan
             "route_lanes_speed_limit",  # (chosen_route_lane_num, 1) # nuplan
             "route_lanes_has_speed_limit",  # (chosen_route_lane_num, 1) # nuplan
@@ -513,4 +513,17 @@ class DiffusionPlannerData(Dataset):
                 raise FileNotFoundError(
                     f"TFRecords file not found: {tfrecord_path}")
             sample["tfrecord_path"] = tfrecord_path
+
+
         return sample
+
+""" outputs
+
+"ego_future_gt_3_dim" : (B, future_len, 3)
+"ego_future_gt_4_dim" : (B, future_len, 4)
+
+"near_future_gt_3_dim" : (B, Pnn, future_len, 3)
+"near_future_gt_4_dim" : (B, Pnn, future_len, 4)
+"near_future_mask" : (B, Pnn, future_len) 
+
+"""

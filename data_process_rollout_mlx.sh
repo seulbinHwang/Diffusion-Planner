@@ -135,7 +135,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # - env에 이미 값이 있으면 그 값을 그대로 사용
 # - 없으면 기본값을 넣어서 CPU 스레드/프로세스 경쟁을 줄임
 # ----------------------------
-export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-8}"
+export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-3}"
 export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
 
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
@@ -177,7 +177,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 --save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
   --rollout_step_count_for_save 1 \
-  --finish_when_no_updated_pt True \
+  --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 5

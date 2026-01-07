@@ -57,6 +57,163 @@ import torch
 
 _VALIDATION_HEARTBEAT: Optional["_ValidationHeartbeat"] = None
 
+from typing import Any, Dict, Set
+import numpy as np
+import torch
+
+
+_INFERENCE_NPZ_EXCLUDED_EXACT_KEYS: Set[str] = {
+    "diff_token_to_future_gt_3_dim",
+    "non_near_agents_past",
+    "near_agents_past",
+    "ego_future_gt_11_dim",
+    "near_future_gt_4_dim",
+    "ego_future_gt_4_dim"
+}
+
+
+def _should_exclude_key_for_inference_npz_save(key: str) -> bool:
+    """추론 npz 저장에서 제외할 key인지 판단합니다.
+
+    제외 규칙
+    --------
+    1) key 이름이 "is_valid"로 끝나면 저장하지 않습니다.
+       - 예: road_edge_is_valid, stop_sign_is_valid 등
+    2) 특정 key는 이름이 정확히 일치하면 저장하지 않습니다.
+       - diff_token_to_future_gt_3_dim
+       - non_near_agents_past
+       - near_agents_past
+
+    Args:
+        key (str): dict의 key 문자열. shape: ()
+
+    Returns:
+        bool:
+            - True: 저장에서 제외
+            - False: 저장에 포함
+            shape: ()
+    """
+    k = str(key)
+    if k.endswith("is_valid"):
+        return True
+    return k in _INFERENCE_NPZ_EXCLUDED_EXACT_KEYS
+
+
+def _as_numpy_array_strict(value: Any, key_name: str) -> np.ndarray:
+    """값을 numpy 배열로 바꿉니다(비교/검증용).
+
+    Args:
+        value (Any): numpy 배열 / torch 텐서 / 리스트 등. shape: (임의)
+        key_name (str): 에러 메시지에 사용할 이름. shape: ()
+
+    Returns:
+        np.ndarray: numpy 배열. shape: value와 동일(가능한 경우)
+    """
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def _assert_planner_future_equals_ego_future_gt_11_dim(
+    sample_dict: Dict[str, Any],
+) -> None:
+    """planner_future_11_dim 과 ego_future_gt_11_dim 값이 완전히 같은지 확인합니다.
+
+    이 함수는 "둘 중 planner_future_11_dim 이 존재할 때만" 검증합니다.
+    - planner_future_11_dim 이 있으면, ego_future_gt_11_dim 도 반드시 있어야 합니다.
+    - 두 배열의 shape과 모든 값이 같아야 통과합니다.
+
+    기대 shape
+    ---------
+    - planner_future_11_dim: (future_len, 11)
+    - ego_future_gt_11_dim: (future_len, 11)
+
+    Args:
+        sample_dict (Dict[str, Any]): 샘플 1개 저장 dict. shape: ()
+
+    Returns:
+        None
+
+    Raises:
+        AssertionError: 값이 다르거나, 한쪽이 없으면 발생합니다.
+    """
+    if "planner_future_11_dim" not in sample_dict:
+        return
+
+    if "ego_future_gt_11_dim" not in sample_dict:
+        raise AssertionError(
+            "planner_future_11_dim 이 있는데 ego_future_gt_11_dim 이 없습니다."
+        )
+
+    planner_arr = _as_numpy_array_strict(sample_dict["planner_future_11_dim"],
+                                         "planner_future_11_dim")
+    ego_arr = _as_numpy_array_strict(sample_dict["ego_future_gt_11_dim"],
+                                     "ego_future_gt_11_dim")
+
+    if tuple(planner_arr.shape) != tuple(ego_arr.shape):
+        raise AssertionError(
+            "planner_future_11_dim 과 ego_future_gt_11_dim 의 shape이 다릅니다. "
+            f"planner_shape={tuple(planner_arr.shape)}, ego_shape={tuple(ego_arr.shape)}"
+        )
+
+    # 값이 “완전히” 동일한지(허용 오차 없이) 확인
+    # dtype이 달라도 값이 같으면 통과하도록, 둘 다 float64로 올려서 비교합니다.
+    np.set_printoptions(precision=2, suppress=True)
+    if not np.array_equal(planner_arr.astype(np.float64), ego_arr.astype(np.float64)):
+        for time_idx in range(planner_arr.shape[0]):
+            a_planner_arr = np.round(planner_arr[time_idx], 2)
+            a_ego_arr = np.round(ego_arr[time_idx], 2)
+            gap = a_planner_arr - a_ego_arr
+            print("==================================================")
+            print(f"[DEBUG] time_idx={time_idx}, a_planner_arr = {a_planner_arr}")
+            print(f"[DEBUG] time_idx={time_idx}, a_ego_arr = {a_ego_arr}")
+            print(f"[DEBUG] time_idx={time_idx}, gap = {gap}")
+        raise AssertionError(
+            "planner_future_11_dim 과 ego_future_gt_11_dim 의 값이 완전히 같지 않습니다."
+        )
+
+
+def _build_inference_npz_payload_for_save(
+    sample_dict: Dict[str, Any],
+) -> Dict[str, Any]:
+    """npz로 저장할 dict를 '규칙에 맞게' 골라서 만듭니다.
+
+    규칙
+    ----
+    1) key가 "is_valid"로 끝나면 저장하지 않습니다.
+    2) 특정 key는 저장하지 않습니다.
+       - diff_token_to_future_gt_3_dim
+       - non_near_agents_past
+       - near_agents_past
+    3) planner_future_11_dim 과 ego_future_gt_11_dim 이 완전히 같아야 하며,
+       저장은 ego_future_gt_11_dim 만 남기고 planner_future_11_dim 은 제외합니다.
+
+    Args:
+        sample_dict (Dict[str, Any]): 샘플 1개 dict. shape: ()
+
+    Returns:
+        Dict[str, Any]:
+            np.savez_compressed에 넣을 dict. shape: ()
+    """
+    # _assert_planner_future_equals_ego_future_gt_11_dim(sample_dict)
+
+    out: Dict[str, Any] = {}
+    for k, v in sample_dict.items():
+        key = str(k)
+
+        if _should_exclude_key_for_inference_npz_save(key):
+            continue
+
+        if key == "planner_future_11_dim":
+            # (3) planner는 저장하지 않음(ego와 동일하다는 assert는 위에서 수행)
+            key= "ego_future_gt_11_dim"
+
+        out[key] = v
+
+    return out
+
 
 def _read_float_env_safe(env_key: str, default: float) -> float:
     """환경변수에서 실수 값을 안전하게 읽습니다.
@@ -2447,7 +2604,9 @@ def _slice_one_sample_from_cpu_batch_cache(
     return out
 
 
-def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_count: int) -> None:
+def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_count: int,
+        unnorm_trajectory_np: np.ndarray, # ((1+)Pnn, 1+T, 4)
+                         ) -> None:
     """rollout 중간 상태(unnorm_inputs_copy)를 npz로 저장합니다.
 
     저장 동작
@@ -2476,23 +2635,8 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
     Returns:
         None
     """
-    # 필수 키 확인(기존 코드와 같은 전제 유지)
-    if "ego_future_gt_4_dim" not in unnorm_inputs_copy:
-        raise KeyError("unnorm_inputs_copy에 'ego_future_gt_4_dim'가 필요합니다.")
-    if "near_future_gt_4_dim" not in unnorm_inputs_copy:
-        raise KeyError("unnorm_inputs_copy에 'near_future_gt_4_dim'가 필요합니다.")
-    if "scenario_id" not in unnorm_inputs_copy:
-        raise KeyError("unnorm_inputs_copy에 'scenario_id'(list)가 필요합니다.")
 
     ego_future_gt_4_dim = unnorm_inputs_copy["ego_future_gt_4_dim"]
-    if not isinstance(ego_future_gt_4_dim, torch.Tensor):
-        raise TypeError("'ego_future_gt_4_dim'는 torch.Tensor여야 합니다.")
-    if ego_future_gt_4_dim.dim() < 2 or int(ego_future_gt_4_dim.shape[-1]) != 4:
-        raise ValueError(
-            "ego_future_gt_4_dim은 (B*R, future_len, 4) 형태여야 합니다. "
-            f"현재 shape={tuple(ego_future_gt_4_dim.shape)}"
-        )
-
     os.makedirs(dir, exist_ok=True)
 
     # batch_size: (B*R)
@@ -2518,20 +2662,34 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
 
         # ✅ (2) 3차원 GT는 CPU에서 "저장 직전"에만 계산
         ego_future_gt_4_np = a_inputs_copy_dict.get("ego_future_gt_4_dim", None)
-        if not isinstance(ego_future_gt_4_np, np.ndarray):
-            raise TypeError("ego_future_gt_4_dim이 numpy로 변환되지 않았습니다.")
         # ego_future_gt_3_dim: (future_len, 3)
         a_inputs_copy_dict["ego_future_gt_3_dim"] = _pose_4_dim_numpy_to_pose_3_dim_numpy(
             ego_future_gt_4_np
         )
 
         near_future_gt_4_np = a_inputs_copy_dict.get("near_future_gt_4_dim", None)
-        if not isinstance(near_future_gt_4_np, np.ndarray):
-            raise TypeError("near_future_gt_4_dim이 numpy로 변환되지 않았습니다.")
         # neighbor_future_gt_3_dim: (Pnn, future_len, 3)
-        a_inputs_copy_dict["neighbor_future_gt_3_dim"] = _pose_4_dim_numpy_to_pose_3_dim_numpy(
+        neighbor_future_gt_3_dim = _pose_4_dim_numpy_to_pose_3_dim_numpy(
             near_future_gt_4_np
         )
+        a_inputs_copy_dict["neighbor_future_gt_3_dim"] = neighbor_future_gt_3_dim
+        draw_near_target_id = np.arange(len(neighbor_future_gt_3_dim))  # ((1+)Pnn)
+        # draw_near_target_id np to tensor
+        draw_near_target_id_tensor = torch.from_numpy(draw_near_target_id).to(torch.int64)
+
+        scenario_id = str(a_inputs_copy_dict["scenario_id"])
+        save_dir = os.path.join(dir, f"debug_vis_{scenario_id}")
+        os.makedirs(save_dir, exist_ok=True)
+        _draw_one_batch_one_rollout(
+            save_dir=save_dir,
+            unnorm_inputs_np=a_inputs_copy_dict,
+            unnorm_trajectory_np=unnorm_trajectory_np,  # ((1+)Pnn, 1+T, 4)
+            ego_future_gt_4_dim=ego_future_gt_4_np,  # (future_len, 4)
+            near_future_gt_3_dim=neighbor_future_gt_3_dim,  # (Pnn, future_len, 3)
+            step_idx=int(step_count),
+            draw_near_target_id=draw_near_target_id_tensor,
+        )
+
         # ✅ step_count를 파일명에 포함해 덮어쓰기 방지
         final_file_name = _build_inference_npz_file_name(
             scenario_id=str(a_inputs_copy_dict["scenario_id"]),
@@ -2540,9 +2698,17 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
         final_path = os.path.join(dir, final_file_name)
         tmp_path = final_path + ".tmp"
 
+        # ✅ 저장용 dict만 따로 만들기 (요구사항 필터 + planner/ego assert 포함)
+        npz_payload_dict: Dict[str, Any] = _build_inference_npz_payload_for_save(
+            a_inputs_copy_dict
+        )
+        print("==================================")
+        for k, v in npz_payload_dict.items():
+            print("  Saving key:", k, "shape/type:", (v.shape if isinstance(v, np.ndarray) else type(v)))
+        # raise Exception("Stop for debug")
         try:
             with open(tmp_path, "wb") as f:
-                np.savez_compressed(f, **a_inputs_copy_dict)
+                np.savez_compressed(f, **npz_payload_dict)
                 f.flush()
                 if enable_fsync:
                     os.fsync(f.fileno())
@@ -2555,16 +2721,13 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
             raise
 
 
-
-
-
 def _prepare_data_for_one_batch_draw(
         norm_inputs_copy: Dict[str, Any],
         normed_trajectories: torch.Tensor,
         state_normalizer: Any,
         observation_normalizer: ObservationNormalizer,
         draw_batch_idx: int,
-) -> Tuple[Dict[str, Any],  np.ndarray, np.ndarray]:
+) -> Tuple[Dict[str, Any],  np.ndarray, np.ndarray, np.ndarray]:
     # 역정규화: ((1+)Pnn, 1+T, 4)
     unnorm_trajectory = state_normalizer.inverse(
         normed_trajectories[draw_batch_idx])
@@ -2790,23 +2953,24 @@ def _predict_rollouts_batched_one_chunk(
                     save_image = False
                     save_video = False
 
+            norm_inputs_for_draw = norm_inputs_copy
+            if "inference_noise" in norm_inputs_for_draw:
+                norm_inputs_for_draw = dict(norm_inputs_copy)  # 얕은 복사
+                norm_inputs_for_draw.pop("inference_noise", None)
             # ✅ draw는 chunk마다 1번만 (step_start 기준으로 파일명 저장)
+            (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim,
+             ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
+                norm_inputs_copy=norm_inputs_for_draw,
+                normed_trajectories=normed_trajectories,
+                state_normalizer=state_normalizer,
+                observation_normalizer=observation_normalizer,
+                draw_batch_idx=draw_batch_idx,
+            )
             if save_image:
                 if draw_near_target_id is None:
                     raise RuntimeError(
                         "save_image=True 인데 draw_near_target_id가 준비되지 않았습니다.")
 
-                norm_inputs_for_draw = norm_inputs_copy
-                if "inference_noise" in norm_inputs_for_draw:
-                    norm_inputs_for_draw = dict(norm_inputs_copy)  # 얕은 복사
-                    norm_inputs_for_draw.pop("inference_noise", None)
-                (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim, ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
-                    norm_inputs_copy=norm_inputs_for_draw,
-                    normed_trajectories=normed_trajectories,
-                    state_normalizer=state_normalizer,
-                    observation_normalizer=observation_normalizer,
-                    draw_batch_idx=draw_batch_idx,
-                )
                 _draw_one_batch_one_rollout(
                     save_dir=save_dir,
                     unnorm_inputs_np=unnorm_inputs_np,
@@ -2869,8 +3033,8 @@ def _predict_rollouts_batched_one_chunk(
                                                               1:, :, :]  # (B*R, Pnn, gap, 4)
             unnorm_inputs_copy = _update_merged_inputs_unnorm_inplace_for_time_chunk(
                 unnorm_inputs_copy=unnorm_inputs_copy,
-                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
-                unnorm_near_pose_chunk=unnorm_near_pose_chunk,
+                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,  # (B*R, gap, 4)
+                unnorm_near_pose_chunk=unnorm_near_pose_chunk, # (B*R, Pnn, gap, 4)
                 cached_valid_masks=cached_valid_masks,
 
             )
@@ -2880,7 +3044,10 @@ def _predict_rollouts_batched_one_chunk(
 
             if args.save_inference_data:
                 _save_inference_data(args.save_cache_path, unnorm_inputs_copy,
-                                     step_count=int(step_count))
+                                     step_count=int(step_count),
+                                     unnorm_trajectory_np=unnorm_trajectory_np, # ((1+)Pnn, 1+T, 4)
+                                     # (Pnn, future_len, 3)
+                                     )
                 if step_count >= args.rollout_step_count_for_save:
                     break
 
@@ -4177,6 +4344,8 @@ def validate_func(
 
     norm_inputs = _sanitize_norm_inputs_for_validation(norm_inputs)
     future_len: int = int(getattr(args, "future_len"))
+    # target_future_valid :  (B, (1+)Pnn, future_len)
+    # target_future_valid 는, 현재에 유효하면, 미래 점도 전부 유효하다고 간주합니다.
     target_future_valid = build_target_future_tensors_and_masks_for_inference(
         args,
         norm_inputs,
@@ -5219,7 +5388,7 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
 
 
 def _transform_origin(
-    norm_inputs_copy: Dict[str, torch.Tensor],
+    unnorm_inputs_copy: Dict[str, torch.Tensor],
     normed_ego_next_pose: torch.Tensor,  # (B*R, 4)
         gap : int,
     cached_valid_masks: Optional[Dict[str, torch.Tensor]] = None,
@@ -5243,7 +5412,7 @@ def _transform_origin(
     cached_valid_masks가 있으면, 그 마스크를 재사용합니다.
 
     Args:
-        norm_inputs_copy (Dict[str, torch.Tensor]):
+        unnorm_inputs_copy (Dict[str, torch.Tensor]):
             입력 dict.
         normed_ego_next_pose (torch.Tensor):
             (B, 4) ego 다음 프레임 (x, y, cos, sin)
@@ -5259,8 +5428,8 @@ def _transform_origin(
      yaw_delta) = _extract_delta_pose_params(normed_ego_next_pose)
 
     # 1) ego_agent_past: (B, time_len, 11)
-    if "ego_agent_past" in norm_inputs_copy:
-        ego_agent_past = norm_inputs_copy["ego_agent_past"]
+    if "ego_agent_past" in unnorm_inputs_copy:
+        ego_agent_past = unnorm_inputs_copy["ego_agent_past"]
         if isinstance(ego_agent_past,
                       torch.Tensor) and ego_agent_past.numel() > 0:
             valid_mask = torch.any(ego_agent_past[..., :8] != 0.0,
@@ -5277,9 +5446,9 @@ def _transform_origin(
     for key in [
             "near_agents_past", "non_near_agents_past", "neighbor_agents_past"
     ]:
-        if key not in norm_inputs_copy:
+        if key not in unnorm_inputs_copy:
             continue
-        agents_past = norm_inputs_copy[key]
+        agents_past = unnorm_inputs_copy[key]
         if not isinstance(agents_past,
                           torch.Tensor) or agents_past.numel() == 0:
             continue
@@ -5297,10 +5466,10 @@ def _transform_origin(
     # 4) future_gt_4_dim: ego + near
     future_gt_keys = ["ego_future_gt_4_dim", "near_future_gt_4_dim"]
     for future_key in future_gt_keys:
-        if future_key not in norm_inputs_copy:
+        if future_key not in unnorm_inputs_copy:
             continue
 
-        future_pose_4 = norm_inputs_copy[future_key]
+        future_pose_4 = unnorm_inputs_copy[future_key]
         if (not isinstance(future_pose_4,
                            torch.Tensor)) or future_pose_4.numel() == 0:
             continue
@@ -5320,7 +5489,7 @@ def _transform_origin(
             valid_mask=valid_mask,
         )
 
-    planner_future_11_dim = norm_inputs_copy.get("planner_future_11_dim", None)
+    planner_future_11_dim = unnorm_inputs_copy.get("planner_future_11_dim", None)
     if planner_future_11_dim is not None:
         future_len = planner_future_11_dim.shape[-2]
 
@@ -5346,10 +5515,10 @@ def _transform_origin(
         ("road_edge", "road_edge_is_valid"),
     ]
     for point_key, mask_key in point_and_mask_keys:
-        if point_key not in norm_inputs_copy or mask_key not in norm_inputs_copy:
+        if point_key not in unnorm_inputs_copy or mask_key not in unnorm_inputs_copy:
             continue
-        points_xy = norm_inputs_copy[point_key]  # (B, N, L, 2)
-        points_valid = norm_inputs_copy[mask_key]  # (B, N, L) 또는 (B, N)
+        points_xy = unnorm_inputs_copy[point_key]  # (B, N, L, 2)
+        points_valid = unnorm_inputs_copy[mask_key]  # (B, N, L) 또는 (B, N)
         if (not isinstance(points_xy, torch.Tensor)) or points_xy.numel() == 0:
             continue
         if not isinstance(points_valid, torch.Tensor):
@@ -5369,9 +5538,9 @@ def _transform_origin(
 
     # 6) lanes / route_lanes: (B, lane_num, lane_len, 12)
     for lane_key in ["lanes", "route_lanes"]:
-        if lane_key not in norm_inputs_copy:
+        if lane_key not in unnorm_inputs_copy:
             continue
-        lane_12 = norm_inputs_copy[lane_key]
+        lane_12 = unnorm_inputs_copy[lane_key]
         if (not isinstance(lane_12, torch.Tensor)) or lane_12.numel() == 0:
             continue
 
@@ -5395,8 +5564,8 @@ def _transform_origin(
         )
 
     # 7) static_objects: (B, static_num, 10)
-    if "static_objects" in norm_inputs_copy:
-        static_objects = norm_inputs_copy["static_objects"]
+    if "static_objects" in unnorm_inputs_copy:
+        static_objects = unnorm_inputs_copy["static_objects"]
         if isinstance(static_objects,
                       torch.Tensor) and static_objects.numel() > 0:
             cached_mask = _pick_cached_mask_if_shape_matches(
@@ -5418,7 +5587,7 @@ def _transform_origin(
                 valid_mask=valid_mask,
             )
 
-    return norm_inputs_copy
+    return unnorm_inputs_copy
 
 
 def _extract_delta_pose_params(

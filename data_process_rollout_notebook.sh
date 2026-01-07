@@ -32,8 +32,9 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation"
-EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
+#EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation"
+EVAL_SET_PATH="${USER_PATH}/nuplan/dataset/processed_compressed"
+EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_training.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -167,10 +168,10 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --resume_model_only True \
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
-  --eval_method "validation" \
-  --batch_size 2 \
+  --eval_method "train" \
+  --batch_size 1 \
   --use_deepspeed True \
-  --wosac_sub_is_active True \
+  --wosac_sub_is_active False \
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
@@ -180,7 +181,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
-  --total_save_image_trial_num 1 \
+  --total_save_image_trial_num 300 \
   --rollout_time_chunk_size 5 \
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
