@@ -102,8 +102,6 @@ try:
 except ImportError:
     fcntl = None  # type: ignore
 
-_VIS_BUDGET_REACHED_LOCAL: bool = False
-
 
 def _should_exclude_key_for_inference_npz_save(key: str) -> bool:
     """추론 npz 저장에서 제외할 key인지 판단합니다.
@@ -475,25 +473,6 @@ def _is_torch_process_group_initialized() -> bool:
     return bool(torch.distributed.is_initialized())
 
 
-def _get_total_save_image_trial_num(args: Any) -> int:
-    """전체 시각화 저장 횟수 제한 값을 안전하게 읽습니다.
-
-    Args:
-        args (Any):
-            args.total_save_image_trial_num(int)를 기대합니다.
-
-    Returns:
-        int:
-            - -1: 제한 없음
-            - 0 이상: 허용되는 총 저장 "횟수"
-    """
-    raw = getattr(args, "total_save_image_trial_num", -1)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return -1
-
-
 def _get_run_count(args: Any) -> int:
     """이번 실행(run_count) 값을 안전하게 읽습니다.
 
@@ -549,60 +528,6 @@ def _safe_remove_file_if_exists(file_path: str) -> bool:
         return False
 
 
-def _purge_visualization_budget_counter_file_at_program_start(
-    args: argparse.Namespace,
-    global_rank: int,
-    world_size: int,
-) -> None:
-    """프로그램 시작 시, 이번 실행(run_count)의 시각화 저장 카운터 파일을 초기화합니다.
-
-    동작 방식
-    --------
-    1) args.save_path / args.eval_method / args.run_count를 이용해
-       이번 실행(run_count)에 해당하는 카운터 파일 경로를 계산합니다.
-       - 파일 예: "{save_path}/.dp_vis_budget_validation_run1.json"
-    2) DDP(멀티 프로세스) 환경에서는 global_rank==0(대표 프로세스)만 삭제합니다.
-       - 여러 프로세스가 동시에 지우거나/만드는 타이밍이 겹치면,
-         오히려 실행 중간에 카운터가 리셋되는 위험이 있습니다.
-    3) 삭제 후, DDP 환경이면 barrier로 모든 프로세스가 "삭제 완료" 이후에만 진행하도록 맞춥니다.
-    4) 로컬 캐시 플래그(_VIS_BUDGET_REACHED_LOCAL)도 False로 되돌려,
-       이번 실행에서 다시 정상적으로 저장 시도를 할 수 있게 합니다.
-
-    Args:
-        args (argparse.Namespace):
-            아래 값들을 사용합니다. (모두 shape: ())
-            - args.save_path (str): 카운터 파일이 있는 폴더
-            - args.eval_method (str): 파일 이름 구분용
-            - args.run_count (int): 파일 이름 구분용
-        global_rank (int):
-            현재 프로세스 rank. shape: ()
-        world_size (int):
-            전체 프로세스 수. shape: ()
-
-    Returns:
-        None
-    """
-    global _VIS_BUDGET_REACHED_LOCAL
-    _VIS_BUDGET_REACHED_LOCAL = False
-
-    counter_path = _get_visualization_budget_counter_path(args)
-    if counter_path is None:
-        return
-
-    # ✅ 대표 프로세스만 삭제 (중간에 리셋되는 레이스 방지)
-    if int(global_rank) == 0:
-        deleted = _safe_remove_file_if_exists(counter_path)
-        if deleted:
-            print(f"[VIS_BUDGET] 기존 카운터 파일 삭제: {counter_path}")
-        else:
-            # 파일이 없거나 삭제 불필요인 경우도 흔하니, 너무 시끄럽지 않게 출력합니다.
-            print(f"[VIS_BUDGET] 카운터 파일 없음(또는 삭제 불필요): {counter_path}")
-
-    # ✅ DDP면 여기서 동기화해서, 모든 rank가 "삭제 이후"에만 진행하도록 보장
-    if int(world_size) > 1 and _is_torch_process_group_initialized():
-        torch.distributed.barrier()
-
-
 def _get_visualization_budget_counter_path(args: Any) -> Optional[str]:
     """이번 실행(run_count)에서 공유할 '카운터 파일' 경로를 만듭니다.
 
@@ -651,100 +576,6 @@ def _read_count_from_json_text(text: str) -> int:
         return int(value)
     except Exception:
         return 0
-
-
-def _try_reserve_visualization_slot(counter_path: str, limit: int) -> bool:
-    """공유 카운터 파일을 이용해 '저장 1회'를 예약합니다.
-
-    동작 방식
-    ----------
-    - counter_path 파일을 열고(없으면 생성),
-    - 잠깐 잠근 뒤(여러 프로세스가 동시에 접근해도 숫자가 꼬이지 않게),
-    - 현재 count를 읽고:
-        * count < limit 이면 count를 1 올리고 True
-        * count >= limit 이면 False
-
-    Args:
-        counter_path (str):
-            카운터 파일 경로.
-        limit (int):
-            허용되는 총 저장 횟수(0 이상).
-
-    Returns:
-        bool:
-            - True: 이번에 저장을 진행해도 됨(예약 성공)
-            - False: 이미 limit을 다 써서 저장 금지
-    """
-    if int(limit) < 0:
-        return True
-    if int(limit) == 0:
-        return False
-
-    os.makedirs(os.path.dirname(counter_path), exist_ok=True)
-    with open(counter_path, "a+", encoding="utf-8") as f:
-        if fcntl is not None:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-
-        f.seek(0)
-        raw = f.read()
-        count = _read_count_from_json_text(raw)
-
-        if int(count) >= int(limit):
-            return False
-
-        new_count = int(count) + 1
-        f.seek(0)
-        f.truncate()
-        f.write(json.dumps({"count": new_count}, ensure_ascii=False))
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except Exception:
-            pass
-
-        return True
-
-
-def _reserve_visualization_budget_if_needed(args: Any) -> bool:
-    """이번에 시각화를 저장해도 되는지 판단하고, 가능하면 1회분을 예약합니다.
-
-    Args:
-        args (Any):
-            - args.total_save_image_trial_num (int): 전체 제한(-1이면 무제한)
-            - args.save_path (str): 카운터 파일을 둘 폴더
-            - args.eval_method (str), args.run_count (int): 카운터 파일 이름 구분용
-
-    Returns:
-        bool:
-            - True: 저장 허용(예약 성공)
-            - False: 저장 금지(제한 초과 또는 설정 문제)
-    """
-    global _VIS_BUDGET_REACHED_LOCAL
-
-    limit = _get_total_save_image_trial_num(args)
-    print("limit:", limit)
-    if int(limit) < 0:
-        return True
-
-    if _VIS_BUDGET_REACHED_LOCAL:
-        return False
-
-    counter_path = _get_visualization_budget_counter_path(args)
-    if counter_path is None:
-        # save_path가 없으면 안전하게 저장을 막습니다(파일 폭증 방지).
-        _VIS_BUDGET_REACHED_LOCAL = True
-        return False
-
-    try:
-        ok = _try_reserve_visualization_slot(counter_path=counter_path,
-                                             limit=int(limit))
-        print("ok:", ok)
-    except Exception:
-        ok = False
-
-    if not ok:
-        _VIS_BUDGET_REACHED_LOCAL = True
-    return ok
 
 
 def _maybe_distributed_barrier(
@@ -1377,7 +1208,7 @@ def _forward_model_for_validation(
     return decoder_output
 
 
-def _shrink_rollout_batch_to_draw_idx(
+def _shrink_batch_to_draw_idx(
     unnorm_inputs_copy: Dict[str, Any],
     draw_batch_idx: int,
 ) -> Dict[str, Any]:
@@ -1434,7 +1265,7 @@ class _RolloutVisualizationState:
     draw_batch_idx: int
     draw_scenario_id: str
     save_dir: str
-    draw_near_target_id: Optional[torch.Tensor]
+    draw_near_target_id: Optional[torch.Tensor]  # shape: (Pnn,)
 
 
 def _init_rollout_visualization_state(
@@ -1470,7 +1301,6 @@ def _maybe_prepare_rollout_visualization_once(
     *,
     args: Any,
     norm_inputs: Dict[str, Any],
-    batch_size: int,
     state: _RolloutVisualizationState,
 ) -> _RolloutVisualizationState:
     """예산 체크 + 저장 폴더/ID 준비를 '딱 1번'만 수행합니다.
@@ -1501,12 +1331,6 @@ def _maybe_prepare_rollout_visualization_once(
             state.requested_save_video)):
         return state
 
-    allowed = _reserve_visualization_budget_if_needed(args)
-    if not bool(allowed):
-        state.enabled_save_image = False
-        state.enabled_save_video = False
-        return state
-
     # 영상이면 PNG 프레임이 필요하므로 이미지도 켭니다.
     state.enabled_save_video = bool(state.requested_save_video)
     state.enabled_save_image = bool(state.requested_save_image or
@@ -1515,43 +1339,34 @@ def _maybe_prepare_rollout_visualization_once(
     if not bool(state.enabled_save_image):
         return state
 
-    base_idx = int(state.draw_batch_idx)
-    if int(base_idx) < 0 or int(base_idx) >= int(batch_size):
-        raise ValueError(
-            "draw_batch_idx가 배치(B) 범위를 벗어났습니다. "
-            f"draw_batch_idx={int(state.draw_batch_idx)}, batch_size={int(batch_size)}"
-        )
-
     draw_scenario_id, draw_near_target_id, save_dir = _prepare_data_for_draw(
         args=args,
         norm_inputs=norm_inputs,
-        draw_batch_idx=int(base_idx),
+        draw_batch_idx=int(state.draw_batch_idx),
     )
     state.draw_scenario_id = str(draw_scenario_id)
     state.save_dir = str(save_dir)
-    state.draw_near_target_id = draw_near_target_id
+    state.draw_near_target_id = draw_near_target_id  # shape: (Pnn,)
     return state
 
 
 def _maybe_draw_rollout_visualization_frame(
     *,
     state: _RolloutVisualizationState,
-    norm_inputs_step: Dict[str, Any],
+    unnorm_inputs_copy: Dict[str, Any],
     normed_selected_traj: torch.Tensor,
     state_normalizer: Any,
-    observation_normalizer: "ObservationNormalizer",
     step_idx: int,
 ) -> None:
     """조건이 맞으면 PNG 프레임 1장을 저장합니다.
 
     Args:
         state (_RolloutVisualizationState): 시각화 상태. shape: ()
-        norm_inputs_step (Dict[str, Any]): 현재 시점 모델 입력(정규화). shape: ()
+        unnorm_inputs_copy (Dict[str, Any]): 현재 시점 모델 입력(정규화). shape: ()
         normed_selected_traj (torch.Tensor):
             선택된 경로(정규화).
             shape: (B*R, 1+Pnn, 1+T, 4)
         state_normalizer (Any): (x,y,cos,sin) 변환 도구. shape: ()
-        observation_normalizer (ObservationNormalizer): 입력 dict 변환 도구. shape: ()
         step_idx (int): 저장 파일 이름에 넣을 step 값. shape: ()
 
     Returns:
@@ -1566,21 +1381,24 @@ def _maybe_draw_rollout_visualization_frame(
         raise RuntimeError("이미지 저장이 켜져 있는데 save_dir가 비어 있습니다.")
 
     # _prepare_data_for_one_batch_draw 내부에서:
-    # - (B*R)에서 state.draw_batch_idx 샘플 1개만 뽑아 numpy로 만듭니다.
-    unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim, ego_future_gt_4_dim_np = _prepare_data_for_one_batch_draw(
-        norm_inputs_copy=norm_inputs_step,
+    # - (B)에서 state.draw_batch_idx 샘플 1개만 뽑아 numpy로 만듭니다.
+    (a_unnorm_inputs_np, a_unnorm_trajectory_np, a_unnorm_near_future_gt_3_dim,
+     a_unnorm_ego_future_gt_4_dim
+    ) = _prepare_data_for_one_batch_draw(
+        unnorm_inputs_copy=unnorm_inputs_copy,
         normed_trajectories=normed_selected_traj,  # shape: (B*R, 1+Pnn, 1+T, 4)
         state_normalizer=state_normalizer,
-        observation_normalizer=observation_normalizer,
         draw_batch_idx=int(state.draw_batch_idx),
     )
 
     _draw_one_batch_one_rollout(
         save_dir=str(state.save_dir),
-        unnorm_inputs_np=unnorm_inputs_np,
-        unnorm_trajectory_np=unnorm_trajectory_np,  # shape: ((1+)Pnn, 1+T, 4)
-        ego_future_gt_4_dim=ego_future_gt_4_dim_np,  # shape: (future_len, 4)
-        near_future_gt_3_dim=near_future_gt_3_dim,  # shape: (Pnn, future_len, 3)
+        unnorm_inputs_np=a_unnorm_inputs_np,
+        unnorm_trajectory_np=a_unnorm_trajectory_np,  # shape: ((1+)Pnn, 1+T, 4)
+        ego_future_gt_4_dim=
+        a_unnorm_near_future_gt_3_dim,  # shape: (future_len, 4)
+        near_future_gt_3_dim=
+        a_unnorm_ego_future_gt_4_dim,  # shape: (Pnn, future_len, 3)
         step_idx=int(step_idx),
         draw_near_target_id=state.draw_near_target_id,  # shape: (Pnn,)
     )
@@ -1636,7 +1454,8 @@ def _prepare_data_for_draw(
     draw_target_id = norm_inputs["target_id"][draw_batch_idx]  # ((1+)Pnn)
     draw_near_target_id = draw_target_id[1:]  # (Pnn,)
 
-    save_dir = os.path.join(args.save_path, f"debug_vis_{draw_scenario_id}")
+    save_dir = os.path.join(args.save_cache_path,
+                            f"debug_vis_{draw_scenario_id}")
     os.makedirs(save_dir, exist_ok=True)
 
     return draw_scenario_id, draw_near_target_id, save_dir
@@ -2071,7 +1890,7 @@ def _predict_one_rollout_sequential(
         None
     """
     # ✅ 시각화 상태
-    vis_state = _init_rollout_visualization_state(
+    vis_state: _RolloutVisualizationState = _init_rollout_visualization_state(
         save_image=bool(save_image),
         save_video=bool(save_video),
         draw_batch_idx=int(draw_batch_idx),
@@ -2169,17 +1988,15 @@ def _predict_one_rollout_sequential(
             vis_state = _maybe_prepare_rollout_visualization_once(
                 args=args,
                 norm_inputs=norm_inputs,
-                batch_size=int(batch_size),
-                state=vis_state,
+                state=vis_state,  # _RolloutVisualizationState
             )
 
             # ✅ (그림) 프레임 저장
             _maybe_draw_rollout_visualization_frame(
                 state=vis_state,
-                norm_inputs_step=norm_inputs_step,
+                unnorm_inputs_copy=unnorm_inputs_copy,
                 normed_selected_traj=normed_selected_traj,  # (B, 1+Pnn, 1+T, 4)
                 state_normalizer=state_normalizer,
-                observation_normalizer=observation_normalizer,
                 step_idx=int(step_start),
             )
 
@@ -2434,42 +2251,37 @@ def _save_inference_data(
 
 
 def _prepare_data_for_one_batch_draw(
-    norm_inputs_copy: Dict[str, Any],
+    unnorm_inputs_copy: Dict[str, Any],
     normed_trajectories: torch.Tensor,
     state_normalizer: Any,
-    observation_normalizer: ObservationNormalizer,
     draw_batch_idx: int,
 ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
     # 역정규화: ((1+)Pnn, 1+T, 4)
-    unnorm_trajectory = state_normalizer.inverse(
+    a_unnorm_trajectory = state_normalizer.inverse(
         normed_trajectories[draw_batch_idx])
-    unnorm_trajectory_np = unnorm_trajectory.cpu().numpy()
-    norm_ego_future_gt_4_dim = norm_inputs_copy[
-        "ego_future_gt_4_dim"]  # (B*R, future_len, 4)
-    norm_near_future_gt_4_dim = norm_inputs_copy[
-        "near_future_gt_4_dim"]  # (B*R, Pnn, future_len, 4)
-    ego_future_gt_4_dim = state_normalizer.inverse(
-        norm_ego_future_gt_4_dim).cpu().numpy()  # (B*R, future_len, 4)
-    ego_future_gt_4_dim = ego_future_gt_4_dim[draw_batch_idx]  # (future_len, 4)
-    # near_future_gt_4_dim: (B
-    near_future_gt_4_dim = state_normalizer.inverse(
-        norm_near_future_gt_4_dim).cpu().numpy(
-        )  # (B*R, Pnn, future_len, 4) # 4 = x, y, cos(yaw), sin(yaw)
-    # near_future_gt_3_dim : x, y, yaw
-    near_future_gt_3_dim = np.concatenate([
-        near_future_gt_4_dim[:, :, :, 0:2],
-        np.arctan2(near_future_gt_4_dim[:, :, :, 3:4],
-                   near_future_gt_4_dim[:, :, :, 2:3])
-    ],
-                                          axis=-1)
-    near_future_gt_3_dim = near_future_gt_3_dim[
-        draw_batch_idx]  # (Pnn, future_len, 3)
+    a_unnorm_trajectory_np = a_unnorm_trajectory.cpu().numpy()
 
-    unnorm_inputs_copy = observation_normalizer.inverse(norm_inputs_copy)
-    unnorm_inputs_copy = _shrink_rollout_batch_to_draw_idx(
-        unnorm_inputs_copy, draw_batch_idx)
-    unnorm_inputs_np = _torch_to_numpy(unnorm_inputs_copy)
-    return unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim, ego_future_gt_4_dim
+    unnorm_ego_future_gt_4_dim = unnorm_inputs_copy["ego_future_gt_4_dim"].cpu(
+    ).numpy()  # (B*R, future_len, 4)
+    a_unnorm_ego_future_gt_4_dim = unnorm_ego_future_gt_4_dim[
+        draw_batch_idx]  # (future_len, 4)
+
+    unnorm_near_future_gt_4_dim = unnorm_inputs_copy[
+        "near_future_gt_4_dim"].cpu().numpy()  # (B*R, Pnn, future_len, 4)
+    # near_future_gt_4_dim: (B
+    # near_future_gt_3_dim : x, y, yaw
+    unnorm_near_future_gt_3_dim = np.concatenate([
+        unnorm_near_future_gt_4_dim[:, :, :, 0:2],
+        np.arctan2(unnorm_near_future_gt_4_dim[:, :, :, 3:4],
+                   unnorm_near_future_gt_4_dim[:, :, :, 2:3])
+    ],
+                                                 axis=-1)
+    a_unnorm_near_future_gt_3_dim = unnorm_near_future_gt_3_dim[
+        draw_batch_idx]  # (Pnn, future_len, 3)
+    a_unnorm_inputs_copy = _shrink_batch_to_draw_idx(unnorm_inputs_copy,
+                                                     draw_batch_idx)
+    a_unnorm_inputs_np = _torch_to_numpy(a_unnorm_inputs_copy)
+    return a_unnorm_inputs_np, a_unnorm_trajectory_np, a_unnorm_near_future_gt_3_dim, a_unnorm_ego_future_gt_4_dim
 
 
 from typing import Any, Dict, Tuple
@@ -2857,13 +2669,6 @@ def _build_recovery_step_count_per_agent(
 ) -> torch.Tensor:  # (B_all, 1+Pnn)
     """Recovery에서 '몇 스텝까지' GT 쪽으로 섞을지 에이전트별로 정합니다.
 
-    동작
-    ----
-    - 설정값 args.time_step_for_recover 와, GT가 실제로 남아있는 유효 스텝 수 중
-      더 작은 값을 사용합니다.
-    - 0으로 나누는 문제를 피하기 위해 최소 1로 제한합니다.
-      (단, GT가 아예 없는 에이전트는 이후 단계에서 'GT가 있는 칸만 섞기'로 인해
-       실제로는 GT쪽으로 끌리지 않습니다.)
     """
     time_step_for_recover = int(args.time_step_for_recover)
     cfg = torch.full_like(gt_valid_step_count_per_agent,
@@ -3135,18 +2940,17 @@ def _get_near_future_11(
     near_future_11[:, :, 0:4] = np_int_traj_4_wrt_ego  # (Pnn, 1+T, 11)
     return near_future_11
 
-
 def _draw_one_batch_one_rollout(
         save_dir: str,
-        unnorm_inputs_np: Dict[str, Any],
-        unnorm_trajectory_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
-        ego_future_gt_4_dim: np.ndarray,  # (future_len, 4)
-        near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
+        a_unnorm_inputs_np: Dict[str, Any],
+        a_unnorm_trajectory_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
+        a_unnorm_near_future_gt_3_dim: np.ndarray,  # (future_len, 4)
+        a_unnorm_ego_future_gt_4_dim: np.ndarray,  # (Pnn, future_len, 3)
         step_idx: int,
         draw_near_target_id: torch.Tensor,  # (Pnn,)
 ) -> None:
     """
-        ego_future_gt_4_dim: torch.Tensor # (B, future_len, 4)
+        a_unnorm_near_future_gt_3_dim: torch.Tensor # (B, future_len, 4)
         near_future_gt_4_dim: torch.Tensor # (B, Pnn, future_len, 4)
     """
 
@@ -3162,35 +2966,35 @@ def _draw_one_batch_one_rollout(
 
 
     """
-    ego_current = unnorm_inputs_np["ego_agent_past"][-1]  # (11)
+    ego_current = a_unnorm_inputs_np["ego_agent_past"][-1]  # (11)
     # ego_future_11 : (1+T, 11)
-    ego_future_11 = _get_ego_future_11(ego_current, unnorm_trajectory_np)
+    ego_future_11 = _get_ego_future_11(ego_current, a_unnorm_trajectory_np)
     output_data["ego_np_int_traj_11_wrt_ego"] = ego_future_11
     output_data["ego_next_wp_wrt_ego"] = ego_future_11[1]
     ###############################
     ego_gt_future_11 = ego_future_11[1:, :].copy()
-    ego_gt_future_11[:, 0:4] = ego_future_gt_4_dim  # (future_len, 4)
-    unnorm_inputs_np["ego_future_gt_11_dim"] = ego_gt_future_11  # (T, 11)
+    ego_gt_future_11[:, 0:4] = a_unnorm_near_future_gt_3_dim  # (future_len, 4)
+    a_unnorm_inputs_np["ego_future_gt_11_dim"] = ego_gt_future_11  # (T, 11)
     diff_token_to_future_gt_3_dim = {}
     for target_id, gt_future_3 in zip(draw_near_target_id,
-                                      near_future_gt_3_dim):
+                                      a_unnorm_ego_future_gt_4_dim):
         diff_token_to_future_gt_3_dim[
             f"{target_id}"] = gt_future_3  # (future_len, 3)
-    unnorm_inputs_np[
+    a_unnorm_inputs_np[
         "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim
     ###############################
-    near_agents_current = unnorm_inputs_np[
+    near_agents_current = a_unnorm_inputs_np[
         "near_agents_past"][:, -1, :]  # (Pnn, 11)
     # near_future_11: (Pnn, 1+T, 11)
     near_future_11 = _get_near_future_11(near_agents_current,
-                                         unnorm_trajectory_np)
+                                         a_unnorm_trajectory_np)
     diff_token_to_np_int_traj_11_wrt_ego = {}
     for target_id, np_int_traj_11 in zip(draw_near_target_id, near_future_11):
         # np_int_traj_11: (1+T, 11)
         diff_token_to_np_int_traj_11_wrt_ego[f"{target_id}"] = np_int_traj_11
     output_data[
         "diff_token_to_np_int_traj_11_wrt_ego"] = diff_token_to_np_int_traj_11_wrt_ego
-    draw_machine_fast.draw_world_model_to_png(unnorm_inputs_np,
+    draw_machine_fast.draw_world_model_to_png(a_unnorm_inputs_np,
                                               output_data=output_data,
                                               save_path=os.path.join(
                                                   save_dir, f"{step_idx}.png"))
@@ -4350,12 +4154,6 @@ def main() -> None:
     should_finish = prepare_wandb_resume(args)
     set_distributed_flag_from_env(args)
 
-    # ✅ (추가) 프로그램 시작 시, 이번 run_count 카운터 파일이 있으면 삭제해서 초기화
-    _purge_visualization_budget_counter_file_at_program_start(
-        args=args,
-        global_rank=int(global_rank),
-        world_size=int(world_size),
-    )
     # Run
     try:
         model_validation(args, global_rank, rank, world_size, use_deepspeed)
