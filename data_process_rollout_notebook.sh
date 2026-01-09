@@ -160,7 +160,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
- eval_predictor.py \
+ finetune_data_maker.py \
  --port 23001 \
   --eval_set "$EVAL_SET_PATH" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
@@ -172,14 +172,10 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --batch_size 2 \
   --use_wandb False \
   --use_deepspeed True \
-  --wosac_sub_is_active False \
-  --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
-  --rollout_step_count_for_save 1 \
-  --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 300 \

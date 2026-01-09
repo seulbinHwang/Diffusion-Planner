@@ -1,9 +1,5 @@
-import argparse
 from diffusion_planner.utils.dataset import DiffusionPlannerData
 from torch.utils.data import DataLoader, DistributedSampler
-import numpy as np
-import torch
-from typing import Any, Dict, List, Optional, Tuple
 from requests.exceptions import HTTPError
 from tools.diffusion_planner_collate import DiffusionPlannerCollate
 import shutil
@@ -2208,7 +2204,6 @@ def build_data_loader(
     )
     return loader
 
-
 def create_diffusion_planner_and_ema(
     args: argparse.Namespace,
     rank: int,
@@ -2266,4 +2261,3 @@ def create_diffusion_planner_and_ema(
         args.ddp and (not use_deepspeed),
     )
     return diffusion_planner, model_ema, base_model
-

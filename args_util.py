@@ -194,8 +194,7 @@ def get_args():
                         help='save_inference_data')
     parser.add_argument('--rollout_step_count_for_save',
                         type=int,
-                        help='state dim for static objects',
-                        default=1)
+                        default=-1)
     parser.add_argument('--static_objects_state_dim',
                         type=int,
                         help='state dim for static objects',
@@ -562,6 +561,15 @@ def get_args():
                         type=int,
                         default=1,
                         help='limit total number of scenarios')
+    parser.add_argument('--fine_tune_gen_k',
+                        type=int,
+                        default=64)
+    parser.add_argument('--fine_tune_temperature',
+                        type=float,
+                        default=0.5)
+    parser.add_argument('--time_step_for_compare',
+                        type=int,
+                        default=20)
     parser.add_argument('--shuffle_scenarios',
                         type=boolean,
                         default=False,
