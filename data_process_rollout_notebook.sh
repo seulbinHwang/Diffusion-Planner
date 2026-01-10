@@ -178,7 +178,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
-  --total_save_image_trial_num 30000 \
   --fine_tune_gen_k 64 \
   --rollout_time_chunk_size 5 \
   --fine_tune_temperature 0.8 \

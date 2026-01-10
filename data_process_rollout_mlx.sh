@@ -32,58 +32,10 @@ fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
 TRAIN_SET_PATH="${USER_PATH}/dataset/processed"
-TRAIN_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_training.json"
+TRAIN_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
 ###################################
 # If validation list json is missing, create it from *.npz in TRAIN_SET_PATH
 ###################################
-ensure_eval_set_list_json() {
-  local validation_dir="$1"
-  local json_path="$2"
-  local python_bin="$3"
-
-  if [[ -f "$json_path" ]]; then
-    echo "[INFO] Found existing eval_set_list json: $json_path"
-    return 0
-  fi
-
-  if [[ ! -d "$validation_dir" ]]; then
-    echo "[ERROR] TRAIN_SET_PATH does not exist or is not a directory: $validation_dir" >&2
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$json_path")"
-
-  # 안전한 전달을 위해 env로 넘김 (경로에 공백이 있어도 안전)
-  export _DP_VALIDATION_DIR="$validation_dir"
-  export _DP_VALIDATION_JSON="$json_path"
-
-  "$python_bin" - <<'PY'
-import glob
-import json
-import os
-
-validation_dir = os.environ["_DP_VALIDATION_DIR"]
-json_path = os.environ["_DP_VALIDATION_JSON"]
-
-# validation_dir 바로 아래의 *.npz만 수집 (재귀 아님)
-npz_paths = glob.glob(os.path.join(validation_dir, "*.npz"))
-
-# "파일명(확장자 포함)"만 추출
-npz_names = [os.path.basename(p) for p in npz_paths]
-npz_names.sort()
-
-with open(json_path, "w", encoding="utf-8") as f:
-    json.dump(npz_names, f, indent=2, ensure_ascii=False)
-
-print(f"[INFO] Created eval_set_list json: {json_path} (num_files={len(npz_names)})")
-PY
-
-  unset _DP_VALIDATION_DIR
-  unset _DP_VALIDATION_JSON
-}
-
-ensure_eval_set_list_json "$TRAIN_SET_PATH" "$TRAIN_SET_LIST_PATH" "$RUN_PYTHON_PATH"
-
 
 # ----------------------------
 # 진행 상황 출력 주기(초) (공통)
@@ -175,10 +127,15 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_video False \
 --save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
-  --rollout_step_count_for_save 1 \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
-  --total_save_image_trial_num 1 \
-  --rollout_time_chunk_size 5
+  --fine_tune_gen_k 64 \
+  --rollout_time_chunk_size 5 \
+  --fine_tune_temperature 0.8 \
+  --use_recovery True \
+  --select_jointly True \
+  --recovery_threshold_m 1.5 \
+  --scenario_finish_step 40 \
+  --use_data_percent 5
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
