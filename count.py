@@ -34,5 +34,5 @@ def count_npz_name_types(json_path: str | Path) -> dict[str, int]:
     }
 
 if __name__ == "__main__":
-    result = count_npz_name_types("diffusion_planner_training.json")
+    result = count_npz_name_types("diffusion_planner_fine_tuning.json")
     print(result)
