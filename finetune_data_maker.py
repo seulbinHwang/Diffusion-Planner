@@ -3021,7 +3021,6 @@ def _select_best_trajectory_by_sample_k(
 
     cand_start = 0
     while cand_start < k_total:
-        print("args._dp_sample_k_candidate_batch_size:", args._dp_sample_k_candidate_batch_size)
         group_count = int(min(cand_group_size, k_total - cand_start))
 
         try:
@@ -3059,6 +3058,7 @@ def _select_best_trajectory_by_sample_k(
                 # 더 작은 값은 안전하므로 저장(이후 호출도 이 값 사용)
                 setattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME,
                         int(cand_group_size))
+                print(f"GPU OOM detected. Reducing candidate batch size to {cand_group_size} and retrying.")
                 continue
             raise
 
