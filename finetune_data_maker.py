@@ -1429,7 +1429,7 @@ def _finalize_rollout_visualization_video_if_needed(
     draw_machine_fast.make_video_from_all_png(
         str(state.save_dir),
         str(state.draw_scenario_id),
-        new_save_dir=args.save_path,
+        new_save_dir=state.save_dir,
         run_count=args.run_count,
     )
 
