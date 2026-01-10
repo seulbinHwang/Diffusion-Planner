@@ -2548,6 +2548,424 @@ def _compute_expert_guidance_distance_m_per_agent(
     return dist
 
 
+# _select_best_trajectory_by_sample_k에서 "후보를 한 번에 몇 개씩 묶어 처리할지"를 캐시하는 args 속성 이름
+_DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME = "_dp_sample_k_candidate_batch_size"
+
+
+def _is_gpu_oom_error(err: BaseException) -> bool:
+    """GPU 메모리 부족(Out Of Memory) 때문에 난 에러인지 확인합니다.
+
+    후보 경로를 여러 개 한 번에 계산하면 빨라지지만,
+    한 번에 처리하는 개수가 너무 크면 GPU 메모리가 부족해질 수 있습니다.
+
+    이 함수는 예외(err)가 "GPU 메모리 부족" 때문에 난 것인지 판별합니다.
+
+    Args:
+        err (BaseException): 발생한 예외 객체. shape: ()
+
+    Returns:
+        bool:
+            - True: GPU 메모리 부족으로 보이는 경우
+            - False: 그 외의 경우
+            shape: ()
+    """
+    # torch 버전에 따라 전용 타입이 없을 수 있어서 문자열도 함께 확인합니다.
+    if hasattr(torch.cuda, "OutOfMemoryError") and isinstance(
+            err, torch.cuda.OutOfMemoryError):
+        return True
+
+    msg = str(err).lower()
+    if "out of memory" in msg:
+        return True
+    if "cuda" in msg and "memory" in msg:
+        return True
+    return False
+
+
+def _clear_gpu_cache_after_oom() -> None:
+    """GPU 메모리 부족 후 다음 시도를 위해 캐시를 정리합니다.
+
+    동작
+    ----
+    - 파이썬이 들고 있던 임시 객체를 가능한 한 빨리 정리합니다.
+    - GPU 캐시도 비워서 다음 시도가 더 잘 되도록 돕습니다.
+
+    Returns:
+        None
+    """
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _repeat_inputs_for_candidate_batch(
+    *,
+    norm_inputs_step: Dict[str, Any],
+    repeat: int,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """후보 개수(repeat)만큼 입력 배치를 늘린 dict를 만듭니다.
+
+    이 함수가 하는 일
+    ---------------
+    후보를 여러 개 한 번에 모델에 넣으려면,
+    입력의 첫 번째 차원(B)을 repeat배로 늘린 (B*repeat, ...) 형태가 필요합니다.
+
+    처리 규칙
+    --------
+    - torch.Tensor 이고 shape[0] == B 인 경우:
+        (B, ...) -> (B*repeat, ...) 로 늘립니다.
+    - list 이고 길이가 B 인 경우:
+        길이 B -> 길이 B*repeat 로 늘립니다.
+    - 그 외 값(None, 숫자, 길이가 B가 아닌 리스트 등):
+        그대로 둡니다.
+
+    Args:
+        norm_inputs_step (Dict[str, Any]):
+            원본 입력 dict. shape: ()
+        repeat (int):
+            후보를 몇 개 묶어서 한 번에 계산할지. shape: ()
+        batch_size (int):
+            원본 배치 크기 B. shape: ()
+
+    Returns:
+        Dict[str, Any]:
+            배치가 늘어난 입력 dict. shape: ()
+    """
+    r = int(max(1, int(repeat)))
+    b = int(max(1, int(batch_size)))
+
+    out: Dict[str, Any] = {}
+    for k, v in norm_inputs_step.items():
+        if isinstance(v, torch.Tensor) and v.dim() >= 1 and int(v.shape[0]) == b:
+            # v: (B, ...)
+            repeat_factors = (r,) + (1,) * (int(v.dim()) - 1)
+            out[k] = v.repeat(*repeat_factors)  # (B*r, ...)
+        elif isinstance(v, list) and int(len(v)) == b:
+            out[k] = v * r  # 길이: B*r
+        else:
+            out[k] = v
+    return out
+
+
+def _build_inference_noise_batch_for_candidate_range(
+    *,
+    reference_tensor: torch.Tensor,
+    batch_size: int,
+    one_or_pnn: int,
+    future_len: int,
+    rollout_idx: int,
+    base_seed: int,
+    ddp_rank: int,
+    step_idx: int,
+    noise_std: float,
+    seed_stride: int,
+    cand_start_idx: int,
+    cand_count: int,
+) -> torch.Tensor:
+    """cand_start_idx부터 cand_count개 후보의 노이즈를 한 번에 만들어 합칩니다.
+
+    Args:
+        reference_tensor (torch.Tensor):
+            device/dtype 기준 텐서. 보통 ego_agent_past 사용.
+            shape 예: (B, T_past, 11)
+        batch_size (int): 배치 크기 B. shape: ()
+        one_or_pnn (int): (1+Pnn). shape: ()
+        future_len (int): 미래 길이. shape: ()
+        rollout_idx (int): rollout 번호. shape: ()
+        base_seed (int): 기본 seed. shape: ()
+        ddp_rank (int): 분산 rank. shape: ()
+        step_idx (int): rollout 안의 step 번호. shape: ()
+        noise_std (float): 노이즈 크기. shape: ()
+        seed_stride (int): 후보마다 seed를 띄우는 간격. shape: ()
+        cand_start_idx (int): 시작 후보 인덱스. shape: ()
+        cand_count (int): 후보 개수. shape: ()
+
+    Returns:
+        torch.Tensor:
+            후보들을 이어붙인 노이즈 텐서.
+            shape: (B*cand_count, 1+Pnn, future_len, 4)
+    """
+    c = int(max(1, int(cand_count)))
+    b = int(max(1, int(batch_size)))
+
+    noises = []
+    for local_i in range(c):
+        cand_idx = int(cand_start_idx) + int(local_i)
+        cand_base_seed = int(base_seed) + int(cand_idx) * int(seed_stride)
+
+        # noise_i: (B, 1+Pnn, future_len, 4)
+        noise_i = _build_inference_noise_for_rollout_chunk(
+            reference_tensor=reference_tensor,
+            batch_size=b,
+            one_or_pnn=int(one_or_pnn),
+            future_len=int(future_len),
+            rollout_idx=int(rollout_idx),
+            base_seed=int(cand_base_seed),
+            ddp_rank=int(ddp_rank),
+            step_idx=int(step_idx),
+            noise_std=float(noise_std),
+        )
+        noises.append(noise_i)
+
+    # noise_stack: (cand_count, B, 1+Pnn, future_len, 4)
+    noise_stack = torch.stack(noises, dim=0)
+
+    # noise_flat: (cand_count*B, 1+Pnn, future_len, 4)
+    noise_flat = noise_stack.reshape(
+        int(c) * int(b),
+        int(one_or_pnn),
+        int(future_len),
+        4,
+    )
+    return noise_flat
+
+
+def _forward_and_score_candidate_batch(
+    *,
+    args: Any,
+    model: nn.Module,
+    norm_inputs_step: Dict[str, Any],
+    state_normalizer: Any,
+    unnorm_gt_ego_future_4_dim: torch.Tensor,
+    unnorm_gt_near_future_4_dim: torch.Tensor,
+    agent_length_m: torch.Tensor,
+    agent_width_m: torch.Tensor,
+    batch_size: int,
+    one_or_pnn: int,
+    future_len: int,
+    rollout_idx: int,
+    base_seed: int,
+    ddp_rank: int,
+    step_idx: int,
+    cand_start_idx: int,
+    cand_count: int,
+    seed_stride: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """후보 cand_count개를 한 번에 모델에 넣고, 거리 점수까지 계산합니다.
+
+    Args:
+        args (Any): 설정 객체. shape: ()
+        model (nn.Module): 예측 모델. shape: ()
+        norm_inputs_step (Dict[str, Any]): 현재 step 입력. shape: ()
+        state_normalizer (Any): (x,y,cos,sin) 변환 도구. shape: ()
+        unnorm_gt_ego_future_4_dim (torch.Tensor): 정답 ego 미래. shape: (B, future_len, 4)
+        unnorm_gt_near_future_4_dim (torch.Tensor): 정답 near 미래. shape: (B, Pnn, future_len, 4)
+        agent_length_m (torch.Tensor): 에이전트 길이. shape: (B, 1+Pnn)
+        agent_width_m (torch.Tensor): 에이전트 너비. shape: (B, 1+Pnn)
+        batch_size (int): B. shape: ()
+        one_or_pnn (int): 1+Pnn. shape: ()
+        future_len (int): 미래 길이. shape: ()
+        rollout_idx (int): rollout 번호. shape: ()
+        base_seed (int): 기본 seed. shape: ()
+        ddp_rank (int): rank. shape: ()
+        step_idx (int): step 번호. shape: ()
+        cand_start_idx (int): 후보 시작 인덱스. shape: ()
+        cand_count (int): 후보 개수. shape: ()
+        seed_stride (int): seed 간격. shape: ()
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            (cand_traj, cand_dist)
+            - cand_traj: shape (cand_count, B, 1+Pnn, 1+future_len, 4)
+            - cand_dist: shape (cand_count, B, 1+Pnn)
+    """
+    c = int(max(1, int(cand_count)))
+    b = int(max(1, int(batch_size)))
+
+    # 1) 후보별 노이즈 만들기
+    # inference_noise_flat: (B*cand_count, 1+Pnn, future_len, 4)
+    inference_noise_flat = _build_inference_noise_batch_for_candidate_range(
+        reference_tensor=norm_inputs_step["ego_agent_past"],
+        batch_size=b,
+        one_or_pnn=int(one_or_pnn),
+        future_len=int(future_len),
+        rollout_idx=int(rollout_idx),
+        base_seed=int(base_seed),
+        ddp_rank=int(ddp_rank),
+        step_idx=int(step_idx),
+        noise_std=float(getattr(args, "fine_tune_temperature", 0.0)),
+        seed_stride=int(seed_stride),
+        cand_start_idx=int(cand_start_idx),
+        cand_count=int(c),
+    )
+
+    # 2) 입력 dict를 (B*cand_count, ...)로 늘리기
+    cand_inputs = _repeat_inputs_for_candidate_batch(
+        norm_inputs_step=norm_inputs_step,
+        repeat=int(c),
+        batch_size=int(b),
+    )
+    cand_inputs["inference_noise"] = inference_noise_flat  # (B*c, 1+Pnn, future_len, 4)
+
+    # 3) 모델 forward (한 번)
+    decoder_output = _forward_model_for_validation(
+        args=args,
+        model=model,
+        norm_inputs=cand_inputs,
+    )
+
+    cand_traj_flat = decoder_output.get("integrated_trajectory", None)
+    if not isinstance(cand_traj_flat, torch.Tensor):
+        raise RuntimeError("decoder_output에 'integrated_trajectory'가 없습니다.")
+
+    # cand_traj_flat: (B*cand_count, 1+Pnn, 1+future_len, 4)
+    cand_traj = cand_traj_flat.reshape(
+        int(c),
+        int(b),
+        int(one_or_pnn),
+        1 + int(future_len),
+        4,
+    )
+
+    # 4) 정답/크기 텐서도 (B*cand_count, ...)로 늘려서 거리 계산
+    # gt_ego_rep:  (B*c, future_len, 4)
+    gt_ego_rep = unnorm_gt_ego_future_4_dim.repeat(int(c), 1, 1)
+    # gt_near_rep: (B*c, Pnn, future_len, 4)
+    gt_near_rep = unnorm_gt_near_future_4_dim.repeat(int(c), 1, 1, 1)
+    # len_rep/wid_rep: (B*c, 1+Pnn)
+    len_rep = agent_length_m.repeat(int(c), 1)
+    wid_rep = agent_width_m.repeat(int(c), 1)
+
+    # cand_dist_flat: (B*c, 1+Pnn)
+    cand_dist_flat = _compute_expert_guidance_distance_m_per_agent(
+        state_normalizer=state_normalizer,
+        normed_trajectory=cand_traj_flat,
+        unnorm_gt_ego_future_4_dim=gt_ego_rep,
+        unnorm_gt_near_future_4_dim=gt_near_rep,
+        compare_steps=int(getattr(args, "time_step_for_compare", 1)),
+        agent_length_m=len_rep,
+        agent_width_m=wid_rep,
+    )
+
+    # cand_dist: (cand_count, B, 1+Pnn)
+    cand_dist = cand_dist_flat.reshape(int(c), int(b), int(one_or_pnn))
+
+    return cand_traj, cand_dist
+
+
+def _select_best_from_candidate_batch_jointly(
+    *,
+    best_traj: Optional[torch.Tensor],
+    best_dist: Optional[torch.Tensor],
+    best_score: Optional[torch.Tensor],
+    cand_traj: torch.Tensor,
+    cand_dist: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """샘플마다 후보 1개를 고르는 방식(select_jointly=True)으로 best를 갱신합니다.
+
+    Args:
+        best_traj (Optional[torch.Tensor]):
+            지금까지의 best 경로.
+            shape: (B, 1+Pnn, 1+future_len, 4) 또는 None
+        best_dist (Optional[torch.Tensor]):
+            지금까지의 best 거리(에이전트별).
+            shape: (B, 1+Pnn) 또는 None
+        best_score (Optional[torch.Tensor]):
+            지금까지의 best 점수(샘플별 1개 값).
+            shape: (B,) 또는 None
+        cand_traj (torch.Tensor):
+            이번 배치의 후보 경로들.
+            shape: (Kc, B, 1+Pnn, 1+future_len, 4)
+        cand_dist (torch.Tensor):
+            이번 배치의 후보 거리들.
+            shape: (Kc, B, 1+Pnn)
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            (best_traj, best_dist, best_score)
+            - best_traj shape: (B, 1+Pnn, 1+future_len, 4)
+            - best_dist shape: (B, 1+Pnn)
+            - best_score shape: (B,)
+    """
+    # cand_score: (Kc, B)
+    cand_score = cand_dist.to(dtype=torch.float32).mean(dim=2)
+
+    # group_best_score: (B,)
+    # group_best_idx:   (B,)
+    group_best_score, group_best_idx = cand_score.min(dim=0)
+
+    # cand_traj_perm: (B, Kc, 1+Pnn, 1+future_len, 4)
+    cand_traj_perm = cand_traj.permute(1, 0, 2, 3, 4)
+    b = int(cand_traj_perm.shape[0])
+    a = int(cand_traj_perm.shape[2])
+    t = int(cand_traj_perm.shape[3])
+
+    # idx_traj: (B, 1, 1+Pnn, 1+future_len, 4)
+    idx_traj = group_best_idx[:, None, None, None, None].expand(b, 1, a, t, 4)
+    group_best_traj = torch.take_along_dim(cand_traj_perm, idx_traj,
+                                           dim=1).squeeze(1)
+
+    # cand_dist_perm: (B, Kc, 1+Pnn)
+    cand_dist_perm = cand_dist.permute(1, 0, 2)
+    idx_dist = group_best_idx[:, None, None].expand(b, 1, a)
+    group_best_dist = torch.take_along_dim(cand_dist_perm, idx_dist,
+                                           dim=1).squeeze(1)
+
+    if best_traj is None or best_dist is None or best_score is None:
+        return group_best_traj, group_best_dist, group_best_score
+
+    better = group_best_score < best_score  # (B,)
+    if torch.any(better):
+        best_traj[better] = group_best_traj[better]
+        best_dist[better] = group_best_dist[better]
+    best_score = torch.where(better, group_best_score, best_score)
+    return best_traj, best_dist, best_score
+
+
+def _select_best_from_candidate_batch_per_agent(
+    *,
+    best_traj: Optional[torch.Tensor],
+    best_dist: Optional[torch.Tensor],
+    cand_traj: torch.Tensor,
+    cand_dist: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """에이전트마다 후보를 따로 고르는 방식(select_jointly=False)으로 best를 갱신합니다.
+
+    Args:
+        best_traj (Optional[torch.Tensor]):
+            지금까지의 best 경로.
+            shape: (B, 1+Pnn, 1+future_len, 4) 또는 None
+        best_dist (Optional[torch.Tensor]):
+            지금까지의 best 거리(에이전트별).
+            shape: (B, 1+Pnn) 또는 None
+        cand_traj (torch.Tensor):
+            이번 배치의 후보 경로들.
+            shape: (Kc, B, 1+Pnn, 1+future_len, 4)
+        cand_dist (torch.Tensor):
+            이번 배치의 후보 거리들.
+            shape: (Kc, B, 1+Pnn)
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            (best_traj, best_dist)
+            - best_traj shape: (B, 1+Pnn, 1+future_len, 4)
+            - best_dist shape: (B, 1+Pnn)
+    """
+    # group_best_dist: (B, 1+Pnn)
+    # group_best_idx:  (B, 1+Pnn)
+    group_best_dist, group_best_idx = cand_dist.min(dim=0)
+
+    # cand_traj_perm: (B, 1+Pnn, Kc, 1+future_len, 4)
+    cand_traj_perm = cand_traj.permute(1, 2, 0, 3, 4)
+    b = int(cand_traj_perm.shape[0])
+    a = int(cand_traj_perm.shape[1])
+    t = int(cand_traj_perm.shape[3])
+
+    # idx_traj: (B, 1+Pnn, 1, 1+future_len, 4)
+    idx_traj = group_best_idx[..., None, None, None].expand(b, a, 1, t, 4)
+    group_best_traj = torch.take_along_dim(cand_traj_perm, idx_traj,
+                                           dim=2).squeeze(2)
+
+    if best_traj is None or best_dist is None:
+        return group_best_traj, group_best_dist
+
+    better = group_best_dist < best_dist  # (B, 1+Pnn)
+    if torch.any(better):
+        best_traj[better] = group_best_traj[better]
+    best_dist = torch.where(better, group_best_dist, best_dist)
+    return best_traj, best_dist
 def _select_best_trajectory_by_sample_k(
     *,
     args: Any,
@@ -2568,25 +2986,14 @@ def _select_best_trajectory_by_sample_k(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """같은 입력에서 후보 K개를 만들고, 규칙에 따라 최종 1개를 고릅니다.
 
-    선택 규칙
-    --------
-    - args.select_jointly == False:
-        에이전트마다 따로 "가장 가까운 후보"를 고릅니다.
-        (그래서 한 샘플 안에서도 에이전트마다 다른 후보가 섞일 수 있습니다)
-
-    - args.select_jointly == True:
-        샘플마다 후보 K개 중 1개만 고릅니다.
-        (샘플의 모든 에이전트가 같은 후보를 공유합니다)
-        점수는 (B, 1+Pnn) 거리 값을 (B,) 점수로 줄여서 비교합니다.
-
-    구현 방식
-    --------
-    - 후보를 한 번에 크게 만들지 않고,
-      후보를 1개씩 만들면서 지금까지의 최적(best)만 유지합니다.
-
-    Args:
-        rollout_idx (int):
-            지금 생성 중인 rollout 번호(0부터). shape: ()
+    변경된 핵심
+    ----------
+    - 기존처럼 후보를 1개씩(for문) 처리하지 않고,
+      후보를 "몇 개씩 묶어서" 한 번에 모델에 넣습니다.
+    - 처음 실행에서는 args.fine_tune_gen_k부터 시작해서,
+      GPU 메모리 부족이 나면 절반으로 줄이며 안전한 묶음 크기를 찾습니다.
+    - 한 번 안전한 묶음 크기가 정해지면(args에 저장),
+      이후 호출에서는 계속 그 크기로만 묶어서 처리합니다.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -2594,77 +3001,94 @@ def _select_best_trajectory_by_sample_k(
             - best_normed_traj: (B, 1+Pnn, 1+future_len, 4)
             - best_distance_m_per_agent: (B, 1+Pnn)
     """
-    best_traj: torch.Tensor = None  # type: ignore[assignment]
-    best_dist: torch.Tensor = None  # type: ignore[assignment]
-    best_joint_score: torch.Tensor = None  # type: ignore[assignment]
+    best_traj: Optional[torch.Tensor] = None
+    best_dist: Optional[torch.Tensor] = None
+    best_joint_score: Optional[torch.Tensor] = None  # (B,)
 
     seed_stride = 10_000_000
     select_jointly: bool = bool(args.select_jointly)
 
-    for cand_idx in range(int(args.fine_tune_gen_k)):
-        cand_base_seed = int(base_seed) + int(cand_idx) * int(seed_stride)
+    k_total = int(max(1, int(getattr(args, "fine_tune_gen_k", 1))))
 
-        # inference_noise: (B, 1+Pnn, future_len, 4)
-        inference_noise = _build_inference_noise_for_rollout_chunk(
-            reference_tensor=norm_inputs_step["ego_agent_past"],
-            batch_size=int(batch_size),
-            one_or_pnn=int(one_or_pnn),
-            future_len=int(future_len),
-            rollout_idx=int(rollout_idx),
-            base_seed=int(cand_base_seed),
-            ddp_rank=int(ddp_rank),
-            step_idx=int(step_idx),
-            noise_std=float(args.fine_tune_temperature),
-        )
+    # ✅ (중요) 처음엔 K부터 시작, 한 번 안전한 값이 잡히면 args에 저장된 값 사용
+    cached_group = getattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME, None)
+    if cached_group is None:
+        cand_group_size = int(k_total)
+    else:
+        cand_group_size = int(max(1, int(cached_group)))
+        cand_group_size = int(min(cand_group_size, k_total))
 
-        cand_inputs = dict(norm_inputs_step)
-        cand_inputs["inference_noise"] = inference_noise
+    cand_start = 0
+    while cand_start < k_total:
+        group_count = int(min(cand_group_size, k_total - cand_start))
 
-        decoder_output = _forward_model_for_validation(
-            args=args,
-            model=model,
-            norm_inputs=cand_inputs,
-        )
+        try:
+            # cand_traj_batch: (group_count, B, 1+Pnn, 1+future_len, 4)
+            # cand_dist_batch: (group_count, B, 1+Pnn)
+            cand_traj_batch, cand_dist_batch = _forward_and_score_candidate_batch(
+                args=args,
+                model=model,
+                norm_inputs_step=norm_inputs_step,
+                state_normalizer=state_normalizer,
+                unnorm_gt_ego_future_4_dim=unnorm_gt_ego_future_4_dim,
+                unnorm_gt_near_future_4_dim=unnorm_gt_near_future_4_dim,
+                agent_length_m=agent_length_m,
+                agent_width_m=agent_width_m,
+                batch_size=int(batch_size),
+                one_or_pnn=int(one_or_pnn),
+                future_len=int(future_len),
+                rollout_idx=int(rollout_idx),
+                base_seed=int(base_seed),
+                ddp_rank=int(ddp_rank),
+                step_idx=int(step_idx),
+                cand_start_idx=int(cand_start),
+                cand_count=int(group_count),
+                seed_stride=int(seed_stride),
+            )
 
-        # cand_traj: (B, 1+Pnn, 1+future_len, 4)
-        # cand_traj 은 원래 무효 agent에 대해서는 전부 0 출력을 내놓습니다. 하지만, 유효 agent에 대해서는 future_len 전부 유효 출력을 내놓습니다.
-        cand_traj = decoder_output.get("integrated_trajectory", None)
+        except BaseException as e:
+            # ✅ OOM이면 절반으로 줄이고 같은 cand_start에서 다시 시도
+            if _is_gpu_oom_error(e):
+                if cand_group_size <= 1:
+                    raise
+                cand_group_size = max(1, int(cand_group_size) // 2)
+                _clear_gpu_cache_after_oom()
 
-        # cand_dist: (B, 1+Pnn) # 무효 agent는 거리 결과가 0으로 고정됩니다.
-        cand_dist = _compute_expert_guidance_distance_m_per_agent(
-            state_normalizer=state_normalizer,
-            normed_trajectory=cand_traj,
-            unnorm_gt_ego_future_4_dim=unnorm_gt_ego_future_4_dim,
-            unnorm_gt_near_future_4_dim=unnorm_gt_near_future_4_dim,
-            compare_steps=int(args.time_step_for_compare),
-            agent_length_m=agent_length_m,
-            agent_width_m=agent_width_m,
-        )
+                # 더 작은 값은 안전하므로 저장(이후 호출도 이 값 사용)
+                setattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME,
+                        int(cand_group_size))
+                continue
+            raise
 
-        if best_traj is None:
-            best_traj = cand_traj
-            best_dist = cand_dist
-            if select_jointly:
-                best_joint_score = cand_dist.to(dtype=torch.float32).mean(dim=1)
-            continue
+        # ✅ 첫 성공(또는 더 작은 값으로 성공) 시점에 고정값을 args에 저장
+        if getattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME, None) is None:
+            setattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME,
+                    int(cand_group_size))
 
         if select_jointly:
-            cand_score = cand_dist.to(dtype=torch.float32).mean(dim=1)
-            better = cand_score < best_joint_score  # (B,)
+            best_traj, best_dist, best_joint_score = _select_best_from_candidate_batch_jointly(
+                best_traj=best_traj,
+                best_dist=best_dist,
+                best_score=best_joint_score,
+                cand_traj=cand_traj_batch,
+                cand_dist=cand_dist_batch,
+            )
+        else:
+            best_traj, best_dist = _select_best_from_candidate_batch_per_agent(
+                best_traj=best_traj,
+                best_dist=best_dist,
+                cand_traj=cand_traj_batch,
+                cand_dist=cand_dist_batch,
+            )
 
-            if torch.any(better):
-                best_traj[better] = cand_traj[better]  # (B, 1+Pnn, 1+T, 4)
-                best_dist[better] = cand_dist[better]  # (B, 1+Pnn)
+        cand_start += int(group_count)
 
-            best_joint_score = torch.where(better, cand_score, best_joint_score)
-            continue
+        # (메모리 압박 완화) 다음 루프 전에 참조 해제
+        del cand_traj_batch
+        del cand_dist_batch
 
-        # 기존 방식: 에이전트별로 후보 선택
-        better = cand_dist < best_dist  # (B, 1+Pnn)
-        if torch.any(better):
-            best_traj[better] = cand_traj[better]
-        best_dist = torch.where(better, cand_dist, best_dist)
-
+    assert isinstance(best_traj, torch.Tensor)
+    assert isinstance(best_dist, torch.Tensor)
     return best_traj, best_dist
 
 
