@@ -180,8 +180,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 30000 \
   --rollout_time_chunk_size 5 \
-  --fine_tune_temperature 0.8 \
-  --use_recovery True \
+  --fine_tune_temperature 1.6 \
+  --use_recovery False \
   --select_jointly True \
   --recovery_threshold_m 1.0
 
