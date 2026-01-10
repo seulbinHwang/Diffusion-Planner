@@ -2966,6 +2966,7 @@ def _select_best_from_candidate_batch_per_agent(
         best_traj[better] = group_best_traj[better]
     best_dist = torch.where(better, group_best_dist, best_dist)
     return best_traj, best_dist
+
 def _select_best_trajectory_by_sample_k(
     *,
     args: Any,
@@ -3020,6 +3021,7 @@ def _select_best_trajectory_by_sample_k(
 
     cand_start = 0
     while cand_start < k_total:
+        print("args._dp_sample_k_candidate_batch_size:", args._dp_sample_k_candidate_batch_size)
         group_count = int(min(cand_group_size, k_total - cand_start))
 
         try:
