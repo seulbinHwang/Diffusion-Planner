@@ -1851,6 +1851,41 @@ def _apply_unvalid_at_unnorm_selected_traj_raw(
     unnorm_selected_traj[:, :, 1:, :] = unnorm_selected_traj_raw_future_len
     return unnorm_selected_traj
 
+from typing import Any
+
+
+def _get_scenario_finish_step_limit(args: Any, *, future_len: int) -> int:
+    """시나리오를 몇 칸까지만 진행할지 '상한'을 정합니다.
+
+    이 함수가 하는 일
+    ---------------
+    - args.scenario_finish_step 값을 읽어서,
+      롤아웃을 "미래 몇 칸까지만" 진행할지 결정합니다.
+    - 잘못된 값(없음/숫자 변환 실패/0 이하)이면 제한을 끄고,
+      원래처럼 future_len까지 진행하게 합니다.
+    - 너무 큰 값이면 future_len로 잘라서 안전하게 맞춥니다.
+
+    Args:
+        args (Any): 설정 값 모음. shape: ()
+        future_len (int): 원래 미래 길이(전체 칸 수). shape: ()
+
+    Returns:
+        int: 실제로 진행할 최대 칸 수(1~future_len 또는 future_len). shape: ()
+    """
+    raw = getattr(args, "scenario_finish_step", None)
+    if raw is None:
+        return int(future_len)
+
+    try:
+        step = int(raw)
+    except (TypeError, ValueError):
+        return int(future_len)
+
+    if step <= 0:
+        return int(future_len)
+
+    return int(min(step, int(future_len)))
+
 
 def _predict_one_rollout_sequential(
     args: Any,
@@ -1905,6 +1940,10 @@ def _predict_one_rollout_sequential(
 
     future_len: int = int(getattr(args, "future_len"))
 
+    # ✅ 추가: 이번 롤아웃에서 "최대 몇 칸까지만" 진행할지
+    scenario_finish_step_limit: int = _get_scenario_finish_step_limit(
+        args, future_len=int(future_len))
+
     # norm_inputs는 공유 객체일 수 있으니, rollout 내부에서는 얕은 복사본을 사용합니다.
     norm_inputs_copy_init: Dict[str, Any] = dict(norm_inputs)
     # unnorm_inputs_copy: 값들이 "원래 단위"인 dict (B 기준)
@@ -1929,8 +1968,8 @@ def _predict_one_rollout_sequential(
         step_count = 0
         step_start = 0
 
-        while step_start < future_len:
-            remaining = int(future_len - step_start)
+        while step_start < int(scenario_finish_step_limit):
+            remaining = int(scenario_finish_step_limit - step_start)
             gap = int(min(time_chunk_size, remaining))
 
             # norm_inputs_step: 현재 step에서 모델에 넣을 정규화 입력
@@ -2027,11 +2066,6 @@ def _predict_one_rollout_sequential(
                         sample_idx_offset
                     ),  # npz 파일명 충돌 방지용 오프셋(보통 rollout_idx * B).
                 )
-
-                limit_steps = int(
-                    getattr(args, "rollout_step_count_for_save", -1))
-                if limit_steps > 0 and step_count_for_save >= limit_steps:
-                    break
 
             # ✅ execute: 앞 gap 스텝 반영
             # unnorm_best_traj: (B, 1+Pnn, 1+future_len, 4)
