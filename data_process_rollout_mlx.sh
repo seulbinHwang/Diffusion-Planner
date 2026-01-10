@@ -71,7 +71,7 @@ else
 fi
 
 RUN_ID=$(date +%Y%m%d-%H%M%S)
-LOG_DIR="${WOMD_PATH}/logs/$RUN_ID"
+LOG_DIR="${USER_PATH}/logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
 
 # 디버그: 파이썬/CPP 스택, NCCL 조기실패
