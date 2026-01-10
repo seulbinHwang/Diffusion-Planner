@@ -528,33 +528,6 @@ def _safe_remove_file_if_exists(file_path: str) -> bool:
         return False
 
 
-def _get_visualization_budget_counter_path(args: Any) -> Optional[str]:
-    """이번 실행(run_count)에서 공유할 '카운터 파일' 경로를 만듭니다.
-
-    이 파일은 여러 프로세스가 같은 위치를 봐야 하므로,
-    모든 프로세스가 공유하는 폴더(여기서는 args.save_path) 아래에 둡니다.
-
-    Args:
-        args (Any):
-            - args.save_path (str): 저장 폴더
-            - args.eval_method (str): validation/test 등(파일 이름 구분용)
-            - args.run_count (int): 이번 실행 번호(파일 이름 구분용)
-
-    Returns:
-        Optional[str]:
-            카운터 파일 경로.
-            save_path가 없으면 None.
-    """
-    save_path = getattr(args, "save_path", None)
-    if not isinstance(save_path, str) or not save_path:
-        return None
-
-    eval_method = str(getattr(args, "eval_method", "eval"))
-    run_count = _get_run_count(args)
-
-    # run_count마다 파일을 분리 → "이번 실행" 단위로 제한이 적용됨
-    file_name = f".dp_vis_budget_{eval_method}_run{run_count}.json"
-    return os.path.join(save_path, file_name)
 
 
 def _read_count_from_json_text(text: str) -> int:
@@ -640,7 +613,7 @@ def model_validation(
             args,
             args.eval_set,
             args.eval_set_list,
-            args.eval_method,
+            "validation",
             world_size,
             global_rank,
         )
