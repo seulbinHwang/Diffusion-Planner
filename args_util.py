@@ -414,6 +414,7 @@ def get_args():
                         type=float,
                         help='encoder drop out rate',
                         default=0.1)
+
     parser.add_argument('--decoder_drop_path_rate',
                         type=float,
                         help='decoder drop out rate',
@@ -599,6 +600,9 @@ def get_args():
     parser.add_argument('--die_all', default=True, type=boolean)
     parser.add_argument('--select_jointly', default=True, type=boolean)
     parser.add_argument('--use_recovery', default=False, type=boolean)
+    parser.add_argument('--recovery_threshold_m',
+                        type=float,
+                        default=3.)
     args = parser.parse_args()
     # ★ stage config(json/yaml)로 CLI 인자 덮어쓰기
     args = _override_args_with_stage_config(args)

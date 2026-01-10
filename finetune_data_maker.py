@@ -3248,8 +3248,7 @@ def _apply_recovery_if_needed(
     if not args.use_recovery:
         return unnorm_selected_traj, gt_valid_mask
 
-    threshold_m = 3.0  # 논문 값 고정
-    trigger = expert_distance_m > float(threshold_m)  # (B_all, 1+Pnn)
+    trigger = expert_distance_m > float(args.recovery_threshold_m)  # (B_all, 1+Pnn)
 
     if not torch.any(trigger):
         return unnorm_selected_traj, gt_valid_mask

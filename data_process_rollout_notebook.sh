@@ -181,7 +181,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --total_save_image_trial_num 30000 \
   --rollout_time_chunk_size 5 \
   --fine_tune_temperature 0.8 \
-  --use_recovery False \
-  --select_jointly False
+  --use_recovery True \
+  --select_jointly True \
+  -recovery_threshold_m 2.0 \
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
