@@ -3046,6 +3046,8 @@ def _select_best_trajectory_by_sample_k(
                 cand_count=int(group_count),
                 seed_stride=int(seed_stride),
             )
+            a_cand_dist_batch = cand_dist_batch[:, 0, 0]
+            print("a_cand_dist_batch:", a_cand_dist_batch)
 
         except BaseException as e:
             # ✅ OOM이면 절반으로 줄이고 같은 cand_start에서 다시 시도
