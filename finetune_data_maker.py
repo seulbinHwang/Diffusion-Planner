@@ -1393,12 +1393,11 @@ def _maybe_draw_rollout_visualization_frame(
 
     _draw_one_batch_one_rollout(
         save_dir=str(state.save_dir),
-        unnorm_inputs_np=a_unnorm_inputs_np,
-        unnorm_trajectory_np=a_unnorm_trajectory_np,  # shape: ((1+)Pnn, 1+T, 4)
-        ego_future_gt_4_dim=
-        a_unnorm_near_future_gt_3_dim,  # shape: (future_len, 4)
-        near_future_gt_3_dim=
-        a_unnorm_ego_future_gt_4_dim,  # shape: (Pnn, future_len, 3)
+        a_unnorm_inputs_np=a_unnorm_inputs_np,
+        a_unnorm_trajectory_np=a_unnorm_trajectory_np,  # shape: ((1+)Pnn, 1+T, 4)
+        a_unnorm_ego_future_gt_4_dim=a_unnorm_ego_future_gt_4_dim,  # shape: (future_len, 4)
+        a_unnorm_near_future_gt_3_dim=
+        a_unnorm_near_future_gt_3_dim,  # shape: (Pnn, future_len, 3)
         step_idx=int(step_idx),
         draw_near_target_id=state.draw_near_target_id,  # shape: (Pnn,)
     )
@@ -2944,8 +2943,8 @@ def _draw_one_batch_one_rollout(
         save_dir: str,
         a_unnorm_inputs_np: Dict[str, Any],
         a_unnorm_trajectory_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
-        a_unnorm_near_future_gt_3_dim: np.ndarray,  # (future_len, 4)
-        a_unnorm_ego_future_gt_4_dim: np.ndarray,  # (Pnn, future_len, 3)
+        a_unnorm_ego_future_gt_4_dim: np.ndarray,  # (future_len, 4)
+        a_unnorm_near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
         step_idx: int,
         draw_near_target_id: torch.Tensor,  # (Pnn,)
 ) -> None:
@@ -2966,6 +2965,7 @@ def _draw_one_batch_one_rollout(
 
 
     """
+    ###############################
     ego_current = a_unnorm_inputs_np["ego_agent_past"][-1]  # (11)
     # ego_future_11 : (1+T, 11)
     ego_future_11 = _get_ego_future_11(ego_current, a_unnorm_trajectory_np)
@@ -2973,15 +2973,8 @@ def _draw_one_batch_one_rollout(
     output_data["ego_next_wp_wrt_ego"] = ego_future_11[1]
     ###############################
     ego_gt_future_11 = ego_future_11[1:, :].copy()
-    ego_gt_future_11[:, 0:4] = a_unnorm_near_future_gt_3_dim  # (future_len, 4)
+    ego_gt_future_11[:, 0:4] = a_unnorm_ego_future_gt_4_dim  # (future_len, 4)
     a_unnorm_inputs_np["ego_future_gt_11_dim"] = ego_gt_future_11  # (T, 11)
-    diff_token_to_future_gt_3_dim = {}
-    for target_id, gt_future_3 in zip(draw_near_target_id,
-                                      a_unnorm_ego_future_gt_4_dim):
-        diff_token_to_future_gt_3_dim[
-            f"{target_id}"] = gt_future_3  # (future_len, 3)
-    a_unnorm_inputs_np[
-        "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim
     ###############################
     near_agents_current = a_unnorm_inputs_np[
         "near_agents_past"][:, -1, :]  # (Pnn, 11)
@@ -2994,6 +2987,16 @@ def _draw_one_batch_one_rollout(
         diff_token_to_np_int_traj_11_wrt_ego[f"{target_id}"] = np_int_traj_11
     output_data[
         "diff_token_to_np_int_traj_11_wrt_ego"] = diff_token_to_np_int_traj_11_wrt_ego
+    ###############################
+    diff_token_to_future_gt_3_dim = {}
+    for target_id, gt_future_3 in zip(draw_near_target_id,
+                                      a_unnorm_near_future_gt_3_dim):
+        diff_token_to_future_gt_3_dim[
+            f"{target_id}"] = gt_future_3  # (future_len, 3)
+    a_unnorm_inputs_np[
+        "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim
+    ###############################
+
     draw_machine_fast.draw_world_model_to_png(a_unnorm_inputs_np,
                                               output_data=output_data,
                                               save_path=os.path.join(
