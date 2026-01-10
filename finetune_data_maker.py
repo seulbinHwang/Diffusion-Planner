@@ -1212,13 +1212,14 @@ def _shrink_batch_to_draw_idx(
     unnorm_inputs_copy: Dict[str, Any],
     draw_batch_idx: int,
 ) -> Dict[str, Any]:
+    a_unnorm_inputs_copy = {}
     for k, v in unnorm_inputs_copy.items():
         if isinstance(v, torch.Tensor):
-            unnorm_inputs_copy[k] = v[draw_batch_idx]
+            a_unnorm_inputs_copy[k] = v[draw_batch_idx]
         elif isinstance(v, list):
-            unnorm_inputs_copy[k] = [v[draw_batch_idx]]
+            a_unnorm_inputs_copy[k] = [v[draw_batch_idx]]
     #
-    return unnorm_inputs_copy
+    return a_unnorm_inputs_copy
 
 
 def _torch_to_numpy(inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -1450,7 +1451,14 @@ def _prepare_data_for_draw(
             - target_id: 길이 (1+Pnn) 리스트
     """
     draw_scenario_id = norm_inputs["scenario_id"][draw_batch_idx]  # str
-    draw_target_id = norm_inputs["target_id"][draw_batch_idx]  # ((1+)Pnn)
+    target_id = norm_inputs.get("target_id", None)
+    if target_id is not None:
+        draw_target_id = target_id[draw_batch_idx]  # ((1+)Pnn)
+    else:
+        # manually set draw_target_id as 0, 1, ..., Pnn
+        one_Pnn = len(norm_inputs["near_agents_past"][draw_batch_idx])
+        draw_target_id = torch.arange(0, one_Pnn + 1)  # ((1+)Pnn)
+
     draw_near_target_id = draw_target_id[1:]  # (Pnn,)
 
     save_dir = os.path.join(args.save_cache_path,
@@ -1899,7 +1907,6 @@ def _predict_one_rollout_sequential(
 
     # norm_inputs는 공유 객체일 수 있으니, rollout 내부에서는 얕은 복사본을 사용합니다.
     norm_inputs_copy_init: Dict[str, Any] = dict(norm_inputs)
-
     # unnorm_inputs_copy: 값들이 "원래 단위"인 dict (B 기준)
     unnorm_inputs_copy: Dict[str, Any] = _initialize_unnorm_inputs_for_rollout(
         norm_inputs_copy=norm_inputs_copy_init,
@@ -1998,7 +2005,6 @@ def _predict_one_rollout_sequential(
                 state_normalizer=state_normalizer,
                 step_idx=int(step_start),
             )
-
             # ✅ npz 저장 (execute 전)
             step_count_for_save = int(step_count) + 1
             if args.save_inference_data:
@@ -2013,7 +2019,6 @@ def _predict_one_rollout_sequential(
                     "ego_future_gt_4_dim"] = demo_ego_future_4_dim  # (B, future_len, 4)
                 unnorm_inputs_for_save[
                     "near_future_gt_4_dim"] = demo_near_future_4_dim  # (B, Pnn, future_len, 4)
-
                 _save_inference_data(
                     args.save_cache_path,
                     unnorm_inputs_for_save,
@@ -2174,6 +2179,8 @@ def _save_inference_data(
         "ego_future_gt_4_dim"]  # (B, future_len, 4)
     # batch_size: (B)
     batch_size = int(ego_future_gt_4_dim.shape[0])
+
+
 
     unnorm_inputs_np = _gpu_tensor_to_cpu_np(
         unnorm_inputs_copy=unnorm_inputs_copy,

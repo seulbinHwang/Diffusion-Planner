@@ -570,6 +570,9 @@ def get_args():
     parser.add_argument('--time_step_for_compare',
                         type=int,
                         default=20)
+    parser.add_argument('--time_step_for_recover',
+                        type=int,
+                        default=30)
     parser.add_argument('--shuffle_scenarios',
                         type=boolean,
                         default=False,
