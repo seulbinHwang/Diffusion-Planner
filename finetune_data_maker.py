@@ -613,7 +613,7 @@ def model_validation(
             args,
             args.eval_set,
             args.eval_set_list,
-            "validation",
+            "fine_tuning",
             world_size,
             global_rank,
         )
