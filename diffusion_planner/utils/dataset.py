@@ -340,7 +340,9 @@ class DiffusionPlannerData(Dataset):
                 data_list=loaded_list,
                 use_data_percent=use_data_percent,
             )
-
+        print( f"[DiffusionPlannerData] Loaded {len(loaded_list)} items from '{data_list}'")
+        print( f"[DiffusionPlannerData] Using first {keep_count} items ({normalized_percent:.2f}%)")
+        raise NotImplementedError("DiffusionPlannerData is not implemented yet.")
         self.data_list = selected_list
         self.predicted_neighbor_num = predicted_neighbor_num
         self.eval_method = eval_method
