@@ -2,7 +2,7 @@ import os
 from typing import Tuple
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
-import args_util
+from diffusion_planner.utils.data_augmentation import StatePerturbation
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
@@ -44,7 +44,7 @@ from tools.predictor_utils import (
     effective_global_batch,
     init_distributed,
     maybe_resume_from_checkpoint,
-safe_get_artifacts,
+    safe_get_artifacts,
 )
 from tools.predictor_utils import (build_dataset_and_sampler, build_data_loader,
                                    create_diffusion_planner_and_ema,

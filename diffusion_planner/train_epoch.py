@@ -1,5 +1,5 @@
 from tqdm import tqdm
-import torch
+import numpy as np
 from torch import nn
 from typing import Tuple
 from diffusion_planner.utils.data_augmentation import StatePerturbation
@@ -209,6 +209,64 @@ def _clip_input_axes_by_args(
                                     keep_agents_for_route)
 
 
+def assert_cur_future_valid_mask_np(
+    valid_bpt: np.ndarray,
+    context: str = "savgol_filter_for_control",
+) -> None:
+    """
+    유효 마스크가 각 (b,p) 행마다 True*False* (단조 감소)인지 검증 (NumPy 버전).
+
+    Args:
+        valid_bpt (np.ndarray):
+            shape: (B, Pnn, T1)
+            dtype: bool 권장 (또는 0/1 int/float 등도 허용)
+            - True(또는 1): 유효
+            - False(또는 0): 무효
+        context (str):
+            에러 메시지에 표시할 호출 위치 문자열.
+
+    Raises:
+        ValueError:
+            0→1 전이(False→True)가 하나라도 발견되면 발생합니다.
+            (예: True, False, True ... / False, True ... 형태는 금지)
+    """
+    v0 = np.asarray(valid_bpt)
+
+    if v0.ndim != 3:
+        raise AssertionError("valid_bpt는 (B,Pnn,T1) 여야 합니다.", v0.shape)
+
+    B, Pnn, T1 = v0.shape
+    if Pnn == 0 or T1 <= 1:
+        # 검사할 행이 없거나, 시간축이 1 이하이면 0→1 전이를 정의하기 어려우므로 통과
+        return
+
+    # bool이 아니면 0/비0 기준으로 bool 변환
+    v_bool = v0 if v0.dtype == np.bool_ else (v0 != 0)
+
+    # (B*Pnn, T1) int8로 변환
+    v = v_bool.reshape(-1, T1).astype(np.int8)
+
+    # d[t] = v[t+1] - v[t], 0→1이면 +1
+    d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
+    has_01 = (d > 0).any(axis=1)  # (B*Pnn,)
+
+    if np.any(has_01):
+        bad_idx = np.nonzero(has_01)[0]  # (N_bad,)
+        max_show = min(int(bad_idx.size), 8)
+        bad_idx_sample = bad_idx[:max_show]
+
+        b_list = (bad_idx_sample // Pnn).tolist()
+        p_list = (bad_idx_sample % Pnn).tolist()
+        print("valid_bpt:", valid_bpt)
+        raise ValueError(
+            f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*). \n"
+            f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.size)},  \n"
+            f"example (b,p)={list(zip(b_list, p_list))}.  \n"
+            f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
+        )
+
+
+
 def _prepare_batch_for_device(
     batch: Dict[str, torch.Tensor],
     device: str,
@@ -235,7 +293,6 @@ def _prepare_batch_for_device(
     를 수행한다.
     """
     batch_on_device: Dict[str, Any] = _move_batch_to_device(batch, device)
-
     aro = batch_on_device.get("agent_route_lane_order", None)
     if isinstance(aro, torch.Tensor):
         batch_on_device["agent_route_lane_order"] = aro.long()
@@ -270,11 +327,20 @@ def _prepare_batch_for_device(
                     dim=-1,
                 )  # (B, future_len, 4)
                 # ego_future_mask: (B, future_len)
+                ego_future_gt_11_dim = batch_on_device.get("planner_future_11_dim", None)
                 ego_future_mask: torch.Tensor = torch.sum(
-                    torch.ne(ego_future_gt_3_dim[..., :3], 0),
+                    torch.ne(ego_future_gt_11_dim[..., :8], 0),
                     dim=-1,
                 ) == 0
                 ego_future_gt_4_dim[ego_future_mask] = 0.0
+
+                # DEBUG
+                ego_future_valid = ~ego_future_mask  # (B, future_len)  True=유효
+                ego_future_valid_np = ego_future_valid.cpu().numpy()
+
+                assert_cur_future_valid_mask_np(
+                    ego_future_valid_np[None, ...],
+                    context="_prepare_batch_for_device")
 
                 ego_future_len = ego_future_gt_3_dim.shape[1]
                 assert ego_future_len == args.future_len, \

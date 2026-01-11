@@ -37,13 +37,15 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 ###################################
 # User Configuration Section
 ###################################
-RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
+RUN_PYTHON_PATH="/home/user/miniforge3/envs/diffusion_planner/bin/python"
 TRAIN_SET_PATH="${NUPLAN_PATH}/dataset/processed_rollout"
-TRAIN_SET_LIST_PATH="${NUPLAN_PATH}/projects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
+TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
 ###################################
+STAGE1_CFG="configs/fine_tuning1.yaml"
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --batch_size 2
+  --stage_config_path "${STAGE1_CFG}" \
+  --batch_size 2 \

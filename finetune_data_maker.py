@@ -2119,8 +2119,22 @@ def _predict_rollouts_sequential(
     ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]  # (B, future_len, 4)
     near_future_gt_4_dim = outputs[
         "near_future_gt_4_dim"]  # (B, Pnn, future_len, 4)
+    # DEBUG
+    ego_future_gt_4_dim_np = ego_future_gt_4_dim.cpu().numpy()
+    ego_future_valid_mask = np.any(ego_future_gt_4_dim_np[..., 0:4] != 0,
+                                   axis=-1)  # (future_len, )
+    assert_cur_future_valid_mask_np(ego_future_valid_mask[None, ...],
+                                    context="_predict_rollouts_sequential_0")
 
-    norm_inputs["ego_future_gt_4_dim"] = state_normalizer(ego_future_gt_4_dim)
+    norm_ego_future_gt_4_dim = state_normalizer(ego_future_gt_4_dim)
+    norm_inputs["ego_future_gt_4_dim"] = norm_ego_future_gt_4_dim
+
+    # DEBUG
+    norm_ego_future_gt_4_dim_np = norm_ego_future_gt_4_dim.cpu().numpy()
+    ego_future_valid_mask = np.any(norm_ego_future_gt_4_dim_np[..., 0:4] != 0,
+                                   axis=-1)  # (future_len, )
+    assert_cur_future_valid_mask_np(ego_future_valid_mask[None, ...],
+                                    context="_predict_rollouts_sequential")
     norm_inputs["near_future_gt_4_dim"] = state_normalizer(near_future_gt_4_dim)
 
     draw_batch_idx = int(getattr(args, "draw_batch_idx", 0))
@@ -2150,6 +2164,63 @@ def _predict_rollouts_sequential(
             draw_batch_idx=int(draw_batch_idx),
         )
 
+
+
+def assert_cur_future_valid_mask_np(
+    valid_bpt: np.ndarray,
+    context: str = "savgol_filter_for_control",
+) -> None:
+    """
+    유효 마스크가 각 (b,p) 행마다 True*False* (단조 감소)인지 검증 (NumPy 버전).
+
+    Args:
+        valid_bpt (np.ndarray):
+            shape: (B, Pnn, T1)
+            dtype: bool 권장 (또는 0/1 int/float 등도 허용)
+            - True(또는 1): 유효
+            - False(또는 0): 무효
+        context (str):
+            에러 메시지에 표시할 호출 위치 문자열.
+
+    Raises:
+        ValueError:
+            0→1 전이(False→True)가 하나라도 발견되면 발생합니다.
+            (예: True, False, True ... / False, True ... 형태는 금지)
+    """
+    v0 = np.asarray(valid_bpt)
+
+    if v0.ndim != 3:
+        raise AssertionError("valid_bpt는 (B,Pnn,T1) 여야 합니다.", v0.shape)
+
+    B, Pnn, T1 = v0.shape
+    if Pnn == 0 or T1 <= 1:
+        # 검사할 행이 없거나, 시간축이 1 이하이면 0→1 전이를 정의하기 어려우므로 통과
+        return
+
+    # bool이 아니면 0/비0 기준으로 bool 변환
+    v_bool = v0 if v0.dtype == np.bool_ else (v0 != 0)
+
+    # (B*Pnn, T1) int8로 변환
+    v = v_bool.reshape(-1, T1).astype(np.int8)
+
+    # d[t] = v[t+1] - v[t], 0→1이면 +1
+    d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
+    has_01 = (d > 0).any(axis=1)  # (B*Pnn,)
+
+    if np.any(has_01):
+        bad_idx = np.nonzero(has_01)[0]  # (N_bad,)
+        max_show = min(int(bad_idx.size), 8)
+        bad_idx_sample = bad_idx[:max_show]
+
+        b_list = (bad_idx_sample // Pnn).tolist()
+        p_list = (bad_idx_sample % Pnn).tolist()
+        print("valid_bpt:", valid_bpt)
+        raise ValueError(
+            f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*). \n"
+            f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.size)},  \n"
+            f"example (b,p)={list(zip(b_list, p_list))}.  \n"
+            f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
+        )
 
 def _save_inference_data(
     dir: str,
@@ -2248,6 +2319,28 @@ def _save_inference_data(
                                    a_inputs_copy_dict)
         npz_payload_dict = _remove_invalid_data(npz_payload_dict)
 
+        # DEBUG
+        ego_agent_past = npz_payload_dict["ego_agent_past"] # (time_len(1+past_len), 11)
+        planner_future_11_dim = npz_payload_dict["ego_future_gt_11_dim"] # (future_len, 11)
+        ego_agent_all = np.concatenate(
+            [ego_agent_past, planner_future_11_dim],
+            axis=0,
+        )  # (time_len + future_len, 11)
+        ego_agent_all_is_valid = np.any(ego_agent_all[..., 0:8] != 0, axis=-1)  # (time_len + future_len, )
+        past_len= ego_agent_past.shape[0] - 1
+        ego_agent_cur_future_is_valid = ego_agent_all_is_valid[ past_len:]  # (1 + future_len, )
+        assert_cur_future_valid_mask_np(ego_agent_cur_future_is_valid[None, None, ...], context="ego")
+        near_agents_past = npz_payload_dict["neighbor_agents_past"] # (Pnn, time_len, 11)
+        near_future_gt_3_dim = npz_payload_dict["neighbor_future_gt_3_dim"] # (Pnn, future_len, 3)
+        near_agents_cur = near_agents_past[:, -1, :]  # (Pnn, 11)
+        near_agents_cur_is_valid = np.any(near_agents_cur[..., 0:8] != 0, axis=-1)  # (Pnn, )
+        near_future_gt_3_dim_is_valid = np.any(near_future_gt_3_dim[..., 0:3] != 0, axis=-1)  # (Pnn, future_len)
+        near_agent_cur_fut_is_valid = np.concatenate(
+            [near_agents_cur_is_valid[:, np.newaxis],
+             near_future_gt_3_dim_is_valid],
+            axis=1,
+        )  # (Pnn, 1 + future_len)
+        assert_cur_future_valid_mask_np(near_agent_cur_fut_is_valid[None, ...], context="npc")
         try:
             with open(tmp_path, "wb") as f:
                 np.savez_compressed(f, **npz_payload_dict)
