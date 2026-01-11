@@ -137,7 +137,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --recovery_threshold_m 1. \
   --scenario_finish_step 20 \
   --time_step_for_compare 60 \
-  --use_data_percent 5 \
+  --use_data_percent 10 \
   --rollout_number 3
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
