@@ -1,18 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
+export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
 
-###################################
-# User Configuration Section
-###################################
 NUPLAN_PATH="/home/user/nuplan"
-RUN_PYTHON_PATH="/home/user/miniforge3/envs/diffusion_planner/bin/python"
-TRAIN_SET_PATH="${NUPLAN_PATH}/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="${NUPLAN_PATH}/projects/Diffusion-Planner/diffusion_planner_training.json"
-TRAIN_SET_NAME="processed_route_with_small"
-TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
-###################################
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 LOG_DIR="${NUPLAN_PATH}/logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
@@ -43,15 +34,16 @@ fi
 export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
+###################################
+# User Configuration Section
+###################################
+RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
+TRAIN_SET_PATH="${NUPLAN_PATH}/dataset/processed_rollout"
+TRAIN_SET_LIST_PATH="${NUPLAN_PATH}/projects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
+###################################
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  train_predictor.py \
- --port 23001 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "test_notebook" \
-  --batch_size 32 \
-  --profile_feasible false \
-  --use_vel_input true \
-  "$@"
-#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
+  --batch_size 2
