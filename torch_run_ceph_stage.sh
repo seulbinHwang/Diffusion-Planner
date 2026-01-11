@@ -39,58 +39,17 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 # User Configuration Section
 ###################################
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+TRAIN_SET_PATH="/mnt/nuplan/dataset/processed_rollout"   # 디렉터리 자체는 유지, 내용만 비움
+TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
 ###################################
 
 
-STAGE1_CFG="configs/stage1.yaml"
-STAGE2_CFG="configs/stage2.yaml"
-STAGE3_CFG="configs/stage3.yaml"
+STAGE1_CFG="configs/fine_tuning1.yaml"
 
-########################################
-# Stage 1: 작은 장면 + end-to-end pretrain
-########################################
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
 --nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" \
  --redirects 3 --tee "$TEE" \
  train_predictor.py \
- --port 23001 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --stage_config_path "${STAGE1_CFG}" \
-  --use_deepspeed true \
-  "$@"
-
-
-########################################
-# Stage 2: 150m full context + encoder_local freeze
-#  - W&B artifact(dp_world_model_latest-model:latest)에서 weight 가져와서 시작
-########################################
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" \
- --redirects 3 --tee "$TEE" \
- train_predictor.py \
- --port 23001 \
-  --train_set "$TRAIN_SET_PATH"/ \
-  --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --resume_wandb_model_name latest \
-  --stage_config_path "${STAGE2_CFG}" \
-  --use_deepspeed true \
-  "$@"
-
-########################################
-# Stage 3: full-unfreeze + encoder_local lr 0.1배
-#  - 다시 동일 collection(dp_world_model_latest-model)의 latest에서 시작
-########################################
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" \
- --redirects 3 --tee "$TEE" \
- train_predictor.py \
- --port 23001 \
-  --train_set "$TRAIN_SET_PATH"/ \
-  --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --resume_wandb_model_name latest \
-  --stage_config_path "${STAGE3_CFG}" \
-  --use_deepspeed true \
-  "$@"
+  --stage_config_path "${STAGE1_CFG}"

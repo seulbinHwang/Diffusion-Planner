@@ -1585,7 +1585,6 @@ def _log_and_save(
     model_ema: Optional[ModelEma],
     best_loss: float,
     global_rank: int,
-    epoch_wosac_metrics: Optional[Dict[str, float]],
 ) -> float:
     """rank 0 프로세스에서만 로그 기록과 체크포인트 저장을 담당한다.
 
@@ -1662,9 +1661,6 @@ def _log_and_save(
 
     # 1) 메트릭 로그
     if global_rank == 0:
-        if epoch_wosac_metrics is not None:
-            for k, v in epoch_wosac_metrics.items():
-                metrics[k] = v
         wandb_logger.log_metrics(metrics, step=epoch + 1)
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
@@ -1978,7 +1974,6 @@ def _run_training_loop(
     model_ema: Optional[ModelEma],
     train_loader: DataLoader,
     train_sampler: DistributedSampler,
-    validation_loader: DataLoader,
     wandb_logger: Logger,
     best_loss: float,
     global_rank: int,
@@ -1995,7 +1990,6 @@ def _run_training_loop(
         args,
         batch_num_in_epoch=len(train_loader),
     )
-    batch_num_in_one_val_epoch: int = max(1, len(validation_loader))
     for epoch in range(init_epoch, train_epochs):
         # ✅ (중요) epoch 시작 전에 sampler epoch를 먼저 세팅
         # - resume(init_epoch>0) 시에도 첫 epoch부터 올바른 shuffle이 나오도록 함
@@ -2049,33 +2043,6 @@ def _run_training_loop(
             loss_dict=loss_dict,
             speed_info=speed_info,
         )
-
-        # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
-        save_interval: int = max(1, int(args.save_utd))
-        is_first_epoch: bool = (epoch == 0)
-
-        # 첫 epoch(=epoch 0)은 무조건 저장, 그 이후에는 save_utd 주기로 저장
-        # if (is_first_epoch) or ((epoch + 1) % save_interval == 0):
-        #     # TODO: WOSAC 여기서 validation dataset으로 1 epoch 평가 수행
-        #     # Dict[str, torch.Tensor]
-        #     (epoch_wosac_metrics, epoch_elapsed_time_sec) = validate_one_epoch(
-        #         epoch=0,
-        #         total_epochs=1,
-        #         validation_loader=validation_loader,
-        #         diffusion_planner=diffusion_planner,
-        #         args=args,
-        #         model_ema=model_ema,
-        #         batch_num_in_one_val_epoch=batch_num_in_one_val_epoch,
-        #         wosac_metrics=wosac_metrics,
-        #         min_ade=min_ade,
-        #     )
-        #     if global_rank == 0:
-        #         # print "epoch_elapsed_time_sec"
-        #         print(f"[Validation] Epoch {epoch + 1} completed in "
-        #               f"{epoch_elapsed_time_sec:.2f} sec.")
-        # else:
-        #     epoch_wosac_metrics = None
-        epoch_wosac_metrics = None
         best_loss = _log_and_save(
             epoch=epoch,
             args=args,
@@ -2088,7 +2055,6 @@ def _run_training_loop(
             model_ema=model_ema,
             best_loss=best_loss,
             global_rank=global_rank,
-            epoch_wosac_metrics=epoch_wosac_metrics,
         )
 
     return best_loss
@@ -2208,14 +2174,6 @@ def model_training(
         world_size,
         global_rank,
     )
-    validation_set, validation_sampler = build_dataset_and_sampler(
-        args,
-        args.validation_set,
-        args.validation_set_list,
-        "validation",
-        world_size,
-        global_rank,
-    )
 
     # 4) warmup step 계산
     warmup_steps_at_B0, warmup_steps = _compute_warmup_steps(
@@ -2230,13 +2188,6 @@ def model_training(
         args,
         train_set,
         train_sampler,
-        batch_size,
-        world_size,
-    )
-    validation_loader = build_data_loader(
-        args,
-        validation_set,
-        validation_sampler,
         batch_size,
         world_size,
     )
@@ -2326,7 +2277,6 @@ def model_training(
         model_ema=model_ema,
         train_loader=train_loader,
         train_sampler=train_sampler,
-        validation_loader=validation_loader,
         wandb_logger=wandb_logger,
         best_loss=best_loss,
         global_rank=global_rank,
