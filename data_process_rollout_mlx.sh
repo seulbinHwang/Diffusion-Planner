@@ -134,8 +134,9 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --fine_tune_temperature 0.8 \
   --use_recovery True \
   --select_jointly True \
-  --recovery_threshold_m 1.5 \
-  --scenario_finish_step 40 \
+  --recovery_threshold_m 1. \
+  --scenario_finish_step 30 \
+  --time_step_for_compare 60 \
   --use_data_percent 5 \
   --rollout_number 3
 
