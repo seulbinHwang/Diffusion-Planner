@@ -2131,11 +2131,15 @@ def build_dataset_and_sampler(
 
     # ✅ eval/validation/test: 패딩/드랍 없는 방식
     else:
+        if eval_method_lower == "fine_tuning":
+            shuffle_ = True
+        else:
+            shuffle_ = False
         data_sampler = NoPaddingDistributedEvalSampler(
             dataset=data_set,
             num_replicas=int(max(1, world_size)),
             rank=int(global_rank),
-            shuffle=False,  # 평가에서는 보통 고정 순서 권장
+            shuffle=shuffle_,  # 평가에서는 보통 고정 순서 권장
             seed=int(args.seed),
         )
         return data_set, data_sampler
