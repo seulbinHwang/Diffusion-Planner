@@ -2219,6 +2219,40 @@ def model_training(
         use_deepspeed=use_deepspeed,
     )
 
+    # ✅ (핵심) DeepSpeed + model-only 재시작인 경우:
+    #    checkpoint(모델/EMA) 로드를 DeepSpeed initialize 이전에 수행한다.
+    resume_model_only_pre_ds_init: bool = bool(
+        use_deepspeed and bool(getattr(args, "resume_model_only", False)) and
+        (getattr(args, "resume_wandb_model_name", None) is not None)
+    )
+
+    init_epoch: int = 0
+    wandb_id: Optional[str] = None
+    train_epochs: int = int(args.train_epochs)
+    allow_val_change: bool = False
+
+    if resume_model_only_pre_ds_init:
+        if global_rank == 0:
+            print("[DeepSpeed][ModelOnly] checkpoint를 DeepSpeed initialize 이전에 로드합니다.")
+        (
+            diffusion_planner,
+            _,
+            _,
+            model_ema,
+            init_epoch,
+            wandb_id,
+            train_epochs,
+            allow_val_change,
+        ) = maybe_resume_from_checkpoint(
+            args=args,
+            diffusion_planner=diffusion_planner,
+            optimizer=None,
+            scheduler=None,
+            model_ema=model_ema,
+            global_rank=global_rank,
+            use_deepspeed=use_deepspeed,
+        )
+
     optimizer = _build_optimizer_with_roles_from_args(
         base_model=base_model,
         args=args,
@@ -2243,16 +2277,27 @@ def model_training(
         )
 
     # 6) 체크포인트 재개
-    (diffusion_planner, optimizer, scheduler, model_ema, init_epoch, wandb_id,
-     train_epochs, allow_val_change) = maybe_resume_from_checkpoint(
-         args=args,
-         diffusion_planner=diffusion_planner,
-         optimizer=optimizer,
-         scheduler=scheduler,
-         model_ema=model_ema,
-         global_rank=global_rank,
-         use_deepspeed=use_deepspeed,
-     )
+    # - model-only + DeepSpeed는 위에서 이미 로드했으므로 여기서는 다시 로드하지 않는다.
+    if not resume_model_only_pre_ds_init:
+        (
+            diffusion_planner,
+            optimizer,
+            scheduler,
+            model_ema,
+            init_epoch,
+            wandb_id,
+            train_epochs,
+            allow_val_change,
+        ) = maybe_resume_from_checkpoint(
+            args=args,
+            diffusion_planner=diffusion_planner,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            model_ema=model_ema,
+            global_rank=global_rank,
+            use_deepspeed=use_deepspeed,
+        )
+
 
     _dump_args(args, global_rank)
 

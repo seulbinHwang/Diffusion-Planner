@@ -147,7 +147,6 @@ def _select_latest_like_tag(save_path: str) -> str:
 
     return tag
 
-
 def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
     save_path: str,
     diffusion_planner: nn.Module,
@@ -196,9 +195,7 @@ def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
     tag_dir = os.path.join(save_path, tag)
 
     # tag 디렉터리 안에서 *_model_states.pt 중 첫 번째를 찾는 방식
-    candidates = [
-        f for f in os.listdir(tag_dir) if f.endswith("_model_states.pt")
-    ]
+    candidates = [f for f in os.listdir(tag_dir) if f.endswith("_model_states.pt")]
     if not candidates:
         raise FileNotFoundError(f"No *_model_states.pt found in {tag_dir}")
 
@@ -206,25 +203,44 @@ def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
     ckpt_path = os.path.join(tag_dir, mp_rank_str)
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    state_like = ckpt.get("ema_state_dict", ckpt["module"])
+    # ✅ EMA state_dict 는 저장 방식에 따라 위치가 다를 수 있어 방어적으로 탐색한다.
+    # - (1) top-level "ema_state_dict" (드문 케이스)
+    # - (2) ckpt["client_state"]["ema_state_dict"] (DeepSpeed save_checkpoint(client_state=...)의 흔한 케이스)
+    # - (3) fallback: ckpt["module"] (기본 모델 가중치)
+    state_like: Optional[Dict[str, Any]] = None
+    state_source: str = "module"
 
-    base_model: nn.Module = getattr(diffusion_planner, "module",
-                                    diffusion_planner)
+    raw_ema_top = ckpt.get("ema_state_dict", None)
+    if isinstance(raw_ema_top, dict) and len(raw_ema_top) > 0:
+        state_like = raw_ema_top
+        state_source = "ema_state_dict(top-level)"
+
+    if state_like is None and "client_state" in ckpt:
+        cs = ckpt.get("client_state", None)
+        if isinstance(cs, dict):
+            raw_ema_cs = cs.get("ema_state_dict", None)
+            if isinstance(raw_ema_cs, dict) and len(raw_ema_cs) > 0:
+                state_like = raw_ema_cs
+                state_source = "ema_state_dict(client_state)"
+
+    if state_like is None:
+        if "module" not in ckpt:
+            raise KeyError(f"DeepSpeed model_states 파일에 'module' 키가 없습니다: {ckpt_path}")
+        state_like = ckpt["module"]
+        state_source = "module"
+
+    base_model: nn.Module = getattr(diffusion_planner, "module", diffusion_planner)
     incompatible = base_model.load_state_dict(state_like, strict=True)
 
     if global_rank == 0:
-        print(f"[ModelOnly<DeepSpeed>] LOAD MODEL PARAM from {ckpt_path}")
+        print(f"[ModelOnly<DeepSpeed>] LOAD MODEL PARAM from {ckpt_path} (source={state_source})")
         missing_keys = getattr(incompatible, "missing_keys", None)
         unexpected_keys = getattr(incompatible, "unexpected_keys", None)
         if missing_keys:
-            print(
-                f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}"
-            )
+            print(f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}")
             raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: missing keys exist.")
         if unexpected_keys:
-            print(
-                f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}"
-            )
+            print(f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}")
             raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: unexpected keys exist.")
         if not missing_keys and not unexpected_keys:
             print("[ModelOnly<DeepSpeed>] Model state load done")
@@ -238,6 +254,7 @@ def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
             p.requires_grad_(False)
 
     return model_ema
+
 
 
 def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:

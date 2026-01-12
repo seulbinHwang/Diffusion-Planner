@@ -414,6 +414,17 @@ class Encoder(nn.Module):
         # type_onehot: (ego, neighbor, static, lane, road_safety)
         self.pos_emb = nn.Linear(9, config.hidden_dim)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
+        # -----------------------------
+        # 로컬 인코더 출력 흔들림(무작위 꺼짐 동작)을 막기 위한 설정
+        # -----------------------------
+        # True면: 로컬 인코더 파라미터가 "전부" 고정된 경우, 로컬 인코더 서브모듈을 eval로 내려서
+        # 학습 모드에서만 발생하는 무작위 꺼짐 동작을 막습니다.
+        self._eval_frozen_encoder_local: bool = True
+
+        # None이면 자동 모드(위 규칙 사용).
+        # True면 무조건 로컬 인코더를 eval로 강제(디버깅/검증용).
+        # False면 로컬 인코더는 부모 모드(train/eval)를 그대로 따름.
+        self._force_encoder_local_eval: Optional[bool] = None
 
     def iter_encoder_local_parameters(self) -> Iterator[nn.Parameter]:
         """로컬 인코더(Group A)에 속한 파라미터들을 순서대로 돌려줍니다.
@@ -452,6 +463,143 @@ class Encoder(nn.Module):
                 continue
             for param in module.parameters():
                 yield param
+
+    def set_eval_frozen_encoder_local_enabled(self, enabled: bool) -> None:
+        """로컬 인코더가 고정된 경우(eval로 내릴지) 정책을 켜거나 끕니다.
+
+        이 함수는 "로컬 인코더 파라미터를 전부 고정한 상태"에서,
+        학습 모드일 때도 로컬 인코더 결과가 매번 달라지는 문제를 줄이기 위한 스위치입니다.
+
+        동작 방식(쉽게 설명):
+            - enabled=True:
+                로컬 인코더 파라미터가 전부 고정(requires_grad=False)이라면,
+                전체 모델이 학습 모드여도 로컬 인코더 서브모듈만 평가 모드로 내려서
+                무작위로 값이 꺼지는 동작이 로컬 인코더에서 나오지 않게 합니다.
+            - enabled=False:
+                로컬 인코더 서브모듈도 부모 모드(train/eval)를 그대로 따릅니다.
+
+        Args:
+            enabled (bool): 위 정책을 사용할지 여부.
+        """
+        self._eval_frozen_encoder_local = bool(enabled)
+        self._sync_encoder_local_train_eval_mode()
+
+    def set_force_encoder_local_eval(self, force_eval: Optional[bool]) -> None:
+        """로컬 인코더를 항상 eval로 둘지(또는 항상 부모 모드를 따를지) 강제 설정합니다.
+
+        이 함수는 "파라미터를 얼렸다"를 lr=0 같은 방식으로 구현해서
+        requires_grad가 True로 남아 있는 경우에도,
+        로컬 인코더의 출력 흔들림(무작위 꺼짐 동작)을 확실히 막고 싶을 때 씁니다.
+
+        동작:
+            - force_eval=None:
+                자동 모드(로컬 파라미터가 전부 고정된 경우에만 eval로 내림)
+            - force_eval=True:
+                무조건 로컬 인코더 서브모듈을 eval로 둠
+            - force_eval=False:
+                무조건 로컬 인코더 서브모듈이 부모 모드(train/eval)를 그대로 따름
+
+        Args:
+            force_eval (Optional[bool]): 위 설명의 강제 값.
+        """
+        self._force_encoder_local_eval = force_eval
+        self._sync_encoder_local_train_eval_mode()
+
+    def are_encoder_local_parameters_frozen(self) -> bool:
+        """로컬 인코더 파라미터가 전부 '고정' 상태인지 확인합니다.
+
+        여기서 "고정"은 PyTorch의 파라미터 옵션인 `requires_grad=False`를 의미합니다.
+        (즉, 학습 중에 그 파라미터 값을 바꾸지 않는 상태)
+
+        Returns:
+            bool:
+                - 로컬 인코더에 속한 파라미터가 하나라도 있고,
+                  그 파라미터들이 전부 requires_grad=False 이면 True
+                - 그 외에는 False
+        """
+        has_any_param: bool = False
+        for p in self.iter_encoder_local_parameters():
+            # p: (out_dim, in_dim) 또는 (dim,) 또는 () 등 여러 형태 가능
+            has_any_param = True
+            if p.requires_grad:
+                return False
+        return has_any_param
+
+    def _encoder_local_modules(self) -> Tuple[nn.Module, ...]:
+        """로컬 인코더로 취급할 서브모듈 목록을 반환합니다.
+
+        Returns:
+            Tuple[nn.Module, ...]: 로컬 인코더에 해당하는 모듈들.
+        """
+        return (
+            self.agents_encoder,
+            self.static_encoder,
+            self.lane_encoder,
+            self.road_safety_encoder,
+            self.pos_emb,  # 선형층이라 모드 영향은 거의 없지만, 일관성 위해 포함
+        )
+
+    @staticmethod
+    def _set_modules_train_mode(modules: Iterable[nn.Module], mode: bool) -> None:
+        """주어진 모듈들을 한꺼번에 train/eval 모드로 바꿉니다.
+
+        Args:
+            modules (Iterable[nn.Module]): 모드 변경 대상 모듈들.
+            mode (bool): True면 학습 모드, False면 평가 모드.
+        """
+        for m in modules:
+            m.train(mode)
+
+    def _sync_encoder_local_train_eval_mode(self) -> None:
+        """현재 설정과 파라미터 고정 상태에 따라, 로컬 인코더 서브모듈의 모드를 맞춥니다.
+
+        목표(쉽게 설명):
+            - 전체 모델이 학습 모드(train)여도,
+              로컬 인코더가 "고정" 상태라면 로컬 인코더 내부에서
+              무작위로 일부 값이 꺼지는 동작이 나오지 않도록(=eval) 만든다.
+            - 반대로 로컬 인코더가 학습 대상이면(=하나라도 requires_grad=True),
+              로컬 인코더도 학습 모드를 유지한다.
+
+        Note:
+            - 이 함수는 값 자체를 바꾸지 않고 "모드(train/eval)만" 바꿉니다.
+            - 모드 변경은 Dropout/DropPath 같은 "학습 모드에서만 흔들리는 동작"을 막는 데 목적이 있습니다.
+        """
+        local_modules = self._encoder_local_modules()
+
+        # 1) 강제 설정이 있으면 그게 최우선
+        if self._force_encoder_local_eval is True:
+            self._set_modules_train_mode(local_modules, mode=False)
+            return
+        if self._force_encoder_local_eval is False:
+            self._set_modules_train_mode(local_modules, mode=bool(self.training))
+            return
+
+        # 2) 자동 모드: "로컬 파라미터가 전부 고정"일 때만 eval로 내림
+        if not self._eval_frozen_encoder_local:
+            self._set_modules_train_mode(local_modules, mode=bool(self.training))
+            return
+
+        local_is_frozen: bool = self.are_encoder_local_parameters_frozen()
+        if bool(self.training) and local_is_frozen:
+            # 전체는 train이어도, 로컬은 eval로 내려서 흔들림 방지
+            self._set_modules_train_mode(local_modules, mode=False)
+        else:
+            # 그 외는 부모 모드를 따름
+            self._set_modules_train_mode(local_modules, mode=bool(self.training))
+
+    def train(self, mode: bool = True) -> "Encoder":
+        """PyTorch train()/eval() 호출 시, 로컬 인코더 모드까지 함께 정리합니다.
+
+        Args:
+            mode (bool): True면 학습 모드, False면 평가 모드.
+
+        Returns:
+            Encoder: 자기 자신(self).
+        """
+        super().train(mode)
+        self._sync_encoder_local_train_eval_mode()
+        return self
+
 
     def _zero_with_touch(self, ref: torch.Tensor,
                          params: Iterable[torch.nn.Parameter]) -> torch.Tensor:
@@ -1629,6 +1777,8 @@ class Encoder(nn.Module):
                 - "near_agents_route_lane_emb":(B, Pnn, hidden_dim)
                 - "route_known_mask":          (B, Pnn)
         """
+        # 로컬 인코더가 고정돼 있으면, 학습 모드에서도 로컬만 eval로 내려 출력 흔들림을 막는다.
+        self._sync_encoder_local_train_eval_mode()
         device_type: str = inputs["ego_agent_past"].device.type
 
         with profile_block(
