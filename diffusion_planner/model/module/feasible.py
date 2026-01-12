@@ -3861,7 +3861,7 @@ class FeasibleProjector(nn.Module):
         """
         p = float(max(0.0, min(1.0, progress)))
         # piecewise-linear for integration weight
-        if p <= args.p_sat:
+        if p < args.p_sat:
             w_int = args.w_int_min + (args.w_int_max -
                                       args.w_int_min) * (p / args.p_sat)
         else:
