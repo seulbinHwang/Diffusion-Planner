@@ -45,7 +45,6 @@ from tools.predictor_utils import (
     init_distributed,
     maybe_resume_from_checkpoint,
     safe_get_artifacts,
-maybe_preload_model_only_weights_before_deepspeed_init,
 )
 from tools.predictor_utils import (build_dataset_and_sampler, build_data_loader,
                                    create_diffusion_planner_and_ema,
@@ -2219,14 +2218,7 @@ def model_training(
         rank=rank,
         use_deepspeed=use_deepspeed,
     )
-    # ✅ (해결책 B) DeepSpeed 초기화 전에 model-only weight를 먼저 로드
-    model_ema, _ = maybe_preload_model_only_weights_before_deepspeed_init(
-        args=args,
-        diffusion_planner=diffusion_planner,
-        model_ema=model_ema,
-        global_rank=global_rank,
-        use_deepspeed=use_deepspeed,
-    )
+
     optimizer = _build_optimizer_with_roles_from_args(
         base_model=base_model,
         args=args,

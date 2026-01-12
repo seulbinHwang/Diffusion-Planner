@@ -2,7 +2,7 @@
 name: "nuplan_womd_fine_tuning1"
 load_name: "nuplan_womd"
 # Stage2: Stage1보다 1/3 정도 작은 lr에서 시작 → 1/4 근처까지 감소
-learning_rate: 2.5e-4        # ≈ 5e-4 / 3
+learning_rate: 3e-4        # ≈ 5e-4 / 3
 
 # Group 설정:
 #  - encoder_local(Group A): freeze
