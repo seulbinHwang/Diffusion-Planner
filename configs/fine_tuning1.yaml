@@ -7,7 +7,7 @@ learning_rate: 2.5e-4        # ≈ 5e-4 / 3
 # Group 설정:
 #  - encoder_local(Group A): freeze
 #  - encoder_global / decoder 는 기본 lr
-freeze_encoder_local: true
+freeze_encoder_local: false
 lr_scheduler_type: cosine
 use_lr_warmup: true
 p_sat: 0.
