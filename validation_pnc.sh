@@ -32,8 +32,8 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final_150_0102/validation"
+EVAL_SET_LIST_PATH="${USER_PATH}/E/projects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -165,13 +165,13 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$TRAIN_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "nuplan_womd_fine_tuning1" \
-  --name "nuplan_womd_fine_tuning1" \
+  --eval_set "$EVAL_SET_PATH" \
+  --eval_set_list "$EVAL_SET_LIST_PATH" \
   --eval_method "validation" \
   --batch_size 256 \
   --use_deepspeed True \
-  --wosac_sub_is_active True \
-  --wosac_metric_is_active False \
+  --wosac_sub_is_active False \
+  --wosac_metric_is_active True \
   --save_image False \
   --save_video False \
   --finish_when_no_updated_pt False \
