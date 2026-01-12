@@ -148,96 +148,194 @@ def _select_latest_like_tag(save_path: str) -> str:
     return tag
 
 
+def _extract_state_like_from_deepspeed_model_states(
+    ckpt: Dict[str, Any],
+) -> Tuple[Dict[str, torch.Tensor], str]:
+    """DeepSpeed 체크포인트(dict)에서 모델에 넣을 state_dict를 골라서 돌려줍니다.
+
+    이 함수는 "프리트레인 weight"를 가져올 때,
+    가능한 경우 **EMA weight**를 우선해서 쓰기 위해 만들었습니다.
+
+    동작 방식:
+      1) ckpt 안에 "client_state"가 있고, 그 안에 "ema_state_dict"가 있으면 그걸 우선 사용합니다.
+      2) 위가 없으면, ckpt 최상단에 "ema_state_dict"가 있으면 그걸 사용합니다.
+      3) 그것도 없으면, ckpt["module"]을 사용합니다. (일반 모델 weight)
+
+    Args:
+      ckpt (Dict[str, Any]):
+        torch.load(...)로 읽어온 체크포인트 딕셔너리입니다.
+        - state_dict 내부 value 텐서는 레이어에 따라 모양이 다양합니다.
+          예) (out_dim, in_dim), (dim,), (C_out, C_in, kH, kW) 등.
+
+    Returns:
+      Tuple[Dict[str, torch.Tensor], str]:
+        - state_dict: 모델에 넣을 파라미터 딕셔너리
+        - source_name: 어떤 경로에서 가져왔는지 표시하는 문자열
+    """
+    client_state = ckpt.get("client_state", None)
+    if isinstance(client_state, dict):
+        ema_state = client_state.get("ema_state_dict", None)
+        if isinstance(ema_state, dict) and len(ema_state) > 0:
+            return ema_state, "client_state.ema_state_dict"
+
+    ema_state_top = ckpt.get("ema_state_dict", None)
+    if isinstance(ema_state_top, dict) and len(ema_state_top) > 0:
+        return ema_state_top, "ema_state_dict"
+
+    module_state = ckpt.get("module", None)
+    if isinstance(module_state, dict) and len(module_state) > 0:
+        return module_state, "module"
+
+    raise KeyError(
+        "DeepSpeed model_states에서 사용할 state_dict를 찾지 못했습니다. "
+        "('client_state.ema_state_dict' / 'ema_state_dict' / 'module' 중 하나가 필요합니다.)"
+    )
+
+
+def maybe_preload_model_only_weights_before_deepspeed_init(
+    args: argparse.Namespace,
+    diffusion_planner: nn.Module,
+    model_ema: Optional[ModelEma],
+    global_rank: int,
+    use_deepspeed: bool,
+) -> Tuple[Optional[ModelEma], bool]:
+    """DeepSpeed 초기화 전에 model-only weight를 미리 로드할지 판단하고, 필요하면 로드합니다.
+
+    왜 필요한가:
+      - DeepSpeed는 초기화할 때(=deepspeed.initialize) 내부적으로 모델/옵티마 상태를 준비합니다.
+      - 그런데 그 "준비"가 끝난 뒤에 weight를 수동으로 덮어쓰면,
+        첫 optimizer step에서 내부 상태가 다시 영향을 주면서 weight가 깨질 수 있습니다.
+      - 그래서 model-only(=가중치만 가져와 새 학습 시작)일 때는
+        **DeepSpeed 초기화 전에** weight를 먼저 넣어주는 방식이 더 안전합니다.
+
+    동작 조건(모두 만족할 때만 로드):
+      1) use_deepspeed == True
+      2) args.resume_model_only == True
+      3) args.resume_wandb_model_name 또는 args.resume_local_path_model_path 중 하나라도 설정됨
+      4) args.save_path가 존재하고, 그 안이 DeepSpeed 체크포인트 구조로 보임
+
+    Args:
+      args (argparse.Namespace):
+        학습 설정입니다. 이 함수는 내부적으로
+        args._model_only_weights_loaded_before_deepspeed_init = True 를 세팅할 수 있습니다.
+      diffusion_planner (nn.Module):
+        아직 deepspeed.initialize 이전의 "일반 PyTorch 모델"입니다.
+      model_ema (Optional[ModelEma]):
+        EMA 모델 래퍼입니다. 없으면 None입니다.
+      global_rank (int):
+        분산 학습 global rank입니다.
+      use_deepspeed (bool):
+        True면 DeepSpeed를 사용할 예정입니다.
+
+    Returns:
+      Tuple[Optional[ModelEma], bool]:
+        - model_ema: 로드 후 EMA가 동기화된 객체(또는 None)
+        - loaded: 실제로 로드를 수행했으면 True
+    """
+    if not use_deepspeed:
+        return model_ema, False
+
+    if not bool(getattr(args, "resume_model_only", False)):
+        return model_ema, False
+
+    has_any_resume_signal = (
+        getattr(args, "resume_wandb_model_name", None) is not None
+        or getattr(args, "resume_local_path_model_path", None) is not None
+    )
+    if not has_any_resume_signal:
+        return model_ema, False
+
+    save_path = getattr(args, "save_path", None)
+    if not isinstance(save_path, str) or not save_path:
+        return model_ema, False
+
+    if not _is_deepspeed_checkpoint_dir(save_path):
+        return model_ema, False
+
+    # ✅ 실제 로드 수행
+    model_ema = _load_model_and_ema_state_only_from_deepspeed_checkpoint(
+        save_path=save_path,
+        diffusion_planner=diffusion_planner,
+        model_ema=model_ema,
+        global_rank=global_rank,
+    )
+
+    # ✅ 이후 단계에서 "중복 로드"를 막기 위한 플래그
+    setattr(args, "_model_only_weights_loaded_before_deepspeed_init", True)
+    return model_ema, True
+
 def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
     save_path: str,
     diffusion_planner: nn.Module,
     model_ema: Optional[ModelEma],
     global_rank: int,
 ) -> Optional[ModelEma]:
-    """DeepSpeed 폴더에서 **모델/EMA 가중치만** 읽어오는 함수.
+    """DeepSpeed 체크포인트 폴더에서 모델(그리고 필요하면 EMA) 가중치만 읽어옵니다.
 
-    이 함수는 optimizer나 스케줄러 상태는 전혀 건드리지 않고,
-    디스크에 저장된 DeepSpeed 체크포인트 폴더에서
-    순수하게 모델 값(가중치)만 불러와 현재 모델에 채워 넣는다.
-
-    사용 의도:
-        * stage1에서 이미 학습한 모델 값을 가져오되,
-          stage2에서는 새로운 학습 설정(optimizer, 학습률 등)을 그대로 쓰고 싶을 때.
-        * encoder_local을 고정(freeze)해서 메모리를 아끼고 싶지만,
-          DeepSpeed의 복잡한 재개(load) 로직은 피하고 싶을 때.
-
-    동작 요약:
-        1) save_path 안에서 "latest"가 들어간 하위 폴더 이름을 고른다.
-           예: latest_epoch-000001
-        2) 그 안의 mp_rank_XX_model_states.pt 파일을 열어
-           저장된 모델 값들을 읽어온다.
-        3) 읽어온 모델 값을 현재 모델(diffusion_planner)에 넣는다.
-        4) EMA 모델이 있으면, 현재 모델 값으로 EMA 모델도 맞춰 준다.
+    이 함수는 optimizer/scheduler 상태는 건드리지 않고,
+    오직 "모델 가중치"만 현재 모델에 채워 넣습니다.
 
     Args:
-        save_path (str):
-            DeepSpeed 체크포인트가 들어 있는 루트 폴더 경로.
-            예: "./training_log/실험이름/2025-12-10-12:52:12/"
-        diffusion_planner (nn.Module):
-            DeepSpeed로 감싸진 주행 계획 모델 또는 그와 같은 구조의 모델.
-        model_ema (Optional[ModelEma]):
-            EMA(지수 이동 평균)를 추적하는 보조 모델 래퍼.
-            없으면 None.
-        global_rank (int):
-            분산 학습에서 이 프로세스의 전체 순번.
-            주로 로그 출력에만 사용된다.
+      save_path (str):
+        DeepSpeed 체크포인트 루트 폴더 경로입니다.
+        예) "./training_log/nuplan_womd_fine_tuning1/2026-01-12-11:39:55/"
+      diffusion_planner (nn.Module):
+        weight를 주입할 모델입니다.
+      model_ema (Optional[ModelEma]):
+        EMA 래퍼입니다. 있으면 base model과 같은 weight로 맞춥니다.
+      global_rank (int):
+        분산 학습 global rank입니다. 0일 때만 주요 로그를 출력합니다.
 
     Returns:
-        Optional[ModelEma]:
-            모델 값이 동기화된 EMA 래퍼를 돌려준다.
-            EMA를 쓰지 않는 경우에는 원래대로 None을 돌려준다.
+      Optional[ModelEma]:
+        EMA를 쓰면 ModelEma, 아니면 None을 돌려줍니다.
     """
     tag = _select_latest_like_tag(save_path)
     tag_dir = os.path.join(save_path, tag)
 
-    # tag 디렉터리 안에서 *_model_states.pt 중 첫 번째를 찾는 방식
-    candidates = [
-        f for f in os.listdir(tag_dir) if f.endswith("_model_states.pt")
-    ]
+    if not os.path.isdir(tag_dir):
+        raise FileNotFoundError(f"DeepSpeed tag 디렉터리를 찾지 못했습니다: {tag_dir}")
+
+    candidates = [f for f in os.listdir(tag_dir) if f.endswith("_model_states.pt")]
     if not candidates:
         raise FileNotFoundError(f"No *_model_states.pt found in {tag_dir}")
 
     mp_rank_str = sorted(candidates)[0]  # 보통 mp_rank_00_model_states.pt
     ckpt_path = os.path.join(tag_dir, mp_rank_str)
-    ckpt = torch.load(ckpt_path, map_location="cpu")
 
-    state_like = ckpt.get("ema_state_dict", ckpt["module"])
+    ckpt: Dict[str, Any] = torch.load(ckpt_path, map_location="cpu")
 
-    base_model: nn.Module = getattr(diffusion_planner, "module",
-                                    diffusion_planner)
+    # ✅ (해결책 C) client_state 안의 ema_state_dict를 우선 사용
+    state_like, source_name = _extract_state_like_from_deepspeed_model_states(ckpt)
+
+    base_model: nn.Module = getattr(diffusion_planner, "module", diffusion_planner)
     incompatible = base_model.load_state_dict(state_like, strict=True)
 
     if global_rank == 0:
         print(f"[ModelOnly<DeepSpeed>] LOAD MODEL PARAM from {ckpt_path}")
+        print(f"[ModelOnly<DeepSpeed>] state source: {source_name}")
         missing_keys = getattr(incompatible, "missing_keys", None)
         unexpected_keys = getattr(incompatible, "unexpected_keys", None)
         if missing_keys:
-            print(
-                f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}"
-            )
+            print(f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}")
             raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: missing keys exist.")
         if unexpected_keys:
-            print(
-                f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}"
-            )
+            print(f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}")
             raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: unexpected keys exist.")
-        if not missing_keys and not unexpected_keys:
-            print("[ModelOnly<DeepSpeed>] Model state load done")
+        print("[ModelOnly<DeepSpeed>] Model state load done")
 
+    # EMA가 있으면 base_model과 동일한 값으로 맞춘다.
     if model_ema is not None:
         ema_model = getattr(model_ema, "ema", model_ema)
         ema_model.load_state_dict(base_model.state_dict(), strict=True)
-        print("[ModelOnly<DeepSpeed>] EMA model state synchronized with base model.")
+        if global_rank == 0:
+            print("[ModelOnly<DeepSpeed>] EMA model state synchronized with base model.")
         ema_model.eval()
         for p in ema_model.parameters():
             p.requires_grad_(False)
 
     return model_ema
+
 
 
 def _is_deepspeed_checkpoint_dir(save_path: str) -> bool:
@@ -1114,6 +1212,30 @@ def maybe_resume_from_checkpoint(
             DeepSpeed 모드 사용 여부.
 
     """
+    # ------------------------------------------------------------------
+    # ✅ (해결책 B) DeepSpeed 초기화 전에 model-only weight를 이미 로드했다면,
+    #              여기서는 절대 다시 로드하지 않는다.
+    # ------------------------------------------------------------------
+    already_preloaded: bool = bool(
+        getattr(args, "_model_only_weights_loaded_before_deepspeed_init", False)
+    )
+    if use_deepspeed and bool(getattr(args, "resume_model_only", False)) and already_preloaded:
+        assert optimizer is not None and scheduler is not None, \
+            "DeepSpeed model-only preloaded 상태에서는 optimizer/scheduler가 None이면 안 됩니다."
+        init_epoch = 0
+        wandb_id = None
+        train_epochs = int(args.train_epochs)
+        allow_val_change = False
+        return (
+            diffusion_planner,
+            optimizer,
+            scheduler,
+            model_ema,
+            init_epoch,
+            wandb_id,
+            train_epochs,
+            allow_val_change,
+        )
 
     if args.resume_wandb_model_name is not None:
         print(f"[LOAD MODEL PARAM] Model loaded from {args.save_path}")
