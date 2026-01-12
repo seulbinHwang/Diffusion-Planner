@@ -10,7 +10,7 @@ learning_rate: 3.75e-4        # ≈ 5e-4 / 3
 freeze_encoder_local: true
 lr_scheduler_type: cosine
 use_lr_warmup: false
-p_sat: 1.0
+p_sat: 0.
 w_int_max: 1.0
 
 resume_local_path_model_path: null
