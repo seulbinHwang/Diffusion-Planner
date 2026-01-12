@@ -210,22 +210,29 @@ def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
 
     base_model: nn.Module = getattr(diffusion_planner, "module",
                                     diffusion_planner)
-    incompatible = base_model.load_state_dict(state_like, strict=False)
+    incompatible = base_model.load_state_dict(state_like, strict=True)
 
     if global_rank == 0:
         print(f"[ModelOnly<DeepSpeed>] LOAD MODEL PARAM from {ckpt_path}")
-        if getattr(incompatible, "missing_keys", None):
+        missing_keys = getattr(incompatible, "missing_keys", None)
+        unexpected_keys = getattr(incompatible, "unexpected_keys", None)
+        if missing_keys:
             print(
                 f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}"
             )
-        if getattr(incompatible, "unexpected_keys", None):
+            raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: missing keys exist.")
+        if unexpected_keys:
             print(
                 f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}"
             )
+            raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: unexpected keys exist.")
+        if not missing_keys and not unexpected_keys:
+            print("[ModelOnly<DeepSpeed>] Model state load done")
 
     if model_ema is not None:
         ema_model = getattr(model_ema, "ema", model_ema)
-        ema_model.load_state_dict(base_model.state_dict(), strict=False)
+        ema_model.load_state_dict(base_model.state_dict(), strict=True)
+        print("[ModelOnly<DeepSpeed>] EMA model state synchronized with base model.")
         ema_model.eval()
         for p in ema_model.parameters():
             p.requires_grad_(False)
