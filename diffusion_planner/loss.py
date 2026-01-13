@@ -850,7 +850,7 @@ def diffusion_loss_func(
     # random_noise: (B, (1+)Pnn, future_len, 4)
     (batch_diffusion_time, low_t_mask, low_t_mask_bt,
      random_noise) = _sample_diffusion_time_and_noise(
-         target_future_gt_4_dim,
+         target_future_gt_4_dim, # (B, (1+)Pnn, future_len, 4)
          eps,
          args,
      )
