@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
+최초 1회 설정(이메일/SMTP/URL 등 입력)
+
 python gpu_node_watcher.py --init
 
+이후 계속 감시(기본: 10분마다 확인)
 
 python gpu_node_watcher.py
 
+만약 접속 시 로그인 화면이 뜨면(환경에 따라 그럴 수 있음) 1번만 “브라우저 창을 띄워서” 로그인 저장
+
 python gpu_node_watcher.py --headful --once
 
-"""
-"""
+
 GPU 노드 감시기
 
 - 지정한 Grafana 링크를 자동으로 열어 표를 읽습니다.
 - 각 노드의 '할당된 총 GPU 수'를 확인합니다.
 - '할당된 총 GPU 수'가 기준값(기본 2) 이하인 노드가 1대라도 있으면 이메일을 보냅니다.
 - 같은 상태가 계속될 때 이메일이 너무 많이 가지 않도록, "상태가 처음 바뀌는 순간"에만 보냅니다.
+- 매번 검사할 때, CLI에 전체 노드별 GPU 점유 현황을 출력합니다.
 
 필수 설치:
     pip install playwright
@@ -115,6 +121,26 @@ class AlertState:
     alert_active: bool = False
 
 
+@dataclass(frozen=True)
+class NodeGpuUsage:
+    """노드별 GPU 점유(사용) 정보를 담습니다.
+
+    화면 표에서 읽어오는 값 중,
+    - 노드 이름
+    - 할당된 총 GPU 수
+    - 전체 GPU 수(가능하면)
+    를 묶어서 다룹니다.
+
+    Args:
+        node (str): 노드 이름(예: k1ncgs2-...).
+        allocated (int): 할당된 총 GPU 수.
+        total (Optional[int]): 전체 GPU 수. 표에서 못 읽으면 None일 수 있습니다.
+    """
+    node: str
+    allocated: int
+    total: Optional[int]
+
+
 # =========================
 # 파일/설정 입출력
 # =========================
@@ -200,7 +226,6 @@ def _set_private_permissions(path: Path) -> None:
     try:
         os.chmod(path, 0o600)
     except Exception:
-        # 환경에 따라 실패할 수 있어도, 프로그램 실행 자체는 계속되게 둡니다.
         pass
 
 
@@ -243,9 +268,6 @@ def _prompt_int(prompt: str, default: int) -> int:
 
 def _load_or_create_config(config_path: Path) -> AppConfig:
     """설정을 읽거나, 없으면 사용자 입력으로 새로 만듭니다.
-
-    이 프로그램은 최초 1회만 필요한 값을 물어보고 파일로 저장합니다.
-    다음부터는 저장된 값을 그대로 씁니다.
 
     Args:
         config_path (Path): 설정 파일 경로.
@@ -342,11 +364,8 @@ def _save_state(state_path: Path, state: AlertState) -> None:
 def _try_keyring_set(service: str, username: str, password: str) -> bool:
     """OS에 비밀번호를 저장하려고 시도합니다.
 
-    이 방식은 보통 파일에 직접 적는 것보다 안전합니다.
-    다만 환경에 따라 keyring이 없거나, 저장 기능이 막혀 있을 수 있습니다.
-
     Args:
-        service (str): 저장할 서비스 이름(프로그램 이름 같은 값).
+        service (str): 저장할 서비스 이름.
         username (str): 계정 이름(여기서는 이메일).
         password (str): 비밀번호.
 
@@ -380,9 +399,6 @@ def _try_keyring_get(service: str, username: str) -> Optional[str]:
 
 def _save_password_to_file(path: Path, password: str) -> None:
     """비밀번호를 파일에 저장합니다.
-
-    주의: 이 방식은 환경에 따라 위험할 수 있습니다.
-    파일 권한을 최대한 줄이려고 시도하지만, 완벽하다고 보장할 수는 없습니다.
 
     Args:
         path (Path): 저장할 파일 경로.
@@ -437,7 +453,6 @@ def _get_or_ask_email_password(config: AppConfig) -> str:
         _save_password_to_file(_get_password_file_path(), pw)
         return pw
 
-    # file 저장 방식
     saved_file = _load_password_from_file(_get_password_file_path())
     if saved_file:
         return saved_file
@@ -480,7 +495,6 @@ def _send_email(settings: EmailSettings, smtp_password: str, subject: str, body:
                 server.login(settings.smtp_username, smtp_password)
                 server.send_message(msg)
         else:
-            # 일부 환경은 SSL 포트를 바로 쓰기도 합니다. 필요하면 포트를 맞춰야 합니다.
             context = ssl.create_default_context()
             with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, context=context, timeout=30) as server:
                 server.login(settings.smtp_username, smtp_password)
@@ -544,16 +558,80 @@ def _find_header_index_any(headers: list[str], candidates: list[str]) -> Optiona
     return None
 
 
-def _extract_table_using_roles(page: Page) -> list[tuple[str, int]]:
-    """화면에서 표를 읽어 (노드, 할당 GPU 수) 목록을 만듭니다.
+def _safe_percent(allocated: int, total: Optional[int]) -> Optional[float]:
+    """(할당/전체)*100 값을 계산합니다.
 
-    이 함수는 화면의 표에서:
-    - 열 이름(예: Node, 할당된 총 GPU 수)을 먼저 찾고,
-    - 각 행에서 해당 열의 값을 읽습니다.
+    Args:
+        allocated (int): 할당된 GPU 수.
+        total (Optional[int]): 전체 GPU 수. 모르면 None.
 
     Returns:
-        list[tuple[str, int]]: 길이 N의 목록.
-            각 원소는 (노드이름, 할당된총GPU수) 입니다.
+        Optional[float]: 계산 가능하면 퍼센트 값, 불가능하면 None.
+    """
+    if total is None or total <= 0:
+        return None
+    return (allocated / total) * 100.0
+
+
+def _print_cli_report(
+    node_usages: list[NodeGpuUsage],
+    matched: list[NodeGpuUsage],
+    threshold: int,
+) -> None:
+    """CLI에 이번 검사 결과를 보기 좋게 출력합니다.
+
+    출력 내용:
+    - 전체 노드 개수
+    - 노드별 '할당/전체' 및 퍼센트(전체 GPU 수를 읽을 수 있을 때)
+    - 기준값 이하 노드가 있는지 여부 및 목록
+
+    Args:
+        node_usages (list[NodeGpuUsage]): 길이 N의 목록. 이번에 읽은 전체 노드 정보.
+        matched (list[NodeGpuUsage]): 길이 M의 목록. 기준값 이하인 노드 정보.
+        threshold (int): 기준값(이 값 이하이면 조건 만족).
+
+    Note:
+        node_usages shape: (N,)
+        matched shape: (M,)
+    """
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print("\n" + "=" * 80)
+    print(f"[{ts}] 검사 결과")
+    print(f"- 전체 노드 수: {len(node_usages)}")
+    print(f"- 조건: 할당된 총 GPU 수 <= {threshold}")
+    print("- 노드별 GPU 점유 현황(할당/전체, %):")
+
+    # 할당 GPU 적은 순으로 정렬해서 보기 편하게 출력
+    sorted_nodes = sorted(node_usages, key=lambda x: (x.allocated, x.node))
+    # sorted_nodes shape: (N,)
+    for u in sorted_nodes:
+        pct = _safe_percent(u.allocated, u.total)
+        if u.total is None:
+            print(f"  - {u.node} : {u.allocated} (전체 GPU 수는 표에서 못 읽음)")
+        else:
+            if pct is None:
+                print(f"  - {u.node} : {u.allocated}/{u.total}")
+            else:
+                print(f"  - {u.node} : {u.allocated}/{u.total} ({pct:.1f}%)")
+
+    if matched:
+        print(f"\n[조건 만족] 기준 이하 노드 {len(matched)}대 발견")
+        for u in matched:
+            if u.total is None:
+                print(f"  * {u.node} : {u.allocated}")
+            else:
+                print(f"  * {u.node} : {u.allocated}/{u.total}")
+    else:
+        print("\n[조건 미만족] 기준 이하 노드 없음")
+
+    print("=" * 80 + "\n")
+
+
+def _extract_table_using_roles(page: Page) -> list[NodeGpuUsage]:
+    """화면에서 표를 읽어 노드별 GPU 점유 정보를 만듭니다.
+
+    Returns:
+        list[NodeGpuUsage]: 길이 N의 목록.
     """
     header_locator = page.locator("[role='columnheader']")
     header_count = header_locator.count()
@@ -565,8 +643,9 @@ def _extract_table_using_roles(page: Page) -> list[tuple[str, int]]:
     for i in range(header_count):
         headers.append(header_locator.nth(i).inner_text().strip())
 
-    allocated_idx = _find_header_index(headers, "할당된 총 GPU 수")
     node_idx = _find_header_index_any(headers, ["Node", "노드"])
+    allocated_idx = _find_header_index(headers, "할당된 총 GPU 수")
+    total_idx = _find_header_index(headers, "전체 GPU 수")  # 없을 수도 있음
 
     if allocated_idx is None or node_idx is None:
         raise ValueError(f"필요한 열을 찾지 못했습니다. headers={headers}")
@@ -576,8 +655,8 @@ def _extract_table_using_roles(page: Page) -> list[tuple[str, int]]:
     if row_count <= 0:
         raise ValueError("표의 행을 찾지 못했습니다(role='row' 없음).")
 
-    results: list[tuple[str, int]] = []
-    # results shape: (N, 2)
+    results: list[NodeGpuUsage] = []
+    # results shape: (N,)
     for r in range(row_count):
         row = row_locator.nth(r)
         cell_locator = row.locator("[role='cell']")
@@ -585,6 +664,9 @@ def _extract_table_using_roles(page: Page) -> list[tuple[str, int]]:
         if cell_count <= 0:
             continue
         if cell_count <= max(allocated_idx, node_idx):
+            continue
+        if total_idx is not None and cell_count <= total_idx:
+            # 전체 GPU 열이 있는데 해당 행에서 칸이 모자라면 건너뜀
             continue
 
         node_cell = cell_locator.nth(node_idx)
@@ -594,10 +676,16 @@ def _extract_table_using_roles(page: Page) -> list[tuple[str, int]]:
         alloc_text = (alloc_cell.get_attribute("title") or alloc_cell.inner_text() or "").strip()
         alloc_val = _parse_first_int(alloc_text)
 
+        total_val: Optional[int] = None
+        if total_idx is not None:
+            total_cell = cell_locator.nth(total_idx)
+            total_text = (total_cell.get_attribute("title") or total_cell.inner_text() or "").strip()
+            total_val = _parse_first_int(total_text)
+
         if not node_text or alloc_val is None:
             continue
 
-        results.append((node_text, alloc_val))
+        results.append(NodeGpuUsage(node=node_text, allocated=alloc_val, total=total_val))
 
     if not results:
         raise ValueError("표에서 데이터를 읽었지만 결과가 비었습니다(행 파싱 실패).")
@@ -605,23 +693,21 @@ def _extract_table_using_roles(page: Page) -> list[tuple[str, int]]:
     return results
 
 
-def _extract_table_using_html_table(page: Page) -> list[tuple[str, int]]:
-    """<table> 태그 기반 표가 있을 때 (노드, 할당 GPU 수) 목록을 읽습니다.
-
-    Grafana 화면은 환경에 따라 <table> 태그가 아닐 수도 있습니다.
-    그래서 이 함수는 '대체 방법'입니다.
+def _extract_table_using_html_table(page: Page) -> list[NodeGpuUsage]:
+    """<table> 태그 기반 표가 있을 때 노드별 GPU 점유 정보를 읽습니다.
 
     Returns:
-        list[tuple[str, int]]: 길이 N의 목록.
-            각 원소는 (노드이름, 할당된총GPU수) 입니다.
+        list[NodeGpuUsage]: 길이 N의 목록.
     """
     table = page.locator("table").first
     if table.count() == 0:
         raise ValueError("<table> 태그를 찾지 못했습니다.")
 
     headers = [h.strip() for h in table.locator("thead tr th").all_inner_texts()]
-    allocated_idx = _find_header_index(headers, "할당된 총 GPU 수")
     node_idx = _find_header_index_any(headers, ["Node", "노드"])
+    allocated_idx = _find_header_index(headers, "할당된 총 GPU 수")
+    total_idx = _find_header_index(headers, "전체 GPU 수")
+
     if allocated_idx is None or node_idx is None:
         raise ValueError(f"<table> 기반에서 필요한 열을 찾지 못했습니다. headers={headers}")
 
@@ -630,22 +716,30 @@ def _extract_table_using_html_table(page: Page) -> list[tuple[str, int]]:
     if row_count <= 0:
         raise ValueError("<table> 기반에서 행을 찾지 못했습니다.")
 
-    results: list[tuple[str, int]] = []
-    # results shape: (N, 2)
+    results: list[NodeGpuUsage] = []
+    # results shape: (N,)
     for i in range(row_count):
         row = rows.nth(i)
         cells = row.locator("td")
         cell_count = cells.count()
         if cell_count <= max(allocated_idx, node_idx):
             continue
+        if total_idx is not None and cell_count <= total_idx:
+            continue
 
         node_text = (cells.nth(node_idx).get_attribute("title") or cells.nth(node_idx).inner_text() or "").strip()
         alloc_text = (cells.nth(allocated_idx).get_attribute("title") or cells.nth(allocated_idx).inner_text() or "").strip()
         alloc_val = _parse_first_int(alloc_text)
 
+        total_val: Optional[int] = None
+        if total_idx is not None:
+            total_text = (cells.nth(total_idx).get_attribute("title") or cells.nth(total_idx).inner_text() or "").strip()
+            total_val = _parse_first_int(total_text)
+
         if not node_text or alloc_val is None:
             continue
-        results.append((node_text, alloc_val))
+
+        results.append(NodeGpuUsage(node=node_text, allocated=alloc_val, total=total_val))
 
     if not results:
         raise ValueError("<table> 기반에서 결과가 비었습니다.")
@@ -657,13 +751,8 @@ def fetch_node_allocated_gpu_counts(
     browser_profile_dir: Path,
     headless: bool,
     table_wait_seconds: int,
-) -> list[tuple[str, int]]:
-    """Grafana 링크를 열어서 노드별 '할당된 총 GPU 수' 목록을 읽어옵니다.
-
-    이 함수는:
-    1) 링크를 자동으로 열고,
-    2) '할당된 총 GPU 수'라는 글자가 화면에 나타날 때까지 기다리고,
-    3) 표에서 (노드, 할당GPU수)를 읽어서 돌려줍니다.
+) -> list[NodeGpuUsage]:
+    """Grafana 링크를 열어서 노드별 GPU 점유 정보를 읽어옵니다.
 
     Args:
         url (str): Grafana 링크.
@@ -672,8 +761,7 @@ def fetch_node_allocated_gpu_counts(
         table_wait_seconds (int): 표가 뜰 때까지 최대 대기 시간(초).
 
     Returns:
-        list[tuple[str, int]]: 길이 N의 목록.
-            각 원소는 (노드이름, 할당된총GPU수) 입니다.
+        list[NodeGpuUsage]: 길이 N의 목록.
 
     Raises:
         RuntimeError: 페이지 열기/표 읽기에 실패했을 때.
@@ -690,10 +778,7 @@ def fetch_node_allocated_gpu_counts(
             page.set_default_timeout(table_wait_seconds * 1000)
 
             page.goto(url, wait_until="domcontentloaded")
-            # 표의 핵심 열이 화면에 뜰 때까지 기다립니다.
             page.wait_for_selector("text=할당된 총 GPU 수")
-
-            # 표가 늦게 채워지는 경우를 대비해 아주 짧게 더 기다립니다.
             page.wait_for_timeout(1500)
 
             try:
@@ -713,38 +798,40 @@ def fetch_node_allocated_gpu_counts(
 # =========================
 
 def find_nodes_below_threshold(
-    node_gpu_list: list[tuple[str, int]],
+    node_usages: list[NodeGpuUsage],
     threshold: int,
-) -> list[tuple[str, int]]:
+) -> list[NodeGpuUsage]:
     """할당 GPU 수가 기준값 이하인 노드만 골라냅니다.
 
     Args:
-        node_gpu_list (list[tuple[str, int]]): 길이 N의 목록. (노드, 할당GPU수)
+        node_usages (list[NodeGpuUsage]): 길이 N의 목록. 전체 노드 점유 정보.
         threshold (int): 기준값. 이 값 이하이면 '조건 만족'입니다.
 
     Returns:
-        list[tuple[str, int]]: 길이 M의 목록. (노드, 할당GPU수)
+        list[NodeGpuUsage]: 길이 M의 목록. 기준값 이하 노드만 모은 결과.
+
+    Note:
+        node_usages shape: (N,)
+        반환 shape: (M,)
     """
-    # node_gpu_list shape: (N, 2)
-    matched: list[tuple[str, int]] = []
-    # matched shape: (M, 2)
-    for node, alloc in node_gpu_list:
-        if alloc <= threshold:
-            matched.append((node, alloc))
+    matched: list[NodeGpuUsage] = []
+    for u in node_usages:
+        if u.allocated <= threshold:
+            matched.append(u)
     return matched
 
 
 def build_email_message(
     grafana_url: str,
     threshold: int,
-    matched_nodes: list[tuple[str, int]],
+    matched_nodes: list[NodeGpuUsage],
 ) -> tuple[str, str]:
     """이메일 제목과 본문을 만듭니다.
 
     Args:
         grafana_url (str): 확인한 링크.
         threshold (int): 기준값.
-        matched_nodes (list[tuple[str, int]]): 길이 M의 목록. (노드, 할당GPU수)
+        matched_nodes (list[NodeGpuUsage]): 길이 M의 목록. 조건 만족 노드.
 
     Returns:
         tuple[str, str]: (제목, 본문)
@@ -752,14 +839,16 @@ def build_email_message(
     subject = f"[GPU 알림] 할당 GPU {threshold} 이하 노드 발견 ({len(matched_nodes)}대)"
 
     lines: list[str] = []
-    # lines shape: (L,)
     lines.append("조건을 만족하는 노드가 발견되었습니다.")
     lines.append(f"- 기준: 할당된 총 GPU 수 <= {threshold}")
     lines.append(f"- 발견 수: {len(matched_nodes)}")
     lines.append("")
     lines.append("노드 목록:")
-    for node, alloc in matched_nodes:
-        lines.append(f"- {node} : {alloc}")
+    for u in matched_nodes:
+        if u.total is None:
+            lines.append(f"- {u.node} : {u.allocated}")
+        else:
+            lines.append(f"- {u.node} : {u.allocated}/{u.total}")
     lines.append("")
     lines.append("확인 링크:")
     lines.append(grafana_url)
@@ -776,24 +865,15 @@ def run_check_and_notify_once(
 ) -> None:
     """1번 확인하고, 필요하면 이메일을 보낸 뒤 상태를 갱신합니다.
 
-    동작:
-    - 표에서 노드별 할당 GPU 수를 읽습니다.
-    - 기준값 이하 노드가 있으면 '알림 상태'로 봅니다.
-    - 직전에는 알림 상태가 아니었는데, 이번에 처음 알림 상태가 되면 이메일을 1번 보냅니다.
-    - 알림 상태가 풀리면(조건 만족 노드가 없어지면) 다음 알림을 위해 상태를 초기화합니다.
-
     Args:
         config (AppConfig): 전체 설정값.
         smtp_password (str): SMTP 비밀번호.
         state (AlertState): 직전 상태.
         headless_override (Optional[bool]): 이번 실행에서만 headless 값을 덮어쓸 때 사용.
-
-    Raises:
-        RuntimeError: 웹페이지 읽기/이메일 전송 실패 시.
     """
     headless = config.watch.headless if headless_override is None else headless_override
 
-    node_gpu_list = fetch_node_allocated_gpu_counts(
+    node_usages = fetch_node_allocated_gpu_counts(
         url=config.watch.grafana_url,
         browser_profile_dir=Path(config.watch.browser_profile_dir),
         headless=headless,
@@ -801,12 +881,16 @@ def run_check_and_notify_once(
     )
 
     matched = find_nodes_below_threshold(
-        node_gpu_list=node_gpu_list,
+        node_usages=node_usages,
         threshold=config.watch.allocated_gpu_threshold,
     )
 
+    # ✅ 매번 검사 결과를 CLI에 출력
+    _print_cli_report(node_usages=node_usages, matched=matched, threshold=config.watch.allocated_gpu_threshold)
+
     alert_now = len(matched) > 0
 
+    # ✅ 메일은 "조건 만족 노드가 있을 때만" 보내며, 같은 상태면 반복 발송하지 않음
     if alert_now and not state.alert_active:
         subject, body = build_email_message(
             grafana_url=config.watch.grafana_url,
@@ -818,6 +902,7 @@ def run_check_and_notify_once(
         state.alert_active = True
         return
 
+    # 조건이 해제되면 다음 알림을 위해 상태만 초기화(메일은 보내지 않음)
     if not alert_now and state.alert_active:
         LOGGER.info("조건이 해제되었습니다(다음에 다시 조건이 생기면 이메일을 보냅니다).")
         state.alert_active = False
@@ -862,7 +947,6 @@ def main() -> None:
 
     state = _load_state(state_path)
 
-    # headful 옵션이 있으면 이번 실행에서만 headless를 False로 둡니다.
     headless_override = False if args.headful else None
 
     if args.once:
