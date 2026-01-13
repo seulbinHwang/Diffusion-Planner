@@ -180,6 +180,6 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 5 \
   --rollout_number 32 \
-  --use_data_percent 2
+  --use_data_percent 1.5
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
