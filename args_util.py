@@ -136,7 +136,7 @@ def get_args():
                         default=-1)
     parser.add_argument('--rollout_number',
                         type=int,
-                        default=1)
+                        default=32)
     parser.add_argument('--future_len',
                         type=int,
                         help='number of time point',
