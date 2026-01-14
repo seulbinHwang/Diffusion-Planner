@@ -278,6 +278,7 @@ class Decoder(nn.Module):
         cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
         batch_size: int,
         one_or_Pnn: int,
+            diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """훈련 모드에서 DiT에 넣을 입력(xT_input_flat)과 현재 프레임(정규화)을 만든다.
 
@@ -314,13 +315,52 @@ class Decoder(nn.Module):
         # target_cur_future_norm_xT: (B, (1+)Pnn, 1+T, 4)
         target_cur_future_norm_xT: torch.Tensor = inputs[
             "target_cur_future_norm_xT"]
+        """
+        target_cur_future_norm_xT : (B, (1+)Pnn, 1+future_len, 4) -> (B, (1+)Pnn, 1+future_len, 5)
+        
+        5: x, y, cos, sin 에서 diffusion noise time step 추가
+        
+        참고로 1+future_len 은 현재+미래. 현재에는 노이즈를 추가하지 않을 것이므로, 0으로 채움
+        미래 future_len 에 대해서는, diffusion_time 에 따라 노이즈 time step을 채움
+        """
+        if diffusion_time.ndim == 1:
+            diffusion_time_expanded = diffusion_time[:, None].repeat(
+                1, self._future_len)  # (B, future_len)
+        elif diffusion_time.ndim == 2:
+            diffusion_time_expanded = diffusion_time  # (B, future_len)
+        else:
+            raise ValueError(
+                f"diffusion_time must be (B,) or (B, future_len). got {diffusion_time.shape}"
+            )
+        diffusion_time_for_future = diffusion_time_expanded  # (B, future_len)
+        diffusion_time_for_current = torch.zeros(
+            (B, 1),
+            dtype=diffusion_time.dtype,
+            device=diffusion_time.device,
+        )  # (B, 1)
+        diffusion_time_full = torch.cat(
+            [diffusion_time_for_current, diffusion_time_for_future],
+            dim=1,
+        )  # (B, 1+future_len)
+        diffusion_time_full = _cast_like(diffusion_time_full,
+                                         target_cur_future_norm_xT)
+        diffusion_time_full = diffusion_time_full[:, None,
+                                                  :, None]  # (B, 1, 1+future_len, 1)
+        target_cur_future_norm_xT = torch.cat(
+            [
+                target_cur_future_norm_xT,
+                diffusion_time_full,
+            ],
+            dim=-1,
+        )  # (B, (1+)Pnn, 1+future_len, 5)
+
+
         # (B, (1+)Pnn, time_len, 4)
         target_agents_past_xyyaw = target_agents_past[..., :4]  #
 
-        #  (B, (1+)Pnn, T, 4)
+        #  (B, (1+)Pnn, T, 5)
         target_future_norm_xT: torch.Tensor = target_cur_future_norm_xT[:, :,
                                                                         1:, :]
-
         # 현재 프레임(정규화): 과거~현재 시퀀스의 마지막 프레임을 기준으로 잡아 정합성 강화
         # target_cur_xyyaw:  (B, (1+)Pnn, 4)
         target_cur_xyyaw: torch.Tensor = target_agents_past_xyyaw[:, :, -1, :]
@@ -330,21 +370,38 @@ class Decoder(nn.Module):
             # dtype/device 정합: concat 전에 맞춰두는 게 안전
             target_agents_past_xyyaw = _cast_like(target_agents_past_xyyaw,
                                                   target_future_norm_xT)
+            """
+            target_agents_past_xyyaw: (B, (1+)Pnn, time_len, 4) -> (B, (1+)Pnn, time_len, 5)
+            5 = (x, y, cos, sin) 에서 diffusion noise time step 추가
+            참고로 time_len 은 과거~현재이므로 노이즈를 추가하지 않을 것이므로, 0으로 채움
+            """
+            time_len: int = target_agents_past_xyyaw.size(2)
+            target_agents_past_xyyaw = torch.cat(
+                [
+                    target_agents_past_xyyaw,
+                    torch.zeros(
+                        (B, one_or_Pnn, time_len, 1),
+                        dtype=target_agents_past_xyyaw.dtype,
+                        device=target_agents_past_xyyaw.device,
+                    ),
+                ],
+                dim=-1,
+            )  # (B, (1+)Pnn, time_len, 5)
 
-            # (B, (1+)Pnn, time_len + T, 4)
-            # (B, (1+)Pnn, time_len, 4) + (B, (1+)Pnn, T, 4)
+            # (B, (1+)Pnn, time_len + T, 5)
+            # (B, (1+)Pnn, time_len, 5) + (B, (1+)Pnn, T, 5)
             xT_input_seq: torch.Tensor = torch.cat(
                 [target_agents_past_xyyaw, target_future_norm_xT],
                 dim=2,
             )
         else:
             if self.config.use_current_input:
-                # (B, (1+)Pnn, 1+T, 4)
+                # (B, (1+)Pnn, 1+T, 5)
                 xT_input_seq = target_cur_future_norm_xT
             else:
-                # (B, (1+)Pnn, T, 4)
+                # (B, (1+)Pnn, T, 5)
                 xT_input_seq = target_future_norm_xT
-
+        ###
         # flatten: (B, (1+)Pnn, F)
         xT_input_flat: torch.Tensor = xT_input_seq.reshape(B, one_or_Pnn, -1)
 
@@ -1566,10 +1623,11 @@ class Decoder(nn.Module):
         return_: Dict[str, torch.Tensor] = {}
 
         B: int = batch_size
+        diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
 
         # 1) DiT 입력 준비 (flatten + 목표점 주입 옵션)
         """ xT_input_flat
-        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, future_len*4)
+        (B, (1+)Pnn, (time_len+future_len)*5) or (B, (1+)Pnn, (1+future_len)*5) or (B, (1+)Pnn, future_len*5)
         target_cur_xyyaw
          (B, (1+)Pnn, 4)
         """
@@ -1579,9 +1637,9 @@ class Decoder(nn.Module):
             cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
+            diffusion_time=diffusion_time,
         )
         # 2) DiT 1회 호출
-        diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
         low_t_mask: torch.Tensor = inputs["low_t_mask"]  # (B,)
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self._run_dit_training_forward(
@@ -1885,12 +1943,13 @@ class DiT(nn.Module):
             self.feasible_projector.enable_profile = self.config.profile_feasible
 
         self._model_type = model_type
-        self.preproj = Mlp(in_features=output_dim,
+        self.preproj = Mlp(in_features=int(output_dim/4*5), # x, y, cos(yaw), sin(yaw), noising timestep
                            hidden_features=512,
                            out_features=hidden_dim,
                            act_layer=nn.GELU,
                            drop=0.)
         self.t_embedder = TimestepEmbedder(hidden_dim)
+        self._amortized_t_emb = nn.Embedding(1, hidden_dim) #
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_dim, heads, dropout, mlp_ratio)
             for i in range(depth)
@@ -2204,7 +2263,11 @@ class DiT(nn.Module):
 
         # 2) timestep embedding
         # t_embedding: (B, H)
-        t_embedding: torch.Tensor = self.t_embedder(diffusion_time).to(x.dtype)
+        if diffusion_time.ndim == 1:
+            t_embedding: torch.Tensor = self.t_embedder(diffusion_time).to(x.dtype)
+        else:
+            t_embedding = self._amortized_t_emb.weight.expand(
+                diffusion_time.shape[0], -1).to(x.dtype) # (B, H)
         ego_fut_global = _cast_like(ego_fut_global, x)
 
         # 3) state_token_in 준비 (현재 프레임 기반)
@@ -2229,14 +2292,14 @@ class DiT(nn.Module):
             target_agents_route_lane_emb=target_agents_route_lane_emb,
             route_known_mask=route_known_mask,  # (B, (1+)Pnn)
         )
-        time_out = self.pram_v2_time_mod(t_embedding)  # (B,1,H)
+        time_out = self.pram_v2_time_mod(t_embedding)  # TimeModulationOutputs 3개 (B,1,H)
 
         # 5) DiT 블록 반복
         for block_index, block in enumerate(self.blocks):
             # Dict[PathName, ModulationTriplet]
             pram_mods = compute_pram_v2_modulations_for_block(
                 composer_out=composer_out,
-                time_out=time_out,
+                time_out=time_out, # TimeModulationOutputs 3개 (B,1,H)
                 path_scalars=self.pram_v2_block_path_scalars,
                 block_index=block_index,
                 batch_size=B,

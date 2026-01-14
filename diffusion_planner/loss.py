@@ -329,34 +329,35 @@ def _sample_diffusion_time_and_noise(
     """
     # target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
     B: int = target_future_gt_4_dim.shape[0]
-
-    # batch_diffusion_time: (B,)
-    batch_diffusion_time: torch.Tensor = torch.rand(
-        B,
-        device=target_future_gt_4_dim.device,
-    ) * (1 - eps) + eps
-    t_threshold: float = float(args.feasible_learn_noise_thresh)
-    if not getattr(args, "use_direct_loss", False):
-        t_threshold = 1.0
-    # low_t_mask: (B,)
-    low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
-    # low_t_mask_bt: (B,1,1)
-    low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
-    if args.use_amortized_diffusion:
-        # half_of_B_amortized_mask: (B) by random sample
-        half_of_B_amortized_mask = torch.randperm(B, device=target_future_gt_4_dim.device) < (B // 2)
+    """
+    매번 50% 50% 확률 뽑기를 해서, 해당 배치 전체를 amortized 모드 또는 일반 모드로 처리한다.
+    """
+    use_amortized_mode: bool = (torch.rand(1).item() < 0.5)
+    if args.use_amortized_diffusion and use_amortized_mode:
 
         future_len = args.future_len # 80
         # t_tau = tau / future_len  # shape (future_len)
         t_tau = torch.arange(1, future_len + 1,
                              device=target_future_gt_4_dim.device) / float(future_len)
         # batch_diffusion_time: (B, future_len) # just append t_tau to each batch. no randomness
-        amortized_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).repeat(B//2, 1) # (B/2, future_len)
-        batch_diffusion_time = batch_diffusion_time.unsqueeze(1).repeat(1, future_len) # (B, future_len)
-        batch_diffusion_time[half_of_B_amortized_mask] = amortized_diffusion_time # (B, future_len)
-        # low_t_mask / low_t_mask_bt: (B,1,1) -> half_of_B_amortized_mask 인 부분은 무조건 True
-        low_t_mask = low_t_mask | half_of_B_amortized_mask
+        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).repeat(B, 1) # (B, future_len)
+        # low_t_mask / low_t_mask_bt: (B,1,1) ->  무조건 True
+        low_t_mask = torch.ones(B, dtype=torch.bool, device=target_future_gt_4_dim.device)
         low_t_mask_bt = low_t_mask.view(B, 1, 1)
+    else:
+        # batch_diffusion_time: (B,)
+        batch_diffusion_time: torch.Tensor = torch.rand(
+            B,
+            device=target_future_gt_4_dim.device,
+        ) * (1 - eps) + eps
+        t_threshold: float = float(args.feasible_learn_noise_thresh)
+        if not getattr(args, "use_direct_loss", False):
+            t_threshold = 1.0
+        # low_t_mask: (B,)
+        low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
+        # low_t_mask_bt: (B,1,1)
+        low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
+
 
     # random_noise: (B, (1+)Pnn, future_len, 4)
     random_noise: torch.Tensor = torch.randn_like(
