@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ---------------- CPU 분리 설정 ----------------
+CPUSET="0-63"
+NUM_CPUS=64
+
+# (선택) 라이브러리들이 멋대로 스레드 폭발시키는 걸 방지
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export BLIS_NUM_THREADS=1
+
+# ✅ 스크립트(현재 쉘) 자체를 CPUSET에 고정 → 이후 실행되는 하위 작업들도 그대로 따라감
+if ! command -v taskset >/dev/null 2>&1; then
+  echo "[ERROR] taskset 명령을 찾을 수 없습니다. (util-linux 설치 필요)" >&2
+  exit 1
+fi
+taskset -cp "${CPUSET}" $$ >/dev/null
+
+echo "[CPU] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
+# ----------------------------------------------
+
 # (:-0은 “없으면 0”이라는 뜻)
 RUN_COUNT="${1:-0}"
 echo "[INFO] run_count=${RUN_COUNT}"
@@ -58,7 +79,8 @@ ensure_eval_set_list_json() {
   export _DP_VALIDATION_DIR="$validation_dir"
   export _DP_VALIDATION_JSON="$json_path"
 
-  "$python_bin" - <<'PY'
+  # (선택) 여기에서도 명시적으로 taskset (스크립트가 이미 고정이라 사실상 중복이지만 안전)
+  taskset -c "${CPUSET}" "$python_bin" - <<'PY'
 import glob
 import json
 import os
@@ -157,10 +179,13 @@ fi
 export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
-
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
- eval_predictor.py \
- --port 23001 \
+# ✅ 메인 실행도 taskset으로 한 번 더 명시 (스크립트 affinity 고정이라 중복이지만 확실하게)
+taskset -c "${CPUSET}" \
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
+  --nnodes 1 --nproc-per-node 1 --standalone \
+  --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
+  eval_predictor.py \
+  --port 23001 \
   --eval_set "$EVAL_SET_PATH" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
