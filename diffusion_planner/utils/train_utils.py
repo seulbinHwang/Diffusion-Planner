@@ -290,7 +290,7 @@ def resume_model(
     except:
         init_epoch = 0
 
-    # Load wandb id
+    # Load wafndb id
     try:
         wandb_id = ckpt['wandb_id']
         print("wandb id load done")

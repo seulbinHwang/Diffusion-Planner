@@ -2200,6 +2200,7 @@ class DiT(nn.Module):
         route_known_mask = _to_bool_mask(route_known_mask).to(device=x.device)
 
         # 2) timestep embedding
+        # t_embedding: (B, H)
         t_embedding: torch.Tensor = self.t_embedder(diffusion_time).to(x.dtype)
         ego_fut_global = _cast_like(ego_fut_global, x)
 

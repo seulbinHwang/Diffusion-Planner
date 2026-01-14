@@ -458,7 +458,7 @@ def _forward_model_with_autocast(
     norm_inputs: Dict[str, torch.Tensor],
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
     target_cur_future_norm_xT: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
-    batch_diffusion_time: torch.Tensor,  # (B,)
+    batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
     use_deepspeed: bool,
 ) -> Dict[str, torch.Tensor]:
@@ -483,7 +483,7 @@ def _forward_model_with_autocast(
 
         target_future_valid: (B, (1 +) Pnn, future_len) 미래 유효 마스크.
         target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재+미래 x_T.
-        batch_diffusion_time: (B,) diffusion 시간.
+        batch_diffusion_time: (B,) or (B, T) diffusion 시간.
         cond_last_pos_norm: (B, (1+)Pnn, 4) cond 용 마지막 위치.
 
     Returns:
@@ -899,7 +899,7 @@ def diffusion_loss_func(
         target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
         target_cur_future_norm_xT=
         target_cur_future_norm_xT,  # (B, (1+)Pnn, 1+future_len, 4)
-        batch_diffusion_time=batch_diffusion_time,  # (B,)
+        batch_diffusion_time=batch_diffusion_time,  # (B,) or (B, future_len)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
         use_deepspeed=getattr(args, "use_deepspeed", False),
     )
