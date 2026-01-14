@@ -310,24 +310,24 @@ def _build_future_masks_and_current_state(
 
 
 def _sample_diffusion_time_and_noise(
-    target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, T, 4)
+    target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     eps: float,
     args: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """미래 궤적 크기에 맞춰 diffusion time 과 노이즈를 샘플링한다.
 
     Args:
-        target_future_gt_4_dim: (B, (1+)Pnn, T, 4) 미래 궤적.
+        target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 궤적.
         eps: 시간 샘플링 하한.
         args: args.feasible_learn_noise_thresh, args.use_direct_loss 사용.
 
     Returns:
-        batch_diffusion_time: (B,) 각 배치별 diffusion 시간.
+        batch_diffusion_time: # (B,) or (B, future_len) 각 배치별 diffusion 시간.
         low_t_mask: (B,) 저노이즈 배치 마스크.
         low_t_mask_bt: (B, 1, 1) 저노이즈 마스크(브로드캐스트용).
-        random_noise: (B, (1+)Pnn, T, 4) 노이즈 샘플.
+        random_noise: (B, (1+)Pnn, future_len, 4) 노이즈 샘플.
     """
-    # target_future_gt_4_dim: (B, (1+)Pnn, T, 4)
+    # target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
     B: int = target_future_gt_4_dim.shape[0]
 
     # batch_diffusion_time: (B,)
@@ -335,16 +335,36 @@ def _sample_diffusion_time_and_noise(
         B,
         device=target_future_gt_4_dim.device,
     ) * (1 - eps) + eps
+    if args.use_amortized_diffusion:
+        # half_of_B_amortized_mask: (B) by random sample
+        half_of_B_amortized_mask = torch.randperm(B, device=target_future_gt_4_dim.device) < (B // 2)
 
-    t_threshold: float = float(args.feasible_learn_noise_thresh)
-    if not getattr(args, "use_direct_loss", False):
-        t_threshold = 1.0
-    # low_t_mask: (B,)
-    low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
-    # low_t_mask_bt: (B,1,1)
-    low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
+        future_len = args.future_len # 80
+        # t_tau = tau / future_len  # shape (future_len)
+        t_tau = torch.arange(1, future_len + 1,
+                             device=target_future_gt_4_dim.device) / float(future_len)
+        # batch_diffusion_time: (B, future_len) # just append t_tau to each batch. no randomness
+        amortized_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).repeat(B//2, 1) # (B/2, future_len)
+        batch_diffusion_time = batch_diffusion_time.unsqueeze(1).repeat(1, future_len) # (B, future_len)
+        batch_diffusion_time[half_of_B_amortized_mask] = amortized_diffusion_time # (B, future_len)
+        # low_t_mask: (B,) always True.
+        low_t_mask: torch.Tensor = torch.ones(
+            B,
+            dtype=torch.bool,
+            device=target_future_gt_4_dim.device,
+        )
+        # low_t_mask_bt: (B,1,1)
+        low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
+    else:
+        t_threshold: float = float(args.feasible_learn_noise_thresh)
+        if not getattr(args, "use_direct_loss", False):
+            t_threshold = 1.0
+        # low_t_mask: (B,)
+        low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
+        # low_t_mask_bt: (B,1,1)
+        low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
 
-    # random_noise: (B, (1+)Pnn, T, 4)
+    # random_noise: (B, (1+)Pnn, future_len, 4)
     random_noise: torch.Tensor = torch.randn_like(
         target_future_gt_4_dim,
         device=target_future_gt_4_dim.device,
@@ -356,7 +376,7 @@ def _normalize_futures_and_build_xT(
     target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_current_xyyaw_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
     target_cur_future_mask: torch.Tensor,  # (B, (1+)Pnn, 1+future_len)
-    batch_diffusion_time: torch.Tensor,  # (B,)
+    batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     state_normalizer: StateNormalizer,
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
@@ -368,7 +388,7 @@ def _normalize_futures_and_build_xT(
         target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 궤적(denorm).
         target_current_xyyaw_norm: (B, (1+)Pnn, 4) 현재 상태(정규화).
         target_cur_future_mask: (B, (1+)Pnn, 1+future_len) 현재+미래 마스크.
-        batch_diffusion_time: (B,) diffusion 시간.
+        batch_diffusion_time: (B,) or (B, future_len) 배치별 diffusion 시간.
         random_noise: (B, (1+)Pnn, future_len, 4) 노이즈.
         state_normalizer: 상태 정규화/역정규화 도우미.
         marginal_prob: SDE 의 marginal_prob 함수.
@@ -408,15 +428,14 @@ def _normalize_futures_and_build_xT(
     target_future_norm_gt: torch.Tensor = target_cur_future_norm_gt[:, :, 1:, :]
 
     # mean, std_raw: 각각 (B, (1+)Pnn, future_len, 4) 또는 (B,) 등 marginal_prob 설계에 맞게 반환
+    # marginal_prob: <diffusion_planner/model/diffusion_utils/sde.py> 의 VPSDE_linear 클래스의 메서드
     mean, std_raw = marginal_prob(target_future_norm_gt, batch_diffusion_time)
     mean = _require_finite("marginal_prob mean", mean)
-    std_raw = _require_finite("marginal_prob std", std_raw)
-
-    # std: (B, 1, 1, 1) 로 reshape
-    std: torch.Tensor = std_raw.view(
-        -1,
-        *([1] * (len(target_future_norm_gt.shape) - 1)),
-    )
+    std = _require_finite("marginal_prob std", std_raw)
+    assert std.ndim == 4, "std_raw must be (B, _, _, _)"
+    """
+    std : (B, 1, 1, 1) or (B, 1, future_len, 1)
+    """
 
     # target_future_noise_xT: (B, (1+)Pnn, future_len, 4)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
@@ -844,7 +863,7 @@ def diffusion_loss_func(
     B, one_or_Pnn, future_len, = target_future_valid.shape
 
     # diffusion time / low noise mask / random noise 샘플링
-    # batch_diffusion_time: (B,)
+    # batch_diffusion_time: # (B,) or (B, future_len)
     # low_t_mask: (B,)
     # low_t_mask_bt: (B,1,1)
     # random_noise: (B, (1+)Pnn, future_len, 4)
@@ -867,7 +886,7 @@ def diffusion_loss_func(
          target_future_gt_4_dim,
          target_current_xyyaw_norm,  # (B, (1+)Pnn, 4)
          target_cur_future_mask,
-         batch_diffusion_time,
+         batch_diffusion_time, # (B,) or (B, future_len)
          random_noise,
          state_normalizer,
          marginal_prob,

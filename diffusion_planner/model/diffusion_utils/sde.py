@@ -75,19 +75,26 @@ class VPSDE_linear(SDE):
 
     def sde(self, x, t):
         """
+        x: (B, (1+)Pnn, future_len, 4) shape
+        t: (B)
+
         SDE of diffusion process
 
         drift = $-\frac{\beta(t)}{2} x$
         diffusion = $\sqrt{\beta(t)}$
         """
-        shape = x.shape
+        shape = x.shape # (B, (1+)Pnn, future_len, 4)
         reshape = [-1] + [
             1,
-        ] * (len(shape) - 1)
-        t = t.reshape(reshape)
-
+        ] * (len(shape) - 1) # [ -1, 1, 1, 1 ]
+        t = t.reshape(reshape) # (B, 1, 1, 1)
+        """
+        _beta_max: 20.0
+        _beta_min: 0.1
+        """
         beta_t = (self._beta_max - self._beta_min) * t + self._beta_min
         drift = -0.5 * beta_t * x
+        # diffusion: (B,1,1,1)
         diffusion = torch.sqrt(beta_t)
 
         return drift, diffusion
@@ -95,17 +102,32 @@ class VPSDE_linear(SDE):
     def marginal_prob(self, x, t):
         """
         Parameters to determine the marginal distribution of the SDE, $p_t(x)$.
+
+        x: (B, (1+)Pnn, future_len, 4) shape
+        t: (B) or (B, future_len)
         """
-        shape = x.shape
-        reshape = [-1] + [
-            1,
-        ] * (len(shape) - 1)
-        t = t.reshape(reshape)
+        shape = x.shape # (B, (1+)Pnn, future_len, 4)
+        t_ndim = t.ndim
+        if t_ndim == 1: # (B,)
+            reshape = [-1] + [
+                1,
+            ] * (len(shape) - 1) # [ -1, 1, 1, 1 ]
+            t = t.reshape(reshape) # (B, 1, 1, 1)
+        else:
+            assert t.shape == (shape[0], shape[2]) # (B, future_len)
+            # t: (B, future_len) -> (B, 1, future_len, 1)
+            reshape = [-1] + [
+                1,
+            ] * (len(shape) - 2) + [1]
+            t = t.reshape(reshape) # (B, 1, future_len, 1)
+
+        # mean_log_coeff: (B, 1, 1, 1)
         mean_log_coeff = -0.25 * t ** 2 * \
             (self._beta_max - self._beta_min) - 0.5 * self._beta_min * t
 
-        mean = torch.exp(mean_log_coeff) * x
+        mean = torch.exp(mean_log_coeff) * x # (B, (1+)Pnn, future_len, 4)
         std = torch.sqrt(1 - torch.exp(2. * mean_log_coeff))
+        # std: (B, 1, 1, 1) or (B, 1, future_len, 1)
         return mean, std
 
     def diffusion_coeff(self, t):

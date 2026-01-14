@@ -195,6 +195,10 @@ def get_args():
                         default=False,
                         type=boolean,
                         help='save_inference_data')
+    parser.add_argument('--save_inference_data',
+                        default=False,
+                        type=boolean,
+                        help='save_inference_data')
     parser.add_argument('--rollout_step_count_for_save',
                         type=int,
                         default=-1)
@@ -272,6 +276,7 @@ def get_args():
                         default='normalization.json',
                         help='filepath of normalization.json',
                         type=str)
+    parser.add_argument('--use_amortized_diffusion', default=False, type=boolean)
     parser.add_argument('--validate_scenario_rollouts', default=True, type=boolean)
     parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
