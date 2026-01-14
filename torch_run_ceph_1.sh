@@ -54,4 +54,4 @@ STAGE1_CFG="configs/fine_tuning1.yaml"
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --stage_config_path "${STAGE1_CFG}" \
-  --batch_size 512
+  --batch_size 576
