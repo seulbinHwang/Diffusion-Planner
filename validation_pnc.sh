@@ -165,8 +165,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "nuplan_womd_fine_tuning1" \
-  --name "nuplan_womd_fine_tuning1" \
+  --load_name "nuplan_womd_fine_tuning1_lr_1" \
+  --name "nuplan_womd_fine_tuning1_lr_1" \
   --eval_method "validation" \
   --batch_size 256 \
   --use_deepspeed True \
