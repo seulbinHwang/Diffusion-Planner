@@ -447,7 +447,7 @@ def get_args():
     # ===== DeepSpeed / ZeRO-2 관련 설정 =====
     parser.add_argument("--use_deepspeed",
                         type=boolean,
-                        default=False,
+                        default=True,
                         help="DeepSpeed ZeRO-2로 학습할지 여부")
 
     parser.add_argument("--grad_accum_steps",
