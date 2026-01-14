@@ -1,6 +1,6 @@
 # configs/stage2.yaml
 name: "nuplan_womd_fine_tuning1_lr_1"
-load_name: "nuplan_womd"
+load_name: "nuplan_womd_fine_tuning1_lr_1"
 # Stage2: Stage1보다 1/3 정도 작은 lr에서 시작 → 1/4 근처까지 감소
 learning_rate: 1e-4        # ≈ 5e-4 / 3
 
@@ -16,5 +16,4 @@ w_int_max: 1.0
 resume_local_path_model_path: null
 # Stage2는 shell에서 --resume_wandb_model_name latest 로 지정해서 시작
 resume_wandb_model_name: latest
-resume_model_only: true
-use_deepspeed: True
+resume_model_only: false
