@@ -363,6 +363,7 @@ class Decoder(nn.Module):
             target_agents_past: torch.Tensor,  # # (B, (1+)Pnn, time_len, 11)
             xT_input_flat: torch.Tensor,  # (B, (1+)Pnn, F)
             diffusion_time: torch.Tensor,  # (B,)
+            low_t_mask: torch.Tensor,  # (B,)
             scene_encoding_token: torch.Tensor,  # (B, token_num, D)
             scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
             ego_fut_global: torch.Tensor,  # (B, D)
@@ -408,6 +409,7 @@ class Decoder(nn.Module):
             route_known_mask,  # (B, Pnn)
             target_class_one_hot,  # (B, (1+)Pnn, 3)
             target_current_xyyaw=target_cur_xyyaw,  # (B, (1+)Pnn, 4)
+            low_t_mask=low_t_mask,
         )
         _require_finite("decoder_dit_output", score_flat)
         return score_flat
@@ -1580,12 +1582,13 @@ class Decoder(nn.Module):
         )
         # 2) DiT 1회 호출
         diffusion_time: torch.Tensor = inputs["diffusion_time"]  # (B,)
-
+        low_t_mask: torch.Tensor = inputs["low_t_mask"]  # (B,)
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self._run_dit_training_forward(
             target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             xT_input_flat=xT_input_flat,  # (B, (1+)Pnn, F)
             diffusion_time=diffusion_time,  # (B,)
+            low_t_mask=low_t_mask,  # (B,)
             scene_encoding_token=scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask=scene_encoding_token_mask,  # (B, token_num)
             ego_fut_global=ego_fut_global,  # (B, D)
@@ -2304,6 +2307,7 @@ class DiT(nn.Module):
         self,
         x: torch.
         Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            low_t_mask: Optional[torch.Tensor],  # (B,)
         diffusion_time: torch.Tensor,  # (B,)
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         target_past_cur_future_valid: torch.
@@ -2339,9 +2343,10 @@ class DiT(nn.Module):
         )
 
         # 3) low-t 마스크 계산
-        low_t_mask: torch.Tensor = self._compute_feasible_low_t_mask(
-            diffusion_time=diffusion_time,  # (B,)
-        )  # (B,)
+        if low_t_mask is None:
+            low_t_mask: torch.Tensor = self._compute_feasible_low_t_mask(
+                diffusion_time=diffusion_time,  # (B,)
+            )  # (B,)
 
         # 4) FeasibleProjector 실행(dit_returns 갱신)
         self._feasible_projection(
@@ -2413,6 +2418,7 @@ class DiT(nn.Module):
         route_known_mask: torch.Tensor,  # (B, (1+)Pnn)
         target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+        low_t_mask: Optional[torch.Tensor] = None,  # (B,) bool
     ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         """DiT 전체 forward 를 수행하는 진입점.
 
@@ -2464,13 +2470,15 @@ class DiT(nn.Module):
 
         # model_type 분기
         if self._model_type == "score":
-            return self._forward_score_branch(
-                x=x,  # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-                diffusion_time=diffusion_time,
-            )
+            raise NotImplementedError("Score model type is not implemented.")
+            # return self._forward_score_branch(
+            #     x=x,  # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            #     diffusion_time=diffusion_time,
+            # )
         elif self._model_type == "x_start":
             return self._forward_x_start_branch(
                 x=x,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+                low_t_mask=low_t_mask,
                 diffusion_time=diffusion_time,
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
                 target_past_cur_future_valid=target_past_cur_future_valid,

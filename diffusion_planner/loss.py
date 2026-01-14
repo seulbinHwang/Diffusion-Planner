@@ -335,6 +335,13 @@ def _sample_diffusion_time_and_noise(
         B,
         device=target_future_gt_4_dim.device,
     ) * (1 - eps) + eps
+    t_threshold: float = float(args.feasible_learn_noise_thresh)
+    if not getattr(args, "use_direct_loss", False):
+        t_threshold = 1.0
+    # low_t_mask: (B,)
+    low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
+    # low_t_mask_bt: (B,1,1)
+    low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
     if args.use_amortized_diffusion:
         # half_of_B_amortized_mask: (B) by random sample
         half_of_B_amortized_mask = torch.randperm(B, device=target_future_gt_4_dim.device) < (B // 2)
@@ -347,22 +354,9 @@ def _sample_diffusion_time_and_noise(
         amortized_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).repeat(B//2, 1) # (B/2, future_len)
         batch_diffusion_time = batch_diffusion_time.unsqueeze(1).repeat(1, future_len) # (B, future_len)
         batch_diffusion_time[half_of_B_amortized_mask] = amortized_diffusion_time # (B, future_len)
-        # low_t_mask: (B,) always True.
-        low_t_mask: torch.Tensor = torch.ones(
-            B,
-            dtype=torch.bool,
-            device=target_future_gt_4_dim.device,
-        )
-        # low_t_mask_bt: (B,1,1)
-        low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
-    else:
-        t_threshold: float = float(args.feasible_learn_noise_thresh)
-        if not getattr(args, "use_direct_loss", False):
-            t_threshold = 1.0
-        # low_t_mask: (B,)
-        low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
-        # low_t_mask_bt: (B,1,1)
-        low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
+        # low_t_mask / low_t_mask_bt: (B,1,1) -> half_of_B_amortized_mask 인 부분은 무조건 True
+        low_t_mask = low_t_mask | half_of_B_amortized_mask
+        low_t_mask_bt = low_t_mask.view(B, 1, 1)
 
     # random_noise: (B, (1+)Pnn, future_len, 4)
     random_noise: torch.Tensor = torch.randn_like(
@@ -439,6 +433,7 @@ def _normalize_futures_and_build_xT(
 
     # target_future_noise_xT: (B, (1+)Pnn, future_len, 4)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
+    target_future_noise_xT[target_future_mask] = 0.0
 
     target_cur_norm_gt = target_cur_future_norm_gt[:, :, :
                                                    1, :]  # (B, (1+)Pnn, 1, 4)
@@ -448,6 +443,7 @@ def _normalize_futures_and_build_xT(
         [target_cur_norm_gt, target_future_noise_xT],
         dim=2,
     )
+    target_cur_future_norm_xT[target_cur_future_mask] = 0.0
     assert target_cur_future_norm_xT.shape == (B, one_or_Pnn, 1 + future_len, 4)
 
     return target_future_norm_gt, target_cur_future_norm_xT, cond_last_pos_norm, std
@@ -459,6 +455,7 @@ def _forward_model_with_autocast(
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
     target_cur_future_norm_xT: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
     batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
+    low_t_mask: torch.Tensor,  # (B,)
     cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
     use_deepspeed: bool,
 ) -> Dict[str, torch.Tensor]:
@@ -501,6 +498,7 @@ def _forward_model_with_autocast(
         "target_cur_future_norm_xT":
             target_cur_future_norm_xT,  # (B, (1+)Pnn, 1+future_len, 4)
         "diffusion_time": batch_diffusion_time,  # (B,)
+        "low_t_mask": low_t_mask,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
     }
     is_ds_engine = hasattr(model, "backward") and hasattr(
@@ -874,6 +872,7 @@ def diffusion_loss_func(
          args,
      )
 
+
     # 미래 궤적 정규화 + x_T 샘플 생성
     """
         target_future_norm_gt: (B, (1+)Pnn, future_len, 4) 정규화된 미래 궤적.
@@ -900,6 +899,7 @@ def diffusion_loss_func(
         target_cur_future_norm_xT=
         target_cur_future_norm_xT,  # (B, (1+)Pnn, 1+future_len, 4)
         batch_diffusion_time=batch_diffusion_time,  # (B,) or (B, future_len)
+        low_t_mask=low_t_mask,  # (B,)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
         use_deepspeed=getattr(args, "use_deepspeed", False),
     )
