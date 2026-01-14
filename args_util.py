@@ -195,10 +195,6 @@ def get_args():
                         default=False,
                         type=boolean,
                         help='save_inference_data')
-    parser.add_argument('--save_inference_data',
-                        default=False,
-                        type=boolean,
-                        help='save_inference_data')
     parser.add_argument('--rollout_step_count_for_save',
                         type=int,
                         default=-1)
