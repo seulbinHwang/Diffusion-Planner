@@ -409,6 +409,7 @@ def _recommend_wosac_mp_processes(
             ", gpu_processes_per_node:", gpu_proc,
             ", TF num threads:", safe_t)
 
+
     raw_p = (float(cpu_cores) *
              float(cpu_fraction)) / float(gpu_proc) / float(safe_t)
 
@@ -466,33 +467,21 @@ def _configure_tensorflow_for_wosac(tf_num_threads: int) -> None:
         pass
 
 
-def _parse_cpuset(s: str) -> set[int]:
-    cpus = set()
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            a, b = part.split("-")
-            cpus.update(range(int(a), int(b) + 1))
-        else:
-            cpus.add(int(part))
-    return cpus
-
-def _pin_current_process_to_dp_cpuset() -> None:
-    cpuset = os.environ.get("DP_CPUSET", "").strip()
-    if not cpuset:
-        return
-    os.sched_setaffinity(0, _parse_cpuset(cpuset))
-
 def _init_wosac_mp_worker(tf_num_threads: int) -> None:
-    cpuset = os.environ.get("DP_CPUSET", "").strip()
-    if cpuset:
-        try:
-            os.sched_setaffinity(0, _parse_cpuset(cpuset))
-        except Exception:
-            raise RuntimeError(f"Failed to set CPU affinity to '{cpuset}'")
+    """multiprocessing worker 프로세스가 시작될 때 1번 실행되는 초기화 함수입니다.
 
+    목적
+    ----
+    Pool의 각 worker는 별도 프로세스이므로,
+    TensorFlow 설정(T, GPU 비활성화)을 worker 안에서도 확실히 적용하기 위해 씁니다.
+
+    Args:
+        tf_num_threads (int):
+            TensorFlow 스레드 수 T. shape: ()
+
+    Returns:
+        None
+    """
     _configure_tensorflow_for_wosac(tf_num_threads=int(tf_num_threads))
 
 
@@ -732,7 +721,6 @@ class WOSACMetrics(Metric):
                  prefix: str,
                  is_active: bool,
                  ego_only: bool = False) -> None:
-        _pin_current_process_to_dp_cpuset()   # ✅ 추가
         super().__init__()
         self.is_active = is_active
         self.is_mp_init = False
