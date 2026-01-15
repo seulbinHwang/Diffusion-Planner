@@ -225,6 +225,8 @@ fi
 # 그리고 miniforge는 기본 "읽기 전용"으로 한 번 더 덮어씌움(환경 보호)
 MOUNTS=(-v "/media/user:/media/user")
 MOUNTS+=(-v "$MINIFORGE_HOST:$MINIFORGE_HOST:${MINIFORGE_MOUNT_OPT}")
+MOUNTS+=(-v "/usr/local/cuda:/usr/local/cuda:ro")
+MOUNTS+=(-v "/usr/local/cuda-12.*/:/usr/local/cuda-12.*:ro")
 
 
 # 작업 폴더(스크립트 위치와 같은 경로를 컨테이너에서도 그대로 사용)
