@@ -165,8 +165,8 @@ ENV PATH=$CONDA_DIR/bin:$PATH
 RUN conda install -n base -c conda-forge -y mamba && conda clean -a -y
 
 # 사용자 생성 (호스트와 UID/GID 맞추기)
-RUN groupadd --gid $USER_GID $USERNAME \
- && useradd  --uid $USER_UID --gid $USER_GID -m $USERNAME
+RUN if ! getent group $USER_GID >/dev/null; then groupadd --gid $USER_GID $USERNAME; fi \
+ && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME
 
 # conda 환경 생성
 COPY environment.docker.yml /tmp/environment.yml
