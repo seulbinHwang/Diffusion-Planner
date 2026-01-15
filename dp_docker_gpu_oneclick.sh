@@ -94,7 +94,8 @@ awk -v newname="$ENV_NAME" '
 
 grep -vE '^[[:space:]]*-[[:space:]]*diffusion-planner==.*$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
 mv "$DOCKER_YML.tmp" "$DOCKER_YML"
-
+grep -vE '^[[:space:]]*-[[:space:]]*(flash-attn|flash_attn)(==.*)?$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
+mv "$DOCKER_YML.tmp" "$DOCKER_YML"
 ###############################################################################
 # 5) tmux 설정 + 레이아웃 스크립트
 ###############################################################################
@@ -177,6 +178,12 @@ COPY environment.docker.yml /tmp/environment.yml
 RUN mamba env create -f /tmp/environment.yml \
  && conda clean -a -y \
  && rm -f /tmp/environment.yml
+
+RUN bash -lc "source /opt/conda/etc/profile.d/conda.sh \
+ && conda activate diffusion_planner \
+ && python -c 'import torch; print(torch.__version__)' \
+ && pip install -U packaging ninja \
+ && MAX_JOBS=16 pip install flash-attn --no-build-isolation"
 
 # 작업 폴더
 RUN mkdir -p /workspace/Diffusion-Planner
