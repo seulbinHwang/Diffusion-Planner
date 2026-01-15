@@ -223,8 +223,9 @@ fi
 
 # 기본 마운트: /media/user/E 전체를 같은 경로로 마운트(절대경로 그대로 쓰기 위함)
 # 그리고 miniforge는 기본 "읽기 전용"으로 한 번 더 덮어씌움(환경 보호)
-MOUNTS=(-v "/media/user/E:/media/user/E")
+MOUNTS=(-v "/media/user:/media/user")
 MOUNTS+=(-v "$MINIFORGE_HOST:$MINIFORGE_HOST:${MINIFORGE_MOUNT_OPT}")
+
 
 # 작업 폴더(스크립트 위치와 같은 경로를 컨테이너에서도 그대로 사용)
 WORKDIR_IN_CONTAINER="$PROJECT_DIR"
