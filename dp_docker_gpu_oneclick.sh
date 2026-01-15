@@ -80,6 +80,7 @@ echo "[5/7] conda 환경 내보내기 (docker용 environment.yml 생성)"
 RAW_YML="$DOCKER_DIR/environment.raw.yml"
 DOCKER_YML="$DOCKER_DIR/environment.docker.yml"
 
+
 conda env export -n "$ENV_NAME" --no-builds > "$RAW_YML"
 
 # prefix(호스트 절대경로) 제거 + 로컬경로/편집설치(-e, file://) 제거 + name 고정
@@ -96,6 +97,10 @@ grep -vE '^[[:space:]]*-[[:space:]]*diffusion-planner==.*$' "$DOCKER_YML" > "$DO
 mv "$DOCKER_YML.tmp" "$DOCKER_YML"
 grep -vE '^[[:space:]]*-[[:space:]]*(flash-attn|flash_attn)(==.*)?$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
 mv "$DOCKER_YML.tmp" "$DOCKER_YML"
+# nuplan-devkit==1.2.2 는 pip에서 못 찾아서 빌드가 멈춤 → yml에서 제거
+grep -vE '^[[:space:]]*-[[:space:]]*nuplan-devkit(==.*)?$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
+mv "$DOCKER_YML.tmp" "$DOCKER_YML"
+
 ###############################################################################
 # 5) tmux 설정 + 레이아웃 스크립트
 ###############################################################################
@@ -184,6 +189,7 @@ RUN bash -lc "source /opt/conda/etc/profile.d/conda.sh \
  && conda activate diffusion_planner \
  && python -c 'import torch; print(torch.__version__)' \
  && pip install -U packaging ninja \
+ && pip install 'git+https://github.com/motional/nuplan-devkit.git@nuplan-devkit-v1.2' \
  && MAX_JOBS=16 pip install flash-attn --no-build-isolation"
 
 # 작업 폴더
