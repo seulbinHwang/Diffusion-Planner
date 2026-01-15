@@ -342,10 +342,17 @@ class Decoder(nn.Module):
             [diffusion_time_for_current, diffusion_time_for_future],
             dim=1,
         )  # (B, 1+future_len)
+        B, P, T1, _ = target_cur_future_norm_xT.shape  # T1 = 1 + future_len
+        diffusion_time_full = diffusion_time_full[
+            :, None, :, None]  # (B,1,T1,1)
+        diffusion_time_full = diffusion_time_full.expand(B, P, T1,
+                                                         1)  # (B,P,T1,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_cur_future_norm_xT)
-        diffusion_time_full = diffusion_time_full[:, None,
-                                                  :, None]  # (B, 1, 1+future_len, 1)
+        """
+        target_cur_future_norm_xT : (B, (1+)Pnn, 1+T, 4) -> (B, (1+)Pnn, 1+T, 5)
+        diffusion_time_full : (B, (1+)Pnn, 1+T, 1)
+        """
         target_cur_future_norm_xT = torch.cat(
             [
                 target_cur_future_norm_xT,
@@ -371,7 +378,8 @@ class Decoder(nn.Module):
             target_agents_past_xyyaw = _cast_like(target_agents_past_xyyaw,
                                                   target_future_norm_xT)
             """
-            target_agents_past_xyyaw: (B, (1+)Pnn, time_len, 4) -> (B, (1+)Pnn, time_len, 5)
+            target_agents_past_xyyaw: 
+                (B, (1+)Pnn, time_len, 4) -> (B, (1+)Pnn, time_len, 5)
             5 = (x, y, cos, sin) 에서 diffusion noise time step 추가
             참고로 time_len 은 과거~현재이므로 노이즈를 추가하지 않을 것이므로, 0으로 채움
             """
@@ -1943,13 +1951,18 @@ class DiT(nn.Module):
             self.feasible_projector.enable_profile = self.config.profile_feasible
 
         self._model_type = model_type
-        self.preproj = Mlp(in_features=int(output_dim/4*5), # x, y, cos(yaw), sin(yaw), noising timestep
+        if self.config.use_amortized_diffusion:
+            output_dim_pre = int(output_dim/4*5)
+        else:
+            output_dim_pre = output_dim
+        self.preproj = Mlp(in_features=output_dim_pre, # x, y, cos(yaw), sin(yaw), noising timestep
                            hidden_features=512,
                            out_features=hidden_dim,
                            act_layer=nn.GELU,
                            drop=0.)
         self.t_embedder = TimestepEmbedder(hidden_dim)
-        self._amortized_t_emb = nn.Embedding(1, hidden_dim) #
+        if self.config.use_amortized_diffusion:
+            self._amortized_t_emb = nn.Embedding(1, hidden_dim) #
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_dim, heads, dropout, mlp_ratio)
             for i in range(depth)

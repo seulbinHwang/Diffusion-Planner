@@ -4,6 +4,7 @@ set -Eeuo pipefail
 # ---------------- CPU 분리 설정 ----------------
 CPUSET="0-63"
 NUM_CPUS=64
+export DP_CPUSET="0-63"
 
 # (선택) 라이브러리들이 멋대로 스레드 폭발시키는 걸 방지
 export OMP_NUM_THREADS=1

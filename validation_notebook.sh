@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ---------------- CPU 분리 설정 ----------------
+CPUSET="0-2"
+NUM_CPUS=3
+
+# (선택) 라이브러리들이 멋대로 스레드 폭발시키는 걸 방지
+export OMP_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export BLIS_NUM_THREADS=1
+
+# ✅ 스크립트(현재 쉘) 자체를 CPUSET에 고정 → 이후 실행되는 하위 작업들도 그대로 따라감
+if ! command -v taskset >/dev/null 2>&1; then
+  echo "[ERROR] taskset 명령을 찾을 수 없습니다. (util-linux 설치 필요)" >&2
+  exit 1
+fi
+taskset -cp "${CPUSET}" $$ >/dev/null
+
+echo "[CPU] Using CPUSET=${CPUSET}, NUM_CPUS=${NUM_CPUS}"
+# ----------------------------------------------
+
 # (:-0은 “없으면 0”이라는 뜻)
 RUN_COUNT="${1:-0}"
 echo "[INFO] run_count=${RUN_COUNT}"
@@ -165,19 +186,20 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "nuplan_womd" \
-  --name "nuplan_womd" \
+  --load_name "nuplan_womd_fine_tuning1_lr_1" \
+  --name "nuplan_womd_fine_tuning1_lr_1" \
   --eval_method "validation" \
-  --batch_size 2 \
+  --batch_size 1 \
   --use_deepspeed True \
-  --wosac_sub_is_active True \
-  --wosac_metric_is_active False \
-  --save_image True \
-  --save_video True \
+  --wosac_sub_is_active False \
+  --wosac_metric_is_active True \
+  --save_image False \
+  --save_video False \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 2 \
+  --rollout_number 2 \
   --rollout_time_chunk_size 5
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

@@ -111,6 +111,7 @@ def _run_validation_once(cfg: _Config, run_count: int) -> int:
         int: 실행 결과 코드. shape: ()
     """
     cmd = [
+        "taskset", "-c", "0-63",
         str(cfg.conda_exe_path),
         "run",
         "--no-capture-output",
@@ -118,7 +119,7 @@ def _run_validation_once(cfg: _Config, run_count: int) -> int:
         cfg.env_name,
         "bash",
         str(cfg.run_sh_path),
-        str(run_count),  # ✅ 실행 횟수 주입
+        str(run_count),
     ]
 
     print(f"[{_now_string()}] 실행 시작 (run_count={run_count})")
@@ -221,7 +222,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--script_path",
         type=str,
-        default="/mnt/nuplan/projects/Diffusion-Planner/validation_mlx.sh",
+        default="/home/user/PycharmProjects/Diffusion-Planner/validation_notebook.sh",
         help="실행할 validation_pnc.sh 경로",
     )
     return parser.parse_args()

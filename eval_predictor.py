@@ -4448,6 +4448,29 @@ def _update_min_ade_for_validation_batch(
             eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
         )
 
+def _get_available_cpu_core_count() -> int:
+    """현재 프로세스가 '실제로 쓸 수 있는' CPU 코어 수를 구합니다.
+
+    왜 필요한가?
+    ------------
+    어떤 서버/클러스터 환경에서는 CPU 전체 코어가 아니라,
+    현재 작업에 할당된 일부 코어만 사용 가능할 수 있습니다.
+    이때 os.cpu_count()만 쓰면 과하게 잡힐 수 있어,
+    가능한 경우(리눅스)에는 "현재 프로세스가 배정받은 코어 수"를 우선 사용합니다.
+
+    Returns:
+        int:
+            사용 가능한 CPU 코어 수. shape: ()
+    """
+    try:
+        # 리눅스에서 cpuset/affinity가 걸린 경우 실제 사용 가능 코어 수가 더 정확합니다.
+        core_count = len(os.sched_getaffinity(0))
+        return int(max(1, core_count))
+    except Exception:
+        core_count = os.cpu_count()
+        if core_count is None:
+            return 1
+        return int(max(1, core_count))
 
 def validate_func(
     args: Any,
@@ -6091,6 +6114,8 @@ def main() -> None:
       3) model_validation(args) 를 호출해 전체 학습 파이프라인을 수행하고,
          예외가 발생하면 rank 정보를 찍고 전체 스택을 출력한다.
     """
+    cpu_cores = int(_get_available_cpu_core_count())
+    print("Available CPU cores:", cpu_cores)
     # 1) 분산 초기화 및 rank 정보
     args = args_util.get_args()
     global_rank, rank, world_size, use_deepspeed = init_distributed(args)
