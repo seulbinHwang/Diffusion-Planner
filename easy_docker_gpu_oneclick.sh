@@ -55,12 +55,11 @@ if [ ! -f "$MINIFORGE_HOST/etc/profile.d/conda.sh" ]; then
   exit 1
 fi
 
-CONDA_BIN="conda"
-if ! command -v conda >/dev/null 2>&1; then
-  CONDA_BIN="$MINIFORGE_HOST/bin/conda"
-fi
+CONDA_BIN="$MINIFORGE_HOST/bin/conda"
 if [ ! -x "$CONDA_BIN" ]; then
-  echo "ERROR: conda 실행 파일을 찾지 못했습니다: $CONDA_BIN"
+  echo "ERROR: miniforge의 conda 실행 파일이 없습니다:"
+  echo "       $CONDA_BIN"
+  echo "       (MINIFORGE_HOST 경로가 맞는지 확인하세요)"
   exit 1
 fi
 
