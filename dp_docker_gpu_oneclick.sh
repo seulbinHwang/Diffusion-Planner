@@ -179,6 +179,7 @@ RUN mamba env create -f /tmp/environment.yml \
  && conda clean -a -y \
  && rm -f /tmp/environment.yml
 
+
 RUN bash -lc "source /opt/conda/etc/profile.d/conda.sh \
  && conda activate diffusion_planner \
  && python -c 'import torch; print(torch.__version__)' \
