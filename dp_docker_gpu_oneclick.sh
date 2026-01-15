@@ -166,7 +166,8 @@ RUN conda install -n base -c conda-forge -y mamba && conda clean -a -y
 
 # 사용자 생성 (호스트와 UID/GID 맞추기)
 RUN if ! getent group $USER_GID >/dev/null; then groupadd --gid $USER_GID $USERNAME; fi \
- && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME
+ && if ! getent passwd $USER_UID >/dev/null; then useradd --uid $USER_UID --gid $USER_GID -m $USERNAME; fi
+
 
 # conda 환경 생성
 COPY environment.docker.yml /tmp/environment.yml
@@ -221,10 +222,10 @@ EOF
 echo "[7/7] 도커 이미지 빌드"
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
-HOST_USER="$(id -un)"
+CONTAINER_USER="ubuntu"
 
 "${DOCKER[@]}" build \
-  --build-arg USERNAME="$HOST_USER" \
+  --build-arg USERNAME="$CONTAINER_USER" \
   --build-arg USER_UID="$HOST_UID" \
   --build-arg USER_GID="$HOST_GID" \
   -t "$IMAGE_NAME" \
