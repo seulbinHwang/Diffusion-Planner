@@ -73,33 +73,18 @@ echo "[4/7] 호스트 /dev/shm 크기(참고)"
 df -h /dev/shm || true
 HOST_SHM_BYTES="$(df -B1 --output=size /dev/shm 2>/dev/null | tail -n 1 | tr -d ' ')"
 
-###############################################################################
-# 4) conda 환경을 docker용 yml로 내보내기
-###############################################################################
-echo "[5/7] conda 환경 내보내기 (docker용 environment.yml 생성)"
-RAW_YML="$DOCKER_DIR/environment.raw.yml"
-DOCKER_YML="$DOCKER_DIR/environment.docker.yml"
+echo "[5/7] conda-pack 환경 준비 확인"
+ENV_TAR="$DOCKER_DIR/dp_env.tar.gz"
 
+if [[ ! -f "$ENV_TAR" ]]; then
+  echo "ERROR: $ENV_TAR 가 없습니다."
+  echo "호스트에서 아래를 먼저 실행하세요:"
+  echo "  conda install -n base -c conda-forge -y conda-pack"
+  echo "  conda-pack -n diffusion_planner -o docker_dp/dp_env.tar.gz"
+  exit 1
+fi
+echo "[OK] Found $ENV_TAR"
 
-conda env export -n "$ENV_NAME" --no-builds > "$RAW_YML"
-
-# prefix(호스트 절대경로) 제거 + 로컬경로/편집설치(-e, file://) 제거 + name 고정
-awk -v newname="$ENV_NAME" '
-  /^name:/ { print "name: " newname; next }
-  /^prefix:/ { next }
-  /^[[:space:]]*-[[:space:]]*-e[[:space:]]/ { next }
-  /^[[:space:]]*-[[:space:]].*@ file:\/\// { next }
-  /^[[:space:]]*-[[:space:]].*file:\/\// { next }
-  { print }
-' "$RAW_YML" > "$DOCKER_YML"
-
-grep -vE '^[[:space:]]*-[[:space:]]*diffusion-planner==.*$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
-mv "$DOCKER_YML.tmp" "$DOCKER_YML"
-grep -vE '^[[:space:]]*-[[:space:]]*(flash-attn|flash_attn)(==.*)?$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
-mv "$DOCKER_YML.tmp" "$DOCKER_YML"
-# nuplan-devkit==1.2.2 는 pip에서 못 찾아서 빌드가 멈춤 → yml에서 제거
-grep -vE '^[[:space:]]*-[[:space:]]*nuplan-devkit(==.*)?$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
-mv "$DOCKER_YML.tmp" "$DOCKER_YML"
 
 ###############################################################################
 # 5) tmux 설정 + 레이아웃 스크립트
@@ -178,19 +163,13 @@ RUN if ! getent group $USER_GID >/dev/null; then groupadd --gid $USER_GID $USERN
  && if ! getent passwd $USER_UID >/dev/null; then useradd --uid $USER_UID --gid $USER_GID -m $USERNAME; fi
 
 
-# conda 환경 생성
-COPY environment.docker.yml /tmp/environment.yml
-RUN mamba env create -f /tmp/environment.yml \
- && conda clean -a -y \
- && rm -f /tmp/environment.yml
+# diffusion_planner 환경을 통째로 복사/풀기
+COPY dp_env.tar.gz /tmp/dp_env.tar.gz
+RUN mkdir -p /opt/conda/envs/diffusion_planner \
+ && tar -xzf /tmp/dp_env.tar.gz -C /opt/conda/envs/diffusion_planner \
+ && rm -f /tmp/dp_env.tar.gz \
+ && /opt/conda/envs/diffusion_planner/bin/conda-unpack
 
-
-RUN bash -lc "source /opt/conda/etc/profile.d/conda.sh \
- && conda activate diffusion_planner \
- && python -c 'import torch; print(torch.__version__)' \
- && pip install -U packaging ninja \
- && pip install 'git+https://github.com/motional/nuplan-devkit.git@nuplan-devkit-v1.2' \
- && MAX_JOBS=16 pip install flash-attn --no-build-isolation"
 
 # 작업 폴더
 RUN mkdir -p /workspace/Diffusion-Planner
