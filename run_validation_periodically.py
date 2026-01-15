@@ -111,7 +111,7 @@ def _run_validation_once(cfg: _Config, run_count: int) -> int:
         int: 실행 결과 코드. shape: ()
     """
     cmd = [
-        "taskset", "-c", "0-63",
+        "taskset", "-c", "0-2",
         str(cfg.conda_exe_path),
         "run",
         "--no-capture-output",

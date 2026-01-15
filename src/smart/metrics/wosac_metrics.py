@@ -479,13 +479,19 @@ def _parse_cpuset(s: str) -> set[int]:
             cpus.add(int(part))
     return cpus
 
+def _pin_current_process_to_dp_cpuset() -> None:
+    cpuset = os.environ.get("DP_CPUSET", "").strip()
+    if not cpuset:
+        return
+    os.sched_setaffinity(0, _parse_cpuset(cpuset))
+
 def _init_wosac_mp_worker(tf_num_threads: int) -> None:
     cpuset = os.environ.get("DP_CPUSET", "").strip()
     if cpuset:
         try:
             os.sched_setaffinity(0, _parse_cpuset(cpuset))
         except Exception:
-            pass
+            raise RuntimeError(f"Failed to set CPU affinity to '{cpuset}'")
 
     _configure_tensorflow_for_wosac(tf_num_threads=int(tf_num_threads))
 
@@ -726,6 +732,7 @@ class WOSACMetrics(Metric):
                  prefix: str,
                  is_active: bool,
                  ego_only: bool = False) -> None:
+        _pin_current_process_to_dp_cpuset()   # ✅ 추가
         super().__init__()
         self.is_active = is_active
         self.is_mp_init = False

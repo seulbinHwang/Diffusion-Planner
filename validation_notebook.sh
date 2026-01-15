@@ -4,6 +4,7 @@ set -Eeuo pipefail
 # ---------------- CPU 분리 설정 ----------------
 CPUSET="0-2"
 NUM_CPUS=3
+export DP_CPUSET="0-2"
 
 # (선택) 라이브러리들이 멋대로 스레드 폭발시키는 걸 방지
 export OMP_NUM_THREADS=1
@@ -159,6 +160,9 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 export DP_WOSAC_TF_THREADS="${DP_WOSAC_TF_THREADS:-2}"
 export DP_WOSAC_CPU_FRACTION="${DP_WOSAC_CPU_FRACTION:-0.75}"
 
+export TF_NUM_INTRAOP_THREADS="${DP_WOSAC_TF_THREADS}"
+export TF_NUM_INTEROP_THREADS=1
+
 printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "DP_WOSAC_CPU_FRACTION:" "${DP_WOSAC_CPU_FRACTION-<unset>}"
 printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
@@ -179,6 +183,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 
+taskset -c "${CPUSET}" \
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  eval_predictor.py \
  --port 23001 \
