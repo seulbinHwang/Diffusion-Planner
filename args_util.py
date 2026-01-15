@@ -570,6 +570,9 @@ def get_args():
     parser.add_argument('--fine_tune_gen_k',
                         type=int,
                         default=64)
+    parser.add_argument('--eval_temperature',
+                        type=float,
+                        default=0.8)
     parser.add_argument('--fine_tune_temperature',
                         type=float,
                         default=0.5)

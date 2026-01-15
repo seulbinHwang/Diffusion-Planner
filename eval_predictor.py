@@ -3009,21 +3009,24 @@ def _predict_rollouts_batched_one_chunk(
                     state_normalizer=state_normalizer,
                     observation_normalizer=observation_normalizer,
                 )
-
-            # inference_noise: (B*R, (1+)Pnn, future_len, 4)
-            inference_noise = _build_inference_noise_for_rollout_chunk(
-                reference_tensor=norm_inputs_copy[
-                    "ego_agent_past"],  # device/dtype 기준
-                batch_size=int(batch_size),
-                one_or_pnn=int(one_or_pnn),
-                future_len=int(future_len),
-                rollout_start_idx=int(rollout_start_idx),
-                rollout_repeat=int(rollout_repeat),
-                base_seed=int(base_seed),
-                ddp_rank=int(ddp_rank),
-                step_idx=int(step_start),  # ✅ chunk 시작 step을 seed에 반영
-                noise_std=0.5,
-            )
+            make_random_noise_cond = (args.use_amortized_diffusion and step_start == 0) or (not args.use_amortized_diffusion)
+            if make_random_noise_cond:
+                # inference_noise: (B*R, (1+)Pnn, future_len, 4)
+                inference_noise = _build_inference_noise_for_rollout_chunk(
+                    reference_tensor=norm_inputs_copy[
+                        "ego_agent_past"],  # device/dtype 기준
+                    batch_size=int(batch_size),
+                    one_or_pnn=int(one_or_pnn),
+                    future_len=int(future_len),
+                    rollout_start_idx=int(rollout_start_idx),
+                    rollout_repeat=int(rollout_repeat),
+                    base_seed=int(base_seed),
+                    ddp_rank=int(ddp_rank),
+                    step_idx=int(step_start),  # ✅ chunk 시작 step을 seed에 반영
+                    noise_std=args.eval_temperature,
+                )
+            else:
+                pass # TODO
             norm_inputs_copy["inference_noise"] = inference_noise
 
             decoder_output = _forward_model_for_validation(
@@ -3448,15 +3451,6 @@ def _build_inference_noise_for_rollout_chunk(
             inference_noise 텐서.
             shape: (B*R, one_or_pnn, future_len, 4)
     """
-    if int(rollout_repeat) <= 0:
-        raise ValueError(
-            f"rollout_repeat는 1 이상이어야 합니다. rollout_repeat={rollout_repeat}")
-    if int(batch_size) <= 0:
-        raise ValueError(f"batch_size는 1 이상이어야 합니다. batch_size={batch_size}")
-    if int(one_or_pnn) <= 0:
-        raise ValueError(f"one_or_pnn는 1 이상이어야 합니다. one_or_pnn={one_or_pnn}")
-    if int(future_len) <= 0:
-        raise ValueError(f"future_len은 1 이상이어야 합니다. future_len={future_len}")
 
     device = reference_tensor.device
     dtype = reference_tensor.dtype
