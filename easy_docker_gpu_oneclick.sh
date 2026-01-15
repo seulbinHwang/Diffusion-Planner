@@ -189,7 +189,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates bash git tmux \
-    procps htop less vim \
+    procps htop less vim gcc g++ make \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
   && rm -rf /var/lib/apt/lists/*
 
