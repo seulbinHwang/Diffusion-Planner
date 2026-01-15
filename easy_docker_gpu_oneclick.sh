@@ -135,13 +135,20 @@ if [ ! -f "${MINIFORGE_ROOT}/etc/profile.d/conda.sh" ]; then
   exec bash -i
 fi
 
-# conda 활성화
+# 여기서부터: 새 bash가 시작될 때도 conda 초기화 + env 활성화 되게 rcfile을 만들어 사용
+RCFILE="/tmp/dp_bashrc"
+
+cat > "$RCFILE" <<RC_EOF
 source "${MINIFORGE_ROOT}/etc/profile.d/conda.sh"
-if ! conda activate "${ENV_NAME}" >/dev/null 2>&1; then
-  echo "ERROR: conda env '${ENV_NAME}' 활성화 실패"
-  echo "       (호스트 miniforge에 env가 있는지 확인하세요)"
-  exec bash -i
-fi
+export CONDA_CHANGEPS1=true
+conda activate "${ENV_NAME}" 2>/dev/null || echo "WARN: conda activate 실패 (env 이름/경로 확인 필요)"
+
+cd "${WORKDIR}" 2>/dev/null || true
+export PYTHONPATH="${WORKDIR}:\${PYTHONPATH-}"
+RC_EOF
+
+exec bash --rcfile "$RCFILE" -i
+
 
 # 프로젝트 폴더로 이동 + PYTHONPATH
 cd "${WORKDIR}" 2>/dev/null || true
