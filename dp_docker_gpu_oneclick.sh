@@ -92,6 +92,9 @@ awk -v newname="$ENV_NAME" '
   { print }
 ' "$RAW_YML" > "$DOCKER_YML"
 
+grep -vE '^[[:space:]]*-[[:space:]]*diffusion-planner==.*$' "$DOCKER_YML" > "$DOCKER_YML.tmp"
+mv "$DOCKER_YML.tmp" "$DOCKER_YML"
+
 ###############################################################################
 # 5) tmux 설정 + 레이아웃 스크립트
 ###############################################################################
@@ -198,9 +201,16 @@ if [[ $- == *i* ]]; then
     conda activate diffusion_planner >/dev/null 2>&1 || true
   fi
 
-  # 프로젝트 경로
   cd /workspace/Diffusion-Planner 2>/dev/null || true
   export PYTHONPATH="/workspace/Diffusion-Planner:${PYTHONPATH-}"
+
+  # 프로젝트를 한 번만 editable로 설치(없으면 설치)
+  if [ -f /workspace/Diffusion-Planner/pyproject.toml ] || [ -f /workspace/Diffusion-Planner/setup.py ]; then
+    if [ ! -f /workspace/Diffusion-Planner/.dp_editable_installed ]; then
+      pip install -e /workspace/Diffusion-Planner >/dev/null 2>&1 || true
+      touch /workspace/Diffusion-Planner/.dp_editable_installed || true
+    fi
+  fi
 
   # tmux 자동 진입
   if command -v tmux >/dev/null 2>&1 && [ -z "${TMUX-}" ]; then
