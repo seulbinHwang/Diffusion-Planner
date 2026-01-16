@@ -109,13 +109,13 @@ class VPSDE_linear(SDE):
         B, P, T, C = x.shape
         t_ndim = t.ndim
         if t_ndim == 1: # (B,)
-            t = t.view(B, 1, 1, 1)
+            t = t.view(B, 1, 1, 1) # shape: (B, 1, 1, 1)
         elif t.ndim == 2:  # (B, T)
             assert t.shape == (B, T)
-            t = t.view(B, 1, T, 1)  # 또는 t[:, None, :, None]
+            t = t.view(B, 1, T, 1)  # shape: (B, 1, future_len, 1)
         else:
             raise ValueError(f"t must be (B,) or (B,T). got {t.shape}")
-        # mean_log_coeff: (B, 1, 1, 1)
+        # mean_log_coeff: (B, 1, 1, 1) or (B, 1, future_len, 1)
         mean_log_coeff = -0.25 * t ** 2 * \
             (self._beta_max - self._beta_min) - 0.5 * self._beta_min * t
 

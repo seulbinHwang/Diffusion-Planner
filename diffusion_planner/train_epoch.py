@@ -982,20 +982,6 @@ def train_epoch(
                 device=args.device,
                 args=args,
             )
-            # near_future_gt_3_dim: (B, Pnn, future_len, 3)
-            # 2) augmentation 적용
-            # near_future_gt_3_dim: torch.Tensor = outputs["near_future_gt_3_dim"]
-            # inputs, ego_future_gt_3_dim, near_future_gt_3_dim = \
-            #     _apply_augmentation(
-            #         inputs=inputs,
-            #         ego_future_gt_3_dim=ego_future_gt_3_dim, # (B, future_len, 3)
-            #         near_future_gt_3_dim=near_future_gt_3_dim, # (B, Pnn, future_len, 3)
-            #         ego_future_gt_mask=ego_future_gt_mask, # (B, future_len)
-            #         near_future_mask=near_future_mask, # (B, Pnn, future_len)
-            #         aug=aug,
-            #         args=args,
-            #     )
-
             # 4) 관측 정규화
             # norm_inputs: 각 value shape = (B, ...)
             norm_inputs: Dict[str, torch.Tensor] = \

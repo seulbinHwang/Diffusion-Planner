@@ -422,16 +422,16 @@ def _normalize_futures_and_build_xT(
     # target_future_norm_gt: (B, (1+)Pnn, future_len, 4)
     target_future_norm_gt: torch.Tensor = target_cur_future_norm_gt[:, :, 1:, :]
 
-    # mean, std_raw: 각각 (B, (1+)Pnn, future_len, 4) 또는 (B,) 등 marginal_prob 설계에 맞게 반환
     # marginal_prob: <diffusion_planner/model/diffusion_utils/sde.py> 의 VPSDE_linear 클래스의 메서드
-    mean, std_raw = marginal_prob(target_future_norm_gt, batch_diffusion_time)
-    mean = _require_finite("marginal_prob mean", mean)
-    std = _require_finite("marginal_prob std", std_raw)
-    assert std.ndim == 4, "std_raw must be (B, _, _, _)"
+    mean, std = marginal_prob(target_future_norm_gt, batch_diffusion_time)
     """
+    mean : (B, (1+)Pnn, future_len, 4)
+    
     std : (B, 1, 1, 1) or (B, 1, future_len, 1)
     """
-
+    mean = _require_finite("marginal_prob mean", mean)
+    std = _require_finite("marginal_prob std", std)
+    assert std.ndim == 4, "std_raw must be (B, _, _, _)"
     # target_future_noise_xT: (B, (1+)Pnn, future_len, 4)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
     target_future_noise_xT[target_future_mask] = 0.0
@@ -498,7 +498,7 @@ def _forward_model_with_autocast(
             target_future_valid,  # (B, (1 +) Pnn, future_len)
         "target_cur_future_norm_xT":
             target_cur_future_norm_xT,  # (B, (1+)Pnn, 1+future_len, 4)
-        "diffusion_time": batch_diffusion_time,  # (B,)
+        "diffusion_time": batch_diffusion_time,  # (B,) or (B, T)
         "low_t_mask": low_t_mask,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
     }
@@ -860,12 +860,14 @@ def diffusion_loss_func(
     )
 
     B, one_or_Pnn, future_len, = target_future_valid.shape
-
+    """
     # diffusion time / low noise mask / random noise 샘플링
+    
     # batch_diffusion_time: # (B,) or (B, future_len)
     # low_t_mask: (B,)
     # low_t_mask_bt: (B,1,1)
     # random_noise: (B, (1+)Pnn, future_len, 4)
+    """
     (batch_diffusion_time, low_t_mask, low_t_mask_bt,
      random_noise) = _sample_diffusion_time_and_noise(
          target_future_gt_4_dim, # (B, (1+)Pnn, future_len, 4)

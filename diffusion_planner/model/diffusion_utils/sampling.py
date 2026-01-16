@@ -37,6 +37,14 @@ def dpm_sampler(model: torch.nn.Module,
                 return noise - guidance_scale * expand_dims(sigma_t, x.dim()) * cond_grad
                     즉, cond_grad 을 통해 노이즈 예측값을 조정함
         """
+        if diffusion_steps == 1:
+            order = 1
+            method = "singlestep_fixed"
+            denoise_to_zero = False
+        else:
+            order = 2
+            method = "multistep"
+            denoise_to_zero = True
         model_fn = dpm.model_wrapper(
             model,  # use your noise prediction model here
             noise_schedule,
@@ -53,13 +61,12 @@ def dpm_sampler(model: torch.nn.Module,
 
         # Steps in [10, 20] can generate quite good samples.
         # And steps = 20 can almost converge.
-        # ERROR
         sample_dpm = dpm_solver.sample(x_T,
                                        steps=diffusion_steps, # 10
-                                       order=2,
+                                       order=order,
                                        skip_type="logSNR",
-                                       method="multistep",
-                                       denoise_to_zero=True, # 마지막에 한번 더 x0로 정리 하겠다.
+                                       method=method,
+                                       denoise_to_zero=denoise_to_zero, # 마지막에 한번 더 x0로 정리 하겠다.
                                        **sample_params)
 
     return sample_dpm
