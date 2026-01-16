@@ -10,7 +10,7 @@ MINIFORGE_HOST="/media/user/E/miniforge"
 IMAGE_NAME="easy_dp_gpu_img"
 
 CPU_SET="0-31,64-95"
-CONTAINER_NAME="easy_dp_gpu_${CPU_SET//,/ _}_cont"
+CONTAINER_NAME="easy_dp_gpu_${CPU_SET}"
 GPU_DEVICE="${GPU_DEVICE:-0}"          # GPU 1개면 보통 0
 FORCE_RECREATE="${FORCE_RECREATE:-0}"  # 1이면 컨테이너 삭제 후 재생성
 
