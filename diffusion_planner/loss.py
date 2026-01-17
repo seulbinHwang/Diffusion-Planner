@@ -309,60 +309,45 @@ def _build_future_masks_and_current_state(
 
     return near_future_valid, near_cur_future_mask, near_current_xyyaw_norm
 
-
 def _sample_diffusion_time_and_noise(
     target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     eps: float,
     args: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """미래 궤적 크기에 맞춰 diffusion time 과 노이즈를 샘플링한다.
-
-    Args:
-        target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 궤적.
-        eps: 시간 샘플링 하한.
-        args: args.feasible_learn_noise_thresh, args.use_direct_loss 사용.
-
-    Returns:
-        batch_diffusion_time: # (B,) or (B, future_len) 각 배치별 diffusion 시간.
-        low_t_mask: (B,) 저노이즈 배치 마스크.
-        low_t_mask_bt: (B, 1, 1) 저노이즈 마스크(브로드캐스트용).
-        random_noise: (B, (1+)Pnn, future_len, 4) 노이즈 샘플.
-    """
-    # target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
+    """미래 궤적 크기에 맞춰 diffusion time 과 노이즈를 샘플링한다."""
     B: int = target_future_gt_4_dim.shape[0]
-    future_len: int = int(target_future_gt_4_dim.shape[2])  # ✅ 실제 텐서에서 가져오기
+    future_len: int = int(target_future_gt_4_dim.shape[2])
 
-    # 매번 50% 50% 확률로 배치 전체를 amortized 모드 또는 일반 모드로 처리
     use_amortized_mode: bool = (torch.rand(1).item() < 0.5)
 
     if args.use_amortized_diffusion and use_amortized_mode:
-        # Paper t_hat: t_hat_tau = max(0, (tau - T_history) / T_future).
-        # Here we add noise ONLY to FUTURE frames, so tau corresponds to 1..T_future,
-        # which yields t in (0, 1].
         tau = torch.arange(
-            1,
-            future_len + 1,
+            1, future_len + 1,
             device=target_future_gt_4_dim.device,
             dtype=torch.float32,
         )  # (T,)
+
         t_tau = tau / float(future_len)  # (T,) = [1/T, 2/T, ..., 1]
 
-        # (B, T) without extra memory
-        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(B, -1)
+        # ✅ [수정] 정확히 t=1을 피해서 수치 리스크를 줄임 (일반 모드도 t=1은 안 씀)
+        t_max: float = max(1.0 - float(eps), 0.0)
+        t_tau = torch.clamp(t_tau, max=t_max)  # (T,)
 
-        # (B,) low-noise mask (kept as before)
-        low_t_mask = torch.ones(B,
-                                dtype=torch.bool,
-                                device=target_future_gt_4_dim.device)
+        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(B, -1)  # (B, T)
+
+        low_t_mask = torch.ones(
+            B, dtype=torch.bool, device=target_future_gt_4_dim.device
+        )
         low_t_mask_bt = low_t_mask.view(B, 1, 1)
 
     else:
-        # Paper uses U(0,1). eps is a numerical guard to avoid exact t=0.
-        batch_diffusion_time: torch.Tensor = (torch.rand(
-            B,
-            device=target_future_gt_4_dim.device,
-            dtype=torch.float32,
-        ) * (1 - eps) + eps)
+        batch_diffusion_time: torch.Tensor = (
+            torch.rand(
+                B,
+                device=target_future_gt_4_dim.device,
+                dtype=torch.float32,
+            ) * (1 - eps) + eps
+        )
 
         t_threshold: float = float(args.feasible_learn_noise_thresh)
         if not getattr(args, "use_direct_loss", False):

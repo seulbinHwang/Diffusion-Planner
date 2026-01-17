@@ -223,8 +223,12 @@ class Decoder(nn.Module):
         self._x0_for_amortized_inference = None  # # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         future_len = self.config.future_len  # e.g., 80
         # Future-only amortized schedule: [1/T, 2/T, ..., 1]
-        self.t_tau = (torch.arange(1, future_len + 1, dtype=torch.float32) /
-                      float(future_len))
+        # ✅ [수정] amortized schedule에서 t=1을 정확히 쓰지 않도록 마지막을 1-eps로 제한
+        # - config에 값이 있으면 그걸 쓰고, 없으면 1e-3 사용
+        t_eps: float = float(getattr(config, "diffusion_time_eps", 1e-3))
+        t_max: float = max(1.0 - t_eps, 0.0)
+        self.t_tau = torch.arange(1, future_len + 1, dtype=torch.float32) / float(future_len)  # (T,)
+        self.t_tau = torch.clamp(self.t_tau, max=t_max)  # (T,)
 
     def _get_inference_noise_from_inputs(
         self,
@@ -1830,7 +1834,7 @@ class Decoder(nn.Module):
                                    torch.Tensor],
         diffusion_steps: int,
     ) -> torch.Tensor:
-        """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다."""
+        """dpm_sampler(또는 amortized 1-step)을 통해 최종 샘플 x0(flat)을 얻는다."""
         guidance_scale: float = float(
             getattr(self.config, "guidance_scale", 1.0))
 
@@ -1847,6 +1851,10 @@ class Decoder(nn.Module):
                 target_current_xyyaw=target_current_xyyaw,
                 inputs=inputs,
             )
+
+        # -----------------------------
+        # diffusion_steps > 1 (기존 DPM-Solver 경로)
+        # -----------------------------
         if diffusion_steps > 1:
             x0: torch.Tensor = dpm_sampler(
                 self.dit,
@@ -1902,35 +1910,37 @@ class Decoder(nn.Module):
             reference_tensor_for_device=xT_f32,
         )
 
-        # low_t_mask: (B,)  (feasible 등을 항상 실행시키기 위한 마스크, 기존 로직 유지)
+        # low_t_mask: (B,)  amortized에서는 feasible을 항상 실행시키기 위한 마스크(기존 의도 유지)
         low_t_mask: torch.Tensor = torch.ones((B,),
                                               dtype=torch.bool,
                                               device=xT.device)
 
-        # (1) 모델 1회 호출: x0_pred
+        # (1) 모델 1회 호출: x0_pred (flat)
         x0_pred: torch.Tensor = self.dit(
-            xT_f32,
-            t_tau,
-            target_agents_past,
-            scene_encoding_token,
-            ego_fut_global,
-            target_agents_route_lane_emb,
-            target_past_cur_future_valid,
-            scene_encoding_token_mask,
-            route_known_mask,
-            target_class_one_hot,
-            target_current_xyyaw=target_current_xyyaw,
-            low_t_mask=low_t_mask,
+            xT_f32,  # (B, Pnn, F)
+            t_tau,  # (B, future_len)
+            target_agents_past,  # (B, (1+)Pnn, time_len, 11)
+            scene_encoding_token,  # (B, token_num, D)
+            ego_fut_global,  # (B, D)
+            target_agents_route_lane_emb,  # (B, (1+)Pnn, D)
+            target_past_cur_future_valid,  # (B, (1+)Pnn, time_len_total)
+            scene_encoding_token_mask,  # (B, token_num)
+            route_known_mask,  # (B, (1+)Pnn)
+            target_class_one_hot,  # (B, (1+)Pnn, 3)
+            target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
+            low_t_mask=low_t_mask,  # (B,)
         )
 
         # (2) guidance를 x0_pred에 반영 (선택)
-        if self._guidance_fn is not None and guidance_scale != 0.0:
-            # condition은 dpm_solver 쪽에서 무엇을 넣는지, 이 코드 조각만으로는 확정 불가 → None 유지
+        if self._guidance_fn is not None and float(guidance_scale) != 0.0:
+            # guidance_fn이 low_t_mask를 쓰는 경우를 위해 전달(너의 기존 의도 유지)
             classifier_kwargs["low_t_mask"] = low_t_mask
+
+            # condition은 dpm_solver 경로에서 뭘 넣는지 여기 코드만으로는 확정 불가 → None 유지(팩트)
             x0_pred = self._apply_classifier_guidance_for_amortized_one_step(
-                xT_flat=xT_f32,
-                x0_pred_flat=x0_pred,
-                t_tau=t_tau,
+                xT_flat=xT_f32,  # (B,Pnn,F)
+                x0_pred_flat=x0_pred,  # (B,Pnn,F)
+                t_tau=t_tau,  # (B,future_len)
                 classifier_kwargs=classifier_kwargs,
                 guidance_scale=guidance_scale,
                 condition=None,
