@@ -572,7 +572,7 @@ def get_args():
                         default=64)
     parser.add_argument('--eval_temperature',
                         type=float,
-                        default=0.8)
+                        default=1.0)
     parser.add_argument('--fine_tune_temperature',
                         type=float,
                         default=0.5)

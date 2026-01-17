@@ -2006,6 +2006,7 @@ def _forward_model_for_validation(
     use_deepspeed_now = use_deepspeed_requested and _is_deepspeed_engine(model)
 
     if use_deepspeed_now:
+        # model:
         _, decoder_output = model(norm_inputs)
         return decoder_output
 
@@ -3026,8 +3027,9 @@ def _predict_rollouts_batched_one_chunk(
                     noise_std=args.eval_temperature,
                 )
             else:
-                pass # TODO
+                inference_noise = None
             norm_inputs_copy["inference_noise"] = inference_noise
+            norm_inputs_copy["need_warmup"] = step_count == 0
 
             decoder_output = _forward_model_for_validation(
                 args=args,

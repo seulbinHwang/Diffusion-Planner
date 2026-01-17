@@ -5,6 +5,7 @@ import wandb
 from typing import Any, Dict, Optional
 import torch
 
+
 def _to_float_for_logging(value: Any) -> float:
     """W&B/TensorBoard에 안전하게 기록할 수 있도록 값을 float로 바꿉니다.
 

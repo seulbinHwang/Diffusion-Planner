@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 from diffusion_planner.utils.normalizer import StateNormalizer
 from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks
-
+from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
@@ -329,37 +329,48 @@ def _sample_diffusion_time_and_noise(
     """
     # target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
     B: int = target_future_gt_4_dim.shape[0]
-    """
-    매번 50% 50% 확률 뽑기를 해서, 해당 배치 전체를 amortized 모드 또는 일반 모드로 처리한다.
-    """
-    use_amortized_mode: bool = (torch.rand(1).item() < 0.5)
-    if args.use_amortized_diffusion and use_amortized_mode:
+    future_len: int = int(target_future_gt_4_dim.shape[2])  # ✅ 실제 텐서에서 가져오기
 
-        future_len = args.future_len # 80
-        # t_tau = tau / future_len  # shape (future_len)
-        t_tau = torch.arange(1, future_len + 1,
-                             device=target_future_gt_4_dim.device) / float(future_len)
-        # batch_diffusion_time: (B, future_len) # just append t_tau to each batch. no randomness
-        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).repeat(B, 1) # (B, future_len)
-        # low_t_mask / low_t_mask_bt: (B,1,1) ->  무조건 True
-        low_t_mask = torch.ones(B, dtype=torch.bool, device=target_future_gt_4_dim.device)
-        low_t_mask_bt = low_t_mask.view(B, 1, 1)
-    else:
-        # batch_diffusion_time: (B,)
-        batch_diffusion_time: torch.Tensor = torch.rand(
-            B,
+    # 매번 50% 50% 확률로 배치 전체를 amortized 모드 또는 일반 모드로 처리
+    use_amortized_mode: bool = (torch.rand(1).item() < 0.5)
+
+    if args.use_amortized_diffusion and use_amortized_mode:
+        # Paper t_hat: t_hat_tau = max(0, (tau - T_history) / T_future).
+        # Here we add noise ONLY to FUTURE frames, so tau corresponds to 1..T_future,
+        # which yields t in (0, 1].
+        tau = torch.arange(
+            1, future_len + 1,
             device=target_future_gt_4_dim.device,
-        ) * (1 - eps) + eps
+            dtype=torch.float32,
+        )  # (T,)
+        t_tau = tau / float(future_len)  # (T,) = [1/T, 2/T, ..., 1]
+
+        # (B, T) without extra memory
+        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(B, -1)
+
+        # (B,) low-noise mask (kept as before)
+        low_t_mask = torch.ones(
+            B, dtype=torch.bool, device=target_future_gt_4_dim.device
+        )
+        low_t_mask_bt = low_t_mask.view(B, 1, 1)
+
+    else:
+        # Paper uses U(0,1). eps is a numerical guard to avoid exact t=0.
+        batch_diffusion_time: torch.Tensor = (
+            torch.rand(
+                B,
+                device=target_future_gt_4_dim.device,
+                dtype=torch.float32,
+            ) * (1 - eps) + eps
+        )
+
         t_threshold: float = float(args.feasible_learn_noise_thresh)
         if not getattr(args, "use_direct_loss", False):
             t_threshold = 1.0
-        # low_t_mask: (B,)
+
         low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
-        # low_t_mask_bt: (B,1,1)
         low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
 
-
-    # random_noise: (B, (1+)Pnn, future_len, 4)
     random_noise: torch.Tensor = torch.randn_like(
         target_future_gt_4_dim,
         device=target_future_gt_4_dim.device,
@@ -451,7 +462,7 @@ def _normalize_futures_and_build_xT(
 
 
 def _forward_model_with_autocast(
-    model: nn.Module,
+    model: Diffusion_Planner,
     norm_inputs: Dict[str, torch.Tensor],
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
     target_cur_future_norm_xT: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
@@ -787,7 +798,7 @@ def _assert_cur_future_valid_mask(
 
 def diffusion_loss_func(
     args: Any,
-    model: nn.Module,
+    model: Diffusion_Planner,
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
@@ -811,7 +822,7 @@ def diffusion_loss_func(
 
     Args:
         args: 학습 설정/옵션이 들어 있는 객체.
-        model: 학습 중인 모델(nn.Module 또는 DDP 래퍼).
+        model: 학습 중인 모델(Diffusion_Planner 또는 DDP 래퍼).
         norm_inputs: 정규화된 관측 dict.
         marginal_prob: SDE marginal_prob 함수.
         near_future_gt_4_dim: (B, Pnn, future_len, 4) 미래 궤적 (denorm).
@@ -870,11 +881,10 @@ def diffusion_loss_func(
     """
     (batch_diffusion_time, low_t_mask, low_t_mask_bt,
      random_noise) = _sample_diffusion_time_and_noise(
-         target_future_gt_4_dim, # (B, (1+)Pnn, future_len, 4)
+         target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
          eps,
          args,
      )
-
 
     # 미래 궤적 정규화 + x_T 샘플 생성
     """
@@ -888,7 +898,7 @@ def diffusion_loss_func(
          target_future_gt_4_dim,
          target_current_xyyaw_norm,  # (B, (1+)Pnn, 4)
          target_cur_future_mask,
-         batch_diffusion_time, # (B,) or (B, future_len)
+         batch_diffusion_time,  # (B,) or (B, future_len)
          random_noise,
          state_normalizer,
          marginal_prob,

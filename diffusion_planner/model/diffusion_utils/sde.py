@@ -83,11 +83,11 @@ class VPSDE_linear(SDE):
         drift = $-\frac{\beta(t)}{2} x$
         diffusion = $\sqrt{\beta(t)}$
         """
-        shape = x.shape # (B, (1+)Pnn, future_len, 4)
+        shape = x.shape  # (B, (1+)Pnn, future_len, 4)
         reshape = [-1] + [
             1,
-        ] * (len(shape) - 1) # [ -1, 1, 1, 1 ]
-        t = t.reshape(reshape) # (B, 1, 1, 1)
+        ] * (len(shape) - 1)  # [ -1, 1, 1, 1 ]
+        t = t.reshape(reshape)  # (B, 1, 1, 1)
         """
         _beta_max: 20.0
         _beta_min: 0.1
@@ -108,8 +108,8 @@ class VPSDE_linear(SDE):
         """
         B, P, T, C = x.shape
         t_ndim = t.ndim
-        if t_ndim == 1: # (B,)
-            t = t.view(B, 1, 1, 1) # shape: (B, 1, 1, 1)
+        if t_ndim == 1:  # (B,)
+            t = t.view(B, 1, 1, 1)  # shape: (B, 1, 1, 1)
         elif t.ndim == 2:  # (B, T)
             assert t.shape == (B, T)
             t = t.view(B, 1, T, 1)  # shape: (B, 1, future_len, 1)
@@ -119,7 +119,7 @@ class VPSDE_linear(SDE):
         mean_log_coeff = -0.25 * t ** 2 * \
             (self._beta_max - self._beta_min) - 0.5 * self._beta_min * t
 
-        mean = torch.exp(mean_log_coeff) * x # (B, (1+)Pnn, future_len, 4)
+        mean = torch.exp(mean_log_coeff) * x  # (B, (1+)Pnn, future_len, 4)
         std = torch.sqrt(1 - torch.exp(2. * mean_log_coeff))
         # std: (B, 1, 1, 1) or (B, 1, future_len, 1)
         return mean, std

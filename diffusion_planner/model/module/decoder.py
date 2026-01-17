@@ -35,9 +35,11 @@ import torch
 from typing import Dict
 
 
-def _ensure_tensor_on_ref(noise: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+def _ensure_tensor_on_ref(noise: torch.Tensor,
+                          ref: torch.Tensor) -> torch.Tensor:
     """noise를 ref와 같은 device/dtype으로 맞춥니다."""
     return noise.to(device=ref.device, dtype=ref.dtype)
+
 
 def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     """입력 마스크를 bool 텐서로 바꿉니다.
@@ -217,17 +219,19 @@ class Decoder(nn.Module):
 
         # self._guidance_fn = config.guidance_fn
         self._guidance_fn = getattr(config, "guidance_fn", None)
-        self._x0_for_amortized_diffusion = None # # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-        future_len = self.config.future_len # 80
-        # t_tau = tau / future_len  # shape (future_len)
-        self.t_tau = torch.arange(1, future_len + 1) / float(future_len)
+        self._x0_for_amortized_inference = None  # # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+        future_len = self.config.future_len  # e.g., 80
+        # Future-only amortized schedule: [1/T, 2/T, ..., 1]
+        self.t_tau = (
+            torch.arange(1, future_len + 1, dtype=torch.float32) / float(future_len)
+        )
 
     def _get_inference_noise_from_inputs(
-            self,
-            inputs: Dict[str, torch.Tensor],
-            batch_size: int,
-            one_or_Pnn: int,
-            target_current_xyyaw: torch.Tensor,
+        self,
+        inputs: Dict[str, torch.Tensor],
+        batch_size: int,
+        one_or_Pnn: int,
+        target_current_xyyaw: torch.Tensor,
     ) -> torch.Tensor:
         """추론 시작에 사용할 noise를 inputs에서 꺼냅니다.
 
@@ -255,19 +259,15 @@ class Decoder(nn.Module):
         """
         noise = inputs.get("inference_noise", None)
         if noise is None:
-            raise KeyError(
-                "Decoder 추론에는 inputs['inference_noise']가 필요합니다. "
-                "eval 코드에서 (rollout_idx 기준으로 만든 noise)를 넣어 주세요."
-            )
+            raise KeyError("Decoder 추론에는 inputs['inference_noise']가 필요합니다. "
+                           "eval 코드에서 (rollout_idx 기준으로 만든 noise)를 넣어 주세요.")
         if not isinstance(noise, torch.Tensor):
             raise TypeError("inputs['inference_noise']는 torch.Tensor여야 합니다.")
 
         expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), 4)
         if tuple(noise.shape) != expected:
-            raise ValueError(
-                "inputs['inference_noise'] shape가 예상과 다릅니다. "
-                f"expected={expected}, got={tuple(noise.shape)}"
-            )
+            raise ValueError("inputs['inference_noise'] shape가 예상과 다릅니다. "
+                             f"expected={expected}, got={tuple(noise.shape)}")
 
         return _ensure_tensor_on_ref(noise, target_current_xyyaw)
 
@@ -365,7 +365,8 @@ class Decoder(nn.Module):
     def _run_dit_training_forward(
             self,
             target_agents_past: torch.Tensor,  # # (B, (1+)Pnn, time_len, 11)
-            xT_input_flat: torch.Tensor,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
+            xT_input_flat: torch.
+        Tensor,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
             diffusion_time: torch.Tensor,  # (B,)  or (B, future_len)
             low_t_mask: torch.Tensor,  # (B,)
             scene_encoding_token: torch.Tensor,  # (B, token_num, D)
@@ -1160,7 +1161,7 @@ class Decoder(nn.Module):
         B: int = batch_size
         noise: torch.Tensor = target_current_xyyaw.new_empty(
             (B, one_or_Pnn, self._future_len, 4),).normal_(
-                0.0, 0.5)  # (B, (1+)Pnn, T, 4)
+                0.0, self.config.eval_temperature)  # (B, (1+)Pnn, T, 4)
         return noise
 
     def _build_inference_xT_from_noise(
@@ -1403,7 +1404,7 @@ class Decoder(nn.Module):
         inputs: Dict[str, torch.Tensor],
         correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
                                    torch.Tensor],
-            diffusion_steps: int,
+        diffusion_steps: int,
     ) -> torch.Tensor:  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다.
         Returns:
@@ -1411,62 +1412,84 @@ class Decoder(nn.Module):
                 샘플링 결과(flat).
                 shape: (B, Pnn, F)
         """
-
-        x0: torch.Tensor = dpm_sampler(
-            self.dit,
-            xT.float(),  # (B, Pnn, F)
-            diffusion_steps=diffusion_steps,
-            other_model_params={
-                "target_agents_past": target_agents_past,
-                "cross_c": scene_encoding_token,
-                "ego_fut_global": ego_fut_global,
-                "target_agents_route_lane_emb": target_agents_route_lane_emb,
-                "target_past_cur_future_valid": target_past_cur_future_valid,
-                "cross_mask": scene_encoding_token_mask,
-                "route_known_mask": route_known_mask,
-                "target_class_one_hot": target_class_one_hot,
-                "target_current_xyyaw": target_current_xyyaw,
-            },
-            dpm_solver_params={
-                "correcting_xt_fn": correcting_xt_fn,
-            },
-            model_wrapper_params={
-                "classifier_fn":
-                    self._guidance_fn,
-                "classifier_kwargs": {
-                    "model": self.dit,
-                    "model_condition": {
-                        "target_agents_past":
-                            target_agents_past,
-                        "cross_c":
-                            scene_encoding_token,
-                        "ego_fut_global":
-                            ego_fut_global,
-                        "target_agents_route_lane_emb":
-                            target_agents_route_lane_emb,
-                        "target_past_cur_future_valid":
-                            target_past_cur_future_valid,
-                        "cross_mask":
-                            scene_encoding_token_mask,
-                        "route_known_mask":
-                            route_known_mask,
-                        "target_class_one_hot":
-                            target_class_one_hot,
-                        "target_current_xyyaw":
-                            target_current_xyyaw,
-                    },
-                    "inputs": inputs,
-                    "observation_normalizer": self._observation_normalizer,
-                    "state_normalizer": self._state_normalizer,
-                    "config": self.config,
+        if diffusion_steps > 1:
+            x0: torch.Tensor = dpm_sampler(
+                self.dit,
+                xT.float(),  # (B, Pnn, F)
+                diffusion_steps=diffusion_steps,
+                other_model_params={
+                    "target_agents_past": target_agents_past,
+                    "cross_c": scene_encoding_token,
+                    "ego_fut_global": ego_fut_global,
+                    "target_agents_route_lane_emb": target_agents_route_lane_emb,
+                    "target_past_cur_future_valid": target_past_cur_future_valid,
+                    "cross_mask": scene_encoding_token_mask,
+                    "route_known_mask": route_known_mask,
+                    "target_class_one_hot": target_class_one_hot,
+                    "target_current_xyyaw": target_current_xyyaw,
                 },
-                "guidance_scale":
-                    1.0,
-                "guidance_type":
-                    ("classifier" if self._guidance_fn is not None else "uncond"
-                    ),
-            },
-        )
+                dpm_solver_params={
+                    "correcting_xt_fn": correcting_xt_fn,
+                },
+                model_wrapper_params={
+                    "classifier_fn":
+                        self._guidance_fn,
+                    "classifier_kwargs": {
+                        "model": self.dit,
+                        "model_condition": {
+                            "target_agents_past":
+                                target_agents_past,
+                            "cross_c":
+                                scene_encoding_token,
+                            "ego_fut_global":
+                                ego_fut_global,
+                            "target_agents_route_lane_emb":
+                                target_agents_route_lane_emb,
+                            "target_past_cur_future_valid":
+                                target_past_cur_future_valid,
+                            "cross_mask":
+                                scene_encoding_token_mask,
+                            "route_known_mask":
+                                route_known_mask,
+                            "target_class_one_hot":
+                                target_class_one_hot,
+                            "target_current_xyyaw":
+                                target_current_xyyaw,
+                        },
+                        "inputs": inputs,
+                        "observation_normalizer": self._observation_normalizer,
+                        "state_normalizer": self._state_normalizer,
+                        "config": self.config,
+                    },
+                    "guidance_scale":
+                        1.0,
+                    "guidance_type":
+                        ("classifier" if self._guidance_fn is not None else "uncond"
+                        ),
+                },
+            )
+        else:
+            assert diffusion_steps == 1, "diffusion_steps must be >= 1"
+            # self.t_tau: (future_len) -> (B, future_len)
+            t_tau = self.t_tau.unsqueeze(0).repeat(xT.shape[0], 1)  # (B, future_len)
+            # low_t_mask: (B), all True
+            low_t_mask = torch.ones(
+                (xT.shape[0],), dtype=torch.bool,
+                device=xT.device,)  # (B,)
+            x0: torch.Tensor = self.dit(
+                xT.float(),  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
+                t_tau,  # (B, future_len)
+                target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
+                scene_encoding_token,  # (B, token_num, D)
+                ego_fut_global,  # (B, D)
+                target_agents_route_lane_emb,  # (B, Pnn, D)
+                target_past_cur_future_valid,  # (B, (1+)Pnn, time_len+future_len)
+                scene_encoding_token_mask,  # (B, token_num)
+                route_known_mask,  # (B, Pnn)
+                target_class_one_hot,  # (B, (1+)Pnn, 3)
+                target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
+                low_t_mask=low_t_mask,
+            )
         return x0
 
     def _reshape_inference_x0_to_sequence(
@@ -1592,7 +1615,8 @@ class Decoder(nn.Module):
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self._run_dit_training_forward(
             target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
-            xT_input_flat=xT_input_flat,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
+            xT_input_flat=
+            xT_input_flat,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
             diffusion_time=diffusion_time,  # (B,) or (B, future_len)
             low_t_mask=low_t_mask,  # (B,)
             scene_encoding_token=scene_encoding_token,  # (B, token_num, D)
@@ -1632,32 +1656,32 @@ class Decoder(nn.Module):
 
     def _get_noise_trajectory_from_prev_trajectory(self) -> torch.Tensor:
         assert self.config.use_amortized_diffusion, (
-            "self._x0_for_amortized_diffusion 이 설정된 상태에서는 "
+            "self._x0_for_amortized_inference 이 설정된 상태에서는 "
             "config.use_amortized_diffusion 이 True 여야 합니다.")
         """
-        self._x0_for_amortized_diffusion : (B, Pnn, future_len, 4) 
+        self._x0_for_amortized_inference : (B, Pnn, future_len, 4) 
             -> (B, Pnn, T-self.config.rollout_time_chunk_size, 4)
         self.t_tau: shape (future_len)
         """
-        _x0_for_amortized_diffusion = torch.zeros_like(
-            self._x0_for_amortized_diffusion)  # (B, Pnn, future_len, 4)
-        # _x0_for_amortized_diffusion: (B, Pnn, future_len, 4)
-        _x0_for_amortized_diffusion[:, :, :-self.config.rollout_time_chunk, :] = \
+        _x0_for_amortized_inference = torch.zeros_like(
+            self._x0_for_amortized_inference)  # (B, Pnn, future_len, 4)
+        # _x0_for_amortized_inference: (B, Pnn, future_len, 4)
+        _x0_for_amortized_inference[:, :, :-self.config.rollout_time_chunk_size, :] = \
         (
-            self._x0_for_amortized_diffusion)[
-            :, :, self.config.rollout_time_chunk:, :]
-
+            self._x0_for_amortized_inference)[
+            :, :, self.config.rollout_time_chunk_size:, :]
+        B = _x0_for_amortized_inference.shape[0]
         # batch_diffusion_time : (B, future_len)
-        batch_diffusion_time: torch.Tensor = self.unsqueeze(0).repeat(B, 1).to(
-            device=self._x0_for_amortized_diffusion.device)
+        batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
+            B, 1).to(device=self._x0_for_amortized_inference.device)
         # mean: (B, Pnn, future_len, 4)
         # std_raw: (B, 1, 1, 1) or (B, 1, future_len, 1)
-        mean, std = self.sde.marginal_prob(self._x0_for_amortized_diffusion,
+        mean, std = self.sde.marginal_prob(_x0_for_amortized_inference,
                                            batch_diffusion_time)
         # random_noise: (B, (1+)Pnn, future_len, 4)
         random_noise: torch.Tensor = torch.randn_like(
-            self._x0_for_amortized_diffusion,
-            device=self._x0_for_amortized_diffusion.device,
+            self._x0_for_amortized_inference,
+            device=self._x0_for_amortized_inference.device,
         )
         # noise_trajectory: (B, (1+)Pnn, T, 4)
         noise_trajectory: torch.Tensor = mean + std * random_noise
@@ -1684,16 +1708,15 @@ class Decoder(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """추론/평가 모드에서 한 배치에 대해 decoder 를 한 번 돌린다."""
         return_: Dict[str, torch.Tensor] = {}
-
         B: int = batch_size
-        """
-        
-        """
         # 1) 시작 노이즈 생성 (미래만)
         # ✅ (변경) 외부에서 만든 noise를 반드시 입력으로 받는다.
         # noise: (B,(1+)Pnn,T,4)
         noise_trajectory = inputs.get("inference_noise", None)
-        if self._x0_for_amortized_diffusion is None:
+        need_warmup = inputs["need_warmup"]
+        if need_warmup:
+            self._x0_for_amortized_inference = None
+        if self._x0_for_amortized_inference is None:
             if noise_trajectory is None:
                 noise_trajectory: torch.Tensor = self._sample_inference_noise(
                     target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
@@ -1711,7 +1734,6 @@ class Decoder(nn.Module):
                 diffusion_steps = 16
             else:
                 diffusion_steps = 10
-
 
         else:
             # noise_trajectory: (B,(1+)Pnn,T,4)
@@ -1772,7 +1794,6 @@ class Decoder(nn.Module):
         # dtype 맞춤(기존 로직 유지)
         x0 = x0.to(xT.dtype)
 
-
         # 6) (B, (1+)Pnn, 1+T, 4)
         x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
             x0=
@@ -1782,7 +1803,8 @@ class Decoder(nn.Module):
             one_or_Pnn=one_or_Pnn,
         )
         if self.config.use_amortized_diffusion:
-            self._x0_for_amortized_diffusion = x0_seq_norm[:, :, 1:, :]  # (B, Pnn, T, 4)
+            self._x0_for_amortized_inference = x0_seq_norm[:, :,
+                                                           1:, :]  # (B, Pnn, T, 4)
 
         # 8) feasible 출력(옵션)
         self._append_inference_feasible_outputs(
@@ -1944,17 +1966,17 @@ class DiT(nn.Module):
 
         self._model_type = model_type
         if self.config.use_amortized_diffusion:
-            output_dim_pre = int(output_dim/4*5)
+            output_dim_pre = int(output_dim / 4 * 5)
         else:
             output_dim_pre = output_dim
-        self.preproj = Mlp(in_features=output_dim_pre, # x, y, cos(yaw), sin(yaw), noising timestep
-                           hidden_features=512,
-                           out_features=hidden_dim,
-                           act_layer=nn.GELU,
-                           drop=0.)
+        self.preproj = Mlp(
+            in_features=
+            output_dim_pre,  # x, y, cos(yaw), sin(yaw), noising timestep
+            hidden_features=512,
+            out_features=hidden_dim,
+            act_layer=nn.GELU,
+            drop=0.)
         self.t_embedder = TimestepEmbedder(hidden_dim)
-        if self.config.use_amortized_diffusion:
-            self._amortized_t_emb = nn.Embedding(1, hidden_dim) #
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_dim, heads, dropout, mlp_ratio)
             for i in range(depth)
@@ -2009,6 +2031,35 @@ class DiT(nn.Module):
         #################
         self._sde = sde
         self.marginal_prob_std = self._sde.marginal_prob_std
+
+    def _get_time_embedding(self, diffusion_time: torch.Tensor,
+                            ref: torch.Tensor) -> torch.Tensor:
+        """
+        diffusion_time:
+          - (B,)          : 일반 확산 시간
+          - (B, future_len): amortized 스케줄 시간
+        ref: dtype/device 기준 텐서 (보통 x)
+        returns: (B, H)
+        """
+        if diffusion_time.ndim == 1:
+            # (B,) -> (B,H)
+            t = diffusion_time.to(device=ref.device, dtype=torch.float32)
+            return self.t_embedder(t).to(dtype=ref.dtype, device=ref.device)
+        if diffusion_time.ndim == 2:
+            # (B,T) -> 대표 스칼라 (B,) -> (B,H)
+            t = diffusion_time.to(device=ref.device, dtype=torch.float32)
+            B, T = t.shape
+            if T != self._future_len:
+                raise ValueError(
+                    f"diffusion_time shape mismatch: expected (B,{self._future_len}), got {tuple(t.shape)}"
+                )
+
+            # ✅ 평균 노이즈 수준을 대표값으로 사용
+            t_global = t.mean(dim=1)  # (B,)
+            return self.t_embedder(t_global).to(dtype=ref.dtype, device=ref.device)
+
+        raise ValueError(
+            f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}")
 
     def preproj_varlen(
             self,
@@ -2159,6 +2210,8 @@ class DiT(nn.Module):
                 feasible을 실제로 실행할 배치만 True.
                 shape: (B,)
         """
+        assert diffusion_time.ndim == 1, \
+            f"diffusion_time must be (B,), got {tuple(diffusion_time.shape)}"
         t_threshold: float = float(self.config.feasible_learn_noise_thresh)
         if not getattr(self.config, "use_direct_loss", False):
             t_threshold = 1.0
@@ -2247,6 +2300,7 @@ class DiT(nn.Module):
         B, one_or_Pnn, _ = target_input_norm_xT.shape
 
         # 1) pre-proj (varlen)
+        # x: (B, (1+)Pnn, H)
         x: torch.Tensor = self.preproj_varlen(
             target_input_norm_xT=
             target_input_norm_xT,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
@@ -2268,11 +2322,9 @@ class DiT(nn.Module):
 
         # 2) timestep embedding
         # t_embedding: (B, H)
-        if diffusion_time.ndim == 1:
-            t_embedding: torch.Tensor = self.t_embedder(diffusion_time).to(x.dtype)
-        else:
-            t_embedding = self._amortized_t_emb.weight.expand(
-                diffusion_time.shape[0], -1).to(x.dtype) # (B, H)
+        t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
+                                                             ref=x)
+
         ego_fut_global = _cast_like(ego_fut_global, x)
 
         # 3) state_token_in 준비 (현재 프레임 기반)
@@ -2297,14 +2349,15 @@ class DiT(nn.Module):
             target_agents_route_lane_emb=target_agents_route_lane_emb,
             route_known_mask=route_known_mask,  # (B, (1+)Pnn)
         )
-        time_out = self.pram_v2_time_mod(t_embedding)  # TimeModulationOutputs 3개 (B,1,H)
+        time_out = self.pram_v2_time_mod(
+            t_embedding)  # TimeModulationOutputs 3개 (B,1,H)
 
         # 5) DiT 블록 반복
         for block_index, block in enumerate(self.blocks):
             # Dict[PathName, ModulationTriplet]
             pram_mods = compute_pram_v2_modulations_for_block(
                 composer_out=composer_out,
-                time_out=time_out, # TimeModulationOutputs 3개 (B,1,H)
+                time_out=time_out,  # TimeModulationOutputs 3개 (B,1,H)
                 path_scalars=self.pram_v2_block_path_scalars,
                 block_index=block_index,
                 batch_size=B,
@@ -2375,7 +2428,7 @@ class DiT(nn.Module):
         self,
         x: torch.
         Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-            low_t_mask: Optional[torch.Tensor],  # (B,)
+        low_t_mask: Optional[torch.Tensor],  # (B,)
         diffusion_time: torch.Tensor,  # (B,)
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         target_past_cur_future_valid: torch.
@@ -2470,50 +2523,62 @@ class DiT(nn.Module):
         target_current_mask: torch.Tensor = ~target_current_valid
         return target_cur_future_valid, target_current_mask
 
-    def _apply_diffusion_timestep(self,
-                                  target_input_norm_xT: torch.Tensor, # (B, (1+)Pnn, F=_*4)
-                                  diffusion_time: torch.Tensor # (B,) or (B, future_len)
-                                  )-> torch.Tensor:
+    def _apply_diffusion_timestep(
+        self,
+        target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*4)
+        diffusion_time: torch.Tensor  # (B,) or (B, future_len)
+    ) -> torch.Tensor:
         """
-        target_cur_future_norm_xT : (B, (1+)Pnn, 1+future_len, 4) -> (B, (1+)Pnn, 1+future_len, 5)
+        target_cur_future_norm_xT : (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _ * 5)
 
         5: x, y, cos, sin 에서 diffusion noise time step 추가
 
         참고로 1+future_len 은 현재+미래. 현재에는 노이즈를 추가하지 않을 것이므로, 0으로 채움
         미래 future_len 에 대해서는, diffusion_time 에 따라 노이즈 time step을 채움
         """
-        B, P, T1, _ = target_input_norm_xT.shape  # T1 = 1 + future_len
+        # target_input_norm_xT: (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _, 4)
+        target_input_norm_xT = target_input_norm_xT.reshape(
+            target_input_norm_xT.shape[0],
+            target_input_norm_xT.shape[1],
+            -1,
+            4,
+        )  # (B, (1+)Pnn, T1, 4)
+
         if diffusion_time.ndim == 1:
             diffusion_time_for_future = diffusion_time[:, None].repeat(
                 1, self._future_len)  # (B, future_len)
         elif diffusion_time.ndim == 2:
-            diffusion_time_for_future = diffusion_time  # (B, future_len)
+            if diffusion_time.shape[1] != self._future_len:
+                raise ValueError(
+                    f"diffusion_time must have shape (B,{self._future_len}) when 2D. got {tuple(diffusion_time.shape)}"
+                )
+            diffusion_time_for_future = diffusion_time # (B, future_len)
         else:
             raise ValueError(
                 f"diffusion_time must be (B,) or (B, future_len). got {diffusion_time.shape}"
             )
-        # (B, 1)
+        B, P, T1, _ = target_input_norm_xT.shape
+        past_cur_time_len = T1 - self._future_len  # past_len + 1
+        # (B, past_cur_time_len)
         diffusion_time_for_current = torch.zeros(
-            (B, 1),
+            (B, past_cur_time_len),
             dtype=diffusion_time.dtype,
             device=diffusion_time.device,
         )
-        # (B, 1+future_len)
+        # (B, past_cur_time_len + future_len)
         diffusion_time_full = torch.cat(
             [diffusion_time_for_current, diffusion_time_for_future],
             dim=1,
         )
-        # (B, 1+future_len) -> (B, 1, 1+future_len, 1)
-        diffusion_time_full = diffusion_time_full[
-            :, None, :, None]
-        # (B, P, 1+future_len, 1)
-        diffusion_time_full = diffusion_time_full.expand(B, P, T1,
-                                                         1)
+        # (B, past_cur_time_len + future_len) -> (B, 1, past_cur_time_len + future_len, 1)
+        diffusion_time_full = diffusion_time_full[:, None, :, None]
+        # (B, P, past_cur_time_len + future_len, 1)
+        diffusion_time_full = diffusion_time_full.expand(B, P, T1, 1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
         """
-        target_input_norm_xT : (B, (1+)Pnn, 1+T, 4) -> (B, (1+)Pnn, 1+T, 5)
-        diffusion_time_full : (B, (1+)Pnn, 1+T, 1)
+        target_input_norm_xT : (B, (1+)Pnn, past_cur_time_len + future_len, 4) -> (B, (1+)Pnn, past_cur_time_len + future_len, 5)
+        diffusion_time_full : (B, (1+)Pnn, past_cur_time_len + future_len, 1)
         """
         target_input_norm_xT = torch.cat(
             [
@@ -2521,7 +2586,12 @@ class DiT(nn.Module):
                 diffusion_time_full,
             ],
             dim=-1,
-        )  # (B, (1+)Pnn, 1+future_len, 5)
+        )  # (B, (1+)Pnn, past_cur_time_len + future_len, 5)
+        target_input_norm_xT = target_input_norm_xT.reshape(
+            B,
+            P,
+            -1,
+        )  # (B, (1+)Pnn, _ * 5)
         return target_input_norm_xT
 
     def forward(
@@ -2529,7 +2599,7 @@ class DiT(nn.Module):
         target_input_norm_xT: torch.
         Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
-        diffusion_time: torch.Tensor, # (B,) or (B, future_len)
+        diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
         target_agents_past: torch.
         Tensor,  # (B, (1+)Pnn, time_len(=past_len+1), 11)
         cross_c: torch.Tensor,  # (B, token_num, D)
@@ -2580,11 +2650,12 @@ class DiT(nn.Module):
         ):
             if self.config.use_amortized_diffusion:
                 #   target_input_norm_xT: (B, (1+)Pnn, (time_len+ T) *5) or (B, (1+)Pnn, T*5) or (B, (1+)Pnn, (1+T)*5)
-                target_input_norm_xT = self._apply_diffusion_timestep(target_input_norm_xT, diffusion_time)
+                target_input_norm_xT = self._apply_diffusion_timestep(
+                    target_input_norm_xT, diffusion_time)
             # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             x: torch.Tensor = self._run_dit_core_with_pram_v2(
-                target_input_norm_xT=target_input_norm_xT, #
-                diffusion_time=diffusion_time, # (B,) or (B, future_len)
+                target_input_norm_xT=target_input_norm_xT,  #
+                diffusion_time=diffusion_time,  # (B,) or (B, future_len)
                 cross_c=cross_c,
                 ego_fut_global=ego_fut_global,
                 target_agents_route_lane_emb=target_agents_route_lane_emb,

@@ -540,7 +540,8 @@ class Encoder(nn.Module):
         )
 
     @staticmethod
-    def _set_modules_train_mode(modules: Iterable[nn.Module], mode: bool) -> None:
+    def _set_modules_train_mode(modules: Iterable[nn.Module],
+                                mode: bool) -> None:
         """주어진 모듈들을 한꺼번에 train/eval 모드로 바꿉니다.
 
         Args:
@@ -571,12 +572,14 @@ class Encoder(nn.Module):
             self._set_modules_train_mode(local_modules, mode=False)
             return
         if self._force_encoder_local_eval is False:
-            self._set_modules_train_mode(local_modules, mode=bool(self.training))
+            self._set_modules_train_mode(local_modules,
+                                         mode=bool(self.training))
             return
 
         # 2) 자동 모드: "로컬 파라미터가 전부 고정"일 때만 eval로 내림
         if not self._eval_frozen_encoder_local:
-            self._set_modules_train_mode(local_modules, mode=bool(self.training))
+            self._set_modules_train_mode(local_modules,
+                                         mode=bool(self.training))
             return
 
         local_is_frozen: bool = self.are_encoder_local_parameters_frozen()
@@ -585,7 +588,8 @@ class Encoder(nn.Module):
             self._set_modules_train_mode(local_modules, mode=False)
         else:
             # 그 외는 부모 모드를 따름
-            self._set_modules_train_mode(local_modules, mode=bool(self.training))
+            self._set_modules_train_mode(local_modules,
+                                         mode=bool(self.training))
 
     def train(self, mode: bool = True) -> "Encoder":
         """PyTorch train()/eval() 호출 시, 로컬 인코더 모드까지 함께 정리합니다.
@@ -599,7 +603,6 @@ class Encoder(nn.Module):
         super().train(mode)
         self._sync_encoder_local_train_eval_mode()
         return self
-
 
     def _zero_with_touch(self, ref: torch.Tensor,
                          params: Iterable[torch.nn.Parameter]) -> torch.Tensor:

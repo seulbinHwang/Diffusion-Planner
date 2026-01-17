@@ -266,7 +266,6 @@ def assert_cur_future_valid_mask_np(
         )
 
 
-
 def _prepare_batch_for_device(
     batch: Dict[str, torch.Tensor],
     device: str,
@@ -327,7 +326,8 @@ def _prepare_batch_for_device(
                     dim=-1,
                 )  # (B, future_len, 4)
                 # ego_future_mask: (B, future_len)
-                ego_future_gt_11_dim = batch_on_device.get("planner_future_11_dim", None)
+                ego_future_gt_11_dim = batch_on_device.get(
+                    "planner_future_11_dim", None)
                 ego_future_mask: torch.Tensor = torch.sum(
                     torch.ne(ego_future_gt_11_dim[..., :8], 0),
                     dim=-1,

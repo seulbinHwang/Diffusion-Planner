@@ -15,6 +15,7 @@ from typing import Any, List, Sequence, Tuple
 import os
 import numpy as np
 
+
 def _normalize_use_data_percent(use_data_percent: Any) -> float:
     """사용할 비율(%) 값을 0~100 범위로 안전하게 정리합니다."""
     if use_data_percent is None:
@@ -340,8 +341,12 @@ class DiffusionPlannerData(Dataset):
                 data_list=loaded_list,
                 use_data_percent=use_data_percent,
             )
-        print( f"[DiffusionPlannerData] Loaded {len(loaded_list)} items from '{data_list}'")
-        print( f"[DiffusionPlannerData] Using first {keep_count} items ({normalized_percent:.2f}%)")
+        print(
+            f"[DiffusionPlannerData] Loaded {len(loaded_list)} items from '{data_list}'"
+        )
+        print(
+            f"[DiffusionPlannerData] Using first {keep_count} items ({normalized_percent:.2f}%)"
+        )
         self.data_list = selected_list
         self.predicted_neighbor_num = predicted_neighbor_num
         self.eval_method = eval_method
@@ -456,7 +461,7 @@ class DiffusionPlannerData(Dataset):
         ]
 
         nuplan_only_keys: List[str] = [
-            "static_objects", #check # (chosen_static_num, 10) # nuplan
+            "static_objects",  #check # (chosen_static_num, 10) # nuplan
             "route_lanes",  # (chosen_route_lane_num, route_len, 12) # nuplan
             "route_lanes_speed_limit",  # (chosen_route_lane_num, 1) # nuplan
             "route_lanes_has_speed_limit",  # (chosen_route_lane_num, 1) # nuplan
@@ -518,8 +523,8 @@ class DiffusionPlannerData(Dataset):
                     f"TFRecords file not found: {tfrecord_path}")
             sample["tfrecord_path"] = tfrecord_path
 
-
         return sample
+
 
 """ outputs
 
