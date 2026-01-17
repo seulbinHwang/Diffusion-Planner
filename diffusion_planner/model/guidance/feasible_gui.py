@@ -8,7 +8,7 @@ DEFAULT_CONSTRAINT_COST_WEIGHT: float = 0.  # 제약 위반량 비용 비율
 
 def feasible_guidance_fn(
     x_dit: torch.Tensor,  # 정규화된 궤적 텐서 (B, Pnn, T, 4) 또는 (B, Pnn, (1+T), 4)
-    t: torch.Tensor,
+    t: torch.Tensor,  # 현재 시간 텐서 (B,) 또는 (B, T)
     cond: Optional[torch.Tensor],
     *args,
     **kwargs,
@@ -21,7 +21,7 @@ def feasible_guidance_fn(
     이 값은 나중에 미분되어, 궤적을 조금씩 더 자연스러운 방향으로 움직이는 데 사용된다.
     """
     # x_dit: (use_current_input = F (B, Pnn, T, 4) or use_current_input = T (B, Pnn, (1+T), 4)
-    # t: (B,) 또는 (B, 1)       — 각 샘플의 현재 시간 값
+    # t: (B,) 또는 (B, T)       — 각 샘플의 현재 시간 값
 
     integrated_trajectory = kwargs["integrated_trajectory"]  # (B, Pnn, T, 4)
     control_constraint_diff = kwargs[
@@ -39,12 +39,10 @@ def feasible_guidance_fn(
         f"제어 제약 차이 길이({constraint_len})가 서로 맞지 않습니다.")
     # 시간 텐서를 배치 크기에 맞는 1차원 벡터로 정리
     # current_time_vector: (B,)
-    current_time_vector = _reshape_time_to_batch_vector(t, x_dit)
-
     # 현재 시간이 어느 구간인지에 따라, 동역학 가이던스를 얼마나 쓸지 결정
     # guidance_strength : (B,)
     guidance_strength = _compute_guidance_strength(
-        current_time_vector,  # (B,)
+        t,  # (B,) or (B, T)
         config,
     )
 
@@ -58,9 +56,9 @@ def feasible_guidance_fn(
 
     # projection 비용 / 제약 위반 비용에 쓸 유효 시간 마스크 만들기
 
-    # near_future_valid : (B, Pnn, T)
+    # near_future_valid : (B, 1+Pnn, T)
     near_future_valid = _build_valid_masks_for_costs(
-        x_dit,  # (B, Pnn, T, 4)
+        x_dit,  # (B, 1+Pnn, T, 4)
         model_condition,
     )
 
@@ -68,8 +66,8 @@ def feasible_guidance_fn(
     # projection_cost_per_batch: (B,)
     projection_cost_per_batch = _compute_projection_based_cost(
         x_dit,  # (B, Pnn, T, 4)
-        integrated_trajectory,  # (B, Pnn, T, 4)
-        near_future_valid,  # (B, Pnn, T)
+        integrated_trajectory,  # (B, 1+Pnn, T, 4)
+        near_future_valid,  # (B, 1+Pnn, T)
     )
 
     # (2) 제어 값이 제약 때문에 얼마나 많이 잘렸는지 기반 비용
@@ -142,7 +140,7 @@ def _compute_guidance_strength(
     아직 노이즈가 많은 구간(t가 큰 쪽)에서는 거의 0에 가깝게,
     노이즈가 많이 줄어든 구간(t가 작아진 뒤)에는 1에 가깝게 값을 만들어 준다.
     """
-    # current_time_vector: (B,)
+    # current_time_vector: (B,) or (B, T)
     batch_size: int = current_time_vector.shape[0]
     feasible_learn_noise_thresh: float = config.feasible_learn_noise_thresh
 
@@ -150,10 +148,17 @@ def _compute_guidance_strength(
         (batch_size,),
         feasible_learn_noise_thresh,
     )  # (B,)
-
-    # t <= feasible_learn_noise_thresh 인 구간만 가이던스를 켠다. (<=: 조금 여유 있게 켜기 위함)
-    guidance_strength = (current_time_vector <= start_time_tensor).to(
-        dtype=current_time_vector.dtype)  # (B,)
+    if current_time_vector.dim() == 1:
+        # t <= feasible_learn_noise_thresh 인 구간만 가이던스를 켠다. (<=: 조금 여유 있게 켜기 위함)
+        guidance_strength = (current_time_vector <= start_time_tensor).to(
+            dtype=current_time_vector.dtype)  # (B,)
+    elif current_time_vector.dim() == 2:
+        # t가 (B, T) 모양으로 들어온 경우, 항상 가이던스를 켜도록 만든다.
+        guidance_strength = current_time_vector.new_ones((batch_size,))  # (B,)
+    else:
+        raise ValueError(
+            f"current_time_vector는 (B,) 또는 (B, T) 모양이어야 합니다. got {current_time_vector.shape}"
+        )
 
     return guidance_strength  # (B,)
 
@@ -162,20 +167,35 @@ def _build_valid_masks_for_costs(
     dit_trajectory: torch.Tensor,  # (B, Pnn, T, 4)
     model_condition: Dict,
 ) -> torch.Tensor:
-    """
-    궤적과 제어 값들 중에서 '실제로 유효한 시점'만 골라내는 마스크를 만드는 함수.
+    """비용 계산에 쓸 '유효한 미래 시점' 마스크를 만듭니다.
 
-    과거·현재·미래 유효 여부를 담은 마스크에서,
-    우리가 쓰려는 미래 구간만을 잘라서 projection / 제약 비용에 각각 맞춰준다.
+    Args:
+        dit_trajectory (torch.Tensor):
+            비용을 계산할 궤적(미래 구간).
+            - shape: (B, 1+Pnn, T, 4)
+        model_condition (Dict):
+            모델 조건 dict.
+            - "target_past_cur_future_valid" 또는 "near_past_cur_future_valid" 중 하나가 있어야 합니다.
+
+    Returns:
+        torch.Tensor:
+            미래 유효 마스크.
+            - shape: (B, 1+Pnn, T)
     """
-    # dit_trajectory: (B, Pnn, T, 4)
-    batch_size, Pnn, future_len, _ = dit_trajectory.shape
-    near_past_cur_future_valid: Optional[torch.Tensor] = model_condition.get(
-        "near_past_cur_future_valid", None)  # (B, Pnn, T_full)
-    if near_past_cur_future_valid is None:
-        raise ValueError("near_past_cur_future_valid 마스크가 제공되지 않았습니다.")
-    near_future_valid = near_past_cur_future_valid[:, :,
-                                                   -future_len:]  # (B, Pnn, T)
+    _, _, future_len, _ = dit_trajectory.shape
+
+    valid_full: Optional[torch.Tensor] = model_condition.get(
+        "target_past_cur_future_valid", None)
+    if valid_full is None:
+        valid_full = model_condition.get("near_past_cur_future_valid", None)
+
+    if valid_full is None:
+        raise ValueError(
+            "유효 마스크가 제공되지 않았습니다. "
+            "model_condition에 'target_past_cur_future_valid' 또는 'near_past_cur_future_valid'가 필요합니다."
+        )
+
+    near_future_valid = valid_full[:, :, -future_len:]  # (B, 1+Pnn, T)
     return near_future_valid
 
 

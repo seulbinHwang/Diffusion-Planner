@@ -3,7 +3,7 @@ from typing import Callable
 import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 from flash_attn.bert_padding import unpad_input, pad_input
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
@@ -218,13 +218,13 @@ class Decoder(nn.Module):
         self._observation_normalizer: ObservationNormalizer = config.observation_normalizer
 
         # self._guidance_fn = config.guidance_fn
+        # = <diffusion_planner/model/guidance/guidance_wrapper.py> 의 GuidanceWrapper 인스턴스가 들어옴
         self._guidance_fn = getattr(config, "guidance_fn", None)
         self._x0_for_amortized_inference = None  # # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         future_len = self.config.future_len  # e.g., 80
         # Future-only amortized schedule: [1/T, 2/T, ..., 1]
-        self.t_tau = (
-            torch.arange(1, future_len + 1, dtype=torch.float32) / float(future_len)
-        )
+        self.t_tau = (torch.arange(1, future_len + 1, dtype=torch.float32) /
+                      float(future_len))
 
     def _get_inference_noise_from_inputs(
         self,
@@ -770,7 +770,7 @@ class Decoder(nn.Module):
 
     def _compute_feasible_blend_beta(
             self,
-            diffusion_time_step: torch.Tensor,  # shape: () or (1,)
+            diffusion_time_step: torch.Tensor,  # shape: (B) or (B, future_len)
             reference_tensor_for_device: torch.Tensor,  # shape: (B, Pnn, _, 4)
     ) -> torch.Tensor:  # shape: ()
         """DPM-Solver가 넘겨주는 현재 시간 t 로 prox-snap 비율 β(t)를 계산하는 함수.
@@ -792,22 +792,29 @@ class Decoder(nn.Module):
         if beta_max <= 0.0:
             return reference_tensor_for_device.new_tensor(0.0)
 
-        # diffusion_time_step: t (shape: () or (1,))
+        # diffusion_time_step: t (shape: (B)
         t_value: torch.Tensor = diffusion_time_step.detach().float()
-        if t_value.dim() > 0:
+        if t_value.dim() == 1:
             # 여러 값이 들어와도 첫 번째 값만 사용 (배치 전체가 같은 t 를 쓰기 때문)
-            t_value = t_value.view(-1)[0]
+            t_value = t_value.view(-1)[0]  # shape: ()
+            # s(t) = clip( (t_th - t) / t_th, 0, 1 )
+            safe_t_threshold: float = max(t_threshold, 1e-6)
+            s_raw: torch.Tensor = (t_threshold - t_value) / safe_t_threshold
+            s_clamped: torch.Tensor = torch.clamp(s_raw, 0.0, 1.0)
 
-        # s(t) = clip( (t_th - t) / t_th, 0, 1 )
-        safe_t_threshold: float = max(t_threshold, 1e-6)
-        s_raw: torch.Tensor = (t_threshold - t_value) / safe_t_threshold
-        s_clamped: torch.Tensor = torch.clamp(s_raw, 0.0, 1.0)
+            beta_value: torch.Tensor = beta_max * (s_clamped**beta_power
+                                                  )  # shape: ()
+            beta_value = beta_value.to(
+                dtype=reference_tensor_for_device.dtype,
+                device=reference_tensor_for_device.device,
+            )
+        elif t_value.dim() == 2:
+            # beta_value : torch Tensor filled with zero. shape = ()
+            beta_value = reference_tensor_for_device.new_tensor(
+                0.0)  # shape: ()
+        else:
+            raise ValueError("diffusion_time_step의 차원 수가 예상과 다릅니다.")
 
-        beta_value: torch.Tensor = beta_max * (s_clamped**beta_power)
-        beta_value = beta_value.to(
-            dtype=reference_tensor_for_device.dtype,
-            device=reference_tensor_for_device.device,
-        )
         return beta_value
 
     def _get_latest_feasible_integrated_trajectory_future(
@@ -1269,7 +1276,7 @@ class Decoder(nn.Module):
             self,
             xt: torch.
         Tensor,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-            t: torch.Tensor,  # () 또는 (1,)
+            t: torch.Tensor,  # (B) or (B,future_len)
             step: int,
             *,
             batch_size: int,  # DONE
@@ -1326,7 +1333,7 @@ class Decoder(nn.Module):
                 "use_feasible_blend 옵션은 use_feasible 이 켜져 있을 때만 동작합니다.")
 
             beta_scalar: torch.Tensor = self._compute_feasible_blend_beta(
-                diffusion_time_step=t,  # () 또는 (1,)
+                diffusion_time_step=t,  # (B,) or (B,future_len)
                 reference_tensor_for_device=xt_sequence,  # (B, Pnn, _, 4)
             )  # shape: ()
 
@@ -1386,47 +1393,484 @@ class Decoder(nn.Module):
             cond_last_mask=cond_last_mask,
         )
 
-    def _run_dpm_sampler_for_inference(
+    def _build_amortized_t_tau(
         self,
-        xT: torch.Tensor,  # (B, Pnn, F)
-        target_agents_past: Optional[
-            torch.Tensor],  # (B, Pnn, time_len(=past_len+1), 11) 또는 None
+        batch_size: int,
+        reference_tensor_for_device: torch.Tensor,
+    ) -> torch.Tensor:
+        """amortized 1-step에서 사용할 프레임별 시간값(t_tau)을 배치 크기에 맞게 만든다.
+
+        Args:
+            batch_size (int): 배치 크기 B.
+            reference_tensor_for_device (torch.Tensor): device 기준 텐서.
+                - shape: 임의
+
+        Returns:
+            torch.Tensor: 프레임별 시간값.
+                - shape: (B, future_len)
+                - dtype: float32
+                - device: reference_tensor_for_device.device
+        """
+        # self.t_tau: (future_len,)
+        t_base: torch.Tensor = self.t_tau.to(
+            device=reference_tensor_for_device.device,
+            dtype=torch.float32,
+        )  # (future_len,)
+
+        # t_tau: (B, future_len)
+        t_tau: torch.Tensor = t_base.unsqueeze(0).expand(int(batch_size),
+                                                         -1).contiguous()
+        return t_tau
+
+    def _compute_amortized_t_eff(self, t_tau: torch.Tensor) -> torch.Tensor:
+        """(B, future_len) 형태의 시간값을 (B,) 대표 시간값으로 요약한다.
+
+        이 대표 시간값은 guidance_fn / correcting_xt_fn 같이
+        '시간을 스칼라로 받는 함수'에 넣기 위한 용도입니다.
+
+        현재 DiT 구현은 (B, future_len) 시간 입력을 내부에서 평균으로 요약해 씁니다.
+        (DiT._get_time_embedding에서 t.mean(dim=1)을 사용)
+
+        Args:
+            t_tau (torch.Tensor): 프레임별 시간값.
+                - shape: (B, future_len)
+
+        Returns:
+            torch.Tensor: 대표 시간값.
+                - shape: (B,)
+                - dtype: float32
+        """
+        if t_tau.dim() != 2:
+            raise ValueError(
+                f"t_tau must be 2D (B,future_len). got {tuple(t_tau.shape)}")
+
+        # t_eff: (B,)
+        t_eff: torch.Tensor = t_tau.mean(dim=1).to(torch.float32)
+        return t_eff
+
+    def _build_amortized_full_time_for_flattened_trajectory(
+            self,
+            t_tau: torch.Tensor,  # (B, future_len)
+            reference_flat: torch.Tensor,  # (B, Pnn, F)
+    ) -> torch.Tensor:
+        """flat 궤적 모양(F=프레임수*4)에 맞는 '프레임별 시간값'을 만든다.
+
+        규칙
+        ----
+        - 과거/현재 프레임(있다면): 시간값을 0으로 둡니다.
+        - 미래 프레임: t_tau를 그대로 붙입니다.
+
+        Args:
+            t_tau (torch.Tensor): 미래 프레임 시간값.
+                - shape: (B, future_len)
+            reference_flat (torch.Tensor): flat 궤적 텐서(길이 맞추기 기준).
+                - shape: (B, Pnn, F)  (F는 4의 배수)
+
+        Returns:
+            torch.Tensor: 전체 프레임 시간값.
+                - shape: (B, total_len)
+                  * total_len = time_len + future_len (use_past_dit_input=True)
+                  * total_len = 1 + future_len       (use_current_input=True)
+                  * total_len = future_len           (use_current_input=False)
+        """
+        if reference_flat.dim() != 3:
+            raise ValueError(
+                f"reference_flat must be 3D (B,Pnn,F). got {tuple(reference_flat.shape)}"
+            )
+
+        B: int = int(reference_flat.shape[0])
+        flat_dim: int = int(reference_flat.shape[-1])
+        if flat_dim % 4 != 0:
+            raise ValueError(
+                f"reference_flat last dim must be multiple of 4. got F={flat_dim}"
+            )
+
+        total_len: int = int(flat_dim // 4)
+        future_len: int = int(self._future_len)
+
+        if self.config.use_past_dit_input:
+            expected_total_len: int = int(self.config.time_len + future_len)
+        elif self.config.use_current_input:
+            expected_total_len = int(1 + future_len)
+        else:
+            expected_total_len = int(future_len)
+
+        if total_len != expected_total_len:
+            raise ValueError(
+                "flat 길이가 config와 맞지 않습니다. "
+                f"total_len={total_len}, expected={expected_total_len}, F={flat_dim}"
+            )
+
+        prefix_len: int = int(total_len - future_len)
+        if prefix_len < 0:
+            raise ValueError(f"prefix_len must be >= 0, got {prefix_len}")
+
+        if prefix_len == 0:
+            # t_full: (B, future_len)
+            return t_tau.to(dtype=torch.float32, device=reference_flat.device)
+
+        # t_prefix: (B, prefix_len)
+        t_prefix: torch.Tensor = torch.zeros(
+            (B, prefix_len),
+            device=reference_flat.device,
+            dtype=torch.float32,
+        )
+        # t_full: (B, total_len)
+        t_full: torch.Tensor = torch.cat(
+            [t_prefix, t_tau.to(torch.float32)], dim=1)
+        return t_full
+
+    def _compute_amortized_sigma2_over_alpha_flat(
+        self,
+        t_full: torch.Tensor,  # (B, total_len)
+        batch_size: int,
+        one_or_Pnn: int,
+        reference_tensor_for_device: torch.Tensor,
+    ) -> torch.Tensor:
+        """프레임별 시간값(t_full)로 (노이즈크기^2 / 원래값비율) 텐서를 만든다.
+
+        목적
+        ----
+        amortized 1-step에서 guidance를 x0_pred에 반영할 때
+        프레임마다 다른 '노이즈 크기'가 있으므로,
+        프레임별로 다른 스케일을 곱해 주기 위한 텐서입니다.
+
+        구현 방식(팩트)
+        --------------
+        - Decoder의 amortized 노이즈 섞기에서 self.sde.marginal_prob(...)를 쓰고 있으므로,
+          여기서도 같은 SDE로 "원래값비율(=mean 계수)"과 "노이즈 크기(=std)"를 구합니다.
+        - x_dummy를 1로 두면 marginal_prob의 mean이 곧 "원래값비율"이 됩니다.
+
+        Args:
+            t_full (torch.Tensor): 전체 프레임 시간값.
+                - shape: (B, total_len)
+            batch_size (int): B
+            one_or_Pnn (int): Pnn
+            reference_tensor_for_device (torch.Tensor): device 기준 텐서.
+                - shape: 임의
+
+        Returns:
+            torch.Tensor: flat 스케일 텐서.
+                - shape: (B, Pnn, total_len*4)
+                - dtype: float32
+        """
+        B: int = int(batch_size)
+        Pnn: int = int(one_or_Pnn)
+        total_len: int = int(t_full.shape[1])
+
+        # t_full_f32: (B, total_len)
+        t_full_f32: torch.Tensor = t_full.to(
+            device=reference_tensor_for_device.device,
+            dtype=torch.float32,
+        )
+
+        # x_dummy: (B, Pnn, total_len, 4)
+        x_dummy: torch.Tensor = torch.ones(
+            (B, Pnn, total_len, 4),
+            device=reference_tensor_for_device.device,
+            dtype=torch.float32,
+        )
+
+        # mean_dummy: (B, Pnn, total_len, 4)  (x_dummy==1 이므로 "원래값비율" 역할)
+        # std:        (B, 1, total_len, 1) 또는 (B, Pnn, total_len, 1) 등 (브로드캐스트 가능)
+        mean_dummy, std = self.sde.marginal_prob(x_dummy, t_full_f32)
+
+        # alpha_safe: (B, Pnn, total_len, 4)
+        alpha_safe: torch.Tensor = mean_dummy.clamp_min(1e-6)
+
+        # sigma2_over_alpha: (B, Pnn, total_len, 4)
+        sigma2_over_alpha: torch.Tensor = (std**2) / alpha_safe
+
+        # t==0인 프레임(과거/현재)은 guidance 스케일을 0으로 강제
+        # t_mask: (B, 1, total_len, 1)
+        t_mask: torch.Tensor = (t_full_f32 > 0.0).to(torch.float32).view(
+            B, 1, total_len, 1)
+        sigma2_over_alpha = sigma2_over_alpha * t_mask  # (B, Pnn, total_len, 4)
+
+        # flat: (B, Pnn, total_len*4)
+        sigma2_over_alpha_flat: torch.Tensor = sigma2_over_alpha.reshape(
+            B, Pnn, total_len * 4)
+        return sigma2_over_alpha_flat
+
+    def _compute_classifier_cond_grad_for_guidance(
+        self,
+        xT_flat: torch.Tensor,  # (B, Pnn, F)
+        t_tau: torch.Tensor,  # (B,)
+        classifier_kwargs: Dict[str, object],
+        condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """guidance가 xT를 어떤 방향으로 움직이고 싶어 하는지(미분 값)를 계산합니다.
+
+        이 함수는 "guidance 함수가 낸 점수(또는 로그값)"를 xT에 대해 미분해서,
+        xT를 어느 방향으로 바꾸면 그 값이 커지는지(=기울기)를 구합니다.
+
+        주의 사항(팩트)
+        -------------
+        - torch의 미분 계산을 사용하므로, 일반 no_grad 추론보다 연산량이 늘어납니다.
+        - guidance 함수 내부에서 모델을 추가로 부르면 비용이 더 늘 수 있습니다.
+          (이건 guidance_fn 구현에 달려 있어 여기서는 확정할 수 없습니다.)
+
+        Args:
+            xT_flat (torch.Tensor):
+                노이즈가 섞인 입력(flat).
+                shape: (B, Pnn, F)
+            t_tau (torch.Tensor):
+                미래 프레임별 시간값.
+                shape: (B, future_len)
+            classifier_kwargs (Dict[str, object]):
+                guidance 함수에 넘길 추가 정보.
+            condition (Optional[torch.Tensor]):
+                guidance 함수의 cond 인자. 기본 None.
+
+        Returns:
+            torch.Tensor:
+                xT_flat과 같은 모양의 미분 값.
+                shape: (B, Pnn, F)
+                dtype: float32
+        """
+        if self._guidance_fn is None:
+            raise ValueError(
+                "self._guidance_fn is None but cond_grad was requested.")
+
+        # t_tau_f32: (B,future_len))
+        t_tau_f32: torch.Tensor = t_tau.to(device=xT_flat.device,
+                                           dtype=torch.float32)
+
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                # x_in: (B, Pnn, F)
+                x_in: torch.Tensor = xT_flat.clone().detach().requires_grad_(
+                    True)
+
+                log_prob: torch.Tensor = self._guidance_fn(
+                    x_in,
+                    t_tau_f32,
+                    condition,
+                    **classifier_kwargs,
+                )
+
+                # cond_grad: (B, Pnn, F)
+                cond_grad: torch.Tensor = torch.autograd.grad(
+                    log_prob.sum(),
+                    x_in,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0]
+
+        return cond_grad.to(dtype=torch.float32)
+
+    def _apply_classifier_guidance_for_amortized_one_step(
+        self,
+        xT_flat: torch.Tensor,  # (B, Pnn, F)
+        x0_pred_flat: torch.Tensor,  # (B, Pnn, F)
+        t_tau: torch.Tensor,  # (B, future_len)
+        classifier_kwargs: Dict[str, object],
+        guidance_scale: float,
+        condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """amortized 1-step 출력(x0_pred)에 classifier guidance를 반영한다.
+
+        구현(팩트)
+        ----------
+        dpm_solver_pytorch.py의 classifier guidance는 "노이즈 예측"을 다음처럼 바꿉니다.
+
+            noise_guided = noise - guidance_scale * sigma * cond_grad
+
+        이 프로젝트에서 DiT는 x0를 직접 예측(model_type="x_start")하므로,
+        위 식을 x0 쪽으로 정리하면 아래처럼 됩니다.
+
+            x0_guided = x0_pred + guidance_scale * (sigma^2 / alpha) * cond_grad
+
+        amortized에서는 프레임마다 시간값이 다르므로,
+        sigma^2/alpha를 프레임별로 계산해 flat 텐서에 맞춰 곱합니다.
+
+        Args:
+            xT_flat (torch.Tensor): noisy 입력(flat).
+                - shape: (B, Pnn, F)
+            x0_pred_flat (torch.Tensor): DiT가 예측한 결과(flat).
+                - shape: (B, Pnn, F)
+            t_tau (torch.Tensor): 미래 프레임 시간값.
+                - shape: (B, future_len)
+            classifier_kwargs (Dict[str, object]): guidance 함수에 넘길 추가 정보.
+            guidance_scale (float): guidance 강도. 0이면 아무 변화가 없습니다.
+            condition (Optional[torch.Tensor]): guidance 함수의 cond 인자. 기본 None.
+
+        Returns:
+            torch.Tensor: guidance가 반영된 결과(flat).
+                - shape: (B, Pnn, F)
+                - dtype: float32
+        """
+        if self._guidance_fn is None:
+            return x0_pred_flat
+        if float(guidance_scale) == 0.0:
+            return x0_pred_flat
+
+        B: int = int(xT_flat.shape[0])
+        Pnn: int = int(xT_flat.shape[1])
+
+        # t_full: (B, total_len)
+        t_full: torch.Tensor = self._build_amortized_full_time_for_flattened_trajectory(
+            t_tau=t_tau,  # (B, future_len)
+            reference_flat=xT_flat,  #  (B, Pnn, F)
+        )
+
+        # sigma2_over_alpha_flat: (B, Pnn, F)
+        sigma2_over_alpha_flat: torch.Tensor = self._compute_amortized_sigma2_over_alpha_flat(
+            t_full=t_full,
+            batch_size=B,
+            one_or_Pnn=Pnn,
+            reference_tensor_for_device=xT_flat,
+        )
+
+        # cond_grad: (B, Pnn, F)
+        cond_grad: torch.Tensor = self._compute_classifier_cond_grad_for_guidance(
+            xT_flat=xT_flat,
+            t_tau=t_tau,
+            classifier_kwargs=classifier_kwargs,
+            condition=condition,
+        )
+
+        # x0_guided: (B, Pnn, F)
+        x0_guided: torch.Tensor = x0_pred_flat.to(torch.float32) + (
+            float(guidance_scale) * sigma2_over_alpha_flat * cond_grad)
+        return x0_guided
+
+    def _build_classifier_kwargs_for_guidance(
+        self,
+        *,
+        target_agents_past: Optional[torch.Tensor],
         scene_encoding_token: torch.Tensor,  # (B, token_num, D)
         scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
         ego_fut_global: torch.Tensor,  # (B, D)
-        target_agents_route_lane_emb: torch.Tensor,  # (B, Pnn, D)
+        target_agents_route_lane_emb: torch.Tensor,  # (B, (1+)Pnn, D)
         target_past_cur_future_valid: torch.
-        Tensor,  # (B, Pnn, time_len+future_len)
-        route_known_mask: torch.Tensor,  # (B, Pnn)
-        target_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
-        target_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
-        target_past: torch.Tensor,  # (B, Pnn, past_len, 11)
+        Tensor,  # (B, (1+)Pnn, time_len_total)
+        route_known_mask: torch.Tensor,  # (B, (1+)Pnn)
+        target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
+        target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+        inputs: Dict[str, torch.Tensor],
+    ) -> Dict[str, object]:
+        """guidance 함수가 필요로 하는 부가 정보를 한 번에 구성합니다.
+
+        이 함수는 DPM-Solver 경로(diffusion_steps>1)와 amortized 1-step 경로(diffusion_steps==1)에서
+        **같은 형태의 classifier_kwargs**를 쓰도록 만들기 위한 공통 유틸입니다.
+
+        Args:
+            target_agents_past (Optional[torch.Tensor]):
+                과거~현재 상태 시퀀스.
+                - shape: (B, (1+)Pnn, time_len, 11)
+            scene_encoding_token (torch.Tensor):
+                장면 토큰.
+                - shape: (B, token_num, D)
+            scene_encoding_token_mask (torch.Tensor):
+                장면 토큰 마스크.
+                - shape: (B, token_num)
+            ego_fut_global (torch.Tensor):
+                ego 미래 요약 벡터.
+                - shape: (B, D)
+            target_agents_route_lane_emb (torch.Tensor):
+                경로/차선 요약 벡터.
+                - shape: (B, (1+)Pnn, D)
+            target_past_cur_future_valid (torch.Tensor):
+                과거~미래 유효 마스크.
+                - shape: (B, (1+)Pnn, time_len_total)
+            route_known_mask (torch.Tensor):
+                경로 유효 여부.
+                - shape: (B, (1+)Pnn)
+            target_class_one_hot (torch.Tensor):
+                클래스 one-hot.
+                - shape: (B, (1+)Pnn, 3)
+            target_current_xyyaw (torch.Tensor):
+                현재 상태(x,y,cos,sin).
+                - shape: (B, (1+)Pnn, 4)
+            inputs (Dict[str, torch.Tensor]):
+                배치 입력 dict.
+
+        Returns:
+            Dict[str, object]:
+                GuidanceWrapper가 받는 **classifier_kwargs** dict.
+        """
+        model_condition: Dict[str, Any] = {
+            "target_agents_past": target_agents_past,
+            "cross_c": scene_encoding_token,
+            "ego_fut_global": ego_fut_global,
+            "target_agents_route_lane_emb": target_agents_route_lane_emb,
+            "target_past_cur_future_valid": target_past_cur_future_valid,
+            "cross_mask": scene_encoding_token_mask,
+            "route_known_mask": route_known_mask,
+            "target_class_one_hot": target_class_one_hot,
+            "target_current_xyyaw": target_current_xyyaw,
+        }
+
+        classifier_kwargs: Dict[str, object] = {
+            "model": self.dit,
+            "model_condition": model_condition,
+            "inputs": inputs,
+            "observation_normalizer": self._observation_normalizer,
+            "state_normalizer": self._state_normalizer,
+            "config": self.config,
+        }
+        return classifier_kwargs
+
+    def _run_dpm_sampler_for_inference(
+        self,
+        xT: torch.Tensor,
+        target_agents_past: Optional[torch.Tensor],
+        scene_encoding_token: torch.Tensor,
+        scene_encoding_token_mask: torch.Tensor,
+        ego_fut_global: torch.Tensor,
+        target_agents_route_lane_emb: torch.Tensor,
+        target_past_cur_future_valid: torch.Tensor,
+        route_known_mask: torch.Tensor,
+        target_class_one_hot: torch.Tensor,
+        target_current_xyyaw: torch.Tensor,
+        target_past: torch.Tensor,
         inputs: Dict[str, torch.Tensor],
         correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
                                    torch.Tensor],
         diffusion_steps: int,
-    ) -> torch.Tensor:  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-        """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다.
-        Returns:
-            x0:
-                샘플링 결과(flat).
-                shape: (B, Pnn, F)
-        """
+    ) -> torch.Tensor:
+        """dpm_sampler를 호출해 최종 샘플 x0(flat)을 얻는다."""
+        guidance_scale: float = float(
+            getattr(self.config, "guidance_scale", 1.0))
+
+        classifier_kwargs: Dict[
+            str, object] = self._build_classifier_kwargs_for_guidance(
+                target_agents_past=target_agents_past,
+                scene_encoding_token=scene_encoding_token,
+                scene_encoding_token_mask=scene_encoding_token_mask,
+                ego_fut_global=ego_fut_global,
+                target_agents_route_lane_emb=target_agents_route_lane_emb,
+                target_past_cur_future_valid=target_past_cur_future_valid,
+                route_known_mask=route_known_mask,
+                target_class_one_hot=target_class_one_hot,
+                target_current_xyyaw=target_current_xyyaw,
+                inputs=inputs,
+            )
         if diffusion_steps > 1:
             x0: torch.Tensor = dpm_sampler(
                 self.dit,
-                xT.float(),  # (B, Pnn, F)
+                xT.float(),
                 diffusion_steps=diffusion_steps,
                 other_model_params={
-                    "target_agents_past": target_agents_past,
-                    "cross_c": scene_encoding_token,
-                    "ego_fut_global": ego_fut_global,
-                    "target_agents_route_lane_emb": target_agents_route_lane_emb,
-                    "target_past_cur_future_valid": target_past_cur_future_valid,
-                    "cross_mask": scene_encoding_token_mask,
-                    "route_known_mask": route_known_mask,
-                    "target_class_one_hot": target_class_one_hot,
-                    "target_current_xyyaw": target_current_xyyaw,
+                    "target_agents_past":
+                        target_agents_past,
+                    "cross_c":
+                        scene_encoding_token,
+                    "ego_fut_global":
+                        ego_fut_global,
+                    "target_agents_route_lane_emb":
+                        target_agents_route_lane_emb,
+                    "target_past_cur_future_valid":
+                        target_past_cur_future_valid,
+                    "cross_mask":
+                        scene_encoding_token_mask,
+                    "route_known_mask":
+                        route_known_mask,
+                    "target_class_one_hot":
+                        target_class_one_hot,
+                    "target_current_xyyaw":
+                        target_current_xyyaw,
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": correcting_xt_fn,
@@ -1434,63 +1878,70 @@ class Decoder(nn.Module):
                 model_wrapper_params={
                     "classifier_fn":
                         self._guidance_fn,
-                    "classifier_kwargs": {
-                        "model": self.dit,
-                        "model_condition": {
-                            "target_agents_past":
-                                target_agents_past,
-                            "cross_c":
-                                scene_encoding_token,
-                            "ego_fut_global":
-                                ego_fut_global,
-                            "target_agents_route_lane_emb":
-                                target_agents_route_lane_emb,
-                            "target_past_cur_future_valid":
-                                target_past_cur_future_valid,
-                            "cross_mask":
-                                scene_encoding_token_mask,
-                            "route_known_mask":
-                                route_known_mask,
-                            "target_class_one_hot":
-                                target_class_one_hot,
-                            "target_current_xyyaw":
-                                target_current_xyyaw,
-                        },
-                        "inputs": inputs,
-                        "observation_normalizer": self._observation_normalizer,
-                        "state_normalizer": self._state_normalizer,
-                        "config": self.config,
-                    },
+                    "classifier_kwargs":
+                        classifier_kwargs,
                     "guidance_scale":
-                        1.0,
-                    "guidance_type":
-                        ("classifier" if self._guidance_fn is not None else "uncond"
-                        ),
+                        guidance_scale,
+                    "guidance_type": ("classifier" if self._guidance_fn
+                                      is not None else "uncond"),
                 },
             )
-        else:
-            assert diffusion_steps == 1, "diffusion_steps must be >= 1"
-            # self.t_tau: (future_len) -> (B, future_len)
-            t_tau = self.t_tau.unsqueeze(0).repeat(xT.shape[0], 1)  # (B, future_len)
-            # low_t_mask: (B), all True
-            low_t_mask = torch.ones(
-                (xT.shape[0],), dtype=torch.bool,
-                device=xT.device,)  # (B,)
-            x0: torch.Tensor = self.dit(
-                xT.float(),  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
-                t_tau,  # (B, future_len)
-                target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
-                scene_encoding_token,  # (B, token_num, D)
-                ego_fut_global,  # (B, D)
-                target_agents_route_lane_emb,  # (B, Pnn, D)
-                target_past_cur_future_valid,  # (B, (1+)Pnn, time_len+future_len)
-                scene_encoding_token_mask,  # (B, token_num)
-                route_known_mask,  # (B, Pnn)
-                target_class_one_hot,  # (B, (1+)Pnn, 3)
-                target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
-                low_t_mask=low_t_mask,
+            return x0
+
+        # -----------------------------
+        # diffusion_steps == 1 (amortized 1-step)
+        # -----------------------------
+        assert diffusion_steps == 1, "diffusion_steps must be >= 1"
+
+        B: int = int(xT.shape[0])
+        xT_f32: torch.Tensor = xT.float()  # (B, Pnn, F)
+
+        # t_tau: (B, future_len)
+        t_tau: torch.Tensor = self._build_amortized_t_tau(
+            batch_size=B,
+            reference_tensor_for_device=xT_f32,
+        )
+
+        # low_t_mask: (B,)  (feasible 등을 항상 실행시키기 위한 마스크, 기존 로직 유지)
+        low_t_mask: torch.Tensor = torch.ones((B,),
+                                              dtype=torch.bool,
+                                              device=xT.device)
+
+        # (1) 모델 1회 호출: x0_pred
+        x0_pred: torch.Tensor = self.dit(
+            xT_f32,
+            t_tau,
+            target_agents_past,
+            scene_encoding_token,
+            ego_fut_global,
+            target_agents_route_lane_emb,
+            target_past_cur_future_valid,
+            scene_encoding_token_mask,
+            route_known_mask,
+            target_class_one_hot,
+            target_current_xyyaw=target_current_xyyaw,
+            low_t_mask=low_t_mask,
+        )
+
+        # (2) guidance를 x0_pred에 반영 (선택)
+        if self._guidance_fn is not None and guidance_scale != 0.0:
+            # condition은 dpm_solver 쪽에서 무엇을 넣는지, 이 코드 조각만으로는 확정 불가 → None 유지
+            classifier_kwargs["low_t_mask"] = low_t_mask
+            x0_pred = self._apply_classifier_guidance_for_amortized_one_step(
+                xT_flat=xT_f32,
+                x0_pred_flat=x0_pred,
+                t_tau=t_tau,
+                classifier_kwargs=classifier_kwargs,
+                guidance_scale=guidance_scale,
+                condition=None,
             )
-        return x0
+
+        # (3) correcting_xt_fn을 x0 공간에서 1회 적용 (선택)
+        if correcting_xt_fn is not None:
+            x0_pred = correcting_xt_fn(x0_pred, t_tau, 0)
+
+        _require_finite("amortized_one_step_x0", x0_pred)
+        return x0_pred
 
     def _reshape_inference_x0_to_sequence(
         self,
@@ -1707,113 +2158,117 @@ class Decoder(nn.Module):
         one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
         """추론/평가 모드에서 한 배치에 대해 decoder 를 한 번 돌린다."""
-        return_: Dict[str, torch.Tensor] = {}
-        B: int = batch_size
-        # 1) 시작 노이즈 생성 (미래만)
-        # ✅ (변경) 외부에서 만든 noise를 반드시 입력으로 받는다.
-        # noise: (B,(1+)Pnn,T,4)
-        noise_trajectory = inputs.get("inference_noise", None)
-        need_warmup = inputs["need_warmup"]
-        if need_warmup:
-            self._x0_for_amortized_inference = None
-        if self._x0_for_amortized_inference is None:
-            if noise_trajectory is None:
-                noise_trajectory: torch.Tensor = self._sample_inference_noise(
-                    target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
-                    batch_size=B,
-                    one_or_Pnn=one_or_Pnn,
-                )  # (B,(1+)Pnn,T,4)
+        with torch.no_grad():
+            return_: Dict[str, torch.Tensor] = {}
+            B: int = batch_size
+            # 1) 시작 노이즈 생성 (미래만)
+            # ✅ (변경) 외부에서 만든 noise를 반드시 입력으로 받는다.
+            # noise: (B,(1+)Pnn,T,4)
+            noise_trajectory = inputs.get("inference_noise", None)
+            need_warmup = inputs["need_warmup"]
+            if need_warmup:
+                self._x0_for_amortized_inference = None
+            if self._x0_for_amortized_inference is None:
+                if noise_trajectory is None:
+                    noise_trajectory: torch.Tensor = self._sample_inference_noise(
+                        target_current_xyyaw=
+                        target_current_xyyaw,  # (B,(1+)Pnn,4)
+                        batch_size=B,
+                        one_or_Pnn=one_or_Pnn,
+                    )  # (B,(1+)Pnn,T,4)
+                else:
+                    noise_trajectory: torch.Tensor = self._get_inference_noise_from_inputs(
+                        inputs=inputs,
+                        batch_size=int(B),
+                        one_or_Pnn=int(one_or_Pnn),
+                        target_current_xyyaw=target_current_xyyaw,
+                    )  # (B,(1+)Pnn,T,4)
+                if self.config.use_amortized_diffusion:
+                    diffusion_steps = 16
+                else:
+                    diffusion_steps = 10
+
             else:
-                noise_trajectory: torch.Tensor = self._get_inference_noise_from_inputs(
-                    inputs=inputs,
-                    batch_size=int(B),
-                    one_or_Pnn=int(one_or_Pnn),
-                    target_current_xyyaw=target_current_xyyaw,
-                )  # (B,(1+)Pnn,T,4)
+                # noise_trajectory: (B,(1+)Pnn,T,4)
+                diffusion_steps = 1
+                noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
+                )
+
+            # 2) xT(flat) 생성
+            # (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+            xT: torch.Tensor = self._build_inference_xT_from_noise(
+                noise=noise_trajectory,  # (B,(1+)Pnn,T,4)
+                target_agents_past=target_agents_past,  # (B,(1+)Pnn,time_len,11)
+                target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
+                batch_size=B,
+                one_or_Pnn=one_or_Pnn,
+            )  # (B,Pnn,F)
+
+            # 3) 목표점(cond-last) 정보 준비
+            cond_last_pos, cond_last_mask = self._build_inference_cond_last_info(
+                cond_last_pos_norm=cond_last_pos_norm,  # (B,1+Pnn,4)
+                batch_size=B,
+                one_or_Pnn=one_or_Pnn,
+                reference_tensor_for_device=
+                xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            )
+
+            # 4) 샘플링 중 보정 함수 구성
+            correcting_xt_fn = self._build_inference_correcting_xt_fn(
+                batch_size=B,
+                one_or_Pnn=one_or_Pnn,
+                target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
+                target_current_xyyaw=target_current_xyyaw,  # (B,Pnn,4)
+                target_past_cur_future_valid=
+                target_past_cur_future_valid,  # (B,Pnn,time_total)
+                cond_last_pos_norm=cond_last_pos,  # (B,1+Pnn,4) or None
+                cond_last_mask=cond_last_mask,  # (B,1+Pnn)
+            )
+
+            # 5) dpm_sampler 실행
+            # x0: (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            x0: torch.Tensor = self._run_dpm_sampler_for_inference(
+                xT=
+                xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+                target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
+                scene_encoding_token=scene_encoding_token,
+                scene_encoding_token_mask=scene_encoding_token_mask,
+                ego_fut_global=ego_fut_global,
+                target_agents_route_lane_emb=target_agents_route_lane_emb,
+                target_past_cur_future_valid=target_past_cur_future_valid,
+                route_known_mask=route_known_mask,
+                target_class_one_hot=target_class_one_hot,
+                target_current_xyyaw=target_current_xyyaw,
+                target_past=target_past,
+                inputs=inputs,
+                correcting_xt_fn=correcting_xt_fn,
+                diffusion_steps=diffusion_steps,
+            )
+
+            # dtype 맞춤(기존 로직 유지)
+            x0 = x0.to(xT.dtype)
+
+            # 6) (B, (1+)Pnn, 1+T, 4)
+            x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
+                x0=
+                x0,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+                target_current_xyyaw=target_current_xyyaw,
+                batch_size=B,
+                one_or_Pnn=one_or_Pnn,
+            )
             if self.config.use_amortized_diffusion:
-                diffusion_steps = 16
-            else:
-                diffusion_steps = 10
+                self._x0_for_amortized_inference = x0_seq_norm[:, :,
+                                                               1:, :].detach(
+                                                               )  # (B, Pnn, T, 4)
 
-        else:
-            # noise_trajectory: (B,(1+)Pnn,T,4)
-            diffusion_steps = 1
-            noise_trajectory = self._get_noise_trajectory_from_prev_trajectory()
+            # 8) feasible 출력(옵션)
+            self._append_inference_feasible_outputs(
+                outputs=return_,
+                target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
+            )
 
-        # 2) xT(flat) 생성
-        # (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-        xT: torch.Tensor = self._build_inference_xT_from_noise(
-            noise=noise_trajectory,  # (B,(1+)Pnn,T,4)
-            target_agents_past=target_agents_past,  # (B,(1+)Pnn,time_len,11)
-            target_current_xyyaw=target_current_xyyaw,  # (B,(1+)Pnn,4)
-            batch_size=B,
-            one_or_Pnn=one_or_Pnn,
-        )  # (B,Pnn,F)
-
-        # 3) 목표점(cond-last) 정보 준비
-        cond_last_pos, cond_last_mask = self._build_inference_cond_last_info(
-            cond_last_pos_norm=cond_last_pos_norm,  # (B,1+Pnn,4)
-            batch_size=B,
-            one_or_Pnn=one_or_Pnn,
-            reference_tensor_for_device=
-            xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-        )
-
-        # 4) 샘플링 중 보정 함수 구성
-        correcting_xt_fn = self._build_inference_correcting_xt_fn(
-            batch_size=B,
-            one_or_Pnn=one_or_Pnn,
-            target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
-            target_current_xyyaw=target_current_xyyaw,  # (B,Pnn,4)
-            target_past_cur_future_valid=
-            target_past_cur_future_valid,  # (B,Pnn,time_total)
-            cond_last_pos_norm=cond_last_pos,  # (B,1+Pnn,4) or None
-            cond_last_mask=cond_last_mask,  # (B,1+Pnn)
-        )
-
-        # 5) dpm_sampler 실행
-        # x0: (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-        x0: torch.Tensor = self._run_dpm_sampler_for_inference(
-            xT=
-            xT,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-            target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
-            scene_encoding_token=scene_encoding_token,
-            scene_encoding_token_mask=scene_encoding_token_mask,
-            ego_fut_global=ego_fut_global,
-            target_agents_route_lane_emb=target_agents_route_lane_emb,
-            target_past_cur_future_valid=target_past_cur_future_valid,
-            route_known_mask=route_known_mask,
-            target_class_one_hot=target_class_one_hot,
-            target_current_xyyaw=target_current_xyyaw,
-            target_past=target_past,
-            inputs=inputs,
-            correcting_xt_fn=correcting_xt_fn,
-            diffusion_steps=diffusion_steps,
-        )
-
-        # dtype 맞춤(기존 로직 유지)
-        x0 = x0.to(xT.dtype)
-
-        # 6) (B, (1+)Pnn, 1+T, 4)
-        x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
-            x0=
-            x0,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-            target_current_xyyaw=target_current_xyyaw,
-            batch_size=B,
-            one_or_Pnn=one_or_Pnn,
-        )
-        if self.config.use_amortized_diffusion:
-            self._x0_for_amortized_inference = x0_seq_norm[:, :,
-                                                           1:, :]  # (B, Pnn, T, 4)
-
-        # 8) feasible 출력(옵션)
-        self._append_inference_feasible_outputs(
-            outputs=return_,
-            target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
-        )
-
-        return_["score"] = x0_seq_norm  # (B, (1+)Pnn, 1+T, 4)
-        return return_
+            return_["score"] = x0_seq_norm  # (B, (1+)Pnn, 1+T, 4)
+            return return_
 
     def forward(
         self,
@@ -2056,10 +2511,12 @@ class DiT(nn.Module):
 
             # ✅ 평균 노이즈 수준을 대표값으로 사용
             t_global = t.mean(dim=1)  # (B,)
-            return self.t_embedder(t_global).to(dtype=ref.dtype, device=ref.device)
+            return self.t_embedder(t_global).to(dtype=ref.dtype,
+                                                device=ref.device)
 
         raise ValueError(
-            f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}")
+            f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}"
+        )
 
     def preproj_varlen(
             self,
@@ -2552,7 +3009,7 @@ class DiT(nn.Module):
                 raise ValueError(
                     f"diffusion_time must have shape (B,{self._future_len}) when 2D. got {tuple(diffusion_time.shape)}"
                 )
-            diffusion_time_for_future = diffusion_time # (B, future_len)
+            diffusion_time_for_future = diffusion_time  # (B, future_len)
         else:
             raise ValueError(
                 f"diffusion_time must be (B,) or (B, future_len). got {diffusion_time.shape}"

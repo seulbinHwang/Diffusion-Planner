@@ -52,13 +52,14 @@ def dpm_sampler(model: torch.nn.Module,
 
         # Steps in [10, 20] can generate quite good samples.
         # And steps = 20 can almost converge.
-        sample_dpm = dpm_solver.sample(x_T,
-                                       steps=diffusion_steps,  # 10
-                                       order=2,
-                                       skip_type="logSNR",
-                                       method="multistep",
-                                       denoise_to_zero=True,
-                                       # 마지막에 한번 더 x0로 정리 하겠다.
-                                       **sample_params)
+        sample_dpm = dpm_solver.sample(
+            x_T,
+            steps=diffusion_steps,  # 10
+            order=2,
+            skip_type="logSNR",
+            method="multistep",
+            denoise_to_zero=True,
+            # 마지막에 한번 더 x0로 정리 하겠다.
+            **sample_params)
 
     return sample_dpm

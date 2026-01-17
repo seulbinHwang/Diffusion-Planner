@@ -6,6 +6,7 @@ import torch.nn as nn
 from diffusion_planner.utils.normalizer import StateNormalizer
 from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks
 from diffusion_planner.model.diffusion_planner import Diffusion_Planner
+
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
@@ -339,7 +340,8 @@ def _sample_diffusion_time_and_noise(
         # Here we add noise ONLY to FUTURE frames, so tau corresponds to 1..T_future,
         # which yields t in (0, 1].
         tau = torch.arange(
-            1, future_len + 1,
+            1,
+            future_len + 1,
             device=target_future_gt_4_dim.device,
             dtype=torch.float32,
         )  # (T,)
@@ -349,20 +351,18 @@ def _sample_diffusion_time_and_noise(
         batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(B, -1)
 
         # (B,) low-noise mask (kept as before)
-        low_t_mask = torch.ones(
-            B, dtype=torch.bool, device=target_future_gt_4_dim.device
-        )
+        low_t_mask = torch.ones(B,
+                                dtype=torch.bool,
+                                device=target_future_gt_4_dim.device)
         low_t_mask_bt = low_t_mask.view(B, 1, 1)
 
     else:
         # Paper uses U(0,1). eps is a numerical guard to avoid exact t=0.
-        batch_diffusion_time: torch.Tensor = (
-            torch.rand(
-                B,
-                device=target_future_gt_4_dim.device,
-                dtype=torch.float32,
-            ) * (1 - eps) + eps
-        )
+        batch_diffusion_time: torch.Tensor = (torch.rand(
+            B,
+            device=target_future_gt_4_dim.device,
+            dtype=torch.float32,
+        ) * (1 - eps) + eps)
 
         t_threshold: float = float(args.feasible_learn_noise_thresh)
         if not getattr(args, "use_direct_loss", False):
