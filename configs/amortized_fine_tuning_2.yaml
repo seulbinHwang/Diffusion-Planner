@@ -2,6 +2,7 @@
 name: "amortized_fine_tuning_lr_5e6"
 load_name: "nuplan_womd_fine_tuning1_lr_1"
 use_amortized_diffusion: true
+use_timestep_weight_loss: false
 learning_rate: 5e-6        # ≈ 5e-4 / 3
 
 # Group 설정:

@@ -2,6 +2,7 @@
 name: "amortized_fine_tuning_lr_2e5"
 load_name: "nuplan_womd_fine_tuning1_lr_1"
 use_amortized_diffusion: true
+use_timestep_weight_loss: false
 learning_rate: 2e-5
 
 # Group 설정:
@@ -12,7 +13,7 @@ lr_scheduler_type: cosine
 use_lr_warmup: true
 p_sat: 0.
 w_int_max: 1.0
-
+train_epochs: 60 # 360
 resume_local_path_model_path: null
 # Stage2는 shell에서 --resume_wandb_model_name latest 로 지정해서 시작
 resume_wandb_model_name: latest
