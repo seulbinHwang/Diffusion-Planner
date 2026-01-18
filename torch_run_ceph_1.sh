@@ -39,12 +39,12 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 # User Configuration Section
 ###################################
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed_rollout"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_fine_tuning_train.json"
+TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
+TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_amortized_fine_tuning.json"
 ###################################
 
 
-STAGE1_CFG="configs/fine_tuning1.yaml"
+STAGE1_CFG="configs/amortized_fine_tuning_1.yaml"
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
 --nnodes 1 --nproc-per-node 3 --standalone --log_dir "$LOG_DIR" \

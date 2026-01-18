@@ -19,7 +19,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # CPU에서 돌아가는 연산(전처리, 일부 텐서 연산, BLAS 등)의 스레드 수를 컨트롤해서, GPU 학습 중 CPU 과도한 스레드 난립 방지
 printf "[ENV] %-28s %s\n" "OMP_NUM_THREADS:"            "${OMP_NUM_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
-DEBUG_LOG=0  # 1: 상세 디버그, 0: 일반 학습
+DEBUG_LOG=1  # 1: 상세 디버그, 0: 일반 학습
 
 if (( DEBUG_LOG )); then
   export NCCL_DEBUG=INFO
@@ -39,12 +39,12 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 # User Configuration Section
 ###################################
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
-TRAIN_SET_PATH="/mnt/nuplan/dataset/processed_rollout"   # 디렉터리 자체는 유지, 내용만 비움
-TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_fine_tuning_train.json"
+TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"   # 디렉터리 자체는 유지, 내용만 비움
+TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_amortized_fine_tuning.json"
 ###################################
 
 
-STAGE1_CFG="configs/fine_tuning1_2.yaml"
+STAGE1_CFG="configs/amortized_fine_tuning_2.yaml"
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 3 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  train_predictor.py \
