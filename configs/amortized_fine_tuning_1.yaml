@@ -1,9 +1,9 @@
 # configs/stage2.yaml
-name: "amortized_fine_tuning_lr_2e5"
+name: "amortized_fine_tuning_lr_2e4"
 load_name: "nuplan_womd_fine_tuning1_lr_1"
 use_amortized_diffusion: true
 use_timestep_weight_loss: false
-learning_rate: 2e-5
+learning_rate: 1e-4
 
 # Group 설정:
 #  - encoder_local(Group A): freeze
