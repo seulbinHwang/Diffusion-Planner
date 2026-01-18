@@ -1,8 +1,8 @@
 # configs/stage2.yaml
-name: "amortized_fine_tuning_lr2e5"
+name: "amortized_fine_tuning_lr_2e5"
 load_name: "nuplan_womd_fine_tuning1_lr_1"
-# Stage2: Stage1보다 1/3 정도 작은 lr에서 시작 → 1/4 근처까지 감소
-learning_rate: 2e-5        # ≈ 5e-4 / 3
+use_amortized_diffusion: true
+learning_rate: 2e-5
 
 # Group 설정:
 #  - encoder_local(Group A): freeze
