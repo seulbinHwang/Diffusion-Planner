@@ -48,7 +48,7 @@ STAGE1_CFG="configs/amortized_fine_tuning_1.yaml"
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
 --nnodes 1 --nproc-per-node 3 --standalone --log_dir "$LOG_DIR" \
- --redirects 3 --tee "$TEE" \
+ --redirects 6 --tee "$TEE" \
  train_predictor.py \
  --port 23001 \
   --train_set "$TRAIN_SET_PATH"/ \
