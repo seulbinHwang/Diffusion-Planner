@@ -1,5 +1,5 @@
 # configs/stage2.yaml
-name: "amortized_fine_tuning_lr_2e4"
+name: "amortized_fine_tuning_lr_1e4"
 load_name: "nuplan_womd_fine_tuning1_lr_1"
 use_amortized_diffusion: true
 use_timestep_weight_loss: false
