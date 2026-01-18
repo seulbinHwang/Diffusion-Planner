@@ -147,6 +147,123 @@ def _select_latest_like_tag(save_path: str) -> str:
 
     return tag
 
+def _maybe_expand_dit_preproj_fc1_weight_4ch_to_6ch(
+    state_dict: Dict[str, torch.Tensor],
+    base_model: nn.Module,
+    *,
+    print_log: bool = False,
+) -> bool:
+    """예전 체크포인트의 DiT.preproj 입력 크기를 새 모델 입력 크기에 맞춰 변환합니다.
+
+    배경
+    ----
+    - 예전(pretrain)은 시간칸마다 (x, y, cos, sin) 4개 값만 입력으로 썼습니다.
+      그래서 preproj.fc1.weight 모양이 (H, T*4) 입니다.
+    - 지금(finetune)은 시간칸마다 (x, y, cos, sin, timestep, validity) 6개 값을 씁니다.
+      그래서 preproj.fc1.weight 모양이 (H, T*6) 이어야 합니다.
+
+    이 모양이 다르면 load_state_dict가 실패합니다(크기 불일치는 strict=False로도 무시되지 않음).
+
+    변환 규칙
+    ---------
+    - 기존 4개 값(x,y,cos,sin)에 해당하는 부분은 그대로 복사합니다.
+      예: old[:, 4*t : 4*t+4] -> new[:, 6*t : 6*t+4]
+    - 새로 추가된 2개 값(timestep, validity)에 해당하는 부분은 0으로 둡니다.
+      (초기 finetune 시작 시점에 새 입력이 기존 동작을 크게 흔들지 않게 하기 위함)
+
+    Args:
+        state_dict (Dict[str, torch.Tensor]):
+            체크포인트에서 읽은 모델 파라미터 dict.
+            - preproj.fc1.weight 텐서 shape 예:
+                · 예전: (H, T*4)
+                · 현재: (H, T*6)
+        base_model (nn.Module):
+            현재 학습에 사용할 모델. base_model.state_dict()로 "정답 shape"를 확인합니다.
+        print_log (bool):
+            True면 변환 여부를 print로 출력합니다.
+
+    Returns:
+        bool:
+            - True  : 이 함수가 state_dict를 바꿨고, 그 결과 strict=False 로드가 필요할 수 있음
+                     (예: 변환 불가능해서 해당 키를 제거한 경우)
+            - False : 변환을 성공적으로 수행했거나, 변환이 필요 없었음(=strict 유지 가능)
+    """
+    suffix = "dit.preproj.fc1.weight"
+
+    # base_key: 현재 모델이 기대하는 fc1.weight 키
+    base_keys = list(base_model.state_dict().keys())
+    base_matches = [k for k in base_keys if k.endswith(suffix)]
+    if len(base_matches) != 1:
+        return False
+    base_key = base_matches[0]
+
+    # state_key: 체크포인트에서 발견한 fc1.weight 키
+    if base_key in state_dict:
+        state_key = base_key
+    else:
+        sd_keys = list(state_dict.keys())
+        sd_matches = [k for k in sd_keys if k.endswith(suffix)]
+        if len(sd_matches) != 1:
+            return False
+        state_key = sd_matches[0]
+
+    src_w = state_dict.get(state_key, None)
+    if not isinstance(src_w, torch.Tensor):
+        return False
+
+    dst_w = base_model.state_dict()[base_key]
+
+    # 이미 같은 shape면 아무 것도 하지 않음
+    if tuple(src_w.shape) == tuple(dst_w.shape):
+        return False
+
+    # src_w: (H, old_F), dst_w: (H, new_F)
+    if src_w.ndim != 2 or dst_w.ndim != 2:
+        # 변환이 불가능한 형태면 키를 제거해서(=랜덤 초기값 유지) 로딩이 진행되게 함
+        del state_dict[state_key]
+        if print_log:
+            print(f"[preproj-compat] drop key (ndim mismatch): {state_key}")
+        return True
+
+    src_h, src_f = int(src_w.shape[0]), int(src_w.shape[1])
+    dst_h, dst_f = int(dst_w.shape[0]), int(dst_w.shape[1])
+
+    # 출력 크기(H)가 다르면 이 함수로 안전하게 맞출 수 없음
+    if src_h != dst_h:
+        del state_dict[state_key]
+        if print_log:
+            print(f"[preproj-compat] drop key (H mismatch): {state_key}, src_h={src_h}, dst_h={dst_h}")
+        return True
+
+    # 4채널 -> 6채널로만 변환 지원
+    if (src_f % 4) != 0 or (dst_f % 6) != 0:
+        del state_dict[state_key]
+        if print_log:
+            print(f"[preproj-compat] drop key (not 4ch->6ch): {state_key}, src_f={src_f}, dst_f={dst_f}")
+        return True
+
+    src_t = src_f // 4  # 예전 시간칸 수 T_old
+    dst_t = dst_f // 6  # 현재 시간칸 수 T_new
+
+    # new_w: (H, dst_f)
+    new_w = torch.zeros((dst_h, dst_f), dtype=src_w.dtype)
+
+    # 가능한 구간까지만 복사 (대부분 src_t == dst_t가 기대됨)
+    t_copy = min(src_t, dst_t)
+    for t in range(t_copy):
+        # old: (H, 4) -> new: (H, 4)
+        new_w[:, (6 * t):(6 * t + 4)] = src_w[:, (4 * t):(4 * t + 4)]
+
+    state_dict[state_key] = new_w
+
+    if print_log:
+        print(
+            f"[preproj-compat] expand fc1.weight 4ch->6ch done: "
+            f"src=({src_h},{src_f}), dst=({dst_h},{dst_f}), T_src={src_t}, T_dst={dst_t}"
+        )
+    return False
+
+
 def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
     save_path: str,
     diffusion_planner: nn.Module,
@@ -230,20 +347,30 @@ def _load_model_and_ema_state_only_from_deepspeed_checkpoint(
         state_source = "module"
 
     base_model: nn.Module = getattr(diffusion_planner, "module", diffusion_planner)
-    incompatible = base_model.load_state_dict(state_like, strict=True)
+
+    # ✅ 추가: preproj.fc1.weight가 옛 체크포인트(4채널)면 6채널로 확장
+    need_strict_false = _maybe_expand_dit_preproj_fc1_weight_4ch_to_6ch(
+        state_dict=state_like,
+        base_model=base_model,
+        print_log=(global_rank == 0),
+    )
+
+    # 기존: strict=True
+    # ✅ 변경: 필요할 때만 strict=False
+    incompatible = base_model.load_state_dict(state_like, strict=(not need_strict_false))
+
 
     if global_rank == 0:
-        print(f"[ModelOnly<DeepSpeed>] LOAD MODEL PARAM from {ckpt_path} (source={state_source})")
-        missing_keys = getattr(incompatible, "missing_keys", None)
-        unexpected_keys = getattr(incompatible, "unexpected_keys", None)
+        missing_keys = getattr(incompatible, "missing_keys", [])
+        unexpected_keys = getattr(incompatible, "unexpected_keys", [])
         if missing_keys:
-            print(f"[ModelOnly<DeepSpeed>] missing_keys: {incompatible.missing_keys}")
-            raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: missing keys exist.")
+            print(f"[ModelOnly<DeepSpeed>] missing_keys: {missing_keys}")
         if unexpected_keys:
-            print(f"[ModelOnly<DeepSpeed>] unexpected_keys: {incompatible.unexpected_keys}")
-            raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치: unexpected keys exist.")
-        if not missing_keys and not unexpected_keys:
-            print("[ModelOnly<DeepSpeed>] Model state load done")
+            print(f"[ModelOnly<DeepSpeed>] unexpected_keys: {unexpected_keys}")
+
+        # ✅ strict=True로 로딩하려던 상황에서 키가 어긋난 경우만 에러로 처리
+        if (not need_strict_false) and (missing_keys or unexpected_keys):
+            raise RuntimeError("[ModelOnly<DeepSpeed>] 모델 파라미터 불일치가 발생했습니다.")
 
     if model_ema is not None:
         ema_model = getattr(model_ema, "ema", model_ema)
@@ -873,6 +1000,11 @@ def _load_model_and_ema_state_only_from_pytorch_checkpoint(
     state_dict = _align_state_dict_keys_to_base_model_for_model_only(
         state_like=state_like,
         base_model=base_model,
+    )
+    _maybe_expand_dit_preproj_fc1_weight_4ch_to_6ch(
+        state_dict=state_dict,
+        base_model=base_model,
+        print_log=(global_rank == 0),
     )
 
     model_ema = _load_state_dict_into_base_and_ema_model_only(
