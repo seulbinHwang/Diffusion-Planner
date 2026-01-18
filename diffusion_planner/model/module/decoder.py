@@ -2436,7 +2436,7 @@ class DiT(nn.Module):
         #     output_dim_pre = output_dim
         self.preproj = Mlp(
             in_features=
-            output_dim_pre,  # x, y, cos(yaw), sin(yaw), noising timestep
+            output_dim_pre,  # x, y, cos(yaw), sin(yaw), noising timestep, validity
             hidden_features=512,
             out_features=hidden_dim,
             act_layer=nn.GELU,
@@ -2518,7 +2518,6 @@ class DiT(nn.Module):
                 raise ValueError(
                     f"diffusion_time shape mismatch: expected (B,{self._future_len}), got {tuple(t.shape)}"
                 )
-
             # ✅ 평균 노이즈 수준을 대표값으로 사용
             t_global = t.mean(dim=1)  # (B,)
             return self.t_embedder(t_global).to(dtype=ref.dtype,
@@ -3005,6 +3004,7 @@ class DiT(nn.Module):
             참고로 1+future_len 은 현재+미래. 현재에는 노이즈를 추가하지 않을 것이므로, 0으로 채움
             미래 future_len 에 대해서는, diffusion_time 에 따라 노이즈 time step을 채움
         """
+        diffusion_time = diffusion_time.to(device=target_input_norm_xT.device)
         # target_input_norm_xT: (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _, 4)
         target_input_norm_xT = target_input_norm_xT.reshape(
             target_input_norm_xT.shape[0],
