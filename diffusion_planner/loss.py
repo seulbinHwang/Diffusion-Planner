@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from diffusion_planner.utils.normalizer import StateNormalizer
 from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks
-from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
@@ -447,7 +446,7 @@ def _normalize_futures_and_build_xT(
 
 
 def _forward_model_with_autocast(
-    model: Diffusion_Planner,
+    model: nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
     target_cur_future_norm_xT: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
@@ -783,7 +782,7 @@ def _assert_cur_future_valid_mask(
 
 def diffusion_loss_func(
     args: Any,
-    model: Diffusion_Planner,
+    model:  nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
