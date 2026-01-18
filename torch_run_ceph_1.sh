@@ -47,11 +47,11 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_am
 STAGE1_CFG="configs/amortized_fine_tuning_1.yaml"
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 3 --standalone --log_dir "$LOG_DIR" \
- --redirects 6 --tee "$TEE" \
+--nnodes 1 --nproc-per-node 6 --standalone --log_dir "$LOG_DIR" \
+ --redirects 3 --tee "$TEE" \
  train_predictor.py \
  --port 23001 \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --stage_config_path "${STAGE1_CFG}" \
-  --batch_size 576
+  --batch_size 1536
