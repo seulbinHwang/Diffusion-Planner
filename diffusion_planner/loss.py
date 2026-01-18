@@ -308,6 +308,7 @@ def _build_future_masks_and_current_state(
 
     return near_future_valid, near_cur_future_mask, near_current_xyyaw_norm
 
+
 def _sample_diffusion_time_and_noise(
     target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     eps: float,
@@ -321,7 +322,8 @@ def _sample_diffusion_time_and_noise(
 
     if args.use_amortized_diffusion and use_amortized_mode:
         tau = torch.arange(
-            1, future_len + 1,
+            1,
+            future_len + 1,
             device=target_future_gt_4_dim.device,
             dtype=torch.float32,
         )  # (T,)
@@ -332,21 +334,20 @@ def _sample_diffusion_time_and_noise(
         t_max: float = max(1.0 - float(eps), 0.0)
         t_tau = torch.clamp(t_tau, max=t_max)  # (T,)
 
-        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(B, -1)  # (B, T)
+        batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(
+            B, -1)  # (B, T)
 
-        low_t_mask = torch.ones(
-            B, dtype=torch.bool, device=target_future_gt_4_dim.device
-        )
+        low_t_mask = torch.ones(B,
+                                dtype=torch.bool,
+                                device=target_future_gt_4_dim.device)
         low_t_mask_bt = low_t_mask.view(B, 1, 1)
 
     else:
-        batch_diffusion_time: torch.Tensor = (
-            torch.rand(
-                B,
-                device=target_future_gt_4_dim.device,
-                dtype=torch.float32,
-            ) * (1 - eps) + eps
-        )
+        batch_diffusion_time: torch.Tensor = (torch.rand(
+            B,
+            device=target_future_gt_4_dim.device,
+            dtype=torch.float32,
+        ) * (1 - eps) + eps)
 
         t_threshold: float = float(args.feasible_learn_noise_thresh)
         if not getattr(args, "use_direct_loss", False):
@@ -782,7 +783,7 @@ def _assert_cur_future_valid_mask(
 
 def diffusion_loss_func(
     args: Any,
-    model:  nn.Module,
+    model: nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
@@ -919,7 +920,6 @@ def diffusion_loss_func(
         target_future_norm_gt=
         target_future_norm_gt,  # (B, (1+)Pnn, future_len, 4)
     )
-
 
     if args.use_timestep_weight_loss:
         # 시간 가중치(w_t) 생성

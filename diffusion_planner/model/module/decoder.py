@@ -227,7 +227,8 @@ class Decoder(nn.Module):
         # - config에 값이 있으면 그걸 쓰고, 없으면 1e-3 사용
         t_eps: float = float(getattr(config, "diffusion_time_eps", 1e-3))
         t_max: float = max(1.0 - t_eps, 0.0)
-        self.t_tau = torch.arange(1, future_len + 1, dtype=torch.float32) / float(future_len)  # (T,)
+        self.t_tau = torch.arange(
+            1, future_len + 1, dtype=torch.float32) / float(future_len)  # (T,)
         self.t_tau = torch.clamp(self.t_tau, max=t_max)  # (T,)
 
     def _get_inference_noise_from_inputs(
@@ -2174,11 +2175,39 @@ class Decoder(nn.Module):
             # 1) 시작 노이즈 생성 (미래만)
             # ✅ (변경) 외부에서 만든 noise를 반드시 입력으로 받는다.
             # noise: (B,(1+)Pnn,T,4)
+            """
+            noise_trajectory 가 들어온 경우
+                1) use_amortized_diffusion 가 False인 경우
+                2) use_amortized_diffusion 가 True인 경우이면서 첫번쨰 샘플링인 경우
+            
+            noise_trajectory 가 들어오지 않은 경우
+                1) use_amortized_diffusion 가 True이면서 첫 스텝이 아닌 경우
+            """
             noise_trajectory = inputs.get("inference_noise", None)
-            need_warmup = inputs["need_warmup"]
-            if need_warmup:
-                self._x0_for_amortized_inference = None
-            if self._x0_for_amortized_inference is None:
+            if self.config.use_amortized_diffusion:
+                if noise_trajectory is not None:  # 첫번쨰 샘플링
+                    self._x0_for_amortized_inference = None
+                    noise_trajectory: torch.Tensor = self._get_inference_noise_from_inputs(
+                        inputs=inputs,
+                        batch_size=int(B),
+                        one_or_Pnn=int(one_or_Pnn),
+                        target_current_xyyaw=target_current_xyyaw,
+                    )  # (B,(1+)Pnn,T,4)
+                    diffusion_steps = 16
+                else:  # 첫 스텝이 아닌 경우
+                    # noise_trajectory: (B,(1+)Pnn,T,4)
+                    diffusion_steps = 1
+                    assert self._x0_for_amortized_inference is not None, (
+                        "When using amortized diffusion during inference, "
+                        "if inference_noise is not provided, "
+                        "self._x0_for_amortized_inference must be set.")
+                    noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
+                    )
+            else:  # 기존 DPM-Solver 경로
+                assert self._x0_for_amortized_inference is None, (
+                    "self._x0_for_amortized_inference should be None when not using amortized diffusion."
+                )
+                diffusion_steps = 10
                 if noise_trajectory is None:
                     noise_trajectory: torch.Tensor = self._sample_inference_noise(
                         target_current_xyyaw=
@@ -2193,16 +2222,6 @@ class Decoder(nn.Module):
                         one_or_Pnn=int(one_or_Pnn),
                         target_current_xyyaw=target_current_xyyaw,
                     )  # (B,(1+)Pnn,T,4)
-                if self.config.use_amortized_diffusion:
-                    diffusion_steps = 16
-                else:
-                    diffusion_steps = 10
-
-            else:
-                # noise_trajectory: (B,(1+)Pnn,T,4)
-                diffusion_steps = 1
-                noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
-                )
 
             # 2) xT(flat) 생성
             # (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
@@ -2990,10 +3009,11 @@ class DiT(nn.Module):
         return target_cur_future_valid, target_current_mask
 
     def _apply_diffusion_timestep_and_validity(
-        self,
-        target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*4)
-        diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
-        target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, 1+past_len+future_len)
+            self,
+            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*4)
+            diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
+            target_past_cur_future_valid: torch.
+        Tensor,  # (B, (1+)Pnn, 1+past_len+future_len)
     ) -> torch.Tensor:
         """
         target_cur_future_norm_xT : (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _ * 6)
@@ -3131,7 +3151,8 @@ class DiT(nn.Module):
             # if self.config.use_amortized_diffusion:
             #   target_input_norm_xT: (B, (1+)Pnn, (time_len+ T) *6) or (B, (1+)Pnn, T*6) or (B, (1+)Pnn, (1+T)*6)
             target_input_norm_xT = self._apply_diffusion_timestep_and_validity(
-                target_input_norm_xT, diffusion_time, target_past_cur_future_valid)
+                target_input_norm_xT, diffusion_time,
+                target_past_cur_future_valid)
             # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             x: torch.Tensor = self._run_dit_core_with_pram_v2(
                 target_input_norm_xT=target_input_norm_xT,  #

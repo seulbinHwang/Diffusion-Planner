@@ -130,7 +130,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --fine_tune_gen_k 64 \
-  --rollout_time_chunk_size 5 \
+  --rollout_time_chunk_size 1 \
   --fine_tune_temperature 0.8 \
   --use_recovery True \
   --select_jointly True \
@@ -138,6 +138,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --scenario_finish_step 20 \
   --time_step_for_compare 60 \
   --use_data_percent 10 \
-  --rollout_number 3
+  --rollout_number 3 \
+  --use_amortized_diffusion True
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

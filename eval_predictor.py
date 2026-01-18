@@ -3081,12 +3081,6 @@ def _predict_rollouts_batched_one_chunk(
             else:
                 inference_noise = None
             norm_inputs_copy["inference_noise"] = inference_noise
-            if args.use_amortized_diffusion:
-                need_warmup = True
-            else:
-                need_warmup = step_count == 0
-            norm_inputs_copy["need_warmup"] = need_warmup
-
             decoder_output = _forward_model_for_validation(
                 args=args,
                 model=model,

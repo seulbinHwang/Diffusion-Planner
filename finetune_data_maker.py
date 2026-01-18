@@ -1940,7 +1940,6 @@ def _predict_one_rollout_sequential(
     with torch.inference_mode():
         step_count = 0
         step_start = 0
-
         while step_start < int(scenario_finish_step_limit):
             remaining = int(scenario_finish_step_limit - step_start)
             gap = int(min(time_chunk_size, remaining))
@@ -2875,21 +2874,26 @@ def _forward_and_score_candidate_batch(
     b = int(max(1, int(batch_size)))
 
     # 1) 후보별 노이즈 만들기
-    # inference_noise_flat: (B*cand_count, 1+Pnn, future_len, 4)
-    inference_noise_flat = _build_inference_noise_batch_for_candidate_range(
-        reference_tensor=norm_inputs_step["ego_agent_past"],
-        batch_size=b,
-        one_or_pnn=int(one_or_pnn),
-        future_len=int(future_len),
-        rollout_idx=int(rollout_idx),
-        base_seed=int(base_seed),
-        ddp_rank=int(ddp_rank),
-        step_idx=int(step_idx),
-        noise_std=float(getattr(args, "fine_tune_temperature", 0.0)),
-        seed_stride=int(seed_stride),
-        cand_start_idx=int(cand_start_idx),
-        cand_count=int(c),
-    )
+    make_random_noise_cond = (args.use_amortized_diffusion and step_idx == 0) or (
+                                 not args.use_amortized_diffusion)
+    if make_random_noise_cond:
+        # inference_noise_flat: (B*cand_count, 1+Pnn, future_len, 4)
+        inference_noise_flat = _build_inference_noise_batch_for_candidate_range(
+            reference_tensor=norm_inputs_step["ego_agent_past"],
+            batch_size=b,
+            one_or_pnn=int(one_or_pnn),
+            future_len=int(future_len),
+            rollout_idx=int(rollout_idx),
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
+            step_idx=int(step_idx),
+            noise_std=float(getattr(args, "fine_tune_temperature", 0.0)),
+            seed_stride=int(seed_stride),
+            cand_start_idx=int(cand_start_idx),
+            cand_count=int(c),
+        )
+    else:
+        inference_noise_flat = None
 
     # 2) 입력 dict를 (B*cand_count, ...)로 늘리기
     cand_inputs = _repeat_inputs_for_candidate_batch(
