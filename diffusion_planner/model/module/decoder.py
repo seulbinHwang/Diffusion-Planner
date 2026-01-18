@@ -2430,10 +2430,10 @@ class DiT(nn.Module):
             self.feasible_projector.enable_profile = self.config.profile_feasible
 
         self._model_type = model_type
-        if self.config.use_amortized_diffusion:
-            output_dim_pre = int(output_dim / 4 * 5)
-        else:
-            output_dim_pre = output_dim
+        # if self.config.use_amortized_diffusion:
+        output_dim_pre = int(output_dim / 4 * 6)
+        # else:
+        #     output_dim_pre = output_dim
         self.preproj = Mlp(
             in_features=
             output_dim_pre,  # x, y, cos(yaw), sin(yaw), noising timestep
@@ -2530,7 +2530,7 @@ class DiT(nn.Module):
 
     def preproj_varlen(
             self,
-            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*4)
+            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*6)
             target_current_mask: torch.Tensor,  # (B, (1+)Pnn) True=pad(무효 에이전트)
     ) -> torch.Tensor:
         """pre-proj MLP 를 유효 에이전트 토큰에만 적용하는 전처리 함수.
@@ -2748,7 +2748,7 @@ class DiT(nn.Module):
     def _run_dit_core_with_pram_v2(
             self,
             target_input_norm_xT: torch.
-        Tensor,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        Tensor,  # (B, (1+)Pnn, (time_len+ T)*6) or (B, (1+)Pnn, T*6) or (B, (1+)Pnn, (1+T)*6)
             diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
             cross_c: torch.Tensor,  # (B, token_num, D)
             ego_fut_global: torch.Tensor,  # (B, D)
@@ -2770,7 +2770,7 @@ class DiT(nn.Module):
         # x: (B, (1+)Pnn, H)
         x: torch.Tensor = self.preproj_varlen(
             target_input_norm_xT=
-            target_input_norm_xT,  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            target_input_norm_xT,  # (B, (1+)Pnn, (time_len+ T) *6) or (B, (1+)Pnn, T*6) or (B, (1+)Pnn, (1+T)*6)
             target_current_mask=_to_bool_mask(
                 target_current_mask),  #  (B, (1+)Pnn)
         )
@@ -2990,18 +2990,20 @@ class DiT(nn.Module):
         target_current_mask: torch.Tensor = ~target_current_valid
         return target_cur_future_valid, target_current_mask
 
-    def _apply_diffusion_timestep(
+    def _apply_diffusion_timestep_and_validity(
         self,
         target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*4)
-        diffusion_time: torch.Tensor  # (B,) or (B, future_len)
+        diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
+        target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, 1+past_len+future_len)
     ) -> torch.Tensor:
         """
-        target_cur_future_norm_xT : (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _ * 5)
+        target_cur_future_norm_xT : (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _ * 6)
 
-        5: x, y, cos, sin 에서 diffusion noise time step 추가
+        5: x, y, cos, sin 에서 diffusion noise time step  + validity 추가
 
-        참고로 1+future_len 은 현재+미래. 현재에는 노이즈를 추가하지 않을 것이므로, 0으로 채움
-        미래 future_len 에 대해서는, diffusion_time 에 따라 노이즈 time step을 채움
+        diffusion noise time step
+            참고로 1+future_len 은 현재+미래. 현재에는 노이즈를 추가하지 않을 것이므로, 0으로 채움
+            미래 future_len 에 대해서는, diffusion_time 에 따라 노이즈 time step을 채움
         """
         # target_input_norm_xT: (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _, 4)
         target_input_norm_xT = target_input_norm_xT.reshape(
@@ -3025,6 +3027,8 @@ class DiT(nn.Module):
                 f"diffusion_time must be (B,) or (B, future_len). got {diffusion_time.shape}"
             )
         B, P, T1, _ = target_input_norm_xT.shape
+        validity = target_past_cur_future_valid[: ,:, -T1:]  # (B, (1+)Pnn, T1)
+        validity = validity[:, :, :, None] # -> (B, (1+)Pnn, T1, 1)
         past_cur_time_len = T1 - self._future_len  # past_len + 1
         # (B, past_cur_time_len)
         diffusion_time_for_current = torch.zeros(
@@ -3032,6 +3036,7 @@ class DiT(nn.Module):
             dtype=diffusion_time.dtype,
             device=diffusion_time.device,
         )
+
         # (B, past_cur_time_len + future_len)
         diffusion_time_full = torch.cat(
             [diffusion_time_for_current, diffusion_time_for_future],
@@ -3044,21 +3049,25 @@ class DiT(nn.Module):
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
         """
-        target_input_norm_xT : (B, (1+)Pnn, past_cur_time_len + future_len, 4) -> (B, (1+)Pnn, past_cur_time_len + future_len, 5)
+        target_input_norm_xT : (B, (1+)Pnn, past_cur_time_len + future_len, 4) 
+            -> (B, (1+)Pnn, past_cur_time_len + future_len, 6)
         diffusion_time_full : (B, (1+)Pnn, past_cur_time_len + future_len, 1)
+        validity : (B, (1+)Pnn, past_cur_time_len + future_len, 1)
         """
         target_input_norm_xT = torch.cat(
             [
                 target_input_norm_xT,
                 diffusion_time_full,
+                validity,
             ],
             dim=-1,
-        )  # (B, (1+)Pnn, past_cur_time_len + future_len, 5)
+        )  # (B, (1+)Pnn, past_cur_time_len + future_len, 6)
+
         target_input_norm_xT = target_input_norm_xT.reshape(
             B,
             P,
             -1,
-        )  # (B, (1+)Pnn, _ * 5)
+        )  # (B, (1+)Pnn, _ * 6)
         return target_input_norm_xT
 
     def forward(
@@ -3115,10 +3124,10 @@ class DiT(nn.Module):
                 enabled=self.config.profile_feasible,
                 device_type=device_type,
         ):
-            if self.config.use_amortized_diffusion:
-                #   target_input_norm_xT: (B, (1+)Pnn, (time_len+ T) *5) or (B, (1+)Pnn, T*5) or (B, (1+)Pnn, (1+T)*5)
-                target_input_norm_xT = self._apply_diffusion_timestep(
-                    target_input_norm_xT, diffusion_time)
+            # if self.config.use_amortized_diffusion:
+            #   target_input_norm_xT: (B, (1+)Pnn, (time_len+ T) *6) or (B, (1+)Pnn, T*6) or (B, (1+)Pnn, (1+T)*6)
+            target_input_norm_xT = self._apply_diffusion_timestep_and_validity(
+                target_input_norm_xT, diffusion_time, target_past_cur_future_valid)
             # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             x: torch.Tensor = self._run_dit_core_with_pram_v2(
                 target_input_norm_xT=target_input_norm_xT,  #
