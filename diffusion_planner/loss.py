@@ -920,17 +920,24 @@ def diffusion_loss_func(
         target_future_norm_gt,  # (B, (1+)Pnn, future_len, 4)
     )
 
-    # 시간 가중치(w_t) 생성
-    time_step_s: float = 0.1
-    half_life_s: float = 2.0
-    # w_t: (1, 1, future_len)
-    w_t: torch.Tensor = _build_half_life_weights(
-        future_len,
-        dt_s=time_step_s,
-        half_life_s=half_life_s,
-        device=dpm_loss.device,  # (B, (1+)Pnn, future_len)
-        dtype=torch.float32,
-    )
+
+    if args.use_timestep_weight_loss:
+        # 시간 가중치(w_t) 생성
+        time_step_s: float = 0.1
+        half_life_s: float = 2.0
+        # w_t: (1, 1, future_len)
+        w_t: torch.Tensor = _build_half_life_weights(
+            future_len,
+            dt_s=time_step_s,
+            half_life_s=half_life_s,
+            device=dpm_loss.device,  # (B, (1+)Pnn, future_len)
+            dtype=torch.float32,
+        )
+    else:
+        # 균등 가중치
+        w_t = torch.ones((1, 1, future_len),
+                         device=dpm_loss.device,
+                         dtype=torch.float32)
 
     # neighbor_prediction_loss (스칼라)
     loss_val: torch.Tensor = _aggregate_weighted_loss(

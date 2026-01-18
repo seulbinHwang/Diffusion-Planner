@@ -586,6 +586,9 @@ def get_args():
                         type=boolean,
                         default=False,
                         help='shuffle scenarios')
+    parser.add_argument('--use_timestep_weight_loss',
+                        type=boolean,
+                        default=True)
     parser.add_argument('--reset_save_path',
                         type=boolean,
                         default=False,
