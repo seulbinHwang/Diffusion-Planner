@@ -3027,8 +3027,11 @@ class DiT(nn.Module):
                 f"diffusion_time must be (B,) or (B, future_len). got {diffusion_time.shape}"
             )
         B, P, T1, _ = target_input_norm_xT.shape
-        validity = target_past_cur_future_valid[: ,:, -T1:]  # (B, (1+)Pnn, T1)
-        validity = validity[:, :, :, None] # -> (B, (1+)Pnn, T1, 1)
+        validity = target_past_cur_future_valid[:, :, -T1:]  # (B,P,T1) bool
+        validity = validity.to(device=target_input_norm_xT.device)  # 안전
+        validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
+            -1)  # (B,P,T1,1) float
+
         past_cur_time_len = T1 - self._future_len  # past_len + 1
         # (B, past_cur_time_len)
         diffusion_time_for_current = torch.zeros(
@@ -3046,6 +3049,7 @@ class DiT(nn.Module):
         diffusion_time_full = diffusion_time_full[:, None, :, None]
         # (B, P, past_cur_time_len + future_len, 1)
         diffusion_time_full = diffusion_time_full.expand(B, P, T1, 1)
+        diffusion_time_full = diffusion_time_full * validity_f  # (B,P,T1,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
         """
@@ -3058,7 +3062,7 @@ class DiT(nn.Module):
             [
                 target_input_norm_xT,
                 diffusion_time_full,
-                validity,
+                validity_f,
             ],
             dim=-1,
         )  # (B, (1+)Pnn, past_cur_time_len + future_len, 6)
