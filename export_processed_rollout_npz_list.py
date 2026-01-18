@@ -83,7 +83,7 @@ def write_npz_filenames_to_json(
 
 
 if __name__ == "__main__":
-    INPUT_DIR = "/mnt/nuplan/dataset/processed_rollout"
+    INPUT_DIR = "/mnt/nuplan/dataset/processed"
     OUTPUT_JSON = "/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_amortized_fine_tuning.json"
 
     write_npz_filenames_to_json(
