@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader, DistributedSampler
 from typing import Tuple, Any, Dict, Optional, List, Callable
 import wandb
 import torch.nn as nn
-from diffusion_planner.loss import _sanitize_norm_inputs
 from tools.predictor_utils import (
     build_dataset_and_sampler,
     build_data_loader,
@@ -53,7 +52,60 @@ from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 import os
 from typing import Optional
 import argparse
-import torch
+import logging
+
+
+def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """tensor에 NaN/Inf가 있는지 확인합니다.
+
+    주의
+    ----
+    bool/int 텐서는 NaN/Inf라는 개념이 없어서,
+    이런 텐서에는 검사를 하지 않고 그대로 통과시킵니다.
+
+    Args:
+        name (str): 로그에 찍을 텐서 이름.
+        tensor (torch.Tensor): 검사할 텐서.
+
+    Returns:
+        torch.Tensor:
+            - float/complex 텐서면 NaN/Inf가 없는지 확인 후 그대로 반환합니다.
+            - bool/int 텐서면 검사 없이 그대로 반환합니다.
+
+    Raises:
+        ValueError:
+            float/complex 텐서에서 NaN 또는 Inf가 발견되면 발생합니다.
+    """
+    if not (torch.is_floating_point(tensor) or torch.is_complex(tensor)):
+        return tensor
+
+    if not torch.isfinite(tensor).all():
+        msg = f"{name} contains NaN or Inf values"
+        logging.error(msg)
+        raise ValueError(msg)
+    return tensor
+
+# ----------------------------------------------------------------------------
+def _sanitize_norm_inputs(
+    norm_inputs: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
+    """정규화된 입력 dict 안 텐서들이 NaN/Inf 인지 확인하고 새 dict 로 돌려준다.
+
+    Args:
+        norm_inputs: 모델 입력용 정규화 관측 dict.
+
+    Returns:
+        각 텐서가 유한값인지 검사한 뒤 담은 새 dict.
+    """
+    checked_norm_inputs: Dict[str, torch.Tensor] = {}
+    for k, v in norm_inputs.items():
+        if isinstance(v, torch.Tensor):
+            checked_norm_inputs[k] = _require_finite(f"norm_inputs['{k}']", v)
+        else:
+            checked_norm_inputs[k] = v
+    return checked_norm_inputs
+    # 각 v: 보통 (B, ·) 모양 텐서들
+
+
 
 _VALIDATION_HEARTBEAT: Optional["_ValidationHeartbeat"] = None
 
@@ -3029,7 +3081,11 @@ def _predict_rollouts_batched_one_chunk(
             else:
                 inference_noise = None
             norm_inputs_copy["inference_noise"] = inference_noise
-            norm_inputs_copy["need_warmup"] = step_count == 0
+            if args.use_amortized_diffusion:
+                need_warmup = True
+            else:
+                need_warmup = step_count == 0
+            norm_inputs_copy["need_warmup"] = need_warmup
 
             decoder_output = _forward_model_for_validation(
                 args=args,
