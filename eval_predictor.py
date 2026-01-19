@@ -3086,7 +3086,7 @@ def _predict_rollouts_batched_one_chunk(
             norm_inputs_copy["rollout_time_chunk_size"] = torch.tensor(
                 [gap] * merged_batch,
                 dtype=torch.int64,
-                device=inference_noise.device,
+                device=norm_inputs_copy["ego_agent_past"].device,
             )
             decoder_output = _forward_model_for_validation(
                 args=args,

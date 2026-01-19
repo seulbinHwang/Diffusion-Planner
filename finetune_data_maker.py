@@ -2907,7 +2907,7 @@ gap: int,
     cand_inputs["rollout_time_chunk_size"] = torch.tensor(
         [gap] * int(b),
         dtype=torch.int64,
-        device=inference_noise_flat.device,
+        device=norm_inputs_step["ego_agent_past"].device,
     )
     # 3) 모델 forward (한 번)
     decoder_output = _forward_model_for_validation(
@@ -4361,6 +4361,8 @@ def _transform_origin(
 
     # 4) future_gt_4_dim: ego + near
     future_gt_keys = ["ego_future_gt_4_dim", "near_future_gt_4_dim"]
+    # ego_future_gt_4_dim: (B, future_len, 4)
+    # near_future_gt_4_dim: (B, Pnn, future_len, 4)
     for future_key in future_gt_keys:
         if future_key not in unnorm_inputs_copy:
             continue
@@ -4378,11 +4380,11 @@ def _transform_origin(
 
         valid_mask = _build_valid_mask_for_pose_4_dim(future_pose_4)
         _transform_pose_4_dim_inplace(
-            pose_4_dim=future_pose_4,
-            delta_xy=delta_xy,
-            cos_delta=cos_delta,
-            sin_delta=sin_delta,
-            valid_mask=valid_mask,
+            pose_4_dim=future_pose_4, # (B, T, 4) 또는 (B, Pnn, T, 4)
+            delta_xy=delta_xy, # (B,)
+            cos_delta=cos_delta, # (B,)
+            sin_delta=sin_delta, # (B,)
+            valid_mask=valid_mask, # (B, T) 또는 (B, Pnn, T)
         )
 
     planner_future_11_dim = unnorm_inputs_copy.get("planner_future_11_dim",

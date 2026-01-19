@@ -2116,7 +2116,8 @@ class Decoder(nn.Module):
 
         return return_
 
-    def _get_noise_trajectory_from_prev_trajectory(self,rollout_time_chunk_size:int) -> torch.Tensor:
+    def _get_noise_trajectory_from_prev_trajectory(
+            self, rollout_time_chunk_size: int) -> torch.Tensor:
         assert self.config.use_amortized_diffusion, (
             "self._x0_for_amortized_inference 이 설정된 상태에서는 "
             "config.use_amortized_diffusion 이 True 여야 합니다.")
@@ -2148,6 +2149,305 @@ class Decoder(nn.Module):
         # noise_trajectory: (B, (1+)Pnn, T, 4)
         noise_trajectory: torch.Tensor = mean + std * random_noise
         return noise_trajectory
+
+    @staticmethod
+    def _normalize_cos_sin_for_rotation(
+        cos_values: torch.Tensor,
+        sin_values: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(cos, sin)을 회전에 쓰기 좋게 길이 1로 맞춥니다.
+
+        - 길이가 충분히 크면: (cos, sin)을 길이 1로 나눠 정리합니다.
+        - 길이가 거의 0이면: 회전을 못하므로 (1, 0)으로 둡니다(회전 없음).
+
+        Args:
+            cos_values: shape = (...)
+            sin_values: shape = (...)
+            eps: 0 나눗셈 방지 값.
+
+        Returns:
+            cos_normalized: shape = (...)
+            sin_normalized: shape = (...)
+        """
+        raw_norm = torch.sqrt(cos_values**2 + sin_values**2)
+        safe_norm = torch.clamp(raw_norm, min=eps)
+
+        cos_normalized = cos_values / safe_norm
+        sin_normalized = sin_values / safe_norm
+
+        too_small = raw_norm < eps
+        cos_normalized = torch.where(too_small, torch.ones_like(cos_normalized),
+                                     cos_normalized)
+        sin_normalized = torch.where(too_small,
+                                     torch.zeros_like(sin_normalized),
+                                     sin_normalized)
+        return cos_normalized, sin_normalized
+
+    def _extract_delta_pose_params(
+        self,
+        normed_ego_next_pose: torch.Tensor,  # (B, 4)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """ego 다음 포즈에서 이동/회전에 필요한 값들을 뽑습니다.
+
+        Args:
+            normed_ego_next_pose: (B, 4) = (x, y, cos(각도), sin(각도))
+
+        Returns:
+            delta_xy: (B, 2)
+            cos_delta: (B,)
+            sin_delta: (B,)
+            yaw_delta: (B,)
+        """
+        if normed_ego_next_pose.dim(
+        ) != 2 or normed_ego_next_pose.shape[-1] != 4:
+            raise ValueError("normed_ego_next_pose는 (B, 4) 여야 합니다. "
+                             f"현재 shape={tuple(normed_ego_next_pose.shape)}")
+
+        delta_xy = normed_ego_next_pose[:, 0:2]  # (B, 2)
+        cos_raw = normed_ego_next_pose[:, 2]  # (B,)
+        sin_raw = normed_ego_next_pose[:, 3]  # (B,)
+
+        cos_delta, sin_delta = self._normalize_cos_sin_for_rotation(
+            cos_raw, sin_raw)
+        yaw_delta = torch.atan2(sin_delta, cos_delta)
+        return delta_xy, cos_delta, sin_delta, yaw_delta
+
+    @staticmethod
+    def _transform_points_to_new_origin(
+            points_xy: torch.Tensor,  # (B, ..., 2)
+            delta_xy: torch.Tensor,  # (B, 2)
+            cos_delta: torch.Tensor,  # (B,)
+            sin_delta: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        """(x, y) 점들을 새 원점 기준으로 변환합니다(이동+회전)."""
+        if points_xy.shape[-1] != 2:
+            raise ValueError(
+                f"points_xy의 마지막 차원은 2여야 합니다. shape={tuple(points_xy.shape)}")
+
+        delta_xy_b = delta_xy
+        cos_b = cos_delta
+        sin_b = sin_delta
+        for _ in range(points_xy.dim() - 2):
+            delta_xy_b = delta_xy_b.unsqueeze(1)
+            cos_b = cos_b.unsqueeze(1)
+            sin_b = sin_b.unsqueeze(1)
+
+        dx = points_xy[..., 0] - delta_xy_b[..., 0]
+        dy = points_xy[..., 1] - delta_xy_b[..., 1]
+
+        x_new = cos_b * dx + sin_b * dy
+        y_new = -sin_b * dx + cos_b * dy
+        return torch.stack([x_new, y_new], dim=-1)
+
+    @staticmethod
+    def _rotate_heading_cos_sin_to_new_origin(
+            cos_heading: torch.Tensor,  # (B, ...)
+            sin_heading: torch.Tensor,  # (B, ...)
+            cos_delta: torch.Tensor,  # (B,)
+            sin_delta: torch.Tensor,  # (B,)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(cos, sin) 방향을 새 기준으로 바꿉니다(각도 빼기)."""
+        cos_b = cos_delta
+        sin_b = sin_delta
+        for _ in range(cos_heading.dim() - 1):
+            cos_b = cos_b.unsqueeze(1)
+            sin_b = sin_b.unsqueeze(1)
+
+        cos_new = cos_heading * cos_b + sin_heading * sin_b
+        sin_new = sin_heading * cos_b - cos_heading * sin_b
+        return cos_new, sin_new
+
+    def _transform_pose_4_dim_inplace(
+        self,
+        pose_4_dim: torch.Tensor,
+        delta_xy: torch.Tensor,
+        cos_delta: torch.Tensor,
+        sin_delta: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> None:
+        """(x, y, cos, sin) 포즈 텐서를 "새 원점/방향" 기준으로 바꿉니다.
+
+        이 함수가 하는 일
+        --------------
+        - pose_4_dim의 위치(x, y)를
+          1) delta_xy 만큼 이동(빼기)
+          2) cos_delta/sin_delta 만큼 회전
+          해서 새 기준 좌표로 바꿉니다.
+        - pose_4_dim의 방향(cos, sin)도 같은 기준으로 회전해 줍니다.
+        - valid_mask가 False인 칸(무효 타임스텝)은 값을 그대로 둡니다.
+
+        Args:
+            pose_4_dim (torch.Tensor):
+                포즈 텐서.
+                shape: (B, T, 4) 또는 (B, P, T, 4) 등 (..., 4)
+                마지막 4는 (x, y, cos, sin)
+            delta_xy (torch.Tensor):
+                새 원점으로 삼을 ego 위치.
+                shape: (B, 2)
+            cos_delta (torch.Tensor):
+                새 기준 회전에 쓰는 cos 값.
+                shape: (B,)
+            sin_delta (torch.Tensor):
+                새 기준 회전에 쓰는 sin 값.
+                shape: (B,)
+            valid_mask (torch.Tensor):
+                변환을 적용할 칸(True) / 그대로 둘 칸(False).
+                shape: pose_4_dim.shape[:-1]
+                dtype: torch.bool
+
+        Returns:
+            None
+        """
+        if pose_4_dim.dim() < 2 or int(pose_4_dim.shape[-1]) != 4:
+            raise ValueError("pose_4_dim은 (..., 4) 이어야 합니다. "
+                             f"현재 shape={tuple(pose_4_dim.shape)}")
+
+        expected_mask_shape = tuple(int(x) for x in pose_4_dim.shape[:-1])
+        if tuple(int(x) for x in valid_mask.shape) != expected_mask_shape:
+            raise ValueError(
+                "valid_mask shape가 pose_4_dim과 맞지 않습니다. "
+                f"expected={expected_mask_shape}, got={tuple(valid_mask.shape)}"
+            )
+
+        valid_mask_bool = valid_mask.to(dtype=torch.bool)
+
+        # 1) (x, y) 변환
+        pos_xy = pose_4_dim[..., 0:2]  # shape: (..., 2)
+        pos_xy_new = self._transform_points_to_new_origin(
+            points_xy=pos_xy,
+            delta_xy=delta_xy,
+            cos_delta=cos_delta,
+            sin_delta=sin_delta,
+        )  # shape: (..., 2)
+        pose_4_dim[..., 0:2] = torch.where(
+            valid_mask_bool[..., None],
+            pos_xy_new,
+            pos_xy,
+        )
+
+        # 2) (cos, sin) 방향 변환
+        cos_h = pose_4_dim[..., 2]  # shape: (...)
+        sin_h = pose_4_dim[..., 3]  # shape: (...)
+        cos_new, sin_new = self._rotate_heading_cos_sin_to_new_origin(
+            cos_heading=cos_h,
+            sin_heading=sin_h,
+            cos_delta=cos_delta,
+            sin_delta=sin_delta,
+        )  # shape: (...), (...)
+
+        pose_4_dim[..., 2] = torch.where(valid_mask_bool, cos_new, cos_h)
+        pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
+
+    def _update_amortized_future_buffer_origin(
+            self,
+            rollout_time_chunk_size: int,
+            target_future_valid: torch.Tensor,
+    ) -> None:
+        """amortized 추론에서 재사용하는 '미래 버퍼'의 좌표 기준을 다음 스텝 기준으로 맞춥니다.
+
+        이 함수가 필요한 이유
+        -------------------
+        평가/롤아웃 코드에서는 매 스텝(또는 chunk)마다 입력 전체를 "새 ego 기준(0,0)"으로 바꿉니다.
+        그런데 Decoder 안의 미래 버퍼(self._x0_for_amortized_inference)는 다음 스텝에도 재사용되므로,
+        이 버퍼도 똑같이 기준을 바꾸지 않으면,
+        다음 스텝에서 "과거/현재(새 기준)"과 "미래 버퍼(옛 기준)"가 섞일 수 있습니다.
+
+        처리 순서(중요)
+        -------------
+        self._x0_for_amortized_inference 는 모델이 쓰는 스케일(정규화된 값)로 저장되어 있습니다.
+        이동/회전은 실제 단위에서 하는 것이 안전하므로 아래 순서를 지킵니다.
+
+          1) 버퍼를 state_normalizer.inverse 로 실제 단위로 되돌립니다.
+          2) rollout_time_chunk_size 시점의 ego 포즈를 기준점으로 삼습니다.
+          3) 버퍼 전체를 같은 기준으로 이동/회전합니다.
+          4) 다시 state_normalizer 로 모델 입력 스케일로 맞춥니다.
+          5) (cos, sin)이 길이 1이 되도록 한 번 더 정리합니다.
+
+        Args:
+            rollout_time_chunk_size (int):
+                다음 호출에서 현재가 될 시점까지의 프레임 수.
+                예) 1이면 '다음 프레임'이 새 기준점입니다.
+            target_future_valid (torch.Tensor):
+                미래 버퍼에서 유효한 프레임 표시 마스크.
+                - shape: (B, (1+)Pnn, future_len)
+                - dtype: bool (True=유효, False=무효)
+
+        Returns:
+            None
+        """
+        if self._x0_for_amortized_inference is None:
+            return
+
+        # buffer_norm: (B, (1+)Pnn, future_len, 4)
+        buffer_norm: torch.Tensor = self._x0_for_amortized_inference
+        if buffer_norm.dim() != 4 or int(buffer_norm.shape[-1]) != 4:
+            raise ValueError(
+                "self._x0_for_amortized_inference는 (B,(1+)Pnn,future_len,4) 이어야 합니다. "
+                f"got shape={tuple(buffer_norm.shape)}"
+            )
+
+        future_len: int = int(buffer_norm.shape[2])
+
+        if rollout_time_chunk_size < 1 or rollout_time_chunk_size > future_len:
+            raise ValueError(
+                "rollout_time_chunk_size는 1 이상 future_len 이하이어야 합니다. "
+                f"got rollout_time_chunk_size={rollout_time_chunk_size}, future_len={future_len}"
+            )
+
+        if target_future_valid.shape[:3] != buffer_norm.shape[:3]:
+            raise ValueError(
+                "target_future_valid shape가 미래 버퍼와 맞지 않습니다. "
+                f"expected={tuple(buffer_norm.shape[:3])}, got={tuple(target_future_valid.shape[:3])}"
+            )
+
+        # dtype/device 보존용
+        original_dtype = buffer_norm.dtype
+        device = buffer_norm.device
+
+        # 1) 버퍼를 실제 단위로 되돌리기
+        # buffer_unnorm: (B, (1+)Pnn, future_len, 4)
+        buffer_unnorm: torch.Tensor = self.config.state_normalizer.inverse(
+            buffer_norm)
+
+        # 2) ego가 기준이 될 시점(rollout_time_chunk_size)에서의 ego 포즈 뽑기
+        # ego_next_pose_unnorm: (B, 4)
+        step_index: int = int(rollout_time_chunk_size - 1)
+        ego_next_pose_unnorm: torch.Tensor = buffer_unnorm[
+            :, 0, step_index, :].detach()
+
+        # 3) 이동/회전에 필요한 값 계산
+        # delta_xy: (B, 2), cos_delta: (B,), sin_delta: (B,)
+        delta_xy, cos_delta, sin_delta, _ = self._extract_delta_pose_params(
+            ego_next_pose_unnorm
+        )
+
+        # 4) 버퍼 전체를 새 기준으로 이동/회전 (유효 프레임만)
+        # valid_mask: (B, (1+)Pnn, future_len)
+        valid_mask: torch.Tensor = target_future_valid.to(device=device,
+                                                          dtype=torch.bool)
+        self._transform_pose_4_dim_inplace(
+            pose_4_dim=buffer_unnorm,  # (B, (1+)Pnn, future_len, 4)  (실제 단위)
+            delta_xy=delta_xy,  # (B, 2)
+            cos_delta=cos_delta,  # (B,)
+            sin_delta=sin_delta,  # (B,)
+            valid_mask=valid_mask,  # (B, (1+)Pnn, future_len)
+        )
+
+        # 5) 다시 모델 스케일로 맞추기
+        # buffer_norm_new: (B, (1+)Pnn, future_len, 4)
+        buffer_norm_new: torch.Tensor = self.config.state_normalizer(
+            buffer_unnorm)
+
+        # dtype/device 원복 + 안전하게 detach
+        buffer_norm_new = buffer_norm_new.to(device=device,
+                                             dtype=original_dtype).detach()
+
+        # 6) (cos, sin) 길이 1 정리
+        buffer_norm_new = self._project_future_yaw_to_unit_circle(
+            buffer_norm_new)
+
+        self._x0_for_amortized_inference = buffer_norm_new
 
     def _forward_inference_mode(
         self,
@@ -2201,14 +2501,16 @@ class Decoder(nn.Module):
                         "When using amortized diffusion during inference, "
                         "if inference_noise is not provided, "
                         "self._x0_for_amortized_inference must be set.")
-                    rollout_time_chunk_size = inputs.get("rollout_time_chunk_size", None)
+                    rollout_time_chunk_size = inputs.get(
+                        "rollout_time_chunk_size", None)
                     assert rollout_time_chunk_size is not None, (
                         "rollout_time_chunk_size must be provided in inputs "
                         "when using amortized diffusion during inference.")
                     # rollout_time_chunk_size: (B,) Tensor, but we will change it to int.
-                    rollout_time_chunk_size_int = rollout_time_chunk_size[0].item() # int
-                    noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(rollout_time_chunk_size_int
-                    )
+                    rollout_time_chunk_size_int = rollout_time_chunk_size[
+                        0].item()  # int
+                    noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
+                        rollout_time_chunk_size_int)
             else:  # 기존 DPM-Solver 경로
                 assert self._x0_for_amortized_inference is None, (
                     "self._x0_for_amortized_inference should be None when not using amortized diffusion."
@@ -2283,6 +2585,7 @@ class Decoder(nn.Module):
             # dtype 맞춤(기존 로직 유지)
             x0 = x0.to(xT.dtype)
 
+
             # 6) (B, (1+)Pnn, 1+T, 4)
             x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
                 x0=
@@ -2291,10 +2594,30 @@ class Decoder(nn.Module):
                 batch_size=B,
                 one_or_Pnn=one_or_Pnn,
             )
+            # self.dit.dit_returns.integrated_trajectory : (B, (1+)Pnn, T, 4) 정규화 상태
             if self.config.use_amortized_diffusion:
-                self._x0_for_amortized_inference = x0_seq_norm[:, :,
-                                                               1:, :].detach(
-                                                               )  # (B, Pnn, T, 4)
+                # self._x0_for_amortized_inference = x0_seq_norm[:, :,
+                #                                                1:, :].detach(
+                #                                                )  # (B, 1+Pnn, T, 4)
+                self._x0_for_amortized_inference = self.dit.dit_returns.integrated_trajectory
+                rollout_time_chunk_size = inputs.get("rollout_time_chunk_size",
+                                                     None)
+                assert rollout_time_chunk_size is not None, (
+                    "rollout_time_chunk_size must be provided in inputs "
+                    "when using amortized diffusion during inference."
+                )
+                rollout_time_chunk_size_int = int(
+                    rollout_time_chunk_size[0].item())
+
+                # target_future_valid: (B, (1+)Pnn, T)
+                target_future_valid = target_past_cur_future_valid[
+                    :, :, -self._future_len:].detach()
+
+                # ✅ 미래 버퍼도 다음 스텝 기준 좌표로 맞추기
+                self._update_amortized_future_buffer_origin(
+                    rollout_time_chunk_size=rollout_time_chunk_size_int,
+                    target_future_valid=target_future_valid,
+                )
 
             # 8) feasible 출력(옵션)
             self._append_inference_feasible_outputs(
