@@ -116,8 +116,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$TRAIN_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "nuplan_womd" \
-  --name "nuplan_womd" \
+  --load_name "amortized_fine_tuning_lr_2e5" \
+  --name "amortized_fine_tuning_lr_2e5" \
   --eval_method "train" \
   --batch_size 1024 \
   --use_deepspeed True \
@@ -125,7 +125,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
---save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
+--save_cache_path "/mnt/nuplan/dataset/processed_rollout2" \
   --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \

@@ -2599,7 +2599,12 @@ class Decoder(nn.Module):
                 # self._x0_for_amortized_inference = x0_seq_norm[:, :,
                 #                                                1:, :].detach(
                 #                                                )  # (B, 1+Pnn, T, 4)
-                self._x0_for_amortized_inference = self.dit.dit_returns.integrated_trajectory
+                integrated = self.dit.dit_returns.integrated_trajectory.to(
+                    device=target_current_xyyaw.device,
+                    dtype=target_current_xyyaw.dtype,
+                ).detach()
+
+                self._x0_for_amortized_inference = integrated # (B, 1+Pnn, T, 4)
                 rollout_time_chunk_size = inputs.get("rollout_time_chunk_size",
                                                      None)
                 assert rollout_time_chunk_size is not None, (
