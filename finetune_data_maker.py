@@ -1981,6 +1981,7 @@ def _predict_one_rollout_sequential(
                 base_seed=int(base_seed),
                 ddp_rank=int(ddp_rank),
                 step_idx=int(step_start),
+                gap=gap,
             )
             # best_normed_traj: (B, 1+Pnn, 1+future_len, 4)
             unnorm_best_traj = state_normalizer.inverse(best_normed_traj)
@@ -2841,6 +2842,7 @@ def _forward_and_score_candidate_batch(
     cand_start_idx: int,
     cand_count: int,
     seed_stride: int,
+gap: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """후보 cand_count개를 한 번에 모델에 넣고, 거리 점수까지 계산합니다.
 
@@ -2901,8 +2903,12 @@ def _forward_and_score_candidate_batch(
         repeat=int(c),
         batch_size=int(b),
     )
-    cand_inputs["inference_noise"] = inference_noise_flat  # (B*c, 1+Pnn, future_len, 4)
-
+    cand_inputs["inference_noise"] = inference_noise_flat # (B*cand_count, 1+Pnn, future_len, 4)
+    cand_inputs["rollout_time_chunk_size"] = torch.tensor(
+        [gap] * int(b),
+        dtype=torch.int64,
+        device=inference_noise_flat.device,
+    )
     # 3) 모델 forward (한 번)
     decoder_output = _forward_model_for_validation(
         args=args,
@@ -3088,6 +3094,7 @@ def _select_best_trajectory_by_sample_k(
     base_seed: int,
     ddp_rank: int,
     step_idx: int,
+gap: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """같은 입력에서 후보 K개를 만들고, 규칙에 따라 최종 1개를 고릅니다.
 
@@ -3149,6 +3156,7 @@ def _select_best_trajectory_by_sample_k(
                 cand_start_idx=int(cand_start),
                 cand_count=int(group_count),
                 seed_stride=int(seed_stride),
+                gap=gap,
             )
         except BaseException as e:
             # ✅ OOM이면 절반으로 줄이고 같은 cand_start에서 다시 시도
