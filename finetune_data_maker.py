@@ -2044,6 +2044,7 @@ def _predict_one_rollout_sequential(
             # unnorm_best_traj: (B, 1+Pnn, 1+future_len, 4)
             # unnorm_target_pose_chunk: (B, 1+Pnn, gap, 4)
             unnorm_target_pose_chunk = unnorm_best_traj[:, :, 1:gap + 1, :]
+            # unnorm_target_pose_chunk = unnorm_selected_traj_raw[:, :, 1:gap + 1, :]
             unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:,
                                                              0, :, :]  # (B, gap, 4)
             unnorm_near_pose_chunk = unnorm_target_pose_chunk[:,
