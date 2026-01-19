@@ -125,7 +125,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
---save_cache_path "/mnt/nuplan/dataset/processed_rollout2" \
+--save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
   --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
