@@ -135,9 +135,9 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_recovery True \
   --select_jointly True \
   --recovery_threshold_m 1. \
-  --scenario_finish_step 40 \
+  --scenario_finish_step 20 \
   --time_step_for_compare 60 \
-  --use_data_percent 7 \
+  --use_data_percent 2 \
   --rollout_number 3 \
   --use_amortized_diffusion True
 
