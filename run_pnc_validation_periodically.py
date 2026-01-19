@@ -221,12 +221,6 @@ def _parse_args() -> argparse.Namespace:
         default="/media/user/E/projects/Diffusion-Planner/validation_pnc.sh",
         help="Path to validation_pnc.sh to run",
     )
-    # parser.add_argument(
-    #     "--script_path",
-    #     type=str,
-    #     default="/mnt/nuplan/projects/Diffusion-Planner/validation_mlx.sh",
-    #     help="Path to validation_pnc.sh to run",
-    # )
     return parser.parse_args()
 
 

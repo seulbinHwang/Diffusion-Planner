@@ -213,12 +213,6 @@ def _parse_args() -> argparse.Namespace:
         default="",
         help="conda 실행 파일 경로(비우면 자동으로 찾아봄)",
     )
-    # parser.add_argument(
-    #     "--script_path",
-    #     type=str,
-    #     default="/media/user/E/projects/Diffusion-Planner/validation_pnc.sh",
-    #     help="실행할 validation_pnc.sh 경로",
-    # )
     parser.add_argument(
         "--script_path",
         type=str,

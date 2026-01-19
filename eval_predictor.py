@@ -3081,6 +3081,13 @@ def _predict_rollouts_batched_one_chunk(
             else:
                 inference_noise = None
             norm_inputs_copy["inference_noise"] = inference_noise
+            # ✅ Decoder가 이번 호출에서 "몇 스텝 전진했는지" 알 수 있게 전달
+            # gap을 전달하면 되는데, 우리는 (B*R,) shape int 텐서로 맞춰서 전달합니다.
+            norm_inputs_copy["rollout_time_chunk_size"] = torch.tensor(
+                [gap] * merged_batch,
+                dtype=torch.int64,
+                device=inference_noise.device,
+            )
             decoder_output = _forward_model_for_validation(
                 args=args,
                 model=model,

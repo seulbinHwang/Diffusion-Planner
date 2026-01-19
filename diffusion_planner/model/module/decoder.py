@@ -2116,22 +2116,22 @@ class Decoder(nn.Module):
 
         return return_
 
-    def _get_noise_trajectory_from_prev_trajectory(self) -> torch.Tensor:
+    def _get_noise_trajectory_from_prev_trajectory(self,rollout_time_chunk_size:int) -> torch.Tensor:
         assert self.config.use_amortized_diffusion, (
             "self._x0_for_amortized_inference 이 설정된 상태에서는 "
             "config.use_amortized_diffusion 이 True 여야 합니다.")
         """
         self._x0_for_amortized_inference : (B, Pnn, future_len, 4) 
-            -> (B, Pnn, T-self.config.rollout_time_chunk_size, 4)
+            -> (B, Pnn, T-rollout_time_chunk_size, 4)
         self.t_tau: shape (future_len)
         """
         _x0_for_amortized_inference = torch.zeros_like(
             self._x0_for_amortized_inference)  # (B, Pnn, future_len, 4)
         # _x0_for_amortized_inference: (B, Pnn, future_len, 4)
-        _x0_for_amortized_inference[:, :, :-self.config.rollout_time_chunk_size, :] = \
+        _x0_for_amortized_inference[:, :, :-rollout_time_chunk_size, :] = \
         (
             self._x0_for_amortized_inference)[
-            :, :, self.config.rollout_time_chunk_size:, :]
+            :, :, rollout_time_chunk_size:, :]
         B = _x0_for_amortized_inference.shape[0]
         # batch_diffusion_time : (B, future_len)
         batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
@@ -2201,7 +2201,13 @@ class Decoder(nn.Module):
                         "When using amortized diffusion during inference, "
                         "if inference_noise is not provided, "
                         "self._x0_for_amortized_inference must be set.")
-                    noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
+                    rollout_time_chunk_size = inputs.get("rollout_time_chunk_size", None)
+                    assert rollout_time_chunk_size is not None, (
+                        "rollout_time_chunk_size must be provided in inputs "
+                        "when using amortized diffusion during inference.")
+                    # rollout_time_chunk_size: (B,) Tensor, but we will change it to int.
+                    rollout_time_chunk_size_int = rollout_time_chunk_size[0].item() # int
+                    noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(rollout_time_chunk_size_int
                     )
             else:  # 기존 DPM-Solver 경로
                 assert self._x0_for_amortized_inference is None, (
