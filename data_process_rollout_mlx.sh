@@ -109,7 +109,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 6 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
  finetune_data_maker.py \
  --port 23001 \
   --eval_set "$TRAIN_SET_PATH" \
@@ -119,7 +119,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "amortized_fine_tuning_lr_2e5" \
   --name "amortized_fine_tuning_lr_2e5" \
   --eval_method "train" \
-  --batch_size 1024 \
+  --batch_size 1536 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \
@@ -140,5 +140,3 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_data_percent 2 \
   --rollout_number 3 \
   --use_amortized_diffusion True
-
-#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
