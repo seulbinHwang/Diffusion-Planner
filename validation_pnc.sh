@@ -195,8 +195,8 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "amortized_fine_tuning_lr_2e5" \
-  --name "amortized_fine_tuning_lr_2e5" \
+  --load_name "wosac_test" \
+  --name "wosac_test" \
   --eval_method "validation" \
   --batch_size 256 \
   --use_deepspeed True \
