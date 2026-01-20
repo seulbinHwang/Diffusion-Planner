@@ -1,5 +1,6 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+from diffusion_planner.model.diffusion_planner import print_param_report
 
 from torch.utils.data import DataLoader, DistributedSampler
 from typing import Tuple, Any, Dict, Optional, List, Callable
@@ -54,6 +55,28 @@ from typing import Optional
 import argparse
 import logging
 
+def _unwrap_to_core_torch_module(model: nn.Module) -> nn.Module:
+    """감싸진 모델에서 실제 torch 모델(nn.Module)을 꺼냅니다.
+
+    Args:
+        model (nn.Module): 모델 또는 모델을 감싼 객체. shape: ()
+
+    Returns:
+        nn.Module: 실제 모델(nn.Module). shape: ()
+
+    Notes:
+        - DDP나 일부 엔진은 보통 model.module 안에 실제 모델을 넣습니다.
+        - 그래서 .module이 nn.Module인 동안 최대 몇 번 반복해서 꺼냅니다.
+        - 이 함수는 텐서 값을 다루지 않아서, 입력 데이터 모양(shape)과 무관합니다.
+    """
+    cur: nn.Module = model
+    for _ in range(8):
+        inner = getattr(cur, "module", None)
+        if isinstance(inner, nn.Module):
+            cur = inner
+        else:
+            break
+    return cur
 
 def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
     """tensor에 NaN/Inf가 있는지 확인합니다.
@@ -1405,6 +1428,9 @@ def model_validation(
              global_rank=global_rank,
              use_deepspeed=use_deepspeed,
          )
+        if _is_main_process_for_logging(args):
+            core_model = _unwrap_to_core_torch_module(diffusion_planner)
+            print_param_report(core_model)
         args._global_update_step = 0
 
         min_ade = minADE(is_active=args.min_ade_is_active).to(
@@ -1427,9 +1453,8 @@ def model_validation(
             wandb_id=None,
             allow_val_change=allow_val_change,
         )
-
+        raise ValueError("test")
         _update_validation_heartbeat_stage(args, "running validation loop")
-
         run_validation_loop(
             args=args,
             diffusion_planner=diffusion_planner,
