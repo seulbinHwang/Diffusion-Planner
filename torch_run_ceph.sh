@@ -45,15 +45,10 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 4 --standalone --log_dir "$LOG_DIR" \
+--nnodes 1 --nproc-per-node 6 --standalone --log_dir "$LOG_DIR" \
 --redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --resume_wandb_model_name latest \
-  --resume_model_only False \
-  --load_name "nuplan_womd" \
-  --name "nuplan_womd" \
-  --batch_size 1024 \
-  --use_deepspeed True
-#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
+  --name "wosac_test" \
+  --batch_size 1536 \
