@@ -1207,10 +1207,11 @@ class Decoder(nn.Module):
             ).reshape(B, Pnn, -1)  # (B, Pnn, (time_len+T)*4)
         else:
             if self.config.use_current_input:
+                # Expected size 1024 but got size 2048 for tensor number 1 in the list.
                 xT: torch.Tensor = torch.cat(
                     [
-                        target_current_xyyaw[:, :, None, :],  # (B, Pnn, 1, 4)
-                        noise,  # (B, Pnn, T, 4)
+                        target_current_xyyaw[:, :, None, :],  # (B, Pnn, 1, 4) # 1024
+                        noise,  # (B, Pnn, T, 4) # 2048
                     ],
                     dim=2,
                 ).reshape(B, Pnn, -1)  # (B, Pnn, (1+T)*4)

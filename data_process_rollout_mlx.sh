@@ -139,4 +139,5 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --time_step_for_compare 60 \
   --use_data_percent 2 \
   --rollout_number 3 \
-  --use_amortized_diffusion True
+  --use_amortized_diffusion True \
+  --dp_sample_k_candidate_batch_size 4

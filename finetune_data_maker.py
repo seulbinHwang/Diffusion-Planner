@@ -2650,7 +2650,7 @@ def _compute_expert_guidance_distance_m_per_agent(
 
 
 # _select_best_trajectory_by_sample_k에서 "후보를 한 번에 몇 개씩 묶어 처리할지"를 캐시하는 args 속성 이름
-_DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME = "_dp_sample_k_candidate_batch_size"
+_DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME = "dp_sample_k_candidate_batch_size"
 
 
 def _is_gpu_oom_error(err: BaseException) -> bool:
@@ -3125,7 +3125,7 @@ gap: int,
 
     # ✅ (중요) 처음엔 K부터 시작, 한 번 안전한 값이 잡히면 args에 저장된 값 사용
     cached_group = getattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME, None)
-    if cached_group is None:
+    if cached_group is None or int(cached_group) <= 0:
         cand_group_size = int(k_total)
     else:
         cand_group_size = int(max(1, int(cached_group)))
