@@ -13,7 +13,7 @@ from diffusion_planner.model.module.mixer import MixerBlock
 from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock
 from diffusion_planner.loss import _require_finite
 # decoder.py 상단 import 섹션에 추가
-from diffusion_planner.model.module.pram_v2 import (
+from diffusion_planner.model.module.pram_wosac import (
     PRAMV2Composer,
     PRAMV2TimeModulator,
     PRAMV2BlockPathScalars,

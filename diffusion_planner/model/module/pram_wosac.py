@@ -238,25 +238,11 @@ class PRAMV2Composer(nn.Module):
             hidden_features=m,  # 128
             out_features=h,  # 128
             activation=activation)
-        self.adapt_E = build_mlp(in_features=hidden_dim,
-                                 hidden_features=m,
-                                 out_features=h,
-                                 activation=activation)
-        self.adapt_R = build_mlp(in_features=hidden_dim,
-                                 hidden_features=m,
-                                 out_features=h,
-                                 activation=activation)
 
         # RMSNorm(무파라미터): 곱(원소곱) 전·후 안정화
         self.rms_pre = RMSNormNoParam()
         self.rms_post = RMSNormNoParam()
 
-        # 6h → c → c 혼합 MLP (LN 포함)
-        self.mix_norm = nn.LayerNorm(6 * h)
-        self.mix_mlp = build_mlp(in_features=6 * h,
-                                 hidden_features=self.composed_hidden_dim,
-                                 out_features=self.composed_hidden_dim,
-                                 activation=activation)
 
         # 출력 헤드(Δs_base, b_base, logit_g_base) : [B, Pnn, H]
         self.head_delta_scale = nn.Linear(self.composed_hidden_dim,
@@ -331,16 +317,13 @@ class PRAMV2Composer(nn.Module):
         s = self.rms_pre(s)
         s = s.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 S 경로 0
 
-        # --- 혼합 ---
-        X = self.mix_norm(s)
-        z = self.mix_mlp(X)  # [B,(1+)Pnn,c]
         """
         5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
         """
         # --- 헤드 ---
-        delta_scale_base = self.head_delta_scale(z)  # [B,(1+)Pnn,H]
-        shift_base = self.head_shift(z)  # [B,(1+)Pnn,H]
-        logit_gate_base = self.head_logit_gate(z)  # [B,(1+)Pnn,H]
+        delta_scale_base = self.head_delta_scale(s)  # [B,(1+)Pnn,H]
+        shift_base = self.head_shift(s)  # [B,(1+)Pnn,H]
+        logit_gate_base = self.head_logit_gate(s)  # [B,(1+)Pnn,H]
 
         # ★ 최종 출력도 무효 agent에서는 모두 0 보장
         delta_scale_base = delta_scale_base.masked_fill(invalid_mask,
