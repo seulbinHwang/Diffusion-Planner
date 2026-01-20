@@ -1078,9 +1078,7 @@ class Decoder(nn.Module):
     def _unpack_encoder_outputs(
         self,
         encoder_outputs: Dict[str, torch.Tensor],
-        batch_size: int,
     ) -> Tuple[
-            torch.Tensor,
             torch.Tensor,
             torch.Tensor,
     ]:
@@ -1088,36 +1086,18 @@ class Decoder(nn.Module):
 
         Args:
             encoder_outputs: Encoder 단계에서 만들어진 출력 dict.
-            batch_size: 배치 크기 B (shape 확인용).
 
         Returns:
             scene_encoding_token: (B, token_num, D) 장면 토큰.
             scene_encoding_token_mask: (B, token_num) bool 마스크.
-            route_known_mask: (B, (1+)Pnn) bool, 경로 유효 여부 마스크.
         """
         scene_encoding_token: torch.Tensor = encoder_outputs[
             "encoding"]  # (B, token_num, D)
         scene_encoding_token_mask: torch.Tensor = encoder_outputs[
             "encoding_mask"]  # (B, token_num) bool
-        route_known_mask: torch.Tensor = encoder_outputs[
-            "route_known_mask"]  # (B, Pnn) bool
-        if self.config.do_ego_predict:
-            # TODO: 나중에는 ego도 제대로 처리 ( _build_target_future_tensors_and_masks 으로 ? )
-            ego_known_mask = torch.zeros(
-                (batch_size, 1),
-                dtype=route_known_mask.dtype,
-                device=route_known_mask.device,
-            )
-            route_known_mask = torch.cat(
-                [ego_known_mask, route_known_mask],
-                dim=1,
-            )  # (B, 1+Pnn)
-        else:
-            route_known_mask = route_known_mask  # (B, Pnn)
         return (
             scene_encoding_token,
             scene_encoding_token_mask,
-            route_known_mask,
         )
 
     def _sample_inference_noise(
@@ -1710,11 +1690,8 @@ class Decoder(nn.Module):
         target_agents_past: Optional[torch.Tensor],
         scene_encoding_token: torch.Tensor,  # (B, token_num, D)
         scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
-        ego_fut_global: torch.Tensor,  # (B, D)
-        target_agents_route_lane_emb: torch.Tensor,  # (B, (1+)Pnn, D)
         target_past_cur_future_valid: torch.
         Tensor,  # (B, (1+)Pnn, time_len_total)
-        route_known_mask: torch.Tensor,  # (B, (1+)Pnn)
         target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
         target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
         inputs: Dict[str, torch.Tensor],
@@ -1734,18 +1711,9 @@ class Decoder(nn.Module):
             scene_encoding_token_mask (torch.Tensor):
                 장면 토큰 마스크.
                 - shape: (B, token_num)
-            ego_fut_global (torch.Tensor):
-                ego 미래 요약 벡터.
-                - shape: (B, D)
-            target_agents_route_lane_emb (torch.Tensor):
-                경로/차선 요약 벡터.
-                - shape: (B, (1+)Pnn, D)
             target_past_cur_future_valid (torch.Tensor):
                 과거~미래 유효 마스크.
                 - shape: (B, (1+)Pnn, time_len_total)
-            route_known_mask (torch.Tensor):
-                경로 유효 여부.
-                - shape: (B, (1+)Pnn)
             target_class_one_hot (torch.Tensor):
                 클래스 one-hot.
                 - shape: (B, (1+)Pnn, 3)
@@ -1762,11 +1730,8 @@ class Decoder(nn.Module):
         model_condition: Dict[str, Any] = {
             "target_agents_past": target_agents_past,
             "cross_c": scene_encoding_token,
-            "ego_fut_global": ego_fut_global, # TODO: remove
-            "target_agents_route_lane_emb": target_agents_route_lane_emb,
             "target_past_cur_future_valid": target_past_cur_future_valid,
             "cross_mask": scene_encoding_token_mask,
-            "route_known_mask": route_known_mask,
             "target_class_one_hot": target_class_one_hot,
             "target_current_xyyaw": target_current_xyyaw,
         }
@@ -1787,10 +1752,7 @@ class Decoder(nn.Module):
         target_agents_past: Optional[torch.Tensor],
         scene_encoding_token: torch.Tensor,
         scene_encoding_token_mask: torch.Tensor,
-        ego_fut_global: torch.Tensor,
-        target_agents_route_lane_emb: torch.Tensor,
         target_past_cur_future_valid: torch.Tensor,
-        route_known_mask: torch.Tensor,
         target_class_one_hot: torch.Tensor,
         target_current_xyyaw: torch.Tensor,
         target_past: torch.Tensor,
@@ -1808,10 +1770,7 @@ class Decoder(nn.Module):
                 target_agents_past=target_agents_past,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
-                ego_fut_global=ego_fut_global,
-                target_agents_route_lane_emb=target_agents_route_lane_emb,
                 target_past_cur_future_valid=target_past_cur_future_valid,
-                route_known_mask=route_known_mask,
                 target_class_one_hot=target_class_one_hot,
                 target_current_xyyaw=target_current_xyyaw,
                 inputs=inputs,
@@ -1830,16 +1789,10 @@ class Decoder(nn.Module):
                         target_agents_past,
                     "cross_c":
                         scene_encoding_token,
-                    "ego_fut_global":
-                        ego_fut_global, # TODO: remove
-                    "target_agents_route_lane_emb":
-                        target_agents_route_lane_emb,
                     "target_past_cur_future_valid":
                         target_past_cur_future_valid,
                     "cross_mask":
                         scene_encoding_token_mask,
-                    "route_known_mask":
-                        route_known_mask,
                     "target_class_one_hot":
                         target_class_one_hot,
                     "target_current_xyyaw":
@@ -1886,11 +1839,8 @@ class Decoder(nn.Module):
             t_tau,  # (B, future_len)
             target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             scene_encoding_token,  # (B, token_num, D)
-            ego_fut_global,  # (B, D)
-            target_agents_route_lane_emb,  # (B, (1+)Pnn, D)
             target_past_cur_future_valid,  # (B, (1+)Pnn, time_len_total)
             scene_encoding_token_mask,  # (B, token_num)
-            route_known_mask,  # (B, (1+)Pnn)
             target_class_one_hot,  # (B, (1+)Pnn, 3)
             target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             low_t_mask=low_t_mask,  # (B,)
@@ -2411,7 +2361,6 @@ class Decoder(nn.Module):
         inputs: Dict[str, torch.Tensor],
         scene_encoding_token: torch.Tensor,
         scene_encoding_token_mask: torch.Tensor,
-        route_known_mask: torch.Tensor,
         target_agents_past: torch.Tensor,
         # (B, (1+)Pnn, time_len, 11)
         target_past: torch.Tensor,
@@ -2525,10 +2474,7 @@ class Decoder(nn.Module):
                 target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
-                ego_fut_global=ego_fut_global,
-                target_agents_route_lane_emb=target_agents_route_lane_emb,
                 target_past_cur_future_valid=target_past_cur_future_valid,
-                route_known_mask=route_known_mask,
                 target_class_one_hot=target_class_one_hot,
                 target_current_xyyaw=target_current_xyyaw,
                 target_past=target_past,
@@ -2652,10 +2598,8 @@ class Decoder(nn.Module):
         (
             scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask,  # (B, token_num)
-            route_known_mask,  # (B, (1+)Pnn)
         ) = self._unpack_encoder_outputs(
             encoder_outputs=encoder_outputs,
-            batch_size=batch_size,
         )
 
         if self.training:
@@ -2679,7 +2623,6 @@ class Decoder(nn.Module):
                 inputs=inputs,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
-                route_known_mask=route_known_mask,
                 target_agents_past=target_agents_past,
                 # (B, (1+)Pnn, time_len, 11)
                 target_past=target_past,
