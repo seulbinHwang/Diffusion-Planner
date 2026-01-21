@@ -51,5 +51,5 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "wosac_test_full" \
-  --batch_size 1344 \
+  --batch_size 1248 \
   --learning_rate 3e-4
