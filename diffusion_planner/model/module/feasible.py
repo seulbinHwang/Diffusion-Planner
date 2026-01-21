@@ -207,9 +207,9 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # 아키텍처 하이퍼파라미터(고정 폭)
         # ------------------------------
-        self._Dx: int = 12  # state encoder 출력 채널 (prev/fut 각각)
-        self._Du: int = 8  # control adapter 출력 채널
-        self._Dc: int = 16  # trunk compressor 출력 채널
+        self._Dx: int = 24  # state encoder 출력 채널 (prev/fut 각각)
+        self._Du: int = 16  # control adapter 출력 채널
+        self._Dc: int = 32  # trunk compressor 출력 채널
         self._Din: int = self._Dx * 2 + self._Du + self._Dc  # 16+16+32+64=192
         self._C: int = self._Din  # 메인 채널 폭(192)
         self._eps: float = 1e-6
@@ -293,7 +293,7 @@ class FeasibleProjector(nn.Module):
         # 마지막 Linear 0-init → 초기엔 U_ref ≈ U_base
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
-        gate_hidden_dim = 32
+        gate_hidden_dim = 64
         # 소프트 게이트 s = softplus(MLP_g(Z_s))
         self.gate_mlp = nn.Sequential(
             nn.LayerNorm(self._C),

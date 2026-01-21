@@ -466,21 +466,6 @@ class DiTBlock(nn.Module):
 
         return shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa, gate_mlp_pa
 
-    def _apply_modulated_self_attention(
-            self,
-            x: torch.Tensor,  # (B, P, D)
-            attn_mask: torch.Tensor,  # (B, P) True=pad
-            shift_msa_pa: torch.Tensor,  # (B, P, D)
-            scale_msa_pa: torch.Tensor,  # (B, P, D)
-            gate_msa_pa: torch.Tensor,  # (B, P, D)
-    ) -> torch.Tensor:
-        """per‑agent 모듈레이션을 적용한 Self‑Attention 경로."""
-        modulated_x = modulate(self.norm1(x), shift_msa_pa,
-                               scale_msa_pa)  # (B, P, D)
-        msa_out = self._self_attn_flash_varlen(modulated_x,
-                                               attn_mask)  # (B, P, D)
-        x = x + gate_msa_pa * msa_out  # (B, P, D)
-        return x
 
     def _apply_modulated_mlp1(
             self,

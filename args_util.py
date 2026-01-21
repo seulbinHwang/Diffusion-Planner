@@ -487,7 +487,7 @@ def get_args():
     parser.add_argument('--decoder_depth',
                         type=int,
                         help='number of decoding layers',
-                        default=3)
+                        default=4)
     parser.add_argument('--num_heads',
                         type=int,
                         help='number of multi-head',

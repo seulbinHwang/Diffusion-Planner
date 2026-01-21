@@ -1430,7 +1430,7 @@ def model_validation(
          )
         if _is_main_process_for_logging(args):
             core_model = _unwrap_to_core_torch_module(diffusion_planner)
-            # print_param_report(core_model)
+            print_param_report(core_model)
         args._global_update_step = 0
 
         min_ade = minADE(is_active=args.min_ade_is_active).to(
@@ -1453,6 +1453,7 @@ def model_validation(
             allow_val_change=allow_val_change,
         )
         _update_validation_heartbeat_stage(args, "running validation loop")
+        raise NotImplementedError("디버그를 위해 일시 중단됨")
         run_validation_loop(
             args=args,
             diffusion_planner=diffusion_planner,
