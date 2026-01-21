@@ -174,14 +174,12 @@ class StateNormalizer:
 
 class ObservationNormalizer:
     # [ADD] 정규화에서 절대 건드리지 말아야 할 키(항상 원본 그대로 유지)
-    PASSTHROUGH_KEYS = {"agent_route_lane_order"}
 
     def __init__(self, normalization_dict):
         # [ADD] 혹시 dict 안에 들어있더라도 패스스루 키는 제거
         self._normalization_dict = {
             k: v
             for k, v in normalization_dict.items()
-            if k not in self.PASSTHROUGH_KEYS
         }
 
     @classmethod
@@ -211,8 +209,6 @@ class ObservationNormalizer:
         for k, v in data.items():
             if k in ["ego", "neighbor"]:
                 continue
-            if k in cls.PASSTHROUGH_KEYS:
-                continue
             ndt[k] = {
                 "mean": torch.tensor(v["mean"], dtype=torch.float32),
                 "std": torch.tensor(v["std"], dtype=torch.float32),
@@ -226,30 +222,36 @@ class ObservationNormalizer:
             for k, v in self._normalization_dict.items():
                 if (k not in data) or (v is None) or (data[k] is None):
                     continue
-                if k in [
-                        "ego_agent_past",
-                        "planner_future_11_dim",
-                        "neighbor_agents_past",
-                        "near_agents_past",
-                        "non_near_agents_past",
-                        "ego_agent_next_11_dim",
-                        "route_lanes",
-                        "lanes",
-                ]:
-                    mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
-                elif k in ["static_objects"]:
-                    mask = torch.sum(torch.ne(data[k][..., :6], 0), dim=-1) == 0
-                else:
-                    mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = (data[k] - v["mean"].to(
                     data[k].device)) / v["std"].to(data[k].device)
-                norm_data[k][mask] = 0
+                self._mask_invalid_data(norm_data)
             # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
             if "agent_route_lane_order" in data:
                 norm_data["agent_route_lane_order"] = data[
                     "agent_route_lane_order"].to(torch.long)
 
             return norm_data
+
+    def _mask_invalid_data(self, norm_data: dict):
+        """
+        ego_agent_past: (B, T, 11) ->
+        planner_future_11_dim : (B, F, 11) ->
+        neighbor_agents_past : (B, A_max, T, 11) ->
+        stop_sign_points : (B, N, len, 2) ->
+        crosswalk_points : (B, N, len, 2) ->
+        lanes : (B, L_max, lane_len, 12) ->
+        lanes_speed_limit : (B, L_max, 1) ->
+        static_objects : (B, S_max, 10) ->
+        route_lanes : (B, R_max, route_len_max, 12) ->
+        route_lanes_speed_limit : (B, R_max, 1) ->
+        speed_bump_points : (B, N, len, 2) ->
+        driveway_points : (B, N, len, 2) ->
+        road_edge : (B, N, len, 2) ->
+
+        near_agents_past : (B, A_near, T, 11) ->
+        non_near_agents_past : (B, A_non_near, T, 11) ->
+
+        """
 
     def inverse(self, data: dict) -> dict:
         device_type = "cuda"
