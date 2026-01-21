@@ -300,7 +300,7 @@ def _prepare_batch_for_device(
         _clip_input_axes_by_args(batch_on_device, args)
 
     # outputs 분리 (정답은 반드시 Tensor여야 함)
-    target_keys = {"ego_future_gt_3_dim", "near_future_gt_3_dim"}
+    target_keys = {"ego_future_gt_3_dim", "ego_future_gt_4_dim", "near_future_gt_3_dim", "near_future_gt_4_dim"}
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
         if key in target_keys:
@@ -309,52 +309,7 @@ def _prepare_batch_for_device(
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
             outputs[key] = value
-            if key == "ego_future_gt_3_dim":
-                # ego_future_gt_3_dim: (B, future_len, 3)
-                ego_future_gt_3_dim: torch.Tensor = value
-                ego_future_gt_4_dim = torch.cat(
-                    [
-                        ego_future_gt_3_dim[..., :2],  # (B, future_len, 2)
-                        torch.stack(
-                            [
-                                ego_future_gt_3_dim[..., 2].cos(),
-                                ego_future_gt_3_dim[..., 2].sin(),
-                            ],
-                            dim=-1,
-                        ),
-                    ],
-                    dim=-1,
-                )  # (B, future_len, 4)
-                # ego_future_mask: (B, future_len)
-                ego_future_gt_11_dim = batch_on_device.get(
-                    "planner_future_11_dim", None)
-                ego_future_mask: torch.Tensor = torch.sum(
-                    torch.ne(ego_future_gt_11_dim[..., :8], 0),
-                    dim=-1,
-                ) == 0
-                ego_future_gt_4_dim[ego_future_mask] = 0.0
-
-                # DEBUG
-                ego_future_valid = ~ego_future_mask  # (B, future_len)  True=유효
-                ego_future_valid_np = ego_future_valid.cpu().numpy()
-
-                assert_cur_future_valid_mask_np(
-                    ego_future_valid_np[None, ...],
-                    context="_prepare_batch_for_device")
-
-                ego_future_len = ego_future_gt_3_dim.shape[1]
-                assert ego_future_len == args.future_len, \
-                    f"ego future len mismatch: {ego_future_len} vs {args.future_len}"
-                outputs["ego_future_gt_4_dim"] = ego_future_gt_4_dim
-            elif key == "near_future_gt_3_dim":
-                # 3) near future 4차원 궤적 + mask 생성
-                # near_future_gt_4_dim: (B, Pnn, future_len, 4)
-                # near_future_mask:    (B, Pnn, future_len)
-                near_future_gt_4_dim, near_future_mask = \
-                    _build_near_future_4dim_and_mask(value)
-                outputs["near_future_gt_4_dim"] = near_future_gt_4_dim
-                outputs["near_future_mask"] = near_future_mask
-
+            # TODO: outputs 에, "near_future_mask" 지웠으니, 아래 코드들도 싹 지워야 함
     inputs: Dict[str, Any] = batch_on_device
     return inputs, outputs
 
@@ -975,6 +930,7 @@ def train_epoch(
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
+
             # 1) device 이동 + 상한 클리핑 + 정답 분리
             inputs, outputs = _prepare_batch_for_device(
                 batch,

@@ -516,6 +516,31 @@ class DiffusionPlannerData(Dataset):
         )
         scenario_id = str(os.path.splitext(file_name)[0])
         sample["scenario_id"] = scenario_id
+
+        # ego_future_gt_4_dim 만들기
+        ego_future_gt_3_dim = sample["ego_future_gt_3_dim"] # (future_len, 3)
+        ego_future_gt_is_valid = sample["ego_future_gt_is_valid"] # (future_len,)
+        # 3: (x, y, heading)
+        # 4: (x, y, cos(heading), sin(heading))
+        heading = ego_future_gt_3_dim[:, 2:3]  # (future_len, 1)
+        cos_heading = np.cos(heading)  # (future_len, 1)
+        sin_heading = np.sin(heading)  # (future_len, 1)
+        ego_future_gt_4_dim = np.concatenate(
+            [ego_future_gt_3_dim[:, :2], cos_heading, sin_heading], axis=-1)  # (future_len, 4)
+        ego_future_gt_4_dim[~ego_future_gt_is_valid] = 0.0
+        sample["ego_future_gt_4_dim"] = ego_future_gt_4_dim
+
+        # near_future_gt_4_dim 만들기
+        near_future_gt_3_dim = sample["near_future_gt_3_dim"] # (predicted_neighbor_num, future_len, 3)
+        near_future_gt_is_valid = sample["near_future_gt_is_valid"] # (predicted_neighbor_num, future_len)
+        heading = near_future_gt_3_dim[:, :, 2:3]  # (predicted_neighbor_num, future_len, 1)
+        cos_heading = np.cos(heading)  # (predicted_neighbor_num, future_len, 1)
+        sin_heading = np.sin(heading)  # (predicted_neighbor_num, future_len, 1)
+        near_future_gt_4_dim = np.concatenate(
+            [near_future_gt_3_dim[:, :, :2], cos_heading, sin_heading], axis=-1 )  # (predicted_neighbor_num, future_len, 4)
+        near_future_gt_4_dim[~near_future_gt_is_valid] = 0.0
+        sample["near_future_gt_4_dim"] = near_future_gt_4_dim
+
         if self.eval_method == "validation":
             tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
             tfrecord_path = os.path.join(self.data_tfrecords_dir,
