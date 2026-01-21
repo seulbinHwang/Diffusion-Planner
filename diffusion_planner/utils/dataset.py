@@ -362,8 +362,10 @@ class DiffusionPlannerData(Dataset):
 
         # 4) validation일 때 tfrecords dir 설정 (기존 로직 유지)
         if self.eval_method == "validation":
-            parent_dir = os.path.dirname(self.data_dir)
-            last_dir_name = os.path.basename(self.data_dir)
+            # self.data_dir: "/mnt/nuplan/dataset/processed"
+            parent_dir = os.path.dirname(self.data_dir)  # "/mnt/nuplan/dataset"
+            last_dir_name = os.path.basename(self.data_dir) # "processed"
+            # "/mnt/nuplan/dataset/processed_tfrecords_splitted"
             self.data_tfrecords_dir = os.path.join(
                 parent_dir, f"{last_dir_name}_tfrecords_splitted")
 
@@ -524,15 +526,3 @@ class DiffusionPlannerData(Dataset):
             sample["tfrecord_path"] = tfrecord_path
 
         return sample
-
-
-""" outputs
-
-"ego_future_gt_3_dim" : (B, future_len, 3)
-"ego_future_gt_4_dim" : (B, future_len, 4)
-
-"near_future_gt_3_dim" : (B, Pnn, future_len, 3)
-"near_future_gt_4_dim" : (B, Pnn, future_len, 4)
-"near_future_mask" : (B, Pnn, future_len) 
-
-"""

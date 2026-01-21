@@ -2120,7 +2120,8 @@ class NoPaddingDistributedEvalSampler(torch.utils.data.Sampler[int]):
     - (옵션에 따라) 끝을 잘라버리거나(drop),
     - 또는 몇 개를 복제해서 길이를 맞추는(padding) 동작을 할 수 있습니다.
 
-    평가/추론에서는 샘플이 "하나도 빠지지 않고, 중복도 없이" 정확히 1번씩 처리되어야 하는 경우가 많습니다.
+    평가/추론에서는 샘플이 "하나도 빠지지 않고, 중복도 없이"
+    정확히 1번씩 처리되어야 하는 경우가 많습니다.
     그래서 이 클래스는 아래 규칙으로만 인덱스를 나눕니다.
 
     규칙
@@ -2287,7 +2288,7 @@ def build_dataset_and_sampler(
 
     # ✅ eval/validation/test: 패딩/드랍 없는 방식
     else:
-        if eval_method_lower == "fine_tuning":
+        if eval_method_lower == "fine_tune_data_maker":
             shuffle_ = True
         else:
             shuffle_ = False

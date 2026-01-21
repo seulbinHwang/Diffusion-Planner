@@ -46,6 +46,9 @@ def add_near_agents_info_inplace(
     - (있을 때만) near_future_gt_3_dim: neighbor_future_gt_3_dim의 near 부분
     - (있을 때만) agent_route_lane_order: agent 축을 near 개수만 남기도록 "덮어씀"
     - (있을 때만) agent_route_lane_order_is_valid: agent 축을 near 개수만 남기도록 "덮어씀"
+    - (있을 때만) near_agents_past_is_valid / non_near_agents_past_is_valid
+    - (있을 때만) near_agents_is_valid / non_near_agents_is_valid
+    - (있을 때만) near_future_gt_is_valid / non_near_future_gt_is_valid
 
     입력에서 기대하는 대표 shape (샘플 1개 기준)
     ----------------------------------------
@@ -93,9 +96,6 @@ def _add_near_agents_info_for_one_sample_inplace(
 ) -> None:
     """샘플 1개 dict에 near / non-near 정보를 그 자리에서 추가합니다.
 
-    이 함수는 "샘플 1개"만 처리하는 코어 로직입니다.
-    (batch(list[dict]) 처리도 결국 이 함수를 반복 호출합니다.)
-
     Args:
         sample:
             - 단일 샘플 dict.
@@ -141,6 +141,43 @@ def _add_near_agents_info_for_one_sample_inplace(
         end=None,
     )
 
+    # --- (추가 1) neighbor_agents_past_is_valid -> near/non-near split ---
+    neighbor_agents_past_is_valid = sample.get("neighbor_agents_past_is_valid",
+                                               None)
+    if neighbor_agents_past_is_valid is not None:
+        expected_ndim = 3 if has_batch_dim else 2
+        if _get_ndim(neighbor_agents_past_is_valid) == expected_ndim:
+            sample["near_agents_past_is_valid"] = _slice_along_dim(
+                value=neighbor_agents_past_is_valid,
+                dim=agent_dim,
+                start=0,
+                end=near_num,
+            )
+            sample["non_near_agents_past_is_valid"] = _slice_along_dim(
+                value=neighbor_agents_past_is_valid,
+                dim=agent_dim,
+                start=near_num,
+                end=None,
+            )
+
+    # --- (추가 2) neighbor_agents_is_valid -> near/non-near split ---
+    neighbor_agents_is_valid = sample.get("neighbor_agents_is_valid", None)
+    if neighbor_agents_is_valid is not None:
+        expected_ndim = 2 if has_batch_dim else 1
+        if _get_ndim(neighbor_agents_is_valid) == expected_ndim:
+            sample["near_agents_is_valid"] = _slice_along_dim(
+                value=neighbor_agents_is_valid,
+                dim=agent_dim,
+                start=0,
+                end=near_num,
+            )
+            sample["non_near_agents_is_valid"] = _slice_along_dim(
+                value=neighbor_agents_is_valid,
+                dim=agent_dim,
+                start=near_num,
+                end=None,
+            )
+
     neighbor_future = sample.get("neighbor_future_gt_3_dim", None)
     if neighbor_future is not None:
         expected_ndim = 4 if has_batch_dim else 3
@@ -153,6 +190,24 @@ def _add_near_agents_info_for_one_sample_inplace(
                 dim=agent_dim,
                 start=0,
                 end=near_num,
+            )
+
+    # --- (추가 3) neighbor_future_gt_is_valid -> near/non-near split ---
+    neighbor_future_gt_is_valid = sample.get("neighbor_future_gt_is_valid", None)
+    if neighbor_future_gt_is_valid is not None:
+        expected_ndim = 3 if has_batch_dim else 2
+        if _get_ndim(neighbor_future_gt_is_valid) == expected_ndim:
+            sample["near_future_gt_is_valid"] = _slice_along_dim(
+                value=neighbor_future_gt_is_valid,
+                dim=agent_dim,
+                start=0,
+                end=near_num,
+            )
+            sample["non_near_future_gt_is_valid"] = _slice_along_dim(
+                value=neighbor_future_gt_is_valid,
+                dim=agent_dim,
+                start=near_num,
+                end=None,
             )
 
     agent_route_lane_order = sample.get("agent_route_lane_order", None)
@@ -187,25 +242,6 @@ def _add_near_agents_info_for_one_sample_inplace(
 
 def _infer_agent_dim_index_from_neighbor_agents_past(
     neighbor_agents_past: Any,) -> Optional[int]:
-    """neighbor_agents_past에서 "agent 개수"가 들어있는 방향(차원 인덱스)을 추정합니다.
-
-    지원하는 입력 shape
-    --------------
-    - 배치 없는 경우: (A, time_len, F)
-      -> agent 개수 A는 0번째 방향에 있음 (반환값 0)
-
-    - 배치 있는 경우: (B, A, time_len, F)
-      -> agent 개수 A는 1번째 방향에 있음 (반환값 1)
-
-    Args:
-        neighbor_agents_past:
-            - numpy 배열 또는 torch 텐서 또는 그와 비슷하게 shape/ndim을 가지는 값
-
-    Returns:
-        Optional[int]:
-            - 0 또는 1
-            - 위 두 형태가 아니면 None (안전하게 스킵하기 위함)
-    """
     ndim = _get_ndim(neighbor_agents_past)
     if ndim is None:
         return None
@@ -223,30 +259,6 @@ def _compute_near_num_for_sample(
     agent_dim: int,
     has_batch_dim: bool,
 ) -> int:
-    """한 샘플에서 실제로 사용할 near 개수(near_num)를 안전하게 결정합니다.
-
-    규칙
-    ----
-    1) requested_near_num = max(predicted_neighbor_num, 0)
-    2) neighbor_agents_past의 agent 개수(A)를 넘지 않도록 제한
-    3) (있으면) neighbor_future_gt_3_dim / agent_route_lane_order /
-       agent_route_lane_order_is_valid 의 agent 축 길이도 함께 고려해서,
-       가장 짧은 길이에 맞춥니다.
-
-    Args:
-        sample:
-            - 단일 샘플 dict
-        predicted_neighbor_num:
-            - near로 뽑고 싶은 최대 개수 (스칼라 int)
-        agent_dim:
-            - agent 개수가 들어있는 방향 인덱스 (0 또는 1)
-        has_batch_dim:
-            - True면 배치 차원이 있다고 보고, 각 key의 기대 ndim을 그에 맞춰 검사합니다.
-
-    Returns:
-        int:
-            - 최종 near 개수(near_num). shape: ()
-    """
     requested_near_num: int = max(0, int(predicted_neighbor_num))
 
     neighbor_agents_past = sample.get("neighbor_agents_past", None)
@@ -256,8 +268,6 @@ def _compute_near_num_for_sample(
 
     near_num: int = min(requested_near_num, int(a_len))
 
-    # 아래 키들은 "있으면" 길이를 맞추기 위해 near_num을 더 줄일 수 있음
-    # (학습 코드 _set_near_agents_info와 같은 의도)
     neighbor_future = sample.get("neighbor_future_gt_3_dim", None)
     if neighbor_future is not None:
         expected_ndim = 4 if has_batch_dim else 3
@@ -286,17 +296,6 @@ def _compute_near_num_for_sample(
 
 
 def _get_ndim(value: Any) -> Optional[int]:
-    """입력 값의 차원 수(ndim)를 안전하게 얻습니다.
-
-    Args:
-        value:
-            - numpy 배열 / torch 텐서 / 리스트 등
-
-    Returns:
-        Optional[int]:
-            - ndim을 알 수 있으면 정수
-            - value가 None이거나 shape를 얻을 수 없으면 None
-    """
     if value is None:
         return None
 
@@ -313,21 +312,6 @@ def _get_ndim(value: Any) -> Optional[int]:
 
 
 def _get_length_along_dim(value: Any, dim: int) -> Optional[int]:
-    """입력 값에서 특정 방향(dim)의 길이를 안전하게 얻습니다.
-
-    예) neighbor_agents_past가 (A, T, F)면 dim=0일 때 길이는 A입니다.
-
-    Args:
-        value:
-            - numpy 배열 / torch 텐서 / 리스트 등
-        dim:
-            - 길이를 알고 싶은 방향 인덱스
-
-    Returns:
-        Optional[int]:
-            - 성공 시: 해당 방향 길이(정수)
-            - 실패 시: None
-    """
     if value is None:
         return None
 
@@ -356,34 +340,12 @@ def _slice_along_dim(
     start: int,
     end: Optional[int],
 ) -> Any:
-    """입력 값을 특정 방향(dim) 기준으로 [start:end] 구간만 남기도록 잘라서 반환합니다.
-
-    주의
-    ----
-    - numpy 배열이나 torch 텐서면 원래 타입을 유지한 채로 자릅니다.
-    - 그 외 타입(list 등)은 numpy로 바꿔 자른 뒤 numpy 배열로 반환할 수 있습니다.
-
-    Args:
-        value:
-            - numpy 배열 / torch 텐서 / 리스트 등
-        dim:
-            - 자를 기준이 되는 방향 인덱스 (0 또는 1을 주로 사용)
-        start:
-            - 시작 인덱스
-        end:
-            - 끝 인덱스 (None이면 끝까지)
-
-    Returns:
-        Any:
-            - 잘린 결과(가능하면 입력 타입 유지)
-    """
     if value is None:
         return None
 
     start_i = max(0, int(start))
     end_i = None if end is None else int(end)
 
-    # torch 텐서
     if torch is not None and isinstance(value, torch.Tensor):
         ndim = int(value.ndim)
         if ndim <= int(dim):
@@ -392,7 +354,6 @@ def _slice_along_dim(
         slices[int(dim)] = slice(start_i, end_i)
         return value[tuple(slices)]
 
-    # numpy 배열
     if isinstance(value, np.ndarray):
         ndim = int(value.ndim)
         if ndim <= int(dim):
@@ -401,7 +362,6 @@ def _slice_along_dim(
         slices[int(dim)] = slice(start_i, end_i)
         return value[tuple(slices)]
 
-    # 그 외는 numpy로 안전 변환 후 슬라이스
     arr = np.asarray(value)
     ndim = int(arr.ndim)
     if ndim <= int(dim):

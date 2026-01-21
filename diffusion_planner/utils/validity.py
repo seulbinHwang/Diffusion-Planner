@@ -143,36 +143,6 @@ def _make_all_true_mask_from_first_dim(array: ArrayLike) -> ArrayLike:
     return np.ones((n,), dtype=bool)
 
 
-def _compute_agent_level_valid_from_future_gt_3(
-    future_gt_3: ArrayLike,) -> ArrayLike:
-    """(A, future_len, 3) 미래 궤적에서 agent별 유효 여부(A,)를 만듭니다.
-
-    규칙:
-      - 한 agent의 (future_len, 3)이 전부 0이면 False
-      - 어디든 하나라도 값이 있으면 True
-
-    Args:
-        future_gt_3: np.ndarray 또는 torch.Tensor. shape: (A, future_len, 3)
-
-    Returns:
-        agent_valid: shape: (A,)
-    """
-    if int(getattr(future_gt_3, "ndim", 0)) != 3 or int(
-            future_gt_3.shape[-1]) != 3:
-        raise ValueError(
-            f"future_gt_3 must have shape (A, future_len, 3). got shape={getattr(future_gt_3, 'shape', None)}"
-        )
-
-    # per_step_valid: shape (A, future_len)
-    per_step_valid = _compute_valid_mask_from_prefix_nonzero(future_gt_3,
-                                                             prefix_dim=3)
-
-    if isinstance(per_step_valid, torch.Tensor):
-        return torch.any(per_step_valid, dim=-1).to(dtype=torch.bool)
-
-    return np.any(per_step_valid, axis=-1).astype(bool)
-
-
 def build_validity_key_dict(
     sample: Mapping[str, Any],
     *,
@@ -263,17 +233,22 @@ def build_validity_key_dict(
         )
 
     # ---------- e: neighbor_future_gt_is_valid ----------
-    neighbor_future_3 = _get_first_non_none_value(sample,
-                                                  ["neighbor_future_gt_3_dim"])
+    neighbor_future_3 = _get_first_non_none_value(
+        sample,
+        ["neighbor_future_gt_3_dim"],
+    )
     if neighbor_future_3 is None or (not _is_array_like(neighbor_future_3)):
         _set_or_skip(out, "neighbor_future_gt_is_valid", None)
     else:
         # neighbor_future_3: shape (A, future_len, 3)
+        # per_step_valid: shape (A, future_len)
         _set_or_skip(
             out,
             "neighbor_future_gt_is_valid",
-            _compute_agent_level_valid_from_future_gt_3(
-                neighbor_future_3),  # shape (A,)
+            _compute_valid_mask_from_prefix_nonzero(
+                neighbor_future_3,
+                prefix_dim=3,
+            ),
         )
 
     # ---------- f: stop_sign_is_valid ----------

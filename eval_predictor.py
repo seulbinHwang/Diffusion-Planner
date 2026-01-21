@@ -1387,7 +1387,7 @@ def model_validation(
             args,
             args.eval_set,
             args.eval_set_list,
-            args.eval_method,
+            args.eval_method, #
             world_size,
             global_rank,
         )
@@ -1453,7 +1453,6 @@ def model_validation(
             allow_val_change=allow_val_change,
         )
         _update_validation_heartbeat_stage(args, "running validation loop")
-        raise NotImplementedError("디버그를 위해 일시 중단됨")
         run_validation_loop(
             args=args,
             diffusion_planner=diffusion_planner,
@@ -1967,6 +1966,16 @@ def validation_epoch(
             disable=(not should_show_progress),
     ) as data_epoch:
         for batch_idx, batch in enumerate(data_epoch, start=1):
+            for key, value in batch:
+                print("[DEBUG] train_epoch batch key:", key)
+                if isinstance(value, torch.Tensor):
+                    print("        shape:", tuple(value.shape),
+                          " dtype:", value.dtype)
+                elif isinstance(value, list):
+                    print("        list of length:", len(value))
+                else:
+                    print("        type:", type(value))
+            raise RuntimeError("Debug break")
             _set_validation_batch_progress_in_args(args, batch_idx,
                                                    total_batch_steps)
             _update_validation_heartbeat_stage(

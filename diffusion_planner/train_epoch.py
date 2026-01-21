@@ -930,7 +930,6 @@ def train_epoch(
     ema: Optional[object],
     scheduler,
     batch_num_in_all_epoch: int,
-    aug: Optional[StatePerturbation] = None,
 ) -> Tuple[Dict[str, float], float]:
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행한다.
 

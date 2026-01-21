@@ -743,35 +743,6 @@ def _dump_args(
     )
 
 
-def _build_augmentation(args: argparse.Namespace,) -> Optional[object]:
-    """ego / npc 궤적에 사용할 데이터 증가(augmentation) 객체를 만든다.
-
-    Args:
-        args: 학습 설정이 들어 있는 argparse.Namespace.
-
-    Returns:
-        aug: StatePerturbation 또는 NPCStatePerturbation, 사용 안 하면 None.
-    """
-    if args.use_ego_data_augment and args.use_npc_data_augment:
-        raise ValueError(
-            "You cannot use both ego and npc data augmentation at the same time. "
-        )
-
-    if args.use_ego_data_augment:
-        aug = StatePerturbation(
-            augment_prob=args.augment_prob,
-            device=args.device,
-        )
-    elif args.use_npc_data_augment:
-        aug = NPCStatePerturbation(
-            augment_prob=args.augment_prob,
-            device=args.device,
-        )
-    else:
-        aug = None
-
-    return aug
-
 
 def _compute_warmup_steps(
     args: argparse.Namespace,
@@ -1246,7 +1217,6 @@ def _train_one_epoch(
     scheduler: Any,
     args: argparse.Namespace,
     model_ema: Optional[ModelEma],
-    aug: Optional[object],
     batch_num_in_all_epoch: int,
 ) -> Tuple[Dict[str, float], float, float]:
     """하나의 epoch 동안 학습을 실행하고, 손실과 걸린 시간을 계산한다.
@@ -1260,7 +1230,6 @@ def _train_one_epoch(
         scheduler: 학습률 스케줄러.
         args: 학습 설정.
         model_ema: EMA 래퍼 또는 None.
-        aug: augmentation 객체(StatePerturbation/NPCStatePerturbation 등) 또는 None.
 
     Returns:
         train_loss: key별 epoch 평균 손실 딕셔너리. 각 값은 scalar float.
@@ -1304,7 +1273,6 @@ def _train_one_epoch(
         model_ema,
         scheduler,
         batch_num_in_all_epoch,
-        aug,
     )
 
     if args.device.startswith('cuda'):
@@ -1981,7 +1949,6 @@ def _run_training_loop(
     init_epoch: int,
     data_num_in_a_epoch: int,
     global_batch_size: int,
-    aug: Optional[object],
 ) -> float:
     """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
     elapsed_training_time_hour: float = 0.0
@@ -2004,7 +1971,6 @@ def _run_training_loop(
             scheduler=scheduler,
             args=args,
             model_ema=model_ema,
-            aug=aug,
             batch_num_in_all_epoch=batch_num_in_all_epoch,
         )
 
@@ -2158,10 +2124,8 @@ def model_training(
     # 2) seed 고정
     set_seed(args.seed + global_rank)
 
-    # 3) augmentation, Dataset, Sampler
+    # Dataset, Sampler
     batch_size = args.batch_size
-    aug = _build_augmentation(args)
-    _ = aug
     """
     train_set: DiffusionPlannerData
     train_sampler: DistributedSampler
@@ -2329,7 +2293,6 @@ def model_training(
         init_epoch=init_epoch,
         data_num_in_a_epoch=data_num_in_a_epoch,
         global_batch_size=global_batch_size,
-        aug=aug,
     )
 
     _finalize_training_cleanup(

@@ -189,9 +189,10 @@ taskset -c "${CPUSET}" \
  --port 23001 \
   --eval_set "$EVAL_SET_PATH" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
+  --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "amortized_fine_tuning_lr_2e5" \
-  --name "amortized_fine_tuning_lr_2e5" \
+  --load_name "wosac_test_full" \
+  --name "wosac_test_full" \
   --eval_method "validation" \
   --batch_size 1 \
   --use_deepspeed True \
@@ -208,4 +209,3 @@ taskset -c "${CPUSET}" \
   --use_amortized_diffusion True
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
-#  --resume_wandb_model_name latest \
