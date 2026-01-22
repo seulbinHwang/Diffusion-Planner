@@ -147,7 +147,8 @@ def _prepare_batch_for_device(
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
         if key in target_keys:
-            value = batch_on_device.pop(key)
+            value = batch_on_device[key]
+            # value = batch_on_device.pop(key)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
