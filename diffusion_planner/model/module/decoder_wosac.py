@@ -3212,19 +3212,21 @@ class DiT(nn.Module):
                 max_window_len_yaw,  # int
             ) = self.feasible_projector.get_feasible_stride_params(future_len)
             # 역정규화 현재+미래 궤적 및 현재 상태
+            target_cur_future_valid = target_past_cur_future_valid[:, :, -future_len:] # (B, Pnn, 1+T) bool
             unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
-                diffusion_trajectory)  # (B, Pnn, 1+T, 4)
+                diffusion_trajectory, target_cur_future_valid)  # (B, Pnn, 1+T, 4)
             unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
                                                                     0, :]  # (B, Pnn, 4)
 
             # 과거 xy-yaw (정규화/역정규화) 준비
+            target_past_valid = target_past_cur_future_valid[:, :,
+                                                             : -future_len - 1]  # (B, Pnn, past_len) bool
             if target_past is not None and target_past.numel() > 0:
-                near_past_xyyaw = target_past[..., :4]  # (B, Pnn, past_len, 4)
-                unnorm_near_past_xyyaw = self.config.state_normalizer.inverse(
-                    near_past_xyyaw)  # (B, Pnn, past_len, 4)
+                target_past_xyyaw = target_past[..., :4]  # (B, Pnn, past_len, 4)
+                unnorm_target_past_xyyaw = self.config.state_normalizer.inverse(
+                    target_past_xyyaw, target_past_valid)  # (B, Pnn, past_len, 4)
             else:
-                near_past_xyyaw = None
-                unnorm_near_past_xyyaw = None
+                unnorm_target_past_xyyaw = None
 
             # --- (1) stride 기준 다운샘플 궤적/마스크 생성 ---
             (
@@ -3240,7 +3242,7 @@ class DiT(nn.Module):
                 target_past=target_past,
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 unnorm_diffusion_trajectory=unnorm_diffusion_trajectory,
-                unnorm_near_past_xyyaw=unnorm_near_past_xyyaw,
+                unnorm_near_past_xyyaw=unnorm_target_past_xyyaw,
                 stride_step=stride_step,
             )
 
@@ -3337,8 +3339,9 @@ class DiT(nn.Module):
                 )
 
             # 정규화해서 DiTReturns 로 저장
+            target_future_valid = target_cur_future_valid[:, :, 1:]  # (B, Pnn, future_len) bool
             integrated_trajectory = self.config.state_normalizer(
-                unnorm_integrated_trajectory)  # (B, Pnn, future_len, 4)
+                unnorm_integrated_trajectory, target_future_valid)  # (B, Pnn, future_len, 4)
             near_future_mask = target_cur_future_valid[:, :,
                                                        1:]  # (B, Pnn, future_len) bool
             integrated_trajectory = integrated_trajectory.masked_fill(
