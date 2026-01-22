@@ -966,8 +966,9 @@ target_current_mask: torch.Tensor,  # [B, (1+)Pnn]  (True=무효)
     shift_final = shift_time + k_final_sh * shift_base  # [B,(1+)Pnn,H]
 
     # 무효 에이전트는 모두 0으로 정리
-    delta_scale_final = delta_scale_final.masked_fill(target_current_mask, 0.0)
-    shift_final = shift_final.masked_fill(target_current_mask, 0.0)
+    target_current_mask = target_current_mask.to(torch.bool)
+    delta_scale_final = delta_scale_final.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+    shift_final = shift_final.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
     # LN → (1+Δs) ⊙ · + b → Linear
     y = final_norm(x)  # [B,(1+)Pnn,H]
