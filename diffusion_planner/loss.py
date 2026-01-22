@@ -269,10 +269,11 @@ def _sample_diffusion_time_and_noise(
     Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
     eps: float,
     args: Any,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """미래 궤적 크기에 맞춰 diffusion time 과 노이즈를 샘플링한다."""
     device_ = normed_target_cur_future_gt_4_dim.device
     B: int = normed_target_cur_future_gt_4_dim.shape[0]
+    one_Pnn = normed_target_cur_future_gt_4_dim.shape[1]
     one_future_len: int = int(normed_target_cur_future_gt_4_dim.shape[2])
     future_len = one_future_len - 1
 
@@ -284,39 +285,38 @@ def _sample_diffusion_time_and_noise(
             one_future_len,
             device=device_,
             dtype=torch.float32,
-        )  # (T,)
+        )  # (T,) # [ 1, 2, ..., T ]
 
         t_tau = tau / float(future_len)  # (T,) = [1/T, 2/T, ..., 1]
 
-        # ✅ [수정] 정확히 t=1을 피해서 수치 리스크를 줄임 (일반 모드도 t=1은 안 씀)
+        # 정확히 t=1을 피해서 수치 리스크를 줄임 (일반 모드도 t=1은 안 씀)
         t_max: float = max(1.0 - float(eps), 0.0)
         t_tau = torch.clamp(t_tau, max=t_max)  # (T,)
 
         batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(
             B, -1)  # (B, T)
-
         low_t_mask = torch.ones(B, dtype=torch.bool, device=device_)
-        low_t_mask_bt = low_t_mask.view(B, 1, 1)
-
     else:
         batch_diffusion_time: torch.Tensor = (torch.rand(
             B,
             device=device_,
             dtype=torch.float32,
-        ) * (1 - eps) + eps)
+        ) * (1 - eps) + eps) # (B,)
 
         t_threshold: float = float(args.feasible_learn_noise_thresh)
         if not getattr(args, "use_direct_loss", False):
             t_threshold = 1.0
 
         low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
-        low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
 
-    random_noise: torch.Tensor = torch.randn_like(
-        normed_target_cur_future_gt_4_dim,
+    # random_noise : (B, (1+)Pnn, future_len, 4)
+    # **평균이 0이고 표준편차가 1인 “정규분포(가우시안)”**에서 뽑은 무작위 숫자
+    random_noise: torch.Tensor = torch.randn(
+        (B, one_Pnn, future_len, 4),
         device=device_,
+        dtype=normed_target_cur_future_gt_4_dim.dtype,
     )
-    return batch_diffusion_time, low_t_mask, low_t_mask_bt, random_noise
+    return batch_diffusion_time, low_t_mask, random_noise
 
 
 def _normalize_futures_and_build_xT(
@@ -350,12 +350,10 @@ def _normalize_futures_and_build_xT(
     mean : (B, (1+)Pnn, future_len, 4)
     std : (B, 1, 1, 1) or (B, 1, future_len, 1)
     """
-    mean = _require_finite("marginal_prob mean", mean)
-    std = _require_finite("marginal_prob std", std)
     assert std.ndim == 4, "std_raw must be (B, _, _, _)"
-
+    # target_future_is_valid: (B, (1+)Pnn, future_len)
     target_future_is_valid = target_cur_future_is_valid[:, :,
-                                                        1:]  # (B, (1+)Pnn, future_len)
+                                                        1:]
     # target_future_noise_xT: (B, (1+)Pnn, future_len, 4)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
     target_future_noise_xT[~target_future_is_valid] = 0.0
@@ -382,35 +380,9 @@ def _forward_model_with_autocast(
 ) -> Dict[str, torch.Tensor]:
     """모델 입력 dict 를 만들고 AMP 로 forward 를 수행한다.
 
-    Args:
-        model: 학습 중인 모델.
-        norm_inputs: 정규화된 관측 dict.
-            ego_agent_past : (B, time_len, 11) #
-            ego_future_gt_3_dim : (B, future_len, 3)
-            neighbor_agents_past : (B, agent_num, time_len, 11) #
-            lanes : (B, lane_num, lane_len, 12) #
-            lanes_speed_limit : (B, lane_num, 1) #
-            lanes_has_speed_limit : (B, lane_num, 1) #
-            route_lanes : (B, route_num, route_len, 12)
-            route_lanes_speed_limit : (B, route_num, 1)
-            route_lanes_has_speed_limit : (B, route_num, 1)
-            static_objects : (B, static_num, 10) #
-            near_future_gt_3_dim: (B, Pnn, future_len, 3)
-            planner_future_11_dim: (B, future_len, 11) #
-            agent_route_lane_order: (B, agent_num, lane_num)
-
-        target_future_valid: (B, (1 +) Pnn, future_len) 미래 유효 마스크.
-        target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재+미래 x_T.
-        batch_diffusion_time: (B,) or (B, T) diffusion 시간.
-        cond_last_pos_norm: (B, (1+)Pnn, 4) cond 용 마지막 위치.
-
     Returns:
         decoder_output: model 의 두 번째 반환값 dict.
 
-
-        "near_future_valid": near_future_valid,  # (B, Pnn, future_len)
-        "near_cur_future_norm_xT":
-            near_cur_future_norm_xT,  # (B, Pnn, 1+future_len, 4)
     """
     merged_inputs: Dict[str, torch.Tensor] = {
         **norm_inputs,
@@ -538,7 +510,7 @@ def _compute_integration_and_constraint_losses(
     decoder_output: Dict[str, torch.Tensor],
     normed_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
-    low_t_mask_bt: torch.Tensor,  # (B, 1, 1)
+    low_t_mask_3_ndim: torch.Tensor,  # (B, 1, 1)
     w_t: torch.Tensor,  # (1, 1, T)
     base_loss: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
@@ -550,7 +522,7 @@ def _compute_integration_and_constraint_losses(
     Args:
         normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
         target_future_valid: ((B, (1 +) Pnn, future_len)
-        low_t_mask_bt: (B, 1, 1)
+        low_t_mask_3_ndim: (B, 1, 1)
         w_t: (1, 1, T)
 
     Returns:
@@ -559,7 +531,7 @@ def _compute_integration_and_constraint_losses(
         integrated_trajectory: (B, (1+)Pnn, T, 4) 또는 None
         control_constraint_diff: (B, (1+)Pnn, T, 3) 또는 None
     """
-    valid_low = target_future_valid & low_t_mask_bt  # (B, (1 +) Pnn, future_len) bool
+    valid_low = target_future_valid & low_t_mask_3_ndim  # (B, (1 +) Pnn, future_len) bool
     valid_low_f = valid_low.float()
 
     integrated_trajectory: Optional[torch.Tensor] = None
@@ -790,23 +762,27 @@ def diffusion_loss_func(
     
     # batch_diffusion_time: # (B,) or (B, future_len)
     # low_t_mask: (B,)
-    # low_t_mask_bt: (B,1,1)
     # random_noise: (B, (1+)Pnn, future_len, 4)
     """
-    (batch_diffusion_time, low_t_mask, low_t_mask_bt,
+    (batch_diffusion_time, low_t_mask,
      random_noise) = _sample_diffusion_time_and_noise(
          normed_target_cur_future_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
          eps,
          args,
      )
+    # low_t_mask_3_ndim: (B,1,1)
+    low_t_mask_3_ndim: torch.Tensor = low_t_mask.view(B, 1, 1)
+    # normed_target_cur_future_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
+    """
     # normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4)
     # normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
     # cond_last_pos_norm: (B, (1+)Pnn, 4)
+    """
     (normed_target_cur_gt_4_dim, normed_target_future_gt_4_dim,
      cond_last_pos_norm) = _split_normed_target_cur_future_gt_4_dim(
          normed_target_cur_future_gt_4_dim)
     """
-        target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재+미래 x_T 샘플.
+        target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재 GT + 미래 x_T
         std: (B, 1, 1, 1) 노이즈 표준편차
     """
     (target_cur_future_norm_xT, std) = _normalize_futures_and_build_xT(
@@ -829,7 +805,7 @@ def diffusion_loss_func(
         batch_diffusion_time=batch_diffusion_time,  # (B,) or (B, future_len)
         low_t_mask=low_t_mask,  # (B,)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
-        use_deepspeed=getattr(args, "use_deepspeed", False),
+        use_deepspeed=args.use_deepspeed,
     )
 
     # score:  (B, one_or_Pnn, future_len, 4)
@@ -897,7 +873,7 @@ def diffusion_loss_func(
              normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
              target_future_valid=
              target_future_valid,  # (B, (1 +) Pnn, future_len)
-             low_t_mask_bt=low_t_mask_bt,  # (B,1,1)
+             low_t_mask_3_ndim=low_t_mask_3_ndim,  # (B,1,1)
              w_t=w_t,  # (1, 1, future_len)
              base_loss=loss_val,
          )
