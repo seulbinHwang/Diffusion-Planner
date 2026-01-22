@@ -140,7 +140,8 @@ def build_target_future_tensors_and_masks(
     ).to(device=near_cur_future_gt_is_valid.device)
     # target_cur_future_is_valid: (B, 1 + Pnn, 1 + future_len)
     target_cur_future_is_valid: torch.Tensor = torch.cat(
-        [ego_cur_future_is_valid, near_cur_future_gt_is_valid],
+        [ego_cur_future_is_valid.unsqueeze(1)
+            , near_cur_future_gt_is_valid],
         dim=1,
     )
 
