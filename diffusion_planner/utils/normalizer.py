@@ -274,7 +274,8 @@ class ObservationNormalizer:
             "non_near_agents_past_is_valid"]  # (B, A_non_near, T)
         norm_data["non_near_agents_past"][~non_near_agents_past_is_valid] = 0
 
-    def inverse(self, data: dict) -> dict:
+    def inverse(self, data: dict, use_masking: bool = True
+                ) -> dict:
         device_type = "cuda"
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
@@ -285,7 +286,8 @@ class ObservationNormalizer:
                     continue
                 norm_data[k] = data[k] * v["std"].to(
                     data[k].device) + v["mean"].to(data[k].device)
-                self._mask_invalid_data(norm_data)
+                if use_masking:
+                    self._mask_invalid_data(norm_data)
 
             # 패스스루 키는 원본 그대로 (정수 유지)
             if "agent_route_lane_order" in data:
