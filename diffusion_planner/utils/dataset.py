@@ -607,13 +607,5 @@ class DiffusionPlannerData(Dataset):
                 # raise FileNotFoundError(
                 #     f"TFRecords file not found: {tfrecord_path}")
             # sample["tfrecord_path"] = tfrecord_path
-        print(f"---------[DiffusionPlannerData]--------------")
-        for k, v in sample.items():
-            if isinstance(v, np.ndarray):
-                print(f"[Collate] key={k}, shape={v.shape}, dtype={v.dtype}")
-            elif isinstance(v, list):
-                print(f"[Collate] key={k}, List[str], length={len(v)}")
-            else:
-                print(f"[Collate] key={k}, value=None")
-        print("===============================================")
+
         return sample

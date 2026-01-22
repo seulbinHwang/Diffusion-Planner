@@ -721,6 +721,15 @@ def _split_normed_target_cur_future_gt_4_dim(
                                                                          -1, :]
     return normed_target_cur_gt_4_dim, normed_target_future_gt_4_dim, cond_last_pos_norm
 
+def _get_near_cur_future_gt_is_valid(norm_inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+    # norm_near_current_4_dim: (B, Pnn, 4)
+    near_future_gt_is_valid = norm_inputs[
+        "near_future_gt_is_valid"]  # (B, Pnn, future_len)
+    near_agents_is_valid = norm_inputs["near_agents_is_valid"]  # (B, Pnn)
+    near_cur_future_gt_is_valid = torch.cat(
+        (near_agents_is_valid.unsqueeze(-1), near_future_gt_is_valid),
+        dim=-1)  # (B, Pnn, 1 + future_len)
+    return near_cur_future_gt_is_valid
 
 def diffusion_loss_func(
     args: Any,
@@ -737,14 +746,6 @@ def diffusion_loss_func(
     eps: float = 1e-3,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     """diffusion 학습에 쓰이는 전체 손실을 계산한다.
-
-    처리 흐름:
-      1) 미래 궤적/마스크, 정규화 입력을 안전하게 준비.
-      2) 현재 상태와 미래를 이어 붙인 시퀀스를 만들고, diffusion time/노이즈 샘플링.
-      3) SDE marginal_prob 를 통해 x_T 샘플 생성 후, 모델 forward.
-      4) 기본 diffusion 손실(dpm_loss) + half-life 시간 가중 평균.
-      5) x_start 모드일 때 통합 궤적/제어 제약 손실, xy/yaw 통계까지 loss dict 에 추가.
-
     Args:
         args: 학습 설정/옵션이 들어 있는 객체.
         model: 학습 중인 모델(Diffusion_Planner 또는 DDP 래퍼).
@@ -764,17 +765,10 @@ def diffusion_loss_func(
     # norm_inputs 의 각 텐서 NaN/Inf 체크
     norm_inputs = _sanitize_norm_inputs(norm_inputs)
 
-    # 기본 크기 정보
-    # 미래/현재 마스크 및 현재 상태 준비
-    # norm_near_current_4_dim: (B, Pnn, 4)
-    near_future_gt_is_valid = norm_inputs[
-        "near_future_gt_is_valid"]  # (B, Pnn, future_len)
-    near_agents_is_valid = norm_inputs["near_agents_is_valid"]  # (B, Pnn)
-    near_cur_future_gt_is_valid = torch.cat(
-        (near_agents_is_valid.unsqueeze(-1), near_future_gt_is_valid),
-        dim=-1)  # (B, Pnn, 1 + future_len)
-    near_agents_past = norm_inputs["near_agents_past"]  # (B, Pnn, time_len, 11)
-    norm_near_current_4_dim = near_agents_past[:, :, -1, :4]  # (B, Pnn, 4)
+    # near_cur_future_gt_is_valid : (B, Pnn, 1 + future_len)
+    near_cur_future_gt_is_valid = _get_near_cur_future_gt_is_valid(norm_inputs)
+    # norm_near_current_4_dim : (B, Pnn, 4)
+    norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
     (
         normed_target_cur_future_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
         target_cur_future_is_valid,  # (B, (1+)Pnn, 1+future_len)

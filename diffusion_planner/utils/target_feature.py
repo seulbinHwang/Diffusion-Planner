@@ -65,16 +65,6 @@ def build_target_future_tensors_and_masks(
     - args.do_ego_predict == False:
         * 이웃(neighbor)만 그대로 사용합니다.
 
-    Args:
-        args: 설정 객체. `args.do_ego_predict`를 사용합니다.
-        norm_inputs: 정규화된 입력 dict.
-            - "ego_future_gt_11_dim": (B, future_len, 11)
-            - "ego_agent_past": (B, time_len, 11)
-        normed_ego_future_gt_4_dim: (B, future_len, 4) ego 미래 정답(x,y,cos,sin).
-        normed_near_future_gt_4_dim: (B, Pnn, future_len, 4) 이웃 미래 정답.
-        near_cur_future_gt_is_valid: (B, Pnn, 1+future_len) 이웃 현재+미래 마스크(True=유효).
-        norm_near_current_4_dim: (B, Pnn, 4) 이웃 현재 상태(정규화).
-
     Returns:
         normed_target_cur_future_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
         target_cur_future_is_valid:
@@ -102,6 +92,7 @@ def build_target_future_tensors_and_masks(
     # ego + 이웃을 함께 학습 대상에 포함
     # ----------------------------
 
+    ############## 미래 위치 텐서 만들기 ##############
     # (B, 1, future_len, 4)
     normed_ego_future_gt_4_dim_ = normed_ego_future_gt_4_dim.unsqueeze(1).to(
         dtype=normed_near_future_gt_4_dim.dtype,
@@ -112,6 +103,7 @@ def build_target_future_tensors_and_masks(
         [normed_ego_future_gt_4_dim_, normed_near_future_gt_4_dim],
         dim=1,
     )
+    ############## 현재 위치 텐서 만들기 ##############
     # ego_agent_past: (B, time_len, 11)
     ego_agent_past: torch.Tensor = norm_inputs["ego_agent_past"]
     # ego_cur_gt_11_dim: (B, 1, 11)
@@ -126,6 +118,7 @@ def build_target_future_tensors_and_masks(
         [ego_current_xyyaw_norm, norm_near_current_4_dim],
         dim=1,
     )
+    ########### 현재 + 미래 위치 텐서 만들기 ##############
     normed_target_cur_future_gt_4_dim = torch.cat(
         [
             target_current_xyyaw_norm.unsqueeze(2),  # (B, 1 + Pnn, 1, 4)
@@ -133,7 +126,7 @@ def build_target_future_tensors_and_masks(
         ],
         dim=2,
     )
-
+    ############### 유효 마스크 만들기 ##############
     # ego_future_gt_is_valid: (B, future_len)  True=유효
     ego_future_gt_is_valid = norm_inputs["ego_future_gt_is_valid"]
     # ego_agent_past_is_valid: (B, time_len)  True=유효
