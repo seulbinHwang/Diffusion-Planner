@@ -28,6 +28,8 @@ def _move_batch_to_device(
     device: str,
 ) -> Dict[str, Any]:
     """배치 dict에서 torch.Tensor만 device로 옮기고, 나머지(None 포함)는 그대로 둔다."""
+    agent_route_lane_order_agent_num = None
+    neighbor_agents_agent_num = None
     batch_on_device: Dict[str, Any] = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
@@ -39,174 +41,12 @@ def _move_batch_to_device(
                 batch_on_device[key].shape[1])
         elif key == "neighbor_agents_past":
             neighbor_agents_agent_num = int(batch_on_device[key].shape[1])
-    assert agent_route_lane_order_agent_num == neighbor_agents_agent_num, \
-        f"agent_route_lane_order agent num ({agent_route_lane_order_agent_num}) " \
-        f"!= neighbor_agents_past agent num ({neighbor_agents_agent_num})"
+    if agent_route_lane_order_agent_num is not None and neighbor_agents_agent_num is not None:
+        assert agent_route_lane_order_agent_num == neighbor_agents_agent_num, \
+            f"agent_route_lane_order agent num ({agent_route_lane_order_agent_num}) " \
+            f"!= neighbor_agents_past agent num ({neighbor_agents_agent_num})"
     return batch_on_device
 
-
-def _clip_axis1_for_key_inplace(
-    batch_on_device: Dict[str, torch.Tensor],
-    key: str,
-    keep_len: int,
-) -> None:
-    """배치 텐서에서 '두 번째 축(axis=1)' 길이를 keep_len으로 안전하게 줄입니다.
-
-    왜 필요한가
-    ----------
-    어떤 그룹의 "개수"를 줄일 때(예: agent 수, lane 수),
-    그 그룹과 짝으로 움직여야 하는 *_is_valid 텐서도 같은 개수로 줄지 않으면
-    이후 연산에서 shape가 안 맞아서 오류가 나거나, 마스크가 엉뚱한 객체를 가리킬 수 있습니다.
-
-    동작 규칙
-    --------
-    - batch_on_device에 key가 없으면 아무 것도 하지 않습니다.
-    - keep_len <= 0이면 아무 것도 하지 않습니다.
-    - 텐서 차원이 2 미만이면(axis=1이 없으면) 아무 것도 하지 않습니다.
-    - 이미 axis=1 길이가 keep_len 이하이면 아무 것도 하지 않습니다.
-    - 위 조건을 통과하면, 해당 텐서를 [:, :keep_len, ...] 형태로 잘라서 다시 넣습니다.
-
-    Args:
-        batch_on_device (Dict[str, torch.Tensor]):
-            배치 dict. 각 텐서는 보통 (B, N, ...) 형태입니다.
-            예:
-              - neighbor_agents_is_valid: (B, A)
-              - lanes_is_valid: (B, L)
-              - lanes_len_is_valid: (B, L, P)
-        key (str):
-            자를 대상 key 이름.
-        keep_len (int):
-            axis=1에서 남길 길이.
-            예: agent를 A'개만 남기면 keep_len=A'
-
-    Returns:
-        None
-    """
-    if keep_len <= 0:
-        return
-    if key not in batch_on_device:
-        return
-
-    t = batch_on_device[key]
-    if not isinstance(t, torch.Tensor):
-        return
-    if t.dim() < 2:
-        return
-
-    current_len = int(t.shape[1])
-    if keep_len >= current_len:
-        return
-
-    # t: (B, N, ...) -> (B, keep_len, ...)
-    batch_on_device[key] = t[:, :keep_len, ...]
-
-
-def _clip_axis1_for_keys_inplace(
-    batch_on_device: Dict[str, torch.Tensor],
-    keys: List[str],
-    keep_len: int,
-) -> None:
-    """여러 key에 대해 axis=1 길이를 동일하게 맞춰 안전하게 줄입니다.
-
-    Args:
-        batch_on_device (Dict[str, torch.Tensor]):
-            배치 dict.
-        keys (List[str]):
-            함께 길이를 맞춰 잘라야 하는 key 목록.
-        keep_len (int):
-            axis=1에서 남길 길이.
-
-    Returns:
-        None
-    """
-    for k in keys:
-        _clip_axis1_for_key_inplace(batch_on_device=batch_on_device,
-                                    key=k,
-                                    keep_len=keep_len)
-
-
-def _clip_input_axes_by_args(
-    batch_on_device: Dict[str, Any],
-    args: argparse.Namespace,
-) -> None:
-    if getattr(args, "do_not_clip", False):
-        return
-
-    # 1) neighbor_agents_past
-    max_agent_num = int(getattr(args, "max_agent_num", 0))
-    neighbor_agents_past = batch_on_device.get("neighbor_agents_past", None)
-    if isinstance(neighbor_agents_past, torch.Tensor
-                 ) and max_agent_num > 0 and neighbor_agents_past.dim() == 4:
-        keep_agents = min(max_agent_num, int(neighbor_agents_past.shape[1]))
-        _clip_axis1_for_key_inplace(batch_on_device, "neighbor_agents_past",
-                                    keep_agents)
-        _clip_axis1_for_keys_inplace(
-            batch_on_device=batch_on_device,
-            keys=[
-                "neighbor_agents_past_is_valid", "neighbor_agents_is_valid",
-                "neighbor_future_gt_is_valid"
-            ],
-            keep_len=keep_agents,
-        )
-
-    # 2) lanes
-    max_lane_num = int(getattr(args, "max_lane_num", 0))
-    lanes = batch_on_device.get("lanes", None)
-    if isinstance(lanes,
-                  torch.Tensor) and max_lane_num > 0 and lanes.dim() == 4:
-        keep_lanes = min(max_lane_num, int(lanes.shape[1]))
-        if keep_lanes < int(lanes.shape[1]):
-            batch_on_device["lanes"] = lanes[:, :keep_lanes, :, :]
-            _clip_axis1_for_key_inplace(batch_on_device, "lanes_speed_limit",
-                                        keep_lanes)
-            _clip_axis1_for_key_inplace(batch_on_device,
-                                        "lanes_has_speed_limit", keep_lanes)
-            _clip_axis1_for_keys_inplace(
-                batch_on_device=batch_on_device,
-                keys=["lanes_len_is_valid", "lanes_is_valid"],
-                keep_len=keep_lanes,
-            )
-
-    # 3) route_lanes
-    route_lanes = batch_on_device.get("route_lanes", None)
-    if isinstance(route_lanes,
-                  torch.Tensor) and max_lane_num > 0 and route_lanes.dim() == 4:
-        keep_route_lanes = min(max_lane_num, int(route_lanes.shape[1]))
-        if keep_route_lanes < int(route_lanes.shape[1]):
-            batch_on_device[
-                "route_lanes"] = route_lanes[:, :keep_route_lanes, :, :]
-            _clip_axis1_for_key_inplace(batch_on_device,
-                                        "route_lanes_speed_limit",
-                                        keep_route_lanes)
-            _clip_axis1_for_key_inplace(batch_on_device,
-                                        "route_lanes_has_speed_limit",
-                                        keep_route_lanes)
-            _clip_axis1_for_keys_inplace(
-                batch_on_device=batch_on_device,
-                keys=["route_lanes_len_is_valid", "route_lanes_is_valid"],
-                keep_len=keep_route_lanes,
-            )
-
-    # 4) agent_route_lane_order
-    arl = batch_on_device.get("agent_route_lane_order", None)
-    if isinstance(arl, torch.Tensor) and arl.dim() == 3:
-        _, c_agent, c_lane = arl.shape
-        keep_agents_for_route = int(c_agent)
-
-        lane_dim_input = int(c_lane)
-        lanes_now = batch_on_device.get("lanes", None)
-        if isinstance(lanes_now, torch.Tensor) and lanes_now.dim() >= 2:
-            lane_dim_input = int(lanes_now.shape[1])
-
-        lane_cap = max_lane_num if max_lane_num > 0 else lane_dim_input
-        keep_lanes_for_route = min(int(lane_cap), int(lane_dim_input))
-
-        batch_on_device[
-            "agent_route_lane_order"] = arl[:, :keep_agents_for_route, :
-                                            keep_lanes_for_route]
-        _clip_axis1_for_key_inplace(batch_on_device,
-                                    "agent_route_lane_order_is_valid",
-                                    keep_agents_for_route)
 
 
 def assert_cur_future_valid_mask_np(
@@ -269,7 +109,6 @@ def assert_cur_future_valid_mask_np(
 def _prepare_batch_for_device(
     batch: Dict[str, torch.Tensor],
     device: str,
-    args: Optional[argparse.Namespace] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     """배치 dict를 GPU/CPU로 옮기고, 모델 상한에 맞게 축을 잘라 입력/정답을 나눈다.
 
@@ -296,9 +135,6 @@ def _prepare_batch_for_device(
     if isinstance(aro, torch.Tensor):
         batch_on_device["agent_route_lane_order"] = aro.long()
 
-    if args is not None:
-        _clip_input_axes_by_args(batch_on_device, args)
-
     # outputs 분리 (정답은 반드시 Tensor여야 함)
     target_keys = {
         "ego_future_gt_3_dim",
@@ -316,7 +152,6 @@ def _prepare_batch_for_device(
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
             outputs[key] = value
-            # TODO: outputs 에, "near_future_mask" 지웠으니, 아래 코드들도 싹 지워야 함
     inputs: Dict[str, Any] = batch_on_device
     return inputs, outputs
 
@@ -340,73 +175,6 @@ def _as_bool_mask(mask: torch.Tensor) -> torch.Tensor:
     return mask > 0
 
 
-def _build_broadcastable_pad_mask(
-    feature: torch.Tensor,
-    is_valid: torch.Tensor,
-) -> torch.Tensor:
-    """feature에 바로 적용 가능한 '패딩 위치 마스크'를 만든다.
-
-    Args:
-        feature: 원본 feature 텐서. shape: (B, ..., C)
-        is_valid: 유효 여부 텐서. 보통 feature의 마지막 차원(C)을 뺀 모양.
-            예:
-              - feature: (B, A, T, 11) / is_valid: (B, A, T)
-              - feature: (B, N, S, 2)  / is_valid: (B, N)
-
-    Returns:
-        pad_mask: bool 텐서. feature에 masked_fill로 바로 쓸 수 있는 모양.
-            True인 곳이 "패딩(0으로 유지해야 하는 곳)".
-    """
-    valid_bool = _as_bool_mask(is_valid)
-    pad_mask = ~valid_bool
-    while pad_mask.dim() < feature.dim():
-        pad_mask = pad_mask.unsqueeze(-1)
-    return pad_mask
-
-
-def _collect_padding_masks_before_augmentation(
-    inputs: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
-    """augmentation 전에 패딩 위치를 기억해 둔다.
-
-    Args:
-        inputs: 모델 입력 dict. 각 value는 torch.Tensor.
-
-    Returns:
-        feature_key -> pad_mask(bool) dict.
-        pad_mask는 feature에 바로 masked_fill 할 수 있는 모양입니다.
-    """
-    pairs: List[Tuple[str, str]] = [
-        ("ego_agent_past", "ego_agent_past_is_valid"),  # (B,T,11) / (B,T)
-        ("planner_future_11_dim",
-         "ego_future_gt_is_valid"),  # (B,Tf,11) / (B,Tf)
-        ("neighbor_agents_past",
-         "neighbor_agents_past_is_valid"),  # (B,A,T,11) / (B,A,T)
-        ("lanes", "lanes_len_is_valid"),  # (B,L,S,12) / (B,L,S)
-        ("route_lanes", "route_lanes_len_is_valid"),  # (B,R,S,12) / (B,R,S)
-        ("static_objects", "static_objects_is_valid"),  # (B,N,10) / (B,N)
-        ("stop_sign_points", "stop_sign_is_valid"),  # (B,N,S,2) / (B,N)
-        ("crosswalk_points", "crosswalk_is_valid"),  # (B,N,S,2) / (B,N)
-        ("speed_bump_points", "speed_bump_is_valid"),  # (B,N,S,2) / (B,N)
-        ("driveway_points", "driveway_is_valid"),  # (B,N,S,2) / (B,N)
-        ("road_edge", "road_edge_is_valid"),  # (B,N,S,2) / (B,N)
-    ]
-
-    pad_masks: Dict[str, torch.Tensor] = {}
-    for feature_key, valid_key in pairs:
-        if feature_key not in inputs:
-            continue
-        feature = inputs[feature_key]
-        if not isinstance(feature, torch.Tensor):
-            continue
-
-        if valid_key in inputs and isinstance(inputs[valid_key], torch.Tensor):
-            pad_masks[feature_key] = _build_broadcastable_pad_mask(
-                feature, inputs[valid_key])
-        else:
-            # is_valid가 없으면 "마지막 차원이 전부 0"인 곳을 패딩으로 보수적으로 간주
-            pad_masks[feature_key] = (feature == 0).all(dim=-1, keepdim=True)
-
-    return pad_masks
 
 
 def _restore_padding_values_inplace(
@@ -495,73 +263,6 @@ def _validate_batch_shapes_for_loss(
         raise ValueError(
             f"neighbor_agents_past agent 수({a_in}) < near_future_gt_3_dim agent 수({a_pred}). "
             "보통 /max_agent_num 설정 또는 collate padding 크기 문제입니다.")
-
-
-def _apply_augmentation(
-    inputs: Dict[str, torch.Tensor],
-    ego_future_gt_3_dim: torch.Tensor,  #(B, future_len, 3)
-    near_future_gt_3_dim: torch.Tensor,  # (B, Pnn, future_len, 3)
-    ego_future_gt_mask: torch.Tensor,  # (B, future_len)
-    near_future_mask: torch.Tensor,  # (B, Pnn, future_len)
-    aug: Optional[StatePerturbation],
-    args: argparse.Namespace,
-) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    """ego / 이웃 궤적에 대해 augmentation 을 적용한다.
-
-    핵심 안전장치(중요)
-    ------------------
-    좌표를 회전/이동시키는 augmentation을 하면,
-    원래 0으로 채워져 있던 패딩 구간까지 값이 바뀌어
-    존재하지 않는 객체가 존재하는 것처럼 보일 수 있습니다.
-
-    그래서 augmentation 전에 "원래 패딩이었던 위치"를 기억해두고,
-    augmentation 후에 그 위치를 다시 전부 0으로 되돌립니다.
-
-    Args:
-        inputs:
-            모델 입력용 dict. 각 텐서는 (B, ...) 모양.
-        ego_future_gt_3_dim:
-            (B, Tf, 3)
-        near_future_gt_3_dim:
-            (B, A, Tf, 3)
-        aug:
-            StatePerturbation 또는 NPCStatePerturbation 또는 None
-        args:
-            NPCStatePerturbation에서 필요할 수 있는 설정
-
-    Returns:
-        inputs, ego_future_gt_3_dim, near_future_gt_3_dim (augmentation 반영 + padding 복원)
-    """
-    # (1) augmentation 이전: 입력/정답에서 "원래 패딩 위치"를 기억
-    input_pad_masks: Dict[
-        str, torch.Tensor] = _collect_padding_masks_before_augmentation(inputs)
-
-    ego_future_pad_mask = ego_future_gt_mask.unsqueeze(-1)  # (B,Tf,1)
-    near_future_pad_mask = near_future_mask.unsqueeze(-1)  # (B,A,Tf,1)
-    assert isinstance(aug,
-                      NPCStatePerturbation), "현재 NPCStatePerturbation 만 지원합니다."
-    if args.do_ego_predict:
-        target_future_gt_3_dim = torch.cat(
-            [ego_future_gt_3_dim.unsqueeze(1), near_future_gt_3_dim],
-            dim=1)  # (B, 1 + A, Tf, 3)
-    else:
-        target_future_gt_3_dim = near_future_gt_3_dim  # (B, A, Tf, 3)
-    inputs, target_future_gt_3_dim = aug(inputs, target_future_gt_3_dim, args)
-    if args.do_ego_predict:
-        ego_future_gt_3_dim = target_future_gt_3_dim[:, 0, :, :]  # (B, Tf, 3)
-        # near_future_gt_3_dim = target_future_gt_3_dim[:, 1:, :, :]  # (B, A, Tf, 3)
-    else:
-        near_future_gt_3_dim = target_future_gt_3_dim  # (B, A, Tf, 3)
-
-    # (3) augmentation 이후: 원래 패딩이었던 위치는 다시 0으로 복원
-    _restore_padding_values_inplace(inputs, input_pad_masks)
-
-    ego_future_gt_3_dim = ego_future_gt_3_dim.masked_fill(
-        ego_future_pad_mask, 0.0)
-    near_future_gt_3_dim = near_future_gt_3_dim.masked_fill(
-        near_future_pad_mask, 0.0)
-
-    return inputs, ego_future_gt_3_dim, near_future_gt_3_dim
 
 
 def _build_near_future_4dim_and_mask(
@@ -818,6 +519,8 @@ def _backward_and_step(
 
         """
         model.step()
+        # DeepSpeed가 내부적으로 옵티마이저/스케줄러 스텝을 처리하므로
+        # 여기서는 따로 호출하지 않는다.
     else:
         # 일반 PyTorch / DDP 모드
         """ loss_tensor.backward()
@@ -844,8 +547,8 @@ def _backward_and_step(
             nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
         # 스케줄러 / 옵티마이저 스텝
-        scheduler.step()
         optimizer.step()
+        scheduler.step()
 
     return total_loss
 
@@ -939,21 +642,28 @@ def train_epoch(
         for batch in data_epoch:
 
             # 1) device 이동 + 상한 클리핑 + 정답 분리
+            """ outputs
+        "ego_future_gt_3_dim",
+        "ego_future_gt_4_dim",
+        "near_future_gt_3_dim",
+        "near_future_gt_4_dim",
+        "ego_future_gt_is_valid",
+        "near_future_gt_is_valid",
+            """
             inputs, outputs = _prepare_batch_for_device(
                 batch,
                 device=args.device,
-                args=args,
             )
             # 4) 관측 정규화
             # norm_inputs: 각 value shape = (B, ...)
             norm_inputs: Dict[str, torch.Tensor] = \
                 args.observation_normalizer(inputs)
             # normed_ego_future_gt_4_dim: (B, Tf, 4)
-            normed_ego_future_gt_4_dim: torch.Tensor = args.state_normalizer(
+            outputs["ego_future_gt_4_dim"] = args.state_normalizer(
                 data=outputs["ego_future_gt_4_dim"],
                 valid_mask=outputs["ego_future_gt_is_valid"])
             # normed_near_future_gt_4_dim: (B, A, Tf, 4)
-            normed_near_future_gt_4_dim: torch.Tensor = args.state_normalizer(
+            outputs["near_future_gt_4_dim"] = args.state_normalizer(
                 data=outputs["near_future_gt_4_dim"],
                 valid_mask=outputs["near_future_gt_is_valid"])
 
@@ -980,9 +690,8 @@ def train_epoch(
                 args=args,
                 model=model,
                 norm_inputs=norm_inputs,
+                norm_outputs=outputs,
                 marginal_prob=sde_marginal_prob,
-                normed_ego_future_gt_4_dim=normed_ego_future_gt_4_dim,
-                normed_near_future_gt_4_dim=normed_near_future_gt_4_dim,
                 state_normalizer=args.state_normalizer,
                 loss_dict=raw_loss_dict,
                 model_type=args.diffusion_model_type,  # 보통 "x_start" 또는 "score"
@@ -1013,7 +722,10 @@ def train_epoch(
                 torch.cuda.synchronize()
 
             data_epoch.set_postfix(loss="{:.4f}".format(total_loss))
-            epoch_loss_dict_list.append(loss_dict)
+            loss_dict_detach_cpu: Dict[str, torch.Tensor] = {
+                k: v.detach().cpu() for k, v in loss_dict.items()
+            }
+            epoch_loss_dict_list.append(loss_dict_detach_cpu)
 
             # 전역 스텝 누적 (진행도 계산에 사용)
             args._global_update_step += 1

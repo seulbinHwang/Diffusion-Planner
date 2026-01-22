@@ -1,5 +1,5 @@
 import os
-from typing import Tuple
+from typing import Tuple, Any
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 from diffusion_planner.utils.data_augmentation import StatePerturbation
@@ -29,7 +29,7 @@ faulthandler.enable(all_threads=True)
 import argparse
 from torch import optim
 from timm.utils import ModelEma
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 import wandb
 from diffusion_planner.utils.train_utils import set_seed, save_model
 from diffusion_planner.utils.normalizer import ObservationNormalizer
@@ -45,18 +45,21 @@ from tools.predictor_utils import (
     init_distributed,
     maybe_resume_from_checkpoint,
     safe_get_artifacts,
+    setup_logger_and_purge
 )
-from tools.predictor_utils import (build_dataset_and_sampler, build_data_loader,
-                                   create_diffusion_planner_and_ema,
-                                   setup_logger_and_purge)
+
 
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
 from diffusion_planner.utils.npc_data_augmentation import NPCStatePerturbation
 from diffusion_planner.train_epoch import train_epoch
 import os
+import args_util
 from eval_predictor import *
 import math
-
+import time
+import shutil
+from diffusion_planner.utils import ddp
+from diffusion_planner.utils.normalizer import StateNormalizer
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -984,6 +987,105 @@ def _build_scheduler_from_args(
 
     return scheduler
 
+def _is_distributed_ready() -> bool:
+    """분산 학습 통신을 사용할 수 있는 상태인지 확인한다.
+
+    Returns:
+        bool:
+            - True: 분산 통신(torch.distributed)을 사용할 수 있는 상태
+            - False: 단일 프로세스이거나 초기화가 안 된 상태
+    """
+    return (torch.distributed.is_available()
+            and torch.distributed.is_initialized())
+
+
+def _get_distributed_sync_device(args: argparse.Namespace) -> torch.device:
+    """분산 통신에 사용할 텐서의 device를 고른다.
+
+    주의:
+    - NCCL 백엔드는 GPU 텐서를 요구하는 경우가 많아서,
+      NCCL이면 현재 프로세스의 GPU를 사용한다.
+    - 그 외 백엔드(gloo 등)는 CPU 텐서로도 동작한다.
+
+    Args:
+        args: 학습 설정. args.device 문자열이 있을 수 있다.
+
+    Returns:
+        torch.device: 통신 텐서를 둘 device. shape: ()
+    """
+    if _is_distributed_ready():
+        backend: str = ""
+        try:
+            backend = str(torch.distributed.get_backend()).lower()
+        except Exception:
+            backend = ""
+
+        if backend == "nccl":
+            # NCCL은 일반적으로 GPU 텐서를 기대
+            if not torch.cuda.is_available():
+                raise RuntimeError("NCCL backend인데 CUDA를 사용할 수 없습니다.")
+            return torch.device("cuda", torch.cuda.current_device())
+
+        # gloo 등: CPU 텐서로도 안전
+        return torch.device("cpu")
+
+    # 분산이 아니면 args.device를 참고해서 대충 맞춘다.
+    dev_str = str(getattr(args, "device", "cpu")).lower()
+    if dev_str.startswith("cuda") and torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _sync_save_best_and_best_loss_across_ranks(
+    save_best_local: bool,
+    best_loss_local: float,
+    args: argparse.Namespace,
+    global_rank: int,
+) -> Tuple[bool, float]:
+    """best 저장 여부와 best_loss를 모든 rank에서 완전히 동일하게 맞춘다.
+
+    핵심:
+    - 0번 프로세스(global_rank==0)가 만든 값을 기준으로,
+      다른 프로세스들도 똑같이 갖도록 맞춘다.
+    - DeepSpeed 체크포인트 저장에서 어떤 프로세스는 "best 저장"을 하고
+      어떤 프로세스는 "best 저장"을 안 하면 멈출 수 있으므로,
+      save_best 값은 반드시 전 프로세스 동일해야 한다.
+
+    구현 메모:
+    - 통신 텐서: shape (2,)
+        sync_tensor[0] = save_best (0.0 또는 1.0)
+        sync_tensor[1] = best_loss (float)
+
+    Args:
+        save_best_local: 현재 프로세스가 가진 save_best 값.
+        best_loss_local: 현재 프로세스가 가진 best_loss 값.
+        args: 학습 설정(args.use_deepspeed 포함).
+        global_rank: 현재 프로세스 번호(0이면 기준 프로세스).
+
+    Returns:
+        Tuple[bool, float]:
+            - save_best_sync: 모든 프로세스가 동일한 save_best
+            - best_loss_sync: 모든 프로세스가 동일한 best_loss
+    """
+    use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False))
+    if (not use_deepspeed) or (not _is_distributed_ready()):
+        return bool(save_best_local), float(best_loss_local)
+
+    device = _get_distributed_sync_device(args)
+
+    # sync_tensor: shape (2,)
+    sync_tensor = torch.empty((2,), device=device, dtype=torch.float64)
+
+    if global_rank == 0:
+        sync_tensor[0] = 1.0 if bool(save_best_local) else 0.0
+        sync_tensor[1] = float(best_loss_local)
+
+    torch.distributed.broadcast(sync_tensor, src=0)
+
+    save_best_sync: bool = bool(float(sync_tensor[0].item()) > 0.5)
+    best_loss_sync: float = float(sync_tensor[1].item())
+    return save_best_sync, best_loss_sync
+
 
 def _distributed_barrier() -> None:
     """분산 학습 상태라면 모든 프로세스가 같은 지점에서 만나도록 기다린다.
@@ -1641,10 +1743,25 @@ def _log_and_save(
         return best_loss
 
     # 3) best 갱신 여부
-    save_best = False
-    if train_total_loss < best_loss:
-        best_loss = train_total_loss
-        save_best = True
+    # 3) best 갱신 여부
+    # - DeepSpeed에서는 모든 rank가 save_checkpoint(...)를 함께 호출해야 안전하다.
+    # - save_best가 rank마다 달라지면 best 저장 경로에서 멈출 수 있으므로,
+    #   global_rank==0에서만 판단하고, 그 결과를 모든 rank에 동일하게 맞춘다.
+
+    save_best_local: bool = False
+    best_loss_local: float = float(best_loss)
+
+    if global_rank == 0:
+        if float(train_total_loss) < float(best_loss):
+            best_loss_local = float(train_total_loss)
+            save_best_local = True
+
+    save_best, best_loss = _sync_save_best_and_best_loss_across_ranks(
+        save_best_local=save_best_local,
+        best_loss_local=best_loss_local,
+        args=args,
+        global_rank=global_rank,
+    )
 
     # 4) local 체크포인트 저장
     if use_deepspeed:

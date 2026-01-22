@@ -454,22 +454,61 @@ def build_mlp(in_features: int,
 
 
 class RMSNormNoParam(nn.Module):
-    """학습 파라미터가 없는 RMSNorm (스케일만 정규화).
+    """학습 파라미터가 없는 RMSNorm (스케일만 정리).
 
-    y = x / sqrt(mean(x^2) + eps)
+    - 입력의 마지막 축(H)을 기준으로, 값의 "크기"를 이용해 나눠서 정리합니다.
+    - 입력이 전부 0인 경우에도 0으로 나누는 문제가 생기지 않도록 안전장치를 둡니다.
+    - 연산 속도를 위해 작은 숫자 형식(float16/bfloat16)을 쓸 때도 안전하도록,
+      분모 계산은 float32로 수행한 뒤 원래 형식으로 되돌립니다.
 
     Args:
-        eps: 수치 안정성용 epsilon
+        eps (float):
+            분모가 너무 작아지는 것을 막기 위한 아주 작은 양수입니다.
+            기본값은 float16 환경에서도 안전한 1e-6 입니다.
     """
 
-    def __init__(self, eps: float = 1e-8) -> None:
+    def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
-        self.eps = eps
+        self.eps: float = float(eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """정규화(정리)를 적용합니다.
+
+        Args:
+            x (torch.Tensor):
+                입력 텐서
+                shape: (..., H)
+
+        Returns:
+            torch.Tensor:
+                정리된 텐서 (입력과 같은 dtype)
+                shape: (..., H)
+        """
         # x: [..., H]
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        return x / rms
+        # float16/bfloat16에서는 eps가 0으로 취급되거나(또는 분모가 0이 되는) 문제가 날 수 있어
+        # 분모 계산만 float32로 올려서 안전하게 처리합니다.
+        if x.dtype in (torch.float16, torch.bfloat16):
+            x_compute: torch.Tensor = x.to(dtype=torch.float32)  # [..., H]
+            compute_dtype = torch.float32
+        else:
+            x_compute = x
+            compute_dtype = x.dtype
+
+        # mean_sq: [..., 1]
+        mean_sq: torch.Tensor = x_compute.pow(2).mean(dim=-1, keepdim=True)
+
+        # eps를 더하고, 최소값을 보장해 분모가 0으로 가지 않게 합니다.
+        eps_t: torch.Tensor = torch.tensor(self.eps, dtype=compute_dtype, device=x_compute.device)
+        mean_sq = (mean_sq + eps_t).clamp_min(eps_t)  # [..., 1]
+
+        # rms: [..., 1]
+        rms: torch.Tensor = mean_sq.sqrt()
+
+        # y: [..., H]
+        y: torch.Tensor = x_compute / rms
+
+        # 원래 dtype으로 복원
+        return y.to(dtype=x.dtype)
 
 
 def zero_init_linear(linear: nn.Linear) -> None:
@@ -579,6 +618,7 @@ class PRAMV2Composer(nn.Module):
     def forward(
             self,
             state_token_in: torch.Tensor,  # [B, (1+)Pnn, D]
+            target_current_mask: torch.Tensor,  # [B, (1+)Pnn]  (True=무효)
     ) -> ComposerOutputs:
         """(요약) state/ego/route → Adapt → (SE/ER/RS) → 혼합 → Δs_base/b_base/logit_g_base.
 
@@ -591,18 +631,11 @@ class PRAMV2Composer(nn.Module):
         1) “입력 요약” 만들기 (한 번만 계산 → 모든 블록 재사용)
         """
 
-        # ★ 무효 agent 마스크: state_token_in의 D차원이 전부 0이면 무효(True)
-        #    state_known_mask: [B,(1+)Pnn] (True=유효), invalid_mask: [B,(1+)Pnn,1] (True=무효)
-        state_known_mask = state_token_in.ne(0).any(
-            dim=-1)  # [B,(1+)Pnn] True=유효
-        invalid_mask = (~state_known_mask).unsqueeze(
-            -1)  # [B,(1+)Pnn,1] True=무효
-
         # --- S 경로 ---
         S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
         s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
         s = self.rms_pre(s)
-        s = s.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 S 경로 0
+        s = s.masked_fill(target_current_mask, 0.0)  # ★ 무효 agent는 S 경로 0
         """
         5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
         """
@@ -612,10 +645,10 @@ class PRAMV2Composer(nn.Module):
         logit_gate_base = self.head_logit_gate(s)  # [B,(1+)Pnn,H]
 
         # ★ 최종 출력도 무효 agent에서는 모두 0 보장
-        delta_scale_base = delta_scale_base.masked_fill(invalid_mask,
+        delta_scale_base = delta_scale_base.masked_fill(target_current_mask,
                                                         0.0)  # [B,(1+)Pnn,H]
-        shift_base = shift_base.masked_fill(invalid_mask, 0.0)  # [B,(1+)Pnn,H]
-        logit_gate_base = logit_gate_base.masked_fill(invalid_mask,
+        shift_base = shift_base.masked_fill(target_current_mask, 0.0)  # [B,(1+)Pnn,H]
+        logit_gate_base = logit_gate_base.masked_fill(target_current_mask,
                                                       0.0)  # [B,(1+)Pnn,H]
 
         return ComposerOutputs(
@@ -662,7 +695,8 @@ class PRAMV2TimeModulator(nn.Module):
 
         # 초기화는 기본값 유지(시간 스타일은 학습 통해 조정되도록)
 
-    def forward(self, t_embedding: torch.Tensor) -> TimeModulationOutputs:
+    def forward(self, t_embedding: torch.Tensor,
+                ) -> TimeModulationOutputs:
         """시간 기반 모듈레이션 계산.
 
         Args:
@@ -677,6 +711,8 @@ class PRAMV2TimeModulator(nn.Module):
         dlt = self.lin_delta_scale(t_embedding).unsqueeze(1)  # [B, 1, H]
         shf = self.lin_shift(t_embedding).unsqueeze(1)  # [B, 1, H]
         lgt = self.lin_logit_gate(t_embedding).unsqueeze(1)  # [B, 1, H]
+
+
 
         return TimeModulationOutputs(
             delta_scale_time=dlt,
@@ -754,6 +790,7 @@ def compute_pram_v2_modulations_for_block(
     batch_size: int,
     one_or_Pnn: int,
     hidden_dim: int,
+    target_current_mask: torch.Tensor, # [B, (1+)Pnn]
 ) -> Dict[PathName, ModulationTriplet]:
     """블록 b에서 SA/FFN/CA 경로별 최종 모듈레이션(Δs, b, gate)을 합성합니다.
 
@@ -818,6 +855,11 @@ def compute_pram_v2_modulations_for_block(
         gate = torch.sigmoid(logit_gate_time + k_g * logit_gate_base +
                              beta_g)  # [B,Pnn,H]
 
+        # 무효 에이전트는 모두 0으로 정리
+        delta_scale = delta_scale.masked_fill(target_current_mask, 0.0)
+        shift = shift.masked_fill(target_current_mask, 0.0)
+        gate = gate.masked_fill(target_current_mask, 0.0)
+
         out[path] = ModulationTriplet(delta_scale=delta_scale,
                                       shift=shift,
                                       gate=gate)
@@ -870,6 +912,7 @@ def apply_pram_v2_final_layer(
     time_out: TimeModulationOutputs,
     final_norm: nn.LayerNorm,  # LN(H) 모듈
     out_proj: nn.Sequential,  # Linear(H -> (T)*4)
+target_current_mask: torch.Tensor,  # [B, (1+)Pnn]  (True=무효)
     final_scalars: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """PRAM‑v2 9단계: 최종 모듈레이션 + 최종 투영까지 수행.
@@ -920,6 +963,10 @@ def apply_pram_v2_final_layer(
     # 최종 합성
     delta_scale_final = delta_scale_time + k_final_s * delta_scale_base  # [B,(1+)Pnn,H]
     shift_final = shift_time + k_final_sh * shift_base  # [B,(1+)Pnn,H]
+
+    # 무효 에이전트는 모두 0으로 정리
+    delta_scale_final = delta_scale_final.masked_fill(target_current_mask, 0.0)
+    shift_final = shift_final.masked_fill(target_current_mask, 0.0)
 
     # LN → (1+Δs) ⊙ · + b → Linear
     y = final_norm(x)  # [B,(1+)Pnn,H]
