@@ -3212,7 +3212,7 @@ class DiT(nn.Module):
                 max_window_len_yaw,  # int
             ) = self.feasible_projector.get_feasible_stride_params(future_len)
             # 역정규화 현재+미래 궤적 및 현재 상태
-            target_cur_future_valid = target_past_cur_future_valid[:, :, -future_len:] # (B, Pnn, 1+T) bool
+            target_cur_future_valid = target_past_cur_future_valid[:, :, -(future_len+1):] # (B, Pnn, 1+T) bool
             unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
                 diffusion_trajectory, target_cur_future_valid)  # (B, Pnn, 1+T, 4)
             unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
@@ -3220,7 +3220,7 @@ class DiT(nn.Module):
 
             # 과거 xy-yaw (정규화/역정규화) 준비
             target_past_valid = target_past_cur_future_valid[:, :,
-                                                             : -future_len - 1]  # (B, Pnn, past_len) bool
+                                                             : -(future_len + 1)]  # (B, Pnn, past_len) bool
             if target_past is not None and target_past.numel() > 0:
                 target_past_xyyaw = target_past[..., :4]  # (B, Pnn, past_len, 4)
                 unnorm_target_past_xyyaw = self.config.state_normalizer.inverse(
