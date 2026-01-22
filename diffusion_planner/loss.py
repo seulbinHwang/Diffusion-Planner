@@ -614,7 +614,7 @@ def _add_xy_yaw_metric_losses(
         # 제어 편차에 대한 통계 값
         if control_constraint_diff is not None:
             temp_dict = {"seg_body_control": control_constraint_diff}
-            temp_dict = observation_normalizer.inverse(temp_dict)
+            temp_dict = observation_normalizer.inverse(temp_dict, use_masking=False)
             # constraint_diff_denorm: (B, Pnn, T, 3)
             constraint_diff_denorm: torch.Tensor = temp_dict["seg_body_control"]
             constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
