@@ -50,6 +50,6 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "wosac_test_full" \
+  --name "wosac_test_full_7e4" \
   --batch_size 1248 \
   --learning_rate 7e-4
