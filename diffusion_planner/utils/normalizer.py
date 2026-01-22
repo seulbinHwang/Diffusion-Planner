@@ -198,7 +198,7 @@ class ObservationNormalizer:
             }
         return cls(ndt)
 
-    def __call__(self, data):
+    def __call__(self, data, use_masking: bool = True) -> dict:
         device_type = "cuda"
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
@@ -207,7 +207,8 @@ class ObservationNormalizer:
                     continue
                 norm_data[k] = (data[k] - v["mean"].to(
                     data[k].device)) / v["std"].to(data[k].device)
-                self._mask_invalid_data(norm_data)
+                if use_masking:
+                    self._mask_invalid_data(norm_data)
             # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
             if "agent_route_lane_order" in data:
                 norm_data["agent_route_lane_order"] = data[
