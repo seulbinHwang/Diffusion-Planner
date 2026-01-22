@@ -12,6 +12,7 @@ from timm.models.layers import Mlp
 PathName = Literal["SA", "FFN", "CA"]
 # -*- coding: utf-8 -*-
 
+
 class PRAMV2StateTokenEncoder(nn.Module):
     """현재 프레임 상태를 더 풍부한 토큰으로 바꿉니다(그룹별 처리 후 합치기).
 
@@ -72,14 +73,11 @@ class PRAMV2StateTokenEncoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
 
         b_hidden: int = self._default_branch_hidden_dim(
-            hidden_dim=self.hidden_dim, branch_hidden_dim=branch_hidden_dim
-        )
-        b_out: int = self._default_branch_out_dim(
-            hidden_dim=self.hidden_dim, branch_out_dim=branch_out_dim
-        )
+            hidden_dim=self.hidden_dim, branch_hidden_dim=branch_hidden_dim)
+        b_out: int = self._default_branch_out_dim(hidden_dim=self.hidden_dim,
+                                                  branch_out_dim=branch_out_dim)
         f_hidden: int = self._default_fuse_hidden_dim(
-            branch_out_dim=b_out, fuse_hidden_dim=fuse_hidden_dim
-        )
+            branch_out_dim=b_out, fuse_hidden_dim=fuse_hidden_dim)
 
         self.branch_hidden_dim = b_hidden
         self.branch_out_dim = b_out
@@ -88,7 +86,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
         # 그룹별 입력 정리(학습 파라미터 없음)
         self.xy_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
         self.heading_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
-        self.shape_type_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
+        self.shape_type_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity(
+        )
 
         # 그룹별 전용 작은 네트워크
         self.xy_mlp = Mlp(
@@ -203,9 +202,9 @@ class PRAMV2StateTokenEncoder(nn.Module):
                 shape: (B, P, 2)
         """
         # raw_norm: (B, P, 1)
-        raw_norm: torch.Tensor = torch.linalg.norm(
-            cos_sin, dim=-1, keepdim=True
-        )
+        raw_norm: torch.Tensor = torch.linalg.norm(cos_sin,
+                                                   dim=-1,
+                                                   keepdim=True)
 
         # safe_norm: (B, P, 1)
         safe_norm: torch.Tensor = raw_norm.clamp_min(float(eps))
@@ -225,8 +224,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     @staticmethod
     def _mask_zero(
-        x: torch.Tensor,  # (B, P, D)
-        mask: torch.Tensor,  # (B, P)
+            x: torch.Tensor,  # (B, P, D)
+            mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
         """무효(패딩) 위치를 0으로 만듭니다.
 
@@ -247,8 +246,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
         return x.masked_fill(mask_bool.unsqueeze(-1), 0.0)
 
     def _split_groups(
-        self,
-        target_cur_norm: torch.Tensor,  # (B, P, 11)
+            self,
+            target_cur_norm: torch.Tensor,  # (B, P, 11)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """입력을 3개 그룹으로 나눕니다.
 
@@ -280,9 +279,9 @@ class PRAMV2StateTokenEncoder(nn.Module):
         return xy, cos_sin, shape_type
 
     def forward(
-        self,
-        target_cur_norm: torch.Tensor,  # (B, (1+)Pnn, 11)
-        target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
+            self,
+            target_cur_norm: torch.Tensor,  # (B, (1+)Pnn, 11)
+            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> torch.Tensor:
         """그룹별 처리 후 합쳐서 state_token_in을 만듭니다."""
         # xy: (B, P, 2), cos_sin: (B, P, 2), shape_type: (B, P, 5)
@@ -317,7 +316,10 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
         # fuse_in: (B, P, 6*O)
         fuse_in: torch.Tensor = torch.cat(
-            [xy_feat, heading_feat, shape_feat, xy_heading, heading_shape, shape_xy],
+            [
+                xy_feat, heading_feat, shape_feat, xy_heading, heading_shape,
+                shape_xy
+            ],
             dim=-1,
         )
 
@@ -327,7 +329,6 @@ class PRAMV2StateTokenEncoder(nn.Module):
         # 무효 에이전트는 0으로 정리
         state_token_in = self._mask_zero(state_token_in, target_current_mask)
         return state_token_in
-
 
 
 # -----------------------------

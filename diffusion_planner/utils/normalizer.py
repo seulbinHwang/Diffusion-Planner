@@ -93,25 +93,14 @@ class StateNormalizer:
         leading_ones = [1] * (data.ndim - 1)
         return stats_1d4.to(device=data.device).view(*leading_ones, 4)
 
-    @staticmethod
-    def _zero_vector_mask(data: torch.Tensor) -> torch.Tensor:
-        """마지막 4개 값이 모두 0인 위치를 True로 표시하는 마스크를 만듭니다.
-
-        Args:
-            data: 입력 데이터 텐서, shape (..., 4).
-
-        Returns:
-            torch.Tensor: bool 마스크, shape (...).
-                data[..., :]가 전부 0이면 True, 아니면 False.
-        """
-        # mask: (...), 마지막 dim(4)을 기준으로 "전부 0인지" 확인
-        return torch.sum(torch.ne(data, 0), dim=-1) == 0
-
-    def __call__(self, data: torch.Tensor) -> torch.Tensor:
+    def __call__(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
         """data를 정규화합니다.
 
         - 입력 data의 마지막 차원이 4인지만 확인합니다. (나머지 차원 수/크기는 무엇이든 OK)
         - data[..., :]가 전부 0인 위치는 정규화 후에도 그대로 0으로 유지합니다.
+
+        ego_future_gt_4_dim : (B, F, 4) -> ego_future_gt_is_valid : (B, F)
+        near_future_gt_4_dim : (B, A_near, F, 4) -> near_future_gt_is_valid : (B, A_near, F)
 
         Args:
             data: 입력 데이터 텐서, shape (..., 4).
@@ -124,17 +113,15 @@ class StateNormalizer:
                 f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
-            # mask: (...), 마지막 4개 값이 전부 0인 위치
-            mask = self._zero_vector_mask(data)  # (...,)
 
             mean = self._reshape_stats_for_data(self.mean, data)  # (1,...,1,4)
             std = self._reshape_stats_for_data(self.std, data)  # (1,...,1,4)
 
             norm_data = (data - mean) / std  # (..., 4)
-            norm_data[mask] = 0
+            norm_data[~valid_mask] = 0.0
             return norm_data
 
-    def inverse(self, data: torch.Tensor) -> torch.Tensor:
+    def inverse(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
         """정규화된 data를 원래 값으로 되돌립니다.
 
         - 입력 data의 마지막 차원이 4인지만 확인합니다.
@@ -151,13 +138,12 @@ class StateNormalizer:
                 f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
-            mask = self._zero_vector_mask(data)  # (...,)
 
             mean = self._reshape_stats_for_data(self.mean, data)  # (1,...,1,4)
             std = self._reshape_stats_for_data(self.std, data)  # (1,...,1,4)
 
             inv_data = data * std + mean  # (..., 4)
-            inv_data[mask] = 0
+            inv_data[~valid_mask] = 0.0
             return inv_data
 
     def to_dict(self) -> dict:
@@ -177,10 +163,7 @@ class ObservationNormalizer:
 
     def __init__(self, normalization_dict):
         # [ADD] 혹시 dict 안에 들어있더라도 패스스루 키는 제거
-        self._normalization_dict = {
-            k: v
-            for k, v in normalization_dict.items()
-        }
+        self._normalization_dict = {k: v for k, v in normalization_dict.items()}
 
     @classmethod
     def from_json(cls, args):
@@ -232,26 +215,63 @@ class ObservationNormalizer:
 
             return norm_data
 
-    def _mask_invalid_data(self, norm_data: dict):
+    def _mask_invalid_data(self, norm_data: dict) -> None:
         """
-        ego_agent_past: (B, T, 11) ->
-        planner_future_11_dim : (B, F, 11) ->
-        neighbor_agents_past : (B, A_max, T, 11) ->
-        stop_sign_points : (B, N, len, 2) ->
-        crosswalk_points : (B, N, len, 2) ->
-        lanes : (B, L_max, lane_len, 12) ->
-        lanes_speed_limit : (B, L_max, 1) ->
-        static_objects : (B, S_max, 10) ->
-        route_lanes : (B, R_max, route_len_max, 12) ->
-        route_lanes_speed_limit : (B, R_max, 1) ->
-        speed_bump_points : (B, N, len, 2) ->
-        driveway_points : (B, N, len, 2) ->
-        road_edge : (B, N, len, 2) ->
-
-        near_agents_past : (B, A_near, T, 11) ->
-        non_near_agents_past : (B, A_non_near, T, 11) ->
-
+        ego_future_gt_3_dim : (B, F, 3) ->
+        neighbor_future_gt_3_dim : (B, A_max, F, 3) ->
+        near_future_gt_3_dim : (B, A_near, F, 3) ->
         """
+        ego_agent_past_is_valid = norm_data["ego_agent_past_is_valid"]  # (B, T)
+        # ego_agent_past_is_valid 가 False인 위치를 0으로 마스킹
+        norm_data["ego_agent_past"][~ego_agent_past_is_valid] = 0
+
+        ego_future_gt_is_valid = norm_data["ego_future_gt_is_valid"]  # (B, F)
+        norm_data["planner_future_11_dim"][~ego_future_gt_is_valid] = 0
+
+        neighbor_agents_past_is_valid = norm_data[
+            "neighbor_agents_past_is_valid"]  # (B, A_max, T)
+        norm_data["neighbor_agents_past"][~neighbor_agents_past_is_valid] = 0
+
+        stop_sign_is_valid = norm_data["stop_sign_is_valid"]  # (B, N)
+        norm_data["stop_sign_points"][~stop_sign_is_valid] = 0
+
+        crosswalk_is_valid = norm_data["crosswalk_is_valid"]  # (B, N)
+        norm_data["crosswalk_points"][~crosswalk_is_valid] = 0
+
+        lanes_len_is_valid = norm_data[
+            "lanes_len_is_valid"]  # (B, L_max, lane_len)
+        norm_data["lanes"][~lanes_len_is_valid] = 0
+
+        lanes_is_valid = norm_data["lanes_is_valid"]  # (B, L_max)
+        norm_data["lanes_speed_limit"][~lanes_is_valid] = 0
+
+        static_objects_is_valid = norm_data[
+            "static_objects_is_valid"]  # (B, S_max)
+        norm_data["static_objects"][~static_objects_is_valid] = 0
+
+        route_lanes_len_is_valid = norm_data[
+            "route_lanes_len_is_valid"]  # (B, R_max, route_len_max)
+        norm_data["route_lanes"][~route_lanes_len_is_valid] = 0
+
+        route_lanes_is_valid = norm_data["route_lanes_is_valid"]  # (B, R_max)
+        norm_data["route_lanes_speed_limit"][~route_lanes_is_valid] = 0
+
+        speed_bump_is_valid = norm_data["speed_bump_is_valid"]  # (B, N)
+        norm_data["speed_bump_points"][~speed_bump_is_valid] = 0
+
+        driveway_is_valid = norm_data["driveway_is_valid"]  # (B, N)
+        norm_data["driveway_points"][~driveway_is_valid] = 0
+
+        road_edge_is_valid = norm_data["road_edge_is_valid"]  # (B, N)
+        norm_data["road_edge"][~road_edge_is_valid] = 0
+
+        near_agents_past_is_valid = norm_data[
+            "near_agents_past_is_valid"]  # (B, A_near, T)
+        norm_data["near_agents_past"][~near_agents_past_is_valid] = 0
+
+        non_near_agents_past_is_valid = norm_data[
+            "non_near_agents_past_is_valid"]  # (B, A_non_near, T)
+        norm_data["non_near_agents_past"][~non_near_agents_past_is_valid] = 0
 
     def inverse(self, data: dict) -> dict:
         device_type = "cuda"
@@ -262,24 +282,9 @@ class ObservationNormalizer:
             for k, v in self._normalization_dict.items():
                 if (k not in data) or (v is None) or (data[k] is None):
                     continue
-                if k in [
-                        "ego_agent_past",
-                        "planner_future_11_dim",
-                        "neighbor_agents_past",
-                        "near_agents_past",
-                        "non_near_agents_past",
-                        "ego_agent_next_11_dim",
-                        "route_lanes",
-                        "lanes",
-                ]:
-                    mask = torch.sum(torch.ne(data[k][..., :8], 0), dim=-1) == 0
-                elif k in ["static_objects"]:
-                    mask = torch.sum(torch.ne(data[k][..., :6], 0), dim=-1) == 0
-                else:
-                    mask = torch.sum(torch.ne(data[k], 0), dim=-1) == 0
                 norm_data[k] = data[k] * v["std"].to(
                     data[k].device) + v["mean"].to(data[k].device)
-                norm_data[k][mask] = 0
+                self._mask_invalid_data(norm_data)
 
             # 패스스루 키는 원본 그대로 (정수 유지)
             if "agent_route_lane_order" in data:

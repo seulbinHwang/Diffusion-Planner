@@ -1210,7 +1210,8 @@ class Decoder(nn.Module):
                 # Expected size 1024 but got size 2048 for tensor number 1 in the list.
                 xT: torch.Tensor = torch.cat(
                     [
-                        target_current_xyyaw[:, :, None, :],  # (B, Pnn, 1, 4) # 1024
+                        target_current_xyyaw[:, :,
+                                             None, :],  # (B, Pnn, 1, 4) # 1024
                         noise,  # (B, Pnn, T, 4) # 2048
                     ],
                     dim=2,
@@ -2341,9 +2342,9 @@ class Decoder(nn.Module):
         pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
 
     def _update_amortized_future_buffer_origin(
-            self,
-            rollout_time_chunk_size: int,
-            target_future_valid: torch.Tensor,
+        self,
+        rollout_time_chunk_size: int,
+        target_future_valid: torch.Tensor,
     ) -> None:
         """amortized 추론에서 재사용하는 '미래 버퍼'의 좌표 기준을 다음 스텝 기준으로 맞춥니다.
 
@@ -2385,8 +2386,7 @@ class Decoder(nn.Module):
         if buffer_norm.dim() != 4 or int(buffer_norm.shape[-1]) != 4:
             raise ValueError(
                 "self._x0_for_amortized_inference는 (B,(1+)Pnn,future_len,4) 이어야 합니다. "
-                f"got shape={tuple(buffer_norm.shape)}"
-            )
+                f"got shape={tuple(buffer_norm.shape)}")
 
         future_len: int = int(buffer_norm.shape[2])
 
@@ -2414,14 +2414,14 @@ class Decoder(nn.Module):
         # 2) ego가 기준이 될 시점(rollout_time_chunk_size)에서의 ego 포즈 뽑기
         # ego_next_pose_unnorm: (B, 4)
         step_index: int = int(rollout_time_chunk_size - 1)
-        ego_next_pose_unnorm: torch.Tensor = buffer_unnorm[
-            :, 0, step_index, :].detach()
+        ego_next_pose_unnorm: torch.Tensor = buffer_unnorm[:, 0,
+                                                           step_index, :].detach(
+                                                           )
 
         # 3) 이동/회전에 필요한 값 계산
         # delta_xy: (B, 2), cos_delta: (B,), sin_delta: (B,)
         delta_xy, cos_delta, sin_delta, _ = self._extract_delta_pose_params(
-            ego_next_pose_unnorm
-        )
+            ego_next_pose_unnorm)
 
         # 4) 버퍼 전체를 새 기준으로 이동/회전 (유효 프레임만)
         # valid_mask: (B, (1+)Pnn, future_len)
@@ -2586,7 +2586,6 @@ class Decoder(nn.Module):
             # dtype 맞춤(기존 로직 유지)
             x0 = x0.to(xT.dtype)
 
-
             # 6) (B, (1+)Pnn, 1+T, 4)
             x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
                 x0=
@@ -2605,19 +2604,19 @@ class Decoder(nn.Module):
                     dtype=target_current_xyyaw.dtype,
                 ).detach()
 
-                self._x0_for_amortized_inference = integrated # (B, 1+Pnn, T, 4)
+                self._x0_for_amortized_inference = integrated  # (B, 1+Pnn, T, 4)
                 rollout_time_chunk_size = inputs.get("rollout_time_chunk_size",
                                                      None)
                 assert rollout_time_chunk_size is not None, (
                     "rollout_time_chunk_size must be provided in inputs "
-                    "when using amortized diffusion during inference."
-                )
+                    "when using amortized diffusion during inference.")
                 rollout_time_chunk_size_int = int(
                     rollout_time_chunk_size[0].item())
 
                 # target_future_valid: (B, (1+)Pnn, T)
-                target_future_valid = target_past_cur_future_valid[
-                    :, :, -self._future_len:].detach()
+                target_future_valid = target_past_cur_future_valid[:, :, -self.
+                                                                   _future_len:].detach(
+                                                                   )
 
                 # ✅ 미래 버퍼도 다음 스텝 기준 좌표로 맞추기
                 self._update_amortized_future_buffer_origin(

@@ -2848,7 +2848,7 @@ def filter_parsed_map_by_radius(
       - lanes (→ lanes_speed_limit, lanes_has_speed_limit, lane_light, lane_type,
                left_line_type, right_line_type는 lanes에 종속이라 자동으로 같이 줄어듭니다)
       - road_edge (→ road_edge_type도 같이 줄어듭니다)
-      - driveway
+      - driveway_points
       - stop_sign_points(=stop_sign_xy_global 기반)
       - crosswalk_points
       - speed_bump_points
@@ -3098,7 +3098,7 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
             if is_valid_polygon_xy(polygon_xy, min_points=3):
                 speed_bump_polygons_xy_global.append(polygon_xy)
 
-        elif feature_type == "driveway":
+        elif feature_type == "driveway_points":
             polygon_xy = _extract_driveway_polygon_xy_global(
                 mf.driveway)  # (M,2)
             if is_valid_polygon_xy(polygon_xy, min_points=2):
@@ -4104,7 +4104,7 @@ def build_cache_dict_for_scenario(
 
         road_edge_type: (E,3) float32
 
-        driveway: (D,10,2) float32
+        driveway_points: (D,10,2) float32
 
     Args:
         scenario: Scenario proto
@@ -4347,7 +4347,7 @@ def build_cache_dict_for_scenario(
         safety_len=SAFETY_LEN,
     )
 
-    driveway = build_polygon_points(
+    driveway_points = build_polygon_points(
         parsed_map.driveway_polygons_xy_global,
         ego_xy_global,
         ego_yaw_global,
@@ -4427,7 +4427,7 @@ def build_cache_dict_for_scenario(
         "stop_sign_points": stop_sign_points,  # (Ns,10,2)  # womd
         "crosswalk_points": crosswalk_points,  # (Nc,10,2)  # womd
         "speed_bump_points": speed_bump_points,  # (Nb,10,2)  # womd
-        "driveway": driveway,  # (D,10,2) # womd
+        "driveway_points": driveway_points,  # (D,10,2) # womd
 
         "lanes": lanes_arr,  # (L,10,12)  # womd
         "lanes_speed_limit": lanes_speed_limit,  # (L,1) # womd

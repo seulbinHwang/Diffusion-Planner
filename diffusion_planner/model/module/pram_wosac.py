@@ -78,17 +78,14 @@ class PRAMV2StateTokenEncoder(nn.Module):
         self.hidden_dim = int(hidden_dim)
 
         b_hidden: int = self._default_branch_hidden_dim(
-            hidden_dim=self.hidden_dim, branch_hidden_dim=branch_hidden_dim
-        )
-        b_out: int = self._default_branch_out_dim(
-            hidden_dim=self.hidden_dim, branch_out_dim=branch_out_dim
-        )
+            hidden_dim=self.hidden_dim, branch_hidden_dim=branch_hidden_dim)
+        b_out: int = self._default_branch_out_dim(hidden_dim=self.hidden_dim,
+                                                  branch_out_dim=branch_out_dim)
         st_hidden: int = self._default_size_type_hidden_dim(
-            branch_hidden_dim=b_hidden, size_type_hidden_dim=size_type_hidden_dim
-        )
+            branch_hidden_dim=b_hidden,
+            size_type_hidden_dim=size_type_hidden_dim)
         f_hidden: int = self._default_fuse_hidden_dim(
-            branch_out_dim=b_out, fuse_hidden_dim=fuse_hidden_dim
-        )
+            branch_out_dim=b_out, fuse_hidden_dim=fuse_hidden_dim)
 
         self.branch_hidden_dim = b_hidden
         self.branch_out_dim = b_out
@@ -245,9 +242,9 @@ class PRAMV2StateTokenEncoder(nn.Module):
                 길이가 1로 정리된 (cos, sin).
                 shape: (B, P, 2)
         """
-        raw_norm: torch.Tensor = torch.linalg.norm(
-            cos_sin, dim=-1, keepdim=True
-        )  # (B, P, 1)
+        raw_norm: torch.Tensor = torch.linalg.norm(cos_sin,
+                                                   dim=-1,
+                                                   keepdim=True)  # (B, P, 1)
         safe_norm: torch.Tensor = raw_norm.clamp_min(float(eps))  # (B, P, 1)
         normalized: torch.Tensor = cos_sin / safe_norm  # (B, P, 2)
 
@@ -261,8 +258,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     @staticmethod
     def _mask_zero(
-        x: torch.Tensor,  # (B, P, D)
-        mask: torch.Tensor,  # (B, P)
+            x: torch.Tensor,  # (B, P, D)
+            mask: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
         """무효(패딩) 위치를 0으로 만듭니다.
 
@@ -308,8 +305,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     @staticmethod
     def _combine_size_and_type_features(
-        size_feat: torch.Tensor,  # (B, P, O)
-        type_feat: torch.Tensor,  # (B, P, O)
+            size_feat: torch.Tensor,  # (B, P, O)
+            type_feat: torch.Tensor,  # (B, P, O)
     ) -> torch.Tensor:
         """크기 특징과 종류 특징을 하나의 'shape' 특징으로 합칩니다.
 
@@ -332,15 +329,16 @@ class PRAMV2StateTokenEncoder(nn.Module):
         return size_feat + type_feat + (size_feat * type_feat)
 
     def forward(
-        self,
-        target_cur_norm: torch.Tensor,  # (B, (1+)Pnn, 11)
-        target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
+            self,
+            target_cur_norm: torch.Tensor,  # (B, (1+)Pnn, 11)
+            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
     ) -> torch.Tensor:
         """그룹별 처리 후 합쳐서 state_token_in을 만듭니다."""
         # xy: (B, P, 2), cos_sin: (B, P, 2), size_wl: (B, P, 2), type_one_hot: (B, P, 3)
         xy, cos_sin, size_wl, type_one_hot = self._split_groups(target_cur_norm)
 
-        cos_sin_unit: torch.Tensor = self._normalize_cos_sin(cos_sin)  # (B, P, 2)
+        cos_sin_unit: torch.Tensor = self._normalize_cos_sin(
+            cos_sin)  # (B, P, 2)
 
         # 그룹별 입력 정리
         xy_in: torch.Tensor = self.xy_norm(xy)  # (B, P, 2)
@@ -356,8 +354,7 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
         # ✅ 크기+종류 결합(파라미터 없음)
         shape_feat: torch.Tensor = self._combine_size_and_type_features(
-            size_feat=size_feat, type_feat=type_feat
-        )  # (B, P, O)
+            size_feat=size_feat, type_feat=type_feat)  # (B, P, O)
 
         # 그룹 사이 “동시 패턴”(파라미터 없이)
         xy_heading: torch.Tensor = xy_feat * heading_feat  # (B, P, O)
@@ -366,7 +363,10 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
         # fuse_in: (B, P, 6*O)
         fuse_in: torch.Tensor = torch.cat(
-            [xy_feat, heading_feat, shape_feat, xy_heading, heading_shape, shape_xy],
+            [
+                xy_feat, heading_feat, shape_feat, xy_heading, heading_shape,
+                shape_xy
+            ],
             dim=-1,
         )
 
@@ -376,7 +376,6 @@ class PRAMV2StateTokenEncoder(nn.Module):
         # 무효 에이전트는 0으로 정리
         state_token_in = self._mask_zero(state_token_in, target_current_mask)
         return state_token_in
-
 
 
 # -----------------------------
@@ -534,7 +533,6 @@ class PRAMV2Composer(nn.Module):
         # RMSNorm(무파라미터): 곱(원소곱) 전·후 안정화
         self.rms_pre = RMSNormNoParam()
 
-
         # 출력 헤드(Δs_base, b_base, logit_g_base) : [B, Pnn, H]
         self.head_delta_scale = nn.Linear(self.composed_hidden_dim,
                                           self.hidden_dim)
@@ -605,7 +603,6 @@ class PRAMV2Composer(nn.Module):
         s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
         s = self.rms_pre(s)
         s = s.masked_fill(invalid_mask, 0.0)  # ★ 무효 agent는 S 경로 0
-
         """
         5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
         """

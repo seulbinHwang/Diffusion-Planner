@@ -177,7 +177,6 @@ def timegrid_future_2d(dt: float,
     return base.reshape(1, total_steps).expand(B, total_steps).clone()
 
 
-
 class Encoder(nn.Module):
 
     def __init__(self, config):
@@ -212,7 +211,7 @@ class Encoder(nn.Module):
             config.lane_len,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
-            depth=config.encoder_depth+1,
+            depth=config.encoder_depth + 1,
             num_fourier_frequencies=self.num_fourier_frequencies,
             time_gap=self.time_gap,
             time_min=self.time_min,
@@ -238,7 +237,8 @@ class Encoder(nn.Module):
         # position embedding encode
         # [x, y, cos, sin] + type_onehot(5) = 9
         # type_onehot: (ego, neighbor, static, lane, road_safety)
-        pos_emb_mlp_ratio: float = float(getattr(config, "pos_emb_mlp_ratio", 1.0))
+        pos_emb_mlp_ratio: float = float(
+            getattr(config, "pos_emb_mlp_ratio", 1.0))
         pos_emb_drop_p: float = float(getattr(config, "pos_emb_drop_p", 0.0))
 
         self.pos_emb = self._build_pos_embedding_module(
@@ -644,7 +644,6 @@ class Encoder(nn.Module):
 
         return encoding_road_safety, road_safety_mask, road_safety_pos
 
-
     def _sample_uniform_prefix_lengths(self, batch_size: int,
                                        max_future_len: int,
                                        device: torch.device) -> torch.Tensor:
@@ -933,7 +932,6 @@ class Encoder(nn.Module):
             B,
         )
 
-
     def _ensure_static_objects_tensor(
         self,
         static_objects: Optional[torch.Tensor],
@@ -1033,7 +1031,6 @@ class Encoder(nn.Module):
 
         return placeholder_static_objects
 
-
     def _encode_agents_static_lanes(
         self,
         static_objects: torch.Tensor,  # (B, P, D_static)
@@ -1083,8 +1080,7 @@ class Encoder(nn.Module):
         static_objects_tensor: torch.Tensor = self._ensure_static_objects_tensor(
             static_objects=static_objects,  # (B, P, D_static) or None
             batch_size=int(lanes.shape[0]),  # B
-            ref_tensor=
-            lanes,  # (B, N_agents_tok, H)  device/dtype 기준
+            ref_tensor=lanes,  # (B, N_agents_tok, H)  device/dtype 기준
         )  # (B, P, D_static)
         encoding_static, static_mask, static_pos = self.static_encoder(
             static_objects_tensor)
@@ -1120,9 +1116,8 @@ class Encoder(nn.Module):
             (encoding_road_safety, road_safety_mask,
              road_safety_pos) = self._build_empty_road_safety_tokens(
                  batch_size=int(lanes.shape[0]),
-                 ref_encoding= encoding_lanes,
-                 ref_pos= lane_pos
-             )
+                 ref_encoding=encoding_lanes,
+                 ref_pos=lane_pos)
         else:
             (encoding_road_safety, road_safety_mask,
              road_safety_pos) = self.road_safety_encoder(
@@ -1139,10 +1134,9 @@ class Encoder(nn.Module):
                  road_edge_type,
              )
 
-
-        return (encoding_static, static_mask, static_pos,
-                encoding_lanes, lanes_mask, lane_pos, encoding_road_safety,
-                road_safety_mask, road_safety_pos)
+        return (encoding_static, static_mask, static_pos, encoding_lanes,
+                lanes_mask, lane_pos, encoding_road_safety, road_safety_mask,
+                road_safety_pos)
 
     def _add_pos_embedding_to_tokens(
             self,
@@ -1287,23 +1281,17 @@ class Encoder(nn.Module):
         # (3) 토큰/마스크/포지션 concat (Fusion용)
         # ------------------------------------------------------------------
         encoding_input: torch.Tensor = torch.cat(
-            [encoding_static,
-                encoding_lanes_for_fusion, encoding_road_safety
-            ],
+            [encoding_static, encoding_lanes_for_fusion, encoding_road_safety],
             dim=1,
         )  # (B, token_num, H)
 
         encoding_mask_2d: torch.Tensor = torch.cat(
-            [static_mask, lanes_mask_for_fusion,
-                road_safety_mask
-            ],
+            [static_mask, lanes_mask_for_fusion, road_safety_mask],
             dim=1,
         )  # (B, token_num)
 
         encoding_pos_2d: torch.Tensor = torch.cat(
-            [static_pos, lane_pos_for_fusion,
-                road_safety_pos
-            ],
+            [static_pos, lane_pos_for_fusion, road_safety_pos],
             dim=1,
         )  # (B, token_num, 9)
 
@@ -1687,7 +1675,6 @@ class SelfAttentionBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return x
-
 
 
 class StaticFusionEncoder(nn.Module):

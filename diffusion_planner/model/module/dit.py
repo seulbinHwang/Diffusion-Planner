@@ -466,7 +466,6 @@ class DiTBlock(nn.Module):
 
         return shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa, gate_mlp_pa
 
-
     def _apply_modulated_mlp1(
             self,
             x: torch.Tensor,  # (B, P, D)

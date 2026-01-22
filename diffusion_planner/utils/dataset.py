@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
-import numpy as np
+import time
 from torch.utils.data import Dataset
 from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_near_agents_info_inplace
 from diffusion_planner.utils.validity import add_validity_keys_inplace
@@ -364,7 +364,7 @@ class DiffusionPlannerData(Dataset):
         if self.eval_method == "validation":
             # self.data_dir: "/mnt/nuplan/dataset/processed"
             parent_dir = os.path.dirname(self.data_dir)  # "/mnt/nuplan/dataset"
-            last_dir_name = os.path.basename(self.data_dir) # "processed"
+            last_dir_name = os.path.basename(self.data_dir)  # "processed"
             # "/mnt/nuplan/dataset/processed_tfrecords_splitted"
             self.data_tfrecords_dir = os.path.join(
                 parent_dir, f"{last_dir_name}_tfrecords_splitted")
@@ -431,6 +431,80 @@ class DiffusionPlannerData(Dataset):
                 f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
             )
 
+    @staticmethod
+    def _build_future_gt_4_dim_from_3_dim(
+        future_gt_3_dim: NDArray[np.floating],
+        future_gt_is_valid: NDArray[np.bool_],
+    ) -> NDArray[np.floating]:
+        """(…, 3) 미래 GT를 (…, 4)로 바꿉니다.
+
+        변환 규칙
+        --------
+        - 입력 마지막 축 3개는 (x, y, 방향각)이라고 가정합니다.
+        - 출력 마지막 축 4개는 (x, y, cos(방향각), sin(방향각)) 입니다.
+        - future_gt_is_valid가 False인 위치는 출력 값을 0.0으로 만듭니다.
+
+        Args:
+            future_gt_3_dim:
+                미래 GT. shape: (..., 3)
+                예:
+                  - ego: (future_len, 3)
+                  - near: (predicted_neighbor_num, future_len, 3)
+            future_gt_is_valid:
+                유효 마스크. shape: (...)  (마지막 차원(3)은 제외한 shape)
+                예:
+                  - ego: (future_len,)
+                  - near: (predicted_neighbor_num, future_len)
+
+        Returns:
+            future_gt_4_dim:
+                변환된 미래 GT. shape: (..., 4)
+        """
+        # future_gt_3_dim: (..., 3)
+        heading = future_gt_3_dim[..., 2:3]  # (..., 1)
+        cos_heading = np.cos(heading)  # (..., 1)
+        sin_heading = np.sin(heading)  # (..., 1)
+
+        future_gt_4_dim = np.concatenate(
+            [future_gt_3_dim[..., :2], cos_heading, sin_heading],
+            axis=-1,
+        )  # (..., 4)
+
+        # future_gt_is_valid: (...)  -> future_gt_4_dim: (..., 4)
+        future_gt_4_dim[~future_gt_is_valid] = 0.0
+        return future_gt_4_dim
+
+    def _add_future_gt_4_dim_keys_inplace(self, sample: Dict[str, Any]) -> None:
+        """sample dict에 ego/near의 *_future_gt_4_dim 키를 추가합니다.
+
+        - sample을 새로 만들지 않고, 들어온 sample dict를 그대로 수정합니다.
+        - 필요한 입력 키:
+          - ego: "ego_future_gt_3_dim", "ego_future_gt_is_valid"
+          - near: "near_future_gt_3_dim", "near_future_gt_is_valid"
+
+        Args:
+            sample:
+                __getitem__에서 만드는 샘플 dict.
+        """
+        # ego
+        ego_future_gt_3_dim = sample["ego_future_gt_3_dim"]  # (future_len, 3)
+        ego_future_gt_is_valid = sample[
+            "ego_future_gt_is_valid"]  # (future_len,)
+        sample["ego_future_gt_4_dim"] = self._build_future_gt_4_dim_from_3_dim(
+            ego_future_gt_3_dim,
+            ego_future_gt_is_valid,
+        )  # (future_len, 4)
+
+        # near
+        near_future_gt_3_dim = sample[
+            "near_future_gt_3_dim"]  # (Pnn, future_len, 3)
+        near_future_gt_is_valid = sample[
+            "near_future_gt_is_valid"]  # (Pnn, future_len)
+        sample["near_future_gt_4_dim"] = self._build_future_gt_4_dim_from_3_dim(
+            near_future_gt_3_dim,
+            near_future_gt_is_valid,
+        )  # (Pnn, future_len, 4)
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """한 샘플을 이름 기반 dict로 반환한다.
         각 key별 기본 shape는 다음과 같다 (B는 배치에서 묶일 때 앞에 붙는다).
@@ -473,6 +547,7 @@ class DiffusionPlannerData(Dataset):
         womd_only_keys: List[str] = [
             "speed_bump_points",  # (speed_bump_num, safety_len, 2) # womd
             "driveway_points",  # (driveway_num, safety_len, 2) # womd (환경에 따라 driveway라는 이름일 수도 있음)
+            "driveway",  # (driveway_num, safety_len, 2)
             "lane_type",  # (chosen_lane_num, 4) # womd
             "left_line_type",  # (chosen_lane_num, 13) # womd
             "right_line_type",  # (chosen_lane_num, 13) # womd
@@ -491,6 +566,7 @@ class DiffusionPlannerData(Dataset):
 
         npz_key_to_new_key: Dict[str, str] = {
             "ego_future_gt_11_dim": "planner_future_11_dim",
+            "driveway": "driveway_points",
         }
 
         sample: Dict[str, Any] = {}
@@ -517,37 +593,27 @@ class DiffusionPlannerData(Dataset):
         scenario_id = str(os.path.splitext(file_name)[0])
         sample["scenario_id"] = scenario_id
 
-        # ego_future_gt_4_dim 만들기
-        ego_future_gt_3_dim = sample["ego_future_gt_3_dim"] # (future_len, 3)
-        ego_future_gt_is_valid = sample["ego_future_gt_is_valid"] # (future_len,)
-        # 3: (x, y, heading)
-        # 4: (x, y, cos(heading), sin(heading))
-        heading = ego_future_gt_3_dim[:, 2:3]  # (future_len, 1)
-        cos_heading = np.cos(heading)  # (future_len, 1)
-        sin_heading = np.sin(heading)  # (future_len, 1)
-        ego_future_gt_4_dim = np.concatenate(
-            [ego_future_gt_3_dim[:, :2], cos_heading, sin_heading], axis=-1)  # (future_len, 4)
-        ego_future_gt_4_dim[~ego_future_gt_is_valid] = 0.0
-        sample["ego_future_gt_4_dim"] = ego_future_gt_4_dim
-
-        # near_future_gt_4_dim 만들기
-        near_future_gt_3_dim = sample["near_future_gt_3_dim"] # (predicted_neighbor_num, future_len, 3)
-        near_future_gt_is_valid = sample["near_future_gt_is_valid"] # (predicted_neighbor_num, future_len)
-        heading = near_future_gt_3_dim[:, :, 2:3]  # (predicted_neighbor_num, future_len, 1)
-        cos_heading = np.cos(heading)  # (predicted_neighbor_num, future_len, 1)
-        sin_heading = np.sin(heading)  # (predicted_neighbor_num, future_len, 1)
-        near_future_gt_4_dim = np.concatenate(
-            [near_future_gt_3_dim[:, :, :2], cos_heading, sin_heading], axis=-1 )  # (predicted_neighbor_num, future_len, 4)
-        near_future_gt_4_dim[~near_future_gt_is_valid] = 0.0
-        sample["near_future_gt_4_dim"] = near_future_gt_4_dim
+        # ✅ 여기만 한 줄로 정리
+        self._add_future_gt_4_dim_keys_inplace(sample)
 
         if self.eval_method == "validation":
             tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
             tfrecord_path = os.path.join(self.data_tfrecords_dir,
                                          tfrecord_file_name)
-            if not os.path.exists(tfrecord_path):
-                raise FileNotFoundError(
-                    f"TFRecords file not found: {tfrecord_path}")
             sample["tfrecord_path"] = tfrecord_path
+            # TODO: 다시 복구해야함
+            # if not os.path.exists(tfrecord_path):
 
+                # raise FileNotFoundError(
+                #     f"TFRecords file not found: {tfrecord_path}")
+            # sample["tfrecord_path"] = tfrecord_path
+        print(f"---------[DiffusionPlannerData]--------------")
+        for k, v in sample.items():
+            if isinstance(v, np.ndarray):
+                print(f"[Collate] key={k}, shape={v.shape}, dtype={v.dtype}")
+            elif isinstance(v, list):
+                print(f"[Collate] key={k}, List[str], length={len(v)}")
+            else:
+                print(f"[Collate] key={k}, value=None")
+        print("===============================================")
         return sample

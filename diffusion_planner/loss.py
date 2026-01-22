@@ -264,67 +264,25 @@ def _sanitize_norm_inputs(
     # 각 v: 보통 (B, ·) 모양 텐서들
 
 
-def _build_future_masks_and_current_state(
-    near_future_gt_4_dim: torch.Tensor,  # (B, Pnn, future_len, 4)
-    near_future_mask: torch.Tensor,  # (B, Pnn, future_len)
-    norm_inputs: Dict[str, torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """미래 마스크와 현재 상태, 현재+미래 마스크를 만든다.
-
-    Args:
-        near_future_gt_4_dim: (B, Pnn, future_len, 4) 미래 궤적 (정규화 전).
-        near_future_mask: (B, Pnn, future_len) True면 값이 없는 프레임.
-        norm_inputs: 정규화된 관측 dict. neighbor_agents_past 포함.
-
-    Returns:
-        near_future_valid: (B, Pnn, future_len) True면 유효 프레임.
-        near_cur_future_mask: (B, Pnn, 1+future_len) 현재+미래 마스크.
-        near_current_xyyaw_norm: (B, Pnn, 4) 현재 시점 상태.
-
-    """
-    # near_future_gt_4_dim: (B, Pnn, future_len, 4)
-    B, Pnn, future_len, _ = near_future_gt_4_dim.shape
-
-    # near_future_valid: (B, Pnn, future_len)
-    near_future_valid: torch.Tensor = ~near_future_mask
-
-    # neighbor_agents_past: (B, Pnn, time_len, 11)
-    near_agents_past: torch.Tensor = norm_inputs["near_agents_past"]
-    # near_current_xyyaw_norm: (B, Pnn, 4)  마지막 과거 프레임의 (x, y, cos, sin)
-    near_current_xyyaw_norm: torch.Tensor = near_agents_past[:, :, -1, :4]
-
-    # near_current_mask: (B, Pnn)
-    near_current_mask: torch.Tensor = torch.sum(
-        torch.ne(near_current_xyyaw_norm[..., :4], 0),
-        dim=-1,
-    ) == 0
-
-    # near_cur_future_mask: (B, Pnn, 1+future_len)
-    near_cur_future_mask: torch.Tensor = torch.concat(
-        (near_current_mask.unsqueeze(-1), near_future_mask),
-        dim=-1,
-    )
-    assert near_cur_future_mask.shape == (B, Pnn, 1 + future_len)
-
-    return near_future_valid, near_cur_future_mask, near_current_xyyaw_norm
-
-
 def _sample_diffusion_time_and_noise(
-    target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    normed_target_cur_future_gt_4_dim: torch.
+    Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
     eps: float,
     args: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """미래 궤적 크기에 맞춰 diffusion time 과 노이즈를 샘플링한다."""
-    B: int = target_future_gt_4_dim.shape[0]
-    future_len: int = int(target_future_gt_4_dim.shape[2])
+    device_ = normed_target_cur_future_gt_4_dim.device
+    B: int = normed_target_cur_future_gt_4_dim.shape[0]
+    one_future_len: int = int(normed_target_cur_future_gt_4_dim.shape[2])
+    future_len = one_future_len - 1
 
     use_amortized_mode: bool = (torch.rand(1).item() < 0.5)
 
     if args.use_amortized_diffusion and use_amortized_mode:
         tau = torch.arange(
             1,
-            future_len + 1,
-            device=target_future_gt_4_dim.device,
+            one_future_len,
+            device=device_,
             dtype=torch.float32,
         )  # (T,)
 
@@ -337,15 +295,13 @@ def _sample_diffusion_time_and_noise(
         batch_diffusion_time: torch.Tensor = t_tau.unsqueeze(0).expand(
             B, -1)  # (B, T)
 
-        low_t_mask = torch.ones(B,
-                                dtype=torch.bool,
-                                device=target_future_gt_4_dim.device)
+        low_t_mask = torch.ones(B, dtype=torch.bool, device=device_)
         low_t_mask_bt = low_t_mask.view(B, 1, 1)
 
     else:
         batch_diffusion_time: torch.Tensor = (torch.rand(
             B,
-            device=target_future_gt_4_dim.device,
+            device=device_,
             dtype=torch.float32,
         ) * (1 - eps) + eps)
 
@@ -357,93 +313,61 @@ def _sample_diffusion_time_and_noise(
         low_t_mask_bt: torch.Tensor = low_t_mask.view(B, 1, 1)
 
     random_noise: torch.Tensor = torch.randn_like(
-        target_future_gt_4_dim,
-        device=target_future_gt_4_dim.device,
+        normed_target_cur_future_gt_4_dim,
+        device=device_,
     )
     return batch_diffusion_time, low_t_mask, low_t_mask_bt, random_noise
 
 
 def _normalize_futures_and_build_xT(
-    target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
-    target_current_xyyaw_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
-    target_cur_future_mask: torch.Tensor,  # (B, (1+)Pnn, 1+future_len)
+    normed_target_cur_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, 4)
+    normed_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    target_cur_future_is_valid: torch.Tensor,  # (B, (1+)Pnn, 1+future_len)
     batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
-    state_normalizer: StateNormalizer,
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """미래 궤적을 정규화하고, x_T 샘플과 std 를 만든다.
 
     Args:
-        target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 궤적(denorm).
-        target_current_xyyaw_norm: (B, (1+)Pnn, 4) 현재 상태(정규화).
-        target_cur_future_mask: (B, (1+)Pnn, 1+future_len) 현재+미래 마스크.
+        normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4) 현재 정규화된 상태.
+        normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 궤적(denorm).
+        target_cur_future_is_valid: (B, (1+)Pnn, 1+future_len) 현재+미래 마스크.
         batch_diffusion_time: (B,) or (B, future_len) 배치별 diffusion 시간.
         random_noise: (B, (1+)Pnn, future_len, 4) 노이즈.
-        state_normalizer: 상태 정규화/역정규화 도우미.
         marginal_prob: SDE 의 marginal_prob 함수.
 
     Returns:
-        target_future_norm_gt: (B, (1+)Pnn, future_len, 4) 정규화된 미래 궤적.
         target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재+미래 x_T 샘플.
-        cond_last_pos_norm: (B, (1+)Pnn, 4) 미래 마지막 프레임(정규화).
         std: (B, 1, 1, 1) 노이즈 표준편차.
     """
-    # target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
-    B, one_or_Pnn, future_len, _ = target_future_gt_4_dim.shape
-
-    # normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
-    normed_target_future_gt_4_dim: torch.Tensor = state_normalizer(
-        target_future_gt_4_dim)
-    target_future_mask = target_cur_future_mask[:, :,
-                                                1:]  # (B, (1+)Pnn, future_len)
-    normed_target_future_gt_4_dim[target_future_mask] = 0.0
-    # cond_last_pos_norm: (B, (1+)Pnn, 4)
-    cond_last_pos_norm: torch.Tensor = normed_target_future_gt_4_dim[:, :,
-                                                                     -1, :]
-
-    normed_target_future_gt_4_dim = _require_finite(
-        "state_normalizer(near_future_gt_4_dim)", normed_target_future_gt_4_dim)
-
-    # target_cur_future_norm_gt: (B, (1+)Pnn, 1+future_len, 4)
-    target_cur_future_norm_gt: torch.Tensor = torch.cat(
-        [
-            target_current_xyyaw_norm[:, :, None, :],
-            normed_target_future_gt_4_dim
-        ],
-        dim=2,
-    )
-    target_cur_future_norm_gt[target_cur_future_mask] = 0.0
-    # target_future_norm_gt: (B, (1+)Pnn, future_len, 4)
-    target_future_norm_gt: torch.Tensor = target_cur_future_norm_gt[:, :, 1:, :]
-
+    B, one_or_Pnn, future_len, _ = normed_target_future_gt_4_dim.shape
     # marginal_prob: <diffusion_planner/model/diffusion_utils/sde.py> 의 VPSDE_linear 클래스의 메서드
-    mean, std = marginal_prob(target_future_norm_gt, batch_diffusion_time)
+    mean, std = marginal_prob(normed_target_future_gt_4_dim,
+                              batch_diffusion_time)
     """
     mean : (B, (1+)Pnn, future_len, 4)
-    
     std : (B, 1, 1, 1) or (B, 1, future_len, 1)
     """
     mean = _require_finite("marginal_prob mean", mean)
     std = _require_finite("marginal_prob std", std)
     assert std.ndim == 4, "std_raw must be (B, _, _, _)"
+
+    target_future_is_valid = target_cur_future_is_valid[:, :,
+                                                        1:]  # (B, (1+)Pnn, future_len)
     # target_future_noise_xT: (B, (1+)Pnn, future_len, 4)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
-    target_future_noise_xT[target_future_mask] = 0.0
+    target_future_noise_xT[~target_future_is_valid] = 0.0
 
-    target_cur_norm_gt = target_cur_future_norm_gt[:, :, :
-                                                   1, :]  # (B, (1+)Pnn, 1, 4)
-
-    # target_cur_future_norm_gt: (B, (1+)Pnn, 1+future_len, 4)
+    # target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4)
     target_cur_future_norm_xT: torch.Tensor = torch.cat(
-        [target_cur_norm_gt, target_future_noise_xT],
+        [normed_target_cur_gt_4_dim, target_future_noise_xT],
         dim=2,
     )
-    target_cur_future_norm_xT[target_cur_future_mask] = 0.0
+    target_cur_future_norm_xT[~target_cur_future_is_valid] = 0.0
     assert target_cur_future_norm_xT.shape == (B, one_or_Pnn, 1 + future_len, 4)
-
-    return target_future_norm_gt, target_cur_future_norm_xT, cond_last_pos_norm, std
+    return target_cur_future_norm_xT, std
 
 
 def _forward_model_with_autocast(
@@ -541,7 +465,8 @@ def _compute_dpm_loss(
         score: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
         std: torch.Tensor,  # (B, 1, 1, 1)
         random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
-        target_future_norm_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+        normed_target_future_gt_4_dim: torch.
+    Tensor,  # (B, (1+)Pnn, future_len, 4)
 ) -> torch.Tensor:
     """기존 diffusion 손실(score/x_start)을 (B,P,future_len) 형태로 계산한다.
 
@@ -559,7 +484,7 @@ def _compute_dpm_loss(
         if model_type == "score":
             err: torch.Tensor = score * std + random_noise
         elif model_type == "x_start":
-            err = score - target_future_norm_gt
+            err = score - normed_target_future_gt_4_dim
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -575,7 +500,7 @@ def _compute_dpm_loss(
             dpm_loss = torch.sum((score * std + random_noise)**2,
                                  dim=-1)  # (B, (1+)Pnn, future_len)
         elif model_type == "x_start":
-            dpm_loss = torch.sum((score - target_future_norm_gt)**2,
+            dpm_loss = torch.sum((score - normed_target_future_gt_4_dim)**2,
                                  dim=-1)  # (B, (1+)Pnn, future_len, 4)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
@@ -611,7 +536,7 @@ def _aggregate_weighted_loss(
 def _compute_integration_and_constraint_losses(
     args: Any,
     decoder_output: Dict[str, torch.Tensor],
-    target_future_norm_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    normed_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
     low_t_mask_bt: torch.Tensor,  # (B, 1, 1)
     w_t: torch.Tensor,  # (1, 1, T)
@@ -623,7 +548,7 @@ def _compute_integration_and_constraint_losses(
     내부 계산은 float32로 수행해서 수치 불안정 가능성을 줄입니다.
 
     Args:
-        target_future_norm_gt: (B, (1+)Pnn, future_len, 4)
+        normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
         target_future_valid: ((B, (1 +) Pnn, future_len)
         low_t_mask_bt: (B, 1, 1)
         w_t: (1, 1, T)
@@ -651,8 +576,8 @@ def _compute_integration_and_constraint_losses(
                                                 1:, :]  # (B, (1+)Pnn, T, 4)
 
         # per_step: (B,P,T) float32
-        diff = (integrated_trajectory -
-                target_future_norm_gt).float()  # (B, (1+)Pnn, future_len, 4)
+        diff = (integrated_trajectory - normed_target_future_gt_4_dim
+               ).float()  # (B, (1+)Pnn, future_len, 4)
         per_step = (diff**2).sum(dim=-1)
 
         w_f = w_t.float()
@@ -689,7 +614,7 @@ def _add_xy_yaw_metric_losses(
     state_normalizer: StateNormalizer,
     observation_normalizer: Any,
     score: torch.Tensor,  # (B, Pnn, T, 4)
-    target_future_norm_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    normed_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, Pnn, T)
     integrated_trajectory: Optional[torch.Tensor],
     control_constraint_diff: Optional[torch.Tensor],
@@ -701,7 +626,7 @@ def _add_xy_yaw_metric_losses(
         state_normalizer: 상태 역정규화용 도우미.
         observation_normalizer: 제어 역정규화용 도우미.
         score: (B, Pnn, T, 4) 모델 예측(정규화).
-        target_future_norm_gt: (B, (1+)Pnn, future_len, 4) 미래 GT(정규화).
+        normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 GT(정규화).
         target_future_valid: (B, (1 +) Pnn, future_len) 미래 유효 마스크.
         integrated_trajectory: (B, Pnn, T, 4) 또는 None.
         control_constraint_diff: (B, Pnn, T, 3) 또는 None.
@@ -710,7 +635,7 @@ def _add_xy_yaw_metric_losses(
     score_denorm: torch.Tensor = state_normalizer.inverse(score)
     # target_future_gt: # (B, (1+)Pnn, future_len, 4)
     target_future_gt: torch.Tensor = state_normalizer.inverse(
-        target_future_norm_gt)
+        normed_target_future_gt_4_dim)
 
     with torch.no_grad():
         # 기본 score 에 대한 xy/yaw 오차
@@ -781,15 +706,30 @@ def _assert_cur_future_valid_mask(
         )
 
 
+def _split_normed_target_cur_future_gt_4_dim(
+    normed_target_cur_future_gt_4_dim: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # normed_target_cur_future_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
+    # normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4)
+    normed_target_cur_gt_4_dim = normed_target_cur_future_gt_4_dim[:, :, :1, :]
+    # normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
+    normed_target_future_gt_4_dim: torch.Tensor = normed_target_cur_future_gt_4_dim[:, :,
+                                                                                    1:, :]
+
+    # cond_last_pos_norm: (B, (1+)Pnn, 4)
+    cond_last_pos_norm: torch.Tensor = normed_target_cur_future_gt_4_dim[:, :,
+                                                                         -1, :]
+    return normed_target_cur_gt_4_dim, normed_target_future_gt_4_dim, cond_last_pos_norm
+
+
 def diffusion_loss_func(
     args: Any,
     model: nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
-    ego_future_gt_4_dim: torch.Tensor,  # (B, future_len, 4)
-    near_future_gt_4_dim: torch.Tensor,  # (B, Pnn, future_len, 4)
-    near_future_mask: torch.Tensor,  # (B, Pnn, future_len)
+    normed_ego_future_gt_4_dim: torch.Tensor,  # (B, future_len, 4)
+    normed_near_future_gt_4_dim: torch.Tensor,  # (B, Pnn, future_len, 4)
     state_normalizer: StateNormalizer,
     loss_dict: Dict[str, Any],
     model_type: str,
@@ -810,8 +750,7 @@ def diffusion_loss_func(
         model: 학습 중인 모델(Diffusion_Planner 또는 DDP 래퍼).
         norm_inputs: 정규화된 관측 dict.
         marginal_prob: SDE marginal_prob 함수.
-        near_future_gt_4_dim: (B, Pnn, future_len, 4) 미래 궤적 (denorm).
-        near_future_mask: (B, Pnn, future_len) True면 값이 없는 프레임.
+        normed_near_future_gt_4_dim: (B, Pnn, future_len, 4) 미래 궤적 (denorm).
         state_normalizer: 상태 정규화/역정규화 도우미.
         loss_dict: 손실/통계를 쌓아갈 dict (in-place 업데이트).
         model_type: "score" 또는 "x_start".
@@ -822,40 +761,36 @@ def diffusion_loss_func(
         loss_dict: 다양한 손실 항목이 담긴 dict.
         decoder_output: 모델 decoder 의 출력 dict.
     """
-    # near_future_gt_4_dim: (B, Pnn, future_len, 4)
-    near_future_gt_4_dim = _require_finite("near_future_gt_4_dim",
-                                           near_future_gt_4_dim)
-
     # norm_inputs 의 각 텐서 NaN/Inf 체크
     norm_inputs = _sanitize_norm_inputs(norm_inputs)
 
     # 기본 크기 정보
     # 미래/현재 마스크 및 현재 상태 준비
-    # near_future_valid: (B, Pnn, future_len)
-    # near_cur_future_mask: (B, Pnn, 1+future_len)
-    # near_current_xyyaw_norm: (B, Pnn, 4)
-    near_future_valid, near_cur_future_mask, near_current_xyyaw_norm = \
-        _build_future_masks_and_current_state(
-            near_future_gt_4_dim, # (B, Pnn, future_len, 4)
-            near_future_mask, # (B, Pnn, future_len)
-            norm_inputs,
-        )
+    # norm_near_current_4_dim: (B, Pnn, 4)
+    near_future_gt_is_valid = norm_inputs[
+        "near_future_gt_is_valid"]  # (B, Pnn, future_len)
+    near_agents_is_valid = norm_inputs["near_agents_is_valid"]  # (B, Pnn)
+    near_cur_future_gt_is_valid = torch.cat(
+        (near_agents_is_valid.unsqueeze(-1), near_future_gt_is_valid),
+        dim=-1)  # (B, Pnn, 1 + future_len)
+    near_agents_past = norm_inputs["near_agents_past"]  # (B, Pnn, time_len, 11)
+    norm_near_current_4_dim = near_agents_past[:, :, -1, :4]  # (B, Pnn, 4)
     (
-        target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
-        target_cur_future_mask,  # (B, (1+)Pnn, 1+future_len)
-        target_current_xyyaw_norm,  # (B, (1+)Pnn, 4)
-        target_future_valid,  # (B, (1+)Pnn, future_len)
+        normed_target_cur_future_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
+        target_cur_future_is_valid,  # (B, (1+)Pnn, 1+future_len)
     ) = build_target_future_tensors_and_masks(
         args=args,
         norm_inputs=norm_inputs,
-        ego_future_gt_4_dim=ego_future_gt_4_dim,  # (B, future_len, 4)
-        near_future_gt_4_dim=near_future_gt_4_dim,  # (B, Pnn, future_len, 4)
-        near_cur_future_mask=near_cur_future_mask,  # (B, Pnn, 1 + future_len)
-        near_current_xyyaw_norm=near_current_xyyaw_norm,  # (B, Pnn, 4)
-        near_future_valid=near_future_valid,  # (B, Pnn, future_len)
+        normed_ego_future_gt_4_dim=
+        normed_ego_future_gt_4_dim,  # (B, future_len, 4)
+        normed_near_future_gt_4_dim=
+        normed_near_future_gt_4_dim,  # (B, Pnn, future_len, 4)
+        near_cur_future_gt_is_valid=
+        near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
+        norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
     )
-
-    B, one_or_Pnn, future_len, = target_future_valid.shape
+    B, one_or_Pnn, one_future_len, _ = normed_target_cur_future_gt_4_dim.shape
+    future_len = one_future_len - 1
     """
     # diffusion time / low noise mask / random noise 샘플링
     
@@ -866,29 +801,30 @@ def diffusion_loss_func(
     """
     (batch_diffusion_time, low_t_mask, low_t_mask_bt,
      random_noise) = _sample_diffusion_time_and_noise(
-         target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
+         normed_target_cur_future_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
          eps,
          args,
      )
-
-    # 미래 궤적 정규화 + x_T 샘플 생성
+    # normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4)
+    # normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
+    # cond_last_pos_norm: (B, (1+)Pnn, 4)
+    (normed_target_cur_gt_4_dim, normed_target_future_gt_4_dim,
+     cond_last_pos_norm) = _split_normed_target_cur_future_gt_4_dim(
+         normed_target_cur_future_gt_4_dim)
     """
-        target_future_norm_gt: (B, (1+)Pnn, future_len, 4) 정규화된 미래 궤적.
         target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재+미래 x_T 샘플.
-        cond_last_pos_norm: (B, (1+)Pnn, 4) 미래 마지막 프레임(정규화).
-        std: (B, 1, 1, 1) 노이즈 표준편차.
+        std: (B, 1, 1, 1) 노이즈 표준편차
     """
-    (target_future_norm_gt, target_cur_future_norm_xT, cond_last_pos_norm,
-     std) = _normalize_futures_and_build_xT(
-         target_future_gt_4_dim,
-         target_current_xyyaw_norm,  # (B, (1+)Pnn, 4)
-         target_cur_future_mask,
-         batch_diffusion_time,  # (B,) or (B, future_len)
-         random_noise,
-         state_normalizer,
-         marginal_prob,
-     )
-
+    (target_cur_future_norm_xT, std) = _normalize_futures_and_build_xT(
+        normed_target_cur_gt_4_dim,  # (B, (1+)Pnn, 4)
+        normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
+        target_cur_future_is_valid,  # (B, (1+)Pnn, 1+future_len)
+        batch_diffusion_time,  # (B,) or (B, future_len)
+        random_noise,
+        marginal_prob,
+    )
+    target_future_valid = target_cur_future_is_valid[:, :,
+                                                     1:]  # (B, (1+)Pnn, future_len)
     # 모델 forward + decoder_output 생성
     decoder_output: Dict[str, torch.Tensor] = _forward_model_with_autocast(
         model=model,  #
@@ -917,8 +853,8 @@ def diffusion_loss_func(
         score=score,  # (B, (1+)Pnn, future_len, 4)
         std=std,  # (B, 1, 1, 1)
         random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4)
-        target_future_norm_gt=
-        target_future_norm_gt,  # (B, (1+)Pnn, future_len, 4)
+        normed_target_future_gt_4_dim=
+        normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
     )
 
     if args.use_timestep_weight_loss:
@@ -963,8 +899,8 @@ def diffusion_loss_func(
          control_constraint_diff) = _compute_integration_and_constraint_losses(
              args=args,
              decoder_output=decoder_output,
-             target_future_norm_gt=
-             target_future_norm_gt,  # (B, (1+)Pnn, future_len, 4)
+             normed_target_future_gt_4_dim=
+             normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
              target_future_valid=
              target_future_valid,  # (B, (1 +) Pnn, future_len)
              low_t_mask_bt=low_t_mask_bt,  # (B,1,1)
@@ -981,8 +917,8 @@ def diffusion_loss_func(
             state_normalizer=state_normalizer,
             observation_normalizer=observation_normalizer,
             score=score,
-            target_future_norm_gt=
-            target_future_norm_gt,  # (B, (1+)Pnn, future_len, 4)
+            normed_target_future_gt_4_dim=
+            normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
             target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
             integrated_trajectory=
             integrated_trajectory,  # (B, (1+)Pnn, T, 4) 또는 None

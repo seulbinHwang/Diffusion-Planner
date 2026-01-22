@@ -300,7 +300,14 @@ def _prepare_batch_for_device(
         _clip_input_axes_by_args(batch_on_device, args)
 
     # outputs 분리 (정답은 반드시 Tensor여야 함)
-    target_keys = {"ego_future_gt_3_dim", "ego_future_gt_4_dim", "near_future_gt_3_dim", "near_future_gt_4_dim"}
+    target_keys = {
+        "ego_future_gt_3_dim",
+        "ego_future_gt_4_dim",
+        "near_future_gt_3_dim",
+        "near_future_gt_4_dim",
+        "ego_future_gt_is_valid",
+        "near_future_gt_is_valid",
+    }
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
         if key in target_keys:
@@ -941,6 +948,14 @@ def train_epoch(
             # norm_inputs: 각 value shape = (B, ...)
             norm_inputs: Dict[str, torch.Tensor] = \
                 args.observation_normalizer(inputs)
+            # normed_ego_future_gt_4_dim: (B, Tf, 4)
+            normed_ego_future_gt_4_dim: torch.Tensor = args.state_normalizer(
+                data=outputs["ego_future_gt_4_dim"],
+                valid_mask=outputs["ego_future_gt_is_valid"])
+            # normed_near_future_gt_4_dim: (B, A, Tf, 4)
+            normed_near_future_gt_4_dim: torch.Tensor = args.state_normalizer(
+                data=outputs["near_future_gt_4_dim"],
+                valid_mask=outputs["near_future_gt_is_valid"])
 
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
             """
@@ -966,9 +981,8 @@ def train_epoch(
                 model=model,
                 norm_inputs=norm_inputs,
                 marginal_prob=sde_marginal_prob,
-                ego_future_gt_4_dim=outputs["ego_future_gt_4_dim"],
-                near_future_gt_4_dim=outputs["near_future_gt_4_dim"],
-                near_future_mask=outputs["near_future_mask"],
+                normed_ego_future_gt_4_dim=normed_ego_future_gt_4_dim,
+                normed_near_future_gt_4_dim=normed_near_future_gt_4_dim,
                 state_normalizer=args.state_normalizer,
                 loss_dict=raw_loss_dict,
                 model_type=args.diffusion_model_type,  # 보통 "x_start" 또는 "score"

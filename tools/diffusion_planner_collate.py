@@ -2,7 +2,7 @@ import argparse
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
-
+import time
 
 class DiffusionPlannerCollate:
     """DiffusionPlannerData 샘플들을 배치 텐서로 묶는 collate_fn.
@@ -1040,7 +1040,8 @@ class DiffusionPlannerCollate:
                 - 숫자/배열 값: torch.Tensor 또는 None
                 - 문자열 값: List[str] (length=B)
         """
-        if len(batch) == 0:
+        batch_size = int(len(batch))
+        if batch_size == 0:
             raise ValueError("빈 batch가 들어왔습니다.")
-
-        return self._build_collated_batch_tensors(batch)
+        outputs = self._build_collated_batch_tensors(batch)
+        return outputs
