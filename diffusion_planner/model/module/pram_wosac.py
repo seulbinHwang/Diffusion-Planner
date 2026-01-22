@@ -635,8 +635,10 @@ class PRAMV2Composer(nn.Module):
         S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
         s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
         s = self.rms_pre(s) # s: [B,(1+)Pnn,h]
-        print("s.shape:", s.shape, "target_current_mask:", target_current_mask.shape)
-        s = s.masked_fill(target_current_mask, 0.0)  # ★ 무효 agent는 S 경로 0
+        # [default4]:s.shape: torch.Size([208, 291, 128]) target_current_mask: torch.Size([208, 291])
+        mask = target_current_mask.to(torch.bool)  # [B, P]
+        s = s.masked_fill(mask.unsqueeze(-1),
+                          0.0)  # [B, P, 1] -> [B, P, H]로 방송됨
         """
         5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
         """
@@ -646,11 +648,9 @@ class PRAMV2Composer(nn.Module):
         logit_gate_base = self.head_logit_gate(s)  # [B,(1+)Pnn,H]
 
         # ★ 최종 출력도 무효 agent에서는 모두 0 보장
-        delta_scale_base = delta_scale_base.masked_fill(target_current_mask,
-                                                        0.0)  # [B,(1+)Pnn,H]
-        shift_base = shift_base.masked_fill(target_current_mask, 0.0)  # [B,(1+)Pnn,H]
-        logit_gate_base = logit_gate_base.masked_fill(target_current_mask,
-                                                      0.0)  # [B,(1+)Pnn,H]
+        delta_scale_base = delta_scale_base.masked_fill(mask.unsqueeze(-1), 0.0)
+        shift_base = shift_base.masked_fill(mask.unsqueeze(-1), 0.0)
+        logit_gate_base = logit_gate_base.masked_fill(mask.unsqueeze(-1), 0.0)
 
         return ComposerOutputs(
             delta_scale_base=delta_scale_base,  # [B, (1+)Pnn, H]
@@ -855,11 +855,11 @@ def compute_pram_v2_modulations_for_block(
         shift = shift_time + k_sh * shift_base  # [B,Pnn,H]
         gate = torch.sigmoid(logit_gate_time + k_g * logit_gate_base +
                              beta_g)  # [B,Pnn,H]
-
+        target_current_mask = target_current_mask.to(torch.bool)
         # 무효 에이전트는 모두 0으로 정리
-        delta_scale = delta_scale.masked_fill(target_current_mask, 0.0)
-        shift = shift.masked_fill(target_current_mask, 0.0)
-        gate = gate.masked_fill(target_current_mask, 0.0)
+        delta_scale = delta_scale.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        shift = shift.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        gate = gate.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
         out[path] = ModulationTriplet(delta_scale=delta_scale,
                                       shift=shift,
