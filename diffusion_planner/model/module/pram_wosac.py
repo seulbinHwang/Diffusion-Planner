@@ -634,7 +634,8 @@ class PRAMV2Composer(nn.Module):
         # --- S 경로 ---
         S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
         s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
-        s = self.rms_pre(s)
+        s = self.rms_pre(s) # s: [B,(1+)Pnn,h]
+        print("s.shape:", s.shape, "target_current_mask:", target_current_mask.shape)
         s = s.masked_fill(target_current_mask, 0.0)  # ★ 무효 agent는 S 경로 0
         """
         5) (z→) 에이전트별 “base” 모듈레이션 (선형 헤드 3개 + 안전 초기화)
