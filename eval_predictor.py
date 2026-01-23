@@ -3414,6 +3414,7 @@ def _predict_rollouts_batched(
     rollout_chunk_size = int(min(rollout_chunk_size, rollout_number))
 
     ego_agent_past = norm_inputs.get("ego_agent_past", None)
+    # target_future_valid: (B, (1 +) Pnn, future_len)
     target_future_valid = norm_inputs.get("target_future_valid", None)
 
     batch_size: int = int(target_future_valid.shape[0])

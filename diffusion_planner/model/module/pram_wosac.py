@@ -635,7 +635,6 @@ class PRAMV2Composer(nn.Module):
         S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
         s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
         s = self.rms_pre(s) # s: [B,(1+)Pnn,h]
-        # [default4]:s.shape: torch.Size([208, 291, 128]) target_current_mask: torch.Size([208, 291])
         mask = target_current_mask.to(torch.bool)  # [B, P]
         s = s.masked_fill(mask.unsqueeze(-1),
                           0.0)  # [B, P, 1] -> [B, P, H]로 방송됨

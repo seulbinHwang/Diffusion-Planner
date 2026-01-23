@@ -2130,8 +2130,9 @@ class Decoder(nn.Module):
 
         # 1) 버퍼를 실제 단위로 되돌리기
         # buffer_unnorm: (B, (1+)Pnn, future_len, 4)
+        # target_future_valid: (B, (1+)Pnn, future_len)
         buffer_unnorm: torch.Tensor = self.config.state_normalizer.inverse(
-            buffer_norm)
+            buffer_norm, target_future_valid)
 
         # 2) ego가 기준이 될 시점(rollout_time_chunk_size)에서의 ego 포즈 뽑기
         # ego_next_pose_unnorm: (B, 4)
@@ -2159,8 +2160,9 @@ class Decoder(nn.Module):
 
         # 5) 다시 모델 스케일로 맞추기
         # buffer_norm_new: (B, (1+)Pnn, future_len, 4)
+        # target_future_valid: (B, (1+)Pnn, future_len)
         buffer_norm_new: torch.Tensor = self.config.state_normalizer(
-            buffer_unnorm)
+            buffer_unnorm, target_future_valid)
 
         # dtype/device 원복 + 안전하게 detach
         buffer_norm_new = buffer_norm_new.to(device=device,
