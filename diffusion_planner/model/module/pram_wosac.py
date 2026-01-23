@@ -498,7 +498,9 @@ class RMSNormNoParam(nn.Module):
         mean_sq: torch.Tensor = x_compute.pow(2).mean(dim=-1, keepdim=True)
 
         # eps를 더하고, 최소값을 보장해 분모가 0으로 가지 않게 합니다.
-        eps_t: torch.Tensor = torch.tensor(self.eps, dtype=compute_dtype, device=x_compute.device)
+        eps_t: torch.Tensor = torch.tensor(self.eps,
+                                           dtype=compute_dtype,
+                                           device=x_compute.device)
         mean_sq = (mean_sq + eps_t).clamp_min(eps_t)  # [..., 1]
 
         # rms: [..., 1]
@@ -634,7 +636,7 @@ class PRAMV2Composer(nn.Module):
         # --- S 경로 ---
         S_in = self.in_norm_S(state_token_in)  # [B,(1+)Pnn,D]
         s = self.adapt_S(S_in)  # [B,(1+)Pnn,h]
-        s = self.rms_pre(s) # s: [B,(1+)Pnn,h]
+        s = self.rms_pre(s)  # s: [B,(1+)Pnn,h]
         mask = target_current_mask.to(torch.bool)  # [B, P]
         s = s.masked_fill(mask.unsqueeze(-1),
                           0.0)  # [B, P, 1] -> [B, P, H]로 방송됨
@@ -695,8 +697,10 @@ class PRAMV2TimeModulator(nn.Module):
 
         # 초기화는 기본값 유지(시간 스타일은 학습 통해 조정되도록)
 
-    def forward(self, t_embedding: torch.Tensor,
-                ) -> TimeModulationOutputs:
+    def forward(
+        self,
+        t_embedding: torch.Tensor,
+    ) -> TimeModulationOutputs:
         """시간 기반 모듈레이션 계산.
 
         Args:
@@ -711,8 +715,6 @@ class PRAMV2TimeModulator(nn.Module):
         dlt = self.lin_delta_scale(t_embedding).unsqueeze(1)  # [B, 1, H]
         shf = self.lin_shift(t_embedding).unsqueeze(1)  # [B, 1, H]
         lgt = self.lin_logit_gate(t_embedding).unsqueeze(1)  # [B, 1, H]
-
-
 
         return TimeModulationOutputs(
             delta_scale_time=dlt,
@@ -783,14 +785,14 @@ class PRAMV2BlockPathScalars(nn.Module):
 
 
 def compute_pram_v2_modulations_for_block(
-    composer_out: ComposerOutputs,  # 3개 [B, Pnn, H]
-    time_out: TimeModulationOutputs,  # 3개 [B, 1, H]
-    path_scalars: PRAMV2BlockPathScalars,
-    block_index: int,
-    batch_size: int,
-    one_or_Pnn: int,
-    hidden_dim: int,
-    target_current_mask: torch.Tensor, # [B, (1+)Pnn]
+        composer_out: ComposerOutputs,  # 3개 [B, Pnn, H]
+        time_out: TimeModulationOutputs,  # 3개 [B, 1, H]
+        path_scalars: PRAMV2BlockPathScalars,
+        block_index: int,
+        batch_size: int,
+        one_or_Pnn: int,
+        hidden_dim: int,
+        target_current_mask: torch.Tensor,  # [B, (1+)Pnn]
 ) -> Dict[PathName, ModulationTriplet]:
     """블록 b에서 SA/FFN/CA 경로별 최종 모듈레이션(Δs, b, gate)을 합성합니다.
 
@@ -856,7 +858,8 @@ def compute_pram_v2_modulations_for_block(
                              beta_g)  # [B,Pnn,H]
         target_current_mask = target_current_mask.to(torch.bool)
         # 무효 에이전트는 모두 0으로 정리
-        delta_scale = delta_scale.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        delta_scale = delta_scale.masked_fill(target_current_mask.unsqueeze(-1),
+                                              0.0)
         shift = shift.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
         gate = gate.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
@@ -912,7 +915,7 @@ def apply_pram_v2_final_layer(
     time_out: TimeModulationOutputs,
     final_norm: nn.LayerNorm,  # LN(H) 모듈
     out_proj: nn.Sequential,  # Linear(H -> (T)*4)
-target_current_mask: torch.Tensor,  # [B, (1+)Pnn]  (True=무효)
+    target_current_mask: torch.Tensor,  # [B, (1+)Pnn]  (True=무효)
     final_scalars: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """PRAM‑v2 9단계: 최종 모듈레이션 + 최종 투영까지 수행.
@@ -966,8 +969,10 @@ target_current_mask: torch.Tensor,  # [B, (1+)Pnn]  (True=무효)
 
     # 무효 에이전트는 모두 0으로 정리
     target_current_mask = target_current_mask.to(torch.bool)
-    delta_scale_final = delta_scale_final.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
-    shift_final = shift_final.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+    delta_scale_final = delta_scale_final.masked_fill(
+        target_current_mask.unsqueeze(-1), 0.0)
+    shift_final = shift_final.masked_fill(target_current_mask.unsqueeze(-1),
+                                          0.0)
 
     # LN → (1+Δs) ⊙ · + b → Linear
     y = final_norm(x)  # [B,(1+)Pnn,H]

@@ -464,7 +464,9 @@ def get_args():
                         type=boolean,
                         default=False,
                         help="ZeRO-2 옵티마 상태를 CPU 메모리로 일부 옮겨서 GPU 메모리를 더 아낄지 여부")
-
+    parser.add_argument("--do_data_statistics",
+                        type=boolean,
+                        default=False)
     parser.add_argument("--ds_steps_per_print",
                         type=int,
                         default=100,

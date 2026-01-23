@@ -509,11 +509,11 @@ class Encoder(nn.Module):
 
     @staticmethod
     def _road_safety_has_any_geometry(
-            stop_sign_points: Optional[torch.Tensor],
-            crosswalk_points: Optional[torch.Tensor],
-            speed_bump_points: Optional[torch.Tensor],
-            driveway_points: Optional[torch.Tensor],
-            road_edge: Optional[torch.Tensor],
+        stop_sign_points: Optional[torch.Tensor],
+        crosswalk_points: Optional[torch.Tensor],
+        speed_bump_points: Optional[torch.Tensor],
+        driveway_points: Optional[torch.Tensor],
+        road_edge: Optional[torch.Tensor],
     ) -> bool:
         """road-safety에서 '점(geometry) 텐서'가 하나라도 들어왔는지 확인합니다.
 
@@ -534,16 +534,13 @@ class Encoder(nn.Module):
                 - points 텐서가 하나라도 있으면 True
                 - 전부 None이면 False
         """
-        return any(
-            t is not None
-            for t in [
-                stop_sign_points,
-                crosswalk_points,
-                speed_bump_points,
-                driveway_points,
-                road_edge,
-            ]
-        )
+        return any(t is not None for t in [
+            stop_sign_points,
+            crosswalk_points,
+            speed_bump_points,
+            driveway_points,
+            road_edge,
+        ])
 
     def _build_empty_road_safety_tokens(
         self,
@@ -805,7 +802,6 @@ class Encoder(nn.Module):
         road_edge_type: Optional[torch.Tensor] = inputs.get(
             "road_edge_type", None)  # (B, E, 3) or None
 
-
         if neighbor_agents_past is not None:
             if not self.config.use_vel_input:
                 neighbor_agents_past[:, :, :, 4:6] = 0.0  # vx, vy
@@ -878,8 +874,6 @@ class Encoder(nn.Module):
         # D_static: 정적 물체 feature 차원
         D_static: int = int(getattr(self.config, "static_objects_state_dim"))
 
-
-
         # -------------------------
         # (1) 입력이 이미 텐서인 경우
         # -------------------------
@@ -898,7 +892,7 @@ class Encoder(nn.Module):
         static_objects_num = 1
         placeholder_static_objects: torch.Tensor = ref_tensor.new_zeros(
             (B, static_objects_num, D_static))
-        static_objects_is_valid:  torch.Tensor = ref_tensor.new_zeros(
+        static_objects_is_valid: torch.Tensor = ref_tensor.new_zeros(
             (B, static_objects_num), dtype=torch.bool)  # True = 유효
         return placeholder_static_objects, static_objects_is_valid
 
@@ -934,7 +928,8 @@ class Encoder(nn.Module):
             "static_objects_is_valid", None)  # (B, P) bool or None
         static_objects_tensor, static_objects_is_valid = self._ensure_static_objects_tensor(
             static_objects=static_objects,  # (B, P, D_static) or None
-            static_objects_is_valid=static_objects_is_valid, # (B, P) bool or None
+            static_objects_is_valid=
+            static_objects_is_valid,  # (B, P) bool or None
             batch_size=int(lanes.shape[0]),  # B
             ref_tensor=lanes,  # (B, N_agents_tok, H)  device/dtype 기준
         )  # (B, P, D_static)
@@ -952,20 +947,22 @@ class Encoder(nn.Module):
         lane_pos:       (B, lane_num, 9)
         """
         lanes_speed_limit = inputs["lanes_speed_limit"]  # (B, L, 1) or None
-        lanes_has_speed_limit = inputs["lanes_has_speed_limit"]  # (B, L, 1) or None
-        lane_type = inputs.get(
-            "lane_type", None)  # (B, L, 4) or None
-        left_line_type = inputs.get(
-            "left_line_type", None)  # (B, L, 13) or None
-        right_line_type = inputs.get(
-            "right_line_type", None)  # (B, L, 13) or None
+        lanes_has_speed_limit = inputs[
+            "lanes_has_speed_limit"]  # (B, L, 1) or None
+        lane_type = inputs.get("lane_type", None)  # (B, L, 4) or None
+        left_line_type = inputs.get("left_line_type",
+                                    None)  # (B, L, 13) or None
+        right_line_type = inputs.get("right_line_type",
+                                     None)  # (B, L, 13) or None
         ##################################
-        lanes_is_valid = inputs["lanes_is_valid"] # (B, L)
+        lanes_is_valid = inputs["lanes_is_valid"]  # (B, L)
         # ✅ is_valid는 반드시 bool로 통일
         lanes_is_valid = lanes_is_valid.to(torch.bool)
-        encoding_lanes, lane_pos = self.lane_encoder(
-            lanes, lanes_speed_limit, lanes_has_speed_limit, lane_type,
-            left_line_type, right_line_type,lanes_is_valid)
+        encoding_lanes, lane_pos = self.lane_encoder(lanes, lanes_speed_limit,
+                                                     lanes_has_speed_limit,
+                                                     lane_type, left_line_type,
+                                                     right_line_type,
+                                                     lanes_is_valid)
         lanes_mask = ~lanes_is_valid
         # --- road safety encoder (입력이 전부 None이면 "빈 토큰"으로 대체) ---
         """
@@ -973,28 +970,27 @@ class Encoder(nn.Module):
         road_safety_mask     : (B, road_safety_num)
         road_safety_pos      : (B, road_safety_num, 9)
         """
-        stop_sign_points = inputs.get(
-            "stop_sign_points", None)  # (B, Ns, safety_len, 2) or None
-        stop_sign_is_valid = inputs.get(
-            "stop_sign_is_valid", None)  # (B, Ns) bool or None
-        crosswalk_points = inputs.get(
-            "crosswalk_points", None)  # (B, Nc, safety_len, 2) or None
-        crosswalk_is_valid = inputs.get(
-            "crosswalk_is_valid", None)  # (B, Nc) bool or None
-        speed_bump_points = inputs.get(
-            "speed_bump_points", None)  # (B, Nb, safety_len, 2) or None
-        speed_bump_is_valid = inputs.get(
-            "speed_bump_is_valid", None)  # (B, Nb) bool or None
-        driveway_points = inputs.get(
-            "driveway_points", None)  # (B, Nd, safety_len, 2) or None
-        driveway_is_valid = inputs.get(
-            "driveway_is_valid", None)  # (B, Nd) bool or None
-        road_edge = inputs.get(
-            "road_edge", None)  # (B, E, safety_len, 2) or None
-        road_edge_is_valid = inputs.get(
-            "road_edge_is_valid", None)  # (B, E) bool or None
-        road_edge_type = inputs.get(
-            "road_edge_type", None)  # (B, E, 3) or None
+        stop_sign_points = inputs.get("stop_sign_points",
+                                      None)  # (B, Ns, safety_len, 2) or None
+        stop_sign_is_valid = inputs.get("stop_sign_is_valid",
+                                        None)  # (B, Ns) bool or None
+        crosswalk_points = inputs.get("crosswalk_points",
+                                      None)  # (B, Nc, safety_len, 2) or None
+        crosswalk_is_valid = inputs.get("crosswalk_is_valid",
+                                        None)  # (B, Nc) bool or None
+        speed_bump_points = inputs.get("speed_bump_points",
+                                       None)  # (B, Nb, safety_len, 2) or None
+        speed_bump_is_valid = inputs.get("speed_bump_is_valid",
+                                         None)  # (B, Nb) bool or None
+        driveway_points = inputs.get("driveway_points",
+                                     None)  # (B, Nd, safety_len, 2) or None
+        driveway_is_valid = inputs.get("driveway_is_valid",
+                                       None)  # (B, Nd) bool or None
+        road_edge = inputs.get("road_edge",
+                               None)  # (B, E, safety_len, 2) or None
+        road_edge_is_valid = inputs.get("road_edge_is_valid",
+                                        None)  # (B, E) bool or None
+        road_edge_type = inputs.get("road_edge_type", None)  # (B, E, 3) or None
         has_any_geometry: bool = self._road_safety_has_any_geometry(
             stop_sign_points=stop_sign_points,
             crosswalk_points=crosswalk_points,
@@ -1006,24 +1002,24 @@ class Encoder(nn.Module):
         if not has_any_geometry:
             (encoding_road_safety, road_safety_mask,
              road_safety_pos) = self._build_empty_road_safety_tokens(
-                batch_size=int(lanes.shape[0]),
-                ref_encoding=encoding_lanes,
-                ref_pos=lane_pos)
+                 batch_size=int(lanes.shape[0]),
+                 ref_encoding=encoding_lanes,
+                 ref_pos=lane_pos)
         else:
             (encoding_road_safety, road_safety_mask,
              road_safety_pos) = self.road_safety_encoder(
-                stop_sign_points,
-                stop_sign_is_valid,
-                crosswalk_points,
-                crosswalk_is_valid,
-                speed_bump_points,
-                speed_bump_is_valid,
-                driveway_points,
-                driveway_is_valid,
-                road_edge,
-                road_edge_is_valid,
-                road_edge_type,
-            )
+                 stop_sign_points,
+                 stop_sign_is_valid,
+                 crosswalk_points,
+                 crosswalk_is_valid,
+                 speed_bump_points,
+                 speed_bump_is_valid,
+                 driveway_points,
+                 driveway_is_valid,
+                 road_edge,
+                 road_edge_is_valid,
+                 road_edge_type,
+             )
 
         return (encoding_static, static_mask, static_pos, encoding_lanes,
                 lanes_mask, lane_pos, encoding_road_safety, road_safety_mask,
@@ -1284,9 +1280,7 @@ class Encoder(nn.Module):
                 encoding_road_safety,  # (B, N_road_safety, H)
                 road_safety_mask,  # (B, N_road_safety)
                 road_safety_pos,  # (B, N_road_safety, 9)
-            ) = self._encode_agents_static_lanes(
-                inputs
-            )
+            ) = self._encode_agents_static_lanes(inputs)
 
             # ---- (4) Fusion 입력 토큰 + 위치 임베딩 구성 ----
             (
@@ -1515,6 +1509,7 @@ class SelfAttentionBlock(nn.Module):
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return x
 
+
 class StaticFusionEncoder(nn.Module):
 
     def __init__(self,
@@ -1551,8 +1546,10 @@ class StaticFusionEncoder(nn.Module):
         # ✅ is_valid는 반드시 bool로 통일
         static_objects_is_valid = static_objects_is_valid.to(torch.bool)
 
-        static_xyyaw = static_objects[:, :, :4].clone()  # (B, static_objects_num, 4)
-        static_feature = self._get_static_feature(static_xyyaw)  # (B, static_objects_num, 9)
+        static_xyyaw = static_objects[:, :, :4].clone(
+        )  # (B, static_objects_num, 4)
+        static_feature = self._get_static_feature(
+            static_xyyaw)  # (B, static_objects_num, 9)
 
         # autocast 환경이면 autocast dtype을, 아니면 입력 dtype 사용
         out_dtype = (torch.get_autocast_gpu_dtype()
@@ -1570,10 +1567,12 @@ class StaticFusionEncoder(nn.Module):
         valid_indices = ~mask_p.reshape(-1)  # (B * static_objects_num,)
 
         if valid_indices.any().item():
-            static_objects_flat = static_objects.reshape(B * static_objects_num, -1)
+            static_objects_flat = static_objects.reshape(
+                B * static_objects_num, -1)
             static_objects_valid = static_objects_flat[valid_indices]
             static_objects_valid = self.projection(static_objects_valid)
-            static_objects_valid = static_objects_valid.to(dtype=static_encoding.dtype)
+            static_objects_valid = static_objects_valid.to(
+                dtype=static_encoding.dtype)
             static_encoding[valid_indices] = static_objects_valid
         else:
             # ✅ dtype 승격 방지: touch 누적을 static_encoding dtype으로 맞춤
@@ -1587,7 +1586,8 @@ class StaticFusionEncoder(nn.Module):
             static_encoding = static_encoding + touch * zero  # 값 변화 없음, dtype 유지
 
         hidden_dim = static_encoding.shape[-1]
-        static_encoding = static_encoding.reshape(B, static_objects_num, hidden_dim)
+        static_encoding = static_encoding.reshape(B, static_objects_num,
+                                                  hidden_dim)
         return static_encoding, static_feature
 
     def _get_static_feature(self, static_xyyaw: torch.Tensor) -> torch.Tensor:
@@ -1602,7 +1602,6 @@ class StaticFusionEncoder(nn.Module):
         assert static_feature.shape == (B, static_objects_num, 9), \
             f"Expected static_feature shape (B, static_objects_num, 9), got {static_feature.shape}"
         return static_feature
-
 
 
 class RoadSafetyFusionEncoder(nn.Module):
@@ -2625,14 +2624,15 @@ class LaneFusionEncoder(nn.Module):
         return lane_feature
 
     def forward(
-        self,
-        lanes: torch.Tensor,  # (B, lane_num, lane_len, D_lane)
-        lanes_speed_limit: torch.Tensor,  # (B, lane_num, 1)
-        lanes_has_speed_limit: torch.Tensor,  # (B, lane_num, 1)
-        lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
-        left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
-        right_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
-        lanes_is_valid: torch.Tensor, # (B, lane_num )
+            self,
+            lanes: torch.Tensor,  # (B, lane_num, lane_len, D_lane)
+            lanes_speed_limit: torch.Tensor,  # (B, lane_num, 1)
+            lanes_has_speed_limit: torch.Tensor,  # (B, lane_num, 1)
+            lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
+            left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
+            right_line_type: Optional[
+                torch.Tensor],  # (B, lane_num, 13) or None
+            lanes_is_valid: torch.Tensor,  # (B, lane_num )
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """차선 정보를 lane 단위 임베딩으로 바꿔 반환합니다.
         Returns:
@@ -2656,8 +2656,9 @@ class LaneFusionEncoder(nn.Module):
             dim=-1,
         )  # (B, lane_num, lane_len, 10)
 
-        lane_pos: torch.Tensor = lanes_10[
-            :, :, int(self._lane_len / 2), :4].clone()  # (B, lane_num, 4)
+        lane_pos: torch.Tensor = lanes_10[:, :,
+                                          int(self._lane_len / 2), :4].clone(
+                                          )  # (B, lane_num, 4)
         lane_feature: torch.Tensor = self._get_lane_feature(
             lane_pos)  # (B, lane_num, 9)
 
@@ -2665,8 +2666,8 @@ class LaneFusionEncoder(nn.Module):
 
         valid_indices = lanes_is_valid.reshape(-1).to(
             torch.bool)  # (B*lane_num,)
-        lanes_flat: torch.Tensor = lanes_10.reshape(B * lane_num, lane_len,
-                                                    -1)  # (B*lane_num, lane_len, 10)
+        lanes_flat: torch.Tensor = lanes_10.reshape(
+            B * lane_num, lane_len, -1)  # (B*lane_num, lane_len, 10)
         num_valid: int = int(valid_indices.sum().item())
 
         # ---- (4) 유효 lane이 하나도 없으면 바로 종료(0 반환) ----
@@ -2713,8 +2714,8 @@ class LaneFusionEncoder(nn.Module):
                                           1)  # (num_valid, channel, lane_len)
         lanes_valid = self.token_pre_project(
             lanes_valid)  # (num_valid, channel, tokens_mlp_dim)
-        lanes_valid = lanes_valid.permute(0, 2,
-                                          1)  # (num_valid, tokens_mlp_dim, channel)
+        lanes_valid = lanes_valid.permute(
+            0, 2, 1)  # (num_valid, tokens_mlp_dim, channel)
 
         for block in self.blocks:
             lanes_valid = block(lanes_valid)
@@ -2742,15 +2743,14 @@ class LaneFusionEncoder(nn.Module):
         if lanes_has_speed_limit_valid.any().item():
             speed_limit_with_limit = self.speed_limit_emb(
                 lanes_speed_limit_valid[lanes_has_speed_limit_valid].unsqueeze(
-                    -1)
-            ).to(lanes_valid.dtype)
+                    -1)).to(lanes_valid.dtype)
             speed_limit_embedding[
                 lanes_has_speed_limit_valid] = speed_limit_with_limit
 
         if (~lanes_has_speed_limit_valid).any().item():
             speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-                int((~lanes_has_speed_limit_valid).sum().item()), -1
-            ).to(lanes_valid.dtype)
+                int((~lanes_has_speed_limit_valid).sum().item()),
+                -1).to(lanes_valid.dtype)
             speed_limit_embedding[
                 ~lanes_has_speed_limit_valid] = speed_limit_no_limit
 
@@ -2789,14 +2789,12 @@ class LaneFusionEncoder(nn.Module):
         )
 
         lanes_valid = (
-                lanes_valid
-                + self._apply_scalar_gate_to_embedding(lane_type_embedding,
-                                                       self.lane_type_alpha)
-                + self._apply_scalar_gate_to_embedding(left_line_type_embedding,
-                                                       self.left_line_type_alpha)
-                + self._apply_scalar_gate_to_embedding(
-            right_line_type_embedding, self.right_line_type_alpha)
-        )
+            lanes_valid + self._apply_scalar_gate_to_embedding(
+                lane_type_embedding, self.lane_type_alpha) +
+            self._apply_scalar_gate_to_embedding(left_line_type_embedding,
+                                                 self.left_line_type_alpha) +
+            self._apply_scalar_gate_to_embedding(right_line_type_embedding,
+                                                 self.right_line_type_alpha))
 
         lanes_valid = self.emb_project(
             self.norm(lanes_valid))  # (num_valid, hidden_dim)
@@ -2807,8 +2805,8 @@ class LaneFusionEncoder(nn.Module):
             dtype=lanes_valid.dtype,
         )
         lane_embedding_flat[valid_indices] = lanes_valid
-        lane_embedding: torch.Tensor = lane_embedding_flat.reshape(B, lane_num,
-                                                                   -1)
+        lane_embedding: torch.Tensor = lane_embedding_flat.reshape(
+            B, lane_num, -1)
 
         return lane_embedding, lane_feature
 
@@ -2852,33 +2850,41 @@ class FusionEncoder(nn.Module):
 
         is_invalid_batch = encoding_mask.all(dim=1)  # [B]
         is_valid_batch = ~is_invalid_batch  # [B]
-        out_tokens = encoding_input.new_zeros(B, token_num, H)  # [B, token_num, H]
+        out_tokens = encoding_input.new_zeros(B, token_num,
+                                              H)  # [B, token_num, H]
 
         if is_valid_batch.any().item():
             on_batch_tokens = encoding_input[is_valid_batch]
             on_batch_token_mask = encoding_mask[is_valid_batch]
             on_B: int = on_batch_tokens.size(0)
 
-            cls_tokens = self.cls_token.expand(on_B, 1, H).to(on_batch_tokens.dtype)
+            cls_tokens = self.cls_token.expand(on_B, 1,
+                                               H).to(on_batch_tokens.dtype)
             cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens], dim=1)
             cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
             cls_with_tokens[:, 0:1, :] = cls_with_tokens[:, 0:1, :] + cls_pos
 
-            cls_false = torch.zeros(on_B, 1, dtype=torch.bool, device=on_batch_token_mask.device)
-            cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask], dim=1)
+            cls_false = torch.zeros(on_B,
+                                    1,
+                                    dtype=torch.bool,
+                                    device=on_batch_token_mask.device)
+            cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask],
+                                            dim=1)
 
             for block in self.blocks:
                 cls_with_tokens = block(cls_with_tokens, cls_with_token_mask)
 
             cls_with_tokens = self.norm(cls_with_tokens)
-            cls_with_tokens = cls_with_tokens.masked_fill(cls_with_token_mask.unsqueeze(-1), 0.0)
+            cls_with_tokens = cls_with_tokens.masked_fill(
+                cls_with_token_mask.unsqueeze(-1), 0.0)
 
             fused_wo_cls = cls_with_tokens[:, 1:, :]
             out_tokens[is_valid_batch] = fused_wo_cls.to(out_tokens.dtype)
 
         else:
             # 모든 배치가 패딩이면, 파라미터들을 0-스케일로 "한 번에" 터치해서 DDP unused param 방지
-            touch = (self.cls_token[..., :1].sum() + self.cls_pos[..., :1].sum())
+            touch = (self.cls_token[..., :1].sum() +
+                     self.cls_pos[..., :1].sum())
 
             for blk in self.blocks:
                 for p in blk.parameters():
@@ -2892,4 +2898,3 @@ class FusionEncoder(nn.Module):
             out_tokens = out_tokens + touch * 0.0
 
         return out_tokens, encoding_mask
-

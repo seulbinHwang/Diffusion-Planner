@@ -48,7 +48,6 @@ def _move_batch_to_device(
     return batch_on_device
 
 
-
 def assert_cur_future_valid_mask_np(
     valid_bpt: np.ndarray,
     context: str = "savgol_filter_for_control",
@@ -175,8 +174,6 @@ def _as_bool_mask(mask: torch.Tensor) -> torch.Tensor:
     if mask.dtype == torch.bool:
         return mask
     return mask > 0
-
-
 
 
 def _restore_padding_values_inplace(

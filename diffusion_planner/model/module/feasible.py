@@ -642,7 +642,6 @@ class FeasibleProjector(nn.Module):
             int,  # future_len_ds
     ]:
         """FeasibleProjector용 다운샘플링 궤적/마스크를 구성하는 메인 함수.
-
         흐름:
             1) 과거 길이(past_len), 미래 길이(future_len)를 계산합니다.
             2) config + past_len 으로 과거 사용 여부(use_past)를 정합니다.
@@ -2190,7 +2189,7 @@ class FeasibleProjector(nn.Module):
         omega_k: torch.Tensor,  # (B,Pnn)
         hp: _ConstraintHParams,
         key_to_limit_bp: Dict[str, torch.Tensor],
-        slip_epsilon: float = 0.20,
+        slip_epsilon: float = 0.1,
         apply_S2: bool = True,
         apply_S4_ax: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
