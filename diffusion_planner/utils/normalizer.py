@@ -198,7 +198,7 @@ class ObservationNormalizer:
             }
         return cls(ndt)
 
-    def __call__(self, data, use_masking: bool = True) -> dict:
+    def __call__(self, data) -> dict:
         device_type = "cuda"
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
@@ -207,8 +207,7 @@ class ObservationNormalizer:
                     continue
                 norm_data[k] = (data[k] - v["mean"].to(
                     data[k].device)) / v["std"].to(data[k].device)
-                if use_masking:
-                    self._mask_invalid_data(norm_data)
+                self._mask_invalid_data(norm_data)
             # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
             if "agent_route_lane_order" in data:
                 norm_data["agent_route_lane_order"] = data[
@@ -218,64 +217,50 @@ class ObservationNormalizer:
 
     def _mask_invalid_data(self, norm_data: dict) -> None:
         """
-        ego_future_gt_3_dim : (B, F, 3) ->
-        neighbor_future_gt_3_dim : (B, A_max, F, 3) ->
-        near_future_gt_3_dim : (B, A_near, F, 3) ->
+        norm_data 안의 '*_is_valid' 마스크가 False인 위치를 0으로 마스킹합니다.
+        - norm_data.get(key, None)로 값을 가져옵니다.
+        - 마스크 또는 대상 텐서가 None이면 해당 항목 마스킹을 스킵합니다.
+
+        대표 shape 예시:
+            ego_agent_past: (B, T, 11)
+            planner_future_11_dim: (B, F, 11)
+            neighbor_agents_past: (B, A_max, T, 11)
+            lanes: (B, L_max, lane_len, 12)
+            route_lanes: (B, R_max, route_len, 12)
+            near_agents_past: (B, A_near, T, 11)
         """
-        ego_agent_past_is_valid = norm_data["ego_agent_past_is_valid"]  # (B, T)
-        # ego_agent_past_is_valid 가 False인 위치를 0으로 마스킹
-        norm_data["ego_agent_past"][~ego_agent_past_is_valid] = 0
 
-        ego_future_gt_is_valid = norm_data["ego_future_gt_is_valid"]  # (B, F)
-        norm_data["planner_future_11_dim"][~ego_future_gt_is_valid] = 0
+        def _mask_inplace(data_key: str, valid_key: str) -> None:
+            """data_key 텐서에서 valid_key 마스크가 False인 위치를 0으로 만든다."""
+            valid = norm_data.get(valid_key, None)
+            data = norm_data.get(data_key, None)
+            if valid is None or data is None:
+                return
+            data[~valid] = 0.
 
-        neighbor_agents_past_is_valid = norm_data[
-            "neighbor_agents_past_is_valid"]  # (B, A_max, T)
-        norm_data["neighbor_agents_past"][~neighbor_agents_past_is_valid] = 0
+        _mask_inplace("ego_agent_past", "ego_agent_past_is_valid")
+        _mask_inplace("planner_future_11_dim", "ego_future_gt_is_valid")
+        _mask_inplace("neighbor_agents_past", "neighbor_agents_past_is_valid")
 
-        stop_sign_is_valid = norm_data["stop_sign_is_valid"]  # (B, N)
-        norm_data["stop_sign_points"][~stop_sign_is_valid] = 0
+        _mask_inplace("stop_sign_points", "stop_sign_is_valid")
+        _mask_inplace("crosswalk_points", "crosswalk_is_valid")
 
-        crosswalk_is_valid = norm_data["crosswalk_is_valid"]  # (B, N)
-        norm_data["crosswalk_points"][~crosswalk_is_valid] = 0
+        _mask_inplace("lanes", "lanes_len_is_valid")
+        _mask_inplace("lanes_speed_limit", "lanes_is_valid")
 
-        lanes_len_is_valid = norm_data[
-            "lanes_len_is_valid"]  # (B, L_max, lane_len)
-        norm_data["lanes"][~lanes_len_is_valid] = 0
+        _mask_inplace("static_objects", "static_objects_is_valid")
 
-        lanes_is_valid = norm_data["lanes_is_valid"]  # (B, L_max)
-        norm_data["lanes_speed_limit"][~lanes_is_valid] = 0
+        _mask_inplace("route_lanes", "route_lanes_len_is_valid")
+        _mask_inplace("route_lanes_speed_limit", "route_lanes_is_valid")
 
-        static_objects_is_valid = norm_data[
-            "static_objects_is_valid"]  # (B, S_max)
-        norm_data["static_objects"][~static_objects_is_valid] = 0
+        _mask_inplace("speed_bump_points", "speed_bump_is_valid")
+        _mask_inplace("driveway_points", "driveway_is_valid")
+        _mask_inplace("road_edge", "road_edge_is_valid")
 
-        route_lanes_len_is_valid = norm_data[
-            "route_lanes_len_is_valid"]  # (B, R_max, route_len_max)
-        norm_data["route_lanes"][~route_lanes_len_is_valid] = 0
+        _mask_inplace("near_agents_past", "near_agents_past_is_valid")
+        _mask_inplace("non_near_agents_past", "non_near_agents_past_is_valid")
 
-        route_lanes_is_valid = norm_data["route_lanes_is_valid"]  # (B, R_max)
-        norm_data["route_lanes_speed_limit"][~route_lanes_is_valid] = 0
-
-        speed_bump_is_valid = norm_data["speed_bump_is_valid"]  # (B, N)
-        norm_data["speed_bump_points"][~speed_bump_is_valid] = 0
-
-        driveway_is_valid = norm_data["driveway_is_valid"]  # (B, N)
-        norm_data["driveway_points"][~driveway_is_valid] = 0
-
-        road_edge_is_valid = norm_data["road_edge_is_valid"]  # (B, N)
-        norm_data["road_edge"][~road_edge_is_valid] = 0
-
-        near_agents_past_is_valid = norm_data[
-            "near_agents_past_is_valid"]  # (B, A_near, T)
-        norm_data["near_agents_past"][~near_agents_past_is_valid] = 0
-
-        non_near_agents_past_is_valid = norm_data[
-            "non_near_agents_past_is_valid"]  # (B, A_non_near, T)
-        norm_data["non_near_agents_past"][~non_near_agents_past_is_valid] = 0
-
-    def inverse(self, data: dict, use_masking: bool = True
-                ) -> dict:
+    def inverse(self, data: dict) -> dict:
         device_type = "cuda"
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
@@ -286,8 +271,7 @@ class ObservationNormalizer:
                     continue
                 norm_data[k] = data[k] * v["std"].to(
                     data[k].device) + v["mean"].to(data[k].device)
-                if use_masking:
-                    self._mask_invalid_data(norm_data)
+                self._mask_invalid_data(norm_data)
 
             # 패스스루 키는 원본 그대로 (정수 유지)
             if "agent_route_lane_order" in data:

@@ -3280,7 +3280,7 @@ class DiT(nn.Module):
 
             # --- (3) 관측 정규화 → FeasibleProjector 네트워크(TCN) 보정 ---
             temp_dict = {"seg_body_control": unnorm_seg_body_control_stride}
-            temp_dict = self.config.observation_normalizer(temp_dict,use_masking=False)
+            temp_dict = self.config.observation_normalizer(temp_dict)
             seg_body_control_stride = temp_dict[
                 "seg_body_control"]  # (B, Pnn, segment_len_ds, 3)
 
@@ -3305,7 +3305,7 @@ class DiT(nn.Module):
 
             seg_body_control_stride_ref = seg_body_control_stride_ref.float()
             temp_dict = {"seg_body_control": seg_body_control_stride_ref}
-            temp_dict = self.config.observation_normalizer.inverse(temp_dict, use_masking=False)
+            temp_dict = self.config.observation_normalizer.inverse(temp_dict)
             unnorm_seg_body_control_stride_ref = temp_dict[
                 "seg_body_control"]  # (B, Pnn, segment_len_ds, 3)
 
@@ -3348,7 +3348,7 @@ class DiT(nn.Module):
                 ~near_future_mask.unsqueeze(-1), 0.0)
 
             temp_dict = {"seg_body_control": unnorm_control_constraint_diff}
-            temp_dict = self.config.observation_normalizer(temp_dict, use_masking=False)
+            temp_dict = self.config.observation_normalizer(temp_dict)
             control_constraint_diff = temp_dict[
                 "seg_body_control"]  # (B, Pnn, future_len, 3)
             control_constraint_diff = control_constraint_diff.masked_fill(
