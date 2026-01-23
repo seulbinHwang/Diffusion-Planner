@@ -956,6 +956,7 @@ class Encoder(nn.Module):
         # static_mask = ~static_objects_is_valid
         encoding_static, static_pos = self.static_encoder(
             static_objects_tensor, static_objects_is_valid)
+        static_mask = ~static_objects_is_valid
 
         # --- lane encoder ---
         """
@@ -974,19 +975,39 @@ class Encoder(nn.Module):
         right_line_type = inputs.get(
             "right_line_type", None)  # (B, L, 13) or None
         ##################################
-        lanes_len_is_valid = inputs.get(
-            "lanes_len_is_valid", None)  # (B, L, lane_len) or None
-        lanes_is_valid = inputs.get(
-            "lanes_is_valid", None)  # (B, L) or None
-        encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
+        lanes_is_valid = inputs["lanes_is_valid"] # (B, L)
+        encoding_lanes, lane_pos = self.lane_encoder(
             lanes, lanes_speed_limit, lanes_has_speed_limit, lane_type,
-            left_line_type, right_line_type)
+            left_line_type, right_line_type,lanes_is_valid)
+        lanes_mask = ~lanes_is_valid
         # --- road safety encoder (입력이 전부 None이면 "빈 토큰"으로 대체) ---
         """
         encoding_road_safety : (B, road_safety_num, hidden_dim)
         road_safety_mask     : (B, road_safety_num)
         road_safety_pos      : (B, road_safety_num, 9)
         """
+        stop_sign_points = inputs.get(
+            "stop_sign_points", None)  # (B, Ns, safety_len, 2) or None
+        stop_sign_is_valid = inputs.get(
+            "stop_sign_is_valid", None)  # (B, Ns) bool or None
+        crosswalk_points = inputs.get(
+            "crosswalk_points", None)  # (B, Nc, safety_len, 2) or None
+        crosswalk_is_valid = inputs.get(
+            "crosswalk_is_valid", None)  # (B, Nc) bool or None
+        speed_bump_points = inputs.get(
+            "speed_bump_points", None)  # (B, Nb, safety_len, 2) or None
+        speed_bump_is_valid = inputs.get(
+            "speed_bump_is_valid", None)  # (B, Nb) bool or None
+        driveway_points = inputs.get(
+            "driveway_points", None)  # (B, Nd, safety_len, 2) or None
+        driveway_is_valid = inputs.get(
+            "driveway_is_valid", None)  # (B, Nd) bool or None
+        road_edge = inputs.get(
+            "road_edge", None)  # (B, E, safety_len, 2) or None
+        road_edge_is_valid = inputs.get(
+            "road_edge_is_valid", None)  # (B, E) bool or None
+        road_edge_type = inputs.get(
+            "road_edge_type", None)  # (B, E, 3) or None
         if self._road_safety_inputs_are_all_none(
                 stop_sign_points,
                 stop_sign_is_valid,
@@ -2628,30 +2649,12 @@ class LaneFusionEncoder(nn.Module):
         lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
         left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
         right_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        lanes_is_valid: torch.Tensor, # (B, lane_num )
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """차선 정보를 lane 단위 임베딩으로 바꿔 반환합니다.
-
-        Args:
-            lanes (torch.Tensor):
-                모양: (B, lane_num, lane_len, D_lane)
-                예시 채널 구성:
-                    - 앞 8개 채널: 차선 중심/경계 관련 값
-                    - 뒤 4개 채널: 신호등(traffic) 관련 값
-            lanes_speed_limit (torch.Tensor):
-                모양: (B, lane_num, 1)
-            lanes_has_speed_limit (torch.Tensor):
-                모양: (B, lane_num, 1)  (0/1 또는 bool)
-            lane_type (Optional[torch.Tensor]):
-                모양: (B, lane_num, 4) 또는 None
-            left_line_type (Optional[torch.Tensor]):
-                모양: (B, lane_num, 13) 또는 None
-            right_line_type (Optional[torch.Tensor]):
-                모양: (B, lane_num, 13) 또는 None
-
         Returns:
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 - lane_embedding: (B, lane_num, hidden_dim)
-                - mask_p:         (B, lane_num)  True=해당 lane이 비어있음
                 - lane_feature:   (B, lane_num, 8)  위치 임베딩용 [x,y,dir(2), type(4)]
         """
         # traffic: (B, lane_num, 4)
@@ -2661,8 +2664,10 @@ class LaneFusionEncoder(nn.Module):
         lanes_8: torch.Tensor = lanes[..., :8]
 
         # ---- (1) 좌/우 경계 유효 플래그 추가 ----
+        # left_is_valid: (B, lane_num, lane_len) bool
+        # right_is_valid: (B, lane_num, lane_len) bool
         left_is_valid, right_is_valid = self._compute_boundary_valid_flags(
-            lanes_8)  # (B, lane_num, lane_len), (B, lane_num, lane_len)
+            lanes_8)
 
         # lanes_10: (B, lane_num, lane_len, 10)
         lanes_10: torch.Tensor = torch.cat(
@@ -2679,21 +2684,16 @@ class LaneFusionEncoder(nn.Module):
         lane_pos: torch.Tensor = lanes_10[:, :,
                                           int(self._lane_len / 2), :4].clone()
         lane_feature: torch.Tensor = self._get_lane_feature(
-            lane_pos)  # (B, lane_num, 8)
+            lane_pos)  # (B, lane_num, 9)
 
         # ---- (3) lane 유효 마스크 ----
         B, lane_num, lane_len, _ = lanes_10.shape
 
-        # mask_v: (B, lane_num, lane_len)  True=해당 점이 비어있음
-        mask_v: torch.Tensor = torch.sum(torch.ne(lanes_10[..., :8], 0),
-                                         dim=-1).to(lanes_10.device) == 0
-        # mask_p: (B, lane_num) True=해당 lane이 전부 비어있음
-        mask_p: torch.Tensor = torch.sum(~mask_v, dim=-1) == 0
-
+        # lanes_is_valid: (B, lane_num) bool
+        valid_indices = lanes_is_valid.reshape(-1)  # (B*lane_num,) bool
         # flatten
         lanes_flat: torch.Tensor = lanes_10.reshape(
             B * lane_num, lane_len, -1)  # (B*lane_num, lane_len, 10)
-        valid_indices: torch.Tensor = ~mask_p.reshape(-1)  # (B*lane_num,) bool
         num_valid: int = int(valid_indices.sum().item())
 
         # ---- (4) 유효 lane이 하나도 없으면 바로 종료(0 반환) ----
@@ -2727,8 +2727,7 @@ class LaneFusionEncoder(nn.Module):
             touch = touch + self.lane_type_alpha.to(out_dtype)
             touch = touch + self.left_line_type_alpha.to(out_dtype)
             touch = touch + self.right_line_type_alpha.to(out_dtype)
-            return lane_embedding + touch * 0.0, mask_p.reshape(
-                B, lane_num), lane_feature
+            return lane_embedding + touch * 0.0, lane_feature
 
         # ---- (5) 유효 lane만 인코딩 ----
         lanes_valid: torch.Tensor = lanes_flat[
@@ -2842,7 +2841,7 @@ class LaneFusionEncoder(nn.Module):
 
         lane_embedding: torch.Tensor = lane_embedding_flat.reshape(
             B, lane_num, -1)  # (B, lane_num, hidden_dim)
-        return lane_embedding, mask_p.reshape(B, lane_num), lane_feature
+        return lane_embedding, lane_feature
 
 
 class FusionEncoder(nn.Module):
