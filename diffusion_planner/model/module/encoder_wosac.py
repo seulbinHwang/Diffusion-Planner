@@ -687,60 +687,10 @@ class Encoder(nn.Module):
         known_mask = time_index.unsqueeze(0) < prefix_lengths.unsqueeze(1)
         return known_mask  # (B, N), bool
 
-    def _truncate_and_pad_ego_future_for_encoder(
-            self,
-            planner_future_11_dim: torch.Tensor,  # (B, future_len, 11)
-            known_mask: torch.Tensor) -> torch.Tensor:
-        """미래 궤적을 [처음 M_i 스텝 유지 + 나머지 0패딩]으로 변환합니다.
-
-        주의:
-        - 에이전트 인코더의 assert(길이 고정)를 만족시키기 위해 **길이는 그대로 N 유지**합니다.
-        - 마스크 판단은 에이전서 내부에서 첫 8채널이 0인지로 이루어지므로,
-          M_i 이후 프레임은 **앞 8채널을 0**으로 채웁니다.
-        - 마지막 3채널(type)은 항상 ego를 의미하도록 **[1,0,0]**(또는 입력의 ego one-hot)을 유지합니다.
-
-        Args:
-            planner_future_11_dim (torch.Tensor):
-                형태: [B, future_len, 11]
-                채널: [x, y, cos, sin, vx, vy, w, l, type(3)]
-            known_mask (torch.Tensor):
-                형태: [B, future_len], bool
-                True=조건 제공(유지), False=미제공(패딩)
-
-        Returns:
-            torch.Tensor:
-                형태: [B, future_len, 11]
-                처음 M_i는 원본 유지, 나머지는 앞 8채널 0, type 3채널은 ego one-hot 유지.
-        """
-        B, future_len, D = planner_future_11_dim.shape  # (B, future_len, 11)
-        assert D == 11, "ego_future_full의 마지막 차원은 11이어야 합니다."
-
-        # (B, 3) ego 타입 벡터를 첫 프레임에서 추출(이미 one-hot이라 가정)
-        ego_type = planner_future_11_dim[:, 0, 8:11].clone()  # (B, 3)
-
-        # 기본 패딩 텐서: 앞 8채널=0, type 3채널=ego one-hot 반복
-        padded_default = planner_future_11_dim.new_zeros(
-            B, future_len, D)  # (B, future_len, 11)
-        padded_default[:, :,
-                       8:11] = ego_type.unsqueeze(1).expand(-1, future_len, -1)
-
-        # keep: (B, future_len, 1)  True=원본 유지
-        keep = known_mask.unsqueeze(-1)
-
-        # 최종: 알려진 구간은 원본, 나머지는 기본 패딩
-        truncated_ego_future = torch.where(
-            keep, planner_future_11_dim, padded_default)  # (B, future_len, 11)
-        return truncated_ego_future
-
     def _prepare_encoder_inputs(
         self,
         inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
-            Optional[torch.
-                     Tensor],  # ego_agent_past: (B, 1, time_len, 11) or None
-            Optional[
-                torch.
-                Tensor],  # planner_future_11_dim: (B, future_len, 11) or None
             Optional[
                 torch.
                 Tensor],  # neighbor_agents_past: (B, A, time_len, 11) or None
@@ -794,8 +744,6 @@ class Encoder(nn.Module):
             inputs (Dict[str, torch.Tensor]):
                 키가 없을 수 있으므로, 모든 키는 optional로 취급합니다.
                 예:
-                    - "ego_agent_past":          (B, time_len, 11)
-                    - "planner_future_11_dim":   (B, future_len, 11)
                     - "neighbor_agents_past":    (B, A, time_len, 11)
                     - "static_objects":          (B, P, D_static)
                     - "lanes":                   (B, L, lane_len, D_lane)
@@ -820,16 +768,11 @@ class Encoder(nn.Module):
                     우선순위로 배치 크기를 추정합니다.
                     1) neighbor_agents_past.shape[0]
                     2) ego_agent_past(before unsqueeze).shape[0]
-                    3) planner_future_11_dim.shape[0]
                     4) 그 외 전부 None이면 0
                 - future_len:
                     planner_future_11_dim이 있으면 shape[1], 없으면 0
         """
         # --- 1) 전부 get(...) 로 가져오기 ---
-        ego_agent_past: Optional[torch.Tensor] = inputs.get(
-            "ego_agent_past", None)  # (B, T, 11) or None
-        planner_future_11_dim: Optional[torch.Tensor] = inputs.get(
-            "planner_future_11_dim", None)  # (B, Tf, 11) or None
         neighbor_agents_past: Optional[torch.Tensor] = inputs.get(
             "neighbor_agents_past", None)  # (B, A, T, 11) or None
         non_near_agents_past: Optional[torch.Tensor] = inputs.get(
@@ -877,11 +820,6 @@ class Encoder(nn.Module):
         road_edge_type: Optional[torch.Tensor] = inputs.get(
             "road_edge_type", None)  # (B, E, 3) or None
 
-        # --- 2) ego/neighbor 속도 채널 제거 + ego 차원 맞추기 ---
-        if ego_agent_past is not None:
-            if not self.config.use_vel_input:
-                ego_agent_past[:, :, 4:6] = 0.0  # vx, vy
-            ego_agent_past = ego_agent_past.unsqueeze(1)  # (B, 1, T, 11)
 
         if neighbor_agents_past is not None:
             if not self.config.use_vel_input:
@@ -890,13 +828,8 @@ class Encoder(nn.Module):
             if not self.config.use_vel_input:
                 non_near_agents_past[:, :, :, 4:6] = 0.0  # vx, vy
 
-        B: int = 0
-        if neighbor_agents_past is not None:
-            B = int(neighbor_agents_past.shape[0])
-        elif ego_agent_past is not None:
-            B = int(ego_agent_past.shape[0])
-        elif planner_future_11_dim is not None:
-            B = int(planner_future_11_dim.shape[0])
+        assert lanes is not None, "lanes tensor is required"
+        B = int(lanes.shape[0])
 
         # --- 4) (옵션) 평가 모드에서 route encoding 강제 무시 ---
         self.neglect_route_encoding = False
@@ -906,8 +839,6 @@ class Encoder(nn.Module):
                                                          fill_value=-1)
 
         return (
-            ego_agent_past,
-            planner_future_11_dim,
             neighbor_agents_past,
             non_near_agents_past,
             static_objects,
@@ -935,9 +866,10 @@ class Encoder(nn.Module):
     def _ensure_static_objects_tensor(
         self,
         static_objects: Optional[torch.Tensor],
+        static_objects_is_valid: Optional[torch.Tensor],
         batch_size: int,
         ref_tensor: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """static_objects가 None이어도 정적 물체 인코더가 항상 동작하도록 입력 텐서를 보장합니다.
 
         학습 데이터에서 정적 물체가 하나도 없는 장면은 `static_objects=None`으로 들어올 수 있습니다.
@@ -952,109 +884,42 @@ class Encoder(nn.Module):
                - (B, P, D_static) 모양인지 확인하고,
                - device가 다르면 ref_tensor의 device로만 옮겨서 그대로 반환합니다.
 
-            2) static_objects가 None이거나, P==0(정말 비어있는 텐서)면:
+            2) static_objects가 None이면,
                - (B, P, D_static) 텐서를 새로 만듭니다.
-               - P는 가능하면 config.static_num(또는 config.static_objects_num)을 사용하고,
-                 둘 다 없으면 1로 둡니다.
-               - 그중 **첫 번째 물체(인덱스 0)** 를 “정적 물체가 없음”을 나타내는 자리로 사용합니다.
-                 이 토큰이 StaticFusionEncoder 내부 마스크에서 **유효(mask=False)** 로 잡히도록,
-                 [x, y, cos, sin] 중 cos 채널(인덱스 2)에 1.0을 넣습니다.
-                 (나머지 값은 0이라서, 실제 물체와 겹치기 어려운 형태가 됩니다.)
-
-        Args:
-            static_objects (Optional[torch.Tensor]):
-                - shape: (B, P, D_static) 또는 None
-                - D_static은 보통 10이며, 앞 4채널은 [x, y, cos, sin]이라고 가정합니다.
-            batch_size (int):
-                - 배치 크기 B
-            ref_tensor (torch.Tensor):
-                - device/dtype 기준 텐서
-                - 예: encoding_agents_chunk (B, N_agents_tok, H)
-
-        Returns:
-            torch.Tensor:
-                - shape: (B, P, D_static)
-                - static_objects가 None이어도 StaticFusionEncoder에 바로 넣을 수 있는 텐서
+               - P는  1로 둡니다.
         """
         B: int = int(batch_size)
-        if B <= 0:
-            raise ValueError(f"batch_size must be > 0. got {B}")
 
         # D_static: 정적 물체 feature 차원
         D_static: int = int(getattr(self.config, "static_objects_state_dim"))
-        if D_static < 10:
-            raise ValueError(
-                f"static_objects_state_dim must be >= 10. got {D_static}")
-        static_objects_num = 1
-        # # P(정적 물체 최대 개수): 가능하면 config에서 가져오고, 없으면 1
-        # if hasattr(self.config, "static_num"):
-        #     static_objects_num: int = int(getattr(self.config, "static_num"))
-        # elif hasattr(self.config, "static_objects_num"):
-        #     static_objects_num = int(getattr(self.config, "static_objects_num"))
-        # else:
-        #     static_objects_num = 1
-        #
-        # static_objects_num = max(1, static_objects_num)
+
+
 
         # -------------------------
         # (1) 입력이 이미 텐서인 경우
         # -------------------------
         if static_objects is not None:
-            if static_objects.dim() != 3:
-                raise ValueError(
-                    f"static_objects must be (B, P, D_static). got {tuple(static_objects.shape)}"
-                )
-            if int(static_objects.shape[0]) != B:
-                raise ValueError(
-                    f"static_objects batch size mismatch. expected B={B}, got {int(static_objects.shape[0])}"
-                )
-            if int(static_objects.shape[2]) != D_static:
-                raise ValueError(
-                    f"static_objects last dim mismatch. expected D_static={D_static}, got {int(static_objects.shape[2])}"
-                )
-
+            assert static_objects_is_valid is not None, \
+                "static_objects_is_valid must be provided when static_objects is given"
             # (B, P, D_static)
             if static_objects.device != ref_tensor.device:
                 static_objects = static_objects.to(device=ref_tensor.device)
-            return static_objects
+            return static_objects, static_objects_is_valid
 
         # -------------------------
         # (2) None(또는 사실상 비어있음)인 경우: "없음 표시" 입력 생성
         # -------------------------
         # placeholder_static_objects: (B, P, D_static)
+        static_objects_num = 1
         placeholder_static_objects: torch.Tensor = ref_tensor.new_zeros(
             (B, static_objects_num, D_static))
-
-        # 첫 번째 토큰을 "없음 표시"로 사용하되, 마스크가 False(유효)로 잡히도록 cos=1
-        # x=0, y=0, cos=1, sin=0  (B, )
-        # placeholder_static_objects[:, 0, 2] = 1.0
-
-        return placeholder_static_objects
+        static_objects_is_valid:  torch.Tensor = ref_tensor.new_zeros(
+            (B, static_objects_num), dtype=torch.bool)  # True = 유효
+        return placeholder_static_objects, static_objects_is_valid
 
     def _encode_agents_static_lanes(
         self,
-        static_objects: torch.Tensor,  # (B, P, D_static)
-        lanes: torch.Tensor,  # (B, L, lane_len, D_lane)
-        lanes_speed_limit: torch.Tensor,  # (B, L, 1)
-        lanes_has_speed_limit: torch.Tensor,  # (B, L, 1)
-        lane_type: Optional[torch.Tensor],  # (B, L, 4)
-        left_line_type: Optional[torch.Tensor],  # (B, L, 13)
-        right_line_type: Optional[torch.Tensor],  # (B, L, 13)
-        stop_sign_points: Optional[
-            torch.Tensor] = None,  # (B, Ns, safety_len, 2)
-        stop_sign_is_valid: Optional[torch.Tensor] = None,  # (B, Ns)
-        crosswalk_points: Optional[
-            torch.Tensor] = None,  # (B, Nc, safety_len, 2)
-        crosswalk_is_valid: Optional[torch.Tensor] = None,  # (B, Nc)
-        speed_bump_points: Optional[
-            torch.Tensor] = None,  # (B, Nb, safety_len, 2)
-        speed_bump_is_valid: Optional[torch.Tensor] = None,  # (B, Nb)
-        driveway_points: Optional[
-            torch.Tensor] = None,  # (B, Nd, safety_len, 2)
-        driveway_is_valid: Optional[torch.Tensor] = None,  # (B, Nd)
-        road_edge: Optional[torch.Tensor] = None,  # (B, E, safety_len, 2)
-        road_edge_is_valid: Optional[torch.Tensor] = None,  # (B, E)
-        road_edge_type: Optional[torch.Tensor] = None,  # (B, E, 3)
+        inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
             torch.Tensor,  # encoding_static:       (B, N_static, H)
             torch.Tensor,  # static_mask:           (B, N_static)
@@ -1076,14 +941,21 @@ class Encoder(nn.Module):
         static_mask:     (B, static_objects_num)
         static_pos:      (B, static_objects_num, 9)
         """
+        lanes = inputs["lanes"]  # (B, L, lane_len, D_lane)
         # static_objects가 None일 수도 있으므로, 항상 텐서로 보장해서 넣는다.
-        static_objects_tensor: torch.Tensor = self._ensure_static_objects_tensor(
+        static_objects: Optional[torch.Tensor] = inputs.get(
+            "static_objects", None)  # (B, P, D_static) or None
+        static_objects_is_valid: Optional[torch.Tensor] = inputs.get(
+            "static_objects_is_valid", None)  # (B, P) bool or None
+        static_objects_tensor, static_objects_is_valid = self._ensure_static_objects_tensor(
             static_objects=static_objects,  # (B, P, D_static) or None
+            static_objects_is_valid=static_objects_is_valid, # (B, P) bool or None
             batch_size=int(lanes.shape[0]),  # B
             ref_tensor=lanes,  # (B, N_agents_tok, H)  device/dtype 기준
         )  # (B, P, D_static)
-        encoding_static, static_mask, static_pos = self.static_encoder(
-            static_objects_tensor)
+        # static_mask = ~static_objects_is_valid
+        encoding_static, static_pos = self.static_encoder(
+            static_objects_tensor, static_objects_is_valid)
 
         # --- lane encoder ---
         """
@@ -1091,6 +963,21 @@ class Encoder(nn.Module):
         lanes_mask:     (B, lane_num)
         lane_pos:       (B, lane_num, 9)
         """
+        lanes_speed_limit = inputs.get(
+            "lanes_speed_limit", None)  # (B, L, 1) or None
+        lanes_has_speed_limit = inputs.get(
+            "lanes_has_speed_limit", None)  # (B, L, 1) or None
+        lane_type = inputs.get(
+            "lane_type", None)  # (B, L, 4) or None
+        left_line_type = inputs.get(
+            "left_line_type", None)  # (B, L, 13) or None
+        right_line_type = inputs.get(
+            "right_line_type", None)  # (B, L, 13) or None
+        ##################################
+        lanes_len_is_valid = inputs.get(
+            "lanes_len_is_valid", None)  # (B, L, lane_len) or None
+        lanes_is_valid = inputs.get(
+            "lanes_is_valid", None)  # (B, L) or None
         encoding_lanes, lanes_mask, lane_pos = self.lane_encoder(
             lanes, lanes_speed_limit, lanes_has_speed_limit, lane_type,
             left_line_type, right_line_type)
@@ -1321,8 +1208,6 @@ class Encoder(nn.Module):
             encoder_outputs:
                 - "encoding":                  (B, token_num, H)
                 - "encoding_mask":             (B, token_num)
-                - "near_agents_route_lane_emb":(B, Pnn, H)
-                - "route_known_mask":          (B, Pnn)  True=유효 route 보유 에이전트
         """
         encoder_outputs: Dict[str, torch.Tensor] = {}
 
@@ -1342,42 +1227,12 @@ class Encoder(nn.Module):
 
     def forward(self, inputs: Dict[str,
                                    torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """인코더 전방 패스(무작위 길이 M만큼 ego 미래를 조건으로 사용하는 버전).
-
-        입력 딕셔너리
-            ego_agent_past : (B, time_len, 11) #
-            ego_future_gt_3_dim : (B, future_len, 3)
-            neighbor_agents_past : (B, agent_num, time_len, 11) #
-            lanes : (B, lane_num, lane_len, 12) #
-            lanes_speed_limit : (B, lane_num, 1) #
-            lanes_has_speed_limit : (B, lane_num, 1) #
-            route_lanes : (B, route_num, route_len, 12)
-            route_lanes_speed_limit : (B, route_num, 1)
-            route_lanes_has_speed_limit : (B, route_num, 1)
-            static_objects : (B, static_num, 10) #
-            near_future_gt_3_dim: (B, Pnn, future_len, 3)
-            planner_future_11_dim: (B, future_len, 11) #
-            agent_route_lane_order: (B, agent_num, lane_num)
-
-            near_future_valid: (B, Pnn, future_len) 미래 유효 마스크.
-            near_cur_future_norm_xT: (B, Pnn, 1+future_len, 4) 현재+미래 x_T.
-            batch_diffusion_time: (B,) diffusion 시간.
-            cond_last_pos_norm: (B, Pnn, 4) cond 용 마지막 위치.
-
-        처리 흐름:
-            1) 입력 텐서 정리 및 속도 채널(vx, vy) 0 세팅(옵션).
-            2) 학습 모드에서는 배치별로 ego 미래를 앞쪽 M 스텝만 남기고 나머지는 0으로 패딩.
-            3) 에이전트/정적/차선 인코더를 통과시켜 토큰/마스크/위치 좌표를 만든다.
-            4) 세 토큰을 한 줄로 이어 붙이고, 위치 임베딩(pos_emb)을 더해 FusionEncoder에 넣는다.
-            5) lane 토큰으로부터 route-lane 요약 벡터를 뽑고, 최종 encoder 출력 dict를 만든다.
+        """인코더 전방 패스
 
         Returns:
             Dict[str, torch.Tensor]:
                 - "encoding":                  (B, token_num, hidden_dim)
                 - "encoding_mask":             (B, token_num)
-                - "ego_fut_global":            (B, hidden_dim)
-                - "near_agents_route_lane_emb":(B, Pnn, hidden_dim)
-                - "route_known_mask":          (B, Pnn)
         """
         # 로컬 인코더가 고정돼 있으면, 학습 모드에서도 로컬만 eval로 내려 출력 흔들림을 막는다.
         self._sync_encoder_local_train_eval_mode()
@@ -1390,8 +1245,6 @@ class Encoder(nn.Module):
         ):
             # ---- (1) 입력 텐서들 준비 ----
             (
-                ego_agent_past,  # (B, 1, time_len, 11)
-                planner_future_11_dim,  # (B, future_len, 11)
                 neighbor_agents_past,  # (B, A, time_len, 11)
                 non_near_agents_past,  # (B, non_near_A, time_len, 11)
                 static_objects,  # (B, P, D_static)
@@ -1415,7 +1268,6 @@ class Encoder(nn.Module):
                 road_edge_type,  # (B, road_edge_num, 3) or None
                 B,
             ) = self._prepare_encoder_inputs(inputs)
-            future_len = self.config.future_len
 
             # ---- (3) agents/static/lanes 인코딩 ----
             (
@@ -1429,24 +1281,7 @@ class Encoder(nn.Module):
                 road_safety_mask,  # (B, N_road_safety)
                 road_safety_pos,  # (B, N_road_safety, 9)
             ) = self._encode_agents_static_lanes(
-                static_objects=static_objects,
-                lanes=lanes,
-                lanes_speed_limit=lanes_speed_limit,
-                lanes_has_speed_limit=lanes_has_speed_limit,
-                lane_type=lane_type,
-                left_line_type=left_line_type,
-                right_line_type=right_line_type,
-                stop_sign_points=stop_sign_points,
-                stop_sign_is_valid=stop_sign_is_valid,
-                crosswalk_points=crosswalk_points,
-                crosswalk_is_valid=crosswalk_is_valid,
-                speed_bump_points=speed_bump_points,
-                speed_bump_is_valid=speed_bump_is_valid,
-                driveway_points=driveway_points,
-                driveway_is_valid=driveway_is_valid,
-                road_edge=road_edge,
-                road_edge_is_valid=road_edge_is_valid,
-                road_edge_type=road_edge_type,
+                inputs
             )
 
             # ---- (4) Fusion 입력 토큰 + 위치 임베딩 구성 ----
@@ -1699,9 +1534,11 @@ class StaticFusionEncoder(nn.Module):
                               act_layer=nn.GELU,
                               drop=drop_path_rate)
 
-    def forward(self, static_objects):
+    def forward(self, static_objects, static_objects_is_valid):
         """
         static_objects: B, static_objects_num, D_10 (x, y, cos, sin, w, l, type(4))
+            # (B, static_objects_num, D_static)
+        static_objects_is_valid : (B, static_objects_num)  True=유효점
 
         returns:
             static_encoding: (B, static_objects_num, hidden_dim)
@@ -1711,7 +1548,7 @@ class StaticFusionEncoder(nn.Module):
         B, static_objects_num, _ = static_objects.shape
         static_xyyaw = static_objects[:, :, :4].clone(
         )  # (B, static_objects_num, 4)
-        # static_feature: (B, static_objects_num, 4 + 4)
+        # static_feature: (B, static_objects_num, 4 + 5)
         static_feature = self._get_static_feature(static_xyyaw)
         # [FIX] 오토캐스트 환경이면 버퍼 dtype을 현재 GPU autocast dtype으로
         out_dtype = (torch.get_autocast_gpu_dtype()
@@ -1722,10 +1559,9 @@ class StaticFusionEncoder(nn.Module):
             device=static_objects.device,
             dtype=out_dtype)
 
-        mask_p = torch.sum(torch.ne(static_objects[..., :10], 0),
-                           dim=-1).to(static_objects.device) == 0
-
-        valid_indices = ~mask_p.reshape(-1)
+        # mask_p: (B, static_objects_num) # 의미: 무효점이면 True
+        mask_p = ~static_objects_is_valid.to(torch.bool)
+        valid_indices = ~mask_p.reshape(-1) # shape: (B * static_objects_num,)
 
         if valid_indices.sum().item() > 0:
             static_objects = static_objects.reshape(B * static_objects_num, -1)
@@ -1744,9 +1580,7 @@ class StaticFusionEncoder(nn.Module):
         static_encoding = static_encoding.reshape(
             B, static_objects_num,
             hidden_dim)  # (B, static_objects_num, hidden_dim)
-        mask_p = mask_p.reshape(B,
-                                static_objects_num)  # (B, static_objects_num)
-        return static_encoding, mask_p, static_feature
+        return static_encoding, static_feature
 
     def _get_static_feature(
         self,
@@ -1760,7 +1594,7 @@ class StaticFusionEncoder(nn.Module):
             dtype=static_xyyaw.dtype,
         )
         static_type[:, :, 2] = 1.0  # type
-        # static_feature: (B, static_objects_num, 4 + 4)
+        # static_feature: (B, static_objects_num, 4 + 5)
         static_feature = torch.cat([static_xyyaw, static_type], dim=-1)
         assert static_feature.shape == (B, static_objects_num, 9), \
             f"Expected static_feature shape (B, static_objects_num, 9), got {static_feature.shape}"
