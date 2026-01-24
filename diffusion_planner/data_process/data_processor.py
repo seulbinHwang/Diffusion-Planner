@@ -269,32 +269,39 @@ class DataProcessor(object):
         return fixed_neighbor_agents_past, neighbor_future_gt_11_dim, neighbor_future_gt_3_dim
 
     def _enforce_no_invalid_between_valid_in_ego_past(
-        self,
-        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
-        *,
-        eps: float = 1e-8,
+            self,
+            ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+            *,
+            eps: float = 1e-8,
     ) -> np.ndarray:
-        """ego_agent_past(과거~현재)만 가지고도 “유효-무효-유효”가 생기지 않게 정리한다.
+        """ego_agent_past(과거~현재)에서 '없는 과거 프레임(0 패딩)'이 끼어도 규칙이 깨지지 않게 정리한다.
 
-        observation_adapter()에서는 ego 미래 GT를 출력하지 않기 때문에,
-        past(과거~현재)만으로 규칙을 강제합니다.
+        핵심 요구사항(이번 수정)
+        -----------------------
+        - ego_agent_past는 과거→현재 순서다.
+        - past가 부족한 경우 "없는 과거"는 앞쪽(prefix)에만 0으로 채워질 수 있다.
+        - 따라서 유효 구간은 [first_valid ... current]로 한 덩어리여야 하며,
+          그 밖(prefix)은 전부 0이어야 한다.
+
+        유효/무효 판정 기준(중요)
+        -----------------------
+        - '없는 프레임'은 size/type 값이 섞여 들어올 수도 있으므로,
+          유효 판정은 **앞 6개 값(x,y,cos,sin,vx,vy)**만 본다.
+          (즉, width/length/one-hot 때문에 무효가 유효로 오인되는 걸 막는다)
 
         규칙
         ----
         - 현재 프레임(=past의 마지막)이 유효일 때:
-          · past 안에서 유효점과 유효점 사이에 무효점(0)이 끼면 안 됩니다.
-          · 그래서 past에서 유효한 프레임들의 첫/마지막 위치를 찾고,
-            그 사이에 비어 있는 프레임이 있으면 x/y/cos/sin/vx/vy를 “직선 중간값”으로 채웁니다.
-          · 유효 구간 밖은 0으로 둡니다.
-
+          · past 안에서 유효점과 유효점 사이에 무효점(0)이 끼면 안 된다.
+          · 유효 프레임들의 first~last 구간을 연속 유효 구간으로 만들고,
+            그 안의 빈 프레임은 x/y/cos/sin/vx/vy를 선형 보간으로 채운다.
+          · 유효 구간 밖(prefix/suffix)은 0으로 둔다.
         - 현재 프레임이 무효면:
-          · 안전하게 past 전체를 0으로 만듭니다.
-            (ego는 보통 항상 존재하지만, 이상 케이스를 막기 위해서입니다.)
+          · 안전하게 past 전체를 0으로 만든다.
 
         Args:
             ego_agent_past (np.ndarray):
                 shape: (Tp, 11)
-                Tp는 보통 21 (2초 과거 + 현재)
             eps (float):
                 0과 아주 가까운 값을 “0”처럼 볼 때 쓰는 기준
 
@@ -316,8 +323,9 @@ class DataProcessor(object):
                                                  copy=True)  # (Tp, 11)
         current_index: int = Tp - 1
 
+        # ✅ 유효 판정은 '앞 6개(x,y,cos,sin,vx,vy)'만 사용
         # valid_mask_1d: (Tp,)
-        valid_mask_1d: np.ndarray = (np.abs(traj[:, :8]) > eps).any(axis=1)
+        valid_mask_1d: np.ndarray = (np.abs(traj[:, :6]) > eps).any(axis=1)
 
         # 현재가 무효면 past 전체를 0으로
         if not bool(valid_mask_1d[current_index]):
@@ -339,22 +347,22 @@ class DataProcessor(object):
             # 중간 구멍이 있으면 x/y/cos/sin/vx/vy를 채움 (0~5)
             if last_valid - first_valid + 1 > valid_idx.size:
                 xs: np.ndarray = valid_idx.astype(np.float64)  # (K,)
-                seg_idx: np.ndarray = np.arange(first_valid,
-                                                last_valid + 1,
+                seg_idx: np.ndarray = np.arange(first_valid, last_valid + 1,
                                                 dtype=np.float64)
 
                 for dim_idx in range(6):  # 0~5
                     ys: np.ndarray = traj[valid_idx, dim_idx].astype(np.float64,
                                                                      copy=False)
                     interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    traj[first_valid:last_valid + 1,
-                         dim_idx] = interp_vals.astype(np.float32, copy=False)
+                    traj[
+                        first_valid:last_valid + 1, dim_idx] = interp_vals.astype(
+                        np.float32, copy=False)
 
         # 타입/크기는 “현재 프레임 값”을 대표로 씀
-        type_vec: np.ndarray = traj[current_index,
-                                    8:11].astype(np.float32, copy=False)  # (3,)
-        rep_size: np.ndarray = traj[current_index,
-                                    6:8].astype(np.float32, copy=False)  # (2,)
+        type_vec: np.ndarray = traj[current_index, 8:11].astype(np.float32,
+                                                                copy=False)  # (3,)
+        rep_size: np.ndarray = traj[current_index, 6:8].astype(np.float32,
+                                                               copy=False)  # (2,)
 
         # one-hot은 유효 구간에만
         traj[:, 8:11] = 0.0
@@ -450,7 +458,6 @@ class DataProcessor(object):
         if bool(self._use_filter_radius):
             return float(self._filter_radius)
         return None
-
     @staticmethod
     def _adjust_ego_future_outputs_to_center_frame(
         ego_state: EgoState,
@@ -461,26 +468,11 @@ class DataProcessor(object):
     ) -> Tuple[np.ndarray, np.ndarray]:
         """ego 미래 궤적 출력이 rear axle 기준일 때, center 기준으로 x,y만 보정한다.
 
-        왜 필요한가
-        ----------
-        `work()`에서는 ego 미래 궤적을 만들 때 `get_ego_future_array_from_scenario(...)`를 쓰는데,
-        이 함수는 내부에서 “현재 ego의 rear axle”을 기준점으로 잡아 ego 로컬 좌표로 바꿉니다.
-
-        그런데 `set_coord_as_center=True`를 켜면,
-        `work()`/`observation_adapter()`에서 다른 대부분의 좌표계 기반 출력들은
-        "현재 ego center"를 기준점으로 쓰도록 바꾸게 됩니다.
-        그러면 ego 미래만 기준점이 달라져서 데이터가 섞이게 됩니다.
-
-        그래서 이 함수는 ego 미래 궤적의 x,y에 대해서만,
-        rear axle 기준 → center 기준으로 원점을 옮기는 상수 보정을 합니다.
-
-        보정 내용
-        --------
-        - 현재 시점에서 (center - rear_axle) 위치 차이를 구합니다. (월드 좌표)
-        - 그 벡터를 “현재 ego heading 축” 기준 로컬 좌표로 돌려서 offset_local = [dx, dy]를 얻습니다.
-        - rear axle 기준 로컬 좌표로 표현된 미래 궤적 x,y에서 offset_local을 빼면,
-          center 기준 로컬 좌표가 됩니다.
-        - heading/cos/sin/vx/vy는 “원점 이동”과 무관하므로 건드리지 않습니다.
+        주의(이번 수정의 핵심)
+        ---------------------
+        - 무효 프레임(앞 8차원이 전부 0인 프레임)은 (0,0,0,0,...) 상태를 유지해야 한다.
+        - 따라서 set_coord_as_center=True 여도 무효 프레임에는 x,y 이동(offset)을 적용하지 않는다.
+          (유효 프레임에만 적용)
 
         Args:
             ego_state (EgoState):
@@ -502,13 +494,16 @@ class DataProcessor(object):
         if not set_coord_as_center:
             return ego_future_gt_3_dim, ego_future_gt_11_dim
 
+        # 미래 길이가 0이면 할 게 없음
+        if ego_future_gt_11_dim.size == 0:
+            return ego_future_gt_3_dim, ego_future_gt_11_dim
+
         # (1) 월드 좌표에서 rear_axle -> center 변위
         dx_world: float = float(ego_state.center.x - ego_state.rear_axle.x)
         dy_world: float = float(ego_state.center.y - ego_state.rear_axle.y)
 
         # (2) 현재 heading 기준 로컬 좌표로 회전 (world -> ego heading frame)
-        heading: float = float(
-            ego_state.rear_axle.heading)  # center.heading와 사실상 동일
+        heading: float = float(ego_state.rear_axle.heading)
         c: float = float(np.cos(heading))
         s: float = float(np.sin(heading))
 
@@ -516,14 +511,21 @@ class DataProcessor(object):
         offset_x_local: float = dx_world * c + dy_world * s
         offset_y_local: float = -dx_world * s + dy_world * c
 
-        # (3) rear axle 기준 로컬 좌표에서 center 기준 로컬 좌표로 원점 이동
-        #     new_xy = old_xy - offset_local
-        ego_future_gt_3_dim[:, 0] -= offset_x_local
-        ego_future_gt_3_dim[:, 1] -= offset_y_local
-        ego_future_gt_11_dim[:, 0] -= offset_x_local
-        ego_future_gt_11_dim[:, 1] -= offset_y_local
+        # ✅ (핵심) 유효/무효 마스크
+        # - 무효 프레임 정의: [x, y, cos, sin, vx, vy, width, length] 8개가 전부 0이면 무효
+        eps: float = 1e-8
+        # valid_mask: shape (T,)
+        valid_mask: np.ndarray = (
+                    np.abs(ego_future_gt_11_dim[:, :6]) > eps).any(axis=1)
+
+        # 유효 프레임에만 원점 이동 적용
+        ego_future_gt_3_dim[valid_mask, 0] -= offset_x_local
+        ego_future_gt_3_dim[valid_mask, 1] -= offset_y_local
+        ego_future_gt_11_dim[valid_mask, 0] -= offset_x_local
+        ego_future_gt_11_dim[valid_mask, 1] -= offset_y_local
 
         return ego_future_gt_3_dim, ego_future_gt_11_dim
+
 
     @staticmethod
     def _normalize_cos_sin_in_traj_11(
@@ -890,6 +892,10 @@ class DataProcessor(object):
             past_cur_ego_world_10=past_cur_ego_world_10,
             ego_cur_pose_np=ego_cur_pose_np,
         )
+        # ✅ 추가: 과거가 부족해 0으로 채운 프레임(prefix)이 있으면 확실히 0으로 정리
+        ego_agent_past = self._enforce_no_invalid_between_valid_in_ego_past(
+            ego_agent_past
+        )
         # Past observations including the current
         observation_buffer: Deque[
             Observation] = history_buffer.observation_buffer
@@ -1056,44 +1062,19 @@ class DataProcessor(object):
         return modified_past
 
     def _merge_and_interpolate_ego_11dim(
-        self,
-        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
-        ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
-        *,
-        eps: float = 1e-8,
+            self,
+            ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+            ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
+            *,
+            eps: float = 1e-8,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """ego 과거~현재 + 미래를 합친 뒤, 유효~유효 사이에 무효(0)가 끼지 않게 만든다.
-
-        - ego는 원래 대부분 "항상 존재"하지만,
-          시나리오 길이가 짧아 미래 끝이 0으로 패딩되는 경우 등이 있어서
-          안전하게 한 번 더 규칙을 강제한다.
-
-        규칙
-        ----
-        - 현재 프레임(=past의 마지막)이 유효일 때만 처리한다.
-        - 전체 101개를 과거→미래로 봤을 때,
-          유효 프레임과 유효 프레임 사이에 무효 프레임이 끼면
-          그 중간을 x/y/cos/sin/vx/vy의 "직선 중간값"으로 채워서
-          연속 유효 구간을 만든다.
-        - 구간 밖(prefix/suffix)은 0으로 둔다.
-
-        Args:
-            ego_agent_past (np.ndarray):
-                shape: (Tp, 11)  # Tp=21
-            ego_future_gt_11_dim (np.ndarray):
-                shape: (Tf, 11)  # Tf=80
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]:
-                - new_ego_agent_past: shape (Tp, 11)
-                - new_ego_future_11:  shape (Tf, 11)
-        """
+        """ego 과거~현재 + 미래를 합친 뒤, 유효~유효 사이에 무효(0)가 끼지 않게 만든다."""
         if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
             raise ValueError(
                 f"`ego_agent_past` shape는 (Tp, 11)이어야 합니다. got {ego_agent_past.shape}"
             )
         if ego_future_gt_11_dim.ndim != 2 or ego_future_gt_11_dim.shape[
-                -1] != 11:
+            -1] != 11:
             raise ValueError(
                 f"`ego_future_gt_11_dim` shape는 (Tf, 11)이어야 합니다. got {ego_future_gt_11_dim.shape}"
             )
@@ -1103,22 +1084,20 @@ class DataProcessor(object):
         if Tp == 0 or Tf == 0:
             return ego_agent_past, ego_future_gt_11_dim
 
-        # full: (Tp+Tf, 11) == (101, 11)
         full: np.ndarray = np.concatenate(
             [ego_agent_past, ego_future_gt_11_dim], axis=0).astype(np.float32,
                                                                    copy=True)
         T_full: int = int(full.shape[0])
         current_index: int = Tp - 1
 
-        # 유효 프레임: 앞 8개 중 하나라도 0이 아니면 유효
-        valid_mask_1d: np.ndarray = (np.abs(full[:, :8])
-                                     > eps).any(axis=1)  # (T_full,)
+        # ✅ 유효 판정은 '앞 6개(x,y,cos,sin,vx,vy)'만 사용
+        valid_mask_1d: np.ndarray = (np.abs(full[:, :6]) > eps).any(
+            axis=1)  # (T_full,)
 
-        # 현재가 유효일 때만 규칙(b)을 강제
         if not bool(valid_mask_1d[current_index]):
             return ego_agent_past, ego_future_gt_11_dim
 
-        valid_idx: np.ndarray = np.nonzero(valid_mask_1d)[0]  # (K,)
+        valid_idx: np.ndarray = np.nonzero(valid_mask_1d)[0]
         if valid_idx.size == 0:
             return ego_agent_past, ego_future_gt_11_dim
 
@@ -1131,35 +1110,27 @@ class DataProcessor(object):
             last_valid: int = int(valid_idx[-1])
             region_mask[first_valid:last_valid + 1] = True
 
-            # 중간 구멍이 있으면 x/y/cos/sin/vx/vy를 채움
             if last_valid - first_valid + 1 > valid_idx.size:
                 xs: np.ndarray = valid_idx.astype(np.float64)
-                seg_idx: np.ndarray = np.arange(first_valid,
-                                                last_valid + 1,
+                seg_idx: np.ndarray = np.arange(first_valid, last_valid + 1,
                                                 dtype=np.float64)
-
                 for dim_idx in range(6):
                     ys: np.ndarray = full[valid_idx, dim_idx].astype(np.float64,
                                                                      copy=False)
                     interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    full[first_valid:last_valid + 1,
-                         dim_idx] = interp_vals.astype(np.float32, copy=False)
+                    full[
+                        first_valid:last_valid + 1, dim_idx] = interp_vals.astype(
+                        np.float32, copy=False)
 
-        # type/size는 현재 프레임 값을 대표값으로 쓴다.
-        type_vec: np.ndarray = ego_agent_past[-1,
-                                              8:11].astype(np.float32,
-                                                           copy=False)  # (3,)
-        rep_size: np.ndarray = ego_agent_past[-1,
-                                              6:8].astype(np.float32,
-                                                          copy=False)  # (2,)
+        type_vec: np.ndarray = ego_agent_past[-1, 8:11].astype(np.float32,
+                                                               copy=False)  # (3,)
+        rep_size: np.ndarray = ego_agent_past[-1, 6:8].astype(np.float32,
+                                                              copy=False)  # (2,)
 
         full[:, 8:11] = 0.0
         full[region_mask, 8:11] = type_vec
-
-        # 구간 밖은 완전히 0으로
         full[~region_mask, :] = 0.0
 
-        # width/length 채우기 + cos/sin 정리 (배치 함수 재사용을 위해 (1,T,11)로 바꿈)
         full_b: np.ndarray = full[None, :, :]  # (1, T_full, 11)
         region_b: np.ndarray = region_mask[None, :]  # (1, T_full)
         rep_size_b: np.ndarray = rep_size[None, :]  # (1, 2)
@@ -1683,7 +1654,10 @@ class DataProcessor(object):
                 past_cur_ego_world_10=past_cur_ego_world_10,
                 ego_cur_pose_np=ego_cur_pose_np,
             )
-
+            # ✅ 추가: 과거가 부족해 0으로 채운 프레임(prefix)이 있으면 확실히 0으로 정리
+            ego_agent_past = self._enforce_no_invalid_between_valid_in_ego_past(
+                ego_agent_past
+            )
             # ─────────────────────────────────────────────
             # ✅ (요구조건 b) ego: past+future(101) 기반으로 규칙 적용
             #    그리고 ego_future_gt_3_dim은 “규칙 적용된 11dim”에서 다시 생성

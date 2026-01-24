@@ -3484,6 +3484,75 @@ class FeasibleProjector(nn.Module):
 
         return derivative_fd  # (N, T, C)
 
+    def _savgol_finite_difference_second_multi(
+        self,
+        sequence_multi_channel: torch.Tensor,  # (N, T, C)
+        valid_mask_bT: torch.Tensor,  # (N, T) bool
+        dt: float,
+    ) -> torch.Tensor:
+        """여러 채널 시퀀스의 '두 번의 변화(2차 변화율)'을 아주 단순한 규칙으로 계산합니다.
+
+        - 중심 시점이 유효(True)이고, 주변에 필요한 점들이 모두 유효(True)일 때만 계산합니다.
+        - 그 외에는 0으로 둡니다.
+        - 이 함수는 창 기반 계산이 어려운 구간(시퀀스가 너무 짧거나, 유효 점이 부족한 곳)의
+          기본값(대체값)으로만 쓰입니다.
+
+        Args:
+            sequence_multi_channel: (N, T, C)
+                시간축 T에 따라 변하는 값들(채널 C개).
+            valid_mask_bT: (N, T) bool
+                각 시점 값이 실제로 있는지(True/False).
+            dt: float
+                샘플 간 시간 간격(초).
+
+        Returns:
+            second_derivative_fd: (N, T, C)
+                2차 변화율 결과. 계산 불가한 곳은 0.
+        """
+        num_rows, sequence_length, num_channels = sequence_multi_channel.shape  # (N,T,C)
+        second_derivative_fd = torch.zeros_like(sequence_multi_channel)  # (N,T,C)
+
+        if sequence_length < 3:
+            return second_derivative_fd
+
+        valid = valid_mask_bT.to(torch.bool)  # (N,T)
+        dt2 = float(dt) * float(dt)
+
+        # 내부 구간(t=1..T-2): (x_{t+1} - 2x_t + x_{t-1}) / dt^2
+        center = valid[:, 1:-1]  # (N,T-2)
+        left = valid[:, :-2]     # (N,T-2)
+        right = valid[:, 2:]     # (N,T-2)
+        ok = center & left & right  # (N,T-2)
+
+        sec = (
+            sequence_multi_channel[:, 2:, :] -
+            2.0 * sequence_multi_channel[:, 1:-1, :] +
+            sequence_multi_channel[:, :-2, :]
+        ) / dt2  # (N,T-2,C)
+
+        second_derivative_fd[:, 1:-1, :] = sec * ok.unsqueeze(-1).to(sequence_multi_channel.dtype)
+
+        # 맨 앞(t=0): (x2 - 2x1 + x0) / dt^2
+        ok0 = valid[:, 0] & valid[:, 1] & valid[:, 2]  # (N,)
+        sec0 = (
+            sequence_multi_channel[:, 2, :] -
+            2.0 * sequence_multi_channel[:, 1, :] +
+            sequence_multi_channel[:, 0, :]
+        ) / dt2  # (N,C)
+        second_derivative_fd[:, 0, :] = sec0 * ok0.unsqueeze(-1).to(sequence_multi_channel.dtype)
+
+        # 맨 뒤(t=T-1): (x_{T-1} - 2x_{T-2} + x_{T-3}) / dt^2
+        okL = valid[:, -1] & valid[:, -2] & valid[:, -3]  # (N,)
+        secL = (
+            sequence_multi_channel[:, -1, :] -
+            2.0 * sequence_multi_channel[:, -2, :] +
+            sequence_multi_channel[:, -3, :]
+        ) / dt2  # (N,C)
+        second_derivative_fd[:, -1, :] = secL * okL.unsqueeze(-1).to(sequence_multi_channel.dtype)
+
+        return second_derivative_fd  # (N,T,C)
+
+
     def _savgol_select_window_length(
         self,
         sequence_length: int,
@@ -3651,48 +3720,56 @@ class FeasibleProjector(nn.Module):
         valid_center_mask: torch.Tensor,  # (N, T) bool
         fd_derivative: torch.Tensor,  # (N, T, C)
         polyorder: int,
+        derivative_order: int,
         regularization_epsilon: float,
     ) -> torch.Tensor:
-        """창 기반 LS를 사용할 수 있는 위치에서만 SG 미분을 계산하고,
-        나머지는 유한 차분 결과를 그대로 활용하는 함수.
+        """창 기반 작은 선형 문제를 풀어, 원하는 변화율(1차 또는 2차)을 계산합니다.
+
+        - 계산이 안정적인 위치(유효 점이 충분하고 중심이 유효한 곳)만 선형 문제를 풀어 값을 얻습니다.
+        - 나머지 위치는 미리 만든 기본값(fd_derivative)을 그대로 둡니다.
+        - 중심 시점이 무효(False)인 위치는 최종적으로 0으로 정리합니다.
 
         Args:
             A_all: (N, T, P+1, P+1)
-                각 위치에서 사용할 작은 행렬 A.
             b_all: (N, T, C, P+1)
-                각 위치/채널에서 사용할 작은 벡터 b.
             valid_count: (N, T)
-                창 안 유효 샘플 개수.
             valid_center_mask: (N, T) bool
-                중심 시점 자체가 유효한지 여부.
             fd_derivative: (N, T, C)
-                미리 계산해 둔 유한 차분 결과.
-            polyorder: int
-                다항식 차수 P.
-            regularization_epsilon: float
-                A 행렬에 더해 줄 작은 값(수치 안정용).
+            polyorder: 다항식 차수(예: 2)
+            derivative_order: 1 또는 2
+            regularization_epsilon: 수치 안정용 작은 값
 
         Returns:
-            torch.Tensor: (N, T, C)
-                최종 SG 미분 결과. 중심이 무효인 위치는 0으로 채운다.
+            derivative_out: (N, T, C)
         """
         num_rows, sequence_length, dim_p1, _ = A_all.shape  # (N, T, P+1, P+1)
-        _, _, num_channels, _ = b_all.shape  # (N, T, C, P+1)
+        _, _, num_channels, _ = b_all.shape                 # (N, T, C, P+1)
+
+        if derivative_order not in (1, 2):
+            raise ValueError(f"derivative_order must be 1 or 2. got={derivative_order}")
+
+        # polyorder가 derivative_order보다 작으면, 창 기반 계산이 의미 없으니 기본값만 사용
+        if int(polyorder) < int(derivative_order):
+            out = torch.where(
+                valid_center_mask.unsqueeze(-1),
+                fd_derivative,
+                torch.zeros_like(fd_derivative),
+            )
+            return out
 
         min_samples = int(polyorder) + 2
 
-        # 기본값은 유한 차분으로 깔아두고, 좋은 위치만 SG로 덮어쓰기
         derivative_out = fd_derivative.clone()  # (N, T, C)
 
-        # SG를 적용할 수 있는 위치(데이터가 충분하고, 중심이 유효한 곳)
         good_mask = (valid_count >= min_samples) & valid_center_mask  # (N, T)
-        # [추가] 맨 앞/맨 뒤 몇 개 시점은 SG를 아예 쓰지 않음 (FD/0만 사용)
-        edge_margin: int = 2  # 필요하면 2로 늘려도 됨
+
+        # 기존 코드와 동일: 맨 앞/뒤는 창 기반 계산을 쓰지 않음
+        edge_margin: int = 2
         if sequence_length > 2 * edge_margin:
             good_mask[:, :edge_margin] = False
             good_mask[:, -edge_margin:] = False
+
         if not good_mask.any():
-            # SG로 풀 곳이 하나도 없으면, 유한 차분 + 중심 마스크만 적용하고 반환
             derivative_out = torch.where(
                 valid_center_mask.unsqueeze(-1),
                 derivative_out,
@@ -3700,15 +3777,13 @@ class FeasibleProjector(nn.Module):
             )
             return derivative_out
 
-        # good 위치만 flatten 해서 batched solve
-        good_flat_idx = good_mask.view(-1).nonzero(as_tuple=False).squeeze(
-            -1)  # (M,)
+        good_flat_idx = good_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)  # (M,)
 
         A_flat = A_all.view(-1, dim_p1, dim_p1)  # (N*T, P+1, P+1)
-        A_good = A_flat[good_flat_idx]  # (M, P+1, P+1)
+        A_good = A_flat[good_flat_idx]           # (M, P+1, P+1)
 
-        b_flat = b_all.view(-1, num_channels, dim_p1)  # (N*T, C, P+1)
-        b_good = b_flat[good_flat_idx].permute(0, 2, 1)  # (M, P+1, C)
+        b_flat = b_all.view(-1, num_channels, dim_p1)          # (N*T, C, P+1)
+        b_good = b_flat[good_flat_idx].permute(0, 2, 1)        # (M, P+1, C)
 
         identity_matrix = torch.eye(
             dim_p1,
@@ -3716,29 +3791,32 @@ class FeasibleProjector(nn.Module):
             dtype=A_good.dtype,
         ).unsqueeze(0)  # (1, P+1, P+1)
 
-        A_good_reg = A_good + regularization_epsilon * identity_matrix  # (M, P+1, P+1)
+        A_good_reg = A_good + float(regularization_epsilon) * identity_matrix  # (M, P+1, P+1)
 
-        # 다채널(C개)을 한 번에 푸는 배치 선형 시스템
-        coefficients_good = torch.linalg.solve(
-            A_good_reg,
-            b_good,
-        )  # (M, P+1, C)
+        coefficients_good = torch.linalg.solve(A_good_reg, b_good)  # (M, P+1, C)
 
-        first_derivative_good = coefficients_good[:, 1, :]  # (M, C)
+        # τ=0에서의 변화율:
+        # 1차: coeff[1]
+        # 2차: 2 * coeff[2]
+        coef_idx = int(derivative_order)
+        if derivative_order == 1:
+            scale = 1.0
+        else:
+            scale = 2.0
+
+        derivative_good = coefficients_good[:, coef_idx, :] * scale  # (M, C)
 
         derivative_out_flat = derivative_out.view(-1, num_channels)  # (N*T, C)
-        derivative_out_flat[good_flat_idx] = first_derivative_good
-        derivative_out = derivative_out_flat.view(num_rows, sequence_length,
-                                                  num_channels)  # (N, T, C)
+        derivative_out_flat[good_flat_idx] = derivative_good
+        derivative_out = derivative_out_flat.view(num_rows, sequence_length, num_channels)  # (N, T, C)
 
-        # 중심이 유효하지 않은 위치는 최종적으로 0으로 처리
         derivative_out = torch.where(
             valid_center_mask.unsqueeze(-1),
             derivative_out,
             torch.zeros_like(derivative_out),
         )
+        return derivative_out
 
-        return derivative_out  # (N, T, C)
 
     def _savgol_derivative_masked_multi_torch(
         self,
@@ -3747,33 +3825,24 @@ class FeasibleProjector(nn.Module):
         dt: float,
         polyorder: int,
         max_window_length: int,
+        derivative_order: int = 1,
     ) -> torch.Tensor:
-        """여러 채널에 대해, 마스크를 고려한 Savitzky–Golay 1차 미분을 한 번에 계산하는 함수.
+        """마스크를 고려해서 '원하는 변화율(1차 또는 2차)'을 계산합니다.
 
-        전체 흐름:
-            1) 먼저 모든 채널에 대해 유한 차분 결과를 만든다.
-            2) 실제로 사용할 창 길이 W를 결정한다.
-            3) 유효 마스크로부터 창별(mask_window) 유효 샘플 수(valid_count)를 구한다.
-            4) 시간 기저(Φ_k)와 Gram(Φ_k^TΦ_k)을 만든다.
-            5) A_all, b_all을 한 번에 만든다.
-            6) 데이터가 충분한 위치만 작은 선형 시스템을 풀어서 SG 미분값을 구하고,
-               나머지는 유한 차분 결과를 그대로 쓴다.
+        - 기본값은 유한 차분(아주 단순 계산)으로 만들고,
+        - 데이터가 충분한 곳만 창 기반 계산으로 덮어씁니다.
+        - 중심 시점이 무효(False)인 곳은 0으로 정리합니다.
 
         Args:
             seq_bTC: (N, T, C)
-                여러 채널로 묶인 시퀀스 값.
             valid_bT: (N, T) bool
-                각 시점 유효 여부.
             dt: float
-                샘플 간 시간 간격.
             polyorder: int
-                다항식 차수.
             max_window_length: int
-                사용할 수 있는 최대 창 길이.
+            derivative_order: 1 또는 2
 
         Returns:
-            torch.Tensor: (N, T, C)
-                각 채널에 대한 SG 1차 미분 결과.
+            derivative_out: (N, T, C)
         """
         if seq_bTC.numel() == 0:
             return seq_bTC
@@ -3782,12 +3851,22 @@ class FeasibleProjector(nn.Module):
         device = seq_bTC.device
         dtype = seq_bTC.dtype
 
-        # 0) 유한 차분 기본값
-        fd_derivative = self._savgol_finite_difference_multi(
-            sequence_multi_channel=seq_bTC,  # (N,T,C)
-            valid_mask_bT=valid_bT,  # (N,T) bool
-            dt=dt,
-        )  # (N, T, C)
+        if derivative_order not in (1, 2):
+            raise ValueError(f"derivative_order must be 1 or 2. got={derivative_order}")
+
+        # 0) 기본값(유한 차분)
+        if derivative_order == 1:
+            fd_derivative = self._savgol_finite_difference_multi(
+                sequence_multi_channel=seq_bTC,  # (N,T,C)
+                valid_mask_bT=valid_bT,          # (N,T)
+                dt=dt,
+            )  # (N,T,C)
+        else:
+            fd_derivative = self._savgol_finite_difference_second_multi(
+                sequence_multi_channel=seq_bTC,  # (N,T,C)
+                valid_mask_bT=valid_bT,          # (N,T)
+                dt=dt,
+            )  # (N,T,C)
 
         # 1) 창 길이 선택
         window_length = self._savgol_select_window_length(
@@ -3796,7 +3875,6 @@ class FeasibleProjector(nn.Module):
         )
 
         if window_length == 0:
-            # SG를 전혀 쓰지 못하는 상황: 유한 차분 결과에 중심 마스크만 씌워 반환
             return torch.where(
                 valid_bT.unsqueeze(-1),
                 fd_derivative,
@@ -3821,31 +3899,31 @@ class FeasibleProjector(nn.Module):
 
         # 4) A_all, b_all 계산
         A_all = self._savgol_build_A_all_from_mask_multi(
-            mask_window=mask_window,  # (N,T,W)
-            gram_per_k=gram_per_k,  # (W,P+1,P+1)
+            mask_window=mask_window,
+            gram_per_k=gram_per_k,
         )  # (N,T,P+1,P+1)
 
         b_all = self._savgol_build_b_all_multi(
             sequence_multi_channel=seq_bTC,  # (N,T,C)
-            mask_window=mask_window,  # (N,T,W)
-            power_per_k=power_per_k,  # (W,P+1)
+            mask_window=mask_window,         # (N,T,W)
+            power_per_k=power_per_k,         # (W,P+1)
             window_length=window_length,
         )  # (N,T,C,P+1)
 
-        # 5) LS를 적용할 수 있는 위치만 SG를 쓰고, 나머지는 유한 차분 유지
         valid_center_mask = valid_bT.to(torch.bool)  # (N,T)
 
         derivative_out = self._savgol_solve_multi(
-            A_all=A_all,  # (N,T,P+1,P+1)
-            b_all=b_all,  # (N,T,C,P+1)
-            valid_count=valid_count,  # (N,T)
-            valid_center_mask=valid_center_mask,  # (N,T)
-            fd_derivative=fd_derivative,  # (N,T,C)
+            A_all=A_all,
+            b_all=b_all,
+            valid_count=valid_count,
+            valid_center_mask=valid_center_mask,
+            fd_derivative=fd_derivative,
             polyorder=polyorder,
+            derivative_order=derivative_order,
             regularization_epsilon=float(getattr(self, "_eps", 1e-6)),
         )  # (N,T,C)
 
-        return derivative_out  # (N,T,C)
+        return derivative_out
 
     @classmethod
     def loss_weights_by_progress(cls, progress: float,
@@ -3878,25 +3956,20 @@ class FeasibleProjector(nn.Module):
         dt: float,
         polyorder: int,
         max_window_length: int,
+        derivative_order: int = 1,
     ) -> torch.Tensor:
-        """(B, Pnn, point_len, C) 모양의 데이터를
-        멀티 채널 SG 미분 함수에 넘기기 좋게 펴고 다시 되돌리는 함수.
+        """(B, Pnn, point_len, C) 모양의 데이터에서 원하는 변화율(1차/2차)을 계산합니다.
 
         Args:
             sequences_points: (B, Pnn, point_len, C)
-                예: x,y 좌표나 cos,sin 값을 채널로 묶은 텐서.
             points_valid: (B, Pnn, point_len) bool
-                각 포인트가 실제로 있는지 나타내는 마스크.
             dt: float
-                샘플 간 시간 간격.
             polyorder: int
-                다항식 차수.
             max_window_length: int
-                최대 창 길이.
+            derivative_order: 1 또는 2
 
         Returns:
-            torch.Tensor: (B, Pnn, point_len, C)
-                각 채널별 SG 1차 미분 결과.
+            derivatives_points: (B, Pnn, point_len, C)
         """
         batch_size, num_neighbors, point_len, num_channels = sequences_points.shape  # (B,Pnn,T,C)
 
@@ -3911,20 +3984,22 @@ class FeasibleProjector(nn.Module):
         )  # (B*Pnn, T)
 
         derivative_flat = self._savgol_derivative_masked_multi_torch(
-            seq_bTC=sequence_flat,  # (B*Pnn, T, C)
-            valid_bT=valid_flat,  # (B*Pnn, T)
+            seq_bTC=sequence_flat,      # (B*Pnn, T, C)
+            valid_bT=valid_flat,        # (B*Pnn, T)
             dt=dt,
             polyorder=polyorder,
             max_window_length=max_window_length,
+            derivative_order=derivative_order,
         )  # (B*Pnn, T, C)
 
-        derivative_points = derivative_flat.reshape(
+        derivatives_points = derivative_flat.reshape(
             batch_size,
             num_neighbors,
             point_len,
             num_channels,
         )  # (B,Pnn,T,C)
-        return derivative_points
+        return derivatives_points
+
 
     def _assert_past_cur_valid_mask(
         self,

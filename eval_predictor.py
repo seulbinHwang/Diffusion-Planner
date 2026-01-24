@@ -1,6 +1,6 @@
 import warnings
 
-import data_statistics
+from data_statistics import DataStatistics
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 from diffusion_planner.model.diffusion_planner import print_param_report
@@ -1959,7 +1959,7 @@ def validation_epoch(
             total_steps=total_batch_steps,
             prefix="Validation",
         )
-
+    data_statistics_inst = DataStatistics(args)
     with tqdm(
             data_loader,
             desc="Validation",
@@ -1979,7 +1979,8 @@ def validation_epoch(
                 device=args.device,
             )
             if args.do_data_statistics:
-                data_statistics.do_data_statistics(inputs, outputs)
+                print("Doing data statistics... \n\n\n\n")
+                data_statistics_inst.do_data_statistics(inputs)
                 continue
 
             norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(
@@ -2008,8 +2009,10 @@ def validation_epoch(
                     done_steps=batch_idx,
                     writer=data_epoch.write,
                 )
-    ddp_rank: int = int(ddp.get_rank()) if bool(getattr(args, "ddp",
-                                                        False)) else 0
+    if args.do_data_statistics:
+        data_statistics_inst.draw_histograms()
+        time.sleep(1)
+        raise RuntimeError("Data statistics completed. Stop validation.")
     ddp_rank: int = int(ddp.get_rank()) if bool(
         getattr(args, "ddp", False)) else 0
     if ddp_rank == 0:
