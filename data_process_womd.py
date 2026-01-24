@@ -4077,8 +4077,8 @@ def build_cache_dict_for_scenario(
         - ego_future_gt_11_dim: (80,11) float32
 
         - neighbor_role: (A,2) bool
-        - neighbor_id: (A,) int64
-        - neighbor_z: (A,) float32
+        - target_id: (A,) int64
+        - target_z: (A,) float32
         - neighbor_shape: (A,3) float32  [length,width,height] 평균
         - neighbor_agents_past: (A,21,11) float32
         - neighbor_future_gt_3_dim: (A,80,3) float32
@@ -4437,7 +4437,6 @@ def build_cache_dict_for_scenario(
         "lane_type": lane_type,  # (L,4)
         "left_line_type": left_line_type,  # (L,13)
 
-        # 요구사항 이름이 right_lne_type로 되어 있어서 key는 그렇게 저장
         "right_line_type": right_line_type,  # (L,13)
 
         "road_edge": road_edge,  # (E,10,2)
