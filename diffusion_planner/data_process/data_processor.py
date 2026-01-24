@@ -2,6 +2,7 @@ import numpy as np
 from tqdm import tqdm
 import matplotlib
 import time
+from typing import Dict, Tuple, Union, List, Optional, Any
 
 matplotlib.use('Agg')  # GUI 백엔드 사용 안함 (메모리 절약)
 import matplotlib.pyplot as plt
@@ -89,6 +90,20 @@ class DataProcessor(object):
             'RIGHT_BOUNDARY': config.lane_len,
             'ROUTE_LANES': config.lane_len
         }  # maximum number of points per feature to extract per feature layer.
+        # =========================
+        # 저장 성능 튜닝 옵션
+        # =========================
+        # 기본값 0: fsync를 아예 하지 않음(가장 빠름)
+        # 필요하면 config에 아래 값을 추가해서 "N개마다 1번"만 강제 반영 가능
+        self._save_fsync_every_n: int = int(getattr(config, "save_fsync_every_n", 0) or 0)
+        self._save_dir_fsync_every_n: int = int(getattr(config, "save_dir_fsync_every_n", 0) or 0)
+
+        # 압축 유지(기존 동작 그대로). 원하면 False로 바꿔 더 빠르게 할 수 있음(파일은 커짐)
+        self._save_use_compression: bool = bool(getattr(config, "save_use_compression", True))
+
+        # 프로세스(워커) 내부에서 저장 횟수 카운트
+        self._save_counter: int = 0
+
 
     @staticmethod
     def _build_origin_world_pose(
@@ -2090,21 +2105,98 @@ class DataProcessor(object):
 
         return cur_fut_agents_world_8_list, token_to_id
 
+    @staticmethod
+    def _fsync_directory(dir_path: str) -> None:
+        """파일 이름 교체(os.replace)가 디스크에 기록되도록 디렉토리를 fsync 한다.
+
+        주의:
+            - 이 동작은 꽤 느릴 수 있어 "매번" 하지 않고 필요할 때만 호출하는 용도입니다.
+            - 운영체제/파일시스템에 따라 동작이 다를 수 있으므로 실패해도 무시합니다.
+
+        Args:
+            dir_path (str): 저장 폴더 경로
+        """
+        try:
+            dir_fd = os.open(dir_path, os.O_RDONLY)
+        except Exception:
+            return
+
+        try:
+            os.fsync(dir_fd)
+        except Exception:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                os.close(dir_fd)
+
     def save_to_disk(self, dir: str, final_file_name: str,
-                     data: Dict[str, np.ndarray]) -> None:
+                     data: Dict[str, Any]) -> None:
+        """npz 파일을 '임시 파일(.tmp) -> 최종 파일 교체' 방식으로 저장합니다.
+
+        이번 변경의 핵심
+        --------------
+        - 기존: 매 파일마다 `os.fsync()`로 "디스크가 진짜 쓸 때까지" 기다림 → 매우 느려질 수 있음
+        - 변경: 기본값으로는 `os.fsync()`를 하지 않음 → OS가 쓰기를 모아서 처리 가능 → 속도 개선
+
+        필요하면(안전성 조금 더 원할 때)
+        -----------------------------
+        - config.save_fsync_every_n > 0 이면, N개 저장마다 1번만 파일 fsync 수행
+        - config.save_dir_fsync_every_n > 0 이면, N개 저장마다 1번만 디렉토리 fsync 수행
+          (파일 이름 교체까지 디스크에 남기고 싶을 때)
+
+        Args:
+            dir (str): 저장 폴더 경로
+            final_file_name (str): 확장자 제외 파일명
+            data (Dict[str, Any]):
+                np.savez 또는 np.savez_compressed에 넘길 값들.
+                (예: np.ndarray, 숫자, 문자열 등)
+
+        Raises:
+            BaseException:
+                저장 중 오류가 나면 예외를 그대로 올리고,
+                남아있는 .tmp 파일은 정리합니다.
+        """
         final_path = f"{dir}/{final_file_name}.npz"
         tmp_path = final_path + ".tmp"
 
         os.makedirs(dir, exist_ok=True)
 
+        # 이번 저장이 몇 번째 저장인지(성공한 저장만 카운트)
+        next_count: int = int(self._save_counter + 1)
+
+        # "N개마다 1번"만 강제 반영
+        need_file_fsync: bool = (
+            self._save_fsync_every_n > 0 and (next_count % self._save_fsync_every_n == 0)
+        )
+        need_dir_fsync: bool = (
+            self._save_dir_fsync_every_n > 0 and (next_count % self._save_dir_fsync_every_n == 0)
+        )
+
         try:
+            # 1) 임시 파일에 먼저 저장
             with open(tmp_path, "wb") as f:
-                np.savez_compressed(f, **data)
-                f.flush()
-                os.fsync(f.fileno())
+                if self._save_use_compression:
+                    np.savez_compressed(f, **data)
+                else:
+                    np.savez(f, **data)
+
+                # ✅ 기본은 fsync 안 함(속도 목적)
+                # 필요할 때만(예: N개마다 1번) 파일 fsync
+                if need_file_fsync:
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            # 2) 저장이 끝난 임시 파일을 최종 파일명으로 교체(원자적 교체)
             os.replace(tmp_path, final_path)
 
-        except BaseException:  # ✅ Ctrl+C(KeyboardInterrupt)도 여기로 들어옴
+            # 필요할 때만 디렉토리 fsync(파일 이름 교체까지 디스크에 남기고 싶을 때)
+            if need_dir_fsync:
+                self._fsync_directory(dir)
+
+            # 성공한 저장만 카운트 반영
+            self._save_counter = next_count
+
+        except BaseException:  # Ctrl+C 포함
             with contextlib.suppress(Exception):
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
