@@ -23,14 +23,14 @@ WOMD_DATA_ROOT="/media/user/E/dataset/womd_v1_3"
 TRAIN_SET_NAME="processed_womd_0124"
 SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 
-#CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
-#taskset -c "${CPUSET}" \
-#python data_process_womd.py \
-#  --womd_data_path "$WOMD_DATA_ROOT" \
-#  --num_workers ${NUM_CPUS} \
-#  --overwrite_womd_cache false \
-#  --save_path "$SAVE_PATH" \
-#  --save_image false
+CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
+taskset -c "${CPUSET}" \
+python data_process_womd.py \
+  --womd_data_path "$WOMD_DATA_ROOT" \
+  --num_workers ${NUM_CPUS} \
+  --overwrite_womd_cache false \
+  --save_path "$SAVE_PATH" \
+  --save_image false
 
 echo "Data processing finished."
 echo "---------------------------------"

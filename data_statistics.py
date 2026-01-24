@@ -311,8 +311,9 @@ class DataStatistics:
         if seg_speed_ok is not None:
             seg_valid_stats_for_accel = seg_valid_stats_for_accel & seg_speed_ok.to(torch.bool)
 
+
         seg_body_accel_max, ok1 = self._masked_abs_max(seg_body_accel, seg_valid_stats_for_accel)
-        seg_body_angular_accel_max, ok2 = self._masked_abs_max(seg_body_angular_accel, seg_valid_stats)
+        seg_body_angular_accel_max, ok2 = self._masked_abs_max(seg_body_angular_accel, seg_valid_stats_for_accel)
 
         stats_valid_ba = agent_ok & ok1 & ok2
         return seg_body_accel_max, seg_body_angular_accel_max, stats_valid_ba
@@ -382,9 +383,9 @@ class DataStatistics:
         # - 차/자전거: v > v_min 인 구간만 포함
         # ================================
         v_min_car = float(
-            getattr(self.config, "stats_r_min_v_min_car_mps", 0.5))
+            getattr(self.config, "stats_r_min_v_min_car_mps", 1.5))
         v_min_bicycle = float(
-            getattr(self.config, "stats_r_min_v_min_bicycle_mps", 0.3))
+            getattr(self.config, "stats_r_min_v_min_bicycle_mps", 0.5))
 
         is_car = (neighbor_agents_type[..., 0] > 0.5)  # (B,agent)
         is_ped = (neighbor_agents_type[..., 1] > 0.5)  # (B,agent)
