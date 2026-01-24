@@ -34,6 +34,57 @@ class DataStatistics:
             - 0.3 rad/s 단위로 통계 히스토그램 그리자 (0~0.3, 0.3~0.6, 0.6~0.9, ..., 8.7~9.0, 9.0~9.3, ...)
         """
 
+    def _auto_tune_stats_params_from_sg_windows(
+        self,
+        max_window_len_xy: int,
+        max_window_len_yaw: int,
+    ) -> None:
+        """SG 창 길이에 맞춰 통계용 edge_trim/min_valid_len을 자동으로 보정합니다.
+
+        목적:
+            - SG는 창 길이 W에서 양 끝 W//2 구간이 중앙 방식이 아니어서 값이 튈 수 있습니다.
+            - 특히 2차 변화율(가속도/각가속도)은 끝부분이 더 민감합니다.
+            - 그래서 window 길이에 기반해 edge_trim을 충분히 크게 만들고,
+              잘라낸 뒤에도 최소한의 유효 구간이 남도록 min_valid_len을 올립니다.
+
+        규칙:
+            half_xy  = max_window_len_xy  // 2
+            half_yaw = max_window_len_yaw // 2
+            stats_edge_trim >= max(2, max(half_xy, half_yaw) + 1)
+            stats_min_valid_len >= 2*stats_edge_trim + 3
+            stats_min_valid_len_for_accel >= 2*stats_edge_trim + 3
+
+        Args:
+            max_window_len_xy: x,y에 사용하는 SG 창 길이(샘플 수, 홀수).
+            max_window_len_yaw: yaw에 사용하는 SG 창 길이(샘플 수, 홀수).
+
+        Returns:
+            None. self.config의 통계 파라미터를 갱신합니다.
+        """
+        w_xy = max(1, int(max_window_len_xy))
+        w_yaw = max(1, int(max_window_len_yaw))
+
+        half_xy = w_xy // 2
+        half_yaw = w_yaw // 2
+
+        recommended_edge_trim = max(2, max(half_xy, half_yaw) + 1)
+
+        cur_edge_trim = int(getattr(self.config, "stats_edge_trim", 2))
+        edge_trim = max(cur_edge_trim, recommended_edge_trim)
+
+        min_len_required = 2 * edge_trim + 3
+
+        cur_min_valid_len = int(getattr(self.config, "stats_min_valid_len", 5))
+        cur_min_valid_len_for_accel = int(
+            getattr(self.config, "stats_min_valid_len_for_accel", 7)
+        )
+
+        self.config.stats_edge_trim = int(edge_trim)
+        self.config.stats_min_valid_len = int(max(cur_min_valid_len, min_len_required))
+        self.config.stats_min_valid_len_for_accel = int(
+            max(cur_min_valid_len_for_accel, min_len_required)
+        )
+
     def do_data_statistics(self, inputs: Dict[str, Any]):
         """ inputs
         neighbor_agents_past : (B, agent_num, time_len, 11)
@@ -59,6 +110,13 @@ class DataStatistics:
             max_window_len_xy,  # int # x,y 좌표에 사용할 최대 윈도 길이(샘플 수).
             max_window_len_yaw,  # int # yaw에 사용할 최대 윈도 길이(샘플 수).
         ) = self.feasible_projector.get_feasible_stride_params(future_len)
+
+        # [추가] SG 창 길이에 맞춰 통계 파라미터 자동 보정
+        self._auto_tune_stats_params_from_sg_windows(
+            max_window_len_xy=max_window_len_xy,
+            max_window_len_yaw=max_window_len_yaw,
+        )
+
 
         neighbor_agents_current = neighbor_agents_past[:, :,
                                                        -1, :]  # (B, agent_num, 11)

@@ -4077,8 +4077,8 @@ def build_cache_dict_for_scenario(
         - ego_future_gt_11_dim: (80,11) float32
 
         - neighbor_role: (A,2) bool
-        - target_id: (A,) int64
-        - target_z: (A,) float32
+        - target_id: (A+1,) int64
+        - target_z: (A+1,) float32
         - neighbor_shape: (A,3) float32  [length,width,height] 평균
         - neighbor_agents_past: (A,21,11) float32
         - neighbor_future_gt_3_dim: (A,80,3) float32
