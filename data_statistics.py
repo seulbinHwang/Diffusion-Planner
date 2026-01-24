@@ -343,26 +343,36 @@ class DataStatistics:
         stats_valid_ba = agent_ok & ok1 & ok2
         return seg_body_accel_max, seg_body_angular_accel_max, stats_valid_ba
 
-
     def _get_seg_body_control_statistics(
             self,
             seg_body_control: torch.Tensor,  # (B, agent_num, total_len, 3)
             seg_valid: torch.Tensor,  # (B, agent_num, total_len) bool
-            neighbor_agents_type: torch.Tensor,
-            # (B, agent_num, 3)  (vehicle, pedestrian, bicycle)
+            neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
             seg_speed_ok: torch.Tensor,  # (B, agent_num, total_len) bool
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         """속도/각속도 관련 통계를 '안정적으로' 계산합니다.
 
+        반영된 규칙(요청사항):
+            1) v_y^b 는 저속(seg_speed_ok=False) 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
+               -> abs_v_y_b_max가 자연스럽게 바뀝니다.
+            2) omega_max(abs_omega_max)는 저속(seg_speed_ok=False) 구간을 max 계산에서 제외합니다.
+               (omega 텐서 자체는 바꾸지 않습니다.)
+               단, 제외 결과로 표본이 하나도 없으면 omega_max는 0으로 두고 유효로 취급합니다.
+            3) a_y_lat(v*|omega|)도 저속 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
+               -> abs_a_y_lat_max가 자연스럽게 바뀝니다.
+            4) r_min의 저속 제외 기준은 별도(stats_r_min_v_min_*)를 쓰지 않고,
+               accel에서 쓰는 v_stop 기준(=seg_speed_ok 생성 기준)으로 통일합니다.
+               보행자는 r_min에서 속도 조건을 적용하지 않습니다(항상 포함).
+
         Returns:
-            abs(v_y^b)_max : (B, agent_num) float32
-            abs(v)_max     : (B, agent_num) float32
-            abs(ω)_max     : (B, agent_num) float32
-            abs(a_y_lat)_max : (B, agent_num) float32
-            R_min          : (B, agent_num) float32
-            stats_valid_ba : (B, agent_num) bool
+            abs(v_y^b)_max    : (B, agent_num) float32
+            abs(v)_max        : (B, agent_num) float32
+            abs(ω)_max        : (B, agent_num) float32
+            abs(a_y_lat)_max  : (B, agent_num) float32
+            R_min             : (B, agent_num) float32
+            stats_valid_ba    : (B, agent_num) bool
         """
         if seg_body_control.dim() != 4:
             raise ValueError(
@@ -379,8 +389,12 @@ class DataStatistics:
                 f"neighbor_agents_type must be (B,agent,3). got={tuple(neighbor_agents_type.shape)}, "
                 f"expected (B,agent,3)=({seg_body_control.shape[0]},{seg_body_control.shape[1]},3)"
             )
+        if seg_speed_ok.shape != seg_valid.shape:
+            raise ValueError(
+                f"seg_speed_ok must match seg_valid shape (B,agent,T). "
+                f"seg_speed_ok={tuple(seg_speed_ok.shape)}, seg_valid={tuple(seg_valid.shape)}"
+            )
 
-        # (2)(3) 파라미터
         edge_trim = int(getattr(self.config, "stats_edge_trim", 2))
         min_valid_len = int(getattr(self.config, "stats_min_valid_len", 5))
 
@@ -390,6 +404,8 @@ class DataStatistics:
             min_valid_len=min_valid_len,
         )  # seg_valid_stats: (B,agent,T), agent_ok: (B,agent)
 
+        seg_speed_ok_bool = seg_speed_ok.to(torch.bool)  # (B,agent,T)
+
         # 값 분해
         v_y_b = seg_body_control[:, :, :, 1]  # (B,agent,T)
         omega = seg_body_control[:, :, :, 2]  # (B,agent,T)
@@ -398,35 +414,45 @@ class DataStatistics:
         a_y_lat = v * omega.abs()  # (B,agent,T)
         r = v / (omega.abs() + 1e-6)  # (B,agent,T)
 
-        abs_v_y_b_max, ok1 = self._masked_abs_max(v_y_b, seg_valid_stats)
+        # ================================
+        # (1) v_y_b 저속 구간 값 0으로 정리
+        # ================================
+        v_y_b_for_stats = torch.where(
+            seg_speed_ok_bool, v_y_b, torch.zeros_like(v_y_b)
+        )  # (B,agent,T)
+
+        # ================================
+        # (3) a_y_lat 저속 구간 값 0으로 정리
+        # ================================
+        a_y_lat_for_stats = torch.where(
+            seg_speed_ok_bool, a_y_lat, torch.zeros_like(a_y_lat)
+        )  # (B,agent,T)
+
+        # (v_y_b, v, a_y_lat)은 seg_valid_stats 기준으로 계산 (값이 0으로 정리되므로 max가 자연히 안정화됨)
+        abs_v_y_b_max, ok1 = self._masked_abs_max(v_y_b_for_stats,
+                                                  seg_valid_stats)
         abs_v_max, ok2 = self._masked_abs_max(v, seg_valid_stats)
-        abs_omega_max, ok3 = self._masked_abs_max(omega, seg_valid_stats)
-        abs_a_y_lat_max, ok4 = self._masked_abs_max(a_y_lat, seg_valid_stats)
+        abs_a_y_lat_max, ok4 = self._masked_abs_max(a_y_lat_for_stats,
+                                                    seg_valid_stats)
 
         # ================================
-        # [핵심 변경] r_min 계산에 저속 구간 제외 마스크 추가
-        # - 보행자: 속도 조건 적용 안 함(항상 포함)
-        # - 차/자전거: v > v_min 인 구간만 포함
+        # (2) omega_max는 저속 구간을 "제외"해서 계산 (omega 값 자체는 변경 안 함)
         # ================================
-        v_min_car = float(
-            getattr(self.config, "stats_r_min_v_min_car_mps", 1.5))
-        v_min_bicycle = float(
-            getattr(self.config, "stats_r_min_v_min_bicycle_mps", 0.5))
+        omega_mask = seg_valid_stats & seg_speed_ok_bool  # (B,agent,T)
+        abs_omega_max, ok3 = self._masked_abs_max(omega, omega_mask)
 
-        is_car = (neighbor_agents_type[..., 0] > 0.5)  # (B,agent)
+        # 저속 제외로 인해 표본이 0개면 omega_max=0으로 두고 유효 처리
+        has_omega_sample = omega_mask.any(dim=2)  # (B,agent)
+        ok3 = ok3 | ((~has_omega_sample) & agent_ok)  # (B,agent)
+
+        # ================================
+        # (4) r_min: 별도 v_min 파라미터 없이, seg_speed_ok(=v_stop 기준)으로 통일
+        #     - 보행자는 속도 조건 없이 항상 포함
+        # ================================
         is_ped = (neighbor_agents_type[..., 1] > 0.5)  # (B,agent)
-        is_bicycle = (neighbor_agents_type[..., 2] > 0.5)  # (B,agent)
+        speed_ok_for_r = is_ped.unsqueeze(-1) | seg_speed_ok_bool  # (B,agent,T)
 
-        # (B,agent) : 차면 v_min_car, 자전거면 v_min_bicycle, 보행자는 0
-        v_min_ba = (is_car.to(v.dtype) * v_min_car) + (
-                    is_bicycle.to(v.dtype) * v_min_bicycle)
-
-        # (B,agent,T) : 보행자는 항상 True, 차/자전거는 v > v_min
-        speed_ok_for_r = is_ped.unsqueeze(-1) | (v > v_min_ba.unsqueeze(-1))
-
-        # r_min에만 적용되는 최종 마스크
         r_valid_stats = seg_valid_stats & speed_ok_for_r  # (B,agent,T)
-
         r_min, ok5 = self._masked_min(r, r_valid_stats, invalid_fill=1.0e6)
 
         stats_valid_ba = agent_ok & ok1 & ok2 & ok3 & ok4 & ok5  # (B,agent)
