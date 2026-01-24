@@ -2,7 +2,7 @@
 set -e
 
 # ---------------- CPU 분리 설정 ----------------
-CPU_SET="0-31,64-95"
+CPUSET="0-31,64-95"
 NUM_CPUS=52
 
 export OMP_NUM_THREADS=1
