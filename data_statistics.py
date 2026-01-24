@@ -135,8 +135,10 @@ class DataStatistics:
         abs_a_y_lat_max : (B, agent_num)
         r_min : (B, agent_num)
         """
-        (abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min, seg_ctrl_stats_valid_ba) = \
-            self._get_seg_body_control_statistics(seg_body_control, seg_valid)
+        (abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min,
+         seg_ctrl_stats_valid_ba) = \
+            self._get_seg_body_control_statistics(seg_body_control, seg_valid,
+                                                  neighbor_agents_type)
 
         self._set_seg_body_control_statistics(
             abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min,
@@ -221,19 +223,16 @@ class DataStatistics:
         stats_valid_ba = agent_ok & ok1 & ok2
         return seg_body_accel_max, seg_body_angular_accel_max, stats_valid_ba
 
-
     def _get_seg_body_control_statistics(
-        self,
-        seg_body_control: torch.Tensor,  # (B, agent_num, total_len, 3)
-        seg_valid: torch.Tensor,         # (B, agent_num, total_len) bool
+            self,
+            seg_body_control: torch.Tensor,  # (B, agent_num, total_len, 3)
+            seg_valid: torch.Tensor,  # (B, agent_num, total_len) bool
+            neighbor_agents_type: torch.Tensor,
+            # (B, agent_num, 3)  (vehicle, pedestrian, bicycle)
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         """속도/각속도 관련 통계를 '안정적으로' 계산합니다.
-
-        변경점:
-            - (2) max/min 계산에서 유효 구간 양끝 edge_trim 세그먼트를 제외합니다.
-            - (3) 유효 길이가 너무 짧으면(min_valid_len 미만) 해당 agent는 통계에서 제외합니다.
 
         Returns:
             abs(v_y^b)_max : (B, agent_num) float32
@@ -241,14 +240,22 @@ class DataStatistics:
             abs(ω)_max     : (B, agent_num) float32
             abs(a_y_lat)_max : (B, agent_num) float32
             R_min          : (B, agent_num) float32
-            stats_valid_ba : (B, agent_num) bool  (히스토그램 누적에 쓸 유효 마스크)
+            stats_valid_ba : (B, agent_num) bool
         """
         if seg_body_control.dim() != 4:
-            raise ValueError(f"seg_body_control must be (B,agent,T,3). got={tuple(seg_body_control.shape)}")
+            raise ValueError(
+                f"seg_body_control must be (B,agent,T,3). got={tuple(seg_body_control.shape)}")
         if seg_valid.shape[:3] != seg_body_control.shape[:3]:
             raise ValueError(
                 f"seg_valid shape must match seg_body_control[:3]. "
                 f"seg_valid={tuple(seg_valid.shape)}, seg_body_control={tuple(seg_body_control.shape)}"
+            )
+        if neighbor_agents_type.dim() != 3 or neighbor_agents_type.shape[
+            :2] != seg_body_control.shape[:2] or neighbor_agents_type.shape[
+            2] != 3:
+            raise ValueError(
+                f"neighbor_agents_type must be (B,agent,3). got={tuple(neighbor_agents_type.shape)}, "
+                f"expected (B,agent,3)=({seg_body_control.shape[0]},{seg_body_control.shape[1]},3)"
             )
 
         # (2)(3) 파라미터
@@ -266,22 +273,45 @@ class DataStatistics:
         omega = seg_body_control[:, :, :, 2]  # (B,agent,T)
 
         v = torch.norm(seg_body_control[:, :, :, 0:2], dim=-1)  # (B,agent,T)
-        a_y_lat = v * omega.abs()                               # (B,agent,T)
-        r = v / (omega.abs() + 1e-6)                            # (B,agent,T)
+        a_y_lat = v * omega.abs()  # (B,agent,T)
+        r = v / (omega.abs() + 1e-6)  # (B,agent,T)
 
         abs_v_y_b_max, ok1 = self._masked_abs_max(v_y_b, seg_valid_stats)
         abs_v_max, ok2 = self._masked_abs_max(v, seg_valid_stats)
         abs_omega_max, ok3 = self._masked_abs_max(omega, seg_valid_stats)
         abs_a_y_lat_max, ok4 = self._masked_abs_max(a_y_lat, seg_valid_stats)
 
-        r_min, ok5 = self._masked_min(r, seg_valid_stats, invalid_fill=1.0e6)
+        # ================================
+        # [핵심 변경] r_min 계산에 저속 구간 제외 마스크 추가
+        # - 보행자: 속도 조건 적용 안 함(항상 포함)
+        # - 차/자전거: v > v_min 인 구간만 포함
+        # ================================
+        v_min_car = float(
+            getattr(self.config, "stats_r_min_v_min_car_mps", 0.5))
+        v_min_bicycle = float(
+            getattr(self.config, "stats_r_min_v_min_bicycle_mps", 0.3))
+
+        is_car = (neighbor_agents_type[..., 0] > 0.5)  # (B,agent)
+        is_ped = (neighbor_agents_type[..., 1] > 0.5)  # (B,agent)
+        is_bicycle = (neighbor_agents_type[..., 2] > 0.5)  # (B,agent)
+
+        # (B,agent) : 차면 v_min_car, 자전거면 v_min_bicycle, 보행자는 0
+        v_min_ba = (is_car.to(v.dtype) * v_min_car) + (
+                    is_bicycle.to(v.dtype) * v_min_bicycle)
+
+        # (B,agent,T) : 보행자는 항상 True, 차/자전거는 v > v_min
+        speed_ok_for_r = is_ped.unsqueeze(-1) | (v > v_min_ba.unsqueeze(-1))
+
+        # r_min에만 적용되는 최종 마스크
+        r_valid_stats = seg_valid_stats & speed_ok_for_r  # (B,agent,T)
+
+        r_min, ok5 = self._masked_min(r, r_valid_stats, invalid_fill=1.0e6)
 
         stats_valid_ba = agent_ok & ok1 & ok2 & ok3 & ok4 & ok5  # (B,agent)
 
         return abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min, stats_valid_ba
 
-
-# =========================================================
+    # =========================================================
 # [NEW] Mask 검증/SG 미분 유틸 (DataStatistics 내부 구현)
 # =========================================================
 

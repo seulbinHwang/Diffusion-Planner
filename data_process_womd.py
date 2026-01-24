@@ -3098,7 +3098,7 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
             if is_valid_polygon_xy(polygon_xy, min_points=3):
                 speed_bump_polygons_xy_global.append(polygon_xy)
 
-        elif feature_type == "driveway_points":
+        elif feature_type == "driveway":
             polygon_xy = _extract_driveway_polygon_xy_global(
                 mf.driveway)  # (M,2)
             if is_valid_polygon_xy(polygon_xy, min_points=2):
