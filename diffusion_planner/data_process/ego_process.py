@@ -1,6 +1,6 @@
 import numpy as np
 import numpy.typing as npt
-from typing import List, Tuple, Generator
+from typing import List, Tuple, Generator, Optional
 
 from nuplan.common.actor_state.state_representation import TimePoint
 from nuplan.common.actor_state.ego_state import EgoState
@@ -21,6 +21,32 @@ from nuplan.planning.scenario_builder.nuplan_db.nuplan_scenario import NuPlanSce
 from diffusion_planner.data_process.utils import convert_absolute_quantities_to_relative
 from nuplan.common.geometry.convert import numpy_array_to_absolute_velocity
 
+
+def _build_ego_reference_pose_np(
+    ego_state: EgoState,
+    *,
+    set_coord_as_center: bool,
+) -> npt.NDArray[np.float64]:
+    """현재 ego 상태에서 '기준점'을 선택해 [x, y, heading] 배열을 만든다.
+
+    Args:
+        ego_state (EgoState):
+            현재 ego 상태.
+        set_coord_as_center (bool):
+            True면 차량 중심점을 기준으로,
+            False면 rear axle(뒷바퀴 축) 지점을 기준으로 삼습니다.
+
+    Returns:
+        npt.NDArray[np.float64]:
+            shape: (3,)
+            [x_world, y_world, heading_world]
+    """
+    ref = ego_state.center if set_coord_as_center else ego_state.rear_axle
+    ego_pose_np: npt.NDArray[np.float64] = np.array(
+        [ref.x, ref.y, ref.heading],
+        dtype=np.float64,
+    )
+    return ego_pose_np
 
 def get_ego_past_array_from_scenario(
         scenario: NuPlanScenario, num_past_poses: int,
@@ -163,100 +189,107 @@ def sampled_future_ego_states_to_array(
 
     return fut_ego_world_10
 
-
 def get_ego_future_array_from_scenario(
     scenario: NuPlanScenario,
     current_ego_state: EgoState,
     num_future_poses: int,
     future_time_horizon: float,
+    *,
+    ego_cur_pose_np: Optional[npt.NDArray[np.float64]] = None,
+    set_coord_as_center: bool = False,
 ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
-    """시나리오에서 ego의 미래 궤적을 가져와,
-    ego 기준 좌표계로 변환한 결과를 (T,3) / (T,11) 두 가지 형태로 돌려준다.
+    """시나리오에서 ego의 미래 궤적을 가져와, ego 기준 좌표계로 변환해 반환한다.
 
-    전체 흐름
-    ----------
-    1) nuPlan 시나리오에서, 현재 ego 상태 기준
-       `num_future_poses`, `future_time_horizon` 조건에 맞게
-       미래 ego 상태들을 가져온다.
-       - future_ego_states: List[EgoState], 길이 T
+    이번 변경의 핵심
+    ---------------
+    - 과거(ego_agent_past)를 만들 때 사용한 기준점(ego_cur_pose_np)과
+      미래(ego_future)를 만들 때 사용한 기준점이 다르면,
+      중간에서 값을 채우는 과정(보간/정리)에서 기준이 섞여 잘못될 수 있습니다.
+    - 그래서 이 함수는 `ego_cur_pose_np`를 입력으로 받아
+      미래도 과거와 "완전히 같은 기준"으로 만들 수 있게 합니다.
 
-    2) `sampled_future_ego_states_to_array` 로
-       각 시점을 10차원 월드 좌표 배열로 바꾼다.
-       - fut_ego_world_10: shape (T, 10)
-         · [x, y, heading, vx, vy, width, length, one-hot(3)]
-
-    3) 현재 ego 포즈(current_ego_state.rear_axle)를
-       [x_ego, y_ego, yaw_ego] 형태의 벡터로 만든다.
-       - ego_cur_pose_np: shape (3,)
-
-    4) `convert_absolute_quantities_to_relative(..., 'ego')` 를 호출해
-       월드 좌표 기반의 10차원 배열을 ego 기준 좌표계로 바꾸면서
-       heading 을 cos, sin 두 값으로 풀어 1차원을 늘린다.
-       - fut_ego_local_11: shape (T, 11), dtype float32
-         · [x, y, cos(yaw), sin(yaw), vx, vy, width, length, one-hot(3)]
-
-    5) x, y 값으로부터 heading 을 다시 뽑아 (단순 arctan2 사용)
-       (T, 3) = [x, y, heading] 형태의 간단한 궤적도 만들어서 함께 반환한다.
-       - fut_ego_local_xyh: shape (T, 3)
+    기준점 선택 규칙
+    --------------
+    1) ego_cur_pose_np를 넘기면:
+       - 그 값을 그대로 기준점으로 사용합니다.
+       - (권장) DataProcessor에서 과거를 만들 때 쓴 ego_cur_pose_np를 그대로 넘기세요.
+    2) ego_cur_pose_np가 None이면:
+       - set_coord_as_center 값에 따라 기준점을 선택합니다.
+         · True: center 기준
+         · False: rear axle 기준 (기존 동작과 동일)
 
     Args:
         scenario (NuPlanScenario):
             nuPlan 시나리오 객체.
         current_ego_state (EgoState):
-            현재 ego 상태. (보통 initial_ego_state 또는 시뮬레이터의 현재 상태)
+            현재 ego 상태.
         num_future_poses (int):
-            몇 개의 미래 시점을 샘플링할지 (T 값).
+            미래 프레임 개수.
         future_time_horizon (float):
-            현재부터 몇 초 뒤까지를 커버할지 [초].
+            미래를 볼 시간 길이(초).
+        ego_cur_pose_np (Optional[npt.NDArray[np.float64]]):
+            shape: (3,)
+            [x_world, y_world, heading_world]
+            과거와 같은 기준으로 만들고 싶으면 반드시 넘겨야 합니다.
+        set_coord_as_center (bool):
+            ego_cur_pose_np가 None일 때만 사용됩니다.
+            True면 center 기준, False면 rear axle 기준.
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]:
+        Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
             - fut_ego_local_xyh:
-                · shape: (T, 3)
-                · 각 행: [x_ego, y_ego, heading_ego] (ego 기준 좌표계)
-                · dtype: float32
+                shape: (T, 3) = [x, y, heading]
             - fut_ego_local_11:
-                · shape: (T, 11)
-                · 각 행:
-                    [x, y, cos(yaw), sin(yaw), vx, vy,
-                     width, length, onehot_car, onehot_ped, onehot_bike]
-                · dtype: float32
+                shape: (T, 11) =
+                [x, y, cos, sin, vx, vy, width, length, onehot(3)]
     """
-    # future_ego_states: List[EgoState], 길이 T
+    # 1) 미래 ego 상태들 (길이 T)
     future_ego_states = scenario.get_ego_future_trajectory(
         iteration=0,
         num_samples=num_future_poses,
-        time_horizon=future_time_horizon)
-
-    # fut_ego_world_10: (T, 10)
-    fut_ego_world_10 = sampled_future_ego_states_to_array(
-        list(future_ego_states))
-    # ego_cur_pose_np: (3,) = [x_ego, y_ego, yaw_ego] (월드 좌표계)
-    ego_cur_pose_np = np.array(
-        [
-            current_ego_state.rear_axle.x,
-            current_ego_state.rear_axle.y,
-            current_ego_state.rear_axle.heading,
-        ],
-        dtype=np.float64,
+        time_horizon=future_time_horizon,
     )
 
-    # fut_ego_local_11: (T, 11)  ← 'ego' 모드로 상대 좌표 변환 후 float32
+    # 2) 월드 기준 10차원 배열로 변환
+    fut_ego_world_10 = sampled_future_ego_states_to_array(list(future_ego_states))  # (T, 10)
+
+    # 3) 기준 포즈 결정
+    if ego_cur_pose_np is None:
+        ego_cur_pose_np_use = _build_ego_reference_pose_np(
+            current_ego_state,
+            set_coord_as_center=set_coord_as_center,
+        )
+    else:
+        if not isinstance(ego_cur_pose_np, np.ndarray):
+            raise TypeError(f"`ego_cur_pose_np`는 np.ndarray 여야 합니다. got {type(ego_cur_pose_np)}")
+        if ego_cur_pose_np.shape != (3,):
+            raise ValueError(f"`ego_cur_pose_np` shape는 (3,) 이어야 합니다. got {ego_cur_pose_np.shape}")
+        ego_cur_pose_np_use = ego_cur_pose_np.astype(np.float64, copy=False)
+
+    # 4) ego 기준으로 변환 (T, 11)
     fut_ego_local_11 = convert_absolute_quantities_to_relative(
-        fut_ego_world_10, ego_cur_pose_np, 'ego').astype(np.float32)
-    # fut_ego_local_xy: (T, 2)  ← x,y 만 분리
-    fut_ego_local_xy = fut_ego_local_11[:, :2]
-    fut_ego_local_cos_yaw = fut_ego_local_11[:, 2]
-    fut_ego_local_sin_yaw = fut_ego_local_11[:, 3]
+        fut_ego_world_10,
+        ego_cur_pose_np_use,
+        'ego',
+    ).astype(np.float32, copy=False)
 
-    # fut_ego_local_heading: (T,)  ← x,y 에서 heading 추출 (현재 구현 그대로 유지)
-    fut_ego_local_heading = np.arctan2(fut_ego_local_sin_yaw,
-                                       fut_ego_local_cos_yaw)
+    # 5) (T, 3) 만들기
+    fut_ego_local_xy = fut_ego_local_11[:, :2]  # (T, 2)
+    fut_ego_local_cos_yaw = fut_ego_local_11[:, 2]  # (T,)
+    fut_ego_local_sin_yaw = fut_ego_local_11[:, 3]  # (T,)
 
-    # fut_ego_local_xyh: (T, 3) = [x, y, heading]
+    fut_ego_local_heading = np.arctan2(
+        fut_ego_local_sin_yaw,
+        fut_ego_local_cos_yaw,
+    ).astype(np.float32, copy=False)  # (T,)
+
     fut_ego_local_xyh = np.concatenate(
-        [fut_ego_local_xy, fut_ego_local_heading[:, None]], axis=-1)
+        [fut_ego_local_xy, fut_ego_local_heading[:, None]],
+        axis=-1,
+    ).astype(np.float32, copy=False)  # (T, 3)
+
     return fut_ego_local_xyh, fut_ego_local_11
+
 
 
 def calculate_additional_ego_states(ego_agent_past, time_stamp):

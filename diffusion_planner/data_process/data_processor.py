@@ -1662,9 +1662,19 @@ class DataProcessor(object):
             # ✅ (요구조건 b) ego: past+future(101) 기반으로 규칙 적용
             #    그리고 ego_future_gt_3_dim은 “규칙 적용된 11dim”에서 다시 생성
             # ─────────────────────────────────────────────
+
             (_, ego_future_gt_11_dim_raw) = get_ego_future_array_from_scenario(
-                scenario, ego_state, self.num_future_poses,
-                self.future_time_horizon)
+                scenario=scenario,
+                current_ego_state=ego_state,
+                num_future_poses=self.num_future_poses,
+                future_time_horizon=self.future_time_horizon,
+                # ✅ 과거를 만들 때 쓴 ego_cur_pose_np를 그대로 넘겨서,
+                #    미래도 "완전히 같은 기준"으로 만들기
+                ego_cur_pose_np=ego_cur_pose_np,
+                # (참고) ego_cur_pose_np가 주어지면 이 값은 사실상 의미가 없지만,
+                #        호출 의도를 명확히 하려고 함께 전달
+                set_coord_as_center=self.set_coord_as_center,
+            )
 
             ego_agent_past, ego_future_gt_11_dim = self._merge_and_interpolate_ego_11dim(
                 ego_agent_past=ego_agent_past,
@@ -1675,13 +1685,10 @@ class DataProcessor(object):
             ego_future_gt_3_dim = self._traj11_to_traj3_yaw(
                 ego_future_gt_11_dim)
 
-            # ✅ center 기준 옵션이면 x,y 원점 보정
-            ego_future_gt_3_dim, ego_future_gt_11_dim = self._adjust_ego_future_outputs_to_center_frame(
-                ego_state=ego_state,
-                ego_future_gt_3_dim=ego_future_gt_3_dim,
-                ego_future_gt_11_dim=ego_future_gt_11_dim,
-                set_coord_as_center=self.set_coord_as_center,
-            )
+            # ✅ 여기서는 추가 center 보정 호출을 하지 않습니다.
+            # 이유:
+            # - 미래도 이미 ego_cur_pose_np(=과거와 동일 기준)로 만들어졌기 때문입니다.
+            # - set_coord_as_center=True일 때 _adjust... 를 또 호출하면 "두 번 이동"이 될 수 있습니다.
 
             (
                 past_cur_agents_world_8_list,

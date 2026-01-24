@@ -693,7 +693,6 @@ class LaneInfo:
     speed_limit_mph: float
     lane_type: int  # lane의 큰 분류(고속도로/일반도로/자전거/미정)
 
-
 @dataclass(frozen=True)
 class ParsedMap:
     """시나리오 맵을 필요한 형태로 미리 모아둔 결과."""
@@ -701,22 +700,25 @@ class ParsedMap:
     crosswalk_polygons_xy_global: List[np.ndarray]  # each shape: (M,2)
     speed_bump_polygons_xy_global: List[np.ndarray]
 
-    # ✅ 추가: driveway polygon (각각 (M,2))
-    driveway_polygons_xy_global: List[np.ndarray]
+    # ✅ driveway는 실제 데이터에서 2가지 형태가 올 수 있어 분리 저장합니다.
+    # - polygon: 닫힌 영역(둘레)
+    # - polyline: 점들의 줄(선)
+    driveway_polygons_xy_global: List[np.ndarray]   # each shape: (M,2)
+    driveway_polylines_xy_global: List[np.ndarray]  # each shape: (K,2)
 
     lanes: List[LaneInfo]
 
     # boundary (road_line / road_edge) polyline
     boundary_polylines_xy_global: Dict[int, np.ndarray]  # id -> shape: (K,2)
 
-    # ✅ 추가: boundary id가 road_line인지 road_edge인지 구분
+    # boundary id가 road_line인지 road_edge인지 구분
     boundary_id_to_kind: Dict[int, str]  # id -> "road_line" or "road_edge"
 
-    # ✅ 추가: road_line / road_edge 타입(정수 enum) 저장
+    # road_line / road_edge 타입(정수 enum) 저장
     road_line_type_by_id: Dict[int, int]  # road_line id -> type int
     road_edge_type_by_id: Dict[int, int]  # road_edge id -> type int
 
-    # ✅ 추가: road_edge id 목록(road_edge 출력용)
+    # road_edge id 목록(road_edge 출력용)
     road_edge_ids: List[int]
 
 
@@ -1216,27 +1218,37 @@ def build_road_edge_points_and_types(
 
     return road_edge_points, road_edge_type
 
+def _extract_driveway_geometry_xy_global(
+    driveway_msg: Any,
+) -> Tuple[np.ndarray, bool]:
+    """driveway 메시지에서 점들과 'polygon인지' 여부를 함께 뽑습니다.
 
-def _extract_driveway_polygon_xy_global(driveway_msg: Any) -> np.ndarray:
-    """driveway 메시지에서 (M,2) polygon 점들을 뽑습니다.
+    driveway는 데이터/버전에 따라 두 가지 형태로 올 수 있습니다.
+    - polygon: 닫힌 영역(둘레가 있는 모양)
+    - polyline: 점들이 줄로 이어진 선
 
-    데이터/버전에 따라 내부 필드명이 약간 다를 수 있어,
-    polygon이 있으면 polygon을 우선 사용하고,
-    없으면 polyline을 대체로 사용합니다.
+    여기서는 아래 우선순위를 사용합니다.
+    1) polygon이 있으면 polygon을 사용 (is_polygon=True)
+    2) polygon이 없고 polyline이 있으면 polyline을 사용 (is_polygon=False)
+    3) 둘 다 없으면 빈 배열 반환
 
     Args:
         driveway_msg: mf.driveway (proto 메시지)
 
     Returns:
-        polygon_xy: shape (M,2) float32
+        points_xy: (M,2) float32. 점들.
+        is_polygon: bool.
+            - True  -> polygon(닫힌 영역)
+            - False -> polyline(선)
     """
-    if hasattr(driveway_msg, "polygon") and len(getattr(driveway_msg,
-                                                        "polygon")) > 0:
-        return _proto_points_to_xy_array(getattr(driveway_msg, "polygon"))
-    if hasattr(driveway_msg, "polyline") and len(
-            getattr(driveway_msg, "polyline")) > 0:
-        return _proto_points_to_xy_array(getattr(driveway_msg, "polyline"))
-    return np.zeros((0, 2), dtype=np.float32)
+    if hasattr(driveway_msg, "polygon") and len(getattr(driveway_msg, "polygon")) > 0:
+        return _proto_points_to_xy_array(getattr(driveway_msg, "polygon")), True
+
+    if hasattr(driveway_msg, "polyline") and len(getattr(driveway_msg, "polyline")) > 0:
+        return _proto_points_to_xy_array(getattr(driveway_msg, "polyline")), False
+
+    return np.zeros((0, 2), dtype=np.float32), False
+
 
 
 def list_tfrecord_files(split_dir: Path) -> List[Path]:
@@ -2836,7 +2848,6 @@ def _keep_polygon_area_if_within_radius(
     )
     return bool(d2 <= r2)
 
-
 def filter_parsed_map_by_radius(
     parsed_map: ParsedMap,
     ego_xy_global: np.ndarray,  # shape: (2,)
@@ -2845,18 +2856,13 @@ def filter_parsed_map_by_radius(
     """ParsedMap에서 ego 반경 안에 들어오는 것만 남겨서 새 ParsedMap을 만듭니다.
 
     이 함수는 캐싱 대상 중 아래 항목들만 필터링합니다.
-      - lanes (→ lanes_speed_limit, lanes_has_speed_limit, lane_light, lane_type,
-               left_line_type, right_line_type는 lanes에 종속이라 자동으로 같이 줄어듭니다)
-      - road_edge (→ road_edge_type도 같이 줄어듭니다)
-      - driveway_points
-      - stop_sign_points(=stop_sign_xy_global 기반)
-      - crosswalk_points
-      - speed_bump_points
-
-    “일부라도 영역 내에 들어오면 포함” 조건을 만족시키기 위해,
-      - polyline: 선분까지의 최소거리로 판정
-      - polygon: (내부 포함) + (테두리 선분까지 최소거리)로 판정
-    을 사용합니다.
+      - lanes (centerline polyline 기준)
+      - road_edge (polyline 기준)
+      - stop_sign (점 기준)
+      - crosswalk (polygon 영역 기준)
+      - speed_bump (polygon 영역 기준)
+      - driveway_polygon (polygon 영역 기준)
+      - driveway_polyline (polyline 기준)
 
     Args:
         parsed_map: parse_map_from_scenario() 결과.
@@ -2899,6 +2905,12 @@ def filter_parsed_map_by_radius(
         if _keep_polygon_area_if_within_radius(poly, ego_xy_global, r):
             driveway_polys.append(poly)
 
+    # ✅ driveway polyline은 "선"이라 polyline 기준 필터를 적용
+    driveway_lines: List[np.ndarray] = []
+    for line in parsed_map.driveway_polylines_xy_global:
+        if _keep_polyline_if_within_radius(line, ego_xy_global, r):
+            driveway_lines.append(line)
+
     # 3) lanes (centerline polyline 기준)
     lanes_filtered: List[LaneInfo] = []
     for lane in parsed_map.lanes:
@@ -2914,12 +2926,12 @@ def filter_parsed_map_by_radius(
         if _keep_polyline_if_within_radius(poly, ego_xy_global, r):
             road_edge_ids_filtered.append(int(edge_id))
 
-    # dict류(경계 polyline/type 정보)는 그대로 참조해도 됨 (캐싱 대상이 아니고, lanes 계산에 필요)
     return ParsedMap(
         stop_sign_xy_global=stop_sign_xy,
         crosswalk_polygons_xy_global=crosswalk_polys,
         speed_bump_polygons_xy_global=speed_bump_polys,
         driveway_polygons_xy_global=driveway_polys,
+        driveway_polylines_xy_global=driveway_lines,
         lanes=lanes_filtered,
         boundary_polylines_xy_global=parsed_map.boundary_polylines_xy_global,
         boundary_id_to_kind=parsed_map.boundary_id_to_kind,
@@ -2927,6 +2939,7 @@ def filter_parsed_map_by_radius(
         road_edge_type_by_id=parsed_map.road_edge_type_by_id,
         road_edge_ids=road_edge_ids_filtered,
     )
+
 
 
 # =========================
@@ -3057,7 +3070,6 @@ def convert_proto_boundary_segments(
             ))
     return segments
 
-
 def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
     """Scenario의 map_features를 요구사항에 맞게 필요한 것만 모읍니다.
 
@@ -3067,7 +3079,10 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
     stop_sign_xy_global: List[np.ndarray] = []
     crosswalk_polygons_xy_global: List[np.ndarray] = []
     speed_bump_polygons_xy_global: List[np.ndarray] = []
+
+    # ✅ driveway는 polygon / polyline을 분리 저장
     driveway_polygons_xy_global: List[np.ndarray] = []
+    driveway_polylines_xy_global: List[np.ndarray] = []
 
     lanes: List[LaneInfo] = []
 
@@ -3083,26 +3098,29 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
 
         if feature_type == "stop_sign":
             pos = mf.stop_sign.position
-            stop_sign_xy_global.append(
-                np.array([pos.x, pos.y], dtype=np.float32))
+            stop_sign_xy_global.append(np.array([pos.x, pos.y], dtype=np.float32))
 
         elif feature_type == "crosswalk":
-            polygon_xy = _proto_points_to_xy_array(
-                mf.crosswalk.polygon)  # (M,2)
+            polygon_xy = _proto_points_to_xy_array(mf.crosswalk.polygon)  # (M,2)
             if is_valid_polygon_xy(polygon_xy, min_points=3):
                 crosswalk_polygons_xy_global.append(polygon_xy)
 
         elif feature_type == "speed_bump":
-            polygon_xy = _proto_points_to_xy_array(
-                mf.speed_bump.polygon)  # (M,2)
+            polygon_xy = _proto_points_to_xy_array(mf.speed_bump.polygon)  # (M,2)
             if is_valid_polygon_xy(polygon_xy, min_points=3):
                 speed_bump_polygons_xy_global.append(polygon_xy)
 
         elif feature_type == "driveway":
-            polygon_xy = _extract_driveway_polygon_xy_global(
-                mf.driveway)  # (M,2)
-            if is_valid_polygon_xy(polygon_xy, min_points=2):
-                driveway_polygons_xy_global.append(polygon_xy)
+            points_xy, is_polygon = _extract_driveway_geometry_xy_global(mf.driveway)  # (M,2), bool
+
+            if bool(is_polygon):
+                # polygon은 "영역" 의미가 있으니 최소 3점 이상만 저장
+                if is_valid_polygon_xy(points_xy, min_points=3):
+                    driveway_polygons_xy_global.append(points_xy)
+            else:
+                # polyline은 "선"이므로 최소 2점 이상이면 저장
+                if is_valid_polygon_xy(points_xy, min_points=2):
+                    driveway_polylines_xy_global.append(points_xy)
 
         elif feature_type == "road_line":
             poly_xy = _proto_points_to_xy_array(mf.road_line.polyline)  # (K,2)
@@ -3110,8 +3128,7 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                 fid = int(mf.id)
                 boundary_polylines_xy_global[fid] = poly_xy
                 boundary_id_to_kind[fid] = "road_line"
-                road_line_type_by_id[fid] = int(getattr(mf.road_line, "type",
-                                                        0))
+                road_line_type_by_id[fid] = int(getattr(mf.road_line, "type", 0))
 
         elif feature_type == "road_edge":
             poly_xy = _proto_points_to_xy_array(mf.road_edge.polyline)  # (K,2)
@@ -3120,19 +3137,15 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                 boundary_polylines_xy_global[fid] = poly_xy
                 boundary_id_to_kind[fid] = "road_edge"
                 road_edge_ids.append(fid)
-                road_edge_type_by_id[fid] = int(getattr(mf.road_edge, "type",
-                                                        0))
+                road_edge_type_by_id[fid] = int(getattr(mf.road_edge, "type", 0))
 
         elif feature_type == "lane":
             centerline_xy = _proto_points_to_xy_array(mf.lane.polyline)  # (P,2)
             if centerline_xy.shape[0] == 0:
                 continue
 
-            # ✅ 변경: boundary_feature_id만 뽑지 않고, start/end index까지 같이 저장
-            left_segments = convert_proto_boundary_segments(
-                mf.lane.left_boundaries)
-            right_segments = convert_proto_boundary_segments(
-                mf.lane.right_boundaries)
+            left_segments = convert_proto_boundary_segments(mf.lane.left_boundaries)
+            right_segments = convert_proto_boundary_segments(mf.lane.right_boundaries)
 
             speed_limit_mph = float(getattr(mf.lane, "speed_limit_mph", 0.0))
             lane_type_value = int(getattr(mf.lane, "type", 0))
@@ -3145,13 +3158,15 @@ def parse_map_from_scenario(scenario: scenario_pb2.Scenario) -> ParsedMap:
                     right_boundary_segments=right_segments,
                     speed_limit_mph=speed_limit_mph,
                     lane_type=lane_type_value,
-                ))
+                )
+            )
 
     return ParsedMap(
         stop_sign_xy_global=stop_sign_xy_global,
         crosswalk_polygons_xy_global=crosswalk_polygons_xy_global,
         speed_bump_polygons_xy_global=speed_bump_polygons_xy_global,
         driveway_polygons_xy_global=driveway_polygons_xy_global,
+        driveway_polylines_xy_global=driveway_polylines_xy_global,
         lanes=lanes,
         boundary_polylines_xy_global=boundary_polylines_xy_global,
         boundary_id_to_kind=boundary_id_to_kind,
@@ -3469,6 +3484,110 @@ def build_stop_sign_points(
                                                         ego_yaw_global)[0]
         out[i] = np.repeat(xy_local[None, :], repeats=safety_len, axis=0)
     return out
+
+def build_polyline_points(
+    polylines_xy_global: List[np.ndarray],  # each (K,2)
+    ego_xy_global: np.ndarray,
+    ego_yaw_global: float,
+    safety_len: int,
+) -> np.ndarray:
+    """polyline(점들의 줄) 리스트를 (n_line, safety_len, 2)로 바꿉니다.
+
+    - polyline은 "닫지 않습니다"(closed=False).
+    - 선의 길이를 따라 같은 간격으로 safety_len개 점을 뽑습니다.
+    - 좌표는 ego 기준으로 바꿔서 저장합니다.
+
+    Args:
+        polylines_xy_global: polyline 점 리스트(각각 (K,2)).
+        ego_xy_global: ego 전역 위치, shape (2,)
+        ego_yaw_global: ego 전역 yaw
+        safety_len: 출력 점 개수(요구사항: 10)
+
+    Returns:
+        points: (n_line, safety_len, 2) float32 (ego 기준)
+    """
+    n = int(len(polylines_xy_global))
+    s = int(safety_len)
+
+    out = np.zeros((n, s, 2), dtype=np.float32)  # shape (n, safety_len, 2)
+
+    for i, line_xy in enumerate(polylines_xy_global):
+        # line_xy: (K,2)
+        if line_xy.ndim != 2 or int(line_xy.shape[1]) != 2 or int(line_xy.shape[0]) == 0:
+            continue
+
+        line_local = transform_points_global_to_ego_local(
+            line_xy, ego_xy_global, ego_yaw_global
+        )  # shape: (K,2)
+
+        sampled = resample_polyline_equal_distance(
+            line_local,
+            num_samples=s,
+            closed=False,
+        )  # shape: (s,2)
+
+        out[i] = sampled.astype(np.float32)
+
+    return out
+
+
+def build_driveway_points_and_is_polygon(
+    driveway_polygon_points: np.ndarray,   # shape: (Dp, safety_len, 2)
+    driveway_polyline_points: np.ndarray,  # shape: (Dl, safety_len, 2)
+    safety_len: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """driveway 점들을 하나로 합치고, 각 항목이 polygon인지 표시하는 배열도 같이 만듭니다.
+
+    목적
+    ----
+    - 기존 코드가 `driveway_points` 하나만 저장하고 있을 가능성이 있어서,
+      출력 호환을 유지하려고 두 종류(polygon/polyline)를 올바르게 샘플링한 뒤 합칩니다.
+    - 동시에, 각 항목이 polygon인지(bool)도 같이 저장해서 이후 단계에서 혼선이 없게 합니다.
+
+    Args:
+        driveway_polygon_points: (Dp, safety_len, 2) float32.
+            polygon(닫힌 영역)에서 만든 점들.
+        driveway_polyline_points: (Dl, safety_len, 2) float32.
+            polyline(선)에서 만든 점들.
+        safety_len: 점 개수(예: 10)
+
+    Returns:
+        driveway_points: (Dp+Dl, safety_len, 2) float32
+        driveway_points_is_polygon: (Dp+Dl,) bool
+            - True  -> polygon에서 온 항목
+            - False -> polyline에서 온 항목
+    """
+    s = int(safety_len)
+
+    dp = int(driveway_polygon_points.shape[0]) if driveway_polygon_points.ndim == 3 else 0
+    dl = int(driveway_polyline_points.shape[0]) if driveway_polyline_points.ndim == 3 else 0
+    print("driveway: polygon count =", dp, ", polyline count =", dl)
+    # shape 검증(조용히 잘못 합쳐지는 것 방지)
+    if dp > 0:
+        if int(driveway_polygon_points.shape[1]) != s or int(driveway_polygon_points.shape[2]) != 2:
+            raise ValueError(
+                "driveway_polygon_points shape이 예상과 다릅니다. "
+                f"expected (*,{s},2), got={driveway_polygon_points.shape}"
+            )
+    if dl > 0:
+        if int(driveway_polyline_points.shape[1]) != s or int(driveway_polyline_points.shape[2]) != 2:
+            raise ValueError(
+                "driveway_polyline_points shape이 예상과 다릅니다. "
+                f"expected (*,{s},2), got={driveway_polyline_points.shape}"
+            )
+
+    out_points = np.zeros((dp + dl, s, 2), dtype=np.float32)  # shape: (D, safety_len, 2)
+    out_is_polygon = np.zeros((dp + dl,), dtype=bool)         # shape: (D,)
+
+    if dp > 0:
+        out_points[:dp] = driveway_polygon_points.astype(np.float32)
+        out_is_polygon[:dp] = True
+
+    if dl > 0:
+        out_points[dp:dp + dl] = driveway_polyline_points.astype(np.float32)
+        out_is_polygon[dp:dp + dl] = False
+
+    return out_points, out_is_polygon
 
 
 def build_polygon_points(
@@ -4346,13 +4465,28 @@ def build_cache_dict_for_scenario(
         ego_yaw_global=ego_yaw_global,
         safety_len=SAFETY_LEN,
     )
-
-    driveway_points = build_polygon_points(
+    # ✅ driveway: polygon / polyline을 분리해서 올바른 방식으로 샘플링
+    driveway_polygon_points = build_polygon_points(
         parsed_map.driveway_polygons_xy_global,
         ego_xy_global,
         ego_yaw_global,
         SAFETY_LEN,
-    )
+    )  # shape: (Dp, SAFETY_LEN, 2)
+
+    driveway_polyline_points = build_polyline_points(
+        parsed_map.driveway_polylines_xy_global,
+        ego_xy_global,
+        ego_yaw_global,
+        SAFETY_LEN,
+    )  # shape: (Dl, SAFETY_LEN, 2)
+
+    # ✅ 기존 키(driveway_points) 호환 + 타입 구분용 bool도 같이 저장
+    driveway_points, driveway_points_is_polygon = build_driveway_points_and_is_polygon(
+        driveway_polygon_points=driveway_polygon_points,
+        driveway_polyline_points=driveway_polyline_points,
+        safety_len=SAFETY_LEN,
+    )  # (Dp+Dl, SAFETY_LEN, 2), (Dp+Dl,)
+
 
     # ego_agent_past_is_valid = _compute_valid_mask_from_prefix_nonzero(
     #     ego_agent_past, prefix_dim=8)
@@ -4427,8 +4561,7 @@ def build_cache_dict_for_scenario(
         "stop_sign_points": stop_sign_points,  # (Ns,10,2)  # womd
         "crosswalk_points": crosswalk_points,  # (Nc,10,2)  # womd
         "speed_bump_points": speed_bump_points,  # (Nb,10,2)  # womd
-        "driveway_points": driveway_points,  # (D,10,2) # womd
-
+        "driveway_points": driveway_points,  # shape: (D,10,2)
         "lanes": lanes_arr,  # (L,10,12)  # womd
         "lanes_speed_limit": lanes_speed_limit,  # (L,1) # womd
         "lanes_has_speed_limit": lanes_has_speed_limit,  # (L,1) # womd
