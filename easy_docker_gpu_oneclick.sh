@@ -227,6 +227,7 @@ MOUNTS=(-v "/media/user:/media/user")
 MOUNTS+=(-v "$MINIFORGE_HOST:$MINIFORGE_HOST:${MINIFORGE_MOUNT_OPT}")
 MOUNTS+=(-v "/usr/local/cuda:/usr/local/cuda:ro")
 MOUNTS+=(-v "/usr/local/cuda-12.*/:/usr/local/cuda-12.*:ro")
+MOUNTS+=(-v "/usr/local/bin/nubescli:/usr/local/bin/nubescli:ro")
 
 
 # 작업 폴더(스크립트 위치와 같은 경로를 컨테이너에서도 그대로 사용)
@@ -244,12 +245,14 @@ else
   RUN_ARGS=(--name "$CONTAINER_NAME" -d
             --cpuset-cpus "$CPU_SET"
             --gpus "device=${GPU_DEVICE}"
-            --user "${HOST_UID}:${HOST_GID}"
-            -e HOME=/tmp
+            --user "0:0"
+            -e HOME=/root
             -e MINIFORGE_ROOT="$MINIFORGE_HOST"
             -e ENV_NAME="$ENV_NAME"
+            -e NUBES_GATEWAY_ADDRESS="c.nubes.sto.navercorp.com:8000"
             -e WORKDIR="$WORKDIR_IN_CONTAINER"
             -w "$WORKDIR_IN_CONTAINER")
+
 
   # /dev/shm 제약 최소화: 우선 --ipc=host 시도, 실패 시 호스트 /dev/shm 크기로 shm-size
   if ! "${DOCKER[@]}" run "${RUN_ARGS[@]}" "${MOUNTS[@]}" --ipc=host "$IMAGE_NAME" >/dev/null; then

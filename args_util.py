@@ -459,6 +459,18 @@ def get_args():
                         type=float,
                         default=3.0,
                         help="gradient clipping 기준값")
+    parser.add_argument("--stats_accel_v_stop_vehicle_mps",
+                        type=float,
+                        default=0.5,
+                        help="gradient clipping 기준값")
+    parser.add_argument("--stats_accel_v_stop_bicycle_mps",
+                        type=float,
+                        default=0.3,
+                        help="gradient clipping 기준값")
+    parser.add_argument("--stats_accel_v_stop_pedestrian_mps",
+                        type=float,
+                        default=0.1,
+                        help="gradient clipping 기준값")
 
     parser.add_argument("--zero_offload_optimizer",
                         type=boolean,

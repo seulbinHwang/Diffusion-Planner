@@ -16,5 +16,5 @@ python data_process.py \
 --save_path $TRAIN_SET_PATH \
 --total_scenarios 12 \
 --num_workers 1 \
---save_image true
+--save_image false
 

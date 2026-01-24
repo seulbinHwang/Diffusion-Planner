@@ -20,7 +20,7 @@ from nuplan.common.actor_state.tracked_objects import TrackedObjects
 from typing import Dict, Tuple, Union, List, Optional
 from nuplan.common.actor_state.state_representation import Point2D
 from nuplan.common.actor_state.ego_state import EgoState
-import draw_machine
+import draw_machine_fast
 # matplotlib 설정 추가
 plt.rcParams['figure.max_open_warning'] = 0  # 경고 메시지 비활성화
 matplotlib.rcParams['figure.max_open_warning'] = 0
@@ -359,10 +359,11 @@ class DataProcessor(object):
                         np.float32, copy=False)
 
         # 타입/크기는 “현재 프레임 값”을 대표로 씀
+        # 수정 (해결)
         type_vec: np.ndarray = traj[current_index, 8:11].astype(np.float32,
-                                                                copy=False)  # (3,)
+                                                                copy=True)
         rep_size: np.ndarray = traj[current_index, 6:8].astype(np.float32,
-                                                               copy=False)  # (2,)
+                                                               copy=True)
 
         # one-hot은 유효 구간에만
         traj[:, 8:11] = 0.0
@@ -1675,7 +1676,6 @@ class DataProcessor(object):
                 #        호출 의도를 명확히 하려고 함께 전달
                 set_coord_as_center=self.set_coord_as_center,
             )
-
             ego_agent_past, ego_future_gt_11_dim = self._merge_and_interpolate_ego_11dim(
                 ego_agent_past=ego_agent_past,
                 ego_future_gt_11_dim=ego_future_gt_11_dim_raw,
@@ -1825,16 +1825,8 @@ class DataProcessor(object):
 
             final_file_name = f"{key_to_array['map_name']}_{key_to_array['token']}"
             ego_agent_past = key_to_array["ego_agent_past"]  # (time_len, 11)
-            ego_agent_type = ego_agent_past[:, 8:11]  # (time_len, 3)
-            print("ego_agent_type sum all: ",
-                  ego_agent_type.sum(axis=0))  # (3, )
             ego_future_gt_11_dim = key_to_array[
                 "ego_future_gt_11_dim"]  # (future_len, 11)
-            ego_agent_type_future = ego_future_gt_11_dim[:, 8:
-                                                         11]  # (future_len, 3)
-            print("ego_agent_type_future sum all: ",
-                  ego_agent_type_future.sum(axis=0))  # (3, )
-
             self.save_to_disk(self._save_dir, final_file_name, key_to_array)
 
             key_to_array["neighbor_track_token"] = neighbor_track_token
@@ -1844,7 +1836,7 @@ class DataProcessor(object):
                 save_path = os.path.join(save_dir, f"{final_file_name}.png")
                 os.makedirs(save_dir, exist_ok=True)
                 key_to_array["token_to_future_traj_wrt_ego"] = None
-                draw_machine.draw_world_model_to_png(key_to_array,
+                draw_machine_fast.draw_world_model_to_png(key_to_array,
                                                      output_data={},
                                                      save_path=save_path)
 
