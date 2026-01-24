@@ -151,7 +151,7 @@ class DrawingOptions:
     DRIVEWAY_draw_driveway: bool = True
     DRIVEWAY_line_color: str = WHITE
     DRIVEWAY_line_width: float = 0.8
-    DRIVEWAY_text: str = "driveway"
+    DRIVEWAY_text: str = "driveway_points"
     DRIVEWAY_text_color: str = WHITE
     DRIVEWAY_text_fontsize: int = 5
     DRIVEWAY_polygon_zorder: int = 4
@@ -261,9 +261,9 @@ class DrawingOptions:
     NEI_neighbor_past_output_token_fontsize = 2
     ########################
     ######### [NEIGHBOR] FUTURE GT #############
-    DIFF_draw_diff_future_gt_3_dim: bool = True
+    DIFF_draw_diff_future_gt_3_dim: bool = False
     # NEW: neighbor_future_gt_3_dim (numpy 버전) on/off
-    DIFF_draw_future_gt_3_dim_wo_token: bool = False
+    DIFF_draw_future_gt_3_dim_wo_token: bool = True
     DIFF_future_gt_3_dim_marker_size: float = 0.6  # 미래 포인트 'x' 마커 크기
     DIFF_future_gt_3_dim_COLOR: str = DARK_BROWN  # 미래 포인트 'x' 마커 크기
 
@@ -483,7 +483,7 @@ def _collect_valid_xy_from_input_data(
             ys_local.extend(valid_xy[:, 1].tolist())
 
     # road_edge / driveway: shape (N, P, 2)
-    for key in ("road_edge", "driveway"):
+    for key in ("road_edge", "driveway_points"):
         pts = input_data.get(key)
         if pts is None:
             continue
@@ -4340,7 +4340,7 @@ def draw_world_model_to_png(
     )
     draw_driveway_points(
         ax=ax,
-        driveway=input_data.get("driveway", None),
+        driveway=input_data.get("driveway_points", None),
         options=draw_option,
     )
 
