@@ -3,7 +3,7 @@ set -e
 
 # ---------------- CPU 분리 설정 ----------------
 CPU_SET="0-31,64-95"
-NUM_CPUS=56
+NUM_CPUS=52
 
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -25,9 +25,10 @@ TRAIN_SET_NAME="processed_nuplan_0124"
 SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 TRAIN_JSON_PATH="${TRAIN_SET_NAME}_json"
 
+PYTHONUNBUFFERED=1 \
 CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
 taskset -c "${CPUSET}" \
-python data_process.py \
+python -u data_process.py \
   --data_path "$NUPLAN_DATA_PATH" \
   --map_path "$NUPLAN_MAP_PATH" \
   --save_path "$SAVE_PATH" \

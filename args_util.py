@@ -620,7 +620,7 @@ def get_args():
                         default=False,
                         help='shuffle scenarios')
     parser.add_argument('--make_statistics_when_caching',
-                        default=True,
+                        default=False,
                         type=boolean)
     parser.add_argument('--die_all', default=True, type=boolean)
     parser.add_argument('--select_jointly', default=True, type=boolean)
