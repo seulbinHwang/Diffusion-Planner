@@ -233,25 +233,6 @@ def build_validity_key_dict(
         )
 
     # ---------- e: neighbor_future_gt_is_valid ----------
-    neighbor_future_3 = _get_first_non_none_value(
-        sample,
-        ["neighbor_future_gt_3_dim"],
-    )
-    if neighbor_future_3 is None or (not _is_array_like(neighbor_future_3)):
-        _set_or_skip(out, "neighbor_future_gt_is_valid", None)
-    else:
-        # neighbor_future_3: shape (A, future_len, 3)
-        # per_step_valid: shape (A, future_len)
-        _set_or_skip(
-            out,
-            "neighbor_future_gt_is_valid",
-            _compute_valid_mask_from_prefix_nonzero(
-                neighbor_future_3,
-                prefix_dim=3,
-            ),
-        )
-    """
-    # ---------- e: neighbor_future_gt_is_valid ----------
     neighbor_future_11 = _get_first_non_none_value(
         sample,
         ["neighbor_future_gt_11_dim"],
@@ -269,7 +250,6 @@ def build_validity_key_dict(
             ),  # shape (A, future_len)
         )
 
-    """
     # ---------- f: stop_sign_is_valid ----------
     stop_sign_points = sample.get("stop_sign_points", None)
     if stop_sign_points is None or (not _is_array_like(stop_sign_points)):
