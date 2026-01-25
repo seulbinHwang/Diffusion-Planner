@@ -860,71 +860,42 @@ def _pack_ego_local_agents(
 
     return all_frame_np_agents_local
 
-
 def build_agents_past_ego_frame_array(
-    past_cur_agents_world_8_list: List[
-        np.ndarray],  # len = num_frames, 각 원소: (frame_agents_num, 8)
-    ego_cur_pose_np: np.ndarray,  # (3,)
+    past_cur_agents_world_8_list: List[np.ndarray],  # len = num_frames
+    ego_cur_pose_np: np.ndarray,  # shape: (3,)
     agents_states_dim: int,
 ) -> np.ndarray:
-    """과거+현재 에이전트 상태를 이고 기준 상대 좌표계 3차원 텐서로 만드는 함수.
-
-    처리 단계:
-        1) `_filter_agents_array` 로 현재 프레임에 존재하는 에이전트만 남긴다.
-        2) `_pad_agent_states` 로 프레임마다 사라지는 에이전트를 이전 상태로 채운다.
-        3) 각 프레임을 이고 기준 상대 좌표계로 변환한다.
-        4) [x, y, cos(yaw), sin(yaw), vx, vy, width, length, id] 를 모아
-           (num_frames, current_agents_num, 9) 텐서를 만든다.
-
-    Args:
-        past_cur_agents_world_8_list (List[np.ndarray]):
-            - 길이: num_frames
-            - 각 원소 shape: (frame_agents_num, 8)
-            - [track_id, vx, vy, heading, width, length, x, y]
-        ego_cur_pose_np (np.ndarray):
-            - shape: (3,), [x_ego, y_ego, yaw_ego]
-        agents_states_dim (int):
-            - x, y, cos h, sin h, vx, vy, length, width 의 차원 수(=8).
+    """과거+현재 에이전트 상태를 ego 기준 상대 좌표계 3차원 텐서로 만든다.
 
     Returns:
-        np.ndarray
-            - all_frame_np_agents_local (np.ndarray):
-                · shape: (num_frames, current_agents_num, agents_states_dim + 1 = 9)
-                -  [x, y, cos(heading), sin(heading), vx, vy, width, length, id]
+        np.ndarray:
+            - shape: (T, N, agents_states_dim + 1)
+            - N이 0이면 (T, 0, agents_states_dim + 1)
     """
-    # 1) 현재 프레임 기준 에이전트 필터링 및 타입 수집
-    # all_frame_cur_exists_agents: len = num_frames,
-    #   각 원소 shape: (frame_save_agents_num, 8)
     all_frame_cur_exists_agents: List[np.ndarray] = _filter_agents_array(
-        past_cur_agents_world_8_list, reverse=True)
+        past_cur_agents_world_8_list, reverse=True
+    )
 
+    num_frames: int = len(all_frame_cur_exists_agents)
+
+    # ✅ 현재 프레임에 에이전트가 0명이면, shape 규칙(T, 0, 9)을 유지한 채 빈 배열 반환
     if all_frame_cur_exists_agents[-1].shape[0] == 0:
-        # Return zero array when there are no agents in the scene
-        # all_frame_np_agents_local: (num_frames, 0, agents_states_dim)
-        all_frame_np_agents_local = np.zeros(
-            (len(all_frame_cur_exists_agents), 0, agents_states_dim))
-    else:
-        # 2) (world→ego) 프레임별 에이전트 상태 변환
-        """ all_frame_cur_exists_agents_local
-        List[np.ndarray]:
-            - 길이: num_frames
-            - 각 원소 shape: (current_agents_num, 8) # current_agents_num 고정
-                = [track_id, vx, vy, heading, width, length, x, y]
-        """
-        all_frame_cur_exists_agents_local = _convert_all_frames_agents_to_ego_local(
-            all_frame_cur_exists_agents=all_frame_cur_exists_agents,
-            ego_cur_pose_np=ego_cur_pose_np,
+        return np.zeros(
+            (num_frames, 0, agents_states_dim + 1),
+            dtype=np.float64,
         )
 
-        # 3) (프레임 × 에이전트 × 특성) 3D 텐서로 패킹
-        # (num_frames, current_agents_num, agents_states_dim + 1 = 9)
-        #  [x, y, cos(heading), sin(heading), vx, vy, width, length, id]
-        all_frame_np_agents_local = _pack_ego_local_agents(
-            all_frame_cur_exists_agents_local=all_frame_cur_exists_agents_local,
-            agents_states_dim=agents_states_dim,
-        )
+    all_frame_cur_exists_agents_local = _convert_all_frames_agents_to_ego_local(
+        all_frame_cur_exists_agents=all_frame_cur_exists_agents,
+        ego_cur_pose_np=ego_cur_pose_np,
+    )
 
+    all_frame_np_agents_local = _pack_ego_local_agents(
+        all_frame_cur_exists_agents_local=all_frame_cur_exists_agents_local,
+        agents_states_dim=agents_states_dim,
+    )
     return all_frame_np_agents_local
+
 
 
 def _build_present_static_feature_6(
@@ -1052,70 +1023,55 @@ def _filter_out_neighbors_not_present_at_current(
 
 
 def _compute_valid_sorted_indices(
-    all_frame_np_agents_local: np.
-    ndarray,  # shape: (num_frames, current_agents_num, 9)
+    all_frame_np_agents_local: np.ndarray,  # shape: (T, N, 9)
     filter_radius: Optional[float],
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """filter_radius 를 적용한 뒤, ego와의 거리 기준으로 에이전트 인덱스를 정렬한다.
-
-    추가로, "현재 프레임에 존재하지 않는 에이전트(현재 상태가 전부 0)"는
-    후보에서 아예 제외한다.
-
-    Args:
-        all_frame_np_agents_local:
-            - shape: (num_frames, current_agents_num, 9)
-            - 마지막 채널(8)은 track_id
-            - 앞 8채널은 [x, y, cos, sin, vx, vy, width, length]
-        filter_radius:
-            - None 이 아니면, ego 기준 거리 <= filter_radius 인 에이전트만 후보.
+    """ego와의 거리 기준으로 후보 인덱스를 정렬한다.
 
     Returns:
-        sorted_cur_agent_indices:
-            - shape: (M,)  # M = 유효 후보 수
-            - ego 로부터 가까운 순서대로 정렬된 현재 프레임 인덱스.
-        dist_from_cur_agent_to_ego:
-            - shape: (current_agents_num,)
-            - 각 에이전트의 ego 기준 2D 거리.
+        Tuple[np.ndarray, np.ndarray]:
+            - sorted_cur_agent_indices: shape (M,)
+            - dist_from_cur_agent_to_ego: shape (N,)
     """
-    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[
-            -1] < 9:
+    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[-1] < 9:
         raise ValueError(
             f"`all_frame_np_agents_local`는 (T, N, 9) shape 이어야 합니다. got {all_frame_np_agents_local.shape}"
         )
 
-    # 현재 프레임(마지막 프레임 기준)에서 ego까지의 거리: (current_agents_num,)
-    dist_from_cur_agent_to_ego: np.ndarray = np.linalg.norm(
-        all_frame_np_agents_local[-1, :, :2], axis=-1)
-
+    num_frames: int = int(all_frame_np_agents_local.shape[0])
     current_agents_num: int = int(all_frame_np_agents_local.shape[1])
 
-    # (핵심) 현재 프레임 존재 여부 판단: (current_agents_num,)
-    # - [x, y, cos, sin, vx, vy, width, length] 이 전부 0이면 "현재에 없음"
-    eps: float = 1e-8
-    current_state_8: np.ndarray = all_frame_np_agents_local[-1, :, :8]  # (N, 8)
-    present_mask: np.ndarray = (np.abs(current_state_8)
-                                > eps).any(axis=1)  # (N,)
+    # ✅ (추가 안전장치) 프레임이 없거나, 에이전트가 0명이면 바로 “후보 없음”
+    if num_frames == 0:
+        return np.zeros((0,), dtype=int), np.zeros((current_agents_num,), dtype=np.float64)
+    if current_agents_num == 0:
+        return np.zeros((0,), dtype=int), np.zeros((0,), dtype=np.float64)
 
-    # filter_radius 내의 에이전트만 후보로 사용
+    dist_from_cur_agent_to_ego: np.ndarray = np.linalg.norm(
+        all_frame_np_agents_local[-1, :, :2], axis=-1
+    )  # shape: (N,)
+
+    eps: float = 1e-8
+    current_state_8: np.ndarray = all_frame_np_agents_local[-1, :, :8]  # shape: (N, 8)
+    present_mask: np.ndarray = (np.abs(current_state_8) > eps).any(axis=1)  # shape: (N,)
+
     if filter_radius is not None:
-        within_radius = dist_from_cur_agent_to_ego <= float(
-            filter_radius)  # (N,)
+        within_radius = dist_from_cur_agent_to_ego <= float(filter_radius)  # shape: (N,)
         valid_mask = present_mask & within_radius
     else:
         valid_mask = present_mask
 
-    valid_indices: np.ndarray = np.nonzero(valid_mask)[0].astype(int)  # (M,)
+    valid_indices: np.ndarray = np.nonzero(valid_mask)[0].astype(int)  # shape: (M,)
 
     if valid_indices.size == 0:
-        # 유효한 에이전트가 하나도 없는 경우
         return np.zeros((0,), dtype=int), dist_from_cur_agent_to_ego
 
-    # 유효한 에이전트들만 뽑아서 거리 기준 정렬
-    dist_valid: np.ndarray = dist_from_cur_agent_to_ego[valid_indices]  # (M,)
-    order_local: np.ndarray = np.argsort(dist_valid)  # (M,)
-    sorted_cur_agent_indices: np.ndarray = valid_indices[order_local]  # (M,)
+    dist_valid: np.ndarray = dist_from_cur_agent_to_ego[valid_indices]  # shape: (M,)
+    order_local: np.ndarray = np.argsort(dist_valid)  # shape: (M,)
+    sorted_cur_agent_indices: np.ndarray = valid_indices[order_local]  # shape: (M,)
 
     return sorted_cur_agent_indices, dist_from_cur_agent_to_ego
+
 
 
 def _select_indices_with_type_cap(
