@@ -51,7 +51,7 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "wosac_TTT_full_7e4" \
-  --batch_size 1248 \
+  --batch_size 208 \
   --learning_rate 7e-4 \
   --use_feasible_dl True \
   --feasible_grad_to_dit True \
