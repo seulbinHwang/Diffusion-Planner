@@ -237,10 +237,15 @@ def build_validity_key_dict(
         sample,
         ["neighbor_future_gt_11_dim"],
     )
+    print("neighbor_future_11.type", type(neighbor_future_11))
     if neighbor_future_11 is None or (not _is_array_like(neighbor_future_11)):
+        print("here A")
         _set_or_skip(out, "neighbor_future_gt_is_valid", None)
+        print("out['neighbor_future_gt_is_valid']", out.get("neighbor_future_gt_is_valid", None))
     else:
         # neighbor_future_11: shape (A, future_len, 11)
+        print("here B")
+        print("neighbor_future_11.shape", neighbor_future_11.shape)
         _set_or_skip(
             out,
             "neighbor_future_gt_is_valid",
@@ -249,6 +254,8 @@ def build_validity_key_dict(
                 prefix_dim=8,  # 마지막 11차원 중 앞 8개 값이 전부 0이면 False(무효)
             ),  # shape (A, future_len)
         )
+        print("out['neighbor_future_gt_is_valid'].shape",
+              out["neighbor_future_gt_is_valid"].shape)
 
     # ---------- f: stop_sign_is_valid ----------
     stop_sign_points = sample.get("stop_sign_points", None)
