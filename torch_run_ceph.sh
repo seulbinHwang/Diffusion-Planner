@@ -45,13 +45,13 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" \
+--nnodes 1 --nproc-per-node 6 --standalone --log_dir "$LOG_DIR" \
 --redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "wosac_TTT_full_7e4" \
-  --batch_size 208 \
+  --batch_size 1248 \
   --learning_rate 7e-4 \
   --use_feasible_dl True \
   --feasible_grad_to_dit True \

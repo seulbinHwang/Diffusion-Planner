@@ -529,6 +529,7 @@ class DiffusionPlannerData(Dataset):
             "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd
             "neighbor_agents_past",  # (chosen_agent_num, time_len, 11) # nuplan  # womd
             "neighbor_future_gt_3_dim",  # (chosen_agent_num, future_len, 3) # nuplan # womd
+            "neighbor_future_gt_11_dim",  # (chosen_agent_num, future_len, 11) # nuplan # womd
             "stop_sign_points",  # (stop_sign_num, safety_len, 2) # nuplan  # womd
             "crosswalk_points",  # (crosswalk_num, safety_len, 2) # nuplan  # womd
             "lanes",  # (chosen_lane_num, lane_len, 12) # nuplan # womd
