@@ -148,7 +148,7 @@ def _prepare_batch_for_device(
         if key in target_keys:
             # TODO: 나중에 pop으로 바꾸기
             value = batch_on_device[key]
-            value = batch_on_device.pop(key)
+            # value = batch_on_device.pop(key)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(
                     f"target '{key}' must be torch.Tensor, got {type(value)}")
