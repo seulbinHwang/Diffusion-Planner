@@ -197,7 +197,7 @@ taskset -c "${CPUSET}" \
   --resume_model_only True \
   --load_name "wosac_test_full" \
   --name "wosac_test_full" \
-  --eval_method "train" \
+  --eval_method "validation" \
   --batch_size 384 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
@@ -210,7 +210,7 @@ taskset -c "${CPUSET}" \
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 1 \
   --rollout_number 32 \
-  --use_data_percent 1 \
+  --use_data_percent 100 \
   --use_amortized_diffusion True \
   --do_data_statistics True \
   --histogram_output_dir "histogram_all"
