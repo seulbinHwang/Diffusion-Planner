@@ -27,27 +27,27 @@ class DataStatistics:
             },
             "a_max": {
                 "bin_width": 0.3,
-                "max_edge_per_class": (10.0, 6.0, 6.0),
+                "max_edge_per_class": (12.0, 6.0, 6.0),
             },
             "alpha_max": {
                 "bin_width": 0.5,
-                "max_edge_per_class": (12.5, 15.0, 13.5),
+                "max_edge_per_class": (3.0, 17.0, 9.0),
             },
             "a_lat_max": {
-                "bin_width": 0.5,
-                "max_edge_per_class": (40.0, 5.0, 16.0),
+                "bin_width": 0.1,
+                "max_edge_per_class": (6.0, 5.0, 5.0),
             },
             "r_min": {
-                "bin_width": 0.5,
-                "max_edge_per_class": (40.0, 40.0, 40.0),
+                "bin_width": 0.3,
+                "max_edge_per_class": (40.0, 5.0, 10.0),
             },
             "omega_max": {
-                "bin_width": 0.3,
-                "max_edge_per_class": (3.0, 3.0, 3.0),
+                "bin_width": 0.2,
+                "max_edge_per_class": (3.0, 5.0, 3.0),
             },
             "v_b_y_max": {
                 "bin_width": 0.1,
-                "max_edge_per_class": (25.0, 5.0, 12.5),
+                "max_edge_per_class": (3.0, 2.0, 2.0),
             },
         }
 
@@ -272,18 +272,7 @@ class DataStatistics:
         # 4 : x, y, cos(heading), sin(heading)
 
         # neighbor_future_gt_3_dim: (x,y, heading) -> neighbor_future_gt_4_dim: (x,y, cos(heading), sin(heading))
-        neighbor_future_gt_heading = neighbor_future_gt_11_dim[:, :, :, 2:
-                                                              3]  # (B, agent_num, future_len, 1)
-        neighbor_future_gt_cos_heading = torch.cos(
-            neighbor_future_gt_heading)  # (B, agent_num, future_len, 1)
-        neighbor_future_gt_sin_heading = torch.sin(
-            neighbor_future_gt_heading)  # (B, agent_num, future_len, 1)
-        neighbor_future_gt_4_dim = torch.cat(
-            [
-                neighbor_future_gt_11_dim[:, :, :, 0:2],
-                neighbor_future_gt_cos_heading, neighbor_future_gt_sin_heading
-            ],
-            dim=-1)  # (B, agent_num, future_len, 4)
+        neighbor_future_gt_4_dim = neighbor_future_gt_11_dim[:, :, : , 0:4]  # (B, agent_num, future_len, 4)
 
         # (B, agent_num, time_len + future_len, 4)
         neighbor_agents_past_cur_future_4_dim = torch.cat(
