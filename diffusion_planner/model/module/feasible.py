@@ -121,6 +121,7 @@ class DynamicLimits:
         a_lat_max_mps2: 최대 횡가속도 [m/s^2]
         R_min_m: 최소 선회 반경 [m]
         omega_max_abs_radps: 최대 요각속도 절대치 [rad/s]
+        v_b_y_max: (비홀로노믹) 바디 y방향 속도 허용 최대치 [m/s]
     """
     v_max_mps: float
     v_max_kmph: float
@@ -129,6 +130,8 @@ class DynamicLimits:
     a_lat_max_mps2: float
     R_min_m: float
     omega_max_abs_radps: float
+    v_b_y_max: float = 0.1  # 기본값(기존 동작과 동일하게 유지)
+
 
     def as_dict(self) -> Dict[str, float]:
         """딕셔너리 형태로 반환."""
@@ -181,6 +184,7 @@ class FeasibleProjector(nn.Module):
                     a_lat_max_mps2=6.0,
                     R_min_m=0.00001,
                     omega_max_abs_radps=3.6,
+                    v_b_y_max=0.1,
                 ),
             ActorClass.BICYCLE:
                 DynamicLimits(
@@ -191,6 +195,7 @@ class FeasibleProjector(nn.Module):
                     a_lat_max_mps2=8.5,
                     R_min_m=1.20,
                     omega_max_abs_radps=1.5,
+                    v_b_y_max=0.1,
                 ),
             ActorClass.CAR:
                 DynamicLimits(
@@ -201,6 +206,7 @@ class FeasibleProjector(nn.Module):
                     a_lat_max_mps2=9.0,
                     R_min_m=4.50,
                     omega_max_abs_radps=0.9,
+                    v_b_y_max=0.1,
                 ),
         }
 
@@ -867,58 +873,46 @@ class FeasibleProjector(nn.Module):
     # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
     # ----------------------------
     def _apply_constraints_batch(
-        self,
-        vx_b_raw: torch.Tensor,  # (B, Pnn, T)  바디 기준 x속도
-        vy_b_raw: torch.Tensor,  # (B, Pnn, T)  바디 기준 y속도
-        omega_raw: torch.Tensor,  # (B, Pnn, T)  요각속도
-        key_to_limit_bp: Dict[str, torch.Tensor],
-        #   v_max/a_max/.../is_nonholonomic, 각 (B, Pnn)
-        hp: _ConstraintHParams,
-        slip_epsilon: float = 0.10,
+            self,
+            vx_b_raw: torch.Tensor,  # (B,Pnn,T)
+            vy_b_raw: torch.Tensor,  # (B,Pnn,T)
+            omega_raw: torch.Tensor,  # (B,Pnn,T)
+            key_to_limit_bp: Dict[str, torch.Tensor],
+            hp: _ConstraintHParams,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """S0, S1, S3 제약을 시간축 전체에 한 번에 적용한다.
-
-        - 입력 속도/각속도 시퀀스 (B, Pnn, T)에 대해
-          같은 규칙(S0/S1/S3)을 모든 시간에 동시에 적용한다.
-        - S2(가속도/각가속도 증분 제한)는 여기서는 아예 사용하지 않는다.
-        """
         if not self.use_feasible_filter:
-            # 필터를 끄면 그대로 통과
             return vx_b_raw, vy_b_raw, omega_raw
 
-        # (S0) 비홀로노믹: y방향 속도 거의 0으로 유지
         vx_after, vy_after = self._apply_S0_nonholonomic_ste(
-            vx_b=vx_b_raw,  # (B,Pnn,T)
-            vy_b=vy_b_raw,  # (B,Pnn,T)
-            slip_epsilon=slip_epsilon,
+            vx_b=vx_b_raw,
+            vy_b=vy_b_raw,
+            v_b_y_max=key_to_limit_bp["v_b_y_max"],  # ✅ 여기로 대체
             eta=hp.eta_slip,
             eps=hp.eps,
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # (B,Pnn)
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
         )
 
-        # (S1) 최대 속도 제한
         vx_after, vy_after = self._apply_S1_speed_limit_ste(
-            vx_b=vx_after,  # (B,Pnn,T)
-            vy_b=vy_after,  # (B,Pnn,T)
-            v_max=key_to_limit_bp["v_max"],  # (B,Pnn)
+            vx_b=vx_after,
+            vy_b=vy_after,
+            v_max=key_to_limit_bp["v_max"],
             eta=hp.eta_speed,
             eps=hp.eps,
         )
 
-        # (S3) 속도-연동 요각속도 제한
         omega_after = self._apply_S3_omega_clip_ste(
-            vx_b=vx_after,  # (B,Pnn,T)
-            vy_b=vy_after,  # (B,Pnn,T)
-            omega=omega_raw,  # (B,Pnn,T)
-            a_lat_max=key_to_limit_bp["a_lat_max"],  # (B,Pnn)
-            R_min=key_to_limit_bp["R_min"],  # (B,Pnn)
-            omega_abs_max=key_to_limit_bp["omega_abs_max"],  # (B,Pnn)
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # (B,Pnn)
+            vx_b=vx_after,
+            vy_b=vy_after,
+            omega=omega_raw,
+            a_lat_max=key_to_limit_bp["a_lat_max"],
+            R_min=key_to_limit_bp["R_min"],
+            omega_abs_max=key_to_limit_bp["omega_abs_max"],
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
             eta=hp.eta_yaw,
             eps=hp.eps,
         )
 
-        return vx_after, vy_after, omega_after  # 모두 (B,Pnn,T)
+        return vx_after, vy_after, omega_after
 
     # ----------------------------
     # [NEW] 시간축 전체 배치 중점 적분 (cumsum 기반)
@@ -1861,39 +1855,24 @@ class FeasibleProjector(nn.Module):
         return delta_u
 
     def _build_per_agent_limits(
-        self,
-        near_class_one_hot: torch.Tensor,
-        # (B,Pnn,3) 0:vehicle(CAR),1:ped,2:bicycle
-        device: torch.device,
-        dtype: torch.dtype,
+            self,
+            near_class_one_hot: torch.Tensor,  # (B,Pnn,3)
+            device: torch.device,
+            dtype: torch.dtype,
     ) -> Dict[str, torch.Tensor]:
-        """클래스별 스칼라 제약치를 (B,Pnn) 텐서로 확장.
-
-        Args:
-            near_class_one_hot: (B, Pnn, 3)
-             one‑hot (0: vehicle, 1: pedestrian, 2: bicycle)
-
-        Returns:
-            Dict[str, Tensor]:
-            v_max/a_max/alpha_max/a_lat_max/R_min/omega_abs_max/a_x_max/a_y_max, is_nonholonomic
-                * 모두 (B,Pnn) 모양
-        """
-        # 순서 주의: [vehicle(CAR), pedestrian, bicycle]
+        """클래스별 스칼라 제약치를 (B,Pnn) 텐서로 확장."""
         car: DynamicLimits = self.constraints[ActorClass.CAR]
         ped: DynamicLimits = self.constraints[ActorClass.PEDESTRIAN]
         bic: DynamicLimits = self.constraints[ActorClass.BICYCLE]
 
-        # 클래스별 상수 → 길이 3 텐서
         def cvec(getattr_name: str) -> torch.Tensor:
-            vals = torch.tensor([
-                getattr(car, getattr_name),
-                getattr(ped, getattr_name),
-                getattr(bic, getattr_name)
-            ],
-                                device=device,
-                                dtype=dtype)  # (3,)
-            # (B,Pnn,3) @ (3,) -> (B,Pnn)
-            return (near_class_one_hot * vals).sum(dim=-1)
+            vals = torch.tensor(
+                [getattr(car, getattr_name), getattr(ped, getattr_name),
+                 getattr(bic, getattr_name)],
+                device=device,
+                dtype=dtype,
+            )  # (3,)
+            return (near_class_one_hot * vals).sum(dim=-1)  # (B,Pnn)
 
         v_max_bp = cvec("v_max_mps")
         a_max_bp = cvec("a_max_mps2")
@@ -1901,26 +1880,25 @@ class FeasibleProjector(nn.Module):
         a_lat_max_bp = cvec("a_lat_max_mps2")
         R_min_bp = cvec("R_min_m")
         omega_abs_bp = cvec("omega_max_abs_radps")
+        v_b_y_max_bp = cvec("v_b_y_max")
 
-        # 마찰원 반경: 종/횡 가속 한계
         a_x_max_bp = a_max_bp
         a_y_max_bp = a_lat_max_bp
 
-        # 보행자는 S0(비홀로노믹) 비활성, 자전거/차는 활성
-        # near_class_one_hot[..., 1] 이 pedestrian
-        is_ped = near_class_one_hot[..., 1] > 0.5  # (B,Pnn) bool
+        is_ped = near_class_one_hot[..., 1] > 0.5
         is_nonholonomic = ~is_ped
 
         return dict(
-            v_max=v_max_bp,  # (B,Pnn)
-            a_max=a_max_bp,  # (B,Pnn)
-            alpha_max=alpha_max_bp,  # (B,Pnn)
-            a_lat_max=a_lat_max_bp,  # (B,Pnn)
-            R_min=R_min_bp,  # (B,Pnn)
-            omega_abs_max=omega_abs_bp,  # (B,Pnn)
-            a_x_max=a_x_max_bp,  # (B,Pnn)
-            a_y_max=a_y_max_bp,  # (B,Pnn)
-            is_nonholonomic=is_nonholonomic,  # (B,Pnn) bool
+            v_max=v_max_bp,
+            a_max=a_max_bp,
+            alpha_max=alpha_max_bp,
+            a_lat_max=a_lat_max_bp,
+            R_min=R_min_bp,
+            omega_abs_max=omega_abs_bp,
+            a_x_max=a_x_max_bp,
+            a_y_max=a_y_max_bp,
+            v_b_y_max=v_b_y_max_bp,  # ✅ 추가
+            is_nonholonomic=is_nonholonomic,
         )
 
     # ----------------------------
@@ -2027,24 +2005,31 @@ class FeasibleProjector(nn.Module):
     # [S0~S4] 제약 적용: **STE 버전** (forward=hard, backward=surrogate)
     # =========================================================
     def _apply_S0_nonholonomic_ste(
-        self,
-        vx_b: torch.Tensor,  # (B,Pnn)
-        vy_b: torch.Tensor,  # (B,Pnn)
-        slip_epsilon: float,
-        eta: float,  # 0.07
-        eps: float,
-        is_nonholonomic: torch.Tensor,
+            self,
+            vx_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+            vy_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+            v_b_y_max: torch.Tensor,  # (B,Pnn)
+            eta: float,
+            eps: float,
+            is_nonholonomic: torch.Tensor,  # (B,Pnn) bool
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """S0: v_y hard-clip(+STE). 보행자 제외."""
-        limit = torch.full_like(vy_b, float(slip_epsilon))  # (B,Pnn)
-        vy_new = self._ste_scalar_clip(vy_b, limit, eta, eps)  # (B,Pnn)
+        """S0: (차/자전거) 바디 y방향 속도를 v_b_y_max로 제한한다."""
+        v_b_y_max = v_b_y_max.to(dtype=vy_b.dtype,
+                                 device=vy_b.device)  # (B,Pnn)
 
-        # ★ 추가: 시간축이 있을 때 에이전트 마스크를 시간축으로 확장
+        # 시간축(T)이 있으면 (B,Pnn,1)로 늘려서 브로드캐스트
+        if v_b_y_max.dim() == vy_b.dim() - 1:
+            v_b_y_max = v_b_y_max.unsqueeze(-1)  # (B,Pnn,1)
+
+        vy_new = self._ste_scalar_clip(vy_b, v_b_y_max, eta, eps)
+
+        # is_nonholonomic도 시간축이 있으면 맞춰서 늘림
         if is_nonholonomic.dim() == vy_b.dim() - 1:
-            # is_nonholonomic: (B,Pnn) -> (B,Pnn,1) -> (B,Pnn,T)
             is_nonholonomic = is_nonholonomic.unsqueeze(-1).expand_as(vy_b)
+
         vy_out = torch.where(is_nonholonomic, vy_new, vy_b)
         return vx_b, vy_out
+
 
     def _apply_S1_speed_limit_ste(
             self, vx_b: torch.Tensor, vy_b: torch.Tensor, v_max: torch.Tensor,
@@ -2180,54 +2165,39 @@ class FeasibleProjector(nn.Module):
     # [NEW] 한 스텝: 제약 S0~S4 적용(모두 STE 버전 호출)
     # ----------------------------
     def _apply_constraints_step(
-        self,
-        vx_b_prev: torch.Tensor,  # (B,Pnn)
-        vy_b_prev: torch.Tensor,  # (B,Pnn)
-        omega_prev: torch.Tensor,  # (B,Pnn)
-        vx_b_k: torch.Tensor,  # (B,Pnn)
-        vy_b_k: torch.Tensor,  # (B,Pnn)
-        omega_k: torch.Tensor,  # (B,Pnn)
-        hp: _ConstraintHParams,
-        key_to_limit_bp: Dict[str, torch.Tensor],
-        slip_epsilon: float = 0.1,
-        apply_S2: bool = True,
-        apply_S4_ax: bool = True,
+            self,
+            vx_b_prev: torch.Tensor,
+            vy_b_prev: torch.Tensor,
+            omega_prev: torch.Tensor,
+            vx_b_k: torch.Tensor,
+            vy_b_k: torch.Tensor,
+            omega_k: torch.Tensor,
+            hp: _ConstraintHParams,
+            key_to_limit_bp: Dict[str, torch.Tensor],
+            apply_S2: bool = True,
+            apply_S4_ax: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """ key_to_limit_bp
-        Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn)
-
-        v_max/a_max/alpha_max/a_lat_max/R_min
-        /omega_abs_max/a_x_max/a_y_max, is_nonholonomic
-
-        self.constraints_h_params = _ConstraintHParams(
-            dt=0.1,
-            eps=1e-6,
-             필요: η 초기값(S0~S4)
-            eta_slip=0.07,
-            eta_speed=0.05,
-            eta_inc=0.10,
-            eta_yaw=0.05,
-            eta_fric=0.05,
-        )
-        """
         # (S0)
         vx_b_k, vy_b_k = self._apply_S0_nonholonomic_ste(
-            vx_b_k,  # (B,Pnn)
-            vy_b_k,  # (B,Pnn)
-            slip_epsilon,
-            hp.eta_slip,  # 0.07
-            hp.eps,
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # (B,Pnn)
+            vx_b=vx_b_k,
+            vy_b=vy_b_k,
+            v_b_y_max=key_to_limit_bp["v_b_y_max"],  # ✅ 여기로 대체
+            eta=hp.eta_slip,
+            eps=hp.eps,
+            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
         )
+
         # (S1)
         vx_b_k, vy_b_k = self._apply_S1_speed_limit_ste(
             vx_b_k, vy_b_k, key_to_limit_bp["v_max"], hp.eta_speed, hp.eps)
-        # # (S2)
+
+        # (S2)
         if apply_S2:
             vx_b_k, vy_b_k, omega_k = self._apply_S2_accel_alpha_limits_ste(
                 vx_b_prev, vy_b_prev, omega_prev, vx_b_k, vy_b_k, omega_k,
                 key_to_limit_bp["a_max"], key_to_limit_bp["alpha_max"], hp.dt,
                 hp.eta_inc, hp.eps)
+
         # (S3)
         omega_k = self._apply_S3_omega_clip_ste(
             vx_b=vx_b_k,
@@ -2239,19 +2209,7 @@ class FeasibleProjector(nn.Module):
             is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
             eta=hp.eta_yaw,
             eps=hp.eps)
-        # (S4)
-        # vx_b_k, vy_b_k, omega_k = self._apply_S4_friction_circle_ste(
-        #     vx_b_prev,
-        #     vy_b_prev,
-        #     vx_b_k,
-        #     vy_b_k,
-        #     omega_k,
-        #     key_to_limit_bp["a_x_max"],
-        #     key_to_limit_bp["a_y_max"],
-        #     hp.dt,
-        #     hp.eta_fric,
-        #     hp.eps,
-        #     use_ax=apply_S4_ax)
+
         return vx_b_k, vy_b_k, omega_k
 
     # ----------------------------
@@ -2419,7 +2377,6 @@ class FeasibleProjector(nn.Module):
                     hp=self.constraints_h_params,  # _ConstraintHParams
                     key_to_limit_bp=
                     key_to_limit_bp,  # Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn)
-                    slip_epsilon=0.1,
                     apply_S2=apply_S2_k,
                     apply_S4_ax=apply_S4_ax_k,
                 )
@@ -2542,7 +2499,6 @@ class FeasibleProjector(nn.Module):
             omega_raw=omega_raw,  # (B,Pnn,T)
             key_to_limit_bp=key_to_limit_bp,
             hp=self.constraints_h_params,
-            slip_epsilon=0.1,
         )
 
         # 중점 적분을 시간축 전체에 대해 배치로 수행

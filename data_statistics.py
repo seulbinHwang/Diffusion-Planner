@@ -748,8 +748,7 @@ class DataStatistics:
         a_y_w = dd_xy[..., 1]  # (B, agent_num, point_len)
 
         # [핵심] 가속도 크기 (분모 제거)
-        accel_mag_node = torch.sqrt(
-            a_x_w * a_x_w + a_y_w * a_y_w + eps)  # (B, agent_num, point_len)
+        accel_mag_node = torch.sqrt(a_x_w * a_x_w + a_y_w * a_y_w)  # (B, agent_num, point_len)
         accel_mag_node = torch.where(points_valid, accel_mag_node,
                                      torch.zeros_like(accel_mag_node))
 
@@ -1088,15 +1087,33 @@ class DataStatistics:
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
 
-
     def _accumulate_seg_body_control_statistics_robust(
-        self,
-        seg_body_control: torch.Tensor,        # (B, agent_num, T, 3)
-        seg_valid: torch.Tensor,              # (B, agent_num, T) bool
-        not_low_speed_seg: torch.Tensor,       # (B, agent_num, T) bool
-        neighbor_agents_type: torch.Tensor,    # (B, agent_num, 3)
+            self,
+            seg_body_control: torch.Tensor,  # (B, agent_num, T, 3)
+            seg_valid: torch.Tensor,  # (B, agent_num, T) bool
+            not_low_speed_seg: torch.Tensor,  # (B, agent_num, T) bool
+            neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
     ) -> None:
-        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다."""
+        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다.
+
+        변경점(중요):
+            - a_lat_max는 저속 구간을 0으로 만들어 포함시키지 않고,
+              저속 구간을 mask에서 제외합니다.
+            - 즉, a_lat_max의 누적 마스크는 (seg_valid_stats & not_low_speed_seg) 입니다.
+
+        Args:
+            seg_body_control: (B, agent_num, T, 3)
+                [v_x^b, v_y^b, omega] 세그먼트 중간값 제어.
+            seg_valid: (B, agent_num, T) bool
+                노드 양 끝이 유효한 세그먼트 마스크.
+            not_low_speed_seg: (B, agent_num, T) bool
+                저속이 아닌 세그먼트 마스크.
+            neighbor_agents_type: (B, agent_num, 3)
+                [vehicle, pedestrian, bicycle] 타입 정보.
+
+        Returns:
+            None
+        """
         edge_trim = int(self.config.stats_edge_trim)
         min_valid_len = int(self.config.stats_min_valid_len)
 
@@ -1104,66 +1121,93 @@ class DataStatistics:
             seg_valid=seg_valid.to(torch.bool),
             edge_trim=edge_trim,
             min_valid_len=min_valid_len,
-        )
-        not_low_speed_seg = not_low_speed_seg.to(torch.bool)
+        )  # (B,agent,T)
 
-        v_y_b = seg_body_control[..., 1]
-        omega = seg_body_control[..., 2]
-        v = torch.norm(seg_body_control[..., 0:2], dim=-1)
-        a_lat = v * omega.abs()
-        r = v / (omega.abs() + 1e-6)
-        vy_mask = seg_valid_stats & not_low_speed_seg
+        not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
 
-        v_y_b_for_stats = torch.where(not_low_speed_seg, v_y_b, torch.zeros_like(v_y_b))
-        a_lat_for_stats = torch.where(not_low_speed_seg, a_lat, torch.zeros_like(a_lat))
+        v_y_b = seg_body_control[..., 1]  # (B,agent,T)
+        omega = seg_body_control[..., 2]  # (B,agent,T)
+
+        v = torch.norm(seg_body_control[..., 0:2], dim=-1)  # (B,agent,T)
+        a_lat = v * omega.abs()  # (B,agent,T)
+        r = v / (omega.abs() + 1e-6)  # (B,agent,T)
+
+        # v_b_y는 저속 구간을 "제외"해서 누적(기존 코드와 동일한 의미 유지)
+        v_b_y_mask = seg_valid_stats & not_low_speed_seg
 
         self._accumulate_metric_from_time_series(
             metric_name="v_b_y_max",
-            values_bat=v_y_b_for_stats.abs(),
-            mask_bat=vy_mask,
+            values_bat=v_y_b.abs(),  # (B,agent,T)
+            mask_bat=v_b_y_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
 
+        # v는 저속 포함해도 큰 문제 없어서 seg_valid_stats만 사용(기존 유지)
         self._accumulate_metric_from_time_series(
             metric_name="v_max",
-            values_bat=v,
-            mask_bat=seg_valid_stats,
+            values_bat=v,  # (B,agent,T)
+            mask_bat=seg_valid_stats,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
 
+        # [FIX] a_lat_max: 저속 구간을 0으로 포함시키지 않고 mask에서 제외
+        a_lat_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="a_lat_max",
-            values_bat=a_lat_for_stats,
-            mask_bat=seg_valid_stats,
+            values_bat=a_lat,  # (B,agent,T)
+            mask_bat=a_lat_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
 
+        # omega_max: 저속 제외(기존 유지)
         omega_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="omega_max",
-            values_bat=omega.abs(),
-            mask_bat=omega_mask,
+            values_bat=omega.abs(),  # (B,agent,T)
+            mask_bat=omega_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
 
+        # r_min: 저속 제외 + 큰 값 제외(기존 유지)
         r_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="r_min",
-            values_bat=r,
-            mask_bat=r_mask,
+            values_bat=r,  # (B,agent,T)
+            mask_bat=r_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
             ignore_above=1.0e5,
         )
 
     def _accumulate_seg_body_control_2_statistics_robust(
-        self,
-        seg_body_accel: torch.Tensor,             # (B, agent_num, T)
-        seg_body_angular_accel: torch.Tensor,     # (B, agent_num, T)
-        seg_valid: torch.Tensor,                  # (B, agent_num, T) bool
-        not_low_speed_seg: torch.Tensor,          # (B, agent_num, T) bool
-        neighbor_agents_type: torch.Tensor,       # (B, agent_num, 3)
+            self,
+            seg_body_accel: torch.Tensor,  # (B, agent_num, T)
+            seg_body_angular_accel: torch.Tensor,  # (B, agent_num, T)
+            seg_valid: torch.Tensor,  # (B, agent_num, T) bool
+            not_low_speed_seg: torch.Tensor,  # (B, agent_num, T) bool
+            neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
     ) -> None:
-        """a / alpha 를 '시간별 값 전체'로 누적합니다."""
+        """a / alpha 를 '시간별 값 전체'로 누적합니다.
+
+        변경점(중요):
+            - alpha_max도 저속 구간을 0으로 포함시키지 않고,
+              저속 구간을 mask에서 제외합니다.
+            - 즉, alpha_max의 누적 마스크는 (seg_valid_stats & not_low_speed_seg) 입니다.
+
+        Args:
+            seg_body_accel: (B, agent_num, T)
+                세그먼트 기준 가속도 크기(시간별).
+            seg_body_angular_accel: (B, agent_num, T)
+                세그먼트 기준 각가속도(시간별).
+            seg_valid: (B, agent_num, T) bool
+                유효 세그먼트 마스크.
+            not_low_speed_seg: (B, agent_num, T) bool
+                저속이 아닌 세그먼트 마스크.
+            neighbor_agents_type: (B, agent_num, 3)
+                타입 정보.
+
+        Returns:
+            None
+        """
         edge_trim = int(self.config.stats_edge_trim)
         min_valid_len = int(self.config.stats_min_valid_len)
 
@@ -1171,23 +1215,28 @@ class DataStatistics:
             seg_valid=seg_valid.to(torch.bool),
             edge_trim=edge_trim,
             min_valid_len=min_valid_len,
-        )
+        )  # (B,agent,T)
 
-        accel_mask = seg_valid_stats & not_low_speed_seg.to(torch.bool)
+        not_low_speed_seg = not_low_speed_seg.to(torch.bool)
+
+        # a_max: 저속 제외(기존 유지)
+        accel_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="a_max",
-            values_bat=seg_body_accel.to(torch.float32),
-            mask_bat=accel_mask,
+            values_bat=seg_body_accel.to(torch.float32),  # (B,agent,T)
+            mask_bat=accel_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
 
+        # [FIX] alpha_max: 저속 제외(기존은 seg_valid_stats만 써서 0이 포함될 수 있었음)
+        alpha_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="alpha_max",
             values_bat=seg_body_angular_accel.abs().to(torch.float32),
-            mask_bat=seg_valid_stats,
+            # (B,agent,T)
+            mask_bat=alpha_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
-
 
     @staticmethod
     def _percentile_values_from_histogram(
@@ -1405,7 +1454,7 @@ class DataStatistics:
             }
 
         # ===== 출력 =====
-        print("========== robust limits (agent-level, softened extremes) ==========")
+        print("========== robust limits (agent-time, softened extremes) ==========")
         metric_order = sorted(hist_data.keys())
 
         for j, p_hi in enumerate(high_p_list):
