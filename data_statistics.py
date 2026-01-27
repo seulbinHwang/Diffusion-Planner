@@ -1337,8 +1337,8 @@ class DataStatistics:
 
         class_names = ["vehicle", "pedestrian", "bicycle"]
 
-        high_p_list = [99.9, 99.5, 99.0, 98.5, 98.0, 97.0, 96.0, 95.0]
-        low_p_list_r = [0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+        high_p_list = [99.9, 99.8, 99.7, 99.6, 99.5, 99.25, 99.0, 95.0]
+        low_p_list_r = [0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 5.0]
 
         hist_data: Dict[str, Dict[str, Any]] = {}
 
