@@ -198,7 +198,7 @@ taskset -c "${CPUSET}" \
   --load_name "wosac_test_full" \
   --name "wosac_test_full" \
   --eval_method "validation" \
-  --batch_size 512 \
+  --batch_size 256 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active True \
