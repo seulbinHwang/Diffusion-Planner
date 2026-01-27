@@ -198,7 +198,7 @@ taskset -c "${CPUSET}" \
   --load_name "wosac_test" \
   --name "wosac_test" \
   --eval_method "train" \
-  --batch_size 1024 \
+  --batch_size 384 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active True \
@@ -212,6 +212,7 @@ taskset -c "${CPUSET}" \
   --rollout_number 32 \
   --use_data_percent 1 \
   --use_amortized_diffusion True \
-  --do_data_statistics True
+  --do_data_statistics True \
+  --histogram_output_dir "histogram_all"
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
