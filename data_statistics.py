@@ -80,20 +80,7 @@ class DataStatistics:
         return bin_width, (float(max_edge_per_class[0]), float(max_edge_per_class[1]), float(max_edge_per_class[2]))
 
     def _get_metric_axis_label(self, metric_name: str) -> str:
-        """히스토그램 x축 라벨(표시 이름)을 metric에 맞게 반환합니다.
-
-        주의:
-            - 현재 히스토그램은 "max/min 결과"가 아니라,
-              시간(세그먼트)별 값들을 그대로 누적한 분포입니다.
-            - 그래서 metric_name이 *_max, r_min 형태여도,
-              x축 라벨은 실제로 쌓인 값의 의미(단위 포함)로 표시합니다.
-
-        Args:
-            metric_name: 지표 이름 (예: "v_max", "a_max", ...)
-
-        Returns:
-            x_label: x축에 표시할 문자열
-        """
+        """히스토그램 x축 라벨(표시 이름)을 metric에 맞게 반환합니다."""
         label_map: Dict[str, str] = {
             "v_max": "v (m/s)",
             "a_max": "a (m/s^2)",
@@ -101,7 +88,8 @@ class DataStatistics:
             "a_lat_max": "a_lat = v*|omega| (m/s^2)",
             "omega_max": "|omega| (rad/s)",
             "v_b_y_max": "|v_y^b| (m/s)",
-            "r_min": "r = v/|omega| (m)",
+            # ✅ 변경: r에서 v 대신 v_x^b 사용
+            "r_min": "r = |v_x^b|/|omega| (m)",
         }
         return label_map.get(metric_name, metric_name)
 
@@ -315,28 +303,29 @@ class DataStatistics:
             )
         # segment valid: 노드 유효(점) 마스크의 양 끝 AND
         points_valid = neighbor_agents_past_cur_future_is_valid.to(
-            torch.bool)  # (B, agent_num, time_len+future_len)
-        seg_valid = (points_valid[:, :, :-1] & points_valid[:, :, 1:]
-                    )  # (B, agent_num, past_len+future_len)
+            torch.bool)  # (B, agent_num, point_len)
+        seg_valid = (points_valid[:, :, :-1] & points_valid[
+            :, :, 1:])  # (B, agent_num, segment_len)
+
         # 속도(저속 제외 마스크용)
         v_x_w = points_world_control[..., 0]  # (B, agent_num, point_len)
         v_y_w = points_world_control[..., 1]  # (B, agent_num, point_len)
-
-        speed_of_points = torch.sqrt(
-            v_x_w * v_x_w + v_y_w * v_y_w)  # (B, agent_num, point_len)
-
         # 타입별 v_stop: (B, agent_num)
         v_stop_per_agent = self._get_stats_accel_v_stop_per_agent(
-            neighbor_agents_type).to(
-            device=speed_of_points.device, dtype=speed_of_points.dtype
+            neighbor_agents_type
         )  # (B, agent_num)
-        # 노드 기준 speed_ok: (B, agent_num, point_len)
-        not_low_speed_points = points_valid & (
-                    speed_of_points >= v_stop_per_agent.unsqueeze(-1))
-        # 세그먼트는 양 끝 노드가 모두 speed_ok 여야 True: (B, agent_num, segment_len)
-        not_low_speed_seg = not_low_speed_points[..., :-1] & not_low_speed_points[..., 1:]
+        # ✅ (수정) 저속 판정은 세그먼트 기준 속도(v_seg)로 통일
+        v_seg = torch.norm(seg_body_control[..., 0:2],
+                           dim=-1)  # (B, agent_num, segment_len)
 
+        v_stop_per_agent = v_stop_per_agent.to(device=v_seg.device,
+                                               dtype=v_seg.dtype)
 
+        not_low_speed_seg = (
+                seg_valid.to(torch.bool)
+                & torch.isfinite(v_seg)
+                & (v_seg >= v_stop_per_agent.unsqueeze(-1))
+        )  # (B, agent_num, segment_len)
 
         """
         abs_v_y_b_max : (B, agent_num)
@@ -687,7 +676,8 @@ class DataStatistics:
 
     def _compute_seg_body_accel_and_angular_accel_via_poly2(
             self,
-            neighbor_agents_past_cur_future_4_dim: torch.Tensor,  # (B, agent_num, point_len, 4)
+            neighbor_agents_past_cur_future_4_dim: torch.Tensor,
+            # (B, agent_num, point_len, 4)
             not_low_speed_seg: torch.Tensor,  # (B, agent_num, point_len-1) bool
             points_valid: torch.Tensor,  # (B, agent_num, point_len) bool
             *,
@@ -699,14 +689,14 @@ class DataStatistics:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """(x,y,cos,sin) 시퀀스로부터 세그먼트 가속도/각가속도를 계산합니다.
 
-        변경 의도(요청사항 반영):
-            1) 선형 가속도는 (ax, ay)의 크기 sqrt(ax^2 + ay^2)를 사용합니다.
-            2) 정지/초저속 구간은 a_max 계산에서 제외할 수 있도록 seg_speed_ok를 함께 만듭니다.
-               - v_stop은 vehicle/ped/bicycle별로 다르게 적용합니다.
+        변경점(요청사항 반영):
+            - (각가속도) cos/sin을 먼저 길이 1로 정규화한 뒤,
+              그 정규화된 cos/sin에 대해 2차 미분을 계산하도록 변경했습니다.
+              (원본 cos/sin 2차 미분 + 정규화 cos/sin 혼용으로 생길 수 있는 스파이크를 줄임)
 
         Args:
             neighbor_agents_past_cur_future_4_dim: (B, agent_num, point_len, 4)
-            not_low_speed_seg:
+            not_low_speed_seg: (B, agent_num, point_len-1) bool
             points_valid: (B, agent_num, point_len) bool
             neighbor_agents_type: (B, agent_num, 3)
             dt: float
@@ -728,12 +718,11 @@ class DataStatistics:
                 f"type={tuple(neighbor_agents_type.shape)}, points_valid={tuple(points_valid.shape)}"
             )
 
-        # (B, agent_num, point_len) bool 보장
-
         # -------------------------
         # (1) (x,y) -> 2차 변화율 (a_x, a_y)
         # -------------------------
-        xy = neighbor_agents_past_cur_future_4_dim[..., 0:2]  # (B, agent_num, point_len, 2)
+        xy = neighbor_agents_past_cur_future_4_dim[
+            ..., 0:2]  # (B, agent_num, point_len, 2)
 
         dd_xy = self._sg_derivative_multi_for_points_fp32(
             sequences_points=xy,
@@ -747,62 +736,69 @@ class DataStatistics:
         a_x_w = dd_xy[..., 0]  # (B, agent_num, point_len)
         a_y_w = dd_xy[..., 1]  # (B, agent_num, point_len)
 
-        # [핵심] 가속도 크기 (분모 제거)
-        accel_mag_node = torch.sqrt(a_x_w * a_x_w + a_y_w * a_y_w)  # (B, agent_num, point_len)
+        accel_mag_node = torch.sqrt(
+            a_x_w * a_x_w + a_y_w * a_y_w)  # (B, agent_num, point_len)
         accel_mag_node = torch.where(points_valid, accel_mag_node,
                                      torch.zeros_like(accel_mag_node))
 
-
-        # 노드 -> 세그먼트(중간값): (B, agent_num, segment_len)
-        seg_body_accel = 0.5 * (
-                    accel_mag_node[..., :-1] + accel_mag_node[..., 1:])
-
-        # 저속 세그먼트는 0으로 정리(통계에서 제외될 거지만, 값도 깔끔히)
+        seg_body_accel = 0.5 * (accel_mag_node[..., :-1] + accel_mag_node[
+            ..., 1:])  # (B, agent_num, segment_len)
         seg_body_accel = torch.where(not_low_speed_seg, seg_body_accel,
                                      torch.zeros_like(seg_body_accel))
 
         # -------------------------
         # (2) (cos,sin) -> yaw 2차 변화율 (angular_accel)
+        #     ✅ cos/sin 정규화 -> 정규화된 값으로 2차 미분
         # -------------------------
-        cos_y = neighbor_agents_past_cur_future_4_dim[..., 2]  # (B, agent_num, point_len)
-        sin_y = neighbor_agents_past_cur_future_4_dim[..., 3]  # (B, agent_num, point_len)
+        cos_y = neighbor_agents_past_cur_future_4_dim[
+            ..., 2]  # (B, agent_num, point_len)
+        sin_y = neighbor_agents_past_cur_future_4_dim[
+            ..., 3]  # (B, agent_num, point_len)
 
-        yaw_unit_stack = torch.stack([cos_y, sin_y],
-                                     dim=-1)  # (B, agent_num, point_len, 2)
+        finite_yaw = torch.isfinite(cos_y) & torch.isfinite(
+            sin_y)  # (B, agent_num, point_len)
+        valid_yaw = points_valid & finite_yaw  # (B, agent_num, point_len)
+
+        norm = torch.sqrt(cos_y * cos_y + sin_y * sin_y).clamp_min(
+            eps)  # (B, agent_num, point_len)
+        cos_u = cos_y / norm
+        sin_u = sin_y / norm
+
+        yaw_unit_norm = torch.stack([cos_u, sin_u],
+                                    dim=-1)  # (B, agent_num, point_len, 2)
+        yaw_unit_norm = torch.where(
+            valid_yaw.unsqueeze(-1),
+            yaw_unit_norm,
+            torch.zeros_like(yaw_unit_norm),
+        )
 
         dd_yaw_unit = self._sg_derivative_multi_for_points_fp32(
-            sequences_points=yaw_unit_stack,
-            points_valid=points_valid,
+            sequences_points=yaw_unit_norm,
+            points_valid=valid_yaw,
             dt=dt,
             polyorder=polyorder,
             max_window_length=max_window_len_yaw,
             derivative_order=2,
         )  # (B, agent_num, point_len, 2)
 
-        d2cos = dd_yaw_unit[..., 0]  # (B, agent_num, point_len)
-        d2sin = dd_yaw_unit[..., 1]  # (B, agent_num, point_len)
+        d2cos_u = dd_yaw_unit[..., 0]  # (B, agent_num, point_len)
+        d2sin_u = dd_yaw_unit[..., 1]  # (B, agent_num, point_len)
 
-        norm = torch.sqrt(cos_y * cos_y + sin_y * sin_y).clamp_min(
-            eps)  # (B, agent_num, point_len)
-        cos_u = cos_y / norm
-        sin_u = sin_y / norm
-        denom = (cos_u * cos_u + sin_u * sin_u).clamp_min(eps)
-
+        denom = (cos_u * cos_u + sin_u * sin_u).clamp_min(
+            eps)  # (B, agent_num, point_len) ~ 1
         angular_accel_node = (
-                                         cos_u * d2sin - sin_u * d2cos) / denom  # (B, agent_num, point_len)
-        angular_accel_node = torch.where(points_valid, angular_accel_node,
+                                         cos_u * d2sin_u - sin_u * d2cos_u) / denom  # (B, agent_num, point_len)
+        angular_accel_node = torch.where(valid_yaw, angular_accel_node,
                                          torch.zeros_like(angular_accel_node))
 
         seg_body_angular_accel = 0.5 * (
                     angular_accel_node[..., :-1] + angular_accel_node[
                 ..., 1:])  # (B, agent_num, segment_len)
+        seg_body_angular_accel = torch.where(not_low_speed_seg,
+                                             seg_body_angular_accel,
+                                             torch.zeros_like(
+                                                 seg_body_angular_accel))
 
-        # seg_body_angular_accel 도 저속 세그먼트는 0으로 정리
-        seg_body_angular_accel = torch.where(
-            not_low_speed_seg,
-            seg_body_angular_accel,
-            torch.zeros_like(seg_body_angular_accel)
-        )
         return seg_body_accel, seg_body_angular_accel
 
     @staticmethod
@@ -1094,26 +1090,7 @@ class DataStatistics:
             not_low_speed_seg: torch.Tensor,  # (B, agent_num, T) bool
             neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
     ) -> None:
-        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다.
-
-        변경점(중요):
-            - a_lat_max는 저속 구간을 0으로 만들어 포함시키지 않고,
-              저속 구간을 mask에서 제외합니다.
-            - 즉, a_lat_max의 누적 마스크는 (seg_valid_stats & not_low_speed_seg) 입니다.
-
-        Args:
-            seg_body_control: (B, agent_num, T, 3)
-                [v_x^b, v_y^b, omega] 세그먼트 중간값 제어.
-            seg_valid: (B, agent_num, T) bool
-                노드 양 끝이 유효한 세그먼트 마스크.
-            not_low_speed_seg: (B, agent_num, T) bool
-                저속이 아닌 세그먼트 마스크.
-            neighbor_agents_type: (B, agent_num, 3)
-                [vehicle, pedestrian, bicycle] 타입 정보.
-
-        Returns:
-            None
-        """
+        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다."""
         edge_trim = int(self.config.stats_edge_trim)
         min_valid_len = int(self.config.stats_min_valid_len)
 
@@ -1125,55 +1102,58 @@ class DataStatistics:
 
         not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
 
+        # ✅ v_x^b 추가로 분리
+        v_x_b = seg_body_control[..., 0]  # (B,agent,T)
         v_y_b = seg_body_control[..., 1]  # (B,agent,T)
         omega = seg_body_control[..., 2]  # (B,agent,T)
 
         v = torch.norm(seg_body_control[..., 0:2], dim=-1)  # (B,agent,T)
         a_lat = v * omega.abs()  # (B,agent,T)
-        r = v / (omega.abs() + 1e-6)  # (B,agent,T)
 
-        # v_b_y는 저속 구간을 "제외"해서 누적(기존 코드와 동일한 의미 유지)
+        # ✅ 변경: r = |v_x^b| / |omega|
+        r = v_x_b.abs() / (omega.abs() + 1e-6)  # (B,agent,T)
+
+        # v_b_y는 저속 구간 제외
         v_b_y_mask = seg_valid_stats & not_low_speed_seg
-
         self._accumulate_metric_from_time_series(
             metric_name="v_b_y_max",
-            values_bat=v_y_b.abs(),  # (B,agent,T)
-            mask_bat=v_b_y_mask,  # (B,agent,T)
+            values_bat=v_y_b.abs(),
+            mask_bat=v_b_y_mask,
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # v는 저속 포함해도 큰 문제 없어서 seg_valid_stats만 사용(기존 유지)
+        # v는 기존 유지
         self._accumulate_metric_from_time_series(
             metric_name="v_max",
-            values_bat=v,  # (B,agent,T)
-            mask_bat=seg_valid_stats,  # (B,agent,T)
+            values_bat=v,
+            mask_bat=seg_valid_stats,
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # [FIX] a_lat_max: 저속 구간을 0으로 포함시키지 않고 mask에서 제외
+        # a_lat는 기존 유지
         a_lat_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="a_lat_max",
-            values_bat=a_lat,  # (B,agent,T)
-            mask_bat=a_lat_mask,  # (B,agent,T)
+            values_bat=a_lat,
+            mask_bat=a_lat_mask,
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # omega_max: 저속 제외(기존 유지)
+        # omega는 기존 유지
         omega_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="omega_max",
-            values_bat=omega.abs(),  # (B,agent,T)
-            mask_bat=omega_mask,  # (B,agent,T)
+            values_bat=omega.abs(),
+            mask_bat=omega_mask,
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # r_min: 저속 제외 + 큰 값 제외(기존 유지)
+        # r_min: ✅ r만 바뀜
         r_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="r_min",
-            values_bat=r,  # (B,agent,T)
-            mask_bat=r_mask,  # (B,agent,T)
+            values_bat=r,
+            mask_bat=r_mask,
             neighbor_agents_type=neighbor_agents_type,
             ignore_above=1.0e5,
         )
@@ -1188,10 +1168,11 @@ class DataStatistics:
     ) -> None:
         """a / alpha 를 '시간별 값 전체'로 누적합니다.
 
-        변경점(중요):
-            - alpha_max도 저속 구간을 0으로 포함시키지 않고,
-              저속 구간을 mask에서 제외합니다.
-            - 즉, alpha_max의 누적 마스크는 (seg_valid_stats & not_low_speed_seg) 입니다.
+        변경점(요청사항 반영):
+            - a_max, alpha_max는 2차 변화율이라 더 예민하므로,
+              통계 유효 길이 기준을 stats_min_valid_len_for_accel로 더 엄격하게 적용합니다.
+            - 즉, _build_seg_valid_for_stats()의 min_valid_len에
+              stats_min_valid_len_for_accel을 사용합니다.
 
         Args:
             seg_body_accel: (B, agent_num, T)
@@ -1209,17 +1190,25 @@ class DataStatistics:
             None
         """
         edge_trim = int(self.config.stats_edge_trim)
-        min_valid_len = int(self.config.stats_min_valid_len)
+
+        # ✅ 핵심 변경: 가속도/각가속도는 더 엄격한 최소 유효 길이를 사용
+        min_valid_len_for_accel = int(
+            getattr(
+                self.config,
+                "stats_min_valid_len_for_accel",
+                getattr(self.config, "stats_min_valid_len", 1),
+            )
+        )
 
         seg_valid_stats, _ = self._build_seg_valid_for_stats(
             seg_valid=seg_valid.to(torch.bool),
             edge_trim=edge_trim,
-            min_valid_len=min_valid_len,
+            min_valid_len=min_valid_len_for_accel,  # ✅ 여기만 바뀜
         )  # (B,agent,T)
 
         not_low_speed_seg = not_low_speed_seg.to(torch.bool)
 
-        # a_max: 저속 제외(기존 유지)
+        # a_max: 저속 제외
         accel_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="a_max",
@@ -1228,7 +1217,7 @@ class DataStatistics:
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # [FIX] alpha_max: 저속 제외(기존은 seg_valid_stats만 써서 0이 포함될 수 있었음)
+        # alpha_max: 저속 제외
         alpha_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="alpha_max",

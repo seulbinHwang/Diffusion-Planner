@@ -2074,44 +2074,49 @@ class FeasibleProjector(nn.Module):
 
     # [추가 요망] (S3: 속도-연동 각속도 한계 — w clip, no slip angle)
     def _apply_S3_omega_clip_ste(
-        self,
-        vx_b: torch.Tensor,  # (B,Pnn)
-        vy_b: torch.Tensor,  # (B,Pnn)
-        omega: torch.Tensor,  # (B,Pnn)
-        a_lat_max: torch.Tensor,  # (B,Pnn)
-        R_min: torch.Tensor,  # (B,Pnn)
-        omega_abs_max: torch.Tensor,  # (B,Pnn)
-        is_nonholonomic: torch.Tensor,  # (B,Pnn)  True: 차/자전거, False: 보행자
-        eta: float,
-        eps: float,
+            self,
+            vx_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+            vy_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+            omega: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+            a_lat_max: torch.Tensor,  # (B,Pnn)
+            R_min: torch.Tensor,  # (B,Pnn)
+            omega_abs_max: torch.Tensor,  # (B,Pnn)
+            is_nonholonomic: torch.Tensor,  # (B,Pnn) bool
+            eta: float,
+            eps: float,
     ) -> torch.Tensor:
-        """(S3) β/Δβ 없이, 속도-연동 w 한계로 직접 clip.
+        """(S3) 속도-연동 omega 한계로 직접 clip.
 
-        w_allow (차/자전거) = min( a_lat_max/|v|, |v|/R_min, w_abs_max )
-        w_allow (보행자)     = min( a_lat_max/|v|, w_abs_max )   # 제자리 회전 허용
+        변경점(요청 반영):
+            - R_min 기반 항(= r = v/|omega| 제약에서 나온 항)에서
+              v 대신 |v_x^b| 를 사용합니다.
+            - 즉, |omega| <= |v_x^b| / R_min
         """
-        speed = torch.sqrt(vx_b * vx_b + vy_b * vy_b + eps)  # (B,Pnn)
+        # 기존 speed는 a_lat_max 항에 계속 사용(그대로 유지)
+        speed = torch.sqrt(
+            vx_b * vx_b + vy_b * vy_b + eps)  # (B,Pnn) or (B,Pnn,T)
+
+        # ✅ r 제약에 쓰는 v는 |v_x^b|
+        v_x_abs = vx_b.abs()  # (B,Pnn) or (B,Pnn,T)
+
         if a_lat_max.dim() == speed.dim() - 1:
             a_lat_max = a_lat_max.unsqueeze(-1)  # (B,Pnn,1)
             R_min = R_min.unsqueeze(-1)  # (B,Pnn,1)
             omega_abs_max = omega_abs_max.unsqueeze(-1)  # (B,Pnn,1)
-        allow_lat = a_lat_max / (speed + eps)  # (B,Pnn)
-        allow_R = speed / (R_min + eps)  # (B,Pnn)
+
+        allow_lat = a_lat_max / (speed + eps)
+        # ✅ 변경: speed 대신 |v_x^b|
+        allow_R = v_x_abs / (R_min + eps)
         allow_abs = omega_abs_max
 
-        # 비홀로노믹이면 R_min 항 포함, 보행자는 제외
         allow_nonh = torch.minimum(torch.minimum(allow_lat, allow_R), allow_abs)
-        allow_holo = torch.minimum(allow_lat, allow_abs)
+        allow_holo = allow_abs #torch.minimum(allow_lat, allow_abs)
 
-        # 추가하자: is_nonholonomic 을 시간축으로 확장
         if is_nonholonomic.dim() == allow_nonh.dim() - 1:
             is_nonholonomic = is_nonholonomic.unsqueeze(-1).expand_as(
                 allow_nonh)
 
-        allow = torch.where(is_nonholonomic, allow_nonh, allow_holo)  # (B,Pnn)
-
-        # forward: hard clamp, backward: band-weighted surrogate (allow는 detach)
-        # omega_new: (B,Pnn)
+        allow = torch.where(is_nonholonomic, allow_nonh, allow_holo)
         omega_new = self._ste_yawrate_clip(omega, allow, eta=eta, eps=eps)
         return omega_new
 
