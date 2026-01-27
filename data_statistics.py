@@ -35,7 +35,7 @@ class DataStatistics:
             },
             "a_lat_max": {
                 "bin_width": 0.5,
-                "max_edge_per_class": (30.0, 5.0, 16.0),
+                "max_edge_per_class": (40.0, 5.0, 16.0),
             },
             "r_min": {
                 "bin_width": 0.5,
@@ -78,6 +78,32 @@ class DataStatistics:
                 f"{metric_name}.max_edge_per_class must be (vehicle,ped,bic). got={max_edge_per_class}"
             )
         return bin_width, (float(max_edge_per_class[0]), float(max_edge_per_class[1]), float(max_edge_per_class[2]))
+
+    def _get_metric_axis_label(self, metric_name: str) -> str:
+        """히스토그램 x축 라벨(표시 이름)을 metric에 맞게 반환합니다.
+
+        주의:
+            - 현재 히스토그램은 "max/min 결과"가 아니라,
+              시간(세그먼트)별 값들을 그대로 누적한 분포입니다.
+            - 그래서 metric_name이 *_max, r_min 형태여도,
+              x축 라벨은 실제로 쌓인 값의 의미(단위 포함)로 표시합니다.
+
+        Args:
+            metric_name: 지표 이름 (예: "v_max", "a_max", ...)
+
+        Returns:
+            x_label: x축에 표시할 문자열
+        """
+        label_map: Dict[str, str] = {
+            "v_max": "v (m/s)",
+            "a_max": "a (m/s^2)",
+            "alpha_max": "|alpha| (rad/s^2)",
+            "a_lat_max": "a_lat = v*|omega| (m/s^2)",
+            "omega_max": "|omega| (rad/s)",
+            "v_b_y_max": "|v_y^b| (m/s)",
+            "r_min": "r = v/|omega| (m)",
+        }
+        return label_map.get(metric_name, metric_name)
 
     def _ensure_metric_histogram(
         self,
@@ -1023,7 +1049,7 @@ class DataStatistics:
         title: str,
         vlines: List[Tuple[float, str]],
         out_path: str,
-        y_break: float = 10.0,
+        y_break: float = 0.5,
     ) -> None:
         """0~y_break 구간은 크게, y_break~100 구간은 작게 보이도록 히스토그램을 저장합니다.
 
@@ -1097,6 +1123,7 @@ class DataStatistics:
         v = torch.norm(seg_body_control[..., 0:2], dim=-1)
         a_lat = v * omega.abs()
         r = v / (omega.abs() + 1e-6)
+        vy_mask = seg_valid_stats & not_low_speed_seg
 
         v_y_b_for_stats = torch.where(not_low_speed_seg, v_y_b, torch.zeros_like(v_y_b))
         a_lat_for_stats = torch.where(not_low_speed_seg, a_lat, torch.zeros_like(a_lat))
@@ -1104,7 +1131,7 @@ class DataStatistics:
         self._accumulate_metric_from_time_series(
             metric_name="v_b_y_max",
             values_bat=v_y_b_for_stats.abs(),
-            mask_bat=seg_valid_stats,
+            mask_bat=vy_mask,
             neighbor_agents_type=neighbor_agents_type,
         )
 
@@ -1458,16 +1485,18 @@ class DataStatistics:
                     save_name = f"{metric_name}_{cls_name}_r{round_id:04d}.png"
                     out_path = os.path.join(out_dir, save_name)
 
+                    x_label = self._get_metric_axis_label(metric_name)
+
                     DataStatistics._save_histogram_percent_broken_y(
                         plt=plt,
                         centers=centers,
                         heights_percent=y_c,
                         widths=widths,
-                        x_label=metric_name,
-                        title=f"{metric_name} / {cls_name} (N={total})",
+                        x_label=x_label,
+                        title=f"{x_label} / {cls_name} (N={total})",
                         vlines=vlines,
                         out_path=out_path,
-                        y_break=10.0,
+                        y_break=0.5,
                     )
 
         # 누적 초기화
