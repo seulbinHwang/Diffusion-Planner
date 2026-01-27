@@ -210,7 +210,7 @@ taskset -c "${CPUSET}" \
   --total_save_image_trial_num 1 \
   --rollout_time_chunk_size 1 \
   --rollout_number 32 \
-  --use_data_percent 1 \
+  --use_data_percent 100 \
   --use_amortized_diffusion True \
   --do_data_statistics True
 
