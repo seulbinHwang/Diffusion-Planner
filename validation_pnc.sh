@@ -211,6 +211,7 @@ taskset -c "${CPUSET}" \
   --rollout_time_chunk_size 1 \
   --rollout_number 32 \
   --use_data_percent 1 \
-  --use_amortized_diffusion True
+  --use_amortized_diffusion True \
+  --do_data_statistics True
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
