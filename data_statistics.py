@@ -15,24 +15,141 @@ class DataStatistics:
         self.feasible_projector = FeasibleProjector(
             self.config, self.config.hidden_dim, self.config.use_feasible_dl,
             self.config.use_feasible_filter)
-        """ (vehicle, pedestrian, bicycle)
-        v_b_y_max
-            - 0.1 m/s 단위로 통계 히스토그램 그리자 (0~0.1, 0.1~0.2, 0.2~0.3, ..., 29.9~30.0, ...)
-        v_max
-            - 3m/s 단위로 통계 히스토그램 그리자 (0~3, 3~6, 6~9, 9~12, 12~15, 15~18, 18~21, 21~24, 24~27, 27~30, ...)
-        a_max
-            - 1m/s^2 단위로 통계 히스토그램 그리자 (0~2, 2~4, 4~6, ..., 28~30, ...)
-        alpha_max
-            - 1 rad/s^2 단위로 통계 히스토그램 그리자 (0~1, 1~2, 2~3, ..., 18~19, 19~20, ...)
-        a_lat_max
-            - 1m/s^2 단위로 통계 히스토그램 그리자 (0~2, 2~4, 4~6, ..., 28~30, ...)
-            - v_abs * omega_abs 으로 계산
-        r_min
-            - 1m 단위로 통계 히스토그램 그리자 (0~1, 1~2, 2~3, ..., 98~99, 99~100, ...)
-            - v_abs / omega_abs 으로 계산
-        omega_max
-            - 0.3 rad/s 단위로 통계 히스토그램 그리자 (0~0.3, 0.3~0.6, 0.6~0.9, ..., 8.7~9.0, 9.0~9.3, ...)
+        # =========================================================
+        # 히스토그램 설정 (클래스 순서: vehicle, pedestrian, bicycle)
+        # - bin_width: bin 간격
+        # - max_edge_per_class: (vehicle, pedestrian, bicycle) 순서의 최대 x 범위
+        # =========================================================
+        self._hist_spec: Dict[str, Dict[str, Any]] = {
+            "v_max": {
+                "bin_width": 1.0,
+                "max_edge_per_class": (45.0, 7.5, 20.0),
+            },
+            "a_max": {
+                "bin_width": 0.3,
+                "max_edge_per_class": (10.0, 6.0, 6.0),
+            },
+            "alpha_max": {
+                "bin_width": 0.5,
+                "max_edge_per_class": (12.5, 15.0, 13.5),
+            },
+            "a_lat_max": {
+                "bin_width": 0.5,
+                "max_edge_per_class": (30.0, 5.0, 16.0),
+            },
+            "r_min": {
+                "bin_width": 0.5,
+                "max_edge_per_class": (40.0, 40.0, 40.0),
+            },
+            "omega_max": {
+                "bin_width": 0.3,
+                "max_edge_per_class": (3.0, 3.0, 3.0),
+            },
+            "v_b_y_max": {
+                "bin_width": 0.1,
+                "max_edge_per_class": (25.0, 5.0, 12.5),
+            },
+        }
+
+    def _get_histogram_spec(
+        self,
+        metric_name: str,
+    ) -> Tuple[float, Tuple[float, float, float]]:
+        """지표(metric)에 대한 히스토그램 설정을 반환합니다.
+
+        Args:
+            metric_name: 지표 이름. 예) "v_max", "a_max", "alpha_max", "a_lat_max",
+                "r_min", "omega_max", "v_b_y_max"
+
+        Returns:
+            bin_width: float
+                bin 간격.
+            max_edge_per_class: (vehicle, pedestrian, bicycle)
+                클래스별 최대 x 범위.
         """
+        if not hasattr(self, "_hist_spec") or metric_name not in self._hist_spec:
+            raise ValueError(f"Unknown metric_name={metric_name}. _hist_spec에 정의가 필요합니다.")
+
+        spec = self._hist_spec[metric_name]
+        bin_width = float(spec["bin_width"])
+        max_edge_per_class = spec["max_edge_per_class"]
+        if (not isinstance(max_edge_per_class, (tuple, list))) or len(max_edge_per_class) != 3:
+            raise ValueError(
+                f"{metric_name}.max_edge_per_class must be (vehicle,ped,bic). got={max_edge_per_class}"
+            )
+        return bin_width, (float(max_edge_per_class[0]), float(max_edge_per_class[1]), float(max_edge_per_class[2]))
+
+    def _ensure_metric_histogram(
+        self,
+        metric_name: str,
+        *,
+        bin_width: float,
+        max_edge_per_class: Tuple[float, float, float],
+        device: torch.device,
+    ) -> None:
+        """특정 지표(metric)의 히스토그램 버퍼를 1회만 생성합니다. (클래스별 x범위 지원)
+
+        - 기존 구조는 metric마다 edges/counts를 1개만 두었지만,
+          여기서는 (vehicle/ped/bic)별로 max_edge가 다를 수 있으므로
+          edges/counts를 클래스별로 따로 만듭니다.
+
+        저장 형태:
+            self._histograms[metric_name] = {
+                "edges_per_class": [edges0, edges1, edges2]  # 각 (num_bins+1,)
+                "counts_per_class": [cnt0, cnt1, cnt2]      # 각 (num_bins,)
+                "bin_width": float
+                "max_edge_per_class": (3,) tuple[float]
+            }
+
+        Args:
+            metric_name: 지표 이름
+            bin_width: bin 간격
+            max_edge_per_class: (vehicle, pedestrian, bicycle) 최대 x 범위
+            device: 텐서 디바이스
+        """
+        self._ensure_hist_state()
+
+        if metric_name in self._histograms:
+            # device가 달라졌으면 기존 버퍼를 새 device로 옮김
+            edges_list: List[torch.Tensor] = self._histograms[metric_name]["edges_per_class"]
+            counts_list: List[torch.Tensor] = self._histograms[metric_name]["counts_per_class"]
+            if edges_list[0].device != device:
+                self._histograms[metric_name]["edges_per_class"] = [e.to(device) for e in edges_list]
+                self._histograms[metric_name]["counts_per_class"] = [c.to(device) for c in counts_list]
+                if metric_name in self._hist_max_values:
+                    self._hist_max_values[metric_name] = self._hist_max_values[metric_name].to(device)
+            return
+
+        bw = float(bin_width)
+        max_edges = [float(max_edge_per_class[0]), float(max_edge_per_class[1]), float(max_edge_per_class[2])]
+
+        edges_per_class: List[torch.Tensor] = []
+        counts_per_class: List[torch.Tensor] = []
+
+        for m in max_edges:
+            # ceil로 bin 개수 결정 (max_edge가 bin_width의 배수가 아니어도 커버)
+            num_bins = int(math.ceil(m / bw))
+            num_bins = max(1, num_bins)
+
+            edges = (torch.arange(num_bins + 1, device=device, dtype=torch.float32) * bw)
+            # 마지막 edge는 요청 max_edge로 "딱 맞춤" (마지막 bin 폭이 조금 달라도 OK)
+            edges[-1] = float(m)
+
+            counts = torch.zeros((num_bins,), device=device, dtype=torch.long)
+            edges_per_class.append(edges)
+            counts_per_class.append(counts)
+
+        self._histograms[metric_name] = {
+            "edges_per_class": edges_per_class,
+            "counts_per_class": counts_per_class,
+            "bin_width": float(bw),
+            "max_edge_per_class": (max_edges[0], max_edges[1], max_edges[2]),
+        }
+
+        self._hist_max_values[metric_name] = torch.full(
+            (3,), float("-inf"), device=device, dtype=torch.float32
+        )
+
 
     def _auto_tune_stats_params_from_sg_windows(
         self,
@@ -771,60 +888,6 @@ class DataStatistics:
         if not hasattr(self, "_hist_draw_round"):
             self._hist_draw_round: int = 0
 
-    def _ensure_metric_histogram(
-            self,
-            metric_name: str,
-            *,
-            bin_width: float,
-            max_edge: float,
-            device: torch.device,
-    ) -> None:
-        """특정 지표(metric)의 히스토그램 버퍼를 1회만 생성합니다.
-
-        변경 요약:
-            - 원본값(raw) 저장 버퍼를 만들지 않습니다.
-            - counts/edges만 유지하므로 메모리 사용량이 거의 고정됩니다.
-
-        Args:
-            metric_name: 지표 이름(예: "v_max")
-            bin_width: 구간 폭
-            max_edge: 마지막 경계값(예: 30.0)
-            device: edges/counts를 올려둘 device
-
-        Returns:
-            None
-        """
-        self._ensure_hist_state()
-
-        if metric_name in self._histograms:
-            # device가 달라졌으면 기존 버퍼를 새 device로 옮김
-            cur_counts: torch.Tensor = self._histograms[metric_name]["counts"]
-            if cur_counts.device != device:
-                self._histograms[metric_name]["edges"] = \
-                    self._histograms[metric_name]["edges"].to(device)
-                self._histograms[metric_name]["counts"] = \
-                    self._histograms[metric_name]["counts"].to(device)
-                if metric_name in self._hist_max_values:
-                    self._hist_max_values[metric_name] = self._hist_max_values[metric_name].to(device)
-            return
-
-        num_bins = int(round(float(max_edge) / float(bin_width)))
-        num_bins = max(1, num_bins)
-
-        edges = (torch.arange(num_bins + 1, device=device, dtype=torch.float32)
-                 * float(bin_width))  # (num_bins+1,)
-        counts = torch.zeros((3, num_bins), device=device, dtype=torch.long)  # (3, num_bins)
-
-        self._histograms[metric_name] = {
-            "edges": edges,
-            "counts": counts,
-            "bin_width": float(bin_width),
-            "max_edge": float(max_edge),
-        }
-
-        self._hist_max_values[metric_name] = torch.full(
-            (3,), float("-inf"), device=device, dtype=torch.float32
-        )
 
 
 
@@ -835,28 +898,16 @@ class DataStatistics:
         mask_bat: torch.Tensor,              # (B, agent_num, T) bool
         neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
         *,
-        bin_width: float,
-        max_edge: float,
         ignore_above: Optional[float] = None,
     ) -> None:
-        """시간별 값 전체를 타입별로 모아 히스토그램 카운트만 누적합니다.
-
-        변경 요약:
-            - 원본값(raw)을 저장하지 않습니다. (CPU 메모리 누적 제거)
-            - counts만 누적하므로 메모리 사용량이 거의 고정됩니다.
-            - 퍼센트(p99.9 등)는 draw_histograms에서 counts로부터 구간 단위로 근사 계산합니다.
+        """시간별 값 전체를 타입별로 모아 히스토그램 카운트만 누적합니다. (클래스별 x범위)
 
         Args:
             metric_name: 지표 이름
-            values_bat: (B, agent_num, T) 시간별 값
-            mask_bat: (B, agent_num, T) bool, True인 값만 포함
-            neighbor_agents_type: (B, agent_num, 3) 타입 정보
-            bin_width: 히스토그램 구간 폭
-            max_edge: 히스토그램 최대 경계
+            values_bat: (B, agent_num, T)
+            mask_bat: (B, agent_num, T) bool
+            neighbor_agents_type: (B, agent_num, 3)
             ignore_above: 너무 큰 값 제외(예: r에서 분모가 거의 0인 경우)
-
-        Returns:
-            None
         """
         if values_bat.dim() != 3:
             raise ValueError(f"values_bat must be (B,agent,T). got={tuple(values_bat.shape)}")
@@ -864,26 +915,30 @@ class DataStatistics:
             raise ValueError(
                 f"mask_bat must match values_bat shape. mask={tuple(mask_bat.shape)}, values={tuple(values_bat.shape)}"
             )
-        if neighbor_agents_type.dim() != 3 or neighbor_agents_type.shape[:2] != values_bat.shape[:2] or neighbor_agents_type.shape[-1] != 3:
+        if (neighbor_agents_type.dim() != 3
+                or neighbor_agents_type.shape[:2] != values_bat.shape[:2]
+                or neighbor_agents_type.shape[-1] != 3):
             raise ValueError(
                 f"neighbor_agents_type must be (B,agent,3) and match values_bat[:2]. "
                 f"type={tuple(neighbor_agents_type.shape)}, values={tuple(values_bat.shape)}"
             )
 
+        # 스펙(요청한 bin_width / max_edge) 가져오기
+        bin_width, max_edge_per_class = self._get_histogram_spec(metric_name)
+
         device = values_bat.device
         self._ensure_metric_histogram(
             metric_name=metric_name,
-            bin_width=float(bin_width),
-            max_edge=float(max_edge),
+            bin_width=bin_width,
+            max_edge_per_class=max_edge_per_class,
             device=device,
         )
 
         hist = self._histograms[metric_name]
-        edges: torch.Tensor = hist["edges"]    # (num_bins+1,)
-        counts: torch.Tensor = hist["counts"]  # (3, num_bins)
-        num_bins = int(counts.shape[1])
+        edges_list: List[torch.Tensor] = hist["edges_per_class"]    # len=3, each (num_bins+1,)
+        counts_list: List[torch.Tensor] = hist["counts_per_class"]  # len=3, each (num_bins,)
+        max_edges: Tuple[float, float, float] = hist["max_edge_per_class"]
 
-        max_edge_f = float(hist["max_edge"])
         eps = 1.0e-6
 
         values = values_bat.detach()
@@ -905,14 +960,19 @@ class DataStatistics:
             if vals.numel() == 0:
                 continue
 
-            # 히스토그램 누적
-            v32 = vals.clamp(min=0.0, max=max_edge_f - eps)
-            idx = torch.bucketize(v32, edges, right=False) - 1
+            edges_c = edges_list[c]
+            counts_c = counts_list[c]
+            num_bins = int(counts_c.numel())
+            max_edge_c = float(max_edges[c])
+
+            # 히스토그램 누적 (0~max_edge 범위로 clamp)
+            v32 = vals.clamp(min=0.0, max=max_edge_c - eps)
+            idx = torch.bucketize(v32, edges_c, right=False) - 1
             idx = idx.clamp(min=0, max=num_bins - 1).to(torch.int64)
 
             add = torch.zeros((num_bins,), device=device, dtype=torch.long)
             add.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
-            counts[c] += add
+            counts_c += add
 
             # 참고용 최대값
             self._hist_max_values[metric_name][c] = torch.maximum(
@@ -920,6 +980,98 @@ class DataStatistics:
                 vals.max(),
             )
 
+    @staticmethod
+    def _draw_wave_break_mark(ax, *, y_axes: float) -> None:
+        """축 경계에 '물결' 형태의 끊김 표시를 그립니다.
+
+        Args:
+            ax: matplotlib axis
+            y_axes: 축 좌표계에서 y 위치 (0.0 또는 1.0)
+        """
+        try:
+            import numpy as np
+        except Exception:
+            np = None
+
+        # 좌/우에 작은 물결을 두 개 그립니다.
+        span = 0.08
+        amp = 0.015
+        waves = 3
+
+        def _plot_one_side(x_start: float) -> None:
+            if np is None:
+                # numpy가 없으면 간단한 지그재그로 대체
+                xs = [x_start, x_start + span * 0.33, x_start + span * 0.66, x_start + span]
+                ys = [y_axes, y_axes + amp, y_axes - amp, y_axes + amp]
+            else:
+                xs = np.linspace(x_start, x_start + span, 200)
+                phase = np.linspace(0.0, 2.0 * math.pi * waves, xs.size)
+                ys = y_axes + amp * np.sin(phase)
+            ax.plot(xs, ys, transform=ax.transAxes, color="k", clip_on=False, linewidth=1.0)
+
+        _plot_one_side(-0.02)         # left
+        _plot_one_side(1.0 - span + 0.02)  # right
+
+    @staticmethod
+    def _save_histogram_percent_broken_y(
+        *,
+        plt,
+        centers: List[float],
+        heights_percent: List[float],
+        widths: List[float],
+        x_label: str,
+        title: str,
+        vlines: List[Tuple[float, str]],
+        out_path: str,
+        y_break: float = 10.0,
+    ) -> None:
+        """0~y_break 구간은 크게, y_break~100 구간은 작게 보이도록 히스토그램을 저장합니다.
+
+        Args:
+            plt: matplotlib.pyplot
+            centers: x 위치 (len=N)
+            heights_percent: y 값(%) (len=N)
+            widths: 막대 폭 (len=N)
+            x_label: x축 라벨
+            title: 제목
+            vlines: [(x, label), ...] 수직선들
+            out_path: 저장 경로
+            y_break: 끊김 기준 (기본 10%)
+        """
+        fig = plt.figure()
+        gs = fig.add_gridspec(2, 1, height_ratios=[1, 5], hspace=0.05)
+        ax_top = fig.add_subplot(gs[0])
+        ax_bot = fig.add_subplot(gs[1], sharex=ax_top)
+
+        for ax in (ax_top, ax_bot):
+            ax.bar(centers, heights_percent, width=widths)
+            for x, label in vlines:
+                ax.axvline(x, linestyle="--", linewidth=1.2, label=label)
+
+        ax_bot.set_ylim(0.0, float(y_break))
+        ax_top.set_ylim(float(y_break), 100.0)
+
+        # x tick은 아래만 보이게
+        plt.setp(ax_top.get_xticklabels(), visible=False)
+        ax_top.tick_params(axis="x", which="both", bottom=False)
+
+        # 끊김 구간 표시(물결)
+        ax_top.spines["bottom"].set_visible(False)
+        ax_bot.spines["top"].set_visible(False)
+        DataStatistics._draw_wave_break_mark(ax_top, y_axes=0.0)
+        DataStatistics._draw_wave_break_mark(ax_bot, y_axes=1.0)
+
+        ax_bot.set_xlabel(x_label)
+        ax_bot.set_ylabel("Percent(%)")
+        ax_top.set_title(title)
+
+        # legend는 위쪽에만(중복 방지)
+        if len(vlines) > 0:
+            ax_top.legend(fontsize="x-small", ncol=2, loc="upper right")
+
+        plt.tight_layout()
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
 
 
     def _accumulate_seg_body_control_statistics_robust(
@@ -929,101 +1081,64 @@ class DataStatistics:
         not_low_speed_seg: torch.Tensor,       # (B, agent_num, T) bool
         neighbor_agents_type: torch.Tensor,    # (B, agent_num, 3)
     ) -> None:
-        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다.
-
-        핵심 변경:
-            - agent마다 3개 대표값을 뽑지 않습니다.
-            - 유효한 시간 구간(mask=True) 안의 값을 전부 타입별로 모아서 히스토그램/원본값을 누적합니다.
-            - draw_histograms의 퍼센트 출력 방식은 그대로 유지됩니다.
-
-        Args:
-            seg_body_control: (B, agent_num, T, 3)
-                [v_x^b, v_y^b, omega] 형태의 세그먼트 값.
-            seg_valid: (B, agent_num, T) bool
-                유효한 세그먼트 마스크.
-            not_low_speed_seg: (B, agent_num, T) bool
-                저속이 아닌 세그먼트 마스크(필요한 지표에서만 사용).
-            neighbor_agents_type: (B, agent_num, 3)
-                타입 정보.
-
-        Returns:
-            None
-        """
+        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다."""
         edge_trim = int(self.config.stats_edge_trim)
         min_valid_len = int(self.config.stats_min_valid_len)
 
-        # seg_valid_stats: (B,agent,T)  (edge_trim/min_valid_len 적용된 마스크)
         seg_valid_stats, _ = self._build_seg_valid_for_stats(
             seg_valid=seg_valid.to(torch.bool),
             edge_trim=edge_trim,
             min_valid_len=min_valid_len,
         )
+        not_low_speed_seg = not_low_speed_seg.to(torch.bool)
 
-        not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
-
-        # 값 분해: (B,agent,T)
         v_y_b = seg_body_control[..., 1]
         omega = seg_body_control[..., 2]
         v = torch.norm(seg_body_control[..., 0:2], dim=-1)
         a_lat = v * omega.abs()
         r = v / (omega.abs() + 1e-6)
 
-        # 기존 의도 유지: 저속 구간은 0으로 정리해서 누적(분포에서 저속 노이즈 완화)
         v_y_b_for_stats = torch.where(not_low_speed_seg, v_y_b, torch.zeros_like(v_y_b))
         a_lat_for_stats = torch.where(not_low_speed_seg, a_lat, torch.zeros_like(a_lat))
 
-        # v_b_y_max: (실제론 시간별 |v_y_b| 분포 누적)
         self._accumulate_metric_from_time_series(
             metric_name="v_b_y_max",
-            values_bat=v_y_b_for_stats.abs(),     # (B,agent,T)
-            mask_bat=seg_valid_stats,             # (B,agent,T)
+            values_bat=v_y_b_for_stats.abs(),
+            mask_bat=seg_valid_stats,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=0.1,
-            max_edge=30.0,
         )
 
-        # v_max: (시간별 speed 분포 누적)
         self._accumulate_metric_from_time_series(
             metric_name="v_max",
-            values_bat=v,                         # (B,agent,T)
-            mask_bat=seg_valid_stats,             # (B,agent,T)
+            values_bat=v,
+            mask_bat=seg_valid_stats,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=3.0,
-            max_edge=30.0,
         )
 
-        # a_lat_max: (시간별 a_lat 분포 누적)
         self._accumulate_metric_from_time_series(
             metric_name="a_lat_max",
-            values_bat=a_lat_for_stats,           # (B,agent,T)
-            mask_bat=seg_valid_stats,             # (B,agent,T)
+            values_bat=a_lat_for_stats,
+            mask_bat=seg_valid_stats,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=2.0,
-            max_edge=30.0,
         )
 
-        # omega_max: 저속 구간은 제외해서 누적(기존 의도 유지)
         omega_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="omega_max",
-            values_bat=omega.abs(),               # (B,agent,T)
-            mask_bat=omega_mask,                  # (B,agent,T)
+            values_bat=omega.abs(),
+            mask_bat=omega_mask,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=0.3,
-            max_edge=9.3,
         )
 
-        # r_min: 저속 구간 제외 + 너무 큰 값 제외
         r_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="r_min",
-            values_bat=r,                         # (B,agent,T)
-            mask_bat=r_mask,                      # (B,agent,T)
+            values_bat=r,
+            mask_bat=r_mask,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=1.0,
-            max_edge=100.0,
             ignore_above=1.0e5,
         )
+
     def _accumulate_seg_body_control_2_statistics_robust(
         self,
         seg_body_accel: torch.Tensor,             # (B, agent_num, T)
@@ -1032,23 +1147,7 @@ class DataStatistics:
         not_low_speed_seg: torch.Tensor,          # (B, agent_num, T) bool
         neighbor_agents_type: torch.Tensor,       # (B, agent_num, 3)
     ) -> None:
-        """a / alpha 를 '시간별 값 전체'로 누적합니다.
-
-        Args:
-            seg_body_accel: (B, agent_num, T)
-                시간별 가속도 크기 값.
-            seg_body_angular_accel: (B, agent_num, T)
-                시간별 각가속도 값.
-            seg_valid: (B, agent_num, T) bool
-                유효 세그먼트 마스크.
-            not_low_speed_seg: (B, agent_num, T) bool
-                저속이 아닌 세그먼트 마스크(a 쪽에서 사용).
-            neighbor_agents_type: (B, agent_num, 3)
-                타입 정보.
-
-        Returns:
-            None
-        """
+        """a / alpha 를 '시간별 값 전체'로 누적합니다."""
         edge_trim = int(self.config.stats_edge_trim)
         min_valid_len = int(self.config.stats_min_valid_len)
 
@@ -1056,27 +1155,21 @@ class DataStatistics:
             seg_valid=seg_valid.to(torch.bool),
             edge_trim=edge_trim,
             min_valid_len=min_valid_len,
-        )  # (B,agent,T)
+        )
 
-        # a_max: 저속 제외(기존 의도 유지)
         accel_mask = seg_valid_stats & not_low_speed_seg.to(torch.bool)
         self._accumulate_metric_from_time_series(
             metric_name="a_max",
             values_bat=seg_body_accel.to(torch.float32),
             mask_bat=accel_mask,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=2.0,
-            max_edge=30.0,
         )
 
-        # alpha_max: abs 기준, seg_valid_stats 기준(저속 구간 값은 0이라면 자연히 0으로 쌓임)
         self._accumulate_metric_from_time_series(
             metric_name="alpha_max",
             values_bat=seg_body_angular_accel.abs().to(torch.float32),
             mask_bat=seg_valid_stats,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=1.0,
-            max_edge=20.0,
         )
 
 
@@ -1148,17 +1241,29 @@ class DataStatistics:
         return out
 
 
-
     def draw_histograms(self) -> Dict[str, Dict[str, Any]]:
         """누적된 히스토그램을 정리하고, 여러 퍼센트 기준 한계값을 출력/그림에 표시합니다.
 
-        변경 요약:
-            - 원본값(raw)을 저장하지 않으므로,
-              퍼센트 값(p99.9 등)은 히스토그램 counts 누적분포로 '구간 단위' 근사 계산합니다.
-            - 메모리 사용량은 거의 고정됩니다.
+        현재 구조(클래스별 x범위):
+            - metric마다 vehicle/pedestrian/bicycle의 x축 최대 범위가 달라서
+              edges/counts를 클래스별로 따로 갖습니다.
+            - 그래서 draw_histograms에서도 클래스별 edges/counts를 사용해
+              퍼센트(%)와 퍼센트 지점 값들을 계산합니다.
 
         Returns:
-            hist_data: metric_name -> 각종 히스토그램/퍼센트/퍼센타일 정보
+            hist_data: metric_name -> {
+                "edges_per_class": [edges_v, edges_p, edges_b]          # 각 (num_bins+1,)
+                "counts_per_class": [counts_v, counts_p, counts_b]      # 각 (num_bins,)
+                "percent_per_class": [percent_v, percent_p, percent_b]  # 각 (num_bins,)
+                "raw_total_per_class": (3,) long
+                "max_per_class": (3,) float
+                "p_low_per_class": (3,) float
+                "p_high_per_class": (3,) float
+                "limit_percentiles": list[float]
+                "limit_values_per_class": (3, K) float
+                "bin_width": float
+                "max_edge_per_class": (3,) float
+            }
         """
         self._ensure_hist_state()
 
@@ -1182,19 +1287,42 @@ class DataStatistics:
         low_p_list_r = [0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 
         hist_data: Dict[str, Dict[str, Any]] = {}
+
         for metric_name, hist in self._histograms.items():
-            edges = hist["edges"].detach().cpu()     # (num_bins+1,)
-            counts = hist["counts"].detach().cpu()   # (3, num_bins)
-            totals = counts.sum(dim=1)               # (3,)
+            # ===== 클래스별 edges/counts 가져오기 (CPU로) =====
+            if "edges_per_class" not in hist or "counts_per_class" not in hist:
+                raise ValueError(
+                    f"[draw_histograms] metric={metric_name} is not class-specific histogram. "
+                    f"expected keys: edges_per_class / counts_per_class"
+                )
 
-            denom = totals.clamp(min=1).to(torch.float32)
-            percent = counts.to(torch.float32) / denom.unsqueeze(-1) * 100.0
+            edges_list_gpu: List[torch.Tensor] = hist["edges_per_class"]
+            counts_list_gpu: List[torch.Tensor] = hist["counts_per_class"]
 
+            if len(edges_list_gpu) != 3 or len(counts_list_gpu) != 3:
+                raise ValueError(
+                    f"[draw_histograms] metric={metric_name} edges/counts must have length 3. "
+                    f"got edges={len(edges_list_gpu)}, counts={len(counts_list_gpu)}"
+                )
+
+            edges_per_class: List[torch.Tensor] = [e.detach().cpu() for e in edges_list_gpu]
+            counts_per_class: List[torch.Tensor] = [c.detach().cpu() for c in counts_list_gpu]
+
+            totals_list: List[int] = [int(c.sum().item()) for c in counts_per_class]
+            totals = torch.tensor(totals_list, dtype=torch.long)  # (3,)
+
+            # percent_per_class: 각 (num_bins,) 0~100
+            percent_per_class: List[torch.Tensor] = []
+            for c in range(3):
+                denom = float(max(totals_list[c], 1))
+                percent_per_class.append(counts_per_class[c].to(torch.float32) / denom * 100.0)
+
+            # 참고용 최대값(각 클래스별로 1개)
             max_vals = self._hist_max_values.get(
-                metric_name, torch.full((3,), float("nan"))
-            ).detach().cpu()
+                metric_name, torch.full((3,), float("nan"), device=edges_list_gpu[0].device)
+            ).detach().cpu()  # (3,)
 
-            # metric별 퍼센트 목록/모드
+            # metric별 "한계 퍼센트" 목록
             if metric_name == "r_min":
                 limit_pcts_actual = low_p_list_r
                 limit_mode = "lower"
@@ -1202,62 +1330,62 @@ class DataStatistics:
                 limit_pcts_actual = high_p_list
                 limit_mode = "higher"
 
-            limit_qs = [float(p) / 100.0 for p in limit_pcts_actual]
+            limit_qs = [float(p) / 100.0 for p in limit_pcts_actual]  # len=8
 
-            raw_totals_list: List[int] = []
             p_low_list: List[float] = []
             p_high_list: List[float] = []
             limit_values_all: List[List[float]] = []
 
             for c in range(3):
-                n = int(totals[c].item())
-                raw_totals_list.append(n)
-
+                n = totals_list[c]
                 if n <= 0:
                     p_low_list.append(float("nan"))
                     p_high_list.append(float("nan"))
                     limit_values_all.append([float("nan")] * len(limit_qs))
                     continue
 
-                # p_low/p_high (근사)
+                edges_c = edges_per_class[c]    # (num_bins+1,)
+                counts_c = counts_per_class[c]  # (num_bins,)
+
+                # p_low / p_high (근사)
                 v_low = self._percentile_values_from_histogram(
-                    edges=edges,
-                    counts_1d=counts[c],
+                    edges=edges_c,
+                    counts_1d=counts_c,
                     qs=[q_low],
                     mode="lower",
                 )[0]
                 v_high = self._percentile_values_from_histogram(
-                    edges=edges,
-                    counts_1d=counts[c],
+                    edges=edges_c,
+                    counts_1d=counts_c,
                     qs=[q_high],
                     mode="higher",
                 )[0]
+
                 p_low_list.append(v_low)
                 p_high_list.append(v_high)
 
                 # 요청 퍼센트 값들(근사)
                 vals_c = self._percentile_values_from_histogram(
-                    edges=edges,
-                    counts_1d=counts[c],
+                    edges=edges_c,
+                    counts_1d=counts_c,
                     qs=limit_qs,
                     mode=limit_mode,
                 )
                 limit_values_all.append(vals_c)
 
             hist_data[metric_name] = {
-                "edges": edges,
-                "counts": counts,
-                "percent": percent,
+                "edges_per_class": edges_per_class,
+                "counts_per_class": counts_per_class,
+                "percent_per_class": percent_per_class,
                 "total_per_class": totals,
-                # raw 저장을 안 하므로, N은 "히스토그램에 누적된 개수"로 대체
-                "raw_total_per_class": torch.tensor(raw_totals_list, dtype=torch.long),
+                "raw_total_per_class": totals.clone(),  # raw 저장이 없으니 totals로 대체
                 "max_per_class": max_vals,
                 "p_low_per_class": torch.tensor(p_low_list, dtype=torch.float32),
                 "p_high_per_class": torch.tensor(p_high_list, dtype=torch.float32),
                 "limit_percentiles": list(limit_pcts_actual),
                 "limit_values_per_class": torch.tensor(limit_values_all, dtype=torch.float32),  # (3,8)
-                "bin_width": float(hist["bin_width"]),
-                "max_edge": float(hist["max_edge"]),
+                "bin_width": float(hist.get("bin_width", float("nan"))),
+                "max_edge_per_class": tuple(hist.get("max_edge_per_class", (float("nan"), float("nan"), float("nan")))),
             }
 
         # ===== 출력 =====
@@ -1269,8 +1397,8 @@ class DataStatistics:
             print(f"[p{p_hi:g}] (r_min은 p{p_r:g} 값 사용)")
 
             for metric_name in metric_order:
-                totals_raw = hist_data[metric_name]["raw_total_per_class"]     # (3,)
-                limit_vals = hist_data[metric_name]["limit_values_per_class"] # (3,8)
+                totals_raw = hist_data[metric_name]["raw_total_per_class"]      # (3,)
+                limit_vals = hist_data[metric_name]["limit_values_per_class"]  # (3,8)
 
                 parts: List[str] = []
                 for i, cls in enumerate(class_names):
@@ -1304,44 +1432,46 @@ class DataStatistics:
             round_id = int(self._hist_draw_round)
 
             for metric_name in sorted(hist_data.keys()):
-                edges = hist_data[metric_name]["edges"]
-                percent = hist_data[metric_name]["percent"]
-                bin_width = float(hist_data[metric_name]["bin_width"])
-
-                centers = ((edges[:-1] + edges[1:]) * 0.5).tolist()
-
-                totals_raw = hist_data[metric_name]["raw_total_per_class"]
-                limit_vals = hist_data[metric_name]["limit_values_per_class"]
+                edges_list = hist_data[metric_name]["edges_per_class"]         # len=3
+                percent_list = hist_data[metric_name]["percent_per_class"]     # len=3
+                totals_raw = hist_data[metric_name]["raw_total_per_class"]     # (3,)
+                limit_vals = hist_data[metric_name]["limit_values_per_class"] # (3, 8)
+                limit_pcts = hist_data[metric_name]["limit_percentiles"]       # len=8
 
                 for c, cls_name in enumerate(class_names):
                     total = int(totals_raw[c].item())
                     if total <= 0:
                         continue
 
-                    y = percent[c].tolist()
+                    edges_c = edges_list[c]                # (num_bins+1,)
+                    y_c = percent_list[c].tolist()         # (num_bins,)
+                    centers = ((edges_c[:-1] + edges_c[1:]) * 0.5).tolist()
+                    widths = (edges_c[1:] - edges_c[:-1]).tolist()
+                    widths = [float(w) * 0.9 for w in widths]
 
-                    fig = plt.figure()
-                    plt.bar(centers, y, width=bin_width * 0.9)
-                    plt.ylim(0.0, 100.0)
-                    plt.xlabel(metric_name)
-                    plt.ylabel("Percent(%)")
-                    plt.title(f"{metric_name} / {cls_name} (N={total})")
-
-                    for j, p_hi in enumerate(high_p_list):
-                        x = float(limit_vals[c, j].item())
+                    vlines: List[Tuple[float, str]] = []
+                    for jj, p in enumerate(limit_pcts):
+                        x = float(limit_vals[c, jj].item())
                         if x == x:
-                            plt.axvline(x, linestyle="--", linewidth=1.2, label=f"p{p_hi:g}")
+                            vlines.append((x, f"p{p:g}"))
 
-                    plt.legend(fontsize="x-small", ncol=2, loc="upper right")
-
-                    plt.tight_layout()
                     save_name = f"{metric_name}_{cls_name}_r{round_id:04d}.png"
-                    fig.savefig(os.path.join(out_dir, save_name), dpi=150)
-                    plt.close(fig)
+                    out_path = os.path.join(out_dir, save_name)
+
+                    DataStatistics._save_histogram_percent_broken_y(
+                        plt=plt,
+                        centers=centers,
+                        heights_percent=y_c,
+                        widths=widths,
+                        x_label=metric_name,
+                        title=f"{metric_name} / {cls_name} (N={total})",
+                        vlines=vlines,
+                        out_path=out_path,
+                        y_break=10.0,
+                    )
 
         # 누적 초기화
         self._histograms.clear()
         self._hist_max_values.clear()
 
         return hist_data
-
