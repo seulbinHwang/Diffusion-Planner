@@ -54,8 +54,8 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final_150_0102/validation"
-EVAL_SET_LIST_PATH="${USER_PATH}/E/projects/Diffusion-Planner/diffusion_planner_training.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed"
+EVAL_SET_LIST_PATH="${USER_PATH}/E/projects/Diffusion-Planner/.json"
 ###################################
 # If the validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
