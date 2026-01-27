@@ -521,6 +521,7 @@ def get_args():
     parser.add_argument('--notes', default='', type=str)
     parser.add_argument('--entity', default='jksg01019-naver-labs', type=str)
     parser.add_argument('--project', default='Diffusion-Planner', type=str)
+    parser.add_argument('--histogram_output_dir', default='histograms', type=str)
 
     # distributed training parameters
     parser.add_argument('--ddp',
