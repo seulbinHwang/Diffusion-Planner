@@ -195,8 +195,8 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "wosac_test" \
-  --name "wosac_test" \
+  --load_name "wosac_test_full" \
+  --name "wosac_test_full" \
   --eval_method "validation" \
   --batch_size 256 \
   --use_deepspeed True \
