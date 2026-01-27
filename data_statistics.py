@@ -23,31 +23,31 @@ class DataStatistics:
         self._hist_spec: Dict[str, Dict[str, Any]] = {
             "v_max": {
                 "bin_width": 1.0,
-                "max_edge_per_class": (45.0, 7.5, 20.0),# (vehicle, pedestrian, bicycle)
+                "max_edge_per_class": (35.0, 5.0, 30.0),# (vehicle, pedestrian, bicycle)
             },
             "a_max": {
-                "bin_width": 0.2,
-                "max_edge_per_class": (13.0, 7.0, 7.0),# (vehicle, pedestrian, bicycle)
+                "bin_width": 0.1,
+                "max_edge_per_class": (12.0, 6.0, 7.5),# (vehicle, pedestrian, bicycle)
             },
             "alpha_max": {
-                "bin_width": 0.2,
-                "max_edge_per_class": (3.5, 19.0, 9.0),# (vehicle, pedestrian, bicycle)
+                "bin_width": 0.1,
+                "max_edge_per_class": (4.0, 18.0, 10.0),# (vehicle, pedestrian, bicycle)
             },
             "a_lat_max": {
                 "bin_width": 0.1,
-                "max_edge_per_class": (6.0, 3.0, 5.0), # (vehicle, pedestrian, bicycle)
+                "max_edge_per_class": (5.0, 4.0, 5.5), # (vehicle, pedestrian, bicycle)
             },
             "r_min": {
-                "bin_width": 0.1,
-                "max_edge_per_class": (5.0, 0.5, 3.0),# (vehicle, pedestrian, bicycle)
+                "bin_width": 0.05,
+                "max_edge_per_class": (5.0, 0.5, 2.0),# (vehicle, pedestrian, bicycle)
             },
             "omega_max": {
                 "bin_width": 0.1,
-                "max_edge_per_class": (2.5, 4.5, 2.5),# (vehicle, pedestrian, bicycle)
+                "max_edge_per_class": (1.3, 4.0, 3.0),# (vehicle, pedestrian, bicycle)
             },
             "v_b_y_max": {
                 "bin_width": 0.05,
-                "max_edge_per_class": (2.5, 1.5, 2.5),# (vehicle, pedestrian, bicycle)
+                "max_edge_per_class": (1.5, 1.5, 2.0),# (vehicle, pedestrian, bicycle)
             },
         }
 
@@ -1337,8 +1337,8 @@ class DataStatistics:
 
         class_names = ["vehicle", "pedestrian", "bicycle"]
 
-        high_p_list = [99.9, 99.8, 99.7, 99.6, 99.5, 99.25, 99.0, 95.0]
-        low_p_list_r = [0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 5.0]
+        high_p_list = [99.99, 99.96, 99.93, 99.9, 99.8, 99.7, 99.6, 99.5]
+        low_p_list_r = [0.01, 0.03, 0.06,  0.1, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 5.0]
 
         hist_data: Dict[str, Dict[str, Any]] = {}
 

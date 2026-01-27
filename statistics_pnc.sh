@@ -213,6 +213,6 @@ taskset -c "${CPUSET}" \
   --use_data_percent 100 \
   --use_amortized_diffusion True \
   --do_data_statistics True \
-  --histogram_output_dir "histogram_all"
+  --histogram_output_dir "histogram_all2"
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
