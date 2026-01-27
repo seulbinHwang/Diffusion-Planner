@@ -1291,35 +1291,23 @@ class DataStatistics:
         idx = max(0, min(idx, n - 1))
         return float(v_sorted[idx].item())
 
-
     def draw_histograms(self) -> Dict[str, Dict[str, Any]]:
-        """누적된 히스토그램 데이터를 정리하고, 타입별 '한계값'을 여러 퍼센트로 출력합니다.
+        """누적된 히스토그램을 정리하고, 여러 퍼센트 기준 한계값을 출력/그림에 표시합니다.
 
-        현재 누적 기준:
-            - scene 대표값 1개가 아니라,
-            - agent별 시간축에서 뽑은 '완화된 극값 3개' 샘플을 누적합니다.
+        출력 형식(요청 반영):
+            - p=99.9 블록에 여러 metric 값을 모아서 출력
+            - p=99.5 블록에 여러 metric 값을 모아서 출력
+            - ...
+            - p=95 블록에 여러 metric 값을 모아서 출력
+            - r_min은 (p0.1,0.5,1,1.5,2,3,4,5)를 각각 (p99.9,99.5,99,98.5,98,97,96,95) 블록에 대응시켜 출력
 
-        출력 규칙(요청사항):
-            - v_b_y_max / v_max / a_lat_max / omega_max / a_max / alpha_max:
-                상위 P = 99.9 / 99.5 / 99 / 98.5 / 98 / 97 / 96 / 95
-            - r_min:
-                하위 P = 0.1 / 0.5 / 1 / 1.5 / 2 / 3 / 4 / 5
+        그림(요청 반영):
+            - p=99.9, 99.5, ..., 95 위치에 수직선(axvline)을 모두 표시
+            - 범례로 각 선이 어떤 p인지 표시
+            - r_min은 “라벨은 p99.9~p95”로 표시하되, 값은 p0.1~p5에서 가져옵니다.
 
         Returns:
-            hist_data: metric_name -> {
-                "edges": (num_bins+1,) CPU tensor
-                "counts": (3, num_bins) CPU tensor
-                "percent": (3, num_bins) CPU tensor (0~100)
-                "total_per_class": (3,) CPU tensor  (counts 기준)
-                "raw_total_per_class": (3,) CPU tensor (원본 샘플 개수)
-                "max_per_class": (3,) CPU tensor (참고용)
-                "p_low_per_class": (3,) CPU tensor  (config 기반)
-                "p_high_per_class": (3,) CPU tensor (config 기반)
-                "limit_percentiles": List[float]
-                "limit_values_per_class": (3, P) CPU tensor
-                "bin_width": float
-                "max_edge": float
-            }
+            hist_data: metric_name -> 각종 히스토그램/퍼센트/퍼센타일 정보 딕셔너리
         """
         self._ensure_hist_state()
 
@@ -1327,8 +1315,9 @@ class DataStatistics:
             print("[draw_histograms] 누적된 통계가 없습니다.")
             return {}
 
-        # (그림에 그릴 p_low/p_high는 기존 config를 그대로 사용)
-        q_high = float(getattr(self.config, "hist_print_upper_percentile", 0.99))
+        # (그림/데이터로 유지할 기본 p_low/p_high; 지금 요청의 주 표시는 아래 high_p_list 사용)
+        q_high = float(
+            getattr(self.config, "hist_print_upper_percentile", 0.99))
         q_high = max(0.0, min(1.0, q_high))
 
         q_low_cfg = getattr(self.config, "hist_print_lower_percentile", None)
@@ -1340,18 +1329,20 @@ class DataStatistics:
 
         class_names = ["vehicle", "pedestrian", "bicycle"]
 
-        # 요청하신 출력 퍼센트(%) 목록
+        # 요청한 퍼센트(%) 목록
         high_p_list = [99.9, 99.5, 99.0, 98.5, 98.0, 97.0, 96.0, 95.0]
+        # r_min은 아래(%)를 위 high_p_list와 같은 인덱스로 매핑해서 출력/표시
         low_p_list_r = [0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 
         hist_data: Dict[str, Dict[str, Any]] = {}
         for metric_name, hist in self._histograms.items():
-            edges = hist["edges"].detach().cpu()     # (num_bins+1,)
-            counts = hist["counts"].detach().cpu()   # (3, num_bins)
-            totals = counts.sum(dim=1)               # (3,)
+            edges = hist["edges"].detach().cpu()  # (num_bins+1,)
+            counts = hist["counts"].detach().cpu()  # (3, num_bins)
+            totals = counts.sum(dim=1)  # (3,)
 
-            denom = totals.clamp(min=1).to(torch.float32)   # (3,)
-            percent = counts.to(torch.float32) / denom.unsqueeze(-1) * 100.0  # (3, num_bins)
+            denom = totals.clamp(min=1).to(torch.float32)  # (3,)
+            percent = counts.to(torch.float32) / denom.unsqueeze(
+                -1) * 100.0  # (3, num_bins)
 
             max_vals = self._hist_max_values.get(
                 metric_name, torch.full((3,), float("nan"))
@@ -1363,25 +1354,27 @@ class DataStatistics:
             p_low_list: List[float] = []
             p_high_list: List[float] = []
 
-            # 출력용 limit 퍼센트/모드 결정
+            # metric별로 실제 계산에 쓰는 퍼센트(%) 목록/모드 결정
             if metric_name == "r_min":
-                limit_pcts = low_p_list_r
+                limit_pcts_actual = low_p_list_r
                 limit_mode = "lower"
             else:
-                limit_pcts = high_p_list
+                limit_pcts_actual = high_p_list
                 limit_mode = "higher"
 
-            limit_values_all: List[List[float]] = []  # (3, P)
+            limit_values_all: List[List[float]] = []  # (3, 8)
 
             for c in range(3):
                 if len(raw_lists[c]) == 0:
                     raw_totals_list.append(0)
                     p_low_list.append(float("nan"))
                     p_high_list.append(float("nan"))
-                    limit_values_all.append([float("nan")] * len(limit_pcts))
+                    limit_values_all.append(
+                        [float("nan")] * len(limit_pcts_actual))
                     continue
 
-                raw_cat = torch.cat(raw_lists[c], dim=0).to(torch.float32)  # (N,)
+                raw_cat = torch.cat(raw_lists[c], dim=0).to(
+                    torch.float32)  # (N,)
                 raw_cat = raw_cat[torch.isfinite(raw_cat)]
                 n_raw = int(raw_cat.numel())
                 raw_totals_list.append(n_raw)
@@ -1389,20 +1382,24 @@ class DataStatistics:
                 if n_raw <= 0:
                     p_low_list.append(float("nan"))
                     p_high_list.append(float("nan"))
-                    limit_values_all.append([float("nan")] * len(limit_pcts))
+                    limit_values_all.append(
+                        [float("nan")] * len(limit_pcts_actual))
                     continue
 
-                # 그림용 p_low/p_high (config 기반)
-                v_low = self._percentile_value_from_raw(raw_cat, q_low, mode="lower")
-                v_high = self._percentile_value_from_raw(raw_cat, q_high, mode="higher")
+                # 기본 p_low/p_high (유지)
+                v_low = self._percentile_value_from_raw(raw_cat, q_low,
+                                                        mode="lower")
+                v_high = self._percentile_value_from_raw(raw_cat, q_high,
+                                                         mode="higher")
                 p_low_list.append(v_low)
                 p_high_list.append(v_high)
 
-                # 요청하신 여러 퍼센트 limit 값
+                # 요청 퍼센트 값들
                 vals_c: List[float] = []
-                for p in limit_pcts:
+                for p in limit_pcts_actual:
                     q = float(p) / 100.0
-                    vals_c.append(self._percentile_value_from_raw(raw_cat, q, mode=limit_mode))
+                    vals_c.append(self._percentile_value_from_raw(raw_cat, q,
+                                                                  mode=limit_mode))
                 limit_values_all.append(vals_c)
 
             hist_data[metric_name] = {
@@ -1410,44 +1407,59 @@ class DataStatistics:
                 "counts": counts,
                 "percent": percent,
                 "total_per_class": totals,
-                "raw_total_per_class": torch.tensor(raw_totals_list, dtype=torch.long),
+                "raw_total_per_class": torch.tensor(raw_totals_list,
+                                                    dtype=torch.long),
                 "max_per_class": max_vals,
-                "p_low_per_class": torch.tensor(p_low_list, dtype=torch.float32),
-                "p_high_per_class": torch.tensor(p_high_list, dtype=torch.float32),
-                "limit_percentiles": list(limit_pcts),
-                "limit_values_per_class": torch.tensor(limit_values_all, dtype=torch.float32),  # (3,P)
+                "p_low_per_class": torch.tensor(p_low_list,
+                                                dtype=torch.float32),
+                "p_high_per_class": torch.tensor(p_high_list,
+                                                 dtype=torch.float32),
+                # 저장은 "실제 계산에 쓴 퍼센트" 그대로
+                "limit_percentiles": list(limit_pcts_actual),
+                "limit_values_per_class": torch.tensor(limit_values_all,
+                                                       dtype=torch.float32),
+                # (3,8)
                 "bin_width": float(hist["bin_width"]),
                 "max_edge": float(hist["max_edge"]),
             }
 
-        # ---- 출력 ----
-        print("========== robust limits (agent-level, softened extremes) ==========")
-        for metric_name in sorted(hist_data.keys()):
-            totals_raw = hist_data[metric_name]["raw_total_per_class"]          # (3,)
-            limit_pcts = hist_data[metric_name]["limit_percentiles"]            # List[float]
-            limit_vals = hist_data[metric_name]["limit_values_per_class"]       # (3,P)
+        # =========================================================
+        # (1) 출력: 퍼센트 기준으로 블록을 나눠서 출력 + r_min 매핑
+        # =========================================================
+        print(
+            "========== robust limits (agent-level, softened extremes) ==========")
 
-            msg_parts = []
-            for i, cls in enumerate(class_names):
-                n_i = int(totals_raw[i].item())
-                if n_i <= 0:
-                    msg_parts.append(f"{cls}=NA(N={n_i})")
-                    continue
+        metric_order = sorted(hist_data.keys())
 
-                vals_i = limit_vals[i]  # (P,)
-                parts_i = []
-                for j, p in enumerate(limit_pcts):
-                    v = float(vals_i[j].item())
+        for j, p_hi in enumerate(high_p_list):
+            p_r = low_p_list_r[j]
+            print(f"[p{p_hi:g}] (r_min은 p{p_r:g} 값 사용)")
+
+            for metric_name in metric_order:
+                totals_raw = hist_data[metric_name][
+                    "raw_total_per_class"]  # (3,)
+                limit_vals = hist_data[metric_name][
+                    "limit_values_per_class"]  # (3,8)
+
+                # r_min은 이미 (p0.1..p5) 순서로 들어 있고, j 인덱스로 high_p_list와 매핑됨
+                parts: List[str] = []
+                for i, cls in enumerate(class_names):
+                    n_i = int(totals_raw[i].item())
+                    if n_i <= 0:
+                        parts.append(f"{cls}=NA(N={n_i})")
+                        continue
+
+                    v = float(limit_vals[i, j].item())
                     if v == v:  # NaN 체크
-                        parts_i.append(f"p{p:g}={v:.6g}")
+                        parts.append(f"{cls}={v:.6g}(N={n_i})")
                     else:
-                        parts_i.append(f"p{p:g}=nan")
+                        parts.append(f"{cls}=nan(N={n_i})")
 
-                msg_parts.append(f"{cls}(" + ",".join(parts_i) + f",N={n_i})")
+                print(f"  {metric_name}: " + " | ".join(parts))
 
-            print(f"{metric_name}: " + " | ".join(msg_parts))
-
-        # ---- 히스토그램 이미지 저장(기존 유지: config 기반 p_low/p_high만 수직선) ----
+        # =========================================================
+        # (2) 그림: p99.9~p95 선 전부 표시 + 라벨 표시(legend)
+        # =========================================================
         import os
         try:
             import matplotlib
@@ -1464,15 +1476,17 @@ class DataStatistics:
             round_id = int(self._hist_draw_round)
 
             for metric_name in sorted(hist_data.keys()):
-                edges = hist_data[metric_name]["edges"]      # CPU
+                edges = hist_data[metric_name]["edges"]  # CPU
                 percent = hist_data[metric_name]["percent"]  # CPU (3, num_bins)
                 bin_width = float(hist_data[metric_name]["bin_width"])
 
-                centers = ((edges[:-1] + edges[1:]) * 0.5).tolist()  # (num_bins,)
+                centers = ((edges[:-1] + edges[
+                    1:]) * 0.5).tolist()  # (num_bins,)
 
-                p_low = hist_data[metric_name]["p_low_per_class"]    # CPU (3,)
-                p_high = hist_data[metric_name]["p_high_per_class"]  # CPU (3,)
-                totals_raw = hist_data[metric_name]["raw_total_per_class"]  # CPU (3,)
+                totals_raw = hist_data[metric_name][
+                    "raw_total_per_class"]  # CPU (3,)
+                limit_vals = hist_data[metric_name][
+                    "limit_values_per_class"]  # CPU (3,8)
 
                 for c, cls_name in enumerate(class_names):
                     total = int(totals_raw[c].item())
@@ -1488,13 +1502,15 @@ class DataStatistics:
                     plt.ylabel("Percent(%)")
                     plt.title(f"{metric_name} / {cls_name} (N={total})")
 
-                    hi = float(p_high[c].item())
-                    if hi == hi:
-                        plt.axvline(hi, linestyle="--", linewidth=1.5)
+                    # p=99.9~p=95 수직선 전부 표시 (r_min도 같은 라벨로 표시하되 값은 p0.1~p5에서 옴)
+                    for j, p_hi in enumerate(high_p_list):
+                        x = float(limit_vals[c, j].item())
+                        if x == x:  # NaN 체크
+                            plt.axvline(x, linestyle="--", linewidth=1.2,
+                                        label=f"p{p_hi:g}")
 
-                    lo = float(p_low[c].item())
-                    if lo == lo:
-                        plt.axvline(lo, linestyle=":", linewidth=1.5)
+                    # 라벨(legend) 표시
+                    plt.legend(fontsize="x-small", ncol=2, loc="upper right")
 
                     plt.tight_layout()
                     save_name = f"{metric_name}_{cls_name}_r{round_id:04d}.png"
@@ -1507,3 +1523,4 @@ class DataStatistics:
         self._hist_raw_values.clear()
 
         return hist_data
+
