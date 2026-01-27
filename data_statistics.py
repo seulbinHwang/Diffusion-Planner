@@ -214,14 +214,14 @@ class DataStatistics:
         r_min : (B, agent_num)
         seg_ctrl_stats_valid_ba: (B, agent_num)
         """
-        (abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min,
-         seg_ctrl_stats_valid_ba) = \
-            self._get_seg_body_control_statistics(seg_body_control, seg_valid, not_low_speed_seg)
-
-        self._set_seg_body_control_statistics(
-            abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min,
-            neighbor_agents_type,
-            values_valid_ba=seg_ctrl_stats_valid_ba,
+        # =========================================================
+        # [NEW] v_b_y / v / a_lat / omega / r : agent-시간축 기반 완화 극값 3개 누적
+        # =========================================================
+        self._accumulate_seg_body_control_statistics_robust(
+            seg_body_control=seg_body_control,     # (B, agent_num, T, 3)
+            seg_valid=seg_valid,                   # (B, agent_num, T)
+            not_low_speed_seg=not_low_speed_seg,   # (B, agent_num, T)
+            neighbor_agents_type=neighbor_agents_type,  # (B, agent_num, 3)
         )
 
 
@@ -251,171 +251,17 @@ class DataStatistics:
         seg_body_angular_accel_max : (B, agent_num)
         seg_ctrl2_stats_valid_ba : (B, agent_num)
         """
-        (seg_body_accel_max, seg_body_angular_accel_max, seg_ctrl2_stats_valid_ba) = \
-            self._get_seg_body_control_2_statistics(
-                seg_body_accel, # (B, agent_num, total_len)
-                seg_body_angular_accel, # (B, agent_num, total_len)
-                seg_valid, # (B, agent_num, total_len)
-                not_low_speed_seg=not_low_speed_seg, # (B, agent_num, total_len)
-            )
-
-
-        self._set_seg_body_control_2_statistics(
-            seg_body_accel_max,
-            seg_body_angular_accel_max,
-            neighbor_agents_type,
-            values_valid_ba=seg_ctrl2_stats_valid_ba,
+        # =========================================================
+        # [NEW] a / alpha : agent-시간축 기반 완화 극값 3개 누적
+        # =========================================================
+        self._accumulate_seg_body_control_2_statistics_robust(
+            seg_body_accel=seg_body_accel,                 # (B, agent_num, T)
+            seg_body_angular_accel=seg_body_angular_accel, # (B, agent_num, T)
+            seg_valid=seg_valid,                           # (B, agent_num, T)
+            not_low_speed_seg=not_low_speed_seg,           # (B, agent_num, T)
+            neighbor_agents_type=neighbor_agents_type,     # (B, agent_num, 3)
         )
 
-    def _get_seg_body_control_2_statistics(
-        self,
-        seg_body_accel: torch.Tensor,         # (B, agent_num, total_len)
-        seg_body_angular_accel: torch.Tensor, # (B, agent_num, total_len)
-        seg_valid: torch.Tensor,              # (B, agent_num, total_len) bool
-        *,
-        not_low_speed_seg: Optional[torch.Tensor] = None,  # (B, agent_num, total_len) bool
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """가속도/각가속도 통계를 '안정적으로' 계산합니다.
-
-        핵심 의도:
-            1) a_max(선형 가속도)는 저속/정지 구간에서 값이 튀기 쉬우므로,
-               speed < v_stop 인 세그먼트는 max 계산 대상에서 제외합니다.
-            2) alpha_max(각가속도)는 위 speed 마스크를 강제로 걸지 않고,
-               기존 유효 구간(seg_valid) 기준으로만 계산합니다.
-            3) 가장자리(edge_trim)와 너무 짧은 유효 구간(min_valid_len)은 기존 규칙대로 제외합니다.
-
-        Args:
-            seg_body_accel: (B, agent_num, T)
-                세그먼트 단위 선형 가속도 값(여기서는 크기 기반).
-            seg_body_angular_accel: (B, agent_num, T)
-                세그먼트 단위 각가속도 값.
-            seg_valid: (B, agent_num, T) bool
-                양 끝 노드가 유효한 세그먼트 마스크.
-            not_low_speed_seg: (B, agent_num, T) bool 또는 None
-                True인 세그먼트만 a_max 계산에 포함합니다.
-                None이면 speed 조건을 적용하지 않습니다.
-
-        Returns:
-            seg_body_accel_max         : (B, agent_num) float32
-            seg_body_angular_accel_max : (B, agent_num) float32
-            stats_valid_ba             : (B, agent_num) bool
-        """
-        edge_trim = self.config.stats_edge_trim
-        min_valid_len = self.config.stats_min_valid_len
-
-        # seg_valid_stats: (B,agent,T)
-        # agent_stats_valid: (B,agent)
-        seg_valid_stats, agent_stats_valid = self._build_seg_valid_for_stats(
-            seg_valid=seg_valid.to(torch.bool),
-            edge_trim=edge_trim,
-            min_valid_len=min_valid_len,
-        )
-        seg_body_accel_max, ok1 = self._masked_abs_max(seg_body_accel, seg_valid_stats)
-
-        # a_max 계산 마스크: seg_valid_stats + (옵션) 저속 제외 마스크
-        if not_low_speed_seg is not None:
-            seg_valid_stats = seg_valid_stats & not_low_speed_seg.to(torch.bool)
-
-        seg_body_angular_accel_max, ok2 = self._masked_abs_max(seg_body_angular_accel, seg_valid_stats)
-
-        stats_valid_ba = agent_stats_valid & ok1 & ok2
-        return seg_body_accel_max, seg_body_angular_accel_max, stats_valid_ba
-
-    def _get_seg_body_control_statistics(
-            self,
-            seg_body_control: torch.Tensor,  # (B, agent_num, total_len, 3)
-            seg_valid: torch.Tensor,  # (B, agent_num, total_len) bool
-            not_low_speed_seg: torch.Tensor,  # (B, agent_num, total_len) bool
-    ) -> Tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """속도/각속도 관련 통계를 '안정적으로' 계산합니다.
-
-        반영된 규칙(요청사항):
-            1) v_y^b 는 저속(not_low_speed_seg=False) 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
-               -> abs_v_y_b_max가 자연스럽게 바뀝니다.
-            2) omega_max(abs_omega_max)는 저속(not_low_speed_seg=False) 구간을 max 계산에서 제외합니다.
-               (omega 텐서 자체는 바꾸지 않습니다.)
-               단, 제외 결과로 표본이 하나도 없으면 omega_max는 0으로 두고 유효로 취급합니다.
-            3) a_y_lat(v*|omega|)도 저속 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
-               -> abs_a_y_lat_max가 자연스럽게 바뀝니다.
-            4) r_min의 저속 제외 기준은 별도(stats_r_min_v_min_*)를 쓰지 않고,
-               accel에서 쓰는 v_stop 기준(=not_low_speed_seg 생성 기준)으로 통일합니다.
-               보행자는 r_min에서 속도 조건을 적용하지 않습니다(항상 포함).
-
-        Returns:
-            abs(v_y^b)_max    : (B, agent_num) float32
-            abs(v)_max        : (B, agent_num) float32
-            abs(ω)_max        : (B, agent_num) float32
-            abs(a_y_lat)_max  : (B, agent_num) float32
-            R_min             : (B, agent_num) float32
-            stats_valid_ba    : (B, agent_num) bool
-        """
-        edge_trim = self.config.stats_edge_trim
-        min_valid_len = self.config.stats_min_valid_len
-
-        # seg_valid_stats: (B,agent,T)
-        # agent_stats_valid: (B,agent)
-        seg_valid_stats, agent_stats_valid = self._build_seg_valid_for_stats(
-            seg_valid=seg_valid.to(torch.bool),  # (B,agent,T)
-            edge_trim=edge_trim,
-            min_valid_len=min_valid_len,
-        )
-
-        not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
-
-        # 값 분해
-        v_y_b = seg_body_control[:, :, :, 1]  # (B,agent,T)
-        omega = seg_body_control[:, :, :, 2]  # (B,agent,T)
-
-        v = torch.norm(seg_body_control[:, :, :, 0:2], dim=-1)  # (B,agent,T)
-        a_y_lat = v * omega.abs()  # (B,agent,T)
-        r = v / (omega.abs() + 1e-6)  # (B,agent,T)
-
-        # ================================
-        # (1) v_y_b 저속 구간 값 0으로 정리
-        # ================================
-        v_y_b_for_stats = torch.where(
-            not_low_speed_seg, v_y_b, torch.zeros_like(v_y_b)
-        )  # (B,agent,T)
-
-        # ================================
-        # (3) a_y_lat 저속 구간 값 0으로 정리
-        # ================================
-        # TODO: why?
-        a_y_lat_for_stats = torch.where(
-            not_low_speed_seg, a_y_lat, torch.zeros_like(a_y_lat)
-        )  # (B,agent,T)
-
-        # (v_y_b, v, a_y_lat)은 seg_valid_stats 기준으로 계산 (값이 0으로 정리되므로 max가 자연히 안정화됨)
-        # abs_v_y_b_max: (B,agent)
-        abs_v_y_b_max, ok1 = self._masked_abs_max(v_y_b_for_stats,
-                                                  seg_valid_stats)
-        # abs_v_max: (B,agent)
-        abs_v_max, ok2 = self._masked_abs_max(v, seg_valid_stats)
-        # abs_a_y_lat_max: (B,agent)
-        abs_a_y_lat_max, ok4 = self._masked_abs_max(a_y_lat_for_stats,
-                                                    seg_valid_stats)
-
-        # ================================
-        # (2) omega_max는 저속 구간을 "제외"해서 계산 (omega 값 자체는 변경 안 함)
-        # ================================
-        omega_valid_mask = seg_valid_stats & not_low_speed_seg  # (B,agent,T)
-        abs_omega_max, ok3 = self._masked_abs_max(omega, omega_valid_mask)
-
-        # 저속 제외로 인해 표본이 0개면 omega_max=0으로 두고 유효 처리
-        has_omega_sample = omega_valid_mask.any(dim=2)  # (B,agent)
-        ok3 = ok3 | ((~has_omega_sample) & agent_stats_valid)  # (B,agent)
-
-        # ================================
-        # (4) r_min: not_low_speed_seg(=v_stop 기준)으로 통일
-        # ================================
-        r_valid_stats = seg_valid_stats & not_low_speed_seg  # (B,agent,T)
-        r_min, ok5 = self._masked_min(r, r_valid_stats, invalid_fill=1.0e6)
-
-        stats_valid_ba = agent_stats_valid & ok1 & ok2 & ok3 & ok4 & ok5  # (B,agent)
-
-        return abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min, stats_valid_ba
 
     # =========================================================
 # [NEW] Mask 검증/SG 미분 유틸 (DataStatistics 내부 구현)
@@ -989,240 +835,404 @@ class DataStatistics:
         # [NEW] 원본 대표값 저장(퍼센트 계산용)
         self._hist_raw_values[metric_name] = [[], [], []]
 
-    def _accumulate_metric_per_batch(
-            self,
-            metric_name: str,
-            values_ba: torch.Tensor,  # (B, agent_num)
-            neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
-            *,
-            bin_width: float,
-            max_edge: float,
-            ignore_above: Optional[float] = None,
-            values_valid_ba: Optional[torch.Tensor] = None,
-            # (B, agent_num) bool
-            reduce: str = "max",
-    ) -> None:
-        """배치 1회 호출에서, scene 단위 대표값을 누적합니다.
 
-        - 기본은 scene마다 "최댓값(max)"을 대표로 누적합니다.
-        - r_min 같은 경우는 의미상 "최솟값(min)"을 대표로 누적해야 하므로 reduce="min"을 사용합니다.
-        - 퍼센트 지점(p1/p99 등)은 counts 근사가 아니라, 여기서 모은 원본 대표값으로 계산합니다.
+    def _select_robust_extremes_per_agent(
+        self,
+        values_bat: torch.Tensor,  # (B, agent_num, T)
+        mask_bat: torch.Tensor,    # (B, agent_num, T) bool
+        *,
+        reduce: str,
+        top_k: int = 7,
+        pick_n: int = 3,
+        fallback_value: Optional[float] = None,
+        fallback_valid_ba: Optional[torch.Tensor] = None,  # (B, agent_num) bool
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """agent별 시간축 값에서 '완화된 극값' pick_n개를 뽑습니다.
+
+        의도:
+            - 그냥 max/min 1개는 튀는 값(노이즈)에 너무 민감할 수 있습니다.
+            - 그래서 각 agent의 시간축 값들 중
+              - max 계열: 상위 top_k개 중 가운데 pick_n개
+              - min 계열: 하위 top_k개 중 가운데 pick_n개
+              를 선택합니다.
+
+        동작 요약:
+            1) mask=True 인 위치만 후보로 둡니다.
+            2) reduce="max"면 상위 top_k개를 뽑고(큰 값 기준),
+               reduce="min"면 하위 top_k개를 뽑습니다(작은 값 기준).
+            3) 그 top_k개(또는 가능한 개수) 안에서 가운데 pick_n개를 고릅니다.
 
         Args:
-            metric_name: 지표 이름
-            values_ba: (B, agent_num)
-            neighbor_agents_type: (B, agent_num, 3)
-            bin_width: 히스토그램 bin 폭
-            max_edge: 히스토그램 최대 경계
-            ignore_above: 이 값 이상은 제외(None이면 미사용)
-            values_valid_ba: (B, agent_num) bool. False인 agent는 제외
+            values_bat: (B, agent_num, T)
+                agent별 시간축 값.
+            mask_bat: (B, agent_num, T) bool
+                값이 유효한 위치만 True.
             reduce: "max" 또는 "min"
+            top_k: 기본 7 (요청사항)
+            pick_n: 기본 3 (요청사항)
+            fallback_value:
+                - None이면: 유효 값이 pick_n개 미만인 agent는 "무효" 처리합니다.
+                - 값이 있으면: 유효 값이 pick_n개 미만인 agent는 fallback_value로 채웁니다.
+            fallback_valid_ba: (B, agent_num) bool
+                fallback을 쓸 때, 이 마스크가 True인 agent는 "유효"로 간주할지 결정합니다.
 
         Returns:
-            None
+            selected_baK: (B, agent_num, pick_n) float32
+                agent별 선택된 값 pick_n개.
+            selected_valid_ba: (B, agent_num) bool
+                선택이 정상적으로 되었는지(또는 fallback으로 유효 처리했는지).
         """
-        if values_ba.dim() != 2:
+        if values_bat.dim() != 3 or mask_bat.dim() != 3 or values_bat.shape != mask_bat.shape:
             raise ValueError(
-                f"values_ba must be (B,agent_num). got={tuple(values_ba.shape)}")
-        if neighbor_agents_type.dim() != 3 or neighbor_agents_type.shape[
-            :2] != values_ba.shape:
-            raise ValueError(
-                f"neighbor_agents_type must be (B,agent_num,3) and match values_ba. "
-                f"got type={tuple(neighbor_agents_type.shape)}, values={tuple(values_ba.shape)}"
+                f"values/mask must be same shape (B,agent,T). values={tuple(values_bat.shape)}, mask={tuple(mask_bat.shape)}"
             )
-        if values_valid_ba is not None and values_valid_ba.shape != values_ba.shape:
-            raise ValueError(
-                f"values_valid_ba must match values_ba shape. "
-                f"valid={tuple(values_valid_ba.shape)}, values={tuple(values_ba.shape)}"
-            )
+
+        B, A, T = values_bat.shape
 
         reduce_mode = str(reduce).lower().strip()
         if reduce_mode not in ("max", "min"):
             raise ValueError(f"reduce must be 'max' or 'min'. got={reduce}")
 
-        device = values_ba.device
+        values = values_bat.to(torch.float32)     # (B,A,T)
+        mask = mask_bat.to(torch.bool)            # (B,A,T)
+
+        if reduce_mode == "max":
+            fill = float("-inf")
+            largest = True
+        else:
+            fill = float("inf")
+            largest = False
+
+        # 마스크 밖은 -inf/inf로 채워 topk에서 자동 배제되게 함
+        masked = values.masked_fill(~mask, fill)  # (B,A,T)
+
+        k = int(min(max(1, int(top_k)), T))        # top_k는 고정이지만 T보다 클 수는 없음
+        pick = int(max(1, int(pick_n)))
+
+        # topk 추출 (max면 큰 값 topk, min이면 작은 값 topk)
+        top_vals = torch.topk(masked, k=k, dim=2, largest=largest, sorted=True).values  # (B,A,k)
+
+        finite = torch.isfinite(top_vals)          # (B,A,k)
+        valid_count = finite.sum(dim=2)            # (B,A)
+        ok = valid_count >= pick                   # (B,A)
+
+        # 유효 개수(valid_count) 안에서 가운데 pick개 선택
+        # 예) k=7이면 valid_count=7 -> start=2 -> 3,4,5번째(0-index 2,3,4)
+        start = ((valid_count - pick) // 2).clamp(min=0)  # (B,A)
+
+        base = torch.arange(pick, device=values_bat.device).view(1, 1, pick)  # (1,1,pick)
+        idx = (start.unsqueeze(-1) + base).clamp(min=0, max=k - 1).to(torch.long)  # (B,A,pick)
+
+        selected = torch.gather(top_vals, dim=2, index=idx)  # (B,A,pick)
+
+        if fallback_value is not None:
+            fallback = torch.full_like(selected, float(fallback_value))  # (B,A,pick)
+            selected = torch.where(ok.unsqueeze(-1), selected, fallback)
+
+            if fallback_valid_ba is None:
+                selected_valid = ok
+            else:
+                fb = fallback_valid_ba.to(torch.bool)
+                selected_valid = ok | ((~ok) & fb)
+        else:
+            # 무효 agent는 NaN으로 채워서 이후 isfinite 필터에서 빠지게 함
+            selected = torch.where(ok.unsqueeze(-1), selected, torch.full_like(selected, float("nan")))
+            selected_valid = ok
+
+        return selected, selected_valid
+
+    def _accumulate_metric_from_agent_samples(
+        self,
+        metric_name: str,
+        samples_baK: torch.Tensor,           # (B, agent_num, K)
+        neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
+        *,
+        bin_width: float,
+        max_edge: float,
+        samples_valid_ba: torch.Tensor,      # (B, agent_num) bool
+    ) -> None:
+        """agent 샘플들을 타입별로 모아 히스토그램/원본값을 누적합니다.
+
+        여기서 "샘플"은 scene 대표값 1개가 아니라,
+        agent마다 뽑아낸 대표 극값 K개(예: 3개)입니다.
+
+        Args:
+            metric_name: 지표 이름
+            samples_baK: (B, agent_num, K)
+                agent별 샘플 K개.
+            neighbor_agents_type: (B, agent_num, 3)
+                [vehicle, pedestrian, bicycle] 타입 마스크(원-핫에 준하는 값).
+            bin_width: 히스토그램 bin 폭
+            max_edge: 히스토그램 최대 경계
+            samples_valid_ba: (B, agent_num) bool
+                True인 agent만 샘플을 통계에 포함합니다.
+
+        Returns:
+            None
+        """
+        if samples_baK.dim() != 3:
+            raise ValueError(f"samples_baK must be (B,agent,K). got={tuple(samples_baK.shape)}")
+        if neighbor_agents_type.dim() != 3 or neighbor_agents_type.shape[:2] != samples_baK.shape[:2]:
+            raise ValueError(
+                f"neighbor_agents_type must be (B,agent,3) and match samples_baK[:2]. "
+                f"type={tuple(neighbor_agents_type.shape)}, samples={tuple(samples_baK.shape)}"
+            )
+        if samples_valid_ba.shape != samples_baK.shape[:2]:
+            raise ValueError(
+                f"samples_valid_ba must be (B,agent). got={tuple(samples_valid_ba.shape)}"
+            )
+
+        device = samples_baK.device
         self._ensure_metric_histogram(
-            metric_name,
+            metric_name=metric_name,
             bin_width=float(bin_width),
             max_edge=float(max_edge),
             device=device,
         )
 
         hist = self._histograms[metric_name]
-        edges: torch.Tensor = hist["edges"]  # (num_bins+1,)
+        edges: torch.Tensor = hist["edges"]    # (num_bins+1,)
         counts: torch.Tensor = hist["counts"]  # (3, num_bins)
         num_bins = int(counts.shape[1])
         max_edge_f = float(hist["max_edge"])
-
-        values = values_ba.detach()  # (B, agent_num)
-        type_mask = (
-                    neighbor_agents_type.detach() > 0.5)  # (B, agent_num, 3) bool
-        valid_mask_ba = None if values_valid_ba is None else values_valid_ba.detach().to(
-            torch.bool)  # (B,agent)
-
-        if torch.is_floating_point(values):
-            fill_min = torch.finfo(values.dtype).min
-            fill_max = torch.finfo(values.dtype).max
-        else:
-            fill_min = torch.iinfo(values.dtype).min
-            fill_max = torch.iinfo(values.dtype).max
-
-        fill_val = fill_min if reduce_mode == "max" else fill_max
         eps = 1.0e-6
 
+        type_mask = (neighbor_agents_type.detach() > 0.5)      # (B,agent,3) bool
+        valid_ba = samples_valid_ba.detach().to(torch.bool)    # (B,agent)
+
         for c in range(3):
-            # mask_ba: (B, agent_num)
-            mask_ba = type_mask[:, :, c]
+            # agent 단위로 타입 + 유효성 반영
+            agent_mask = type_mask[:, :, c] & valid_ba         # (B,agent)
 
-            # agent 단위 유효성 반영
-            if valid_mask_ba is not None:
-                mask_ba = mask_ba & valid_mask_ba
+            # 샘플 단위 마스크: (B,agent,K)
+            sample_mask = agent_mask.unsqueeze(-1) & torch.isfinite(samples_baK)
 
-            if ignore_above is not None:
-                mask_ba = mask_ba & (values < float(ignore_above))
+            vals = samples_baK[sample_mask].to(torch.float32)  # (N,)
+            if vals.numel() == 0:
+                continue
 
-            # scene 내에 해당 타입 agent가 "유효하게" 존재하는지
-            has_b = mask_ba.any(dim=1)  # (B,)
+            # 원본 샘플 저장(퍼센트 계산용)
+            self._hist_raw_values[metric_name][c].append(vals.detach().cpu())
 
-            masked = values.masked_fill(~mask_ba, fill_val)  # (B, agent_num)
-
-            if reduce_mode == "max":
-                per_b = masked.max(dim=1).values  # (B,)
-            else:
-                per_b = masked.min(dim=1).values  # (B,)
-
-            # NaN/Inf는 통계에서 제외
-            has_b = has_b & torch.isfinite(per_b)  # (B,)
-
-            # 히스토그램 누적 (has_b==False는 weights=0이므로 영향 없음)
-            per_b_safe = torch.where(has_b, per_b,
-                                     torch.zeros_like(per_b))  # (B,)
-            v32 = per_b_safe.to(torch.float32).clamp(min=0.0,
-                                                     max=max_edge_f - eps)  # (B,)
-
-            idx = torch.bucketize(v32, edges, right=False) - 1  # (B,)
+            # 히스토그램 누적
+            v32 = vals.clamp(min=0.0, max=max_edge_f - eps)      # (N,)
+            idx = torch.bucketize(v32, edges, right=False) - 1   # (N,)
             idx = idx.clamp(min=0, max=num_bins - 1).to(torch.int64)
 
-            weights = has_b.to(torch.long)  # (B,)
-
             add = torch.zeros((num_bins,), device=device, dtype=torch.long)
-            add.scatter_add_(0, idx, weights)
+            add.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.long))
             counts[c] += add
 
-            # [NEW] 원본 대표값 저장(퍼센트 계산용): (N,) CPU
-            raw = per_b.detach().to(torch.float32)
-            raw = raw[has_b].cpu()
-            if raw.numel() > 0:
-                self._hist_raw_values[metric_name][c].append(raw)
-
-            # 참고용 최대값(원하면 제거 가능)
-            per_b_valid = per_b.to(torch.float32).masked_fill(~has_b,
-                                                              float("-inf"))
-            call_max = per_b_valid.max()
+            # 참고용 최대값
             self._hist_max_values[metric_name][c] = torch.maximum(
                 self._hist_max_values[metric_name][c],
-                call_max,
+                vals.max(),
             )
 
-    # =========================================================
-    # [IMPLEMENT] _set_seg_body_control_2_statistics
-    # =========================================================
-    def _set_seg_body_control_2_statistics(
+    def _accumulate_metric_agent_robust_extremes(
         self,
-        seg_body_accel_max: torch.Tensor,          # (B, agent_num)
-        seg_body_angular_accel_max: torch.Tensor,  # (B, agent_num)
-        neighbor_agents_type: torch.Tensor,        # (B, agent_num, 3)
+        metric_name: str,
+        values_bat: torch.Tensor,            # (B, agent_num, T)
+        mask_bat: torch.Tensor,              # (B, agent_num, T) bool
+        neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
         *,
-        values_valid_ba: Optional[torch.Tensor] = None,  # (B, agent_num) bool
+        bin_width: float,
+        max_edge: float,
+        reduce: str,
+        ignore_above: Optional[float] = None,
+        base_valid_ba: Optional[torch.Tensor] = None,     # (B,agent) bool
+        fallback_value: Optional[float] = None,
+        fallback_valid_ba: Optional[torch.Tensor] = None, # (B,agent) bool
+        top_k: int = 7,
+        pick_n: int = 3,
     ) -> None:
-        """a_max/alpha_max 히스토그램 누적. values_valid_ba가 있으면 그 agent는 제외합니다."""
-        self._accumulate_metric_per_batch(
-            metric_name="a_max",
-            values_ba=seg_body_accel_max,
-            neighbor_agents_type=neighbor_agents_type,
-            bin_width=2.0,
-            max_edge=30.0,
-            values_valid_ba=values_valid_ba,
+        """시간축 값 -> (상/하위 7개 중 가운데 3개) -> 타입별 누적까지 한 번에 처리합니다.
+
+        Args:
+            metric_name: 지표 이름
+            values_bat: (B, agent_num, T)
+            mask_bat: (B, agent_num, T) bool
+            neighbor_agents_type: (B, agent_num, 3)
+            bin_width, max_edge: 히스토그램 설정
+            reduce: "max" 또는 "min"
+            ignore_above: 값이 너무 큰 경우(예: r에서 분모가 거의 0) 제외용
+            base_valid_ba: (B,agent) bool
+                False인 agent는 통계에서 제외합니다.
+            fallback_value/fallback_valid_ba:
+                유효 값이 pick_n개 미만일 때 처리 방식.
+            top_k/pick_n: 기본 (7,3)
+
+        Returns:
+            None
+        """
+        if ignore_above is not None:
+            mask_bat = mask_bat & (values_bat < float(ignore_above))
+
+        selected_baK, selected_ok_ba = self._select_robust_extremes_per_agent(
+            values_bat=values_bat,
+            mask_bat=mask_bat,
+            reduce=reduce,
+            top_k=int(top_k),
+            pick_n=int(pick_n),
+            fallback_value=fallback_value,
+            fallback_valid_ba=fallback_valid_ba,
         )
 
-        self._accumulate_metric_per_batch(
-            metric_name="alpha_max",
-            values_ba=seg_body_angular_accel_max,
+        if base_valid_ba is not None:
+            selected_ok_ba = selected_ok_ba & base_valid_ba.to(torch.bool)
+
+        self._accumulate_metric_from_agent_samples(
+            metric_name=metric_name,
+            samples_baK=selected_baK,
             neighbor_agents_type=neighbor_agents_type,
-            bin_width=1.0,
-            max_edge=20.0,
-            values_valid_ba=values_valid_ba,
+            bin_width=float(bin_width),
+            max_edge=float(max_edge),
+            samples_valid_ba=selected_ok_ba,
         )
 
-
-
-    # =========================================================
-    # [IMPLEMENT] _set_seg_body_control_statistics
-    # =========================================================
-    def _set_seg_body_control_statistics(
-            self,
-            abs_v_y_b_max: torch.Tensor,  # (B, agent_num)
-            abs_v_max: torch.Tensor,  # (B, agent_num)
-            abs_omega_max: torch.Tensor,  # (B, agent_num)
-            abs_a_y_lat_max: torch.Tensor,  # (B, agent_num)
-            r_min: torch.Tensor,  # (B, agent_num)
-            neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
-            *,
-            values_valid_ba: Optional[torch.Tensor] = None,
-            # (B, agent_num) bool
+    def _accumulate_seg_body_control_statistics_robust(
+        self,
+        seg_body_control: torch.Tensor,        # (B, agent_num, T, 3)
+        seg_valid: torch.Tensor,              # (B, agent_num, T) bool
+        not_low_speed_seg: torch.Tensor,       # (B, agent_num, T) bool
+        neighbor_agents_type: torch.Tensor,    # (B, agent_num, 3)
     ) -> None:
-        """v/omega 관련 히스토그램 누적. values_valid_ba가 있으면 그 agent는 제외합니다."""
-        self._accumulate_metric_per_batch(
+        """v_b_y / v / a_lat / omega / r 을 'agent 시간축 완화 극값 3개' 방식으로 누적합니다."""
+        edge_trim = int(self.config.stats_edge_trim)
+        min_valid_len = int(self.config.stats_min_valid_len)
+
+        seg_valid_stats, agent_stats_valid = self._build_seg_valid_for_stats(
+            seg_valid=seg_valid.to(torch.bool),
+            edge_trim=edge_trim,
+            min_valid_len=min_valid_len,
+        )  # (B,agent,T), (B,agent)
+
+        not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
+
+        # 값 분해
+        v_y_b = seg_body_control[..., 1]  # (B,agent,T)
+        omega = seg_body_control[..., 2]  # (B,agent,T)
+
+        v = torch.norm(seg_body_control[..., 0:2], dim=-1)  # (B,agent,T)
+        a_lat = v * omega.abs()                             # (B,agent,T)
+        r = v / (omega.abs() + 1e-6)                        # (B,agent,T)
+
+        # 저속 구간 정리(기존 코드 의도 유지)
+        v_y_b_for_stats = torch.where(not_low_speed_seg, v_y_b, torch.zeros_like(v_y_b))  # (B,agent,T)
+        a_lat_for_stats = torch.where(not_low_speed_seg, a_lat, torch.zeros_like(a_lat)) # (B,agent,T)
+
+        # v_b_y_max: 상위7개 중 가운데3개 (abs 기준)
+        self._accumulate_metric_agent_robust_extremes(
             metric_name="v_b_y_max",
-            values_ba=abs_v_y_b_max,
+            values_bat=v_y_b_for_stats.abs(),     # (B,agent,T)
+            mask_bat=seg_valid_stats,             # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
             bin_width=0.1,
             max_edge=30.0,
-            values_valid_ba=values_valid_ba,
             reduce="max",
+            base_valid_ba=agent_stats_valid,
         )
 
-        self._accumulate_metric_per_batch(
+        # v_max
+        self._accumulate_metric_agent_robust_extremes(
             metric_name="v_max",
-            values_ba=abs_v_max,
+            values_bat=v,                          # (B,agent,T)
+            mask_bat=seg_valid_stats,              # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
             bin_width=3.0,
             max_edge=30.0,
-            values_valid_ba=values_valid_ba,
             reduce="max",
+            base_valid_ba=agent_stats_valid,
         )
 
-        self._accumulate_metric_per_batch(
+        # a_lat_max
+        self._accumulate_metric_agent_robust_extremes(
             metric_name="a_lat_max",
-            values_ba=abs_a_y_lat_max,
+            values_bat=a_lat_for_stats,            # (B,agent,T)
+            mask_bat=seg_valid_stats,              # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
             bin_width=2.0,
             max_edge=30.0,
-            values_valid_ba=values_valid_ba,
             reduce="max",
+            base_valid_ba=agent_stats_valid,
         )
 
-        # [FIX] r_min은 scene 대표값을 "최솟값"으로 누적해야 의미가 맞습니다.
-        self._accumulate_metric_per_batch(
-            metric_name="r_min",
-            values_ba=r_min,
-            neighbor_agents_type=neighbor_agents_type,
-            bin_width=1.0,
-            max_edge=100.0,
-            ignore_above=1.0e5,
-            values_valid_ba=values_valid_ba,
-            reduce="min",
-        )
-
-        self._accumulate_metric_per_batch(
+        # omega_max: 저속 구간은 mask에서 제외(기존 코드 의도 유지)
+        omega_mask = seg_valid_stats & not_low_speed_seg  # (B,agent,T)
+        # 예외적으로, omega_mask에서 유효값이 너무 적으면 0으로 채워 유효 처리(기존 코드와 비슷한 취지)
+        self._accumulate_metric_agent_robust_extremes(
             metric_name="omega_max",
-            values_ba=abs_omega_max,
+            values_bat=omega.abs(),                # (B,agent,T)
+            mask_bat=omega_mask,                   # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
             bin_width=0.3,
             max_edge=9.3,
-            values_valid_ba=values_valid_ba,
             reduce="max",
+            base_valid_ba=agent_stats_valid,
+            fallback_value=0.0,
+            fallback_valid_ba=agent_stats_valid,
         )
+
+        # r_min: 하위7개 중 가운데3개
+        r_mask = seg_valid_stats & not_low_speed_seg  # (B,agent,T)
+        self._accumulate_metric_agent_robust_extremes(
+            metric_name="r_min",
+            values_bat=r,                          # (B,agent,T)
+            mask_bat=r_mask,                       # (B,agent,T)
+            neighbor_agents_type=neighbor_agents_type,
+            bin_width=1.0,
+            max_edge=100.0,
+            reduce="min",
+            ignore_above=1.0e5,
+            base_valid_ba=agent_stats_valid,
+        )
+
+    def _accumulate_seg_body_control_2_statistics_robust(
+        self,
+        seg_body_accel: torch.Tensor,             # (B, agent_num, T)
+        seg_body_angular_accel: torch.Tensor,     # (B, agent_num, T)
+        seg_valid: torch.Tensor,                  # (B, agent_num, T) bool
+        not_low_speed_seg: torch.Tensor,          # (B, agent_num, T) bool
+        neighbor_agents_type: torch.Tensor,       # (B, agent_num, 3)
+    ) -> None:
+        """a / alpha 를 'agent 시간축 완화 극값 3개' 방식으로 누적합니다."""
+        edge_trim = int(self.config.stats_edge_trim)
+        min_valid_len = int(self.config.stats_min_valid_len)
+
+        seg_valid_stats, agent_stats_valid = self._build_seg_valid_for_stats(
+            seg_valid=seg_valid.to(torch.bool),
+            edge_trim=edge_trim,
+            min_valid_len=min_valid_len,
+        )  # (B,agent,T), (B,agent)
+
+        # a_max: 저속 제외를 한 번 더 확실히 적용(원하면 seg_valid_stats만 써도 됩니다)
+        accel_mask = seg_valid_stats & not_low_speed_seg.to(torch.bool)  # (B,agent,T)
+
+        self._accumulate_metric_agent_robust_extremes(
+            metric_name="a_max",
+            values_bat=seg_body_accel.to(torch.float32),  # (B,agent,T)
+            mask_bat=accel_mask,                          # (B,agent,T)
+            neighbor_agents_type=neighbor_agents_type,
+            bin_width=2.0,
+            max_edge=30.0,
+            reduce="max",
+            base_valid_ba=agent_stats_valid,
+        )
+
+        # alpha_max: abs 기준, seg_valid_stats 기준
+        self._accumulate_metric_agent_robust_extremes(
+            metric_name="alpha_max",
+            values_bat=seg_body_angular_accel.abs().to(torch.float32),  # (B,agent,T)
+            mask_bat=seg_valid_stats,                                   # (B,agent,T)
+            neighbor_agents_type=neighbor_agents_type,
+            bin_width=1.0,
+            max_edge=20.0,
+            reduce="max",
+            base_valid_ba=agent_stats_valid,
+        )
+
+
+
 
     @staticmethod
     def _percentile_value_from_raw(
@@ -1282,16 +1292,18 @@ class DataStatistics:
         return float(v_sorted[idx].item())
 
 
-
-
     def draw_histograms(self) -> Dict[str, Dict[str, Any]]:
-        """누적된 히스토그램 데이터를 정리하고, p1/p99를 원본 값으로 정확히 계산해 출력/표시합니다.
+        """누적된 히스토그램 데이터를 정리하고, 타입별 '한계값'을 여러 퍼센트로 출력합니다.
 
-        변경점(요청사항 반영):
-            - p_low/p_high를 counts 기반 근사로 구하지 않습니다.
-            - 배치마다 누적해 둔 원본 대표값으로 p_low/p_high를 계산합니다.
-            - r_min은 누적 자체가 scene 최솟값 기준으로 들어오므로,
-              이름과 의미가 일치합니다.
+        현재 누적 기준:
+            - scene 대표값 1개가 아니라,
+            - agent별 시간축에서 뽑은 '완화된 극값 3개' 샘플을 누적합니다.
+
+        출력 규칙(요청사항):
+            - v_b_y_max / v_max / a_lat_max / omega_max / a_max / alpha_max:
+                상위 P = 99.9 / 99.5 / 99 / 98.5 / 98 / 97 / 96 / 95
+            - r_min:
+                하위 P = 0.1 / 0.5 / 1 / 1.5 / 2 / 3 / 4 / 5
 
         Returns:
             hist_data: metric_name -> {
@@ -1299,10 +1311,12 @@ class DataStatistics:
                 "counts": (3, num_bins) CPU tensor
                 "percent": (3, num_bins) CPU tensor (0~100)
                 "total_per_class": (3,) CPU tensor  (counts 기준)
-                "raw_total_per_class": (3,) CPU tensor (원본 대표값 개수 = p계산에 실제 사용)
+                "raw_total_per_class": (3,) CPU tensor (원본 샘플 개수)
                 "max_per_class": (3,) CPU tensor (참고용)
-                "p_low_per_class": (3,) CPU tensor  (원본 값 기반)
-                "p_high_per_class": (3,) CPU tensor (원본 값 기반)
+                "p_low_per_class": (3,) CPU tensor  (config 기반)
+                "p_high_per_class": (3,) CPU tensor (config 기반)
+                "limit_percentiles": List[float]
+                "limit_values_per_class": (3, P) CPU tensor
                 "bin_width": float
                 "max_edge": float
             }
@@ -1313,9 +1327,8 @@ class DataStatistics:
             print("[draw_histograms] 누적된 통계가 없습니다.")
             return {}
 
-        # ---- 퍼센트 설정 ----
-        q_high = float(
-            getattr(self.config, "hist_print_upper_percentile", 0.99))
+        # (그림에 그릴 p_low/p_high는 기존 config를 그대로 사용)
+        q_high = float(getattr(self.config, "hist_print_upper_percentile", 0.99))
         q_high = max(0.0, min(1.0, q_high))
 
         q_low_cfg = getattr(self.config, "hist_print_lower_percentile", None)
@@ -1325,42 +1338,50 @@ class DataStatistics:
             q_low = float(q_low_cfg)
         q_low = max(0.0, min(1.0, q_low))
 
-        high_pct = q_high * 100.0
-        low_pct = q_low * 100.0
-
         class_names = ["vehicle", "pedestrian", "bicycle"]
+
+        # 요청하신 출력 퍼센트(%) 목록
+        high_p_list = [99.9, 99.5, 99.0, 98.5, 98.0, 97.0, 96.0, 95.0]
+        low_p_list_r = [0.1, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
 
         hist_data: Dict[str, Dict[str, Any]] = {}
         for metric_name, hist in self._histograms.items():
-            edges = hist["edges"].detach().cpu()  # (num_bins+1,)
-            counts = hist["counts"].detach().cpu()  # (3, num_bins)
-            totals = counts.sum(dim=1)  # (3,)
+            edges = hist["edges"].detach().cpu()     # (num_bins+1,)
+            counts = hist["counts"].detach().cpu()   # (3, num_bins)
+            totals = counts.sum(dim=1)               # (3,)
 
-            denom = totals.clamp(min=1).to(torch.float32)  # (3,)
-            percent = counts.to(torch.float32) / denom.unsqueeze(
-                -1) * 100.0  # (3, num_bins)
+            denom = totals.clamp(min=1).to(torch.float32)   # (3,)
+            percent = counts.to(torch.float32) / denom.unsqueeze(-1) * 100.0  # (3, num_bins)
 
-            # 참고용(원하면 제거 가능)
             max_vals = self._hist_max_values.get(
                 metric_name, torch.full((3,), float("nan"))
-            ).detach().cpu()  # (3,)
+            ).detach().cpu()
 
-            # ---- (A) 원본 대표값 기반 p_low/p_high ----
             raw_lists = self._hist_raw_values.get(metric_name, [[], [], []])
 
             raw_totals_list: List[int] = []
             p_low_list: List[float] = []
             p_high_list: List[float] = []
 
+            # 출력용 limit 퍼센트/모드 결정
+            if metric_name == "r_min":
+                limit_pcts = low_p_list_r
+                limit_mode = "lower"
+            else:
+                limit_pcts = high_p_list
+                limit_mode = "higher"
+
+            limit_values_all: List[List[float]] = []  # (3, P)
+
             for c in range(3):
                 if len(raw_lists[c]) == 0:
                     raw_totals_list.append(0)
                     p_low_list.append(float("nan"))
                     p_high_list.append(float("nan"))
+                    limit_values_all.append([float("nan")] * len(limit_pcts))
                     continue
 
-                raw_cat = torch.cat(raw_lists[c], dim=0).to(
-                    torch.float32)  # (N,)
+                raw_cat = torch.cat(raw_lists[c], dim=0).to(torch.float32)  # (N,)
                 raw_cat = raw_cat[torch.isfinite(raw_cat)]
                 n_raw = int(raw_cat.numel())
                 raw_totals_list.append(n_raw)
@@ -1368,57 +1389,65 @@ class DataStatistics:
                 if n_raw <= 0:
                     p_low_list.append(float("nan"))
                     p_high_list.append(float("nan"))
+                    limit_values_all.append([float("nan")] * len(limit_pcts))
                     continue
 
-                v_low = self._percentile_value_from_raw(raw_cat, q_low,
-                                                        mode="lower")
-                v_high = self._percentile_value_from_raw(raw_cat, q_high,
-                                                         mode="higher")
+                # 그림용 p_low/p_high (config 기반)
+                v_low = self._percentile_value_from_raw(raw_cat, q_low, mode="lower")
+                v_high = self._percentile_value_from_raw(raw_cat, q_high, mode="higher")
                 p_low_list.append(v_low)
                 p_high_list.append(v_high)
+
+                # 요청하신 여러 퍼센트 limit 값
+                vals_c: List[float] = []
+                for p in limit_pcts:
+                    q = float(p) / 100.0
+                    vals_c.append(self._percentile_value_from_raw(raw_cat, q, mode=limit_mode))
+                limit_values_all.append(vals_c)
 
             hist_data[metric_name] = {
                 "edges": edges,
                 "counts": counts,
                 "percent": percent,
-                "total_per_class": totals,  # counts 기준
-                "raw_total_per_class": torch.tensor(raw_totals_list,
-                                                    dtype=torch.long),  # 원본값 기준
-                "max_per_class": max_vals,  # 참고용
-                "p_low_per_class": torch.tensor(p_low_list,
-                                                dtype=torch.float32),
-                "p_high_per_class": torch.tensor(p_high_list,
-                                                 dtype=torch.float32),
+                "total_per_class": totals,
+                "raw_total_per_class": torch.tensor(raw_totals_list, dtype=torch.long),
+                "max_per_class": max_vals,
+                "p_low_per_class": torch.tensor(p_low_list, dtype=torch.float32),
+                "p_high_per_class": torch.tensor(p_high_list, dtype=torch.float32),
+                "limit_percentiles": list(limit_pcts),
+                "limit_values_per_class": torch.tensor(limit_values_all, dtype=torch.float32),  # (3,P)
                 "bin_width": float(hist["bin_width"]),
                 "max_edge": float(hist["max_edge"]),
             }
 
         # ---- 출력 ----
-        print(
-            "========== robust scalar stats (from RAW values percentiles) ==========")
+        print("========== robust limits (agent-level, softened extremes) ==========")
         for metric_name in sorted(hist_data.keys()):
-            totals_raw = hist_data[metric_name]["raw_total_per_class"]  # (3,)
-            p_low = hist_data[metric_name]["p_low_per_class"]  # (3,)
-            p_high = hist_data[metric_name]["p_high_per_class"]  # (3,)
+            totals_raw = hist_data[metric_name]["raw_total_per_class"]          # (3,)
+            limit_pcts = hist_data[metric_name]["limit_percentiles"]            # List[float]
+            limit_vals = hist_data[metric_name]["limit_values_per_class"]       # (3,P)
 
             msg_parts = []
             for i, cls in enumerate(class_names):
                 n_i = int(totals_raw[i].item())
-                if n_i <= 0 or (not torch.isfinite(p_high[i])):
+                if n_i <= 0:
                     msg_parts.append(f"{cls}=NA(N={n_i})")
                     continue
 
-                lo = float(p_low[i].item()) if torch.isfinite(
-                    p_low[i]) else float("nan")
-                hi = float(p_high[i].item())
+                vals_i = limit_vals[i]  # (P,)
+                parts_i = []
+                for j, p in enumerate(limit_pcts):
+                    v = float(vals_i[j].item())
+                    if v == v:  # NaN 체크
+                        parts_i.append(f"p{p:g}={v:.6g}")
+                    else:
+                        parts_i.append(f"p{p:g}=nan")
 
-                msg_parts.append(
-                    f"{cls}:p{low_pct:.3g}={lo:.6g},p{high_pct:.3g}={hi:.6g}(N={n_i})"
-                )
+                msg_parts.append(f"{cls}(" + ",".join(parts_i) + f",N={n_i})")
 
             print(f"{metric_name}: " + " | ".join(msg_parts))
 
-        # ---- 히스토그램 이미지 저장 + p_low/p_high 수직선 ----
+        # ---- 히스토그램 이미지 저장(기존 유지: config 기반 p_low/p_high만 수직선) ----
         import os
         try:
             import matplotlib
@@ -1435,18 +1464,15 @@ class DataStatistics:
             round_id = int(self._hist_draw_round)
 
             for metric_name in sorted(hist_data.keys()):
-                edges = hist_data[metric_name]["edges"]  # CPU
+                edges = hist_data[metric_name]["edges"]      # CPU
                 percent = hist_data[metric_name]["percent"]  # CPU (3, num_bins)
-                counts = hist_data[metric_name]["counts"]  # CPU (3, num_bins)
                 bin_width = float(hist_data[metric_name]["bin_width"])
 
-                centers = ((edges[:-1] + edges[
-                    1:]) * 0.5).tolist()  # (num_bins,)
+                centers = ((edges[:-1] + edges[1:]) * 0.5).tolist()  # (num_bins,)
 
-                p_low = hist_data[metric_name]["p_low_per_class"]  # CPU (3,)
+                p_low = hist_data[metric_name]["p_low_per_class"]    # CPU (3,)
                 p_high = hist_data[metric_name]["p_high_per_class"]  # CPU (3,)
-                totals_raw = hist_data[metric_name][
-                    "raw_total_per_class"]  # CPU (3,)
+                totals_raw = hist_data[metric_name]["raw_total_per_class"]  # CPU (3,)
 
                 for c, cls_name in enumerate(class_names):
                     total = int(totals_raw[c].item())
@@ -1463,7 +1489,7 @@ class DataStatistics:
                     plt.title(f"{metric_name} / {cls_name} (N={total})")
 
                     hi = float(p_high[c].item())
-                    if hi == hi:  # NaN 체크
+                    if hi == hi:
                         plt.axvline(hi, linestyle="--", linewidth=1.5)
 
                     lo = float(p_low[c].item())
