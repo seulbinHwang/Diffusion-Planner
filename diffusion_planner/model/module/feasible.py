@@ -1515,8 +1515,94 @@ class FeasibleProjector(nn.Module):
 
         return unnorm_seg_body_control
 
-    # <추가하자>
     def _compute_midpoint_yaw_from_cos_sin(
+            self,
+            cos_all: torch.Tensor,  # (B, Pnn, point_len)
+            sin_all: torch.Tensor,  # (B, Pnn, point_len)
+            start_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
+            end_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
+            eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """두 끝점의 (cos, sin)로부터 '중간 방향'의 (cos, sin)을 계산합니다.
+
+        핵심 아이디어:
+            - 기존 방식(끝 벡터를 평균낸 뒤 정규화)은,
+              두 방향이 서로 반대(또는 거의 반대)일 때 평균 벡터의 크기가 0에 가까워져
+              중간 방향이 쉽게 튀는 문제가 생길 수 있습니다.
+            - 여기서는 (cos, sin)을 각도로 바꾼 뒤(atan2),
+              두 각도의 차이를 [-pi, pi] 범위로 접어서(가장 짧은 회전),
+              그 중간 각도를 사용합니다. 그래서 평균 벡터 크기가 0으로 가는 문제가 없습니다.
+
+        마스크 처리:
+            - start_valid/end_valid는 각 세그먼트의 양 끝 노드 유효 여부(0/1)입니다.
+            - 양 끝이 모두 유효하면: 두 각도로 midpoint를 계산합니다.
+            - 한쪽만 유효하면: 유효한 쪽 각도를 그대로 사용합니다.
+            - 둘 다 무효면: 0 라디안 방향(cos=1, sin=0)을 사용합니다.
+
+        Args:
+            cos_all: (B, Pnn, point_len)
+            sin_all: (B, Pnn, point_len)
+            start_valid: (B, Pnn, segment_len) float {0,1}
+            end_valid: (B, Pnn, segment_len) float {0,1}
+            eps: 작은 값(0으로 나눔 방지 등)
+
+        Returns:
+            cos_mid: (B, Pnn, segment_len)
+            sin_mid: (B, Pnn, segment_len)
+        """
+        # (B, Pnn, segment_len)
+        cos_start = cos_all[..., :-1]
+        sin_start = sin_all[..., :-1]
+        cos_end = cos_all[..., 1:]
+        sin_end = sin_all[..., 1:]
+
+        # float(0/1) -> bool
+        start_ok = start_valid > 0.5
+        end_ok = end_valid > 0.5
+
+        # 값이 NaN/Inf면 무효로 취급(출력 NaN 전파 방지)
+        start_ok = start_ok & torch.isfinite(cos_start) & torch.isfinite(
+            sin_start)
+        end_ok = end_ok & torch.isfinite(cos_end) & torch.isfinite(sin_end)
+
+        # 무효인 곳은 안전한 방향(0rad: cos=1, sin=0)으로 대체
+        cos_start_safe = torch.where(start_ok, cos_start,
+                                     torch.ones_like(cos_start))
+        sin_start_safe = torch.where(start_ok, sin_start,
+                                     torch.zeros_like(sin_start))
+        cos_end_safe = torch.where(end_ok, cos_end, torch.ones_like(cos_end))
+        sin_end_safe = torch.where(end_ok, sin_end, torch.zeros_like(sin_end))
+
+        # 각도(라디안): (B, Pnn, segment_len)
+        yaw_start = torch.atan2(sin_start_safe, cos_start_safe)
+        yaw_end = torch.atan2(sin_end_safe, cos_end_safe)
+
+        # 각도 차이를 [-pi, pi] 범위로 접기(= wrap_to_pi 역할)
+        delta_raw = yaw_end - yaw_start
+        delta = torch.atan2(torch.sin(delta_raw), torch.cos(delta_raw))
+
+        # midpoint 각도
+        yaw_mid = yaw_start + 0.5 * delta
+
+        # 한쪽만 유효한 경우는 유효한 쪽을 그대로 사용(기존 가중 평균과 같은 의도)
+        yaw_mid = torch.where(start_ok & (~end_ok), yaw_start, yaw_mid)
+        yaw_mid = torch.where((~start_ok) & end_ok, yaw_end, yaw_mid)
+        yaw_mid = torch.where((~start_ok) & (~end_ok),
+                              torch.zeros_like(yaw_mid), yaw_mid)
+
+        # 다시 (cos, sin)
+        cos_mid = torch.cos(yaw_mid)
+        sin_mid = torch.sin(yaw_mid)
+
+        # (선택) 혹시 모를 수치 오차 정리(거의 1이지만 안전용)
+        norm = torch.sqrt(cos_mid * cos_mid + sin_mid * sin_mid + eps)
+        cos_mid = cos_mid / norm
+        sin_mid = sin_mid / norm
+
+        return cos_mid, sin_mid
+
+    # <추가하자>
+    def _compute_midpoint_yaw_from_cos_sin_prev(
         self,
         cos_all: torch.Tensor,  # (B, Pnn, point_len)
         sin_all: torch.Tensor,  # (B, Pnn, point_len)
