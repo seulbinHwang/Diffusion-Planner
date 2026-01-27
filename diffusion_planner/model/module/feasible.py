@@ -179,8 +179,8 @@ class FeasibleProjector(nn.Module):
                 DynamicLimits(
                     v_max_mps=5.0,
                     v_max_kmph=5.0 * 3.6,
-                    a_max_mps2=4.4,
-                    alpha_max_radps2=12.5,
+                    a_max_mps2=4.7,
+                    alpha_max_radps2=14.0,
                     a_lat_max_mps2=3.2,
                     R_min_m=0.00001,
                     omega_max_abs_radps=3.3,
@@ -190,12 +190,12 @@ class FeasibleProjector(nn.Module):
                 DynamicLimits(
                     v_max_mps=22.,
                     v_max_kmph=22. * 3.6,
-                    a_max_mps2=5.2,
+                    a_max_mps2=5.5,
                     alpha_max_radps2=6.0,
                     a_lat_max_mps2=4.4,
                     R_min_m=0.5,
-                    omega_max_abs_radps=1.7,
-                    v_b_y_max=1.25,
+                    omega_max_abs_radps=2.0,
+                    v_b_y_max=1.3,
                 ),
             ActorClass.CAR:
                 DynamicLimits(
@@ -205,7 +205,7 @@ class FeasibleProjector(nn.Module):
                     alpha_max_radps2=1.75,
                     a_lat_max_mps2=4.2,
                     R_min_m=4.50,
-                    omega_max_abs_radps=0.8,
+                    omega_max_abs_radps=0.9,
                     v_b_y_max=1.0,
                 ),
         }
