@@ -88,7 +88,7 @@ class DataStatistics:
     def do_data_statistics(self, inputs: Dict[str, Any]):
         """ inputs
         neighbor_agents_past : (B, agent_num, time_len, 11)
-        neighbor_future_gt_3_dim : (B, agent_num, future_len, 3)
+        neighbor_future_gt_11_dim : (B, agent_num, future_len, 11)
 
         neighbor_agents_past_is_valid : (B, agent_num, time_len)
         neighbor_future_gt_is_valid : (B, agent_num, future_len)
@@ -97,10 +97,10 @@ class DataStatistics:
 
         neighbor_agents_past = inputs[
             "neighbor_agents_past"]  # (B, agent_num, time_len, 11)
-        neighbor_future_gt_3_dim = inputs[
-            "neighbor_future_gt_3_dim"]  # (B, agent_num, future_len, 3)
+        neighbor_future_gt_11_dim = inputs[
+            "neighbor_future_gt_11_dim"]  # (B, agent_num, future_len, 11)
 
-        future_len = neighbor_future_gt_3_dim.shape[2]
+        future_len = neighbor_future_gt_11_dim.shape[2]
 
         assert self.config.feasible_stride_dt == 0.1, \
             "DataStatistics assumes feasible_stride_dt == 0.1s"
@@ -129,7 +129,7 @@ class DataStatistics:
         # 4 : x, y, cos(heading), sin(heading)
 
         # neighbor_future_gt_3_dim: (x,y, heading) -> neighbor_future_gt_4_dim: (x,y, cos(heading), sin(heading))
-        neighbor_future_gt_heading = neighbor_future_gt_3_dim[:, :, :, 2:
+        neighbor_future_gt_heading = neighbor_future_gt_11_dim[:, :, :, 2:
                                                               3]  # (B, agent_num, future_len, 1)
         neighbor_future_gt_cos_heading = torch.cos(
             neighbor_future_gt_heading)  # (B, agent_num, future_len, 1)
@@ -137,7 +137,7 @@ class DataStatistics:
             neighbor_future_gt_heading)  # (B, agent_num, future_len, 1)
         neighbor_future_gt_4_dim = torch.cat(
             [
-                neighbor_future_gt_3_dim[:, :, :, 0:2],
+                neighbor_future_gt_11_dim[:, :, :, 0:2],
                 neighbor_future_gt_cos_heading, neighbor_future_gt_sin_heading
             ],
             dim=-1)  # (B, agent_num, future_len, 4)
@@ -182,33 +182,27 @@ class DataStatistics:
                 # (B, Pnn, past_len_ds+1+T_ds) bool
             )
         # segment valid: 노드 유효(점) 마스크의 양 끝 AND
-        node_valid = neighbor_agents_past_cur_future_is_valid.to(
+        points_valid = neighbor_agents_past_cur_future_is_valid.to(
             torch.bool)  # (B, agent_num, time_len+future_len)
-        seg_valid = (node_valid[:, :, :-1] & node_valid[:, :, 1:]
+        seg_valid = (points_valid[:, :, :-1] & points_valid[:, :, 1:]
                     )  # (B, agent_num, past_len+future_len)
-
-
-
         # 속도(저속 제외 마스크용)
         v_x_w = points_world_control[..., 0]  # (B, agent_num, point_len)
         v_y_w = points_world_control[..., 1]  # (B, agent_num, point_len)
 
-        speed_node = torch.sqrt(
+        speed_of_points = torch.sqrt(
             v_x_w * v_x_w + v_y_w * v_y_w)  # (B, agent_num, point_len)
 
         # 타입별 v_stop: (B, agent_num)
-        v_stop_ba = self._get_stats_accel_v_stop_per_agent(
+        v_stop_per_agent = self._get_stats_accel_v_stop_per_agent(
             neighbor_agents_type).to(
-            device=speed_node.device, dtype=speed_node.dtype
+            device=speed_of_points.device, dtype=speed_of_points.dtype
         )  # (B, agent_num)
-        points_valid = node_valid  # (B, agent_num, time_len+future_len) bool
-        points_valid_bool = points_valid.to(torch.bool)
         # 노드 기준 speed_ok: (B, agent_num, point_len)
-        speed_ok_node = points_valid_bool & (
-                    speed_node >= v_stop_ba.unsqueeze(-1))
-
+        not_low_speed_points = points_valid & (
+                    speed_of_points >= v_stop_per_agent.unsqueeze(-1))
         # 세그먼트는 양 끝 노드가 모두 speed_ok 여야 True: (B, agent_num, segment_len)
-        seg_speed_ok = speed_ok_node[..., :-1] & speed_ok_node[..., 1:]
+        not_low_speed_seg = not_low_speed_points[..., :-1] & not_low_speed_points[..., 1:]
 
 
 
@@ -218,11 +212,11 @@ class DataStatistics:
         abs_omega_max : (B, agent_num)
         abs_a_y_lat_max : (B, agent_num)
         r_min : (B, agent_num)
+        seg_ctrl_stats_valid_ba: (B, agent_num)
         """
         (abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min,
          seg_ctrl_stats_valid_ba) = \
-            self._get_seg_body_control_statistics(seg_body_control, seg_valid,
-                                                  neighbor_agents_type, seg_speed_ok)
+            self._get_seg_body_control_statistics(seg_body_control, seg_valid, not_low_speed_seg)
 
         self._set_seg_body_control_statistics(
             abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min,
@@ -240,12 +234,11 @@ class DataStatistics:
                                         context="do_data_statistics.seg_valid")
 
         # [NEW] (x,y,cos,sin) 2차 곡선 기반으로 accel/alpha를 직접 계산
-        # points_xycs: (B, agent_num, point_len, 4)
-        points_xycs = neighbor_agents_past_cur_future_4_dim  # (B, agent_num, time_len+future_len, 4)
-
+        # seg_body_accel: (B, agent_num, total_len)
+        # seg_body_angular_accel: (B, agent_num, total_len)
         seg_body_accel, seg_body_angular_accel = self._compute_seg_body_accel_and_angular_accel_via_poly2(
-            points_xycs=points_xycs,
-            seg_speed_ok=seg_speed_ok,
+            neighbor_agents_past_cur_future_4_dim=neighbor_agents_past_cur_future_4_dim, # (B, agent_num, time_len+future_len, 4)
+            not_low_speed_seg=not_low_speed_seg,
             points_valid=points_valid,
             neighbor_agents_type=neighbor_agents_type,  # ✅ 추가
             dt=dt_for_savgol,
@@ -253,13 +246,17 @@ class DataStatistics:
             max_window_len_yaw=max_window_len_yaw,
             polyorder=2,
         )
-
+        """
+        seg_body_accel_max : (B, agent_num)
+        seg_body_angular_accel_max : (B, agent_num)
+        seg_ctrl2_stats_valid_ba : (B, agent_num)
+        """
         (seg_body_accel_max, seg_body_angular_accel_max, seg_ctrl2_stats_valid_ba) = \
             self._get_seg_body_control_2_statistics(
-                seg_body_accel,
-                seg_body_angular_accel,
-                seg_valid,
-                seg_speed_ok=seg_speed_ok,
+                seg_body_accel, # (B, agent_num, total_len)
+                seg_body_angular_accel, # (B, agent_num, total_len)
+                seg_valid, # (B, agent_num, total_len)
+                not_low_speed_seg=not_low_speed_seg, # (B, agent_num, total_len)
             )
 
 
@@ -276,7 +273,7 @@ class DataStatistics:
         seg_body_angular_accel: torch.Tensor, # (B, agent_num, total_len)
         seg_valid: torch.Tensor,              # (B, agent_num, total_len) bool
         *,
-        seg_speed_ok: Optional[torch.Tensor] = None,  # (B, agent_num, total_len) bool
+        not_low_speed_seg: Optional[torch.Tensor] = None,  # (B, agent_num, total_len) bool
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """가속도/각가속도 통계를 '안정적으로' 계산합니다.
 
@@ -294,7 +291,7 @@ class DataStatistics:
                 세그먼트 단위 각가속도 값.
             seg_valid: (B, agent_num, T) bool
                 양 끝 노드가 유효한 세그먼트 마스크.
-            seg_speed_ok: (B, agent_num, T) bool 또는 None
+            not_low_speed_seg: (B, agent_num, T) bool 또는 None
                 True인 세그먼트만 a_max 계산에 포함합니다.
                 None이면 speed 조건을 적용하지 않습니다.
 
@@ -303,67 +300,47 @@ class DataStatistics:
             seg_body_angular_accel_max : (B, agent_num) float32
             stats_valid_ba             : (B, agent_num) bool
         """
-        if seg_body_accel.dim() != 3 or seg_body_angular_accel.dim() != 3:
-            raise ValueError(
-                f"seg_body_accel/seg_body_angular_accel must be (B,agent,T). "
-                f"accel={tuple(seg_body_accel.shape)}, ang={tuple(seg_body_angular_accel.shape)}"
-            )
-        if seg_body_accel.shape != seg_body_angular_accel.shape:
-            raise ValueError("seg_body_accel and seg_body_angular_accel shape mismatch.")
-        if seg_valid.shape != seg_body_accel.shape:
-            raise ValueError(
-                f"seg_valid must match accel shape. seg_valid={tuple(seg_valid.shape)}, accel={tuple(seg_body_accel.shape)}"
-            )
+        edge_trim = self.config.stats_edge_trim
+        min_valid_len = self.config.stats_min_valid_len
 
-        if seg_speed_ok is not None:
-            if seg_speed_ok.shape != seg_body_accel.shape:
-                raise ValueError(
-                    f"seg_speed_ok must match (B,agent,T). "
-                    f"seg_speed_ok={tuple(seg_speed_ok.shape)}, accel={tuple(seg_body_accel.shape)}"
-                )
-
-        edge_trim = int(getattr(self.config, "stats_edge_trim", 2))
-        min_valid_len = int(getattr(self.config, "stats_min_valid_len_for_accel", 7))
-
-        seg_valid_stats, agent_ok = self._build_seg_valid_for_stats(
+        # seg_valid_stats: (B,agent,T)
+        # agent_stats_valid: (B,agent)
+        seg_valid_stats, agent_stats_valid = self._build_seg_valid_for_stats(
             seg_valid=seg_valid.to(torch.bool),
             edge_trim=edge_trim,
             min_valid_len=min_valid_len,
         )
+        seg_body_accel_max, ok1 = self._masked_abs_max(seg_body_accel, seg_valid_stats)
 
         # a_max 계산 마스크: seg_valid_stats + (옵션) 저속 제외 마스크
-        seg_valid_stats_for_accel = seg_valid_stats
-        if seg_speed_ok is not None:
-            seg_valid_stats_for_accel = seg_valid_stats_for_accel & seg_speed_ok.to(torch.bool)
+        if not_low_speed_seg is not None:
+            seg_valid_stats = seg_valid_stats & not_low_speed_seg.to(torch.bool)
 
+        seg_body_angular_accel_max, ok2 = self._masked_abs_max(seg_body_angular_accel, seg_valid_stats)
 
-        seg_body_accel_max, ok1 = self._masked_abs_max(seg_body_accel, seg_valid_stats_for_accel)
-        seg_body_angular_accel_max, ok2 = self._masked_abs_max(seg_body_angular_accel, seg_valid_stats_for_accel)
-
-        stats_valid_ba = agent_ok & ok1 & ok2
+        stats_valid_ba = agent_stats_valid & ok1 & ok2
         return seg_body_accel_max, seg_body_angular_accel_max, stats_valid_ba
 
     def _get_seg_body_control_statistics(
             self,
             seg_body_control: torch.Tensor,  # (B, agent_num, total_len, 3)
             seg_valid: torch.Tensor,  # (B, agent_num, total_len) bool
-            neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
-            seg_speed_ok: torch.Tensor,  # (B, agent_num, total_len) bool
+            not_low_speed_seg: torch.Tensor,  # (B, agent_num, total_len) bool
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         """속도/각속도 관련 통계를 '안정적으로' 계산합니다.
 
         반영된 규칙(요청사항):
-            1) v_y^b 는 저속(seg_speed_ok=False) 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
+            1) v_y^b 는 저속(not_low_speed_seg=False) 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
                -> abs_v_y_b_max가 자연스럽게 바뀝니다.
-            2) omega_max(abs_omega_max)는 저속(seg_speed_ok=False) 구간을 max 계산에서 제외합니다.
+            2) omega_max(abs_omega_max)는 저속(not_low_speed_seg=False) 구간을 max 계산에서 제외합니다.
                (omega 텐서 자체는 바꾸지 않습니다.)
                단, 제외 결과로 표본이 하나도 없으면 omega_max는 0으로 두고 유효로 취급합니다.
             3) a_y_lat(v*|omega|)도 저속 구간의 값을 0으로 정리한 뒤 max를 계산합니다.
                -> abs_a_y_lat_max가 자연스럽게 바뀝니다.
             4) r_min의 저속 제외 기준은 별도(stats_r_min_v_min_*)를 쓰지 않고,
-               accel에서 쓰는 v_stop 기준(=seg_speed_ok 생성 기준)으로 통일합니다.
+               accel에서 쓰는 v_stop 기준(=not_low_speed_seg 생성 기준)으로 통일합니다.
                보행자는 r_min에서 속도 조건을 적용하지 않습니다(항상 포함).
 
         Returns:
@@ -374,37 +351,18 @@ class DataStatistics:
             R_min             : (B, agent_num) float32
             stats_valid_ba    : (B, agent_num) bool
         """
-        if seg_body_control.dim() != 4:
-            raise ValueError(
-                f"seg_body_control must be (B,agent,T,3). got={tuple(seg_body_control.shape)}")
-        if seg_valid.shape[:3] != seg_body_control.shape[:3]:
-            raise ValueError(
-                f"seg_valid shape must match seg_body_control[:3]. "
-                f"seg_valid={tuple(seg_valid.shape)}, seg_body_control={tuple(seg_body_control.shape)}"
-            )
-        if neighbor_agents_type.dim() != 3 or neighbor_agents_type.shape[
-            :2] != seg_body_control.shape[:2] or neighbor_agents_type.shape[
-            2] != 3:
-            raise ValueError(
-                f"neighbor_agents_type must be (B,agent,3). got={tuple(neighbor_agents_type.shape)}, "
-                f"expected (B,agent,3)=({seg_body_control.shape[0]},{seg_body_control.shape[1]},3)"
-            )
-        if seg_speed_ok.shape != seg_valid.shape:
-            raise ValueError(
-                f"seg_speed_ok must match seg_valid shape (B,agent,T). "
-                f"seg_speed_ok={tuple(seg_speed_ok.shape)}, seg_valid={tuple(seg_valid.shape)}"
-            )
+        edge_trim = self.config.stats_edge_trim
+        min_valid_len = self.config.stats_min_valid_len
 
-        edge_trim = int(getattr(self.config, "stats_edge_trim", 2))
-        min_valid_len = int(getattr(self.config, "stats_min_valid_len", 5))
-
-        seg_valid_stats, agent_ok = self._build_seg_valid_for_stats(
+        # seg_valid_stats: (B,agent,T)
+        # agent_stats_valid: (B,agent)
+        seg_valid_stats, agent_stats_valid = self._build_seg_valid_for_stats(
             seg_valid=seg_valid.to(torch.bool),  # (B,agent,T)
             edge_trim=edge_trim,
             min_valid_len=min_valid_len,
-        )  # seg_valid_stats: (B,agent,T), agent_ok: (B,agent)
+        )
 
-        seg_speed_ok_bool = seg_speed_ok.to(torch.bool)  # (B,agent,T)
+        not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
 
         # 값 분해
         v_y_b = seg_body_control[:, :, :, 1]  # (B,agent,T)
@@ -418,44 +376,44 @@ class DataStatistics:
         # (1) v_y_b 저속 구간 값 0으로 정리
         # ================================
         v_y_b_for_stats = torch.where(
-            seg_speed_ok_bool, v_y_b, torch.zeros_like(v_y_b)
+            not_low_speed_seg, v_y_b, torch.zeros_like(v_y_b)
         )  # (B,agent,T)
 
         # ================================
         # (3) a_y_lat 저속 구간 값 0으로 정리
         # ================================
+        # TODO: why?
         a_y_lat_for_stats = torch.where(
-            seg_speed_ok_bool, a_y_lat, torch.zeros_like(a_y_lat)
+            not_low_speed_seg, a_y_lat, torch.zeros_like(a_y_lat)
         )  # (B,agent,T)
 
         # (v_y_b, v, a_y_lat)은 seg_valid_stats 기준으로 계산 (값이 0으로 정리되므로 max가 자연히 안정화됨)
+        # abs_v_y_b_max: (B,agent)
         abs_v_y_b_max, ok1 = self._masked_abs_max(v_y_b_for_stats,
                                                   seg_valid_stats)
+        # abs_v_max: (B,agent)
         abs_v_max, ok2 = self._masked_abs_max(v, seg_valid_stats)
+        # abs_a_y_lat_max: (B,agent)
         abs_a_y_lat_max, ok4 = self._masked_abs_max(a_y_lat_for_stats,
                                                     seg_valid_stats)
 
         # ================================
         # (2) omega_max는 저속 구간을 "제외"해서 계산 (omega 값 자체는 변경 안 함)
         # ================================
-        omega_mask = seg_valid_stats & seg_speed_ok_bool  # (B,agent,T)
-        abs_omega_max, ok3 = self._masked_abs_max(omega, omega_mask)
+        omega_valid_mask = seg_valid_stats & not_low_speed_seg  # (B,agent,T)
+        abs_omega_max, ok3 = self._masked_abs_max(omega, omega_valid_mask)
 
         # 저속 제외로 인해 표본이 0개면 omega_max=0으로 두고 유효 처리
-        has_omega_sample = omega_mask.any(dim=2)  # (B,agent)
-        ok3 = ok3 | ((~has_omega_sample) & agent_ok)  # (B,agent)
+        has_omega_sample = omega_valid_mask.any(dim=2)  # (B,agent)
+        ok3 = ok3 | ((~has_omega_sample) & agent_stats_valid)  # (B,agent)
 
         # ================================
-        # (4) r_min: 별도 v_min 파라미터 없이, seg_speed_ok(=v_stop 기준)으로 통일
-        #     - 보행자는 속도 조건 없이 항상 포함
+        # (4) r_min: not_low_speed_seg(=v_stop 기준)으로 통일
         # ================================
-        is_ped = (neighbor_agents_type[..., 1] > 0.5)  # (B,agent)
-        speed_ok_for_r = is_ped.unsqueeze(-1) | seg_speed_ok_bool  # (B,agent,T)
-
-        r_valid_stats = seg_valid_stats & speed_ok_for_r  # (B,agent,T)
+        r_valid_stats = seg_valid_stats & not_low_speed_seg  # (B,agent,T)
         r_min, ok5 = self._masked_min(r, r_valid_stats, invalid_fill=1.0e6)
 
-        stats_valid_ba = agent_ok & ok1 & ok2 & ok3 & ok4 & ok5  # (B,agent)
+        stats_valid_ba = agent_stats_valid & ok1 & ok2 & ok3 & ok4 & ok5  # (B,agent)
 
         return abs_v_y_b_max, abs_v_max, abs_omega_max, abs_a_y_lat_max, r_min, stats_valid_ba
 
@@ -615,9 +573,6 @@ class DataStatistics:
             seg_valid_stats: (B, agent_num, T) bool
             agent_stats_valid: (B, agent_num) bool
         """
-        if seg_valid.dim() != 3:
-            raise ValueError(f"seg_valid must be (B,agent,T). got={tuple(seg_valid.shape)}")
-
         B, A, T = seg_valid.shape
         if T <= 0:
             return seg_valid.to(torch.bool), torch.zeros((B, A), device=seg_valid.device, dtype=torch.bool)
@@ -725,7 +680,7 @@ class DataStatistics:
                 [vehicle, pedestrian, bicycle] 원-핫(또는 그에 준하는 값).
 
         Returns:
-            v_stop_ba: (B, agent_num) float32
+            v_stop_per_agent: (B, agent_num) float32
                 각 agent별 v_stop 값.
         """
         if neighbor_agents_type.dim() != 3 or neighbor_agents_type.shape[
@@ -739,50 +694,23 @@ class DataStatistics:
         is_ped = neighbor_agents_type[..., 1] > 0.5
         is_bicycle = neighbor_agents_type[..., 2] > 0.5
 
-        v_vehicle_cfg = getattr(self.config, "stats_accel_v_stop_vehicle_mps",
-                                None)
-        v_ped_cfg = getattr(self.config, "stats_accel_v_stop_pedestrian_mps",
-                            None)
-        v_bic_cfg = getattr(self.config, "stats_accel_v_stop_bicycle_mps", None)
-        v_all_cfg = getattr(self.config, "stats_accel_v_stop_mps", None)
-
-        # per-class 설정이 "하나라도" 있으면 per-class 모드로 간주
-        has_any_per_class = (v_vehicle_cfg is not None) or (
-                    v_ped_cfg is not None) or (v_bic_cfg is not None)
-
-        if has_any_per_class:
-            v_vehicle = float(v_vehicle_cfg) if v_vehicle_cfg is not None else (
-                float(v_all_cfg) if v_all_cfg is not None else 0.5)
-            v_ped = float(v_ped_cfg) if v_ped_cfg is not None else (
-                float(v_all_cfg) if v_all_cfg is not None else 0.1)
-            v_bic = float(v_bic_cfg) if v_bic_cfg is not None else (
-                float(v_all_cfg) if v_all_cfg is not None else 0.3)
-        else:
-            if v_all_cfg is not None:
-                v_vehicle = float(v_all_cfg)
-                v_ped = float(v_all_cfg)
-                v_bic = float(v_all_cfg)
-            else:
-                v_vehicle, v_ped, v_bic = 0.5, 0.1, 0.3
-
-        # 음수 방지(0이면 사실상 "저속 제외 안 함")
-        v_vehicle = max(0.0, v_vehicle)
-        v_ped = max(0.0, v_ped)
-        v_bic = max(0.0, v_bic)
+        v_vehicle = self.config.stats_accel_v_stop_vehicle_mps
+        v_ped = self.config.stats_accel_v_stop_pedestrian_mps
+        v_bic = self.config.stats_accel_v_stop_bicycle_mps
 
         dtype = torch.float32
-        v_stop_ba = (
+        v_stop_per_agent = (
                 is_vehicle.to(dtype) * v_vehicle +
                 is_ped.to(dtype) * v_ped +
                 is_bicycle.to(dtype) * v_bic
         )  # (B, agent_num)
 
-        return v_stop_ba
+        return v_stop_per_agent
 
     def _compute_seg_body_accel_and_angular_accel_via_poly2(
             self,
-            points_xycs: torch.Tensor,  # (B, agent_num, point_len, 4)
-            seg_speed_ok: torch.Tensor,  # (B, agent_num, point_len-1) bool
+            neighbor_agents_past_cur_future_4_dim: torch.Tensor,  # (B, agent_num, point_len, 4)
+            not_low_speed_seg: torch.Tensor,  # (B, agent_num, point_len-1) bool
             points_valid: torch.Tensor,  # (B, agent_num, point_len) bool
             *,
             neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
@@ -799,8 +727,8 @@ class DataStatistics:
                - v_stop은 vehicle/ped/bicycle별로 다르게 적용합니다.
 
         Args:
-            points_xycs: (B, agent_num, point_len, 4)
-            seg_speed_ok:
+            neighbor_agents_past_cur_future_4_dim: (B, agent_num, point_len, 4)
+            not_low_speed_seg:
             points_valid: (B, agent_num, point_len) bool
             neighbor_agents_type: (B, agent_num, 3)
             dt: float
@@ -823,16 +751,15 @@ class DataStatistics:
             )
 
         # (B, agent_num, point_len) bool 보장
-        points_valid_bool = points_valid.to(torch.bool)
 
         # -------------------------
         # (1) (x,y) -> 2차 변화율 (a_x, a_y)
         # -------------------------
-        xy = points_xycs[..., 0:2]  # (B, agent_num, point_len, 2)
+        xy = neighbor_agents_past_cur_future_4_dim[..., 0:2]  # (B, agent_num, point_len, 2)
 
         dd_xy = self._sg_derivative_multi_for_points_fp32(
             sequences_points=xy,
-            points_valid=points_valid_bool,
+            points_valid=points_valid,
             dt=dt,
             polyorder=polyorder,
             max_window_length=max_window_len_xy,
@@ -845,7 +772,7 @@ class DataStatistics:
         # [핵심] 가속도 크기 (분모 제거)
         accel_mag_node = torch.sqrt(
             a_x_w * a_x_w + a_y_w * a_y_w + eps)  # (B, agent_num, point_len)
-        accel_mag_node = torch.where(points_valid_bool, accel_mag_node,
+        accel_mag_node = torch.where(points_valid, accel_mag_node,
                                      torch.zeros_like(accel_mag_node))
 
 
@@ -854,21 +781,21 @@ class DataStatistics:
                     accel_mag_node[..., :-1] + accel_mag_node[..., 1:])
 
         # 저속 세그먼트는 0으로 정리(통계에서 제외될 거지만, 값도 깔끔히)
-        seg_body_accel = torch.where(seg_speed_ok, seg_body_accel,
+        seg_body_accel = torch.where(not_low_speed_seg, seg_body_accel,
                                      torch.zeros_like(seg_body_accel))
 
         # -------------------------
         # (2) (cos,sin) -> yaw 2차 변화율 (angular_accel)
         # -------------------------
-        cos_y = points_xycs[..., 2]  # (B, agent_num, point_len)
-        sin_y = points_xycs[..., 3]  # (B, agent_num, point_len)
+        cos_y = neighbor_agents_past_cur_future_4_dim[..., 2]  # (B, agent_num, point_len)
+        sin_y = neighbor_agents_past_cur_future_4_dim[..., 3]  # (B, agent_num, point_len)
 
         yaw_unit_stack = torch.stack([cos_y, sin_y],
                                      dim=-1)  # (B, agent_num, point_len, 2)
 
         dd_yaw_unit = self._sg_derivative_multi_for_points_fp32(
             sequences_points=yaw_unit_stack,
-            points_valid=points_valid_bool,
+            points_valid=points_valid,
             dt=dt,
             polyorder=polyorder,
             max_window_length=max_window_len_yaw,
@@ -886,7 +813,7 @@ class DataStatistics:
 
         angular_accel_node = (
                                          cos_u * d2sin - sin_u * d2cos) / denom  # (B, agent_num, point_len)
-        angular_accel_node = torch.where(points_valid_bool, angular_accel_node,
+        angular_accel_node = torch.where(points_valid, angular_accel_node,
                                          torch.zeros_like(angular_accel_node))
 
         seg_body_angular_accel = 0.5 * (
@@ -895,7 +822,7 @@ class DataStatistics:
 
         # seg_body_angular_accel 도 저속 세그먼트는 0으로 정리
         seg_body_angular_accel = torch.where(
-            seg_speed_ok,
+            not_low_speed_seg,
             seg_body_angular_accel,
             torch.zeros_like(seg_body_angular_accel)
         )
