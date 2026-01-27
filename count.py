@@ -46,7 +46,7 @@ def main() -> None:
         "/media/user/D/dataset/processed_womd_0124/training",
         "/media/user/D/dataset/processed_nuplan_0124",
     ]
-    dst_json = "/media/user/E/projects/Diffusion-Planner/diffusion_planner/processed_all_0124.json"
+    dst_json = "/media/user/E/projects/Diffusion-Planner/processed_all_0124.json"
 
     all_names: List[str] = []
     for d in src_dirs:
