@@ -195,8 +195,8 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "wosac_test_full" \
-  --name "wosac_test_full" \
+  --load_name "wosac_final_0128" \
+  --name "wosac_final_0128" \
   --eval_method "validation" \
   --batch_size 384 \
   --use_deepspeed True \
@@ -212,7 +212,5 @@ taskset -c "${CPUSET}" \
   --rollout_number 32 \
   --use_data_percent 1 \
   --use_amortized_diffusion True \
-  --do_data_statistics True \
-  --histogram_output_dir "histogram_womd"
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
