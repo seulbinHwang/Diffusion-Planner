@@ -24,15 +24,15 @@ WOMD_DATA_ROOT="/media/user/E/dataset/womd_v1_3"
 TRAIN_SET_NAME="processed_womd_val_test_0128"
 SAVE_PATH="/media/user/D/dataset/${TRAIN_SET_NAME}"
 
-CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
-taskset -c "${CPUSET}" \
-python data_process_womd.py \
-  --womd_data_path "$WOMD_DATA_ROOT" \
-  --num_workers ${NUM_CPUS_FOR_USE} \
-  --overwrite_womd_cache false \
-  --save_path "$SAVE_PATH" \
-  --save_image false \
-  --womd_splits "validation,testing"
+#CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
+#taskset -c "${CPUSET}" \
+#python data_process_womd.py \
+#  --womd_data_path "$WOMD_DATA_ROOT" \
+#  --num_workers ${NUM_CPUS_FOR_USE} \
+#  --overwrite_womd_cache false \
+#  --save_path "$SAVE_PATH" \
+#  --save_image false \
+#  --womd_splits "validation,testing"
 
 echo "Data processing finished."
 echo "---------------------------------"
@@ -41,7 +41,7 @@ echo "Step 2: Uploading processed data..."
 taskset -c "${CPUSET}" \
 nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
   "$SAVE_PATH" \
-  -e -j ${NUM_CPUNUM_CPUS_FOR_USES}
+  -e -j ${NUM_CPUS_FOR_USE}
 
 echo "Upload complete."
 echo "Pipeline finished successfully."
