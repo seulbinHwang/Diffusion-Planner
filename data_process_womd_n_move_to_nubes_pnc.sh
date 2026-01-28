@@ -30,7 +30,8 @@ python data_process_womd.py \
   --num_workers ${NUM_CPUS} \
   --overwrite_womd_cache false \
   --save_path "$SAVE_PATH" \
-  --save_image false
+  --save_image false \
+  --womd_splits "validation,testing"
 
 echo "Data processing finished."
 echo "---------------------------------"
