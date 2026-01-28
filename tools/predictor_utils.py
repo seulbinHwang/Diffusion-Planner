@@ -2300,9 +2300,6 @@ def build_dataset_and_sampler(
             seed=int(args.seed),
         )
         return data_set, data_sampler
-    raise ValueError(
-        f"Unsupported eval_method for building dataset and sampler: eval_method='{eval_method}'"
-    )
 
 
 def build_data_loader(
