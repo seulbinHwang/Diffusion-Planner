@@ -4,6 +4,7 @@ set -e
 # ---------------- CPU 분리 설정 ----------------
 CPUSET="0-31,64-95"
 NUM_CPUS=64
+NUM_CPUS_FOR_USE=56
 
 export DP_MAX_CPUS=${NUM_CPUS}
 export OMP_NUM_THREADS=1
@@ -27,7 +28,7 @@ CUDA_VISIBLE_DEVICES= NVIDIA_VISIBLE_DEVICES= PYTORCH_ENABLE_MPS_FALLBACK=0 \
 taskset -c "${CPUSET}" \
 python data_process_womd.py \
   --womd_data_path "$WOMD_DATA_ROOT" \
-  --num_workers ${NUM_CPUS} \
+  --num_workers ${NUM_CPUS_FOR_USE} \
   --overwrite_womd_cache false \
   --save_path "$SAVE_PATH" \
   --save_image false \
@@ -40,7 +41,7 @@ echo "Step 2: Uploading processed data..."
 taskset -c "${CPUSET}" \
 nubescli dir-upload "labs-mlops/ad/research/pnc/hsb/dataset/${TRAIN_SET_NAME}" \
   "$SAVE_PATH" \
-  -e -j ${NUM_CPUS}
+  -e -j ${NUM_CPUNUM_CPUS_FOR_USES}
 
 echo "Upload complete."
 echo "Pipeline finished successfully."
