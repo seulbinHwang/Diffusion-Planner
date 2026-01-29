@@ -2265,7 +2265,7 @@ def _expand_norm_inputs_for_rollout_batch(
     norm_outputs: Dict[str, Any],
     batch_size: int,
     rollout_repeat: int,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """norm_inputs를 rollout을 batch 차원으로 펼친 형태로 확장합니다.
 
     목표 shape
@@ -3002,27 +3002,43 @@ def _save_inference_data(
 
 
 def _prepare_data_for_one_batch_draw(
-    norm_inputs_copy: Dict[str, Any],
+    norm_inputs_b_r_copy: Dict[str, Any],
+    norm_outputs_b_r_copy: Dict[str, Any],
     normed_trajectories: torch.Tensor,
     state_normalizer: Any,
     observation_normalizer: ObservationNormalizer,
     draw_batch_idx: int,
 ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
-    # 역정규화: ((1+)Pnn, 1+T, 4)
+    # target_future_valid: (B, (1 +) Pnn, future_len)
+    draw_normed_trajectories = normed_trajectories[
+        draw_batch_idx]  # ((1+)Pnn, 1+T, 4)
+    target_future_valid = norm_inputs_b_r_copy[
+        "target_future_valid"]  # (B*R, (1 +) Pnn, future_len)
+    draw_target_future_valid = target_future_valid[
+        draw_batch_idx]  # ((1+)Pnn, future_len)
+    # draw_target_future_valid: ((1+)Pnn, future_len) -> ((1+)Pnn, 1+T)
+    pad = torch.ones((draw_target_future_valid.shape[0], 1),
+                     dtype=draw_target_future_valid.dtype,
+                     device=draw_target_future_valid.device)
+    draw_target_future_valid = torch.cat([pad, draw_target_future_valid], dim=1)
     unnorm_trajectory = state_normalizer.inverse(
-        normed_trajectories[draw_batch_idx])
+        data=draw_normed_trajectories,  # ((1+)Pnn, 1+T, 4)
+        valid_mask=draw_target_future_valid  # ((1+)Pnn, 1+T)
+    )
     unnorm_trajectory_np = unnorm_trajectory.cpu().numpy()
-    norm_ego_future_gt_4_dim = norm_inputs_copy[
-        "ego_future_gt_4_dim"]  # (B*R, future_len, 4)
-    norm_near_future_gt_4_dim = norm_inputs_copy[
-        "near_future_gt_4_dim"]  # (B*R, Pnn, future_len, 4)
+    # (B*R, future_len, 4)
     ego_future_gt_4_dim = state_normalizer.inverse(
-        norm_ego_future_gt_4_dim).cpu().numpy()  # (B*R, future_len, 4)
+        data=norm_outputs_b_r_copy[
+            "ego_future_gt_4_dim"],  # (B*R, future_len, 4)
+        valid_mask=norm_outputs_b_r_copy["ego_future_gt_is_valid"]).cpu().numpy(
+        )
     ego_future_gt_4_dim = ego_future_gt_4_dim[draw_batch_idx]  # (future_len, 4)
-    # near_future_gt_4_dim: (B
+    # near_future_gt_4_dim: (B * R, Pnn, future_len, 4)
     near_future_gt_4_dim = state_normalizer.inverse(
-        norm_near_future_gt_4_dim).cpu().numpy(
-        )  # (B*R, Pnn, future_len, 4) # 4 = x, y, cos(yaw), sin(yaw)
+        data=norm_outputs_b_r_copy[
+            "near_future_gt_4_dim"],  # (B*R, Pnn, future_len, 4)
+        valid_mask=norm_outputs_b_r_copy["near_future_gt_is_valid"]).cpu(
+        ).numpy()
     # near_future_gt_3_dim : x, y, yaw
     near_future_gt_3_dim = np.concatenate([
         near_future_gt_4_dim[:, :, :, 0:2],
@@ -3033,7 +3049,7 @@ def _prepare_data_for_one_batch_draw(
     near_future_gt_3_dim = near_future_gt_3_dim[
         draw_batch_idx]  # (Pnn, future_len, 3)
 
-    unnorm_inputs_copy = observation_normalizer.inverse(norm_inputs_copy)
+    unnorm_inputs_copy = observation_normalizer.inverse(norm_inputs_b_r_copy)
     unnorm_inputs_copy = _shrink_rollout_batch_to_draw_idx(
         unnorm_inputs_copy, draw_batch_idx)
     unnorm_inputs_np = _torch_to_numpy(unnorm_inputs_copy)
@@ -3109,21 +3125,22 @@ def _predict_rollouts_batched_one_chunk(
 
     norm_inputs = observation_normalizer(inputs)
     # (B, ...) -> (B*R, ...)
-    norm_inputs_b_r_copy: Dict[str,
-                               Any] = _expand_norm_inputs_for_rollout_batch(
-                                   norm_inputs=norm_inputs,
-                                   norm_outputs=norm_outputs,
-                                   batch_size=int(batch_size),
-                                   rollout_repeat=int(rollout_repeat),
-                               )
+    (norm_inputs_b_r_copy,
+     norm_outputs_b_r_copy) = _expand_norm_inputs_for_rollout_batch(
+         norm_inputs=norm_inputs,
+         norm_outputs=norm_outputs,
+         batch_size=int(batch_size),
+         rollout_repeat=int(rollout_repeat),
+     )
 
     # ✅ unnorm 입력을 chunk 시작에 1번만 만들어 유지
-    unnorm_inputs_b_r_copy: Dict[
-        str, Any] = _initialize_unnorm_inputs_for_rollout(
-            norm_inputs_b_r_copy=norm_inputs_b_r_copy,
-            state_normalizer=state_normalizer,
-            observation_normalizer=observation_normalizer,
-        )
+    (unnorm_inputs_b_r_copy,
+     unnorm_outputs_b_r_copy) = _initialize_unnorm_inputs_for_rollout(
+         norm_inputs_b_r_copy=norm_inputs_b_r_copy,
+         norm_outputs_b_r_copy=norm_outputs_b_r_copy,
+         state_normalizer=state_normalizer,
+         observation_normalizer=observation_normalizer,
+     )
 
     # ✅ lanes/route_lanes/static_objects 유효 마스크 캐시(1회)
     cached_valid_masks_br: Dict[
@@ -3134,9 +3151,8 @@ def _predict_rollouts_batched_one_chunk(
     unnorm_origin_pose_world = unnorm_inputs_b_r_copy["origin_world_pose"]
     if unnorm_origin_pose_world.dim() != 2 or int(
             unnorm_origin_pose_world.shape[-1]) != 4:
-        raise ValueError(
-            "origin_world_pose는 (B*R, 4) 형태여야 합니다. "
-            f"현재 shape={tuple(unnorm_origin_pose_world.shape)}")
+        raise ValueError("origin_world_pose는 (B*R, 4) 형태여야 합니다. "
+                         f"현재 shape={tuple(unnorm_origin_pose_world.shape)}")
 
     # 출력 미리 할당: (B*R, (1+)Pnn, future_len, 4)
     target_joint_scene_world = torch.empty(
@@ -3165,19 +3181,20 @@ def _predict_rollouts_batched_one_chunk(
                           remaining))  # (B) 마지막 chunk는 gap < N 가능
 
             # ✅ chunk 시작 시점에만 unnorm -> norm 1번
-            norm_input_b_r_copy: Dict[
-                str, Any] = _build_norm_inputs_from_unnorm_inputs(
-                    unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
-                    state_normalizer=state_normalizer,
-                    observation_normalizer=observation_normalizer,
-                )
+            (norm_inputs_b_r_copy,
+             norm_outputs_b_r_copy) = _build_norm_inputs_from_unnorm_inputs(
+                 unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+                 unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
+                 state_normalizer=state_normalizer,
+                 observation_normalizer=observation_normalizer,
+             )
             make_random_noise_cond = (args.use_amortized_diffusion and
                                       step_start == 0) or (
                                           not args.use_amortized_diffusion)
             if make_random_noise_cond:
                 # inference_noise: (B*R, (1+)Pnn, future_len, 4)
                 inference_noise = _build_inference_noise_for_rollout_chunk(
-                    reference_tensor=norm_input_b_r_copy[
+                    reference_tensor=norm_inputs_b_r_copy[
                         "ego_agent_past"],  # device/dtype 기준
                     batch_size=int(batch_size),
                     one_or_pnn=int(one_or_pnn),
@@ -3191,26 +3208,21 @@ def _predict_rollouts_batched_one_chunk(
                 )
             else:
                 inference_noise = None
-            norm_input_b_r_copy["inference_noise"] = inference_noise
+            norm_inputs_b_r_copy["inference_noise"] = inference_noise
             # ✅ Decoder가 이번 호출에서 "몇 스텝 전진했는지" 알 수 있게 전달
             # gap을 전달하면 되는데, 우리는 (B*R,) shape int 텐서로 맞춰서 전달합니다.
-            norm_input_b_r_copy["rollout_time_chunk_size"] = torch.tensor(
+            norm_inputs_b_r_copy["rollout_time_chunk_size"] = torch.tensor(
                 [gap] * merged_batch,
                 dtype=torch.int64,
-                device=norm_input_b_r_copy["ego_agent_past"].device,
+                device=norm_inputs_b_r_copy["ego_agent_past"].device,
             )
             decoder_output = _forward_model_for_validation(
                 args=args,
                 model=model,
-                norm_inputs=norm_input_b_r_copy,
+                norm_inputs=norm_inputs_b_r_copy,
             )
 
-            normed_trajectories = decoder_output.get("integrated_trajectory",
-                                                     None)
-            if normed_trajectories is None:
-                raise KeyError(
-                    "decoder_output에서 'integrated_trajectory'를 찾을 수 없습니다. "
-                    "현재 validate_func는 integrated_trajectory를 사용하도록 구현되어 있습니다.")
+            normed_trajectories = decoder_output["integrated_trajectory"]
 
             # integrated_trajectory가 실제로 제공하는 예측 길이 확인(안전)
             max_pred_step = int(
@@ -3244,14 +3256,15 @@ def _predict_rollouts_batched_one_chunk(
                     save_image = False
                     save_video = False
 
-            norm_inputs_for_draw = norm_input_b_r_copy
+            norm_inputs_for_draw = norm_inputs_b_r_copy
             if "inference_noise" in norm_inputs_for_draw:
-                norm_inputs_for_draw = dict(norm_input_b_r_copy)  # 얕은 복사
+                norm_inputs_for_draw = dict(norm_inputs_b_r_copy)
                 norm_inputs_for_draw.pop("inference_noise", None)
             # ✅ draw는 chunk마다 1번만 (step_start 기준으로 파일명 저장)
             (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim,
              ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
-                 norm_inputs_copy=norm_inputs_for_draw,
+                 norm_inputs_b_r_copy=norm_inputs_for_draw,
+                 norm_outputs_b_r_copy=norm_outputs_b_r_copy,
                  normed_trajectories=normed_trajectories,
                  state_normalizer=state_normalizer,
                  observation_normalizer=observation_normalizer,
@@ -3266,14 +3279,14 @@ def _predict_rollouts_batched_one_chunk(
                     save_dir=save_dir,
                     unnorm_inputs_np=unnorm_inputs_np,
                     unnorm_trajectory_np=
-                    unnorm_trajectory_np,  # ((1+)Pnn, 1+T, 4)
+                    unnorm_trajectory_np,  # ((1+)Pnn, 1+future_len, 4)
                     ego_future_gt_4_dim=ego_future_gt_4_dim,  # (future_len, 4)
                     near_future_gt_3_dim=
                     near_future_gt_3_dim,  # (Pnn, future_len, 3)
                     step_idx=int(step_start),
                     draw_near_target_id=draw_near_target_id,
                 )
-
+            # TODO
             # ---------------------------------------------------------
             # ✅ chunk의 1..gap 포즈를 한 번에 꺼내서 처리
             # ---------------------------------------------------------
@@ -5352,20 +5365,14 @@ import torch
 
 def _initialize_unnorm_inputs_for_rollout(
     norm_inputs_b_r_copy: Dict[str, Any],
+    norm_outputs_b_r_copy: Dict[str, Any],
     state_normalizer: "StateNormalizer",
     observation_normalizer: "ObservationNormalizer",
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """rollout에서 계속 유지할 '원래 값(unnorm)' 입력 dict를 1번만 만들어 둡니다.
 
     목표
     ----
-    기존 코드는 매 step마다:
-      1) norm -> unnorm (inverse)
-      2) 좌표 기준 변환
-      3) unnorm -> norm
-    을 반복합니다.
-
-    여기서는 이 중 (1)을 매 step마다 하지 않도록,
     rollout 시작 시점에 unnorm dict를 한 번 만들어서 계속 들고 갑니다.
 
     Args:
@@ -5392,23 +5399,25 @@ def _initialize_unnorm_inputs_for_rollout(
     unnorm_inputs_b_r_copy: Dict[str, Any] = observation_normalizer.inverse(
         norm_inputs_b_r_copy)
 
-    # 2) 일부 4차원 포즈 키는 StateNormalizer가 기준이므로 추가로 덮어씁니다.
-    #    - shape 예:
-    #      - ego_future_gt_4_dim: (B*R, future_len, 4)
-    #      - near_future_gt_4_dim: (B*R, Pnn, future_len, 4)
-    for key in _STATE_NORMALIZER_4DIM_KEYS:
-        value = norm_inputs_b_r_copy.get(key, None)
-        if isinstance(value, torch.Tensor) and value.numel() > 0:
-            unnorm_inputs_b_r_copy[key] = state_normalizer.inverse(value)
-
-    return unnorm_inputs_b_r_copy
+    unnorm_outputs_b_r_copy = {
+        k: v.clone() for k, v in norm_outputs_b_r_copy.items()
+    }
+    unnorm_outputs_b_r_copy["ego_future_gt_4_dim"] = state_normalizer.inverse(
+        data=norm_outputs_b_r_copy["ego_future_gt_4_dim"],
+        valid_mask=norm_outputs_b_r_copy["ego_future_gt_is_valid"])
+    # (B, Pnn, future_len, 4)
+    unnorm_outputs_b_r_copy["near_future_gt_4_dim"] = state_normalizer.inverse(
+        data=norm_outputs_b_r_copy["near_future_gt_4_dim"],
+        valid_mask=norm_outputs_b_r_copy["near_future_gt_is_valid"])
+    return unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
 
 
 def _build_norm_inputs_from_unnorm_inputs(
     unnorm_inputs_b_r_copy: Dict[str, Any],
+    unnorm_outputs_b_r_copy: Dict[str, Any],
     state_normalizer: "StateNormalizer",
     observation_normalizer: "ObservationNormalizer",
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """현재 unnorm 입력을 모델 입력용 norm dict로 만듭니다.
 
     목표
@@ -5428,24 +5437,21 @@ def _build_norm_inputs_from_unnorm_inputs(
         observation_normalizer (ObservationNormalizer):
             입력 dict 여러 키에 대한 정규화 도구.
 
-    Returns:
-        Dict[str, Any]:
-            정규화된 입력 dict(모델 forward에 넣을 dict).
     """
-    norm_inputs_b_r_step: Dict[str,
-                           Any] = observation_normalizer(unnorm_inputs_b_r_copy)
+    norm_inputs_b_r_step: Dict[str, Any] = observation_normalizer(
+        unnorm_inputs_b_r_copy)
+    norm_outputs_b_r_step = {
+        k: v.clone() for k, v in unnorm_outputs_b_r_copy.items()
+    }
+    norm_outputs_b_r_step["ego_future_gt_4_dim"] = state_normalizer(
+        data=unnorm_outputs_b_r_copy["ego_future_gt_4_dim"],
+        valid_mask=unnorm_outputs_b_r_copy["ego_future_gt_is_valid"])
+    # (B, Pnn, future_len, 4)
+    norm_outputs_b_r_step["near_future_gt_4_dim"] = state_normalizer(
+        data=unnorm_outputs_b_r_copy["near_future_gt_4_dim"],
+        valid_mask=unnorm_outputs_b_r_copy["near_future_gt_is_valid"])
 
-    # StateNormalizer 기준 키는 ObservationNormalizer 결과를 덮어쓰는 방식으로 맞춥니다.
-    # 2) 일부 4차원 포즈 키는 StateNormalizer가 기준이므로 추가로 덮어씁니다.
-    #    - shape 예:
-    #      - ego_future_gt_4_dim: (B*R, future_len, 4)
-    #      - near_future_gt_4_dim: (B*R, Pnn, future_len, 4)
-    for key in _STATE_NORMALIZER_4DIM_KEYS:
-        value = unnorm_inputs_b_r_copy.get(key, None)
-        if isinstance(value, torch.Tensor) and value.numel() > 0:
-            norm_inputs_b_r_step[key] = state_normalizer(value)
-
-    return norm_inputs_b_r_step
+    return norm_inputs_b_r_step, norm_outputs_b_r_step
 
 
 def _build_cached_valid_masks_for_static_map_features(
