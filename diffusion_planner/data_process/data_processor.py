@@ -95,15 +95,17 @@ class DataProcessor(object):
         # =========================
         # 기본값 0: fsync를 아예 하지 않음(가장 빠름)
         # 필요하면 config에 아래 값을 추가해서 "N개마다 1번"만 강제 반영 가능
-        self._save_fsync_every_n: int = int(getattr(config, "save_fsync_every_n", 0) or 0)
-        self._save_dir_fsync_every_n: int = int(getattr(config, "save_dir_fsync_every_n", 0) or 0)
+        self._save_fsync_every_n: int = int(
+            getattr(config, "save_fsync_every_n", 0) or 0)
+        self._save_dir_fsync_every_n: int = int(
+            getattr(config, "save_dir_fsync_every_n", 0) or 0)
 
         # 압축 유지(기존 동작 그대로). 원하면 False로 바꿔 더 빠르게 할 수 있음(파일은 커짐)
-        self._save_use_compression: bool = bool(getattr(config, "save_use_compression", True))
+        self._save_use_compression: bool = bool(
+            getattr(config, "save_use_compression", True))
 
         # 프로세스(워커) 내부에서 저장 횟수 카운트
         self._save_counter: int = 0
-
 
     @staticmethod
     def _build_origin_world_pose(
@@ -284,10 +286,10 @@ class DataProcessor(object):
         return fixed_neighbor_agents_past, neighbor_future_gt_11_dim, neighbor_future_gt_3_dim
 
     def _enforce_no_invalid_between_valid_in_ego_past(
-            self,
-            ego_agent_past: np.ndarray,  # shape: (Tp, 11)
-            *,
-            eps: float = 1e-8,
+        self,
+        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+        *,
+        eps: float = 1e-8,
     ) -> np.ndarray:
         """ego_agent_past(과거~현재)에서 '없는 과거 프레임(0 패딩)'이 끼어도 규칙이 깨지지 않게 정리한다.
 
@@ -362,16 +364,16 @@ class DataProcessor(object):
             # 중간 구멍이 있으면 x/y/cos/sin/vx/vy를 채움 (0~5)
             if last_valid - first_valid + 1 > valid_idx.size:
                 xs: np.ndarray = valid_idx.astype(np.float64)  # (K,)
-                seg_idx: np.ndarray = np.arange(first_valid, last_valid + 1,
+                seg_idx: np.ndarray = np.arange(first_valid,
+                                                last_valid + 1,
                                                 dtype=np.float64)
 
                 for dim_idx in range(6):  # 0~5
                     ys: np.ndarray = traj[valid_idx, dim_idx].astype(np.float64,
                                                                      copy=False)
                     interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    traj[
-                        first_valid:last_valid + 1, dim_idx] = interp_vals.astype(
-                        np.float32, copy=False)
+                    traj[first_valid:last_valid + 1,
+                         dim_idx] = interp_vals.astype(np.float32, copy=False)
 
         # 타입/크기는 “현재 프레임 값”을 대표로 씀
         # 수정 (해결)
@@ -474,6 +476,7 @@ class DataProcessor(object):
         if bool(self._use_filter_radius):
             return float(self._filter_radius)
         return None
+
     @staticmethod
     def _adjust_ego_future_outputs_to_center_frame(
         ego_state: EgoState,
@@ -531,8 +534,8 @@ class DataProcessor(object):
         # - 무효 프레임 정의: [x, y, cos, sin, vx, vy, width, length] 8개가 전부 0이면 무효
         eps: float = 1e-8
         # valid_mask: shape (T,)
-        valid_mask: np.ndarray = (
-                    np.abs(ego_future_gt_11_dim[:, :6]) > eps).any(axis=1)
+        valid_mask: np.ndarray = (np.abs(ego_future_gt_11_dim[:, :6])
+                                  > eps).any(axis=1)
 
         # 유효 프레임에만 원점 이동 적용
         ego_future_gt_3_dim[valid_mask, 0] -= offset_x_local
@@ -541,7 +544,6 @@ class DataProcessor(object):
         ego_future_gt_11_dim[valid_mask, 1] -= offset_y_local
 
         return ego_future_gt_3_dim, ego_future_gt_11_dim
-
 
     @staticmethod
     def _normalize_cos_sin_in_traj_11(
@@ -910,8 +912,7 @@ class DataProcessor(object):
         )
         # ✅ 추가: 과거가 부족해 0으로 채운 프레임(prefix)이 있으면 확실히 0으로 정리
         ego_agent_past = self._enforce_no_invalid_between_valid_in_ego_past(
-            ego_agent_past
-        )
+            ego_agent_past)
         # Past observations including the current
         observation_buffer: Deque[
             Observation] = history_buffer.observation_buffer
@@ -1078,11 +1079,11 @@ class DataProcessor(object):
         return modified_past
 
     def _merge_and_interpolate_ego_11dim(
-            self,
-            ego_agent_past: np.ndarray,  # shape: (Tp, 11)
-            ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
-            *,
-            eps: float = 1e-8,
+        self,
+        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+        ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
+        *,
+        eps: float = 1e-8,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """ego 과거~현재 + 미래를 합친 뒤, 유효~유효 사이에 무효(0)가 끼지 않게 만든다."""
         if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
@@ -1090,7 +1091,7 @@ class DataProcessor(object):
                 f"`ego_agent_past` shape는 (Tp, 11)이어야 합니다. got {ego_agent_past.shape}"
             )
         if ego_future_gt_11_dim.ndim != 2 or ego_future_gt_11_dim.shape[
-            -1] != 11:
+                -1] != 11:
             raise ValueError(
                 f"`ego_future_gt_11_dim` shape는 (Tf, 11)이어야 합니다. got {ego_future_gt_11_dim.shape}"
             )
@@ -1107,8 +1108,8 @@ class DataProcessor(object):
         current_index: int = Tp - 1
 
         # ✅ 유효 판정은 '앞 6개(x,y,cos,sin,vx,vy)'만 사용
-        valid_mask_1d: np.ndarray = (np.abs(full[:, :6]) > eps).any(
-            axis=1)  # (T_full,)
+        valid_mask_1d: np.ndarray = (np.abs(full[:, :6])
+                                     > eps).any(axis=1)  # (T_full,)
 
         if not bool(valid_mask_1d[current_index]):
             return ego_agent_past, ego_future_gt_11_dim
@@ -1128,20 +1129,22 @@ class DataProcessor(object):
 
             if last_valid - first_valid + 1 > valid_idx.size:
                 xs: np.ndarray = valid_idx.astype(np.float64)
-                seg_idx: np.ndarray = np.arange(first_valid, last_valid + 1,
+                seg_idx: np.ndarray = np.arange(first_valid,
+                                                last_valid + 1,
                                                 dtype=np.float64)
                 for dim_idx in range(6):
                     ys: np.ndarray = full[valid_idx, dim_idx].astype(np.float64,
                                                                      copy=False)
                     interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    full[
-                        first_valid:last_valid + 1, dim_idx] = interp_vals.astype(
-                        np.float32, copy=False)
+                    full[first_valid:last_valid + 1,
+                         dim_idx] = interp_vals.astype(np.float32, copy=False)
 
-        type_vec: np.ndarray = ego_agent_past[-1, 8:11].astype(np.float32,
-                                                               copy=False)  # (3,)
-        rep_size: np.ndarray = ego_agent_past[-1, 6:8].astype(np.float32,
-                                                              copy=False)  # (2,)
+        type_vec: np.ndarray = ego_agent_past[-1,
+                                              8:11].astype(np.float32,
+                                                           copy=False)  # (3,)
+        rep_size: np.ndarray = ego_agent_past[-1,
+                                              6:8].astype(np.float32,
+                                                          copy=False)  # (2,)
 
         full[:, 8:11] = 0.0
         full[region_mask, 8:11] = type_vec
@@ -1672,8 +1675,7 @@ class DataProcessor(object):
             )
             # ✅ 추가: 과거가 부족해 0으로 채운 프레임(prefix)이 있으면 확실히 0으로 정리
             ego_agent_past = self._enforce_no_invalid_between_valid_in_ego_past(
-                ego_agent_past
-            )
+                ego_agent_past)
             # ─────────────────────────────────────────────
             # ✅ (요구조건 b) ego: past+future(101) 기반으로 규칙 적용
             #    그리고 ego_future_gt_3_dim은 “규칙 적용된 11dim”에서 다시 생성
@@ -1852,8 +1854,8 @@ class DataProcessor(object):
                 os.makedirs(save_dir, exist_ok=True)
                 key_to_array["token_to_future_traj_wrt_ego"] = None
                 draw_machine_fast.draw_world_model_to_png(key_to_array,
-                                                     output_data={},
-                                                     save_path=save_path)
+                                                          output_data={},
+                                                          save_path=save_path)
 
     @staticmethod
     def _estimate_stable_neighbor_sizes(
@@ -2165,12 +2167,11 @@ class DataProcessor(object):
         next_count: int = int(self._save_counter + 1)
 
         # "N개마다 1번"만 강제 반영
-        need_file_fsync: bool = (
-            self._save_fsync_every_n > 0 and (next_count % self._save_fsync_every_n == 0)
-        )
-        need_dir_fsync: bool = (
-            self._save_dir_fsync_every_n > 0 and (next_count % self._save_dir_fsync_every_n == 0)
-        )
+        need_file_fsync: bool = (self._save_fsync_every_n > 0 and
+                                 (next_count % self._save_fsync_every_n == 0))
+        need_dir_fsync: bool = (self._save_dir_fsync_every_n > 0 and
+                                (next_count % self._save_dir_fsync_every_n
+                                 == 0))
 
         try:
             # 1) 임시 파일에 먼저 저장

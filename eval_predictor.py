@@ -58,6 +58,7 @@ from typing import Optional
 import argparse
 import logging
 
+
 def _unwrap_to_core_torch_module(model: nn.Module) -> nn.Module:
     """감싸진 모델에서 실제 torch 모델(nn.Module)을 꺼냅니다.
 
@@ -80,6 +81,7 @@ def _unwrap_to_core_torch_module(model: nn.Module) -> nn.Module:
         else:
             break
     return cur
+
 
 def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
     """tensor에 NaN/Inf가 있는지 확인합니다.
@@ -111,6 +113,7 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(msg)
     return tensor
 
+
 # ----------------------------------------------------------------------------
 def _sanitize_norm_inputs(
     norm_inputs: Dict[str, torch.Tensor],) -> Dict[str, torch.Tensor]:
@@ -132,13 +135,11 @@ def _sanitize_norm_inputs(
     # 각 v: 보통 (B, ·) 모양 텐서들
 
 
-
 _VALIDATION_HEARTBEAT: Optional["_ValidationHeartbeat"] = None
 
 from typing import Any, Dict, Set
 import numpy as np
 import torch
-
 
 _INFERENCE_NPZ_EXCLUDED_EXACT_KEYS: Set[str] = {
     "diff_token_to_future_gt_3_dim",
@@ -197,8 +198,7 @@ def _as_numpy_array_strict(value: Any, key_name: str) -> np.ndarray:
 
 
 def _assert_planner_future_equals_ego_future_gt_11_dim(
-    sample_dict: Dict[str, Any],
-) -> None:
+    sample_dict: Dict[str, Any],) -> None:
     """planner_future_11_dim 과 ego_future_gt_11_dim 값이 완전히 같은지 확인합니다.
 
     이 함수는 "둘 중 planner_future_11_dim 이 존재할 때만" 검증합니다.
@@ -224,8 +224,7 @@ def _assert_planner_future_equals_ego_future_gt_11_dim(
 
     if "ego_future_gt_11_dim" not in sample_dict:
         raise AssertionError(
-            "planner_future_11_dim 이 있는데 ego_future_gt_11_dim 이 없습니다."
-        )
+            "planner_future_11_dim 이 있는데 ego_future_gt_11_dim 이 없습니다.")
 
     planner_arr = _as_numpy_array_strict(sample_dict["planner_future_11_dim"],
                                          "planner_future_11_dim")
@@ -241,23 +240,23 @@ def _assert_planner_future_equals_ego_future_gt_11_dim(
     # 값이 “완전히” 동일한지(허용 오차 없이) 확인
     # dtype이 달라도 값이 같으면 통과하도록, 둘 다 float64로 올려서 비교합니다.
     np.set_printoptions(precision=2, suppress=True)
-    if not np.array_equal(planner_arr.astype(np.float64), ego_arr.astype(np.float64)):
+    if not np.array_equal(planner_arr.astype(np.float64),
+                          ego_arr.astype(np.float64)):
         for time_idx in range(planner_arr.shape[0]):
             a_planner_arr = np.round(planner_arr[time_idx], 2)
             a_ego_arr = np.round(ego_arr[time_idx], 2)
             gap = a_planner_arr - a_ego_arr
             print("==================================================")
-            print(f"[DEBUG] time_idx={time_idx}, a_planner_arr = {a_planner_arr}")
+            print(
+                f"[DEBUG] time_idx={time_idx}, a_planner_arr = {a_planner_arr}")
             print(f"[DEBUG] time_idx={time_idx}, a_ego_arr = {a_ego_arr}")
             print(f"[DEBUG] time_idx={time_idx}, gap = {gap}")
         raise AssertionError(
-            "planner_future_11_dim 과 ego_future_gt_11_dim 의 값이 완전히 같지 않습니다."
-        )
+            "planner_future_11_dim 과 ego_future_gt_11_dim 의 값이 완전히 같지 않습니다.")
 
 
 def _build_inference_npz_payload_for_save(
-    sample_dict: Dict[str, Any],
-) -> Dict[str, Any]:
+    sample_dict: Dict[str, Any],) -> Dict[str, Any]:
     """npz로 저장할 dict를 '규칙에 맞게' 골라서 만듭니다.
 
     규칙
@@ -288,7 +287,7 @@ def _build_inference_npz_payload_for_save(
             continue
         if key == "planner_future_11_dim":
             # (3) planner는 저장하지 않음(ego와 동일하다는 assert는 위에서 수행)
-            key= "ego_future_gt_11_dim"
+            key = "ego_future_gt_11_dim"
 
         out[key] = v
 
@@ -685,9 +684,9 @@ def _upload_wosac_submission_tar_to_wandb(
         return True
 
     except Exception as e:
-        print(f"[WANDB][WARNING] WOSAC tar.gz 업로드 실패(로컬 파일 유지): {e}", flush=True)
+        print(f"[WANDB][WARNING] WOSAC tar.gz 업로드 실패(로컬 파일 유지): {e}",
+              flush=True)
         return False
-
 
 
 def _finalize_wandb_and_cleanup_tb_dir(
@@ -1057,6 +1056,7 @@ def _maybe_distributed_barrier(
 
     torch.distributed.barrier()
 
+
 def _is_resume_wosac_submission_enabled(args: argparse.Namespace) -> bool:
     """WOSAC submission을 '이어하기' 모드로 돌릴지 여부를 반환합니다.
 
@@ -1170,8 +1170,7 @@ def _read_scenario_ids_from_submission_binproto(file_path: str) -> List[str]:
 
 
 def _load_done_scenario_id_set_from_binproto_files(
-    binproto_paths: Sequence[str],
-) -> Set[str]:
+    binproto_paths: Sequence[str],) -> Set[str]:
     """여러 binproto 파일에서 이미 저장된 scenario_id들을 set으로 모읍니다.
 
     Args:
@@ -1224,9 +1223,7 @@ def _write_filtered_eval_set_list_json(
     with open(original_eval_set_list_path, "r", encoding="utf-8") as f:
         obj = json.load(f)
     if not isinstance(obj, list):
-        raise TypeError(
-            f"eval_set_list json은 list여야 합니다. type={type(obj)}"
-        )
+        raise TypeError(f"eval_set_list json은 list여야 합니다. type={type(obj)}")
 
     original_list: List[str] = [str(x) for x in obj]
     total_before = int(len(original_list))
@@ -1245,7 +1242,8 @@ def _write_filtered_eval_set_list_json(
         json.dump(filtered, f, indent=2, ensure_ascii=False)
 
     total_after = int(len(filtered))
-    return str(output_eval_set_list_path), total_before, total_after, int(removed)
+    return str(output_eval_set_list_path), total_before, total_after, int(
+        removed)
 
 
 def _broadcast_object_if_possible(obj: Any, src: int = 0) -> Any:
@@ -1313,12 +1311,15 @@ def _prepare_wosac_resume_state_and_filter_eval_list(
     new_eval_list_rank0: str = eval_set_list_path
 
     if int(global_rank) == 0:
-        binproto_paths = _list_existing_submission_binproto_files(submission_dir)
+        binproto_paths = _list_existing_submission_binproto_files(
+            submission_dir)
         shard_count_rank0 = int(len(binproto_paths))
-        next_i_file_rank0 = int(_infer_next_submission_shard_index(binproto_paths))
+        next_i_file_rank0 = int(
+            _infer_next_submission_shard_index(binproto_paths))
 
         if shard_count_rank0 > 0:
-            done_ids_rank0 = _load_done_scenario_id_set_from_binproto_files(binproto_paths)
+            done_ids_rank0 = _load_done_scenario_id_set_from_binproto_files(
+                binproto_paths)
 
             # 새 eval_set_list json 경로 (save_path 아래에 남김)
             out_json_path = os.path.join(
@@ -1345,7 +1346,8 @@ def _prepare_wosac_resume_state_and_filter_eval_list(
             shard_count_rank0 = 0
 
     # 모든 rank가 같은 eval_set_list 경로를 쓰도록 맞춤
-    new_eval_list_all = _broadcast_object_if_possible(new_eval_list_rank0, src=0)
+    new_eval_list_all = _broadcast_object_if_possible(new_eval_list_rank0,
+                                                      src=0)
     next_i_file_all = _broadcast_object_if_possible(next_i_file_rank0, src=0)
     shard_count_all = _broadcast_object_if_possible(shard_count_rank0, src=0)
 
@@ -1355,7 +1357,6 @@ def _prepare_wosac_resume_state_and_filter_eval_list(
     if int(global_rank) == 0:
         return done_ids_rank0, int(next_i_file_all), int(shard_count_all)
     return None, int(next_i_file_all), int(shard_count_all)
-
 
 
 def model_validation(
@@ -1380,7 +1381,8 @@ def model_validation(
         # ✅ (추가) 재개 모드면: 기존 binproto 기반으로 eval_set_list를 필터링하고,
         #     WOSAC 저장 번호(i_file)도 이어서 쓸 값을 준비합니다.
         (done_scenario_ids_rank0, resume_next_i_file,
-         resume_existing_shard_count) = _prepare_wosac_resume_state_and_filter_eval_list(
+         resume_existing_shard_count
+        ) = _prepare_wosac_resume_state_and_filter_eval_list(
             args=args,
             global_rank=int(global_rank),
         )
@@ -1390,7 +1392,7 @@ def model_validation(
             args,
             args.eval_set,
             args.eval_set_list,
-            args.eval_method, #
+            args.eval_method,  #
             world_size,
             global_rank,
         )
@@ -1474,13 +1476,13 @@ def model_validation(
         # ✅ tar.gz 생성은 “모든 정리/동기화(barrier)가 끝난 뒤”에 rank0만 수행
         if int(global_rank) == 0:
             if bool(getattr(wosac_submission, "is_active", False)):
-                _update_validation_heartbeat_stage(args,
-                                                   "creating WOSAC submission tar.gz")
+                _update_validation_heartbeat_stage(
+                    args, "creating WOSAC submission tar.gz")
                 wosac_submission.save_sub_file()
 
                 tar_file_path = _get_wosac_submission_tar_path(wosac_submission)
-                _update_validation_heartbeat_stage(args,
-                                                   "uploading WOSAC tar.gz to wandb artifact")
+                _update_validation_heartbeat_stage(
+                    args, "uploading WOSAC tar.gz to wandb artifact")
                 upload_ok = _upload_wosac_submission_tar_to_wandb(
                     args=args,
                     tar_file_path=tar_file_path,
@@ -1507,6 +1509,7 @@ def model_validation(
 
     finally:
         _stop_validation_heartbeat_if_needed(args)
+
 
 def _finalize_eval_cleanup(
     args: argparse.Namespace,
@@ -1983,14 +1986,11 @@ def validation_epoch(
                 data_statistics_inst.do_data_statistics(inputs)
                 continue
 
-            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(
-                inputs)
-
             validate_func(
                 args=args,
                 model=model,
                 ema=ema,
-                norm_inputs=norm_inputs,
+                inputs=inputs,
                 outputs=outputs,
                 state_normalizer=args.state_normalizer,
                 observation_normalizer=args.observation_normalizer,
@@ -2013,8 +2013,8 @@ def validation_epoch(
         data_statistics_inst.draw_histograms()
         time.sleep(1)
         raise RuntimeError("Data statistics completed. Stop validation.")
-    ddp_rank: int = int(ddp.get_rank()) if bool(
-        getattr(args, "ddp", False)) else 0
+    ddp_rank: int = int(ddp.get_rank()) if bool(getattr(args, "ddp",
+                                                        False)) else 0
     if ddp_rank == 0:
         if wosac_submission.is_active:
             wosac_submission.flush_shards()
@@ -2357,6 +2357,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+
 def _build_inference_npz_file_name(scenario_id: str, step_count: int) -> str:
     """추론 결과 npz 파일 이름을 만듭니다.
 
@@ -2373,8 +2374,11 @@ def _build_inference_npz_file_name(scenario_id: str, step_count: int) -> str:
     Returns:
         str: 예) "{scenario_id}_step0001.npz" 형태의 파일명. shape: ()
     """
-    safe_scenario_id = str(scenario_id).replace("/", "_").replace("\\", "_").replace(os.sep, "_")
+    safe_scenario_id = str(scenario_id).replace("/",
+                                                "_").replace("\\", "_").replace(
+                                                    os.sep, "_")
     return f"{safe_scenario_id}_step{int(step_count):04d}.npz"
+
 
 def _get_inference_debug_vis_dir(save_root_dir: str, scenario_id: str) -> str:
     """inference npz 저장과 함께 남길 디버그 이미지 폴더 경로를 만듭니다.
@@ -2407,8 +2411,7 @@ def _get_inference_debug_vis_dir(save_root_dir: str, scenario_id: str) -> str:
 
 
 def _build_debug_unnorm_trajectory_np_from_gt(
-    unnorm_inputs_np: Dict[str, Any],
-) -> Optional[np.ndarray]:
+    unnorm_inputs_np: Dict[str, Any],) -> Optional[np.ndarray]:
     """그림을 그리기 위한 '임시 궤적'을 정답 미래를 이용해 만듭니다.
 
     _draw_one_batch_one_rollout는 (ego + 주변 객체)의 궤적을 입력으로 받습니다.
@@ -2437,20 +2440,29 @@ def _build_debug_unnorm_trajectory_np_from_gt(
               - 마지막 4: (x, y, cos, sin)
             필요한 값이 부족하면 None.
     """
-    ego_future_gt_4_dim = unnorm_inputs_np.get("ego_future_gt_4_dim", None)  # (T, 4)
-    if (not isinstance(ego_future_gt_4_dim, np.ndarray)) or ego_future_gt_4_dim.ndim != 2 or int(ego_future_gt_4_dim.shape[-1]) != 4:
+    ego_future_gt_4_dim = unnorm_inputs_np.get("ego_future_gt_4_dim",
+                                               None)  # (T, 4)
+    if (not isinstance(ego_future_gt_4_dim,
+                       np.ndarray)) or ego_future_gt_4_dim.ndim != 2 or int(
+                           ego_future_gt_4_dim.shape[-1]) != 4:
         return None
 
     future_len: int = int(ego_future_gt_4_dim.shape[0])  # T
     if future_len <= 0:
         return None
 
-    ego_agent_past = unnorm_inputs_np.get("ego_agent_past", None)  # (T_past, 11)
-    if isinstance(ego_agent_past, np.ndarray) and ego_agent_past.ndim == 2 and int(ego_agent_past.shape[-1]) >= 4 and int(ego_agent_past.shape[0]) > 0:
-        ego_current_pose_4 = ego_agent_past[-1, 0:4].astype(ego_future_gt_4_dim.dtype, copy=False)  # (4,)
+    ego_agent_past = unnorm_inputs_np.get("ego_agent_past",
+                                          None)  # (T_past, 11)
+    if isinstance(ego_agent_past,
+                  np.ndarray) and ego_agent_past.ndim == 2 and int(
+                      ego_agent_past.shape[-1]) >= 4 and int(
+                          ego_agent_past.shape[0]) > 0:
+        ego_current_pose_4 = ego_agent_past[-1, 0:4].astype(
+            ego_future_gt_4_dim.dtype, copy=False)  # (4,)
     else:
         # 현재 ego 포즈를 못 꺼내면, "원점 + 정면"을 기본으로 둡니다.
-        ego_current_pose_4 = np.array([0.0, 0.0, 1.0, 0.0], dtype=ego_future_gt_4_dim.dtype)  # (4,)
+        ego_current_pose_4 = np.array([0.0, 0.0, 1.0, 0.0],
+                                      dtype=ego_future_gt_4_dim.dtype)  # (4,)
 
     # ego_traj_4: (1+T, 4)
     ego_traj_4 = np.concatenate(
@@ -2458,15 +2470,21 @@ def _build_debug_unnorm_trajectory_np_from_gt(
         axis=0,
     )
 
-    near_agents_past = unnorm_inputs_np.get("near_agents_past", None)  # (Pnn, T_past, 11)
-    near_future_gt_4_dim = unnorm_inputs_np.get("near_future_gt_4_dim", None)  # (Pnn, T, 4)
+    near_agents_past = unnorm_inputs_np.get("near_agents_past",
+                                            None)  # (Pnn, T_past, 11)
+    near_future_gt_4_dim = unnorm_inputs_np.get("near_future_gt_4_dim",
+                                                None)  # (Pnn, T, 4)
 
     pnn_from_past = 0
-    if isinstance(near_agents_past, np.ndarray) and near_agents_past.ndim == 3 and int(near_agents_past.shape[-1]) >= 4:
+    if isinstance(near_agents_past,
+                  np.ndarray) and near_agents_past.ndim == 3 and int(
+                      near_agents_past.shape[-1]) >= 4:
         pnn_from_past = int(near_agents_past.shape[0])
 
     pnn_from_future = 0
-    if isinstance(near_future_gt_4_dim, np.ndarray) and near_future_gt_4_dim.ndim == 3 and int(near_future_gt_4_dim.shape[-1]) == 4:
+    if isinstance(near_future_gt_4_dim,
+                  np.ndarray) and near_future_gt_4_dim.ndim == 3 and int(
+                      near_future_gt_4_dim.shape[-1]) == 4:
         pnn_from_future = int(near_future_gt_4_dim.shape[0])
 
     pnn: int = int(max(pnn_from_past, pnn_from_future))
@@ -2475,23 +2493,32 @@ def _build_debug_unnorm_trajectory_np_from_gt(
         return ego_traj_4[None, :, :]
 
     # near_current_pose_4: (Pnn, 4)
-    if isinstance(near_agents_past, np.ndarray) and near_agents_past.ndim == 3 and int(near_agents_past.shape[0]) >= pnn and int(near_agents_past.shape[1]) > 0:
-        near_current_pose_4 = near_agents_past[:pnn, -1, 0:4].astype(ego_future_gt_4_dim.dtype, copy=False)
+    if isinstance(near_agents_past,
+                  np.ndarray) and near_agents_past.ndim == 3 and int(
+                      near_agents_past.shape[0]) >= pnn and int(
+                          near_agents_past.shape[1]) > 0:
+        near_current_pose_4 = near_agents_past[:pnn, -1, 0:4].astype(
+            ego_future_gt_4_dim.dtype, copy=False)
     else:
-        near_current_pose_4 = np.zeros((pnn, 4), dtype=ego_future_gt_4_dim.dtype)
+        near_current_pose_4 = np.zeros((pnn, 4),
+                                       dtype=ego_future_gt_4_dim.dtype)
 
     # near_future_4: (Pnn, T, 4)
-    if isinstance(near_future_gt_4_dim, np.ndarray) and near_future_gt_4_dim.ndim == 3 and int(near_future_gt_4_dim.shape[-1]) == 4:
+    if isinstance(near_future_gt_4_dim,
+                  np.ndarray) and near_future_gt_4_dim.ndim == 3 and int(
+                      near_future_gt_4_dim.shape[-1]) == 4:
         near_future_4 = near_future_gt_4_dim[:pnn]
         near_t = int(near_future_4.shape[1])
 
         if near_t > future_len:
             near_future_4 = near_future_4[:, :future_len, :]
         elif near_t < future_len:
-            pad = np.zeros((pnn, future_len - near_t, 4), dtype=near_future_4.dtype)
+            pad = np.zeros((pnn, future_len - near_t, 4),
+                           dtype=near_future_4.dtype)
             near_future_4 = np.concatenate([near_future_4, pad], axis=1)
     else:
-        near_future_4 = np.zeros((pnn, future_len, 4), dtype=ego_future_gt_4_dim.dtype)
+        near_future_4 = np.zeros((pnn, future_len, 4),
+                                 dtype=ego_future_gt_4_dim.dtype)
 
     # near_traj_4: (Pnn, 1+T, 4)
     near_traj_4 = np.concatenate(
@@ -2568,12 +2595,11 @@ def _pose_4_dim_numpy_to_pose_3_dim_numpy(pose_4_dim: np.ndarray) -> np.ndarray:
             마지막 차원이 4가 아니면 에러.
     """
     if not isinstance(pose_4_dim, np.ndarray):
-        raise TypeError(f"pose_4_dim은 np.ndarray여야 합니다. type={type(pose_4_dim)}")
+        raise TypeError(
+            f"pose_4_dim은 np.ndarray여야 합니다. type={type(pose_4_dim)}")
     if pose_4_dim.ndim < 1 or int(pose_4_dim.shape[-1]) != 4:
-        raise ValueError(
-            "pose_4_dim의 마지막 차원은 4여야 합니다. "
-            f"현재 shape={tuple(pose_4_dim.shape)}"
-        )
+        raise ValueError("pose_4_dim의 마지막 차원은 4여야 합니다. "
+                         f"현재 shape={tuple(pose_4_dim.shape)}")
 
     # pose_4_dim[..., 0:2]: (.., 2)
     xy = pose_4_dim[..., 0:2]
@@ -2623,7 +2649,8 @@ def _build_cpu_batch_cache_for_npz_save(
         if isinstance(value, torch.Tensor):
             if value.dim() == 0:
                 # 스칼라 텐서는 그대로 1개 값으로 저장(샘플별 인덱싱 불가)
-                cpu_cache[key] = _tensor_to_cpu_numpy_for_npz_save(value)  # shape: ()
+                cpu_cache[key] = _tensor_to_cpu_numpy_for_npz_save(
+                    value)  # shape: ()
                 continue
 
             if int(value.shape[0]) != int(batch_size):
@@ -2639,8 +2666,7 @@ def _build_cpu_batch_cache_for_npz_save(
             if int(len(value)) != int(batch_size):
                 raise ValueError(
                     "저장 대상 list는 길이가 batch_size여야 합니다. "
-                    f"key='{key}', len={len(value)}, batch_size={batch_size}"
-                )
+                    f"key='{key}', len={len(value)}, batch_size={batch_size}")
             cpu_cache[key] = value
 
         else:
@@ -2690,126 +2716,168 @@ def _slice_one_sample_from_cpu_batch_cache(
     return out
 
 
-def _remove_invalid_data(npz_payload_dict: Dict[str,Any]) -> Dict[str,Any]:
-    dim_11_12_keys = { "neighbor_agents_past", # (chosen_agent_num, time_len, 11)
-                       "lanes", # (chosen_lane_num, lane_len, 12)
-                       "route_lanes", # (chosen_route_lane_num, route_len, 12)
-                   }
+def _remove_invalid_data(npz_payload_dict: Dict[str, Any]) -> Dict[str, Any]:
+    dim_11_12_keys = {
+        "neighbor_agents_past",  # (chosen_agent_num, time_len, 11)
+        "lanes",  # (chosen_lane_num, lane_len, 12)
+        "route_lanes",  # (chosen_route_lane_num, route_len, 12)
+    }
     neighbor_agents_past = npz_payload_dict["neighbor_agents_past"]
     if neighbor_agents_past is not None:
-        neighbor_agents_current = neighbor_agents_past[:, -1, :]  # (chosen_agent_num, 11)
+        neighbor_agents_current = neighbor_agents_past[:,
+                                                       -1, :]  # (chosen_agent_num, 11)
         neighbor_agents_past_is_invalid = np.all(
-            neighbor_agents_current[..., 0:8] == 0, axis=-1)  # (chosen_agent_num)
+            neighbor_agents_current[...,
+                                    0:8] == 0, axis=-1)  # (chosen_agent_num)
         neighbor_agents_past_is_valid = np.logical_not(
             neighbor_agents_past_is_invalid)  # (chosen_agent_num)
         npz_payload_dict["neighbor_agents_past"] = neighbor_agents_past[
             neighbor_agents_past_is_valid]  # (valid_chosen_agent_num, time_len, 11)
         npz_payload_dict["neighbor_future_gt_3_dim"] = npz_payload_dict[
-            "neighbor_future_gt_3_dim"][neighbor_agents_past_is_valid]  # (valid_chosen_agent_num, future_len, 3)
+            "neighbor_future_gt_3_dim"][
+                neighbor_agents_past_is_valid]  # (valid_chosen_agent_num, future_len, 3)
 
-    lanes = npz_payload_dict["lanes"] # (chosen_lane_num, lane_len, 12)
+    lanes = npz_payload_dict["lanes"]  # (chosen_lane_num, lane_len, 12)
     if lanes is not None:
-        lanes_point_is_invalid = np.all(
-            lanes[..., 0:8] == 0, axis=-1)  # (chosen_lane_num, lane_len)
+        lanes_point_is_invalid = np.all(lanes[..., 0:8] == 0,
+                                        axis=-1)  # (chosen_lane_num, lane_len)
         # lanes_point_is_invalid_sum: (chosen_lane_num)
         lanes_point_is_invalid_sum = np.sum(lanes_point_is_invalid, axis=-1)
         # lanes_point_is_invalid_sum 이 0 인 경우 -> 유효한 lane
         lanes_is_valid = lanes_point_is_invalid_sum == 0  # (chosen_lane_num)
-        npz_payload_dict["lanes"] = lanes[lanes_is_valid]  # (valid_chosen_lane_num, lane_len, 12)
+        npz_payload_dict["lanes"] = lanes[
+            lanes_is_valid]  # (valid_chosen_lane_num, lane_len, 12)
         npz_payload_dict["lanes_speed_limit"] = npz_payload_dict[
             "lanes_speed_limit"][lanes_is_valid]  # (valid_chosen_lane_num, 1)
         npz_payload_dict["lanes_has_speed_limit"] = npz_payload_dict[
-            "lanes_has_speed_limit"][lanes_is_valid]  # (valid_chosen_lane_num, 1)
+            "lanes_has_speed_limit"][
+                lanes_is_valid]  # (valid_chosen_lane_num, 1)
         # lane_type: (chosen_lane_num, 4) / "left_line_type" : (chosen_lane_num, 13) / "right_line_type" : (chosen_lane_num, 13)
         lane_type = npz_payload_dict.get("lane_type", None)
         if lane_type is not None:
-            npz_payload_dict["lane_type"] = lane_type[lanes_is_valid]  # (valid_chosen_lane_num, 4)
+            npz_payload_dict["lane_type"] = lane_type[
+                lanes_is_valid]  # (valid_chosen_lane_num, 4)
             npz_payload_dict["left_line_type"] = npz_payload_dict[
                 "left_line_type"][lanes_is_valid]  # (valid_chosen_lane_num, 13)
             npz_payload_dict["right_line_type"] = npz_payload_dict[
-                "right_line_type"][lanes_is_valid]  # (valid_chosen_lane_num, 13)
+                "right_line_type"][
+                    lanes_is_valid]  # (valid_chosen_lane_num, 13)
 
-    agent_route_lane_order = npz_payload_dict.get("agent_route_lane_order", None)
+    agent_route_lane_order = npz_payload_dict.get("agent_route_lane_order",
+                                                  None)
     if agent_route_lane_order is not None:
         # "agent_route_lane_order",#check#check  # (chosen_agent_num, chosen_lane_num) -> (valid_chosen_agent_num, valid_chosen_lane_num)
-        npz_payload_dict["agent_route_lane_order"] = agent_route_lane_order[neighbor_agents_past_is_valid][:, lanes_is_valid]  # (valid_chosen_agent_num, valid_chosen_lane_num)
+        npz_payload_dict["agent_route_lane_order"] = agent_route_lane_order[
+            neighbor_agents_past_is_valid][:,
+                                           lanes_is_valid]  # (valid_chosen_agent_num, valid_chosen_lane_num)
 
-    route_lanes = npz_payload_dict.get("route_lanes", None) # (chosen_route_lane_num, route_len, 12)
+    route_lanes = npz_payload_dict.get(
+        "route_lanes", None)  # (chosen_route_lane_num, route_len, 12)
     if route_lanes is not None:
         route_lanes_point_is_invalid = np.all(
-            route_lanes[..., 0:8] == 0, axis=-1)  # (chosen_route_lane_num, route_len)
+            route_lanes[..., 0:8] == 0,
+            axis=-1)  # (chosen_route_lane_num, route_len)
         # route_lanes_point_is_invalid_sum: (chosen_route_lane_num)
-        route_lanes_point_is_invalid_sum = np.sum(route_lanes_point_is_invalid, axis=-1)
+        route_lanes_point_is_invalid_sum = np.sum(route_lanes_point_is_invalid,
+                                                  axis=-1)
         # route_lanes_point_is_invalid_sum 이 0 인 경우 -> 유효한 route_lane
         route_lanes_is_valid = route_lanes_point_is_invalid_sum == 0  # (chosen_route_lane_num)
-        npz_payload_dict["route_lanes"] = route_lanes[route_lanes_is_valid]  # (valid_chosen_route_lane_num, route_len, 12)
+        npz_payload_dict["route_lanes"] = route_lanes[
+            route_lanes_is_valid]  # (valid_chosen_route_lane_num, route_len, 12)
         npz_payload_dict["route_lanes_speed_limit"] = npz_payload_dict[
-            "route_lanes_speed_limit"][route_lanes_is_valid]  # (valid_chosen_route_lane_num, 1)
+            "route_lanes_speed_limit"][
+                route_lanes_is_valid]  # (valid_chosen_route_lane_num, 1)
         npz_payload_dict["route_lanes_has_speed_limit"] = npz_payload_dict[
-            "route_lanes_has_speed_limit"][route_lanes_is_valid]  # (valid_chosen_route_lane_num, 1)
+            "route_lanes_has_speed_limit"][
+                route_lanes_is_valid]  # (valid_chosen_route_lane_num, 1)
     """
     # stop_sign_points : (stop_sign_num, safety_len, 2) / crosswalk_points: (crosswalk_num, safety_len, 2)
     speed_bump_points : (speed_bump_num, safety_len, 2) / driveway_points : (driveway_num, safety_len, 2)
     road_edge : (chosen_edge_num, safety_len, 2) 
     이 5개는 2차원 (x,y) 값이 전부 0. 이면 무효다. 그리고 전 safety_len 점이 모두 유효해야 유효한 객체다.
     """
-    stop_sign_points = npz_payload_dict.get("stop_sign_points", None) # (stop_sign_num, safety_len, 2)
+    stop_sign_points = npz_payload_dict.get(
+        "stop_sign_points", None)  # (stop_sign_num, safety_len, 2)
     if stop_sign_points is not None:
         stop_sign_points_is_invalid = np.all(
-            stop_sign_points[..., 0:2] == 0, axis=-1)  # (stop_sign_num, safety_len)
-        stop_sign_points_is_invalid_sum = np.sum(stop_sign_points_is_invalid, axis=-1)
+            stop_sign_points[...,
+                             0:2] == 0, axis=-1)  # (stop_sign_num, safety_len)
+        stop_sign_points_is_invalid_sum = np.sum(stop_sign_points_is_invalid,
+                                                 axis=-1)
         stop_sign_points_is_valid = stop_sign_points_is_invalid_sum == 0  # (stop_sign_num)
-        npz_payload_dict["stop_sign_points"] = stop_sign_points[stop_sign_points_is_valid]  # (valid_stop_sign_num, safety_len, 2)
+        npz_payload_dict["stop_sign_points"] = stop_sign_points[
+            stop_sign_points_is_valid]  # (valid_stop_sign_num, safety_len, 2)
 
-    speed_bump_points = npz_payload_dict.get("speed_bump_points", None) # (speed_bump_num, safety_len, 2)
+    speed_bump_points = npz_payload_dict.get(
+        "speed_bump_points", None)  # (speed_bump_num, safety_len, 2)
     if speed_bump_points is not None:
         speed_bump_points_is_invalid = np.all(
-            speed_bump_points[..., 0:2] == 0, axis=-1)  # (speed_bump_num, safety_len)
-        speed_bump_points_is_invalid_sum = np.sum(speed_bump_points_is_invalid, axis=-1)
+            speed_bump_points[..., 0:2] == 0,
+            axis=-1)  # (speed_bump_num, safety_len)
+        speed_bump_points_is_invalid_sum = np.sum(speed_bump_points_is_invalid,
+                                                  axis=-1)
         speed_bump_points_is_valid = speed_bump_points_is_invalid_sum == 0  # (speed_bump_num)
-        npz_payload_dict["speed_bump_points"] = speed_bump_points[speed_bump_points_is_valid]  # (valid_speed_bump_num, safety_len, 2)
+        npz_payload_dict["speed_bump_points"] = speed_bump_points[
+            speed_bump_points_is_valid]  # (valid_speed_bump_num, safety_len, 2)
 
-    crosswalk_points = npz_payload_dict.get("crosswalk_points", None) # (crosswalk_num, safety_len, 2)
+    crosswalk_points = npz_payload_dict.get(
+        "crosswalk_points", None)  # (crosswalk_num, safety_len, 2)
     if crosswalk_points is not None:
         crosswalk_points_is_valid = ~np.all(
-            crosswalk_points[..., 0:2] == 0, axis=-1)  #(crosswalk_num, safety_len)
-        crosswalk_points_is_invalid_sum = np.sum(~crosswalk_points_is_valid, axis=-1)
+            crosswalk_points[...,
+                             0:2] == 0, axis=-1)  #(crosswalk_num, safety_len)
+        crosswalk_points_is_invalid_sum = np.sum(~crosswalk_points_is_valid,
+                                                 axis=-1)
         crosswalk_points_is_valid = crosswalk_points_is_invalid_sum == 0  # (crosswalk_num)
-        npz_payload_dict["crosswalk_points"] = crosswalk_points[crosswalk_points_is_valid]  # (valid_crosswalk_num, safety_len, 2)
+        npz_payload_dict["crosswalk_points"] = crosswalk_points[
+            crosswalk_points_is_valid]  # (valid_crosswalk_num, safety_len, 2)
 
-    driveway_points = npz_payload_dict.get("driveway_points", None) # (driveway_num, safety_len, 2)
+    driveway_points = npz_payload_dict.get(
+        "driveway_points", None)  # (driveway_num, safety_len, 2)
     if driveway_points is not None:
         driveway_points_is_invalid = np.all(
-            driveway_points[..., 0:2] == 0, axis=-1)  #(driveway_num, safety_len)
-        driveway_points_is_invalid_sum = np.sum(driveway_points_is_invalid, axis=-1)
+            driveway_points[...,
+                            0:2] == 0, axis=-1)  #(driveway_num, safety_len)
+        driveway_points_is_invalid_sum = np.sum(driveway_points_is_invalid,
+                                                axis=-1)
         driveway_points_is_valid = driveway_points_is_invalid_sum == 0  # (driveway_num)
-        npz_payload_dict["driveway_points"] = driveway_points[driveway_points_is_valid]  # (valid_driveway_num, safety_len, 2)
+        npz_payload_dict["driveway_points"] = driveway_points[
+            driveway_points_is_valid]  # (valid_driveway_num, safety_len, 2)
 
-    road_edge = npz_payload_dict.get("road_edge", None) # (chosen_edge_num, safety_len, 2)
+    road_edge = npz_payload_dict.get("road_edge",
+                                     None)  # (chosen_edge_num, safety_len, 2)
     if road_edge is not None:
-        road_edge_is_invalid = np.all(
-            road_edge[..., 0:2] == 0, axis=-1)  #(chosen_edge_num, safety_len)
+        road_edge_is_invalid = np.all(road_edge[..., 0:2] == 0,
+                                      axis=-1)  #(chosen_edge_num, safety_len)
         road_edge_is_invalid_sum = np.sum(road_edge_is_invalid, axis=-1)
         road_edge_is_valid = road_edge_is_invalid_sum == 0  # (chosen_edge_num)
-        npz_payload_dict["road_edge"] = road_edge[road_edge_is_valid]  # (valid_chosen_edge_num, safety_len, 2)
+        npz_payload_dict["road_edge"] = road_edge[
+            road_edge_is_valid]  # (valid_chosen_edge_num, safety_len, 2)
 
         # road_edge_type : (chosen_edge_num, 3)  -> (valid_chosen_edge_num, 3)
-        npz_payload_dict["road_edge_type"] = npz_payload_dict[
-            "road_edge_type"][road_edge_is_valid]  # (valid_chosen_edge_num , 3)
+        npz_payload_dict["road_edge_type"] = npz_payload_dict["road_edge_type"][
+            road_edge_is_valid]  # (valid_chosen_edge_num , 3)
 
     # static_objects : (chosen_static_num, 10) 뒤 10개 속성 중, 앞 5개가 전부 0. 이면 무효
-    static_objects = npz_payload_dict.get("static_objects", None) # (chosen_static_num, 10)
+    static_objects = npz_payload_dict.get("static_objects",
+                                          None)  # (chosen_static_num, 10)
     if static_objects is not None:
-        static_objects_is_invalid = np.all(
-            static_objects[..., 0:5] == 0, axis=-1)  #(chosen_static_num)
-        static_objects_is_valid = np.logical_not(static_objects_is_invalid)  # (chosen_static_num)
-        npz_payload_dict["static_objects"] = static_objects[static_objects_is_valid]  # (valid_chosen_static_num, 10)
+        static_objects_is_invalid = np.all(static_objects[..., 0:5] == 0,
+                                           axis=-1)  #(chosen_static_num)
+        static_objects_is_valid = np.logical_not(
+            static_objects_is_invalid)  # (chosen_static_num)
+        npz_payload_dict["static_objects"] = static_objects[
+            static_objects_is_valid]  # (valid_chosen_static_num, 10)
 
     return npz_payload_dict
 
-def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_count: int,
-        unnorm_trajectory_np: np.ndarray, # ((1+)Pnn, 1+T, 4)
-                         ) -> None:
+
+def _save_inference_data(
+        dir: str,
+        unnorm_inputs_copy: Dict[str, Any],
+        step_count: int,
+        unnorm_trajectory_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
+) -> None:
     """rollout 중간 상태(unnorm_inputs_copy)를 npz로 저장합니다.
 
     저장 동작
@@ -2853,30 +2921,34 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
 
     # ✅ (3) fsync는 옵션으로 (기본: 수행)
     #    - DP_INFERENCE_NPZ_FSYNC=0 이면 fsync 생략
-    enable_fsync = bool(_read_float_env_safe("DP_INFERENCE_NPZ_FSYNC", 1.0) > 0.0)
+    enable_fsync = bool(
+        _read_float_env_safe("DP_INFERENCE_NPZ_FSYNC", 1.0) > 0.0)
 
     for current_batch_idx in range(batch_size):
         # ✅ 루프 안에서는 인덱싱만
-        a_inputs_copy_dict: Dict[str, Any] = _slice_one_sample_from_cpu_batch_cache(
-            cpu_batch_cache=cpu_batch_cache,
-            sample_idx=int(current_batch_idx),
-            batch_size=int(batch_size),
-        )
+        a_inputs_copy_dict: Dict[str,
+                                 Any] = _slice_one_sample_from_cpu_batch_cache(
+                                     cpu_batch_cache=cpu_batch_cache,
+                                     sample_idx=int(current_batch_idx),
+                                     batch_size=int(batch_size),
+                                 )
 
         # ✅ (2) 3차원 GT는 CPU에서 "저장 직전"에만 계산
         ego_future_gt_4_np = a_inputs_copy_dict.get("ego_future_gt_4_dim", None)
         # ego_future_gt_3_dim: (future_len, 3)
-        a_inputs_copy_dict["ego_future_gt_3_dim"] = _pose_4_dim_numpy_to_pose_3_dim_numpy(
-            ego_future_gt_4_np
-        )
+        a_inputs_copy_dict[
+            "ego_future_gt_3_dim"] = _pose_4_dim_numpy_to_pose_3_dim_numpy(
+                ego_future_gt_4_np)
 
-        near_future_gt_4_np = a_inputs_copy_dict.get("near_future_gt_4_dim", None)
+        near_future_gt_4_np = a_inputs_copy_dict.get("near_future_gt_4_dim",
+                                                     None)
         # neighbor_future_gt_3_dim: (Pnn, future_len, 3)
         neighbor_future_gt_3_dim = _pose_4_dim_numpy_to_pose_3_dim_numpy(
-            near_future_gt_4_np
-        )
-        a_inputs_copy_dict["neighbor_future_gt_3_dim"] = neighbor_future_gt_3_dim
-        draw_near_target_id = np.arange(len(neighbor_future_gt_3_dim))  # ((1+)Pnn)
+            near_future_gt_4_np)
+        a_inputs_copy_dict[
+            "neighbor_future_gt_3_dim"] = neighbor_future_gt_3_dim
+        draw_near_target_id = np.arange(
+            len(neighbor_future_gt_3_dim))  # ((1+)Pnn)
         # draw_near_target_id np to tensor
         # draw_near_target_id_tensor = torch.from_numpy(draw_near_target_id).to(torch.int64)
         #
@@ -2902,9 +2974,9 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
         tmp_path = final_path + ".tmp"
 
         # ✅ 저장용 dict만 따로 만들기 (요구사항 필터 + planner/ego assert 포함)
-        npz_payload_dict: Dict[str, Any] = _build_inference_npz_payload_for_save(
-            a_inputs_copy_dict
-        )
+        npz_payload_dict: Dict[str,
+                               Any] = _build_inference_npz_payload_for_save(
+                                   a_inputs_copy_dict)
         npz_payload_dict = _remove_invalid_data(npz_payload_dict)
         # print(f"=================================={final_file_name}")
         # for k, v in npz_payload_dict.items():
@@ -2925,12 +2997,12 @@ def _save_inference_data(dir: str, unnorm_inputs_copy: Dict[str, Any], step_coun
 
 
 def _prepare_data_for_one_batch_draw(
-        norm_inputs_copy: Dict[str, Any],
-        normed_trajectories: torch.Tensor,
-        state_normalizer: Any,
-        observation_normalizer: ObservationNormalizer,
-        draw_batch_idx: int,
-) -> Tuple[Dict[str, Any],  np.ndarray, np.ndarray, np.ndarray]:
+    norm_inputs_copy: Dict[str, Any],
+    normed_trajectories: torch.Tensor,
+    state_normalizer: Any,
+    observation_normalizer: ObservationNormalizer,
+    draw_batch_idx: int,
+) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
     # 역정규화: ((1+)Pnn, 1+T, 4)
     unnorm_trajectory = state_normalizer.inverse(
         normed_trajectories[draw_batch_idx])
@@ -2966,7 +3038,7 @@ def _prepare_data_for_one_batch_draw(
 def _predict_rollouts_batched_one_chunk(
     args: Any,
     model: torch.nn.Module,
-    norm_inputs: Dict[str, Any],
+    inputs: Dict[str, Any],
     outputs: Dict[str, Any],
     state_normalizer: Any,
     observation_normalizer: "ObservationNormalizer",
@@ -3002,13 +3074,14 @@ def _predict_rollouts_batched_one_chunk(
     """
     # (B, future_len, 4)
     ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]
-    norm_ego_future_gt_4_dim = state_normalizer(ego_future_gt_4_dim)
-    norm_inputs["ego_future_gt_4_dim"] = norm_ego_future_gt_4_dim
-
+    outputs["ego_future_gt_4_dim"] = state_normalizer(data=ego_future_gt_4_dim,
+                                                valid_mask=outputs[
+                                                    "ego_future_gt_is_valid"]
+                                                )
     # (B, Pnn, future_len, 4)
-    near_future_gt_4_dim = outputs["near_future_gt_4_dim"]
-    norm_near_future_gt_4_dim = state_normalizer(near_future_gt_4_dim)
-    norm_inputs["near_future_gt_4_dim"] = norm_near_future_gt_4_dim
+    outputs["near_future_gt_4_dim"] = state_normalizer(
+        data=outputs["near_future_gt_4_dim"],
+        valid_mask=outputs["near_future_gt_is_valid"])
 
     # -----------------------------------------
     # ✅ 저장 요청값은 보관만 하고,
@@ -3029,6 +3102,8 @@ def _predict_rollouts_batched_one_chunk(
     rollout_repeat = int(rollout_repeat)
     merged_batch: int = int(batch_size * rollout_repeat)
 
+    norm_inputs = observation_normalizer(inputs)
+    # TODO
     # (B, ...) -> (B*R, ...)
     norm_inputs_copy_init: Dict[str,
                                 Any] = _expand_norm_inputs_for_rollout_batch(
@@ -3054,8 +3129,9 @@ def _predict_rollouts_batched_one_chunk(
     if isinstance(unnorm_origin_pose_world, torch.Tensor):
         if unnorm_origin_pose_world.dim() != 2 or int(
                 unnorm_origin_pose_world.shape[-1]) != 4:
-            raise ValueError("origin_world_pose는 (B*R, 4) 형태여야 합니다. "
-                             f"현재 shape={tuple(unnorm_origin_pose_world.shape)}")
+            raise ValueError(
+                "origin_world_pose는 (B*R, 4) 형태여야 합니다. "
+                f"현재 shape={tuple(unnorm_origin_pose_world.shape)}")
 
     # 출력 미리 할당: (B*R, (1+)Pnn, future_len, 4)
     target_joint_scene_world = torch.empty(
@@ -3093,7 +3169,9 @@ def _predict_rollouts_batched_one_chunk(
                     state_normalizer=state_normalizer,
                     observation_normalizer=observation_normalizer,
                 )
-            make_random_noise_cond = (args.use_amortized_diffusion and step_start == 0) or (not args.use_amortized_diffusion)
+            make_random_noise_cond = (args.use_amortized_diffusion and
+                                      step_start == 0) or (
+                                          not args.use_amortized_diffusion)
             if make_random_noise_cond:
                 # inference_noise: (B*R, (1+)Pnn, future_len, 4)
                 inference_noise = _build_inference_noise_for_rollout_chunk(
@@ -3171,12 +3249,12 @@ def _predict_rollouts_batched_one_chunk(
             # ✅ draw는 chunk마다 1번만 (step_start 기준으로 파일명 저장)
             (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim,
              ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
-                norm_inputs_copy=norm_inputs_for_draw,
-                normed_trajectories=normed_trajectories,
-                state_normalizer=state_normalizer,
-                observation_normalizer=observation_normalizer,
-                draw_batch_idx=draw_batch_idx,
-            )
+                 norm_inputs_copy=norm_inputs_for_draw,
+                 normed_trajectories=normed_trajectories,
+                 state_normalizer=state_normalizer,
+                 observation_normalizer=observation_normalizer,
+                 draw_batch_idx=draw_batch_idx,
+             )
             if save_image:
                 if draw_near_target_id is None:
                     raise RuntimeError(
@@ -3185,9 +3263,11 @@ def _predict_rollouts_batched_one_chunk(
                 _draw_one_batch_one_rollout(
                     save_dir=save_dir,
                     unnorm_inputs_np=unnorm_inputs_np,
-                    unnorm_trajectory_np=unnorm_trajectory_np, # ((1+)Pnn, 1+T, 4)
-                    ego_future_gt_4_dim = ego_future_gt_4_dim, # (future_len, 4)
-                    near_future_gt_3_dim= near_future_gt_3_dim, # (Pnn, future_len, 3)
+                    unnorm_trajectory_np=
+                    unnorm_trajectory_np,  # ((1+)Pnn, 1+T, 4)
+                    ego_future_gt_4_dim=ego_future_gt_4_dim,  # (future_len, 4)
+                    near_future_gt_3_dim=
+                    near_future_gt_3_dim,  # (Pnn, future_len, 3)
                     step_idx=int(step_start),
                     draw_near_target_id=draw_near_target_id,
                 )
@@ -3235,7 +3315,8 @@ def _predict_rollouts_batched_one_chunk(
                 # 다음 chunk를 위한 origin 갱신(ego 기준, world 좌표) - 마지막 스텝만 사용
                 unnorm_origin_pose_world = unnorm_target_pose_chunk_world[:, 0,
                                                                           -1, :]  # (B*R, 4)
-                unnorm_inputs_copy["origin_world_pose"] = unnorm_origin_pose_world
+                unnorm_inputs_copy[
+                    "origin_world_pose"] = unnorm_origin_pose_world
 
             # ---------------------------------------------------------
             # ✅ 입력 업데이트: gap개를 한 번에 반영 + 마지막 포즈로 1번만 좌표 변환
@@ -3247,19 +3328,22 @@ def _predict_rollouts_batched_one_chunk(
             unnorm_inputs_copy = _update_merged_inputs_unnorm_inplace_for_time_chunk(
                 unnorm_inputs_copy=unnorm_inputs_copy,
                 unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,  # (B*R, gap, 4)
-                unnorm_near_pose_chunk=unnorm_near_pose_chunk, # (B*R, Pnn, gap, 4)
+                unnorm_near_pose_chunk=
+                unnorm_near_pose_chunk,  # (B*R, Pnn, gap, 4)
                 cached_valid_masks=cached_valid_masks,
-
             )
             step_start += gap
             step_count += 1
 
             if args.save_inference_data:
-                _save_inference_data(args.save_cache_path, unnorm_inputs_copy,
-                                     step_count=int(step_count),
-                                     unnorm_trajectory_np=unnorm_trajectory_np, # ((1+)Pnn, 1+T, 4)
-                                     # (Pnn, future_len, 3)
-                                     )
+                _save_inference_data(
+                    args.save_cache_path,
+                    unnorm_inputs_copy,
+                    step_count=int(step_count),
+                    unnorm_trajectory_np=
+                    unnorm_trajectory_np,  # ((1+)Pnn, 1+T, 4)
+                    # (Pnn, future_len, 3)
+                )
                 if step_count >= args.rollout_step_count_for_save:
                     break
 
@@ -3324,9 +3408,9 @@ def _get_near_future_11(
 def _draw_one_batch_one_rollout(
         save_dir: str,
         unnorm_inputs_np: Dict[str, Any],
-unnorm_trajectory_np: np.ndarray, # ((1+)Pnn, 1+T, 4)
-ego_future_gt_4_dim: np.ndarray,  # (future_len, 4)
-near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
+        unnorm_trajectory_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
+        ego_future_gt_4_dim: np.ndarray,  # (future_len, 4)
+        near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
         step_idx: int,
         draw_near_target_id: torch.Tensor,  # (Pnn,)
 ) -> None:
@@ -3337,7 +3421,6 @@ near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
         ego_future_gt_4_dim: torch.Tensor # (B, future_len, 4)
         near_future_gt_4_dim: torch.Tensor # (B, Pnn, future_len, 4)
     """
-
 
     output_data = {}
     """
@@ -3371,7 +3454,8 @@ near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
     near_agents_current = unnorm_inputs_np[
         "near_agents_past"][:, -1, :]  # (Pnn, 11)
     # near_future_11: (Pnn, 1+T, 11)
-    near_future_11 = _get_near_future_11(near_agents_current, unnorm_trajectory_np)
+    near_future_11 = _get_near_future_11(near_agents_current,
+                                         unnorm_trajectory_np)
     diff_token_to_np_int_traj_11_wrt_ego = {}
     for target_id, np_int_traj_11 in zip(draw_near_target_id, near_future_11):
         # np_int_traj_11: (1+T, 11)
@@ -3379,15 +3463,15 @@ near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
     output_data[
         "diff_token_to_np_int_traj_11_wrt_ego"] = diff_token_to_np_int_traj_11_wrt_ego
     draw_machine_fast.draw_world_model_to_png(unnorm_inputs_np,
-                                         output_data=output_data,
-                                         save_path=os.path.join(
-                                             save_dir, f"{step_idx}.png"))
+                                              output_data=output_data,
+                                              save_path=os.path.join(
+                                                  save_dir, f"{step_idx}.png"))
 
 
 def _predict_rollouts_batched(
     args: Any,
     model: nn.Module,
-    norm_inputs: Dict[str, Any],
+    inputs: Dict[str, Any],
     outputs: Dict[str, Any],
     state_normalizer: Any,
     observation_normalizer: ObservationNormalizer,
@@ -3412,9 +3496,9 @@ def _predict_rollouts_batched(
     rollout_chunk_size = int(max(1, rollout_chunk_size))
     rollout_chunk_size = int(min(rollout_chunk_size, rollout_number))
 
-    ego_agent_past = norm_inputs.get("ego_agent_past", None)
+    ego_agent_past = inputs["ego_agent_past"]
     # target_future_valid: (B, (1 +) Pnn, future_len)
-    target_future_valid = norm_inputs.get("target_future_valid", None)
+    target_future_valid = inputs["target_future_valid"]
 
     batch_size: int = int(target_future_valid.shape[0])
     one_or_pnn: int = int(target_future_valid.shape[1])
@@ -3430,11 +3514,22 @@ def _predict_rollouts_batched(
     trial = 0
     while start < rollout_number:
         cur = int(min(rollout_chunk_size, rollout_number - start))
+        """
+3. **`_predict_rollouts_batched_one_chunk` (실제 “예측 생성기”: 한 묶음의 rollout을 만들어내는 핵심)**
 
+* 목표: 
+    “이번 묶음(cur개 rollout)”을 **한 번에 처리**해서 실제 미래 궤적을 만들어냅니다.
+* 방식(개념): 
+    입력을 rollout 개수만큼 늘려 **한 번에 많이 처리(B×cur)** 하고, 
+    시간 방향으로는 **이전 예측을 다시 입력에 반영하며** 
+        다음을 계속 예측하는 방식(연속 생성)으로 rollout을 완성합니다.
+* 추가로: 좌표 변환, 입력 갱신, (옵션) 시각화/저장 같은 **실제 무거운 작업이 여기서** 일어납니다.
+
+        """
         chunk_pred = _predict_rollouts_batched_one_chunk(
             args=args,
             model=model,
-            norm_inputs=norm_inputs,
+            inputs=inputs,
             outputs=outputs,
             state_normalizer=state_normalizer,
             observation_normalizer=observation_normalizer,
@@ -3693,7 +3788,7 @@ def _set_cached_rollout_chunk_size_for_oom_fallback(
 def _predict_rollouts_batched_with_oom_fallback(
     args: Any,
     model: nn.Module,
-    norm_inputs: Dict[str, Any],
+    inputs: Dict[str, Any],
     outputs: Dict[str, Any],
     state_normalizer: StateNormalizer,
     observation_normalizer: ObservationNormalizer,
@@ -3714,8 +3809,7 @@ def _predict_rollouts_batched_with_oom_fallback(
         torch.Tensor:
             shape: (B, (1+)Pnn, rollout_number, future_len, 4)
     """
-    rollout_number_i = int(rollout_number)
-    rollout_number_i = int(max(1, rollout_number_i))
+    rollout_number_i = int(max(1, int(rollout_number)))
 
     # ✅ 1) 이번 배치에서 "처음 시도할" chunk_size 결정 (캐시 반영)
     start_chunk_size = _get_cached_rollout_chunk_size_for_oom_fallback(
@@ -3736,10 +3830,24 @@ def _predict_rollouts_batched_with_oom_fallback(
 
     for chunk_size in candidates:
         try:
+            """
+2. **`_predict_rollouts_batched` (전체 rollout을 “묶음 단위로 나눠 실행+조립”하는 관리자)**
+
+* 목표: 
+    요청된 rollout_number개를 **여러 묶음으로 쪼개서** 순서대로 생성하고, 
+    **큰 결과 상자에 끼워 맞춰** 최종 결과를 만듭니다.
+* 특징: 
+    묶음마다 `_predict_rollouts_batched_one_chunk`를 호출해서 결과를 받아오고, 
+    그걸 **rollout 축**에 맞춰 채웁니다.
+* 중요한 차이: 
+    OOM fallback 때문에 chunk size가 바뀌어도 결과가 흔들리지 않도록, 
+    **rollout 인덱스 기준으로 “랜덤 샘플(노이즈)”이 일관되게 나오게** 설계돼 있습니다.
+
+            """
             out = _predict_rollouts_batched(
                 args=args,
                 model=model,
-                norm_inputs=norm_inputs,
+                inputs=inputs,
                 outputs=outputs,
                 state_normalizer=state_normalizer,
                 observation_normalizer=observation_normalizer,
@@ -3851,8 +3959,8 @@ def _filter_rollout_tensors_by_agent_mask(
     pred_z: Optional[torch.Tensor],
     pred_head: torch.Tensor,
     agent_valid_mask: torch.Tensor,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, Optional[torch.Tensor],
-           torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor,
+           Optional[torch.Tensor], torch.Tensor]:
     """agent_valid_mask가 True인 agent만 남기도록 rollout 관련 텐서들을 같이 걸러냅니다.
 
     Args:
@@ -3946,8 +4054,8 @@ def _prepare_inference_model_for_validation(
     return inference_model
 
 
-def _sanitize_norm_inputs_for_validation(
-    norm_inputs: Dict[str, Any],) -> Dict[str, Any]:
+def _sanitize_inputs_for_validation(
+    inputs: Dict[str, Any],) -> Dict[str, Any]:
     """입력 dict에서 텐서 값만 NaN/Inf 등을 안전한 값으로 정리합니다.
 
     왜 분리했나?
@@ -3956,7 +4064,7 @@ def _sanitize_norm_inputs_for_validation(
     이 함수는 텐서만 골라 정리한 뒤, 다시 원래 dict 구조로 합쳐줍니다.
 
     Args:
-        norm_inputs (Dict[str, Any]):
+        inputs (Dict[str, Any]):
             모델 입력 dict.
             - 텐서 예: (B, T, C) 등
             - 리스트 예: scenario_id: List[str] (길이 B)
@@ -3969,7 +4077,7 @@ def _sanitize_norm_inputs_for_validation(
     tensor_only: Dict[str, torch.Tensor] = {}
     non_tensor_only: Dict[str, Any] = {}
 
-    for k, v in norm_inputs.items():
+    for k, v in inputs.items():
         if isinstance(v, torch.Tensor):
             tensor_only[k] = v
         else:
@@ -4026,7 +4134,8 @@ def _get_rollout_settings_for_validation(
     """
     rollout_number: int = int(getattr(args, "rollout_number", 32))
     if args.save_inference_data:
-        rollout_number = 1
+        assert rollout_number == 1, (
+            "save_inference_data가 True일 때는 rollout_number가 1이어야 합니다.")
     requested_rollout_chunk_size: int = int(
         getattr(args, "rollout_chunk_size", rollout_number))
     requested_rollout_chunk_size = max(
@@ -4084,15 +4193,15 @@ def _build_pred_traj_and_pred_head_from_world_rollouts(
     return pred_traj, pred_head
 
 
-def _get_string_list_from_norm_inputs(
-    norm_inputs: Dict[str, Any],
+def _get_string_list_from_inputs(
+    inputs: Dict[str, Any],
     key: str,
     expected_length: int,
 ) -> List[str]:
     """norm_inputs에서 List[str] 값을 꺼내고 길이를 확인합니다.
 
     Args:
-        norm_inputs (Dict[str, Any]):
+        inputs (Dict[str, Any]):
             입력 dict.
         key (str):
             꺼낼 키 이름. 예: "scenario_id", "tfrecord_path"
@@ -4107,7 +4216,7 @@ def _get_string_list_from_norm_inputs(
         AssertionError:
             타입이 list가 아니거나 길이가 다르면 에러.
     """
-    value = norm_inputs.get(key, None)
+    value = inputs.get(key, None)
     assert isinstance(value, list), f"{key}는 List[str] 타입이어야 합니다."
     assert int(len(value)) == int(expected_length), (
         f"{key} 길이가 batch_size와 맞지 않습니다. "
@@ -4116,8 +4225,8 @@ def _get_string_list_from_norm_inputs(
     return value
 
 
-def _get_target_id_flat_from_norm_inputs(
-        norm_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+def _get_target_id_flat_from_inputs(
+        inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
     """target_id를 (N,) 형태로 펼쳐서 반환합니다.
 
     기대 입력/출력 shape
@@ -4126,14 +4235,14 @@ def _get_target_id_flat_from_norm_inputs(
     - 출력: target_id_flat: (N,)  (N = B*(1+)Pnn)
 
     Args:
-        norm_inputs (Dict[str, Any]):
+        inputs (Dict[str, Any]):
             "target_id"를 포함해야 합니다.
 
     Returns:
         torch.Tensor:
             target_id_flat, shape (N,)
     """
-    target_id = norm_inputs.get("target_id", None)
+    target_id = inputs.get("target_id", None)
     if target_id is None:
         return None
     if target_id.dim() != 2:
@@ -4180,7 +4289,7 @@ def _build_agent_batch_tensor(
 
 
 def _expand_target_z_to_rollout_grid(
-    norm_inputs: Dict[str, Any],
+    inputs: Dict[str, Any],
     n_rollout: int,
     n_step: int,
     device: torch.device,
@@ -4195,7 +4304,7 @@ def _expand_target_z_to_rollout_grid(
       - future_len = n_step
 
     Args:
-        norm_inputs (Dict[str, Any]):
+        inputs (Dict[str, Any]):
             "target_z"를 포함해야 합니다.
         n_rollout (int):
             R
@@ -4208,7 +4317,7 @@ def _expand_target_z_to_rollout_grid(
         torch.Tensor:
             target_z_grid, shape (N, R, future_len)
     """
-    target_z = norm_inputs.get("target_z", None)
+    target_z = inputs.get("target_z", None)
     if target_z is None:
         return None
     if not isinstance(target_z, torch.Tensor):
@@ -4435,7 +4544,7 @@ def _build_padded_eval_object_ids_tensor_for_batch(
 
 def _update_min_ade_for_validation_batch(
     outputs: Dict[str, torch.Tensor],
-    norm_inputs: Dict[str, Any],
+    inputs: Dict[str, Any],
     pred_traj: torch.Tensor,
     agent_batch: torch.Tensor,  # (N,)
     target_id: torch.Tensor,  # (N,)
@@ -4465,7 +4574,7 @@ def _update_min_ade_for_validation_batch(
     Args:
         outputs (Dict[str, torch.Tensor]):
             GT 텐서들이 들어있는 dict.
-        norm_inputs (Dict[str, Any]):
+        inputs (Dict[str, Any]):
             "origin_world_pose"가 필요합니다.
             - origin_world_pose: (B, 4)
         pred_traj (torch.Tensor):
@@ -4506,7 +4615,7 @@ def _update_min_ade_for_validation_batch(
         unnorm_target_future_gt_4_dim.shape[3],
     )
 
-    unnorm_origin_pose_world = norm_inputs["origin_world_pose"]  # (B, 4)
+    unnorm_origin_pose_world = inputs["origin_world_pose"]  # (B, 4)
 
     # (N, T, 4) (world)
     unnorm_target_future_gt_4_dim_world = _covert_from_ego_to_world(
@@ -4533,11 +4642,12 @@ def _update_min_ade_for_validation_batch(
             eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
         )
 
+
 def validate_func(
     args: Any,
     model: nn.Module,
     ema: Optional[ModelEma],
-    norm_inputs: Dict[str, torch.Tensor],
+    inputs: Dict[str, torch.Tensor],
     outputs: Dict[str, torch.Tensor],
     state_normalizer: StateNormalizer,
     observation_normalizer: ObservationNormalizer,
@@ -4555,28 +4665,50 @@ def validate_func(
 
     _update_validation_heartbeat_stage(args, f"{tag} | preparing inputs")
 
-    norm_inputs = _sanitize_norm_inputs_for_validation(norm_inputs)
+    inputs = _sanitize_inputs_for_validation(inputs)
     future_len: int = int(getattr(args, "future_len"))
     # target_future_valid :  (B, (1+)Pnn, future_len)
     # target_future_valid 는, 현재에 유효하면, 미래 점도 전부 유효하다고 간주합니다.
     target_future_valid = build_target_future_tensors_and_masks_for_inference(
         args,
-        norm_inputs,
+        inputs,
         future_len,
     )
-    norm_inputs["target_future_valid"] = target_future_valid
-
-    batch_size = _get_batch_size_from_ego_agent_past(norm_inputs)
-    rollout_number, requested_rollout_chunk_size, base_seed, ddp_rank = _get_rollout_settings_for_validation(
-        args)
+    inputs["target_future_valid"] = target_future_valid
+    """
+    args.save_inference_data 가 켜져있으면, 저장/디버그 목적이라 rollout 개수를 1로 강제로 줄입니다.
+    """
+    batch_size = _get_batch_size_from_ego_agent_past(inputs)
+    (rollout_number, requested_rollout_chunk_size, base_seed,
+     ddp_rank) = _get_rollout_settings_for_validation(args)
 
     _update_validation_heartbeat_stage(
         args, f"{tag} | predicting rollouts (rollout={rollout_number})")
     #  (B, (1+)Pnn, rollout_number, future_len, 4)
+    """
+
+1. **`_predict_rollouts_batched_with_oom_fallback` (최상위 “안전장치” 래퍼)**
+
+* 목표: 
+    **rollout을 최대한 크게 묶어 빠르게 돌리되**, 
+    GPU 메모리가 부족하면 **자동으로 묶음 크기(chunk size)를 줄여서 다시 시도**
+* 특징: 
+    한 번 성공한 chunk size를 **기억해두고**, 
+    다음 배치부터는 그 크기(또는 더 작은 값)로 **바로 시작**해서 반복 실패를 줄임
+* 결과: 
+    “어떤 chunk size로 돌렸든” **rollout_number 전체 결과**를 반환하는 게 목적
+
+요약하면,
+
+* **_predict_rollouts_batched_with_oom_fallback = “안 터지게(메모리) 책임지는 상위 컨트롤”**
+* **_predict_rollouts_batched = “전체를 묶음으로 나눠 돌리고 결과를 조립”**
+* **_predict_rollouts_batched_one_chunk = “한 묶음의 rollout을 실제로 생성”**
+
+    """
     target_scenario_rollouts_world = _predict_rollouts_batched_with_oom_fallback(
         args=args,
         model=inference_model,
-        norm_inputs=norm_inputs,
+        inputs=inputs,
         outputs=outputs,
         state_normalizer=state_normalizer,
         observation_normalizer=observation_normalizer,
@@ -4591,19 +4723,19 @@ def validate_func(
     pred_traj, pred_head = _build_pred_traj_and_pred_head_from_world_rollouts(
         target_scenario_rollouts_world=target_scenario_rollouts_world)
 
-    scenario_id: List[str] = _get_string_list_from_norm_inputs(
-        norm_inputs=norm_inputs,
+    scenario_id: List[str] = _get_string_list_from_inputs(
+        inputs=inputs,
         key="scenario_id",
         expected_length=batch_size,
     )
     if args.eval_method == "validation":
-        tfrecord_path: List[str] = _get_string_list_from_norm_inputs(
-            norm_inputs=norm_inputs,
+        tfrecord_path: List[str] = _get_string_list_from_inputs(
+            inputs=inputs,
             key="tfrecord_path",
             expected_length=batch_size,
         )
 
-    target_id = _get_target_id_flat_from_norm_inputs(norm_inputs)
+    target_id = _get_target_id_flat_from_inputs(inputs)
     one_Pnn = int(target_future_valid.shape[1])
 
     agent_batch = _build_agent_batch_tensor(
@@ -4613,7 +4745,7 @@ def validate_func(
     )
 
     pred_z = _expand_target_z_to_rollout_grid(
-        norm_inputs=norm_inputs,
+        inputs=inputs,
         n_rollout=int(pred_traj.shape[1]),
         n_step=int(pred_traj.shape[2]),
         device=pred_traj.device,
@@ -4646,23 +4778,22 @@ def validate_func(
     #     - wosac_metrics 계산은 (C) 방식이면 포장을 worker에서 만들 수 있습니다.
     # ------------------------------------------------------------
     need_scenario_rollouts_for_submission: bool = bool(
-        getattr(wosac_submission, "is_active", False)
-    )
+        getattr(wosac_submission, "is_active", False))
 
     scenario_rollouts: Optional[List[
-        sim_agents_submission_pb2.ScenarioRollouts
-    ]] = None
+        sim_agents_submission_pb2.ScenarioRollouts]] = None
 
     if need_scenario_rollouts_for_submission:
-        _update_validation_heartbeat_stage(args, f"{tag} | packaging WOSAC inputs")
+        _update_validation_heartbeat_stage(args,
+                                           f"{tag} | packaging WOSAC inputs")
 
         scenario_rollouts = get_scenario_rollouts(
             scenario_id=get_scenario_id_int_tensor(scenario_id, device),
-            agent_id=wosac_agent_id,         # (N2,)
-            agent_batch=wosac_agent_batch,   # (N2,)
-            pred_traj=wosac_pred_traj,       # (N2, R, T, 2)
-            pred_z=wosac_pred_z,             # (N2, R, T)
-            pred_head=wosac_pred_head,       # (N2, R, T)
+            agent_id=wosac_agent_id,  # (N2,)
+            agent_batch=wosac_agent_batch,  # (N2,)
+            pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
+            pred_z=wosac_pred_z,  # (N2, R, T)
+            pred_head=wosac_pred_head,  # (N2, R, T)
         )
 
     # ------------------------------------------------------------
@@ -4670,8 +4801,7 @@ def validate_func(
     # ------------------------------------------------------------
     if wosac_submission.is_active:
         _update_validation_heartbeat_stage(
-            args, f"{tag} | collecting data for submission"
-        )
+            args, f"{tag} | collecting data for submission")
 
         wosac_submission.update(
             scenario_id=scenario_id,
@@ -4683,7 +4813,8 @@ def validate_func(
             global_rank=int(ddp_rank),
         )
 
-        world_size_now: int = int(ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
+        world_size_now: int = int(
+            ddp.get_world_size()) if ddp.is_dist_avail_and_initialized() else 1
 
         if world_size_now <= 1:
             if int(ddp_rank) == 0 and scenario_rollouts is not None:
@@ -4707,8 +4838,7 @@ def validate_func(
     # ------------------------------------------------------------
     if wosac_metrics.is_active:
         _update_validation_heartbeat_stage(
-            args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})"
-        )
+            args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})")
 
         if scenario_rollouts is not None:
             wosac_metrics.update(
@@ -4718,17 +4848,15 @@ def validate_func(
             )
         else:
             wosac_metrics.update_from_rollout_tensors(
-                scenario_files=tfrecord_path,     # len=B
-                scenario_ids=scenario_id,         # len=B
-                agent_id=wosac_agent_id,          # (N2,)
-                agent_batch=wosac_agent_batch,    # (N2,)
-                pred_traj=wosac_pred_traj,        # (N2, R, T, 2)
-                pred_z=wosac_pred_z,              # (N2, R, T)
-                pred_head=wosac_pred_head,        # (N2, R, T)
+                scenario_files=tfrecord_path,  # len=B
+                scenario_ids=scenario_id,  # len=B
+                agent_id=wosac_agent_id,  # (N2,)
+                agent_batch=wosac_agent_batch,  # (N2,)
+                pred_traj=wosac_pred_traj,  # (N2, R, T, 2)
+                pred_z=wosac_pred_z,  # (N2, R, T)
+                pred_head=wosac_pred_head,  # (N2, R, T)
                 should_validate=args.validate_scenario_rollouts,
             )
-
-
 
     if min_ade.is_active:
         _update_validation_heartbeat_stage(args, f"{tag} | computing minADE")
@@ -4746,7 +4874,7 @@ def validate_func(
 
         _update_min_ade_for_validation_batch(
             outputs=outputs,
-            norm_inputs=norm_inputs,
+            inputs=inputs,
             pred_traj=pred_traj,
             agent_batch=agent_batch,
             target_id=target_id,
@@ -4833,7 +4961,6 @@ def _build_origin_transform_working_sets(
             working_masks[key] = norm_inputs_copy[key]
 
     return working_tensors, working_masks
-
 
 
 from typing import Any, Dict, List
@@ -5599,11 +5726,10 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     return unnorm_inputs_copy
 
 
-
 def _transform_origin(
     unnorm_inputs_copy: Dict[str, torch.Tensor],
     normed_ego_next_pose: torch.Tensor,  # (B*R, 4)
-        gap : int,
+    gap: int,
     cached_valid_masks: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
     """normed_ego_next_pose 기준으로 입력 전체의 좌표 기준을 바꿉니다.
@@ -5689,8 +5815,8 @@ def _transform_origin(
         future_len = future_pose_4.shape[-2]
 
         # ✅ 겹치는 슬라이스 대입 방지: RHS에 clone()
-        future_pose_4[..., :future_len - gap, :] = future_pose_4[
-            ..., gap:, :].clone()
+        future_pose_4[..., :future_len -
+                      gap, :] = future_pose_4[..., gap:, :].clone()
         future_pose_4[..., future_len - gap:, :] = 0.0
 
         valid_mask = _build_valid_mask_for_pose_4_dim(future_pose_4)
@@ -5702,7 +5828,8 @@ def _transform_origin(
             valid_mask=valid_mask,
         )
 
-    planner_future_11_dim = unnorm_inputs_copy.get("planner_future_11_dim", None)
+    planner_future_11_dim = unnorm_inputs_copy.get("planner_future_11_dim",
+                                                   None)
     if planner_future_11_dim is not None:
         future_len = planner_future_11_dim.shape[-2]
 

@@ -48,6 +48,7 @@ def _build_ego_reference_pose_np(
     )
     return ego_pose_np
 
+
 def get_ego_past_array_from_scenario(
         scenario: NuPlanScenario, num_past_poses: int,
         past_time_horizon: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -189,6 +190,7 @@ def sampled_future_ego_states_to_array(
 
     return fut_ego_world_10
 
+
 def get_ego_future_array_from_scenario(
     scenario: NuPlanScenario,
     current_ego_state: EgoState,
@@ -251,7 +253,8 @@ def get_ego_future_array_from_scenario(
     )
 
     # 2) 월드 기준 10차원 배열로 변환
-    fut_ego_world_10 = sampled_future_ego_states_to_array(list(future_ego_states))  # (T, 10)
+    fut_ego_world_10 = sampled_future_ego_states_to_array(
+        list(future_ego_states))  # (T, 10)
 
     # 3) 기준 포즈 결정
     if ego_cur_pose_np is None:
@@ -261,9 +264,13 @@ def get_ego_future_array_from_scenario(
         )
     else:
         if not isinstance(ego_cur_pose_np, np.ndarray):
-            raise TypeError(f"`ego_cur_pose_np`는 np.ndarray 여야 합니다. got {type(ego_cur_pose_np)}")
+            raise TypeError(
+                f"`ego_cur_pose_np`는 np.ndarray 여야 합니다. got {type(ego_cur_pose_np)}"
+            )
         if ego_cur_pose_np.shape != (3,):
-            raise ValueError(f"`ego_cur_pose_np` shape는 (3,) 이어야 합니다. got {ego_cur_pose_np.shape}")
+            raise ValueError(
+                f"`ego_cur_pose_np` shape는 (3,) 이어야 합니다. got {ego_cur_pose_np.shape}"
+            )
         ego_cur_pose_np_use = ego_cur_pose_np.astype(np.float64, copy=False)
 
     # 4) ego 기준으로 변환 (T, 11)
@@ -289,7 +296,6 @@ def get_ego_future_array_from_scenario(
     ).astype(np.float32, copy=False)  # (T, 3)
 
     return fut_ego_local_xyh, fut_ego_local_11
-
 
 
 def calculate_additional_ego_states(ego_agent_past, time_stamp):

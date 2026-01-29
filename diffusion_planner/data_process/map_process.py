@@ -923,6 +923,7 @@ def _initialize_lane_attribute_arrays(
         lanes_point_tl_array,
     )
 
+
 def _is_resampled_centerline_valid(
     center_xy: np.ndarray,  # shape: (lane_len, 2)
     *,
@@ -948,7 +949,8 @@ def _is_resampled_centerline_valid(
             False: 무효(패딩 취급해야 함)
     """
     if center_xy.ndim != 2 or center_xy.shape[1] != 2:
-        raise ValueError(f"`center_xy` shape은 (lane_len, 2)여야 합니다. got {center_xy.shape}")
+        raise ValueError(
+            f"`center_xy` shape은 (lane_len, 2)여야 합니다. got {center_xy.shape}")
 
     lane_len: int = int(center_xy.shape[0])
     if lane_len == 0:
@@ -980,15 +982,21 @@ def _is_resampled_centerline_valid(
 
     return True
 
+
 def _fill_lane_arrays_for_selected_lanes(
         selected_lane_indices: List[int],  # 길이 = chosen_lane_num
-        feature_coords: List[np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
-        left_boundary: List[np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
-        right_boundary: List[np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
+        feature_coords: List[
+            np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
+        left_boundary: List[
+            np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
+        right_boundary: List[
+            np.ndarray],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, 2)
         lanes_roadblock_id_list: List[str],  # 길이 = chosen_lane_num
         lane_has_speed_limit: np.ndarray,  # (chosen_lane_num,)
         lane_speed_limit: np.ndarray,  # (chosen_lane_num,)
-        feature_tl_data: Optional[List[np.ndarray]],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, dim) 또는 None
+        feature_tl_data: Optional[List[
+            np.
+            ndarray]],  # 길이 = chosen_lane_num, 각 원소: (num_points_i, dim) 또는 None
         map_points_num: int,
         chosen_center_xy: np.ndarray,  # (chosen_lane_num, map_points_num, 2)
         left_array: np.ndarray,  # (chosen_lane_num, map_points_num, 2)
@@ -996,7 +1004,8 @@ def _fill_lane_arrays_for_selected_lanes(
         lane_xy_valid_mask: np.ndarray,  # (chosen_lane_num, map_points_num)
         lane_has_speed_limit_array: np.ndarray,  # (chosen_lane_num, 1)
         lane_speed_limit_array: np.ndarray,  # (chosen_lane_num, 1)
-        lanes_point_tl_array: Optional[np.ndarray],  # (chosen_lane_num, map_points_num, dim) 또는 None
+        lanes_point_tl_array: Optional[
+            np.ndarray],  # (chosen_lane_num, map_points_num, dim) 또는 None
 ) -> List[str]:
     """선택된 lane 인덱스들에 대해, 실제 좌표/속도제한/신호 데이터를 배열에 채워 넣는다.
 
@@ -1013,11 +1022,13 @@ def _fill_lane_arrays_for_selected_lanes(
     chosen_lanes_rb_id_list: List[str] = []
 
     for out_idx, src_idx in enumerate(selected_lane_indices):
-        element_coords_raw: np.ndarray = feature_coords[src_idx]  # (num_points_i, 2)
+        element_coords_raw: np.ndarray = feature_coords[
+            src_idx]  # (num_points_i, 2)
 
         # centerline만 먼저 보간/리샘플
         # element_coords: (map_points_num, 2)
-        element_coords: np.ndarray = _interpolate_points(element_coords_raw, map_points_num)
+        element_coords: np.ndarray = _interpolate_points(
+            element_coords_raw, map_points_num)
 
         # ✅ centerline 유효성 판단 (left/right는 보지 않음)
         if not _is_resampled_centerline_valid(element_coords, eps=1e-6):
@@ -1031,23 +1042,28 @@ def _fill_lane_arrays_for_selected_lanes(
             continue
 
         # 유효 lane만 나머지도 채움
-        left_coords_raw: np.ndarray = left_boundary[src_idx]   # (num_points_i, 2)
-        right_coords_raw: np.ndarray = right_boundary[src_idx] # (num_points_i, 2)
+        left_coords_raw: np.ndarray = left_boundary[
+            src_idx]  # (num_points_i, 2)
+        right_coords_raw: np.ndarray = right_boundary[
+            src_idx]  # (num_points_i, 2)
 
         # left/right도 동일 길이로 맞춤
-        left_coords: np.ndarray = _interpolate_points(left_coords_raw, map_points_num)    # (map_points_num, 2)
-        right_coords: np.ndarray = _interpolate_points(right_coords_raw, map_points_num) # (map_points_num, 2)
+        left_coords: np.ndarray = _interpolate_points(
+            left_coords_raw, map_points_num)  # (map_points_num, 2)
+        right_coords: np.ndarray = _interpolate_points(
+            right_coords_raw, map_points_num)  # (map_points_num, 2)
 
         # 좌표 채우기
         chosen_center_xy[out_idx] = element_coords  # (map_points_num, 2)
-        left_array[out_idx] = left_coords           # (map_points_num, 2)
-        right_array[out_idx] = right_coords         # (map_points_num, 2)
+        left_array[out_idx] = left_coords  # (map_points_num, 2)
+        right_array[out_idx] = right_coords  # (map_points_num, 2)
 
         # ✅ 유효 lane만 True
-        lane_xy_valid_mask[out_idx] = True          # (map_points_num,)
+        lane_xy_valid_mask[out_idx] = True  # (map_points_num,)
 
         # 속도제한 / roadblock id 채우기
-        lane_has_speed_limit_array[out_idx, 0] = bool(lane_has_speed_limit[src_idx])
+        lane_has_speed_limit_array[out_idx,
+                                   0] = bool(lane_has_speed_limit[src_idx])
         lane_speed_limit_array[out_idx, 0] = float(lane_speed_limit[src_idx])
         chosen_lanes_rb_id_list.append(lanes_roadblock_id_list[src_idx])
 

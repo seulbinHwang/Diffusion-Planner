@@ -860,6 +860,7 @@ def _pack_ego_local_agents(
 
     return all_frame_np_agents_local
 
+
 def build_agents_past_ego_frame_array(
     past_cur_agents_world_8_list: List[np.ndarray],  # len = num_frames
     ego_cur_pose_np: np.ndarray,  # shape: (3,)
@@ -873,8 +874,7 @@ def build_agents_past_ego_frame_array(
             - N이 0이면 (T, 0, agents_states_dim + 1)
     """
     all_frame_cur_exists_agents: List[np.ndarray] = _filter_agents_array(
-        past_cur_agents_world_8_list, reverse=True
-    )
+        past_cur_agents_world_8_list, reverse=True)
 
     num_frames: int = len(all_frame_cur_exists_agents)
 
@@ -895,7 +895,6 @@ def build_agents_past_ego_frame_array(
         agents_states_dim=agents_states_dim,
     )
     return all_frame_np_agents_local
-
 
 
 def _build_present_static_feature_6(
@@ -1033,7 +1032,8 @@ def _compute_valid_sorted_indices(
             - sorted_cur_agent_indices: shape (M,)
             - dist_from_cur_agent_to_ego: shape (N,)
     """
-    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[-1] < 9:
+    if all_frame_np_agents_local.ndim != 3 or all_frame_np_agents_local.shape[
+            -1] < 9:
         raise ValueError(
             f"`all_frame_np_agents_local`는 (T, N, 9) shape 이어야 합니다. got {all_frame_np_agents_local.shape}"
         )
@@ -1043,35 +1043,40 @@ def _compute_valid_sorted_indices(
 
     # ✅ (추가 안전장치) 프레임이 없거나, 에이전트가 0명이면 바로 “후보 없음”
     if num_frames == 0:
-        return np.zeros((0,), dtype=int), np.zeros((current_agents_num,), dtype=np.float64)
+        return np.zeros((0,), dtype=int), np.zeros((current_agents_num,),
+                                                   dtype=np.float64)
     if current_agents_num == 0:
         return np.zeros((0,), dtype=int), np.zeros((0,), dtype=np.float64)
 
     dist_from_cur_agent_to_ego: np.ndarray = np.linalg.norm(
-        all_frame_np_agents_local[-1, :, :2], axis=-1
-    )  # shape: (N,)
+        all_frame_np_agents_local[-1, :, :2], axis=-1)  # shape: (N,)
 
     eps: float = 1e-8
-    current_state_8: np.ndarray = all_frame_np_agents_local[-1, :, :8]  # shape: (N, 8)
-    present_mask: np.ndarray = (np.abs(current_state_8) > eps).any(axis=1)  # shape: (N,)
+    current_state_8: np.ndarray = all_frame_np_agents_local[-1, :, :
+                                                            8]  # shape: (N, 8)
+    present_mask: np.ndarray = (np.abs(current_state_8)
+                                > eps).any(axis=1)  # shape: (N,)
 
     if filter_radius is not None:
-        within_radius = dist_from_cur_agent_to_ego <= float(filter_radius)  # shape: (N,)
+        within_radius = dist_from_cur_agent_to_ego <= float(
+            filter_radius)  # shape: (N,)
         valid_mask = present_mask & within_radius
     else:
         valid_mask = present_mask
 
-    valid_indices: np.ndarray = np.nonzero(valid_mask)[0].astype(int)  # shape: (M,)
+    valid_indices: np.ndarray = np.nonzero(valid_mask)[0].astype(
+        int)  # shape: (M,)
 
     if valid_indices.size == 0:
         return np.zeros((0,), dtype=int), dist_from_cur_agent_to_ego
 
-    dist_valid: np.ndarray = dist_from_cur_agent_to_ego[valid_indices]  # shape: (M,)
+    dist_valid: np.ndarray = dist_from_cur_agent_to_ego[
+        valid_indices]  # shape: (M,)
     order_local: np.ndarray = np.argsort(dist_valid)  # shape: (M,)
-    sorted_cur_agent_indices: np.ndarray = valid_indices[order_local]  # shape: (M,)
+    sorted_cur_agent_indices: np.ndarray = valid_indices[
+        order_local]  # shape: (M,)
 
     return sorted_cur_agent_indices, dist_from_cur_agent_to_ego
-
 
 
 def _select_indices_with_type_cap(

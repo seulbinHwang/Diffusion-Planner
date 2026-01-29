@@ -132,7 +132,6 @@ class DynamicLimits:
     omega_max_abs_radps: float
     v_b_y_max: float = 0.1  # 기본값(기존 동작과 동일하게 유지)
 
-
     def as_dict(self) -> Dict[str, float]:
         """딕셔너리 형태로 반환."""
         return asdict(self)
@@ -873,12 +872,12 @@ class FeasibleProjector(nn.Module):
     # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
     # ----------------------------
     def _apply_constraints_batch(
-            self,
-            vx_b_raw: torch.Tensor,  # (B,Pnn,T)
-            vy_b_raw: torch.Tensor,  # (B,Pnn,T)
-            omega_raw: torch.Tensor,  # (B,Pnn,T)
-            key_to_limit_bp: Dict[str, torch.Tensor],
-            hp: _ConstraintHParams,
+        self,
+        vx_b_raw: torch.Tensor,  # (B,Pnn,T)
+        vy_b_raw: torch.Tensor,  # (B,Pnn,T)
+        omega_raw: torch.Tensor,  # (B,Pnn,T)
+        key_to_limit_bp: Dict[str, torch.Tensor],
+        hp: _ConstraintHParams,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.use_feasible_filter:
             return vx_b_raw, vy_b_raw, omega_raw
@@ -1516,12 +1515,12 @@ class FeasibleProjector(nn.Module):
         return unnorm_seg_body_control
 
     def _compute_midpoint_yaw_from_cos_sin(
-            self,
-            cos_all: torch.Tensor,  # (B, Pnn, point_len)
-            sin_all: torch.Tensor,  # (B, Pnn, point_len)
-            start_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
-            end_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
-            eps: float,
+        self,
+        cos_all: torch.Tensor,  # (B, Pnn, point_len)
+        sin_all: torch.Tensor,  # (B, Pnn, point_len)
+        start_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
+        end_valid: torch.Tensor,  # (B, Pnn, segment_len)  float {0,1}
+        eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """두 끝점의 (cos, sin)로부터 '중간 방향'의 (cos, sin)을 계산합니다.
 
@@ -1941,10 +1940,10 @@ class FeasibleProjector(nn.Module):
         return delta_u
 
     def _build_per_agent_limits(
-            self,
-            near_class_one_hot: torch.Tensor,  # (B,Pnn,3)
-            device: torch.device,
-            dtype: torch.dtype,
+        self,
+        near_class_one_hot: torch.Tensor,  # (B,Pnn,3)
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> Dict[str, torch.Tensor]:
         """클래스별 스칼라 제약치를 (B,Pnn) 텐서로 확장."""
         car: DynamicLimits = self.constraints[ActorClass.CAR]
@@ -1953,8 +1952,11 @@ class FeasibleProjector(nn.Module):
 
         def cvec(getattr_name: str) -> torch.Tensor:
             vals = torch.tensor(
-                [getattr(car, getattr_name), getattr(ped, getattr_name),
-                 getattr(bic, getattr_name)],
+                [
+                    getattr(car, getattr_name),
+                    getattr(ped, getattr_name),
+                    getattr(bic, getattr_name)
+                ],
                 device=device,
                 dtype=dtype,
             )  # (3,)
@@ -2116,7 +2118,6 @@ class FeasibleProjector(nn.Module):
         vy_out = torch.where(is_nonholonomic, vy_new, vy_b)
         return vx_b, vy_out
 
-
     def _apply_S1_speed_limit_ste(
             self, vx_b: torch.Tensor, vy_b: torch.Tensor, v_max: torch.Tensor,
             eta: float, eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2160,16 +2161,16 @@ class FeasibleProjector(nn.Module):
 
     # [추가 요망] (S3: 속도-연동 각속도 한계 — w clip, no slip angle)
     def _apply_S3_omega_clip_ste(
-            self,
-            vx_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
-            vy_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
-            omega: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
-            a_lat_max: torch.Tensor,  # (B,Pnn)
-            R_min: torch.Tensor,  # (B,Pnn)
-            omega_abs_max: torch.Tensor,  # (B,Pnn)
-            is_nonholonomic: torch.Tensor,  # (B,Pnn) bool
-            eta: float,
-            eps: float,
+        self,
+        vx_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+        vy_b: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+        omega: torch.Tensor,  # (B,Pnn) or (B,Pnn,T)
+        a_lat_max: torch.Tensor,  # (B,Pnn)
+        R_min: torch.Tensor,  # (B,Pnn)
+        omega_abs_max: torch.Tensor,  # (B,Pnn)
+        is_nonholonomic: torch.Tensor,  # (B,Pnn) bool
+        eta: float,
+        eps: float,
     ) -> torch.Tensor:
         """(S3) 속도-연동 omega 한계로 직접 clip.
 
@@ -2179,8 +2180,8 @@ class FeasibleProjector(nn.Module):
             - 즉, |omega| <= |v_x^b| / R_min
         """
         # 기존 speed는 a_lat_max 항에 계속 사용(그대로 유지)
-        speed = torch.sqrt(
-            vx_b * vx_b + vy_b * vy_b + eps)  # (B,Pnn) or (B,Pnn,T)
+        speed = torch.sqrt(vx_b * vx_b + vy_b * vy_b +
+                           eps)  # (B,Pnn) or (B,Pnn,T)
 
         # ✅ r 제약에 쓰는 v는 |v_x^b|
         v_x_abs = vx_b.abs()  # (B,Pnn) or (B,Pnn,T)
@@ -2196,7 +2197,7 @@ class FeasibleProjector(nn.Module):
         allow_abs = omega_abs_max
 
         allow_nonh = torch.minimum(torch.minimum(allow_lat, allow_R), allow_abs)
-        allow_holo = allow_abs #torch.minimum(allow_lat, allow_abs)
+        allow_holo = allow_abs  #torch.minimum(allow_lat, allow_abs)
 
         if is_nonholonomic.dim() == allow_nonh.dim() - 1:
             is_nonholonomic = is_nonholonomic.unsqueeze(-1).expand_as(
@@ -2256,17 +2257,17 @@ class FeasibleProjector(nn.Module):
     # [NEW] 한 스텝: 제약 S0~S4 적용(모두 STE 버전 호출)
     # ----------------------------
     def _apply_constraints_step(
-            self,
-            vx_b_prev: torch.Tensor,
-            vy_b_prev: torch.Tensor,
-            omega_prev: torch.Tensor,
-            vx_b_k: torch.Tensor,
-            vy_b_k: torch.Tensor,
-            omega_k: torch.Tensor,
-            hp: _ConstraintHParams,
-            key_to_limit_bp: Dict[str, torch.Tensor],
-            apply_S2: bool = True,
-            apply_S4_ax: bool = True,
+        self,
+        vx_b_prev: torch.Tensor,
+        vy_b_prev: torch.Tensor,
+        omega_prev: torch.Tensor,
+        vx_b_k: torch.Tensor,
+        vy_b_k: torch.Tensor,
+        omega_k: torch.Tensor,
+        hp: _ConstraintHParams,
+        key_to_limit_bp: Dict[str, torch.Tensor],
+        apply_S2: bool = True,
+        apply_S4_ax: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # (S0)
         vx_b_k, vy_b_k = self._apply_S0_nonholonomic_ste(
@@ -3557,7 +3558,8 @@ class FeasibleProjector(nn.Module):
                 2차 변화율 결과. 계산 불가한 곳은 0.
         """
         num_rows, sequence_length, num_channels = sequence_multi_channel.shape  # (N,T,C)
-        second_derivative_fd = torch.zeros_like(sequence_multi_channel)  # (N,T,C)
+        second_derivative_fd = torch.zeros_like(
+            sequence_multi_channel)  # (N,T,C)
 
         if sequence_length < 3:
             return second_derivative_fd
@@ -3567,38 +3569,34 @@ class FeasibleProjector(nn.Module):
 
         # 내부 구간(t=1..T-2): (x_{t+1} - 2x_t + x_{t-1}) / dt^2
         center = valid[:, 1:-1]  # (N,T-2)
-        left = valid[:, :-2]     # (N,T-2)
-        right = valid[:, 2:]     # (N,T-2)
+        left = valid[:, :-2]  # (N,T-2)
+        right = valid[:, 2:]  # (N,T-2)
         ok = center & left & right  # (N,T-2)
 
-        sec = (
-            sequence_multi_channel[:, 2:, :] -
-            2.0 * sequence_multi_channel[:, 1:-1, :] +
-            sequence_multi_channel[:, :-2, :]
-        ) / dt2  # (N,T-2,C)
+        sec = (sequence_multi_channel[:, 2:, :] -
+               2.0 * sequence_multi_channel[:, 1:-1, :] +
+               sequence_multi_channel[:, :-2, :]) / dt2  # (N,T-2,C)
 
-        second_derivative_fd[:, 1:-1, :] = sec * ok.unsqueeze(-1).to(sequence_multi_channel.dtype)
+        second_derivative_fd[:, 1:-1, :] = sec * ok.unsqueeze(-1).to(
+            sequence_multi_channel.dtype)
 
         # 맨 앞(t=0): (x2 - 2x1 + x0) / dt^2
         ok0 = valid[:, 0] & valid[:, 1] & valid[:, 2]  # (N,)
-        sec0 = (
-            sequence_multi_channel[:, 2, :] -
-            2.0 * sequence_multi_channel[:, 1, :] +
-            sequence_multi_channel[:, 0, :]
-        ) / dt2  # (N,C)
-        second_derivative_fd[:, 0, :] = sec0 * ok0.unsqueeze(-1).to(sequence_multi_channel.dtype)
+        sec0 = (sequence_multi_channel[:, 2, :] -
+                2.0 * sequence_multi_channel[:, 1, :] +
+                sequence_multi_channel[:, 0, :]) / dt2  # (N,C)
+        second_derivative_fd[:, 0, :] = sec0 * ok0.unsqueeze(-1).to(
+            sequence_multi_channel.dtype)
 
         # 맨 뒤(t=T-1): (x_{T-1} - 2x_{T-2} + x_{T-3}) / dt^2
         okL = valid[:, -1] & valid[:, -2] & valid[:, -3]  # (N,)
-        secL = (
-            sequence_multi_channel[:, -1, :] -
-            2.0 * sequence_multi_channel[:, -2, :] +
-            sequence_multi_channel[:, -3, :]
-        ) / dt2  # (N,C)
-        second_derivative_fd[:, -1, :] = secL * okL.unsqueeze(-1).to(sequence_multi_channel.dtype)
+        secL = (sequence_multi_channel[:, -1, :] -
+                2.0 * sequence_multi_channel[:, -2, :] +
+                sequence_multi_channel[:, -3, :]) / dt2  # (N,C)
+        second_derivative_fd[:, -1, :] = secL * okL.unsqueeze(-1).to(
+            sequence_multi_channel.dtype)
 
         return second_derivative_fd  # (N,T,C)
-
 
     def _savgol_select_window_length(
         self,
@@ -3790,10 +3788,11 @@ class FeasibleProjector(nn.Module):
             derivative_out: (N, T, C)
         """
         num_rows, sequence_length, dim_p1, _ = A_all.shape  # (N, T, P+1, P+1)
-        _, _, num_channels, _ = b_all.shape                 # (N, T, C, P+1)
+        _, _, num_channels, _ = b_all.shape  # (N, T, C, P+1)
 
         if derivative_order not in (1, 2):
-            raise ValueError(f"derivative_order must be 1 or 2. got={derivative_order}")
+            raise ValueError(
+                f"derivative_order must be 1 or 2. got={derivative_order}")
 
         # polyorder가 derivative_order보다 작으면, 창 기반 계산이 의미 없으니 기본값만 사용
         if int(polyorder) < int(derivative_order):
@@ -3824,13 +3823,14 @@ class FeasibleProjector(nn.Module):
             )
             return derivative_out
 
-        good_flat_idx = good_mask.view(-1).nonzero(as_tuple=False).squeeze(-1)  # (M,)
+        good_flat_idx = good_mask.view(-1).nonzero(as_tuple=False).squeeze(
+            -1)  # (M,)
 
         A_flat = A_all.view(-1, dim_p1, dim_p1)  # (N*T, P+1, P+1)
-        A_good = A_flat[good_flat_idx]           # (M, P+1, P+1)
+        A_good = A_flat[good_flat_idx]  # (M, P+1, P+1)
 
-        b_flat = b_all.view(-1, num_channels, dim_p1)          # (N*T, C, P+1)
-        b_good = b_flat[good_flat_idx].permute(0, 2, 1)        # (M, P+1, C)
+        b_flat = b_all.view(-1, num_channels, dim_p1)  # (N*T, C, P+1)
+        b_good = b_flat[good_flat_idx].permute(0, 2, 1)  # (M, P+1, C)
 
         identity_matrix = torch.eye(
             dim_p1,
@@ -3838,9 +3838,11 @@ class FeasibleProjector(nn.Module):
             dtype=A_good.dtype,
         ).unsqueeze(0)  # (1, P+1, P+1)
 
-        A_good_reg = A_good + float(regularization_epsilon) * identity_matrix  # (M, P+1, P+1)
+        A_good_reg = A_good + float(
+            regularization_epsilon) * identity_matrix  # (M, P+1, P+1)
 
-        coefficients_good = torch.linalg.solve(A_good_reg, b_good)  # (M, P+1, C)
+        coefficients_good = torch.linalg.solve(A_good_reg,
+                                               b_good)  # (M, P+1, C)
 
         # τ=0에서의 변화율:
         # 1차: coeff[1]
@@ -3855,7 +3857,8 @@ class FeasibleProjector(nn.Module):
 
         derivative_out_flat = derivative_out.view(-1, num_channels)  # (N*T, C)
         derivative_out_flat[good_flat_idx] = derivative_good
-        derivative_out = derivative_out_flat.view(num_rows, sequence_length, num_channels)  # (N, T, C)
+        derivative_out = derivative_out_flat.view(num_rows, sequence_length,
+                                                  num_channels)  # (N, T, C)
 
         derivative_out = torch.where(
             valid_center_mask.unsqueeze(-1),
@@ -3863,7 +3866,6 @@ class FeasibleProjector(nn.Module):
             torch.zeros_like(derivative_out),
         )
         return derivative_out
-
 
     def _savgol_derivative_masked_multi_torch(
         self,
@@ -3899,19 +3901,20 @@ class FeasibleProjector(nn.Module):
         dtype = seq_bTC.dtype
 
         if derivative_order not in (1, 2):
-            raise ValueError(f"derivative_order must be 1 or 2. got={derivative_order}")
+            raise ValueError(
+                f"derivative_order must be 1 or 2. got={derivative_order}")
 
         # 0) 기본값(유한 차분)
         if derivative_order == 1:
             fd_derivative = self._savgol_finite_difference_multi(
                 sequence_multi_channel=seq_bTC,  # (N,T,C)
-                valid_mask_bT=valid_bT,          # (N,T)
+                valid_mask_bT=valid_bT,  # (N,T)
                 dt=dt,
             )  # (N,T,C)
         else:
             fd_derivative = self._savgol_finite_difference_second_multi(
                 sequence_multi_channel=seq_bTC,  # (N,T,C)
-                valid_mask_bT=valid_bT,          # (N,T)
+                valid_mask_bT=valid_bT,  # (N,T)
                 dt=dt,
             )  # (N,T,C)
 
@@ -3952,8 +3955,8 @@ class FeasibleProjector(nn.Module):
 
         b_all = self._savgol_build_b_all_multi(
             sequence_multi_channel=seq_bTC,  # (N,T,C)
-            mask_window=mask_window,         # (N,T,W)
-            power_per_k=power_per_k,         # (W,P+1)
+            mask_window=mask_window,  # (N,T,W)
+            power_per_k=power_per_k,  # (W,P+1)
             window_length=window_length,
         )  # (N,T,C,P+1)
 
@@ -4031,8 +4034,8 @@ class FeasibleProjector(nn.Module):
         )  # (B*Pnn, T)
 
         derivative_flat = self._savgol_derivative_masked_multi_torch(
-            seq_bTC=sequence_flat,      # (B*Pnn, T, C)
-            valid_bT=valid_flat,        # (B*Pnn, T)
+            seq_bTC=sequence_flat,  # (B*Pnn, T, C)
+            valid_bT=valid_flat,  # (B*Pnn, T)
             dt=dt,
             polyorder=polyorder,
             max_window_length=max_window_length,
@@ -4046,7 +4049,6 @@ class FeasibleProjector(nn.Module):
             num_channels,
         )  # (B,Pnn,T,C)
         return derivatives_points
-
 
     def _assert_past_cur_valid_mask(
         self,
