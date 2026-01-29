@@ -3103,7 +3103,6 @@ def _predict_rollouts_batched_one_chunk(
     merged_batch: int = int(batch_size * rollout_repeat)
 
     norm_inputs = observation_normalizer(inputs)
-    # TODO
     # (B, ...) -> (B*R, ...)
     norm_inputs_copy_init: Dict[str,
                                 Any] = _expand_norm_inputs_for_rollout_batch(
