@@ -136,9 +136,7 @@ def _prepare_batch_for_device(
 
     # outputs 분리 (정답은 반드시 Tensor여야 함)
     target_keys = {
-        "ego_future_gt_3_dim",
         "ego_future_gt_4_dim",
-        "near_future_gt_3_dim",
         "near_future_gt_4_dim",
         "ego_future_gt_is_valid",
         "near_future_gt_is_valid",
@@ -203,65 +201,6 @@ def _restore_padding_values_inplace(
         else:
             inputs[feature_key] = t.masked_fill(pad_mask, 0)
 
-
-def _validate_batch_shapes_for_loss(
-    inputs: Dict[str, torch.Tensor],
-    outputs: Dict[str, torch.Tensor],
-    args: argparse.Namespace,
-) -> None:
-    """손실 계산 전에 꼭 맞아야 하는 모양(shape)을 점검한다.
-
-    Args:
-        inputs:
-            - neighbor_agents_past: (B, A_in, T_past, 11)
-        outputs:
-            - ego_future_gt_3_dim: (B, Tf, 3)
-            - near_future_gt_3_dim: (B, A_pred, Tf, 3)
-        args:
-            - future_len 사용
-
-    Raises:
-        ValueError: 모양이 맞지 않으면 즉시 에러로 중단합니다.
-    """
-    if "ego_future_gt_3_dim" not in outputs or "near_future_gt_3_dim" not in outputs:
-        raise ValueError(
-            "outputs에 'ego_future_gt_3_dim' 또는 'near_future_gt_3_dim'이 없습니다.")
-
-    ego_fut = outputs["ego_future_gt_3_dim"]
-    near_fut = outputs["near_future_gt_3_dim"]
-
-    if ego_fut.dim() != 3 or ego_fut.size(-1) != 3:
-        raise ValueError(
-            f"ego_future_gt_3_dim shape expected (B,Tf,3), got {tuple(ego_fut.shape)}"
-        )
-    if near_fut.dim() != 4 or near_fut.size(-1) != 3:
-        raise ValueError(
-            f"near_future_gt_3_dim shape expected (B,A,Tf,3), got {tuple(near_fut.shape)}"
-        )
-
-    if int(ego_fut.shape[1]) != int(args.future_len) or int(
-            near_fut.shape[2]) != int(args.future_len):
-        raise ValueError(
-            f"future_len mismatch: args.future_len={int(args.future_len)}, "
-            f"ego_future_len={int(ego_fut.shape[1])}, near_future_len={int(near_fut.shape[2])}"
-        )
-
-    if "neighbor_agents_past" not in inputs:
-        raise ValueError(
-            "inputs에 'neighbor_agents_past'가 없습니다. loss에서 현재 상태를 만들 수 없습니다.")
-
-    neigh_past = inputs["neighbor_agents_past"]
-    if neigh_past.dim() != 4:
-        raise ValueError(
-            f"neighbor_agents_past must be (B,A,T,11), got {tuple(neigh_past.shape)}"
-        )
-
-    a_in = int(neigh_past.shape[1])
-    a_pred = int(near_fut.shape[1])
-    if a_in < a_pred:
-        raise ValueError(
-            f"neighbor_agents_past agent 수({a_in}) < near_future_gt_3_dim agent 수({a_pred}). "
-            "보통 /max_agent_num 설정 또는 collate padding 크기 문제입니다.")
 
 
 def _build_near_future_4dim_and_mask(
@@ -642,9 +581,7 @@ def train_epoch(
 
             # 1) device 이동 + 상한 클리핑 + 정답 분리
             """ outputs
-        "ego_future_gt_3_dim",
         "ego_future_gt_4_dim",
-        "near_future_gt_3_dim",
         "near_future_gt_4_dim",
         "ego_future_gt_is_valid",
         "near_future_gt_is_valid",
