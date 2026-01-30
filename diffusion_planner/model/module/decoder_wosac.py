@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Callable
 import torch.nn as nn
+from ray.tune.examples.pbt_dcgan_mnist.common import batch_size
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple, Any
@@ -381,7 +382,7 @@ class Decoder(nn.Module):
             return
 
         # integrated_trajectory: (B, (1+)Pnn, T, 4)
-        integrated_trajectory: torch.Tensor = self.dit.dit_returns.integrated_trajectory
+        integrated_trajectory: torch.Tensor = self.dit.norm_dit_returns.integrated_trajectory
         integrated_trajectory = torch.cat(
             [target_current_xyyaw.unsqueeze(2), integrated_trajectory],
             dim=2,
@@ -389,7 +390,7 @@ class Decoder(nn.Module):
 
         decoder_training_output["integrated_trajectory"] = integrated_trajectory
         decoder_training_output[
-            "control_constraint_diff"] = self.dit.dit_returns.control_constraint_diff  # (B, (1+)Pnn, T, 3)
+            "control_constraint_diff"] = self.dit.norm_dit_returns.control_constraint_diff  # (B, (1+)Pnn, T, 3)
 
     def _assert_past_cur_valid_mask(
         self,
@@ -592,7 +593,7 @@ class Decoder(nn.Module):
     ) -> Optional[torch.Tensor]:  # returns: (B, Pnn, future_len, 4) or None
         """DiT가 방금 저장해 둔 FeasibleProjector 적분 결과를 꺼내오는 메서드.
 
-        - 학습/추론 공통으로 self.dit.dit_returns.integrated_trajectory 에 저장된 값을 사용한다.
+        - 학습/추론 공통으로 self.dit.norm_dit_returns.integrated_trajectory 에 저장된 값을 사용한다.
         - shape 이나 배치 크기가 안 맞으면 None 을 돌려서 prox-snap 을 건너뛴다.
         """
         dit_returns = getattr(self.dit, "dit_returns", None)
@@ -1403,6 +1404,7 @@ class Decoder(nn.Module):
         # diffusion_steps > 1 (기존 DPM-Solver 경로)
         # -----------------------------
         if diffusion_steps > 1:
+            #  (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             x0: torch.Tensor = dpm_sampler(
                 self.dit,
                 xT.float(),
@@ -1453,6 +1455,7 @@ class Decoder(nn.Module):
                                               device=xT.device)
 
         # (1) 모델 1회 호출: x0_pred (flat)
+        # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         x0_pred: torch.Tensor = self.dit(
             target_input_norm_xT=xT_f32,  # (B, Pnn, F)
             diffusion_time=t_tau,  # (B, future_len)
@@ -1470,7 +1473,6 @@ class Decoder(nn.Module):
             # guidance_fn이 low_t_mask를 쓰는 경우를 위해 전달(너의 기존 의도 유지)
             classifier_kwargs["low_t_mask"] = low_t_mask
 
-            # condition은 dpm_solver 경로에서 뭘 넣는지 여기 코드만으로는 확정 불가 → None 유지(팩트)
             x0_pred = self._apply_classifier_guidance_for_amortized_one_step(
                 xT_flat=xT_f32,  # (B,Pnn,F)
                 x0_pred_flat=x0_pred,  # (B,Pnn,F)
@@ -1488,18 +1490,17 @@ class Decoder(nn.Module):
         return x0_pred
 
     def _reshape_inference_x0_to_sequence(
-        self,
-        x0: torch.
+            self,
+            x0: torch.
         Tensor,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-        target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
-        batch_size: int,
-        one_or_Pnn: int,
+            target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
     ) -> torch.Tensor:
         """샘플링 결과 x0(flat)를 (B, (1+)Pnn, 1+T, 4) 형태로 복원한다.
         Returns:
             x0_seq:
                 shape: (B, (1+)Pnn, 1+T, 4)
         """
+        batch_size, one_or_Pnn = x0.shape[:2]
         B: int = batch_size
         if self.config.use_past_dit_input:
             x0_seq = x0.reshape(
@@ -1550,23 +1551,23 @@ class Decoder(nn.Module):
 
     def _append_inference_feasible_outputs(
             self,
-            outputs: Dict[str, torch.Tensor],  #
+            return_norm_dict: Dict[str, torch.Tensor],  #
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
     ) -> None:
         """추론 모드에서 feasible 출력(integrated_trajectory)을 outputs에 추가한다.
         Returns:
             None
         """
-        if not getattr(self.config, "use_feasible", False):
+        if not self.config.use_feasible:
             return
 
         # integrated_trajectory: (B, (1+)Pnn, T, 4)  (정규화 상태)
-        integrated_trajectory: torch.Tensor = self.dit.dit_returns.integrated_trajectory
+        integrated_trajectory: torch.Tensor = self.dit.norm_dit_returns.integrated_trajectory
         integrated_trajectory = torch.cat(
             [target_current_xyyaw.unsqueeze(2), integrated_trajectory],
             dim=2,
         )  # (B, (1+)Pnn, 1+T, 4)
-        outputs["integrated_trajectory"] = integrated_trajectory
+        return_norm_dict["integrated_trajectory"] = integrated_trajectory
 
     def _forward_training_mode(
         self,
@@ -1855,9 +1856,9 @@ class Decoder(nn.Module):
         pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
 
     def _update_amortized_future_buffer_origin(
-        self,
-        rollout_time_chunk_size: int,
-        target_future_valid: torch.Tensor,
+            self,
+            rollout_time_chunk_size: int,
+            target_future_valid: torch.Tensor,  # (B, (1+)Pnn, future_len)
     ) -> None:
         """amortized 추론에서 재사용하는 '미래 버퍼'의 좌표 기준을 다음 스텝 기준으로 맞춥니다.
 
@@ -1879,41 +1880,12 @@ class Decoder(nn.Module):
           4) 다시 state_normalizer 로 모델 입력 스케일로 맞춥니다.
           5) (cos, sin)이 길이 1이 되도록 한 번 더 정리합니다.
 
-        Args:
-            rollout_time_chunk_size (int):
-                다음 호출에서 현재가 될 시점까지의 프레임 수.
-                예) 1이면 '다음 프레임'이 새 기준점입니다.
-            target_future_valid (torch.Tensor):
-                미래 버퍼에서 유효한 프레임 표시 마스크.
-                - shape: (B, (1+)Pnn, future_len)
-                - dtype: bool (True=유효, False=무효)
-
-        Returns:
-            None
         """
         if self._x0_for_amortized_inference is None:
             return
 
         # buffer_norm: (B, (1+)Pnn, future_len, 4)
         buffer_norm: torch.Tensor = self._x0_for_amortized_inference
-        if buffer_norm.dim() != 4 or int(buffer_norm.shape[-1]) != 4:
-            raise ValueError(
-                "self._x0_for_amortized_inference는 (B,(1+)Pnn,future_len,4) 이어야 합니다. "
-                f"got shape={tuple(buffer_norm.shape)}")
-
-        future_len: int = int(buffer_norm.shape[2])
-
-        if rollout_time_chunk_size < 1 or rollout_time_chunk_size > future_len:
-            raise ValueError(
-                "rollout_time_chunk_size는 1 이상 future_len 이하이어야 합니다. "
-                f"got rollout_time_chunk_size={rollout_time_chunk_size}, future_len={future_len}"
-            )
-
-        if target_future_valid.shape[:3] != buffer_norm.shape[:3]:
-            raise ValueError(
-                "target_future_valid shape가 미래 버퍼와 맞지 않습니다. "
-                f"expected={tuple(buffer_norm.shape[:3])}, got={tuple(target_future_valid.shape[:3])}"
-            )
 
         # dtype/device 보존용
         original_dtype = buffer_norm.dtype
@@ -1926,16 +1898,17 @@ class Decoder(nn.Module):
             buffer_norm, target_future_valid)
 
         # 2) ego가 기준이 될 시점(rollout_time_chunk_size)에서의 ego 포즈 뽑기
-        # ego_next_pose_unnorm: (B, 4)
+
         step_index: int = int(rollout_time_chunk_size - 1)
-        ego_next_pose_unnorm: torch.Tensor = buffer_unnorm[:, 0,
-                                                           step_index, :].detach(
-                                                           )
+        # unnorm_ego_next_4_dim: (B, 4)
+        unnorm_ego_next_4_dim: torch.Tensor = buffer_unnorm[:, 0,
+                                                            step_index, :].detach(
+                                                            )
 
         # 3) 이동/회전에 필요한 값 계산
         # delta_xy: (B, 2), cos_delta: (B,), sin_delta: (B,)
         delta_xy, cos_delta, sin_delta, _ = self._extract_delta_pose_params(
-            ego_next_pose_unnorm)
+            unnorm_ego_next_4_dim)
 
         # 4) 버퍼 전체를 새 기준으로 이동/회전 (유효 프레임만)
         # valid_mask: (B, (1+)Pnn, future_len)
@@ -1976,11 +1949,14 @@ class Decoder(nn.Module):
         batch_size: int,
         one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
-        """추론/평가 모드에서 한 배치에 대해 decoder 를 한 번 돌린다."""
+        """ return_norm_dict
+        "score" : (B, (1+)Pnn, 1+T, 4)
+        "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
+        """
         with torch.no_grad():
             target_current_xyyaw = target_agents_past[:, :,
                                                       -1, :4]  # (B,(1+)Pnn,4)
-            return_: Dict[str, torch.Tensor] = {}
+            return_norm_dict: Dict[str, torch.Tensor] = {}
             B: int = batch_size
             # 1) 시작 노이즈 생성 (미래만)
             # ✅ (변경) 외부에서 만든 noise를 반드시 입력으로 받는다.
@@ -2075,38 +2051,30 @@ class Decoder(nn.Module):
             # dtype 맞춤(기존 로직 유지)
             x0 = x0.to(xT.dtype)
 
-            # 6) (B, (1+)Pnn, 1+T, 4)
+            # 6) x0_seq_norm: (B, (1+)Pnn, 1+T, 4)
             x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
                 x0=
                 x0,  # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-                target_current_xyyaw=target_current_xyyaw,
-                batch_size=B,
-                one_or_Pnn=one_or_Pnn,
+                target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
-            # self.dit.dit_returns.integrated_trajectory : (B, (1+)Pnn, T, 4) 정규화 상태
+            # self.dit.norm_dit_returns.integrated_trajectory : (B, (1+)Pnn, T, 4) 정규화 상태
             if self.config.use_amortized_diffusion:
                 # self._x0_for_amortized_inference = x0_seq_norm[:, :,
                 #                                                1:, :].detach(
                 #                                                )  # (B, 1+Pnn, T, 4)
-                integrated = self.dit.dit_returns.integrated_trajectory.to(
+                integrated = self.dit.norm_dit_returns.integrated_trajectory.to(
                     device=target_current_xyyaw.device,
                     dtype=target_current_xyyaw.dtype,
                 ).detach()
 
                 self._x0_for_amortized_inference = integrated  # (B, 1+Pnn, T, 4)
-                rollout_time_chunk_size = inputs.get("rollout_time_chunk_size",
-                                                     None)
-                assert rollout_time_chunk_size is not None, (
-                    "rollout_time_chunk_size must be provided in inputs "
-                    "when using amortized diffusion during inference.")
+                rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
                 rollout_time_chunk_size_int = int(
                     rollout_time_chunk_size[0].item())
-
                 # target_future_valid: (B, (1+)Pnn, T)
                 target_future_valid = target_past_cur_future_valid[:, :, -self.
                                                                    _future_len:].detach(
                                                                    )
-
                 # ✅ 미래 버퍼도 다음 스텝 기준 좌표로 맞추기
                 self._update_amortized_future_buffer_origin(
                     rollout_time_chunk_size=rollout_time_chunk_size_int,
@@ -2114,13 +2082,17 @@ class Decoder(nn.Module):
                 )
 
             # 8) feasible 출력(옵션)
+            # return_norm_dict["integrated_trajectory"] : (B, (1+)Pnn, 1+T, 4)
             self._append_inference_feasible_outputs(
-                outputs=return_,
+                return_norm_dict=return_norm_dict,
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
-
-            return_["score"] = x0_seq_norm  # (B, (1+)Pnn, 1+T, 4)
-            return return_
+            return_norm_dict["score"] = x0_seq_norm  # (B, (1+)Pnn, 1+T, 4)
+            """ return_norm_dict
+            "score" : (B, (1+)Pnn, 1+T, 4)
+            "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
+            """
+            return return_norm_dict
 
     def forward(
         self,
@@ -2166,6 +2138,10 @@ class Decoder(nn.Module):
                 one_or_Pnn=one_or_Pnn,
             )
         else:
+            """ return_norm_dict
+            "score" : (B, (1+)Pnn, 1+T, 4)
+            "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
+            """
             return self._forward_inference_mode(
                 inputs=inputs,
                 scene_encoding_token=scene_encoding_token,
@@ -2200,7 +2176,7 @@ class DiT(nn.Module):
                  mlp_ratio=4.0,
                  model_type="x_start"):
         super().__init__()
-        self.dit_returns = None
+        self.norm_dit_returns = None
         self.config = config
         self._future_len: int = config.future_len  # <추가하자>
 
@@ -2397,9 +2373,9 @@ class DiT(nn.Module):
         )
 
     def _build_diffusion_trajectory_for_feasible_projection(
-        self,
-        x_for_feasible: torch.Tensor,  # (B, (1+)Pnn, F_out)
-        target_current_xyyaw_for_feasible: torch.
+            self,
+            x_for_feasible: torch.Tensor,  # (B, (1+)Pnn, F_out)
+            target_current_xyyaw_for_feasible: torch.
         Tensor,  # (B,(1+)Pnn,4) float32
     ) -> torch.Tensor:
         """FeasibleProjector 입력으로 쓸 (현재+미래) 궤적 텐서를 만든다.
@@ -2470,12 +2446,10 @@ class DiT(nn.Module):
         return low_t_mask
 
     def _maybe_replace_x_with_integrated_trajectory_for_eval(
-        self,
-        x: torch.Tensor,  # (B, Pnn, F_out)
-        integrated_trajectory: torch.Tensor,  # (B, Pnn, T, 4)
-        target_current_xyyaw_for_feasible: torch.Tensor,  # (B, Pnn, 4)
-        batch_size: int,
-        one_or_Pnn: int,
+            self,
+            x: torch.Tensor,  # (B, Pnn, F_out)
+            integrated_trajectory: torch.Tensor,  # (B, Pnn, T, 4)
+            target_current_xyyaw_for_feasible: torch.Tensor,  # (B, Pnn, 4)
     ) -> torch.Tensor:
         """평가 모드에서 integrated_trajectory를 최종 출력으로 쓸지 결정한다.
 
@@ -2494,7 +2468,7 @@ class DiT(nn.Module):
         """
         if self.training or self.config.use_direct_loss:
             return x
-
+        batch_size, one_or_Pnn = x.shape[:2]
         B: int = batch_size
 
         if self.config.use_past_dit_input:
@@ -2675,12 +2649,10 @@ class DiT(nn.Module):
         target_agents_past: torch.Tensor,  # (B, (1+)Pnn, past_len, 11)
         target_past_cur_future_valid: torch.
         Tensor,  # (B, (1+)Pnn, 1+past_len+future_len)
-        B: int,
-        one_or_Pnn: int,
     ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         """model_type 이 'x_start' 인 경우 출력 텐서를 만드는 함수."""
         target_past_11_dim = target_agents_past[:, :, :
-                                         -1, :]  # (B, (1+)Pnn, past_len, 11)
+                                                -1, :]  # (B, (1+)Pnn, past_len, 11)
         target_current_xyyaw = target_agents_past[:, :,
                                                   -1, :4]  # (B, (1+)Pnn, 4)
         target_class_one_hot = target_agents_past[:, :, -1,
@@ -2729,15 +2701,14 @@ class DiT(nn.Module):
         # integrated_trajectory : (B, (1+)Pnn, future_len, 4)
         # control_constraint_diff : (B, (1+)Pnn, future_len, 3)
         """
-        # 5) 평가 모드에서는 integrated_trajectory로 출력 교체(옵션, 기존 로직 유지)
+        # 5) 평가 모드 + use_direct_loss = False에서
+        # integrated_trajectory로 출력 교체(옵션, 기존 로직 유지)
         # x_out: (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         x_out: torch.Tensor = self._maybe_replace_x_with_integrated_trajectory_for_eval(
             x=x,
-            integrated_trajectory=self.dit_returns.
+            integrated_trajectory=self.norm_dit_returns.
             integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
             target_current_xyyaw_for_feasible=target_current_xyyaw_for_feasible,
-            batch_size=B,
-            one_or_Pnn=one_or_Pnn,
         )
         return x_out
 
@@ -2809,7 +2780,6 @@ class DiT(nn.Module):
             )
         B, P, T_any, _ = target_input_norm_xT.shape
 
-
         past_cur_time_len = T_any - self._future_len  # past_len + 1
         # diffusion_time_for_past_cur: (B, past_cur_time_len)
         diffusion_time_for_past_cur = torch.zeros(
@@ -2827,7 +2797,8 @@ class DiT(nn.Module):
         # (B, P, past_cur_time_len + future_len, 1)
         diffusion_time_full = diffusion_time_full.expand(B, P, T_any, 1)
 
-        validity = target_past_cur_future_valid[:, :, -T_any:]  # (B,P,T_any) bool
+        validity = target_past_cur_future_valid[:, :,
+                                                -T_any:]  # (B,P,T_any) bool
         validity = validity.to(device=target_input_norm_xT.device)  # 안전
         validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
             -1)  # (B,P,T_any,1) float
@@ -2917,7 +2888,7 @@ class DiT(nn.Module):
                 cross_c=cross_c,
                 cross_mask=cross_mask,
                 target_current_11_dim=target_current_11_dim,  # (B, (1+)Pnn, 11)
-                target_current_valid=target_current_valid, # (B, (1+)Pnn)
+                target_current_valid=target_current_valid,  # (B, (1+)Pnn)
             )
 
         # model_type 분기
@@ -2936,8 +2907,6 @@ class DiT(nn.Module):
                 target_agents_past=
                 target_agents_past,  # (B, (1+)Pnn, time_len, 11)
                 target_past_cur_future_valid=target_past_cur_future_valid,
-                B=B,
-                one_or_Pnn=one_or_Pnn,
             )
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
@@ -2979,7 +2948,8 @@ class DiT(nn.Module):
             target_past_cur_future_valid = target_past_cur_future_valid.to(
                 torch.bool)  # (B, Pnn, time_len+future_len)
             if target_past_11_dim is not None:
-                target_past_11_dim = target_past_11_dim.float()  # (B, Pnn, past_len, 11)
+                target_past_11_dim = target_past_11_dim.float(
+                )  # (B, Pnn, past_len, 11)
 
             B, Pnn, one_future_len, _ = diffusion_trajectory.shape
             future_len: int = int(one_future_len - 1)  # T
@@ -2995,14 +2965,15 @@ class DiT(nn.Module):
             target_cur_future_valid = target_past_cur_future_valid[:, :, -(
                 one_future_len):]  # (B, Pnn, 1+T) bool
             unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
-                data=diffusion_trajectory, # (B, Pnn, 1+T, 4)
+                data=diffusion_trajectory,  # (B, Pnn, 1+T, 4)
                 valid_mask=target_cur_future_valid)  # (B, Pnn, 1+T)
             unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
                                                                     0, :]  # (B, Pnn, 4)
 
             # 과거 xy-yaw (정규화/역정규화) 준비
 
-            if target_past_11_dim is not None and target_past_11_dim.numel() > 0:
+            if target_past_11_dim is not None and target_past_11_dim.numel(
+            ) > 0:
                 # target_past_xyyaw: (B, Pnn, past_len, 4)
                 target_past_xyyaw = target_past_11_dim[..., :4]
                 # target_past_valid : (B, Pnn, past_len) bool
@@ -3010,8 +2981,7 @@ class DiT(nn.Module):
                     one_future_len)]
                 # (B, Pnn, past_len, 4)
                 unnorm_target_past_xyyaw = self.config.state_normalizer.inverse(
-                    data=target_past_xyyaw,
-                    valid_mask=target_past_valid)
+                    data=target_past_xyyaw, valid_mask=target_past_valid)
             else:
                 unnorm_target_past_xyyaw = None
 
@@ -3096,7 +3066,8 @@ class DiT(nn.Module):
 
             seg_body_control_stride_ref = seg_body_control_stride_ref.float()
             norm_temp_dict = {"seg_body_control": seg_body_control_stride_ref}
-            temp_dict = self.config.observation_normalizer.inverse(norm_temp_dict)
+            temp_dict = self.config.observation_normalizer.inverse(
+                norm_temp_dict)
             unnorm_seg_body_control_stride_ref = temp_dict[
                 "seg_body_control"]  # (B, Pnn, segment_len_ds, 3)
 
@@ -3129,26 +3100,21 @@ class DiT(nn.Module):
                     unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
                     target_class_one_hot,  # (B, Pnn, 3)
                 )
-            # TODO
             # 정규화해서 DiTReturns 로 저장
             target_future_valid = target_cur_future_valid[:, :,
                                                           1:]  # (B, Pnn, future_len) bool
             integrated_trajectory = self.config.state_normalizer(
-                unnorm_integrated_trajectory,
-                target_future_valid)  # (B, Pnn, future_len, 4)
-            near_future_mask = target_cur_future_valid[:, :,
-                                                       1:]  # (B, Pnn, future_len) bool
-            integrated_trajectory = integrated_trajectory.masked_fill(
-                ~near_future_mask.unsqueeze(-1), 0.0)
+                data=unnorm_integrated_trajectory,
+                valid_mask=target_future_valid)  # (B, Pnn, future_len, 4)
 
             temp_dict = {"seg_body_control": unnorm_control_constraint_diff}
-            temp_dict = self.config.observation_normalizer(temp_dict)
-            control_constraint_diff = temp_dict[
+            norm_temp_dict = self.config.observation_normalizer(temp_dict)
+            control_constraint_diff = norm_temp_dict[
                 "seg_body_control"]  # (B, Pnn, future_len, 3)
             control_constraint_diff = control_constraint_diff.masked_fill(
-                ~near_future_mask.unsqueeze(-1), 0.0)
+                ~target_future_valid.unsqueeze(-1), 0.0)
 
-            self.dit_returns = DiTReturns(
+            self.norm_dit_returns = DiTReturns(
                 integrated_trajectory=
                 integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
                 control_constraint_diff=
@@ -3181,8 +3147,8 @@ class DiT(nn.Module):
         #   - integrated_trajectory: 원 궤적(x_start) 그대로 (t=1..future_len)
         #   - control_constraint_diff: 전부 0
         # diffusion_trajectory 는 정규화 상태라고 가정
-        base_integrated = diffusion_trajectory[:, :,
-                                               1:, :].detach()  # (B,Pnn,future_len,4)
+        base_integrated = diffusion_trajectory[:, :, 1:, :].detach(
+        )  # (B,Pnn,future_len,4)
         base_constraint = torch.zeros((B, Pnn, future_len, 3),
                                       device=device,
                                       dtype=dtype)  # (B,Pnn,future_len,3)
@@ -3208,20 +3174,21 @@ class DiT(nn.Module):
             diffusion_trajectory[active_idx],
             target_class_one_hot[active_idx],
             target_past_cur_future_valid[active_idx],
-            target_past_11_dim[active_idx] if target_past_11_dim is not None else None,
+            target_past_11_dim[active_idx]
+            if target_past_11_dim is not None else None,
             self.final_hidden_tokens[active_idx],
         )
 
-        # `_feasible_projection_core` 은 서브 배치 기준으로 self.dit_returns 를 채운다.
-        integ_active = self.dit_returns.integrated_trajectory  # (N_active, Pnn, future_len, 4)
-        const_active = self.dit_returns.control_constraint_diff  # (N_active, Pnn, future_len, 3)
+        # `_feasible_projection_core` 은 서브 배치 기준으로 self.norm_dit_returns 를 채운다.
+        integ_active = self.norm_dit_returns.integrated_trajectory  # (N_active, Pnn, future_len, 4)
+        const_active = self.norm_dit_returns.control_constraint_diff  # (N_active, Pnn, future_len, 3)
 
         # 선택된 active 샘플에 대해서만 결과를 덮어쓰기
         integrated_all[active_idx] = integ_active
         constraint_all[active_idx] = const_active
 
         # 전체 배치 기준으로 다시 dit_returns 업데이트
-        self.dit_returns = DiTReturns(
+        self.norm_dit_returns = DiTReturns(
             integrated_trajectory=integrated_all,  # (B, (1+)Pnn, future_len, 4)
             control_constraint_diff=
             constraint_all,  #  (B, (1+)Pnn, future_len, 3)

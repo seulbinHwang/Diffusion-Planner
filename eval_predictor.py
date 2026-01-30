@@ -2016,8 +2016,9 @@ def _forward_model_for_validation(
     Returns:
         Dict[str, Any]:
             decoder_output dict.
-            예:
-              - integrated_trajectory: (B, (1+)Pnn, 1+T, 4)
+            예: norm 값임
+            "score" : (B, (1+)Pnn, 1+T, 4)
+            "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
     """
     use_deepspeed_requested = bool(getattr(args, "use_deepspeed", False))
     use_deepspeed_now = use_deepspeed_requested and _is_deepspeed_engine(model)
@@ -2525,7 +2526,7 @@ import torch
 
 
 def _get_unnorm_target_pose_chunk(
-    normed_trajectories: torch.Tensor,
+    normed_trajectories: torch.Tensor, # (B, (1+)Pnn, 1+T, 4)
     target_future_valid: torch.Tensor,
     state_normalizer: Any,
     gap: int,
@@ -2786,20 +2787,8 @@ def _predict_rollouts_batched_one_chunk(
                 model=model,
                 norm_inputs=norm_inputs_b_r_copy,
             )
-
+            # (B, (1+)Pnn, 1+T, 4)
             normed_trajectories = decoder_output["integrated_trajectory"]
-
-            # integrated_trajectory가 실제로 제공하는 예측 길이 확인(안전)
-            max_pred_step = int(
-                normed_trajectories.shape[2]) - 1  # (1..max_pred_step 가능)
-            if gap > max_pred_step:
-                gap = int(max_pred_step)
-            if gap <= 0:
-                raise RuntimeError(
-                    "integrated_trajectory의 시간 길이가 너무 짧습니다. "
-                    f"integrated_trajectory.shape={tuple(normed_trajectories.shape)}"
-                )
-
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약
             # ---------------------------------------------------------
@@ -2830,7 +2819,7 @@ def _predict_rollouts_batched_one_chunk(
              ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
                  norm_inputs_b_r_copy=norm_inputs_for_draw,
                  norm_outputs_b_r_copy=norm_outputs_b_r_copy,
-                 normed_trajectories=normed_trajectories,
+                 normed_trajectories=normed_trajectories, # (B, (1+)Pnn, 1+T, 4)
                  state_normalizer=state_normalizer,
                  observation_normalizer=observation_normalizer,
                  draw_batch_idx=draw_batch_idx,
@@ -2853,7 +2842,7 @@ def _predict_rollouts_batched_one_chunk(
                 )
             # unnorm_target_pose_chunk: (B*R, (1+)Pnn, gap, 4)
             unnorm_target_pose_chunk = _get_unnorm_target_pose_chunk(
-                normed_trajectories=normed_trajectories,
+                normed_trajectories=normed_trajectories, # (B, (1+)Pnn, 1+T, 4)
                 target_future_valid=norm_inputs_b_r_copy[
                     "target_future_valid"],  # (B*R, (1+)Pnn, future_len)
                 state_normalizer=state_normalizer,
@@ -3387,6 +3376,7 @@ def _predict_rollouts_batched_with_oom_fallback(
     **rollout 인덱스 기준으로 “랜덤 샘플(노이즈)”이 일관되게 나오게** 설계돼 있습니다.
 
             """
+            #  (B, (1+)Pnn, rollout_number, future_len, 4)
             out = _predict_rollouts_batched(
                 args=args,
                 model=model,
@@ -3697,15 +3687,15 @@ def _build_pred_traj_and_pred_head_from_world_rollouts(
 
     입력 shape
     ---------
-    - target_scenario_rollouts_world: (B, (1+)Pnn, R, future_len, 4)
+    - target_scenario_rollouts_world:
         (B, (1+)Pnn, rollout_number, future_len, 4)
 
     출력 shape
     ---------
-    - pred_traj: (N, R, future_len, 2)
+    - pred_traj: (B * (1+)Pnn, R, future_len, 2)
       - N = B * (1+)Pnn
       - 마지막 2: (x, y)
-    - pred_head: (N, R, future_len)
+    - pred_head: (B * (1+)Pnn, R, future_len)
       - 값: 방향(각도) 라디안
 
     Args:
@@ -3817,13 +3807,8 @@ def _build_agent_batch_tensor(
 
     Returns:
         torch.Tensor:
-            agent_batch, shape (N,), dtype torch.long
+            agent_batch, shape (B * one_Pnn,), dtype torch.long
     """
-    if batch_size <= 0:
-        raise ValueError(f"batch_size는 1 이상이어야 합니다. batch_size={batch_size}")
-    if one_Pnn <= 0:
-        raise ValueError(f"agents_per_batch는 1 이상이어야 합니다. one_Pnn={one_Pnn}")
-
     batch_index = torch.arange(batch_size, device=device,
                                dtype=torch.long)  # (B,)
     agent_batch = batch_index.repeat_interleave(int(one_Pnn), dim=0)  # (N,)
@@ -4247,6 +4232,7 @@ def validate_func(
 * **_predict_rollouts_batched_one_chunk = “한 묶음의 rollout을 실제로 생성”**
 
     """
+    #  (B, (1+)Pnn, rollout_number, future_len, 4)
     target_scenario_rollouts_world = _predict_rollouts_batched_with_oom_fallback(
         args=args,
         model=inference_model,
@@ -4261,31 +4247,36 @@ def validate_func(
     )
 
     _update_validation_heartbeat_stage(args, f"{tag} | postprocessing rollouts")
-
+    """ 
+    target_scenario_rollouts_world: (B, (1+)Pnn, R, future_len, 4)
+    pred_traj : (B * (1+)Pnn, R, future_len, 2)
+    pred_head : (B * (1+)Pnn, R, future_len)
+    """
     pred_traj, pred_head = _build_pred_traj_and_pred_head_from_world_rollouts(
         target_scenario_rollouts_world=target_scenario_rollouts_world)
-
+    # scenario_id: List[str], len=B
     scenario_id: List[str] = _get_string_list_from_inputs(
         inputs=inputs,
         key="scenario_id",
         expected_length=batch_size,
     )
     if args.eval_method == "validation":
+        # tfrecord_path: List[str], len=B
         tfrecord_path: List[str] = _get_string_list_from_inputs(
             inputs=inputs,
             key="tfrecord_path",
             expected_length=batch_size,
         )
-
-    target_id = _get_target_id_flat_from_inputs(inputs)
+    # target_id_flat: (N,)  (N = B*(1+)Pnn)
+    target_id: Optional[torch.Tensor] = _get_target_id_flat_from_inputs(inputs)
     one_Pnn = int(target_future_valid.shape[1])
-
+    # agent_batch : (B * one_Pnn,)
     agent_batch = _build_agent_batch_tensor(
         batch_size=batch_size,
         one_Pnn=one_Pnn,
         device=pred_traj.device,
     )
-
+    # TODO: 여기서부터
     pred_z = _expand_target_z_to_rollout_grid(
         inputs=inputs,
         n_rollout=int(pred_traj.shape[1]),
