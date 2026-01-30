@@ -4826,18 +4826,6 @@ def _initialize_unnorm_inputs_for_rollout(
     ----
     rollout 시작 시점에 unnorm dict를 한 번 만들어서 계속 들고 갑니다.
 
-    Args:
-        norm_inputs_b_r_copy (Dict[str, Any]):
-            정규화된 입력 dict.
-            예시(rollout batch로 펼친 뒤):
-              - ego_agent_past: (B*R, T_past, 11)
-              - near_agents_past: (B*R, Pnn, T_past, 11)
-              - lanes: (B*R, lane_num, lane_len, 12)
-              - static_objects: (B*R, static_num, 10)
-        state_normalizer (StateNormalizer):
-            (x, y, cos, sin) 4개 값에 대한 정규화/역정규화 도구.
-        observation_normalizer (ObservationNormalizer):
-            입력 dict 여러 키에 대한 정규화/역정규화 도구.
 
     Returns:
         Dict[str, Any]:
@@ -4889,7 +4877,6 @@ def _build_norm_inputs_from_unnorm_inputs(
             입력 dict 여러 키에 대한 정규화 도구.
 
     """
-    # TODO
     norm_inputs_b_r_step: Dict[str, Any] = observation_normalizer(
         unnorm_inputs_b_r_copy)
     norm_outputs_b_r_step = {
