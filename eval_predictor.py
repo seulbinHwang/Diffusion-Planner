@@ -2757,7 +2757,6 @@ def _predict_rollouts_batched_one_chunk(
                                       step_start == 0) or (
                                           not args.use_amortized_diffusion)
             if make_random_noise_cond:
-                # TODO: low_t_mask
                 # inference_noise: (B*R, (1+)Pnn, future_len, 4)
                 inference_noise = _build_inference_noise_for_rollout_chunk(
                     device=device,  # device/dtype 기준
@@ -2774,7 +2773,6 @@ def _predict_rollouts_batched_one_chunk(
                 )
             else:
                 inference_noise = None
-                low_t_mask = torch.ones(B_R, dtype=torch.bool, device=device)
             norm_inputs_b_r_copy["inference_noise"] = inference_noise
             # ✅ Decoder가 이번 호출에서 "몇 스텝 전진했는지" 알 수 있게 전달
             # gap을 전달하면 되는데, 우리는 (B*R,) shape int 텐서로 맞춰서 전달합니다.
