@@ -305,7 +305,7 @@ def _sample_diffusion_time_and_noise(
         t_threshold: float = float(args.feasible_learn_noise_thresh)
         if not getattr(args, "use_direct_loss", False):
             t_threshold = 1.0
-
+        # low_t_mask: (B,)
         low_t_mask: torch.Tensor = batch_diffusion_time <= t_threshold
 
     # random_noise : (B, (1+)Pnn, future_len, 4)

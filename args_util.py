@@ -629,6 +629,9 @@ def get_args():
     parser.add_argument('--recovery_threshold_m',
                         type=float,
                         default=3.)
+    parser.add_argument('--guidance_scale',
+                        type=float,
+                        default=1.)
     parser.add_argument('--dp_sample_k_candidate_batch_size',
                         type=float,
                         default=-1.)
