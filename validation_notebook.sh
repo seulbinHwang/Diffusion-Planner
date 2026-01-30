@@ -54,8 +54,8 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-EVAL_SET_PATH="${WOMD_PATH}/processed_womd_0124/training"
-EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_training.json"
+EVAL_SET_PATH="${WOMD_PATH}/processed_womd_0124/validation"
+EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -191,15 +191,15 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "wosac_test_full" \
-  --name "wosac_test_full" \
+  --load_name "wosac_final_0128" \
+  --name "wosac_final_0128" \
   --eval_method "validation" \
   --batch_size 3 \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \
-  --save_image False \
-  --save_video False \
+  --save_image True \
+  --save_video True \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
@@ -207,6 +207,6 @@ taskset -c "${CPUSET}" \
   --rollout_number 1 \
   --rollout_time_chunk_size 1 \
   --use_amortized_diffusion True \
-  --do_data_statistics True
+  --do_data_statistics False
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

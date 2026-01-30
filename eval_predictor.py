@@ -2738,7 +2738,6 @@ def _predict_rollouts_batched_one_chunk(
         step_start = 0
         while step_start < future_len:
             reference_tensor = norm_inputs_b_r_copy["ego_agent_past"]
-            B_R = int(reference_tensor.shape[0])
             device = reference_tensor.device
             dtype = reference_tensor.dtype
             remaining = int(future_len - step_start)
@@ -4890,6 +4889,7 @@ def _build_norm_inputs_from_unnorm_inputs(
             입력 dict 여러 키에 대한 정규화 도구.
 
     """
+    # TODO
     norm_inputs_b_r_step: Dict[str, Any] = observation_normalizer(
         unnorm_inputs_b_r_copy)
     norm_outputs_b_r_step = {
@@ -5042,14 +5042,15 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
         dim=1,
     )
 
+
+    ego_agent_past_is_valid = unnorm_inputs_b_r_copy[
+        "ego_agent_past_is_valid"]  # (B*R, time_len)
     # ego_chunk_is_valid: (B*R, gap)
     ego_chunk_is_valid = torch.ones(
         (int(unnorm_ego_pose_chunk.shape[0]), gap),
-        dtype=ego_agent_past.dtype,
-        device=ego_agent_past.device,
+        dtype=ego_agent_past_is_valid.dtype,
+        device=ego_agent_past_is_valid.device,
     )
-    ego_agent_past_is_valid = unnorm_inputs_b_r_copy[
-        "ego_agent_past_is_valid"]  # (B*R, time_len)
     # ego_agent_past_is_valid: (B*R, time_len)
     unnorm_inputs_b_r_copy["ego_agent_past_is_valid"] = torch.cat(
         [ego_agent_past_is_valid[:, gap:], ego_chunk_is_valid],

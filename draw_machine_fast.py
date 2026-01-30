@@ -261,9 +261,9 @@ class DrawingOptions:
     NEI_neighbor_past_output_token_fontsize = 2
     ########################
     ######### [NEIGHBOR] FUTURE GT #############
-    DIFF_draw_diff_future_gt_3_dim: bool = False
+    DIFF_draw_diff_future_gt_3_dim: bool = True
     # NEW: neighbor_future_gt_3_dim (numpy 버전) on/off
-    DIFF_draw_future_gt_3_dim_wo_token: bool = True
+    DIFF_draw_future_gt_3_dim_wo_token: bool = False
     DIFF_future_gt_3_dim_marker_size: float = 0.6  # 미래 포인트 'x' 마커 크기
     DIFF_future_gt_3_dim_COLOR: str = DARK_BROWN  # 미래 포인트 'x' 마커 크기
 
