@@ -1901,8 +1901,8 @@ def _predict_one_rollout_sequential(
              )
             # 후보 K개 중 best 선택
             """
-            - best_normed_traj: (B_all, 1+Pnn, 1+T, 4)
-            - best_distance_m_per_agent: (B_all, 1+Pnn)
+            - best_normed_traj: (B, 1+Pnn, 1+T, 4)
+            - best_distance_m_per_agent: (B, 1+Pnn)
             """
             best_normed_traj, best_dist_m = _select_best_trajectory_by_sample_k(
                 args=args,
@@ -1922,9 +1922,31 @@ def _predict_one_rollout_sequential(
                 gap=gap,
             )
             # best_normed_traj: (B, 1+Pnn, 1+future_len, 4)
-            unnorm_best_traj = state_normalizer.inverse(best_normed_traj)
+            target_future_valid = unnorm_inputs_copy[
+                "target_future_valid"]  #  (B, (1+)Pnn, future_len)
+            # ego_agent_past_is_valid: (B, T_past)
+            ego_agent_past_is_valid = unnorm_inputs_copy[
+                "ego_agent_past_is_valid"]
+            ego_agent_current_is_valid = ego_agent_past_is_valid[:, -1]  # (B,)
+            # near_agents_is_valid: (B, Pnn)
+            near_agents_is_valid = unnorm_inputs_copy["near_agents_is_valid"]
+            # target_agent_is_valid: (B, 1+Pnn)
+            target_agent_is_valid = torch.cat(
+                [ego_agent_current_is_valid[:, None], near_agents_is_valid],
+                dim=1)  # (B, 1+Pnn)
+            # target_cur_future_is_valid: (B, 1+Pnn, 1+future_len)
+            # target_agent_is_valid + target_future_valid
+            target_cur_future_is_valid = torch.cat(
+                [target_agent_is_valid[:, :, None], target_future_valid],
+                dim=2)  # (B, 1+Pnn, future_len)
+            # unnorm_best_traj: (B, 1+Pnn, 1+future_len, 4)
+            unnorm_best_traj = state_normalizer.inverse(
+                data=best_normed_traj, # (B, 1+Pnn, 1+future_len, 4)
+                valid_mask=target_cur_future_is_valid, # (B, 1+Pnn, 1+future_len)
+            )
             # unnorm_selected_traj_raw: (B, 1+Pnn, 1+future_len, 4)
             # gt_valid_mask: (B_all, 1+Pnn, future_len)
+            # TODO
             unnorm_selected_traj_raw, gt_valid_mask = _apply_recovery_if_needed(
                 args=args,
                 unnorm_selected_traj=
@@ -1933,9 +1955,11 @@ def _predict_one_rollout_sequential(
                 unnorm_outputs_copy=unnorm_outputs_copy,
                 future_len=int(future_len),
             )
+            # (B, 1+Pnn, 1+future_len, 4)
             unnorm_selected_traj = _apply_unvalid_at_unnorm_selected_traj_raw(
                 unnorm_selected_traj_raw, gt_valid_mask)
-            normed_selected_traj = state_normalizer(unnorm_selected_traj)
+            normed_selected_traj = state_normalizer(data=unnorm_selected_traj,
+                                                    valid_mask=target_cur_future_is_valid)
 
             # ✅ (그림/영상) 준비는 1번만
             vis_state = _maybe_prepare_rollout_visualization_once(
@@ -2478,68 +2502,93 @@ def _build_box_corners_xy_from_pose_4_dim_with_size(
     return torch.stack([x_corner, y_corner], dim=-1)
 
 
-def _compute_expert_guidance_distance_m_per_agent(
+from typing import Any, Dict, Tuple
+import torch
+
+
+def _extract_target_future_gt_and_valid_for_compare(
+    *,
+    unnorm_outputs_step: Dict[str, torch.Tensor],
+    compare_steps: int,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """정답 미래 포즈와 유효 마스크를 비교 구간 길이로 잘라 (ego+near)로 합칩니다.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, int]:
+            - gt_future_4_dim: (B_all, 1+Pnn, H, 4)
+            - gt_valid_mask: (B_all, 1+Pnn, H)  bool
+            - future_len: 정답 future_len 값. shape: ()
+    """
+    ego_future_gt_4_dim = unnorm_outputs_step[
+        "ego_future_gt_4_dim"]  # (B_all, T, 4)
+    ego_future_gt_is_valid = unnorm_outputs_step[
+        "ego_future_gt_is_valid"]  # (B_all, T)
+
+    near_future_gt_4_dim = unnorm_outputs_step[
+        "near_future_gt_4_dim"]  # (B_all, Pnn, T, 4)
+    near_future_gt_is_valid = unnorm_outputs_step[
+        "near_future_gt_is_valid"]  # (B_all, Pnn, T)
+
+    future_len = int(ego_future_gt_4_dim.shape[1])
+
+    # gt_valid_mask: (B_all, 1+Pnn, T) -> (B_all, 1+Pnn, H)
+    gt_valid_mask_full = torch.cat(
+        [
+            ego_future_gt_is_valid[:, None, :],
+            near_future_gt_is_valid,
+        ],
+        dim=1,
+    ).to(dtype=torch.bool)
+
+    gt_valid_mask = gt_valid_mask_full[:, :, :int(
+        compare_steps)]  # (B_all, 1+Pnn, H)
+
+    # gt_future_4_dim: (B_all, 1+Pnn, H, 4)
+    ego_gt = ego_future_gt_4_dim[:, :int(compare_steps), :]  # (B_all, H, 4)
+    near_gt = near_future_gt_4_dim[:, :, :int(
+        compare_steps), :]  # (B_all, Pnn, H, 4)
+    gt_future_4_dim = torch.cat([ego_gt[:, None, :, :], near_gt], dim=1)
+
+    return gt_future_4_dim, gt_valid_mask, int(future_len)
+
+
+def _compute_corner_mean_distance_m_per_agent(
         *,
-        state_normalizer: Any,
-        normed_trajectory: torch.Tensor,  # (B_all, 1+Pnn, 1+future_len, 4)
-        unnorm_br_outputs_step: Dict[str, torch.Tensor],
-        compare_steps: int,
+        unnorm_pred_future_4_dim: torch.Tensor,  # (B_all, 1+Pnn, H, 4)
+        unnorm_gt_future_4_dim: torch.Tensor,  # (B_all, 1+Pnn, H, 4)
+        gt_valid_mask: torch.Tensor,  # (B_all, 1+Pnn, H) bool
         agent_length_m: torch.Tensor,  # (B_all, 1+Pnn)
         agent_width_m: torch.Tensor,  # (B_all, 1+Pnn)
-) -> torch.Tensor:  # (B_all, 1+Pnn)
-    """후보 경로(예측)와 정답 미래 경로를 비교해, 에이전트별 '코너 평균 거리'를 계산합니다.
+) -> torch.Tensor:
+    """예측/정답 포즈를 박스 코너로 바꾼 뒤, 코너 평균 거리로 에이전트별 점수를 만듭니다.
 
-    계산 방식
-    --------
-    - 미래 첫 N스텝(compare_steps)만 비교합니다.
-    - 에이전트마다 차량 크기(length/width)가 다를 수 있으므로,
-      해당 에이전트의 크기를 사용해 4개 코너 위치를 만든 뒤 비교합니다.
-    - 정답 경로가 0으로 채워진(=무효) 시간 구간은 비교에서 제외합니다.
-    - 추가: 예측 경로 자체가 전체 0 패딩인(=존재하지 않는) agent는 거리 결과를 0으로 고정합니다.
+    Args:
+        unnorm_pred_future_4_dim (torch.Tensor):
+            예측 포즈(원래 단위). shape: (B_all, 1+Pnn, H, 4)
+        unnorm_gt_future_4_dim (torch.Tensor):
+            정답 포즈(원래 단위). shape: (B_all, 1+Pnn, H, 4)
+        gt_valid_mask (torch.Tensor):
+            정답이 존재하는 칸만 True. shape: (B_all, 1+Pnn, H) bool
+        agent_length_m (torch.Tensor):
+            에이전트 길이. shape: (B_all, 1+Pnn)
+        agent_width_m (torch.Tensor):
+            에이전트 너비. shape: (B_all, 1+Pnn)
 
     Returns:
         torch.Tensor:
-            에이전트별 거리 점수.
-            shape: (B_all, 1+Pnn)
+            dist_m: 에이전트별 평균 거리(미터). shape: (B_all, 1+Pnn)
             dtype: float32
-
-    normed_trajectory 은 원래 무효 agent에 대해서는 전부 0 출력을 내놓습니다.
-    하지만, 유효 agent에 대해서는 future_len 전부 유효 출력을 내놓습니다.
     """
-    # (B_all, future_len, 4)
-    unnorm_gt_ego_future_4_dim = unnorm_br_outputs_step["ego_future_gt_4_dim"]
-    # ego_future_gt_is_valid: (B_all, future_len)
-    ego_future_gt_is_valid = unnorm_br_outputs_step["ego_future_gt_is_valid"]
-    # (B_all, Pnn, future_len, 4)
-    unnorm_gt_near_future_4_dim = unnorm_br_outputs_step["near_future_gt_4_dim"]
-    near_future_gt_is_valid = unnorm_br_outputs_step["near_future_gt_is_valid"]
-    # normed_trajectory: (B_all, 1+Pnn, 1+future_len, 4)
-    pred_future_len = int(normed_trajectory.shape[2]) - 1  # (1+T) -> T
-    gt_future_len = int(unnorm_gt_ego_future_4_dim.shape[1])
-    assert pred_future_len == gt_future_len, "Error: mismatched future_len between prediction and ground truth."
-    assert compare_steps <= pred_future_len, "compare_steps exceeds future length."
-    # norm_compare_future_4_dim: (B_all, 1+Pnn, H, 4)
-    norm_compare_future_4_dim = normed_trajectory[:, :, 1:compare_steps + 1, :]
-    ego_compare_gt_is_valid = ego_future_gt_is_valid[:, :compare_steps]  # (B_all, H)
-    # pred_future_unnorm: (B_all, 1+Pnn, H, 4)
-    pred_future_unnorm = state_normalizer.inverse(data=norm_compare_future_4_dim,
-                                                  valid_mask=ego_compare_gt_is_valid,
-                                                  )
-    # TODO: 여기서부터
+    # H: 비교 스텝 수
+    compare_steps = int(unnorm_pred_future_4_dim.shape[2])
 
-    # gt_all: (B_all, 1+Pnn, H, 4)
-    ego_gt = unnorm_gt_ego_future_4_dim[:, :compare_steps, :]
-    near_gt = unnorm_gt_near_future_4_dim[:, :, :compare_steps, :]
-    gt_all = torch.cat([ego_gt[:, None, :, :], near_gt], dim=1)
+    # float32로 안정화
+    pred_f = unnorm_pred_future_4_dim.to(
+        dtype=torch.float32)  # (B_all, 1+Pnn, H, 4)
+    gt_f = unnorm_gt_future_4_dim.to(
+        dtype=torch.float32)  # (B_all, 1+Pnn, H, 4)
 
-    # 정답이 0패딩된 구간은 제외: valid_mask (B_all, 1+Pnn, H)
-    valid_mask = torch.any(gt_all != 0.0, dim=-1)
-
-    # 거리 계산은 float32로 안정화
-    pred_f = pred_future_unnorm.to(dtype=torch.float32)  # (B_all, 1+Pnn, H, 4)
-    gt_f = gt_all.to(dtype=torch.float32)  # (B_all, 1+Pnn, H, 4)
-
-    # size를 시간축으로 확장: (B_all, 1+Pnn, H)
+    # 길이/너비를 시간축으로 늘림: (B_all, 1+Pnn, H)
     length_h = agent_length_m.to(dtype=torch.float32)[:, :, None].expand(
         -1, -1, compare_steps)
     width_h = agent_width_m.to(dtype=torch.float32)[:, :, None].expand(
@@ -2547,14 +2596,14 @@ def _compute_expert_guidance_distance_m_per_agent(
 
     # corners: (B_all, 1+Pnn, H, 4, 2)
     pred_corners = _build_box_corners_xy_from_pose_4_dim_with_size(
-        pose_4_dim=pred_f,  # (B_all, 1+Pnn, H, 4)
-        length_m=length_h,  # (B_all, 1+Pnn, H)
-        width_m=width_h,  # (B_all, 1+Pnn, H)
+        pose_4_dim=pred_f,
+        length_m=length_h,
+        width_m=width_h,
     )
     gt_corners = _build_box_corners_xy_from_pose_4_dim_with_size(
-        pose_4_dim=gt_f,  # (B_all, 1+Pnn, H, 4)
-        length_m=length_h,  # (B_all, 1+Pnn, H)
-        width_m=width_h,  # (B_all, 1+Pnn, H)
+        pose_4_dim=gt_f,
+        length_m=length_h,
+        width_m=width_h,
     )
 
     # diff: (B_all, 1+Pnn, H, 4, 2)
@@ -2567,23 +2616,119 @@ def _compute_expert_guidance_distance_m_per_agent(
     # step_dist: (B_all, 1+Pnn, H)  코너 평균
     step_dist = corner_dist.mean(dim=-1)
 
-    valid_f = valid_mask.to(dtype=torch.float32)  # (B_all, 1+Pnn, H)
+    valid_f = gt_valid_mask.to(dtype=torch.float32)  # (B_all, 1+Pnn, H)
     sum_dist = (step_dist * valid_f).sum(dim=-1)  # (B_all, 1+Pnn)
     denom = torch.clamp(valid_f.sum(dim=-1), min=1.0)  # (B_all, 1+Pnn)
 
-    dist = sum_dist / denom  # (B_all, 1+Pnn)
+    dist = (sum_dist / denom).to(dtype=torch.float32)  # (B_all, 1+Pnn)
+    return dist
 
-    # ✅ 무효 agent는 거리 결과를 0으로 고정 (에러/선택 로직 흔들림 방지)
-    # ✅ 무효 agent 감지: (1+T, 4)가 전부 0이면 "존재하지 않는 agent"로 봅니다.
-    # agent_has_any_value: (B_all, 1+Pnn)
-    agent_has_any_value = torch.any(
-        torch.any(normed_trajectory != 0.0, dim=-1),  # (B_all, 1+Pnn, 1+T)
-        dim=-1,  # -> (B_all, 1+Pnn)
+
+def _build_target_agent_current_is_valid_mask(
+    norm_inputs_step: Dict[str, torch.Tensor],) -> torch.Tensor:
+    """현재 시점에서 agent가 존재하는지(True/False) 마스크를 만듭니다.
+
+    Args:
+        norm_inputs_step (Dict[str, torch.Tensor]):
+            입력 dict. shape: ()
+            필요한 키와 shape:
+              - ego_agent_past_is_valid: (B_all, T_past)
+              - near_agents_past_is_valid: (B_all, Pnn, T_past)
+
+    Returns:
+        torch.Tensor:
+            target_agent_current_is_valid: (B_all, 1+Pnn) bool
+    """
+    ego_past_is_valid = norm_inputs_step[
+        "ego_agent_past_is_valid"]  # (B_all, T_past)
+    near_past_is_valid = norm_inputs_step[
+        "near_agents_past_is_valid"]  # (B_all, Pnn, T_past)
+    ego_cur = ego_past_is_valid[:, -1].to(dtype=torch.bool)  # (B_all,)
+    near_cur = near_past_is_valid[:, :, -1].to(dtype=torch.bool)  # (B_all, Pnn)
+
+    # (B_all, 1+Pnn)
+    return torch.cat([ego_cur[:, None], near_cur], dim=1)
+
+
+def _zero_out_distance_for_invalid_agents(
+    dist_m_per_agent: torch.Tensor,
+    agent_current_is_valid: torch.Tensor,
+) -> torch.Tensor:
+    """존재하지 않는 agent의 거리 점수를 0으로 고정합니다.
+
+    Args:
+        dist_m_per_agent (torch.Tensor):
+            거리 점수. shape: (B_all, 1+Pnn)
+        agent_current_is_valid (torch.Tensor):
+            현재 존재 여부. shape: (B_all, 1+Pnn) bool
+
+    Returns:
+        torch.Tensor:
+            0 처리된 거리 점수. shape: (B_all, 1+Pnn)
+    """
+    invalid_mask = ~agent_current_is_valid.to(
+        dtype=torch.bool)  # (B_all, 1+Pnn)
+    return torch.where(invalid_mask, torch.zeros_like(dist_m_per_agent),
+                       dist_m_per_agent)
+
+
+def _compute_expert_guidance_distance_m_per_agent(
+        *,
+        state_normalizer: Any,
+        normed_trajectory: torch.Tensor,  # (B_all, 1+Pnn, 1+future_len, 4)
+        norm_br_inputs_step: Dict[str, torch.Tensor],
+        unnorm_br_outputs_step: Dict[str, torch.Tensor],
+        compare_steps: int,
+        agent_length_m: torch.Tensor,  # (B_all, 1+Pnn)
+        agent_width_m: torch.Tensor,  # (B_all, 1+Pnn)
+) -> torch.Tensor:  # (B_all, 1+Pnn)
+    """후보 경로(예측)와 정답 미래 경로를 비교해, 에이전트별 '코너 평균 거리'를 계산합니다.
+
+    Returns:
+        torch.Tensor:
+            에이전트별 거리 점수.
+            shape: (B_all, 1+Pnn)
+            dtype: float32
+    """
+    # 1) 정답(미래) + 유효 마스크 준비 (비교 구간으로 자름)
+    # gt_future_4_dim: (B_all, 1+Pnn, H, 4),
+    # gt_valid_mask: (B_all, 1+Pnn, H)
+    (gt_future_4_dim, gt_valid_mask,
+     future_len_gt) = _extract_target_future_gt_and_valid_for_compare(
+         unnorm_outputs_step=unnorm_br_outputs_step,
+         compare_steps=int(compare_steps),
+     )
+
+    # 2) 예측(미래) 비교 구간 뽑기 + 길이 검증
+    # # (B_all, 1+Pnn, H, 4)
+    normed_pred_future_4_dim = normed_trajectory[:, :,
+                                                 1:int(compare_steps) + 1, :]
+    # 3) 예측을 원래 단위로 되돌리되, 정답이 없는 칸은 0으로 유지
+    # unnorm_pred_future_4_dim :  (B_all, 1+Pnn, H, 4)
+    unnorm_pred_future_4_dim = state_normalizer.inverse(
+        data=normed_pred_future_4_dim,  # (B_all, 1+Pnn, H, 4)
+        valid_mask=gt_valid_mask,  # (B_all, 1+Pnn, H)
     )
-    # invalid_agent_mask: (B_all, 1+Pnn)  True=무효 agent
-    invalid_agent_mask = ~agent_has_any_value
-    dist = torch.where(invalid_agent_mask, torch.zeros_like(dist), dist)
 
+    # 4) 코너 평균 거리로 에이전트별 점수 계산(정답이 없는 칸은 제외)
+    # dist: (B_all, 1+Pnn), float32
+    dist = _compute_corner_mean_distance_m_per_agent(
+        unnorm_pred_future_4_dim=unnorm_pred_future_4_dim,  # (B_all, 1+Pnn, H, 4)
+        unnorm_gt_future_4_dim=gt_future_4_dim,  # (B_all, 1+Pnn, H, 4)
+        gt_valid_mask=gt_valid_mask,  # (B_all, 1+Pnn, H)
+        agent_length_m=agent_length_m,  # (B_all, 1+Pnn)
+        agent_width_m=agent_width_m,  # (B_all, 1+Pnn)
+    )
+
+    # 5) "존재하지 않는 agent"는 0으로 고정
+    # target_agent_current_is_valid: (B_all, 1+Pnn) bool
+    target_agent_current_is_valid = _build_target_agent_current_is_valid_mask(
+        norm_inputs_step=norm_br_inputs_step,)
+    # dist: (B_all, 1+Pnn)
+    dist = _zero_out_distance_for_invalid_agents(
+        dist_m_per_agent=dist,  # (B_all, 1+Pnn)
+        agent_current_is_valid=target_agent_current_is_valid,  # (B_all, 1+Pnn)
+    )
     return dist
 
 
@@ -2805,13 +2950,13 @@ def _forward_and_score_candidate_batch(
         )
     else:
         inference_noise_flat = None
-        
+
     unnorm_br_outputs_step = _repeat_inputs_for_candidate_batch(
         norm_data_step=unnorm_outputs_copy,
         repeat=int(c),
         batch_size=int(b),
     )
-    
+
     norm_inputs_step["rollout_time_chunk_size"] = torch.tensor(
         [gap] * int(b),
         dtype=torch.int64,
@@ -2848,10 +2993,11 @@ def _forward_and_score_candidate_batch(
     len_rep = agent_length_m.repeat(int(c), 1)
     wid_rep = agent_width_m.repeat(int(c), 1)
 
-    # cand_dist_flat: (B*c, 1+Pnn)
+    # cand_dist_flat: (B*c, 1+Pnn) # 무효 agent 는 0. 으로 처리했음.
     cand_dist_flat = _compute_expert_guidance_distance_m_per_agent(
         state_normalizer=state_normalizer,
         normed_trajectory=cand_traj_flat,
+        norm_br_inputs_step=norm_br_inputs_step,
         unnorm_br_outputs_step=unnorm_br_outputs_step,
         compare_steps=int(getattr(args, "time_step_for_compare", 1)),
         agent_length_m=len_rep,
@@ -2869,27 +3015,10 @@ def _select_best_from_candidate_batch_jointly(
     best_traj: Optional[torch.Tensor],
     best_dist: Optional[torch.Tensor],
     best_score: Optional[torch.Tensor],
-    cand_traj: torch.Tensor,
-    cand_dist: torch.Tensor,
+    cand_traj: torch.Tensor,  # (group_count, B, 1+Pnn, 1+future_len, 4)
+    cand_dist: torch.Tensor,  # (group_count, B, 1+Pnn) # 무효 agent 는 0. 으로 처리
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """샘플마다 후보 1개를 고르는 방식(select_jointly=True)으로 best를 갱신합니다.
-
-    Args:
-        best_traj (Optional[torch.Tensor]):
-            지금까지의 best 경로.
-            shape: (B, 1+Pnn, 1+future_len, 4) 또는 None
-        best_dist (Optional[torch.Tensor]):
-            지금까지의 best 거리(에이전트별).
-            shape: (B, 1+Pnn) 또는 None
-        best_score (Optional[torch.Tensor]):
-            지금까지의 best 점수(샘플별 1개 값).
-            shape: (B,) 또는 None
-        cand_traj (torch.Tensor):
-            이번 배치의 후보 경로들.
-            shape: (Kc, B, 1+Pnn, 1+future_len, 4)
-        cand_dist (torch.Tensor):
-            이번 배치의 후보 거리들.
-            shape: (Kc, B, 1+Pnn)
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3009,8 +3138,7 @@ def _select_best_trajectory_by_sample_k(
 
     변경된 핵심
     ----------
-    - 기존처럼 후보를 1개씩(for문) 처리하지 않고,
-      후보를 "몇 개씩 묶어서" 한 번에 모델에 넣습니다.
+    - 후보를 "몇 개씩 묶어서" 한 번에 모델에 넣습니다.
     - 처음 실행에서는 args.fine_tune_gen_k부터 시작해서,
       GPU 메모리 부족이 나면 절반으로 줄이며 안전한 묶음 크기를 찾습니다.
     - 한 번 안전한 묶음 크기가 정해지면(args에 저장),
@@ -3045,27 +3173,28 @@ def _select_best_trajectory_by_sample_k(
 
         try:
             # cand_traj_batch: (group_count, B, 1+Pnn, 1+future_len, 4)
-            # cand_dist_batch: (group_count, B, 1+Pnn)
-            cand_traj_batch, cand_dist_batch = _forward_and_score_candidate_batch(
-                args=args,
-                model=model,
-                norm_inputs_step=norm_inputs_step,
-                state_normalizer=state_normalizer,
-                unnorm_outputs_copy=unnorm_outputs_copy,
-                agent_length_m=agent_length_m,
-                agent_width_m=agent_width_m,
-                batch_size=int(batch_size),
-                one_or_pnn=int(one_or_pnn),
-                future_len=int(future_len),
-                rollout_idx=int(rollout_idx),
-                base_seed=int(base_seed),
-                ddp_rank=int(ddp_rank),
-                step_idx=int(step_idx),
-                cand_start_idx=int(cand_start),
-                cand_count=int(group_count),
-                seed_stride=int(seed_stride),
-                gap=gap,
-            )
+            # cand_dist_batch: (group_count, B, 1+Pnn) # 무효 agent 는 0. 으로 처리
+            (cand_traj_batch,
+             cand_dist_batch) = _forward_and_score_candidate_batch(
+                 args=args,
+                 model=model,
+                 norm_inputs_step=norm_inputs_step,
+                 state_normalizer=state_normalizer,
+                 unnorm_outputs_copy=unnorm_outputs_copy,
+                 agent_length_m=agent_length_m,
+                 agent_width_m=agent_width_m,
+                 batch_size=int(batch_size),
+                 one_or_pnn=int(one_or_pnn),
+                 future_len=int(future_len),
+                 rollout_idx=int(rollout_idx),
+                 base_seed=int(base_seed),
+                 ddp_rank=int(ddp_rank),
+                 step_idx=int(step_idx),
+                 cand_start_idx=int(cand_start),
+                 cand_count=int(group_count),
+                 seed_stride=int(seed_stride),
+                 gap=gap,
+             )
         except BaseException as e:
             # ✅ OOM이면 절반으로 줄이고 같은 cand_start에서 다시 시도
             if _is_gpu_oom_error(e):
@@ -3089,19 +3218,24 @@ def _select_best_trajectory_by_sample_k(
                     int(cand_group_size))
 
         if select_jointly:
-            best_traj, best_dist, best_joint_score = _select_best_from_candidate_batch_jointly(
-                best_traj=best_traj,
-                best_dist=best_dist,
-                best_score=best_joint_score,
-                cand_traj=cand_traj_batch,
-                cand_dist=cand_dist_batch,
+            (best_traj, best_dist, best_joint_score
+            ) = _select_best_from_candidate_batch_jointly(
+                best_traj=best_traj,  # (B, 1+Pnn, 1+future_len, 4)
+                best_dist=best_dist,  # (B, 1+Pnn)
+                best_score=best_joint_score,  # (B,)
+                cand_traj=
+                cand_traj_batch,  # (group_count, B, 1+Pnn, 1+future_len, 4)
+                cand_dist=
+                cand_dist_batch,  # (group_count, B, 1+Pnn) # 무효 agent 는 0. 으로 처리
             )
         else:
             best_traj, best_dist = _select_best_from_candidate_batch_per_agent(
                 best_traj=best_traj,
                 best_dist=best_dist,
-                cand_traj=cand_traj_batch,
-                cand_dist=cand_dist_batch,
+                cand_traj=
+                cand_traj_batch,  # (group_count, B, 1+Pnn, 1+future_len, 4)
+                cand_dist=
+                cand_dist_batch,  # (group_count, B, 1+Pnn) # 무효 agent 는 0. 으로 처리
             )
 
         cand_start += int(group_count)
@@ -3250,11 +3384,13 @@ def _apply_recovery_if_needed(
             복구가 반영된 경로(원래 단위).
             shape: (B_all, 1+Pnn, 1+future_len, 4)
     """
+    unnorm_ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"]
+    unnorm_near_future_gt_4_dim = unnorm_outputs_copy["near_future_gt_4_dim"]
     # gt_all: (B_all, 1+Pnn, future_len, 4)
     gt_all = torch.cat(
         [
-            unnorm_gt_ego_future_4_dim[:, None, :, :],
-            unnorm_gt_near_future_4_dim
+            unnorm_ego_future_gt_4_dim[:, None, :, :],
+            unnorm_near_future_gt_4_dim
         ],
         dim=1,
     )
@@ -3909,11 +4045,9 @@ def _build_norm_inputs_from_unnorm_inputs(
         Dict[str, Any]:
             정규화된 입력 dict(모델 forward에 넣을 dict).
     """
-    norm_inputs_step: Dict[str, Any] = observation_normalizer(
-        unnorm_inputs_copy)
-    norm_outputs_step = {
-        k: v.clone() for k, v in unnorm_outputs_copy.items()
-    }
+    norm_inputs_step: Dict[str,
+                           Any] = observation_normalizer(unnorm_inputs_copy)
+    norm_outputs_step = {k: v.clone() for k, v in unnorm_outputs_copy.items()}
     norm_outputs_step["ego_future_gt_4_dim"] = state_normalizer(
         data=unnorm_outputs_copy["ego_future_gt_4_dim"],
         valid_mask=unnorm_outputs_copy["ego_future_gt_is_valid"])
