@@ -136,10 +136,10 @@ def _prepare_batch_for_device(
 
     # outputs 분리 (정답은 반드시 Tensor여야 함)
     target_keys = {
-        "ego_future_gt_4_dim",
-        "near_future_gt_4_dim",
-        "ego_future_gt_is_valid",
-        "near_future_gt_is_valid",
+        "ego_future_gt_4_dim", # output 에서만 꺼내도록
+        "near_future_gt_4_dim", # output 에서만 꺼내도록
+        "ego_future_gt_is_valid", # input / output 둘다
+        "near_future_gt_is_valid", # input / output 둘다
     }
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
