@@ -1876,8 +1876,8 @@ def _build_target_cur_future_is_valid_for_rollout_step(
 def _predict_one_rollout_sequential(
     args: Any,
     model: nn.Module,
-    norm_inputs: Dict[str, Any],
-    norm_outputs: Dict[str, Any],
+    unnorm_inputs_copy: Dict[str, Any],
+    unnorm_outputs_copy: Dict[str, Any],
     state_normalizer: "StateNormalizer",
     observation_normalizer: "ObservationNormalizer",
     rollout_idx: int,
@@ -1907,17 +1907,18 @@ def _predict_one_rollout_sequential(
     # ✅ 추가: 이번 롤아웃에서 "최대 몇 칸까지만" 진행할지
     scenario_finish_step = args.scenario_finish_step
 
-    # norm_inputs는 공유 객체일 수 있으니, rollout 내부에서는 얕은 복사본을 사용합니다.
-    norm_inputs_copy: Dict[str, Any] = dict(norm_inputs)
-    norm_outputs_copy: Dict[str, Any] = dict(norm_outputs)
-    # unnorm_inputs_copy: 값들이 "원래 단위"인 dict (B 기준)
-    (unnorm_inputs_copy,
-     unnorm_outputs_copy) = _initialize_unnorm_inputs_for_rollout(
-         norm_inputs_copy=norm_inputs_copy,
-         norm_outputs_copy=norm_outputs_copy,
-         state_normalizer=state_normalizer,
-         observation_normalizer=observation_normalizer,
-     )
+    norm_inputs = observation_normalizer(unnorm_inputs_copy)
+    # ✅ GT 미래를 norm_inputs에 1번만 넣어 둡니다.
+    norm_outputs = {k: v.clone() for k, v in unnorm_outputs_copy.items()}
+    ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"]
+    norm_outputs["ego_future_gt_4_dim"] = state_normalizer(
+        data=ego_future_gt_4_dim,
+        valid_mask=unnorm_outputs_copy["ego_future_gt_is_valid"])
+
+    # (B, Pnn, future_len, 4)
+    norm_outputs["near_future_gt_4_dim"] = state_normalizer(
+        data=unnorm_outputs_copy["near_future_gt_4_dim"],
+        valid_mask=unnorm_outputs_copy["near_future_gt_is_valid"])
 
     cached_valid_masks: Dict[
         str, torch.Tensor] = _build_cached_valid_masks_for_static_map_features(
@@ -2121,18 +2122,6 @@ def _predict_rollouts_sequential(
 
     batch_size = int(target_future_valid.shape[0])  # B
     one_or_pnn = int(target_future_valid.shape[1])  # (1+Pnn)
-    norm_inputs = observation_normalizer(inputs)
-
-    # ✅ GT 미래를 norm_inputs에 1번만 넣어 둡니다.
-    norm_outputs = {k: v.clone() for k, v in outputs.items()}
-    ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]
-    norm_outputs["ego_future_gt_4_dim"] = state_normalizer(
-        data=ego_future_gt_4_dim, valid_mask=outputs["ego_future_gt_is_valid"])
-
-    # (B, Pnn, future_len, 4)
-    norm_outputs["near_future_gt_4_dim"] = state_normalizer(
-        data=outputs["near_future_gt_4_dim"],
-        valid_mask=outputs["near_future_gt_is_valid"])
 
     draw_batch_idx = int(getattr(args, "draw_batch_idx", 0))
 
@@ -2147,8 +2136,8 @@ def _predict_rollouts_sequential(
         _predict_one_rollout_sequential(
             args=args,
             model=model,
-            norm_inputs=norm_inputs,
-            norm_outputs=norm_outputs,
+            unnorm_inputs_copy=inputs,
+            unnorm_outputs_copy=outputs,
             state_normalizer=state_normalizer,
             observation_normalizer=observation_normalizer,
             rollout_idx=int(r),
@@ -4186,41 +4175,6 @@ def _transform_pose_4_dim_inplace(
 
     pose_4_dim[..., 2] = torch.where(valid_mask_bool, cos_new, cos_h)
     pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
-
-
-def _initialize_unnorm_inputs_for_rollout(
-    norm_inputs_copy: Dict[str, Any],
-    norm_outputs_copy: Dict[str, Any],
-    state_normalizer: "StateNormalizer",
-    observation_normalizer: "ObservationNormalizer",
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """rollout에서 계속 유지할 '원래 값(unnorm)' 입력 dict를 1번만 만들어 둡니다.
-
-    목표
-    ----
-    rollout 시작 시점에 unnorm dict를 한 번 만들어서 계속 들고 갑니다.
-
-
-    Returns:
-        Dict[str, Any]:
-            unnorm 입력 dict.
-            - 좌표 변환은 이 dict에 대해 수행합니다.
-            - 값이 Tensor가 아닌 항목(list 등)은 그대로 들어있을 수 있습니다.
-    """
-    # 1) 기본은 ObservationNormalizer 기준으로 unnorm 변환
-    #    - 키가 normalizer dict에 없으면 그대로 유지됩니다.
-    unnorm_inputs_copy: Dict[str, Any] = observation_normalizer.inverse(
-        norm_inputs_copy)
-
-    unnorm_outputs_copy = {k: v.clone() for k, v in norm_outputs_copy.items()}
-    unnorm_outputs_copy["ego_future_gt_4_dim"] = state_normalizer.inverse(
-        data=norm_outputs_copy["ego_future_gt_4_dim"],
-        valid_mask=norm_outputs_copy["ego_future_gt_is_valid"])
-    # (B, Pnn, future_len, 4)
-    unnorm_outputs_copy["near_future_gt_4_dim"] = state_normalizer.inverse(
-        data=norm_outputs_copy["near_future_gt_4_dim"],
-        valid_mask=norm_outputs_copy["near_future_gt_is_valid"])
-    return unnorm_inputs_copy, unnorm_outputs_copy
 
 
 def _build_norm_inputs_from_unnorm_inputs(
