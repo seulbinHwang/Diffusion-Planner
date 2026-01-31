@@ -5044,60 +5044,70 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
     )
 
 
+
 def _update_near_past_and_valid_inplace_for_time_chunk(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_near_pose_chunk: torch.Tensor,
 ) -> None:
     """2) near past와 near_agents_past_is_valid를 gap만큼 앞으로 당겨 업데이트합니다.
 
-    Args:
-        unnorm_inputs_b_r_copy (Dict[str, Any]):
-            입력 dict(원래 단위, inplace 갱신).
-            필요한 키/shape:
-              - near_agents_past: (B*R, Pnn, time_len, 11)
-              - near_agents_past_is_valid: (B*R, Pnn, time_len)
-        unnorm_near_pose_chunk (torch.Tensor):
-            이번에 예측된 near 포즈 시퀀스.
-            shape: (B*R, Pnn, gap, 4)  # (x, y, cos, sin)
+\    --------
+    - 각 near agent의 "현재 시점(기존 past의 마지막)" valid를 그대로 이어 붙입니다.
+      그래서 원래 존재하지 않던 agent(False)가 rollout이 진행되며 True로 바뀌는 일이 없습니다.
+    - 추가로, 무효 agent는 새로 붙는 state 값도 0으로 유지해
+      "값이 0이면 무효" 같은 후속 로직에서도 agent가 생기지 않게 합니다.
 
     Returns:
-        int:
-            Pnn 값(near agent 수). shape: ()
+        None
     """
+    near_agents_past = unnorm_inputs_b_r_copy["near_agents_past"]  # (B, Pnn, time_len, 11)
+    near_agents_past_is_valid = unnorm_inputs_b_r_copy[
+        "near_agents_past_is_valid"
+    ]  # (B, Pnn, time_len)
 
-    near_agents_past = unnorm_inputs_b_r_copy[
-        "near_agents_past"]  # (B*R, Pnn, time_len, 11)
-    pnn = int(near_agents_past.shape[1])
     gap = int(unnorm_near_pose_chunk.shape[2])
     if gap <= 0:
         return
 
-    # near_last: (B*R, Pnn, 11)
-    near_last = near_agents_past[:, :, -1, :].clone()
+    # near_current: (B, Pnn, 11)
+    near_current = near_agents_past[:, :, -1, :].clone()
 
-    # near_chunk_11: (B*R, Pnn, gap, 11)
-    near_chunk_11 = near_last[:, :, None, :].expand(-1, -1, gap, -1).clone()
-    near_chunk_11[:, :, :, 0:4] = unnorm_near_pose_chunk
+    # near_chunk_11: (B, Pnn, gap, 11)
+    near_chunk_11 = near_current[:, :, None, :].expand(-1, -1, gap, -1).clone()
+    near_chunk_11[:, :, :, 0:4] = unnorm_near_pose_chunk  # (x,y,cos,sin)
 
-    # near_agents_past: (B*R, Pnn, time_len, 11)
+    # ✅ (중요) 새로 붙이는 valid는 "현재 시점 valid"를 그대로 이어 붙입니다.
+    # near_current_is_valid: (B, Pnn) bool
+    near_current_is_valid = near_agents_past_is_valid[:, :, -1].to(dtype=torch.bool)
+
+    # near_chunk_is_valid: (B, Pnn, gap) bool
+    near_chunk_is_valid = near_current_is_valid[:, :, None].expand(-1, -1, gap)
+
+    # near_chunk_is_valid: (B, Pnn, gap) dtype = near_agents_past_is_valid.dtype
+    near_chunk_is_valid = near_chunk_is_valid.to(dtype=near_agents_past_is_valid.dtype)
+
+    # ✅ 무효 agent는 값도 0으로 유지(값 기반 무효 판정 로직까지 안전하게)
+    # mask_f: (B, Pnn, gap, 1)
+    mask_f = near_chunk_is_valid.to(dtype=near_chunk_11.dtype)[..., None]
+    near_chunk_11 = near_chunk_11 * mask_f  # (B, Pnn, gap, 11)
+
+    # near_agents_past: (B, Pnn, time_len, 11)
     unnorm_inputs_b_r_copy["near_agents_past"] = torch.cat(
         [near_agents_past[:, :, gap:, :], near_chunk_11],
         dim=2,
     )
 
-    near_agents_past_is_valid = unnorm_inputs_b_r_copy[
-        "near_agents_past_is_valid"]  # (B*R, Pnn, time_len)
-    # near_chunk_is_valid: (B*R, Pnn, gap)
-    near_chunk_is_valid = torch.ones(
-        (int(unnorm_near_pose_chunk.shape[0]), pnn, gap),
-        dtype=near_agents_past_is_valid.dtype,
-        device=near_agents_past_is_valid.device,
-    )
-    # near_agents_past_is_valid: (B*R, Pnn, time_len)
+    # near_agents_past_is_valid: (B, Pnn, time_len)
     unnorm_inputs_b_r_copy["near_agents_past_is_valid"] = torch.cat(
         [near_agents_past_is_valid[:, :, gap:], near_chunk_is_valid],
         dim=2,
     )
+
+    # (선택) 현재 시점 near 유효 여부를 여기서도 최신으로 맞춰 둠
+    # near_agents_is_valid: (B, Pnn)
+    unnorm_inputs_b_r_copy["near_agents_is_valid"] = near_current_is_valid.to(
+        dtype=near_agents_past_is_valid.dtype
+    ).clone()
 
 
 def _assert_non_near_agents_not_supported_for_time_chunk(

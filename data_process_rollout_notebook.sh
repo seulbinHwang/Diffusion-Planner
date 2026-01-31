@@ -34,7 +34,7 @@ echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
 #EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation"
 EVAL_SET_PATH="${USER_PATH}/nuplan/dataset/processed_compressed"
-EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_training.json"
+EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_processed_compressed.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -166,19 +166,19 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "amortized_fine_tuning_lr_2e5" \
-  --name "amortized_fine_tuning_lr_2e5" \
-  --eval_method "train" \
+  --load_name "wosac_final_0128" \
+  --name "wosac_final_0128" \
+  --eval_method "fine_tune_data_maker" \
   --batch_size 1 \
   --use_wandb False \
   --use_deepspeed True \
   --save_image True \
   --save_video True \
-  --save_cache_path "/home/user/nuplan/dataset/processed_rollout2" \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0131_2" \
   --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
-  --fine_tune_gen_k 64 \
+  --fine_tune_gen_k 32 \
   --rollout_time_chunk_size 1 \
   --fine_tune_temperature 0.8 \
   --use_recovery True \
@@ -186,7 +186,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --recovery_threshold_m 1. \
   --scenario_finish_step 40 \
   --time_step_for_compare 60 \
-  --rollout_number 3 \
+  --rollout_number 1 \
   --use_amortized_diffusion True
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

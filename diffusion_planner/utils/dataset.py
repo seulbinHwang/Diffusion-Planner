@@ -548,7 +548,6 @@ class DiffusionPlannerData(Dataset):
         womd_only_keys: List[str] = [
             "speed_bump_points",  # (speed_bump_num, safety_len, 2) # womd
             "driveway_points",  # (driveway_num, safety_len, 2) # womd (환경에 따라 driveway라는 이름일 수도 있음)
-            "driveway",  # (driveway_num, safety_len, 2)
             "lane_type",  # (chosen_lane_num, 4) # womd
             "left_line_type",  # (chosen_lane_num, 13) # womd
             "right_line_type",  # (chosen_lane_num, 13) # womd
