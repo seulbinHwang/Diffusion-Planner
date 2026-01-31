@@ -1381,7 +1381,7 @@ def _maybe_draw_rollout_visualization_frame(
     state: _RolloutVisualizationState,
     unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
-    normed_selected_traj: torch.Tensor,
+    normed_selected_gt_traj: torch.Tensor,
     target_cur_fut_gt_is_valid: torch.Tensor,
     state_normalizer: Any,
     step_idx: int,
@@ -1391,7 +1391,7 @@ def _maybe_draw_rollout_visualization_frame(
     Args:
         state (_RolloutVisualizationState): 시각화 상태. shape: ()
         unnorm_inputs_copy (Dict[str, Any]): 현재 시점 모델 입력(정규화). shape: ()
-        normed_selected_traj (torch.Tensor):
+        normed_selected_gt_traj (torch.Tensor):
             선택된 경로(정규화).
             shape: (B, 1+Pnn, 1+T, 4)
         state_normalizer (Any): (x,y,cos,sin) 변환 도구. shape: ()
@@ -1410,12 +1410,12 @@ def _maybe_draw_rollout_visualization_frame(
 
     # _prepare_data_for_one_batch_draw 내부에서:
     # - (B)에서 state.draw_batch_idx 샘플 1개만 뽑아 numpy로 만듭니다.
-    (a_unnorm_inputs_np, a_unnorm_trajectory_np, a_unnorm_near_future_gt_3_dim,
-     a_unnorm_ego_future_gt_4_dim
+    (a_unnorm_inputs_np, a_unnorm_selected_gt_traj_np,
+     a_unnorm_near_future_gt_3_dim, a_unnorm_ego_future_gt_4_dim
     ) = _prepare_data_for_one_batch_draw(
         unnorm_inputs_copy=unnorm_inputs_copy,
         unnorm_outputs_copy=unnorm_outputs_copy,
-        normed_selected_traj=normed_selected_traj,  # (B, 1+Pnn, 1+T, 4)
+        normed_selected_gt_traj=normed_selected_gt_traj,  # (B, 1+Pnn, 1+T, 4)
         target_cur_fut_gt_is_valid=target_cur_fut_gt_is_valid,  # (B, 1+Pnn, 1+T)
         state_normalizer=state_normalizer,
         draw_batch_idx=int(state.draw_batch_idx),
@@ -1424,7 +1424,8 @@ def _maybe_draw_rollout_visualization_frame(
     _draw_one_batch_one_rollout(
         save_dir=str(state.save_dir),
         a_unnorm_inputs_np=a_unnorm_inputs_np,
-        a_unnorm_trajectory_np=a_unnorm_trajectory_np,  # shape: ((1+)Pnn, 1+T, 4)
+        a_unnorm_selected_gt_traj_np=
+        a_unnorm_selected_gt_traj_np,  # shape: ((1+)Pnn, 1+T, 4)
         a_unnorm_ego_future_gt_4_dim=
         a_unnorm_ego_future_gt_4_dim,  # shape: (future_len, 4)
         a_unnorm_near_future_gt_3_dim=
@@ -1910,7 +1911,7 @@ from typing import Any
 def _build_target_cur_future_is_valid(
     *,
     unnorm_inputs_copy: Dict[str, Any],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """rollout step에서 target 유효 마스크들을 만듭니다.
 
     하는 일
@@ -1958,7 +1959,7 @@ def _build_target_cur_future_is_valid(
         dim=2,
     )  # (B, 1+Pnn, 1+future_len)
 
-    return target_future_gt_is_valid, target_cur_fut_gt_is_valid
+    return target_current_is_valid, target_future_gt_is_valid, target_cur_fut_gt_is_valid
 
 
 def _expand_origin_world_pose_for_agents(
@@ -2236,12 +2237,16 @@ def _predict_one_rollout_sequential(
                 gap=gap,
             )
             # (B, 1+Pnn, future_len), (B, 1+Pnn, 1+future_len)
-            (target_future_gt_is_valid,
+            (target_current_is_valid, target_future_gt_is_valid,
              target_cur_fut_gt_is_valid) = _build_target_cur_future_is_valid(
                  unnorm_inputs_copy=unnorm_inputs_copy,)
+            # target_current_is_valid: (B, 1+Pnn) -> (B, 1+Pnn, 1) -> (B, 1+Pnn, 1+future_len)
+            target_current_is_valid_expand = target_current_is_valid.unsqueeze(
+                2).expand(-1, -1, 1 + int(future_len))
             unnorm_best_traj = state_normalizer.inverse(
                 data=best_normed_traj,  # (B, 1+Pnn, 1+future_len, 4)
-                valid_mask=target_cur_fut_gt_is_valid,  # (B, 1+Pnn, 1+future_len)
+                valid_mask=
+                target_current_is_valid_expand,  # (B, 1+Pnn, 1+future_len)
             )
             # unnorm_selected_traj_raw: (B, 1+Pnn, 1+future_len, 4)
             unnorm_selected_traj_raw = _apply_recovery_if_needed(
@@ -2251,14 +2256,16 @@ def _predict_one_rollout_sequential(
                 unnorm_outputs_copy=unnorm_outputs_copy,
                 target_future_gt_is_valid=
                 target_future_gt_is_valid,  # (B, 1+Pnn, future_len)
+                target_current_is_valid_expand=
+                target_current_is_valid_expand,  # (B, 1+Pnn, 1+future_len)
                 future_len=int(future_len),
             )
             # (B, 1+Pnn, 1+future_len, 4)
-            unnorm_selected_traj = _apply_unvalid_at_unnorm_selected_traj_raw(
+            unnorm_selected_gt_traj = _apply_unvalid_at_unnorm_selected_traj_raw(
                 unnorm_selected_traj_raw, target_cur_fut_gt_is_valid)
-            # normed_selected_traj: (B, 1+Pnn, 1+future_len, 4)
-            normed_selected_traj = state_normalizer(
-                data=unnorm_selected_traj,
+            # normed_selected_gt_traj: (B, 1+Pnn, 1+future_len, 4)
+            normed_selected_gt_traj = state_normalizer(
+                data=unnorm_selected_gt_traj,
                 valid_mask=target_cur_fut_gt_is_valid)
 
             # ✅ (그림/영상) 준비는 1번만
@@ -2275,7 +2282,8 @@ def _predict_one_rollout_sequential(
                 state=vis_state,
                 unnorm_inputs_copy=unnorm_inputs_copy,
                 unnorm_outputs_copy=unnorm_outputs_copy,
-                normed_selected_traj=normed_selected_traj,  # (B, 1+Pnn, 1+T, 4)
+                normed_selected_gt_traj=
+                normed_selected_gt_traj,  # (B, 1+Pnn, 1+T, 4)
                 target_cur_fut_gt_is_valid=
                 target_cur_fut_gt_is_valid,  # (B, 1+Pnn, 1+T)
                 state_normalizer=state_normalizer,
@@ -2290,8 +2298,8 @@ def _predict_one_rollout_sequential(
                 # near_future_gt_4_dim: (B, Pnn, future_len, 4)
                 (ego_future_gt_4_dim, near_future_gt_4_dim
                 ) = _build_generated_demo_futures_from_selected_traj(
-                    unnorm_selected_traj=
-                    unnorm_selected_traj,  # (B, 1+Pnn, 1+future_len, 4)
+                    unnorm_selected_gt_traj=
+                    unnorm_selected_gt_traj,  # (B, 1+Pnn, 1+future_len, 4)
                 )
                 unnorm_outputs_for_save[
                     "ego_future_gt_4_dim"] = ego_future_gt_4_dim  # (B, future_len, 4)
@@ -2703,16 +2711,16 @@ def _save_inference_data(
 def _prepare_data_for_one_batch_draw(
     unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
-    normed_selected_traj: torch.Tensor,  # (B, 1+Pnn, 1+T, 4)
+    normed_selected_gt_traj: torch.Tensor,  # (B, 1+Pnn, 1+T, 4)
     target_cur_fut_gt_is_valid: torch.Tensor,  # (B, 1+Pnn, 1+T)
     state_normalizer: Any,
     draw_batch_idx: int,
 ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
     # 역정규화: ((1+)Pnn, 1+T, 4)
-    a_unnorm_trajectory = state_normalizer.inverse(
-        data=normed_selected_traj[draw_batch_idx],
+    a_unnorm_selected_gt_traj = state_normalizer.inverse(
+        data=normed_selected_gt_traj[draw_batch_idx],
         valid_mask=target_cur_fut_gt_is_valid[draw_batch_idx])
-    a_unnorm_trajectory_np = a_unnorm_trajectory.cpu().numpy()
+    a_unnorm_selected_gt_traj_np = a_unnorm_selected_gt_traj.cpu().numpy()
 
     unnorm_ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"].cpu(
     ).numpy()  # (B, future_len, 4)
@@ -2734,7 +2742,7 @@ def _prepare_data_for_one_batch_draw(
     a_unnorm_inputs_copy = _shrink_batch_to_draw_idx(unnorm_inputs_copy,
                                                      draw_batch_idx)
     a_unnorm_inputs_np = _torch_to_numpy(a_unnorm_inputs_copy)
-    return a_unnorm_inputs_np, a_unnorm_trajectory_np, a_unnorm_near_future_gt_3_dim, a_unnorm_ego_future_gt_4_dim
+    return a_unnorm_inputs_np, a_unnorm_selected_gt_traj_np, a_unnorm_near_future_gt_3_dim, a_unnorm_ego_future_gt_4_dim
 
 
 from typing import Any, Dict, Tuple
@@ -3831,6 +3839,8 @@ def _apply_recovery_if_needed(
     expert_distance_m: torch.Tensor,  # (B_all, 1+Pnn)
     unnorm_outputs_copy: Dict[str, torch.Tensor],
     target_future_gt_is_valid: torch.Tensor,  # (B_all, 1+Pnn, future_len) bool
+    target_current_is_valid_expand: torch.
+    Tensor,  # (B_all, 1+Pnn, 1+future_len) bool
     future_len: int,
 ) -> torch.Tensor:  # (B_all, 1+Pnn, 1+future_len, 4), (B_all, 1+Pnn, future_len) bool
     """선택된 경로가 GT에서 너무 멀면, 에이전트별로 GT 쪽으로 부드럽게 섞습니다.
@@ -3915,7 +3925,8 @@ def _apply_recovery_if_needed(
     # (cos, sin) 정리는 "0이 아닌 칸"에만
     _normalize_heading_cos_sin_in_pose_4_dim_inplace(
         pose_4_dim=out_future,  # (B_all, 1+Pnn, future_len, 4)
-        valid_mask=target_future_gt_is_valid,  # (B_all, 1+Pnn, future_len)
+        valid_mask=
+        target_current_is_valid_expand[:, :, 1:],  # (B_all, 1+Pnn, future_len)
     )
     out = unnorm_best_traj.clone()  # (B, 1+Pnn, 1+future_len, 4)
     out[:, :, 1:, :] = out_future
@@ -3925,7 +3936,7 @@ def _apply_recovery_if_needed(
 
 def _build_generated_demo_futures_from_selected_traj(
     *,
-    unnorm_selected_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, 4)
+    unnorm_selected_gt_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, 4)
 ) -> Tuple[torch.Tensor,
            torch.Tensor]:  # (B, future_len, 4) / (B, Pnn, future_len, 4)
     """선택(및 복구)된 경로로 저장용 미래 GT 텐서를 만듭니다.
@@ -3943,7 +3954,7 @@ def _build_generated_demo_futures_from_selected_traj(
             - near_future_gt_4_dim: (B_all, Pnn, future_len, 4)
     """
     # selected_future_all: (B_all, 1+Pnn, future_len, 4)
-    selected_future_all = unnorm_selected_traj[:, :, 1:, :]
+    selected_future_all = unnorm_selected_gt_traj[:, :, 1:, :]
     # demo_ego:  (B_all, future_len, 4)
     # demo_near: (B_all, Pnn, future_len, 4)  (Pnn이 0이면 (B_all,0,future_len,4))
     demo_ego = selected_future_all[:, 0, :, :]
@@ -3987,7 +3998,7 @@ def _get_near_future_11(
 def _draw_one_batch_one_rollout(
         save_dir: str,
         a_unnorm_inputs_np: Dict[str, Any],
-        a_unnorm_trajectory_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
+        a_unnorm_selected_gt_traj_np: np.ndarray,  # ((1+)Pnn, 1+T, 4)
         a_unnorm_ego_future_gt_4_dim: np.ndarray,  # (future_len, 4)
         a_unnorm_near_future_gt_3_dim: np.ndarray,  # (Pnn, future_len, 3)
         step_idx: int,
@@ -3996,8 +4007,8 @@ def _draw_one_batch_one_rollout(
     output_data = {}
 
     ego_current = a_unnorm_inputs_np["ego_agent_past"][-1]  # (11,)
-    ego_future_11 = _get_ego_future_11(ego_current,
-                                       a_unnorm_trajectory_np)  # (1+T, 11)
+    ego_future_11 = _get_ego_future_11(
+        ego_current, a_unnorm_selected_gt_traj_np)  # (1+T, 11)
     output_data["ego_np_int_traj_11_wrt_ego"] = ego_future_11
     output_data["ego_next_wp_wrt_ego"] = ego_future_11[1]
 
@@ -4008,7 +4019,7 @@ def _draw_one_batch_one_rollout(
     near_agents_current = a_unnorm_inputs_np[
         "near_agents_past"][:, -1, :]  # (Pnn, 11)
     near_future_11 = _get_near_future_11(
-        near_agents_current, a_unnorm_trajectory_np)  # (Pnn, 1+T, 11)
+        near_agents_current, a_unnorm_selected_gt_traj_np)  # (Pnn, 1+T, 11)
 
     # ✅ key를 항상 "17" 같은 형태로 만들기
     diff_token_to_np_int_traj_11_wrt_ego: Dict[str, np.ndarray] = {}
@@ -4616,10 +4627,6 @@ def _update_near_past_and_valid_inplace_for_time_chunk(
 
     # near_chunk_is_valid: (B, Pnn, gap) bool
     near_chunk_is_valid = near_current_is_valid[:, :, None].expand(-1, -1, gap)
-
-    # near_chunk_is_valid: (B, Pnn, gap) dtype = near_agents_past_is_valid.dtype
-    near_chunk_is_valid = near_chunk_is_valid.to(
-        dtype=near_agents_past_is_valid.dtype)
 
     # ✅ 무효 agent는 값도 0으로 유지(값 기반 무효 판정 로직까지 안전하게)
     # mask_f: (B, Pnn, gap, 1)
