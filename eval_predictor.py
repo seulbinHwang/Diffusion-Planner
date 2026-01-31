@@ -3484,10 +3484,10 @@ def _build_valid_agent_mask_for_wosac(
 
 
 def _filter_rollout_tensors_by_agent_mask(
-    agent_id: Optional[torch.Tensor], # (N = B*(1+)Pnn)
+    agent_id: Optional[torch.Tensor],  # (N = B*(1+)Pnn)
     agent_batch: torch.Tensor,  # (N,)
-    pred_traj: torch.Tensor, # (N, R, future_len, 2)
-    pred_z: Optional[torch.Tensor], # (N, R, future_len)
+    pred_traj: torch.Tensor,  # (N, R, future_len, 2)
+    pred_z: Optional[torch.Tensor],  # (N, R, future_len)
     pred_head: torch.Tensor,  # (N, R, future_len)
     agent_valid_mask: torch.Tensor,  # (N,)
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor,
@@ -4043,8 +4043,8 @@ def _build_padded_eval_object_ids_tensor_for_batch(
 
 
 def _update_min_ade_for_validation_batch(
-    outputs: Dict[str, torch.Tensor], # unnorm
-    inputs: Dict[str, Any], # unnorm
+    outputs: Dict[str, torch.Tensor],  # unnorm
+    inputs: Dict[str, Any],  # unnorm
     pred_traj: torch.Tensor,
     agent_batch: torch.Tensor,  # (N,)
     target_id: torch.Tensor,  # (N,)
@@ -4124,7 +4124,7 @@ def _update_min_ade_for_validation_batch(
 
     # target_future_valid_flat: (N, T)  마지막 4차원이 전부 0이면 그 스텝은 무효
     ego_future_gt_is_valid = outputs["ego_future_gt_is_valid"]  # (B, T)
-    near_future_gt_is_valid = outputs["near_future_gt_is_valid"] # (B, Pnn, T)
+    near_future_gt_is_valid = outputs["near_future_gt_is_valid"]  # (B, Pnn, T)
     target_future_valid = torch.cat(
         [
             ego_future_gt_is_valid[:, None, :],
@@ -4267,11 +4267,11 @@ def validate_func(
         dtype=torch.bool)  # (N,)
 
     (
-        wosac_agent_id, # (N2,)
-        wosac_agent_batch, # (N2,)
-        wosac_pred_traj, # (N2, R, T, 2)
-        wosac_pred_z, # (N2, R, T)
-        wosac_pred_head, # (N2, R, T)
+        wosac_agent_id,  # (N2,)
+        wosac_agent_batch,  # (N2,)
+        wosac_pred_traj,  # (N2, R, T, 2)
+        wosac_pred_z,  # (N2, R, T)
+        wosac_pred_head,  # (N2, R, T)
     ) = _filter_rollout_tensors_by_agent_mask(
         agent_id=target_id,  # (N = B*(1+)Pnn)
         agent_batch=agent_batch,  # (N,)
@@ -5028,7 +5028,6 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
         [ego_agent_past[:, gap:, :], unnorm_ego_chunk_11],
         dim=1,
     )
-
 
     ego_agent_past_is_valid = unnorm_inputs_b_r_copy[
         "ego_agent_past_is_valid"]  # (B*R, time_len)
