@@ -1268,7 +1268,9 @@ def _init_rollout_visualization_state(
 def _maybe_prepare_rollout_visualization_once(
     *,
     args: Any,
-    norm_inputs: Dict[str, Any],
+    scenario_id: List[str],
+    target_id: List[torch.Tensor],
+    one_or_pnn: int,
     state: _RolloutVisualizationState,
 ) -> _RolloutVisualizationState:
     """예산 체크 + 저장 폴더/ID 준비를 '딱 1번'만 수행합니다.
@@ -1309,7 +1311,9 @@ def _maybe_prepare_rollout_visualization_once(
 
     draw_scenario_id, draw_near_target_id, save_dir = _prepare_data_for_draw(
         args=args,
-        norm_inputs=norm_inputs,
+        scenario_id=scenario_id,
+        target_id=target_id,
+        one_or_pnn=one_or_pnn,
         draw_batch_idx=int(state.draw_batch_idx),
     )
     state.draw_scenario_id = str(draw_scenario_id)
@@ -1324,7 +1328,7 @@ def _maybe_draw_rollout_visualization_frame(
     unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
     normed_selected_traj: torch.Tensor,
-    target_cur_future_is_valid: torch.Tensor,
+    target_cur_fut_gt_is_valid: torch.Tensor,
     state_normalizer: Any,
     step_idx: int,
 ) -> None:
@@ -1335,7 +1339,7 @@ def _maybe_draw_rollout_visualization_frame(
         unnorm_inputs_copy (Dict[str, Any]): 현재 시점 모델 입력(정규화). shape: ()
         normed_selected_traj (torch.Tensor):
             선택된 경로(정규화).
-            shape: (B*R, 1+Pnn, 1+T, 4)
+            shape: (B, 1+Pnn, 1+T, 4)
         state_normalizer (Any): (x,y,cos,sin) 변환 도구. shape: ()
         step_idx (int): 저장 파일 이름에 넣을 step 값. shape: ()
 
@@ -1353,15 +1357,15 @@ def _maybe_draw_rollout_visualization_frame(
     # _prepare_data_for_one_batch_draw 내부에서:
     # - (B)에서 state.draw_batch_idx 샘플 1개만 뽑아 numpy로 만듭니다.
     (a_unnorm_inputs_np, a_unnorm_trajectory_np, a_unnorm_near_future_gt_3_dim,
-     a_unnorm_ego_future_gt_4_dim) = _prepare_data_for_one_batch_draw(
-         unnorm_inputs_copy=unnorm_inputs_copy,
-         unnorm_outputs_copy=unnorm_outputs_copy,
-         normed_selected_traj=normed_selected_traj,  # (B*R, 1+Pnn, 1+T, 4)
-         target_cur_future_is_valid=
-         target_cur_future_is_valid,  # (B*R, 1+Pnn, 1+T)
-         state_normalizer=state_normalizer,
-         draw_batch_idx=int(state.draw_batch_idx),
-     )
+     a_unnorm_ego_future_gt_4_dim
+    ) = _prepare_data_for_one_batch_draw(
+        unnorm_inputs_copy=unnorm_inputs_copy,
+        unnorm_outputs_copy=unnorm_outputs_copy,
+        normed_selected_traj=normed_selected_traj,  # (B, 1+Pnn, 1+T, 4)
+        target_cur_fut_gt_is_valid=target_cur_fut_gt_is_valid,  # (B, 1+Pnn, 1+T)
+        state_normalizer=state_normalizer,
+        draw_batch_idx=int(state.draw_batch_idx),
+    )
 
     _draw_one_batch_one_rollout(
         save_dir=str(state.save_dir),
@@ -1408,7 +1412,9 @@ def _finalize_rollout_visualization_video_if_needed(
 
 def _prepare_data_for_draw(
     args,
-    norm_inputs: Dict[str, Any],
+    scenario_id: List[str],
+    target_id: List[torch.Tensor],
+    one_or_pnn: int,
     draw_batch_idx: int,
 ) -> Tuple[
         str,
@@ -1422,14 +1428,12 @@ def _prepare_data_for_draw(
             - scenario_id: 길이 B 리스트
             - target_id: 길이 (1+Pnn) 리스트
     """
-    draw_scenario_id = norm_inputs["scenario_id"][draw_batch_idx]  # str
-    target_id = norm_inputs.get("target_id", None)
+    draw_scenario_id = scenario_id[draw_batch_idx]  # str
     if target_id is not None:
         draw_target_id = target_id[draw_batch_idx]  # ((1+)Pnn)
     else:
         # manually set draw_target_id as 0, 1, ..., Pnn
-        one_Pnn = len(norm_inputs["near_agents_past"][draw_batch_idx])
-        draw_target_id = torch.arange(0, one_Pnn + 1)  # ((1+)Pnn)
+        draw_target_id = torch.arange(0, one_or_pnn + 1)  # ((1+)Pnn)
 
     draw_near_target_id = draw_target_id[1:]  # (Pnn,)
 
@@ -1450,16 +1454,16 @@ def _build_inference_npz_file_name(
     왜 sample_idx를 넣나?
     -------------------
     같은 scenario_id에 대해 rollout을 R번 만들면,
-    (B*R) 배치 안에서 scenario_id가 반복됩니다.
+    (B) 배치 안에서 scenario_id가 반복됩니다.
     step_count만 파일명에 넣으면 같은 이름이 여러 번 만들어져서 덮어쓰게 됩니다.
 
-    그래서 파일명에 (B*R) 배치 인덱스(sample_idx)를 함께 넣어서
+    그래서 파일명에 (B) 배치 인덱스(sample_idx)를 함께 넣어서
     "배치/rollout별로 파일이 각각 남도록" 합니다.
 
     Args:
         scenario_id (str): 시나리오 id 문자열. shape: ()
         step_count (int): rollout 루프 저장 step 번호. shape: ()
-        sample_idx (int): (B*R) 배치에서의 샘플 인덱스. shape: ()
+        sample_idx (int): (B) 배치에서의 샘플 인덱스. shape: ()
 
     Returns:
         str: 예) "{scenario_id}_b0007_step0003.npz" 형태. shape: ()
@@ -1806,24 +1810,19 @@ def _remove_invalid_data(npz_payload_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 def _apply_unvalid_at_unnorm_selected_traj_raw(
         unnorm_selected_traj_raw: torch.Tensor,  # (B, 1+Pnn, 1+future_len, 4)
-        target_future_valid: torch.Tensor,  # (B, 1+Pnn, future_len)
+        target_cur_fut_gt_is_valid: torch.Tensor,  # (B, 1+Pnn, 1+future_len)
 ) -> torch.Tensor:  # (B, 1+Pnn, 1+future_len, 4)
     # 중요: unnorm_selected_traj 에서, GT가 없는 구간은 0. 으로 채워집니다.
-    unnorm_selected_traj_raw_future_len = unnorm_selected_traj_raw[:, :,
-                                                                   1:, :]  # (B, 1+Pnn, future_len, 4)
-    # apply target_future_valid to unnorm_selected_traj_raw_future_len
-    unnorm_selected_traj_raw_future_len = unnorm_selected_traj_raw_future_len * \
-                                          target_future_valid[
-                                              ..., None]  # (B, 1+Pnn, future_len, 4)
-    unnorm_selected_traj = unnorm_selected_traj_raw.clone()
-    unnorm_selected_traj[:, :, 1:, :] = unnorm_selected_traj_raw_future_len
+    unnorm_selected_traj = unnorm_selected_traj_raw * target_cur_fut_gt_is_valid.unsqueeze(
+        -1).to(
+            dtype=unnorm_selected_traj_raw.dtype)  # (B, 1+Pnn, 1+future_len, 4)
     return unnorm_selected_traj
 
 
 from typing import Any
 
 
-def _build_target_cur_future_is_valid_for_rollout_step(
+def _build_target_cur_future_is_valid(
     *,
     unnorm_inputs_copy: Dict[str, Any],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1831,24 +1830,29 @@ def _build_target_cur_future_is_valid_for_rollout_step(
 
     하는 일
     ------
-    1) target_future_valid을 꺼냅니다.
     2) 현재 시점에서 ego/near가 존재하는지(유효한지) 마스크를 만듭니다.
     3) (현재 1칸 + 미래 future_len칸) 전체 유효 마스크를 합쳐 만듭니다.
 
     Args:
         unnorm_inputs_copy (Dict[str, Any]):
             필요한 키/shape
-            - target_future_valid: (B, 1+Pnn, future_len)  bool 또는 0/1
             - ego_agent_past_is_valid: (B, past_len)  bool 또는 0/1
             - near_agents_is_valid: (B, Pnn)  bool 또는 0/1
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
-            - target_future_valid: (B, 1+Pnn, future_len) bool
-            - target_cur_future_is_valid: (B, 1+Pnn, 1+future_len) bool
+            - target_cur_fut_gt_is_valid: (B, 1+Pnn, 1+future_len) bool
     """
-    target_future_valid = unnorm_inputs_copy["target_future_valid"]
-    target_future_valid = target_future_valid.to(dtype=torch.bool)
+    ego_future_gt_is_valid = unnorm_inputs_copy["ego_future_gt_is_valid"]
+    ego_future_gt_is_valid = ego_future_gt_is_valid.to(dtype=torch.bool)
+
+    near_future_gt_is_valid = unnorm_inputs_copy["near_future_gt_is_valid"]
+    near_future_gt_is_valid = near_future_gt_is_valid.to(dtype=torch.bool)
+
+    target_future_gt_is_valid = torch.cat(
+        [ego_future_gt_is_valid.unsqueeze(1), near_future_gt_is_valid],
+        dim=1,
+    )  # (B, 1+Pnn, future_len)
 
     ego_agent_past_is_valid = unnorm_inputs_copy["ego_agent_past_is_valid"]
     ego_agent_past_is_valid = ego_agent_past_is_valid.to(dtype=torch.bool)
@@ -1859,18 +1863,17 @@ def _build_target_cur_future_is_valid_for_rollout_step(
     # ego_agent_current_is_valid: (B,)
     ego_agent_current_is_valid = ego_agent_past_is_valid[:, -1]
 
-    # target_agent_is_valid: (B, 1+Pnn)
-    target_agent_is_valid = torch.cat(
-        [ego_agent_current_is_valid[:, None], near_agents_is_valid],
+    target_current_is_valid = torch.cat(
+        [ego_agent_current_is_valid.unsqueeze(1), near_agents_is_valid],
         dim=1,
-    )
+    )  # (B, 1+Pnn)
 
-    # target_cur_future_is_valid: (B, 1+Pnn, 1+future_len)
-    target_cur_future_is_valid = torch.cat(
-        [target_agent_is_valid[:, :, None], target_future_valid],
+    target_cur_fut_gt_is_valid = torch.cat(
+        [target_current_is_valid.unsqueeze(2), target_future_gt_is_valid],
         dim=2,
-    )
-    return target_future_valid, target_cur_future_is_valid
+    )  # (B, 1+Pnn, 1+future_len)
+
+    return target_future_gt_is_valid, target_cur_fut_gt_is_valid
 
 
 def _predict_one_rollout_sequential(
@@ -1906,20 +1909,11 @@ def _predict_one_rollout_sequential(
 
     # ✅ 추가: 이번 롤아웃에서 "최대 몇 칸까지만" 진행할지
     scenario_finish_step = args.scenario_finish_step
+    scenario_id = unnorm_inputs_copy["scenario_id"]  # length B list of str
+    target_id = unnorm_inputs_copy.get(
+        "target_id", None)  # length (1+Pnn) list of torch.Tensor
 
-    norm_inputs = observation_normalizer(unnorm_inputs_copy)
     # ✅ GT 미래를 norm_inputs에 1번만 넣어 둡니다.
-    norm_outputs = {k: v.clone() for k, v in unnorm_outputs_copy.items()}
-    ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"]
-    norm_outputs["ego_future_gt_4_dim"] = state_normalizer(
-        data=ego_future_gt_4_dim,
-        valid_mask=unnorm_outputs_copy["ego_future_gt_is_valid"])
-
-    # (B, Pnn, future_len, 4)
-    norm_outputs["near_future_gt_4_dim"] = state_normalizer(
-        data=unnorm_outputs_copy["near_future_gt_4_dim"],
-        valid_mask=unnorm_outputs_copy["near_future_gt_is_valid"])
-
     cached_valid_masks: Dict[
         str, torch.Tensor] = _build_cached_valid_masks_for_static_map_features(
             unnorm_inputs_copy=unnorm_inputs_copy)
@@ -1973,12 +1967,12 @@ def _predict_one_rollout_sequential(
                 gap=gap,
             )
             # (B, 1+Pnn, future_len), (B, 1+Pnn, 1+future_len)
-            (target_future_valid, target_cur_future_is_valid
-            ) = _build_target_cur_future_is_valid_for_rollout_step(
-                unnorm_inputs_copy=unnorm_inputs_copy,)
+            (target_future_gt_is_valid,
+             target_cur_fut_gt_is_valid) = _build_target_cur_future_is_valid(
+                 unnorm_inputs_copy=unnorm_inputs_copy,)
             unnorm_best_traj = state_normalizer.inverse(
                 data=best_normed_traj,  # (B, 1+Pnn, 1+future_len, 4)
-                valid_mask=target_cur_future_is_valid,  # (B, 1+Pnn, 1+future_len)
+                valid_mask=target_cur_fut_gt_is_valid,  # (B, 1+Pnn, 1+future_len)
             )
             # unnorm_selected_traj_raw: (B, 1+Pnn, 1+future_len, 4)
             unnorm_selected_traj_raw = _apply_recovery_if_needed(
@@ -1986,21 +1980,24 @@ def _predict_one_rollout_sequential(
                 unnorm_best_traj=unnorm_best_traj,  # (B, 1+Pnn, 1+future_len, 4)
                 expert_distance_m=best_dist_m,  # (B, 1+Pnn)
                 unnorm_outputs_copy=unnorm_outputs_copy,
-                target_future_valid=target_future_valid,  # (B, 1+Pnn, future_len)
+                target_future_gt_is_valid=
+                target_future_gt_is_valid,  # (B, 1+Pnn, future_len)
                 future_len=int(future_len),
             )
             # (B, 1+Pnn, 1+future_len, 4)
             unnorm_selected_traj = _apply_unvalid_at_unnorm_selected_traj_raw(
-                unnorm_selected_traj_raw, target_future_valid)
+                unnorm_selected_traj_raw, target_cur_fut_gt_is_valid)
             # normed_selected_traj: (B, 1+Pnn, 1+future_len, 4)
             normed_selected_traj = state_normalizer(
                 data=unnorm_selected_traj,
-                valid_mask=target_cur_future_is_valid)
+                valid_mask=target_cur_fut_gt_is_valid)
 
             # ✅ (그림/영상) 준비는 1번만
             vis_state = _maybe_prepare_rollout_visualization_once(
                 args=args,
-                norm_inputs=norm_inputs,
+                scenario_id=scenario_id,
+                target_id=target_id,
+                one_or_pnn=one_or_pnn,
                 state=vis_state,  # _RolloutVisualizationState
             )
 
@@ -2010,20 +2007,16 @@ def _predict_one_rollout_sequential(
                 unnorm_inputs_copy=unnorm_inputs_copy,
                 unnorm_outputs_copy=unnorm_outputs_copy,
                 normed_selected_traj=normed_selected_traj,  # (B, 1+Pnn, 1+T, 4)
-                target_cur_future_is_valid=
-                target_cur_future_is_valid,  # (B, 1+Pnn, 1+T)
+                target_cur_fut_gt_is_valid=
+                target_cur_fut_gt_is_valid,  # (B, 1+Pnn, 1+T)
                 state_normalizer=state_normalizer,
                 step_idx=int(step_start),
             )
             # ✅ npz 저장 (execute 전)
             step_count_for_save = int(step_count) + 1
             if args.save_inference_data:
-                unnorm_inputs_for_save = {
-                    k: v.clone() for k, v in unnorm_inputs_copy.items()
-                }
-                unnorm_outputs_for_save = {
-                    k: v.clone() for k, v in unnorm_outputs_copy.items()
-                }
+                unnorm_inputs_for_save = dict(unnorm_inputs_copy)
+                unnorm_outputs_for_save = dict(unnorm_outputs_copy)
                 # ego_future_gt_4_dim: (B, future_len, 4)
                 # near_future_gt_4_dim: (B, Pnn, future_len, 4)
                 (ego_future_gt_4_dim, near_future_gt_4_dim
@@ -2442,9 +2435,8 @@ def _save_inference_data(
 ) -> None:
     """rollout 중간 상태를 npz로 저장합니다(내부를 역할별 함수로 분리한 버전)."""
     os.makedirs(dir, exist_ok=True)
-
-    ego_future_gt_4_dim = unnorm_outputs[
-        "ego_future_gt_4_dim"]  # (B, future_len, 4)
+    # (B, future_len, 4)
+    ego_future_gt_4_dim = unnorm_outputs["ego_future_gt_4_dim"]
     batch_size = int(ego_future_gt_4_dim.shape[0])  # B
 
     unnorm_inputs_np = _gpu_tensor_to_cpu_np(
@@ -2515,23 +2507,23 @@ def _prepare_data_for_one_batch_draw(
     unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
     normed_selected_traj: torch.Tensor,  # (B, 1+Pnn, 1+T, 4)
-    target_cur_future_is_valid: torch.Tensor,  # (B, 1+Pnn, 1+T)
+    target_cur_fut_gt_is_valid: torch.Tensor,  # (B, 1+Pnn, 1+T)
     state_normalizer: Any,
     draw_batch_idx: int,
 ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
     # 역정규화: ((1+)Pnn, 1+T, 4)
     a_unnorm_trajectory = state_normalizer.inverse(
         data=normed_selected_traj[draw_batch_idx],
-        valid_mask=target_cur_future_is_valid[draw_batch_idx])
+        valid_mask=target_cur_fut_gt_is_valid[draw_batch_idx])
     a_unnorm_trajectory_np = a_unnorm_trajectory.cpu().numpy()
 
     unnorm_ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"].cpu(
-    ).numpy()  # (B*R, future_len, 4)
+    ).numpy()  # (B, future_len, 4)
     a_unnorm_ego_future_gt_4_dim = unnorm_ego_future_gt_4_dim[
         draw_batch_idx]  # (future_len, 4)
 
     unnorm_near_future_gt_4_dim = unnorm_outputs_copy[
-        "near_future_gt_4_dim"].cpu().numpy()  # (B*R, Pnn, future_len, 4)
+        "near_future_gt_4_dim"].cpu().numpy()  # (B, Pnn, future_len, 4)
     # near_future_gt_4_dim: (B
     # near_future_gt_3_dim : x, y, yaw
     unnorm_near_future_gt_3_dim = np.concatenate([
@@ -2704,14 +2696,13 @@ def _extract_target_future_gt_and_valid_for_compare(
     *,
     unnorm_outputs_step: Dict[str, torch.Tensor],
     compare_steps: int,
-) -> Tuple[torch.Tensor, torch.Tensor, int]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """정답 미래 포즈와 유효 마스크를 비교 구간 길이로 잘라 (ego+near)로 합칩니다.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor, int]:
-            - gt_future_4_dim: (B_all, 1+Pnn, H, 4)
-            - gt_valid_mask: (B_all, 1+Pnn, H)  bool
-            - future_len: 정답 future_len 값. shape: ()
+            - unnorm_gt_compare_4_dim: (B_all, 1+Pnn, H, 4)
+            - target_compare_gt_is_valid: (B_all, 1+Pnn, H)  bool
     """
     ego_future_gt_4_dim = unnorm_outputs_step[
         "ego_future_gt_4_dim"]  # (B_all, T, 4)
@@ -2725,8 +2716,8 @@ def _extract_target_future_gt_and_valid_for_compare(
 
     future_len = int(ego_future_gt_4_dim.shape[1])
 
-    # gt_valid_mask: (B_all, 1+Pnn, T) -> (B_all, 1+Pnn, H)
-    gt_valid_mask_full = torch.cat(
+    # target_compare_gt_is_valid: (B_all, 1+Pnn, T) -> (B_all, 1+Pnn, H)
+    target_future_gt_is_valid = torch.cat(
         [
             ego_future_gt_is_valid[:, None, :],
             near_future_gt_is_valid,
@@ -2734,23 +2725,23 @@ def _extract_target_future_gt_and_valid_for_compare(
         dim=1,
     ).to(dtype=torch.bool)
 
-    gt_valid_mask = gt_valid_mask_full[:, :, :int(
+    target_compare_gt_is_valid = target_future_gt_is_valid[:, :, :int(
         compare_steps)]  # (B_all, 1+Pnn, H)
 
-    # gt_future_4_dim: (B_all, 1+Pnn, H, 4)
+    # unnorm_gt_compare_4_dim: (B_all, 1+Pnn, H, 4)
     ego_gt = ego_future_gt_4_dim[:, :int(compare_steps), :]  # (B_all, H, 4)
     near_gt = near_future_gt_4_dim[:, :, :int(
         compare_steps), :]  # (B_all, Pnn, H, 4)
-    gt_future_4_dim = torch.cat([ego_gt[:, None, :, :], near_gt], dim=1)
+    unnorm_gt_compare_4_dim = torch.cat([ego_gt[:, None, :, :], near_gt], dim=1)
 
-    return gt_future_4_dim, gt_valid_mask, int(future_len)
+    return unnorm_gt_compare_4_dim, target_compare_gt_is_valid
 
 
 def _compute_corner_mean_distance_m_per_agent(
         *,
         unnorm_pred_future_4_dim: torch.Tensor,  # (B_all, 1+Pnn, H, 4)
         unnorm_gt_future_4_dim: torch.Tensor,  # (B_all, 1+Pnn, H, 4)
-        gt_valid_mask: torch.Tensor,  # (B_all, 1+Pnn, H) bool
+        target_compare_gt_is_valid: torch.Tensor,  # (B_all, 1+Pnn, H) bool
         agent_length_m: torch.Tensor,  # (B_all, 1+Pnn)
         agent_width_m: torch.Tensor,  # (B_all, 1+Pnn)
 ) -> torch.Tensor:
@@ -2761,7 +2752,7 @@ def _compute_corner_mean_distance_m_per_agent(
             예측 포즈(원래 단위). shape: (B_all, 1+Pnn, H, 4)
         unnorm_gt_future_4_dim (torch.Tensor):
             정답 포즈(원래 단위). shape: (B_all, 1+Pnn, H, 4)
-        gt_valid_mask (torch.Tensor):
+        target_compare_gt_is_valid (torch.Tensor):
             정답이 존재하는 칸만 True. shape: (B_all, 1+Pnn, H) bool
         agent_length_m (torch.Tensor):
             에이전트 길이. shape: (B_all, 1+Pnn)
@@ -2810,7 +2801,8 @@ def _compute_corner_mean_distance_m_per_agent(
     # step_dist: (B_all, 1+Pnn, H)  코너 평균
     step_dist = corner_dist.mean(dim=-1)
 
-    valid_f = gt_valid_mask.to(dtype=torch.float32)  # (B_all, 1+Pnn, H)
+    valid_f = target_compare_gt_is_valid.to(
+        dtype=torch.float32)  # (B_all, 1+Pnn, H)
     sum_dist = (step_dist * valid_f).sum(dim=-1)  # (B_all, 1+Pnn)
     denom = torch.clamp(valid_f.sum(dim=-1), min=1.0)  # (B_all, 1+Pnn)
 
@@ -2885,13 +2877,13 @@ def _compute_expert_guidance_distance_m_per_agent(
             dtype: float32
     """
     # 1) 정답(미래) + 유효 마스크 준비 (비교 구간으로 자름)
-    # gt_future_4_dim: (B_all, 1+Pnn, H, 4),
-    # gt_valid_mask: (B_all, 1+Pnn, H)
-    (gt_future_4_dim, gt_valid_mask,
-     future_len_gt) = _extract_target_future_gt_and_valid_for_compare(
-         unnorm_outputs_step=unnorm_br_outputs_step,
-         compare_steps=int(compare_steps),
-     )
+    # unnorm_gt_compare_4_dim: (B_all, 1+Pnn, H, 4),
+    # target_compare_gt_is_valid: (B_all, 1+Pnn, H)
+    (unnorm_gt_compare_4_dim, target_compare_gt_is_valid
+    ) = _extract_target_future_gt_and_valid_for_compare(
+        unnorm_outputs_step=unnorm_br_outputs_step,
+        compare_steps=int(compare_steps),
+    )
 
     # 2) 예측(미래) 비교 구간 뽑기 + 길이 검증
     # # (B_all, 1+Pnn, H, 4)
@@ -2901,15 +2893,16 @@ def _compute_expert_guidance_distance_m_per_agent(
     # unnorm_pred_future_4_dim :  (B_all, 1+Pnn, H, 4)
     unnorm_pred_future_4_dim = state_normalizer.inverse(
         data=normed_pred_future_4_dim,  # (B_all, 1+Pnn, H, 4)
-        valid_mask=gt_valid_mask,  # (B_all, 1+Pnn, H)
+        valid_mask=target_compare_gt_is_valid,  # (B_all, 1+Pnn, H)
     )
 
     # 4) 코너 평균 거리로 에이전트별 점수 계산(정답이 없는 칸은 제외)
     # dist: (B_all, 1+Pnn), float32
     dist = _compute_corner_mean_distance_m_per_agent(
         unnorm_pred_future_4_dim=unnorm_pred_future_4_dim,  # (B_all, 1+Pnn, H, 4)
-        unnorm_gt_future_4_dim=gt_future_4_dim,  # (B_all, 1+Pnn, H, 4)
-        gt_valid_mask=gt_valid_mask,  # (B_all, 1+Pnn, H)
+        unnorm_gt_future_4_dim=unnorm_gt_compare_4_dim,  # (B_all, 1+Pnn, H, 4)
+        target_compare_gt_is_valid=
+        target_compare_gt_is_valid,  # (B_all, 1+Pnn, H)
         agent_length_m=agent_length_m,  # (B_all, 1+Pnn)
         agent_width_m=agent_width_m,  # (B_all, 1+Pnn)
     )
@@ -3116,7 +3109,7 @@ def _forward_and_score_candidate_batch(
             - cand_traj: shape (cand_count, B, 1+Pnn, 1+future_len, 4)
             - cand_dist: shape (cand_count, B, 1+Pnn)
     """
-    c = int(max(1, int(cand_count)))
+    rollout_repeat = int(max(1, int(cand_count)))
     b = int(max(1, int(batch_size)))
 
     # 1) 후보별 노이즈 만들기
@@ -3140,14 +3133,14 @@ def _forward_and_score_candidate_batch(
             noise_std=args.fine_tune_temperature,
             seed_stride=int(seed_stride),
             cand_start_idx=int(cand_start_idx),
-            cand_count=int(c),
+            cand_count=int(rollout_repeat),
         )
     else:
         inference_noise_flat = None
 
     unnorm_br_outputs_step = _repeat_inputs_for_candidate_batch(
         norm_data_step=unnorm_outputs_copy,
-        repeat=int(c),
+        repeat=int(rollout_repeat),
         batch_size=int(b),
     )
 
@@ -3159,7 +3152,7 @@ def _forward_and_score_candidate_batch(
     # 2) 입력 dict를 (B*cand_count, ...)로 늘리기
     norm_br_inputs_step = _repeat_inputs_for_candidate_batch(
         norm_data_step=norm_inputs_step,
-        repeat=int(c),
+        repeat=int(rollout_repeat),
         batch_size=int(b),
     )
     norm_br_inputs_step[
@@ -3174,20 +3167,20 @@ def _forward_and_score_candidate_batch(
 
     cand_traj_flat = decoder_output["integrated_trajectory"]
 
-    # cand_traj_flat: (B*cand_count, 1+Pnn, 1+future_len, 4)
+    # cand_traj_flat: (B*rollout_repeat, 1+Pnn, 1+future_len, 4)
     cand_traj = cand_traj_flat.reshape(
-        int(c),
+        int(rollout_repeat),
         int(b),
         int(one_or_pnn),
         1 + int(future_len),
         4,
     )
 
-    # len_rep/wid_rep: (B*c, 1+Pnn)
-    len_rep = agent_length_m.repeat(int(c), 1)
-    wid_rep = agent_width_m.repeat(int(c), 1)
+    # len_rep/wid_rep: (B*rollout_repeat, 1+Pnn)
+    len_rep = agent_length_m.repeat(int(rollout_repeat), 1)
+    wid_rep = agent_width_m.repeat(int(rollout_repeat), 1)
 
-    # cand_dist_flat: (B*c, 1+Pnn) # 무효 agent 는 0. 으로 처리했음.
+    # cand_dist_flat: (B*rollout_repeat, 1+Pnn) # 무효 agent 는 0. 으로 처리했음.
     cand_dist_flat = _compute_expert_guidance_distance_m_per_agent(
         state_normalizer=state_normalizer,
         normed_trajectory=cand_traj_flat,
@@ -3198,8 +3191,9 @@ def _forward_and_score_candidate_batch(
         agent_width_m=wid_rep,
     )
 
-    # cand_dist: (cand_count, B, 1+Pnn)
-    cand_dist = cand_dist_flat.reshape(int(c), int(b), int(one_or_pnn))
+    # cand_dist: (rollout_repeat, B, 1+Pnn)
+    cand_dist = cand_dist_flat.reshape(int(rollout_repeat), int(b),
+                                       int(one_or_pnn))
 
     return cand_traj, cand_dist
 
@@ -3231,17 +3225,18 @@ def _select_best_from_candidate_batch_jointly(
     # cand_traj_perm: (B, Kc, 1+Pnn, 1+future_len, 4)
     cand_traj_perm = cand_traj.permute(1, 0, 2, 3, 4)
     b = int(cand_traj_perm.shape[0])
-    a = int(cand_traj_perm.shape[2])
+    one_Pnn = int(cand_traj_perm.shape[2])
     t = int(cand_traj_perm.shape[3])
 
     # idx_traj: (B, 1, 1+Pnn, 1+future_len, 4)
-    idx_traj = group_best_idx[:, None, None, None, None].expand(b, 1, a, t, 4)
+    idx_traj = group_best_idx[:, None, None, None,
+                              None].expand(b, 1, one_Pnn, t, 4)
     group_best_traj = torch.take_along_dim(cand_traj_perm, idx_traj,
                                            dim=1).squeeze(1)
 
     # cand_dist_perm: (B, Kc, 1+Pnn)
     cand_dist_perm = cand_dist.permute(1, 0, 2)
-    idx_dist = group_best_idx[:, None, None].expand(b, 1, a)
+    idx_dist = group_best_idx[:, None, None].expand(b, 1, one_Pnn)
     group_best_dist = torch.take_along_dim(cand_dist_perm, idx_dist,
                                            dim=1).squeeze(1)
 
@@ -3292,11 +3287,11 @@ def _select_best_from_candidate_batch_per_agent(
     # cand_traj_perm: (B, 1+Pnn, Kc, 1+future_len, 4)
     cand_traj_perm = cand_traj.permute(1, 2, 0, 3, 4)
     b = int(cand_traj_perm.shape[0])
-    a = int(cand_traj_perm.shape[1])
+    one_Pnn = int(cand_traj_perm.shape[1])
     t = int(cand_traj_perm.shape[3])
 
     # idx_traj: (B, 1+Pnn, 1, 1+future_len, 4)
-    idx_traj = group_best_idx[..., None, None, None].expand(b, a, 1, t, 4)
+    idx_traj = group_best_idx[..., None, None, None].expand(b, one_Pnn, 1, t, 4)
     group_best_traj = torch.take_along_dim(cand_traj_perm, idx_traj,
                                            dim=2).squeeze(2)
 
@@ -3500,7 +3495,7 @@ def _mix_pred_and_gt_future_for_recovery(
     *,
     unnorm_best_fut_traj: torch.Tensor,  # (B_all, 1+Pnn, future_len, 4)
     gt_future: torch.Tensor,  # (B_all, 1+Pnn, future_len, 4)
-    target_future_valid: torch.Tensor,  # (B_all, 1+Pnn, future_len) bool
+    target_future_gt_is_valid: torch.Tensor,  # (B_all, 1+Pnn, future_len) bool
     lambda_: torch.Tensor,  # (B_all, 1+Pnn, future_len, 1) float32
 ) -> torch.Tensor:  # (B_all, 1+Pnn, future_len, 4)
     """예측 미래와 GT 미래를 섞되, GT가 없는 칸은 예측 값을 유지합니다.
@@ -3511,7 +3506,7 @@ def _mix_pred_and_gt_future_for_recovery(
     mixed_f = (1.0 - lambda_) * pred_f + lambda_ * gt_f  # (B_all, 1+Pnn, T, 4)
 
     # ✅ GT가 없는 칸은 섞지 않고 pred 유지
-    mixed_f = torch.where(target_future_valid[..., None], mixed_f, pred_f)
+    mixed_f = torch.where(target_future_gt_is_valid[..., None], mixed_f, pred_f)
 
     return mixed_f.to(dtype=unnorm_best_fut_traj.dtype)
 
@@ -3560,10 +3555,10 @@ def _normalize_heading_cos_sin_in_pose_4_dim_inplace(
 def _apply_recovery_if_needed(
     *,
     args: Any,
-    unnorm_best_traj: torch.Tensor,  # (B*R, 1+Pnn, 1+future_len, 4)
+    unnorm_best_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, 4)
     expert_distance_m: torch.Tensor,  # (B_all, 1+Pnn)
     unnorm_outputs_copy: Dict[str, torch.Tensor],
-    target_future_valid: torch.Tensor,  # (B_all, 1+Pnn, future_len) bool
+    target_future_gt_is_valid: torch.Tensor,  # (B_all, 1+Pnn, future_len) bool
     future_len: int,
 ) -> torch.Tensor:  # (B_all, 1+Pnn, 1+future_len, 4), (B_all, 1+Pnn, future_len) bool
     """선택된 경로가 GT에서 너무 멀면, 에이전트별로 GT 쪽으로 부드럽게 섞습니다.
@@ -3577,19 +3572,10 @@ def _apply_recovery_if_needed(
             복구가 반영된 경로(원래 단위).
             shape: (B_all, 1+Pnn, 1+future_len, 4)
     """
-    unnorm_ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"]
-    unnorm_near_future_gt_4_dim = unnorm_outputs_copy["near_future_gt_4_dim"]
-    # unnorm_target_future_gt_4_dim: (B_all, 1+Pnn, future_len, 4)
-    unnorm_target_future_gt_4_dim = torch.cat(
-        [
-            unnorm_ego_future_gt_4_dim[:, None, :, :],
-            unnorm_near_future_gt_4_dim
-        ],
-        dim=1,
-    )
+
     # ✅ (중요) GT 유효 스텝 수를 에이전트별로 계산
-    # target_valid: (B_all, 1+Pnn)
-    target_valid = target_future_valid.sum(dim=-1).to(dtype=torch.long)
+    # target_gt_valid: (B_all, 1+Pnn)
+    target_gt_valid = target_future_gt_is_valid.sum(dim=-1).to(dtype=torch.long)
 
     if not args.use_recovery:
         return unnorm_best_traj
@@ -3612,7 +3598,7 @@ def _apply_recovery_if_needed(
     unnorm_best_fut_traj = unnorm_best_traj[:, :, 1:, :]
 
     # GT가 아예 없는 에이전트는 recovery 대상에서 제외(논리적으로 더 안전)
-    recovery_need_mask = recovery_need_mask & (target_valid > 0)
+    recovery_need_mask = recovery_need_mask & (target_gt_valid > 0)
     if not torch.any(recovery_need_mask):
         return unnorm_best_traj
 
@@ -3629,12 +3615,23 @@ def _apply_recovery_if_needed(
         device=device,
     )
 
+    unnorm_ego_future_gt_4_dim = unnorm_outputs_copy["ego_future_gt_4_dim"]
+    unnorm_near_future_gt_4_dim = unnorm_outputs_copy["near_future_gt_4_dim"]
+    # unnorm_target_future_gt_4_dim: (B_all, 1+Pnn, future_len, 4)
+    unnorm_target_future_gt_4_dim = torch.cat(
+        [
+            unnorm_ego_future_gt_4_dim[:, None, :, :],
+            unnorm_near_future_gt_4_dim
+        ],
+        dim=1,
+    )
     # mixed_future: (B_all, 1+Pnn, future_len, 4)
     mixed_future = _mix_pred_and_gt_future_for_recovery(
         unnorm_best_fut_traj=
         unnorm_best_fut_traj,  # (B_all, 1+Pnn, future_len, 4)
         gt_future=unnorm_target_future_gt_4_dim,  # (B_all, 1+Pnn, future_len, 4)
-        target_future_valid=target_future_valid,  # (B_all, 1+Pnn, future_len)
+        target_future_gt_is_valid=
+        target_future_gt_is_valid,  # (B_all, 1+Pnn, future_len)
         lambda_=lambda_,  #  (B_all, 1+Pnn, future_len, 1)
     )
 
@@ -3646,9 +3643,9 @@ def _apply_recovery_if_needed(
     # (cos, sin) 정리는 "0이 아닌 칸"에만
     _normalize_heading_cos_sin_in_pose_4_dim_inplace(
         pose_4_dim=out_future,  # (B_all, 1+Pnn, future_len, 4)
-        valid_mask=target_future_valid,  # (B_all, 1+Pnn, future_len)
+        valid_mask=target_future_gt_is_valid,  # (B_all, 1+Pnn, future_len)
     )
-    out = unnorm_best_traj.clone()  # (B*R, 1+Pnn, 1+future_len, 4)
+    out = unnorm_best_traj.clone()  # (B, 1+Pnn, 1+future_len, 4)
     out[:, :, 1:, :] = out_future
 
     return out
@@ -3656,9 +3653,9 @@ def _apply_recovery_if_needed(
 
 def _build_generated_demo_futures_from_selected_traj(
     *,
-    unnorm_selected_traj: torch.Tensor,  # (B*R, 1+Pnn, 1+future_len, 4)
+    unnorm_selected_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, 4)
 ) -> Tuple[torch.Tensor,
-           torch.Tensor]:  # (B*R, future_len, 4) / (B*R, Pnn, future_len, 4)
+           torch.Tensor]:  # (B, future_len, 4) / (B, Pnn, future_len, 4)
     """선택(및 복구)된 경로로 저장용 미래 GT 텐서를 만듭니다.
 
     동작
@@ -4217,21 +4214,21 @@ def _build_cached_valid_masks_for_static_map_features(
     lanes_len_is_valid = unnorm_inputs_copy.get("lanes_len_is_valid", None)
     if isinstance(lanes_len_is_valid,
                   torch.Tensor) and lanes_len_is_valid.numel() > 0:
-        # lanes: (B*R, lane_num, lane_len)
+        # lanes: (B, lane_num, lane_len)
         cached["lanes"] = lanes_len_is_valid.to(dtype=torch.bool)
 
     route_lanes_len_is_valid = unnorm_inputs_copy.get(
         "route_lanes_len_is_valid", None)
     if isinstance(route_lanes_len_is_valid,
                   torch.Tensor) and route_lanes_len_is_valid.numel() > 0:
-        # route_lanes: (B*R, route_lane_num, lane_len, 12)
+        # route_lanes: (B, route_lane_num, lane_len, 12)
         cached["route_lanes"] = route_lanes_len_is_valid.to(dtype=torch.bool)
 
     static_objects_is_valid = unnorm_inputs_copy.get("static_objects_is_valid",
                                                      None)
     if isinstance(static_objects_is_valid,
                   torch.Tensor) and static_objects_is_valid.numel() > 0:
-        # static_objects: (B*R, static_num, 10)
+        # static_objects: (B, static_num, 10)
         cached["static_objects"] = static_objects_is_valid.to(dtype=torch.bool)
 
     return cached
@@ -4277,16 +4274,6 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
 ) -> None:
     """1) ego past와 ego_agent_past_is_valid를 gap만큼 앞으로 당겨 업데이트합니다.
 
-    Args:
-        unnorm_inputs_copy (Dict[str, Any]):
-            입력 dict(원래 단위, inplace 갱신).
-            필요한 키/shape:
-              - ego_agent_past: (B*R, time_len, 11)
-              - ego_agent_past_is_valid: (B*R, time_len)
-        unnorm_ego_pose_chunk (torch.Tensor):
-            이번에 예측된 ego 포즈 시퀀스.
-            shape: (B*R, gap, 4)  # (x, y, cos, sin)
-
     Returns:
         None
 
@@ -4297,36 +4284,36 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
         - ego_agent_past_is_valid도 동일하게 앞쪽 gap을 버리고,
           뒤에 True(또는 1)로 채운 gap개를 붙입니다.
     """
-    ego_agent_past = unnorm_inputs_copy["ego_agent_past"]  # (B*R, time_len, 11)
+    ego_agent_past = unnorm_inputs_copy["ego_agent_past"]  # (B, time_len, 11)
 
     gap = int(unnorm_ego_pose_chunk.shape[1])
 
     if gap <= 0:
         return
 
-    # ego_current_11_dim: (B*R, 11)
+    # ego_current_11_dim: (B, 11)
     ego_current_11_dim = ego_agent_past[:, -1, :].clone()
 
-    # unnorm_ego_chunk_11: (B*R, gap, 11)
+    # unnorm_ego_chunk_11: (B, gap, 11)
     unnorm_ego_chunk_11 = ego_current_11_dim[:, None, :].expand(-1, gap,
                                                                 -1).clone()
     unnorm_ego_chunk_11[:, :, 0:4] = unnorm_ego_pose_chunk  # (x,y,cos,sin)
 
-    # ego_agent_past: (B*R, time_len, 11)
+    # ego_agent_past: (B, time_len, 11)
     unnorm_inputs_copy["ego_agent_past"] = torch.cat(
         [ego_agent_past[:, gap:, :], unnorm_ego_chunk_11],
         dim=1,
     )
 
     ego_agent_past_is_valid = unnorm_inputs_copy[
-        "ego_agent_past_is_valid"]  # (B*R, time_len)
-    # ego_chunk_is_valid: (B*R, gap)
+        "ego_agent_past_is_valid"]  # (B, time_len)
+    # ego_chunk_is_valid: (B, gap)
     ego_chunk_is_valid = torch.ones(
         (int(unnorm_ego_pose_chunk.shape[0]), gap),
         dtype=ego_agent_past_is_valid.dtype,
         device=ego_agent_past_is_valid.device,
     )
-    # ego_agent_past_is_valid: (B*R, time_len)
+    # ego_agent_past_is_valid: (B, time_len)
     unnorm_inputs_copy["ego_agent_past_is_valid"] = torch.cat(
         [ego_agent_past_is_valid[:, gap:], ego_chunk_is_valid],
         dim=1,
@@ -4339,50 +4326,37 @@ def _update_near_past_and_valid_inplace_for_time_chunk(
 ) -> None:
     """2) near past와 near_agents_past_is_valid를 gap만큼 앞으로 당겨 업데이트합니다.
 
-    Args:
-        unnorm_inputs_copy (Dict[str, Any]):
-            입력 dict(원래 단위, inplace 갱신).
-            필요한 키/shape:
-              - near_agents_past: (B*R, Pnn, time_len, 11)
-              - near_agents_past_is_valid: (B*R, Pnn, time_len)
-        unnorm_near_pose_chunk (torch.Tensor):
-            이번에 예측된 near 포즈 시퀀스.
-            shape: (B*R, Pnn, gap, 4)  # (x, y, cos, sin)
-
-    Returns:
-        int:
-            Pnn 값(near agent 수). shape: ()
     """
 
     near_agents_past = unnorm_inputs_copy[
-        "near_agents_past"]  # (B*R, Pnn, time_len, 11)
+        "near_agents_past"]  # (B, Pnn, time_len, 11)
     pnn = int(near_agents_past.shape[1])
     gap = int(unnorm_near_pose_chunk.shape[2])
     if gap <= 0:
         return
 
-    # near_last: (B*R, Pnn, 11)
+    # near_last: (B, Pnn, 11)
     near_last = near_agents_past[:, :, -1, :].clone()
 
-    # near_chunk_11: (B*R, Pnn, gap, 11)
+    # near_chunk_11: (B, Pnn, gap, 11)
     near_chunk_11 = near_last[:, :, None, :].expand(-1, -1, gap, -1).clone()
     near_chunk_11[:, :, :, 0:4] = unnorm_near_pose_chunk
 
-    # near_agents_past: (B*R, Pnn, time_len, 11)
+    # near_agents_past: (B, Pnn, time_len, 11)
     unnorm_inputs_copy["near_agents_past"] = torch.cat(
         [near_agents_past[:, :, gap:, :], near_chunk_11],
         dim=2,
     )
 
     near_agents_past_is_valid = unnorm_inputs_copy[
-        "near_agents_past_is_valid"]  # (B*R, Pnn, time_len)
-    # near_chunk_is_valid: (B*R, Pnn, gap)
+        "near_agents_past_is_valid"]  # (B, Pnn, time_len)
+    # near_chunk_is_valid: (B, Pnn, gap)
     near_chunk_is_valid = torch.ones(
         (int(unnorm_near_pose_chunk.shape[0]), pnn, gap),
         dtype=near_agents_past_is_valid.dtype,
         device=near_agents_past_is_valid.device,
     )
-    # near_agents_past_is_valid: (B*R, Pnn, time_len)
+    # near_agents_past_is_valid: (B, Pnn, time_len)
     unnorm_inputs_copy["near_agents_past_is_valid"] = torch.cat(
         [near_agents_past_is_valid[:, :, gap:], near_chunk_is_valid],
         dim=2,
@@ -4419,14 +4393,14 @@ def _update_neighbor_past_and_valid_inplace_for_time_chunk(
         unnorm_inputs_copy (Dict[str, Any]):
             입력 dict(원래 단위, inplace 갱신).
             사용하는 키/shape:
-              - neighbor_agents_past: (B*R, Pnn, time_len, 11) 또는 None
-              - near_agents_past: (B*R, Pnn, time_len, 11)
-              - near_agents_past_is_valid: (B*R, Pnn, time_len)
+              - neighbor_agents_past: (B, Pnn, time_len, 11) 또는 None
+              - near_agents_past: (B, Pnn, time_len, 11)
+              - near_agents_past_is_valid: (B, Pnn, time_len)
             생성/갱신하는 키:
               - neighbor_agents_past
               - neighbor_agents_past_is_valid
-              - near_agents_is_valid: (B*R, Pnn)  # 마지막 time 스텝의 valid
-              - neighbor_agents_is_valid: (B*R, Pnn)
+              - near_agents_is_valid: (B, Pnn)  # 마지막 time 스텝의 valid
+              - neighbor_agents_is_valid: (B, Pnn)
 
 
     Returns:
@@ -4449,7 +4423,7 @@ def _update_neighbor_past_and_valid_inplace_for_time_chunk(
         "neighbor_agents_past_is_valid"] = neighbor_agents_past_is_valid
 
     # neighbor_agents_is_valid / near_agents_is_valid: 마지막 시점 valid만 뽑아서 저장
-    # neighbor_agents_is_valid: (B*R, Pnn)
+    # neighbor_agents_is_valid: (B, Pnn)
     neighbor_agents_is_valid = neighbor_agents_past_is_valid[:, :, -1].clone()
     unnorm_inputs_copy["near_agents_is_valid"] = neighbor_agents_is_valid
     unnorm_inputs_copy["neighbor_agents_is_valid"] = neighbor_agents_is_valid
@@ -4466,18 +4440,18 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
         unnorm_inputs_copy (Dict[str, Any]):
             입력 dict(원래 단위, inplace 갱신).
             갱신하는 키:
-              - ego_future_gt_is_valid: (B*R, future_len) bool
-              - near_future_gt_is_valid: (B*R, Pnn, future_len) bool
-              - neighbor_future_gt_is_valid: (B*R, Pnn, future_len) bool
+              - ego_future_gt_is_valid: (B, future_len) bool
+              - near_future_gt_is_valid: (B, Pnn, future_len) bool
+              - neighbor_future_gt_is_valid: (B, Pnn, future_len) bool
 
         unnorm_outputs_copy (Dict[str, Any]):
             출력/정답 dict(원래 단위, inplace 갱신).
             필요한 키/shape:
-              - ego_future_gt_4_dim: (B*R, future_len, 4)
-              - near_future_gt_4_dim: (B*R, Pnn, future_len, 4)
-              - planner_future_11_dim: (B*R, future_len, 11)
-              - ego_future_gt_is_valid: (B*R, future_len)
-              - near_future_gt_is_valid: (B*R, Pnn, future_len)
+              - ego_future_gt_4_dim: (B, future_len, 4)
+              - near_future_gt_4_dim: (B, Pnn, future_len, 4)
+              - planner_future_11_dim: (B, future_len, 11)
+              - ego_future_gt_is_valid: (B, future_len)
+              - near_future_gt_is_valid: (B, Pnn, future_len)
 
         gap (int):
             이번에 한 번에 진행한 스텝 수. shape: ()
@@ -4495,7 +4469,7 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
 
     # ego_future_gt_4_dim shift
     ego_future_gt_4_dim = unnorm_outputs_copy[
-        "ego_future_gt_4_dim"]  # (B*R, future_len, 4)
+        "ego_future_gt_4_dim"]  # (B, future_len, 4)
     future_len = int(ego_future_gt_4_dim.shape[1])
     ego_future_gt_4_dim[:, :future_len -
                         gap, :] = ego_future_gt_4_dim[:, gap:, :].clone()
@@ -4504,7 +4478,7 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
 
     # planner_future_11_dim shift
     planner_future_11_dim = unnorm_inputs_copy[
-        "planner_future_11_dim"]  # (B*R, future_len, 11)
+        "planner_future_11_dim"]  # (B, future_len, 11)
     planner_future_11_dim[:, :future_len -
                           gap, :] = planner_future_11_dim[:, gap:, :].clone()
     planner_future_11_dim[:, future_len - gap:, :] = 0.0
@@ -4512,7 +4486,7 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
 
     # ego_future_gt_is_valid shift
     ego_future_gt_is_valid = unnorm_outputs_copy[
-        "ego_future_gt_is_valid"]  # (B*R, future_len)
+        "ego_future_gt_is_valid"]  # (B, future_len)
     ego_future_gt_is_valid[:, :future_len - gap] = ego_future_gt_is_valid[:,
                                                                           gap:]
     ego_future_gt_is_valid[:, future_len - gap:] = 0
@@ -4523,14 +4497,14 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
 
     # near future shift
     near_future_gt_4_dim = unnorm_outputs_copy[
-        "near_future_gt_4_dim"]  # (B*R, Pnn, future_len, 4)
+        "near_future_gt_4_dim"]  # (B, Pnn, future_len, 4)
     near_future_gt_4_dim[:, :, :future_len -
                          gap, :] = near_future_gt_4_dim[:, :, gap:, :].clone()
     near_future_gt_4_dim[:, :, future_len - gap:, :] = 0.0
     unnorm_outputs_copy["near_future_gt_4_dim"] = near_future_gt_4_dim
 
     near_future_gt_is_valid = unnorm_outputs_copy[
-        "near_future_gt_is_valid"]  # (B*R, Pnn, future_len)
+        "near_future_gt_is_valid"]  # (B, Pnn, future_len)
     near_future_gt_is_valid[:, :, :future_len -
                             gap] = near_future_gt_is_valid[:, :, gap:]
     near_future_gt_is_valid[:, :, future_len - gap:] = 0
@@ -4547,18 +4521,10 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
 def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
-    unnorm_ego_pose_chunk: torch.Tensor,  # (B*R, gap, 4)
-    unnorm_near_pose_chunk: torch.Tensor,  # (B*R, Pnn, gap, 4)
+    unnorm_ego_pose_chunk: torch.Tensor,  # (B, gap, 4)
+    unnorm_near_pose_chunk: torch.Tensor,  # (B, Pnn, gap, 4)
     cached_valid_masks: Optional[Dict[str, torch.Tensor]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    1) 여러 스텝(gap개)을 한 번에 past/GT에 반영하고,
-    2) 좌표 기준을 마지막 스텝으로 맞춥니다.
-
-    Returns:
-        Tuple[Dict[str, Any], Dict[str, Any]]:
-            (unnorm_inputs_copy, unnorm_outputs_copy)
-    """
     """
     1) 여러 스텝(gap개)을 한 번에 past/GT에 반영하고,
     2) 좌표 기준을 마지막 스텝으로 맞춥니다.
@@ -4598,7 +4564,7 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     )
 
     # 6) 좌표 기준 변환은 "마지막(gap번째) ego 포즈"로 1번만
-    unnorm_ego_new_cur_pose = unnorm_ego_pose_chunk[:, -1, :]  # (B*R, 4)
+    unnorm_ego_new_cur_pose = unnorm_ego_pose_chunk[:, -1, :]  # (B, 4)
     _transform_origin(
         unnorm_inputs_copy,
         unnorm_outputs_copy,
@@ -4611,19 +4577,19 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
 
 def _transform_origin_step1_ego_past_inplace(
         unnorm_inputs_copy: Dict[str, Any],
-        delta_xy: torch.Tensor,  # (B*R, 2)
-        cos_delta: torch.Tensor,  # (B*R,)
-        sin_delta: torch.Tensor,  # (B*R,)
+        delta_xy: torch.Tensor,  # (B, 2)
+        cos_delta: torch.Tensor,  # (B,)
+        sin_delta: torch.Tensor,  # (B,)
 ) -> None:
     """1) ego_agent_past를 새 기준으로 바꿉니다.
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - ego_agent_past: (B*R, time_len, 11)
-            - ego_agent_past_is_valid: (B*R, time_len)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - ego_agent_past: (B, time_len, 11)
+            - ego_agent_past_is_valid: (B, time_len)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
 
     Returns:
         None
@@ -4631,31 +4597,31 @@ def _transform_origin_step1_ego_past_inplace(
     ego_agent_past = unnorm_inputs_copy["ego_agent_past"]
     ego_agent_past_is_valid = unnorm_inputs_copy["ego_agent_past_is_valid"]
     _transform_state_11_dim_inplace(
-        state_11=ego_agent_past,  # (B*R, time_len, 11)
-        delta_xy=delta_xy,  # (B*R, 2)
-        cos_delta=cos_delta,  # (B*R,)
-        sin_delta=sin_delta,  # (B*R,)
-        valid_mask=ego_agent_past_is_valid,  # (B*R, time_len)
+        state_11=ego_agent_past,  # (B, time_len, 11)
+        delta_xy=delta_xy,  # (B, 2)
+        cos_delta=cos_delta,  # (B,)
+        sin_delta=sin_delta,  # (B,)
+        valid_mask=ego_agent_past_is_valid,  # (B, time_len)
     )
 
 
 def _transform_origin_step2_agents_past_inplace(
         unnorm_inputs_copy: Dict[str, Any],
-        delta_xy: torch.Tensor,  # (B*R, 2)
-        cos_delta: torch.Tensor,  # (B*R,)
-        sin_delta: torch.Tensor,  # (B*R,)
+        delta_xy: torch.Tensor,  # (B, 2)
+        cos_delta: torch.Tensor,  # (B,)
+        sin_delta: torch.Tensor,  # (B,)
 ) -> None:
     """2) near/non_near/neighbor의 past를 새 기준으로 바꿉니다.
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - near_agents_past: (B*R, Pnn, time_len, 11)
-            - non_near_agents_past: (B*R, Nnn, time_len, 11) 또는 (B*R, 0, time_len, 11)
-            - neighbor_agents_past: (B*R, Pnn, time_len, 11) 또는 None
-            - 각 *_is_valid: (B*R, P?, time_len) (없을 수도 있음)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - near_agents_past: (B, Pnn, time_len, 11)
+            - non_near_agents_past: (B, Nnn, time_len, 11) 또는 (B, 0, time_len, 11)
+            - neighbor_agents_past: (B, Pnn, time_len, 11) 또는 None
+            - 각 *_is_valid: (B, P?, time_len) (없을 수도 있음)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
 
     Returns:
         None
@@ -4673,30 +4639,30 @@ def _transform_origin_step2_agents_past_inplace(
         valid_mask = unnorm_inputs_copy[valid_key]
 
         _transform_state_11_dim_inplace(
-            state_11=agents_past,  # (B*R, P?, time_len, 11)
-            delta_xy=delta_xy,  # (B*R, 2)
-            cos_delta=cos_delta,  # (B*R,)
-            sin_delta=sin_delta,  # (B*R,)
-            valid_mask=valid_mask,  # (B*R, P?, time_len)
+            state_11=agents_past,  # (B, P?, time_len, 11)
+            delta_xy=delta_xy,  # (B, 2)
+            cos_delta=cos_delta,  # (B,)
+            sin_delta=sin_delta,  # (B,)
+            valid_mask=valid_mask,  # (B, P?, time_len)
         )
 
 
 def _transform_origin_step3_future_gt_inplace(
         unnorm_outputs_copy: Dict[str, Any],
-        delta_xy: torch.Tensor,  # (B*R, 2)
-        cos_delta: torch.Tensor,  # (B*R,)
-        sin_delta: torch.Tensor,  # (B*R,)
+        delta_xy: torch.Tensor,  # (B, 2)
+        cos_delta: torch.Tensor,  # (B,)
+        sin_delta: torch.Tensor,  # (B,)
 ) -> None:
     """3) ego/near의 미래 GT(4차원 포즈)를 새 기준으로 바꿉니다.
 
     Args:
         unnorm_outputs_copy: 출력/정답 dict (inplace 변경).
-            - ego_future_gt_4_dim: (B*R, future_len, 4)
-            - near_future_gt_4_dim: (B*R, Pnn, future_len, 4)
-            - 각 *_is_valid: (B*R, ...) (없을 수도 있음)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - ego_future_gt_4_dim: (B, future_len, 4)
+            - near_future_gt_4_dim: (B, Pnn, future_len, 4)
+            - 각 *_is_valid: (B, ...) (없을 수도 있음)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
 
     Returns:
         None
@@ -4713,28 +4679,28 @@ def _transform_origin_step3_future_gt_inplace(
 
         _transform_pose_4_dim_inplace(
             pose_4_dim=pose_4,  # (..., 4)
-            delta_xy=delta_xy,  # (B*R, 2)
-            cos_delta=cos_delta,  # (B*R,)
-            sin_delta=sin_delta,  # (B*R,)
+            delta_xy=delta_xy,  # (B, 2)
+            cos_delta=cos_delta,  # (B,)
+            sin_delta=sin_delta,  # (B,)
             valid_mask=valid_mask,  # pose_4.shape[:-1]
         )
 
 
 def _transform_origin_step4_planner_future_inplace(
         unnorm_inputs_copy: Dict[str, Any],
-        delta_xy: torch.Tensor,  # (B*R, 2)
-        cos_delta: torch.Tensor,  # (B*R,)
-        sin_delta: torch.Tensor,  # (B*R,)
+        delta_xy: torch.Tensor,  # (B, 2)
+        cos_delta: torch.Tensor,  # (B,)
+        sin_delta: torch.Tensor,  # (B,)
 ) -> None:
     """4) planner_future_11_dim을 새 기준으로 바꿉니다.
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - planner_future_11_dim: (B*R, future_len, 11) 또는 None
-            - ego_future_gt_is_valid: (B*R, future_len) (없을 수도 있음)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - planner_future_11_dim: (B, future_len, 11) 또는 None
+            - ego_future_gt_is_valid: (B, future_len) (없을 수도 있음)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
 
     Returns:
         None
@@ -4748,29 +4714,29 @@ def _transform_origin_step4_planner_future_inplace(
     valid_mask = unnorm_inputs_copy["ego_future_gt_is_valid"]
 
     _transform_state_11_dim_inplace(
-        state_11=planner_future_11_dim,  # (B*R, future_len, 11)
-        delta_xy=delta_xy,  # (B*R, 2)
-        cos_delta=cos_delta,  # (B*R,)
-        sin_delta=sin_delta,  # (B*R,)
-        valid_mask=valid_mask,  # (B*R, future_len)
+        state_11=planner_future_11_dim,  # (B, future_len, 11)
+        delta_xy=delta_xy,  # (B, 2)
+        cos_delta=cos_delta,  # (B,)
+        sin_delta=sin_delta,  # (B,)
+        valid_mask=valid_mask,  # (B, future_len)
     )
 
 
 def _transform_origin_step5_points_inplace(
         unnorm_inputs_copy: Dict[str, Any],
-        delta_xy: torch.Tensor,  # (B*R, 2)
-        cos_delta: torch.Tensor,  # (B*R,)
-        sin_delta: torch.Tensor,  # (B*R,)
+        delta_xy: torch.Tensor,  # (B, 2)
+        cos_delta: torch.Tensor,  # (B,)
+        sin_delta: torch.Tensor,  # (B,)
 ) -> None:
     """5) stop/crosswalk/speed_bump/driveway/road_edge 점들을 새 기준으로 바꿉니다.
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - *_points: (B*R, N, L, 2) 등
-            - *_is_valid: (B*R, N, L) 또는 (B*R, N)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - *_points: (B, N, L, 2) 등
+            - *_is_valid: (B, N, L) 또는 (B, N)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
 
     Returns:
         None
@@ -4790,39 +4756,39 @@ def _transform_origin_step5_points_inplace(
             continue
         points_valid = unnorm_inputs_copy[valid_key]
 
-        # points_valid: (B*R, N) + points_xy: (B*R, N, L, 2) 인 케이스 대응
+        # points_valid: (B, N) + points_xy: (B, N, L, 2) 인 케이스 대응
         if points_valid.dim() == 2 and points_xy.dim() == 4:
             points_valid = points_valid.unsqueeze(-1).expand_as(
-                points_xy[..., 0])  # (B*R, N, L)
+                points_xy[..., 0])  # (B, N, L)
 
         _transform_points_2d_inplace(
-            points_xy=points_xy,  # (B*R, ..., 2)
-            delta_xy=delta_xy,  # (B*R, 2)
-            cos_delta=cos_delta,  # (B*R,)
-            sin_delta=sin_delta,  # (B*R,)
-            valid_mask=points_valid.to(dtype=torch.bool),  # (B*R, ...)
+            points_xy=points_xy,  # (B, ..., 2)
+            delta_xy=delta_xy,  # (B, 2)
+            cos_delta=cos_delta,  # (B,)
+            sin_delta=sin_delta,  # (B,)
+            valid_mask=points_valid.to(dtype=torch.bool),  # (B, ...)
         )
 
 
 def _transform_origin_step6_lanes_inplace(
     unnorm_inputs_copy: Dict[str, Any],
-    delta_xy: torch.Tensor,  # (B*R, 2)
-    cos_delta: torch.Tensor,  # (B*R,)
-    sin_delta: torch.Tensor,  # (B*R,)
+    delta_xy: torch.Tensor,  # (B, 2)
+    cos_delta: torch.Tensor,  # (B,)
+    sin_delta: torch.Tensor,  # (B,)
     cached_valid_masks: Optional[Dict[str, torch.Tensor]],
 ) -> None:
     """6) lanes/route_lanes를 새 기준으로 바꿉니다(캐시 마스크 사용).
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - lanes: (B*R, lane_num, lane_len, 12)
-            - route_lanes: (B*R, route_lane_num, lane_len, 12)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - lanes: (B, lane_num, lane_len, 12)
+            - route_lanes: (B, route_lane_num, lane_len, 12)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
         cached_valid_masks: 미리 만든 유효 마스크 dict.
-            - "lanes": (B*R, lane_num, lane_len) bool
-            - "route_lanes": (B*R, route_lane_num, lane_len) bool
+            - "lanes": (B, lane_num, lane_len) bool
+            - "route_lanes": (B, route_lane_num, lane_len) bool
 
     Returns:
         None
@@ -4835,38 +4801,38 @@ def _transform_origin_step6_lanes_inplace(
         cached_mask = _pick_cached_mask_if_shape_matches(
             cached_valid_masks=cached_valid_masks,
             key=lane_key,
-            expected_shape=lane_12.shape[:-1],  # (B*R, lane_num, lane_len)
+            expected_shape=lane_12.shape[:-1],  # (B, lane_num, lane_len)
         )
         if cached_mask is None:
             raise NotImplementedError(
                 "현재 lanes/route_lanes의 유효 마스크는 캐시된 값이 반드시 필요합니다.")
 
         _transform_lane_12_dim_inplace(
-            lane_12=lane_12,  # (B*R, ..., 12)
-            delta_xy=delta_xy,  # (B*R, 2)
-            cos_delta=cos_delta,  # (B*R,)
-            sin_delta=sin_delta,  # (B*R,)
-            valid_mask=cached_mask,  # (B*R, ...)
+            lane_12=lane_12,  # (B, ..., 12)
+            delta_xy=delta_xy,  # (B, 2)
+            cos_delta=cos_delta,  # (B,)
+            sin_delta=sin_delta,  # (B,)
+            valid_mask=cached_mask,  # (B, ...)
         )
 
 
 def _transform_origin_step7_static_objects_inplace(
     unnorm_inputs_copy: Dict[str, Any],
-    delta_xy: torch.Tensor,  # (B*R, 2)
-    cos_delta: torch.Tensor,  # (B*R,)
-    sin_delta: torch.Tensor,  # (B*R,)
+    delta_xy: torch.Tensor,  # (B, 2)
+    cos_delta: torch.Tensor,  # (B,)
+    sin_delta: torch.Tensor,  # (B,)
     cached_valid_masks: Optional[Dict[str, torch.Tensor]],
 ) -> None:
     """7) static_objects를 새 기준으로 바꿉니다(캐시 마스크 사용).
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - static_objects: (B*R, static_num, 10)
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
+            - static_objects: (B, static_num, 10)
+        delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
+        cos_delta: 새 기준의 방향 cos 값. shape (B,)
+        sin_delta: 새 기준의 방향 sin 값. shape (B,)
         cached_valid_masks: 미리 만든 유효 마스크 dict.
-            - "static_objects": (B*R, static_num) bool
+            - "static_objects": (B, static_num) bool
 
     Returns:
         None
@@ -4879,25 +4845,25 @@ def _transform_origin_step7_static_objects_inplace(
     cached_mask = _pick_cached_mask_if_shape_matches(
         cached_valid_masks=cached_valid_masks,
         key="static_objects",
-        expected_shape=static_objects.shape[:-1],  # (B*R, static_num)
+        expected_shape=static_objects.shape[:-1],  # (B, static_num)
     )
     if cached_mask is None:
         raise NotImplementedError(
             "현재 static_objects의 유효 마스크는 캐시된 값이 반드시 필요합니다.")
 
     _transform_static_object_10_dim_inplace(
-        static_10=static_objects,  # (B*R, static_num, 10)
-        delta_xy=delta_xy,  # (B*R, 2)
-        cos_delta=cos_delta,  # (B*R,)
-        sin_delta=sin_delta,  # (B*R,)
-        valid_mask=cached_mask,  # (B*R, static_num)
+        static_10=static_objects,  # (B, static_num, 10)
+        delta_xy=delta_xy,  # (B, 2)
+        cos_delta=cos_delta,  # (B,)
+        sin_delta=sin_delta,  # (B,)
+        valid_mask=cached_mask,  # (B, static_num)
     )
 
 
 def _transform_origin(
     unnorm_inputs_copy: Dict[str, torch.Tensor],
     unnorm_outputs_copy: Dict[str, torch.Tensor],
-    unnorm_ego_new_cur_pose: torch.Tensor,  # (B*R, 4)
+    unnorm_ego_new_cur_pose: torch.Tensor,  # (B, 4)
     cached_valid_masks: Optional[Dict[str, torch.Tensor]] = None,
 ) -> Dict[str, torch.Tensor]:
     """unnorm_ego_new_cur_pose 기준으로 입력 전체의 좌표 기준을 바꿉니다."""
