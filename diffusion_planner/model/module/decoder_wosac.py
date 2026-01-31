@@ -1,7 +1,6 @@
 from functools import partial
 from typing import Callable
 import torch.nn as nn
-from ray.tune.examples.pbt_dcgan_mnist.common import batch_size
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple, Any
@@ -203,6 +202,54 @@ class Decoder(nn.Module):
         self.t_tau = torch.arange(
             1, future_len + 1, dtype=torch.float32) / float(future_len)  # (T,)
         self.t_tau = torch.clamp(self.t_tau, max=t_max)  # (T,)
+
+    def _get_amortized_random_noise_from_inputs(
+            self,
+            inputs: Dict[str, torch.Tensor],
+            batch_size: int,
+            one_or_Pnn: int,
+            target_current_xyyaw: torch.Tensor,
+    ) -> torch.Tensor:
+        """amortized + step_idx>0에서 사용할 랜덤 텐서를 inputs에서 꺼냅니다.
+
+        이 랜덤은 Decoder가 기존에 torch.randn_like(...)로 만들던 값(표준정규)을
+        바깥(eval 코드)에서 cand_idx 기반 seed로 만든 뒤 전달받는 용도입니다.
+
+        Args:
+            inputs (Dict[str, torch.Tensor]):
+                모델 입력 dict.
+                - amortized_random_noise: (B, (1+)Pnn, future_len, 4)
+            batch_size (int):
+                B
+            one_or_Pnn (int):
+                (1+Pnn)
+            target_current_xyyaw (torch.Tensor):
+                dtype/device 기준 텐서.
+                shape: (B, (1+)Pnn, 4)
+
+        Returns:
+            torch.Tensor:
+                amortized random noise 텐서.
+                shape: (B, (1+)Pnn, future_len, 4)
+        """
+        noise = inputs.get("amortized_random_noise", None)
+        if noise is None:
+            raise KeyError(
+                "amortized(step_idx>0) 추론에는 inputs['amortized_random_noise']가 필요합니다. "
+                "eval 코드에서 cand_idx 기반 seed로 만든 텐서를 넣어 주세요."
+            )
+        if not isinstance(noise, torch.Tensor):
+            raise TypeError(
+                "inputs['amortized_random_noise']는 torch.Tensor여야 합니다.")
+
+        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), 4)
+        if tuple(noise.shape) != expected:
+            raise ValueError(
+                "inputs['amortized_random_noise'] shape가 예상과 다릅니다. "
+                f"expected={expected}, got={tuple(noise.shape)}"
+            )
+
+        return _ensure_tensor_on_ref(noise, target_current_xyyaw)
 
     def _get_inference_noise_from_inputs(
         self,
@@ -1636,33 +1683,62 @@ class Decoder(nn.Module):
         return decoder_training_output
 
     def _get_noise_trajectory_from_prev_trajectory(
-            self, rollout_time_chunk_size: int) -> torch.Tensor:
-        """
-        self._x0_for_amortized_inference : (B, Pnn, future_len, 4) 
-            -> (B, Pnn, T-rollout_time_chunk_size, 4)
-        self.t_tau: shape (future_len)
-        """
-        _x0_for_amortized_inference = torch.zeros_like(
-            self._x0_for_amortized_inference)  # (B, Pnn, future_len, 4)
-        B = _x0_for_amortized_inference.shape[0]
+            self,
+            rollout_time_chunk_size: int,
+            random_noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """이전 step의 버퍼(self._x0_for_amortized_inference)로부터 다음 step의 noise_trajectory를 만듭니다.
 
-        # _x0_for_amortized_inference: (B, Pnn, future_len, 4)
-        _x0_for_amortized_inference[:, :, :
-                                    -rollout_time_chunk_size, :] = \
-            self._x0_for_amortized_inference[:, :, rollout_time_chunk_size:, :]
-        # batch_diffusion_time : (B, future_len)
+        변경점(핵심)
+        ----------
+        - 기존: torch.randn_like(...)로 내부에서 랜덤 생성
+        - 변경: 외부에서 전달된 random_noise를 사용 (cand_idx 기반 seed로 재현 가능)
+
+        Args:
+            rollout_time_chunk_size (int):
+                이번에 실행(execute)한 시간 길이(gap).
+            random_noise (torch.Tensor):
+                표준정규 랜덤 텐서.
+                shape: (B, (1+)Pnn, future_len, 4)
+
+        Returns:
+            torch.Tensor:
+                noise_trajectory: (B, (1+)Pnn, future_len, 4)
+        """
+        if self._x0_for_amortized_inference is None:
+            raise RuntimeError("self._x0_for_amortized_inference is None.")
+
+        if not isinstance(random_noise, torch.Tensor):
+            raise TypeError("random_noise must be torch.Tensor.")
+
+        if tuple(random_noise.shape) != tuple(
+                self._x0_for_amortized_inference.shape):
+            raise ValueError(
+                "random_noise shape가 self._x0_for_amortized_inference와 같아야 합니다. "
+                f"random_noise={tuple(random_noise.shape)}, "
+                f"buffer={tuple(self._x0_for_amortized_inference.shape)}"
+            )
+
+        # (B, (1+)Pnn, future_len, 4)
+        x0_shifted = torch.zeros_like(self._x0_for_amortized_inference)
+        B = int(x0_shifted.shape[0])
+
+        # 앞쪽으로 당기기 (rollout_time_chunk_size 만큼)
+        if int(rollout_time_chunk_size) > 0:
+            x0_shifted[:, :, :-int(rollout_time_chunk_size), :] = \
+                self._x0_for_amortized_inference[
+                    :, :, int(rollout_time_chunk_size):, :]
+
+        # batch_diffusion_time: (B, future_len)
         batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
             B, 1).to(device=self._x0_for_amortized_inference.device)
-        # mean: (B, Pnn, future_len, 4)
-        # std_raw: (B, 1, 1, 1) or (B, 1, future_len, 1)
-        mean, std = self.sde.marginal_prob(_x0_for_amortized_inference,
-                                           batch_diffusion_time)
-        # random_noise: (B, (1+)Pnn, future_len, 4)
-        random_noise: torch.Tensor = torch.randn_like(
-            self._x0_for_amortized_inference,
-            device=self._x0_for_amortized_inference.device,
-        )
-        # noise_trajectory: (B, (1+)Pnn, T, 4)
+
+        mean, std = self.sde.marginal_prob(x0_shifted, batch_diffusion_time)
+
+        # ✅ 외부에서 받은 랜덤 사용
+        random_noise = _ensure_tensor_on_ref(random_noise,
+                                             self._x0_for_amortized_inference)
+
         noise_trajectory: torch.Tensor = mean + std * random_noise
         return noise_trajectory
 
@@ -1982,19 +2058,29 @@ class Decoder(nn.Module):
                     )
                     diffusion_steps = 16
                 else:  # 첫 스텝이 아닌 경우
-                    # noise_trajectory: (B,(1+)Pnn,T,4)
                     diffusion_steps = 1
                     assert self._x0_for_amortized_inference is not None, (
                         "When using amortized diffusion during inference, "
                         "if inference_noise is not provided, "
-                        "self._x0_for_amortized_inference must be set.")
-                    # rollout_time_chunk_size: (B,) Tensor, but we will change it to int.
+                        "self._x0_for_amortized_inference must be set."
+                    )
+
                     rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
-                    rollout_time_chunk_size_int = rollout_time_chunk_size[
-                        0].item()  # int
-                    # noise_trajectory: (B,(1+)Pnn,T,4)
+                    rollout_time_chunk_size_int = int(
+                        rollout_time_chunk_size[0].item())
+
+                    # ✅ cand_idx 기반 seed로 만든 랜덤을 inputs에서 받아 사용
+                    amortized_random_noise = self._get_amortized_random_noise_from_inputs(
+                        inputs=inputs,
+                        batch_size=int(B),
+                        one_or_Pnn=int(one_or_Pnn),
+                        target_current_xyyaw=target_current_xyyaw,
+                    )
+
                     noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
-                        rollout_time_chunk_size_int)
+                        rollout_time_chunk_size=rollout_time_chunk_size_int,
+                        random_noise=amortized_random_noise,
+                    )
             else:  # 기존 DPM-Solver 경로
                 assert self._x0_for_amortized_inference is None, (
                     "self._x0_for_amortized_inference should be None when not using amortized diffusion."

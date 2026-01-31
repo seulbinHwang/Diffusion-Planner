@@ -170,64 +170,6 @@ def _as_numpy_array_strict(value: Any, key_name: str) -> np.ndarray:
     return np.asarray(value)
 
 
-def _assert_planner_future_equals_ego_future_gt_11_dim(
-    sample_dict: Dict[str, Any],) -> None:
-    """planner_future_11_dim 과 ego_future_gt_11_dim 값이 완전히 같은지 확인합니다.
-
-    이 함수는 "둘 중 planner_future_11_dim 이 존재할 때만" 검증합니다.
-    - planner_future_11_dim 이 있으면, ego_future_gt_11_dim 도 반드시 있어야 합니다.
-    - 두 배열의 shape과 모든 값이 같아야 통과합니다.
-
-    기대 shape
-    ---------
-    - planner_future_11_dim: (future_len, 11)
-    - ego_future_gt_11_dim: (future_len, 11)
-
-    Args:
-        sample_dict (Dict[str, Any]): 샘플 1개 저장 dict. shape: ()
-
-    Returns:
-        None
-
-    Raises:
-        AssertionError: 값이 다르거나, 한쪽이 없으면 발생합니다.
-    """
-    if "planner_future_11_dim" not in sample_dict:
-        return
-
-    if "ego_future_gt_11_dim" not in sample_dict:
-        raise AssertionError(
-            "planner_future_11_dim 이 있는데 ego_future_gt_11_dim 이 없습니다.")
-
-    planner_arr = _as_numpy_array_strict(sample_dict["planner_future_11_dim"],
-                                         "planner_future_11_dim")
-    ego_arr = _as_numpy_array_strict(sample_dict["ego_future_gt_11_dim"],
-                                     "ego_future_gt_11_dim")
-
-    if tuple(planner_arr.shape) != tuple(ego_arr.shape):
-        raise AssertionError(
-            "planner_future_11_dim 과 ego_future_gt_11_dim 의 shape이 다릅니다. "
-            f"planner_shape={tuple(planner_arr.shape)}, ego_shape={tuple(ego_arr.shape)}"
-        )
-
-    # 값이 “완전히” 동일한지(허용 오차 없이) 확인
-    # dtype이 달라도 값이 같으면 통과하도록, 둘 다 float64로 올려서 비교합니다.
-    np.set_printoptions(precision=2, suppress=True)
-    if not np.array_equal(planner_arr.astype(np.float64),
-                          ego_arr.astype(np.float64)):
-        for time_idx in range(planner_arr.shape[0]):
-            a_planner_arr = np.round(planner_arr[time_idx], 2)
-            a_ego_arr = np.round(ego_arr[time_idx], 2)
-            gap = a_planner_arr - a_ego_arr
-            print("==================================================")
-            print(
-                f"[DEBUG] time_idx={time_idx}, a_planner_arr = {a_planner_arr}")
-            print(f"[DEBUG] time_idx={time_idx}, a_ego_arr = {a_ego_arr}")
-            print(f"[DEBUG] time_idx={time_idx}, gap = {gap}")
-        raise AssertionError(
-            "planner_future_11_dim 과 ego_future_gt_11_dim 의 값이 완전히 같지 않습니다.")
-
-
 def _read_float_env_safe(env_key: str, default: float) -> float:
     """환경변수에서 실수 값을 안전하게 읽습니다.
 
@@ -2636,20 +2578,6 @@ def _predict_rollouts_batched_one_chunk(
 ) -> torch.Tensor:
     """rollout을 batch로 펼쳐서(=B*R) 한 번에 autoregressive rollout을 생성합니다.
 
-    최적화(핵심)
-    -----------
-    1) step마다 ObservationNormalizer.inverse(...)를 반복하지 않습니다.
-       - chunk 시작 시점에 unnorm 입력 dict를 한 번 만들고 계속 유지합니다.
-    2) lanes/route_lanes/static_objects 유효 마스크를 한 번 만들고 재사용합니다.
-       - _transform_origin 내부의 torch.any(...) 스캔을 줄입니다.
-    3) (추가) time-chunk(N스텝) 방식:
-       - args.rollout_time_chunk_size=N (없으면 1)
-       - 모델은 chunk마다 1번만 실행하고,
-         integrated_trajectory의 1..gap 포즈를 world로 변환해 슬라이스로 저장합니다.
-       - past 업데이트는 gap개를 한 번에 shift+concat 합니다.
-       - 좌표 기준 변환은 gap번째(가장 미래) ego 포즈로 1번만 합니다.
-       - draw는 chunk마다 1장만 저장합니다.
-
     Returns:
         torch.Tensor:
             shape: (B, (1+)Pnn, rollout_repeat, future_len, 4)
@@ -2722,27 +2650,25 @@ def _predict_rollouts_batched_one_chunk(
         dtype=ego_future_gt_4_dim.dtype,
     )
 
-    # ✅ time-chunk 크기 N (없으면 1)
-    requested_time_chunk_size = args.rollout_time_chunk_size
-    requested_time_chunk_size = int(max(1, requested_time_chunk_size))
+    # ✅ time-chunk 크기 N
+    requested_time_chunk_size = int(
+        max(1, int(getattr(args, "rollout_time_chunk_size", 1))))
 
     ego_agent_past_unnorm = unnorm_inputs_b_r_copy["ego_agent_past"]
-    time_len = int(ego_agent_past_unnorm.shape[1])
-    time_len = int(max(1, time_len))
+    time_len = int(max(1, int(ego_agent_past_unnorm.shape[1])))
 
-    # (A) N > time_len 방지: time_chunk_size는 time_len 이하로 제한
+    # time_chunk_size는 time_len 이하로 제한
     time_chunk_size = int(min(requested_time_chunk_size, time_len))
 
     with torch.inference_mode():
-        step_count = 0
         step_start = 0
         while step_start < future_len:
             reference_tensor = norm_inputs_b_r_copy["ego_agent_past"]
             device = reference_tensor.device
             dtype = reference_tensor.dtype
+
             remaining = int(future_len - step_start)
-            gap = int(min(time_chunk_size,
-                          remaining))  # (B) 마지막 chunk는 gap < N 가능
+            gap = int(min(time_chunk_size, remaining))
 
             # ✅ chunk 시작 시점에만 unnorm -> norm 1번
             (norm_inputs_b_r_copy,
@@ -2752,14 +2678,17 @@ def _predict_rollouts_batched_one_chunk(
                  state_normalizer=state_normalizer,
                  observation_normalizer=observation_normalizer,
              )
-            make_random_noise_cond = (args.use_amortized_diffusion and
-                                      step_start == 0) or (
-                                          not args.use_amortized_diffusion)
-            if make_random_noise_cond:
+            use_amortized = bool(getattr(args, "use_amortized_diffusion",
+                                         False))
+
+            # (A) 첫 스텝(step_start==0) 또는 non-amortized에서는 기존처럼 inference_noise를 넣음
+            need_inference_noise = (not use_amortized) or (use_amortized and
+                                                           int(step_start) == 0)
+            if need_inference_noise:
                 # inference_noise: (B*R, (1+)Pnn, future_len, 4)
                 inference_noise = _build_inference_noise_for_rollout_chunk(
-                    device=device,  # device/dtype 기준
-                    dtype=dtype,  # device/dtype 기준
+                    device=device,
+                    dtype=dtype,
                     batch_size=int(batch_size),
                     one_or_pnn=int(one_or_pnn),
                     future_len=int(future_len),
@@ -2767,26 +2696,51 @@ def _predict_rollouts_batched_one_chunk(
                     rollout_repeat=int(rollout_repeat),
                     base_seed=int(base_seed),
                     ddp_rank=int(ddp_rank),
-                    step_idx=int(step_start),  # ✅ chunk 시작 step을 seed에 반영
-                    noise_std=args.eval_temperature,
+                    step_idx=int(step_start),
+                    noise_std=float(getattr(args, "eval_temperature", 0.5)),
                 )
             else:
                 inference_noise = None
+
+            # (B) amortized + step_start>0에서는 Decoder 내부 랜덤 대신
+            #     rollout_idx(seed) 기반 표준정규 노이즈를 inputs로 전달
+            if use_amortized and int(step_start) > 0:
+                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4)
+                # ✅ 표준정규를 맞추기 위해 noise_std=1.0
+                amortized_random_noise = _build_inference_noise_for_rollout_chunk(
+                    device=device,
+                    dtype=dtype,
+                    batch_size=int(batch_size),
+                    one_or_pnn=int(one_or_pnn),
+                    future_len=int(future_len),
+                    rollout_start_idx=int(rollout_start_idx),
+                    rollout_repeat=int(rollout_repeat),
+                    base_seed=int(base_seed),
+                    ddp_rank=int(ddp_rank),
+                    step_idx=int(step_start),
+                    noise_std=1.0,
+                )
+            else:
+                amortized_random_noise = None
+
             norm_inputs_b_r_copy["inference_noise"] = inference_noise
-            # ✅ Decoder가 이번 호출에서 "몇 스텝 전진했는지" 알 수 있게 전달
-            # gap을 전달하면 되는데, 우리는 (B*R,) shape int 텐서로 맞춰서 전달합니다.
+            norm_inputs_b_r_copy[
+                "amortized_random_noise"] = amortized_random_noise
+
             norm_inputs_b_r_copy["rollout_time_chunk_size"] = torch.tensor(
                 [gap] * merged_batch,
                 dtype=torch.int64,
                 device=norm_inputs_b_r_copy["ego_agent_past"].device,
             )
+
             decoder_output = _forward_model_for_validation(
                 args=args,
                 model=model,
                 norm_inputs=norm_inputs_b_r_copy,
             )
-            # (B, (1+)Pnn, 1+T, 4)
-            normed_trajectories = decoder_output["integrated_trajectory"]
+            normed_trajectories = decoder_output[
+                "integrated_trajectory"]  # (B*R, (1+)Pnn, 1+T, 4)
+
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약
             # ---------------------------------------------------------
@@ -2808,22 +2762,26 @@ def _predict_rollouts_batched_one_chunk(
                     save_image = False
                     save_video = False
 
-            norm_inputs_for_draw = norm_inputs_b_r_copy
-            if "inference_noise" in norm_inputs_for_draw:
-                norm_inputs_for_draw = dict(norm_inputs_b_r_copy)
-                norm_inputs_for_draw.pop("inference_noise", None)
-            # ✅ draw는 chunk마다 1번만 (step_start 기준으로 파일명 저장)
-            (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim,
-             ego_future_gt_4_dim
-            ) = _prepare_data_for_one_batch_draw(
-                norm_inputs_b_r_copy=norm_inputs_for_draw,
-                norm_outputs_b_r_copy=norm_outputs_b_r_copy,
-                normed_trajectories=normed_trajectories,  # (B, (1+)Pnn, 1+T, 4)
-                state_normalizer=state_normalizer,
-                observation_normalizer=observation_normalizer,
-                draw_batch_idx=draw_batch_idx,
-            )
+            # ---------------------------------------------------------
+            # ✅ (핵심 수정) save_image=True일 때만 draw 준비/CPU/NumPy 변환 수행
+            # ---------------------------------------------------------
             if save_image:
+                norm_inputs_for_draw = norm_inputs_b_r_copy
+                if "inference_noise" in norm_inputs_for_draw:
+                    norm_inputs_for_draw = dict(norm_inputs_b_r_copy)
+                    norm_inputs_for_draw.pop("inference_noise", None)
+                    norm_inputs_for_draw.pop("amortized_random_noise", None)
+
+                (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim,
+                 ego_future_gt_4_dim_np) = _prepare_data_for_one_batch_draw(
+                     norm_inputs_b_r_copy=norm_inputs_for_draw,
+                     norm_outputs_b_r_copy=norm_outputs_b_r_copy,
+                     normed_trajectories=normed_trajectories,
+                     state_normalizer=state_normalizer,
+                     observation_normalizer=observation_normalizer,
+                     draw_batch_idx=draw_batch_idx,
+                 )
+
                 if draw_near_target_id is None:
                     raise RuntimeError(
                         "save_image=True 인데 draw_near_target_id가 준비되지 않았습니다.")
@@ -2831,55 +2789,50 @@ def _predict_rollouts_batched_one_chunk(
                 _draw_one_batch_one_rollout(
                     save_dir=save_dir,
                     unnorm_inputs_np=unnorm_inputs_np,
-                    unnorm_trajectory_np=
-                    unnorm_trajectory_np,  # ((1+)Pnn, 1+future_len, 4)
-                    ego_future_gt_4_dim=ego_future_gt_4_dim,  # (future_len, 4)
-                    near_future_gt_3_dim=
-                    near_future_gt_3_dim,  # (Pnn, future_len, 3)
+                    unnorm_trajectory_np=unnorm_trajectory_np,
+                    ego_future_gt_4_dim=ego_future_gt_4_dim_np,
+                    near_future_gt_3_dim=near_future_gt_3_dim,
                     step_idx=int(step_start),
                     draw_near_target_id=draw_near_target_id,
                 )
+
             # unnorm_target_pose_chunk: (B*R, (1+)Pnn, gap, 4)
             unnorm_target_pose_chunk = _get_unnorm_target_pose_chunk(
-                normed_trajectories=normed_trajectories,  # (B, (1+)Pnn, 1+T, 4)
-                target_future_valid=norm_inputs_b_r_copy[
-                    "target_future_valid"],  # (B*R, (1+)Pnn, future_len)
+                normed_trajectories=normed_trajectories,
+                target_future_valid=norm_inputs_b_r_copy["target_future_valid"],
                 state_normalizer=state_normalizer,
                 gap=int(gap),
             )
-            # unnorm_origin_pose_world: (B*R, (1+)Pnn, gap, 4)
+
             unnorm_target_pose_chunk_world = _convert_target_chunk_to_world(
                 unnorm_target_pose_chunk=unnorm_target_pose_chunk,
                 gap=int(gap),
                 unnorm_origin_pose_world=unnorm_origin_pose_world,
             )
 
-            # (B*R, (1+)Pnn, future_len, 4) 중 [step_start:step_start+gap] 저장
             target_joint_scene_world[:, :, step_start:step_start +
                                      gap, :] = unnorm_target_pose_chunk_world
-            # unnorm_origin_pose_world: (B*R, 4)
+
             # 다음 chunk를 위해 origin 갱신
-            unnorm_inputs_b_r_copy[
-                "origin_world_pose"] = unnorm_target_pose_chunk_world[:, 0,
+            unnorm_origin_pose_world = unnorm_target_pose_chunk_world[:, 0,
                                                                       -1, :]
-            # ---------------------------------------------------------
-            # ✅ 입력 업데이트: gap개를 한 번에 반영 + 마지막 포즈로 1번만 좌표 변환
-            # ---------------------------------------------------------
-            # unnorm_ego_pose_chunk: (B*R, gap, 4)
+            unnorm_inputs_b_r_copy[
+                "origin_world_pose"] = unnorm_origin_pose_world
+
+            # 입력 업데이트
             unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:, 0, :, :]
-            # unnorm_near_pose_chunk: (B*R, Pnn, gap, 4)
             unnorm_near_pose_chunk = unnorm_target_pose_chunk[:, 1:, :, :]
+
             (unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
             ) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
                 unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
                 unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
-                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,  # (B*R, gap, 4)
-                unnorm_near_pose_chunk=
-                unnorm_near_pose_chunk,  # (B*R, Pnn, gap, 4)
+                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
+                unnorm_near_pose_chunk=unnorm_near_pose_chunk,
                 cached_valid_masks_br=cached_valid_masks_br,
             )
+
             step_start += gap
-            step_count += 1
 
     # (B*R, (1+)Pnn, future_len, 4) -> (B, R, (1+)Pnn, future_len, 4)
     target_joint_scene_world = target_joint_scene_world.reshape(
@@ -2939,6 +2892,43 @@ def _get_near_future_11(
     return near_future_11
 
 
+def _to_debug_object_id_str(object_id: Any) -> str:
+    """디버그 dict key로 쓸 object_id를 사람이 보기 쉬운 문자열로 만듭니다.
+
+    목적
+    ----
+    torch.Tensor(스칼라)을 f-string으로 바로 문자열로 만들면
+    "tensor(123)" 같은 형태가 되어, 로그/디버그 해석이 불편해질 수 있습니다.
+    그래서 스칼라 텐서는 숫자(int)로 꺼내서 "123" 형태로 만듭니다.
+
+    Args:
+        object_id (Any):
+            보통 다음 중 하나를 기대합니다.
+            - torch.Tensor 스칼라: shape=() 또는 (1,)
+            - numpy 스칼라: np.int64 등
+            - int / str 등
+
+    Returns:
+        str:
+            예) "123"
+    """
+    if isinstance(object_id, torch.Tensor):
+        if int(object_id.numel()) != 1:
+            raise ValueError(
+                "object_id 텐서는 스칼라(원소 1개)여야 합니다. "
+                f"got numel={int(object_id.numel())}, shape={tuple(object_id.shape)}"
+            )
+        return str(int(object_id.detach().cpu().item()))
+
+    if isinstance(object_id, np.generic):
+        return str(int(object_id.item()))
+
+    try:
+        return str(int(object_id))
+    except Exception:
+        return str(object_id)
+
+
 def _draw_one_batch_one_rollout(
         save_dir: str,
         unnorm_inputs_np: Dict[str, Any],
@@ -2980,8 +2970,9 @@ def _draw_one_batch_one_rollout(
     diff_token_to_future_gt_3_dim = {}
     for target_id, gt_future_3 in zip(draw_near_target_id,
                                       near_future_gt_3_dim):
-        diff_token_to_future_gt_3_dim[
-            f"{target_id}"] = gt_future_3  # (future_len, 3)
+        key = _to_debug_object_id_str(target_id)
+        diff_token_to_future_gt_3_dim[key] = gt_future_3  # (future_len, 3)
+
     unnorm_inputs_np[
         "diff_token_to_future_gt_3_dim"] = diff_token_to_future_gt_3_dim
     ###############################
@@ -2992,10 +2983,12 @@ def _draw_one_batch_one_rollout(
                                          unnorm_trajectory_np)
     diff_token_to_np_int_traj_11_wrt_ego = {}
     for target_id, np_int_traj_11 in zip(draw_near_target_id, near_future_11):
-        # np_int_traj_11: (1+T, 11)
-        diff_token_to_np_int_traj_11_wrt_ego[f"{target_id}"] = np_int_traj_11
+        key = _to_debug_object_id_str(target_id)
+        diff_token_to_np_int_traj_11_wrt_ego[key] = np_int_traj_11  # (1+T, 11)
+
     output_data[
         "diff_token_to_np_int_traj_11_wrt_ego"] = diff_token_to_np_int_traj_11_wrt_ego
+
     draw_machine_fast.draw_world_model_to_png(unnorm_inputs_np,
                                               output_data=output_data,
                                               save_path=os.path.join(
@@ -3416,71 +3409,6 @@ def _predict_rollouts_batched_with_oom_fallback(
 
     assert last_oom is not None
     raise last_oom
-
-
-def _build_valid_agent_mask_for_wosac(
-    agent_id: Optional[torch.Tensor],
-    target_future_valid: torch.Tensor,
-) -> torch.Tensor:
-    """WOSAC 계산에 넣을 "유효 agent"만 고르는 True/False 표시 텐서를 만듭니다.
-
-    왜 필요한가?
-    -------------
-    입력 데이터는 (ego + near agents)를 고정 크기(예: 1+Pnn=128)로 맞추기 위해
-    실제로 존재하지 않는 agent 칸을 0으로 채우는 경우가 많습니다.
-    이때 agent_id=0 같은 값이 그대로 WOSAC로 들어가면,
-    Waymo metric 내부에서 "시나리오에 없는 object_id"로 판단되어 즉시 에러가 납니다.
-
-    동작 규칙(안전한 쪽 기준)
-    ------------------------
-    - agent_id가 0인 경우:
-      - 그 agent가 실제로 존재하는지(target_future_valid에 True가 하나라도 있는지) 확인합니다.
-      - 존재하지 않으면(전부 False면) 패딩으로 보고 제거합니다.
-    - agent_id가 0이 아닌 경우:
-      - 기본적으로 유지합니다.
-
-    Args:
-        agent_id (torch.Tensor):
-            agent의 object_id.
-            shape: (N,)
-            - N = B * (1+Pnn)
-        target_future_valid (torch.Tensor):
-            agent별 미래 구간 유효 여부.
-            shape: (B, 1+Pnn, T)
-            - T = future_len
-
-    Returns:
-        torch.Tensor:
-            WOSAC에 넣어도 되는 agent만 True인 표시 텐서.
-            shape: (N,)
-    """
-    # (B, 1+Pnn, T) -> (B, 1+Pnn) -> (N,)
-    agent_has_any_future: torch.Tensor = torch.any(
-        target_future_valid.to(dtype=torch.bool),
-        dim=-1).reshape(-1)  # shape: (N,)
-    return agent_has_any_future
-
-    # if agent_id.dim() != 1:
-    #     raise ValueError(
-    #         f"agent_id는 (N,) 이어야 합니다. 현재 shape={tuple(agent_id.shape)}")
-    # if target_future_valid.dim() != 3:
-    #     raise ValueError("target_future_valid는 (B, 1+Pnn, T) 이어야 합니다. "
-    #                      f"현재 shape={tuple(target_future_valid.shape)}")
-    #
-    #
-    #
-    # if int(agent_has_any_future.shape[0]) != int(agent_id.shape[0]):
-    #     raise ValueError(
-    #         "agent_id의 길이(N)와 target_future_valid에서 펼친 길이가 다릅니다. "
-    #         f"N(agent_id)={int(agent_id.shape[0])}, "
-    #         f"N(from target_future_valid)={int(agent_has_any_future.shape[0])}")
-    #
-    # # 패딩으로 자주 쓰이는 케이스: agent_id == 0 이면서 미래 valid가 전부 False
-    # is_padded_zero: torch.Tensor = (agent_id == 0) & (~agent_has_any_future
-    #                                                  )  # (N,)
-    # valid_mask: torch.Tensor = ~is_padded_zero  # (N,)
-    #
-    # return agent_has_any_future
 
 
 def _filter_rollout_tensors_by_agent_mask(
@@ -4157,6 +4085,8 @@ def validate_func(
     wosac_submission: WOSACSubmission,
     min_ade: minADE,
 ) -> None:
+    assert args.eval_method == "validation", (
+        "validate_func는 args.eval_method가 'validation'일 때만 호출되어야 합니다.")
     """validation에서 예측 rollouts를 만들고 metric을 업데이트합니다."""
     tag = _get_validation_batch_progress_tag(args)
 
@@ -4169,13 +4099,15 @@ def validate_func(
 
     inputs = _sanitize_inputs_for_validation(inputs)
     future_len: int = int(getattr(args, "future_len"))
+    # target_agents_current_valid: (B, (1+)Pnn)
     # target_future_valid :  (B, (1+)Pnn, future_len)
     # target_future_valid 는, 현재에 유효하면, 미래 점도 전부 유효하다고 간주합니다.
-    target_future_valid = build_target_future_tensors_and_masks_for_inference(
-        args,
-        inputs,
-        future_len,
-    )
+    (target_agents_current_valid,
+     target_future_valid) = build_target_future_tensors_and_masks_for_inference(
+         args,
+         inputs,
+         future_len,
+     )
     inputs["target_future_valid"] = target_future_valid
     """
     args.save_inference_data 가 켜져있으면, 저장/디버그 목적이라 rollout 개수를 1로 강제로 줄입니다.
@@ -4235,13 +4167,12 @@ def validate_func(
         key="scenario_id",
         expected_length=batch_size,
     )
-    if args.eval_method == "validation":
-        # tfrecord_path: List[str], len=B
-        tfrecord_path: List[str] = _get_string_list_from_inputs(
-            inputs=inputs,
-            key="tfrecord_path",
-            expected_length=batch_size,
-        )
+    # tfrecord_path: List[str], len=B
+    tfrecord_path: List[str] = _get_string_list_from_inputs(
+        inputs=inputs,
+        key="tfrecord_path",
+        expected_length=batch_size,
+    )
     # target_id_flat: (N,)  (N = B*(1+)Pnn)
     target_id: Optional[torch.Tensor] = _get_target_id_flat_from_inputs(inputs)
     one_Pnn = int(target_future_valid.shape[1])
@@ -4262,8 +4193,7 @@ def validate_func(
     device = pred_traj.device
 
     # wosac_agent_is_valid: (N=B*(1+)Pnn)
-    wosac_agent_is_valid = target_future_valid[:, :, 0]  # (B, (1+)Pnn)
-    wosac_agent_is_valid = wosac_agent_is_valid.reshape(-1).to(
+    wosac_agent_is_valid = target_agents_current_valid.reshape(-1).to(
         dtype=torch.bool)  # (N,)
 
     (
@@ -4330,6 +4260,7 @@ def validate_func(
                 wosac_submission.aggregate_rollouts(scenario_rollouts_all)
 
         wosac_submission.reset()
+    if wosac_metrics.is_active:
         # ------------------------------------------------------------
         _update_validation_heartbeat_stage(
             args, f"{tag} | computing WOSAC metrics (scenarios={batch_size})")
@@ -5044,7 +4975,6 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
     )
 
 
-
 def _update_near_past_and_valid_inplace_for_time_chunk(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_near_pose_chunk: torch.Tensor,
@@ -5060,10 +4990,10 @@ def _update_near_past_and_valid_inplace_for_time_chunk(
     Returns:
         None
     """
-    near_agents_past = unnorm_inputs_b_r_copy["near_agents_past"]  # (B, Pnn, time_len, 11)
+    near_agents_past = unnorm_inputs_b_r_copy[
+        "near_agents_past"]  # (B, Pnn, time_len, 11)
     near_agents_past_is_valid = unnorm_inputs_b_r_copy[
-        "near_agents_past_is_valid"
-    ]  # (B, Pnn, time_len)
+        "near_agents_past_is_valid"]  # (B, Pnn, time_len)
 
     gap = int(unnorm_near_pose_chunk.shape[2])
     if gap <= 0:
@@ -5078,13 +5008,15 @@ def _update_near_past_and_valid_inplace_for_time_chunk(
 
     # ✅ (중요) 새로 붙이는 valid는 "현재 시점 valid"를 그대로 이어 붙입니다.
     # near_current_is_valid: (B, Pnn) bool
-    near_current_is_valid = near_agents_past_is_valid[:, :, -1].to(dtype=torch.bool)
+    near_current_is_valid = near_agents_past_is_valid[:, :,
+                                                      -1].to(dtype=torch.bool)
 
     # near_chunk_is_valid: (B, Pnn, gap) bool
     near_chunk_is_valid = near_current_is_valid[:, :, None].expand(-1, -1, gap)
 
     # near_chunk_is_valid: (B, Pnn, gap) dtype = near_agents_past_is_valid.dtype
-    near_chunk_is_valid = near_chunk_is_valid.to(dtype=near_agents_past_is_valid.dtype)
+    near_chunk_is_valid = near_chunk_is_valid.to(
+        dtype=near_agents_past_is_valid.dtype)
 
     # ✅ 무효 agent는 값도 0으로 유지(값 기반 무효 판정 로직까지 안전하게)
     # mask_f: (B, Pnn, gap, 1)
@@ -5106,8 +5038,7 @@ def _update_near_past_and_valid_inplace_for_time_chunk(
     # (선택) 현재 시점 near 유효 여부를 여기서도 최신으로 맞춰 둠
     # near_agents_is_valid: (B, Pnn)
     unnorm_inputs_b_r_copy["near_agents_is_valid"] = near_current_is_valid.to(
-        dtype=near_agents_past_is_valid.dtype
-    ).clone()
+        dtype=near_agents_past_is_valid.dtype).clone()
 
 
 def _assert_non_near_agents_not_supported_for_time_chunk(
@@ -5238,8 +5169,8 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     # ego_future_gt_is_valid shift
     ego_future_gt_is_valid = unnorm_outputs_b_r_copy[
         "ego_future_gt_is_valid"]  # (B*R, future_len)
-    ego_future_gt_is_valid[:, :future_len - gap] = ego_future_gt_is_valid[:,
-                                                                          gap:]
+    ego_future_gt_is_valid[:, :future_len -
+                           gap] = ego_future_gt_is_valid[:, gap:].clone()
     ego_future_gt_is_valid[:, future_len - gap:] = 0
     ego_future_gt_is_valid = ego_future_gt_is_valid.to(dtype=torch.bool)
 
@@ -5257,7 +5188,7 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     near_future_gt_is_valid = unnorm_outputs_b_r_copy[
         "near_future_gt_is_valid"]  # (B*R, Pnn, future_len)
     near_future_gt_is_valid[:, :, :future_len -
-                            gap] = near_future_gt_is_valid[:, :, gap:]
+                            gap] = near_future_gt_is_valid[:, :, gap:].clone()
     near_future_gt_is_valid[:, :, future_len - gap:] = 0
     near_future_gt_is_valid = near_future_gt_is_valid.to(dtype=torch.bool)
 
@@ -5842,6 +5773,7 @@ def _transform_future_3_dim_inplace(
         yaw_delta: torch.Tensor,  # (B,)
         valid_mask: torch.Tensor,  # (B, ...) bool
 ) -> None:
+    valid_mask = valid_mask.to(dtype=torch.bool)
     """3차원 미래 정답(x,y,각도)을 새 기준으로 변환합니다."""
     if future_3.shape[-1] != 3:
         raise ValueError(

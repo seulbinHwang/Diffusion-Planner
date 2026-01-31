@@ -15,6 +15,7 @@ def build_target_future_tensors_and_masks_for_inference(
         near_agents_is_valid 에서 True인 agent는 미래 예측을 수행하고, (valid=True)
         False인 agent는 미래 예측을 수행하지 않습니다. (valid=False)
         """
+        target_agents_current_valid = near_agents_is_valid
         target_future_valid = near_agents_is_valid.unsqueeze(-1).repeat(
             1, 1, future_len)  # (B, Pnn, future_len)  True=유효
     else:
@@ -31,7 +32,7 @@ def build_target_future_tensors_and_masks_for_inference(
         )  # (B, 1 + Pnn) True=유효
         target_future_valid = target_agents_current_valid.unsqueeze(-1).repeat(
             1, 1, future_len)  # (B, 1 + Pnn, future_len)  True=유효
-    return target_future_valid  # (B, (1+)Pnn, future_len)  True=유효
+    return target_agents_current_valid, target_future_valid  # (B, (1+)Pnn, future_len)  True=유효
 
 
 def build_target_future_tensors_and_masks(

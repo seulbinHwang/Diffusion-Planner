@@ -3124,10 +3124,6 @@ def _compute_expert_guidance_distance_m_per_agent(
     return dist
 
 
-# _select_best_trajectory_by_sample_k에서 "후보를 한 번에 몇 개씩 묶어 처리할지"를 캐시하는 args 속성 이름
-_DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME = "dp_sample_k_candidate_batch_size"
-
-
 def _is_gpu_oom_error(err: BaseException) -> bool:
     """GPU 메모리 부족(Out Of Memory) 때문에 난 에러인지 확인합니다.
 
@@ -3308,26 +3304,45 @@ def _forward_and_score_candidate_batch(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """후보 cand_count개를 한 번에 모델에 넣고, 거리 점수까지 계산합니다.
 
+    변경점(핵심)
+    ----------
+    - amortized + step_idx>0 에서 Decoder가 내부에서 randn_like로 랜덤을 만들지 않도록,
+      "amortized_random_noise"를 cand_idx 기반 seed로 만들어 inputs로 전달합니다.
+    - 이로써 후보의 랜덤이 GPU RNG 상태가 아니라 cand_idx/seed로 고정됩니다.
+
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
             (cand_traj, cand_dist)
-            - cand_traj: shape (cand_count, B, 1+Pnn, 1+future_len, 4)
-            - cand_dist: shape (cand_count, B, 1+Pnn)
+            - cand_traj: (cand_count, B, 1+Pnn, 1+future_len, 4)
+            - cand_dist: (cand_count, B, 1+Pnn)
     """
     rollout_repeat = int(max(1, int(cand_count)))
     b = int(max(1, int(batch_size)))
 
-    # 1) 후보별 노이즈 만들기
-    make_random_noise_cond = (args.use_amortized_diffusion and step_idx
-                              == 0) or (not args.use_amortized_diffusion)
+    use_amortized = bool(getattr(args, "use_amortized_diffusion", False))
+
     reference_tensor = norm_inputs_step["ego_agent_past"]
     device = reference_tensor.device
     dtype = reference_tensor.dtype
-    if make_random_noise_cond:
-        # inference_noise_flat: (B*cand_count, 1+Pnn, future_len, 4)
+
+    # ------------------------------------------------------------
+    # (1) 후보별 노이즈 준비
+    #   - inference_noise: step_idx==0(또는 non-amortized)에서 쓰는 "초기 xT 노이즈"
+    #   - amortized_random_noise: amortized + step_idx>0에서 쓰는 "이전 버퍼에 섞을 랜덤"
+    #     (Decoder 내부 randn_like를 대체)
+    # ------------------------------------------------------------
+    inference_noise_flat: Optional[torch.Tensor] = None
+    amortized_random_noise_flat: Optional[torch.Tensor] = None
+
+    need_initial_inference_noise = (not use_amortized) or (use_amortized and
+                                                           int(step_idx) == 0)
+    need_amortized_random_noise = (use_amortized and int(step_idx) > 0)
+
+    if need_initial_inference_noise:
+        # inference_noise_flat: (B*rollout_repeat, 1+Pnn, future_len, 4)
         inference_noise_flat = _build_inference_noise_batch_for_candidate_range(
-            device=device,  # device/dtype 기준
-            dtype=dtype,  # device/dtype 기준
+            device=device,
+            dtype=dtype,
             batch_size=b,
             one_or_pnn=int(one_or_pnn),
             future_len=int(future_len),
@@ -3335,44 +3350,66 @@ def _forward_and_score_candidate_batch(
             base_seed=int(base_seed),
             ddp_rank=int(ddp_rank),
             step_idx=int(step_idx),
-            noise_std=args.fine_tune_temperature,
+            noise_std=float(getattr(args, "fine_tune_temperature", 0.5)),
             seed_stride=int(seed_stride),
             cand_start_idx=int(cand_start_idx),
             cand_count=int(rollout_repeat),
         )
-    else:
-        inference_noise_flat = None
 
+    if need_amortized_random_noise:
+        # ✅ Decoder의 기존 torch.randn_like(...)와 같은 분포를 맞추기 위해 noise_std=1.0 사용
+        # amortized_random_noise_flat: (B*rollout_repeat, 1+Pnn, future_len, 4)
+        amortized_random_noise_flat = _build_inference_noise_batch_for_candidate_range(
+            device=device,
+            dtype=dtype,
+            batch_size=b,
+            one_or_pnn=int(one_or_pnn),
+            future_len=int(future_len),
+            rollout_idx=int(rollout_idx),
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
+            step_idx=int(step_idx),
+            noise_std=1.0,
+            seed_stride=int(seed_stride),
+            cand_start_idx=int(cand_start_idx),
+            cand_count=int(rollout_repeat),
+        )
+
+    # outputs도 후보 개수만큼 반복
     unnorm_br_outputs_step = _repeat_inputs_for_candidate_batch(
         norm_data_step=unnorm_outputs_copy,
         repeat=int(rollout_repeat),
         batch_size=int(b),
     )
 
+    # rollout_time_chunk_size: (B,)
     norm_inputs_step["rollout_time_chunk_size"] = torch.tensor(
-        [gap] * int(b),
+        [int(gap)] * int(b),
         dtype=torch.int64,
         device=norm_inputs_step["ego_agent_past"].device,
     )
-    # 2) 입력 dict를 (B*cand_count, ...)로 늘리기
+
+    # (2) 입력 dict를 (B*rollout_repeat, ...)로 늘리기
     norm_br_inputs_step = _repeat_inputs_for_candidate_batch(
         norm_data_step=norm_inputs_step,
         repeat=int(rollout_repeat),
         batch_size=int(b),
     )
-    norm_br_inputs_step[
-        "inference_noise"] = inference_noise_flat  # (B*cand_count, 1+Pnn, future_len, 4)
 
-    # 3) 모델 forward (한 번)
+    # ✅ Decoder가 읽는 키들
+    norm_br_inputs_step["inference_noise"] = inference_noise_flat
+    norm_br_inputs_step["amortized_random_noise"] = amortized_random_noise_flat
+
+    # (3) 모델 forward (한 번)
     decoder_output = _forward_model_for_validation(
         args=args,
         model=model,
         norm_inputs=norm_br_inputs_step,
     )
 
-    cand_traj_flat = decoder_output["integrated_trajectory"]
+    cand_traj_flat = decoder_output[
+        "integrated_trajectory"]  # (B*R, 1+Pnn, 1+T, 4)
 
-    # cand_traj_flat: (B*rollout_repeat, 1+Pnn, 1+future_len, 4)
     cand_traj = cand_traj_flat.reshape(
         int(rollout_repeat),
         int(b),
@@ -3381,11 +3418,11 @@ def _forward_and_score_candidate_batch(
         4,
     )
 
-    # len_rep/wid_rep: (B*rollout_repeat, 1+Pnn)
+    # len_rep/wid_rep: (B*R, 1+Pnn)
     len_rep = unnorm_agent_length_m.repeat(int(rollout_repeat), 1)
     wid_rep = unnorm_agent_width_m.repeat(int(rollout_repeat), 1)
 
-    # cand_dist_flat: (B*rollout_repeat, 1+Pnn) # 무효 agent 는 0. 으로 처리했음.
+    # cand_dist_flat: (B*R, 1+Pnn)
     cand_dist_flat = _compute_expert_guidance_distance_m_per_agent(
         state_normalizer=state_normalizer,
         normed_trajectory=cand_traj_flat,
@@ -3396,7 +3433,6 @@ def _forward_and_score_candidate_batch(
         unnorm_agent_width_m=wid_rep,
     )
 
-    # cand_dist: (rollout_repeat, B, 1+Pnn)
     cand_dist = cand_dist_flat.reshape(int(rollout_repeat), int(b),
                                        int(one_or_pnn))
 
@@ -3602,11 +3638,10 @@ def _select_best_trajectory_by_sample_k(
 
     변경된 핵심
     ----------
-    - 후보를 "몇 개씩 묶어서" 한 번에 모델에 넣습니다.
-    - 처음 실행에서는 args.fine_tune_gen_k부터 시작해서,
-      GPU 메모리 부족이 나면 절반으로 줄이며 안전한 묶음 크기를 찾습니다.
-    - 한 번 안전한 묶음 크기가 정해지면(args에 저장),
-      이후 호출에서는 계속 그 크기로만 묶어서 처리합니다.
+    - 후보 K개를 절대로 쪼개지 않고, 항상 "한 번의 모델 실행"으로 처리합니다.
+      (후보를 여러 번 나눠서 처리할 때 Decoder 내부 버퍼가 마지막 그룹으로 덮이는 문제를 피하기 위함)
+    - 따라서 GPU 메모리가 부족하면(OOM) 여기서 바로 예외를 냅니다.
+      (자동으로 K를 줄여 재시도하지 않습니다)
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -3614,106 +3649,75 @@ def _select_best_trajectory_by_sample_k(
             - best_normed_traj: (B, 1+Pnn, 1+future_len, 4)
             - best_distance_m_per_agent: (B, 1+Pnn)
     """
-    best_traj: Optional[torch.Tensor] = None
-    best_dist: Optional[torch.Tensor] = None
-    best_joint_score: Optional[torch.Tensor] = None  # (B,)
+    select_jointly: bool = bool(getattr(args, "select_jointly", False))
+
+    # K(후보 개수)
+    fine_tune_gen_k_raw = getattr(args, "fine_tune_gen_k", 1)
+    try:
+        fine_tune_gen_k = int(fine_tune_gen_k_raw)
+    except (TypeError, ValueError):
+        fine_tune_gen_k = 1
+    fine_tune_gen_k = int(max(1, fine_tune_gen_k))
 
     seed_stride = 10_000_000
-    select_jointly: bool = bool(args.select_jointly)
 
-    fine_tune_gen_k = args.fine_tune_gen_k
+    try:
+        # cand_traj_batch: (K, B, 1+Pnn, 1+future_len, 4)
+        # cand_dist_batch: (K, B, 1+Pnn)
+        (cand_traj_batch, cand_dist_batch) = _forward_and_score_candidate_batch(
+            args=args,
+            model=model,
+            norm_inputs_step=norm_inputs_step,
+            state_normalizer=state_normalizer,
+            unnorm_outputs_copy=unnorm_outputs_copy,
+            unnorm_agent_length_m=unnorm_agent_length_m,
+            unnorm_agent_width_m=unnorm_agent_width_m,
+            batch_size=int(batch_size),
+            one_or_pnn=int(one_or_pnn),
+            future_len=int(future_len),
+            rollout_idx=int(rollout_idx),
+            base_seed=int(base_seed),
+            ddp_rank=int(ddp_rank),
+            step_idx=int(step_idx),
+            cand_start_idx=0,
+            cand_count=int(fine_tune_gen_k),
+            seed_stride=int(seed_stride),
+            gap=int(gap),
+        )
+    except BaseException as e:
+        # ✅ 분할/재시도는 하지 않음. OOM이면 메시지만 보강하고 그대로 실패 처리.
+        if _is_gpu_oom_error(e):
+            _clear_gpu_cache_after_oom()
+            raise RuntimeError(
+                "GPU 메모리가 부족해서 fine_tune_gen_k 후보를 한 번에 처리하지 못했습니다. "
+                f"fine_tune_gen_k={fine_tune_gen_k}. "
+                "이 설정을 낮추거나, (근본 해결로는) 후보별 버퍼를 안전하게 관리하는 방식이 필요합니다.") from e
+        raise
 
-    # ✅ (중요) 처음엔 K부터 시작, 한 번 안전한 값이 잡히면 args에 저장된 값 사용
-    cached_group = getattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME, None)
-    if cached_group is None or int(cached_group) <= 0:
-        cand_group_size = int(fine_tune_gen_k)
+    if select_jointly:
+        # (B, 1+Pnn)
+        target_agent_current_is_valid = _build_target_agent_current_is_valid_mask(
+            norm_inputs_step=norm_inputs_step,)
+        best_traj, best_dist, _best_score = _select_best_from_candidate_batch_jointly(
+            best_traj=None,
+            best_dist=None,
+            best_score=None,
+            cand_traj=cand_traj_batch,  # (K, B, 1+Pnn, 1+future_len, 4)
+            cand_dist=cand_dist_batch,  # (K, B, 1+Pnn)
+            agent_current_is_valid=target_agent_current_is_valid,  # (B, 1+Pnn)
+        )
     else:
-        cand_group_size = int(max(1, int(cached_group)))
-        cand_group_size = int(min(cand_group_size, fine_tune_gen_k))
+        best_traj, best_dist = _select_best_from_candidate_batch_per_agent(
+            best_traj=None,
+            best_dist=None,
+            cand_traj=cand_traj_batch,  # (K, B, 1+Pnn, 1+future_len, 4)
+            cand_dist=cand_dist_batch,  # (K, B, 1+Pnn)
+        )
 
-    cand_start = 0
-    while cand_start < fine_tune_gen_k:
-        group_count = int(min(cand_group_size, fine_tune_gen_k - cand_start))
+    # (메모리 압박 완화)
+    del cand_traj_batch
+    del cand_dist_batch
 
-        try:
-            # cand_traj_batch: (group_count, B, 1+Pnn, 1+future_len, 4)
-            # cand_dist_batch: (group_count, B, 1+Pnn) # 무효 agent 는 0. 으로 처리
-            (cand_traj_batch,
-             cand_dist_batch) = _forward_and_score_candidate_batch(
-                 args=args,
-                 model=model,
-                 norm_inputs_step=norm_inputs_step,
-                 state_normalizer=state_normalizer,
-                 unnorm_outputs_copy=unnorm_outputs_copy,
-                 unnorm_agent_length_m=unnorm_agent_length_m,
-                 unnorm_agent_width_m=unnorm_agent_width_m,
-                 batch_size=int(batch_size),
-                 one_or_pnn=int(one_or_pnn),
-                 future_len=int(future_len),
-                 rollout_idx=int(rollout_idx),
-                 base_seed=int(base_seed),
-                 ddp_rank=int(ddp_rank),
-                 step_idx=int(step_idx),
-                 cand_start_idx=int(cand_start),
-                 cand_count=int(group_count),
-                 seed_stride=int(seed_stride),
-                 gap=gap,
-             )
-        except BaseException as e:
-            # ✅ OOM이면 절반으로 줄이고 같은 cand_start에서 다시 시도
-            if _is_gpu_oom_error(e):
-                if cand_group_size <= 1:
-                    raise
-                cand_group_size = max(1, int(cand_group_size) // 2)
-                _clear_gpu_cache_after_oom()
-
-                # 더 작은 값은 안전하므로 저장(이후 호출도 이 값 사용)
-                setattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME,
-                        int(cand_group_size))
-                print(
-                    f"GPU OOM detected. Reducing candidate batch size to {cand_group_size} and retrying."
-                )
-                continue
-            raise
-
-        # ✅ 첫 성공(또는 더 작은 값으로 성공) 시점에 고정값을 args에 저장
-        if getattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME, None) is None:
-            setattr(args, _DP_SAMPLE_K_CANDIDATE_BATCH_ATTR_NAME,
-                    int(cand_group_size))
-        target_agent_current_is_valid: Optional[torch.Tensor] = None
-        if select_jointly:
-            # (B, 1+Pnn)
-            target_agent_current_is_valid = _build_target_agent_current_is_valid_mask(
-                norm_inputs_step=norm_inputs_step,)
-            (best_traj, best_dist,
-             best_joint_score) = _select_best_from_candidate_batch_jointly(
-                 best_traj=best_traj,  # (B, 1+Pnn, 1+future_len, 4)
-                 best_dist=best_dist,  # (B, 1+Pnn)
-                 best_score=best_joint_score,  # (B,)
-                 cand_traj=
-                 cand_traj_batch,  # (group_count, B, 1+Pnn, 1+future_len, 4)
-                 cand_dist=cand_dist_batch,  # (group_count, B, 1+Pnn)
-                 agent_current_is_valid=
-                 target_agent_current_is_valid,  # (B, 1+Pnn)
-             )
-        else:
-            best_traj, best_dist = _select_best_from_candidate_batch_per_agent(
-                best_traj=best_traj,
-                best_dist=best_dist,
-                cand_traj=
-                cand_traj_batch,  # (group_count, B, 1+Pnn, 1+future_len, 4)
-                cand_dist=
-                cand_dist_batch,  # (group_count, B, 1+Pnn) # 무효 agent 는 0. 으로 처리
-            )
-
-        cand_start += int(group_count)
-
-        # (메모리 압박 완화) 다음 루프 전에 참조 해제
-        del cand_traj_batch
-        del cand_dist_batch
-
-    assert isinstance(best_traj, torch.Tensor)
-    assert isinstance(best_dist, torch.Tensor)
     return best_traj, best_dist
 
 
@@ -4271,12 +4275,14 @@ def validate_func(
 
     inputs = _sanitize_norm_inputs_for_validation(inputs)
     future_len: int = int(getattr(args, "future_len"))
+    # target_agents_current_valid: (B, (1+)Pnn)
     # target_future_valid :  (B, (1+)Pnn, future_len)
-    target_future_valid = build_target_future_tensors_and_masks_for_inference(
-        args,
-        inputs,
-        future_len,
-    )
+    (target_agents_current_valid,
+     target_future_valid) = build_target_future_tensors_and_masks_for_inference(
+         args,
+         inputs,
+         future_len,
+     )
     inputs["target_future_valid"] = target_future_valid
 
     rollout_number, base_seed, ddp_rank = _get_rollout_settings_for_validation(
