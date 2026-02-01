@@ -35,6 +35,9 @@ echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 #EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation"
 EVAL_SET_PATH="${USER_PATH}/nuplan/dataset/processed_compressed"
 EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_processed_compressed.json"
+
+#EVAL_SET_PATH="${WOMD_PATH}/processed_womd_0124/validation"
+#EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
 # If validation list json is missing, create it from *.npz in EVAL_SET_PATH
 ###################################
@@ -174,8 +177,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_deepspeed True \
   --save_image True \
   --save_video True \
-  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0131_4" \
-  --save_inference_data True \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0131_6" \
+  --save_inference_data False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --fine_tune_gen_k 16 \
