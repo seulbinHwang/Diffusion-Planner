@@ -327,17 +327,19 @@ class FeasibleProjector(nn.Module):
         # 잔차 초안 ΔU_raw
         # - 기존: (B,Pnn,T,C) 토큰별 Linear
         # - 변경: (B*Pnn,C,T)에서 1x1 Conv로 처리
+        head_bottleneck_dim: int = max(1, self._C // 4)
+
         self.head = nn.Sequential(
-            nn.Conv1d(self._C, self._C, kernel_size=1, bias=True),
+            nn.Conv1d(self._C, head_bottleneck_dim, kernel_size=1, bias=True),
             nn.GELU(),
-            nn.Conv1d(self._C, 3, kernel_size=1, bias=True),
+            nn.Conv1d(head_bottleneck_dim, 3, kernel_size=1, bias=True),
         )
 
         # 마지막 Conv 0-init → 초기엔 U_ref ≈ U_base
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
+
         gate_hidden_dim = 64
-        # 소프트 게이트 s = softplus(MLP_g(Z_s))
         self.gate_mlp = nn.Sequential(
             nn.LayerNorm(self._C),
             nn.Linear(self._C, gate_hidden_dim),
