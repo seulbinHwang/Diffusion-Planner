@@ -193,10 +193,7 @@ taskset -c "${CPUSET}" \
   --port 23001 \
   --eval_set "$EVAL_SET_PATH" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
-  --resume_wandb_model_name latest \
-  --resume_model_only True \
-  --load_name "wosac_test_full" \
-  --name "wosac_test_full" \
+  --name "wosac_test_0202" \
   --eval_method "validation" \
   --batch_size 384 \
   --use_deepspeed True \
