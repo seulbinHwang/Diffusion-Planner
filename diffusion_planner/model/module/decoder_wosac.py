@@ -1648,12 +1648,13 @@ class Decoder(nn.Module):
         low_t_mask: torch.Tensor = inputs["low_t_mask"]  # (B,)
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self.dit(
-            xT_input_flat,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
-            diffusion_time,  # (B,)  or (B, future_len)
-            target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
-            target_past_cur_future_valid,  # (B, (1+)Pnn, time_len+future_len)
-            scene_encoding_token,  # (B, token_num, D)
-            scene_encoding_token_mask,  # (B, token_num)
+            target_input_norm_xT=xT_input_flat,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
+            diffusion_time=diffusion_time,  # (B,)  or (B, future_len)
+            target_agents_past=target_agents_past,  # # (B, (1+)Pnn, time_len, 11)
+            target_past_cur_future_valid=target_past_cur_future_valid,
+            # (B, (1+)Pnn, time_len+future_len)
+            cross_c=scene_encoding_token,  # (B, token_num, D)
+            cross_mask=scene_encoding_token_mask,  # (B, token_num)
             low_t_mask=low_t_mask,
         )
         _require_finite("decoder_dit_output", score_flat)
@@ -2207,8 +2208,6 @@ class Decoder(nn.Module):
             batch_size,
             one_or_Pnn,
         ) = self._prepare_target_trajectories_and_masks(inputs)
-        print("target_past_cur_future_valid.shape:", target_past_cur_future_valid.shape)
-        raise NotImplementedError("디버그용 중단")
         (
             scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask,  # (B, token_num)
@@ -2918,7 +2917,6 @@ class DiT(nn.Module):
         validity = validity.to(device=target_input_norm_xT.device)  # 안전
         validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
             -1)  # (B,P,T_any,1) float
-        print("diffusion_time_full.shape:", diffusion_time_full.shape)
         diffusion_time_full = diffusion_time_full * validity_f  # (B,P,T_any,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
@@ -2951,9 +2949,9 @@ class DiT(nn.Module):
         diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
         target_agents_past: torch.
         Tensor,  # (B, (1+)Pnn, time_len(=past_len+1), 11)
+            target_past_cur_future_valid: torch.Tensor,
+            # (B, (1+)Pnn, 1+past_len+future_len) bool
         cross_c: torch.Tensor,  # (B, token_num, D)
-        target_past_cur_future_valid: torch.Tensor,
-        # (B, (1+)Pnn, 1+past_len+future_len) bool
         cross_mask: torch.Tensor,  # (B, token_num)
         low_t_mask: Optional[torch.Tensor] = None,  # (B,) bool
     ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
