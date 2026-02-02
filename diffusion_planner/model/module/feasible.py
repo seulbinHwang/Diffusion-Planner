@@ -218,11 +218,11 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # 아키텍처 하이퍼파라미터(고정 폭)
         # ------------------------------
-        self._Dx: int = 16  # state encoder 출력 채널 (prev/fut 각각)
+        self._Dx: int = 24  # state encoder 출력 채널 (prev/fut 각각)
         self._Du: int = 16  # control adapter 출력 채널
-        self._Dc: int = 24  # trunk compressor 출력 채널
+        self._Dc: int = 32  # trunk compressor 출력 채널
         self._Din: int = self._Dx * 2 + self._Du + self._Dc  # 16+16+32+64=192
-        self._C: int = 96 #self._Din  # 메인 채널 폭(192)
+        self._C: int = 64 #self._Din  # 메인 채널 폭(192)
         self._eps: float = 1e-6
 
         # [추가 필요] L_integration 경로 차단용 플래그 (state, u_base detach)
@@ -254,7 +254,7 @@ class FeasibleProjector(nn.Module):
         # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
         self.trunk_compressor = nn.Sequential(
             nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 3 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
+            nn.Linear(hidden_dim, 2 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
             nn.GELU(),
             nn.Linear(3 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
         )
@@ -270,7 +270,7 @@ class FeasibleProjector(nn.Module):
         # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
         # ------------------------------
         self._kernel_size: int = 7
-        self._dilations: List[int] = [1, 8]  #: 4블록→2블록
+        self._dilations: List[int] = [1]#, 8]  #: 4블록→2블록
         self.tcn_depth = len(self._dilations)  # : 현재는 2
         self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
             [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
