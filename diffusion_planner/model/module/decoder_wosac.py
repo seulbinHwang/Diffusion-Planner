@@ -3153,16 +3153,22 @@ class DiT(nn.Module):
                     device_type=device_type,
             ):
                 # (B, Pnn, point_len_ds, 3)  [v_x^w, v_y^w, ω]
-                unnorm_points_world_control_stride = \
-                    self.feasible_projector.savgol_filter_for_control(
-                        unnorm_diffusion_trajectory_stride,    # (B, Pnn, 1+T_ds, 4)
-                        unnorm_near_past_xyyaw_stride,         # (B, Pnn, past_len_ds, 4) or None
-                        near_past_cur_future_valid_stride,     # (B, Pnn, past_len_ds+1+T_ds) bool
-                        dt=dt_for_savgol,
-                        polyorder=2,
-                        max_window_len_xy=max_window_len_xy,
-                        max_window_len_yaw=max_window_len_yaw,
-                    )
+                # + point_len_inputs_stride: (prepare_points_and_masks 결과 재사용용)
+                (
+                    unnorm_points_world_control_stride,
+                    point_len_inputs_stride,
+                ) = self.feasible_projector.savgol_filter_for_control(
+                    unnorm_diffusion_trajectory_stride,  # (B, Pnn, 1+T_ds, 4)
+                    unnorm_near_past_xyyaw_stride,
+                    # (B, Pnn, past_len_ds, 4) or None
+                    near_past_cur_future_valid_stride,
+                    # (B, Pnn, past_len_ds+1+T_ds) bool
+                    dt=dt_for_savgol,
+                    polyorder=2,
+                    max_window_len_xy=max_window_len_xy,
+                    max_window_len_yaw=max_window_len_yaw,
+                    return_point_len_inputs=True,
+                )
 
             with profile_block(
                     "feasible.compute_midpoint_controls",
@@ -3171,13 +3177,16 @@ class DiT(nn.Module):
             ):
                 # (B, Pnn, segment_len_ds, 3)  [v_x^b, v_y^b, ω]_mid (stride 타임라인 기준)
                 """무효 구간(점이 무효한 구간)은 0.0으로 출력됩니다."""
-                unnorm_seg_body_control_stride = \
-                    self.feasible_projector.compute_midpoint_controls(
-                        unnorm_diffusion_trajectory_stride,    # (B, Pnn, 1+T_ds, 4)
-                        unnorm_near_past_xyyaw_stride,         # (B, Pnn, past_len_ds, 4) or None
-                        unnorm_points_world_control_stride,    # (B, Pnn, point_len_ds, 3)
-                        near_past_cur_future_valid_stride,     # (B, Pnn, past_len_ds+1+T_ds) bool
-                    )
+                unnorm_seg_body_control_stride = self.feasible_projector.compute_midpoint_controls(
+                    unnorm_diffusion_trajectory_stride,  # (B, Pnn, 1+T_ds, 4)
+                    unnorm_near_past_xyyaw_stride,
+                    # (B, Pnn, past_len_ds, 4) or None
+                    unnorm_points_world_control_stride,
+                    # (B, Pnn, point_len_ds, 3)
+                    near_past_cur_future_valid_stride,
+                    # (B, Pnn, past_len_ds+1+T_ds) bool
+                    point_len_inputs=point_len_inputs_stride,
+                )
 
             # --- (3) 관측 정규화 → FeasibleProjector 네트워크(TCN) 보정 ---
             temp_dict = {"seg_body_control": unnorm_seg_body_control_stride}
