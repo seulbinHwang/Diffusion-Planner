@@ -50,8 +50,8 @@ class DataStatistics:
                 "max_edge_per_class": (1.5, 1.5, 2.0),# (vehicle, pedestrian, bicycle)
             },
             "beta_max": {
-                "bin_width": 0.01,
-                "max_edge_per_class": (1.6, 1.6, 1.6),
+                "bin_width": 0.02,
+                "max_edge_per_class": (0.4, 1.0, 1.6),
                 # (vehicle, pedestrian, bicycle) 1.6rad ≈ 91.6deg
             },
         }
