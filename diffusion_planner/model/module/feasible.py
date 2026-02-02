@@ -269,7 +269,7 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
         # ------------------------------
-        self._kernel_size: int = 7
+        self._kernel_size: int = 10
         self._dilations: List[int] = [1]#, 8]  #: 4블록→2블록
         self.tcn_depth = len(self._dilations)  # : 현재는 2
         self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
