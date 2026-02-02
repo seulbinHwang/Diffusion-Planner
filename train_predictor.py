@@ -2359,8 +2359,6 @@ def model_training(
             global_rank=global_rank,
             use_deepspeed=use_deepspeed,
         )
-        core_model = _unwrap_to_core_torch_module(diffusion_planner)
-        print_param_report(core_model)
     optimizer = _build_optimizer_with_roles_from_args(
         base_model=base_model,
         args=args,
@@ -2421,7 +2419,8 @@ def model_training(
         wandb_id=wandb_id,
         allow_val_change=allow_val_change,
     )
-
+    core_model = _unwrap_to_core_torch_module(diffusion_planner)
+    print_param_report(core_model)
     best_loss = _run_training_loop(
         args=args,
         diffusion_planner=diffusion_planner,
