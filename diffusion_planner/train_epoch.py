@@ -29,9 +29,25 @@ import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
 
+
 # name -> 호출 횟수 / 누적 시간(ms)
 _PROFILE_CALL_COUNT: Dict[str, int] = {}
 _PROFILE_TOTAL_MS: Dict[str, float] = {}
+
+
+def _is_main_process() -> bool:
+    """로그를 출력할 프로세스인지 확인합니다.
+
+    Returns:
+        bool:
+            - True: rank 0(메인 프로세스)
+            - False: 그 외
+    """
+    try:
+        return int(ddp.get_rank()) == 0
+    except Exception:
+        # 단일 프로세스/분산 미초기화 등
+        return True
 
 
 @contextmanager
@@ -39,8 +55,21 @@ def profile_block(
     name: str,
     enabled: bool = True,
     device_type: str = "cuda",
+    *,
+    print_rank0_only: bool = True,
 ) -> Iterator[None]:
-    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러(누적 평균 포함)."""
+    """코드 블록 실행 시간을 ms 단위로 출력합니다(누적 평균 포함).
+
+    Args:
+        name (str): 출력에 사용할 블록 이름.
+        enabled (bool): False면 계측 없이 그대로 실행합니다.
+        device_type (str): "cuda"면 앞/뒤로 synchronize 해서 GPU 작업까지 포함해 잽니다.
+        print_rank0_only (bool): True면 rank0에서만 print 합니다.
+
+    Notes:
+        - enabled=True일 때는 synchronize가 들어가므로, 평소 학습 속도 측정에는 부적합합니다.
+          “몇 step만” 켜고 원인 찾는 용도로 쓰는 걸 권장합니다.
+    """
     if not enabled:
         yield
         return
@@ -49,12 +78,13 @@ def profile_block(
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    start_time: float = time.perf_counter()
+    t0: float = time.perf_counter()
     yield
+
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    elapsed_ms: float = (time.perf_counter() - t0) * 1000.0
 
     prev_cnt: int = _PROFILE_CALL_COUNT.get(name, 0)
     prev_sum: float = _PROFILE_TOTAL_MS.get(name, 0.0)
@@ -66,7 +96,171 @@ def profile_block(
     _PROFILE_TOTAL_MS[name] = new_sum
 
     avg_ms: float = new_sum / float(new_cnt)
-    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}")
+
+    if (not print_rank0_only) or _is_main_process():
+        print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}")
+
+
+
+def _run_backward_and_step_deepspeed(
+    model: nn.Module,
+    loss_tensor: torch.Tensor,
+    *,
+    enable_profile: bool,
+    device_type: str,
+) -> None:
+    """DeepSpeed 경로에서 역전파+업데이트를 수행하고, 구간별 시간을 출력합니다.
+
+    Args:
+        model (nn.Module):
+            DeepSpeedEngine(모델이면서 .backward/.step을 가진 객체)를 기대합니다.
+        loss_tensor (torch.Tensor):
+            최종 손실 스칼라 텐서.
+            - shape: ()  (스칼라)
+        enable_profile (bool):
+            True면 구간별 시간을 출력합니다.
+        device_type (str):
+            "cuda" 또는 "cpu"
+    """
+    with profile_block(
+        "train_epoch._backward_and_step.deepspeed.backward",
+        enabled=enable_profile,
+        device_type=device_type,
+    ):
+        model.backward(loss_tensor)
+
+    with profile_block(
+        "train_epoch._backward_and_step.deepspeed.step",
+        enabled=enable_profile,
+        device_type=device_type,
+    ):
+        model.step()
+
+
+def _run_backward_and_step_pytorch(
+    model: nn.Module,
+    loss_tensor: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    *,
+    max_grad_norm: float,
+    enable_profile: bool,
+    device_type: str,
+) -> None:
+    """일반(PyTorch/DDP) 경로에서 역전파+클리핑+업데이트를 수행하고 구간별 시간을 출력합니다.
+
+    Args:
+        model (nn.Module): 학습 중인 모델.
+        loss_tensor (torch.Tensor):
+            최종 손실 스칼라 텐서.
+            - shape: ()  (스칼라)
+        optimizer (torch.optim.Optimizer): 옵티마이저.
+        scheduler (Any): 스케줄러(있으면 step() 호출).
+        max_grad_norm (float): 0보다 크면 기울기 크기 제한을 수행합니다.
+        enable_profile (bool): True면 구간별 시간을 출력합니다.
+        device_type (str): "cuda" 또는 "cpu"
+    """
+    with profile_block(
+        "train_epoch._backward_and_step.pytorch.backward",
+        enabled=enable_profile,
+        device_type=device_type,
+    ):
+        loss_tensor.backward()
+
+    if float(max_grad_norm) > 0.0:
+        with profile_block(
+            "train_epoch._backward_and_step.pytorch.clip_grad_norm",
+            enabled=enable_profile,
+            device_type=device_type,
+        ):
+            nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+
+    with profile_block(
+        "train_epoch._backward_and_step.pytorch.optimizer_step",
+        enabled=enable_profile,
+        device_type=device_type,
+    ):
+        optimizer.step()
+
+    if scheduler is not None:
+        with profile_block(
+            "train_epoch._backward_and_step.pytorch.scheduler_step",
+            enabled=enable_profile,
+            device_type=device_type,
+        ):
+            scheduler.step()
+
+
+def _maybe_run_torch_profiler_for_backward_step(
+    args: Any,
+    *,
+    use_deepspeed: bool,
+    model: nn.Module,
+    loss_tensor: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    max_grad_norm: float,
+) -> bool:
+    """(선택) torch.profiler로 backward/step 내부를 더 자세히 캡처합니다.
+
+    이 기능은 “연산”과 “GPU간 통신”이 무엇 때문에 오래 걸리는지(예: NCCL 통신, 특정 backward 연산 등)
+    더 깊게 보고 싶을 때 사용합니다.
+
+    켜는 방법(예시)
+        args.profile_backward_torch = True
+        args.profile_backward_torch_steps = 2   # 처음 2 step만 캡처
+        args.profile_backward_torch_row_limit = 30
+
+    Returns:
+        bool:
+            - True: 이번 호출에서 profiler를 실제로 실행함
+            - False: 실행 안 함
+    """
+    enabled: bool = bool(getattr(args, "profile_backward_torch", False))
+    if not enabled:
+        return False
+
+    step_idx: int = int(getattr(args, "_global_update_step", 0))
+    max_steps: int = int(getattr(args, "profile_backward_torch_steps", 1))
+    if step_idx >= max_steps:
+        return False
+
+    # torch.profiler는 모든 rank에서 동일하게 도는 편이 안전합니다(속도는 느려져도 “멈춤” 위험을 줄임).
+    from torch.profiler import ProfilerActivity, profile
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    with profile(
+        activities=activities,
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as prof:
+        if use_deepspeed:
+            model.backward(loss_tensor)
+            model.step()
+        else:
+            loss_tensor.backward()
+            if float(max_grad_norm) > 0.0:
+                nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+    # 출력은 rank 0만
+    if _is_main_process():
+        row_limit: int = int(getattr(args, "profile_backward_torch_row_limit", 30))
+        print("\n==================== [torch.profiler] backward/step top CUDA ====================")
+        try:
+            print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=row_limit))
+        except Exception:
+            # CUDA가 없거나 버전에 따라 컬럼명이 다를 수 있음
+            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=row_limit))
+        print("=================================================================================\n")
+
+    return True
 
 
 def _move_batch_to_device(
@@ -387,153 +581,75 @@ def _compute_loss_dict(
     return loss_dict
 
 
+
 def _backward_and_step(
     loss_dict: Dict[str, torch.Tensor],
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler,
-    args: argparse.Namespace,
+    scheduler: Any,
+    args: Any,
 ) -> float:
-    """역전파/그래디언트 클리핑/스케줄러/옵티마이저 업데이트를 한 번 수행한다.
+    """역전파/업데이트를 수행하고, (선택) 내부 시간을 더 잘게 출력합니다.
 
     Args:
-        loss_dict:
-            - "loss" 키에 최종 scalar 손실 텐서가 들어 있는 dict.
-              · loss_dict["loss"]의 shape: ()  스칼라 텐서.
-        model:
-            학습 중인 모델.
-            - 일반 모드: nn.Module 또는 DDP 래퍼.
-            - ZeRO-2 모드: deepspeed.DeepSpeedEngine.
-        optimizer:
-            torch.optim.Optimizer 또는 DeepSpeed가 감싼 Optimizer.
-        scheduler:
-            학습률 스케줄러. 일반 모드에서만 직접 step()을 호출한다.
-        args:
-            학습 설정/상태 Namespace.
-            - args.use_deepspeed: True이면 DeepSpeed 엔진을 사용한다.
-            - args.max_grad_norm: 기울기 클리핑 기준값. 0 이하이면 클리핑 안 함.
+        loss_dict (Dict[str, torch.Tensor]):
+            - loss_dict["loss"]는 스칼라 텐서여야 합니다.
+              shape: ()
+        model (nn.Module):
+            - DeepSpeed 사용 시: .backward/.step을 가진 엔진
+            - 그 외: 일반 nn.Module
+        optimizer (torch.optim.Optimizer): 옵티마이저(DeepSpeed면 내부에서 사용될 수 있음)
+        scheduler (Any): 스케줄러(DeepSpeed면 내부에서 처리, 일반이면 여기서 step)
+        args (Any): 학습 설정/상태
 
     Returns:
-        float:
-            loss_dict["loss"].item() 값 (logging 용).
+        float: loss 값(로그용)
     """
-    # total_loss는 scalar float 값
-    total_loss: float = float(loss_dict["loss"].item())
-    loss_tensor: torch.Tensor = loss_dict["loss"]
+    loss_tensor: torch.Tensor = loss_dict["loss"]  # shape: ()
+    device_type: str = "cuda" if loss_tensor.is_cuda else "cpu"
 
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False)) \
         and hasattr(model, "backward") and hasattr(model, "step")
 
-    # 한 곳에서만 클리핑 기준을 정한다.
+    # ✅ 내부 구간 프로파일링 on/off (기본은 False)
+    enable_profile: bool = bool(getattr(args, "profile_backward_detail", False))
+    enable_profile: True
+
     max_grad_norm: float = float(getattr(args, "max_grad_norm", 0.0))
 
-    if use_deepspeed:
-        # DeepSpeed 엔진을 사용하는 경우:
-        # gradient_clipping 값은 build_deepspeed_config()에서
-        # ds_config["gradient_clipping"] = max_grad_norm 으로 넘어간다.
-        # 여기서는 따로 clip_grad_norm을 호출하지 않는다.
-        """ model.backward(loss_tensor) # deepseed 전용 역전파
-        각 GPU가 자기 배치에 대한 기울기를 먼저 계산한다.
-            GPU0: g0(W1), g0(W2), g0(W3), g0(W4)
-            GPU1: g1(W1), g1(W2), g1(W3), g1(W4)
-        여기까진 “각자 전체 기울기를 한 번씩 계산했다”고 보면 된다.
-            (이 단계는 ZeRO-2라도 어쩔 수 없이 한 번 거치는 단계)
+    # (선택) torch.profiler: 더 깊게 보고 싶을 때만
+    ran_torch_prof: bool = _maybe_run_torch_profiler_for_backward_step(
+        args,
+        use_deepspeed=use_deepspeed,
+        model=model,
+        loss_tensor=loss_tensor,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        max_grad_norm=max_grad_norm,
+    )
 
-        2. 그 다음 “기울기를 나누고 합치는 통신 단계”가 들어간다.
-        
-           * GPU0와 GPU1이 서로 기울기 조각을 주고받아서:
-        
-             * GPU0는 W1, W2에 대한
-               **(g0 + g1)의 합**만 남기고 W3, W4에 대한 기울기는 버린다.
-             * GPU1은 W3, W4에 대한
-               **(g0 + g1)의 합**만 남기고 W1, W2에 대한 기울기는 버린다.
-        
-           즉, **최종적으로**:
-        
-           * GPU0: (합쳐진 기울기) g(W1), g(W2) 만 보관
-           * GPU1: (합쳐진 기울기) g(W3), g(W4) 만 보관
-        
-           → 이게 “기울기를 GPU 사이에 나눠서 가진다”는 뜻이다.
-           (옵티마 상태도 비슷하게 “나눠서 저장”한다.)
+    # torch.profiler를 안 돌린 경우에만, 우리가 쪼갠 profile_block 계측 실행
+    if not ran_torch_prof:
+        if use_deepspeed:
+            _run_backward_and_step_deepspeed(
+                model=model,
+                loss_tensor=loss_tensor,
+                enable_profile=enable_profile,
+                device_type=device_type,
+            )
+        else:
+            _run_backward_and_step_pytorch(
+                model=model,
+                loss_tensor=loss_tensor,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                max_grad_norm=max_grad_norm,
+                enable_profile=enable_profile,
+                device_type=device_type,
+            )
 
-# algather_partitions = False 일 때
-    1. GPU0, GPU1이 각각 **자기 배치에 대해 전체 기울기**를 계산 (g0, g1).
-    
-    2. GPU0와 GPU1이 통신해서:
-       * **먼저 전체 기울기를 서로 합친다.**
-         * 결과적으로 GPU0, GPU1 둘 다
-           * g_sum(W1), g_sum(W2), g_sum(W3), g_sum(W4)
-             를 잠깐씩 다 들고 있을 수 있다.
-       * 그 다음,
-         * “나는 W1,W2만 쥐고 있을게” / “나는 W3,W4만 쥐고 있을게” 식으로
-           기울기와 옵티마 상태를 다시 나누고 정리.
-    
-       → 즉, **중간에 “모든 기울기 합본을 한 번씩 다 들고 있는 순간”이 있을 수 있다.**
-       그래서 메모리 사용량 관점에서 조금 덜 효율적인 쪽.
-
-# allgather_partitions = True 일 때
-    2. 그런데 여기서는, **“전체 합본을 두 군데 다 오래 들고 있게 만들지 않고”**
-       바로 “나눠진 형태” 위주로 유지하려고 한다.
-    
-       예를 들어 개념적으로는:
-    
-       * 단계 1: GPU0/1이 서로 기울기를 교환하면서,
-    
-         * GPU0는 W1,W2 부분에 대한 `g0+g1`만 남기고,
-         * GPU1은 W3,W4 부분에 대한 `g0+g1`만 남긴다.
-       * 이때 “모든 파라미터에 대한 합본”을 각 GPU가 오래 들고 있는 순간을 줄이고,
-         * 바로 “나눠진 합본”만 남기는 쪽으로 통신을 설계하는 것.
-    
-       → 실제 구현은 더 복잡하지만,
-       **“합친 전체 기울기를 각 GPU가 길게 들고 있지 않는다”**는 방향으로 생각하면 된다.
-        """
-        model.backward(loss_tensor)
-        """ model.step()
-3. 옵티마 단계에서:
-   * GPU0는 자신이 가진 파라미터에 대해서만 갱신
-     * W1, W2 를 g(W1), g(W2) 와 자기 쪽 옵티마 상태를 써서 업데이트
-   * GPU1은 W3, W4 를 자기 쪽 기울기/옵티마로 업데이트
-
-4. 업데이트가 끝나면,
-   * GPU0와 GPU1이 서로 **업데이트된 W1~W4 전체를 다시 맞춘다**.
-     (브로드캐스트 혹은 비슷한 방식으로 동기화)
-   * 그래서 **step이 끝난 후에는** 다시
-     * GPU0: W1~W4 전체 최신 버전
-     * GPU1: W1~W4 전체 최신 버전
-
-        """
-        model.step()
-        # DeepSpeed가 내부적으로 옵티마이저/스케줄러 스텝을 처리하므로
-        # 여기서는 따로 호출하지 않는다.
-    else:
-        # 일반 PyTorch / DDP 모드
-        """ loss_tensor.backward()
-이때 DDP가 **파라미터별 gradient가 만들어지는 순간마다 후크를 걸어** 다음을 수행:
-
-* GPU0는 자기 gradient `g0`를 가지고 있음.
-* GPU1는 자기 gradient `g1`를 가지고 있음.
-* PyTorch DDP 내부에서:
-  * 각 파라미터마다
-    `g_avg = (g0 + g1) / 2` 를 만들기 위해
-    GPU0와 GPU1이 서로 값을 주고받고, 더하고, 나눔.
-* 그 결과:
-  * GPU0의 해당 파라미터 gradient = `g_avg`
-  * GPU1의 해당 파라미터 gradient = `g_avg`
-즉, **backward가 끝났을 때, 두 GPU의 gradient는 완전히 동일**하게 맞춰져 있음.
-이 과정이 이 설정에서 **가장 큰 통신 비용**이야.        
-        """
-        loss_tensor.backward()
-        """
-        아래 3줄 코드에서는 GPU끼리 통신하지 않음.
-        """
-        # max_grad_norm > 0 일 때만 클리핑 수행
-        if max_grad_norm > 0.0:
-            nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-
-        # 스케줄러 / 옵티마이저 스텝
-        optimizer.step()
-        scheduler.step()
-
+    # 로그용 loss 값(스칼라). CPU로 가져오는 순간 동기화가 일어날 수 있습니다.
+    total_loss: float = float(loss_tensor.detach().float().cpu().item())
     return total_loss
 
 
