@@ -54,5 +54,5 @@ TRAIN_SET_LIST_PATH="/media/user/E/projects/Diffusion-Planner/diffusion_planner_
   --batch_size 32 \
   --learning_rate 3e-4 \
   --profile_feasible True \
-  --feasible_stride_dt 0.1
+  --feasible_stride_dt 1.0
 
