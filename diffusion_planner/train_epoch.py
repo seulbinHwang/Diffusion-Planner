@@ -25,6 +25,14 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 
+import time
+from contextlib import contextmanager
+from typing import Dict, Iterator
+
+# name -> 호출 횟수 / 누적 시간(ms)
+_PROFILE_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_TOTAL_MS: Dict[str, float] = {}
+
 
 @contextmanager
 def profile_block(
@@ -32,27 +40,33 @@ def profile_block(
     enabled: bool = True,
     device_type: str = "cuda",
 ) -> Iterator[None]:
-    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
-
-    Args:
-        name: 출력에 사용할 블록 이름.
-        enabled: False면 측정 없이 그냥 실행.
-        device_type: "cuda"면 GPU 연산이 끝난 시점을 맞추기 위해 앞/뒤로 동기화를 수행.
-    """
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러(누적 평균 포함)."""
     if not enabled:
         yield
         return
 
-    if device_type == "cuda" and torch.cuda.is_available():
+    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
+    if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
+
     start_time: float = time.perf_counter()
-
     yield
-
-    if device_type == "cuda" and torch.cuda.is_available():
+    if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
+
     elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
-    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
+
+    prev_cnt: int = _PROFILE_CALL_COUNT.get(name, 0)
+    prev_sum: float = _PROFILE_TOTAL_MS.get(name, 0.0)
+
+    new_cnt: int = prev_cnt + 1
+    new_sum: float = prev_sum + float(elapsed_ms)
+
+    _PROFILE_CALL_COUNT[name] = new_cnt
+    _PROFILE_TOTAL_MS[name] = new_sum
+
+    avg_ms: float = new_sum / float(new_cnt)
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}")
 
 
 def _move_batch_to_device(

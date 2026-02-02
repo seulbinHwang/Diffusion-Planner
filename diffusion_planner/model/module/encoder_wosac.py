@@ -11,34 +11,59 @@ from typing import Tuple  # 이미 있으면 중복 추가 불필요
 import time
 from contextlib import contextmanager
 from typing import Iterator
+import time
+from contextlib import contextmanager
+from typing import Dict, Iterator
+
+# name -> 호출 횟수 / 누적 시간(ms)
+_PROFILE_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_TOTAL_MS: Dict[str, float] = {}
 
 
 @contextmanager
-def profile_block(name: str,
-                  enabled: bool = True,
-                  device_type: str = "cuda") -> Iterator[None]:
-    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
+def profile_block(
+    name: str,
+    enabled: bool = True,
+    device_type: str = "cuda",
+) -> Iterator[None]:
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러(누적 평균 포함).
+
+    출력 형식(예):
+        [PROFILE] some_block: 1.234 ms | avg 1.100 ms | n=10
 
     Args:
-        name: 출력에 사용할 블록 이름.
-        enabled: False 이면 아무 것도 하지 않고 그냥 통과.
-        device_type: "cuda" 인 경우, GPU 연산 정합을 위해 앞/뒤에 synchronize 호출.
+        name: 출력에 사용할 블록 이름(키).
+        enabled: False이면 아무 것도 출력하지 않고 그냥 실행.
+        device_type: "cuda"면 GPU 연산 정합을 위해 앞/뒤로 synchronize 수행.
     """
     if not enabled:
-        # 아무 것도 하지 않고 블록만 실행
         yield
         return
 
-    if device_type == "cuda" and torch.cuda.is_available():
+    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
+    if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
+
     start_time: float = time.perf_counter()
-
-    yield  # 실제 코드 실행
-
-    if device_type == "cuda" and torch.cuda.is_available():
+    yield
+    if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
+
     elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
-    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
+
+    # 누적 통계 업데이트
+    prev_cnt: int = _PROFILE_CALL_COUNT.get(name, 0)
+    prev_sum: float = _PROFILE_TOTAL_MS.get(name, 0.0)
+
+    new_cnt: int = prev_cnt + 1
+    new_sum: float = prev_sum + float(elapsed_ms)
+
+    _PROFILE_CALL_COUNT[name] = new_cnt
+    _PROFILE_TOTAL_MS[name] = new_sum
+
+    avg_ms: float = new_sum / float(new_cnt)
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}")
+
 
 
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
