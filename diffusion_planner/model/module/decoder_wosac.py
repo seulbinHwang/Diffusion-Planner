@@ -2917,6 +2917,8 @@ class DiT(nn.Module):
         validity = validity.to(device=target_input_norm_xT.device)  # 안전
         validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
             -1)  # (B,P,T_any,1) float
+        print("diffusion_time_full.shape:", diffusion_time_full.shape)
+        print("validity_f.shape:", validity_f.shape)
         diffusion_time_full = diffusion_time_full * validity_f  # (B,P,T_any,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
