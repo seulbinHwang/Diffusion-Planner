@@ -53,5 +53,5 @@ TRAIN_SET_LIST_PATH="/media/user/E/projects/Diffusion-Planner/diffusion_planner_
   --name "wosac_final_0128" \
   --batch_size 32 \
   --learning_rate 3e-4 \
-  --profile_feasible True
+  --profile_feasible False
 
