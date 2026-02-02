@@ -2062,79 +2062,67 @@ class FeasibleProjector(nn.Module):
         out[..., 2:4] = cs / norm
         return out
 
-    # =========================================================
-    # [B] 피처 인코딩 (prev/fut/u_base/trunk)
-    # =========================================================
     def _features_from_inputs(
             self,
             x_prev: torch.Tensor,  # (B, Pnn, segment_len, 4)
             x_fut: torch.Tensor,  # (B, Pnn, segment_len, 4)
             u_base: torch.Tensor,  # (B, Pnn, segment_len, 3)
             dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
-            points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len)  bool
+            points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len) bool
     ) -> torch.Tensor:
-        """입력을 통일 피처 Z_in으로 변환합니다.
+        """입력을 통일 피처 Z_in으로 변환합니다(전체 한번에 계산 + 마스크로 0 고정).
 
-        변경점:
-            - 유효한 구간(세그먼트)만 뽑아서 encoders(값을 바꾸는 큰 작업)를 실행합니다.
-            - 무효 구간은 계산 자체를 하지 않고, 결과를 0으로 둡니다.
+        핵심 변경:
+            - 예전에는 유효 구간만 뽑아서(state encoder / control adapter) 계산했습니다.
+            - 이제는 (B,Pnn,T,·) 전체를 한 번에 계산한 뒤,
+              유효하지 않은 구간은 seg_mask_1로 곱해 **출력을 0으로 고정**합니다.
+
+        왜 결과가 같나:
+            - 여기서 하는 작업들은 각 시점(토큰)별로 독립적으로 계산되므로,
+              무효 구간을 같이 계산하더라도 유효 구간의 값은 변하지 않습니다.
+            - 무효 구간은 곧바로 0으로 눌러서 출력/학습 신호가 사라집니다.
 
         Args:
-            x_prev: (B, Pnn, segment_len, 4)
-            x_fut:  (B, Pnn, segment_len, 4)
-            u_base: (B, Pnn, segment_len, 3)
-            dit_final_hidden_tokens: (B, Pnn, H)
-            points_valid: (B, Pnn, 1+segment_len) bool
+            x_prev: (B, Pnn, T, 4)  구간 시작 노드의 [x,y,cos,sin]
+            x_fut:  (B, Pnn, T, 4)  구간 끝 노드의 [x,y,cos,sin]
+            u_base: (B, Pnn, T, 3)  베이스 제어 [v_x^b, v_y^b, w]
+            dit_final_hidden_tokens: (B, Pnn, H)  트렁크 은닉
+            points_valid: (B, Pnn, 1+T) bool  노드 유효 마스크(현재 포함)
 
         Returns:
-            Z_in: (B, Pnn, segment_len, 192)
+            Z_in: (B, Pnn, T, self._Din)
+                여기서 self._Din = 2*self._Dx + self._Du + self._Dc
         """
-        # points_valid_bool: (B,Pnn,1+segment_len)
-        points_valid_bool = points_valid.to(torch.bool)
+        # seg_mask_1: (B, Pnn, T, 1)  float(0/1), dtype는 입력 dtype으로 맞춤
+        _, seg_mask_1 = self._build_segment_mask(
+            near_cur_future_valid=points_valid,  # (B,Pnn,1+T)
+            value_dtype=x_prev.dtype,
+        )
 
-        # seg_valid_bool: (B,Pnn,segment_len)  = 양 끝 노드가 모두 True인 구간
-        seg_valid_bool = points_valid_bool[..., :-1] & points_valid_bool[
-            ..., 1:]
+        # u_base는 필요 시 detach만 적용 (기존 동작 유지)
+        u_base_for_net = u_base.detach() if self.detach_u_for_ctrl_losses else u_base
 
-        # 유효 구간 인덱스(한 번만 계산해서 재사용)
-        # valid_idx: (N_valid,)
-        valid_idx = seg_valid_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
-            -1)
+        # --- token-wise 모듈들: 전체 텐서에 한 번에 적용 ---
+        # feat_prev: (B, Pnn, T, self._Dx)
+        feat_prev = self.state_prev_encoder(x_prev)
+        # feat_fut: (B, Pnn, T, self._Dx)
+        feat_fut = self.state_fut_encoder(x_fut)
+        # feat_u: (B, Pnn, T, self._Du)
+        feat_u = self.control_adapter(u_base_for_net)
 
-        # u_base는 필요 시 detach만 적용 (무효 구간은 pack 단계에서 애초에 계산하지 않음)
-        if self.detach_u_for_ctrl_losses:
-            u_base_for_net = u_base.detach()
-        else:
-            u_base_for_net = u_base
+        # --- 무효 구간은 0으로 고정(출력/역전파 신호 차단) ---
+        mask_feat = seg_mask_1.to(dtype=feat_prev.dtype,
+                                  device=feat_prev.device)  # (B,Pnn,T,1)
+        feat_prev = feat_prev * mask_feat
+        feat_fut = feat_fut * mask_feat
+        feat_u = feat_u * mask_feat
 
-        # encoders는 "유효 구간"에서만 실행
-        feat_prev = self._apply_tokenwise_module_packed(
-            x=x_prev,  # (B,Pnn,T,4)
-            token_valid_mask=seg_valid_bool,  # (B,Pnn,T)
-            module=self.state_prev_encoder,
-            valid_token_flat_idx=valid_idx,
-        )  # (B,Pnn,T,self._Dx)
-
-        feat_fut = self._apply_tokenwise_module_packed(
-            x=x_fut,  # (B,Pnn,T,4)
-            token_valid_mask=seg_valid_bool,  # (B,Pnn,T)
-            module=self.state_fut_encoder,
-            valid_token_flat_idx=valid_idx,
-        )  # (B,Pnn,T,self._Dx)
-
-        feat_u = self._apply_tokenwise_module_packed(
-            x=u_base_for_net,  # (B,Pnn,T,3)
-            token_valid_mask=seg_valid_bool,  # (B,Pnn,T)
-            module=self.control_adapter,
-            valid_token_flat_idx=valid_idx,
-        )  # (B,Pnn,T,self._Du)
-
-        # trunk: (B,Pnn,self._Dc)
+        # trunk: (B, Pnn, self._Dc)
         trunk = self.trunk_compressor(dit_final_hidden_tokens)
-        # trunk_rep: (B,Pnn,segment_len,self._Dc)
+        # trunk_rep: (B, Pnn, T, self._Dc)
         trunk_rep = trunk.unsqueeze(2).expand(-1, -1, int(x_prev.size(2)), -1)
 
-        # Z_in: (B,Pnn,segment_len,192)
+        # Z_in: (B, Pnn, T, self._Din)
         Z_in = torch.cat([feat_prev, feat_fut, feat_u, trunk_rep], dim=-1)
         return Z_in
 
@@ -2164,71 +2152,56 @@ class FeasibleProjector(nn.Module):
 
     def _prepare_tcn_input(
             self,
-            Z_in: torch.Tensor,  # (B, Pnn, T, 192)
-            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
+            Z_in: torch.Tensor,  # (B, Pnn, T, Din)
+            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)  float(0/1)
     ) -> torch.Tensor:
-        """Stem 실행 후, 무효 구간은 0으로 유지합니다.
+        """Stem 실행 후 무효 구간을 0으로 고정합니다(전체 한번에 계산 + 마스크).
 
-        변경점:
-            - (B,Pnn,T) 중 유효 구간만 뽑아서 stem_norm/ stem_fc/ activation을 실행합니다.
-            - 무효 구간은 계산 자체를 하지 않고 0으로 둡니다.
+        예전:
+            - 유효 토큰만 뽑아서 stem_norm/stem_fc/stem_act 실행 후 다시 채움.
+
+        이제:
+            - (B,Pnn,T,·) 전체에 stem을 한 번에 적용
+            - 마지막에 seg_mask_1로 곱해 무효 구간 출력은 0으로 고정
 
         Args:
-            Z_in: (B,Pnn,T,192)
-            seg_mask_1: (B,Pnn,T,1) 0/1
+            Z_in: (B, Pnn, T, Din)
+            seg_mask_1: (B, Pnn, T, 1) 0/1
 
         Returns:
-            Z_s: (B,Pnn,T,192)
+            Z_s: (B, Pnn, T, self._C)
         """
-        # seg_mask_bool: (B,Pnn,T)
-        seg_mask_bool = self._to_bool_mask(seg_mask_1.squeeze(-1))
+        # stem: token-wise 연산이므로 전체 텐서에 바로 적용
+        Z = self.stem_norm(Z_in)  # (B,Pnn,T,Din)
+        Z = self.stem_fc(Z)  # (B,Pnn,T,C)
+        Z = self.stem_act(Z)  # (B,Pnn,T,C)
 
-        # valid_idx: (N_valid,)
-        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
-            -1)
-
-        B, Pnn, T, Din = Z_in.shape
-        total_tokens = int(B * Pnn * T)
-
-        if int(valid_idx.numel()) == 0:
-            # 유효 구간이 없으면 전부 0
-            return Z_in.new_zeros((B, Pnn, T, int(self._C)))
-
-        # Z_flat: (B*Pnn*T, Din)
-        Z_flat = Z_in.reshape(total_tokens, int(Din))
-        Z_valid = Z_flat.index_select(0, valid_idx)  # (N_valid, Din)
-
-        # stem 적용: (N_valid, Din) -> (N_valid, C)
-        Z_valid = self.stem_norm(Z_valid)
-        Z_valid = self.stem_fc(Z_valid)
-        Z_valid = self.stem_act(Z_valid)
-
-        # 원위치 복원: (B*Pnn*T, C) -> (B,Pnn,T,C)
-        Z_out_flat = Z_valid.new_zeros((total_tokens, int(Z_valid.shape[-1])))
-        Z_out_flat = Z_out_flat.index_copy(0, valid_idx, Z_valid)
-        Z_s = Z_out_flat.view(B, Pnn, T, int(Z_valid.shape[-1]))
+        # 무효 구간은 0 고정
+        mask = seg_mask_1.to(dtype=Z.dtype, device=Z.device)  # (B,Pnn,T,1)
+        Z_s = Z * mask
         return Z_s
 
     def _run_tcn(
             self,
-            Z_s: torch.Tensor,  # (B, Pnn, T, 192)
-            seg_mask: torch.Tensor,  # (B, Pnn, T)
-            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)  (호출부 호환용)
+            Z_s: torch.Tensor,  # (B, Pnn, T, C)
+            seg_mask: torch.Tensor,  # (B, Pnn, T) 0/1
+            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)  (호환용, 내부에서는 seg_mask 사용)
     ) -> torch.Tensor:
-        """TCN 블록 실행.
+        """TCN 블록 실행(토큰별 packed 제거, 마스크 기반 0 고정 유지).
 
-        변경점(요청 반영):
-            - pointwise Linear(C->C)를 Conv1d(kernel=1)로 교체해
-              (B*Pnn, C, T) 형태에서 그대로 처리합니다.
-            - pre LayerNorm 및 depthwise conv 마스크 처리 로직은 기존을 유지합니다.
+        변경점:
+            - pre LayerNorm을 유효 토큰만 뽑아서 계산하던 방식을 제거.
+            - 전체를 한 번에 LayerNorm하고,
+              depthwise conv는 기존처럼 mask를 사용해 "무효 구간이 섞이지 않게" 처리.
+            - 블록 끝에서 (Z + Y) * mask 로 무효 구간을 0으로 고정(기존 유지).
 
         Args:
-            Z_s: (B,Pnn,T,C)
-            seg_mask: (B,Pnn,T) 0/1
-            seg_mask_1: (B,Pnn,T,1) (호환용, 내부에서는 seg_mask로 처리)
+            Z_s: (B, Pnn, T, C)
+            seg_mask: (B, Pnn, T) 0/1
+            seg_mask_1: (B, Pnn, T, 1)  (호환용)
 
         Returns:
-            (B,Pnn,T,C)
+            out: (B, Pnn, T, C)
         """
         B, Pnn, T, C = Z_s.shape
         B_Pnn = int(B * Pnn)
@@ -2236,61 +2209,50 @@ class FeasibleProjector(nn.Module):
         # seg_mask_bool: (B,Pnn,T)
         seg_mask_bool = self._to_bool_mask(seg_mask)
 
-        # conv/residual에 쓸 float 마스크: (B*Pnn,1,T)
-        seg_mask_float = seg_mask_bool.to(dtype=Z_s.dtype, device=Z_s.device)
+        # conv/residual에 쓸 float 마스크: (B*Pnn, 1, T)
+        seg_mask_float = seg_mask_bool.to(dtype=Z_s.dtype,
+                                          device=Z_s.device)  # (B,Pnn,T)
         seg_mask_flat = seg_mask_float.reshape(B_Pnn, int(T))  # (B*Pnn,T)
         mask_b1t = seg_mask_flat.unsqueeze(1)  # (B*Pnn,1,T)
 
-        # LN 패킹용 인덱스(한 번만 계산해서 블록들에 재사용)
-        # valid_idx: (N_valid,)
-        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
-
         # Z: (B*Pnn, C, T)
-        Z = Z_s.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)
+        Z = Z_s.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)  # (B*Pnn,C,T)
 
         for block_idx in range(self.tcn_depth):
             # (B*Pnn, T, C)
             Z_tc = Z.transpose(1, 2)
 
-            # pre LayerNorm: 유효 구간만 실행
-            Z_ln_tc = self._apply_tokenwise_module_packed(
-                x=Z_tc,  # (B*Pnn,T,C)
-                token_valid_mask=seg_mask_bool.reshape(B_Pnn, int(T)),  # (B*Pnn,T)
-                module=self.tcn_pre_lns[block_idx],
-                valid_token_flat_idx=valid_idx,
-            )  # (B*Pnn,T,C)  무효 구간은 0
+            # pre LayerNorm: 전체 한번에 계산
+            Z_ln_tc = self.tcn_pre_lns[int(block_idx)](Z_tc)  # (B*Pnn,T,C)
 
-            # depthwise conv는 전체 길이에 대해 수행 (이미 마스크 고려)
+            # depthwise conv: 기존대로 mask를 고려한 conv (무효가 섞이지 않음)
             Z_ln = Z_ln_tc.transpose(1, 2)  # (B*Pnn,C,T)
             Y = self._depthwise_conv_masked_bct(
                 x_bct=Z_ln,
                 mask_b1t=mask_b1t,
-                block_idx=block_idx,
+                block_idx=int(block_idx),
             )  # (B*Pnn,C,T)
 
             Y = F.gelu(Y)
+            Y = self.tcn_linear[int(block_idx)](Y)  # (B*Pnn,C,T)
 
-            # pointwise 1x1 Conv: (B*Pnn,C,T)에서 그대로 처리
-            Y = self.tcn_linear[block_idx](Y)  # (B*Pnn,C,T)
-
-            # Residual + 무효 구간 0 고정
+            # Residual + 무효 구간 0 고정(기존 유지)
             Z = (Z + Y) * mask_b1t
 
         out = Z.transpose(1, 2).reshape(B, Pnn, int(T), int(C))
         return out
 
-
     def _predict_delta_u(
             self,
-            Z_tcn: torch.Tensor,  # (B, Pnn, T, 192)
+            Z_tcn: torch.Tensor,  # (B, Pnn, T, C)
             seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
     ) -> torch.Tensor:
-        """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일.
+        """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일(전체 한번에 계산 + 마스크).
 
-        변경점(요청 반영):
-            - Head의 Linear들을 Conv1d(kernel=1)로 바꿨기 때문에,
-              (B*Pnn, C, T)로 만든 뒤 Conv1d로 처리합니다.
-            - 무효 구간은 seg_mask로 0 처리합니다.
+        변경점:
+            - gate_mlp를 유효 토큰만 뽑아서 계산하던 방식을 제거.
+            - (B,Pnn,T,·) 전체에 gate_mlp를 한 번에 적용한 뒤,
+              seg_mask_1로 무효 구간 출력(및 학습 신호)을 0으로 고정합니다.
 
         Args:
             Z_tcn: (B,Pnn,T,C)
@@ -2299,45 +2261,39 @@ class FeasibleProjector(nn.Module):
         Returns:
             delta_u: (B,Pnn,T,3)
         """
-        seg_mask_bool = self._to_bool_mask(seg_mask_1.squeeze(-1))  # (B,Pnn,T)
-
-        # valid_idx: (N_valid,)
-        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
-
-        if int(valid_idx.numel()) == 0:
-            B, Pnn, T, _ = Z_tcn.shape
-            return Z_tcn.new_zeros((B, Pnn, int(T), 3))
-
         B, Pnn, T, C = Z_tcn.shape
         B_Pnn = int(B * Pnn)
+
+        # seg_mask: (B,Pnn,T,1) float(0/1)
+        seg_mask = seg_mask_1.to(dtype=Z_tcn.dtype, device=Z_tcn.device)
 
         # -----------------------
         # Head: (B*Pnn, C, T) -> (B*Pnn, 3, T)
         # -----------------------
-        z_bct = Z_tcn.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)  # (B*Pnn,C,T)
+        z_bct = Z_tcn.reshape(B_Pnn, int(T), int(C)).transpose(1,
+                                                               2)  # (B*Pnn,C,T)
         delta_u_b3t = self.head(z_bct)  # (B*Pnn,3,T)
 
-        delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T), 3)  # (B,Pnn,T,3)
+        # delta_u_raw: (B,Pnn,T,3)
+        delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T), 3)
 
-        # 무효 구간은 0으로 고정
-        delta_u_raw = delta_u_raw * seg_mask_bool.unsqueeze(-1).to(dtype=delta_u_raw.dtype)
+        # 무효 구간은 0 고정
+        delta_u_raw = delta_u_raw * seg_mask
 
         # -----------------------
-        # gate_mlp: 기존대로 "유효 구간만" 계산
+        # Gate: token-wise 연산이므로 전체 한번에 계산
         # -----------------------
-        gate_logits = self._apply_tokenwise_module_packed(
-            x=Z_tcn.detach(),
-            token_valid_mask=seg_mask_bool,
-            module=self.gate_mlp,
-            valid_token_flat_idx=valid_idx,
-        )  # (B,Pnn,T,3)  무효 구간은 0
+        # gate_logits: (B,Pnn,T,3)
+        gate_logits = self.gate_mlp(Z_tcn.detach())
+
+        # 무효 구간은 0 고정 (packed 동작과 동일한 의미)
+        gate_logits = gate_logits * seg_mask
 
         gate_scale = F.softplus(gate_logits)  # (B,Pnn,T,3)
+
+        # delta_u_raw가 이미 무효 구간 0이므로 최종도 무효 구간 0
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
-
-        # delta_u_raw에서 이미 무효 구간을 0으로 만들었으므로 추가 마스킹은 불필요
         return delta_u
-
 
     def _build_per_agent_limits(
         self,
