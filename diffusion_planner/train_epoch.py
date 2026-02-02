@@ -634,6 +634,8 @@ def train_epoch(
             outputs["near_future_gt_4_dim"] = args.state_normalizer(
                 data=outputs["near_future_gt_4_dim"],
                 valid_mask=outputs["near_future_gt_is_valid"])
+            near_future_gt_4_dim = outputs["near_future_gt_4_dim"]
+            print("near_future_gt_4_dim.shape:", near_future_gt_4_dim.shape)
 
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
             """

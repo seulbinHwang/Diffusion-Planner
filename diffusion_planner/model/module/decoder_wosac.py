@@ -2911,6 +2911,7 @@ class DiT(nn.Module):
         diffusion_time_full = diffusion_time_full[:, None, :, None]
         # (B, P, past_cur_time_len + future_len, 1)
         diffusion_time_full = diffusion_time_full.expand(B, P, T_any, 1)
+        print("target_past_cur_future_valid.shape:", target_past_cur_future_valid.shape)
 
         validity = target_past_cur_future_valid[:, :,
                                                 -T_any:]  # (B,P,T_any) bool
@@ -2918,7 +2919,6 @@ class DiT(nn.Module):
         validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
             -1)  # (B,P,T_any,1) float
         print("diffusion_time_full.shape:", diffusion_time_full.shape)
-        print("validity_f.shape:", validity_f.shape)
         diffusion_time_full = diffusion_time_full * validity_f  # (B,P,T_any,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
