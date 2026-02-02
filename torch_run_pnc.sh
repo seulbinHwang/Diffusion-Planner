@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
-export CUDA_HOME="$CONDA_PREFIX"
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+#export CUDA_HOME="$CONDA_PREFIX"
+#export PATH="$CUDA_HOME/bin:$PATH"
+#export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 LOG_DIR=/mnt/nuplan/logs/$RUN_ID
 mkdir -p "$LOG_DIR"
