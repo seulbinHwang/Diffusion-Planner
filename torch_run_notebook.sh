@@ -2,10 +2,11 @@
 set -Eeuo pipefail
 export WANDB_DEBUG=1   # ← 여기 추가
 export PYTHONUNBUFFERED=1
-
-NUPLAN_PATH="/home/user/nuplan"
+#export CUDA_HOME="$CONDA_PREFIX"
+#export PATH="$CUDA_HOME/bin:$PATH"
+#export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
 RUN_ID=$(date +%Y%m%d-%H%M%S)
-LOG_DIR="${NUPLAN_PATH}/logs/$RUN_ID"
+LOG_DIR="/home/user/PycharmProjects/logs/$RUN_ID"
 mkdir -p "$LOG_DIR"
 
 # 디버그: 파이썬/CPP 스택, NCCL 조기실패
@@ -38,14 +39,17 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 # User Configuration Section
 ###################################
 RUN_PYTHON_PATH="/home/user/miniforge3/envs/diffusion_planner/bin/python"
-TRAIN_SET_PATH="${NUPLAN_PATH}/dataset/processed_rollout"
-TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
+TRAIN_SET_PATH="/home/user/nuplan/dataset/processed"
+TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_training.json"
 ###################################
-STAGE1_CFG="configs/fine_tuning1.yaml"
-
-"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
+"$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
+--nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" \
+--redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --stage_config_path "${STAGE1_CFG}" \
-  --batch_size 2 \
+  --name "wosac_final_0128" \
+  --batch_size 4 \
+  --learning_rate 3e-4 \
+  --profile_feasible True
+
