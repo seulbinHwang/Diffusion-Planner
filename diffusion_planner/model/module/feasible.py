@@ -256,7 +256,7 @@ class FeasibleProjector(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, 2 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
             nn.GELU(),
-            nn.Linear(3 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
+            nn.Linear(2 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
         )
 
         # ------------------------------
