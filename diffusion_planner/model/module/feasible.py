@@ -303,19 +303,31 @@ class FeasibleProjector(nn.Module):
 
 
         # pointwise 1x1 (시간축 보존, 채널 결합)
-        self.tcn_linear = nn.ModuleList(
-            [nn.Linear(self._C, self._C) for _ in range(self.tcn_depth)])
+        # - 기존: nn.Linear(C->C) + (B*Pnn,C,T) ↔ (B*Pnn,T,C) 변환
+        # - 변경: nn.Conv1d(C->C, kernel_size=1)로 (B*Pnn, C, T)에서 그대로 처리
+        self.tcn_linear = nn.ModuleList([
+            nn.Conv1d(
+                in_channels=self._C,
+                out_channels=self._C,
+                kernel_size=1,
+                bias=True,
+            ) for _ in range(self.tcn_depth)
+        ])
+
 
         # ------------------------------
         # Head & Gate
         # ------------------------------
         # 잔차 초안 ΔU_raw
+        # - 기존: (B,Pnn,T,C) 토큰별 Linear
+        # - 변경: (B*Pnn,C,T)에서 1x1 Conv로 처리
         self.head = nn.Sequential(
-            nn.Linear(self._C, self._C),
+            nn.Conv1d(self._C, self._C, kernel_size=1, bias=True),
             nn.GELU(),
-            nn.Linear(self._C, 3),
+            nn.Conv1d(self._C, 3, kernel_size=1, bias=True),
         )
-        # 마지막 Linear 0-init → 초기엔 U_ref ≈ U_base
+
+        # 마지막 Conv 0-init → 초기엔 U_ref ≈ U_base
         nn.init.zeros_(self.head[-1].weight)
         nn.init.zeros_(self.head[-1].bias)
         gate_hidden_dim = 64
@@ -2205,12 +2217,10 @@ class FeasibleProjector(nn.Module):
     ) -> torch.Tensor:
         """TCN 블록 실행.
 
-        변경점:
-            - depthwise conv는 그대로 둡니다.
-            - 대신, 각 블록의
-                * pre LayerNorm
-                * pointwise Linear(C->C)
-              는 유효 구간만 뽑아서 실행하고, 무효 구간은 0으로 둡니다.
+        변경점(요청 반영):
+            - pointwise Linear(C->C)를 Conv1d(kernel=1)로 교체해
+              (B*Pnn, C, T) 형태에서 그대로 처리합니다.
+            - pre LayerNorm 및 depthwise conv 마스크 처리 로직은 기존을 유지합니다.
 
         Args:
             Z_s: (B,Pnn,T,C)
@@ -2231,10 +2241,9 @@ class FeasibleProjector(nn.Module):
         seg_mask_flat = seg_mask_float.reshape(B_Pnn, int(T))  # (B*Pnn,T)
         mask_b1t = seg_mask_flat.unsqueeze(1)  # (B*Pnn,1,T)
 
-        # LN/Linear 패킹용 인덱스(한 번만 계산해서 블록들에 재사용)
+        # LN 패킹용 인덱스(한 번만 계산해서 블록들에 재사용)
         # valid_idx: (N_valid,)
-        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
-            -1)
+        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
 
         # Z: (B*Pnn, C, T)
         Z = Z_s.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)
@@ -2246,8 +2255,7 @@ class FeasibleProjector(nn.Module):
             # pre LayerNorm: 유효 구간만 실행
             Z_ln_tc = self._apply_tokenwise_module_packed(
                 x=Z_tc,  # (B*Pnn,T,C)
-                token_valid_mask=seg_mask_bool.reshape(B_Pnn, int(T)),
-                # (B*Pnn,T)
+                token_valid_mask=seg_mask_bool.reshape(B_Pnn, int(T)),  # (B*Pnn,T)
                 module=self.tcn_pre_lns[block_idx],
                 valid_token_flat_idx=valid_idx,
             )  # (B*Pnn,T,C)  무효 구간은 0
@@ -2262,23 +2270,15 @@ class FeasibleProjector(nn.Module):
 
             Y = F.gelu(Y)
 
-            # pointwise Linear(C->C): 유효 구간만 실행
-            Y_tc = Y.transpose(1, 2)  # (B*Pnn,T,C)
-            Y_tc = self._apply_tokenwise_module_packed(
-                x=Y_tc,  # (B*Pnn,T,C)
-                token_valid_mask=seg_mask_bool.reshape(B_Pnn, int(T)),
-                # (B*Pnn,T)
-                module=self.tcn_linear[block_idx],
-                valid_token_flat_idx=valid_idx,
-            )  # (B*Pnn,T,C)
-
-            Y = Y_tc.transpose(1, 2)  # (B*Pnn,C,T)
+            # pointwise 1x1 Conv: (B*Pnn,C,T)에서 그대로 처리
+            Y = self.tcn_linear[block_idx](Y)  # (B*Pnn,C,T)
 
             # Residual + 무효 구간 0 고정
             Z = (Z + Y) * mask_b1t
 
         out = Z.transpose(1, 2).reshape(B, Pnn, int(T), int(C))
         return out
+
 
     def _predict_delta_u(
             self,
@@ -2287,9 +2287,10 @@ class FeasibleProjector(nn.Module):
     ) -> torch.Tensor:
         """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일.
 
-        변경점:
-            - Head(큰 작업)와 gate_mlp(큰 작업)를 유효 구간만 뽑아서 실행합니다.
-            - 무효 구간은 계산 자체를 하지 않고 0으로 둡니다.
+        변경점(요청 반영):
+            - Head의 Linear들을 Conv1d(kernel=1)로 바꿨기 때문에,
+              (B*Pnn, C, T)로 만든 뒤 Conv1d로 처리합니다.
+            - 무효 구간은 seg_mask로 0 처리합니다.
 
         Args:
             Z_tcn: (B,Pnn,T,C)
@@ -2301,34 +2302,42 @@ class FeasibleProjector(nn.Module):
         seg_mask_bool = self._to_bool_mask(seg_mask_1.squeeze(-1))  # (B,Pnn,T)
 
         # valid_idx: (N_valid,)
-        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
-            -1)
+        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(-1)
 
         if int(valid_idx.numel()) == 0:
             B, Pnn, T, _ = Z_tcn.shape
             return Z_tcn.new_zeros((B, Pnn, int(T), 3))
 
-        # Head: 유효 구간만 실행
-        delta_u_raw = self._apply_tokenwise_module_packed(
-            x=Z_tcn,  # (B,Pnn,T,C)
-            token_valid_mask=seg_mask_bool,  # (B,Pnn,T)
-            module=self.head,
-            valid_token_flat_idx=valid_idx,
-        )  # (B,Pnn,T,3)  무효 구간은 0
+        B, Pnn, T, C = Z_tcn.shape
+        B_Pnn = int(B * Pnn)
 
-        # gate_mlp: 유효 구간만 실행 (입력은 기존대로 detach)
+        # -----------------------
+        # Head: (B*Pnn, C, T) -> (B*Pnn, 3, T)
+        # -----------------------
+        z_bct = Z_tcn.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)  # (B*Pnn,C,T)
+        delta_u_b3t = self.head(z_bct)  # (B*Pnn,3,T)
+
+        delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T), 3)  # (B,Pnn,T,3)
+
+        # 무효 구간은 0으로 고정
+        delta_u_raw = delta_u_raw * seg_mask_bool.unsqueeze(-1).to(dtype=delta_u_raw.dtype)
+
+        # -----------------------
+        # gate_mlp: 기존대로 "유효 구간만" 계산
+        # -----------------------
         gate_logits = self._apply_tokenwise_module_packed(
             x=Z_tcn.detach(),
             token_valid_mask=seg_mask_bool,
             module=self.gate_mlp,
             valid_token_flat_idx=valid_idx,
-        )  # (B,Pnn,T,3)
+        )  # (B,Pnn,T,3)  무효 구간은 0
 
         gate_scale = F.softplus(gate_logits)  # (B,Pnn,T,3)
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
 
-        # 무효 구간은 이미 0이므로 추가 곱셈은 필요 없음
+        # delta_u_raw에서 이미 무효 구간을 0으로 만들었으므로 추가 마스킹은 불필요
         return delta_u
+
 
     def _build_per_agent_limits(
         self,

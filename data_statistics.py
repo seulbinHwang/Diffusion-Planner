@@ -49,6 +49,11 @@ class DataStatistics:
                 "bin_width": 0.05,
                 "max_edge_per_class": (1.5, 1.5, 2.0),# (vehicle, pedestrian, bicycle)
             },
+            "beta_max": {
+                "bin_width": 0.01,
+                "max_edge_per_class": (1.6, 1.6, 1.6),
+                # (vehicle, pedestrian, bicycle) 1.6rad ≈ 91.6deg
+            },
         }
 
     def _get_histogram_spec(
@@ -90,6 +95,7 @@ class DataStatistics:
             "v_b_y_max": "|v_y^b| (m/s)",
             # ✅ 변경: r에서 v 대신 v_x^b 사용
             "r_min": "r = |v_x^b|/|omega| (m)",
+            "beta_max": "|beta| (rad)",
         }
         return label_map.get(metric_name, metric_name)
 
@@ -1090,7 +1096,7 @@ class DataStatistics:
             not_low_speed_seg: torch.Tensor,  # (B, agent_num, T) bool
             neighbor_agents_type: torch.Tensor,  # (B, agent_num, 3)
     ) -> None:
-        """v_b_y / v / a_lat / omega / r 을 '시간별 값 전체'로 누적합니다."""
+        """v_b_y / v / a_lat / omega / r / |beta| 을 '시간별 값 전체'로 누적합니다."""
         edge_trim = int(self.config.stats_edge_trim)
         min_valid_len = int(self.config.stats_min_valid_len)
 
@@ -1102,7 +1108,6 @@ class DataStatistics:
 
         not_low_speed_seg = not_low_speed_seg.to(torch.bool)  # (B,agent,T)
 
-        # ✅ v_x^b 추가로 분리
         v_x_b = seg_body_control[..., 0]  # (B,agent,T)
         v_y_b = seg_body_control[..., 1]  # (B,agent,T)
         omega = seg_body_control[..., 2]  # (B,agent,T)
@@ -1110,8 +1115,14 @@ class DataStatistics:
         v = torch.norm(seg_body_control[..., 0:2], dim=-1)  # (B,agent,T)
         a_lat = v * omega.abs()  # (B,agent,T)
 
-        # ✅ 변경: r = |v_x^b| / |omega|
+        # r = |v_x^b| / |omega|
         r = v_x_b.abs() / (omega.abs() + 1e-6)  # (B,agent,T)
+
+        # ✅ [NEW] |beta| = |atan2(v_y^b, |v_x^b|)|
+        beta_abs = self._compute_sideslip_angle_beta_abs_from_body_controls(
+            seg_body_control=seg_body_control,  # (B,agent,T,3)
+            eps=1.0e-6,
+        )  # (B,agent,T)
 
         # v_b_y는 저속 구간 제외
         v_b_y_mask = seg_valid_stats & not_low_speed_seg
@@ -1122,7 +1133,7 @@ class DataStatistics:
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # v는 기존 유지
+        # v
         self._accumulate_metric_from_time_series(
             metric_name="v_max",
             values_bat=v,
@@ -1130,7 +1141,7 @@ class DataStatistics:
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # a_lat는 기존 유지
+        # a_lat는 저속 제외
         a_lat_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="a_lat_max",
@@ -1139,7 +1150,7 @@ class DataStatistics:
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # omega는 기존 유지
+        # omega는 저속 제외
         omega_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="omega_max",
@@ -1148,7 +1159,7 @@ class DataStatistics:
             neighbor_agents_type=neighbor_agents_type,
         )
 
-        # r_min: ✅ r만 바뀜
+        # r_min (저속 제외)
         r_mask = seg_valid_stats & not_low_speed_seg
         self._accumulate_metric_from_time_series(
             metric_name="r_min",
@@ -1156,6 +1167,15 @@ class DataStatistics:
             mask_bat=r_mask,
             neighbor_agents_type=neighbor_agents_type,
             ignore_above=1.0e5,
+        )
+
+        # ✅ [NEW] beta_max (저속 제외)
+        beta_mask = seg_valid_stats & not_low_speed_seg
+        self._accumulate_metric_from_time_series(
+            metric_name="beta_max",
+            values_bat=beta_abs,
+            mask_bat=beta_mask,
+            neighbor_agents_type=neighbor_agents_type,
         )
 
     def _accumulate_seg_body_control_2_statistics_robust(
@@ -1226,6 +1246,51 @@ class DataStatistics:
             mask_bat=alpha_mask,  # (B,agent,T)
             neighbor_agents_type=neighbor_agents_type,
         )
+
+    @staticmethod
+    def _compute_sideslip_angle_beta_abs_from_body_controls(
+        seg_body_control: torch.Tensor,  # (B, agent_num, T, 3)
+        *,
+        eps: float = 1.0e-6,
+    ) -> torch.Tensor:
+        """세그먼트(중간점) 기준 body-frame 속도로 사이드슬립 각 |β|를 계산합니다.
+
+        β는 "heading 방향"과 "실제 이동 방향"의 차이 각도입니다.
+        body frame에서는 heading이 x축이므로, 속도 벡터 (v_x^b, v_y^b)의 방향 각도로 β를 구합니다.
+
+        계산:
+            beta = atan2(v_y^b, |v_x^b| + eps)
+            beta_abs = |beta|
+
+        주의:
+            - 정지/저속에서는 방향 각도가 의미가 약해지므로,
+              호출하는 쪽에서 저속 구간을 mask로 제외해서 통계에 넣는 것을 권장합니다.
+            - |v_x^b|를 쓰는 이유는, 후진처럼 v_x^b가 음수인 경우에도
+              "옆방향 비율" 관점에서 β가 튀지 않게 하려는 목적입니다.
+
+        Args:
+            seg_body_control (torch.Tensor): (B, agent_num, T, 3)
+                세그먼트 중간점 기준 제어/속도값.
+                - [..., 0] = v_x^b
+                - [..., 1] = v_y^b
+                - [..., 2] = omega
+            eps (float): 0으로 나누는 문제를 피하기 위한 작은 값.
+
+        Returns:
+            torch.Tensor: (B, agent_num, T) float32
+                |β| (rad)
+        """
+        if seg_body_control.dim() != 4 or seg_body_control.shape[-1] < 2:
+            raise ValueError(
+                f"seg_body_control must be (B,agent,T,3). got={tuple(seg_body_control.shape)}"
+            )
+
+        v_x_b = seg_body_control[..., 0].to(torch.float32)  # (B,agent,T)
+        v_y_b = seg_body_control[..., 1].to(torch.float32)  # (B,agent,T)
+
+        beta = torch.atan2(v_y_b, v_x_b.abs() + float(eps))  # (B,agent,T)
+        return beta.abs()
+
 
     @staticmethod
     def _percentile_values_from_histogram(
