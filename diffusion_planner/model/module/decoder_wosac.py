@@ -2591,111 +2591,140 @@ class DiT(nn.Module):
 
     def _run_dit_core_with_pram_v2(
             self,
-            target_input_norm_xT: torch.
-        Tensor,  # (B, (1+)Pnn, (time_len+ T)*6) or (B, (1+)Pnn, T*6) or (B, (1+)Pnn, (1+T)*6)
-            diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
-            cross_c: torch.Tensor,  # (B, token_num, D)
-            cross_mask: torch.Tensor,  # (B, token_num)
-            target_current_11_dim: torch.Tensor,  # (B, (1+)Pnn, 11)
-            target_current_valid: torch.Tensor,  # (B, (1+)Pnn)
-    ) -> torch.Tensor:  # (B, (1+)Pnn, _ * 4)
-        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다.
+            target_input_norm_xT: torch.Tensor,
+            diffusion_time: torch.Tensor,
+            cross_c: torch.Tensor,
+            cross_mask: torch.Tensor,
+            target_current_11_dim: torch.Tensor,
+            target_current_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다."""
+        device_type: str = target_input_norm_xT.device.type
 
-        추가로 이 구현은 다음을 보장합니다.
-          - cross_c / target_agents_route_lane_emb dtype/device를 x와 맞춰 float32 승격을 방지
-          - cross_mask / near_current_mask를 bool로 통일
-        """
         target_current_mask = ~target_current_valid.to(torch.bool)
         B, one_or_Pnn, _ = target_input_norm_xT.shape
 
         # 1) pre-proj (varlen)
-        # x: (B, (1+)Pnn, H)
-        x: torch.Tensor = self.preproj_varlen(
-            target_input_norm_xT=
-            target_input_norm_xT,  # (B, (1+)Pnn, (time_len+ T) *6) or (B, (1+)Pnn, T*6) or (B, (1+)Pnn, (1+T)*6)
-            target_current_mask=_to_bool_mask(
-                target_current_mask),  #  (B, (1+)Pnn)
-        )
+        with profile_block(
+                "DiT.preproj_varlen",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            x: torch.Tensor = self.preproj_varlen(
+                target_input_norm_xT=target_input_norm_xT,
+                target_current_mask=_to_bool_mask(target_current_mask),
+            )
+
         target_current_mask = _to_bool_mask(target_current_mask).to(
             device=x.device)
-        x = x.masked_fill(target_current_mask.unsqueeze(-1),
-                          0.0)  # (B,(1+)Pnn,H)
+        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
-        # ★ dtype/device 정렬 (매우 중요: float16/bfloat16 섞이면 float32로 승격될 수 있음)
-        cross_c = _cast_like(cross_c, x)  # (B,token_num,H)
-        cross_mask = _to_bool_mask(cross_mask).to(
-            device=x.device)  # 의미는 유지, dtype만 bool
+        # dtype/device 정렬
+        cross_c = _cast_like(cross_c, x)
+        cross_mask = _to_bool_mask(cross_mask).to(device=x.device)
 
         # 2) timestep embedding
-        # t_embedding: (B, H)
-        t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
-                                                             ref=x)
+        with profile_block(
+                "DiT._get_time_embedding",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
+                                                                 ref=x)
 
         # 3) state_token_in 준비 (현재 프레임 기반)
-        # state_token_in: (B, (1+)Pnn, H)
-        state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
-            target_cur_norm=target_current_11_dim.to(dtype=x.dtype,
-                                                     device=x.device),
-            # (B, (1+)Pnn, 11)
-            target_current_mask=target_current_mask,  # (B,(1+)Pnn)
-        )
+        with profile_block(
+                "DiT.pram_v2_state_token_encoder",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
+                target_cur_norm=target_current_11_dim.to(dtype=x.dtype,
+                                                         device=x.device),
+                target_current_mask=target_current_mask,
+            )
 
         # 4) PRAM-v2 composer + time modulation
-        """
-            delta_scale_base=delta_scale_base, # [B, (1+)Pnn, H]
-            shift_base=shift_base, # [B, (1+)Pnn, H]
-            logit_gate_base=logit_gate_base, # [B, (1+)Pnn, H]
-        """
-        composer_out = self.pram_v2_composer(
-            state_token_in=state_token_in,  # (B, (1+)Pnn, H)
-            target_current_mask=target_current_mask,  # (B,(1+)Pnn)
-        )
-        time_out = self.pram_v2_time_mod(t_embedding,
-                                        )  # TimeModulationOutputs 3개 (B,1,H)
-
-        # 5) DiT 블록 반복
-        for block_index, block in enumerate(self.blocks):
-            # Dict[PathName, ModulationTriplet]
-            pram_mods = compute_pram_v2_modulations_for_block(
-                composer_out=composer_out,
-                time_out=time_out,  # TimeModulationOutputs 3개 (B,1,H)
-                path_scalars=self.pram_v2_block_path_scalars,
-                block_index=block_index,
-                batch_size=B,
-                one_or_Pnn=one_or_Pnn,
-                hidden_dim=x.shape[-1],
-                target_current_mask=target_current_mask,  # (B,(1+)Pnn)
+        with profile_block(
+                "DiT.pram_v2_composer",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            composer_out = self.pram_v2_composer(
+                state_token_in=state_token_in,
+                target_current_mask=target_current_mask,
             )
-            x = block(
-                x=x,  # (B,(1+)Pnn,H)
-                cross_c=cross_c,
-                pram_v2_modulations=
-                pram_mods,  # Dict[PathName, ModulationTriplet]
-                target_current_mask=target_current_mask,  # (B,(1+)Pnn)
-                cross_mask=cross_mask,  # (B, token_num)
-            )
-            x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
-        # 6) feasible 에서 사용할 최종 hidden 저장
+        with profile_block(
+                "DiT.pram_v2_time_mod",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            time_out = self.pram_v2_time_mod(t_embedding)
+
+        # 5) DiT 블록 반복 (루프 전체 + 내부 1회 호출 시간)
+        with profile_block(
+                "DiT.blocks_total",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            for block_index, block in enumerate(self.blocks):
+                with profile_block(
+                        f"DiT.compute_pram_v2_modulations_for_block[{block_index}]",
+                        enabled=self.config.profile_feasible,
+                        device_type=device_type,
+                ):
+                    pram_mods = compute_pram_v2_modulations_for_block(
+                        composer_out=composer_out,
+                        time_out=time_out,
+                        path_scalars=self.pram_v2_block_path_scalars,
+                        block_index=block_index,
+                        batch_size=B,
+                        one_or_Pnn=one_or_Pnn,
+                        hidden_dim=x.shape[-1],
+                        target_current_mask=target_current_mask,
+                    )
+
+                with profile_block(
+                        f"DiT.block[{block_index}]",
+                        enabled=self.config.profile_feasible,
+                        device_type=device_type,
+                ):
+                    x = block(
+                        x=x,
+                        cross_c=cross_c,
+                        pram_v2_modulations=pram_mods,
+                        target_current_mask=target_current_mask,
+                        cross_mask=cross_mask,
+                    )
+                    x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+
+        # 6) feasible 에서 사용할 최종 hidden 저장(기존 유지)
         if getattr(self.config, "feasible_grad_to_dit", False):
             self.final_hidden_tokens = x.float()
         else:
             self.final_hidden_tokens = x.detach().clone().float()
 
         # 7) PRAM-v2 최종 레이어
-        x = apply_pram_v2_final_layer(
-            x=x,  # (B, (1+)Pnn, H)
-            composer_out=composer_out,
-            time_out=time_out,
-            final_norm=self.pram_v2_final_norm,
-            out_proj=self.pram_v2_out_proj,
-            target_current_mask=target_current_mask,  # (B,(1+)Pnn)
-            final_scalars=(
-                self.pram_v2_final_scale_scalar,
-                self.pram_v2_final_shift_scalar,
-            ),
-        )
-        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        with profile_block(
+                "DiT.apply_pram_v2_final_layer",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            x = apply_pram_v2_final_layer(
+                x=x,
+                composer_out=composer_out,
+                time_out=time_out,
+                final_norm=self.pram_v2_final_norm,
+                out_proj=self.pram_v2_out_proj,
+                target_current_mask=target_current_mask,
+                final_scalars=(
+                    self.pram_v2_final_scale_scalar,
+                    self.pram_v2_final_shift_scalar,
+                ),
+            )
+            x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+
         return x
 
     def _forward_score_branch(
@@ -2940,6 +2969,8 @@ class DiT(nn.Module):
                 - "score": score(x_t) (B, Pnn, F)
                 - "x_start": x_start 또는 feasible 보정 후 궤적 (B, Pnn, F)
         """
+        if self.config.profile_feasible:
+            print("=============[DEBUG] DiT.forward 호출 =============")
         # 현재+미래 유효 마스크 및 현재 무효 에이전트 마스크
         """ target_past_cur_future_valid: (B, (1+)Pnn, 1+past_len+future_len) bool
         target_cur_future_valid :  (B, (1+)Pnn, 1+future_len)
@@ -2964,9 +2995,15 @@ class DiT(nn.Module):
             #   target_input_norm_xT: (B, (1+)Pnn, (time_len+ T) *6)
             #   or (B, (1+)Pnn, T*6)
             #   or (B, (1+)Pnn, (1+T)*6)
-            target_input_norm_xT = self._apply_diffusion_timestep_and_validity(
-                target_input_norm_xT, diffusion_time,
-                target_past_cur_future_valid)
+            with profile_block(
+                    "DiT._apply_diffusion_timestep_and_validity",
+                    enabled=self.config.profile_feasible,
+                    device_type=device_type,
+            ):
+                target_input_norm_xT = self._apply_diffusion_timestep_and_validity(
+                    target_input_norm_xT, diffusion_time,
+                    target_past_cur_future_valid
+                )
             # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             x: torch.Tensor = self._run_dit_core_with_pram_v2(
                 target_input_norm_xT=target_input_norm_xT,  #

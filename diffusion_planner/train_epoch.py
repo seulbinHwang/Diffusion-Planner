@@ -21,6 +21,38 @@ from typing import Dict, List
 import argparse
 import torch
 # =====================================================================
+import time
+from contextlib import contextmanager
+from typing import Iterator
+
+
+@contextmanager
+def profile_block(
+    name: str,
+    enabled: bool = True,
+    device_type: str = "cuda",
+) -> Iterator[None]:
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
+
+    Args:
+        name: 출력에 사용할 블록 이름.
+        enabled: False면 측정 없이 그냥 실행.
+        device_type: "cuda"면 GPU 연산이 끝난 시점을 맞추기 위해 앞/뒤로 동기화를 수행.
+    """
+    if not enabled:
+        yield
+        return
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time: float = time.perf_counter()
+
+    yield
+
+    if device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
 
 
 def _move_batch_to_device(
@@ -643,13 +675,24 @@ def train_epoch(
                 batch_num_in_all_epoch=batch_num_in_all_epoch,
             )
 
-            total_loss: float = _backward_and_step(
-                loss_dict=loss_dict,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                args=args,
-            )
+            enable_profile: bool = bool(
+                getattr(args, "profile_feasible", False))
+            if enable_profile:
+                print("===============[PROFILE train_epoch ENABLED]===============")
+            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+
+            with profile_block(
+                    "train_epoch.train_epoch._backward_and_step",
+                    enabled=enable_profile,
+                    device_type=device_type,
+            ):
+                total_loss: float = _backward_and_step(
+                    loss_dict=loss_dict,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                )
             # 6) WD warmdown, EMA 업데이트
             _apply_weight_decay_warmdown(optimizer)
             _update_ema_if_needed(ema, model)
