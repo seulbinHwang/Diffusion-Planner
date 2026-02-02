@@ -49,7 +49,7 @@ TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_plan
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "wosac_final_0128" \
-  --batch_size 4 \
+  --batch_size 8 \
   --learning_rate 3e-4 \
   --profile_feasible True
 
