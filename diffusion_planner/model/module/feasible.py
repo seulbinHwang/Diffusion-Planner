@@ -222,7 +222,7 @@ class FeasibleProjector(nn.Module):
         self._Du: int = 16  # control adapter 출력 채널
         self._Dc: int = 32  # trunk compressor 출력 채널
         self._Din: int = self._Dx * 2 + self._Du + self._Dc  # 16+16+32+64=192
-        self._C: int = 64 #self._Din  # 메인 채널 폭(192)
+        self._C: int = 48 #self._Din  # 메인 채널 폭(192)
         self._eps: float = 1e-6
 
         # [추가 필요] L_integration 경로 차단용 플래그 (state, u_base detach)
