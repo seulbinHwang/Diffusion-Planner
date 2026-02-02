@@ -2207,6 +2207,8 @@ class Decoder(nn.Module):
             batch_size,
             one_or_Pnn,
         ) = self._prepare_target_trajectories_and_masks(inputs)
+        print("target_past_cur_future_valid.shape:", target_past_cur_future_valid.shape)
+        raise NotImplementedError("디버그용 중단")
         (
             scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask,  # (B, token_num)
@@ -2911,8 +2913,6 @@ class DiT(nn.Module):
         diffusion_time_full = diffusion_time_full[:, None, :, None]
         # (B, P, past_cur_time_len + future_len, 1)
         diffusion_time_full = diffusion_time_full.expand(B, P, T_any, 1)
-        print("target_past_cur_future_valid.shape:", target_past_cur_future_valid.shape)
-
         validity = target_past_cur_future_valid[:, :,
                                                 -T_any:]  # (B,P,T_any) bool
         validity = validity.to(device=target_input_norm_xT.device)  # 안전
@@ -2977,6 +2977,7 @@ class DiT(nn.Module):
         """ target_past_cur_future_valid: (B, (1+)Pnn, 1+past_len+future_len) bool
         target_cur_future_valid :  (B, (1+)Pnn, 1+future_len)
         target_current_valid :  (B, (1+)Pnn)
+        
         """
         target_cur_future_valid, target_current_valid = \
             self._compute_target_current_valid(
