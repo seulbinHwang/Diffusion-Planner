@@ -1056,7 +1056,7 @@ class Encoder(nn.Module):
         str, torch.Tensor]:
         """인코더 전방 패스"""
         if self.config.profile_feasible:
-            print("=============[DEBUG] Encoder.forward 호출 =============")
+            print("\n\n\n\n=============[DEBUG] Encoder.forward 호출 =============")
         self._sync_encoder_local_train_eval_mode()
         device_type: str = inputs["ego_agent_past"].device.type
 
