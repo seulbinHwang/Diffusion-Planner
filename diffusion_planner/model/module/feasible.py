@@ -2571,7 +2571,6 @@ class FeasibleProjector(nn.Module):
         if future_len == 0:
             raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
 
-        ego_class_one_hot = near_class_one_hot[:, 0, :]  # (B,1,3)
         # per-agent 제한값 (v_max, a_lat_max, R_min, ...)
         key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
             near_class_one_hot,
