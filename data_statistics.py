@@ -99,6 +99,106 @@ class DataStatistics:
         }
         return label_map.get(metric_name, metric_name)
 
+    @staticmethod
+    def _extract_unit_from_axis_label(label: str) -> Optional[str]:
+        """축 라벨 문자열에서 괄호 안의 '단위 문자열'만 뽑아냅니다.
+
+        예:
+            label="|omega| (rad/s)" -> "rad/s"
+            label="v (m/s)" -> "m/s"
+            label에 괄호가 없으면 None
+
+        Args:
+            label (str): 축 라벨 문자열.
+
+        Returns:
+            Optional[str]: 괄호 안 단위 문자열. 없으면 None.
+        """
+        if not isinstance(label, str):
+            return None
+        l = label.strip()
+        start = l.rfind("(")
+        end = l.rfind(")")
+        if start < 0 or end < 0 or end <= start:
+            return None
+        return l[start + 1:end].strip()
+
+    @staticmethod
+    def _rad_based_value_to_degree(value: float) -> float:
+        """라디안 기반 값(rad, rad/s, rad/s^2)을 도(deg) 기반 값으로 바꿉니다.
+
+        - 각도 단위에서 rad -> deg로 바꾸는 것은 항상 같은 비율(180/pi) 곱하기입니다.
+        - rad/s, rad/s^2도 마찬가지로 숫자에 같은 비율을 곱하면 deg/s, deg/s^2가 됩니다.
+
+        Args:
+            value (float): 라디안 기반 값.
+
+        Returns:
+            float: 도(deg) 기반 값.
+        """
+        return float(value) * (180.0 / math.pi)
+
+    def _format_print_value_with_degree_if_needed(
+        self,
+        *,
+        metric_name: str,
+        value: float,
+    ) -> str:
+        """출력(print)용 값 문자열을 만듭니다.
+
+        규칙:
+            - 라벨 단위에 'rad'가 포함되어 있으면:
+                "{rad값} {rad단위} ({deg값} {deg단위})"
+              형태로 rad와 deg를 같이 보여줍니다.
+            - 아니면 기존처럼 숫자만 보여줍니다.
+
+        Args:
+            metric_name (str): metric 이름.
+            value (float): 출력할 값.
+
+        Returns:
+            str: 사람이 보기 좋은 출력 문자열.
+        """
+        if not math.isfinite(float(value)):
+            return "nan"
+
+        x_label = self._get_metric_axis_label(metric_name)
+        unit = self._extract_unit_from_axis_label(x_label)
+
+        if unit is None or ("rad" not in unit):
+            return f"{float(value):.6g}"
+
+        deg_value = self._rad_based_value_to_degree(float(value))
+        deg_unit = unit.replace("rad", "deg")
+        return f"{float(value):.6g} {unit} ({deg_value:.6g} {deg_unit})"
+
+    def _get_histogram_degree_xaxis_info(
+        self,
+        metric_name: str,
+    ) -> Tuple[Optional[str], Optional[float]]:
+        """히스토그램에 '도(deg) 단위 x축'을 위쪽에 추가할지 결정합니다.
+
+        - metric 축 라벨의 단위에 'rad'가 있으면 deg 축을 같이 추가합니다.
+        - 위쪽 축 라벨은 너무 길지 않게 'deg 단위 문자열'만 사용합니다. (예: "deg/s")
+
+        Args:
+            metric_name (str): metric 이름.
+
+        Returns:
+            Tuple[Optional[str], Optional[float]]:
+                (deg_axis_label, scale)
+                - deg_axis_label: 예) "deg", "deg/s", "deg/s^2"
+                - scale: rad -> deg 변환 계수(180/pi). deg_axis_label이 None이면 scale도 None
+        """
+        x_label = self._get_metric_axis_label(metric_name)
+        unit = self._extract_unit_from_axis_label(x_label)
+        if unit is None or ("rad" not in unit):
+            return None, None
+
+        deg_unit = unit.replace("rad", "deg")
+        return deg_unit, (180.0 / math.pi)
+
+
     def _ensure_metric_histogram(
         self,
         metric_name: str,
@@ -1040,19 +1140,28 @@ class DataStatistics:
         vlines: List[Tuple[float, str]],
         out_path: str,
         y_break: float = 0.5,
+        x_secondary_label: Optional[str] = None,
+        x_secondary_scale: Optional[float] = None,
     ) -> None:
         """0~y_break 구간은 크게, y_break~100 구간은 작게 보이도록 히스토그램을 저장합니다.
 
+        추가 기능:
+            - x_secondary_label / x_secondary_scale이 주어지면,
+              위쪽에 '도(deg) 단위 x축'을 하나 더 그립니다.
+              (아래는 rad 축, 위는 deg 축)
+
         Args:
             plt: matplotlib.pyplot
-            centers: x 위치 (len=N)
-            heights_percent: y 값(%) (len=N)
-            widths: 막대 폭 (len=N)
-            x_label: x축 라벨
-            title: 제목
-            vlines: [(x, label), ...] 수직선들
-            out_path: 저장 경로
-            y_break: 끊김 기준 (기본 10%)
+            centers (List[float]): x 위치 (len=N)
+            heights_percent (List[float]): y 값(%) (len=N)
+            widths (List[float]): 막대 폭 (len=N)
+            x_label (str): 아래쪽 x축 라벨(기본 단위, 보통 rad 포함)
+            title (str): 제목
+            vlines (List[Tuple[float, str]]): [(x, label), ...] 수직선들
+            out_path (str): 저장 경로
+            y_break (float): 끊김 기준 (기본 0.5%)
+            x_secondary_label (Optional[str]): 위쪽 x축 라벨(예: "deg/s")
+            x_secondary_scale (Optional[float]): 아래 x축 값 * scale = 위쪽 x축 값
         """
         fig = plt.figure()
         gs = fig.add_gridspec(2, 1, height_ratios=[1, 5], hspace=0.05)
@@ -1067,7 +1176,7 @@ class DataStatistics:
         ax_bot.set_ylim(0.0, float(y_break))
         ax_top.set_ylim(float(y_break), 100.0)
 
-        # x tick은 아래만 보이게
+        # 아래(rad) x tick은 ax_bot만 보이게
         plt.setp(ax_top.get_xticklabels(), visible=False)
         ax_top.tick_params(axis="x", which="both", bottom=False)
 
@@ -1079,15 +1188,45 @@ class DataStatistics:
 
         ax_bot.set_xlabel(x_label)
         ax_bot.set_ylabel("Percent(%)")
-        ax_top.set_title(title)
+
+        # title은 deg 축이 있을 때 조금 더 위로 띄움(겹침 완화)
+        title_pad = 6.0
+        if (x_secondary_label is not None) and (x_secondary_scale is not None):
+            title_pad = 16.0
+        ax_top.set_title(title, pad=title_pad)
 
         # legend는 위쪽에만(중복 방지)
         if len(vlines) > 0:
             ax_top.legend(fontsize="x-small", ncol=2, loc="upper right")
 
+        # ✅ 위쪽(deg) x축 추가
+        if (x_secondary_label is not None) and (x_secondary_scale is not None):
+            scale = float(x_secondary_scale)
+
+            # 우선 secondary_xaxis를 시도하고, 안 되면 twiny로 대체
+            try:
+                secax = ax_top.secondary_xaxis(
+                    "top",
+                    functions=(
+                        lambda x: x * scale,  # rad -> deg
+                        lambda x: x / scale,  # deg -> rad
+                    ),
+                )
+                secax.set_xlabel(str(x_secondary_label), labelpad=2.0)
+            except Exception:
+                secax = ax_top.twiny()
+                x0, x1 = ax_top.get_xlim()
+                secax.set_xlim(x0 * scale, x1 * scale)
+
+                rad_ticks = ax_top.get_xticks()
+                deg_ticks = [float(t) * scale for t in rad_ticks]
+                secax.set_xticks(deg_ticks)
+                secax.set_xlabel(str(x_secondary_label), labelpad=2.0)
+
         plt.tight_layout()
         fig.savefig(out_path, dpi=150)
         plt.close(fig)
+
 
     def _accumulate_seg_body_control_statistics_robust(
             self,
@@ -1528,7 +1667,11 @@ class DataStatistics:
 
                     v = float(limit_vals[i, j].item())
                     if v == v:
-                        parts.append(f"{cls}={v:.6g}(N={n_i})")
+                        v_str = self._format_print_value_with_degree_if_needed(
+                            metric_name=metric_name,
+                            value=v,
+                        )
+                        parts.append(f"{cls}={v_str}(N={n_i})")
                     else:
                         parts.append(f"{cls}=nan(N={n_i})")
 
@@ -1578,6 +1721,7 @@ class DataStatistics:
                     out_path = os.path.join(out_dir, save_name)
 
                     x_label = self._get_metric_axis_label(metric_name)
+                    x_secondary_label, x_secondary_scale = self._get_histogram_degree_xaxis_info(metric_name)
 
                     DataStatistics._save_histogram_percent_broken_y(
                         plt=plt,
@@ -1589,6 +1733,8 @@ class DataStatistics:
                         vlines=vlines,
                         out_path=out_path,
                         y_break=0.5,
+                        x_secondary_label=x_secondary_label,
+                        x_secondary_scale=x_secondary_scale,
                     )
 
         # 누적 초기화
