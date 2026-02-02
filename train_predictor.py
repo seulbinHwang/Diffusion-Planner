@@ -632,10 +632,11 @@ def build_adamw_with_param_groups(
                 weight_decay=0.0,
             )
         except (TypeError, RuntimeError):
-            optim_obj = torch.optim.AdamW(
-                final_param_groups,
-                weight_decay=0.0,
-            )
+            raise ValueError("Fused AdamW is not supported in your PyTorch version. ")
+            # optim_obj = torch.optim.AdamW(
+            #     final_param_groups,
+            #     weight_decay=0.0,
+            # )
 
     return optim_obj, extra_nwd
 
