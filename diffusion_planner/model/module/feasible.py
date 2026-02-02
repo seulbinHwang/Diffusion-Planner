@@ -201,7 +201,7 @@ class FeasibleProjector(nn.Module):
                     R_min_m=0.00001,
                     omega_max_abs_radps=3.3,
                     v_b_y_max=1.3,
-                    beta_max_rad=0.0,  # ✅ TODO: (라디안) 통계값 넣기
+                    beta_max_rad=10.0,  # ✅ TODO: (라디안) 통계값 넣기
                 ),
             ActorClass.BICYCLE:
                 DynamicLimits(
@@ -213,7 +213,7 @@ class FeasibleProjector(nn.Module):
                     R_min_m=0.5,
                     omega_max_abs_radps=2.0,
                     v_b_y_max=1.3,
-                    beta_max_rad=0.0,  # ✅ TODO: (라디안) 통계값 넣기
+                    beta_max_rad=0.7,
 
                 ),
             ActorClass.CAR:
@@ -226,7 +226,7 @@ class FeasibleProjector(nn.Module):
                     R_min_m=4.50,
                     omega_max_abs_radps=0.9,
                     v_b_y_max=1.0,
-                    beta_max_rad=0.0,  # ✅ TODO: (라디안) 통계값 넣기
+                    beta_max_rad=0.27,
 
                 ),
         }
