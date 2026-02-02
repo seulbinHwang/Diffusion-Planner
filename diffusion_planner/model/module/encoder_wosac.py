@@ -241,7 +241,7 @@ class Encoder(nn.Module):
             time_gap=self.time_gap,
             time_min=self.time_min,
             time_max=self.time_max)
-        self.lane_encoder.enable_profile = False #bool(getattr(config, "profile_feasible", False))
+        self.lane_encoder.enable_profile = bool(getattr(config, "profile_feasible", False))
         lane_summary_num: int = int(getattr(config, "lane_summary_num", 0))
         if lane_summary_num > 0:
             self.lane_summary_pooler = LaneSummaryTokenPooler(
