@@ -332,6 +332,138 @@ class FeasibleProjector(nn.Module):
         with torch.no_grad():
             self.gate_mlp[-1].bias.fill_(b_init)
 
+
+    @staticmethod
+    def _to_bool_mask(mask: torch.Tensor) -> torch.Tensor:
+        """0/1 또는 True/False 형태의 유효 표시를 True/False로 통일합니다.
+
+        Args:
+            mask (torch.Tensor): (...,) 모양의 텐서. 값이 0/1 이거나 bool일 수 있습니다.
+
+        Returns:
+            torch.Tensor: (...,) bool 텐서.
+        """
+        if mask.dtype == torch.bool:
+            return mask
+        return mask > 0.5
+
+    @staticmethod
+    def _infer_tokenwise_module_output_dim(
+        module: nn.Module,
+        input_last_dim: int,
+    ) -> int:
+        """한 위치(한 시점)의 마지막 축 길이가, 주어진 작업을 거친 뒤 어떻게 바뀌는지 추정합니다.
+
+        - 여기서 “한 위치”는 (N, C)에서 N 중 한 줄을 의미합니다.
+        - 이 함수는 '유효 위치가 0개'인 경우에도 출력 모양을 만들기 위해 사용합니다.
+
+        Args:
+            module (nn.Module): (N, C_in) -> (N, C_out) 형태로 동작하는 작업.
+            input_last_dim (int): 입력의 마지막 축 길이(C_in).
+
+        Returns:
+            int: 출력의 마지막 축 길이(C_out).
+
+        Raises:
+            ValueError: 지원하지 않는 작업이 들어온 경우.
+        """
+        if isinstance(module, nn.Linear):
+            return int(module.out_features)
+        if isinstance(module, nn.LayerNorm):
+            return int(input_last_dim)
+        if isinstance(module, (nn.GELU, nn.ReLU, nn.SiLU, nn.Identity, nn.Dropout)):
+            return int(input_last_dim)
+
+        if isinstance(module, nn.Sequential):
+            dim = int(input_last_dim)
+            for sub in module:
+                dim = FeasibleProjector._infer_tokenwise_module_output_dim(sub, dim)
+            return dim
+
+        raise ValueError(
+            f"[FeasibleProjector] 지원하지 않는 작업 타입입니다: {type(module)}. "
+            "필요하면 _infer_tokenwise_module_output_dim에 규칙을 추가해 주세요."
+        )
+
+    def _apply_tokenwise_module_packed(
+        self,
+        x: torch.Tensor,                 # (..., C_in)
+        token_valid_mask: torch.Tensor,  # (...) bool or 0/1
+        module: nn.Module,
+        *,
+        valid_token_flat_idx: Optional[torch.Tensor] = None,  # (N_valid,)
+    ) -> torch.Tensor:
+        """유효한 위치(True)만 뽑아서 작업을 적용하고, 결과를 원래 모양으로 되돌립니다.
+
+        - x의 마지막 축(C_in)은 값의 채널(특성) 축이라고 가정합니다.
+        - token_valid_mask가 False인 위치는 결과를 항상 0으로 둡니다.
+        - 이렇게 하면 False 구간에 대해 큰 계산을 아예 하지 않습니다.
+
+        Args:
+            x (torch.Tensor):
+                shape: (..., C_in)
+            token_valid_mask (torch.Tensor):
+                shape: (...)
+                x에서 마지막 축을 뺀 모양과 같아야 합니다.
+            module (nn.Module):
+                (N, C_in) -> (N, C_out) 형태로 동작하는 작업(예: LayerNorm, Linear, MLP 등).
+            valid_token_flat_idx (Optional[torch.Tensor]):
+                shape: (N_valid,)
+                이미 구해 둔 “유효 위치”의 1차원 인덱스가 있으면 넘깁니다(중복 계산 방지).
+
+        Returns:
+            torch.Tensor:
+                shape: (..., C_out)
+                유효 위치만 계산된 값, 무효 위치는 0.
+
+        Raises:
+            ValueError: 입력 모양이 맞지 않는 경우.
+        """
+        if token_valid_mask.shape != x.shape[:-1]:
+            raise ValueError(
+                "[FeasibleProjector] token_valid_mask.shape 와 x.shape[:-1]가 다릅니다. "
+                f"token_valid_mask.shape={tuple(token_valid_mask.shape)}, x.shape={tuple(x.shape)}"
+            )
+
+        # mask_bool: (...) bool
+        mask_bool = self._to_bool_mask(token_valid_mask)
+
+        # x_flat: (N_token, C_in), mask_flat: (N_token,)
+        x_flat = x.reshape(-1, int(x.shape[-1]))
+        mask_flat = mask_bool.reshape(-1)
+
+        if valid_token_flat_idx is None:
+            valid_token_flat_idx = mask_flat.nonzero(as_tuple=False).squeeze(-1)
+
+        # 유효 위치가 하나도 없으면, 모양만 맞춰서 0 반환
+        if int(valid_token_flat_idx.numel()) == 0:
+            out_dim = self._infer_tokenwise_module_output_dim(
+                module=module,
+                input_last_dim=int(x.shape[-1]),
+            )
+            return x.new_zeros((*x.shape[:-1], int(out_dim)))
+
+        # x_valid: (N_valid, C_in)
+        x_valid = x_flat.index_select(0, valid_token_flat_idx)
+
+        # y_valid: (N_valid, C_out)
+        y_valid = module(x_valid)
+        if y_valid.dim() != 2:
+            raise ValueError(
+                "[FeasibleProjector] module 출력은 (N_valid, C_out) 2D 형태여야 합니다. "
+                f"got shape={tuple(y_valid.shape)}"
+            )
+
+        out_dim = int(y_valid.shape[-1])
+
+        # y_flat: (N_token, C_out)  (무효 위치는 0으로 유지)
+        y_flat = y_valid.new_zeros((int(x_flat.shape[0]), out_dim))
+        y_flat = y_flat.index_copy(0, valid_token_flat_idx, y_valid)
+
+        # (..., C_out)
+        y = y_flat.view(*x.shape[:-1], out_dim)
+        return y
+
     def _infer_past_future_lengths_for_downsample(
             self,
             diffusion_trajectory: torch.Tensor,  # shape: (B, Pnn, 1+T, 4)
@@ -1927,52 +2059,71 @@ class FeasibleProjector(nn.Module):
             x_fut: torch.Tensor,  # (B, Pnn, segment_len, 4)
             u_base: torch.Tensor,  # (B, Pnn, segment_len, 3)
             dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
-            points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len)
+            points_valid: torch.Tensor,  # (B, Pnn, 1+segment_len)  bool
     ) -> torch.Tensor:
-        """입력을 통일 피처 Z_in으로 변환.
+        """입력을 통일 피처 Z_in으로 변환합니다.
 
-        파이프라인:
-            prev/fut 인코딩(16) + control 어댑터(32) + trunk 압축(64) → concat(192)
+        변경점:
+            - 유효한 구간(세그먼트)만 뽑아서 encoders(값을 바꾸는 큰 작업)를 실행합니다.
+            - 무효 구간은 계산 자체를 하지 않고, 결과를 0으로 둡니다.
 
         Args:
-            x_prev (torch.Tensor): (B, Pnn, segment_len, 4)
-            x_fut (torch.Tensor): (B, Pnn, segment_len, 4)
-            u_base (torch.Tensor): (B, Pnn, segment_len, 3)
-            dit_final_hidden_tokens (torch.Tensor): (B, Pnn, H)
+            x_prev: (B, Pnn, segment_len, 4)
+            x_fut:  (B, Pnn, segment_len, 4)
+            u_base: (B, Pnn, segment_len, 3)
+            dit_final_hidden_tokens: (B, Pnn, H)
+            points_valid: (B, Pnn, 1+segment_len) bool
 
         Returns:
-            torch.Tensor: (B, Pnn, segment_len, 192)  = Z_in
+            Z_in: (B, Pnn, segment_len, 192)
         """
-        # 함수 본문 초입에 추가
-        valid = points_valid.to(x_prev.dtype)  # (B,Pnn,1+segment_len)   요망!
-        start_valid = valid[..., :-1].unsqueeze(
-            -1)  # (B,Pnn,segment_len,1)   요망!
-        end_valid = valid[..., 1:].unsqueeze(-1)  # (B,Pnn,segment_len,1)   요망!
+        # points_valid_bool: (B,Pnn,1+segment_len)
+        points_valid_bool = points_valid.to(torch.bool)
 
-        # prev/fut 노드 유효성으로 입력 자체 0화 (LN/Linear 이전 차단)
-        x_prev = x_prev * start_valid
-        x_fut = x_fut * end_valid
+        # seg_valid_bool: (B,Pnn,segment_len)  = 양 끝 노드가 모두 True인 구간
+        seg_valid_bool = points_valid_bool[..., :-1] & points_valid_bool[
+            ..., 1:]
 
-        # 세그먼트 유효성(AND)로 u_base 0화
-        seg_mask, seg_mask_1 = self._build_segment_mask(points_valid)
-        seg_mask_1 = seg_mask_1.to(u_base.dtype)
+        # 유효 구간 인덱스(한 번만 계산해서 재사용)
+        # valid_idx: (N_valid,)
+        valid_idx = seg_valid_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
+            -1)
 
+        # u_base는 필요 시 detach만 적용 (무효 구간은 pack 단계에서 애초에 계산하지 않음)
         if self.detach_u_for_ctrl_losses:
-            u_base_in = (u_base.detach()) * seg_mask_1
+            u_base_for_net = u_base.detach()
         else:
-            u_base_in = u_base * seg_mask_1
+            u_base_for_net = u_base
 
-        feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,segment_len,16)
-        feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,segment_len,16)
-        feat_u = self.control_adapter(u_base_in)  # (B,Pnn,segment_len,32)
-        # dit_final_hidden_tokens: (B,Pnn,H)
-        # trunk: (B,Pnn,64)
+        # encoders는 "유효 구간"에서만 실행
+        feat_prev = self._apply_tokenwise_module_packed(
+            x=x_prev,  # (B,Pnn,T,4)
+            token_valid_mask=seg_valid_bool,  # (B,Pnn,T)
+            module=self.state_prev_encoder,
+            valid_token_flat_idx=valid_idx,
+        )  # (B,Pnn,T,self._Dx)
+
+        feat_fut = self._apply_tokenwise_module_packed(
+            x=x_fut,  # (B,Pnn,T,4)
+            token_valid_mask=seg_valid_bool,  # (B,Pnn,T)
+            module=self.state_fut_encoder,
+            valid_token_flat_idx=valid_idx,
+        )  # (B,Pnn,T,self._Dx)
+
+        feat_u = self._apply_tokenwise_module_packed(
+            x=u_base_for_net,  # (B,Pnn,T,3)
+            token_valid_mask=seg_valid_bool,  # (B,Pnn,T)
+            module=self.control_adapter,
+            valid_token_flat_idx=valid_idx,
+        )  # (B,Pnn,T,self._Du)
+
+        # trunk: (B,Pnn,self._Dc)
         trunk = self.trunk_compressor(dit_final_hidden_tokens)
-        trunk_rep = trunk.unsqueeze(2).expand(-1, -1, x_prev.size(2),
-                                              -1)  # (B,Pnn,segment_len,64)
+        # trunk_rep: (B,Pnn,segment_len,self._Dc)
+        trunk_rep = trunk.unsqueeze(2).expand(-1, -1, int(x_prev.size(2)), -1)
 
-        Z_in = torch.cat([feat_prev, feat_fut, feat_u, trunk_rep],
-                         dim=-1)  # (B,Pnn,segment_len,192)
+        # Z_in: (B,Pnn,segment_len,192)
+        Z_in = torch.cat([feat_prev, feat_fut, feat_u, trunk_rep], dim=-1)
         return Z_in
 
     def _split_midpoint_nodes_and_controls(
@@ -2000,11 +2151,15 @@ class FeasibleProjector(nn.Module):
         return cos_all, sin_all, v_x_all, v_y_all, omega_all
 
     def _prepare_tcn_input(
-        self,
-        Z_in: torch.Tensor,       # (B, Pnn, T, 192)
-        seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
+            self,
+            Z_in: torch.Tensor,  # (B, Pnn, T, 192)
+            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
     ) -> torch.Tensor:
-        """Stem: LayerNorm → Linear → GELU 후, 무효 구간은 0으로 고정합니다.
+        """Stem 실행 후, 무효 구간은 0으로 유지합니다.
+
+        변경점:
+            - (B,Pnn,T) 중 유효 구간만 뽑아서 stem_norm/ stem_fc/ activation을 실행합니다.
+            - 무효 구간은 계산 자체를 하지 않고 0으로 둡니다.
 
         Args:
             Z_in: (B,Pnn,T,192)
@@ -2013,101 +2168,167 @@ class FeasibleProjector(nn.Module):
         Returns:
             Z_s: (B,Pnn,T,192)
         """
-        Z_s = self.stem_act(self.stem_fc(self.stem_norm(Z_in)))  # (B,Pnn,T,192)
+        # seg_mask_bool: (B,Pnn,T)
+        seg_mask_bool = self._to_bool_mask(seg_mask_1.squeeze(-1))
 
-        # [A1] dtype 섞임 방지: mask를 Z_s dtype으로 맞춘 뒤 곱한다
-        seg_mask_1 = seg_mask_1.to(dtype=Z_s.dtype, device=Z_s.device)
-        Z_s = Z_s * seg_mask_1
+        # valid_idx: (N_valid,)
+        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
+            -1)
+
+        B, Pnn, T, Din = Z_in.shape
+        total_tokens = int(B * Pnn * T)
+
+        if int(valid_idx.numel()) == 0:
+            # 유효 구간이 없으면 전부 0
+            return Z_in.new_zeros((B, Pnn, T, int(self._C)))
+
+        # Z_flat: (B*Pnn*T, Din)
+        Z_flat = Z_in.reshape(total_tokens, int(Din))
+        Z_valid = Z_flat.index_select(0, valid_idx)  # (N_valid, Din)
+
+        # stem 적용: (N_valid, Din) -> (N_valid, C)
+        Z_valid = self.stem_norm(Z_valid)
+        Z_valid = self.stem_fc(Z_valid)
+        Z_valid = self.stem_act(Z_valid)
+
+        # 원위치 복원: (B*Pnn*T, C) -> (B,Pnn,T,C)
+        Z_out_flat = Z_valid.new_zeros((total_tokens, int(Z_valid.shape[-1])))
+        Z_out_flat = Z_out_flat.index_copy(0, valid_idx, Z_valid)
+        Z_s = Z_out_flat.view(B, Pnn, T, int(Z_valid.shape[-1]))
         return Z_s
 
     def _run_tcn(
-        self,
-        Z_s: torch.Tensor,        # (B, Pnn, T, 192)
-        seg_mask: torch.Tensor,   # (B, Pnn, T)
-        seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)  (호출부 호환용, 내부에서는 seg_mask 기반으로 재구성)
+            self,
+            Z_s: torch.Tensor,  # (B, Pnn, T, 192)
+            seg_mask: torch.Tensor,  # (B, Pnn, T)
+            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)  (호출부 호환용)
     ) -> torch.Tensor:
         """TCN 블록 실행.
 
-        개선 포인트:
-            - [B1] 블록마다 (B,Pnn,T,C) ↔ (B*Pnn,C,T) 변환을 반복하지 않도록,
-              한 번만 flatten(B*Pnn)해서 내부 계산을 진행합니다.
-            - [A1] seg_mask / den 계산에 쓰는 텐서 dtype을 conv 입력 dtype과 맞춰
-              dtype 섞임으로 인한 느린 경로를 피합니다.
+        변경점:
+            - depthwise conv는 그대로 둡니다.
+            - 대신, 각 블록의
+                * pre LayerNorm
+                * pointwise Linear(C->C)
+              는 유효 구간만 뽑아서 실행하고, 무효 구간은 0으로 둡니다.
 
         Args:
             Z_s: (B,Pnn,T,C)
             seg_mask: (B,Pnn,T) 0/1
-            seg_mask_1: (B,Pnn,T,1) (호환을 위해 받지만, 내부에서는 seg_mask로 다시 만듭니다.)
+            seg_mask_1: (B,Pnn,T,1) (호환용, 내부에서는 seg_mask로 처리)
 
         Returns:
             (B,Pnn,T,C)
         """
         B, Pnn, T, C = Z_s.shape
-        B_Pnn: int = int(B * Pnn)
+        B_Pnn = int(B * Pnn)
 
-        # [A1] dtype 섞임 방지: seg_mask를 Z_s dtype으로 통일
-        seg_mask = seg_mask.to(dtype=Z_s.dtype, device=Z_s.device)
+        # seg_mask_bool: (B,Pnn,T)
+        seg_mask_bool = self._to_bool_mask(seg_mask)
 
-        # (B*Pnn, T)
-        seg_mask_flat = seg_mask.reshape(B_Pnn, T)
-        mask_b1t = seg_mask_flat.unsqueeze(1)    # (B*Pnn, 1, T)
-        mask_bt1 = seg_mask_flat.unsqueeze(-1)   # (B*Pnn, T, 1)
+        # conv/residual에 쓸 float 마스크: (B*Pnn,1,T)
+        seg_mask_float = seg_mask_bool.to(dtype=Z_s.dtype, device=Z_s.device)
+        seg_mask_flat = seg_mask_float.reshape(B_Pnn, int(T))  # (B*Pnn,T)
+        mask_b1t = seg_mask_flat.unsqueeze(1)  # (B*Pnn,1,T)
 
-        # 내부 메인 레이아웃: (B*Pnn, C, T)
-        # - flatten은 한 번만 수행
-        Z = Z_s.reshape(B_Pnn, T, C).transpose(1, 2)  # (B*Pnn, C, T)
+        # LN/Linear 패킹용 인덱스(한 번만 계산해서 블록들에 재사용)
+        # valid_idx: (N_valid,)
+        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
+            -1)
+
+        # Z: (B*Pnn, C, T)
+        Z = Z_s.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)
 
         for block_idx in range(self.tcn_depth):
-            # Pre-LN은 (B*Pnn, T, C)에서 수행
-            Z_tc = Z.transpose(1, 2)  # (B*Pnn, T, C)
-            Z_ln_tc = self.tcn_pre_lns[block_idx](Z_tc)  # (B*Pnn, T, C)
-            Z_ln_tc = Z_ln_tc * mask_bt1
+            # (B*Pnn, T, C)
+            Z_tc = Z.transpose(1, 2)
 
-            # depthwise conv는 (B*Pnn, C, T)에서 수행
-            Z_ln = Z_ln_tc.transpose(1, 2)  # (B*Pnn, C, T)
+            # pre LayerNorm: 유효 구간만 실행
+            Z_ln_tc = self._apply_tokenwise_module_packed(
+                x=Z_tc,  # (B*Pnn,T,C)
+                token_valid_mask=seg_mask_bool.reshape(B_Pnn, int(T)),
+                # (B*Pnn,T)
+                module=self.tcn_pre_lns[block_idx],
+                valid_token_flat_idx=valid_idx,
+            )  # (B*Pnn,T,C)  무효 구간은 0
+
+            # depthwise conv는 전체 길이에 대해 수행 (이미 마스크 고려)
+            Z_ln = Z_ln_tc.transpose(1, 2)  # (B*Pnn,C,T)
             Y = self._depthwise_conv_masked_bct(
                 x_bct=Z_ln,
                 mask_b1t=mask_b1t,
                 block_idx=block_idx,
-            )  # (B*Pnn, C, T)
+            )  # (B*Pnn,C,T)
 
             Y = F.gelu(Y)
 
-            # pointwise linear는 (B*Pnn, T, C)에서 수행
-            Y_tc = Y.transpose(1, 2)  # (B*Pnn, T, C)
-            Y_tc = self.tcn_linear[block_idx](Y_tc)  # (B*Pnn, T, C)
-            Y_tc = Y_tc * mask_bt1
-            Y = Y_tc.transpose(1, 2)  # (B*Pnn, C, T)
+            # pointwise Linear(C->C): 유효 구간만 실행
+            Y_tc = Y.transpose(1, 2)  # (B*Pnn,T,C)
+            Y_tc = self._apply_tokenwise_module_packed(
+                x=Y_tc,  # (B*Pnn,T,C)
+                token_valid_mask=seg_mask_bool.reshape(B_Pnn, int(T)),
+                # (B*Pnn,T)
+                module=self.tcn_linear[block_idx],
+                valid_token_flat_idx=valid_idx,
+            )  # (B*Pnn,T,C)
 
-            # Residual + mask (무효 구간 0 고정)
+            Y = Y_tc.transpose(1, 2)  # (B*Pnn,C,T)
+
+            # Residual + 무효 구간 0 고정
             Z = (Z + Y) * mask_b1t
 
-        out = Z.transpose(1, 2).reshape(B, Pnn, T, C)  # (B,Pnn,T,C)
+        out = Z.transpose(1, 2).reshape(B, Pnn, int(T), int(C))
         return out
 
     def _predict_delta_u(
-        self,
-        Z_tcn: torch.Tensor,       # (B, Pnn, T, 192)
-        seg_mask_1: torch.Tensor   # (B, Pnn, T, 1)
+            self,
+            Z_tcn: torch.Tensor,  # (B, Pnn, T, 192)
+            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
     ) -> torch.Tensor:
         """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일.
 
+        변경점:
+            - Head(큰 작업)와 gate_mlp(큰 작업)를 유효 구간만 뽑아서 실행합니다.
+            - 무효 구간은 계산 자체를 하지 않고 0으로 둡니다.
+
         Args:
-            Z_tcn: (B,Pnn,T,192)
-            seg_mask_1: (B,Pnn,T,1) 0/1
+            Z_tcn: (B,Pnn,T,C)
+            seg_mask_1: (B,Pnn,T,1)
 
         Returns:
-            delta_u: (B,Pnn,T,3) (무효 구간은 0)
+            delta_u: (B,Pnn,T,3)
         """
-        delta_u_raw = self.head(Z_tcn)  # (B,Pnn,T,3)
-        gate_scale = F.softplus(self.gate_mlp(Z_tcn.detach()))  # (B,Pnn,T,3)
+        seg_mask_bool = self._to_bool_mask(seg_mask_1.squeeze(-1))  # (B,Pnn,T)
+
+        # valid_idx: (N_valid,)
+        valid_idx = seg_mask_bool.reshape(-1).nonzero(as_tuple=False).squeeze(
+            -1)
+
+        if int(valid_idx.numel()) == 0:
+            B, Pnn, T, _ = Z_tcn.shape
+            return Z_tcn.new_zeros((B, Pnn, int(T), 3))
+
+        # Head: 유효 구간만 실행
+        delta_u_raw = self._apply_tokenwise_module_packed(
+            x=Z_tcn,  # (B,Pnn,T,C)
+            token_valid_mask=seg_mask_bool,  # (B,Pnn,T)
+            module=self.head,
+            valid_token_flat_idx=valid_idx,
+        )  # (B,Pnn,T,3)  무효 구간은 0
+
+        # gate_mlp: 유효 구간만 실행 (입력은 기존대로 detach)
+        gate_logits = self._apply_tokenwise_module_packed(
+            x=Z_tcn.detach(),
+            token_valid_mask=seg_mask_bool,
+            module=self.gate_mlp,
+            valid_token_flat_idx=valid_idx,
+        )  # (B,Pnn,T,3)
+
+        gate_scale = F.softplus(gate_logits)  # (B,Pnn,T,3)
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
 
-        # [A1] dtype 섞임 방지
-        seg_mask_1 = seg_mask_1.to(dtype=delta_u.dtype, device=delta_u.device)
-        delta_u = delta_u * seg_mask_1
+        # 무효 구간은 이미 0이므로 추가 곱셈은 필요 없음
         return delta_u
-
 
     def _build_per_agent_limits(
         self,
