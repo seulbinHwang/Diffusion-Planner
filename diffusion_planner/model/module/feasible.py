@@ -346,6 +346,10 @@ class FeasibleProjector(nn.Module):
             nn.GELU(),
             nn.Linear(gate_hidden_dim, 3),
         )
+        # Gate를 시간별이 아니라 이웃별로 계산할지 여부 (기본: True)
+        self.feasible_gate_agentwise: bool = bool(
+            getattr(self.config, "feasible_gate_agentwise", True))
+
         # gate 초기 스케일 s0 설정(보수적으로)
         s0 = 0.05
         b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
@@ -2278,24 +2282,76 @@ class FeasibleProjector(nn.Module):
         out = Z.transpose(1, 2).reshape(B, Pnn, int(T), int(C))
         return out
 
+    def _masked_time_mean(
+            self,
+            seq_bptc: torch.Tensor,  # (B, Pnn, T, C)
+            seg_mask_1: torch.Tensor,  # (B, Pnn, T, 1)  float(0/1) 또는 bool
+            *,
+            eps: float,
+    ) -> torch.Tensor:
+        """시간축 평균을 '유효 구간'만 대상으로 계산합니다.
+
+        Args:
+            seq_bptc (torch.Tensor):
+                shape: (B, Pnn, T, C)
+                시간축(T)을 가진 값입니다.
+            seg_mask_1 (torch.Tensor):
+                shape: (B, Pnn, T, 1)
+                유효 구간은 1, 무효 구간은 0인 마스크입니다.
+            eps (float):
+                0으로 나눔을 피하기 위한 작은 값입니다.
+
+        Returns:
+            torch.Tensor:
+                shape: (B, Pnn, C)
+                유효 구간만 평균낸 값입니다.
+                유효 구간이 0개인 경우는 0을 반환합니다.
+        """
+        if seq_bptc.dim() != 4:
+            raise ValueError(
+                "_masked_time_mean: seq_bptc는 (B,Pnn,T,C) 4D 텐서여야 합니다. "
+                f"got shape={tuple(seq_bptc.shape)}"
+            )
+        if seg_mask_1.dim() != 4:
+            raise ValueError(
+                "_masked_time_mean: seg_mask_1은 (B,Pnn,T,1) 4D 텐서여야 합니다. "
+                f"got shape={tuple(seg_mask_1.shape)}"
+            )
+        if seq_bptc.shape[:3] != seg_mask_1.shape[:3] or int(
+                seg_mask_1.shape[-1]) != 1:
+            raise ValueError(
+                "_masked_time_mean: seq_bptc와 seg_mask_1의 (B,Pnn,T) 또는 마지막 축이 맞지 않습니다. "
+                f"seq_bptc.shape={tuple(seq_bptc.shape)}, seg_mask_1.shape={tuple(seg_mask_1.shape)}"
+            )
+
+        mask = seg_mask_1.to(dtype=seq_bptc.dtype,
+                             device=seq_bptc.device)  # (B,Pnn,T,1)
+        seq_sum = (seq_bptc * mask).sum(dim=2)  # (B,Pnn,C)
+        count = mask.sum(dim=2).clamp_min(float(eps))  # (B,Pnn,1)
+        return seq_sum / count  # (B,Pnn,C)
+
     def _predict_delta_u(
             self,
             Z_tcn: torch.Tensor,  # (B, Pnn, T, C)
-            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1)
+            seg_mask_1: torch.Tensor,  # (B, Pnn, T, 1)
     ) -> torch.Tensor:
-        """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일(전체 한번에 계산 + 마스크).
+        """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일.
 
         변경점:
-            - gate_mlp를 유효 토큰만 뽑아서 계산하던 방식을 제거.
-            - (B,Pnn,T,·) 전체에 gate_mlp를 한 번에 적용한 뒤,
-              seg_mask_1로 무효 구간 출력(및 학습 신호)을 0으로 고정합니다.
+            - Gate를 시간마다(T) 계산하지 않고,
+              (B,Pnn,3) 한 번만 계산한 뒤 시간축으로 복사합니다.
+            - Gate 입력은 '유효 구간'만 대상으로 Z_tcn을 시간축 평균낸 값입니다.
+            - config.feasible_gate_agentwise=False 로 두면 예전 방식(시간별 Gate)로 동작합니다.
 
         Args:
-            Z_tcn: (B,Pnn,T,C)
-            seg_mask_1: (B,Pnn,T,1)
+            Z_tcn (torch.Tensor):
+                shape: (B, Pnn, T, C)
+            seg_mask_1 (torch.Tensor):
+                shape: (B, Pnn, T, 1)
 
         Returns:
-            delta_u: (B,Pnn,T,3)
+            torch.Tensor:
+                delta_u shape: (B, Pnn, T, 3)
         """
         B, Pnn, T, C = Z_tcn.shape
         B_Pnn = int(B * Pnn)
@@ -2312,22 +2368,33 @@ class FeasibleProjector(nn.Module):
 
         # delta_u_raw: (B,Pnn,T,3)
         delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T), 3)
-
-        # 무효 구간은 0 고정
-        delta_u_raw = delta_u_raw * seg_mask
+        delta_u_raw = delta_u_raw * seg_mask  # 무효 구간은 0 고정
 
         # -----------------------
-        # Gate: token-wise 연산이므로 전체 한번에 계산
+        # Gate
         # -----------------------
-        # gate_logits: (B,Pnn,T,3)
-        gate_logits = self.gate_mlp(Z_tcn.detach())
+        if bool(getattr(self, "feasible_gate_agentwise", False)):
+            # (B,Pnn,C): 유효 구간만으로 시간축 평균
+            gate_in = self._masked_time_mean(
+                seq_bptc=Z_tcn.detach(),  # (B,Pnn,T,C)
+                seg_mask_1=seg_mask,  # (B,Pnn,T,1)
+                eps=float(self._eps),
+            )
 
-        # 무효 구간은 0 고정 (packed 동작과 동일한 의미)
-        gate_logits = gate_logits * seg_mask
+            # (B,Pnn,3): 이웃별로 1번만 계산
+            gate_logits_agent = self.gate_mlp(gate_in)
+
+            # (B,Pnn,T,3): 시간축으로 복사
+            gate_logits = gate_logits_agent.unsqueeze(2).expand(-1, -1, int(T),
+                                                                -1)
+        else:
+            # 기존 방식: 시간별로 Gate 계산 (B,Pnn,T,3)
+            gate_logits = self.gate_mlp(Z_tcn.detach())
+
+        # 무효 구간은 0으로 맞춰 두기(출력은 어차피 0이지만 모양/의미를 맞춤)
+        gate_logits = gate_logits * seg_mask  # (B,Pnn,T,3)
 
         gate_scale = F.softplus(gate_logits)  # (B,Pnn,T,3)
-
-        # delta_u_raw가 이미 무효 구간 0이므로 최종도 무효 구간 0
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
         return delta_u
 
