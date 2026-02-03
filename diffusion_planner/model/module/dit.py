@@ -99,20 +99,40 @@ def scale(x, scale, only_first=False):
 
     return x
 
-
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
     """
 
-    def __init__(self, hidden_size, frequency_embedding_size=256):
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        max_period: float = 10000.0,
+    ) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
-        self.frequency_embedding_size = frequency_embedding_size
+        self.frequency_embedding_size = int(frequency_embedding_size)
+        self.max_period = float(max_period)
+
+        # -----------------------------
+        # ✅ 방법 1) freqs를 1번만 만들고 재사용 (register_buffer)
+        # -----------------------------
+        half: int = int(self.frequency_embedding_size // 2)
+        if half > 0:
+            exponent = (-math.log(self.max_period)) * (
+                torch.arange(start=0, end=half, dtype=torch.float32) / float(half)
+            )  # (half,)
+            freqs = torch.exp(exponent)  # (half,) float32
+        else:
+            freqs = torch.empty((0,), dtype=torch.float32)
+
+        # persistent=False: 체크포인트 호환(새 buffer로 인해 strict 로딩 실패) 위험 줄이기
+        self.register_buffer("_freqs", freqs, persistent=False)  # (half,)
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
@@ -124,22 +144,95 @@ class TimestepEmbedder(nn.Module):
         :param max_period: controls the minimum frequency of the embeddings.
         :return: an (N, D) Tensor of positional embeddings.
         """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        # (원본 호환 유지용: 외부에서 static 호출할 가능성 대비)
         half = dim // 2
-        freqs = torch.exp(-math.log(max_period) *
-                          torch.arange(start=0, end=half, dtype=torch.float32) /
-                          half).to(device=t.device)
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32)
+            / half
+        ).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding
 
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+    def _timestep_embedding_cached(self, t: torch.Tensor) -> torch.Tensor:
+        """시간값 t를 sin/cos 임베딩으로 바꿉니다(캐시된 freqs 사용).
+
+        Args:
+            t (torch.Tensor):
+                시간값 텐서.
+                - shape: (N,)
+                - dtype: 무관 (내부에서 float32로 계산)
+
+        Returns:
+            torch.Tensor:
+                sin/cos 임베딩.
+                - shape: (N, frequency_embedding_size)
+                - dtype: float32
+                - device: t.device
+        """
+        if t.dim() != 1:
+            raise ValueError(f"t must be 1D (N,), got {tuple(t.shape)}")
+
+        N: int = int(t.shape[0])
+        half: int = int(self.frequency_embedding_size // 2)
+
+        if half == 0:
+            # 거의 안 쓰는 케이스지만 안전하게 처리
+            return torch.zeros((N, self.frequency_embedding_size),
+                               device=t.device, dtype=torch.float32)
+
+        freqs: torch.Tensor = self._freqs
+        if freqs.device != t.device:
+            freqs = freqs.to(device=t.device)
+
+        args = t[:, None].float() * freqs[None, :]  # (N, half)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (N, 2*half)
+
+        if (self.frequency_embedding_size % 2) == 1:
+            pad = torch.zeros((N, 1), device=t.device, dtype=emb.dtype)  # (N,1)
+            emb = torch.cat([emb, pad], dim=-1)  # (N, 2*half+1)
+
+        return emb  # float32
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (B,)
+        if t.dim() != 1:
+            raise ValueError(f"t must be 1D (B,), got {tuple(t.shape)}")
+
+        B: int = int(t.shape[0])
+        if B == 0:
+            # (0, H)
+            out_dim: int = int(self.mlp[-1].out_features)
+            return torch.zeros((0, out_dim), device=t.device, dtype=torch.float32)
+
+        # -----------------------------
+        # ✅ 방법 2) 배치의 t가 전부 같은 경우: 1번만 계산 + expand
+        #   - GPU 동기화 없이 처리(마스크로 나머지만 계산)
+        # -----------------------------
+        t0 = t[:1]  # (1,)
+        same_mask = (t == t0)  # (B,) bool
+
+        # (1) 첫 값 임베딩 1회
+        t0_freq = self._timestep_embedding_cached(t0)  # (1, F)
+        t0_emb = self.mlp(t0_freq)  # (1, H)
+
+        # (2) 다른 값이 있는 샘플만 추가 계산
+        t_other = t[~same_mask]  # (N_other,)
+        if t_other.numel() == 0:
+            return t0_emb.expand(B, -1)  # (B, H)
+
+        t_other_freq = self._timestep_embedding_cached(t_other)  # (N_other, F)
+        t_other_emb = self.mlp(t_other_freq)  # (N_other, H)
+
+        out = t0_emb.expand(B, -1).clone()  # (B, H)
+        out[~same_mask] = t_other_emb
+        return out
+
 
 
 class DiTBlock(nn.Module):
