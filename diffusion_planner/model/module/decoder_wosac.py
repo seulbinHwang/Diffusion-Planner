@@ -32,7 +32,99 @@ import time
 from contextlib import contextmanager
 from typing import Iterator
 import torch
-from typing import Dict
+from typing import Tuple
+
+
+def _infer_fast_compute_dtype(reference_tensor: torch.Tensor) -> torch.dtype:
+    """모델이 실제로 계산할 때 쓸 가능성이 큰 dtype을 고릅니다.
+
+    목적:
+        - cross_c 같은 큰 텐서를 매번 fp32 -> bf16/fp16 로 복사하는 일을 줄입니다.
+        - 이미 같은 dtype이면 복사가 일어나지 않도록 합니다.
+
+    Args:
+        reference_tensor (torch.Tensor): device 확인용 기준 텐서. shape: 임의
+
+    Returns:
+        torch.dtype: 계산에 쓸 dtype
+    """
+    # GPU에서 "작은 dtype으로 계산하는 모드"가 켜져 있으면 그 dtype을 따릅니다.
+    if reference_tensor.is_cuda and torch.is_autocast_enabled():
+        try:
+            return torch.get_autocast_gpu_dtype()
+        except Exception:
+            return reference_tensor.dtype
+    return reference_tensor.dtype
+
+
+def _prepare_bool_mask_on_device(
+    mask: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """마스크를 bool + 지정 device로 정리합니다.
+
+    Args:
+        mask (torch.Tensor): (....) shape, bool 또는 0/1 float/int 가능
+        device (torch.device): 올릴 device
+
+    Returns:
+        torch.Tensor: bool 마스크, device는 지정값
+    """
+    m = _to_bool_mask(mask)
+    if m.device != device:
+        m = m.to(device=device)
+    return m
+
+
+def _prepare_cross_inputs_for_dit(
+    cross_c: torch.Tensor,        # (B, token_num, D)
+    cross_mask: torch.Tensor,     # (B, token_num) bool/0-1
+    reference_tensor: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """DiT에 넣기 전에 cross 입력(인코더 토큰/마스크)을 미리 정리합니다.
+
+    목표:
+        - DiT 내부에서 cross_c를 다시 dtype/device 변환하지 않게(복사 없게) 만들기
+        - cross_mask를 bool + 같은 device로 맞추기
+
+    Args:
+        cross_c (torch.Tensor): (B, token_num, D)
+        cross_mask (torch.Tensor): (B, token_num) bool 또는 0/1
+        reference_tensor (torch.Tensor): device/dtype 기준 텐서. shape: 임의
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            cross_c_out: (B, token_num, D)  reference_tensor와 같은 device + (가능하면) 계산 dtype
+            cross_mask_out: (B, token_num) bool + 같은 device
+    """
+    device = reference_tensor.device
+    dtype = _infer_fast_compute_dtype(reference_tensor)
+
+    # 큰 텐서는 "필요할 때만" 변환(이미 동일하면 복사 없음)
+    if cross_c.device != device or cross_c.dtype != dtype:
+        cross_c = cross_c.to(device=device, dtype=dtype)
+
+    cross_mask = _prepare_bool_mask_on_device(cross_mask, device=device)
+    return cross_c, cross_mask
+
+
+def _prepare_diffusion_time_for_dit(
+    diffusion_time: torch.Tensor,     # (B,) or (B, future_len)
+    reference_tensor: torch.Tensor,   # device 기준
+) -> torch.Tensor:
+    """diffusion_time을 DiT가 바로 쓰기 좋은 형태(device + float32)로 맞춥니다.
+
+    Args:
+        diffusion_time (torch.Tensor): (B,) 또는 (B, future_len)
+        reference_tensor (torch.Tensor): device 기준 텐서. shape: 임의
+
+    Returns:
+        torch.Tensor: diffusion_time_f32 (원 shape 유지), device는 reference_tensor.device, dtype=float32
+    """
+    if diffusion_time.device != reference_tensor.device or diffusion_time.dtype != torch.float32:
+        diffusion_time = diffusion_time.to(device=reference_tensor.device, dtype=torch.float32)
+    return diffusion_time
+
 
 
 def _ensure_tensor_on_ref(noise: torch.Tensor,
@@ -168,9 +260,18 @@ def profile_block(
 
 
 def _cast_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """ref 텐서의 dtype/device로 x를 캐스팅합니다."""
-    return x.to(dtype=ref.dtype, device=ref.device)
+    """ref 텐서의 dtype/device로 x를 맞춥니다(이미 같으면 그대로 반환).
 
+    Args:
+        x (torch.Tensor): 입력 텐서. shape: 임의
+        ref (torch.Tensor): 기준 텐서. shape: 임의
+
+    Returns:
+        torch.Tensor: x를 ref와 같은 dtype/device로 맞춘 텐서.
+    """
+    if x.device == ref.device and x.dtype == ref.dtype:
+        return x
+    return x.to(dtype=ref.dtype, device=ref.device)
 
 class Decoder(nn.Module):
 
@@ -1659,9 +1760,20 @@ class Decoder(nn.Module):
             inputs=inputs,
             target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
         )
-        # target_agents_past: (B, (1+)Pnn, time_len, 11)
-        # 2) DiT 1회 호출
-        low_t_mask: torch.Tensor = inputs["low_t_mask"]  # (B,)
+
+        # ✅ (B) diffusion_time: 미리 GPU float32로 맞춤 (DiT 내부 .to()가 no-op 되도록)
+        diffusion_time = _prepare_diffusion_time_for_dit(
+            diffusion_time=diffusion_time,  # (B,) or (B,future_len)
+            reference_tensor=xT_input_flat,  # device 기준
+        )
+
+        # ✅ (C) low_t_mask도 bool + 같은 device로 (필요하면만) 변환
+        low_t_mask_in: torch.Tensor = inputs["low_t_mask"]  # (B,) bool/0-1
+        low_t_mask: torch.Tensor = _prepare_bool_mask_on_device(
+            low_t_mask_in,
+            device=xT_input_flat.device,
+        )  # (B,) bool
+
         # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self.dit(
             target_input_norm_xT=xT_input_flat,  # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
@@ -2228,6 +2340,15 @@ class Decoder(nn.Module):
             scene_encoding_token,  # (B, token_num, D)
             scene_encoding_token_mask,  # (B, token_num)
         ) = self._unpack_encoder_outputs(encoder_outputs=encoder_outputs,)
+        # ✅ (A) cross_c / (C) cross_mask 를 DiT 호출 전에 미리 정리
+        # - training에서 작은 dtype 계산을 쓰는 경우(bf16/fp16), 여기서 맞춰 두면
+        #   DiT 내부의 _cast_like(cross_c, x)가 복사 없이 끝납니다.
+        scene_encoding_token, scene_encoding_token_mask = _prepare_cross_inputs_for_dit(
+            cross_c=scene_encoding_token,  # (B, token_num, D)
+            cross_mask=scene_encoding_token_mask,  # (B, token_num)
+            reference_tensor=target_agents_past,  # device/dtype 기준
+        )
+
 
         if self.training:
             return self._forward_training_mode(
