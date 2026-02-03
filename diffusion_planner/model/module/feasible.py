@@ -290,7 +290,11 @@ class FeasibleProjector(nn.Module):
         ])
         # key: (block_idx, device, dtype)
         self._tcn_den_ones_kernel_cache: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
-
+        # [NEW] den(=커널이 보는 위치 중 유효한 개수) 계산을 conv 없이 하기 위한 캐시
+        # key: (kernel_size, dilation, padding, T, device) -> positions_kT (k, T) long
+        self._tcn_den_positions_cache: Dict[
+            Tuple[int, int, int, int, torch.device], torch.Tensor
+        ] = {}
         # 블록마다 kernel_size가 달라질 수 있는 형태를 대비해 "블록별 base 텐서"로 저장
         for block_idx in range(self.tcn_depth):
             self.register_buffer(
@@ -1057,15 +1061,6 @@ class FeasibleProjector(nn.Module):
         if not self.use_feasible_filter:
             return vx_b_raw, vy_b_raw, omega_raw
 
-        # vx_after, vy_after = self._apply_S0_nonholonomic_ste(
-        #     vx_b=vx_b_raw,
-        #     vy_b=vy_b_raw,
-        #     v_b_y_max=key_to_limit_bp["v_b_y_max"],  # ✅ 여기로 대체
-        #     eta=hp.eta_slip,
-        #     eps=hp.eps,
-        #     is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
-        # )
-
         # ✅ 추가: 사이드슬립 각(β) 상한 → v_y^b만 줄이기
         vx_after, vy_after = self._apply_S0_sideslip_angle_limit_ste(
             vx_b=vx_b_raw,
@@ -1083,6 +1078,7 @@ class FeasibleProjector(nn.Module):
             eta=hp.eta_speed,
             eps=hp.eps,
         )
+
 
         omega_after = self._apply_S3_omega_clip_ste(
             vx_b=vx_after,
@@ -1897,6 +1893,166 @@ class FeasibleProjector(nn.Module):
         omega_mid = u_mid[..., 2]
         return v_x_mid_w, v_y_mid_w, omega_mid
 
+    def _get_tcn_dilated_positions_kT(
+            self,
+            *,
+            kernel_size: int,
+            dilation: int,
+            padding: int,
+            sequence_length: int,
+            device: torch.device,
+    ) -> torch.Tensor:
+        """(den 계산용) 각 시점 t에서 '커널이 참조하는 입력 위치' 표를 만든다.
+
+        Args:
+            kernel_size (int): 한 번에 보는 길이 k.
+            dilation (int): 간격 d. (예: 2면 2칸씩 건너뜀)
+            padding (int): 양쪽에 0을 붙이는 길이 p.
+            sequence_length (int): 시간 길이 T.
+            device (torch.device): 텐서를 만들 디바이스.
+
+        Returns:
+            torch.Tensor:
+                positions_kT: (k, T) long
+                    positions_kT[i, t] = t + (i * dilation) - padding
+
+        Notes:
+            - 이 값은 mask가 0/1일 때, 기존 den = conv1d(mask, ones, dilation, padding)과
+              **동일한 위치들을** 참조한다.
+            - dtype과 무관한 long 텐서라 캐시에 저장해 재사용한다.
+        """
+        k = int(kernel_size)
+        d = int(dilation)
+        p = int(padding)
+        T = int(sequence_length)
+
+        key = (k, d, p, T, device)
+        cached = self._tcn_den_positions_cache.get(key, None)
+        if cached is not None:
+            return cached
+
+        # offsets: (k,) = [0*d - p, 1*d - p, ..., (k-1)*d - p]
+        offsets = torch.arange(k, device=device,
+                               dtype=torch.long) * d - p  # (k,)
+
+        # t_index: (T,) = [0, 1, ..., T-1]
+        t_index = torch.arange(T, device=device, dtype=torch.long)  # (T,)
+
+        # positions_kT: (k, T)
+        positions_kT = offsets.unsqueeze(1) + t_index.unsqueeze(0)
+
+        self._tcn_den_positions_cache[key] = positions_kT
+        return positions_kT
+
+    def _compute_den_from_contiguous_mask_b1t(
+            self,
+            mask_b1t: torch.Tensor,  # (N, 1, T) float(0/1) 또는 bool
+            *,
+            kernel_size: int,
+            dilation: int,
+            padding: int,
+    ) -> torch.Tensor:
+        """마스크가 '한 덩어리(0*1*0*)'라는 가정 하에 den을 conv 없이 계산한다.
+
+        Args:
+            mask_b1t (torch.Tensor):
+                shape: (N, 1, T)
+                값은 0/1 (또는 bool) 이어야 한다.
+            kernel_size (int): k
+            dilation (int): d
+            padding (int): p
+
+        Returns:
+            torch.Tensor:
+                den_b1t: (N, 1, T), dtype=mask_b1t.dtype
+                각 시점 t에서, 커널이 참조하는 위치들 중 mask==1인 개수.
+
+        Raises:
+            ValueError:
+                (디버그 모드에서) mask에 구멍(1→0→1)이 있으면 에러.
+                이 경우는 '한 덩어리' 가정이 깨져서 결과가 달라질 수 있다.
+        """
+        if mask_b1t.numel() == 0:
+            return mask_b1t
+
+        if mask_b1t.dim() != 3 or int(mask_b1t.shape[1]) != 1:
+            raise ValueError(
+                "_compute_den_from_contiguous_mask_b1t: mask_b1t는 (N,1,T)여야 합니다. "
+                f"got shape={tuple(mask_b1t.shape)}"
+            )
+
+        N = int(mask_b1t.shape[0])
+        T = int(mask_b1t.shape[2])
+
+        # mask_bool: (N, T)
+        mask_bool = (mask_b1t.squeeze(
+            1) > 0.5) if mask_b1t.dtype != torch.bool else mask_b1t.squeeze(1)
+
+        # has_any: (N,)  -> 마스크가 1을 하나라도 갖는지
+        has_any = mask_bool.any(dim=-1)  # (N,)
+
+        # start/end: (N,) long
+        # - start: 첫 1의 위치
+        # - end:   마지막 1의 위치
+        mask_int = mask_bool.to(torch.int8)  # (N, T)
+
+        start = torch.argmax(mask_int, dim=-1)  # (N,)  all-zero면 0이 나옴
+        end_from_right = torch.argmax(torch.flip(mask_int, dims=[-1]),
+                                      dim=-1)  # (N,)
+        end = (T - 1) - end_from_right  # (N,) all-zero면 T-1이 나옴
+
+        # all-zero 행 처리: start=0, end=-1 로 만들어서 span이 비게 함
+        start = torch.where(has_any, start, torch.zeros_like(start))
+        end = torch.where(has_any, end, torch.full_like(end, -1))
+
+        # (선택/권장) 디버그 모드에서만 “한 덩어리(구멍 없음)” 검증
+        if bool(getattr(self, "feasible_debug_check_mask", False)):
+            # mask_sum: (N,)  실제 1의 개수
+            mask_sum = mask_int.sum(dim=-1).to(torch.long)  # (N,)
+            # span_len: (N,)  start~end 길이 (all-zero면 0)
+            span_len = (end.to(torch.long) - start.to(
+                torch.long) + 1).clamp_min(0)
+
+            bad = has_any & (mask_sum != span_len)
+            if bool(bad.any()):
+                bad_idx = bad.nonzero(as_tuple=False).squeeze(-1)
+                max_show = min(int(bad_idx.numel()), 8)
+                sample = bad_idx[:max_show].tolist()
+                raise ValueError(
+                    "[_compute_den_from_contiguous_mask_b1t] mask가 '한 덩어리(0*1*0*)' 형태가 아닙니다. "
+                    "즉, 1→0→1 같은 구멍이 있습니다. "
+                    f"예시 row idx={sample} (N={N}, T={T})."
+                )
+
+        # positions_kT: (k, T) long
+        positions_kT = self._get_tcn_dilated_positions_kT(
+            kernel_size=int(kernel_size),
+            dilation=int(dilation),
+            padding=int(padding),
+            sequence_length=int(T),
+            device=mask_b1t.device,
+        )
+
+        # start/end broadcast:
+        # start_nt11: (N,1,1), end_nt11: (N,1,1)
+        start_nt11 = start.to(dtype=torch.long, device=mask_b1t.device).view(N,
+                                                                             1,
+                                                                             1)
+        end_nt11 = end.to(dtype=torch.long, device=mask_b1t.device).view(N, 1,
+                                                                         1)
+
+        # pos_1kT: (1, k, T)
+        pos_1kT = positions_kT.view(1, int(kernel_size), T)
+
+        # in_range: (N, k, T) bool
+        in_range = (pos_1kT >= start_nt11) & (pos_1kT <= end_nt11)
+
+        # den_nt: (N, T) -> (N,1,T)
+        den_nt = in_range.sum(dim=1).to(dtype=mask_b1t.dtype)  # (N,T)
+        den_b1t = den_nt.unsqueeze(1)  # (N,1,T)
+
+        return den_b1t
+
     def _get_tcn_den_ones_kernel(
         self,
         block_idx: int,
@@ -1937,23 +2093,24 @@ class FeasibleProjector(nn.Module):
         return kernel
 
     def _depthwise_conv_masked_bct(
-        self,
-        x_bct: torch.Tensor,      # (B*Pnn, C, T)
-        mask_b1t: torch.Tensor,   # (B*Pnn, 1, T)  float(0/1)
-        block_idx: int,
+            self,
+            x_bct: torch.Tensor,  # (B*Pnn, C, T)
+            mask_b1t: torch.Tensor,  # (B*Pnn, 1, T)  float(0/1) 또는 bool
+            block_idx: int,
     ) -> torch.Tensor:
         """마스크를 고려한 depthwise conv을 (B*Pnn, C, T) 형태에서 수행합니다.
 
-        계산 방식:
-            - 분자: depthwise_conv(x * mask)
-            - 분모: conv1d(mask, ones_kernel)  (커널 안 유효 샘플 수)
-            - 출력: 분자 / max(분모, eps)
+        변경점(요청 반영):
+            - 분모 den을 구할 때, 기존에는 conv1d(mask, ones)를 한 번 더 돌렸습니다.
+            - 이제는 mask가 '한 덩어리(0*1*0*)'라는 가정 하에,
+              커널이 보는 위치들을 정수로 계산해서 den을 만듭니다.
+            - 따라서 블록당 conv는 1번(분자)만 실행됩니다.
 
         Args:
             x_bct:
                 shape (B*Pnn, C, T)
             mask_b1t:
-                shape (B*Pnn, 1, T), 값 0 또는 1
+                shape (B*Pnn, 1, T), 값 0/1 또는 bool
             block_idx:
                 사용할 depthwise conv 블록 인덱스
 
@@ -1966,30 +2123,31 @@ class FeasibleProjector(nn.Module):
 
         conv = self.tcn_dw[int(block_idx)]
 
-        # [A1] dtype 섞임 방지: mask를 x dtype으로 맞춘다
+        # dtype/device 정렬
         mask = mask_b1t.to(dtype=x_bct.dtype, device=x_bct.device)
 
-        # 분자
+        # -----------------
+        # 분자: conv(x * mask)
+        # -----------------
         y_num = conv(x_bct * mask)  # (B*Pnn, C, T)
 
-        # 분모
+        # -----------------
+        # 분모: den (conv 없이 계산)
+        # -----------------
         k = int(conv.kernel_size[0])
         pad = int(conv.padding[0])
         dil = int(conv.dilation[0])
 
-        ones = self._get_tcn_den_ones_kernel(
-            int(block_idx),
-            device=x_bct.device,
-            dtype=x_bct.dtype,
-        )  # (1,1,self._kernel_size)
+        den = self._compute_den_from_contiguous_mask_b1t(
+            mask_b1t=mask,  # (B*Pnn, 1, T)
+            kernel_size=k,
+            dilation=dil,
+            padding=pad,
+        )  # (B*Pnn, 1, T)
 
-        # 혹시 커널 크기가 달라진 경우(설계 변경 등) 안전 처리
-        if int(ones.shape[-1]) != k:
-            ones = torch.ones((1, 1, k), device=x_bct.device, dtype=x_bct.dtype)
-
-        den = F.conv1d(mask, ones, padding=pad, dilation=dil)  # (B*Pnn, 1, T)
-
+        # -----------------
         # 정규화
+        # -----------------
         y = y_num / den.clamp_min(self._eps)  # (B*Pnn, C, T)
         return y
 
@@ -2812,15 +2970,6 @@ class FeasibleProjector(nn.Module):
         apply_S2: bool = True,
         apply_S4_ax: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # (S0)
-        # vx_b_k, vy_b_k = self._apply_S0_nonholonomic_ste(
-        #     vx_b=vx_b_k,
-        #     vy_b=vy_b_k,
-        #     v_b_y_max=key_to_limit_bp["v_b_y_max"],  # ✅ 여기로 대체
-        #     eta=hp.eta_slip,
-        #     eps=hp.eps,
-        #     is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
-        # )
         # ✅ 추가: 사이드슬립 각(β) 상한 → v_y^b만 줄이기
         vx_b_k, vy_b_k = self._apply_S0_sideslip_angle_limit_ste(
             vx_b=vx_b_k,

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # file: diffusion_planner/model/module/pram_v2.py
 from __future__ import annotations
-
+from flash_attn.bert_padding import unpad_input, pad_input
+import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Literal
 
@@ -16,52 +17,17 @@ PathName = Literal["SA", "FFN", "CA"]
 class PRAMV2StateTokenEncoder(nn.Module):
     """현재 프레임 상태를 더 풍부한 토큰으로 바꿉니다(그룹별 처리 후 합치기).
 
-    이 버전은 입력을 성격별로 나눠서 각각 따로 처리한 뒤 합칩니다.
+    변경점(성능)
+    ----------
+    1) target_current_mask=True(무효/패딩) 에이전트는 아예 계산에서 제외합니다.
+       - 유효 에이전트만 unpad_input으로 뽑아서 계산
+       - 결과를 pad_input으로 원래 자리로 되돌림
+       - 무효 에이전트 결과는 자동으로 0이 됩니다.
 
-    - 위치 그룹: (x, y)
-    - 방향 그룹: (cos, sin)  (길이를 1로 정리한 뒤 사용)
-    - 크기 그룹: (w, l)
-    - 종류 그룹: type_one_hot[3]
-
-    Args:
-        hidden_dim (int):
-            최종 출력 토큰의 마지막 차원 크기 D.
-        branch_hidden_dim (Optional[int]):
-            (x,y)와 (cos,sin) 그룹 전용 작은 네트워크의 중간 크기.
-            None이면 hidden_dim//2 를 사용합니다.
-        branch_out_dim (Optional[int]):
-            각 그룹 전용 작은 네트워크의 출력 크기.
-            None이면 max(16, hidden_dim//3) 을 사용합니다.
-            (그룹 출력 크기는 동일해야 원소별 곱을 만들 수 있습니다.)
-        size_type_hidden_dim (Optional[int]):
-            (w,l) / type 그룹 전용 작은 네트워크의 중간 크기.
-            None이면 branch_hidden_dim보다 작게 자동 설정합니다(파라미터 2~3배 목표 유지).
-        fuse_hidden_dim (Optional[int]):
-            합친 뒤 최종으로 섞는 작은 네트워크의 중간 크기.
-            None이면 branch_out_dim 을 사용합니다.
-        use_rmsnorm (bool):
-            입력값을 “크기 기준”으로 정리할지 여부입니다.
-            True면 각 그룹 입력을 간단히 정리한 뒤 네트워크에 넣습니다.
-        zero_init_last (bool):
-            마지막 합치기 네트워크의 마지막 선형을 0으로 초기화할지 여부입니다.
-            주의: 이 프로젝트에서는 state_token_in이 전부 0이면 무효로 판정될 수 있어,
-            기본 False가 안전합니다.
-
-    Inputs:
-        target_cur_norm (torch.Tensor):
-            현재 프레임 상태.
-            shape: (B, (1+)Pnn, 11)
-            채널 의미(현재 코드 기준):
-              0: x, 1: y, 2: cos, 3: sin, 4: vx, 5: vy, 6: w, 7: l, 8~10: type one-hot
-            여기서는 속도(vx,vy)는 사용하지 않습니다.
-        target_current_mask (torch.Tensor):
-            True면 무효(패딩) 에이전트.
-            shape: (B, (1+)Pnn)
-
-    Returns:
-        torch.Tensor:
-            state_token_in
-            shape: (B, (1+)Pnn, D)
+    2) xy/heading/size/type 4개 작은 MLP를 "블록 대각선"으로 묶어
+       fc1 1번 + fc2 1번 호출로 수학적으로 동일하게 계산합니다.
+       - 훈련: torch.block_diag로 매번 구성(그래디언트 정상 전파)
+       - 추론(eval): 한 번 만든 가중치를 캐시해서 재사용
     """
 
     def __init__(
@@ -79,18 +45,21 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
         b_hidden: int = self._default_branch_hidden_dim(
             hidden_dim=self.hidden_dim, branch_hidden_dim=branch_hidden_dim)
-        b_out: int = self._default_branch_out_dim(hidden_dim=self.hidden_dim,
-                                                  branch_out_dim=branch_out_dim)
+        b_out: int = self._default_branch_out_dim(
+            hidden_dim=self.hidden_dim, branch_out_dim=branch_out_dim)
         st_hidden: int = self._default_size_type_hidden_dim(
-            branch_hidden_dim=b_hidden,
-            size_type_hidden_dim=size_type_hidden_dim)
+            branch_hidden_dim=b_hidden, size_type_hidden_dim=size_type_hidden_dim)
         f_hidden: int = self._default_fuse_hidden_dim(
             branch_out_dim=b_out, fuse_hidden_dim=fuse_hidden_dim)
 
-        self.branch_hidden_dim = b_hidden
-        self.branch_out_dim = b_out
-        self.size_type_hidden_dim = st_hidden
-        self.fuse_hidden_dim = f_hidden
+        self.branch_hidden_dim = int(b_hidden)
+        self.branch_out_dim = int(b_out)
+        self.size_type_hidden_dim = int(st_hidden)
+        self.fuse_hidden_dim = int(f_hidden)
+
+        # 옵션: 필요하면 외부에서 False로 꺼도 됩니다.
+        self.enable_varlen_unpad: bool = True
+        self.enable_fused_group_mlp: bool = True  # 4개 MLP -> 블록대각선 1회 호출
 
         # 그룹별 입력 정리(학습 파라미터 없음)
         self.xy_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
@@ -98,7 +67,7 @@ class PRAMV2StateTokenEncoder(nn.Module):
         self.size_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
         self.type_norm = RMSNormNoParam() if use_rmsnorm else nn.Identity()
 
-        # 그룹별 전용 작은 네트워크
+        # 그룹별 전용 작은 네트워크(파라미터는 그대로 유지: 기존 체크포인트 호환에 유리)
         self.xy_mlp = Mlp(
             in_features=2,
             hidden_features=self.branch_hidden_dim,
@@ -113,8 +82,6 @@ class PRAMV2StateTokenEncoder(nn.Module):
             act_layer=nn.GELU,
             drop=0.0,
         )
-
-        # ✅ (요청 반영) 크기(w,l)와 type(3)을 분리
         self.size_mlp = Mlp(
             in_features=2,  # (w, l)
             hidden_features=self.size_type_hidden_dim,
@@ -131,8 +98,6 @@ class PRAMV2StateTokenEncoder(nn.Module):
         )
 
         # 합치기 네트워크
-        # 입력은 6개 묶음:
-        #   [xy, heading, shape, xy*heading, heading*shape, shape*xy]
         fuse_in_dim: int = int(self.branch_out_dim * 6)
         self.fuse_mlp = Mlp(
             in_features=fuse_in_dim,
@@ -141,241 +106,402 @@ class PRAMV2StateTokenEncoder(nn.Module):
             act_layer=nn.GELU,
             drop=0.0,
         )
-
         if zero_init_last:
             nn.init.zeros_(self.fuse_mlp.fc2.weight)
             nn.init.zeros_(self.fuse_mlp.fc2.bias)
 
+        # --- eval용 캐시(블록대각선 가중치) ---
+        # persistent=False: state_dict에 저장하지 않음(로드/세이브 영향 최소화)
+        self.register_buffer("_fused_fc1_w", torch.empty(0), persistent=False)
+        self.register_buffer("_fused_fc1_b", torch.empty(0), persistent=False)
+        self.register_buffer("_fused_fc2_w", torch.empty(0), persistent=False)
+        self.register_buffer("_fused_fc2_b", torch.empty(0), persistent=False)
+
     @staticmethod
-    def _default_branch_hidden_dim(
-        hidden_dim: int,
-        branch_hidden_dim: Optional[int],
-    ) -> int:
-        """(x,y)/(cos,sin) 그룹 전용 네트워크의 중간 크기를 정합니다.
-
-        Args:
-            hidden_dim (int): 최종 출력 크기 D.
-            branch_hidden_dim (Optional[int]): 사용자가 지정한 값 또는 None.
-
-        Returns:
-            int: 중간 크기.
-        """
+    def _default_branch_hidden_dim(hidden_dim: int,
+                                  branch_hidden_dim: Optional[int]) -> int:
         if branch_hidden_dim is not None:
             return int(branch_hidden_dim)
         return max(32, int(hidden_dim // 2))
 
     @staticmethod
-    def _default_branch_out_dim(
-        hidden_dim: int,
-        branch_out_dim: Optional[int],
-    ) -> int:
-        """그룹 전용 네트워크의 출력 크기를 정합니다.
-
-        Args:
-            hidden_dim (int): 최종 출력 크기 D.
-            branch_out_dim (Optional[int]): 사용자가 지정한 값 또는 None.
-
-        Returns:
-            int: 출력 크기.
-        """
+    def _default_branch_out_dim(hidden_dim: int,
+                               branch_out_dim: Optional[int]) -> int:
         if branch_out_dim is not None:
             return int(branch_out_dim)
         return max(16, int(hidden_dim // 3))
 
     @staticmethod
-    def _default_size_type_hidden_dim(
-        branch_hidden_dim: int,
-        size_type_hidden_dim: Optional[int],
-    ) -> int:
-        """(w,l) / type 그룹 전용 네트워크의 중간 크기를 정합니다.
-
-        기본 목표:
-            - 분리로 인해 파라미터가 과하게 늘지 않도록,
-              branch_hidden_dim보다 작게 자동 설정합니다.
-
-        Args:
-            branch_hidden_dim (int): (x,y)/(cos,sin) 그룹의 중간 크기.
-            size_type_hidden_dim (Optional[int]): 사용자가 지정한 값 또는 None.
-
-        Returns:
-            int: (w,l) / type 그룹 전용 중간 크기.
-        """
+    def _default_size_type_hidden_dim(branch_hidden_dim: int,
+                                     size_type_hidden_dim: Optional[int]) -> int:
         if size_type_hidden_dim is not None:
             return int(size_type_hidden_dim)
-        # 기본: branch_hidden_dim * 5/8 (예: 96 -> 60), 최소 32
         return max(32, int(branch_hidden_dim * 5 // 8))
 
     @staticmethod
-    def _default_fuse_hidden_dim(
-        branch_out_dim: int,
-        fuse_hidden_dim: Optional[int],
-    ) -> int:
-        """합치기 네트워크의 중간 크기를 정합니다.
-
-        Args:
-            branch_out_dim (int): 그룹 전용 네트워크 출력 크기.
-            fuse_hidden_dim (Optional[int]): 사용자가 지정한 값 또는 None.
-
-        Returns:
-            int: 합치기 네트워크 중간 크기.
-        """
+    def _default_fuse_hidden_dim(branch_out_dim: int,
+                                fuse_hidden_dim: Optional[int]) -> int:
         if fuse_hidden_dim is not None:
             return int(fuse_hidden_dim)
         return int(branch_out_dim)
 
     @staticmethod
-    def _normalize_cos_sin(
-        cos_sin: torch.Tensor,  # (B, P, 2)
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
+    def _normalize_cos_sin(cos_sin: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         """(cos, sin)의 길이를 1로 정리합니다.
 
         Args:
-            cos_sin (torch.Tensor):
-                방향 정보.
-                shape: (B, P, 2)
-            eps (float):
-                0에 가까운 경우 나눗셈이 불안정해지는 것을 막기 위한 값.
+            cos_sin (torch.Tensor): 방향 정보
+                - shape: (..., 2)
+            eps (float): 0 나눗셈 방지
 
         Returns:
             torch.Tensor:
-                길이가 1로 정리된 (cos, sin).
-                shape: (B, P, 2)
+                - shape: (..., 2)
         """
-        raw_norm: torch.Tensor = torch.linalg.norm(cos_sin,
-                                                   dim=-1,
-                                                   keepdim=True)  # (B, P, 1)
-        safe_norm: torch.Tensor = raw_norm.clamp_min(float(eps))  # (B, P, 1)
-        normalized: torch.Tensor = cos_sin / safe_norm  # (B, P, 2)
+        raw_norm: torch.Tensor = torch.linalg.norm(cos_sin, dim=-1, keepdim=True)  # (..., 1)
+        safe_norm: torch.Tensor = raw_norm.clamp_min(float(eps))
+        normalized: torch.Tensor = cos_sin / safe_norm
 
         ones: torch.Tensor = torch.ones_like(normalized[..., :1])
         zeros: torch.Tensor = torch.zeros_like(normalized[..., :1])
-        fallback: torch.Tensor = torch.cat([ones, zeros], dim=-1)  # (B, P, 2)
+        fallback: torch.Tensor = torch.cat([ones, zeros], dim=-1)  # (..., 2)
 
-        too_small: torch.Tensor = (raw_norm < float(eps))  # (B, P, 1)
+        too_small: torch.Tensor = (raw_norm < float(eps))
         normalized = torch.where(too_small, fallback, normalized)
         return normalized
 
-    @staticmethod
-    def _mask_zero(
-            x: torch.Tensor,  # (B, P, D)
-            mask: torch.Tensor,  # (B, P)
-    ) -> torch.Tensor:
-        """무효(패딩) 위치를 0으로 만듭니다.
-
-        Args:
-            x (torch.Tensor):
-                입력 텐서.
-                shape: (B, P, D)
-            mask (torch.Tensor):
-                True면 무효.
-                shape: (B, P)
-
-        Returns:
-            torch.Tensor:
-                무효 위치가 0으로 정리된 텐서.
-                shape: (B, P, D)
-        """
-        mask_bool: torch.Tensor = mask.to(dtype=torch.bool)  # (B, P)
-        return x.masked_fill(mask_bool.unsqueeze(-1), 0.0)
-
     def _split_groups(
         self,
-        target_cur_norm: torch.Tensor,  # (B, P, 11)
+        target_cur_norm: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """입력을 (x,y)/(cos,sin)/(w,l)/type으로 나눕니다.
 
         Args:
             target_cur_norm (torch.Tensor):
-                현재 프레임 상태.
-                shape: (B, P, 11)
+                - shape: (..., 11)
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-                - xy: (B, P, 2)
-                - cos_sin: (B, P, 2)
-                - size_wl: (B, P, 2) = (w, l)
-                - type_one_hot: (B, P, 3)
+            xy:          (..., 2)
+            cos_sin:      (..., 2)
+            size_wl:      (..., 2)
+            type_one_hot: (..., 3)
         """
-        xy: torch.Tensor = target_cur_norm[..., 0:2]  # (B, P, 2)
-        cos_sin: torch.Tensor = target_cur_norm[..., 2:4]  # (B, P, 2)
-        size_wl: torch.Tensor = target_cur_norm[..., 6:8]  # (B, P, 2)
-        type_one_hot: torch.Tensor = target_cur_norm[..., 8:11]  # (B, P, 3)
+        xy: torch.Tensor = target_cur_norm[..., 0:2]
+        cos_sin: torch.Tensor = target_cur_norm[..., 2:4]
+        size_wl: torch.Tensor = target_cur_norm[..., 6:8]
+        type_one_hot: torch.Tensor = target_cur_norm[..., 8:11]
         return xy, cos_sin, size_wl, type_one_hot
 
     @staticmethod
     def _combine_size_and_type_features(
-            size_feat: torch.Tensor,  # (B, P, O)
-            type_feat: torch.Tensor,  # (B, P, O)
+        size_feat: torch.Tensor,
+        type_feat: torch.Tensor,
     ) -> torch.Tensor:
-        """크기 특징과 종류 특징을 하나의 'shape' 특징으로 합칩니다.
+        """크기 특징과 종류 특징을 하나의 특징으로 합칩니다.
 
-        합치는 규칙(파라미터 없음):
+        규칙(파라미터 없음):
             shape_feat = size_feat + type_feat + (size_feat * type_feat)
 
         Args:
-            size_feat (torch.Tensor):
-                크기(w,l)에서 뽑은 특징.
-                shape: (B, P, O)
-            type_feat (torch.Tensor):
-                type(one-hot)에서 뽑은 특징.
-                shape: (B, P, O)
+            size_feat (torch.Tensor): (..., O)
+            type_feat (torch.Tensor): (..., O)
 
         Returns:
-            torch.Tensor:
-                결합된 shape 특징.
-                shape: (B, P, O)
+            torch.Tensor: (..., O)
         """
         return size_feat + type_feat + (size_feat * type_feat)
 
-    def forward(
-            self,
-            target_cur_norm: torch.Tensor,  # (B, (1+)Pnn, 11)
-            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
+    def _ddp_touch_scalar(self) -> torch.Tensor:
+        """(예외 케이스) 유효 토큰이 0개일 때도 파라미터가 '사용된 것'으로 보이게 합니다.
+
+        Returns:
+            torch.Tensor:
+                - shape: ()  (스칼라)
+        """
+        # 아주 작은 일부만 더해도 목적(파라미터 사용 흔적)에는 충분합니다.
+        touch = (
+            self.xy_mlp.fc1.weight.view(-1)[:1].sum() +
+            self.xy_mlp.fc2.weight.view(-1)[:1].sum() +
+            self.fuse_mlp.fc1.weight.view(-1)[:1].sum() +
+            self.fuse_mlp.fc2.weight.view(-1)[:1].sum()
+        ) * 0.0
+        return touch
+
+    def _unpad_valid_agents(
+        self,
+        target_cur_norm: torch.Tensor,        # (B, P, 11)
+        target_current_mask: torch.Tensor,    # (B, P)  True=무효
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        """유효 에이전트만 뽑아서 2D로 펴 줍니다.
+
+        Args:
+            target_cur_norm (torch.Tensor):
+                - shape: (B, P, 11)
+            target_current_mask (torch.Tensor):
+                - shape: (B, P)
+                - True=무효(패딩), False=유효
+
+        Returns:
+            x_unpad (torch.Tensor):
+                - shape: (T_total, 11)  (T_total=유효 토큰 총합)
+            indices (torch.Tensor):
+                - shape: (T_total,)
+            batch_size (int): B
+            agent_slots (int): P
+        """
+        B: int = int(target_cur_norm.shape[0])
+        P: int = int(target_cur_norm.shape[1])
+
+        mask_bool = target_current_mask.to(dtype=torch.bool)  # (B, P)
+        valid_mask = (~mask_bool)  # (B, P) True=유효
+
+        res = unpad_input(target_cur_norm, valid_mask)
+        if len(res) == 4:
+            x_unpad, indices, _, _ = res
+        else:
+            x_unpad, indices, _, _, _ = res
+        return x_unpad, indices, B, P
+
+    def _pad_back_agents(
+        self,
+        token_unpad: torch.Tensor,   # (T_total, D)
+        indices: torch.Tensor,       # (T_total,)
+        batch_size: int,             # B
+        agent_slots: int,            # P
     ) -> torch.Tensor:
-        """그룹별 처리 후 합쳐서 state_token_in을 만듭니다."""
-        # xy: (B, P, 2), cos_sin: (B, P, 2), size_wl: (B, P, 2), type_one_hot: (B, P, 3)
-        xy, cos_sin, size_wl, type_one_hot = self._split_groups(target_cur_norm)
+        """unpad 상태의 결과를 원래 (B,P,*)로 되돌립니다.
 
-        cos_sin_unit: torch.Tensor = self._normalize_cos_sin(
-            cos_sin)  # (B, P, 2)
+        Args:
+            token_unpad (torch.Tensor):
+                - shape: (T_total, D)
+            indices (torch.Tensor):
+                - shape: (T_total,)
+            batch_size (int): B
+            agent_slots (int): P
 
-        # 그룹별 입력 정리
-        xy_in: torch.Tensor = self.xy_norm(xy)  # (B, P, 2)
-        heading_in: torch.Tensor = self.heading_norm(cos_sin_unit)  # (B, P, 2)
-        size_in: torch.Tensor = self.size_norm(size_wl)  # (B, P, 2)
-        type_in: torch.Tensor = self.type_norm(type_one_hot)  # (B, P, 3)
+        Returns:
+            torch.Tensor:
+                - shape: (B, P, D)
+                - pad 위치는 0
+        """
+        return pad_input(token_unpad, indices, int(batch_size), int(agent_slots))
 
-        # 그룹별 특징 추출
-        xy_feat: torch.Tensor = self.xy_mlp(xy_in)  # (B, P, O)
-        heading_feat: torch.Tensor = self.heading_mlp(heading_in)  # (B, P, O)
-        size_feat: torch.Tensor = self.size_mlp(size_in)  # (B, P, O)
-        type_feat: torch.Tensor = self.type_mlp(type_in)  # (B, P, O)
+    def _build_fused_group_weights_train(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """훈련 모드에서 4개 그룹 MLP 가중치를 블록 대각선으로 묶어 반환합니다.
 
-        # ✅ 크기+종류 결합(파라미터 없음)
-        shape_feat: torch.Tensor = self._combine_size_and_type_features(
-            size_feat=size_feat, type_feat=type_feat)  # (B, P, O)
+        반환 텐서는 원래 파라미터로부터 만들어지므로, 그래디언트가 정상적으로 전파됩니다.
 
-        # 그룹 사이 “동시 패턴”(파라미터 없이)
-        xy_heading: torch.Tensor = xy_feat * heading_feat  # (B, P, O)
-        heading_shape: torch.Tensor = heading_feat * shape_feat  # (B, P, O)
-        shape_xy: torch.Tensor = shape_feat * xy_feat  # (B, P, O)
+        Returns:
+            fc1_w: (H_sum, In_sum)
+            fc1_b: (H_sum,)
+            fc2_w: (Out_sum, H_sum)
+            fc2_b: (Out_sum,)
+        """
+        # fc1 blocks
+        w1_xy = self.xy_mlp.fc1.weight
+        w1_hd = self.heading_mlp.fc1.weight
+        w1_sz = self.size_mlp.fc1.weight
+        w1_tp = self.type_mlp.fc1.weight
+        fc1_w = torch.block_diag(w1_xy, w1_hd, w1_sz, w1_tp)
 
-        # fuse_in: (B, P, 6*O)
-        fuse_in: torch.Tensor = torch.cat(
-            [
-                xy_feat, heading_feat, shape_feat, xy_heading, heading_shape,
-                shape_xy
-            ],
+        def _bias_or_zeros(bias: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+            if bias is None:
+                return torch.zeros((like.shape[0],), device=like.device, dtype=like.dtype)
+            return bias
+
+        b1_xy = _bias_or_zeros(self.xy_mlp.fc1.bias, w1_xy)
+        b1_hd = _bias_or_zeros(self.heading_mlp.fc1.bias, w1_hd)
+        b1_sz = _bias_or_zeros(self.size_mlp.fc1.bias, w1_sz)
+        b1_tp = _bias_or_zeros(self.type_mlp.fc1.bias, w1_tp)
+        fc1_b = torch.cat([b1_xy, b1_hd, b1_sz, b1_tp], dim=0)
+
+        # fc2 blocks
+        w2_xy = self.xy_mlp.fc2.weight
+        w2_hd = self.heading_mlp.fc2.weight
+        w2_sz = self.size_mlp.fc2.weight
+        w2_tp = self.type_mlp.fc2.weight
+        fc2_w = torch.block_diag(w2_xy, w2_hd, w2_sz, w2_tp)
+
+        b2_xy = _bias_or_zeros(self.xy_mlp.fc2.bias, w2_xy)
+        b2_hd = _bias_or_zeros(self.heading_mlp.fc2.bias, w2_hd)
+        b2_sz = _bias_or_zeros(self.size_mlp.fc2.bias, w2_sz)
+        b2_tp = _bias_or_zeros(self.type_mlp.fc2.bias, w2_tp)
+        fc2_b = torch.cat([b2_xy, b2_hd, b2_sz, b2_tp], dim=0)
+
+        return fc1_w, fc1_b, fc2_w, fc2_b
+
+    def _maybe_rebuild_fused_group_cache_eval(self) -> None:
+        """추론(eval) 모드에서 블록 대각선 가중치를 1회 캐시로 만들어 둡니다."""
+        w_ref = self.xy_mlp.fc1.weight
+        need = (self._fused_fc1_w.numel() == 0 or
+                self._fused_fc1_w.device != w_ref.device or
+                self._fused_fc1_w.dtype != w_ref.dtype)
+        if not need:
+            return
+
+        with torch.no_grad():
+            fc1_w, fc1_b, fc2_w, fc2_b = self._build_fused_group_weights_train()
+            self._fused_fc1_w = fc1_w.detach()
+            self._fused_fc1_b = fc1_b.detach()
+            self._fused_fc2_w = fc2_w.detach()
+            self._fused_fc2_b = fc2_b.detach()
+
+    def _group_mlps_forward(
+        self,
+        xy_in: torch.Tensor,       # (N, 2)
+        heading_in: torch.Tensor,  # (N, 2)
+        size_in: torch.Tensor,     # (N, 2)
+        type_in: torch.Tensor,     # (N, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """4개 그룹 MLP를 계산합니다(합쳐서 1~2번 호출로 처리).
+
+        Args:
+            xy_in: (N, 2)
+            heading_in: (N, 2)
+            size_in: (N, 2)
+            type_in: (N, 3)
+
+        Returns:
+            xy_feat: (N, O)
+            heading_feat: (N, O)
+            size_feat: (N, O)
+            type_feat: (N, O)
+        """
+        if not self.enable_fused_group_mlp:
+            xy_feat = self.xy_mlp(xy_in)
+            heading_feat = self.heading_mlp(heading_in)
+            size_feat = self.size_mlp(size_in)
+            type_feat = self.type_mlp(type_in)
+            return xy_feat, heading_feat, size_feat, type_feat
+
+        x_cat = torch.cat([xy_in, heading_in, size_in, type_in], dim=-1)  # (N, 9)
+
+        if self.training:
+            fc1_w, fc1_b, fc2_w, fc2_b = self._build_fused_group_weights_train()
+        else:
+            self._maybe_rebuild_fused_group_cache_eval()
+            fc1_w, fc1_b = self._fused_fc1_w, self._fused_fc1_b
+            fc2_w, fc2_b = self._fused_fc2_w, self._fused_fc2_b
+
+        h = F.linear(x_cat, fc1_w, fc1_b)     # (N, H_sum)
+        h = F.gelu(h)                         # (N, H_sum)
+        y = F.linear(h, fc2_w, fc2_b)         # (N, 4*O)
+
+        O = int(self.branch_out_dim)
+        xy_feat, heading_feat, size_feat, type_feat = y.split(O, dim=-1)
+        return xy_feat, heading_feat, size_feat, type_feat
+
+    def _forward_unpadded_tokens(
+        self,
+        target_cur_norm_unpad: torch.Tensor,  # (T_total, 11)
+    ) -> torch.Tensor:
+        """유효 토큰(2D)만으로 state_token_in을 계산합니다.
+
+        Args:
+            target_cur_norm_unpad:
+                - shape: (T_total, 11)
+
+        Returns:
+            state_token_unpad:
+                - shape: (T_total, D)
+        """
+        xy, cos_sin, size_wl, type_one_hot = self._split_groups(target_cur_norm_unpad)  # (T,2),(T,2),(T,2),(T,3)
+        cos_sin_unit = self._normalize_cos_sin(cos_sin)  # (T_total, 2)
+
+        xy_in = self.xy_norm(xy)                # (T_total, 2)
+        heading_in = self.heading_norm(cos_sin_unit)  # (T_total, 2)
+        size_in = self.size_norm(size_wl)       # (T_total, 2)
+        type_in = self.type_norm(type_one_hot)  # (T_total, 3)
+
+        xy_feat, heading_feat, size_feat, type_feat = self._group_mlps_forward(
+            xy_in=xy_in,
+            heading_in=heading_in,
+            size_in=size_in,
+            type_in=type_in,
+        )  # 각 (T_total, O)
+
+        shape_feat = self._combine_size_and_type_features(size_feat=size_feat, type_feat=type_feat)  # (T_total, O)
+
+        xy_heading = xy_feat * heading_feat        # (T_total, O)
+        heading_shape = heading_feat * shape_feat  # (T_total, O)
+        shape_xy = shape_feat * xy_feat            # (T_total, O)
+
+        fuse_in = torch.cat(
+            [xy_feat, heading_feat, shape_feat, xy_heading, heading_shape, shape_xy],
             dim=-1,
-        )
+        )  # (T_total, 6*O)
 
-        # state_token_in: (B, P, D)
-        state_token_in: torch.Tensor = self.fuse_mlp(fuse_in)
+        state_token_unpad = self.fuse_mlp(fuse_in)  # (T_total, D)
+        return state_token_unpad
 
-        # 무효 에이전트는 0으로 정리
-        state_token_in = self._mask_zero(state_token_in, target_current_mask)
-        return state_token_in
+    def forward(
+        self,
+        target_cur_norm: torch.Tensor,       # (B, (1+)Pnn, 11)
+        target_current_mask: torch.Tensor,   # (B, (1+)Pnn) True=무효
+    ) -> torch.Tensor:
+        """그룹별 처리 후 합쳐서 state_token_in을 만듭니다.
+
+        Returns:
+            torch.Tensor:
+                - shape: (B, (1+)Pnn, D)
+                - 무효(패딩) 에이전트 위치는 0
+        """
+        if not self.enable_varlen_unpad:
+            # (기존 방식) 전체 계산 후 마스크로 0 처리
+            xy, cos_sin, size_wl, type_one_hot = self._split_groups(target_cur_norm)
+            cos_sin_unit = self._normalize_cos_sin(cos_sin)
+
+            xy_in = self.xy_norm(xy)
+            heading_in = self.heading_norm(cos_sin_unit)
+            size_in = self.size_norm(size_wl)
+            type_in = self.type_norm(type_one_hot)
+
+            xy_feat, heading_feat, size_feat, type_feat = self._group_mlps_forward(
+                xy_in=xy_in.reshape(-1, 2),
+                heading_in=heading_in.reshape(-1, 2),
+                size_in=size_in.reshape(-1, 2),
+                type_in=type_in.reshape(-1, 3),
+            )
+            B, P = target_cur_norm.shape[:2]
+            O = self.branch_out_dim
+            xy_feat = xy_feat.reshape(B, P, O)
+            heading_feat = heading_feat.reshape(B, P, O)
+            size_feat = size_feat.reshape(B, P, O)
+            type_feat = type_feat.reshape(B, P, O)
+
+            shape_feat = self._combine_size_and_type_features(size_feat=size_feat, type_feat=type_feat)
+            xy_heading = xy_feat * heading_feat
+            heading_shape = heading_feat * shape_feat
+            shape_xy = shape_feat * xy_feat
+
+            fuse_in = torch.cat([xy_feat, heading_feat, shape_feat, xy_heading, heading_shape, shape_xy], dim=-1)
+            state_token_in = self.fuse_mlp(fuse_in)
+
+            mask_bool = target_current_mask.to(torch.bool)
+            return state_token_in.masked_fill(mask_bool.unsqueeze(-1), 0.0)
+
+        # ✅ (조언 1) 유효 에이전트만 뽑아서 계산
+        x_unpad, indices, B, P = self._unpad_valid_agents(
+            target_cur_norm=target_cur_norm,
+            target_current_mask=target_current_mask,
+        )  # x_unpad: (T_total, 11)
+
+        if x_unpad.numel() == 0:
+            zeros = target_cur_norm.new_zeros((B, P, self.hidden_dim))
+            return zeros + self._ddp_touch_scalar()
+
+        token_unpad = self._forward_unpadded_tokens(x_unpad)  # (T_total, D)
+
+        # ✅ 결과를 원래 자리로 복원(pad 위치는 0)
+        token = self._pad_back_agents(
+            token_unpad=token_unpad,
+            indices=indices,
+            batch_size=B,
+            agent_slots=P,
+        )  # (B, P, D)
+        return token
 
 
 # -----------------------------
