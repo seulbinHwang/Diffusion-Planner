@@ -347,8 +347,7 @@ class FeasibleProjector(nn.Module):
             nn.Linear(gate_hidden_dim, 3),
         )
         # Gate를 시간별이 아니라 이웃별로 계산할지 여부 (기본: True)
-        self.feasible_gate_agentwise: bool = bool(
-            getattr(self.config, "feasible_gate_agentwise", True))
+        self.feasible_gate_agentwise: bool = False #bool(getattr(self.config, "feasible_gate_agentwise", True))
 
         # gate 초기 스케일 s0 설정(보수적으로)
         s0 = 0.05
