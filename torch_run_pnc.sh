@@ -6,8 +6,8 @@ export PYTHONUNBUFFERED=1
 #export PATH="$CUDA_HOME/bin:$PATH"
 #export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
 RUN_ID=$(date +%Y%m%d-%H%M%S)
-#LOG_DIR=/mnt/nuplan/logs/$RUN_ID
-#mkdir -p "$LOG_DIR"
+LOG_DIR=/mnt/nuplan/logs/$RUN_ID
+mkdir -p "$LOG_DIR"
 
 # 디버그: 파이썬/CPP 스택, NCCL 조기실패
 export TORCH_SHOW_CPP_STACKTRACES=1
