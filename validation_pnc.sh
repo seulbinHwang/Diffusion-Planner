@@ -168,7 +168,7 @@ printf "[ENV] %-28s %s\n" "DP_WOSAC_TF_THREADS:"   "${DP_WOSAC_TF_THREADS-<unset
 printf "[ENV] %-28s %s\n" "DP_WOSAC_CPU_FRACTION:" "${DP_WOSAC_CPU_FRACTION-<unset>}"
 printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
 
-DEBUG_LOG=1   # 1: verbose debug, 0: normal
+DEBUG_LOG=0   # 1: verbose debug, 0: normal
 
 if (( DEBUG_LOG )); then
   export NCCL_DEBUG=INFO
