@@ -1029,6 +1029,20 @@ class Encoder(nn.Module):
             [static_mask, lanes_mask_for_fusion, road_safety_mask],
             dim=1,
         )  # (B, token_num)
+        # ------------------------------------------------------------------
+        # (3-1) pos dtype/device 통일 (torch.cat dtype mismatch 방지)
+        # ------------------------------------------------------------------
+        pos_dtype: torch.dtype = encoding_input.dtype
+        pos_device: torch.device = encoding_input.device
+
+        if static_pos.dtype != pos_dtype or static_pos.device != pos_device:
+            static_pos = static_pos.to(device=pos_device, dtype=pos_dtype)
+
+        if lane_pos_for_fusion.dtype != pos_dtype or lane_pos_for_fusion.device != pos_device:
+            lane_pos_for_fusion = lane_pos_for_fusion.to(device=pos_device, dtype=pos_dtype)
+
+        if road_safety_pos.dtype != pos_dtype or road_safety_pos.device != pos_device:
+            road_safety_pos = road_safety_pos.to(device=pos_device, dtype=pos_dtype)
 
         encoding_pos_2d: torch.Tensor = torch.cat(
             [static_pos, lane_pos_for_fusion, road_safety_pos],
@@ -1194,31 +1208,29 @@ class SelfAttentionBlock(nn.Module):
     # ------------------------------------------------------------------
     # 유틸: dtype / unpad / pad / DropPath(varlen)
     # ------------------------------------------------------------------
-
     @staticmethod
     def _get_compute_dtype(x: torch.Tensor) -> torch.dtype:
-        """연산 dtype을 선택합니다(BF16/FP16 우선).
+        """어텐션 내부 계산 dtype을 결정합니다.
+
+        정책
+        ----
+        - autocast가 켜져 있으면: autocast dtype을 그대로 사용합니다.
+        - autocast가 꺼져 있으면: 입력 텐서 dtype을 그대로 존중합니다.
+          (예: 입력이 float32면 float32 유지)
 
         Args:
-            x: 임의 텐서. (shape 무관)
+            x (torch.Tensor): 기준 텐서. shape 무관.
 
         Returns:
-            torch.float16 또는 torch.bfloat16
+            torch.dtype: 선택된 dtype.
         """
         if torch.is_autocast_enabled():
             try:
                 return torch.get_autocast_gpu_dtype()
             except Exception:
                 pass
+        return x.dtype
 
-        if x.dtype in (torch.float16, torch.bfloat16):
-            return x.dtype
-
-        if x.is_cuda and torch.cuda.is_available():
-            major, _ = torch.cuda.get_device_capability(x.device)
-            return torch.bfloat16 if major >= 8 else torch.float16
-
-        return torch.float16
 
     def _unpad_from_mask(
         self,

@@ -18,7 +18,7 @@ from diffusion_planner.model.module.pram_wosac import (
     PRAMV2TimeModulator,
     PRAMV2BlockPathScalars,
     PRAMV2StateTokenEncoder,
-    compute_pram_v2_modulations_for_block,
+    ModulationTriplet,
     apply_pram_v2_final_layer,  # ← 9단계 마무리 보정 호출용(스켈레톤이어도 OK)
 )
 from typing import Tuple, Optional
@@ -34,7 +34,6 @@ from typing import Iterator
 import torch
 from typing import Tuple
 from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, FlashAttnKVCache
-from diffusion_planner.model.module.pram_v2 import ModulationTriplet
 
 
 def _infer_fast_compute_dtype(reference_tensor: torch.Tensor) -> torch.dtype:
@@ -3499,6 +3498,11 @@ class DiT(nn.Module):
                         seg_body_control_stride,  # (B, Pnn, segment_len_ds, 3)
                         final_hidden_tokens,  # (B, Pnn, H)
                     )
+                    touch = self._ddp_touch_feasible_projector_params(
+                        device=seg_body_control_stride_ref.device,
+                        dtype=seg_body_control_stride_ref.dtype,
+                    )
+                    seg_body_control_stride_ref = seg_body_control_stride_ref + touch
 
             seg_body_control_stride_ref = seg_body_control_stride_ref.float()
             norm_temp_dict = {"seg_body_control": seg_body_control_stride_ref}
@@ -3637,21 +3641,16 @@ class DiT(nn.Module):
         #  - (DDP 등에서) feasible_projector 파라미터가 "완전히 미사용"이 되는 상황을 피하고 싶으면,
         #    파라미터를 0배로만 얇게 연결해 둔다(출력값은 바뀌지 않음).
         if int(active_idx.numel()) == 0:
-            if getattr(self, "feasible_projector", None) is not None:
-                dummy = base_integrated.new_zeros(())
-                for p in self.feasible_projector.parameters():
-                    # p 전체 sum은 비용이 커서, 첫 원소만 살짝 연결(그래프만 유지, 값은 0)
-                    dummy = dummy + (p.view(-1)[0] * 0.0).to(device=device,
-                                                             dtype=base_integrated.dtype)
-                integrated_all = base_integrated + dummy
-                constraint_all = base_constraint + dummy
-            else:
-                integrated_all = base_integrated
-                constraint_all = base_constraint
+            touch = self._ddp_touch_feasible_projector_params(
+                device=device,
+                dtype=base_integrated.dtype,
+            )
+            integrated_all = base_integrated + touch
+            constraint_all = base_constraint + touch
 
             self.norm_dit_returns = DiTReturns(
-                integrated_trajectory=integrated_all,  # (B,Pnn,future_len,4)
-                control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
+                integrated_trajectory=integrated_all,
+                control_constraint_diff=constraint_all,
             )
             return
 

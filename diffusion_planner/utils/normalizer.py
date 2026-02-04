@@ -10,279 +10,237 @@ except Exception:
     def to_absolute_path(path: str) -> str:
         return str(Path(path).expanduser().resolve())
 
-
 import torch
+from typing import Any
 
 
-# src/smart/metrics/wosac_metrics.py
 class StateNormalizer:
-
     def __init__(self, mean: object, std: object) -> None:
-        """상태 벡터(마지막 차원 4개 값)를 정규화/역정규화하는 클래스입니다.
-
-        - mean/std는 내부적으로 항상 shape (4,) 로 보관합니다.
-        - 실제 계산할 때는 입력 data의 차원 수(ndim)에 맞춰 mean/std를 (1, ..., 1, 4)로 바꿔서,
-          data가 (N, 4)이든 (B, T, 4)이든 (B, A, T, 4)이든 같은 방식으로 처리합니다.
-
-        Args:
-            mean: 평균 값. 총 원소 개수가 4개여야 합니다. (예: (4,), (1,4), (1,1,4) 등)
-            std: 표준편차 값. 총 원소 개수가 4개여야 합니다. (예: (4,), (1,4), (1,1,4) 등)
-
-        Raises:
-            ValueError: mean/std의 총 원소 개수가 4가 아니면 발생합니다.
-        """
         self.mean = self._to_1d4(mean, name="mean")  # (4,)
         self.std = self._to_1d4(std, name="std")  # (4,)
 
-    @classmethod
-    def from_json(cls, args):
-        data = openjson(args.normalization_file_path)
-        mean = data["neighbor"]["mean"]
-        std = data["neighbor"]["std"]
-        return cls(mean, std)
-
-    @classmethod
-    def from_json2(cls, args_dict):
-        path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")
-        data = openjson(to_absolute_path(path_str))
-        mean = data["neighbor"]["mean"]
-        std = data["neighbor"]["std"]
-        return cls(mean, std)
-
     @staticmethod
     def _to_1d4(values: object, name: str) -> torch.Tensor:
-        """입력 값을 float32 torch 텐서 shape (4,)로 정리합니다.
-
-        Args:
-            values: 평균/표준편차 값. 어떤 모양이든 총 원소 개수가 4개면 허용합니다.
-            name: 에러 메시지에 사용할 이름(예: "mean", "std").
-
-        Returns:
-            torch.Tensor: float32 텐서, shape (4,).
-
-        Raises:
-            ValueError: 총 원소 개수가 4가 아니면 발생합니다.
-        """
-        values_t = torch.as_tensor(values,
-                                   dtype=torch.float32).reshape(-1)  # (N,)
+        values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
         if values_t.numel() != 4:
             raise ValueError(
                 f"{name}는 총 4개 값이어야 합니다. "
                 f"(받은 원소 개수={values_t.numel()}, 받은 shape={tuple(torch.as_tensor(values).shape)})"
             )
-        return values_t  # (4,)
+        return values_t
 
     @staticmethod
-    def _reshape_stats_for_data(stats_1d4: torch.Tensor,
-                                data: torch.Tensor) -> torch.Tensor:
-        """stats(4,)를 data(...,4)에 맞게 (1, ..., 1, 4) 모양으로 바꿉니다.
-
-        Args:
-            stats_1d4: 통계 값 텐서, shape (4,).
-            data: 입력 데이터 텐서, shape (..., 4).
-
-        Returns:
-            torch.Tensor: stats를 data의 ndim에 맞춘 텐서, shape (1, ..., 1, 4).
-                예)
-                - data shape (N, 4)      -> (1, 4)
-                - data shape (B, T, 4)   -> (1, 1, 4)
-                - data shape (B,A,T,4)   -> (1, 1, 1, 4)
-        """
-        # data: (..., 4)
+    def _reshape_stats_for_data(stats_1d4: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
         leading_ones = [1] * (data.ndim - 1)
         return stats_1d4.to(device=data.device).view(*leading_ones, 4)
 
-    def __call__(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
-        """data를 정규화합니다.
-
-        - 입력 data의 마지막 차원이 4인지만 확인합니다. (나머지 차원 수/크기는 무엇이든 OK)
-        - data[..., :]가 전부 0인 위치는 정규화 후에도 그대로 0으로 유지합니다.
-
-        ego_future_gt_4_dim : (B, F, 4) -> ego_future_gt_is_valid : (B, F)
-        near_future_gt_4_dim : (B, A_near, F, 4) -> near_future_gt_is_valid : (B, A_near, F)
+    @staticmethod
+    def _broadcast_valid_mask(valid_mask: Any, data: torch.Tensor) -> torch.Tensor:
+        """valid_mask를 data와 같은 shape로 브로드캐스트 가능한 형태로 정리합니다.
 
         Args:
-            data: 입력 데이터 텐서, shape (..., 4).
+            valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크.
+            data: (..., 4) 텐서.
 
         Returns:
-            torch.Tensor: 정규화된 텐서, shape (..., 4).
+            torch.Tensor: data와 같은 shape로 broadcast 가능한 bool 마스크.
+                - 일반적으로 (...., 1)로 확장됩니다.
+
+        Raises:
+            ValueError: valid_mask 모양이 data와 맞지 않는 경우.
+        """
+        mask = torch.as_tensor(valid_mask, device=data.device).to(torch.bool)
+
+        if mask.shape == data.shape:
+            return mask
+
+        # 보통 valid_mask는 data의 마지막 채널(4)을 뺀 모양임: (...,)
+        if mask.shape == data.shape[:-1]:
+            return mask.unsqueeze(-1)
+
+        raise ValueError(
+            "valid_mask 모양이 data와 맞지 않습니다. "
+            f"valid_mask.shape={tuple(mask.shape)}, data.shape={tuple(data.shape)}"
+        )
+
+    @staticmethod
+    def _mask_out_of_place(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """in-place 없이 마스크 False 위치를 0으로 만듭니다.
+
+        Args:
+            x: data와 동일 shape 텐서.
+            mask: x와 동일 shape (또는 broadcast 가능한) bool 마스크.
+
+        Returns:
+            torch.Tensor: mask가 False인 위치가 0인 새 텐서.
+        """
+        return torch.where(mask, x, torch.zeros_like(x))
+
+    def __call__(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
+        """data를 정규화합니다(마스크는 out-of-place로 적용).
+
+        Args:
+            data: (..., 4)
+            valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크
+
+        Returns:
+            (..., 4) 정규화 결과. invalid 위치는 0.
         """
         if data.shape[-1] != 4:
-            raise ValueError(
-                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+            raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
-
-            mean = self._reshape_stats_for_data(self.mean, data)  # (1,...,1,4)
-            std = self._reshape_stats_for_data(self.std, data)  # (1,...,1,4)
-
-            norm_data = (data - mean) / std  # (..., 4)
-            norm_data[~valid_mask] = 0.0
-            return norm_data
+            mean = self._reshape_stats_for_data(self.mean, data)
+            std = self._reshape_stats_for_data(self.std, data)
+            norm_data = (data - mean) / std
+            mask = self._broadcast_valid_mask(valid_mask, data)
+            return self._mask_out_of_place(norm_data, mask)
 
     def inverse(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
-        """정규화된 data를 원래 값으로 되돌립니다.
-
-        - 입력 data의 마지막 차원이 4인지만 확인합니다.
-        - data[..., :]가 전부 0인 위치는 역변환 후에도 그대로 0으로 유지합니다.
+        """정규화된 data를 역변환합니다(마스크는 out-of-place로 적용).
 
         Args:
-            data: 입력 데이터 텐서, shape (..., 4).
+            data: (..., 4)
+            valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크
 
         Returns:
-            torch.Tensor: 역변환된 텐서, shape (..., 4).
+            (..., 4) 역변환 결과. invalid 위치는 0.
         """
         if data.shape[-1] != 4:
-            raise ValueError(
-                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+            raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
+            mean = self._reshape_stats_for_data(self.mean, data)
+            std = self._reshape_stats_for_data(self.std, data)
+            inv_data = data * std + mean
+            mask = self._broadcast_valid_mask(valid_mask, data)
+            return self._mask_out_of_place(inv_data, mask)
 
-            mean = self._reshape_stats_for_data(self.mean, data)  # (1,...,1,4)
-            std = self._reshape_stats_for_data(self.std, data)  # (1,...,1,4)
 
-            inv_data = data * std + mean  # (..., 4)
-            inv_data[~valid_mask] = 0.0
-            return inv_data
-
-    def to_dict(self) -> dict:
-        """현재 mean/std를 저장용 dict로 바꿉니다.
-
-        Returns:
-            dict: {"mean": ..., "std": ...}
-                mean/std는 (1, 1, 4) 모양의 중첩 리스트로 내보냅니다.
-        """
-        mean_1x1x4 = self.mean.view(1, 1, 4).detach().cpu().numpy().tolist()
-        std_1x1x4 = self.std.view(1, 1, 4).detach().cpu().numpy().tolist()
-        return {"mean": mean_1x1x4, "std": std_1x1x4}
+from copy import copy
+from typing import Dict, Any, Optional
+import torch
 
 
 class ObservationNormalizer:
-    # [ADD] 정규화에서 절대 건드리지 말아야 할 키(항상 원본 그대로 유지)
-
-    def __init__(self, normalization_dict):
-        # [ADD] 혹시 dict 안에 들어있더라도 패스스루 키는 제거
+    def __init__(self, normalization_dict: Dict[str, Dict[str, torch.Tensor]]):
         self._normalization_dict = {k: v for k, v in normalization_dict.items()}
 
-    @classmethod
-    def from_json(cls, args):
-        if isinstance(args, str):
-            path = args
+    @staticmethod
+    def _infer_device_type_from_dict(data: Dict[str, Any]) -> str:
+        """dict 안의 텐서 중 하나를 찾아 device type을 고릅니다."""
+        for v in data.values():
+            if torch.is_tensor(v):
+                return v.device.type
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    @staticmethod
+    def _apply_valid_mask_out_of_place(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """x에서 valid가 False인 위치를 0으로 만든 새 텐서를 반환합니다.
+
+        Args:
+            x: 임의 shape 텐서 (예: (B,T,11), (B,A,T,11), ...)
+            valid: 보통 x.shape[:-1] 모양의 bool 마스크
+
+        Returns:
+            x와 같은 shape 텐서. invalid 위치는 0.
+        """
+        v = valid.to(dtype=torch.bool, device=x.device)
+
+        if v.shape == x.shape:
+            mask = v
+        elif v.shape == x.shape[:-1]:
+            mask = v.unsqueeze(-1)
         else:
-            path = args.normalization_file_path
+            raise ValueError(
+                "valid 마스크 shape이 데이터와 맞지 않습니다. "
+                f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}"
+            )
 
-        data = openjson(path)
-        ndt = {}
-        for k, v in data.items():
-            if k not in ["ego", "neighbor"]:
-                ndt[k] = {
-                    "mean": torch.tensor(v["mean"], dtype=torch.float32),
-                    "std": torch.tensor(v["std"], dtype=torch.float32)
-                }
-        return cls(ndt)
+        return torch.where(mask, x, torch.zeros_like(x))
 
-    @classmethod
-    def from_json2(cls, args_dict):
-        path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")
-        data = openjson(to_absolute_path(path_str))
-
-        ndt = {}
-        for k, v in data.items():
-            if k in ["ego", "neighbor"]:
-                continue
-            ndt[k] = {
-                "mean": torch.tensor(v["mean"], dtype=torch.float32),
-                "std": torch.tensor(v["std"], dtype=torch.float32),
-            }
-        return cls(ndt)
-
-    def __call__(self, data) -> dict:
-        device_type = "cuda"
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        device_type = self._infer_device_type_from_dict(data)
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
+
+            # 1) 정의된 키만 정규화
             for k, v in self._normalization_dict.items():
                 if (k not in data) or (v is None) or (data[k] is None):
                     continue
-                norm_data[k] = (data[k] - v["mean"].to(
-                    data[k].device)) / v["std"].to(data[k].device)
-                self._mask_invalid_data(norm_data)
-            # 2) 패스스루 키는 원본 그대로(타입까지 보존/강제)
+                x = data[k]
+                if not torch.is_tensor(x):
+                    continue
+                mean = v["mean"].to(x.device)
+                std = v["std"].to(x.device)
+                norm_data[k] = (x - mean) / std
+
+            # 2) 마스킹은 딱 1번만(out-of-place)
+            self._mask_invalid_data(norm_data)
+
+            # 3) 패스스루 키
             if "agent_route_lane_order" in data:
-                norm_data["agent_route_lane_order"] = data[
-                    "agent_route_lane_order"].to(torch.long)
+                norm_data["agent_route_lane_order"] = data["agent_route_lane_order"].to(torch.long)
 
             return norm_data
 
-    def _mask_invalid_data(self, norm_data: dict) -> None:
-        """
-        norm_data 안의 '*_is_valid' 마스크가 False인 위치를 0으로 마스킹합니다.
-        - norm_data.get(key, None)로 값을 가져옵니다.
-        - 마스크 또는 대상 텐서가 None이면 해당 항목 마스킹을 스킵합니다.
+    def inverse(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        device_type = self._infer_device_type_from_dict(data)
+        with torch.amp.autocast(device_type, enabled=False):
+            norm_data = copy(data)
 
-        대표 shape 예시:
-            ego_agent_past: (B, T, 11)
-            planner_future_11_dim: (B, F, 11)
-            neighbor_agents_past: (B, A_max, T, 11)
-            lanes: (B, L_max, lane_len, 12)
-            route_lanes: (B, R_max, route_len, 12)
-            near_agents_past: (B, A_near, T, 11)
-        """
+            for k, v in self._normalization_dict.items():
+                if (k not in data) or (v is None) or (data[k] is None):
+                    continue
+                x = data[k]
+                if not torch.is_tensor(x):
+                    continue
+                mean = v["mean"].to(x.device)
+                std = v["std"].to(x.device)
+                norm_data[k] = x * std + mean
 
-        def _mask_inplace(data_key: str, valid_key: str) -> None:
-            """data_key 텐서에서 valid_key 마스크가 False인 위치를 0으로 만든다."""
+            self._mask_invalid_data(norm_data)
+
+            if "agent_route_lane_order" in data:
+                norm_data["agent_route_lane_order"] = data["agent_route_lane_order"].to(torch.long)
+
+            return norm_data
+
+    def _mask_invalid_data(self, norm_data: Dict[str, Any]) -> None:
+        """'*_is_valid' 마스크가 False인 위치를 0으로 만든 텐서를 다시 dict에 넣습니다.
+
+        주의:
+            - in-place로 원본 텐서를 직접 바꾸지 않습니다.
+            - dict 안에 같은 텐서 참조가 있어도 안전합니다.
+        """
+        def _mask(data_key: str, valid_key: str) -> None:
             valid = norm_data.get(valid_key, None)
-            data = norm_data.get(data_key, None)
-            if valid is None or data is None:
+            x = norm_data.get(data_key, None)
+            if valid is None or x is None:
                 return
-            data[~valid] = 0.
+            if not torch.is_tensor(valid) or not torch.is_tensor(x):
+                return
+            norm_data[data_key] = self._apply_valid_mask_out_of_place(x, valid)
 
-        _mask_inplace("ego_agent_past", "ego_agent_past_is_valid")
-        _mask_inplace("planner_future_11_dim", "ego_future_gt_is_valid")
-        _mask_inplace("neighbor_agents_past", "neighbor_agents_past_is_valid")
+        _mask("ego_agent_past", "ego_agent_past_is_valid")
+        _mask("planner_future_11_dim", "ego_future_gt_is_valid")
+        _mask("neighbor_agents_past", "neighbor_agents_past_is_valid")
 
-        _mask_inplace("stop_sign_points", "stop_sign_is_valid")
-        _mask_inplace("crosswalk_points", "crosswalk_is_valid")
+        _mask("stop_sign_points", "stop_sign_is_valid")
+        _mask("crosswalk_points", "crosswalk_is_valid")
 
-        _mask_inplace("lanes", "lanes_len_is_valid")
-        _mask_inplace("lanes_speed_limit", "lanes_is_valid")
+        _mask("lanes", "lanes_len_is_valid")
+        _mask("lanes_speed_limit", "lanes_is_valid")
 
-        _mask_inplace("static_objects", "static_objects_is_valid")
+        _mask("static_objects", "static_objects_is_valid")
 
-        _mask_inplace("route_lanes", "route_lanes_len_is_valid")
-        _mask_inplace("route_lanes_speed_limit", "route_lanes_is_valid")
+        _mask("route_lanes", "route_lanes_len_is_valid")
+        _mask("route_lanes_speed_limit", "route_lanes_is_valid")
 
-        _mask_inplace("speed_bump_points", "speed_bump_is_valid")
-        _mask_inplace("driveway_points", "driveway_is_valid")
-        _mask_inplace("road_edge", "road_edge_is_valid")
+        _mask("speed_bump_points", "speed_bump_is_valid")
+        _mask("driveway_points", "driveway_is_valid")
+        _mask("road_edge", "road_edge_is_valid")
 
-        _mask_inplace("near_agents_past", "near_agents_past_is_valid")
-        _mask_inplace("non_near_agents_past", "non_near_agents_past_is_valid")
+        _mask("near_agents_past", "near_agents_past_is_valid")
+        _mask("non_near_agents_past", "non_near_agents_past_is_valid")
 
-    def inverse(self, data: dict) -> dict:
-        device_type = "cuda"
-        with torch.amp.autocast(device_type, enabled=False):
-            norm_data = copy(data)
-
-            # 역정규화도 정의된 키만 수행
-            for k, v in self._normalization_dict.items():
-                if (k not in data) or (v is None) or (data[k] is None):
-                    continue
-                norm_data[k] = data[k] * v["std"].to(
-                    data[k].device) + v["mean"].to(data[k].device)
-                self._mask_invalid_data(norm_data)
-
-            # 패스스루 키는 원본 그대로 (정수 유지)
-            if "agent_route_lane_order" in data:
-                norm_data["agent_route_lane_order"] = data[
-                    "agent_route_lane_order"].to(torch.long)
-
-            return norm_data
-
-    def to_dict(self):
-        return {
-            k: {
-                kk: vv.detach().cpu().numpy().tolist() for kk, vv in v.items()
-            } for k, v in self._normalization_dict.items()
-        }
