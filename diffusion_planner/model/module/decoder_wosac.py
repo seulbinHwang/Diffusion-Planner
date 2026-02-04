@@ -33,6 +33,8 @@ from contextlib import contextmanager
 from typing import Iterator
 import torch
 from typing import Tuple
+from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, FlashAttnKVCache
+from diffusion_planner.model.module.pram_v2 import ModulationTriplet
 
 
 def _infer_fast_compute_dtype(reference_tensor: torch.Tensor) -> torch.dtype:
@@ -2557,6 +2559,97 @@ class DiT(nn.Module):
         x = pad_input(x_unpad, indices, B, Pnn)  # (B, Pnn, D)
         return x
 
+    @staticmethod
+    def _unpad_input_with_valid_mask(
+        x: torch.Tensor,          # (B, L, C)
+        valid_mask: torch.Tensor  # (B, L) True=valid
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """flash_attn.bert_padding.unpad_input 결과를 버전 차이(4/5개 반환)와 무관하게 정리합니다.
+
+        Args:
+            x (torch.Tensor): (B, L, C) 입력
+            valid_mask (torch.Tensor): (B, L) True=유효 토큰
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+                - x_unpad: (T, C)
+                - indices: (T,)
+                - cu_seqlens: (B+1,) int32
+                - max_seqlen: int
+        """
+        if valid_mask.dtype != torch.bool:
+            valid_mask = valid_mask.to(torch.bool)
+
+        res = unpad_input(x, valid_mask)
+        if len(res) == 4:
+            x_unpad, indices, cu_seqlens, max_seqlen = res
+        elif len(res) == 5:
+            x_unpad, indices, cu_seqlens, max_seqlen, _ = res
+        else:
+            raise RuntimeError(f"unexpected unpad_input return size: {len(res)}")
+
+        cu_seqlens = cu_seqlens.to(torch.int32)
+        max_seqlen_int = int(max_seqlen)
+        return x_unpad, indices, cu_seqlens, max_seqlen_int
+
+    def preproj_varlen_packed(
+        self,
+        target_input_norm_xT: torch.Tensor,  # (B, P, F)
+        target_current_mask: torch.Tensor,   # (B, P) True=pad
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """pre-proj를 유효 에이전트 토큰만 대상으로 수행하고, packed(T,D)로 반환합니다.
+
+        Args:
+            target_input_norm_xT (torch.Tensor): (B, P, F)
+            target_current_mask (torch.Tensor): (B, P) True=무효(패딩)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+                - x_unpad: (T, D)
+                - indices: (T,)
+                - cu_seqlens: (B+1,) int32
+                - max_seqlen: int
+        """
+        if target_current_mask.dtype != torch.bool:
+            target_current_mask = target_current_mask.to(torch.bool)
+
+        valid_mask = (~target_current_mask)  # (B, P) True=valid
+        xT_unpad, indices, cu_seqlens, max_seqlen = self._unpad_input_with_valid_mask(
+            target_input_norm_xT, valid_mask
+        )
+
+        if xT_unpad.numel() == 0 or max_seqlen == 0:
+            # 파라미터 터치(DDP unused 방지용)
+            touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
+                     (self.preproj.fc1.bias.view(-1)[:1].sum()
+                      if self.preproj.fc1.bias is not None else 0) +
+                     self.preproj.fc2.weight.view(-1)[:1].sum() +
+                     (self.preproj.fc2.bias.view(-1)[:1].sum()
+                      if self.preproj.fc2.bias is not None else 0)) * 0.0
+            D_out = int(self.preproj.fc2.out_features)
+            return xT_unpad.new_zeros((0, D_out)) + touch, indices, cu_seqlens, max_seqlen
+
+        x_unpad = self.preproj(xT_unpad)  # (T, D)
+        return x_unpad, indices, cu_seqlens, max_seqlen
+
+    def _build_cross_kv_cache(
+        self,
+        cross_c: torch.Tensor,      # (B, Lk, D)
+        cross_mask: torch.Tensor,   # (B, Lk) True=pad
+    ) -> FlashAttnKVCache:
+        """scene 토큰(cross_c)을 한 번만 unpad해서 KV 캐시로 만듭니다."""
+        if cross_mask.dtype != torch.bool:
+            cross_mask = cross_mask.to(torch.bool)
+
+        kv_valid = (~cross_mask)  # (B, Lk) True=valid
+        kv_unpad, _, cu_k, max_k = self._unpad_input_with_valid_mask(cross_c, kv_valid)
+        return FlashAttnKVCache(
+            kv_unpad=kv_unpad,
+            cu_seqlens_k=cu_k,
+            max_seqlen_k=int(max_k),
+        )
+
+
     def _select_tensors_for_feasible_projection(
         self,
         x: torch.
@@ -2728,65 +2821,80 @@ class DiT(nn.Module):
         return self._model_type
 
     def _run_dit_core_with_pram_v2(
-            self,
-            target_input_norm_xT: torch.Tensor,
-            diffusion_time: torch.Tensor,
-            cross_c: torch.Tensor,
-            cross_mask: torch.Tensor,
-            target_current_11_dim: torch.Tensor,
-            target_current_valid: torch.Tensor,
+        self,
+        target_input_norm_xT: torch.Tensor,
+        diffusion_time: torch.Tensor,
+        cross_c: torch.Tensor,
+        cross_mask: torch.Tensor,
+        target_current_11_dim: torch.Tensor,
+        target_current_valid: torch.Tensor,
     ) -> torch.Tensor:
-        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다."""
+        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다.
+
+        핵심 변경점:
+          - 에이전트 토큰은 시작에 1번만 unpad하여 (T,D) packed로 블록 전체를 수행
+          - scene 토큰 KV는 시작에 1번만 unpad하여 모든 블록에서 재사용
+          - 블록별 PRAM 모듈레이션은 depth 전체를 한 번에 계산하고, 블록에서는 슬라이스만 사용
+          - masked_fill은 최종 출력에서 1번만 수행
+        """
         device_type: str = target_input_norm_xT.device.type
 
-        target_current_mask = ~target_current_valid.to(torch.bool)
+        target_current_mask = (~target_current_valid.to(torch.bool))  # (B, P) True=pad
         B, one_or_Pnn, _ = target_input_norm_xT.shape
+        depth: int = int(len(self.blocks))
 
-        # 1) pre-proj (varlen)
+        # 1) pre-proj (packed)
         with profile_block(
-                "DiT.preproj_varlen",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT.preproj_varlen_packed",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
-            x: torch.Tensor = self.preproj_varlen(
-                target_input_norm_xT=target_input_norm_xT,
-                target_current_mask=_to_bool_mask(target_current_mask),
+            x_unpad, agent_indices, cu_q, max_q = self.preproj_varlen_packed(
+                target_input_norm_xT=target_input_norm_xT,                 # (B,P,F)
+                target_current_mask=_to_bool_mask(target_current_mask),     # (B,P)
             )
 
-        target_current_mask = _to_bool_mask(target_current_mask).to(
-            device=x.device)
-        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        # dtype/device 정렬 기준은 x_unpad로
+        # (packed이 비어있을 때도 dtype/device는 target_input_norm_xT와 같게 유지)
+        ref_for_dtype = x_unpad if x_unpad.numel() > 0 else target_input_norm_xT
 
-        # dtype/device 정렬
-        cross_c = _cast_like(cross_c, x)
-        cross_mask = _to_bool_mask(cross_mask).to(device=x.device)
+        # 2) cross 입력 정렬 + KV 캐시(1회)
+        cross_c = _cast_like(cross_c, ref_for_dtype)
+        cross_mask = _to_bool_mask(cross_mask).to(device=ref_for_dtype.device)
 
-        # 2) timestep embedding
         with profile_block(
-                "DiT._get_time_embedding",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT.cross_kv_unpad_once",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
-            t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
-                                                                 ref=x)
+            kv_cache = self._build_cross_kv_cache(cross_c=cross_c, cross_mask=cross_mask)
 
-        # 3) state_token_in 준비 (현재 프레임 기반)
+        # 3) timestep embedding
         with profile_block(
-                "DiT.pram_v2_state_token_encoder",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT._get_time_embedding",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
+        ):
+            t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time, ref=ref_for_dtype)
+
+        # 4) state_token_in (B,P,D)
+        target_current_mask = _to_bool_mask(target_current_mask).to(device=ref_for_dtype.device)
+
+        with profile_block(
+            "DiT.pram_v2_state_token_encoder",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
             state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
-                target_cur_norm=target_current_11_dim.to(dtype=x.dtype,
-                                                         device=x.device),
+                target_cur_norm=target_current_11_dim.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device),
                 target_current_mask=target_current_mask,
             )
 
-        # 4) PRAM-v2 composer + time modulation
+        # 5) composer + time modulation
         with profile_block(
-                "DiT.pram_v2_composer",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT.pram_v2_composer",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
             composer_out = self.pram_v2_composer(
                 state_token_in=state_token_in,
@@ -2794,63 +2902,119 @@ class DiT(nn.Module):
             )
 
         with profile_block(
-                "DiT.pram_v2_time_mod",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT.pram_v2_time_mod",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
             time_out = self.pram_v2_time_mod(t_embedding)
 
-        # 5) DiT 블록 반복 (루프 전체 + 내부 1회 호출 시간)
+        # 6) PRAM 모듈레이션을 depth 전체에 대해 1번에 계산 (packed 기준)
         with profile_block(
-                "DiT.blocks_total",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT.pram_v2_modulations_packed_all_blocks",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
+        ):
+            if agent_indices.dtype != torch.long:
+                agent_indices = agent_indices.to(torch.long)
+
+            P: int = int(one_or_Pnn)
+            H: int = int(state_token_in.shape[-1])
+            T: int = int(agent_indices.numel())
+
+            # indices = b*P + p 이므로, 배치 인덱스는 indices//P
+            batch_indices = (agent_indices // P).to(torch.long)  # (T,)
+
+            # base (B,P,H) -> (T,H)
+            ds_base = composer_out.delta_scale_base.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).reshape(B * P, H)
+            sh_base = composer_out.shift_base.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).reshape(B * P, H)
+            lg_base = composer_out.logit_gate_base.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).reshape(B * P, H)
+
+            ds_base_p = ds_base.index_select(0, agent_indices)  # (T,H)
+            sh_base_p = sh_base.index_select(0, agent_indices)  # (T,H)
+            lg_base_p = lg_base.index_select(0, agent_indices)  # (T,H)
+
+            # time (B,1,H) -> (B,H) -> (T,H) (배치별로 동일)
+            ds_time_b = time_out.delta_scale_time.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).squeeze(1)  # (B,H)
+            sh_time_b = time_out.shift_time.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).squeeze(1)        # (B,H)
+            lg_time_b = time_out.logit_gate_time.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).squeeze(1)   # (B,H)
+
+            ds_time_p = ds_time_b.index_select(0, batch_indices)  # (T,H)
+            sh_time_p = sh_time_b.index_select(0, batch_indices)  # (T,H)
+            lg_time_p = lg_time_b.index_select(0, batch_indices)  # (T,H)
+
+            # path scalars: (depth,3)
+            k_s = self.pram_v2_block_path_scalars.k_s.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).view(depth, 3, 1, 1)
+            k_sh = self.pram_v2_block_path_scalars.k_sh.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).view(depth, 3, 1, 1)
+            k_g = self.pram_v2_block_path_scalars.k_g.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).view(depth, 3, 1, 1)
+            beta_g = self.pram_v2_block_path_scalars.beta_g.to(dtype=ref_for_dtype.dtype, device=ref_for_dtype.device).view(depth, 3, 1, 1)
+
+            # (T,H) -> (1,1,T,H)
+            ds_base_p = ds_base_p.view(1, 1, T, H)
+            sh_base_p = sh_base_p.view(1, 1, T, H)
+            lg_base_p = lg_base_p.view(1, 1, T, H)
+            ds_time_p = ds_time_p.view(1, 1, T, H)
+            sh_time_p = sh_time_p.view(1, 1, T, H)
+            lg_time_p = lg_time_p.view(1, 1, T, H)
+
+            # 최종 packed 모듈레이션: (depth,3,T,H)
+            ds_packed_all = ds_time_p + k_s * ds_base_p
+            sh_packed_all = sh_time_p + k_sh * sh_base_p
+            gate_packed_all = torch.sigmoid(lg_time_p + k_g * lg_base_p + beta_g)
+
+        # 7) 블록 스택: packed로만 수행
+        with profile_block(
+            "DiT.blocks_total_packed",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
             for block_index, block in enumerate(self.blocks):
                 with profile_block(
-                        f"DiT.compute_pram_v2_modulations_for_block[{block_index}]",
-                        enabled=self.config.profile_feasible,
-                        device_type=device_type,
+                    f"DiT.block_packed[{block_index}]",
+                    enabled=self.config.profile_feasible,
+                    device_type=device_type,
                 ):
-                    pram_mods = compute_pram_v2_modulations_for_block(
-                        composer_out=composer_out,
-                        time_out=time_out,
-                        path_scalars=self.pram_v2_block_path_scalars,
-                        block_index=block_index,
-                        batch_size=B,
-                        one_or_Pnn=one_or_Pnn,
-                        hidden_dim=x.shape[-1],
-                        target_current_mask=target_current_mask,
+                    pram_mods = {
+                        "SA": ModulationTriplet(
+                            delta_scale=ds_packed_all[block_index, 0],
+                            shift=sh_packed_all[block_index, 0],
+                            gate=gate_packed_all[block_index, 0],
+                        ),
+                        "FFN": ModulationTriplet(
+                            delta_scale=ds_packed_all[block_index, 1],
+                            shift=sh_packed_all[block_index, 1],
+                            gate=gate_packed_all[block_index, 1],
+                        ),
+                        "CA": ModulationTriplet(
+                            delta_scale=ds_packed_all[block_index, 2],
+                            shift=sh_packed_all[block_index, 2],
+                            gate=gate_packed_all[block_index, 2],
+                        ),
+                    }
+
+                    x_unpad = block.forward_packed(
+                        x_unpad=x_unpad,                  # (T,D)
+                        cu_seqlens_q=cu_q,                 # (B+1,)
+                        max_seqlen_q=max_q,                # int
+                        cross_kv_cache=kv_cache,           # cached KV
+                        pram_v2_modulations=pram_mods,     # packed mods
                     )
 
-                with profile_block(
-                        f"DiT.block[{block_index}]",
-                        enabled=self.config.profile_feasible,
-                        device_type=device_type,
-                ):
-                    x = block(
-                        x=x,
-                        cross_c=cross_c,
-                        pram_v2_modulations=pram_mods,
-                        target_current_mask=target_current_mask,
-                        cross_mask=cross_mask,
-                    )
-                    x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        # 8) blocks 출력(hidden)을 (B,P,H)로 1회 pad 복원(Feasible용 저장 포함)
+        x_hidden: torch.Tensor = pad_input(x_unpad, agent_indices, B, one_or_Pnn)  # (B,P,H)
 
-        # 6) feasible 에서 사용할 최종 hidden 저장(기존 유지)
         if getattr(self.config, "feasible_grad_to_dit", False):
-            self.final_hidden_tokens = x.float()
+            self.final_hidden_tokens = x_hidden.float()
         else:
-            self.final_hidden_tokens = x.detach().clone().float()
+            self.final_hidden_tokens = x_hidden.detach().clone().float()
 
-        # 7) PRAM-v2 최종 레이어
+        # 9) PRAM-v2 최종 레이어(기존 함수 사용)
         with profile_block(
-                "DiT.apply_pram_v2_final_layer",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
+            "DiT.apply_pram_v2_final_layer",
+            enabled=self.config.profile_feasible,
+            device_type=device_type,
         ):
-            x = apply_pram_v2_final_layer(
-                x=x,
+            x_out = apply_pram_v2_final_layer(
+                x=x_hidden,
                 composer_out=composer_out,
                 time_out=time_out,
                 final_norm=self.pram_v2_final_norm,
@@ -2861,9 +3025,11 @@ class DiT(nn.Module):
                     self.pram_v2_final_shift_scalar,
                 ),
             )
-            x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
-        return x
+        # ✅ masked_fill은 최종 1회만
+        x_out = x_out.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        return x_out
+
 
     def _forward_score_branch(
             self,

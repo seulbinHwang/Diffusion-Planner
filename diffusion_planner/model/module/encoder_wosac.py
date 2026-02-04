@@ -2575,45 +2575,317 @@ class LaneFusionEncoder(nn.Module):
         raise ValueError(f"lanes_xy_and_offsets must be 3D or 4D. got {tuple(lanes_xy_and_offsets.shape)}")
 
     def _embed_optional_lane_attribute(
-        self,
-        lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
-        embedding_layer: nn.Linear,              # F -> C
-        valid_idx: torch.Tensor,                 # (num_valid,) int64
-        batch_size: int,
-        lane_num: int,
-        out_dtype: torch.dtype,
-        out_device: torch.device,
+            self,
+            lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
+            embedding_layer: nn.Linear,  # F -> C
+            valid_idx: torch.Tensor,  # (num_valid,) int64
+            batch_size: int,
+            lane_num: int,
+            out_dtype: torch.dtype,
+            out_device: torch.device,
     ) -> torch.Tensor:
-        """lane 속성(one-hot 또는 float 벡터)을 임베딩으로 바꿔 valid lane에만 맞춰 반환합니다."""
+        """lane 속성 벡터를 valid lane 기준 임베딩으로 바꿔 반환합니다.
+
+        Args:
+            lane_attribute: (B, lane_num, F) 또는 None.
+                None이면 "속성이 없다"로 보고 (num_valid, C) 0을 반환합니다.
+            embedding_layer: (F -> C) 변환 레이어.
+            valid_idx: (num_valid,) 유효 lane의 평탄화 인덱스.
+            batch_size: 배치 크기 B.
+            lane_num: lane 개수.
+            out_dtype: 반환 dtype.
+            out_device: 반환 device.
+
+        Returns:
+            (num_valid, C) 텐서.
+                - lane_attribute가 있으면: 해당 값 임베딩
+                - lane_attribute가 없으면: 전부 0
+        """
         if valid_idx.dtype != torch.long:
             valid_idx = valid_idx.to(torch.long)
 
         num_valid: int = int(valid_idx.numel())
-        base_embedding: torch.Tensor = torch.zeros(
-            (num_valid, self._channel),
-            device=out_device,
-            dtype=out_dtype,
-        )
 
+        # ✅ attribute가 없거나(num_valid==0 포함) 실제로 쓸 값이 없을 때만 zeros 생성
         if (lane_attribute is None) or (num_valid == 0):
+            base_embedding: torch.Tensor = torch.zeros(
+                (num_valid, self._channel),
+                device=out_device,
+                dtype=out_dtype,
+            )
+
+            # DDP unused param 방지용: 값은 그대로(0)지만 그래프만 연결
             touch: torch.Tensor = base_embedding.new_zeros(())
             for p in embedding_layer.parameters():
-                touch = touch + p.view(-1)[:1].sum().to(out_dtype)
+                touch = touch + p.view(-1)[:1].sum().to(dtype=out_dtype,
+                                                        device=out_device)
+
             return base_embedding + touch * 0.0
 
         if lane_attribute.dim() != 3:
-            raise ValueError(f"lane_attribute must be (B, lane_num, F). got {tuple(lane_attribute.shape)}")
-        if int(lane_attribute.shape[0]) != int(batch_size) or int(lane_attribute.shape[1]) != int(lane_num):
             raise ValueError(
-                f"lane_attribute shape mismatch. expected (B={batch_size}, lane_num={lane_num}, F), got {tuple(lane_attribute.shape)}"
+                f"lane_attribute must be (B, lane_num, F). got {tuple(lane_attribute.shape)}"
+            )
+        if int(lane_attribute.shape[0]) != int(batch_size) or int(
+                lane_attribute.shape[1]) != int(lane_num):
+            raise ValueError(
+                f"lane_attribute shape mismatch. expected (B={batch_size}, lane_num={lane_num}, F), "
+                f"got {tuple(lane_attribute.shape)}"
             )
 
         total_count: int = int(batch_size) * int(lane_num)
+
+        # (B*lane_num, F) -> (num_valid, F)
         lane_attribute = lane_attribute.to(device=out_device, dtype=out_dtype)
-        lane_attribute_flat: torch.Tensor = lane_attribute.reshape(total_count, -1)  # (B*lane_num, F)
-        lane_attribute_valid: torch.Tensor = lane_attribute_flat.index_select(0, valid_idx)  # (num_valid, F)
-        lane_attribute_embedding: torch.Tensor = embedding_layer(lane_attribute_valid)  # (num_valid, C)
-        return lane_attribute_embedding.to(dtype=out_dtype)
+        lane_attribute_flat: torch.Tensor = lane_attribute.reshape(total_count,
+                                                                   -1)  # (B*lane_num, F)
+        lane_attribute_valid: torch.Tensor = lane_attribute_flat.index_select(0,
+                                                                              valid_idx)  # (num_valid, F)
+
+        lane_attribute_embedding: torch.Tensor = embedding_layer(
+            lane_attribute_valid)  # (num_valid, C)
+        return lane_attribute_embedding.to(dtype=out_dtype, device=out_device)
+
+    def _select_optional_lane_attribute_features(
+            self,
+            lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
+            valid_idx: torch.Tensor,  # (num_valid,) int64
+            batch_size: int,
+            lane_num: int,
+            feat_dim: int,
+            out_dtype: torch.dtype,
+            out_device: torch.device,
+            name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """선택 입력(lane_attribute)에서 valid lane에 해당하는 값만 뽑아 반환합니다.
+
+        목적:
+            - lane_attribute가 있을 때: (B, lane_num, F)에서 valid lane만 골라 (num_valid, F)로 만듭니다.
+            - lane_attribute가 없을 때(None): (num_valid, F) 0 텐서와 enable=0을 반환합니다.
+
+        Args:
+            lane_attribute: (B, lane_num, F) 또는 None
+            valid_idx: (num_valid,)  flatten 기준 valid lane 인덱스
+            batch_size: B
+            lane_num: lane 개수
+            feat_dim: F (예: lane_type=4, left/right=13)
+            out_dtype: 반환 dtype
+            out_device: 반환 device
+            name: 에러 메시지용 이름
+
+        Returns:
+            feat_valid:
+                shape: (num_valid, feat_dim)
+            enabled:
+                shape: () 스칼라 텐서 (0 또는 1)
+                - lane_attribute가 None이면 0
+                - 있으면 1
+        """
+        if valid_idx.dtype != torch.long:
+            valid_idx = valid_idx.to(torch.long)
+        if valid_idx.device != out_device:
+            valid_idx = valid_idx.to(device=out_device)
+
+        num_valid: int = int(valid_idx.numel())
+        enabled_off: torch.Tensor = torch.zeros((), device=out_device,
+                                                dtype=out_dtype)
+        enabled_on: torch.Tensor = torch.ones((), device=out_device,
+                                              dtype=out_dtype)
+
+        if lane_attribute is None:
+            feat_zero: torch.Tensor = torch.zeros(
+                (num_valid, int(feat_dim)),
+                device=out_device,
+                dtype=out_dtype,
+            )
+            return feat_zero, enabled_off
+
+        if lane_attribute.dim() != 3:
+            raise ValueError(
+                f"{name} must be (B, lane_num, F). got {tuple(lane_attribute.shape)}")
+        if int(lane_attribute.shape[0]) != int(batch_size) or int(
+                lane_attribute.shape[1]) != int(lane_num):
+            raise ValueError(
+                f"{name} shape mismatch. expected (B={batch_size}, lane_num={lane_num}, F={feat_dim}), "
+                f"got {tuple(lane_attribute.shape)}"
+            )
+        if int(lane_attribute.shape[2]) != int(feat_dim):
+            raise ValueError(
+                f"{name} last dim mismatch. expected F={feat_dim}, got {int(lane_attribute.shape[2])}"
+            )
+
+        total_count: int = int(batch_size) * int(lane_num)
+
+        lane_attribute = lane_attribute.to(device=out_device,
+                                           dtype=out_dtype)  # (B, lane_num, F)
+        feat_flat: torch.Tensor = lane_attribute.reshape(total_count,
+                                                         int(feat_dim))  # (B*lane_num, F)
+        feat_valid: torch.Tensor = feat_flat.index_select(0,
+                                                          valid_idx)  # (num_valid, F)
+        return feat_valid, enabled_on
+
+    def _embed_lane_attrs_with_single_linear(
+            self,
+            traffic_valid: torch.Tensor,  # (num_valid, 4)
+            lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
+            left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
+            right_line_type: Optional[torch.Tensor],
+            # (B, lane_num, 13) or None
+            valid_idx: torch.Tensor,  # (num_valid,)
+            batch_size: int,
+            lane_num: int,
+            out_dtype: torch.dtype,
+            out_device: torch.device,
+    ) -> torch.Tensor:
+        """lane_type/left/right/traffic 값을 한 번에 (num_valid, C)로 바꿉니다.
+
+        기존 수식(개념):
+            traffic + lane_alpha * lane_type + left_alpha * left + right_alpha * right
+
+        여기서는 입력을 이어 붙이고, 가중치/바이어스도 이어 붙여
+        F.linear를 1번만 호출합니다.
+
+        Args:
+            traffic_valid: (num_valid, 4)
+            lane_type: (B, lane_num, 4) 또는 None
+            left_line_type: (B, lane_num, 13) 또는 None
+            right_line_type: (B, lane_num, 13) 또는 None
+            valid_idx: (num_valid,)
+            batch_size: B
+            lane_num: lane 개수
+            out_dtype: 출력 dtype
+            out_device: 출력 device
+
+        Returns:
+            (num_valid, C)  C=self._channel
+        """
+        if valid_idx.dtype != torch.long:
+            valid_idx = valid_idx.to(torch.long)
+        if valid_idx.device != out_device:
+            valid_idx = valid_idx.to(device=out_device)
+
+        num_valid: int = int(valid_idx.numel())
+        C: int = int(self._channel)
+
+        if num_valid == 0:
+            # 호출 경로상 보통 여기로 안 오지만, 안전하게 처리합니다.
+            empty: torch.Tensor = torch.zeros((0, C), device=out_device,
+                                              dtype=out_dtype)
+            touch: torch.Tensor = empty.new_zeros(())
+            for mod in [self.traffic_emb, self.lane_type_emb,
+                        self.left_line_type_emb, self.right_line_type_emb]:
+                for p in mod.parameters():
+                    touch = touch + p.view(-1)[:1].sum().to(dtype=out_dtype,
+                                                            device=out_device)
+            touch = touch + self.lane_type_alpha.to(dtype=out_dtype,
+                                                    device=out_device)
+            touch = touch + self.left_line_type_alpha.to(dtype=out_dtype,
+                                                         device=out_device)
+            touch = touch + self.right_line_type_alpha.to(dtype=out_dtype,
+                                                          device=out_device)
+            return empty + touch * 0.0
+
+        if traffic_valid.dim() != 2 or int(
+                traffic_valid.shape[0]) != num_valid or int(
+                traffic_valid.shape[1]) != 4:
+            raise ValueError(
+                f"traffic_valid must be (num_valid, 4). got {tuple(traffic_valid.shape)}, num_valid={num_valid}"
+            )
+        traffic_x: torch.Tensor = traffic_valid.to(device=out_device,
+                                                   dtype=out_dtype)  # (num_valid, 4)
+
+        lane_x, lane_enabled = self._select_optional_lane_attribute_features(
+            lane_attribute=lane_type,
+            valid_idx=valid_idx,
+            batch_size=batch_size,
+            lane_num=lane_num,
+            feat_dim=4,
+            out_dtype=out_dtype,
+            out_device=out_device,
+            name="lane_type",
+        )  # (num_valid, 4), ()
+
+        left_x, left_enabled = self._select_optional_lane_attribute_features(
+            lane_attribute=left_line_type,
+            valid_idx=valid_idx,
+            batch_size=batch_size,
+            lane_num=lane_num,
+            feat_dim=13,
+            out_dtype=out_dtype,
+            out_device=out_device,
+            name="left_line_type",
+        )  # (num_valid, 13), ()
+
+        right_x, right_enabled = self._select_optional_lane_attribute_features(
+            lane_attribute=right_line_type,
+            valid_idx=valid_idx,
+            batch_size=batch_size,
+            lane_num=lane_num,
+            feat_dim=13,
+            out_dtype=out_dtype,
+            out_device=out_device,
+            name="right_line_type",
+        )  # (num_valid, 13), ()
+
+        one: torch.Tensor = torch.ones((), device=out_device, dtype=out_dtype)
+
+        # 스칼라 조절값(없으면 0으로 꺼짐)
+        gate_lane: torch.Tensor = self.lane_type_alpha.to(dtype=out_dtype,
+                                                          device=out_device) * lane_enabled  # ()
+        gate_left: torch.Tensor = self.left_line_type_alpha.to(dtype=out_dtype,
+                                                               device=out_device) * left_enabled  # ()
+        gate_right: torch.Tensor = self.right_line_type_alpha.to(
+            dtype=out_dtype, device=out_device) * right_enabled  # ()
+        gate_traffic: torch.Tensor = one  # ()
+
+        # weight: (C, in_dim), bias: (C,)
+        w_lane = self.lane_type_emb.weight.to(device=out_device,
+                                              dtype=out_dtype) * gate_lane  # (C,4)
+        b_lane = (
+                     self.lane_type_emb.bias.to(device=out_device,
+                                                dtype=out_dtype)
+                     if self.lane_type_emb.bias is not None
+                     else torch.zeros((C,), device=out_device, dtype=out_dtype)
+                 ) * gate_lane  # (C,)
+
+        w_left = self.left_line_type_emb.weight.to(device=out_device,
+                                                   dtype=out_dtype) * gate_left  # (C,13)
+        b_left = (
+                     self.left_line_type_emb.bias.to(device=out_device,
+                                                     dtype=out_dtype)
+                     if self.left_line_type_emb.bias is not None
+                     else torch.zeros((C,), device=out_device, dtype=out_dtype)
+                 ) * gate_left  # (C,)
+
+        w_right = self.right_line_type_emb.weight.to(device=out_device,
+                                                     dtype=out_dtype) * gate_right  # (C,13)
+        b_right = (
+                      self.right_line_type_emb.bias.to(device=out_device,
+                                                       dtype=out_dtype)
+                      if self.right_line_type_emb.bias is not None
+                      else torch.zeros((C,), device=out_device, dtype=out_dtype)
+                  ) * gate_right  # (C,)
+
+        w_traffic = self.traffic_emb.weight.to(device=out_device,
+                                               dtype=out_dtype) * gate_traffic  # (C,4)
+        b_traffic = (
+                        self.traffic_emb.bias.to(device=out_device,
+                                                 dtype=out_dtype)
+                        if self.traffic_emb.bias is not None
+                        else torch.zeros((C,), device=out_device,
+                                         dtype=out_dtype)
+                    ) * gate_traffic  # (C,)
+
+        # (num_valid, 34) = [lane(4), left(13), right(13), traffic(4)]
+        x_concat: torch.Tensor = torch.cat([lane_x, left_x, right_x, traffic_x],
+                                           dim=-1)  # (num_valid, 34)
+        w_concat: torch.Tensor = torch.cat([w_lane, w_left, w_right, w_traffic],
+                                           dim=1)  # (C, 34)
+        b_total: torch.Tensor = b_lane + b_left + b_right + b_traffic  # (C,)
+
+        out: torch.Tensor = F.linear(x_concat, w_concat,
+                                     b_total)  # (num_valid, C)
+        return out
 
     def _get_lane_feature(self, lane_xyyaw: torch.Tensor) -> torch.Tensor:
         """lane_pos(4) + type_onehot(5) -> feature(9)"""
@@ -2748,9 +3020,12 @@ class LaneFusionEncoder(nn.Module):
         # (3) token_pre_project: lane_len -> T_small (기본 16)
         # ============================================================
         with profile_block("LaneFusionEncoder.token_pre_project", enabled=enable_profile, device_type=device_type):
-            lanes_valid = lanes_valid.transpose(1, 2).contiguous()   # (num_valid, C, lane_len)
-            lanes_valid = self.token_pre_project(lanes_valid)         # (num_valid, C, T_small)
-            lanes_valid = lanes_valid.transpose(1, 2).contiguous()    # (num_valid, T_small, C)
+            lanes_valid = lanes_valid.transpose(1,
+                                                2).contiguous()  # (num_valid, C, lane_len)
+            lanes_valid = self.token_pre_project(
+                lanes_valid)  # (num_valid, C, T_small)
+            lanes_valid = lanes_valid.transpose(1,
+                                                2)  # (num_valid, T_small, C)  ✅ 큰 복사 1회 제거
 
         # ============================================================
         # (4) MixerBlock (토큰 섞기 중심 + 특징 변환 축소)
@@ -2769,73 +3044,48 @@ class LaneFusionEncoder(nn.Module):
         # (6) 속성 임베딩(속도/신호/타입) -> mean 쪽에 더하기
         # ============================================================
         lane_vec: torch.Tensor = mean_pool  # (num_valid, C)
-        with profile_block("LaneFusionEncoder.attr_embedding", enabled=enable_profile, device_type=device_type):
-            lanes_speed_limit_flat: torch.Tensor = lanes_speed_limit.reshape(total_count, 1)  # (B*lane_num, 1)
-            lanes_has_speed_limit_flat: torch.Tensor = lanes_has_speed_limit.to(torch.bool).reshape(total_count, 1)  # (B*lane_num, 1)
+        with profile_block("LaneFusionEncoder.attr_embedding",
+                           enabled=enable_profile, device_type=device_type):
+            lanes_speed_limit_flat: torch.Tensor = lanes_speed_limit.reshape(
+                total_count, 1)  # (B*lane_num, 1)
+            lanes_has_speed_limit_flat: torch.Tensor = lanes_has_speed_limit.to(
+                torch.bool).reshape(total_count, 1)  # (B*lane_num, 1)
 
-            lanes_has_speed_limit_valid: torch.Tensor = lanes_has_speed_limit_flat.index_select(0, valid_idx).squeeze(-1)  # (num_valid,)
-            lanes_speed_limit_valid: torch.Tensor = lanes_speed_limit_flat.index_select(0, valid_idx).squeeze(-1)          # (num_valid,)
+            lanes_has_speed_limit_valid: torch.Tensor = lanes_has_speed_limit_flat.index_select(
+                0, valid_idx).squeeze(-1)  # (num_valid,)
+            lanes_speed_limit_valid: torch.Tensor = lanes_speed_limit_flat.index_select(
+                0, valid_idx).squeeze(-1)  # (num_valid,)
 
-            speed_limit_embedding: torch.Tensor = torch.zeros(
-                (num_valid, self._channel),
-                device=lane_vec.device,
-                dtype=lane_vec.dtype,
-            )
+            # ✅ 분기/.item()/부분 인덱싱/부분 대입 제거: 항상 둘 다 계산하고 where로 선택
+            speed_mask: torch.Tensor = lanes_has_speed_limit_valid.unsqueeze(
+                -1)  # (num_valid, 1) bool
 
-            if lanes_has_speed_limit_valid.any().item():
-                speed_limit_with_limit = self.speed_limit_emb(
-                    lanes_speed_limit_valid[lanes_has_speed_limit_valid].unsqueeze(-1)
-                ).to(lane_vec.dtype)
-                speed_limit_embedding[lanes_has_speed_limit_valid] = speed_limit_with_limit
+            speed_with: torch.Tensor = self.speed_limit_emb(
+                lanes_speed_limit_valid.unsqueeze(-1)  # (num_valid, 1)
+            ).to(dtype=lane_vec.dtype, device=lane_vec.device)  # (num_valid, C)
 
-            if (~lanes_has_speed_limit_valid).any().item():
-                speed_limit_no_limit = self.unknown_speed_emb.weight.expand(
-                    int((~lanes_has_speed_limit_valid).sum().item()),
-                    -1
-                ).to(lane_vec.dtype)
-                speed_limit_embedding[~lanes_has_speed_limit_valid] = speed_limit_no_limit
+            speed_no: torch.Tensor = self.unknown_speed_emb.weight.to(
+                dtype=lane_vec.dtype, device=lane_vec.device
+            ).expand(num_valid, -1)  # (num_valid, C)
 
-            traffic_light_embedding: torch.Tensor = self.traffic_emb(traffic_valid).to(lane_vec.dtype)
+            speed_limit_embedding: torch.Tensor = torch.where(speed_mask,
+                                                              speed_with,
+                                                              speed_no)  # (num_valid, C)
 
-            lane_type_embedding: torch.Tensor = self._embed_optional_lane_attribute(
-                lane_attribute=lane_type,
-                embedding_layer=self.lane_type_emb,
-                valid_idx=valid_idx,
+            # ✅ lane_type/left/right/traffic 임베딩을 한 번의 F.linear로 합치기
+            attrs_embedding: torch.Tensor = self._embed_lane_attrs_with_single_linear(
+                traffic_valid=traffic_valid,  # (num_valid, 4)
+                lane_type=lane_type,  # (B, lane_num, 4) or None
+                left_line_type=left_line_type,  # (B, lane_num, 13) or None
+                right_line_type=right_line_type,  # (B, lane_num, 13) or None
+                valid_idx=valid_idx,  # (num_valid,)
                 batch_size=B,
                 lane_num=lane_num,
                 out_dtype=lane_vec.dtype,
                 out_device=lane_vec.device,
-            )
-
-            left_line_type_embedding: torch.Tensor = self._embed_optional_lane_attribute(
-                lane_attribute=left_line_type,
-                embedding_layer=self.left_line_type_emb,
-                valid_idx=valid_idx,
-                batch_size=B,
-                lane_num=lane_num,
-                out_dtype=lane_vec.dtype,
-                out_device=lane_vec.device,
-            )
-
-            right_line_type_embedding: torch.Tensor = self._embed_optional_lane_attribute(
-                lane_attribute=right_line_type,
-                embedding_layer=self.right_line_type_emb,
-                valid_idx=valid_idx,
-                batch_size=B,
-                lane_num=lane_num,
-                out_dtype=lane_vec.dtype,
-                out_device=lane_vec.device,
-            )
-
-            lane_vec = (
-                lane_vec
-                + speed_limit_embedding
-                + traffic_light_embedding
-                + self._apply_scalar_gate_to_embedding(lane_type_embedding, self.lane_type_alpha)
-                + self._apply_scalar_gate_to_embedding(left_line_type_embedding, self.left_line_type_alpha)
-                + self._apply_scalar_gate_to_embedding(right_line_type_embedding, self.right_line_type_alpha)
             )  # (num_valid, C)
 
+            lane_vec = lane_vec + speed_limit_embedding + attrs_embedding  # (num_valid, C)
         # ============================================================
         # (7) pool 결과 결합(mean_with_attr + max) -> lane_post_mlp (2C -> C)
         # ============================================================
