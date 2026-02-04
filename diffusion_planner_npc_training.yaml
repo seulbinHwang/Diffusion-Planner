@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hsb-npc-training
+  namespace: p-pnc
+  annotations:
+    sidecar.istio.io/inject: "false"
+spec:
+  terminationGracePeriodSeconds: 120
+  restartPolicy: Never
+  nodeSelector:
+    mlx.navercorp.com/zone: private-h100-ib-naverlabs-0
+
+  imagePullSecrets:
+    - name: pnc-secret
+
+  # PVC 쓰기 권한 확보(권장 방식)
+  # - 컨테이너를 root로 안 돌려도, /mnt/nuplan 아래를 "그룹 쓰기 가능"하게 만드는 목적
+  securityContext:
+    fsGroup: 1000
+
+  volumes:
+    - name: nuplan-storage
+      persistentVolumeClaim:
+        claimName: pvc-rbd-diffusion-planner-djkim
+    - name: dshm2
+      emptyDir:
+        medium: Memory
+        sizeLimit: 128Gi
+
+  initContainers:
+    - name: install-nubescli
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -Eeuo pipefail
+          umask 002
+
+          # PVC에 꼭 필요한 디렉터리 미리 생성
+          mkdir -p /mnt/nuplan/tools
+          mkdir -p /mnt/nuplan/logs
+
+          # nubescli 준비
+          if [ ! -s /mnt/nuplan/tools/nubescli ]; then
+            echo "[init] nubescli not found - downloading..."
+            curl -fsSL -o /mnt/nuplan/tools/nubescli \
+              http://owfsrepo.navercorp.com/nubes/dist/nubescli_latest/linux/nubescli
+            chmod +x /mnt/nuplan/tools/nubescli
+          else
+            echo "[init] nubescli already exists - skip download"
+          fi
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+
+  containers:
+    - name: main
+      image: labs-ad2flow.n3r.reg.navercorp.com/mlx_exp/pnc_traffic_model:20260121
+      securityContext:
+        allowPrivilegeEscalation: false
+
+      env:
+        - name: PATH
+          value: "/mnt/nuplan/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        - name: NUBES_GATEWAY_ADDRESS
+          value: "c.nubes.sto.navercorp.com:8000"
+
+        - name: WANDB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: wandb-secret
+              key: api-key
+        - name: WANDB_ENTITY
+          value: "jksg01019-naver-labs"
+        - name: WANDB_PROJECT
+          value: "Diffusion-Planner"
+        - name: WANDB_MODE
+          value: "online"
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -Eeo pipefail
+          umask 002
+          trap 'echo "Exit (code $?) - keeping pod alive for inspection"; sleep infinity' EXIT
+
+          export PATH=/mnt/work/miniforge/bin:$PATH
+          source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
+          conda activate base
+          conda activate diffusion_planner
+
+          pip install --no-cache-dir wandb
+          wandb login --relogin "$WANDB_API_KEY"
+
+          mkdir -p "$HOME"
+          cat << 'EOF' > "$HOME/.tmux.conf"
+          set -g mouse on
+          set -g history-limit 100000
+          set -g set-clipboard on
+          setw -g mode-keys vi
+          bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel
+          bind -T copy-mode-vi y send-keys -X copy-selection-and-cancel
+          EOF
+
+          git config --global --add safe.directory /mnt/nuplan/projects/Diffusion-Planner
+
+          cd /mnt/nuplan/projects/Diffusion-Planner
+          git fetch
+          git stash
+          if [ "$(git rev-parse --abbrev-ref HEAD)" = "feature/womd" ]; then
+            git checkout main
+          fi
+          git branch -D feature/womd 2>/dev/null || true
+          git checkout -b feature/womd origin/feature/womd
+          git pull
+
+          SESSION_NAME="npc-training"
+          tmux new-session -d -s "$SESSION_NAME"
+          tmux split-window -h -t "$SESSION_NAME:0"
+          tmux send-keys -t "$SESSION_NAME:0.1" \
+            "cd /mnt/nuplan/projects/Diffusion-Planner" C-m
+          tmux select-layout -t "$SESSION_NAME" even-horizontal
+
+          echo "Started tmux session '$SESSION_NAME'."
+          sleep infinity
+
+      resources:
+        requests:
+          cpu: "32"
+          memory: "256Gi"
+          nvidia.com/gpu: "5"
+        limits:
+          cpu: "32"
+          memory: "256Gi"
+          nvidia.com/gpu: "5"
+
+      volumeMounts:
+        - name: nuplan-storage
+          mountPath: /mnt/nuplan
+        - name: dshm2
+          mountPath: /dev/shm
