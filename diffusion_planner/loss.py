@@ -317,53 +317,42 @@ def _sample_diffusion_time_and_noise(
     )
     return batch_diffusion_time, low_t_mask, random_noise
 
-
 def _normalize_futures_and_build_xT(
     normed_target_cur_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, 4)
     normed_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_cur_future_is_valid: torch.Tensor,  # (B, (1+)Pnn, 1+future_len)
     batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
-    marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
-                                                                torch.Tensor]],
+    marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """미래 궤적을 정규화하고, x_T 샘플과 std 를 만든다.
-
-    Args:
-        normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4) 현재 정규화된 상태.
-        normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4) 미래 궤적(denorm).
-        target_cur_future_is_valid: (B, (1+)Pnn, 1+future_len) 현재+미래 마스크.
-        batch_diffusion_time: (B,) or (B, future_len) 배치별 diffusion 시간.
-        random_noise: (B, (1+)Pnn, future_len, 4) 노이즈.
-        marginal_prob: SDE 의 marginal_prob 함수.
-
-    Returns:
-        target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재+미래 x_T 샘플.
-        std: (B, 1, 1, 1) 노이즈 표준편차.
-    """
+    """미래 궤적을 정규화하고, x_T 샘플과 std 를 만든다."""
     B, one_or_Pnn, future_len, _ = normed_target_future_gt_4_dim.shape
-    # marginal_prob: <diffusion_planner/model/diffusion_utils/sde.py> 의 VPSDE_linear 클래스의 메서드
-    mean, std = marginal_prob(normed_target_future_gt_4_dim,
-                              batch_diffusion_time)
-    """
-    mean : (B, (1+)Pnn, future_len, 4)
-    std : (B, 1, 1, 1) or (B, 1, future_len, 1)
-    """
+    mean, std = marginal_prob(normed_target_future_gt_4_dim, batch_diffusion_time)
     assert std.ndim == 4, "std_raw must be (B, _, _, _)"
+
     # target_future_is_valid: (B, (1+)Pnn, future_len)
-    target_future_is_valid = target_cur_future_is_valid[:, :, 1:]
+    target_future_is_valid = target_cur_future_is_valid[:, :, 1:].to(torch.bool)
+
     # target_future_noise_xT: (B, (1+)Pnn, future_len, 4)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
-    target_future_noise_xT[~target_future_is_valid] = 0.0
+
+    # ✅ in-place 대신 out-of-place 마스킹
+    invalid_future = (~target_future_is_valid).unsqueeze(-1)  # (B, (1+)Pnn, future_len, 1)
+    target_future_noise_xT = target_future_noise_xT.masked_fill(invalid_future, 0.0)
 
     # target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4)
     target_cur_future_norm_xT: torch.Tensor = torch.cat(
         [normed_target_cur_gt_4_dim, target_future_noise_xT],
         dim=2,
     )
-    target_cur_future_norm_xT[~target_cur_future_is_valid] = 0.0
+
+    # ✅ in-place 대신 out-of-place 마스킹
+    invalid_cur_future = (~target_cur_future_is_valid.to(torch.bool)).unsqueeze(-1)  # (B, (1+)Pnn, 1+future_len, 1)
+    target_cur_future_norm_xT = target_cur_future_norm_xT.masked_fill(invalid_cur_future, 0.0)
+
     assert target_cur_future_norm_xT.shape == (B, one_or_Pnn, 1 + future_len, 4)
     return target_cur_future_norm_xT, std
+
 
 
 def _forward_model_with_autocast(

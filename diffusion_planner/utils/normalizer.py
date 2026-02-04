@@ -135,29 +135,72 @@ class ObservationNormalizer:
         return "cuda" if torch.cuda.is_available() else "cpu"
 
     @staticmethod
-    def _apply_valid_mask_out_of_place(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    def _apply_valid_mask_out_of_place(x: torch.Tensor,
+                                       valid: torch.Tensor) -> torch.Tensor:
         """x에서 valid가 False인 위치를 0으로 만든 새 텐서를 반환합니다.
 
+        허용하는 valid 모양
+        - valid.shape == x.shape
+        - valid.shape == x.shape[:-1] (마지막 채널만 없는 형태)
+        - valid가 x의 "앞쪽 축"까지만 있는 형태
+          예) x=(B,N,S,2) 이고 valid=(B,N) 인 경우 → valid를 (B,N,1,1)로 늘려서 적용
+
         Args:
-            x: 임의 shape 텐서 (예: (B,T,11), (B,A,T,11), ...)
-            valid: 보통 x.shape[:-1] 모양의 bool 마스크
+            x (torch.Tensor): 임의 shape 텐서.
+            valid (torch.Tensor): 유효 마스크 텐서.
 
         Returns:
-            x와 같은 shape 텐서. invalid 위치는 0.
+            torch.Tensor: x와 같은 shape 텐서. invalid 위치는 0.
+
+        Raises:
+            ValueError: valid 마스크 shape이 x와 맞지 않는 경우.
         """
         v = valid.to(dtype=torch.bool, device=x.device)
 
-        if v.shape == x.shape:
-            mask = v
-        elif v.shape == x.shape[:-1]:
-            mask = v.unsqueeze(-1)
-        else:
+        if v.ndim > x.ndim:
             raise ValueError(
-                "valid 마스크 shape이 데이터와 맞지 않습니다. "
+                "valid 마스크 차원 수가 데이터보다 큽니다. "
+                f"valid.ndim={int(v.ndim)}, x.ndim={int(x.ndim)}, "
                 f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}"
             )
 
-        return torch.where(mask, x, torch.zeros_like(x))
+        # 1) 완전 동일 모양
+        if v.shape == x.shape:
+            mask = v
+            return torch.where(mask, x, torch.zeros_like(x))
+
+        # 2) 마지막 채널만 없는 모양: (.. ) -> (..,1)
+        if v.shape == x.shape[:-1]:
+            mask = v.unsqueeze(-1)
+            return torch.where(mask, x, torch.zeros_like(x))
+
+        # 3) "앞쪽 축"까지만 있는 모양: 뒤쪽 축을 1로 늘려서 맞춤
+        #    예: x=(B,N,S,2), v=(B,N)  -> (B,N,1,1)
+        #        x=(B,L,T,D), v=(B,L)  -> (B,L,1,1)
+        prefix_ok = True
+        for i in range(int(v.ndim)):
+            v_dim = int(v.shape[i])
+            x_dim = int(x.shape[i])
+            if v_dim != 1 and v_dim != x_dim:
+                prefix_ok = False
+                break
+
+        if prefix_ok:
+            # 뒤쪽 축을 1로 채워서 x.ndim과 맞춤
+            if v.ndim < x.ndim:
+                expand_shape = tuple(v.shape) + (1,) * int(x.ndim - v.ndim)
+                mask = v.reshape(expand_shape)
+            else:
+                mask = v
+
+            return torch.where(mask, x, torch.zeros_like(x))
+
+        raise ValueError(
+            "valid 마스크 shape이 데이터와 맞지 않습니다. "
+            "허용: valid.shape == x.shape, valid.shape == x.shape[:-1], "
+            "또는 valid가 x의 앞쪽 축과 맞고(중간에 1은 허용) 뒤쪽 축은 자동 확장 가능한 경우입니다. "
+            f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}"
+        )
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         device_type = self._infer_device_type_from_dict(data)
