@@ -269,7 +269,7 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
         # ------------------------------
-        self._kernel_size: int = 7
+        self._kernel_size: int = 9
         self._dilations: List[int] = [1, 8]  #: 4블록→2블록
         self.tcn_depth = len(self._dilations)  # : 현재는 2
         self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
@@ -1051,17 +1051,25 @@ class FeasibleProjector(nn.Module):
     # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
     # ----------------------------
     def _apply_constraints_batch(
-        self,
-        vx_b_raw: torch.Tensor,  # (B,Pnn,T)
-        vy_b_raw: torch.Tensor,  # (B,Pnn,T)
-        omega_raw: torch.Tensor,  # (B,Pnn,T)
-        key_to_limit_bp: Dict[str, torch.Tensor],
-        hp: _ConstraintHParams,
+            self,
+            vx_b_raw: torch.Tensor,  # (B,Pnn,T)
+            vy_b_raw: torch.Tensor,  # (B,Pnn,T)
+            omega_raw: torch.Tensor,  # (B,Pnn,T)
+            key_to_limit_bp: Dict[str, torch.Tensor],
+            hp: _ConstraintHParams,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """시간축 전체 배치로 S0/S1/S2/S3 제약을 적용합니다.
+
+        호출 순서:
+            S0(β) -> S1(speed) -> S2(accel/alpha) -> S3(omega)
+
+        Returns:
+            vx_after, vy_after, omega_after: 모두 (B,Pnn,T)
+        """
         if not self.use_feasible_filter:
             return vx_b_raw, vy_b_raw, omega_raw
 
-        # ✅ 추가: 사이드슬립 각(β) 상한 → v_y^b만 줄이기
+        # (S0) 사이드슬립 각(β) 상한 → v_y^b만 줄이기
         vx_after, vy_after = self._apply_S0_sideslip_angle_limit_ste(
             vx_b=vx_b_raw,
             vy_b=vy_b_raw,
@@ -1071,6 +1079,7 @@ class FeasibleProjector(nn.Module):
             is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
         )
 
+        # (S1) 속도 크기 제한
         vx_after, vy_after = self._apply_S1_speed_limit_ste(
             vx_b=vx_after,
             vy_b=vy_after,
@@ -1079,11 +1088,23 @@ class FeasibleProjector(nn.Module):
             eps=hp.eps,
         )
 
+        # (S2) 가속도/각가속도 증분 제한 (시간축 전체 배치, for-loop 없음)
+        vx_after, vy_after, omega_after = self._apply_S2_accel_alpha_limits_ste_batch(
+            vx_b=vx_after,  # (B,Pnn,T)
+            vy_b=vy_after,  # (B,Pnn,T)
+            omega=omega_raw,  # (B,Pnn,T)
+            a_max=key_to_limit_bp["a_max"],  # (B,Pnn)
+            alpha_max=key_to_limit_bp["alpha_max"],  # (B,Pnn)
+            dt=float(hp.dt),
+            eta=float(hp.eta_inc),
+            eps=float(hp.eps),
+        )
 
+        # (S3) 속도-연동 omega 한계로 clip
         omega_after = self._apply_S3_omega_clip_ste(
             vx_b=vx_after,
             vy_b=vy_after,
-            omega=omega_raw,
+            omega=omega_after,
             a_lat_max=key_to_limit_bp["a_lat_max"],
             R_min=key_to_limit_bp["R_min"],
             omega_abs_max=key_to_limit_bp["omega_abs_max"],
@@ -2860,6 +2881,114 @@ class FeasibleProjector(nn.Module):
         w_new = omega_prev + dw_ste
         return vx_b_new, vy_b_new, w_new
 
+    def _apply_S2_accel_alpha_limits_ste_batch(
+            self,
+            vx_b: torch.Tensor,  # (B, Pnn, T)
+            vy_b: torch.Tensor,  # (B, Pnn, T)
+            omega: torch.Tensor,  # (B, Pnn, T)
+            a_max: torch.Tensor,  # (B, Pnn)
+            alpha_max: torch.Tensor,  # (B, Pnn)
+            dt: float,
+            eta: float,
+            eps: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(S2) 가속도/각가속도 증분 제약을 시간축 전체 배치 연산으로 적용합니다.
+
+        목표(이산 형태):
+            k>=1 에 대해
+              || [vx_k - vx_{k-1}, vy_k - vy_{k-1}] || <= a_max * dt
+              |  omega_k - omega_{k-1} | <= alpha_max * dt
+
+        구현 방식(시간축 for-loop 없음):
+            1) dv, dw를 diff로 한 번에 계산 (T-1 길이)
+            2) dv는 2D 노름 기준, dw는 스칼라 기준으로 STE-hard clip
+            3) cumsum으로 다시 vx/vy/omega 시퀀스를 복원
+               - 첫 시점(k=0)은 그대로 유지합니다(기존 sequential에서 k=0에 S2를 안 거는 것과 동일한 의도).
+
+        Args:
+            vx_b: (B, Pnn, T)
+            vy_b: (B, Pnn, T)
+            omega: (B, Pnn, T)
+            a_max: (B, Pnn)  종/횡을 묶은 “속도 변화량” 상한에 쓰는 값 (m/s^2)
+            alpha_max: (B, Pnn)  요각속도 변화 상한에 쓰는 값 (rad/s^2)
+            dt: float  샘플 간 시간 간격(초)
+            eta: float  STE 밴드 폭
+            eps: float  수치 안정용
+
+        Returns:
+            (vx_out, vy_out, omega_out):
+                모두 (B, Pnn, T)
+        """
+        if vx_b.dim() != 3 or vy_b.dim() != 3 or omega.dim() != 3:
+            raise ValueError(
+                "[_apply_S2_accel_alpha_limits_ste_batch] 입력은 (B,Pnn,T) 3D 텐서여야 합니다."
+            )
+        if vx_b.shape != vy_b.shape or vx_b.shape != omega.shape:
+            raise ValueError(
+                "[_apply_S2_accel_alpha_limits_ste_batch] vx/vy/omega shape이 서로 다릅니다. "
+                f"vx={tuple(vx_b.shape)}, vy={tuple(vy_b.shape)}, omega={tuple(omega.shape)}"
+            )
+
+        B, Pnn, T = vx_b.shape
+        if T <= 1:
+            return vx_b, vy_b, omega
+
+        # ------------------------
+        # 1) 선형 속도 증분 dv: (B,Pnn,T-1,2)
+        # ------------------------
+        dvx = vx_b[..., 1:] - vx_b[..., :-1]  # (B,Pnn,T-1)
+        dvy = vy_b[..., 1:] - vy_b[..., :-1]  # (B,Pnn,T-1)
+        dv = torch.stack([dvx, dvy], dim=-1)  # (B,Pnn,T-1,2)
+
+        dv_limit = (a_max.to(dtype=vx_b.dtype, device=vx_b.device) * float(
+            dt))  # (B,Pnn)
+        dv_limit_bpt = dv_limit.unsqueeze(-1).expand(B, Pnn,
+                                                     T - 1)  # (B,Pnn,T-1)
+
+        dv_ste = self._ste_increment_vec_nd(
+            dv=dv,  # (B,Pnn,T-1,2)
+            limit=dv_limit_bpt,  # (B,Pnn,T-1)
+            eta=eta,
+            eps=eps,
+        )  # (B,Pnn,T-1,2)
+
+        # cumsum으로 복원
+        dv_prefix = torch.cumsum(dv_ste, dim=2)  # (B,Pnn,T-1,2)
+
+        vx0 = vx_b[..., :1]  # (B,Pnn,1)
+        vy0 = vy_b[..., :1]  # (B,Pnn,1)
+
+        vx_tail = vx0 + dv_prefix[..., 0]  # (B,Pnn,T-1)
+        vy_tail = vy0 + dv_prefix[..., 1]  # (B,Pnn,T-1)
+
+        vx_out = torch.cat([vx0, vx_tail], dim=2)  # (B,Pnn,T)
+        vy_out = torch.cat([vy0, vy_tail], dim=2)  # (B,Pnn,T)
+
+        # ------------------------
+        # 2) 요각속도 증분 dw: (B,Pnn,T-1)
+        # ------------------------
+        dw = omega[..., 1:] - omega[..., :-1]  # (B,Pnn,T-1)
+
+        dw_limit = (alpha_max.to(dtype=omega.dtype,
+                                 device=omega.device) * float(dt))  # (B,Pnn)
+        dw_limit_bpt = dw_limit.unsqueeze(-1).expand(B, Pnn,
+                                                     T - 1)  # (B,Pnn,T-1)
+
+        dw_ste = self._ste_scalar_clip(
+            x=dw,  # (B,Pnn,T-1)
+            limit=dw_limit_bpt,  # (B,Pnn,T-1)
+            eta=eta,
+            eps=eps,
+        )  # (B,Pnn,T-1)
+
+        dw_prefix = torch.cumsum(dw_ste, dim=2)  # (B,Pnn,T-1)
+
+        w0 = omega[..., :1]  # (B,Pnn,1)
+        w_tail = w0 + dw_prefix  # (B,Pnn,T-1)
+        omega_out = torch.cat([w0, w_tail], dim=2)  # (B,Pnn,T)
+
+        return vx_out, vy_out, omega_out
+
     # [추가 요망] (S3: 속도-연동 각속도 한계 — w clip, no slip angle)
     def _apply_S3_omega_clip_ste(
         self,
@@ -2953,6 +3082,61 @@ class FeasibleProjector(nn.Module):
         vy_b_new = vy_b_prev + dv_sc[..., 1]  # (B,Pnn)
         omega_new = s * omega_k  # (B,Pnn)
         return vx_b_new, vy_b_new, omega_new
+
+    @staticmethod
+    def _ste_increment_vec_nd(
+            dv: torch.Tensor,  # (..., 2)
+            limit: torch.Tensor,  # (...,)
+            eta: float,
+            eps: float,
+    ) -> torch.Tensor:
+        """증분(2D 벡터) 노름 제한을 STE 방식으로 적용합니다.
+
+        forward(값 계산):
+            - dv의 크기(2D 노름)가 limit보다 크면, limit에 맞게 같은 비율로 줄입니다.
+            - dv의 방향(부호/방향)은 유지합니다.
+
+        backward(학습 기울기):
+            - 기존 코드의 밴드(eta) 규칙을 그대로 사용해
+              limit 근처에서만 기울기가 자연스럽게 흐르도록 만듭니다.
+
+        Args:
+            dv (torch.Tensor):
+                shape: (..., 2)
+                연속한 두 시점의 속도 변화량입니다. 마지막 축 2는 [dvx, dvy]입니다.
+            limit (torch.Tensor):
+                shape: dv.shape[:-1]
+                각 위치별 허용 변화량 크기(예: a_max*dt)입니다.
+            eta (float):
+                STE 밴드 폭(기존과 동일한 의미).
+            eps (float):
+                0 나눗셈 방지용 작은 값.
+
+        Returns:
+            torch.Tensor:
+                shape: (..., 2)
+                노름 제한이 적용된 변화량.
+        """
+        if limit.shape != dv.shape[:-1]:
+            raise ValueError(
+                "[_ste_increment_vec_nd] limit.shape 와 dv.shape[:-1]가 다릅니다. "
+                f"limit.shape={tuple(limit.shape)}, dv.shape={tuple(dv.shape)}"
+            )
+
+        limit_f = limit.to(dtype=dv.dtype, device=dv.device)  # (...,)
+        limit_f_ex = limit_f.unsqueeze(-1)  # (..., 1)
+
+        norm = torch.linalg.norm(dv, dim=-1, keepdim=True).clamp_min(
+            eps)  # (..., 1)
+        s_hard = torch.clamp(limit_f_ex / norm, max=1.0)  # (..., 1)
+        dv_hard = s_hard * dv  # (..., 2)
+
+        r = (norm.squeeze(-1)) / (limit_f + eps)  # (...,)
+        w = FeasibleProjector._ste_band_weight(r, eta).unsqueeze(-1)  # (..., 1)
+
+        dv_sur = w * dv + (1.0 - w) * dv.detach()  # (..., 2)
+        dv_out = dv_sur + (dv_hard - dv_sur).detach()  # (..., 2)
+        return dv_out
 
     # ----------------------------
     # [NEW] 한 스텝: 제약 S0~S4 적용(모두 STE 버전 호출)

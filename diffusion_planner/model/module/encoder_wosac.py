@@ -1337,88 +1337,98 @@ class SelfAttentionBlock(nn.Module):
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
         return x
 
-
 class StaticFusionEncoder(nn.Module):
 
-    def __init__(self,
-                 dim,
-                 drop_path_rate=0.3,
-                 hidden_dim=192,
-                 device="cuda",
-                 num_fourier_frequencies=4,
-                 time_gap=0.1,
-                 time_min=-2.0,
-                 time_max=8.0):
+    def __init__(
+        self,
+        dim: int,
+        drop_path_rate: float = 0.3,
+        hidden_dim: int = 192,
+        device: str = "cuda",
+        num_fourier_frequencies: int = 4,
+        time_gap: float = 0.1,
+        time_min: float = -2.0,
+        time_max: float = 8.0,
+    ) -> None:
         super().__init__()
-        self.time_gap = time_gap
-        self.time_min = time_min
-        self.time_max = time_max
-        self._hidden_dim = hidden_dim
-        self.projection = Mlp(in_features=dim,
-                              hidden_features=hidden_dim,
-                              out_features=hidden_dim,
-                              act_layer=nn.GELU,
-                              drop=drop_path_rate)
+        self.time_gap = float(time_gap)
+        self.time_min = float(time_min)
+        self.time_max = float(time_max)
+        self._hidden_dim = int(hidden_dim)
 
-    def forward(self, static_objects, static_objects_is_valid):
-        """
-        static_objects: (B, static_objects_num, D_static)
-        static_objects_is_valid : (B, static_objects_num)  True=유효
-
-        returns:
-            static_encoding: (B, static_objects_num, hidden_dim)
-            static_feature: (B, static_objects_num, 9)
-        """
-        B, static_objects_num, _ = static_objects.shape
-
-        # ✅ is_valid는 반드시 bool로 통일
-        static_objects_is_valid = static_objects_is_valid.to(torch.bool)
-
-        static_xyyaw = static_objects[:, :, :4].clone(
-        )  # (B, static_objects_num, 4)
-        static_feature = self._get_static_feature(
-            static_xyyaw)  # (B, static_objects_num, 9)
-
-        # autocast 환경이면 autocast dtype을, 아니면 입력 dtype 사용
-        out_dtype = (torch.get_autocast_gpu_dtype()
-                     if torch.is_autocast_enabled() and static_objects.is_cuda
-                     else static_objects.dtype)
-
-        static_encoding = torch.zeros(
-            (B * static_objects_num, self._hidden_dim),
-            device=static_objects.device,
-            dtype=out_dtype,
+        # ✅ 이미 너가 넣어둔 경량화(중간폭=hidden_dim//2) 유지
+        self.projection = Mlp(
+            in_features=int(dim),
+            hidden_features=int(hidden_dim // 2),
+            out_features=int(hidden_dim),
+            act_layer=nn.GELU,
+            drop=float(drop_path_rate),
         )
 
-        # mask_p: (B, static_objects_num) True=무효
-        mask_p = ~static_objects_is_valid
-        valid_indices = ~mask_p.reshape(-1)  # (B * static_objects_num,)
+    def forward(
+        self,
+        static_objects: torch.Tensor,          # (B, P, D_static)
+        static_objects_is_valid: torch.Tensor  # (B, P)  True=유효
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """정적 물체를 임베딩으로 바꾸고, 위치/종류 pos(9차원)를 반환합니다.
 
-        if valid_indices.any().item():
-            static_objects_flat = static_objects.reshape(
-                B * static_objects_num, -1)
-            static_objects_valid = static_objects_flat[valid_indices]
-            static_objects_valid = self.projection(static_objects_valid)
-            static_objects_valid = static_objects_valid.to(
-                dtype=static_encoding.dtype)
-            static_encoding[valid_indices] = static_objects_valid
-        else:
-            # ✅ dtype 승격 방지: touch 누적을 static_encoding dtype으로 맞춤
-            touch = static_encoding.new_zeros(())  # scalar, dtype=out_dtype
-            for p in self.projection.parameters():
-                touch = touch + p.view(-1)[:1].sum().to(
-                    dtype=static_encoding.dtype,
-                    device=static_encoding.device,
-                )
-            zero = static_encoding.new_zeros(())  # scalar 0, dtype=out_dtype
-            static_encoding = static_encoding + touch * zero  # 값 변화 없음, dtype 유지
+        변경점(핵심)
+        ----------
+        - 기존처럼 valid만 뽑아서 MLP→scatter 하지 않고,
+          (B,P,D) 전체를 한 번에 MLP에 통과시킨 뒤
+          invalid 위치만 마지막에 0으로 만듭니다.
 
-        hidden_dim = static_encoding.shape[-1]
-        static_encoding = static_encoding.reshape(B, static_objects_num,
-                                                  hidden_dim)
+        Args:
+            static_objects:
+                (B, P, D_static)
+            static_objects_is_valid:
+                (B, P) bool 또는 0/1 텐서. True=유효.
+
+        Returns:
+            static_encoding:
+                (B, P, H)  (invalid는 0)
+            static_feature:
+                (B, P, 9)  = [x,y,cos,sin] + type_onehot(5) (static=1)
+        """
+        if static_objects.dim() != 3:
+            raise ValueError(
+                "static_objects must be (B, P, D_static) 3D tensor. "
+                f"got shape={tuple(static_objects.shape)}"
+            )
+        if static_objects_is_valid.dim() != 2:
+            raise ValueError(
+                "static_objects_is_valid must be (B, P) 2D tensor. "
+                f"got shape={tuple(static_objects_is_valid.shape)}"
+            )
+
+        B, P, _ = static_objects.shape
+
+        # ✅ is_valid는 반드시 bool로 통일
+        valid_bp = static_objects_is_valid.to(torch.bool)  # (B, P)
+        pad_bp = ~valid_bp                                  # (B, P) True=무효
+
+        # 1) pos(=static_feature) 만들기: (B,P,9)
+        static_xyyaw = static_objects[..., :4]  # (B, P, 4)  clone 제거
+        static_feature = static_xyyaw.new_zeros((B, P, 9))  # (B, P, 9)
+        static_feature[..., :4] = static_xyyaw
+        # type_onehot(5) 중 static index=2 → 전체 9에서 4+2=6
+        static_feature[..., 6] = 1.0
+
+        # 2) 전체를 한 번에 projection → invalid만 0
+        out_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if torch.is_autocast_enabled() and static_objects.is_cuda
+            else static_objects.dtype
+        )
+
+        static_encoding = self.projection(static_objects)  # (B, P, H) (AMP면 자동 캐스팅)
+        static_encoding = static_encoding.to(dtype=out_dtype, device=static_objects.device)
+        static_encoding = static_encoding.masked_fill(pad_bp.unsqueeze(-1), 0.0)
+
         return static_encoding, static_feature
 
     def _get_static_feature(self, static_xyyaw: torch.Tensor) -> torch.Tensor:
+        # (기존 호환용으로 남겨둠 - 필요하면 지워도 됩니다)
         B, static_objects_num, _ = static_xyyaw.shape
         static_type = torch.zeros(
             (B, static_objects_num, 5),
@@ -1427,8 +1437,6 @@ class StaticFusionEncoder(nn.Module):
         )
         static_type[:, :, 2] = 1.0
         static_feature = torch.cat([static_xyyaw, static_type], dim=-1)
-        assert static_feature.shape == (B, static_objects_num, 9), \
-            f"Expected static_feature shape (B, static_objects_num, 9), got {static_feature.shape}"
         return static_feature
 
 
