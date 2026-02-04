@@ -4,7 +4,7 @@ import torch.nn as nn
 from diffusion_planner.utils.normalizer import StateNormalizer
 from dataclasses import dataclass, asdict
 from enum import Enum
-from typing import Dict, Iterable, List, Tuple, Union, TypedDict, Optional
+from typing import Dict, Iterable, List, Tuple, Union, TypedDict, Optional, Callable
 from scipy.signal import savgol_filter  # type: ignore
 import math
 import numpy as np
