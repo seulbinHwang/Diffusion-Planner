@@ -742,6 +742,26 @@ class FeasibleProjector(nn.Module):
 
         return use_past
 
+    @staticmethod
+    def _min_sg_window_length(polyorder: int) -> int:
+        """Savitzky–Golay에서 쓸 창 길이(window_length)의 최소값(홀수)을 계산합니다.
+
+        - 일반적으로 window_length는 polyorder보다 커야 합니다.
+        - 안정적으로 쓰려면 보통 polyorder+2 이상이 안전합니다.
+        - SG는 보통 홀수 길이를 쓰므로, 여기서 홀수로 맞춥니다.
+
+        Args:
+            polyorder (int): SG 다항식 차수
+
+        Returns:
+            int: 최소 창 길이(홀수, 최소 3)
+        """
+        p = int(max(polyorder, 0))
+        w = max(3, p + 2)  # polyorder+2 이상
+        if w % 2 == 0:
+            w += 1
+        return w
+
     def _build_stride_indices_with_past(
         self,
         past_len: int,
@@ -1163,63 +1183,79 @@ class FeasibleProjector(nn.Module):
         return upsampled
 
     def get_feasible_stride_params(
-        self,
-        future_len: int,
+            self,
+            future_len: int,
     ) -> Tuple[int, float, int, int]:
         """FeasibleProjector용 다운샘플링 간격과 SG 윈도 길이를 계산합니다.
 
-        Args:
-            future_len: 미래 노드 개수 T. (예: 80)
+        추가된 안전장치:
+            - stride_step이 커져도 SG 창 길이가 1/3 같은 값으로 내려가서
+              SG가 사실상 꺼지거나 품질이 흔들리지 않게,
+              max_window_len_xy/yaw에 최소 하한을 강제합니다.
+            - 최소 하한은 polyorder 기반(polyorder+2, 홀수)으로 잡습니다.
+              (기본 polyorder=2 → 최소 5)
 
         Returns:
-            stride_step: 정수 스트라이드 (1이면 다운샘플링 없음).
-            dt_for_savgol: SG 필터에 넘길 샘플 간 시간 간격 [초].
-            max_window_len_xy: x,y 좌표에 사용할 최대 윈도 길이(샘플 수).
-            max_window_len_yaw: yaw에 사용할 최대 윈도 길이(샘플 수).
+            stride_step: 정수 스트라이드
+            dt_for_savgol: SG에 넘길 샘플 간 시간 간격 [초]
+            max_window_len_xy: x,y에 사용할 최대 창 길이(샘플 수)
+            max_window_len_yaw: yaw에 사용할 최대 창 길이(샘플 수)
         """
-
-        # FeasibleProjector 내부에서 사용하는 base dt (원래 타임스텝, 예: 0.1s)
         base_dt: float = float(self.constraints_h_params.dt)
 
-        # 사용자가 원하는 다운샘플 간격(초). 없으면 base_dt 그대로 사용.
         desired_dt: float = float(
             getattr(self.config, "feasible_stride_dt", base_dt))
-        # base_dt 보다 작게 들어오면 의미가 없으니 최소 base_dt로 클램프
         if desired_dt < base_dt:
             desired_dt = base_dt
 
-        # index 기준 스트라이드 = 원하는 시간 간격 / base_dt
         stride_step: int = max(1, int(round(desired_dt / base_dt)))
         dt_for_savgol: float = base_dt * float(stride_step)
 
-        # "보고 싶은 시간 길이"를 초 단위로 고정해 두고,
-        # stride에 맞게 샘플 개수를 다시 계산한다.
         default_window_xy: int = int(
             getattr(self.config, "feasible_sg_max_window_len_xy", 11))
         default_window_yaw: int = int(
             getattr(self.config, "feasible_sg_max_window_len_yaw", 7))
+
         window_time_xy: float = base_dt * float(default_window_xy)
         window_time_yaw: float = base_dt * float(default_window_yaw)
 
         max_window_len_xy: int = max(1,
                                      int(round(window_time_xy / dt_for_savgol)))
-        max_window_len_yaw: int = max(
-            1, int(round(window_time_yaw / dt_for_savgol)))
+        max_window_len_yaw: int = max(1, int(round(
+            window_time_yaw / dt_for_savgol)))
 
-        # SG 필터 특성상 홀수 길이 강제
+        # ---------- [추가] SG 최소 창 길이 보장 ----------
+        # 현재 코드 경로에서 polyorder는 2로 쓰고 있으므로 기본값 2로 둡니다.
+        # 필요하면 config로 바꿀 수 있게 해 둡니다.
+        poly_xy: int = int(getattr(self.config, "feasible_sg_polyorder_xy", 2))
+        poly_yaw: int = int(
+            getattr(self.config, "feasible_sg_polyorder_yaw", 2))
+
+        min_xy: int = self._min_sg_window_length(poly_xy)  # 예: poly=2 -> 5
+        min_yaw: int = self._min_sg_window_length(poly_yaw)  # 예: poly=2 -> 5
+
+        max_window_len_xy = max(int(max_window_len_xy), int(min_xy))
+        max_window_len_yaw = max(int(max_window_len_yaw), int(min_yaw))
+        # -----------------------------------------------
+
+        # 홀수 길이 강제
         if max_window_len_xy % 2 == 0:
             max_window_len_xy += 1
         if max_window_len_yaw % 2 == 0:
             max_window_len_yaw += 1
 
-        # 너무 큰 창은 실제 시퀀스 길이보다 약간만 크게 제한
-        max_allow_window: int = future_len + 1
+        # 너무 큰 창은 제한(기존 로직 유지)
+        max_allow_window: int = int(future_len + 1)
         max_window_len_xy = min(max_window_len_xy, max_allow_window)
         max_window_len_yaw = min(max_window_len_yaw, max_allow_window)
 
-        # 현재 설계에서는 "현재 → 마지막 미래 노드"가 항상 포함되고
-        # 그 사이가 등간격이 되어야 하므로
-        # stride_step 이 future_len 을 정확히 나누지 못하면 에러로 알려준다.
+        # cap 이후 짝수가 될 수 있으니 다시 홀수로 맞춤(가능하면 -1로)
+        if max_window_len_xy % 2 == 0:
+            max_window_len_xy = max(1, max_window_len_xy - 1)
+        if max_window_len_yaw % 2 == 0:
+            max_window_len_yaw = max(1, max_window_len_yaw - 1)
+
+        # stride_step이 future_len을 정확히 나누어야 한다(기존 유지)
         if future_len % stride_step != 0:
             raise ValueError(
                 "[FeasibleProjector] future_len="
@@ -2304,22 +2340,9 @@ class FeasibleProjector(nn.Module):
         """마스크를 고려한 depthwise conv을 (B*Pnn, C, T) 형태에서 수행합니다.
 
         변경점(요청 반영):
-            - 분모 den을 구할 때, 기존에는 conv1d(mask, ones)를 한 번 더 돌렸습니다.
-            - 이제는 mask가 '한 덩어리(0*1*0*)'라는 가정 하에,
-              커널이 보는 위치들을 정수로 계산해서 den을 만듭니다.
-            - 따라서 블록당 conv는 1번(분자)만 실행됩니다.
-
-        Args:
-            x_bct:
-                shape (B*Pnn, C, T)
-            mask_b1t:
-                shape (B*Pnn, 1, T), 값 0/1 또는 bool
-            block_idx:
-                사용할 depthwise conv 블록 인덱스
-
-        Returns:
-            torch.Tensor:
-                shape (B*Pnn, C, T)
+            - den은 '유효 샘플 개수'이므로 값이 0,1,2,... 형태입니다.
+            - den==0인 경우를 포함해 분모가 너무 작아지는 것을 막기 위해
+              den을 최소 1.0으로 클램프합니다.
         """
         if x_bct.numel() == 0:
             return x_bct
@@ -2350,8 +2373,10 @@ class FeasibleProjector(nn.Module):
 
         # -----------------
         # 정규화
+        #  - den은 유효 샘플 개수(0,1,2,...)라서 최소 1로 클램프하는 게 안전합니다.
         # -----------------
-        y = y_num / den.clamp_min(self._eps)  # (B*Pnn, C, T)
+        den_safe = den.clamp_min(1.0)  # (B*Pnn, 1, T)
+        y = y_num / den_safe  # (B*Pnn, C, T)
         return y
 
     def _depthwise_conv_masked(
@@ -3463,113 +3488,109 @@ class FeasibleProjector(nn.Module):
     # 4) S2 (증분 제한) soft clip 수정
     # ==========================================
 
-    # ============================
-    # [REFACTORED] 본체: Filter + Integrate
-    # ============================
     def _filter_and_integrate_sequential(
             self,
             unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
             near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
-            unnorm_cur_future_seg_body_control: torch.
-        Tensor,  # (B, Pnn, future_len, 3)
+            unnorm_cur_future_seg_body_control: torch.Tensor,
+            # (B, Pnn, future_len, 3)
             near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # self._assert_cur_future_valid_mask(near_cur_future_valid,
-        #                                    context="filter_and_integrate")
         B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
         device = unnorm_cur_future_seg_body_control.device
         dtype = unnorm_cur_future_seg_body_control.dtype
+
         if future_len == 0:
             raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
-            # 맨 앞에 추가
-        """ key_to_limit_bp
-        Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn) 
 
-        v_max/a_max/alpha_max/a_lat_max/R_min
-        /omega_abs_max/a_x_max/a_y_max, is_nonholonomic
-        """
         key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
-            near_class_one_hot, device=device, dtype=dtype)
-        # (B,Pnn,future_len)
-        vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
-            unnorm_cur_future_seg_body_control)
-        """ key_to_all_states
-        x_next / y_next / cos_next / sin_next: (B,Pnn,future_len)
-        vx_after / vy_after / omega_after: (B,Pnn,future_len)
-        """
-        key_to_all_states: Dict[str,
-                                torch.Tensor] = self._init_integration_buffers(
-                                    B, Pnn, future_len, dtype, device)
+            near_class_one_hot, device=device, dtype=dtype
+        )
 
-        x_k = unnorm_near_current_state[..., 0]  # (B,Pnn)
-        y_k = unnorm_near_current_state[..., 1]  # (B,Pnn)
-        cos_yaw_k = unnorm_near_current_state[..., 2]  # (B,Pnn)
-        sin_yaw_k = unnorm_near_current_state[..., 3]  # (B,Pnn)
-        vx_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)  # (B,Pnn)
-        vy_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)  # (B,Pnn)
-        omega_prev = torch.zeros((B, Pnn), device=device,
-                                 dtype=dtype)  # (B,Pnn)
+        vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
+            unnorm_cur_future_seg_body_control
+        )  # (B,Pnn,T) 각각
+
+        # 초기 상태 (B,Pnn)
+        x_k = unnorm_near_current_state[..., 0]
+        y_k = unnorm_near_current_state[..., 1]
+        cos_yaw_k = unnorm_near_current_state[..., 2]
+        sin_yaw_k = unnorm_near_current_state[..., 3]
+
+        vx_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+        vy_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+        omega_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+
+        # ✅ in-place 버퍼 저장 대신, 리스트에 쌓아서 마지막에 stack
+        x_list: List[torch.Tensor] = []
+        y_list: List[torch.Tensor] = []
+        cos_list: List[torch.Tensor] = []
+        sin_list: List[torch.Tensor] = []
+        vx_list: List[torch.Tensor] = []
+        vy_list: List[torch.Tensor] = []
+        omega_list: List[torch.Tensor] = []
 
         for k in range(future_len):
             apply_S2_k = (k > 0)
             apply_S4_ax_k = (k > 0)
 
-            # (B,Pnn)
-            vx_b_k, vy_b_k, yaw_rate_k = vx_b_raw[..., k], vy_b_raw[
-                ..., k], omega_raw[..., k]
-            """ key_to_limit_bp
-            Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn) 
+            vx_b_k = vx_b_raw[..., k]  # (B,Pnn)
+            vy_b_k = vy_b_raw[..., k]  # (B,Pnn)
+            yaw_rate_k = omega_raw[..., k]  # (B,Pnn)
 
-            v_max/a_max/alpha_max/a_lat_max/R_min
-            /omega_abs_max/a_x_max/a_y_max, is_nonholonomic
-            """
-            # [STE] S0~S4
             if self.use_feasible_filter:
                 vx_b_k, vy_b_k, yaw_rate_k = self._apply_constraints_step(
-                    vx_b_prev,  # (B,Pnn)
-                    vy_b_prev,  # (B,Pnn)
-                    omega_prev,  # (B,Pnn)
-                    vx_b_k,  # (B,Pnn)
-                    vy_b_k,  # (B,Pnn)
-                    yaw_rate_k,  # (B,Pnn)
-                    hp=self.constraints_h_params,  # _ConstraintHParams
-                    key_to_limit_bp=
-                    key_to_limit_bp,  # Dict[str, torch.Tensor]: Tensor 은 전부 (B,Pnn)
+                    vx_b_prev=vx_b_prev,
+                    vy_b_prev=vy_b_prev,
+                    omega_prev=omega_prev,
+                    vx_b_k=vx_b_k,
+                    vy_b_k=vy_b_k,
+                    omega_k=yaw_rate_k,
+                    hp=self.constraints_h_params,
+                    key_to_limit_bp=key_to_limit_bp,
                     apply_S2=apply_S2_k,
                     apply_S4_ax=apply_S4_ax_k,
                 )
-            x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(
-                x_k, y_k, cos_yaw_k, sin_yaw_k, vx_b_k, vy_b_k, yaw_rate_k,
-                self.constraints_h_params)
 
-            key_to_all_states["x_next"][..., k] = x_k1  # (B,Pnn)
-            key_to_all_states["y_next"][..., k] = y_k1  # (B,Pnn)
-            key_to_all_states["cos_next"][..., k] = cos_k1  # (B,Pnn)
-            key_to_all_states["sin_next"][..., k] = sin_k1  # (B,Pnn)
-            key_to_all_states["vx_after"][..., k] = vx_b_k  # (B,Pnn)
-            key_to_all_states["vy_after"][..., k] = vy_b_k  # (B,Pnn)
-            key_to_all_states["omega_after"][..., k] = yaw_rate_k  # (B,Pnn)
+            x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(
+                x_k=x_k,
+                y_k=y_k,
+                cos_yaw_k=cos_yaw_k,
+                sin_yaw_k=sin_yaw_k,
+                vx_b_k=vx_b_k,
+                vy_b_k=vy_b_k,
+                omega_k=yaw_rate_k,
+                hp=self.constraints_h_params,
+            )
+
+            x_list.append(x_k1)
+            y_list.append(y_k1)
+            cos_list.append(cos_k1)
+            sin_list.append(sin_k1)
+            vx_list.append(vx_b_k)
+            vy_list.append(vy_b_k)
+            omega_list.append(yaw_rate_k)
 
             x_k, y_k, cos_yaw_k, sin_yaw_k = x_k1, y_k1, cos_k1, sin_k1
             vx_b_prev, vy_b_prev, omega_prev = vx_b_k, vy_b_k, yaw_rate_k
-        """ key_to_all_states
-        x_next / y_next / cos_next / sin_next: (B,Pnn,future_len)
-        vx_after / vy_after / omega_after: (B,Pnn,future_len)
 
-        vx_b_raw: (B,Pnn,future_len)
-        vy_b_raw: (B,Pnn,future_len)
-        omega_raw: (B,Pnn,future_len)
+        key_to_all_states: Dict[str, torch.Tensor] = {
+            "x_next": torch.stack(x_list, dim=2),  # (B,Pnn,T)
+            "y_next": torch.stack(y_list, dim=2),  # (B,Pnn,T)
+            "cos_next": torch.stack(cos_list, dim=2),  # (B,Pnn,T)
+            "sin_next": torch.stack(sin_list, dim=2),  # (B,Pnn,T)
+            "vx_after": torch.stack(vx_list, dim=2),  # (B,Pnn,T)
+            "vy_after": torch.stack(vy_list, dim=2),  # (B,Pnn,T)
+            "omega_after": torch.stack(omega_list, dim=2),  # (B,Pnn,T)
+        }
 
-        near_cur_future_valid: (B,Pnn,1+future_len) bool
-        """
-        return self._assemble_outputs(key_to_all_states, vx_b_raw, vy_b_raw,
-                                      omega_raw, near_cur_future_valid)
-
-    # 지우개: 아래 기존 filter_and_integrate 본문 전체를 대체합니다.
-    # def filter_and_integrate(...):
-    #     (기존 step-by-step for 루프 구현)
-    #     ...
-
+        return self._assemble_outputs(
+            key_to_all_states=key_to_all_states,
+            vx_b_raw=vx_b_raw,
+            vy_b_raw=vy_b_raw,
+            omega_raw=omega_raw,
+            near_cur_future_valid=near_cur_future_valid,
+        )
 
     def _compute_active_indices_from_near_cur_future_valid(
         self,
@@ -3638,41 +3659,44 @@ class FeasibleProjector(nn.Module):
         return state_active, valid_active, ctrl_active, class_active
 
     def _scatter_active_subset_for_filter_and_integrate(
-        self,
-        unnorm_integrated_trajectory_active: torch.Tensor,      # (N_active, 1, T, 4)
-        unnorm_control_constraint_diff_active: torch.Tensor,    # (N_active, 1, T, 3)
-        active_indices: torch.Tensor,                           # (N_active,)
-        *,
-        B: int,
-        Pnn: int,
-        T: int,
-        device: torch.device,
-        dtype: torch.dtype,
+            self,
+            unnorm_integrated_trajectory_active: torch.Tensor,
+            # (N_active, 1, T, 4)
+            unnorm_control_constraint_diff_active: torch.Tensor,
+            # (N_active, 1, T, 3)
+            active_indices: torch.Tensor,  # (N_active,)
+            *,
+            B: int,
+            Pnn: int,
+            T: int,
+            device: torch.device,
+            dtype: torch.dtype,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """active 결과를 (B,Pnn,...) 원래 위치로 되돌리고, inactive는 0으로 둡니다.
 
-        Args:
-            unnorm_integrated_trajectory_active: (N_active, 1, T, 4)
-            unnorm_control_constraint_diff_active: (N_active, 1, T, 3)
-            active_indices: (N_active,)
-            B, Pnn, T: 원래 배치/이웃/시간 길이
-            device, dtype: 출력 텐서의 device/dtype
-
-        Returns:
-            unnorm_integrated_trajectory: (B, Pnn, T, 4)
-            unnorm_control_constraint_diff: (B, Pnn, T, 3)
+        핵심:
+            - in-place index_copy_로 '값만 복사'하지 않고,
+            - out-of-place index_copy로 "새 텐서"를 만들어
+              active 결과 → 최종 출력으로 학습 신호가 이어지게 합니다.
         """
         B_Pnn = int(B * Pnn)
 
-        out_traj_flat = torch.zeros((B_Pnn, T, 4), device=device, dtype=dtype)  # (B*Pnn, T, 4)
-        out_diff_flat = torch.zeros((B_Pnn, T, 3), device=device, dtype=dtype)  # (B*Pnn, T, 3)
+        out_traj_flat = torch.zeros((B_Pnn, T, 4), device=device,
+                                    dtype=dtype)  # (B*Pnn, T, 4)
+        out_diff_flat = torch.zeros((B_Pnn, T, 3), device=device,
+                                    dtype=dtype)  # (B*Pnn, T, 3)
 
         if int(active_indices.numel()) > 0:
-            idx = active_indices.to(device=device, dtype=torch.long)  # (N_active,)
-            traj_src = unnorm_integrated_trajectory_active.squeeze(1)          # (N_active, T, 4)
-            diff_src = unnorm_control_constraint_diff_active.squeeze(1)        # (N_active, T, 3)
-            out_traj_flat.index_copy_(0, idx, traj_src)
-            out_diff_flat.index_copy_(0, idx, diff_src)
+            idx = active_indices.to(device=device,
+                                    dtype=torch.long)  # (N_active,)
+            traj_src = unnorm_integrated_trajectory_active.squeeze(1).to(
+                device=device, dtype=dtype)  # (N_active, T, 4)
+            diff_src = unnorm_control_constraint_diff_active.squeeze(1).to(
+                device=device, dtype=dtype)  # (N_active, T, 3)
+
+            # ✅ out-of-place
+            out_traj_flat = out_traj_flat.index_copy(0, idx, traj_src)
+            out_diff_flat = out_diff_flat.index_copy(0, idx, diff_src)
 
         out_traj = out_traj_flat.view(B, Pnn, T, 4)  # (B, Pnn, T, 4)
         out_diff = out_diff_flat.view(B, Pnn, T, 3)  # (B, Pnn, T, 3)
@@ -4503,43 +4527,38 @@ class FeasibleProjector(nn.Module):
         delta_u_active = delta_u_active.squeeze(1)  # (N_active, segment_len, 3)
         return delta_u_active
 
-    # [!추가하자!]
     def _scatter_forward_delta_u(
-        self,
-        seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
-        delta_u_active: torch.Tensor,  # (N_active, segment_len, 3)
-        active_indices: torch.Tensor,  # (N_active,)
-        B: int,
-        Pnn: int,
-        segment_len: int,
+            self,
+            seg_body_control: torch.Tensor,  # (B, Pnn, segment_len, 3)
+            delta_u_active: torch.Tensor,  # (N_active, segment_len, 3)
+            active_indices: torch.Tensor,  # (N_active,)
+            B: int,
+            Pnn: int,
+            segment_len: int,
     ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)
         """active 이웃들에서 계산한 ΔU를 전체 (B,Pnn,segment_len,3) 텐서로 되돌립니다.
 
-        - inactive 이웃의 ΔU는 0으로 두고,
-        - active 이웃 위치에만 ΔU를 채운 뒤,
-        - 최종적으로 U_ref = U_base + ΔU 를 구성합니다.
-
-        Args:
-            seg_body_control: (B, Pnn, segment_len, 3)
-                베이스 제어 U_base.
-            delta_u_active: (N_active, segment_len, 3)
-                active 이웃들의 ΔU.
-            active_indices: (N_active,)
-                flatten된 row 인덱스 (0..B*Pnn-1).
-            B: 배치 크기.
-            Pnn: neighbor 슬롯 수.
-            segment_len: 세그먼트 길이.
-
-        Returns:
-            u_ref: (B, Pnn, segment_len, 3)
-                보정된 제어.
+        핵심:
+            - in-place로 '값만 복사'하지 않고,
+            - out-of-place index_copy로 "새 텐서"를 만들어
+              delta_u_active → u_ref로 학습 신호가 이어지게 합니다.
         """
-        B_Pnn = B * Pnn
-        seg_body_control_flat = seg_body_control.view(
-            B_Pnn, segment_len, 3)  # (B*Pnn, segment_len, 3)
-        delta_u_flat = torch.zeros_like(
-            seg_body_control_flat)  # (B*Pnn, segment_len, 3)
-        delta_u_flat[active_indices] = delta_u_active  # active 위치만 채움
+        B_Pnn = int(B * Pnn)
+
+        seg_body_control_flat = seg_body_control.view(B_Pnn, segment_len,
+                                                      3)  # (B*Pnn, segment_len, 3)
+
+        # inactive는 0, active만 채운 delta_u_flat을 "새로" 만든다.
+        delta_u_flat = seg_body_control_flat.new_zeros(
+            (B_Pnn, segment_len, 3))  # (B*Pnn, segment_len, 3)
+
+        if int(active_indices.numel()) > 0:
+            idx = active_indices.to(device=seg_body_control.device,
+                                    dtype=torch.long)  # (N_active,)
+            src = delta_u_active.to(device=seg_body_control.device,
+                                    dtype=seg_body_control_flat.dtype)  # (N_active, segment_len, 3)
+            delta_u_flat = delta_u_flat.index_copy(0, idx,
+                                                   src)  # ✅ out-of-place
 
         delta_u = delta_u_flat.view(B, Pnn, segment_len,
                                     3)  # (B, Pnn, segment_len, 3)

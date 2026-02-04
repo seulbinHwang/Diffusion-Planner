@@ -637,6 +637,8 @@ class Encoder(nn.Module):
         if M > 0:
             # type_onehot(5)의 마지막(road_safety) 위치 = index 8
             road_safety_pos[:, :, 8] = 1.0
+        road_safety_pos = road_safety_pos.masked_fill(
+            road_safety_mask.unsqueeze(-1), 0.0)
 
         # ----- (C) 파라미터를 0계수로 아주 약하게 연결(값은 그대로 0) -----
         # touch_f32: shape ()
@@ -695,35 +697,21 @@ class Encoder(nn.Module):
         known_mask = time_index.unsqueeze(0) < prefix_lengths.unsqueeze(1)
         return known_mask  # (B, N), bool
 
-
     def _ensure_static_objects_tensor(
-        self,
-        static_objects: Optional[torch.Tensor],
-        static_objects_is_valid: Optional[torch.Tensor],
-        batch_size: int,
-        ref_tensor: torch.Tensor,
+            self,
+            static_objects: Optional[torch.Tensor],
+            static_objects_is_valid: Optional[torch.Tensor],
+            batch_size: int,
+            ref_tensor: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """static_objects가 None이어도 정적 물체 인코더가 항상 동작하도록 입력 텐서를 보장합니다.
 
-        학습 데이터에서 정적 물체가 하나도 없는 장면은 `static_objects=None`으로 들어올 수 있습니다.
-        그런데 StaticFusionEncoder는 내부에서 `static_objects.shape`를 바로 사용하므로,
-        None이면 즉시 에러가 납니다.
-
-        이 함수는 None인 경우에도 **정적 물체 인코더가 실제로 실행되도록**
-        (B, P, D_static) 형태의 텐서를 만들어 반환합니다.
-
-        동작 방식(쉽게 설명):
-            1) static_objects가 텐서면:
-               - (B, P, D_static) 모양인지 확인하고,
-               - device가 다르면 ref_tensor의 device로만 옮겨서 그대로 반환합니다.
-
-            2) static_objects가 None이면,
-               - (B, P, D_static) 텐서를 새로 만듭니다.
-               - P는  1로 둡니다.
+        핵심 보장:
+            - static_objects가 주어지면 static_objects와 static_objects_is_valid를
+              둘 다 ref_tensor.device로 맞춥니다. (CPU/GPU 불일치 방지)
+            - static_objects가 None이면 placeholder 텐서와 is_valid(False) 마스크를 만듭니다.
         """
         B: int = int(batch_size)
-
-        # D_static: 정적 물체 feature 차원
         D_static: int = int(getattr(self.config, "static_objects_state_dim"))
 
         # -------------------------
@@ -732,21 +720,32 @@ class Encoder(nn.Module):
         if static_objects is not None:
             assert static_objects_is_valid is not None, \
                 "static_objects_is_valid must be provided when static_objects is given"
-            # (B, P, D_static)
+
+            # static_objects: (B, P, D_static)
             if static_objects.device != ref_tensor.device:
                 static_objects = static_objects.to(device=ref_tensor.device)
+
+            # ✅ static_objects_is_valid도 반드시 같은 device로 이동
+            if static_objects_is_valid.device != ref_tensor.device:
+                static_objects_is_valid = static_objects_is_valid.to(
+                    device=ref_tensor.device)
+
             return static_objects, static_objects_is_valid
 
         # -------------------------
-        # (2) None(또는 사실상 비어있음)인 경우: "없음 표시" 입력 생성
+        # (2) None인 경우: "없음 표시" 입력 생성
         # -------------------------
-        # placeholder_static_objects: (B, P, D_static)
-        static_objects_num = 1
+        static_objects_num: int = 1
         placeholder_static_objects: torch.Tensor = ref_tensor.new_zeros(
-            (B, static_objects_num, D_static))
-        static_objects_is_valid: torch.Tensor = ref_tensor.new_zeros(
-            (B, static_objects_num), dtype=torch.bool)  # True = 유효
-        return placeholder_static_objects, static_objects_is_valid
+            (B, static_objects_num, D_static)
+        )  # (B, 1, D_static)
+
+        static_objects_is_valid_tensor: torch.Tensor = ref_tensor.new_zeros(
+            (B, static_objects_num),
+            dtype=torch.bool,
+        )  # (B, 1) True=유효, 여기서는 전부 False
+
+        return placeholder_static_objects, static_objects_is_valid_tensor
 
     def _encode_agents_static_lanes(
             self,
@@ -1980,10 +1979,15 @@ class RoadSafetyFusionEncoder(nn.Module):
             seed_emb)
 
         # 집합 통계(mean/max)를 요약 토큰에 잔차로 추가 (게이트 0 시작)
-        ds_mean = self._masked_mean(elements_emb, elements_mask)  # (B,H)
-        ds_max = self._masked_max(elements_emb, elements_mask)  # (B,H)
-        seed_emb = seed_emb + self.ds_mean_alpha.to(dtype) * ds_mean.unsqueeze(
-            1) + self.ds_max_alpha.to(dtype) * ds_max.unsqueeze(1)
+        # 집합 통계(mean/max)를 요약 토큰에 잔차로 추가 (게이트 0 시작)
+        ds_mean = self._masked_mean(elements_emb, elements_mask).to(
+            dtype)  # (B,H)
+        ds_max = self._masked_max(elements_emb, elements_mask).to(
+            dtype)  # (B,H)
+
+        seed_emb = seed_emb \
+                   + self.ds_mean_alpha.to(dtype) * ds_mean.unsqueeze(1) \
+                   + self.ds_max_alpha.to(dtype) * ds_max.unsqueeze(1)
 
         seed_emb = self.out_drop(self.out_norm(seed_emb))  # (B,M,H)
 
@@ -2103,11 +2107,15 @@ class RoadSafetyFusionEncoder(nn.Module):
                                     dtype=ref.dtype)
             seed_emb = self._touch_self_parameters(seed_emb)
             road_safety_pos = self._build_pos9_from_pos4(seed_pos4)
+            road_safety_pos = road_safety_pos.masked_fill(
+                seed_mask.unsqueeze(-1), 0.0)
             return seed_emb, seed_mask, road_safety_pos
 
         seed_emb, seed_mask, seed_pos4 = self._seed_pool(
             elements_emb, elements_pos4, elements_mask)
         road_safety_pos = self._build_pos9_from_pos4(seed_pos4)
+        road_safety_pos = road_safety_pos.masked_fill(seed_mask.unsqueeze(-1),
+                                                      0.0)
         return seed_emb, seed_mask, road_safety_pos
 
 

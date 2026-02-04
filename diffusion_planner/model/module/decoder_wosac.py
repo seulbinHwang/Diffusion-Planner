@@ -3557,7 +3557,48 @@ class DiT(nn.Module):
                 control_constraint_diff,  # (B, (1+)Pnn, future_len, 3)
             )
 
-    # [추가!!!] 학습 시 low‑t 샘플에 대해서만 FeasibleProjector를 돌리는 래퍼
+    def _ddp_touch_feasible_projector_params(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """FeasibleProjector 파라미터를 0배로 한 번 만져서(사용 흔적) 그래프에 포함시킵니다.
+
+        목적:
+            - 이번 배치에서 low_t_mask가 전부 False라 feasible을 "실행"하지 않아도,
+              DDP에서 FeasibleProjector 파라미터가 unused로 판단되는 상황을 피하려고,
+              모든 파라미터를 계산 그래프에 한 번씩 등장시킵니다.
+            - 결과 스칼라는 항상 0이므로, 어떤 출력 텐서에 더해도 값이 바뀌지 않습니다.
+
+        Args:
+            device (torch.device): 결과 스칼라를 만들 device
+            dtype (torch.dtype): 결과 스칼라 dtype
+
+        Returns:
+            torch.Tensor:
+                - shape: ()
+                - 값: 0.0 (출력값 변화 없음)
+        """
+        if not hasattr(self, "feasible_projector") or self.feasible_projector is None:
+            return torch.zeros((), device=device, dtype=dtype)
+
+        touch: torch.Tensor = torch.zeros((), device=device, dtype=dtype)
+
+        # ✅ 핵심: FeasibleProjector의 "모든" 학습 파라미터가 그래프에 등장하도록 1원소씩 터치
+        for p in self.feasible_projector.parameters():
+            if p is None:
+                continue
+            if not p.requires_grad:
+                continue
+            if p.numel() == 0:
+                continue
+
+            # dtype/device 정렬 후 0을 곱해 값은 0, 그래프에는 파라미터가 등장
+            touch = touch + (p.view(-1)[0].to(device=device, dtype=dtype) * 0.0)
+
+        return touch
+
     def _feasible_projection(
             self,
             diffusion_trajectory: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
@@ -3575,57 +3616,72 @@ class DiT(nn.Module):
 
         # [B] -> bool 로 정리
         low_t_mask = low_t_mask.to(device=device)
-        if low_t_mask.dtype != torch.bool:
-            # 0/1 float 같은 케이스 방어용
-            low_t_mask = low_t_mask > 0.5
+        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (
+                    low_t_mask > 0.5)
 
         # 기본값:
         #   - integrated_trajectory: 원 궤적(x_start) 그대로 (t=1..future_len)
         #   - control_constraint_diff: 전부 0
         # diffusion_trajectory 는 정규화 상태라고 가정
-        base_integrated = diffusion_trajectory[:, :, 1:, :].detach(
-        )  # (B,Pnn,future_len,4)
-        base_constraint = torch.zeros((B, Pnn, future_len, 3),
-                                      device=device,
-                                      dtype=dtype)  # (B,Pnn,future_len,3)
-
-        integrated_all = base_integrated.clone()  # (B,Pnn,future_len,4)
-        constraint_all = base_constraint.clone()  # (B,Pnn,future_len,3)
+        base_integrated = diffusion_trajectory[
+            :, :, 1:, :].detach()  # (B,Pnn,future_len,4)
+        base_constraint = diffusion_trajectory.new_zeros(
+            (B, Pnn, future_len, 3))  # (B,Pnn,future_len,3)
 
         # 실제로 FeasibleProjector를 돌릴 배치 인덱스 선택
-        active_idx = torch.nonzero(low_t_mask,
-                                   as_tuple=False).squeeze(-1)  # (N_active,)
+        active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(
+            -1)  # (N_active,)
 
-        # 만약 이번 배치가 전부 high‑t 라면, 그래도 최소 1개 샘플(0번)은
-        # FeasibleProjector를 한 번 태워서 그래프에는 항상 등장하도록 한다.
-        if active_idx.numel() == 0:
-            active_idx = torch.tensor([0], device=device,
-                                      dtype=torch.long)  # (1,)
-        """
-        # integrated_trajectory : (B, (1+)Pnn, future_len, 4)
-        # control_constraint_diff : (B, (1+)Pnn, future_len, 3)
-        """
-        # 서브 배치만 골라서 전체 파이프라인 실행
+        # low-t 샘플이 없으면:
+        #  - 출력은 base로 유지
+        #  - (DDP 등에서) feasible_projector 파라미터가 "완전히 미사용"이 되는 상황을 피하고 싶으면,
+        #    파라미터를 0배로만 얇게 연결해 둔다(출력값은 바뀌지 않음).
+        if int(active_idx.numel()) == 0:
+            if getattr(self, "feasible_projector", None) is not None:
+                dummy = base_integrated.new_zeros(())
+                for p in self.feasible_projector.parameters():
+                    # p 전체 sum은 비용이 커서, 첫 원소만 살짝 연결(그래프만 유지, 값은 0)
+                    dummy = dummy + (p.view(-1)[0] * 0.0).to(device=device,
+                                                             dtype=base_integrated.dtype)
+                integrated_all = base_integrated + dummy
+                constraint_all = base_constraint + dummy
+            else:
+                integrated_all = base_integrated
+                constraint_all = base_constraint
+
+            self.norm_dit_returns = DiTReturns(
+                integrated_trajectory=integrated_all,  # (B,Pnn,future_len,4)
+                control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
+            )
+            return
+
+        # ---- active subset만 projector 파이프라인 실행 ----
         self._feasible_projection_core(
             diffusion_trajectory[active_idx],
             target_class_one_hot[active_idx],
             target_past_cur_future_valid[active_idx],
-            target_past_11_dim[active_idx]
-            if target_past_11_dim is not None else None,
+            target_past_11_dim[
+                active_idx] if target_past_11_dim is not None else None,
             self.final_hidden_tokens[active_idx],
         )
 
         # `_feasible_projection_core` 은 서브 배치 기준으로 self.norm_dit_returns 를 채운다.
-        integ_active = self.norm_dit_returns.integrated_trajectory  # (N_active, Pnn, future_len, 4)
-        const_active = self.norm_dit_returns.control_constraint_diff  # (N_active, Pnn, future_len, 3)
+        integ_active = self.norm_dit_returns.integrated_trajectory  # (N_active,Pnn,future_len,4)
+        const_active = self.norm_dit_returns.control_constraint_diff  # (N_active,Pnn,future_len,3)
 
-        # 선택된 active 샘플에 대해서만 결과를 덮어쓰기
-        integrated_all[active_idx] = integ_active
-        constraint_all[active_idx] = const_active
+        # dtype 맞추기(기존 코드의 in-place 대입도 결국 여기서 캐스팅되던 동작과 동일)
+        integ_active = integ_active.to(device=device,
+                                       dtype=base_integrated.dtype)
+        const_active = const_active.to(device=device,
+                                       dtype=base_constraint.dtype)
 
-        # 전체 배치 기준으로 다시 dit_returns 업데이트
+        # ✅ 핵심: in-place 대입이 아니라 "새 텐서"를 만들어서 연결 유지
+        integrated_all = base_integrated.index_copy(0, active_idx, integ_active)
+        constraint_all = base_constraint.index_copy(0, active_idx, const_active)
+
         self.norm_dit_returns = DiTReturns(
-            integrated_trajectory=integrated_all,  # (B, (1+)Pnn, future_len, 4)
-            control_constraint_diff=
-            constraint_all,  #  (B, (1+)Pnn, future_len, 3)
+            integrated_trajectory=integrated_all,  # (B,Pnn,future_len,4)
+            control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
         )
+
+
