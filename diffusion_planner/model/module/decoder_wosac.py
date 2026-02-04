@@ -1691,29 +1691,6 @@ class Decoder(nn.Module):
         )  # (B,Pnn,1+T,4)
         return x0_seq
 
-    def _inverse_normalize_and_cleanup_padding(
-            self,
-            x_norm: torch.Tensor,  # (B, (1+)Pnn, 1+T, 4)
-            target_current_mask: torch.Tensor,  # (B, (1+)Pnn)
-    ) -> torch.Tensor:
-        """정규화된 궤적을 역정규화하고, 패딩 슬롯은 0으로 정리한다.
-
-        Args:
-            x_norm: 정규화된 궤적.
-                shape: (B, Pnn, 1+T, 4)
-            target_current_mask: True=무효 에이전트.
-                shape: (B, Pnn)
-
-        Returns:
-            x_denorm:
-                역정규화된 궤적.
-                shape: (B, Pnn, 1+T, 4)
-        """
-        x_denorm: torch.Tensor = self._state_normalizer.inverse(
-            x_norm)  # (B,Pnn,1+T,4)
-        x_denorm[target_current_mask] = 0.0
-        return x_denorm
-
     def _append_inference_feasible_outputs(
             self,
             return_norm_dict: Dict[str, torch.Tensor],  #
