@@ -156,10 +156,18 @@ class FeasibleProjector(nn.Module):
         self.use_feasible_dl = use_feasible_dl
         self.use_feasible_filter = use_feasible_filter
         # --- [NEW] Savitzky–Golay 커널 캐시(LRU) ---
-        # key: (W, polyorder, deriv_order, dt, dtype, device)
-        # val: torch.Tensor of shape (1, 1, W)
-        # [추가 요망] SG 위치별(one‑sided/중앙) 가중치 캐시(LRU)
-        # key: (W, polyorder, deriv_order, m, dt, dtype, device)  → val: (W,) weights
+        # key: (W, polyorder, deriv_order, dt_key, dtype, device, reg_eps)
+        # val: torch.Tensor (1, 1, W)
+        self._sg_conv_kernel_cache: OrderedDict[
+            Tuple[
+                int, int, int, float, torch.dtype, torch.device, float], torch.Tensor
+        ] = OrderedDict()
+        self._sg_conv_kernel_cache_max_size: int = 32
+
+        # valid_count 계산용 ones 커널 캐시
+        # key: (W, device, dtype) -> (1,1,W)
+        self._sg_ones_kernel_cache: Dict[
+            Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
 
         self.use_batch_integration = self.config.use_batch_integration  # 필요
         self.constraints_h_params = _ConstraintHParams(
@@ -185,7 +193,7 @@ class FeasibleProjector(nn.Module):
                     R_min_m=0.00001,
                     omega_max_abs_radps=3.3,
                     v_b_y_max=1.3,
-                    beta_max_rad=10.0,  # ✅ TODO: (라디안) 통계값 넣기
+                    beta_max_rad=10.0,
                 ),
             ActorClass.BICYCLE:
                 DynamicLimits(
@@ -359,6 +367,178 @@ class FeasibleProjector(nn.Module):
         with torch.no_grad():
             self.gate_mlp[-1].bias.fill_(b_init)
 
+    def _get_sg_ones_kernel_1x1w(
+            self,
+            window_length: int,
+            *,
+            device: torch.device,
+            dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """valid_count 계산에 쓰는 ones 커널(1,1,W)을 캐시해서 반환합니다.
+
+        Args:
+            window_length: 창 길이 W (홀수 권장)
+            device: 커널을 둘 디바이스
+            dtype: 커널 dtype
+
+        Returns:
+            ones_kernel: (1, 1, W)
+        """
+        W = int(window_length)
+        key = (W, device, dtype)
+        cached = self._sg_ones_kernel_cache.get(key, None)
+        if cached is not None:
+            return cached
+
+        ones_kernel = torch.ones((1, 1, W), device=device, dtype=dtype)
+        self._sg_ones_kernel_cache[key] = ones_kernel
+        return ones_kernel
+
+    def _get_sg_center_derivative_kernel_1x1w(
+            self,
+            window_length: int,
+            polyorder: int,
+            derivative_order: int,
+            dt: float,
+            *,
+            device: torch.device,
+            dtype: torch.dtype,
+            regularization_epsilon: float,
+    ) -> torch.Tensor:
+        """'창이 전부 유효'한 경우에 쓰는 SG 중앙 미분 커널을 (1,1,W)로 만들어 캐시합니다.
+
+        이 커널을 conv1d로 적용하면, 각 시점 t에서
+            derivative[t] = sum_{i=0..W-1} w[i] * x[t + i - half]
+        형태로 SG 중앙 미분 값을 얻습니다.
+
+        Args:
+            window_length: 창 길이 W
+            polyorder: 다항식 차수 P
+            derivative_order: 1 또는 2
+            dt: 샘플 간 시간 간격(초)
+            device: 결과 커널을 둘 디바이스
+            dtype: 결과 커널 dtype
+            regularization_epsilon: (A^T A)에 더해 줄 작은 값(수치 안정)
+
+        Returns:
+            kernel_1x1w: (1, 1, W)
+        """
+        W = int(window_length)
+        P = int(polyorder)
+        d = int(derivative_order)
+        if d not in (1, 2):
+            raise ValueError(f"derivative_order must be 1 or 2. got={d}")
+
+        # dt는 float 키로 쓸 때 흔들리지 않도록 약간 반올림
+        dt_key = float(round(float(dt), 12))
+        reg_key = float(round(float(regularization_epsilon), 18))
+
+        key = (W, P, d, dt_key, dtype, device, reg_key)
+        cached = self._sg_conv_kernel_cache.get(key, None)
+        if cached is not None:
+            # LRU 갱신
+            self._sg_conv_kernel_cache.move_to_end(key)
+            return cached
+
+        # ---- 커널 계산(한 번만) ----
+        # 계산은 CPU float64로 해서 안정적으로 만든 뒤, device/dtype으로 옮깁니다.
+        with torch.no_grad():
+            cpu = torch.device("cpu")
+            compute_dtype = torch.float64
+
+            design_matrix, _, _ = self._sg_build_design_matrix_and_gram(
+                window_length=W,
+                polyorder=P,
+                dt=float(dt),
+                device=cpu,
+                dtype=compute_dtype,
+            )  # (W, P+1)
+
+            # A: (W, P+1)
+            A = design_matrix
+            P1 = int(P + 1)
+
+            # ATA: (P+1, P+1)
+            ATA = A.transpose(0, 1).matmul(A)
+
+            # 정규화 항 추가: (P+1, P+1)
+            I = torch.eye(P1, device=cpu, dtype=compute_dtype)
+            ATA_reg = ATA + float(regularization_epsilon) * I
+
+            # e_d: (P+1,)
+            e = torch.zeros((P1,), device=cpu, dtype=compute_dtype)
+            e[d] = 1.0
+
+            # g: (P+1,) = (ATA_reg)^{-1} e_d
+            g = torch.linalg.solve(ATA_reg, e)
+
+            # weights: (W,) = d! * A @ g
+            scale = float(math.factorial(d))
+            w = scale * (A.matmul(g))  # (W,)
+
+            kernel = w.view(1, 1, W).to(device=device, dtype=dtype)
+
+        # LRU 저장
+        self._sg_conv_kernel_cache[key] = kernel
+        self._sg_conv_kernel_cache.move_to_end(key)
+        if len(self._sg_conv_kernel_cache) > int(
+                self._sg_conv_kernel_cache_max_size):
+            self._sg_conv_kernel_cache.popitem(last=False)
+
+        return kernel
+
+    def _apply_same_kernel_conv1d_per_channel(
+            self,
+            seq_bTC: torch.Tensor,  # (N, T, C)
+            kernel_1x1w: torch.Tensor,  # (1, 1, W)
+    ) -> torch.Tensor:
+        """같은 (1,1,W) 커널을 각 채널에 독립적으로 적용해 (N,T,C)로 돌려줍니다.
+
+        Args:
+            seq_bTC: (N, T, C)
+            kernel_1x1w: (1, 1, W)
+
+        Returns:
+            out_bTC: (N, T, C)
+        """
+        if seq_bTC.numel() == 0:
+            return seq_bTC
+
+        if seq_bTC.dim() != 3:
+            raise ValueError(
+                "_apply_same_kernel_conv1d_per_channel: seq_bTC는 (N,T,C) 3D여야 합니다. "
+                f"got shape={tuple(seq_bTC.shape)}"
+            )
+        if kernel_1x1w.dim() != 3 or int(kernel_1x1w.shape[0]) != 1 or int(
+                kernel_1x1w.shape[1]) != 1:
+            raise ValueError(
+                "_apply_same_kernel_conv1d_per_channel: kernel은 (1,1,W)여야 합니다. "
+                f"got shape={tuple(kernel_1x1w.shape)}"
+            )
+
+        N, T, C = seq_bTC.shape
+        W = int(kernel_1x1w.shape[-1])
+        half = W // 2
+
+        # (N, C, T)
+        x_bCT = seq_bTC.permute(0, 2, 1).contiguous()
+
+        # (C, 1, W)로 반복해서 groups=C로 채널별 독립 conv
+        weight = kernel_1x1w.to(dtype=seq_bTC.dtype,
+                                device=seq_bTC.device).repeat(int(C), 1, 1)
+
+        y_bCT = F.conv1d(
+            x_bCT,
+            weight,
+            bias=None,
+            stride=1,
+            padding=int(half),
+            dilation=1,
+            groups=int(C),
+        )  # (N, C, T)
+
+        out_bTC = y_bCT.permute(0, 2, 1).contiguous()  # (N, T, C)
+        return out_bTC
 
     @staticmethod
     def _to_bool_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -4908,29 +5088,30 @@ class FeasibleProjector(nn.Module):
         )
         return derivative_out
 
-
-
     def _savgol_derivative_masked_multi_torch(
-        self,
-        seq_bTC: torch.Tensor,  # (N, T, C)
-        valid_bT: torch.Tensor,  # (N, T) bool
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-        derivative_order: int = 1,
+            self,
+            seq_bTC: torch.Tensor,  # (N, T, C)
+            valid_bT: torch.Tensor,  # (N, T) bool
+            dt: float,
+            polyorder: int,
+            max_window_length: int,
+            derivative_order: int = 1,
     ) -> torch.Tensor:
-        """마스크를 고려해서 '원하는 변화율(1차 또는 2차)'을 계산합니다.
+        """마스크를 고려해서 변화율(1차 또는 2차)을 계산합니다.
 
-        - 기본값은 유한 차분(아주 단순 계산)으로 만들고,
-        - 데이터가 충분한 곳만 창 기반 계산으로 덮어씁니다.
-        - 중심 시점이 무효(False)인 곳은 0으로 정리합니다.
+        구현 정책(요청 반영):
+            1) 기본값은 fd(유한 차분)로 만든다.
+            2) valid_count는 unfold 대신 conv1d로 계산한다.
+            3) 창이 "전부 유효(valid_count == W)"인 구간만
+               SG 고정 커널 conv1d 결과로 덮어쓴다.
+            4) 나머지(경계/짧은 유효구간)는 fd를 유지한다.
 
         Args:
             seq_bTC: (N, T, C)
             valid_bT: (N, T) bool
-            dt: float
-            polyorder: int
-            max_window_length: int
+            dt: 샘플 간 시간 간격(초)
+            polyorder: SG 다항식 차수
+            max_window_length: 사용할 최대 창 길이
             derivative_order: 1 또는 2
 
         Returns:
@@ -4939,83 +5120,125 @@ class FeasibleProjector(nn.Module):
         if seq_bTC.numel() == 0:
             return seq_bTC
 
-        num_rows, sequence_length, num_channels = seq_bTC.shape  # (N, T, C)
-        device = seq_bTC.device
-        dtype = seq_bTC.dtype
-
         if derivative_order not in (1, 2):
             raise ValueError(
                 f"derivative_order must be 1 or 2. got={derivative_order}")
 
-        # 0) 기본값(유한 차분)
+        N, T, C = seq_bTC.shape
+        device = seq_bTC.device
+        dtype = seq_bTC.dtype
+
+        valid = valid_bT.to(torch.bool)  # (N, T)
+
+        # 0) 기본값(fd)
         if derivative_order == 1:
             fd_derivative = self._savgol_finite_difference_multi(
                 sequence_multi_channel=seq_bTC,  # (N,T,C)
-                valid_mask_bT=valid_bT,  # (N,T)
-                dt=dt,
-            )  # (N,T,C)
+                valid_mask_bT=valid,  # (N,T)
+                dt=float(dt),
+            )
         else:
             fd_derivative = self._savgol_finite_difference_second_multi(
                 sequence_multi_channel=seq_bTC,  # (N,T,C)
-                valid_mask_bT=valid_bT,  # (N,T)
-                dt=dt,
-            )  # (N,T,C)
+                valid_mask_bT=valid,  # (N,T)
+                dt=float(dt),
+            )
 
-        # 1) 창 길이 선택
-        window_length = self._savgol_select_window_length(
-            sequence_length=sequence_length,
-            max_window_length=max_window_length,
-        )
-
-        if window_length == 0:
+        # polyorder가 derivative_order보다 작으면 SG 기반 계산은 의미가 없으니 fd만 사용
+        if int(polyorder) < int(derivative_order):
             return torch.where(
-                valid_bT.unsqueeze(-1),
+                valid.unsqueeze(-1),
                 fd_derivative,
                 torch.zeros_like(fd_derivative),
             )
 
-        # 2) 마스크 기반 창/유효 개수 계산
-        mask_window, valid_count = self._savgol_build_mask_and_count_multi(
-            valid_mask_bT=valid_bT,
-            window_length=window_length,
-            value_dtype=dtype,
-        )  # (N,T,W), (N,T)
+        # 1) 창 길이 선택
+        window_length = self._savgol_select_window_length(
+            sequence_length=int(T),
+            max_window_length=int(max_window_length),
+        )
+        if window_length <= 0:
+            return torch.where(
+                valid.unsqueeze(-1),
+                fd_derivative,
+                torch.zeros_like(fd_derivative),
+            )
 
-        # 3) 시간 기저 및 Gram, power 계산
-        _, gram_per_k, power_per_k = self._sg_build_design_matrix_and_gram(
-            window_length=window_length,
-            polyorder=polyorder,
-            dt=dt,
+        # SG 기본 조건: window_length > polyorder
+        # 이 조건이 깨지면 커널을 만들 수 없으니 fd 유지
+        if int(window_length) <= int(polyorder):
+            return torch.where(
+                valid.unsqueeze(-1),
+                fd_derivative,
+                torch.zeros_like(fd_derivative),
+            )
+
+        W = int(window_length)
+        half = W // 2
+
+        # 2) valid_count를 conv1d로 계산
+        #    valid_count: (N, T)
+        valid_float = valid.to(dtype=dtype, device=device)  # (N,T)
+        ones_kernel = self._get_sg_ones_kernel_1x1w(
+            window_length=W,
             device=device,
             dtype=dtype,
-        )  # gram_per_k: (W,P+1,P+1), power_per_k: (W,P+1)
+        )  # (1,1,W)
 
-        # 4) A_all, b_all 계산
-        A_all = self._savgol_build_A_all_from_mask_multi(
-            mask_window=mask_window,
-            gram_per_k=gram_per_k,
-        )  # (N,T,P+1,P+1)
+        valid_count = F.conv1d(
+            valid_float.unsqueeze(1),  # (N,1,T)
+            ones_kernel,  # (1,1,W)
+            padding=int(half),
+        ).squeeze(1)  # (N,T)
 
-        b_all = self._savgol_build_b_all_multi(
-            sequence_multi_channel=seq_bTC,  # (N,T,C)
-            mask_window=mask_window,  # (N,T,W)
-            power_per_k=power_per_k,  # (W,P+1)
-            window_length=window_length,
-        )  # (N,T,C,P+1)
+        # 3) "창이 전부 유효"인 곳만 SG conv로 덮어쓰기
+        # float 비교 안정성 때문에 == 대신 >= W-0.5 사용
+        full_window_mask = (valid_count >= (float(W) - 0.5)) & valid  # (N,T)
 
-        valid_center_mask = valid_bT.to(torch.bool)  # (N,T)
+        # 기존 코드와 동일한 edge_margin 정책 유지(앞/뒤 몇 칸은 창 기반 계산을 쓰지 않음)
+        edge_margin: int = 2
+        if int(T) > 2 * edge_margin:
+            full_window_mask[:, :edge_margin] = False
+            full_window_mask[:, -edge_margin:] = False
 
-        derivative_out = self._savgol_solve_multi(
-            A_all=A_all,
-            b_all=b_all,
-            valid_count=valid_count,
-            valid_center_mask=valid_center_mask,
-            fd_derivative=fd_derivative,
-            polyorder=polyorder,
-            derivative_order=derivative_order,
-            regularization_epsilon=float(getattr(self, "_eps", 1e-6)),
+        # full window가 한 군데도 없으면 그냥 fd 반환
+        if not bool(full_window_mask.any()):
+            return torch.where(
+                valid.unsqueeze(-1),
+                fd_derivative,
+                torch.zeros_like(fd_derivative),
+            )
+
+        # 4) SG 중앙 미분 커널(conv) 계산
+        reg_eps: float = 1e-6  # 기존 solve 경로의 안정화 항과 맞춤(동일하게 두는 게 안전)
+        kernel_1x1w = self._get_sg_center_derivative_kernel_1x1w(
+            window_length=W,
+            polyorder=int(polyorder),
+            derivative_order=int(derivative_order),
+            dt=float(dt),
+            device=device,
+            dtype=dtype,
+            regularization_epsilon=float(reg_eps),
+        )  # (1,1,W)
+
+        sg_derivative = self._apply_same_kernel_conv1d_per_channel(
+            seq_bTC=seq_bTC,  # (N,T,C)
+            kernel_1x1w=kernel_1x1w,  # (1,1,W)
         )  # (N,T,C)
 
+        # 5) full window인 곳만 SG로 덮어쓰기, 나머지는 fd 유지
+        derivative_out = torch.where(
+            full_window_mask.unsqueeze(-1),
+            sg_derivative,
+            fd_derivative,
+        )
+
+        # 6) 중심이 invalid면 0
+        derivative_out = torch.where(
+            valid.unsqueeze(-1),
+            derivative_out,
+            torch.zeros_like(derivative_out),
+        )
         return derivative_out
 
     @classmethod
