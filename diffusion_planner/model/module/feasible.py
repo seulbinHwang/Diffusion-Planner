@@ -3760,417 +3760,6 @@ class FeasibleProjector(nn.Module):
         )
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff
 
-    def _apply_S0_S1_pointwise_ste(
-        self,
-        vx_b_raw_k: torch.Tensor,          # (B,Pnn)
-        vy_b_raw_k: torch.Tensor,          # (B,Pnn)
-        *,
-        beta_max_rad: torch.Tensor,        # (B,Pnn)
-        v_max: torch.Tensor,               # (B,Pnn)
-        is_nonholonomic: torch.Tensor,     # (B,Pnn) bool
-        eta_slip: float,
-        eta_speed: float,
-        eps: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """한 시점(k)의 (vx,vy)에 S0→S1을 바로 적용합니다.
-
-        Args:
-            vx_b_raw_k: (B,Pnn) 바디 x속도 (k 시점)
-            vy_b_raw_k: (B,Pnn) 바디 y속도 (k 시점)
-            beta_max_rad: (B,Pnn) 사이드슬립 각 상한(라디안)
-            v_max: (B,Pnn) 속도 상한
-            is_nonholonomic: (B,Pnn) True인 대상에만 S0를 적용
-            eta_slip: S0 밴드 폭
-            eta_speed: S1 밴드 폭
-            eps: 작은 값(수치 안정)
-
-        Returns:
-            vx_s1_k, vy_s1_k: (B,Pnn)
-                S0, S1이 적용된 값
-        """
-        vx_k, vy_k = self._apply_S0_sideslip_angle_limit_ste(
-            vx_b=vx_b_raw_k,                    # (B,Pnn)
-            vy_b=vy_b_raw_k,                    # (B,Pnn)
-            beta_max_rad=beta_max_rad,          # (B,Pnn)
-            eta=float(eta_slip),
-            eps=float(eps),
-            is_nonholonomic=is_nonholonomic,    # (B,Pnn)
-        )
-        vx_k, vy_k = self._apply_S1_speed_limit_ste(
-            vx_b=vx_k,
-            vy_b=vy_k,
-            v_max=v_max,                        # (B,Pnn)
-            eta=float(eta_speed),
-            eps=float(eps),
-        )
-        return vx_k, vy_k
-
-    def _filter_and_integrate_onepass_impl(
-        self,
-        unnorm_near_current_state: torch.Tensor,  # (B,Pnn,4)
-        vx_b_raw: torch.Tensor,                  # (B,Pnn,T)
-        vy_b_raw: torch.Tensor,                  # (B,Pnn,T)
-        omega_raw: torch.Tensor,                 # (B,Pnn,T)
-        *,
-        v_max: torch.Tensor,                     # (B,Pnn)
-        a_max: torch.Tensor,                     # (B,Pnn)
-        alpha_max: torch.Tensor,                 # (B,Pnn)
-        a_lat_max: torch.Tensor,                 # (B,Pnn)
-        R_min: torch.Tensor,                     # (B,Pnn)
-        omega_abs_max: torch.Tensor,             # (B,Pnn)
-        beta_max_rad: torch.Tensor,              # (B,Pnn)
-        is_nonholonomic: torch.Tensor,           # (B,Pnn) bool
-        dt: float,
-        eps: float,
-        eta_slip: float,
-        eta_speed: float,
-        eta_inc: float,
-        eta_yaw: float,
-        use_filter: bool,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(시간축 한 번 훑기) 제약(S0~S3) + 중점 적분을 한 흐름으로 계산합니다.
-
-        핵심 아이디어:
-            - 큰 (B,Pnn,T) 중간 텐서를 여러 번 만들지 않습니다.
-            - 매 시점 k에서:
-                (1) raw 제어를 읽고
-                (2) S0/S1을 그 자리에서 적용하고
-                (3) S2는 dv/dw(증분)만 계산해서 누적 상태를 업데이트하고
-                (4) S3를 적용한 omega로 바로 중점 적분을 수행합니다.
-            - 결과로 (B,Pnn,T) 출력 버퍼만 채웁니다.
-
-        Returns:
-            x_next, y_next, cos_next, sin_next: (B,Pnn,T)
-            vx_after, vy_after, omega_after:    (B,Pnn,T)
-        """
-        if vx_b_raw.dim() != 3:
-            raise ValueError("vx_b_raw는 (B,Pnn,T) 3D 텐서여야 합니다.")
-        if unnorm_near_current_state.dim() != 3 or int(unnorm_near_current_state.shape[-1]) != 4:
-            raise ValueError("unnorm_near_current_state는 (B,Pnn,4)여야 합니다.")
-
-        B, Pnn, T = vx_b_raw.shape
-        device = vx_b_raw.device
-        dtype = vx_b_raw.dtype
-
-        x_next = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-        y_next = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-        cos_next = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-        sin_next = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-
-        vx_after = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-        vy_after = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-        omega_after = torch.empty((B, Pnn, T), device=device, dtype=dtype)
-
-        # 현재 노드 상태 (B,Pnn)
-        x_k = unnorm_near_current_state[..., 0]
-        y_k = unnorm_near_current_state[..., 1]
-        cos_k = unnorm_near_current_state[..., 2]
-        sin_k = unnorm_near_current_state[..., 3]
-
-        # --- S2(batch 방식과 같은 의미)의 "누적 상태" ---
-        # S2는 (S0+S1 적용 후 값)의 dv를 clip해서 누적하는 구조이므로,
-        # start 값은 (S0+S1이 적용된 k=0 값)으로 둡니다.
-        if use_filter:
-            vx_s01_cur, vy_s01_cur = self._apply_S0_S1_pointwise_ste(
-                vx_b_raw_k=vx_b_raw.select(-1, 0),  # (B,Pnn)
-                vy_b_raw_k=vy_b_raw.select(-1, 0),  # (B,Pnn)
-                beta_max_rad=beta_max_rad,
-                v_max=v_max,
-                is_nonholonomic=is_nonholonomic,
-                eta_slip=eta_slip,
-                eta_speed=eta_speed,
-                eps=eps,
-            )
-            vx2_cur = vx_s01_cur                    # (B,Pnn)
-            vy2_cur = vy_s01_cur                    # (B,Pnn)
-            omega_raw_cur = omega_raw.select(-1, 0) # (B,Pnn)
-            omega2_cur = omega_raw_cur              # (B,Pnn)
-
-            omega3_cur = self._apply_S3_omega_clip_ste(
-                vx_b=vx2_cur,
-                vy_b=vy2_cur,
-                omega=omega2_cur,
-                a_lat_max=a_lat_max,
-                R_min=R_min,
-                omega_abs_max=omega_abs_max,
-                is_nonholonomic=is_nonholonomic,
-                eta=float(eta_yaw),
-                eps=float(eps),
-            )  # (B,Pnn)
-        else:
-            vx2_cur = vx_b_raw.select(-1, 0)
-            vy2_cur = vy_b_raw.select(-1, 0)
-            omega_raw_cur = omega_raw.select(-1, 0)
-            omega2_cur = omega_raw_cur
-            omega3_cur = omega2_cur
-
-            # S2에서 쓰는 "S0+S1 결과"는 필터 off면 그냥 raw로 둡니다.
-            vx_s01_cur = vx2_cur
-            vy_s01_cur = vy2_cur
-
-        dv_limit = (a_max * float(dt)).to(dtype=dtype, device=device)          # (B,Pnn)
-        dw_limit = (alpha_max * float(dt)).to(dtype=dtype, device=device)      # (B,Pnn)
-
-        for k in range(int(T)):
-            # 1) 현재 시점 k의 "최종 제어" 저장
-            vx_after[..., k] = vx2_cur
-            vy_after[..., k] = vy2_cur
-            omega_after[..., k] = omega3_cur
-
-            # 2) 현재 시점 k의 제어로 중점 적분해서 다음 노드 상태 계산
-            x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(
-                x_k=x_k,
-                y_k=y_k,
-                cos_yaw_k=cos_k,
-                sin_yaw_k=sin_k,
-                vx_b_k=vx2_cur,
-                vy_b_k=vy2_cur,
-                omega_k=omega3_cur,
-                hp=self.constraints_h_params,
-            )
-
-            x_next[..., k] = x_k1
-            y_next[..., k] = y_k1
-            cos_next[..., k] = cos_k1
-            sin_next[..., k] = sin_k1
-
-            # 상태 갱신
-            x_k, y_k, cos_k, sin_k = x_k1, y_k1, cos_k1, sin_k1
-
-            # 3) 다음 시점(k+1) 제어 준비 (k==T-1이면 끝)
-            if k >= int(T) - 1:
-                break
-
-            if use_filter:
-                # (a) S0+S1 적용 값: k+1 (B,Pnn)
-                vx_s01_next, vy_s01_next = self._apply_S0_S1_pointwise_ste(
-                    vx_b_raw_k=vx_b_raw.select(-1, k + 1),
-                    vy_b_raw_k=vy_b_raw.select(-1, k + 1),
-                    beta_max_rad=beta_max_rad,
-                    v_max=v_max,
-                    is_nonholonomic=is_nonholonomic,
-                    eta_slip=eta_slip,
-                    eta_speed=eta_speed,
-                    eps=eps,
-                )
-
-                # (b) S2(batch와 같은 의미): dv/dw만 만들어서 누적 상태 업데이트
-                dv_raw = torch.stack(
-                    [vx_s01_next - vx_s01_cur, vy_s01_next - vy_s01_cur],
-                    dim=-1,  # (B,Pnn,2)
-                )
-                dv_ste = self._ste_increment_vec(
-                    dv=dv_raw,          # (B,Pnn,2)
-                    limit=dv_limit,     # (B,Pnn)
-                    eta=float(eta_inc),
-                    eps=float(eps),
-                )  # (B,Pnn,2)
-
-                vx2_next = vx2_cur + dv_ste[..., 0]
-                vy2_next = vy2_cur + dv_ste[..., 1]
-
-                omega_raw_next = omega_raw.select(-1, k + 1)
-                dw_raw = omega_raw_next - omega_raw_cur
-                dw_ste = self._ste_scalar_clip(
-                    x=dw_raw,          # (B,Pnn)
-                    limit=dw_limit,    # (B,Pnn)
-                    eta=float(eta_inc),
-                    eps=float(eps),
-                )
-                omega2_next = omega2_cur + dw_ste
-
-                # (c) S3 적용(점별)
-                omega3_next = self._apply_S3_omega_clip_ste(
-                    vx_b=vx2_next,
-                    vy_b=vy2_next,
-                    omega=omega2_next,
-                    a_lat_max=a_lat_max,
-                    R_min=R_min,
-                    omega_abs_max=omega_abs_max,
-                    is_nonholonomic=is_nonholonomic,
-                    eta=float(eta_yaw),
-                    eps=float(eps),
-                )
-
-                # 다음 스텝용 갱신
-                vx_s01_cur, vy_s01_cur = vx_s01_next, vy_s01_next
-                vx2_cur, vy2_cur = vx2_next, vy2_next
-                omega_raw_cur = omega_raw_next
-                omega2_cur = omega2_next
-                omega3_cur = omega3_next
-            else:
-                # 필터 꺼짐: 다음 시점 제어는 그냥 raw를 씁니다.
-                vx2_cur = vx_b_raw.select(-1, k + 1)
-                vy2_cur = vy_b_raw.select(-1, k + 1)
-                omega3_cur = omega_raw.select(-1, k + 1)
-
-        return x_next, y_next, cos_next, sin_next, vx_after, vy_after, omega_after
-
-    def _get_compiled_filter_and_integrate_onepass(
-        self,
-        *,
-        future_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Optional[Callable[..., Tuple[torch.Tensor, ...]]]:
-        """one-pass 구현을 torch.compile로 감싼 함수를 캐시로 관리합니다."""
-        if not hasattr(torch, "compile"):
-            return None
-        if device.type != "cuda":
-            return None
-
-        cache: Dict[Tuple[int, str, int], Callable[..., Tuple[torch.Tensor, ...]]]
-        if not hasattr(self, "_feasible_onepass_compiled_cache"):
-            self._feasible_onepass_compiled_cache = {}
-        cache = self._feasible_onepass_compiled_cache
-
-        key = (int(future_len), str(device), int(dtype == torch.float16))
-        if key in cache:
-            return cache[key]
-
-        # fullgraph=True가 실패할 수 있어 try/except로 안전하게 처리합니다.
-        try:
-            compiled = torch.compile(
-                self._filter_and_integrate_onepass_impl,
-                fullgraph=True,
-                mode=str(getattr(self.config, "feasible_compile_mode", "reduce-overhead")),
-            )
-            cache[key] = compiled
-            return compiled
-        except Exception:
-            return None
-
-    def _filter_and_integrate_batch(
-        self,
-        unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
-        near_cur_future_valid: torch.Tensor,      # (B, Pnn, 1+T) bool
-        unnorm_cur_future_seg_body_control: torch.Tensor,  # (B, Pnn, T, 3)
-        near_class_one_hot: torch.Tensor,         # (B, Pnn, 3)
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """시간축 배치 경로(개선판): 제약+적분을 '한 흐름'으로 처리하는 one-pass 우선.
-
-        동작:
-            1) 가능하면(one-pass + torch.compile 성공) -> 큰 중간 텐서 없이 한 번에 계산
-            2) 실패하면 기존 방식(_apply_constraints_batch + _integrate_midpoint_batch)로 fallback
-        """
-        B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
-        device = unnorm_cur_future_seg_body_control.device
-        dtype = unnorm_cur_future_seg_body_control.dtype
-
-        if future_len == 0:
-            raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
-
-        # raw 분해: (B,Pnn,T)
-        vx_b_raw, vy_b_raw, omega_raw = self._split_controls(unnorm_cur_future_seg_body_control)
-
-        hp = self.constraints_h_params
-        dt = float(hp.dt)
-        eps = float(hp.eps)
-
-        use_filter = bool(self.use_feasible_filter)
-
-        # 필터가 켜져있을 때만 제한값 준비(불필요 계산 줄이기)
-        if use_filter:
-            key_to_limit_bp = self._build_per_agent_limits(
-                near_class_one_hot=near_class_one_hot,
-                device=device,
-                dtype=dtype,
-            )
-            v_max = key_to_limit_bp["v_max"]
-            a_max = key_to_limit_bp["a_max"]
-            alpha_max = key_to_limit_bp["alpha_max"]
-            a_lat_max = key_to_limit_bp["a_lat_max"]
-            R_min = key_to_limit_bp["R_min"]
-            omega_abs_max = key_to_limit_bp["omega_abs_max"]
-            beta_max_rad = key_to_limit_bp["beta_max_rad"]
-            is_nonholonomic = key_to_limit_bp["is_nonholonomic"]
-        else:
-            # dummy (shape만 맞추기)
-            v_max = torch.zeros((B, Pnn), device=device, dtype=dtype)
-            a_max = torch.zeros((B, Pnn), device=device, dtype=dtype)
-            alpha_max = torch.zeros((B, Pnn), device=device, dtype=dtype)
-            a_lat_max = torch.zeros((B, Pnn), device=device, dtype=dtype)
-            R_min = torch.ones((B, Pnn), device=device, dtype=dtype)
-            omega_abs_max = torch.full((B, Pnn), float("inf"), device=device, dtype=dtype)
-            beta_max_rad = torch.zeros((B, Pnn), device=device, dtype=dtype)
-            is_nonholonomic = torch.zeros((B, Pnn), device=device, dtype=torch.bool)
-
-        # one-pass + compile 시도
-        want_onepass = bool(getattr(self.config, "feasible_onepass_filter_integrate", True))
-        compiled_fn = None
-        if want_onepass:
-            compiled_fn = self._get_compiled_filter_and_integrate_onepass(
-                future_len=future_len,
-                device=device,
-                dtype=dtype,
-            )
-
-        if compiled_fn is not None:
-            try:
-                x_n, y_n, c_n, s_n, vx_a, vy_a, w_a = compiled_fn(
-                    unnorm_near_current_state,
-                    vx_b_raw,
-                    vy_b_raw,
-                    omega_raw,
-                    v_max=v_max,
-                    a_max=a_max,
-                    alpha_max=alpha_max,
-                    a_lat_max=a_lat_max,
-                    R_min=R_min,
-                    omega_abs_max=omega_abs_max,
-                    beta_max_rad=beta_max_rad,
-                    is_nonholonomic=is_nonholonomic,
-                    dt=dt,
-                    eps=eps,
-                    eta_slip=float(hp.eta_slip),
-                    eta_speed=float(hp.eta_speed),
-                    eta_inc=float(hp.eta_inc),
-                    eta_yaw=float(hp.eta_yaw),
-                    use_filter=use_filter,
-                )
-                key_to_all_states = {
-                    "x_next": x_n,
-                    "y_next": y_n,
-                    "cos_next": c_n,
-                    "sin_next": s_n,
-                    "vx_after": vx_a,
-                    "vy_after": vy_a,
-                    "omega_after": w_a,
-                }
-                return self._assemble_outputs(
-                    key_to_all_states=key_to_all_states,
-                    vx_b_raw=vx_b_raw,
-                    vy_b_raw=vy_b_raw,
-                    omega_raw=omega_raw,
-                    near_cur_future_valid=near_cur_future_valid,
-                )
-            except Exception:
-                # compile 경로가 깨지면 안전하게 기존 방식으로 돌아갑니다.
-                pass
-
-        # ---------- fallback: 기존 배치 방식 ----------
-        vx_b_after, vy_b_after, omega_after = self._apply_constraints_batch(
-            vx_b_raw=vx_b_raw,
-            vy_b_raw=vy_b_raw,
-            omega_raw=omega_raw,
-            key_to_limit_bp=self._build_per_agent_limits(near_class_one_hot, device=device, dtype=dtype),
-            hp=self.constraints_h_params,
-        )
-        key_to_all_states = self._integrate_midpoint_batch(
-            unnorm_near_current_state=unnorm_near_current_state,
-            vx_b_seq=vx_b_after,
-            vy_b_seq=vy_b_after,
-            omega_seq=omega_after,
-            hp=self.constraints_h_params,
-        )
-        return self._assemble_outputs(
-            key_to_all_states=key_to_all_states,
-            vx_b_raw=vx_b_raw,
-            vy_b_raw=vy_b_raw,
-            omega_raw=omega_raw,
-            near_cur_future_valid=near_cur_future_valid,
-        )
 
     # ================================================================
     # [REFACTOR] Savitzky–Golay 유틸들 (모두 torch-only, 미분 가능)
@@ -4215,6 +3804,67 @@ class FeasibleProjector(nn.Module):
     # 지우개: 예전 `_compute_world_linear_velocity_via_sg` 구현은
     #        x, y를 각각 단일 채널 SG에 넣어 두 번 호출하던 코드입니다.
     #        해당 본문 전체를 지우고 아래 새 구현으로 교체하세요.
+
+    def _filter_and_integrate_batch(
+            self,
+            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
+            unnorm_cur_future_seg_body_control: torch.
+        Tensor,  # (B, Pnn, future_len, 3)
+            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """시간축 전체를 한 번에 처리하는 배치 버전.
+
+        - S2(가속/각가속 증분 제한)는 사용하지 않는다.
+        - S0/S1/S3만 vx,vy,omega 시퀀스에 배치로 적용한다.
+        - yaw 및 위치는 cumsum 기반 중점 적분으로 계산한다.
+        """
+        B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
+        device = unnorm_cur_future_seg_body_control.device
+        dtype = unnorm_cur_future_seg_body_control.dtype
+
+        if future_len == 0:
+            raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
+
+        # per-agent 제한값 (v_max, a_lat_max, R_min, ...)
+        key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
+            near_class_one_hot,
+            device=device,
+            dtype=dtype,
+        )
+
+        # (B,Pnn,future_len)
+        vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
+            unnorm_cur_future_seg_body_control)
+
+        # 시간축 전체에 S0/S1/S3 배치 적용 (S2는 미사용)
+        """ 3개 모두 (B,Pnn,future_len) 반환"""
+        vx_b_after, vy_b_after, omega_after = self._apply_constraints_batch(
+            vx_b_raw=vx_b_raw,  # (B,Pnn,T)
+            vy_b_raw=vy_b_raw,  # (B,Pnn,T)
+            omega_raw=omega_raw,  # (B,Pnn,T)
+            key_to_limit_bp=key_to_limit_bp,
+            hp=self.constraints_h_params,
+        )
+
+
+
+        # 중점 적분을 시간축 전체에 대해 배치로 수행
+        key_to_all_states = self._integrate_midpoint_batch(
+            unnorm_near_current_state=unnorm_near_current_state,  # (B,Pnn,4)
+            vx_b_seq=vx_b_after,  # (B,Pnn,T)
+            vy_b_seq=vy_b_after,  # (B,Pnn,T)
+            omega_seq=omega_after,  # (B,Pnn,T)
+            hp=self.constraints_h_params,
+        )
+
+        return self._assemble_outputs(
+            key_to_all_states=key_to_all_states,
+            vx_b_raw=vx_b_raw,
+            vy_b_raw=vy_b_raw,
+            omega_raw=omega_raw,
+            near_cur_future_valid=near_cur_future_valid,
+        )
 
     def _compute_world_linear_velocity_via_sg(
         self,
