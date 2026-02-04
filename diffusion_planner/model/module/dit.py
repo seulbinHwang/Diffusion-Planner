@@ -137,6 +137,158 @@ class TimestepEmbedder(nn.Module):
         self.register_buffer("_freqs", freqs, persistent=False)  # (half,)
 
 
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # (원본 호환 유지용: 외부에서 static 호출할 가능성 대비)
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32)
+            / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+        return embedding
+
+    def _timestep_embedding_cached(self, t: torch.Tensor) -> torch.Tensor:
+        """시간값 t를 sin/cos 임베딩으로 바꿉니다(캐시된 freqs 사용).
+
+        Args:
+            t (torch.Tensor):
+                시간값 텐서.
+                - shape: (N,)
+                - dtype: 무관 (내부에서 float32로 계산)
+
+        Returns:
+            torch.Tensor:
+                sin/cos 임베딩.
+                - shape: (N, frequency_embedding_size)
+                - dtype: float32
+                - device: t.device
+        """
+        if t.dim() != 1:
+            raise ValueError(f"t must be 1D (N,), got {tuple(t.shape)}")
+
+        N: int = int(t.shape[0])
+        half: int = int(self.frequency_embedding_size // 2)
+
+        if half == 0:
+            # 거의 안 쓰는 케이스지만 안전하게 처리
+            return torch.zeros((N, self.frequency_embedding_size),
+                               device=t.device, dtype=torch.float32)
+
+        freqs: torch.Tensor = self._freqs
+        if freqs.device != t.device:
+            freqs = freqs.to(device=t.device)
+
+        args = t[:, None].float() * freqs[None, :]  # (N, half)
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (N, 2*half)
+
+        if (self.frequency_embedding_size % 2) == 1:
+            pad = torch.zeros((N, 1), device=t.device, dtype=emb.dtype)  # (N,1)
+            emb = torch.cat([emb, pad], dim=-1)  # (N, 2*half+1)
+
+        return emb  # float32
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (B,)
+        if t.dim() != 1:
+            raise ValueError(f"t must be 1D (B,), got {tuple(t.shape)}")
+
+        B: int = int(t.shape[0])
+        if B == 0:
+            # (0, H)
+            out_dim: int = int(self.mlp[-1].out_features)
+            return torch.zeros((0, out_dim), device=t.device, dtype=torch.float32)
+
+        # -----------------------------
+        # ✅ 방법 2) 배치의 t가 전부 같은 경우: 1번만 계산 + expand
+        #   - GPU 동기화 없이 처리(마스크로 나머지만 계산)
+        # -----------------------------
+        t0 = t[:1]  # (1,)
+        same_mask = (t == t0)  # (B,) bool
+
+        # (1) 첫 값 임베딩 1회
+        t0_freq = self._timestep_embedding_cached(t0)  # (1, F)
+        t0_emb = self.mlp(t0_freq)  # (1, H)
+
+        # (2) 다른 값이 있는 샘플만 추가 계산
+        t_other = t[~same_mask]  # (N_other,)
+        if t_other.numel() == 0:
+            return t0_emb.expand(B, -1)  # (B, H)
+
+        t_other_freq = self._timestep_embedding_cached(t_other)  # (N_other, F)
+        t_other_emb = self.mlp(t_other_freq)  # (N_other, H)
+
+        out = t0_emb.expand(B, -1).clone()  # (B, H)
+        out[~same_mask] = t_other_emb
+        return out
+
+
+
+class DiTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning for ego and Cross-Attention.
+    """
+
+    def __init__(self, dim=192, heads=8, dropout=0.1, mlp_ratio=4.0):
+        super().__init__()
+        self.num_heads = heads
+        self.head_dim = dim // heads
+        assert dim % heads == 0, f"dim({dim}) must be divisible by heads({heads})"
+        if (self.head_dim % 8) != 0:
+            # FlashAttention-2는 FP16/BF16에서 head_dim이 8의 배수일 때 최적화가 가장 좋습니다.
+            print(f"[Warning] head_dim={self.head_dim} is not a multiple of 8; "
+                  f"FlashAttention-2 성능이 저하될 수 있습니다.")
+            raise RuntimeError("head_dim이 8의 배수가 되도록 dim 또는 heads를 조정하세요.")
+
+        # === 원본 LayerNorm/MLP/게이팅은 그대로 유지 ===
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp1 = Mlp(in_features=dim,
+                        hidden_features=mlp_hidden_dim,
+                        act_layer=approx_gelu,
+                        drop=0)
+
+        self.norm3 = nn.LayerNorm(dim)
+        self.norm4 = nn.LayerNorm(dim)
+        self.mlp2 = Mlp(in_features=dim,
+                        hidden_features=mlp_hidden_dim,
+                        act_layer=approx_gelu,
+                        drop=0)
+
+        # === FlashAttention-2용 프로젝션 (Self-Attn) ===
+        # QKV/Out은 패딩 제거된 유효 토큰에만 적용됩니다.
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=True)
+        self.out_proj = nn.Linear(dim, dim, bias=True)
+
+        # === FlashAttention-2용 프로젝션 (Cross-Attn) ===
+        self.q_proj_cross = nn.Linear(dim, dim, bias=True)
+        self.kv_proj_cross = nn.Linear(dim, 2 * dim, bias=True)
+        self.out_proj_cross = nn.Linear(dim, dim, bias=True)
+
+        # === 게이트(원본 유지) ===
+        self.gate_mlp2 = nn.Parameter(torch.tensor(0.0))
+
+        # Dropout 확률(Train일 때만 FA2에 전달)
+        self._attn_dropout_p = dropout
+
+
     @staticmethod
     def _to_token_view_from_indices_or_cu(
         t: torch.Tensor,
@@ -386,156 +538,6 @@ class TimestepEmbedder(nn.Module):
         x_unpad = x_unpad + self.gate_mlp2.to(dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(y)  # (T,D)
 
         return x_unpad
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # (원본 호환 유지용: 외부에서 static 호출할 가능성 대비)
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
-            / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-            )
-        return embedding
-
-    def _timestep_embedding_cached(self, t: torch.Tensor) -> torch.Tensor:
-        """시간값 t를 sin/cos 임베딩으로 바꿉니다(캐시된 freqs 사용).
-
-        Args:
-            t (torch.Tensor):
-                시간값 텐서.
-                - shape: (N,)
-                - dtype: 무관 (내부에서 float32로 계산)
-
-        Returns:
-            torch.Tensor:
-                sin/cos 임베딩.
-                - shape: (N, frequency_embedding_size)
-                - dtype: float32
-                - device: t.device
-        """
-        if t.dim() != 1:
-            raise ValueError(f"t must be 1D (N,), got {tuple(t.shape)}")
-
-        N: int = int(t.shape[0])
-        half: int = int(self.frequency_embedding_size // 2)
-
-        if half == 0:
-            # 거의 안 쓰는 케이스지만 안전하게 처리
-            return torch.zeros((N, self.frequency_embedding_size),
-                               device=t.device, dtype=torch.float32)
-
-        freqs: torch.Tensor = self._freqs
-        if freqs.device != t.device:
-            freqs = freqs.to(device=t.device)
-
-        args = t[:, None].float() * freqs[None, :]  # (N, half)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (N, 2*half)
-
-        if (self.frequency_embedding_size % 2) == 1:
-            pad = torch.zeros((N, 1), device=t.device, dtype=emb.dtype)  # (N,1)
-            emb = torch.cat([emb, pad], dim=-1)  # (N, 2*half+1)
-
-        return emb  # float32
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        # t: (B,)
-        if t.dim() != 1:
-            raise ValueError(f"t must be 1D (B,), got {tuple(t.shape)}")
-
-        B: int = int(t.shape[0])
-        if B == 0:
-            # (0, H)
-            out_dim: int = int(self.mlp[-1].out_features)
-            return torch.zeros((0, out_dim), device=t.device, dtype=torch.float32)
-
-        # -----------------------------
-        # ✅ 방법 2) 배치의 t가 전부 같은 경우: 1번만 계산 + expand
-        #   - GPU 동기화 없이 처리(마스크로 나머지만 계산)
-        # -----------------------------
-        t0 = t[:1]  # (1,)
-        same_mask = (t == t0)  # (B,) bool
-
-        # (1) 첫 값 임베딩 1회
-        t0_freq = self._timestep_embedding_cached(t0)  # (1, F)
-        t0_emb = self.mlp(t0_freq)  # (1, H)
-
-        # (2) 다른 값이 있는 샘플만 추가 계산
-        t_other = t[~same_mask]  # (N_other,)
-        if t_other.numel() == 0:
-            return t0_emb.expand(B, -1)  # (B, H)
-
-        t_other_freq = self._timestep_embedding_cached(t_other)  # (N_other, F)
-        t_other_emb = self.mlp(t_other_freq)  # (N_other, H)
-
-        out = t0_emb.expand(B, -1).clone()  # (B, H)
-        out[~same_mask] = t_other_emb
-        return out
-
-
-
-class DiTBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning for ego and Cross-Attention.
-    """
-
-    def __init__(self, dim=192, heads=8, dropout=0.1, mlp_ratio=4.0):
-        super().__init__()
-        self.num_heads = heads
-        self.head_dim = dim // heads
-        assert dim % heads == 0, f"dim({dim}) must be divisible by heads({heads})"
-        if (self.head_dim % 8) != 0:
-            # FlashAttention-2는 FP16/BF16에서 head_dim이 8의 배수일 때 최적화가 가장 좋습니다.
-            print(f"[Warning] head_dim={self.head_dim} is not a multiple of 8; "
-                  f"FlashAttention-2 성능이 저하될 수 있습니다.")
-            raise RuntimeError("head_dim이 8의 배수가 되도록 dim 또는 heads를 조정하세요.")
-
-        # === 원본 LayerNorm/MLP/게이팅은 그대로 유지 ===
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp1 = Mlp(in_features=dim,
-                        hidden_features=mlp_hidden_dim,
-                        act_layer=approx_gelu,
-                        drop=0)
-
-        self.norm3 = nn.LayerNorm(dim)
-        self.norm4 = nn.LayerNorm(dim)
-        self.mlp2 = Mlp(in_features=dim,
-                        hidden_features=mlp_hidden_dim,
-                        act_layer=approx_gelu,
-                        drop=0)
-
-        # === FlashAttention-2용 프로젝션 (Self-Attn) ===
-        # QKV/Out은 패딩 제거된 유효 토큰에만 적용됩니다.
-        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=True)
-        self.out_proj = nn.Linear(dim, dim, bias=True)
-
-        # === FlashAttention-2용 프로젝션 (Cross-Attn) ===
-        self.q_proj_cross = nn.Linear(dim, dim, bias=True)
-        self.kv_proj_cross = nn.Linear(dim, 2 * dim, bias=True)
-        self.out_proj_cross = nn.Linear(dim, dim, bias=True)
-
-        # === 게이트(원본 유지) ===
-        self.gate_mlp2 = nn.Parameter(torch.tensor(0.0))
-
-        # Dropout 확률(Train일 때만 FA2에 전달)
-        self._attn_dropout_p = dropout
 
     # ====================== 유틸/헬퍼 함수들 ======================
 
