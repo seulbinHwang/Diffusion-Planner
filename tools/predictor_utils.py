@@ -2100,7 +2100,7 @@ def build_deepspeed_config(args: argparse.Namespace,
         "zero_allow_untested_optimizer": True,
         "steps_per_print": steps_per_print,
     }
-    ds_config["wall_clock_breakdown"] = True
+    ds_config["wall_clock_breakdown"] = False
 
     # 옵티마 상태를 CPU로 일부 넘겨서 GPU 메모리를 더 줄이고 싶을 때
     if zero_offload_optimizer:
