@@ -41,8 +41,10 @@ except Exception as _e1:
         _FA2_IMPORT_ERR = Exception(
             f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
-# ===========================================================
-
+from typing import Dict, Tuple
+import torch
+import torch.nn as nn
+from diffusion_planner.model.module.pram_v2 import ModulationTriplet
 
 def modulate(
     x: torch.Tensor,  # (B, L, D)
@@ -133,6 +135,257 @@ class TimestepEmbedder(nn.Module):
 
         # persistent=False: 체크포인트 호환(새 buffer로 인해 strict 로딩 실패) 위험 줄이기
         self.register_buffer("_freqs", freqs, persistent=False)  # (half,)
+
+
+    @staticmethod
+    def _to_token_view_from_indices_or_cu(
+        t: torch.Tensor,
+        *,
+        indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """(B,L,...) 또는 (B,...) 형태 텐서를 (T,...) 유효 토큰 순서로 맞춥니다.
+
+        목적:
+            - pram 모듈레이션(scale/shift/gate)이 (B,L,...) 이면 indices로 unpad
+            - (B,...) 이면 배치별 유효 토큰 수만큼 repeat해서 (T,...)로 변환
+
+        Args:
+            t (torch.Tensor):
+                - (B, L, ...) 또는 (B, ...) 또는 스칼라 형태
+            indices (torch.Tensor):
+                unpad_input이 준 indices. shape: (T,)
+            cu_seqlens (torch.Tensor):
+                unpad_input이 준 cu_seqlens. shape: (B+1,)
+
+        Returns:
+            torch.Tensor:
+                (T, ...) 모양의 텐서
+        """
+        if t.dim() >= 3:
+            # (B,L,...) -> (B*L, ...) -> indices로 선택
+            flat = t.reshape(-1, *t.shape[2:])
+            return flat.index_select(0, indices)
+
+        if t.dim() == 2:
+            # (B,D) -> 배치별 유효 토큰 수만큼 repeat -> (T,D)
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)  # (B,)
+            return torch.repeat_interleave(t, seqlens, dim=0)
+
+        if t.dim() == 1:
+            # (B,) -> (T,1)
+            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)  # (B,)
+            out = torch.repeat_interleave(t, seqlens, dim=0)  # (T,)
+            return out.unsqueeze(-1)
+
+        # 스칼라() -> (T,1)
+        return t.view(1, 1).expand(int(indices.numel()), 1)
+
+    def _self_attn_flash_varlen_packed(
+        self,
+        x_unpad: torch.Tensor,      # (T, D)
+        cu_seqlens: torch.Tensor,   # (B+1,)
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """Self-Attn을 packed(T,D)에서 바로 계산합니다.
+
+        Args:
+            x_unpad: 유효 토큰만 모은 텐서. shape: (T, D)
+            cu_seqlens: 배치별 누적 길이. shape: (B+1,)
+            max_seqlen: 배치 내 최대 유효 길이. int
+
+        Returns:
+            out_unpad: shape (T, D)
+        """
+        self._check_flash_available()
+
+        T, D = x_unpad.shape
+        if T == 0 or int(max_seqlen) == 0:
+            touch = (self.qkv_proj.weight.view(-1)[:1].sum() +
+                     (self.qkv_proj.bias.view(-1)[:1].sum()
+                      if self.qkv_proj.bias is not None else 0) +
+                     self.out_proj.weight.view(-1)[:1].sum() +
+                     (self.out_proj.bias.view(-1)[:1].sum()
+                      if self.out_proj.bias is not None else 0)) * 0.0
+            return x_unpad + touch  # (0,D) 유지
+
+        qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
+        qkv = qkv.reshape(T, 3, self.num_heads, self.head_dim)  # (T,3,H,Hd)
+        comp_dtype = self._get_compute_dtype(qkv)
+        qkv = qkv.to(comp_dtype)
+
+        out = flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_seqlens=cu_seqlens.to(torch.int32),
+            max_seqlen=int(max_seqlen),
+            dropout_p=self._attn_dropout_p if self.training else 0.0,
+            softmax_scale=None,
+            causal=False,
+        )  # (T,H,Hd)
+
+        out = out.reshape(T, self.num_heads * self.head_dim)  # (T,D)
+        out = self.out_proj(out.to(x_unpad.dtype))  # (T,D)
+        return out
+
+    def _cross_attn_flash_varlen_packed(
+        self,
+        q_unpad: torch.Tensor,          # (Tq, D)
+        cu_seqlens_q: torch.Tensor,     # (B+1,)
+        max_seqlen_q: int,
+        kv_unpad: torch.Tensor,         # (Tk, D)
+        cu_seqlens_k: torch.Tensor,     # (B+1,)
+        max_seqlen_k: int,
+    ) -> torch.Tensor:
+        """Cross-Attn을 packed(T,D)에서 바로 계산합니다. (KV는 바깥에서 캐시된 것을 사용)
+
+        Args:
+            q_unpad: 유효 쿼리 토큰. shape: (Tq, D)
+            cu_seqlens_q: q의 누적 길이. shape: (B+1,)
+            max_seqlen_q: q의 배치 내 최대 길이. int
+            kv_unpad: 유효 KV 토큰(캐시). shape: (Tk, D)
+            cu_seqlens_k: k의 누적 길이. shape: (B+1,)
+            max_seqlen_k: k의 배치 내 최대 길이. int
+
+        Returns:
+            out_unpad: q 자리 출력. shape: (Tq, D)
+        """
+        self._check_flash_available()
+
+        Tq, D = q_unpad.shape
+        Tk = int(kv_unpad.shape[0])
+
+        if Tq == 0 or Tk == 0 or int(max_seqlen_q) == 0 or int(max_seqlen_k) == 0:
+            touch = (self.q_proj_cross.weight.view(-1)[:1].sum() +
+                     (self.q_proj_cross.bias.view(-1)[:1].sum()
+                      if self.q_proj_cross.bias is not None else 0) +
+                     self.kv_proj_cross.weight.view(-1)[:1].sum() +
+                     (self.kv_proj_cross.bias.view(-1)[:1].sum()
+                      if self.kv_proj_cross.bias is not None else 0) +
+                     self.out_proj_cross.weight.view(-1)[:1].sum() +
+                     (self.out_proj_cross.bias.view(-1)[:1].sum()
+                      if self.out_proj_cross.bias is not None else 0)) * 0.0
+            return q_unpad + touch  # (Tq,D) 유지(빈 경우도 OK)
+
+        q = self.q_proj_cross(q_unpad).reshape(Tq, self.num_heads, self.head_dim)  # (Tq,H,Hd)
+        kv = self.kv_proj_cross(kv_unpad).reshape(Tk, 2, self.num_heads, self.head_dim)  # (Tk,2,H,Hd)
+
+        comp_dtype = self._get_compute_dtype(q)
+        q = q.to(comp_dtype)
+        kv = kv.to(comp_dtype)
+
+        out = flash_attn_varlen_cross_func(
+            q=q,
+            kv=kv,
+            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
+            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+            dropout_p=self._attn_dropout_p if self.training else 0.0,
+            softmax_scale=None,
+            causal=False,
+        )  # (Tq,H,Hd)
+
+        out = out.reshape(Tq, self.num_heads * self.head_dim)  # (Tq,D)
+        out = self.out_proj_cross(out.to(q_unpad.dtype))       # (Tq,D)
+        return out
+
+    def forward_packed(
+        self,
+        x_unpad: torch.Tensor,          # (T, D)
+        *,
+        indices: torch.Tensor,          # (T,)
+        cu_seqlens_q: torch.Tensor,     # (B+1,)
+        max_seqlen_q: int,
+        kv_unpad: torch.Tensor,         # (Tk, D)
+        cu_seqlens_k: torch.Tensor,     # (B+1,)
+        max_seqlen_k: int,
+        pram_v2_modulations: Dict[str, ModulationTriplet],
+    ) -> torch.Tensor:
+        """블록 전체를 packed(T,D)에서 수행합니다.
+
+        핵심:
+            - LayerNorm/MLP까지 유효 토큰만 계산 (패딩 에이전트 계산 제거)
+            - Cross-Attn의 KV는 바깥에서 캐시된 kv_unpad/cu_k/max_k를 사용
+
+        Args:
+            x_unpad:
+                유효 에이전트 토큰. shape: (T, D)
+            indices:
+                unpad_input이 준 indices. shape: (T,)
+            cu_seqlens_q:
+                Q(에이전트)의 누적 길이. shape: (B+1,)
+            max_seqlen_q:
+                Q의 배치 내 최대 길이. int
+            kv_unpad:
+                scene KV 유효 토큰(캐시). shape: (Tk, D)
+            cu_seqlens_k:
+                KV의 누적 길이. shape: (B+1,)
+            max_seqlen_k:
+                KV의 배치 내 최대 길이. int
+            pram_v2_modulations:
+                {"SA","FFN","CA"} 각각의 모듈레이션(shift/scale/gate)
+
+        Returns:
+            torch.Tensor:
+                블록 출력(유효 토큰만). shape: (T, D)
+        """
+        # --- SA ---
+        sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
+        sa_scale = self._to_token_view_from_indices_or_cu(sa_mod.scale, indices=indices, cu_seqlens=cu_seqlens_q)
+        sa_shift = self._to_token_view_from_indices_or_cu(sa_mod.shift, indices=indices, cu_seqlens=cu_seqlens_q)
+        sa_gate  = self._to_token_view_from_indices_or_cu(sa_mod.gate,  indices=indices, cu_seqlens=cu_seqlens_q)
+
+        sa_scale = sa_scale.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        sa_shift = sa_shift.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        sa_gate  = sa_gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
+
+        y = self.norm1(x_unpad)  # (T,D)
+        y = y * (1.0 + sa_scale) + sa_shift
+        f_sa = self._self_attn_flash_varlen_packed(y, cu_seqlens_q, max_seqlen_q)  # (T,D)
+        x_unpad = x_unpad + sa_gate * f_sa  # (T,D)
+
+        # --- FFN(MLP1) ---
+        ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
+        ffn_scale = self._to_token_view_from_indices_or_cu(ffn_mod.scale, indices=indices, cu_seqlens=cu_seqlens_q)
+        ffn_shift = self._to_token_view_from_indices_or_cu(ffn_mod.shift, indices=indices, cu_seqlens=cu_seqlens_q)
+        ffn_gate  = self._to_token_view_from_indices_or_cu(ffn_mod.gate,  indices=indices, cu_seqlens=cu_seqlens_q)
+
+        ffn_scale = ffn_scale.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        ffn_shift = ffn_shift.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        ffn_gate  = ffn_gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
+
+        y = self.norm2(x_unpad)  # (T,D)
+        y = y * (1.0 + ffn_scale) + ffn_shift
+        f_ffn = self.mlp1(y)  # (T,D)
+        x_unpad = x_unpad + ffn_gate * f_ffn  # (T,D)
+
+        # --- CA (KV 캐시 사용) ---
+        ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
+        ca_scale = self._to_token_view_from_indices_or_cu(ca_mod.scale, indices=indices, cu_seqlens=cu_seqlens_q)
+        ca_shift = self._to_token_view_from_indices_or_cu(ca_mod.shift, indices=indices, cu_seqlens=cu_seqlens_q)
+        ca_gate  = self._to_token_view_from_indices_or_cu(ca_mod.gate,  indices=indices, cu_seqlens=cu_seqlens_q)
+
+        ca_scale = ca_scale.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        ca_shift = ca_shift.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        ca_gate  = ca_gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
+
+        y = self.norm3(x_unpad)  # (T,D)
+        q = y * (1.0 + ca_scale) + ca_shift
+        f_ca = self._cross_attn_flash_varlen_packed(
+            q_unpad=q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            kv_unpad=kv_unpad,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_k=max_seqlen_k,
+        )  # (T,D)
+        x_unpad = x_unpad + ca_gate * f_ca  # (T,D)
+
+        # --- 원본 MLP2 ---
+        y = self.norm4(x_unpad)  # (T,D)
+        x_unpad = x_unpad + self.gate_mlp2.to(dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(y)  # (T,D)
+
+        return x_unpad
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
