@@ -706,59 +706,6 @@ class DiTBlock(nn.Module):
         return x_unpad
 
 
-    def _combine_global_and_route_modulations(
-        self,
-        global_modulations: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                                  torch.Tensor, torch.Tensor,
-                                  torch.Tensor],  # (B,D)×6
-        route_residuals_mods: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                                    torch.Tensor, torch.Tensor,
-                                    torch.Tensor],  # (B,P,D)×6
-        ego_fut_residuals: Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                                 torch.Tensor, torch.Tensor,
-                                 torch.Tensor],  # (B,P,D)×6
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor]:
-        """전역 모듈레이션(B,D)과 per‑agent 잔차(B,P,D)를 결합해 (B,P,D) 6개를 반환합니다.
-
-        결합식:
-            shift_msa^p = shift_msa + route_msa_alpha * Δshift_msa^p
-            scale_msa^p = scale_msa + route_msa_alpha * Δscale_msa^p
-            gate_msa^p  = gate_msa  + route_msa_alpha * Δgate_msa^p
-            (MLP 경로도 동일; α는 학습 가능한 스칼라)
-        """
-        (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-         gate_mlp) = global_modulations
-        (d_shift_msa, d_scale_msa, d_gate_msa, d_shift_mlp, d_scale_mlp,
-         d_gate_mlp) = route_residuals_mods
-
-        # ★ FIX: 스칼라 파라미터 α를 연산 dtype에 맞춤 (수치/성능 안정화)
-        alpha_msa = self.route_msa_alpha.to(dtype=shift_msa.dtype)
-        alpha_mlp = self.route_mlp_alpha.to(dtype=shift_mlp.dtype)
-
-        # (B, D) → (B, 1, D) 승격 후 (B, P, D) 잔차와 합
-        shift_msa_pa = shift_msa.unsqueeze(1) + alpha_msa * d_shift_msa
-        scale_msa_pa = scale_msa.unsqueeze(1) + alpha_msa * d_scale_msa
-        gate_msa_pa = gate_msa.unsqueeze(1) + alpha_msa * d_gate_msa
-
-        shift_mlp_pa = shift_mlp.unsqueeze(1) + alpha_mlp * d_shift_mlp
-        scale_mlp_pa = scale_mlp.unsqueeze(1) + alpha_mlp * d_scale_mlp
-        gate_mlp_pa = gate_mlp.unsqueeze(1) + alpha_mlp * d_gate_mlp
-
-        (dsh_msa_e, dsc_msa_e, dgt_msa_e, dsh_mlp_e, dsc_mlp_e,
-         dgt_mlp_e) = ego_fut_residuals
-
-        a_msa = self.ego_msa_alpha.to(shift_msa.dtype)
-        a_mlp = self.ego_mlp_alpha.to(shift_mlp.dtype)
-        shift_msa_pa = shift_msa_pa + a_msa * dsh_msa_e
-        scale_msa_pa = scale_msa_pa + a_msa * dsc_msa_e
-        gate_msa_pa = gate_msa_pa + a_msa * dgt_msa_e
-        shift_mlp_pa = shift_mlp_pa + a_mlp * dsh_mlp_e
-        scale_mlp_pa = scale_mlp_pa + a_mlp * dsc_mlp_e
-        gate_mlp_pa = gate_mlp_pa + a_mlp * dgt_mlp_e
-
-        return shift_msa_pa, scale_msa_pa, gate_msa_pa, shift_mlp_pa, scale_mlp_pa, gate_mlp_pa
-
     def _apply_modulated_mlp1(
             self,
             x: torch.Tensor,  # (B, P, D)

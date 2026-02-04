@@ -762,14 +762,14 @@ class Decoder(nn.Module):
         - 학습/추론 공통으로 self.dit.norm_dit_returns.integrated_trajectory 에 저장된 값을 사용한다.
         - shape 이나 배치 크기가 안 맞으면 None 을 돌려서 prox-snap 을 건너뛴다.
         """
-        dit_returns = getattr(self.dit, "dit_returns", None)
-        if dit_returns is None:
+        norm_dit_returns = getattr(self.dit, "norm_dit_returns", None)
+        if norm_dit_returns is None:
             return None
         """
         # integrated_trajectory : (B, (1+)Pnn, future_len, 4)
         # control_constraint_diff : (B, (1+)Pnn, future_len, 3)
         """
-        integrated_future = getattr(dit_returns, "integrated_trajectory",
+        integrated_future = getattr(norm_dit_returns, "integrated_trajectory",
                                     None)  # (B, (1+)Pnn, T, 4)
         if integrated_future is None:
             return None
