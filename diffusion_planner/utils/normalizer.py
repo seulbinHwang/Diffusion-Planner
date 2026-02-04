@@ -21,6 +21,22 @@ class StateNormalizer:
         self.mean = self._to_1d4(mean, name="mean")  # (4,)
         self.std = self._to_1d4(std, name="std")  # (4,)
 
+    @classmethod
+    def from_json(cls, args):
+        data = openjson(args.normalization_file_path)
+        mean = data["neighbor"]["mean"]
+        std = data["neighbor"]["std"]
+        return cls(mean, std)
+
+    @classmethod
+    def from_json2(cls, args_dict):
+        path_str = args_dict.get("normalization_file_path",
+                                 "normalization.json")
+        data = openjson(to_absolute_path(path_str))
+        mean = data["neighbor"]["mean"]
+        std = data["neighbor"]["std"]
+        return cls(mean, std)
+
     @staticmethod
     def _to_1d4(values: object, name: str) -> torch.Tensor:
         values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
@@ -142,6 +158,17 @@ class StateNormalizer:
             mask = self._broadcast_valid_mask(valid_mask, data)
             return self._mask_out_of_place(inv_data, mask)
 
+    def to_dict(self) -> dict:
+        """현재 mean/std를 저장용 dict로 바꿉니다.
+
+        Returns:
+            dict: {"mean": ..., "std": ...}
+                mean/std는 (1, 1, 4) 모양의 중첩 리스트로 내보냅니다.
+        """
+        mean_1x1x4 = self.mean.view(1, 1, 4).detach().cpu().numpy().tolist()
+        std_1x1x4 = self.std.view(1, 1, 4).detach().cpu().numpy().tolist()
+        return {"mean": mean_1x1x4, "std": std_1x1x4}
+
 
 from copy import copy
 from typing import Dict, Any, Optional
@@ -152,6 +179,39 @@ class ObservationNormalizer:
 
     def __init__(self, normalization_dict: Dict[str, Dict[str, torch.Tensor]]):
         self._normalization_dict = {k: v for k, v in normalization_dict.items()}
+
+    @classmethod
+    def from_json(cls, args):
+        if isinstance(args, str):
+            path = args
+        else:
+            path = args.normalization_file_path
+
+        data = openjson(path)
+        ndt = {}
+        for k, v in data.items():
+            if k not in ["ego", "neighbor"]:
+                ndt[k] = {
+                    "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                    "std": torch.tensor(v["std"], dtype=torch.float32)
+                }
+        return cls(ndt)
+
+    @classmethod
+    def from_json2(cls, args_dict):
+        path_str = args_dict.get("normalization_file_path",
+                                 "normalization.json")
+        data = openjson(to_absolute_path(path_str))
+
+        ndt = {}
+        for k, v in data.items():
+            if k in ["ego", "neighbor"]:
+                continue
+            ndt[k] = {
+                "mean": torch.tensor(v["mean"], dtype=torch.float32),
+                "std": torch.tensor(v["std"], dtype=torch.float32),
+            }
+        return cls(ndt)
 
     @staticmethod
     def _infer_device_type_from_dict(data: Dict[str, Any]) -> str:
@@ -329,3 +389,10 @@ class ObservationNormalizer:
 
         _mask("near_agents_past", "near_agents_past_is_valid")
         _mask("non_near_agents_past", "non_near_agents_past_is_valid")
+
+    def to_dict(self):
+        return {
+            k: {
+                kk: vv.detach().cpu().numpy().tolist() for kk, vv in v.items()
+            } for k, v in self._normalization_dict.items()
+        }
