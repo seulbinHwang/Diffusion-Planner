@@ -40,7 +40,8 @@ def profile_block(
         yield
         return
 
-    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
+    is_cuda: bool = isinstance(device_type,
+                               str) and device_type.startswith("cuda")
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -62,8 +63,9 @@ def profile_block(
     _PROFILE_TOTAL_MS[name] = new_sum
 
     avg_ms: float = new_sum / float(new_cnt)
-    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}")
-
+    print(
+        f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}"
+    )
 
 
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
@@ -241,7 +243,8 @@ class Encoder(nn.Module):
             time_gap=self.time_gap,
             time_min=self.time_min,
             time_max=self.time_max)
-        self.lane_encoder.enable_profile = bool(getattr(config, "profile_feasible", False))
+        self.lane_encoder.enable_profile = bool(
+            getattr(config, "profile_feasible", False))
         lane_summary_num: int = int(getattr(config, "lane_summary_num", 0))
         if lane_summary_num > 0:
             self.lane_summary_pooler = LaneSummaryTokenPooler(
@@ -698,11 +701,11 @@ class Encoder(nn.Module):
         return known_mask  # (B, N), bool
 
     def _ensure_static_objects_tensor(
-            self,
-            static_objects: Optional[torch.Tensor],
-            static_objects_is_valid: Optional[torch.Tensor],
-            batch_size: int,
-            ref_tensor: torch.Tensor,
+        self,
+        static_objects: Optional[torch.Tensor],
+        static_objects_is_valid: Optional[torch.Tensor],
+        batch_size: int,
+        ref_tensor: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """static_objects가 None이어도 정적 물체 인코더가 항상 동작하도록 입력 텐서를 보장합니다.
 
@@ -737,8 +740,7 @@ class Encoder(nn.Module):
         # -------------------------
         static_objects_num: int = 1
         placeholder_static_objects: torch.Tensor = ref_tensor.new_zeros(
-            (B, static_objects_num, D_static)
-        )  # (B, 1, D_static)
+            (B, static_objects_num, D_static))  # (B, 1, D_static)
 
         static_objects_is_valid_tensor: torch.Tensor = ref_tensor.new_zeros(
             (B, static_objects_num),
@@ -748,26 +750,26 @@ class Encoder(nn.Module):
         return placeholder_static_objects, static_objects_is_valid_tensor
 
     def _encode_agents_static_lanes(
-            self,
-            inputs: Dict[str, torch.Tensor],
+        self,
+        inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
-        torch.Tensor,  # encoding_static:       (B, N_static, H)
-        torch.Tensor,  # static_mask:           (B, N_static)
-        torch.Tensor,  # static_pos:            (B, N_static, 9)
-        torch.Tensor,  # encoding_lanes:        (B, N_lanes, H)
-        torch.Tensor,  # lanes_mask:            (B, N_lanes)
-        torch.Tensor,  # lane_pos:              (B, N_lanes, 9)
-        torch.Tensor,  # encoding_road_safety:  (B, N_road_safety, H)
-        torch.Tensor,  # road_safety_mask:      (B, N_road_safety)
-        torch.Tensor,  # road_safety_pos:       (B, N_road_safety, 9)
+            torch.Tensor,  # encoding_static:       (B, N_static, H)
+            torch.Tensor,  # static_mask:           (B, N_static)
+            torch.Tensor,  # static_pos:            (B, N_static, 9)
+            torch.Tensor,  # encoding_lanes:        (B, N_lanes, H)
+            torch.Tensor,  # lanes_mask:            (B, N_lanes)
+            torch.Tensor,  # lane_pos:              (B, N_lanes, 9)
+            torch.Tensor,  # encoding_road_safety:  (B, N_road_safety, H)
+            torch.Tensor,  # road_safety_mask:      (B, N_road_safety)
+            torch.Tensor,  # road_safety_pos:       (B, N_road_safety, 9)
     ]:
         """에이전트 / 정적 객체 / 차선 인코더를 한 번에 호출한다."""
         lanes = inputs["lanes"]  # (B, L, lane_len, D_lane)
         device_type: str = lanes.device.type
 
         # --- static encoder ---
-        static_objects: Optional[torch.Tensor] = inputs.get("static_objects",
-                                                            None)
+        static_objects: Optional[torch.Tensor] = inputs.get(
+            "static_objects", None)
         static_objects_is_valid: Optional[torch.Tensor] = inputs.get(
             "static_objects_is_valid", None)
 
@@ -848,9 +850,9 @@ class Encoder(nn.Module):
             ):
                 (encoding_road_safety, road_safety_mask,
                  road_safety_pos) = self._build_empty_road_safety_tokens(
-                    batch_size=int(lanes.shape[0]),
-                    ref_encoding=encoding_lanes,
-                    ref_pos=lane_pos)
+                     batch_size=int(lanes.shape[0]),
+                     ref_encoding=encoding_lanes,
+                     ref_pos=lane_pos)
         else:
             with profile_block(
                     "Encoder._encode_agents_static_lanes.road_safety_encoder",
@@ -859,24 +861,22 @@ class Encoder(nn.Module):
             ):
                 (encoding_road_safety, road_safety_mask,
                  road_safety_pos) = self.road_safety_encoder(
-                    stop_sign_points,
-                    stop_sign_is_valid,
-                    crosswalk_points,
-                    crosswalk_is_valid,
-                    speed_bump_points,
-                    speed_bump_is_valid,
-                    driveway_points,
-                    driveway_is_valid,
-                    road_edge,
-                    road_edge_is_valid,
-                    road_edge_type,
-                )
+                     stop_sign_points,
+                     stop_sign_is_valid,
+                     crosswalk_points,
+                     crosswalk_is_valid,
+                     speed_bump_points,
+                     speed_bump_is_valid,
+                     driveway_points,
+                     driveway_is_valid,
+                     road_edge,
+                     road_edge_is_valid,
+                     road_edge_type,
+                 )
 
-        return (
-            encoding_static, static_mask, static_pos,
-            encoding_lanes, lanes_mask, lane_pos,
-            encoding_road_safety, road_safety_mask, road_safety_pos
-        )
+        return (encoding_static, static_mask, static_pos, encoding_lanes,
+                lanes_mask, lane_pos, encoding_road_safety, road_safety_mask,
+                road_safety_pos)
 
     def _add_pos_embedding_to_tokens(
             self,
@@ -888,8 +888,11 @@ class Encoder(nn.Module):
 
         이 함수는 다음을 보장합니다.
         - 패딩 토큰(mask=True)은 위치 임베딩을 더하지 않습니다.
-        - 유효 토큰(mask=False)만 골라 pos_emb(Linear(9→H))를 적용합니다.
+        - 유효 토큰(mask=False)만 골라 pos_emb(Linear/MLP(9→H))를 적용합니다.
         - pos_scale(스칼라)을 곱한 뒤 token_embeddings에 더합니다.
+        - ✅ (추가) 배치 전체가 패딩이라 유효 토큰이 0개여도,
+          pos_emb/pos_scale 파라미터가 해당 step에서 완전히 미사용이 되지 않도록
+          0계수로 그래프에 연결합니다. (출력 값은 동일)
 
         Args:
             token_embeddings:
@@ -945,12 +948,14 @@ class Encoder(nn.Module):
                 dtype=token_embeddings.dtype,
             )
             pos_result_flat[~mask_flat] = pos_valid  # (B*N, H)
-            pos_result = pos_result_flat.view(B, N, H)  # (B,N,H)
+            pos_result = pos_result_flat.view(B, N, H)  # (B, N, H)
         else:
-            # 유효 토큰이 하나도 없으면 pos_result는 0
-            pos_result = torch.zeros((B, N, H),
-                                     device=token_embeddings.device,
-                                     dtype=token_embeddings.dtype)
+            # ✅ 유효 토큰이 0개인 경우에도 pos_emb/pos_scale을 0계수로 연결해
+            # 분산 학습에서 "이번 스텝에 파라미터가 안 쓰였다" 문제를 줄입니다.
+            # 출력은 기존처럼 전부 0입니다.
+            touch_params = list(self.pos_emb.parameters()) + [self.pos_scale]
+            pos_result = self._zero_with_touch(
+                token_embeddings, touch_params)  # (B, N, H) zeros + touch*0
 
         return token_embeddings + pos_result
 
@@ -1039,10 +1044,12 @@ class Encoder(nn.Module):
             static_pos = static_pos.to(device=pos_device, dtype=pos_dtype)
 
         if lane_pos_for_fusion.dtype != pos_dtype or lane_pos_for_fusion.device != pos_device:
-            lane_pos_for_fusion = lane_pos_for_fusion.to(device=pos_device, dtype=pos_dtype)
+            lane_pos_for_fusion = lane_pos_for_fusion.to(device=pos_device,
+                                                         dtype=pos_dtype)
 
         if road_safety_pos.dtype != pos_dtype or road_safety_pos.device != pos_device:
-            road_safety_pos = road_safety_pos.to(device=pos_device, dtype=pos_dtype)
+            road_safety_pos = road_safety_pos.to(device=pos_device,
+                                                 dtype=pos_dtype)
 
         encoding_pos_2d: torch.Tensor = torch.cat(
             [static_pos, lane_pos_for_fusion, road_safety_pos],
@@ -1091,11 +1098,12 @@ class Encoder(nn.Module):
     # --------------------------------------------------------------------- #
     # 리팩토링된 Encoder.forward
     # --------------------------------------------------------------------- #
-    def forward(self, inputs: Dict[str, torch.Tensor]) -> Dict[
-        str, torch.Tensor]:
+    def forward(self, inputs: Dict[str,
+                                   torch.Tensor]) -> Dict[str, torch.Tensor]:
         """인코더 전방 패스"""
         if self.config.profile_feasible:
-            print("\n\n\n\n=============[DEBUG] Encoder.forward 호출 =============")
+            print(
+                "\n\n\n\n=============[DEBUG] Encoder.forward 호출 =============")
         self._sync_encoder_local_train_eval_mode()
         device_type: str = inputs["ego_agent_past"].device.type
 
@@ -1123,16 +1131,16 @@ class Encoder(nn.Module):
             ):
                 (encoding_input_with_pos,
                  encoding_mask_2d) = self._build_fusion_inputs(
-                    encoding_static=encoding_static,
-                    static_mask=static_mask,
-                    static_pos=static_pos,
-                    encoding_lanes=encoding_lanes,
-                    lanes_mask=lanes_mask,
-                    lane_pos=lane_pos,
-                    encoding_road_safety=encoding_road_safety,
-                    road_safety_mask=road_safety_mask,
-                    road_safety_pos=road_safety_pos,
-                )
+                     encoding_static=encoding_static,
+                     static_mask=static_mask,
+                     static_pos=static_pos,
+                     encoding_lanes=encoding_lanes,
+                     lanes_mask=lanes_mask,
+                     lane_pos=lane_pos,
+                     encoding_road_safety=encoding_road_safety,
+                     road_safety_mask=road_safety_mask,
+                     road_safety_pos=road_safety_pos,
+                 )
 
             with profile_block(
                     "Encoder._run_fusion_and_route_encoder",
@@ -1141,9 +1149,9 @@ class Encoder(nn.Module):
             ):
                 encoder_outputs: Dict[
                     str, torch.Tensor] = self._run_fusion_and_route_encoder(
-                    encoding_input_with_pos=encoding_input_with_pos,
-                    encoding_mask_2d=encoding_mask_2d,
-                )
+                        encoding_input_with_pos=encoding_input_with_pos,
+                        encoding_mask_2d=encoding_mask_2d,
+                    )
 
             return encoder_outputs
 
@@ -1177,9 +1185,11 @@ class SelfAttentionBlock(nn.Module):
         self.attn_out_drop = nn.Dropout(attn_drop_p)
 
         # 원래 코드와 호환을 위해 모듈은 그대로 둡니다(폴백 경로에서 사용).
-        self.drop_path = DropPath(drop_path_p) if drop_path_p > 0.0 else nn.Identity()
+        self.drop_path = DropPath(
+            drop_path_p) if drop_path_p > 0.0 else nn.Identity()
         self._drop_path_p: float = float(drop_path_p)
-        self._drop_path_scale_by_keep: bool = bool(getattr(self.drop_path, "scale_by_keep", True))
+        self._drop_path_scale_by_keep: bool = bool(
+            getattr(self.drop_path, "scale_by_keep", True))
 
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
@@ -1195,10 +1205,8 @@ class SelfAttentionBlock(nn.Module):
         self.head_dim = dim // heads
         assert dim % heads == 0, f"dim({dim}) must be divisible by heads({heads})"
         if (self.head_dim % 8) != 0:
-            print(
-                f"[Warning] head_dim={self.head_dim} (not multiple of 8). "
-                "FlashAttention‑2 성능이 저하될 수 있습니다."
-            )
+            print(f"[Warning] head_dim={self.head_dim} (not multiple of 8). "
+                  "FlashAttention‑2 성능이 저하될 수 있습니다.")
 
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=True)
         self.out_proj = nn.Linear(dim, dim, bias=True)
@@ -1231,11 +1239,10 @@ class SelfAttentionBlock(nn.Module):
                 pass
         return x.dtype
 
-
     def _unpad_from_mask(
         self,
-        x: torch.Tensor,      # (B, L, H)
-        mask: torch.Tensor,   # (B, L) True=pad
+        x: torch.Tensor,  # (B, L, H)
+        mask: torch.Tensor,  # (B, L) True=pad
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """패딩 마스크를 이용해 (B,L,H) -> (T,H)로 줄이고, 복원 정보를 함께 반환합니다.
 
@@ -1263,17 +1270,17 @@ class SelfAttentionBlock(nn.Module):
             x_unpad, indices, cu_seqlens, max_seqlen, _seqlens = res
         else:
             raise RuntimeError(
-                f"unpad_input() return format is unexpected. len={len(res)}"
-            )
+                f"unpad_input() return format is unexpected. len={len(res)}")
 
         # max_seqlen은 int 또는 텐서일 수 있어 int로 통일
-        max_seqlen_int: int = int(max_seqlen) if not isinstance(max_seqlen, int) else max_seqlen
+        max_seqlen_int: int = int(max_seqlen) if not isinstance(
+            max_seqlen, int) else max_seqlen
         return x_unpad, indices, cu_seqlens, max_seqlen_int
 
     @staticmethod
     def _pad_to_batch(
-        x_unpad: torch.Tensor,   # (T, H)
-        indices: torch.Tensor,   # (T,)
+        x_unpad: torch.Tensor,  # (T, H)
+        indices: torch.Tensor,  # (T,)
         batch_size: int,
         seq_len: int,
     ) -> torch.Tensor:
@@ -1300,9 +1307,9 @@ class SelfAttentionBlock(nn.Module):
         return out + touch * 0.0
 
     def _drop_path_varlen(
-        self,
-        x_unpad: torch.Tensor,     # (T, H)
-        cu_seqlens: torch.Tensor,  # (B+1,)
+            self,
+            x_unpad: torch.Tensor,  # (T, H)
+            cu_seqlens: torch.Tensor,  # (B+1,)
     ) -> torch.Tensor:
         """unpad된 토큰들((T,H))에 DropPath를 '배치 단위 동일 마스크'로 적용합니다.
 
@@ -1336,16 +1343,20 @@ class SelfAttentionBlock(nn.Module):
 
         # 배치별 마스크 생성: (B,)
         # - float32로 만든 뒤 x dtype으로 캐스팅 (안정성)
-        rnd = torch.rand((B,), device=x_unpad.device, dtype=torch.float32)  # (B,)
+        rnd = torch.rand((B,), device=x_unpad.device,
+                         dtype=torch.float32)  # (B,)
         keep_mask = (rnd < keep_prob).to(torch.float32)  # (B,)  0 또는 1
         if self._drop_path_scale_by_keep:
             keep_mask = keep_mask / keep_prob  # (B,)  0 또는 1/keep_prob
 
         # 토큰 인덱스(0..T-1)가 어떤 배치에 속하는지 계산
         # boundaries = cu_seqlens[1:] = 각 배치의 끝 인덱스
-        boundaries = cu_seqlens[1:].to(device=x_unpad.device, dtype=torch.int64)  # (B,)
-        positions = torch.arange(T, device=x_unpad.device, dtype=torch.int64)    # (T,)
-        batch_ids = torch.bucketize(positions, boundaries, right=True)           # (T,) in [0..B-1]
+        boundaries = cu_seqlens[1:].to(device=x_unpad.device,
+                                       dtype=torch.int64)  # (B,)
+        positions = torch.arange(T, device=x_unpad.device,
+                                 dtype=torch.int64)  # (T,)
+        batch_ids = torch.bucketize(positions, boundaries,
+                                    right=True)  # (T,) in [0..B-1]
 
         token_scale = keep_mask.to(dtype=x_unpad.dtype)[batch_ids]  # (T,)
         return x_unpad * token_scale.unsqueeze(-1)  # (T,H)
@@ -1356,8 +1367,8 @@ class SelfAttentionBlock(nn.Module):
 
     def _self_attn_flash_varlen_unpadded(
         self,
-        x_unpad: torch.Tensor,      # (T, H)
-        cu_seqlens: torch.Tensor,   # (B+1,)
+        x_unpad: torch.Tensor,  # (T, H)
+        cu_seqlens: torch.Tensor,  # (B+1,)
         max_seqlen: int,
     ) -> torch.Tensor:
         """unpad된 토큰((T,H))에 대해 FlashAttention-2(varlen) self-attention을 수행합니다.
@@ -1371,15 +1382,14 @@ class SelfAttentionBlock(nn.Module):
             (T, H) self-attention 출력
         """
         if not _FA2_AVAILABLE:
-            raise RuntimeError(
-                "FlashAttention-2(varlen) 모듈을 불러오지 못했습니다. "
-                f"(원인: {_FA2_IMPORT_ERR})"
-            )
+            raise RuntimeError("FlashAttention-2(varlen) 모듈을 불러오지 못했습니다. "
+                               f"(원인: {_FA2_IMPORT_ERR})")
 
         T, D = x_unpad.shape
         if T == 0 or max_seqlen == 0:
             # 호출은 됐지만 실제 토큰이 없는 경우
-            touch = self._touch_params_zero_output(x_unpad.new_zeros((1,))).sum() * 0.0
+            touch = self._touch_params_zero_output(x_unpad.new_zeros(
+                (1,))).sum() * 0.0
             return x_unpad.new_zeros((T, D)) + touch
 
         # QKV: (T, 3*D) -> (T, 3, Hh, Hd)
@@ -1389,7 +1399,8 @@ class SelfAttentionBlock(nn.Module):
         comp_dtype = self._get_compute_dtype(qkv)
         qkv = qkv.to(comp_dtype)
 
-        cu = cu_seqlens.to(device=qkv.device, dtype=torch.int32)  # (B+1,) int32 권장
+        cu = cu_seqlens.to(device=qkv.device,
+                           dtype=torch.int32)  # (B+1,) int32 권장
 
         out = flash_attn_varlen_qkvpacked_func(
             qkv,
@@ -1412,9 +1423,9 @@ class SelfAttentionBlock(nn.Module):
     # ------------------------------------------------------------------
 
     def _forward_fallback_mha(
-        self,
-        x: torch.Tensor,     # (B, L, H)
-        mask: torch.Tensor,  # (B, L) True=pad
+            self,
+            x: torch.Tensor,  # (B, L, H)
+            mask: torch.Tensor,  # (B, L) True=pad
     ) -> torch.Tensor:
         """FlashAttention이 없을 때(MHA 폴백) 기존 방식으로 동작합니다."""
         if mask.dtype != torch.bool:
@@ -1424,11 +1435,11 @@ class SelfAttentionBlock(nn.Module):
         x_norm = self.norm1(x)  # (B,L,H)
 
         # key_padding_mask: True=패딩
-        y = self.attn(
-            x_norm, x_norm, x_norm,
-            key_padding_mask=mask,
-            need_weights=False
-        )[0]  # (B,L,H)
+        y = self.attn(x_norm,
+                      x_norm,
+                      x_norm,
+                      key_padding_mask=mask,
+                      need_weights=False)[0]  # (B,L,H)
 
         y = self.attn_out_drop(y)
         x = x + self.drop_path(y)
@@ -1438,9 +1449,9 @@ class SelfAttentionBlock(nn.Module):
         return x
 
     def forward(
-        self,
-        x: torch.Tensor,     # (B, L, H)
-        mask: torch.Tensor,  # (B, L) True=pad
+            self,
+            x: torch.Tensor,  # (B, L, H)
+            mask: torch.Tensor,  # (B, L) True=pad
     ) -> torch.Tensor:
         """패딩 토큰에 대한 LN/MLP 계산을 없앤 버전입니다.
 
@@ -1470,7 +1481,8 @@ class SelfAttentionBlock(nn.Module):
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)  # (B,L,H)
 
         # (1) unpad 1회
-        x_unpad, indices, cu_seqlens, max_seqlen = self._unpad_from_mask(x, mask)  # (T,H), ...
+        x_unpad, indices, cu_seqlens, max_seqlen = self._unpad_from_mask(
+            x, mask)  # (T,H), ...
         T = int(x_unpad.shape[0])
 
         if T == 0 or max_seqlen == 0:
@@ -1482,7 +1494,8 @@ class SelfAttentionBlock(nn.Module):
         x1 = self.norm1(x_unpad)  # (T,H)
 
         # (3) Attention (유효 토큰만)
-        y = self._self_attn_flash_varlen_unpadded(x1, cu_seqlens, max_seqlen)  # (T,H)
+        y = self._self_attn_flash_varlen_unpadded(x1, cu_seqlens,
+                                                  max_seqlen)  # (T,H)
         y = self.attn_out_drop(y)  # (T,H)
 
         # (4) Residual + DropPath (배치 단위 동일 마스크)
@@ -1495,7 +1508,10 @@ class SelfAttentionBlock(nn.Module):
         x_unpad = x_unpad + self._drop_path_varlen(m, cu_seqlens)  # (T,H)
 
         # (7) pad back 1회
-        out = self._pad_to_batch(x_unpad, indices, batch_size=int(B), seq_len=int(L))  # (B,L,H)
+        out = self._pad_to_batch(x_unpad,
+                                 indices,
+                                 batch_size=int(B),
+                                 seq_len=int(L))  # (B,L,H)
 
         # (8) 안전하게 한 번 더 0 고정
         out = out.masked_fill(mask.unsqueeze(-1), 0.0)
@@ -1532,7 +1548,7 @@ class StaticFusionEncoder(nn.Module):
 
     def forward(
         self,
-        static_objects: torch.Tensor,          # (B, P, D_static)
+        static_objects: torch.Tensor,  # (B, P, D_static)
         static_objects_is_valid: torch.Tensor  # (B, P)  True=유효
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """정적 물체를 임베딩으로 바꾸고, 위치/종류 pos(9차원)를 반환합니다.
@@ -1558,19 +1574,17 @@ class StaticFusionEncoder(nn.Module):
         if static_objects.dim() != 3:
             raise ValueError(
                 "static_objects must be (B, P, D_static) 3D tensor. "
-                f"got shape={tuple(static_objects.shape)}"
-            )
+                f"got shape={tuple(static_objects.shape)}")
         if static_objects_is_valid.dim() != 2:
             raise ValueError(
                 "static_objects_is_valid must be (B, P) 2D tensor. "
-                f"got shape={tuple(static_objects_is_valid.shape)}"
-            )
+                f"got shape={tuple(static_objects_is_valid.shape)}")
 
         B, P, _ = static_objects.shape
 
         # ✅ is_valid는 반드시 bool로 통일
         valid_bp = static_objects_is_valid.to(torch.bool)  # (B, P)
-        pad_bp = ~valid_bp                                  # (B, P) True=무효
+        pad_bp = ~valid_bp  # (B, P) True=무효
 
         # 1) pos(=static_feature) 만들기: (B,P,9)
         static_xyyaw = static_objects[..., :4]  # (B, P, 4)  clone 제거
@@ -1580,14 +1594,14 @@ class StaticFusionEncoder(nn.Module):
         static_feature[..., 6] = 1.0
 
         # 2) 전체를 한 번에 projection → invalid만 0
-        out_dtype = (
-            torch.get_autocast_gpu_dtype()
-            if torch.is_autocast_enabled() and static_objects.is_cuda
-            else static_objects.dtype
-        )
+        out_dtype = (torch.get_autocast_gpu_dtype()
+                     if torch.is_autocast_enabled() and static_objects.is_cuda
+                     else static_objects.dtype)
 
-        static_encoding = self.projection(static_objects)  # (B, P, H) (AMP면 자동 캐스팅)
-        static_encoding = static_encoding.to(dtype=out_dtype, device=static_objects.device)
+        static_encoding = self.projection(
+            static_objects)  # (B, P, H) (AMP면 자동 캐스팅)
+        static_encoding = static_encoding.to(dtype=out_dtype,
+                                             device=static_objects.device)
         static_encoding = static_encoding.masked_fill(pad_bp.unsqueeze(-1), 0.0)
 
         return static_encoding, static_feature
@@ -1992,10 +2006,10 @@ class RoadSafetyFusionEncoder(nn.Module):
 
         # 집합 통계(mean/max)를 요약 토큰에 잔차로 추가 (게이트 0 시작)
         # 집합 통계(mean/max)를 요약 토큰에 잔차로 추가 (게이트 0 시작)
-        ds_mean = self._masked_mean(elements_emb, elements_mask).to(
-            dtype)  # (B,H)
-        ds_max = self._masked_max(elements_emb, elements_mask).to(
-            dtype)  # (B,H)
+        ds_mean = self._masked_mean(elements_emb,
+                                    elements_mask).to(dtype)  # (B,H)
+        ds_max = self._masked_max(elements_emb,
+                                  elements_mask).to(dtype)  # (B,H)
 
         seed_emb = seed_emb \
                    + self.ds_mean_alpha.to(dtype) * ds_mean.unsqueeze(1) \
@@ -2391,6 +2405,7 @@ class LaneSummaryTokenPooler(nn.Module):
 
         return summary_embeddings, summary_mask, summary_pos
 
+
 class LaneFusionEncoder(nn.Module):
 
     def __init__(
@@ -2403,7 +2418,8 @@ class LaneFusionEncoder(nn.Module):
         token_pre_hidden_dim: int = 64,  # ✅ token_pre_project의 중간 길이
         channels_mlp_dim=192,
         mixer_channels_mlp_ratio: float = 0.25,  # ✅ 토큰 단계에서 '큰 특징 변환' 줄이기
-        lane_post_hidden_dim: Optional[int] = None,  # ✅ pool 이후 큰 MLP 중간 길이(기본 자동)
+        lane_post_hidden_dim: Optional[
+            int] = None,  # ✅ pool 이후 큰 MLP 중간 길이(기본 자동)
         num_fourier_frequencies=4,
         time_gap=0.1,
         time_min=-2.0,
@@ -2468,8 +2484,7 @@ class LaneFusionEncoder(nn.Module):
                 int(channels_mlp_dim),
                 float(drop_path_rate),
                 channels_mlp_ratio=float(mixer_channels_mlp_ratio),
-            )
-            for _ in range(depth)
+            ) for _ in range(depth)
         ])
 
         self.norm = nn.LayerNorm(channels_mlp_dim)
@@ -2479,7 +2494,8 @@ class LaneFusionEncoder(nn.Module):
         #   - mean+max로 (num_valid, 2C) 만든 뒤, (num_valid, C)로 되돌림
         # ============================================================
         if lane_post_hidden_dim is None:
-            lane_post_hidden_dim = self._default_lane_post_hidden_dim(int(channels_mlp_dim))
+            lane_post_hidden_dim = self._default_lane_post_hidden_dim(
+                int(channels_mlp_dim))
 
         self.lane_post_norm = nn.LayerNorm(2 * int(channels_mlp_dim))
         self.lane_post_mlp = Mlp(
@@ -2536,7 +2552,8 @@ class LaneFusionEncoder(nn.Module):
         return cls._round_up_to_multiple(raw, 64)
 
     @staticmethod
-    def _mean_max_pool_tokens(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _mean_max_pool_tokens(
+            x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """(N, T, C)에서 T축 평균과 최댓값을 동시에 만듭니다.
 
         Args:
@@ -2557,7 +2574,8 @@ class LaneFusionEncoder(nn.Module):
             raise ValueError("T must be >= 1")
 
         in_dtype: torch.dtype = x.dtype
-        mean_pool_f32: torch.Tensor = x.sum(dim=1, dtype=torch.float32) * (1.0 / float(T))  # (N, C) fp32
+        mean_pool_f32: torch.Tensor = x.sum(dim=1, dtype=torch.float32) * (
+            1.0 / float(T))  # (N, C) fp32
         mean_pool: torch.Tensor = mean_pool_f32.to(dtype=in_dtype)  # (N, C)
         max_pool: torch.Tensor = x.amax(dim=1)  # (N, C)
         return mean_pool, max_pool
@@ -2566,11 +2584,12 @@ class LaneFusionEncoder(nn.Module):
 
     @staticmethod
     def _apply_scalar_gate_to_embedding(
-        embedding: torch.Tensor,  # (N, C)
-        gate: torch.Tensor,  # ()
+            embedding: torch.Tensor,  # (N, C)
+            gate: torch.Tensor,  # ()
     ) -> torch.Tensor:  # (N, C)
         """임베딩에 스칼라 게이트를 곱해 영향도를 조절합니다."""
-        gate_value: torch.Tensor = gate.to(dtype=embedding.dtype, device=embedding.device)
+        gate_value: torch.Tensor = gate.to(dtype=embedding.dtype,
+                                           device=embedding.device)
         return embedding * gate_value
 
     @staticmethod
@@ -2580,29 +2599,35 @@ class LaneFusionEncoder(nn.Module):
         """좌/우 경계 정보 유무를 점 단위로 계산합니다."""
         if lanes_xy_and_offsets.dim() == 4:
             if lanes_xy_and_offsets.shape[-1] < 8:
-                raise ValueError(f"lanes_xy_and_offsets last dim must be >= 8. got {tuple(lanes_xy_and_offsets.shape)}")
+                raise ValueError(
+                    f"lanes_xy_and_offsets last dim must be >= 8. got {tuple(lanes_xy_and_offsets.shape)}"
+                )
             left_is_valid = (lanes_xy_and_offsets[..., 4:6] != 0).any(dim=-1)
             right_is_valid = (lanes_xy_and_offsets[..., 6:8] != 0).any(dim=-1)
             return left_is_valid, right_is_valid
 
         if lanes_xy_and_offsets.dim() == 3:
             if lanes_xy_and_offsets.shape[-1] < 8:
-                raise ValueError(f"lanes_xy_and_offsets last dim must be >= 8. got {tuple(lanes_xy_and_offsets.shape)}")
+                raise ValueError(
+                    f"lanes_xy_and_offsets last dim must be >= 8. got {tuple(lanes_xy_and_offsets.shape)}"
+                )
             left_is_valid = (lanes_xy_and_offsets[..., 4:6] != 0).any(dim=-1)
             right_is_valid = (lanes_xy_and_offsets[..., 6:8] != 0).any(dim=-1)
             return left_is_valid, right_is_valid
 
-        raise ValueError(f"lanes_xy_and_offsets must be 3D or 4D. got {tuple(lanes_xy_and_offsets.shape)}")
+        raise ValueError(
+            f"lanes_xy_and_offsets must be 3D or 4D. got {tuple(lanes_xy_and_offsets.shape)}"
+        )
 
     def _embed_optional_lane_attribute(
-            self,
-            lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
-            embedding_layer: nn.Linear,  # F -> C
-            valid_idx: torch.Tensor,  # (num_valid,) int64
-            batch_size: int,
-            lane_num: int,
-            out_dtype: torch.dtype,
-            out_device: torch.device,
+        self,
+        lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
+        embedding_layer: nn.Linear,  # F -> C
+        valid_idx: torch.Tensor,  # (num_valid,) int64
+        batch_size: int,
+        lane_num: int,
+        out_dtype: torch.dtype,
+        out_device: torch.device,
     ) -> torch.Tensor:
         """lane 속성 벡터를 valid lane 기준 임베딩으로 바꿔 반환합니다.
 
@@ -2650,32 +2675,31 @@ class LaneFusionEncoder(nn.Module):
                 lane_attribute.shape[1]) != int(lane_num):
             raise ValueError(
                 f"lane_attribute shape mismatch. expected (B={batch_size}, lane_num={lane_num}, F), "
-                f"got {tuple(lane_attribute.shape)}"
-            )
+                f"got {tuple(lane_attribute.shape)}")
 
         total_count: int = int(batch_size) * int(lane_num)
 
         # (B*lane_num, F) -> (num_valid, F)
         lane_attribute = lane_attribute.to(device=out_device, dtype=out_dtype)
-        lane_attribute_flat: torch.Tensor = lane_attribute.reshape(total_count,
-                                                                   -1)  # (B*lane_num, F)
-        lane_attribute_valid: torch.Tensor = lane_attribute_flat.index_select(0,
-                                                                              valid_idx)  # (num_valid, F)
+        lane_attribute_flat: torch.Tensor = lane_attribute.reshape(
+            total_count, -1)  # (B*lane_num, F)
+        lane_attribute_valid: torch.Tensor = lane_attribute_flat.index_select(
+            0, valid_idx)  # (num_valid, F)
 
         lane_attribute_embedding: torch.Tensor = embedding_layer(
             lane_attribute_valid)  # (num_valid, C)
         return lane_attribute_embedding.to(dtype=out_dtype, device=out_device)
 
     def _select_optional_lane_attribute_features(
-            self,
-            lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
-            valid_idx: torch.Tensor,  # (num_valid,) int64
-            batch_size: int,
-            lane_num: int,
-            feat_dim: int,
-            out_dtype: torch.dtype,
-            out_device: torch.device,
-            name: str,
+        self,
+        lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
+        valid_idx: torch.Tensor,  # (num_valid,) int64
+        batch_size: int,
+        lane_num: int,
+        feat_dim: int,
+        out_dtype: torch.dtype,
+        out_device: torch.device,
+        name: str,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """선택 입력(lane_attribute)에서 valid lane에 해당하는 값만 뽑아 반환합니다.
 
@@ -2707,9 +2731,11 @@ class LaneFusionEncoder(nn.Module):
             valid_idx = valid_idx.to(device=out_device)
 
         num_valid: int = int(valid_idx.numel())
-        enabled_off: torch.Tensor = torch.zeros((), device=out_device,
+        enabled_off: torch.Tensor = torch.zeros((),
+                                                device=out_device,
                                                 dtype=out_dtype)
-        enabled_on: torch.Tensor = torch.ones((), device=out_device,
+        enabled_on: torch.Tensor = torch.ones((),
+                                              device=out_device,
                                               dtype=out_dtype)
 
         if lane_attribute is None:
@@ -2722,13 +2748,13 @@ class LaneFusionEncoder(nn.Module):
 
         if lane_attribute.dim() != 3:
             raise ValueError(
-                f"{name} must be (B, lane_num, F). got {tuple(lane_attribute.shape)}")
+                f"{name} must be (B, lane_num, F). got {tuple(lane_attribute.shape)}"
+            )
         if int(lane_attribute.shape[0]) != int(batch_size) or int(
                 lane_attribute.shape[1]) != int(lane_num):
             raise ValueError(
                 f"{name} shape mismatch. expected (B={batch_size}, lane_num={lane_num}, F={feat_dim}), "
-                f"got {tuple(lane_attribute.shape)}"
-            )
+                f"got {tuple(lane_attribute.shape)}")
         if int(lane_attribute.shape[2]) != int(feat_dim):
             raise ValueError(
                 f"{name} last dim mismatch. expected F={feat_dim}, got {int(lane_attribute.shape[2])}"
@@ -2738,24 +2764,24 @@ class LaneFusionEncoder(nn.Module):
 
         lane_attribute = lane_attribute.to(device=out_device,
                                            dtype=out_dtype)  # (B, lane_num, F)
-        feat_flat: torch.Tensor = lane_attribute.reshape(total_count,
-                                                         int(feat_dim))  # (B*lane_num, F)
-        feat_valid: torch.Tensor = feat_flat.index_select(0,
-                                                          valid_idx)  # (num_valid, F)
+        feat_flat: torch.Tensor = lane_attribute.reshape(
+            total_count, int(feat_dim))  # (B*lane_num, F)
+        feat_valid: torch.Tensor = feat_flat.index_select(
+            0, valid_idx)  # (num_valid, F)
         return feat_valid, enabled_on
 
     def _embed_lane_attrs_with_single_linear(
-            self,
-            traffic_valid: torch.Tensor,  # (num_valid, 4)
-            lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
-            left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
-            right_line_type: Optional[torch.Tensor],
-            # (B, lane_num, 13) or None
-            valid_idx: torch.Tensor,  # (num_valid,)
-            batch_size: int,
-            lane_num: int,
-            out_dtype: torch.dtype,
-            out_device: torch.device,
+        self,
+        traffic_valid: torch.Tensor,  # (num_valid, 4)
+        lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
+        left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
+        right_line_type: Optional[torch.Tensor],
+        # (B, lane_num, 13) or None
+        valid_idx: torch.Tensor,  # (num_valid,)
+        batch_size: int,
+        lane_num: int,
+        out_dtype: torch.dtype,
+        out_device: torch.device,
     ) -> torch.Tensor:
         """lane_type/left/right/traffic 값을 한 번에 (num_valid, C)로 바꿉니다.
 
@@ -2789,11 +2815,14 @@ class LaneFusionEncoder(nn.Module):
 
         if num_valid == 0:
             # 호출 경로상 보통 여기로 안 오지만, 안전하게 처리합니다.
-            empty: torch.Tensor = torch.zeros((0, C), device=out_device,
+            empty: torch.Tensor = torch.zeros((0, C),
+                                              device=out_device,
                                               dtype=out_dtype)
             touch: torch.Tensor = empty.new_zeros(())
-            for mod in [self.traffic_emb, self.lane_type_emb,
-                        self.left_line_type_emb, self.right_line_type_emb]:
+            for mod in [
+                    self.traffic_emb, self.lane_type_emb,
+                    self.left_line_type_emb, self.right_line_type_emb
+            ]:
                 for p in mod.parameters():
                     touch = touch + p.view(-1)[:1].sum().to(dtype=out_dtype,
                                                             device=out_device)
@@ -2807,12 +2836,12 @@ class LaneFusionEncoder(nn.Module):
 
         if traffic_valid.dim() != 2 or int(
                 traffic_valid.shape[0]) != num_valid or int(
-                traffic_valid.shape[1]) != 4:
+                    traffic_valid.shape[1]) != 4:
             raise ValueError(
                 f"traffic_valid must be (num_valid, 4). got {tuple(traffic_valid.shape)}, num_valid={num_valid}"
             )
-        traffic_x: torch.Tensor = traffic_valid.to(device=out_device,
-                                                   dtype=out_dtype)  # (num_valid, 4)
+        traffic_x: torch.Tensor = traffic_valid.to(
+            device=out_device, dtype=out_dtype)  # (num_valid, 4)
 
         lane_x, lane_enabled = self._select_optional_lane_attribute_features(
             lane_attribute=lane_type,
@@ -2850,51 +2879,42 @@ class LaneFusionEncoder(nn.Module):
         one: torch.Tensor = torch.ones((), device=out_device, dtype=out_dtype)
 
         # 스칼라 조절값(없으면 0으로 꺼짐)
-        gate_lane: torch.Tensor = self.lane_type_alpha.to(dtype=out_dtype,
-                                                          device=out_device) * lane_enabled  # ()
-        gate_left: torch.Tensor = self.left_line_type_alpha.to(dtype=out_dtype,
-                                                               device=out_device) * left_enabled  # ()
+        gate_lane: torch.Tensor = self.lane_type_alpha.to(
+            dtype=out_dtype, device=out_device) * lane_enabled  # ()
+        gate_left: torch.Tensor = self.left_line_type_alpha.to(
+            dtype=out_dtype, device=out_device) * left_enabled  # ()
         gate_right: torch.Tensor = self.right_line_type_alpha.to(
             dtype=out_dtype, device=out_device) * right_enabled  # ()
         gate_traffic: torch.Tensor = one  # ()
 
         # weight: (C, in_dim), bias: (C,)
-        w_lane = self.lane_type_emb.weight.to(device=out_device,
-                                              dtype=out_dtype) * gate_lane  # (C,4)
-        b_lane = (
-                     self.lane_type_emb.bias.to(device=out_device,
-                                                dtype=out_dtype)
-                     if self.lane_type_emb.bias is not None
-                     else torch.zeros((C,), device=out_device, dtype=out_dtype)
-                 ) * gate_lane  # (C,)
+        w_lane = self.lane_type_emb.weight.to(
+            device=out_device, dtype=out_dtype) * gate_lane  # (C,4)
+        b_lane = (self.lane_type_emb.bias.to(device=out_device, dtype=out_dtype)
+                  if self.lane_type_emb.bias is not None else torch.zeros(
+                      (C,), device=out_device,
+                      dtype=out_dtype)) * gate_lane  # (C,)
 
-        w_left = self.left_line_type_emb.weight.to(device=out_device,
-                                                   dtype=out_dtype) * gate_left  # (C,13)
+        w_left = self.left_line_type_emb.weight.to(
+            device=out_device, dtype=out_dtype) * gate_left  # (C,13)
         b_left = (
-                     self.left_line_type_emb.bias.to(device=out_device,
-                                                     dtype=out_dtype)
-                     if self.left_line_type_emb.bias is not None
-                     else torch.zeros((C,), device=out_device, dtype=out_dtype)
-                 ) * gate_left  # (C,)
+            self.left_line_type_emb.bias.to(device=out_device, dtype=out_dtype)
+            if self.left_line_type_emb.bias is not None else torch.zeros(
+                (C,), device=out_device, dtype=out_dtype)) * gate_left  # (C,)
 
-        w_right = self.right_line_type_emb.weight.to(device=out_device,
-                                                     dtype=out_dtype) * gate_right  # (C,13)
+        w_right = self.right_line_type_emb.weight.to(
+            device=out_device, dtype=out_dtype) * gate_right  # (C,13)
         b_right = (
-                      self.right_line_type_emb.bias.to(device=out_device,
-                                                       dtype=out_dtype)
-                      if self.right_line_type_emb.bias is not None
-                      else torch.zeros((C,), device=out_device, dtype=out_dtype)
-                  ) * gate_right  # (C,)
+            self.right_line_type_emb.bias.to(device=out_device, dtype=out_dtype)
+            if self.right_line_type_emb.bias is not None else torch.zeros(
+                (C,), device=out_device, dtype=out_dtype)) * gate_right  # (C,)
 
-        w_traffic = self.traffic_emb.weight.to(device=out_device,
-                                               dtype=out_dtype) * gate_traffic  # (C,4)
-        b_traffic = (
-                        self.traffic_emb.bias.to(device=out_device,
-                                                 dtype=out_dtype)
-                        if self.traffic_emb.bias is not None
-                        else torch.zeros((C,), device=out_device,
-                                         dtype=out_dtype)
-                    ) * gate_traffic  # (C,)
+        w_traffic = self.traffic_emb.weight.to(
+            device=out_device, dtype=out_dtype) * gate_traffic  # (C,4)
+        b_traffic = (self.traffic_emb.bias.to(
+            device=out_device, dtype=out_dtype
+        ) if self.traffic_emb.bias is not None else torch.zeros(
+            (C,), device=out_device, dtype=out_dtype)) * gate_traffic  # (C,)
 
         # (num_valid, 34) = [lane(4), left(13), right(13), traffic(4)]
         x_concat: torch.Tensor = torch.cat([lane_x, left_x, right_x, traffic_x],
@@ -2922,14 +2942,15 @@ class LaneFusionEncoder(nn.Module):
     # ------------------------------ forward ------------------------------ #
 
     def forward(
-        self,
-        lanes: torch.Tensor,  # (B, lane_num, lane_len, D_lane)
-        lanes_speed_limit: torch.Tensor,  # (B, lane_num, 1)
-        lanes_has_speed_limit: torch.Tensor,  # (B, lane_num, 1)
-        lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
-        left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
-        right_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
-        lanes_is_valid: torch.Tensor,  # (B, lane_num)
+            self,
+            lanes: torch.Tensor,  # (B, lane_num, lane_len, D_lane)
+            lanes_speed_limit: torch.Tensor,  # (B, lane_num, 1)
+            lanes_has_speed_limit: torch.Tensor,  # (B, lane_num, 1)
+            lane_type: Optional[torch.Tensor],  # (B, lane_num, 4) or None
+            left_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
+            right_line_type: Optional[
+                torch.Tensor],  # (B, lane_num, 13) or None
+            lanes_is_valid: torch.Tensor,  # (B, lane_num)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """차선 정보를 lane 단위 임베딩으로 바꿔 반환합니다.
 
@@ -2948,7 +2969,9 @@ class LaneFusionEncoder(nn.Module):
         enable_profile: bool = bool(getattr(self, "enable_profile", False))
 
         if lanes.dim() != 4:
-            raise ValueError(f"lanes must be (B, lane_num, lane_len, D_lane). got {tuple(lanes.shape)}")
+            raise ValueError(
+                f"lanes must be (B, lane_num, lane_len, D_lane). got {tuple(lanes.shape)}"
+            )
 
         B, lane_num, lane_len, d_lane = lanes.shape
         total_count: int = int(B) * int(lane_num)
@@ -2956,19 +2979,24 @@ class LaneFusionEncoder(nn.Module):
         # -----------------------------
         # (0) 유효 lane 인덱스
         # -----------------------------
-        valid_mask_flat: torch.Tensor = lanes_is_valid.reshape(-1)  # (B*lane_num,)
-        valid_idx: torch.Tensor = torch.nonzero(valid_mask_flat, as_tuple=False).squeeze(1)  # (num_valid,)
+        valid_mask_flat: torch.Tensor = lanes_is_valid.reshape(
+            -1)  # (B*lane_num,)
+        valid_idx: torch.Tensor = torch.nonzero(
+            valid_mask_flat, as_tuple=False).squeeze(1)  # (num_valid,)
         num_valid: int = int(valid_idx.numel())
 
-        lane_feature_flat: torch.Tensor = lanes.new_zeros((total_count, 9))  # (B*lane_num, 9)
+        lane_feature_flat: torch.Tensor = lanes.new_zeros(
+            (total_count, 9))  # (B*lane_num, 9)
 
         # ---- 유효 lane이 하나도 없으면 바로 종료(0 반환) ----
         if num_valid == 0:
             H: int = int(self.emb_project.fc2.out_features)
             out_dtype = (torch.get_autocast_gpu_dtype()
-                         if torch.is_autocast_enabled() and lanes.is_cuda
-                         else lanes.dtype)
-            lane_embedding = torch.zeros((B, lane_num, H), device=lanes.device, dtype=out_dtype)
+                         if torch.is_autocast_enabled() and lanes.is_cuda else
+                         lanes.dtype)
+            lane_embedding = torch.zeros((B, lane_num, H),
+                                         device=lanes.device,
+                                         dtype=out_dtype)
 
             # DDP unused param 방지용 터치(새로 추가된 모듈 포함)
             touch = lane_embedding.new_zeros(())
@@ -3001,12 +3029,18 @@ class LaneFusionEncoder(nn.Module):
         # ============================================================
         # (1) 전처리: valid lane만 대상으로 lanes_10, lane_feature 구성
         # ============================================================
-        with profile_block("LaneFusionEncoder.preprocess", enabled=enable_profile, device_type=device_type):
-            lanes_flat_raw: torch.Tensor = lanes.reshape(total_count, lane_len, d_lane)  # (B*lane_num, lane_len, D_lane)
-            lanes_raw_valid: torch.Tensor = lanes_flat_raw.index_select(0, valid_idx)   # (num_valid, lane_len, D_lane)
+        with profile_block("LaneFusionEncoder.preprocess",
+                           enabled=enable_profile,
+                           device_type=device_type):
+            lanes_flat_raw: torch.Tensor = lanes.reshape(
+                total_count, lane_len, d_lane)  # (B*lane_num, lane_len, D_lane)
+            lanes_raw_valid: torch.Tensor = lanes_flat_raw.index_select(
+                0, valid_idx)  # (num_valid, lane_len, D_lane)
 
-            lanes_8_valid: torch.Tensor = lanes_raw_valid[..., :8]  # (num_valid, lane_len, 8)
-            left_is_valid_valid, right_is_valid_valid = self._compute_boundary_valid_flags(lanes_8_valid)  # (num_valid, lane_len)
+            lanes_8_valid: torch.Tensor = lanes_raw_valid[
+                ..., :8]  # (num_valid, lane_len, 8)
+            left_is_valid_valid, right_is_valid_valid = self._compute_boundary_valid_flags(
+                lanes_8_valid)  # (num_valid, lane_len)
 
             lanes_10_valid: torch.Tensor = torch.cat(
                 [
@@ -3018,7 +3052,8 @@ class LaneFusionEncoder(nn.Module):
             )  # (num_valid, lane_len, 10)
 
             mid_idx: int = int(self._lane_len / 2)
-            lane_pos_valid: torch.Tensor = lanes_10_valid[:, mid_idx, :4].clone()  # (num_valid, 4)
+            lane_pos_valid: torch.Tensor = lanes_10_valid[:, mid_idx, :4].clone(
+            )  # (num_valid, 4)
 
             lane_feature_valid: torch.Tensor = self._get_lane_feature(
                 lane_pos_valid.unsqueeze(0)  # (1, num_valid, 4)
@@ -3027,45 +3062,57 @@ class LaneFusionEncoder(nn.Module):
             lane_feature_flat.index_copy_(0, valid_idx, lane_feature_valid)
             lane_feature: torch.Tensor = lane_feature_flat.view(B, lane_num, 9)
 
-            traffic_valid: torch.Tensor = lanes_raw_valid[:, 0, 8:]  # (num_valid, 4)
+            traffic_valid: torch.Tensor = lanes_raw_valid[:, 0,
+                                                          8:]  # (num_valid, 4)
 
         # ============================================================
         # (2) channel_pre_project: (num_valid, lane_len, 10) -> (num_valid, lane_len, C)
         # ============================================================
         lanes_valid: torch.Tensor = lanes_10_valid
-        with profile_block("LaneFusionEncoder.channel_pre_project", enabled=enable_profile, device_type=device_type):
-            lanes_valid = self.channel_pre_project(lanes_valid)  # (num_valid, lane_len, C)
+        with profile_block("LaneFusionEncoder.channel_pre_project",
+                           enabled=enable_profile,
+                           device_type=device_type):
+            lanes_valid = self.channel_pre_project(
+                lanes_valid)  # (num_valid, lane_len, C)
 
         # ============================================================
         # (3) token_pre_project: lane_len -> T_small (기본 16)
         # ============================================================
-        with profile_block("LaneFusionEncoder.token_pre_project", enabled=enable_profile, device_type=device_type):
-            lanes_valid = lanes_valid.transpose(1,
-                                                2).contiguous()  # (num_valid, C, lane_len)
+        with profile_block("LaneFusionEncoder.token_pre_project",
+                           enabled=enable_profile,
+                           device_type=device_type):
+            lanes_valid = lanes_valid.transpose(
+                1, 2).contiguous()  # (num_valid, C, lane_len)
             lanes_valid = self.token_pre_project(
                 lanes_valid)  # (num_valid, C, T_small)
-            lanes_valid = lanes_valid.transpose(1,
-                                                2)  # (num_valid, T_small, C)  ✅ 큰 복사 1회 제거
+            lanes_valid = lanes_valid.transpose(
+                1, 2)  # (num_valid, T_small, C)  ✅ 큰 복사 1회 제거
 
         # ============================================================
         # (4) MixerBlock (토큰 섞기 중심 + 특징 변환 축소)
         # ============================================================
         for i, block in enumerate(self.blocks):
-            with profile_block(f"LaneFusionEncoder.mixer_block[{i}]", enabled=enable_profile, device_type=device_type):
+            with profile_block(f"LaneFusionEncoder.mixer_block[{i}]",
+                               enabled=enable_profile,
+                               device_type=device_type):
                 lanes_valid = block(lanes_valid)  # (num_valid, T_small, C)
 
         # ============================================================
         # (5) mean+max pool
         # ============================================================
-        with profile_block("LaneFusionEncoder.mean_max_pool", enabled=enable_profile, device_type=device_type):
-            mean_pool, max_pool = self._mean_max_pool_tokens(lanes_valid)  # (num_valid, C), (num_valid, C)
+        with profile_block("LaneFusionEncoder.mean_max_pool",
+                           enabled=enable_profile,
+                           device_type=device_type):
+            mean_pool, max_pool = self._mean_max_pool_tokens(
+                lanes_valid)  # (num_valid, C), (num_valid, C)
 
         # ============================================================
         # (6) 속성 임베딩(속도/신호/타입) -> mean 쪽에 더하기
         # ============================================================
         lane_vec: torch.Tensor = mean_pool  # (num_valid, C)
         with profile_block("LaneFusionEncoder.attr_embedding",
-                           enabled=enable_profile, device_type=device_type):
+                           enabled=enable_profile,
+                           device_type=device_type):
             lanes_speed_limit_flat: torch.Tensor = lanes_speed_limit.reshape(
                 total_count, 1)  # (B*lane_num, 1)
             lanes_has_speed_limit_flat: torch.Tensor = lanes_has_speed_limit.to(
@@ -3085,12 +3132,11 @@ class LaneFusionEncoder(nn.Module):
             ).to(dtype=lane_vec.dtype, device=lane_vec.device)  # (num_valid, C)
 
             speed_no: torch.Tensor = self.unknown_speed_emb.weight.to(
-                dtype=lane_vec.dtype, device=lane_vec.device
-            ).expand(num_valid, -1)  # (num_valid, C)
+                dtype=lane_vec.dtype,
+                device=lane_vec.device).expand(num_valid, -1)  # (num_valid, C)
 
-            speed_limit_embedding: torch.Tensor = torch.where(speed_mask,
-                                                              speed_with,
-                                                              speed_no)  # (num_valid, C)
+            speed_limit_embedding: torch.Tensor = torch.where(
+                speed_mask, speed_with, speed_no)  # (num_valid, C)
 
             # ✅ lane_type/left/right/traffic 임베딩을 한 번의 F.linear로 합치기
             attrs_embedding: torch.Tensor = self._embed_lane_attrs_with_single_linear(
@@ -3109,15 +3155,23 @@ class LaneFusionEncoder(nn.Module):
         # ============================================================
         # (7) pool 결과 결합(mean_with_attr + max) -> lane_post_mlp (2C -> C)
         # ============================================================
-        with profile_block("LaneFusionEncoder.lane_post_mlp", enabled=enable_profile, device_type=device_type):
-            pooled_2c: torch.Tensor = torch.cat([lane_vec, max_pool.to(lane_vec.dtype)], dim=-1)  # (num_valid, 2C)
-            lanes_valid = self.lane_post_mlp(self.lane_post_norm(pooled_2c))  # (num_valid, C)
+        with profile_block("LaneFusionEncoder.lane_post_mlp",
+                           enabled=enable_profile,
+                           device_type=device_type):
+            pooled_2c: torch.Tensor = torch.cat(
+                [lane_vec, max_pool.to(lane_vec.dtype)],
+                dim=-1)  # (num_valid, 2C)
+            lanes_valid = self.lane_post_mlp(
+                self.lane_post_norm(pooled_2c))  # (num_valid, C)
 
         # ============================================================
         # (8) 최종 projection + scatter
         # ============================================================
-        with profile_block("LaneFusionEncoder.final_projection", enabled=enable_profile, device_type=device_type):
-            lanes_valid = self.emb_project(self.norm(lanes_valid))  # (num_valid, hidden_dim)
+        with profile_block("LaneFusionEncoder.final_projection",
+                           enabled=enable_profile,
+                           device_type=device_type):
+            lanes_valid = self.emb_project(
+                self.norm(lanes_valid))  # (num_valid, hidden_dim)
 
             lane_embedding_flat: torch.Tensor = torch.zeros(
                 (total_count, lanes_valid.shape[-1]),
@@ -3125,7 +3179,8 @@ class LaneFusionEncoder(nn.Module):
                 dtype=lanes_valid.dtype,
             )
             lane_embedding_flat.index_copy_(0, valid_idx, lanes_valid)
-            lane_embedding: torch.Tensor = lane_embedding_flat.view(B, lane_num, -1)
+            lane_embedding: torch.Tensor = lane_embedding_flat.view(
+                B, lane_num, -1)
 
         return lane_embedding, lane_feature
 

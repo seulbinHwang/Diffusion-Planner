@@ -45,10 +45,11 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
         b_hidden: int = self._default_branch_hidden_dim(
             hidden_dim=self.hidden_dim, branch_hidden_dim=branch_hidden_dim)
-        b_out: int = self._default_branch_out_dim(
-            hidden_dim=self.hidden_dim, branch_out_dim=branch_out_dim)
+        b_out: int = self._default_branch_out_dim(hidden_dim=self.hidden_dim,
+                                                  branch_out_dim=branch_out_dim)
         st_hidden: int = self._default_size_type_hidden_dim(
-            branch_hidden_dim=b_hidden, size_type_hidden_dim=size_type_hidden_dim)
+            branch_hidden_dim=b_hidden,
+            size_type_hidden_dim=size_type_hidden_dim)
         f_hidden: int = self._default_fuse_hidden_dim(
             branch_out_dim=b_out, fuse_hidden_dim=fuse_hidden_dim)
 
@@ -119,34 +120,35 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     @staticmethod
     def _default_branch_hidden_dim(hidden_dim: int,
-                                  branch_hidden_dim: Optional[int]) -> int:
+                                   branch_hidden_dim: Optional[int]) -> int:
         if branch_hidden_dim is not None:
             return int(branch_hidden_dim)
         return max(32, int(hidden_dim // 2))
 
     @staticmethod
     def _default_branch_out_dim(hidden_dim: int,
-                               branch_out_dim: Optional[int]) -> int:
+                                branch_out_dim: Optional[int]) -> int:
         if branch_out_dim is not None:
             return int(branch_out_dim)
         return max(16, int(hidden_dim // 3))
 
     @staticmethod
-    def _default_size_type_hidden_dim(branch_hidden_dim: int,
-                                     size_type_hidden_dim: Optional[int]) -> int:
+    def _default_size_type_hidden_dim(
+            branch_hidden_dim: int, size_type_hidden_dim: Optional[int]) -> int:
         if size_type_hidden_dim is not None:
             return int(size_type_hidden_dim)
         return max(32, int(branch_hidden_dim * 5 // 8))
 
     @staticmethod
     def _default_fuse_hidden_dim(branch_out_dim: int,
-                                fuse_hidden_dim: Optional[int]) -> int:
+                                 fuse_hidden_dim: Optional[int]) -> int:
         if fuse_hidden_dim is not None:
             return int(fuse_hidden_dim)
         return int(branch_out_dim)
 
     @staticmethod
-    def _normalize_cos_sin(cos_sin: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    def _normalize_cos_sin(cos_sin: torch.Tensor,
+                           eps: float = 1e-6) -> torch.Tensor:
         """(cos, sin)의 길이를 1로 정리합니다.
 
         Args:
@@ -158,7 +160,9 @@ class PRAMV2StateTokenEncoder(nn.Module):
             torch.Tensor:
                 - shape: (..., 2)
         """
-        raw_norm: torch.Tensor = torch.linalg.norm(cos_sin, dim=-1, keepdim=True)  # (..., 1)
+        raw_norm: torch.Tensor = torch.linalg.norm(cos_sin,
+                                                   dim=-1,
+                                                   keepdim=True)  # (..., 1)
         safe_norm: torch.Tensor = raw_norm.clamp_min(float(eps))
         normalized: torch.Tensor = cos_sin / safe_norm
 
@@ -219,18 +223,16 @@ class PRAMV2StateTokenEncoder(nn.Module):
                 - shape: ()  (스칼라)
         """
         # 아주 작은 일부만 더해도 목적(파라미터 사용 흔적)에는 충분합니다.
-        touch = (
-            self.xy_mlp.fc1.weight.view(-1)[:1].sum() +
-            self.xy_mlp.fc2.weight.view(-1)[:1].sum() +
-            self.fuse_mlp.fc1.weight.view(-1)[:1].sum() +
-            self.fuse_mlp.fc2.weight.view(-1)[:1].sum()
-        ) * 0.0
+        touch = (self.xy_mlp.fc1.weight.view(-1)[:1].sum() +
+                 self.xy_mlp.fc2.weight.view(-1)[:1].sum() +
+                 self.fuse_mlp.fc1.weight.view(-1)[:1].sum() +
+                 self.fuse_mlp.fc2.weight.view(-1)[:1].sum()) * 0.0
         return touch
 
     def _unpad_valid_agents(
-        self,
-        target_cur_norm: torch.Tensor,        # (B, P, 11)
-        target_current_mask: torch.Tensor,    # (B, P)  True=무효
+            self,
+            target_cur_norm: torch.Tensor,  # (B, P, 11)
+            target_current_mask: torch.Tensor,  # (B, P)  True=무효
     ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
         """유효 에이전트만 뽑아서 2D로 펴 줍니다.
 
@@ -263,11 +265,11 @@ class PRAMV2StateTokenEncoder(nn.Module):
         return x_unpad, indices, B, P
 
     def _pad_back_agents(
-        self,
-        token_unpad: torch.Tensor,   # (T_total, D)
-        indices: torch.Tensor,       # (T_total,)
-        batch_size: int,             # B
-        agent_slots: int,            # P
+            self,
+            token_unpad: torch.Tensor,  # (T_total, D)
+            indices: torch.Tensor,  # (T_total,)
+            batch_size: int,  # B
+            agent_slots: int,  # P
     ) -> torch.Tensor:
         """unpad 상태의 결과를 원래 (B,P,*)로 되돌립니다.
 
@@ -284,11 +286,11 @@ class PRAMV2StateTokenEncoder(nn.Module):
                 - shape: (B, P, D)
                 - pad 위치는 0
         """
-        return pad_input(token_unpad, indices, int(batch_size), int(agent_slots))
+        return pad_input(token_unpad, indices, int(batch_size),
+                         int(agent_slots))
 
     def _build_fused_group_weights_train(
-        self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """훈련 모드에서 4개 그룹 MLP 가중치를 블록 대각선으로 묶어 반환합니다.
 
         반환 텐서는 원래 파라미터로부터 만들어지므로, 그래디언트가 정상적으로 전파됩니다.
@@ -306,9 +308,12 @@ class PRAMV2StateTokenEncoder(nn.Module):
         w1_tp = self.type_mlp.fc1.weight
         fc1_w = torch.block_diag(w1_xy, w1_hd, w1_sz, w1_tp)
 
-        def _bias_or_zeros(bias: Optional[torch.Tensor], like: torch.Tensor) -> torch.Tensor:
+        def _bias_or_zeros(bias: Optional[torch.Tensor],
+                           like: torch.Tensor) -> torch.Tensor:
             if bias is None:
-                return torch.zeros((like.shape[0],), device=like.device, dtype=like.dtype)
+                return torch.zeros((like.shape[0],),
+                                   device=like.device,
+                                   dtype=like.dtype)
             return bias
 
         b1_xy = _bias_or_zeros(self.xy_mlp.fc1.bias, w1_xy)
@@ -350,10 +355,10 @@ class PRAMV2StateTokenEncoder(nn.Module):
 
     def _group_mlps_forward(
         self,
-        xy_in: torch.Tensor,       # (N, 2)
+        xy_in: torch.Tensor,  # (N, 2)
         heading_in: torch.Tensor,  # (N, 2)
-        size_in: torch.Tensor,     # (N, 2)
-        type_in: torch.Tensor,     # (N, 3)
+        size_in: torch.Tensor,  # (N, 2)
+        type_in: torch.Tensor,  # (N, 3)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """4개 그룹 MLP를 계산합니다(합쳐서 1~2번 호출로 처리).
 
@@ -376,7 +381,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
             type_feat = self.type_mlp(type_in)
             return xy_feat, heading_feat, size_feat, type_feat
 
-        x_cat = torch.cat([xy_in, heading_in, size_in, type_in], dim=-1)  # (N, 9)
+        x_cat = torch.cat([xy_in, heading_in, size_in, type_in],
+                          dim=-1)  # (N, 9)
 
         if self.training:
             fc1_w, fc1_b, fc2_w, fc2_b = self._build_fused_group_weights_train()
@@ -385,17 +391,17 @@ class PRAMV2StateTokenEncoder(nn.Module):
             fc1_w, fc1_b = self._fused_fc1_w, self._fused_fc1_b
             fc2_w, fc2_b = self._fused_fc2_w, self._fused_fc2_b
 
-        h = F.linear(x_cat, fc1_w, fc1_b)     # (N, H_sum)
-        h = F.gelu(h)                         # (N, H_sum)
-        y = F.linear(h, fc2_w, fc2_b)         # (N, 4*O)
+        h = F.linear(x_cat, fc1_w, fc1_b)  # (N, H_sum)
+        h = F.gelu(h)  # (N, H_sum)
+        y = F.linear(h, fc2_w, fc2_b)  # (N, 4*O)
 
         O = int(self.branch_out_dim)
         xy_feat, heading_feat, size_feat, type_feat = y.split(O, dim=-1)
         return xy_feat, heading_feat, size_feat, type_feat
 
     def _forward_unpadded_tokens(
-        self,
-        target_cur_norm_unpad: torch.Tensor,  # (T_total, 11)
+            self,
+            target_cur_norm_unpad: torch.Tensor,  # (T_total, 11)
     ) -> torch.Tensor:
         """유효 토큰(2D)만으로 state_token_in을 계산합니다.
 
@@ -407,12 +413,13 @@ class PRAMV2StateTokenEncoder(nn.Module):
             state_token_unpad:
                 - shape: (T_total, D)
         """
-        xy, cos_sin, size_wl, type_one_hot = self._split_groups(target_cur_norm_unpad)  # (T,2),(T,2),(T,2),(T,3)
+        xy, cos_sin, size_wl, type_one_hot = self._split_groups(
+            target_cur_norm_unpad)  # (T,2),(T,2),(T,2),(T,3)
         cos_sin_unit = self._normalize_cos_sin(cos_sin)  # (T_total, 2)
 
-        xy_in = self.xy_norm(xy)                # (T_total, 2)
+        xy_in = self.xy_norm(xy)  # (T_total, 2)
         heading_in = self.heading_norm(cos_sin_unit)  # (T_total, 2)
-        size_in = self.size_norm(size_wl)       # (T_total, 2)
+        size_in = self.size_norm(size_wl)  # (T_total, 2)
         type_in = self.type_norm(type_one_hot)  # (T_total, 3)
 
         xy_feat, heading_feat, size_feat, type_feat = self._group_mlps_forward(
@@ -422,14 +429,18 @@ class PRAMV2StateTokenEncoder(nn.Module):
             type_in=type_in,
         )  # 각 (T_total, O)
 
-        shape_feat = self._combine_size_and_type_features(size_feat=size_feat, type_feat=type_feat)  # (T_total, O)
+        shape_feat = self._combine_size_and_type_features(
+            size_feat=size_feat, type_feat=type_feat)  # (T_total, O)
 
-        xy_heading = xy_feat * heading_feat        # (T_total, O)
+        xy_heading = xy_feat * heading_feat  # (T_total, O)
         heading_shape = heading_feat * shape_feat  # (T_total, O)
-        shape_xy = shape_feat * xy_feat            # (T_total, O)
+        shape_xy = shape_feat * xy_feat  # (T_total, O)
 
         fuse_in = torch.cat(
-            [xy_feat, heading_feat, shape_feat, xy_heading, heading_shape, shape_xy],
+            [
+                xy_feat, heading_feat, shape_feat, xy_heading, heading_shape,
+                shape_xy
+            ],
             dim=-1,
         )  # (T_total, 6*O)
 
@@ -437,9 +448,9 @@ class PRAMV2StateTokenEncoder(nn.Module):
         return state_token_unpad
 
     def forward(
-        self,
-        target_cur_norm: torch.Tensor,       # (B, (1+)Pnn, 11)
-        target_current_mask: torch.Tensor,   # (B, (1+)Pnn) True=무효
+            self,
+            target_cur_norm: torch.Tensor,  # (B, (1+)Pnn, 11)
+            target_current_mask: torch.Tensor,  # (B, (1+)Pnn) True=무효
     ) -> torch.Tensor:
         """그룹별 처리 후 합쳐서 state_token_in을 만듭니다.
 
@@ -450,7 +461,8 @@ class PRAMV2StateTokenEncoder(nn.Module):
         """
         if not self.enable_varlen_unpad:
             # (기존 방식) 전체 계산 후 마스크로 0 처리
-            xy, cos_sin, size_wl, type_one_hot = self._split_groups(target_cur_norm)
+            xy, cos_sin, size_wl, type_one_hot = self._split_groups(
+                target_cur_norm)
             cos_sin_unit = self._normalize_cos_sin(cos_sin)
 
             xy_in = self.xy_norm(xy)
@@ -471,12 +483,17 @@ class PRAMV2StateTokenEncoder(nn.Module):
             size_feat = size_feat.reshape(B, P, O)
             type_feat = type_feat.reshape(B, P, O)
 
-            shape_feat = self._combine_size_and_type_features(size_feat=size_feat, type_feat=type_feat)
+            shape_feat = self._combine_size_and_type_features(
+                size_feat=size_feat, type_feat=type_feat)
             xy_heading = xy_feat * heading_feat
             heading_shape = heading_feat * shape_feat
             shape_xy = shape_feat * xy_feat
 
-            fuse_in = torch.cat([xy_feat, heading_feat, shape_feat, xy_heading, heading_shape, shape_xy], dim=-1)
+            fuse_in = torch.cat([
+                xy_feat, heading_feat, shape_feat, xy_heading, heading_shape,
+                shape_xy
+            ],
+                                dim=-1)
             state_token_in = self.fuse_mlp(fuse_in)
 
             mask_bool = target_current_mask.to(torch.bool)

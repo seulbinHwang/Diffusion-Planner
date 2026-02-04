@@ -29,7 +29,6 @@ import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
 
-
 # name -> 호출 횟수 / 누적 시간(ms)
 _PROFILE_CALL_COUNT: Dict[str, int] = {}
 _PROFILE_TOTAL_MS: Dict[str, float] = {}
@@ -74,7 +73,8 @@ def profile_block(
         yield
         return
 
-    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
+    is_cuda: bool = isinstance(device_type,
+                               str) and device_type.startswith("cuda")
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -98,8 +98,9 @@ def profile_block(
     avg_ms: float = new_sum / float(new_cnt)
 
     if (not print_rank0_only) or _is_main_process():
-        print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}")
-
+        print(
+            f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}"
+        )
 
 
 def _run_backward_and_step_deepspeed(
@@ -123,16 +124,16 @@ def _run_backward_and_step_deepspeed(
             "cuda" 또는 "cpu"
     """
     with profile_block(
-        "train_epoch._backward_and_step.deepspeed.backward",
-        enabled=enable_profile,
-        device_type=device_type,
+            "train_epoch._backward_and_step.deepspeed.backward",
+            enabled=enable_profile,
+            device_type=device_type,
     ):
         model.backward(loss_tensor)
 
     with profile_block(
-        "train_epoch._backward_and_step.deepspeed.step",
-        enabled=enable_profile,
-        device_type=device_type,
+            "train_epoch._backward_and_step.deepspeed.step",
+            enabled=enable_profile,
+            device_type=device_type,
     ):
         model.step()
 
@@ -161,32 +162,32 @@ def _run_backward_and_step_pytorch(
         device_type (str): "cuda" 또는 "cpu"
     """
     with profile_block(
-        "train_epoch._backward_and_step.pytorch.backward",
-        enabled=enable_profile,
-        device_type=device_type,
+            "train_epoch._backward_and_step.pytorch.backward",
+            enabled=enable_profile,
+            device_type=device_type,
     ):
         loss_tensor.backward()
 
     if float(max_grad_norm) > 0.0:
         with profile_block(
-            "train_epoch._backward_and_step.pytorch.clip_grad_norm",
-            enabled=enable_profile,
-            device_type=device_type,
+                "train_epoch._backward_and_step.pytorch.clip_grad_norm",
+                enabled=enable_profile,
+                device_type=device_type,
         ):
             nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
 
     with profile_block(
-        "train_epoch._backward_and_step.pytorch.optimizer_step",
-        enabled=enable_profile,
-        device_type=device_type,
+            "train_epoch._backward_and_step.pytorch.optimizer_step",
+            enabled=enable_profile,
+            device_type=device_type,
     ):
         optimizer.step()
 
     if scheduler is not None:
         with profile_block(
-            "train_epoch._backward_and_step.pytorch.scheduler_step",
-            enabled=enable_profile,
-            device_type=device_type,
+                "train_epoch._backward_and_step.pytorch.scheduler_step",
+                enabled=enable_profile,
+                device_type=device_type,
         ):
             scheduler.step()
 
@@ -233,10 +234,10 @@ def _maybe_run_torch_profiler_for_backward_step(
         activities.append(ProfilerActivity.CUDA)
 
     with profile(
-        activities=activities,
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
+            activities=activities,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
     ) as prof:
         if use_deepspeed:
             model.backward(loss_tensor)
@@ -244,21 +245,29 @@ def _maybe_run_torch_profiler_for_backward_step(
         else:
             loss_tensor.backward()
             if float(max_grad_norm) > 0.0:
-                nn.utils.clip_grad_norm_(model.parameters(), float(max_grad_norm))
+                nn.utils.clip_grad_norm_(model.parameters(),
+                                         float(max_grad_norm))
             optimizer.step()
             if scheduler is not None:
                 scheduler.step()
 
     # 출력은 rank 0만
     if _is_main_process():
-        row_limit: int = int(getattr(args, "profile_backward_torch_row_limit", 30))
-        print("\n==================== [torch.profiler] backward/step top CUDA ====================")
+        row_limit: int = int(
+            getattr(args, "profile_backward_torch_row_limit", 30))
+        print(
+            "\n==================== [torch.profiler] backward/step top CUDA ===================="
+        )
         try:
-            print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=row_limit))
+            print(prof.key_averages().table(sort_by="self_cuda_time_total",
+                                            row_limit=row_limit))
         except Exception:
             # CUDA가 없거나 버전에 따라 컬럼명이 다를 수 있음
-            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=row_limit))
-        print("=================================================================================\n")
+            print(prof.key_averages().table(sort_by="cpu_time_total",
+                                            row_limit=row_limit))
+        print(
+            "=================================================================================\n"
+        )
 
     return True
 
@@ -376,10 +385,10 @@ def _prepare_batch_for_device(
 
     # outputs 분리 (정답은 반드시 Tensor여야 함)
     target_keys = {
-        "ego_future_gt_4_dim", # output 에서만 꺼내도록
-        "near_future_gt_4_dim", # output 에서만 꺼내도록
-        "ego_future_gt_is_valid", # input / output 둘다
-        "near_future_gt_is_valid", # input / output 둘다
+        "ego_future_gt_4_dim",  # output 에서만 꺼내도록
+        "near_future_gt_4_dim",  # output 에서만 꺼내도록
+        "ego_future_gt_is_valid",  # input / output 둘다
+        "near_future_gt_is_valid",  # input / output 둘다
     }
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
@@ -440,7 +449,6 @@ def _restore_padding_values_inplace(
             inputs[feature_key] = t.masked_fill(pad_mask, 0.0)
         else:
             inputs[feature_key] = t.masked_fill(pad_mask, 0)
-
 
 
 def _build_near_future_4dim_and_mask(
@@ -579,7 +587,6 @@ def _compute_loss_dict(
     loss_dict["loss"] = w_dir * l_dir + w_int * l_int + w_const * l_con
 
     return loss_dict
-
 
 
 def _backward_and_step(
@@ -805,10 +812,12 @@ def train_epoch(
                 batch_num_in_all_epoch=batch_num_in_all_epoch,
             )
 
-            enable_profile: bool = bool(
-                getattr(args, "profile_feasible", False))
+            enable_profile: bool = bool(getattr(args, "profile_feasible",
+                                                False))
             if enable_profile:
-                print("===============[PROFILE train_epoch ENABLED]===============")
+                print(
+                    "===============[PROFILE train_epoch ENABLED]==============="
+                )
             device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
 
             with profile_block(

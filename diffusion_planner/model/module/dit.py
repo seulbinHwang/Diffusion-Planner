@@ -42,6 +42,8 @@ except Exception as _e1:
         _FA2_IMPORT_ERR = Exception(
             f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
+
+
 # ===========================================================
 class FlashAttnKVCache(NamedTuple):
     """Cross-Attention에서 K/V 쪽(scene 토큰)을 한 번만 펼쳐서 재사용하기 위한 캐시.
@@ -111,6 +113,7 @@ def scale(x, scale, only_first=False):
 
     return x
 
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -137,8 +140,8 @@ class TimestepEmbedder(nn.Module):
         half: int = int(self.frequency_embedding_size // 2)
         if half > 0:
             exponent = (-math.log(self.max_period)) * (
-                torch.arange(start=0, end=half, dtype=torch.float32) / float(half)
-            )  # (half,)
+                torch.arange(start=0, end=half, dtype=torch.float32) /
+                float(half))  # (half,)
             freqs = torch.exp(exponent)  # (half,) float32
         else:
             freqs = torch.empty((0,), dtype=torch.float32)
@@ -158,17 +161,14 @@ class TimestepEmbedder(nn.Module):
         """
         # (원본 호환 유지용: 외부에서 static 호출할 가능성 대비)
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
-            / half
-        ).to(device=t.device)
+        freqs = torch.exp(-math.log(max_period) *
+                          torch.arange(start=0, end=half, dtype=torch.float32) /
+                          half).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-            )
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def _timestep_embedding_cached(self, t: torch.Tensor) -> torch.Tensor:
@@ -196,14 +196,16 @@ class TimestepEmbedder(nn.Module):
         if half == 0:
             # 거의 안 쓰는 케이스지만 안전하게 처리
             return torch.zeros((N, self.frequency_embedding_size),
-                               device=t.device, dtype=torch.float32)
+                               device=t.device,
+                               dtype=torch.float32)
 
         freqs: torch.Tensor = self._freqs
         if freqs.device != t.device:
             freqs = freqs.to(device=t.device)
 
         args = t[:, None].float() * freqs[None, :]  # (N, half)
-        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (N, 2*half)
+        emb = torch.cat([torch.cos(args), torch.sin(args)],
+                        dim=-1)  # (N, 2*half)
 
         if (self.frequency_embedding_size % 2) == 1:
             pad = torch.zeros((N, 1), device=t.device, dtype=emb.dtype)  # (N,1)
@@ -220,7 +222,9 @@ class TimestepEmbedder(nn.Module):
         if B == 0:
             # (0, H)
             out_dim: int = int(self.mlp[-1].out_features)
-            return torch.zeros((0, out_dim), device=t.device, dtype=torch.float32)
+            return torch.zeros((0, out_dim),
+                               device=t.device,
+                               dtype=torch.float32)
 
         # -----------------------------
         # ✅ 방법 2) 배치의 t가 전부 같은 경우: 1번만 계산 + expand
@@ -244,7 +248,6 @@ class TimestepEmbedder(nn.Module):
         out = t0_emb.expand(B, -1).clone()  # (B, H)
         out[~same_mask] = t_other_emb
         return out
-
 
 
 class DiTBlock(nn.Module):
@@ -520,8 +523,8 @@ class DiTBlock(nn.Module):
 
     def _self_attn_flash_varlen_packed(
         self,
-        x_unpad: torch.Tensor,         # (Tq, D)
-        cu_seqlens_q: torch.Tensor,    # (B+1,) int32
+        x_unpad: torch.Tensor,  # (Tq, D)
+        cu_seqlens_q: torch.Tensor,  # (B+1,) int32
         max_seqlen_q: int,
     ) -> torch.Tensor:
         """패딩이 제거된(unpad) 토큰(Tq, D)에 대해서만 Self-Attention을 계산합니다.
@@ -537,7 +540,8 @@ class DiTBlock(nn.Module):
         self._check_flash_available()
 
         if x_unpad.dim() != 2:
-            raise ValueError(f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
+            raise ValueError(
+                f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
 
         Tq, D = x_unpad.shape
         if Tq == 0 or int(max_seqlen_q) == 0:
@@ -551,7 +555,8 @@ class DiTBlock(nn.Module):
             return x_unpad.new_zeros((Tq, D)) + touch
 
         qkv = self.qkv_proj(x_unpad)  # (Tq, 3*D)
-        qkv = qkv.reshape(Tq, 3, self.num_heads, self.head_dim)  # (Tq, 3, H, Hd)
+        qkv = qkv.reshape(Tq, 3, self.num_heads,
+                          self.head_dim)  # (Tq, 3, H, Hd)
         comp_dtype = self._get_compute_dtype(qkv)
         qkv = qkv.to(comp_dtype)
 
@@ -565,13 +570,13 @@ class DiTBlock(nn.Module):
         )  # (Tq, H, Hd)
 
         out = out.reshape(Tq, self.num_heads * self.head_dim)  # (Tq, D)
-        out = self.out_proj(out.to(dtype=x_unpad.dtype))       # (Tq, D)
+        out = self.out_proj(out.to(dtype=x_unpad.dtype))  # (Tq, D)
         return out
 
     def _cross_attn_flash_varlen_packed(
         self,
-        q_unpad: torch.Tensor,         # (Tq, D)
-        cu_seqlens_q: torch.Tensor,    # (B+1,) int32
+        q_unpad: torch.Tensor,  # (Tq, D)
+        cu_seqlens_q: torch.Tensor,  # (B+1,) int32
         max_seqlen_q: int,
         kv_cache: FlashAttnKVCache,
     ) -> torch.Tensor:
@@ -589,7 +594,8 @@ class DiTBlock(nn.Module):
         self._check_flash_available()
 
         if q_unpad.dim() != 2:
-            raise ValueError(f"q_unpad must be 2D (Tq,D). got {tuple(q_unpad.shape)}")
+            raise ValueError(
+                f"q_unpad must be 2D (Tq,D). got {tuple(q_unpad.shape)}")
 
         kv_unpad = kv_cache.kv_unpad
         cu_k = kv_cache.cu_seqlens_k
@@ -610,8 +616,10 @@ class DiTBlock(nn.Module):
                       if self.out_proj_cross.bias is not None else 0)) * 0.0
             return q_unpad.new_zeros((Tq, D)) + touch
 
-        q = self.q_proj_cross(q_unpad).reshape(Tq, self.num_heads, self.head_dim)  # (Tq, H, Hd)
-        kv = self.kv_proj_cross(kv_unpad).reshape(Tk, 2, self.num_heads, self.head_dim)  # (Tk, 2, H, Hd)
+        q = self.q_proj_cross(q_unpad).reshape(Tq, self.num_heads,
+                                               self.head_dim)  # (Tq, H, Hd)
+        kv = self.kv_proj_cross(kv_unpad).reshape(
+            Tk, 2, self.num_heads, self.head_dim)  # (Tk, 2, H, Hd)
 
         comp_dtype = self._get_compute_dtype(q)
         q = q.to(comp_dtype)
@@ -629,17 +637,18 @@ class DiTBlock(nn.Module):
             causal=False,
         )  # (Tq, H, Hd)
 
-        out = out.reshape(Tq, self.num_heads * self.head_dim)     # (Tq, D)
-        out = self.out_proj_cross(out.to(dtype=q_unpad.dtype))    # (Tq, D)
+        out = out.reshape(Tq, self.num_heads * self.head_dim)  # (Tq, D)
+        out = self.out_proj_cross(out.to(dtype=q_unpad.dtype))  # (Tq, D)
         return out
 
     def forward_packed(
-        self,
-        x_unpad: torch.Tensor,                   # (Tq, D)
-        cu_seqlens_q: torch.Tensor,              # (B+1,) int32
-        max_seqlen_q: int,
-        cross_kv_cache: FlashAttnKVCache,
-        pram_v2_modulations: Dict[str, ModulationTriplet],  # 값 텐서 shape: (Tq, D)
+            self,
+            x_unpad: torch.Tensor,  # (Tq, D)
+            cu_seqlens_q: torch.Tensor,  # (B+1,) int32
+            max_seqlen_q: int,
+            cross_kv_cache: FlashAttnKVCache,
+            pram_v2_modulations: Dict[str,
+                                      ModulationTriplet],  # 값 텐서 shape: (Tq, D)
     ) -> torch.Tensor:
         """블록 전체를 (Tq, D) packed 토큰에서만 수행합니다.
 
@@ -658,7 +667,8 @@ class DiTBlock(nn.Module):
             torch.Tensor: (Tq, D)
         """
         if x_unpad.dim() != 2:
-            raise ValueError(f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
+            raise ValueError(
+                f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
 
         # ----- SA -----
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
@@ -700,11 +710,10 @@ class DiTBlock(nn.Module):
         x_unpad = x_unpad + g * f_ca
 
         # ----- MLP2 -----
-        x_unpad = x_unpad + self.gate_mlp2.to(dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(
-            self.norm4(x_unpad)
-        )
+        x_unpad = x_unpad + self.gate_mlp2.to(
+            dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(
+                self.norm4(x_unpad))
         return x_unpad
-
 
     def _apply_modulated_mlp1(
             self,

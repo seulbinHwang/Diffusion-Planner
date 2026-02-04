@@ -31,7 +31,8 @@ class MixerBlock(nn.Module):
 
         self.norm1 = nn.LayerNorm(channels_mlp_dim)
 
-        hidden_c: int = max(16, int(float(channels_mlp_dim) * float(channels_mlp_ratio)))
+        hidden_c: int = max(
+            16, int(float(channels_mlp_dim) * float(channels_mlp_ratio)))
         self.channels_mlp = Mlp(
             in_features=channels_mlp_dim,
             hidden_features=hidden_c,

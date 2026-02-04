@@ -39,6 +39,7 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(msg)
     return tensor
 
+
 def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     """마스크 텐서를 bool로 통일합니다.
 
@@ -183,7 +184,8 @@ def _compute_xy_yaw_losses(
         - 'neighbor_prediction_loss_xy' (float): mean Euclidean distance over neighbor coords.
         - 'neighbor_prediction_loss_yaw' (float): mean abs angular error (deg) for neighbors.
     """
-    target_future_valid = _to_bool_mask(target_future_valid).to(device=score_denorm.device)
+    target_future_valid = _to_bool_mask(target_future_valid).to(
+        device=score_denorm.device)
     # score_denorm[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
     pred_xy = score_denorm[..., :2]  # [B, Pnn, T, 2]
     gt_xy = target_future_gt[..., :2]  # # (B, (1+)Pnn, future_len, 2)
@@ -339,40 +341,46 @@ def _sample_diffusion_time_and_noise(
     )
     return batch_diffusion_time, low_t_mask, random_noise
 
+
 def _normalize_futures_and_build_xT(
     normed_target_cur_gt_4_dim: torch.Tensor,
     normed_target_future_gt_4_dim: torch.Tensor,
     target_cur_future_is_valid: torch.Tensor,
     batch_diffusion_time: torch.Tensor,
     random_noise: torch.Tensor,
-    marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+    marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
+                                                                torch.Tensor]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """미래 궤적을 정규화하고, x_T 샘플과 std 를 만든다."""
     B, one_or_Pnn, future_len, _ = normed_target_future_gt_4_dim.shape
-    mean, std = marginal_prob(normed_target_future_gt_4_dim, batch_diffusion_time)
+    mean, std = marginal_prob(normed_target_future_gt_4_dim,
+                              batch_diffusion_time)
     assert std.ndim == 4, "std_raw must be (B, _, _, _)"
 
     # ✅ (핵심) 전체 마스크를 bool로 통일
-    target_cur_future_is_valid_bool = _to_bool_mask(target_cur_future_is_valid)  # (B,(1+)Pnn,1+T)
-    target_future_is_valid = target_cur_future_is_valid_bool[:, :, 1:]          # (B,(1+)Pnn,T) bool
+    target_cur_future_is_valid_bool = _to_bool_mask(
+        target_cur_future_is_valid)  # (B,(1+)Pnn,1+T)
+    target_future_is_valid = target_cur_future_is_valid_bool[:, :,
+                                                             1:]  # (B,(1+)Pnn,T) bool
 
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
 
     invalid_future = (~target_future_is_valid).unsqueeze(-1)  # (B,(1+)Pnn,T,1)
-    target_future_noise_xT = target_future_noise_xT.masked_fill(invalid_future, 0.0)
+    target_future_noise_xT = target_future_noise_xT.masked_fill(
+        invalid_future, 0.0)
 
     target_cur_future_norm_xT: torch.Tensor = torch.cat(
         [normed_target_cur_gt_4_dim, target_future_noise_xT],
         dim=2,
     )
 
-    invalid_cur_future = (~target_cur_future_is_valid_bool).unsqueeze(-1)  # (B,(1+)Pnn,1+T,1)
-    target_cur_future_norm_xT = target_cur_future_norm_xT.masked_fill(invalid_cur_future, 0.0)
+    invalid_cur_future = (~target_cur_future_is_valid_bool).unsqueeze(
+        -1)  # (B,(1+)Pnn,1+T,1)
+    target_cur_future_norm_xT = target_cur_future_norm_xT.masked_fill(
+        invalid_cur_future, 0.0)
 
     assert target_cur_future_norm_xT.shape == (B, one_or_Pnn, 1 + future_len, 4)
     return target_cur_future_norm_xT, std
-
-
 
 
 def _forward_model_with_autocast(

@@ -10,11 +10,13 @@ except Exception:
     def to_absolute_path(path: str) -> str:
         return str(Path(path).expanduser().resolve())
 
+
 import torch
 from typing import Any
 
 
 class StateNormalizer:
+
     def __init__(self, mean: object, std: object) -> None:
         self.mean = self._to_1d4(mean, name="mean")  # (4,)
         self.std = self._to_1d4(std, name="std")  # (4,)
@@ -30,7 +32,8 @@ class StateNormalizer:
         return values_t
 
     @staticmethod
-    def _reshape_stats_for_data(stats_1d4: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+    def _reshape_stats_for_data(stats_1d4: torch.Tensor,
+                                data: torch.Tensor) -> torch.Tensor:
         """stats(4,)를 data(...,4)에 맞게 reshape + dtype/device를 data와 맞춥니다.
 
         Args:
@@ -42,10 +45,12 @@ class StateNormalizer:
             dtype/device는 data와 동일.
         """
         leading_ones = [1] * (data.ndim - 1)
-        return stats_1d4.to(device=data.device, dtype=data.dtype).view(*leading_ones, 4)
+        return stats_1d4.to(device=data.device,
+                            dtype=data.dtype).view(*leading_ones, 4)
 
     @staticmethod
-    def _broadcast_valid_mask(valid_mask: Any, data: torch.Tensor) -> torch.Tensor:
+    def _broadcast_valid_mask(valid_mask: Any,
+                              data: torch.Tensor) -> torch.Tensor:
         """valid_mask를 data와 같은 shape로 브로드캐스트 가능한 형태로 정리합니다.
 
         Args:
@@ -101,7 +106,8 @@ class StateNormalizer:
             (..., 4) 정규화 결과. invalid 위치는 0.
         """
         if data.shape[-1] != 4:
-            raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+            raise ValueError(
+                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         # autocast는 끄고, dtype은 '입력 data dtype'을 그대로 존중합니다.
         with torch.amp.autocast(data.device.type, enabled=False):
@@ -126,7 +132,8 @@ class StateNormalizer:
             (..., 4) 역변환 결과. invalid 위치는 0.
         """
         if data.shape[-1] != 4:
-            raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+            raise ValueError(
+                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
         with torch.amp.autocast(data.device.type, enabled=False):
             mean = self._reshape_stats_for_data(self.mean, data)
@@ -142,6 +149,7 @@ import torch
 
 
 class ObservationNormalizer:
+
     def __init__(self, normalization_dict: Dict[str, Dict[str, torch.Tensor]]):
         self._normalization_dict = {k: v for k, v in normalization_dict.items()}
 
@@ -154,7 +162,8 @@ class ObservationNormalizer:
         return "cuda" if torch.cuda.is_available() else "cpu"
 
     @staticmethod
-    def _apply_valid_mask_out_of_place(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    def _apply_valid_mask_out_of_place(x: torch.Tensor,
+                                       valid: torch.Tensor) -> torch.Tensor:
         """x에서 valid가 False인 위치를 0으로 만든 새 텐서를 반환합니다.
 
         허용하는 valid 모양
@@ -179,8 +188,7 @@ class ObservationNormalizer:
             raise ValueError(
                 "valid 마스크 차원 수가 데이터보다 큽니다. "
                 f"valid.ndim={int(v.ndim)}, x.ndim={int(x.ndim)}, "
-                f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}"
-            )
+                f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}")
 
         # 1) 완전 동일 모양
         if v.shape == x.shape:
@@ -214,8 +222,7 @@ class ObservationNormalizer:
             "valid 마스크 shape이 데이터와 맞지 않습니다. "
             "허용: valid.shape == x.shape, valid.shape == x.shape[:-1], "
             "또는 valid가 x의 앞쪽 축과 맞고(중간에 1은 허용) 뒤쪽 축은 자동 확장 가능한 경우입니다. "
-            f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}"
-        )
+            f"valid.shape={tuple(v.shape)}, x.shape={tuple(x.shape)}")
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """정규화(mean/std 적용) + invalid 마스킹을 수행합니다.
@@ -247,7 +254,8 @@ class ObservationNormalizer:
 
             # 3) 패스스루 키
             if "agent_route_lane_order" in data:
-                norm_data["agent_route_lane_order"] = data["agent_route_lane_order"].to(torch.long)
+                norm_data["agent_route_lane_order"] = data[
+                    "agent_route_lane_order"].to(torch.long)
 
             return norm_data
 
@@ -278,7 +286,8 @@ class ObservationNormalizer:
             self._mask_invalid_data(norm_data)
 
             if "agent_route_lane_order" in data:
-                norm_data["agent_route_lane_order"] = data["agent_route_lane_order"].to(torch.long)
+                norm_data["agent_route_lane_order"] = data[
+                    "agent_route_lane_order"].to(torch.long)
 
             return norm_data
 
@@ -289,6 +298,7 @@ class ObservationNormalizer:
             - in-place로 원본 텐서를 직접 바꾸지 않습니다.
             - dict 안에 같은 텐서 참조가 있어도 안전합니다.
         """
+
         def _mask(data_key: str, valid_key: str) -> None:
             valid = norm_data.get(valid_key, None)
             x = norm_data.get(data_key, None)

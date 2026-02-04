@@ -925,6 +925,26 @@ def print_param_report(model: nn.Module) -> None:
                 )
 
 
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import torch
+import torch.nn as nn
+
+
+@dataclass(frozen=True)
+class _EncoderIntentionalInitSnapshot:
+    """Encoder 내부에서 '의도적으로 초기화된 값'을 보존하기 위한 스냅샷입니다.
+
+    - pos_emb: Encoder._build_pos_embedding_module()에서 std=0.02 등으로 초기화한 값이
+      전역 초기화(xavier)로 덮이지 않도록, state_dict 전체를 저장합니다.
+    - lane 임베딩 Linear들: LaneFusionEncoder.__init__()에서 weight만 std=0.02로 초기화한
+      모듈들에 대해, weight만 저장합니다. (bias는 전역 초기화에서 0으로 유지)
+    """
+    pos_emb_state: Optional[Dict[str, torch.Tensor]]
+    lane_linear_weight: Dict[str, torch.Tensor]
+
+
 class Diffusion_Planner(nn.Module):
 
     def __init__(self, config):
@@ -977,27 +997,120 @@ class Diffusion_Planner_Encoder(nn.Module):
         self.encoder = Encoder(config)
         self.initialize_weights()
 
+    @staticmethod
+    def _lane_encoder_intentional_linear_names() -> Tuple[str, ...]:
+        """LaneFusionEncoder에서 weight를 의도적으로 초기화한 Linear 이름 목록.
+
+        Returns:
+            Tuple[str, ...]: LaneFusionEncoder 내부 attribute 이름들.
+        """
+        return (
+            "speed_limit_emb",
+            "traffic_emb",
+            "lane_type_emb",
+            "left_line_type_emb",
+            "right_line_type_emb",
+        )
+
+    def _snapshot_encoder_intentional_init(
+            self) -> _EncoderIntentionalInitSnapshot:
+        """전역 초기화 전에, Encoder가 '의도적으로 초기화'한 값만 저장합니다.
+
+        저장 대상
+        - pos_emb: state_dict 전체 저장
+        - lane_encoder의 특정 Linear들: weight만 저장
+          (weight shape 예: (C, in_dim) where C=channels_mlp_dim)
+
+        Returns:
+            _EncoderIntentionalInitSnapshot: 복원에 필요한 텐서 스냅샷
+        """
+        pos_emb_state: Optional[Dict[str, torch.Tensor]] = None
+        lane_linear_weight: Dict[str, torch.Tensor] = {}
+
+        # (1) pos_emb: (Linear 또는 timm.Mlp) 내부 fc1/fc2까지 포함해서 통째로 보존
+        pos_emb = getattr(self.encoder, "pos_emb", None)
+        if isinstance(pos_emb, nn.Module):
+            # state_dict 텐서들을 clone()으로 복사해 저장 (값만 저장, RNG 추가 사용 없음)
+            state = pos_emb.state_dict()
+            pos_emb_state = {k: v.detach().clone() for k, v in state.items()}
+
+        # (2) lane_encoder의 일부 Linear: weight만 보존 (bias는 전역 init으로 0 유지)
+        lane_encoder = getattr(self.encoder, "lane_encoder", None)
+        if isinstance(lane_encoder, nn.Module):
+            for attr_name in self._lane_encoder_intentional_linear_names():
+                layer = getattr(lane_encoder, attr_name, None)
+                if isinstance(layer, nn.Linear):
+                    lane_linear_weight[attr_name] = layer.weight.detach().clone(
+                    )
+
+        return _EncoderIntentionalInitSnapshot(
+            pos_emb_state=pos_emb_state,
+            lane_linear_weight=lane_linear_weight,
+        )
+
+    def _restore_encoder_intentional_init(
+        self,
+        snapshot: _EncoderIntentionalInitSnapshot,
+    ) -> None:
+        """전역 초기화 이후, '의도적으로 초기화된 값'을 다시 복원합니다.
+
+        - pos_emb: 저장해 둔 state_dict로 전체 복원
+        - lane 임베딩 Linear들: weight만 복원 (bias는 전역 초기화 결과 유지)
+
+        Args:
+            snapshot: _snapshot_encoder_intentional_init()에서 만든 스냅샷
+        """
+        # (1) pos_emb 전체 복원
+        if snapshot.pos_emb_state is not None:
+            pos_emb = getattr(self.encoder, "pos_emb", None)
+            if isinstance(pos_emb, nn.Module):
+                # load_state_dict는 내부적으로 copy를 수행합니다.
+                pos_emb.load_state_dict(snapshot.pos_emb_state, strict=True)
+
+        # (2) lane 임베딩 Linear weight만 복원
+        lane_encoder = getattr(self.encoder, "lane_encoder", None)
+        if isinstance(lane_encoder, nn.Module) and len(
+                snapshot.lane_linear_weight) > 0:
+            with torch.no_grad():
+                for attr_name, w_saved in snapshot.lane_linear_weight.items():
+                    layer = getattr(lane_encoder, attr_name, None)
+                    if not isinstance(layer, nn.Linear):
+                        continue
+                    if layer.weight.shape != w_saved.shape:
+                        raise ValueError(
+                            f"lane_encoder.{attr_name}.weight shape mismatch: "
+                            f"current={tuple(layer.weight.shape)}, saved={tuple(w_saved.shape)}"
+                        )
+                    layer.weight.copy_(
+                        w_saved.to(device=layer.weight.device,
+                                   dtype=layer.weight.dtype))
+
     def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(m):
+        """전역 초기화를 하되, Encoder가 의도적으로 초기화한 일부는 최종적으로 유지합니다."""
+        # (A) Encoder 내부의 '의도적 초기화' 값 스냅샷 저장
+        snapshot = self._snapshot_encoder_intentional_init()
+
+        # (B) 기존 전역 초기화 로직 유지
+        def _basic_init(m: nn.Module) -> None:
             if isinstance(m, nn.Linear):
                 torch.nn.init.xavier_uniform_(m.weight)
-                if isinstance(m, nn.Linear) and m.bias is not None:
+                if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+                if m.weight is not None:
+                    nn.init.constant_(m.weight, 1.0)
             elif isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
         self.apply(_basic_init)
 
-        # Initialize embedding MLP:
+        # (C) 전역 초기화로 덮일 수 있는 '의도적 초기화' 값만 다시 복원
+        self._restore_encoder_intentional_init(snapshot)
 
     def forward(self, inputs):
-
         encoder_outputs = self.encoder(inputs)
-
         return encoder_outputs
 
 
