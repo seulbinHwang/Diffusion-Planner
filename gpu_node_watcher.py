@@ -32,6 +32,7 @@ GPU 노드 감시기
 """
 
 from __future__ import annotations
+import subprocess
 
 import argparse
 import getpass
@@ -52,6 +53,39 @@ from playwright.sync_api import Page, sync_playwright
 
 LOGGER = logging.getLogger("gpu_node_watcher")
 
+def _apply_k8s_yaml(yaml_path: Path, namespace: str) -> str:
+    """YAML 파일을 kubectl apply로 적용합니다.
+
+    이 함수는 아래 일을 합니다.
+    - YAML 파일이 실제로 존재하는지 확인합니다.
+    - `kubectl -n <namespace> apply -f <yaml_path>` 를 실행합니다.
+    - 성공하면 kubectl 출력(stdout)을 문자열로 돌려줍니다.
+    - 실패하면(권한/클러스터 접속/파일 오류 등) 이유를 포함해 예외를 발생시킵니다.
+
+    Args:
+        yaml_path (Path): 적용할 YAML 파일 경로.
+        namespace (str): 적용할 네임스페이스 이름.
+
+    Returns:
+        str: kubectl이 출력한 결과 문자열.
+
+    Raises:
+        FileNotFoundError: YAML 파일이 없을 때 발생합니다.
+        RuntimeError: kubectl 실행이 실패했을 때 발생합니다.
+    """
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"YAML 파일이 없습니다: {yaml_path}")
+
+    cmd = ["kubectl", "-n", namespace, "apply", "-f", str(yaml_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        msg = "\n".join([s for s in [stdout, stderr] if s])
+        raise RuntimeError(f"kubectl apply 실패:\n{msg}")
+
+    return (result.stdout or "").strip()
 
 # =========================
 # 데이터 구조
@@ -863,11 +897,20 @@ def run_check_and_notify_once(
     state: AlertState,
     headless_override: Optional[bool] = None,
 ) -> None:
-    """1번 확인하고, 필요하면 이메일을 보낸 뒤 상태를 갱신합니다.
+    """1번 확인하고, 조건을 만족하면 이메일 + kubectl apply를 실행한 뒤 상태를 갱신합니다.
+
+    동작:
+    - 표에서 노드별 할당 GPU 수를 읽습니다.
+    - 기준값 이하 노드가 있으면 '조건 만족'으로 봅니다.
+    - 조건이 "처음" 만족되는 순간에만:
+        1) 이메일 발송
+        2) 지정된 YAML을 kubectl apply로 실행
+      을 수행합니다.
+    - 조건이 해제되면, 다음 조건 발생 때 다시 실행할 수 있도록 상태를 초기화합니다.
 
     Args:
         config (AppConfig): 전체 설정값.
-        smtp_password (str): SMTP 비밀번호.
+        smtp_password (str): SMTP 비밀번호(앱 비밀번호).
         state (AlertState): 직전 상태.
         headless_override (Optional[bool]): 이번 실행에서만 headless 값을 덮어쓸 때 사용.
     """
@@ -885,30 +928,47 @@ def run_check_and_notify_once(
         threshold=config.watch.allocated_gpu_threshold,
     )
 
-    # ✅ 매번 검사 결과를 CLI에 출력
+    # 매번 검사 결과를 CLI에 출력
     _print_cli_report(node_usages=node_usages, matched=matched, threshold=config.watch.allocated_gpu_threshold)
 
     alert_now = len(matched) > 0
 
-    # ✅ 메일은 "조건 만족 노드가 있을 때만" 보내며, 같은 상태면 반복 발송하지 않음
     if alert_now and not state.alert_active:
-        subject, body = build_email_message(
-            grafana_url=config.watch.grafana_url,
-            threshold=config.watch.allocated_gpu_threshold,
-            matched_nodes=matched,
-        )
-        _send_email(config.email, smtp_password, subject, body)
-        LOGGER.info("이메일 발송 완료. 조건 만족 노드 수=%d", len(matched))
+        # 1) 이메일 발송(실패해도, 아래 kubectl apply는 시도)
+        try:
+            subject, body = build_email_message(
+                grafana_url=config.watch.grafana_url,
+                threshold=config.watch.allocated_gpu_threshold,
+                matched_nodes=matched,
+            )
+            _send_email(config.email, smtp_password, subject, body)
+            LOGGER.info("이메일 발송 완료. 조건 만족 노드 수=%d", len(matched))
+        except Exception as e:
+            LOGGER.error("이메일 발송 실패: %s", e)
+
+        # 2) kubectl apply 실행
+        yaml_path = Path("/media/user/E/projects/Diffusion-Planner/diffusion_planner_npc_training2.yaml")
+        namespace = "p-pnc"
+        try:
+            out = _apply_k8s_yaml(yaml_path=yaml_path, namespace=namespace)
+            if out:
+                LOGGER.info("kubectl apply 결과:\n%s", out)
+            else:
+                LOGGER.info("kubectl apply 성공(출력 없음)")
+        except Exception as e:
+            LOGGER.error("kubectl apply 실패: %s", e)
+
+        # 조건이 처음 생긴 순간에만 위 동작을 1번 수행하도록 상태 갱신
         state.alert_active = True
         return
 
-    # 조건이 해제되면 다음 알림을 위해 상태만 초기화(메일은 보내지 않음)
     if not alert_now and state.alert_active:
-        LOGGER.info("조건이 해제되었습니다(다음에 다시 조건이 생기면 이메일을 보냅니다).")
+        LOGGER.info("조건이 해제되었습니다(다음에 다시 조건이 생기면 이메일+kubectl apply를 실행합니다).")
         state.alert_active = False
         return
 
     LOGGER.info("변화 없음. 조건 만족 노드 수=%d (알림 상태=%s)", len(matched), state.alert_active)
+
 
 
 # =========================
