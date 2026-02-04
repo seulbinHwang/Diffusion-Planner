@@ -31,8 +31,18 @@ class StateNormalizer:
 
     @staticmethod
     def _reshape_stats_for_data(stats_1d4: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+        """stats(4,)를 data(...,4)에 맞게 reshape + dtype/device를 data와 맞춥니다.
+
+        Args:
+            stats_1d4: (4,)
+            data: (..., 4)
+
+        Returns:
+            (..., 4)에 broadcast 가능한 shape의 stats 텐서.
+            dtype/device는 data와 동일.
+        """
         leading_ones = [1] * (data.ndim - 1)
-        return stats_1d4.to(device=data.device).view(*leading_ones, 4)
+        return stats_1d4.to(device=data.device, dtype=data.dtype).view(*leading_ones, 4)
 
     @staticmethod
     def _broadcast_valid_mask(valid_mask: Any, data: torch.Tensor) -> torch.Tensor:
@@ -79,6 +89,10 @@ class StateNormalizer:
     def __call__(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
         """data를 정규화합니다(마스크는 out-of-place로 적용).
 
+        핵심 변경:
+            - mean/std를 data와 같은 dtype으로 맞춘 뒤 계산합니다.
+              (입력이 bf16면 bf16로 계산/출력)
+
         Args:
             data: (..., 4)
             valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크
@@ -89,6 +103,7 @@ class StateNormalizer:
         if data.shape[-1] != 4:
             raise ValueError(f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
 
+        # autocast는 끄고, dtype은 '입력 data dtype'을 그대로 존중합니다.
         with torch.amp.autocast(data.device.type, enabled=False):
             mean = self._reshape_stats_for_data(self.mean, data)
             std = self._reshape_stats_for_data(self.std, data)
@@ -98,6 +113,10 @@ class StateNormalizer:
 
     def inverse(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
         """정규화된 data를 역변환합니다(마스크는 out-of-place로 적용).
+
+        핵심 변경:
+            - mean/std를 data와 같은 dtype으로 맞춘 뒤 계산합니다.
+              (입력이 bf16면 bf16로 계산/출력)
 
         Args:
             data: (..., 4)
@@ -135,8 +154,7 @@ class ObservationNormalizer:
         return "cuda" if torch.cuda.is_available() else "cpu"
 
     @staticmethod
-    def _apply_valid_mask_out_of_place(x: torch.Tensor,
-                                       valid: torch.Tensor) -> torch.Tensor:
+    def _apply_valid_mask_out_of_place(x: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         """x에서 valid가 False인 위치를 0으로 만든 새 텐서를 반환합니다.
 
         허용하는 valid 모양
@@ -175,8 +193,6 @@ class ObservationNormalizer:
             return torch.where(mask, x, torch.zeros_like(x))
 
         # 3) "앞쪽 축"까지만 있는 모양: 뒤쪽 축을 1로 늘려서 맞춤
-        #    예: x=(B,N,S,2), v=(B,N)  -> (B,N,1,1)
-        #        x=(B,L,T,D), v=(B,L)  -> (B,L,1,1)
         prefix_ok = True
         for i in range(int(v.ndim)):
             v_dim = int(v.shape[i])
@@ -186,7 +202,6 @@ class ObservationNormalizer:
                 break
 
         if prefix_ok:
-            # 뒤쪽 축을 1로 채워서 x.ndim과 맞춤
             if v.ndim < x.ndim:
                 expand_shape = tuple(v.shape) + (1,) * int(x.ndim - v.ndim)
                 mask = v.reshape(expand_shape)
@@ -203,6 +218,12 @@ class ObservationNormalizer:
         )
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """정규화(mean/std 적용) + invalid 마스킹을 수행합니다.
+
+        핵심 변경:
+            - mean/std를 각 입력 텐서(x)와 같은 dtype으로 맞춘 뒤 계산합니다.
+              (입력이 bf16면 bf16로 계산/출력)
+        """
         device_type = self._infer_device_type_from_dict(data)
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
@@ -214,8 +235,11 @@ class ObservationNormalizer:
                 x = data[k]
                 if not torch.is_tensor(x):
                     continue
-                mean = v["mean"].to(x.device)
-                std = v["std"].to(x.device)
+                if not torch.is_floating_point(x):
+                    continue
+
+                mean = v["mean"].to(device=x.device, dtype=x.dtype)
+                std = v["std"].to(device=x.device, dtype=x.dtype)
                 norm_data[k] = (x - mean) / std
 
             # 2) 마스킹은 딱 1번만(out-of-place)
@@ -228,6 +252,12 @@ class ObservationNormalizer:
             return norm_data
 
     def inverse(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """역정규화(std/mean 되돌림) + invalid 마스킹을 수행합니다.
+
+        핵심 변경:
+            - mean/std를 각 입력 텐서(x)와 같은 dtype으로 맞춘 뒤 계산합니다.
+              (입력이 bf16면 bf16로 계산/출력)
+        """
         device_type = self._infer_device_type_from_dict(data)
         with torch.amp.autocast(device_type, enabled=False):
             norm_data = copy(data)
@@ -238,8 +268,11 @@ class ObservationNormalizer:
                 x = data[k]
                 if not torch.is_tensor(x):
                     continue
-                mean = v["mean"].to(x.device)
-                std = v["std"].to(x.device)
+                if not torch.is_floating_point(x):
+                    continue
+
+                mean = v["mean"].to(device=x.device, dtype=x.dtype)
+                std = v["std"].to(device=x.device, dtype=x.dtype)
                 norm_data[k] = x * std + mean
 
             self._mask_invalid_data(norm_data)
@@ -286,4 +319,3 @@ class ObservationNormalizer:
 
         _mask("near_agents_past", "near_agents_past_is_valid")
         _mask("non_near_agents_past", "non_near_agents_past_is_valid")
-

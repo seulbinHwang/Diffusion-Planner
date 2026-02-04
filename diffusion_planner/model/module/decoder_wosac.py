@@ -3593,7 +3593,6 @@ class DiT(nn.Module):
         B, Pnn, one_future_len, _ = diffusion_trajectory.shape
         future_len = one_future_len - 1
         device = diffusion_trajectory.device
-        dtype = diffusion_trajectory.dtype
 
         # [B] -> bool 로 정리
         low_t_mask = low_t_mask.to(device=device)
@@ -3609,25 +3608,26 @@ class DiT(nn.Module):
         base_constraint = diffusion_trajectory.new_zeros(
             (B, Pnn, future_len, 3))  # (B,Pnn,future_len,3)
 
+        # ✅ DDP 안전용: feasible_projector 파라미터를 "0배로" 그래프에 등장시키는 스칼라
+        touch = self._ddp_touch_feasible_projector_params(
+            device=device,
+            dtype=base_integrated.dtype,
+        )
+
         # 실제로 FeasibleProjector를 돌릴 배치 인덱스 선택
         active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(
             -1)  # (N_active,)
 
         # low-t 샘플이 없으면:
         #  - 출력은 base로 유지
-        #  - (DDP 등에서) feasible_projector 파라미터가 "완전히 미사용"이 되는 상황을 피하고 싶으면,
-        #    파라미터를 0배로만 얇게 연결해 둔다(출력값은 바뀌지 않음).
+        #  - DDP unused 방지용 touch만 더해 둔다(값 변화 없음)
         if int(active_idx.numel()) == 0:
-            touch = self._ddp_touch_feasible_projector_params(
-                device=device,
-                dtype=base_integrated.dtype,
-            )
             integrated_all = base_integrated + touch
             constraint_all = base_constraint + touch
 
             self.norm_dit_returns = DiTReturns(
-                integrated_trajectory=integrated_all,
-                control_constraint_diff=constraint_all,
+                integrated_trajectory=integrated_all,  # (B,Pnn,future_len,4)
+                control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
             )
             return
 
@@ -3645,7 +3645,7 @@ class DiT(nn.Module):
         integ_active = self.norm_dit_returns.integrated_trajectory  # (N_active,Pnn,future_len,4)
         const_active = self.norm_dit_returns.control_constraint_diff  # (N_active,Pnn,future_len,3)
 
-        # dtype 맞추기(기존 코드의 in-place 대입도 결국 여기서 캐스팅되던 동작과 동일)
+        # dtype 맞추기
         integ_active = integ_active.to(device=device,
                                        dtype=base_integrated.dtype)
         const_active = const_active.to(device=device,
@@ -3654,6 +3654,12 @@ class DiT(nn.Module):
         # ✅ 핵심: in-place 대입이 아니라 "새 텐서"를 만들어서 연결 유지
         integrated_all = base_integrated.index_copy(0, active_idx, integ_active)
         constraint_all = base_constraint.index_copy(0, active_idx, const_active)
+
+        # ✅ 추가 안전장치:
+        #    - FeasibleProjector 내부가 어떤 이유로든 조기 return해서 "파라미터 미사용"이 발생해도,
+        #      최종 출력에서 touch가 들어가므로 DDP unused 방지
+        integrated_all = integrated_all + touch
+        constraint_all = constraint_all + touch
 
         self.norm_dit_returns = DiTReturns(
             integrated_trajectory=integrated_all,  # (B,Pnn,future_len,4)
