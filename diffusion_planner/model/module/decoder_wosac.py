@@ -2604,52 +2604,6 @@ class DiT(nn.Module):
             f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}"
         )
 
-    def preproj_varlen(
-            self,
-            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*6)
-            target_current_mask: torch.Tensor,  # (B, (1+)Pnn) True=pad(무효 에이전트)
-    ) -> torch.Tensor:
-        """pre-proj MLP 를 유효 에이전트 토큰에만 적용하는 전처리 함수.
-
-        마스크를 이용해 유효 토큰만 펼친 뒤 MLP 를 통과시키고,
-        다시 배치 모양으로 되돌립니다.
-
-
-        Returns:
-            torch.Tensor:
-                pre-proj 후 토큰.
-                shape: (B, Pnn, D)
-        """
-        B, Pnn, F = target_input_norm_xT.shape  # (B, Pnn, F)
-        # unpad_input 은 True=유효 이므로 반전 필요
-        attention_mask = (~target_current_mask).to(torch.bool)  # (B, Pnn)
-
-        res = unpad_input(target_input_norm_xT, attention_mask)
-        # x_unpad: (T_total, F), indices: (T_total,)
-        if len(res) == 4:
-            x_unpad, indices, cu_seqlens, max_seqlen = res
-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-        else:
-            x_unpad, indices, cu_seqlens, max_seqlen, seqlens = res
-
-        if x_unpad.numel() == 0:
-            D_out = self.preproj.fc2.out_features
-            zeros = target_input_norm_xT.new_zeros((B, Pnn, D_out))
-            touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc1.bias.view(-1)[:1].sum()
-                      if self.preproj.fc1.bias is not None else 0) +
-                     self.preproj.fc2.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc2.bias.view(-1)[:1].sum()
-                      if self.preproj.fc2.bias is not None else 0)) * 0.0
-            return zeros + touch
-
-        # 유효 토큰만 pre-proj 수행
-        x_unpad = self.preproj(x_unpad)  # (T_total, D)
-
-        # 다시 배치 모양으로 복원 (pad 위치는 0)
-        x = pad_input(x_unpad, indices, B, Pnn)  # (B, Pnn, D)
-        return x
-
     @staticmethod
     def _unpad_input_with_valid_mask(
         x: torch.Tensor,  # (B, L, C)
