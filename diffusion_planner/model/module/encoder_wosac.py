@@ -2415,13 +2415,268 @@ class LaneFusionEncoder(nn.Module):
         """(N,D) -> (B,L,D)로 되돌린다. 무효 위치는 0으로 채운다."""
         return pad_input(x_unpad, indices, int(batch_size), int(seq_len))
 
-    # -------------------------- 기존 유틸(그대로) -------------------------- #
-    # (중간 생략: _round_up_to_multiple, _default_lane_post_hidden_dim,
-    #           _mean_max_pool_tokens, _apply_scalar_gate_to_embedding,
-    #           _compute_boundary_valid_flags, _embed_optional_lane_attribute,
-    #           _select_optional_lane_attribute_features,
-    #           _embed_lane_attrs_with_single_linear, _get_lane_feature ...)
-    # ---------------------------------------------------------------------- #
+
+    @staticmethod
+    def _round_up_to_multiple(value: int, multiple: int) -> int:
+        """정수 값을 특정 수의 배수로 올림합니다.
+
+        Args:
+            value: 올림할 값.
+            multiple: 배수 기준(예: 64).
+
+        Returns:
+            multiple의 배수로 올림된 값.
+        """
+        if multiple <= 0:
+            raise ValueError("multiple must be >= 1")
+        return int((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple)
+
+    @classmethod
+    def _default_lane_post_hidden_dim(cls, channels_dim: int) -> int:
+        """lane_post(2C -> C)에서 중간 길이(hidden)를 기본값으로 정합니다.
+
+        목적:
+            - 너무 작으면 표현력이 약해질 수 있고,
+            - 너무 크면 불필요하게 느려질 수 있습니다.
+            - 기본은 C에 비례해서 적당히 크게 두고(2C + C/3),
+              GPU 친화적으로 64의 배수로 맞춥니다.
+
+        Args:
+            channels_dim: C (예: 192)
+
+        Returns:
+            중간 길이(예: 448 같은 값). 64의 배수.
+        """
+        raw: int = int(channels_dim * 2 + channels_dim // 3)  # 예: 192 -> 448
+        raw = max(64, raw)
+        return cls._round_up_to_multiple(raw, 64)
+
+    @staticmethod
+    def _mean_max_pool_tokens(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(N, T, C)에서 T축 평균/최댓값을 뽑습니다.
+
+        Args:
+            x: shape (N, T, C)
+
+        Returns:
+            mean_pool: shape (N, C)
+            max_pool:  shape (N, C)
+
+        Note:
+            평균은 float32로 누적 후 원래 dtype으로 되돌립니다(수치 안정).
+        """
+        if x.dim() != 3:
+            raise ValueError(f"x must be (N, T, C). got {tuple(x.shape)}")
+        T: int = int(x.shape[1])
+        if T <= 0:
+            raise ValueError("T must be >= 1")
+
+        in_dtype = x.dtype
+        mean_f32 = x.sum(dim=1, dtype=torch.float32) * (1.0 / float(T))  # (N,C) fp32
+        mean_pool = mean_f32.to(dtype=in_dtype)  # (N,C)
+        max_pool = x.amax(dim=1)  # (N,C)
+        return mean_pool, max_pool
+
+    @staticmethod
+    def _compute_boundary_valid_flags(
+        lanes_xy_and_offsets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """좌/우 경계 정보가 있는지(점 단위) bool로 만듭니다.
+
+        Args:
+            lanes_xy_and_offsets:
+                - shape (N, T, 8) 또는 (B, N, T, 8) 처럼 마지막이 최소 8이어야 함
+                - 마지막 8차원은 [x,y,yaw?,... , left_dx,left_dy,right_dx,right_dy]처럼
+                  (여기서는 4:6이 left, 6:8이 right라고 가정)
+
+        Returns:
+            left_is_valid:  shape (..., T) bool
+            right_is_valid: shape (..., T) bool
+        """
+        if lanes_xy_and_offsets.dim() not in (3, 4):
+            raise ValueError(
+                f"lanes_xy_and_offsets must be 3D or 4D. got {tuple(lanes_xy_and_offsets.shape)}"
+            )
+        if int(lanes_xy_and_offsets.shape[-1]) < 8:
+            raise ValueError(
+                f"lanes_xy_and_offsets last dim must be >= 8. got {tuple(lanes_xy_and_offsets.shape)}"
+            )
+
+        left_is_valid = (lanes_xy_and_offsets[..., 4:6] != 0).any(dim=-1)
+        right_is_valid = (lanes_xy_and_offsets[..., 6:8] != 0).any(dim=-1)
+        return left_is_valid, right_is_valid
+
+    @staticmethod
+    def _get_lane_feature(lane_xyyaw: torch.Tensor) -> torch.Tensor:
+        """lane_pos(4) + type_onehot(5) -> feature(9)
+
+        Args:
+            lane_xyyaw:
+                shape (B, L, 4)  (x,y,cos,sin)
+
+        Returns:
+            lane_feature:
+                shape (B, L, 9)
+        """
+        if lane_xyyaw.dim() != 3 or int(lane_xyyaw.shape[-1]) != 4:
+            raise ValueError(f"lane_xyyaw must be (B, L, 4). got {tuple(lane_xyyaw.shape)}")
+
+        B, L, _ = lane_xyyaw.shape
+        lane_type = torch.zeros((B, L, 5), device=lane_xyyaw.device, dtype=lane_xyyaw.dtype)
+        lane_type[:, :, 3] = 1.0
+        return torch.cat([lane_xyyaw, lane_type], dim=-1)  # (B,L,9)
+
+    def _select_optional_lane_attribute_features(
+        self,
+        lane_attribute: Optional[torch.Tensor],  # (B, lane_num, F) or None
+        valid_idx: torch.Tensor,                 # (num_valid,)  flatten index
+        batch_size: int,
+        lane_num: int,
+        feat_dim: int,
+        out_dtype: torch.dtype,
+        out_device: torch.device,
+        name: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """선택 입력에서 valid lane에 해당하는 값만 뽑습니다.
+
+        Args:
+            lane_attribute: (B, lane_num, F) 또는 None
+            valid_idx: (num_valid,) flatten(B*lane_num) 기준 인덱스
+            batch_size: B
+            lane_num: lane_num
+            feat_dim: F
+            out_dtype/out_device: 반환 dtype/device
+            name: 에러 메시지용
+
+        Returns:
+            feat_valid: (num_valid, F)
+            enabled:    () 스칼라 텐서 (0 또는 1)
+        """
+        if valid_idx.dtype != torch.long:
+            valid_idx = valid_idx.to(torch.long)
+        if valid_idx.device != out_device:
+            valid_idx = valid_idx.to(device=out_device)
+
+        enabled_off = torch.zeros((), device=out_device, dtype=out_dtype)
+        enabled_on = torch.ones((), device=out_device, dtype=out_dtype)
+
+        num_valid = int(valid_idx.numel())
+        if lane_attribute is None:
+            feat_zero = torch.zeros((num_valid, int(feat_dim)), device=out_device, dtype=out_dtype)
+            return feat_zero, enabled_off
+
+        if lane_attribute.dim() != 3:
+            raise ValueError(f"{name} must be (B, lane_num, F). got {tuple(lane_attribute.shape)}")
+        if int(lane_attribute.shape[0]) != int(batch_size) or int(lane_attribute.shape[1]) != int(lane_num):
+            raise ValueError(
+                f"{name} shape mismatch. expected (B={batch_size}, lane_num={lane_num}, F={feat_dim}), "
+                f"got {tuple(lane_attribute.shape)}"
+            )
+        if int(lane_attribute.shape[2]) != int(feat_dim):
+            raise ValueError(f"{name} last dim mismatch. expected F={feat_dim}, got {int(lane_attribute.shape[2])}")
+
+        lane_attribute = lane_attribute.to(device=out_device, dtype=out_dtype)  # (B,lane_num,F)
+        flat = lane_attribute.reshape(int(batch_size) * int(lane_num), int(feat_dim))  # (B*lane_num,F)
+        feat_valid = flat.index_select(0, valid_idx)  # (num_valid,F)
+        return feat_valid, enabled_on
+
+    def _embed_lane_attrs_with_single_linear(
+        self,
+        traffic_valid: torch.Tensor,                       # (num_valid, 4)
+        lane_type: Optional[torch.Tensor],                 # (B, lane_num, 4) or None
+        left_line_type: Optional[torch.Tensor],            # (B, lane_num, 13) or None
+        right_line_type: Optional[torch.Tensor],           # (B, lane_num, 13) or None
+        valid_idx: torch.Tensor,                           # (num_valid,)
+        batch_size: int,
+        lane_num: int,
+        out_dtype: torch.dtype,
+        out_device: torch.device,
+    ) -> torch.Tensor:
+        """lane_type/left/right/traffic를 한 번의 F.linear로 (num_valid, C)로 만듭니다.
+
+        Returns:
+            (num_valid, C)  C=self._channel
+        """
+        if valid_idx.dtype != torch.long:
+            valid_idx = valid_idx.to(torch.long)
+        if valid_idx.device != out_device:
+            valid_idx = valid_idx.to(device=out_device)
+
+        num_valid = int(valid_idx.numel())
+        C = int(self._channel)
+
+        if num_valid == 0:
+            return torch.zeros((0, C), device=out_device, dtype=out_dtype)
+
+        if traffic_valid.shape != (num_valid, 4):
+            raise ValueError(f"traffic_valid must be (num_valid, 4). got {tuple(traffic_valid.shape)}")
+
+        traffic_x = traffic_valid.to(device=out_device, dtype=out_dtype)  # (num_valid,4)
+
+        lane_x, lane_enabled = self._select_optional_lane_attribute_features(
+            lane_attribute=lane_type,
+            valid_idx=valid_idx,
+            batch_size=batch_size,
+            lane_num=lane_num,
+            feat_dim=4,
+            out_dtype=out_dtype,
+            out_device=out_device,
+            name="lane_type",
+        )  # (num_valid,4), ()
+
+        left_x, left_enabled = self._select_optional_lane_attribute_features(
+            lane_attribute=left_line_type,
+            valid_idx=valid_idx,
+            batch_size=batch_size,
+            lane_num=lane_num,
+            feat_dim=13,
+            out_dtype=out_dtype,
+            out_device=out_device,
+            name="left_line_type",
+        )  # (num_valid,13), ()
+
+        right_x, right_enabled = self._select_optional_lane_attribute_features(
+            lane_attribute=right_line_type,
+            valid_idx=valid_idx,
+            batch_size=batch_size,
+            lane_num=lane_num,
+            feat_dim=13,
+            out_dtype=out_dtype,
+            out_device=out_device,
+            name="right_line_type",
+        )  # (num_valid,13), ()
+
+        one = torch.ones((), device=out_device, dtype=out_dtype)
+
+        gate_lane = self.lane_type_alpha.to(dtype=out_dtype, device=out_device) * lane_enabled
+        gate_left = self.left_line_type_alpha.to(dtype=out_dtype, device=out_device) * left_enabled
+        gate_right = self.right_line_type_alpha.to(dtype=out_dtype, device=out_device) * right_enabled
+        gate_traffic = one
+
+        # weight: (C, in_dim), bias: (C,)
+        w_lane = self.lane_type_emb.weight.to(device=out_device, dtype=out_dtype) * gate_lane
+        b_lane = (self.lane_type_emb.bias.to(device=out_device, dtype=out_dtype)
+                  if self.lane_type_emb.bias is not None else torch.zeros((C,), device=out_device, dtype=out_dtype)) * gate_lane
+
+        w_left = self.left_line_type_emb.weight.to(device=out_device, dtype=out_dtype) * gate_left
+        b_left = (self.left_line_type_emb.bias.to(device=out_device, dtype=out_dtype)
+                  if self.left_line_type_emb.bias is not None else torch.zeros((C,), device=out_device, dtype=out_dtype)) * gate_left
+
+        w_right = self.right_line_type_emb.weight.to(device=out_device, dtype=out_dtype) * gate_right
+        b_right = (self.right_line_type_emb.bias.to(device=out_device, dtype=out_dtype)
+                   if self.right_line_type_emb.bias is not None else torch.zeros((C,), device=out_device, dtype=out_dtype)) * gate_right
+
+        w_traffic = self.traffic_emb.weight.to(device=out_device, dtype=out_dtype) * gate_traffic
+        b_traffic = (self.traffic_emb.bias.to(device=out_device, dtype=out_dtype)
+                     if self.traffic_emb.bias is not None else torch.zeros((C,), device=out_device, dtype=out_dtype)) * gate_traffic
+
+        # (num_valid, 34) = [lane(4), left(13), right(13), traffic(4)]
+        x_concat = torch.cat([lane_x, left_x, right_x, traffic_x], dim=-1)  # (num_valid,34)
+        w_concat = torch.cat([w_lane, w_left, w_right, w_traffic], dim=1)   # (C,34)
+        b_total = b_lane + b_left + b_right + b_traffic                     # (C,)
+
+        out = F.linear(x_concat, w_concat, b_total)  # (num_valid,C)
+        return out
 
 
     def forward(
