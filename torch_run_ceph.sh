@@ -52,7 +52,8 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "wosac_final_0204" \
   --batch_size 1280 \
-  --learning_rate 7e-4 \
+  --learning_rate 1e-3 \
+  --min_learning_rate 1e-6 \
   --profile_feasible False \
   --feasible_stride_dt 0.1
 
