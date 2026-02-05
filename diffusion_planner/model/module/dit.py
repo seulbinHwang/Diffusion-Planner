@@ -42,6 +42,197 @@ except Exception as _e1:
         _FA2_IMPORT_ERR = Exception(
             f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
+import inspect
+from typing import Any, Dict, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ============================================================
+# (추가) 빠른 LayerNorm / 빠른 MLP를 "있으면 쓰고, 없으면 안전하게 복귀"하기 위한 유틸
+# ============================================================
+
+# ---- flash-attn fused LayerNorm (선택) ----
+try:
+    from flash_attn.ops.layer_norm import layer_norm as _flash_layer_norm  # type: ignore
+except Exception:
+    try:
+        # 일부 빌드/버전에서 이름이 다를 수 있어 백업
+        from flash_attn.ops.layer_norm import layer_norm_fn as _flash_layer_norm  # type: ignore
+    except Exception:
+        _flash_layer_norm = None
+
+# ---- flash-attn fused Dense+GELU+Dense (선택) ----
+try:
+    from flash_attn.ops.fused_dense import fused_dense_gelu_dense as _flash_fused_dense_gelu_dense  # type: ignore
+except Exception:
+    _flash_fused_dense_gelu_dense = None
+
+# fused_dense_gelu_dense가 받는 추가 인자(버전별 차이)를 미리 파악해 둠
+_FUSED_DGDD_KWARGS: Dict[str, Any] = {}
+if _flash_fused_dense_gelu_dense is not None:
+    try:
+        sig = inspect.signature(_flash_fused_dense_gelu_dense)
+        params = sig.parameters
+        if "checkpoint_lvl" in params:
+            _FUSED_DGDD_KWARGS["checkpoint_lvl"] = 0
+        if "heuristic" in params:
+            _FUSED_DGDD_KWARGS["heuristic"] = 0
+        if "save_pre_act" in params:
+            _FUSED_DGDD_KWARGS["save_pre_act"] = False
+    except Exception:
+        _FUSED_DGDD_KWARGS = {}
+
+
+def _is_cuda_fp16_or_bf16(x: torch.Tensor) -> bool:
+    """GPU에서 작은 dtype(fp16/bf16)로 계산 중인지 확인합니다.
+
+    Args:
+        x (torch.Tensor): 임의 텐서. shape: 임의
+
+    Returns:
+        bool: CUDA + (float16 또는 bfloat16) 이면 True
+    """
+    return bool(x.is_cuda and x.dtype in (torch.float16, torch.bfloat16))
+
+
+def _fast_layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
+    """LayerNorm을 가능한 빠른 경로로 실행합니다.
+
+    동작:
+        1) flash-attn의 LayerNorm 함수가 있고, GPU + fp16/bf16이면 그걸 먼저 시도합니다.
+        2) 실패하거나 조건이 안 맞으면, PyTorch의 layer_norm으로 안전하게 실행합니다.
+
+    Args:
+        x (torch.Tensor): 입력 텐서. shape: (..., D)
+        ln (nn.LayerNorm): LayerNorm 모듈. (weight/bias/eps 사용)
+
+    Returns:
+        torch.Tensor: 정규화 결과. shape: (..., D)
+    """
+    if x.numel() == 0:
+        # 빈 텐서는 그대로 처리(안전)
+        return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
+
+    if _flash_layer_norm is not None and _is_cuda_fp16_or_bf16(x):
+        # flash-attn layer_norm은 버전/빌드에 따라 인자명이 다를 수 있어 2가지 형태로 시도
+        try:
+            return _flash_layer_norm(x, ln.weight, ln.bias, ln.eps)  # type: ignore[misc]
+        except TypeError:
+            try:
+                return _flash_layer_norm(x, ln.weight, ln.bias, eps=ln.eps)  # type: ignore[misc]
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # 기본 경로(항상 동작)
+    return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
+
+
+def _fast_modulated_layer_norm(
+    x: torch.Tensor,               # shape: (..., D)
+    ln: nn.LayerNorm,
+    delta_scale: torch.Tensor,     # shape: (..., D)
+    shift: torch.Tensor,           # shape: (..., D)
+) -> torch.Tensor:
+    """LayerNorm 이후에 (1+delta_scale)과 shift를 적용합니다.
+
+    계산식(그대로 유지):
+        y = LayerNorm(x)
+        out = y * (1 + delta_scale) + shift
+
+    구현(속도 목적):
+        - (1 + delta_scale) 를 따로 만들지 않고,
+          y*(1+ds) = y + ds*y 로 바꿔서 addcmul로 처리합니다.
+        - 이렇게 하면 작은 텐서에서 GPU 호출 횟수를 줄일 수 있습니다.
+
+    Args:
+        x (torch.Tensor): 입력. shape: (..., D)
+        ln (nn.LayerNorm): 정규화 모듈
+        delta_scale (torch.Tensor): 스케일 보정. shape: (..., D)
+        shift (torch.Tensor): 이동 보정. shape: (..., D)
+
+    Returns:
+        torch.Tensor: 보정된 출력. shape: (..., D)
+    """
+    # y: (..., D)
+    y = _fast_layer_norm(x, ln)
+
+    # dtype/device 맞추기(이미 같으면 복사 없음)
+    if delta_scale.device != y.device or delta_scale.dtype != y.dtype:
+        delta_scale = delta_scale.to(device=y.device, dtype=y.dtype)
+    if shift.device != y.device or shift.dtype != y.dtype:
+        shift = shift.to(device=y.device, dtype=y.dtype)
+
+    # y*(1+ds) = y + ds*y  (addcmul 1회)
+    y_scaled = torch.addcmul(y, delta_scale, y)  # (..., D)
+
+    # + shift (1회)
+    out = y_scaled + shift  # (..., D)
+    return out
+
+
+def _fast_mlp_gelu(
+    x: torch.Tensor,      # shape: (..., D)
+    mlp: nn.Module,
+) -> torch.Tensor:
+    """Linear -> GELU -> Linear 형태 MLP를 가능한 빠른 경로로 실행합니다.
+
+    동작:
+        1) flash-attn fused 함수가 있고, 입력/가중치 dtype이 fp16/bf16이면 fused를 시도합니다.
+        2) 조건이 안 맞거나 실패하면, 기존 mlp(x)로 실행합니다.
+
+    Args:
+        x (torch.Tensor): 입력. shape: (..., D)
+        mlp (nn.Module): timm Mlp 같은 형태를 기대합니다.
+            - mlp.fc1, mlp.fc2 (nn.Linear)가 있어야 합니다.
+
+    Returns:
+        torch.Tensor: 출력. shape: (..., D_out)
+    """
+    if _flash_fused_dense_gelu_dense is None:
+        return mlp(x)
+
+    if x.numel() == 0:
+        return mlp(x)
+
+    if not _is_cuda_fp16_or_bf16(x):
+        return mlp(x)
+
+    # timm.Mlp 호환: fc1/fc2가 있어야 함
+    if not (hasattr(mlp, "fc1") and hasattr(mlp, "fc2")):
+        return mlp(x)
+
+    fc1 = getattr(mlp, "fc1")
+    fc2 = getattr(mlp, "fc2")
+    if not (isinstance(fc1, nn.Linear) and isinstance(fc2, nn.Linear)):
+        return mlp(x)
+
+    # fused_dense는 보통 가중치 dtype이 입력과 같아야 안정적입니다.
+    if fc1.weight.dtype != x.dtype or fc2.weight.dtype != x.dtype:
+        return mlp(x)
+    if (fc1.weight.device != x.device) or (fc2.weight.device != x.device):
+        return mlp(x)
+
+    # x_2d: (N, D)
+    orig_shape = tuple(int(s) for s in x.shape)
+    x_2d = x.reshape(-1, orig_shape[-1])
+
+    # fused 실행
+    try:
+        y_2d = _flash_fused_dense_gelu_dense(  # type: ignore[misc]
+            x_2d,
+            fc1.weight, fc1.bias,
+            fc2.weight, fc2.bias,
+            **_FUSED_DGDD_KWARGS,
+        )  # (N, D_out)
+    except Exception:
+        return mlp(x)
+
+    # 원래 shape로 복원: (..., D_out)
+    out_shape = orig_shape[:-1] + (int(y_2d.shape[-1]),)
+    return y_2d.reshape(out_shape)
 
 
 # ===========================================================
@@ -647,13 +838,16 @@ class DiTBlock(nn.Module):
             cu_seqlens_q: torch.Tensor,  # (B+1,) int32
             max_seqlen_q: int,
             cross_kv_cache: FlashAttnKVCache,
-            pram_v2_modulations: Dict[str,
-                                      ModulationTriplet],  # 값 텐서 shape: (Tq, D)
+            pram_v2_modulations: Dict[str, ModulationTriplet],
+            # 값 텐서 shape: (Tq, D)
     ) -> torch.Tensor:
         """블록 전체를 (Tq, D) packed 토큰에서만 수행합니다.
 
-        - LayerNorm/MLP까지 전부 유효 토큰만 계산합니다.
-        - Cross-Attn의 KV(scene 토큰)는 캐시된 kv_unpad/cu_k/max_k를 재사용합니다.
+        변경점(속도 목적):
+            - LayerNorm은 가능하면 flash-attn 경로로 실행합니다(없으면 기존 경로).
+            - y*(1+ds)+sh 는 addcmul을 이용해 적은 호출로 계산합니다.
+            - x + g*f 도 addcmul로 계산해 호출 수를 줄입니다.
+            - MLP는 가능하면 flash-attn fused 경로를 사용합니다(없으면 기존 timm Mlp).
 
         Args:
             x_unpad: (Tq, D) 유효 에이전트 토큰
@@ -672,47 +866,81 @@ class DiTBlock(nn.Module):
 
         # ----- SA -----
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
-        y = self.norm1(x_unpad)  # (Tq, D)
-        ds = sa_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = sa_mod.shift.to(dtype=y.dtype, device=y.device)
-        y_tilde = y * (1.0 + ds) + sh
+
+        # y_tilde: (Tq, D)
+        y_tilde = _fast_modulated_layer_norm(
+            x=x_unpad,  # (Tq, D)
+            ln=self.norm1,  # LayerNorm 파라미터 그대로 사용
+            delta_scale=sa_mod.delta_scale,  # (Tq, D)
+            shift=sa_mod.shift,  # (Tq, D)
+        )
+
+        # f_sa: (Tq, D)
         f_sa = self._self_attn_flash_varlen_packed(
             x_unpad=y_tilde,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
         )
-        g = sa_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_sa
+
+        # x = x + g * f_sa  (addcmul 1회)
+        g_sa = sa_mod.gate
+        if g_sa.device != x_unpad.device or g_sa.dtype != x_unpad.dtype:
+            g_sa = g_sa.to(device=x_unpad.device, dtype=x_unpad.dtype)
+        x_unpad = torch.addcmul(x_unpad, g_sa, f_sa)  # (Tq, D)
 
         # ----- FFN(MLP1) -----
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
-        y = self.norm2(x_unpad)
-        ds = ffn_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = ffn_mod.shift.to(dtype=y.dtype, device=y.device)
-        y_tilde = y * (1.0 + ds) + sh
-        f_ffn = self.mlp1(y_tilde)
-        g = ffn_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_ffn
+
+        y_tilde = _fast_modulated_layer_norm(
+            x=x_unpad,  # (Tq, D)
+            ln=self.norm2,
+            delta_scale=ffn_mod.delta_scale,  # (Tq, D)
+            shift=ffn_mod.shift,  # (Tq, D)
+        )
+
+        # f_ffn: (Tq, D)
+        f_ffn = _fast_mlp_gelu(y_tilde, self.mlp1)
+
+        # x = x + g * f_ffn  (addcmul 1회)
+        g_ffn = ffn_mod.gate
+        if g_ffn.device != x_unpad.device or g_ffn.dtype != x_unpad.dtype:
+            g_ffn = g_ffn.to(device=x_unpad.device, dtype=x_unpad.dtype)
+        x_unpad = torch.addcmul(x_unpad, g_ffn, f_ffn)  # (Tq, D)
 
         # ----- CA -----
         ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
-        y = self.norm3(x_unpad)
-        ds = ca_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = ca_mod.shift.to(dtype=y.dtype, device=y.device)
-        q_styled = y * (1.0 + ds) + sh
+
+        q_styled = _fast_modulated_layer_norm(
+            x=x_unpad,  # (Tq, D)
+            ln=self.norm3,
+            delta_scale=ca_mod.delta_scale,  # (Tq, D)
+            shift=ca_mod.shift,  # (Tq, D)
+        )
+
+        # f_ca: (Tq, D)
         f_ca = self._cross_attn_flash_varlen_packed(
             q_unpad=q_styled,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             kv_cache=cross_kv_cache,
         )
-        g = ca_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_ca
+
+        # x = x + g * f_ca  (addcmul 1회)
+        g_ca = ca_mod.gate
+        if g_ca.device != x_unpad.device or g_ca.dtype != x_unpad.dtype:
+            g_ca = g_ca.to(device=x_unpad.device, dtype=x_unpad.dtype)
+        x_unpad = torch.addcmul(x_unpad, g_ca, f_ca)  # (Tq, D)
 
         # ----- MLP2 -----
-        x_unpad = x_unpad + self.gate_mlp2.to(
-            dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(
-                self.norm4(x_unpad))
+        # norm4도 가능한 빠른 경로로
+        y4 = _fast_layer_norm(x_unpad, self.norm4)  # (Tq, D)
+        mlp2_out = _fast_mlp_gelu(y4, self.mlp2)  # (Tq, D)
+
+        # 게이트는 학습되는 파라미터라 item()로 빼면 안 됩니다.
+        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype,
+                                  device=x_unpad.device)  # shape: ()
+        x_unpad = x_unpad + gate2 * mlp2_out  # (Tq, D)
+
         return x_unpad
 
     def _apply_modulated_mlp1(
