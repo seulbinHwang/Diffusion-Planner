@@ -1225,6 +1225,128 @@ class SelfAttentionBlock(nn.Module):
     # (중간 유틸 함수들은 기존 그대로 두면 됩니다: _get_compute_dtype, _unpad_from_mask, _pad_to_batch, ...)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _get_compute_dtype(x: torch.Tensor) -> torch.dtype:
+        """어텐션 내부 계산 dtype을 결정합니다."""
+        if torch.is_autocast_enabled():
+            try:
+                return torch.get_autocast_gpu_dtype()
+            except Exception:
+                pass
+        return x.dtype
+
+    def _unpad_from_mask(
+        self,
+        x: torch.Tensor,      # (B, L, H)
+        mask: torch.Tensor,   # (B, L) True=pad
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """(B,L,H) -> (T,H) 유효 토큰만 모으고 복원 정보도 함께 반환."""
+        if mask.dtype != torch.bool:
+            mask = mask.to(torch.bool)
+
+        # unpad_input은 True=유효 마스크를 받습니다.
+        attention_mask = (~mask).to(torch.bool)  # (B,L) True=유효
+        res = unpad_input(x, attention_mask)
+
+        if len(res) == 4:
+            x_unpad, indices, cu_seqlens, max_seqlen = res
+        elif len(res) == 5:
+            x_unpad, indices, cu_seqlens, max_seqlen, _seqlens = res
+        else:
+            raise RuntimeError(f"unpad_input() return format is unexpected. len={len(res)}")
+
+        max_seqlen_int = int(max_seqlen) if not isinstance(max_seqlen, int) else max_seqlen
+        return x_unpad, indices, cu_seqlens, max_seqlen_int
+
+    @staticmethod
+    def _pad_to_batch(
+        x_unpad: torch.Tensor,   # (T, H)
+        indices: torch.Tensor,   # (T,)
+        batch_size: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """(T,H) -> (B,L,H)로 복원합니다. 패딩 위치는 0으로 채웁니다."""
+        return pad_input(x_unpad, indices, int(batch_size), int(seq_len))
+
+    def _touch_params_zero_output(self, ref: torch.Tensor) -> torch.Tensor:
+        """ref와 같은 shape의 0 텐서를 만들되, 파라미터들을 0계수로 연결합니다."""
+        out = ref.new_zeros(ref.shape)
+        touch = out.new_zeros(())
+        for p in self.parameters():
+            touch = touch + p.view(-1)[:1].sum().to(out.dtype)
+        return out + touch * 0.0
+
+    def _drop_path_varlen(
+        self,
+        x_unpad: torch.Tensor,      # (T, H)
+        cu_seqlens: torch.Tensor,   # (B+1,)
+    ) -> torch.Tensor:
+        """(T,H) 토큰들에 DropPath를 배치 단위 동일 마스크처럼 적용."""
+        if (not self.training) or (float(getattr(self, "_drop_path_p", 0.0)) <= 0.0):
+            return x_unpad
+
+        T = int(x_unpad.shape[0])
+        if T == 0:
+            return x_unpad
+
+        B = int(cu_seqlens.numel() - 1)
+        if B <= 0:
+            return x_unpad
+
+        keep_prob = 1.0 - float(self._drop_path_p)
+        if keep_prob <= 0.0:
+            return x_unpad.new_zeros(x_unpad.shape)
+
+        rnd = torch.rand((B,), device=x_unpad.device, dtype=torch.float32)  # (B,)
+        keep_mask = (rnd < keep_prob).to(torch.float32)  # (B,) 0/1
+
+        scale_by_keep = bool(getattr(self, "_drop_path_scale_by_keep", True))
+        if scale_by_keep:
+            keep_mask = keep_mask / keep_prob
+
+        boundaries = cu_seqlens[1:].to(device=x_unpad.device, dtype=torch.int64)  # (B,)
+        positions = torch.arange(T, device=x_unpad.device, dtype=torch.int64)     # (T,)
+        batch_ids = torch.bucketize(positions, boundaries, right=True)            # (T,) in [0..B-1]
+
+        token_scale = keep_mask.to(dtype=x_unpad.dtype)[batch_ids]  # (T,)
+        return x_unpad * token_scale.unsqueeze(-1)                  # (T,H)
+
+    def _self_attn_flash_varlen_unpadded(
+        self,
+        x_unpad: torch.Tensor,      # (T, H)
+        cu_seqlens: torch.Tensor,   # (B+1,)
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """unpad된 토큰에 대해 FlashAttention(varlen) self-attention."""
+        if not globals().get("_FA2_AVAILABLE", False):
+            raise RuntimeError("FlashAttention-2(varlen) is not available.")
+
+        T, D = x_unpad.shape
+        if T == 0 or max_seqlen == 0:
+            return x_unpad.new_zeros((T, D)) + self._touch_params_zero_output(x_unpad.new_zeros((1,))).sum() * 0.0
+
+        qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
+        qkv = qkv.view(T, 3, self.num_heads, self.head_dim)  # (T,3,Hh,Hd)
+
+        comp_dtype = self._get_compute_dtype(qkv)
+        qkv = qkv.to(comp_dtype)
+
+        cu = cu_seqlens.to(device=qkv.device, dtype=torch.int32)
+
+        out = flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_seqlens=cu,
+            max_seqlen=int(max_seqlen),
+            dropout_p=float(self._attn_dropout_p) if self.training else 0.0,
+            softmax_scale=None,
+            causal=False,
+        )  # (T, Hh, Hd)
+
+        out = out.reshape(T, self.num_heads * self.head_dim)  # (T,D)
+        out = self.out_proj(out.to(x_unpad.dtype))            # (T,D)
+        return out.to(x_unpad.dtype)
+
+
     def _forward_fallback_mha(
             self,
             x: torch.Tensor,  # (B, L, H)
