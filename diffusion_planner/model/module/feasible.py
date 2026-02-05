@@ -2909,27 +2909,22 @@ class FeasibleProjector(nn.Module):
     ) -> torch.Tensor:
         """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일.
 
-        변경점:
-            - Gate를 시간마다(T) 계산하지 않고,
-              (B,Pnn,3) 한 번만 계산한 뒤 시간축으로 복사합니다.
-            - Gate 입력은 '유효 구간'만 대상으로 Z_tcn을 시간축 평균낸 값입니다.
-            - config.feasible_gate_agentwise=False 로 두면 예전 방식(시간별 Gate)로 동작합니다.
-
-        Args:
-            Z_tcn (torch.Tensor):
-                shape: (B, Pnn, T, C)
-            seg_mask_1 (torch.Tensor):
-                shape: (B, Pnn, T, 1)
-
-        Returns:
-            torch.Tensor:
-                delta_u shape: (B, Pnn, T, 3)
+        변경점(요청 반영):
+            - 무효 구간 마스킹을 `* 0` 대신 `masked_fill(..., 0.0)`로 수행합니다.
+            - 적용 위치:
+                1) delta_u_raw 계산 직후
+                2) gate_logits 계산 직후(softplus 전에)
         """
         B, Pnn, T, C = Z_tcn.shape
         B_Pnn = int(B * Pnn)
 
-        # seg_mask: (B,Pnn,T,1) float(0/1)
-        seg_mask = seg_mask_1.to(dtype=Z_tcn.dtype, device=Z_tcn.device)
+        # float 마스크(평균 계산 등에 사용)
+        seg_mask = seg_mask_1.to(dtype=Z_tcn.dtype,
+                                 device=Z_tcn.device)  # (B,Pnn,T,1)
+
+        # bool 마스크(안전한 0 처리용)
+        seg_mask_bool = self._to_bool_mask(seg_mask_1)  # (B,Pnn,T,1) bool
+        mask3 = seg_mask_bool.expand(-1, -1, -1, 3)  # (B,Pnn,T,3) bool
 
         # -----------------------
         # Head: (B*Pnn, C, T) -> (B*Pnn, 3, T)
@@ -2940,7 +2935,9 @@ class FeasibleProjector(nn.Module):
 
         # delta_u_raw: (B,Pnn,T,3)
         delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T), 3)
-        delta_u_raw = delta_u_raw * seg_mask  # 무효 구간은 0 고정
+
+        # ✅ 여기 1) 기존: delta_u_raw = delta_u_raw * seg_mask
+        delta_u_raw = delta_u_raw.masked_fill(~mask3, 0.0)
 
         # -----------------------
         # Gate
@@ -2949,25 +2946,29 @@ class FeasibleProjector(nn.Module):
             # (B,Pnn,C): 유효 구간만으로 시간축 평균
             gate_in = self._masked_time_mean(
                 seq_bptc=Z_tcn.detach(),  # (B,Pnn,T,C)
-                seg_mask_1=seg_mask,  # (B,Pnn,T,1)
+                seg_mask_1=seg_mask,  # (B,Pnn,T,1) float
                 eps=float(self._eps),
-            )
+            )  # (B,Pnn,C)
 
             # (B,Pnn,3): 이웃별로 1번만 계산
-            gate_logits_agent = self.gate_mlp(gate_in)
+            gate_logits_agent = self.gate_mlp(gate_in)  # (B,Pnn,3)
 
             # (B,Pnn,T,3): 시간축으로 복사
-            gate_logits = gate_logits_agent.unsqueeze(2).expand(
-                -1, -1, int(T), -1)
+            gate_logits = gate_logits_agent.unsqueeze(2).expand(-1, -1, int(T),
+                                                                -1)
         else:
-            # 기존 방식: 시간별로 Gate 계산 (B,Pnn,T,3)
+            # (B,Pnn,T,3): 시간별로 Gate 계산
             gate_logits = self.gate_mlp(Z_tcn.detach())
 
-        # 무효 구간은 0으로 맞춰 두기(출력은 어차피 0이지만 모양/의미를 맞춤)
-        gate_logits = gate_logits * seg_mask  # (B,Pnn,T,3)
+        # ✅ 여기 2) 기존: gate_logits = gate_logits * seg_mask
+        gate_logits = gate_logits.masked_fill(~mask3, 0.0)
 
         gate_scale = F.softplus(gate_logits)  # (B,Pnn,T,3)
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
+
+        # (선택) 최종 결과도 한번 더 0 보장(모양/의미 정리용)
+        delta_u = delta_u.masked_fill(~mask3, 0.0)
+
         return delta_u
 
     def _build_per_agent_limits(
