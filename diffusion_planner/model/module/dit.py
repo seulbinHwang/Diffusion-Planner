@@ -42,6 +42,7 @@ except Exception as _e1:
         _FA2_IMPORT_ERR = Exception(
             f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
+
 import inspect
 from typing import Any, Dict, Tuple
 import torch
@@ -83,52 +84,63 @@ if _flash_fused_dense_gelu_dense is not None:
     except Exception:
         _FUSED_DGDD_KWARGS = {}
 
+try:
+    from flash_attn.ops.triton.layer_norm import layer_norm_fn as _triton_layer_norm_fn  # type: ignore
+    _TRITON_LN_AVAILABLE = True
+except Exception:
+    _triton_layer_norm_fn = None
+    _TRITON_LN_AVAILABLE = False
+
 
 def _is_cuda_fp16_or_bf16(x: torch.Tensor) -> bool:
-    """GPU에서 작은 dtype(fp16/bf16)로 계산 중인지 확인합니다.
-
-    Args:
-        x (torch.Tensor): 임의 텐서. shape: 임의
-
-    Returns:
-        bool: CUDA + (float16 또는 bfloat16) 이면 True
-    """
     return bool(x.is_cuda and x.dtype in (torch.float16, torch.bfloat16))
 
 
 def _fast_layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
-    """LayerNorm을 가능한 빠른 경로로 실행합니다.
+    """LayerNorm을 Triton 경로로 우선 처리합니다.
 
-    동작:
-        1) flash-attn의 LayerNorm 함수가 있고, GPU + fp16/bf16이면 그걸 먼저 시도합니다.
-        2) 실패하거나 조건이 안 맞으면, PyTorch의 layer_norm으로 안전하게 실행합니다.
+    목표:
+        - flash_attn.ops.layer_norm(CUDA 확장 LN)을 타지 않게 함
+        - 5090(sm_120)에서도 런타임 에러 없이 동작
 
     Args:
-        x (torch.Tensor): 입력 텐서. shape: (..., D)
-        ln (nn.LayerNorm): LayerNorm 모듈. (weight/bias/eps 사용)
+        x: (..., D)
+        ln: nn.LayerNorm (weight/bias/eps 사용)
 
     Returns:
-        torch.Tensor: 정규화 결과. shape: (..., D)
+        (..., D)
     """
     if x.numel() == 0:
-        # 빈 텐서는 그대로 처리(안전)
         return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
 
-    if _flash_layer_norm is not None and _is_cuda_fp16_or_bf16(x):
-        # flash-attn layer_norm은 버전/빌드에 따라 인자명이 다를 수 있어 2가지 형태로 시도
+    if _TRITON_LN_AVAILABLE and _is_cuda_fp16_or_bf16(x):
+        w = ln.weight
+        b = ln.bias
+
+        # Triton LN은 weight/bias dtype/device가 입력과 맞을 때가 안전합니다(작아서 비용 작음)
+        if w is not None and (w.device != x.device or w.dtype != x.dtype):
+            w = w.to(device=x.device, dtype=x.dtype)
+        if b is not None and (b.device != x.device or b.dtype != x.dtype):
+            b = b.to(device=x.device, dtype=x.dtype)
+
         try:
-            return _flash_layer_norm(x, ln.weight, ln.bias, ln.eps)  # type: ignore[misc]
-        except TypeError:
-            try:
-                return _flash_layer_norm(x, ln.weight, ln.bias, eps=ln.eps)  # type: ignore[misc]
-            except Exception:
-                pass
+            y = _triton_layer_norm_fn(
+                x,
+                w,
+                b,
+                eps=float(ln.eps),
+                dropout_p=0.0,
+                is_rms_norm=False,
+            )
+            if isinstance(y, tuple):
+                y = y[0]
+            return y
         except Exception:
-            pass
+            # Triton LN이 어떤 이유로든 실패하면 안전 경로로 복귀
+            return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
 
-    # 기본 경로(항상 동작)
+    # 안전 경로
     return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
-
 
 def _fast_modulated_layer_norm(
     x: torch.Tensor,               # shape: (..., D)
