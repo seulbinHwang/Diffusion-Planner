@@ -18,6 +18,14 @@ from typing import Iterator
 import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
+from diffusion_planner.model.module.mixer import (
+    MixerBlock,
+    Conv1dMlp,
+    FastLayerNorm,
+    FastMlp,
+    FastLayerNormMlp,
+)
+
 
 # name -> 호출 횟수 / 누적 시간(ms)
 _PROFILE_CALL_COUNT: Dict[str, int] = {}
@@ -890,33 +898,25 @@ class Encoder(nn.Module):
     ) -> torch.Tensor:
         """토큰 임베딩에 위치 정보를 더해줍니다.
 
-        이 함수는 다음을 보장합니다.
+        보장:
         - 패딩 토큰(mask=True)은 위치 임베딩을 더하지 않습니다.
-        - 유효 토큰(mask=False)만 골라 pos_emb(Linear/MLP(9→H))를 적용합니다.
-        - pos_scale(스칼라)을 곱한 뒤 token_embeddings에 더합니다.
-        - ✅ (추가) 배치 전체가 패딩이라 유효 토큰이 0개여도,
-          pos_emb/pos_scale 파라미터가 해당 step에서 완전히 미사용이 되지 않도록
-          0계수로 그래프에 연결합니다. (출력 값은 동일)
+        - 유효 토큰(mask=False)만 골라 pos_emb(9→H)를 적용합니다.
+        - pos_scale(스칼라)을 곱해 token_embeddings에 더합니다.
+        - ✅ 유효 토큰이 0개인 step에서도 pos_emb/pos_scale 파라미터가
+          완전히 미사용 처리되지 않도록 0계수로 그래프에 연결합니다(출력 값은 동일).
 
         Args:
-            token_embeddings:
-                shape: (B, N, H)
-            token_pos:
-                shape: (B, N, 9)
-                [x,y,cos,sin] + type_onehot(5)
-            token_mask:
-                shape: (B, N)  True=패딩(무효)
+            token_embeddings: (B, N, H)
+            token_pos:        (B, N, 9)
+            token_mask:       (B, N) True=pad
 
         Returns:
-            torch.Tensor:
-                shape: (B, N, H)
-                위치 임베딩이 더해진 토큰 텐서
+            (B, N, H)
         """
         if token_mask.dtype != torch.bool:
             token_mask = token_mask.to(torch.bool)
 
-        if token_embeddings.dim() != 3 or token_pos.dim(
-        ) != 3 or token_mask.dim() != 2:
+        if token_embeddings.dim() != 3 or token_pos.dim() != 3 or token_mask.dim() != 2:
             raise ValueError(
                 f"Expected token_embeddings (B,N,H), token_pos (B,N,9), token_mask (B,N). "
                 f"got {tuple(token_embeddings.shape)}, {tuple(token_pos.shape)}, {tuple(token_mask.shape)}"
@@ -931,36 +931,41 @@ class Encoder(nn.Module):
                 f"token_mask must be (B, N). got {tuple(token_mask.shape)}")
 
         # (B*N,)
-        mask_flat: torch.Tensor = token_mask.reshape(-1)
+        mask_flat: torch.Tensor = token_mask.reshape(-1)  # True=pad
+        valid_flat: torch.Tensor = (~mask_flat)  # True=valid
+
         # (B*N, 9)
         pos_flat: torch.Tensor = token_pos.reshape(B * N, 9)
 
-        # 유효 토큰만 pos_emb 적용
-        if (~mask_flat).any().item():
-            pos_valid: torch.Tensor = self.pos_emb(
-                pos_flat[~mask_flat])  # (N_valid, H)
-            pos_valid = pos_valid.to(dtype=token_embeddings.dtype,
-                                     device=token_embeddings.device)
+        # 유효 토큰만 pos_emb 적용 (유효 0개면 빈 텐서로 자연스럽게 통과)
+        pos_valid_in: torch.Tensor = pos_flat[valid_flat]  # (N_valid, 9)
+        pos_valid: torch.Tensor = self.pos_emb(pos_valid_in)  # (N_valid, H)
 
-            scale: torch.Tensor = self.pos_scale.to(
-                dtype=token_embeddings.dtype, device=token_embeddings.device)
-            pos_valid = scale * pos_valid  # (N_valid, H)
+        pos_valid = pos_valid.to(dtype=token_embeddings.dtype,
+                                 device=token_embeddings.device)
+        scale: torch.Tensor = self.pos_scale.to(dtype=token_embeddings.dtype,
+                                                device=token_embeddings.device)
+        pos_valid = scale * pos_valid  # (N_valid, H)
 
-            pos_result_flat: torch.Tensor = torch.zeros(
-                (B * N, H),
-                device=token_embeddings.device,
-                dtype=token_embeddings.dtype,
-            )
-            pos_result_flat[~mask_flat] = pos_valid  # (B*N, H)
-            pos_result = pos_result_flat.view(B, N, H)  # (B, N, H)
-        else:
-            # ✅ 유효 토큰이 0개인 경우에도 pos_emb/pos_scale을 0계수로 연결해
-            # 분산 학습에서 "이번 스텝에 파라미터가 안 쓰였다" 문제를 줄입니다.
-            # 출력은 기존처럼 전부 0입니다.
-            touch_params = list(self.pos_emb.parameters()) + [self.pos_scale]
-            pos_result = self._zero_with_touch(
-                token_embeddings, touch_params)  # (B, N, H) zeros + touch*0
+        # scatter back: (B*N, H) -> (B, N, H)
+        pos_result_flat: torch.Tensor = torch.zeros(
+            (B * N, H),
+            device=token_embeddings.device,
+            dtype=token_embeddings.dtype,
+        )
+        pos_result_flat[valid_flat] = pos_valid  # 유효 0개면 no-op
+        pos_result: torch.Tensor = pos_result_flat.view(B, N, H)
 
+        # ✅ 항상 0계수로 파라미터 터치(출력 변화 없음, DDP unused param 예방)
+        touch_f32: torch.Tensor = torch.zeros((),
+                                              device=token_embeddings.device,
+                                              dtype=torch.float32)
+        for p in self.pos_emb.parameters():
+            touch_f32 = touch_f32 + p.view(-1)[:1].sum().float()
+        touch_f32 = touch_f32 + self.pos_scale.view(-1)[:1].sum().float()
+
+        pos_result = pos_result + touch_f32.to(
+            dtype=token_embeddings.dtype) * 0.0
         return token_embeddings + pos_result
 
     def _build_fusion_inputs(
@@ -1166,15 +1171,15 @@ class SelfAttentionBlock(nn.Module):
             self,
             dim=192,
             heads=8,
-            attn_drop_p: float = 0.0,  # 어텐션 드롭아웃
-            ffn_drop_p: float = 0.0,  # FFN 드롭아웃
-            drop_path_p: float = 0.0,  # Stochastic Depth
+            attn_drop_p: float = 0.0,
+            ffn_drop_p: float = 0.0,
+            drop_path_p: float = 0.0,
             mlp_ratio=4.0):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(dim)
+        # ✅ fused LayerNorm 우선 사용
+        self.norm1 = FastLayerNorm(dim)
 
-        # FlashAttention-2 사용 가능 여부에 따라 폴백(MHA) 준비
         self.use_fallback_mha = not _FA2_AVAILABLE
         if self.use_fallback_mha:
             self.attn = nn.MultiheadAttention(
@@ -1188,23 +1193,23 @@ class SelfAttentionBlock(nn.Module):
 
         self.attn_out_drop = nn.Dropout(attn_drop_p)
 
-        # 원래 코드와 호환을 위해 모듈은 그대로 둡니다(폴백 경로에서 사용).
         self.drop_path = DropPath(
             drop_path_p) if drop_path_p > 0.0 else nn.Identity()
         self._drop_path_p: float = float(drop_path_p)
         self._drop_path_scale_by_keep: bool = bool(
             getattr(self.drop_path, "scale_by_keep", True))
 
-        self.norm2 = nn.LayerNorm(dim)
+        # ✅ fused LayerNorm + fused MLP 우선 사용
+        self.norm2 = FastLayerNorm(dim)
+
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=nn.GELU,
-            drop=ffn_drop_p,
+        self.mlp = FastMlp(
+            in_features=int(dim),
+            hidden_features=int(mlp_hidden_dim),
+            out_features=int(dim),
+            drop=float(ffn_drop_p),
         )
 
-        # === FlashAttention‑2용 QKV/출력 프로젝션 ===
         self.num_heads = heads
         self.head_dim = dim // heads
         assert dim % heads == 0, f"dim({dim}) must be divisible by heads({heads})"
@@ -1217,213 +1222,7 @@ class SelfAttentionBlock(nn.Module):
 
         self._attn_dropout_p = attn_drop_p
 
-    # ------------------------------------------------------------------
-    # 유틸: dtype / unpad / pad / DropPath(varlen)
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _get_compute_dtype(x: torch.Tensor) -> torch.dtype:
-        """어텐션 내부 계산 dtype을 결정합니다.
-
-        정책
-        ----
-        - autocast가 켜져 있으면: autocast dtype을 그대로 사용합니다.
-        - autocast가 꺼져 있으면: 입력 텐서 dtype을 그대로 존중합니다.
-          (예: 입력이 float32면 float32 유지)
-
-        Args:
-            x (torch.Tensor): 기준 텐서. shape 무관.
-
-        Returns:
-            torch.dtype: 선택된 dtype.
-        """
-        if torch.is_autocast_enabled():
-            try:
-                return torch.get_autocast_gpu_dtype()
-            except Exception:
-                pass
-        return x.dtype
-
-    def _unpad_from_mask(
-        self,
-        x: torch.Tensor,  # (B, L, H)
-        mask: torch.Tensor,  # (B, L) True=pad
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """패딩 마스크를 이용해 (B,L,H) -> (T,H)로 줄이고, 복원 정보를 함께 반환합니다.
-
-        Args:
-            x: (B, L, H)
-            mask: (B, L) bool. True면 패딩(무효), False면 유효 토큰.
-
-        Returns:
-            x_unpad:    (T, H)  유효 토큰만 모은 텐서
-            indices:    (T,)    pad back에 필요한 인덱스
-            cu_seqlens: (B+1,)  배치별 누적 길이(int32가 권장)
-            max_seqlen: int     배치 내 최대 유효 길이
-        """
-        if mask.dtype != torch.bool:
-            mask = mask.to(torch.bool)
-
-        # flash-attn의 unpad_input은 True=유효 마스크를 받습니다.
-        attention_mask = (~mask).to(torch.bool)  # (B,L) True=유효
-        res = unpad_input(x, attention_mask)
-
-        # 버전별 반환 개수 차이 대응
-        if len(res) == 4:
-            x_unpad, indices, cu_seqlens, max_seqlen = res
-        elif len(res) == 5:
-            x_unpad, indices, cu_seqlens, max_seqlen, _seqlens = res
-        else:
-            raise RuntimeError(
-                f"unpad_input() return format is unexpected. len={len(res)}")
-
-        # max_seqlen은 int 또는 텐서일 수 있어 int로 통일
-        max_seqlen_int: int = int(max_seqlen) if not isinstance(
-            max_seqlen, int) else max_seqlen
-        return x_unpad, indices, cu_seqlens, max_seqlen_int
-
-    @staticmethod
-    def _pad_to_batch(
-        x_unpad: torch.Tensor,  # (T, H)
-        indices: torch.Tensor,  # (T,)
-        batch_size: int,
-        seq_len: int,
-    ) -> torch.Tensor:
-        """(T,H) -> (B,L,H)로 복원합니다. 패딩 위치는 0으로 채웁니다."""
-        return pad_input(x_unpad, indices, batch_size, seq_len)
-
-    def _touch_params_zero_output(self, ref: torch.Tensor) -> torch.Tensor:
-        """ref와 같은 shape의 0 텐서를 만들되, 블록 파라미터들을 0계수로 살짝 연결합니다.
-
-        목적:
-            - 입력이 전부 패딩이라 실제 연산 경로가 비는 경우에도,
-              분산 학습에서 '이번 스텝에 파라미터가 안 쓰였다'로 판단되는 문제를 줄입니다.
-
-        Args:
-            ref: 기준 텐서. (shape 무관)
-
-        Returns:
-            ref와 같은 shape의 0 텐서(그래프만 연결됨)
-        """
-        out = ref.new_zeros(ref.shape)
-        touch = out.new_zeros(())
-        for p in self.parameters():
-            touch = touch + p.view(-1)[:1].sum().to(out.dtype)
-        return out + touch * 0.0
-
-    def _drop_path_varlen(
-            self,
-            x_unpad: torch.Tensor,  # (T, H)
-            cu_seqlens: torch.Tensor,  # (B+1,)
-    ) -> torch.Tensor:
-        """unpad된 토큰들((T,H))에 DropPath를 '배치 단위 동일 마스크'로 적용합니다.
-
-        원래 DropPath는 (B, L, H)에서 배치마다 하나의 마스크를 뽑아
-        해당 배치의 모든 토큰에 동일하게 적용합니다.
-
-        여기서는 (T,H)만 있으므로, cu_seqlens를 이용해 토큰이 어느 배치에 속하는지 찾아
-        같은 효과가 나도록 배치별 스케일을 토큰별로 펼쳐 곱합니다.
-
-        Args:
-            x_unpad: (T, H)
-            cu_seqlens: (B+1,) 누적 길이. cu_seqlens[b]..cu_seqlens[b+1]-1 토큰이 b배치.
-
-        Returns:
-            (T, H)
-        """
-        if (not self.training) or (self._drop_path_p <= 0.0):
-            return x_unpad
-
-        T = int(x_unpad.shape[0])
-        if T == 0:
-            return x_unpad
-
-        B = int(cu_seqlens.numel() - 1)
-        if B <= 0:
-            return x_unpad
-
-        keep_prob = 1.0 - float(self._drop_path_p)
-        if keep_prob <= 0.0:
-            return x_unpad.new_zeros(x_unpad.shape)
-
-        # 배치별 마스크 생성: (B,)
-        # - float32로 만든 뒤 x dtype으로 캐스팅 (안정성)
-        rnd = torch.rand((B,), device=x_unpad.device,
-                         dtype=torch.float32)  # (B,)
-        keep_mask = (rnd < keep_prob).to(torch.float32)  # (B,)  0 또는 1
-        if self._drop_path_scale_by_keep:
-            keep_mask = keep_mask / keep_prob  # (B,)  0 또는 1/keep_prob
-
-        # 토큰 인덱스(0..T-1)가 어떤 배치에 속하는지 계산
-        # boundaries = cu_seqlens[1:] = 각 배치의 끝 인덱스
-        boundaries = cu_seqlens[1:].to(device=x_unpad.device,
-                                       dtype=torch.int64)  # (B,)
-        positions = torch.arange(T, device=x_unpad.device,
-                                 dtype=torch.int64)  # (T,)
-        batch_ids = torch.bucketize(positions, boundaries,
-                                    right=True)  # (T,) in [0..B-1]
-
-        token_scale = keep_mask.to(dtype=x_unpad.dtype)[batch_ids]  # (T,)
-        return x_unpad * token_scale.unsqueeze(-1)  # (T,H)
-
-    # ------------------------------------------------------------------
-    # FlashAttention(varlen) - unpad 입력 버전
-    # ------------------------------------------------------------------
-
-    def _self_attn_flash_varlen_unpadded(
-        self,
-        x_unpad: torch.Tensor,  # (T, H)
-        cu_seqlens: torch.Tensor,  # (B+1,)
-        max_seqlen: int,
-    ) -> torch.Tensor:
-        """unpad된 토큰((T,H))에 대해 FlashAttention-2(varlen) self-attention을 수행합니다.
-
-        Args:
-            x_unpad: (T, H)  (이미 norm까지 끝난 입력)
-            cu_seqlens: (B+1,) 누적 길이
-            max_seqlen: 배치 내 최대 유효 길이
-
-        Returns:
-            (T, H) self-attention 출력
-        """
-        if not _FA2_AVAILABLE:
-            raise RuntimeError("FlashAttention-2(varlen) 모듈을 불러오지 못했습니다. "
-                               f"(원인: {_FA2_IMPORT_ERR})")
-
-        T, D = x_unpad.shape
-        if T == 0 or max_seqlen == 0:
-            # 호출은 됐지만 실제 토큰이 없는 경우
-            touch = self._touch_params_zero_output(x_unpad.new_zeros(
-                (1,))).sum() * 0.0
-            return x_unpad.new_zeros((T, D)) + touch
-
-        # QKV: (T, 3*D) -> (T, 3, Hh, Hd)
-        qkv = self.qkv_proj(x_unpad)  # (T, 3*D)
-        qkv = qkv.view(T, 3, self.num_heads, self.head_dim)  # (T, 3, Hh, Hd)
-
-        comp_dtype = self._get_compute_dtype(qkv)
-        qkv = qkv.to(comp_dtype)
-
-        cu = cu_seqlens.to(device=qkv.device,
-                           dtype=torch.int32)  # (B+1,) int32 권장
-
-        out = flash_attn_varlen_qkvpacked_func(
-            qkv,
-            cu_seqlens=cu,
-            max_seqlen=int(max_seqlen),
-            dropout_p=self._attn_dropout_p if self.training else 0.0,
-            softmax_scale=None,
-            causal=False,
-        )  # (T, Hh, Hd)
-
-        out = out.reshape(T, self.num_heads * self.head_dim)  # (T, D)
-
-        # 원래 코드와 동일하게 "입력 x_unpad dtype"에 맞춰 out_proj
-        out = self.out_proj(out.to(x_unpad.dtype))  # (T, D)
-        out = out.to(x_unpad.dtype)
-        return out
-
-    # ------------------------------------------------------------------
-    # forward (핵심 변경)
+    # (중간 유틸 함수들은 기존 그대로 두면 됩니다: _get_compute_dtype, _unpad_from_mask, _pad_to_batch, ...)
     # ------------------------------------------------------------------
 
     def _forward_fallback_mha(
@@ -1431,14 +1230,12 @@ class SelfAttentionBlock(nn.Module):
             x: torch.Tensor,  # (B, L, H)
             mask: torch.Tensor,  # (B, L) True=pad
     ) -> torch.Tensor:
-        """FlashAttention이 없을 때(MHA 폴백) 기존 방식으로 동작합니다."""
         if mask.dtype != torch.bool:
             mask = mask.to(torch.bool)
 
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)  # (B,L,H)
         x_norm = self.norm1(x)  # (B,L,H)
 
-        # key_padding_mask: True=패딩
         y = self.attn(x_norm,
                       x_norm,
                       x_norm,
@@ -1447,6 +1244,8 @@ class SelfAttentionBlock(nn.Module):
 
         y = self.attn_out_drop(y)
         x = x + self.drop_path(y)
+
+        # ✅ norm2 + mlp도 fused 우선 사용
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)
@@ -1457,36 +1256,16 @@ class SelfAttentionBlock(nn.Module):
             x: torch.Tensor,  # (B, L, H)
             mask: torch.Tensor,  # (B, L) True=pad
     ) -> torch.Tensor:
-        """패딩 토큰에 대한 LN/MLP 계산을 없앤 버전입니다.
-
-        핵심:
-            - (B,L,H)에서 유효 토큰만 (T,H)로 한 번만 뽑습니다(unpad 1회).
-            - (T,H) 상태로 norm1/attention/norm2/mlp를 전부 수행합니다.
-            - DropPath는 배치 단위 동일 마스크가 되도록 varlen 방식으로 적용합니다.
-            - 마지막에 (B,L,H)로 복원(pad back)하고, 패딩 위치는 0으로 고정합니다.
-
-        Args:
-            x: (B, L, H)
-            mask: (B, L) True=pad
-
-        Returns:
-            (B, L, H)
-        """
         if mask.dtype != torch.bool:
             mask = mask.to(torch.bool)
 
-        # FlashAttention이 없으면 폴백 경로로(정상 동작 보장)
         if self.use_fallback_mha:
             return self._forward_fallback_mha(x, mask)
 
         B, L, H = x.shape
-
-        # 원래 코드와 동일하게 패딩 위치는 0으로 고정(의미 보존)
         x = x.masked_fill(mask.unsqueeze(-1), 0.0)  # (B,L,H)
 
-        # (1) unpad 1회
-        x_unpad, indices, cu_seqlens, max_seqlen = self._unpad_from_mask(
-            x, mask)  # (T,H), ...
+        x_unpad, indices, cu_seqlens, max_seqlen = self._unpad_from_mask(x, mask)
         T = int(x_unpad.shape[0])
 
         if T == 0 or max_seqlen == 0:
@@ -1498,28 +1277,22 @@ class SelfAttentionBlock(nn.Module):
         x1 = self.norm1(x_unpad)  # (T,H)
 
         # (3) Attention (유효 토큰만)
-        y = self._self_attn_flash_varlen_unpadded(x1, cu_seqlens,
-                                                  max_seqlen)  # (T,H)
+        y = self._self_attn_flash_varlen_unpadded(x1, cu_seqlens, max_seqlen)  # (T,H)
         y = self.attn_out_drop(y)  # (T,H)
 
-        # (4) Residual + DropPath (배치 단위 동일 마스크)
+        # (4) Residual + DropPath
         x_unpad = x_unpad + self._drop_path_varlen(y, cu_seqlens)  # (T,H)
 
-        # (5) LN2 + MLP (유효 토큰만)
+        # (5) LN2 + MLP (유효 토큰만)  ✅ fused MLP 우선 사용
         m = self.mlp(self.norm2(x_unpad))  # (T,H)
 
         # (6) Residual + DropPath
         x_unpad = x_unpad + self._drop_path_varlen(m, cu_seqlens)  # (T,H)
 
-        # (7) pad back 1회
-        out = self._pad_to_batch(x_unpad,
-                                 indices,
-                                 batch_size=int(B),
-                                 seq_len=int(L))  # (B,L,H)
-
-        # (8) 안전하게 한 번 더 0 고정
+        out = self._pad_to_batch(x_unpad, indices, batch_size=int(B), seq_len=int(L))
         out = out.masked_fill(mask.unsqueeze(-1), 0.0)
         return out
+
 
 
 class StaticFusionEncoder(nn.Module):
@@ -2387,25 +2160,7 @@ class LaneSummaryTokenPooler(nn.Module):
             lane_mask: torch.Tensor,  # (B, L) True=pad
             lane_pos: torch.Tensor,  # (B, L, 9)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """lane 토큰을 M개 요약 토큰으로 압축합니다.
-
-        Args:
-            lane_embeddings:
-                shape: (B, L, H)
-            lane_mask:
-                shape: (B, L)  True=패딩(무효)
-            lane_pos:
-                shape: (B, L, 9)
-                [x,y,cos,sin] + type_onehot(5)
-
-        Returns:
-            summary_embeddings:
-                shape: (B, M, H)
-            summary_mask:
-                shape: (B, M)  True=패딩(무효)
-            summary_pos:
-                shape: (B, M, 9)
-        """
+        """lane 토큰을 M개 요약 토큰으로 압축합니다."""
         if lane_mask.dtype != torch.bool:
             lane_mask = lane_mask.to(torch.bool)
 
@@ -2451,14 +2206,12 @@ class LaneSummaryTokenPooler(nn.Module):
                               lane_embeddings.float())
         logits = logits / math.sqrt(max(1.0, float(H)))  # (B,M,L)
 
-        if lane_mask.any().item():
-            logits = logits.masked_fill(lane_mask.unsqueeze(1), float("-inf"))
+        # ✅ .any().item() 없이 항상 마스크 적용
+        logits = logits.masked_fill(lane_mask.unsqueeze(1), float("-inf"))
 
-        # 전부 패딩인 배치 softmax NaN 방지
+        # ✅ 전부 패딩인 배치 softmax NaN 방지: 해당 배치 logits를 0으로 덮음
         all_off = lane_mask.all(dim=1)  # (B,)
-        if all_off.any().item():
-            logits = logits.clone()
-            logits[all_off] = 0.0
+        logits = logits.masked_fill(all_off.view(B, 1, 1), 0.0)
 
         attn = F.softmax(logits, dim=-1)  # (B,M,L) float32
         if self.attn_drop_p > 0 and self.training:
@@ -2467,18 +2220,20 @@ class LaneSummaryTokenPooler(nn.Module):
         # (E) 요약 토큰 생성: (B,M,H)
         summary_embeddings = torch.einsum("bml,blh->bmh", attn,
                                           lane_embeddings.float()).to(
-                                              dtype)  # (B,M,H)
+            dtype)  # (B,M,H)
 
         summary_embeddings = summary_embeddings + self.seed_ffn_alpha.to(
             dtype) * self.seed_ffn(summary_embeddings)
 
         # 집합 통계 잔차(게이트 0에서 시작)
-        ds_mean = self._masked_mean(lane_embeddings,
-                                    lane_mask).to(dtype)  # (B,H)
+        ds_mean = self._masked_mean(lane_embeddings, lane_mask).to(
+            dtype)  # (B,H)
         ds_max = self._masked_max(lane_embeddings, lane_mask).to(dtype)  # (B,H)
         summary_embeddings = summary_embeddings \
-            + self.ds_mean_alpha.to(dtype) * ds_mean.unsqueeze(1) \
-            + self.ds_max_alpha.to(dtype) * ds_max.unsqueeze(1)  # (B,M,H)
+                             + self.ds_mean_alpha.to(dtype) * ds_mean.unsqueeze(
+            1) \
+                             + self.ds_max_alpha.to(dtype) * ds_max.unsqueeze(
+            1)  # (B,M,H)
 
         summary_embeddings = self.out_drop(
             self.out_norm(summary_embeddings))  # (B,M,H)
@@ -2487,8 +2242,8 @@ class LaneSummaryTokenPooler(nn.Module):
         lane_pos4 = lane_pos[..., :4].to(torch.float32)  # (B,L,4)
         pos_xy = torch.einsum("bml,bld->bmd", attn,
                               lane_pos4[..., :2])  # (B,M,2)
-        pos_dir = torch.einsum("bml,bld->bmd", attn, lane_pos4[...,
-                                                               2:4])  # (B,M,2)
+        pos_dir = torch.einsum("bml,bld->bmd", attn,
+                               lane_pos4[..., 2:4])  # (B,M,2)
         pos_dir = self._normalize_dir(pos_dir)  # (B,M,2)
         pos4 = torch.cat([pos_xy, pos_dir], dim=-1).to(dtype)  # (B,M,4)
 
@@ -2520,10 +2275,10 @@ class LaneFusionEncoder(nn.Module):
         drop_path_rate=0.3,
         hidden_dim=192,
         depth=3,
-        tokens_mlp_dim: int = 16,  # ✅ 기본값: 64 -> 16 (압축 토큰 길이)
-        token_pre_hidden_dim: int = 64,  # ✅ token_pre_project의 중간 길이
+        tokens_mlp_dim: int = 16,
+        token_pre_hidden_dim: int = 64,
         channels_mlp_dim=192,
-        mixer_channels_mlp_ratio: float = 0.25,  # ✅ 토큰 단계에서 '큰 특징 변환' 줄이기
+        mixer_channels_mlp_ratio: float = 0.25,
         lane_post_hidden_dim: Optional[int] = None,
         num_fourier_frequencies=4,
         time_gap=0.1,
@@ -2538,7 +2293,9 @@ class LaneFusionEncoder(nn.Module):
         self.num_fourier_frequencies = num_fourier_frequencies
         self._channel = channels_mlp_dim
 
-        # ✅ 상세 프로파일링 on/off 스위치 (기본 False)
+        # ✅ 출력 hidden_dim 저장(early return에서 필요)
+        self._out_hidden_dim: int = int(hidden_dim)
+
         self.enable_profile: bool = False
 
         self.speed_limit_emb = nn.Linear(1, channels_mlp_dim)
@@ -2558,23 +2315,19 @@ class LaneFusionEncoder(nn.Module):
         self.right_line_type_emb = nn.Linear(13, channels_mlp_dim)
         nn.init.normal_(self.right_line_type_emb.weight, std=0.02)
 
-        # lane_type / line_type 임베딩 스칼라 게이트 (초기 0)
         self.lane_type_alpha = nn.Parameter(torch.tensor(0.0))
         self.left_line_type_alpha = nn.Parameter(torch.tensor(0.0))
         self.right_line_type_alpha = nn.Parameter(torch.tensor(0.0))
 
+        # ✅ (가능하면) fused MLP 우선 사용
         # (num_valid, lane_len, 10) -> (num_valid, lane_len, C)
-        self.channel_pre_project = Mlp(
+        self.channel_pre_project = FastMlp(
             in_features=10,
-            hidden_features=channels_mlp_dim,
-            out_features=channels_mlp_dim,
-            act_layer=nn.GELU,
+            hidden_features=int(channels_mlp_dim),
+            out_features=int(channels_mlp_dim),
             drop=0.0,
         )
 
-        # ✅ (길이 축 압축) lane_len(예:20) -> T_small(기본 16)
-        # 기존: (num_valid, C, lane_len)로 transpose 후 Linear(=Mlp)
-        # 변경: (num_valid, lane_len, C) 그대로 Conv1d(kernel=1)로 lane_len 축을 섞어 T_small로 만듦
         self.token_pre_project = Conv1dMlp(
             in_channels=int(lane_len),
             hidden_channels=int(token_pre_hidden_dim),
@@ -2583,7 +2336,6 @@ class LaneFusionEncoder(nn.Module):
             act_layer=nn.GELU(),
         )
 
-        # ✅ 토큰 단계 MixerBlock
         self.blocks = nn.ModuleList([
             MixerBlock(
                 int(tokens_mlp_dim),
@@ -2593,27 +2345,24 @@ class LaneFusionEncoder(nn.Module):
             ) for _ in range(depth)
         ])
 
-        self.norm = nn.LayerNorm(channels_mlp_dim)
-
         if lane_post_hidden_dim is None:
             lane_post_hidden_dim = self._default_lane_post_hidden_dim(
                 int(channels_mlp_dim))
 
-        self.lane_post_norm = nn.LayerNorm(2 * int(channels_mlp_dim))
-        self.lane_post_mlp = Mlp(
+        # ✅ lane_post_norm + lane_post_mlp -> FastLayerNormMlp
+        self.lane_post = FastLayerNormMlp(
             in_features=2 * int(channels_mlp_dim),
             hidden_features=int(lane_post_hidden_dim),
             out_features=int(channels_mlp_dim),
-            act_layer=nn.GELU,
             drop=float(drop_path_rate),
         )
 
-        self.emb_project = Mlp(
-            in_features=channels_mlp_dim,
-            hidden_features=hidden_dim,
-            out_features=hidden_dim,
-            act_layer=nn.GELU,
-            drop=drop_path_rate,
+        # ✅ norm + emb_project -> FastLayerNormMlp
+        self.emb_project = FastLayerNormMlp(
+            in_features=int(channels_mlp_dim),
+            hidden_features=int(hidden_dim),
+            out_features=int(hidden_dim),
+            drop=float(drop_path_rate),
         )
 
     # -------------------------- (추가) unpad/pad 유틸 -------------------------- #
@@ -2674,6 +2423,7 @@ class LaneFusionEncoder(nn.Module):
     #           _embed_lane_attrs_with_single_linear, _get_lane_feature ...)
     # ---------------------------------------------------------------------- #
 
+
     def forward(
         self,
         lanes: torch.Tensor,  # (B, lane_num, lane_len, D_lane)
@@ -2684,18 +2434,6 @@ class LaneFusionEncoder(nn.Module):
         right_line_type: Optional[torch.Tensor],  # (B, lane_num, 13) or None
         lanes_is_valid: torch.Tensor,  # (B, lane_num) True=유효
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """차선 정보를 lane 단위 임베딩으로 바꿔 반환합니다.
-
-        변경 요약(핵심)
-        ----------
-        - valid lane 모으기/되돌리기: nonzero/index_select/index_copy -> unpad_input/pad_input
-        - token_pre_project(20->16): transpose 없이 Conv1d(kernel=1)로 동일 계산
-        - MixerBlock.tokens_mlp: permute 없이 Conv1d(kernel=1)로 동일 계산
-
-        Returns:
-            lane_embedding: (B, lane_num, hidden_dim)
-            lane_feature:   (B, lane_num, 9)
-        """
         lanes_is_valid = lanes_is_valid.to(torch.bool)
         device_type: str = lanes.device.type
         enable_profile: bool = bool(getattr(self, "enable_profile", False))
@@ -2713,7 +2451,7 @@ class LaneFusionEncoder(nn.Module):
         # -----------------------------
         num_valid_total: int = int(lanes_is_valid.sum().item())
         if num_valid_total == 0:
-            H: int = int(self.emb_project.fc2.out_features)
+            H: int = int(self._out_hidden_dim)
             out_dtype = (
                 torch.get_autocast_gpu_dtype()
                 if torch.is_autocast_enabled() and lanes.is_cuda
@@ -2727,16 +2465,14 @@ class LaneFusionEncoder(nn.Module):
             )
             lane_feature = lanes.new_zeros((B, lane_num, 9))
 
-            # DDP unused param 방지용 터치(새로 바뀐 모듈 포함)
+            # DDP unused param 방지용 터치
             touch = lane_embedding.new_zeros(())
             touch_modules = [
-                self.channel_pre_project,
-                self.token_pre_project,   # ✅ Conv1dMlp
+                self.channel_pre_project,   # ✅ FastMlp
+                self.token_pre_project,     # Conv1dMlp
                 *self.blocks,
-                self.lane_post_norm,
-                self.lane_post_mlp,
-                self.norm,
-                self.emb_project,
+                self.lane_post,             # ✅ FastLayerNormMlp
+                self.emb_project,           # ✅ FastLayerNormMlp
                 self.speed_limit_emb,
                 self.unknown_speed_emb,
                 self.traffic_emb,
@@ -2755,48 +2491,36 @@ class LaneFusionEncoder(nn.Module):
             return lane_embedding + touch * 0.0, lane_feature
 
         # ============================================================
-        # (1) unpad: valid lane만 (num_valid, lane_len, D_lane)로 모으기
+        # (1) unpad: valid lane만 모으기
         # ============================================================
         with profile_block(
             "LaneFusionEncoder.unpad_lanes",
             enabled=enable_profile,
             device_type=device_type
         ):
-            # lanes_flat: (B, lane_num, lane_len*D_lane)
             lanes_flat: torch.Tensor = lanes.reshape(B, lane_num, lane_len * d_lane)
-
-            # lanes_unpad_flat: (num_valid, lane_len*D_lane)
-            # indices: (num_valid,)
             lanes_unpad_flat, indices = self._unpad_input_3d_with_valid_mask(
                 lanes_flat, lanes_is_valid
             )
             num_valid: int = int(lanes_unpad_flat.shape[0])
-
-            # lanes_raw_valid: (num_valid, lane_len, D_lane)
             lanes_raw_valid: torch.Tensor = lanes_unpad_flat.view(
                 num_valid, lane_len, d_lane
             )
-
-            # index_select용 int64 인덱스
             valid_idx: torch.Tensor = indices.to(torch.long)
 
         # ============================================================
-        # (2) 전처리: lanes_10_valid, lane_feature, traffic_valid
+        # (2) 전처리
         # ============================================================
         with profile_block(
             "LaneFusionEncoder.preprocess",
             enabled=enable_profile,
             device_type=device_type
         ):
-            # lanes_8_valid: (num_valid, lane_len, 8)
             lanes_8_valid: torch.Tensor = lanes_raw_valid[..., :8]
-
-            # left/right_is_valid_valid: (num_valid, lane_len)
             left_is_valid_valid, right_is_valid_valid = self._compute_boundary_valid_flags(
                 lanes_8_valid
             )
 
-            # lanes_10_valid: (num_valid, lane_len, 10)
             lanes_10_valid: torch.Tensor = torch.cat(
                 [
                     lanes_8_valid,
@@ -2807,16 +2531,11 @@ class LaneFusionEncoder(nn.Module):
             )
 
             mid_idx: int = int(self._lane_len / 2)
-
-            # lane_pos_valid: (num_valid, 4)
             lane_pos_valid: torch.Tensor = lanes_10_valid[:, mid_idx, :4].clone()
-
-            # lane_feature_valid: (num_valid, 9)
             lane_feature_valid: torch.Tensor = self._get_lane_feature(
                 lane_pos_valid.unsqueeze(0)
             ).squeeze(0)
 
-            # lane_feature: (B, lane_num, 9)  pad 위치는 0
             lane_feature: torch.Tensor = self._pad_input_2d_back_to_3d(
                 lane_feature_valid.to(device=lanes.device, dtype=lanes.dtype),
                 indices,
@@ -2825,11 +2544,11 @@ class LaneFusionEncoder(nn.Module):
             )
             lane_feature = lane_feature.masked_fill((~lanes_is_valid).unsqueeze(-1), 0.0)
 
-            # traffic_valid: (num_valid, 4)
             traffic_valid: torch.Tensor = lanes_raw_valid[:, 0, 8:]
 
         # ============================================================
         # (3) channel_pre_project: (num_valid, lane_len, 10) -> (num_valid, lane_len, C)
+        #     ✅ FastMlp(가능하면 fused)
         # ============================================================
         lanes_valid: torch.Tensor = lanes_10_valid
         with profile_block(
@@ -2837,19 +2556,16 @@ class LaneFusionEncoder(nn.Module):
             enabled=enable_profile,
             device_type=device_type
         ):
-            # (num_valid, lane_len, C)
             lanes_valid = self.channel_pre_project(lanes_valid)
 
         # ============================================================
-        # (4) token_pre_project: lane_len -> T_small (transpose 없이 Conv1d로)
+        # (4) token_pre_project
         # ============================================================
         with profile_block(
             "LaneFusionEncoder.token_pre_project_conv1d",
             enabled=enable_profile,
             device_type=device_type
         ):
-            # 입력:  (num_valid, lane_len, C)
-            # 출력:  (num_valid, T_small, C)
             lanes_valid = self.token_pre_project(lanes_valid)
 
         # ============================================================
@@ -2861,7 +2577,7 @@ class LaneFusionEncoder(nn.Module):
                 enabled=enable_profile,
                 device_type=device_type
             ):
-                lanes_valid = block(lanes_valid)  # (num_valid, T_small, C)
+                lanes_valid = block(lanes_valid)
 
         # ============================================================
         # (6) mean+max pool
@@ -2874,9 +2590,9 @@ class LaneFusionEncoder(nn.Module):
             mean_pool, max_pool = self._mean_max_pool_tokens(lanes_valid)
 
         # ============================================================
-        # (7) 속성 임베딩(속도/신호/타입) -> mean 쪽에 더하기
+        # (7) 속성 임베딩 -> mean 쪽에 더하기 (기존 그대로)
         # ============================================================
-        lane_vec: torch.Tensor = mean_pool  # (num_valid, C)
+        lane_vec: torch.Tensor = mean_pool
         with profile_block(
             "LaneFusionEncoder.attr_embedding",
             enabled=enable_profile,
@@ -2889,41 +2605,41 @@ class LaneFusionEncoder(nn.Module):
 
             lanes_has_speed_limit_valid: torch.Tensor = lanes_has_speed_limit_flat.index_select(
                 0, valid_idx
-            ).squeeze(-1)  # (num_valid,)
+            ).squeeze(-1)
             lanes_speed_limit_valid: torch.Tensor = lanes_speed_limit_flat.index_select(
                 0, valid_idx
-            ).squeeze(-1)  # (num_valid,)
+            ).squeeze(-1)
 
-            # speed_mask: (num_valid, 1)
             speed_mask: torch.Tensor = lanes_has_speed_limit_valid.unsqueeze(-1)
 
             speed_with: torch.Tensor = self.speed_limit_emb(
                 lanes_speed_limit_valid.unsqueeze(-1)
-            ).to(dtype=lane_vec.dtype, device=lane_vec.device)  # (num_valid, C)
+            ).to(dtype=lane_vec.dtype, device=lane_vec.device)
 
             speed_no: torch.Tensor = self.unknown_speed_emb.weight.to(
                 dtype=lane_vec.dtype,
                 device=lane_vec.device
-            ).expand(num_valid, -1)  # (num_valid, C)
+            ).expand(num_valid, -1)
 
             speed_limit_embedding: torch.Tensor = torch.where(speed_mask, speed_with, speed_no)
 
             attrs_embedding: torch.Tensor = self._embed_lane_attrs_with_single_linear(
-                traffic_valid=traffic_valid,        # (num_valid, 4)
-                lane_type=lane_type,                # (B, lane_num, 4) or None
-                left_line_type=left_line_type,      # (B, lane_num, 13) or None
-                right_line_type=right_line_type,    # (B, lane_num, 13) or None
-                valid_idx=valid_idx,                # (num_valid,)
+                traffic_valid=traffic_valid,
+                lane_type=lane_type,
+                left_line_type=left_line_type,
+                right_line_type=right_line_type,
+                valid_idx=valid_idx,
                 batch_size=B,
                 lane_num=lane_num,
                 out_dtype=lane_vec.dtype,
                 out_device=lane_vec.device,
-            )  # (num_valid, C)
+            )
 
-            lane_vec = lane_vec + speed_limit_embedding + attrs_embedding  # (num_valid, C)
+            lane_vec = lane_vec + speed_limit_embedding + attrs_embedding
 
         # ============================================================
-        # (8) pool 결과 결합(mean_with_attr + max) -> lane_post_mlp (2C -> C)
+        # (8) lane_post: (2C) -> C
+        #     ✅ lane_post_norm + lane_post_mlp를 FastLayerNormMlp로 대체
         # ============================================================
         with profile_block(
             "LaneFusionEncoder.lane_post_mlp",
@@ -2934,26 +2650,26 @@ class LaneFusionEncoder(nn.Module):
                 [lane_vec, max_pool.to(lane_vec.dtype)],
                 dim=-1
             )  # (num_valid, 2C)
-            lanes_valid = self.lane_post_mlp(self.lane_post_norm(pooled_2c))  # (num_valid, C)
+
+            lanes_valid = self.lane_post(pooled_2c)  # (num_valid, C)
 
         # ============================================================
         # (9) 최종 projection + pad back
+        #     ✅ norm + emb_project를 FastLayerNormMlp로 대체
         # ============================================================
         with profile_block(
             "LaneFusionEncoder.final_projection",
             enabled=enable_profile,
             device_type=device_type
         ):
-            lanes_valid = self.emb_project(self.norm(lanes_valid))  # (num_valid, hidden_dim)
+            lanes_valid = self.emb_project(lanes_valid)  # (num_valid, hidden_dim)
 
-            # lane_embedding: (B, lane_num, hidden_dim)
             lane_embedding: torch.Tensor = self._pad_input_2d_back_to_3d(
                 lanes_valid, indices, batch_size=int(B), seq_len=int(lane_num)
             )
             lane_embedding = lane_embedding.masked_fill((~lanes_is_valid).unsqueeze(-1), 0.0)
 
         return lane_embedding, lane_feature
-
 
 
 class FusionEncoder(nn.Module):
@@ -2989,32 +2705,43 @@ class FusionEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(
-            self, encoding_input: torch.Tensor,
-            encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            self,
+            encoding_input: torch.Tensor,
+            encoding_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if encoding_mask.dtype != torch.bool:
+            encoding_mask = encoding_mask.to(torch.bool)
+
         B, token_num, H = encoding_input.shape
 
-        is_invalid_batch = encoding_mask.all(dim=1)  # [B]
-        is_valid_batch = ~is_invalid_batch  # [B]
-        out_tokens = encoding_input.new_zeros(B, token_num,
-                                              H)  # [B, token_num, H]
+        # 배치 단위로 "전부 패딩"인지 계산 (tensor로 유지)
+        is_invalid_batch = encoding_mask.all(dim=1)  # (B,)
+        is_valid_batch = ~is_invalid_batch  # (B,)
 
-        if is_valid_batch.any().item():
-            on_batch_tokens = encoding_input[is_valid_batch]
-            on_batch_token_mask = encoding_mask[is_valid_batch]
-            on_B: int = on_batch_tokens.size(0)
+        out_tokens = encoding_input.new_zeros(
+            (B, token_num, H))  # (B, token_num, H)
 
-            cls_tokens = self.cls_token.expand(on_B, 1,
-                                               H).to(on_batch_tokens.dtype)
-            cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens], dim=1)
+        # ✅ .any().item() 없이, 먼저 골라 담고 shape로 분기 (shape 접근은 .item() 동기화가 아님)
+        on_batch_tokens = encoding_input[is_valid_batch]  # (on_B, token_num, H)
+        on_batch_token_mask = encoding_mask[is_valid_batch]  # (on_B, token_num)
+        on_B: int = int(on_batch_tokens.size(0))
+
+        if on_B > 0:
+            cls_tokens = self.cls_token.expand(on_B, 1, H).to(
+                on_batch_tokens.dtype)  # (on_B,1,H)
+            cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens],
+                                        dim=1)  # (on_B,1+token_num,H)
+
             cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
             cls_with_tokens[:, 0:1, :] = cls_with_tokens[:, 0:1, :] + cls_pos
 
-            cls_false = torch.zeros(on_B,
-                                    1,
-                                    dtype=torch.bool,
-                                    device=on_batch_token_mask.device)
+            cls_false = torch.zeros(
+                (on_B, 1),
+                dtype=torch.bool,
+                device=on_batch_token_mask.device
+            )
             cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask],
-                                            dim=1)
+                                            dim=1)  # (on_B,1+token_num)
 
             for block in self.blocks:
                 cls_with_tokens = block(cls_with_tokens, cls_with_token_mask)
@@ -3023,23 +2750,22 @@ class FusionEncoder(nn.Module):
             cls_with_tokens = cls_with_tokens.masked_fill(
                 cls_with_token_mask.unsqueeze(-1), 0.0)
 
-            fused_wo_cls = cls_with_tokens[:, 1:, :]
+            fused_wo_cls = cls_with_tokens[:, 1:, :]  # (on_B, token_num, H)
             out_tokens[is_valid_batch] = fused_wo_cls.to(out_tokens.dtype)
 
         else:
-            # 모든 배치가 패딩이면, 파라미터들을 0-스케일로 "한 번에" 터치해서 DDP unused param 방지
-            touch = (self.cls_token[..., :1].sum() +
-                     self.cls_pos[..., :1].sum())
+            # 모든 배치가 패딩이면, 파라미터들을 0-스케일로 터치해서 DDP unused param 방지
+            touch = (self.cls_token[..., :1].sum() + self.cls_pos[
+                ..., :1].sum())
 
             for blk in self.blocks:
                 for p in blk.parameters():
                     touch = touch + p.view(-1)[:1].sum()
 
-            # ✅ self.norm 파라미터도 touch에 포함
             for p in self.norm.parameters():
                 touch = touch + p.view(-1)[:1].sum()
 
-            # ✅ touch를 다 만든 다음 out_tokens에 한 번만 반영
-            out_tokens = out_tokens + touch * 0.0
+            out_tokens = out_tokens + touch.to(dtype=out_tokens.dtype) * 0.0
 
         return out_tokens, encoding_mask
+
