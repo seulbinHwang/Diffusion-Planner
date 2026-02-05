@@ -47,6 +47,7 @@ def _try_build_flash_fused_mlp(
 ) -> Optional[nn.Module]:
     """flash-attn fused MLP를 만들 수 있으면 만들고, 아니면 None을 반환합니다."""
     if (not _FLASH_FUSED_MLP_AVAILABLE) or (_FlashAttnFusedMLP is None):
+        raise RuntimeError("flash-attn fused MLP is not available") from _FLASH_FUSED_MLP_IMPORT_ERR
         return None
 
     candidates = [
@@ -148,9 +149,10 @@ class FastLayerNorm(nn.Module):
                     y = y[0]
                 return y
             except Exception:
+                raise RuntimeError("Triton LN failed") from None
                 # Triton 경로가 어떤 이유로든 실패하면 안전 경로로 복귀
                 return F.layer_norm(x, self._ln.normalized_shape, self._ln.weight, self._ln.bias, self._ln.eps)
-
+        raise RuntimeError("Triton LN is not available")
         # 안전 경로
         return self._ln(x)
 

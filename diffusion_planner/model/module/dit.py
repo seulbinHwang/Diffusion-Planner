@@ -136,9 +136,10 @@ def _fast_layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
                 y = y[0]
             return y
         except Exception:
+            raise RuntimeError("Triton LN failed") from None
             # Triton LN이 어떤 이유로든 실패하면 안전 경로로 복귀
             return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
-
+    raise RuntimeError("Triton LN is not available")
     # 안전 경로
     return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
 
@@ -204,6 +205,7 @@ def _fast_mlp_gelu(
         torch.Tensor: 출력. shape: (..., D_out)
     """
     if _flash_fused_dense_gelu_dense is None:
+        raise RuntimeError("flash-attn fused MLP is not available")
         return mlp(x)
 
     if x.numel() == 0:
