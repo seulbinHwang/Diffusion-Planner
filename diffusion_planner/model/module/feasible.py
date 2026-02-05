@@ -40,264 +40,6 @@ class StemInputParts(NamedTuple):
     feat_u: torch.Tensor     # (B, Pnn, T, Du)
     trunk: torch.Tensor      # (B, Pnn, Dc)
 
-def _compute_contiguous_start_end_from_mask_b1t(
-    self,
-    mask_b1t: torch.Tensor,  # (N, 1, T) float(0/1) 또는 bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """마스크가 한 덩어리(0*1*0*)라고 가정하고, 각 row의 시작/끝 위치를 구합니다.
-
-    Args:
-        mask_b1t: (N, 1, T)
-            값이 0/1 또는 bool인 마스크입니다.
-
-    Returns:
-        has_any: (N,) bool
-            row에 1이 하나라도 있으면 True입니다.
-        start: (N,) long
-            첫 1의 위치입니다. (없으면 0)
-        end: (N,) long
-            마지막 1의 위치입니다. (없으면 -1)
-
-    Notes:
-        - config.feasible_debug_check_mask=True 일 때만,
-          "1→0→1 같은 구멍"이 있는지 검사합니다.
-    """
-    if mask_b1t.dim() != 3 or int(mask_b1t.shape[1]) != 1:
-        raise ValueError(
-            "_compute_contiguous_start_end_from_mask_b1t: mask_b1t는 (N,1,T)여야 합니다. "
-            f"got shape={tuple(mask_b1t.shape)}"
-        )
-
-    N = int(mask_b1t.shape[0])
-    T = int(mask_b1t.shape[2])
-
-    mask_nt = mask_b1t.squeeze(1)
-    mask_bool = self._to_bool_mask(mask_nt)  # (N,T) bool
-
-    has_any = mask_bool.any(dim=-1)  # (N,)
-
-    mask_int = mask_bool.to(torch.int8)  # (N,T)
-    start = torch.argmax(mask_int, dim=-1)  # (N,) all-zero면 0
-
-    end_from_right = torch.argmax(torch.flip(mask_int, dims=[-1]), dim=-1)  # (N,)
-    end = (T - 1) - end_from_right  # (N,) all-zero면 T-1
-
-    start = torch.where(has_any, start, torch.zeros_like(start))
-    end = torch.where(has_any, end, torch.full_like(end, -1))
-
-    if bool(getattr(self, "feasible_debug_check_mask", False)):
-        mask_sum = mask_int.sum(dim=-1).to(torch.long)  # (N,)
-        span_len = (end.to(torch.long) - start.to(torch.long) + 1).clamp_min(0)
-        bad = has_any & (mask_sum != span_len)
-        if bool(bad.any()):
-            bad_idx = bad.nonzero(as_tuple=False).squeeze(-1)
-            max_show = min(int(bad_idx.numel()), 8)
-            sample = bad_idx[:max_show].tolist()
-            raise ValueError(
-                "[_compute_contiguous_start_end_from_mask_b1t] mask가 '한 덩어리(0*1*0*)' 형태가 아닙니다. "
-                "즉, 1→0→1 같은 구멍이 있습니다. "
-                f"예시 row idx={sample} (N={N}, T={T})."
-            )
-
-    return has_any, start.to(torch.long), end.to(torch.long)
-
-
-def _compute_den_from_contiguous_start_end(
-    self,
-    *,
-    start: torch.Tensor,       # (N,) long
-    end: torch.Tensor,         # (N,) long  (없으면 -1)
-    has_any: torch.Tensor,     # (N,) bool
-    sequence_length: int,
-    kernel_size: int,
-    dilation: int,
-    padding: int,
-    out_dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """연속(한 덩어리) 마스크의 start/end로 den(유효 개수)을 빠르게 계산합니다.
-
-    den[t]는 conv1d(mask, ones, dilation, padding)와 동일하게
-    "해당 시점 t에서 커널이 참조하는 위치 중 mask==1인 개수"입니다.
-
-    Args:
-        start: (N,) long
-        end: (N,) long
-        has_any: (N,) bool
-        sequence_length: T
-        kernel_size: k
-        dilation: d
-        padding: p
-        out_dtype: 반환 dtype(보통 mask dtype)
-        device: 반환 device
-
-    Returns:
-        den_b1t: (N, 1, T) out_dtype
-    """
-    N = int(start.shape[0])
-    T = int(sequence_length)
-    k = int(kernel_size)
-    d = int(dilation)
-    p = int(padding)
-
-    if d <= 0:
-        raise ValueError(f"dilation must be positive. got={d}")
-    if k <= 0:
-        raise ValueError(f"kernel_size must be positive. got={k}")
-
-    # t: (1, T)
-    t = torch.arange(T, device=device, dtype=torch.long).view(1, T)
-
-    # start/end: (N,1)
-    s = start.view(N, 1).to(device=device, dtype=torch.long)
-    e = end.view(N, 1).to(device=device, dtype=torch.long)
-
-    # 조건: s <= (t + i*d - p) <= e  를 i에 대해 풀기
-    # i_min = ceil((s + p - t)/d), i_max = floor((e + p - t)/d)
-    a_min = s + p - t  # (N,T)
-    a_max = e + p - t  # (N,T)
-
-    i_min = -torch.div(-a_min, d, rounding_mode="floor")  # ceil
-    i_max = torch.div(a_max, d, rounding_mode="floor")    # floor
-
-    # i는 [0, k-1] 범위만 허용 → 겹치는 구간 길이
-    zero = torch.zeros_like(i_min)
-    k1 = torch.full_like(i_max, k - 1)
-
-    overlap_low = torch.maximum(i_min, zero)
-    overlap_high = torch.minimum(i_max, k1)
-
-    count_nt = (overlap_high - overlap_low + 1).clamp_min(0)  # (N,T)
-
-    # all-zero row는 무조건 0
-    count_nt = count_nt * has_any.to(device=device, dtype=count_nt.dtype).view(N, 1)
-
-    den_b1t = count_nt.unsqueeze(1).to(dtype=out_dtype)  # (N,1,T)
-    return den_b1t
-
-
-def _stem_forward_without_cat(
-    self,
-    stem_parts: StemInputParts,
-) -> torch.Tensor:
-    """Stem을 큰 torch.cat 없이 실행합니다.
-
-    계산 목표(기존과 동일):
-        Z = GELU( stem_fc( stem_norm( concat(prev, fut, u, trunk_rep) ) ) )
-
-    여기서는 concat 텐서를 만들지 않고,
-    - LayerNorm의 평균/분산은 각 조각의 합/제곱합으로 계산하고,
-    - Linear는 가중치 열을 조각별로 잘라서 따로 계산해 더합니다.
-
-    Args:
-        stem_parts:
-            feat_prev: (B,Pnn,T,Dx)
-            feat_fut : (B,Pnn,T,Dx)
-            feat_u   : (B,Pnn,T,Du)
-            trunk    : (B,Pnn,Dc)
-
-    Returns:
-        Z_s: (B, Pnn, T, C)
-    """
-    feat_prev = stem_parts.feat_prev
-    feat_fut = stem_parts.feat_fut
-    feat_u = stem_parts.feat_u
-    trunk = stem_parts.trunk
-
-    if feat_prev.dim() != 4 or feat_fut.dim() != 4 or feat_u.dim() != 4:
-        raise ValueError(
-            "[_stem_forward_without_cat] feat_prev/feat_fut/feat_u는 (B,Pnn,T,*) 4D여야 합니다."
-        )
-    if trunk.dim() != 3:
-        raise ValueError("[_stem_forward_without_cat] trunk는 (B,Pnn,Dc) 3D여야 합니다.")
-
-    B, Pnn, T, Dx = feat_prev.shape
-    if feat_fut.shape[:3] != (B, Pnn, T) or int(feat_fut.shape[-1]) != int(Dx):
-        raise ValueError("[_stem_forward_without_cat] feat_fut shape이 feat_prev와 맞지 않습니다.")
-    if feat_u.shape[:3] != (B, Pnn, T):
-        raise ValueError("[_stem_forward_without_cat] feat_u shape의 (B,Pnn,T)가 맞지 않습니다.")
-    if trunk.shape[:2] != (B, Pnn):
-        raise ValueError("[_stem_forward_without_cat] trunk shape의 (B,Pnn)가 맞지 않습니다.")
-
-    Du = int(feat_u.shape[-1])
-    Dc = int(trunk.shape[-1])
-    Din = int(2 * Dx + Du + Dc)
-    if Din != int(self._Din):
-        raise ValueError(
-            f"[_stem_forward_without_cat] Din 계산값({Din})이 self._Din({int(self._Din)})과 다릅니다."
-        )
-
-    # ---- LayerNorm 통계(평균/분산) ----
-    # 큰 텐서를 만들지 않고, 조각별 sum / sumsq를 더합니다.
-    eps_ln = float(self.stem_norm.eps)
-
-    sum_prev = feat_prev.sum(dim=-1, keepdim=True, dtype=torch.float32)  # (B,Pnn,T,1)
-    sum_fut = feat_fut.sum(dim=-1, keepdim=True, dtype=torch.float32)    # (B,Pnn,T,1)
-    sum_u = feat_u.sum(dim=-1, keepdim=True, dtype=torch.float32)        # (B,Pnn,T,1)
-
-    # trunk는 시간축에 대해 같은 값이지만, mean/var는 시간마다 달라질 수 있으므로
-    # 합/제곱합만 (B,Pnn,1,1)로 구해 broadcast 합니다.
-    trunk_t = trunk.unsqueeze(2)  # (B,Pnn,1,Dc)
-    sum_trunk = trunk_t.sum(dim=-1, keepdim=True, dtype=torch.float32)  # (B,Pnn,1,1)
-
-    sum_all = sum_prev + sum_fut + sum_u + sum_trunk  # (B,Pnn,T,1)  (broadcast)
-
-    sumsq_prev = (feat_prev * feat_prev).sum(dim=-1, keepdim=True, dtype=torch.float32)
-    sumsq_fut = (feat_fut * feat_fut).sum(dim=-1, keepdim=True, dtype=torch.float32)
-    sumsq_u = (feat_u * feat_u).sum(dim=-1, keepdim=True, dtype=torch.float32)
-    sumsq_trunk = (trunk_t * trunk_t).sum(dim=-1, keepdim=True, dtype=torch.float32)  # (B,Pnn,1,1)
-
-    sumsq_all = sumsq_prev + sumsq_fut + sumsq_u + sumsq_trunk  # (B,Pnn,T,1)
-
-    mean = sum_all / float(Din)  # (B,Pnn,T,1) float32
-    var = (sumsq_all / float(Din)) - (mean * mean)  # (B,Pnn,T,1) float32
-    var = var.clamp_min(0.0)
-    inv_std = torch.rsqrt(var + eps_ln)  # (B,Pnn,T,1) float32
-
-    # 실제 값 계산은 입력 dtype으로(기존과 비슷한 출력/속도)
-    mean = mean.to(dtype=feat_prev.dtype)
-    inv_std = inv_std.to(dtype=feat_prev.dtype)
-
-    # ---- LayerNorm의 scale/bias를 조각별로 적용 ----
-    gamma = self.stem_norm.weight  # (Din,)
-    beta = self.stem_norm.bias     # (Din,)
-
-    # ---- Linear 가중치도 조각별로 잘라서 적용 ----
-    W = self.stem_fc.weight  # (C, Din)
-    b = self.stem_fc.bias    # (C,)
-
-    off0 = 0
-    off1 = off0 + Dx
-    off2 = off1 + Dx
-    off3 = off2 + Du
-    off4 = off3 + Dc
-    if off4 != Din:
-        raise ValueError("[_stem_forward_without_cat] 내부 오프셋 계산이 잘못되었습니다.")
-
-    def _ln_affine(x: torch.Tensor, g: torch.Tensor, be: torch.Tensor) -> torch.Tensor:
-        """(x-mean)/std 후, feature별 scale/bias 적용."""
-        g_view = g.view(1, 1, 1, -1)
-        b_view = be.view(1, 1, 1, -1)
-        x_hat = (x - mean) * inv_std
-        return x_hat * g_view + b_view
-
-    x_prev_ln = _ln_affine(feat_prev, gamma[off0:off1], beta[off0:off1])  # (B,Pnn,T,Dx)
-    x_fut_ln = _ln_affine(feat_fut, gamma[off1:off2], beta[off1:off2])    # (B,Pnn,T,Dx)
-    x_u_ln = _ln_affine(feat_u, gamma[off2:off3], beta[off2:off3])        # (B,Pnn,T,Du)
-
-    # trunk는 (B,Pnn,1,Dc)지만 mean/inv_std가 (B,Pnn,T,1)라서 자동 broadcast
-    x_trunk_ln = _ln_affine(trunk_t, gamma[off3:off4], beta[off3:off4])    # (B,Pnn,T,Dc)
-
-    # Linear: concat 후 한 번에 하는 것과 동일한 합
-    out = F.linear(x_prev_ln, W[:, off0:off1], bias=None)  # (B,Pnn,T,C)
-    out = out + F.linear(x_fut_ln, W[:, off1:off2], bias=None)
-    out = out + F.linear(x_u_ln, W[:, off2:off3], bias=None)
-    out = out + F.linear(x_trunk_ln, W[:, off3:off4], bias=None)
-    out = out + b.view(1, 1, 1, -1)
-
-    out = self.stem_act(out)  # GELU
-    return out
-
 
 @contextmanager
 def profile_block(name: str,
@@ -629,6 +371,283 @@ class FeasibleProjector(nn.Module):
         b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
         with torch.no_grad():
             self.gate_mlp[-1].bias.fill_(b_init)
+
+    def _compute_contiguous_start_end_from_mask_b1t(
+            self,
+            mask_b1t: torch.Tensor,  # (N, 1, T) float(0/1) 또는 bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """마스크가 한 덩어리(0*1*0*)라고 가정하고, 각 row의 시작/끝 위치를 구합니다.
+
+        Args:
+            mask_b1t: (N, 1, T)
+                값이 0/1 또는 bool인 마스크입니다.
+
+        Returns:
+            has_any: (N,) bool
+                row에 1이 하나라도 있으면 True입니다.
+            start: (N,) long
+                첫 1의 위치입니다. (없으면 0)
+            end: (N,) long
+                마지막 1의 위치입니다. (없으면 -1)
+
+        Notes:
+            - config.feasible_debug_check_mask=True 일 때만,
+              "1→0→1 같은 구멍"이 있는지 검사합니다.
+        """
+        if mask_b1t.dim() != 3 or int(mask_b1t.shape[1]) != 1:
+            raise ValueError(
+                "_compute_contiguous_start_end_from_mask_b1t: mask_b1t는 (N,1,T)여야 합니다. "
+                f"got shape={tuple(mask_b1t.shape)}"
+            )
+
+        N = int(mask_b1t.shape[0])
+        T = int(mask_b1t.shape[2])
+
+        mask_nt = mask_b1t.squeeze(1)
+        mask_bool = self._to_bool_mask(mask_nt)  # (N,T) bool
+
+        has_any = mask_bool.any(dim=-1)  # (N,)
+
+        mask_int = mask_bool.to(torch.int8)  # (N,T)
+        start = torch.argmax(mask_int, dim=-1)  # (N,) all-zero면 0
+
+        end_from_right = torch.argmax(torch.flip(mask_int, dims=[-1]),
+                                      dim=-1)  # (N,)
+        end = (T - 1) - end_from_right  # (N,) all-zero면 T-1
+
+        start = torch.where(has_any, start, torch.zeros_like(start))
+        end = torch.where(has_any, end, torch.full_like(end, -1))
+
+        if bool(getattr(self, "feasible_debug_check_mask", False)):
+            mask_sum = mask_int.sum(dim=-1).to(torch.long)  # (N,)
+            span_len = (end.to(torch.long) - start.to(
+                torch.long) + 1).clamp_min(0)
+            bad = has_any & (mask_sum != span_len)
+            if bool(bad.any()):
+                bad_idx = bad.nonzero(as_tuple=False).squeeze(-1)
+                max_show = min(int(bad_idx.numel()), 8)
+                sample = bad_idx[:max_show].tolist()
+                raise ValueError(
+                    "[_compute_contiguous_start_end_from_mask_b1t] mask가 '한 덩어리(0*1*0*)' 형태가 아닙니다. "
+                    "즉, 1→0→1 같은 구멍이 있습니다. "
+                    f"예시 row idx={sample} (N={N}, T={T})."
+                )
+
+        return has_any, start.to(torch.long), end.to(torch.long)
+
+    def _compute_den_from_contiguous_start_end(
+            self,
+            *,
+            start: torch.Tensor,  # (N,) long
+            end: torch.Tensor,  # (N,) long  (없으면 -1)
+            has_any: torch.Tensor,  # (N,) bool
+            sequence_length: int,
+            kernel_size: int,
+            dilation: int,
+            padding: int,
+            out_dtype: torch.dtype,
+            device: torch.device,
+    ) -> torch.Tensor:
+        """연속(한 덩어리) 마스크의 start/end로 den(유효 개수)을 빠르게 계산합니다.
+
+        den[t]는 conv1d(mask, ones, dilation, padding)와 동일하게
+        "해당 시점 t에서 커널이 참조하는 위치 중 mask==1인 개수"입니다.
+
+        Args:
+            start: (N,) long
+            end: (N,) long
+            has_any: (N,) bool
+            sequence_length: T
+            kernel_size: k
+            dilation: d
+            padding: p
+            out_dtype: 반환 dtype(보통 mask dtype)
+            device: 반환 device
+
+        Returns:
+            den_b1t: (N, 1, T) out_dtype
+        """
+        N = int(start.shape[0])
+        T = int(sequence_length)
+        k = int(kernel_size)
+        d = int(dilation)
+        p = int(padding)
+
+        if d <= 0:
+            raise ValueError(f"dilation must be positive. got={d}")
+        if k <= 0:
+            raise ValueError(f"kernel_size must be positive. got={k}")
+
+        # t: (1, T)
+        t = torch.arange(T, device=device, dtype=torch.long).view(1, T)
+
+        # start/end: (N,1)
+        s = start.view(N, 1).to(device=device, dtype=torch.long)
+        e = end.view(N, 1).to(device=device, dtype=torch.long)
+
+        # 조건: s <= (t + i*d - p) <= e  를 i에 대해 풀기
+        # i_min = ceil((s + p - t)/d), i_max = floor((e + p - t)/d)
+        a_min = s + p - t  # (N,T)
+        a_max = e + p - t  # (N,T)
+
+        i_min = -torch.div(-a_min, d, rounding_mode="floor")  # ceil
+        i_max = torch.div(a_max, d, rounding_mode="floor")  # floor
+
+        # i는 [0, k-1] 범위만 허용 → 겹치는 구간 길이
+        zero = torch.zeros_like(i_min)
+        k1 = torch.full_like(i_max, k - 1)
+
+        overlap_low = torch.maximum(i_min, zero)
+        overlap_high = torch.minimum(i_max, k1)
+
+        count_nt = (overlap_high - overlap_low + 1).clamp_min(0)  # (N,T)
+
+        # all-zero row는 무조건 0
+        count_nt = count_nt * has_any.to(device=device,
+                                         dtype=count_nt.dtype).view(N, 1)
+
+        den_b1t = count_nt.unsqueeze(1).to(dtype=out_dtype)  # (N,1,T)
+        return den_b1t
+
+    def _stem_forward_without_cat(
+            self,
+            stem_parts: StemInputParts,
+    ) -> torch.Tensor:
+        """Stem을 큰 torch.cat 없이 실행합니다.
+
+        계산 목표(기존과 동일):
+            Z = GELU( stem_fc( stem_norm( concat(prev, fut, u, trunk_rep) ) ) )
+
+        여기서는 concat 텐서를 만들지 않고,
+        - LayerNorm의 평균/분산은 각 조각의 합/제곱합으로 계산하고,
+        - Linear는 가중치 열을 조각별로 잘라서 따로 계산해 더합니다.
+
+        Args:
+            stem_parts:
+                feat_prev: (B,Pnn,T,Dx)
+                feat_fut : (B,Pnn,T,Dx)
+                feat_u   : (B,Pnn,T,Du)
+                trunk    : (B,Pnn,Dc)
+
+        Returns:
+            Z_s: (B, Pnn, T, C)
+        """
+        feat_prev = stem_parts.feat_prev
+        feat_fut = stem_parts.feat_fut
+        feat_u = stem_parts.feat_u
+        trunk = stem_parts.trunk
+
+        if feat_prev.dim() != 4 or feat_fut.dim() != 4 or feat_u.dim() != 4:
+            raise ValueError(
+                "[_stem_forward_without_cat] feat_prev/feat_fut/feat_u는 (B,Pnn,T,*) 4D여야 합니다."
+            )
+        if trunk.dim() != 3:
+            raise ValueError(
+                "[_stem_forward_without_cat] trunk는 (B,Pnn,Dc) 3D여야 합니다.")
+
+        B, Pnn, T, Dx = feat_prev.shape
+        if feat_fut.shape[:3] != (B, Pnn, T) or int(feat_fut.shape[-1]) != int(
+                Dx):
+            raise ValueError(
+                "[_stem_forward_without_cat] feat_fut shape이 feat_prev와 맞지 않습니다.")
+        if feat_u.shape[:3] != (B, Pnn, T):
+            raise ValueError(
+                "[_stem_forward_without_cat] feat_u shape의 (B,Pnn,T)가 맞지 않습니다.")
+        if trunk.shape[:2] != (B, Pnn):
+            raise ValueError(
+                "[_stem_forward_without_cat] trunk shape의 (B,Pnn)가 맞지 않습니다.")
+
+        Du = int(feat_u.shape[-1])
+        Dc = int(trunk.shape[-1])
+        Din = int(2 * Dx + Du + Dc)
+        if Din != int(self._Din):
+            raise ValueError(
+                f"[_stem_forward_without_cat] Din 계산값({Din})이 self._Din({int(self._Din)})과 다릅니다."
+            )
+
+        # ---- LayerNorm 통계(평균/분산) ----
+        # 큰 텐서를 만들지 않고, 조각별 sum / sumsq를 더합니다.
+        eps_ln = float(self.stem_norm.eps)
+
+        sum_prev = feat_prev.sum(dim=-1, keepdim=True,
+                                 dtype=torch.float32)  # (B,Pnn,T,1)
+        sum_fut = feat_fut.sum(dim=-1, keepdim=True,
+                               dtype=torch.float32)  # (B,Pnn,T,1)
+        sum_u = feat_u.sum(dim=-1, keepdim=True,
+                           dtype=torch.float32)  # (B,Pnn,T,1)
+
+        # trunk는 시간축에 대해 같은 값이지만, mean/var는 시간마다 달라질 수 있으므로
+        # 합/제곱합만 (B,Pnn,1,1)로 구해 broadcast 합니다.
+        trunk_t = trunk.unsqueeze(2)  # (B,Pnn,1,Dc)
+        sum_trunk = trunk_t.sum(dim=-1, keepdim=True,
+                                dtype=torch.float32)  # (B,Pnn,1,1)
+
+        sum_all = sum_prev + sum_fut + sum_u + sum_trunk  # (B,Pnn,T,1)  (broadcast)
+
+        sumsq_prev = (feat_prev * feat_prev).sum(dim=-1, keepdim=True,
+                                                 dtype=torch.float32)
+        sumsq_fut = (feat_fut * feat_fut).sum(dim=-1, keepdim=True,
+                                              dtype=torch.float32)
+        sumsq_u = (feat_u * feat_u).sum(dim=-1, keepdim=True,
+                                        dtype=torch.float32)
+        sumsq_trunk = (trunk_t * trunk_t).sum(dim=-1, keepdim=True,
+                                              dtype=torch.float32)  # (B,Pnn,1,1)
+
+        sumsq_all = sumsq_prev + sumsq_fut + sumsq_u + sumsq_trunk  # (B,Pnn,T,1)
+
+        mean = sum_all / float(Din)  # (B,Pnn,T,1) float32
+        var = (sumsq_all / float(Din)) - (mean * mean)  # (B,Pnn,T,1) float32
+        var = var.clamp_min(0.0)
+        inv_std = torch.rsqrt(var + eps_ln)  # (B,Pnn,T,1) float32
+
+        # 실제 값 계산은 입력 dtype으로(기존과 비슷한 출력/속도)
+        mean = mean.to(dtype=feat_prev.dtype)
+        inv_std = inv_std.to(dtype=feat_prev.dtype)
+
+        # ---- LayerNorm의 scale/bias를 조각별로 적용 ----
+        gamma = self.stem_norm.weight  # (Din,)
+        beta = self.stem_norm.bias  # (Din,)
+
+        # ---- Linear 가중치도 조각별로 잘라서 적용 ----
+        W = self.stem_fc.weight  # (C, Din)
+        b = self.stem_fc.bias  # (C,)
+
+        off0 = 0
+        off1 = off0 + Dx
+        off2 = off1 + Dx
+        off3 = off2 + Du
+        off4 = off3 + Dc
+        if off4 != Din:
+            raise ValueError("[_stem_forward_without_cat] 내부 오프셋 계산이 잘못되었습니다.")
+
+        def _ln_affine(x: torch.Tensor, g: torch.Tensor,
+                       be: torch.Tensor) -> torch.Tensor:
+            """(x-mean)/std 후, feature별 scale/bias 적용."""
+            g_view = g.view(1, 1, 1, -1)
+            b_view = be.view(1, 1, 1, -1)
+            x_hat = (x - mean) * inv_std
+            return x_hat * g_view + b_view
+
+        x_prev_ln = _ln_affine(feat_prev, gamma[off0:off1],
+                               beta[off0:off1])  # (B,Pnn,T,Dx)
+        x_fut_ln = _ln_affine(feat_fut, gamma[off1:off2],
+                              beta[off1:off2])  # (B,Pnn,T,Dx)
+        x_u_ln = _ln_affine(feat_u, gamma[off2:off3],
+                            beta[off2:off3])  # (B,Pnn,T,Du)
+
+        # trunk는 (B,Pnn,1,Dc)지만 mean/inv_std가 (B,Pnn,T,1)라서 자동 broadcast
+        x_trunk_ln = _ln_affine(trunk_t, gamma[off3:off4],
+                                beta[off3:off4])  # (B,Pnn,T,Dc)
+
+        # Linear: concat 후 한 번에 하는 것과 동일한 합
+        out = F.linear(x_prev_ln, W[:, off0:off1], bias=None)  # (B,Pnn,T,C)
+        out = out + F.linear(x_fut_ln, W[:, off1:off2], bias=None)
+        out = out + F.linear(x_u_ln, W[:, off2:off3], bias=None)
+        out = out + F.linear(x_trunk_ln, W[:, off3:off4], bias=None)
+        out = out + b.view(1, 1, 1, -1)
+
+        out = self.stem_act(out)  # GELU
+        return out
 
     @staticmethod
     def _to_bool_mask(mask: torch.Tensor) -> torch.Tensor:
