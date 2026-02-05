@@ -5478,60 +5478,328 @@ class FeasibleProjector(nn.Module):
             w_int = args.w_int_max
         return args.w_dir, w_int, args.w_const
 
-    # ================================================================
-    # [추가] (B,Pnn,point_len, C) 형태를 멀티 채널 SG에 넘겨주는 헬퍼
-    # ================================================================
-    def _sg_derivative_multi_for_points(
-        self,
-        sequences_points: torch.Tensor,  # (B, Pnn, point_len, C)
-        points_valid: torch.Tensor,  # (B, Pnn, point_len) bool
-        *,
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-        derivative_order: int = 1,
-    ) -> torch.Tensor:
-        """(B, Pnn, point_len, C) 모양의 데이터에서 원하는 변화율(1차/2차)을 계산합니다.
+    def _compute_active_row_indices_from_points_valid(
+            self,
+            points_valid: torch.Tensor,  # (B, Pnn, T) bool or 0/1
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """points_valid에서 '완전 무효 row'를 제외하기 위한 active row 인덱스를 구합니다.
 
         Args:
-            sequences_points: (B, Pnn, point_len, C)
-            points_valid: (B, Pnn, point_len) bool
-            dt: float
-            polyorder: int
-            max_window_length: int
-            derivative_order: 1 또는 2
+            points_valid (torch.Tensor):
+                shape: (B, Pnn, T)
+                각 (batch, neighbor) 슬롯의 시간축 유효 여부 마스크입니다.
+                True(또는 1)인 시점이 하나라도 있으면 그 row는 'active'로 봅니다.
 
         Returns:
-            derivatives_points: (B, Pnn, point_len, C)
+            Tuple[torch.Tensor, torch.Tensor]:
+                active_indices:
+                    shape: (N_active,), dtype=torch.long
+                    (B*Pnn)으로 펼친 row 중에서 active인 row의 인덱스 목록입니다.
+                active_mask_flat:
+                    shape: (B*Pnn,), dtype=torch.bool
+                    각 row가 active인지 여부입니다.
+
+        Notes:
+            - active=False인 row는 "모든 시점이 무효"이므로, SG 미분 결과가 항상 0이어야 합니다.
+            - 이런 row는 이후 SG 계산에서 완전히 제외해도 출력이 변하지 않습니다.
         """
-        batch_size, num_neighbors, point_len, num_channels = sequences_points.shape  # (B,Pnn,T,C)
+        if points_valid.dim() != 3:
+            raise ValueError(
+                "[_compute_active_row_indices_from_points_valid] points_valid는 (B,Pnn,T) 3D 텐서여야 합니다. "
+                f"got shape={tuple(points_valid.shape)}"
+            )
 
-        sequence_flat = sequences_points.reshape(
-            batch_size * num_neighbors,
-            point_len,
-            num_channels,
-        )  # (B*Pnn, T, C)
-        valid_flat = points_valid.reshape(
-            batch_size * num_neighbors,
-            point_len,
-        )  # (B*Pnn, T)
+        # (B, Pnn, T) -> bool
+        valid_bpt = self._to_bool_mask(points_valid)
 
-        derivative_flat = self._savgol_derivative_masked_multi_torch(
-            seq_bTC=sequence_flat,  # (B*Pnn, T, C)
-            valid_bT=valid_flat,  # (B*Pnn, T)
-            dt=dt,
-            polyorder=polyorder,
-            max_window_length=max_window_length,
-            derivative_order=derivative_order,
-        )  # (B*Pnn, T, C)
+        # row마다 "True가 하나라도 있나?"
+        # active_bp: (B, Pnn)
+        active_bp = valid_bpt.any(dim=-1)
 
-        derivatives_points = derivative_flat.reshape(
-            batch_size,
-            num_neighbors,
-            point_len,
-            num_channels,
+        # active_mask_flat: (B*Pnn,)
+        active_mask_flat = active_bp.reshape(-1)
+
+        # active_indices: (N_active,)
+        active_indices = active_mask_flat.nonzero(as_tuple=False).squeeze(-1)
+        return active_indices, active_mask_flat
+
+    def _scatter_active_rows_ntc_to_bptc(
+            self,
+            active_values_ntc: torch.Tensor,  # (N_active, T, C)
+            active_indices: torch.Tensor,  # (N_active,)
+            *,
+            B: int,
+            Pnn: int,
+            T: int,
+            C: int,
+            device: torch.device,
+            dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """active row에서만 계산한 (N_active,T,C) 결과를 (B,Pnn,T,C)로 되돌립니다.
+
+        Args:
+            active_values_ntc (torch.Tensor):
+                shape: (N_active, T, C)
+                active row들에서만 계산한 결과입니다.
+            active_indices (torch.Tensor):
+                shape: (N_active,), dtype=torch.long
+                (B*Pnn) flatten 기준 active row 인덱스입니다.
+            B, Pnn, T, C:
+                최종 출력 shape를 구성하기 위한 크기 값입니다.
+            device, dtype:
+                최종 출력 텐서의 device/dtype입니다.
+
+        Returns:
+            torch.Tensor:
+                out_bptc shape: (B, Pnn, T, C)
+                - active row 위치에는 active_values가 들어갑니다.
+                - inactive row 위치는 0으로 유지됩니다.
+
+        Notes:
+            - in-place 대입 대신 out-of-place index_copy를 사용해
+              active 결과로의 학습 신호가 자연스럽게 이어지도록 합니다.
+        """
+        B_Pnn = int(B * Pnn)
+
+        # (B*Pnn, T, C)  inactive는 0 유지
+        out_flat = torch.zeros((B_Pnn, T, C), device=device, dtype=dtype)
+
+        if int(active_indices.numel()) > 0:
+            idx = active_indices.to(device=device, dtype=torch.long)
+            src = active_values_ntc.to(device=device, dtype=dtype)
+            out_flat = out_flat.index_copy(0, idx, src)  # ✅ out-of-place
+
+        return out_flat.view(B, Pnn, T, C)
+
+    def _sg_derivative_multi_for_active_rows(
+            self,
+            sequence_multi_channel: torch.Tensor,  # (N, T, C)
+            valid_mask_bT: torch.Tensor,  # (N, T) bool or 0/1
+            dt: float,
+            polyorder: int,
+            max_window_length: int,
+            *,
+            derivative_order: int,
+            regularization_epsilon: float,
+    ) -> torch.Tensor:
+        """(active row들만) Savitzky–Golay 기반 미분을 계산합니다.
+
+        Args:
+            sequence_multi_channel (torch.Tensor):
+                shape: (N, T, C)
+                한 row마다 시간축 T를 가진 값(C채널)입니다.
+            valid_mask_bT (torch.Tensor):
+                shape: (N, T)
+                각 시점이 유효한지(True/False) 마스크입니다.
+            dt (float):
+                샘플 간 시간 간격(초).
+            polyorder (int):
+                SG에서 사용하는 다항식 차수.
+            max_window_length (int):
+                SG 창 길이 최대값(홀수 권장).
+            derivative_order (int):
+                1이면 1차 변화율, 2이면 2차 변화율.
+            regularization_epsilon (float):
+                작은 정규화 값(수치 안정 목적).
+
+        Returns:
+            torch.Tensor:
+                derivative shape: (N, T, C)
+                - 중심 시점이 무효인 위치는 0입니다.
+                - 계산이 어려운 위치(유효 샘플 부족 등)는 유한 차분 기반 기본값으로 채웁니다.
+
+        Notes:
+            - 이 함수는 "N row 전체가 active"라고 가정합니다(= 적어도 한 시점은 valid).
+              완전 무효 row 스킵(gather/scatter)은 바깥 래퍼에서 처리합니다.
+        """
+        if sequence_multi_channel.numel() == 0:
+            return sequence_multi_channel
+
+        if sequence_multi_channel.dim() != 3:
+            raise ValueError(
+                "[_sg_derivative_multi_for_active_rows] sequence_multi_channel은 (N,T,C) 3D여야 합니다. "
+                f"got shape={tuple(sequence_multi_channel.shape)}"
+            )
+
+        N, T, C = sequence_multi_channel.shape
+        valid_bool = self._to_bool_mask(valid_mask_bT)
+        if valid_bool.shape != (N, T):
+            raise ValueError(
+                "[_sg_derivative_multi_for_active_rows] valid_mask_bT shape이 (N,T)와 다릅니다. "
+                f"valid_mask_bT.shape={tuple(valid_bool.shape)}, expected={(N, T)}"
+            )
+
+        # 1) 기본값(대체값): 마스크를 고려한 유한 차분
+        if int(derivative_order) == 1:
+            fd_derivative = self._savgol_finite_difference_multi(
+                sequence_multi_channel=sequence_multi_channel,  # (N,T,C)
+                valid_mask_bT=valid_bool,  # (N,T)
+                dt=float(dt),
+            )
+        elif int(derivative_order) == 2:
+            fd_derivative = self._savgol_finite_difference_second_multi(
+                sequence_multi_channel=sequence_multi_channel,  # (N,T,C)
+                valid_mask_bT=valid_bool,  # (N,T)
+                dt=float(dt),
+            )
+        else:
+            raise ValueError(
+                f"[_sg_derivative_multi_for_active_rows] derivative_order는 1 또는 2만 지원합니다. got={derivative_order}"
+            )
+
+        # 2) SG 창 길이 결정
+        window_length = self._savgol_select_window_length(
+            sequence_length=int(T),
+            max_window_length=int(max_window_length),
+        )
+
+        # SG를 쓸 수 없는 조건이면(창이 너무 짧거나 polyorder가 부족하면) 기본값만 반환
+        if window_length < 3 or int(polyorder) < int(derivative_order):
+            return fd_derivative
+
+        # 3) 시간 기저/gram 미리 만들기
+        _, gram_per_k, power_per_k = self._sg_build_design_matrix_and_gram(
+            window_length=int(window_length),
+            polyorder=int(polyorder),
+            dt=float(dt),
+            device=sequence_multi_channel.device,
+            dtype=sequence_multi_channel.dtype,
+        )
+
+        # 4) 창 마스크 및 유효 샘플 개수
+        mask_window, valid_count = self._savgol_build_mask_and_count_multi(
+            valid_mask_bT=valid_bool,  # (N,T)
+            window_length=int(window_length),
+            value_dtype=sequence_multi_channel.dtype,
+        )  # mask_window: (N,T,W), valid_count: (N,T)
+
+        # 5) A_all / b_all 구성 후 solve(가능한 위치만)
+        A_all = self._savgol_build_A_all_from_mask_multi(
+            mask_window=mask_window,  # (N,T,W)
+            gram_per_k=gram_per_k,  # (W,P+1,P+1)
+        )  # (N,T,P+1,P+1)
+
+        b_all = self._savgol_build_b_all_multi(
+            sequence_multi_channel=sequence_multi_channel,  # (N,T,C)
+            mask_window=mask_window,  # (N,T,W)
+            power_per_k=power_per_k,  # (W,P+1)
+            window_length=int(window_length),
+        )  # (N,T,C,P+1)
+
+        derivative = self._savgol_solve_multi(
+            A_all=A_all,
+            b_all=b_all,
+            valid_count=valid_count,
+            valid_center_mask=valid_bool,
+            fd_derivative=fd_derivative,
+            polyorder=int(polyorder),
+            derivative_order=int(derivative_order),
+            regularization_epsilon=float(regularization_epsilon),
+        )  # (N,T,C)
+
+        return derivative
+
+    def _sg_derivative_multi_for_points(
+            self,
+            sequences_points: torch.Tensor,  # (B, Pnn, T, C)
+            points_valid: torch.Tensor,  # (B, Pnn, T) bool or 0/1
+            dt: float,
+            polyorder: int,
+            max_window_length: int,
+            *,
+            derivative_order: int = 1,
+            regularization_epsilon: Optional[float] = None,
+    ) -> torch.Tensor:
+        """(핵심 변경) 완전 무효 row는 SG 계산을 스킵하고 0을 반환하는 SG 미분 래퍼입니다.
+
+        Args:
+            sequences_points (torch.Tensor):
+                shape: (B, Pnn, T, C)
+                시간축 T를 가진 값(채널 C개)입니다.
+            points_valid (torch.Tensor):
+                shape: (B, Pnn, T)
+                각 시점이 유효한지(True/False) 마스크입니다.
+            dt, polyorder, max_window_length:
+                SG 미분 설정값입니다.
+            derivative_order (int):
+                1 또는 2 (기본 1).
+            regularization_epsilon (Optional[float]):
+                None이면 self._eps를 사용합니다.
+
+        Returns:
+            torch.Tensor:
+                derivative shape: (B, Pnn, T, C)
+                - 완전 무효 row는 전부 0.
+                - active row만 실제 SG 계산 결과가 들어갑니다.
+
+        Notes:
+            - 기존 대비 달라진 점은 "완전 무효 row를 먼저 걸러서 비싼 SG 계산을 안 한다"는 것뿐입니다.
+            - active row에 대한 계산 방식(값)은 동일합니다.
+        """
+        if sequences_points.numel() == 0:
+            return sequences_points
+
+        if sequences_points.dim() != 4:
+            raise ValueError(
+                "[_sg_derivative_multi_for_points] sequences_points는 (B,Pnn,T,C) 4D 텐서여야 합니다. "
+                f"got shape={tuple(sequences_points.shape)}"
+            )
+
+        if points_valid.shape != sequences_points.shape[:-1]:
+            raise ValueError(
+                "[_sg_derivative_multi_for_points] points_valid.shape와 sequences_points.shape[:-1]가 다릅니다. "
+                f"points_valid.shape={tuple(points_valid.shape)}, sequences_points.shape={tuple(sequences_points.shape)}"
+            )
+
+        B, Pnn, T, C = sequences_points.shape
+        device = sequences_points.device
+        dtype = sequences_points.dtype
+
+        if regularization_epsilon is None:
+            regularization_epsilon = float(self._eps)
+
+        # 1) active row 찾기: (B*Pnn) 기준
+        active_indices, _ = self._compute_active_row_indices_from_points_valid(
+            points_valid=points_valid,  # (B,Pnn,T)
+        )
+
+        # 2) active가 하나도 없으면 전부 0 반환(기존 결과와 동일)
+        if int(active_indices.numel()) == 0:
+            return sequences_points.new_zeros((B, Pnn, T, C))
+
+        # 3) active row만 gather: (N_active, T, C), (N_active, T)
+        B_Pnn = int(B * Pnn)
+        seq_flat = sequences_points.reshape(B_Pnn, T, C)
+        valid_flat = self._to_bool_mask(points_valid).reshape(B_Pnn, T)
+
+        idx = active_indices.to(device=device, dtype=torch.long)
+        seq_active = seq_flat.index_select(0, idx)  # (N_active, T, C)
+        valid_active = valid_flat.index_select(0, idx)  # (N_active, T)
+
+        # 4) SG 미분은 active row만 수행
+        deriv_active = self._sg_derivative_multi_for_active_rows(
+            sequence_multi_channel=seq_active,  # (N_active,T,C)
+            valid_mask_bT=valid_active,  # (N_active,T)
+            dt=float(dt),
+            polyorder=int(polyorder),
+            max_window_length=int(max_window_length),
+            derivative_order=int(derivative_order),
+            regularization_epsilon=float(regularization_epsilon),
+        )  # (N_active, T, C)
+
+        # 5) scatter: (B,Pnn,T,C)로 복원 (inactive는 0 유지)
+        deriv_full = self._scatter_active_rows_ntc_to_bptc(
+            active_values_ntc=deriv_active,  # (N_active,T,C)
+            active_indices=idx,  # (N_active,)
+            B=int(B),
+            Pnn=int(Pnn),
+            T=int(T),
+            C=int(C),
+            device=device,
+            dtype=dtype,
         )  # (B,Pnn,T,C)
-        return derivatives_points
+
+        return deriv_full
 
     def _assert_past_cur_valid_mask(
         self,
