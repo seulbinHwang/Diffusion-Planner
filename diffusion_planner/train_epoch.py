@@ -47,6 +47,15 @@ def _is_main_process() -> bool:
     except Exception:
         # 단일 프로세스/분산 미초기화 등
         return True
+# name -> 호출 횟수 / 누적 시간(ms)
+# - total_* : 전체 호출 기준(워밍업 포함)
+# - avg_*   : 평균 계산에 포함된 호출(워밍업 제외)
+_PROFILE_TOTAL_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_AVG_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_AVG_TOTAL_MS: Dict[str, float] = {}
+
+# 각 블록(name)별로 처음 N번 호출은 avg에서 제외
+_PROFILE_WARMUP_CALLS: int = 30
 
 
 @contextmanager
@@ -59,22 +68,14 @@ def profile_block(
 ) -> Iterator[None]:
     """코드 블록 실행 시간을 ms 단위로 출력합니다(누적 평균 포함).
 
-    Args:
-        name (str): 출력에 사용할 블록 이름.
-        enabled (bool): False면 계측 없이 그대로 실행합니다.
-        device_type (str): "cuda"면 앞/뒤로 synchronize 해서 GPU 작업까지 포함해 잽니다.
-        print_rank0_only (bool): True면 rank0에서만 print 합니다.
-
-    Notes:
-        - enabled=True일 때는 synchronize가 들어가므로, 평소 학습 속도 측정에는 부적합합니다.
-          “몇 step만” 켜고 원인 찾는 용도로 쓰는 걸 권장합니다.
+    변경점:
+        - 각 name별로 최초 _PROFILE_WARMUP_CALLS번 호출은 avg 계산에서 제외합니다.
     """
     if not enabled:
         yield
         return
 
-    is_cuda: bool = isinstance(device_type,
-                               str) and device_type.startswith("cuda")
+    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -86,22 +87,31 @@ def profile_block(
 
     elapsed_ms: float = (time.perf_counter() - t0) * 1000.0
 
-    prev_cnt: int = _PROFILE_CALL_COUNT.get(name, 0)
-    prev_sum: float = _PROFILE_TOTAL_MS.get(name, 0.0)
+    # (1) 전체 호출 카운트(워밍업 포함)
+    total_prev: int = _PROFILE_TOTAL_CALL_COUNT.get(name, 0)
+    total_now: int = total_prev + 1
+    _PROFILE_TOTAL_CALL_COUNT[name] = total_now
 
-    new_cnt: int = prev_cnt + 1
-    new_sum: float = prev_sum + float(elapsed_ms)
+    # (2) avg에 포함할지 결정: (name별) 처음 30번은 제외
+    avg_cnt_prev: int = _PROFILE_AVG_CALL_COUNT.get(name, 0)
+    avg_sum_prev: float = _PROFILE_AVG_TOTAL_MS.get(name, 0.0)
 
-    _PROFILE_CALL_COUNT[name] = new_cnt
-    _PROFILE_TOTAL_MS[name] = new_sum
+    if total_now > int(_PROFILE_WARMUP_CALLS):
+        avg_cnt_now: int = avg_cnt_prev + 1
+        avg_sum_now: float = avg_sum_prev + float(elapsed_ms)
+        _PROFILE_AVG_CALL_COUNT[name] = avg_cnt_now
+        _PROFILE_AVG_TOTAL_MS[name] = avg_sum_now
+    else:
+        avg_cnt_now = avg_cnt_prev
+        avg_sum_now = avg_sum_prev
 
-    avg_ms: float = new_sum / float(new_cnt)
+    avg_ms: float = (avg_sum_now / float(avg_cnt_now)) if avg_cnt_now > 0 else 0.0
 
     if (not print_rank0_only) or _is_main_process():
+        warmup_left = max(0, int(_PROFILE_WARMUP_CALLS) - total_now)
         print(
-            f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}"
+            f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={avg_cnt_now} | warmup_left={warmup_left}"
         )
-
 
 def _run_backward_and_step_deepspeed(
     model: nn.Module,

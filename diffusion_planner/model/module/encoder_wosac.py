@@ -15,9 +15,19 @@ import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
 
-# name -> 호출 횟수 / 누적 시간(ms)
-_PROFILE_CALL_COUNT: Dict[str, int] = {}
-_PROFILE_TOTAL_MS: Dict[str, float] = {}
+import time
+from contextlib import contextmanager
+from typing import Dict, Iterator
+
+import torch
+
+# name -> 호출 횟수 / 평균 계산에 포함된 횟수 / 평균 누적(ms)
+_PROFILE_TOTAL_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_AVG_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_AVG_TOTAL_MS: Dict[str, float] = {}
+
+# 각 name별로 처음 N번 호출은 avg 계산에서 제외
+_PROFILE_WARMUP_CALLS: int = 30
 
 
 @contextmanager
@@ -26,46 +36,62 @@ def profile_block(
     enabled: bool = True,
     device_type: str = "cuda",
 ) -> Iterator[None]:
-    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러(누적 평균 포함).
+    """코드 블록 실행 시간을 ms 단위로 출력하고, 평균(avg)은 워밍업 이후만 누적합니다.
 
-    출력 형식(예):
-        [PROFILE] some_block: 1.234 ms | avg 1.100 ms | n=10
+    동작:
+        - name(문자열)별로 호출 횟수를 셉니다.
+        - 각 name에서 처음 _PROFILE_WARMUP_CALLS번 호출은 avg 누적에서 제외합니다.
+        - 그 다음 호출부터 avg_ms = (워밍업 제외 누적 시간) / (워밍업 제외 호출 횟수) 로 출력합니다.
 
     Args:
-        name: 출력에 사용할 블록 이름(키).
-        enabled: False이면 아무 것도 출력하지 않고 그냥 실행.
-        device_type: "cuda"면 GPU 연산 정합을 위해 앞/뒤로 synchronize 수행.
+        name (str): 출력/누적의 키로 쓸 블록 이름.
+        enabled (bool): False이면 계측 없이 그대로 실행합니다.
+        device_type (str): "cuda"면 GPU 작업까지 포함해 재기 위해 앞/뒤로 synchronize 합니다.
+
+    Yields:
+        None
     """
     if not enabled:
         yield
         return
 
-    is_cuda: bool = isinstance(device_type,
-                               str) and device_type.startswith("cuda")
+    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    start_time: float = time.perf_counter()
+    t0: float = time.perf_counter()
     yield
+
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
-    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    elapsed_ms: float = (time.perf_counter() - t0) * 1000.0
 
-    # 누적 통계 업데이트
-    prev_cnt: int = _PROFILE_CALL_COUNT.get(name, 0)
-    prev_sum: float = _PROFILE_TOTAL_MS.get(name, 0.0)
+    # (1) 전체 호출 카운트(워밍업 포함)
+    total_prev: int = _PROFILE_TOTAL_CALL_COUNT.get(name, 0)
+    total_now: int = total_prev + 1
+    _PROFILE_TOTAL_CALL_COUNT[name] = total_now
 
-    new_cnt: int = prev_cnt + 1
-    new_sum: float = prev_sum + float(elapsed_ms)
+    # (2) avg 누적(워밍업 제외)
+    avg_cnt_prev: int = _PROFILE_AVG_CALL_COUNT.get(name, 0)
+    avg_sum_prev: float = _PROFILE_AVG_TOTAL_MS.get(name, 0.0)
 
-    _PROFILE_CALL_COUNT[name] = new_cnt
-    _PROFILE_TOTAL_MS[name] = new_sum
+    if total_now > int(_PROFILE_WARMUP_CALLS):
+        avg_cnt_now: int = avg_cnt_prev + 1
+        avg_sum_now: float = avg_sum_prev + float(elapsed_ms)
+        _PROFILE_AVG_CALL_COUNT[name] = avg_cnt_now
+        _PROFILE_AVG_TOTAL_MS[name] = avg_sum_now
+    else:
+        avg_cnt_now = avg_cnt_prev
+        avg_sum_now = avg_sum_prev
 
-    avg_ms: float = new_sum / float(new_cnt)
+    avg_ms: float = (avg_sum_now / float(avg_cnt_now)) if avg_cnt_now > 0 else 0.0
+    warmup_left: int = max(0, int(_PROFILE_WARMUP_CALLS) - total_now)
+
     print(
-        f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}"
+        f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={avg_cnt_now} | warmup_left={warmup_left}"
     )
+
 
 
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
