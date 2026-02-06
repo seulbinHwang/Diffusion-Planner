@@ -49,32 +49,36 @@ def _is_main_process() -> bool:
         return True
 
 
+# name -> 호출 횟수 / 누적 시간(ms)
+# - total_* : 전체 호출 기준(워밍업 포함)
+# - avg_*   : 평균 계산에 포함된 호출(워밍업 제외)
+_PROFILE_TOTAL_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_AVG_CALL_COUNT: Dict[str, int] = {}
+_PROFILE_AVG_TOTAL_MS: Dict[str, float] = {}
+
+# 각 블록(name)별로 처음 N번 호출은 avg에서 제외
+_PROFILE_WARMUP_CALLS: int = 30
+
+
 @contextmanager
 def profile_block(
-    name: str,
-    enabled: bool = True,
-    device_type: str = "cuda",
-    *,
-    print_rank0_only: bool = True,
+        name: str,
+        enabled: bool = True,
+        device_type: str = "cuda",
+        *,
+        print_rank0_only: bool = True,
 ) -> Iterator[None]:
     """코드 블록 실행 시간을 ms 단위로 출력합니다(누적 평균 포함).
 
-    Args:
-        name (str): 출력에 사용할 블록 이름.
-        enabled (bool): False면 계측 없이 그대로 실행합니다.
-        device_type (str): "cuda"면 앞/뒤로 synchronize 해서 GPU 작업까지 포함해 잽니다.
-        print_rank0_only (bool): True면 rank0에서만 print 합니다.
-
-    Notes:
-        - enabled=True일 때는 synchronize가 들어가므로, 평소 학습 속도 측정에는 부적합합니다.
-          “몇 step만” 켜고 원인 찾는 용도로 쓰는 걸 권장합니다.
+    변경점:
+        - 각 name별로 최초 _PROFILE_WARMUP_CALLS번 호출은 avg 계산에서 제외합니다.
     """
     if not enabled:
         yield
         return
 
-    is_cuda: bool = isinstance(device_type,
-                               str) and device_type.startswith("cuda")
+    is_cuda: bool = isinstance(device_type, str) and device_type.startswith(
+        "cuda")
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -86,29 +90,40 @@ def profile_block(
 
     elapsed_ms: float = (time.perf_counter() - t0) * 1000.0
 
-    prev_cnt: int = _PROFILE_CALL_COUNT.get(name, 0)
-    prev_sum: float = _PROFILE_TOTAL_MS.get(name, 0.0)
+    # (1) 전체 호출 카운트(워밍업 포함)
+    total_prev: int = _PROFILE_TOTAL_CALL_COUNT.get(name, 0)
+    total_now: int = total_prev + 1
+    _PROFILE_TOTAL_CALL_COUNT[name] = total_now
 
-    new_cnt: int = prev_cnt + 1
-    new_sum: float = prev_sum + float(elapsed_ms)
+    # (2) avg에 포함할지 결정: (name별) 처음 30번은 제외
+    avg_cnt_prev: int = _PROFILE_AVG_CALL_COUNT.get(name, 0)
+    avg_sum_prev: float = _PROFILE_AVG_TOTAL_MS.get(name, 0.0)
 
-    _PROFILE_CALL_COUNT[name] = new_cnt
-    _PROFILE_TOTAL_MS[name] = new_sum
+    if total_now > int(_PROFILE_WARMUP_CALLS):
+        avg_cnt_now: int = avg_cnt_prev + 1
+        avg_sum_now: float = avg_sum_prev + float(elapsed_ms)
+        _PROFILE_AVG_CALL_COUNT[name] = avg_cnt_now
+        _PROFILE_AVG_TOTAL_MS[name] = avg_sum_now
+    else:
+        avg_cnt_now = avg_cnt_prev
+        avg_sum_now = avg_sum_prev
 
-    avg_ms: float = new_sum / float(new_cnt)
+    avg_ms: float = (
+                avg_sum_now / float(avg_cnt_now)) if avg_cnt_now > 0 else 0.0
 
     if (not print_rank0_only) or _is_main_process():
+        warmup_left = max(0, int(_PROFILE_WARMUP_CALLS) - total_now)
         print(
-            f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={new_cnt}"
+            f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={avg_cnt_now} | warmup_left={warmup_left}"
         )
 
 
 def _run_backward_and_step_deepspeed(
-    model: nn.Module,
-    loss_tensor: torch.Tensor,
-    *,
-    enable_profile: bool,
-    device_type: str,
+        model: nn.Module,
+        loss_tensor: torch.Tensor,
+        *,
+        enable_profile: bool,
+        device_type: str,
 ) -> None:
     """DeepSpeed 경로에서 역전파+업데이트를 수행하고, 구간별 시간을 출력합니다.
 
@@ -139,14 +154,14 @@ def _run_backward_and_step_deepspeed(
 
 
 def _run_backward_and_step_pytorch(
-    model: nn.Module,
-    loss_tensor: torch.Tensor,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    *,
-    max_grad_norm: float,
-    enable_profile: bool,
-    device_type: str,
+        model: nn.Module,
+        loss_tensor: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any,
+        *,
+        max_grad_norm: float,
+        enable_profile: bool,
+        device_type: str,
 ) -> None:
     """일반(PyTorch/DDP) 경로에서 역전파+클리핑+업데이트를 수행하고 구간별 시간을 출력합니다.
 
@@ -193,14 +208,14 @@ def _run_backward_and_step_pytorch(
 
 
 def _maybe_run_torch_profiler_for_backward_step(
-    args: Any,
-    *,
-    use_deepspeed: bool,
-    model: nn.Module,
-    loss_tensor: torch.Tensor,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    max_grad_norm: float,
+        args: Any,
+        *,
+        use_deepspeed: bool,
+        model: nn.Module,
+        loss_tensor: torch.Tensor,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any,
+        max_grad_norm: float,
 ) -> bool:
     """(선택) torch.profiler로 backward/step 내부를 더 자세히 캡처합니다.
 
@@ -273,8 +288,8 @@ def _maybe_run_torch_profiler_for_backward_step(
 
 
 def _move_batch_to_device(
-    batch: Dict[str, Any],
-    device: str,
+        batch: Dict[str, Any],
+        device: str,
 ) -> Dict[str, Any]:
     """배치 dict에서 torch.Tensor만 device로 옮기고, 나머지(None 포함)는 그대로 둔다."""
     agent_route_lane_order_agent_num = None
@@ -298,8 +313,8 @@ def _move_batch_to_device(
 
 
 def assert_cur_future_valid_mask_np(
-    valid_bpt: np.ndarray,
-    context: str = "savgol_filter_for_control",
+        valid_bpt: np.ndarray,
+        context: str = "savgol_filter_for_control",
 ) -> None:
     """
     유효 마스크가 각 (b,p) 행마다 True*False* (단조 감소)인지 검증 (NumPy 버전).
@@ -355,8 +370,8 @@ def assert_cur_future_valid_mask_np(
 
 
 def _prepare_batch_for_device(
-    batch: Dict[str, torch.Tensor],
-    device: str,
+        batch: Dict[str, torch.Tensor],
+        device: str,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     """배치 dict를 GPU/CPU로 옮기고, 모델 상한에 맞게 축을 잘라 입력/정답을 나눈다.
 
@@ -424,8 +439,8 @@ def _as_bool_mask(mask: torch.Tensor) -> torch.Tensor:
 
 
 def _restore_padding_values_inplace(
-    inputs: Dict[str, torch.Tensor],
-    pad_masks: Dict[str, torch.Tensor],
+        inputs: Dict[str, torch.Tensor],
+        pad_masks: Dict[str, torch.Tensor],
 ) -> None:
     """pad_masks로 지정된 위치를 다시 0으로 되돌린다.
 
@@ -452,7 +467,8 @@ def _restore_padding_values_inplace(
 
 
 def _build_near_future_4dim_and_mask(
-    near_future_gt_3_dim: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        near_future_gt_3_dim: torch.Tensor, ) -> Tuple[
+    torch.Tensor, torch.Tensor]:
     """yaw를 cos/sin으로 확장하고, 비어 있는 구간 마스크를 만든다.
 
     처리 내용:
@@ -508,11 +524,11 @@ def _build_near_future_4dim_and_mask(
 
 
 def _compute_loss_dict(
-    loss_dict: Dict[str, torch.Tensor],
-    args: argparse.Namespace,
-    model: nn.Module,
-    norm_inputs: Dict[str, torch.Tensor],
-    batch_num_in_all_epoch: int,
+        loss_dict: Dict[str, torch.Tensor],
+        args: argparse.Namespace,
+        model: nn.Module,
+        norm_inputs: Dict[str, torch.Tensor],
+        batch_num_in_all_epoch: int,
 ) -> Dict[str, torch.Tensor]:
     """diffusion 손실과 feasible 가중합까지 포함한 loss_dict dict 를 계산한다.
 
@@ -590,11 +606,11 @@ def _compute_loss_dict(
 
 
 def _backward_and_step(
-    loss_dict: Dict[str, torch.Tensor],
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: Any,
-    args: Any,
+        loss_dict: Dict[str, torch.Tensor],
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler: Any,
+        args: Any,
 ) -> float:
     """역전파/업데이트를 수행하고, (선택) 내부 시간을 더 잘게 출력합니다.
 
@@ -616,7 +632,8 @@ def _backward_and_step(
     device_type: str = "cuda" if loss_tensor.is_cuda else "cpu"
 
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False)) \
-        and hasattr(model, "backward") and hasattr(model, "step")
+                          and hasattr(model, "backward") and hasattr(model,
+                                                                     "step")
 
     # ✅ 내부 구간 프로파일링 on/off (기본은 False)
     enable_profile: bool = bool(getattr(args, "profile_backward_detail", False))
@@ -695,13 +712,13 @@ def _update_ema_if_needed(ema: Optional[object], model: nn.Module) -> None:
 
 
 def train_epoch(
-    data_loader,
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    args: argparse.Namespace,
-    ema: Optional[object],
-    scheduler,
-    batch_num_in_all_epoch: int,
+        data_loader,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        args: argparse.Namespace,
+        ema: Optional[object],
+        scheduler,
+        batch_num_in_all_epoch: int,
 ) -> Tuple[Dict[str, float], float]:
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행한다.
 
@@ -711,7 +728,7 @@ def train_epoch(
       3) 각 배치에 대해
          - device 로 이동 및 상한 클리핑(_prepare_batch_for_device)
          - augmentation, near future mask/ near future 4차원 궤적 생성
-         - 관측 normalization 
+         - 관측 normalization
          - diffusion 손실 / feasible 손실 합성
          - 역전파, optimizer/scheduler step, EMA 업데이트
          - 배치별 loss 를 epoch_loss_dict_list 리스트에 모은다.
@@ -775,9 +792,9 @@ def train_epoch(
             # 5) loss 계산 + 역전파 + optimizer/scheduler step
             """
             이번 배치(batch)를 학습하기 전에, 이전 배치에서 남아있는 기울기(gradient) 값을 깨끗이 지우는 작업
-            
+
             (DeepSpeed를 쓰면 optimizer가 모델 내부에 묶여 동작하는 경우가 많아서, “모델에게” 초기화를 맡기는 방식이 맞습니다.)
-            
+
             set_to_none=True는 기울기 값을 “0으로 채우기”보다 **아예 비워(None으로 만들기)**에 가까워서, 보통 메모리/속도 면에서 조금 더 유리할 수 있습니다.
             """
             if args.use_deepspeed and hasattr(model, "zero_grad"):
@@ -853,7 +870,7 @@ def train_epoch(
     {"loss": 0.42, "neighbor_prediction_loss": 0.3, ...}
     """
     epoch_mean_loss: Dict[str,
-                          float] = get_epoch_mean_loss(epoch_loss_dict_list)
+    float] = get_epoch_mean_loss(epoch_loss_dict_list)
 
     if args.ddp:
         """ ddp.reduce_and_average_losses
