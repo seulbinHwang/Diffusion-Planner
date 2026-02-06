@@ -457,7 +457,7 @@ def get_args():
 
     parser.add_argument("--max_grad_norm",
                         type=float,
-                        default=3.0,
+                        default=1.0,
                         help="gradient clipping 기준값")
     parser.add_argument("--stats_accel_v_stop_vehicle_mps",
                         type=float,
