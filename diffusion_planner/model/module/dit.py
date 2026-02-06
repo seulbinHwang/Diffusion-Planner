@@ -44,6 +44,58 @@ except Exception as _e1:
         flash_attn_varlen_cross_func = None
 
 
+def _fast_layer_norm(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
+    """LayerNorm을 한 번 호출로 계산합니다.
+
+    Args:
+        x (torch.Tensor): 입력. shape: (..., D)
+        ln (nn.LayerNorm): LayerNorm 모듈(내부 weight/bias/eps 사용)
+
+    Returns:
+        torch.Tensor: 출력. shape: (..., D)
+    """
+    if x.numel() == 0:
+        return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
+    return F.layer_norm(x, ln.normalized_shape, ln.weight, ln.bias, ln.eps)
+
+
+def _fast_modulated_layer_norm(
+    x: torch.Tensor,           # shape: (..., D)
+    ln: nn.LayerNorm,
+    delta_scale: torch.Tensor, # shape: (..., D)
+    shift: torch.Tensor,       # shape: (..., D)
+) -> torch.Tensor:
+    """LayerNorm 결과에 (1+delta_scale)과 shift를 적용하되, 호출 수를 줄입니다.
+
+    계산식(의미 동일):
+        y = LayerNorm(x)
+        out = y * (1 + delta_scale) + shift
+
+    구현(커널 호출 줄이기 목적):
+        y*(1+ds) = y + ds*y 로 바꿔서 addcmul로 처리합니다.
+
+    Args:
+        x (torch.Tensor): 입력. shape: (..., D)
+        ln (nn.LayerNorm): LayerNorm 모듈
+        delta_scale (torch.Tensor): 스케일 보정. shape: (..., D)
+        shift (torch.Tensor): 이동 보정. shape: (..., D)
+
+    Returns:
+        torch.Tensor: 출력. shape: (..., D)
+    """
+    y = _fast_layer_norm(x, ln)  # (..., D)
+
+    if delta_scale.device != y.device or delta_scale.dtype != y.dtype:
+        delta_scale = delta_scale.to(device=y.device, dtype=y.dtype)
+    if shift.device != y.device or shift.dtype != y.dtype:
+        shift = shift.to(device=y.device, dtype=y.dtype)
+
+    # y + delta_scale * y  (1회)
+    y_scaled = torch.addcmul(y, delta_scale, y)  # (..., D)
+    # + shift (1회)
+    return y_scaled + shift  # (..., D)
+
+
 # ===========================================================
 class FlashAttnKVCache(NamedTuple):
     """Cross-Attention에서 K/V 쪽(scene 토큰)을 한 번만 펼쳐서 재사용하기 위한 캐시.
@@ -647,20 +699,22 @@ class DiTBlock(nn.Module):
             cu_seqlens_q: torch.Tensor,  # (B+1,) int32
             max_seqlen_q: int,
             cross_kv_cache: FlashAttnKVCache,
-            pram_v2_modulations: Dict[str,
-                                      ModulationTriplet],  # 값 텐서 shape: (Tq, D)
+            pram_v2_modulations: Dict[str, ModulationTriplet],
+            # 값 텐서 shape: (Tq, D)
     ) -> torch.Tensor:
-        """블록 전체를 (Tq, D) packed 토큰에서만 수행합니다.
+        """(Tq, D) 유효 토큰에 대해서만 블록을 수행합니다.
 
-        - LayerNorm/MLP까지 전부 유효 토큰만 계산합니다.
-        - Cross-Attn의 KV(scene 토큰)는 캐시된 kv_unpad/cu_k/max_k를 재사용합니다.
+        after_weak에서 반영하는 변경점:
+          - y*(1+ds)+sh 와 x + g*f 를 각각 "작은 연산 여러 번" 대신
+            addcmul 기반으로 계산해 GPU 호출 수를 줄입니다.
+          - Cross-Attn은 cross_kv_cache(K/V가 미리 펼쳐진 형태)를 그대로 재사용합니다.
 
         Args:
-            x_unpad: (Tq, D) 유효 에이전트 토큰
-            cu_seqlens_q: (B+1,) 누적 길이(int32)
-            max_seqlen_q: 배치 내 최대 길이
-            cross_kv_cache: scene KV 캐시
-            pram_v2_modulations: {"SA","FFN","CA"} 각 ModulationTriplet
+            x_unpad: (Tq, D)
+            cu_seqlens_q: (B+1,) int32
+            max_seqlen_q: int
+            cross_kv_cache: (kv_unpad, cu_seqlens_k, max_seqlen_k)
+            pram_v2_modulations: {"SA","FFN","CA"} -> ModulationTriplet
                 - delta_scale/shift/gate: (Tq, D)
 
         Returns:
@@ -672,47 +726,69 @@ class DiTBlock(nn.Module):
 
         # ----- SA -----
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
-        y = self.norm1(x_unpad)  # (Tq, D)
-        ds = sa_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = sa_mod.shift.to(dtype=y.dtype, device=y.device)
-        y_tilde = y * (1.0 + ds) + sh
+        y_tilde = _fast_modulated_layer_norm(
+            x=x_unpad,  # (Tq, D)
+            ln=self.norm1,
+            delta_scale=sa_mod.delta_scale,  # (Tq, D)
+            shift=sa_mod.shift,  # (Tq, D)
+        )  # (Tq, D)
+
         f_sa = self._self_attn_flash_varlen_packed(
             x_unpad=y_tilde,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-        )
-        g = sa_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_sa
+        )  # (Tq, D)
+
+        g_sa = sa_mod.gate
+        if g_sa.device != x_unpad.device or g_sa.dtype != x_unpad.dtype:
+            g_sa = g_sa.to(device=x_unpad.device, dtype=x_unpad.dtype)
+        x_unpad = torch.addcmul(x_unpad, g_sa, f_sa)  # (Tq, D)
 
         # ----- FFN(MLP1) -----
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
-        y = self.norm2(x_unpad)
-        ds = ffn_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = ffn_mod.shift.to(dtype=y.dtype, device=y.device)
-        y_tilde = y * (1.0 + ds) + sh
-        f_ffn = self.mlp1(y_tilde)
-        g = ffn_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_ffn
+        y_tilde = _fast_modulated_layer_norm(
+            x=x_unpad,
+            ln=self.norm2,
+            delta_scale=ffn_mod.delta_scale,
+            shift=ffn_mod.shift,
+        )  # (Tq, D)
+
+        f_ffn = self.mlp1(y_tilde)  # (Tq, D)
+
+        g_ffn = ffn_mod.gate
+        if g_ffn.device != x_unpad.device or g_ffn.dtype != x_unpad.dtype:
+            g_ffn = g_ffn.to(device=x_unpad.device, dtype=x_unpad.dtype)
+        x_unpad = torch.addcmul(x_unpad, g_ffn, f_ffn)  # (Tq, D)
 
         # ----- CA -----
         ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
-        y = self.norm3(x_unpad)
-        ds = ca_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = ca_mod.shift.to(dtype=y.dtype, device=y.device)
-        q_styled = y * (1.0 + ds) + sh
+        q_styled = _fast_modulated_layer_norm(
+            x=x_unpad,
+            ln=self.norm3,
+            delta_scale=ca_mod.delta_scale,
+            shift=ca_mod.shift,
+        )  # (Tq, D)
+
         f_ca = self._cross_attn_flash_varlen_packed(
             q_unpad=q_styled,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-            kv_cache=cross_kv_cache,
-        )
-        g = ca_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_ca
+            kv_cache=cross_kv_cache,  # ✅ KV 재사용
+        )  # (Tq, D)
+
+        g_ca = ca_mod.gate
+        if g_ca.device != x_unpad.device or g_ca.dtype != x_unpad.dtype:
+            g_ca = g_ca.to(device=x_unpad.device, dtype=x_unpad.dtype)
+        x_unpad = torch.addcmul(x_unpad, g_ca, f_ca)  # (Tq, D)
 
         # ----- MLP2 -----
-        x_unpad = x_unpad + self.gate_mlp2.to(
-            dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(
-                self.norm4(x_unpad))
+        y4 = _fast_layer_norm(x_unpad, self.norm4)  # (Tq, D)
+        mlp2_out = self.mlp2(y4)  # (Tq, D)
+
+        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype,
+                                  device=x_unpad.device)  # shape: ()
+        x_unpad = torch.addcmul(x_unpad, gate2, mlp2_out)  # (Tq, D)
+
         return x_unpad
 
     def _apply_modulated_mlp1(

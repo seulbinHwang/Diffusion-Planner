@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import math
 from diffusion_planner.model.module.mixer import MixerBlock
 from flash_attn.bert_padding import unpad_input, pad_input
+from diffusion_planner.model.module.mixer import MixerBlock, Conv1dMlp
+
 
 # ==== (encoder.py 상단 import 근처에 추가) ====
 from typing import Tuple  # 이미 있으면 중복 추가 불필요
@@ -1845,17 +1847,14 @@ class RoadSafetyFusionEncoder(nn.Module):
         is_valid: Optional[torch.Tensor],  # (B, N) or None
         category_index: int,
         closed: bool,
-        road_edge_type: Optional[
-            torch.Tensor] = None,  # (B, N, 3) road_edge만 사용
+        road_edge_type: Optional[torch.Tensor] = None,  # (B, N, 3) road_edge만 사용
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """한 종류의 요소들을 (B, N, hidden_dim) 임베딩으로 바꿉니다.
 
-        Args:
-            points: (B, N, S, 2)
-            is_valid: (B, N) 또는 None
-            category_index: 0..4 (stop/cross/speed/driveway/edge)
-            closed: 폴리곤이면 True, 폴리라인이면 False
-            road_edge_type: (B, N, 3) 또는 None
+        after_weak 변경점
+        - 유효 개수(num_valid)를 .item()로 뽑아 분기하지 않습니다.
+        - 유효 요소가 0개여도, "빈 텐서 흐름"으로 자연스럽게 통과하게 만듭니다.
+          (빈 텐서일 때도 reshape/대입은 안전하게 no-op로 동작)
 
         Returns:
             emb:  (B, N, H)
@@ -1866,61 +1865,50 @@ class RoadSafetyFusionEncoder(nn.Module):
         device = points.device
         out_dtype = self._get_output_dtype(points)
 
-        element_mask = self._build_element_mask(points,
-                                                is_valid)  # (B, N) True=pad
-        valid_flat = (~element_mask).reshape(B * N)  # (B*N,)
-        num_valid: int = int(valid_flat.sum().item())
+        element_mask = self._build_element_mask(points, is_valid)  # (B, N) True=pad
+        valid_flat = (~element_mask).reshape(B * N)  # (B*N,) bool
 
-        emb_flat = torch.zeros((B * N, self.hidden_dim),
-                               device=device,
-                               dtype=out_dtype)  # (B*N, H)
-        pos4_flat = torch.zeros((B * N, 4), device=device,
-                                dtype=out_dtype)  # (B*N, 4)
+        # (B*N, S, 2) -> (M, S, 2)
+        points_flat = points.reshape(B * N, S, 2)
+        points_valid = points_flat[valid_flat]  # (M, S, 2) (M이 0일 수도 있음)
 
-        if num_valid > 0:
-            points_flat = points.reshape(B * N, S, 2)  # (B*N, S, 2)
-            points_valid = points_flat[valid_flat]  # (M, S, 2)
+        # (M,8), (M,4)
+        numeric_feat_f32, pos4_f32 = self._compute_geometry_features(points_valid, closed=closed)
+        numeric_feat = numeric_feat_f32.to(device=device, dtype=out_dtype)  # (M,8)
 
-            numeric_feat_f32, pos4_f32 = self._compute_geometry_features(
-                points_valid, closed=closed)  # (M,8),(M,4)
-            numeric_feat = numeric_feat_f32.to(device=device,
-                                               dtype=out_dtype)  # (M,8)
+        # (M,H)
+        emb_valid = self.numeric_mlp(numeric_feat)  # (M,H)
 
-            emb_valid = self.numeric_mlp(numeric_feat)  # (M, H)
+        # 카테고리 임베딩(게이트로 작게 시작) - (1,H)로 만들어 broadcast
+        onehot = torch.zeros((1, 5), device=device, dtype=emb_valid.dtype)  # (1,5)
+        onehot[0, category_index] = 1.0
+        cat_emb = self.category_emb(onehot)  # (1, H)
+        emb_valid = emb_valid + self.category_scale.to(emb_valid.dtype) * cat_emb  # (M,H) + (1,H)
 
-            # 카테고리 임베딩(게이트로 작게 시작)
-            onehot = torch.zeros((1, 5), device=device,
-                                 dtype=emb_valid.dtype)  # (1,5)
-            onehot[0, category_index] = 1.0
-            cat_emb = self.category_emb(onehot).expand(num_valid, -1)  # (M, H)
-            emb_valid = emb_valid + self.category_scale.to(
-                emb_valid.dtype) * cat_emb
+        # road_edge_type 임베딩(road_edge에서만)
+        if road_edge_type is not None:
+            if road_edge_type.shape[:2] != (B, N) or road_edge_type.shape[-1] != 3:
+                raise ValueError(
+                    f"road_edge_type must be (B, N, 3). got {tuple(road_edge_type.shape)}"
+                )
+            edge_type_flat = road_edge_type.reshape(B * N, 3).to(device=device, dtype=emb_valid.dtype)  # (B*N,3)
+            edge_type_valid = edge_type_flat[valid_flat]  # (M,3)
+            emb_valid = emb_valid + self.road_edge_type_scale.to(emb_valid.dtype) * self.road_edge_type_emb(edge_type_valid)
 
-            # road_edge_type 임베딩(road_edge에서만)
-            if road_edge_type is not None:
-                if road_edge_type.shape[:2] != (
-                        B, N) or road_edge_type.shape[-1] != 3:
-                    raise ValueError(
-                        f"road_edge_type must be (B, N, 3). got {tuple(road_edge_type.shape)}"
-                    )
-                edge_type_valid = road_edge_type.reshape(
-                    B * N, 3)[valid_flat].to(device=device,
-                                             dtype=emb_valid.dtype)  # (M,3)
-                emb_valid = emb_valid + self.road_edge_type_scale.to(
-                    emb_valid.dtype) * self.road_edge_type_emb(edge_type_valid)
+        emb_valid = self.in_norm(emb_valid)  # (M, H)
 
-            emb_valid = self.in_norm(emb_valid)  # (M, H)
+        # scatter back
+        emb_flat = torch.zeros((B * N, self.hidden_dim), device=device, dtype=out_dtype)  # (B*N, H)
+        pos4_flat = torch.zeros((B * N, 4), device=device, dtype=out_dtype)  # (B*N, 4)
 
-            emb_flat[valid_flat] = emb_valid.to(out_dtype)
-            pos4_flat[valid_flat] = pos4_f32.to(device=device, dtype=out_dtype)
+        emb_flat[valid_flat] = emb_valid.to(out_dtype)  # M==0이면 no-op
+        pos4_flat[valid_flat] = pos4_f32.to(device=device, dtype=out_dtype)
 
-        emb = emb_flat.reshape(B, N, self.hidden_dim)  # (B, N, H)
-        pos4 = pos4_flat.reshape(B, N, 4)  # (B, N, 4)
+        emb = emb_flat.reshape(B, N, self.hidden_dim)  # (B,N,H)
+        pos4 = pos4_flat.reshape(B, N, 4)  # (B,N,4)
 
-        # pad 위치는 0 고정
         emb = emb.masked_fill(element_mask.unsqueeze(-1), 0.0)
         pos4 = pos4.masked_fill(element_mask.unsqueeze(-1), 0.0)
-
         return emb, element_mask, pos4
 
     @staticmethod
@@ -2049,100 +2037,57 @@ class RoadSafetyFusionEncoder(nn.Module):
     # ------------------------- forward ------------------------- #
 
     def forward(
-            self,
-            stop_sign_points: Optional[torch.Tensor],  # (B, Ns, S, 2)
-            stop_sign_is_valid: Optional[torch.Tensor],  # (B, Ns)
-            crosswalk_points: Optional[torch.Tensor],  # (B, Nc, S, 2)
-            crosswalk_is_valid: Optional[torch.Tensor],  # (B, Nc)
-            speed_bump_points: Optional[torch.Tensor],  # (B, Nb, S, 2)
-            speed_bump_is_valid: Optional[torch.Tensor],  # (B, Nb)
-            driveway_points: Optional[torch.Tensor],  # (B, Nd, S, 2)
-            driveway_is_valid: Optional[torch.Tensor],  # (B, Nd)
-            road_edge: Optional[torch.Tensor],  # (B, Ne, S, 2)
-            road_edge_is_valid: Optional[torch.Tensor],  # (B, Ne)
-            road_edge_type: Optional[torch.Tensor],  # (B, Ne, 3)
+        self,
+        stop_sign_points: Optional[torch.Tensor],      # (B, Ns, S, 2)
+        stop_sign_is_valid: Optional[torch.Tensor],    # (B, Ns)
+        crosswalk_points: Optional[torch.Tensor],      # (B, Nc, S, 2)
+        crosswalk_is_valid: Optional[torch.Tensor],    # (B, Nc)
+        speed_bump_points: Optional[torch.Tensor],     # (B, Nb, S, 2)
+        speed_bump_is_valid: Optional[torch.Tensor],   # (B, Nb)
+        driveway_points: Optional[torch.Tensor],       # (B, Nd, S, 2)
+        driveway_is_valid: Optional[torch.Tensor],     # (B, Nd)
+        road_edge: Optional[torch.Tensor],             # (B, Ne, S, 2)
+        road_edge_is_valid: Optional[torch.Tensor],    # (B, Ne)
+        road_edge_type: Optional[torch.Tensor],        # (B, Ne, 3)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Road-safety 입력을 요약 토큰으로 변환합니다.
 
-        Returns:
-            encoding_road_safety: (B, num_seeds, hidden_dim)
-            road_safety_mask:     (B, num_seeds)  True=pad
-            road_safety_pos:      (B, num_seeds, 9)
+        after_weak 변경점
+        - total_valid = (...).sum().item()로 CPU 동기화 후 분기하던 부분을 없앱니다.
+        - _seed_pool이 알아서(마스크 기반으로) 유효가 0인 경우도 처리하도록 둡니다.
         """
         B = self._infer_batch_size([
-            stop_sign_points, stop_sign_is_valid, crosswalk_points,
-            crosswalk_is_valid, speed_bump_points, speed_bump_is_valid,
-            driveway_points, driveway_is_valid, road_edge, road_edge_is_valid,
+            stop_sign_points, stop_sign_is_valid,
+            crosswalk_points, crosswalk_is_valid,
+            speed_bump_points, speed_bump_is_valid,
+            driveway_points, driveway_is_valid,
+            road_edge, road_edge_is_valid,
             road_edge_type
         ])
 
         parts: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
-        # 카테고리 인덱스: 0 stop, 1 crosswalk, 2 speed_bump, 3 driveway, 4 road_edge
         if stop_sign_points is not None:
-            parts.append(
-                self._encode_category(stop_sign_points,
-                                      stop_sign_is_valid,
-                                      0,
-                                      closed=True))
+            parts.append(self._encode_category(stop_sign_points, stop_sign_is_valid, 0, closed=True))
         if crosswalk_points is not None:
-            parts.append(
-                self._encode_category(crosswalk_points,
-                                      crosswalk_is_valid,
-                                      1,
-                                      closed=True))
+            parts.append(self._encode_category(crosswalk_points, crosswalk_is_valid, 1, closed=True))
         if speed_bump_points is not None:
-            parts.append(
-                self._encode_category(speed_bump_points,
-                                      speed_bump_is_valid,
-                                      2,
-                                      closed=True))
+            parts.append(self._encode_category(speed_bump_points, speed_bump_is_valid, 2, closed=True))
         if driveway_points is not None:
-            parts.append(
-                self._encode_category(driveway_points,
-                                      driveway_is_valid,
-                                      3,
-                                      closed=True))
+            parts.append(self._encode_category(driveway_points, driveway_is_valid, 3, closed=True))
         if road_edge is not None:
-            parts.append(
-                self._encode_category(road_edge,
-                                      road_edge_is_valid,
-                                      4,
-                                      closed=False,
-                                      road_edge_type=road_edge_type))
+            parts.append(self._encode_category(road_edge, road_edge_is_valid, 4, closed=False, road_edge_type=road_edge_type))
 
         if len(parts) == 0:
-            raise ValueError(
-                "RoadSafetyFusionEncoder: 모든 입력이 None이라 처리할 수 없습니다.")
+            raise ValueError("RoadSafetyFusionEncoder: 모든 입력이 None이라 처리할 수 없습니다.")
 
-        elements_emb, elements_mask, elements_pos4 = self._concat_parts(
-            parts)  # (B,N,H),(B,N),(B,N,4)
-        total_valid = int((~elements_mask).sum().item())
+        elements_emb, elements_mask, elements_pos4 = self._concat_parts(parts)  # (B,N,H),(B,N),(B,N,4)
 
-        # 유효 요소가 하나도 없으면: 전부 pad 토큰 반환 + unused param 방지 터치
-        if total_valid == 0:
-            ref = elements_emb
-            seed_emb = torch.zeros((B, self.num_seeds, self.hidden_dim),
-                                   device=ref.device,
-                                   dtype=ref.dtype)
-            seed_mask = torch.ones((B, self.num_seeds),
-                                   device=ref.device,
-                                   dtype=torch.bool)
-            seed_pos4 = torch.zeros((B, self.num_seeds, 4),
-                                    device=ref.device,
-                                    dtype=ref.dtype)
-            seed_emb = self._touch_self_parameters(seed_emb)
-            road_safety_pos = self._build_pos9_from_pos4(seed_pos4)
-            road_safety_pos = road_safety_pos.masked_fill(
-                seed_mask.unsqueeze(-1), 0.0)
-            return seed_emb, seed_mask, road_safety_pos
-
-        seed_emb, seed_mask, seed_pos4 = self._seed_pool(
-            elements_emb, elements_pos4, elements_mask)
+        seed_emb, seed_mask, seed_pos4 = self._seed_pool(elements_emb, elements_pos4, elements_mask)
         road_safety_pos = self._build_pos9_from_pos4(seed_pos4)
-        road_safety_pos = road_safety_pos.masked_fill(seed_mask.unsqueeze(-1),
-                                                      0.0)
+        road_safety_pos = road_safety_pos.masked_fill(seed_mask.unsqueeze(-1), 0.0)
         return seed_emb, seed_mask, road_safety_pos
+
 
 
 class LaneSummaryTokenPooler(nn.Module):
@@ -2345,14 +2290,10 @@ class LaneSummaryTokenPooler(nn.Module):
                               lane_embeddings.float())
         logits = logits / math.sqrt(max(1.0, float(H)))  # (B,M,L)
 
-        if lane_mask.any().item():
-            logits = logits.masked_fill(lane_mask.unsqueeze(1), float("-inf"))
+        logits = logits.masked_fill(lane_mask.unsqueeze(1), float("-inf"))
 
-        # 전부 패딩인 배치 softmax NaN 방지
         all_off = lane_mask.all(dim=1)  # (B,)
-        if all_off.any().item():
-            logits = logits.clone()
-            logits[all_off] = 0.0
+        logits = logits.masked_fill(all_off.view(B, 1, 1), 0.0)
 
         attn = F.softmax(logits, dim=-1)  # (B,M,L) float32
         if self.attn_drop_p > 0 and self.training:
@@ -2468,13 +2409,14 @@ class LaneFusionEncoder(nn.Module):
         )
 
         # ✅ (길이 축 압축) lane_len(예:20) -> T_small(기본 16)
-        # 입력은 (num_valid, C, lane_len) 이고, 마지막 축(lane_len)을 학습으로 요약합니다.
-        self.token_pre_project = Mlp(
-            in_features=lane_len,
-            hidden_features=int(token_pre_hidden_dim),
-            out_features=int(tokens_mlp_dim),
-            act_layer=nn.GELU,
-            drop=0.0,
+        # 입력은 (num_valid, lane_len, C)이고,
+        # lane_len 축을 "채널"로 보고 Conv1d(kernel=1)로 T_small로 줄입니다.
+        self.token_pre_project = Conv1dMlp(
+            in_channels=int(lane_len),
+            hidden_channels=int(token_pre_hidden_dim),
+            out_channels=int(tokens_mlp_dim),
+            drop_p=0.0,
+            act_layer=nn.GELU(),
         )
 
         # ✅ 토큰 단계 MixerBlock: 토큰 섞기는 유지, 특징 쪽 변환은 ratio로 축소
@@ -3076,17 +3018,13 @@ class LaneFusionEncoder(nn.Module):
                 lanes_valid)  # (num_valid, lane_len, C)
 
         # ============================================================
-        # (3) token_pre_project: lane_len -> T_small (기본 16)
+        # (3) token_pre_project: lane_len -> T_small (Conv1d kernel=1)
+        #     - (num_valid, lane_len, C) -> (num_valid, T_small, C)
         # ============================================================
         with profile_block("LaneFusionEncoder.token_pre_project",
                            enabled=enable_profile,
                            device_type=device_type):
-            lanes_valid = lanes_valid.transpose(
-                1, 2).contiguous()  # (num_valid, C, lane_len)
-            lanes_valid = self.token_pre_project(
-                lanes_valid)  # (num_valid, C, T_small)
-            lanes_valid = lanes_valid.transpose(
-                1, 2)  # (num_valid, T_small, C)  ✅ 큰 복사 1회 제거
+            lanes_valid = self.token_pre_project(lanes_valid)  # (num_valid, T_small, C)
 
         # ============================================================
         # (4) MixerBlock (토큰 섞기 중심 + 특징 변환 축소)
@@ -3218,57 +3156,51 @@ class FusionEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(
-            self, encoding_input: torch.Tensor,
-            encoding_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        self,
+        encoding_input: torch.Tensor,
+        encoding_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, token_num, H = encoding_input.shape
 
-        is_invalid_batch = encoding_mask.all(dim=1)  # [B]
-        is_valid_batch = ~is_invalid_batch  # [B]
-        out_tokens = encoding_input.new_zeros(B, token_num,
-                                              H)  # [B, token_num, H]
+        is_invalid_batch = encoding_mask.all(dim=1)  # (B,)
+        is_valid_batch = ~is_invalid_batch  # (B,)
 
-        if is_valid_batch.any().item():
-            on_batch_tokens = encoding_input[is_valid_batch]
-            on_batch_token_mask = encoding_mask[is_valid_batch]
-            on_B: int = on_batch_tokens.size(0)
+        out_tokens = encoding_input.new_zeros(B, token_num, H)
 
-            cls_tokens = self.cls_token.expand(on_B, 1,
-                                               H).to(on_batch_tokens.dtype)
-            cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens], dim=1)
+        # ✅ .any().item() 없이, 먼저 골라 담고 "크기"로만 분기
+        on_batch_tokens = encoding_input[is_valid_batch]          # (on_B, token_num, H)
+        on_batch_token_mask = encoding_mask[is_valid_batch]       # (on_B, token_num)
+        on_B: int = int(on_batch_tokens.size(0))
+
+        if on_B > 0:
+            cls_tokens = self.cls_token.expand(on_B, 1, H).to(on_batch_tokens.dtype)
+            cls_with_tokens = torch.cat([cls_tokens, on_batch_tokens], dim=1)  # (on_B, 1+token_num, H)
+
             cls_pos = self.cls_pos.to(cls_with_tokens.dtype)
             cls_with_tokens[:, 0:1, :] = cls_with_tokens[:, 0:1, :] + cls_pos
 
-            cls_false = torch.zeros(on_B,
-                                    1,
-                                    dtype=torch.bool,
-                                    device=on_batch_token_mask.device)
-            cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask],
-                                            dim=1)
+            cls_false = torch.zeros(
+                on_B, 1, dtype=torch.bool, device=on_batch_token_mask.device
+            )
+            cls_with_token_mask = torch.cat([cls_false, on_batch_token_mask], dim=1)
 
             for block in self.blocks:
                 cls_with_tokens = block(cls_with_tokens, cls_with_token_mask)
 
             cls_with_tokens = self.norm(cls_with_tokens)
-            cls_with_tokens = cls_with_tokens.masked_fill(
-                cls_with_token_mask.unsqueeze(-1), 0.0)
+            cls_with_tokens = cls_with_tokens.masked_fill(cls_with_token_mask.unsqueeze(-1), 0.0)
 
             fused_wo_cls = cls_with_tokens[:, 1:, :]
             out_tokens[is_valid_batch] = fused_wo_cls.to(out_tokens.dtype)
 
         else:
-            # 모든 배치가 패딩이면, 파라미터들을 0-스케일로 "한 번에" 터치해서 DDP unused param 방지
-            touch = (self.cls_token[..., :1].sum() +
-                     self.cls_pos[..., :1].sum())
-
+            touch = (self.cls_token[..., :1].sum() + self.cls_pos[..., :1].sum())
             for blk in self.blocks:
                 for p in blk.parameters():
                     touch = touch + p.view(-1)[:1].sum()
-
-            # ✅ self.norm 파라미터도 touch에 포함
             for p in self.norm.parameters():
                 touch = touch + p.view(-1)[:1].sum()
 
-            # ✅ touch를 다 만든 다음 out_tokens에 한 번만 반영
             out_tokens = out_tokens + touch * 0.0
 
         return out_tokens, encoding_mask
