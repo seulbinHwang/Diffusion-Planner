@@ -18,6 +18,9 @@ from typing import Dict, Iterator
 import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
+from typing import Tuple, Optional
+import torch
+import torch.nn.functional as F
 
 import torch
 

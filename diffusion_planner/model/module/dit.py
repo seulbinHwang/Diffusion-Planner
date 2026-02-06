@@ -43,6 +43,180 @@ except Exception as _e1:
             f"interface import err: {_e1}; top-level err: {_e2}")
         flash_attn_varlen_cross_func = None
 
+# ===== fused MLP (Linear -> GELU -> Linear) hard-require =====
+try:
+    from flash_attn.ops.fused_dense import fused_dense_gelu_dense
+except Exception as _e_fused_mlp:
+    raise RuntimeError(
+        "This code path requires fused MLP only.\n"
+        "Failed to import flash_attn.ops.fused_dense.fused_dense_gelu_dense.\n"
+        "Please install/build flash-attn with fused_dense support and retry.\n"
+        f"(cause: {_e_fused_mlp})"
+    ) from _e_fused_mlp
+
+
+def _require_fused_mlp_ready(
+    x2d: torch.Tensor,  # (N, Din)
+    fc1: nn.Linear,
+    fc2: nn.Linear,
+) -> None:
+    """Validate prerequisites for fused MLP and hard-fail if not satisfied.
+
+    Args:
+        x2d (torch.Tensor):
+            Input to the fused op.
+            - shape: (N, Din)
+            - device: must be CUDA
+            - dtype: must be fp16 or bf16
+        fc1 (nn.Linear):
+            First linear layer.
+            - weight shape: (H, Din)
+            - bias shape: (H,) or None
+        fc2 (nn.Linear):
+            Second linear layer.
+            - weight shape: (Dout, H)
+            - bias shape: (Dout,) or None
+
+    Raises:
+        RuntimeError: If CUDA/dtype/shape/parameter state is not compatible.
+    """
+    if x2d.dim() != 2:
+        raise RuntimeError(
+            f"Fused MLP input must be 2D (N, Din). Got {tuple(x2d.shape)}")
+
+    if not x2d.is_cuda:
+        raise RuntimeError(
+            "Fused MLP is hard-required to run on CUDA (GPU) only.")
+
+    if x2d.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "Fused MLP is hard-required to use fp16/bf16 only. "
+            f"Current dtype={x2d.dtype}. "
+            "Cast the model/inputs to half() or bfloat16(), or use autocast."
+        )
+
+    # Require parameters to match input device/dtype (no fallback).
+    params = [
+        ("fc1.weight", fc1.weight),
+        ("fc2.weight", fc2.weight),
+    ]
+    if fc1.bias is not None:
+        params.append(("fc1.bias", fc1.bias))
+    if fc2.bias is not None:
+        params.append(("fc2.bias", fc2.bias))
+
+    for name, p in params:
+        if not p.is_cuda:
+            raise RuntimeError(
+                f"Fused MLP parameter {name} is not on CUDA.")
+        if p.dtype != x2d.dtype:
+            raise RuntimeError(
+                f"Fused MLP parameter {name} dtype({p.dtype}) "
+                f"does not match input dtype({x2d.dtype}). "
+                "No fallback is allowed. Align parameter dtype with input dtype."
+            )
+
+
+class FusedMlpGelu(nn.Module):
+    """MLP that *only* uses fused Dense->GELU->Dense.
+
+    - Holds two nn.Linear modules as parameters.
+    - Forward always calls fused_dense_gelu_dense.
+    - If requirements are not met (e.g., CPU or fp32), it raises immediately.
+
+    Attributes:
+        fc1 (nn.Linear): (Din -> H)
+        fc2 (nn.Linear): (H -> Dout)
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: Optional[int] = None,
+        bias: bool = True,
+    ) -> None:
+        """Initialize the fused MLP.
+
+        Args:
+            in_features: Input feature dimension (Din).
+            hidden_features: Hidden feature dimension (H).
+            out_features: Output feature dimension (Dout). If None, equals Din.
+            bias: Whether to use bias for both linear layers.
+        """
+        super().__init__()
+        out_features = int(in_features) if out_features is None else int(
+            out_features)
+        self.fc1 = nn.Linear(int(in_features), int(hidden_features), bias=bias)
+        self.fc2 = nn.Linear(int(hidden_features), int(out_features), bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run fused Dense->GELU->Dense.
+
+        Args:
+            x (torch.Tensor):
+                Input tensor.
+                - supported shapes:
+                    1) (N, Din)
+                    2) (B, L, Din) -> internally flattened to (B*L, Din)
+                - device: CUDA
+                - dtype: fp16 or bf16
+
+        Returns:
+            torch.Tensor:
+                Output tensor.
+                - shape:
+                    1) input (N, Din) -> (N, Dout)
+                    2) input (B, L, Din) -> (B, L, Dout)
+
+        Raises:
+            RuntimeError: If fused prerequisites are not met (no fallback).
+        """
+        if x.dim() == 2:
+            x2d = x  # (N, Din)
+            restore_shape = None
+        elif x.dim() == 3:
+            B, L, Din = x.shape
+            x2d = x.reshape(B * L, Din)  # (B*L, Din)
+            restore_shape = (B, L)
+        else:
+            raise RuntimeError(
+                f"Fused MLP supports only 2D/3D inputs. Got {tuple(x.shape)}")
+
+        _require_fused_mlp_ready(x2d, self.fc1, self.fc2)
+
+        # Empty input can fail in fused kernel; handle safely while keeping graph "touched".
+        N = int(x2d.shape[0])
+        Dout = int(self.fc2.out_features)
+        if N == 0:
+            out2d = x2d.new_zeros((0, Dout))  # (0, Dout)
+            touch = (
+                self.fc1.weight.view(-1)[:1].sum()
+                + (self.fc1.bias.view(-1)[:1].sum()
+                   if self.fc1.bias is not None else 0.0)
+                + self.fc2.weight.view(-1)[:1].sum()
+                + (self.fc2.bias.view(-1)[:1].sum()
+                   if self.fc2.bias is not None else 0.0)
+            ) * 0.0
+            out2d = out2d + touch
+        else:
+            # Fused kernels often prefer contiguous inputs/weights.
+            x2d = x2d.contiguous()  # (N, Din)
+            w1 = self.fc1.weight.contiguous()  # (H, Din)
+            b1 = self.fc1.bias.contiguous(
+            ) if self.fc1.bias is not None else None  # (H,) or None
+            w2 = self.fc2.weight.contiguous()  # (Dout, H)
+            b2 = self.fc2.bias.contiguous(
+            ) if self.fc2.bias is not None else None  # (Dout,) or None
+
+            # Hard-require fused path only.
+            out2d = fused_dense_gelu_dense(x2d, w1, b1, w2, b2)  # (N, Dout)
+
+        if restore_shape is None:
+            return out2d  # (N, Dout)
+
+        B, L = restore_shape
+        return out2d.reshape(B, L, Dout)  # (B, L, Dout)
 
 # ===========================================================
 class FlashAttnKVCache(NamedTuple):
@@ -270,19 +444,23 @@ class DiTBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp1 = Mlp(in_features=dim,
-                        hidden_features=mlp_hidden_dim,
-                        act_layer=approx_gelu,
-                        drop=0)
+        # ✅ fused MLP로 강제 교체 (Linear -> GELU -> Linear)
+        self.mlp1 = FusedMlpGelu(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            out_features=dim,
+            bias=True,
+        )
 
         self.norm3 = nn.LayerNorm(dim)
         self.norm4 = nn.LayerNorm(dim)
-        self.mlp2 = Mlp(in_features=dim,
-                        hidden_features=mlp_hidden_dim,
-                        act_layer=approx_gelu,
-                        drop=0)
-
+        # ✅ fused MLP로 강제 교체 (Linear -> GELU -> Linear)
+        self.mlp2 = FusedMlpGelu(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            out_features=dim,
+            bias=True,
+        )
         # === FlashAttention-2용 프로젝션 (Self-Attn) ===
         # QKV/Out은 패딩 제거된 유효 토큰에만 적용됩니다.
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=True)
