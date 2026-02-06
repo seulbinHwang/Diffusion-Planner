@@ -2,7 +2,12 @@ from timm.models.layers import Mlp
 from timm.layers import DropPath
 import torch.nn.functional as F
 import math
-from diffusion_planner.model.module.mixer import MixerBlock
+from diffusion_planner.model.module.mixer import (
+    MixerBlock,
+    FastLayerNorm,
+    FastMlp,
+    FastLayerNormMlp,
+)
 from flash_attn.bert_padding import unpad_input, pad_input
 
 # ==== (encoder.py 상단 import 근처에 추가) ====
@@ -1197,7 +1202,8 @@ class SelfAttentionBlock(nn.Module):
             mlp_ratio=4.0):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(dim)
+        self.norm1 = FastLayerNorm(dim)
+
 
         # FlashAttention-2 사용 가능 여부에 따라 폴백(MHA) 준비
         self.use_fallback_mha = not _FA2_AVAILABLE
@@ -1220,13 +1226,13 @@ class SelfAttentionBlock(nn.Module):
         self._drop_path_scale_by_keep: bool = bool(
             getattr(self.drop_path, "scale_by_keep", True))
 
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm2 = FastLayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(
+        self.mlp = FastMlp(
             in_features=dim,
             hidden_features=mlp_hidden_dim,
-            act_layer=nn.GELU,
-            drop=ffn_drop_p,
+            out_features=dim,
+            drop=float(ffn_drop_p),
         )
 
         # === FlashAttention‑2용 QKV/출력 프로젝션 ===
@@ -2516,7 +2522,7 @@ class LaneFusionEncoder(nn.Module):
             ) for _ in range(depth)
         ])
 
-        self.norm = nn.LayerNorm(channels_mlp_dim)
+        self._hidden_out_dim: int = int(hidden_dim)
 
         # ============================================================
         # ✅ (Lane-Heavy) pool 이후 큰 MLP
@@ -2525,23 +2531,18 @@ class LaneFusionEncoder(nn.Module):
         if lane_post_hidden_dim is None:
             lane_post_hidden_dim = self._default_lane_post_hidden_dim(
                 int(channels_mlp_dim))
-
-        self.lane_post_norm = nn.LayerNorm(2 * int(channels_mlp_dim))
-        self.lane_post_mlp = Mlp(
+        self.lane_post: FastLayerNormMlp = FastLayerNormMlp(
             in_features=2 * int(channels_mlp_dim),
             hidden_features=int(lane_post_hidden_dim),
             out_features=int(channels_mlp_dim),
-            act_layer=nn.GELU,
             drop=float(drop_path_rate),
         )
 
-        # 최종 hidden_dim으로 맞추는 projection(기존 유지)
-        self.emb_project = Mlp(
-            in_features=channels_mlp_dim,
-            hidden_features=hidden_dim,
-            out_features=hidden_dim,
-            act_layer=nn.GELU,
-            drop=drop_path_rate,
+        self.emb_project: FastLayerNormMlp = FastLayerNormMlp(
+            in_features=int(channels_mlp_dim),
+            hidden_features=int(hidden_dim),
+            out_features=int(hidden_dim),
+            drop=float(drop_path_rate),
         )
 
     # -------------------------- 새로 추가된 유틸 -------------------------- #
@@ -3019,7 +3020,7 @@ class LaneFusionEncoder(nn.Module):
 
         # ---- 유효 lane이 하나도 없으면 바로 종료(0 반환) ----
         if num_valid == 0:
-            H: int = int(self.emb_project.fc2.out_features)
+            H: int = int(self._hidden_out_dim)
             out_dtype = (torch.get_autocast_gpu_dtype()
                          if torch.is_autocast_enabled() and lanes.is_cuda else
                          lanes.dtype)
@@ -3033,10 +3034,8 @@ class LaneFusionEncoder(nn.Module):
                 self.channel_pre_project,
                 self.token_pre_project,
                 *self.blocks,
-                self.lane_post_norm,
-                self.lane_post_mlp,
-                self.norm,
-                self.emb_project,
+                self.lane_post,  # ✅ 추가
+                self.emb_project,  # ✅ 기존 emb_project는 FastLayerNormMlp로 교체된 상태
                 self.speed_limit_emb,
                 self.unknown_speed_emb,
                 self.traffic_emb,
@@ -3190,8 +3189,8 @@ class LaneFusionEncoder(nn.Module):
             pooled_2c: torch.Tensor = torch.cat(
                 [lane_vec, max_pool.to(lane_vec.dtype)],
                 dim=-1)  # (num_valid, 2C)
-            lanes_valid = self.lane_post_mlp(
-                self.lane_post_norm(pooled_2c))  # (num_valid, C)
+            lanes_valid = self.lane_post(pooled_2c)  # (num_valid, C)
+
 
         # ============================================================
         # (8) 최종 projection + scatter
@@ -3199,8 +3198,8 @@ class LaneFusionEncoder(nn.Module):
         with profile_block("LaneFusionEncoder.final_projection",
                            enabled=enable_profile,
                            device_type=device_type):
-            lanes_valid = self.emb_project(
-                self.norm(lanes_valid))  # (num_valid, hidden_dim)
+            lanes_valid = self.emb_project(lanes_valid)  # (num_valid, hidden_dim)
+
 
             lane_embedding_flat: torch.Tensor = torch.zeros(
                 (total_count, lanes_valid.shape[-1]),
