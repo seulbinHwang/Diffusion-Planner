@@ -27,105 +27,46 @@ from typing import Dict, Tuple, Optional, Any
 
 # <추가하자>
 from typing import NamedTuple
+
+# decoder.py 또는 feasible.py 상단 import 근처에 추가
 import time
 from contextlib import contextmanager
-from typing import Dict, Iterator
-
-import torch
-# =========================================================
-# [after_weak 추가] 파일 상단(클래스 밖)에 추가
-# =========================================================
-from typing import NamedTuple
-import torch
-import torch.nn.functional as F
-
+from typing import Iterator
 
 class StemInputParts(NamedTuple):
-    """Stem 입력을 큰 cat 텐서 없이 전달하기 위한 묶음입니다.
-
-    Attributes:
-        feat_prev: (B, Pnn, T, Dx)
-        feat_fut:  (B, Pnn, T, Dx)
-        feat_u:    (B, Pnn, T, Du)
-        trunk:     (B, Pnn, Dc)  # 시간축(T)으로는 같은 값(복사해서 쓰는 값)
-    """
-    feat_prev: torch.Tensor
-    feat_fut: torch.Tensor
-    feat_u: torch.Tensor
-    trunk: torch.Tensor
-
-
-# name -> 호출 횟수 / 평균 계산에 포함된 횟수 / 평균 누적(ms)
-_PROFILE_TOTAL_CALL_COUNT: Dict[str, int] = {}
-_PROFILE_AVG_CALL_COUNT: Dict[str, int] = {}
-_PROFILE_AVG_TOTAL_MS: Dict[str, float] = {}
-
-# 각 name별로 처음 N번 호출은 avg 계산에서 제외
-_PROFILE_WARMUP_CALLS: int = 30
+    """Stem 입력을 큰 cat 없이 전달하기 위한 묶음."""
+    feat_prev: torch.Tensor  # (B, Pnn, T, Dx)
+    feat_fut: torch.Tensor   # (B, Pnn, T, Dx)
+    feat_u: torch.Tensor     # (B, Pnn, T, Du)
+    trunk: torch.Tensor      # (B, Pnn, Dc)
 
 
 @contextmanager
-def profile_block(
-    name: str,
-    enabled: bool = True,
-    device_type: str = "cuda",
-) -> Iterator[None]:
-    """코드 블록 실행 시간을 ms 단위로 출력하고, 평균(avg)은 워밍업 이후만 누적합니다.
-
-    동작:
-        - name(문자열)별로 호출 횟수를 셉니다.
-        - 각 name에서 처음 _PROFILE_WARMUP_CALLS번 호출은 avg 누적에서 제외합니다.
-        - 그 다음 호출부터 avg_ms = (워밍업 제외 누적 시간) / (워밍업 제외 호출 횟수) 로 출력합니다.
+def profile_block(name: str,
+                  enabled: bool = True,
+                  device_type: str = "cuda") -> Iterator[None]:
+    """코드 블록 실행 시간을 ms 단위로 출력하는 간단한 프로파일러.
 
     Args:
-        name (str): 출력/누적의 키로 쓸 블록 이름.
-        enabled (bool): False이면 계측 없이 그대로 실행합니다.
-        device_type (str): "cuda"면 GPU 작업까지 포함해 재기 위해 앞/뒤로 synchronize 합니다.
-
-    Yields:
-        None
+        name: 출력에 사용할 블록 이름.
+        enabled: False 이면 아무 것도 하지 않고 그냥 통과.
+        device_type: "cuda" 인 경우, GPU 연산 정합을 위해 앞/뒤에 synchronize 호출.
     """
     if not enabled:
+        # 아무 것도 하지 않고 블록만 실행
         yield
         return
 
-    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
-    if is_cuda and torch.cuda.is_available():
+    if device_type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
+    start_time: float = time.perf_counter()
 
-    t0: float = time.perf_counter()
-    yield
+    yield  # 실제 코드 실행
 
-    if is_cuda and torch.cuda.is_available():
+    if device_type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
-
-    elapsed_ms: float = (time.perf_counter() - t0) * 1000.0
-
-    # (1) 전체 호출 카운트(워밍업 포함)
-    total_prev: int = _PROFILE_TOTAL_CALL_COUNT.get(name, 0)
-    total_now: int = total_prev + 1
-    _PROFILE_TOTAL_CALL_COUNT[name] = total_now
-
-    # (2) avg 누적(워밍업 제외)
-    avg_cnt_prev: int = _PROFILE_AVG_CALL_COUNT.get(name, 0)
-    avg_sum_prev: float = _PROFILE_AVG_TOTAL_MS.get(name, 0.0)
-
-    if total_now > int(_PROFILE_WARMUP_CALLS):
-        avg_cnt_now: int = avg_cnt_prev + 1
-        avg_sum_now: float = avg_sum_prev + float(elapsed_ms)
-        _PROFILE_AVG_CALL_COUNT[name] = avg_cnt_now
-        _PROFILE_AVG_TOTAL_MS[name] = avg_sum_now
-    else:
-        avg_cnt_now = avg_cnt_prev
-        avg_sum_now = avg_sum_prev
-
-    avg_ms: float = (avg_sum_now / float(avg_cnt_now)) if avg_cnt_now > 0 else 0.0
-    warmup_left: int = max(0, int(_PROFILE_WARMUP_CALLS) - total_now)
-
-    print(
-        f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={avg_cnt_now} | warmup_left={warmup_left}"
-    )
-
+    elapsed_ms: float = (time.perf_counter() - start_time) * 1000.0
+    print(f"[PROFILE] {name}: {elapsed_ms:.3f} ms")
 
 
 # <추가하자>
@@ -431,9 +372,142 @@ class FeasibleProjector(nn.Module):
         with torch.no_grad():
             self.gate_mlp[-1].bias.fill_(b_init)
 
-        # ---------------------------------------------------------------------
-        # (1) cat 제거를 위한 Stem 실행 함수 (추가)
-        # ---------------------------------------------------------------------
+    def _compute_contiguous_start_end_from_mask_b1t(
+            self,
+            mask_b1t: torch.Tensor,  # (N, 1, T) float(0/1) 또는 bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """마스크가 한 덩어리(0*1*0*)라고 가정하고, 각 row의 시작/끝 위치를 구합니다.
+
+        Args:
+            mask_b1t: (N, 1, T)
+                값이 0/1 또는 bool인 마스크입니다.
+
+        Returns:
+            has_any: (N,) bool
+                row에 1이 하나라도 있으면 True입니다.
+            start: (N,) long
+                첫 1의 위치입니다. (없으면 0)
+            end: (N,) long
+                마지막 1의 위치입니다. (없으면 -1)
+
+        Notes:
+            - config.feasible_debug_check_mask=True 일 때만,
+              "1→0→1 같은 구멍"이 있는지 검사합니다.
+        """
+        if mask_b1t.dim() != 3 or int(mask_b1t.shape[1]) != 1:
+            raise ValueError(
+                "_compute_contiguous_start_end_from_mask_b1t: mask_b1t는 (N,1,T)여야 합니다. "
+                f"got shape={tuple(mask_b1t.shape)}"
+            )
+
+        N = int(mask_b1t.shape[0])
+        T = int(mask_b1t.shape[2])
+
+        mask_nt = mask_b1t.squeeze(1)
+        mask_bool = self._to_bool_mask(mask_nt)  # (N,T) bool
+
+        has_any = mask_bool.any(dim=-1)  # (N,)
+
+        mask_int = mask_bool.to(torch.int8)  # (N,T)
+        start = torch.argmax(mask_int, dim=-1)  # (N,) all-zero면 0
+
+        end_from_right = torch.argmax(torch.flip(mask_int, dims=[-1]),
+                                      dim=-1)  # (N,)
+        end = (T - 1) - end_from_right  # (N,) all-zero면 T-1
+
+        start = torch.where(has_any, start, torch.zeros_like(start))
+        end = torch.where(has_any, end, torch.full_like(end, -1))
+
+        if bool(getattr(self, "feasible_debug_check_mask", False)):
+            mask_sum = mask_int.sum(dim=-1).to(torch.long)  # (N,)
+            span_len = (end.to(torch.long) - start.to(
+                torch.long) + 1).clamp_min(0)
+            bad = has_any & (mask_sum != span_len)
+            if bool(bad.any()):
+                bad_idx = bad.nonzero(as_tuple=False).squeeze(-1)
+                max_show = min(int(bad_idx.numel()), 8)
+                sample = bad_idx[:max_show].tolist()
+                raise ValueError(
+                    "[_compute_contiguous_start_end_from_mask_b1t] mask가 '한 덩어리(0*1*0*)' 형태가 아닙니다. "
+                    "즉, 1→0→1 같은 구멍이 있습니다. "
+                    f"예시 row idx={sample} (N={N}, T={T})."
+                )
+
+        return has_any, start.to(torch.long), end.to(torch.long)
+
+    def _compute_den_from_contiguous_start_end(
+            self,
+            *,
+            start: torch.Tensor,  # (N,) long
+            end: torch.Tensor,  # (N,) long  (없으면 -1)
+            has_any: torch.Tensor,  # (N,) bool
+            sequence_length: int,
+            kernel_size: int,
+            dilation: int,
+            padding: int,
+            out_dtype: torch.dtype,
+            device: torch.device,
+    ) -> torch.Tensor:
+        """연속(한 덩어리) 마스크의 start/end로 den(유효 개수)을 빠르게 계산합니다.
+
+        den[t]는 conv1d(mask, ones, dilation, padding)와 동일하게
+        "해당 시점 t에서 커널이 참조하는 위치 중 mask==1인 개수"입니다.
+
+        Args:
+            start: (N,) long
+            end: (N,) long
+            has_any: (N,) bool
+            sequence_length: T
+            kernel_size: k
+            dilation: d
+            padding: p
+            out_dtype: 반환 dtype(보통 mask dtype)
+            device: 반환 device
+
+        Returns:
+            den_b1t: (N, 1, T) out_dtype
+        """
+        N = int(start.shape[0])
+        T = int(sequence_length)
+        k = int(kernel_size)
+        d = int(dilation)
+        p = int(padding)
+
+        if d <= 0:
+            raise ValueError(f"dilation must be positive. got={d}")
+        if k <= 0:
+            raise ValueError(f"kernel_size must be positive. got={k}")
+
+        # t: (1, T)
+        t = torch.arange(T, device=device, dtype=torch.long).view(1, T)
+
+        # start/end: (N,1)
+        s = start.view(N, 1).to(device=device, dtype=torch.long)
+        e = end.view(N, 1).to(device=device, dtype=torch.long)
+
+        # 조건: s <= (t + i*d - p) <= e  를 i에 대해 풀기
+        # i_min = ceil((s + p - t)/d), i_max = floor((e + p - t)/d)
+        a_min = s + p - t  # (N,T)
+        a_max = e + p - t  # (N,T)
+
+        i_min = -torch.div(-a_min, d, rounding_mode="floor")  # ceil
+        i_max = torch.div(a_max, d, rounding_mode="floor")  # floor
+
+        # i는 [0, k-1] 범위만 허용 → 겹치는 구간 길이
+        zero = torch.zeros_like(i_min)
+        k1 = torch.full_like(i_max, k - 1)
+
+        overlap_low = torch.maximum(i_min, zero)
+        overlap_high = torch.minimum(i_max, k1)
+
+        count_nt = (overlap_high - overlap_low + 1).clamp_min(0)  # (N,T)
+
+        # all-zero row는 무조건 0
+        count_nt = count_nt * has_any.to(device=device,
+                                         dtype=count_nt.dtype).view(N, 1)
+
+        den_b1t = count_nt.unsqueeze(1).to(dtype=out_dtype)  # (N,1,T)
+        return den_b1t
 
     def _stem_forward_without_cat(
             self,
@@ -441,19 +515,19 @@ class FeasibleProjector(nn.Module):
     ) -> torch.Tensor:
         """Stem을 큰 torch.cat 없이 실행합니다.
 
-        기존 목표(동일):
+        계산 목표(기존과 동일):
             Z = GELU( stem_fc( stem_norm( concat(prev, fut, u, trunk_rep) ) ) )
 
-        여기서는 concat 텐서를 새로 만들지 않고,
-        - LayerNorm의 평균/분산을 "조각들의 합/제곱합"으로 계산하고
-        - Linear는 weight를 입력 채널 구간별로 잘라 각각 계산한 뒤 더합니다.
+        여기서는 concat 텐서를 만들지 않고,
+        - LayerNorm의 평균/분산은 각 조각의 합/제곱합으로 계산하고,
+        - Linear는 가중치 열을 조각별로 잘라서 따로 계산해 더합니다.
 
         Args:
             stem_parts:
-                feat_prev: (B, Pnn, T, Dx)
-                feat_fut:  (B, Pnn, T, Dx)
-                feat_u:    (B, Pnn, T, Du)
-                trunk:     (B, Pnn, Dc)
+                feat_prev: (B,Pnn,T,Dx)
+                feat_fut : (B,Pnn,T,Dx)
+                feat_u   : (B,Pnn,T,Du)
+                trunk    : (B,Pnn,Dc)
 
         Returns:
             Z_s: (B, Pnn, T, C)
@@ -465,12 +539,11 @@ class FeasibleProjector(nn.Module):
 
         if feat_prev.dim() != 4 or feat_fut.dim() != 4 or feat_u.dim() != 4:
             raise ValueError(
-                "[_stem_forward_without_cat] feat_prev/feat_fut/feat_u는 (B,Pnn,T,*) 4D 텐서여야 합니다."
+                "[_stem_forward_without_cat] feat_prev/feat_fut/feat_u는 (B,Pnn,T,*) 4D여야 합니다."
             )
         if trunk.dim() != 3:
             raise ValueError(
-                "[_stem_forward_without_cat] trunk는 (B,Pnn,Dc) 3D 텐서여야 합니다."
-            )
+                "[_stem_forward_without_cat] trunk는 (B,Pnn,Dc) 3D여야 합니다.")
 
         B, Pnn, T, Dx = feat_prev.shape
         if feat_fut.shape[:3] != (B, Pnn, T) or int(feat_fut.shape[-1]) != int(
@@ -489,10 +562,11 @@ class FeasibleProjector(nn.Module):
         Din = int(2 * Dx + Du + Dc)
         if Din != int(self._Din):
             raise ValueError(
-                f"[_stem_forward_without_cat] Din({Din})이 self._Din({int(self._Din)})과 다릅니다."
+                f"[_stem_forward_without_cat] Din 계산값({Din})이 self._Din({int(self._Din)})과 다릅니다."
             )
 
-        # ---- LayerNorm 통계(평균/분산): 큰 텐서 없이 합/제곱합을 조합 ----
+        # ---- LayerNorm 통계(평균/분산) ----
+        # 큰 텐서를 만들지 않고, 조각별 sum / sumsq를 더합니다.
         eps_ln = float(self.stem_norm.eps)
 
         sum_prev = feat_prev.sum(dim=-1, keepdim=True,
@@ -502,11 +576,13 @@ class FeasibleProjector(nn.Module):
         sum_u = feat_u.sum(dim=-1, keepdim=True,
                            dtype=torch.float32)  # (B,Pnn,T,1)
 
+        # trunk는 시간축에 대해 같은 값이지만, mean/var는 시간마다 달라질 수 있으므로
+        # 합/제곱합만 (B,Pnn,1,1)로 구해 broadcast 합니다.
         trunk_t = trunk.unsqueeze(2)  # (B,Pnn,1,Dc)
         sum_trunk = trunk_t.sum(dim=-1, keepdim=True,
                                 dtype=torch.float32)  # (B,Pnn,1,1)
 
-        sum_all = sum_prev + sum_fut + sum_u + sum_trunk  # (B,Pnn,T,1) (broadcast)
+        sum_all = sum_prev + sum_fut + sum_u + sum_trunk  # (B,Pnn,T,1)  (broadcast)
 
         sumsq_prev = (feat_prev * feat_prev).sum(dim=-1, keepdim=True,
                                                  dtype=torch.float32)
@@ -524,13 +600,15 @@ class FeasibleProjector(nn.Module):
         var = var.clamp_min(0.0)
         inv_std = torch.rsqrt(var + eps_ln)  # (B,Pnn,T,1) float32
 
-        # 계산은 입력 dtype으로 맞춰(기존 경로와 유사하게)
+        # 실제 값 계산은 입력 dtype으로(기존과 비슷한 출력/속도)
         mean = mean.to(dtype=feat_prev.dtype)
         inv_std = inv_std.to(dtype=feat_prev.dtype)
 
+        # ---- LayerNorm의 scale/bias를 조각별로 적용 ----
         gamma = self.stem_norm.weight  # (Din,)
         beta = self.stem_norm.bias  # (Din,)
 
+        # ---- Linear 가중치도 조각별로 잘라서 적용 ----
         W = self.stem_fc.weight  # (C, Din)
         b = self.stem_fc.bias  # (C,)
 
@@ -544,13 +622,7 @@ class FeasibleProjector(nn.Module):
 
         def _ln_affine(x: torch.Tensor, g: torch.Tensor,
                        be: torch.Tensor) -> torch.Tensor:
-            """(x-mean)/std 후, feature별 scale/bias 적용.
-
-            x shape:
-                - (B,Pnn,T,D) 또는 (B,Pnn,1,D)
-            반환:
-                - (B,Pnn,T,D)  (필요 시 broadcast)
-            """
+            """(x-mean)/std 후, feature별 scale/bias 적용."""
             g_view = g.view(1, 1, 1, -1)
             b_view = be.view(1, 1, 1, -1)
             x_hat = (x - mean) * inv_std
@@ -562,16 +634,19 @@ class FeasibleProjector(nn.Module):
                               beta[off1:off2])  # (B,Pnn,T,Dx)
         x_u_ln = _ln_affine(feat_u, gamma[off2:off3],
                             beta[off2:off3])  # (B,Pnn,T,Du)
-        x_trunk_ln = _ln_affine(trunk_t, gamma[off3:off4],
-                                beta[off3:off4])  # (B,Pnn,T,Dc) (broadcast)
 
+        # trunk는 (B,Pnn,1,Dc)지만 mean/inv_std가 (B,Pnn,T,1)라서 자동 broadcast
+        x_trunk_ln = _ln_affine(trunk_t, gamma[off3:off4],
+                                beta[off3:off4])  # (B,Pnn,T,Dc)
+
+        # Linear: concat 후 한 번에 하는 것과 동일한 합
         out = F.linear(x_prev_ln, W[:, off0:off1], bias=None)  # (B,Pnn,T,C)
         out = out + F.linear(x_fut_ln, W[:, off1:off2], bias=None)
         out = out + F.linear(x_u_ln, W[:, off2:off3], bias=None)
         out = out + F.linear(x_trunk_ln, W[:, off3:off4], bias=None)
         out = out + b.view(1, 1, 1, -1)
 
-        out = self.stem_act(out)
+        out = self.stem_act(out)  # GELU
         return out
 
     @staticmethod
@@ -2386,13 +2461,9 @@ class FeasibleProjector(nn.Module):
         self._tcn_den_positions_cache[key] = positions_kT
         return positions_kT
 
-        # ---------------------------------------------------------------------
-        # (6) den 계산 함수: start/end 재사용 가능 + 수식 기반으로 교체 (교체)
-        # ---------------------------------------------------------------------
-
     def _compute_den_from_contiguous_mask_b1t(
             self,
-            mask_b1t: torch.Tensor,  # (N, 1, T)
+            mask_b1t: torch.Tensor,  # (N, 1, T) float(0/1) 또는 bool
             *,
             kernel_size: int,
             dilation: int,
@@ -2401,17 +2472,22 @@ class FeasibleProjector(nn.Module):
             mask_start: Optional[torch.Tensor] = None,  # (N,) long
             mask_end: Optional[torch.Tensor] = None,  # (N,) long
     ) -> torch.Tensor:
-        """연속(0*1*0*) 마스크의 den(유효 개수)을 계산합니다.
+        """마스크가 '한 덩어리(0*1*0*)'라는 가정 하에 den을 빠르게 계산합니다.
 
-        after_weak 반영:
-            - (마스크 시작/끝 찾기)를 블록마다 반복하지 않게, 밖에서 구한 값을 재사용할 수 있습니다.
-            - den은 큰 보조 텐서(in_range 같은)를 만들지 않고, start/end 수식으로 계산합니다.
+        Args:
+            mask_b1t: (N,1,T)
+            kernel_size: k
+            dilation: d
+            padding: p
+            mask_has_any/mask_start/mask_end:
+                forward에서 한 번 계산한 값을 넘기면 중복 계산을 줄일 수 있습니다.
 
         Returns:
-            den_b1t: (N, 1, T)
+            den_b1t: (N,1,T)
         """
         if mask_b1t.numel() == 0:
             return mask_b1t
+
         if mask_b1t.dim() != 3 or int(mask_b1t.shape[1]) != 1:
             raise ValueError(
                 "_compute_den_from_contiguous_mask_b1t: mask_b1t는 (N,1,T)여야 합니다. "
@@ -2435,7 +2511,7 @@ class FeasibleProjector(nn.Module):
             padding=int(padding),
             out_dtype=mask_b1t.dtype,
             device=mask_b1t.device,
-        )  # (N,1,T)
+        )
         return den
 
     def _get_tcn_den_ones_kernel(
@@ -2477,14 +2553,10 @@ class FeasibleProjector(nn.Module):
         self._tcn_den_ones_kernel_cache[key] = kernel
         return kernel
 
-        # ---------------------------------------------------------------------
-        # (7) depthwise conv: start/end 재사용 인자 추가 (교체)
-        # ---------------------------------------------------------------------
-
     def _depthwise_conv_masked_bct(
             self,
             x_bct: torch.Tensor,  # (B*Pnn, C, T)
-            mask_b1t: torch.Tensor,  # (B*Pnn, 1, T)
+            mask_b1t: torch.Tensor,  # (B*Pnn, 1, T) float(0/1) 또는 bool
             block_idx: int,
             *,
             mask_has_any: Optional[torch.Tensor] = None,  # (B*Pnn,) bool
@@ -2493,11 +2565,16 @@ class FeasibleProjector(nn.Module):
     ) -> torch.Tensor:
         """마스크를 고려한 depthwise conv을 (B*Pnn, C, T)에서 수행합니다.
 
-        after_weak 반영:
-            - (mask start/end)을 밖에서 한 번만 구해 재사용할 수 있습니다.
-            - den(유효 개수)은 start/end 수식으로 계산합니다.
-            - 블록 끝의 (Z+Y)*mask는 _run_tcn에서 제거하고,
-              여기서는 "입력에만 mask"를 반영합니다.
+        변경점:
+            - start/end를 forward에서 한 번만 구해 재사용할 수 있습니다.
+            - den은 연속 마스크 가정(0*1*0*)을 이용해 빠르게 계산합니다.
+
+        Args:
+            x_bct: (B*Pnn, C, T)
+            mask_b1t: (B*Pnn, 1, T)
+            block_idx: 블록 인덱스
+            mask_has_any/mask_start/mask_end:
+                미리 계산해 넘기면 중복 계산을 줄입니다.
 
         Returns:
             y: (B*Pnn, C, T)
@@ -2506,18 +2583,19 @@ class FeasibleProjector(nn.Module):
             return x_bct
 
         conv = self.tcn_dw[int(block_idx)]
+
         mask = mask_b1t.to(dtype=x_bct.dtype, device=x_bct.device)
 
         # 분자: conv(x * mask)
-        y_num = conv(x_bct * mask)  # (B*Pnn, C, T)
+        y_num = conv(x_bct * mask)  # (B*Pnn,C,T)
 
-        # 분모: den
+        # 분모: den (유효 샘플 개수)
         k = int(conv.kernel_size[0])
         pad = int(conv.padding[0])
         dil = int(conv.dilation[0])
 
         den = self._compute_den_from_contiguous_mask_b1t(
-            mask_b1t=mask,
+            mask_b1t=mask,  # (B*Pnn,1,T)
             kernel_size=k,
             dilation=dil,
             padding=pad,
@@ -2527,7 +2605,9 @@ class FeasibleProjector(nn.Module):
         )  # (B*Pnn,1,T)
 
         den_safe = den.clamp_min(1.0)
-        return y_num / den_safe  # (B*Pnn, C, T)
+        y = y_num / den_safe
+        return y
+
     def _depthwise_conv_masked(
         self,
         seq_bptc: torch.Tensor,  # (B,Pnn,T,C)
@@ -2635,25 +2715,28 @@ class FeasibleProjector(nn.Module):
         out[..., 2:4] = cs / norm
         return out
 
-
-    # ---------------------------------------------------------------------
-    # (2) _features_from_inputs: cat 제거 + 중간 마스크 곱 제거 (교체)
-    # ---------------------------------------------------------------------
     def _features_from_inputs(
-        self,
-        x_prev: torch.Tensor,  # (B, Pnn, T, 4)
-        x_fut: torch.Tensor,   # (B, Pnn, T, 4)
-        u_base: torch.Tensor,  # (B, Pnn, T, 3)
-        dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
-        points_valid: torch.Tensor,  # (B, Pnn, 1+T) bool (호환용, 여기서는 사용 안 함)
+            self,
+            x_prev: torch.Tensor,  # (B, Pnn, T, 4)
+            x_fut: torch.Tensor,  # (B, Pnn, T, 4)
+            u_base: torch.Tensor,  # (B, Pnn, T, 3)
+            dit_final_hidden_tokens: torch.Tensor,  # (B, Pnn, H)
+            points_valid: torch.Tensor,
+            # (B, Pnn, 1+T) bool  (호환용: 여기서는 사용하지 않음)
     ) -> StemInputParts:
-        """Stem에 필요한 입력 조각(feat_prev/fut/u/trunk)을 만듭니다.
+        """입력에서 stem에 필요한 조각 피처를 만듭니다.
 
-        after_weak 반영:
-            - 큰 concat 텐서(Z_in)를 만들지 않습니다.
-            - feat_*에 대해 중간에 *mask로 계속 0을 강제하지 않습니다.
-              (시간축으로 섞이는 계산은 depthwise conv 입력에서만 마스크로 막고,
-               최종 ΔU에서만 0을 보장합니다.)
+        변경점:
+            - 무효 구간에 대해 feat_*에 `*mask`로 0을 강제하지 않습니다.
+            - 시간 섞임이 생기는 곳(depthwise conv)에서만 마스크를 적용하고,
+              마지막 출력(ΔU)에서만 무효 구간을 0으로 보장합니다.
+
+        Args:
+            x_prev: (B,Pnn,T,4)
+            x_fut:  (B,Pnn,T,4)
+            u_base: (B,Pnn,T,3)
+            dit_final_hidden_tokens: (B,Pnn,H)
+            points_valid: (B,Pnn,1+T) bool  (호환용)
 
         Returns:
             StemInputParts:
@@ -2664,9 +2747,10 @@ class FeasibleProjector(nn.Module):
         """
         u_base_for_net = u_base.detach() if self.detach_u_for_ctrl_losses else u_base
 
-        feat_prev = self.state_prev_encoder(x_prev)   # (B,Pnn,T,Dx)
-        feat_fut = self.state_fut_encoder(x_fut)      # (B,Pnn,T,Dx)
-        feat_u = self.control_adapter(u_base_for_net) # (B,Pnn,T,Du)
+        feat_prev = self.state_prev_encoder(x_prev)  # (B,Pnn,T,Dx)
+        feat_fut = self.state_fut_encoder(x_fut)  # (B,Pnn,T,Dx)
+        feat_u = self.control_adapter(u_base_for_net)  # (B,Pnn,T,Du)
+
         trunk = self.trunk_compressor(dit_final_hidden_tokens)  # (B,Pnn,Dc)
 
         return StemInputParts(
@@ -2675,7 +2759,6 @@ class FeasibleProjector(nn.Module):
             feat_u=feat_u,
             trunk=trunk,
         )
-
 
     def _split_midpoint_nodes_and_controls(
         self,
@@ -2701,26 +2784,29 @@ class FeasibleProjector(nn.Module):
 
         return cos_all, sin_all, v_x_all, v_y_all, omega_all
 
-    # ---------------------------------------------------------------------
-    # (3) _prepare_tcn_input: cat 제거 + stem 출력 마스크 곱 제거 (교체)
-    # ---------------------------------------------------------------------
     def _prepare_tcn_input(
-        self,
-        stem_parts: StemInputParts,
-        seg_mask_1: torch.Tensor,  # (B, Pnn, T, 1) (shape 검사용)
+            self,
+            stem_parts: StemInputParts,
+            seg_mask_1: torch.Tensor,  # (B, Pnn, T, 1)  (호환/검사용)
     ) -> torch.Tensor:
-        """Stem 출력(Z_s)을 준비합니다.
+        """Stem 결과(Z_s)를 준비합니다.
 
-        after_weak 반영:
-            - 큰 cat 텐서를 만들지 않고 _stem_forward_without_cat로 계산합니다.
-            - Z_s에 대해 다시 *seg_mask_1로 0을 강제하지 않습니다.
+        변경점:
+            - torch.cat로 큰 Z_in을 만들지 않습니다.
+            - seg_mask_1로 Z_s를 다시 0으로 누르지 않습니다.
               (마스크는 depthwise conv 입력에서만 적용)
 
+        Args:
+            stem_parts: StemInputParts
+            seg_mask_1: (B,Pnn,T,1) 0/1 (shape 검사용)
+
         Returns:
-            Z_s: (B, Pnn, T, C)
+            Z_s: (B,Pnn,T,C)
         """
+        # 가벼운 shape 검사만
         B, Pnn, T, _ = stem_parts.feat_prev.shape
-        if seg_mask_1.shape[:3] != (B, Pnn, T) or int(seg_mask_1.shape[-1]) != 1:
+        if seg_mask_1.shape[:3] != (B, Pnn, T) or int(
+                seg_mask_1.shape[-1]) != 1:
             raise ValueError(
                 "[_prepare_tcn_input] seg_mask_1 shape이 stem_parts와 맞지 않습니다. "
                 f"seg_mask_1.shape={tuple(seg_mask_1.shape)}, feat_prev.shape={tuple(stem_parts.feat_prev.shape)}"
@@ -2728,173 +2814,46 @@ class FeasibleProjector(nn.Module):
 
         return self._stem_forward_without_cat(stem_parts)
 
-        # ---------------------------------------------------------------------
-        # (4) 마스크 start/end 1회 계산용 함수 (추가)
-        # ---------------------------------------------------------------------
-
-    def _compute_contiguous_start_end_from_mask_b1t(
-            self,
-            mask_b1t: torch.Tensor,  # (N, 1, T) float(0/1) 또는 bool
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """마스크가 0*1*0* 형태(한 덩어리)라고 보고, 각 row의 시작/끝 위치를 구합니다.
-
-        Args:
-            mask_b1t: (N, 1, T)
-                값이 0/1 또는 bool인 마스크입니다.
-
-        Returns:
-            has_any: (N,) bool
-                1이 하나라도 있으면 True.
-            start: (N,) long
-                첫 1의 위치(없으면 0).
-            end: (N,) long
-                마지막 1의 위치(없으면 -1).
-
-        Notes:
-            - config.feasible_debug_check_mask=True 일 때만,
-              "1→0→1 같은 구멍"이 있는지 검사합니다.
-        """
-        if mask_b1t.dim() != 3 or int(mask_b1t.shape[1]) != 1:
-            raise ValueError(
-                "_compute_contiguous_start_end_from_mask_b1t: mask_b1t는 (N,1,T)여야 합니다. "
-                f"got shape={tuple(mask_b1t.shape)}"
-            )
-
-        N = int(mask_b1t.shape[0])
-        T = int(mask_b1t.shape[2])
-
-        mask_nt = mask_b1t.squeeze(1)  # (N,T)
-        mask_bool = self._to_bool_mask(mask_nt)  # (N,T) bool
-
-        has_any = mask_bool.any(dim=-1)  # (N,)
-
-        mask_int = mask_bool.to(torch.int8)  # (N,T)
-        start = torch.argmax(mask_int, dim=-1)  # (N,) all-zero면 0
-
-        end_from_right = torch.argmax(torch.flip(mask_int, dims=[-1]),
-                                      dim=-1)  # (N,)
-        end = (T - 1) - end_from_right  # (N,) all-zero면 T-1
-
-        start = torch.where(has_any, start, torch.zeros_like(start))
-        end = torch.where(has_any, end, torch.full_like(end, -1))
-
-        if bool(getattr(self, "feasible_debug_check_mask", False)):
-            mask_sum = mask_int.sum(dim=-1).to(torch.long)  # (N,)
-            span_len = (end.to(torch.long) - start.to(
-                torch.long) + 1).clamp_min(0)
-            bad = has_any & (mask_sum != span_len)
-            if bool(bad.any()):
-                bad_idx = bad.nonzero(as_tuple=False).squeeze(-1)
-                sample = bad_idx[: min(int(bad_idx.numel()), 8)].tolist()
-                raise ValueError(
-                    "[_compute_contiguous_start_end_from_mask_b1t] mask가 '한 덩어리(0*1*0*)' 형태가 아닙니다. "
-                    "즉, 1→0→1 같은 구멍이 있습니다. "
-                    f"예시 row idx={sample} (N={N}, T={T})."
-                )
-
-        return has_any, start.to(torch.long), end.to(torch.long)
-
-
-    # ---------------------------------------------------------------------
-    # (5) den 계산 단순화(수식 기반) (추가)
-    # ---------------------------------------------------------------------
-    def _compute_den_from_contiguous_start_end(
-        self,
-        *,
-        start: torch.Tensor,    # (N,) long
-        end: torch.Tensor,      # (N,) long (없으면 -1)
-        has_any: torch.Tensor,  # (N,) bool
-        sequence_length: int,
-        kernel_size: int,
-        dilation: int,
-        padding: int,
-        out_dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """연속 마스크(start/end)로 den(유효 개수)을 빠르게 계산합니다.
-
-        den[t]는 depthwise conv에서 "시간 t에서 커널이 보는 위치들 중 유효(=1)한 개수"입니다.
-        기존 conv1d(mask, ones, dilation, padding)과 같은 의미가 되도록 계산합니다.
-
-        Returns:
-            den_b1t: (N, 1, T) out_dtype
-        """
-        N = int(start.shape[0])
-        T = int(sequence_length)
-        k = int(kernel_size)
-        d = int(dilation)
-        p = int(padding)
-
-        if d <= 0:
-            raise ValueError(f"dilation must be positive. got={d}")
-        if k <= 0:
-            raise ValueError(f"kernel_size must be positive. got={k}")
-
-        # t: (1, T)
-        t = torch.arange(T, device=device, dtype=torch.long).view(1, T)
-
-        # start/end: (N,1)
-        s = start.view(N, 1).to(device=device, dtype=torch.long)
-        e = end.view(N, 1).to(device=device, dtype=torch.long)
-
-        # start <= t + i*d - p <= end  를 i에 대해 풀기:
-        # i_min = ceil((start + p - t)/d), i_max = floor((end + p - t)/d)
-        a_min = s + p - t  # (N,T)
-        a_max = e + p - t  # (N,T)
-
-        i_min = -torch.div(-a_min, d, rounding_mode="floor")  # ceil
-        i_max = torch.div(a_max, d, rounding_mode="floor")    # floor
-
-        # i는 [0, k-1] 안에서만 의미 있음
-        zero = torch.zeros_like(i_min)
-        k1 = torch.full_like(i_max, k - 1)
-
-        overlap_low = torch.maximum(i_min, zero)
-        overlap_high = torch.minimum(i_max, k1)
-
-        count_nt = (overlap_high - overlap_low + 1).clamp_min(0)  # (N,T)
-
-        # all-zero row는 0으로
-        count_nt = count_nt * has_any.to(device=device, dtype=count_nt.dtype).view(N, 1)
-
-        return count_nt.unsqueeze(1).to(dtype=out_dtype)  # (N,1,T)
-
-        # ---------------------------------------------------------------------
-        # (8) TCN 실행: start/end 1회 계산 + 블록 끝 마스크 곱 제거 (교체)
-        # ---------------------------------------------------------------------
-
     def _run_tcn(
             self,
             Z_s: torch.Tensor,  # (B, Pnn, T, C)
             seg_mask: torch.Tensor,  # (B, Pnn, T) 0/1
-            seg_mask_1: torch.Tensor,  # (B, Pnn, T, 1) (호환용)
+            seg_mask_1: torch.Tensor  # (B, Pnn, T, 1) (호환용)
     ) -> torch.Tensor:
         """TCN 블록 실행.
 
-        after_weak 반영:
-            - 마스크 start/end는 1회만 구해 블록들에서 재사용합니다.
-            - den 계산은 start/end 수식 기반으로 합니다.
-            - 블록 끝의 (Z + Y) * mask 를 제거합니다. (Z = Z + Y)
-              마스크는 depthwise conv 입력(x*mask)에서만 반영합니다.
+        변경점:
+            - 블록 끝에서 (Z + Y) * mask 를 하지 않습니다. (Z = Z + Y)
+            - 마스크는 depthwise conv 입력(x*mask)에서만 적용합니다.
+            - mask의 start/end는 forward에서 한 번만 계산해 블록들에서 재사용합니다.
+
+        Args:
+            Z_s: (B,Pnn,T,C)
+            seg_mask: (B,Pnn,T) 0/1
+            seg_mask_1: (B,Pnn,T,1) (호환용)
 
         Returns:
-            out: (B, Pnn, T, C)
+            out: (B,Pnn,T,C)
         """
         B, Pnn, T, C = Z_s.shape
         B_Pnn = int(B * Pnn)
 
-        seg_mask_bool = self._to_bool_mask(seg_mask)  # (B,Pnn,T) bool
+        seg_mask_bool = self._to_bool_mask(seg_mask)  # (B,Pnn,T)
+
+        # (B*Pnn,1,T)
         mask_b1t = seg_mask_bool.to(dtype=Z_s.dtype, device=Z_s.device).reshape(
-            B_Pnn, int(T)).unsqueeze(1)  # (B*Pnn,1,T)
+            B_Pnn, int(T)).unsqueeze(1)
 
         # start/end 1회 계산
         mask_has_any, mask_start, mask_end = self._compute_contiguous_start_end_from_mask_b1t(
             mask_b1t)
 
-        Z = Z_s.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)  # (B*Pnn,C,T)
+        # Z: (B*Pnn, C, T)
+        Z = Z_s.reshape(B_Pnn, int(T), int(C)).transpose(1, 2)
 
         for block_idx in range(self.tcn_depth):
             Z_tc = Z.transpose(1, 2)  # (B*Pnn,T,C)
+
             Z_ln_tc = self.tcn_pre_lns[int(block_idx)](Z_tc)  # (B*Pnn,T,C)
             Z_ln = Z_ln_tc.transpose(1, 2)  # (B*Pnn,C,T)
 
@@ -2910,10 +2869,11 @@ class FeasibleProjector(nn.Module):
             Y = F.gelu(Y)
             Y = self.tcn_linear[int(block_idx)](Y)  # (B*Pnn,C,T)
 
-            # ✅ 블록 끝 마스크 곱 제거
+            # ✅ 마스크 곱 제거
             Z = Z + Y
 
-        return Z.transpose(1, 2).reshape(B, Pnn, int(T), int(C))
+        out = Z.transpose(1, 2).reshape(B, Pnn, int(T), int(C))
+        return out
 
     def _masked_time_mean(
         self,
@@ -2961,10 +2921,6 @@ class FeasibleProjector(nn.Module):
         count = mask.sum(dim=2).clamp_min(float(eps))  # (B,Pnn,1)
         return seq_sum / count  # (B,Pnn,C)
 
-        # ---------------------------------------------------------------------
-        # (9) ΔU 예측: 중간 마스크 곱 제거, 최종 출력에서만 0 보장 (교체)
-        # ---------------------------------------------------------------------
-
     def _predict_delta_u(
             self,
             Z_tcn: torch.Tensor,  # (B, Pnn, T, C)
@@ -2972,50 +2928,66 @@ class FeasibleProjector(nn.Module):
     ) -> torch.Tensor:
         """잔차 제어 ΔU 산출: Head + softplus 게이트 스케일.
 
-        after_weak 반영:
-            - delta_u_raw / gate_logits 등 중간에서 *mask로 계속 0을 만들지 않습니다.
-            - 최종 delta_u 출력에서만 "무효 구간=0"을 보장합니다.
-            - (feasible_gate_agentwise=True인 경우) 시간 평균은 유효 구간만 평균내기 위해 마스크를 사용합니다.
-
-        Returns:
-            delta_u: (B, Pnn, T, 3)  # 무효 구간은 0
+        변경점(요청 반영):
+            - 무효 구간 마스킹을 `* 0` 대신 `masked_fill(..., 0.0)`로 수행합니다.
+            - 적용 위치:
+                1) delta_u_raw 계산 직후
+                2) gate_logits 계산 직후(softplus 전에)
         """
         B, Pnn, T, C = Z_tcn.shape
         B_Pnn = int(B * Pnn)
 
-        # bool 마스크: (B,Pnn,T,1) -> (B,Pnn,T,3)
-        seg_mask_bool = self._to_bool_mask(seg_mask_1)  # (B,Pnn,T,1)
-        mask3 = seg_mask_bool.expand(-1, -1, -1, 3)  # (B,Pnn,T,3)
+        # float 마스크(평균 계산 등에 사용)
+        seg_mask = seg_mask_1.to(dtype=Z_tcn.dtype,
+                                 device=Z_tcn.device)  # (B,Pnn,T,1)
 
-        # Head
+        # bool 마스크(안전한 0 처리용)
+        seg_mask_bool = self._to_bool_mask(seg_mask_1)  # (B,Pnn,T,1) bool
+        mask3 = seg_mask_bool.expand(-1, -1, -1, 3)  # (B,Pnn,T,3) bool
+
+        # -----------------------
+        # Head: (B*Pnn, C, T) -> (B*Pnn, 3, T)
+        # -----------------------
         z_bct = Z_tcn.reshape(B_Pnn, int(T), int(C)).transpose(1,
                                                                2)  # (B*Pnn,C,T)
         delta_u_b3t = self.head(z_bct)  # (B*Pnn,3,T)
-        delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T),
-                                                          3)  # (B,Pnn,T,3)
 
+        # delta_u_raw: (B,Pnn,T,3)
+        delta_u_raw = delta_u_b3t.transpose(1, 2).reshape(B, Pnn, int(T), 3)
+
+        # ✅ 여기 1) 기존: delta_u_raw = delta_u_raw * seg_mask
+        delta_u_raw = delta_u_raw.masked_fill(~mask3, 0.0)
+
+        # -----------------------
         # Gate
+        # -----------------------
         if bool(getattr(self, "feasible_gate_agentwise", False)):
-            seg_mask_float = seg_mask_1.to(dtype=Z_tcn.dtype,
-                                           device=Z_tcn.device)  # (B,Pnn,T,1)
-
+            # (B,Pnn,C): 유효 구간만으로 시간축 평균
             gate_in = self._masked_time_mean(
                 seq_bptc=Z_tcn.detach(),  # (B,Pnn,T,C)
-                seg_mask_1=seg_mask_float,  # (B,Pnn,T,1)
+                seg_mask_1=seg_mask,  # (B,Pnn,T,1) float
                 eps=float(self._eps),
             )  # (B,Pnn,C)
 
+            # (B,Pnn,3): 이웃별로 1번만 계산
             gate_logits_agent = self.gate_mlp(gate_in)  # (B,Pnn,3)
+
+            # (B,Pnn,T,3): 시간축으로 복사
             gate_logits = gate_logits_agent.unsqueeze(2).expand(-1, -1, int(T),
-                                                                -1)  # (B,Pnn,T,3)
+                                                                -1)
         else:
-            gate_logits = self.gate_mlp(Z_tcn.detach())  # (B,Pnn,T,3)
+            # (B,Pnn,T,3): 시간별로 Gate 계산
+            gate_logits = self.gate_mlp(Z_tcn.detach())
+
+        # ✅ 여기 2) 기존: gate_logits = gate_logits * seg_mask
+        gate_logits = gate_logits.masked_fill(~mask3, 0.0)
 
         gate_scale = F.softplus(gate_logits)  # (B,Pnn,T,3)
         delta_u = gate_scale * torch.tanh(delta_u_raw)  # (B,Pnn,T,3)
 
-        # ✅ 최종 출력에서만 0 보장
+        # (선택) 최종 결과도 한번 더 0 보장(모양/의미 정리용)
         delta_u = delta_u.masked_fill(~mask3, 0.0)
+
         return delta_u
 
     def _build_per_agent_limits(
@@ -4713,28 +4685,40 @@ class FeasibleProjector(nn.Module):
             dit_tokens_active,
         )
 
-        # ---------------------------------------------------------------------
-        # (10) active subset 경로: _features_from_inputs / _prepare_tcn_input 호출부 수정 (교체)
-        # ---------------------------------------------------------------------
-
+    # [!추가하자!]
     def _run_feasible_tcn_for_active_subset(
             self,
-            points_trajectory_active: torch.Tensor,
-            # (N_active, 1, 1+segment_len, 4)
+            points_trajectory_active: torch.
+        Tensor,  # (N_active, 1, 1+segment_len, 4)
             points_valid_active: torch.Tensor,  # (N_active, 1, 1+segment_len)
-            seg_body_control_active: torch.Tensor,
-            # (N_active, 1, segment_len, 3)
+            seg_body_control_active: torch.
+        Tensor,  # (N_active, 1, segment_len, 3)
             seg_mask_active: torch.Tensor,  # (N_active, 1, segment_len)
             seg_mask_1_active: torch.Tensor,  # (N_active, 1, segment_len, 1)
             dit_tokens_active: torch.Tensor,  # (N_active, 1, H)
-    ) -> torch.Tensor:
-        """active 이웃들에 대해서만 TCN 기반 ΔU를 계산합니다.
+    ) -> torch.Tensor:  # (N_active, segment_len, 3)
+        """유효 이웃(active subset)에 대해서만 TCN 기반 ΔU를 계산합니다.
+
+        Args:
+            points_trajectory_active: (N_active, 1, 1+segment_len, 4)
+                active 이웃들의 포인트 궤적.
+            points_valid_active: (N_active, 1, 1+segment_len) bool
+                포인트 유효 마스크.
+            seg_body_control_active: (N_active, 1, segment_len, 3)
+                세그먼트 제어 [v_x^b, v_y^b, w].
+            seg_mask_active: (N_active, 1, segment_len)
+                세그먼트 마스크(0/1).
+            seg_mask_1_active: (N_active, 1, segment_len, 1)
+                세그먼트 마스크(채널용).
+            dit_tokens_active: (N_active, 1, H)
+                디퓨전 트렁크 은닉.
 
         Returns:
             delta_u_active: (N_active, segment_len, 3)
+                각 active 이웃에 대한 ΔU.
         """
         x_prev_active, x_fut_active = self._split_prev_fut(
-            points_trajectory_active)  # (N_active,1,segment_len,4)
+            points_trajectory_active)  # (N_active, 1, segment_len, 4) each
         x_prev_active = self._normalize_cos_sin(x_prev_active)
         x_fut_active = self._normalize_cos_sin(x_fut_active)
 
@@ -4744,22 +4728,20 @@ class FeasibleProjector(nn.Module):
             u_base=seg_body_control_active,
             dit_final_hidden_tokens=dit_tokens_active,
             points_valid=points_valid_active,
-        )  # StemInputParts
+        )
 
         Z_s_active = self._prepare_tcn_input(
-            stem_parts=stem_parts_active,
-            seg_mask_1=seg_mask_1_active,
-        )  # (N_active,1,segment_len,C)
-
+            stem_parts_active,
+            seg_mask_1_active,
+        )
         Z_tcn_active = self._run_tcn(
-            Z_s=Z_s_active,
-            seg_mask=seg_mask_active,
-            seg_mask_1=seg_mask_1_active,
-        )  # (N_active,1,segment_len,C)
+            Z_s_active, seg_mask_active,
+            seg_mask_1_active)  # (N_active, 1, segment_len, 192)
 
-        delta_u_active = self._predict_delta_u(Z_tcn_active,
-                                               seg_mask_1_active)  # (N_active,1,segment_len,3)
-        return delta_u_active.squeeze(1)  # (N_active, segment_len, 3)
+        delta_u_active = self._predict_delta_u(
+            Z_tcn_active, seg_mask_1_active)  # (N_active, 1, segment_len, 3)
+        delta_u_active = delta_u_active.squeeze(1)  # (N_active, segment_len, 3)
+        return delta_u_active
 
     def _scatter_forward_delta_u(
         self,
@@ -5515,60 +5497,328 @@ class FeasibleProjector(nn.Module):
             w_int = args.w_int_max
         return args.w_dir, w_int, args.w_const
 
-    # ================================================================
-    # [추가] (B,Pnn,point_len, C) 형태를 멀티 채널 SG에 넘겨주는 헬퍼
-    # ================================================================
-    def _sg_derivative_multi_for_points(
-        self,
-        sequences_points: torch.Tensor,  # (B, Pnn, point_len, C)
-        points_valid: torch.Tensor,  # (B, Pnn, point_len) bool
-        *,
-        dt: float,
-        polyorder: int,
-        max_window_length: int,
-        derivative_order: int = 1,
-    ) -> torch.Tensor:
-        """(B, Pnn, point_len, C) 모양의 데이터에서 원하는 변화율(1차/2차)을 계산합니다.
+    def _compute_active_row_indices_from_points_valid(
+            self,
+            points_valid: torch.Tensor,  # (B, Pnn, T) bool or 0/1
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """points_valid에서 '완전 무효 row'를 제외하기 위한 active row 인덱스를 구합니다.
 
         Args:
-            sequences_points: (B, Pnn, point_len, C)
-            points_valid: (B, Pnn, point_len) bool
-            dt: float
-            polyorder: int
-            max_window_length: int
-            derivative_order: 1 또는 2
+            points_valid (torch.Tensor):
+                shape: (B, Pnn, T)
+                각 (batch, neighbor) 슬롯의 시간축 유효 여부 마스크입니다.
+                True(또는 1)인 시점이 하나라도 있으면 그 row는 'active'로 봅니다.
 
         Returns:
-            derivatives_points: (B, Pnn, point_len, C)
+            Tuple[torch.Tensor, torch.Tensor]:
+                active_indices:
+                    shape: (N_active,), dtype=torch.long
+                    (B*Pnn)으로 펼친 row 중에서 active인 row의 인덱스 목록입니다.
+                active_mask_flat:
+                    shape: (B*Pnn,), dtype=torch.bool
+                    각 row가 active인지 여부입니다.
+
+        Notes:
+            - active=False인 row는 "모든 시점이 무효"이므로, SG 미분 결과가 항상 0이어야 합니다.
+            - 이런 row는 이후 SG 계산에서 완전히 제외해도 출력이 변하지 않습니다.
         """
-        batch_size, num_neighbors, point_len, num_channels = sequences_points.shape  # (B,Pnn,T,C)
+        if points_valid.dim() != 3:
+            raise ValueError(
+                "[_compute_active_row_indices_from_points_valid] points_valid는 (B,Pnn,T) 3D 텐서여야 합니다. "
+                f"got shape={tuple(points_valid.shape)}"
+            )
 
-        sequence_flat = sequences_points.reshape(
-            batch_size * num_neighbors,
-            point_len,
-            num_channels,
-        )  # (B*Pnn, T, C)
-        valid_flat = points_valid.reshape(
-            batch_size * num_neighbors,
-            point_len,
-        )  # (B*Pnn, T)
+        # (B, Pnn, T) -> bool
+        valid_bpt = self._to_bool_mask(points_valid)
 
-        derivative_flat = self._savgol_derivative_masked_multi_torch(
-            seq_bTC=sequence_flat,  # (B*Pnn, T, C)
-            valid_bT=valid_flat,  # (B*Pnn, T)
-            dt=dt,
-            polyorder=polyorder,
-            max_window_length=max_window_length,
-            derivative_order=derivative_order,
-        )  # (B*Pnn, T, C)
+        # row마다 "True가 하나라도 있나?"
+        # active_bp: (B, Pnn)
+        active_bp = valid_bpt.any(dim=-1)
 
-        derivatives_points = derivative_flat.reshape(
-            batch_size,
-            num_neighbors,
-            point_len,
-            num_channels,
+        # active_mask_flat: (B*Pnn,)
+        active_mask_flat = active_bp.reshape(-1)
+
+        # active_indices: (N_active,)
+        active_indices = active_mask_flat.nonzero(as_tuple=False).squeeze(-1)
+        return active_indices, active_mask_flat
+
+    def _scatter_active_rows_ntc_to_bptc(
+            self,
+            active_values_ntc: torch.Tensor,  # (N_active, T, C)
+            active_indices: torch.Tensor,  # (N_active,)
+            *,
+            B: int,
+            Pnn: int,
+            T: int,
+            C: int,
+            device: torch.device,
+            dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """active row에서만 계산한 (N_active,T,C) 결과를 (B,Pnn,T,C)로 되돌립니다.
+
+        Args:
+            active_values_ntc (torch.Tensor):
+                shape: (N_active, T, C)
+                active row들에서만 계산한 결과입니다.
+            active_indices (torch.Tensor):
+                shape: (N_active,), dtype=torch.long
+                (B*Pnn) flatten 기준 active row 인덱스입니다.
+            B, Pnn, T, C:
+                최종 출력 shape를 구성하기 위한 크기 값입니다.
+            device, dtype:
+                최종 출력 텐서의 device/dtype입니다.
+
+        Returns:
+            torch.Tensor:
+                out_bptc shape: (B, Pnn, T, C)
+                - active row 위치에는 active_values가 들어갑니다.
+                - inactive row 위치는 0으로 유지됩니다.
+
+        Notes:
+            - in-place 대입 대신 out-of-place index_copy를 사용해
+              active 결과로의 학습 신호가 자연스럽게 이어지도록 합니다.
+        """
+        B_Pnn = int(B * Pnn)
+
+        # (B*Pnn, T, C)  inactive는 0 유지
+        out_flat = torch.zeros((B_Pnn, T, C), device=device, dtype=dtype)
+
+        if int(active_indices.numel()) > 0:
+            idx = active_indices.to(device=device, dtype=torch.long)
+            src = active_values_ntc.to(device=device, dtype=dtype)
+            out_flat = out_flat.index_copy(0, idx, src)  # ✅ out-of-place
+
+        return out_flat.view(B, Pnn, T, C)
+
+    def _sg_derivative_multi_for_active_rows(
+            self,
+            sequence_multi_channel: torch.Tensor,  # (N, T, C)
+            valid_mask_bT: torch.Tensor,  # (N, T) bool or 0/1
+            dt: float,
+            polyorder: int,
+            max_window_length: int,
+            *,
+            derivative_order: int,
+            regularization_epsilon: float,
+    ) -> torch.Tensor:
+        """(active row들만) Savitzky–Golay 기반 미분을 계산합니다.
+
+        Args:
+            sequence_multi_channel (torch.Tensor):
+                shape: (N, T, C)
+                한 row마다 시간축 T를 가진 값(C채널)입니다.
+            valid_mask_bT (torch.Tensor):
+                shape: (N, T)
+                각 시점이 유효한지(True/False) 마스크입니다.
+            dt (float):
+                샘플 간 시간 간격(초).
+            polyorder (int):
+                SG에서 사용하는 다항식 차수.
+            max_window_length (int):
+                SG 창 길이 최대값(홀수 권장).
+            derivative_order (int):
+                1이면 1차 변화율, 2이면 2차 변화율.
+            regularization_epsilon (float):
+                작은 정규화 값(수치 안정 목적).
+
+        Returns:
+            torch.Tensor:
+                derivative shape: (N, T, C)
+                - 중심 시점이 무효인 위치는 0입니다.
+                - 계산이 어려운 위치(유효 샘플 부족 등)는 유한 차분 기반 기본값으로 채웁니다.
+
+        Notes:
+            - 이 함수는 "N row 전체가 active"라고 가정합니다(= 적어도 한 시점은 valid).
+              완전 무효 row 스킵(gather/scatter)은 바깥 래퍼에서 처리합니다.
+        """
+        if sequence_multi_channel.numel() == 0:
+            return sequence_multi_channel
+
+        if sequence_multi_channel.dim() != 3:
+            raise ValueError(
+                "[_sg_derivative_multi_for_active_rows] sequence_multi_channel은 (N,T,C) 3D여야 합니다. "
+                f"got shape={tuple(sequence_multi_channel.shape)}"
+            )
+
+        N, T, C = sequence_multi_channel.shape
+        valid_bool = self._to_bool_mask(valid_mask_bT)
+        if valid_bool.shape != (N, T):
+            raise ValueError(
+                "[_sg_derivative_multi_for_active_rows] valid_mask_bT shape이 (N,T)와 다릅니다. "
+                f"valid_mask_bT.shape={tuple(valid_bool.shape)}, expected={(N, T)}"
+            )
+
+        # 1) 기본값(대체값): 마스크를 고려한 유한 차분
+        if int(derivative_order) == 1:
+            fd_derivative = self._savgol_finite_difference_multi(
+                sequence_multi_channel=sequence_multi_channel,  # (N,T,C)
+                valid_mask_bT=valid_bool,  # (N,T)
+                dt=float(dt),
+            )
+        elif int(derivative_order) == 2:
+            fd_derivative = self._savgol_finite_difference_second_multi(
+                sequence_multi_channel=sequence_multi_channel,  # (N,T,C)
+                valid_mask_bT=valid_bool,  # (N,T)
+                dt=float(dt),
+            )
+        else:
+            raise ValueError(
+                f"[_sg_derivative_multi_for_active_rows] derivative_order는 1 또는 2만 지원합니다. got={derivative_order}"
+            )
+
+        # 2) SG 창 길이 결정
+        window_length = self._savgol_select_window_length(
+            sequence_length=int(T),
+            max_window_length=int(max_window_length),
+        )
+
+        # SG를 쓸 수 없는 조건이면(창이 너무 짧거나 polyorder가 부족하면) 기본값만 반환
+        if window_length < 3 or int(polyorder) < int(derivative_order):
+            return fd_derivative
+
+        # 3) 시간 기저/gram 미리 만들기
+        _, gram_per_k, power_per_k = self._sg_build_design_matrix_and_gram(
+            window_length=int(window_length),
+            polyorder=int(polyorder),
+            dt=float(dt),
+            device=sequence_multi_channel.device,
+            dtype=sequence_multi_channel.dtype,
+        )
+
+        # 4) 창 마스크 및 유효 샘플 개수
+        mask_window, valid_count = self._savgol_build_mask_and_count_multi(
+            valid_mask_bT=valid_bool,  # (N,T)
+            window_length=int(window_length),
+            value_dtype=sequence_multi_channel.dtype,
+        )  # mask_window: (N,T,W), valid_count: (N,T)
+
+        # 5) A_all / b_all 구성 후 solve(가능한 위치만)
+        A_all = self._savgol_build_A_all_from_mask_multi(
+            mask_window=mask_window,  # (N,T,W)
+            gram_per_k=gram_per_k,  # (W,P+1,P+1)
+        )  # (N,T,P+1,P+1)
+
+        b_all = self._savgol_build_b_all_multi(
+            sequence_multi_channel=sequence_multi_channel,  # (N,T,C)
+            mask_window=mask_window,  # (N,T,W)
+            power_per_k=power_per_k,  # (W,P+1)
+            window_length=int(window_length),
+        )  # (N,T,C,P+1)
+
+        derivative = self._savgol_solve_multi(
+            A_all=A_all,
+            b_all=b_all,
+            valid_count=valid_count,
+            valid_center_mask=valid_bool,
+            fd_derivative=fd_derivative,
+            polyorder=int(polyorder),
+            derivative_order=int(derivative_order),
+            regularization_epsilon=float(regularization_epsilon),
+        )  # (N,T,C)
+
+        return derivative
+
+    def _sg_derivative_multi_for_points(
+            self,
+            sequences_points: torch.Tensor,  # (B, Pnn, T, C)
+            points_valid: torch.Tensor,  # (B, Pnn, T) bool or 0/1
+            dt: float,
+            polyorder: int,
+            max_window_length: int,
+            *,
+            derivative_order: int = 1,
+            regularization_epsilon: Optional[float] = None,
+    ) -> torch.Tensor:
+        """(핵심 변경) 완전 무효 row는 SG 계산을 스킵하고 0을 반환하는 SG 미분 래퍼입니다.
+
+        Args:
+            sequences_points (torch.Tensor):
+                shape: (B, Pnn, T, C)
+                시간축 T를 가진 값(채널 C개)입니다.
+            points_valid (torch.Tensor):
+                shape: (B, Pnn, T)
+                각 시점이 유효한지(True/False) 마스크입니다.
+            dt, polyorder, max_window_length:
+                SG 미분 설정값입니다.
+            derivative_order (int):
+                1 또는 2 (기본 1).
+            regularization_epsilon (Optional[float]):
+                None이면 self._eps를 사용합니다.
+
+        Returns:
+            torch.Tensor:
+                derivative shape: (B, Pnn, T, C)
+                - 완전 무효 row는 전부 0.
+                - active row만 실제 SG 계산 결과가 들어갑니다.
+
+        Notes:
+            - 기존 대비 달라진 점은 "완전 무효 row를 먼저 걸러서 비싼 SG 계산을 안 한다"는 것뿐입니다.
+            - active row에 대한 계산 방식(값)은 동일합니다.
+        """
+        if sequences_points.numel() == 0:
+            return sequences_points
+
+        if sequences_points.dim() != 4:
+            raise ValueError(
+                "[_sg_derivative_multi_for_points] sequences_points는 (B,Pnn,T,C) 4D 텐서여야 합니다. "
+                f"got shape={tuple(sequences_points.shape)}"
+            )
+
+        if points_valid.shape != sequences_points.shape[:-1]:
+            raise ValueError(
+                "[_sg_derivative_multi_for_points] points_valid.shape와 sequences_points.shape[:-1]가 다릅니다. "
+                f"points_valid.shape={tuple(points_valid.shape)}, sequences_points.shape={tuple(sequences_points.shape)}"
+            )
+
+        B, Pnn, T, C = sequences_points.shape
+        device = sequences_points.device
+        dtype = sequences_points.dtype
+
+        if regularization_epsilon is None:
+            regularization_epsilon = float(self._eps)
+
+        # 1) active row 찾기: (B*Pnn) 기준
+        active_indices, _ = self._compute_active_row_indices_from_points_valid(
+            points_valid=points_valid,  # (B,Pnn,T)
+        )
+
+        # 2) active가 하나도 없으면 전부 0 반환(기존 결과와 동일)
+        if int(active_indices.numel()) == 0:
+            return sequences_points.new_zeros((B, Pnn, T, C))
+
+        # 3) active row만 gather: (N_active, T, C), (N_active, T)
+        B_Pnn = int(B * Pnn)
+        seq_flat = sequences_points.reshape(B_Pnn, T, C)
+        valid_flat = self._to_bool_mask(points_valid).reshape(B_Pnn, T)
+
+        idx = active_indices.to(device=device, dtype=torch.long)
+        seq_active = seq_flat.index_select(0, idx)  # (N_active, T, C)
+        valid_active = valid_flat.index_select(0, idx)  # (N_active, T)
+
+        # 4) SG 미분은 active row만 수행
+        deriv_active = self._sg_derivative_multi_for_active_rows(
+            sequence_multi_channel=seq_active,  # (N_active,T,C)
+            valid_mask_bT=valid_active,  # (N_active,T)
+            dt=float(dt),
+            polyorder=int(polyorder),
+            max_window_length=int(max_window_length),
+            derivative_order=int(derivative_order),
+            regularization_epsilon=float(regularization_epsilon),
+        )  # (N_active, T, C)
+
+        # 5) scatter: (B,Pnn,T,C)로 복원 (inactive는 0 유지)
+        deriv_full = self._scatter_active_rows_ntc_to_bptc(
+            active_values_ntc=deriv_active,  # (N_active,T,C)
+            active_indices=idx,  # (N_active,)
+            B=int(B),
+            Pnn=int(Pnn),
+            T=int(T),
+            C=int(C),
+            device=device,
+            dtype=dtype,
         )  # (B,Pnn,T,C)
-        return derivatives_points
+
+        return deriv_full
 
     def _assert_past_cur_valid_mask(
         self,
