@@ -54,6 +54,6 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --batch_size 256 \
   --learning_rate 1e-3 \
   --min_learning_rate 1e-6 \
-  --profile_feasible False \
+  --profile_feasible True \
   --feasible_stride_dt 0.1
 
