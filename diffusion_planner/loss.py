@@ -9,6 +9,223 @@ from diffusion_planner.utils.target_feature import build_target_future_tensors_a
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+import torch
+import torch.nn as nn
+
+
+def _unwrap_to_core_module(model: nn.Module) -> nn.Module:
+    """DeepSpeed/DDP 래퍼가 씌워져 있어도 실제 nn.Module을 꺼냅니다.
+
+    Args:
+        model (nn.Module): 래핑될 수도 있는 모델. shape: ()
+
+    Returns:
+        nn.Module: 가능한 한 안쪽의 실제 nn.Module. shape: ()
+    """
+    cur: nn.Module = model
+    for _ in range(8):
+        inner = getattr(cur, "module", None)
+        if isinstance(inner, nn.Module):
+            cur = inner
+        else:
+            break
+    return cur
+
+
+def _collect_tensor_dtypes_in_dict(data: Dict[str, Any]) -> Dict[str, str]:
+    """dict 안의 torch.Tensor 항목들의 dtype을 모아 요약합니다.
+
+    Args:
+        data (Dict[str, Any]): 입력 dict. value가 Tensor일 수도 있음.
+
+    Returns:
+        Dict[str, str]: key -> dtype 문자열 요약.
+    """
+    out: Dict[str, str] = {}
+    for k, v in data.items():
+        if isinstance(v, torch.Tensor):
+            out[str(k)] = str(v.dtype)
+    return out
+
+
+def _find_fused_mlp_modules(root: nn.Module) -> List[Tuple[str, nn.Module]]:
+    """모델 내부에서 fused MLP 모듈(FusedMlpGelu)을 찾아 반환합니다.
+
+    Args:
+        root (nn.Module): 실제 nn.Module. shape: ()
+
+    Returns:
+        List[Tuple[str, nn.Module]]:
+            - (모듈 이름, 모듈) 리스트
+            - 모듈 이름은 root.named_modules() 기준의 경로 문자열
+    """
+    fused_list: List[Tuple[str, nn.Module]] = []
+    for name, m in root.named_modules():
+        # import 순환을 피하려고 클래스 이름 문자열로만 판정
+        if m.__class__.__name__ == "FusedMlpGelu":
+            fused_list.append((name, m))
+    return fused_list
+
+
+def forward_once_and_check_bf16(
+    model: nn.Module,
+    merged_inputs: Dict[str, Any],
+    *,
+    use_deepspeed: bool,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    strict_bf16: bool = True,
+    max_records: int = 16,
+) -> Dict[str, torch.Tensor]:
+    """forward 1회 실행 중 fused MLP가 bf16으로 잘 돌고 있는지 확인합니다.
+
+    이 함수가 하는 일
+    - fused MLP(FusedMlpGelu) 모듈들에 forward hook을 달아,
+      실제로 fused MLP로 들어가는 입력 텐서의 dtype/shape/device를 기록합니다.
+    - fused MLP(fc1/fc2) 파라미터 dtype도 같이 기록합니다.
+    - forward는 사용자가 제시한 로직 그대로 실행합니다:
+        - use_deepspeed=True  -> autocast 없이 model(merged_inputs)
+        - use_deepspeed=False -> torch.autocast("cuda", dtype=amp_dtype)로 감싸서 실행
+    - strict_bf16=True이면:
+        - fused MLP 입력 dtype이 torch.bfloat16이 아니거나
+        - fused MLP 파라미터 dtype이 torch.bfloat16이 아니면
+      바로 RuntimeError를 발생시킵니다.
+
+    Args:
+        model (nn.Module): DeepSpeedEngine 또는 일반 nn.Module. shape: ()
+        merged_inputs (Dict[str, Any]): 모델 입력 dict. 텐서 value들의 shape은 배치에 따라 다름.
+        use_deepspeed (bool): DeepSpeed 경로 사용 여부.
+        amp_dtype (torch.dtype): non-DS 경로에서 사용할 autocast dtype (기본 bf16).
+        strict_bf16 (bool): True면 bf16 아니면 즉시 실패.
+        max_records (int): hook 기록 최대 개수(너무 많이 쌓이는 것 방지).
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            decoder_output dict. (model(merged_inputs)의 두 번째 반환값)
+    """
+    core: nn.Module = _unwrap_to_core_module(model)
+    fused_mlps: List[Tuple[str, nn.Module]] = _find_fused_mlp_modules(core)
+
+    records: List[Dict[str, Any]] = []
+    handles: List[Any] = []
+
+    def _make_hook(mod_name: str) -> Any:
+        """forward hook 생성"""
+        def _hook(mod: nn.Module, inputs: Tuple[Any, ...], output: Any) -> None:
+            # inputs[0]이 보통 x 입니다.
+            if len(records) >= int(max_records):
+                return
+            x = inputs[0] if len(inputs) > 0 else None
+            if not isinstance(x, torch.Tensor):
+                return
+
+            rec: Dict[str, Any] = {
+                "module": mod_name,
+                "class": mod.__class__.__name__,
+                "x_dtype": x.dtype,
+                "x_device": str(x.device),
+                "x_shape": tuple(int(s) for s in x.shape),  # shape: (..)
+            }
+
+            # FusedMlpGelu는 fc1/fc2가 있다고 가정(너 코드 기준)
+            fc1 = getattr(mod, "fc1", None)
+            fc2 = getattr(mod, "fc2", None)
+            if isinstance(fc1, nn.Linear) and isinstance(fc2, nn.Linear):
+                rec["fc1_w_dtype"] = fc1.weight.dtype
+                rec["fc2_w_dtype"] = fc2.weight.dtype
+                rec["fc1_b_dtype"] = (fc1.bias.dtype if fc1.bias is not None else None)
+                rec["fc2_b_dtype"] = (fc2.bias.dtype if fc2.bias is not None else None)
+
+            records.append(rec)
+
+        return _hook
+
+    # hook 장착
+    for name, m in fused_mlps:
+        handles.append(m.register_forward_hook(_make_hook(name)))
+
+    # (옵션) DeepSpeed 엔진 플래그 출력에 도움되는 값들
+    ds_bf16_enabled: Optional[bool] = None
+    if use_deepspeed and hasattr(model, "bfloat16_enabled"):
+        try:
+            ds_bf16_enabled = bool(model.bfloat16_enabled())
+        except Exception:
+            ds_bf16_enabled = None
+
+    # 입력 dtype 요약(참고용)
+    input_dtype_map = _collect_tensor_dtypes_in_dict(merged_inputs)
+
+    # forward 실행 (사용자 제시 로직 그대로)
+    if use_deepspeed:
+        _, decoder_output = model(merged_inputs)
+    else:
+        with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            _, decoder_output = model(merged_inputs)
+
+    # hook 제거
+    for h in handles:
+        try:
+            h.remove()
+        except Exception:
+            pass
+
+    # ---- 결과 출력 ----
+    print("\n==================== [BF16 CHECK] ====================")
+    print(f"- use_deepspeed: {use_deepspeed}")
+    if ds_bf16_enabled is not None:
+        print(f"- deepspeed_engine.bfloat16_enabled(): {ds_bf16_enabled}")
+    print(f"- torch.is_autocast_enabled() (after forward): {torch.is_autocast_enabled()}")
+    print("- merged_inputs tensor dtypes (요약):")
+    for k, v in sorted(input_dtype_map.items()):
+        print(f"  - {k}: {v}")
+
+    print(f"- found FusedMlpGelu modules: {len(fused_mlps)}")
+    print(f"- captured fused-mlp call records: {len(records)}")
+
+    if len(records) > 0:
+        # record 몇 개만 보기
+        show_n = min(8, len(records))
+        print(f"- fused-mlp records (상위 {show_n}개):")
+        for i in range(show_n):
+            r = records[i]
+            print(
+                "  - "
+                f"[{i}] {r.get('module')} | "
+                f"x_dtype={r.get('x_dtype')} | "
+                f"x_shape={r.get('x_shape')} | "
+                f"fc1_w_dtype={r.get('fc1_w_dtype')} | "
+                f"fc2_w_dtype={r.get('fc2_w_dtype')}"
+            )
+    print("======================================================\n")
+
+    # ---- strict 검사 ----
+    if strict_bf16:
+        if len(records) == 0:
+            raise RuntimeError(
+                "BF16 체크 실패: fused MLP 호출 기록이 0개입니다. "
+                "이 배치에서 유효 토큰이 0개였거나, 해당 경로가 실행되지 않았을 수 있습니다."
+            )
+
+        for r in records:
+            x_dtype = r.get("x_dtype", None)
+            fc1_w_dtype = r.get("fc1_w_dtype", None)
+            fc2_w_dtype = r.get("fc2_w_dtype", None)
+
+            if x_dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "BF16 체크 실패: fused MLP 입력 dtype이 bf16이 아닙니다. "
+                    f"module={r.get('module')}, x_dtype={x_dtype}"
+                )
+            if fc1_w_dtype != torch.bfloat16 or fc2_w_dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "BF16 체크 실패: fused MLP 파라미터 dtype이 bf16이 아닙니다. "
+                    f"module={r.get('module')}, fc1_w_dtype={fc1_w_dtype}, fc2_w_dtype={fc2_w_dtype}"
+                )
+
+    return decoder_output
+
 def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
     """tensor에 NaN/Inf가 있는지 확인합니다.
 
@@ -411,6 +628,14 @@ def _forward_model_with_autocast(
         "low_t_mask": low_t_mask,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
     }
+    # merged_inputs 만들어진 직후
+    decoder_output = forward_once_and_check_bf16(
+        model=model,
+        merged_inputs=merged_inputs,
+        use_deepspeed=use_deepspeed,
+        amp_dtype=torch.bfloat16,
+        strict_bf16=True,  # bf16 아니면 바로 에러
+    )
     is_ds_engine = hasattr(model, "backward") and hasattr(
         model, "step") and hasattr(model, "module")
 
