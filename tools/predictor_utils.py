@@ -2086,7 +2086,7 @@ def build_deepspeed_config(args: argparse.Namespace,
             "enabled": False,
         },
         "bf16": {
-            "enabled": False,
+            "enabled": True,
         },
         "zero_optimization": {
             "stage": 2,  # ZeRO-2
