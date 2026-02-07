@@ -894,25 +894,54 @@ class DiTBlock(nn.Module):
         out = self.out_proj_cross(out.to(dtype=q_unpad.dtype))  # (Tq, D)
         return out
 
+    @staticmethod
+    def _cast_to_block_compute_dtype(
+        x: torch.Tensor,
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """AMP(autocast) 환경에서 다음 무거운 연산에 맞게 dtype을 정리합니다.
+
+        목적
+        - LayerNorm 같은 연산은 AMP에서 float32로 나오는 경우가 있습니다.
+        - 하지만 이후 MLP/FlashAttention은 bf16으로 돌고 싶은 경우가 많습니다.
+        - 그래서 "LayerNorm 결과"를 autocast가 선택한 dtype(bfloat16/float16)로 다시 맞춥니다.
+
+        Args:
+            x (torch.Tensor): dtype을 맞출 대상 텐서. shape: 임의
+            ref (torch.Tensor): device/dtype 판단 기준 텐서. shape: 임의
+
+        Returns:
+            torch.Tensor:
+                - shape: x와 동일
+                - dtype:
+                    - autocast가 켜져 있고 CUDA면: torch.get_autocast_gpu_dtype()
+                    - 그 외: ref.dtype
+        """
+        target_dtype: torch.dtype = DiTBlock._get_compute_dtype(ref)
+        if x.device != ref.device:
+            x = x.to(device=ref.device)
+        if x.dtype != target_dtype:
+            x = x.to(dtype=target_dtype)
+        return x
+
     def forward_packed(
-            self,
-            x_unpad: torch.Tensor,  # (Tq, D)
-            cu_seqlens_q: torch.Tensor,  # (B+1,) int32
-            max_seqlen_q: int,
-            cross_kv_cache: FlashAttnKVCache,
-            pram_v2_modulations: Dict[str,
-                                      ModulationTriplet],  # 값 텐서 shape: (Tq, D)
+        self,
+        x_unpad: torch.Tensor,  # (Tq, D)
+        cu_seqlens_q: torch.Tensor,  # (B+1,) int32
+        max_seqlen_q: int,
+        cross_kv_cache: FlashAttnKVCache,
+        pram_v2_modulations: Dict[str, ModulationTriplet],  # 각 값 텐서 shape: (Tq, D)
     ) -> torch.Tensor:
         """블록 전체를 (Tq, D) packed 토큰에서만 수행합니다.
 
-        - LayerNorm/MLP까지 전부 유효 토큰만 계산합니다.
-        - Cross-Attn의 KV(scene 토큰)는 캐시된 kv_unpad/cu_k/max_k를 재사용합니다.
+        - LayerNorm은 AMP 정책대로 fp32가 될 수 있습니다.
+        - 하지만 그 다음 MLP/Attention 경로는 bf16이 되도록, LN 출력만 다시 캐스팅합니다.
 
         Args:
-            x_unpad: (Tq, D) 유효 에이전트 토큰
-            cu_seqlens_q: (B+1,) 누적 길이(int32)
-            max_seqlen_q: 배치 내 최대 길이
-            cross_kv_cache: scene KV 캐시
+            x_unpad: (Tq, D)
+            cu_seqlens_q: (B+1,)
+            max_seqlen_q: int
+            cross_kv_cache: KV 캐시
             pram_v2_modulations: {"SA","FFN","CA"} 각 ModulationTriplet
                 - delta_scale/shift/gate: (Tq, D)
 
@@ -920,52 +949,74 @@ class DiTBlock(nn.Module):
             torch.Tensor: (Tq, D)
         """
         if x_unpad.dim() != 2:
-            raise ValueError(
-                f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
+            raise ValueError(f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
+
+        # (A) 블록 내부 기준 dtype을 "autocast가 선택한 dtype"으로 맞춤
+        # - autocast 꺼져 있으면 사실상 no-op
+        x_unpad = self._cast_to_block_compute_dtype(x_unpad, ref=x_unpad)
 
         # ----- SA -----
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
-        y = self.norm1(x_unpad)  # (Tq, D)
-        ds = sa_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = sa_mod.shift.to(dtype=y.dtype, device=y.device)
-        y_tilde = y * (1.0 + ds) + sh
+
+        y1 = self.norm1(x_unpad)  # (Tq, D)  (AMP에서 float32일 수 있음)
+        y1 = self._cast_to_block_compute_dtype(y1, ref=x_unpad)  # (Tq, D) bf16로 복귀
+
+        ds = sa_mod.delta_scale.to(dtype=y1.dtype, device=y1.device)  # (Tq, D)
+        sh = sa_mod.shift.to(dtype=y1.dtype, device=y1.device)        # (Tq, D)
+        y_tilde = y1 * (1.0 + ds) + sh                                 # (Tq, D)
+
         f_sa = self._self_attn_flash_varlen_packed(
             x_unpad=y_tilde,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-        )
-        g = sa_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_sa
+        )  # (Tq, D)
+
+        g = sa_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)  # (Tq, D)
+        x_unpad = x_unpad + g * f_sa                                     # (Tq, D)
 
         # ----- FFN(MLP1) -----
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
-        y = self.norm2(x_unpad)
-        ds = ffn_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = ffn_mod.shift.to(dtype=y.dtype, device=y.device)
-        y_tilde = y * (1.0 + ds) + sh
-        f_ffn = self.mlp1(y_tilde)
-        g = ffn_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_ffn
+
+        y2 = self.norm2(x_unpad)  # (Tq, D) (AMP에서 float32일 수 있음)
+        y2 = self._cast_to_block_compute_dtype(y2, ref=x_unpad)  # (Tq, D) bf16로 복귀
+
+        ds = ffn_mod.delta_scale.to(dtype=y2.dtype, device=y2.device)  # (Tq, D)
+        sh = ffn_mod.shift.to(dtype=y2.dtype, device=y2.device)        # (Tq, D)
+        y_tilde = y2 * (1.0 + ds) + sh                                   # (Tq, D)
+
+        f_ffn = self.mlp1(y_tilde)                                       # (Tq, D)
+
+        g = ffn_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)  # (Tq, D)
+        x_unpad = x_unpad + g * f_ffn                                     # (Tq, D)
 
         # ----- CA -----
         ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
-        y = self.norm3(x_unpad)
-        ds = ca_mod.delta_scale.to(dtype=y.dtype, device=y.device)
-        sh = ca_mod.shift.to(dtype=y.dtype, device=y.device)
-        q_styled = y * (1.0 + ds) + sh
+
+        y3 = self.norm3(x_unpad)  # (Tq, D)
+        y3 = self._cast_to_block_compute_dtype(y3, ref=x_unpad)  # (Tq, D)
+
+        ds = ca_mod.delta_scale.to(dtype=y3.dtype, device=y3.device)  # (Tq, D)
+        sh = ca_mod.shift.to(dtype=y3.dtype, device=y3.device)        # (Tq, D)
+        q_styled = y3 * (1.0 + ds) + sh                                 # (Tq, D)
+
         f_ca = self._cross_attn_flash_varlen_packed(
             q_unpad=q_styled,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             kv_cache=cross_kv_cache,
-        )
-        g = ca_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
-        x_unpad = x_unpad + g * f_ca
+        )  # (Tq, D)
+
+        g = ca_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)  # (Tq, D)
+        x_unpad = x_unpad + g * f_ca                                     # (Tq, D)
 
         # ----- MLP2 -----
-        x_unpad = x_unpad + self.gate_mlp2.to(
-            dtype=x_unpad.dtype, device=x_unpad.device) * self.mlp2(
-                self.norm4(x_unpad))
+        y4 = self.norm4(x_unpad)  # (Tq, D)
+        y4 = self._cast_to_block_compute_dtype(y4, ref=x_unpad)  # (Tq, D)
+
+        mlp2_out = self.mlp2(y4)  # (Tq, D)
+        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype, device=x_unpad.device)  # ()
+        x_unpad = x_unpad + gate2 * mlp2_out  # (Tq, D)
+
         return x_unpad
 
     def _apply_modulated_mlp1(
@@ -1024,6 +1075,8 @@ class DiTBlock(nn.Module):
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
         y = self.norm2(x)  # [B,(1+)Pnn,D]
         y_tilde = apply_pram_v2_path_modulation(y, ffn_mod)  # [B,(1+)Pnn,D]
+        y_tilde = self._cast_to_block_compute_dtype(y_tilde, ref=x)  # ✅ 추가
+
         f_ffn = self.mlp1(y_tilde)  # [B,(1+)Pnn,D]
         x = x + ffn_mod.gate.to(dtype=x.dtype,
                                 device=x.device) * f_ffn  # [B,(1+)Pnn,D]
@@ -1040,8 +1093,10 @@ class DiTBlock(nn.Module):
                                device=x.device) * f_ca  # (B,(1+)Pnn,D)
 
         # ------ 원본 MLP2 경로 유지 ------
+        y4 = self.norm4(x)
+        y4 = self._cast_to_block_compute_dtype(y4, ref=x)  # ✅ 추가
         x = x + self.gate_mlp2.to(dtype=x.dtype, device=x.device) * self.mlp2(
-            self.norm4(x))
+            y4)
 
         # 무효 에이전트 0‑클램프 (안전)
         x = x.masked_fill(target_current_mask.unsqueeze(-1),
