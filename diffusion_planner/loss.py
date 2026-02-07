@@ -631,13 +631,13 @@ def _forward_model_with_autocast(
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
     }
     # merged_inputs 만들어진 직후
-    decoder_output = forward_once_and_check_bf16(
-        model=model,
-        merged_inputs=merged_inputs,
-        use_deepspeed=use_deepspeed,
-        amp_dtype=torch.bfloat16,
-        strict_bf16=True,  # bf16 아니면 바로 에러
-    )
+    # decoder_output = forward_once_and_check_bf16(
+    #     model=model,
+    #     merged_inputs=merged_inputs,
+    #     use_deepspeed=use_deepspeed,
+    #     amp_dtype=torch.bfloat16,
+    #     strict_bf16=True,  # bf16 아니면 바로 에러
+    # )
     is_ds_engine = hasattr(model, "backward") and hasattr(
         model, "step") and hasattr(model, "module")
 
