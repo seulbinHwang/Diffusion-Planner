@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from typing import Any, Callable, Dict, List, Tuple, Optional
+
 import logging
 
 import torch
@@ -9,7 +12,6 @@ from diffusion_planner.utils.target_feature import build_target_future_tensors_a
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
 
-from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 import torch
