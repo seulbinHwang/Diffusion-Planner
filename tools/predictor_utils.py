@@ -2076,7 +2076,7 @@ def build_deepspeed_config(args: argparse.Namespace,
         "gradient_accumulation_steps": grad_accum_steps,
         "gradient_clipping": max_grad_norm,
         "torch_autocast": {
-            "enabled": False,
+            "enabled": True,
             # 둘 중 하나 선택:
             "dtype": "bfloat16",  # 또는 "float16"
             # (선택) 이 목록을 안 주면 DeepSpeed 기본 목록을 씀 :contentReference[oaicite:1]{index=1}
@@ -2086,7 +2086,7 @@ def build_deepspeed_config(args: argparse.Namespace,
             "enabled": False,
         },
         "bf16": {
-            "enabled": True,
+            "enabled": False,
         },
         "zero_optimization": {
             "stage": 2,  # ZeRO-2
