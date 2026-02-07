@@ -416,8 +416,9 @@ def _forward_model_with_autocast(
 
     if use_deepspeed:
         assert is_ds_engine, "use_deepspeed=True 인데 model 이 DS engine 아님"
-        # target_past_cur_future_valid
-        _, decoder_output = model(merged_inputs)  # DS가 torch_autocast로 처리
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            # target_past_cur_future_valid
+            _, decoder_output = model(merged_inputs)  # DS가 torch_autocast로 처리
     else:
         with torch.autocast("cuda", dtype=AMP_DTYPE):
             _, decoder_output = model(merged_inputs)
