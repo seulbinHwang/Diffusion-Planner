@@ -55,7 +55,6 @@ except Exception as _e_fused_mlp:
         f"(cause: {_e_fused_mlp})"
     ) from _e_fused_mlp
 
-
 def _fused_linear_gelu_linear(
     x2d: torch.Tensor,  # (N, Din)
     w1: torch.Tensor,  # (H, Din)
@@ -64,23 +63,9 @@ def _fused_linear_gelu_linear(
     b2: Optional[torch.Tensor],  # (Dout,) or None
     is_training: bool,
 ) -> torch.Tensor:
-    """fused_mlp_func로 Linear -> GELU -> Linear을 수행합니다.
+    """fused_mlp_func로 Linear -> GELU(근사) -> Linear을 수행합니다."""
+    act = "gelu_approx"
 
-    Args:
-        x2d (torch.Tensor): 입력 (N, Din), CUDA, fp16/bf16
-        w1 (torch.Tensor): 첫 Linear weight (H, Din)
-        b1 (Optional[torch.Tensor]): 첫 Linear bias (H,) 또는 None
-        w2 (torch.Tensor): 둘째 Linear weight (Dout, H)
-        b2 (Optional[torch.Tensor]): 둘째 Linear bias (Dout,) 또는 None
-        is_training (bool): 학습 모드 여부. 일부 구현은 학습 때만 중간값 저장 옵션이 필요합니다.
-
-    Returns:
-        torch.Tensor: 출력 (N, Dout)
-
-    Raises:
-        RuntimeError: fused_mlp_func 호출이 실패하면(시그니처 불일치 등) 즉시 실패합니다.
-    """
-    # flash-attn 쪽에서 (x, w1, w2, b1, b2, ...) 순서로 쓰는 코드가 존재합니다. :contentReference[oaicite:1]{index=1}
     try:
         return fused_mlp_func(
             x2d,
@@ -88,7 +73,7 @@ def _fused_linear_gelu_linear(
             w2,
             b1,
             b2,
-            activation="gelu",
+            activation=act,
             save_pre_act=is_training,
             return_residual=False,
         )
@@ -101,7 +86,7 @@ def _fused_linear_gelu_linear(
                 w2,
                 b1,
                 b2,
-                activation="gelu",
+                activation=act,
                 save_pre_act=is_training,
             )
         except TypeError:
@@ -112,7 +97,7 @@ def _fused_linear_gelu_linear(
                     w2,
                     b1,
                     b2,
-                    activation="gelu",
+                    activation=act,
                 )
             except Exception as e:
                 raise RuntimeError(
@@ -120,6 +105,7 @@ def _fused_linear_gelu_linear(
                     "Your flash-attn build may have an incompatible fused_dense interface."
                     f" (cause: {e})"
                 ) from e
+
 
 def _require_fused_mlp_ready(
     x2d: torch.Tensor,  # (N, Din)
