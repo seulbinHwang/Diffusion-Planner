@@ -19,7 +19,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=32
 # CPU에서 돌아가는 연산(전처리, 일부 텐서 연산, BLAS 등)의 스레드 수를 컨트롤해서, GPU 학습 중 CPU 과도한 스레드 난립 방지
 printf "[ENV] %-28s %s\n" "OMP_NUM_THREADS:"            "${OMP_NUM_THREADS-<unset>}"
 printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONNECTIONS-<unset>}"
-DEBUG_LOG=1   # 1: 상세 디버그, 0: 일반 학습
+DEBUG_LOG=0   # 1: 상세 디버그, 0: 일반 학습
 
 if (( DEBUG_LOG )); then
   export NCCL_DEBUG=INFO
@@ -45,15 +45,18 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
---nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" \
+--nnodes 1 --nproc-per-node 6 --standalone --log_dir "$LOG_DIR" \
 --redirects 3 --tee "$TEE" \
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "final_test" \
-  --batch_size 256 \
+  --name "final_fast" \
+  --batch_size 1536 \
   --learning_rate 1e-3 \
   --min_learning_rate 1e-6 \
-  --profile_feasible True \
+  --profile_feasible False \
+  --use_feasible False \
+  --use_feasible_dl False \
+  --use_feasible_filter False \
   --feasible_stride_dt 0.1
 
