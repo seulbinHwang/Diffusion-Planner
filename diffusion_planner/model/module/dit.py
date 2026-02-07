@@ -144,108 +144,16 @@ def _require_fused_mlp_ready(
 
 
 
-def _make_linear(
-    in_features: int,
-    out_features: int,
-    bias: bool,
-    *,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> nn.Linear:
-    """nn.Linear를 원하는 device/dtype으로 생성합니다.
-
-    Args:
-        in_features: 입력 차원 Din.
-        out_features: 출력 차원 Dout.
-        bias: bias 사용 여부.
-        device: 파라미터를 둘 장치. (예: cuda)
-        dtype: 파라미터 숫자 형식. (예: torch.bfloat16)
-
-    Returns:
-        nn.Linear:
-            - weight shape: (Dout, Din)
-            - bias shape: (Dout,) 또는 None
-    """
-    try:
-        # torch 버전에 따라 device/dtype 인자가 지원됩니다.
-        return nn.Linear(
-            int(in_features),
-            int(out_features),
-            bias=bias,
-            device=device,
-            dtype=dtype,
-        )
-    except TypeError:
-        layer = nn.Linear(int(in_features), int(out_features), bias=bias)
-        if device is not None or dtype is not None:
-            layer = layer.to(device=device, dtype=dtype)
-        return layer
-
-
-def _require_fused_mlp_ready(
-    x2d: torch.Tensor,  # (N, Din)
-    fc1: nn.Linear,
-    fc2: nn.Linear,
-    *,
-    strict_param_dtype: bool = True,
-) -> None:
-    """fused_mlp_func를 안전하게 호출할 수 있는 상태인지 검사합니다.
-
-    Args:
-        x2d: 입력 텐서. shape: (N, Din)
-        fc1: 첫 번째 Linear (Din -> H)
-        fc2: 두 번째 Linear (H -> Dout)
-        strict_param_dtype: True면 파라미터 dtype이 입력 dtype과 정확히 같아야 합니다.
-
-    Raises:
-        RuntimeError: fused 커널 전제조건을 만족하지 못하면 발생.
-    """
-    if x2d.dim() != 2:
-        raise RuntimeError(f"Fused MLP input must be 2D (N, Din). Got {tuple(x2d.shape)}")
-
-    if not x2d.is_cuda:
-        raise RuntimeError("Fused MLP is hard-required to run on CUDA (GPU) only.")
-
-    if x2d.dtype not in (torch.float16, torch.bfloat16):
-        raise RuntimeError(
-            "Fused MLP input must be fp16/bf16. "
-            f"Current dtype={x2d.dtype}."
-        )
-
-    params = [("fc1.weight", fc1.weight), ("fc2.weight", fc2.weight)]
-    if fc1.bias is not None:
-        params.append(("fc1.bias", fc1.bias))
-    if fc2.bias is not None:
-        params.append(("fc2.bias", fc2.bias))
-
-    for name, p in params:
-        if not p.is_cuda:
-            raise RuntimeError(f"Fused MLP parameter {name} is not on CUDA.")
-
-        # fused 경로를 “진짜로” 쓰려면 보통 파라미터도 fp16/bf16이어야 안전합니다.
-        if p.dtype not in (torch.float16, torch.bfloat16):
-            raise RuntimeError(
-                f"Fused MLP parameter {name} must be fp16/bf16 for this code path. "
-                f"Got dtype={p.dtype}. "
-                "Convert module/model parameters before training."
-            )
-
-        if strict_param_dtype and (p.dtype != x2d.dtype):
-            raise RuntimeError(
-                f"Fused MLP parameter {name} dtype({p.dtype}) does not match input dtype({x2d.dtype}). "
-                "To meet your goal (param dtype == input dtype), convert parameters first."
-            )
-
-
 class FusedMlpGelu(nn.Module):
-    """fused Linear -> GELU(근사) -> Linear만 사용하는 MLP.
+    """MLP that *only* uses fused Linear->GELU->Linear via fused_mlp_func.
 
-    목표:
-      - fused 커널을 쓰는 동안,
-      - 파라미터 dtype을 입력 dtype과 같게 유지(저장)하도록 강제.
+    - Holds two nn.Linear modules as parameters.
+    - Forward always calls fused_mlp_func (no fallback).
+    - If requirements are not met (e.g., CPU or fp32), it raises immediately.
 
-    주의:
-      - dtype 변환은 학습 시작 전에(옵티마이저/DeepSpeed 초기화 전에) 해주는 게 안전합니다.
+    Attributes:
+        fc1 (nn.Linear): (Din -> H)
+        fc2 (nn.Linear): (H -> Dout)
     """
 
     def __init__(
@@ -254,65 +162,42 @@ class FusedMlpGelu(nn.Module):
         hidden_features: int,
         out_features: Optional[int] = None,
         bias: bool = True,
-        *,
-        param_dtype: Optional[torch.dtype] = None,
-        param_device: Optional[torch.device] = None,
-        enforce_param_dtype_match: bool = True,
     ) -> None:
         """Initialize the fused MLP.
 
         Args:
-            in_features: 입력 차원 Din.
-            hidden_features: 히든 차원 H.
-            out_features: 출력 차원 Dout. None이면 Din과 동일.
-            bias: bias 사용 여부.
-            param_dtype: 파라미터를 만들 dtype (예: torch.bfloat16). None이면 torch 기본값(fp32).
-            param_device: 파라미터를 만들 device (예: torch.device("cuda")).
-            enforce_param_dtype_match: True면 forward에서 입력 dtype과 파라미터 dtype 일치를 강제.
+            in_features: Input feature dimension (Din).
+            hidden_features: Hidden feature dimension (H).
+            out_features: Output feature dimension (Dout). If None, equals Din.
+            bias: Whether to use bias for both linear layers.
         """
         super().__init__()
-        out_features = int(in_features) if out_features is None else int(out_features)
-
-        self._enforce_param_dtype_match = bool(enforce_param_dtype_match)
-
-        self.fc1 = _make_linear(
-            in_features=int(in_features),
-            out_features=int(hidden_features),
-            bias=bias,
-            device=param_device,
-            dtype=param_dtype,
-        )
-        self.fc2 = _make_linear(
-            in_features=int(hidden_features),
-            out_features=int(out_features),
-            bias=bias,
-            device=param_device,
-            dtype=param_dtype,
-        )
-
-    def convert_parameters_to_dtype(self, dtype: torch.dtype) -> None:
-        """파라미터 저장 dtype을 지정한 dtype으로 맞춥니다.
-
-        Args:
-            dtype: 목표 dtype (예: torch.bfloat16)
-
-        Note:
-            - 학습 시작 전에(옵티마이저/DeepSpeed 초기화 전에) 호출하는 것을 권장합니다.
-        """
-        self.fc1.to(dtype=dtype)
-        self.fc2.to(dtype=dtype)
+        out_features = int(in_features) if out_features is None else int(
+            out_features)
+        self.fc1 = nn.Linear(int(in_features), int(hidden_features), bias=bias)
+        self.fc2 = nn.Linear(int(hidden_features), int(out_features), bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run fused Linear->GELU->Linear.
 
         Args:
-            x:
-                - shape: (N, Din) 또는 (B, L, Din)
+            x (torch.Tensor):
+                Input tensor.
+                - supported shapes:
+                    1) (N, Din)
+                    2) (B, L, Din) -> internally flattened to (B*L, Din)
                 - device: CUDA
                 - dtype: fp16 or bf16
 
         Returns:
-            - shape: (N, Dout) 또는 (B, L, Dout)
+            torch.Tensor:
+                Output tensor.
+                - shape:
+                    1) input (N, Din) -> (N, Dout)
+                    2) input (B, L, Din) -> (B, L, Dout)
+
+        Raises:
+            RuntimeError: If fused prerequisites are not met (no fallback).
         """
         if x.dim() == 2:
             x2d = x  # (N, Din)
@@ -322,27 +207,36 @@ class FusedMlpGelu(nn.Module):
             x2d = x.reshape(B * L, Din)  # (B*L, Din)
             restore_shape = (B, L)
         else:
-            raise RuntimeError(f"Fused MLP supports only 2D/3D inputs. Got {tuple(x.shape)}")
+            raise RuntimeError(
+                f"Fused MLP supports only 2D/3D inputs. Got {tuple(x.shape)}")
 
-        # 목표 달성을 위해: 입력 dtype == 파라미터 dtype을 강제
-        _require_fused_mlp_ready(
-            x2d,
-            self.fc1,
-            self.fc2,
-            strict_param_dtype=self._enforce_param_dtype_match,
-        )
+        _require_fused_mlp_ready(x2d, self.fc1, self.fc2)
 
-        # 여기부터는 기존 로직 그대로 (contiguous + fused_mlp_func 호출)
-        if x2d.numel() == 0:
-            Dout = int(self.fc2.out_features)
-            out2d = x2d.new_zeros((int(x2d.shape[0]), Dout))
+        # Empty input can fail in fused kernel; handle safely while keeping graph "touched".
+        N = int(x2d.shape[0])
+        Dout = int(self.fc2.out_features)
+        if N == 0:
+            out2d = x2d.new_zeros((0, Dout))  # (0, Dout)
+            touch = (
+                self.fc1.weight.view(-1)[:1].sum()
+                + (self.fc1.bias.view(-1)[:1].sum()
+                   if self.fc1.bias is not None else 0.0)
+                + self.fc2.weight.view(-1)[:1].sum()
+                + (self.fc2.bias.view(-1)[:1].sum()
+                   if self.fc2.bias is not None else 0.0)
+            ) * 0.0
+            out2d = out2d + touch
         else:
-            x2d = x2d.contiguous()
-            w1 = self.fc1.weight.contiguous()
-            b1 = self.fc1.bias.contiguous() if self.fc1.bias is not None else None
-            w2 = self.fc2.weight.contiguous()
-            b2 = self.fc2.bias.contiguous() if self.fc2.bias is not None else None
+            # Fused kernels often prefer contiguous inputs/weights.
+            x2d = x2d.contiguous()  # (N, Din)
+            w1 = self.fc1.weight.contiguous()  # (H, Din)
+            b1 = self.fc1.bias.contiguous(
+            ) if self.fc1.bias is not None else None  # (H,) or None
+            w2 = self.fc2.weight.contiguous()  # (Dout, H)
+            b2 = self.fc2.bias.contiguous(
+            ) if self.fc2.bias is not None else None  # (Dout,) or None
 
+            # Hard-require fused path only (via fused_mlp_func).
             out2d = _fused_linear_gelu_linear(
                 x2d=x2d,
                 w1=w1,
@@ -350,14 +244,13 @@ class FusedMlpGelu(nn.Module):
                 w2=w2,
                 b2=b2,
                 is_training=self.training,
-            )
+            )  # (N, Dout)
 
         if restore_shape is None:
-            return out2d
+            return out2d  # (N, Dout)
 
         B, L = restore_shape
-        Dout = int(self.fc2.out_features)
-        return out2d.reshape(B, L, Dout)
+        return out2d.reshape(B, L, Dout)  # (B, L, Dout)
 
 
 # ===========================================================
