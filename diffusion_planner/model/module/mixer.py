@@ -23,7 +23,9 @@ except Exception as e:
 
 # (2) LayerNorm (flash-attn implementation)
 try:
-    from flash_attn.ops.layer_norm import LayerNorm as _FlashLayerNorm
+    # TODO
+    # from flash_attn.ops.layer_norm import LayerNorm as _FlashLayerNorm
+    from flash_attn.ops.layer_norm import layer_norm as _FlashLayerNorm
 except Exception as e1:
     try:
         from flash_attn.ops.triton.layer_norm import LayerNorm as _FlashLayerNorm
