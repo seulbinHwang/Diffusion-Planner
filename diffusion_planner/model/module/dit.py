@@ -121,52 +121,26 @@ def _fused_linear_gelu_linear(
                     f" (cause: {e})"
                 ) from e
 
-
 def _require_fused_mlp_ready(
     x2d: torch.Tensor,  # (N, Din)
     fc1: nn.Linear,
     fc2: nn.Linear,
+    *,
+    strict_param_dtype: bool = False,
 ) -> None:
-    """Validate prerequisites for fused MLP and hard-fail if not satisfied.
-
-    Args:
-        x2d (torch.Tensor):
-            Input to the fused op.
-            - shape: (N, Din)
-            - device: must be CUDA
-            - dtype: must be fp16 or bf16
-        fc1 (nn.Linear):
-            First linear layer.
-            - weight shape: (H, Din)
-            - bias shape: (H,) or None
-        fc2 (nn.Linear):
-            Second linear layer.
-            - weight shape: (Dout, H)
-            - bias shape: (Dout,) or None
-
-    Raises:
-        RuntimeError: If CUDA/dtype/shape/parameter state is not compatible.
-    """
     if x2d.dim() != 2:
-        raise RuntimeError(
-            f"Fused MLP input must be 2D (N, Din). Got {tuple(x2d.shape)}")
+        raise RuntimeError(f"Fused MLP input must be 2D (N, Din). Got {tuple(x2d.shape)}")
 
     if not x2d.is_cuda:
-        raise RuntimeError(
-            "Fused MLP is hard-required to run on CUDA (GPU) only.")
+        raise RuntimeError("Fused MLP is hard-required to run on CUDA (GPU) only.")
 
     if x2d.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(
             "Fused MLP is hard-required to use fp16/bf16 only. "
-            f"Current dtype={x2d.dtype}. "
-            "Cast the model/inputs to half() or bfloat16(), or use autocast."
+            f"Current dtype={x2d.dtype}. Use autocast or cast inputs."
         )
 
-    # Require parameters to match input device/dtype (no fallback).
-    params = [
-        ("fc1.weight", fc1.weight),
-        ("fc2.weight", fc2.weight),
-    ]
+    params = [("fc1.weight", fc1.weight), ("fc2.weight", fc2.weight)]
     if fc1.bias is not None:
         params.append(("fc1.bias", fc1.bias))
     if fc2.bias is not None:
@@ -174,14 +148,14 @@ def _require_fused_mlp_ready(
 
     for name, p in params:
         if not p.is_cuda:
+            raise RuntimeError(f"Fused MLP parameter {name} is not on CUDA.")
+
+        # ✅ 여기만 조건부로: strict_param_dtype=False면 dtype 불일치 체크를 안 함
+        if strict_param_dtype and (p.dtype != x2d.dtype):
             raise RuntimeError(
-                f"Fused MLP parameter {name} is not on CUDA.")
-        if p.dtype != x2d.dtype:
-            raise RuntimeError(
-                f"Fused MLP parameter {name} dtype({p.dtype}) "
-                f"does not match input dtype({x2d.dtype}). "
-                "No fallback is allowed. Align parameter dtype with input dtype."
+                f"Fused MLP parameter {name} dtype({p.dtype}) does not match input dtype({x2d.dtype})."
             )
+
 
 
 class FusedMlpGelu(nn.Module):
