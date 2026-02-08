@@ -918,7 +918,14 @@ def train_epoch(
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
-    with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
+    disable_tqdm: bool = (not _is_main_process())
+
+    with tqdm(
+            data_loader,
+            desc="Training",
+            unit="batch",
+            disable=disable_tqdm,
+    ) as data_epoch:
         for batch in data_epoch:
             # 1) device 이동 + 상한 클리핑 + 정답 분리
             inputs, outputs = _prepare_batch_for_device(

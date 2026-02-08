@@ -1403,8 +1403,8 @@ def _train_one_epoch(
         batch_num_in_all_epoch,
     )
 
-    if args.device.startswith('cuda'):
-        torch.cuda.empty_cache()
+    # if args.device.startswith('cuda'):
+    #     torch.cuda.empty_cache()
 
     if args.ddp:
         torch.cuda.synchronize()
