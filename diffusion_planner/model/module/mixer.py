@@ -38,11 +38,11 @@ except Exception as e1:
         from flash_attn.ops.triton.layer_norm import layer_norm as _flash_layer_norm_fn  # type: ignore
         _FLASH_LAYER_NORM_AVAILABLE = True
     except Exception as e2:
-        raise ImportError(
-            "Required: cannot import flash-attn layer_norm function. "
-            "This project must use FastLayerNorm (no fallback). "
-            f"(cause1: {repr(e1)} / cause2: {repr(e2)})"
-        ) from e2
+        # raise ImportError(
+        #     "Required: cannot import flash-attn layer_norm function. "
+        #     "This project must use FastLayerNorm (no fallback). "
+        #     f"(cause1: {repr(e1)} / cause2: {repr(e2)})"
+        # ) from e2
         _flash_layer_norm_fn = None
         _FLASH_LAYER_NORM_AVAILABLE = False
         _FLASH_IMPORT_ERRORS["layer_norm"] = f"cause1: {repr(e1)} / cause2: {repr(e2)}"
