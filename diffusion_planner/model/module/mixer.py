@@ -1,5 +1,7 @@
 # diffusion_planner/model/module/mixer.py (REPLACE THE WHOLE FILE)
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +10,9 @@ from typing import Optional, Dict
 
 # ============================================================
 # Prefer flash-attn fused LayerNorm / fused MLP
-# - If unavailable, fall back to plain PyTorch (no import-time error)
+# - If unavailable:
+#   - use_fallback=True  -> fall back to plain PyTorch
+#   - use_fallback=False -> raise an error (but NOT at import-time)
 # ============================================================
 
 _FLASH_IMPORT_ERRORS: Dict[str, str] = {}
@@ -20,12 +24,8 @@ try:
     from flash_attn.ops.fused_dense import FusedMLP as _FlashFusedMLP  # type: ignore
     _FLASH_FUSED_MLP_AVAILABLE = True
 except Exception as e:
-    # raise ImportError(
-    #     "Required: cannot import flash_attn.ops.fused_dense.FusedMLP. "
-    #     "This project must use FastMlp (no fallback). "
-    #     f"(cause: {repr(e)})"
-    # ) from e
     _FlashFusedMLP = None  # type: ignore
+    _FLASH_FUSED_MLP_AVAILABLE = False
     _FLASH_IMPORT_ERRORS["fused_mlp"] = repr(e)
 
 # (2) LayerNorm function (flash-attn)
@@ -38,14 +38,40 @@ except Exception as e1:
         from flash_attn.ops.triton.layer_norm import layer_norm as _flash_layer_norm_fn  # type: ignore
         _FLASH_LAYER_NORM_AVAILABLE = True
     except Exception as e2:
-        # raise ImportError(
-        #     "Required: cannot import flash-attn layer_norm function. "
-        #     "This project must use FastLayerNorm (no fallback). "
-        #     f"(cause1: {repr(e1)} / cause2: {repr(e2)})"
-        # ) from e2
         _flash_layer_norm_fn = None
         _FLASH_LAYER_NORM_AVAILABLE = False
         _FLASH_IMPORT_ERRORS["layer_norm"] = f"cause1: {repr(e1)} / cause2: {repr(e2)}"
+
+
+def _require_flash_component_or_raise(
+    component_key: str,
+    *,
+    available: bool,
+    use_fallback: bool,
+    what: str,
+) -> None:
+    """flash-attn 구성요소가 없을 때, 폴백 허용 여부에 따라 에러를 낼지 결정합니다.
+
+    Args:
+        component_key: _FLASH_IMPORT_ERRORS에 저장된 키 ("fused_mlp" 또는 "layer_norm").
+        available: 해당 구성요소 import 성공 여부.
+        use_fallback: True면 폴백 허용(에러 안 냄), False면 폴백 금지(에러 냄).
+        what: 에러 메시지에 넣을 설명 문자열.
+
+    Raises:
+        RuntimeError: use_fallback=False인데 import가 실패한 경우.
+    """
+    if use_fallback:
+        return
+    if available:
+        return
+    cause = _FLASH_IMPORT_ERRORS.get(component_key, "unknown")
+    raise RuntimeError(
+        f"{what} 를 반드시 써야 하는데(use_fallback=False), flash-attn import에 실패했습니다.\n"
+        f"- 실패 항목: {component_key}\n"
+        f"- 원인: {cause}\n"
+        "해결: flash-attn을 fused_dense / layer_norm 지원까지 포함되도록 설치/빌드한 뒤 다시 실행하세요."
+    )
 
 
 def _create_activation(activation: str) -> nn.Module:
@@ -64,7 +90,6 @@ def _create_activation(activation: str) -> nn.Module:
     name = str(activation).lower().strip()
 
     if name in ("gelu_approx", "gelu_fast", "gelu_tanh"):
-        # PyTorch 버전에 따라 approximate 옵션이 없을 수도 있어 안전하게 처리
         try:
             return nn.GELU(approximate="tanh")
         except TypeError:
@@ -80,24 +105,19 @@ def _create_activation(activation: str) -> nn.Module:
 
 
 class _FlashLayerNorm(nn.Module):
-    """flash-attn의 layer_norm(함수)을 nn.Module처럼 쓰기 위한 래퍼(폴백 포함).
+    """flash-attn의 layer_norm(함수)을 nn.Module처럼 쓰기 위한 래퍼.
 
     동작:
-        - flash-attn layer_norm 함수가 있고,
-          입력이 CUDA + (fp16/bf16)일 때: flash-attn 함수 사용
-        - 그 외(패키지 없음/CPU/fp32 등): PyTorch layer_norm으로 폴백
+    - flash-attn layer_norm 함수가 있고,
+      입력이 CUDA + (fp16/bf16)일 때: flash-attn 함수 사용
+    - 그 외(패키지 없음/CPU/fp32 등): PyTorch layer_norm 사용
 
     입력/출력 모양:
-        - 입력:  (..., D)
-        - 출력: (..., D)
+    - 입력:  (..., D)
+    - 출력: (..., D)
     """
 
     def __init__(self, normalized_shape: int, eps: float = 1e-5) -> None:
-        """
-        Args:
-            normalized_shape (int): 마지막 차원 D
-            eps (float): 0으로 나누기 방지용 작은 값
-        """
         super().__init__()
         self.normalized_shape: int = int(normalized_shape)
         self.eps: float = float(eps)
@@ -108,7 +128,6 @@ class _FlashLayerNorm(nn.Module):
 
     @staticmethod
     def _can_use_flash(x: torch.Tensor) -> bool:
-        """현재 입력에서 flash-attn layer_norm을 안전하게 쓸 수 있는지 확인합니다."""
         if not _FLASH_LAYER_NORM_AVAILABLE:
             return False
         if _flash_layer_norm_fn is None:
@@ -118,7 +137,6 @@ class _FlashLayerNorm(nn.Module):
         return x.dtype in (torch.float16, torch.bfloat16)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(..., D) -> (..., D)"""
         if x.shape[-1] != self.normalized_shape:
             raise ValueError(
                 f"_FlashLayerNorm: last dim must be {self.normalized_shape}. got {int(x.shape[-1])}"
@@ -138,51 +156,56 @@ class _FlashLayerNorm(nn.Module):
         b = self.bias.to(device=x2d.device, dtype=x2d.dtype).contiguous()    # (D,)
 
         if self._can_use_flash(x2d):
-            # flash-attn layer_norm: 보통 (x, weight, bias, epsilon) 형태
-            y2d = _flash_layer_norm_fn(x2d, w, b, self.eps)  # type: ignore[misc]  # (M, D)
+            y2d = _flash_layer_norm_fn(x2d, w, b, self.eps)  # type: ignore[misc]
         else:
-            # PyTorch 폴백
             y2d = F.layer_norm(x2d, (D,), weight=w, bias=b, eps=self.eps)  # (M, D)
 
         return y2d.reshape(orig_shape)
 
 
-def _create_layernorm(hidden_size: int, eps: float) -> nn.Module:
+def _create_layernorm(hidden_size: int, eps: float, *, use_fallback: bool) -> nn.Module:
     """LayerNorm 모듈을 만듭니다.
 
-    - 가능하면 flash-attn 기반을 쓰고,
-    - 불가능하면 PyTorch 구현으로 폴백합니다.
+    정책:
+    - use_fallback=True:
+        - flash-attn layer_norm import 실패해도 PyTorch로 동작
+    - use_fallback=False:
+        - import 실패 상태면 여기서 즉시 에러
 
     Args:
-        hidden_size (int): 마지막 차원 크기 D
-        eps (float): 작은 값
+        hidden_size: 마지막 차원 D
+        eps: 작은 값
+        use_fallback: 폴백 허용 여부
 
     Returns:
-        nn.Module: LayerNorm 동작을 하는 모듈
+        nn.Module: LayerNorm 동작 모듈
     """
-    # flash-attn이 없더라도 _FlashLayerNorm 내부에서 자동 폴백되지만,
-    # 패키지가 아예 없을 때도 안정적으로 동작하도록 여기서도 분기 가능.
+    _require_flash_component_or_raise(
+        "layer_norm",
+        available=_FLASH_LAYER_NORM_AVAILABLE and (_flash_layer_norm_fn is not None),
+        use_fallback=bool(use_fallback),
+        what="flash-attn layer_norm",
+    )
     return _FlashLayerNorm(int(hidden_size), eps=float(eps))
 
 
 class FastLayerNorm(nn.Module):
-    """LayerNorm 래퍼(폴백 포함).
+    """LayerNorm 래퍼.
 
-    - flash-attn layer_norm이 준비되어 있으면 자동으로 사용
-    - 없으면 PyTorch layer_norm으로 자동 폴백
-
-    Shape:
-        - Input:  (..., D)
-        - Output: (..., D)
+    - use_fallback=True: flash-attn이 없으면 PyTorch로 동작
+    - use_fallback=False: flash-attn import가 안 된 상태면 생성 시점에 에러
     """
 
-    def __init__(self, normalized_shape: int, eps: float = 1e-5) -> None:
+    def __init__(self, normalized_shape: int, eps: float = 1e-5, *, use_fallback: bool = True) -> None:
         super().__init__()
         self.normalized_shape: int = int(normalized_shape)
         self.eps: float = float(eps)
+        self.use_fallback: bool = bool(use_fallback)
+
         self._ln: nn.Module = _create_layernorm(
             hidden_size=self.normalized_shape,
             eps=self.eps,
+            use_fallback=self.use_fallback,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -190,16 +213,16 @@ class FastLayerNorm(nn.Module):
 
 
 class _TorchMlp(nn.Module):
-    """PyTorch 기본 연산으로 만든 2단 MLP (flash-attn 미사용 폴백).
+    """PyTorch 기본 연산으로 만든 2단 MLP (폴백용).
 
     구성:
-        - 선형 변환 1번
-        - 활성 함수 1번
-        - 선형 변환 1번
+    - 선형 변환 1번
+    - 활성 함수 1번
+    - 선형 변환 1번
 
     입력/출력 모양:
-        - 입력:  (M, in_features)
-        - 출력: (M, out_features)
+    - 입력:  (M, in_features)
+    - 출력: (M, out_features)
     """
 
     def __init__(
@@ -212,15 +235,6 @@ class _TorchMlp(nn.Module):
         checkpoint_lvl: int = 0,
         return_residual: bool = False,
     ) -> None:
-        """
-        Args:
-            in_features (int): 입력 마지막 차원 크기
-            hidden_features (int): 중간 차원 크기
-            out_features (int): 출력 마지막 차원 크기
-            activation (str): 활성 함수 이름
-            checkpoint_lvl (int): 호환용 인자(여기서는 0만 권장). 0이 아니어도 동작은 합니다.
-            return_residual (bool): 호환용 인자(이 파일에서는 False만 사용).
-        """
         super().__init__()
         self.in_features: int = int(in_features)
         self.hidden_features: int = int(hidden_features)
@@ -233,7 +247,6 @@ class _TorchMlp(nn.Module):
         self.fc2: nn.Linear = nn.Linear(self.hidden_features, self.out_features, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """(M, in_features) -> (M, out_features)"""
         if x.dim() != 2:
             raise ValueError(f"_TorchMlp expects 2D (M,D). got {tuple(x.shape)}")
         if int(x.shape[1]) != self.in_features:
@@ -241,8 +254,6 @@ class _TorchMlp(nn.Module):
 
         y = self.fc2(self.act(self.fc1(x)))  # (M, out_features)
 
-        # 이 파일의 사용 방식에서는 return_residual=False만 사용합니다.
-        # (True일 때의 반환 형태를 강제로 맞추면, 호출부가 바뀌어야 해서 여기서는 지원하지 않습니다.)
         if self.return_residual:
             raise RuntimeError("_TorchMlp fallback does not support return_residual=True in this project.")
 
@@ -256,21 +267,27 @@ def _create_mlp_backend(
     *,
     activation: str,
     checkpoint_lvl: int,
+    use_fallback: bool,
 ) -> nn.Module:
     """MLP 백엔드를 만듭니다.
 
-    - flash-attn FusedMLP가 있으면: 그걸 사용
-    - 없으면: PyTorch MLP로 폴백
+    정책:
+    - flash-attn FusedMLP import 성공:
+        - 항상 flash-attn 모듈 사용
+    - import 실패:
+        - use_fallback=True -> PyTorch MLP로 진행
+        - use_fallback=False -> 생성 시점에 에러
 
     Args:
-        in_features (int): 입력 차원 D
-        hidden_features (int): 중간 차원 H
-        out_features (int): 출력 차원 O
-        activation (str): 활성 함수 이름
-        checkpoint_lvl (int): flash-attn 쪽 옵션(폴백에서는 유지용 인자)
+        in_features: 입력 차원 D
+        hidden_features: 중간 차원 H
+        out_features: 출력 차원 O
+        activation: 활성 함수 이름
+        checkpoint_lvl: flash-attn 쪽 옵션
+        use_fallback: 폴백 허용 여부
 
     Returns:
-        nn.Module: (M, D) -> (M, O) 를 수행하는 모듈
+        nn.Module: (M, D) -> (M, O)
     """
     if _FLASH_FUSED_MLP_AVAILABLE and _FlashFusedMLP is not None:
         return _FlashFusedMLP(  # type: ignore[call-arg]
@@ -281,6 +298,13 @@ def _create_mlp_backend(
             return_residual=False,
             checkpoint_lvl=int(checkpoint_lvl),
         )
+
+    _require_flash_component_or_raise(
+        "fused_mlp",
+        available=False,
+        use_fallback=bool(use_fallback),
+        what="flash-attn FusedMLP",
+    )
 
     return _TorchMlp(
         in_features=int(in_features),
@@ -293,22 +317,14 @@ def _create_mlp_backend(
 
 
 class FastMlp(nn.Module):
-    """MLP 래퍼(폴백 포함).
+    """MLP 래퍼.
 
-    Key behavior:
-        - 입력을 2D로 펼쳐서 (M, D) 형태로 만든 뒤 MLP 호출
-        - 다시 원래 모양으로 복원
-
-    Backend:
-        - flash-attn FusedMLP가 있으면 자동 사용
-        - 없으면 PyTorch 연산으로 폴백
+    - use_fallback=True: flash-attn이 없으면 PyTorch로 동작
+    - use_fallback=False: flash-attn import가 안 된 상태면 생성 시점에 에러
 
     Shape:
-        - Input:  (..., in_features)
-        - Output: (..., out_features)
-
-    Note:
-        - drop > 0 이면 출력에 dropout을 적용합니다.
+    - Input:  (..., in_features)
+    - Output: (..., out_features)
     """
 
     def __init__(
@@ -320,12 +336,14 @@ class FastMlp(nn.Module):
         *,
         activation: str = "gelu_approx",
         checkpoint_lvl: int = 0,
+        use_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.in_features: int = int(in_features)
         self.hidden_features: int = int(hidden_features) if hidden_features is not None else int(in_features)
         self.out_features: int = int(out_features) if out_features is not None else int(in_features)
         self.drop_p: float = float(drop)
+        self.use_fallback: bool = bool(use_fallback)
 
         self._mlp: nn.Module = _create_mlp_backend(
             in_features=self.in_features,
@@ -333,6 +351,7 @@ class FastMlp(nn.Module):
             out_features=self.out_features,
             activation=str(activation),
             checkpoint_lvl=int(checkpoint_lvl),
+            use_fallback=self.use_fallback,
         )
 
         self._drop: nn.Module = nn.Dropout(self.drop_p) if self.drop_p > 0.0 else nn.Identity()
@@ -357,12 +376,7 @@ class FastMlp(nn.Module):
 
 
 class FastLayerNormMlp(nn.Module):
-    """한 번에 LayerNorm -> MLP를 이어서 수행하는 모듈(폴백 포함).
-
-    Shape:
-        - Input:  (..., in_features)
-        - Output: (..., out_features)
-    """
+    """LayerNorm -> MLP를 이어서 수행하는 모듈."""
 
     def __init__(
         self,
@@ -374,13 +388,15 @@ class FastLayerNormMlp(nn.Module):
         eps: float = 1e-5,
         activation: str = "gelu_approx",
         checkpoint_lvl: int = 0,
+        use_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.in_features: int = int(in_features)
         self.hidden_features: int = int(hidden_features)
         self.out_features: int = int(out_features)
+        self.use_fallback: bool = bool(use_fallback)
 
-        self.norm: FastLayerNorm = FastLayerNorm(self.in_features, eps=float(eps))
+        self.norm: FastLayerNorm = FastLayerNorm(self.in_features, eps=float(eps), use_fallback=self.use_fallback)
         self.mlp: FastMlp = FastMlp(
             in_features=self.in_features,
             hidden_features=self.hidden_features,
@@ -388,6 +404,7 @@ class FastLayerNormMlp(nn.Module):
             drop=float(drop),
             activation=str(activation),
             checkpoint_lvl=int(checkpoint_lvl),
+            use_fallback=self.use_fallback,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -398,8 +415,8 @@ class MixerBlock(nn.Module):
     """토큰 길이(T) 방향과 채널(C) 방향을 번갈아 섞는 블록.
 
     Shape:
-        - Input:  (N, T, C)
-        - Output: (N, T, C)
+    - Input:  (N, T, C)
+    - Output: (N, T, C)
     """
 
     def __init__(
@@ -409,16 +426,19 @@ class MixerBlock(nn.Module):
         drop_path_rate: float,
         *,
         channels_mlp_ratio: float = 1.0,
+        use_fallback: bool = True,
     ) -> None:
         super().__init__()
+        self.use_fallback: bool = bool(use_fallback)
 
         # (A) Token-axis mixing: LN (over C) + MLP over T (applied on (N, C, T))
-        self.norm1: FastLayerNorm = FastLayerNorm(int(channels_mlp_dim))
+        self.norm1: FastLayerNorm = FastLayerNorm(int(channels_mlp_dim), use_fallback=self.use_fallback)
         self.tokens_mlp: FastMlp = FastMlp(
             in_features=int(tokens_mlp_dim),
             hidden_features=int(tokens_mlp_dim),
             out_features=int(tokens_mlp_dim),
             drop=float(drop_path_rate),
+            use_fallback=self.use_fallback,
         )
 
         # (B) Channel-axis mixing: LN + MLP
@@ -428,6 +448,7 @@ class MixerBlock(nn.Module):
             hidden_features=int(hidden_c),
             out_features=int(channels_mlp_dim),
             drop=float(drop_path_rate),
+            use_fallback=self.use_fallback,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

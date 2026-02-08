@@ -2566,7 +2566,7 @@ class DiT(nn.Module):
             drop=0.)
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, heads, dropout, mlp_ratio)
+            DiTBlock(config, hidden_dim, heads, dropout, mlp_ratio)
             for i in range(depth)
         ])
         ##################

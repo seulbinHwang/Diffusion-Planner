@@ -269,6 +269,7 @@ class Encoder(nn.Module):
             out_drop_p=0.0,
         )
         self.lane_encoder = LaneFusionEncoder(
+            config,
             config.lane_len,
             drop_path_rate=config.encoder_drop_path_rate,
             hidden_dim=config.hidden_dim,
@@ -291,6 +292,7 @@ class Encoder(nn.Module):
             self.lane_summary_pooler = None
 
         self.fusion = FusionEncoder(
+            config=config,
             hidden_dim=config.hidden_dim,
             num_heads=config.num_heads,
             drop_path_rate=config.encoder_drop_path_rate,
@@ -1194,6 +1196,7 @@ class SelfAttentionBlock(nn.Module):
 
     def __init__(
             self,
+            config,
             dim=192,
             heads=8,
             attn_drop_p: float = 0.0,  # 어텐션 드롭아웃
@@ -1202,7 +1205,7 @@ class SelfAttentionBlock(nn.Module):
             mlp_ratio=4.0):
         super().__init__()
 
-        self.norm1 = FastLayerNorm(dim)
+        self.norm1 = FastLayerNorm(dim,use_fallback=config.use_fallback)
 
 
         # FlashAttention-2 사용 가능 여부에 따라 폴백(MHA) 준비
@@ -1226,13 +1229,13 @@ class SelfAttentionBlock(nn.Module):
         self._drop_path_scale_by_keep: bool = bool(
             getattr(self.drop_path, "scale_by_keep", True))
 
-        self.norm2 = FastLayerNorm(dim)
+        self.norm2 = FastLayerNorm(dim,use_fallback=config.use_fallback)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = FastMlp(
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             out_features=dim,
-            drop=float(ffn_drop_p),
+            drop=float(ffn_drop_p),use_fallback=config.use_fallback
         )
 
         # === FlashAttention‑2용 QKV/출력 프로젝션 ===
@@ -2445,6 +2448,7 @@ class LaneFusionEncoder(nn.Module):
 
     def __init__(
         self,
+            config,
         lane_len,
         drop_path_rate=0.3,
         hidden_dim=192,
@@ -2519,6 +2523,7 @@ class LaneFusionEncoder(nn.Module):
                 int(channels_mlp_dim),
                 float(drop_path_rate),
                 channels_mlp_ratio=float(mixer_channels_mlp_ratio),
+                use_fallback=config.use_fallback,
             ) for _ in range(depth)
         ])
 
@@ -2535,14 +2540,14 @@ class LaneFusionEncoder(nn.Module):
             in_features=2 * int(channels_mlp_dim),
             hidden_features=int(lane_post_hidden_dim),
             out_features=int(channels_mlp_dim),
-            drop=float(drop_path_rate),
+            drop=float(drop_path_rate), use_fallback=config.use_fallback,
         )
 
         self.emb_project: FastLayerNormMlp = FastLayerNormMlp(
             in_features=int(channels_mlp_dim),
             hidden_features=int(hidden_dim),
             out_features=int(hidden_dim),
-            drop=float(drop_path_rate),
+            drop=float(drop_path_rate), use_fallback=config.use_fallback,
         )
 
     # -------------------------- 새로 추가된 유틸 -------------------------- #
@@ -3217,6 +3222,7 @@ class FusionEncoder(nn.Module):
 
     def __init__(
             self,
+            config,
             hidden_dim=192,
             num_heads=8,
             drop_path_rate=0.2,
@@ -3235,6 +3241,7 @@ class FusionEncoder(nn.Module):
         dpr_list = torch.linspace(0.0, drop_path_rate, steps=depth).tolist()
         self.blocks = nn.ModuleList([
             SelfAttentionBlock(
+                config,
                 hidden_dim,
                 num_heads,
                 attn_drop_p=attn_drop_p,

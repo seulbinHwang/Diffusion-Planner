@@ -246,13 +246,19 @@ def _require_fused_mlp_ready(
 class FusedMlpGelu(nn.Module):
     """MLP 모듈.
 
-    - fused_mlp_func가 준비돼 있고 조건이 맞으면 fused 경로를 우선 사용합니다.
-    - fused import가 실패했거나, 조건이 안 맞거나, 실행 중 오류가 나면
-      자동으로 일반 PyTorch 연산(Linear -> GELU -> Linear)으로 폴백합니다.
+    동작 규칙
+    - use_fallback=True:
+        - fused_mlp_func가 준비돼 있고 조건이 맞으면 fused 경로를 우선 사용합니다.
+        - fused import가 실패했거나, 조건이 안 맞거나, 실행 중 오류가 나면
+          일반 PyTorch 연산(Linear -> GELU -> Linear)으로 폴백합니다.
+    - use_fallback=False:
+        - fused import가 안 되어 있으면 __init__에서 즉시 에러를 냅니다.
+        - 실행 중 fused 경로가 실패해도 폴백하지 않고 에러를 냅니다.
 
     Attributes:
         fc1 (nn.Linear): (Din -> H)
         fc2 (nn.Linear): (H -> Dout)
+        use_fallback (bool): 폴백 허용 여부
     """
 
     def __init__(
@@ -261,6 +267,8 @@ class FusedMlpGelu(nn.Module):
         hidden_features: int,
         out_features: Optional[int] = None,
         bias: bool = True,
+        *,
+        use_fallback: bool = True,
     ) -> None:
         """Initialize the fused MLP.
 
@@ -269,18 +277,27 @@ class FusedMlpGelu(nn.Module):
             hidden_features: Hidden feature dimension (H).
             out_features: Output feature dimension (Dout). If None, equals Din.
             bias: Whether to use bias for both linear layers.
+            use_fallback:
+                - True면 fused 경로가 불가능할 때 일반 연산으로 계속 진행합니다.
+                - False면 fused import/실행이 불가능하면 즉시 에러를 냅니다.
         """
         super().__init__()
-        out_features = int(in_features) if out_features is None else int(
-            out_features)
+        self.use_fallback: bool = bool(use_fallback)
+
+        # ✅ use_fallback=False이면 "설치 안 됨(import 실패)"을 여기서 바로 에러로 처리
+        if (not self.use_fallback) and (not _FUSED_MLP_AVAILABLE):
+            raise RuntimeError(
+                "Fused MLP가 필수인데(fallback 비활성), fused_mlp_func/FusedMLP import에 실패했습니다.\n"
+                "flash-attn을 fused_dense 지원까지 포함되도록 설치/빌드한 뒤 다시 실행하세요.\n"
+                f"(원인: {_FUSED_MLP_IMPORT_ERR})"
+            ) from _FUSED_MLP_IMPORT_ERR
+
+        out_features = int(in_features) if out_features is None else int(out_features)
         self.fc1 = nn.Linear(int(in_features), int(hidden_features), bias=bias)
         self.fc2 = nn.Linear(int(hidden_features), int(out_features), bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Linear -> GELU -> Linear을 수행합니다.
-
-        fused_mlp_func가 가능하면 fused를 우선 사용하고,
-        불가능하거나 실패하면 일반 PyTorch 연산으로 폴백합니다.
 
         Args:
             x (torch.Tensor):
@@ -308,18 +325,23 @@ class FusedMlpGelu(nn.Module):
                 f"FusedMlpGelu supports only 2D/3D inputs. Got {tuple(x.shape)}"
             )
 
-        # Empty input 안전 처리 (fused/폴백 모두 동일)
+        # ✅ fallback 비활성인데 fused 자체가 없으면 여기서도 방어적으로 에러
+        if (not self.use_fallback) and (not _FUSED_MLP_AVAILABLE):
+            raise RuntimeError(
+                "Fused MLP가 필수인데(fallback 비활성), fused_mlp_func/FusedMLP가 준비되지 않았습니다.\n"
+                f"(원인: {_FUSED_MLP_IMPORT_ERR})"
+            ) from _FUSED_MLP_IMPORT_ERR
+
+        # Empty input 안전 처리
         N = int(x2d.shape[0])
         Dout = int(self.fc2.out_features)
         if N == 0:
             out2d = x2d.new_zeros((0, Dout))  # (0, Dout)
             touch = (
                 self.fc1.weight.view(-1)[:1].sum()
-                + (self.fc1.bias.view(-1)[:1].sum()
-                   if self.fc1.bias is not None else 0.0)
+                + (self.fc1.bias.view(-1)[:1].sum() if self.fc1.bias is not None else 0.0)
                 + self.fc2.weight.view(-1)[:1].sum()
-                + (self.fc2.bias.view(-1)[:1].sum()
-                   if self.fc2.bias is not None else 0.0)
+                + (self.fc2.bias.view(-1)[:1].sum() if self.fc2.bias is not None else 0.0)
             ) * 0.0
             out2d = out2d + touch
         else:
@@ -329,25 +351,51 @@ class FusedMlpGelu(nn.Module):
             w2 = self.fc2.weight.contiguous()  # (Dout, H)
             b2 = self.fc2.bias.contiguous() if self.fc2.bias is not None else None  # (Dout,) or None
 
-            use_fused, _reason = _can_use_fused_mlp(
+            use_fused, reason = _can_use_fused_mlp(
                 x2d=x2d,
                 fc1=self.fc1,
                 fc2=self.fc2,
                 strict_param_dtype=False,
             )
 
-            if use_fused:
-                try:
-                    out2d = _fused_linear_gelu_linear(
-                        x2d=x2d,
-                        w1=w1,
-                        b1=b1,
-                        w2=w2,
-                        b2=b2,
-                        is_training=self.training,
-                    )  # (N, Dout)
-                except Exception:
-                    # fused 호출이 실패하면 바로 폴백
+            # ✅ fallback 비활성: fused가 "가능"해야만 진행, 아니면 에러
+            if not self.use_fallback:
+                if not use_fused:
+                    raise RuntimeError(
+                        "Fused MLP가 필수인데(fallback 비활성), fused 경로를 사용할 수 없습니다.\n"
+                        f"(이유: {reason})"
+                    )
+                # fused 호출 실패도 폴백 금지 → 에러
+                out2d = _fused_linear_gelu_linear(
+                    x2d=x2d,
+                    w1=w1,
+                    b1=b1,
+                    w2=w2,
+                    b2=b2,
+                    is_training=self.training,
+                )  # (N, Dout)
+
+            # ✅ fallback 활성: 기존 동작(가능하면 fused, 아니면/실패하면 폴백)
+            else:
+                if use_fused:
+                    try:
+                        out2d = _fused_linear_gelu_linear(
+                            x2d=x2d,
+                            w1=w1,
+                            b1=b1,
+                            w2=w2,
+                            b2=b2,
+                            is_training=self.training,
+                        )  # (N, Dout)
+                    except Exception:
+                        out2d = _linear_gelu_linear_fallback(
+                            x2d=x2d,
+                            w1=w1,
+                            b1=b1,
+                            w2=w2,
+                            b2=b2,
+                        )  # (N, Dout)
+                else:
                     out2d = _linear_gelu_linear_fallback(
                         x2d=x2d,
                         w1=w1,
@@ -355,15 +403,6 @@ class FusedMlpGelu(nn.Module):
                         w2=w2,
                         b2=b2,
                     )  # (N, Dout)
-            else:
-                # fused 자체가 없거나(미설치), 조건이 안 맞으면 폴백
-                out2d = _linear_gelu_linear_fallback(
-                    x2d=x2d,
-                    w1=w1,
-                    b1=b1,
-                    w2=w2,
-                    b2=b2,
-                )  # (N, Dout)
 
         if restore_shape is None:
             return out2d  # (N, Dout)
@@ -584,8 +623,9 @@ class DiTBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning for ego and Cross-Attention.
     """
 
-    def __init__(self, dim=192, heads=8, dropout=0.1, mlp_ratio=4.0):
+    def __init__(self, config, dim=192, heads=8, dropout=0.1, mlp_ratio=4.0):
         super().__init__()
+        self.config = config
         self.num_heads = heads
         self.head_dim = dim // heads
         assert dim % heads == 0, f"dim({dim}) must be divisible by heads({heads})"
@@ -600,11 +640,14 @@ class DiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         # ✅ fused MLP로 강제 교체 (Linear -> GELU -> Linear)
+        use_fallback: bool = bool(getattr(config, "use_fallback", True))
+
         self.mlp1 = FusedMlpGelu(
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             out_features=dim,
             bias=True,
+            use_fallback=use_fallback,
         )
 
         self.norm3 = nn.LayerNorm(dim)
@@ -615,6 +658,7 @@ class DiTBlock(nn.Module):
             hidden_features=mlp_hidden_dim,
             out_features=dim,
             bias=True,
+            use_fallback=use_fallback,
         )
         # === FlashAttention-2용 프로젝션 (Self-Attn) ===
         # QKV/Out은 패딩 제거된 유효 토큰에만 적용됩니다.
