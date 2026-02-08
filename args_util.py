@@ -342,6 +342,10 @@ def get_args():
                         type=int,
                         help='save frequency',
                         default=10)
+    parser.add_argument('--xy_yaw_metric_interval_steps',
+                        type=int,
+                        help='save frequency',
+                        default=1)
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
@@ -479,7 +483,7 @@ def get_args():
                         default=False)
     parser.add_argument("--ds_steps_per_print",
                         type=int,
-                        default=100,
+                        default=10000,
                         help="DeepSpeed가 내부 로그를 몇 step마다 출력할지")
 
     parser.add_argument("--ds_allgather_bucket_size",

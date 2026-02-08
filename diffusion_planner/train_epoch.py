@@ -604,43 +604,45 @@ def _compute_loss_dict(
 
     return loss_dict
 
-
 def _backward_and_step(
-        loss_dict: Dict[str, torch.Tensor],
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: Any,
-        args: Any,
-) -> float:
-    """역전파/업데이트를 수행하고, (선택) 내부 시간을 더 잘게 출력합니다.
+    loss_dict: Dict[str, torch.Tensor],
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    args: Any,
+) -> None:
+    """역전파/업데이트를 수행합니다. (로그용 CPU loss 변환은 하지 않습니다)
+
+    핵심 변경:
+        - 기존에는 여기서 loss를 매 step마다 CPU float로 만들었습니다(.cpu().item()).
+        - 이제는 학습은 그대로 수행하고, "로그용 숫자 변환"은 epoch 끝에 한 번만 합니다.
 
     Args:
         loss_dict (Dict[str, torch.Tensor]):
-            - loss_dict["loss"]는 스칼라 텐서여야 합니다.
+            - loss_dict["loss"] 는 스칼라 텐서여야 합니다.
               shape: ()
         model (nn.Module):
             - DeepSpeed 사용 시: .backward/.step을 가진 엔진
             - 그 외: 일반 nn.Module
-        optimizer (torch.optim.Optimizer): 옵티마이저(DeepSpeed면 내부에서 사용될 수 있음)
-        scheduler (Any): 스케줄러(DeepSpeed면 내부에서 처리, 일반이면 여기서 step)
-        args (Any): 학습 설정/상태
+        optimizer (torch.optim.Optimizer):
+            - 일반 PyTorch 경로에서 사용
+        scheduler (Any):
+            - 일반 PyTorch 경로에서 step() 호출
+        args (Any):
+            - 학습 설정/상태
 
     Returns:
-        float: loss 값(로그용)
+        None
     """
     loss_tensor: torch.Tensor = loss_dict["loss"]  # shape: ()
     device_type: str = "cuda" if loss_tensor.is_cuda else "cpu"
 
     use_deepspeed: bool = bool(getattr(args, "use_deepspeed", False)) \
-                          and hasattr(model, "backward") and hasattr(model,
-                                                                     "step")
+        and hasattr(model, "backward") and hasattr(model, "step")
 
-    # ✅ 내부 구간 프로파일링 on/off (기본은 False)
     enable_profile: bool = bool(getattr(args, "profile_backward_detail", False))
-
     max_grad_norm: float = float(getattr(args, "max_grad_norm", 0.0))
 
-    # (선택) torch.profiler: 더 깊게 보고 싶을 때만
     ran_torch_prof: bool = _maybe_run_torch_profiler_for_backward_step(
         args,
         use_deepspeed=use_deepspeed,
@@ -651,7 +653,6 @@ def _backward_and_step(
         max_grad_norm=max_grad_norm,
     )
 
-    # torch.profiler를 안 돌린 경우에만, 우리가 쪼갠 profile_block 계측 실행
     if not ran_torch_prof:
         if use_deepspeed:
             _run_backward_and_step_deepspeed(
@@ -671,9 +672,6 @@ def _backward_and_step(
                 device_type=device_type,
             )
 
-    # 로그용 loss 값(스칼라). CPU로 가져오는 순간 동기화가 일어날 수 있습니다.
-    total_loss: float = float(loss_tensor.detach().float().cpu().item())
-    return total_loss
 
 
 def _apply_weight_decay_warmdown(optimizer: torch.optim.Optimizer) -> None:
@@ -706,106 +704,251 @@ def _update_ema_if_needed(ema: Optional[object], model: nn.Module) -> None:
         src_model: nn.Module = getattr(model, "module", model)
         ema.update(src_model)
 
+def _to_float_scalar_tensor(
+    value: Any,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """값을 float32 스칼라 텐서로 바꿉니다.
+
+    목적:
+        - loss_dict 안의 값을 "누적합(sum)"에 더하기 쉬운 형태로 통일합니다.
+        - CPU로 가져오지 않고, 같은 device(GPU/CPU) 위에서만 처리합니다.
+
+    Args:
+        value (Any):
+            - 보통 torch.Tensor 를 기대합니다.
+            - int/float 도 허용합니다.
+        device (torch.device):
+            - 결과 텐서를 둘 device.
+            - 예: torch.device("cuda") 또는 torch.device("cpu")
+
+    Returns:
+        Optional[torch.Tensor]:
+            - shape: ()  (스칼라)
+            - dtype: torch.float32
+            - 변환 불가능한 타입이면 None
+
+    Note:
+        - value가 텐서인데 원소가 1개가 아니면(mean으로) 스칼라로 만듭니다.
+          (예: shape이 (N,) 이면 mean() 후 shape () )
+    """
+    if isinstance(value, torch.Tensor):
+        t: torch.Tensor = value.detach()
+        if t.numel() != 1:
+            # 여러 값이면 평균으로 스칼라 하나로 만듭니다.
+            t = t.mean()
+        return t.to(device=device, dtype=torch.float32)
+
+    if isinstance(value, (int, float)):
+        return torch.tensor(float(value), device=device, dtype=torch.float32)
+
+    return None
+
+
+def _accumulate_epoch_loss_sums_inplace(
+    loss_sums: Dict[str, torch.Tensor],
+    loss_counts: Dict[str, torch.Tensor],
+    loss_dict: Dict[str, Any],
+    *,
+    device: torch.device,
+) -> None:
+    """step 단위 loss_dict를 에폭 누적합(sum)과 횟수(count)에 더합니다. (in-place)
+
+    Args:
+        loss_sums (Dict[str, torch.Tensor]):
+            - key -> 누적합 텐서
+            - 각 텐서 shape: () (스칼라), dtype: float32
+        loss_counts (Dict[str, torch.Tensor]):
+            - key -> 해당 key가 등장한 횟수
+            - 각 텐서 shape: () (스칼라), dtype: float32
+        loss_dict (Dict[str, Any]):
+            - 이번 step에서 계산된 loss 들
+            - 보통 value는 torch.Tensor(스칼라)입니다.
+        device (torch.device):
+            - 누적을 수행할 device
+
+    Returns:
+        None
+
+    Note:
+        - 어떤 key가 어떤 step에 없으면, 그 step은 그 key 평균 계산에 포함되지 않습니다.
+          (기존 get_epoch_mean_loss 동작과 같은 의미)
+    """
+    with torch.no_grad():
+        for key, value in loss_dict.items():
+            scalar = _to_float_scalar_tensor(value, device=device)
+            if scalar is None:
+                continue
+
+            if key not in loss_sums:
+                loss_sums[key] = torch.zeros((), device=device, dtype=torch.float32)
+                loss_counts[key] = torch.zeros((), device=device, dtype=torch.float32)
+
+            loss_sums[key] += scalar
+            loss_counts[key] += 1.0
+
+
+def _ddp_get_union_keys(local_keys: List[str]) -> List[str]:
+    """DDP에서 rank 전체의 key 목록 합집합(union)을 만듭니다.
+
+    Args:
+        local_keys (List[str]):
+            - 현재 rank에서 관측된 key 목록
+
+    Returns:
+        List[str]:
+            - 전체 rank에서의 key 합집합(정렬됨)
+    """
+    keys_sorted: List[str] = sorted(local_keys)
+
+    if not ddp.is_dist_avail_and_initialized():
+        return keys_sorted
+
+    import torch.distributed as dist
+
+    # 가능하면 all_gather_object로 각 rank의 key 리스트를 모아서 union을 만듭니다.
+    if hasattr(dist, "all_gather_object"):
+        gathered: List[List[str]] = [[] for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, keys_sorted)
+
+        union_set: set = set()
+        for ks in gathered:
+            union_set.update(ks)
+        return sorted(union_set)
+
+    # fallback: object gather가 없으면 "키가 모든 rank에서 동일"하다고 가정합니다.
+    return keys_sorted
+
+
+def _finalize_epoch_mean_loss(
+    loss_sums: Dict[str, torch.Tensor],
+    loss_counts: Dict[str, torch.Tensor],
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+) -> Dict[str, float]:
+    """에폭 누적합/횟수로 평균을 만들고, (DDP면) rank 전체 평균으로 맞춘 뒤 CPU float로 반환합니다.
+
+    Args:
+        loss_sums (Dict[str, torch.Tensor]):
+            - key -> sum 텐서 (shape: ())
+        loss_counts (Dict[str, torch.Tensor]):
+            - key -> count 텐서 (shape: ())
+        args (argparse.Namespace):
+            - args.ddp 가 True이면 DDP all_reduce 수행
+        device (torch.device):
+            - 통신/계산에 사용할 device
+
+    Returns:
+        Dict[str, float]:
+            - key -> epoch 평균(파이썬 float)
+
+    Note:
+        - DDP일 때:
+            sum들과 count들을 SUM으로 합친 뒤, mean = sum / count 로 만듭니다.
+        - CPU로의 복사는 epoch 끝에 "한 번"만 일어나도록 벡터로 묶어서 가져옵니다.
+    """
+    if len(loss_sums) == 0:
+        return {}
+
+    union_keys: List[str] = _ddp_get_union_keys(list(loss_sums.keys()))
+
+    # 모든 rank에서 같은 key 순서를 가지도록, 없는 키는 0으로 채웁니다.
+    for k in union_keys:
+        if k not in loss_sums:
+            loss_sums[k] = torch.zeros((), device=device, dtype=torch.float32)
+        if k not in loss_counts:
+            loss_counts[k] = torch.zeros((), device=device, dtype=torch.float32)
+
+    # 벡터로 묶어서 통신 횟수를 줄입니다.
+    # sum_vec: (K,), count_vec: (K,)
+    sum_vec: torch.Tensor = torch.stack([loss_sums[k] for k in union_keys], dim=0).to(device)
+    count_vec: torch.Tensor = torch.stack([loss_counts[k] for k in union_keys], dim=0).to(device)
+
+    if bool(getattr(args, "ddp", False)) and ddp.is_dist_avail_and_initialized():
+        import torch.distributed as dist
+        dist.all_reduce(sum_vec, op=dist.ReduceOp.SUM)
+        dist.all_reduce(count_vec, op=dist.ReduceOp.SUM)
+
+    safe_count: torch.Tensor = torch.clamp(count_vec, min=1.0)  # (K,)
+    mean_vec: torch.Tensor = sum_vec / safe_count  # (K,)
+
+    # CPU로 한 번에 가져옵니다. (2, K)
+    packed_cpu: torch.Tensor = torch.stack([mean_vec, count_vec], dim=0).detach().cpu()
+    mean_list: List[float] = packed_cpu[0].tolist()
+    count_list: List[float] = packed_cpu[1].tolist()
+
+    epoch_mean_loss: Dict[str, float] = {}
+    for k, m, c in zip(union_keys, mean_list, count_list):
+        # count가 0이면(어느 rank에서도 한 번도 안 나온 key) 결과에서 제외
+        if float(c) <= 0.0:
+            continue
+        epoch_mean_loss[k] = float(m)
+
+    return epoch_mean_loss
+
 
 # =====================================================================
 
-
 def train_epoch(
-        data_loader,
-        model: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        args: argparse.Namespace,
-        ema: Optional[object],
-        scheduler,
-        batch_num_in_all_epoch: int,
+    data_loader,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    ema: Optional[object],
+    scheduler,
+    batch_num_in_all_epoch: int,
 ) -> Tuple[Dict[str, float], float]:
-    """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행한다.
+    """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행합니다.
 
-    처리 순서:
-      1) 모델을 train 모드로 두고, DDP 사용 시 CUDA 동기화.
-      2) 전체 업데이트 스텝 수(batch_num_in_all_epoch)를 계산해 진행도(progress) 기준을 잡는다.
-      3) 각 배치에 대해
-         - device 로 이동 및 상한 클리핑(_prepare_batch_for_device)
-         - augmentation, near future mask/ near future 4차원 궤적 생성
-         - 관측 normalization
-         - diffusion 손실 / feasible 손실 합성
-         - 역전파, optimizer/scheduler step, EMA 업데이트
-         - 배치별 loss 를 epoch_loss_dict_list 리스트에 모은다.
-      4) epoch 종료 후, 배치별 loss 를 평균(get_epoch_mean_loss).
-      5) DDP 사용 시 rank 0 기준으로 평균 후 출력/반환.
-
-    Args:
-        data_loader:
-            PyTorch DataLoader. 각 요소는 collate_fn 이 만든 배치 dict.
-        model:
-            학습 중인 모델(nn.Module 또는 DDP 래퍼).
-        optimizer:
-            torch.optim.Optimizer 인스턴스.
-        args:
-            학습 설정/상태 Namespace.
-        ema:
-            EMA 래퍼(ModelEma 등) 또는 None.
-        scheduler:
-            학습률 스케줄러. 배치마다 step() 이 호출된다.
-        aug:
-            StatePerturbation 또는 NPCStatePerturbation, 또는 None.
+    핵심 변경:
+      - step마다 loss를 CPU로 가져오지 않습니다.
+      - step마다 loss_dict 전체를 CPU로 복사해서 리스트에 쌓지 않습니다.
+      - 대신 GPU에 "누적합(sum)"과 "횟수(count)"만 저장하고,
+        epoch 끝에 한 번만 평균을 만들어 CPU float로 바꿉니다.
 
     Returns:
-        - epoch_mean_loss: 손실 항목별 평균 dict. ( Dict[str, float] )
-        - epoch_mean_loss["loss"]: 최종 스칼라 손실 값. float
+        - epoch_mean_loss: 손실 항목별 epoch 평균 dict (Dict[str, float])
+        - epoch_mean_loss["loss"]: 최종 스칼라 손실 값 (float)
     """
-    epoch_loss_dict_list: List[Dict[str, torch.Tensor]] = []
-
     model.train()
 
-    if args.ddp:
-        torch.cuda.synchronize()
+    # 에폭 통계(누적합/횟수)는 loss가 존재하는 device에 맞춰 저장합니다.
+    stat_device: torch.device = torch.device(args.device)
+    epoch_loss_sums: Dict[str, torch.Tensor] = {}
+    epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
     with tqdm(data_loader, desc="Training", unit="batch") as data_epoch:
         for batch in data_epoch:
-
             # 1) device 이동 + 상한 클리핑 + 정답 분리
-            """ outputs
-        "ego_future_gt_4_dim",
-        "near_future_gt_4_dim",
-        "ego_future_gt_is_valid",
-        "near_future_gt_is_valid",
-            """
             inputs, outputs = _prepare_batch_for_device(
                 batch,
                 device=args.device,
             )
-            # 4) 관측 정규화
-            # norm_inputs: 각 value shape = (B, ...)
-            norm_inputs: Dict[str, torch.Tensor] = \
-                args.observation_normalizer(inputs)
-            # normed_ego_future_gt_4_dim: (B, Tf, 4)
+
+            # 2) 관측 정규화
+            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
+
             outputs["ego_future_gt_4_dim"] = args.state_normalizer(
                 data=outputs["ego_future_gt_4_dim"],
-                valid_mask=outputs["ego_future_gt_is_valid"])
-            # normed_near_future_gt_4_dim: (B, A, Tf, 4)
+                valid_mask=outputs["ego_future_gt_is_valid"],
+            )
             outputs["near_future_gt_4_dim"] = args.state_normalizer(
                 data=outputs["near_future_gt_4_dim"],
-                valid_mask=outputs["near_future_gt_is_valid"])
+                valid_mask=outputs["near_future_gt_is_valid"],
+            )
 
-            # 5) loss 계산 + 역전파 + optimizer/scheduler step
-            """
-            이번 배치(batch)를 학습하기 전에, 이전 배치에서 남아있는 기울기(gradient) 값을 깨끗이 지우는 작업
-
-            (DeepSpeed를 쓰면 optimizer가 모델 내부에 묶여 동작하는 경우가 많아서, “모델에게” 초기화를 맡기는 방식이 맞습니다.)
-
-            set_to_none=True는 기울기 값을 “0으로 채우기”보다 **아예 비워(None으로 만들기)**에 가까워서, 보통 메모리/속도 면에서 조금 더 유리할 수 있습니다.
-            """
+            # 3) grad 초기화
             if args.use_deepspeed and hasattr(model, "zero_grad"):
                 model.zero_grad()
             else:
                 optimizer.zero_grad(set_to_none=True)
 
-            # base_model: DDP/DeepSpeed 래퍼 벗긴 실제 모델
+            # base_model: DDP/DeepSpeed 래퍼 제거
             base_model = ddp.get_model(model, args.ddp)
             sde_marginal_prob = base_model.sde.marginal_prob
 
-            # 5-1) diffusion 기본 loss 계산 (neighbor / integration / constraint 등)
+            # 4) diffusion loss
             raw_loss_dict: Dict[str, torch.Tensor] = {}
             raw_loss_dict, _ = diffusion_loss_func(
                 args=args,
@@ -815,11 +958,11 @@ def train_epoch(
                 marginal_prob=sde_marginal_prob,
                 state_normalizer=args.state_normalizer,
                 loss_dict=raw_loss_dict,
-                model_type=args.diffusion_model_type,  # 보통 "x_start" 또는 "score"
+                model_type=args.diffusion_model_type,
                 observation_normalizer=args.observation_normalizer,
             )
 
-            # 5-2) feasible weight 로 최종 loss 합성
+            # 5) feasible weight 포함 최종 loss 합성
             loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
                 loss_dict=raw_loss_dict,
                 args=args,
@@ -828,61 +971,50 @@ def train_epoch(
                 batch_num_in_all_epoch=batch_num_in_all_epoch,
             )
 
-            enable_profile: bool = bool(getattr(args, "profile_feasible",
-                                                False))
-            if enable_profile:
-                print(
-                    "===============[PROFILE train_epoch ENABLED]==============="
-                )
-            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+            # 6) (중요) step 통계 누적: CPU로 가져오지 않고 GPU에서 sum/count만 갱신
+            _accumulate_epoch_loss_sums_inplace(
+                loss_sums=epoch_loss_sums,
+                loss_counts=epoch_loss_counts,
+                loss_dict=loss_dict,
+                device=stat_device,
+            )
 
+            # 7) backward + step
+            enable_profile: bool = bool(getattr(args, "profile_feasible", False))
+            if enable_profile and _is_main_process():
+                print("===============[PROFILE train_epoch ENABLED]===============")
+
+            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
             with profile_block(
-                    "train_epoch.train_epoch._backward_and_step",
-                    enabled=enable_profile,
-                    device_type=device_type,
+                "train_epoch.train_epoch._backward_and_step",
+                enabled=enable_profile,
+                device_type=device_type,
             ):
-                total_loss: float = _backward_and_step(
+                _backward_and_step(
                     loss_dict=loss_dict,
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     args=args,
                 )
-            # 6) WD warmdown, EMA 업데이트
+
+            # 8) WD warmdown, EMA 업데이트
             _apply_weight_decay_warmdown(optimizer)
             _update_ema_if_needed(ema, model)
 
-            if args.ddp:
-                torch.cuda.synchronize()
-
-            data_epoch.set_postfix(loss="{:.4f}".format(total_loss))
-            loss_dict_detach_cpu: Dict[str, torch.Tensor] = {
-                k: v.detach().cpu() for k, v in loss_dict.items()
-            }
-            epoch_loss_dict_list.append(loss_dict_detach_cpu)
-
-            # 전역 스텝 누적 (진행도 계산에 사용)
+            # 9) 전역 스텝 누적
             args._global_update_step += 1
 
-    # --- 에폭 평균 손실 계산 ---
-    """ epoch_mean_loss (각 GPU마다 계산해 둠)
-    {"loss": 0.42, "neighbor_prediction_loss": 0.3, ...}
-    """
-    epoch_mean_loss: Dict[str,
-    float] = get_epoch_mean_loss(epoch_loss_dict_list)
+    # --- epoch 평균 손실 계산(DDP면 all_reduce 포함) ---
+    epoch_mean_loss: Dict[str, float] = _finalize_epoch_mean_loss(
+        loss_sums=epoch_loss_sums,
+        loss_counts=epoch_loss_counts,
+        args=args,
+        device=stat_device,
+    )
 
-    if args.ddp:
-        """ ddp.reduce_and_average_losses
-            두 GPU가 서로 값을 더해서 합을 만든 뒤(world_size로 나눔)
-            → 모든 GPU가 동일한 평균 값을 가지게 함
-        통신하는 내용
-            스칼라 몇 개밖에 안 되는 작은 숫자
-        """
-        epoch_mean_loss = ddp.reduce_and_average_losses(
-            epoch_mean_loss,
-            torch.device(args.device),
-        )
-    if ddp.get_rank() == 0:
+    if ddp.get_rank() == 0 and "loss" in epoch_mean_loss:
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
-    return epoch_mean_loss, epoch_mean_loss["loss"]
+    return epoch_mean_loss, epoch_mean_loss.get("loss", float("nan"))
+

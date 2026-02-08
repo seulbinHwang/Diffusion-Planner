@@ -818,60 +818,77 @@ def _compute_integration_and_constraint_losses(
 
 
 def _add_xy_yaw_metric_losses(
-        loss_dict: Dict[str, Any],
-        state_normalizer: StateNormalizer,
-        observation_normalizer: Any,
-        score: torch.Tensor,  # (B, one_or_Pnn, future_len, 4)
-        normed_target_future_gt_4_dim: torch.
-    Tensor,  # (B, (1+)Pnn, future_len, 4)
-        target_future_valid: torch.Tensor,  #  (B, (1 +) Pnn, future_len)
-        integrated_trajectory: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 4)
-        control_constraint_diff: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 3)
+    loss_dict: Dict[str, Any],
+    state_normalizer: StateNormalizer,
+    observation_normalizer: Any,
+    score: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    normed_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    target_future_valid: torch.Tensor,  # (B, (1+)Pnn, future_len)
+    integrated_trajectory: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 4) 또는 None
+    control_constraint_diff: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 3) 또는 None
 ) -> None:
-    """xy / yaw 관련 부가 지표들을 loss_dict dict 에 추가한다.
+    """xy / yaw 관련 보기용 지표를 loss_dict에 추가합니다.
 
+    중요:
+        - 이 함수가 만드는 값들은 "학습(역전파/업데이트)"에는 쓰이지 않습니다.
+        - 따라서 반드시 torch.no_grad()로 감싸서 불필요한 비용을 줄입니다.
+
+    Args:
+        loss_dict: 결과를 추가할 dict (in-place)
+        state_normalizer: 상태 역정규화 도우미
+        observation_normalizer: 제어 역정규화 도우미
+        score: 예측 궤적(정규화된 값). shape: (B, (1+)Pnn, T, 4)
+        normed_target_future_gt_4_dim: 정답 궤적(정규화된 값). shape: (B, (1+)Pnn, T, 4)
+        target_future_valid: 유효 마스크. shape: (B, (1+)Pnn, T)
+        integrated_trajectory: 통합 궤적(정규화된 값). shape: (B, (1+)Pnn, T, 4) 또는 None
+        control_constraint_diff: 제어 차이(정규화된 값). shape: (B, (1+)Pnn, T, 3) 또는 None
+
+    Returns:
+        None
     """
-    # score_denorm: (B, (1+)Pnn, T, 4)
-    score_denorm: torch.Tensor = state_normalizer.inverse(
-        score, target_future_valid)
-    # target_future_gt: # (B, (1+)Pnn, future_len, 4)
-    target_future_gt: torch.Tensor = state_normalizer.inverse(
-        normed_target_future_gt_4_dim, target_future_valid)
-
     with torch.no_grad():
-        # 기본 score 에 대한 xy/yaw 오차
+        # score_denorm: (B, (1+)Pnn, T, 4)
+        score_denorm: torch.Tensor = state_normalizer.inverse(score, target_future_valid)
+
+        # target_future_gt: (B, (1+)Pnn, T, 4)
+        target_future_gt: torch.Tensor = state_normalizer.inverse(
+            normed_target_future_gt_4_dim, target_future_valid
+        )
+
+        # (1) score 기준 xy/yaw 오차
         xy_yaw_losses = _compute_xy_yaw_losses(
-            score_denorm,  #  (B, (1+)Pnn, future_len, 4)
-            target_future_gt,  # (B, (1+)Pnn, future_len, 4)
-            target_future_valid,  # (B, Pnn, future_len)
+            score_denorm,
+            target_future_gt,
+            target_future_valid,
         )
         loss_dict.update(xy_yaw_losses)
 
-        # 통합 궤적에 대한 xy/yaw 오차
+        # (2) integrated_trajectory 기준 xy/yaw 오차
         if integrated_trajectory is not None:
-            # integrated_trajectory_denorm: (B, Pnn, T, 4)
-            integrated_trajectory_denorm: torch.Tensor = \
-                state_normalizer.inverse(integrated_trajectory, target_future_valid)
+            integrated_trajectory_denorm: torch.Tensor = state_normalizer.inverse(
+                integrated_trajectory, target_future_valid
+            )
             integ_xy_yaw_losses = _compute_xy_yaw_losses(
                 integrated_trajectory_denorm,
-                target_future_gt,  # (B, (1+)Pnn, future_len, 4)
-                target_future_valid,  # (B, Pnn, T)
+                target_future_gt,
+                target_future_valid,
                 prefix="integration_loss",
             )
             loss_dict.update(integ_xy_yaw_losses)
 
-        # 제어 편차에 대한 통계 값
+        # (3) control_constraint_diff 물리 단위 통계
         if control_constraint_diff is not None:
             temp_dict = {"seg_body_control": control_constraint_diff}
             temp_dict = observation_normalizer.inverse(temp_dict)
-            # constraint_diff_denorm: (B, Pnn, T, 3)
-            constraint_diff_denorm: torch.Tensor = temp_dict["seg_body_control"]
+            constraint_diff_denorm: torch.Tensor = temp_dict["seg_body_control"]  # (B,P,T,3)
+
             constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
-                constraint_diff_denorm,  # (B, (1+)Pnn, T, 3)
-                target_future_valid,  # (B, Pnn, T)
+                constraint_diff_denorm,
+                target_future_valid,
                 prefix="constraint_diff",
             )
             loss_dict.update(constraint_xy_yaw_losses)
+
 
 
 def _assert_cur_future_valid_mask(
@@ -938,6 +955,58 @@ def _get_near_cur_future_gt_is_valid(
         (near_agents_is_valid.unsqueeze(-1), near_future_gt_is_valid),
         dim=-1)  # (B, Pnn, 1 + future_len)
     return near_cur_future_gt_is_valid
+
+def _get_xy_yaw_metric_interval_steps(args: Any) -> int:
+    """xy/yaw 보기용 지표를 몇 step마다 계산할지 정합니다.
+
+    목적:
+        - 학습에는 쓰이지 않는 지표 계산을 매 step에서 하지 않도록 줄입니다.
+
+    규칙:
+        1) args.xy_yaw_metric_interval_steps 가 있으면 그 값을 사용합니다.
+            - 0 이하: 지표 계산 안 함
+            - 1: 매 step 계산(기존 동작)
+            - N>=2: N step마다 계산
+        2) 옵션이 없으면 기본값을 사용합니다.
+            - DDP면 50 step마다
+            - DDP 아니면 10 step마다
+
+    Args:
+        args (Any): 학습 설정 객체
+
+    Returns:
+        int: 지표 계산 step 간격
+    """
+    if hasattr(args, "xy_yaw_metric_interval_steps"):
+        try:
+            return int(getattr(args, "xy_yaw_metric_interval_steps"))
+        except Exception:
+            return 0
+
+    use_ddp = bool(getattr(args, "ddp", False))
+    return 50 if use_ddp else 10
+
+
+def _should_compute_xy_yaw_metrics_this_step(args: Any) -> bool:
+    """현재 step에서 xy/yaw 보기용 지표를 계산할지 결정합니다.
+
+    Args:
+        args (Any):
+            - args._global_update_step: 현재까지 step 수(정수)
+            - args.xy_yaw_metric_interval_steps: (선택) 계산 간격
+
+    Returns:
+        bool: True면 이번 step에서 지표 계산
+    """
+    interval = _get_xy_yaw_metric_interval_steps(args)
+    if interval <= 0:
+        return False
+
+    step_idx = int(getattr(args, "_global_update_step", 0))
+    if interval == 1:
+        return True
+
+    return (step_idx % interval) == 0
 
 
 def diffusion_loss_func(
@@ -1118,21 +1187,18 @@ def diffusion_loss_func(
         loss_dict["integration_loss"] = integration_loss_val
         loss_dict["constraint_loss"] = constraint_loss_val
 
-        # xy/yaw 관련 추가 metric 들
-        _add_xy_yaw_metric_losses(
-            loss_dict=loss_dict,
-            state_normalizer=state_normalizer,
-            observation_normalizer=observation_normalizer,
-            score=score,
-            normed_target_future_gt_4_dim=
-            normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
-            target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
-            integrated_trajectory=
-            integrated_trajectory,  # (B, (1+)Pnn, T, 4) 또는 None
-            control_constraint_diff=
-            control_constraint_diff,  # (B, (1+)Pnn, T, 3) 또는 None
-        )
-
+        # xy/yaw 관련 보기용 지표는 매 step이 아니라 "가끔"만 계산합니다.
+        if _should_compute_xy_yaw_metrics_this_step(args):
+            _add_xy_yaw_metric_losses(
+                loss_dict=loss_dict,
+                state_normalizer=state_normalizer,
+                observation_normalizer=observation_normalizer,
+                score=score,
+                normed_target_future_gt_4_dim=normed_target_future_gt_4_dim,
+                target_future_valid=target_future_valid,
+                integrated_trajectory=integrated_trajectory,
+                control_constraint_diff=control_constraint_diff,
+            )
     # dpm_loss 전체가 유한값인지 마지막으로 검사
     assert torch.isfinite(dpm_loss).all().item(), \
         f"loss cannot be nan, random_noise={random_noise}"
