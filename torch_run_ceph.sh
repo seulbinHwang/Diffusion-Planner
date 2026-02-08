@@ -5,6 +5,7 @@ export WANDB_DEBUG=0
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
 export CUDA_DEVICE_MAX_CONNECTIONS=32
+export PYTHONWARNINGS="ignore:nvfuser is no longer supported in torch script:UserWarning"
 
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 
