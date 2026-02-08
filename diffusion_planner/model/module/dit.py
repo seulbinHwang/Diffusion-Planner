@@ -47,6 +47,8 @@ except Exception as _e1:
 try:
     # flash-attn 2.8.x 환경에서 흔히 존재
     from flash_attn.ops.fused_dense import fused_mlp_func, FusedMLP
+    _FUSED_MLP_AVAILABLE = True
+    _FUSED_MLP_IMPORT_ERR = None
 except Exception as _e_fused_mlp:
     # raise RuntimeError(
     #     "This code path requires fused MLP only.\n"
