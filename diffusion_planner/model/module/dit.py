@@ -54,6 +54,10 @@ except Exception as _e_fused_mlp:
         "Please install/build flash-attn with fused_dense support and retry.\n"
         f"(cause: {_e_fused_mlp})"
     ) from _e_fused_mlp
+    fused_mlp_func = None  # type: ignore[assignment]
+    FusedMLP = None  # type: ignore[assignment]
+    _FUSED_MLP_AVAILABLE = False
+    _FUSED_MLP_IMPORT_ERR = _e_fused_mlp
 
 def _fused_linear_gelu_linear(
     x2d: torch.Tensor,  # (N, Din)
@@ -64,6 +68,9 @@ def _fused_linear_gelu_linear(
     is_training: bool,
 ) -> torch.Tensor:
     """fused_mlp_func로 Linear -> GELU(근사) -> Linear을 수행합니다."""
+    if fused_mlp_func is None:
+        raise RuntimeError("fused_mlp_func is not available (import failed).")
+
     act = "gelu_approx"
 
     try:
@@ -106,6 +113,96 @@ def _fused_linear_gelu_linear(
                     f" (cause: {e})"
                 ) from e
 
+def _can_use_fused_mlp(
+    x2d: torch.Tensor,  # (N, Din)
+    fc1: nn.Linear,
+    fc2: nn.Linear,
+    *,
+    strict_param_dtype: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """fused MLP 경로를 사용해도 되는지 확인합니다.
+
+    fused MLP는 환경/장치/자료형 조건이 까다로운 편이라,
+    조건이 안 맞으면 예외가 나면서 학습이 멈출 수 있습니다.
+
+    이 함수는 "쓸 수 있으면 True", 아니면 False와 이유를 돌려줘서
+    호출하는 쪽에서 안전하게 일반 연산으로 폴백할 수 있게 합니다.
+
+    Args:
+        x2d: 입력 텐서. shape: (N, Din)
+        fc1: 첫 번째 선형층(nn.Linear). weight shape: (H, Din)
+        fc2: 두 번째 선형층(nn.Linear). weight shape: (Dout, H)
+        strict_param_dtype: True면 파라미터 dtype이 입력 dtype과 꼭 같아야 합니다.
+
+    Returns:
+        Tuple[bool, Optional[str]]:
+            - 첫 값: fused 사용 가능 여부
+            - 둘째 값: 불가능한 경우 이유(문자열). 가능하면 None
+    """
+    if not _FUSED_MLP_AVAILABLE:
+        return False, f"import 실패: {_FUSED_MLP_IMPORT_ERR}"
+
+    try:
+        _require_fused_mlp_ready(
+            x2d=x2d,
+            fc1=fc1,
+            fc2=fc2,
+            strict_param_dtype=strict_param_dtype,
+        )
+    except Exception as e:
+        return False, str(e)
+
+    return True, None
+
+
+def _linear_gelu_linear_fallback(
+    x2d: torch.Tensor,  # (N, Din)
+    w1: torch.Tensor,  # (H, Din)
+    b1: Optional[torch.Tensor],  # (H,) or None
+    w2: torch.Tensor,  # (Dout, H)
+    b2: Optional[torch.Tensor],  # (Dout,) or None
+) -> torch.Tensor:
+    """일반 PyTorch 연산으로 Linear -> GELU -> Linear을 수행합니다(폴백 경로).
+
+    fused_mlp_func가 없거나, fused 경로 조건이 안 맞거나,
+    fused 호출이 실패할 때도 학습이 계속 진행되도록 하기 위한 함수입니다.
+
+    혼합 dtype(예: x=bf16, weight=fp32) 입력이 들어올 수 있어,
+    연산에 들어가기 전에 weight/bias를 입력 dtype/device에 맞춰 변환합니다.
+    (이 변환은 학습이 멈추는 것보다 훨씬 안전한 폴백 전략입니다.)
+
+    Args:
+        x2d: 입력 텐서. shape: (N, Din)
+        w1: 첫 번째 weight. shape: (H, Din)
+        b1: 첫 번째 bias. shape: (H,) 또는 None
+        w2: 두 번째 weight. shape: (Dout, H)
+        b2: 두 번째 bias. shape: (Dout,) 또는 None
+
+    Returns:
+        torch.Tensor: 출력 텐서. shape: (N, Dout)
+    """
+    if x2d.dim() != 2:
+        raise ValueError(f"x2d must be 2D (N, Din). got {tuple(x2d.shape)}")
+
+    # 폴백에서는 dtype/device 불일치로 matmul이 터지지 않도록 안전하게 정렬
+    target_device = x2d.device
+    target_dtype = x2d.dtype
+
+    w1_ = w1 if (w1.device == target_device and w1.dtype == target_dtype) else w1.to(device=target_device, dtype=target_dtype)
+    w2_ = w2 if (w2.device == target_device and w2.dtype == target_dtype) else w2.to(device=target_device, dtype=target_dtype)
+
+    b1_ = None
+    if b1 is not None:
+        b1_ = b1 if (b1.device == target_device and b1.dtype == target_dtype) else b1.to(device=target_device, dtype=target_dtype)
+
+    b2_ = None
+    if b2 is not None:
+        b2_ = b2 if (b2.device == target_device and b2.dtype == target_dtype) else b2.to(device=target_device, dtype=target_dtype)
+
+    h = F.linear(x2d, w1_, b1_)  # (N, H)
+    h = F.gelu(h, approximate="tanh")  # (N, H)
+    out = F.linear(h, w2_, b2_)  # (N, Dout)
+    return out
 
 def _require_fused_mlp_ready(
     x2d: torch.Tensor,  # (N, Din)
@@ -145,11 +242,11 @@ def _require_fused_mlp_ready(
 
 
 class FusedMlpGelu(nn.Module):
-    """MLP that *only* uses fused Linear->GELU->Linear via fused_mlp_func.
+    """MLP 모듈.
 
-    - Holds two nn.Linear modules as parameters.
-    - Forward always calls fused_mlp_func (no fallback).
-    - If requirements are not met (e.g., CPU or fp32), it raises immediately.
+    - fused_mlp_func가 준비돼 있고 조건이 맞으면 fused 경로를 우선 사용합니다.
+    - fused import가 실패했거나, 조건이 안 맞거나, 실행 중 오류가 나면
+      자동으로 일반 PyTorch 연산(Linear -> GELU -> Linear)으로 폴백합니다.
 
     Attributes:
         fc1 (nn.Linear): (Din -> H)
@@ -178,26 +275,24 @@ class FusedMlpGelu(nn.Module):
         self.fc2 = nn.Linear(int(hidden_features), int(out_features), bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Run fused Linear->GELU->Linear.
+        """Linear -> GELU -> Linear을 수행합니다.
+
+        fused_mlp_func가 가능하면 fused를 우선 사용하고,
+        불가능하거나 실패하면 일반 PyTorch 연산으로 폴백합니다.
 
         Args:
             x (torch.Tensor):
-                Input tensor.
-                - supported shapes:
+                입력 텐서.
+                - 지원 shape:
                     1) (N, Din)
-                    2) (B, L, Din) -> internally flattened to (B*L, Din)
-                - device: CUDA
-                - dtype: fp16 or bf16
+                    2) (B, L, Din) -> 내부에서 (B*L, Din)으로 펼침
 
         Returns:
             torch.Tensor:
-                Output tensor.
+                출력 텐서.
                 - shape:
-                    1) input (N, Din) -> (N, Dout)
-                    2) input (B, L, Din) -> (B, L, Dout)
-
-        Raises:
-            RuntimeError: If fused prerequisites are not met (no fallback).
+                    1) 입력 (N, Din) -> (N, Dout)
+                    2) 입력 (B, L, Din) -> (B, L, Dout)
         """
         if x.dim() == 2:
             x2d = x  # (N, Din)
@@ -208,11 +303,10 @@ class FusedMlpGelu(nn.Module):
             restore_shape = (B, L)
         else:
             raise RuntimeError(
-                f"Fused MLP supports only 2D/3D inputs. Got {tuple(x.shape)}")
+                f"FusedMlpGelu supports only 2D/3D inputs. Got {tuple(x.shape)}"
+            )
 
-        _require_fused_mlp_ready(x2d, self.fc1, self.fc2)
-
-        # Empty input can fail in fused kernel; handle safely while keeping graph "touched".
+        # Empty input 안전 처리 (fused/폴백 모두 동일)
         N = int(x2d.shape[0])
         Dout = int(self.fc2.out_features)
         if N == 0:
@@ -227,30 +321,54 @@ class FusedMlpGelu(nn.Module):
             ) * 0.0
             out2d = out2d + touch
         else:
-            # Fused kernels often prefer contiguous inputs/weights.
             x2d = x2d.contiguous()  # (N, Din)
             w1 = self.fc1.weight.contiguous()  # (H, Din)
-            b1 = self.fc1.bias.contiguous(
-            ) if self.fc1.bias is not None else None  # (H,) or None
+            b1 = self.fc1.bias.contiguous() if self.fc1.bias is not None else None  # (H,) or None
             w2 = self.fc2.weight.contiguous()  # (Dout, H)
-            b2 = self.fc2.bias.contiguous(
-            ) if self.fc2.bias is not None else None  # (Dout,) or None
+            b2 = self.fc2.bias.contiguous() if self.fc2.bias is not None else None  # (Dout,) or None
 
-            # Hard-require fused path only (via fused_mlp_func).
-            out2d = _fused_linear_gelu_linear(
+            use_fused, _reason = _can_use_fused_mlp(
                 x2d=x2d,
-                w1=w1,
-                b1=b1,
-                w2=w2,
-                b2=b2,
-                is_training=self.training,
-            )  # (N, Dout)
+                fc1=self.fc1,
+                fc2=self.fc2,
+                strict_param_dtype=False,
+            )
+
+            if use_fused:
+                try:
+                    out2d = _fused_linear_gelu_linear(
+                        x2d=x2d,
+                        w1=w1,
+                        b1=b1,
+                        w2=w2,
+                        b2=b2,
+                        is_training=self.training,
+                    )  # (N, Dout)
+                except Exception:
+                    # fused 호출이 실패하면 바로 폴백
+                    out2d = _linear_gelu_linear_fallback(
+                        x2d=x2d,
+                        w1=w1,
+                        b1=b1,
+                        w2=w2,
+                        b2=b2,
+                    )  # (N, Dout)
+            else:
+                # fused 자체가 없거나(미설치), 조건이 안 맞으면 폴백
+                out2d = _linear_gelu_linear_fallback(
+                    x2d=x2d,
+                    w1=w1,
+                    b1=b1,
+                    w2=w2,
+                    b2=b2,
+                )  # (N, Dout)
 
         if restore_shape is None:
             return out2d  # (N, Dout)
 
         B, L = restore_shape
         return out2d.reshape(B, L, Dout)  # (B, L, Dout)
+
 
 
 # ===========================================================
