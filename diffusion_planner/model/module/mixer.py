@@ -20,11 +20,11 @@ try:
     from flash_attn.ops.fused_dense import FusedMLP as _FlashFusedMLP  # type: ignore
     _FLASH_FUSED_MLP_AVAILABLE = True
 except Exception as e:
-    raise ImportError(
-        "Required: cannot import flash_attn.ops.fused_dense.FusedMLP. "
-        "This project must use FastMlp (no fallback). "
-        f"(cause: {repr(e)})"
-    ) from e
+    # raise ImportError(
+    #     "Required: cannot import flash_attn.ops.fused_dense.FusedMLP. "
+    #     "This project must use FastMlp (no fallback). "
+    #     f"(cause: {repr(e)})"
+    # ) from e
     _FlashFusedMLP = None  # type: ignore
     _FLASH_IMPORT_ERRORS["fused_mlp"] = repr(e)
 

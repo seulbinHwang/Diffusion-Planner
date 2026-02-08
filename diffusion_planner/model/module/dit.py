@@ -48,12 +48,12 @@ try:
     # flash-attn 2.8.x 환경에서 흔히 존재
     from flash_attn.ops.fused_dense import fused_mlp_func, FusedMLP
 except Exception as _e_fused_mlp:
-    raise RuntimeError(
-        "This code path requires fused MLP only.\n"
-        "Failed to import flash_attn.ops.fused_dense.fused_mlp_func / FusedMLP.\n"
-        "Please install/build flash-attn with fused_dense support and retry.\n"
-        f"(cause: {_e_fused_mlp})"
-    ) from _e_fused_mlp
+    # raise RuntimeError(
+    #     "This code path requires fused MLP only.\n"
+    #     "Failed to import flash_attn.ops.fused_dense.fused_mlp_func / FusedMLP.\n"
+    #     "Please install/build flash-attn with fused_dense support and retry.\n"
+    #     f"(cause: {_e_fused_mlp})"
+    # ) from _e_fused_mlp
     fused_mlp_func = None  # type: ignore[assignment]
     FusedMLP = None  # type: ignore[assignment]
     _FUSED_MLP_AVAILABLE = False
