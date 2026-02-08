@@ -637,7 +637,6 @@ def _backward_and_step(
 
     # ✅ 내부 구간 프로파일링 on/off (기본은 False)
     enable_profile: bool = bool(getattr(args, "profile_backward_detail", False))
-    enable_profile: True
 
     max_grad_norm: float = float(getattr(args, "max_grad_norm", 0.0))
 
