@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-export WANDB_DEBUG=1   # ← 여기 추가
+export WANDB_DEBUG=0   # ← 여기 추가
 export PYTHONUNBUFFERED=1
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -51,7 +51,7 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
   --name "final_fast" \
-  --batch_size 1536 \
+  --batch_size 1920 \
   --learning_rate 1e-3 \
   --min_learning_rate 1e-6 \
   --profile_feasible False \
