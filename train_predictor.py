@@ -10,6 +10,7 @@ from diffusion_planner.utils.lr_schedule import (
     build_pytorch_warmup_cosine_scheduler,
     build_pytorch_warmup_constant_scheduler,
 )
+from tqdm import tqdm
 from diffusion_planner.model.diffusion_planner import print_param_report
 
 # deprecated 키는 사용 금지
@@ -2093,16 +2094,34 @@ def _run_training_loop(
     data_num_in_a_epoch: int,
     global_batch_size: int,
 ) -> float:
-    """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다."""
+    """전체 epoch 루프를 돌면서 학습, 속도 측정, 로깅, 체크포인트 저장을 수행한다.
+
+    변경점:
+      - epoch 루프에 tqdm를 붙여서, 진행 표시 갱신을 "epoch 단위"로만 수행합니다.
+      - 배치 단위 tqdm는 train_epoch에서 제거되어, 빈번한 출력/I/O를 줄입니다.
+    """
+
     elapsed_training_time_hour: float = 0.0
+
     # 전체 업데이트 스텝 수 설정 및 global step 초기화 보장
     batch_num_in_all_epoch: int = _init_global_step_and_total_updates(
         args,
         batch_num_in_epoch=len(train_loader),
     )
-    for epoch in range(init_epoch, train_epochs):
-        # ✅ (중요) epoch 시작 전에 sampler epoch를 먼저 세팅
-        # - resume(init_epoch>0) 시에도 첫 epoch부터 올바른 shuffle이 나오도록 함
+
+    disable_epoch_tqdm: bool = (global_rank != 0)
+
+    epoch_iter = tqdm(
+        range(init_epoch, train_epochs),
+        total=int(train_epochs),
+        initial=int(init_epoch),
+        desc="Training (epoch)",
+        unit="epoch",
+        disable=disable_epoch_tqdm,
+    )
+
+    for epoch in epoch_iter:
+        # epoch 시작 전에 sampler epoch 세팅
         train_sampler.set_epoch(epoch + args.sampler_epoch_offset)
 
         train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
@@ -2133,11 +2152,11 @@ def _run_training_loop(
         )
 
         (
-            weight_dict,  # Dict[str, float]
-            direct_loss_dict,  # Dict[str, float]
-            integration_loss_dict,  # Dict[str, float]
-            constraint_loss_dict,  # Dict[str, float]
-            loss_dict,  # Dict[str, float]
+            weight_dict,
+            direct_loss_dict,
+            integration_loss_dict,
+            constraint_loss_dict,
+            loss_dict,
         ) = _split_train_loss_for_logging(
             train_loss=train_loss,
             info_dict=info_dict,
@@ -2152,6 +2171,7 @@ def _run_training_loop(
             loss_dict=loss_dict,
             speed_info=speed_info,
         )
+
         best_loss = _log_and_save(
             epoch=epoch,
             args=args,
@@ -2166,7 +2186,24 @@ def _run_training_loop(
             global_rank=global_rank,
         )
 
+        # rank0 tqdm에만 요약 표시(에폭당 1회)
+        if not disable_epoch_tqdm:
+            try:
+                epoch_iter.set_postfix({
+                    "loss": f"{float(train_total_loss):.4f}",
+                    "sec": f"{float(epoch_elapsed_time_sec):.1f}",
+                    "data/s": f"{float(speed_info.get('data_process_per_sec', 0.0)):.1f}",
+                })
+            except Exception:
+                pass
+
+    try:
+        epoch_iter.close()
+    except Exception:
+        pass
+
     return best_loss
+
 
 
 def _finalize_training_cleanup(

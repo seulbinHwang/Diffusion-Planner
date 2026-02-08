@@ -901,11 +901,9 @@ def train_epoch(
 ) -> Tuple[Dict[str, float], float]:
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행합니다.
 
-    핵심 변경:
-      - step마다 loss를 CPU로 가져오지 않습니다.
-      - step마다 loss_dict 전체를 CPU로 복사해서 리스트에 쌓지 않습니다.
-      - 대신 GPU에 "누적합(sum)"과 "횟수(count)"만 저장하고,
-        epoch 끝에 한 번만 평균을 만들어 CPU float로 바꿉니다.
+    변경점:
+      - tqdm를 완전히 제거해서, 배치 단위 출력/로그 갱신을 없앱니다.
+      - 나머지 학습 로직(누적합 sum/count, backward/step, EMA 등)은 그대로 유지합니다.
 
     Returns:
         - epoch_mean_loss: 손실 항목별 epoch 평균 dict (Dict[str, float])
@@ -918,99 +916,91 @@ def train_epoch(
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
-    disable_tqdm: bool = (not _is_main_process())
+    for batch in data_loader:
+        # 1) device 이동 + 상한 클리핑 + 정답 분리
+        inputs, outputs = _prepare_batch_for_device(
+            batch,
+            device=args.device,
+        )
 
-    with tqdm(
-            data_loader,
-            desc="Training",
-            unit="batch",
-            disable=disable_tqdm,
-    ) as data_epoch:
-        for batch in data_epoch:
-            # 1) device 이동 + 상한 클리핑 + 정답 분리
-            inputs, outputs = _prepare_batch_for_device(
-                batch,
-                device=args.device,
-            )
+        # 2) 관측 정규화
+        norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
 
-            # 2) 관측 정규화
-            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
+        outputs["ego_future_gt_4_dim"] = args.state_normalizer(
+            data=outputs["ego_future_gt_4_dim"],
+            valid_mask=outputs["ego_future_gt_is_valid"],
+        )
+        outputs["near_future_gt_4_dim"] = args.state_normalizer(
+            data=outputs["near_future_gt_4_dim"],
+            valid_mask=outputs["near_future_gt_is_valid"],
+        )
 
-            outputs["ego_future_gt_4_dim"] = args.state_normalizer(
-                data=outputs["ego_future_gt_4_dim"],
-                valid_mask=outputs["ego_future_gt_is_valid"],
-            )
-            outputs["near_future_gt_4_dim"] = args.state_normalizer(
-                data=outputs["near_future_gt_4_dim"],
-                valid_mask=outputs["near_future_gt_is_valid"],
-            )
+        # 3) grad 초기화
+        if args.use_deepspeed and hasattr(model, "zero_grad"):
+            model.zero_grad()
+        else:
+            optimizer.zero_grad(set_to_none=True)
 
-            # 3) grad 초기화
-            if args.use_deepspeed and hasattr(model, "zero_grad"):
-                model.zero_grad()
-            else:
-                optimizer.zero_grad(set_to_none=True)
+        # base_model: DDP/DeepSpeed 래퍼 제거
+        base_model = ddp.get_model(model, args.ddp)
+        sde_marginal_prob = base_model.sde.marginal_prob
 
-            # base_model: DDP/DeepSpeed 래퍼 제거
-            base_model = ddp.get_model(model, args.ddp)
-            sde_marginal_prob = base_model.sde.marginal_prob
+        # 4) diffusion loss
+        raw_loss_dict: Dict[str, torch.Tensor] = {}
+        raw_loss_dict, _ = diffusion_loss_func(
+            args=args,
+            model=model,
+            norm_inputs=norm_inputs,
+            norm_outputs=outputs,
+            marginal_prob=sde_marginal_prob,
+            state_normalizer=args.state_normalizer,
+            loss_dict=raw_loss_dict,
+            model_type=args.diffusion_model_type,
+            observation_normalizer=args.observation_normalizer,
+        )
 
-            # 4) diffusion loss
-            raw_loss_dict: Dict[str, torch.Tensor] = {}
-            raw_loss_dict, _ = diffusion_loss_func(
-                args=args,
-                model=model,
-                norm_inputs=norm_inputs,
-                norm_outputs=outputs,
-                marginal_prob=sde_marginal_prob,
-                state_normalizer=args.state_normalizer,
-                loss_dict=raw_loss_dict,
-                model_type=args.diffusion_model_type,
-                observation_normalizer=args.observation_normalizer,
-            )
+        # 5) feasible weight 포함 최종 loss 합성
+        loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
+            loss_dict=raw_loss_dict,
+            args=args,
+            model=model,
+            norm_inputs=norm_inputs,
+            batch_num_in_all_epoch=batch_num_in_all_epoch,
+        )
 
-            # 5) feasible weight 포함 최종 loss 합성
-            loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
-                loss_dict=raw_loss_dict,
-                args=args,
-                model=model,
-                norm_inputs=norm_inputs,
-                batch_num_in_all_epoch=batch_num_in_all_epoch,
-            )
+        # 6) step 통계 누적: CPU로 가져오지 않고 sum/count만 갱신
+        _accumulate_epoch_loss_sums_inplace(
+            loss_sums=epoch_loss_sums,
+            loss_counts=epoch_loss_counts,
+            loss_dict=loss_dict,
+            device=stat_device,
+        )
 
-            # 6) (중요) step 통계 누적: CPU로 가져오지 않고 GPU에서 sum/count만 갱신
-            _accumulate_epoch_loss_sums_inplace(
-                loss_sums=epoch_loss_sums,
-                loss_counts=epoch_loss_counts,
+        # 7) backward + step
+        enable_profile: bool = bool(getattr(args, "profile_feasible", False))
+        if enable_profile and _is_main_process():
+            print("===============[PROFILE train_epoch ENABLED]===============")
+
+        device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+        with profile_block(
+            "train_epoch.train_epoch._backward_and_step",
+            enabled=enable_profile,
+            device_type=device_type,
+        ):
+            _backward_and_step(
                 loss_dict=loss_dict,
-                device=stat_device,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=args,
             )
 
-            # 7) backward + step
-            enable_profile: bool = bool(getattr(args, "profile_feasible", False))
-            if enable_profile and _is_main_process():
-                print("===============[PROFILE train_epoch ENABLED]===============")
+        # 8) WD warmdown, EMA 업데이트
+        _apply_weight_decay_warmdown(optimizer)
+        _update_ema_if_needed(ema, model)
 
-            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
-            with profile_block(
-                "train_epoch.train_epoch._backward_and_step",
-                enabled=enable_profile,
-                device_type=device_type,
-            ):
-                _backward_and_step(
-                    loss_dict=loss_dict,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    args=args,
-                )
-
-            # 8) WD warmdown, EMA 업데이트
-            _apply_weight_decay_warmdown(optimizer)
-            _update_ema_if_needed(ema, model)
-
-            # 9) 전역 스텝 누적
-            args._global_update_step += 1
+        # 9) 전역 스텝 누적
+        args._global_update_step += 1
 
     # --- epoch 평균 손실 계산(DDP면 all_reduce 포함) ---
     epoch_mean_loss: Dict[str, float] = _finalize_epoch_mean_loss(
@@ -1024,4 +1014,5 @@ def train_epoch(
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
     return epoch_mean_loss, epoch_mean_loss.get("loss", float("nan"))
+
 
