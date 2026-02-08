@@ -280,6 +280,7 @@ def get_args():
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--prefetch_factor',type=int,default=4)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)
     parser.add_argument('--use_feasible', default=True, type=boolean)
@@ -411,10 +412,7 @@ def get_args():
         help='decoder(Group C)에 곱해질 lr 배율.',
     )
 
-    parser.add_argument('--prefetch_factor',
-                        type=int,
-                        help='number of warm up',
-                        default=4)
+
     parser.add_argument('--encoder_drop_path_rate',
                         type=float,
                         help='encoder drop out rate',
