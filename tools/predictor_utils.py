@@ -2273,6 +2273,8 @@ def build_dataset_and_sampler(
         args.predicted_neighbor_num,
         eval_method,
         args.use_data_percent,
+    use_agent_route_lane_order=args.use_agent_route_lane_order,
+
     )
 
     eval_method_lower = str(eval_method).lower()

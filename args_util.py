@@ -279,8 +279,29 @@ def get_args():
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
-    parser.add_argument('--num_workers', default=3, type=int)
-    parser.add_argument('--prefetch_factor',type=int,default=3)
+    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--prefetch_factor',type=int,default=4)
+    # ✅ [ADD] GPU in-flight step 제한(가벼운 동기화)
+    parser.add_argument(
+        '--cuda_inflight_step_limit',
+        type=int,
+        default=2,
+        help=(
+            "GPU가 동시에 처리 중인 step이 너무 많이 쌓이지 않도록 제한합니다. "
+            "매 step마다 CUDA 이벤트를 기록하고, 이벤트가 이 값보다 많아지면 "
+            "가장 오래된 이벤트 1개만 기다립니다. "
+            "0 이하로 주면 비활성화됩니다."
+        ),
+    )
+    parser.add_argument(
+        '--use_agent_route_lane_order',
+        default=False,
+        type=boolean,
+        help=(
+            "True이면 agent_route_lane_order를 dataset/배치에 포함합니다. "
+            "학습에서 사용하지 않으면 False로 두면 CPU/RAM 사용을 줄일 수 있습니다."
+        ),
+    )
     parser.add_argument('--use_fallback', default=False, type=boolean)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)

@@ -313,9 +313,9 @@ class ObservationNormalizer:
             self._mask_invalid_data(norm_data)
 
             # 3) 패스스루 키
-            if "agent_route_lane_order" in data:
-                norm_data["agent_route_lane_order"] = data[
-                    "agent_route_lane_order"].to(torch.long)
+            aro = data.get("agent_route_lane_order", None)
+            if torch.is_tensor(aro):
+                norm_data["agent_route_lane_order"] = aro.to(torch.long)
 
             return norm_data
 
@@ -345,9 +345,9 @@ class ObservationNormalizer:
 
             self._mask_invalid_data(norm_data)
 
-            if "agent_route_lane_order" in data:
-                norm_data["agent_route_lane_order"] = data[
-                    "agent_route_lane_order"].to(torch.long)
+            aro = data.get("agent_route_lane_order", None)
+            if torch.is_tensor(aro):
+                norm_data["agent_route_lane_order"] = aro.to(torch.long)
 
             return norm_data
 

@@ -314,6 +314,7 @@ class DiffusionPlannerData(Dataset):
         predicted_neighbor_num,
         eval_method: str = "train",
         use_data_percent: float = 100.0,
+        use_agent_route_lane_order: bool = False,
     ):
         """
         data_dir: "/mnt/nuplan/dataset/processed"
@@ -327,6 +328,8 @@ class DiffusionPlannerData(Dataset):
         """
         self.data_dir = data_dir
         self.data_tfrecords_dir = None
+        self.use_agent_route_lane_order = bool(use_agent_route_lane_order)
+
 
         # 1) json에서 파일 리스트 로드 (순서 유지)
         loaded_list = openjson(data_list)
@@ -506,54 +509,45 @@ class DiffusionPlannerData(Dataset):
         )  # (Pnn, future_len, 4)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """한 샘플을 이름 기반 dict로 반환한다.
-        각 key별 기본 shape는 다음과 같다 (B는 배치에서 묶일 때 앞에 붙는다).
-
-        # 참고
-            - chosen_agent_num <= caching_max_agent_num
-            - chosen_lane_num <= lane_num
-            - chosen_route_lane_num <= route_num
-            - chosen_static_num <= max_static_num
-
-        womd 추가 : scenario_id /
-
-        """
         file_name = self.data_list[idx]
         data = opendata(os.path.join(self.data_dir, file_name))
         if data is None:
             raise IndexError(f"Corrupted sample at index {idx}")
+
         both_keys: List[str] = [
-            "origin_world_pose",  # (4,)  # nuplan  # womd
-            "ego_agent_past",  # (time_len, 11) # nuplan # womd
-            "ego_future_gt_3_dim",  # (future_len, 3) # nuplan  # womd
-            "ego_future_gt_11_dim",  # (future_len, 11) # nuplan # womd
-            "neighbor_agents_past",  # (chosen_agent_num, time_len, 11) # nuplan  # womd
-            "neighbor_future_gt_3_dim",  # (chosen_agent_num, future_len, 3) # nuplan # womd
-            "neighbor_future_gt_11_dim",  # (chosen_agent_num, future_len, 11) # nuplan # womd
-            "stop_sign_points",  # (stop_sign_num, safety_len, 2) # nuplan  # womd
-            "crosswalk_points",  # (crosswalk_num, safety_len, 2) # nuplan  # womd
-            "lanes",  # (chosen_lane_num, lane_len, 12) # nuplan # womd
-            "lanes_speed_limit",  # (chosen_lane_num, 1) # nuplan # womd
-            "lanes_has_speed_limit",  # (chosen_lane_num, 1) # nuplan # womd
+            "origin_world_pose",
+            "ego_agent_past",
+            "ego_future_gt_3_dim",
+            "ego_future_gt_11_dim",
+            "neighbor_agents_past",
+            "neighbor_future_gt_3_dim",
+            "neighbor_future_gt_11_dim",
+            "stop_sign_points",
+            "crosswalk_points",
+            "lanes",
+            "lanes_speed_limit",
+            "lanes_has_speed_limit",
         ]
 
         nuplan_only_keys: List[str] = [
-            "static_objects",  #check # (chosen_static_num, 10) # nuplan
-            "route_lanes",  # (chosen_route_lane_num, route_len, 12) # nuplan
-            "route_lanes_speed_limit",  # (chosen_route_lane_num, 1) # nuplan
-            "route_lanes_has_speed_limit",  # (chosen_route_lane_num, 1) # nuplan
-            "agent_route_lane_order",  # (chosen_agent_num, chosen_lane_num) # nuplan
+            "static_objects",
+            "route_lanes",
+            "route_lanes_speed_limit",
+            "route_lanes_has_speed_limit",
         ]
+        if self.use_agent_route_lane_order:
+            nuplan_only_keys.append("agent_route_lane_order")
 
         womd_only_keys: List[str] = [
-            "speed_bump_points",  # (speed_bump_num, safety_len, 2) # womd
-            "driveway_points",  # (driveway_num, safety_len, 2) # womd (환경에 따라 driveway라는 이름일 수도 있음)
-            "lane_type",  # (chosen_lane_num, 4) # womd
-            "left_line_type",  # (chosen_lane_num, 13) # womd
-            "right_line_type",  # (chosen_lane_num, 13) # womd
-            "road_edge",  # (chosen_edge_num, safety_len, 2) # womd
-            "road_edge_type",  # (chosen_edge_num, 3) # womd
+            "speed_bump_points",
+            "driveway_points",
+            "lane_type",
+            "left_line_type",
+            "right_line_type",
+            "road_edge",
+            "road_edge_type",
         ]
+
         wosac_only_keys: List[str] = []
         if self.eval_method in ("validation", "test"):
             wosac_only_keys = [
@@ -561,24 +555,26 @@ class DiffusionPlannerData(Dataset):
                 "target_z",
             ]
 
-        npz_keys: List[
-            str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
+        npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
 
         npz_key_to_new_key: Dict[str, str] = {
             "ego_future_gt_11_dim": "planner_future_11_dim",
             "driveway": "driveway_points",
         }
 
+
         sample: Dict[str, Any] = {}
         try:
             for npz_key in npz_keys:
                 value = data.get(npz_key, None)
+
+                # agent_route_lane_order를 읽는 경우에만 dtype 정리
                 if value is not None and npz_key == "agent_route_lane_order":
                     value = value.astype("int64")
+
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value
         finally:
-            # opendata가 np.load(...) 결과(NpzFile)를 반환하므로 닫아주는 게 안전
             if hasattr(data, "close"):
                 try:
                     data.close()

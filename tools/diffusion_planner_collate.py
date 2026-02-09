@@ -16,15 +16,17 @@ class DiffusionPlannerCollate:
     """
 
     def __init__(self, args: argparse.Namespace) -> None:
-        """collate 설정을 초기화한다.
-
+        """
         Args:
-            args (argparse.Namespace):
-                - caching_max_agent_num (int)
-                - caching_max_lane_num (int)
-                - caching_max_static_num (int)
+            args:
+                - use_agent_route_lane_order (bool):
+                    True면 agent_route_lane_order를 배치에 포함합니다.
+                    False면 해당 key를 완전히 제외해 CPU/RAM 부담을 줄입니다.
         """
         self.args = args
+        self._use_agent_route_lane_order: bool = bool(
+            getattr(args, "use_agent_route_lane_order", False)
+        )
 
 
     _FIXED_STACK_EGO_KEYS: Tuple[str, ...] = (
@@ -463,24 +465,6 @@ class DiffusionPlannerCollate:
         return t.dtype
 
     def _collect_batch_keys(self, batch: List[Dict[str, Any]]) -> List[str]:
-        """ 배치 안에 등장한 key를 모아서 “collate 대상 key 목록”을 만든다. (중복 제거)
-
-#### 내부에서 호출되는 함수들(핵심)
-
-* `_is_collatable_value(v)`
-
-  * **텐서로 묶을 수 있는 값인지** 판단
-  * 숫자/배열/텐서/None은 True, **문자열은 False**
-* `_is_string_container_value(v)`
-
-  * **문자열(또는 문자열 묶음)** 인지 판단
-  * 문자열이면 텐서로 바꾸지 않고 따로 처리하기 위해 사용
-
-#### 결과
-
-* `keys: List[str]` 생성
-* 그리고 `_FIXED_STACK_KEYS`에 있는 5개 key가 있으면 **keys의 맨 앞으로** 배치합니다.
-        """
         seen = set()
         keys: List[str] = []
 
@@ -489,9 +473,11 @@ class DiffusionPlannerCollate:
                 if k in seen:
                     continue
 
-                # ✅ 텐서로 묶을 수 있거나, 문자열 계열이면 key를 포함
-                if self._is_collatable_value(
-                        v) or self._is_string_container_value(v):
+                # ✅ agent_route_lane_order를 안 쓰면 아예 key를 제외
+                if (not self._use_agent_route_lane_order) and str(k) == "agent_route_lane_order":
+                    continue
+
+                if self._is_collatable_value(v) or self._is_string_container_value(v):
                     seen.add(k)
                     keys.append(k)
 
@@ -900,23 +886,6 @@ class DiffusionPlannerCollate:
         self,
         batch: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """배치(dict 리스트)를 최종 배치 텐서(dict)로 변환합니다.
-
-        변경 포인트
-        ----------
-        - 문자열(str) 계열 key는 텐서로 만들지 않고 List[str]로 반환합니다.
-          (길이 B, None은 ""로 치환)
-        - 나머지 숫자/배열 key는 기존대로 torch.Tensor 또는 None을 반환합니다.
-
-        Args:
-            batch (List[Dict[str, Any]]): 길이 B 샘플 dict 리스트
-
-        Returns:
-            Dict[str, Any]:
-                - 텐서로 만들 수 있으면 torch.Tensor
-                - 배치 전체가 None이면 None
-                - 문자열 계열이면 List[str] (length=B)
-        """
         batch_size: int = int(len(batch))
         if batch_size <= 0:
             raise ValueError("빈 batch가 들어왔습니다.")
@@ -924,13 +893,13 @@ class DiffusionPlannerCollate:
         keys: List[str] = self._collect_batch_keys(batch)
         batch_out: Dict[str, Any] = {}
 
-        # 1) 고정 5개 key (항상 텐서로)
+        # 1) 고정 5개 key
         for k in self._FIXED_STACK_EGO_KEYS:
             if k not in keys:
                 continue
             values = [sample.get(k, None) for sample in batch]
             t = self._stack_fixed_key_for_named_key(k, values)
-            batch_out[k] = t  # torch.Tensor 또는 None
+            batch_out[k] = t
 
         # 2) 나머지 key
         fixed_set = set(self._FIXED_STACK_EGO_KEYS)
@@ -940,53 +909,49 @@ class DiffusionPlannerCollate:
 
             values = [sample.get(k, None) for sample in batch]
 
-            # 전부 None이면 None 유지
             if all(v is None for v in values):
                 batch_out[k] = None
                 continue
 
-            # ✅ 문자열 계열이면 List[str]로 반환 # 어떤 str은 None일 수도 있으므로 ""로 치환
             if self._should_return_string_list_for_key(k, values):
                 batch_out[k] = self._collate_string_values_to_list(values)
                 continue
 
-            # agent_route_lane_order는 마지막에 전용 처리
+            # agent_route_lane_order는 (사용할 때만) 아래에서 처리
             if k == "agent_route_lane_order":
                 continue
 
-            # 그 외는 기존 padding+stack 경로
             t = self._pad_and_stack_variable_key_for_named_key(k, values, batch)
-            batch_out[k] = t  # torch.Tensor 또는 None
+            batch_out[k] = t
 
-        # 3) agent_route_lane_order는 -1 padding 전용 처리
-        neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
-        lanes = batch_out.get("lanes", None)
+        # 3) agent_route_lane_order는 필요할 때만 생성 (큰 int64 패딩 텐서 제거 목적)
+        if self._use_agent_route_lane_order:
+            neighbor_agents_past = batch_out.get("neighbor_agents_past", None)
+            lanes = batch_out.get("lanes", None)
 
-        if not isinstance(neighbor_agents_past, torch.Tensor):
-            raise ValueError(
-                "[Collate] neighbor_agents_past가 torch.Tensor가 아닙니다. "
-                "문자열 key 처리와 무관하게, 입력 데이터가 깨졌을 가능성이 큽니다.")
-        if not isinstance(lanes, torch.Tensor):
-            raise ValueError("[Collate] lanes가 torch.Tensor가 아닙니다. "
-                             "문자열 key 처리와 무관하게, 입력 데이터가 깨졌을 가능성이 큽니다.")
+            if not isinstance(neighbor_agents_past, torch.Tensor):
+                raise ValueError(
+                    "[Collate] use_agent_route_lane_order=True 인데 neighbor_agents_past가 torch.Tensor가 아닙니다."
+                )
+            if not isinstance(lanes, torch.Tensor):
+                raise ValueError(
+                    "[Collate] use_agent_route_lane_order=True 인데 lanes가 torch.Tensor가 아닙니다."
+                )
 
-        max_agent_num = int(neighbor_agents_past.shape[1])  # shape: ()
-        max_lane_num = int(lanes.shape[1])  # shape: ()
+            max_agent_num = int(neighbor_agents_past.shape[1])
+            max_lane_num = int(lanes.shape[1])
 
-        batch_out[
-            "agent_route_lane_order"] = self._pad_and_stack_agent_route_lane_order(
+            batch_out["agent_route_lane_order"] = self._pad_and_stack_agent_route_lane_order(
                 batch=batch,
                 max_agent_num=max_agent_num,
                 max_lane_num=max_lane_num,
             )
 
-        # 간단 정합 체크
-        agent_route_lane_order = batch_out.get("agent_route_lane_order", None)
-        if isinstance(agent_route_lane_order, torch.Tensor):
-            assert int(agent_route_lane_order.shape[1]) == int(
-                neighbor_agents_past.shape[1]
-            ), ("agent_route_lane_order의 agent 수와 neighbor_agents_past의 agent 수가 "
-                "일치하지 않습니다.")
+            # 정합 체크(있을 때만)
+            aro = batch_out.get("agent_route_lane_order", None)
+            if isinstance(aro, torch.Tensor):
+                assert int(aro.shape[1]) == int(neighbor_agents_past.shape[1]), \
+                    "agent_route_lane_order의 agent 수와 neighbor_agents_past의 agent 수가 일치하지 않습니다."
 
         return batch_out
 

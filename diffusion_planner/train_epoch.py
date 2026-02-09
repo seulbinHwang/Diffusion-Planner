@@ -28,6 +28,97 @@ from typing import Iterator
 import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
+from typing import Any, List, Optional
+import torch
+
+
+def _get_cuda_inflight_step_limit(args: Any) -> int:
+    """args에서 GPU in-flight step 제한 값을 읽어 안전한 정수로 만든다.
+
+    목적:
+        - args.cuda_inflight_step_limit 값을 읽어옵니다.
+        - 0 이하이면 기능을 끕니다.
+        - 1 이상이면 "동시에 GPU에서 처리 중인 step"의 최대 개수로 사용합니다.
+
+    Args:
+        args (Any):
+            학습 설정 객체.
+            - cuda_inflight_step_limit (int)가 있을 수 있습니다.
+
+    Returns:
+        int:
+            - 0 이하: 비활성화
+            - 1 이상: 최대 in-flight step 개수
+    """
+    try:
+        return int(getattr(args, "cuda_inflight_step_limit", 0))
+    except Exception:
+        return 0
+
+
+class _CudaInFlightStepLimiter:
+    """GPU가 처리 중인 step이 너무 많이 쌓이지 않게 제한한다.
+
+    배경:
+        - 배치를 GPU로 옮길 때 non_blocking=True이면, CPU는 "복사 요청"만 걸고 바로 다음으로 넘어갈 수 있습니다.
+        - CPU가 너무 빨리 다음 배치로 넘어가면, 아직 복사가 끝나지 않은 pinned 메모리(배치 버퍼)가
+          여러 step 동안 동시에 남아 있을 수 있습니다.
+        - 이 상태가 반복되면 pinned 메모리 사용량이 계속 올라갈 수 있습니다.
+
+    해결 방식:
+        - 매 step 끝에 CUDA 이벤트를 하나 기록합니다.
+        - 이벤트가 max_inflight_steps 보다 많이 쌓이면,
+          가장 오래된 이벤트 1개만 synchronize() 해서 GPU가 따라올 시간을 줍니다.
+        - 즉, "매 step마다 전부 기다리는 것"이 아니라,
+          "너무 앞서가기 시작할 때만 조금 기다리는" 방식입니다.
+
+    Notes:
+        - 이 로직은 학습 결과(손실/업데이트 값)를 바꾸지 않습니다.
+        - CUDA가 아니거나, limit이 0 이하면 아무 것도 하지 않습니다.
+    """
+
+    def __init__(self, max_inflight_steps: int) -> None:
+        """제한기 생성.
+
+        Args:
+            max_inflight_steps (int):
+                동시에 GPU에서 처리 중인 step 최대 개수.
+                - 1 이상이어야 의미가 있습니다.
+        """
+        self._max_inflight_steps: int = max(1, int(max_inflight_steps))
+        self._events: List[torch.cuda.Event] = []
+
+    def record_step_end_and_maybe_wait(self) -> None:
+        """현재 step 끝에 이벤트를 기록하고, 필요하면 오래된 step 1개만 기다린다.
+
+        Returns:
+            None
+        """
+        if not torch.cuda.is_available():
+            return
+
+        evt = torch.cuda.Event(enable_timing=False)
+        # 현재 CUDA stream에 "여기까지의 작업이 끝났는지"를 표시하는 이벤트를 기록합니다.
+        evt.record()
+        self._events.append(evt)
+
+        # 너무 많이 쌓였으면, 가장 오래된 1개만 기다립니다.
+        if len(self._events) > self._max_inflight_steps:
+            oldest = self._events.pop(0)
+            oldest.synchronize()
+
+    def flush(self) -> None:
+        """남아 있는 이벤트를 모두 기다려서 정리한다.
+
+        Returns:
+            None
+        """
+        if not torch.cuda.is_available():
+            self._events.clear()
+            return
+
+        while self._events:
+            self._events.pop(0).synchronize()
 
 # name -> 호출 횟수 / 누적 시간(ms)
 _PROFILE_CALL_COUNT: Dict[str, int] = {}
@@ -288,28 +379,32 @@ def _maybe_run_torch_profiler_for_backward_step(
 
 
 def _move_batch_to_device(
-        batch: Dict[str, Any],
-        device: str,
+    batch: Dict[str, Any],
+    device: str,
 ) -> Dict[str, Any]:
     """배치 dict에서 torch.Tensor만 device로 옮기고, 나머지(None 포함)는 그대로 둔다."""
     agent_route_lane_order_agent_num = None
     neighbor_agents_agent_num = None
+
     batch_on_device: Dict[str, Any] = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
             batch_on_device[key] = value.to(device, non_blocking=True)
         else:
-            batch_on_device[key] = value  # None / metadata 등 유지
-        if key == "agent_route_lane_order":
-            agent_route_lane_order_agent_num = int(
-                batch_on_device[key].shape[1])
-        elif key == "neighbor_agents_past":
+            batch_on_device[key] = value
+
+        if key == "agent_route_lane_order" and isinstance(batch_on_device[key], torch.Tensor):
+            agent_route_lane_order_agent_num = int(batch_on_device[key].shape[1])
+        elif key == "neighbor_agents_past" and isinstance(batch_on_device[key], torch.Tensor):
             neighbor_agents_agent_num = int(batch_on_device[key].shape[1])
+
     if agent_route_lane_order_agent_num is not None and neighbor_agents_agent_num is not None:
         assert agent_route_lane_order_agent_num == neighbor_agents_agent_num, \
             f"agent_route_lane_order agent num ({agent_route_lane_order_agent_num}) " \
             f"!= neighbor_agents_past agent num ({neighbor_agents_agent_num})"
+
     return batch_on_device
+
 
 
 def assert_cur_future_valid_mask_np(
@@ -395,8 +490,8 @@ def _prepare_batch_for_device(
     """
     batch_on_device: Dict[str, Any] = _move_batch_to_device(batch, device)
     aro = batch_on_device.get("agent_route_lane_order", None)
-    if isinstance(aro, torch.Tensor):
-        batch_on_device["agent_route_lane_order"] = aro.long()
+    if isinstance(aro, torch.Tensor) and aro.dtype != torch.long:
+        batch_on_device["agent_route_lane_order"] = aro.to(torch.long)
 
     # outputs 분리 (정답은 반드시 Tensor여야 함)
     target_keys = {
@@ -916,6 +1011,12 @@ def train_epoch(
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
+    # ✅ [ADD] in-flight step 제한기 준비 (CUDA에서만 동작)
+    cuda_step_limiter: Optional[_CudaInFlightStepLimiter] = None
+    inflight_limit: int = _get_cuda_inflight_step_limit(args)
+    if (stat_device.type == "cuda") and (inflight_limit > 0) and torch.cuda.is_available():
+        cuda_step_limiter = _CudaInFlightStepLimiter(max_inflight_steps=inflight_limit)
+
     for batch in data_loader:
         # 1) device 이동 + 상한 클리핑 + 정답 분리
         inputs, outputs = _prepare_batch_for_device(
@@ -1001,6 +1102,14 @@ def train_epoch(
 
         # 9) 전역 스텝 누적
         args._global_update_step += 1
+
+        # ✅ [ADD] (핵심) 너무 앞서가면 오래된 step 1개만 기다려서 pinned 메모리 누적을 끊음
+        if cuda_step_limiter is not None:
+            cuda_step_limiter.record_step_end_and_maybe_wait()
+
+    # ✅ [ADD] epoch 끝에서 남은 이벤트 정리(최대 1~2개 수준)
+    if cuda_step_limiter is not None:
+        cuda_step_limiter.flush()
 
     # --- epoch 평균 손실 계산(DDP면 all_reduce 포함) ---
     epoch_mean_loss: Dict[str, float] = _finalize_epoch_mean_loss(
