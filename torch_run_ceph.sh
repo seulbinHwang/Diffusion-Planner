@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# ============================================================
+# (ADD) OOM 상황에서 "학습 런처"가 먼저 죽기 쉽게(best-effort)
+# - 권한/환경에 따라 실패할 수 있으니 실패해도 무시합니다.
+# ============================================================
+if [[ -w /proc/self/oom_score_adj ]]; then
+  ( echo 500 > /proc/self/oom_score_adj ) 2>/dev/null || true
+fi
+
 export WANDB_DEBUG=0
 export CUDA_HOME="$CONDA_PREFIX"
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -47,20 +55,16 @@ else
   export NCCL_DEBUG=WARN
   export NCCL_DEBUG_SUBSYS=INIT
 
-  # 디버그용 env는 굳이 켤 필요 없음(에러 때만 의미라 켜도 되지만, 깔끔하게 off)
   unset TORCH_SHOW_CPP_STACKTRACES || true
   unset PYTHONFAULTHANDLER || true
   unset TORCH_NCCL_ASYNC_ERROR_HANDLING || true
   unset TORCH_DISABLE_ADDR2LINE || true
 
-  # torchelastic 에러 파일은 "에러 때만" 쓰이므로 /tmp로(파일 I/O 최소 + Ceph 회피)
   export TORCHELASTIC_ERROR_FILE="/tmp/torchelastic_error_${RUN_ID}.json"
 
-  # unbuffered 출력은 끔(출력 I/O 부담 감소)
   unset PYTHONUNBUFFERED || true
   PY_ARGS=()
 
-  # torchrun의 rank별 파일 리다이렉트/tee를 완전히 끔(핵심)
   TORCHRUN_LOG_ARGS=()
 fi
 

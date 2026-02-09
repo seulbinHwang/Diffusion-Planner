@@ -1,5 +1,36 @@
 import os
 from typing import Tuple, Any
+
+def _try_set_oom_score_adj(value: int) -> None:
+    """OOM 상황에서 이 파이썬 프로세스가 먼저 종료될 가능성을 높입니다.
+
+    Args:
+        value (int):
+            /proc/self/oom_score_adj 에 쓸 값.
+            값이 클수록(양수) OOM 때 먼저 종료될 후보가 될 가능성이 커집니다.
+
+    Returns:
+        None
+    """
+    try:
+        path = "/proc/self/oom_score_adj"
+        if not os.path.exists(path):
+            return
+        # 권한/정책에 따라 실패할 수 있으므로, 실패해도 조용히 무시합니다.
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(int(value)))
+    except Exception:
+        pass
+
+# 기본값 500 (환경변수로 바꾸고 싶으면 DP_OOM_SCORE_ADJ=700 같은 식으로)
+_oom_adj_str = os.environ.get("DP_OOM_SCORE_ADJ", "500")
+try:
+    _oom_adj = int(_oom_adj_str)
+except Exception:
+    _oom_adj = 500
+
+_try_set_oom_score_adj(_oom_adj)
+
 # 128 MiB 단위로 메모리 청크를 잘라서 할당하도록 설정
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 from diffusion_planner.utils.data_augmentation import StatePerturbation
