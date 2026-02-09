@@ -132,11 +132,11 @@ spec:
         requests:
           cpu: "24"
           memory: "192Gi"
-          nvidia.com/gpu: "5"
+          nvidia.com/gpu: "6"
         limits:
           cpu: "24"
           memory: "192Gi"
-          nvidia.com/gpu: "5"
+          nvidia.com/gpu: "6"
 
       volumeMounts:
         - name: nuplan-storage
