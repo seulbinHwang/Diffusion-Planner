@@ -302,6 +302,12 @@ def get_args():
             "학습에서 사용하지 않으면 False로 두면 CPU/RAM 사용을 줄일 수 있습니다."
         ),
     )
+    parser.add_argument(
+        '--use_cuda_prefetch',
+        default=True,
+        type=boolean,
+        help='True이면 다음 배치를 별도 CUDA stream에서 미리 GPU로 옮깁니다(속도 유지/개선 + pinned CPU 메모리 피크 완화 기대).',
+    )
     parser.add_argument('--use_fallback', default=False, type=boolean)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)

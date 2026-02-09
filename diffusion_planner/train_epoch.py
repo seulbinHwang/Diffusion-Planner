@@ -120,6 +120,149 @@ class _CudaInFlightStepLimiter:
         while self._events:
             self._events.pop(0).synchronize()
 
+
+from typing import Callable, Iterable
+
+
+def _should_use_cuda_prefetch(args: argparse.Namespace) -> bool:
+    """CUDA prefetch를 사용할지 결정합니다.
+
+    Args:
+        args (argparse.Namespace):
+            - args.device: "cuda" 또는 "cuda:0" 등
+            - args.use_cuda_prefetch: (선택) True/False
+            - args.pin_mem: (선택) pin_memory 사용 여부
+
+    Returns:
+        bool:
+            - True: CUDA prefetch 사용
+            - False: 기존 방식 사용
+    """
+    use_flag = bool(getattr(args, "use_cuda_prefetch", False))
+    if not use_flag:
+        return False
+
+    dev_str = str(getattr(args, "device", "cpu")).lower()
+    if not dev_str.startswith("cuda"):
+        return False
+
+    if not torch.cuda.is_available():
+        return False
+
+    # pin_memory가 꺼져 있으면 non_blocking이 기대만큼 안 먹을 수 있어서,
+    # 그래도 동작은 하지만 효과가 약할 가능성이 큼
+    return True
+
+
+def _record_stream_for_nested(obj: Any, stream: "torch.cuda.Stream") -> None:
+    """중첩 구조(dict/list/tuple) 안의 CUDA 텐서들에 record_stream을 적용합니다.
+
+    목적:
+        - prefetch stream에서 만들어진 CUDA 텐서가
+          메인 stream에서 사용될 예정임을 알려서,
+          stream 간 메모리 재사용 꼬임을 방지합니다.
+
+    Args:
+        obj (Any):
+            torch.Tensor 또는 dict/list/tuple로 중첩된 구조
+        stream (torch.cuda.Stream):
+            메인에서 사용할 stream (보통 torch.cuda.current_stream())
+
+    Returns:
+        None
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.is_cuda:
+            obj.record_stream(stream)
+        return
+
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _record_stream_for_nested(v, stream)
+        return
+
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            _record_stream_for_nested(v, stream)
+        return
+
+    return
+
+
+class CudaPreparedBatchPrefetcher:
+    """다음 배치를 별도 CUDA stream에서 미리 GPU로 옮기는 프리패처.
+
+    동작 방식:
+        - DataLoader에서 다음 CPU 배치를 하나 미리 가져옵니다.
+        - prefetch 전용 CUDA stream에서 _prepare_batch_for_device(...)를 실행해
+          (inputs, outputs)를 GPU로 올려둡니다.
+        - 학습 루프는 다음 step 시작 시점에 wait_stream만 걸고
+          이미 준비된 (inputs, outputs)를 바로 사용합니다.
+
+    메모리/성능 관점:
+        - CPU pinned 메모리는 "복사가 끝날 때까지" 잡히는데,
+          복사를 더 일찍 시작하면 해제 시점이 앞당겨질 수 있습니다.
+        - 보통 step 시간은 유지되거나 개선될 가능성이 있습니다.
+        - 대신 GPU에는 "다음 배치 1개"가 추가로 올라가므로 GPU 메모리는 증가합니다.
+    """
+
+    def __init__(
+        self,
+        data_loader: Iterable[Dict[str, Any]],
+        device: str,
+        prepare_fn: Callable[[Dict[str, Any], str], Tuple[Dict[str, Any], Dict[str, torch.Tensor]]],
+    ) -> None:
+        self._data_loader = data_loader
+        self._iter = iter(data_loader)
+        self._device = str(device)
+        self._prepare_fn = prepare_fn
+
+        # 현재 device 기준 stream (DDP면 각 rank가 자기 device로 이미 set_device 되어 있어야 함)
+        self._prefetch_stream: torch.cuda.Stream = torch.cuda.Stream()
+
+        self._next_prepared: Optional[Tuple[Dict[str, Any], Dict[str, torch.Tensor]]] = None
+        self._next_cpu_batch_ref: Optional[Dict[str, Any]] = None
+
+        self._preload()
+
+    def __iter__(self) -> "CudaPreparedBatchPrefetcher":
+        return self
+
+    def _preload(self) -> None:
+        """다음 배치를 prefetch stream에서 GPU로 미리 올립니다."""
+        try:
+            cpu_batch = next(self._iter)
+        except StopIteration:
+            self._next_prepared = None
+            self._next_cpu_batch_ref = None
+            return
+
+        # CPU batch 참조를 들고 있어야(조기 해제 방지) 복사가 안전합니다.
+        self._next_cpu_batch_ref = cpu_batch
+
+        with torch.cuda.stream(self._prefetch_stream):
+            self._next_prepared = self._prepare_fn(cpu_batch, self._device)
+
+    def __next__(self) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+        if self._next_prepared is None:
+            raise StopIteration
+
+        # 메인 stream이 prefetch stream의 작업이 끝날 때까지 기다립니다.
+        torch.cuda.current_stream().wait_stream(self._prefetch_stream)
+
+        prepared = self._next_prepared
+
+        # 이 텐서들이 메인 stream에서 사용될 예정임을 기록(안전장치)
+        _record_stream_for_nested(prepared, torch.cuda.current_stream())
+
+        # CPU batch 참조 해제(다음 preload에서 갱신됨)
+        self._next_cpu_batch_ref = None
+
+        # 다음 배치를 다시 미리 올립니다.
+        self._preload()
+        return prepared
+
+
 # name -> 호출 횟수 / 누적 시간(ms)
 _PROFILE_CALL_COUNT: Dict[str, int] = {}
 _PROFILE_TOTAL_MS: Dict[str, float] = {}
@@ -984,7 +1127,6 @@ def _finalize_epoch_mean_loss(
 
 
 # =====================================================================
-
 def train_epoch(
     data_loader,
     model: nn.Module,
@@ -997,121 +1139,196 @@ def train_epoch(
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행합니다.
 
     변경점:
-      - tqdm를 완전히 제거해서, 배치 단위 출력/로그 갱신을 없앱니다.
-      - 나머지 학습 로직(누적합 sum/count, backward/step, EMA 등)은 그대로 유지합니다.
+        - use_cuda_prefetch=True 이면,
+          다음 배치를 별도 CUDA stream에서 미리 GPU로 옮긴 뒤(inputs/outputs),
+          학습 루프는 준비된 배치를 바로 사용합니다.
+        - 기존 in-flight step limiter(cuda_inflight_step_limit)와 함께 써도 됩니다.
+          (CPU가 GPU를 너무 많이 앞지르지 않도록 안전장치 역할)
 
     Returns:
-        - epoch_mean_loss: 손실 항목별 epoch 평균 dict (Dict[str, float])
-        - epoch_mean_loss["loss"]: 최종 스칼라 손실 값 (float)
+        - epoch_mean_loss: 손실 항목별 epoch 평균 dict
+        - epoch_mean_loss["loss"]: 최종 손실 값
     """
     model.train()
 
-    # 에폭 통계(누적합/횟수)는 loss가 존재하는 device에 맞춰 저장합니다.
     stat_device: torch.device = torch.device(args.device)
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
-    # ✅ [ADD] in-flight step 제한기 준비 (CUDA에서만 동작)
+    # ✅ in-flight step 제한기 (기존 유지)
     cuda_step_limiter: Optional[_CudaInFlightStepLimiter] = None
     inflight_limit: int = _get_cuda_inflight_step_limit(args)
     if (stat_device.type == "cuda") and (inflight_limit > 0) and torch.cuda.is_available():
         cuda_step_limiter = _CudaInFlightStepLimiter(max_inflight_steps=inflight_limit)
 
-    for batch in data_loader:
-        # 1) device 이동 + 상한 클리핑 + 정답 분리
-        inputs, outputs = _prepare_batch_for_device(
-            batch,
-            device=args.device,
+    use_prefetch: bool = _should_use_cuda_prefetch(args)
+
+    if use_prefetch:
+        batch_iter = CudaPreparedBatchPrefetcher(
+            data_loader=data_loader,
+            device=str(args.device),
+            prepare_fn=_prepare_batch_for_device,
         )
 
-        # 2) 관측 정규화
-        norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
+        for (inputs, outputs) in batch_iter:
+            # 1) 관측 정규화
+            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
 
-        outputs["ego_future_gt_4_dim"] = args.state_normalizer(
-            data=outputs["ego_future_gt_4_dim"],
-            valid_mask=outputs["ego_future_gt_is_valid"],
-        )
-        outputs["near_future_gt_4_dim"] = args.state_normalizer(
-            data=outputs["near_future_gt_4_dim"],
-            valid_mask=outputs["near_future_gt_is_valid"],
-        )
-
-        # 3) grad 초기화
-        if args.use_deepspeed and hasattr(model, "zero_grad"):
-            model.zero_grad()
-        else:
-            optimizer.zero_grad(set_to_none=True)
-
-        # base_model: DDP/DeepSpeed 래퍼 제거
-        base_model = ddp.get_model(model, args.ddp)
-        sde_marginal_prob = base_model.sde.marginal_prob
-
-        # 4) diffusion loss
-        raw_loss_dict: Dict[str, torch.Tensor] = {}
-        raw_loss_dict, _ = diffusion_loss_func(
-            args=args,
-            model=model,
-            norm_inputs=norm_inputs,
-            norm_outputs=outputs,
-            marginal_prob=sde_marginal_prob,
-            state_normalizer=args.state_normalizer,
-            loss_dict=raw_loss_dict,
-            model_type=args.diffusion_model_type,
-            observation_normalizer=args.observation_normalizer,
-        )
-
-        # 5) feasible weight 포함 최종 loss 합성
-        loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
-            loss_dict=raw_loss_dict,
-            args=args,
-            model=model,
-            norm_inputs=norm_inputs,
-            batch_num_in_all_epoch=batch_num_in_all_epoch,
-        )
-
-        # 6) step 통계 누적: CPU로 가져오지 않고 sum/count만 갱신
-        _accumulate_epoch_loss_sums_inplace(
-            loss_sums=epoch_loss_sums,
-            loss_counts=epoch_loss_counts,
-            loss_dict=loss_dict,
-            device=stat_device,
-        )
-
-        # 7) backward + step
-        enable_profile: bool = bool(getattr(args, "profile_feasible", False))
-        if enable_profile and _is_main_process():
-            print("===============[PROFILE train_epoch ENABLED]===============")
-
-        device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
-        with profile_block(
-            "train_epoch.train_epoch._backward_and_step",
-            enabled=enable_profile,
-            device_type=device_type,
-        ):
-            _backward_and_step(
-                loss_dict=loss_dict,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                args=args,
+            outputs["ego_future_gt_4_dim"] = args.state_normalizer(
+                data=outputs["ego_future_gt_4_dim"],
+                valid_mask=outputs["ego_future_gt_is_valid"],
+            )
+            outputs["near_future_gt_4_dim"] = args.state_normalizer(
+                data=outputs["near_future_gt_4_dim"],
+                valid_mask=outputs["near_future_gt_is_valid"],
             )
 
-        # 8) WD warmdown, EMA 업데이트
-        _apply_weight_decay_warmdown(optimizer)
-        _update_ema_if_needed(ema, model)
+            # 2) grad 초기화
+            if args.use_deepspeed and hasattr(model, "zero_grad"):
+                model.zero_grad()
+            else:
+                optimizer.zero_grad(set_to_none=True)
 
-        # 9) 전역 스텝 누적
-        args._global_update_step += 1
+            base_model = ddp.get_model(model, args.ddp)
+            sde_marginal_prob = base_model.sde.marginal_prob
 
-        # ✅ [ADD] (핵심) 너무 앞서가면 오래된 step 1개만 기다려서 pinned 메모리 누적을 끊음
-        if cuda_step_limiter is not None:
-            cuda_step_limiter.record_step_end_and_maybe_wait()
+            # 3) loss
+            raw_loss_dict: Dict[str, torch.Tensor] = {}
+            raw_loss_dict, _ = diffusion_loss_func(
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs,
+                norm_outputs=outputs,
+                marginal_prob=sde_marginal_prob,
+                state_normalizer=args.state_normalizer,
+                loss_dict=raw_loss_dict,
+                model_type=args.diffusion_model_type,
+                observation_normalizer=args.observation_normalizer,
+            )
 
-    # ✅ [ADD] epoch 끝에서 남은 이벤트 정리(최대 1~2개 수준)
+            loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
+                loss_dict=raw_loss_dict,
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs,
+                batch_num_in_all_epoch=batch_num_in_all_epoch,
+            )
+
+            # 4) 통계 누적
+            _accumulate_epoch_loss_sums_inplace(
+                loss_sums=epoch_loss_sums,
+                loss_counts=epoch_loss_counts,
+                loss_dict=loss_dict,
+                device=stat_device,
+            )
+
+            # 5) backward + step
+            enable_profile: bool = bool(getattr(args, "profile_feasible", False))
+            if enable_profile and _is_main_process():
+                print("===============[PROFILE train_epoch ENABLED]===============")
+
+            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+            with profile_block(
+                "train_epoch.train_epoch._backward_and_step",
+                enabled=enable_profile,
+                device_type=device_type,
+            ):
+                _backward_and_step(
+                    loss_dict=loss_dict,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                )
+
+            _apply_weight_decay_warmdown(optimizer)
+            _update_ema_if_needed(ema, model)
+            args._global_update_step += 1
+
+            # ✅ 기존 안전장치 유지
+            if cuda_step_limiter is not None:
+                cuda_step_limiter.record_step_end_and_maybe_wait()
+
+    else:
+        # 기존 방식(프리패치 OFF)
+        for batch in data_loader:
+            inputs, outputs = _prepare_batch_for_device(batch, device=args.device)
+
+            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
+
+            outputs["ego_future_gt_4_dim"] = args.state_normalizer(
+                data=outputs["ego_future_gt_4_dim"],
+                valid_mask=outputs["ego_future_gt_is_valid"],
+            )
+            outputs["near_future_gt_4_dim"] = args.state_normalizer(
+                data=outputs["near_future_gt_4_dim"],
+                valid_mask=outputs["near_future_gt_is_valid"],
+            )
+
+            if args.use_deepspeed and hasattr(model, "zero_grad"):
+                model.zero_grad()
+            else:
+                optimizer.zero_grad(set_to_none=True)
+
+            base_model = ddp.get_model(model, args.ddp)
+            sde_marginal_prob = base_model.sde.marginal_prob
+
+            raw_loss_dict: Dict[str, torch.Tensor] = {}
+            raw_loss_dict, _ = diffusion_loss_func(
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs,
+                norm_outputs=outputs,
+                marginal_prob=sde_marginal_prob,
+                state_normalizer=args.state_normalizer,
+                loss_dict=raw_loss_dict,
+                model_type=args.diffusion_model_type,
+                observation_normalizer=args.observation_normalizer,
+            )
+
+            loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
+                loss_dict=raw_loss_dict,
+                args=args,
+                model=model,
+                norm_inputs=norm_inputs,
+                batch_num_in_all_epoch=batch_num_in_all_epoch,
+            )
+
+            _accumulate_epoch_loss_sums_inplace(
+                loss_sums=epoch_loss_sums,
+                loss_counts=epoch_loss_counts,
+                loss_dict=loss_dict,
+                device=stat_device,
+            )
+
+            enable_profile: bool = bool(getattr(args, "profile_feasible", False))
+            if enable_profile and _is_main_process():
+                print("===============[PROFILE train_epoch ENABLED]===============")
+
+            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+            with profile_block(
+                "train_epoch.train_epoch._backward_and_step",
+                enabled=enable_profile,
+                device_type=device_type,
+            ):
+                _backward_and_step(
+                    loss_dict=loss_dict,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    args=args,
+                )
+
+            _apply_weight_decay_warmdown(optimizer)
+            _update_ema_if_needed(ema, model)
+            args._global_update_step += 1
+
+            if cuda_step_limiter is not None:
+                cuda_step_limiter.record_step_end_and_maybe_wait()
+
     if cuda_step_limiter is not None:
         cuda_step_limiter.flush()
 
-    # --- epoch 평균 손실 계산(DDP면 all_reduce 포함) ---
     epoch_mean_loss: Dict[str, float] = _finalize_epoch_mean_loss(
         loss_sums=epoch_loss_sums,
         loss_counts=epoch_loss_counts,
