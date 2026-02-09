@@ -91,7 +91,7 @@ spec:
           export PATH=/mnt/work/miniforge/bin:$PATH
           source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
           conda activate base
-          conda activate diffusion_planner
+          conda activate diffusion_planner_fa
 
           pip install --no-cache-dir wandb
           wandb login --relogin "$WANDB_API_KEY"
