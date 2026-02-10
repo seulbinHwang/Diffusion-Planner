@@ -282,7 +282,7 @@ def get_args():
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--prefetch_factor', type=int, default=4)
+    parser.add_argument('--prefetch_factor', type=int, default=8)
 
     parser.add_argument(
         '--use_agent_route_lane_order',
