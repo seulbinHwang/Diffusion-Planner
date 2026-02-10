@@ -279,8 +279,8 @@ def get_args():
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
-    parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--prefetch_factor',type=int,default=4)
+    parser.add_argument('--num_workers', default=3, type=int)
+    parser.add_argument('--prefetch_factor',type=int,default=3)
     # ✅ [ADD] GPU in-flight step 제한(가벼운 동기화)
     parser.add_argument(
         '--cuda_inflight_step_limit',
