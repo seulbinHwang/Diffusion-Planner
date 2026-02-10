@@ -130,12 +130,12 @@ spec:
 
       resources:
         requests:
-          cpu: "32"
-          memory: "256Gi"
+          cpu: "96"
+          memory: "1536Gi"
           nvidia.com/gpu: "6"
         limits:
-          cpu: "32"
-          memory: "256Gi"
+          cpu: "96"
+          memory: "1536Gi"
           nvidia.com/gpu: "6"
 
       volumeMounts:
