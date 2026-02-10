@@ -359,7 +359,7 @@ def get_args():
     parser.add_argument('--xy_yaw_metric_interval_steps',
                         type=int,
                         help='save frequency',
-                        default=10)
+                        default=50)
     parser.add_argument('--batch_size',
                         type=int,
                         help='batch size (default: 2048)',
