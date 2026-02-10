@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: hsb-npc-training
+  name: hsb-npc-training-2
   namespace: p-pnc
   annotations:
     sidecar.istio.io/inject: "false"
 spec:
   terminationGracePeriodSeconds: 120
-  restartPolicy: OnFailure #Never
+  restartPolicy: Never
   nodeSelector:
     mlx.navercorp.com/zone: private-h100-ib-naverlabs-0
 
@@ -22,7 +22,7 @@ spec:
   volumes:
     - name: nuplan-storage
       persistentVolumeClaim:
-        claimName: pvc-rbd-diffusion-planner-djkim
+        claimName: kks-sa-static-map
     - name: dshm2
       emptyDir:
         medium: Memory
@@ -91,7 +91,7 @@ spec:
           export PATH=/mnt/work/miniforge/bin:$PATH
           source /mnt/nuplan/miniforge/etc/profile.d/conda.sh
           conda activate base
-          conda activate diffusion_planner_fa
+          conda activate diffusion_planner
 
           pip install --no-cache-dir wandb
           wandb login --relogin "$WANDB_API_KEY"
@@ -130,12 +130,12 @@ spec:
 
       resources:
         requests:
-          cpu: "84"
-          memory: "1344Gi"
+          cpu: "32"
+          memory: "256Gi"
           nvidia.com/gpu: "6"
         limits:
-          cpu: "96"
-          memory: "1536Gi"
+          cpu: "32"
+          memory: "256Gi"
           nvidia.com/gpu: "6"
 
       volumeMounts:
