@@ -1125,8 +1125,6 @@ def _finalize_epoch_mean_loss(
 
     return epoch_mean_loss
 
-
-# =====================================================================
 def train_epoch(
     data_loader,
     model: nn.Module,
@@ -1139,15 +1137,14 @@ def train_epoch(
     """하나의 epoch 동안 DataLoader 전체를 돌며 학습을 수행합니다.
 
     변경점:
-        - use_cuda_prefetch=True 이면,
-          다음 배치를 별도 CUDA stream에서 미리 GPU로 옮긴 뒤(inputs/outputs),
-          학습 루프는 준비된 배치를 바로 사용합니다.
-        - 기존 in-flight step limiter(cuda_inflight_step_limit)와 함께 써도 됩니다.
-          (CPU가 GPU를 너무 많이 앞지르지 않도록 안전장치 역할)
+        - cuda_inflight_step_limit 기능 제거
+        - use_cuda_prefetch(CUDA prefetch) 기능 제거
+        - 항상 "기존 방식"으로 배치를 받아서 학습합니다.
 
     Returns:
-        - epoch_mean_loss: 손실 항목별 epoch 평균 dict
-        - epoch_mean_loss["loss"]: 최종 손실 값
+        Tuple[Dict[str, float], float]:
+            - epoch_mean_loss: 손실 항목별 epoch 평균 dict
+            - epoch_mean_loss.get("loss"): 최종 손실 값 (없으면 NaN)
     """
     model.train()
 
@@ -1155,179 +1152,84 @@ def train_epoch(
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
-    # ✅ in-flight step 제한기 (기존 유지)
-    cuda_step_limiter: Optional[_CudaInFlightStepLimiter] = None
-    inflight_limit: int = _get_cuda_inflight_step_limit(args)
-    if (stat_device.type == "cuda") and (inflight_limit > 0) and torch.cuda.is_available():
-        cuda_step_limiter = _CudaInFlightStepLimiter(max_inflight_steps=inflight_limit)
+    for batch in data_loader:
+        inputs, outputs = _prepare_batch_for_device(batch, device=args.device)
 
-    use_prefetch: bool = _should_use_cuda_prefetch(args)
+        # 1) 관측 정규화
+        norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
 
-    if use_prefetch:
-        batch_iter = CudaPreparedBatchPrefetcher(
-            data_loader=data_loader,
-            device=str(args.device),
-            prepare_fn=_prepare_batch_for_device,
+        outputs["ego_future_gt_4_dim"] = args.state_normalizer(
+            data=outputs["ego_future_gt_4_dim"],
+            valid_mask=outputs["ego_future_gt_is_valid"],
+        )
+        outputs["near_future_gt_4_dim"] = args.state_normalizer(
+            data=outputs["near_future_gt_4_dim"],
+            valid_mask=outputs["near_future_gt_is_valid"],
         )
 
-        for (inputs, outputs) in batch_iter:
-            # 1) 관측 정규화
-            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
+        # 2) grad 초기화
+        if args.use_deepspeed and hasattr(model, "zero_grad"):
+            model.zero_grad()
+        else:
+            optimizer.zero_grad(set_to_none=True)
 
-            outputs["ego_future_gt_4_dim"] = args.state_normalizer(
-                data=outputs["ego_future_gt_4_dim"],
-                valid_mask=outputs["ego_future_gt_is_valid"],
-            )
-            outputs["near_future_gt_4_dim"] = args.state_normalizer(
-                data=outputs["near_future_gt_4_dim"],
-                valid_mask=outputs["near_future_gt_is_valid"],
-            )
+        base_model = ddp.get_model(model, args.ddp)
+        sde_marginal_prob = base_model.sde.marginal_prob
 
-            # 2) grad 초기화
-            if args.use_deepspeed and hasattr(model, "zero_grad"):
-                model.zero_grad()
-            else:
-                optimizer.zero_grad(set_to_none=True)
+        # 3) loss
+        raw_loss_dict: Dict[str, torch.Tensor] = {}
+        raw_loss_dict, _ = diffusion_loss_func(
+            args=args,
+            model=model,
+            norm_inputs=norm_inputs,
+            norm_outputs=outputs,
+            marginal_prob=sde_marginal_prob,
+            state_normalizer=args.state_normalizer,
+            loss_dict=raw_loss_dict,
+            model_type=args.diffusion_model_type,
+            observation_normalizer=args.observation_normalizer,
+        )
 
-            base_model = ddp.get_model(model, args.ddp)
-            sde_marginal_prob = base_model.sde.marginal_prob
+        loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
+            loss_dict=raw_loss_dict,
+            args=args,
+            model=model,
+            norm_inputs=norm_inputs,
+            batch_num_in_all_epoch=batch_num_in_all_epoch,
+        )
 
-            # 3) loss
-            raw_loss_dict: Dict[str, torch.Tensor] = {}
-            raw_loss_dict, _ = diffusion_loss_func(
-                args=args,
-                model=model,
-                norm_inputs=norm_inputs,
-                norm_outputs=outputs,
-                marginal_prob=sde_marginal_prob,
-                state_normalizer=args.state_normalizer,
-                loss_dict=raw_loss_dict,
-                model_type=args.diffusion_model_type,
-                observation_normalizer=args.observation_normalizer,
-            )
+        # 4) 통계 누적
+        _accumulate_epoch_loss_sums_inplace(
+            loss_sums=epoch_loss_sums,
+            loss_counts=epoch_loss_counts,
+            loss_dict=loss_dict,
+            device=stat_device,
+        )
 
-            loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
-                loss_dict=raw_loss_dict,
-                args=args,
-                model=model,
-                norm_inputs=norm_inputs,
-                batch_num_in_all_epoch=batch_num_in_all_epoch,
-            )
+        # 5) backward + step
+        enable_profile: bool = bool(getattr(args, "profile_feasible", False))
+        if enable_profile and _is_main_process():
+            print("===============[PROFILE train_epoch ENABLED]===============")
 
-            # 4) 통계 누적
-            _accumulate_epoch_loss_sums_inplace(
-                loss_sums=epoch_loss_sums,
-                loss_counts=epoch_loss_counts,
+        device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+        with profile_block(
+            "train_epoch.train_epoch._backward_and_step",
+            enabled=enable_profile,
+            device_type=device_type,
+        ):
+            _backward_and_step(
                 loss_dict=loss_dict,
-                device=stat_device,
-            )
-
-            # 5) backward + step
-            enable_profile: bool = bool(getattr(args, "profile_feasible", False))
-            if enable_profile and _is_main_process():
-                print("===============[PROFILE train_epoch ENABLED]===============")
-
-            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
-            with profile_block(
-                "train_epoch.train_epoch._backward_and_step",
-                enabled=enable_profile,
-                device_type=device_type,
-            ):
-                _backward_and_step(
-                    loss_dict=loss_dict,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    args=args,
-                )
-
-            _apply_weight_decay_warmdown(optimizer)
-            _update_ema_if_needed(ema, model)
-            args._global_update_step += 1
-
-            # ✅ 기존 안전장치 유지
-            if cuda_step_limiter is not None:
-                cuda_step_limiter.record_step_end_and_maybe_wait()
-
-    else:
-        # 기존 방식(프리패치 OFF)
-        for batch in data_loader:
-            inputs, outputs = _prepare_batch_for_device(batch, device=args.device)
-
-            norm_inputs: Dict[str, torch.Tensor] = args.observation_normalizer(inputs)
-
-            outputs["ego_future_gt_4_dim"] = args.state_normalizer(
-                data=outputs["ego_future_gt_4_dim"],
-                valid_mask=outputs["ego_future_gt_is_valid"],
-            )
-            outputs["near_future_gt_4_dim"] = args.state_normalizer(
-                data=outputs["near_future_gt_4_dim"],
-                valid_mask=outputs["near_future_gt_is_valid"],
-            )
-
-            if args.use_deepspeed and hasattr(model, "zero_grad"):
-                model.zero_grad()
-            else:
-                optimizer.zero_grad(set_to_none=True)
-
-            base_model = ddp.get_model(model, args.ddp)
-            sde_marginal_prob = base_model.sde.marginal_prob
-
-            raw_loss_dict: Dict[str, torch.Tensor] = {}
-            raw_loss_dict, _ = diffusion_loss_func(
-                args=args,
                 model=model,
-                norm_inputs=norm_inputs,
-                norm_outputs=outputs,
-                marginal_prob=sde_marginal_prob,
-                state_normalizer=args.state_normalizer,
-                loss_dict=raw_loss_dict,
-                model_type=args.diffusion_model_type,
-                observation_normalizer=args.observation_normalizer,
-            )
-
-            loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(
-                loss_dict=raw_loss_dict,
+                optimizer=optimizer,
+                scheduler=scheduler,
                 args=args,
-                model=model,
-                norm_inputs=norm_inputs,
-                batch_num_in_all_epoch=batch_num_in_all_epoch,
             )
 
-            _accumulate_epoch_loss_sums_inplace(
-                loss_sums=epoch_loss_sums,
-                loss_counts=epoch_loss_counts,
-                loss_dict=loss_dict,
-                device=stat_device,
-            )
-
-            enable_profile: bool = bool(getattr(args, "profile_feasible", False))
-            if enable_profile and _is_main_process():
-                print("===============[PROFILE train_epoch ENABLED]===============")
-
-            device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
-            with profile_block(
-                "train_epoch.train_epoch._backward_and_step",
-                enabled=enable_profile,
-                device_type=device_type,
-            ):
-                _backward_and_step(
-                    loss_dict=loss_dict,
-                    model=model,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    args=args,
-                )
-
-            _apply_weight_decay_warmdown(optimizer)
-            _update_ema_if_needed(ema, model)
-            args._global_update_step += 1
-
-            if cuda_step_limiter is not None:
-                cuda_step_limiter.record_step_end_and_maybe_wait()
-
-    if cuda_step_limiter is not None:
-        cuda_step_limiter.flush()
+        _apply_weight_decay_warmdown(optimizer)
+        _update_ema_if_needed(ema, model)
+        if args.ddp:
+            torch.cuda.synchronize()
+        args._global_update_step += 1
 
     epoch_mean_loss: Dict[str, float] = _finalize_epoch_mean_loss(
         loss_sums=epoch_loss_sums,
@@ -1340,5 +1242,3 @@ def train_epoch(
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
 
     return epoch_mean_loss, epoch_mean_loss.get("loss", float("nan"))
-
-

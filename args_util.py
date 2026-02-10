@@ -260,6 +260,7 @@ def get_args():
     parser.add_argument('--w_const', type=float, help='w_const', default=0.02)
 
     # DataLoader parameters
+    # DataLoader parameters
     parser.add_argument('--augment_prob',
                         type=float,
                         help='augmentation probability',
@@ -273,26 +274,16 @@ def get_args():
                         help='filepath of normalization.json',
                         type=str)
     parser.add_argument('--use_amortized_diffusion', default=True, type=boolean)
-    parser.add_argument('--validate_scenario_rollouts', default=True, type=boolean)
+    parser.add_argument('--validate_scenario_rollouts', default=True,
+                        type=boolean)
     parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--prefetch_factor',type=int,default=4)
-    # ✅ [ADD] GPU in-flight step 제한(가벼운 동기화)
-    parser.add_argument(
-        '--cuda_inflight_step_limit',
-        type=int,
-        default=1,
-        help=(
-            "GPU가 동시에 처리 중인 step이 너무 많이 쌓이지 않도록 제한합니다. "
-            "매 step마다 CUDA 이벤트를 기록하고, 이벤트가 이 값보다 많아지면 "
-            "가장 오래된 이벤트 1개만 기다립니다. "
-            "0 이하로 주면 비활성화됩니다."
-        ),
-    )
+    parser.add_argument('--prefetch_factor', type=int, default=4)
+
     parser.add_argument(
         '--use_agent_route_lane_order',
         default=False,
@@ -302,12 +293,7 @@ def get_args():
             "학습에서 사용하지 않으면 False로 두면 CPU/RAM 사용을 줄일 수 있습니다."
         ),
     )
-    parser.add_argument(
-        '--use_cuda_prefetch',
-        default=True,
-        type=boolean,
-        help='True이면 다음 배치를 별도 CUDA stream에서 미리 GPU로 옮깁니다(속도 유지/개선 + pinned CPU 메모리 피크 완화 기대).',
-    )
+
     parser.add_argument('--use_fallback', default=False, type=boolean)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)
