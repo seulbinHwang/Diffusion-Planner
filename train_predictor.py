@@ -37,6 +37,8 @@ from diffusion_planner.utils.data_augmentation import StatePerturbation
 # DDP 디버깅을 위해 사용되지 않은 파라미터 정보를 상세히 출력
 # os.environ.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
 import torch
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 from diffusion_planner.utils.lr_schedule import (
     build_pytorch_warmup_cosine_scheduler,
     build_pytorch_warmup_constant_scheduler,

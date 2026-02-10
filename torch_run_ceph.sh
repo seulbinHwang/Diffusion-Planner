@@ -8,6 +8,11 @@ set -Eeuo pipefail
 if [[ -w /proc/self/oom_score_adj ]]; then
   ( echo 500 > /proc/self/oom_score_adj ) 2>/dev/null || true
 fi
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
 
 export WANDB_DEBUG=0
 export CUDA_HOME="$CONDA_PREFIX"
