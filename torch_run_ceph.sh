@@ -90,7 +90,7 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
   train_predictor.py \
     --train_set "$TRAIN_SET_PATH"/ \
     --train_set_list "$TRAIN_SET_LIST_PATH" \
-    --name "final_416_synchronize" \
+    --name "final_38_synchronize" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -99,5 +99,5 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
     --use_feasible_dl False \
     --use_feasible_filter False \
     --feasible_stride_dt 0.1 \
-    --num_workers 4 \
-    --prefetch_factor 16
+    --num_workers 3 \
+    --prefetch_factor 8
