@@ -107,6 +107,344 @@ import _hashlib
 from wandb.sdk.lib import hashutil as wandb_hashutil
 from src.smart.metrics import WOSACMetrics
 from src.smart.metrics import minADE
+import threading
+import time
+from typing import Optional, Dict, List, Tuple
+
+
+def _get_env_float(name: str, default: float) -> float:
+    """환경변수에서 float 값을 읽는다.
+
+    Args:
+        name (str): 환경변수 이름. shape: ()
+        default (float): 파싱 실패/미설정일 때 사용할 기본값. shape: ()
+
+    Returns:
+        float: 읽은 값. shape: ()
+    """
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _read_text_file(path: str) -> Optional[str]:
+    """텍스트 파일을 읽어서 문자열로 반환한다.
+
+    Args:
+        path (str): 읽을 파일 경로. shape: ()
+
+    Returns:
+        Optional[str]:
+            - 성공: 파일 내용(문자열)
+            - 실패: None
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _parse_cpu_list_count(cpu_list_text: str) -> int:
+    """CPU 번호 목록 문자열(예: '0-3,8,10-11')을 CPU 개수로 바꾼다.
+
+    Args:
+        cpu_list_text (str): CPU 목록 문자열. shape: ()
+
+    Returns:
+        int: CPU 개수(0 이상). shape: ()
+    """
+    s = cpu_list_text.strip()
+    if not s:
+        return 0
+
+    total = 0
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a_str, b_str = part.split("-", 1)
+            try:
+                a = int(a_str)
+                b = int(b_str)
+            except Exception:
+                continue
+            if b >= a:
+                total += (b - a + 1)
+        else:
+            try:
+                int(part)
+                total += 1
+            except Exception:
+                continue
+    return int(total)
+
+
+def _read_cgroup_cpu_limit_cores() -> Tuple[float, float]:
+    """이 컨테이너(파드) 기준 CPU 제한(코어 수)을 읽는다.
+
+    읽는 값:
+    - cgroup v2: /sys/fs/cgroup/cpu.max
+      - 형식: "<quota> <period>"
+      - quota가 "max"면 제한이 없다고 본다.
+    - 제한이 없거나 읽기 실패면, cpuset(실제로 돌 수 있는 CPU 목록) 개수로 대체한다.
+
+    Returns:
+        Tuple[float, float]:
+            - limit_cores (float): "이 컨테이너가 쓸 수 있는 CPU 코어 수(상한)".
+              예: 32.0  # shape: ()
+            - has_quota (float): cpu.max에서 실제 quota를 읽었으면 1.0, 아니면 0.0.  # shape: ()
+    """
+    cpu_max_text = _read_text_file("/sys/fs/cgroup/cpu.max")
+    if cpu_max_text is not None:
+        fields = cpu_max_text.strip().split()
+        if len(fields) >= 2:
+            quota_str, period_str = fields[0], fields[1]
+            if quota_str != "max":
+                try:
+                    quota_us = int(quota_str)
+                    period_us = int(period_str)
+                    if period_us > 0 and quota_us >= 0:
+                        limit = float(quota_us) / float(period_us)
+                        # limit이 0이면 사실상 멈춘 상태라 의미가 없어서 최소 1e-6으로 방어
+                        return max(limit, 1e-6), 1.0
+                except Exception:
+                    pass
+
+    # quota를 못 읽었거나 "max"면, cpuset 기준으로 대체
+    cpuset_text = (
+        _read_text_file("/sys/fs/cgroup/cpuset.cpus.effective")
+        or _read_text_file("/sys/fs/cgroup/cpuset/cpuset.cpus")
+        or ""
+    )
+    cpuset_count = _parse_cpu_list_count(cpuset_text)
+    if cpuset_count > 0:
+        return float(cpuset_count), 0.0
+
+    # 마지막 fallback: os.cpu_count()
+    cpu_cnt = os.cpu_count() or 1
+    return float(cpu_cnt), 0.0
+
+
+def _read_cgroup_cpu_stat() -> Tuple[int, int, int]:
+    """이 컨테이너(파드) 기준 누적 CPU 사용 시간을 읽는다.
+
+    가능하면 cgroup v2의 /sys/fs/cgroup/cpu.stat 를 사용한다.
+    - usage_usec: 누적 CPU 사용 시간(마이크로초)
+    - nr_throttled: 제한 때문에 "잠깐 멈춘 사건" 횟수
+    - throttled_usec: 제한 때문에 멈춘 누적 시간(마이크로초)
+
+    Returns:
+        Tuple[int, int, int]:
+            - usage_usec (int): 누적 CPU 사용 시간(마이크로초). shape: ()
+            - nr_throttled (int): 스로틀 발생 횟수(가능하면). shape: ()
+            - throttled_usec (int): 스로틀 누적 시간(마이크로초, 가능하면). shape: ()
+    """
+    text = _read_text_file("/sys/fs/cgroup/cpu.stat")
+    if text is not None:
+        usage_usec = 0
+        nr_throttled = 0
+        throttled_usec = 0
+        for line in text.strip().splitlines():
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            k, v = parts[0], parts[1]
+            try:
+                iv = int(v)
+            except Exception:
+                continue
+            if k == "usage_usec":
+                usage_usec = iv
+            elif k == "nr_throttled":
+                nr_throttled = iv
+            elif k == "throttled_usec":
+                throttled_usec = iv
+        return int(usage_usec), int(nr_throttled), int(throttled_usec)
+
+    # cgroup v1 fallback (스로틀 정보는 얻기 어려워서 0으로 둠)
+    for p in (
+        "/sys/fs/cgroup/cpuacct/cpuacct.usage",
+        "/sys/fs/cgroup/cpuacct.usage",
+    ):
+        t = _read_text_file(p)
+        if t is None:
+            continue
+        try:
+            ns = int(t.strip())
+            return int(ns // 1000), 0, 0  # ns -> usec
+        except Exception:
+            continue
+
+    return 0, 0, 0
+
+
+class PodCpuUsageMonitor:
+    """에폭 동안 '파드 CPU 사용량(32 vCPU 제한 대비 %)'을 측정하는 도구.
+
+    이 클래스는 별도 스레드로 주기적으로 /sys/fs/cgroup 값을 읽어서
+    에폭 동안의 CPU 사용률(평균/피크)을 계산한다.
+
+    Notes:
+        - 평균(average):
+            에폭 시작~끝 누적 CPU 사용 시간 증가량을
+            에폭 벽시계 시간으로 나눠 "평균 코어 사용량"을 구하고,
+            이를 limit_cores(예: 32)로 나눠 %로 바꾼다.
+        - 피크(peak):
+            sample_interval_sec 간격으로 구한 "짧은 구간 평균" 중 최대값이다.
+            간격이 짧을수록 더 날카로운 피크에 가까워진다.
+    """
+
+    def __init__(self, sample_interval_sec: float = 1.0) -> None:
+        """초기화.
+
+        Args:
+            sample_interval_sec (float):
+                피크 측정을 위한 샘플링 간격(초).
+                너무 작게 하면 오버헤드가 늘 수 있다. shape: ()
+        """
+        self._sample_interval_sec: float = max(0.1, float(sample_interval_sec))
+        self._limit_cores: float
+        self._has_quota: float
+        self._limit_cores, self._has_quota = _read_cgroup_cpu_limit_cores()
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # 에폭 시작 시점 스냅샷(스칼라)  # shape: ()
+        self._start_wall_sec: float = 0.0
+        self._start_usage_usec: int = 0
+        self._start_nr_throttled: int = 0
+        self._start_throttled_usec: int = 0
+
+        # 샘플 기록  # shape: (N,)
+        self._inst_percent_samples: List[float] = []
+        self._running: bool = False
+
+    def start(self) -> None:
+        """에폭 시작 시 호출해서 측정을 시작한다.
+
+        Returns:
+            None
+        """
+        with self._lock:
+            if self._running:
+                return
+
+            usage_usec, nr_th, thr_usec = _read_cgroup_cpu_stat()
+            self._start_wall_sec = float(time.monotonic())
+            self._start_usage_usec = int(usage_usec)
+            self._start_nr_throttled = int(nr_th)
+            self._start_throttled_usec = int(thr_usec)
+
+            self._inst_percent_samples = []
+            self._running = True
+            self._stop_event.clear()
+
+            self._thread = threading.Thread(
+                target=self._run_sampler_thread,
+                name="pod-cpu-usage-monitor",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop_and_get_metrics(self) -> Dict[str, float]:
+        """에폭 종료 시 호출해서 측정을 멈추고 결과를 반환한다.
+
+        Returns:
+            Dict[str, float]:
+                - limit_cores: 제한 코어 수(예: 32.0). shape: ()
+                - has_quota: quota 기반이면 1.0, 아니면 0.0. shape: ()
+                - avg_cores: 에폭 평균 사용 코어 수. shape: ()
+                - peak_cores: 샘플 기준 피크 코어 수. shape: ()
+                - avg_percent_of_limit: avg_cores / limit_cores * 100. shape: ()
+                - peak_percent_of_limit: peak_cores / limit_cores * 100. shape: ()
+                - nr_throttled_delta: 에폭 동안 스로틀 발생 횟수 증가량(가능하면). shape: ()
+                - throttled_usec_delta: 에폭 동안 스로틀 누적 시간 증가량(가능하면). shape: ()
+        """
+        # (1) 스레드 정지
+        thread_to_join: Optional[threading.Thread] = None
+        with self._lock:
+            if not self._running:
+                return {}
+
+            self._running = False
+            self._stop_event.set()
+            thread_to_join = self._thread
+            self._thread = None
+
+        if thread_to_join is not None:
+            try:
+                thread_to_join.join(timeout=float(self._sample_interval_sec) + 1.0)
+            except Exception:
+                pass
+
+        # (2) 최종 스냅샷 + 평균 계산
+        end_wall_sec = float(time.monotonic())
+        end_usage_usec, end_nr_th, end_thr_usec = _read_cgroup_cpu_stat()
+
+        wall_delta_sec = max(1e-9, end_wall_sec - float(self._start_wall_sec))
+        usage_delta_usec = max(0, int(end_usage_usec) - int(self._start_usage_usec))
+
+        avg_cores = float(usage_delta_usec) / (wall_delta_sec * 1e6)
+        limit_cores = max(1e-6, float(self._limit_cores))
+        avg_percent = (avg_cores / limit_cores) * 100.0
+
+        # (3) 피크 계산(샘플 기반)
+        if self._inst_percent_samples:
+            peak_percent = float(max(self._inst_percent_samples))
+        else:
+            peak_percent = float(avg_percent)
+
+        peak_cores = (peak_percent / 100.0) * limit_cores
+
+        # (4) 스로틀 정보(가능하면)
+        nr_th_delta = max(0, int(end_nr_th) - int(self._start_nr_throttled))
+        thr_usec_delta = max(0, int(end_thr_usec) - int(self._start_throttled_usec))
+
+        return {
+            "limit_cores": float(limit_cores),
+            "has_quota": float(self._has_quota),
+            "avg_cores": float(avg_cores),
+            "peak_cores": float(peak_cores),
+            "avg_percent_of_limit": float(avg_percent),
+            "peak_percent_of_limit": float(peak_percent),
+            "nr_throttled_delta": float(nr_th_delta),
+            "throttled_usec_delta": float(thr_usec_delta),
+        }
+
+    def _run_sampler_thread(self) -> None:
+        """샘플링 스레드 본체.
+
+        Returns:
+            None
+        """
+        prev_wall_sec = float(time.monotonic())
+        prev_usage_usec, _, _ = _read_cgroup_cpu_stat()
+        limit_cores = max(1e-6, float(self._limit_cores))
+
+        while not self._stop_event.wait(timeout=float(self._sample_interval_sec)):
+            now_wall_sec = float(time.monotonic())
+            usage_usec, _, _ = _read_cgroup_cpu_stat()
+
+            wall_dt = now_wall_sec - prev_wall_sec
+            usage_dt = int(usage_usec) - int(prev_usage_usec)
+
+            if wall_dt > 1e-9 and usage_dt >= 0:
+                inst_cores = float(usage_dt) / (wall_dt * 1e6)
+                inst_percent = (inst_cores / limit_cores) * 100.0
+                # 샘플 리스트 shape: (N,)
+                self._inst_percent_samples.append(float(inst_percent))
+
+            prev_wall_sec = now_wall_sec
+            prev_usage_usec = int(usage_usec)
+
 
 def _unwrap_to_core_torch_module(model: nn.Module) -> nn.Module:
     """감싸진 모델에서 실제 torch 모델(nn.Module)을 꺼냅니다.
@@ -2132,9 +2470,15 @@ def _run_training_loop(
     변경점:
       - epoch 루프에 tqdm를 붙여서, 진행 표시 갱신을 "epoch 단위"로만 수행합니다.
       - 배치 단위 tqdm는 train_epoch에서 제거되어, 빈번한 출력/I/O를 줄입니다.
+      - (추가) 에폭 동안 파드 CPU 사용률(32 vCPU 제한 대비 평균/피크)을 측정해 wandb에 기록합니다.
     """
-
     elapsed_training_time_hour: float = 0.0
+
+    # ✅ (추가) CPU 사용률 모니터는 rank0에서만 실행
+    cpu_monitor: Optional[PodCpuUsageMonitor] = None
+    if global_rank == 0:
+        interval_sec = _get_env_float("DP_CPU_MONITOR_INTERVAL_SEC", 1.0)
+        cpu_monitor = PodCpuUsageMonitor(sample_interval_sec=float(interval_sec))
 
     # 전체 업데이트 스텝 수 설정 및 global step 초기화 보장
     batch_num_in_all_epoch: int = _init_global_step_and_total_updates(
@@ -2157,17 +2501,27 @@ def _run_training_loop(
         # epoch 시작 전에 sampler epoch 세팅
         train_sampler.set_epoch(epoch + args.sampler_epoch_offset)
 
-        train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
-            epoch=epoch,
-            train_epochs=train_epochs,
-            train_loader=train_loader,
-            diffusion_planner=diffusion_planner,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            args=args,
-            model_ema=model_ema,
-            batch_num_in_all_epoch=batch_num_in_all_epoch,
-        )
+        # ✅ (추가) 에폭 CPU 측정 시작
+        if cpu_monitor is not None:
+            cpu_monitor.start()
+
+        cpu_epoch_metrics: Optional[Dict[str, float]] = None
+        try:
+            train_loss, train_total_loss, epoch_elapsed_time_sec = _train_one_epoch(
+                epoch=epoch,
+                train_epochs=train_epochs,
+                train_loader=train_loader,
+                diffusion_planner=diffusion_planner,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                args=args,
+                model_ema=model_ema,
+                batch_num_in_all_epoch=batch_num_in_all_epoch,
+            )
+        finally:
+            # ✅ (추가) 에폭 CPU 측정 종료(에러가 나도 스레드는 정리)
+            if cpu_monitor is not None:
+                cpu_epoch_metrics = cpu_monitor.stop_and_get_metrics()
 
         elapsed_training_time_hour += epoch_elapsed_time_sec / 3600.0
 
@@ -2205,6 +2559,11 @@ def _run_training_loop(
             speed_info=speed_info,
         )
 
+        # ✅ (추가) CPU 측정값을 wandb에 같이 기록
+        # - %는 "제한(limit_cores=보통 32) 대비" 값
+        if (global_rank == 0) and (cpu_epoch_metrics is not None) and cpu_epoch_metrics:
+            metrics.update({f"cpu/{k}": float(v) for k, v in cpu_epoch_metrics.items()})
+
         best_loss = _log_and_save(
             epoch=epoch,
             args=args,
@@ -2222,11 +2581,18 @@ def _run_training_loop(
         # rank0 tqdm에만 요약 표시(에폭당 1회)
         if not disable_epoch_tqdm:
             try:
-                epoch_iter.set_postfix({
+                postfix_dict = {
                     "loss": f"{float(train_total_loss):.4f}",
                     "sec": f"{float(epoch_elapsed_time_sec):.1f}",
                     "data/s": f"{float(speed_info.get('data_process_per_sec', 0.0)):.1f}",
-                })
+                }
+                # CPU 사용률도 같이 표시(있을 때만)
+                if cpu_epoch_metrics is not None and "avg_percent_of_limit" in cpu_epoch_metrics:
+                    postfix_dict["cpu%avg"] = f"{float(cpu_epoch_metrics['avg_percent_of_limit']):.1f}"
+                if cpu_epoch_metrics is not None and "peak_percent_of_limit" in cpu_epoch_metrics:
+                    postfix_dict["cpu%peak"] = f"{float(cpu_epoch_metrics['peak_percent_of_limit']):.1f}"
+
+                epoch_iter.set_postfix(postfix_dict)
             except Exception:
                 pass
 
@@ -2236,6 +2602,7 @@ def _run_training_loop(
         pass
 
     return best_loss
+
 
 
 
