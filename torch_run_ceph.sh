@@ -90,7 +90,9 @@ if (( USE_LOCAL_SHARDS )); then
       --seed 3407 \
       --predicted_neighbor_num 448 \
       --use_agent_route_lane_order false \
-      --force_rebuild false
+      --force_rebuild false \
+      --progress_interval_min 2
+
   else
     echo "[LOCAL_SHARDS] manifest exists -> skip build: $LOCAL_SHARD_MANIFEST"
   fi

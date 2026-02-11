@@ -39,6 +39,159 @@ def _is_overlay_like(path: str) -> Optional[bool]:
         return None
 
 
+def _format_duration_hm(seconds: float) -> str:
+    """초 단위 시간을 'XhYYm' 형태로 바꿉니다.
+
+    Args:
+        seconds (float): 초 단위 시간. shape: ()
+
+    Returns:
+        str:
+            예: 0h03m, 2h15m 같은 문자열. shape: ()
+    """
+    sec = float(max(0.0, seconds))
+    hours = int(sec // 3600.0)
+    minutes = int((sec % 3600.0) // 60.0)
+    return f"{hours}h{minutes:02d}m"
+
+
+def _safe_rate(units_done: int, elapsed_sec: float) -> float:
+    """처리 속도(단위/초)를 안전하게 계산합니다.
+
+    Args:
+        units_done (int): 지금까지 처리한 단위 개수. shape: ()
+        elapsed_sec (float): 지금까지 경과한 시간(초). shape: ()
+
+    Returns:
+        float:
+            단위/초. shape: ()
+    """
+    done = int(max(0, units_done))
+    t = float(max(1e-9, elapsed_sec))
+    return float(done) / t
+
+
+def _estimate_total_and_remaining_sec(
+    total_units: int,
+    units_done: int,
+    elapsed_sec: float,
+) -> Tuple[Optional[float], Optional[float]]:
+    """현재까지의 평균 속도로 전체/남은 시간을 추정합니다.
+
+    Args:
+        total_units (int): 전체 단위 개수. shape: ()
+        units_done (int): 처리 완료 단위 개수. shape: ()
+        elapsed_sec (float): 경과 시간(초). shape: ()
+
+    Returns:
+        Tuple[Optional[float], Optional[float]]:
+            - est_total_sec: 예상 총 소요 시간(초) 또는 None. shape: ()
+            - est_remaining_sec: 예상 남은 시간(초) 또는 None. shape: ()
+    """
+    total = int(max(0, total_units))
+    done = int(max(0, units_done))
+    if total <= 0 or done <= 0:
+        return None, None
+
+    rate = _safe_rate(done, elapsed_sec)  # units/sec
+    if rate <= 0.0:
+        return None, None
+
+    est_total = float(total) / rate
+    est_remaining = max(0.0, est_total - float(elapsed_sec))
+    return float(est_total), float(est_remaining)
+
+
+class _ProgressPrinter:
+    """shard 생성 진행 상황을 '매 N분마다' 출력하는 도구입니다.
+
+    출력 내용(요구사항 반영):
+        - 예상 총 소요 시간(시/분)
+        - 지금까지 경과 시간(시/분)
+        - 진행률(%)
+        - (추가) 샘플/샤드 기준 진행량
+
+    Note:
+        - ETA는 "지금까지 평균 속도" 기반이라 초반에는 흔들릴 수 있습니다.
+    """
+
+    def __init__(
+        self,
+        *,
+        total_samples: int,
+        total_shards: int,
+        interval_sec: float,
+    ) -> None:
+        """초기화.
+
+        Args:
+            total_samples (int): 전체 샘플 개수. shape: ()
+            total_shards (int): 전체 shard 개수. shape: ()
+            interval_sec (float): 출력 간격(초). shape: ()
+        """
+        self._total_samples: int = int(max(0, total_samples))
+        self._total_shards: int = int(max(0, total_shards))
+        self._interval_sec: float = float(max(1.0, interval_sec))
+
+        self._start_wall_sec: float = float(time.perf_counter())
+        self._last_print_wall_sec: float = self._start_wall_sec
+
+    def maybe_print(
+        self,
+        *,
+        done_samples: int,
+        done_shards: int,
+        force: bool = False,
+    ) -> None:
+        """필요한 시점(매 N분 또는 강제)마다 진행 상황을 출력합니다.
+
+        Args:
+            done_samples (int): 처리 완료 샘플 개수. shape: ()
+            done_shards (int): 완료된 shard 개수. shape: ()
+            force (bool): True면 간격과 무관하게 즉시 출력. shape: ()
+
+        Returns:
+            None
+        """
+        now = float(time.perf_counter())
+        if (not force) and ((now - self._last_print_wall_sec) < self._interval_sec):
+            return
+
+        elapsed = now - self._start_wall_sec
+        ds = int(max(0, done_samples))
+        dsh = int(max(0, done_shards))
+
+        total = max(1, self._total_samples)
+        percent = (float(ds) / float(total)) * 100.0
+
+        est_total_sec, est_remaining_sec = _estimate_total_and_remaining_sec(
+            total_units=self._total_samples,
+            units_done=ds,
+            elapsed_sec=elapsed,
+        )
+
+        elapsed_hm = _format_duration_hm(elapsed)
+        if est_total_sec is None or est_remaining_sec is None:
+            total_hm = "?"
+            remain_hm = "?"
+        else:
+            total_hm = _format_duration_hm(est_total_sec)
+            remain_hm = _format_duration_hm(est_remaining_sec)
+
+        # 샘플/초는 참고용(요구사항에는 없지만 튜닝에 도움)
+        rate_sps = _safe_rate(ds, elapsed)
+
+        print(
+            "[local_shards][progress] "
+            f"{percent:.2f}% | elapsed={elapsed_hm} | remaining≈{remain_hm} | total≈{total_hm} | "
+            f"samples={ds}/{self._total_samples} | shards={dsh}/{self._total_shards} | "
+            f"avg_speed≈{rate_sps:.1f} samples/s",
+            flush=True,
+        )
+
+        self._last_print_wall_sec = now
+
+
 def _to_save_array(value: Any, key: str) -> Optional[np.ndarray]:
     """np.savez에 넣을 수 있는 형태로 변환합니다.
 
@@ -136,6 +289,8 @@ def build_local_shards(
     predicted_neighbor_num: int,
     use_agent_route_lane_order: bool,
     force_rebuild: bool,
+    progress_interval_min: float,
+    progress_check_every_samples: int,
 ) -> None:
     """로컬 shard를 생성합니다(오프라인 1회).
 
@@ -146,6 +301,10 @@ def build_local_shards(
     3) 전역 1회 shuffle
     4) 2048개씩 shard를 만들며 .bin/.idx 생성
     5) manifest.json 저장
+
+    추가 기능
+    --------
+    - 매 N분마다 진행 상황(경과/예상 남은 시간/예상 총 시간/진행률)을 출력합니다.
 
     Args:
         src_data_dir:
@@ -166,6 +325,10 @@ def build_local_shards(
             dataset 옵션. shape: ()
         force_rebuild:
             True면 기존 결과가 있어도 다시 생성.
+        progress_interval_min:
+            진행 출력 주기(분). shape: ()
+        progress_check_every_samples:
+            몇 샘플마다 "출력할 시간인지"만 확인할지. shape: ()
     """
     out_root = os.path.abspath(out_root)
     data_dir = os.path.join(out_root, "data")
@@ -231,12 +394,28 @@ def build_local_shards(
         f"shard_size={shard_size_i}, shard_count={shard_count}",
         flush=True,
     )
+    print(
+        f"[local_shards] progress_interval_min={float(progress_interval_min):.2f} min, "
+        f"progress_check_every_samples={int(progress_check_every_samples)}",
+        flush=True,
+    )
+
+    # 진행 출력기 준비
+    interval_sec = float(max(0.1, progress_interval_min)) * 60.0
+    progress = _ProgressPrinter(
+        total_samples=int(keep_count),
+        total_shards=int(shard_count),
+        interval_sec=interval_sec,
+    )
+    progress.maybe_print(done_samples=0, done_shards=0, force=True)
 
     expected_keys_set: Set[str] = set()
-
     shards_meta: List[Dict[str, Any]] = []
 
-    t0 = time.perf_counter()
+    done_samples = 0
+    done_shards = 0
+    check_every = int(max(1, progress_check_every_samples))
+
     for sid in range(shard_count):
         bin_rel = os.path.join("data", f"shard_{sid:06d}.bin")
         idx_rel = os.path.join("data", f"shard_{sid:06d}.idx")
@@ -261,6 +440,14 @@ def build_local_shards(
                 entries.append((offset, length))
                 offset += length
 
+                done_samples += 1
+                if (done_samples % check_every) == 0:
+                    progress.maybe_print(
+                        done_samples=int(done_samples),
+                        done_shards=int(done_shards),
+                        force=False,
+                    )
+
         _write_idx_table(idx_path, entries)
 
         shards_meta.append(
@@ -271,9 +458,12 @@ def build_local_shards(
             }
         )
 
-        if (sid + 1) % 5 == 0 or (sid + 1) == shard_count:
-            elapsed = time.perf_counter() - t0
-            print(f"[local_shards] built shard {sid+1}/{shard_count} (elapsed={elapsed:.1f}s)", flush=True)
+        done_shards += 1
+        progress.maybe_print(
+            done_samples=int(done_samples),
+            done_shards=int(done_shards),
+            force=False,
+        )
 
     expected_keys = sorted(list(expected_keys_set))
 
@@ -301,6 +491,13 @@ def build_local_shards(
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
 
+    # 마지막 한 번 강제 출력(100% 근처)
+    progress.maybe_print(
+        done_samples=int(done_samples),
+        done_shards=int(done_shards),
+        force=True,
+    )
+
     print(f"[local_shards] DONE. manifest={manifest_path}", flush=True)
 
 
@@ -319,6 +516,20 @@ def main() -> None:
 
     parser.add_argument("--force_rebuild", type=_bool_arg, default=False)
 
+    # ✅ 추가: 진행 출력 옵션
+    parser.add_argument(
+        "--progress_interval_min",
+        type=float,
+        default=5.0,
+        help="몇 분마다 진행 상황(경과/예상 남은 시간/%)을 출력할지",
+    )
+    parser.add_argument(
+        "--progress_check_every_samples",
+        type=int,
+        default=256,
+        help="몇 샘플마다 '출력할 시간인지'만 확인할지(오버헤드 줄이기용)",
+    )
+
     args = parser.parse_args()
 
     build_local_shards(
@@ -331,6 +542,8 @@ def main() -> None:
         predicted_neighbor_num=int(args.predicted_neighbor_num),
         use_agent_route_lane_order=bool(args.use_agent_route_lane_order),
         force_rebuild=bool(args.force_rebuild),
+        progress_interval_min=float(args.progress_interval_min),
+        progress_check_every_samples=int(args.progress_check_every_samples),
     )
 
 
