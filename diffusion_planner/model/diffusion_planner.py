@@ -979,7 +979,7 @@ class Diffusion_Planner(nn.Module):
 
     @property
     def sde(self):
-        return self.decoder.decoder.sde
+        return self.decoder.decoder.sde #VPSDE_linear 를 쓰고 있음
 
     def forward(self, inputs):
 

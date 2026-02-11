@@ -27,6 +27,10 @@ spec:
       emptyDir:
         medium: Memory
         sizeLimit: 96Gi
+    - name: local-disk
+      emptyDir:
+        sizeLimit: 1800Gi
+
 
   initContainers:
     - name: install-nubescli
