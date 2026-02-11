@@ -60,6 +60,8 @@ spec:
       volumeMounts:
         - name: nuplan-storage
           mountPath: /mnt/nuplan
+        - name: local-disk
+          mountPath: /mnt/local_cache
 
   containers:
     - name: main
@@ -147,3 +149,5 @@ spec:
           mountPath: /mnt/nuplan
         - name: dshm2
           mountPath: /dev/shm
+        - name: local-cache
+          mountPath: /mnt/local_cache

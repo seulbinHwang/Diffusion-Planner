@@ -147,3 +147,5 @@ spec:
           mountPath: /mnt/nuplan
         - name: dshm2
           mountPath: /dev/shm
+        - name: local-cache
+          mountPath: /mnt/local_cache
