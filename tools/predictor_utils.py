@@ -13,7 +13,17 @@ from diffusion_planner.model.diffusion_planner import Diffusion_Planner
 import argparse
 import os
 from diffusion_planner.utils.tb_log import TensorBoardLogger as Logger
-
+from diffusion_planner.utils.dataset import DiffusionPlannerData
+from diffusion_planner.utils.local_shard_dataset import (
+    LocalShardDataset,
+    ShardDistributedSampler,
+    is_local_shard_manifest_path,
+)
+from torch.utils.data import DataLoader, DistributedSampler
+import torch
+from typing import Any, Dict, List, Optional, Tuple, Iterator
+import argparse
+import os
 from datetime import datetime
 from torch import optim
 from diffusion_planner.utils.train_utils import set_seed, save_model, resume_model
@@ -2230,6 +2240,7 @@ def effective_global_batch(batch_size: int, world_size: int) -> int:
     return per_rank * world_size  # drop_last 정합 반영
 
 
+
 def build_dataset_and_sampler(
     args: argparse.Namespace,
     set_: str,
@@ -2237,47 +2248,42 @@ def build_dataset_and_sampler(
     eval_method: str,
     world_size: int,
     global_rank: int,
-) -> Tuple[DiffusionPlannerData, torch.utils.data.Sampler[int]]:
-    """Dataset과 Sampler를 만든다.
+):
+    """Dataset과 Sampler를 만든다 (train은 shard 기반 선택 가능)."""
 
-    변경 목표(평가 시)
-    ----------------
-    - 평가(eval_method이 train이 아닐 때)는
-      1) 샘플 중복 없이
-      2) 샘플 누락 없이
-      각 rank가 자기 몫만 처리하도록 Sampler를 바꾼다.
-      (indices[rank::world_size] 방식)
+    eval_method_lower = str(eval_method).lower()
 
-    학습 시
-    ------
-    - 기존 로직(DistributedSampler + shuffle)을 그대로 유지한다.
+    # ✅ 1) train_set_list가 shard manifest면: LocalShardDataset + ShardDistributedSampler
+    if (eval_method_lower == "train") and is_local_shard_manifest_path(set_list):
+        data_set = LocalShardDataset(
+            shard_root=set_,
+            manifest_path=set_list,
+            expected_predicted_neighbor_num=int(args.predicted_neighbor_num),
+            expected_use_agent_route_lane_order=bool(args.use_agent_route_lane_order),
+            expected_eval_method="train",
+        )
 
-    Args:
-        args: 학습/평가 설정 Namespace.
-        set_: 데이터 루트 경로. shape: ()
-        set_list: 파일 리스트(json) 경로. shape: ()
-        eval_method: "train" 또는 "validation" 등. shape: ()
-        world_size: 전체 프로세스 수. shape: ()
-        global_rank: 현재 프로세스의 global rank. shape: ()
+        per_rank_batch_size = int(max(1, int(args.batch_size) // int(max(1, world_size))))
 
-    Returns:
-        Tuple[DiffusionPlannerData, torch.utils.data.Sampler[int]]:
-            - data_set: DiffusionPlannerData
-            - data_sampler:
-                · train: torch.utils.data.DistributedSampler
-                · eval : NoPaddingDistributedEvalSampler
-    """
+        data_sampler = ShardDistributedSampler(
+            dataset=data_set,
+            num_replicas=int(max(1, world_size)),
+            rank=int(global_rank),
+            seed=int(args.seed),
+            num_workers=int(getattr(args, "num_workers", 0)),
+            per_rank_batch_size=int(per_rank_batch_size),
+        )
+        return data_set, data_sampler
+
+    # ✅ 2) 그 외는 기존 로직 유지
     data_set = DiffusionPlannerData(
         set_,
         set_list,
         args.predicted_neighbor_num,
         eval_method,
         args.use_data_percent,
-    use_agent_route_lane_order=args.use_agent_route_lane_order,
-
+        use_agent_route_lane_order=args.use_agent_route_lane_order,
     )
-
-    eval_method_lower = str(eval_method).lower()
 
     if eval_method_lower == "train":
         data_sampler = DistributedSampler(
@@ -2289,20 +2295,21 @@ def build_dataset_and_sampler(
         )
         return data_set, data_sampler
 
-    # ✅ eval/validation/test: 패딩/드랍 없는 방식
+    # ---- 아래는 원래 있던 eval sampler 로직 그대로 두면 됩니다. ----
+    # (여기 아래는 네 코드의 기존 구현을 유지)
+    if eval_method_lower == "fine_tune_data_maker":
+        shuffle_ = True
     else:
-        if eval_method_lower == "fine_tune_data_maker":
-            shuffle_ = True
-        else:
-            shuffle_ = False
-        data_sampler = NoPaddingDistributedEvalSampler(
-            dataset=data_set,
-            num_replicas=int(max(1, world_size)),
-            rank=int(global_rank),
-            shuffle=shuffle_,  # 평가에서는 보통 고정 순서 권장
-            seed=int(args.seed),
-        )
-        return data_set, data_sampler
+        shuffle_ = False
+
+    data_sampler = NoPaddingDistributedEvalSampler(
+        dataset=data_set,
+        num_replicas=int(max(1, world_size)),
+        rank=int(global_rank),
+        shuffle=shuffle_,
+        seed=int(args.seed),
+    )
+    return data_set, data_sampler
 
 
 def build_data_loader(
