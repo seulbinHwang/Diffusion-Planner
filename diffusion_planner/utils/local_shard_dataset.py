@@ -71,73 +71,88 @@ class ShardPaths:
     idx_path: str
 
 
-class _ReadonlyMemoryViewFile:
-    """memoryview를 '파일처럼' 읽게 해주는 가벼운 래퍼입니다.
+class _ReadonlyMemoryViewFile(io.RawIOBase):
+    """memoryview를 '읽기 전용 파일'처럼 보이게 하는 래퍼.
 
     목적
     ----
-    - bytes 덩어리(chunk) 안의 일부 구간(memoryview 슬라이스)을
-      np.load가 읽을 수 있도록 "read/seek/tell" 인터페이스를 제공합니다.
-    - 중요한 점:
-      - 이 객체는 **원본 chunk를 복사해서 들고 있지 않습니다.**
-      - 즉, 샘플마다 blob 전체를 bytes로 새로 만드는(tobytes) 큰 복사를 피합니다.
+    - np.load(.npz)가 내부에서 쓰는 zipfile이 요구하는 최소 인터페이스를 만족합니다.
+    - 큰 blob을 bytes로 새로 만드는 복사를 피하고, chunk의 memoryview를 그대로 사용합니다.
 
     주의
     ----
-    - np.load(zip 기반)는 내부적으로 read()를 호출하므로
-      read()가 bytes를 만들어 반환하는 "작은 복사"는 남습니다.
-      하지만 우리가 원래 하던 "샘플 전체 blob을 한 번 더 통째로 복사"는 제거됩니다.
-
-    Args:
-        view (memoryview):
-            npz blob 바이트를 가리키는 뷰. shape: (N_bytes,)
+    - zip(.npz) 특성상, 내부 압축 해제 과정에서 일부 bytes 복사는 생길 수 있습니다.
+      하지만 "샘플 blob 전체를 통째로 tobytes()로 복사"하는 큰 복사는 제거됩니다.
     """
 
     def __init__(self, view: memoryview) -> None:
-        self._view: memoryview = view  # shape: (N_bytes,)
+        super().__init__()
+        # view: shape (N_bytes,)
+        self._view: memoryview = view
         self._pos: int = 0
 
+    # --- zipfile이 기대하는 표준 메서드들 ---
+    def readable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return True
+
+    # --- 위치 제어 ---
     def tell(self) -> int:
-        """현재 읽기 위치를 반환합니다."""
         return int(self._pos)
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        """읽기 위치를 이동합니다."""
-        n = int(self._view.nbytes)
         off = int(offset)
-
         if whence == io.SEEK_SET:
             new_pos = off
         elif whence == io.SEEK_CUR:
             new_pos = int(self._pos) + off
         elif whence == io.SEEK_END:
-            new_pos = n + off
+            new_pos = int(self._view.nbytes) + off
         else:
             raise ValueError(f"invalid whence: {whence}")
 
-        new_pos = max(0, min(n, int(new_pos)))
-        self._pos = int(new_pos)
+        # 표준 파일처럼: 0 미만은 0으로만 막고, end 넘어가는 건 허용
+        self._pos = max(0, int(new_pos))
         return int(self._pos)
 
+    # --- 읽기 ---
     def read(self, size: int = -1) -> bytes:
-        """현재 위치부터 size 만큼 읽어 bytes로 반환합니다."""
         n = int(self._view.nbytes)
+        pos = int(self._pos)
         if size is None or int(size) < 0:
-            size_i = n - int(self._pos)
+            end = n
         else:
-            size_i = int(size)
+            end = min(n, pos + int(size))
 
-        if size_i <= 0 or int(self._pos) >= n:
+        if pos >= n or end <= pos:
             return b""
 
-        end = min(n, int(self._pos) + int(size_i))
-        out = self._view[int(self._pos):end].tobytes()
+        out = self._view[pos:end].tobytes()  # 요청 구간만 bytes로 만듦(필요 최소)
         self._pos = int(end)
         return out
 
-    def close(self) -> None:
-        """zipfile이 close()를 부를 수 있어서 준비합니다(실제 자원 해제는 없음)."""
-        return
+    def readinto(self, b: bytearray | memoryview) -> int:
+        """가능하면 bytes 새 할당을 피하고, 주어진 버퍼에 바로 복사합니다."""
+        mv = memoryview(b)
+        if mv.ndim != 1:
+            mv = mv.cast("B")
+        n = int(self._view.nbytes)
+        pos = int(self._pos)
+        if pos >= n:
+            return 0
+
+        to_read = min(len(mv), n - pos)
+        if to_read <= 0:
+            return 0
+
+        mv[:to_read] = self._view[pos:pos + to_read]
+        self._pos = pos + to_read
+        return int(to_read)
 
 
 class LocalShardDataset(Dataset):
