@@ -92,7 +92,7 @@ if (( USE_LOCAL_SHARDS )); then
       --use_agent_route_lane_order false \
       --force_rebuild true \
       --progress_interval_min 5 \
-      --build_workers 12
+      --build_workers 24
 
   else
     echo "[LOCAL_SHARDS] manifest exists -> skip build: $LOCAL_SHARD_MANIFEST"
