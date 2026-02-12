@@ -248,34 +248,35 @@ def _write_idx_table(idx_path: str, entries: List[Tuple[int, int]]) -> None:
         for offset, length in entries:
             f.write(struct.pack("<QQ", int(offset), int(length)))
 
-
 def _compute_keep_count(
     total_count: int,
     *,
     shard_size: int,
     world_size: int,
 ) -> int:
-    """world_size와 shard_size에 딱 맞게 떨어지도록 keep_count를 계산합니다.
+    """shard_size에 딱 맞게 떨어지도록 keep_count를 계산합니다.
 
-    목표
-    ----
-    - shard_count = keep_count / shard_size 가 정수
-    - shard_count 가 world_size 로 나누어 떨어짐 (rank당 shard 수 동일)
+    변경 의도
+    --------
+    - 기존에는 (shard_size * world_size) 배수로 맞춰 잘랐습니다.
+      → 그래서 shard를 만들 때 쓰던 GPU 개수와 학습 때 GPU 개수가 달라지면,
+        shard_count가 나눠떨어지지 않아 학습이 막힐 수 있었습니다.
+    - 이제는 shard를 "GPU 개수와 무관"하게 만들기 위해
+      keep_count를 shard_size 배수로만 맞춥니다.
 
     Args:
         total_count: 원본 파일 개수. shape: ()
         shard_size: 2048. shape: ()
-        world_size: 6. shape: ()
+        world_size: (호환용) 더 이상 keep_count 계산에 사용하지 않음. shape: ()
 
     Returns:
         keep_count: shape: ()
     """
     total = int(max(0, total_count))
-    unit = int(shard_size) * int(max(1, world_size))
-    if unit <= 0:
-        return 0
+    unit = int(max(1, shard_size))
     keep = (total // unit) * unit
     return int(keep)
+
 
 
 def build_local_shards(
@@ -384,11 +385,6 @@ def build_local_shards(
     if shard_count * shard_size_i != keep_count:
         raise ValueError("internal mismatch: shard_count*shard_size != keep_count")
 
-    if (shard_count % int(world_size)) != 0:
-        raise ValueError(
-            f"shard_count must be divisible by world_size. shard_count={shard_count}, world_size={world_size}"
-        )
-
     print(
         f"[local_shards] total={total_count}, keep={keep_count}, dropped={dropped}, "
         f"shard_size={shard_size_i}, shard_count={shard_count}",
@@ -480,6 +476,7 @@ def build_local_shards(
         "shard_size": int(shard_size_i),
         "shard_count": int(shard_count),
         "world_size": int(world_size),
+        "world_size_hint_only": True,
         "seed_global_shuffle_once": int(seed),
         "predicted_neighbor_num": int(predicted_neighbor_num),
         "use_agent_route_lane_order": bool(use_agent_route_lane_order),
