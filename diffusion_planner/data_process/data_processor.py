@@ -151,6 +151,94 @@ def differentiate_numpy_pose3_to_control3(
     return cur_future_control_gt_3_dim
 
 
+def integrate_numpy_control3_to_pose3_midpoint(
+    cur_future_control_gt_3_dim: ArrayF,  # (P, T, 3) = (v_x^b, v_y^b, omega)
+    near_current_pose_3_dim: ArrayF,  # (P, 3) = (x0, y0, heading0)
+    dt: Union[float, np.ndarray],
+    *,
+    eps: float = 1e-8,
+    normalize_yaw: bool = True,
+    wrap_heading: bool = True,
+) -> ArrayF:
+    """(v_x^b, v_y^b, omega) 시퀀스를 midpoint 적분하여 (x,y,heading) 궤적으로 복원합니다.
+
+    입력:
+        cur_future_control_gt_3_dim: (P, T, 3)
+            - 마지막 3은 (v_x^b, v_y^b, omega)
+            - 시간축은 구간 k=0..T-1 (총 T개 구간)
+        near_current_pose_3_dim: (P, 3)
+            - (x0, y0, heading0) 현재 노드 상태
+
+    출력:
+        cur_future_pose_gt_3_dim: (P, 1+T, 3)
+            - 마지막 3은 (x, y, heading[rad])
+            - 시간축은 노드 k=0..T (총 1+T개 상태)
+    """
+    control = np.asarray(cur_future_control_gt_3_dim)
+    pose0 = np.asarray(near_current_pose_3_dim)
+    # float dtype 강제(삼각함수/나눗셈 안정)
+    control = control.astype(np.float32 if control.dtype.kind != "f" else control.dtype, copy=False)
+    pose0 = pose0.astype(control.dtype, copy=False)
+
+    P, T, _ = control.shape
+    if T <= 0:
+        raise ValueError(f"T는 최소 1이어야 합니다. got T={T}")
+    if pose0.shape[0] != P:
+        raise ValueError(
+            f"P 차원이 일치해야 합니다. control P={P}, pose0 P={pose0.shape[0]}"
+        )
+
+    dt_s = _to_scalar_dt(dt, ref=control)
+    if (not np.isfinite(dt_s)) or float(dt_s) <= 0.0:
+        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt_s}")
+
+    vx_b = control[..., 0]
+    vy_b = control[..., 1]
+    omega = control[..., 2]
+
+    x0 = pose0[..., 0]
+    y0 = pose0[..., 1]
+    yaw0 = pose0[..., 2]
+
+    # 각속도 적분: Δθ_k = w_k * dt
+    dtheta_seq = (omega * dt_s).astype(control.dtype, copy=False)  # (P,T)
+    dtheta_prefix = np.cumsum(dtheta_seq, axis=1)  # (P,T)
+    zero_pad = np.zeros_like(dtheta_seq[..., :1])  # (P,1)
+    dtheta_exclusive = np.concatenate([zero_pad, dtheta_prefix[..., :-1]], axis=1)  # (P,T)
+    yaw_start = (yaw0[..., None] + dtheta_exclusive).astype(control.dtype, copy=False)  # (P,T)
+
+    # 중점/종단 각도
+    yaw_mid = (yaw_start + 0.5 * dtheta_seq).astype(control.dtype, copy=False)  # (P,T)
+    yaw_next = (yaw_start + dtheta_seq).astype(control.dtype, copy=False)  # (P,T)
+    if wrap_heading:
+        yaw_next = _wrap_to_pi(yaw_next)
+
+    cos_mid = np.cos(yaw_mid).astype(control.dtype, copy=False)
+    sin_mid = np.sin(yaw_mid).astype(control.dtype, copy=False)
+    if normalize_yaw:
+        cos_mid, sin_mid = _normalize_cos_sin(cos_mid, sin_mid, eps=float(eps))
+
+    # 세계 기준 중점 속도
+    vwx_mid = (cos_mid * vx_b - sin_mid * vy_b).astype(control.dtype, copy=False)
+    vwy_mid = (sin_mid * vx_b + cos_mid * vy_b).astype(control.dtype, copy=False)
+
+    dx_seq = (vwx_mid * dt_s).astype(control.dtype, copy=False)
+    dy_seq = (vwy_mid * dt_s).astype(control.dtype, copy=False)
+
+    x_next = (x0[..., None] + np.cumsum(dx_seq, axis=1)).astype(control.dtype, copy=False)
+    y_next = (y0[..., None] + np.cumsum(dy_seq, axis=1)).astype(control.dtype, copy=False)
+
+    # 출력 조립: (P, 1+T, 3)
+    cur_future_pose_gt_3_dim = np.zeros((P, T + 1, 3), dtype=control.dtype)
+    cur_future_pose_gt_3_dim[:, 0, 0] = x0
+    cur_future_pose_gt_3_dim[:, 0, 1] = y0
+    cur_future_pose_gt_3_dim[:, 0, 2] = yaw0
+    cur_future_pose_gt_3_dim[:, 1:, 0] = x_next
+    cur_future_pose_gt_3_dim[:, 1:, 1] = y_next
+    cur_future_pose_gt_3_dim[:, 1:, 2] = yaw_next
+    return cur_future_pose_gt_3_dim
+
+
 
 
 class DataProcessor(object):
@@ -213,6 +301,8 @@ class DataProcessor(object):
 
         # 프로세스(워커) 내부에서 저장 횟수 카운트
         self._save_counter: int = 0
+        # 디버그 플롯 파일명 증가용 카운터
+        self._debug_plot_counter: int = 0
 
     @staticmethod
     def _build_origin_world_pose(
@@ -1375,7 +1465,7 @@ class DataProcessor(object):
         neighbor_cur_future_gt_11_dim: np.ndarray,  # shape: (N, 1+Tf, 11)
         *,
         eps: float = 1e-8,
-    ) -> np.ndarray: # (1+N, Tf)
+    ) -> Tuple[np.ndarray, np.ndarray]: # (1+N, Tf)
         """ego+neighbor의 현재~미래 유효 마스크를 만든다.
 
         유효 기준: 11차원 중 앞 8개(x,y,cos,sin,vx,vy,width,length) 값이 전부 0이면 무효.
@@ -1389,7 +1479,98 @@ class DataProcessor(object):
         near_cur_future_valid: np.ndarray = np.concatenate([ego_valid[None, :], neighbor_valid], axis=0) # (1+N, 1+Tf)
         mask_interval = near_cur_future_valid[..., :-1] & near_cur_future_valid[
             ..., 1:]  # (1+N, Tf)
-        return mask_interval
+        return near_cur_future_valid, mask_interval
+
+    def _save_integration_debug_plot(
+        self,
+        all_cur_future_gt_3_dim: np.ndarray,  # shape: (P, 1+T, 3)
+        cur_future_pose_integrated_3_dim: np.ndarray,  # shape: (P, 1+T, 3)
+        near_cur_future_valid: np.ndarray,  # shape: (P, 1+T)
+    ) -> None:
+        """GT vs integrated pose를 배치 플롯으로 PNG 저장한다."""
+        if not getattr(self.config, "save_integration_traj", False):
+            return
+        if not self._save_dir:
+            return
+        debug_dir = os.path.join(self._save_dir, "debug_integration")
+        os.makedirs(debug_dir, exist_ok=True)
+        plot_idx = int(self._debug_plot_counter)
+        self._debug_plot_counter = plot_idx + 1
+        save_path = os.path.join(
+            debug_dir, f"integrate_compare_{plot_idx:06d}.png")
+
+        mask = near_cur_future_valid.astype(bool)
+        mask_xy = mask[..., None]
+
+        gt_xy = all_cur_future_gt_3_dim[..., :2].astype(np.float32, copy=False)
+        int_xy = cur_future_pose_integrated_3_dim[..., :2].astype(np.float32, copy=False)
+
+        gt_xy = np.where(mask_xy, gt_xy, np.nan)
+        int_xy = np.where(mask_xy, int_xy, np.nan)
+
+        x_gt = gt_xy[..., 0]
+        y_gt = gt_xy[..., 1]
+        x_int = int_xy[..., 0]
+        y_int = int_xy[..., 1]
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        # 범례용 더미 라인
+        dummy_gt, = ax.plot([], [], color="tab:blue", linestyle="-", label="gt")
+        dummy_int, = ax.plot([], [], color="tab:orange", linestyle="--", label="integrated")
+
+        # 배치 플롯 (행=agent, 열=time)
+        ax.plot(x_gt.T, y_gt.T, color="tab:blue", alpha=0.6, linewidth=1.0)
+        ax.plot(x_int.T, y_int.T, color="tab:orange", alpha=0.6, linewidth=1.0, linestyle="--")
+
+        # heading 방향 화살표 (단위 길이)
+        heading_gt = all_cur_future_gt_3_dim[..., 2].astype(np.float32, copy=False)
+        heading_int = cur_future_pose_integrated_3_dim[..., 2].astype(np.float32, copy=False)
+        cos_gt = np.cos(heading_gt)
+        sin_gt = np.sin(heading_gt)
+        cos_int = np.cos(heading_int)
+        sin_int = np.sin(heading_int)
+
+        x_gt_v = x_gt[mask]
+        y_gt_v = y_gt[mask]
+        u_gt_v = cos_gt[mask]
+        v_gt_v = sin_gt[mask]
+        x_int_v = x_int[mask]
+        y_int_v = y_int[mask]
+        u_int_v = cos_int[mask]
+        v_int_v = sin_int[mask]
+
+        ax.quiver(
+            x_gt_v,
+            y_gt_v,
+            u_gt_v,
+            v_gt_v,
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            width=0.002,
+            color="tab:blue",
+            alpha=0.4,
+        )
+        ax.quiver(
+            x_int_v,
+            y_int_v,
+            u_int_v,
+            v_int_v,
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
+            width=0.002,
+            color="tab:orange",
+            alpha=0.4,
+        )
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.legend(handles=[dummy_gt, dummy_int], loc="best")
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
 
     def _merge_and_interpolate_neighbor_11dim(
         self,
@@ -1974,13 +2155,28 @@ class DataProcessor(object):
                 [ego_cur_future_gt_3_dim, neighbor_cur_future_gt_3_dim], axis=0
             ) # (1+N, 1+Tf, 3)
             # near_future_segment_valid: (1+N, Tf)
-            near_future_segment_valid = self._get_near_future_segment_valid(
+            near_cur_future_valid, near_future_segment_valid = self._get_near_future_segment_valid(
                 ego_cur_future_gt_11_dim=np.concatenate([ego_agent_past[-1:, :], ego_future_gt_11_dim], axis=0),  # (1+future_len, 11)
                 neighbor_cur_future_gt_11_dim=np.concatenate([neighbor_agents_past[:, -1, :], neighbor_future_gt_11_dim], axis=1),  # (N, 1+future_len, 11)
             )
             # cur_future_control_gt_3_dim: (1+N, Tf, 3)
             cur_future_control_gt_3_dim = differentiate_numpy_pose3_to_control3(all_cur_future_gt_3_dim, dt=0.1)
             cur_future_control_gt_3_dim[~near_future_segment_valid] = 0.0
+            # cur_future_control_gt_3_dim 을 적분하여 다시 pose로 만들자. (무효점은 0.)
+            cur_future_pose_integrated_3_dim = integrate_numpy_control3_to_pose3_midpoint(
+                cur_future_control_gt_3_dim,  # (1+N, Tf, 3)
+                all_cur_future_gt_3_dim[:, 0, :],  # (1+N, 3) 현재 pose
+                dt=0.1,
+            )  # (1+N, 1+Tf, 3)
+            cur_future_pose_integrated_3_dim[~near_cur_future_valid] = 0.0
+            # all_cur_future_gt_3_dim 와 cur_future_pose_integrated_3_dim 을 그림으로 그리기 (png로)
+            self._save_integration_debug_plot(
+                all_cur_future_gt_3_dim=all_cur_future_gt_3_dim,
+                cur_future_pose_integrated_3_dim=cur_future_pose_integrated_3_dim,
+                near_cur_future_valid=near_cur_future_valid,
+            )
+
+
             # cur_future_control_gt_3_dim 에서,
             key_to_array = {
                 "origin_world_pose": origin_world_pose,  # (4,)
