@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import os
 import time
+import shutil  # ✅ 추가
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -14,7 +15,6 @@ from diffusion_planner.utils.dataset import DiffusionPlannerData
 
 
 _LOCAL_SHARD_FORMAT = "dp_local_shards_v1"
-
 
 # -----------------------------
 # 병렬 빌드용 전역(워커 프로세스 안에서만 사용)
@@ -37,6 +37,73 @@ def _bool_arg(v: Any) -> bool:
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
+
+def _purge_out_root_dirs_if_force_rebuild(
+    *,
+    out_root: str,
+    force_rebuild: bool,
+) -> None:
+    """force_rebuild=True면 out_root 아래 data/, meta/를 실제로 삭제한 뒤 다시 만든다.
+
+    목적
+    ----
+    - 기존 구현은 manifest가 있어도 "스킵만 하지 않는다"는 의미였고,
+      data/, meta/ 아래에 남아 있는 오래된 파일(예: shard 개수 변경으로 남는 파일)을
+      자동으로 지우지는 않았습니다.
+    - 이 함수는 force_rebuild=True일 때,
+      out_root/data 와 out_root/meta 를 통째로 지워서
+      "완전히 깨끗한 상태"에서 shard를 다시 만들게 합니다.
+
+    안전장치
+    --------
+    - out_root가 루트(/)이거나, 너무 짧은 경로(예: "/mnt")처럼 위험한 경로면
+      삭제를 거부합니다.
+    - 삭제는 out_root 바로 아래의 "data", "meta" 디렉터리에만 수행합니다.
+
+    Args:
+        out_root (str): shard 출력 루트 경로. shape: ()
+        force_rebuild (bool): True면 삭제 후 재생성. shape: ()
+
+    Returns:
+        None
+    """
+    if not bool(force_rebuild):
+        return
+
+    if not isinstance(out_root, str) or not out_root:
+        raise ValueError("out_root must be a non-empty str.")
+
+    out_root_abs = os.path.abspath(out_root)
+
+    # ✅ 매우 위험한 경로 방지: "/" 또는 너무 상위 디렉터리 삭제 금지
+    # - 필요하면 여기 조건을 더 엄격하게 바꿔도 됩니다.
+    banned = {"/", "/root", "/home", "/mnt", "/var", "/tmp", "/workspace"}
+    if out_root_abs in banned:
+        raise ValueError(
+            f"Refusing to purge a dangerous path: out_root='{out_root_abs}'. "
+            "Please set out_root to a dedicated directory (e.g., /workspace/local_shards_v1)."
+        )
+
+    # path depth가 너무 얕으면 거부 (예: "/a", "/mnt/nuplan" 같은 상위일 가능성)
+    parts = [p for p in out_root_abs.split(os.sep) if p]
+    if len(parts) < 3:
+        raise ValueError(
+            f"Refusing to purge a too-shallow path: out_root='{out_root_abs}'. "
+            "Use a deeper dedicated directory (e.g., /workspace/local_shards_v1)."
+        )
+
+    data_dir = os.path.join(out_root_abs, "data")
+    meta_dir = os.path.join(out_root_abs, "meta")
+
+    # ✅ 삭제는 data/, meta/만
+    for d in (data_dir, meta_dir):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ✅ 다시 생성
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(meta_dir, exist_ok=True)
 
 def _available_cpu_count() -> int:
     """현재 프로세스가 '실제로 쓸 수 있는' CPU 개수를 추정합니다.
@@ -494,55 +561,15 @@ def build_local_shards(
     build_workers: int,
     bin_buffer_mb: int,
 ) -> None:
-    """로컬 shard를 생성합니다(오프라인 1회).
-
-    기존 메커니즘(느렸던 이유)
-    -------------------------
-    - 단일 프로세스가 모든 샘플을 순서대로 처리했습니다.
-      즉, "원본 파일 읽기 → 변환 → 저장"을 1개씩만 진행했습니다.
-    - 이 과정은 저장소 대기(파일 읽기/쓰기)와 CPU 작업(변환/직렬화)이 섞여 있어,
-      1개 프로세스만 쓰면 CPU가 놀거나(대기) 저장소가 놀 수 있습니다.
-
-    변경 메커니즘(빠르게 만든 핵심)
-    ------------------------------
-    - shard 단위(예: 2048개 묶음)로 일을 쪼개고,
-      여러 프로세스가 서로 다른 shard 파일을 동시에 만들도록 했습니다.
-      shard_000001.bin/idx 와 shard_000002.bin/idx 는 서로 다른 파일이라 충돌이 없습니다.
-    - 추가로, idx 저장은 파이썬 루프 대신 numpy 배열을 한 번에 써서 오버헤드를 줄였습니다.
-    - npz 직렬화는 BytesIO를 재사용하고, bytes 복사를 1번 줄였습니다.
-
-    Args:
-        src_data_dir:
-            원본 npz 폴더. 예: /mnt/nuplan/dataset/processed. shape: ()
-        src_list_json:
-            원본 파일명 리스트 json. shape: ()
-        out_root:
-            출력 루트. 예: /workspace/local_shards_v1. shape: ()
-        shard_size:
-            2048. shape: ()
-        world_size:
-            (호환용) shard 생성에는 직접 영향이 없고 manifest에만 기록. shape: ()
-        seed:
-            전역 1회 섞기 시드. shape: ()
-        predicted_neighbor_num:
-            dataset 옵션. shape: ()
-        use_agent_route_lane_order:
-            dataset 옵션. shape: ()
-        force_rebuild:
-            True면 기존 결과가 있어도 다시 생성.
-        progress_interval_min:
-            진행 출력 주기(분). shape: ()
-        progress_check_every_samples:
-            (단일 프로세스 모드에서만 의미) 몇 샘플마다 출력 체크를 할지. shape: ()
-        build_workers:
-            shard 빌드 프로세스 수.
-            - 0 이하: 자동값 사용
-            - 1: 단일 프로세스
-            - 2 이상: 병렬 빌드
-        bin_buffer_mb:
-            bin 파일 write buffer 크기(MB). shape: ()
-    """
+    """로컬 shard를 생성합니다(오프라인 1회)."""
     out_root = os.path.abspath(out_root)
+
+    # ✅ (추가) force_rebuild=True면 out_root/data, out_root/meta 를 싹 지우고 재생성
+    _purge_out_root_dirs_if_force_rebuild(
+        out_root=out_root,
+        force_rebuild=bool(force_rebuild),
+    )
+
     data_dir = os.path.join(out_root, "data")
     meta_dir = os.path.join(out_root, "meta")
     manifest_path = os.path.join(meta_dir, "manifest.json")
@@ -552,6 +579,7 @@ def build_local_shards(
     _ensure_dir(data_dir)
     _ensure_dir(meta_dir)
 
+    # ✅ 기존 로직: force_rebuild=False이고 manifest가 있으면 스킵
     if os.path.isfile(manifest_path) and (not force_rebuild):
         print(f"[local_shards] manifest exists -> skip build: {manifest_path}", flush=True)
         return
