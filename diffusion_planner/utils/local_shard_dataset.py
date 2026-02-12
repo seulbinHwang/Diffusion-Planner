@@ -437,6 +437,7 @@ class LocalShardDataset(Dataset):
         Returns:
             List[Dict[str, Any]]: length=N
         """
+        print("__getitems__:!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
         if not indices:
             return []
 
