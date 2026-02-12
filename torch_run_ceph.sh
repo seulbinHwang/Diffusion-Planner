@@ -114,7 +114,7 @@ echo "[TRAIN] train_set_list=$TRAIN_SET_LIST_PATH"
   train_predictor.py \
     --train_set "$TRAIN_SET_PATH"/ \
     --train_set_list "$TRAIN_SET_LIST_PATH" \
-    --name "final_46_compressed" \
+    --name "final_64_compressed" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
