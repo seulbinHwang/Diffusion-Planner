@@ -1192,6 +1192,76 @@ class DataProcessor(object):
         raise ValueError(
             f"`traj_11`은 (T,11) 또는 (N,T,11) 이어야 합니다. got {traj_11.shape}")
 
+    @staticmethod
+    def _get_ego_cur_future_gt_3_dim(
+        ego_current_4_dim: np.ndarray,  # shape: (4,)
+        ego_future_gt_3_dim: np.ndarray,  # shape: (Tf, 3)
+        *,
+        eps: float = 1e-8,
+    ) -> np.ndarray: # (1+Tf, 3)
+        """ego의 현재(x,y,cos,sin)와 미래(x,y,yaw)를 이어 붙여 (1+Tf,3)으로 만든다.
+
+        규칙:
+        - 현재가 무효(전부 0)이면, 현재+미래 전체를 0으로 만든다.
+        """
+        future_len: int = int(ego_future_gt_3_dim.shape[0])
+        out: np.ndarray = np.zeros((1 + future_len, 3), dtype=np.float32)
+
+        is_valid: bool = bool((np.abs(ego_current_4_dim) > eps).any())
+        if not is_valid:
+            return out
+
+        yaw: float = float(np.arctan2(ego_current_4_dim[3],
+                                      ego_current_4_dim[2]))
+        out[0, 0] = float(ego_current_4_dim[0])
+        out[0, 1] = float(ego_current_4_dim[1])
+        out[0, 2] = yaw
+
+        if future_len > 0:
+            out[1:, :] = ego_future_gt_3_dim.astype(np.float32, copy=False)
+        return out
+
+    @staticmethod
+    def _get_neighbor_cur_future_gt_3_dim(
+        neighbor_agents_current_4_dim: np.ndarray,  # shape: (N, 4)
+        neighbor_future_gt_3_dim: np.ndarray,  # shape: (N, Tf, 3)
+        *,
+        eps: float = 1e-8,
+    ) -> np.ndarray: # (N, 1+Tf, 3)
+        """neighbor의 현재(x,y,cos,sin)와 미래(x,y,yaw)를 이어 붙여 (N,1+Tf,3)을 만든다.
+
+        규칙:
+        - 현재가 무효(전부 0)이면, 현재+미래 전체를 0으로 만든다.
+        """
+
+        num_agents: int = int(neighbor_agents_current_4_dim.shape[0])
+        future_len: int = int(neighbor_future_gt_3_dim.shape[1])
+        out: np.ndarray = np.zeros((num_agents, 1 + future_len, 3),
+                                   dtype=np.float32)
+        if num_agents == 0:
+            return out
+
+        valid_mask: np.ndarray = (np.abs(neighbor_agents_current_4_dim)
+                                  > eps).any(axis=1)  # (N,)
+        if not np.any(valid_mask):
+            return out
+
+        yaw = np.arctan2(neighbor_agents_current_4_dim[:, 3],
+                         neighbor_agents_current_4_dim[:, 2]).astype(
+                             np.float32,
+                             copy=False,
+                         )
+        out[:, 0, 0] = neighbor_agents_current_4_dim[:, 0].astype(np.float32,
+                                                                  copy=False)
+        out[:, 0, 1] = neighbor_agents_current_4_dim[:, 1].astype(np.float32,
+                                                                  copy=False)
+        out[:, 0, 2] = yaw
+        out[:, 1:, :] = neighbor_future_gt_3_dim.astype(np.float32, copy=False)
+
+        if not np.all(valid_mask):
+            out[~valid_mask, :, :] = 0.0
+        return out
+
     def _merge_and_interpolate_neighbor_11dim(
         self,
         neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
@@ -1761,7 +1831,19 @@ class DataProcessor(object):
                 ego_cur_pose_np=ego_cur_pose_np,
                 filter_radius=self._get_effective_filter_radius_m(),
             )
-
+            # ego_cur_future_gt_3_dim: (1+Tf, 3)
+            ego_cur_future_gt_3_dim = self._get_ego_cur_future_gt_3_dim(
+                ego_current_4_dim = ego_agent_past[-1, :4],  # (4,) # x, y, cos(yaw), sin(yaw)
+                ego_future_gt_3_dim = ego_future_gt_3_dim,  # (future_len, 3) # x, y, yaw
+            )
+            # neighbor_cur_future_gt_3_dim: (N, 1+Tf, 3)
+            neighbor_cur_future_gt_3_dim = self._get_neighbor_cur_future_gt_3_dim(
+                neighbor_agents_current_4_dim = neighbor_agents_past[:, -1, :4],  # (N, 4) # x, y, cos(yaw), sin(yaw)
+                neighbor_future_gt_3_dim = neighbor_future_gt_3_dim,  # (N, future_len, 3) # x, y, yaw
+            )
+            all_cur_future_gt_3_dim = np.concatenate(
+                [ego_cur_future_gt_3_dim, neighbor_cur_future_gt_3_dim], axis=0
+            ) # (1+N, 1+Tf, 3)
             key_to_array = {
                 "origin_world_pose": origin_world_pose,  # (4,)
                 "ego_agent_past": ego_agent_past,  # (time_len, 11)
