@@ -44,6 +44,113 @@ from diffusion_planner.data_process.utils import convert_data_dict_to_device_ten
 import json
 from nuplan.common.actor_state.tracked_objects_types import TrackedObjectType  # 타입 판정용
 from diffusion_planner.data_process.road_safety_process import extract_stop_sign_points, extract_crosswalk_points
+from typing import Tuple, Union
+
+import numpy as np
+from numpy.typing import NDArray
+
+ArrayF = NDArray[np.floating]
+
+
+def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
+    """dt를 ref와 같은 dtype의 '스칼라'로 정리합니다."""
+    dt_arr = np.asarray(value, dtype=ref.dtype)
+    if dt_arr.size != 1:
+        raise ValueError(f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
+    return dt_arr.reshape(()).item()
+
+
+def _normalize_cos_sin(
+    cos_seq: ArrayF,
+    sin_seq: ArrayF,
+    eps: float,
+) -> Tuple[ArrayF, ArrayF]:
+    """(cos, sin) 쌍을 길이 1이 되도록 정규화합니다."""
+    r = np.sqrt(cos_seq * cos_seq + sin_seq * sin_seq + eps).astype(cos_seq.dtype, copy=False)
+    return (cos_seq / r).astype(cos_seq.dtype, copy=False), (sin_seq / r).astype(sin_seq.dtype, copy=False)
+
+
+def _wrap_to_pi(delta: ArrayF) -> ArrayF:
+    """각도 차이를 (-pi, pi] 범위로 접습니다."""
+    return np.arctan2(np.sin(delta), np.cos(delta)).astype(delta.dtype, copy=False)
+
+
+def differentiate_numpy_pose3_to_control3(
+    cur_future_pose_gt_3_dim: ArrayF,  # (P, 1+T, 3) = (x, y, heading)
+    dt: Union[float, np.ndarray],
+    *,
+    eps: float = 1e-8,
+    normalize_yaw: bool = True,
+    wrap_heading: bool = True,
+) -> ArrayF:
+    """(x,y,heading) 궤적에서 구간별 제어(vx_b, vy_b, omega)를 차분으로 복원합니다.
+
+    입력:
+        cur_future_pose_gt_3_dim: (P -> , 1+T, 3)
+            - 마지막 3은 (x, y, heading[rad])
+            - 시간축은 k=0..T (총 1+T개 상태)
+
+    출력:
+        cur_future_control_gt_3_dim: (P, T, 3)
+            - 마지막 3은 (v_x^b, v_y^b, omega)
+            - 시간축은 구간 k=0..T-1 (총 T개 구간)
+    """
+    pose = np.asarray(cur_future_pose_gt_3_dim)
+    if pose.ndim != 3 or int(pose.shape[-1]) != 3:
+        raise ValueError(
+            "cur_future_pose_gt_3_dim은 (P, 1+T, 3) 3D 배열이어야 합니다. "
+            f"got shape={pose.shape}"
+        )
+
+    # float dtype 강제(삼각함수/나눗셈 안정)
+    pose = pose.astype(np.float32 if pose.dtype.kind != "f" else pose.dtype, copy=False)
+
+    P, time_len, _ = pose.shape  # last dim=3
+    T = int(time_len - 1)
+    if T <= 0:
+        raise ValueError(f"time_len(=1+T)은 최소 2여야 합니다. got time_len={time_len}")
+
+    dt_s = _to_scalar_dt(dt, ref=pose)
+    if (not np.isfinite(dt_s)) or float(dt_s) <= 0.0:
+        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt_s}")
+
+    # 분해: (P, 1+T)
+    x = pose[..., 0]
+    y = pose[..., 1]
+    heading = pose[..., 2]
+
+    # 구간별 slice: (P, T)
+    x0, x1 = x[..., :-1], x[..., 1:]
+    y0, y1 = y[..., :-1], y[..., 1:]
+    th0, th1 = heading[..., :-1], heading[..., 1:]
+
+    # 1) Δθ, omega
+    delta_theta = (th1 - th0).astype(pose.dtype, copy=False)  # (P, T)
+    if wrap_heading:
+        delta_theta = _wrap_to_pi(delta_theta)  # (P, T)
+    omega = (delta_theta / dt_s).astype(pose.dtype, copy=False)  # (P, T)
+
+    # 2) midpoint heading -> (cos, sin)
+    th_mid = (th0 + 0.5 * delta_theta).astype(pose.dtype, copy=False)  # (P, T)
+    cos_mid = np.cos(th_mid).astype(pose.dtype, copy=False)            # (P, T)
+    sin_mid = np.sin(th_mid).astype(pose.dtype, copy=False)            # (P, T)
+
+    if normalize_yaw:
+        cos_mid, sin_mid = _normalize_cos_sin(cos_mid, sin_mid, eps=float(eps))
+
+    # 3) world velocity
+    vwx = ((x1 - x0) / dt_s).astype(pose.dtype, copy=False)  # (P, T)
+    vwy = ((y1 - y0) / dt_s).astype(pose.dtype, copy=False)  # (P, T)
+
+    # 4) world -> body (inverse rotation by midpoint heading)
+    vx_b = (cos_mid * vwx + sin_mid * vwy).astype(pose.dtype, copy=False)     # (P, T)
+    vy_b = (-sin_mid * vwx + cos_mid * vwy).astype(pose.dtype, copy=False)   # (P, T)
+
+    # 출력: (P, T, 3)
+    cur_future_control_gt_3_dim = np.stack([vx_b, vy_b, omega], axis=-1).astype(pose.dtype, copy=False)
+    return cur_future_control_gt_3_dim
+
+
 
 
 class DataProcessor(object):
@@ -1262,6 +1369,28 @@ class DataProcessor(object):
             out[~valid_mask, :, :] = 0.0
         return out
 
+    @staticmethod
+    def _get_near_future_segment_valid(
+        ego_cur_future_gt_11_dim: np.ndarray,  # shape: (1+Tf, 11)
+        neighbor_cur_future_gt_11_dim: np.ndarray,  # shape: (N, 1+Tf, 11)
+        *,
+        eps: float = 1e-8,
+    ) -> np.ndarray: # (1+N, Tf)
+        """ego+neighbor의 현재~미래 유효 마스크를 만든다.
+
+        유효 기준: 11차원 중 앞 8개(x,y,cos,sin,vx,vy,width,length) 값이 전부 0이면 무효.
+        """
+
+        ego_valid: np.ndarray = (np.abs(ego_cur_future_gt_11_dim[:, :8])
+                                 > eps).any(axis=1)  # (1+Tf,)
+        neighbor_valid: np.ndarray = (
+            np.abs(neighbor_cur_future_gt_11_dim[:, :, :8]) > eps).any(
+                axis=2)  # (N, 1+Tf)
+        near_cur_future_valid: np.ndarray = np.concatenate([ego_valid[None, :], neighbor_valid], axis=0) # (1+N, 1+Tf)
+        mask_interval = near_cur_future_valid[..., :-1] & near_cur_future_valid[
+            ..., 1:]  # (1+N, Tf)
+        return mask_interval
+
     def _merge_and_interpolate_neighbor_11dim(
         self,
         neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
@@ -1844,6 +1973,15 @@ class DataProcessor(object):
             all_cur_future_gt_3_dim = np.concatenate(
                 [ego_cur_future_gt_3_dim, neighbor_cur_future_gt_3_dim], axis=0
             ) # (1+N, 1+Tf, 3)
+            # near_future_segment_valid: (1+N, Tf)
+            near_future_segment_valid = self._get_near_future_segment_valid(
+                ego_cur_future_gt_11_dim=np.concatenate([ego_agent_past[-1:, :], ego_future_gt_11_dim], axis=0),  # (1+future_len, 11)
+                neighbor_cur_future_gt_11_dim=np.concatenate([neighbor_agents_past[:, -1, :], neighbor_future_gt_11_dim], axis=1),  # (N, 1+future_len, 11)
+            )
+            # cur_future_control_gt_3_dim: (1+N, Tf, 3)
+            cur_future_control_gt_3_dim = differentiate_numpy_pose3_to_control3(all_cur_future_gt_3_dim, dt=0.1)
+            cur_future_control_gt_3_dim[~near_future_segment_valid] = 0.0
+            # cur_future_control_gt_3_dim 에서,
             key_to_array = {
                 "origin_world_pose": origin_world_pose,  # (4,)
                 "ego_agent_past": ego_agent_past,  # (time_len, 11)
