@@ -283,7 +283,8 @@ def _serialize_sample_to_npz_buffer(sample: Dict[str, Any], buffer: io.BytesIO) 
             continue
         save_dict[str(k)] = arr
 
-    np.savez_compressed(buffer, **save_dict)  # ✅ 변경
+    # np.savez_compressed(buffer, **save_dict)  # ✅ 변경
+    np.savez(buffer, **save_dict)  # ✅ 변경
     return buffer.getbuffer()
 
 
