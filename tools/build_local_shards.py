@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import multiprocessing as mp
 import os
-import struct
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -14,6 +14,15 @@ from diffusion_planner.utils.dataset import DiffusionPlannerData
 
 
 _LOCAL_SHARD_FORMAT = "dp_local_shards_v1"
+
+
+# -----------------------------
+# 병렬 빌드용 전역(워커 프로세스 안에서만 사용)
+# -----------------------------
+_WORKER_DS: Optional[DiffusionPlannerData] = None
+_WORKER_OUT_ROOT: Optional[str] = None
+_WORKER_SHARD_SIZE: int = 0
+_WORKER_BIN_BUFFER_BYTES: int = 0
 
 
 def _bool_arg(v: Any) -> bool:
@@ -29,14 +38,42 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def _is_overlay_like(path: str) -> Optional[bool]:
-    """df 없이도 '대략' 판단하려고 시도합니다(정확 판별은 어려움)."""
+def _available_cpu_count() -> int:
+    """현재 프로세스가 '실제로 쓸 수 있는' CPU 개수를 추정합니다.
+
+    이유
+    ----
+    컨테이너/쿠버네티스에서는 host 전체 CPU 개수(os.cpu_count)와,
+    실제로 할당된 CPU 개수가 다를 수 있습니다.
+    가능한 경우 sched_getaffinity를 사용해 현재 프로세스에 허용된 CPU 개수를 우선합니다.
+
+    Returns:
+        int:
+            사용 가능한 CPU 개수. shape: ()
+    """
     try:
-        st = os.statvfs(path)
-        _ = st.f_frsize * st.f_bavail
-        return None
+        return int(len(os.sched_getaffinity(0)))
     except Exception:
-        return None
+        c = os.cpu_count() or 1
+        return int(max(1, c))
+
+
+def _default_build_workers() -> int:
+    """shard 빌드 병렬 worker 기본값을 정합니다.
+
+    설계 의도
+    --------
+    - 이 작업은 "원본 파일 읽기 + 변환 + 저장"이 섞여 있어,
+      너무 많은 프로세스를 쓰면 저장소가 먼저 포화될 수 있습니다.
+    - 그래서 기본값은 보수적으로 8개(또는 그 이하)로 둡니다.
+      (필요하면 CLI에서 더 키우면 됩니다.)
+
+    Returns:
+        int:
+            기본 worker 수. shape: ()
+    """
+    cpu = _available_cpu_count()
+    return int(max(1, min(8, cpu)))
 
 
 def _format_duration_hm(seconds: float) -> str:
@@ -105,14 +142,11 @@ def _estimate_total_and_remaining_sec(
 class _ProgressPrinter:
     """shard 생성 진행 상황을 '매 N분마다' 출력하는 도구입니다.
 
-    출력 내용(요구사항 반영):
+    출력 내용:
         - 예상 총 소요 시간(시/분)
         - 지금까지 경과 시간(시/분)
         - 진행률(%)
-        - (추가) 샘플/샤드 기준 진행량
-
-    Note:
-        - ETA는 "지금까지 평균 속도" 기반이라 초반에는 흔들릴 수 있습니다.
+        - 샘플/샤드 기준 진행량
     """
 
     def __init__(
@@ -178,7 +212,6 @@ class _ProgressPrinter:
             total_hm = _format_duration_hm(est_total_sec)
             remain_hm = _format_duration_hm(est_remaining_sec)
 
-        # 샘플/초는 참고용(요구사항에는 없지만 튜닝에 도움)
         rate_sps = _safe_rate(ds, elapsed)
 
         print(
@@ -214,15 +247,35 @@ def _to_save_array(value: Any, key: str) -> Optional[np.ndarray]:
             raise ValueError(f"[shard] object dtype is not allowed. key='{key}'")
         return value
 
-    # 문자열 / 숫자 스칼라
     arr = np.asarray(value)
     if isinstance(arr, np.ndarray) and arr.dtype.kind == "O":
         raise ValueError(f"[shard] object dtype is not allowed. key='{key}'")
     return arr
 
 
-def _serialize_sample_to_blob(sample: Dict[str, Any]) -> bytes:
-    """sample dict를 '압축 없는 npz 바이트'로 직렬화합니다."""
+def _serialize_sample_to_npz_buffer(sample: Dict[str, Any], buffer: io.BytesIO) -> memoryview:
+    """sample dict를 '압축 없는 npz' 형태로 buffer에 쓰고, 그 메모리 뷰를 돌려줍니다.
+
+    속도 최적화 포인트
+    -----------------
+    - 매 샘플마다 bytes 객체를 새로 만들지 않고(buffer를 재사용),
+      buffer.getbuffer()로 얻은 memoryview를 바로 파일에 씁니다.
+    - 이렇게 하면 "버퍼->bytes 복사" 1번을 줄일 수 있습니다.
+
+    Args:
+        sample (Dict[str, Any]):
+            샘플 dict. value는 np.ndarray 또는 scalar 등. shape: 다양
+        buffer (io.BytesIO):
+            재사용할 메모리 버퍼. shape: ()
+
+    Returns:
+        memoryview:
+            npz 바이트를 가리키는 memoryview. shape: (N,)
+            (주의) caller는 write 후 반드시 view.release()를 호출해야 합니다.
+    """
+    buffer.seek(0)
+    buffer.truncate(0)
+
     save_dict: Dict[str, np.ndarray] = {}
     for k, v in sample.items():
         arr = _to_save_array(v, key=str(k))
@@ -230,23 +283,33 @@ def _serialize_sample_to_blob(sample: Dict[str, Any]) -> bytes:
             continue
         save_dict[str(k)] = arr
 
-    buff = io.BytesIO()
-    # ✅ 압축 없음: np.savez
-    np.savez(buff, **save_dict)
-    return buff.getvalue()
+    np.savez_compressed(buffer, **save_dict)  # ✅ 변경
+    return buffer.getbuffer()
 
 
-def _write_idx_table(idx_path: str, entries: List[Tuple[int, int]]) -> None:
-    """(offset,length) 목록을 idx 파일로 저장합니다.
+def _write_idx_table_fast(idx_path: str, idx_table: np.ndarray) -> None:
+    """(offset,length) 테이블을 idx 파일로 빠르게 저장합니다.
 
-    저장 포맷
-    --------
-    - 각 엔트리: uint64 offset + uint64 length (16바이트)
-    - 총 엔트리 수 = shard_size
+    포맷
+    ----
+    - (shard_size, 2) shape의 uint64 테이블을
+      row-major(C-order)로 그대로 저장합니다.
+    - 각 행: [offset, length]  # 둘 다 uint64
+
+    Args:
+        idx_path (str): 저장할 idx 파일 경로. shape: ()
+        idx_table (np.ndarray):
+            shape: (shard_size, 2), dtype=uint64
     """
+    if not isinstance(idx_table, np.ndarray):
+        raise TypeError("idx_table must be a numpy array.")
+    if idx_table.ndim != 2 or idx_table.shape[1] != 2:
+        raise ValueError(f"idx_table shape must be (N,2). got {idx_table.shape}")
+
+    raw = idx_table.astype(np.dtype("<u8"), copy=False).tobytes(order="C")
     with open(idx_path, "wb") as f:
-        for offset, length in entries:
-            f.write(struct.pack("<QQ", int(offset), int(length)))
+        f.write(raw)
+
 
 def _compute_keep_count(
     total_count: int,
@@ -258,10 +321,7 @@ def _compute_keep_count(
 
     변경 의도
     --------
-    - 기존에는 (shard_size * world_size) 배수로 맞춰 잘랐습니다.
-      → 그래서 shard를 만들 때 쓰던 GPU 개수와 학습 때 GPU 개수가 달라지면,
-        shard_count가 나눠떨어지지 않아 학습이 막힐 수 있었습니다.
-    - 이제는 shard를 "GPU 개수와 무관"하게 만들기 위해
+    - shard를 "GPU 개수와 무관"하게 만들기 위해
       keep_count를 shard_size 배수로만 맞춥니다.
 
     Args:
@@ -278,6 +338,144 @@ def _compute_keep_count(
     return int(keep)
 
 
+def _build_one_shard_files(
+    *,
+    ds: DiffusionPlannerData,
+    out_root: str,
+    shard_id: int,
+    shard_size: int,
+    bin_buffer_bytes: int,
+) -> Set[str]:
+    """shard 1개(.bin/.idx)를 생성합니다.
+
+    병렬 처리를 위해 shard 단위로 작업을 쪼갭니다.
+    shard 파일은 shard_id마다 경로가 고유하므로, 여러 프로세스가 동시에 실행해도 충돌이 없습니다.
+
+    Args:
+        ds (DiffusionPlannerData):
+            원본 데이터셋 로더. ds[i] -> sample dict. shape: ()
+        out_root (str):
+            shard 루트. 예: /workspace/local_shards_v1. shape: ()
+        shard_id (int):
+            생성할 shard 번호. shape: ()
+        shard_size (int):
+            shard 당 샘플 개수. 예: 2048. shape: ()
+        bin_buffer_bytes (int):
+            bin 파일 write 버퍼 크기(바이트). shape: ()
+
+    Returns:
+        Set[str]:
+            이 shard에서 관측한 sample dict 키 집합. shape: (K,)
+    """
+    sid = int(shard_id)
+    shard_size_i = int(max(1, shard_size))
+    out_root_abs = os.path.abspath(out_root)
+
+    bin_rel = os.path.join("data", f"shard_{sid:06d}.bin")
+    idx_rel = os.path.join("data", f"shard_{sid:06d}.idx")
+    bin_path = os.path.join(out_root_abs, bin_rel)
+    idx_path = os.path.join(out_root_abs, idx_rel)
+
+    keys_set: Set[str] = set()
+
+    idx_table = np.zeros((shard_size_i, 2), dtype=np.uint64)  # shape: (shard_size, 2)
+    offset = 0
+
+    buff = io.BytesIO()
+
+    with open(bin_path, "wb", buffering=int(max(0, bin_buffer_bytes))) as bin_f:
+        base = sid * shard_size_i
+        for j in range(shard_size_i):
+            global_idx = base + j
+            sample = ds[global_idx]
+
+            keys_set.update(sample.keys())
+
+            view = _serialize_sample_to_npz_buffer(sample, buff)
+            try:
+                length = int(view.nbytes)
+                bin_f.write(view)
+            finally:
+                view.release()
+
+            idx_table[j, 0] = np.uint64(offset)
+            idx_table[j, 1] = np.uint64(length)
+            offset += length
+
+    _write_idx_table_fast(idx_path, idx_table)
+    return keys_set
+
+
+def _init_worker(
+    src_data_dir: str,
+    src_list_json: str,
+    predicted_neighbor_num: int,
+    use_agent_route_lane_order: bool,
+    raw_list: List[str],
+    shard_size: int,
+    out_root: str,
+    bin_buffer_bytes: int,
+) -> None:
+    """multiprocessing worker 초기화 함수입니다.
+
+    각 worker 프로세스는:
+      - DiffusionPlannerData를 1번 생성하고
+      - data_list를 동일한 shuffled raw_list로 교체한 뒤
+      - 이후 여러 shard를 연속으로 처리합니다.
+
+    Args:
+        src_data_dir (str): 원본 npz 폴더. shape: ()
+        src_list_json (str): 원본 파일 리스트 json. shape: ()
+        predicted_neighbor_num (int): dataset 옵션. shape: ()
+        use_agent_route_lane_order (bool): dataset 옵션. shape: ()
+        raw_list (List[str]): 전역 shuffle된 파일 리스트. length: (keep_count,)
+        shard_size (int): shard 당 샘플 수. shape: ()
+        out_root (str): shard 출력 루트. shape: ()
+        bin_buffer_bytes (int): bin write buffer 크기. shape: ()
+    """
+    global _WORKER_DS, _WORKER_OUT_ROOT, _WORKER_SHARD_SIZE, _WORKER_BIN_BUFFER_BYTES
+
+    ds = DiffusionPlannerData(
+        src_data_dir,
+        src_list_json,
+        int(predicted_neighbor_num),
+        eval_method="train",
+        use_data_percent=100.0,
+        use_agent_route_lane_order=bool(use_agent_route_lane_order),
+    )
+    ds.data_list = raw_list
+
+    _WORKER_DS = ds
+    _WORKER_OUT_ROOT = os.path.abspath(out_root)
+    _WORKER_SHARD_SIZE = int(shard_size)
+    _WORKER_BIN_BUFFER_BYTES = int(max(0, bin_buffer_bytes))
+
+
+def _build_one_shard_in_worker(shard_id: int) -> Tuple[int, Set[str]]:
+    """worker 프로세스에서 shard 1개를 생성하고, 키 집합을 반환합니다.
+
+    Args:
+        shard_id (int): shard 번호. shape: ()
+
+    Returns:
+        Tuple[int, Set[str]]:
+            - shard_id: shape: ()
+            - keys_set: shape: (K,)
+    """
+    global _WORKER_DS, _WORKER_OUT_ROOT, _WORKER_SHARD_SIZE, _WORKER_BIN_BUFFER_BYTES
+
+    if _WORKER_DS is None or _WORKER_OUT_ROOT is None:
+        raise RuntimeError("worker is not initialized. (_WORKER_DS/_WORKER_OUT_ROOT is None)")
+
+    keys_set = _build_one_shard_files(
+        ds=_WORKER_DS,
+        out_root=_WORKER_OUT_ROOT,
+        shard_id=int(shard_id),
+        shard_size=int(_WORKER_SHARD_SIZE),
+        bin_buffer_bytes=int(_WORKER_BIN_BUFFER_BYTES),
+    )
+    return int(shard_id), keys_set
+
 
 def build_local_shards(
     *,
@@ -292,20 +490,25 @@ def build_local_shards(
     force_rebuild: bool,
     progress_interval_min: float,
     progress_check_every_samples: int,
+    build_workers: int,
+    bin_buffer_mb: int,
 ) -> None:
     """로컬 shard를 생성합니다(오프라인 1회).
 
-    처리 순서(설계도 그대로)
-    ----------------------
-    1) 원본 json 리스트 로드
-    2) keep_count를 계산해 drop_last와 동치로 자름
-    3) 전역 1회 shuffle
-    4) 2048개씩 shard를 만들며 .bin/.idx 생성
-    5) manifest.json 저장
+    기존 메커니즘(느렸던 이유)
+    -------------------------
+    - 단일 프로세스가 모든 샘플을 순서대로 처리했습니다.
+      즉, "원본 파일 읽기 → 변환 → 저장"을 1개씩만 진행했습니다.
+    - 이 과정은 저장소 대기(파일 읽기/쓰기)와 CPU 작업(변환/직렬화)이 섞여 있어,
+      1개 프로세스만 쓰면 CPU가 놀거나(대기) 저장소가 놀 수 있습니다.
 
-    추가 기능
-    --------
-    - 매 N분마다 진행 상황(경과/예상 남은 시간/예상 총 시간/진행률)을 출력합니다.
+    변경 메커니즘(빠르게 만든 핵심)
+    ------------------------------
+    - shard 단위(예: 2048개 묶음)로 일을 쪼개고,
+      여러 프로세스가 서로 다른 shard 파일을 동시에 만들도록 했습니다.
+      shard_000001.bin/idx 와 shard_000002.bin/idx 는 서로 다른 파일이라 충돌이 없습니다.
+    - 추가로, idx 저장은 파이썬 루프 대신 numpy 배열을 한 번에 써서 오버헤드를 줄였습니다.
+    - npz 직렬화는 BytesIO를 재사용하고, bytes 복사를 1번 줄였습니다.
 
     Args:
         src_data_dir:
@@ -317,11 +520,11 @@ def build_local_shards(
         shard_size:
             2048. shape: ()
         world_size:
-            6. shape: ()
+            (호환용) shard 생성에는 직접 영향이 없고 manifest에만 기록. shape: ()
         seed:
             전역 1회 섞기 시드. shape: ()
         predicted_neighbor_num:
-            448. shape: ()
+            dataset 옵션. shape: ()
         use_agent_route_lane_order:
             dataset 옵션. shape: ()
         force_rebuild:
@@ -329,7 +532,14 @@ def build_local_shards(
         progress_interval_min:
             진행 출력 주기(분). shape: ()
         progress_check_every_samples:
-            몇 샘플마다 "출력할 시간인지"만 확인할지. shape: ()
+            (단일 프로세스 모드에서만 의미) 몇 샘플마다 출력 체크를 할지. shape: ()
+        build_workers:
+            shard 빌드 프로세스 수.
+            - 0 이하: 자동값 사용
+            - 1: 단일 프로세스
+            - 2 이상: 병렬 빌드
+        bin_buffer_mb:
+            bin 파일 write buffer 크기(MB). shape: ()
     """
     out_root = os.path.abspath(out_root)
     data_dir = os.path.join(out_root, "data")
@@ -345,7 +555,6 @@ def build_local_shards(
         print(f"[local_shards] manifest exists -> skip build: {manifest_path}", flush=True)
         return
 
-    # 1) 기존 DiffusionPlannerData 로직을 그대로 재사용해서 sample dict를 만든다.
     ds = DiffusionPlannerData(
         src_data_dir,
         src_list_json,
@@ -364,20 +573,16 @@ def build_local_shards(
     if keep_count <= 0:
         raise ValueError(f"keep_count computed as {keep_count}. total_count={total_count}")
 
-    # drop_last와 동치: 뒤쪽 remainder는 쓰지 않음
-    raw_list: List[str] = list(ds.data_list[:keep_count])  # length=keep_count
+    raw_list: List[str] = list(ds.data_list[:keep_count])
     dropped = int(total_count - keep_count)
 
-    # 2) 전역 1회 섞기
     rng = np.random.default_rng(int(seed))
     rng.shuffle(raw_list)
 
-    # 디버깅용: shard 구성 원본 파일 리스트(섞인 순서)를 저장
     with open(sources_txt_path, "w", encoding="utf-8") as f:
         for name in raw_list:
             f.write(str(name) + "\n")
 
-    # 3) dataset에 그대로 주입해서 __getitem__이 "같은 로직"으로 동작하도록 함
     ds.data_list = raw_list
 
     shard_size_i = int(shard_size)
@@ -385,9 +590,20 @@ def build_local_shards(
     if shard_count * shard_size_i != keep_count:
         raise ValueError("internal mismatch: shard_count*shard_size != keep_count")
 
+    bw = int(build_workers)
+    if bw <= 0:
+        bw = _default_build_workers()
+    bw = int(max(1, bw))
+
+    bin_buffer_bytes = int(max(0, int(bin_buffer_mb)) * 1024 * 1024)
+
     print(
         f"[local_shards] total={total_count}, keep={keep_count}, dropped={dropped}, "
         f"shard_size={shard_size_i}, shard_count={shard_count}",
+        flush=True,
+    )
+    print(
+        f"[local_shards] build_workers={bw}, bin_buffer_mb={int(bin_buffer_mb)}",
         flush=True,
     )
     print(
@@ -396,7 +612,6 @@ def build_local_shards(
         flush=True,
     )
 
-    # 진행 출력기 준비
     interval_sec = float(max(0.1, progress_interval_min)) * 60.0
     progress = _ProgressPrinter(
         total_samples=int(keep_count),
@@ -410,56 +625,99 @@ def build_local_shards(
 
     done_samples = 0
     done_shards = 0
-    check_every = int(max(1, progress_check_every_samples))
 
     for sid in range(shard_count):
-        bin_rel = os.path.join("data", f"shard_{sid:06d}.bin")
-        idx_rel = os.path.join("data", f"shard_{sid:06d}.idx")
-        bin_path = os.path.join(out_root, bin_rel)
-        idx_path = os.path.join(out_root, idx_rel)
-
-        entries: List[Tuple[int, int]] = []
-        offset = 0
-
-        with open(bin_path, "wb") as bin_f:
-            base = sid * shard_size_i
-            for j in range(shard_size_i):
-                global_idx = base + j
-                sample = ds[global_idx]  # 기존 dataset.py 로직 그대로
-
-                expected_keys_set.update(sample.keys())
-
-                blob = _serialize_sample_to_blob(sample)
-                length = len(blob)
-
-                bin_f.write(blob)
-                entries.append((offset, length))
-                offset += length
-
-                done_samples += 1
-                if (done_samples % check_every) == 0:
-                    progress.maybe_print(
-                        done_samples=int(done_samples),
-                        done_shards=int(done_shards),
-                        force=False,
-                    )
-
-        _write_idx_table(idx_path, entries)
-
         shards_meta.append(
             {
                 "shard_id": int(sid),
-                "bin": bin_rel,
-                "idx": idx_rel,
+                "bin": os.path.join("data", f"shard_{sid:06d}.bin"),
+                "idx": os.path.join("data", f"shard_{sid:06d}.idx"),
             }
         )
 
-        done_shards += 1
-        progress.maybe_print(
-            done_samples=int(done_samples),
-            done_shards=int(done_shards),
-            force=False,
-        )
+    if bw >= 2 and shard_count >= 2:
+        try:
+            ctx = mp.get_context("fork")
+        except Exception:
+            ctx = mp.get_context()
+
+        shard_ids = list(range(shard_count))
+        chunksize = int(max(1, shard_count // (bw * 4)))
+
+        with ctx.Pool(
+            processes=bw,
+            initializer=_init_worker,
+            initargs=(
+                str(src_data_dir),
+                str(src_list_json),
+                int(predicted_neighbor_num),
+                bool(use_agent_route_lane_order),
+                raw_list,
+                int(shard_size_i),
+                str(out_root),
+                int(bin_buffer_bytes),
+            ),
+        ) as pool:
+            for _, keys in pool.imap_unordered(_build_one_shard_in_worker, shard_ids, chunksize=chunksize):
+                expected_keys_set.update(keys)
+
+                done_shards += 1
+                done_samples += shard_size_i
+
+                progress.maybe_print(
+                    done_samples=int(done_samples),
+                    done_shards=int(done_shards),
+                    force=False,
+                )
+    else:
+        check_every = int(max(1, progress_check_every_samples))
+        for sid in range(shard_count):
+            base = sid * shard_size_i
+
+            idx_table = np.zeros((shard_size_i, 2), dtype=np.uint64)
+            offset = 0
+
+            bin_rel = os.path.join("data", f"shard_{sid:06d}.bin")
+            idx_rel = os.path.join("data", f"shard_{sid:06d}.idx")
+            bin_path = os.path.join(out_root, bin_rel)
+            idx_path = os.path.join(out_root, idx_rel)
+
+            buff = io.BytesIO()
+
+            with open(bin_path, "wb", buffering=int(max(0, bin_buffer_bytes))) as bin_f:
+                for j in range(shard_size_i):
+                    global_idx = base + j
+                    sample = ds[global_idx]
+
+                    expected_keys_set.update(sample.keys())
+
+                    view = _serialize_sample_to_npz_buffer(sample, buff)
+                    try:
+                        length = int(view.nbytes)
+                        bin_f.write(view)
+                    finally:
+                        view.release()
+
+                    idx_table[j, 0] = np.uint64(offset)
+                    idx_table[j, 1] = np.uint64(length)
+                    offset += length
+
+                    done_samples += 1
+                    if (done_samples % check_every) == 0:
+                        progress.maybe_print(
+                            done_samples=int(done_samples),
+                            done_shards=int(done_shards),
+                            force=False,
+                        )
+
+            _write_idx_table_fast(idx_path, idx_table)
+
+            done_shards += 1
+            progress.maybe_print(
+                done_samples=int(done_samples),
+                done_shards=int(done_shards),
+                force=False,
+            )
 
     expected_keys = sorted(list(expected_keys_set))
 
@@ -482,13 +740,14 @@ def build_local_shards(
         "use_agent_route_lane_order": bool(use_agent_route_lane_order),
         "expected_keys": expected_keys,
         "sources_txt": os.path.relpath(sources_txt_path, out_root),
+        "build_workers": int(bw),
+        "bin_buffer_mb": int(bin_buffer_mb),
         "shards": shards_meta,
     }
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False)
 
-    # 마지막 한 번 강제 출력(100% 근처)
     progress.maybe_print(
         done_samples=int(done_samples),
         done_shards=int(done_shards),
@@ -513,7 +772,6 @@ def main() -> None:
 
     parser.add_argument("--force_rebuild", type=_bool_arg, default=False)
 
-    # ✅ 추가: 진행 출력 옵션
     parser.add_argument(
         "--progress_interval_min",
         type=float,
@@ -524,7 +782,20 @@ def main() -> None:
         "--progress_check_every_samples",
         type=int,
         default=256,
-        help="몇 샘플마다 '출력할 시간인지'만 확인할지(오버헤드 줄이기용)",
+        help="(단일 프로세스) 몇 샘플마다 '출력할 시간인지'만 확인할지(오버헤드 줄이기용)",
+    )
+
+    parser.add_argument(
+        "--build_workers",
+        type=int,
+        default=0,
+        help="shard 생성에 쓸 프로세스 수. 0 이하이면 자동.",
+    )
+    parser.add_argument(
+        "--bin_buffer_mb",
+        type=int,
+        default=8,
+        help="bin 파일 write buffer 크기(MB).",
     )
 
     args = parser.parse_args()
@@ -541,6 +812,8 @@ def main() -> None:
         force_rebuild=bool(args.force_rebuild),
         progress_interval_min=float(args.progress_interval_min),
         progress_check_every_samples=int(args.progress_check_every_samples),
+        build_workers=int(args.build_workers),
+        bin_buffer_mb=int(args.bin_buffer_mb),
     )
 
 

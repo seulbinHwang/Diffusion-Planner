@@ -91,7 +91,8 @@ if (( USE_LOCAL_SHARDS )); then
       --predicted_neighbor_num 448 \
       --use_agent_route_lane_order false \
       --force_rebuild false \
-      --progress_interval_min 5
+      --progress_interval_min 5 \
+      --build_workers 12
 
   else
     echo "[LOCAL_SHARDS] manifest exists -> skip build: $LOCAL_SHARD_MANIFEST"

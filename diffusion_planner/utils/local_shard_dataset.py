@@ -15,15 +15,7 @@ _LOCAL_SHARD_FORMAT = "dp_local_shards_v1"
 
 
 def is_local_shard_manifest_path(path: Any) -> bool:
-    """입력 경로가 로컬 shard manifest.json 형태인지 '대략' 판별합니다.
-
-    Args:
-        path: 파일 경로. shape: ()
-
-    Returns:
-        bool:
-            True면 로컬 shard manifest일 가능성이 큼.
-    """
+    """입력 경로가 로컬 shard manifest.json 형태인지 '대략' 판별합니다."""
     if not isinstance(path, str) or not path:
         return False
     if not os.path.isfile(path):
@@ -82,18 +74,13 @@ class ShardPaths:
 class LocalShardDataset(Dataset):
     """로컬 shard(.bin/.idx)에서 샘플을 읽어오는 Dataset.
 
-    핵심 목표
-    --------
-    - 학습 중에는 원본 npz를 열지 않습니다.
-    - (offset, length) 표(.idx)를 이용해 .bin에서 blob만 읽고,
-      그 blob을 복원해서 sample dict를 만듭니다.
-    - sample dict는 기존 DiffusionPlannerData와 "키 구조"가 같도록,
-      expected_keys 기준으로 없는 키는 None으로 채웁니다.
-
-    주의
-    ----
-    - 이 Dataset은 'train shard'를 가정합니다.
-      (validation/test shard까지 만들고 싶으면 동일 방식으로 확장 가능합니다.)
+    핵심 변경(성능)
+    -------------
+    - __getitems__(indices)를 구현해서,
+      DataLoader가 "배치 단위"로 인덱스를 넘길 때
+      샘플 256개(배치 1개)를 1번에 크게 읽을 수 있게 했습니다.
+    - (Sampler가 배치가 shard 안에서 연속 256개가 되게 만들어 준다는 전제에서)
+      seek+read 호출 수를 크게 줄일 수 있습니다.
     """
 
     def __init__(
@@ -105,19 +92,6 @@ class LocalShardDataset(Dataset):
         expected_use_agent_route_lane_order: bool,
         expected_eval_method: str = "train",
     ) -> None:
-        """
-        Args:
-            shard_root (str):
-                shard 루트. 예: "/workspace/local_shards_v1". shape: ()
-            manifest_path (str):
-                manifest.json 경로. 예: "/workspace/local_shards_v1/meta/manifest.json". shape: ()
-            expected_predicted_neighbor_num (int):
-                현재 학습 args.predicted_neighbor_num 값. shape: ()
-            expected_use_agent_route_lane_order (bool):
-                현재 학습 args.use_agent_route_lane_order 값. shape: ()
-            expected_eval_method (str):
-                보통 "train". shape: ()
-        """
         if not isinstance(shard_root, str) or not shard_root:
             raise ValueError("shard_root must be a non-empty str.")
         if not isinstance(manifest_path, str) or not manifest_path:
@@ -237,8 +211,7 @@ class LocalShardDataset(Dataset):
             raise ValueError(
                 f"idx table size mismatch: got={arr.size}, expected={int(self._shard_size) * 2}, path={idx_path}"
             )
-        table = arr.reshape(int(self._shard_size), 2)  # (shard_size, 2)
-        return table
+        return arr.reshape(int(self._shard_size), 2)  # (shard_size, 2)
 
     def _ensure_shard_open(self, shard_id: int) -> None:
         """요청된 shard가 캐시에 없으면, 그 shard의 bin/idx를 열어 캐시에 올린다."""
@@ -257,9 +230,76 @@ class LocalShardDataset(Dataset):
         if not os.path.isfile(paths.idx_path):
             raise FileNotFoundError(f"idx not found: {paths.idx_path}")
 
-        self._cached_bin_fp = open(paths.bin_path, "rb")
+        # buffering을 크게 두면 큰 read를 할 때 유리한 경우가 많습니다.
+        self._cached_bin_fp = open(paths.bin_path, "rb", buffering=1024 * 1024)
         self._cached_idx_table = self._load_idx_table(paths.idx_path)
         self._cached_shard_id = sid
+
+    def _decode_blob_to_sample(self, blob: Any) -> Dict[str, Any]:
+        """npz blob(바이트)을 sample dict로 복원합니다."""
+        sample: Dict[str, Any] = {}
+        with np.load(io.BytesIO(blob), allow_pickle=False) as data:
+            files_set = set(data.files)
+            for k in self._expected_keys:
+                if k not in files_set:
+                    sample[k] = None
+                    continue
+
+                v = data[k]
+                # 문자열 scalar(np.array("..."))는 python str로 변환
+                if isinstance(v, np.ndarray) and v.shape == () and v.dtype.kind in ("U", "S"):
+                    try:
+                        sample[k] = str(v.item())
+                    except Exception:
+                        sample[k] = str(v)
+                else:
+                    sample[k] = v
+        return sample
+
+    def _read_one_blob(self, *, offset: int, length: int) -> bytes:
+        """bin 파일에서 (offset,length)만큼 읽어 blob을 돌려줍니다."""
+        assert self._cached_bin_fp is not None
+        self._cached_bin_fp.seek(int(offset))
+        blob = self._cached_bin_fp.read(int(length))
+        if len(blob) != int(length):
+            raise IOError(f"failed to read full blob: want={length}, got={len(blob)}")
+        return blob
+
+    def _read_many_blobs_one_chunk(
+        self,
+        offsets: np.ndarray,
+        lengths: np.ndarray,
+    ) -> List[bytes]:
+        """여러 blob을 '한 번에 크게 읽고' 잘라서 돌려줍니다.
+
+        Args:
+            offsets: uint64 배열. shape: (N,)
+            lengths: uint64 배열. shape: (N,)
+
+        Returns:
+            List[bytes]: length=N
+        """
+        assert self._cached_bin_fp is not None
+
+        offs = offsets.astype(np.int64, copy=False)  # (N,)
+        lens = lengths.astype(np.int64, copy=False)  # (N,)
+
+        start = int(np.min(offs))
+        end = int(np.max(offs + lens))
+        total_len = int(max(0, end - start))
+
+        self._cached_bin_fp.seek(start)
+        chunk = self._cached_bin_fp.read(total_len)
+        if len(chunk) != total_len:
+            raise IOError(f"failed to read chunk: want={total_len}, got={len(chunk)}")
+
+        mv = memoryview(chunk)
+        out: List[bytes] = []
+        for o, l in zip(offs.tolist(), lens.tolist()):
+            rel = int(o - start)
+            ln = int(l)
+            out.append(mv[rel:rel + ln].tobytes())
+        return out
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """샘플 1개를 읽어 sample dict로 반환합니다."""
@@ -272,62 +312,76 @@ class LocalShardDataset(Dataset):
 
         self._ensure_shard_open(shard_id)
 
-        assert self._cached_bin_fp is not None
         assert self._cached_idx_table is not None
-
         offset_u64 = self._cached_idx_table[int(local_id), 0]
         length_u64 = self._cached_idx_table[int(local_id), 1]
-        offset = int(offset_u64)
-        length = int(length_u64)
 
-        self._cached_bin_fp.seek(offset)
-        blob = self._cached_bin_fp.read(length)
-        if len(blob) != length:
-            raise IOError(
-                f"failed to read full blob: want={length}, got={len(blob)}, shard_id={shard_id}, local_id={local_id}"
-            )
+        blob = self._read_one_blob(offset=int(offset_u64), length=int(length_u64))
+        return self._decode_blob_to_sample(blob)
 
-        # blob -> npz -> dict
-        sample: Dict[str, Any] = {}
-        with np.load(io.BytesIO(blob), allow_pickle=False) as data:
-            files_set = set(data.files)
+    def __getitems__(self, indices: Sequence[int]) -> List[Dict[str, Any]]:
+        """여러 인덱스를 한 번에 읽습니다(배치 최적화).
 
-            for k in self._expected_keys:
-                if k not in files_set:
-                    sample[k] = None
-                    continue
+        DataLoader가 batch_size>1일 때, (환경에 따라) indices가 한 번에 들어올 수 있습니다.
+        이때 같은 shard 안의 연속 구간이면:
+          - seek+read 1번으로 큰 덩어리를 읽고
+          - 메모리에서 잘라서 각 샘플을 복원합니다.
 
-                v = data[k]
-                # 문자열 scalar(np.array("..."))는 python str로 바꿔서 기존 형태에 더 가깝게 맞춤
-                if isinstance(v, np.ndarray) and v.shape == () and v.dtype.kind in ("U", "S"):
-                    try:
-                        sample[k] = str(v.item())
-                    except Exception:
-                        sample[k] = str(v)
-                else:
-                    sample[k] = v
+        Args:
+            indices: 인덱스 목록. length=N
 
-        return sample
+        Returns:
+            List[Dict[str, Any]]: length=N
+        """
+        if not indices:
+            return []
+
+        # 결과를 "입력 순서"대로 돌려주기 위해, 위치를 보존합니다.
+        n = int(len(indices))
+        out: List[Optional[Dict[str, Any]]] = [None] * n
+
+        # shard_id별로 묶습니다: shard_id -> [(pos, local_id), ...]
+        groups: Dict[int, List[Tuple[int, int]]] = {}
+        shard_size = int(self._shard_size)
+
+        for pos, raw_i in enumerate(indices):
+            i = int(raw_i)
+            if i < 0 or i >= int(self._num_samples):
+                raise IndexError(f"index out of range: {i}")
+
+            sid = i // shard_size
+            lid = i % shard_size
+            groups.setdefault(int(sid), []).append((int(pos), int(lid)))
+
+        # shard_id가 1개면(대부분 배치) 1회 큰 읽기 최적화가 잘 먹습니다.
+        for sid, pos_lids in groups.items():
+            self._ensure_shard_open(int(sid))
+            assert self._cached_idx_table is not None
+
+            # local_id 배열(입력 순서 보존)
+            pos_list = [p for p, _ in pos_lids]
+            lid_list = [lid for _, lid in pos_lids]
+
+            lids = np.asarray(lid_list, dtype=np.int64)  # (N_g,)
+            offsets_u64 = self._cached_idx_table[lids, 0]  # (N_g,)
+            lengths_u64 = self._cached_idx_table[lids, 1]  # (N_g,)
+
+            blobs = self._read_many_blobs_one_chunk(offsets_u64, lengths_u64)  # length=N_g
+
+            for p, blob in zip(pos_list, blobs):
+                out[p] = self._decode_blob_to_sample(blob)
+
+        # mypy/안전: None이 남아있으면 내부 로직 오류
+        final: List[Dict[str, Any]] = []
+        for item in out:
+            if item is None:
+                raise RuntimeError("internal error: some samples were not filled.")
+            final.append(item)
+        return final
 
 
 class ShardDistributedSampler(Sampler[int]):
-    """train 전용: shard 단위 셔플 + rank 분배 + worker 분배를 수행하는 Sampler.
-
-    변경 목표
-    --------
-    - shard_count가 현재 world_size로 나누어 떨어지지 않아도 학습 가능해야 합니다.
-    - 각 rank가 처리하는 샘플 수(=step 수)가 같아야 분산 학습이 멈추지 않습니다.
-
-    동작 규칙
-    --------
-    1) 에폭마다 shard id(0..shard_count-1) 순서를 동일하게 섞습니다(모든 rank 동일).
-    2) shard_count가 world_size로 나누어 떨어지지 않으면,
-       "앞에서부터 world_size로 나누어 떨어지는 개수"까지만 이번 에폭에서 사용합니다.
-       (남는 shard는 다음 에폭에서는 섞인 결과에 따라 포함될 수 있습니다.)
-    3) 사용하기로 한 shard들을 rank별로 똑같이 나눕니다.
-    4) rank 안에서는 worker별로 shard를 나눠 주고,
-       DataLoader의 round-robin과 맞물리게 "배치 단위"로 인덱스를 내보냅니다.
-    """
+    """train 전용: shard 단위 셔플 + rank 분배 + worker 분배를 수행하는 Sampler."""
 
     def __init__(
         self,
@@ -350,39 +404,28 @@ class ShardDistributedSampler(Sampler[int]):
         self.shard_size = int(dataset.shard_size)
         self.shard_count = int(dataset.shard_count)
 
+        if (self.shard_count % self.num_replicas) != 0:
+            raise ValueError(
+                f"shard_count must be divisible by world_size. shard_count={self.shard_count}, world_size={self.num_replicas}"
+            )
+
+        if (self.shard_size % self.per_rank_batch_size) != 0:
+            raise ValueError(
+                f"shard_size must be divisible by per_rank_batch_size. "
+                f"shard_size={self.shard_size}, per_rank_batch_size={self.per_rank_batch_size}"
+            )
+
+        self.shards_per_rank = self.shard_count // self.num_replicas
+        self.num_samples = self.shards_per_rank * self.shard_size
+
+        self.batches_per_shard = self.shard_size // self.per_rank_batch_size
+
+        self.epoch: int = 0
+
         if self.rank < 0 or self.rank >= self.num_replicas:
             raise ValueError(
                 f"rank must be in [0, num_replicas-1]. got rank={self.rank}, num_replicas={self.num_replicas}"
             )
-
-        # ✅ 변경: shard_count가 world_size로 나눠떨어질 필요 없음
-        usable_shard_count = (self.shard_count // self.num_replicas) * self.num_replicas
-        if usable_shard_count <= 0:
-            raise ValueError(
-                "not enough shards for current world_size.\n"
-                f"  shard_count={self.shard_count}\n"
-                f"  world_size={self.num_replicas}\n"
-                "→ shard_count >= world_size 인지 확인하세요."
-            )
-
-        self.usable_shard_count = int(usable_shard_count)  # shape: ()
-        self.dropped_shards_per_epoch = int(self.shard_count - self.usable_shard_count)  # shape: ()
-
-        # rank당 shard 개수는 항상 동일(DDP 정합)
-        self.shards_per_rank = self.usable_shard_count // self.num_replicas
-        self.num_samples = self.shards_per_rank * self.shard_size
-
-        # (기존 로직 유지) shard 안에서 배치 단위로 끊어 내보내려면 나눠떨어지는게 가장 깔끔
-        if (self.shard_size % self.per_rank_batch_size) != 0:
-            raise ValueError(
-                f"shard_size must be divisible by per_rank_batch_size.\n"
-                f"  shard_size={self.shard_size}\n"
-                f"  per_rank_batch_size={self.per_rank_batch_size}\n"
-                "→ 보통 args.batch_size를 (per_rank_batch_size * world_size) 형태로 맞추면 해결됩니다."
-            )
-
-        self.batches_per_shard = self.shard_size // self.per_rank_batch_size
-        self.epoch: int = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -397,24 +440,17 @@ class ShardDistributedSampler(Sampler[int]):
         return shard_ids
 
     def __iter__(self) -> Iterator[int]:
-        # 1) shard 순서 셔플 (모든 rank에서 동일)
         shard_ids = self._shuffle_shard_ids_for_epoch()
 
-        # ✅ 2) 이번 에폭에서 사용할 shard만 선택 (world_size로 나눠떨어지는 개수)
-        shard_ids = shard_ids[: int(self.usable_shard_count)]
-
-        # 3) rank별로 동일한 크기로 분할
         start = int(self.rank) * int(self.shards_per_rank)
         end = start + int(self.shards_per_rank)
-        rank_shards = shard_ids[start:end]  # length=shards_per_rank
+        rank_shards = shard_ids[start:end]
 
-        # 4) worker별 round-robin 분배 (겹치지 않게)
         worker_shards: List[List[int]] = [
             rank_shards[w::self.num_workers] for w in range(self.num_workers)
         ]
         max_wave = max((len(ws) for ws in worker_shards), default=0)
 
-        # 5) "배치 단위"로 worker0→worker1→... 순서로 내보냄
         for wave_idx in range(max_wave):
             for k in range(self.batches_per_shard):
                 for w in range(self.num_workers):
