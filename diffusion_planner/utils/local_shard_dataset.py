@@ -1,10 +1,12 @@
+
 from __future__ import annotations
 
 import io
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Union
+
 
 import numpy as np
 import torch
@@ -12,6 +14,120 @@ from torch.utils.data import Dataset, Sampler
 
 
 _LOCAL_SHARD_FORMAT = "dp_local_shards_v1"
+
+class _ReadOnlyMemoryViewIO(io.RawIOBase):
+    """memoryview를 '파일처럼(read/seek)' 다룰 수 있게 만드는 read-only IO 래퍼.
+
+    목적
+    ----
+    - np.load(npz)를 호출할 때, 기존처럼 blob 전체를 bytes로 한 번 더 복사하지 않고
+      memoryview를 그대로 잡은 채로 읽도록 하기 위함입니다.
+    - 즉, "chunk bytes → sample bytes(tobytes)" 형태의 큰 추가 복사를 피합니다.
+
+    주의
+    ----
+    - file-like 객체의 read()는 bytes를 반환해야 하므로,
+      np.load/zipfile이 요청한 구간만큼의 복사는 발생할 수 있습니다.
+      하지만 기존처럼 샘플 blob 전체를 매번 새 bytes로 만드는 복사는 없앨 수 있습니다.
+
+    Args:
+        view (memoryview):
+            읽기 대상 버퍼. shape: (N,)
+
+    """
+
+    def __init__(self, view: memoryview) -> None:
+        if not isinstance(view, memoryview):
+            raise TypeError("view must be a memoryview.")
+        # view: shape (N,) 로 가정. 다른 형태면 바이트 단위로 맞춥니다.
+        if view.ndim != 1 or view.format != "B":
+            view = view.cast("B")
+        self._view: memoryview = view  # shape: (N,)
+        self._pos: int = 0  # shape: ()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return int(self._pos)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        """파일 포인터 위치를 이동합니다.
+
+        Args:
+            offset (int): 이동할 오프셋. shape: ()
+            whence (int): io.SEEK_SET/CUR/END 중 하나. shape: ()
+
+        Returns:
+            int: 이동 후 위치. shape: ()
+        """
+        buf_len = int(len(self._view))  # shape: ()
+        off = int(offset)
+
+        if whence == io.SEEK_SET:
+            new_pos = off
+        elif whence == io.SEEK_CUR:
+            new_pos = int(self._pos) + off
+        elif whence == io.SEEK_END:
+            new_pos = buf_len + off
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+
+        # 0~len 범위로 clamp
+        new_pos = max(0, min(int(new_pos), buf_len))
+        self._pos = int(new_pos)
+        return int(self._pos)
+
+    def read(self, size: int = -1) -> bytes:
+        """현재 위치에서 size 바이트를 읽습니다.
+
+        Args:
+            size (int): 읽을 크기. 음수면 끝까지. shape: ()
+
+        Returns:
+            bytes: 읽은 데이터. shape: (K,)
+        """
+        buf_len = int(len(self._view))
+        pos = int(self._pos)
+
+        if size is None or int(size) < 0:
+            end = buf_len
+        else:
+            end = min(buf_len, pos + int(size))
+
+        if end <= pos:
+            return b""
+
+        out = self._view[pos:end].tobytes()
+        self._pos = int(end)
+        return out
+
+    def readinto(self, b: Union[bytearray, memoryview]) -> int:
+        """버퍼 b에 데이터를 채워 넣습니다(불필요한 임시 bytes 생성 감소).
+
+        Args:
+            b (bytearray | memoryview): 채울 버퍼. shape: (K,)
+
+        Returns:
+            int: 실제로 채운 바이트 수. shape: ()
+        """
+        mv = memoryview(b)
+        if mv.nbytes <= 0:
+            return 0
+
+        buf_len = int(len(self._view))
+        pos = int(self._pos)
+        remain = buf_len - pos
+        if remain <= 0:
+            return 0
+
+        n = min(int(mv.nbytes), int(remain))
+        mv[:n] = self._view[pos:pos + n]
+        self._pos = int(pos + n)
+        return int(n)
 
 
 def is_local_shard_manifest_path(path: Any) -> bool:
@@ -71,104 +187,16 @@ class ShardPaths:
     idx_path: str
 
 
-class _ReadonlyMemoryViewFile(io.RawIOBase):
-    """memoryview를 '읽기 전용 파일'처럼 보이게 하는 래퍼.
-
-    목적
-    ----
-    - np.load(.npz)가 내부에서 쓰는 zipfile이 요구하는 최소 인터페이스를 만족합니다.
-    - 큰 blob을 bytes로 새로 만드는 복사를 피하고, chunk의 memoryview를 그대로 사용합니다.
-
-    주의
-    ----
-    - zip(.npz) 특성상, 내부 압축 해제 과정에서 일부 bytes 복사는 생길 수 있습니다.
-      하지만 "샘플 blob 전체를 통째로 tobytes()로 복사"하는 큰 복사는 제거됩니다.
-    """
-
-    def __init__(self, view: memoryview) -> None:
-        super().__init__()
-        # view: shape (N_bytes,)
-        self._view: memoryview = view
-        self._pos: int = 0
-
-    # --- zipfile이 기대하는 표준 메서드들 ---
-    def readable(self) -> bool:
-        return True
-
-    def writable(self) -> bool:
-        return False
-
-    def seekable(self) -> bool:
-        return True
-
-    # --- 위치 제어 ---
-    def tell(self) -> int:
-        return int(self._pos)
-
-    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        off = int(offset)
-        if whence == io.SEEK_SET:
-            new_pos = off
-        elif whence == io.SEEK_CUR:
-            new_pos = int(self._pos) + off
-        elif whence == io.SEEK_END:
-            new_pos = int(self._view.nbytes) + off
-        else:
-            raise ValueError(f"invalid whence: {whence}")
-
-        # 표준 파일처럼: 0 미만은 0으로만 막고, end 넘어가는 건 허용
-        self._pos = max(0, int(new_pos))
-        return int(self._pos)
-
-    # --- 읽기 ---
-    def read(self, size: int = -1) -> bytes:
-        n = int(self._view.nbytes)
-        pos = int(self._pos)
-        if size is None or int(size) < 0:
-            end = n
-        else:
-            end = min(n, pos + int(size))
-
-        if pos >= n or end <= pos:
-            return b""
-
-        out = self._view[pos:end].tobytes()  # 요청 구간만 bytes로 만듦(필요 최소)
-        self._pos = int(end)
-        return out
-
-    def readinto(self, b: bytearray | memoryview) -> int:
-        """가능하면 bytes 새 할당을 피하고, 주어진 버퍼에 바로 복사합니다."""
-        mv = memoryview(b)
-        if mv.ndim != 1:
-            mv = mv.cast("B")
-        n = int(self._view.nbytes)
-        pos = int(self._pos)
-        if pos >= n:
-            return 0
-
-        to_read = min(len(mv), n - pos)
-        if to_read <= 0:
-            return 0
-
-        mv[:to_read] = self._view[pos:pos + to_read]
-        self._pos = pos + to_read
-        return int(to_read)
-
-
 class LocalShardDataset(Dataset):
     """로컬 shard(.bin/.idx)에서 샘플을 읽어오는 Dataset.
 
     핵심 변경(성능)
     -------------
-    - __getitems__(indices)에서:
-      - 큰 chunk 1번 read
-      - 샘플별로 bytes(tobytes) 복사 생성 ❌ 제거
-      - 대신 memoryview 슬라이스(복사 없는 뷰)로 np.load 수행 ✅
-
-    기대 효과(팩트 기반)
-    -------------------
-    - 배치 1개(예: 256개)당 "샘플 blob 전체 복사" 단계가 사라집니다.
-    - 데이터가 클수록(샤드가 커질수록) CPU/메모리 대역폭 낭비가 줄 가능성이 큽니다.
+    - __getitems__(indices)를 구현해서,
+      DataLoader가 "배치 단위"로 인덱스를 넘길 때
+      샘플 256개(배치 1개)를 1번에 크게 읽을 수 있게 했습니다.
+    - (Sampler가 배치가 shard 안에서 연속 256개가 되게 만들어 준다는 전제에서)
+      seek+read 호출 수를 크게 줄일 수 있습니다.
     """
 
     def __init__(
@@ -299,7 +327,7 @@ class LocalShardDataset(Dataset):
             raise ValueError(
                 f"idx table size mismatch: got={arr.size}, expected={int(self._shard_size) * 2}, path={idx_path}"
             )
-        return arr.reshape(int(self._shard_size), 2)  # shape: (shard_size, 2)
+        return arr.reshape(int(self._shard_size), 2)  # (shard_size, 2)
 
     def _ensure_shard_open(self, shard_id: int) -> None:
         """요청된 shard가 캐시에 없으면, 그 shard의 bin/idx를 열어 캐시에 올린다."""
@@ -323,25 +351,52 @@ class LocalShardDataset(Dataset):
         self._cached_idx_table = self._load_idx_table(paths.idx_path)
         self._cached_shard_id = sid
 
-    def _decode_blob_view_to_sample(self, blob_view: memoryview) -> Dict[str, Any]:
-        """npz blob(memoryview)을 sample dict로 복원합니다.
+    def _decode_blob_to_sample(self, blob: Any) -> Dict[str, Any]:
+        """npz blob(바이트/메모리뷰)을 sample dict로 복원합니다.
 
-        핵심
-        ----
-        - blob_view는 chunk 내부를 가리키는 "복사 없는 뷰"입니다.
-        - np.load가 요구하는 read/seek/tell을 제공하기 위해 _ReadonlyMemoryViewFile을 씁니다.
-        - 여기서 샘플 blob 전체를 bytes로 새로 만들지 않습니다.
+        개선 포인트
+        ----------
+        - blob이 memoryview인 경우:
+          · 기존처럼 blob 전체를 bytes로 새로 만들지 않고,
+          · memoryview를 file-like로 감싸서(np.load가 요구하는 read/seek 지원)
+            가능한 한 큰 복사를 피합니다.
 
         Args:
-            blob_view: npz blob 바이트 뷰. shape: (N_bytes,)
+            blob:
+                - bytes / bytearray / memoryview 중 하나를 기대합니다.
+                - shape: (N,)
 
         Returns:
-            sample: Dict[str, Any]
+            Dict[str, Any]:
+                sample dict. 각 value는 np.ndarray 또는 scalar 등. shape: 다양
         """
-        fobj = _ReadonlyMemoryViewFile(blob_view)
-
         sample: Dict[str, Any] = {}
-        with np.load(fobj, allow_pickle=False) as data:
+
+        # ✅ memoryview면: zero-copy에 가까운 방식(추가로 blob 전체 복사 없음)
+        if isinstance(blob, memoryview):
+            with _ReadOnlyMemoryViewIO(blob) as raw_io:
+                # zipfile/np.load 쪽에서 작은 read를 많이 할 수 있어서 버퍼를 하나 둡니다.
+                with io.BufferedReader(raw_io) as buf_io:
+                    with np.load(buf_io, allow_pickle=False) as data:
+                        files_set = set(data.files)
+                        for k in self._expected_keys:
+                            if k not in files_set:
+                                sample[k] = None
+                                continue
+
+                            v = data[k]
+                            # 문자열 scalar(np.array("..."))는 python str로 변환
+                            if isinstance(v, np.ndarray) and v.shape == () and v.dtype.kind in ("U", "S"):
+                                try:
+                                    sample[k] = str(v.item())
+                                except Exception:
+                                    sample[k] = str(v)
+                            else:
+                                sample[k] = v
+            return sample
+
+        # ✅ bytes/bytearray면: 기존 방식 유지(여기서는 원래부터 추가 blob 복사가 없음)
+        with np.load(io.BytesIO(blob), allow_pickle=False) as data:
             files_set = set(data.files)
             for k in self._expected_keys:
                 if k not in files_set:
@@ -358,8 +413,9 @@ class LocalShardDataset(Dataset):
                     sample[k] = v
         return sample
 
+
     def _read_one_blob(self, *, offset: int, length: int) -> bytes:
-        """bin 파일에서 (offset,length)만큼 읽어 blob(bytes)을 돌려줍니다."""
+        """bin 파일에서 (offset,length)만큼 읽어 blob을 돌려줍니다."""
         assert self._cached_bin_fp is not None
         self._cached_bin_fp.seek(int(offset))
         blob = self._cached_bin_fp.read(int(length))
@@ -367,23 +423,33 @@ class LocalShardDataset(Dataset):
             raise IOError(f"failed to read full blob: want={length}, got={len(blob)}")
         return blob
 
-    def _read_one_chunk_for_many_blobs(
+    def _read_many_blobs_one_chunk(
         self,
         offsets: np.ndarray,
         lengths: np.ndarray,
-    ) -> Tuple[memoryview, int, np.ndarray, np.ndarray]:
-        """여러 blob이 포함된 구간을 한 번에 읽고, blob 뷰를 만들 준비를 합니다.
+    ) -> List[memoryview]:
+        """여러 blob을 '한 번에 크게 읽고' memoryview 슬라이스로 돌려줍니다.
+
+        기존 문제
+        --------
+        - chunk를 읽은 뒤, 샘플마다 mv[...].tobytes()로
+          blob 전체를 새 bytes로 복사했습니다.
+
+        개선
+        ----
+        - chunk는 bytes로 1번만 만들고,
+        - 샘플별 blob은 memoryview 슬라이스로만 만들어 반환합니다.
+        - 이후 디코딩에서 memoryview를 file-like로 감싸 np.load에 넣어
+          "blob 전체 복사"를 피합니다.
 
         Args:
             offsets: uint64 배열. shape: (N,)
             lengths: uint64 배열. shape: (N,)
 
         Returns:
-            Tuple[memoryview, int, np.ndarray, np.ndarray]:
-                - chunk_view: 읽어온 큰 덩어리 뷰. shape: (chunk_bytes,)
-                - start: 이 chunk가 원본 bin에서 시작한 offset. shape: ()
-                - rel_offsets: chunk_view 기준 상대 offset(int64). shape: (N,)
-                - lens: 각 blob 길이(int64). shape: (N,)
+            List[memoryview]:
+                length=N
+                각 원소는 해당 샘플 blob을 가리키는 memoryview. shape: (L_i,)
         """
         assert self._cached_bin_fp is not None
 
@@ -399,10 +465,15 @@ class LocalShardDataset(Dataset):
         if len(chunk) != total_len:
             raise IOError(f"failed to read chunk: want={total_len}, got={len(chunk)}")
 
-        rel_offsets = (offs - start).astype(np.int64, copy=False)  # shape: (N,)
-        lens2 = lens.astype(np.int64, copy=False)  # shape: (N,)
+        mv = memoryview(chunk)  # shape: (total_len,)
 
-        return memoryview(chunk), int(start), rel_offsets, lens2
+        out: List[memoryview] = []
+        for o, l in zip(offs, lens):
+            rel = int(o) - start
+            ln = int(l)
+            out.append(mv[rel:rel + ln])  # ✅ tobytes() 제거 (추가 복사 없음)
+        return out
+
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """샘플 1개를 읽어 sample dict로 반환합니다."""
@@ -419,17 +490,16 @@ class LocalShardDataset(Dataset):
         offset_u64 = self._cached_idx_table[int(local_id), 0]
         length_u64 = self._cached_idx_table[int(local_id), 1]
 
-        # 단일 샘플은 기존처럼 bytes로 읽습니다(배치 최적화는 __getitems__에서만).
         blob = self._read_one_blob(offset=int(offset_u64), length=int(length_u64))
-        return self._decode_blob_view_to_sample(memoryview(blob))
+        return self._decode_blob_to_sample(blob)
 
     def __getitems__(self, indices: Sequence[int]) -> List[Dict[str, Any]]:
         """여러 인덱스를 한 번에 읽습니다(배치 최적화).
 
-        변경점(핵심)
-        ----------
-        - 기존: chunk read 후 mv[...] .tobytes()로 샘플 bytes를 새로 만들었다(큰 복사).
-        - 변경: chunk read 후 mv[...] 슬라이스(memoryview)를 그대로 np.load에 전달한다(큰 복사 제거).
+        DataLoader가 batch_size>1일 때, (환경에 따라) indices가 한 번에 들어올 수 있습니다.
+        이때 같은 shard 안의 연속 구간이면:
+          - seek+read 1번으로 큰 덩어리를 읽고
+          - 메모리에서 잘라서 각 샘플을 복원합니다.
 
         Args:
             indices: 인덱스 목록. length=N
@@ -440,9 +510,11 @@ class LocalShardDataset(Dataset):
         if not indices:
             return []
 
+        # 결과를 "입력 순서"대로 돌려주기 위해, 위치를 보존합니다.
         n = int(len(indices))
         out: List[Optional[Dict[str, Any]]] = [None] * n
 
+        # shard_id별로 묶습니다: shard_id -> [(pos, local_id), ...]
         groups: Dict[int, List[Tuple[int, int]]] = {}
         shard_size = int(self._shard_size)
 
@@ -455,28 +527,25 @@ class LocalShardDataset(Dataset):
             lid = i % shard_size
             groups.setdefault(int(sid), []).append((int(pos), int(lid)))
 
+        # shard_id가 1개면(대부분 배치) 1회 큰 읽기 최적화가 잘 먹습니다.
         for sid, pos_lids in groups.items():
             self._ensure_shard_open(int(sid))
             assert self._cached_idx_table is not None
 
-            pos_list = [p for p, _ in pos_lids]      # shape: (N_g,)
-            lid_list = [lid for _, lid in pos_lids]  # shape: (N_g,)
+            # local_id 배열(입력 순서 보존)
+            pos_list = [p for p, _ in pos_lids]
+            lid_list = [lid for _, lid in pos_lids]
 
-            lids = np.asarray(lid_list, dtype=np.int64)                # shape: (N_g,)
-            offsets_u64 = self._cached_idx_table[lids, 0]              # shape: (N_g,)
-            lengths_u64 = self._cached_idx_table[lids, 1]              # shape: (N_g,)
+            lids = np.asarray(lid_list, dtype=np.int64)  # (N_g,)
+            offsets_u64 = self._cached_idx_table[lids, 0]  # (N_g,)
+            lengths_u64 = self._cached_idx_table[lids, 1]  # (N_g,)
 
-            chunk_view, _, rel_offsets, lens = self._read_one_chunk_for_many_blobs(
-                offsets=offsets_u64,
-                lengths=lengths_u64,
-            )
+            blobs = self._read_many_blobs_one_chunk(offsets_u64, lengths_u64)  # length=N_g
 
-            for p, rel, ln in zip(pos_list, rel_offsets.tolist(), lens.tolist()):
-                r = int(rel)
-                l = int(ln)
-                blob_view = chunk_view[r:r + l]  # shape: (l,)
-                out[p] = self._decode_blob_view_to_sample(blob_view)
+            for p, blob in zip(pos_list, blobs):
+                out[p] = self._decode_blob_to_sample(blob)
 
+        # mypy/안전: None이 남아있으면 내부 로직 오류
         final: List[Dict[str, Any]] = []
         for item in out:
             if item is None:
