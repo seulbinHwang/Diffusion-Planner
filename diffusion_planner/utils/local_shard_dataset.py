@@ -71,16 +71,89 @@ class ShardPaths:
     idx_path: str
 
 
+class _ReadonlyMemoryViewFile:
+    """memoryview를 '파일처럼' 읽게 해주는 가벼운 래퍼입니다.
+
+    목적
+    ----
+    - bytes 덩어리(chunk) 안의 일부 구간(memoryview 슬라이스)을
+      np.load가 읽을 수 있도록 "read/seek/tell" 인터페이스를 제공합니다.
+    - 중요한 점:
+      - 이 객체는 **원본 chunk를 복사해서 들고 있지 않습니다.**
+      - 즉, 샘플마다 blob 전체를 bytes로 새로 만드는(tobytes) 큰 복사를 피합니다.
+
+    주의
+    ----
+    - np.load(zip 기반)는 내부적으로 read()를 호출하므로
+      read()가 bytes를 만들어 반환하는 "작은 복사"는 남습니다.
+      하지만 우리가 원래 하던 "샘플 전체 blob을 한 번 더 통째로 복사"는 제거됩니다.
+
+    Args:
+        view (memoryview):
+            npz blob 바이트를 가리키는 뷰. shape: (N_bytes,)
+    """
+
+    def __init__(self, view: memoryview) -> None:
+        self._view: memoryview = view  # shape: (N_bytes,)
+        self._pos: int = 0
+
+    def tell(self) -> int:
+        """현재 읽기 위치를 반환합니다."""
+        return int(self._pos)
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        """읽기 위치를 이동합니다."""
+        n = int(self._view.nbytes)
+        off = int(offset)
+
+        if whence == io.SEEK_SET:
+            new_pos = off
+        elif whence == io.SEEK_CUR:
+            new_pos = int(self._pos) + off
+        elif whence == io.SEEK_END:
+            new_pos = n + off
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+
+        new_pos = max(0, min(n, int(new_pos)))
+        self._pos = int(new_pos)
+        return int(self._pos)
+
+    def read(self, size: int = -1) -> bytes:
+        """현재 위치부터 size 만큼 읽어 bytes로 반환합니다."""
+        n = int(self._view.nbytes)
+        if size is None or int(size) < 0:
+            size_i = n - int(self._pos)
+        else:
+            size_i = int(size)
+
+        if size_i <= 0 or int(self._pos) >= n:
+            return b""
+
+        end = min(n, int(self._pos) + int(size_i))
+        out = self._view[int(self._pos):end].tobytes()
+        self._pos = int(end)
+        return out
+
+    def close(self) -> None:
+        """zipfile이 close()를 부를 수 있어서 준비합니다(실제 자원 해제는 없음)."""
+        return
+
+
 class LocalShardDataset(Dataset):
     """로컬 shard(.bin/.idx)에서 샘플을 읽어오는 Dataset.
 
     핵심 변경(성능)
     -------------
-    - __getitems__(indices)를 구현해서,
-      DataLoader가 "배치 단위"로 인덱스를 넘길 때
-      샘플 256개(배치 1개)를 1번에 크게 읽을 수 있게 했습니다.
-    - (Sampler가 배치가 shard 안에서 연속 256개가 되게 만들어 준다는 전제에서)
-      seek+read 호출 수를 크게 줄일 수 있습니다.
+    - __getitems__(indices)에서:
+      - 큰 chunk 1번 read
+      - 샘플별로 bytes(tobytes) 복사 생성 ❌ 제거
+      - 대신 memoryview 슬라이스(복사 없는 뷰)로 np.load 수행 ✅
+
+    기대 효과(팩트 기반)
+    -------------------
+    - 배치 1개(예: 256개)당 "샘플 blob 전체 복사" 단계가 사라집니다.
+    - 데이터가 클수록(샤드가 커질수록) CPU/메모리 대역폭 낭비가 줄 가능성이 큽니다.
     """
 
     def __init__(
@@ -211,7 +284,7 @@ class LocalShardDataset(Dataset):
             raise ValueError(
                 f"idx table size mismatch: got={arr.size}, expected={int(self._shard_size) * 2}, path={idx_path}"
             )
-        return arr.reshape(int(self._shard_size), 2)  # (shard_size, 2)
+        return arr.reshape(int(self._shard_size), 2)  # shape: (shard_size, 2)
 
     def _ensure_shard_open(self, shard_id: int) -> None:
         """요청된 shard가 캐시에 없으면, 그 shard의 bin/idx를 열어 캐시에 올린다."""
@@ -235,10 +308,25 @@ class LocalShardDataset(Dataset):
         self._cached_idx_table = self._load_idx_table(paths.idx_path)
         self._cached_shard_id = sid
 
-    def _decode_blob_to_sample(self, blob: Any) -> Dict[str, Any]:
-        """npz blob(바이트)을 sample dict로 복원합니다."""
+    def _decode_blob_view_to_sample(self, blob_view: memoryview) -> Dict[str, Any]:
+        """npz blob(memoryview)을 sample dict로 복원합니다.
+
+        핵심
+        ----
+        - blob_view는 chunk 내부를 가리키는 "복사 없는 뷰"입니다.
+        - np.load가 요구하는 read/seek/tell을 제공하기 위해 _ReadonlyMemoryViewFile을 씁니다.
+        - 여기서 샘플 blob 전체를 bytes로 새로 만들지 않습니다.
+
+        Args:
+            blob_view: npz blob 바이트 뷰. shape: (N_bytes,)
+
+        Returns:
+            sample: Dict[str, Any]
+        """
+        fobj = _ReadonlyMemoryViewFile(blob_view)
+
         sample: Dict[str, Any] = {}
-        with np.load(io.BytesIO(blob), allow_pickle=False) as data:
+        with np.load(fobj, allow_pickle=False) as data:
             files_set = set(data.files)
             for k in self._expected_keys:
                 if k not in files_set:
@@ -246,7 +334,6 @@ class LocalShardDataset(Dataset):
                     continue
 
                 v = data[k]
-                # 문자열 scalar(np.array("..."))는 python str로 변환
                 if isinstance(v, np.ndarray) and v.shape == () and v.dtype.kind in ("U", "S"):
                     try:
                         sample[k] = str(v.item())
@@ -257,7 +344,7 @@ class LocalShardDataset(Dataset):
         return sample
 
     def _read_one_blob(self, *, offset: int, length: int) -> bytes:
-        """bin 파일에서 (offset,length)만큼 읽어 blob을 돌려줍니다."""
+        """bin 파일에서 (offset,length)만큼 읽어 blob(bytes)을 돌려줍니다."""
         assert self._cached_bin_fp is not None
         self._cached_bin_fp.seek(int(offset))
         blob = self._cached_bin_fp.read(int(length))
@@ -265,24 +352,28 @@ class LocalShardDataset(Dataset):
             raise IOError(f"failed to read full blob: want={length}, got={len(blob)}")
         return blob
 
-    def _read_many_blobs_one_chunk(
+    def _read_one_chunk_for_many_blobs(
         self,
         offsets: np.ndarray,
         lengths: np.ndarray,
-    ) -> List[bytes]:
-        """여러 blob을 '한 번에 크게 읽고' 잘라서 돌려줍니다.
+    ) -> Tuple[memoryview, int, np.ndarray, np.ndarray]:
+        """여러 blob이 포함된 구간을 한 번에 읽고, blob 뷰를 만들 준비를 합니다.
 
         Args:
             offsets: uint64 배열. shape: (N,)
             lengths: uint64 배열. shape: (N,)
 
         Returns:
-            List[bytes]: length=N
+            Tuple[memoryview, int, np.ndarray, np.ndarray]:
+                - chunk_view: 읽어온 큰 덩어리 뷰. shape: (chunk_bytes,)
+                - start: 이 chunk가 원본 bin에서 시작한 offset. shape: ()
+                - rel_offsets: chunk_view 기준 상대 offset(int64). shape: (N,)
+                - lens: 각 blob 길이(int64). shape: (N,)
         """
         assert self._cached_bin_fp is not None
 
-        offs = offsets.astype(np.int64, copy=False)  # (N,)
-        lens = lengths.astype(np.int64, copy=False)  # (N,)
+        offs = offsets.astype(np.int64, copy=False)  # shape: (N,)
+        lens = lengths.astype(np.int64, copy=False)  # shape: (N,)
 
         start = int(np.min(offs))
         end = int(np.max(offs + lens))
@@ -293,13 +384,10 @@ class LocalShardDataset(Dataset):
         if len(chunk) != total_len:
             raise IOError(f"failed to read chunk: want={total_len}, got={len(chunk)}")
 
-        mv = memoryview(chunk)
-        out: List[bytes] = []
-        for o, l in zip(offs.tolist(), lens.tolist()):
-            rel = int(o - start)
-            ln = int(l)
-            out.append(mv[rel:rel + ln].tobytes())
-        return out
+        rel_offsets = (offs - start).astype(np.int64, copy=False)  # shape: (N,)
+        lens2 = lens.astype(np.int64, copy=False)  # shape: (N,)
+
+        return memoryview(chunk), int(start), rel_offsets, lens2
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """샘플 1개를 읽어 sample dict로 반환합니다."""
@@ -316,16 +404,17 @@ class LocalShardDataset(Dataset):
         offset_u64 = self._cached_idx_table[int(local_id), 0]
         length_u64 = self._cached_idx_table[int(local_id), 1]
 
+        # 단일 샘플은 기존처럼 bytes로 읽습니다(배치 최적화는 __getitems__에서만).
         blob = self._read_one_blob(offset=int(offset_u64), length=int(length_u64))
-        return self._decode_blob_to_sample(blob)
+        return self._decode_blob_view_to_sample(memoryview(blob))
 
     def __getitems__(self, indices: Sequence[int]) -> List[Dict[str, Any]]:
         """여러 인덱스를 한 번에 읽습니다(배치 최적화).
 
-        DataLoader가 batch_size>1일 때, (환경에 따라) indices가 한 번에 들어올 수 있습니다.
-        이때 같은 shard 안의 연속 구간이면:
-          - seek+read 1번으로 큰 덩어리를 읽고
-          - 메모리에서 잘라서 각 샘플을 복원합니다.
+        변경점(핵심)
+        ----------
+        - 기존: chunk read 후 mv[...] .tobytes()로 샘플 bytes를 새로 만들었다(큰 복사).
+        - 변경: chunk read 후 mv[...] 슬라이스(memoryview)를 그대로 np.load에 전달한다(큰 복사 제거).
 
         Args:
             indices: 인덱스 목록. length=N
@@ -336,11 +425,9 @@ class LocalShardDataset(Dataset):
         if not indices:
             return []
 
-        # 결과를 "입력 순서"대로 돌려주기 위해, 위치를 보존합니다.
         n = int(len(indices))
         out: List[Optional[Dict[str, Any]]] = [None] * n
 
-        # shard_id별로 묶습니다: shard_id -> [(pos, local_id), ...]
         groups: Dict[int, List[Tuple[int, int]]] = {}
         shard_size = int(self._shard_size)
 
@@ -353,25 +440,28 @@ class LocalShardDataset(Dataset):
             lid = i % shard_size
             groups.setdefault(int(sid), []).append((int(pos), int(lid)))
 
-        # shard_id가 1개면(대부분 배치) 1회 큰 읽기 최적화가 잘 먹습니다.
         for sid, pos_lids in groups.items():
             self._ensure_shard_open(int(sid))
             assert self._cached_idx_table is not None
 
-            # local_id 배열(입력 순서 보존)
-            pos_list = [p for p, _ in pos_lids]
-            lid_list = [lid for _, lid in pos_lids]
+            pos_list = [p for p, _ in pos_lids]      # shape: (N_g,)
+            lid_list = [lid for _, lid in pos_lids]  # shape: (N_g,)
 
-            lids = np.asarray(lid_list, dtype=np.int64)  # (N_g,)
-            offsets_u64 = self._cached_idx_table[lids, 0]  # (N_g,)
-            lengths_u64 = self._cached_idx_table[lids, 1]  # (N_g,)
+            lids = np.asarray(lid_list, dtype=np.int64)                # shape: (N_g,)
+            offsets_u64 = self._cached_idx_table[lids, 0]              # shape: (N_g,)
+            lengths_u64 = self._cached_idx_table[lids, 1]              # shape: (N_g,)
 
-            blobs = self._read_many_blobs_one_chunk(offsets_u64, lengths_u64)  # length=N_g
+            chunk_view, _, rel_offsets, lens = self._read_one_chunk_for_many_blobs(
+                offsets=offsets_u64,
+                lengths=lengths_u64,
+            )
 
-            for p, blob in zip(pos_list, blobs):
-                out[p] = self._decode_blob_to_sample(blob)
+            for p, rel, ln in zip(pos_list, rel_offsets.tolist(), lens.tolist()):
+                r = int(rel)
+                l = int(ln)
+                blob_view = chunk_view[r:r + l]  # shape: (l,)
+                out[p] = self._decode_blob_view_to_sample(blob_view)
 
-        # mypy/안전: None이 남아있으면 내부 로직 오류
         final: List[Dict[str, Any]] = []
         for item in out:
             if item is None:
