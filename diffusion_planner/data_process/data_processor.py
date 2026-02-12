@@ -1,6 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 import matplotlib
+from matplotlib.collections import PolyCollection
 import time
 from typing import Dict, Tuple, Union, List, Optional, Any
 
@@ -1486,12 +1487,23 @@ class DataProcessor(object):
         all_cur_future_gt_3_dim: np.ndarray,  # shape: (P, 1+T, 3)
         cur_future_pose_integrated_3_dim: np.ndarray,  # shape: (P, 1+T, 3)
         near_cur_future_valid: np.ndarray,  # shape: (P, 1+T)
+        cur_agent_size_2_dim: np.ndarray,  # shape: (P, 2) = (width, length)
     ) -> None:
         """GT vs integrated pose를 배치 플롯으로 PNG 저장한다."""
         if not getattr(self.config, "save_integration_traj", False):
             return
         if not self._save_dir:
             return
+        if cur_agent_size_2_dim.ndim != 2 or cur_agent_size_2_dim.shape[-1] != 2:
+            raise ValueError(
+                "cur_agent_size_2_dim shape must be (P, 2). "
+                f"got {cur_agent_size_2_dim.shape}"
+            )
+        if cur_agent_size_2_dim.shape[0] != all_cur_future_gt_3_dim.shape[0]:
+            raise ValueError(
+                "cur_agent_size_2_dim P must match trajectory P. "
+                f"got {cur_agent_size_2_dim.shape[0]} vs {all_cur_future_gt_3_dim.shape[0]}"
+            )
         debug_dir = os.path.join(self._save_dir, "debug_integration")
         os.makedirs(debug_dir, exist_ok=True)
         plot_idx = int(self._debug_plot_counter)
@@ -1522,54 +1534,110 @@ class DataProcessor(object):
         ax.plot(x_gt.T, y_gt.T, color="tab:blue", alpha=0.6, linewidth=1.0)
         ax.plot(x_int.T, y_int.T, color="tab:orange", alpha=0.6, linewidth=1.0, linestyle="--")
 
-        # heading 방향 화살표 (단위 길이)
+        # heading 방향이 표시된 사각형(속 채우지 않음)
         heading_gt = all_cur_future_gt_3_dim[..., 2].astype(np.float32, copy=False)
         heading_int = cur_future_pose_integrated_3_dim[..., 2].astype(np.float32, copy=False)
+
+        width = cur_agent_size_2_dim[:, 0].astype(np.float32, copy=False)
+        length = cur_agent_size_2_dim[:, 1].astype(np.float32, copy=False)
+        valid_size = np.isfinite(width) & np.isfinite(length) & (width > 0.0) & (length > 0.0)
+
+        width = width[:, None]
+        length = length[:, None]
+        half_w = 0.5 * width
+        half_l = 0.5 * length
+
+        # GT 사각형
         cos_gt = np.cos(heading_gt)
         sin_gt = np.sin(heading_gt)
+        dx_gt = cos_gt * half_l
+        dy_gt = sin_gt * half_l
+        wx_gt = -sin_gt * half_w
+        wy_gt = cos_gt * half_w
+
+        p1x = x_gt + dx_gt + wx_gt
+        p1y = y_gt + dy_gt + wy_gt
+        p2x = x_gt + dx_gt - wx_gt
+        p2y = y_gt + dy_gt - wy_gt
+        p3x = x_gt - dx_gt - wx_gt
+        p3y = y_gt - dy_gt - wy_gt
+        p4x = x_gt - dx_gt + wx_gt
+        p4y = y_gt - dy_gt + wy_gt
+
+        poly_gt = np.stack(
+            [
+                np.stack([p1x, p1y], axis=-1),
+                np.stack([p2x, p2y], axis=-1),
+                np.stack([p3x, p3y], axis=-1),
+                np.stack([p4x, p4y], axis=-1),
+            ],
+            axis=2,
+        )  # (P, T, 4, 2)
+
+        mask_box = mask & valid_size[:, None]
+        poly_gt_flat = poly_gt.reshape(-1, 4, 2)
+        poly_gt_flat = poly_gt_flat[mask_box.reshape(-1)]
+        if poly_gt_flat.size > 0:
+            gt_boxes = PolyCollection(
+                poly_gt_flat,
+                facecolors="none",
+                edgecolors="tab:blue",
+                linewidths=0.6,
+                alpha=0.4,
+            )
+            ax.add_collection(gt_boxes)
+
+        # Integrated 사각형
         cos_int = np.cos(heading_int)
         sin_int = np.sin(heading_int)
+        dx_int = cos_int * half_l
+        dy_int = sin_int * half_l
+        wx_int = -sin_int * half_w
+        wy_int = cos_int * half_w
 
-        x_gt_v = x_gt[mask]
-        y_gt_v = y_gt[mask]
-        u_gt_v = cos_gt[mask]
-        v_gt_v = sin_gt[mask]
-        x_int_v = x_int[mask]
-        y_int_v = y_int[mask]
-        u_int_v = cos_int[mask]
-        v_int_v = sin_int[mask]
+        q1x = x_int + dx_int + wx_int
+        q1y = y_int + dy_int + wy_int
+        q2x = x_int + dx_int - wx_int
+        q2y = y_int + dy_int - wy_int
+        q3x = x_int - dx_int - wx_int
+        q3y = y_int - dy_int - wy_int
+        q4x = x_int - dx_int + wx_int
+        q4y = y_int - dy_int + wy_int
 
-        ax.quiver(
-            x_gt_v,
-            y_gt_v,
-            u_gt_v,
-            v_gt_v,
-            angles="xy",
-            scale_units="xy",
-            scale=1.0,
-            width=0.002,
-            color="tab:blue",
-            alpha=0.4,
-        )
-        ax.quiver(
-            x_int_v,
-            y_int_v,
-            u_int_v,
-            v_int_v,
-            angles="xy",
-            scale_units="xy",
-            scale=1.0,
-            width=0.002,
-            color="tab:orange",
-            alpha=0.4,
-        )
+        poly_int = np.stack(
+            [
+                np.stack([q1x, q1y], axis=-1),
+                np.stack([q2x, q2y], axis=-1),
+                np.stack([q3x, q3y], axis=-1),
+                np.stack([q4x, q4y], axis=-1),
+            ],
+            axis=2,
+        )  # (P, T, 4, 2)
+
+        poly_int_flat = poly_int.reshape(-1, 4, 2)
+        poly_int_flat = poly_int_flat[mask_box.reshape(-1)]
+        if poly_int_flat.size > 0:
+            int_boxes = PolyCollection(
+                poly_int_flat,
+                facecolors="none",
+                edgecolors="tab:orange",
+                linewidths=0.6,
+                alpha=0.4,
+                linestyles="--",
+            )
+            ax.add_collection(int_boxes)
 
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlabel("x")
         ax.set_ylabel("y")
         ax.legend(handles=[dummy_gt, dummy_int], loc="best")
         fig.tight_layout()
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(
+            save_path,
+            dpi=900,
+            bbox_inches="tight",
+            pad_inches=0.02,
+        )
         plt.close(fig)
 
     def _merge_and_interpolate_neighbor_11dim(
@@ -2151,30 +2219,40 @@ class DataProcessor(object):
                 neighbor_agents_current_4_dim = neighbor_agents_past[:, -1, :4],  # (N, 4) # x, y, cos(yaw), sin(yaw)
                 neighbor_future_gt_3_dim = neighbor_future_gt_3_dim,  # (N, future_len, 3) # x, y, yaw
             )
+            # ego는 (1+Tf, 3) 2D이므로 batch 차원을 추가해 (1, 1+Tf, 3)으로 맞춘다.
             all_cur_future_gt_3_dim = np.concatenate(
-                [ego_cur_future_gt_3_dim, neighbor_cur_future_gt_3_dim], axis=0
+                [ego_cur_future_gt_3_dim[None, ...], neighbor_cur_future_gt_3_dim], axis=0
             ) # (1+N, 1+Tf, 3)
             # near_future_segment_valid: (1+N, Tf)
             near_cur_future_valid, near_future_segment_valid = self._get_near_future_segment_valid(
                 ego_cur_future_gt_11_dim=np.concatenate([ego_agent_past[-1:, :], ego_future_gt_11_dim], axis=0),  # (1+future_len, 11)
-                neighbor_cur_future_gt_11_dim=np.concatenate([neighbor_agents_past[:, -1, :], neighbor_future_gt_11_dim], axis=1),  # (N, 1+future_len, 11)
+                neighbor_cur_future_gt_11_dim=np.concatenate(
+                    [neighbor_agents_past[:, -1:, :], neighbor_future_gt_11_dim],
+                    axis=1,
+                ),  # (N, 1+future_len, 11)
             )
             # cur_future_control_gt_3_dim: (1+N, Tf, 3)
             cur_future_control_gt_3_dim = differentiate_numpy_pose3_to_control3(all_cur_future_gt_3_dim, dt=0.1)
             cur_future_control_gt_3_dim[~near_future_segment_valid] = 0.0
             # cur_future_control_gt_3_dim 을 적분하여 다시 pose로 만들자. (무효점은 0.)
-            cur_future_pose_integrated_3_dim = integrate_numpy_control3_to_pose3_midpoint(
-                cur_future_control_gt_3_dim,  # (1+N, Tf, 3)
-                all_cur_future_gt_3_dim[:, 0, :],  # (1+N, 3) 현재 pose
-                dt=0.1,
-            )  # (1+N, 1+Tf, 3)
-            cur_future_pose_integrated_3_dim[~near_cur_future_valid] = 0.0
-            # all_cur_future_gt_3_dim 와 cur_future_pose_integrated_3_dim 을 그림으로 그리기 (png로)
-            self._save_integration_debug_plot(
-                all_cur_future_gt_3_dim=all_cur_future_gt_3_dim,
-                cur_future_pose_integrated_3_dim=cur_future_pose_integrated_3_dim,
-                near_cur_future_valid=near_cur_future_valid,
-            )
+            # cur_future_pose_integrated_3_dim = integrate_numpy_control3_to_pose3_midpoint(
+            #     cur_future_control_gt_3_dim,  # (1+N, Tf, 3)
+            #     all_cur_future_gt_3_dim[:, 0, :],  # (1+N, 3) 현재 pose
+            #     dt=0.1,
+            # )  # (1+N, 1+Tf, 3)
+            # cur_future_pose_integrated_3_dim[~near_cur_future_valid] = 0.0
+            # # 현재 프레임의 width/length (ego + neighbors)
+            # cur_agent_size_2_dim = np.concatenate(
+            #     [ego_agent_past[-1, 6:8][None, :], neighbor_agents_past[:, -1, 6:8]],
+            #     axis=0,
+            # )  # (1+N, 2)
+            # # all_cur_future_gt_3_dim 와 cur_future_pose_integrated_3_dim 을 그림으로 그리기 (png로)
+            # self._save_integration_debug_plot(
+            #     all_cur_future_gt_3_dim=all_cur_future_gt_3_dim,
+            #     cur_future_pose_integrated_3_dim=cur_future_pose_integrated_3_dim,
+            #     near_cur_future_valid=near_cur_future_valid,
+            #     cur_agent_size_2_dim=cur_agent_size_2_dim,
+            # )
 
 
             # cur_future_control_gt_3_dim 에서,
