@@ -593,7 +593,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dst_list", type=str, required=True, help="로컬 train_set_list(json) 저장 경로")
     p.add_argument("--force_rebuild", type=str, default="false", help="true면 항상 다시 복사")
     p.add_argument("--suffix", type=str, default=".npz", help="복사 대상 파일 확장자(기본 .npz)")
-    p.add_argument("--num_workers", type=int, default=8, help="복사 작업자 수(기본 8)")
+    p.add_argument("--num_workers", type=int, default=24, help="복사 작업자 수(기본 8)")
     return p
 
 
