@@ -1383,7 +1383,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
-        default=0,
+        default=24,
         help="동시에 처리할 개수. 0이면 자동, 1이면 순차 실행.",
     )
     parser.add_argument(
