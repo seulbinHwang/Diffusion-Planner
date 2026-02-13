@@ -889,7 +889,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--use_agent_route_lane_order",
-        action="store_true",
+        type=bool,
+        default=False,
         help="dataset.py와 동일하게 agent_route_lane_order 키도 sample에 포함합니다.",
     )
     return parser
