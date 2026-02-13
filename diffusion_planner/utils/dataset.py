@@ -57,7 +57,6 @@ _PRECOMPUTED_GT4_KEYS: List[str] = [
 
 _PRECOMPUTED_CONTROL_KEYS: List[str] = [
     "past_future_seg_control_gt_3_dim",
-    "future_seg_control_gt_3_dim",  # 과거 버전 호환
 ]
 
 
