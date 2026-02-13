@@ -97,21 +97,21 @@ FORCE_REBUILD=0
   --dst_root "$LOCAL_TRAIN_SET_PATH" \
   --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
   --force_rebuild "$FORCE_REBUILD" \
-  --num_workers 8
-
-# ---- 학습은 로컬 데이터로 ----
-"$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
-  --nnodes 1 --nproc-per-node 6 --standalone \
-  "${TORCHRUN_LOG_ARGS[@]}" \
-  train_predictor.py \
-    --train_set "$LOCAL_TRAIN_SET_PATH"/ \
-    --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "final_48_synchronize" \
-    --batch_size 1536 \
-    --learning_rate 1e-3 \
-    --min_learning_rate 1e-6 \
-    --profile_feasible False \
-    --use_feasible False \
-    --use_feasible_dl False \
-    --use_feasible_filter False \
-    --feasible_stride_dt 0.1
+  --num_workers 24
+#
+## ---- 학습은 로컬 데이터로 ----
+#"$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
+#  --nnodes 1 --nproc-per-node 6 --standalone \
+#  "${TORCHRUN_LOG_ARGS[@]}" \
+#  train_predictor.py \
+#    --train_set "$LOCAL_TRAIN_SET_PATH"/ \
+#    --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
+#    --name "final_48_synchronize" \
+#    --batch_size 1536 \
+#    --learning_rate 1e-3 \
+#    --min_learning_rate 1e-6 \
+#    --profile_feasible False \
+#    --use_feasible False \
+#    --use_feasible_dl False \
+#    --use_feasible_filter False \
+#    --feasible_stride_dt 0.1
