@@ -303,29 +303,28 @@ def _get_near_future_segment_valid(
     return near_cur_future_valid, near_future_segment_valid
 
 
-def build_cur_future_control_gt_3_dim_from_npz_arrays(
-    ego_agent_past: ArrayF,  # (Tp,11)
-    ego_future_gt_11_dim: ArrayF,  # (Tf,11)
+def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)  Tp=20+1
+    ego_future_gt_11_dim: ArrayF,  # (Tf,11)  Tf=80
     neighbor_agents_past: ArrayF,  # (N,Tp,11)
     neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
     *,
     dt: float,
     eps: float = 1e-8,
 ) -> ArrayF:
-    """npz 내부의 11차원 궤적들로부터 cur_future_control_gt_3_dim을 만듭니다.
+    """npz 내부의 11차원 궤적들로부터 (과거~미래) 구간 제어를 만듭니다.
 
-    Args:
-        ego_agent_past (np.ndarray): (Tp,11)
-        ego_future_gt_11_dim (np.ndarray): (Tf,11)
-        neighbor_agents_past (np.ndarray): (N,Tp,11)
-        neighbor_future_gt_11_dim (np.ndarray): (N,Tf,11)
-        dt (float): 시간 간격(예: 0.1)
-        eps (float): 0 판정 기준(아주 작은 값)
+    입력 포즈 개수:
+        - 과거 20 + 현재 1 + 미래 Tf(=80) = 101 개 포즈
+
+    출력 제어(구간) 개수:
+        - (101 - 1) = 100 = 과거 구간 20 + 미래 구간 80
 
     Returns:
         np.ndarray:
-            future_seg_control_gt_3_dim, shape (1+N, Tf, 3)
+            past_future_seg_control_gt_3_dim, shape (1+N, (Tp-1)+Tf, 3)
             - 마지막 3: (v_x^b, v_y^b, omega)
+            - 무효 구간은 0.0
     """
     ego_past = np.asarray(ego_agent_past)
     ego_fut11 = np.asarray(ego_future_gt_11_dim)
@@ -341,12 +340,12 @@ def build_cur_future_control_gt_3_dim_from_npz_arrays(
     if nbr_fut11.ndim != 3 or nbr_fut11.shape[-1] != 11:
         raise ValueError(f"neighbor_future_gt_11_dim shape는 (N,Tf,11)이어야 합니다. got {nbr_fut11.shape}")
 
-    Tp = int(ego_past.shape[0])
-    Tf = int(ego_fut11.shape[0])
+    Tp = int(ego_past.shape[0])  # past(20)+cur(1) = 21
+    Tf = int(ego_fut11.shape[0])  # 80
     N = int(nbr_past.shape[0])
 
-    if Tp <= 0:
-        raise ValueError(f"ego_agent_past Tp는 최소 1이어야 합니다. got Tp={Tp}")
+    if Tp <= 1:
+        raise ValueError(f"Tp는 최소 2(=과거1+현재1) 이상이어야 합니다. got Tp={Tp}")
     if nbr_past.shape[1] != Tp:
         raise ValueError(f"neighbor_agents_past의 Tp가 ego와 같아야 합니다. got {nbr_past.shape[1]} vs {Tp}")
     if nbr_fut11.shape[0] != N:
@@ -354,47 +353,68 @@ def build_cur_future_control_gt_3_dim_from_npz_arrays(
     if nbr_fut11.shape[1] != Tf:
         raise ValueError(f"neighbor_future_gt_11_dim의 Tf가 ego_future와 같아야 합니다. got {nbr_fut11.shape[1]} vs {Tf}")
 
-    # 11 -> 3 (x,y,heading)
-    ego_future_gt_3_dim = _traj11_to_traj3_heading(ego_fut11)          # (Tf,3)
-    neighbor_future_gt_3_dim = _traj11_to_traj3_heading(nbr_fut11)     # (N,Tf,3)
+    dt = float(dt)
+    if (not np.isfinite(dt)) or dt <= 0.0:
+        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
 
-    # 현재+미래 3D 만들기
-    ego_cur_future_gt_3_dim = _get_ego_cur_future_gt_3_dim(
-        ego_current_4_dim=ego_past[-1, :4],          # (4,)
-        ego_future_gt_3_dim=ego_future_gt_3_dim,     # (Tf,3)
-        eps=eps,
-    )  # (1+Tf,3)
+    # float32로 정리 (삼각함수/나눗셈 안정)
+    ego_past = ego_past.astype(np.float32 if ego_past.dtype.kind != "f" else ego_past.dtype, copy=False)
+    ego_fut11 = ego_fut11.astype(ego_past.dtype, copy=False)
+    nbr_past = nbr_past.astype(ego_past.dtype, copy=False)
+    nbr_fut11 = nbr_fut11.astype(ego_past.dtype, copy=False)
 
-    neighbor_cur_future_gt_3_dim = _get_neighbor_cur_future_gt_3_dim(
-        neighbor_agents_current_4_dim=nbr_past[:, -1, :4],   # (N,4)
-        neighbor_future_gt_3_dim=neighbor_future_gt_3_dim,   # (N,Tf,3)
-        eps=eps,
-    )  # (N,1+Tf,3)
+    # -----------------------------
+    # (1) 과거+현재+미래 11D 타임라인 만들기
+    # -----------------------------
+    # ego_all11: (Tp+Tf, 11)
+    ego_all11 = np.concatenate([ego_past, ego_fut11], axis=0).astype(np.float32, copy=False)
+    # nbr_all11: (N, Tp+Tf, 11)
+    nbr_all11 = np.concatenate([nbr_past, nbr_fut11], axis=1).astype(np.float32, copy=False)
 
-    # 합치기: (1+N,1+Tf,3)
-    all_cur_future_gt_3_dim = np.concatenate(
-        [ego_cur_future_gt_3_dim[None, ...], neighbor_cur_future_gt_3_dim],
+    # (안전) 현재가 무효면 그 에이전트 전체를 0으로
+    ego_cur_valid = bool((np.abs(ego_past[-1, :8]) > eps).any())
+    if not ego_cur_valid:
+        ego_all11[:] = 0.0
+
+    if N > 0:
+        nbr_cur_valid_mask = (np.abs(nbr_past[:, -1, :8]) > eps).any(axis=1)  # (N,)
+        if not np.all(nbr_cur_valid_mask):
+            nbr_all11 = np.array(nbr_all11, copy=True)  # 쓰기 가능하게
+            nbr_all11[~nbr_cur_valid_mask, :, :] = 0.0
+
+    # -----------------------------
+    # (2) 11D -> pose3(x,y,heading) 변환 (과거+현재+미래 전체)
+    # -----------------------------
+    ego_pose_all3 = _traj11_to_traj3_heading(ego_all11)      # (Tp+Tf, 3)
+    nbr_pose_all3 = _traj11_to_traj3_heading(nbr_all11)      # (N, Tp+Tf, 3)
+
+    # all_pose: (1+N, Tp+Tf, 3)  == (P, 1+T, 3)
+    all_pose = np.concatenate(
+        [ego_pose_all3[None, ...], nbr_pose_all3],
         axis=0,
     ).astype(np.float32, copy=False)
 
-    # 유효 구간 마스크 (앞 8차원이 전부 0이면 무효)
-    ego_cur_future_gt_11_dim = np.concatenate([ego_past[-1:, :], ego_fut11], axis=0)  # (1+Tf,11)
-    neighbor_cur_future_gt_11_dim = np.concatenate([nbr_past[:, -1:, :], nbr_fut11], axis=1)  # (N,1+Tf,11)
-    _, near_future_segment_valid = _get_near_future_segment_valid(
-        ego_cur_future_gt_11_dim=ego_cur_future_gt_11_dim,
-        neighbor_cur_future_gt_11_dim=neighbor_cur_future_gt_11_dim,
-        eps=eps,
-    )  # (1+N,Tf)
+    # -----------------------------
+    # (3) “과거~미래 전체” 구간 유효 마스크 만들기 (101포즈 -> 100구간)
+    # -----------------------------
+    ego_valid = (np.abs(ego_all11[:, :8]) > eps).any(axis=1)            # (Tp+Tf,)
+    nbr_valid = (np.abs(nbr_all11[:, :, :8]) > eps).any(axis=2)         # (N, Tp+Tf)
+    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N, Tp+Tf)
 
-    # 제어 복원
-    future_seg_control_gt_3_dim = differentiate_numpy_pose3_to_control3(
-        all_cur_future_gt_3_dim,
-        dt=float(dt),
-    )  # (1+N,Tf,3)
+    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)  # (1+N, (Tp+Tf-1)) = (1+N, (Tp-1)+Tf)
 
-    # 무효 구간은 0
-    future_seg_control_gt_3_dim[~near_future_segment_valid] = 0.0
-    return future_seg_control_gt_3_dim.astype(np.float32, copy=False)
+    # -----------------------------
+    # (4) 전체 타임라인 차분 -> 구간 제어(100개) 만들기
+    # -----------------------------
+    # controls: (1+N, (Tp+Tf-1), 3)
+    controls = differentiate_numpy_pose3_to_control3(
+        all_pose,
+        dt=dt,
+    ).astype(np.float32, copy=False)
+
+    controls[~seg_valid] = 0.0
+    return controls
+
 
 
 def _load_training_file_list(json_path: str) -> List[str]:
@@ -767,7 +787,8 @@ def _process_one_file(
     data = _read_npz_as_dict(npz_path)
 
     # (A) control key 처리
-    need_control = bool(overwrite) or ("future_seg_control_gt_3_dim" not in data)
+    control_key = "past_future_seg_control_gt_3_dim"
+    need_control = bool(overwrite) or (control_key not in data)
 
     changed = False
     if need_control:
@@ -781,7 +802,7 @@ def _process_one_file(
             if k not in data:
                 return False, f"missing key '{k}'"
 
-        control = build_cur_future_control_gt_3_dim_from_npz_arrays(
+        control = build_past_future_seg_control_gt_3_dim_from_npz_arrays(
             ego_agent_past=data["ego_agent_past"],
             ego_future_gt_11_dim=data["ego_future_gt_11_dim"],
             neighbor_agents_past=data["neighbor_agents_past"],
@@ -789,7 +810,7 @@ def _process_one_file(
             dt=float(dt),
         )
 
-        data["future_seg_control_gt_3_dim"] = control
+        data[control_key] = control
         changed = True
 
     # (B) dataset.py __getitem__의 sample dict 로직을 동일하게 수행 (tfrecord_path 제외)
