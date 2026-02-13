@@ -13,6 +13,310 @@ from numpy.typing import NDArray
 from typing import Any, List, Sequence, Tuple
 import os
 import numpy as np
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+
+# --- add_control_to_npz.py로 미리 저장될 수 있는 key들 ---
+_PRECOMPUTED_VALIDITY_KEYS: List[str] = [
+    "ego_agent_past_is_valid",
+    "ego_future_gt_is_valid",
+    "neighbor_agents_past_is_valid",
+    "neighbor_agents_is_valid",
+    "neighbor_future_gt_is_valid",
+    "stop_sign_is_valid",
+    "crosswalk_is_valid",
+    "lanes_len_is_valid",
+    "lanes_is_valid",
+    "static_objects_is_valid",
+    "route_lanes_len_is_valid",
+    "route_lanes_is_valid",
+    "agent_route_lane_order_is_valid",
+    "speed_bump_is_valid",
+    "driveway_is_valid",
+    "road_edge_is_valid",
+]
+
+_PRECOMPUTED_NEAR_KEYS: List[str] = [
+    "near_agents_past",
+    "non_near_agents_past",
+    "near_future_gt_3_dim",
+    "near_agents_past_is_valid",
+    "non_near_agents_past_is_valid",
+    "near_agents_is_valid",
+    "non_near_agents_is_valid",
+    "near_future_gt_is_valid",
+    "non_near_future_gt_is_valid",
+]
+
+_PRECOMPUTED_GT4_KEYS: List[str] = [
+    "ego_future_gt_4_dim",
+    "near_future_gt_4_dim",
+]
+
+_PRECOMPUTED_CONTROL_KEYS: List[str] = [
+    "past_future_seg_control_gt_3_dim",
+    "future_seg_control_gt_3_dim",  # 과거 버전 호환
+]
+
+
+def _unique_keep_order(items: Sequence[str]) -> List[str]:
+    """중복을 제거하되, 처음 등장한 순서는 유지합니다."""
+    seen = set()
+    out: List[str] = []
+    for x in items:
+        k = str(x)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out
+
+
+def _is_np_array(value: Any) -> bool:
+    """value가 numpy 배열인지 확인합니다."""
+    return isinstance(value, np.ndarray)
+
+
+def _infer_agent_dim_from_neighbor_agents_past(neighbor_agents_past: np.ndarray) -> Optional[int]:
+    """neighbor_agents_past에서 agent 축이 몇 번째인지 추정합니다.
+
+    Args:
+        neighbor_agents_past (np.ndarray):
+            - (A, T, F) 또는 (B, A, T, F) 형태를 기대합니다.
+
+    Returns:
+        Optional[int]:
+            - (A, T, F)면 0
+            - (B, A, T, F)면 1
+            - 그 외면 None
+    """
+    if not _is_np_array(neighbor_agents_past):
+        return None
+    if int(neighbor_agents_past.ndim) == 3:
+        return 0
+    if int(neighbor_agents_past.ndim) == 4:
+        return 1
+    return None
+
+
+def _slice_np_along_dim(value: np.ndarray, dim: int, end: int) -> np.ndarray:
+    """numpy 배열을 특정 축 기준으로 [:end] 슬라이스합니다."""
+    if int(value.ndim) <= int(dim):
+        return value
+    slices = [slice(None)] * int(value.ndim)
+    slices[int(dim)] = slice(0, int(end))
+    return value[tuple(slices)]
+
+
+def _ensure_validity_keys_if_needed_inplace(sample: Dict[str, Any]) -> None:
+    """validity key를 '이미 있으면 그대로 쓰고', 없으면 계산해서 채웁니다.
+
+    규칙
+    ----
+    - key가 이미 있고 np.ndarray면: 그대로 둡니다.
+    - key가 없거나 None인데, 원본 입력도 없으면: 그 key는 None으로 채워둡니다.
+    - key가 없거나 None인데, 원본 입력은 있으면: add_validity_keys_inplace로 계산합니다.
+    """
+    # 어떤 validity는 입력이 없으면 None이 정상인데, npz에는 None을 저장하지 않았을 수 있음.
+    # 그래서 "입력도 없으면 None으로만 채움"을 먼저 하고, 정말 계산이 필요한 경우만 계산합니다.
+
+    def _has_source_for(key: str) -> bool:
+        if key == "ego_future_gt_is_valid":
+            # planner_future_11_dim(=ego_future_gt_11_dim rename)이 있으면 계산 가능
+            return sample.get("planner_future_11_dim", None) is not None or sample.get("ego_future_gt_11_dim", None) is not None
+        if key == "driveway_is_valid":
+            return sample.get("driveway_points", None) is not None or sample.get("driveway", None) is not None
+        if key in ("lanes_len_is_valid", "lanes_is_valid"):
+            return sample.get("lanes", None) is not None
+        if key in ("route_lanes_len_is_valid", "route_lanes_is_valid"):
+            return sample.get("route_lanes", None) is not None
+        if key == "static_objects_is_valid":
+            return sample.get("static_objects", None) is not None
+        if key == "stop_sign_is_valid":
+            return sample.get("stop_sign_points", None) is not None
+        if key == "crosswalk_is_valid":
+            return sample.get("crosswalk_points", None) is not None
+        if key == "speed_bump_is_valid":
+            return sample.get("speed_bump_points", None) is not None
+        if key == "road_edge_is_valid":
+            return sample.get("road_edge", None) is not None
+        if key == "agent_route_lane_order_is_valid":
+            return sample.get("agent_route_lane_order", None) is not None
+        if key == "ego_agent_past_is_valid":
+            return sample.get("ego_agent_past", None) is not None
+        if key in ("neighbor_agents_past_is_valid", "neighbor_agents_is_valid"):
+            return sample.get("neighbor_agents_past", None) is not None
+        if key == "neighbor_future_gt_is_valid":
+            return sample.get("neighbor_future_gt_11_dim", None) is not None
+        return False
+
+    need_compute = False
+    for k in _PRECOMPUTED_VALIDITY_KEYS:
+        v = sample.get(k, None)
+        if _is_np_array(v):
+            continue
+
+        # v가 None/미존재인데, source도 없으면 None으로 채워서 "키 존재"만 맞춤
+        if not _has_source_for(k):
+            sample[k] = None
+            continue
+
+        # source는 있는데 값이 없으면 계산 필요
+        need_compute = True
+
+    if need_compute:
+        # 기존 공통 유틸 그대로 사용 (규칙 통일)
+        add_validity_keys_inplace(sample, missing_policy="none")
+
+
+def _expected_near_num_from_sample(
+    sample: Dict[str, Any],
+    *,
+    predicted_neighbor_num: int,
+    agent_dim: int,
+    has_batch_dim: bool,
+    use_agent_route_lane_order: bool,
+) -> int:
+    """현재 sample 내용과 설정값으로 'near로 남아야 하는 agent 수'를 계산합니다."""
+    requested = max(0, int(predicted_neighbor_num))
+
+    neighbor_agents_past = sample.get("neighbor_agents_past", None)
+    if not _is_np_array(neighbor_agents_past):
+        return 0
+
+    near_num = min(requested, int(neighbor_agents_past.shape[int(agent_dim)]))
+
+    neighbor_future = sample.get("neighbor_future_gt_3_dim", None)
+    if _is_np_array(neighbor_future):
+        expected_ndim = 4 if has_batch_dim else 3
+        if int(neighbor_future.ndim) == int(expected_ndim):
+            near_num = min(near_num, int(neighbor_future.shape[int(agent_dim)]))
+
+    if use_agent_route_lane_order:
+        aro = sample.get("agent_route_lane_order", None)
+        if _is_np_array(aro):
+            expected_ndim = 3 if has_batch_dim else 2
+            if int(aro.ndim) == int(expected_ndim):
+                near_num = min(near_num, int(aro.shape[int(agent_dim)]))
+
+        aro_valid = sample.get("agent_route_lane_order_is_valid", None)
+        if _is_np_array(aro_valid):
+            expected_ndim = 2 if has_batch_dim else 1
+            if int(aro_valid.ndim) == int(expected_ndim):
+                near_num = min(near_num, int(aro_valid.shape[int(agent_dim)]))
+
+    return int(near_num)
+
+
+def _near_keys_are_ready(
+    sample: Dict[str, Any],
+    *,
+    near_num: int,
+    agent_dim: int,
+    has_batch_dim: bool,
+) -> bool:
+    """near 관련 key들이 이미 있고, near_num과 shape도 맞는지 확인합니다."""
+    near_agents_past = sample.get("near_agents_past", None)
+    non_near_agents_past = sample.get("non_near_agents_past", None)
+    if (not _is_np_array(near_agents_past)) or (not _is_np_array(non_near_agents_past)):
+        return False
+
+    # neighbor_agents_past와 같은 ndim(3 또는 4)이어야 함
+    neighbor_agents_past = sample.get("neighbor_agents_past", None)
+    if not _is_np_array(neighbor_agents_past):
+        return False
+
+    if int(near_agents_past.ndim) != int(neighbor_agents_past.ndim):
+        return False
+    if int(near_agents_past.shape[int(agent_dim)]) != int(near_num):
+        return False
+
+    # neighbor_future가 있으면 near_future_gt_3_dim도 있어야 함
+    neighbor_future = sample.get("neighbor_future_gt_3_dim", None)
+    if _is_np_array(neighbor_future):
+        expected_ndim = 4 if has_batch_dim else 3
+        if int(neighbor_future.ndim) == int(expected_ndim):
+            near_future = sample.get("near_future_gt_3_dim", None)
+            if not _is_np_array(near_future):
+                return False
+            if int(near_future.shape[int(agent_dim)]) != int(near_num):
+                return False
+
+    # neighbor_*_is_valid가 "배열"로 있으면 near_*_is_valid도 있어야 함
+    neighbor_agents_past_is_valid = sample.get("neighbor_agents_past_is_valid", None)
+    if _is_np_array(neighbor_agents_past_is_valid):
+        expected_ndim = 3 if has_batch_dim else 2
+        if int(neighbor_agents_past_is_valid.ndim) == int(expected_ndim):
+            if not _is_np_array(sample.get("near_agents_past_is_valid", None)):
+                return False
+            if not _is_np_array(sample.get("non_near_agents_past_is_valid", None)):
+                return False
+
+    neighbor_agents_is_valid = sample.get("neighbor_agents_is_valid", None)
+    if _is_np_array(neighbor_agents_is_valid):
+        expected_ndim = 2 if has_batch_dim else 1
+        if int(neighbor_agents_is_valid.ndim) == int(expected_ndim):
+            if not _is_np_array(sample.get("near_agents_is_valid", None)):
+                return False
+            if not _is_np_array(sample.get("non_near_agents_is_valid", None)):
+                return False
+
+    neighbor_future_gt_is_valid = sample.get("neighbor_future_gt_is_valid", None)
+    if _is_np_array(neighbor_future_gt_is_valid):
+        expected_ndim = 3 if has_batch_dim else 2
+        if int(neighbor_future_gt_is_valid.ndim) == int(expected_ndim):
+            if not _is_np_array(sample.get("near_future_gt_is_valid", None)):
+                return False
+            if not _is_np_array(sample.get("non_near_future_gt_is_valid", None)):
+                return False
+
+    return True
+
+
+def _ensure_near_keys_if_needed_inplace(
+    sample: Dict[str, Any],
+    *,
+    predicted_neighbor_num: int,
+    use_agent_route_lane_order: bool,
+) -> None:
+    """near 관련 key를 '이미 있으면 그대로 쓰고', 없거나 안 맞으면 다시 만듭니다."""
+    neighbor_agents_past = sample.get("neighbor_agents_past", None)
+    if not _is_np_array(neighbor_agents_past):
+        return
+
+    agent_dim = _infer_agent_dim_from_neighbor_agents_past(neighbor_agents_past)
+    if agent_dim is None:
+        # shape가 예상과 다르면 기존 유틸이 알아서 스킵할 수도 있으니 호출만 해봄
+        add_near_agents_info_inplace(sample, predicted_neighbor_num=int(predicted_neighbor_num))
+        return
+
+    has_batch_dim = (int(agent_dim) == 1)
+
+    near_num = _expected_near_num_from_sample(
+        sample,
+        predicted_neighbor_num=int(predicted_neighbor_num),
+        agent_dim=int(agent_dim),
+        has_batch_dim=bool(has_batch_dim),
+        use_agent_route_lane_order=bool(use_agent_route_lane_order),
+    )
+
+    if _near_keys_are_ready(sample, near_num=int(near_num), agent_dim=int(agent_dim), has_batch_dim=bool(has_batch_dim)):
+        # add_control_to_npz는 원본 key를 덮어쓰지 않게 했으므로,
+        # sample dict에서는 agent_route_lane_order만 near 길이로 맞춰줍니다(필요한 경우).
+        if use_agent_route_lane_order:
+            aro = sample.get("agent_route_lane_order", None)
+            if _is_np_array(aro):
+                sample["agent_route_lane_order"] = _slice_np_along_dim(aro, dim=int(agent_dim), end=int(near_num))
+
+            aro_valid = sample.get("agent_route_lane_order_is_valid", None)
+            if _is_np_array(aro_valid):
+                sample["agent_route_lane_order_is_valid"] = _slice_np_along_dim(aro_valid, dim=int(agent_dim), end=int(near_num))
+        return
+
+    # 없거나 shape가 안 맞으면 원래 유틸로 재생성
+    add_near_agents_info_inplace(sample, predicted_neighbor_num=int(predicted_neighbor_num))
 
 
 def _normalize_use_data_percent(use_data_percent: Any) -> float:
@@ -477,35 +781,45 @@ class DiffusionPlannerData(Dataset):
         return future_gt_4_dim
 
     def _add_future_gt_4_dim_keys_inplace(self, sample: Dict[str, Any]) -> None:
-        """sample dict에 ego/near의 *_future_gt_4_dim 키를 추가합니다.
+        """sample dict에 ego/near의 *_future_gt_4_dim 키를 필요할 때만 추가합니다.
 
-        - sample을 새로 만들지 않고, 들어온 sample dict를 그대로 수정합니다.
-        - 필요한 입력 키:
-          - ego: "ego_future_gt_3_dim", "ego_future_gt_is_valid"
-          - near: "near_future_gt_3_dim", "near_future_gt_is_valid"
-
-        Args:
-            sample:
-                __getitem__에서 만드는 샘플 dict.
+        규칙
+        ----
+        - key가 이미 있고 shape가 맞으면 그대로 둡니다.
+        - 없거나 shape가 안 맞으면 계산해서 채웁니다.
         """
         # ego
-        ego_future_gt_3_dim = sample["ego_future_gt_3_dim"]  # (future_len, 3)
-        ego_future_gt_is_valid = sample[
-            "ego_future_gt_is_valid"]  # (future_len,)
-        sample["ego_future_gt_4_dim"] = self._build_future_gt_4_dim_from_3_dim(
-            ego_future_gt_3_dim,
-            ego_future_gt_is_valid,
-        )  # (future_len, 4)
+        ego_gt3 = sample.get("ego_future_gt_3_dim", None)          # (Tf, 3)
+        ego_valid = sample.get("ego_future_gt_is_valid", None)     # (Tf,)
+        ego_gt4 = sample.get("ego_future_gt_4_dim", None)          # (Tf, 4) 예상
+
+        if _is_np_array(ego_gt3) and _is_np_array(ego_valid):
+            need_ego = True
+            if _is_np_array(ego_gt4):
+                if int(ego_gt4.ndim) == 2 and int(ego_gt4.shape[-1]) == 4 and ego_gt4.shape[0] == ego_gt3.shape[0]:
+                    need_ego = False
+            if need_ego:
+                sample["ego_future_gt_4_dim"] = self._build_future_gt_4_dim_from_3_dim(
+                    ego_gt3,
+                    ego_valid,
+                )
 
         # near
-        near_future_gt_3_dim = sample[
-            "near_future_gt_3_dim"]  # (Pnn, future_len, 3)
-        near_future_gt_is_valid = sample[
-            "near_future_gt_is_valid"]  # (Pnn, future_len)
-        sample["near_future_gt_4_dim"] = self._build_future_gt_4_dim_from_3_dim(
-            near_future_gt_3_dim,
-            near_future_gt_is_valid,
-        )  # (Pnn, future_len, 4)
+        near_gt3 = sample.get("near_future_gt_3_dim", None)        # (Pnn, Tf, 3)
+        near_valid = sample.get("near_future_gt_is_valid", None)   # (Pnn, Tf)
+        near_gt4 = sample.get("near_future_gt_4_dim", None)        # (Pnn, Tf, 4) 예상
+
+        if _is_np_array(near_gt3) and _is_np_array(near_valid):
+            need_near = True
+            if _is_np_array(near_gt4):
+                if int(near_gt4.ndim) == 3 and int(near_gt4.shape[-1]) == 4 and near_gt4.shape[:2] == near_gt3.shape[:2]:
+                    need_near = False
+            if need_near:
+                sample["near_future_gt_4_dim"] = self._build_future_gt_4_dim_from_3_dim(
+                    near_gt3,
+                    near_valid,
+                )
+
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         file_name = self.data_list[idx]
@@ -527,6 +841,9 @@ class DiffusionPlannerData(Dataset):
             "lanes_speed_limit",
             "lanes_has_speed_limit",
         ]
+
+        # ✅ 전처리로 추가된 control 키도 읽어오도록 포함(없으면 None)
+        both_keys += _PRECOMPUTED_CONTROL_KEYS
 
         nuplan_only_keys: List[str] = [
             "static_objects",
@@ -554,22 +871,33 @@ class DiffusionPlannerData(Dataset):
                 "target_z",
             ]
 
-        npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
+        # ✅ 전처리로 저장된 파생 key들도 "읽을 수 있으면" 읽습니다.
+        precomputed_extra_keys: List[str] = (
+            ["scenario_id"]
+            + _PRECOMPUTED_VALIDITY_KEYS
+            + _PRECOMPUTED_NEAR_KEYS
+            + _PRECOMPUTED_GT4_KEYS
+        )
+
+        npz_keys: List[str] = _unique_keep_order(
+            both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys + precomputed_extra_keys
+        )
 
         npz_key_to_new_key: Dict[str, str] = {
             "ego_future_gt_11_dim": "planner_future_11_dim",
             "driveway": "driveway_points",
         }
 
-
         sample: Dict[str, Any] = {}
         try:
             for npz_key in npz_keys:
                 value = data.get(npz_key, None)
 
-                # agent_route_lane_order를 읽는 경우에만 dtype 정리
                 if value is not None and npz_key == "agent_route_lane_order":
-                    value = value.astype("int64")
+                    try:
+                        value = np.asarray(value).astype("int64")
+                    except Exception:
+                        pass
 
                 out_key = npz_key_to_new_key.get(npz_key, npz_key)
                 sample[out_key] = value
@@ -579,28 +907,27 @@ class DiffusionPlannerData(Dataset):
                     data.close()
                 except Exception:
                     pass
-        # a~n validity key 추가 (공통 유틸)
-        add_validity_keys_inplace(sample, missing_policy="none")
-        add_near_agents_info_inplace(
-            sample,
-            predicted_neighbor_num=self.predicted_neighbor_num,
-        )
+
+        # ✅ scenario_id는 항상 "파이썬 str"로 통일 (npz에 저장된 값 타입 차이 방지)
         scenario_id = str(os.path.splitext(file_name)[0])
         sample["scenario_id"] = scenario_id
 
-        # ✅ 여기만 한 줄로 정리
+        # (1) validity: 이미 있으면 skip, 없으면 계산
+        _ensure_validity_keys_if_needed_inplace(sample)
+
+        # (2) near split: 이미 있으면 skip, 없거나 predicted_neighbor_num이 달라서 안 맞으면 계산
+        _ensure_near_keys_if_needed_inplace(
+            sample,
+            predicted_neighbor_num=int(self.predicted_neighbor_num),
+            use_agent_route_lane_order=bool(self.use_agent_route_lane_order),
+        )
+
+        # (3) future_gt_4_dim: 이미 있으면 skip, 없으면 계산
         self._add_future_gt_4_dim_keys_inplace(sample)
 
         if self.eval_method == "validation":
             tfrecord_file_name = file_name.replace(".npz", ".tfrecords")
-            tfrecord_path = os.path.join(self.data_tfrecords_dir,
-                                         tfrecord_file_name)
+            tfrecord_path = os.path.join(self.data_tfrecords_dir, tfrecord_file_name)
             sample["tfrecord_path"] = tfrecord_path
-            # TODO: 다시 복구해야함
-            # if not os.path.exists(tfrecord_path):
-
-            # raise FileNotFoundError(
-            #     f"TFRecords file not found: {tfrecord_path}")
-            # sample["tfrecord_path"] = tfrecord_path
 
         return sample
