@@ -1417,11 +1417,7 @@ def main() -> None:
     use_agent_route_lane_order: bool = bool(args.use_agent_route_lane_order)
 
     workers: int = int(args.workers)
-    compress_level: int = int(args.compress_level)
     fast_update: bool = (not bool(args.legacy_rewrite))
-
-    if compress_level < 0 or compress_level > 9:
-        raise ValueError(f"--compress_level은 0~9여야 합니다. got {compress_level}")
 
     file_names = _load_training_file_list(train_json)
     if limit > 0:
