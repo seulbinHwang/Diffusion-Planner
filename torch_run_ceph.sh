@@ -114,7 +114,7 @@ echo "[TRAIN] train_set_list=$TRAIN_SET_LIST_PATH"
   train_predictor.py \
     --train_set "$TRAIN_SET_PATH"/ \
     --train_set_list "$TRAIN_SET_LIST_PATH" \
-    --name "final_32_savez" \
+    --name "final_33_savez" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -124,4 +124,4 @@ echo "[TRAIN] train_set_list=$TRAIN_SET_LIST_PATH"
     --use_feasible_filter False \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
-    --prefetch_factor 2
+    --prefetch_factor 3
