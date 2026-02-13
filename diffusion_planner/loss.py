@@ -7,7 +7,7 @@ import logging
 import torch
 import torch.nn as nn
 from diffusion_planner.utils.normalizer import StateNormalizer
-from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks
+from diffusion_planner.utils.target_feature import build_target_future_tensors_and_masks, build_target_future_tensors_and_masks_vel
 
 AMP_DTYPE = torch.bfloat16  # A100 권장 dtype
 
@@ -507,16 +507,16 @@ def _sanitize_norm_inputs(
 
 
 def _sample_diffusion_time_and_noise(
-    normed_target_cur_future_gt_4_dim: torch.
+    normed_target_seq_gt_4_dim: torch.
     Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
     eps: float,
     args: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """미래 궤적 크기에 맞춰 diffusion time 과 노이즈를 샘플링한다."""
-    device_ = normed_target_cur_future_gt_4_dim.device
-    B: int = normed_target_cur_future_gt_4_dim.shape[0]
-    one_Pnn = normed_target_cur_future_gt_4_dim.shape[1]
-    one_future_len: int = int(normed_target_cur_future_gt_4_dim.shape[2])
+    device_ = normed_target_seq_gt_4_dim.device
+    B: int = normed_target_seq_gt_4_dim.shape[0]
+    one_Pnn = normed_target_seq_gt_4_dim.shape[1]
+    one_future_len: int = int(normed_target_seq_gt_4_dim.shape[2])
     future_len = one_future_len - 1
 
     use_amortized_mode: bool = (torch.rand(1).item() < 0.5)
@@ -556,7 +556,7 @@ def _sample_diffusion_time_and_noise(
     random_noise: torch.Tensor = torch.randn(
         (B, one_Pnn, future_len, 4),
         device=device_,
-        dtype=normed_target_cur_future_gt_4_dim.dtype,
+        dtype=normed_target_seq_gt_4_dim.dtype,
     )
     return batch_diffusion_time, low_t_mask, random_noise
 
@@ -564,7 +564,7 @@ def _sample_diffusion_time_and_noise(
 def _normalize_futures_and_build_xT(
     normed_target_cur_gt_4_dim: torch.Tensor,
     normed_target_future_gt_4_dim: torch.Tensor,
-    target_cur_future_is_valid: torch.Tensor,
+    target_seq_is_valid: torch.Tensor,
     batch_diffusion_time: torch.Tensor,
     random_noise: torch.Tensor,
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
@@ -578,7 +578,7 @@ def _normalize_futures_and_build_xT(
 
     # ✅ (핵심) 전체 마스크를 bool로 통일
     target_cur_future_is_valid_bool = _to_bool_mask(
-        target_cur_future_is_valid)  # (B,(1+)Pnn,1+T)
+        target_seq_is_valid)  # (B,(1+)Pnn,1+T)
     target_future_is_valid = target_cur_future_is_valid_bool[:, :,
                                                              1:]  # (B,(1+)Pnn,T) bool
 
@@ -925,17 +925,17 @@ def _assert_cur_future_valid_mask(
 
 
 def _split_normed_target_cur_future_gt_4_dim(
-    normed_target_cur_future_gt_4_dim: torch.Tensor
+    normed_target_seq_gt_4_dim: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # normed_target_cur_future_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
+    # normed_target_seq_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
     # normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4)
-    normed_target_cur_gt_4_dim = normed_target_cur_future_gt_4_dim[:, :, :1, :]
+    normed_target_cur_gt_4_dim = normed_target_seq_gt_4_dim[:, :, :1, :]
     # normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
-    normed_target_future_gt_4_dim: torch.Tensor = normed_target_cur_future_gt_4_dim[:, :,
+    normed_target_future_gt_4_dim: torch.Tensor = normed_target_seq_gt_4_dim[:, :,
                                                                                     1:, :]
 
     # cond_last_pos_norm: (B, (1+)Pnn, 4)
-    cond_last_pos_norm: torch.Tensor = normed_target_cur_future_gt_4_dim[:, :,
+    cond_last_pos_norm: torch.Tensor = normed_target_seq_gt_4_dim[:, :,
                                                                          -1, :]
     return normed_target_cur_gt_4_dim, normed_target_future_gt_4_dim, cond_last_pos_norm
 
@@ -1045,27 +1045,36 @@ def diffusion_loss_func(
     # near_cur_future_gt_is_valid : (B, Pnn, 1 + future_len)
     near_cur_future_gt_is_valid = _get_near_cur_future_gt_is_valid(
         norm_inputs, norm_outputs)
-    # norm_near_current_4_dim : (B, Pnn, 4)
-    norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
-    (
-        normed_target_cur_future_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
-        target_cur_future_is_valid,  # (B, (1+)Pnn, 1+future_len)
-    ) = build_target_future_tensors_and_masks(
-        args=args,
-        norm_inputs=norm_inputs,
-        normed_ego_future_gt_4_dim=norm_outputs[
-            "ego_future_gt_4_dim"],  # (B, future_len, 4)
-        normed_near_future_gt_4_dim=norm_outputs[
-            "near_future_gt_4_dim"],  # (B, Pnn, future_len, 4)
-        near_cur_future_gt_is_valid=
-        near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
-        norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
-    )
+    B, one_or_Pnn, one_future_len = near_cur_future_gt_is_valid.shape
+    future_len = one_future_len - 1
+    if args.pose_based:
+        # norm_near_current_4_dim : (B, Pnn, 4)
+        norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
+        (
+            normed_target_seq_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
+            target_seq_is_valid,  # (B, (1+)Pnn, 1+future_len)
+        ) = build_target_future_tensors_and_masks(
+            args=args,
+            norm_inputs=norm_inputs,
+            normed_ego_future_gt_4_dim=norm_outputs[
+                "ego_future_gt_4_dim"],  # (B, future_len, 4)
+            normed_near_future_gt_4_dim=norm_outputs[
+                "near_future_gt_4_dim"],  # (B, Pnn, future_len, 4)
+            near_cur_future_gt_is_valid=
+            near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
+            norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
+        )
+    else: # velocity_based
+        # TODO
+        """
+        normed_target_seq_gt_4_dim : (B, (1+)Pnn, future_len, 4)
+        target_seq_is_valid : (B, (1+)Pnn, future_len)
+        """
+        pass
 
     # ✅ (핵심) upstream dtype 변화(0/1 float 등) 대비
-    target_cur_future_is_valid = _to_bool_mask(target_cur_future_is_valid)
-    B, one_or_Pnn, one_future_len, _ = normed_target_cur_future_gt_4_dim.shape
-    future_len = one_future_len - 1
+    target_seq_is_valid = _to_bool_mask(target_seq_is_valid)
+
     """
     # diffusion time / low noise mask / random noise 샘플링
     
@@ -1075,13 +1084,13 @@ def diffusion_loss_func(
     """
     (batch_diffusion_time, low_t_mask,
      random_noise) = _sample_diffusion_time_and_noise(
-         normed_target_cur_future_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
+         normed_target_seq_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
          eps,
          args,
      )
     # low_t_mask_3_ndim: (B,1,1)
     low_t_mask_3_ndim: torch.Tensor = low_t_mask.view(B, 1, 1)
-    # normed_target_cur_future_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
+    # normed_target_seq_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
     """
     # normed_target_cur_gt_4_dim: (B, (1+)Pnn, 4)
     # normed_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
@@ -1089,7 +1098,7 @@ def diffusion_loss_func(
     """
     (normed_target_cur_gt_4_dim, normed_target_future_gt_4_dim,
      cond_last_pos_norm) = _split_normed_target_cur_future_gt_4_dim(
-         normed_target_cur_future_gt_4_dim)
+         normed_target_seq_gt_4_dim)
     """
         target_cur_future_norm_xT: (B, (1+)Pnn, 1+future_len, 4) 현재 GT + 미래 x_T
         std: (B, 1, 1, 1) 노이즈 표준편차
@@ -1097,12 +1106,12 @@ def diffusion_loss_func(
     (target_cur_future_norm_xT, std) = _normalize_futures_and_build_xT(
         normed_target_cur_gt_4_dim,  # (B, (1+)Pnn, 4)
         normed_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
-        target_cur_future_is_valid,  # (B, (1+)Pnn, 1+future_len)
+        target_seq_is_valid,  # (B, (1+)Pnn, 1+future_len)
         batch_diffusion_time,  # (B,) or (B, future_len)
         random_noise,
         marginal_prob,
     )
-    target_future_valid = target_cur_future_is_valid[:, :,
+    target_future_valid = target_seq_is_valid[:, :,
                                                      1:]  # (B, (1+)Pnn, future_len)
     # 모델 forward + decoder_output 생성
     decoder_output: Dict[str, torch.Tensor] = _forward_model_with_autocast(

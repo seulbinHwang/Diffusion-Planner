@@ -642,6 +642,7 @@ def get_args():
     parser.add_argument('--make_statistics_when_caching',
                         default=False,
                         type=boolean)
+    parser.add_argument('--pose_based', default=True, type=boolean)
     parser.add_argument('--die_all', default=True, type=boolean)
     parser.add_argument('--select_jointly', default=True, type=boolean)
     parser.add_argument('--use_recovery', default=False, type=boolean)
