@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple, Union
+from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -80,7 +80,7 @@ def differentiate_numpy_pose3_to_control3(
             - 시간축은 k=0..T (총 1+T개 상태)
 
     출력:
-        cur_future_control_gt_3_dim: (P, T, 3)
+        future_seg_control_gt_3_dim: (P, T, 3)
             - 마지막 3은 (v_x^b, v_y^b, omega) 입니다.
             - 시간축은 구간 k=0..T-1 (총 T개 구간)
     """
@@ -136,8 +136,8 @@ def differentiate_numpy_pose3_to_control3(
     vy_b = (-sin_mid * vwx + cos_mid * vwy).astype(pose.dtype, copy=False)   # (P, T)
 
     # 출력: (P, T, 3)
-    cur_future_control_gt_3_dim = np.stack([vx_b, vy_b, omega], axis=-1).astype(pose.dtype, copy=False)
-    return cur_future_control_gt_3_dim
+    future_seg_control_gt_3_dim = np.stack([vx_b, vy_b, omega], axis=-1).astype(pose.dtype, copy=False)
+    return future_seg_control_gt_3_dim
 
 
 def _traj11_to_traj3_heading(traj_11: ArrayF) -> ArrayF:
@@ -324,7 +324,7 @@ def build_cur_future_control_gt_3_dim_from_npz_arrays(
 
     Returns:
         np.ndarray:
-            cur_future_control_gt_3_dim, shape (1+N, Tf, 3)
+            future_seg_control_gt_3_dim, shape (1+N, Tf, 3)
             - 마지막 3: (v_x^b, v_y^b, omega)
     """
     ego_past = np.asarray(ego_agent_past)
@@ -387,14 +387,14 @@ def build_cur_future_control_gt_3_dim_from_npz_arrays(
     )  # (1+N,Tf)
 
     # 제어 복원
-    cur_future_control_gt_3_dim = differentiate_numpy_pose3_to_control3(
+    future_seg_control_gt_3_dim = differentiate_numpy_pose3_to_control3(
         all_cur_future_gt_3_dim,
         dt=float(dt),
     )  # (1+N,Tf,3)
 
     # 무효 구간은 0
-    cur_future_control_gt_3_dim[~near_future_segment_valid] = 0.0
-    return cur_future_control_gt_3_dim.astype(np.float32, copy=False)
+    future_seg_control_gt_3_dim[~near_future_segment_valid] = 0.0
+    return future_seg_control_gt_3_dim.astype(np.float32, copy=False)
 
 
 def _load_training_file_list(json_path: str) -> List[str]:
@@ -442,14 +442,321 @@ def _atomic_save_npz(npz_path: str, data: Dict[str, np.ndarray], *, compress: bo
         raise
 
 
+def _build_future_gt_4_dim_from_3_dim(
+    future_gt_3_dim: NDArray[np.floating],
+    future_gt_is_valid: NDArray[np.bool_],
+) -> NDArray[np.floating]:
+    """(…, 3) 미래 GT를 (…, 4)로 바꿉니다.
+
+    변환 규칙
+    --------
+    - 입력 마지막 축 3개는 (x, y, 방향각)이라고 가정합니다.
+    - 출력 마지막 축 4개는 (x, y, cos(방향각), sin(방향각)) 입니다.
+    - future_gt_is_valid가 False인 위치는 출력 값을 0.0으로 만듭니다.
+
+    Args:
+        future_gt_3_dim:
+            미래 GT. shape: (..., 3)
+            예:
+              - ego: (future_len, 3)
+              - near: (predicted_neighbor_num, future_len, 3)
+        future_gt_is_valid:
+            유효 마스크. shape: (...)  (마지막 차원(3)은 제외한 shape)
+            예:
+              - ego: (future_len,)
+              - near: (predicted_neighbor_num, future_len)
+
+    Returns:
+        future_gt_4_dim:
+            변환된 미래 GT. shape: (..., 4)
+    """
+    gt3 = np.asarray(future_gt_3_dim)
+    valid = np.asarray(future_gt_is_valid).astype(bool)
+
+    if gt3.ndim < 1 or int(gt3.shape[-1]) != 3:
+        raise ValueError(f"future_gt_3_dim last dim must be 3. got shape={gt3.shape}")
+
+    heading = gt3[..., 2:3]  # (..., 1)
+    cos_heading = np.cos(heading)  # (..., 1)
+    sin_heading = np.sin(heading)  # (..., 1)
+
+    future_gt_4_dim = np.concatenate(
+        [gt3[..., :2], cos_heading, sin_heading],
+        axis=-1,
+    )  # (..., 4)
+
+    future_gt_4_dim[~valid] = 0.0
+    return future_gt_4_dim
+
+
+def _add_future_gt_4_dim_keys_inplace(sample: Dict[str, Any]) -> None:
+    """sample dict에 ego/near의 *_future_gt_4_dim 키를 추가합니다.
+
+    - sample을 새로 만들지 않고, 들어온 sample dict를 그대로 수정합니다.
+    - 필요한 입력 키:
+      - ego: "ego_future_gt_3_dim", "ego_future_gt_is_valid"
+      - near: "near_future_gt_3_dim", "near_future_gt_is_valid"
+
+    Args:
+        sample:
+            __getitem__에서 만드는 샘플 dict와 같은 형태의 dict.
+    """
+    ego_future_gt_3_dim = sample.get("ego_future_gt_3_dim", None)
+    ego_future_gt_is_valid = sample.get("ego_future_gt_is_valid", None)
+
+    if isinstance(ego_future_gt_3_dim, np.ndarray) and isinstance(ego_future_gt_is_valid, np.ndarray):
+        sample["ego_future_gt_4_dim"] = _build_future_gt_4_dim_from_3_dim(
+            ego_future_gt_3_dim,
+            ego_future_gt_is_valid,
+        )
+
+    near_future_gt_3_dim = sample.get("near_future_gt_3_dim", None)
+    near_future_gt_is_valid = sample.get("near_future_gt_is_valid", None)
+
+    if isinstance(near_future_gt_3_dim, np.ndarray) and isinstance(near_future_gt_is_valid, np.ndarray):
+        sample["near_future_gt_4_dim"] = _build_future_gt_4_dim_from_3_dim(
+            near_future_gt_3_dim,
+            near_future_gt_is_valid,
+        )
+
+
+def _get_dataset_npz_keys(
+    *,
+    eval_method: str,
+    use_agent_route_lane_order: bool,
+) -> Tuple[List[str], Dict[str, str]]:
+    """dataset.py의 __getitem__이 읽던 key 목록과 rename 규칙을 제공합니다."""
+    both_keys: List[str] = [
+        "origin_world_pose",
+        "ego_agent_past",
+        "ego_future_gt_3_dim",
+        "ego_future_gt_11_dim",
+        "neighbor_agents_past",
+        "neighbor_future_gt_3_dim",
+        "neighbor_future_gt_11_dim",
+        "stop_sign_points",
+        "crosswalk_points",
+        "lanes",
+        "lanes_speed_limit",
+        "lanes_has_speed_limit",
+    ]
+
+    nuplan_only_keys: List[str] = [
+        "static_objects",
+        "route_lanes",
+        "route_lanes_speed_limit",
+        "route_lanes_has_speed_limit",
+    ]
+    if bool(use_agent_route_lane_order):
+        nuplan_only_keys.append("agent_route_lane_order")
+
+    womd_only_keys: List[str] = [
+        "speed_bump_points",
+        "driveway_points",
+        "lane_type",
+        "left_line_type",
+        "right_line_type",
+        "road_edge",
+        "road_edge_type",
+    ]
+
+    wosac_only_keys: List[str] = []
+    if str(eval_method) in ("validation", "test"):
+        wosac_only_keys = [
+            "target_id",
+            "target_z",
+        ]
+
+    npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
+
+    npz_key_to_new_key: Dict[str, str] = {
+        "ego_future_gt_11_dim": "planner_future_11_dim",
+        "driveway": "driveway_points",
+    }
+    return npz_keys, npz_key_to_new_key
+
+
+def _build_sample_dict_like_dataset_getitem(
+    npz_data: Mapping[str, Any],
+    *,
+    file_name: str,
+    predicted_neighbor_num: int,
+    eval_method: str,
+    use_agent_route_lane_order: bool,
+) -> Tuple[Dict[str, Any], Sequence[str], Sequence[str]]:
+    """DiffusionPlannerData.__getitem__과 같은 방식으로 sample dict를 만듭니다.
+
+    차이점
+    ------
+    - "tfrecord_path"는 어떤 경우에도 넣지 않습니다.
+
+    Args:
+        npz_data:
+            npz에서 읽은 key->value 매핑.
+        file_name:
+            data_list에 있던 파일명(예: "abc.npz"). scenario_id를 만들 때 사용합니다.
+        predicted_neighbor_num:
+            near로 자를 neighbor 수.
+        eval_method:
+            "train" / "validation" / "test". 일부 key 선택에만 사용합니다.
+        use_agent_route_lane_order:
+            True면 agent_route_lane_order를 sample에 포함합니다.
+
+    Returns:
+        Tuple[Dict[str, Any], Sequence[str], Sequence[str]]:
+            - sample: __getitem__이 반환하던 것과 같은 형태의 dict
+            - base_output_keys: npz 원본에서 읽어서 채운 key들(rename 반영)
+            - alias_output_keys: rename 때문에 새로 생긴 key들(예: planner_future_11_dim)
+    """
+    npz_keys, npz_key_to_new_key = _get_dataset_npz_keys(
+        eval_method=str(eval_method),
+        use_agent_route_lane_order=bool(use_agent_route_lane_order),
+    )
+
+    base_output_keys: List[str] = []
+    alias_output_keys: List[str] = []
+
+    sample: Dict[str, Any] = {}
+    for npz_key in npz_keys:
+        value = npz_data.get(npz_key, None)
+
+        # dataset.py와 동일: agent_route_lane_order는 int64로 정리
+        if value is not None and npz_key == "agent_route_lane_order":
+            try:
+                value = np.asarray(value).astype("int64")
+            except Exception:
+                pass
+
+        out_key = npz_key_to_new_key.get(npz_key, npz_key)
+        sample[out_key] = value
+        base_output_keys.append(out_key)
+
+        if out_key != npz_key:
+            alias_output_keys.append(out_key)
+
+    # validity / near split 로직은 기존 유틸을 그대로 사용
+    try:
+        from diffusion_planner.utils.validity import add_validity_keys_inplace
+    except Exception as e:
+        raise RuntimeError(
+            "diffusion_planner.utils.validity.add_validity_keys_inplace import 실패. "
+            "프로젝트 루트가 PYTHONPATH에 잡혀있는지 확인해 주세요."
+        ) from e
+
+    try:
+        from nuplan_extent.planning.training.preprocessing.utils.near_agents import (
+            add_near_agents_info_inplace,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "nuplan_extent...add_near_agents_info_inplace import 실패. "
+            "프로젝트/의존성이 정상 설치되어 있는지 확인해 주세요."
+        ) from e
+
+    add_validity_keys_inplace(sample, missing_policy="none")
+    add_near_agents_info_inplace(sample, predicted_neighbor_num=int(predicted_neighbor_num))
+
+    scenario_id = str(os.path.splitext(str(file_name))[0])
+    sample["scenario_id"] = scenario_id
+
+    _add_future_gt_4_dim_keys_inplace(sample)
+    return sample, base_output_keys, alias_output_keys
+
+
+def _to_np_array_or_skip(value: Any) -> Union[np.ndarray, None]:
+    """np.savez에 넣을 수 있는 값이면 np.ndarray로 바꾸고, 아니면 None을 반환합니다.
+
+    Args:
+        value: sample dict의 값.
+
+    Returns:
+        np.ndarray | None:
+            - 저장 가능한 값이면 np.ndarray
+            - 저장이 애매하면 None (스킵)
+    """
+    if value is None:
+        return None
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, (np.number, int, float, bool, str, bytes)):
+        return np.asarray(value)
+    return None
+
+
+def _merge_sample_keys_into_npz_data(
+    data: Dict[str, np.ndarray],
+    sample: Mapping[str, Any],
+    *,
+    base_output_keys: Sequence[str],
+    alias_output_keys: Sequence[str],
+    overwrite: bool,
+) -> bool:
+    """sample dict에서 만든 파생 key들을 npz dict에 합칩니다.
+
+    규칙
+    ----
+    - dataset __getitem__이 "원본에서 읽은 key"들은 저장하지 않습니다.
+      (큰 배열을 중복 저장하지 않기 위함)
+    - 단, rename 때문에 생긴 alias key(예: planner_future_11_dim)는 저장합니다.
+    - overwrite=False면:
+        이미 존재하는 파생 key는 건드리지 않습니다.
+    - overwrite=True면:
+        파생 key를 다시 계산한 값으로 덮어씁니다.
+
+    Args:
+        data:
+            npz에 저장할 dict (수정 대상).
+        sample:
+            __getitem__ 형태로 만든 sample dict.
+        base_output_keys:
+            원본에서 읽어서 채운 key들(rename 반영).
+        alias_output_keys:
+            rename으로 새로 생긴 key들.
+        overwrite:
+            True면 파생 key를 덮어씁니다.
+
+    Returns:
+        bool:
+            data가 실제로 바뀌었으면 True, 아니면 False.
+    """
+    base_set = set(map(str, base_output_keys))
+    alias_set = set(map(str, alias_output_keys))
+
+    changed = False
+    for key, value in sample.items():
+        k = str(key)
+
+        # 원본에서 읽어온 값은 저장하지 않음(중복 방지).
+        # 단, alias key는 예외로 저장.
+        if (k in base_set) and (k not in alias_set):
+            continue
+
+        arr = _to_np_array_or_skip(value)
+        if arr is None:
+            continue
+
+        if (not overwrite) and (k in data):
+            continue
+
+        data[k] = arr
+        changed = True
+
+    return changed
+
+
 def _process_one_file(
     npz_path: str,
     *,
     dt: float,
     overwrite: bool,
     compress: bool,
+    add_sample_keys: bool,
+    overwrite_sample_keys: bool,
+    predicted_neighbor_num: int,
+    eval_method: str,
+    use_agent_route_lane_order: bool,
 ) -> Tuple[bool, str]:
-    """npz 하나를 읽고 cur_future_control_gt_3_dim을 추가해 저장합니다.
+    """npz 하나를 읽고 필요한 key들을 추가해 저장합니다.
 
     Returns:
         (success, message)
@@ -459,50 +766,111 @@ def _process_one_file(
 
     data = _read_npz_as_dict(npz_path)
 
-    if (not overwrite) and ("cur_future_control_gt_3_dim" in data):
-        return True, "skip(existing key)"
+    # (A) control key 처리
+    need_control = bool(overwrite) or ("future_seg_control_gt_3_dim" not in data)
 
-    required_keys = [
-        "ego_agent_past",
-        "ego_future_gt_11_dim",
-        "neighbor_agents_past",
-        "neighbor_future_gt_11_dim",
-    ]
-    for k in required_keys:
-        if k not in data:
-            return False, f"missing key '{k}'"
+    changed = False
+    if need_control:
+        required_keys = [
+            "ego_agent_past",
+            "ego_future_gt_11_dim",
+            "neighbor_agents_past",
+            "neighbor_future_gt_11_dim",
+        ]
+        for k in required_keys:
+            if k not in data:
+                return False, f"missing key '{k}'"
 
-    control = build_cur_future_control_gt_3_dim_from_npz_arrays(
-        ego_agent_past=data["ego_agent_past"],
-        ego_future_gt_11_dim=data["ego_future_gt_11_dim"],
-        neighbor_agents_past=data["neighbor_agents_past"],
-        neighbor_future_gt_11_dim=data["neighbor_future_gt_11_dim"],
-        dt=float(dt),
-    )
+        control = build_cur_future_control_gt_3_dim_from_npz_arrays(
+            ego_agent_past=data["ego_agent_past"],
+            ego_future_gt_11_dim=data["ego_future_gt_11_dim"],
+            neighbor_agents_past=data["neighbor_agents_past"],
+            neighbor_future_gt_11_dim=data["neighbor_future_gt_11_dim"],
+            dt=float(dt),
+        )
 
-    data["cur_future_control_gt_3_dim"] = control
+        data["future_seg_control_gt_3_dim"] = control
+        changed = True
+
+    # (B) dataset.py __getitem__의 sample dict 로직을 동일하게 수행 (tfrecord_path 제외)
+    if bool(add_sample_keys):
+        try:
+            sample, base_output_keys, alias_output_keys = _build_sample_dict_like_dataset_getitem(
+                data,
+                file_name=os.path.basename(npz_path),
+                predicted_neighbor_num=int(predicted_neighbor_num),
+                eval_method=str(eval_method),
+                use_agent_route_lane_order=bool(use_agent_route_lane_order),
+            )
+        except Exception as e:
+            return False, f"build_sample_failed: {type(e).__name__}: {e}"
+
+        # sample에서 계산된 "파생 key"만 npz에 추가
+        changed |= _merge_sample_keys_into_npz_data(
+            data,
+            sample,
+            base_output_keys=base_output_keys,
+            alias_output_keys=alias_output_keys,
+            overwrite=bool(overwrite_sample_keys),
+        )
+
+    if not changed:
+        return True, "skip(no change)"
+
     _atomic_save_npz(npz_path, data, compress=compress)
     return True, "ok"
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Add cur_future_control_gt_3_dim to existing npz files.")
+    parser = argparse.ArgumentParser(
+        description="Add future_seg_control_gt_3_dim and (optionally) dataset sample keys to existing npz files."
+    )
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default="/mnt/nuplan/dataset/processed",
+        default="/workspace/local_shards_v1",
         help="npz 파일들이 들어있는 폴더(내부 폴더 없음)",
     )
     parser.add_argument(
         "--train_json",
         type=str,
-        default="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json",
+        default="/workspace/local_shards_v1/diffusion_planner_training.json",
         help="학습에 쓰는 npz 파일명 리스트(json)",
     )
     parser.add_argument("--dt", type=float, default=0.1, help="시간 간격 dt (예: 0.1)")
-    parser.add_argument("--overwrite", action="store_true", help="이미 키가 있어도 다시 계산해서 덮어씁니다.")
+    parser.add_argument("--overwrite", action="store_true", help="이미 control 키가 있어도 다시 계산해서 덮어씁니다.")
     parser.add_argument("--no_compress", action="store_true", help="저장할 때 압축을 끕니다(더 빠르지만 파일이 커짐).")
     parser.add_argument("--limit", type=int, default=0, help="0이면 전체, 양수면 앞에서 N개만 처리")
+
+    # --- dataset.py __getitem__ sample dict 생성 관련 옵션 ---
+    parser.add_argument(
+        "--skip_sample_keys",
+        action="store_true",
+        help="dataset.py __getitem__에서 만들던 sample 파생키(validity/near/gt_4_dim/scenario_id)를 npz에 저장하지 않습니다.",
+    )
+    parser.add_argument(
+        "--overwrite_sample_keys",
+        action="store_true",
+        help="파생키가 이미 있어도 다시 계산해서 덮어씁니다.",
+    )
+    parser.add_argument(
+        "--predicted_neighbor_num",
+        type=int,
+        default=32,
+        help="near로 뽑을 neighbor 수(predicted_neighbor_num).",
+    )
+    parser.add_argument(
+        "--eval_method",
+        type=str,
+        default="train",
+        choices=["train", "validation", "test"],
+        help="dataset.py __getitem__에서 일부 key 선택에 쓰는 모드. tfrecord_path는 어떤 모드에서도 추가하지 않습니다.",
+    )
+    parser.add_argument(
+        "--use_agent_route_lane_order",
+        action="store_true",
+        help="dataset.py와 동일하게 agent_route_lane_order 키도 sample에 포함합니다.",
+    )
     return parser
 
 
@@ -515,6 +883,12 @@ def main() -> None:
     overwrite: bool = bool(args.overwrite)
     compress: bool = (not bool(args.no_compress))
     limit: int = int(args.limit)
+
+    add_sample_keys: bool = (not bool(args.skip_sample_keys))
+    overwrite_sample_keys: bool = bool(args.overwrite_sample_keys)
+    predicted_neighbor_num: int = int(args.predicted_neighbor_num)
+    eval_method: str = str(args.eval_method)
+    use_agent_route_lane_order: bool = bool(args.use_agent_route_lane_order)
 
     file_names = _load_training_file_list(train_json)
     if limit > 0:
@@ -531,6 +905,11 @@ def main() -> None:
                 dt=dt,
                 overwrite=overwrite,
                 compress=compress,
+                add_sample_keys=add_sample_keys,
+                overwrite_sample_keys=overwrite_sample_keys,
+                predicted_neighbor_num=predicted_neighbor_num,
+                eval_method=eval_method,
+                use_agent_route_lane_order=use_agent_route_lane_order,
             )
             if ok:
                 ok_count += 1
@@ -552,5 +931,10 @@ python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py
 
 python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --dt 0.1
 
+# sample 파생키(near/validity/gt_4_dim/scenario_id)를 저장하지 않고 control만 추가
+python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
+
+# 이미 저장된 파생키도 다시 계산해서 갱신
+python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --overwrite_sample_keys
 
 """

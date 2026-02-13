@@ -9,7 +9,6 @@ from nuplan_extent.planning.training.preprocessing.utils.near_agents import add_
 from diffusion_planner.utils.validity import add_validity_keys_inplace
 from diffusion_planner.utils.train_utils import openjson, opendata
 
-import numpy as np
 from numpy.typing import NDArray
 from typing import Any, List, Sequence, Tuple
 import os
