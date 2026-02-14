@@ -121,7 +121,10 @@ FORCE_REBUILD=0
     --num_workers 3 \
     --prefetch_factor 8 \
     --pose_based False \
-    --p_sat 0. \
-    --w_int_max 1.0 \
-    --w_const 0.1
+    --p_sat 0.30 \
+    --w_dir 1.0 \
+    --w_int_min 0.05 \
+    --w_int_max 3.0 \
+    --w_const 0.10
+
 
