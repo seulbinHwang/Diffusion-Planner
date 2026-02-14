@@ -1105,7 +1105,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--predicted_neighbor_num",
         type=int,
-        default=32,
+        default=448,
         help="near로 뽑을 neighbor 수(predicted_neighbor_num).",
     )
     parser.add_argument(
