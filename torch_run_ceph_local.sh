@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# 스크립트가 어디서 실행되든, 이 파일이 있는 폴더로 이동(상대 경로 안전)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # ============================================================
 # (ADD) OOM 상황에서 "학습 런처"가 먼저 죽기 쉽게(best-effort)
-# - 권한/환경에 따라 실패할 수 있으니 실패해도 무시합니다.
 # ============================================================
 if [[ -w /proc/self/oom_score_adj ]]; then
   ( echo 500 > /proc/self/oom_score_adj ) 2>/dev/null || true
 fi
+
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -32,31 +36,24 @@ TORCHRUN_LOG_ARGS=()
 PY_ARGS=()
 
 if (( DEBUG_LOG )); then
-  # ✅ 디버그 모드: 파일 로그 허용 (기존 의도 유지)
   LOG_DIR="/mnt/nuplan/logs/$RUN_ID"
   mkdir -p "$LOG_DIR"
 
   export NCCL_DEBUG=INFO
   export NCCL_DEBUG_SUBSYS=INIT
 
-  # 파이썬 디버그(에러 때 도움)
   export TORCH_SHOW_CPP_STACKTRACES=1
   export PYTHONFAULTHANDLER=1
   export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
   export TORCH_DISABLE_ADDR2LINE=1
 
-  # torchelastic 에러 파일(디버그 모드에서는 Ceph에 저장)
   export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
-  # 출력이 많아도 “바로바로” 보이게(디버그 편의)
   export PYTHONUNBUFFERED=1
   PY_ARGS=(-u -X faulthandler)
 
-  # torchrun이 rank별 stdout/stderr를 파일로 저장 + 콘솔에도 출력(디버그 편의)
   TORCHRUN_LOG_ARGS=(--log_dir "$LOG_DIR" --redirects 3 --tee 3)
-
 else
-  # ✅ 빠른 학습 모드: "학습 중 파일 로그"는 끔
   export NCCL_DEBUG=WARN
   export NCCL_DEBUG_SUBSYS=INIT
 
@@ -81,16 +78,35 @@ printf "[ENV] %-28s %s\n" "CUDA_DEVICE_MAX_CONNECTIONS:" "${CUDA_DEVICE_MAX_CONN
 # User Configuration
 # -------------------------
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
+
+# (원본) CephRBD 경로
 TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 
+# (로컬) 학습에 사용할 경로
+LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
+LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
+
+# 복사 강제 옵션: 1이면 항상 다시 복사
+FORCE_REBUILD=0
+
+# 로컬 데이터 준비(복사 1회 + 로컬 리스트 생성)
+"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
+  --src_root "$TRAIN_SET_PATH" \
+  --src_list "$TRAIN_SET_LIST_PATH" \
+  --dst_root "$LOCAL_TRAIN_SET_PATH" \
+  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
+  --force_rebuild "$FORCE_REBUILD" \
+  --num_workers 24
+#
+# ---- 학습은 로컬 데이터로 ----
 "$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
   --nnodes 1 --nproc-per-node 6 --standalone \
   "${TORCHRUN_LOG_ARGS[@]}" \
   train_predictor.py \
-    --train_set "$TRAIN_SET_PATH"/ \
-    --train_set_list "$TRAIN_SET_LIST_PATH" \
-    --name "final_38_ceph" \
+    --train_set "$LOCAL_TRAIN_SET_PATH"/ \
+    --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
+    --name "final_38_local" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -98,6 +114,4 @@ TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_tr
     --use_feasible False \
     --use_feasible_dl False \
     --use_feasible_filter False \
-    --feasible_stride_dt 0.1 \
-    --num_workers 3 \
-    --prefetch_factor 8
+    --feasible_stride_dt 0.1
