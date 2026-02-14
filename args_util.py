@@ -251,6 +251,7 @@ def get_args():
                         type=float,
                         help='w_int_max',
                         default=2.0)
+    parser.add_argument('--w_const', type=float, help='w_const', default=0.02)
     parser.add_argument(
         "--resume_wosac_submission",
         default=False,
@@ -260,7 +261,7 @@ def get_args():
             "wosac_submission 결과 폴더를 지우지 않고 이어서 저장합니다."
         ),
     )
-    parser.add_argument('--w_const', type=float, help='w_const', default=0.02)
+
 
     # DataLoader parameters
     # DataLoader parameters
