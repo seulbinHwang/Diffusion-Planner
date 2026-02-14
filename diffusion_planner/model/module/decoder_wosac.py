@@ -3819,7 +3819,7 @@ else
                 torch.bool)  # (B, Pnn, time_len+future_len)
             target_cur_future_valid = target_past_cur_future_valid[:, :, -(
                 one_future_len):]  # (B, Pnn, 1+T) bool
-            target_cur_valid = target_cur_future_valid[:, : 0] # (B, Pnn)
+            target_cur_valid = target_cur_future_valid[:, : ,0] # (B, Pnn)
             target_past_11_dim = target_past_11_dim.float(
             )  # (B, Pnn, past_len, 11)
             near_current_state = target_past_11_dim[:, :, -1, :4] # (B, Pnn, 4)
