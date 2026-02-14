@@ -490,7 +490,7 @@ def _compute_vxy_yaw_losses(
     yaw_pred = score_denorm[..., 2]  # [B, P, T]
     yaw_gt = target_future_gt[..., 2] # [B, P, T]
     yaw_err_deg = torch.rad2deg(yaw_pred - yaw_gt)
-    dist_yaw = torch.abs(yaw_err_deg)  # abs error in radians # [B, P, T]
+    dist_yaw = torch.abs(yaw_err_deg)  # abs error in degrees # [B, P, T]
     # target_future_valid :# (B, Pnn, T)
     masked_yaw = dist_yaw[target_future_valid]
     neigh_yaw = masked_yaw.mean() if masked_yaw.numel() > 0 else torch.tensor(

@@ -3274,12 +3274,12 @@ class DiT(nn.Module):
             (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
             """
             B, one_Pnn, F = x.shape
-            x = x.reshape(B, one_Pnn, -1, 3) # (B, (1+)Pnn, (past_len + T) ,3) or (B, (1+)Pnn, T,3)
+            x_flat = x.reshape(B, one_Pnn, -1, 3) # (B, (1+)Pnn, (past_len + T) ,3) or (B, (1+)Pnn, T,3)
             # diffusion_control_traj: (B, (1+)Pnn, future_len, 3)
-            diffusion_control_traj = x[:, :, -self.config.future_len:, :]
+            diffusion_control_traj = x_flat[:, :, -self.config.future_len:, :]
             self._feasible_projection_vel(
                 diffusion_control_traj=diffusion_control_traj,  # (B, (1+)Pnn, future_len, 3)
-                target_past_11_dim=target_past_11_dim,  # (B,(1+)Pnn,past_len,11)
+                target_agents_past=target_agents_past,  # (B,(1+)Pnn,time_len,11)
                 target_class_one_hot=target_class_one_hot,  # (B,(1+)Pnn,3)
                 target_past_cur_future_valid=
                 target_past_cur_future_valid,
@@ -3788,7 +3788,7 @@ else
             target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
             target_past_cur_future_valid: torch.Tensor,
             # (B, (1+)Pnn, time_len=1+past_len+future_len) bool
-            target_past_11_dim:  torch.Tensor,  # (B, (1+)Pnn, past_len, 11)
+            target_agents_past:  torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
     ) -> None:
         """FeasibleProjector 전체 파이프라인을 한 번에 실행합니다.
 
@@ -3820,10 +3820,10 @@ else
             target_cur_future_valid = target_past_cur_future_valid[:, :, -(
                 one_future_len):]  # (B, Pnn, 1+T) bool
             target_cur_valid = target_cur_future_valid[:, : ,0] # (B, Pnn)
-            target_past_11_dim = target_past_11_dim.float(
-            )  # (B, Pnn, past_len, 11)
-            near_current_state = target_past_11_dim[:, :, -1, :4] # (B, Pnn, 4)
-            unnorm_near_current_state = self.config.state_normalizer(
+            target_agents_past = target_agents_past.float(
+            )  # (B, Pnn, time_len, 11)
+            near_current_state = target_agents_past[:, :, -1, :4] # (B, Pnn, 4)
+            unnorm_near_current_state = self.config.state_normalizer.inverse(
                 data=near_current_state, # (B, Pnn, 4)
                 valid_mask=target_cur_valid, # (B, Pnn)
             )
@@ -3831,8 +3831,8 @@ else
             # 역정규화 현재+미래 궤적 및 현재 상태
 
             temp_dict = {"seg_body_control": diffusion_control_traj}
-            norm_temp_dict = self.config.observation_normalizer(temp_dict)
-            unnorm_diffusion_control_traj = norm_temp_dict[
+            unnorm_temp_dict = self.config.observation_normalizer.inverse(temp_dict)
+            unnorm_diffusion_control_traj = unnorm_temp_dict[
                 "seg_body_control"]  # (B, Pnn, future_len, 3)
 
 
@@ -4009,8 +4009,8 @@ else
     def _feasible_projection_vel(
             self,
             diffusion_control_traj: torch.Tensor,  # # (B, (1+)Pnn, future_len, 3)
-            target_past_11_dim: torch.Tensor,
-            # (B, (1+)Pnn, past_len, 11) 또는 None
+            target_agents_past: torch.Tensor,
+            # (B, (1+)Pnn, time_len, 11) 또는 None
             target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
             target_past_cur_future_valid: torch.Tensor,
             # (B, (1+)Pnn, time_len(=1+past_len) + future_len) bool
@@ -4052,7 +4052,7 @@ else
             diffusion_control_traj[active_idx], # (B, (1+)Pnn, future_len, 3)
             target_class_one_hot[active_idx],
             target_past_cur_future_valid[active_idx],
-            target_past_11_dim[active_idx]
+            target_agents_past[active_idx]
         )
 
         # `_feasible_projection_core` 은 서브 배치 기준으로 self.norm_dit_returns 를 채운다.
