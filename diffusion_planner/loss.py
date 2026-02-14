@@ -383,7 +383,7 @@ def _compute_control_xy_yaw_diff(
 
 
 def _compute_xy_yaw_losses(
-        score_denorm: torch.Tensor,
+        score_denorm: torch.Tensor, # (B, (1+)Pnn, T, 4)
         target_future_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
         target_future_valid: torch.Tensor,
         early_stage_num: int = 5,
@@ -457,6 +457,61 @@ def _compute_xy_yaw_losses(
         f'{prefix}_yaw_early': early_valid_yaw_mean,  # scalar # degree
     }
 
+def _compute_vxy_yaw_losses(
+        score_denorm: torch.Tensor, # (B, (1+)Pnn, T, 3)
+        target_future_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
+        target_future_valid: torch.Tensor,
+        early_stage_num: int = 5,
+        prefix: str = "neighbor_prediction_loss") -> Dict[str, torch.Tensor]:
+    target_future_valid = _to_bool_mask(target_future_valid).to(
+        device=score_denorm.device)
+    # score_denorm[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
+    pred_xy = score_denorm[..., :2]  # [B, Pnn, T, 2]
+    gt_xy = target_future_gt[..., :2]  # # (B, (1+)Pnn, future_len, 2)
+    # Euclidean distance: sqrt((dx)^2 + (dy)^2)
+    dist_ = torch.sqrt(((pred_xy - gt_xy).pow(2).sum(-1)) + 1e-6)  # [B, Pnn, T]
+
+    # target_future_valid :# (B, Pnn, T)
+    valid_dist = dist_[target_future_valid]  # [num_valid]
+    valid_dist_mean = valid_dist.mean() if valid_dist.numel(
+    ) > 0 else torch.tensor(0.0, device=dist_.device)
+
+    early_stage_dist_ = dist_[..., :
+                              early_stage_num]  # [B, Pnn, early_stage_num]
+    # target_future_valid :# (B, Pnn, T)
+    near_future_early_valid = target_future_valid[
+        ..., :early_stage_num]  # [B, Pnn, early_stage_num]
+    early_valid_dist = early_stage_dist_[
+        near_future_early_valid]  # [num_early_valid]
+    early_valid_dist_mean = early_valid_dist.mean() if early_valid_dist.numel(
+    ) > 0 else torch.tensor(0.0, device=dist_.device)
+
+    # Compute yaw angles from cos/sin
+    yaw_pred = score_denorm[..., 2]  # [B, P, T]
+    yaw_gt = target_future_gt[..., 2] # [B, P, T]
+    # Angular error wrapped to [-pi, pi]
+    yaw_err = (yaw_pred - yaw_gt +
+               torch.pi) % (2 * torch.pi) - torch.pi  # [B, P, T]
+    yaw_err_deg = torch.rad2deg(yaw_err)  # [-180, 180]
+
+    dist_yaw = torch.abs(yaw_err_deg)  # abs error in radians # [B, P, T]
+    # target_future_valid :# (B, Pnn, T)
+    masked_yaw = dist_yaw[target_future_valid]
+    neigh_yaw = masked_yaw.mean() if masked_yaw.numel() > 0 else torch.tensor(
+        0.0, device=dist_yaw.device)
+
+    early_stage_dist_yaw = dist_yaw[
+        ..., :early_stage_num]  # [B, Pnn, early_stage_num]
+    early_valid_yaw = early_stage_dist_yaw[near_future_early_valid]
+    early_valid_yaw_mean = early_valid_yaw.mean() if early_valid_yaw.numel(
+    ) > 0 else torch.tensor(0.0, device=dist_yaw.device)
+
+    return {
+        f'{prefix}_vxy': valid_dist_mean,  # scalar
+        f'{prefix}_yaw_rate': neigh_yaw,  # scalar # degree
+        f'{prefix}_vxy_early': early_valid_dist_mean,  # scalar
+        f'{prefix}_yaw_rate_early': early_valid_yaw_mean,  # scalar # degree
+    }
 
 def _masked_weighted_mse_from_diff(
     diff: torch.Tensor,  # (B, P, T, C)
@@ -668,18 +723,18 @@ def _forward_model_with_autocast(
     return decoder_output  # decoder_output["score"], ["integrated_trajectory"], ...
 
 
-def _extract_score_from_decoder(
+def _extract_score_from_decoder(future_len: int,
     decoder_output: Dict[str, torch.Tensor],) -> torch.Tensor:
     """decoder_output 에서 미래 score 만 꺼내고 모양을 확인한다.
 
     Args:
         decoder_output: model(...) 의 두 번째 반환 dict.
     Returns:
-        score: (B, one_or_Pnn, future_len, 4) 예측된 미래 궤적.
+        score: # (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
     """
     # decoder_output["score"]: (B, one_or_Pnn, 1+future_len, 4)
     score: torch.Tensor = decoder_output[
-        "score"][:, :, 1:, :]  # (B, one_or_Pnn, future_len, 4)
+        "score"][:, :,-future_len:, :]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     score = _require_finite("decoder_output['score']", score)
     return score
 
@@ -687,11 +742,11 @@ def _extract_score_from_decoder(
 def _compute_dpm_loss(
         args: Any,
         model_type: str,
-        score: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+        score: torch.Tensor,   # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, T, 3)
         std: torch.Tensor,  # (B, 1, 1, 1)
-        random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+        random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4 or 3)
         normed_target_future_seq_gt: torch.
-    Tensor,  # (B, (1+)Pnn, future_len, 4)
+    Tensor, # (B, (1+)Pnn, future_len, 4 or 3)
 ) -> torch.Tensor:
     """기존 diffusion 손실(score/x_start)을 (B,P,future_len) 형태로 계산한다.
 
@@ -705,21 +760,21 @@ def _compute_dpm_loss(
     HUBER_DELTA: float = 1.0
 
     if args.use_huber_loss:
-        # err: (B, (1+)Pnn, future_len, 4)
+        # err: (B, (1+)Pnn, future_len, 4 or 3)
         if model_type == "score":
             err: torch.Tensor = score * std + random_noise
         elif model_type == "x_start":
-            # err: (B, (1+)Pnn, future_len, 4)
+            # err: (B, (1+)Pnn, future_len, 4 or 3)
             err = score - normed_target_future_seq_gt
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
-        abs_err: torch.Tensor = err.abs()  # (B, (1+)Pnn, future_len, 4)
-        quad: torch.Tensor = 0.5 * err.pow(2)  # (B, (1+)Pnn, future_len, 4)
+        abs_err: torch.Tensor = err.abs()  # (B, (1+)Pnn, future_len, 4 or 3)
+        quad: torch.Tensor = 0.5 * err.pow(2)  # (B, (1+)Pnn, future_len, 4 or 3)
         lin: torch.Tensor = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA
-                                          )  # (B, (1+)Pnn, future_len, 4)
+                                          )  # (B, (1+)Pnn, future_len, 4 or 3)
         huber: torch.Tensor = torch.where(abs_err <= HUBER_DELTA, quad,
-                                          lin)  # (B, (1+)Pnn, future_len, 4)
+                                          lin)  # (B, (1+)Pnn, future_len, 4 or 3)
         dpm_loss: torch.Tensor = huber.sum(dim=-1)  # (B, (1+)Pnn, future_len)
     else:
         if model_type == "score":
@@ -727,7 +782,7 @@ def _compute_dpm_loss(
                                  dim=-1)  # (B, (1+)Pnn, future_len)
         elif model_type == "x_start":
             dpm_loss = torch.sum((score - normed_target_future_seq_gt)**2,
-                                 dim=-1)  # (B, (1+)Pnn, future_len, 4)
+                                 dim=-1)  # (B, (1+)Pnn, future_len, 4 or 3) -> (B, (1+)Pnn, future_len)
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
@@ -762,7 +817,7 @@ def _aggregate_weighted_loss(
 def _compute_integration_and_constraint_losses(
     args: Any,
     decoder_output: Dict[str, torch.Tensor],
-    normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
     low_t_mask_3_ndim: torch.Tensor,  # (B, 1, 1)
     w_t: torch.Tensor,  # (1, 1, T)
@@ -774,7 +829,7 @@ def _compute_integration_and_constraint_losses(
     내부 계산은 float32로 수행해서 수치 불안정 가능성을 줄입니다.
 
     Args:
-        normed_target_future_seq_gt: (B, (1+)Pnn, future_len, 4)
+        norm_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
         target_future_valid: ((B, (1 +) Pnn, future_len)
         low_t_mask_3_ndim: (B, 1, 1)
         w_t: (1, 1, T)
@@ -803,7 +858,7 @@ def _compute_integration_and_constraint_losses(
                                                 1:, :]  # (B, (1+)Pnn, T, 4)
 
         # per_step: (B,(1+)Pnn,T) float32
-        diff = (integrated_trajectory - normed_target_future_seq_gt
+        diff = (integrated_trajectory - norm_target_future_gt_4_dim
                ).float()  # (B, (1+)Pnn, future_len, 4)
         per_step = (diff**2).sum(dim=-1)
 
@@ -835,59 +890,59 @@ def _compute_integration_and_constraint_losses(
 
 
 def _add_xy_yaw_metric_losses(
+    pose_based: bool,
     loss_dict: Dict[str, Any],
     state_normalizer: StateNormalizer,
     observation_normalizer: Any,
-    score: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
-    normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    score: torch.Tensor,   # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+    normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4 or 3)
+    norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, (1+)Pnn, future_len)
     integrated_trajectory: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 4) 또는 None
     control_constraint_diff: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 3) 또는 None
 ) -> None:
     """xy / yaw 관련 보기용 지표를 loss_dict에 추가합니다.
-
-    중요:
-        - 이 함수가 만드는 값들은 "학습(역전파/업데이트)"에는 쓰이지 않습니다.
-        - 따라서 반드시 torch.no_grad()로 감싸서 불필요한 비용을 줄입니다.
-
-    Args:
-        loss_dict: 결과를 추가할 dict (in-place)
-        state_normalizer: 상태 역정규화 도우미
-        observation_normalizer: 제어 역정규화 도우미
-        score: 예측 궤적(정규화된 값). shape: (B, (1+)Pnn, T, 4)
-        normed_target_future_seq_gt: 정답 궤적(정규화된 값). shape: (B, (1+)Pnn, T, 4)
-        target_future_valid: 유효 마스크. shape: (B, (1+)Pnn, T)
-        integrated_trajectory: 통합 궤적(정규화된 값). shape: (B, (1+)Pnn, T, 4) 또는 None
-        control_constraint_diff: 제어 차이(정규화된 값). shape: (B, (1+)Pnn, T, 3) 또는 None
-
-    Returns:
-        None
     """
     with torch.no_grad():
-        # score_denorm: (B, (1+)Pnn, T, 4)
-        score_denorm: torch.Tensor = state_normalizer.inverse(score, target_future_valid)
+        if pose_based:
+            # score_denorm: (B, (1+)Pnn, T, 4)
+            score_denorm: torch.Tensor = state_normalizer.inverse(score, target_future_valid)
+            # target_future_gt: (B, (1+)Pnn, T, 4)
+            target_future_gt: torch.Tensor = state_normalizer.inverse(
+                normed_target_future_seq_gt, target_future_valid
+            )
+            # (1) score 기준 xy/yaw 오차
+            xy_yaw_losses = _compute_xy_yaw_losses(
+                score_denorm,  # (B, (1+)Pnn, T, 4)
+                target_future_gt,  # (B, (1+)Pnn, T, 4)
+                target_future_valid,  # (B, (1+)Pnn, future_len)
+            )
+            loss_dict.update(xy_yaw_losses)
 
-        # target_future_gt: (B, (1+)Pnn, T, 4)
-        target_future_gt: torch.Tensor = state_normalizer.inverse(
-            normed_target_future_seq_gt, target_future_valid
-        )
-
-        # (1) score 기준 xy/yaw 오차
-        xy_yaw_losses = _compute_xy_yaw_losses(
-            score_denorm,
-            target_future_gt,
-            target_future_valid,
-        )
-        loss_dict.update(xy_yaw_losses)
-
+        else:
+            # score_denorm: (B, (1+)Pnn, T, 3)
+            score_denorm: torch.Tensor = observation_normalizer.inverse(score)
+            # target_future_gt: (B, (1+)Pnn, T, 3)
+            target_future_gt: torch.Tensor = observation_normalizer.inverse(
+                normed_target_future_seq_gt)
+            # (1) score 기준 xy/yaw 오차
+            vxy_yaw_losses = _compute_vxy_yaw_losses(
+                score_denorm,  # (B, (1+)Pnn, T,  3)
+                target_future_gt,  # (B, (1+)Pnn, T, 3)
+                target_future_valid,  # (B, (1+)Pnn, future_len)
+            )
+            loss_dict.update(vxy_yaw_losses)
         # (2) integrated_trajectory 기준 xy/yaw 오차
         if integrated_trajectory is not None:
+            target_future_gt_4_dim: torch.Tensor = state_normalizer.inverse(
+                norm_target_future_gt_4_dim, target_future_valid
+            )
             integrated_trajectory_denorm: torch.Tensor = state_normalizer.inverse(
                 integrated_trajectory, target_future_valid
             )
             integ_xy_yaw_losses = _compute_xy_yaw_losses(
                 integrated_trajectory_denorm,
-                target_future_gt,
+                target_future_gt_4_dim,
                 target_future_valid,
                 prefix="integration_loss",
             )
@@ -1074,7 +1129,13 @@ def diffusion_loss_func(
         [norm_inputs["ego_agent_past_is_valid"][:, -1:],
          norm_inputs["ego_future_gt_is_valid"]], dim=1,
     )
-
+    # (B, future_len, 4)
+    ego_future_gt_4_dim = norm_outputs["ego_future_gt_4_dim"]
+    # (B, Pnn, future_len, 4)
+    near_future_gt_4_dim = norm_outputs["near_future_gt_4_dim"]
+    norm_target_future_gt_4_dim = torch.cat([
+         ego_future_gt_4_dim.unsqueeze(1), near_future_gt_4_dim
+    ], dim=1)  # (B, (1+)Pnn, future_len, 4)
     # norm_near_current_4_dim : (B, Pnn, 4)
     norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
     if args.pose_based:
@@ -1084,8 +1145,7 @@ def diffusion_loss_func(
         ) = build_target_future_tensors_and_masks(
             args=args,
             norm_ego_cur_gt_4_dim=norm_ego_cur_gt_4_dim, # (B, 4)
-            normed_ego_future_gt_4_dim=norm_outputs[
-                "ego_future_gt_4_dim"],  # (B, future_len, 4)
+            normed_ego_future_gt_4_dim=ego_future_gt_4_dim,  # (B, future_len, 4)
             ego_cur_future_gt_is_valid=ego_cur_future_gt_is_valid,
             # (B, 1 + future_len)
             norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
@@ -1102,7 +1162,7 @@ def diffusion_loss_func(
         normed_target_seq_gt : (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
         target_seq_is_valid : (B, (1+)Pnn, future_len)
         """
-        past_future_seg_control_gt_3_dim = norm_outputs[
+        past_future_seg_control_gt_3_dim = norm_inputs[
                 "past_future_seg_control_gt_3_dim"]
         # past_seq_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
         past_seq_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
@@ -1174,19 +1234,19 @@ def diffusion_loss_func(
         past_seq_control_gt_3_dim=past_seq_control_gt_3_dim, # (B, (1+)Pnn, past_len, 3) or None
     )
 
-    # score:  (B, one_or_Pnn, future_len, 4)
-    score: torch.Tensor = _extract_score_from_decoder(
+    # score:  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+    score: torch.Tensor = _extract_score_from_decoder(future_len=args.future_len,
         decoder_output=decoder_output)
 
     # dpm_loss: (B, (1+)Pnn, future_len)
     dpm_loss: torch.Tensor = _compute_dpm_loss(
         args=args,
         model_type=model_type,
-        score=score,  # (B, (1+)Pnn, future_len, 4)
+        score=score, # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, T, 3)
         std=std,  # (B, 1, 1, 1)
-        random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4)
+        random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4 or 3)
         normed_target_future_seq_gt=
-        normed_target_future_seq_gt,  # (B, (1+)Pnn, future_len, 4)
+        normed_target_future_seq_gt,  # (B, (1+)Pnn, future_len, 4 or 3)
     )
 
     if args.use_timestep_weight_loss:
@@ -1228,12 +1288,13 @@ def diffusion_loss_func(
         control_constraint_diff: (B, (1+)Pnn, T, 3) 또는 None
         
 =        """
+        # norm_target_future_gt_4_dim  # (B, (1+)Pnn, future_len, 4)
         (integration_loss_val, constraint_loss_val, integrated_trajectory,
          control_constraint_diff) = _compute_integration_and_constraint_losses(
              args=args,
              decoder_output=decoder_output,
-             normed_target_future_seq_gt=
-             normed_target_future_seq_gt,  # (B, (1+)Pnn, future_len, 4)
+             norm_target_future_gt_4_dim=
+             norm_target_future_gt_4_dim, # (B, (1+)Pnn, future_len, 4)
              target_future_valid=
              target_future_valid,  # (B, (1 +) Pnn, future_len)
              low_t_mask_3_ndim=low_t_mask_3_ndim,  # (B,1,1)
@@ -1247,14 +1308,17 @@ def diffusion_loss_func(
         # xy/yaw 관련 보기용 지표는 매 step이 아니라 "가끔"만 계산합니다.
         if _should_compute_xy_yaw_metrics_this_step(args):
             _add_xy_yaw_metric_losses(
+                pose_based=args.pose_based,
                 loss_dict=loss_dict,
                 state_normalizer=state_normalizer,
                 observation_normalizer=observation_normalizer,
-                score=score,
-                normed_target_future_seq_gt=normed_target_future_seq_gt,
-                target_future_valid=target_future_valid,
-                integrated_trajectory=integrated_trajectory,
-                control_constraint_diff=control_constraint_diff,
+                score=score, #  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+                normed_target_future_seq_gt=normed_target_future_seq_gt, # # (B, (1+)Pnn, future_len, 4 or 3)
+                norm_target_future_gt_4_dim=
+                norm_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
+                target_future_valid=target_future_valid, # (B, (1 +) Pnn, future_len)
+                integrated_trajectory=integrated_trajectory, # (B, (1+)Pnn, T, 4) 또는 None
+                control_constraint_diff=control_constraint_diff, # (B, (1+)Pnn, T, 3) 또는 None
             )
     # # dpm_loss 전체가 유한값인지 마지막으로 검사
     # assert torch.isfinite(dpm_loss).all().item(), \

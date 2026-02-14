@@ -1919,7 +1919,6 @@ class Decoder(nn.Module):
         else
             (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
         """
-
         score_flat: torch.Tensor = self.dit(
             target_input_norm_xT=
             xT_input_flat,
@@ -1936,6 +1935,12 @@ class Decoder(nn.Module):
         _require_finite("decoder_dit_output", score_flat)
         # (B, (1+)Pnn, 4)
         target_current_xyyaw = target_agents_past[:, :, -1, :4]
+        """ score_flat / xT_input_flat
+        if pose_based
+            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        else
+            (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+        """
         # 3) (B,(1+)Pnn,F_out) ->
         # score_cur_future : (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
         score_cur_future: torch.Tensor = self._extract_cur_future_from_score(
@@ -1948,7 +1953,7 @@ class Decoder(nn.Module):
         decoder_training_output[
             "score"] = score_cur_future  # (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
         """ decoder_training_output
-        score : (B, (1+)Pnn, 1+T, 4)
+        score : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
         "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
         "control_constraint_diff" : (B, (1+)Pnn, T, 3)
         """
@@ -2882,6 +2887,7 @@ class DiT(nn.Module):
             self,
             x: torch.Tensor,  # (B, Pnn, F_out)
             integrated_trajectory: torch.Tensor,  # (B, Pnn, T, 4)
+            target_past_11_dim: torch.Tensor,  # (B,(1+)Pnn,past_len,11)
             target_current_xyyaw_for_feasible: torch.Tensor,  # (B, Pnn, 4)
     ) -> torch.Tensor:
         """평가 모드에서 integrated_trajectory를 최종 출력으로 쓸지 결정한다.
@@ -2903,13 +2909,16 @@ class DiT(nn.Module):
             return x
         batch_size, one_or_Pnn = x.shape[:2]
         B: int = batch_size
-
+        """ x
+    pose_based:
+        (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+    else:
+        (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
+        """
         if self.config.use_past_dit_input:
             # x의 과거+현재 부분만 유지한 뒤, 미래를 integrated_trajectory로 교체
-            x_past_cur = (
-                x.reshape(B, one_or_Pnn, -1,
-                          4).contiguous()[:, :, :(self.config.time_len), :]
-            )  # (B, Pnn, time_len, 4)
+            # (B, Pnn, time_len, 4)
+            x_past_cur = target_past_11_dim[:, :, :, :4]
 
             x_new = torch.cat(
                 [x_past_cur, integrated_trajectory],
@@ -3279,12 +3288,12 @@ class DiT(nn.Module):
         """
         # 5) 평가 모드 + use_direct_loss = False에서
         # integrated_trajectory로 출력 교체(옵션, 기존 로직 유지)
-        # TODO:
         # x_out: (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         x_out: torch.Tensor = self._maybe_replace_x_with_integrated_trajectory_for_eval(
             x=x,
             integrated_trajectory=self.norm_dit_returns.
             integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
+            target_past_11_dim=target_past_11_dim,  # (B,(1+)Pnn,past_len,11)
             target_current_xyyaw_for_feasible=target_current_xyyaw_for_feasible,
         )
         return x_out
@@ -3520,6 +3529,12 @@ else
             # )
         elif self._model_type == "x_start":
             # x 를 대부분의 경우에 그대로 반환
+            """ return x
+        pose_based:
+            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        else:
+            (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
+            """
             return self._forward_x_start_branch(
                 x=x,
                 # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
