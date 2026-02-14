@@ -120,4 +120,8 @@ FORCE_REBUILD=0
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
     --prefetch_factor 8 \
-    --pose_based False
+    --pose_based False \
+    --p_sat 0. \
+    --w_int_max 1.0 \
+    --w_const 0.1
+
