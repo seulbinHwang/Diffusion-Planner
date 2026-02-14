@@ -2292,6 +2292,11 @@ def _split_train_loss_for_logging(
                 "neighbor_prediction_loss_yaw",
                 "neighbor_prediction_loss_xy_early",
                 "neighbor_prediction_loss_yaw_early",
+                "neighbor_prediction_loss_vxy",
+                "neighbor_prediction_loss_yaw_rate",
+                "neighbor_prediction_loss_vxy_early",
+                "neighbor_prediction_loss_yaw_rate_early",
+
         ):
             direct_loss_dict[k] = v
         elif k in (
