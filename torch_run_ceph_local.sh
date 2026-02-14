@@ -97,7 +97,7 @@ FORCE_REBUILD=0
   --dst_root "$LOCAL_TRAIN_SET_PATH" \
   --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
   --force_rebuild "$FORCE_REBUILD" \
-  --num_workers 28
+  --num_workers 24
 #
 ## ---- 학습은 로컬 데이터로 ----
 #"$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
