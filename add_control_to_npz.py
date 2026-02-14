@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union, Optional
+import multiprocessing as mp
+
 import zipfile
+import shutil
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,6 +17,242 @@ import time
 ArrayF = NDArray[np.floating]
 
 CONTROL_KEY = "past_future_seg_control_gt_3_dim"
+_WORKER_CONFIG: Dict[str, Any] = {}
+
+
+def _get_auto_worker_count(total_files: int) -> int:
+    """자동으로 사용할 프로세스 개수를 정합니다.
+
+    Args:
+        total_files (int): 처리할 파일 개수.
+
+    Returns:
+        int:
+            사용할 프로세스 개수.
+            - CPU 코어 수를 기준으로 하되, 너무 큰 값은 제한합니다.
+            - 파일 개수보다 많게 잡지 않습니다.
+    """
+    cpu = int(os.cpu_count() or 1)
+
+    # 너무 과하게 늘리면 디스크가 버거울 수 있어서 상한을 둡니다.
+    upper = min(16, cpu)
+
+    if int(total_files) <= 0:
+        return 1
+    return max(1, min(int(total_files), int(upper)))
+
+
+def _init_worker_process(config: Dict[str, Any]) -> None:
+    """각 워커 프로세스 시작 시 설정을 저장합니다.
+
+    Args:
+        config (Dict[str, Any]): 워커가 공통으로 쓸 설정 값들.
+    """
+    global _WORKER_CONFIG
+    _WORKER_CONFIG = dict(config)
+
+
+def _worker_process_one_fname(fname: str) -> Tuple[str, bool, str, bool]:
+    """워커 프로세스에서 npz 파일 1개를 처리합니다.
+
+    Args:
+        fname (str): train_json에 들어있는 파일명(예: "abc.npz")
+
+    Returns:
+        Tuple[str, bool, str, bool]:
+            - fname: 입력 파일명
+            - ok: 성공(True) / 실패(False)
+            - msg: "ok" / "skip(...)" / 실패 원인 메시지
+            - skipped: 이미 처리 완료라서 스킵이면 True, 아니면 False
+    """
+    cfg = _WORKER_CONFIG
+    dataset_dir = str(cfg["dataset_dir"])
+
+    dt = float(cfg["dt"])
+    overwrite = bool(cfg["overwrite"])
+    compress = bool(cfg["compress"])
+    add_sample_keys = bool(cfg["add_sample_keys"])
+    overwrite_sample_keys = bool(cfg["overwrite_sample_keys"])
+    predicted_neighbor_num = int(cfg["predicted_neighbor_num"])
+    eval_method = str(cfg["eval_method"])
+    use_agent_route_lane_order = bool(cfg["use_agent_route_lane_order"])
+
+    npz_path = os.path.join(dataset_dir, str(fname))
+
+    try:
+        keys: Optional[set[str]] = None
+        try:
+            keys = _read_npz_key_set(npz_path)
+        except Exception:
+            keys = None
+
+        if _is_already_processed_npz(
+            npz_path,
+            overwrite=overwrite,
+            add_sample_keys=add_sample_keys,
+            overwrite_sample_keys=overwrite_sample_keys,
+            use_agent_route_lane_order=use_agent_route_lane_order,
+            existing_keys=keys,
+        ):
+            return str(fname), True, "skip(already processed)", True
+
+        ok, msg = _process_one_file(
+            npz_path,
+            dt=dt,
+            overwrite=overwrite,
+            compress=compress,
+            add_sample_keys=add_sample_keys,
+            overwrite_sample_keys=overwrite_sample_keys,
+            predicted_neighbor_num=predicted_neighbor_num,
+            eval_method=eval_method,
+            use_agent_route_lane_order=use_agent_route_lane_order,
+            existing_keys=keys,
+        )
+        return str(fname), bool(ok), str(msg), False
+
+    except Exception as e:
+        return str(fname), False, f"{type(e).__name__}: {e}", False
+
+def _load_npz_subset_as_dict(npz_path: str, keys: Sequence[str]) -> Dict[str, np.ndarray]:
+    """npz에서 '필요한 key들만' 골라서 dict로 읽습니다.
+
+    Args:
+        npz_path (str): npz 파일 경로.
+        keys (Sequence[str]): 읽고 싶은 key 목록.
+
+    Returns:
+        Dict[str, np.ndarray]:
+            - key -> np.ndarray
+            - npz에 없는 key는 결과 dict에 포함되지 않습니다.
+
+    Notes:
+        - 기존 `_read_npz_as_dict()`처럼 파일 전체를 다 읽지 않습니다.
+        - 기본은 allow_pickle=False로 읽고,
+          object 배열 때문에 실패하면 allow_pickle=True로 한 번 더 시도합니다.
+    """
+    key_list = [str(k) for k in keys]
+    key_set = set(key_list)
+
+    try:
+        with np.load(npz_path, allow_pickle=False) as npz:
+            files = set(npz.files)
+            return {k: npz[k] for k in key_set if k in files}
+    except ValueError as e:
+        msg = str(e)
+        if "allow_pickle=False" in msg or "Object arrays cannot be loaded" in msg:
+            with np.load(npz_path, allow_pickle=True) as npz:
+                files = set(npz.files)
+                return {k: npz[k] for k in key_set if k in files}
+        raise
+
+
+def _atomic_update_npz_by_copy_and_append(
+    npz_path: str,
+    new_arrays: Mapping[str, np.ndarray],
+    *,
+    compress: bool,
+    compresslevel: int = 1,
+) -> None:
+    """원본 npz를 그대로 복사한 뒤, 새 key들만 '추가로' 붙여서 원자적으로 교체합니다.
+
+    이 방식의 핵심:
+        - 기존 npz의 모든 배열을 다시 저장(재압축)하지 않습니다.
+        - 실제로 새로 만든 배열들만 zip 끝에 추가로 기록합니다.
+        - 마지막에 os.replace로 한 번에 교체합니다.
+
+    Args:
+        npz_path (str): 대상 npz 경로.
+        new_arrays (Mapping[str, np.ndarray]): 추가/갱신할 key -> 배열.
+        compress (bool): True면 새로 추가하는 entry는 deflate 압축으로 저장합니다.
+        compresslevel (int): 압축 강도(낮을수록 보통 더 빠름). 기본 1.
+
+    Notes:
+        - overwrite 모드에서 기존 key를 "갱신"하려면 zip에 같은 이름을 다시 쓰게 됩니다.
+          이 스크립트에서는 overwrite 계열일 때는 전체 재저장(full rewrite)로 처리해서,
+          기본 모드에서는 중복 entry가 생기지 않게 설계합니다.
+    """
+    tmp_path = npz_path + ".tmp"
+    try:
+        # 1) 원본을 그대로 복사 (기존 데이터는 재압축/재저장 안 함)
+        shutil.copyfile(npz_path, tmp_path)
+
+        compression = zipfile.ZIP_DEFLATED if bool(compress) else zipfile.ZIP_STORED
+
+        zip_kwargs: Dict[str, Any] = {"mode": "a", "compression": compression}
+        if bool(compress):
+            zip_kwargs["compresslevel"] = int(max(0, int(compresslevel)))
+
+        def _append_with_kwargs(kwargs: Dict[str, Any]) -> None:
+            with zipfile.ZipFile(tmp_path, **kwargs) as zf:
+                # key 순서를 고정하면, 실행마다 결과가 더 일정해집니다(보기/검증용).
+                for key in sorted(new_arrays.keys()):
+                    arr = np.asarray(new_arrays[key])
+                    # npz 내부에서는 "<key>.npy" 형태로 저장됩니다.
+                    with zf.open(f"{key}.npy", mode="w") as f:
+                        np.save(f, arr, allow_pickle=False)
+
+        try:
+            _append_with_kwargs(zip_kwargs)
+        except TypeError:
+            # 일부 파이썬/환경에서 compresslevel을 지원하지 않을 수 있어 안전 처리
+            zip_kwargs.pop("compresslevel", None)
+            _append_with_kwargs(zip_kwargs)
+
+        # 2) 원자적 교체
+        os.replace(tmp_path, npz_path)
+
+    except BaseException:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise
+
+
+def _collect_npz_arrays_from_sample(
+    sample: Mapping[str, Any],
+    *,
+    base_output_keys: Sequence[str],
+    alias_output_keys: Sequence[str],
+    overwrite: bool,
+    existing_keys: set[str],
+) -> Dict[str, np.ndarray]:
+    """sample dict에서 '실제로 npz에 저장할 파생 key'만 골라 dict로 뽑습니다.
+
+    Args:
+        sample (Mapping[str, Any]): __getitem__ 형태로 만든 sample dict.
+        base_output_keys (Sequence[str]): 원본에서 읽어서 채운 key들(rename 반영).
+        alias_output_keys (Sequence[str]): rename으로 새로 생긴 key들(예: planner_future_11_dim).
+        overwrite (bool): True면 이미 존재하는 파생키도 덮어쓴다고 가정합니다.
+        existing_keys (set[str]): 현재 npz에 이미 들어있는 key 이름 집합.
+
+    Returns:
+        Dict[str, np.ndarray]: npz에 추가로 저장할 key -> array dict.
+    """
+    base_set = set(map(str, base_output_keys))
+    alias_set = set(map(str, alias_output_keys))
+
+    out: Dict[str, np.ndarray] = {}
+    for key, value in sample.items():
+        k = str(key)
+
+        # 원본에서 읽어온 값은 저장하지 않음(중복 방지).
+        # 단, alias key는 예외로 저장.
+        if (k in base_set) and (k not in alias_set):
+            continue
+
+        arr = _to_np_array_or_skip(value)
+        if arr is None:
+            continue
+
+        # overwrite가 아니면: 이미 있는 키는 "추가 저장"하지 않아서 zip 중복을 방지
+        if (not bool(overwrite)) and (k in existing_keys):
+            continue
+
+        out[k] = arr
+
+    return out
 
 
 def _read_npz_key_set(npz_path: str) -> set[str]:
@@ -131,7 +370,6 @@ def _build_expected_keys_for_done(
 
     return expected
 
-
 def _is_already_processed_npz(
     npz_path: str,
     *,
@@ -139,6 +377,7 @@ def _is_already_processed_npz(
     add_sample_keys: bool,
     overwrite_sample_keys: bool,
     use_agent_route_lane_order: bool,
+    existing_keys: Optional[set[str]] = None,
 ) -> bool:
     """이 npz를 '이미 완료'로 보고 바로 스킵해도 되는지 판단합니다.
 
@@ -148,6 +387,7 @@ def _is_already_processed_npz(
         add_sample_keys (bool): sample 파생키 모드인지 여부.
         overwrite_sample_keys (bool): True면 sample 파생키도 다시 계산해야 하므로 False 반환.
         use_agent_route_lane_order (bool): agent_route_lane_order 포함 모드인지 여부.
+        existing_keys (Optional[set[str]]): 이미 읽어둔 key set이 있으면 재사용합니다.
 
     Returns:
         bool: 이미 완료 상태면 True, 아니면 False.
@@ -159,11 +399,14 @@ def _is_already_processed_npz(
     if bool(add_sample_keys) and bool(overwrite_sample_keys):
         return False
 
-    try:
-        keys = _read_npz_key_set(npz_path)
-    except Exception:
-        # key 목록조차 못 읽으면, 스킵하지 말고 기존 로직에서 에러가 나게 둡니다.
-        return False
+    keys: set[str]
+    if existing_keys is not None:
+        keys = set(existing_keys)
+    else:
+        try:
+            keys = _read_npz_key_set(npz_path)
+        except Exception:
+            return False
 
     expected = _build_expected_keys_for_done(
         keys,
@@ -171,6 +414,7 @@ def _is_already_processed_npz(
         use_agent_route_lane_order=bool(use_agent_route_lane_order),
     )
     return expected.issubset(keys)
+
 
 
 def _format_seconds_to_hh_mm(seconds: float) -> str:
@@ -1003,8 +1247,16 @@ def _process_one_file(
     predicted_neighbor_num: int,
     eval_method: str,
     use_agent_route_lane_order: bool,
+    existing_keys: Optional[set[str]] = None,
 ) -> Tuple[bool, str]:
     """npz 하나를 읽고 필요한 key들을 추가해 저장합니다.
+
+    속도 최적화 요점:
+        1) 기본 모드(덮어쓰기 없음)에서는 "원본 전체 재저장"을 하지 않습니다.
+           - 원본을 .tmp로 복사한 뒤,
+           - 새로 만든 key들만 추가로 붙이고,
+           - os.replace로 교체합니다.
+        2) 계산에 필요한 입력 key만 골라서 읽습니다(파일 전체 로드 방지).
 
     Returns:
         (success, message)
@@ -1012,14 +1264,146 @@ def _process_one_file(
     if not os.path.exists(npz_path):
         return False, f"missing: {npz_path}"
 
+    # 기존 key 목록(가능하면 main에서 읽어온 것을 재사용)
+    keys: set[str]
+    if existing_keys is not None:
+        keys = set(existing_keys)
+    else:
+        try:
+            keys = _read_npz_key_set(npz_path)
+        except Exception:
+            keys = set()
+
+    # 이번 옵션에서 "완료"에 필요한 key / missing key
+    expected = _build_expected_keys_for_done(
+        keys,
+        add_sample_keys=bool(add_sample_keys),
+        use_agent_route_lane_order=bool(use_agent_route_lane_order),
+    )
+    missing_expected = expected.difference(keys)
+
+    # 무엇을 해야 하는지 결정
+    need_control = bool(overwrite) or (CONTROL_KEY in missing_expected)
+
+    need_sample = bool(add_sample_keys) and (
+        bool(overwrite_sample_keys) or (len(missing_expected.difference({CONTROL_KEY})) > 0)
+    )
+
+    if (not need_control) and (not need_sample):
+        return True, "skip(no change)"
+
+    # overwrite 계열이면: 중복 entry가 쌓이지 않도록 기존 방식(전체 재저장) 유지
+    must_full_rewrite = bool(overwrite) or (bool(add_sample_keys) and bool(overwrite_sample_keys))
+
+    # ------------------------------------------------------------
+    # (A) 기본 모드(덮어쓰기 없음): 필요한 입력만 로드 + 새 key만 append 저장
+    # ------------------------------------------------------------
+    if not must_full_rewrite:
+        # 계산에 필요한 입력 key만 선택
+        keys_to_load: set[str] = set()
+
+        if need_control:
+            keys_to_load.update(
+                {
+                    "ego_agent_past",
+                    "ego_future_gt_11_dim",
+                    "neighbor_agents_past",
+                    "neighbor_future_gt_11_dim",
+                }
+            )
+
+        if need_sample:
+            # sample 파생키 생성에 필요한 소스들(파생키 계산에 실제로 쓰는 것들만)
+            keys_to_load.update(
+                {
+                    "ego_agent_past",
+                    "ego_future_gt_11_dim",
+                    "ego_future_gt_3_dim",
+                    "neighbor_agents_past",
+                    "neighbor_future_gt_11_dim",
+                    "neighbor_future_gt_3_dim",
+                    "stop_sign_points",
+                    "crosswalk_points",
+                    "lanes",
+                    "static_objects",
+                    "route_lanes",
+                    "speed_bump_points",
+                    "driveway_points",
+                    "road_edge",
+                }
+            )
+            if bool(use_agent_route_lane_order):
+                keys_to_load.add("agent_route_lane_order")
+
+        npz_data = _load_npz_subset_as_dict(npz_path, sorted(keys_to_load))
+
+        new_arrays: Dict[str, np.ndarray] = {}
+
+        # (A-1) control key
+        if need_control:
+            required_keys = [
+                "ego_agent_past",
+                "ego_future_gt_11_dim",
+                "neighbor_agents_past",
+                "neighbor_future_gt_11_dim",
+            ]
+            for k in required_keys:
+                if k not in npz_data:
+                    return False, f"missing key '{k}'"
+
+            control = build_past_future_seg_control_gt_3_dim_from_npz_arrays(
+                ego_agent_past=npz_data["ego_agent_past"],
+                ego_future_gt_11_dim=npz_data["ego_future_gt_11_dim"],
+                neighbor_agents_past=npz_data["neighbor_agents_past"],
+                neighbor_future_gt_11_dim=npz_data["neighbor_future_gt_11_dim"],
+                dt=float(dt),
+            )
+            new_arrays[CONTROL_KEY] = control
+
+        # (A-2) sample 파생키
+        if need_sample:
+            try:
+                sample, base_output_keys, alias_output_keys = _build_sample_dict_like_dataset_getitem(
+                    npz_data,
+                    file_name=os.path.basename(npz_path),
+                    predicted_neighbor_num=int(predicted_neighbor_num),
+                    eval_method=str(eval_method),
+                    use_agent_route_lane_order=bool(use_agent_route_lane_order),
+                )
+            except Exception as e:
+                return False, f"build_sample_failed: {type(e).__name__}: {e}"
+
+            sample_new = _collect_npz_arrays_from_sample(
+                sample,
+                base_output_keys=base_output_keys,
+                alias_output_keys=alias_output_keys,
+                overwrite=False,  # 이 브랜치는 덮어쓰기 없음
+                existing_keys=keys,
+            )
+            new_arrays.update(sample_new)
+
+        if not new_arrays:
+            return True, "skip(no change)"
+
+        # ✅ 핵심: 전체 재저장 대신 "새 key만" tmp 복사본에 append
+        _atomic_update_npz_by_copy_and_append(
+            npz_path,
+            new_arrays,
+            compress=bool(compress),
+            compresslevel=1,
+        )
+        return True, "ok"
+
+    # ------------------------------------------------------------
+    # (B) overwrite 계열: 기존 방식(전체 재저장) 유지 (중복 entry 방지)
+    # ------------------------------------------------------------
     data = _read_npz_as_dict(npz_path)
 
-    # (A) control key 처리
-    control_key = "past_future_seg_control_gt_3_dim"
-    need_control = bool(overwrite) or (control_key not in data)
-
     changed = False
-    if need_control:
+
+    # (B-1) control key
+    need_control_full = bool(overwrite) or (CONTROL_KEY not in data)
+    if need_control_full:
         required_keys = [
             "ego_agent_past",
             "ego_future_gt_11_dim",
@@ -1037,11 +1421,10 @@ def _process_one_file(
             neighbor_future_gt_11_dim=data["neighbor_future_gt_11_dim"],
             dt=float(dt),
         )
-
-        data[control_key] = control
+        data[CONTROL_KEY] = control
         changed = True
 
-    # (B) dataset.py __getitem__의 sample dict 로직을 동일하게 수행 (tfrecord_path 제외)
+    # (B-2) sample 파생키
     if bool(add_sample_keys):
         try:
             sample, base_output_keys, alias_output_keys = _build_sample_dict_like_dataset_getitem(
@@ -1054,7 +1437,6 @@ def _process_one_file(
         except Exception as e:
             return False, f"build_sample_failed: {type(e).__name__}: {e}"
 
-        # sample에서 계산된 "파생 key"만 npz에 추가
         changed |= _merge_sample_keys_into_npz_data(
             data,
             sample,
@@ -1066,8 +1448,9 @@ def _process_one_file(
     if not changed:
         return True, "skip(no change)"
 
-    _atomic_save_npz(npz_path, data, compress=compress)
+    _atomic_save_npz(npz_path, data, compress=bool(compress))
     return True, "ok"
+
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1105,7 +1488,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--predicted_neighbor_num",
         type=int,
-        default=32,
+        default=448,
         help="near로 뽑을 neighbor 수(predicted_neighbor_num).",
     )
     parser.add_argument(
@@ -1120,6 +1503,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=bool,
         default=False,
         help="dataset.py와 동일하게 agent_route_lane_order 키도 sample에 포함합니다.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="프로세스 개수. 0이면 자동(최대 16), 1이면 순차 처리",
     )
     return parser
 
@@ -1139,69 +1528,151 @@ def main() -> None:
     eval_method: str = str(args.eval_method)
     use_agent_route_lane_order: bool = bool(args.use_agent_route_lane_order)
 
+    workers_arg: int = int(getattr(args, "workers", 0))
+
     file_names = _load_training_file_list(train_json)
     if limit > 0:
         file_names = file_names[:limit]
 
+    total_files = len(file_names)
+    if total_files <= 0:
+        print("done. ok=0, fail=0, skip=0, total=0")
+        return
+
+    workers: int = workers_arg if workers_arg > 0 else _get_auto_worker_count(total_files)
+    workers = max(1, min(int(workers), int(total_files)))
+
     ok_count = 0
     fail_count = 0
+    skip_count = 0
 
-    total_files = len(file_names)
     start_time_s = time.monotonic()
     last_print_time_s = start_time_s
 
-    pbar = tqdm(file_names, desc="add_control_to_npz")
-    skip_count = 0
+    # -----------------------------
+    # (1) 순차 모드
+    # -----------------------------
+    if workers <= 1:
+        pbar = tqdm(file_names, desc="add_control_to_npz")
+        for idx, fname in enumerate(pbar, start=1):
+            npz_path = os.path.join(dataset_dir, fname)
 
-    pbar = tqdm(file_names, desc="add_control_to_npz")
-    for idx, fname in enumerate(pbar, start=1):
-        npz_path = os.path.join(dataset_dir, fname)
+            try:
+                keys: Optional[set[str]] = None
+                try:
+                    keys = _read_npz_key_set(npz_path)
+                except Exception:
+                    keys = None
 
-        try:
-            # ✅ 이미 완료된 파일이면: _process_one_file 자체를 호출하지 않음
-            if _is_already_processed_npz(
-                npz_path,
-                overwrite=overwrite,
-                add_sample_keys=add_sample_keys,
-                overwrite_sample_keys=overwrite_sample_keys,
-                use_agent_route_lane_order=use_agent_route_lane_order,
-            ):
-                ok = True
-                msg = "skip(already processed)"
-                skip_count += 1
-            else:
-                ok, msg = _process_one_file(
+                if _is_already_processed_npz(
                     npz_path,
-                    dt=dt,
                     overwrite=overwrite,
-                    compress=compress,
                     add_sample_keys=add_sample_keys,
                     overwrite_sample_keys=overwrite_sample_keys,
-                    predicted_neighbor_num=predicted_neighbor_num,
-                    eval_method=eval_method,
                     use_agent_route_lane_order=use_agent_route_lane_order,
-                )
+                    existing_keys=keys,
+                ):
+                    ok = True
+                    msg = "skip(already processed)"
+                    skip_count += 1
+                else:
+                    ok, msg = _process_one_file(
+                        npz_path,
+                        dt=dt,
+                        overwrite=overwrite,
+                        compress=compress,
+                        add_sample_keys=add_sample_keys,
+                        overwrite_sample_keys=overwrite_sample_keys,
+                        predicted_neighbor_num=predicted_neighbor_num,
+                        eval_method=eval_method,
+                        use_agent_route_lane_order=use_agent_route_lane_order,
+                        existing_keys=keys,
+                    )
+
+                if ok:
+                    ok_count += 1
+                else:
+                    fail_count += 1
+                    tqdm.write(f"[FAIL] {fname}: {msg}")
+
+            except Exception as e:
+                fail_count += 1
+                tqdm.write(f"[EXCEPTION] {fname}: {type(e).__name__}: {e}")
+
+            last_print_time_s = _maybe_print_progress_every_5_min(
+                start_time_s=start_time_s,
+                last_print_time_s=last_print_time_s,
+                processed=idx,
+                total=total_files,
+                interval_s=300.0,
+            )
+
+        print(f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={total_files}")
+        return
+
+    # -----------------------------
+    # (2) 병렬 모드
+    # -----------------------------
+    worker_config: Dict[str, Any] = {
+        "dataset_dir": dataset_dir,
+        "dt": dt,
+        "overwrite": overwrite,
+        "compress": compress,
+        "add_sample_keys": add_sample_keys,
+        "overwrite_sample_keys": overwrite_sample_keys,
+        "predicted_neighbor_num": predicted_neighbor_num,
+        "eval_method": eval_method,
+        "use_agent_route_lane_order": use_agent_route_lane_order,
+    }
+
+    ctx = mp.get_context()  # 기본 시작 방식 사용
+    processed_count = 0
+
+    pbar = tqdm(total=total_files, desc=f"add_control_to_npz (workers={workers})")
+
+    pool = ctx.Pool(
+        processes=workers,
+        initializer=_init_worker_process,
+        initargs=(worker_config,),
+    )
+
+    try:
+        # chunksize는 너무 작으면 오버헤드가 커질 수 있어 적당히 잡습니다.
+        chunksize = 4
+
+        for fname, ok, msg, skipped in pool.imap_unordered(_worker_process_one_fname, file_names, chunksize=chunksize):
+            processed_count += 1
+            pbar.update(1)
 
             if ok:
                 ok_count += 1
+                if bool(skipped):
+                    skip_count += 1
             else:
                 fail_count += 1
                 tqdm.write(f"[FAIL] {fname}: {msg}")
 
-        except Exception as e:
-            fail_count += 1
-            tqdm.write(f"[EXCEPTION] {fname}: {type(e).__name__}: {e}")
+            last_print_time_s = _maybe_print_progress_every_5_min(
+                start_time_s=start_time_s,
+                last_print_time_s=last_print_time_s,
+                processed=processed_count,
+                total=total_files,
+                interval_s=300.0,
+            )
 
-        # ✅ 5분마다 진행 상황 출력(스킵이든 처리든 동일하게 동작)
-        last_print_time_s = _maybe_print_progress_every_5_min(
-            start_time_s=start_time_s,
-            last_print_time_s=last_print_time_s,
-            processed=idx,
-            total=total_files,
-            interval_s=300.0,
-        )
+        pool.close()
+        pool.join()
 
-    print(f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={len(file_names)}")
+    except KeyboardInterrupt:
+        tqdm.write("[STOP] Ctrl+C")
+        pool.terminate()
+        pool.join()
+
+    finally:
+        pbar.close()
+
+    print(f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={total_files}")
+
 
 
 
