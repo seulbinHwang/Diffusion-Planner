@@ -323,15 +323,20 @@ class Decoder(nn.Module):
         self._cond_last_prob: float = getattr(config, "cond_last_prob",
                                               0.0)  # 20%
         if self.config.use_past_dit_input:
-            output_dim = (config.time_len +
-                          config.future_len) * 4  # x, y, cos, sin
-        else:
-            if self.config.use_current_input:
-
-                output_dim = (config.future_len + 1) * 4  # x, y, cos, sin
+            if self.config.pose_based:
+                output_dim = (config.time_len +
+                              config.future_len) * 4  # x, y, cos, sin
             else:
-                output_dim = (config.future_len) * 4  # x, y, cos, sin
-
+                output_dim = (config.time_len -1 +
+                              config.future_len) * 3
+        else:
+            if self.config.pose_based:
+                if self.config.use_current_input:
+                    output_dim = (config.future_len + 1) * 4  # x, y, cos, sin
+                else:
+                    output_dim = (config.future_len) * 4  # x, y, cos, sin
+            else:
+                output_dim = (config.future_len) * 3
         self.dit = DiT(
             config=config,
             sde=self._sde,
@@ -1197,7 +1202,7 @@ class Decoder(nn.Module):
             x_seq = x_flat.reshape(B, P, S, 3)
             target_past_future_seg_valid = (
                         target_past_cur_future_valid[..., :-1] & target_past_cur_future_valid[
-                    ... , 1:]).astype(bool)  # (B, P, past_len + future_len)
+                    ... , 1:])  # (B, P, past_len + future_len)
             x_seq = self._mask_invalid_timesteps_to_zero(
                 x_seq=x_seq,
                 target_past_cur_future_valid=target_past_future_seg_valid,
@@ -2567,7 +2572,10 @@ class DiT(nn.Module):
 
         self._model_type = model_type
         # if self.config.use_amortized_diffusion:
-        output_dim_pre = int(output_dim / 4 * 6)
+        if self.config.pose_based:
+            output_dim_pre = int(output_dim / 4 * 6)
+        else:
+            output_dim_pre = int(output_dim / 3 * 5)
         # else:
         #     output_dim_pre = output_dim
         self.preproj = Mlp(
@@ -2664,51 +2672,6 @@ class DiT(nn.Module):
             f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}"
         )
 
-    def preproj_varlen(
-            self,
-            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*6)
-            target_current_mask: torch.Tensor,  # (B, (1+)Pnn) True=pad(무효 에이전트)
-    ) -> torch.Tensor:
-        """pre-proj MLP 를 유효 에이전트 토큰에만 적용하는 전처리 함수.
-
-        마스크를 이용해 유효 토큰만 펼친 뒤 MLP 를 통과시키고,
-        다시 배치 모양으로 되돌립니다.
-
-
-        Returns:
-            torch.Tensor:
-                pre-proj 후 토큰.
-                shape: (B, Pnn, D)
-        """
-        B, Pnn, F = target_input_norm_xT.shape  # (B, Pnn, F)
-        # unpad_input 은 True=유효 이므로 반전 필요
-        attention_mask = (~target_current_mask).to(torch.bool)  # (B, Pnn)
-
-        res = unpad_input(target_input_norm_xT, attention_mask)
-        # x_unpad: (T_total, F), indices: (T_total,)
-        if len(res) == 4:
-            x_unpad, indices, cu_seqlens, max_seqlen = res
-            seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
-        else:
-            x_unpad, indices, cu_seqlens, max_seqlen, seqlens = res
-
-        if x_unpad.numel() == 0:
-            D_out = self.preproj.fc2.out_features
-            zeros = target_input_norm_xT.new_zeros((B, Pnn, D_out))
-            touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc1.bias.view(-1)[:1].sum()
-                      if self.preproj.fc1.bias is not None else 0) +
-                     self.preproj.fc2.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc2.bias.view(-1)[:1].sum()
-                      if self.preproj.fc2.bias is not None else 0)) * 0.0
-            return zeros + touch
-
-        # 유효 토큰만 pre-proj 수행
-        x_unpad = self.preproj(x_unpad)  # (T_total, D)
-
-        # 다시 배치 모양으로 복원 (pad 위치는 0)
-        x = pad_input(x_unpad, indices, B, Pnn)  # (B, Pnn, D)
-        return x
 
     @staticmethod
     def _unpad_input_with_valid_mask(
@@ -2975,7 +2938,7 @@ class DiT(nn.Module):
 
     def _run_dit_core_with_pram_v2(
             self,
-            target_input_norm_xT: torch.Tensor,
+            target_input_norm_xT: torch.Tensor, #  (B, (1+)Pnn, _ * 6 or 5)
             diffusion_time: torch.Tensor,
             cross_c: torch.Tensor,
             cross_mask: torch.Tensor,
@@ -3253,7 +3216,12 @@ class DiT(nn.Module):
             target_past_cur_future_valid: torch.
             Tensor,  # (B, (1+)Pnn, 1+past_len+future_len)
     ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-        """model_type 이 'x_start' 인 경우 출력 텐서를 만드는 함수."""
+        """ x
+    pose_based:
+        (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+    else:
+        (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
+        """
         target_past_11_dim = target_agents_past[:, :, :
                                                       -1, :]  # (B, (1+)Pnn, past_len, 11)
         target_current_xyyaw = target_agents_past[:, :,
@@ -3311,6 +3279,7 @@ class DiT(nn.Module):
         """
         # 5) 평가 모드 + use_direct_loss = False에서
         # integrated_trajectory로 출력 교체(옵션, 기존 로직 유지)
+        # TODO:
         # x_out: (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         x_out: torch.Tensor = self._maybe_replace_x_with_integrated_trajectory_for_eval(
             x=x,
@@ -3360,7 +3329,7 @@ class DiT(nn.Module):
 if pose_based
     (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
 else
-    (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+    (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
         5: x, y, cos, sin 에서 diffusion noise time step  + validity 추가
 
         diffusion noise time step
@@ -3395,9 +3364,9 @@ else
             )
         """
 if pose_based
-    (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+    (B, (1+)Pnn, (time_len+ T) ,4) or (B, (1+)Pnn, T,4) or (B, (1+)Pnn, (1+T),4)
 else
-    (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+    (B, (1+)Pnn, (past_len + T) ,3) or (B, (1+)Pnn, T,3)
         """
         B, P, T_any, _ = target_input_norm_xT.shape
 
@@ -3420,18 +3389,25 @@ else
         if self.config.pose_based:
             validity = target_past_cur_future_valid[:, :,
             -T_any:]  # (B,P,T_any) bool
-            validity = validity.to(device=target_input_norm_xT.device)  # 안전
-            validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
-                -1)  # (B,P,T_any,1) float
         else:
-            # TODO
-            pass
+            target_past_future_seg_valid = (
+                        target_past_cur_future_valid[..., :-1] & target_past_cur_future_valid[
+                    ... , 1:])  # (B, P, past_len + future_len)
+            validity = target_past_future_seg_valid[:, :, -T_any:]
+        validity = validity.to(device=target_input_norm_xT.device)  # 안전
+        validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
+            -1)  # (B,P,T_any,1) float
         diffusion_time_full = diffusion_time_full * validity_f  # (B,P,T_any,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
         """
-        target_input_norm_xT : (B, (1+)Pnn, past_cur_time_len + future_len, 4) 
-            -> (B, (1+)Pnn, past_cur_time_len + future_len, 6)
+        target_input_norm_xT
+if pose_based
+    (B, (1+)Pnn, (time_len+ T) ,4) or (B, (1+)Pnn, T,4) or (B, (1+)Pnn, (1+T),4)
+else
+    (B, (1+)Pnn, (past_len + T) ,3) or (B, (1+)Pnn, T,3)
+
+
         diffusion_time_full : (B, (1+)Pnn, past_cur_time_len + future_len, 1)
         validity : (B, (1+)Pnn, past_cur_time_len + future_len, 1)
         """
@@ -3444,12 +3420,12 @@ else
                 validity_f,  # (B, (1+)Pnn, past_cur_time_len + future_len, 1)
             ],
             dim=-1,
-        )  # (B, (1+)Pnn, past_cur_time_len + future_len, 6)
+        )  # (B, (1+)Pnn, past_cur_time_len + future_len, 6 or 5)
         target_input_norm_xT = target_input_norm_xT.reshape(
             B,
             P,
             -1,
-        )  # (B, (1+)Pnn, _ * 6)
+        )  # (B, (1+)Pnn, _ * 6 or 5)
         return target_input_norm_xT
 
     def forward(
@@ -3471,7 +3447,7 @@ else
             if pose_based
                 (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             else
-                (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+                (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
 
         순서 개요:
             1) 과거+현재+미래 유효 마스크에서 현재 에이전트 마스크를 만든다.
@@ -3516,12 +3492,18 @@ else
                     enabled=self.config.profile_feasible,
                     device_type=device_type,
             ):
+                # target_input_norm_xT: (B, (1+)Pnn, _ * 6 or 5)
                 target_input_norm_xT = self._apply_diffusion_timestep_and_validity(
                     target_input_norm_xT, diffusion_time,
                     target_past_cur_future_valid)
-            # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            """ x
+        pose_based:
+            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        else:
+            (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
+            """
             x: torch.Tensor = self._run_dit_core_with_pram_v2(
-                target_input_norm_xT=target_input_norm_xT,  #
+                target_input_norm_xT=target_input_norm_xT,  #  (B, (1+)Pnn, _ * 6 or 5)
                 diffusion_time=diffusion_time,  # (B,) or (B, future_len)
                 cross_c=cross_c,
                 cross_mask=cross_mask,
