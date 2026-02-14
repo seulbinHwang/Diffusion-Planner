@@ -90,15 +90,15 @@ LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training
 # 복사 강제 옵션: 1이면 항상 다시 복사
 FORCE_REBUILD=0
 
-# 로컬 데이터 준비(복사 1회 + 로컬 리스트 생성)
-"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
-  --src_root "$TRAIN_SET_PATH" \
-  --src_list "$TRAIN_SET_LIST_PATH" \
-  --dst_root "$LOCAL_TRAIN_SET_PATH" \
-  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-  --force_rebuild "$FORCE_REBUILD" \
-  --num_workers 24
-#
+## 로컬 데이터 준비(복사 1회 + 로컬 리스트 생성)
+#"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
+#  --src_root "$TRAIN_SET_PATH" \
+#  --src_list "$TRAIN_SET_LIST_PATH" \
+#  --dst_root "$LOCAL_TRAIN_SET_PATH" \
+#  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
+#  --force_rebuild "$FORCE_REBUILD" \
+#  --num_workers 24
+##
 # ---- 학습은 로컬 데이터로 ----
 "$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
   --nnodes 1 --nproc-per-node 6 --standalone \
