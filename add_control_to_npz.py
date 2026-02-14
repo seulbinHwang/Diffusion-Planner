@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
+import zipfile
 
 import numpy as np
 from numpy.typing import NDArray
@@ -11,6 +12,166 @@ from tqdm import tqdm
 import time
 
 ArrayF = NDArray[np.floating]
+
+CONTROL_KEY = "past_future_seg_control_gt_3_dim"
+
+
+def _read_npz_key_set(npz_path: str) -> set[str]:
+    """npz 파일에 들어있는 key 이름 목록만 빠르게 읽습니다.
+
+    Args:
+        npz_path (str): npz 파일 경로.
+
+    Returns:
+        set[str]: npz 내부 key 이름 집합.
+
+    Notes:
+        - 배열 데이터(값)는 읽지 않습니다.
+        - zip 파일 목록만 확인합니다.
+    """
+    with zipfile.ZipFile(npz_path, "r") as zf:
+        names = zf.namelist()
+
+    keys: set[str] = set()
+    for name in names:
+        if name.endswith(".npy"):
+            keys.add(name[:-4])  # ".npy" 제거
+    return keys
+
+
+def _build_expected_keys_for_done(
+    existing_keys: set[str],
+    *,
+    add_sample_keys: bool,
+    use_agent_route_lane_order: bool,
+) -> set[str]:
+    """현재 옵션에서 '처리 완료'라고 보기 위해 필요한 key 집합을 만듭니다.
+
+    기준:
+        - control key는 항상 필요
+        - sample 파생키 모드면:
+          - 항상 추가되는 key + (원본에 해당 입력 key가 있을 때만) 추가되는 key를 포함
+
+    Args:
+        existing_keys (set[str]):
+            현재 npz에 있는 key 이름들.
+        add_sample_keys (bool):
+            sample 파생키를 저장하는 모드인지 여부(--skip_sample_keys 반대).
+        use_agent_route_lane_order (bool):
+            agent_route_lane_order를 sample에 포함하는 모드인지 여부.
+
+    Returns:
+        set[str]: 완료 판정에 필요한 key 이름 집합.
+    """
+    expected: set[str] = {CONTROL_KEY}
+
+    if not bool(add_sample_keys):
+        return expected
+
+    # sample 파생키 모드에서 "항상" 추가되는 것들
+    expected.update(
+        {
+            "scenario_id",
+            "planner_future_11_dim",  # ego_future_gt_11_dim의 alias 저장
+        }
+    )
+
+    # --- validity 관련(입력 key가 있을 때만 저장되는 것들) ---
+    validity_by_source: Dict[str, List[str]] = {
+        "ego_agent_past": ["ego_agent_past_is_valid"],
+        "ego_future_gt_11_dim": ["ego_future_gt_is_valid"],
+        "neighbor_agents_past": ["neighbor_agents_past_is_valid", "neighbor_agents_is_valid"],
+        "neighbor_future_gt_11_dim": ["neighbor_future_gt_is_valid"],
+        "stop_sign_points": ["stop_sign_is_valid"],
+        "crosswalk_points": ["crosswalk_is_valid"],
+        "lanes": ["lanes_len_is_valid", "lanes_is_valid"],
+        "static_objects": ["static_objects_is_valid"],
+        "route_lanes": ["route_lanes_len_is_valid", "route_lanes_is_valid"],
+        "speed_bump_points": ["speed_bump_is_valid"],
+        "driveway_points": ["driveway_is_valid"],
+        "road_edge": ["road_edge_is_valid"],
+    }
+    for src_key, out_keys in validity_by_source.items():
+        if src_key in existing_keys:
+            expected.update(out_keys)
+
+    if bool(use_agent_route_lane_order) and ("agent_route_lane_order" in existing_keys):
+        expected.add("agent_route_lane_order_is_valid")
+
+    # --- near split 관련(입력 key가 있을 때만 저장되는 것들) ---
+    if "neighbor_agents_past" in existing_keys:
+        expected.update(
+            {
+                "near_agents_past",
+                "non_near_agents_past",
+                "near_agents_past_is_valid",
+                "non_near_agents_past_is_valid",
+                "near_agents_is_valid",
+                "non_near_agents_is_valid",
+            }
+        )
+
+    if "neighbor_future_gt_11_dim" in existing_keys:
+        expected.update(
+            {
+                "near_future_gt_is_valid",
+                "non_near_future_gt_is_valid",
+            }
+        )
+
+    if "neighbor_future_gt_3_dim" in existing_keys:
+        expected.add("near_future_gt_3_dim")
+
+    # --- gt_4_dim 관련(입력 key가 있을 때만 저장되는 것들) ---
+    if ("ego_future_gt_3_dim" in existing_keys) and ("ego_future_gt_11_dim" in existing_keys):
+        expected.add("ego_future_gt_4_dim")
+
+    if ("neighbor_future_gt_3_dim" in existing_keys) and ("neighbor_future_gt_11_dim" in existing_keys):
+        expected.add("near_future_gt_4_dim")
+
+    return expected
+
+
+def _is_already_processed_npz(
+    npz_path: str,
+    *,
+    overwrite: bool,
+    add_sample_keys: bool,
+    overwrite_sample_keys: bool,
+    use_agent_route_lane_order: bool,
+) -> bool:
+    """이 npz를 '이미 완료'로 보고 바로 스킵해도 되는지 판단합니다.
+
+    Args:
+        npz_path (str): npz 파일 경로.
+        overwrite (bool): True면 항상 다시 처리해야 하므로 False 반환.
+        add_sample_keys (bool): sample 파생키 모드인지 여부.
+        overwrite_sample_keys (bool): True면 sample 파생키도 다시 계산해야 하므로 False 반환.
+        use_agent_route_lane_order (bool): agent_route_lane_order 포함 모드인지 여부.
+
+    Returns:
+        bool: 이미 완료 상태면 True, 아니면 False.
+    """
+    if not os.path.exists(npz_path):
+        return False
+    if bool(overwrite):
+        return False
+    if bool(add_sample_keys) and bool(overwrite_sample_keys):
+        return False
+
+    try:
+        keys = _read_npz_key_set(npz_path)
+    except Exception:
+        # key 목록조차 못 읽으면, 스킵하지 말고 기존 로직에서 에러가 나게 둡니다.
+        return False
+
+    expected = _build_expected_keys_for_done(
+        keys,
+        add_sample_keys=bool(add_sample_keys),
+        use_agent_route_lane_order=bool(use_agent_route_lane_order),
+    )
+    return expected.issubset(keys)
+
 
 def _format_seconds_to_hh_mm(seconds: float) -> str:
     """초 단위 시간을 '시간:분' 문자열(HH:MM)로 바꿉니다.
@@ -990,30 +1151,48 @@ def main() -> None:
     last_print_time_s = start_time_s
 
     pbar = tqdm(file_names, desc="add_control_to_npz")
+    skip_count = 0
+
+    pbar = tqdm(file_names, desc="add_control_to_npz")
     for idx, fname in enumerate(pbar, start=1):
         npz_path = os.path.join(dataset_dir, fname)
+
         try:
-            ok, msg = _process_one_file(
+            # ✅ 이미 완료된 파일이면: _process_one_file 자체를 호출하지 않음
+            if _is_already_processed_npz(
                 npz_path,
-                dt=dt,
                 overwrite=overwrite,
-                compress=compress,
                 add_sample_keys=add_sample_keys,
                 overwrite_sample_keys=overwrite_sample_keys,
-                predicted_neighbor_num=predicted_neighbor_num,
-                eval_method=eval_method,
                 use_agent_route_lane_order=use_agent_route_lane_order,
-            )
+            ):
+                ok = True
+                msg = "skip(already processed)"
+                skip_count += 1
+            else:
+                ok, msg = _process_one_file(
+                    npz_path,
+                    dt=dt,
+                    overwrite=overwrite,
+                    compress=compress,
+                    add_sample_keys=add_sample_keys,
+                    overwrite_sample_keys=overwrite_sample_keys,
+                    predicted_neighbor_num=predicted_neighbor_num,
+                    eval_method=eval_method,
+                    use_agent_route_lane_order=use_agent_route_lane_order,
+                )
+
             if ok:
                 ok_count += 1
             else:
                 fail_count += 1
                 tqdm.write(f"[FAIL] {fname}: {msg}")
+
         except Exception as e:
             fail_count += 1
             tqdm.write(f"[EXCEPTION] {fname}: {type(e).__name__}: {e}")
 
-        # ✅ 5분마다 진행 상황 출력
+        # ✅ 5분마다 진행 상황 출력(스킵이든 처리든 동일하게 동작)
         last_print_time_s = _maybe_print_progress_every_5_min(
             start_time_s=start_time_s,
             last_print_time_s=last_print_time_s,
@@ -1022,7 +1201,8 @@ def main() -> None:
             interval_s=300.0,
         )
 
-    print(f"done. ok={ok_count}, fail={fail_count}, total={len(file_names)}")
+    print(f"done. ok={ok_count}, fail={fail_count}, skip={skip_count}, total={len(file_names)}")
+
 
 
 if __name__ == "__main__":
