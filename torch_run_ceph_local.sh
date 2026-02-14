@@ -114,4 +114,6 @@ FORCE_REBUILD=0
     --use_feasible False \
     --use_feasible_dl False \
     --use_feasible_filter False \
-    --feasible_stride_dt 0.1
+    --feasible_stride_dt 0.1 \
+    --num_workers 3 \
+    --prefetch_factor 8
