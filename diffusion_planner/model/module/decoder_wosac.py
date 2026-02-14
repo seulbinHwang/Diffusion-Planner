@@ -481,12 +481,13 @@ class Decoder(nn.Module):
         #  (B, (1+)Pnn, future_len, 4 or 3)
         target_future_norm_xT: torch.Tensor = target_seq_norm_xT[:, :,
         -self.config.future_len:, :]
+        # dtype/device 정합: concat 전에 맞춰두는 게 안전
+        target_seq_past = _cast_like(target_seq_past,
+                                     target_future_norm_xT)
         # 현재 프레임(정규화): 과거~현재 시퀀스의 마지막 프레임을 기준으로 잡아 정합성 강화
         # xT_input_seq 구성
         if self.config.use_past_dit_input:
-            # dtype/device 정합: concat 전에 맞춰두는 게 안전
-            target_seq_past = _cast_like(target_seq_past,
-                                                  target_future_norm_xT)
+
             # xT_input_seq: (B, (1+)Pnn, (time_len + future_len, 4) or (past_len + future_len)*3)
             # target_seq_past: (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
             # target_future_norm_xT : (B, (1+)Pnn, future_len, 4 or 3)
@@ -515,7 +516,7 @@ class Decoder(nn.Module):
             target_current_xyyaw: torch.Tensor,  # (B, Pnn, 4)
             batch_size: int,
             one_or_Pnn: int,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor: #(B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
         """훈련 모드에서 DiT 출력(flat)을 (B, Pnn, 1+T, 4) 형태로 바꾼다.
 
         - use_past_dit_input / use_current_input 설정 조합을 그대로 반영합니다.
@@ -523,41 +524,62 @@ class Decoder(nn.Module):
 
         Args:
             score_flat: DiT 출력(flat).
-                shape: (B, Pnn, F_out)
+                pose_based
+                    (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+                else
+                    (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
             target_current_xyyaw: 현재 상태(정규화).
                 shape: (B, Pnn, 4)
 
         Returns:
             score_cur_future:
-                shape: (B, Pnn, 1+T, 4)
+                shape: (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
         """
         B: int = batch_size
         if self.config.use_past_dit_input:
-            # score_flat: (B, Pnn, (time_len + future_len) * 4)
-            score_cur_future = score_flat.reshape(
-                B,
-                one_or_Pnn,
-                self.config.time_len + self._future_len,
-                4,
-            )
-            # 마지막 (1+T)만 사용: (B, Pnn, 1+T, 4)
-            score_cur_future = score_cur_future[:, :,
-            -(1 + self._future_len):, :]
+            if self.config.pose_based:
+                # score_flat: (B, Pnn, (time_len + future_len) * 4)
+                score_cur_future = score_flat.reshape(
+                    B,
+                    one_or_Pnn,
+                    self.config.time_len + self._future_len,
+                    4,
+                )
+                # 마지막 (1+T)만 사용: (B, Pnn, 1+T, 4)
+                score_cur_future = score_cur_future[:, :,
+                -(1 + self._future_len):, :]
+            else:
+                score_cur_future = score_flat.reshape(
+                    B,
+                    one_or_Pnn,
+                    self.config.time_len - 1 + self._future_len,
+                    3,
+                )
+                score_cur_future = score_cur_future[:, :,
+                -(self._future_len):, :]
             return score_cur_future
 
         if self.config.use_current_input:
-            # score_cur_future: (B, Pnn, 1+T, 4)
-            score_cur_future = score_flat.reshape(B, one_or_Pnn,
-                                                  1 + self._future_len, 4)
+            if self.config.pose_based:
+                # score_cur_future: (B, Pnn, 1+T, 4)
+                score_cur_future = score_flat.reshape(B, one_or_Pnn,
+                                                      1 + self._future_len, 4)
+            else:
+                score_cur_future = score_flat.reshape(B, one_or_Pnn,
+                                                       self._future_len, 3)
             return score_cur_future
 
         # use_current_input=False 인 경우: DiT 출력은 미래만 (B,Pnn,T,4)
-        score_future = score_flat.reshape(B, one_or_Pnn, self._future_len,
-                                          4)  # (B,Pnn,T,4)
-        score_cur_future = torch.cat(
-            [target_current_xyyaw.unsqueeze(2), score_future],
-            dim=2,
-        )  # (B,Pnn,1+T,4)
+        if self.config.pose_based:
+            score_future = score_flat.reshape(B, one_or_Pnn, self._future_len,
+                                              4)  # (B,Pnn,T,4)
+            score_cur_future = torch.cat(
+                [target_current_xyyaw.unsqueeze(2), score_future],
+                dim=2,
+            )  # (B,Pnn,1+T,4)
+        else:
+            score_cur_future = score_flat.reshape(B, one_or_Pnn,
+                                                       self._future_len, 3)
         return score_cur_future
 
     def _append_training_feasible_outputs(
@@ -946,6 +968,7 @@ class Decoder(nn.Module):
             "near_agents_past"]  # (B,Pnn,time_len,11)
         near_agents_past_is_valid = inputs[
             "near_agents_past_is_valid"]  # (B, Pnn, time_len) bool
+
         # target_agents_past: (B, (1+)Pnn, time_len, 11)
         if self.config.do_ego_predict:
             ego_agent_past: torch.Tensor = inputs[
@@ -994,11 +1017,17 @@ class Decoder(nn.Module):
                 float("nan"),
             )
         cond_last_pos_norm = _cast_like(cond_last_pos_norm, target_agents_past)
-
+        # past_seq_control_gt_3_dim:  (B, (1+)Pnn, past_len, 3) or None
+        past_seq_control_gt_3_dim = inputs.get("past_seq_control_gt_3_dim",
+                                               None)
         if self.config.pose_based:
-            pass
+            # target_agents_past: (B, (1+)Pnn, time_len, 11)
+            #target_seq_past: (B, (1+)Pnn, time_len, 4)
+            target_seq_past =  target_agents_past[:, : ,:, :4]
         else:
-            pass
+            assert past_seq_control_gt_3_dim is not None, \
+                f"past_seq_control_gt_3_dim is None, but config.pose_based={self.config.pose_based}"
+            target_seq_past = past_seq_control_gt_3_dim # (B, (1+)Pnn, past_len, 3)
         return (
             target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             cond_last_pos_norm,  # (B, (1+)Pnn, 4)
@@ -1127,33 +1156,11 @@ class Decoder(nn.Module):
         Raises:
             ValueError: shape이 기대와 다를 때
         """
-        if x_seq.dim() != 4 or int(x_seq.shape[-1]) != 4:
-            raise ValueError("x_seq는 (B,P,S,4) 이어야 합니다. "
-                             f"got shape={tuple(x_seq.shape)}")
-        if target_past_cur_future_valid.dim() != 3:
-            raise ValueError(
-                "target_past_cur_future_valid는 (B,P,T_all) 이어야 합니다. "
-                f"got shape={tuple(target_past_cur_future_valid.shape)}")
-
         B, P, S, _ = x_seq.shape
-        if int(target_past_cur_future_valid.shape[0]) != int(B) or int(
-                target_past_cur_future_valid.shape[1]) != int(P):
-            raise ValueError(
-                "B,P 축이 서로 맞아야 합니다. "
-                f"x_seq(B,P)=({B},{P}), "
-                f"valid(B,P)=({int(target_past_cur_future_valid.shape[0])},{int(target_past_cur_future_valid.shape[1])})"
-            )
-
-        T_all: int = int(target_past_cur_future_valid.shape[-1])
-        if T_all < int(S):
-            raise ValueError("valid 마스크의 시간 길이가 x_seq보다 짧습니다. "
-                             f"T_all={T_all}, S={int(S)}")
-
         # 뒤쪽 S칸이 x_seq의 시간축과 대응(현재+미래 / 미래만 / 과거+미래 모두 대응)
         valid_sliced: torch.Tensor = _to_bool_mask(
             target_past_cur_future_valid[..., -int(S):]).to(
             device=x_seq.device, dtype=torch.bool)  # (B,P,S)
-
         # (B,P,S,4)에서 무효 칸을 0으로
         x_seq_out: torch.Tensor = x_seq.masked_fill(~valid_sliced.unsqueeze(-1),
                                                     0.0)
@@ -1161,7 +1168,8 @@ class Decoder(nn.Module):
 
     def _mask_invalid_timesteps_in_flat_xyyaw(
             self,
-            x_flat: torch.Tensor,  # (B, P, F) where F%4==0
+            x_flat: torch.Tensor,
+            # (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (past_len + future_len)*3)
             target_past_cur_future_valid: torch.Tensor,  # (B, P, T_all)
     ) -> torch.Tensor:
         """flat 형태(F=시간*4) 텐서에서 무효 시간 칸을 0으로 정리합니다.
@@ -1176,22 +1184,24 @@ class Decoder(nn.Module):
             torch.Tensor:
                 shape: (B, P, F), 무효 칸은 0
         """
-        if x_flat.dim() != 3:
-            raise ValueError(
-                f"x_flat must be (B,P,F), got {tuple(x_flat.shape)}")
-        F: int = int(x_flat.shape[-1])
-        if (F % 4) != 0:
-            raise ValueError(
-                f"x_flat last dim must be multiple of 4. got F={F}")
-
-        B, P, _ = x_flat.shape
-        S: int = int(F // 4)
-
-        x_seq = x_flat.reshape(B, P, S, 4)  # (B,P,S,4)
-        x_seq = self._mask_invalid_timesteps_to_zero(
-            x_seq=x_seq,
-            target_past_cur_future_valid=target_past_cur_future_valid,
-        )
+        B, P, F = x_flat.shape
+        if self.config.pose_based:
+            S: int = int(F // 4) # S: (time_len + future_len) or 1+future_len or future_len
+            x_seq = x_flat.reshape(B, P, S, 4)  # (B,P,S,4)
+            x_seq = self._mask_invalid_timesteps_to_zero(
+                x_seq=x_seq,
+                target_past_cur_future_valid=target_past_cur_future_valid, # (B, P, T_all)
+            )
+        else:
+            S: int = int(F // 3) # S: (past_len + future_len) or future_len
+            x_seq = x_flat.reshape(B, P, S, 3)
+            target_past_future_seg_valid = (
+                        target_past_cur_future_valid[..., :-1] & target_past_cur_future_valid[
+                    ... , 1:]).astype(bool)  # (B, P, past_len + future_len)
+            x_seq = self._mask_invalid_timesteps_to_zero(
+                x_seq=x_seq,
+                target_past_cur_future_valid=target_past_future_seg_valid,
+            )
         return x_seq.reshape(B, P, F)
 
     def _initial_state_constraint(
@@ -1859,6 +1869,7 @@ class Decoder(nn.Module):
             inputs: Dict[str, torch.Tensor],
             scene_encoding_token: torch.Tensor,
             scene_encoding_token_mask: torch.Tensor,
+            target_agents_past: torch.Tensor,  # (B, (1+)Pnn, (time_len, 11)
             target_seq_past: torch.Tensor,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
             target_past_cur_future_valid: torch.Tensor,
             batch_size: int,
@@ -1877,7 +1888,7 @@ class Decoder(nn.Module):
         """
         xT_input_flat = self._build_training_dit_inputs(
             inputs=inputs,
-            target_seq_past=target_seq_past,  # (B, (1+)Pnn, time_len, 4)
+            target_seq_past=target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
         )
 
         # ✅ 추가: DiT 입력에서도 무효 타임스텝 0 처리(실수로 downstream에서 쓰여도 안전)
@@ -1885,7 +1896,6 @@ class Decoder(nn.Module):
             x_flat=xT_input_flat,
             target_past_cur_future_valid=target_past_cur_future_valid,
         )
-
         # ✅ (B) diffusion_time: 미리 GPU float32로 맞춤 (DiT 내부 .to()가 no-op 되도록)
         diffusion_time = _prepare_diffusion_time_for_dit(
             diffusion_time=diffusion_time,  # (B,) or (B,future_len)
@@ -1898,8 +1908,13 @@ class Decoder(nn.Module):
             low_t_mask_in,
             device=xT_input_flat.device,
         )  # (B,) bool
+        """ score_flat / xT_input_flat
+        if pose_based
+            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        else
+            (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+        """
 
-        # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         score_flat: torch.Tensor = self.dit(
             target_input_norm_xT=
             xT_input_flat,
@@ -1916,17 +1931,17 @@ class Decoder(nn.Module):
         _require_finite("decoder_dit_output", score_flat)
         # (B, (1+)Pnn, 4)
         target_current_xyyaw = target_agents_past[:, :, -1, :4]
-        # 3) (B,(1+)Pnn,F_out) -> (B,(1+)Pnn,1+T,4)
+        # 3) (B,(1+)Pnn,F_out) ->
+        # score_cur_future : (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
         score_cur_future: torch.Tensor = self._extract_cur_future_from_score(
             score_flat=
             score_flat,
-            # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
         )
         decoder_training_output[
-            "score"] = score_cur_future  # (B, (1+)Pnn, 1+T, 4)
+            "score"] = score_cur_future  # (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
         """ decoder_training_output
         score : (B, (1+)Pnn, 1+T, 4)
         "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
@@ -2490,6 +2505,7 @@ class Decoder(nn.Module):
                 inputs=inputs,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
+                target_agents_past=target_agents_past,
                 target_seq_past=
                 target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
                 target_past_cur_future_valid=target_past_cur_future_valid,
@@ -2497,6 +2513,7 @@ class Decoder(nn.Module):
                 one_or_Pnn=one_or_Pnn,
             )
         else:
+            # TODO
             """ return_norm_dict
             "score" : (B, (1+)Pnn, 1+T, 4)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
@@ -3334,13 +3351,16 @@ class DiT(nn.Module):
 
     def _apply_diffusion_timestep_and_validity(
             self,
-            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, F=_*4)
+            target_input_norm_xT: torch.Tensor,
             diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
             target_past_cur_future_valid: torch.
             Tensor,  # (B, (1+)Pnn, past_len+1+future_len)
     ) -> torch.Tensor:  # (B, (1+)Pnn, F=_*6)
         """
-
+if pose_based
+    (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+else
+    (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
         5: x, y, cos, sin 에서 diffusion noise time step  + validity 추가
 
         diffusion noise time step
@@ -3348,13 +3368,17 @@ class DiT(nn.Module):
             미래 future_len 에 대해서는, diffusion_time 에 따라 노이즈 time step을 채움
         """
         diffusion_time = diffusion_time.to(device=target_input_norm_xT.device)
-        # target_input_norm_xT: (B, (1+)Pnn, _ * 4) -> (B, (1+)Pnn, _, 4)
+        if self.config.pose_based:
+            final_dim = 4
+        else:
+            final_dim = 3
+        # target_input_norm_xT: (B, (1+)Pnn, _ * 4 or 3) -> (B, (1+)Pnn, _, 4 or 3)
         target_input_norm_xT = target_input_norm_xT.reshape(
             target_input_norm_xT.shape[0],
             target_input_norm_xT.shape[1],
             -1,
-            4,
-        )  # (B, (1+)Pnn, T_any, 4)
+            final_dim,
+        )  # (B, (1+)Pnn, T_any, 4 or 3)
 
         if diffusion_time.ndim == 1:
             diffusion_time_for_future = diffusion_time[:, None].repeat(
@@ -3369,6 +3393,12 @@ class DiT(nn.Module):
             raise ValueError(
                 f"diffusion_time must be (B,) or (B, future_len). got {diffusion_time.shape}"
             )
+        """
+if pose_based
+    (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+else
+    (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+        """
         B, P, T_any, _ = target_input_norm_xT.shape
 
         past_cur_time_len = T_any - self._future_len  # past_len + 1
@@ -3387,11 +3417,15 @@ class DiT(nn.Module):
         diffusion_time_full = diffusion_time_full[:, None, :, None]
         # (B, P, past_cur_time_len + future_len, 1)
         diffusion_time_full = diffusion_time_full.expand(B, P, T_any, 1)
-        validity = target_past_cur_future_valid[:, :,
-        -T_any:]  # (B,P,T_any) bool
-        validity = validity.to(device=target_input_norm_xT.device)  # 안전
-        validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
-            -1)  # (B,P,T_any,1) float
+        if self.config.pose_based:
+            validity = target_past_cur_future_valid[:, :,
+            -T_any:]  # (B,P,T_any) bool
+            validity = validity.to(device=target_input_norm_xT.device)  # 안전
+            validity_f = validity.to(dtype=target_input_norm_xT.dtype).unsqueeze(
+                -1)  # (B,P,T_any,1) float
+        else:
+            # TODO
+            pass
         diffusion_time_full = diffusion_time_full * validity_f  # (B,P,T_any,1)
         diffusion_time_full = _cast_like(diffusion_time_full,
                                          target_input_norm_xT)
@@ -3422,7 +3456,6 @@ class DiT(nn.Module):
             self,
             target_input_norm_xT: torch.
             Tensor,
-            # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
             #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
             diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
             target_agents_past: torch.
@@ -3432,8 +3465,13 @@ class DiT(nn.Module):
             cross_c: torch.Tensor,  # (B, token_num, D)
             cross_mask: torch.Tensor,  # (B, token_num)
             low_t_mask: Optional[torch.Tensor] = None,  # (B,) bool
-    ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+    ) -> torch.Tensor:
         """DiT 전체 forward 를 수행하는 진입점.
+        target_input_norm_xT (input) 혹은 xT_input_flat (output)
+            if pose_based
+                (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            else
+                (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
 
         순서 개요:
             1) 과거+현재+미래 유효 마스크에서 현재 에이전트 마스크를 만든다.
@@ -3453,7 +3491,6 @@ class DiT(nn.Module):
         """ target_past_cur_future_valid: (B, (1+)Pnn, 1+past_len+future_len) bool
         target_cur_future_valid :  (B, (1+)Pnn, 1+future_len)
         target_current_valid :  (B, (1+)Pnn)
-
         """
         target_cur_future_valid, target_current_valid = \
             self._compute_target_current_valid(

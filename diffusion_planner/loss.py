@@ -626,6 +626,7 @@ def _forward_model_with_autocast(
     low_t_mask: torch.Tensor,  # (B,)
     cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
     use_deepspeed: bool,
+    past_seq_control_gt_3_dim: Optional[torch.Tensor],  # (B, (1+)Pnn, past_len, 3) or None
 ) -> Dict[str, torch.Tensor]:
     """모델 입력 dict 를 만들고 AMP 로 forward 를 수행한다.
 
@@ -635,7 +636,6 @@ def _forward_model_with_autocast(
     """
     target_future_valid = _to_bool_mask(target_future_valid)
 
-    # TODO: target_seq_norm_xT 처리
     merged_inputs: Dict[str, torch.Tensor] = {
         **norm_inputs,
         "target_future_valid":
@@ -645,6 +645,7 @@ def _forward_model_with_autocast(
         "diffusion_time": batch_diffusion_time,  # (B,) or (B, T)
         "low_t_mask": low_t_mask,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
+        "past_seq_control_gt_3_dim": past_seq_control_gt_3_dim,  # (B, (1+)Pnn, past_len, 3) or None
     }
     # merged_inputs 만들어진 직후
     # decoder_output = forward_once_and_check_bf16(
@@ -1093,6 +1094,7 @@ def diffusion_loss_func(
             near_cur_future_gt_is_valid=
             near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
         )
+        past_seq_control_gt_3_dim = None
     else: # velocity_based
         """
         past_future_seg_control_gt_3_dim: (B, 1+Pnn, past_len + future_len, 3)
@@ -1102,6 +1104,8 @@ def diffusion_loss_func(
         """
         past_future_seg_control_gt_3_dim = norm_outputs[
                 "past_future_seg_control_gt_3_dim"]
+        # past_seq_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
+        past_seq_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
         # (B, (1+)Pnn, future_len, 3)
         future_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, -future_len:, :]
         (
@@ -1167,6 +1171,7 @@ def diffusion_loss_func(
         low_t_mask=low_t_mask,  # (B,)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
         use_deepspeed=args.use_deepspeed,
+        past_seq_control_gt_3_dim=past_seq_control_gt_3_dim, # (B, (1+)Pnn, past_len, 3) or None
     )
 
     # score:  (B, one_or_Pnn, future_len, 4)
