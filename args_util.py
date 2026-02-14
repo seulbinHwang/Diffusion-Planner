@@ -354,7 +354,7 @@ def get_args():
     parser.add_argument('--train_epochs',
                         type=int,
                         help='epochs of training',
-                        default=360)
+                        default=550)
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',
