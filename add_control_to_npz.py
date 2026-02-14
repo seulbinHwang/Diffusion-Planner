@@ -8,8 +8,75 @@ from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union
 import numpy as np
 from numpy.typing import NDArray
 from tqdm import tqdm
+import time
 
 ArrayF = NDArray[np.floating]
+
+def _format_seconds_to_hh_mm(seconds: float) -> str:
+    """초 단위 시간을 '시간:분' 문자열(HH:MM)로 바꿉니다.
+
+    Args:
+        seconds (float): 초 단위 시간(음수면 0으로 처리).
+
+    Returns:
+        str: 'HH:MM' 형태 문자열.
+    """
+    s = float(seconds)
+    if (not np.isfinite(s)) or s < 0.0:
+        s = 0.0
+
+    # 분 단위로 반올림(보기용)
+    total_minutes = int((s + 30.0) // 60.0)
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def _maybe_print_progress_every_5_min(
+    *,
+    start_time_s: float,
+    last_print_time_s: float,
+    processed: int,
+    total: int,
+    interval_s: float = 300.0,
+) -> float:
+    """5분(기본)마다 진행률/경과/남은시간(예상)을 출력합니다.
+
+    출력 내용:
+        - 진행률(%)
+        - 경과 시간(HH:MM)
+        - 남은 시간(예상, HH:MM)
+
+    Args:
+        start_time_s (float): 시작 시각(time.monotonic()).
+        last_print_time_s (float): 마지막 출력 시각(time.monotonic()).
+        processed (int): 지금까지 처리한 파일 수.
+        total (int): 전체 파일 수.
+        interval_s (float): 출력 간격(초). 기본 300초(=5분).
+
+    Returns:
+        float: 업데이트된 마지막 출력 시각(출력했으면 now, 아니면 기존값).
+    """
+    now = time.monotonic()
+    if (now - float(last_print_time_s)) < float(interval_s):
+        return last_print_time_s
+
+    if total <= 0 or processed <= 0:
+        return now
+
+    elapsed_s = now - float(start_time_s)
+    pct = (float(processed) / float(total)) * 100.0
+
+    avg_s_per_file = elapsed_s / float(processed)
+    remaining_files = max(int(total - processed), 0)
+    remaining_s = avg_s_per_file * float(remaining_files)
+
+    tqdm.write(
+        f"[진행] {pct:.2f}% ({processed}/{total}) | "
+        f"경과 {_format_seconds_to_hh_mm(elapsed_s)} | "
+        f"남은시간(예상) {_format_seconds_to_hh_mm(remaining_s)}"
+    )
+    return now
 
 
 def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
@@ -895,7 +962,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     return parser
 
-
 def main() -> None:
     args = _build_arg_parser().parse_args()
 
@@ -919,7 +985,12 @@ def main() -> None:
     ok_count = 0
     fail_count = 0
 
-    for fname in tqdm(file_names, desc="add_control_to_npz"):
+    total_files = len(file_names)
+    start_time_s = time.monotonic()
+    last_print_time_s = start_time_s
+
+    pbar = tqdm(file_names, desc="add_control_to_npz")
+    for idx, fname in enumerate(pbar, start=1):
         npz_path = os.path.join(dataset_dir, fname)
         try:
             ok, msg = _process_one_file(
@@ -941,6 +1012,15 @@ def main() -> None:
         except Exception as e:
             fail_count += 1
             tqdm.write(f"[EXCEPTION] {fname}: {type(e).__name__}: {e}")
+
+        # ✅ 5분마다 진행 상황 출력
+        last_print_time_s = _maybe_print_progress_every_5_min(
+            start_time_s=start_time_s,
+            last_print_time_s=last_print_time_s,
+            processed=idx,
+            total=total_files,
+            interval_s=300.0,
+        )
 
     print(f"done. ok={ok_count}, fail={fail_count}, total={len(file_names)}")
 
