@@ -1095,19 +1095,21 @@ def diffusion_loss_func(
         )
     else: # velocity_based
         """
-        past_future_seg_control_gt_3_dim: (B, 1+Pnn, future_len, 3)
+        past_future_seg_control_gt_3_dim: (B, 1+Pnn, past_len + future_len, 3)
         
         normed_target_seq_gt : (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
         target_seq_is_valid : (B, (1+)Pnn, future_len)
         """
-
+        past_future_seg_control_gt_3_dim = norm_outputs[
+                "past_future_seg_control_gt_3_dim"]
+        # (B, (1+)Pnn, future_len, 3)
+        future_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, -future_len:, :]
         (
             normed_target_seq_gt,  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
             target_seq_is_valid,  # (B, (1+)Pnn, future_len)
         ) = build_target_future_tensors_and_masks_vel(
             args=args,
-            past_future_seg_control_gt_3_dim=norm_outputs[
-                "past_future_seg_control_gt_3_dim"],  # (B, 1+Pnn, future_len, 3)
+            future_seg_control_gt_3_dim=future_seg_control_gt_3_dim,  # (B, 1+Pnn, future_len, 3)
             ego_cur_future_gt_is_valid=ego_cur_future_gt_is_valid, # (B, 1 + future_len)
             near_cur_future_gt_is_valid=
             near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)

@@ -127,7 +127,7 @@ def build_target_future_tensors_and_masks(
 
 def build_target_future_tensors_and_masks_vel(
     args: Any,
-    past_future_seg_control_gt_3_dim: torch.Tensor,  # (B, 1+Pnn, future_len, 3)
+    future_seg_control_gt_3_dim: torch.Tensor,  # (B, 1+Pnn, future_len, 3)
     ego_cur_future_gt_is_valid: torch.Tensor,        # (B, 1+future_len)
     near_cur_future_gt_is_valid: torch.Tensor,       # (B, Pnn, 1+future_len)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -144,7 +144,7 @@ def build_target_future_tensors_and_masks_vel(
 
     Args:
         args: 설정 객체. args.do_ego_predict (bool)을 사용합니다.
-        past_future_seg_control_gt_3_dim: (B, 1+Pnn, future_len, 3)
+        future_seg_control_gt_3_dim: (B, 1+Pnn, past_len + future_len, 3)
             [ego, neighbors...] 순서로 들어있는 구간 제어 정답.
         ego_cur_future_gt_is_valid: (B, 1+future_len)
             ego의 프레임 단위 유효(현재+미래) 마스크.
@@ -175,12 +175,12 @@ def build_target_future_tensors_and_masks_vel(
     do_ego_predict = bool(getattr(args, "do_ego_predict", False))
     if not do_ego_predict:
         # ego(0번)를 제외
-        normed_target_seq_gt = past_future_seg_control_gt_3_dim[:, 1:]  # (B, Pnn, future_len, 3)
+        normed_target_seq_gt = future_seg_control_gt_3_dim[:, 1:]  # (B, Pnn, future_len, 3)
         target_seq_is_valid = near_seg_valid                                  # (B, Pnn, future_len)
         return normed_target_seq_gt, target_seq_is_valid
 
     # ego 포함
-    normed_target_seq_gt = past_future_seg_control_gt_3_dim             # (B, 1+Pnn, future_len, 3)
+    normed_target_seq_gt = future_seg_control_gt_3_dim             # (B, 1+Pnn, future_len, 3)
     target_seq_is_valid = torch.cat(
         [ego_seg_valid.unsqueeze(1), near_seg_valid],
         dim=1,
