@@ -565,43 +565,55 @@ def _sample_diffusion_time_and_noise(
 
 
 def _normalize_futures_and_build_xT(
-    normed_target_cur_seq_gt: torch.Tensor,
-    normed_target_future_seq_gt: torch.Tensor,
-    target_seq_is_valid: torch.Tensor,
-    batch_diffusion_time: torch.Tensor,
-    random_noise: torch.Tensor,
+    normed_target_cur_seq_gt: torch.Tensor, # (B, (1+)Pnn, 4) or None
+    normed_target_future_seq_gt: torch.Tensor, # (B, (1+)Pnn, future_len, 4 or 3)
+    target_seq_is_valid: torch.Tensor, # (B, (1+)Pnn, 1+future_len or future_len)
+    batch_diffusion_time: torch.Tensor, # (B,) or (B, future_len)
+    random_noise: torch.Tensor, # (B, (1+)Pnn, future_len, 4 or 3)
     marginal_prob: Callable[[torch.Tensor, torch.Tensor], Tuple[torch.Tensor,
                                                                 torch.Tensor]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """미래 궤적을 정규화하고, x_T 샘플과 std 를 만든다."""
+    """미래 궤적을 정규화하고, x_T 샘플과 std 를 만든다.
+    return
+        target_seq_norm_xT
+            (B, (1+)Pnn, 1+future_len, 4) 현재 GT + 미래 x_T
+            (B, (1+)Pnn, future_len, 3) 미래 x_T
+        std
+            (B, 1, 1, 1)
+    
+    """
     B, one_or_Pnn, future_len, _ = normed_target_future_seq_gt.shape
     mean, std = marginal_prob(normed_target_future_seq_gt,
                               batch_diffusion_time)
     assert std.ndim == 4, "std_raw must be (B, _, _, _)"
 
     # ✅ (핵심) 전체 마스크를 bool로 통일
-    target_cur_future_is_valid_bool = _to_bool_mask(
-        target_seq_is_valid)  # (B,(1+)Pnn,1+T)
-    target_future_is_valid = target_cur_future_is_valid_bool[:, :,
-                                                             1:]  # (B,(1+)Pnn,T) bool
+    target_seq_is_valid_bool = _to_bool_mask(
+        target_seq_is_valid)  # (B, (1+)Pnn, 1+future_len or future_len)
+    # target_future_is_valid: (B, (1+)Pnn, future_len)
+    target_future_is_valid = target_seq_is_valid_bool[:, :,-future_len:]
 
+    # target_future_noise_xT: (B, (1+)Pnn, future_len, 4 or 3)
     target_future_noise_xT: torch.Tensor = mean + std * random_noise
 
     invalid_future = (~target_future_is_valid).unsqueeze(-1)  # (B,(1+)Pnn,T,1)
     target_future_noise_xT = target_future_noise_xT.masked_fill(
         invalid_future, 0.0)
 
-    target_seq_norm_xT: torch.Tensor = torch.cat(
-        [normed_target_cur_seq_gt, target_future_noise_xT],
-        dim=2,
-    )
+    # target_seq_norm_xT: (B, (1+)Pnn, 1+future_len, 4) or (B, (1+)Pnn, future_len, 3)
+    if normed_target_cur_seq_gt is None:
+        target_seq_norm_xT = target_future_noise_xT
+    else:
+        target_seq_norm_xT: torch.Tensor = torch.cat(
+            [normed_target_cur_seq_gt, target_future_noise_xT],
+            dim=2,
+        )
 
-    invalid_cur_future = (~target_cur_future_is_valid_bool).unsqueeze(
-        -1)  # (B,(1+)Pnn,1+T,1)
+    invalid_cur_future = (~target_seq_is_valid_bool).unsqueeze(
+        -1)  # (B, (1+)Pnn, 1+future_len or future_len, 1)
     target_seq_norm_xT = target_seq_norm_xT.masked_fill(
         invalid_cur_future, 0.0)
 
-    assert target_seq_norm_xT.shape == (B, one_or_Pnn, 1 + future_len, 4)
     return target_seq_norm_xT, std
 
 
@@ -609,7 +621,7 @@ def _forward_model_with_autocast(
     model: nn.Module,
     norm_inputs: Dict[str, torch.Tensor],
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
-    target_seq_norm_xT: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
+    target_seq_norm_xT: torch.Tensor,  # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
     batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     low_t_mask: torch.Tensor,  # (B,)
     cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
@@ -623,12 +635,13 @@ def _forward_model_with_autocast(
     """
     target_future_valid = _to_bool_mask(target_future_valid)
 
+    # TODO: target_seq_norm_xT 처리
     merged_inputs: Dict[str, torch.Tensor] = {
         **norm_inputs,
         "target_future_valid":
             target_future_valid,  # (B, (1 +) Pnn, future_len)
         "target_seq_norm_xT":
-            target_seq_norm_xT,  # (B, (1+)Pnn, 1+future_len, 4)
+            target_seq_norm_xT,  # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
         "diffusion_time": batch_diffusion_time,  # (B,) or (B, T)
         "low_t_mask": low_t_mask,  # (B,)
         "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
@@ -1140,15 +1153,14 @@ def diffusion_loss_func(
         random_noise, # (B, (1+)Pnn, future_len, 4 or 3)
         marginal_prob,
     )
-    target_future_valid = target_seq_is_valid[:, :,
-                                                     1:]  # (B, (1+)Pnn, future_len)
+    target_future_valid = target_seq_is_valid[:, :,-future_len:]  # (B, (1+)Pnn, future_len)
     # 모델 forward + decoder_output 생성
     decoder_output: Dict[str, torch.Tensor] = _forward_model_with_autocast(
         model=model,  #
         norm_inputs=norm_inputs,  #
         target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
         target_seq_norm_xT=
-        target_seq_norm_xT,  # (B, (1+)Pnn, 1+future_len, 4)
+        target_seq_norm_xT, # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
         batch_diffusion_time=batch_diffusion_time,  # (B,) or (B, future_len)
         low_t_mask=low_t_mask,  # (B,)
         cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
