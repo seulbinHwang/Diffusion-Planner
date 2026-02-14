@@ -113,10 +113,11 @@ FORCE_REBUILD=0
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --profile_feasible False \
-    --use_feasible False \
+    --use_feasible True \
     --use_feasible_dl False \
-    --use_feasible_filter False \
+    --use_feasible_filter True \
+    --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
     --prefetch_factor 8 \
-    --pose_based false
+    --pose_based False

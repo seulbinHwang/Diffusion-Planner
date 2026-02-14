@@ -849,7 +849,7 @@ def _compute_integration_and_constraint_losses(
     control_constraint_diff: Optional[torch.Tensor] = None
 
     # --- L_integration ---
-    if ("integrated_trajectory" in decoder_output) and args.use_feasible_dl:
+    if ("integrated_trajectory" in decoder_output):
         integrated_full = _require_finite(
             "decoder_output['integrated_trajectory']",
             decoder_output["integrated_trajectory"],
@@ -871,7 +871,7 @@ def _compute_integration_and_constraint_losses(
                                            dtype=torch.float32)
 
     # --- L_constraint ---
-    if "control_constraint_diff" in decoder_output and args.use_feasible_dl:
+    if "control_constraint_diff" in decoder_output:
         control_constraint_diff = _require_finite(
             "decoder_output['control_constraint_diff']",
             decoder_output["control_constraint_diff"],
