@@ -489,11 +489,7 @@ def _compute_vxy_yaw_losses(
     # Compute yaw angles from cos/sin
     yaw_pred = score_denorm[..., 2]  # [B, P, T]
     yaw_gt = target_future_gt[..., 2] # [B, P, T]
-    # Angular error wrapped to [-pi, pi]
-    yaw_err = (yaw_pred - yaw_gt +
-               torch.pi) % (2 * torch.pi) - torch.pi  # [B, P, T]
-    yaw_err_deg = torch.rad2deg(yaw_err)  # [-180, 180]
-
+    yaw_err_deg = torch.rad2deg(yaw_pred - yaw_gt)
     dist_yaw = torch.abs(yaw_err_deg)  # abs error in radians # [B, P, T]
     # target_future_valid :# (B, Pnn, T)
     masked_yaw = dist_yaw[target_future_valid]
@@ -679,7 +675,6 @@ def _forward_model_with_autocast(
     target_seq_norm_xT: torch.Tensor,  # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
     batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     low_t_mask: torch.Tensor,  # (B,)
-    cond_last_pos_norm: torch.Tensor,  # (B, (1+)Pnn, 4)
     use_deepspeed: bool,
     past_seq_control_gt_3_dim: Optional[torch.Tensor],  # (B, (1+)Pnn, past_len, 3) or None
 ) -> Dict[str, torch.Tensor]:
@@ -699,7 +694,6 @@ def _forward_model_with_autocast(
             target_seq_norm_xT,  # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
         "diffusion_time": batch_diffusion_time,  # (B,) or (B, T)
         "low_t_mask": low_t_mask,  # (B,)
-        "cond_last_pos_norm": cond_last_pos_norm,  # (B, (1+)Pnn, 4)
         "past_seq_control_gt_3_dim": past_seq_control_gt_3_dim,  # (B, (1+)Pnn, past_len, 3) or None
     }
     # merged_inputs 만들어진 직후
@@ -921,10 +915,14 @@ def _add_xy_yaw_metric_losses(
 
         else:
             # score_denorm: (B, (1+)Pnn, T, 3)
-            score_denorm: torch.Tensor = observation_normalizer.inverse(score)
+            temp_dict = {"seg_body_control": score}
+            norm_temp_dict = observation_normalizer.inverse(temp_dict)
+            score_denorm = norm_temp_dict["seg_body_control"]
             # target_future_gt: (B, (1+)Pnn, T, 3)
-            target_future_gt: torch.Tensor = observation_normalizer.inverse(
-                normed_target_future_seq_gt)
+            temp_dict = {"seg_body_control": normed_target_future_seq_gt}
+            norm_temp_dict = observation_normalizer.inverse(
+                temp_dict)
+            target_future_gt = norm_temp_dict["seg_body_control"]
             # (1) score 기준 xy/yaw 오차
             vxy_yaw_losses = _compute_vxy_yaw_losses(
                 score_denorm,  # (B, (1+)Pnn, T,  3)
@@ -999,7 +997,7 @@ def _assert_cur_future_valid_mask(
 def _split_normed_target_seq_gt(
 pose_based: bool,
     normed_target_seq_gt: torch.Tensor  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
-) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
     # normed_target_cur_seq_gt: (B, (1+)Pnn, 4) OR None
     if pose_based:
         normed_target_cur_seq_gt = normed_target_seq_gt[:, :, :1, :]
@@ -1009,9 +1007,7 @@ pose_based: bool,
         normed_target_cur_seq_gt = None
         normed_target_future_seq_gt = normed_target_seq_gt # (B, (1+)Pnn, future_len, 3)
 
-    # cond_last_pos_norm: (B, (1+)Pnn, 4 or 3)
-    cond_last_pos_norm: torch.Tensor = normed_target_seq_gt[:, :, -1, :]
-    return normed_target_cur_seq_gt, normed_target_future_seq_gt, cond_last_pos_norm
+    return normed_target_cur_seq_gt, normed_target_future_seq_gt
 
 
 def _get_near_cur_future_gt_is_valid(
@@ -1200,10 +1196,8 @@ def diffusion_loss_func(
     """
     # normed_target_cur_seq_gt: (B, (1+)Pnn, 4) or None
     # normed_target_future_seq_gt: (B, (1+)Pnn, future_len, 4 or 3)
-    # cond_last_pos_norm: (B, (1+)Pnn, 4 or 3)
     """
-    (normed_target_cur_seq_gt, normed_target_future_seq_gt,
-     cond_last_pos_norm) = _split_normed_target_seq_gt(args.pose_based,
+    (normed_target_cur_seq_gt, normed_target_future_seq_gt) = _split_normed_target_seq_gt(args.pose_based,
          normed_target_seq_gt) # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
     """
         target_seq_norm_xT: 
@@ -1229,7 +1223,6 @@ def diffusion_loss_func(
         target_seq_norm_xT, # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
         batch_diffusion_time=batch_diffusion_time,  # (B,) or (B, future_len)
         low_t_mask=low_t_mask,  # (B,)
-        cond_last_pos_norm=cond_last_pos_norm,  # (B, (1+)Pnn, 4)
         use_deepspeed=args.use_deepspeed,
         past_seq_control_gt_3_dim=past_seq_control_gt_3_dim, # (B, (1+)Pnn, past_len, 3) or None
     )

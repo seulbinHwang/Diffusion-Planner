@@ -282,132 +282,132 @@ class FeasibleProjector(nn.Module):
         # ------------------------------
         # Encoders (시간축 보존, 채널만 변환)
         # ------------------------------
-        # if self.use_feasible_dl:
-        # 상태 인코더(현재 노드 X_prev: (x,y,cos,sin))
-        self.state_prev_encoder = nn.Sequential(
-            nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
-            nn.Linear(4, self._Dx),  #: #4 → 16
-            nn.GELU(),
-            nn.Linear(self._Dx, self._Dx),  #: 16 → 16 (= self._Dx)
-        )
-        self.state_fut_encoder = nn.Sequential(
-            nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
-            nn.Linear(4, self._Dx),  #: 4 → 16
-            nn.GELU(),
-            nn.Linear(self._Dx, self._Dx),  # : 16 → 16 (= self._Dx)
-        )
-        self.control_adapter = nn.Sequential(
-            nn.LayerNorm(3),  # (B,Pnn,segment_len,3)
-            nn.Linear(3, self._Du),  # : 3 → 8 (= self._Du)
-            nn.GELU(),
-        )
-
-        # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
-        self.trunk_compressor = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 3 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
-            nn.GELU(),
-            nn.Linear(3 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
-        )
-
-        # ------------------------------
-        # Stem (채널 정렬)
-        # ------------------------------
-        self.stem_norm = nn.LayerNorm(self._Din)
-        self.stem_fc = nn.Linear(self._Din, self._C)
-        self.stem_act = nn.GELU()
-
-        # ------------------------------
-        # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
-        # ------------------------------
-        self._kernel_size: int = 9
-        self._dilations: List[int] = [1, 8]  #: 4블록→2블록
-        self.tcn_depth = len(self._dilations)  # : 현재는 2
-        self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
-            [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
-
-        # depthwise conv (C 채널, groups=C)
-        def _same_pad(k: int, d: int) -> int:
-            return d * (k // 2)
-
-        self.tcn_dw = nn.ModuleList([
-            nn.Conv1d(in_channels=self._C,
-                      out_channels=self._C,
-                      kernel_size=self._kernel_size,
-                      padding=_same_pad(self._kernel_size, d),
-                      dilation=d,
-                      groups=self._C,
-                      bias=False) for d in self._dilations
-        ])
-        # key: (block_idx, device, dtype)
-        self._tcn_den_ones_kernel_cache: Dict[Tuple[int, torch.device,
-                                                    torch.dtype],
-                                              torch.Tensor] = {}
-        # [NEW] den(=커널이 보는 위치 중 유효한 개수) 계산을 conv 없이 하기 위한 캐시
-        # key: (kernel_size, dilation, padding, T, device) -> positions_kT (k, T) long
-        self._tcn_den_positions_cache: Dict[Tuple[int, int, int, int,
-                                                  torch.device],
-                                            torch.Tensor] = {}
-        # 블록마다 kernel_size가 달라질 수 있는 형태를 대비해 "블록별 base 텐서"로 저장
-        for block_idx in range(self.tcn_depth):
-            self.register_buffer(
-                f"_tcn_den_ones_kernel_base_{block_idx}",
-                torch.ones((1, 1, self._kernel_size), dtype=torch.float32),
+        if self.use_feasible_dl:
+            # 상태 인코더(현재 노드 X_prev: (x,y,cos,sin))
+            self.state_prev_encoder = nn.Sequential(
+                nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
+                nn.Linear(4, self._Dx),  #: #4 → 16
+                nn.GELU(),
+                nn.Linear(self._Dx, self._Dx),  #: 16 → 16 (= self._Dx)
+            )
+            self.state_fut_encoder = nn.Sequential(
+                nn.LayerNorm(4),  # (B,Pnn,segment_len,4)
+                nn.Linear(4, self._Dx),  #: 4 → 16
+                nn.GELU(),
+                nn.Linear(self._Dx, self._Dx),  # : 16 → 16 (= self._Dx)
+            )
+            self.control_adapter = nn.Sequential(
+                nn.LayerNorm(3),  # (B,Pnn,segment_len,3)
+                nn.Linear(3, self._Du),  # : 3 → 8 (= self._Du)
+                nn.GELU(),
             )
 
-        # ------------------------------
-        # [A3] 마스크 검증(디버그용) on/off
-        #   - 기본값: False (학습/추론 경로에서 비용 제거)
-        #   - True로 켜고 싶으면 config.feasible_debug_check_mask = True
-        # ------------------------------
-        self.feasible_debug_check_mask: bool = bool(
-            getattr(self.config, "feasible_debug_check_mask", False))
+            # (B,Pnn,H) -> (B,Pnn,_Dc=8) 로 trunk 압축
+            self.trunk_compressor = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, 3 * self._Dc),  #: hidden_dim → 64 (중간 폭 축소)
+                nn.GELU(),
+                nn.Linear(3 * self._Dc, self._Dc),  #: 64 → 8 (= self._Dc)
+            )
 
-        # pointwise 1x1 (시간축 보존, 채널 결합)
-        # - 기존: nn.Linear(C->C) + (B*Pnn,C,T) ↔ (B*Pnn,T,C) 변환
-        # - 변경: nn.Conv1d(C->C, kernel_size=1)로 (B*Pnn, C, T)에서 그대로 처리
-        self.tcn_linear = nn.ModuleList([
-            nn.Conv1d(
-                in_channels=self._C,
-                out_channels=self._C,
-                kernel_size=1,
-                bias=True,
-            ) for _ in range(self.tcn_depth)
-        ])
+            # ------------------------------
+            # Stem (채널 정렬)
+            # ------------------------------
+            self.stem_norm = nn.LayerNorm(self._Din)
+            self.stem_fc = nn.Linear(self._Din, self._C)
+            self.stem_act = nn.GELU()
 
-        # ------------------------------
-        # Head & Gate
-        # ------------------------------
-        # 잔차 초안 ΔU_raw
-        # - 기존: (B,Pnn,T,C) 토큰별 Linear
-        # - 변경: (B*Pnn,C,T)에서 1x1 Conv로 처리
-        head_bottleneck_dim: int = max(1, self._C // 4)
+            # ------------------------------
+            # TCN 4블록: depthwise(7) + dilation {1,2,4,8} + 1x1
+            # ------------------------------
+            self._kernel_size: int = 9
+            self._dilations: List[int] = [1, 8]  #: 4블록→2블록
+            self.tcn_depth = len(self._dilations)  # : 현재는 2
+            self.tcn_pre_lns = nn.ModuleList(  #: 블록 수만큼 LayerNorm
+                [nn.LayerNorm(self._C) for _ in range(self.tcn_depth)])
 
-        self.head = nn.Sequential(
-            nn.Conv1d(self._C, head_bottleneck_dim, kernel_size=1, bias=True),
-            nn.GELU(),
-            nn.Conv1d(head_bottleneck_dim, 3, kernel_size=1, bias=True),
-        )
+            # depthwise conv (C 채널, groups=C)
+            def _same_pad(k: int, d: int) -> int:
+                return d * (k // 2)
 
-        # 마지막 Conv 0-init → 초기엔 U_ref ≈ U_base
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
+            self.tcn_dw = nn.ModuleList([
+                nn.Conv1d(in_channels=self._C,
+                          out_channels=self._C,
+                          kernel_size=self._kernel_size,
+                          padding=_same_pad(self._kernel_size, d),
+                          dilation=d,
+                          groups=self._C,
+                          bias=False) for d in self._dilations
+            ])
+            # key: (block_idx, device, dtype)
+            self._tcn_den_ones_kernel_cache: Dict[Tuple[int, torch.device,
+                                                        torch.dtype],
+                                                  torch.Tensor] = {}
+            # [NEW] den(=커널이 보는 위치 중 유효한 개수) 계산을 conv 없이 하기 위한 캐시
+            # key: (kernel_size, dilation, padding, T, device) -> positions_kT (k, T) long
+            self._tcn_den_positions_cache: Dict[Tuple[int, int, int, int,
+                                                      torch.device],
+                                                torch.Tensor] = {}
+            # 블록마다 kernel_size가 달라질 수 있는 형태를 대비해 "블록별 base 텐서"로 저장
+            for block_idx in range(self.tcn_depth):
+                self.register_buffer(
+                    f"_tcn_den_ones_kernel_base_{block_idx}",
+                    torch.ones((1, 1, self._kernel_size), dtype=torch.float32),
+                )
 
-        gate_hidden_dim = 64
-        self.gate_mlp = nn.Sequential(
-            nn.LayerNorm(self._C),
-            nn.Linear(self._C, gate_hidden_dim),
-            nn.GELU(),
-            nn.Linear(gate_hidden_dim, 3),
-        )
-        # Gate를 시간별이 아니라 이웃별로 계산할지 여부 (기본: True)
-        self.feasible_gate_agentwise: bool = False  #bool(getattr(self.config, "feasible_gate_agentwise", True))
+            # ------------------------------
+            # [A3] 마스크 검증(디버그용) on/off
+            #   - 기본값: False (학습/추론 경로에서 비용 제거)
+            #   - True로 켜고 싶으면 config.feasible_debug_check_mask = True
+            # ------------------------------
+            self.feasible_debug_check_mask: bool = bool(
+                getattr(self.config, "feasible_debug_check_mask", False))
 
-        # gate 초기 스케일 s0 설정(보수적으로)
-        s0 = 0.05
-        b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
-        with torch.no_grad():
-            self.gate_mlp[-1].bias.fill_(b_init)
+            # pointwise 1x1 (시간축 보존, 채널 결합)
+            # - 기존: nn.Linear(C->C) + (B*Pnn,C,T) ↔ (B*Pnn,T,C) 변환
+            # - 변경: nn.Conv1d(C->C, kernel_size=1)로 (B*Pnn, C, T)에서 그대로 처리
+            self.tcn_linear = nn.ModuleList([
+                nn.Conv1d(
+                    in_channels=self._C,
+                    out_channels=self._C,
+                    kernel_size=1,
+                    bias=True,
+                ) for _ in range(self.tcn_depth)
+            ])
+
+            # ------------------------------
+            # Head & Gate
+            # ------------------------------
+            # 잔차 초안 ΔU_raw
+            # - 기존: (B,Pnn,T,C) 토큰별 Linear
+            # - 변경: (B*Pnn,C,T)에서 1x1 Conv로 처리
+            head_bottleneck_dim: int = max(1, self._C // 4)
+
+            self.head = nn.Sequential(
+                nn.Conv1d(self._C, head_bottleneck_dim, kernel_size=1, bias=True),
+                nn.GELU(),
+                nn.Conv1d(head_bottleneck_dim, 3, kernel_size=1, bias=True),
+            )
+
+            # 마지막 Conv 0-init → 초기엔 U_ref ≈ U_base
+            nn.init.zeros_(self.head[-1].weight)
+            nn.init.zeros_(self.head[-1].bias)
+
+            gate_hidden_dim = 64
+            self.gate_mlp = nn.Sequential(
+                nn.LayerNorm(self._C),
+                nn.Linear(self._C, gate_hidden_dim),
+                nn.GELU(),
+                nn.Linear(gate_hidden_dim, 3),
+            )
+            # Gate를 시간별이 아니라 이웃별로 계산할지 여부 (기본: True)
+            self.feasible_gate_agentwise: bool = False  #bool(getattr(self.config, "feasible_gate_agentwise", True))
+
+            # gate 초기 스케일 s0 설정(보수적으로)
+            s0 = 0.05
+            b_init = math.log(math.exp(float(s0)) - 1.0)  # softplus^{-1}(s0)
+            with torch.no_grad():
+                self.gate_mlp[-1].bias.fill_(b_init)
 
     @staticmethod
     def _to_bool_mask(mask: torch.Tensor) -> torch.Tensor:
