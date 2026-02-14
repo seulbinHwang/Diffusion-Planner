@@ -1047,30 +1047,53 @@ def diffusion_loss_func(
         norm_inputs, norm_outputs)
     B, one_or_Pnn, one_future_len = near_cur_future_gt_is_valid.shape
     future_len = one_future_len - 1
+
+    # ego_cur_gt_4_dim: (B, 4)
+    norm_ego_cur_gt_4_dim = norm_inputs["ego_agent_past"][:, -1, :4]
+    # (B, 1) + (B, future_len) = (B, 1 + future_len)
+    ego_cur_future_gt_is_valid = torch.cat(
+        [norm_inputs["ego_agent_past_is_valid"][:, -1:],
+         norm_inputs["ego_future_gt_is_valid"]], dim=1,
+    )
+
+    # norm_near_current_4_dim : (B, Pnn, 4)
+    norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
     if args.pose_based:
-        # norm_near_current_4_dim : (B, Pnn, 4)
-        norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
         (
             normed_target_seq_gt_4_dim,  # (B, (1+)Pnn, 1+future_len, 4)
             target_seq_is_valid,  # (B, (1+)Pnn, 1+future_len)
         ) = build_target_future_tensors_and_masks(
             args=args,
-            norm_inputs=norm_inputs,
+            norm_ego_cur_gt_4_dim=norm_ego_cur_gt_4_dim, # (B, 4)
             normed_ego_future_gt_4_dim=norm_outputs[
                 "ego_future_gt_4_dim"],  # (B, future_len, 4)
+            ego_cur_future_gt_is_valid=ego_cur_future_gt_is_valid,
+            # (B, 1 + future_len)
+            norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
             normed_near_future_gt_4_dim=norm_outputs[
                 "near_future_gt_4_dim"],  # (B, Pnn, future_len, 4)
             near_cur_future_gt_is_valid=
             near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
-            norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
         )
     else: # velocity_based
         # TODO
         """
+        past_future_seg_control_gt_3_dim: (B, 1+Pnn, future_len, 3)
+        
         normed_target_seq_gt_4_dim : (B, (1+)Pnn, future_len, 4)
         target_seq_is_valid : (B, (1+)Pnn, future_len)
         """
-        pass
+        (
+            normed_target_seq_gt_4_dim,  # (B, (1+)Pnn, future_len, 3)
+            target_seq_is_valid,  # (B, (1+)Pnn, future_len)
+        ) = build_target_future_tensors_and_masks_vel(
+            args=args,
+            past_future_seg_control_gt_3_dim=norm_outputs[
+                "past_future_seg_control_gt_3_dim"],  # (B, 1+Pnn, future_len, 3)
+            ego_cur_future_gt_is_valid=ego_cur_future_gt_is_valid, # (B, 1 + future_len)
+            near_cur_future_gt_is_valid=
+            near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
+        )
 
     # ✅ (핵심) upstream dtype 변화(0/1 float 등) 대비
     target_seq_is_valid = _to_bool_mask(target_seq_is_valid)
