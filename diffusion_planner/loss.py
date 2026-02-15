@@ -1161,7 +1161,7 @@ def diffusion_loss_func(
         # past_seq_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
         past_seq_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
         if not args.do_ego_predict:
-            past_seq_control_gt_3_dim = past_seq_control_gt_3_dim[:, :, 1:, :]
+            past_seq_control_gt_3_dim = past_seq_control_gt_3_dim[:, 1:, :, :]
         # (B, (1+)Pnn, future_len, 3)
         future_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, -future_len:, :]
         (
