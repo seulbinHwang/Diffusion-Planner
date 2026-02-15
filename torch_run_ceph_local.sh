@@ -108,15 +108,15 @@ FORCE_REBUILD=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "38_control" \
+    --name "38_control_only" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --profile_feasible False \
-    --use_feasible True \
+    --use_feasible False \
     --use_feasible_dl False \
-    --use_feasible_filter True \
-    --feasible_grad_to_dit True \
+    --use_feasible_filter False \
+    --feasible_grad_to_dit False \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
     --prefetch_factor 8 \
