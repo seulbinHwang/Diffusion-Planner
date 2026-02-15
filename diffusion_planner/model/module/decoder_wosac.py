@@ -3315,11 +3315,11 @@ class DiT(nn.Module):
         else:
             # CHECK
             B, one_Pnn, F = x.shape
-            x = x.reshape(B, one_Pnn, -1, 3)  # (B, (1+)Pnn, L, 3)
+            x_4ndim = x.reshape(B, one_Pnn, -1, 3)  # (B, (1+)Pnn, L, 3)
             future_len = int(self.config.future_len)
-            seq_len = int(x.shape[2])
+            seq_len = int(x_4ndim.shape[2])
             # diffusion_control_traj: (B, (1+)Pnn, future_len, 3)
-            diffusion_control_traj = x[:, :, -future_len:, :]
+            diffusion_control_traj = x_4ndim[:, :, -future_len:, :]
 
             # ---------------------------
             # [NEW] prev_seg_body_control / prev_control_valid 준비
@@ -3334,7 +3334,7 @@ class DiT(nn.Module):
             if use_prev:
                 # seq_len이 future_len+1 이상이면 "마지막 past 세그먼트"가 존재
                 if seq_len >= future_len + 1:
-                    prev_seg_body_control = x[
+                    prev_seg_body_control = x_4ndim[
                         :, :, -(future_len + 1), :]  # (B,(1+)Pnn,3)
 
                     # prev 세그먼트 유효성: (past_last_node & current_node)
@@ -3343,9 +3343,9 @@ class DiT(nn.Module):
 
                     if past_len >= 1:
                         prev_control_valid = (
-                                target_past_cur_future_valid[:, :, past_len].to(
+                                target_past_cur_future_valid[:, :, past_len -1 ].to(
                                     torch.bool) &
-                                target_past_cur_future_valid[:, :, past_len + 1].to(
+                                target_past_cur_future_valid[:, :, past_len].to(
                                     torch.bool)
                         )  # (B,(1+)Pnn)
                     else:
@@ -3819,9 +3819,9 @@ else
                 if past_len >= 1 and int(past_len_ds) > 0:
                     # prev 세그먼트 유효성: (past_last_node & current_node)
                     prev_control_valid = (
-                            target_past_cur_future_valid[:, :, past_len].to(
+                            target_past_cur_future_valid[:, :, past_len-1].to(
                                 torch.bool) &
-                            target_past_cur_future_valid[:, :, past_len+1].to(
+                            target_past_cur_future_valid[:, :, past_len].to(
                                 torch.bool)
                     )  # (B,Pnn)
 
@@ -3833,10 +3833,10 @@ else
                             unnorm_seg_body_control_stride.shape[2]) >= int(
                             past_len):
                         prev_seg_body_control = unnorm_seg_body_control_stride[
-                            :, :, past_len, :]  # (B,Pnn,3)
+                            :, :, past_len-1, :]  # (B,Pnn,3)
                     else:
                         prev_seg_body_control = unnorm_seg_body_control_stride[
-                            :, :, int(past_len_ds), :]  # (B,Pnn,3)
+                            :, :, int(past_len_ds)-1, :]  # (B,Pnn,3)
 
                     # dtype/device 정렬
                     prev_seg_body_control = prev_seg_body_control.to(
