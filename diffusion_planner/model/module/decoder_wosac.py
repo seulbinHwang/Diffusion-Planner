@@ -3343,9 +3343,9 @@ class DiT(nn.Module):
 
                     if past_len >= 1:
                         prev_control_valid = (
-                                target_past_cur_future_valid[:, :, past_len - 1].to(
-                                    torch.bool) &
                                 target_past_cur_future_valid[:, :, past_len].to(
+                                    torch.bool) &
+                                target_past_cur_future_valid[:, :, past_len + 1].to(
                                     torch.bool)
                         )  # (B,(1+)Pnn)
                     else:
@@ -3819,9 +3819,9 @@ else
                 if past_len >= 1 and int(past_len_ds) > 0:
                     # prev 세그먼트 유효성: (past_last_node & current_node)
                     prev_control_valid = (
-                            target_past_cur_future_valid[:, :, past_len - 1].to(
-                                torch.bool) &
                             target_past_cur_future_valid[:, :, past_len].to(
+                                torch.bool) &
+                            target_past_cur_future_valid[:, :, past_len+1].to(
                                 torch.bool)
                     )  # (B,Pnn)
 
@@ -3833,10 +3833,10 @@ else
                             unnorm_seg_body_control_stride.shape[2]) >= int(
                             past_len):
                         prev_seg_body_control = unnorm_seg_body_control_stride[
-                            :, :, past_len - 1, :]  # (B,Pnn,3)
+                            :, :, past_len, :]  # (B,Pnn,3)
                     else:
                         prev_seg_body_control = unnorm_seg_body_control_stride[
-                            :, :, int(past_len_ds) - 1, :]  # (B,Pnn,3)
+                            :, :, int(past_len_ds), :]  # (B,Pnn,3)
 
                     # dtype/device 정렬
                     prev_seg_body_control = prev_seg_body_control.to(
@@ -4138,10 +4138,14 @@ else
         low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (
                     low_t_mask > 0.5)
 
-        base_integrated = diffusion_control_traj.new_zeros(
-            (B, Pnn, future_len, 4))
-        base_constraint = diffusion_control_traj.new_zeros(
-            (B, Pnn, future_len, 3))
+        # ✅ 핵심 변경:
+        # low_t_mask=False인 경우에도 integrated_trajectory가 0이 아니도록,
+        # "예측 control을 그대로 적분한 baseline"을 기본값으로 채워 둔다.
+        base_integrated, base_constraint = self._compute_vel_baseline_dit_returns(
+            diffusion_control_traj=diffusion_control_traj,                # (B,Pnn,T,3)
+            target_past_11_dim=target_past_11_dim,                        # (B,Pnn,past_len,11)
+            target_past_cur_future_valid=target_past_cur_future_valid,    # (B,Pnn,time_len_total)
+        )  # (B,Pnn,T,4), (B,Pnn,T,3)
 
         active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(-1)
 
