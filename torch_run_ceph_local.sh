@@ -110,7 +110,7 @@ FORCE_REBUILD=0
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
     --name "38_control_only" \
     --batch_size 1536 \
-    --learning_rate 1e-3 \
+    --learning_rate 7e-4 \
     --min_learning_rate 1e-6 \
     --profile_feasible False \
     --use_feasible False \
