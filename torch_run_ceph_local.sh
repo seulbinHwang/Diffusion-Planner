@@ -101,6 +101,8 @@ FORCE_REBUILD=0
 ## python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
 #"$RUN_PYTHON_PATH" add_control_to_npz.py --skip_sample_keys
 #
+export DP_ENABLE_CPU_MONITOR=0
+
 ### ---- 학습은 로컬 데이터로 ----
 "$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
   --nnodes 1 --nproc-per-node 6 --standalone \
@@ -110,7 +112,7 @@ FORCE_REBUILD=0
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
     --name "38_control_only7e-4" \
     --batch_size 1536 \
-    --learning_rate 7e-4 \
+    --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --profile_feasible False \
     --use_feasible False \

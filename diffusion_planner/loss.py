@@ -282,9 +282,9 @@ def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
 
 
 def _integrate_midpoint_controls_to_pose_denorm(
-    unnorm_target_cur_gt_4_dim: torch.Tensor,  # (B, P, 4)
-    seg_body_control_denorm: torch.Tensor,  # (B, P, T, 3) = [v_x^b, v_y^b, yaw_rate]
-    target_future_valid: torch.Tensor,  # (B, P, T) bool/0-1
+    unnorm_target_cur_gt_4_dim: torch.Tensor,   # (B, (1+)Pnn, 4)
+    seg_body_control_denorm: torch.Tensor,   # (B,(1 +) Pnn,future_len,3)
+    target_future_valid: torch.Tensor, # (B, (1 +) Pnn, future_len)
     *,
     dt: float = 0.1,
     eps: float = 1e-6,
@@ -312,29 +312,7 @@ def _integrate_midpoint_controls_to_pose_denorm(
             미래 포즈(노드) 시퀀스. shape: (B, P, T, 4) = [x, y, cos, sin]
             무효 스텝은 0으로 마스킹된다.
     """
-    if unnorm_target_cur_gt_4_dim.dim() != 3 or int(unnorm_target_cur_gt_4_dim.shape[-1]) != 4:
-        raise ValueError(
-            "unnorm_target_cur_gt_4_dim must be (B,P,4). "
-            f"got shape={tuple(unnorm_target_cur_gt_4_dim.shape)}"
-        )
-    if seg_body_control_denorm.dim() != 4 or int(seg_body_control_denorm.shape[-1]) != 3:
-        raise ValueError(
-            "seg_body_control_denorm must be (B,P,T,3). "
-            f"got shape={tuple(seg_body_control_denorm.shape)}"
-        )
-
     B, P, T, _ = seg_body_control_denorm.shape
-    if tuple(unnorm_target_cur_gt_4_dim.shape[:2]) != (B, P):
-        raise ValueError(
-            "unnorm_target_cur_gt_4_dim (B,P) mismatch with seg_body_control_denorm. "
-            f"cur={tuple(unnorm_target_cur_gt_4_dim.shape)}, ctrl={tuple(seg_body_control_denorm.shape)}"
-        )
-    if tuple(target_future_valid.shape) != (B, P, T):
-        raise ValueError(
-            "target_future_valid must be (B,P,T) and match ctrl. "
-            f"valid={tuple(target_future_valid.shape)}, ctrl={tuple(seg_body_control_denorm.shape)}"
-        )
-
     future_valid = _to_bool_mask(target_future_valid).to(device=seg_body_control_denorm.device)
 
     # 현재 유효 여부(현재 포즈가 invalid면 보통 cos/sin이 0으로 마스킹되어 있음)
@@ -1004,11 +982,11 @@ def _add_xy_yaw_metric_losses(
     observation_normalizer: Any,
     score: torch.Tensor,   # (B,P,T,4) or (B,P,T,3)
     normed_target_future_seq_gt: torch.Tensor,  # (B,P,T,4 or 3)
-    norm_target_future_gt_4_dim: torch.Tensor,  # (B,P,T,4)
-    target_future_valid: torch.Tensor,  # (B,P,T)
+    norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
+    target_future_valid: torch.Tensor, # (B, (1 +) Pnn, future_len)
     integrated_trajectory: Optional[torch.Tensor],  # (B,P,T,4) or None
     control_constraint_diff: Optional[torch.Tensor],  # (B,P,T,3) or None
-    unnorm_target_cur_gt_4_dim: torch.Tensor,  # (B,P,4)
+    unnorm_target_cur_gt_4_dim: torch.Tensor, # (B, (1+)Pnn, 4)
 ) -> None:
     """xy / yaw 관련 보기용 지표를 loss_dict에 추가합니다."""
     with torch.no_grad():
@@ -1016,6 +994,7 @@ def _add_xy_yaw_metric_losses(
 
         if pose_based:
             # score_denorm: (B,P,T,4)
+            # target_future_valid_bool :  (B, (1 +) Pnn, future_len)
             score_denorm: torch.Tensor = state_normalizer.inverse(score, target_future_valid_bool)
 
             # target_future_gt: (B,P,T,4)
@@ -1026,7 +1005,7 @@ def _add_xy_yaw_metric_losses(
             xy_yaw_losses = _compute_xy_yaw_losses(
                 score_denorm,  # (B,P,T,4)
                 target_future_gt,  # (B,P,T,4)
-                target_future_valid_bool,  # (B,P,T)
+                target_future_valid_bool,  # (B, (1 +) Pnn, future_len)
             )
             loss_dict.update(xy_yaw_losses)
 
@@ -1043,35 +1022,24 @@ def _add_xy_yaw_metric_losses(
             vxy_yaw_losses = _compute_vxy_yaw_losses(
                 score_denorm,             # (B,P,T,3)
                 target_future_ctrl_gt,    # (B,P,T,3)
-                target_future_valid_bool, # (B,P,T)
+                target_future_valid_bool, # (B, (1 +) Pnn, future_len)
             )
             loss_dict.update(vxy_yaw_losses)
 
             # --- (2) control을 중점 적분해서 pose로 만든 뒤 pose 기준 xy/yaw 지표 ---
-            # P 차원이 do_ego_predict 등에 따라 달라질 수 있어, score 기준으로 정렬
-            P = int(score_denorm.shape[1])
-            cur_pose = unnorm_target_cur_gt_4_dim
-            if int(cur_pose.shape[1]) != P:
-                cur_pose = cur_pose[:, :P, :]
 
-            norm_target_future_gt_4_dim_aligned = norm_target_future_gt_4_dim
-            if int(norm_target_future_gt_4_dim_aligned.shape[1]) != P:
-                norm_target_future_gt_4_dim_aligned = norm_target_future_gt_4_dim_aligned[:, :P, :, :]
 
-            valid_aligned = target_future_valid_bool
-            if int(valid_aligned.shape[1]) != P:
-                valid_aligned = valid_aligned[:, :P, :]
-
-            # GT pose (denorm): (B,P,T,4)
+            # GT pose (denorm): # (B, (1+)Pnn, future_len, 4)
             target_future_pose_gt = state_normalizer.inverse(
-                norm_target_future_gt_4_dim_aligned, valid_aligned
+                norm_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
+                target_future_valid_bool # (B, (1 +) Pnn, future_len)
             )
 
             # pred control -> pred pose (denorm): (B,P,T,4)
             score_pose_denorm = _integrate_midpoint_controls_to_pose_denorm(
-                unnorm_target_cur_gt_4_dim=cur_pose,               # (B,P,4)
-                seg_body_control_denorm=score_denorm,              # (B,P,T,3)
-                target_future_valid=valid_aligned,                 # (B,P,T)
+                unnorm_target_cur_gt_4_dim=unnorm_target_cur_gt_4_dim, # (B, (1+)Pnn, 4)
+                seg_body_control_denorm=score_denorm,              # (B,(1 +) Pnn,future_len,3)
+                target_future_valid=target_future_valid_bool,  # (B, (1 +) Pnn, future_len)
                 dt=0.1,
                 eps=1e-6,
             )
@@ -1079,7 +1047,7 @@ def _add_xy_yaw_metric_losses(
             xy_yaw_losses = _compute_xy_yaw_losses(
                 score_pose_denorm,        # (B,P,T,4)
                 target_future_pose_gt,    # (B,P,T,4)
-                valid_aligned,            # (B,P,T)
+                target_future_valid_bool, # (B, (1 +) Pnn, future_len)
             )
             loss_dict.update(xy_yaw_losses)
 
@@ -1297,34 +1265,6 @@ def diffusion_loss_func(
     # norm_near_current_4_dim : (B, Pnn, 4)
     norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
 
-    # 현재 유효 마스크 (ego / near)
-    ego_cur_gt_is_valid = _to_bool_mask(ego_cur_future_gt_is_valid[:, 0])          # (B,)
-    near_cur_gt_is_valid = _to_bool_mask(near_cur_future_gt_is_valid[:, :, 0])    # (B, Pnn)
-
-    # do_ego_predict에 따라 target_cur(=현재 포즈) 구성
-    if bool(getattr(args, "do_ego_predict", True)):
-        # (B, 1+Pnn, 4)
-        norm_target_cur_gt_4_dim = torch.cat(
-            [norm_ego_cur_gt_4_dim.unsqueeze(1), norm_near_current_4_dim],
-            dim=1,
-        )
-        # (B, 1+Pnn)
-        target_cur_gt_is_valid = torch.cat(
-            [ego_cur_gt_is_valid.unsqueeze(1), near_cur_gt_is_valid],
-            dim=1,
-        )
-    else:
-        # ego 미예측이면 neighbor만 맞춰줌
-        # (B, Pnn, 4)
-        norm_target_cur_gt_4_dim = norm_near_current_4_dim
-        # (B, Pnn)
-        target_cur_gt_is_valid = near_cur_gt_is_valid
-
-    # unnorm_target_cur_gt_4_dim: (B, (1+)Pnn, 4) 또는 (B, Pnn, 4)
-    unnorm_target_cur_gt_4_dim = state_normalizer.inverse(
-        norm_target_cur_gt_4_dim,
-        target_cur_gt_is_valid,
-    )
     if args.pose_based:
         (
             normed_target_seq_gt,  # (B, (1+)Pnn, 1+future_len, 4)
@@ -1494,6 +1434,38 @@ def diffusion_loss_func(
 
         # xy/yaw 관련 보기용 지표는 매 step이 아니라 "가끔"만 계산합니다.
         if _should_compute_xy_yaw_metrics_this_step(args):
+
+            # 현재 유효 마스크 (ego / near)
+            ego_cur_gt_is_valid = _to_bool_mask(
+                ego_cur_future_gt_is_valid[:, 0])  # (B,)
+            near_cur_gt_is_valid = _to_bool_mask(
+                near_cur_future_gt_is_valid[:, :, 0])  # (B, Pnn)
+
+            # do_ego_predict에 따라 target_cur(=현재 포즈) 구성
+            if bool(getattr(args, "do_ego_predict", True)):
+                # (B, 1+Pnn, 4)
+                norm_target_cur_gt_4_dim = torch.cat(
+                    [norm_ego_cur_gt_4_dim.unsqueeze(1),
+                     norm_near_current_4_dim],
+                    dim=1,
+                )
+                # (B, 1+Pnn)
+                target_cur_gt_is_valid = torch.cat(
+                    [ego_cur_gt_is_valid.unsqueeze(1), near_cur_gt_is_valid],
+                    dim=1,
+                )
+            else:
+                # ego 미예측이면 neighbor만 맞춰줌
+                # (B, Pnn, 4)
+                norm_target_cur_gt_4_dim = norm_near_current_4_dim
+                # (B, Pnn)
+                target_cur_gt_is_valid = near_cur_gt_is_valid
+
+            # unnorm_target_cur_gt_4_dim: (B, (1+)Pnn, 4) 또는 (B, Pnn, 4)
+            unnorm_target_cur_gt_4_dim = state_normalizer.inverse(
+                norm_target_cur_gt_4_dim,
+                target_cur_gt_is_valid,
+            )
             _add_xy_yaw_metric_losses(
                 pose_based=args.pose_based,
                 loss_dict=loss_dict,

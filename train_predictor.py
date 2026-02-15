@@ -1786,7 +1786,7 @@ def _train_one_epoch(
     return train_loss, train_total_loss, epoch_elapsed_time_sec
 
 
-TEMP_WANDB_ROOT_DIR: str = "/mnt/temp_wandb"
+TEMP_WANDB_ROOT_DIR: str = "/workspace/temp_wandb" #"/mnt/temp_wandb"
 
 
 def _copy_file_to_temp_wandb(
@@ -2479,11 +2479,16 @@ def _run_training_loop(
     """
     elapsed_training_time_hour: float = 0.0
 
-    # ✅ (추가) CPU 사용률 모니터는 rank0에서만 실행
+    # ✅ CPU 모니터 on/off (기본: OFF)
+    _enable_cpu_monitor = os.environ.get("DP_ENABLE_CPU_MONITOR",
+                                         "0").lower() in ("1", "true", "t", "y",
+                                                          "yes")
+
     cpu_monitor: Optional[PodCpuUsageMonitor] = None
-    if global_rank == 0:
+    if (global_rank == 0) and _enable_cpu_monitor:
         interval_sec = _get_env_float("DP_CPU_MONITOR_INTERVAL_SEC", 1.0)
-        cpu_monitor = PodCpuUsageMonitor(sample_interval_sec=float(interval_sec))
+        cpu_monitor = PodCpuUsageMonitor(
+            sample_interval_sec=float(interval_sec))
 
     # 전체 업데이트 스텝 수 설정 및 global step 초기화 보장
     batch_num_in_all_epoch: int = _init_global_step_and_total_updates(
