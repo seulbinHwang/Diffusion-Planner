@@ -1381,7 +1381,8 @@ class FeasibleProjector(nn.Module):
         vx_b_seq: torch.Tensor,  # (B, Pnn, T)  바디 기준 x속도 시퀀스
         vy_b_seq: torch.Tensor,  # (B, Pnn, T)  바디 기준 y속도 시퀀스
         omega_seq: torch.Tensor,  # (B, Pnn, T)  요각속도 시퀀스
-        hp: _ConstraintHParams,
+        dt: float,
+            eps: float = 1e-6,
     ) -> Dict[str, torch.Tensor]:
         """시간축 전체에 대해 '중점 적분'을 한 번에 수행한다.
 
@@ -1396,8 +1397,6 @@ class FeasibleProjector(nn.Module):
         device = vx_b_seq.device
         dtype = vx_b_seq.dtype
 
-        dt: float = hp.dt
-        eps: float = hp.eps
 
         # 초기 위치/자세 (노드 0)
         x0 = unnorm_near_current_state[..., 0]  # (B,Pnn)
@@ -3919,7 +3918,8 @@ class FeasibleProjector(nn.Module):
             vx_b_seq=vx_b_after,  # (B,Pnn,T)
             vy_b_seq=vy_b_after,  # (B,Pnn,T)
             omega_seq=omega_after,  # (B,Pnn,T)
-            hp=self.constraints_h_params,
+            dt=self.constraints_h_params.dt,
+            eps=self.constraints_h_params.eps,
         )
 
         return self._assemble_outputs(

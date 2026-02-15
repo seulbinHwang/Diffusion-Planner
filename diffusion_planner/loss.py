@@ -892,6 +892,7 @@ def _add_xy_yaw_metric_losses(
     target_future_valid: torch.Tensor,  # (B, (1+)Pnn, future_len)
     integrated_trajectory: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 4) 또는 None
     control_constraint_diff: Optional[torch.Tensor],  # (B, (1+)Pnn, T, 3) 또는 None
+    unnorm_target_cur_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, 4)
 ) -> None:
     """xy / yaw 관련 보기용 지표를 loss_dict에 추가합니다.
     """
@@ -928,6 +929,25 @@ def _add_xy_yaw_metric_losses(
                 target_future_valid,  # (B, (1+)Pnn, future_len)
             )
             loss_dict.update(vxy_yaw_losses)
+            """
+            # TODO: FeaslbieProjector의 _integrate_midpoint_batch 에 해당하는 로직을 적용하여
+            
+            score_denorm: (B, (1+)Pnn, T,  3) 와 현재 위치(unnorm_target_cur_gt_4_dim)를 input으로 하여
+            
+            score_pose_denorm: (B, (1+)Pnn, T, 4) 를 출력하도록 구현해야함.
+            
+            정규화/비정규화를 조심하여 잘 다뤄야 한다.
+            
+            유효 무효점을 조심하여 잘 다뤄야 한다.
+            
+            """
+            # (1) score 기준 xy/yaw 오차
+            xy_yaw_losses = _compute_xy_yaw_losses(
+                score_pose_denorm,  # (B, (1+)Pnn, T, 4)
+                target_future_gt,  # (B, (1+)Pnn, T, 4)
+                target_future_valid,  # (B, (1+)Pnn, future_len)
+            )
+            loss_dict.update(xy_yaw_losses)
         # (2) integrated_trajectory 기준 xy/yaw 오차
         if integrated_trajectory is not None:
             target_future_gt_4_dim: torch.Tensor = state_normalizer.inverse(
@@ -1130,8 +1150,19 @@ def diffusion_loss_func(
     norm_target_future_gt_4_dim = torch.cat([
          ego_future_gt_4_dim.unsqueeze(1), near_future_gt_4_dim
     ], dim=1)  # (B, (1+)Pnn, future_len, 4)
+    # norm_ego_cur_gt_4_dim: (B, 4)
     # norm_near_current_4_dim : (B, Pnn, 4)
     norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]
+    norm_target_cur_gt_4_dim = torch.cat([norm_ego_cur_gt_4_dim.unsqueeze(1),
+                                         norm_near_current_4_dim], dim=1)  # (B, (1+)Pnn, 4)
+    ego_cur_gt_is_valid = ego_cur_future_gt_is_valid[:, 0] # (B, )
+    near_cur_gt_is_valid = near_cur_future_gt_is_valid[:, :, 0] # (B, Pnn)
+    target_cur_gt_is_valid = torch.cat([ego_cur_gt_is_valid.unsqueeze(1)
+                                           , near_cur_gt_is_valid], dim=-1) # (B, Pnn)
+
+    unnorm_target_cur_gt_4_dim: torch.Tensor = state_normalizer.inverse(
+        norm_target_cur_gt_4_dim, target_cur_gt_is_valid
+    )
     if args.pose_based:
         (
             normed_target_seq_gt,  # (B, (1+)Pnn, 1+future_len, 4)
@@ -1313,6 +1344,7 @@ def diffusion_loss_func(
                 target_future_valid=target_future_valid, # (B, (1 +) Pnn, future_len)
                 integrated_trajectory=integrated_trajectory, # (B, (1+)Pnn, T, 4) 또는 None
                 control_constraint_diff=control_constraint_diff, # (B, (1+)Pnn, T, 3) 또는 None
+                unnorm_target_cur_gt_4_dim=unnorm_target_cur_gt_4_dim, # (B, (1+)Pnn, 4)
             )
     # # dpm_loss 전체가 유한값인지 마지막으로 검사
     # assert torch.isfinite(dpm_loss).all().item(), \
