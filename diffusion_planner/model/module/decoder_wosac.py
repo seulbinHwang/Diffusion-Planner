@@ -364,6 +364,99 @@ class Decoder(nn.Module):
             1, future_len + 1, dtype=torch.float32) / float(future_len)  # (T,)
         self.t_tau = torch.clamp(self.t_tau, max=t_max)  # (T,)
 
+
+    def _build_prev_control_for_feasible_from_past_controls(
+        self,
+        *,
+        target_seq_past: torch.Tensor,  # (B, (1+)Pnn, past_len, 3)
+        target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, past_len+1+future_len)
+        reference_tensor: torch.Tensor,  # device/dtype 기준 텐서. shape: 임의
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """control diffusion(pose_based=False)에서 S2 시작점(prev)에 쓸 '직전 제어'를 입력 past에서 뽑습니다.
+
+        이 함수가 하는 일
+        ----------------
+        - past control 시퀀스에서 마지막 구간 제어를 prev로 꺼냅니다.
+          prev = past_seq_control_gt_3_dim[:, :, -1, :]
+        - prev가 믿을 만한지(prev_control_valid)는
+          "마지막 past 노드"와 "현재 노드"가 둘 다 유효한지로 판단합니다.
+
+        적용 조건
+        --------
+        - config.use_past_for_feasible == True
+        - config.use_past_dit_input == True
+        - config.pose_based == False
+
+        Args:
+            target_seq_past (torch.Tensor):
+                과거 구간 제어 시퀀스.
+                shape: (B, (1+)Pnn, past_len, 3)
+            target_past_cur_future_valid (torch.Tensor):
+                과거~현재~미래 노드 유효 표시(True=유효).
+                shape: (B, (1+)Pnn, past_len + 1 + future_len)
+            reference_tensor (torch.Tensor):
+                결과를 올릴 device/dtype 기준 텐서. shape: 임의
+
+        Returns:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+                prev_seg_body_control:
+                    shape: (B, (1+)Pnn, 3), dtype/device는 reference_tensor와 맞춤
+                    조건 불만족이면 None
+                prev_control_valid:
+                    shape: (B, (1+)Pnn) bool, device는 reference_tensor와 맞춤
+                    조건 불만족이면 None
+        """
+        # control diffusion 전용
+        if bool(getattr(self.config, "pose_based", False)):
+            return None, None
+
+        use_prev = bool(getattr(self.config, "use_past_for_feasible", False)) and bool(
+            getattr(self.config, "use_past_dit_input", False)
+        )
+        if not use_prev:
+            return None, None
+
+        if target_seq_past.dim() != 4 or int(target_seq_past.shape[-1]) != 3:
+            raise ValueError(
+                "target_seq_past는 (B,(1+)Pnn,past_len,3) 이어야 합니다. "
+                f"got shape={tuple(target_seq_past.shape)}"
+            )
+        if target_past_cur_future_valid.dim() != 3:
+            raise ValueError(
+                "target_past_cur_future_valid는 (B,(1+)Pnn,L) 3D 이어야 합니다. "
+                f"got shape={tuple(target_past_cur_future_valid.shape)}"
+            )
+
+        past_len: int = int(target_seq_past.shape[2])
+        if past_len <= 0:
+            return None, None
+
+        future_len: int = int(self._future_len)
+        total_len: int = int(target_past_cur_future_valid.shape[2])
+        past_len_from_mask: int = total_len - (1 + future_len)
+        if past_len_from_mask != past_len:
+            raise ValueError(
+                "past_len이 mask와 맞지 않습니다. "
+                f"past_len(from target_seq_past)={past_len}, "
+                f"past_len(from mask)={past_len_from_mask}, "
+                f"total_len={total_len}, future_len={future_len}"
+            )
+
+        # prev control: 마지막 past 세그먼트
+        prev_seg_body_control = target_seq_past[:, :, past_len - 1, :]  # (B,(1+)Pnn,3)
+
+        # prev valid: (마지막 past 노드) & (현재 노드)
+        valid = target_past_cur_future_valid.to(torch.bool)  # (B,(1+)Pnn,past_len+1+future_len)
+        prev_control_valid = valid[:, :, past_len - 1] & valid[:, :, past_len]  # (B,(1+)Pnn)
+
+        # device/dtype 정렬
+        prev_seg_body_control = prev_seg_body_control.to(
+            device=reference_tensor.device, dtype=reference_tensor.dtype
+        )
+        prev_control_valid = prev_control_valid.to(device=reference_tensor.device, dtype=torch.bool)
+
+        return prev_seg_body_control, prev_control_valid
+
     def _get_amortized_random_noise_from_inputs(
             self,
             inputs: Dict[str, torch.Tensor],
@@ -1702,9 +1795,11 @@ class Decoder(nn.Module):
             scene_encoding_token_mask: torch.Tensor,
             target_past_cur_future_valid: torch.Tensor,
             inputs: Dict[str, torch.Tensor],
-            correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
-            torch.Tensor],
+            correcting_xt_fn: Callable[
+                [torch.Tensor, torch.Tensor, int], torch.Tensor],
             diffusion_steps: int,
+            prev_seg_body_control_input: Optional[torch.Tensor] = None,  # ✅ 추가
+            prev_control_valid_input: Optional[torch.Tensor] = None,  # ✅ 추가
     ) -> torch.Tensor:
         """dpm_sampler(또는 amortized 1-step)을 통해 최종 샘플 x0(flat)을 얻는다."""
         classifier_kwargs: Dict[
@@ -1726,14 +1821,13 @@ class Decoder(nn.Module):
                 xT.float(),
                 diffusion_steps=diffusion_steps,
                 other_model_params={
-                    "target_agents_past":
-                        target_agents_past,
-                    "target_past_cur_future_valid":
-                        target_past_cur_future_valid,
-                    "cross_c":
-                        scene_encoding_token,
-                    "cross_mask":
-                        scene_encoding_token_mask,
+                    "target_agents_past": target_agents_past,
+                    "target_past_cur_future_valid": target_past_cur_future_valid,
+                    "cross_c": scene_encoding_token,
+                    "cross_mask": scene_encoding_token_mask,
+                    # ✅ 추가
+                    "prev_seg_body_control_input": prev_seg_body_control_input,
+                    "prev_control_valid_input": prev_control_valid_input,
                 },
                 dpm_solver_params={
                     "correcting_xt_fn": correcting_xt_fn,
@@ -1773,14 +1867,16 @@ class Decoder(nn.Module):
         # (1) 모델 1회 호출: x0_pred (flat)
         # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         x0_pred: torch.Tensor = self.dit(
-            target_input_norm_xT=xT_f32,  # (B, Pnn, F)
-            diffusion_time=t_tau,  # (B, future_len)
-            target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
+            target_input_norm_xT=xT_f32,
+            diffusion_time=t_tau,
+            target_agents_past=target_agents_past,
             target_past_cur_future_valid=target_past_cur_future_valid,
-            # (B, (1+)Pnn, time_len_total)
-            cross_c=scene_encoding_token,  # (B, token_num, D)
-            cross_mask=scene_encoding_token_mask,  # (B, token_num)
-            low_t_mask=low_t_mask,  # (B,)
+            cross_c=scene_encoding_token,
+            cross_mask=scene_encoding_token_mask,
+            low_t_mask=low_t_mask,
+            # ✅ 추가
+            prev_seg_body_control_input=prev_seg_body_control_input,
+            prev_control_valid_input=prev_control_valid_input,
         )
 
         # (2) guidance를 x0_pred에 반영 (선택)
@@ -1918,17 +2014,28 @@ class Decoder(nn.Module):
         else
             (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
         """
+        # ---- (추가) control diffusion일 때만 prev를 입력 past에서 생성 ----
+        prev_seg_body_control_input: Optional[torch.Tensor] = None
+        prev_control_valid_input: Optional[torch.Tensor] = None
+        if not bool(getattr(self.config, "pose_based", False)):
+            prev_seg_body_control_input, prev_control_valid_input = self._build_prev_control_for_feasible_from_past_controls(
+                target_seq_past=target_seq_past,  # (B,(1+)Pnn,past_len,3)
+                target_past_cur_future_valid=target_past_cur_future_valid,
+                # (B,(1+)Pnn,past_len+1+future_len)
+                reference_tensor=xT_input_flat,  # device/dtype 기준
+            )
+
         score_flat: torch.Tensor = self.dit(
-            target_input_norm_xT=
-            xT_input_flat,
-            diffusion_time=diffusion_time,  # (B,)  or (B, future_len)
+            target_input_norm_xT=xT_input_flat,
+            diffusion_time=diffusion_time,
             target_agents_past=target_agents_past,
-            # # (B, (1+)Pnn, time_len, 11)
             target_past_cur_future_valid=target_past_cur_future_valid,
-            # (B, (1+)Pnn, time_len+future_len)
-            cross_c=scene_encoding_token,  # (B, token_num, D)
-            cross_mask=scene_encoding_token_mask,  # (B, token_num)
+            cross_c=scene_encoding_token,
+            cross_mask=scene_encoding_token_mask,
             low_t_mask=low_t_mask,
+            # ---- (추가) ----
+            prev_seg_body_control_input=prev_seg_body_control_input,
+            prev_control_valid_input=prev_control_valid_input,
         )
         _require_finite("decoder_dit_output", score_flat)
         # (B, (1+)Pnn, 4)
@@ -2300,7 +2407,7 @@ class Decoder(nn.Module):
             scene_encoding_token: torch.Tensor,
             scene_encoding_token_mask: torch.Tensor,
             target_agents_past: torch.Tensor,
-            # (B, (1+)Pnn, time_len, 11)
+            target_seq_past: torch.Tensor,  # ✅ 추가
             target_past_cur_future_valid: torch.Tensor,
             batch_size: int,
             one_or_Pnn: int,
@@ -2395,7 +2502,14 @@ class Decoder(nn.Module):
                 x_flat=xT,
                 target_past_cur_future_valid=target_past_cur_future_valid,
             )
-
+            prev_seg_body_control_input: Optional[torch.Tensor] = None
+            prev_control_valid_input: Optional[torch.Tensor] = None
+            if not bool(getattr(self.config, "pose_based", False)):
+                prev_seg_body_control_input, prev_control_valid_input = self._build_prev_control_for_feasible_from_past_controls(
+                    target_seq_past=target_seq_past,  # (B,(1+)Pnn,past_len,3)
+                    target_past_cur_future_valid=target_past_cur_future_valid,
+                    reference_tensor=xT,  # ✅ xT 기준으로 device/dtype 맞춤
+                )
             # 4) 샘플링 중 보정 함수 구성
             correcting_xt_fn = self._build_inference_correcting_xt_fn(
                 batch_size=B,
@@ -2408,18 +2522,18 @@ class Decoder(nn.Module):
             # 5) dpm_sampler 실행
             # x0: (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             x0: torch.Tensor = self._run_dpm_sampler_for_inference(
-                xT=
-                xT,
-                # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-                target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
+                xT=xT,
+                target_agents_past=target_agents_past,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 inputs=inputs,
                 correcting_xt_fn=correcting_xt_fn,
                 diffusion_steps=diffusion_steps,
+                # ✅ 추가
+                prev_seg_body_control_input=prev_seg_body_control_input,
+                prev_control_valid_input=prev_control_valid_input,
             )
-
             # dtype 맞춤(기존 로직 유지)
             x0 = x0.to(xT.dtype)
 
@@ -2530,7 +2644,7 @@ class Decoder(nn.Module):
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
                 target_agents_past=target_agents_past,
-                # (B, (1+)Pnn, time_len, 11)
+                target_seq_past=target_seq_past,  # ✅ 추가
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 batch_size=batch_size,
                 one_or_Pnn=one_or_Pnn,
@@ -2723,15 +2837,15 @@ class DiT(nn.Module):
 
         # (B,Pnn,4) 현재 상태(여기선 past의 마지막)
         near_current_state = target_past_11_dim[:, :, -1, :4].float()
-        unnorm_near_current_state = self.config.state_normalizer(
+        unnorm_near_current_state = self.config.state_normalizer.inverse(
             data=near_current_state,          # (B,Pnn,4)
             valid_mask=cur_valid,             # (B,Pnn)
         )  # (B,Pnn,4)
 
         # control도 기존 core_vel과 동일 흐름을 따름
         temp_dict = {"seg_body_control": diffusion_control_traj.detach().float()}
-        norm_temp_dict = self.config.observation_normalizer(temp_dict)
-        unnorm_control = norm_temp_dict["seg_body_control"]  # (B,Pnn,T,3)
+        unnorm_temp_dict = self.config.observation_normalizer.inverse(temp_dict)
+        unnorm_control = unnorm_temp_dict["seg_body_control"]  # (B,Pnn,T,3)
 
         vx_b = unnorm_control[..., 0]     # (B,Pnn,T)
         vy_b = unnorm_control[..., 1]     # (B,Pnn,T)
@@ -3249,16 +3363,64 @@ class DiT(nn.Module):
         out: torch.Tensor = (x.float() / (std + 1e-6)).to(x.dtype)
         return out
 
+
+    @staticmethod
+    def _compute_stride_prev_segment_valid_mask(
+        near_past_cur_future_valid_stride: torch.Tensor,  # (B,Pnn, past_len_ds+1+future_len_ds) bool
+        past_len_ds: int,
+    ) -> torch.Tensor:
+        """stride 타임라인에서 '현재 바로 전 세그먼트'의 양끝 노드가 모두 유효한지 계산합니다.
+
+        Args:
+            near_past_cur_future_valid_stride (torch.Tensor):
+                stride로 샘플링된 노드 유효 마스크.
+                shape: (B, Pnn, past_len_ds + 1 + future_len_ds)
+            past_len_ds (int):
+                stride 타임라인에서 과거 노드 개수(현재 노드 제외).
+                shape: ()
+
+        Returns:
+            torch.Tensor:
+                stride_prev_seg_valid.
+                shape: (B, Pnn) bool
+                True면 (past_len_ds-1) 노드와 (past_len_ds) 노드(=현재)가 모두 유효합니다.
+        """
+        if near_past_cur_future_valid_stride.dim() != 3:
+            raise ValueError(
+                "near_past_cur_future_valid_stride는 (B,Pnn,L) 3D여야 합니다. "
+                f"got shape={tuple(near_past_cur_future_valid_stride.shape)}"
+            )
+
+        B, Pnn, L = near_past_cur_future_valid_stride.shape
+        if int(past_len_ds) <= 0:
+            return near_past_cur_future_valid_stride.new_zeros(
+                (int(B), int(Pnn)), dtype=torch.bool
+            )
+
+        # past_len_ds가 가리키는 '현재 노드' 인덱스가 범위를 벗어나면 안전하게 False 처리
+        if int(past_len_ds) >= int(L):
+            return near_past_cur_future_valid_stride.new_zeros(
+                (int(B), int(Pnn)), dtype=torch.bool
+            )
+
+        valid = near_past_cur_future_valid_stride.to(torch.bool)
+        prev_node_valid = valid[:, :, int(past_len_ds) - 1]  # (B,Pnn)
+        cur_node_valid = valid[:, :, int(past_len_ds)]       # (B,Pnn)
+        return prev_node_valid & cur_node_valid
+
     def _forward_x_start_branch(
             self,
-            x: torch.
-            Tensor,
-            low_t_mask: Optional[torch.Tensor],  # (B,)
-            diffusion_time: torch.Tensor,  # (B,)
-            target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
-            target_past_cur_future_valid: torch.
-            Tensor,   # (B, (1+)Pnn, time_len+future_len)
-    ) -> torch.Tensor:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            x: torch.Tensor,
+            low_t_mask: Optional[torch.Tensor],
+            diffusion_time: torch.Tensor,
+            target_agents_past: torch.Tensor,
+            target_past_cur_future_valid: torch.Tensor,
+            # ✅ 추가
+            prev_seg_body_control_input: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn,3)
+            prev_control_valid_input: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn) bool
+    ) -> torch.Tensor: # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         # target_past_11_dim: (B, (1+)Pnn, past_len, 11)
         target_past_11_dim = target_agents_past[:, :, :-1, :]
         # target_current_xyyaw: (B, (1+)Pnn, 4)
@@ -3313,47 +3475,46 @@ class DiT(nn.Module):
                 low_t_mask=low_t_mask,  # (B,)
             )
         else:
-            # CHECK
+            """ x # x_for_feasible
+            (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
+            """
+            # --- pose_based=False (control diffusion) ---
             B, one_Pnn, F = x.shape
-            x_4ndim = x.reshape(B, one_Pnn, -1, 3)  # (B, (1+)Pnn, L, 3)
+            x_4ndim = x.reshape(B, one_Pnn, -1, 3)  # (B,(1+)Pnn,L,3)
             future_len = int(self.config.future_len)
-            seq_len = int(x_4ndim.shape[2])
-            # diffusion_control_traj: (B, (1+)Pnn, future_len, 3)
-            diffusion_control_traj = x_4ndim[:, :, -future_len:, :]
 
-            # ---------------------------
-            # [NEW] prev_seg_body_control / prev_control_valid 준비
-            # ---------------------------
-            prev_seg_body_control: Optional[torch.Tensor] = None  # (B, (1+)Pnn, 3)
-            prev_control_valid: Optional[torch.Tensor] = None  # (B, (1+)Pnn) bool
+            diffusion_control_traj = x_4ndim[
+                :, :, -future_len:, :]  # (B,(1+)Pnn,future_len,3)
+
+            prev_seg_body_control: Optional[torch.Tensor] = None
+            prev_control_valid: Optional[torch.Tensor] = None
 
             use_prev = bool(
-                getattr(self.config, "use_past_for_feasible", False)) and \
-                       bool(getattr(self.config, "use_past_dit_input", False))
+                getattr(self.config, "use_past_for_feasible", False)) and bool(
+                getattr(self.config, "use_past_dit_input", False)
+            )
 
-            if use_prev:
-                # seq_len이 future_len+1 이상이면 "마지막 past 세그먼트"가 존재
-                if seq_len >= future_len + 1:
-                    prev_seg_body_control = x_4ndim[
-                        :, :, -(future_len + 1), :]  # (B,(1+)Pnn,3)
+            # ✅ 핵심: prev는 "입력으로 받은 past control"만 사용
+            if use_prev and prev_seg_body_control_input is not None and prev_control_valid_input is not None:
+                if prev_seg_body_control_input.dim() != 3 or int(
+                        prev_seg_body_control_input.shape[-1]) != 3:
+                    raise ValueError(
+                        "prev_seg_body_control_input는 (B,(1+)Pnn,3) 이어야 합니다. "
+                        f"got shape={tuple(prev_seg_body_control_input.shape)}"
+                    )
+                if prev_control_valid_input.dim() != 2:
+                    raise ValueError(
+                        "prev_control_valid_input는 (B,(1+)Pnn) 이어야 합니다. "
+                        f"got shape={tuple(prev_control_valid_input.shape)}"
+                    )
 
-                    # prev 세그먼트 유효성: (past_last_node & current_node)
-                    total_time_len = int(target_past_cur_future_valid.shape[2])
-                    past_len = total_time_len - (1 + future_len)
-
-                    if past_len >= 1:
-                        prev_control_valid = (
-                                target_past_cur_future_valid[:, :, past_len -1 ].to(
-                                    torch.bool) &
-                                target_past_cur_future_valid[:, :, past_len].to(
-                                    torch.bool)
-                        )  # (B,(1+)Pnn)
-                    else:
-                        prev_seg_body_control = None
-                        prev_control_valid = None
-                else:
-                    prev_seg_body_control = None
-                    prev_control_valid = None
+                prev_seg_body_control = prev_seg_body_control_input.to(
+                    device=diffusion_control_traj.device,
+                    dtype=diffusion_control_traj.dtype
+                )
+                prev_control_valid = prev_control_valid_input.to(
+                    device=diffusion_control_traj.device, dtype=torch.bool
+                )
 
             self._feasible_projection_vel(
                 diffusion_control_traj=diffusion_control_traj,
@@ -3512,17 +3673,18 @@ else
 
     def forward(
             self,
-            target_input_norm_xT: torch.
-            Tensor,
-            #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
-            diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
-            target_agents_past: torch.
-            Tensor,  # (B, (1+)Pnn, time_len(=past_len+1), 11)
+            target_input_norm_xT: torch.Tensor,
+            diffusion_time: torch.Tensor,
+            target_agents_past: torch.Tensor,
             target_past_cur_future_valid: torch.Tensor,
-            # (B, (1+)Pnn, 1+past_len+future_len) bool
-            cross_c: torch.Tensor,  # (B, token_num, D)
-            cross_mask: torch.Tensor,  # (B, token_num)
-            low_t_mask: Optional[torch.Tensor] = None,  # (B,) bool
+            cross_c: torch.Tensor,
+            cross_mask: torch.Tensor,
+            low_t_mask: Optional[torch.Tensor] = None,
+            # ✅ 추가
+            prev_seg_body_control_input: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn,3)
+            prev_control_valid_input: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn) bool
     ) -> torch.Tensor:
         """DiT 전체 forward 를 수행하는 진입점.
         target_input_norm_xT (input) 혹은 xT_input_flat (output)
@@ -3598,11 +3760,13 @@ else
             """
             return self._forward_x_start_branch(
                 x=x,
-                low_t_mask=low_t_mask,  # (B,)
+                low_t_mask=low_t_mask,
                 diffusion_time=diffusion_time,
-                target_agents_past=
-                target_agents_past,  # (B, (1+)Pnn, time_len, 11)
-                target_past_cur_future_valid=target_past_cur_future_valid, # (B, (1+)Pnn, time_len+future_len)
+                target_agents_past=target_agents_past,
+                target_past_cur_future_valid=target_past_cur_future_valid,
+                # ✅ 추가
+                prev_seg_body_control_input=prev_seg_body_control_input,
+                prev_control_valid_input=prev_control_valid_input,
             )
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
@@ -3799,9 +3963,9 @@ else
             )
             # CHECK
             # ---------------------------
+            # ---------------------------
             # [NEW] prev_seg_body_control / prev_control_valid 준비 (pose_based=True)
-            #  - 절대로 다시 미분/적분해서 만들지 않음
-            #  - 이미 계산된 seg control(unnorm_seg_body_control_stride)에서 "마지막 past segment"를 재사용
+            #  - stride_step>1에서도, stride로 선택된 prev 세그먼트가 "정말 유효"할 때만 prev를 켠다
             # ---------------------------
             prev_seg_body_control: Optional[torch.Tensor] = None  # (B,Pnn,3)
             prev_control_valid: Optional[torch.Tensor] = None  # (B,Pnn) bool
@@ -3815,28 +3979,38 @@ else
                                          2])  # = past_len + 1 + future_len
                 past_len = total_time_len - (1 + future_len)
 
-                # past_len>=1이면 "직전 past segment"가 존재 (index = past_len-1)
+                # past_len>=1이면 "직전 past segment"가 존재 (fine 기준 index = past_len-1)
                 if past_len >= 1 and int(past_len_ds) > 0:
-                    # prev 세그먼트 유효성: (past_last_node & current_node)
-                    prev_control_valid = (
-                            target_past_cur_future_valid[:, :, past_len-1].to(
+                    # (1) fine 기준: (past_last_node & current_node)
+                    prev_valid_fine = (
+                            target_past_cur_future_valid[:, :, past_len - 1].to(
                                 torch.bool) &
                             target_past_cur_future_valid[:, :, past_len].to(
                                 torch.bool)
                     )  # (B,Pnn)
 
+                    # (2) stride 기준: stride에서 선택된 "현재 바로 전 세그먼트" 양끝 노드가 둘 다 valid인지
+                    prev_valid_stride = self._compute_stride_prev_segment_valid_mask(
+                        near_past_cur_future_valid_stride=near_past_cur_future_valid_stride,
+                        # (B,Pnn,past_len_ds+1+T_ds)
+                        past_len_ds=int(past_len_ds),
+                    )  # (B,Pnn)
+
+                    # ✅ 최종: fine AND stride
+                    prev_control_valid = prev_valid_fine & prev_valid_stride  # (B,Pnn)
+
                     # prev 제어: 이미 만든 seg control에서 재사용
-                    # - stride_step==1 이고 past_len_ds==past_len이면 "정확히 past_len-1 segment"를 바로 쓸 수 있음
-                    # - 그 외에는 downsample timeline에서 "현재 바로 전 segment"를 안전하게 사용(리스크 최소)
+                    # - stride_step==1 && past_len_ds==past_len이면 "정확히 past_len-1 segment"를 바로 사용
+                    # - 그 외에는 stride 타임라인에서 "현재 바로 전 segment(=past_len_ds-1)"를 사용
                     if int(stride_step) == 1 and int(past_len_ds) == int(
-                            past_len) and int(
-                            unnorm_seg_body_control_stride.shape[2]) >= int(
-                            past_len):
+                            past_len) and \
+                            int(unnorm_seg_body_control_stride.shape[2]) >= int(
+                        past_len):
                         prev_seg_body_control = unnorm_seg_body_control_stride[
-                            :, :, past_len-1, :]  # (B,Pnn,3)
+                            :, :, past_len - 1, :]  # (B,Pnn,3)
                     else:
                         prev_seg_body_control = unnorm_seg_body_control_stride[
-                            :, :, int(past_len_ds)-1, :]  # (B,Pnn,3)
+                            :, :, int(past_len_ds) - 1, :]  # (B,Pnn,3)
 
                     # dtype/device 정렬
                     prev_seg_body_control = prev_seg_body_control.to(
@@ -3844,7 +4018,8 @@ else
                         dtype=unnorm_fut_seg_body_control.dtype,
                     )
                     prev_control_valid = prev_control_valid.to(
-                        device=unnorm_fut_seg_body_control.device)
+                        device=unnorm_fut_seg_body_control.device
+                    )
                 else:
                     prev_seg_body_control = None
                     prev_control_valid = None

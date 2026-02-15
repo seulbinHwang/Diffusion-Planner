@@ -1304,7 +1304,7 @@ class FeasibleProjector(nn.Module):
         return stride_step, dt_for_savgol, max_window_len_xy, max_window_len_yaw
 
     # ----------------------------
-    # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
+    # [NEW] 시간축 전체 배치로 S0/S1/S2/S3 제약 적용
     # ----------------------------
     def _apply_constraints_batch(
             self,
