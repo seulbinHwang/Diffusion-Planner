@@ -1055,21 +1055,18 @@ def _add_xy_yaw_metric_losses(
         if integrated_trajectory is not None:
             # (B,P,T,4) 기준으로 정렬(혹시 P가 다르면 score/integrated 기준으로 slice)
             P_int = int(integrated_trajectory.shape[1])
-            valid_int = target_future_valid_bool
-            if int(valid_int.shape[1]) != P_int:
-                valid_int = valid_int[:, :P_int, :]
 
             norm_gt_int = norm_target_future_gt_4_dim
             if int(norm_gt_int.shape[1]) != P_int:
                 norm_gt_int = norm_gt_int[:, :P_int, :, :]
 
-            target_future_gt_4_dim: torch.Tensor = state_normalizer.inverse(norm_gt_int, valid_int)
-            integrated_trajectory_denorm: torch.Tensor = state_normalizer.inverse(integrated_trajectory, valid_int)
+            target_future_gt_4_dim: torch.Tensor = state_normalizer.inverse(norm_gt_int, target_future_valid_bool)
+            integrated_trajectory_denorm: torch.Tensor = state_normalizer.inverse(integrated_trajectory, target_future_valid_bool)
 
             integ_xy_yaw_losses = _compute_xy_yaw_losses(
                 integrated_trajectory_denorm,
                 target_future_gt_4_dim,
-                valid_int,
+                target_future_valid_bool,
                 prefix="integration_loss",
             )
             loss_dict.update(integ_xy_yaw_losses)
@@ -1258,9 +1255,12 @@ def diffusion_loss_func(
     ego_future_gt_4_dim = norm_outputs["ego_future_gt_4_dim"]
     # (B, Pnn, future_len, 4)
     near_future_gt_4_dim = norm_outputs["near_future_gt_4_dim"]
-    norm_target_future_gt_4_dim = torch.cat([
-         ego_future_gt_4_dim.unsqueeze(1), near_future_gt_4_dim
-    ], dim=1)  # (B, (1+)Pnn, future_len, 4)
+    if args.do_ego_predict:
+        norm_target_future_gt_4_dim = torch.cat([
+             ego_future_gt_4_dim.unsqueeze(1), near_future_gt_4_dim
+        ], dim=1)  # (B, (1+)Pnn, future_len, 4)
+    else:
+        norm_target_future_gt_4_dim = near_future_gt_4_dim
 
     # norm_near_current_4_dim : (B, Pnn, 4)
     norm_near_current_4_dim = norm_inputs["near_agents_past"][:, :, -1, :4]

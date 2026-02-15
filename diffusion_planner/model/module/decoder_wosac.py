@@ -2674,6 +2674,102 @@ class DiT(nn.Module):
             f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}"
         )
 
+    @torch.no_grad()
+    def _compute_vel_baseline_dit_returns(
+        self,
+        diffusion_control_traj: torch.Tensor,          # (B, Pnn, future_len, 3)
+        target_past_11_dim: torch.Tensor,              # (B, Pnn, past_len, 11)
+        target_past_cur_future_valid: torch.Tensor,    # (B, Pnn, past_len+1+future_len)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """low_t_mask=False에서도 integrated_trajectory를 0으로 두지 않기 위한 baseline을 만듭니다.
+
+        baseline 정의:
+            - 예측한 control(바디 기준 vx, vy, yaw_rate)을 그대로 적분해서
+              (x, y, cos(yaw), sin(yaw)) 궤적을 만듭니다.
+            - 어떤 보정도 하지 않으므로 constraint_diff는 기본적으로 0입니다.
+            - 학습에 불필요하게 영향을 주지 않도록, 계산 그래프를 만들지 않습니다(no_grad).
+
+        Args:
+            diffusion_control_traj:
+                (B, Pnn, future_len, 3)
+                예측 control 시퀀스(현재 코드 흐름 기준으로 normalizer를 그대로 거칩니다).
+            target_past_11_dim:
+                (B, Pnn, past_len, 11)
+                현재 상태를 얻기 위해 past의 마지막을 사용합니다.
+            target_past_cur_future_valid:
+                (B, Pnn, past_len+1+future_len) bool/0-1
+                노드 유효 표시. 여기서 현재~미래(1+future_len)만 잘라 씁니다.
+
+        Returns:
+            integrated_trajectory:
+                (B, Pnn, future_len, 4)  (정규화된 상태 표현)
+            control_constraint_diff:
+                (B, Pnn, future_len, 3)  (정규화된 diff, 보정이 없어서 보통 0)
+        """
+        B, Pnn, future_len, _ = diffusion_control_traj.shape
+        device = diffusion_control_traj.device
+
+        # past_len이 없으면 현재 상태를 못 잡으니 안전하게 0 반환
+        past_len = int(target_past_11_dim.shape[2])
+        if past_len <= 0:
+            integrated_zeros = diffusion_control_traj.new_zeros((B, Pnn, future_len, 4))
+            diff_zeros = diffusion_control_traj.new_zeros((B, Pnn, future_len, 3))
+            return integrated_zeros, diff_zeros
+
+        valid_all = target_past_cur_future_valid.to(torch.bool)  # (B,Pnn, past_len+1+future_len)
+        cur_future_valid = valid_all[:, :, -(1 + future_len):]    # (B,Pnn, 1+T)
+        cur_valid = cur_future_valid[:, :, 0]                     # (B,Pnn)
+        future_valid = cur_future_valid[:, :, 1:]                 # (B,Pnn, T)
+
+        # (B,Pnn,4) 현재 상태(여기선 past의 마지막)
+        near_current_state = target_past_11_dim[:, :, -1, :4].float()
+        unnorm_near_current_state = self.config.state_normalizer(
+            data=near_current_state,          # (B,Pnn,4)
+            valid_mask=cur_valid,             # (B,Pnn)
+        )  # (B,Pnn,4)
+
+        # control도 기존 core_vel과 동일 흐름을 따름
+        temp_dict = {"seg_body_control": diffusion_control_traj.detach().float()}
+        norm_temp_dict = self.config.observation_normalizer(temp_dict)
+        unnorm_control = norm_temp_dict["seg_body_control"]  # (B,Pnn,T,3)
+
+        vx_b = unnorm_control[..., 0]     # (B,Pnn,T)
+        vy_b = unnorm_control[..., 1]     # (B,Pnn,T)
+        omega = unnorm_control[..., 2]    # (B,Pnn,T)
+
+        # 보정 없이 적분만 수행
+        key_to_all_states = self.feasible_projector._integrate_midpoint_batch(
+            unnorm_near_current_state=unnorm_near_current_state,  # (B,Pnn,4)
+            vx_b_seq=vx_b,                                        # (B,Pnn,T)
+            vy_b_seq=vy_b,                                        # (B,Pnn,T)
+            omega_seq=omega,                                      # (B,Pnn,T)
+            dt=float(self.feasible_projector.constraints_h_params.dt),
+            eps=float(self.feasible_projector.constraints_h_params.eps),
+        )
+
+        unnorm_integrated, unnorm_diff = self.feasible_projector._assemble_outputs(
+            key_to_all_states=key_to_all_states,
+            vx_b_raw=vx_b,
+            vy_b_raw=vy_b,
+            omega_raw=omega,
+            near_cur_future_valid=cur_future_valid,               # (B,Pnn,1+T)
+        )  # (B,Pnn,T,4), (B,Pnn,T,3)
+
+        # DiTReturns 형식에 맞게 정규화 + 미래 유효만 남김
+        integrated_trajectory = self.config.state_normalizer(
+            data=unnorm_integrated,        # (B,Pnn,T,4)
+            valid_mask=future_valid,       # (B,Pnn,T)
+        )  # (B,Pnn,T,4)
+
+        temp_dict2 = {"seg_body_control": unnorm_diff}
+        norm_temp_dict2 = self.config.observation_normalizer(temp_dict2)
+        control_constraint_diff = norm_temp_dict2["seg_body_control"]  # (B,Pnn,T,3)
+        control_constraint_diff = control_constraint_diff.masked_fill(
+            ~future_valid.unsqueeze(-1), 0.0
+        )
+
+        return integrated_trajectory, control_constraint_diff
+
 
     @staticmethod
     def _unpad_input_with_valid_mask(
@@ -3923,67 +4019,55 @@ else
 
     def _feasible_projection_vel(
             self,
-            diffusion_control_traj: torch.Tensor,  # # (B, (1+)Pnn, future_len, 3)
-            target_agents_past: torch.Tensor,
-            # (B, (1+)Pnn, time_len, 11)
-            target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
-            target_past_cur_future_valid: torch.Tensor,
-            # (B, (1+)Pnn, time_len(=1+past_len) + future_len) bool
-            low_t_mask: torch.Tensor,  # (B, )
+            diffusion_control_traj: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
+            target_past_11_dim: torch.Tensor,      # (B, (1+)Pnn, past_len, 11)
+            target_class_one_hot: torch.Tensor,    # (B, (1+)Pnn, 3)
+            target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, time_len_total)
+            low_t_mask: torch.Tensor,              # (B,)
     ) -> None:
         B, Pnn, future_len, _ = diffusion_control_traj.shape
         device = diffusion_control_traj.device
 
-        # [B] -> bool 로 정리
         low_t_mask = low_t_mask.to(device=device)
-        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (
-                low_t_mask > 0.5)
+        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (low_t_mask > 0.5)
 
-        # 기본값:
-        #   - integrated_trajectory: 원 궤적(x_start) 그대로 (t=1..future_len)
-        #   - control_constraint_diff: 전부 0
-        # diffusion_trajectory 는 정규화 상태라고 가정
-        base_integrated = diffusion_control_traj.new_zeros(
-            (B, Pnn, future_len, 4))
-        base_constraint = diffusion_control_traj.new_zeros(
-            (B, Pnn, future_len, 3))  # (B,Pnn,future_len,3)
+        # ✅ 핵심 변경:
+        # low_t_mask=False인 경우에도 integrated_trajectory가 0이 아니도록,
+        # "예측 control을 그대로 적분한 baseline"을 기본값으로 채워 둔다.
+        base_integrated, base_constraint = self._compute_vel_baseline_dit_returns(
+            diffusion_control_traj=diffusion_control_traj,                # (B,Pnn,T,3)
+            target_past_11_dim=target_past_11_dim,                        # (B,Pnn,past_len,11)
+            target_past_cur_future_valid=target_past_cur_future_valid,    # (B,Pnn,time_len_total)
+        )  # (B,Pnn,T,4), (B,Pnn,T,3)
 
-        # 실제로 FeasibleProjector를 돌릴 배치 인덱스 선택
-        active_idx = torch.nonzero(low_t_mask_bool,
-                                   as_tuple=False).squeeze(-1)  # (N_active,)
+        active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(-1)  # (N_active,)
 
-        # low-t 샘플이 없으면:
-        #  - 출력은 base로 유지
-        #  - DDP unused 방지용 touch만 더해 둔다(값 변화 없음)
+        # low-t 샘플이 없으면 baseline 그대로
         if int(active_idx.numel()) == 0:
             self.norm_dit_returns = DiTReturns(
-                integrated_trajectory=base_integrated,  # (B,Pnn,future_len,4)
-                control_constraint_diff=base_constraint,  # (B,Pnn,future_len,3)
+                integrated_trajectory=base_integrated,
+                control_constraint_diff=base_constraint,
             )
             return
 
-        # ---- active subset만 projector 파이프라인 실행 ----
+        # ---- active subset만 기존 projector 파이프라인 실행 ----
         self._feasible_projection_core_vel(
-            diffusion_control_traj[active_idx], # (B, (1+)Pnn, future_len, 3)
-            target_class_one_hot[active_idx], # (B, (1+)Pnn, 3)
-            target_past_cur_future_valid[active_idx], # (B, (1+)Pnn, time_len(=1+past_len) + future_len)
-            target_agents_past[active_idx] # (B, (1+)Pnn, time_len, 11)
+            diffusion_control_traj[active_idx],      # (N_active,Pnn,future_len,3)
+            target_class_one_hot[active_idx],
+            target_past_cur_future_valid[active_idx],
+            target_past_11_dim[active_idx],
         )
 
-        # `_feasible_projection_core` 은 서브 배치 기준으로 self.norm_dit_returns 를 채운다.
-        integ_active = self.norm_dit_returns.integrated_trajectory  # (N_active,Pnn,future_len,4)
-        const_active = self.norm_dit_returns.control_constraint_diff  # (N_active,Pnn,future_len,3)
+        integ_active = self.norm_dit_returns.integrated_trajectory          # (N_active,Pnn,future_len,4)
+        const_active = self.norm_dit_returns.control_constraint_diff        # (N_active,Pnn,future_len,3)
 
-        # dtype 맞추기
-        integ_active = integ_active.to(device=device,
-                                       dtype=base_integrated.dtype)
-        const_active = const_active.to(device=device,
-                                       dtype=base_constraint.dtype)
+        integ_active = integ_active.to(device=device, dtype=base_integrated.dtype)
+        const_active = const_active.to(device=device, dtype=base_constraint.dtype)
 
-        # ✅ 핵심: in-place 대입이 아니라 "새 텐서"를 만들어서 연결 유지
         integrated_all = base_integrated.index_copy(0, active_idx, integ_active)
         constraint_all = base_constraint.index_copy(0, active_idx, const_active)
+
         self.norm_dit_returns = DiTReturns(
-            integrated_trajectory=integrated_all,  # (B,Pnn,future_len,4)
-            control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
+            integrated_trajectory=integrated_all,        # (B,Pnn,future_len,4)
+            control_constraint_diff=constraint_all,      # (B,Pnn,future_len,3)
         )

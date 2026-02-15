@@ -272,7 +272,7 @@ def get_args():
     parser.add_argument('--feasible_learn_noise_thresh',
                         type=float,
                         help='feasible_learn_noise_thresh',
-                        default=0.3)
+                        default=0.26)
     parser.add_argument('--normalization_file_path',
                         default='normalization.json',
                         help='filepath of normalization.json',
@@ -296,7 +296,7 @@ def get_args():
             "True이면 agent_route_lane_order를 dataset/배치에 포함합니다. "
             "학습에서 사용하지 않으면 False로 두면 CPU/RAM 사용을 줄일 수 있습니다."
         ),
-    )
+    ) # use_past_for_feasible = True / use_past_dit_input = True
 
     parser.add_argument('--use_fallback', default=False, type=boolean)
     parser.add_argument('--pin_mem', default=True, type=boolean)
