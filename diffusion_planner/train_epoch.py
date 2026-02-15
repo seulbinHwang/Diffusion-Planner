@@ -816,11 +816,6 @@ def _compute_loss_dict(
     )
     w_dir, w_int, w_const = FeasibleProjector.loss_weights_by_progress(
         progress, args)
-
-    if not args.use_direct_loss:
-        w_dir = 0.0
-        w_int = 1.0
-
     # 진행도/가중치 기록(평균 로그용)
     loss_dict["learn_progress"] = torch.tensor(float(progress),
                                                device=next(

@@ -309,7 +309,6 @@ def get_args():
     parser.add_argument('--use_past_dit_input', default=True, type=boolean)
     parser.add_argument('--use_current_input', default=True, type=boolean)
     parser.add_argument('--feasible_grad_to_dit', default=False, type=boolean)
-    parser.add_argument('--use_direct_loss', default=True, type=boolean)
     parser.add_argument('--use_huber_loss', default=True, type=boolean)
     parser.add_argument('--profile_feasible', default=False, type=boolean)
     parser.add_argument('--use_vel_input', default=False, type=boolean)
@@ -659,11 +658,6 @@ def get_args():
     args = parser.parse_args()
     # ★ stage config(json/yaml)로 CLI 인자 덮어쓰기
     args = _override_args_with_stage_config(args)
-    if not args.use_direct_loss:
-        assert not args.use_guidance and not args.use_feasible_blend, \
-            "use_direct_loss가 False인 경우, use_guidance와 use_feasible_blend는 모두 False여야 합니다."
-        assert args.feasible_grad_to_dit, \
-            "use_direct_loss가 False인 경우, feasible_grad_to_dit는 True여야 합니다."
     args.state_normalizer = StateNormalizer.from_json(args)
     args.observation_normalizer = ObservationNormalizer.from_json(args)
 
