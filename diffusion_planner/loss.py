@@ -652,13 +652,13 @@ def _normalize_futures_and_build_xT(
         invalid_future, 0.0)
 
     # target_seq_norm_xT: (B, (1+)Pnn, 1+future_len, 4) or (B, (1+)Pnn, future_len, 3)
-    if normed_target_cur_seq_gt is None:
-        target_seq_norm_xT = target_future_noise_xT
-    else:
+    if normed_target_cur_seq_gt is not None:
         target_seq_norm_xT: torch.Tensor = torch.cat(
             [normed_target_cur_seq_gt, target_future_noise_xT],
             dim=2,
         )
+    else:
+        target_seq_norm_xT = target_future_noise_xT
 
     invalid_cur_future = (~target_seq_is_valid_bool).unsqueeze(
         -1)  # (B, (1+)Pnn, 1+future_len or future_len, 1)
@@ -720,11 +720,11 @@ def _forward_model_with_autocast(
 def _extract_score_from_decoder(future_len: int,
     decoder_output: Dict[str, torch.Tensor],) -> torch.Tensor:
     """decoder_output 에서 미래 score 만 꺼내고 모양을 확인한다.
-
+        # (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
     Args:
         decoder_output: model(...) 의 두 번째 반환 dict.
     Returns:
-        score: # (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
+        score: (B, (1+)Pnn, future_len, 4) 또는 (B, (1+)Pnn, future_len, 3)
     """
     # decoder_output["score"]: (B, one_or_Pnn, 1+future_len, 4)
     score: torch.Tensor = decoder_output[
@@ -916,13 +916,13 @@ def _add_xy_yaw_metric_losses(
         else:
             # score_denorm: (B, (1+)Pnn, T, 3)
             temp_dict = {"seg_body_control": score}
-            norm_temp_dict = observation_normalizer.inverse(temp_dict)
-            score_denorm = norm_temp_dict["seg_body_control"]
+            denorm_temp_dict = observation_normalizer.inverse(temp_dict)
+            score_denorm = denorm_temp_dict["seg_body_control"]
             # target_future_gt: (B, (1+)Pnn, T, 3)
             temp_dict = {"seg_body_control": normed_target_future_seq_gt}
-            norm_temp_dict = observation_normalizer.inverse(
+            denorm_temp_dict = observation_normalizer.inverse(
                 temp_dict)
-            target_future_gt = norm_temp_dict["seg_body_control"]
+            target_future_gt = denorm_temp_dict["seg_body_control"]
             # (1) score 기준 xy/yaw 오차
             vxy_yaw_losses = _compute_vxy_yaw_losses(
                 score_denorm,  # (B, (1+)Pnn, T,  3)
@@ -1162,6 +1162,8 @@ def diffusion_loss_func(
                 "past_future_seg_control_gt_3_dim"]
         # past_seq_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
         past_seq_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
+        if not args.do_ego_predict:
+            past_seq_control_gt_3_dim = past_seq_control_gt_3_dim[:, :, 1:, :]
         # (B, (1+)Pnn, future_len, 3)
         future_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, -future_len:, :]
         (
@@ -1235,7 +1237,7 @@ def diffusion_loss_func(
     dpm_loss: torch.Tensor = _compute_dpm_loss(
         args=args,
         model_type=model_type,
-        score=score, # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, T, 3)
+        score=score, # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, future_len, 3)
         std=std,  # (B, 1, 1, 1)
         random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4 or 3)
         normed_target_future_seq_gt=
