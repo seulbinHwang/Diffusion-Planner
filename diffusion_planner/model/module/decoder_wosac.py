@@ -528,11 +528,12 @@ class Decoder(nn.Module):
         - 최종적으로 Decoder가 리턴하는 score는 항상 (B, Pnn, 1+T, 4) 형태가 되도록 맞춥니다.
 
         Args:
-            score_flat: DiT 출력(flat).
-                pose_based
-                    (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-                else
-                    (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+            score_flat / xT_input_flat
+            if pose_based
+                (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+            else
+                (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
+
             target_current_xyyaw: 현재 상태(정규화).
                 shape: (B, Pnn, 4)
 
@@ -553,6 +554,7 @@ class Decoder(nn.Module):
                 # 마지막 (1+T)만 사용: (B, Pnn, 1+T, 4)
                 score_cur_future = score_cur_future[:, :,
                 -(1 + self._future_len):, :]
+                score_cur_future[:, :, 0, :] = target_current_xyyaw
             else:
                 score_cur_future = score_flat.reshape(
                     B,
@@ -1162,20 +1164,23 @@ class Decoder(nn.Module):
             self,
             x_flat: torch.Tensor,
             # (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (past_len + future_len)*3)
-            target_past_cur_future_valid: torch.Tensor,  # (B, P, T_all)
+            target_past_cur_future_valid: torch.Tensor,   # (B, (1+)Pnn, time_len + future_len)
     ) -> torch.Tensor:
+        """ xT_input_flat
+        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, (future_len)*4)
+        (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
+        """
         """flat 형태(F=시간*4) 텐서에서 무효 시간 칸을 0으로 정리합니다.
 
         Args:
-            x_flat (torch.Tensor):
-                shape: (B, P, F), F는 4의 배수
             target_past_cur_future_valid (torch.Tensor):
-                shape: (B, P, T_all), True=유효 / False=무효
+                shape:  # (B, (1+)Pnn, time_len + future_len), True=유효 / False=무효
 
         Returns:
             torch.Tensor:
                 shape: (B, P, F), 무효 칸은 0
         """
+
         B, P, F = x_flat.shape
         if self.config.pose_based:
             S: int = int(F // 4) # S: (time_len + future_len) or 1+future_len or future_len
@@ -1187,6 +1192,8 @@ class Decoder(nn.Module):
         else:
             S: int = int(F // 3) # S: (past_len + future_len) or future_len
             x_seq = x_flat.reshape(B, P, S, 3)
+            # (B, P, T_all)
+            # # (B, (1+)Pnn, time_len + future_len), True=유효 / False=무효
             target_past_future_seg_valid = (
                         target_past_cur_future_valid[..., :-1] & target_past_cur_future_valid[
                     ... , 1:])  # (B, P, past_len + future_len)
@@ -1861,9 +1868,9 @@ class Decoder(nn.Module):
             inputs: Dict[str, torch.Tensor],
             scene_encoding_token: torch.Tensor,
             scene_encoding_token_mask: torch.Tensor,
-            target_agents_past: torch.Tensor,  # (B, (1+)Pnn, (time_len, 11)
+            target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
             target_seq_past: torch.Tensor,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-            target_past_cur_future_valid: torch.Tensor,
+            target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, time_len + future_len)
             batch_size: int,
             one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
@@ -1876,17 +1883,22 @@ class Decoder(nn.Module):
 
         # 1) DiT 입력 준비 (flatten + 목표점 주입 옵션)
         """ xT_input_flat
-        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (past_len + future_len)*3)
+        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, (future_len)*4)
+        (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
         """
         xT_input_flat = self._build_training_dit_inputs(
             inputs=inputs,
             target_seq_past=target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
         )
 
+        """ xT_input_flat (input / output)
+        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, (future_len)*4)
+        (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
+        """
         # ✅ 추가: DiT 입력에서도 무효 타임스텝 0 처리(실수로 downstream에서 쓰여도 안전)
         xT_input_flat = self._mask_invalid_timesteps_in_flat_xyyaw(
             x_flat=xT_input_flat,
-            target_past_cur_future_valid=target_past_cur_future_valid,
+            target_past_cur_future_valid=target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
         )
         # ✅ (B) diffusion_time: 미리 GPU float32로 맞춤 (DiT 내부 .to()가 no-op 되도록)
         diffusion_time = _prepare_diffusion_time_for_dit(
@@ -1909,7 +1921,6 @@ class Decoder(nn.Module):
         score_flat: torch.Tensor = self.dit(
             target_input_norm_xT=
             xT_input_flat,
-            # (B, (1+)Pnn, F) #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
             diffusion_time=diffusion_time,  # (B,)  or (B, future_len)
             target_agents_past=target_agents_past,
             # # (B, (1+)Pnn, time_len, 11)
@@ -2501,10 +2512,10 @@ class Decoder(nn.Module):
                 inputs=inputs,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
-                target_agents_past=target_agents_past,
+                target_agents_past=target_agents_past, # (B, (1+)Pnn, time_len, 11)
                 target_seq_past=
                 target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-                target_past_cur_future_valid=target_past_cur_future_valid,
+                target_past_cur_future_valid=target_past_cur_future_valid, # (B, (1+)Pnn, time_len + future_len)
                 batch_size=batch_size,
                 one_or_Pnn=one_or_Pnn,
             )
