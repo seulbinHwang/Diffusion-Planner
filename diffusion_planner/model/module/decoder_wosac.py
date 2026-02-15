@@ -3314,12 +3314,10 @@ class DiT(nn.Module):
             )
         else:
             # CHECK
-            target_current_xyyaw_for_feasible = target_current_xyyaw.float()
             B, one_Pnn, F = x.shape
             x = x.reshape(B, one_Pnn, -1, 3)  # (B, (1+)Pnn, L, 3)
             future_len = int(self.config.future_len)
             seq_len = int(x.shape[2])
-
             # diffusion_control_traj: (B, (1+)Pnn, future_len, 3)
             diffusion_control_traj = x[:, :, -future_len:, :]
 
@@ -3368,6 +3366,7 @@ class DiT(nn.Module):
                 # (B,(1+)Pnn,3) or None (정규화)
                 prev_control_valid=prev_control_valid,  # (B,(1+)Pnn) or None
             )
+        # CHECK END
         return x
 
     def _compute_target_current_valid(
@@ -3798,6 +3797,7 @@ else
                 future_len_full=future_len,  # int
                 stride_step=stride_step,  # int
             )
+            # CHECK
             # ---------------------------
             # [NEW] prev_seg_body_control / prev_control_valid 준비 (pose_based=True)
             #  - 절대로 다시 미분/적분해서 만들지 않음
@@ -3848,7 +3848,7 @@ else
                 else:
                     prev_seg_body_control = None
                     prev_control_valid = None
-
+            # CHECK END
             # --- (5) 제약 기반 필터 + 적분 ---
             target_cur_future_valid = target_past_cur_future_valid[:, :, -(
                     1 + future_len):]  # (B, Pnn, 1+future_len) bool
@@ -3893,7 +3893,7 @@ else
             )
 
 
-    # : stride 기반 down/up 샘플링을 통합한 새 파이프라인
+    # # CHECK
     def _feasible_projection_core_vel(
             self,
             diffusion_control_traj: torch.Tensor,
@@ -3925,15 +3925,16 @@ else
             target_past_11_dim = target_past_11_dim.float()
             near_current_state = target_past_11_dim[:, :, -1, :4]  # (B,Pnn,4)
 
-            unnorm_near_current_state = self.config.state_normalizer(
+            # unnorm_near_current_state: (B,Pnn,4)
+            unnorm_near_current_state = self.config.state_normalizer.inverse(
                 data=near_current_state,
                 valid_mask=target_cur_valid,
             )
 
             # (정규화) -> (비정규화) future 제어
             temp_dict = {"seg_body_control": diffusion_control_traj}
-            norm_temp_dict = self.config.observation_normalizer(temp_dict)
-            unnorm_diffusion_control_traj = norm_temp_dict[
+            unnorm_temp_dict = self.config.observation_normalizer.inverse(temp_dict)
+            unnorm_diffusion_control_traj = unnorm_temp_dict[
                 "seg_body_control"]  # (B,Pnn,T,3)
 
             # (정규화) -> (비정규화) prev 제어(있을 때만)
@@ -3943,7 +3944,7 @@ else
                     "seg_body_control": prev_seg_body_control.float().unsqueeze(
                         2)}  # (B,Pnn,1,3)
                 unnorm_prev_seg_body_control = \
-                self.config.observation_normalizer(tmp_prev)[
+                self.config.observation_normalizer.inverse(tmp_prev)[
                     "seg_body_control"].squeeze(2)  # (B,Pnn,3)
 
             target_cur_future_valid = target_past_cur_future_valid[
@@ -3958,9 +3959,9 @@ else
                     unnorm_integrated_trajectory,
                     unnorm_control_constraint_diff,
                 ) = self.feasible_projector.filter_and_integrate(
-                    unnorm_near_current_state,
-                    target_cur_future_valid,
-                    unnorm_diffusion_control_traj,
+                    unnorm_near_current_state, # (B,Pnn,4)
+                    target_cur_future_valid, # (B,Pnn,1+T)
+                    unnorm_diffusion_control_traj, # (B,Pnn,T,3)
                     target_class_one_hot,
                     prev_seg_body_control=unnorm_prev_seg_body_control,
                     # (B,Pnn,3) or None
@@ -4116,6 +4117,7 @@ else
             control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
         )
 
+    # CHECK
     def _feasible_projection_vel(
             self,
             diffusion_control_traj: torch.Tensor,
@@ -4163,8 +4165,8 @@ else
             target_class_one_hot[active_idx],
             target_past_cur_future_valid[active_idx],
             target_past_11_dim[active_idx],
-            prev_seg_body_control=prev_seg_body_control_active,
-            prev_control_valid=prev_control_valid_active,
+            prev_seg_body_control=prev_seg_body_control_active, # (N_active,Pnn,3)
+            prev_control_valid=prev_control_valid_active, # (N_active,Pnn)
         )
 
         integ_active = self.norm_dit_returns.integrated_trajectory

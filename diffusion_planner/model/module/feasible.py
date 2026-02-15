@@ -1337,6 +1337,7 @@ class FeasibleProjector(nn.Module):
         )
 
         # (S2) prev 포함
+        # CHECK
         if prev_seg_body_control is not None and prev_apply_mask is not None and bool(
                 prev_apply_mask.any()):
             vx_after, vy_after, omega_after = self._apply_S2_accel_alpha_limits_ste_batch_with_prev(
@@ -1362,7 +1363,7 @@ class FeasibleProjector(nn.Module):
                 eta=float(hp.eta_inc),
                 eps=float(hp.eps),
             )
-
+        # CHECK END
         omega_after = self._apply_S3_omega_clip_ste(
             vx_b=vx_after,
             vy_b=vy_after,
@@ -3786,6 +3787,7 @@ class FeasibleProjector(nn.Module):
         out_diff = out_diff_flat.view(B, Pnn, T, 3)  # (B, Pnn, T, 3)
         return out_traj, out_diff
 
+    # CHECK
     def _should_use_prev_for_s2(
             self,
             prev_seg_body_control: Optional[torch.Tensor],
@@ -3908,6 +3910,8 @@ class FeasibleProjector(nn.Module):
 
         return vx_ext_out[..., 1:], vy_ext_out[..., 1:], w_ext_out[..., 1:]
 
+    # CHECK END
+    # CHECK
     def filter_and_integrate(
             self,
             unnorm_near_current_state: torch.Tensor,  # (B,Pnn,4)
@@ -4001,7 +4005,7 @@ class FeasibleProjector(nn.Module):
             dtype=dtype,
         )
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff
-
+    # CHECK END
     # ================================================================
     # [REFACTOR] Savitzky–Golay 유틸들 (모두 torch-only, 미분 가능)
     # ================================================================
@@ -4044,7 +4048,7 @@ class FeasibleProjector(nn.Module):
     # 지우개: 예전 `_compute_world_linear_velocity_via_sg` 구현은
     #        x, y를 각각 단일 채널 SG에 넣어 두 번 호출하던 코드입니다.
     #        해당 본문 전체를 지우고 아래 새 구현으로 교체하세요.
-
+    # CHECK
     def _filter_and_integrate_batch(
             self,
             unnorm_near_current_state: torch.Tensor,
@@ -4101,7 +4105,7 @@ class FeasibleProjector(nn.Module):
             omega_raw=omega_raw,
             near_cur_future_valid=near_cur_future_valid,
         )
-
+    # CHECK END
     def _compute_world_linear_velocity_via_sg(
         self,
         x: torch.Tensor,  # (B, Pnn, point_len)
