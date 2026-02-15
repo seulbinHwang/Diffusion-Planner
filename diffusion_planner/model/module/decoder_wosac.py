@@ -3313,26 +3313,60 @@ class DiT(nn.Module):
                 low_t_mask=low_t_mask,  # (B,)
             )
         else:
-            # (B, (1+)Pnn, 4)
+            # CHECK
             target_current_xyyaw_for_feasible = target_current_xyyaw.float()
-            """ x # x_for_feasible
-        pose_based:
-            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-        else:
-            (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
-            """
             B, one_Pnn, F = x.shape
-            x_4_ndim = x.reshape(B, one_Pnn, -1, 3) # (B, (1+)Pnn, (past_len + T) ,3) or (B, (1+)Pnn, T,3)
+            x = x.reshape(B, one_Pnn, -1, 3)  # (B, (1+)Pnn, L, 3)
+            future_len = int(self.config.future_len)
+            seq_len = int(x.shape[2])
+
             # diffusion_control_traj: (B, (1+)Pnn, future_len, 3)
-            diffusion_control_traj = x_4_ndim[:, :, -self.config.future_len:, :]
+            diffusion_control_traj = x[:, :, -future_len:, :]
+
+            # ---------------------------
+            # [NEW] prev_seg_body_control / prev_control_valid 준비
+            # ---------------------------
+            prev_seg_body_control: Optional[torch.Tensor] = None  # (B, (1+)Pnn, 3)
+            prev_control_valid: Optional[torch.Tensor] = None  # (B, (1+)Pnn) bool
+
+            use_prev = bool(
+                getattr(self.config, "use_past_for_feasible", False)) and \
+                       bool(getattr(self.config, "use_past_dit_input", False))
+
+            if use_prev:
+                # seq_len이 future_len+1 이상이면 "마지막 past 세그먼트"가 존재
+                if seq_len >= future_len + 1:
+                    prev_seg_body_control = x[
+                        :, :, -(future_len + 1), :]  # (B,(1+)Pnn,3)
+
+                    # prev 세그먼트 유효성: (past_last_node & current_node)
+                    total_time_len = int(target_past_cur_future_valid.shape[2])
+                    past_len = total_time_len - (1 + future_len)
+
+                    if past_len >= 1:
+                        prev_control_valid = (
+                                target_past_cur_future_valid[:, :, past_len - 1].to(
+                                    torch.bool) &
+                                target_past_cur_future_valid[:, :, past_len].to(
+                                    torch.bool)
+                        )  # (B,(1+)Pnn)
+                    else:
+                        prev_seg_body_control = None
+                        prev_control_valid = None
+                else:
+                    prev_seg_body_control = None
+                    prev_control_valid = None
+
             self._feasible_projection_vel(
-                diffusion_control_traj=diffusion_control_traj,  # (B, (1+)Pnn, future_len, 3)
-                target_agents_past=target_agents_past,  # (B,(1+)Pnn,time_len,11)
+                diffusion_control_traj=diffusion_control_traj,
+                # (B,(1+)Pnn,future_len,3) (정규화)
+                target_past_11_dim=target_past_11_dim,  # (B,(1+)Pnn,past_len,11)
                 target_class_one_hot=target_class_one_hot,  # (B,(1+)Pnn,3)
-                target_past_cur_future_valid=
-                target_past_cur_future_valid,
-                # (B, (1+)Pnn, time_len+future_len)
-                low_t_mask=low_t_mask,  # (B,)
+                target_past_cur_future_valid=target_past_cur_future_valid,
+                low_t_mask=low_t_mask,
+                prev_seg_body_control=prev_seg_body_control,
+                # (B,(1+)Pnn,3) or None (정규화)
+                prev_control_valid=prev_control_valid,  # (B,(1+)Pnn) or None
             )
         return x
 
@@ -3764,6 +3798,57 @@ else
                 future_len_full=future_len,  # int
                 stride_step=stride_step,  # int
             )
+            # ---------------------------
+            # [NEW] prev_seg_body_control / prev_control_valid 준비 (pose_based=True)
+            #  - 절대로 다시 미분/적분해서 만들지 않음
+            #  - 이미 계산된 seg control(unnorm_seg_body_control_stride)에서 "마지막 past segment"를 재사용
+            # ---------------------------
+            prev_seg_body_control: Optional[torch.Tensor] = None  # (B,Pnn,3)
+            prev_control_valid: Optional[torch.Tensor] = None  # (B,Pnn) bool
+
+            use_prev = bool(
+                getattr(self.config, "use_past_for_feasible", False)) and \
+                       bool(getattr(self.config, "use_past_dit_input", False))
+
+            if use_prev:
+                total_time_len = int(target_past_cur_future_valid.shape[
+                                         2])  # = past_len + 1 + future_len
+                past_len = total_time_len - (1 + future_len)
+
+                # past_len>=1이면 "직전 past segment"가 존재 (index = past_len-1)
+                if past_len >= 1 and int(past_len_ds) > 0:
+                    # prev 세그먼트 유효성: (past_last_node & current_node)
+                    prev_control_valid = (
+                            target_past_cur_future_valid[:, :, past_len - 1].to(
+                                torch.bool) &
+                            target_past_cur_future_valid[:, :, past_len].to(
+                                torch.bool)
+                    )  # (B,Pnn)
+
+                    # prev 제어: 이미 만든 seg control에서 재사용
+                    # - stride_step==1 이고 past_len_ds==past_len이면 "정확히 past_len-1 segment"를 바로 쓸 수 있음
+                    # - 그 외에는 downsample timeline에서 "현재 바로 전 segment"를 안전하게 사용(리스크 최소)
+                    if int(stride_step) == 1 and int(past_len_ds) == int(
+                            past_len) and int(
+                            unnorm_seg_body_control_stride.shape[2]) >= int(
+                            past_len):
+                        prev_seg_body_control = unnorm_seg_body_control_stride[
+                            :, :, past_len - 1, :]  # (B,Pnn,3)
+                    else:
+                        prev_seg_body_control = unnorm_seg_body_control_stride[
+                            :, :, int(past_len_ds) - 1, :]  # (B,Pnn,3)
+
+                    # dtype/device 정렬
+                    prev_seg_body_control = prev_seg_body_control.to(
+                        device=unnorm_fut_seg_body_control.device,
+                        dtype=unnorm_fut_seg_body_control.dtype,
+                    )
+                    prev_control_valid = prev_control_valid.to(
+                        device=unnorm_fut_seg_body_control.device)
+                else:
+                    prev_seg_body_control = None
+                    prev_control_valid = None
+
             # --- (5) 제약 기반 필터 + 적분 ---
             target_cur_future_valid = target_past_cur_future_valid[:, :, -(
                     1 + future_len):]  # (B, Pnn, 1+future_len) bool
@@ -3782,6 +3867,9 @@ else
                     target_cur_future_valid,  # (B, Pnn, 1+future_len) bool
                     unnorm_fut_seg_body_control,  # (B, Pnn, future_len, 3)
                     target_class_one_hot,  # (B, Pnn, 3)
+                    prev_seg_body_control=prev_seg_body_control,
+                    # ✅ (B,Pnn,3) or None
+                    prev_control_valid=prev_control_valid,  # ✅ (B,Pnn) or None
                 )
             # 정규화해서 DiTReturns 로 저장
             target_future_valid = target_cur_future_valid[:, :,
@@ -3808,63 +3896,75 @@ else
     # : stride 기반 down/up 샘플링을 통합한 새 파이프라인
     def _feasible_projection_core_vel(
             self,
-            diffusion_control_traj: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
+            diffusion_control_traj: torch.Tensor,
+            # (B, (1+)Pnn, future_len, 3) (정규화)
             target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
             target_past_cur_future_valid: torch.Tensor,
-            # (B, (1+)Pnn, time_len=1+past_len+future_len) bool
-            target_agents_past:  torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
+            target_past_11_dim: torch.Tensor,  # (B, (1+)Pnn, past_len, 11)
+            prev_seg_body_control: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn,3) (정규화)
+            prev_control_valid: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn) bool
     ) -> None:
         device_type: str = diffusion_control_traj.device.type
-        use_profile: bool = bool(getattr(self.config, "profile_feasible",
-                                         False))
+        use_profile: bool = bool(
+            getattr(self.config, "profile_feasible", False))
 
-        # Feasible 파트는 모두 FP32로 고정
         with torch.autocast(device_type=device_type, enabled=False):
             B, Pnn, future_len, _ = diffusion_control_traj.shape
             one_future_len = 1 + future_len
-            diffusion_control_traj = diffusion_control_traj.float(
-            )  # (B, Pnn, T, 3)
-            target_class_one_hot = target_class_one_hot.float()  # (B, Pnn, 3)
+
+            diffusion_control_traj = diffusion_control_traj.float()
+            target_class_one_hot = target_class_one_hot.float()
             target_past_cur_future_valid = target_past_cur_future_valid.to(
-                torch.bool)  # (B, Pnn, time_len+future_len)
-            target_cur_future_valid = target_past_cur_future_valid[:, :, -(
-                one_future_len):]  # (B, Pnn, 1+T) bool
-            target_cur_valid = target_cur_future_valid[:, : ,0] # (B, Pnn)
-            target_agents_past = target_agents_past.float(
-            )  # (B, Pnn, time_len, 11)
-            near_current_state = target_agents_past[:, :, -1, :4] # (B, Pnn, 4)
-            # unnorm_near_current_state: (B, Pnn, 4)
-            unnorm_near_current_state = self.config.state_normalizer.inverse(
-                data=near_current_state, # (B, Pnn, 4)
-                valid_mask=target_cur_valid, # (B, Pnn)
+                torch.bool)
+            target_cur_future_valid = target_past_cur_future_valid[
+                :, :, -(one_future_len):]  # (B,Pnn,1+T)
+            target_cur_valid = target_cur_future_valid[:, :, 0]  # (B,Pnn)
+
+            target_past_11_dim = target_past_11_dim.float()
+            near_current_state = target_past_11_dim[:, :, -1, :4]  # (B,Pnn,4)
+
+            unnorm_near_current_state = self.config.state_normalizer(
+                data=near_current_state,
+                valid_mask=target_cur_valid,
             )
 
-            # 역정규화 현재+미래 궤적 및 현재 상태
-
+            # (정규화) -> (비정규화) future 제어
             temp_dict = {"seg_body_control": diffusion_control_traj}
-            unnorm_temp_dict = self.config.observation_normalizer.inverse(temp_dict)
-            unnorm_diffusion_control_traj = unnorm_temp_dict[
-                "seg_body_control"]  # (B, Pnn, future_len, 3)
+            norm_temp_dict = self.config.observation_normalizer(temp_dict)
+            unnorm_diffusion_control_traj = norm_temp_dict[
+                "seg_body_control"]  # (B,Pnn,T,3)
 
+            # (정규화) -> (비정규화) prev 제어(있을 때만)
+            unnorm_prev_seg_body_control: Optional[torch.Tensor] = None
+            if prev_seg_body_control is not None and prev_control_valid is not None:
+                tmp_prev = {
+                    "seg_body_control": prev_seg_body_control.float().unsqueeze(
+                        2)}  # (B,Pnn,1,3)
+                unnorm_prev_seg_body_control = \
+                self.config.observation_normalizer(tmp_prev)[
+                    "seg_body_control"].squeeze(2)  # (B,Pnn,3)
 
-            # --- (5) 제약 기반 필터 + 적분 ---
-            target_cur_future_valid = target_past_cur_future_valid[:, :, -(
-                    1 + future_len):]  # (B, Pnn, 1+future_len) bool
+            target_cur_future_valid = target_past_cur_future_valid[
+                :, :, -(1 + future_len):]  # (B,Pnn,1+T)
 
             with profile_block(
                     "feasible.filter_and_integrate",
                     enabled=use_profile,
                     device_type=device_type,
             ):
-                """무효 구간(점이 무효한 구간)은 0.0으로 출력됩니다."""
                 (
-                    unnorm_integrated_trajectory,  # (B, Pnn, future_len, 4)
-                    unnorm_control_constraint_diff,  # (B, Pnn, future_len, 3)
+                    unnorm_integrated_trajectory,
+                    unnorm_control_constraint_diff,
                 ) = self.feasible_projector.filter_and_integrate(
-                    unnorm_near_current_state,  # (B, Pnn, 4)
-                    target_cur_future_valid,  # (B, Pnn, 1+future_len) bool
-                    unnorm_diffusion_control_traj,  # (B, Pnn, future_len, 3)
-                    target_class_one_hot,  # (B, Pnn, 3)
+                    unnorm_near_current_state,
+                    target_cur_future_valid,
+                    unnorm_diffusion_control_traj,
+                    target_class_one_hot,
+                    prev_seg_body_control=unnorm_prev_seg_body_control,
+                    # (B,Pnn,3) or None
+                    prev_control_valid=prev_control_valid,  # (B,Pnn) or None
                 )
             # 정규화해서 DiTReturns 로 저장
             target_future_valid = target_cur_future_valid[:, :,
@@ -4016,33 +4116,33 @@ else
             control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
         )
 
-
     def _feasible_projection_vel(
             self,
-            diffusion_control_traj: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
-            target_past_11_dim: torch.Tensor,      # (B, (1+)Pnn, past_len, 11)
-            target_class_one_hot: torch.Tensor,    # (B, (1+)Pnn, 3)
-            target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, time_len_total)
-            low_t_mask: torch.Tensor,              # (B,)
+            diffusion_control_traj: torch.Tensor,
+            # (B, (1+)Pnn, future_len, 3)  (정규화)
+            target_past_11_dim: torch.Tensor,
+            target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
+            target_past_cur_future_valid: torch.Tensor,
+            low_t_mask: torch.Tensor,  # (B, )
+            prev_seg_body_control: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn,3) (정규화)
+            prev_control_valid: Optional[torch.Tensor] = None,
+            # (B,(1+)Pnn) bool
     ) -> None:
         B, Pnn, future_len, _ = diffusion_control_traj.shape
         device = diffusion_control_traj.device
 
         low_t_mask = low_t_mask.to(device=device)
-        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (low_t_mask > 0.5)
+        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (
+                    low_t_mask > 0.5)
 
-        # ✅ 핵심 변경:
-        # low_t_mask=False인 경우에도 integrated_trajectory가 0이 아니도록,
-        # "예측 control을 그대로 적분한 baseline"을 기본값으로 채워 둔다.
-        base_integrated, base_constraint = self._compute_vel_baseline_dit_returns(
-            diffusion_control_traj=diffusion_control_traj,                # (B,Pnn,T,3)
-            target_past_11_dim=target_past_11_dim,                        # (B,Pnn,past_len,11)
-            target_past_cur_future_valid=target_past_cur_future_valid,    # (B,Pnn,time_len_total)
-        )  # (B,Pnn,T,4), (B,Pnn,T,3)
+        base_integrated = diffusion_control_traj.new_zeros(
+            (B, Pnn, future_len, 4))
+        base_constraint = diffusion_control_traj.new_zeros(
+            (B, Pnn, future_len, 3))
 
-        active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(-1)  # (N_active,)
+        active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(-1)
 
-        # low-t 샘플이 없으면 baseline 그대로
         if int(active_idx.numel()) == 0:
             self.norm_dit_returns = DiTReturns(
                 integrated_trajectory=base_integrated,
@@ -4050,24 +4150,36 @@ else
             )
             return
 
-        # ---- active subset만 기존 projector 파이프라인 실행 ----
+        prev_seg_body_control_active: Optional[torch.Tensor] = None
+        prev_control_valid_active: Optional[torch.Tensor] = None
+        if prev_seg_body_control is not None and prev_control_valid is not None:
+            prev_seg_body_control_active = prev_seg_body_control[
+                active_idx]  # (N_active,Pnn,3)
+            prev_control_valid_active = prev_control_valid[
+                active_idx]  # (N_active,Pnn)
+
         self._feasible_projection_core_vel(
-            diffusion_control_traj[active_idx],      # (N_active,Pnn,future_len,3)
+            diffusion_control_traj[active_idx],
             target_class_one_hot[active_idx],
             target_past_cur_future_valid[active_idx],
             target_past_11_dim[active_idx],
+            prev_seg_body_control=prev_seg_body_control_active,
+            prev_control_valid=prev_control_valid_active,
         )
 
-        integ_active = self.norm_dit_returns.integrated_trajectory          # (N_active,Pnn,future_len,4)
-        const_active = self.norm_dit_returns.control_constraint_diff        # (N_active,Pnn,future_len,3)
+        integ_active = self.norm_dit_returns.integrated_trajectory
+        const_active = self.norm_dit_returns.control_constraint_diff
 
-        integ_active = integ_active.to(device=device, dtype=base_integrated.dtype)
-        const_active = const_active.to(device=device, dtype=base_constraint.dtype)
+        integ_active = integ_active.to(device=device,
+                                       dtype=base_integrated.dtype)
+        const_active = const_active.to(device=device,
+                                       dtype=base_constraint.dtype)
 
         integrated_all = base_integrated.index_copy(0, active_idx, integ_active)
         constraint_all = base_constraint.index_copy(0, active_idx, const_active)
 
         self.norm_dit_returns = DiTReturns(
-            integrated_trajectory=integrated_all,        # (B,Pnn,future_len,4)
-            control_constraint_diff=constraint_all,      # (B,Pnn,future_len,3)
+            integrated_trajectory=integrated_all,
+            control_constraint_diff=constraint_all,
         )
+
