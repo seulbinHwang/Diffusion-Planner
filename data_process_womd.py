@@ -4496,36 +4496,8 @@ def build_cache_dict_for_scenario(
         else:
             neigh_past_xyyaw = np.zeros((0, past_len_nodes, 4), dtype=np.float32)
 
-        past_xyyaw_pnn = np.concatenate(
-            [ego_past_xyyaw[None, ...], neigh_past_xyyaw],
-            axis=0,
-        ).astype(np.float32)  # (1+A,20,4)
 
 
-    # current+future: (B,Pnn,1+future_len,4)
-    ego_cur_xyyaw = ego_agent_past[past_len_nodes:past_len_nodes + 1, 0:4].astype(np.float32)  # (1,4)
-    ego_fut_xyyaw = ego_future_gt_11_dim[:, 0:4].astype(np.float32)  # (80,4)
-    ego_cur_future_xyyaw = np.concatenate([ego_cur_xyyaw, ego_fut_xyyaw], axis=0).astype(np.float32)  # (81,4)
-
-    if agent_num > 0:
-        neigh_cur_xyyaw = neighbor_agents_past[:, past_len_nodes:past_len_nodes + 1, 0:4].astype(np.float32)  # (A,1,4)
-        neigh_fut_xyyaw = neighbor_future_gt_11_dim[:, :, 0:4].astype(np.float32)  # (A,80,4)
-        neigh_cur_future_xyyaw = np.concatenate([neigh_cur_xyyaw, neigh_fut_xyyaw], axis=1).astype(np.float32)  # (A,81,4)
-    else:
-        neigh_cur_future_xyyaw = np.zeros((0, 1 + future_len, 4), dtype=np.float32)
-
-    cur_future_xyyaw_pnn = np.concatenate(
-        [ego_cur_future_xyyaw[None, ...], neigh_cur_future_xyyaw],
-        axis=0,
-    ).astype(np.float32)  # (1+A,81,4)
-
-
-    # valid: (B,Pnn,point_len) = (1,1+A,101)
-    valid_pnn = np.concatenate(
-        [ego_pf_valid[None, ...], neighbor_pf_valid],
-        axis=0,
-    ).astype(bool)  # (1+A,101)
-    target_past_cur_future_valid_t = torch.from_numpy(valid_pnn[None, ...])  # (1,1+A,101)
 
     # (5) yaw_rate 계산 (FeasibleProjector 내부 함수 직접 호출, batch)
     fp = _get_feasible_projector_for_cache()
