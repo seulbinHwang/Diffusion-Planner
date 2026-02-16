@@ -280,6 +280,161 @@ def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
         return mask > float(threshold)
     return mask != 0
 
+def _huber_sum_last_dim_from_error(
+    err: torch.Tensor,  # (B, P, T, C)
+    *,
+    huber_delta: float = 1.0,
+) -> torch.Tensor:
+    """마지막 채널(C)에 대해 Huber를 적용하고 합산합니다.
+
+    Args:
+        err (torch.Tensor): 예측-정답 오차 텐서. shape: (B, P, T, C)
+        huber_delta (float): Huber 경계값(기본 1.0)
+
+    Returns:
+        torch.Tensor: step별 손실. shape: (B, P, T)
+    """
+    if err.dim() != 4:
+        raise ValueError(f"err must be (B,P,T,C), got {tuple(err.shape)}")
+
+    err_f = err.float()  # 수치 안정성을 위해 float32
+    abs_err = err_f.abs()
+
+    delta = float(huber_delta)
+    quad = 0.5 * err_f.pow(2)
+    lin = delta * (abs_err - 0.5 * delta)
+    per_elem = torch.where(abs_err <= delta, quad, lin)  # (B,P,T,C)
+
+    return per_elem.sum(dim=-1)  # (B,P,T)
+
+
+def _build_control_delta_u_from_norm_control(
+    control_norm: torch.Tensor,  # (B, P, T, 3)
+    observation_normalizer: Any,
+    *,
+    dt_s: float = 0.1,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """정규화된 control(vx,vy,yaw_rate)로부터 u=[dx,dy,cos(dθ),sin(dθ)]를 만듭니다.
+
+    구현 의도
+    - dx,dy는 "정규화된 vx,vy"에 dt만 곱해서 delta 형태로 만듭니다.
+      (즉, rate를 그대로 쓰지 않고 오차 크기를 dt만큼 줄이는 효과)
+    - 각도는 cos/sin을 만들기 위해 yaw_rate를 물리 단위(rad/s)로 되돌린 뒤 dθ=ω*dt로 계산합니다.
+
+    Args:
+        control_norm (torch.Tensor):
+            정규화된 control. shape: (B, P, T, 3) = [vx_norm, vy_norm, yaw_rate_norm]
+        observation_normalizer (Any):
+            ObservationNormalizer. 여기서는 "seg_body_control" 키에 대한 inverse가 필요합니다.
+        dt_s (float): 시간 간격(초). 기본 0.1
+        eps (float): cos/sin 정규화 분모 보호용
+
+    Returns:
+        torch.Tensor:
+            u 텐서. shape: (B, P, T, 4) = [dx_norm, dy_norm, cos(dθ), sin(dθ)]
+            (float32로 반환)
+    """
+    if control_norm.dim() != 4 or int(control_norm.size(-1)) != 3:
+        raise ValueError(
+            f"control_norm must be (B,P,T,3), got {tuple(control_norm.shape)}"
+        )
+
+    ctrl_norm_f = control_norm.float()  # (B,P,T,3)
+
+    # (1) dx, dy: 정규화 공간에서 dt만 반영
+    dx_b_norm = ctrl_norm_f[..., 0] * float(dt_s)  # (B,P,T)
+    dy_b_norm = ctrl_norm_f[..., 1] * float(dt_s)  # (B,P,T)
+
+    # (2) yaw_rate: cos/sin을 위해 물리 단위(rad/s)로 복원
+    # 주의: observation_normalizer가 "seg_body_control" 키를 지원해야 함
+    denorm_ctrl = observation_normalizer.inverse({"seg_body_control": ctrl_norm_f})
+    if ("seg_body_control" not in denorm_ctrl) or (not torch.is_tensor(denorm_ctrl["seg_body_control"])):
+        raise ValueError(
+            "observation_normalizer.inverse({'seg_body_control': ...})에서 "
+            "'seg_body_control' 텐서를 얻지 못했습니다. "
+            "정규화 json 키/이름을 확인해 주세요."
+        )
+    ctrl_denorm_f = denorm_ctrl["seg_body_control"].float()  # (B,P,T,3)
+
+    omega = ctrl_denorm_f[..., 2]  # (B,P,T) rad/s
+    dtheta = omega * float(dt_s)   # (B,P,T) rad
+
+    c = torch.cos(dtheta)  # (B,P,T)
+    s = torch.sin(dtheta)  # (B,P,T)
+
+    # 혹시라도 수치 오차가 생기면 단위원으로 살짝 정규화
+    norm_cs = torch.sqrt(c * c + s * s + float(eps))  # (B,P,T)
+    c = c / norm_cs
+    s = s / norm_cs
+
+    return torch.stack([dx_b_norm, dy_b_norm, c, s], dim=-1)  # (B,P,T,4)
+
+
+def _compute_control_delta_u_dpm_loss_x_start(
+    args: Any,
+    score: torch.Tensor,  # (B, P, T, 3)  (정규화된 예측)
+    normed_target_future_seq_gt: torch.Tensor,  # (B, P, T, 3) (정규화된 정답)
+    target_future_valid: torch.Tensor,  # (B, P, T) bool/0/1
+    observation_normalizer: Any,
+    *,
+    dt_s: float = 0.1,
+    huber_delta: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """pose_based=False & model_type='x_start'일 때 사용하는 새 per-step 손실을 만듭니다.
+
+    u = [dx_norm, dy_norm, cos(dθ), sin(dθ)]
+    - dx_norm = vx_norm * dt
+    - dy_norm = vy_norm * dt
+    - dθ = yaw_rate_denorm * dt  (rad)
+    그리고 u_pred - u_gt에 대해 Huber 또는 MSE를 계산합니다.
+
+    Args:
+        args: args.use_huber_loss 사용
+        score: 예측(정규화). shape: (B,P,T,3)
+        normed_target_future_seq_gt: 정답(정규화). shape: (B,P,T,3)
+        target_future_valid: 유효 마스크. shape: (B,P,T)
+        observation_normalizer: yaw_rate 역정규화에 사용
+        dt_s: 시간 간격(초)
+        huber_delta: Huber delta
+        eps: 수치 안정용
+
+    Returns:
+        torch.Tensor: step별 손실. shape: (B,P,T)
+    """
+    if tuple(score.shape) != tuple(normed_target_future_seq_gt.shape):
+        raise ValueError(
+            "score와 normed_target_future_seq_gt shape이 다릅니다. "
+            f"score={tuple(score.shape)}, gt={tuple(normed_target_future_seq_gt.shape)}"
+        )
+    if score.dim() != 4 or int(score.size(-1)) != 3:
+        raise ValueError(f"score must be (B,P,T,3), got {tuple(score.shape)}")
+
+    valid = _to_bool_mask(target_future_valid).to(device=score.device)  # (B,P,T)
+    if tuple(valid.shape) != tuple(score.shape[:3]):
+        raise ValueError(
+            f"target_future_valid must be (B,P,T)={tuple(score.shape[:3])}, got {tuple(valid.shape)}"
+        )
+
+    u_pred = _build_control_delta_u_from_norm_control(
+        score, observation_normalizer, dt_s=dt_s, eps=eps
+    )  # (B,P,T,4)
+    u_gt = _build_control_delta_u_from_norm_control(
+        normed_target_future_seq_gt, observation_normalizer, dt_s=dt_s, eps=eps
+    )  # (B,P,T,4)
+
+    # invalid 위치는 학습에서 제외
+    u_pred = u_pred.masked_fill(~valid.unsqueeze(-1), 0.0)
+    u_gt = u_gt.masked_fill(~valid.unsqueeze(-1), 0.0)
+
+    err_u = u_pred - u_gt  # (B,P,T,4)
+
+    if bool(getattr(args, "use_huber_loss", True)):
+        return _huber_sum_last_dim_from_error(err_u, huber_delta=huber_delta)  # (B,P,T)
+
+    return (err_u.float().pow(2)).sum(dim=-1)  # (B,P,T)
+
 
 def _integrate_midpoint_controls_to_pose_denorm(
     unnorm_target_cur_gt_4_dim: torch.Tensor,   # (B, (1+)Pnn, 4)
@@ -1366,16 +1521,28 @@ def diffusion_loss_func(
         decoder_output=decoder_output)
 
     # dpm_loss: (B, (1+)Pnn, future_len)
-    dpm_loss: torch.Tensor = _compute_dpm_loss(
-        args=args,
-        model_type=model_type,
-        score=score, # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, future_len, 3)
-        std=std,  # (B, 1, 1, 1)
-        random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4 or 3)
-        normed_target_future_seq_gt=
-        normed_target_future_seq_gt,  # (B, (1+)Pnn, future_len, 4 or 3)
-    )
-
+    if (not bool(args.pose_based)) and (model_type == "x_start"):
+        # pose_based=False일 때만: u=[dx,dy,cos(dθ),sin(dθ)] 기반 loss 사용
+        dpm_loss: torch.Tensor = _compute_control_delta_u_dpm_loss_x_start(
+            args=args,
+            score=score,  # (B,P,T,3) normalized
+            normed_target_future_seq_gt=normed_target_future_seq_gt,  # (B,P,T,3) normalized
+            target_future_valid=target_future_valid,  # (B,P,T)
+            observation_normalizer=observation_normalizer,
+            dt_s=0.1,
+            huber_delta=1.0,
+            eps=1e-6,
+        )
+    else:
+        # 기존 방식 유지 (pose_based=True이거나, model_type이 score인 경우 등)
+        dpm_loss: torch.Tensor = _compute_dpm_loss(
+            args=args,
+            model_type=model_type,
+            score=score,  # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, future_len, 3)
+            std=std,  # (B, 1, 1, 1)
+            random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4 or 3)
+            normed_target_future_seq_gt=normed_target_future_seq_gt,  # (B, (1+)Pnn, future_len, 4 or 3)
+        )
     if args.use_timestep_weight_loss:
         # 시간 가중치(w_t) 생성
         time_step_s: float = 0.1
