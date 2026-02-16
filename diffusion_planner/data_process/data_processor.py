@@ -100,7 +100,6 @@ def compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
     목적:
       - work()에서 이미 뽑아둔 past+future의 (cos,sin) 값을 그대로 써서
         FeasibleProjector 내부 SG 미분 로직으로 yaw_rate를 구합니다.
-      - (cos,sin)을 다시 만들거나, (x,y,cos,sin) 전체를 다시 구성하는 중복을 줄입니다.
 
     Args:
         past_future_cs_yaw (np.ndarray):
@@ -2334,7 +2333,7 @@ class DataProcessor(object):
         polyorder: int,
         max_window_len_yaw: int,
         eps_valid: float,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> np.ndarray:
         """past~current~future 기반 control(3) = [v_x, v_y, yaw_rate] 를 만든다.
 
         흐름:
@@ -2352,14 +2351,11 @@ class DataProcessor(object):
             eps_valid: 유효 판정 기준
 
         Returns:
-            Tuple[np.ndarray, np.ndarray]:
-                - past_future_control:
-                    · ego: (time_len+future_len, 3)
-                    · neighbor: (A, time_len+future_len, 3)
-                    · 마지막 3은 [v_x, v_y, yaw_rate]
-                - past_future_yaw_rate:
-                    · ego: (time_len+future_len,)
-                    · neighbor: (A, time_len+future_len)
+            - past_future_control:
+                · ego: (time_len+future_len, 3)
+                · neighbor: (A, time_len+future_len, 3)
+                · 마지막 3은 [v_x, v_y, yaw_rate]
+
         """
         past_future_vxy = self._concat_past_future_vxy_from_traj11(
             past_cur_traj_11=past_cur_traj_11,
@@ -2402,7 +2398,7 @@ class DataProcessor(object):
                 axis=2,
             ).astype(np.float32, copy=False)
 
-        return past_future_control, past_future_yaw_rate
+        return past_future_control
 
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
@@ -2561,7 +2557,10 @@ class DataProcessor(object):
             # =========================================================
             # ✅ [ADDED] past+future 기반 control(3) = [v_x, v_y, yaw_rate]
             # =========================================================
-            ego_past_future_control, ego_past_future_gt_yaw_rate = self._build_past_future_control_vxy_yawrate_from_traj11(
+            """
+            ego_past_future_control : (time_len+future_len, 3)
+            """
+            ego_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
                 past_cur_traj_11=ego_agent_past,         # (time_len, 11)
                 future_traj_11=ego_future_gt_11_dim,     # (future_len, 11)
                 dt=0.1,
@@ -2569,8 +2568,10 @@ class DataProcessor(object):
                 max_window_len_yaw=7,
                 eps_valid=1e-8,
             )
-
-            neighbor_past_future_control, neighbor_past_future_gt_yaw_rate = self._build_past_future_control_vxy_yawrate_from_traj11(
+            """
+            neighbor_past_future_control : (A, time_len+future_len, 3)
+            """
+            neighbor_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
                 past_cur_traj_11=neighbor_agents_past,      # (A, time_len, 11)
                 future_traj_11=neighbor_future_gt_11_dim,   # (A, future_len, 11)
                 dt=0.1,
