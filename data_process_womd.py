@@ -61,6 +61,49 @@ def _compute_valid_mask_from_feat_11(
     return (abs_max > float(eps))
 
 
+def _extract_future_vxy_from_feat_11(
+    future_feat_11: np.ndarray,  # shape: (F, 11) or (A, F, 11)
+    future_len: int,
+) -> np.ndarray:
+    """미래 11차원 feature에서 v_x, v_y만 뽑아 (F,2) 또는 (A,F,2)로 반환합니다.
+
+    11차원 포맷은 아래 순서를 가정합니다.
+      [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
+
+    즉 v_x, v_y는 마지막 차원 기준으로 4,5번째 칸(0-index)입니다.
+
+    Args:
+        future_feat_11: 미래 feature.
+            - ego: (F,11)
+            - neighbors: (A,F,11)
+        future_len: 미래 길이 F (예: 80)
+
+    Returns:
+        future_vxy:
+            - ego면 (F,2)
+            - neighbors면 (A,F,2)
+            dtype=float32
+    """
+    f = int(future_len)
+
+    if future_feat_11.ndim == 2:
+        # (F,11)
+        if int(future_feat_11.shape[0]) != f or int(future_feat_11.shape[1]) != 11:
+            raise ValueError(
+                f"future_feat_11 must be (F,11). got shape={future_feat_11.shape}, F={f}"
+            )
+    elif future_feat_11.ndim == 3:
+        # (A,F,11)
+        if int(future_feat_11.shape[1]) != f or int(future_feat_11.shape[2]) != 11:
+            raise ValueError(
+                f"future_feat_11 must be (A,F,11). got shape={future_feat_11.shape}, F={f}"
+            )
+    else:
+        raise ValueError(
+            f"future_feat_11 must be 2D or 3D. got shape={future_feat_11.shape}"
+        )
+
+    return future_feat_11[..., 4:6].astype(np.float32)
 
 
 
@@ -4166,6 +4209,10 @@ def build_cache_dict_for_scenario(
         agent_one_hot=one_hot_all[ego_idx],  # (3,)
         enforce_all_invalid_when_current_invalid=False,  # ego는 현재가 무조건 유효(위에서 검증)
     )
+    ego_future_vxy = _extract_future_vxy_from_feat_11(
+        future_feat_11=ego_future_gt_11_dim,  # (F,11)
+        future_len=FUTURE_LEN,
+    )  # (F,2)
 
     # -------------------------
     # neighbors: 현재 시점에 존재하는(agent valid at current)만
@@ -4227,7 +4274,10 @@ def build_cache_dict_for_scenario(
         neighbor_agents_past[out_i] = n_past_11
         neighbor_future_gt_3_dim[out_i] = n_future_3
         neighbor_future_gt_11_dim[out_i] = n_future_11
-
+    neighbor_future_vxy = _extract_future_vxy_from_feat_11(
+        future_feat_11=neighbor_future_gt_11_dim,  # (A,F,11)
+        future_len=FUTURE_LEN,
+    )  # (A,F,2)
     # -------------------------
     # ✅ ego + neighbor를 한 줄로 묶은 target_id / target_z 만들기
     # -------------------------

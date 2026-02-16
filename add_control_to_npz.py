@@ -19,6 +19,115 @@ ArrayF = NDArray[np.floating]
 CONTROL_KEY = "past_future_seg_control_gt_3_dim"
 _WORKER_CONFIG: Dict[str, Any] = {}
 
+class ControlStatsAccumulator:
+    """(v_x^b, v_y^b, yaw_rate) mean/std 계산을 위한 누적기입니다.
+
+    원본 값을 전부 저장하지 않고, 아래 3가지만 누적합니다.
+      1) count: 유효 샘플 개수
+      2) sum:   값의 합 (채널 3개)
+      3) sumsq: 값^2의 합 (채널 3개)
+
+    Notes:
+        - update()에 들어오는 values는 shape (M, 3) 이어야 합니다.
+        - 누적은 float64로 합니다. (오차가 덜 쌓이도록)
+    """
+
+    def __init__(self) -> None:
+        self.count: int = 0
+        self.sum: NDArray[np.float64] = np.zeros((3,), dtype=np.float64)    # (3,)
+        self.sumsq: NDArray[np.float64] = np.zeros((3,), dtype=np.float64)  # (3,)
+
+    def update(self, values: np.ndarray) -> None:
+        """유효한 값들을 누적합니다.
+
+        Args:
+            values (np.ndarray): shape (M, 3)
+                [v_x^b, v_y^b, yaw_rate] 값들.
+
+        Returns:
+            None
+        """
+        v = np.asarray(values)
+        if v.size == 0:
+            return
+        if v.ndim != 2 or int(v.shape[1]) != 3:
+            raise ValueError(f"values는 (M,3) 이어야 합니다. got shape={v.shape}")
+
+        # v: (M,3)
+        v64 = v.astype(np.float64, copy=False)
+
+        # (M,) 행 단위로 finite 체크 (3개 채널이 모두 유한한 경우만 사용)
+        finite_row = np.isfinite(v64).all(axis=1)
+        if not np.any(finite_row):
+            return
+
+        v_sel = v64[finite_row]  # (K,3)
+        if v_sel.size == 0:
+            return
+
+        self.count += int(v_sel.shape[0])
+        self.sum += v_sel.sum(axis=0)             # (3,)
+        self.sumsq += (v_sel * v_sel).sum(axis=0) # (3,)
+
+    def merge(self, other: "ControlStatsAccumulator") -> None:
+        """다른 누적기의 값을 합칩니다.
+
+        Args:
+            other (ControlStatsAccumulator): 합칠 대상.
+
+        Returns:
+            None
+        """
+        if not isinstance(other, ControlStatsAccumulator):
+            raise ValueError(f"other는 ControlStatsAccumulator 이어야 합니다. got={type(other)}")
+        self.count += int(other.count)
+        self.sum += np.asarray(other.sum, dtype=np.float64)
+        self.sumsq += np.asarray(other.sumsq, dtype=np.float64)
+
+    def merge_from_parts(
+        self,
+        *,
+        count: int,
+        sum_list: Sequence[float],
+        sumsq_list: Sequence[float],
+    ) -> None:
+        """(count, sum, sumsq) 형태의 작은 값 묶음을 합칩니다.
+
+        멀티프로세스에서 워커가 보내주는 값 합치기에 사용합니다.
+
+        Args:
+            count (int): 유효 샘플 개수
+            sum_list (Sequence[float]): shape (3,)
+            sumsq_list (Sequence[float]): shape (3,)
+
+        Returns:
+            None
+        """
+        self.count += int(count)
+        self.sum += np.asarray(sum_list, dtype=np.float64).reshape((3,))
+        self.sumsq += np.asarray(sumsq_list, dtype=np.float64).reshape((3,))
+
+    def compute_mean_std(self) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """누적된 값으로 mean/std를 계산합니다.
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - mean: shape (3,)
+                - std:  shape (3,)
+        """
+        if int(self.count) <= 0:
+            nan3 = np.full((3,), np.nan, dtype=np.float64)
+            return nan3, nan3
+
+        n = float(self.count)
+        mean = self.sum / n                      # (3,)
+        var = (self.sumsq / n) - (mean * mean)   # (3,)
+
+        # 수치 오차로 -0.xx 가 나오는 것을 방지
+        var = np.maximum(var, 0.0)
+        std = np.sqrt(var)
+        return mean, std
+
 
 def _get_auto_worker_count(total_files: int) -> int:
     """자동으로 사용할 프로세스 개수를 정합니다.
@@ -775,28 +884,28 @@ def _get_near_future_segment_valid(
     return near_cur_future_valid, near_future_segment_valid
 
 
-def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
-    ego_agent_past: ArrayF,  # (Tp,11)  Tp=20+1
-    ego_future_gt_11_dim: ArrayF,  # (Tf,11)  Tf=80
+def _build_past_future_seg_control_gt_and_seg_valid_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)
+    ego_future_gt_11_dim: ArrayF,  # (Tf,11)
     neighbor_agents_past: ArrayF,  # (N,Tp,11)
     neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
     *,
     dt: float,
     eps: float = 1e-8,
-) -> ArrayF:
-    """npz 내부의 11차원 궤적들로부터 (과거~미래) 구간 제어를 만듭니다.
-
-    입력 포즈 개수:
-        - 과거 20 + 현재 1 + 미래 Tf(=80) = 101 개 포즈
-
-    출력 제어(구간) 개수:
-        - (101 - 1) = 100 = 과거 구간 20 + 미래 구간 80
+) -> Tuple[ArrayF, NDArray[np.bool_]]:
+    """(과거~미래) 구간 제어와 seg_valid를 함께 계산합니다.
 
     Returns:
-        np.ndarray:
-            past_future_seg_control_gt_3_dim, shape (1+N, (Tp-1)+Tf, 3)
-            - 마지막 3: (v_x^b, v_y^b, omega)
-            - 무효 구간은 0.0
+        Tuple[np.ndarray, np.ndarray]:
+            controls: shape (1+N, (Tp-1)+Tf, 3)
+                마지막 3은 (v_x^b, v_y^b, yaw_rate)
+            seg_valid: shape (1+N, (Tp-1)+Tf) bool
+                구간이 유효하면 True
+
+    Notes:
+        - 통계 모드에서는 seg_valid=True인 controls만 모아서 mean/std를 계산합니다.
+        - 여기서는 controls를 '그대로' 반환합니다(유효하지 않은 구간을 0으로 만들지 않음).
+          (필요하면 호출자가 seg_valid로 걸러서 쓰면 됩니다.)
     """
     ego_past = np.asarray(ego_agent_past)
     ego_fut11 = np.asarray(ego_future_gt_11_dim)
@@ -812,17 +921,17 @@ def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
     if nbr_fut11.ndim != 3 or nbr_fut11.shape[-1] != 11:
         raise ValueError(f"neighbor_future_gt_11_dim shape는 (N,Tf,11)이어야 합니다. got {nbr_fut11.shape}")
 
-    Tp = int(ego_past.shape[0])  # past(20)+cur(1) = 21
+    Tp = int(ego_past.shape[0])   # (past+cur) = 21
     Tf = int(ego_fut11.shape[0])  # 80
     N = int(nbr_past.shape[0])
 
     if Tp <= 1:
-        raise ValueError(f"Tp는 최소 2(=과거1+현재1) 이상이어야 합니다. got Tp={Tp}")
-    if nbr_past.shape[1] != Tp:
+        raise ValueError(f"Tp는 최소 2 이상이어야 합니다. got Tp={Tp}")
+    if int(nbr_past.shape[1]) != Tp:
         raise ValueError(f"neighbor_agents_past의 Tp가 ego와 같아야 합니다. got {nbr_past.shape[1]} vs {Tp}")
-    if nbr_fut11.shape[0] != N:
+    if int(nbr_fut11.shape[0]) != N:
         raise ValueError(f"neighbor_future_gt_11_dim의 N이 neighbor_agents_past와 같아야 합니다. got {nbr_fut11.shape[0]} vs {N}")
-    if nbr_fut11.shape[1] != Tf:
+    if int(nbr_fut11.shape[1]) != Tf:
         raise ValueError(f"neighbor_future_gt_11_dim의 Tf가 ego_future와 같아야 합니다. got {nbr_fut11.shape[1]} vs {Tf}")
 
     dt = float(dt)
@@ -835,13 +944,9 @@ def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
     nbr_past = nbr_past.astype(ego_past.dtype, copy=False)
     nbr_fut11 = nbr_fut11.astype(ego_past.dtype, copy=False)
 
-    # -----------------------------
     # (1) 과거+현재+미래 11D 타임라인 만들기
-    # -----------------------------
-    # ego_all11: (Tp+Tf, 11)
-    ego_all11 = np.concatenate([ego_past, ego_fut11], axis=0).astype(np.float32, copy=False)
-    # nbr_all11: (N, Tp+Tf, 11)
-    nbr_all11 = np.concatenate([nbr_past, nbr_fut11], axis=1).astype(np.float32, copy=False)
+    ego_all11 = np.concatenate([ego_past, ego_fut11], axis=0).astype(np.float32, copy=False)  # (Tp+Tf,11)
+    nbr_all11 = np.concatenate([nbr_past, nbr_fut11], axis=1).astype(np.float32, copy=False)  # (N,Tp+Tf,11)
 
     # (안전) 현재가 무효면 그 에이전트 전체를 0으로
     ego_cur_valid = bool((np.abs(ego_past[-1, :8]) > eps).any())
@@ -851,41 +956,61 @@ def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
     if N > 0:
         nbr_cur_valid_mask = (np.abs(nbr_past[:, -1, :8]) > eps).any(axis=1)  # (N,)
         if not np.all(nbr_cur_valid_mask):
-            nbr_all11 = np.array(nbr_all11, copy=True)  # 쓰기 가능하게
+            nbr_all11 = np.array(nbr_all11, copy=True)
             nbr_all11[~nbr_cur_valid_mask, :, :] = 0.0
 
-    # -----------------------------
-    # (2) 11D -> pose3(x,y,heading) 변환 (과거+현재+미래 전체)
-    # -----------------------------
-    ego_pose_all3 = _traj11_to_traj3_heading(ego_all11)      # (Tp+Tf, 3)
-    nbr_pose_all3 = _traj11_to_traj3_heading(nbr_all11)      # (N, Tp+Tf, 3)
+    # (2) 11D -> pose3(x,y,heading)
+    ego_pose_all3 = _traj11_to_traj3_heading(ego_all11)  # (Tp+Tf,3)
+    nbr_pose_all3 = _traj11_to_traj3_heading(nbr_all11)  # (N,Tp+Tf,3)
 
-    # all_pose: (1+N, Tp+Tf, 3)  == (P, 1+T, 3)
-    all_pose = np.concatenate(
-        [ego_pose_all3[None, ...], nbr_pose_all3],
-        axis=0,
-    ).astype(np.float32, copy=False)
+    all_pose = np.concatenate([ego_pose_all3[None, ...], nbr_pose_all3], axis=0).astype(np.float32, copy=False)
+    # all_pose: (1+N, Tp+Tf, 3)
 
-    # -----------------------------
-    # (3) “과거~미래 전체” 구간 유효 마스크 만들기 (101포즈 -> 100구간)
-    # -----------------------------
-    ego_valid = (np.abs(ego_all11[:, :8]) > eps).any(axis=1)            # (Tp+Tf,)
-    nbr_valid = (np.abs(nbr_all11[:, :, :8]) > eps).any(axis=2)         # (N, Tp+Tf)
-    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N, Tp+Tf)
+    # (3) seg_valid 만들기
+    ego_valid = (np.abs(ego_all11[:, :8]) > eps).any(axis=1)          # (Tp+Tf,)
+    nbr_valid = (np.abs(nbr_all11[:, :, :8]) > eps).any(axis=2)       # (N,Tp+Tf)
+    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N,Tp+Tf)
 
-    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)  # (1+N, (Tp+Tf-1)) = (1+N, (Tp-1)+Tf)
+    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)   # (1+N,Tp+Tf-1)
 
-    # -----------------------------
-    # (4) 전체 타임라인 차분 -> 구간 제어(100개) 만들기
-    # -----------------------------
-    # controls: (1+N, (Tp+Tf-1), 3)
-    controls = differentiate_numpy_pose3_to_control3(
-        all_pose,
-        dt=dt,
-    ).astype(np.float32, copy=False)
+    # (4) controls 계산
+    controls = differentiate_numpy_pose3_to_control3(all_pose, dt=dt).astype(np.float32, copy=False)
+    # controls: (1+N, Tp+Tf-1, 3)
 
+    return controls, seg_valid
+
+
+def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)  Tp=20+1
+    ego_future_gt_11_dim: ArrayF,  # (Tf,11)  Tf=80
+    neighbor_agents_past: ArrayF,  # (N,Tp,11)
+    neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
+    *,
+    dt: float,
+    eps: float = 1e-8,
+) -> ArrayF:
+    """npz 내부의 11차원 궤적들로부터 (과거~미래) 구간 제어를 만듭니다.
+
+    Returns:
+        np.ndarray:
+            past_future_seg_control_gt_3_dim, shape (1+N, (Tp-1)+Tf, 3)
+            - 마지막 3: (v_x^b, v_y^b, yaw_rate)
+            - 무효 구간은 0.0
+    """
+    controls, seg_valid = _build_past_future_seg_control_gt_and_seg_valid_from_npz_arrays(
+        ego_agent_past=ego_agent_past,
+        ego_future_gt_11_dim=ego_future_gt_11_dim,
+        neighbor_agents_past=neighbor_agents_past,
+        neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,
+        dt=float(dt),
+        eps=float(eps),
+    )
+
+    # controls: (1+N, Tseg, 3)
+    # seg_valid: (1+N, Tseg)
     controls[~seg_valid] = 0.0
     return controls
+
 
 
 
@@ -1452,6 +1577,261 @@ def _process_one_file(
     return True, "ok"
 
 
+def _calculate_control_statistics_from_npz_path(
+    npz_path: str,
+    *,
+    dt: float,
+) -> Tuple[bool, str, ControlStatsAccumulator]:
+    """npz 파일 1개에서 (v_x^b, v_y^b, yaw_rate) 통계 누적값을 계산합니다.
+
+    이 함수는 "저장"을 절대 하지 않습니다(읽기 전용).
+
+    Args:
+        npz_path (str): npz 파일 경로
+        dt (float): 시간 간격
+
+    Returns:
+        Tuple[bool, str, ControlStatsAccumulator]:
+            - ok: 성공 여부
+            - msg: "ok" 또는 실패 원인
+            - acc: 해당 파일에서 얻은 누적기(성공 시 값 포함)
+    """
+    acc = ControlStatsAccumulator()
+
+    if not os.path.exists(npz_path):
+        return False, f"missing: {npz_path}", acc
+
+    # controls 계산에 필요한 key만 읽기 (저장/수정 없음)
+    keys_to_load = [
+        "ego_agent_past",
+        "ego_future_gt_11_dim",
+        "neighbor_agents_past",
+        "neighbor_future_gt_11_dim",
+    ]
+
+    try:
+        npz_data = _load_npz_subset_as_dict(npz_path, keys_to_load)
+    except Exception as e:
+        return False, f"load_failed: {type(e).__name__}: {e}", acc
+
+    for k in keys_to_load:
+        if k not in npz_data:
+            return False, f"missing key '{k}'", acc
+
+    try:
+        controls, seg_valid = _build_past_future_seg_control_gt_and_seg_valid_from_npz_arrays(
+            ego_agent_past=npz_data["ego_agent_past"],
+            ego_future_gt_11_dim=npz_data["ego_future_gt_11_dim"],
+            neighbor_agents_past=npz_data["neighbor_agents_past"],
+            neighbor_future_gt_11_dim=npz_data["neighbor_future_gt_11_dim"],
+            dt=float(dt),
+        )
+    except Exception as e:
+        return False, f"control_build_failed: {type(e).__name__}: {e}", acc
+
+    # controls: (P, Tseg, 3)
+    # seg_valid: (P, Tseg)
+    if controls.ndim != 3 or int(controls.shape[-1]) != 3:
+        return False, f"controls shape mismatch: {controls.shape}", acc
+    if seg_valid.shape != controls.shape[:2]:
+        return False, f"seg_valid shape mismatch: seg_valid={seg_valid.shape}, controls={controls.shape}", acc
+
+    # seg_valid=True인 구간만 모아서 (M,3)로 만들기
+    values = controls[seg_valid]  # (M,3)
+    acc.update(values)
+    return True, "ok", acc
+
+
+def _worker_calculate_statistics_one_fname(
+    fname: str,
+) -> Tuple[str, bool, str, int, List[float], List[float]]:
+    """멀티프로세스 워커: 파일 1개 통계를 계산해 (count,sum,sumsq)만 반환합니다."""
+    cfg = _WORKER_CONFIG
+    dataset_dir = str(cfg["dataset_dir"])
+    dt = float(cfg["dt"])
+
+    npz_path = os.path.join(dataset_dir, str(fname))
+
+    ok, msg, acc = _calculate_control_statistics_from_npz_path(npz_path, dt=dt)
+    if not ok:
+        return str(fname), False, str(msg), 0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+
+    return (
+        str(fname),
+        True,
+        "ok",
+        int(acc.count),
+        [float(x) for x in acc.sum.reshape((3,)).tolist()],
+        [float(x) for x in acc.sumsq.reshape((3,)).tolist()],
+    )
+
+
+def _run_only_calculate_statistics(
+    *,
+    dataset_dir: str,
+    train_json: str,
+    dt: float,
+    limit: int,
+    workers_arg: int,
+) -> None:
+    """npz를 수정하지 않고 mean/std만 계산하는 실행 함수입니다.
+
+    Args:
+        dataset_dir (str): npz 폴더
+        train_json (str): 파일명 리스트(json)
+        dt (float): 시간 간격
+        limit (int): 0이면 전체, 양수면 앞에서 N개만
+        workers_arg (int): 0이면 자동, 1이면 순차, 2 이상이면 멀티프로세스
+
+    Returns:
+        None
+    """
+    file_names = _load_training_file_list(train_json)
+    if int(limit) > 0:
+        file_names = file_names[: int(limit)]
+
+    total_files = len(file_names)
+    if total_files <= 0:
+        print("done. files_total=0, files_failed=0, samples_valid=0")
+        return
+
+    workers: int = int(workers_arg) if int(workers_arg) > 0 else _get_auto_worker_count(total_files)
+    workers = max(1, min(int(workers), int(total_files)))
+
+    global_acc = ControlStatsAccumulator()
+    fail_count = 0
+
+    start_time_s = time.monotonic()
+    last_print_time_s = start_time_s
+
+    # (1) 순차
+    if workers <= 1:
+        pbar = tqdm(file_names, desc="only_calculate_statistics")
+        for idx, fname in enumerate(pbar, start=1):
+            npz_path = os.path.join(dataset_dir, str(fname))
+            ok, msg, acc = _calculate_control_statistics_from_npz_path(npz_path, dt=float(dt))
+            if ok:
+                global_acc.merge(acc)
+            else:
+                fail_count += 1
+                tqdm.write(f"[FAIL] {fname}: {msg}")
+
+            last_print_time_s = _maybe_print_progress_every_5_min(
+                start_time_s=start_time_s,
+                last_print_time_s=last_print_time_s,
+                processed=idx,
+                total=total_files,
+                interval_s=300.0,
+            )
+
+        mean, std = global_acc.compute_mean_std()
+        _print_control_statistics_summary(
+            total_files=total_files,
+            fail_count=fail_count,
+            acc=global_acc,
+            mean=mean,
+            std=std,
+        )
+        return
+
+    # (2) 멀티프로세스
+    worker_config: Dict[str, Any] = {
+        "dataset_dir": str(dataset_dir),
+        "dt": float(dt),
+        "only_calculate_statistics": True,
+    }
+
+    ctx = mp.get_context()
+    processed_count = 0
+
+    pbar = tqdm(total=total_files, desc=f"only_calculate_statistics (workers={workers})")
+
+    pool = ctx.Pool(
+        processes=workers,
+        initializer=_init_worker_process,
+        initargs=(worker_config,),
+    )
+
+    try:
+        chunksize = 4
+        for fname, ok, msg, count, sum_list, sumsq_list in pool.imap_unordered(
+            _worker_calculate_statistics_one_fname,
+            file_names,
+            chunksize=chunksize,
+        ):
+            processed_count += 1
+            pbar.update(1)
+
+            if ok:
+                global_acc.merge_from_parts(
+                    count=int(count),
+                    sum_list=sum_list,
+                    sumsq_list=sumsq_list,
+                )
+            else:
+                fail_count += 1
+                tqdm.write(f"[FAIL] {fname}: {msg}")
+
+            last_print_time_s = _maybe_print_progress_every_5_min(
+                start_time_s=start_time_s,
+                last_print_time_s=last_print_time_s,
+                processed=processed_count,
+                total=total_files,
+                interval_s=300.0,
+            )
+
+        pool.close()
+        pool.join()
+
+    except KeyboardInterrupt:
+        tqdm.write("[STOP] Ctrl+C")
+        pool.terminate()
+        pool.join()
+
+    finally:
+        pbar.close()
+
+    mean, std = global_acc.compute_mean_std()
+    _print_control_statistics_summary(
+        total_files=total_files,
+        fail_count=fail_count,
+        acc=global_acc,
+        mean=mean,
+        std=std,
+    )
+
+
+def _print_control_statistics_summary(
+    *,
+    total_files: int,
+    fail_count: int,
+    acc: ControlStatsAccumulator,
+    mean: NDArray[np.float64],
+    std: NDArray[np.float64],
+) -> None:
+    """콘솔에 결과를 보기 좋게 출력합니다."""
+    labels = ["v_x^b", "v_y^b", "yaw_rate"]
+
+    print("========== only_calculate_statistics result ==========")
+    print(f"files_total={int(total_files)}, files_failed={int(fail_count)}")
+    print(f"samples_valid={int(acc.count)}")
+
+    for i, name in enumerate(labels):
+        m = float(mean[i]) if np.isfinite(mean[i]) else float("nan")
+        s = float(std[i]) if np.isfinite(std[i]) else float("nan")
+        print(f"{name}: mean={m:.6g}, std={s:.6g}")
+
+    # 복사/붙여넣기 편하게 json도 같이 출력
+    out = {
+        "v_x_b": {"mean": float(mean[0]), "std": float(std[0])},
+        "v_y_b": {"mean": float(mean[1]), "std": float(std[1])},
+        "yaw_rate": {"mean": float(mean[2]), "std": float(std[2])},
+        "samples_valid": int(acc.count),
+        "files_total": int(total_files),
+        "files_failed": int(fail_count),
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1473,6 +1853,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true", help="이미 control 키가 있어도 다시 계산해서 덮어씁니다.")
     parser.add_argument("--no_compress", action="store_true", help="저장할 때 압축을 끕니다(더 빠르지만 파일이 커짐).")
     parser.add_argument("--limit", type=int, default=0, help="0이면 전체, 양수면 앞에서 N개만 처리")
+    parser.add_argument(
+        "--only_calculate_statistics",
+        action="store_true",
+        help="npz를 저장/수정하지 않고 (v_x^b, v_y^b, yaw_rate)의 mean/std만 계산합니다.",
+    )
 
     # --- dataset.py __getitem__ sample dict 생성 관련 옵션 ---
     parser.add_argument(
@@ -1528,8 +1913,19 @@ def main() -> None:
     eval_method: str = str(args.eval_method)
     use_agent_route_lane_order: bool = bool(args.use_agent_route_lane_order)
 
+    only_calculate_statistics: bool = bool(getattr(args, "only_calculate_statistics", False))
     workers_arg: int = int(getattr(args, "workers", 0))
 
+    if only_calculate_statistics:
+        # ✅ 이 모드에서는 npz를 절대 저장/수정하지 않습니다.
+        _run_only_calculate_statistics(
+            dataset_dir=str(args.dataset_dir),
+            train_json=str(args.train_json),
+            dt=float(args.dt),
+            limit=int(args.limit),
+            workers_arg=int(workers_arg),
+        )
+        return
     file_names = _load_training_file_list(train_json)
     if limit > 0:
         file_names = file_names[:limit]
