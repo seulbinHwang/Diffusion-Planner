@@ -2723,7 +2723,7 @@ class DiT(nn.Module):
 
         # (B,Pnn,4) 현재 상태(여기선 past의 마지막)
         near_current_state = target_past_11_dim[:, :, -1, :4].float()
-        unnorm_near_current_state = self.config.state_normalizer(
+        unnorm_near_current_state = self.config.state_normalizer.inverse(
             data=near_current_state,          # (B,Pnn,4)
             valid_mask=cur_valid,             # (B,Pnn)
         )  # (B,Pnn,4)

@@ -51,6 +51,153 @@ import numpy as np
 from numpy.typing import NDArray
 
 ArrayF = NDArray[np.floating]
+from typing import Any, Tuple, Optional
+import numpy as np
+import torch
+
+
+_FEASIBLE_SG_PROJECTOR: Optional[Any] = None
+
+
+def _get_feasible_sg_projector() -> Any:
+    """FeasibleProjector의 SG(yaw_rate) 계산만 재사용하기 위한 싱글턴을 반환합니다.
+
+    Returns:
+        Any:
+            FeasibleProjector 인스턴스(내부적으로 torch 기반 SG 계산 기능을 사용).
+    """
+    global _FEASIBLE_SG_PROJECTOR
+    if _FEASIBLE_SG_PROJECTOR is not None:
+        return _FEASIBLE_SG_PROJECTOR
+
+    # 무거운 import는 "필요할 때만" 하도록 lazy import
+    from diffusion_planner.model.module.feasible import FeasibleProjector  # pylint: disable=import-error
+
+    class _DummyCfg:
+        """FeasibleProjector 초기화에 필요한 최소 설정."""
+        use_batch_integration: bool = False
+
+    # SG 유틸만 쓸 거라서 use_feasible_dl=False로 두면 네트워크 모듈을 만들지 않습니다.
+    _FEASIBLE_SG_PROJECTOR = FeasibleProjector(
+        config=_DummyCfg(),
+        hidden_dim=1,
+        use_feasible_dl=False,
+        use_feasible_filter=False,
+    )
+    _FEASIBLE_SG_PROJECTOR.eval()
+    return _FEASIBLE_SG_PROJECTOR
+
+
+def compute_past_future_yaw_rate_via_feasible_sg(
+    past_cur_traj_11: np.ndarray,   # (A, time_len, 11) 또는 (time_len, 11)
+    future_traj_11: np.ndarray,     # (A, future_len, 11) 또는 (future_len, 11)
+    *,
+    dt: float = 0.1,
+    polyorder: int = 2,
+    max_window_len_yaw: int = 7,
+    eps: float = 1e-8,
+) -> np.ndarray:
+    """(cos(yaw), sin(yaw))에 대해 유효 구간만 SG로 미분해서 yaw_rate를 계산합니다.
+
+    유효/무효 규칙:
+      - 11차원 중 앞 8개([x,y,cos,sin,vx,vy,width,length])가 전부 0이면 무효.
+      - 유효 구간은 "한 덩어리(0*1*0*)"이고, 중간에 구멍(1→0→1)은 없다고 가정합니다.
+
+    Args:
+        past_cur_traj_11 (np.ndarray):
+            - ego: (time_len, 11)
+            - neighbor: (A, time_len, 11)
+            - time_len = past_len+1 (현재 포함)
+        future_traj_11 (np.ndarray):
+            - ego: (future_len, 11)
+            - neighbor: (A, future_len, 11)
+            - future_len = 현재 제외 미래 길이(예: 80)
+        dt (float): 샘플 간 시간 간격. shape: ()
+        polyorder (int): SG 다항 차수. shape: ()
+        max_window_len_yaw (int): yaw에 쓸 최대 창 길이(홀수 권장). shape: ()
+        eps (float): 0 판정/수치 안정용 작은 값. shape: ()
+
+    Returns:
+        np.ndarray:
+            - ego 입력이면: (time_len+future_len,)
+            - neighbor 입력이면: (A, time_len+future_len)
+            - 무효 프레임은 0.0으로 유지됩니다.
+    """
+    if past_cur_traj_11.ndim == 2:
+        # ego 케이스
+        past_11 = past_cur_traj_11[None, ...]   # (1, time_len, 11)
+        fut_11 = future_traj_11[None, ...]      # (1, future_len, 11)
+        squeeze_agent = True
+    elif past_cur_traj_11.ndim == 3:
+        past_11 = past_cur_traj_11             # (A, time_len, 11)
+        fut_11 = future_traj_11                # (A, future_len, 11)
+        squeeze_agent = False
+    else:
+        raise ValueError(f"past_cur_traj_11 must be 2D or 3D. got {past_cur_traj_11.shape}")
+
+    if past_11.shape[0] != fut_11.shape[0]:
+        raise ValueError(f"A(agent) dim mismatch: past={past_11.shape}, future={fut_11.shape}")
+    if past_11.shape[-1] != 11 or fut_11.shape[-1] != 11:
+        raise ValueError(f"last dim must be 11: past={past_11.shape}, future={fut_11.shape}")
+
+    A = int(past_11.shape[0])
+    time_len = int(past_11.shape[1])
+    future_len = int(fut_11.shape[1])
+
+    if A == 0:
+        out = np.zeros((0, time_len + future_len), dtype=np.float32)
+        return out[0] if squeeze_agent else out
+
+    if time_len < 1:
+        raise ValueError(f"time_len must be >= 1. got {time_len}")
+
+    past_len = int(time_len - 1)  # 현재 제외 과거 길이
+
+    # past+future 전체: (A, time_len+future_len, 11)
+    full_11 = np.concatenate([past_11, fut_11], axis=1).astype(np.float32, copy=False)
+
+    # 노드 유효 마스크: (A, time_len+future_len)
+    valid = (np.abs(full_11[:, :, :8]) > float(eps)).any(axis=2)
+
+    # FeasibleProjector 입력 형태로 구성
+    # - past: (B=1, Pnn=A, past_len, 4)
+    # - cur+future: (B=1, Pnn=A, 1+future_len, 4)
+    past_xycs = past_11[:, :past_len, :4].astype(np.float32, copy=False)                 # (A, past_len, 4)
+    cur_xycs = past_11[:, -1:, :4].astype(np.float32, copy=False)                        # (A, 1, 4)
+    fut_xycs = fut_11[:, :, :4].astype(np.float32, copy=False)                           # (A, future_len, 4)
+    cur_future_xycs = np.concatenate([cur_xycs, fut_xycs], axis=1)                        # (A, 1+future_len, 4)
+
+    past_xycs_t = torch.from_numpy(past_xycs).unsqueeze(0)                                # (1, A, past_len, 4)
+    cur_future_xycs_t = torch.from_numpy(cur_future_xycs).unsqueeze(0)                    # (1, A, 1+future_len, 4)
+    valid_t = torch.from_numpy(valid.astype(bool)).unsqueeze(0)                           # (1, A, time_len+future_len)
+
+    projector = _get_feasible_sg_projector()
+
+    with torch.no_grad():
+        # point_len_inputs를 만들고, 그 안의 points_valid를 그대로 사용해 yaw_rate만 계산
+        point_inputs = projector._prepare_points_and_masks(
+            unnorm_diffusion_trajectory=cur_future_xycs_t,           # (1, A, 1+future_len, 4)
+            unnorm_near_past_xyyaw=past_xycs_t,                      # (1, A, past_len, 4)
+            target_past_cur_future_valid=valid_t,                    # (1, A, time_len+future_len)
+        )
+        # (1, A, point_len=101, 4)
+        pts_xycs = point_inputs.unnorm_points_xyyaw
+        pts_valid = point_inputs.points_valid                        # (1, A, 101)
+
+        cos_y = pts_xycs[..., 2]                                     # (1, A, 101)
+        sin_y = pts_xycs[..., 3]                                     # (1, A, 101)
+
+        yaw_rate_t = projector._compute_yaw_rate_via_sg(
+            cos_y=cos_y,
+            sin_y=sin_y,
+            points_valid=pts_valid,
+            dt=float(dt),
+            polyorder=int(polyorder),
+            max_window_len_yaw=int(max_window_len_yaw),
+        )                                                            # (1, A, 101)
+
+    yaw_rate = yaw_rate_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False)         # (A, 101)
+    return yaw_rate[0] if squeeze_agent else yaw_rate
 
 
 def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
@@ -2254,6 +2401,79 @@ class DataProcessor(object):
             #     cur_agent_size_2_dim=cur_agent_size_2_dim,
             # )
 
+            # ✅ [ADDED] ego/neighbor past~current~future v_x, v_y 시퀀스 만들기
+            # - v_x, v_y 는 이미 11차원 텐서의 4:6 채널에 라벨로 들어있음
+            # - past는 "과거~현재(현재 포함)", future는 "현재 제외 미래" 이므로
+            #   이어붙이면 (time_len + future_len) 길이가 됨
+
+            # ego_future_vxy: (time_len + future_len, 2)
+            ego_future_vxy: np.ndarray = np.concatenate(
+                [ego_agent_past[:, 4:6], ego_future_gt_11_dim[:, 4:6]],
+                axis=0,
+            )
+
+            # neighbor_future_vxy: (N, time_len + future_len, 2)
+            # (neighbor_agents_past / neighbor_future_gt_11_dim 와 agent 수/순서 동일)
+            neighbor_future_vxy: np.ndarray = np.concatenate(
+                [
+                    neighbor_agents_past[:, :, 4:6],
+                    neighbor_future_gt_11_dim[:, :, 4:6],
+                ],
+                axis=1,
+            )
+            # =========================================================
+            # ✅ [ADDED] past+future(101) cos/sin(yaw) -> SG yaw_rate -> control(3)
+            # =========================================================
+
+            # (1) past+future 11dim 합치기
+            ego_past_future_gt_11_dim: np.ndarray = np.concatenate(
+                [ego_agent_past, ego_future_gt_11_dim],
+                axis=0,
+            ).astype(np.float32, copy=False)  # (time_len+future_len, 11)
+
+            neighbor_past_future_gt_11_dim: np.ndarray = np.concatenate(
+                [neighbor_agents_past, neighbor_future_gt_11_dim],
+                axis=1,
+            ).astype(np.float32, copy=False)  # (A, time_len+future_len, 11)
+
+            # (2) cos/sin(yaw) 뽑기 (0-based 2:4)
+            ego_past_future_gt_cs_yaw: np.ndarray = ego_past_future_gt_11_dim[:, 2:4].astype(
+                np.float32, copy=False
+            )  # (time_len+future_len, 2)
+
+            neighbor_past_future_gt_cs_yaw: np.ndarray = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(
+                np.float32, copy=False
+            )  # (A, time_len+future_len, 2)
+
+            # (3) SG(yaw_rate) 계산 (FeasibleProjector SG 로직 재사용)
+            ego_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_via_feasible_sg(
+                past_cur_traj_11=ego_agent_past,          # (time_len, 11)  (현재 포함)
+                future_traj_11=ego_future_gt_11_dim,      # (future_len, 11) (현재 제외)
+                dt=0.1,
+                polyorder=2,
+                max_window_len_yaw=7,
+                eps=1e-8,
+            ).astype(np.float32, copy=False)              # (time_len+future_len,)
+
+            neighbor_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_via_feasible_sg(
+                past_cur_traj_11=neighbor_agents_past,     # (A, time_len, 11)
+                future_traj_11=neighbor_future_gt_11_dim,  # (A, future_len, 11)
+                dt=0.1,
+                polyorder=2,
+                max_window_len_yaw=7,
+                eps=1e-8,
+            ).astype(np.float32, copy=False)              # (A, time_len+future_len)
+
+            # (4) vxy + yaw_rate -> control(3)
+            ego_past_future_control: np.ndarray = np.concatenate(
+                [ego_future_vxy, ego_past_future_gt_yaw_rate[:, None]],
+                axis=1,
+            ).astype(np.float32, copy=False)  # (time_len+future_len, 3)
+
+            neighbor_past_future_control: np.ndarray = np.concatenate(
+                [neighbor_future_vxy, neighbor_past_future_gt_yaw_rate[:, :, None]],
+                axis=2,
+            ).astype(np.float32, copy=False)  # (A, time_len+future_len, 3)
 
             # cur_future_control_gt_3_dim 에서,
             key_to_array = {

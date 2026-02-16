@@ -14,7 +14,8 @@ import time
 import sys  # 추가
 import contextlib
 import multiprocessing.pool as mppool
-
+from types import SimpleNamespace
+from diffusion_planner.model.module.feasible import FeasibleProjector
 _LOG_ENABLED = True  # 메인 프로세스는 기본 출력
 _LOGGER_PID_VAL = None  # multiprocessing.Value (pid 저장)
 # =========================
@@ -61,49 +62,6 @@ def _compute_valid_mask_from_feat_11(
     return (abs_max > float(eps))
 
 
-def _extract_future_vxy_from_feat_11(
-    future_feat_11: np.ndarray,  # shape: (F, 11) or (A, F, 11)
-    future_len: int,
-) -> np.ndarray:
-    """미래 11차원 feature에서 v_x, v_y만 뽑아 (F,2) 또는 (A,F,2)로 반환합니다.
-
-    11차원 포맷은 아래 순서를 가정합니다.
-      [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
-
-    즉 v_x, v_y는 마지막 차원 기준으로 4,5번째 칸(0-index)입니다.
-
-    Args:
-        future_feat_11: 미래 feature.
-            - ego: (F,11)
-            - neighbors: (A,F,11)
-        future_len: 미래 길이 F (예: 80)
-
-    Returns:
-        future_vxy:
-            - ego면 (F,2)
-            - neighbors면 (A,F,2)
-            dtype=float32
-    """
-    f = int(future_len)
-
-    if future_feat_11.ndim == 2:
-        # (F,11)
-        if int(future_feat_11.shape[0]) != f or int(future_feat_11.shape[1]) != 11:
-            raise ValueError(
-                f"future_feat_11 must be (F,11). got shape={future_feat_11.shape}, F={f}"
-            )
-    elif future_feat_11.ndim == 3:
-        # (A,F,11)
-        if int(future_feat_11.shape[1]) != f or int(future_feat_11.shape[2]) != 11:
-            raise ValueError(
-                f"future_feat_11 must be (A,F,11). got shape={future_feat_11.shape}, F={f}"
-            )
-    else:
-        raise ValueError(
-            f"future_feat_11 must be 2D or 3D. got shape={future_feat_11.shape}"
-        )
-
-    return future_feat_11[..., 4:6].astype(np.float32)
 
 
 
@@ -429,6 +387,39 @@ def _log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] pid={os.getpid()} {msg}",
           file=sys.stderr,
           flush=True)
+
+_FEASIBLE_PROJECTOR_CACHE: Optional[FeasibleProjector] = None
+
+
+def _get_feasible_projector_for_cache() -> FeasibleProjector:
+    """캐싱 스크립트에서 yaw_rate 계산에만 쓸 FeasibleProjector를 워커당 1개만 만든 뒤 재사용합니다.
+
+    - FeasibleProjector의 SG(yaw_rate 계산) 관련 함수들을 그대로 쓰기 위한 목적입니다.
+    - 신경망(Feasible DL)은 쓰지 않으므로 use_feasible_dl=False로 만들어 초기화 비용을 줄입니다.
+
+    Returns:
+        FeasibleProjector: 워커 프로세스 내에서 재사용되는 인스턴스.
+    """
+    global _FEASIBLE_PROJECTOR_CACHE
+    if _FEASIBLE_PROJECTOR_CACHE is not None:
+        return _FEASIBLE_PROJECTOR_CACHE
+
+    # FeasibleProjector __init__에서 필요한 최소 config 필드만 둡니다.
+    cfg = SimpleNamespace(
+        use_batch_integration=False,
+        feasible_debug_check_mask=False,
+    )
+
+    # hidden_dim은 Feasible DL을 끄면 사실상 쓰이지 않지만, 시그니처 상 필요합니다.
+    fp = FeasibleProjector(
+        config=cfg,
+        hidden_dim=1,
+        use_feasible_dl=False,
+        use_feasible_filter=False,
+    )
+    fp.eval()
+    _FEASIBLE_PROJECTOR_CACHE = fp
+    return fp
 
 
 import numpy as np
@@ -2055,6 +2046,74 @@ def gather_agent_sequence_by_indices(
 
 
 import numpy as np
+
+def build_past_current_and_future_vxy_from_feat_11(
+    past_feat_11: np.ndarray,   # shape: (T, 11) or (A, T, 11)
+    future_feat_11: np.ndarray, # shape: (F, 11) or (A, F, 11)
+) -> np.ndarray:
+    """11차원 특징에서 v_x, v_y만 뽑아 (과거+현재+미래)로 이어붙입니다.
+
+    이 프로젝트의 11차원 agent 특징은 아래 순서를 가집니다.
+      [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
+    따라서 v_x, v_y는 항상 [:, 4:6] 위치에 이미 들어 있습니다.
+
+    이 함수는
+      - 과거+현재(past_feat_11)에서 v_x,v_y를 뽑고
+      - 미래(future_feat_11)에서 v_x,v_y를 뽑아서
+      - 시간축으로 그대로 이어붙여 반환합니다.
+
+    중요한 점:
+      - v_x, v_y는 "데이터셋에 라벨로 들어있는 속도"를 그대로 사용합니다.
+      - 위치를 미분해서 속도를 새로 계산하지 않습니다.
+      - 입력에서 무효 시점이 0으로 채워져 있으면, 출력도 그 시점은 0으로 유지됩니다.
+
+    Args:
+        past_feat_11 (np.ndarray):
+            과거+현재 11차원 특징.
+            shape: (T, 11) 또는 (A, T, 11)
+        future_feat_11 (np.ndarray):
+            미래 11차원 특징(현재 점 제외).
+            shape: (F, 11) 또는 (A, F, 11)
+
+    Returns:
+        np.ndarray:
+            vxy 시계열.
+            shape: (T+F, 2) 또는 (A, T+F, 2)
+            dtype: float32
+    """
+    past = np.asarray(past_feat_11, dtype=np.float32)
+    future = np.asarray(future_feat_11, dtype=np.float32)
+
+    if past.ndim not in (2, 3):
+        raise ValueError(
+            f"past_feat_11 must be (T,11) or (A,T,11). got shape={past.shape}"
+        )
+    if future.ndim != past.ndim:
+        raise ValueError(
+            f"future_feat_11 ndim mismatch. past={past.shape}, future={future.shape}"
+        )
+
+    if past.shape[-1] < 6 or future.shape[-1] < 6:
+        raise ValueError(
+            f"feat_11 last dim must be >= 6 (to include v_x,v_y). "
+            f"past.shape={past.shape}, future.shape={future.shape}"
+        )
+
+    # past/future의 "시간축(-2)과 feature축(-1)을 제외한 앞쪽 shape"가 같아야 합니다.
+    # - (T,11)에서는 past.shape[:-2] == () 이고 future도 동일
+    # - (A,T,11)에서는 past.shape[:-2] == (A,) 이고 future도 (A,) 이어야 함
+    if past.shape[:-2] != future.shape[:-2]:
+        raise ValueError(
+            f"leading dims mismatch (excluding time/feat). "
+            f"past.shape={past.shape}, future.shape={future.shape}"
+        )
+
+    past_vxy = past[..., 4:6]    # shape: (T,2) or (A,T,2)
+    future_vxy = future[..., 4:6]  # shape: (F,2) or (A,F,2)
+
+    # 시간축은 항상 -2 입니다. (마지막 축은 2)
+    vxy = np.concatenate([past_vxy, future_vxy], axis=-2).astype(np.float32)
+    return vxy
 
 
 def pack_agent_features_11(
@@ -4209,10 +4268,6 @@ def build_cache_dict_for_scenario(
         agent_one_hot=one_hot_all[ego_idx],  # (3,)
         enforce_all_invalid_when_current_invalid=False,  # ego는 현재가 무조건 유효(위에서 검증)
     )
-    ego_future_vxy = _extract_future_vxy_from_feat_11(
-        future_feat_11=ego_future_gt_11_dim,  # (F,11)
-        future_len=FUTURE_LEN,
-    )  # (F,2)
 
     # -------------------------
     # neighbors: 현재 시점에 존재하는(agent valid at current)만
@@ -4274,10 +4329,141 @@ def build_cache_dict_for_scenario(
         neighbor_agents_past[out_i] = n_past_11
         neighbor_future_gt_3_dim[out_i] = n_future_3
         neighbor_future_gt_11_dim[out_i] = n_future_11
-    neighbor_future_vxy = _extract_future_vxy_from_feat_11(
-        future_feat_11=neighbor_future_gt_11_dim,  # (A,F,11)
-        future_len=FUTURE_LEN,
-    )  # (A,F,2)
+    # -------------------------
+    # ✅ (추가) ego/neighbor v_x, v_y 전체 시계열 만들기
+    #   - 과거 20 + 현재 1 + 미래 80(현재 제외) => (TIME_LEN + FUTURE_LEN)
+    # -------------------------
+    ego_future_vxy = build_past_current_and_future_vxy_from_feat_11(
+        past_feat_11=ego_agent_past,          # shape: (TIME_LEN, 11)
+        future_feat_11=ego_future_gt_11_dim,  # shape: (FUTURE_LEN, 11)
+    )  # shape: (TIME_LEN + FUTURE_LEN, 2)
+
+    neighbor_future_vxy = build_past_current_and_future_vxy_from_feat_11(
+        past_feat_11=neighbor_agents_past,      # shape: (A, TIME_LEN, 11)
+        future_feat_11=neighbor_future_gt_11_dim,  # shape: (A, FUTURE_LEN, 11)
+    )  # shape: (A, TIME_LEN + FUTURE_LEN, 2)
+    # ============================================================
+    # ✅ (추가) (past+future) 11dim -> cs_yaw -> (FeasibleProjector) yaw_rate -> control
+    #   - FeasibleProjector 내부 함수(_prepare_points_and_masks/_compute_yaw_rate_via_sg) 직접 호출
+    #   - ego + neighbor를 (B=1, Pnn=1+A)로 묶어서 batch로 한 번에 계산
+    # ============================================================
+    time_len = int(TIME_LEN)                 # 예: 21 (past+current)
+    future_len = int(FUTURE_LEN)             # 예: 80
+    point_len = int(time_len + future_len)   # 예: 101
+    past_len_nodes = int(max(0, time_len - 1))  # 예: 20 (current 제외)
+
+    # (1) past+future 11차원
+    ego_past_future_gt_11_dim = np.concatenate(
+        [ego_agent_past, ego_future_gt_11_dim],
+        axis=0,
+    ).astype(np.float32)  # (101,11)
+
+    neighbor_past_future_gt_11_dim = np.concatenate(
+        [neighbor_agents_past, neighbor_future_gt_11_dim],
+        axis=1,
+    ).astype(np.float32)  # (A,101,11)
+
+    # (2) cos/sin(yaw) (원본 값, normalization 없음)
+    ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(np.float32)          # (101,2)
+    neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(np.float32)  # (A,101,2)
+
+    # (3) 유효 마스크: 11차원 중 첫 8차원이 전부 0이면 무효
+    ego_pf_valid = _compute_valid_mask_from_prefix_nonzero(
+        ego_past_future_gt_11_dim,
+        prefix_dim=8,
+    )  # (101,)
+
+    neighbor_pf_valid = _compute_valid_mask_from_prefix_nonzero(
+        neighbor_past_future_gt_11_dim,
+        prefix_dim=8,
+    )  # (A,101)
+
+    # (4) FeasibleProjector 입력 배치 구성 (B=1, Pnn=1+A)
+
+    # past(현재 제외): (B,Pnn,past_len,4)  where 4=[x,y,cos,sin]
+    if past_len_nodes > 0:
+        ego_past_xyyaw = ego_agent_past[:past_len_nodes, 0:4].astype(np.float32)  # (20,4)
+        if agent_num > 0:
+            neigh_past_xyyaw = neighbor_agents_past[:, :past_len_nodes, 0:4].astype(np.float32)  # (A,20,4)
+        else:
+            neigh_past_xyyaw = np.zeros((0, past_len_nodes, 4), dtype=np.float32)
+
+        past_xyyaw_pnn = np.concatenate(
+            [ego_past_xyyaw[None, ...], neigh_past_xyyaw],
+            axis=0,
+        ).astype(np.float32)  # (1+A,20,4)
+
+        unnorm_near_past_xyyaw_t: Optional[torch.Tensor] = torch.from_numpy(past_xyyaw_pnn[None, ...])  # (1,1+A,20,4)
+    else:
+        unnorm_near_past_xyyaw_t = None
+
+    # current+future: (B,Pnn,1+future_len,4)
+    ego_cur_xyyaw = ego_agent_past[past_len_nodes:past_len_nodes + 1, 0:4].astype(np.float32)  # (1,4)
+    ego_fut_xyyaw = ego_future_gt_11_dim[:, 0:4].astype(np.float32)  # (80,4)
+    ego_cur_future_xyyaw = np.concatenate([ego_cur_xyyaw, ego_fut_xyyaw], axis=0).astype(np.float32)  # (81,4)
+
+    if agent_num > 0:
+        neigh_cur_xyyaw = neighbor_agents_past[:, past_len_nodes:past_len_nodes + 1, 0:4].astype(np.float32)  # (A,1,4)
+        neigh_fut_xyyaw = neighbor_future_gt_11_dim[:, :, 0:4].astype(np.float32)  # (A,80,4)
+        neigh_cur_future_xyyaw = np.concatenate([neigh_cur_xyyaw, neigh_fut_xyyaw], axis=1).astype(np.float32)  # (A,81,4)
+    else:
+        neigh_cur_future_xyyaw = np.zeros((0, 1 + future_len, 4), dtype=np.float32)
+
+    cur_future_xyyaw_pnn = np.concatenate(
+        [ego_cur_future_xyyaw[None, ...], neigh_cur_future_xyyaw],
+        axis=0,
+    ).astype(np.float32)  # (1+A,81,4)
+
+    unnorm_diffusion_trajectory_t = torch.from_numpy(cur_future_xyyaw_pnn[None, ...])  # (1,1+A,81,4)
+
+    # valid: (B,Pnn,point_len) = (1,1+A,101)
+    valid_pnn = np.concatenate(
+        [ego_pf_valid[None, ...], neighbor_pf_valid],
+        axis=0,
+    ).astype(bool)  # (1+A,101)
+    target_past_cur_future_valid_t = torch.from_numpy(valid_pnn[None, ...])  # (1,1+A,101)
+
+    # (5) yaw_rate 계산 (FeasibleProjector 내부 함수 직접 호출, batch)
+    fp = _get_feasible_projector_for_cache()
+    with torch.no_grad():
+        point_inputs = fp._prepare_points_and_masks(
+            unnorm_diffusion_trajectory=unnorm_diffusion_trajectory_t,      # (1,1+A,81,4)
+            unnorm_near_past_xyyaw=unnorm_near_past_xyyaw_t,                # (1,1+A,20,4) or None
+            target_past_cur_future_valid=target_past_cur_future_valid_t,    # (1,1+A,101)
+        )
+        pts = point_inputs.unnorm_points_xyyaw    # (1,1+A,101,4)
+        pts_valid = point_inputs.points_valid     # (1,1+A,101)
+
+        cos_y = pts[..., 2]  # (1,1+A,101)
+        sin_y = pts[..., 3]  # (1,1+A,101)
+
+        yaw_rate_t = fp._compute_yaw_rate_via_sg(
+            cos_y=cos_y,
+            sin_y=sin_y,
+            points_valid=pts_valid,
+            dt=float(DT_SEC),
+            polyorder=2,
+            max_window_len_yaw=7,
+        )  # (1,1+A,101)
+
+    yaw_rate_pnn = yaw_rate_t.squeeze(0).cpu().numpy().astype(np.float32)  # (1+A,101)
+    ego_past_future_gt_yaw_rate = yaw_rate_pnn[0]         # (101,)
+    neighbor_past_future_gt_yaw_rate = yaw_rate_pnn[1:]   # (A,101)
+
+    # (6) control = [v_x, v_y, yaw_rate]
+    ego_past_future_control = np.concatenate(
+        [ego_future_vxy, ego_past_future_gt_yaw_rate[:, None]],
+        axis=1,
+    ).astype(np.float32)  # (101,3)
+
+    if agent_num > 0:
+        neighbor_past_future_control = np.concatenate(
+            [neighbor_future_vxy, neighbor_past_future_gt_yaw_rate[..., None]],
+            axis=2,
+        ).astype(np.float32)  # (A,101,3)
+    else:
+        neighbor_past_future_control = np.zeros((0, point_len, 3), dtype=np.float32)
+
     # -------------------------
     # ✅ ego + neighbor를 한 줄로 묶은 target_id / target_z 만들기
     # -------------------------

@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-
+# TODO: past_future_seg_control_gt_3_dim 에도 near을 적용해야 맞음.
 # --- add_control_to_npz.py로 미리 저장될 수 있는 key들 ---
 _PRECOMPUTED_VALIDITY_KEYS: List[str] = [
     "ego_agent_past_is_valid",

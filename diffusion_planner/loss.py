@@ -1057,7 +1057,6 @@ def _aggregate_weighted_loss(
 
 
 def _compute_integration_and_constraint_losses(
-    args: Any,
     decoder_output: Dict[str, torch.Tensor],
     norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
@@ -1585,7 +1584,6 @@ def diffusion_loss_func(
         # norm_target_future_gt_4_dim  # (B, (1+)Pnn, future_len, 4)
         (integration_loss_val, constraint_loss_val, integrated_trajectory,
          control_constraint_diff) = _compute_integration_and_constraint_losses(
-             args=args,
              decoder_output=decoder_output,
              norm_target_future_gt_4_dim=
              norm_target_future_gt_4_dim, # (B, (1+)Pnn, future_len, 4)
