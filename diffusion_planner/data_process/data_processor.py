@@ -2221,6 +2221,188 @@ class DataProcessor(object):
         key_to_road_safety["crosswalk_points"] = crosswalk_points
         return key_to_road_safety
 
+    @staticmethod
+    def _concat_past_future_vxy_from_traj11(
+        past_cur_traj_11: np.ndarray,  # (time_len,11) or (A,time_len,11)
+        future_traj_11: np.ndarray,    # (future_len,11) or (A,future_len,11)
+    ) -> np.ndarray:
+        """past~current~future의 (v_x, v_y) 시퀀스를 만든다.
+
+        Args:
+            past_cur_traj_11 (np.ndarray):
+                - ego: (time_len, 11)
+                - neighbor: (A, time_len, 11)
+                - time_len = past_len+1 (현재 포함)
+            future_traj_11 (np.ndarray):
+                - ego: (future_len, 11)
+                - neighbor: (A, future_len, 11)
+                - future_len = 현재 제외 미래 길이
+        Returns:
+            np.ndarray:
+                - ego: (time_len+future_len, 2)
+                - neighbor: (A, time_len+future_len, 2)
+                - 마지막 2는 [v_x, v_y]
+        """
+        past = np.asarray(past_cur_traj_11)
+        fut = np.asarray(future_traj_11)
+
+        if past.ndim != fut.ndim:
+            raise ValueError(f"past/future ndim mismatch: past={past.shape}, future={fut.shape}")
+        if past.shape[-1] != 11 or fut.shape[-1] != 11:
+            raise ValueError(f"last dim must be 11: past={past.shape}, future={fut.shape}")
+
+        if past.ndim == 2:
+            axis_time = 0
+        elif past.ndim == 3:
+            if past.shape[0] != fut.shape[0]:
+                raise ValueError(f"A(agent) dim mismatch: past={past.shape}, future={fut.shape}")
+            axis_time = 1
+        else:
+            raise ValueError(f"traj_11 must be 2D or 3D. got past={past.shape}")
+
+        past_vxy = past[..., 4:6]
+        fut_vxy = fut[..., 4:6]
+        vxy = np.concatenate([past_vxy, fut_vxy], axis=axis_time).astype(np.float32, copy=False)
+        return vxy
+
+    @staticmethod
+    def _build_past_future_yaw_inputs_from_traj11(
+        past_cur_traj_11: np.ndarray,  # (time_len,11) or (A,time_len,11)
+        future_traj_11: np.ndarray,    # (future_len,11) or (A,future_len,11)
+        *,
+        eps_valid: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """yaw_rate 계산에 필요한 (cs_yaw, valid_mask)를 만든다.
+
+        - valid_mask: 앞 8개 값([x,y,cos,sin,vx,vy,width,length])이 전부 0이면 무효(False)
+
+        Args:
+            past_cur_traj_11 (np.ndarray):
+                - ego: (time_len, 11)
+                - neighbor: (A, time_len, 11)
+            future_traj_11 (np.ndarray):
+                - ego: (future_len, 11)
+                - neighbor: (A, future_len, 11)
+            eps_valid (float):
+                0 판정 기준(아주 작은 값).
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - past_future_cs_yaw:
+                    · ego: (time_len+future_len, 2)
+                    · neighbor: (A, time_len+future_len, 2)
+                    · 마지막 2는 [cos(yaw), sin(yaw)]
+                - past_future_valid:
+                    · ego: (time_len+future_len,) bool
+                    · neighbor: (A, time_len+future_len) bool
+        """
+        past = np.asarray(past_cur_traj_11)
+        fut = np.asarray(future_traj_11)
+
+        if past.ndim != fut.ndim:
+            raise ValueError(f"past/future ndim mismatch: past={past.shape}, future={fut.shape}")
+        if past.shape[-1] != 11 or fut.shape[-1] != 11:
+            raise ValueError(f"last dim must be 11: past={past.shape}, future={fut.shape}")
+
+        if past.ndim == 2:
+            axis_time = 0
+        elif past.ndim == 3:
+            if past.shape[0] != fut.shape[0]:
+                raise ValueError(f"A(agent) dim mismatch: past={past.shape}, future={fut.shape}")
+            axis_time = 1
+        else:
+            raise ValueError(f"traj_11 must be 2D or 3D. got past={past.shape}")
+
+        # valid: (time_len,) or (A,time_len)
+        past_valid = (np.abs(past[..., :8]) > float(eps_valid)).any(axis=-1)
+        fut_valid = (np.abs(fut[..., :8]) > float(eps_valid)).any(axis=-1)
+        past_future_valid = np.concatenate([past_valid, fut_valid], axis=axis_time).astype(bool, copy=False)
+
+        # cs_yaw: (time_len,2) or (A,time_len,2)
+        past_cs = past[..., 2:4]
+        fut_cs = fut[..., 2:4]
+        past_future_cs_yaw = np.concatenate([past_cs, fut_cs], axis=axis_time).astype(np.float32, copy=False)
+
+        return past_future_cs_yaw, past_future_valid
+
+    def _build_past_future_control_vxy_yawrate_from_traj11(
+        self,
+        past_cur_traj_11: np.ndarray,  # (time_len,11) or (A,time_len,11)
+        future_traj_11: np.ndarray,    # (future_len,11) or (A,future_len,11)
+        *,
+        dt: float,
+        polyorder: int,
+        max_window_len_yaw: int,
+        eps_valid: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """past~current~future 기반 control(3) = [v_x, v_y, yaw_rate] 를 만든다.
+
+        흐름:
+          1) vxy 시퀀스 만들기
+          2) cs_yaw + valid 만들기
+          3) cs_yaw + valid로 SG(yaw_rate) 계산
+          4) vxy + yaw_rate를 concat해서 control(3) 만들기
+
+        Args:
+            past_cur_traj_11: (time_len,11) 또는 (A,time_len,11)
+            future_traj_11:   (future_len,11) 또는 (A,future_len,11)
+            dt: 샘플 간 시간 간격
+            polyorder: SG 다항 차수
+            max_window_len_yaw: yaw_rate 미분 창 길이
+            eps_valid: 유효 판정 기준
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - past_future_control:
+                    · ego: (time_len+future_len, 3)
+                    · neighbor: (A, time_len+future_len, 3)
+                    · 마지막 3은 [v_x, v_y, yaw_rate]
+                - past_future_yaw_rate:
+                    · ego: (time_len+future_len,)
+                    · neighbor: (A, time_len+future_len)
+        """
+        past_future_vxy = self._concat_past_future_vxy_from_traj11(
+            past_cur_traj_11=past_cur_traj_11,
+            future_traj_11=future_traj_11,
+        )
+
+        past_future_cs_yaw, past_future_valid = self._build_past_future_yaw_inputs_from_traj11(
+            past_cur_traj_11=past_cur_traj_11,
+            future_traj_11=future_traj_11,
+            eps_valid=float(eps_valid),
+        )
+
+        past_future_yaw_rate = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
+            past_future_cs_yaw=past_future_cs_yaw,
+            past_future_valid=past_future_valid,
+            dt=float(dt),
+            polyorder=int(polyorder),
+            max_window_len_yaw=int(max_window_len_yaw),
+        ).astype(np.float32, copy=False)
+
+        # vxy + yaw_rate -> control(3)
+        if past_future_vxy.ndim == 2:
+            # ego: (T,2) + (T,1) -> (T,3)
+            if past_future_yaw_rate.ndim != 1 or past_future_yaw_rate.shape[0] != past_future_vxy.shape[0]:
+                raise ValueError(
+                    f"ego yaw_rate shape mismatch: vxy={past_future_vxy.shape}, yaw_rate={past_future_yaw_rate.shape}"
+                )
+            past_future_control = np.concatenate(
+                [past_future_vxy, past_future_yaw_rate[:, None]],
+                axis=1,
+            ).astype(np.float32, copy=False)
+        else:
+            # neighbor: (A,T,2) + (A,T,1) -> (A,T,3)
+            if past_future_yaw_rate.ndim != 2 or past_future_yaw_rate.shape[:2] != past_future_vxy.shape[:2]:
+                raise ValueError(
+                    f"neighbor yaw_rate shape mismatch: vxy={past_future_vxy.shape}, yaw_rate={past_future_yaw_rate.shape}"
+                )
+            past_future_control = np.concatenate(
+                [past_future_vxy, past_future_yaw_rate[:, :, None]],
+                axis=2,
+            ).astype(np.float32, copy=False)
+
+        return past_future_control, past_future_yaw_rate
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
         for scenario in scenarios:
@@ -2375,97 +2557,26 @@ class DataProcessor(object):
             #     near_cur_future_valid=near_cur_future_valid,
             #     cur_agent_size_2_dim=cur_agent_size_2_dim,
             # )
-
-            # ✅ [ADDED] ego/neighbor past~current~future v_x, v_y 시퀀스 만들기
-            # - v_x, v_y 는 이미 11차원 텐서의 4:6 채널에 라벨로 들어있음
-            # - past는 "과거~현재(현재 포함)", future는 "현재 제외 미래" 이므로
-            #   이어붙이면 (time_len + future_len) 길이가 됨
-
-            # ego_future_vxy: (time_len + future_len, 2)
-            ego_future_vxy: np.ndarray = np.concatenate(
-                [ego_agent_past[:, 4:6], ego_future_gt_11_dim[:, 4:6]],
-                axis=0,
-            )
-
-            # neighbor_future_vxy: (N, time_len + future_len, 2)
-            # (neighbor_agents_past / neighbor_future_gt_11_dim 와 agent 수/순서 동일)
-            neighbor_future_vxy: np.ndarray = np.concatenate(
-                [
-                    neighbor_agents_past[:, :, 4:6],
-                    neighbor_future_gt_11_dim[:, :, 4:6],
-                ],
-                axis=1,
-            )
             # =========================================================
-            # ✅ [ADDED] past+future(101) cos/sin(yaw) -> SG yaw_rate -> control(3)
+            # ✅ [ADDED] past+future 기반 control(3) = [v_x, v_y, yaw_rate]
             # =========================================================
-            # =========================================================
-            # ✅ [ADDED] past+future(101) cos/sin(yaw) -> SG yaw_rate -> control(3)
-            #   - cs_yaw는 "yaw_rate 계산을 위한 입력"으로만 사용(출력 목적 아님)
-            # =========================================================
-            eps_valid: float = 1e-8
-
-            # (1) past+future 유효 마스크 만들기 (앞 8차원이 전부 0이면 무효)
-            # ego_past_future_valid: (time_len+future_len,)
-            ego_past_future_valid: np.ndarray = (
-                np.abs(
-                    np.concatenate(
-                        [ego_agent_past[:, :8], ego_future_gt_11_dim[:, :8]],
-                        axis=0,
-                    )
-                ) > eps_valid
-            ).any(axis=1)
-
-            # neighbor_past_future_valid: (A, time_len+future_len)
-            neighbor_past_future_valid: np.ndarray = (
-                np.abs(
-                    np.concatenate(
-                        [neighbor_agents_past[:, :, :8], neighbor_future_gt_11_dim[:, :, :8]],
-                        axis=1,
-                    )
-                ) > eps_valid
-            ).any(axis=2)
-
-            # (2) past+future cos/sin(yaw) 뽑기 (0-based 2:4)
-            # ego_past_future_gt_cs_yaw: (time_len+future_len, 2)
-            ego_past_future_gt_cs_yaw: np.ndarray = np.concatenate(
-                [ego_agent_past[:, 2:4], ego_future_gt_11_dim[:, 2:4]],
-                axis=0,
-            ).astype(np.float32, copy=False)
-
-            # neighbor_past_future_gt_cs_yaw: (A, time_len+future_len, 2)
-            neighbor_past_future_gt_cs_yaw: np.ndarray = np.concatenate(
-                [neighbor_agents_past[:, :, 2:4], neighbor_future_gt_11_dim[:, :, 2:4]],
-                axis=1,
-            ).astype(np.float32, copy=False)
-
-            # (3) SG(yaw_rate) 계산: cs_yaw를 그대로 사용 (중복 계산 제거)
-            ego_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
-                past_future_cs_yaw=ego_past_future_gt_cs_yaw,
-                past_future_valid=ego_past_future_valid,
+            ego_past_future_control, ego_past_future_gt_yaw_rate = self._build_past_future_control_vxy_yawrate_from_traj11(
+                past_cur_traj_11=ego_agent_past,         # (time_len, 11)
+                future_traj_11=ego_future_gt_11_dim,     # (future_len, 11)
                 dt=0.1,
                 polyorder=2,
                 max_window_len_yaw=7,
-            ).astype(np.float32, copy=False)  # (time_len+future_len,)
+                eps_valid=1e-8,
+            )
 
-            neighbor_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
-                past_future_cs_yaw=neighbor_past_future_gt_cs_yaw,
-                past_future_valid=neighbor_past_future_valid,
+            neighbor_past_future_control, neighbor_past_future_gt_yaw_rate = self._build_past_future_control_vxy_yawrate_from_traj11(
+                past_cur_traj_11=neighbor_agents_past,      # (A, time_len, 11)
+                future_traj_11=neighbor_future_gt_11_dim,   # (A, future_len, 11)
                 dt=0.1,
                 polyorder=2,
                 max_window_len_yaw=7,
-            ).astype(np.float32, copy=False)  # (A, time_len+future_len)
-
-            # (4) vxy + yaw_rate -> control(3)
-            ego_past_future_control: np.ndarray = np.concatenate(
-                [ego_future_vxy, ego_past_future_gt_yaw_rate[:, None]],
-                axis=1,
-            ).astype(np.float32, copy=False)  # (time_len+future_len, 3)
-
-            neighbor_past_future_control: np.ndarray = np.concatenate(
-                [neighbor_future_vxy, neighbor_past_future_gt_yaw_rate[:, :, None]],
-                axis=2,
-            ).astype(np.float32, copy=False)  # (A, time_len+future_len, 3)
+                eps_valid=1e-8,
+            )
 
 
             # cur_future_control_gt_3_dim 에서,

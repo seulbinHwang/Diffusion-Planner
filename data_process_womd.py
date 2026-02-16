@@ -4450,99 +4450,75 @@ def build_cache_dict_for_scenario(
         past_feat_11=neighbor_agents_past,      # shape: (A, TIME_LEN, 11)
         future_feat_11=neighbor_future_gt_11_dim,  # shape: (A, FUTURE_LEN, 11)
     )  # shape: (A, TIME_LEN + FUTURE_LEN, 2)
-    # ============================================================
-    # ✅ (추가) (past+future) 11dim -> cs_yaw -> (FeasibleProjector) yaw_rate -> control
-    #   - FeasibleProjector 내부 함수(_prepare_points_and_masks/_compute_yaw_rate_via_sg) 직접 호출
-    #   - ego + neighbor를 (B=1, Pnn=1+A)로 묶어서 batch로 한 번에 계산
-    # ============================================================
-    time_len = int(TIME_LEN)                 # 예: 21 (past+current)
-    future_len = int(FUTURE_LEN)             # 예: 80
-    point_len = int(time_len + future_len)   # 예: 101
-    past_len_nodes = int(max(0, time_len - 1))  # 예: 20 (current 제외)
+    # -------------------------
+    # ✅ (추가) ego/neighbor v_x, v_y 전체 시계열 만들기
+    #   - 과거 20 + 현재 1 + 미래 80(현재 제외) => (TIME_LEN + FUTURE_LEN)
+    # -------------------------
+    ego_future_vxy = build_past_current_and_future_vxy_from_feat_11(
+        past_feat_11=ego_agent_past,          # (TIME_LEN, 11)
+        future_feat_11=ego_future_gt_11_dim,  # (FUTURE_LEN, 11)
+    )  # (TIME_LEN + FUTURE_LEN, 2)
 
-    # (1) past+future 11차원
+    neighbor_future_vxy = build_past_current_and_future_vxy_from_feat_11(
+        past_feat_11=neighbor_agents_past,        # (A, TIME_LEN, 11)
+        future_feat_11=neighbor_future_gt_11_dim, # (A, FUTURE_LEN, 11)
+    )  # (A, TIME_LEN + FUTURE_LEN, 2)
+
+    # ============================================================
+    # ✅ (핵심) cs_yaw(=cos/sin) 그대로 사용해서 yaw_rate만 계산 (중복 제거 버전)
+    # ============================================================
+    point_len = int(TIME_LEN + FUTURE_LEN)  # 예: 101
+
+    # (1) past+future 11차원 (현재 포함 past + 현재 제외 future)
     ego_past_future_gt_11_dim = np.concatenate(
         [ego_agent_past, ego_future_gt_11_dim],
         axis=0,
-    ).astype(np.float32)  # (101,11)
+    ).astype(np.float32)  # (point_len, 11)
 
     neighbor_past_future_gt_11_dim = np.concatenate(
         [neighbor_agents_past, neighbor_future_gt_11_dim],
         axis=1,
-    ).astype(np.float32)  # (A,101,11)
+    ).astype(np.float32)  # (A, point_len, 11)
 
-    # (2) cos/sin(yaw) (원본 값, normalization 없음)
-    ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(np.float32)          # (101,2)
-    neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(np.float32)  # (A,101,2)
+    # (2) cs_yaw (이미 11차원에 들어있는 cos/sin 재사용)
+    ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(np.float32)               # (point_len, 2)
+    neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(np.float32) # (A, point_len, 2)
 
-    # (3) 유효 마스크: 11차원 중 첫 8차원이 전부 0이면 무효
+    # (3) valid 마스크 (앞 8차원이 전부 0이면 무효)
     ego_pf_valid = _compute_valid_mask_from_prefix_nonzero(
         ego_past_future_gt_11_dim,
         prefix_dim=8,
-    )  # (101,)
+    )  # (point_len,)
 
     neighbor_pf_valid = _compute_valid_mask_from_prefix_nonzero(
         neighbor_past_future_gt_11_dim,
         prefix_dim=8,
-    )  # (A,101)
+    )  # (A, point_len)
 
-    # (4) FeasibleProjector 입력 배치 구성 (B=1, Pnn=1+A)
-
-    # past(현재 제외): (B,Pnn,past_len,4)  where 4=[x,y,cos,sin]
-    if past_len_nodes > 0:
-        ego_past_xyyaw = ego_agent_past[:past_len_nodes, 0:4].astype(np.float32)  # (20,4)
-        if agent_num > 0:
-            neigh_past_xyyaw = neighbor_agents_past[:, :past_len_nodes, 0:4].astype(np.float32)  # (A,20,4)
-        else:
-            neigh_past_xyyaw = np.zeros((0, past_len_nodes, 4), dtype=np.float32)
-
-
-
-
-    # (5) yaw_rate 계산 (FeasibleProjector 내부 함수 직접 호출, batch)
-    fp = _get_feasible_projector_for_cache()
-    with torch.no_grad():
-        # (2) cos/sin(yaw) (원본 값, normalization 없음)
-        ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(
-            np.float32)  # (101,2)
-        neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[
-            :, :, 2:4].astype(np.float32)  # (A,101,2)
-
-        # (3) 유효 마스크: 11차원 중 첫 8차원이 전부 0이면 무효
-        ego_pf_valid = _compute_valid_mask_from_prefix_nonzero(
-            ego_past_future_gt_11_dim,
-            prefix_dim=8,
-        )  # (101,)
-
-        neighbor_pf_valid = _compute_valid_mask_from_prefix_nonzero(
-            neighbor_past_future_gt_11_dim,
-            prefix_dim=8,
-        )  # (A,101)
-
-        # (4) yaw_rate 계산: cs_yaw를 그대로 사용해서 SG 로직만 재사용
-        ego_past_future_gt_yaw_rate, neighbor_past_future_gt_yaw_rate = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_projector(
-            ego_past_future_gt_cs_yaw=ego_past_future_gt_cs_yaw,  # (101,2)
-            neighbor_past_future_gt_cs_yaw=neighbor_past_future_gt_cs_yaw,
-            # (A,101,2)
-            ego_pf_valid=ego_pf_valid,  # (101,)
-            neighbor_pf_valid=neighbor_pf_valid,  # (A,101)
+    # (4) yaw_rate 계산 (helper 내부에서 FeasibleProjector SG 로직 재사용)
+    ego_past_future_gt_yaw_rate, neighbor_past_future_gt_yaw_rate = (
+        compute_past_future_yaw_rate_from_cs_yaw_via_feasible_projector(
+            ego_past_future_gt_cs_yaw=ego_past_future_gt_cs_yaw,               # (point_len,2)
+            neighbor_past_future_gt_cs_yaw=neighbor_past_future_gt_cs_yaw,     # (A,point_len,2)
+            ego_pf_valid=ego_pf_valid,                                         # (point_len,)
+            neighbor_pf_valid=neighbor_pf_valid,                               # (A,point_len)
             dt_sec=float(DT_SEC),
             polyorder=2,
             max_window_len_yaw=7,
         )
+    )
 
-
-    # (6) control = [v_x, v_y, yaw_rate]
+    # (5) control = [v_x, v_y, yaw_rate]
     ego_past_future_control = np.concatenate(
         [ego_future_vxy, ego_past_future_gt_yaw_rate[:, None]],
         axis=1,
-    ).astype(np.float32)  # (101,3)
+    ).astype(np.float32)  # (point_len, 3)
 
     if agent_num > 0:
         neighbor_past_future_control = np.concatenate(
             [neighbor_future_vxy, neighbor_past_future_gt_yaw_rate[..., None]],
             axis=2,
-        ).astype(np.float32)  # (A,101,3)
+        ).astype(np.float32)  # (A, point_len, 3)
     else:
         neighbor_past_future_control = np.zeros((0, point_len, 3), dtype=np.float32)
 
