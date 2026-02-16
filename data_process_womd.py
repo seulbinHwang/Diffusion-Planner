@@ -390,6 +390,114 @@ def _log(msg: str) -> None:
 
 _FEASIBLE_PROJECTOR_CACHE: Optional[FeasibleProjector] = None
 
+def compute_past_future_yaw_rate_from_cs_yaw_via_feasible_projector(
+    ego_past_future_gt_cs_yaw: np.ndarray,          # shape: (point_len, 2)
+    neighbor_past_future_gt_cs_yaw: np.ndarray,     # shape: (A, point_len, 2)
+    ego_pf_valid: np.ndarray,                       # shape: (point_len,)
+    neighbor_pf_valid: np.ndarray,                  # shape: (A, point_len)
+    *,
+    dt_sec: float,
+    polyorder: int = 2,
+    max_window_len_yaw: int = 7,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """(cos(yaw), sin(yaw))을 그대로 사용해 yaw_rate를 계산합니다.
+
+    목적
+    ----
+    - 이미 계산해 둔 cs_yaw(=cos/sin) 시계열을 그대로 사용해,
+      FeasibleProjector의 SG(yaw_rate) 로직만 재사용합니다.
+    - 이렇게 하면 points(x,y,cos,sin)를 다시 만들거나,
+      그 안에서 다시 cos/sin을 뽑는 중복 계산을 줄일 수 있습니다.
+
+    Args:
+        ego_past_future_gt_cs_yaw:
+            shape: (point_len, 2), dtype float32 권장.
+            마지막 축 2는 [cos(yaw), sin(yaw)] 입니다.
+        neighbor_past_future_gt_cs_yaw:
+            shape: (A, point_len, 2), dtype float32 권장.
+        ego_pf_valid:
+            shape: (point_len,), dtype bool.
+            True면 유효 시점입니다.
+        neighbor_pf_valid:
+            shape: (A, point_len), dtype bool.
+        dt_sec:
+            샘플 간 시간 간격(초).
+        polyorder:
+            SG 계산 차수(기본 2).
+        max_window_len_yaw:
+            SG 창 최대 길이(기본 7).
+
+    Returns:
+        ego_yaw_rate:
+            shape: (point_len,), dtype float32
+        neighbor_yaw_rate:
+            shape: (A, point_len), dtype float32
+    """
+    ego_cs = np.asarray(ego_past_future_gt_cs_yaw, dtype=np.float32)
+    neigh_cs = np.asarray(neighbor_past_future_gt_cs_yaw, dtype=np.float32)
+
+    ego_valid = np.asarray(ego_pf_valid, dtype=bool)
+    neigh_valid = np.asarray(neighbor_pf_valid, dtype=bool)
+
+    if ego_cs.ndim != 2 or int(ego_cs.shape[1]) != 2:
+        raise ValueError(f"ego_past_future_gt_cs_yaw must be (point_len,2). got={ego_cs.shape}")
+    if neigh_cs.ndim != 3 or int(neigh_cs.shape[2]) != 2:
+        raise ValueError(f"neighbor_past_future_gt_cs_yaw must be (A,point_len,2). got={neigh_cs.shape}")
+
+    point_len = int(ego_cs.shape[0])
+    if int(ego_valid.shape[0]) != point_len:
+        raise ValueError(
+            "ego_pf_valid length mismatch. "
+            f"ego_pf_valid.shape={ego_valid.shape}, point_len={point_len}"
+        )
+
+    A = int(neigh_cs.shape[0])
+    if int(neigh_cs.shape[1]) != point_len:
+        raise ValueError(
+            "neighbor_past_future_gt_cs_yaw point_len mismatch. "
+            f"neighbor.shape={neigh_cs.shape}, point_len={point_len}"
+        )
+    if neigh_valid.shape != (A, point_len):
+        raise ValueError(
+            "neighbor_pf_valid shape mismatch. "
+            f"neighbor_pf_valid.shape={neigh_valid.shape}, expected={(A, point_len)}"
+        )
+
+    # (1) ego+neighbor를 (Pnn=1+A)로 묶기
+    cs_yaw_pnn = np.concatenate(
+        [ego_cs[None, ...], neigh_cs],
+        axis=0,
+    ).astype(np.float32)  # shape: (1+A, point_len, 2)
+
+    valid_pnn = np.concatenate(
+        [ego_valid[None, ...], neigh_valid],
+        axis=0,
+    ).astype(bool)  # shape: (1+A, point_len)
+
+    # (2) torch 입력 (B=1, Pnn=1+A)
+    # cos_y/sin_y: (1, 1+A, point_len)
+    cos_y_t = torch.from_numpy(np.ascontiguousarray(cs_yaw_pnn[..., 0][None, ...]))
+    sin_y_t = torch.from_numpy(np.ascontiguousarray(cs_yaw_pnn[..., 1][None, ...]))
+    points_valid_t = torch.from_numpy(np.ascontiguousarray(valid_pnn[None, ...]))  # bool
+
+    # (3) SG(yaw_rate) 계산 (FeasibleProjector SG 로직 재사용)
+    fp = _get_feasible_projector_for_cache()
+    with torch.no_grad():
+        yaw_rate_t = fp._compute_yaw_rate_via_sg(
+            cos_y=cos_y_t,
+            sin_y=sin_y_t,
+            points_valid=points_valid_t,
+            dt=float(dt_sec),
+            polyorder=int(polyorder),
+            max_window_len_yaw=int(max_window_len_yaw),
+        )  # shape: (1, 1+A, point_len)
+
+    yaw_rate_pnn = yaw_rate_t.squeeze(0).cpu().numpy().astype(np.float32)  # (1+A, point_len)
+    ego_yaw_rate = yaw_rate_pnn[0]         # (point_len,)
+    neighbor_yaw_rate = yaw_rate_pnn[1:]   # (A, point_len)
+
+    return ego_yaw_rate, neighbor_yaw_rate
+
 
 def _get_feasible_projector_for_cache() -> FeasibleProjector:
     """캐싱 스크립트에서 yaw_rate 계산에만 쓸 FeasibleProjector를 워커당 1개만 만든 뒤 재사용합니다.
@@ -4393,9 +4501,6 @@ def build_cache_dict_for_scenario(
             axis=0,
         ).astype(np.float32)  # (1+A,20,4)
 
-        unnorm_near_past_xyyaw_t: Optional[torch.Tensor] = torch.from_numpy(past_xyyaw_pnn[None, ...])  # (1,1+A,20,4)
-    else:
-        unnorm_near_past_xyyaw_t = None
 
     # current+future: (B,Pnn,1+future_len,4)
     ego_cur_xyyaw = ego_agent_past[past_len_nodes:past_len_nodes + 1, 0:4].astype(np.float32)  # (1,4)
@@ -4414,7 +4519,6 @@ def build_cache_dict_for_scenario(
         axis=0,
     ).astype(np.float32)  # (1+A,81,4)
 
-    unnorm_diffusion_trajectory_t = torch.from_numpy(cur_future_xyyaw_pnn[None, ...])  # (1,1+A,81,4)
 
     # valid: (B,Pnn,point_len) = (1,1+A,101)
     valid_pnn = np.concatenate(
@@ -4426,29 +4530,35 @@ def build_cache_dict_for_scenario(
     # (5) yaw_rate 계산 (FeasibleProjector 내부 함수 직접 호출, batch)
     fp = _get_feasible_projector_for_cache()
     with torch.no_grad():
-        point_inputs = fp._prepare_points_and_masks(
-            unnorm_diffusion_trajectory=unnorm_diffusion_trajectory_t,      # (1,1+A,81,4)
-            unnorm_near_past_xyyaw=unnorm_near_past_xyyaw_t,                # (1,1+A,20,4) or None
-            target_past_cur_future_valid=target_past_cur_future_valid_t,    # (1,1+A,101)
-        )
-        pts = point_inputs.unnorm_points_xyyaw    # (1,1+A,101,4)
-        pts_valid = point_inputs.points_valid     # (1,1+A,101)
+        # (2) cos/sin(yaw) (원본 값, normalization 없음)
+        ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(
+            np.float32)  # (101,2)
+        neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[
+            :, :, 2:4].astype(np.float32)  # (A,101,2)
 
-        cos_y = pts[..., 2]  # (1,1+A,101)
-        sin_y = pts[..., 3]  # (1,1+A,101)
+        # (3) 유효 마스크: 11차원 중 첫 8차원이 전부 0이면 무효
+        ego_pf_valid = _compute_valid_mask_from_prefix_nonzero(
+            ego_past_future_gt_11_dim,
+            prefix_dim=8,
+        )  # (101,)
 
-        yaw_rate_t = fp._compute_yaw_rate_via_sg(
-            cos_y=cos_y,
-            sin_y=sin_y,
-            points_valid=pts_valid,
-            dt=float(DT_SEC),
+        neighbor_pf_valid = _compute_valid_mask_from_prefix_nonzero(
+            neighbor_past_future_gt_11_dim,
+            prefix_dim=8,
+        )  # (A,101)
+
+        # (4) yaw_rate 계산: cs_yaw를 그대로 사용해서 SG 로직만 재사용
+        ego_past_future_gt_yaw_rate, neighbor_past_future_gt_yaw_rate = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_projector(
+            ego_past_future_gt_cs_yaw=ego_past_future_gt_cs_yaw,  # (101,2)
+            neighbor_past_future_gt_cs_yaw=neighbor_past_future_gt_cs_yaw,
+            # (A,101,2)
+            ego_pf_valid=ego_pf_valid,  # (101,)
+            neighbor_pf_valid=neighbor_pf_valid,  # (A,101)
+            dt_sec=float(DT_SEC),
             polyorder=2,
             max_window_len_yaw=7,
-        )  # (1,1+A,101)
+        )
 
-    yaw_rate_pnn = yaw_rate_t.squeeze(0).cpu().numpy().astype(np.float32)  # (1+A,101)
-    ego_past_future_gt_yaw_rate = yaw_rate_pnn[0]         # (101,)
-    neighbor_past_future_gt_yaw_rate = yaw_rate_pnn[1:]   # (A,101)
 
     # (6) control = [v_x, v_y, yaw_rate]
     ego_past_future_control = np.concatenate(

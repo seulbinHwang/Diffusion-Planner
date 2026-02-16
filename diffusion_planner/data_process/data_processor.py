@@ -87,6 +87,91 @@ def _get_feasible_sg_projector() -> Any:
     _FEASIBLE_SG_PROJECTOR.eval()
     return _FEASIBLE_SG_PROJECTOR
 
+def compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
+    past_future_cs_yaw: np.ndarray,  # (T,2) 또는 (A,T,2)
+    past_future_valid: np.ndarray,   # (T,) 또는 (A,T) bool
+    *,
+    dt: float = 0.1,
+    polyorder: int = 2,
+    max_window_len_yaw: int = 7,
+) -> np.ndarray:
+    """(cos(yaw), sin(yaw)) 시퀀스를 그대로 사용해 yaw_rate를 계산합니다.
+
+    목적:
+      - work()에서 이미 뽑아둔 past+future의 (cos,sin) 값을 그대로 써서
+        FeasibleProjector 내부 SG 미분 로직으로 yaw_rate를 구합니다.
+      - (cos,sin)을 다시 만들거나, (x,y,cos,sin) 전체를 다시 구성하는 중복을 줄입니다.
+
+    Args:
+        past_future_cs_yaw (np.ndarray):
+            - ego: (T, 2)
+            - neighbor: (A, T, 2)
+            - 마지막 2는 [cos(yaw), sin(yaw)]
+        past_future_valid (np.ndarray):
+            - ego: (T,) bool
+            - neighbor: (A, T) bool
+            - True면 유효 노드, False면 무효 노드
+        dt (float): 샘플 간 시간 간격. shape: ()
+        polyorder (int): SG 다항 차수. shape: ()
+        max_window_len_yaw (int): yaw 미분 창 길이. shape: ()
+
+    Returns:
+        np.ndarray:
+            - ego: (T,)
+            - neighbor: (A, T)
+            - 무효 노드는 0.0
+    """
+    if past_future_cs_yaw.ndim == 2:
+        cs = past_future_cs_yaw[None, ...]  # (1, T, 2)
+        valid = past_future_valid[None, ...]  # (1, T)
+        squeeze_agent = True
+    elif past_future_cs_yaw.ndim == 3:
+        cs = past_future_cs_yaw  # (A, T, 2)
+        valid = past_future_valid  # (A, T)
+        squeeze_agent = False
+    else:
+        raise ValueError(
+            f"past_future_cs_yaw must be 2D or 3D. got {past_future_cs_yaw.shape}"
+        )
+
+    if cs.shape[-1] != 2:
+        raise ValueError(f"last dim must be 2(cos,sin). got {cs.shape}")
+    if valid.shape != cs.shape[:2]:
+        raise ValueError(
+            f"past_future_valid shape mismatch: valid={valid.shape}, cs={cs.shape}"
+        )
+
+    A = int(cs.shape[0])
+    T = int(cs.shape[1])
+    if A == 0:
+        out = np.zeros((0, T), dtype=np.float32)
+        return out[0] if squeeze_agent else out
+
+    cs_f32 = np.ascontiguousarray(cs.astype(np.float32, copy=False))         # (A,T,2)
+    valid_b = np.ascontiguousarray(valid.astype(bool, copy=False))           # (A,T)
+
+    # torch: (B=1, Pnn=A, T)
+    cs_t = torch.from_numpy(cs_f32).unsqueeze(0)                             # (1,A,T,2)
+    valid_t = torch.from_numpy(valid_b).unsqueeze(0)                         # (1,A,T) bool
+
+    cos_y = cs_t[..., 0]                                                     # (1,A,T)
+    sin_y = cs_t[..., 1]                                                     # (1,A,T)
+
+    projector = _get_feasible_sg_projector()
+
+    with torch.no_grad():
+        yaw_rate_t = projector._compute_yaw_rate_via_sg(
+            cos_y=cos_y,
+            sin_y=sin_y,
+            points_valid=valid_t,
+            dt=float(dt),
+            polyorder=int(polyorder),
+            max_window_len_yaw=int(max_window_len_yaw),
+        )  # (1,A,T)
+
+    yaw_rate = yaw_rate_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False)  # (A,T)
+    return yaw_rate[0] if squeeze_agent else yaw_rate
+
 
 def compute_past_future_yaw_rate_via_feasible_sg(
     past_cur_traj_11: np.ndarray,   # (A, time_len, 11) 또는 (time_len, 11)
@@ -2424,45 +2509,62 @@ class DataProcessor(object):
             # =========================================================
             # ✅ [ADDED] past+future(101) cos/sin(yaw) -> SG yaw_rate -> control(3)
             # =========================================================
+            # =========================================================
+            # ✅ [ADDED] past+future(101) cos/sin(yaw) -> SG yaw_rate -> control(3)
+            #   - cs_yaw는 "yaw_rate 계산을 위한 입력"으로만 사용(출력 목적 아님)
+            # =========================================================
+            eps_valid: float = 1e-8
 
-            # (1) past+future 11dim 합치기
-            ego_past_future_gt_11_dim: np.ndarray = np.concatenate(
-                [ego_agent_past, ego_future_gt_11_dim],
+            # (1) past+future 유효 마스크 만들기 (앞 8차원이 전부 0이면 무효)
+            # ego_past_future_valid: (time_len+future_len,)
+            ego_past_future_valid: np.ndarray = (
+                np.abs(
+                    np.concatenate(
+                        [ego_agent_past[:, :8], ego_future_gt_11_dim[:, :8]],
+                        axis=0,
+                    )
+                ) > eps_valid
+            ).any(axis=1)
+
+            # neighbor_past_future_valid: (A, time_len+future_len)
+            neighbor_past_future_valid: np.ndarray = (
+                np.abs(
+                    np.concatenate(
+                        [neighbor_agents_past[:, :, :8], neighbor_future_gt_11_dim[:, :, :8]],
+                        axis=1,
+                    )
+                ) > eps_valid
+            ).any(axis=2)
+
+            # (2) past+future cos/sin(yaw) 뽑기 (0-based 2:4)
+            # ego_past_future_gt_cs_yaw: (time_len+future_len, 2)
+            ego_past_future_gt_cs_yaw: np.ndarray = np.concatenate(
+                [ego_agent_past[:, 2:4], ego_future_gt_11_dim[:, 2:4]],
                 axis=0,
-            ).astype(np.float32, copy=False)  # (time_len+future_len, 11)
+            ).astype(np.float32, copy=False)
 
-            neighbor_past_future_gt_11_dim: np.ndarray = np.concatenate(
-                [neighbor_agents_past, neighbor_future_gt_11_dim],
+            # neighbor_past_future_gt_cs_yaw: (A, time_len+future_len, 2)
+            neighbor_past_future_gt_cs_yaw: np.ndarray = np.concatenate(
+                [neighbor_agents_past[:, :, 2:4], neighbor_future_gt_11_dim[:, :, 2:4]],
                 axis=1,
-            ).astype(np.float32, copy=False)  # (A, time_len+future_len, 11)
+            ).astype(np.float32, copy=False)
 
-            # (2) cos/sin(yaw) 뽑기 (0-based 2:4)
-            ego_past_future_gt_cs_yaw: np.ndarray = ego_past_future_gt_11_dim[:, 2:4].astype(
-                np.float32, copy=False
-            )  # (time_len+future_len, 2)
-
-            neighbor_past_future_gt_cs_yaw: np.ndarray = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(
-                np.float32, copy=False
-            )  # (A, time_len+future_len, 2)
-
-            # (3) SG(yaw_rate) 계산 (FeasibleProjector SG 로직 재사용)
-            ego_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_via_feasible_sg(
-                past_cur_traj_11=ego_agent_past,          # (time_len, 11)  (현재 포함)
-                future_traj_11=ego_future_gt_11_dim,      # (future_len, 11) (현재 제외)
+            # (3) SG(yaw_rate) 계산: cs_yaw를 그대로 사용 (중복 계산 제거)
+            ego_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
+                past_future_cs_yaw=ego_past_future_gt_cs_yaw,
+                past_future_valid=ego_past_future_valid,
                 dt=0.1,
                 polyorder=2,
                 max_window_len_yaw=7,
-                eps=1e-8,
-            ).astype(np.float32, copy=False)              # (time_len+future_len,)
+            ).astype(np.float32, copy=False)  # (time_len+future_len,)
 
-            neighbor_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_via_feasible_sg(
-                past_cur_traj_11=neighbor_agents_past,     # (A, time_len, 11)
-                future_traj_11=neighbor_future_gt_11_dim,  # (A, future_len, 11)
+            neighbor_past_future_gt_yaw_rate: np.ndarray = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
+                past_future_cs_yaw=neighbor_past_future_gt_cs_yaw,
+                past_future_valid=neighbor_past_future_valid,
                 dt=0.1,
                 polyorder=2,
                 max_window_len_yaw=7,
-                eps=1e-8,
-            ).astype(np.float32, copy=False)              # (A, time_len+future_len)
+            ).astype(np.float32, copy=False)  # (A, time_len+future_len)
 
             # (4) vxy + yaw_rate -> control(3)
             ego_past_future_control: np.ndarray = np.concatenate(
@@ -2474,6 +2576,7 @@ class DataProcessor(object):
                 [neighbor_future_vxy, neighbor_past_future_gt_yaw_rate[:, :, None]],
                 axis=2,
             ).astype(np.float32, copy=False)  # (A, time_len+future_len, 3)
+
 
             # cur_future_control_gt_3_dim 에서,
             key_to_array = {
