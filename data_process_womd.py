@@ -4439,61 +4439,48 @@ def build_cache_dict_for_scenario(
         neighbor_future_gt_11_dim[out_i] = n_future_11
     # -------------------------
     # ✅ (추가) ego/neighbor v_x, v_y 전체 시계열 만들기
-    #   - 과거 20 + 현재 1 + 미래 80(현재 제외) => (TIME_LEN + FUTURE_LEN)
+    #   - past(TIME_LEN=21, 현재 포함) + future(FUTURE_LEN=80, 현재 제외) => point_len=101
     # -------------------------
     ego_future_vxy = build_past_current_and_future_vxy_from_feat_11(
         past_feat_11=ego_agent_past,          # shape: (TIME_LEN, 11)
         future_feat_11=ego_future_gt_11_dim,  # shape: (FUTURE_LEN, 11)
-    )  # shape: (TIME_LEN + FUTURE_LEN, 2)
+    ).astype(np.float32)  # shape: (TIME_LEN + FUTURE_LEN, 2)
 
     neighbor_future_vxy = build_past_current_and_future_vxy_from_feat_11(
-        past_feat_11=neighbor_agents_past,      # shape: (A, TIME_LEN, 11)
+        past_feat_11=neighbor_agents_past,         # shape: (A, TIME_LEN, 11)
         future_feat_11=neighbor_future_gt_11_dim,  # shape: (A, FUTURE_LEN, 11)
-    )  # shape: (A, TIME_LEN + FUTURE_LEN, 2)
-    # -------------------------
-    # ✅ (추가) ego/neighbor v_x, v_y 전체 시계열 만들기
-    #   - 과거 20 + 현재 1 + 미래 80(현재 제외) => (TIME_LEN + FUTURE_LEN)
-    # -------------------------
-    ego_future_vxy = build_past_current_and_future_vxy_from_feat_11(
-        past_feat_11=ego_agent_past,          # (TIME_LEN, 11)
-        future_feat_11=ego_future_gt_11_dim,  # (FUTURE_LEN, 11)
-    )  # (TIME_LEN + FUTURE_LEN, 2)
-
-    neighbor_future_vxy = build_past_current_and_future_vxy_from_feat_11(
-        past_feat_11=neighbor_agents_past,        # (A, TIME_LEN, 11)
-        future_feat_11=neighbor_future_gt_11_dim, # (A, FUTURE_LEN, 11)
-    )  # (A, TIME_LEN + FUTURE_LEN, 2)
+    ).astype(np.float32)  # shape: (A, TIME_LEN + FUTURE_LEN, 2)
 
     # ============================================================
-    # ✅ (핵심) cs_yaw(=cos/sin) 그대로 사용해서 yaw_rate만 계산 (중복 제거 버전)
+    # ✅ (핵심) cs_yaw(=cos/sin) 그대로 사용해서 yaw_rate만 계산
     # ============================================================
     point_len = int(TIME_LEN + FUTURE_LEN)  # 예: 101
 
-    # (1) past+future 11차원 (현재 포함 past + 현재 제외 future)
+    # (1) past+future 11차원
     ego_past_future_gt_11_dim = np.concatenate(
         [ego_agent_past, ego_future_gt_11_dim],
         axis=0,
-    ).astype(np.float32)  # (point_len, 11)
+    ).astype(np.float32)  # shape: (point_len, 11)
 
     neighbor_past_future_gt_11_dim = np.concatenate(
         [neighbor_agents_past, neighbor_future_gt_11_dim],
         axis=1,
-    ).astype(np.float32)  # (A, point_len, 11)
+    ).astype(np.float32)  # shape: (A, point_len, 11)
 
-    # (2) cs_yaw (이미 11차원에 들어있는 cos/sin 재사용)
-    ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(np.float32)               # (point_len, 2)
-    neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(np.float32) # (A, point_len, 2)
+    # (2) cs_yaw: (cos(yaw), sin(yaw)) 그대로 사용
+    ego_past_future_gt_cs_yaw = ego_past_future_gt_11_dim[:, 2:4].astype(np.float32)               # shape: (point_len, 2)
+    neighbor_past_future_gt_cs_yaw = neighbor_past_future_gt_11_dim[:, :, 2:4].astype(np.float32) # shape: (A, point_len, 2)
 
-    # (3) valid 마스크 (앞 8차원이 전부 0이면 무효)
+    # (3) valid 마스크: 11차원 중 앞 8차원이 전부 0이면 무효
     ego_pf_valid = _compute_valid_mask_from_prefix_nonzero(
         ego_past_future_gt_11_dim,
         prefix_dim=8,
-    )  # (point_len,)
+    ).astype(bool)  # shape: (point_len,)
 
     neighbor_pf_valid = _compute_valid_mask_from_prefix_nonzero(
         neighbor_past_future_gt_11_dim,
         prefix_dim=8,
-    )  # (A, point_len)
+    ).astype(bool)  # shape: (A, point_len)
 
     # (4) yaw_rate 계산 (helper 내부에서 FeasibleProjector SG 로직 재사용)
     ego_past_future_gt_yaw_rate, neighbor_past_future_gt_yaw_rate = (
@@ -4512,13 +4499,13 @@ def build_cache_dict_for_scenario(
     ego_past_future_control = np.concatenate(
         [ego_future_vxy, ego_past_future_gt_yaw_rate[:, None]],
         axis=1,
-    ).astype(np.float32)  # (point_len, 3)
+    ).astype(np.float32)  # shape: (point_len, 3)
 
     if agent_num > 0:
         neighbor_past_future_control = np.concatenate(
             [neighbor_future_vxy, neighbor_past_future_gt_yaw_rate[..., None]],
             axis=2,
-        ).astype(np.float32)  # (A, point_len, 3)
+        ).astype(np.float32)  # shape: (A, point_len, 3)
     else:
         neighbor_past_future_control = np.zeros((0, point_len, 3), dtype=np.float32)
 
