@@ -110,7 +110,7 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "38_control_only_new_loss_1e-3" \
+    --name "38_control_only_new_network_1e-3" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
