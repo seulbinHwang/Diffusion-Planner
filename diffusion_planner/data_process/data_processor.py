@@ -2403,6 +2403,7 @@ class DataProcessor(object):
             ).astype(np.float32, copy=False)
 
         return past_future_control, past_future_yaw_rate
+
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
         for scenario in scenarios:
