@@ -2588,6 +2588,12 @@ class DiT(nn.Module):
             out_features=hidden_dim,
             act_layer=nn.GELU,
             drop=0.)
+        # [추가] 현재 상태 토큰(state_token_in)을 에이전트 토큰(preproj 출력)에 직접 더하기 위한 레이어
+        # - 0 초기화: 처음에는 기존 출력/동작과 완전히 동일하게 시작
+        self.state_token_injector = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        nn.init.zeros_(self.state_token_injector.weight)
+        if self.state_token_injector.bias is not None:
+            nn.init.zeros_(self.state_token_injector.bias)
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.blocks = nn.ModuleList([
             DiTBlock(config, hidden_dim, heads, dropout, mlp_ratio)
@@ -2608,6 +2614,15 @@ class DiT(nn.Module):
 
         self.pram_v2_state_token_encoder = PRAMV2StateTokenEncoder(
             hidden_dim=hidden_dim)
+        # [추가] pose_based=False일 때만:
+        # 현재 motion(마지막 과거 구간 control: vxᵇ, vyᵇ, yaw_rate)을 state_token_in에 더하기 위한 프로젝션
+        # - weight를 0으로 시작하면, 학습 시작 시점에는 기존과 완전히 동일(추가 토큰이 항상 0)
+        # - bias를 없애면, motion 정보가 0일 때 항상 0이 더해져서 더 보수적으로 동작
+        self.pram_v2_motion_proj: Optional[nn.Linear] = None
+        if not self.config.pose_based:
+            self.pram_v2_motion_proj = nn.Linear(3, hidden_dim, bias=False)
+            nn.init.zeros_(self.pram_v2_motion_proj.weight)
+
         # 블록×경로 토글 스칼라 및 게이트 편향.
         self.pram_v2_block_path_scalars = PRAMV2BlockPathScalars(depth=depth)
 
@@ -2845,6 +2860,90 @@ class DiT(nn.Module):
         x_unpad = self.preproj(xT_unpad)  # (T, D)
         return x_unpad, indices, cu_seqlens, max_seqlen
 
+    def _inject_state_token_to_agent_tokens_packed(
+            self,
+            x_unpad: torch.Tensor,  # (T, H)
+            state_token_in: torch.Tensor,  # (B, P, H)
+            agent_indices: torch.Tensor,  # (T,)
+    ) -> torch.Tensor:
+        """preproj 출력(packed 에이전트 토큰)에 현재 상태 토큰을 직접 더합니다.
+
+        목적:
+            - 에이전트 토큰이 블록에 들어가기 전부터 "현재 상태 기준"을 내용으로 갖게 해서,
+              장면 토큰(차선/정적물 등)을 참고할 때 필요한 기준을 더 빨리/직접적으로 제공하려는 것입니다.
+
+        동작(팩트):
+            1) state_token_in (B,P,H)를 (B*P,H)로 펼칩니다.
+            2) unpad_input이 만든 agent_indices로 유효 에이전트만 (T,H)로 뽑습니다.
+            3) 0 초기화 Linear(H->H)을 통과시킨 뒤 x_unpad에 더합니다.
+               - 초기에는 Linear 출력이 0이므로, 기존 출력과 동일합니다.
+
+        Args:
+            x_unpad (torch.Tensor):
+                preproj 결과(유효 에이전트만 모은 packed 토큰).
+                shape: (T, H)
+            state_token_in (torch.Tensor):
+                현재 상태 토큰(패딩 위치는 0).
+                shape: (B, P, H)
+            agent_indices (torch.Tensor):
+                unpad_input이 만든 인덱스. 보통 b*P + p 형태.
+                shape: (T,)
+
+        Returns:
+            torch.Tensor:
+                상태 주입이 반영된 packed 에이전트 토큰.
+                shape: (T, H)
+        """
+        if x_unpad.dim() != 2:
+            raise ValueError(
+                f"x_unpad must be 2D (T,H). got {tuple(x_unpad.shape)}")
+        if state_token_in.dim() != 3:
+            raise ValueError(
+                f"state_token_in must be 3D (B,P,H). got {tuple(state_token_in.shape)}"
+            )
+        if agent_indices.dim() != 1:
+            raise ValueError(
+                f"agent_indices must be 1D (T,). got {tuple(agent_indices.shape)}"
+            )
+
+        # 유효 토큰이 0개면(=T=0) 이 레이어 파라미터도 "사용된 것"으로 보이게 0값 스칼라를 한 번 섞어둡니다.
+        # (여러 GPU 학습에서 특정 배치가 완전히 비면 오류가 나는 경우를 피하기 위한 안전장치)
+        if x_unpad.numel() == 0 or agent_indices.numel() == 0:
+            touch = (
+                            self.state_token_injector.weight.view(-1)[
+                                :1].sum() +
+                            (self.state_token_injector.bias.view(-1)[:1].sum()
+                             if self.state_token_injector.bias is not None else 0.0)
+                    ) * 0.0
+            touch = touch.to(device=x_unpad.device, dtype=x_unpad.dtype)
+            return x_unpad + touch
+
+        B: int = int(state_token_in.shape[0])
+        P: int = int(state_token_in.shape[1])
+        H: int = int(state_token_in.shape[2])
+
+        if int(x_unpad.shape[1]) != H:
+            raise ValueError(
+                "hidden dim mismatch. "
+                f"x_unpad H={int(x_unpad.shape[1])}, state_token_in H={H}"
+            )
+
+        idx = agent_indices
+        if idx.dtype != torch.long:
+            idx = idx.to(torch.long)
+
+        # (B,P,H) -> (B*P,H)
+        state_flat = state_token_in.reshape(B * P, H)  # (B*P, H)
+
+        # 유효 에이전트만 (T,H)
+        state_unpad = state_flat.index_select(0, idx)  # (T, H)
+
+        # 0-init Linear(H->H)
+        state_add = self.state_token_injector(state_unpad)  # (T, H)
+        state_add = _cast_like(state_add, x_unpad)
+
+        return x_unpad + state_add
+
     def _build_cross_kv_cache(
             self,
             cross_c: torch.Tensor,  # (B, Lk, D)
@@ -2980,6 +3079,69 @@ class DiT(nn.Module):
     def model_type(self):
         return self._model_type
 
+    def _extract_last_past_segment_control_for_pram(
+        self,
+        target_input_norm_xT: torch.Tensor,  # (B, P, T_any*5)  (pose_based=False 기준)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """pose_based=False에서 PRAM에 넣을 '현재 motion'을 뽑습니다.
+
+        여기서 '현재 motion'은 "현재 시점 바로 직전 구간"의 control(vxᵇ, vyᵇ, yaw_rate) 입니다.
+        즉, past_seq_control_gt_3_dim[..., -1, :]과 같은 의미입니다.
+
+        Args:
+            target_input_norm_xT (torch.Tensor):
+                DiT에 들어가는 flat 입력.
+                pose_based=False일 때는 한 구간이 아래 5개 값으로 구성됩니다.
+                  - control 3개: (vxᵇ, vyᵇ, yaw_rate)
+                  - 노이즈 시간값 1개
+                  - 유효 여부 1개(0/1)
+                shape: (B, P, T_any*5)
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                cur_motion_norm:
+                    마지막 과거 구간 control(정규화된 값).
+                    shape: (B, P, 3)
+                cur_motion_valid:
+                    그 구간이 유효하면 True.
+                    shape: (B, P) bool
+        """
+        if target_input_norm_xT.dim() != 3:
+            raise ValueError(
+                f"target_input_norm_xT must be 3D (B,P,F). got {tuple(target_input_norm_xT.shape)}"
+            )
+
+        B, P, F = target_input_norm_xT.shape
+        step_dim: int = 5  # (vxᵇ, vyᵇ, yaw_rate, 노이즈시간, 유효여부)
+
+        if F % step_dim != 0:
+            raise ValueError(
+                f"pose_based=False expects last dim multiple of {step_dim}. got F={F}"
+            )
+
+        T_any: int = int(F // step_dim)
+        future_len: int = int(self._future_len)
+        past_len: int = int(T_any - future_len)
+
+        # 과거 구간이 없으면(=현재 motion을 정의할 수 없으면) 0으로 반환
+        if past_len <= 0:
+            zeros = target_input_norm_xT.new_zeros((B, P, 3))
+            valid = torch.zeros(
+                (B, P),
+                device=target_input_norm_xT.device,
+                dtype=torch.bool,
+            )
+            return zeros, valid
+
+        last_past_index: int = int(past_len - 1)
+
+        x_seq = target_input_norm_xT.reshape(B, P, T_any, step_dim)
+        cur_motion_norm = x_seq[:, :, last_past_index, 0:3]        # (B,P,3)
+        cur_motion_valid = x_seq[:, :, last_past_index, 4] > 0.5    # (B,P) bool
+
+        return cur_motion_norm, cur_motion_valid
+
+
     def _run_dit_core_with_pram_v2(
             self,
             target_input_norm_xT: torch.Tensor, #  (B, (1+)Pnn, _ * 6 or 5)
@@ -3053,6 +3215,47 @@ class DiT(nn.Module):
                 target_cur_norm=target_current_11_dim.to(
                     dtype=ref_for_dtype.dtype, device=ref_for_dtype.device),
                 target_current_mask=target_current_mask,
+            )
+        # [추가] pose_based=False인 경우에만:
+        # 현재 motion(마지막 과거 구간 control)을 state_token_in에 안전하게 더합니다.
+        # - pram_v2_motion_proj 가중치가 0으로 시작하므로, 초기에는 기존과 완전히 동일하게 동작합니다.
+        if self.pram_v2_motion_proj is not None:
+            cur_motion_norm, cur_motion_valid = self._extract_last_past_segment_control_for_pram(
+                target_input_norm_xT=target_input_norm_xT,  # (B,P,T_any*5)
+            )
+
+            # dtype/device 정렬
+            cur_motion_norm = _cast_like(cur_motion_norm, state_token_in)
+            cur_motion_valid_f = cur_motion_valid.to(
+                dtype=cur_motion_norm.dtype,
+                device=cur_motion_norm.device,
+            ).unsqueeze(-1)  # (B,P,1)
+
+            # 유효하지 않은 구간은 0으로
+            cur_motion_norm = cur_motion_norm * cur_motion_valid_f  # (B,P,3)
+
+            # motion -> hidden_dim
+            motion_token = self.pram_v2_motion_proj(cur_motion_norm)  # (B,P,H)
+
+            # 현재 에이전트가 패딩이면 0
+            motion_token = motion_token.masked_fill(
+                target_current_mask.unsqueeze(-1), 0.0
+            )
+            motion_token = _cast_like(motion_token, state_token_in)
+
+            # 최종 반영: state_token_in = token_geom + token_motion
+            state_token_in = state_token_in + motion_token
+
+
+        with profile_block(
+                "DiT.state_token_inject_to_agents_packed",
+                enabled=self.config.profile_feasible,
+                device_type=device_type,
+        ):
+            x_unpad = self._inject_state_token_to_agent_tokens_packed(
+                x_unpad=x_unpad,  # (T,H)
+                state_token_in=state_token_in,  # (B,P,H)
+                agent_indices=agent_indices,  # (T,)
             )
 
         # 5) composer + time modulation

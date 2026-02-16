@@ -57,6 +57,38 @@ import torch
 
 
 _FEASIBLE_SG_PROJECTOR: Optional[Any] = None
+_FEASIBLE_FILTER_PROJECTOR: Optional[Any] = None
+
+
+def _get_feasible_filter_projector() -> Any:
+    """FeasibleProjector의 filter_and_integrate(제약+적분)만 재사용하기 위한 싱글턴을 반환합니다.
+
+    Returns:
+        Any:
+            FeasibleProjector 인스턴스.
+            - use_feasible_dl=False: 네트워크(TCN)는 만들지 않음
+            - use_feasible_filter=True: 제약 필터는 적용
+            - use_batch_integration=True: 시간축 배치 적분 경로 사용(빠름)
+    """
+    global _FEASIBLE_FILTER_PROJECTOR
+    if _FEASIBLE_FILTER_PROJECTOR is not None:
+        return _FEASIBLE_FILTER_PROJECTOR
+
+    from diffusion_planner.model.module.feasible import FeasibleProjector  # pylint: disable=import-error
+
+    class _DummyCfg:
+        """FeasibleProjector 초기화에 필요한 최소 설정."""
+        use_batch_integration: bool = True
+        feasible_debug_check_mask: bool = False
+
+    _FEASIBLE_FILTER_PROJECTOR = FeasibleProjector(
+        config=_DummyCfg(),
+        hidden_dim=1,
+        use_feasible_dl=False,
+        use_feasible_filter=True,
+    )
+    _FEASIBLE_FILTER_PROJECTOR.eval()
+    return _FEASIBLE_FILTER_PROJECTOR
 
 
 def _get_feasible_sg_projector() -> Any:
@@ -86,6 +118,49 @@ def _get_feasible_sg_projector() -> Any:
     )
     _FEASIBLE_SG_PROJECTOR.eval()
     return _FEASIBLE_SG_PROJECTOR
+
+class _RunningMeanVar:
+    """스칼라 값의 평균/분산을 스트리밍으로 누적한다(Welford).
+
+    Attributes:
+        count (int): 누적된 샘플 수. shape: ()
+        mean (float): 평균. shape: ()
+        m2 (float): (x-mean)^2 누적 합. shape: ()
+    """
+
+    def __init__(self) -> None:
+        self.count: int = 0
+        self.mean: float = 0.0
+        self.m2: float = 0.0
+
+    def update(self, x: float) -> None:
+        """샘플 1개를 누적한다.
+
+        Args:
+            x (float): 스칼라 값. shape: ()
+        """
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / float(self.count)
+        delta2 = x - self.mean
+        self.m2 += delta * delta2
+
+    def get_mean_and_var(self) -> Tuple[float, float, int]:
+        """현재까지 평균/분산/개수를 반환한다.
+
+        분산은 '모집단 분산'(m2 / count) 기준입니다.
+
+        Returns:
+            Tuple[float, float, int]:
+                - mean (float): 평균. shape: ()
+                - var (float): 분산. shape: ()
+                - count (int): 샘플 수. shape: ()
+        """
+        if self.count <= 0:
+            return 0.0, 0.0, 0
+        var = self.m2 / float(self.count)
+        return float(self.mean), float(var), int(self.count)
+
 
 def compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
     past_future_cs_yaw: np.ndarray,  # (T,2) 또는 (A,T,2)
@@ -425,6 +500,12 @@ class DataProcessor(object):
         self._save_counter: int = 0
         # 디버그 플롯 파일명 증가용 카운터
         self._debug_plot_counter: int = 0
+        # =========================================================
+        # [ADDED] integrated_trajectory vs GT (neighbor xy / yaw) 통계
+        # =========================================================
+        self._integrated_vs_gt_neighbor_xy_stats: _RunningMeanVar = _RunningMeanVar()
+        self._integrated_vs_gt_neighbor_yaw_stats: _RunningMeanVar = _RunningMeanVar()
+
 
     @staticmethod
     def _build_origin_world_pose(
@@ -2400,6 +2481,479 @@ class DataProcessor(object):
 
         return past_future_control
 
+
+    def _build_target_integrated_outputs_via_filter_and_integrate(
+        self,
+        target_past_future_body_seg_control: np.ndarray,  # (1+N, past_len+future_len, 3)
+        ego_agent_past: np.ndarray,  # (time_len, 11)
+        ego_future_gt_11_dim: np.ndarray,  # (future_len, 11)
+        neighbor_agents_past: np.ndarray,  # (N, time_len, 11)
+        neighbor_future_gt_11_dim: np.ndarray,  # (N, future_len, 11)
+        *,
+        dt: float = 0.1,
+        eps_valid: float = 1e-8,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """filter_and_integrate 입력을 만들고, 적분 결과를 계산합니다.
+
+        흐름:
+            1) target_current_state: (1+N,4)  = 현재 (x,y,cos,sin)
+            2) target_class_one_hot: (1+N,3) = 현재 타입(one-hot)
+            3) target_cur_future_valid: (1+N,1+future_len) = 현재~미래 노드 유효 마스크
+            4) target_past_future_body_seg_control에서 "현재→미래" 세그먼트만 잘라
+               target_future_seg_body_control: (1+N,future_len,3) 생성
+            5) FeasibleProjector.filter_and_integrate 실행
+               -> target_integrated_trajectory: (1+N,future_len,4)
+               -> target_control_constraint_diff: (1+N,future_len,3)
+
+        Args:
+            target_past_future_body_seg_control (np.ndarray):
+                shape: (1+N, past_len+future_len, 3)
+                과거~현재~미래 전체 세그먼트 바디 제어.
+            ego_agent_past (np.ndarray):
+                shape: (time_len, 11)
+            ego_future_gt_11_dim (np.ndarray):
+                shape: (future_len, 11)
+            neighbor_agents_past (np.ndarray):
+                shape: (N, time_len, 11)
+            neighbor_future_gt_11_dim (np.ndarray):
+                shape: (N, future_len, 11)
+            dt (float):
+                시간 간격. shape: ()
+            eps_valid (float):
+                유효 판정 기준. shape: ()
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                - target_integrated_trajectory:
+                    shape: (1+N, future_len, 4)
+                    [x, y, cos, sin] (현재 이후 미래 노드들)
+                - target_control_constraint_diff:
+                    shape: (1+N, future_len, 3)
+                    [dvx, dvy, domega] (필터 적용으로 바뀐 제어 차이)
+                - target_current_state:
+                    shape: (1+N, 4)
+                - target_cur_future_valid:
+                    shape: (1+N, 1+future_len) bool
+                - target_class_one_hot:
+                    shape: (1+N, 3)
+        """
+        # -----------------------
+        # 0) 길이/shape 정리
+        # -----------------------
+        if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
+            raise ValueError(f"ego_agent_past must be (time_len,11). got {ego_agent_past.shape}")
+        if ego_future_gt_11_dim.ndim != 2 or ego_future_gt_11_dim.shape[-1] != 11:
+            raise ValueError(f"ego_future_gt_11_dim must be (future_len,11). got {ego_future_gt_11_dim.shape}")
+        if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[-1] != 11:
+            raise ValueError(f"neighbor_agents_past must be (N,time_len,11). got {neighbor_agents_past.shape}")
+        if neighbor_future_gt_11_dim.ndim != 3 or neighbor_future_gt_11_dim.shape[-1] != 11:
+            raise ValueError(f"neighbor_future_gt_11_dim must be (N,future_len,11). got {neighbor_future_gt_11_dim.shape}")
+
+        time_len: int = int(ego_agent_past.shape[0])
+        past_len: int = int(time_len - 1)
+        future_len: int = int(ego_future_gt_11_dim.shape[0])
+
+        N: int = int(neighbor_agents_past.shape[0])
+        if int(neighbor_agents_past.shape[1]) != time_len:
+            raise ValueError(f"time_len mismatch: ego={time_len}, neighbor={int(neighbor_agents_past.shape[1])}")
+        if int(neighbor_future_gt_11_dim.shape[1]) != future_len:
+            raise ValueError(f"future_len mismatch: ego={future_len}, neighbor={int(neighbor_future_gt_11_dim.shape[1])}")
+
+        expected_seg_len: int = int(past_len + future_len)
+        if target_past_future_body_seg_control.shape != (1 + N, expected_seg_len, 3):
+            raise ValueError(
+                "target_past_future_body_seg_control shape mismatch. "
+                f"expected={(1+N, expected_seg_len, 3)}, got={target_past_future_body_seg_control.shape}"
+            )
+
+        # -----------------------
+        # 1) target_current_state: (1+N,4)
+        # -----------------------
+        ego_cur_xycs = ego_agent_past[-1, :4].astype(np.float32, copy=False)  # (4,)
+        nei_cur_xycs = neighbor_agents_past[:, -1, :4].astype(np.float32, copy=False)  # (N,4)
+        target_current_state = np.concatenate(
+            [ego_cur_xycs[None, :], nei_cur_xycs],
+            axis=0,
+        ).astype(np.float32, copy=False)  # (1+N,4)
+
+        # -----------------------
+        # 2) target_class_one_hot: (1+N,3)
+        # -----------------------
+        ego_cls = ego_agent_past[-1, 8:11].astype(np.float32, copy=False)  # (3,)
+        nei_cls = neighbor_agents_past[:, -1, 8:11].astype(np.float32, copy=False)  # (N,3)
+        target_class_one_hot = np.concatenate(
+            [ego_cls[None, :], nei_cls],
+            axis=0,
+        ).astype(np.float32, copy=False)  # (1+N,3)
+
+        # -----------------------
+        # 3) target_cur_future_valid: (1+N,1+future_len)
+        #    (앞 8차원 기준 유효성)
+        # -----------------------
+        ego_cur_future_11 = np.concatenate(
+            [ego_agent_past[-1:, :], ego_future_gt_11_dim],
+            axis=0,
+        )  # (1+future_len,11)
+
+        nei_cur_future_11 = np.concatenate(
+            [neighbor_agents_past[:, -1:, :], neighbor_future_gt_11_dim],
+            axis=1,
+        )  # (N,1+future_len,11)
+
+        target_cur_future_valid, _ = self._get_near_future_segment_valid(
+            ego_cur_future_gt_11_dim=ego_cur_future_11,           # (1+future_len,11)
+            neighbor_cur_future_gt_11_dim=nei_cur_future_11,      # (N,1+future_len,11)
+            eps=float(eps_valid),
+        )  # (1+N,1+future_len) bool
+
+        # -----------------------
+        # 4) 미래 세그먼트만 잘라서 filter_and_integrate에 넣기
+        #   - past 부분은 "현재 이전"이라 적분에 필요 없음
+        # -----------------------
+        # target_future_seg_body_control: (1+N, future_len, 3)
+        target_future_seg_body_control = target_past_future_body_seg_control[:, past_len:past_len + future_len, :].astype(
+            np.float32, copy=False
+        )
+        if target_future_seg_body_control.shape != (1 + N, future_len, 3):
+            raise ValueError(
+                "target_future_seg_body_control shape mismatch. "
+                f"expected={(1+N, future_len, 3)}, got={target_future_seg_body_control.shape}"
+            )
+
+        # -----------------------
+        # 5) FeasibleProjector.filter_and_integrate 실행
+        #   - B=1, Pnn=1+N 로 맞춘다.
+        # -----------------------
+        projector = _get_feasible_filter_projector()
+
+        unnorm_near_current_state_t = torch.from_numpy(
+            np.ascontiguousarray(target_current_state)
+        ).unsqueeze(0)  # (1,1+N,4)
+
+        near_cur_future_valid_t = torch.from_numpy(
+            np.ascontiguousarray(target_cur_future_valid.astype(bool, copy=False))
+        ).unsqueeze(0)  # (1,1+N,1+future_len) bool
+
+        unnorm_cur_future_seg_body_control_t = torch.from_numpy(
+            np.ascontiguousarray(target_future_seg_body_control)
+        ).unsqueeze(0)  # (1,1+N,future_len,3)
+
+        near_class_one_hot_t = torch.from_numpy(
+            np.ascontiguousarray(target_class_one_hot)
+        ).unsqueeze(0)  # (1,1+N,3)
+
+        with torch.no_grad():
+            traj_t, diff_t = projector.filter_and_integrate(
+                unnorm_near_current_state=unnorm_near_current_state_t,
+                near_cur_future_valid=near_cur_future_valid_t,
+                unnorm_cur_future_seg_body_control=unnorm_cur_future_seg_body_control_t,
+                near_class_one_hot=near_class_one_hot_t,
+            )  # traj: (1,1+N,future_len,4), diff: (1,1+N,future_len,3)
+
+        target_integrated_trajectory = traj_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False)  # (1+N,future_len,4)
+        target_control_constraint_diff = diff_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False)  # (1+N,future_len,3)
+
+        return (
+            target_integrated_trajectory,
+            target_control_constraint_diff,
+            target_current_state,
+            target_cur_future_valid.astype(bool, copy=False),
+            target_class_one_hot,
+        )
+
+    def _accumulate_neighbor_xy_yaw_losses_for_integrated_trajectory(
+        self,
+        target_integrated_trajectory: np.ndarray,  # (1+N, future_len, 4)
+        ego_future_gt_11_dim: np.ndarray,          # (future_len, 11)
+        neighbor_future_gt_11_dim: np.ndarray,     # (N, future_len, 11)
+        target_cur_future_valid: np.ndarray,       # (1+N, 1+future_len) bool
+        *,
+        eps_valid: float = 1e-8,
+    ) -> None:
+        """integrated_trajectory 와 GT의 xy/yaw 오차를 loss.py 방식으로 계산해 누적한다.
+
+        누적 대상:
+            - "neighbor_prediction_loss_xy"
+            - "neighbor_prediction_loss_yaw"
+
+        Args:
+            target_integrated_trajectory:
+                shape: (1+N, future_len, 4)
+                [x, y, cos, sin] (미래 노드)
+            ego_future_gt_11_dim:
+                shape: (future_len, 11)
+            neighbor_future_gt_11_dim:
+                shape: (N, future_len, 11)
+            target_cur_future_valid:
+                shape: (1+N, 1+future_len) bool
+                현재 포함 노드 유효 마스크.
+            eps_valid:
+                0 판정 기준. shape: ()
+        """
+        # -----------------------
+        # 0) shape 체크
+        # -----------------------
+        if target_integrated_trajectory.ndim != 3 or int(target_integrated_trajectory.shape[-1]) != 4:
+            raise ValueError(
+                "target_integrated_trajectory must be (1+N, future_len, 4). "
+                f"got {target_integrated_trajectory.shape}"
+            )
+        if ego_future_gt_11_dim.ndim != 2 or int(ego_future_gt_11_dim.shape[-1]) != 11:
+            raise ValueError(f"ego_future_gt_11_dim must be (future_len,11). got {ego_future_gt_11_dim.shape}")
+        if neighbor_future_gt_11_dim.ndim != 3 or int(neighbor_future_gt_11_dim.shape[-1]) != 11:
+            raise ValueError(f"neighbor_future_gt_11_dim must be (N,future_len,11). got {neighbor_future_gt_11_dim.shape}")
+        if target_cur_future_valid.ndim != 2:
+            raise ValueError(f"target_cur_future_valid must be (1+N,1+future_len). got {target_cur_future_valid.shape}")
+
+        one_plus_n: int = int(target_integrated_trajectory.shape[0])
+        future_len: int = int(target_integrated_trajectory.shape[1])
+        if int(ego_future_gt_11_dim.shape[0]) != future_len:
+            raise ValueError(
+                f"future_len mismatch: integrated={future_len}, ego_future_gt_11_dim={int(ego_future_gt_11_dim.shape[0])}"
+            )
+        if int(neighbor_future_gt_11_dim.shape[1]) != future_len:
+            raise ValueError(
+                f"future_len mismatch: integrated={future_len}, neighbor_future_gt_11_dim={int(neighbor_future_gt_11_dim.shape[1])}"
+            )
+        if int(target_cur_future_valid.shape[0]) != one_plus_n or int(target_cur_future_valid.shape[1]) != (1 + future_len):
+            raise ValueError(
+                "target_cur_future_valid shape mismatch. "
+                f"expected={(one_plus_n, 1 + future_len)}, got={target_cur_future_valid.shape}"
+            )
+
+        # -----------------------
+        # 1) target_future_gt_4_dim: (1+N, future_len, 4)
+        # -----------------------
+        ego_future_4 = ego_future_gt_11_dim[:, :4].astype(np.float32, copy=False)  # (future_len,4)
+        nei_future_4 = neighbor_future_gt_11_dim[:, :, :4].astype(np.float32, copy=False)  # (N,future_len,4)
+        target_future_gt_4_dim = np.concatenate(
+            [ego_future_4[None, ...], nei_future_4],
+            axis=0,
+        ).astype(np.float32, copy=False)  # (1+N,future_len,4)
+
+        # -----------------------
+        # 2) valid mask 만들기 (neighbor만)
+        #   - future_valid: (1+N, future_len)
+        #   - ego row는 False로 만들어 "neighbor만" 평가
+        #   - 현재가 무효면, 미래도 무효로 취급(적분 시작이 불가능하므로)
+        # -----------------------
+        valid_np = np.ascontiguousarray(target_cur_future_valid.astype(bool, copy=False))  # (1+N,1+future_len)
+        cur_valid = valid_np[:, :1]  # (1+N,1)
+        future_valid = valid_np[:, 1:]  # (1+N,future_len)
+        future_valid = future_valid & cur_valid  # (1+N,future_len)
+
+        # ego 제외
+        if one_plus_n > 0:
+            future_valid[0, :] = False
+
+        # -----------------------
+        # 3) loss.py의 _compute_xy_yaw_losses 호출 (torch)
+        # -----------------------
+        from diffusion_planner.loss import _compute_xy_yaw_losses  # lazy import
+
+        pred_t = torch.from_numpy(np.ascontiguousarray(target_integrated_trajectory.astype(np.float32, copy=False))).unsqueeze(0)
+        gt_t = torch.from_numpy(np.ascontiguousarray(target_future_gt_4_dim)).unsqueeze(0)
+        valid_t = torch.from_numpy(np.ascontiguousarray(future_valid)).unsqueeze(0)  # (1,1+N,future_len)
+
+        with torch.no_grad():
+            xy_yaw_losses = _compute_xy_yaw_losses(
+                score_denorm=pred_t,          # (B=1, 1+N, future_len, 4)
+                target_future_gt=gt_t,        # (B=1, 1+N, future_len, 4)
+                target_future_valid=valid_t,  # (B=1, 1+N, future_len)
+                prefix="neighbor_prediction_loss",
+            )
+
+        # -----------------------
+        # 4) 필요한 두 값만 누적
+        # -----------------------
+        loss_xy = float(xy_yaw_losses["neighbor_prediction_loss_xy"].cpu().item())
+        loss_yaw = float(xy_yaw_losses["neighbor_prediction_loss_yaw"].cpu().item())
+
+        self._integrated_vs_gt_neighbor_xy_stats.update(loss_xy)
+        self._integrated_vs_gt_neighbor_yaw_stats.update(loss_yaw)
+
+    def _print_integrated_vs_gt_neighbor_xy_yaw_stats(self) -> None:
+        """누적된 integrated vs GT(neighbor) xy/yaw 평균/분산을 출력한다."""
+        mean_xy, var_xy, n_xy = self._integrated_vs_gt_neighbor_xy_stats.get_mean_and_var()
+        mean_yaw, var_yaw, n_yaw = self._integrated_vs_gt_neighbor_yaw_stats.get_mean_and_var()
+
+        # 둘은 같은 횟수로 누적되므로 n_xy를 대표로 사용
+        print(
+            "[integrated_vs_gt_stats] "
+            f"neighbor_prediction_loss_xy: mean={mean_xy:.6f}, var={var_xy:.6f}, n={n_xy} | "
+            f"neighbor_prediction_loss_yaw: mean={mean_yaw:.6f}, var={var_yaw:.6f}, n={n_yaw}"
+        )
+
+
+    def _build_target_past_future_body_seg_control_via_midpoint(
+        self,
+        ego_agent_past: np.ndarray,                # (time_len, 11)
+        ego_future_gt_11_dim: np.ndarray,          # (future_len, 11)
+        neighbor_agents_past: np.ndarray,          # (N, time_len, 11)
+        neighbor_future_gt_11_dim: np.ndarray,     # (N, future_len, 11)
+        ego_past_future_control: np.ndarray,       # (time_len+future_len, 3)
+        neighbor_past_future_control: np.ndarray,  # (N, time_len+future_len, 3)
+        *,
+        dt: float = 0.1,
+        eps_valid: float = 1e-8,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """ego/neighbor의 past~current~future control을 합쳐 midpoint body seg control을 만든다.
+
+        목표:
+            - 노드 기준 control(길이 = time_len+future_len)을
+              세그먼트(midpoint) 기준 body control(길이 = past_len+future_len)로 변환합니다.
+            - 변환은 FeasibleProjector.compute_midpoint_controls 를 사용합니다.
+
+        Args:
+            ego_agent_past (np.ndarray):
+                shape: (time_len, 11)
+            ego_future_gt_11_dim (np.ndarray):
+                shape: (future_len, 11)  # 현재 제외 미래
+            neighbor_agents_past (np.ndarray):
+                shape: (N, time_len, 11)
+            neighbor_future_gt_11_dim (np.ndarray):
+                shape: (N, future_len, 11)
+            ego_past_future_control (np.ndarray):
+                shape: (time_len+future_len, 3)
+            neighbor_past_future_control (np.ndarray):
+                shape: (N, time_len+future_len, 3)
+            dt (float):
+                시간 간격. shape: ()
+            eps_valid (float):
+                유효/무효 판정 기준. shape: ()
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - target_past_future_control:
+                    shape: (1+N, time_len+future_len, 3)
+                - target_past_future_body_seg_control:
+                    shape: (1+N, past_len+future_len, 3)
+        """
+        # -----------------------
+        # 0) 기본 shape 체크
+        # -----------------------
+        if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
+            raise ValueError(f"ego_agent_past must be (time_len,11). got {ego_agent_past.shape}")
+        if ego_future_gt_11_dim.ndim != 2 or ego_future_gt_11_dim.shape[-1] != 11:
+            raise ValueError(f"ego_future_gt_11_dim must be (future_len,11). got {ego_future_gt_11_dim.shape}")
+        if neighbor_agents_past.ndim != 3 or neighbor_agents_past.shape[-1] != 11:
+            raise ValueError(f"neighbor_agents_past must be (N,time_len,11). got {neighbor_agents_past.shape}")
+        if neighbor_future_gt_11_dim.ndim != 3 or neighbor_future_gt_11_dim.shape[-1] != 11:
+            raise ValueError(f"neighbor_future_gt_11_dim must be (N,future_len,11). got {neighbor_future_gt_11_dim.shape}")
+
+        time_len: int = int(ego_agent_past.shape[0])
+        future_len: int = int(ego_future_gt_11_dim.shape[0])
+        past_len: int = int(time_len - 1)
+        if time_len < 1:
+            raise ValueError(f"time_len must be >= 1. got {time_len}")
+        if future_len < 0:
+            raise ValueError(f"future_len must be >= 0. got {future_len}")
+
+        N: int = int(neighbor_agents_past.shape[0])
+        if int(neighbor_agents_past.shape[1]) != time_len:
+            raise ValueError(
+                f"time_len mismatch: ego={time_len}, neighbor={int(neighbor_agents_past.shape[1])}"
+            )
+        if int(neighbor_future_gt_11_dim.shape[1]) != future_len:
+            raise ValueError(
+                f"future_len mismatch: ego={future_len}, neighbor={int(neighbor_future_gt_11_dim.shape[1])}"
+            )
+
+        point_len: int = int(time_len + future_len)         # 노드 개수
+        segment_len: int = int(past_len + future_len)       # 구간 개수 = point_len-1
+
+        # -----------------------
+        # 1) target_past_future_control 만들기: (1+N, point_len, 3)
+        # -----------------------
+        if ego_past_future_control.shape != (point_len, 3):
+            raise ValueError(
+                f"ego_past_future_control must be ({point_len},3). got {ego_past_future_control.shape}"
+            )
+        if neighbor_past_future_control.shape != (N, point_len, 3):
+            raise ValueError(
+                f"neighbor_past_future_control must be ({N},{point_len},3). got {neighbor_past_future_control.shape}"
+            )
+
+        target_past_future_control: np.ndarray = np.concatenate(
+            [ego_past_future_control[None, ...], neighbor_past_future_control],
+            axis=0,
+        ).astype(np.float32, copy=False)  # (1+N, point_len, 3)
+
+        # -----------------------
+        # 2) compute_midpoint_controls 입력 준비
+        #   - unnorm_near_past_xyyaw: (B=1, Pnn=1+N, past_len, 4)
+        #   - unnorm_diffusion_trajectory: (1, 1+N, 1+future_len, 4)
+        #   - unnorm_points_world_control: (1, 1+N, point_len, 3)
+        #   - target_past_cur_future_valid: (1, 1+N, point_len)
+        # -----------------------
+        # (2-1) valid mask: 앞 8차원 기준
+        ego_valid_p = (np.abs(ego_agent_past[:, :8]) > float(eps_valid)).any(axis=1)              # (time_len,)
+        ego_valid_f = (np.abs(ego_future_gt_11_dim[:, :8]) > float(eps_valid)).any(axis=1)        # (future_len,)
+        ego_valid = np.concatenate([ego_valid_p, ego_valid_f], axis=0)                            # (point_len,)
+
+        neighbor_valid_p = (np.abs(neighbor_agents_past[:, :, :8]) > float(eps_valid)).any(axis=2)          # (N,time_len)
+        neighbor_valid_f = (np.abs(neighbor_future_gt_11_dim[:, :, :8]) > float(eps_valid)).any(axis=2)     # (N,future_len)
+        neighbor_valid = np.concatenate([neighbor_valid_p, neighbor_valid_f], axis=1)                        # (N,point_len)
+
+        target_valid_np = np.concatenate([ego_valid[None, :], neighbor_valid], axis=0).astype(bool, copy=False)  # (1+N,point_len)
+
+        # (2-2) points(x,y,cos,sin) 구성
+        # past(현재 제외)
+        if past_len > 0:
+            ego_past_xycs = ego_agent_past[:past_len, :4].astype(np.float32, copy=False)                 # (past_len,4)
+            neighbor_past_xycs = neighbor_agents_past[:, :past_len, :4].astype(np.float32, copy=False)   # (N,past_len,4)
+            past_xycs_all = np.concatenate([ego_past_xycs[None, ...], neighbor_past_xycs], axis=0)       # (1+N,past_len,4)
+            unnorm_near_past_xyyaw_t: Optional[torch.Tensor] = torch.from_numpy(past_xycs_all).unsqueeze(0)  # (1,1+N,past_len,4)
+        else:
+            unnorm_near_past_xyyaw_t = None
+
+        # current+future
+        ego_cur_future_xycs = np.concatenate(
+            [ego_agent_past[-1:, :4], ego_future_gt_11_dim[:, :4]],
+            axis=0,
+        ).astype(np.float32, copy=False)  # (1+future_len,4)
+
+        neighbor_cur_future_xycs = np.concatenate(
+            [neighbor_agents_past[:, -1:, :4], neighbor_future_gt_11_dim[:, :, :4]],
+            axis=1,
+        ).astype(np.float32, copy=False)  # (N,1+future_len,4)
+
+        cur_future_xycs_all = np.concatenate(
+            [ego_cur_future_xycs[None, ...], neighbor_cur_future_xycs],
+            axis=0,
+        ).astype(np.float32, copy=False)  # (1+N,1+future_len,4)
+
+        unnorm_diffusion_trajectory_t = torch.from_numpy(cur_future_xycs_all).unsqueeze(0)  # (1,1+N,1+future_len,4)
+
+        # (2-3) world control(노드): (1,1+N,point_len,3)
+        unnorm_points_world_control_t = torch.from_numpy(
+            target_past_future_control.astype(np.float32, copy=False)
+        ).unsqueeze(0)  # (1,1+N,point_len,3)
+
+        # (2-4) valid: (1,1+N,point_len) bool
+        target_past_cur_future_valid_t = torch.from_numpy(target_valid_np).unsqueeze(0)  # (1,1+N,point_len)
+
+        # -----------------------
+        # 3) midpoint body seg control 계산
+        # -----------------------
+        projector = _get_feasible_sg_projector()
+        with torch.no_grad():
+            seg_body_control_t = projector.compute_midpoint_controls(
+                unnorm_diffusion_trajectory=unnorm_diffusion_trajectory_t,        # (1,1+N,1+future_len,4)
+                unnorm_near_past_xyyaw=unnorm_near_past_xyyaw_t,                  # (1,1+N,past_len,4) or None
+                unnorm_points_world_control=unnorm_points_world_control_t,        # (1,1+N,point_len,3)
+                target_past_cur_future_valid=target_past_cur_future_valid_t,      # (1,1+N,point_len)
+            )  # (1,1+N,segment_len,3)
+
+        seg_body_control_np = seg_body_control_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False)  # (1+N,segment_len,3)
+
+        if seg_body_control_np.shape != (1 + N, segment_len, 3):
+            raise ValueError(
+                f"unexpected seg_body_control_np shape. expected={(1+N, segment_len, 3)}, got={seg_body_control_np.shape}"
+            )
+
+        return target_past_future_control, seg_body_control_np
+
     # Use for data preprocess
     def work(self, scenarios: List[NuPlanScenario]) -> None:
         for scenario in scenarios:
@@ -2579,6 +3133,55 @@ class DataProcessor(object):
                 max_window_len_yaw=7,
                 eps_valid=1e-8,
             )
+            # =========================================================
+            # ✅ [ADDED] ego+neighbor node control -> midpoint body seg control
+            #   - target_past_future_control: (1+N, time_len+future_len, 3)
+            #   - target_past_future_body_seg_control: (1+N, past_len+future_len, 3)
+            # =========================================================
+            (
+                target_past_future_control,
+                target_past_future_body_seg_control,
+            ) = self._build_target_past_future_body_seg_control_via_midpoint(
+                ego_agent_past=ego_agent_past,                            # (time_len,11)
+                ego_future_gt_11_dim=ego_future_gt_11_dim,                # (future_len,11)
+                neighbor_agents_past=neighbor_agents_past,                # (N,time_len,11)
+                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,      # (N,future_len,11)
+                ego_past_future_control=ego_past_future_control,          # (time_len+future_len,3)
+                neighbor_past_future_control=neighbor_past_future_control,# (N,time_len+future_len,3)
+                dt=0.1,
+                eps_valid=1e-8,
+            )
+            # =========================================================
+            # ✅ [ADDED] target_past_future_body_seg_control + current/valid/class
+            #            -> filter_and_integrate
+            #   - target_integrated_trajectory: (1+N, future_len, 4)
+            #   - target_control_constraint_diff: (1+N, future_len, 3)
+            # =========================================================
+            (
+                target_integrated_trajectory,
+                target_control_constraint_diff,
+                target_current_state,
+                target_cur_future_valid,
+                target_class_one_hot,
+            ) = self._build_target_integrated_outputs_via_filter_and_integrate(
+                target_past_future_body_seg_control=target_past_future_body_seg_control,  # (1+N,past_len+future_len,3)
+                ego_agent_past=ego_agent_past,                                            # (time_len,11)
+                ego_future_gt_11_dim=ego_future_gt_11_dim,                                # (future_len,11)
+                neighbor_agents_past=neighbor_agents_past,                                # (N,time_len,11)
+                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,                      # (N,future_len,11)
+                dt=0.1,
+                eps_valid=1e-8,
+            )
+            # =========================================================
+            # [ADDED] integrated_trajectory vs GT(neighbor) xy/yaw loss 누적
+            # =========================================================
+            self._accumulate_neighbor_xy_yaw_losses_for_integrated_trajectory(
+                target_integrated_trajectory=target_integrated_trajectory,  # (1+N,future_len,4)
+                ego_future_gt_11_dim=ego_future_gt_11_dim,                  # (future_len,11)
+                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,        # (N,future_len,11)
+                target_cur_future_valid=target_cur_future_valid,            # (1+N,1+future_len)
+                eps_valid=1e-8,
+            )
 
 
             # cur_future_control_gt_3_dim 에서,
@@ -2676,6 +3279,7 @@ class DataProcessor(object):
                 draw_machine_fast.draw_world_model_to_png(key_to_array,
                                                           output_data={},
                                                           save_path=save_path)
+            self._print_integrated_vs_gt_neighbor_xy_yaw_stats()
 
     @staticmethod
     def _estimate_stable_neighbor_sizes(
