@@ -9,11 +9,11 @@
     },
       "seg_body_control": {
         "mean": [0, 0, 0],
-        "std": [20, 20, 1]
+        "std": [3.5, 0.3, 1]
     },
     "past_future_seg_control_gt_3_dim": {
         "mean": [0, 0, 0],
-        "std": [20, 20, 1]
+        "std": [3.5, 0.3, 1]
     },
     "ego_agent_past": {
         "mean": [10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
