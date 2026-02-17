@@ -17,5 +17,5 @@ python data_process.py \
 --total_scenarios 120 \
 --num_workers 1 \
 --save_image false \
---save_integration_traj true
+--save_integration_traj false
 

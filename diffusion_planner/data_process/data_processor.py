@@ -54,6 +54,8 @@ ArrayF = NDArray[np.floating]
 from typing import Any, Tuple, Optional
 import numpy as np
 import torch
+import math
+from functools import lru_cache
 
 
 _FEASIBLE_SG_PROJECTOR: Optional[Any] = None
@@ -246,6 +248,264 @@ def compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
     yaw_rate = yaw_rate_t.squeeze(0).cpu().numpy().astype(np.float32, copy=False)  # (A,T)
     return yaw_rate[0] if squeeze_agent else yaw_rate
 
+
+@lru_cache(maxsize=64)
+def _get_sg_first_derivative_coeffs(
+    window_len: int,
+    polyorder: int,
+    dt: float,
+) -> np.ndarray:
+    """SG 방식으로 '1차 미분'을 계산하기 위한 계수를 만든다(캐시됨).
+
+    Args:
+        window_len (int):
+            한 번에 볼 점 개수. shape: ()
+            - 홀수여야 함.
+        polyorder (int):
+            내부에서 맞출 곡선의 차수. shape: ()
+        dt (float):
+            샘플 간 시간 간격(초). shape: ()
+
+    Returns:
+        np.ndarray:
+            shape: (window_len, window_len)
+            - coeffs[pos] 는, 길이 window_len인 구간에서
+              'pos 위치'의 1차 미분값을 만들기 위한 가중치 벡터입니다.
+            - dtype: float64
+    """
+    if window_len < 3:
+        raise ValueError(f"window_len must be >= 3. got {window_len}")
+    if window_len % 2 == 0:
+        raise ValueError(f"window_len must be odd. got {window_len}")
+    if polyorder < 1:
+        raise ValueError(f"polyorder must be >= 1 for first derivative. got {polyorder}")
+    if polyorder >= window_len:
+        raise ValueError(f"polyorder must be < window_len. got polyorder={polyorder}, window_len={window_len}")
+
+    dt_f = float(dt)
+    if (not np.isfinite(dt_f)) or dt_f <= 0.0:
+        raise ValueError(f"dt must be finite and > 0. got {dt}")
+
+    coeffs = np.zeros((window_len, window_len), dtype=np.float64)
+
+    # pos: 0..window_len-1
+    for pos in range(window_len):
+        # 평가 지점을 0으로 두기 위해 x축을 pos 기준으로 이동
+        # x: shape (window_len,)
+        x = np.arange(window_len, dtype=np.float64) - float(pos)
+
+        # A: shape (window_len, polyorder+1)
+        # A[k, j] = x[k]^j  (j=0..polyorder)
+        A = np.vander(x, polyorder + 1, increasing=True)
+
+        # pinv: shape (polyorder+1, window_len)
+        pinv = np.linalg.pinv(A)
+
+        # 1차 미분은 다항식 계수 중 1차항 계수(c[1])가 dt로 나눈 값
+        # coeff: shape (window_len,)
+        coeff = pinv[1] / dt_f
+        coeffs[pos] = coeff
+
+    # 캐시된 배열이 실수로 수정되는 걸 막기 위해 read-only로 둠
+    coeffs.setflags(write=False)
+    return coeffs
+
+
+def _sg_first_derivative_1d(
+    y: np.ndarray,  # (L,)
+    *,
+    dt: float,
+    polyorder: int,
+    max_window_len: int,
+) -> np.ndarray:
+    """1차원 시퀀스 y(t)에서 SG 방식으로 dy/dt를 구한다.
+
+    - 구간 길이가 짧으면(또는 창 길이를 만들 수 없으면) 단순 차분으로 대체합니다.
+
+    Args:
+        y (np.ndarray):
+            shape: (L,)
+            1차원 값 시퀀스.
+        dt (float):
+            샘플 간 시간 간격(초). shape: ()
+        polyorder (int):
+            SG 차수. shape: ()
+        max_window_len (int):
+            최대 창 길이. shape: ()
+
+    Returns:
+        np.ndarray:
+            shape: (L,)
+            dy/dt. dtype=float32
+    """
+    y_np = np.asarray(y)
+    if y_np.ndim != 1:
+        raise ValueError(f"y must be 1D. got {y_np.shape}")
+
+    L = int(y_np.shape[0])
+    if L <= 0:
+        return np.zeros((0,), dtype=np.float32)
+
+    dt_f = float(dt)
+    if (not np.isfinite(dt_f)) or dt_f <= 0.0:
+        raise ValueError(f"dt must be finite and > 0. got {dt}")
+
+    # 길이가 1이면 미분 불가 -> 0
+    if L < 2:
+        return np.zeros((L,), dtype=np.float32)
+
+    # 창 길이 선택: 가능한 한 크게, 홀수 유지
+    win = int(min(int(max_window_len), L))
+    if win % 2 == 0:
+        win -= 1
+
+    # SG가 불가능하면(너무 짧거나, polyorder 조건 불만족) 단순 차분으로 대체
+    if win < 3 or polyorder < 1 or win <= int(polyorder):
+        out = np.zeros((L,), dtype=np.float32)
+        inv_dt = np.float32(1.0 / dt_f)
+        y_f = y_np.astype(np.float32, copy=False)
+        out[1:] = (y_f[1:] - y_f[:-1]) * inv_dt
+        out[0] = out[1]  # 첫 점은 바로 다음 점과 같게 둠(안정 목적)
+        return out
+
+    coeffs = _get_sg_first_derivative_coeffs(win, int(polyorder), float(dt_f))  # (win,win)
+    half = win // 2
+
+    y_f64 = y_np.astype(np.float64, copy=False)
+    out_f64 = np.zeros((L,), dtype=np.float64)
+
+    for i in range(L):
+        # 경계에서는 창을 [0..win-1] 또는 [L-win..L-1]로 고정하고,
+        # 내부에서는 중앙 정렬
+        if i < half:
+            start = 0
+            pos = i
+        elif i > (L - 1 - half):
+            start = L - win
+            pos = i - start
+        else:
+            start = i - half
+            pos = half
+
+        # y_win: shape (win,)
+        y_win = y_f64[start:start + win]
+        out_f64[i] = float(np.dot(coeffs[pos], y_win))
+
+    return out_f64.astype(np.float32, copy=False)
+
+
+def compute_past_future_vxy_from_xy_via_savgol(
+    past_future_xy: np.ndarray,    # (T,2) or (A,T,2)
+    past_future_valid: np.ndarray, # (T,) or (A,T) bool
+    *,
+    dt: float = 0.1,
+    polyorder: int = 2,
+    max_window_len_lin_vel: int = 7,
+) -> np.ndarray:
+    """(x,y) 시퀀스를 SG 방식으로 미분해서 (v_x, v_y)를 만든다.
+
+    중요한 처리 규칙:
+      - past_future_valid=False 인 프레임은 출력 v_x/v_y를 0으로 둡니다.
+      - 유효(True) 구간이 여러 덩어리로 나뉘어 있으면, 덩어리별로 따로 미분합니다.
+        (무효 구간(0 패딩)이 유효 구간의 속도 계산에 섞이지 않게 하기 위함)
+
+    Args:
+        past_future_xy (np.ndarray):
+            - ego: (T, 2)
+            - neighbor: (A, T, 2)
+            - 마지막 2는 [x, y]
+        past_future_valid (np.ndarray):
+            - ego: (T,) bool
+            - neighbor: (A, T) bool
+        dt (float): 샘플 간 시간 간격(초). shape: ()
+        polyorder (int): SG 차수. shape: ()
+        max_window_len_lin_vel (int): 속도 미분에 사용할 최대 창 길이. shape: ()
+
+    Returns:
+        np.ndarray:
+            - ego: (T, 2)
+            - neighbor: (A, T, 2)
+            - 마지막 2는 [v_x, v_y]
+            - 무효 프레임은 (0,0)
+    """
+    xy = np.asarray(past_future_xy)
+    valid = np.asarray(past_future_valid)
+
+    if xy.ndim == 2:
+        if xy.shape[-1] != 2:
+            raise ValueError(f"past_future_xy last dim must be 2. got {xy.shape}")
+        if valid.ndim != 1 or valid.shape[0] != xy.shape[0]:
+            raise ValueError(f"valid shape mismatch: xy={xy.shape}, valid={valid.shape}")
+        xy_b = xy[None, ...]         # (1,T,2)
+        valid_b = valid[None, ...]   # (1,T)
+        squeeze_agent = True
+    elif xy.ndim == 3:
+        if xy.shape[-1] != 2:
+            raise ValueError(f"past_future_xy last dim must be 2. got {xy.shape}")
+        if valid.shape != xy.shape[:2]:
+            raise ValueError(f"valid shape mismatch: xy={xy.shape}, valid={valid.shape}")
+        xy_b = xy                    # (A,T,2)
+        valid_b = valid              # (A,T)
+        squeeze_agent = False
+    else:
+        raise ValueError(f"past_future_xy must be 2D or 3D. got {xy.shape}")
+
+    A = int(xy_b.shape[0])
+    T = int(xy_b.shape[1])
+    out = np.zeros((A, T, 2), dtype=np.float32)
+
+    dt_f = float(dt)
+    if (not np.isfinite(dt_f)) or dt_f <= 0.0:
+        raise ValueError(f"dt must be finite and > 0. got {dt}")
+
+    for a in range(A):
+        vm = valid_b[a].astype(bool, copy=False)  # (T,)
+        if not np.any(vm):
+            continue
+
+        # 유효 인덱스들을 모아 연속 구간(덩어리)로 분리
+        idx = np.nonzero(vm)[0]
+        start = int(idx[0])
+        prev = int(idx[0])
+
+        segments: List[Tuple[int, int]] = []
+        for k in idx[1:]:
+            k_i = int(k)
+            if k_i != prev + 1:
+                segments.append((start, prev))
+                start = k_i
+            prev = k_i
+        segments.append((start, prev))
+
+        x_all = xy_b[a, :, 0].astype(np.float32, copy=False)  # (T,)
+        y_all = xy_b[a, :, 1].astype(np.float32, copy=False)  # (T,)
+
+        for (s, e) in segments:
+            seg_len = int(e - s + 1)
+            if seg_len < 2:
+                continue
+
+            # seg_x/seg_y: (seg_len,)
+            seg_x = x_all[s:e + 1]
+            seg_y = y_all[s:e + 1]
+
+            vx = _sg_first_derivative_1d(
+                seg_x,
+                dt=dt_f,
+                polyorder=int(polyorder),
+                max_window_len=int(max_window_len_lin_vel),
+            )  # (seg_len,)
+            vy = _sg_first_derivative_1d(
+                seg_y,
+                dt=dt_f,
+                polyorder=int(polyorder),
+                max_window_len=int(max_window_len_lin_vel),
+            )  # (seg_len,)
+
+            out[a, s:e + 1, 0] = vx
+            out[a, s:e + 1, 1] = vy
+
+    return out[0] if squeeze_agent else out
 
 
 
@@ -2611,50 +2871,117 @@ class DataProcessor(object):
 
         return past_future_cs_yaw, past_future_valid
 
+    @staticmethod
+    def _concat_past_future_xy_from_traj11(
+            past_cur_traj_11: np.ndarray,  # (time_len,11) or (A,time_len,11)
+            future_traj_11: np.ndarray,  # (future_len,11) or (A,future_len,11)
+    ) -> np.ndarray:
+        """past~current~future의 (x, y) 시퀀스를 만든다.
+
+        Args:
+            past_cur_traj_11 (np.ndarray):
+                - ego: (time_len, 11)
+                - neighbor: (A, time_len, 11)
+            future_traj_11 (np.ndarray):
+                - ego: (future_len, 11)
+                - neighbor: (A, future_len, 11)
+
+        Returns:
+            np.ndarray:
+                - ego: (time_len+future_len, 2)
+                - neighbor: (A, time_len+future_len, 2)
+                - 마지막 2는 [x, y]
+        """
+        past = np.asarray(past_cur_traj_11)
+        fut = np.asarray(future_traj_11)
+
+        if past.ndim != fut.ndim:
+            raise ValueError(
+                f"past/future ndim mismatch: past={past.shape}, future={fut.shape}")
+        if past.shape[-1] != 11 or fut.shape[-1] != 11:
+            raise ValueError(
+                f"last dim must be 11: past={past.shape}, future={fut.shape}")
+
+        if past.ndim == 2:
+            axis_time = 0
+        elif past.ndim == 3:
+            if past.shape[0] != fut.shape[0]:
+                raise ValueError(
+                    f"A(agent) dim mismatch: past={past.shape}, future={fut.shape}")
+            axis_time = 1
+        else:
+            raise ValueError(f"traj_11 must be 2D or 3D. got past={past.shape}")
+
+        past_xy = past[..., 0:2]
+        fut_xy = fut[..., 0:2]
+        xy = np.concatenate([past_xy, fut_xy], axis=axis_time).astype(
+            np.float32, copy=False)
+        return xy
+
     def _build_past_future_control_vxy_yawrate_from_traj11(
-        self,
-        past_cur_traj_11: np.ndarray,  # (time_len,11) or (A,time_len,11)
-        future_traj_11: np.ndarray,    # (future_len,11) or (A,future_len,11)
-        *,
-        dt: float,
-        polyorder: int,
-        max_window_len_yaw: int,
-        eps_valid: float,
+            self,
+            past_cur_traj_11: np.ndarray,  # (time_len,11) or (A,time_len,11)
+            future_traj_11: np.ndarray,  # (future_len,11) or (A,future_len,11)
+            *,
+            dt: float,
+            polyorder: int,
+            max_window_len_yaw: int,
+            eps_valid: float,
+            use_savgol_lin_vel: bool = False,
+            max_window_len_lin_vel: int = 7,
     ) -> np.ndarray:
         """past~current~future 기반 control(3) = [v_x, v_y, yaw_rate] 를 만든다.
 
-        흐름:
-          1) vxy 시퀀스 만들기
-          2) cs_yaw + valid 만들기
-          3) cs_yaw + valid로 SG(yaw_rate) 계산
-          4) vxy + yaw_rate를 concat해서 control(3) 만들기
+        변경점(요청사항):
+          - use_savgol_lin_vel=True 이면,
+            traj11의 (v_x, v_y) 채널(4:6)을 그대로 쓰지 않고,
+            (x,y) 궤적을 SG 방식으로 미분해서 v_x, v_y를 직접 만듭니다.
+          - yaw_rate는 기존과 동일하게 (cos,sin)에서 SG 방식으로 계산합니다.
+          - past_future_valid=False 인 프레임은 v_x/v_y/yaw_rate 모두 0으로 둡니다.
 
         Args:
             past_cur_traj_11: (time_len,11) 또는 (A,time_len,11)
             future_traj_11:   (future_len,11) 또는 (A,future_len,11)
-            dt: 샘플 간 시간 간격
-            polyorder: SG 다항 차수
-            max_window_len_yaw: yaw_rate 미분 창 길이
-            eps_valid: 유효 판정 기준
+            dt: 샘플 간 시간 간격. shape: ()
+            polyorder: SG 차수. shape: ()
+            max_window_len_yaw: yaw_rate 미분 창 길이. shape: ()
+            eps_valid: 유효 판정 기준. shape: ()
+            use_savgol_lin_vel: True면 (x,y) 미분으로 v_x/v_y 생성. shape: ()
+            max_window_len_lin_vel: v_x/v_y 미분 창 최대 길이. shape: ()
 
         Returns:
-            - past_future_control:
-                · ego: (time_len+future_len, 3)
-                · neighbor: (A, time_len+future_len, 3)
-                · 마지막 3은 [v_x, v_y, yaw_rate]
-
+            np.ndarray:
+                - ego: (time_len+future_len, 3)
+                - neighbor: (A, time_len+future_len, 3)
+                - 마지막 3은 [v_x, v_y, yaw_rate]
         """
-        past_future_vxy = self._concat_past_future_vxy_from_traj11(
-            past_cur_traj_11=past_cur_traj_11,
-            future_traj_11=future_traj_11,
-        )
-
+        # 1) yaw_rate 계산에 필요한 cs_yaw + valid (유효 마스크는 여기서 같이 얻어 재사용)
         past_future_cs_yaw, past_future_valid = self._build_past_future_yaw_inputs_from_traj11(
             past_cur_traj_11=past_cur_traj_11,
             future_traj_11=future_traj_11,
             eps_valid=float(eps_valid),
         )
 
+        # 2) v_x/v_y 만들기
+        if bool(use_savgol_lin_vel):
+            past_future_xy = self._concat_past_future_xy_from_traj11(
+                past_cur_traj_11=past_cur_traj_11,
+                future_traj_11=future_traj_11,
+            )
+            past_future_vxy = compute_past_future_vxy_from_xy_via_savgol(
+                past_future_xy=past_future_xy,
+                past_future_valid=past_future_valid,
+                dt=float(dt),
+                polyorder=int(polyorder),
+                max_window_len_lin_vel=int(max_window_len_lin_vel),
+            ).astype(np.float32, copy=False)
+        else:
+            past_future_vxy = self._concat_past_future_vxy_from_traj11(
+                past_cur_traj_11=past_cur_traj_11,
+                future_traj_11=future_traj_11,
+            ).astype(np.float32, copy=False)
+
+        # 3) yaw_rate (기존 로직 유지)
         past_future_yaw_rate = compute_past_future_yaw_rate_from_cs_yaw_via_feasible_sg(
             past_future_cs_yaw=past_future_cs_yaw,
             past_future_valid=past_future_valid,
@@ -2663,10 +2990,11 @@ class DataProcessor(object):
             max_window_len_yaw=int(max_window_len_yaw),
         ).astype(np.float32, copy=False)
 
-        # vxy + yaw_rate -> control(3)
+        # 4) vxy + yaw_rate -> control(3)
         if past_future_vxy.ndim == 2:
             # ego: (T,2) + (T,1) -> (T,3)
-            if past_future_yaw_rate.ndim != 1 or past_future_yaw_rate.shape[0] != past_future_vxy.shape[0]:
+            if past_future_yaw_rate.ndim != 1 or past_future_yaw_rate.shape[
+                0] != past_future_vxy.shape[0]:
                 raise ValueError(
                     f"ego yaw_rate shape mismatch: vxy={past_future_vxy.shape}, yaw_rate={past_future_yaw_rate.shape}"
                 )
@@ -2676,7 +3004,8 @@ class DataProcessor(object):
             ).astype(np.float32, copy=False)
         else:
             # neighbor: (A,T,2) + (A,T,1) -> (A,T,3)
-            if past_future_yaw_rate.ndim != 2 or past_future_yaw_rate.shape[:2] != past_future_vxy.shape[:2]:
+            if past_future_yaw_rate.ndim != 2 or past_future_yaw_rate.shape[
+                :2] != past_future_vxy.shape[:2]:
                 raise ValueError(
                     f"neighbor yaw_rate shape mismatch: vxy={past_future_vxy.shape}, yaw_rate={past_future_yaw_rate.shape}"
                 )
@@ -2686,7 +3015,6 @@ class DataProcessor(object):
             ).astype(np.float32, copy=False)
 
         return past_future_control
-
 
     def _build_target_integrated_outputs_via_filter_and_integrate(
         self,
@@ -3579,28 +3907,31 @@ class DataProcessor(object):
             # =========================================================
             # ✅ [ADDED] past+future 기반 control(3) = [v_x, v_y, yaw_rate]
             # =========================================================
-            """
-            ego_past_future_control : (time_len+future_len, 3)
-            """
+            use_savgol_lin_vel: bool = bool(
+                getattr(self.config, "use_savgol_lin_vel", False))
+            use_savgol_lin_vel = True
             ego_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
-                past_cur_traj_11=ego_agent_past,         # (time_len, 11)
-                future_traj_11=ego_future_gt_11_dim,     # (future_len, 11)
+                past_cur_traj_11=ego_agent_past,
+                future_traj_11=ego_future_gt_11_dim,
                 dt=0.1,
                 polyorder=2,
                 max_window_len_yaw=7,
                 eps_valid=1e-8,
+                use_savgol_lin_vel=use_savgol_lin_vel,
+                max_window_len_lin_vel=7,
             )
-            """
-            neighbor_past_future_control : (A, time_len+future_len, 3)
-            """
+
             neighbor_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
-                past_cur_traj_11=neighbor_agents_past,      # (A, time_len, 11)
-                future_traj_11=neighbor_future_gt_11_dim,   # (A, future_len, 11)
+                past_cur_traj_11=neighbor_agents_past,
+                future_traj_11=neighbor_future_gt_11_dim,
                 dt=0.1,
                 polyorder=2,
                 max_window_len_yaw=7,
                 eps_valid=1e-8,
+                use_savgol_lin_vel=use_savgol_lin_vel,
+                max_window_len_lin_vel=7,
             )
+
             # =========================================================
             # ✅ [ADDED] ego+neighbor node control -> midpoint body seg control
             #   - target_past_future_control: (1+N, time_len+future_len, 3)
