@@ -768,7 +768,7 @@ def _forward_model_with_autocast(
     batch_diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
     low_t_mask: torch.Tensor,  # (B,)
     use_deepspeed: bool,
-    past_seq_control_gt_3_dim: Optional[torch.Tensor],  # (B, (1+)Pnn, past_len, 3) or None
+    past_seg_control_gt_3_dim: Optional[torch.Tensor],  # (B, (1+)Pnn, past_len, 3) or None
 ) -> Dict[str, torch.Tensor]:
     """모델 입력 dict 를 만들고 AMP 로 forward 를 수행한다.
 
@@ -786,7 +786,7 @@ def _forward_model_with_autocast(
             target_seq_norm_xT,  # (B, (1+)Pnn, (1+future_len, 4) or (future_len, 3))
         "diffusion_time": batch_diffusion_time,  # (B,) or (B, T)
         "low_t_mask": low_t_mask,  # (B,)
-        "past_seq_control_gt_3_dim": past_seq_control_gt_3_dim,  # (B, (1+)Pnn, past_len, 3) or None
+        "past_seg_control_gt_3_dim": past_seg_control_gt_3_dim,  # (B, (1+)Pnn, past_len, 3) or None
     }
     # merged_inputs 만들어진 직후
     # decoder_output = forward_once_and_check_bf16(
@@ -1279,7 +1279,7 @@ def diffusion_loss_func(
             near_cur_future_gt_is_valid=
             near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
         )
-        past_seq_control_gt_3_dim = None
+        past_seg_control_gt_3_dim = None
     else: # velocity_based
         """
         past_future_seg_control_gt_3_dim: (B, 1+Pnn, past_len + future_len, 3)
@@ -1295,10 +1295,10 @@ def diffusion_loss_func(
             future_seg_control_gt_3_dim,
         ]) # (B, 1+Pnn, past_len + future_len, 3)
         assert past_future_seg_control_gt_3_dim.shape[2] == (args.time_len - 1 + future_len)
-        # past_seq_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
-        past_seq_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
+        # past_seg_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
+        past_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
         if not args.do_ego_predict:
-            past_seq_control_gt_3_dim = past_seq_control_gt_3_dim[:, 1:, :, :]
+            past_seg_control_gt_3_dim = past_seg_control_gt_3_dim[:, 1:, :, :]
         # (B, (1+)Pnn, future_len, 3)
         future_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, -future_len:, :]
         (
@@ -1361,7 +1361,7 @@ def diffusion_loss_func(
         batch_diffusion_time=batch_diffusion_time,  # (B,) or (B, future_len)
         low_t_mask=low_t_mask,  # (B,)
         use_deepspeed=args.use_deepspeed,
-        past_seq_control_gt_3_dim=past_seq_control_gt_3_dim, # (B, (1+)Pnn, past_len, 3) or None
+        past_seg_control_gt_3_dim=past_seg_control_gt_3_dim, # (B, (1+)Pnn, past_len, 3) or None
     )
 
     # score:  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)

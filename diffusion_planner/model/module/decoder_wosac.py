@@ -1038,12 +1038,12 @@ class Decoder(nn.Module):
             #target_seq_past: (B, (1+)Pnn, time_len, 4)
             target_seq_past =  target_agents_past[:, : ,:, :4]
         else:
-            # past_seq_control_gt_3_dim:  (B, (1+)Pnn, past_len, 3) or None
-            past_seq_control_gt_3_dim = inputs.get("past_seq_control_gt_3_dim",
+            # past_seg_control_gt_3_dim:  (B, (1+)Pnn, past_len, 3) or None
+            past_seg_control_gt_3_dim = inputs.get("past_seg_control_gt_3_dim",
                                                    None)
-            assert past_seq_control_gt_3_dim is not None, \
-                f"past_seq_control_gt_3_dim is None, but config.pose_based={self.config.pose_based}"
-            target_seq_past = past_seq_control_gt_3_dim # (B, (1+)Pnn, past_len, 3)
+            assert past_seg_control_gt_3_dim is not None, \
+                f"past_seg_control_gt_3_dim is None, but config.pose_based={self.config.pose_based}"
+            target_seq_past = past_seg_control_gt_3_dim # (B, (1+)Pnn, past_len, 3)
         return (
             target_agents_past,  # (B, (1+)Pnn, time_len, 11)
             target_seq_past, # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
@@ -2830,7 +2830,7 @@ class DiT(nn.Module):
 
         # control도 기존 core_vel과 동일 흐름을 따름
         temp_dict = {"seg_body_control": diffusion_control_traj.detach().float()}
-        norm_temp_dict = self.config.observation_normalizer(temp_dict)
+        norm_temp_dict = self.config.observation_normalizer.inverse(temp_dict)
         unnorm_control = norm_temp_dict["seg_body_control"]  # (B,Pnn,T,3)
 
         vx_b = unnorm_control[..., 0]     # (B,Pnn,T)
@@ -3171,7 +3171,7 @@ class DiT(nn.Module):
         """pose_based=False에서 PRAM에 넣을 '현재 motion'을 뽑습니다.
 
         여기서 '현재 motion'은 "현재 시점 바로 직전 구간"의 control(vxᵇ, vyᵇ, yaw_rate) 입니다.
-        즉, past_seq_control_gt_3_dim[..., -1, :]과 같은 의미입니다.
+        즉, past_seg_control_gt_3_dim[..., -1, :]과 같은 의미입니다.
 
         Args:
             target_input_norm_xT (torch.Tensor):
