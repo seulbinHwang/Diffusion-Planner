@@ -412,7 +412,7 @@ from typing import Dict, Optional
 
 def _compute_control_xy_yaw_diff(
     control_diff_denorm: torch.
-    Tensor,  # [B, P, T, 3], (vx[m/s], vy[m/s], yaw_rate[rad/s] 또는 deg/s)
+    Tensor,  # [B, P, T, 3], (vx[m/s], vy[m/s], yaw_rate[rad/s])
     valid_mask: torch.Tensor,  # [B, P, T], True=유효
     *,
     prefix: str = "constraint_diff",
@@ -1287,8 +1287,13 @@ def diffusion_loss_func(
         normed_target_seq_gt : (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
         target_seq_is_valid : (B, (1+)Pnn, future_len)
         """
-        past_future_seg_control_gt_3_dim = norm_inputs[
-                "past_future_seg_control_gt_3_dim"]
+        past_seg_control_gt_3_dim = norm_inputs[
+                "past_seg_control_gt_3_dim"]
+        future_seg_control_gt_3_dim = norm_outputs["future_seg_control_gt_3_dim"]
+        past_future_seg_control_gt_3_dim = torch.cat([
+            past_seg_control_gt_3_dim,
+            future_seg_control_gt_3_dim,
+        ]) # (B, 1+Pnn, past_len + future_len, 3)
         assert past_future_seg_control_gt_3_dim.shape[2] == (args.time_len - 1 + future_len)
         # past_seq_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
         past_seq_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :-future_len, : ]
