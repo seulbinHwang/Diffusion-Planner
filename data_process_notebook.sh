@@ -14,7 +14,7 @@ python data_process.py \
 --data_path $NUPLAN_DATA_PATH \
 --map_path $NUPLAN_MAP_PATH \
 --save_path $TRAIN_SET_PATH \
---total_scenarios 12 \
+--total_scenarios 120 \
 --num_workers 1 \
 --save_image false \
 --save_integration_traj true

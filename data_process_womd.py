@@ -4825,6 +4825,277 @@ _WORKER_LOCAL_NEIGHBOR_XY_YAW_SUMS: Optional[NeighborXYYawLossRunningSums] = Non
 _NEIGHBOR_XY_YAW_SUMS_PROXY: Optional[Any] = None
 _NEIGHBOR_XY_YAW_SUMS_LOCK: Optional[Any] = None
 
+from typing import Any, Optional, Tuple
+import os
+import math
+import uuid
+from pathlib import Path
+
+import numpy as np
+
+
+def build_target_current_wl_from_current_feat11_for_cache(
+    ego_agents_past: np.ndarray,          # shape: (TIME_LEN, 11)
+    neighbor_agents_past: np.ndarray,     # shape: (N, TIME_LEN, 11)
+) -> np.ndarray:
+    """ego/neighbor의 현재 시점 width/length를 (1+N,2)로 만듭니다.
+
+    11차원 agent 특징 포맷(요약):
+      [x, y, cos(yaw), sin(yaw), v_x, v_y, width, length, one_hot(3)]
+    따라서 width/length는 항상 [6:8]에 있습니다.
+
+    Args:
+        ego_agents_past: (TIME_LEN, 11) float32.
+            마지막 시점(-1)이 현재입니다.
+        neighbor_agents_past: (N, TIME_LEN, 11) float32.
+            마지막 시점(-1)이 현재입니다.
+
+    Returns:
+        target_current_wl: (1+N, 2) float32.
+            [:,0] = width, [:,1] = length
+            첫 행은 ego, 그 뒤는 neighbor 순서입니다.
+    """
+    ego = np.asarray(ego_agents_past, dtype=np.float32)
+    neigh = np.asarray(neighbor_agents_past, dtype=np.float32)
+
+    if ego.ndim != 2 or int(ego.shape[1]) < 8:
+        raise ValueError(f"ego_agents_past must be (TIME_LEN, >=8). got={ego.shape}")
+    if neigh.ndim != 3 or int(neigh.shape[2]) < 8:
+        raise ValueError(f"neighbor_agents_past must be (N, TIME_LEN, >=8). got={neigh.shape}")
+
+    ego_wl = ego[-1, 6:8].reshape(1, 2).astype(np.float32)  # (1,2)
+
+    n = int(neigh.shape[0])
+    if n > 0:
+        neigh_wl = neigh[:, -1, 6:8].astype(np.float32)     # (N,2)
+        out = np.concatenate([ego_wl, neigh_wl], axis=0).astype(np.float32)  # (1+N,2)
+    else:
+        out = ego_wl.astype(np.float32)  # (1,2)
+
+    return out
+
+
+def _rect_poly_and_heading_xy(
+    center_xy: np.ndarray,  # shape: (2,)
+    cos_yaw: float,
+    sin_yaw: float,
+    width: float,
+    length: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """중심/방향/가로세로로 “방향 표시가 되는” 사각형 외곽선(poly)과 전방 포인트를 만듭니다.
+
+    Args:
+        center_xy: (2,) [x,y]
+        cos_yaw: cos(yaw)
+        sin_yaw: sin(yaw)
+        width: 가로(옆 폭)
+        length: 세로(앞뒤 길이)
+
+    Returns:
+        poly_xy: (5,2) float32. 사각형 외곽선(마지막은 첫 점으로 닫음).
+        head_xy: (2,) float32. 중심에서 “앞 방향”을 가리키는 점(전방 중심).
+    """
+    c = np.asarray(center_xy, dtype=np.float32).reshape(2,)
+    w = float(width)
+    l = float(length)
+
+    hl = 0.5 * l
+    hw = 0.5 * w
+
+    # local corners: 앞(+x) 기준으로 길이, 옆(+y) 기준으로 폭
+    local = np.array(
+        [
+            [ hl,  hw],
+            [ hl, -hw],
+            [-hl, -hw],
+            [-hl,  hw],
+        ],
+        dtype=np.float32,
+    )  # (4,2)
+
+    # cos/sin이 정규화가 아니어도 atan2로 yaw 복원 가능하지만,
+    # 회전엔 “정규화된” 방향이 더 안전합니다(0 나눗셈 방지).
+    norm = math.sqrt(float(cos_yaw) * float(cos_yaw) + float(sin_yaw) * float(sin_yaw))
+    if norm <= 1e-6:
+        cy = 1.0
+        sy = 0.0
+    else:
+        cy = float(cos_yaw) / norm
+        sy = float(sin_yaw) / norm
+
+    rot = np.array([[cy, -sy], [sy, cy]], dtype=np.float32)  # (2,2)
+
+    world = (local @ rot.T) + c[None, :]  # (4,2)
+    poly = np.vstack([world, world[:1]]).astype(np.float32)  # (5,2)
+
+    head_local = np.array([hl, 0.0], dtype=np.float32)       # (2,)
+    head_xy = (head_local @ rot.T) + c                        # (2,)
+
+    return poly, head_xy.astype(np.float32)
+
+
+def save_rect_trajectory_comparison_png(
+    out_dir: str,
+    *,
+    scenario_id: str,
+    target_integrated_trajectory: np.ndarray,  # shape: (1+N, F, 4)
+    target_future_gt_4_dim: np.ndarray,        # shape: (1+N, F, 4)
+    target_current_wl: np.ndarray,             # shape: (1+N, 2)
+    target_cur_future_valid: np.ndarray,       # shape: (1+N, 1+F)
+    dpi: int = 150,
+    step_stride: int = 1,
+) -> str:
+    """integrated vs GT를 사각형(방향 포함) 궤적으로 겹쳐 그린 png를 저장합니다.
+
+    Args:
+        out_dir: 저장 폴더 경로.
+        scenario_id: 파일명에 포함할 시나리오 id.
+        target_integrated_trajectory: (1+N, F, 4) [x,y,cos,sin]
+        target_future_gt_4_dim: (1+N, F, 4) [x,y,cos,sin]
+        target_current_wl: (1+N, 2) [width,length]
+        target_cur_future_valid: (1+N, 1+F) bool. 현재+미래 유효 마스크.
+        dpi: 저장 dpi.
+        step_stride: 몇 스텝 간격으로 사각형을 그릴지(1이면 전부).
+
+    Returns:
+        saved_path: 저장된 png 경로(str). 실패하면 "".
+    """
+    integ = np.asarray(target_integrated_trajectory, dtype=np.float32)
+    gt = np.asarray(target_future_gt_4_dim, dtype=np.float32)
+    wl = np.asarray(target_current_wl, dtype=np.float32)
+    valid_cf = np.asarray(target_cur_future_valid, dtype=bool)
+
+    if integ.ndim != 3 or int(integ.shape[2]) != 4:
+        raise ValueError(f"target_integrated_trajectory must be (P,F,4). got={integ.shape}")
+    if gt.shape != integ.shape:
+        raise ValueError(f"target_future_gt_4_dim shape mismatch. gt={gt.shape}, integ={integ.shape}")
+    if wl.shape != (int(integ.shape[0]), 2):
+        raise ValueError(f"target_current_wl must be (P,2). got={wl.shape}, P={int(integ.shape[0])}")
+    if valid_cf.shape != (int(integ.shape[0]), int(integ.shape[1]) + 1):
+        raise ValueError(
+            "target_cur_future_valid must be (P,1+F). "
+            f"got={valid_cf.shape}, expected={(int(integ.shape[0]), int(integ.shape[1]) + 1)}"
+        )
+
+    # 미래 유효 마스크: (P,F)
+    valid_f = valid_cf[:, 1:]  # (P,F)
+
+    # matplotlib는 환경에 따라 없을 수 있어, 없으면 조용히 스킵
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except Exception:
+        return ""
+
+    # 저장 경로 준비(파일명 충돌 방지: pid + uuid)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    fname = f"{scenario_id}_pid{os.getpid()}_{uuid.uuid4().hex}.png"
+    save_path = str(Path(out_dir) / fname)
+
+    # 보기 범위 계산(유효한 xy만)
+    def _collect_valid_xy(arr_4: np.ndarray) -> np.ndarray:
+        # arr_4: (P,F,4)
+        xy = arr_4[:, :, 0:2]  # (P,F,2)
+        m = valid_f
+        if not bool(np.any(m)):
+            return np.zeros((0, 2), dtype=np.float32)
+        pts = xy[m].reshape(-1, 2).astype(np.float32)  # (K,2)
+        return pts
+
+    pts_all = []
+    pts_i = _collect_valid_xy(integ)
+    pts_g = _collect_valid_xy(gt)
+    if pts_i.shape[0] > 0:
+        pts_all.append(pts_i)
+    if pts_g.shape[0] > 0:
+        pts_all.append(pts_g)
+
+    if len(pts_all) > 0:
+        pts = np.concatenate(pts_all, axis=0)  # (K,2)
+        x_min = float(np.min(pts[:, 0]))
+        x_max = float(np.max(pts[:, 0]))
+        y_min = float(np.min(pts[:, 1]))
+        y_max = float(np.max(pts[:, 1]))
+    else:
+        x_min, x_max, y_min, y_max = -10.0, 10.0, -10.0, 10.0
+
+    # 여유 마진(차 크기 고려)
+    max_len = float(np.max(wl[:, 1])) if wl.size > 0 else 4.0
+    max_wid = float(np.max(wl[:, 0])) if wl.size > 0 else 2.0
+    margin = max(10.0, 2.0 * max(max_len, max_wid))
+    x_min -= margin
+    x_max += margin
+    y_min -= margin
+    y_max += margin
+
+    fig, ax = plt.subplots(figsize=(8, 8), dpi=int(dpi))
+
+    def _draw_one(traj_4: np.ndarray, color: str, step_stride_i: int) -> None:
+        P = int(traj_4.shape[0])
+        F = int(traj_4.shape[1])
+        stride = max(1, int(step_stride_i))
+
+        # 중심 궤적(라인)도 같이(가독성)
+        for p in range(P):
+            m = valid_f[p]  # (F,)
+            if not bool(np.any(m)):
+                continue
+            xy = traj_4[p, :, 0:2]  # (F,2)
+            xy_v = xy[m]
+            if xy_v.shape[0] >= 2:
+                ax.plot(xy_v[:, 0], xy_v[:, 1], color=color, alpha=0.35, linewidth=1.0)
+
+        # 사각형(방향 포함)
+        for p in range(P):
+            width = float(wl[p, 0])
+            length = float(wl[p, 1])
+            if not (width > 0.0 and length > 0.0):
+                continue
+
+            for t in range(0, F, stride):
+                if not bool(valid_f[p, t]):
+                    continue
+
+                x = float(traj_4[p, t, 0])
+                y = float(traj_4[p, t, 1])
+                cy = float(traj_4[p, t, 2])
+                sy = float(traj_4[p, t, 3])
+
+                poly, head = _rect_poly_and_heading_xy(
+                    center_xy=np.array([x, y], dtype=np.float32),
+                    cos_yaw=cy,
+                    sin_yaw=sy,
+                    width=width,
+                    length=length,
+                )  # poly:(5,2), head:(2,)
+
+                ax.plot(poly[:, 0], poly[:, 1], color=color, alpha=0.18, linewidth=0.8)
+                ax.plot([x, float(head[0])], [y, float(head[1])], color=color, alpha=0.25, linewidth=0.8)
+
+    # GT(파란색) vs integrated(빨간색)
+    _draw_one(gt, color="tab:blue", step_stride_i=step_stride)
+    _draw_one(integ, color="tab:red", step_stride_i=step_stride)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+    ax.grid(True, alpha=0.2)
+    ax.set_title(f"rect traj compare | scenario={scenario_id}")
+
+    # 범례(간단히 2개만)
+    legend_lines = [
+        Line2D([0], [0], color="tab:blue", lw=2, label="GT (future_gt_4_dim)"),
+        Line2D([0], [0], color="tab:red", lw=2, label="Integrated (filter_and_integrate)"),
+    ]
+    ax.legend(handles=legend_lines, loc="upper right")
+
+    fig.tight_layout()
+    fig.savefig(save_path)
+    plt.close(fig)
+    return save_path
+
 
 def build_target_future_gt_4_dim_from_future_11_dim(
     ego_future_gt_11_dim: np.ndarray,          # shape: (F, 11)
@@ -5197,7 +5468,10 @@ def compute_target_integrated_trajectory_and_constraint_diff_for_cache(
 # 시나리오 -> pkl dict 만들기
 # =========================
 def build_cache_dict_for_scenario(
-    scenario: scenario_pb2.Scenario,) -> Dict[str, Any]:
+    scenario: scenario_pb2.Scenario,
+    *,
+    traj_rect_compare_dir: Optional[str] = None,
+) -> Dict[str, Any]:
     """Scenario 1개를 요구사항 포맷의 dict로 바꿉니다.
 
     이 dict가 그대로 pickle로 저장됩니다.
@@ -5459,6 +5733,27 @@ def build_cache_dict_for_scenario(
         ego_future_gt_11_dim=ego_future_gt_11_dim,                 # (F,11)
         neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,       # (A,F,11)
     )  # (1+A,F,4)
+
+    # ------------------------------------------------------------
+    # (추가) 현재 width/length로 사각형 궤적 비교 그림 저장
+    # ------------------------------------------------------------
+    if traj_rect_compare_dir is not None:
+        target_current_wl = build_target_current_wl_from_current_feat11_for_cache(
+            ego_agents_past=ego_agent_past,               # (TIME_LEN,11)
+            neighbor_agents_past=neighbor_agents_past,    # (N,TIME_LEN,11)
+        )  # (1+N,2)
+
+        _ = save_rect_trajectory_comparison_png(
+            traj_rect_compare_dir,
+            scenario_id=str(scenario.scenario_id),
+            target_integrated_trajectory=target_integrated_trajectory,  # (1+N,F,4)
+            target_future_gt_4_dim=target_future_gt_4_dim,              # (1+N,F,4)
+            target_current_wl=target_current_wl,                         # (1+N,2)
+            target_cur_future_valid=target_cur_future_valid,             # (1+N,1+F)
+            dpi=150,
+            step_stride=1,
+        )
+
 
     xy_loss, yaw_loss, num_valid = compute_neighbor_xy_yaw_losses_for_integrated_trajectory(
         target_integrated_trajectory=target_integrated_trajectory,  # (1+A,F,4)
@@ -5753,7 +6048,18 @@ def process_one_tfrecord_file(
                 message = "ABORTED_BY_USER"
                 break
 
-            cache_dict = build_cache_dict_for_scenario(scenario)
+            traj_rect_dir: Optional[str] = None
+            if bool(save_image):
+                traj_rect_dir = os.path.join(
+                    out_split_dir.as_posix() if hasattr(out_split_dir,
+                                                        "as_posix") else str(
+                        out_split_dir),
+                    "traj_rect_compare")
+
+            cache_dict = build_cache_dict_for_scenario(
+                scenario,
+                traj_rect_compare_dir=traj_rect_dir,
+            )
 
             # ✅ npz 저장 (scenario_id, neighbor_track_token 제외)
             save_cache_dict_to_npz(
@@ -5787,11 +6093,11 @@ def process_one_tfrecord_file(
                 save_path = os.path.join(save_dir, f"{scenario_id}.png")
                 os.makedirs(save_dir, exist_ok=True)
                 cache_dict["token_to_future_traj_wrt_ego"] = None
-                draw_machine_fast.draw_world_model_to_png(
-                    cache_dict,
-                    output_data={},
-                    save_path=save_path
-                )
+                # draw_machine_fast.draw_world_model_to_png(
+                #     cache_dict,
+                #     output_data={},
+                #     save_path=save_path
+                # )
 
         except Exception as e:
             failed += 1

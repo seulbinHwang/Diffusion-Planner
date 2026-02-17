@@ -686,15 +686,16 @@ class DataProcessor(object):
         return fixed_neighbor_agents_past, neighbor_future_gt_11_dim, neighbor_future_gt_3_dim
 
     def _enforce_no_invalid_between_valid_in_ego_past(
-        self,
-        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
-        *,
-        eps: float = 1e-8,
+            self,
+            ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+            *,
+            eps: float = 1e-8,
+            dt: float = 0.1,
     ) -> np.ndarray:
         """ego_agent_past(과거~현재)에서 '없는 과거 프레임(0 패딩)'이 끼어도 규칙이 깨지지 않게 정리한다.
 
-        핵심 요구사항(이번 수정)
-        -----------------------
+        핵심 요구사항
+        ------------
         - ego_agent_past는 과거→현재 순서다.
         - past가 부족한 경우 "없는 과거"는 앞쪽(prefix)에만 0으로 채워질 수 있다.
         - 따라서 유효 구간은 [first_valid ... current]로 한 덩어리여야 하며,
@@ -704,14 +705,22 @@ class DataProcessor(object):
         -----------------------
         - '없는 프레임'은 size/type 값이 섞여 들어올 수도 있으므로,
           유효 판정은 **앞 6개 값(x,y,cos,sin,vx,vy)**만 본다.
-          (즉, width/length/one-hot 때문에 무효가 유효로 오인되는 걸 막는다)
+          (width/length/one-hot 때문에 무효가 유효로 오인되는 걸 막는다)
 
         규칙
         ----
         - 현재 프레임(=past의 마지막)이 유효일 때:
           · past 안에서 유효점과 유효점 사이에 무효점(0)이 끼면 안 된다.
           · 유효 프레임들의 first~last 구간을 연속 유효 구간으로 만들고,
-            그 안의 빈 프레임은 x/y/cos/sin/vx/vy를 선형 보간으로 채운다.
+            그 안의 "구멍 프레임(무효 프레임)"만 채운다.
+          · 채우는 방식(구멍 프레임만):
+            - x/y: 시간축 선형 보간
+            - 방향(cos/sin):
+                1) 유효 프레임의 cos/sin → yaw(방향각, rad) 변환
+                2) yaw가 -pi/pi 경계에서 끊기지 않도록 연속 각도로 변환
+                3) yaw 선형 보간
+                4) 보간된 yaw → cos/sin 재생성
+            - vx/vy: (채워진 x/y)의 차분 / dt 로 구멍 프레임만 생성
           · 유효 구간 밖(prefix/suffix)은 0으로 둔다.
         - 현재 프레임이 무효면:
           · 안전하게 past 전체를 0으로 만든다.
@@ -720,7 +729,9 @@ class DataProcessor(object):
             ego_agent_past (np.ndarray):
                 shape: (Tp, 11)
             eps (float):
-                0과 아주 가까운 값을 “0”처럼 볼 때 쓰는 기준
+                0과 아주 가까운 값을 “0”처럼 볼 때 쓰는 기준. shape: ()
+            dt (float):
+                프레임 간 시간 간격(초). 구멍 프레임의 vx/vy를 만들 때만 사용. shape: ()
 
         Returns:
             np.ndarray:
@@ -736,6 +747,10 @@ class DataProcessor(object):
         if Tp == 0:
             return ego_agent_past
 
+        dt_f: float = float(dt)
+        if (not np.isfinite(dt_f)) or dt_f <= 0.0:
+            raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
+
         traj: np.ndarray = ego_agent_past.astype(np.float32,
                                                  copy=True)  # (Tp, 11)
         current_index: int = Tp - 1
@@ -748,7 +763,7 @@ class DataProcessor(object):
         if not bool(valid_mask_1d[current_index]):
             return np.zeros_like(traj)
 
-        valid_idx: np.ndarray = np.nonzero(valid_mask_1d)[0]
+        valid_idx: np.ndarray = np.nonzero(valid_mask_1d)[0]  # (K,)
         if valid_idx.size == 0:
             return np.zeros_like(traj)
 
@@ -761,26 +776,81 @@ class DataProcessor(object):
             last_valid: int = int(valid_idx[-1])
             region_mask[first_valid:last_valid + 1] = True
 
-            # 중간 구멍이 있으면 x/y/cos/sin/vx/vy를 채움 (0~5)
-            if last_valid - first_valid + 1 > valid_idx.size:
-                xs: np.ndarray = valid_idx.astype(np.float64)  # (K,)
-                seg_idx: np.ndarray = np.arange(first_valid,
-                                                last_valid + 1,
-                                                dtype=np.float64)
+            region_len: int = int(last_valid - first_valid + 1)
+            if region_len > int(valid_idx.size):
+                # region_indices: (L,)
+                region_indices: np.ndarray = np.arange(first_valid,
+                                                       last_valid + 1,
+                                                       dtype=np.int32)
 
-                for dim_idx in range(6):  # 0~5
-                    ys: np.ndarray = traj[valid_idx, dim_idx].astype(np.float64,
-                                                                     copy=False)
-                    interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    traj[first_valid:last_valid + 1,
-                         dim_idx] = interp_vals.astype(np.float32, copy=False)
+                # hole_mask_region: (L,) True면 "구멍 프레임"
+                hole_mask_region: np.ndarray = ~valid_mask_1d[region_indices]
+                if np.any(hole_mask_region):
+                    hole_time_indices: np.ndarray = region_indices[
+                        hole_mask_region]  # (H,)
+                    hole_t: np.ndarray = hole_time_indices.astype(np.float64,
+                                                                  copy=False)  # (H,)
+                    xs: np.ndarray = valid_idx.astype(np.float64,
+                                                      copy=False)  # (K,)
+
+                    # ---- (1) x/y: 구멍 프레임만 선형 보간 ----
+                    x_valid: np.ndarray = traj[valid_idx, 0].astype(np.float64,
+                                                                    copy=False)  # (K,)
+                    y_valid: np.ndarray = traj[valid_idx, 1].astype(np.float64,
+                                                                    copy=False)  # (K,)
+
+                    x_hole: np.ndarray = np.interp(hole_t, xs, x_valid)  # (H,)
+                    y_hole: np.ndarray = np.interp(hole_t, xs, y_valid)  # (H,)
+
+                    traj[hole_time_indices, 0] = x_hole.astype(np.float32,
+                                                               copy=False)
+                    traj[hole_time_indices, 1] = y_hole.astype(np.float32,
+                                                               copy=False)
+
+                    # ---- (2) vx/vy: (채워진 x/y)의 차분 / dt (구멍 프레임만) ----
+                    x_region: np.ndarray = traj[region_indices, 0].astype(
+                        np.float32, copy=False)  # (L,)
+                    y_region: np.ndarray = traj[region_indices, 1].astype(
+                        np.float32, copy=False)  # (L,)
+
+                    dt_inv: np.float32 = np.float32(1.0 / dt_f)
+                    vwx_region: np.ndarray = np.zeros_like(x_region)  # (L,)
+                    vwy_region: np.ndarray = np.zeros_like(y_region)  # (L,)
+                    if x_region.shape[0] >= 2:
+                        vwx_region[1:] = (x_region[1:] - x_region[:-1]) * dt_inv
+                        vwy_region[1:] = (y_region[1:] - y_region[:-1]) * dt_inv
+
+                    traj[hole_time_indices, 4] = vwx_region[hole_mask_region]
+                    traj[hole_time_indices, 5] = vwy_region[hole_mask_region]
+
+                    # ---- (3) 방향: yaw로 변환 -> 연속화 -> 보간 -> cos/sin 재생성 (구멍만) ----
+                    cos_valid: np.ndarray = traj[valid_idx, 2].astype(
+                        np.float64, copy=False)  # (K,)
+                    sin_valid: np.ndarray = traj[valid_idx, 3].astype(
+                        np.float64, copy=False)  # (K,)
+
+                    yaw_valid: np.ndarray = np.arctan2(sin_valid,
+                                                       cos_valid).astype(
+                        np.float64, copy=False)  # (K,)
+                    yaw_unwrapped: np.ndarray = np.unwrap(yaw_valid)  # (K,)
+
+                    yaw_hole: np.ndarray = np.interp(hole_t, xs,
+                                                     yaw_unwrapped)  # (H,)
+                    # [-pi, pi] 범위로 한 번 정리
+                    yaw_hole = np.arctan2(np.sin(yaw_hole),
+                                          np.cos(yaw_hole)).astype(np.float64,
+                                                                   copy=False)
+
+                    traj[hole_time_indices, 2] = np.cos(yaw_hole).astype(
+                        np.float32, copy=False)
+                    traj[hole_time_indices, 3] = np.sin(yaw_hole).astype(
+                        np.float32, copy=False)
 
         # 타입/크기는 “현재 프레임 값”을 대표로 씀
-        # 수정 (해결)
         type_vec: np.ndarray = traj[current_index, 8:11].astype(np.float32,
-                                                                copy=True)
+                                                                copy=True)  # (3,)
         rep_size: np.ndarray = traj[current_index, 6:8].astype(np.float32,
-                                                               copy=True)
+                                                               copy=True)  # (2,)
 
         # one-hot은 유효 구간에만
         traj[:, 8:11] = 0.0
@@ -1479,19 +1549,53 @@ class DataProcessor(object):
         return modified_past
 
     def _merge_and_interpolate_ego_11dim(
-        self,
-        ego_agent_past: np.ndarray,  # shape: (Tp, 11)
-        ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
-        *,
-        eps: float = 1e-8,
+            self,
+            ego_agent_past: np.ndarray,  # shape: (Tp, 11)
+            ego_future_gt_11_dim: np.ndarray,  # shape: (Tf, 11)
+            *,
+            eps: float = 1e-8,
+            dt: float = 0.1,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """ego 과거~현재 + 미래를 합친 뒤, 유효~유효 사이에 무효(0)가 끼지 않게 만든다."""
+        """ego 과거~현재 + 미래를 합친 뒤, 유효~유효 사이에 무효(0)가 끼지 않게 만든다.
+
+        규칙(현재 프레임 기준)
+        ---------------------
+        - 현재 프레임(=past의 마지막)이 무효면: 원본을 그대로 반환(안 건드림)
+        - 현재 프레임이 유효면:
+          · 전체 시퀀스에서 유효 프레임과 유효 프레임 사이에 0 프레임이 끼면 안 되므로,
+            first_valid~last_valid 구간을 연속 유효 구간으로 만들고,
+            그 안의 "구멍 프레임"만 채운다.
+          · 채우는 방식(구멍 프레임만):
+            - x/y: 시간축 선형 보간
+            - 방향: 유효 프레임의 cos/sin -> yaw로 만든 뒤,
+                    각도 끊김을 없애 연속화한 yaw를 선형 보간,
+                    그리고 보간된 yaw로 cos/sin을 다시 계산
+            - vx/vy: (채워진 x/y)의 차분 / dt 로 구멍 프레임만 생성
+          · 연속 유효 구간 밖(prefix/suffix)은 0 유지
+          · width/length는 대표값으로 채움(기존 로직 유지)
+          · one-hot(type)은 연속 유효 구간에만 채움(기존 로직 유지)
+
+        Args:
+            ego_agent_past (np.ndarray):
+                shape: (Tp, 11)
+            ego_future_gt_11_dim (np.ndarray):
+                shape: (Tf, 11)
+            eps (float):
+                0 판정 기준. shape: ()
+            dt (float):
+                프레임 간 시간 간격(초). 구멍 프레임의 vx/vy를 만들 때만 사용. shape: ()
+
+        Returns:
+            Tuple[np.ndarray, np.ndarray]:
+                - new_ego_agent_past: shape (Tp, 11)
+                - new_ego_future_11:  shape (Tf, 11)
+        """
         if ego_agent_past.ndim != 2 or ego_agent_past.shape[-1] != 11:
             raise ValueError(
                 f"`ego_agent_past` shape는 (Tp, 11)이어야 합니다. got {ego_agent_past.shape}"
             )
         if ego_future_gt_11_dim.ndim != 2 or ego_future_gt_11_dim.shape[
-                -1] != 11:
+            -1] != 11:
             raise ValueError(
                 f"`ego_future_gt_11_dim` shape는 (Tf, 11)이어야 합니다. got {ego_future_gt_11_dim.shape}"
             )
@@ -1501,16 +1605,22 @@ class DataProcessor(object):
         if Tp == 0 or Tf == 0:
             return ego_agent_past, ego_future_gt_11_dim
 
+        dt_f: float = float(dt)
+        if (not np.isfinite(dt_f)) or dt_f <= 0.0:
+            raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
+
+        # full: (T_full, 11)
         full: np.ndarray = np.concatenate(
-            [ego_agent_past, ego_future_gt_11_dim], axis=0).astype(np.float32,
-                                                                   copy=True)
+            [ego_agent_past, ego_future_gt_11_dim], axis=0
+        ).astype(np.float32, copy=True)
         T_full: int = int(full.shape[0])
         current_index: int = Tp - 1
 
-        # ✅ 유효 판정은 '앞 6개(x,y,cos,sin,vx,vy)'만 사용
-        valid_mask_1d: np.ndarray = (np.abs(full[:, :6])
-                                     > eps).any(axis=1)  # (T_full,)
+        # ✅ 유효 판정은 '앞 6개(x,y,cos,sin,vx,vy)'만 사용 (기존 정책 유지)
+        # valid_mask_1d: (T_full,)
+        valid_mask_1d: np.ndarray = (np.abs(full[:, :6]) > eps).any(axis=1)
 
+        # 현재가 무효면 건드리지 않음
         if not bool(valid_mask_1d[current_index]):
             return ego_agent_past, ego_future_gt_11_dim
 
@@ -1518,6 +1628,7 @@ class DataProcessor(object):
         if valid_idx.size == 0:
             return ego_agent_past, ego_future_gt_11_dim
 
+        # region_mask: (T_full,)
         region_mask: np.ndarray = np.zeros((T_full,), dtype=bool)
 
         if valid_idx.size == 1:
@@ -1527,29 +1638,91 @@ class DataProcessor(object):
             last_valid: int = int(valid_idx[-1])
             region_mask[first_valid:last_valid + 1] = True
 
-            if last_valid - first_valid + 1 > valid_idx.size:
-                xs: np.ndarray = valid_idx.astype(np.float64)
-                seg_idx: np.ndarray = np.arange(first_valid,
-                                                last_valid + 1,
-                                                dtype=np.float64)
-                for dim_idx in range(6):
-                    ys: np.ndarray = full[valid_idx, dim_idx].astype(np.float64,
-                                                                     copy=False)
-                    interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                    full[first_valid:last_valid + 1,
-                         dim_idx] = interp_vals.astype(np.float32, copy=False)
+            region_len: int = int(last_valid - first_valid + 1)
+            if region_len > int(valid_idx.size):
+                # region_indices: (L,)
+                region_indices: np.ndarray = np.arange(first_valid,
+                                                       last_valid + 1,
+                                                       dtype=np.int32)
 
-        type_vec: np.ndarray = ego_agent_past[-1,
-                                              8:11].astype(np.float32,
-                                                           copy=False)  # (3,)
-        rep_size: np.ndarray = ego_agent_past[-1,
-                                              6:8].astype(np.float32,
-                                                          copy=False)  # (2,)
+                # hole_mask_region: (L,)  True면 "구멍 프레임"
+                hole_mask_region: np.ndarray = ~valid_mask_1d[region_indices]
+                if np.any(hole_mask_region):
+                    # hole_time_indices: (H,)
+                    hole_time_indices: np.ndarray = region_indices[
+                        hole_mask_region]
+                    hole_t: np.ndarray = hole_time_indices.astype(np.float64,
+                                                                  copy=False)  # (H,)
+                    xs: np.ndarray = valid_idx.astype(np.float64,
+                                                      copy=False)  # (K,)
 
+                    # ---- (1) x/y: 구멍 프레임만 보간 ----
+                    x_valid: np.ndarray = full[valid_idx, 0].astype(np.float64,
+                                                                    copy=False)  # (K,)
+                    y_valid: np.ndarray = full[valid_idx, 1].astype(np.float64,
+                                                                    copy=False)  # (K,)
+                    x_hole: np.ndarray = np.interp(hole_t, xs, x_valid)  # (H,)
+                    y_hole: np.ndarray = np.interp(hole_t, xs, y_valid)  # (H,)
+
+                    full[hole_time_indices, 0] = x_hole.astype(np.float32,
+                                                               copy=False)
+                    full[hole_time_indices, 1] = y_hole.astype(np.float32,
+                                                               copy=False)
+
+                    # ---- (2) vx/vy: (채워진 x/y)의 차분 / dt (구멍 프레임만) ----
+                    # x_region/y_region: (L,)
+                    x_region: np.ndarray = full[region_indices, 0].astype(
+                        np.float32, copy=False)
+                    y_region: np.ndarray = full[region_indices, 1].astype(
+                        np.float32, copy=False)
+
+                    dt_inv: np.float32 = np.float32(1.0 / dt_f)
+                    vwx_region: np.ndarray = np.zeros_like(x_region)  # (L,)
+                    vwy_region: np.ndarray = np.zeros_like(y_region)  # (L,)
+                    if x_region.shape[0] >= 2:
+                        vwx_region[1:] = (x_region[1:] - x_region[:-1]) * dt_inv
+                        vwy_region[1:] = (y_region[1:] - y_region[:-1]) * dt_inv
+
+                    full[hole_time_indices, 4] = vwx_region[hole_mask_region]
+                    full[hole_time_indices, 5] = vwy_region[hole_mask_region]
+
+                    # ---- (3) 방향: yaw로 변환 -> 연속화 -> 보간 -> cos/sin 재생성 (구멍만) ----
+                    cos_valid: np.ndarray = full[valid_idx, 2].astype(
+                        np.float64, copy=False)  # (K,)
+                    sin_valid: np.ndarray = full[valid_idx, 3].astype(
+                        np.float64, copy=False)  # (K,)
+
+                    yaw_valid: np.ndarray = np.arctan2(sin_valid,
+                                                       cos_valid).astype(
+                        np.float64, copy=False)  # (K,)
+                    yaw_unwrapped: np.ndarray = np.unwrap(yaw_valid)  # (K,)
+
+                    yaw_hole: np.ndarray = np.interp(hole_t, xs,
+                                                     yaw_unwrapped)  # (H,)
+                    # 수치 안정용으로 [-pi, pi] 범위로 한 번 접기
+                    yaw_hole = np.arctan2(np.sin(yaw_hole),
+                                          np.cos(yaw_hole)).astype(np.float64,
+                                                                   copy=False)
+
+                    full[hole_time_indices, 2] = np.cos(yaw_hole).astype(
+                        np.float32, copy=False)
+                    full[hole_time_indices, 3] = np.sin(yaw_hole).astype(
+                        np.float32, copy=False)
+
+        # 타입/크기는 “현재 프레임 값”을 대표로 씀(기존 로직 유지)
+        type_vec: np.ndarray = ego_agent_past[-1, 8:11].astype(np.float32,
+                                                               copy=False)  # (3,)
+        rep_size: np.ndarray = ego_agent_past[-1, 6:8].astype(np.float32,
+                                                              copy=False)  # (2,)
+
+        # one-hot은 유효 구간에만
         full[:, 8:11] = 0.0
         full[region_mask, 8:11] = type_vec
+
+        # 유효 구간 밖은 완전 0
         full[~region_mask, :] = 0.0
 
+        # width/length 채우기 + cos/sin 정리
         full_b: np.ndarray = full[None, :, :]  # (1, T_full, 11)
         region_b: np.ndarray = region_mask[None, :]  # (1, T_full)
         rep_size_b: np.ndarray = rep_size[None, :]  # (1, 2)
@@ -1843,41 +2016,17 @@ class DataProcessor(object):
         plt.close(fig)
 
     def _merge_and_interpolate_neighbor_11dim(
-        self,
-        neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
-        neighbor_cur_fut_gt_11_dim: np.ndarray,
-        # (max_agent_num, Tf, 11)  # 0번이 현재
+            self,
+            neighbor_agents_past: np.ndarray,  # (max_agent_num, Tp, 11)
+            neighbor_cur_fut_gt_11_dim: np.ndarray,
+            # (max_agent_num, Tf, 11)  # 0번이 현재
+            *,
+            dt: float = 0.1,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """neighbor 과거/현재와 현재/미래를 이어 붙인 뒤, "중간에 비었다가 다시 살아나는" 문제를 막는다.
+        """neighbor 과거/현재와 현재/미래를 이어 붙인 뒤, 중간에 비었다가 다시 살아나는 문제를 막는다.
 
-        이 함수가 보장하는 규칙(한 agent 기준)
-        -----------------------------------
-        (a) 현재 프레임(=past의 마지막)이 무효라면:
-            - 과거~미래 전체 프레임을 전부 0으로 만든다.
-            - 즉, "현재는 없는데 미래에 갑자기 나타나는" 케이스를 없앤다.
-
-        (b) 현재 프레임이 유효라면:
-            - 전체 시퀀스를 과거→미래로 봤을 때,
-              유효 프레임과 유효 프레임 사이에 무효(0) 프레임이 끼지 않게 만든다.
-            - 방법:
-              1) 전체 시퀀스에서 유효 프레임들의 첫 index(first_valid)와 마지막 index(last_valid)를 찾는다.
-              2) first_valid~last_valid 구간은 "연속 유효 구간"으로 만들고,
-                 그 안에 비어 있던 프레임은 x/y/cos/sin/vx/vy를 직선 중간값으로 채운다.
-              3) 구간 밖(prefix/suffix)은 그대로 0으로 둔다.
-
-        Args:
-            neighbor_agents_past (np.ndarray):
-                shape: (N, Tp, 11)
-            neighbor_cur_fut_gt_11_dim (np.ndarray):
-                shape: (N, Tf, 11)
-                index 0이 "현재"라고 가정한다.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]:
-                - new_neighbor_agents_past: shape (N, Tp, 11)
-                - new_neighbor_future_11:  shape (N, Tf-1, 11)  # 현재 제외
+        (설명/규칙은 기존 docstring과 동일, 구현은 '구멍 프레임만' 계산하도록 최적화)
         """
-        # 기본 shape 검사
         if neighbor_agents_past.ndim != 3 or neighbor_cur_fut_gt_11_dim.ndim != 3:
             raise ValueError(
                 f"`neighbor_agents_past` / `neighbor_cur_fut_gt_11_dim`는 "
@@ -1887,7 +2036,7 @@ class DataProcessor(object):
         if neighbor_agents_past.shape[-1] != 11 or \
                 neighbor_cur_fut_gt_11_dim.shape[-1] != 11:
             raise ValueError(
-                f"두 입력의 마지막 차원은 11이어야 합니다. "
+                "두 입력의 마지막 차원은 11이어야 합니다. "
                 f"got {neighbor_agents_past.shape[-1]}, {neighbor_cur_fut_gt_11_dim.shape[-1]}"
             )
         if neighbor_agents_past.shape[0] != neighbor_cur_fut_gt_11_dim.shape[0]:
@@ -1895,21 +2044,21 @@ class DataProcessor(object):
                 "neighbor_agents_past 와 neighbor_cur_fut_gt_11_dim 의 agent 축 크기가 다릅니다."
             )
 
+        dt_f: float = float(dt)
+        if (not np.isfinite(dt_f)) or dt_f <= 0.0:
+            raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
+
         max_agent_num: int = int(neighbor_agents_past.shape[0])
         past_len: int = int(neighbor_agents_past.shape[1])  # Tp
         fut_len_with_current: int = int(
             neighbor_cur_fut_gt_11_dim.shape[1])  # Tf (0번 포함)
 
-        # future 프레임이 아예 없으면 그대로 반환
         if fut_len_with_current == 0:
             return neighbor_agents_past, neighbor_cur_fut_gt_11_dim
 
-        # current(0번) 프레임은 항상 한 번 제거
-        # neighbor_future_wo_current: (N, Tf-1, 11)
-        neighbor_future_wo_current: np.ndarray = neighbor_cur_fut_gt_11_dim[:,
-                                                                            1:, :]
+        neighbor_future_wo_current: np.ndarray = neighbor_cur_fut_gt_11_dim[
+            :, 1:, :]  # (N, Tf-1, 11)
 
-        # 에이전트가 0명이면 보간 없이 바로 반환
         if max_agent_num == 0:
             return neighbor_agents_past, neighbor_future_wo_current
 
@@ -1917,114 +2066,171 @@ class DataProcessor(object):
         full_traj_11: np.ndarray = np.concatenate(
             [neighbor_agents_past, neighbor_future_wo_current], axis=1)
         T_full: int = int(full_traj_11.shape[1])
-        current_index: int = past_len - 1  # full_traj에서 현재는 past의 마지막
+        current_index: int = past_len - 1
 
-        # (1) size 대표값 계산 (기본: 과거~현재만 사용)
-        # stable_size: (N, 2) = [width_rep, length_rep]
         stable_size: np.ndarray = self._estimate_stable_neighbor_sizes(
             full_traj_11=full_traj_11,
             past_len=past_len,
             use_future=False,
-        )
+        )  # (N,2)
 
-        # (2) "유효 프레임" 마스크 계산 (앞 8개 값 중 하나라도 0이 아니면 유효)
         full_off_p_mask, _ = self._get_agents_past_cur_mask_np(full_traj_11)
         full_valid_mask: np.ndarray = ~full_off_p_mask  # (N, T_full)
 
-        # (3) rule (a): 현재 프레임이 무효면 전체 0
-        current_valid_mask: np.ndarray = full_valid_mask[:,
-                                                         current_index]  # (N,)
+        current_valid_mask: np.ndarray = full_valid_mask[
+            :, current_index]  # (N,)
         invalid_agents: np.ndarray = ~current_valid_mask
 
-        # 결과 버퍼
         full_traj_interp: np.ndarray = full_traj_11.astype(np.float32,
-                                                           copy=True)
+                                                           copy=True)  # (N,T_full,11)
+        full_traj_interp[invalid_agents, :, :] = 0.0
 
-        # 각 agent별 "연속 유효 구간" 마스크
-        # region_mask_all: (N, T_full)
         region_mask_all: np.ndarray = np.zeros((max_agent_num, T_full),
                                                dtype=bool)
 
-        # 현재가 무효인 agent는 전부 0으로 만들고 끝
-        if np.any(invalid_agents):
-            full_traj_interp[invalid_agents, :, :] = 0.0
-            # region_mask_all은 그대로 False
+        valid_agents: np.ndarray = np.nonzero(~invalid_agents)[0]  # (V,)
+        if valid_agents.size > 0:
+            valid_rows: np.ndarray = full_valid_mask[valid_agents]  # (V,T_full)
 
-        # (4) rule (b): 현재가 유효인 agent는 유효~유효 사이 구멍을 채움
-        for agent_idx in range(max_agent_num):
-            if invalid_agents[agent_idx]:
-                continue
+            first_valid_v: np.ndarray = valid_rows.argmax(axis=1).astype(
+                np.int32, copy=False)  # (V,)
+            last_valid_v: np.ndarray = (
+                        T_full - 1 - valid_rows[:, ::-1].argmax(axis=1)).astype(
+                np.int32, copy=False)  # (V,)
 
-            agent_valid_idx: np.ndarray = \
-            np.nonzero(full_valid_mask[agent_idx])[0]
-            if agent_valid_idx.size == 0:
-                # (현재는 유효인데 valid_idx가 0인 경우는 거의 없지만, 안전하게 0 처리)
-                full_traj_interp[agent_idx, :, :] = 0.0
-                continue
+            t_idx = np.arange(T_full, dtype=np.int32)[None, :]  # (1,T_full)
+            region_mask_all[valid_agents] = (t_idx >= first_valid_v[
+                :, None]) & (t_idx <= last_valid_v[:, None])
 
-            first_valid: int = int(agent_valid_idx[0])
-            last_valid: int = int(agent_valid_idx[-1])
+            valid_count_v: np.ndarray = valid_rows.sum(axis=1).astype(np.int32,
+                                                                      copy=False)  # (V,)
+            region_len_v: np.ndarray = (
+                        last_valid_v - first_valid_v + 1).astype(np.int32,
+                                                                 copy=False)  # (V,)
+            has_hole_v: np.ndarray = region_len_v > valid_count_v  # (V,)
 
-            if agent_valid_idx.size == 1:
-                # 유효 프레임이 1개면 "유효-무효-유효" 자체가 성립하지 않으므로 그대로 둠
-                region_mask_all[agent_idx, first_valid] = True
-            else:
-                # first~last를 "연속 유효 구간"으로 선언
-                region_mask_all[agent_idx, first_valid:last_valid + 1] = True
+            hole_agents: np.ndarray = valid_agents[has_hole_v]  # (H,)
 
-                # 중간에 빈 프레임이 있을 때만 x/y/cos/sin/vx/vy를 직선 중간값으로 채움
-                if last_valid - first_valid + 1 > agent_valid_idx.size:
-                    xs: np.ndarray = agent_valid_idx.astype(np.float64)  # (K,)
-                    seg_idx: np.ndarray = np.arange(first_valid,
-                                                    last_valid + 1,
-                                                    dtype=np.float64)
+            dt_inv: np.float32 = np.float32(1.0 / dt_f)
 
-                    for dim_idx in range(6):  # 0~5: [x, y, cos, sin, vx, vy]
-                        ys: np.ndarray = full_traj_11[agent_idx,
-                                                      agent_valid_idx,
-                                                      dim_idx].astype(
-                                                          np.float64,
-                                                          copy=False)
-                        interp_vals: np.ndarray = np.interp(seg_idx, xs, ys)
-                        full_traj_interp[agent_idx, first_valid:last_valid + 1,
-                                         dim_idx] = interp_vals.astype(
-                                             np.float32, copy=False)
+            for agent_idx in hole_agents.tolist():
+                agent_valid_idx: np.ndarray = \
+                np.nonzero(full_valid_mask[agent_idx])[0]  # (K,)
+                if agent_valid_idx.size < 2:
+                    continue
 
-            # 타입(one-hot)은 agent당 하나로 고정해서 "연속 유효 구간"에만 채움
-            type_candidates: np.ndarray = full_traj_11[agent_idx, :,
-                                                       8:11]  # (T_full, 3)
-            type_valid_mask: np.ndarray = (np.abs(type_candidates).sum(axis=1)
-                                           > 0)
-            if np.any(type_valid_mask):
-                type_vec: np.ndarray = type_candidates[type_valid_mask][
-                    0].astype(np.float32, copy=False)  # (3,)
-            else:
-                type_vec = np.zeros((3,), dtype=np.float32)
+                first_valid: int = int(agent_valid_idx[0])
+                last_valid: int = int(agent_valid_idx[-1])
 
-            full_traj_interp[agent_idx, :, 8:11] = 0.0
-            full_traj_interp[agent_idx, region_mask_all[agent_idx],
-                             8:11] = type_vec
+                region_indices: np.ndarray = np.arange(first_valid,
+                                                       last_valid + 1,
+                                                       dtype=np.int32)  # (L,)
+                hole_mask_region: np.ndarray = ~full_valid_mask[
+                    agent_idx, region_indices]  # (L,)
+                if not np.any(hole_mask_region):
+                    continue
 
-            # 연속 유효 구간 밖은 완전히 0으로
-            full_traj_interp[agent_idx, ~region_mask_all[agent_idx], :] = 0.0
+                hole_time_indices: np.ndarray = region_indices[
+                    hole_mask_region]  # (H,)
+                xs: np.ndarray = agent_valid_idx.astype(np.float64,
+                                                        copy=False)  # (K,)
+                hole_t: np.ndarray = hole_time_indices.astype(np.float64,
+                                                              copy=False)  # (H,)
 
-        # (5) width/length를 대표값으로 통일해서 "연속 유효 구간"에만 채움
+                # ---- (1) x/y: 구멍 프레임만 선형 보간 ----
+                x_valid: np.ndarray = full_traj_11[
+                    agent_idx, agent_valid_idx, 0].astype(np.float64,
+                                                          copy=False)  # (K,)
+                y_valid: np.ndarray = full_traj_11[
+                    agent_idx, agent_valid_idx, 1].astype(np.float64,
+                                                          copy=False)  # (K,)
+
+                x_hole: np.ndarray = np.interp(hole_t, xs, x_valid)  # (H,)
+                y_hole: np.ndarray = np.interp(hole_t, xs, y_valid)  # (H,)
+
+                full_traj_interp[
+                    agent_idx, hole_time_indices, 0] = x_hole.astype(np.float32,
+                                                                     copy=False)
+                full_traj_interp[
+                    agent_idx, hole_time_indices, 1] = y_hole.astype(np.float32,
+                                                                     copy=False)
+
+                # ---- (2) vx/vy: (보간된 x/y)의 차분 / dt (구멍 프레임만) ----
+                x_region: np.ndarray = full_traj_interp[
+                    agent_idx, region_indices, 0].astype(np.float32,
+                                                         copy=False)  # (L,)
+                y_region: np.ndarray = full_traj_interp[
+                    agent_idx, region_indices, 1].astype(np.float32,
+                                                         copy=False)  # (L,)
+
+                vwx_region = np.zeros_like(x_region)  # (L,)
+                vwy_region = np.zeros_like(y_region)  # (L,)
+                if x_region.shape[0] >= 2:
+                    vwx_region[1:] = (x_region[1:] - x_region[:-1]) * dt_inv
+                    vwy_region[1:] = (y_region[1:] - y_region[:-1]) * dt_inv
+
+                full_traj_interp[agent_idx, hole_time_indices, 4] = vwx_region[
+                    hole_mask_region].astype(np.float32, copy=False)
+                full_traj_interp[agent_idx, hole_time_indices, 5] = vwy_region[
+                    hole_mask_region].astype(np.float32, copy=False)
+
+                # ---- (3) 방향: yaw로 변환(유효) -> 연속화 -> 구멍 프레임만 보간 -> cos/sin 생성 ----
+                cos_valid: np.ndarray = full_traj_11[
+                    agent_idx, agent_valid_idx, 2].astype(np.float64,
+                                                          copy=False)  # (K,)
+                sin_valid: np.ndarray = full_traj_11[
+                    agent_idx, agent_valid_idx, 3].astype(np.float64,
+                                                          copy=False)  # (K,)
+
+                yaw_valid: np.ndarray = np.arctan2(sin_valid, cos_valid).astype(
+                    np.float64, copy=False)  # (K,)
+                yaw_unwrapped: np.ndarray = np.unwrap(yaw_valid)  # (K,)
+
+                yaw_hole: np.ndarray = np.interp(hole_t, xs,
+                                                 yaw_unwrapped)  # (H,)
+                yaw_hole = np.arctan2(np.sin(yaw_hole),
+                                      np.cos(yaw_hole)).astype(np.float64,
+                                                               copy=False)
+
+                full_traj_interp[agent_idx, hole_time_indices, 2] = np.cos(
+                    yaw_hole).astype(np.float32, copy=False)
+                full_traj_interp[agent_idx, hole_time_indices, 3] = np.sin(
+                    yaw_hole).astype(np.float32, copy=False)
+
+        # 타입(one-hot)은 agent당 하나로 고정해서 region에만 채움
+        full_traj_interp[:, :, 8:11] = 0.0
+        if valid_agents.size > 0:
+            for agent_idx in valid_agents.tolist():
+                type_candidates: np.ndarray = full_traj_11[
+                    agent_idx, :, 8:11]  # (T_full, 3)
+                type_valid_mask: np.ndarray = (
+                            np.abs(type_candidates).sum(axis=1) > 0)
+                if np.any(type_valid_mask):
+                    type_vec: np.ndarray = type_candidates[type_valid_mask][
+                        0].astype(np.float32, copy=False)  # (3,)
+                else:
+                    type_vec = np.zeros((3,), dtype=np.float32)
+
+                full_traj_interp[
+                    agent_idx, region_mask_all[agent_idx], 8:11] = type_vec
+
+        # 연속 유효 구간 밖(prefix/suffix)은 0
+        full_traj_interp *= region_mask_all[:, :, None].astype(
+            full_traj_interp.dtype, copy=False)
+
+        # width/length 대표값 채우기 + cos/sin 정규화
         full_traj_interp = self._fill_width_length_with_representative_size(
             traj_11=full_traj_interp,
             valid_mask=region_mask_all,  # (N, T_full)
             rep_size=stable_size,  # (N, 2)
         )
-
-        # (6) cos/sin 길이를 1로 정리 (연속 유효 구간에만 적용)
         full_traj_interp = self._normalize_cos_sin_in_traj_11(
             traj_11=full_traj_interp,
             valid_mask=region_mask_all,
         )
 
-        # 과거/현재와 미래로 다시 분리
         new_neighbor_agents_past: np.ndarray = full_traj_interp[:, :past_len, :]
-        new_neighbor_future_11: np.ndarray = full_traj_interp[:,
-                                                              past_len:, :]  # 현재 제외된 미래
+        new_neighbor_future_11: np.ndarray = full_traj_interp[:, past_len:, :]
 
         return new_neighbor_agents_past, new_neighbor_future_11
 
@@ -2484,7 +2690,7 @@ class DataProcessor(object):
 
     def _build_target_integrated_outputs_via_filter_and_integrate(
         self,
-        target_past_future_body_seg_control: np.ndarray,  # (1+N, past_len+future_len, 3)
+        target_future_seg_body_control: np.ndarray,  # (1+N, future_len, 3)
         ego_agent_past: np.ndarray,  # (time_len, 11)
         ego_future_gt_11_dim: np.ndarray,  # (future_len, 11)
         neighbor_agents_past: np.ndarray,  # (N, time_len, 11)
@@ -2506,8 +2712,8 @@ class DataProcessor(object):
                -> target_control_constraint_diff: (1+N,future_len,3)
 
         Args:
-            target_past_future_body_seg_control (np.ndarray):
-                shape: (1+N, past_len+future_len, 3)
+            target_future_seg_body_control (np.ndarray):
+                shape: (1+N, future_len, 3)
                 과거~현재~미래 전체 세그먼트 바디 제어.
             ego_agent_past (np.ndarray):
                 shape: (time_len, 11)
@@ -2560,11 +2766,7 @@ class DataProcessor(object):
             raise ValueError(f"future_len mismatch: ego={future_len}, neighbor={int(neighbor_future_gt_11_dim.shape[1])}")
 
         expected_seg_len: int = int(past_len + future_len)
-        if target_past_future_body_seg_control.shape != (1 + N, expected_seg_len, 3):
-            raise ValueError(
-                "target_past_future_body_seg_control shape mismatch. "
-                f"expected={(1+N, expected_seg_len, 3)}, got={target_past_future_body_seg_control.shape}"
-            )
+
 
         # -----------------------
         # 1) target_current_state: (1+N,4)
@@ -2611,9 +2813,6 @@ class DataProcessor(object):
         #   - past 부분은 "현재 이전"이라 적분에 필요 없음
         # -----------------------
         # target_future_seg_body_control: (1+N, future_len, 3)
-        target_future_seg_body_control = target_past_future_body_seg_control[:, past_len:past_len + future_len, :].astype(
-            np.float32, copy=False
-        )
         if target_future_seg_body_control.shape != (1 + N, future_len, 3):
             raise ValueError(
                 "target_future_seg_body_control shape mismatch. "
@@ -2662,48 +2861,40 @@ class DataProcessor(object):
         )
 
     def _accumulate_neighbor_xy_yaw_losses_for_integrated_trajectory(
-        self,
-        target_integrated_trajectory: np.ndarray,  # (1+N, future_len, 4)
-        ego_future_gt_11_dim: np.ndarray,          # (future_len, 11)
-        neighbor_future_gt_11_dim: np.ndarray,     # (N, future_len, 11)
-        target_cur_future_valid: np.ndarray,       # (1+N, 1+future_len) bool
-        *,
-        eps_valid: float = 1e-8,
+            self,
+            target_integrated_trajectory: np.ndarray,  # (1+N, future_len, 4)
+            ego_future_gt_11_dim: np.ndarray,  # (future_len, 11)
+            neighbor_future_gt_11_dim: np.ndarray,  # (N, future_len, 11)
+            target_cur_future_valid: np.ndarray,  # (1+N, 1+future_len) bool
+            *,
+            eps_valid: float = 1e-8,
     ) -> None:
         """integrated_trajectory 와 GT의 xy/yaw 오차를 loss.py 방식으로 계산해 누적한다.
 
-        누적 대상:
-            - "neighbor_prediction_loss_xy"
-            - "neighbor_prediction_loss_yaw"
-
-        Args:
-            target_integrated_trajectory:
-                shape: (1+N, future_len, 4)
-                [x, y, cos, sin] (미래 노드)
-            ego_future_gt_11_dim:
-                shape: (future_len, 11)
-            neighbor_future_gt_11_dim:
-                shape: (N, future_len, 11)
-            target_cur_future_valid:
-                shape: (1+N, 1+future_len) bool
-                현재 포함 노드 유효 마스크.
-            eps_valid:
-                0 판정 기준. shape: ()
+        변경점:
+          - future_valid에서 True 개수(num_valid)가 0이면, 이 시나리오는 통계 누적을 스킵합니다.
+            (WOMD 쪽과 동일한 정책)
         """
         # -----------------------
         # 0) shape 체크
         # -----------------------
-        if target_integrated_trajectory.ndim != 3 or int(target_integrated_trajectory.shape[-1]) != 4:
+        if target_integrated_trajectory.ndim != 3 or int(
+                target_integrated_trajectory.shape[-1]) != 4:
             raise ValueError(
                 "target_integrated_trajectory must be (1+N, future_len, 4). "
                 f"got {target_integrated_trajectory.shape}"
             )
-        if ego_future_gt_11_dim.ndim != 2 or int(ego_future_gt_11_dim.shape[-1]) != 11:
-            raise ValueError(f"ego_future_gt_11_dim must be (future_len,11). got {ego_future_gt_11_dim.shape}")
-        if neighbor_future_gt_11_dim.ndim != 3 or int(neighbor_future_gt_11_dim.shape[-1]) != 11:
-            raise ValueError(f"neighbor_future_gt_11_dim must be (N,future_len,11). got {neighbor_future_gt_11_dim.shape}")
+        if ego_future_gt_11_dim.ndim != 2 or int(
+                ego_future_gt_11_dim.shape[-1]) != 11:
+            raise ValueError(
+                f"ego_future_gt_11_dim must be (future_len,11). got {ego_future_gt_11_dim.shape}")
+        if neighbor_future_gt_11_dim.ndim != 3 or int(
+                neighbor_future_gt_11_dim.shape[-1]) != 11:
+            raise ValueError(
+                f"neighbor_future_gt_11_dim must be (N,future_len,11). got {neighbor_future_gt_11_dim.shape}")
         if target_cur_future_valid.ndim != 2:
-            raise ValueError(f"target_cur_future_valid must be (1+N,1+future_len). got {target_cur_future_valid.shape}")
+            raise ValueError(
+                f"target_cur_future_valid must be (1+N,1+future_len). got {target_cur_future_valid.shape}")
 
         one_plus_n: int = int(target_integrated_trajectory.shape[0])
         future_len: int = int(target_integrated_trajectory.shape[1])
@@ -2715,7 +2906,8 @@ class DataProcessor(object):
             raise ValueError(
                 f"future_len mismatch: integrated={future_len}, neighbor_future_gt_11_dim={int(neighbor_future_gt_11_dim.shape[1])}"
             )
-        if int(target_cur_future_valid.shape[0]) != one_plus_n or int(target_cur_future_valid.shape[1]) != (1 + future_len):
+        if int(target_cur_future_valid.shape[0]) != one_plus_n or int(
+                target_cur_future_valid.shape[1]) != (1 + future_len):
             raise ValueError(
                 "target_cur_future_valid shape mismatch. "
                 f"expected={(one_plus_n, 1 + future_len)}, got={target_cur_future_valid.shape}"
@@ -2724,53 +2916,329 @@ class DataProcessor(object):
         # -----------------------
         # 1) target_future_gt_4_dim: (1+N, future_len, 4)
         # -----------------------
-        ego_future_4 = ego_future_gt_11_dim[:, :4].astype(np.float32, copy=False)  # (future_len,4)
-        nei_future_4 = neighbor_future_gt_11_dim[:, :, :4].astype(np.float32, copy=False)  # (N,future_len,4)
+        ego_future_4 = ego_future_gt_11_dim[:, :4].astype(np.float32,
+                                                          copy=False)  # (future_len,4)
+        nei_future_4 = neighbor_future_gt_11_dim[:, :, :4].astype(np.float32,
+                                                                  copy=False)  # (N,future_len,4)
         target_future_gt_4_dim = np.concatenate(
             [ego_future_4[None, ...], nei_future_4],
             axis=0,
         ).astype(np.float32, copy=False)  # (1+N,future_len,4)
 
         # -----------------------
-        # 2) valid mask 만들기 (neighbor만)
+        # 2) valid mask 만들기
         #   - future_valid: (1+N, future_len)
-        #   - ego row는 False로 만들어 "neighbor만" 평가
-        #   - 현재가 무효면, 미래도 무효로 취급(적분 시작이 불가능하므로)
+        #   - 현재가 무효면, 미래도 무효로 취급
         # -----------------------
-        valid_np = np.ascontiguousarray(target_cur_future_valid.astype(bool, copy=False))  # (1+N,1+future_len)
+        valid_np = np.ascontiguousarray(target_cur_future_valid.astype(bool,
+                                                                       copy=False))  # (1+N,1+future_len)
         cur_valid = valid_np[:, :1]  # (1+N,1)
         future_valid = valid_np[:, 1:]  # (1+N,future_len)
         future_valid = future_valid & cur_valid  # (1+N,future_len)
 
-        # ego 제외
-        if one_plus_n > 0:
-            future_valid[0, :] = False
+        # ✅ [추가] 유효한 (agent,time)이 0개면 스킵 (WOMD와 동일)
+        num_valid: int = int(np.count_nonzero(future_valid))
+        if num_valid <= 0:
+            return
 
         # -----------------------
         # 3) loss.py의 _compute_xy_yaw_losses 호출 (torch)
         # -----------------------
         from diffusion_planner.loss import _compute_xy_yaw_losses  # lazy import
 
-        pred_t = torch.from_numpy(np.ascontiguousarray(target_integrated_trajectory.astype(np.float32, copy=False))).unsqueeze(0)
-        gt_t = torch.from_numpy(np.ascontiguousarray(target_future_gt_4_dim)).unsqueeze(0)
-        valid_t = torch.from_numpy(np.ascontiguousarray(future_valid)).unsqueeze(0)  # (1,1+N,future_len)
+        pred_t = torch.from_numpy(
+            np.ascontiguousarray(
+                target_integrated_trajectory.astype(np.float32, copy=False))
+        ).unsqueeze(0)  # (1,1+N,future_len,4)
+        gt_t = torch.from_numpy(
+            np.ascontiguousarray(target_future_gt_4_dim)
+        ).unsqueeze(0)  # (1,1+N,future_len,4)
+        valid_t = torch.from_numpy(
+            np.ascontiguousarray(future_valid)
+        ).unsqueeze(0)  # (1,1+N,future_len)
 
         with torch.no_grad():
             xy_yaw_losses = _compute_xy_yaw_losses(
-                score_denorm=pred_t,          # (B=1, 1+N, future_len, 4)
-                target_future_gt=gt_t,        # (B=1, 1+N, future_len, 4)
-                target_future_valid=valid_t,  # (B=1, 1+N, future_len)
+                score_denorm=pred_t,
+                target_future_gt=gt_t,
+                target_future_valid=valid_t,
                 prefix="neighbor_prediction_loss",
             )
 
         # -----------------------
         # 4) 필요한 두 값만 누적
         # -----------------------
-        loss_xy = float(xy_yaw_losses["neighbor_prediction_loss_xy"].cpu().item())
-        loss_yaw = float(xy_yaw_losses["neighbor_prediction_loss_yaw"].cpu().item())
+        loss_xy = float(
+            xy_yaw_losses["neighbor_prediction_loss_xy"].cpu().item())
+        loss_yaw = float(
+            xy_yaw_losses["neighbor_prediction_loss_yaw"].cpu().item())
 
         self._integrated_vs_gt_neighbor_xy_stats.update(loss_xy)
         self._integrated_vs_gt_neighbor_yaw_stats.update(loss_yaw)
+
+    @staticmethod
+    def _build_target_current_wl_from_past(
+        ego_agent_past: np.ndarray,        # (time_len, 11)
+        neighbor_agents_past: np.ndarray,  # (N, time_len, 11)
+    ) -> np.ndarray:
+        """현재 프레임의 width/length를 모아 (1+N,2)로 만든다.
+
+        Args:
+            ego_agent_past (np.ndarray):
+                shape: (time_len, 11)
+            neighbor_agents_past (np.ndarray):
+                shape: (N, time_len, 11)
+
+        Returns:
+            np.ndarray:
+                target_current_wl
+                shape: (1+N, 2)
+                마지막 2는 [width, length]
+        """
+        if ego_agent_past.ndim != 2 or int(ego_agent_past.shape[-1]) != 11:
+            raise ValueError(f"ego_agent_past must be (time_len,11). got {ego_agent_past.shape}")
+        if neighbor_agents_past.ndim != 3 or int(neighbor_agents_past.shape[-1]) != 11:
+            raise ValueError(f"neighbor_agents_past must be (N,time_len,11). got {neighbor_agents_past.shape}")
+
+        ego_wl = ego_agent_past[-1, 6:8].astype(np.float32, copy=False)  # (2,)
+        nei_wl = neighbor_agents_past[:, -1, 6:8].astype(np.float32, copy=False)  # (N,2)
+        target_current_wl = np.concatenate([ego_wl[None, :], nei_wl], axis=0).astype(np.float32, copy=False)  # (1+N,2)
+        return target_current_wl
+
+    @staticmethod
+    def _build_target_future_gt_4_dim_from_future11(
+        ego_future_gt_11_dim: np.ndarray,          # (future_len, 11)
+        neighbor_future_gt_11_dim: np.ndarray,     # (N, future_len, 11)
+    ) -> np.ndarray:
+        """ego/neighbor 미래 GT(11dim)에서 (x,y,cos,sin)만 뽑아 (1+N,future_len,4)로 만든다.
+
+        Args:
+            ego_future_gt_11_dim (np.ndarray):
+                shape: (future_len, 11)
+            neighbor_future_gt_11_dim (np.ndarray):
+                shape: (N, future_len, 11)
+
+        Returns:
+            np.ndarray:
+                target_future_gt_4_dim
+                shape: (1+N, future_len, 4)
+        """
+        if ego_future_gt_11_dim.ndim != 2 or int(ego_future_gt_11_dim.shape[-1]) != 11:
+            raise ValueError(f"ego_future_gt_11_dim must be (future_len,11). got {ego_future_gt_11_dim.shape}")
+        if neighbor_future_gt_11_dim.ndim != 3 or int(neighbor_future_gt_11_dim.shape[-1]) != 11:
+            raise ValueError(f"neighbor_future_gt_11_dim must be (N,future_len,11). got {neighbor_future_gt_11_dim.shape}")
+
+        future_len = int(ego_future_gt_11_dim.shape[0])
+        if int(neighbor_future_gt_11_dim.shape[1]) != future_len:
+            raise ValueError(
+                f"future_len mismatch: ego={future_len}, neighbor={int(neighbor_future_gt_11_dim.shape[1])}"
+            )
+
+        ego_future_4 = ego_future_gt_11_dim[:, :4].astype(np.float32, copy=False)  # (future_len,4)
+        nei_future_4 = neighbor_future_gt_11_dim[:, :, :4].astype(np.float32, copy=False)  # (N,future_len,4)
+        target_future_gt_4_dim = np.concatenate([ego_future_4[None, ...], nei_future_4], axis=0).astype(np.float32, copy=False)
+        return target_future_gt_4_dim  # (1+N,future_len,4)
+
+    def _save_integrated_vs_gt_box_compare_plot(
+        self,
+        target_integrated_trajectory: np.ndarray,  # (1+N, future_len, 4)
+        target_future_gt_4_dim: np.ndarray,        # (1+N, future_len, 4)
+        target_current_wl: np.ndarray,             # (1+N, 2)
+        target_cur_future_valid: np.ndarray,       # (1+N, 1+future_len) bool
+        *,
+        map_name: str,
+        token: str,
+        eps: float = 1e-6,
+    ) -> None:
+        """integrated vs GT 미래 궤적을 '방향 포함 사각형'으로 비교하는 PNG를 저장한다.
+
+        - 선: x,y 궤적
+        - 박스: (x,y,cos,sin) + (width,length)로 4꼭지점 계산 후 PolyCollection으로 그림
+        - 무효 프레임은 그리지 않음
+        - 파일명은 pid/time_ns를 섞어 절대 겹치지 않게 만듦
+
+        Args:
+            target_integrated_trajectory (np.ndarray):
+                shape: (1+N, future_len, 4) = [x, y, cos, sin]
+            target_future_gt_4_dim (np.ndarray):
+                shape: (1+N, future_len, 4) = [x, y, cos, sin]
+            target_current_wl (np.ndarray):
+                shape: (1+N, 2) = [width, length] (현재 프레임)
+            target_cur_future_valid (np.ndarray):
+                shape: (1+N, 1+future_len) bool (현재 포함 노드 유효)
+            map_name (str):
+                맵 이름. shape: ()
+            token (str):
+                시나리오 토큰. shape: ()
+            eps (float):
+                cos/sin 정규화 등에 쓰는 작은 값. shape: ()
+        """
+        # 저장 on/off (기존 디버그 플래그 재사용)
+        if not bool(getattr(self.config, "save_integration_traj", False)):
+            return
+        if not self._save_dir:
+            return
+
+        if target_integrated_trajectory.ndim != 3 or int(target_integrated_trajectory.shape[-1]) != 4:
+            raise ValueError(f"target_integrated_trajectory must be (1+N,future_len,4). got {target_integrated_trajectory.shape}")
+        if target_future_gt_4_dim.shape != target_integrated_trajectory.shape:
+            raise ValueError(
+                "target_future_gt_4_dim shape must match integrated. "
+                f"gt={target_future_gt_4_dim.shape}, integrated={target_integrated_trajectory.shape}"
+            )
+        if target_current_wl.ndim != 2 or int(target_current_wl.shape[-1]) != 2:
+            raise ValueError(f"target_current_wl must be (1+N,2). got {target_current_wl.shape}")
+        if int(target_current_wl.shape[0]) != int(target_integrated_trajectory.shape[0]):
+            raise ValueError(
+                "target_current_wl 첫 축(1+N)이 trajectory와 같아야 합니다. "
+                f"wl={target_current_wl.shape[0]}, traj={target_integrated_trajectory.shape[0]}"
+            )
+        if target_cur_future_valid.ndim != 2:
+            raise ValueError(f"target_cur_future_valid must be (1+N,1+future_len). got {target_cur_future_valid.shape}")
+
+        P = int(target_integrated_trajectory.shape[0])  # 1+N
+        T = int(target_integrated_trajectory.shape[1])  # future_len
+        if target_cur_future_valid.shape != (P, 1 + T):
+            raise ValueError(
+                "target_cur_future_valid shape mismatch. "
+                f"expected={(P, 1 + T)}, got={target_cur_future_valid.shape}"
+            )
+
+        # --- 유효 마스크: 현재가 무효면 미래도 전부 무효로 취급 ---
+        valid_np = np.ascontiguousarray(target_cur_future_valid.astype(bool, copy=False))  # (P,1+T)
+        cur_valid = valid_np[:, :1]  # (P,1)
+        fut_valid = valid_np[:, 1:] & cur_valid  # (P,T)
+
+        # --- 저장 경로/파일명(절대 중복 방지) ---
+        debug_dir = os.path.join(self._save_dir, "debug_integrated_vs_gt_boxes")
+        os.makedirs(debug_dir, exist_ok=True)
+
+        safe_map = str(map_name).replace(os.sep, "_")
+        safe_token = str(token).replace(os.sep, "_")
+        uniq = f"{safe_map}_{safe_token}_pid{os.getpid()}_{time.time_ns()}"
+        save_path = os.path.join(debug_dir, f"boxes_compare_{uniq}.png")
+
+        # --- 선(trajectory)용 xy ---
+        mask_xy = fut_valid[..., None]  # (P,T,1)
+        gt_xy = np.where(mask_xy, target_future_gt_4_dim[..., :2].astype(np.float32, copy=False), np.nan)  # (P,T,2)
+        it_xy = np.where(mask_xy, target_integrated_trajectory[..., :2].astype(np.float32, copy=False), np.nan)  # (P,T,2)
+
+        x_gt, y_gt = gt_xy[..., 0], gt_xy[..., 1]  # (P,T)
+        x_it, y_it = it_xy[..., 0], it_xy[..., 1]  # (P,T)
+
+        # --- 박스 계산 유틸 ---
+        def _boxes_from_xycs_wl(
+            xycs: np.ndarray,     # (P,T,4)
+            wl: np.ndarray,       # (P,2)
+            valid_pt: np.ndarray, # (P,T) bool
+        ) -> Tuple[np.ndarray, np.ndarray]:
+            """(x,y,cos,sin) + (w,l)로 박스 꼭지점 (P,T,4,2)와 마스크(P,T)를 만든다."""
+            x = xycs[..., 0].astype(np.float32, copy=False)  # (P,T)
+            y = xycs[..., 1].astype(np.float32, copy=False)  # (P,T)
+            c = xycs[..., 2].astype(np.float32, copy=False)  # (P,T)
+            s = xycs[..., 3].astype(np.float32, copy=False)  # (P,T)
+
+            # cos/sin 정규화(수치 안전)
+            norm = np.sqrt(c * c + s * s + float(eps)).astype(np.float32, copy=False)
+            c = (c / norm).astype(np.float32, copy=False)
+            s = (s / norm).astype(np.float32, copy=False)
+
+            width = wl[:, 0].astype(np.float32, copy=False)  # (P,)
+            length = wl[:, 1].astype(np.float32, copy=False)  # (P,)
+            valid_size = np.isfinite(width) & np.isfinite(length) & (width > 0.0) & (length > 0.0)  # (P,)
+
+            half_w = (0.5 * width)[:, None]   # (P,1)
+            half_l = (0.5 * length)[:, None]  # (P,1)
+
+            dx = c * half_l
+            dy = s * half_l
+            wx = -s * half_w
+            wy = c * half_w
+
+            p1x = x + dx + wx
+            p1y = y + dy + wy
+            p2x = x + dx - wx
+            p2y = y + dy - wy
+            p3x = x - dx - wx
+            p3y = y - dy - wy
+            p4x = x - dx + wx
+            p4y = y - dy + wy
+
+            poly = np.stack(
+                [
+                    np.stack([p1x, p1y], axis=-1),
+                    np.stack([p2x, p2y], axis=-1),
+                    np.stack([p3x, p3y], axis=-1),
+                    np.stack([p4x, p4y], axis=-1),
+                ],
+                axis=2,
+            ).astype(np.float32, copy=False)  # (P,T,4,2)
+
+            finite_xy = np.isfinite(x) & np.isfinite(y) & np.isfinite(c) & np.isfinite(s)  # (P,T)
+            mask_box = valid_pt & finite_xy & valid_size[:, None]  # (P,T)
+            return poly, mask_box
+
+        poly_gt, mask_box_gt = _boxes_from_xycs_wl(
+            xycs=target_future_gt_4_dim,
+            wl=target_current_wl,
+            valid_pt=fut_valid,
+        )
+        poly_it, mask_box_it = _boxes_from_xycs_wl(
+            xycs=target_integrated_trajectory,
+            wl=target_current_wl,
+            valid_pt=fut_valid,
+        )
+
+        # --- plot ---
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        # 범례용 더미
+        dummy_gt, = ax.plot([], [], color="tab:blue", linestyle="-", label="gt")
+        dummy_it, = ax.plot([], [], color="tab:orange", linestyle="-", label="integrated")
+
+        # 선 궤적
+        ax.plot(x_gt.T, y_gt.T, color="tab:blue", alpha=0.6, linewidth=1.0)
+        ax.plot(x_it.T, y_it.T, color="tab:orange", alpha=0.6, linewidth=1.0)
+
+        # 박스(평면) - GT
+        flat_gt = poly_gt.reshape(-1, 4, 2)
+        flat_gt = flat_gt[mask_box_gt.reshape(-1)]
+        if flat_gt.size > 0:
+            gt_boxes = PolyCollection(
+                flat_gt,
+                facecolors="none",
+                edgecolors="tab:blue",
+                linewidths=0.6,
+                alpha=0.35,
+            )
+            ax.add_collection(gt_boxes)
+
+        # 박스(평면) - integrated
+        flat_it = poly_it.reshape(-1, 4, 2)
+        flat_it = flat_it[mask_box_it.reshape(-1)]
+        if flat_it.size > 0:
+            it_boxes = PolyCollection(
+                flat_it,
+                facecolors="none",
+                edgecolors="tab:orange",
+                linewidths=0.6,
+                alpha=0.35,
+            )
+            ax.add_collection(it_boxes)
+
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.legend(handles=[dummy_gt, dummy_it], loc="best")
+        fig.tight_layout()
+        fig.savefig(
+            save_path,
+            dpi=900,
+            bbox_inches="tight",
+            pad_inches=0.02,
+        )
+        plt.close(fig)
+
 
     def _print_integrated_vs_gt_neighbor_xy_yaw_stats(self) -> None:
         """누적된 integrated vs GT(neighbor) xy/yaw 평균/분산을 출력한다."""
@@ -3157,6 +3625,11 @@ class DataProcessor(object):
             #   - target_integrated_trajectory: (1+N, future_len, 4)
             #   - target_control_constraint_diff: (1+N, future_len, 3)
             # =========================================================
+            future_len: int = int(ego_future_gt_11_dim.shape[0])
+            target_future_seg_body_control = \
+            target_past_future_body_seg_control[:, -future_len:, :] # (1+N, future_len, 3)
+            # # cur_future_control_gt_3_dim
+            # cur_future_control_gt_3_dim[:, :, 2] = target_future_seg_body_control[:, :, 2]
             (
                 target_integrated_trajectory,
                 target_control_constraint_diff,
@@ -3164,7 +3637,7 @@ class DataProcessor(object):
                 target_cur_future_valid,
                 target_class_one_hot,
             ) = self._build_target_integrated_outputs_via_filter_and_integrate(
-                target_past_future_body_seg_control=target_past_future_body_seg_control,  # (1+N,past_len+future_len,3)
+                target_future_seg_body_control=target_future_seg_body_control,  # (1+N,past_len+future_len,3)
                 ego_agent_past=ego_agent_past,                                            # (time_len,11)
                 ego_future_gt_11_dim=ego_future_gt_11_dim,                                # (future_len,11)
                 neighbor_agents_past=neighbor_agents_past,                                # (N,time_len,11)
@@ -3172,6 +3645,32 @@ class DataProcessor(object):
                 dt=0.1,
                 eps_valid=1e-8,
             )
+
+            # =========================================================
+            # [ADDED] 현재 width/length + GT(4dim) 만들고, 박스 궤적 비교 PNG 저장
+            # =========================================================
+            target_current_wl = self._build_target_current_wl_from_past(
+                ego_agent_past=ego_agent_past,                    # (time_len,11)
+                neighbor_agents_past=neighbor_agents_past,        # (N,time_len,11)
+            )  # (1+N,2)
+
+            target_future_gt_4_dim = self._build_target_future_gt_4_dim_from_future11(
+                ego_future_gt_11_dim=ego_future_gt_11_dim,            # (future_len,11)
+                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,  # (N,future_len,11)
+            )  # (1+N,future_len,4)
+
+            self._save_integrated_vs_gt_box_compare_plot(
+                target_integrated_trajectory=target_integrated_trajectory,  # (1+N,future_len,4)
+                target_future_gt_4_dim=target_future_gt_4_dim,              # (1+N,future_len,4)
+                target_current_wl=target_current_wl,                        # (1+N,2)
+                target_cur_future_valid=target_cur_future_valid,            # (1+N,1+future_len)
+                map_name=map_name,
+                token=scenario_token,
+                eps=1e-6,
+            )
+
+
+
             # =========================================================
             # [ADDED] integrated_trajectory vs GT(neighbor) xy/yaw loss 누적
             # =========================================================
