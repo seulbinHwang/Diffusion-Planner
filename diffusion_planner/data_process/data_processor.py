@@ -87,7 +87,7 @@ def _get_feasible_filter_projector() -> Any:
         config=_DummyCfg(),
         hidden_dim=1,
         use_feasible_dl=False,
-        use_feasible_filter=True,
+        use_feasible_filter=False,
     )
     _FEASIBLE_FILTER_PROJECTOR.eval()
     return _FEASIBLE_FILTER_PROJECTOR
