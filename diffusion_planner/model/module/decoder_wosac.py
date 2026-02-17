@@ -353,7 +353,7 @@ class Decoder(nn.Module):
         # self._guidance_fn = config.guidance_fn
         # = <diffusion_planner/model/guidance/guidance_wrapper.py> 의 GuidanceWrapper 인스턴스가 들어옴
         self._guidance_fn = getattr(config, "guidance_fn", None)
-        self._x0_for_amortized_inference = None  # # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+        self._x0_for_amortized_inference = None # (B, 1+Pnn, T, 4 or 3)
         future_len = self.config.future_len  # e.g., 80
         # Future-only amortized schedule: [1/T, 2/T, ..., 1]
         # ✅ [수정] amortized schedule에서 t=1을 정확히 쓰지 않도록 마지막을 1-eps로 제한
@@ -695,41 +695,55 @@ class Decoder(nn.Module):
             xt: torch.Tensor,  # shape: (B, Pnn, flattened_dim)
             batch_size: int,
             one_or_Pnn: int,
-            target_agents_past: torch.Tensor,  # shape: (B, Pnn, time_len, 11)
-            target_current_xyyaw: torch.Tensor  # shape: (B, Pnn, 4)
+            target_seq_past: torch.Tensor,
+            # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
     ) -> torch.Tensor:
         """샘플 xt 를 (B, Pnn, _, 4) 모양으로 펼치고
         '과거~현재 상태 프레임'을 맨 앞에 올바르게 넣어주는 메서드.
         """
+        if self.config.pose_based:
+            last_dim = 4
+        else:
+            last_dim = 3
+        past_seq_len = target_seq_past.shape[-2] # time_len or past_len(=time_len-1)
         if self.config.use_past_dit_input:
-            # xt_reshaped: (B, Pnn, time_len+T, 4)
+            # xt_reshaped: (B, Pnn, time_len+T, 4) or (B, Pnn, past_len+T, 3)
             xt_reshaped = xt.reshape(
                 batch_size,
                 one_or_Pnn,
-                self.config.time_len + self._future_len,
-                4,
+                -1,
+                last_dim
             )
             # 과거~현재 상태 주입
-            xt_reshaped[:, :, :self.config.
-            time_len, :] = target_agents_past[:, :, :, 0:4]
+            xt_reshaped[:, :, :past_seq_len, :] = target_seq_past
         else:
             if self.config.use_current_input:
-                # xt_reshaped: (B, Pnn, 1+T, 4)
-                xt_reshaped = xt.reshape(
-                    batch_size,
-                    one_or_Pnn,
-                    1 + self._future_len,
-                    4,
-                )
-                xt_reshaped[:, :,
-                0, :] = target_current_xyyaw  # 현재 상태 주입 (B,Pnn,4)
+                if self.config.pose_based:
+                    # xt_reshaped: (B, Pnn, 1+T, 4)
+                    xt_reshaped = xt.reshape(
+                        batch_size,
+                        one_or_Pnn,
+                        1 + self._future_len,
+                        -1,
+                    )
+                    target_current_xyyaw = target_seq_past[:, :, -1, :] # (B,Pnn,4)
+                    xt_reshaped[:, :,
+                    0, :] = target_current_xyyaw  # 현재 상태 주입 (B,Pnn,4)
+                else:
+                    # xt_reshaped: (B, Pnn, T, 3)
+                    xt_reshaped = xt.reshape(
+                        batch_size,
+                        one_or_Pnn,
+                        self._future_len,
+                        -1,
+                    )
             else:
-                # xt_reshaped: (B, Pnn, T, 4)
+                # xt_reshaped: (B, Pnn, T, 4 or 3)
                 xt_reshaped = xt.reshape(
                     batch_size,
                     one_or_Pnn,
                     self._future_len,
-                    4,
+                    -1,
                 )
         return xt_reshaped
 
@@ -1078,46 +1092,52 @@ class Decoder(nn.Module):
     def _build_inference_xT_from_noise(
             self,
             noise: torch.Tensor,  # (B,(1+)Pnn,T,4)
-            target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
-    ) -> torch.Tensor:  # (B, one_or_Pnn, (time_len+T)*4) or (B, one_or_Pnn, (1+T)*4) or (B, one_or_Pnn, T*4)
+            target_seq_past: torch.Tensor,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+    ) -> torch.Tensor:
         """샘플링 시작점 xT(flat)를 만든다.
 
 
         Returns:
-            xT:
-                shape:
-                  - use_past_dit_input=True  -> (B, one_or_Pnn, (time_len+T)*4)
-                  - use_current_input=True  -> (B, one_or_Pnn, (1+T)*4)
-                  - use_current_input=False -> (B, one_or_Pnn, T*4)
+            # xT(flat) 생성
+            pose_based = True
+                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+            pose_based = False
+                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+
         """
-        target_current_xyyaw = target_agents_past[:, :,
-        -1, :4]  # (B, (1+)Pnn, 4)
+        # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+
         B, one_or_Pnn = noise.shape[:2]
         if self.config.use_past_dit_input:
             # XT: (B, one_or_Pnn, time_len+T, 4)
             xT: torch.Tensor = torch.cat(
                 [
-                    target_agents_past[:, :, :, :
-                                                4],
-                    # (B, one_or_Pnn, time_len, 4)
-                    noise,  # (B, one_or_Pnn, T, 4)
+                    target_seq_past,
+                    # (B, (1+)Pnn, time_len, 4) or (past_len(=time_len-1), 3))
+                    noise,  # (B, one_or_Pnn, T, 4) or (B, one_or_Pnn, T, 3)
                 ],
                 dim=2,
-            ).reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, (time_len+T)*4)
+            ).reshape(B, one_or_Pnn, -1)
         else:
             if self.config.use_current_input:
-                # Expected size 1024 but got size 2048 for tensor number 1 in the list.
-                xT: torch.Tensor = torch.cat(
-                    [
-                        target_current_xyyaw[:, :,
-                        None, :],  # (B, one_or_Pnn, 1, 4) # 1024
-                        noise,  # (B, one_or_Pnn, T, 4) # 2048
-                    ],
-                    dim=2,
-                ).reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, (1+T)*4)
+                if self.config.pose_based:
+                    target_current_xyyaw = target_seq_past[:, :,
+                    -1, :]  # (B, (1+)Pnn, 4)
+                    # Expected size 1024 but got size 2048 for tensor number 1 in the list.
+                    xT: torch.Tensor = torch.cat(
+                        [
+                            target_current_xyyaw[:, :,
+                            None, :],  # (B, one_or_Pnn, 1, 4) # 1024
+                            noise,  # (B, one_or_Pnn, T, 4) # 2048
+                        ],
+                        dim=2,
+                    ).reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, (1+T)*4)
+                else:
+                    xT = noise.reshape(B, one_or_Pnn,
+                                       -1)  # (B, one_or_Pnn, T*(4 or 3))
                 return xT
 
-            xT = noise.reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, T*4)
+            xT = noise.reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, T*(4 or 3))
         return xT
 
     def _mask_invalid_timesteps_to_zero(
@@ -1166,9 +1186,12 @@ class Decoder(nn.Module):
             # (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (past_len + future_len)*3)
             target_past_cur_future_valid: torch.Tensor,   # (B, (1+)Pnn, time_len + future_len)
     ) -> torch.Tensor:
-        """ xT_input_flat
-        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, (future_len)*4)
-        (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
+        """
+        # 2) xT(flat) 생성
+        pose_based = True
+            (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+        pose_based = False
+            (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
         """
         """flat 형태(F=시간*4) 텐서에서 무효 시간 칸을 0으로 정리합니다.
 
@@ -1207,14 +1230,13 @@ class Decoder(nn.Module):
             self,
             xt: torch.
             Tensor,
-            # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             t: torch.Tensor,  # (B) or (B,future_len)
             step: int,
             *,
             batch_size: int,  # DONE
             one_or_Pnn: int,  # DONE
-            target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
-            target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+            target_seq_past: torch.Tensor,
+            # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
             target_past_cur_future_valid: torch.
             Tensor,  # (B, (1+)Pnn, time_len_total)
     ) -> torch.Tensor:
@@ -1239,16 +1261,23 @@ class Decoder(nn.Module):
         B: int = batch_size
 
         # xt_sequence: (B, Pnn, _, 4)
+        """
+        # 2) xT and x0
+        pose_based = True
+            (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+        pose_based = False
+            (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+        """
         xt_sequence: torch.Tensor = self._reshape_xt_with_current_state(
             xt=xt,
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
-            target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
-            target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
+            target_seq_past=target_seq_past,
         )
 
         # (옵션) feasible 결과와 섞기
         if self.config.use_feasible_blend:
+            raise NotImplementedError("현재 use_feasible_blend 옵션은 구현 중입니다.")
             assert self.config.use_feasible, (
                 "use_feasible_blend 옵션은 use_feasible 이 켜져 있을 때만 동작합니다.")
 
@@ -1266,17 +1295,16 @@ class Decoder(nn.Module):
                 )
 
         # yaw (cos, sin) 정리
-        xt_sequence = self._project_future_yaw_to_unit_circle(
-            xt_sequence=xt_sequence,  # (B, (1+)Pnn, _, 4)
-        )
+        if self.config.pose_based:
+            xt_sequence = self._project_future_yaw_to_unit_circle(
+                xt_sequence=xt_sequence,  # (B, (1+)Pnn, _, 4)
+            )
 
         # ✅ 추가: 무효(패딩) 타임스텝을 항상 0으로 강제
-        xt_sequence = self._mask_invalid_timesteps_to_zero(
-            x_seq=xt_sequence,  # (B,P,S,4)
-            target_past_cur_future_valid=
-            target_past_cur_future_valid,  # (B,P,T_all)
+        xt_sequence = self._mask_invalid_timesteps_in_flat_xyyaw(
+            x_flat=xt_sequence,
+            target_past_cur_future_valid=target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
         )
-
         # 다시 flatten: (B, Pnn, F)
         return xt_sequence.reshape(B, one_or_Pnn, -1)
 
@@ -1284,7 +1312,7 @@ class Decoder(nn.Module):
             self,
             batch_size: int,
             one_or_Pnn: int,
-            target_agents_past: torch.Tensor,  # (B, Pnn, time_len, 11)
+            target_seq_past: torch.Tensor,
             target_past_cur_future_valid: torch.Tensor,
             # (B, Pnn, time_len_total)
     ) -> Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor]:
@@ -1296,7 +1324,6 @@ class Decoder(nn.Module):
         Args:
             batch_size: B
             one_or_Pnn: Pnn
-            target_current_xyyaw: (B, Pnn, 4)
             target_past_cur_future_valid: (B, Pnn, time_len_total)
 
         Returns:
@@ -1304,14 +1331,11 @@ class Decoder(nn.Module):
                 callable(xt, t, step) -> xt_out
                 xt: (B, Pnn, F), xt_out: (B, Pnn, F)
         """
-        target_current_xyyaw = target_agents_past[:, :,
-        -1, :4]  # (B, (1+)Pnn, 4)
         return partial(
             self._initial_state_constraint,
             batch_size=batch_size,
             one_or_Pnn=one_or_Pnn,
-            target_agents_past=target_agents_past,
-            target_current_xyyaw=target_current_xyyaw,
+            target_seq_past=target_seq_past,
             target_past_cur_future_valid=target_past_cur_future_valid,
         )
 
@@ -1720,7 +1744,13 @@ class Decoder(nn.Module):
         # diffusion_steps > 1 (기존 DPM-Solver 경로)
         # -----------------------------
         if diffusion_steps > 1:
-            #  (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            """
+            # 2) xT and x0
+            pose_based = True
+                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+            pose_based = False
+                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+            """
             x0: torch.Tensor = dpm_sampler(
                 self.dit,
                 xT.float(),
@@ -1755,7 +1785,6 @@ class Decoder(nn.Module):
         # diffusion_steps == 1 (amortized 1-step)
         # -----------------------------
         assert diffusion_steps == 1, "diffusion_steps must be >= 1"
-
         B: int = int(xT.shape[0])
         xT_f32: torch.Tensor = xT.float()  # (B, Pnn, F)
 
@@ -1771,6 +1800,13 @@ class Decoder(nn.Module):
                                               device=xT.device)
 
         # (1) 모델 1회 호출: x0_pred (flat)
+        """
+        # 2) x0_pred and xT_f32
+        pose_based = True
+            (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+        pose_based = False
+            (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+        """
         # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
         x0_pred: torch.Tensor = self.dit(
             target_input_norm_xT=xT_f32,  # (B, Pnn, F)
@@ -1789,14 +1825,14 @@ class Decoder(nn.Module):
             # guidance_fn이 low_t_mask를 쓰는 경우를 위해 전달(너의 기존 의도 유지)
             classifier_kwargs["low_t_mask"] = low_t_mask
 
-            x0_pred = self._apply_classifier_guidance_for_amortized_one_step(
-                xT_flat=xT_f32,  # (B,Pnn,F)
-                x0_pred_flat=x0_pred,  # (B,Pnn,F)
-                t_tau=t_tau,  # (B,future_len)
-                classifier_kwargs=classifier_kwargs,
-                guidance_scale=self.config.guidance_scale,
-                condition=None,
-            )
+            # x0_pred = self._apply_classifier_guidance_for_amortized_one_step(
+            #     xT_flat=xT_f32,  # (B,Pnn,F)
+            #     x0_pred_flat=x0_pred,  # (B,Pnn,F)
+            #     t_tau=t_tau,  # (B,future_len)
+            #     classifier_kwargs=classifier_kwargs,
+            #     guidance_scale=self.config.guidance_scale,
+            #     condition=None,
+            # )
 
         # (3) correcting_xt_fn을 x0 공간에서 1회 적용 (선택)
         if correcting_xt_fn is not None:
@@ -1812,35 +1848,49 @@ class Decoder(nn.Module):
             # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
     ) -> torch.Tensor:
-        """샘플링 결과 x0(flat)를 (B, (1+)Pnn, 1+T, 4) 형태로 복원한다.
+        """
+        # 2) xT and x0
+        pose_based = True
+            (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+        pose_based = False
+            (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+        """
+        """
         Returns:
             x0_seq:
-                shape: (B, (1+)Pnn, 1+T, 4)
+                shape: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
         """
+        if self.config.pose_based:
+            last_dim = 4
+            seq_len = 1 + self._future_len
+        else:
+            last_dim = 3
+            seq_len = self._future_len
+
         batch_size, one_or_Pnn = x0.shape[:2]
         B: int = batch_size
         if self.config.use_past_dit_input:
             x0_seq = x0.reshape(
                 B,
                 one_or_Pnn,
-                self.config.time_len + self._future_len,
-                4,
+                1,
+                last_dim,
             )
-            x0_seq = x0_seq[:, :, -(1 + self._future_len):, :]  # (B,Pnn,1+T,4)
+            x0_seq = x0_seq[:, :, -seq_len:, :]
             return x0_seq
         if self.config.use_current_input:
-            assert x0.shape == (B, one_or_Pnn, (1 + self._future_len) * 4)
-            x0_seq = x0.reshape(B, one_or_Pnn, -1, 4)  # (B,Pnn,1+T,4)
+            x0_seq = x0.reshape(B, one_or_Pnn, seq_len, last_dim)
             return x0_seq
-
-        assert x0.shape == (B, one_or_Pnn, self._future_len * 4)
-        x0_seq = torch.cat(
-            [
-                target_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
-                x0.reshape(B, one_or_Pnn, -1, 4),  # (B,Pnn,T,4)
-            ],
-            dim=2,
-        )  # (B,Pnn,1+T,4)
+        if self.config.pose_based:
+            x0_seq = torch.cat(
+                [
+                    target_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
+                    x0.reshape(B, one_or_Pnn, seq_len, last_dim),  # (B,Pnn,T,4)
+                ],
+                dim=2,
+            )  # (B,Pnn,1+T,4)
+        else:
+            x0_seq = x0.reshape(B, one_or_Pnn, seq_len, last_dim)
         return x0_seq
 
     def _append_inference_feasible_outputs(
@@ -1966,7 +2016,7 @@ class Decoder(nn.Module):
     def _get_noise_trajectory_from_prev_trajectory(
             self,
             rollout_time_chunk_size: int,
-            random_noise: torch.Tensor,
+            random_noise: torch.Tensor, # (B*R, (1+)Pnn, future_len, 4or 3)
     ) -> torch.Tensor:
         """이전 step의 버퍼(self._x0_for_amortized_inference)로부터 다음 step의 noise_trajectory를 만듭니다.
 
@@ -1984,7 +2034,7 @@ class Decoder(nn.Module):
 
         Returns:
             torch.Tensor:
-                noise_trajectory: (B, (1+)Pnn, future_len, 4)
+                noise_trajectory: (B, (1+)Pnn, future_len, 4 or 3)
         """
         if self._x0_for_amortized_inference is None:
             raise RuntimeError("self._x0_for_amortized_inference is None.")
@@ -1999,11 +2049,12 @@ class Decoder(nn.Module):
                 f"random_noise={tuple(random_noise.shape)}, "
                 f"buffer={tuple(self._x0_for_amortized_inference.shape)}")
 
-        # (B, (1+)Pnn, future_len, 4)
+        # (B, (1+)Pnn, future_len, 4 or 3)
         x0_shifted = torch.zeros_like(self._x0_for_amortized_inference)
         B = int(x0_shifted.shape[0])
 
         # 앞쪽으로 당기기 (rollout_time_chunk_size 만큼)
+        # self._x0_for_amortized_inference: (B, 1+Pnn, T, 4 or 3)
         if int(rollout_time_chunk_size) > 0:
             x0_shifted[:, :, :-int(rollout_time_chunk_size), :] = \
                 self._x0_for_amortized_inference[
@@ -2299,8 +2350,10 @@ class Decoder(nn.Module):
             inputs: Dict[str, torch.Tensor],
             scene_encoding_token: torch.Tensor,
             scene_encoding_token_mask: torch.Tensor,
-            target_agents_past: torch.Tensor,
             # (B, (1+)Pnn, time_len, 11)
+            target_agents_past: torch.Tensor,
+            # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+            target_seq_past: torch.Tensor,
             target_past_cur_future_valid: torch.Tensor,
             batch_size: int,
             one_or_Pnn: int,
@@ -2329,7 +2382,7 @@ class Decoder(nn.Module):
             if self.config.use_amortized_diffusion:
                 if noise_trajectory is not None:  # 첫번쨰 샘플링
                     self._x0_for_amortized_inference = None
-                    # noise_trajectory: (B,(1+)Pnn,T,4)
+                    # noise_trajectory: (B,(1+)Pnn,T,4 or 3)
                     noise_trajectory = self._get_inference_noise_from_inputs(
                         inputs=inputs,
                         batch_size=int(B),
@@ -2349,16 +2402,17 @@ class Decoder(nn.Module):
                         rollout_time_chunk_size[0].item())
 
                     # ✅ cand_idx 기반 seed로 만든 랜덤을 inputs에서 받아 사용
+                    # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
                     amortized_random_noise = self._get_amortized_random_noise_from_inputs(
                         inputs=inputs,
                         batch_size=int(B),
                         one_or_Pnn=int(one_or_Pnn),
                         target_current_xyyaw=target_current_xyyaw,
                     )
-
+                    # noise_trajectory ; (B,(1+)Pnn,T,4 or 3)
                     noise_trajectory = self._get_noise_trajectory_from_prev_trajectory(
                         rollout_time_chunk_size=rollout_time_chunk_size_int,
-                        random_noise=amortized_random_noise,
+                        random_noise=amortized_random_noise, # (B*R, (1+)Pnn, future_len, 4or 3)
                     )
             else:  # 기존 DPM-Solver 경로
                 assert self._x0_for_amortized_inference is None, (
@@ -2382,35 +2436,45 @@ class Decoder(nn.Module):
                         one_or_Pnn=int(one_or_Pnn),
                         target_current_xyyaw=target_current_xyyaw,
                     )  # (B,(1+)Pnn,T,4)
-
+            """
             # 2) xT(flat) 생성
-            # (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+            pose_based = True
+                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+            pose_based = False
+                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+            """
             xT: torch.Tensor = self._build_inference_xT_from_noise(
-                noise=noise_trajectory,  # (B,(1+)Pnn,T,4)
-                target_agents_past=target_agents_past,
-                # (B,(1+)Pnn,time_len,11)
+                noise=noise_trajectory,  # (B,(1+)Pnn,T,4 or 3)
+                target_seq_past=target_seq_past,
+                # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
             )  # (B,Pnn,F)
             # ✅ 추가: 샘플링 시작점부터 무효 타임스텝 0 처리
             xT = self._mask_invalid_timesteps_in_flat_xyyaw(
                 x_flat=xT,
-                target_past_cur_future_valid=target_past_cur_future_valid,
+                target_past_cur_future_valid=target_past_cur_future_valid, # (B, (1+)Pnn, time_len + future_len)
             )
 
             # 4) 샘플링 중 보정 함수 구성
             correcting_xt_fn = self._build_inference_correcting_xt_fn(
                 batch_size=B,
                 one_or_Pnn=one_or_Pnn,
-                target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
+                target_seq_past=target_seq_past,
+                # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
                 target_past_cur_future_valid=
                 target_past_cur_future_valid,  # (B,Pnn,time_total)
             )
 
             # 5) dpm_sampler 실행
-            # x0: (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
+            """
+            # 2) xT and x0
+            pose_based = True
+                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+            pose_based = False
+                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+            """
             x0: torch.Tensor = self._run_dpm_sampler_for_inference(
                 xT=
                 xT,
-                # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
                 target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
@@ -2423,24 +2487,33 @@ class Decoder(nn.Module):
             # dtype 맞춤(기존 로직 유지)
             x0 = x0.to(xT.dtype)
 
-            # 6) x0_seq_norm: (B, (1+)Pnn, 1+T, 4)
+            # 6) x0_seq_norm: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
             x0_seq_norm: torch.Tensor = self._reshape_inference_x0_to_sequence(
                 x0=
                 x0,
-                # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
             # self.dit.norm_dit_returns.integrated_trajectory : (B, (1+)Pnn, T, 4) 정규화 상태
             if self.config.use_amortized_diffusion:
-                # self._x0_for_amortized_inference = x0_seq_norm[:, :,
-                #                                                1:, :].detach(
-                #                                                )  # (B, 1+Pnn, T, 4)
-                integrated = self.dit.norm_dit_returns.integrated_trajectory.to(
-                    device=target_current_xyyaw.device,
-                    dtype=target_current_xyyaw.dtype,
-                ).detach()
+                if self.config.use_feasible:
+                    if self.config.pose_based:
+                        integrated = self.dit.norm_dit_returns.integrated_trajectory.to(
+                            device=target_current_xyyaw.device,
+                            dtype=target_current_xyyaw.dtype,
+                        ).detach()
+                        self._x0_for_amortized_inference = integrated  # (B, 1+Pnn, T, 4)
+                    else:
+                        # TODO: 나중에, FeasibleProjector 의 filter_and_integrate 함수에서 추출한 제어값을
+                        #  self._x0_for_amortized_inference에 넣어주는 방식으로 바꿔보는 것도 고려해볼 수 있습니다.
+                        raise ValueError(
+                            "amortized_diffusion with feasible is not supported for pose_based=False.")
 
-                self._x0_for_amortized_inference = integrated  # (B, 1+Pnn, T, 4)
+                else:
+                    self._x0_for_amortized_inference = x0_seq_norm[:, :,
+                                                               -self.config.future_len:, :].detach(
+                                                               )  # (B, 1+Pnn, T, 4 or 3)
+
+
                 rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
                 rollout_time_chunk_size_int = int(
                     rollout_time_chunk_size[0].item())
@@ -2449,10 +2522,11 @@ class Decoder(nn.Module):
                 _future_len:].detach(
                 )
                 # ✅ 미래 버퍼도 다음 스텝 기준 좌표로 맞추기
-                self._update_amortized_future_buffer_origin(
-                    rollout_time_chunk_size=rollout_time_chunk_size_int,
-                    target_future_valid=target_future_valid,
-                )
+                if self.config.pose_based:
+                    self._update_amortized_future_buffer_origin(
+                        rollout_time_chunk_size=rollout_time_chunk_size_int,
+                        target_future_valid=target_future_valid,
+                    )
 
             # 8) feasible 출력(옵션)
             # return_norm_dict["integrated_trajectory"] : (B, (1+)Pnn, 1+T, 4)
@@ -2460,9 +2534,10 @@ class Decoder(nn.Module):
                 return_norm_dict=return_norm_dict,
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
-            return_norm_dict["score"] = x0_seq_norm  # (B, (1+)Pnn, 1+T, 4)
+            # 6) x0_seq_norm: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
+            return_norm_dict["score"] = x0_seq_norm
             """ return_norm_dict
-            "score" : (B, (1+)Pnn, 1+T, 4)
+            "score" : (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             """
             return return_norm_dict
@@ -2489,7 +2564,8 @@ class Decoder(nn.Module):
         """
         (
             target_agents_past,  # (B, (1+)Pnn, time_len, 11)
-            target_seq_past, # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+            # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+            target_seq_past,
             target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
             batch_size,
             one_or_Pnn,
@@ -2520,7 +2596,6 @@ class Decoder(nn.Module):
                 one_or_Pnn=one_or_Pnn,
             )
         else:
-            # TODO
             """ return_norm_dict
             "score" : (B, (1+)Pnn, 1+T, 4)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
@@ -2531,6 +2606,9 @@ class Decoder(nn.Module):
                 scene_encoding_token_mask=scene_encoding_token_mask,
                 target_agents_past=target_agents_past,
                 # (B, (1+)Pnn, time_len, 11)
+                target_seq_past=
+                target_seq_past,
+                # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 batch_size=batch_size,
                 one_or_Pnn=one_or_Pnn,

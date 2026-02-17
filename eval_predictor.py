@@ -2471,8 +2471,10 @@ def _get_unnorm_target_pose_chunk(
     normed_trajectories: torch.Tensor,  # (B, (1+)Pnn, 1+T, 4)
     target_future_valid: torch.Tensor,
     state_normalizer: Any,
+    # (B*R, (1+)Pnn, T, 3)
+    target_future_control_seq: Optional[torch.Tensor],
     gap: int,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """이번 chunk(gap개)의 예측 포즈를 뽑아 -> 비정규화한 결과를 만듭니다.
 
     하는 일
@@ -2496,7 +2498,11 @@ def _get_unnorm_target_pose_chunk(
     normed_ego_pose_chunk = normed_trajectories[:, 0, 1:gap + 1, :]
     # near: (B*R, Pnn, gap, 4)
     normed_near_pose_chunk = normed_trajectories[:, 1:, 1:gap + 1, :]
-
+    if target_future_control_seq is None:
+        normed_target_chunk_control_seq = None
+    else:
+        # (B*R, (1+)Pnn, T, 3) ->  (B*R, (1+)Pnn, gap, 3)
+        normed_target_chunk_control_seq = target_future_control_seq[:, :, :gap, :] #
     # target: (B*R, (1+)Pnn, gap, 4)
     normed_target_pose_chunk = torch.cat(
         [normed_ego_pose_chunk[:, None, :, :], normed_near_pose_chunk],
@@ -2511,19 +2517,27 @@ def _get_unnorm_target_pose_chunk(
         data=normed_target_pose_chunk,
         valid_mask=target_gap_valid,
     )
-    return unnorm_target_pose_chunk
+    if normed_target_chunk_control_seq is None:
+        unnorm_target_control_chunk = None
+    else:
+        # unnorm_target_control_chunk: (B*R, (1+)Pnn, gap, 3)
+        unnorm_target_control_chunk = state_normalizer.inverse(
+            data=normed_target_chunk_control_seq,
+            valid_mask=target_gap_valid,
+        )
+    return unnorm_target_pose_chunk, unnorm_target_control_chunk
 
 
 def _convert_target_chunk_to_world(
-    unnorm_target_pose_chunk: torch.Tensor,
+    unnorm_target_pose_chunk: torch.Tensor, # (B*R, (1+)Pnn, gap, 4)
     gap: int,
-    unnorm_origin_pose_world: Optional[torch.Tensor],
+    unnorm_origin_pose_world: Optional[torch.Tensor], # (B*R, 4)
 ) -> Optional[torch.Tensor]:
-    """원래 단위 포즈 chunk를 world 좌표로 바꿔 저장하고, 다음 origin_world_pose를 계산합니다.
+    """원래 단위 포즈 chunk를 world 좌표로 바꿔 저장
 
     하는 일
     ------
-    - unnorm_origin_pose_world가 None이면 아무 것도 하지 않고 None을 반환합니다.
+    - unnorm_origin_pose_world 가 None이면 아무 것도 하지 않고 None을 반환합니다.
     - None이 아니면:
       1) (B*R, (1+)Pnn, gap, 4) 포즈를 펼쳐서 world 좌표로 변환합니다.
 
@@ -2557,6 +2571,80 @@ def _convert_target_chunk_to_world(
         int(merged_batch), int(one_or_pnn), int(gap), 4)
 
     return unnorm_target_pose_chunk_world
+from typing import Any, Dict, Optional
+import torch
+
+
+def _update_target_seg_control_for_time_chunk(
+    unnorm_inputs_b_r_copy: Dict[str, Any],
+    unnorm_target_control_chunk: Optional[torch.Tensor],
+) -> None:
+    """이번 chunk의 예측 구간 제어를 past_seg_control_gt_3_dim에 반영합니다.
+
+    Args:
+        unnorm_inputs_b_r_copy (Dict[str, Any]):
+            rollout 동안 유지하는 입력 dict 입니다.
+            아래 키가 있어야 합니다.
+            - "past_seg_control_gt_3_dim": (B*R, 1+Pnn, past_len, 3)
+
+        unnorm_target_control_chunk (Optional[torch.Tensor]):
+            이번 chunk에서 예측한 구간 제어 값입니다.
+            - None이면(예: pose_based=True) 아무 것도 하지 않습니다.
+            - shape: (B*R, 1+Pnn, gap, 3)
+            - 마지막 3은 (v_x^b, v_y^b, yaw_rate) 입니다.
+
+    Notes:
+        - past_seg_control_gt_3_dim의 시간축(past_len)을 gap만큼 앞으로 당긴 뒤,
+          뒤쪽에 이번 chunk control을 붙입니다.
+        - gap이 past_len보다 크면, 최신 past_len개만 남깁니다.
+        - 이 함수는 "*_is_valid" 같은 유효 마스크 키는 업데이트하지 않습니다.
+    """
+    if unnorm_target_control_chunk is None:
+        return
+
+    past_ctrl = unnorm_inputs_b_r_copy.get("past_seg_control_gt_3_dim", None)
+    if not isinstance(past_ctrl, torch.Tensor):
+        raise KeyError(
+            "unnorm_target_control_chunk가 있는데 'past_seg_control_gt_3_dim' 키가 없습니다."
+        )
+
+    if past_ctrl.dim() != 4 or int(past_ctrl.shape[-1]) != 3:
+        raise ValueError(
+            "past_seg_control_gt_3_dim은 (B*R, 1+Pnn, past_len, 3) 이어야 합니다. "
+            f"got shape={tuple(past_ctrl.shape)}"
+        )
+
+    if unnorm_target_control_chunk.dim() != 4 or int(unnorm_target_control_chunk.shape[-1]) != 3:
+        raise ValueError(
+            "unnorm_target_control_chunk는 (B*R, 1+Pnn, gap, 3) 이어야 합니다. "
+            f"got shape={tuple(unnorm_target_control_chunk.shape)}"
+        )
+
+    if int(past_ctrl.shape[0]) != int(unnorm_target_control_chunk.shape[0]) or int(past_ctrl.shape[1]) != int(
+        unnorm_target_control_chunk.shape[1]
+    ):
+        raise ValueError(
+            "batch 축(B*R) 또는 agent 축(1+Pnn) 크기가 맞지 않습니다. "
+            f"past={tuple(past_ctrl.shape[:2])}, chunk={tuple(unnorm_target_control_chunk.shape[:2])}"
+        )
+
+    past_len = int(past_ctrl.shape[2])
+    gap = int(unnorm_target_control_chunk.shape[2])
+    if past_len <= 0 or gap <= 0:
+        return
+
+    move = int(min(gap, past_len))
+
+    # gap이 past_len보다 크면: 최신 past_len개만 남김
+    if move == past_len:
+        new_past = unnorm_target_control_chunk[:, :, -past_len:, :].contiguous()
+        unnorm_inputs_b_r_copy["past_seg_control_gt_3_dim"] = new_past
+        return
+
+    # 일반 케이스: 앞쪽 move개 버리고, 뒤에 move개 붙이기
+    left = past_ctrl[:, :, move:, :]  # (B*R, 1+Pnn, past_len-move, 3)
+    right = unnorm_target_control_chunk[:, :, :move, :]  # (B*R, 1+Pnn, move, 3)
+    unnorm_inputs_b_r_copy["past_seg_control_gt_3_dim"] = torch.cat([left, right], dim=2)
 
 
 def _predict_rollouts_batched_one_chunk(
@@ -2684,8 +2772,11 @@ def _predict_rollouts_batched_one_chunk(
             # (A) 첫 스텝(step_start==0) 또는 non-amortized에서는 기존처럼 inference_noise를 넣음
             need_inference_noise = (not use_amortized) or (use_amortized and
                                                            int(step_start) == 0)
+            pose_based_flag = bool(getattr(args, "pose_based", True))
+
             if need_inference_noise:
-                # inference_noise: (B*R, (1+)Pnn, future_len, 4)
+                # inference_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
+                # (A) inference_noise
                 inference_noise = _build_inference_noise_for_rollout_chunk(
                     device=device,
                     dtype=dtype,
@@ -2697,16 +2788,19 @@ def _predict_rollouts_batched_one_chunk(
                     base_seed=int(base_seed),
                     ddp_rank=int(ddp_rank),
                     step_idx=int(step_start),
+                    pose_based=pose_based_flag,
                     noise_std=float(getattr(args, "eval_temperature", 0.5)),
                 )
+
             else:
                 inference_noise = None
 
             # (B) amortized + step_start>0에서는 Decoder 내부 랜덤 대신
             #     rollout_idx(seed) 기반 표준정규 노이즈를 inputs로 전달
             if use_amortized and int(step_start) > 0:
-                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4)
+                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
                 # ✅ 표준정규를 맞추기 위해 noise_std=1.0
+                # (B) amortized_random_noise
                 amortized_random_noise = _build_inference_noise_for_rollout_chunk(
                     device=device,
                     dtype=dtype,
@@ -2718,6 +2812,7 @@ def _predict_rollouts_batched_one_chunk(
                     base_seed=int(base_seed),
                     ddp_rank=int(ddp_rank),
                     step_idx=int(step_start),
+                    pose_based=pose_based_flag,
                     noise_std=1.0,
                 )
             else:
@@ -2732,7 +2827,6 @@ def _predict_rollouts_batched_one_chunk(
                 dtype=torch.int64,
                 device=norm_inputs_b_r_copy["ego_agent_past"].device,
             )
-
             decoder_output = _forward_model_for_validation(
                 args=args,
                 model=model,
@@ -2740,7 +2834,11 @@ def _predict_rollouts_batched_one_chunk(
             )
             normed_trajectories = decoder_output[
                 "integrated_trajectory"]  # (B*R, (1+)Pnn, 1+T, 4)
-
+            if args.pose_based:
+                target_future_control_seq = None
+            else:
+                # (B*R, (1+)Pnn, T, 3)
+                target_future_control_seq = decoder_output["score"]
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약
             # ---------------------------------------------------------
@@ -2771,12 +2869,17 @@ def _predict_rollouts_batched_one_chunk(
                     norm_inputs_for_draw = dict(norm_inputs_b_r_copy)
                     norm_inputs_for_draw.pop("inference_noise", None)
                     norm_inputs_for_draw.pop("amortized_random_noise", None)
-
+                """
+                unnorm_inputs_np: 그림용 입력 스냅샷(dict, 원래 단위, numpy 중심)
+                unnorm_trajectory_np: 모델 예측 궤적(원래 단위, numpy)
+                near_future_gt_3_dim: near 정답 미래 (x,y,yaw)
+                ego_future_gt_4_dim_np: ego 정답 미래 (x,y,cos,sin)
+                """
                 (unnorm_inputs_np, unnorm_trajectory_np, near_future_gt_3_dim,
                  ego_future_gt_4_dim_np) = _prepare_data_for_one_batch_draw(
                      norm_inputs_b_r_copy=norm_inputs_for_draw,
                      norm_outputs_b_r_copy=norm_outputs_b_r_copy,
-                     normed_trajectories=normed_trajectories,
+                     normed_trajectories=normed_trajectories, # 이번 step에서 출력한 diffusion 궤적
                      state_normalizer=state_normalizer,
                      observation_normalizer=observation_normalizer,
                      draw_batch_idx=draw_batch_idx,
@@ -2789,7 +2892,7 @@ def _predict_rollouts_batched_one_chunk(
                 _draw_one_batch_one_rollout(
                     save_dir=save_dir,
                     unnorm_inputs_np=unnorm_inputs_np,
-                    unnorm_trajectory_np=unnorm_trajectory_np,
+                    unnorm_trajectory_np=unnorm_trajectory_np, # 이번 step에서 출력한 diffusion 궤적
                     ego_future_gt_4_dim=ego_future_gt_4_dim_np,
                     near_future_gt_3_dim=near_future_gt_3_dim,
                     step_idx=int(step_start),
@@ -2797,31 +2900,32 @@ def _predict_rollouts_batched_one_chunk(
                 )
 
             # unnorm_target_pose_chunk: (B*R, (1+)Pnn, gap, 4)
-            unnorm_target_pose_chunk = _get_unnorm_target_pose_chunk(
+            # unnorm_target_control_chunk: Optional[(B*R, (1+)Pnn, gap, 3)]
+            (unnorm_target_pose_chunk, unnorm_target_control_chunk) = _get_unnorm_target_pose_chunk(
                 normed_trajectories=normed_trajectories,
                 target_future_valid=norm_inputs_b_r_copy["target_future_valid"],
                 state_normalizer=state_normalizer,
+                target_future_control_seq=target_future_control_seq,
                 gap=int(gap),
             )
-
+            # unnorm_target_pose_chunk_world: (B*R, (1+)Pnn, gap, 4)
             unnorm_target_pose_chunk_world = _convert_target_chunk_to_world(
-                unnorm_target_pose_chunk=unnorm_target_pose_chunk,
+                unnorm_target_pose_chunk=unnorm_target_pose_chunk, # (B*R, (1+)Pnn, gap, 4)
                 gap=int(gap),
-                unnorm_origin_pose_world=unnorm_origin_pose_world,
+                unnorm_origin_pose_world=unnorm_origin_pose_world, # (B*R, 4)
             )
 
             target_joint_scene_world[:, :, step_start:step_start +
                                      gap, :] = unnorm_target_pose_chunk_world
 
             # 다음 chunk를 위해 origin 갱신
-            unnorm_origin_pose_world = unnorm_target_pose_chunk_world[:, 0,
-                                                                      -1, :]
-            unnorm_inputs_b_r_copy[
-                "origin_world_pose"] = unnorm_origin_pose_world
+            # unnorm_origin_pose_world: (B*R, 4)
+            unnorm_origin_pose_world = unnorm_target_pose_chunk_world[:, 0, -1, :]
+            unnorm_inputs_b_r_copy["origin_world_pose"] = unnorm_origin_pose_world
 
             # 입력 업데이트
-            unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:, 0, :, :]
-            unnorm_near_pose_chunk = unnorm_target_pose_chunk[:, 1:, :, :]
+            unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:, 0, :, :] # (B*R, gap, 4)
+            unnorm_near_pose_chunk = unnorm_target_pose_chunk[:, 1:, :, :] # (B*R, Pnn, gap, 4)
 
             (unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
             ) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
@@ -2829,6 +2933,7 @@ def _predict_rollouts_batched_one_chunk(
                 unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
                 unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
                 unnorm_near_pose_chunk=unnorm_near_pose_chunk,
+                unnorm_target_control_chunk=unnorm_target_control_chunk, # Optional[(B*R, (1+)Pnn, gap, 3)]
                 cached_valid_masks_br=cached_valid_masks_br,
             )
 
@@ -3110,7 +3215,6 @@ def _make_rollout_step_seed(
     )
     return int(base) + int(step_idx)
 
-
 def _build_inference_noise_for_rollout_chunk(
     device: torch.device,
     dtype: torch.dtype,
@@ -3122,52 +3226,23 @@ def _build_inference_noise_for_rollout_chunk(
     base_seed: int,
     ddp_rank: int,
     step_idx: int,
+    pose_based: bool,
     noise_std: float = 0.5,
 ) -> torch.Tensor:
     """현재 chunk의 (B*R) 배치에 넣을 inference noise를 만듭니다.
 
-    이 함수의 목표는 “chunk_size가 바뀌어도” 같은 (rollout_idx, step_idx)에서는
-    항상 같은 noise가 나오도록 만드는 것입니다.
-
-    생성 규칙
-    --------
-    - 전역 rollout 인덱스 g = rollout_start_idx + r (r=0..R-1)
-    - seed = base_seed + rank + g (기존 규칙 유지) + step_idx
-    - 각 rollout(g)마다 (B, one_or_pnn, future_len, 4) noise를 만들고,
-      이를 (B, R, one_or_pnn, future_len, 4)에 채운 뒤,
-      최종적으로 (B*R, one_or_pnn, future_len, 4)로 펼쳐 반환합니다.
-
-    Args:
-
-        batch_size (int):
-            원래 배치 크기 B. shape: ()
-        one_or_pnn (int):
-            (1+Pnn) 크기. shape: ()
-        future_len (int):
-            모델이 한 번에 예측하는 미래 길이. shape: ()
-        rollout_start_idx (int):
-            이번 chunk가 담당하는 전역 rollout 시작 인덱스. shape: ()
-        rollout_repeat (int):
-            이번 chunk의 rollout 개수 R. shape: ()
-        base_seed (int):
-            기본 seed 값. shape: ()
-        ddp_rank (int):
-            프로세스 rank. shape: ()
-        step_idx (int):
-            autoregressive step 인덱스. shape: ()
-        noise_std (float):
-            noise 표준편차. 기본 0.5. shape: ()
-
     Returns:
         torch.Tensor:
             inference_noise 텐서.
-            shape: (B*R, one_or_pnn, future_len, 4)
+            shape:
+              - pose_based=True  -> (B*R, one_or_pnn, future_len, 4)
+              - pose_based=False -> (B*R, one_or_pnn, future_len, 3)
     """
+    last_dim = 4 if bool(pose_based) else 3
 
-    # noise_stack: (B, R, one_or_pnn, future_len, 4)
+    # noise_stack: (B, R, one_or_pnn, future_len, last_dim)
     noise_stack = torch.empty(
-        (int(batch_size), int(rollout_repeat), int(one_or_pnn), int(future_len),
-         4),
+        (int(batch_size), int(rollout_repeat), int(one_or_pnn), int(future_len), int(last_dim)),
         device=device,
         dtype=dtype,
     )
@@ -3184,9 +3259,9 @@ def _build_inference_noise_for_rollout_chunk(
         )
         gen.manual_seed(int(seed))
 
-        # noise_r: (B, one_or_pnn, future_len, 4)
+        # noise_r: (B, one_or_pnn, future_len, last_dim)
         noise_r = torch.randn(
-            (int(batch_size), int(one_or_pnn), int(future_len), 4),
+            (int(batch_size), int(one_or_pnn), int(future_len), int(last_dim)),
             device=device,
             dtype=dtype,
             generator=gen,
@@ -3199,8 +3274,9 @@ def _build_inference_noise_for_rollout_chunk(
         int(batch_size) * int(rollout_repeat),
         int(one_or_pnn),
         int(future_len),
-        4,
+        int(last_dim),
     )
+
 
 
 def _make_rollout_seed(
@@ -5207,6 +5283,7 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     unnorm_outputs_b_r_copy: Dict[str, Any],
     unnorm_ego_pose_chunk: torch.Tensor,  # (B*R, gap, 4)
     unnorm_near_pose_chunk: torch.Tensor,  # (B*R, Pnn, gap, 4)
+    unnorm_target_control_chunk: Optional[torch.Tensor],  # (B*R, 1+Pnn, gap, 3)
     cached_valid_masks_br: Optional[Dict[str, torch.Tensor]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
@@ -5239,7 +5316,11 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     # 4) neighbor past/valid (near와 동일하게)
     _update_neighbor_past_and_valid_inplace_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,)
-
+    # ✅ (추가) past_seg_control_gt_3_dim 업데이트 (valid 키는 건드리지 않음)
+    _update_target_seg_control_for_time_chunk(
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+        unnorm_target_control_chunk=unnorm_target_control_chunk,  # (B*R, 1+Pnn, gap, 3) or None
+    )
     # 5) 미래 GT/valid 갱신
     _update_future_gt_and_valid_inplace_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
@@ -5247,12 +5328,13 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
         gap=int(gap),
     )
 
+
     # 6) 좌표 기준 변환은 "마지막(gap번째) ego 포즈"로 1번만
     unnorm_ego_new_cur_pose = unnorm_ego_pose_chunk[:, -1, :]  # (B*R, 4)
     _transform_origin(
         unnorm_inputs_b_r_copy,
         unnorm_outputs_b_r_copy,
-        unnorm_ego_new_cur_pose,
+        unnorm_ego_new_cur_pose, # (B*R, 4)
         cached_valid_masks_br=cached_valid_masks_br,
     )
 
