@@ -3961,6 +3961,7 @@ class DataProcessor(object):
             target_past_future_body_seg_control[:, -future_len:, :] # (1+N, future_len, 3)
             # # cur_future_control_gt_3_dim
             # cur_future_control_gt_3_dim[:, :, 2] = target_future_seg_body_control[:, :, 2]
+            target_future_seg_body_control[:, :, 2] = cur_future_control_gt_3_dim[:, :, 2]
             (
                 target_integrated_trajectory,
                 target_control_constraint_diff,
