@@ -195,10 +195,16 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "wosac_final_0128" \
-  --name "wosac_final_0128" \
+  --load_name "8_control_only_new_network_1e-3" \
+  --name "38_control_only_new_network_1e-3" \
   --eval_method "validation" \
   --batch_size 384 \
+  --pose_based False \
+  --profile_feasible False \
+  --use_feasible False \
+  --use_feasible_dl False \
+  --use_feasible_filter False \
+  --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active True \
@@ -208,9 +214,8 @@ taskset -c "${CPUSET}" \
   --validate_scenario_rollouts False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
-  --rollout_time_chunk_size 1 \
-  --rollout_number 32 \
   --use_data_percent 1 \
-  --use_amortized_diffusion True \
+  --num_workers 3 \
+  --prefetch_factor 8
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

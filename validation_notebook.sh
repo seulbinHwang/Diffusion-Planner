@@ -195,6 +195,12 @@ taskset -c "${CPUSET}" \
   --name "wosac_final_0128" \
   --eval_method "validation" \
   --batch_size 1 \
+  --pose_based False \
+  --profile_feasible False \
+  --use_feasible False \
+  --use_feasible_dl False \
+  --use_feasible_filter False \
+  --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \
@@ -205,8 +211,6 @@ taskset -c "${CPUSET}" \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 200 \
   --rollout_number 1 \
-  --rollout_time_chunk_size 1 \
-  --use_amortized_diffusion True \
   --do_data_statistics False
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

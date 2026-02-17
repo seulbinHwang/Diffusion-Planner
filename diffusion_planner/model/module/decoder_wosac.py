@@ -379,7 +379,7 @@ class Decoder(nn.Module):
         Args:
             inputs (Dict[str, torch.Tensor]):
                 모델 입력 dict.
-                - amortized_random_noise: (B, (1+)Pnn, future_len, 4)
+                - amortized_random_noise: (B, (1+)Pnn, future_len, 4 or 3)
             batch_size (int):
                 B
             one_or_Pnn (int):
@@ -391,7 +391,7 @@ class Decoder(nn.Module):
         Returns:
             torch.Tensor:
                 amortized random noise 텐서.
-                shape: (B, (1+)Pnn, future_len, 4)
+                shape: (B, (1+)Pnn, future_len, 4 or 3)
         """
         noise = inputs.get("amortized_random_noise", None)
         if noise is None:
@@ -401,8 +401,11 @@ class Decoder(nn.Module):
         if not isinstance(noise, torch.Tensor):
             raise TypeError(
                 "inputs['amortized_random_noise']는 torch.Tensor여야 합니다.")
-
-        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), 4)
+        if self.config.pose_based:
+            expected_dim = 4
+        else:
+            expected_dim = 3
+        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), expected_dim)
         if tuple(noise.shape) != expected:
             raise ValueError(
                 "inputs['amortized_random_noise'] shape가 예상과 다릅니다. "
@@ -427,7 +430,7 @@ class Decoder(nn.Module):
         Args:
             inputs (Dict[str, torch.Tensor]):
                 모델 입력 dict.
-                - inference_noise: shape (B, (1+)Pnn, future_len, 4)
+                - inference_noise: shape (B, (1+)Pnn, future_len, 4 or 3)
             batch_size (int):
                 B. shape: ()
             one_or_Pnn (int):
@@ -447,8 +450,11 @@ class Decoder(nn.Module):
                            "eval 코드에서 (rollout_idx 기준으로 만든 noise)를 넣어 주세요.")
         if not isinstance(noise, torch.Tensor):
             raise TypeError("inputs['inference_noise']는 torch.Tensor여야 합니다.")
-
-        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), 4)
+        if self.config.pose_based:
+            expected_dim = 4
+        else:
+            expected_dim = 3
+        expected = (int(batch_size), int(one_or_Pnn), int(self._future_len), expected_dim)
         if tuple(noise.shape) != expected:
             raise ValueError("inputs['inference_noise'] shape가 예상과 다릅니다. "
                              f"expected={expected}, got={tuple(noise.shape)}")
@@ -1026,14 +1032,15 @@ class Decoder(nn.Module):
 
         batch_size, one_or_Pnn, _, _ = target_agents_past.shape
 
-        # past_seq_control_gt_3_dim:  (B, (1+)Pnn, past_len, 3) or None
-        past_seq_control_gt_3_dim = inputs.get("past_seq_control_gt_3_dim",
-                                               None)
+
         if self.config.pose_based:
             # target_agents_past: (B, (1+)Pnn, time_len, 11)
             #target_seq_past: (B, (1+)Pnn, time_len, 4)
             target_seq_past =  target_agents_past[:, : ,:, :4]
         else:
+            # past_seq_control_gt_3_dim:  (B, (1+)Pnn, past_len, 3) or None
+            past_seq_control_gt_3_dim = inputs.get("past_seq_control_gt_3_dim",
+                                                   None)
             assert past_seq_control_gt_3_dim is not None, \
                 f"past_seq_control_gt_3_dim is None, but config.pose_based={self.config.pose_based}"
             target_seq_past = past_seq_control_gt_3_dim # (B, (1+)Pnn, past_len, 3)
@@ -1299,14 +1306,14 @@ class Decoder(nn.Module):
             xt_sequence = self._project_future_yaw_to_unit_circle(
                 xt_sequence=xt_sequence,  # (B, (1+)Pnn, _, 4)
             )
-
+        xt_sequence_flattened = xt_sequence.reshape(B, one_or_Pnn, -1)
         # ✅ 추가: 무효(패딩) 타임스텝을 항상 0으로 강제
-        xt_sequence = self._mask_invalid_timesteps_in_flat_xyyaw(
-            x_flat=xt_sequence,
+        xt_sequence_flattened = self._mask_invalid_timesteps_in_flat_xyyaw(
+            x_flat=xt_sequence_flattened,  # (B, (1+)Pnn, F)
             target_past_cur_future_valid=target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
         )
         # 다시 flatten: (B, Pnn, F)
-        return xt_sequence.reshape(B, one_or_Pnn, -1)
+        return xt_sequence_flattened
 
     def _build_inference_correcting_xt_fn(
             self,
@@ -1873,7 +1880,7 @@ class Decoder(nn.Module):
             x0_seq = x0.reshape(
                 B,
                 one_or_Pnn,
-                1,
+                -1,
                 last_dim,
             )
             x0_seq = x0_seq[:, :, -seq_len:, :]

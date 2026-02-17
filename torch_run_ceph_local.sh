@@ -114,6 +114,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
+    --pose_based False \
     --profile_feasible False \
     --use_feasible False \
     --use_feasible_dl False \
@@ -122,7 +123,6 @@ export DP_ENABLE_CPU_MONITOR=0
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
     --prefetch_factor 8 \
-    --pose_based False \
     --p_sat 0.4 \
     --w_dir 1.0 \
     --w_int_min 0.05 \

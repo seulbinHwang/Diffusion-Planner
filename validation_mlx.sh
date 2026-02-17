@@ -168,16 +168,24 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "nuplan_womd" \
   --name "nuplan_womd" \
   --eval_method "validation" \
-  --batch_size 1024 \
+  --batch_size 1536 \
+  --pose_based False \
+  --profile_feasible False \
+  --use_feasible False \
+  --use_feasible_dl False \
+  --use_feasible_filter False \
+  --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active True \
   --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
   --finish_when_no_updated_pt True \
+  --validate_scenario_rollouts False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 1 \
-  --resume_wosac_submission True \
-  --rollout_time_chunk_size 5
+  --resume_wosac_submission False \
+  --num_workers 3 \
+  --prefetch_factor 8
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \

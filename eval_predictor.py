@@ -2471,6 +2471,7 @@ def _get_unnorm_target_pose_chunk(
     normed_trajectories: torch.Tensor,  # (B, (1+)Pnn, 1+T, 4)
     target_future_valid: torch.Tensor,
     state_normalizer: Any,
+    observation_normalizer: Any,
     # (B*R, (1+)Pnn, T, 3)
     target_future_control_seq: Optional[torch.Tensor],
     gap: int,
@@ -2521,10 +2522,11 @@ def _get_unnorm_target_pose_chunk(
         unnorm_target_control_chunk = None
     else:
         # unnorm_target_control_chunk: (B*R, (1+)Pnn, gap, 3)
-        unnorm_target_control_chunk = state_normalizer.inverse(
-            data=normed_target_chunk_control_seq,
-            valid_mask=target_gap_valid,
+        norm_temp_dict = {"seg_body_control": normed_target_chunk_control_seq}
+        unnorm_temp_dict = observation_normalizer.inverse(
+            norm_temp_dict
         )
+        unnorm_target_control_chunk = unnorm_temp_dict["seg_body_control"]
     return unnorm_target_pose_chunk, unnorm_target_control_chunk
 
 
@@ -2905,6 +2907,7 @@ def _predict_rollouts_batched_one_chunk(
                 normed_trajectories=normed_trajectories,
                 target_future_valid=norm_inputs_b_r_copy["target_future_valid"],
                 state_normalizer=state_normalizer,
+                observation_normalizer=observation_normalizer,
                 target_future_control_seq=target_future_control_seq,
                 gap=int(gap),
             )
