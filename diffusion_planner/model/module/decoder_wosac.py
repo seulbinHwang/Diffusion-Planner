@@ -1090,7 +1090,7 @@ class Decoder(nn.Module):
                 미래 프레임 노이즈.
                 shape: (B, Pnn, T, 4)
         """
-        if self.args.pose_based:
+        if self.config.pose_based:
             last_dim = 4
         else:
             last_dim = 3
@@ -1905,23 +1905,55 @@ class Decoder(nn.Module):
 
     def _append_inference_feasible_outputs(
             self,
-            return_norm_dict: Dict[str, torch.Tensor],  #
+            return_norm_dict: Dict[str, torch.Tensor],
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
     ) -> None:
-        """추론 모드에서 feasible 출력(integrated_trajectory)을 outputs에 추가한다.
-        Returns:
-            None
+        """추론 모드에서 feasible 결과를 outputs에 추가합니다.
+
+        추가되는 키
+        ----------
+        - "integrated_trajectory":
+            Feasible가 적분한 미래 궤적을 현재 프레임과 붙여 반환합니다.
+            shape: (B, (1+)Pnn, 1+T, 4)
+
+        - (pose_based=False인 경우) "control_sequence":
+            Feasible가 최종으로 적분에 사용한 control 시퀀스입니다.
+            (필터가 켜져 있으면 필터 적용 후 값, 꺼져 있으면 raw와 동일)
+            shape: (B, (1+)Pnn, T, 3)
+
+        목적
+        ----
+        pose_based=False & use_feasible=True에서
+        - pose 업데이트는 integrated_trajectory(=Feasible 기반)
+        - 다음 chunk 입력 past control 업데이트는 control_sequence(=Feasible 최종 control)
+        로 맞춰, 입력 불일치(past pose vs past control)를 없앱니다.
         """
         if not self.config.use_feasible:
             return
 
-        # integrated_trajectory: (B, (1+)Pnn, T, 4)  (정규화 상태)
-        integrated_trajectory: torch.Tensor = self.dit.norm_dit_returns.integrated_trajectory
-        integrated_trajectory = torch.cat(
-            [target_current_xyyaw.unsqueeze(2), integrated_trajectory],
+        norm_returns = getattr(self.dit, "norm_dit_returns", None)
+        if norm_returns is None:
+            return
+
+        integrated_future = getattr(norm_returns, "integrated_trajectory", None)
+        if not isinstance(integrated_future, torch.Tensor):
+            return
+
+        # integrated_trajectory: (B, (1+)Pnn, 1+T, 4)
+        integrated_trajectory: torch.Tensor = torch.cat(
+            [target_current_xyyaw.unsqueeze(2), integrated_future],
             dim=2,
-        )  # (B, (1+)Pnn, 1+T, 4)
+        )
         return_norm_dict["integrated_trajectory"] = integrated_trajectory
+
+        # pose_based=False인 경우: Feasible가 최종으로 사용한 control_sequence를 함께 노출
+        if not bool(self.config.pose_based):
+            control_sequence = getattr(norm_returns, "control_sequence", None)
+            if isinstance(control_sequence, torch.Tensor):
+                # dtype/device는 integrated_trajectory와 맞춰 둠(불필요한 변환 방지)
+                return_norm_dict["control_sequence"] = _cast_like(
+                    control_sequence, integrated_trajectory
+                )
 
     def _forward_training_mode(
             self,
@@ -2401,7 +2433,7 @@ class Decoder(nn.Module):
                     )
                     diffusion_steps = 16
                 else:  # 첫 스텝이 아닌 경우
-                    diffusion_steps = 1
+                    diffusion_steps = 2
                     assert self._x0_for_amortized_inference is not None, (
                         "When using amortized diffusion during inference, "
                         "if inference_noise is not provided, "
@@ -3133,19 +3165,23 @@ class DiT(nn.Module):
             self,
             diffusion_time: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
-        """현재 시간 값으로 'feasible을 돌릴 배치' 마스크를 만든다.
+        """현재 시간 값으로 '저노이즈 배치' 마스크를 만든다.
 
-        - diffusion_time이 작을수록(노이즈가 적다고 보는 구간) feasible을 적극 적용합니다.
-        - direct loss를 쓰지 않는 설정에서는 모든 배치에 대해 feasible을 돌리기 위해
-          threshold를 1.0으로 둡니다(기존 로직 유지).
+        의미(중요)
+        ----------
+        - pose_based=True:
+            low_t_mask==True 인 배치만 FeasibleProjector 경로(보정/필터/적분)를 실제로 실행합니다.
+        - pose_based=False:
+            filter_and_integrate(적분)는 항상 수행하고,
+            low_t_mask==True 인 배치에만 "제약(필터)"를 적용합니다.
 
         Args:
-            diffusion_time: 확산 시간.
-                shape: (B,)
+            diffusion_time: 확산 시간. shape: (B,)
 
         Returns:
             low_t_mask:
-                feasible을 실제로 실행할 배치만 True.
+                pose_based=True  -> feasible 전체 실행 배치 마스크
+                pose_based=False -> 제약(필터) 적용 배치 마스크
                 shape: (B,)
         """
         assert diffusion_time.ndim == 1, \
@@ -4122,8 +4158,10 @@ else
             ):
                 """무효 구간(점이 무효한 구간)은 0.0으로 출력됩니다."""
                 """
-                pose_based = False 에서는, noise 레벨에 상관 없이 모든 데이터가 
-                _feasible_projection_core 에 넘어왔습니다. -> filter_and_integrate 로 전달
+                pose_based=False에서는 filter_and_integrate(적분)을 항상 호출합니다.
+                - 적분(integration)은 전체 배치에 대해 수행됩니다.
+                - filter_active_idx는 "제약(필터) 적용 배치"만 지정합니다.
+                  (비어 있으면 제약은 적용하지 않고, 적분만 수행)
                 """
                 (
                     unnorm_integrated_trajectory,  # (B, Pnn, future_len, 4)
@@ -4295,29 +4333,30 @@ else
             control_constraint_diff=constraint_all,  # (B,Pnn,future_len,3)
         )
 
-
     def _feasible_projection_vel(
             self,
             diffusion_control_traj: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
-            target_current_xyyaw: torch.Tensor,      # (B, (1+)Pnn, 4)
-            target_class_one_hot: torch.Tensor,    # (B, (1+)Pnn, 3)
-            target_past_cur_future_valid: torch.Tensor,  # (B, (1+)Pnn, time_len_total)
-            low_t_mask: torch.Tensor,              # (B,)
+            target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
+            target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
+            target_past_cur_future_valid: torch.Tensor,
+            # (B, (1+)Pnn, time_len_total)
+            low_t_mask: torch.Tensor,  # (B,)
     ) -> None:
         B, Pnn, future_len, _ = diffusion_control_traj.shape
         device = diffusion_control_traj.device
 
         low_t_mask = low_t_mask.to(device=device)
-        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (low_t_mask > 0.5)
+        low_t_mask_bool = low_t_mask if low_t_mask.dtype == torch.bool else (
+                    low_t_mask > 0.5)
 
-        active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(-1) #
+        # active_idx는 "제약(필터) 적용 배치" 인덱스입니다. (pose_based=False에서는 적분은 항상 수행)
+        # - active_idx가 비면: 제약(필터)은 적용하지 않고, 적분만 수행됩니다.
+        active_idx = torch.nonzero(low_t_mask_bool, as_tuple=False).squeeze(-1)
 
-
-        # ---- active subset만 기존 projector 파이프라인 실행 ----
         self._feasible_projection_core_vel(
-            diffusion_control_traj, # (B, (1+)Pnn, future_len, 3)
-            target_class_one_hot, # (B, (1+)Pnn, 3)
-            target_past_cur_future_valid, # (B, (1+)Pnn, time_len_total)
+            diffusion_control_traj,  # (B, (1+)Pnn, future_len, 3)
+            target_class_one_hot,  # (B, (1+)Pnn, 3)
+            target_past_cur_future_valid,  # (B, (1+)Pnn, time_len_total)
             target_current_xyyaw,  # (B, (1+)Pnn, 4)
-        filter_active_idx=active_idx, # (B_N_active,)
+            filter_active_idx=active_idx,  # (B_filter,)
         )

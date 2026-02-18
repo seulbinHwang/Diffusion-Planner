@@ -2655,6 +2655,27 @@ def _build_target_control_chunk_valid_mask_for_time_chunk(
     return mask_f
 
 
+from typing import Any, Dict, Optional
+import torch
+
+
+def _match_device_and_dtype(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """x를 ref와 같은 device/dtype으로 맞춥니다.
+
+    Args:
+        x (torch.Tensor): 맞출 텐서. shape: (임의, ...)
+        ref (torch.Tensor): 기준 텐서. shape: (임의, ...)
+
+    Returns:
+        torch.Tensor:
+            device/dtype이 ref와 동일한 텐서.
+            shape: x와 동일
+    """
+    if x.device == ref.device and x.dtype == ref.dtype:
+        return x
+    return x.to(device=ref.device, dtype=ref.dtype)
+
+
 def _update_target_seg_control_for_time_chunk(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_target_control_chunk: Optional[torch.Tensor],
@@ -2666,6 +2687,8 @@ def _update_target_seg_control_for_time_chunk(
     - 무효(패딩) agent가 control로 “살아나는” 걸 막기 위해,
       ego_chunk_is_valid + near_chunk_is_valid로 control chunk를 0 마스킹한 뒤에만
       past_seg_control_gt_3_dim에 누적합니다.
+    - (추가 안전장치) past_ctrl과 dtype/device가 다르면, cat 전에 chunk 쪽을 past_ctrl에 맞춥니다.
+      이미 같으면 아무 것도 하지 않습니다.
 
     Args:
         unnorm_inputs_b_r_copy (Dict[str, Any]):
@@ -2715,11 +2738,7 @@ def _update_target_seg_control_for_time_chunk(
     if past_len <= 0 or gap <= 0:
         return
 
-    # ------------------------------------------------------------
-    # ✅ (추가) ego_chunk_is_valid + near_chunk_is_valid로 control chunk 마스킹
-    #    - ego_chunk_is_valid:  ego_agent_past_is_valid의 마지막 gap
-    #    - near_chunk_is_valid: near_agents_past_is_valid의 마지막 gap
-    # ------------------------------------------------------------
+    # 1) ego/near valid로 control chunk 마스킹
     mask_f = _build_target_control_chunk_valid_mask_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
         gap=int(gap),
@@ -2727,8 +2746,10 @@ def _update_target_seg_control_for_time_chunk(
         dtype=unnorm_target_control_chunk.dtype,
     )  # (B*R, 1+Pnn, gap, 1)
 
-    # masked_control: (B*R, 1+Pnn, gap, 3)
-    masked_control = unnorm_target_control_chunk * mask_f
+    masked_control = unnorm_target_control_chunk * mask_f  # (B*R, 1+Pnn, gap, 3)
+
+    # 2) ✅ dtype/device 불일치가 있으면 여기서만 맞춤 (이미 같으면 no-op)
+    masked_control = _match_device_and_dtype(masked_control, past_ctrl)
 
     move = int(min(gap, past_len))
 
@@ -2739,8 +2760,8 @@ def _update_target_seg_control_for_time_chunk(
         return
 
     # 일반 케이스: 앞쪽 move개 버리고, 뒤에 move개 붙이기
-    left = past_ctrl[:, :, move:, :]                    # (B*R, 1+Pnn, past_len-move, 3)
-    right = masked_control[:, :, :move, :]              # (B*R, 1+Pnn, move, 3)
+    left = past_ctrl[:, :, move:, :]               # (B*R, 1+Pnn, past_len-move, 3)
+    right = masked_control[:, :, :move, :]         # (B*R, 1+Pnn, move, 3)
     unnorm_inputs_b_r_copy["past_seg_control_gt_3_dim"] = torch.cat([left, right], dim=2)
 
 
@@ -2920,8 +2941,9 @@ def _predict_rollouts_batched_one_chunk(
             norm_inputs_b_r_copy[
                 "amortized_random_noise"] = amortized_random_noise
 
-            norm_inputs_b_r_copy["rollout_time_chunk_size"] = torch.tensor(
-                [gap] * merged_batch,
+            norm_inputs_b_r_copy["rollout_time_chunk_size"] = torch.full(
+                (merged_batch,),
+                int(gap),
                 dtype=torch.int64,
                 device=norm_inputs_b_r_copy["ego_agent_past"].device,
             )
@@ -2935,8 +2957,14 @@ def _predict_rollouts_batched_one_chunk(
             if args.pose_based:
                 target_future_control_seq = None
             else:
-                # (B*R, (1+)Pnn, T, 3)
-                target_future_control_seq = decoder_output["score"]
+                # ✅ 우선: Feasible가 최종으로 사용한 control
+                target_future_control_seq = decoder_output.get(
+                    "control_sequence", None)
+
+                # fallback: 구버전/예외 상황에서는 기존 score 사용
+                if not isinstance(target_future_control_seq, torch.Tensor):
+                    target_future_control_seq = decoder_output["score"]
+
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약
             # ---------------------------------------------------------
@@ -6178,6 +6206,41 @@ def _covert_from_ego_to_world(
                              torch.zeros_like(world_pose))
     return world_pose
 
+def _enforce_pose_based_requires_feasible(args: argparse.Namespace) -> None:
+    """pose_based=False이면 use_feasible을 강제로 True로 맞춥니다.
+
+    이유(팩트)
+    ----------
+    - eval_predictor.py는 decoder_output["integrated_trajectory"]를 항상 사용합니다.
+    - integrated_trajectory는 Decoder에서 use_feasible=True일 때만 만들어집니다.
+    - 따라서 pose_based=False에서는 use_feasible=False 조합을 허용하면 실행 중 깨질 수 있습니다.
+
+    Args:
+        args (argparse.Namespace): 실행 인자 객체. shape: ()
+
+    Returns:
+        None
+
+    Raises:
+        RuntimeError: args.use_feasible 값을 강제로 설정할 수 없을 때
+        AssertionError: 강제 설정 후에도 use_feasible이 True가 아닐 때(방어)
+    """
+    pose_based = bool(getattr(args, "pose_based", True))
+    if pose_based:
+        return
+
+    prev_use_feasible = bool(getattr(args, "use_feasible", False))
+
+    try:
+        setattr(args, "use_feasible", True)
+    except Exception as e:
+        raise RuntimeError("pose_based=False인데 args.use_feasible을 True로 강제 설정하지 못했습니다.") from e
+
+    # (선택) 사용자 실수 방지용 로그: 분산 초기화 전이라 env RANK로 판단
+    if (not prev_use_feasible) and int(_get_rank_from_env()) == 0:
+        print("[CONFIG] pose_based=False 이므로 use_feasible=True 로 강제 설정합니다.", flush=True)
+
+    assert bool(getattr(args, "use_feasible", False)), "pose_based=False일 때는 use_feasible=True가 반드시 필요합니다."
 
 def main() -> None:
     """train_predictor 진입점.
@@ -6192,6 +6255,8 @@ def main() -> None:
     """
     # 1) 분산 초기화 및 rank 정보
     args = args_util.get_args()
+    # ✅ 추가: pose_based=False => use_feasible=True 강제
+    _enforce_pose_based_requires_feasible(args)
     global_rank, rank, world_size, use_deepspeed = init_distributed(args)
 
     set_save_path(

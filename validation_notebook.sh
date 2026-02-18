@@ -199,13 +199,13 @@ taskset -c "${CPUSET}" \
   --profile_feasible False \
   --use_feasible True \
   --use_feasible_dl False \
-  --use_feasible_filter False \
+  --use_feasible_filter True \
   --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \
-  --save_image True \
-  --save_video True \
+  --save_image False \
+  --save_video False \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \

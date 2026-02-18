@@ -11,6 +11,89 @@ from matplotlib.patches import Polygon, FancyArrowPatch, Circle
 import enum
 
 from matplotlib.colors import to_rgba
+from typing import Optional, Tuple, Dict, Any
+import numpy as np
+import matplotlib.pyplot as plt
+
+def _get_ego_current_xy_from_input_data(
+    input_data: Dict[str, Any],
+    options: "DrawingOptions",
+) -> Optional[Tuple[float, float]]:
+    """input_data에서 ego의 '현재' (x, y)를 찾습니다.
+
+    우선순위/규칙
+    - ego_agent_past (T, 11)에서 뒤에서부터 유효한(row11) 프레임을 찾아 그 (x,y)를 사용합니다.
+    - 유효 판단은 is_valid_agent_row(row11, eps)를 그대로 사용합니다.
+
+    Args:
+        input_data (Dict[str, Any]):
+            draw_world_model_to_png로 들어오는 입력 dict.
+        options (DrawingOptions):
+            invalid_eps를 사용합니다.
+
+    Returns:
+        Optional[Tuple[float, float]]:
+            (ego_x, ego_y). 찾지 못하면 None.
+    """
+    ego_past = input_data.get("ego_agent_past", None)
+    if ego_past is None:
+        return None
+
+    arr = np.asarray(ego_past)
+    if arr.size == 0:
+        return None
+    if arr.ndim != 2 or arr.shape[1] != 11:
+        return None
+
+    eps = float(options.invalid_eps)
+
+    # 뒤에서부터 유효한 프레임 찾기(현재에 가장 가까운 값)
+    for t in range(int(arr.shape[0]) - 1, -1, -1):
+        row = arr[t]  # shape: (11,)
+        if is_valid_agent_row(row, eps):
+            return float(row[0]), float(row[1])
+
+    return None
+
+
+def set_axes_limits_centered_on_xy(
+    ax: plt.Axes,
+    bounds: Tuple[float, float, float, float],
+    center_xy: Tuple[float, float],
+    margin_m: float,
+) -> None:
+    """bounds를 모두 포함하면서, center_xy가 축의 정중앙이 되도록 xlim/ylim을 설정합니다.
+
+    동작
+    - bounds(xmin,xmax,ymin,ymax)와 center_xy(cx,cy)를 기준으로,
+      좌/우/상/하 중 가장 먼 거리를 half_span으로 잡습니다.
+    - xlim = [cx-half_span, cx+half_span]
+      ylim = [cy-half_span, cy+half_span]
+    - 이렇게 하면 ego가 항상 축 중앙에 옵니다.
+
+    Args:
+        ax (plt.Axes):
+            matplotlib 축.
+        bounds (Tuple[float, float, float, float]):
+            (xmin, xmax, ymin, ymax).
+        center_xy (Tuple[float, float]):
+            (cx, cy).
+        margin_m (float):
+            여백 [m]. half_span에 더해집니다.
+
+    Returns:
+        None
+    """
+    xmin, xmax, ymin, ymax = bounds
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+
+    dx = max(abs(cx - float(xmin)), abs(float(xmax) - cx), 1e-3)
+    dy = max(abs(cy - float(ymin)), abs(float(ymax) - cy), 1e-3)
+
+    half_span = max(dx, dy) + float(margin_m)
+
+    ax.set_xlim(cx - half_span, cx + half_span)
+    ax.set_ylim(cy - half_span, cy + half_span)
 
 Array = np.ndarray
 WorldModelFeature = Dict[str, Array]
@@ -173,7 +256,7 @@ class DrawingOptions:
     EGO_radius_circle_line_width: float = 0.8  # 원 테두리 두께
     ##############################
     ########### [EGO] FUTURE PLANNER NEXT STATE ##################
-    EGO_future_traj_draw_mode: str = "rectangle"  # 'rectangle' / 'arrow'/ 'point' / 'line'
+    EGO_future_traj_draw_mode: str = "point"  # 'rectangle' / 'arrow'/ 'point' / 'line'
 
     EGO_draw_ego_agent_next_11_dim: bool = True
     EGO_draw_diffusion: bool = True
@@ -4354,7 +4437,19 @@ def draw_world_model_to_png(
     # # ── (5) 축 범위/스타일 ───────────────────────────────────────────
     # # [Add]
     bounds = compute_auto_bounds(input_data, output_data, draw_option)
-    set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
+
+    ego_center_xy = _get_ego_current_xy_from_input_data(input_data, draw_option)
+    if ego_center_xy is not None:
+        set_axes_limits_centered_on_xy(
+            ax=ax,
+            bounds=bounds,
+            center_xy=ego_center_xy,
+            margin_m=draw_option.margin_m,
+        )
+    else:
+        # ego를 못 찾으면 기존 방식 유지(안전)
+        set_axes_limits_with_margin(ax, bounds, draw_option.margin_m)
+
     apply_axes_style(ax, draw_option)
 
     # 6) 저장
