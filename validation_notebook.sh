@@ -197,7 +197,7 @@ taskset -c "${CPUSET}" \
   --batch_size 1 \
   --pose_based False \
   --profile_feasible False \
-  --use_feasible False \
+  --use_feasible True \
   --use_feasible_dl False \
   --use_feasible_filter False \
   --feasible_grad_to_dit False \
