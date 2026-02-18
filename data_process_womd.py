@@ -5520,6 +5520,7 @@ def _normalize_cos_sin(cos_seq: ArrayF, sin_seq: ArrayF, eps: float) -> Tuple[Ar
     r = np.sqrt(cos_seq * cos_seq + sin_seq * sin_seq + eps).astype(cos_seq.dtype, copy=False)
     return (cos_seq / r).astype(cos_seq.dtype, copy=False), (sin_seq / r).astype(sin_seq.dtype, copy=False)
 
+from typing import Union
 
 def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
     """dt를 ref와 같은 dtype의 스칼라로 정리합니다.
@@ -5544,7 +5545,6 @@ def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> 
         raise ValueError(f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
     return dt_arr.reshape(()).item()
 
-from typing import Union
 
 def differentiate_numpy_pose3_to_control3(
     cur_future_pose_gt_3_dim: ArrayF,  # (P, 1+T, 3) = (x, y, heading)
@@ -6051,11 +6051,13 @@ def build_cache_dict_for_scenario(
         neighbor_future_gt_3_dim[out_i] = n_future_3
         neighbor_future_gt_11_dim[out_i] = n_future_11
 
+    # past_seg_control_gt_3_dim : (1+Pnn, past_len, 3)
     past_seg_control_gt_3_dim = build_past_seg_control_gt_3_dim_from_npz_arrays(
         ego_agent_past=ego_agent_past,
         neighbor_agents_past=neighbor_agents_past,
         dt=float(0.1),
     )
+    # future_seg_control_gt_3_dim : (1+Pnn, future_len, 3)
     future_seg_control_gt_3_dim = build_future_seg_control_gt_3_dim_from_npz_arrays(
         ego_agent_past=ego_agent_past,
         ego_future_gt_11_dim=ego_future_gt_11_dim,
