@@ -5521,6 +5521,31 @@ def _normalize_cos_sin(cos_seq: ArrayF, sin_seq: ArrayF, eps: float) -> Tuple[Ar
     return (cos_seq / r).astype(cos_seq.dtype, copy=False), (sin_seq / r).astype(sin_seq.dtype, copy=False)
 
 
+def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
+    """dt를 ref와 같은 dtype의 스칼라로 정리합니다.
+
+    Args:
+        value (float | np.ndarray):
+            시간 간격 dt (스칼라).
+            - float 또는 shape=() 혹은 size=1인 배열도 허용합니다.
+        ref (np.ndarray):
+            dtype 기준 배열.
+
+    Returns:
+        np.floating:
+            ref.dtype로 맞춘 스칼라 dt.
+
+    Raises:
+        ValueError:
+            dt가 스칼라가 아닐 때 발생합니다.
+    """
+    dt_arr = np.asarray(value, dtype=ref.dtype)
+    if dt_arr.size != 1:
+        raise ValueError(f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
+    return dt_arr.reshape(()).item()
+
+from typing import Union
+
 def differentiate_numpy_pose3_to_control3(
     cur_future_pose_gt_3_dim: ArrayF,  # (P, 1+T, 3) = (x, y, heading)
     dt: Union[float, np.ndarray],
