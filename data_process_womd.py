@@ -6325,8 +6325,8 @@ def build_cache_dict_for_scenario(
         "ego_agent_past": ego_agent_past,  # (21,11)  # womd
         "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (80,3)  # womd
         "ego_future_gt_11_dim": ego_future_gt_11_dim,  # (80,11)  # womd
-        "past_seg_control_gt_3_dim": past_seg_control_gt_3_dim,
-        "future_seg_control_gt_3_dim": future_seg_control_gt_3_dim,
+        "past_seg_control_gt_3_dim": past_seg_control_gt_3_dim, #  (1+Pnn, past_len, 3)
+        "future_seg_control_gt_3_dim": future_seg_control_gt_3_dim, # (1+Pnn, future_len, 3)
 
         "neighbor_role": neighbor_role,  # (A,2) bool
         "target_id": target_id,  # (1+A,) int64. [ego_id, neighbor_id...]

@@ -508,7 +508,6 @@ def compute_past_future_vxy_from_xy_via_savgol(
     return out[0] if squeeze_agent else out
 
 
-
 def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
     """dt를 ref와 같은 dtype의 '스칼라'로 정리합니다."""
     dt_arr = np.asarray(value, dtype=ref.dtype)
@@ -696,7 +695,262 @@ def integrate_numpy_control3_to_pose3_midpoint(
     return cur_future_pose_gt_3_dim
 
 
+def _traj11_to_traj3_heading(traj_11: ArrayF) -> ArrayF:
+    """11차원 궤적을 (x, y, heading) 3차원으로 바꿉니다.
 
+    Args:
+        traj_11 (np.ndarray):
+            - (T, 11) 또는 (N, T, 11)
+            - 11차원 = [x, y, cos, sin, vx, vy, width, length, onehot(3)]
+
+    Returns:
+        np.ndarray:
+            - (T, 3) 또는 (N, T, 3)
+            - 3차원 = [x, y, heading]
+    """
+    arr = np.asarray(traj_11)
+    if arr.ndim == 2:
+        if arr.shape[-1] != 11:
+            raise ValueError(f"traj_11 마지막 차원은 11이어야 합니다. got {arr.shape}")
+        heading = np.arctan2(arr[:, 3], arr[:, 2]).astype(np.float32, copy=False)
+        return np.stack([arr[:, 0], arr[:, 1], heading], axis=-1).astype(np.float32, copy=False)
+    if arr.ndim == 3:
+        if arr.shape[-1] != 11:
+            raise ValueError(f"traj_11 마지막 차원은 11이어야 합니다. got {arr.shape}")
+        heading = np.arctan2(arr[:, :, 3], arr[:, :, 2]).astype(np.float32, copy=False)
+        return np.stack([arr[:, :, 0], arr[:, :, 1], heading], axis=-1).astype(np.float32, copy=False)
+    raise ValueError(f"traj_11은 (T,11) 또는 (N,T,11) 이어야 합니다. got {arr.shape}")
+
+
+def _build_seg_control_gt_and_seg_valid_from_all11(
+    ego_all11: ArrayF,  # (T,11)
+    neighbor_all11: ArrayF,  # (N,T,11)
+    *,
+    current_index: int,
+    dt: float,
+    eps: float = 1e-8,
+) -> Tuple[ArrayF, NDArray[np.bool_]]:
+    """11차원 궤적에서 구간 제어와 구간 유효 마스크를 계산합니다.
+
+    동작 요약:
+        - (x,y,cos,sin,...) 값이 모두 0에 가깝다면 그 프레임은 무효로 봅니다.
+        - 두 프레임이 연속으로 유효일 때만 그 사이 "구간"을 유효로 봅니다(seg_valid=True).
+        - current_index 위치의 프레임이 무효라면(현재가 무효),
+          해당 에이전트의 전체 궤적을 0으로 만들어 결과도 전부 0이 되게 합니다.
+
+    Args:
+        ego_all11 (np.ndarray): ego 궤적. shape: (T, 11)
+        neighbor_all11 (np.ndarray): neighbor 궤적. shape: (N, T, 11)
+        current_index (int): "현재 프레임"이 들어있는 인덱스
+        dt (float): 시간 간격
+        eps (float): 0 판정 기준
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            controls: shape (1+N, T-1, 3)
+                - 마지막 3은 (v_x^b, v_y^b, yaw_rate)
+            seg_valid: shape (1+N, T-1) bool
+                - 구간이 유효하면 True
+    """
+    ego11 = np.asarray(ego_all11)
+    nbr11 = np.asarray(neighbor_all11)
+
+    if ego11.ndim != 2 or int(ego11.shape[-1]) != 11:
+        raise ValueError(f"ego_all11 shape는 (T,11) 이어야 합니다. got {ego11.shape}")
+    if nbr11.ndim != 3 or int(nbr11.shape[-1]) != 11:
+        raise ValueError(f"neighbor_all11 shape는 (N,T,11) 이어야 합니다. got {nbr11.shape}")
+    if int(nbr11.shape[1]) != int(ego11.shape[0]):
+        raise ValueError(f"T 차원이 일치해야 합니다. got ego T={ego11.shape[0]} vs nbr T={nbr11.shape[1]}")
+
+    T = int(ego11.shape[0])
+    if T <= 1:
+        raise ValueError(f"T는 최소 2 이상이어야 합니다. got T={T}")
+
+    dt = float(dt)
+    if (not np.isfinite(dt)) or dt <= 0.0:
+        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
+
+    cur_idx = int(current_index)
+    if cur_idx < 0:
+        cur_idx += T
+    if not (0 <= cur_idx < T):
+        raise ValueError(f"current_index 범위가 잘못되었습니다. got {current_index}, T={T}")
+
+    # float dtype 강제(삼각함수/나눗셈 안정)
+    ego11 = ego11.astype(np.float32 if ego11.dtype.kind != "f" else ego11.dtype, copy=False)
+    nbr11 = nbr11.astype(ego11.dtype, copy=False)
+
+    # (안전) "현재"가 무효면 그 에이전트 전체를 0으로
+    ego_cur_valid = bool((np.abs(ego11[cur_idx, :8]) > eps).any())
+    if not ego_cur_valid:
+        ego11 = np.zeros_like(ego11)
+
+    N = int(nbr11.shape[0])
+    if N > 0:
+        nbr_cur_valid_mask = (np.abs(nbr11[:, cur_idx, :8]) > eps).any(axis=1)  # (N,)
+        if not np.all(nbr_cur_valid_mask):
+            nbr11 = np.array(nbr11, copy=True)
+            nbr11[~nbr_cur_valid_mask, :, :] = 0.0
+
+    # 11D -> pose3(x,y,heading)
+    ego_pose3 = _traj11_to_traj3_heading(ego11)  # (T,3)
+    nbr_pose3 = _traj11_to_traj3_heading(nbr11)  # (N,T,3)
+    all_pose3 = np.concatenate([ego_pose3[None, ...], nbr_pose3], axis=0).astype(np.float32, copy=False)
+    # all_pose3: (1+N, T, 3)
+
+    # frame valid -> seg valid
+    ego_valid = (np.abs(ego11[:, :8]) > eps).any(axis=1)            # (T,)
+    nbr_valid = (np.abs(nbr11[:, :, :8]) > eps).any(axis=2)         # (N,T)
+    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N,T)
+    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)  # (1+N,T-1)
+
+    # controls
+    controls = differentiate_numpy_pose3_to_control3(all_pose3, dt=dt).astype(np.float32, copy=False)
+    # controls: (1+N, T-1, 3)
+
+    return controls, seg_valid
+
+
+def _build_past_seg_control_gt_and_seg_valid_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)
+    neighbor_agents_past: ArrayF,  # (N,Tp,11)
+    *,
+    dt: float,
+    eps: float = 1e-8,
+) -> Tuple[ArrayF, NDArray[np.bool_]]:
+    """past 구간 제어(past_len=Tp-1)와 seg_valid를 계산합니다."""
+    ego_past = np.asarray(ego_agent_past)
+    nbr_past = np.asarray(neighbor_agents_past)
+
+    if ego_past.ndim != 2 or ego_past.shape[-1] != 11:
+        raise ValueError(f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
+    if nbr_past.ndim != 3 or nbr_past.shape[-1] != 11:
+        raise ValueError(f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}")
+    if int(nbr_past.shape[1]) != int(ego_past.shape[0]):
+        raise ValueError(f"Tp 차원이 일치해야 합니다. got ego Tp={ego_past.shape[0]} vs nbr Tp={nbr_past.shape[1]}")
+
+    Tp = int(ego_past.shape[0])
+    return _build_seg_control_gt_and_seg_valid_from_all11(
+        ego_all11=ego_past,                 # (Tp,11)
+        neighbor_all11=nbr_past,            # (N,Tp,11)
+        current_index=Tp - 1,               # past에서 현재는 마지막 프레임
+        dt=float(dt),
+        eps=float(eps),
+    )
+
+
+def build_past_seg_control_gt_3_dim_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)
+    neighbor_agents_past: ArrayF,  # (N,Tp,11)
+    *,
+    dt: float,
+    eps: float = 1e-8,
+) -> ArrayF:
+    """npz 내부의 past 11차원 궤적으로부터 past 구간 제어를 만듭니다.
+
+    Returns:
+        np.ndarray:
+            past_seg_control_gt_3_dim, shape (1+N, Tp-1, 3)
+            - 마지막 3: (v_x^b, v_y^b, yaw_rate)
+            - 무효 구간은 0.0
+    """
+    controls, seg_valid = _build_past_seg_control_gt_and_seg_valid_from_npz_arrays(
+        ego_agent_past=ego_agent_past,
+        neighbor_agents_past=neighbor_agents_past,
+        dt=float(dt),
+        eps=float(eps),
+    )
+    controls[~seg_valid] = 0.0
+    return controls
+
+
+def _build_future_seg_control_gt_and_seg_valid_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)  현재 프레임을 얻기 위해 필요
+    ego_future_gt_11_dim: ArrayF,  # (Tf,11)
+    neighbor_agents_past: ArrayF,  # (N,Tp,11) 현재 프레임을 얻기 위해 필요
+    neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
+    *,
+    dt: float,
+    eps: float = 1e-8,
+) -> Tuple[ArrayF, NDArray[np.bool_]]:
+    """future 구간 제어(future_len=Tf)와 seg_valid를 계산합니다.
+
+    future 구간은 "현재 -> 첫 미래"부터 시작하므로,
+    (현재 1프레임 + 미래 Tf프레임) = (1+Tf) 상태를 만든 뒤,
+    그 사이 구간 Tf개에 대한 제어를 만듭니다.
+    """
+    ego_past = np.asarray(ego_agent_past)
+    ego_fut = np.asarray(ego_future_gt_11_dim)
+    nbr_past = np.asarray(neighbor_agents_past)
+    nbr_fut = np.asarray(neighbor_future_gt_11_dim)
+
+    if ego_past.ndim != 2 or ego_past.shape[-1] != 11:
+        raise ValueError(f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
+    if ego_fut.ndim != 2 or ego_fut.shape[-1] != 11:
+        raise ValueError(f"ego_future_gt_11_dim shape는 (Tf,11)이어야 합니다. got {ego_fut.shape}")
+    if nbr_past.ndim != 3 or nbr_past.shape[-1] != 11:
+        raise ValueError(f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}")
+    if nbr_fut.ndim != 3 or nbr_fut.shape[-1] != 11:
+        raise ValueError(f"neighbor_future_gt_11_dim shape는 (N,Tf,11)이어야 합니다. got {nbr_fut.shape}")
+
+    Tp = int(ego_past.shape[0])
+    Tf = int(ego_fut.shape[0])
+    N = int(nbr_past.shape[0])
+
+    if Tp <= 0:
+        raise ValueError(f"Tp는 1 이상이어야 합니다. got Tp={Tp}")
+    if int(nbr_past.shape[1]) != Tp:
+        raise ValueError(f"neighbor_agents_past의 Tp가 ego와 같아야 합니다. got {nbr_past.shape[1]} vs {Tp}")
+    if int(nbr_fut.shape[0]) != N:
+        raise ValueError(f"neighbor_future_gt_11_dim의 N이 neighbor_agents_past와 같아야 합니다. got {nbr_fut.shape[0]} vs {N}")
+    if int(nbr_fut.shape[1]) != Tf:
+        raise ValueError(f"neighbor_future_gt_11_dim의 Tf가 ego_future와 같아야 합니다. got {nbr_fut.shape[1]} vs {Tf}")
+
+    # (현재 1프레임 + 미래 Tf프레임) 만들기
+    ego_cur = ego_past[-1:, :]  # (1,11)
+    ego_all11 = np.concatenate([ego_cur, ego_fut], axis=0)  # (1+Tf,11)
+
+    if N > 0:
+        nbr_cur = nbr_past[:, -1:, :]  # (N,1,11)
+        nbr_all11 = np.concatenate([nbr_cur, nbr_fut], axis=1)  # (N,1+Tf,11)
+    else:
+        nbr_all11 = np.zeros((0, 1 + Tf, 11), dtype=ego_all11.dtype)
+
+    return _build_seg_control_gt_and_seg_valid_from_all11(
+        ego_all11=ego_all11,              # (1+Tf,11)
+        neighbor_all11=nbr_all11,         # (N,1+Tf,11)
+        current_index=0,                  # future에서 현재는 첫 프레임
+        dt=float(dt),
+        eps=float(eps),
+    )
+
+def build_future_seg_control_gt_3_dim_from_npz_arrays(
+    ego_agent_past: ArrayF,  # (Tp,11)
+    ego_future_gt_11_dim: ArrayF,  # (Tf,11)
+    neighbor_agents_past: ArrayF,  # (N,Tp,11)
+    neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
+    *,
+    dt: float,
+    eps: float = 1e-8,
+) -> ArrayF:
+    """npz 내부의 future 11차원 궤적으로부터 future 구간 제어를 만듭니다.
+
+    Returns:
+        np.ndarray:
+            future_seg_control_gt_3_dim, shape (1+N, Tf, 3)
+            - 마지막 3: (v_x^b, v_y^b, yaw_rate)
+            - 무효 구간은 0.0
+    """
+    controls, seg_valid = _build_future_seg_control_gt_and_seg_valid_from_npz_arrays(
+        ego_agent_past=ego_agent_past,
+        ego_future_gt_11_dim=ego_future_gt_11_dim,
+        neighbor_agents_past=neighbor_agents_past,
+        neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,
+        dt=float(dt),
+        eps=float(eps),
+    )
+    controls[~seg_valid] = 0.0
+    return controls
 
 class DataProcessor(object):
 
@@ -3860,38 +4114,21 @@ class DataProcessor(object):
                 ego_cur_pose_np=ego_cur_pose_np,
                 filter_radius=self._get_effective_filter_radius_m(),
             )
-            # ego_cur_future_gt_3_dim: (1+Tf, 3)
-            ego_cur_future_gt_3_dim = self._get_ego_cur_future_gt_3_dim(
-                ego_current_4_dim = ego_agent_past[-1, :4],  # (4,) # x, y, cos(yaw), sin(yaw)
-                ego_future_gt_3_dim = ego_future_gt_3_dim,  # (future_len, 3) # x, y, yaw
+            # past_seg_control_gt_3_dim : (1+Pnn, past_len, 3)
+            past_seg_control_gt_3_dim = build_past_seg_control_gt_3_dim_from_npz_arrays(
+                ego_agent_past=ego_agent_past,
+                neighbor_agents_past=neighbor_agents_past,
+                dt=float(0.1),
             )
-            # neighbor_cur_future_gt_3_dim: (N, 1+Tf, 3)
-            neighbor_cur_future_gt_3_dim = self._get_neighbor_cur_future_gt_3_dim(
-                neighbor_agents_current_4_dim = neighbor_agents_past[:, -1, :4],  # (N, 4) # x, y, cos(yaw), sin(yaw)
-                neighbor_future_gt_3_dim = neighbor_future_gt_3_dim,  # (N, future_len, 3) # x, y, yaw
+            # future_seg_control_gt_3_dim : (1+Pnn, future_len, 3)
+            future_seg_control_gt_3_dim = build_future_seg_control_gt_3_dim_from_npz_arrays(
+                ego_agent_past=ego_agent_past,
+                ego_future_gt_11_dim=ego_future_gt_11_dim,
+                neighbor_agents_past=neighbor_agents_past,
+                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,
+                dt=float(0.1),
             )
-            # ego는 (1+Tf, 3) 2D이므로 batch 차원을 추가해 (1, 1+Tf, 3)으로 맞춘다.
-            all_cur_future_gt_3_dim = np.concatenate(
-                [ego_cur_future_gt_3_dim[None, ...], neighbor_cur_future_gt_3_dim], axis=0
-            ) # (1+N, 1+Tf, 3)
-            # near_future_segment_valid: (1+N, Tf)
-            near_cur_future_valid, near_future_segment_valid = self._get_near_future_segment_valid(
-                ego_cur_future_gt_11_dim=np.concatenate([ego_agent_past[-1:, :], ego_future_gt_11_dim], axis=0),  # (1+future_len, 11)
-                neighbor_cur_future_gt_11_dim=np.concatenate(
-                    [neighbor_agents_past[:, -1:, :], neighbor_future_gt_11_dim],
-                    axis=1,
-                ),  # (N, 1+future_len, 11)
-            )
-            # cur_future_control_gt_3_dim: (1+N, Tf, 3)
-            cur_future_control_gt_3_dim = differentiate_numpy_pose3_to_control3(all_cur_future_gt_3_dim, dt=0.1)
-            cur_future_control_gt_3_dim[~near_future_segment_valid] = 0.0
-            # cur_future_control_gt_3_dim 을 적분하여 다시 pose로 만들자. (무효점은 0.)
-            # cur_future_pose_integrated_3_dim = integrate_numpy_control3_to_pose3_midpoint(
-            #     cur_future_control_gt_3_dim,  # (1+N, Tf, 3)
-            #     all_cur_future_gt_3_dim[:, 0, :],  # (1+N, 3) 현재 pose
-            #     dt=0.1,
-            # )  # (1+N, 1+Tf, 3)
-            # cur_future_pose_integrated_3_dim[~near_cur_future_valid] = 0.0
+
             # # 현재 프레임의 width/length (ego + neighbors)
             # cur_agent_size_2_dim = np.concatenate(
             #     [ego_agent_past[-1, 6:8][None, :], neighbor_agents_past[:, -1, 6:8]],
@@ -3907,112 +4144,112 @@ class DataProcessor(object):
             # =========================================================
             # ✅ [ADDED] past+future 기반 control(3) = [v_x, v_y, yaw_rate]
             # =========================================================
-            use_savgol_lin_vel: bool = bool(
-                getattr(self.config, "use_savgol_lin_vel", False))
-            use_savgol_lin_vel = True
-            ego_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
-                past_cur_traj_11=ego_agent_past,
-                future_traj_11=ego_future_gt_11_dim,
-                dt=0.1,
-                polyorder=2,
-                max_window_len_yaw=7,
-                eps_valid=1e-8,
-                use_savgol_lin_vel=use_savgol_lin_vel,
-                max_window_len_lin_vel=7,
-            )
-
-            neighbor_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
-                past_cur_traj_11=neighbor_agents_past,
-                future_traj_11=neighbor_future_gt_11_dim,
-                dt=0.1,
-                polyorder=2,
-                max_window_len_yaw=7,
-                eps_valid=1e-8,
-                use_savgol_lin_vel=use_savgol_lin_vel,
-                max_window_len_lin_vel=7,
-            )
-
-            # =========================================================
-            # ✅ [ADDED] ego+neighbor node control -> midpoint body seg control
-            #   - target_past_future_control: (1+N, time_len+future_len, 3)
-            #   - target_past_future_body_seg_control: (1+N, past_len+future_len, 3)
-            # =========================================================
-            (
-                target_past_future_control,
-                target_past_future_body_seg_control,
-            ) = self._build_target_past_future_body_seg_control_via_midpoint(
-                ego_agent_past=ego_agent_past,                            # (time_len,11)
-                ego_future_gt_11_dim=ego_future_gt_11_dim,                # (future_len,11)
-                neighbor_agents_past=neighbor_agents_past,                # (N,time_len,11)
-                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,      # (N,future_len,11)
-                ego_past_future_control=ego_past_future_control,          # (time_len+future_len,3)
-                neighbor_past_future_control=neighbor_past_future_control,# (N,time_len+future_len,3)
-                dt=0.1,
-                eps_valid=1e-8,
-            )
-            # =========================================================
-            # ✅ [ADDED] target_past_future_body_seg_control + current/valid/class
-            #            -> filter_and_integrate
-            #   - target_integrated_trajectory: (1+N, future_len, 4)
-            #   - target_control_constraint_diff: (1+N, future_len, 3)
-            # =========================================================
-            future_len: int = int(ego_future_gt_11_dim.shape[0])
-            target_future_seg_body_control = \
-            target_past_future_body_seg_control[:, -future_len:, :] # (1+N, future_len, 3)
-            # # cur_future_control_gt_3_dim
-            # cur_future_control_gt_3_dim[:, :, 2] = target_future_seg_body_control[:, :, 2]
-            target_future_seg_body_control[:, :, 2] = cur_future_control_gt_3_dim[:, :, 2]
-            (
-                target_integrated_trajectory,
-                target_control_constraint_diff,
-                target_current_state,
-                target_cur_future_valid,
-                target_class_one_hot,
-            ) = self._build_target_integrated_outputs_via_filter_and_integrate(
-                target_future_seg_body_control=target_future_seg_body_control,  # (1+N,past_len+future_len,3)
-                ego_agent_past=ego_agent_past,                                            # (time_len,11)
-                ego_future_gt_11_dim=ego_future_gt_11_dim,                                # (future_len,11)
-                neighbor_agents_past=neighbor_agents_past,                                # (N,time_len,11)
-                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,                      # (N,future_len,11)
-                dt=0.1,
-                eps_valid=1e-8,
-            )
-
-            # =========================================================
-            # [ADDED] 현재 width/length + GT(4dim) 만들고, 박스 궤적 비교 PNG 저장
-            # =========================================================
-            target_current_wl = self._build_target_current_wl_from_past(
-                ego_agent_past=ego_agent_past,                    # (time_len,11)
-                neighbor_agents_past=neighbor_agents_past,        # (N,time_len,11)
-            )  # (1+N,2)
-
-            target_future_gt_4_dim = self._build_target_future_gt_4_dim_from_future11(
-                ego_future_gt_11_dim=ego_future_gt_11_dim,            # (future_len,11)
-                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,  # (N,future_len,11)
-            )  # (1+N,future_len,4)
-
-            self._save_integrated_vs_gt_box_compare_plot(
-                target_integrated_trajectory=target_integrated_trajectory,  # (1+N,future_len,4)
-                target_future_gt_4_dim=target_future_gt_4_dim,              # (1+N,future_len,4)
-                target_current_wl=target_current_wl,                        # (1+N,2)
-                target_cur_future_valid=target_cur_future_valid,            # (1+N,1+future_len)
-                map_name=map_name,
-                token=scenario_token,
-                eps=1e-6,
-            )
-
-
-
-            # =========================================================
-            # [ADDED] integrated_trajectory vs GT(neighbor) xy/yaw loss 누적
-            # =========================================================
-            self._accumulate_neighbor_xy_yaw_losses_for_integrated_trajectory(
-                target_integrated_trajectory=target_integrated_trajectory,  # (1+N,future_len,4)
-                ego_future_gt_11_dim=ego_future_gt_11_dim,                  # (future_len,11)
-                neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,        # (N,future_len,11)
-                target_cur_future_valid=target_cur_future_valid,            # (1+N,1+future_len)
-                eps_valid=1e-8,
-            )
+            # use_savgol_lin_vel: bool = bool(
+            #     getattr(self.config, "use_savgol_lin_vel", False))
+            # use_savgol_lin_vel = True
+            # ego_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
+            #     past_cur_traj_11=ego_agent_past,
+            #     future_traj_11=ego_future_gt_11_dim,
+            #     dt=0.1,
+            #     polyorder=2,
+            #     max_window_len_yaw=7,
+            #     eps_valid=1e-8,
+            #     use_savgol_lin_vel=use_savgol_lin_vel,
+            #     max_window_len_lin_vel=7,
+            # )
+            #
+            # neighbor_past_future_control = self._build_past_future_control_vxy_yawrate_from_traj11(
+            #     past_cur_traj_11=neighbor_agents_past,
+            #     future_traj_11=neighbor_future_gt_11_dim,
+            #     dt=0.1,
+            #     polyorder=2,
+            #     max_window_len_yaw=7,
+            #     eps_valid=1e-8,
+            #     use_savgol_lin_vel=use_savgol_lin_vel,
+            #     max_window_len_lin_vel=7,
+            # )
+            #
+            # # =========================================================
+            # # ✅ [ADDED] ego+neighbor node control -> midpoint body seg control
+            # #   - target_past_future_control: (1+N, time_len+future_len, 3)
+            # #   - target_past_future_body_seg_control: (1+N, past_len+future_len, 3)
+            # # =========================================================
+            # (
+            #     target_past_future_control,
+            #     target_past_future_body_seg_control,
+            # ) = self._build_target_past_future_body_seg_control_via_midpoint(
+            #     ego_agent_past=ego_agent_past,                            # (time_len,11)
+            #     ego_future_gt_11_dim=ego_future_gt_11_dim,                # (future_len,11)
+            #     neighbor_agents_past=neighbor_agents_past,                # (N,time_len,11)
+            #     neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,      # (N,future_len,11)
+            #     ego_past_future_control=ego_past_future_control,          # (time_len+future_len,3)
+            #     neighbor_past_future_control=neighbor_past_future_control,# (N,time_len+future_len,3)
+            #     dt=0.1,
+            #     eps_valid=1e-8,
+            # )
+            # # =========================================================
+            # # ✅ [ADDED] target_past_future_body_seg_control + current/valid/class
+            # #            -> filter_and_integrate
+            # #   - target_integrated_trajectory: (1+N, future_len, 4)
+            # #   - target_control_constraint_diff: (1+N, future_len, 3)
+            # # =========================================================
+            # future_len: int = int(ego_future_gt_11_dim.shape[0])
+            # target_future_seg_body_control = \
+            # target_past_future_body_seg_control[:, -future_len:, :] # (1+N, future_len, 3)
+            # # # cur_future_control_gt_3_dim
+            # # cur_future_control_gt_3_dim[:, :, 2] = target_future_seg_body_control[:, :, 2]
+            # target_future_seg_body_control[:, :, 2] = cur_future_control_gt_3_dim[:, :, 2]
+            # (
+            #     target_integrated_trajectory,
+            #     target_control_constraint_diff,
+            #     target_current_state,
+            #     target_cur_future_valid,
+            #     target_class_one_hot,
+            # ) = self._build_target_integrated_outputs_via_filter_and_integrate(
+            #     target_future_seg_body_control=target_future_seg_body_control,  # (1+N,past_len+future_len,3)
+            #     ego_agent_past=ego_agent_past,                                            # (time_len,11)
+            #     ego_future_gt_11_dim=ego_future_gt_11_dim,                                # (future_len,11)
+            #     neighbor_agents_past=neighbor_agents_past,                                # (N,time_len,11)
+            #     neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,                      # (N,future_len,11)
+            #     dt=0.1,
+            #     eps_valid=1e-8,
+            # )
+            #
+            # # =========================================================
+            # # [ADDED] 현재 width/length + GT(4dim) 만들고, 박스 궤적 비교 PNG 저장
+            # # =========================================================
+            # target_current_wl = self._build_target_current_wl_from_past(
+            #     ego_agent_past=ego_agent_past,                    # (time_len,11)
+            #     neighbor_agents_past=neighbor_agents_past,        # (N,time_len,11)
+            # )  # (1+N,2)
+            #
+            # target_future_gt_4_dim = self._build_target_future_gt_4_dim_from_future11(
+            #     ego_future_gt_11_dim=ego_future_gt_11_dim,            # (future_len,11)
+            #     neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,  # (N,future_len,11)
+            # )  # (1+N,future_len,4)
+            #
+            # self._save_integrated_vs_gt_box_compare_plot(
+            #     target_integrated_trajectory=target_integrated_trajectory,  # (1+N,future_len,4)
+            #     target_future_gt_4_dim=target_future_gt_4_dim,              # (1+N,future_len,4)
+            #     target_current_wl=target_current_wl,                        # (1+N,2)
+            #     target_cur_future_valid=target_cur_future_valid,            # (1+N,1+future_len)
+            #     map_name=map_name,
+            #     token=scenario_token,
+            #     eps=1e-6,
+            # )
+            #
+            #
+            #
+            # # =========================================================
+            # # [ADDED] integrated_trajectory vs GT(neighbor) xy/yaw loss 누적
+            # # =========================================================
+            # self._accumulate_neighbor_xy_yaw_losses_for_integrated_trajectory(
+            #     target_integrated_trajectory=target_integrated_trajectory,  # (1+N,future_len,4)
+            #     ego_future_gt_11_dim=ego_future_gt_11_dim,                  # (future_len,11)
+            #     neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,        # (N,future_len,11)
+            #     target_cur_future_valid=target_cur_future_valid,            # (1+N,1+future_len)
+            #     eps_valid=1e-8,
+            # )
 
 
             # cur_future_control_gt_3_dim 에서,
@@ -4022,6 +4259,8 @@ class DataProcessor(object):
                 "ego_future_gt_3_dim": ego_future_gt_3_dim,  # (future_len, 3)
                 "ego_future_gt_11_dim": ego_future_gt_11_dim,
                 # (future_len, 11)
+                "past_seg_control_gt_3_dim": past_seg_control_gt_3_dim, # (1+Pnn, past_len, 3)
+                "future_seg_control_gt_3_dim": future_seg_control_gt_3_dim, # (1+Pnn, future_len, 3)
                 "neighbor_agents_past": neighbor_agents_past,
                 # (chosen_agent_num, time_len, 11)
 
