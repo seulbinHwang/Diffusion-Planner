@@ -1090,62 +1090,65 @@ class Decoder(nn.Module):
                 미래 프레임 노이즈.
                 shape: (B, Pnn, T, 4)
         """
+        if self.args.pose_based:
+            last_dim = 4
+        else:
+            last_dim = 3
         B: int = batch_size
         noise: torch.Tensor = target_current_xyyaw.new_empty(
-            (B, one_or_Pnn, self._future_len, 4), ).normal_(
+            (B, one_or_Pnn, self._future_len, last_dim), ).normal_(
             0.0, self.config.eval_temperature)  # (B, (1+)Pnn, T, 4)
         return noise
 
     def _build_inference_xT_from_noise(
             self,
-            noise: torch.Tensor,  # (B,(1+)Pnn,T,4)
-            target_seq_past: torch.Tensor,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+            noise: torch.Tensor,  # (B,(1+)Pnn,T,4 or 3)
+            target_seq_past: torch.Tensor,
+            # (B, (1+)Pnn, (time_len, 4) or (past_len, 3))
     ) -> torch.Tensor:
         """샘플링 시작점 xT(flat)를 만든다.
 
-
         Returns:
-            # xT(flat) 생성
-            pose_based = True
-                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-            pose_based = False
-                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
-
+            pose_based=True:
+                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, (1+)Pnn, T*4)
+            pose_based=False:
+                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, T*3)
         """
-        # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-
         B, one_or_Pnn = noise.shape[:2]
+
         if self.config.use_past_dit_input:
-            # XT: (B, one_or_Pnn, time_len+T, 4)
+            target_seq_past = _cast_like(target_seq_past, noise)
+
             xT: torch.Tensor = torch.cat(
                 [
-                    target_seq_past,
-                    # (B, (1+)Pnn, time_len, 4) or (past_len(=time_len-1), 3))
-                    noise,  # (B, one_or_Pnn, T, 4) or (B, one_or_Pnn, T, 3)
+                    target_seq_past,  # (B, (1+)Pnn, past_len, 4 or 3)
+                    noise,  # (B, (1+)Pnn, future_len, 4 or 3)
                 ],
                 dim=2,
             ).reshape(B, one_or_Pnn, -1)
-        else:
-            if self.config.use_current_input:
-                if self.config.pose_based:
-                    target_current_xyyaw = target_seq_past[:, :,
-                    -1, :]  # (B, (1+)Pnn, 4)
-                    # Expected size 1024 but got size 2048 for tensor number 1 in the list.
-                    xT: torch.Tensor = torch.cat(
-                        [
-                            target_current_xyyaw[:, :,
-                            None, :],  # (B, one_or_Pnn, 1, 4) # 1024
-                            noise,  # (B, one_or_Pnn, T, 4) # 2048
-                        ],
-                        dim=2,
-                    ).reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, (1+T)*4)
-                else:
-                    xT = noise.reshape(B, one_or_Pnn,
-                                       -1)  # (B, one_or_Pnn, T*(4 or 3))
+            return xT
+
+        if self.config.use_current_input:
+            if self.config.pose_based:
+                # target_current_xyyaw: (B, (1+)Pnn, 4)
+                target_current_xyyaw = target_seq_past[:, :, -1, :]
+                target_current_xyyaw = _cast_like(target_current_xyyaw, noise)
+
+                xT = torch.cat(
+                    [
+                        target_current_xyyaw[:, :, None, :],
+                        # (B, (1+)Pnn, 1, 4)
+                        noise,  # (B, (1+)Pnn, T, 4)
+                    ],
+                    dim=2,
+                ).reshape(B, one_or_Pnn, -1)
                 return xT
 
-            xT = noise.reshape(B, one_or_Pnn, -1)  # (B, one_or_Pnn, T*(4 or 3))
-        return xT
+            # pose_based=False + use_current_input=True: current 프레임이 입력에 따로 없으므로 noise만 사용
+            return noise.reshape(B, one_or_Pnn, -1)
+
+        # use_current_input=False: 미래만
+        return noise.reshape(B, one_or_Pnn, -1)
 
     def _mask_invalid_timesteps_to_zero(
             self,

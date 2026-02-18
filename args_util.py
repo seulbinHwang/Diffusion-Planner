@@ -298,7 +298,7 @@ def get_args():
         ),
     ) # use_past_for_feasible = True / use_past_dit_input = True
 
-    parser.add_argument('--use_fallback', default=False, type=boolean)
+    parser.add_argument('--use_fallback', default=True, type=boolean)
     parser.add_argument('--pin_mem', default=True, type=boolean)
     parser.add_argument('--set_coord_as_center', default=True, type=boolean)
     parser.add_argument('--use_feasible', default=True, type=boolean)

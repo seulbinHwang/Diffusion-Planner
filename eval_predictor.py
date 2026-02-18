@@ -2577,29 +2577,109 @@ from typing import Any, Dict, Optional
 import torch
 
 
+from typing import Any, Dict, Optional
+import torch
+
+
+def _build_target_control_chunk_valid_mask_for_time_chunk(
+    unnorm_inputs_b_r_copy: Dict[str, Any],
+    gap: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """control chunk를 마스킹하기 위한 유효 마스크를 만듭니다.
+
+    Args:
+        unnorm_inputs_b_r_copy (Dict[str, Any]):
+            rollout 동안 유지하는 입력 dict.
+            아래 키가 있어야 합니다.
+            - ego_agent_past_is_valid:  (B*R, time_len)
+            - near_agents_past_is_valid: (B*R, Pnn, time_len)  (Pnn이 0이면 비어 있을 수 있음)
+        gap (int):
+            이번 time-chunk 길이. shape: ()
+        device (torch.device):
+            반환 마스크가 올라갈 디바이스. shape: ()
+        dtype (torch.dtype):
+            반환 마스크 dtype(보통 control chunk dtype). shape: ()
+
+    Returns:
+        torch.Tensor:
+            mask_f: (B*R, 1+Pnn, gap, 1)
+            - ego는 ego_chunk_is_valid 기반
+            - near는 near_chunk_is_valid 기반
+    """
+    if int(gap) <= 0:
+        raise ValueError(f"gap은 1 이상이어야 합니다. gap={gap}")
+
+    ego_past_is_valid = unnorm_inputs_b_r_copy.get("ego_agent_past_is_valid", None)
+    if not isinstance(ego_past_is_valid, torch.Tensor) or ego_past_is_valid.dim() != 2:
+        raise KeyError("control 마스킹을 위해 'ego_agent_past_is_valid' (B*R, time_len)가 필요합니다.")
+
+    time_len = int(ego_past_is_valid.shape[1])
+    if time_len < int(gap):
+        raise ValueError(
+            "ego_agent_past_is_valid의 time_len이 gap보다 작습니다. "
+            f"time_len={time_len}, gap={int(gap)}"
+        )
+
+    # ego_chunk_is_valid: (B*R, gap)
+    ego_chunk_is_valid = ego_past_is_valid[:, -int(gap):].to(device=device)
+
+    near_past_is_valid = unnorm_inputs_b_r_copy.get("near_agents_past_is_valid", None)
+
+    # near가 없거나 Pnn=0인 경우도 안전 처리
+    if not isinstance(near_past_is_valid, torch.Tensor) or near_past_is_valid.numel() == 0:
+        # mask_f_ego: (B*R, 1, gap, 1)
+        mask_f_ego = ego_chunk_is_valid[:, None, :, None].to(dtype=dtype)
+        return mask_f_ego
+
+    if near_past_is_valid.dim() != 3:
+        raise ValueError(
+            "near_agents_past_is_valid는 (B*R, Pnn, time_len) 형태여야 합니다. "
+            f"got shape={tuple(near_past_is_valid.shape)}"
+        )
+
+    if int(near_past_is_valid.shape[2]) < int(gap):
+        raise ValueError(
+            "near_agents_past_is_valid의 time_len이 gap보다 작습니다. "
+            f"time_len={int(near_past_is_valid.shape[2])}, gap={int(gap)}"
+        )
+
+    # near_chunk_is_valid: (B*R, Pnn, gap)
+    near_chunk_is_valid = near_past_is_valid[:, :, -int(gap):].to(device=device)
+
+    # mask_f: (B*R, 1+Pnn, gap, 1)
+    mask_f_ego = ego_chunk_is_valid[:, None, :, None].to(dtype=dtype)          # (B*R, 1, gap, 1)
+    mask_f_near = near_chunk_is_valid[:, :, :, None].to(dtype=dtype)           # (B*R, Pnn, gap, 1)
+    mask_f = torch.cat([mask_f_ego, mask_f_near], dim=1)                       # (B*R, 1+Pnn, gap, 1)
+    return mask_f
+
+
 def _update_target_seg_control_for_time_chunk(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_target_control_chunk: Optional[torch.Tensor],
 ) -> None:
     """이번 chunk의 예측 구간 제어를 past_seg_control_gt_3_dim에 반영합니다.
 
+    추가 반영(요청사항)
+    ----------------
+    - 무효(패딩) agent가 control로 “살아나는” 걸 막기 위해,
+      ego_chunk_is_valid + near_chunk_is_valid로 control chunk를 0 마스킹한 뒤에만
+      past_seg_control_gt_3_dim에 누적합니다.
+
     Args:
         unnorm_inputs_b_r_copy (Dict[str, Any]):
-            rollout 동안 유지하는 입력 dict 입니다.
-            아래 키가 있어야 합니다.
-            - "past_seg_control_gt_3_dim": (B*R, 1+Pnn, past_len, 3)
-
+            rollout 동안 유지하는 입력 dict.
+            - past_seg_control_gt_3_dim: (B*R, 1+Pnn, past_len, 3)
+            - ego_agent_past_is_valid: (B*R, time_len)
+            - near_agents_past_is_valid: (B*R, Pnn, time_len)
         unnorm_target_control_chunk (Optional[torch.Tensor]):
-            이번 chunk에서 예측한 구간 제어 값입니다.
-            - None이면(예: pose_based=True) 아무 것도 하지 않습니다.
+            이번 chunk에서 예측한 control.
+            - None이면 아무 것도 하지 않습니다.
             - shape: (B*R, 1+Pnn, gap, 3)
-            - 마지막 3은 (v_x^b, v_y^b, yaw_rate) 입니다.
 
-    Notes:
-        - past_seg_control_gt_3_dim의 시간축(past_len)을 gap만큼 앞으로 당긴 뒤,
-          뒤쪽에 이번 chunk control을 붙입니다.
-        - gap이 past_len보다 크면, 최신 past_len개만 남깁니다.
-        - 이 함수는 "*_is_valid" 같은 유효 마스크 키는 업데이트하지 않습니다.
+    Returns:
+        None
     """
     if unnorm_target_control_chunk is None:
         return
@@ -2635,18 +2715,34 @@ def _update_target_seg_control_for_time_chunk(
     if past_len <= 0 or gap <= 0:
         return
 
+    # ------------------------------------------------------------
+    # ✅ (추가) ego_chunk_is_valid + near_chunk_is_valid로 control chunk 마스킹
+    #    - ego_chunk_is_valid:  ego_agent_past_is_valid의 마지막 gap
+    #    - near_chunk_is_valid: near_agents_past_is_valid의 마지막 gap
+    # ------------------------------------------------------------
+    mask_f = _build_target_control_chunk_valid_mask_for_time_chunk(
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+        gap=int(gap),
+        device=unnorm_target_control_chunk.device,
+        dtype=unnorm_target_control_chunk.dtype,
+    )  # (B*R, 1+Pnn, gap, 1)
+
+    # masked_control: (B*R, 1+Pnn, gap, 3)
+    masked_control = unnorm_target_control_chunk * mask_f
+
     move = int(min(gap, past_len))
 
     # gap이 past_len보다 크면: 최신 past_len개만 남김
     if move == past_len:
-        new_past = unnorm_target_control_chunk[:, :, -past_len:, :].contiguous()
+        new_past = masked_control[:, :, -past_len:, :].contiguous()
         unnorm_inputs_b_r_copy["past_seg_control_gt_3_dim"] = new_past
         return
 
     # 일반 케이스: 앞쪽 move개 버리고, 뒤에 move개 붙이기
-    left = past_ctrl[:, :, move:, :]  # (B*R, 1+Pnn, past_len-move, 3)
-    right = unnorm_target_control_chunk[:, :, :move, :]  # (B*R, 1+Pnn, move, 3)
+    left = past_ctrl[:, :, move:, :]                    # (B*R, 1+Pnn, past_len-move, 3)
+    right = masked_control[:, :, :move, :]              # (B*R, 1+Pnn, move, 3)
     unnorm_inputs_b_r_copy["past_seg_control_gt_3_dim"] = torch.cat([left, right], dim=2)
+
 
 
 def _predict_rollouts_batched_one_chunk(

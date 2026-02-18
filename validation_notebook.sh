@@ -191,8 +191,8 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "wosac_final_0128" \
-  --name "wosac_final_0128" \
+  --load_name "38_control_only_new_network_1e-3" \
+  --name "38_control_only_new_network_1e-3" \
   --eval_method "validation" \
   --batch_size 1 \
   --pose_based False \
