@@ -2963,7 +2963,10 @@ def _predict_rollouts_batched_one_chunk(
 
                 # fallback: 구버전/예외 상황에서는 기존 score 사용
                 if not isinstance(target_future_control_seq, torch.Tensor):
-                    target_future_control_seq = decoder_output["score"]
+                    raise KeyError("Decoder 출력에 'control_sequence' 키가 없거나 텐서가 아닙니다. "
+                                   "rollout_time_chunk_size > 1이면서 pose_based=False인 경우, "
+                                      "모델이 'control_sequence'를 출력하도록 해야 합니다.")
+                    # target_future_control_seq = decoder_output["score"]
 
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약

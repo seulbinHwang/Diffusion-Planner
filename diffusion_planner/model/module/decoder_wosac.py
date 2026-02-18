@@ -2433,7 +2433,7 @@ class Decoder(nn.Module):
                     )
                     diffusion_steps = 16
                 else:  # 첫 스텝이 아닌 경우
-                    diffusion_steps = 2
+                    diffusion_steps = 1
                     assert self._x0_for_amortized_inference is not None, (
                         "When using amortized diffusion during inference, "
                         "if inference_noise is not provided, "

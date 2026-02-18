@@ -204,13 +204,14 @@ taskset -c "${CPUSET}" \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \
-  --save_image False \
-  --save_video False \
+  --save_image True \
+  --save_video True \
   --validate_scenario_rollouts False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --total_save_image_trial_num 200 \
   --rollout_number 1 \
-  --do_data_statistics False
+  --do_data_statistics False \
+  --use_amortized_diffusion False
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
