@@ -532,7 +532,7 @@ def get_args():
     parser.add_argument('--diffusion_model_type',
                         type=str,
                         help='type of diffusion model [x_start, score]',
-                        choices=['score', 'x_start'],
+                        choices=['score', 'x_start', "v"],
                         default='x_start')
 
     parser.add_argument('--use_wandb', default=True, type=boolean)

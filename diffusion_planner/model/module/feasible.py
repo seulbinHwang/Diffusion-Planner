@@ -1307,25 +1307,21 @@ class FeasibleProjector(nn.Module):
     # [NEW] 시간축 전체 배치로 S0/S1/S3 제약 적용 (S2는 미사용)
     # ----------------------------
     def _apply_constraints_batch(
-        self,
-        vx_b_raw: torch.Tensor,  # (B,Pnn,T)
-        vy_b_raw: torch.Tensor,  # (B,Pnn,T)
-        omega_raw: torch.Tensor,  # (B,Pnn,T)
-        key_to_limit_bp: Dict[str, torch.Tensor],
-        hp: _ConstraintHParams,
+            self,
+            vx_b_raw: torch.Tensor,  # (B,Pnn,T)
+            vy_b_raw: torch.Tensor,  # (B,Pnn,T)
+            omega_raw: torch.Tensor,  # (B,Pnn,T)
+            key_to_limit_bp: Dict[str, torch.Tensor],
+            hp: _ConstraintHParams,
+            target_current_control: Optional[torch.Tensor] = None,
+            # (B,Pnn,3) or None (unnorm)
+            target_current_control_valid: Optional[torch.Tensor] = None,
+            # (B,Pnn) or None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """시간축 전체 배치로 S0/S1/S2/S3 제약을 적용합니다.
-
-        호출 순서:
-            S0(β) -> S1(speed) -> S2(accel/alpha) -> S3(omega)
-
-        Returns:
-            vx_after, vy_after, omega_after: 모두 (B,Pnn,T)
-        """
+        """시간축 전체 배치로 S0/S1/S2/S3 제약을 적용합니다."""
         if not self.use_feasible_filter:
             return vx_b_raw, vy_b_raw, omega_raw
 
-        # (S0) 사이드슬립 각(β) 상한 → v_y^b만 줄이기
         vx_after, vy_after = self._apply_S0_sideslip_angle_limit_ste(
             vx_b=vx_b_raw,
             vy_b=vy_b_raw,
@@ -1335,7 +1331,6 @@ class FeasibleProjector(nn.Module):
             is_nonholonomic=key_to_limit_bp["is_nonholonomic"],
         )
 
-        # (S1) 속도 크기 제한
         vx_after, vy_after = self._apply_S1_speed_limit_ste(
             vx_b=vx_after,
             vy_b=vy_after,
@@ -1344,19 +1339,19 @@ class FeasibleProjector(nn.Module):
             eps=hp.eps,
         )
 
-        # (S2) 가속도/각가속도 증분 제한 (시간축 전체 배치, for-loop 없음)
         vx_after, vy_after, omega_after = self._apply_S2_accel_alpha_limits_ste_batch(
-            vx_b=vx_after,  # (B,Pnn,T)
-            vy_b=vy_after,  # (B,Pnn,T)
-            omega=omega_raw,  # (B,Pnn,T)
-            a_max=key_to_limit_bp["a_max"],  # (B,Pnn)
-            alpha_max=key_to_limit_bp["alpha_max"],  # (B,Pnn)
+            vx_b=vx_after,
+            vy_b=vy_after,
+            omega=omega_raw,
+            a_max=key_to_limit_bp["a_max"],
+            alpha_max=key_to_limit_bp["alpha_max"],
             dt=float(hp.dt),
             eta=float(hp.eta_inc),
             eps=float(hp.eps),
+            target_current_control=target_current_control,
+            target_current_control_valid=target_current_control_valid,
         )
 
-        # (S3) 속도-연동 omega 한계로 clip
         omega_after = self._apply_S3_omega_clip_ste(
             vx_b=vx_after,
             vy_b=vy_after,
@@ -1370,6 +1365,8 @@ class FeasibleProjector(nn.Module):
         )
 
         return vx_after, vy_after, omega_after
+
+
 
     # ----------------------------
     # [NEW] 시간축 전체 배치 중점 적분 (cumsum 기반)
@@ -3121,112 +3118,163 @@ class FeasibleProjector(nn.Module):
         return vx_b_new, vy_b_new, w_new
 
     def _apply_S2_accel_alpha_limits_ste_batch(
-        self,
-        vx_b: torch.Tensor,  # (B, Pnn, T)
-        vy_b: torch.Tensor,  # (B, Pnn, T)
-        omega: torch.Tensor,  # (B, Pnn, T)
-        a_max: torch.Tensor,  # (B, Pnn)
-        alpha_max: torch.Tensor,  # (B, Pnn)
-        dt: float,
-        eta: float,
-        eps: float,
+            self,
+            vx_b: torch.Tensor,  # (B,Pnn,T)
+            vy_b: torch.Tensor,  # (B,Pnn,T)
+            omega: torch.Tensor,  # (B,Pnn,T)
+            a_max: torch.Tensor,  # (B,Pnn)
+            alpha_max: torch.Tensor,  # (B,Pnn)
+            dt: float,
+            eta: float,
+            eps: float,
+            target_current_control: Optional[torch.Tensor] = None,
+            # (B,Pnn,3) or None
+            target_current_control_valid: Optional[torch.Tensor] = None,
+            # (B,Pnn) or None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(S2) 가속도/각가속도 증분 제약을 시간축 전체 배치 연산으로 적용합니다.
+        """(S2) 증분 제한을 적용합니다.
 
-        목표(이산 형태):
-            k>=1 에 대해
-              || [vx_k - vx_{k-1}, vy_k - vy_{k-1}] || <= a_max * dt
-              |  omega_k - omega_{k-1} | <= alpha_max * dt
-
-        구현 방식(시간축 for-loop 없음):
-            1) dv, dw를 diff로 한 번에 계산 (T-1 길이)
-            2) dv는 2D 노름 기준, dw는 스칼라 기준으로 STE-hard clip
-            3) cumsum으로 다시 vx/vy/omega 시퀀스를 복원
-               - 첫 시점(k=0)은 그대로 유지합니다(기존 sequential에서 k=0에 S2를 안 거는 것과 동일한 의도).
-
-        Args:
-            vx_b: (B, Pnn, T)
-            vy_b: (B, Pnn, T)
-            omega: (B, Pnn, T)
-            a_max: (B, Pnn)  종/횡을 묶은 “속도 변화량” 상한에 쓰는 값 (m/s^2)
-            alpha_max: (B, Pnn)  요각속도 변화 상한에 쓰는 값 (rad/s^2)
-            dt: float  샘플 간 시간 간격(초)
-            eta: float  STE 밴드 폭
-            eps: float  수치 안정용
-
-        Returns:
-            (vx_out, vy_out, omega_out):
-                모두 (B, Pnn, T)
+        - target_current_control이 없으면: 기존처럼 k>=1만 제한
+        - 있으면:
+          - valid=True인 행만 k=0부터 제한
+          - valid=False인 행은 기존처럼 k>=1만 제한
         """
         if vx_b.dim() != 3 or vy_b.dim() != 3 or omega.dim() != 3:
-            raise ValueError(
-                "[_apply_S2_accel_alpha_limits_ste_batch] 입력은 (B,Pnn,T) 3D 텐서여야 합니다."
-            )
+            raise ValueError("vx_b/vy_b/omega는 (B,Pnn,T) 3D여야 합니다.")
         if vx_b.shape != vy_b.shape or vx_b.shape != omega.shape:
-            raise ValueError(
-                "[_apply_S2_accel_alpha_limits_ste_batch] vx/vy/omega shape이 서로 다릅니다. "
-                f"vx={tuple(vx_b.shape)}, vy={tuple(vy_b.shape)}, omega={tuple(omega.shape)}"
-            )
+            raise ValueError("vx/vy/omega shape이 서로 다릅니다.")
 
         B, Pnn, T = vx_b.shape
-        if T <= 1:
+        if T <= 0:
             return vx_b, vy_b, omega
 
-        # ------------------------
-        # 1) 선형 속도 증분 dv: (B,Pnn,T-1,2)
-        # ------------------------
-        dvx = vx_b[..., 1:] - vx_b[..., :-1]  # (B,Pnn,T-1)
-        dvy = vy_b[..., 1:] - vy_b[..., :-1]  # (B,Pnn,T-1)
-        dv = torch.stack([dvx, dvy], dim=-1)  # (B,Pnn,T-1,2)
+        # (기존 방식) target_current_control이 없으면 그대로
+        if target_current_control is None:
+            if T <= 1:
+                return vx_b, vy_b, omega
 
-        dv_limit = (a_max.to(dtype=vx_b.dtype, device=vx_b.device) * float(dt)
-                   )  # (B,Pnn)
-        dv_limit_bpt = dv_limit.unsqueeze(-1).expand(B, Pnn,
-                                                     T - 1)  # (B,Pnn,T-1)
+            dv_limit = (a_max.to(dtype=vx_b.dtype, device=vx_b.device) * float(
+                dt))
+            dw_limit = (alpha_max.to(dtype=omega.dtype,
+                                     device=omega.device) * float(dt))
 
-        dv_ste = self._ste_increment_vec_nd(
-            dv=dv,  # (B,Pnn,T-1,2)
-            limit=dv_limit_bpt,  # (B,Pnn,T-1)
-            eta=eta,
-            eps=eps,
-        )  # (B,Pnn,T-1,2)
+            dvx = vx_b[..., 1:] - vx_b[..., :-1]
+            dvy = vy_b[..., 1:] - vy_b[..., :-1]
+            dv = torch.stack([dvx, dvy], dim=-1)  # (B,Pnn,T-1,2)
 
-        # cumsum으로 복원
-        dv_prefix = torch.cumsum(dv_ste, dim=2)  # (B,Pnn,T-1,2)
+            dv_limit_bpt = dv_limit.unsqueeze(-1).expand(B, Pnn, T - 1)
+            dv_ste = self._ste_increment_vec_nd(dv=dv, limit=dv_limit_bpt,
+                                                eta=eta, eps=eps)
+            dv_prefix = torch.cumsum(dv_ste, dim=2)
 
-        vx0 = vx_b[..., :1]  # (B,Pnn,1)
-        vy0 = vy_b[..., :1]  # (B,Pnn,1)
+            vx0 = vx_b[..., :1]
+            vy0 = vy_b[..., :1]
+            vx_tail = vx0 + dv_prefix[..., 0]
+            vy_tail = vy0 + dv_prefix[..., 1]
+            vx_out = torch.cat([vx0, vx_tail], dim=2)
+            vy_out = torch.cat([vy0, vy_tail], dim=2)
 
-        vx_tail = vx0 + dv_prefix[..., 0]  # (B,Pnn,T-1)
-        vy_tail = vy0 + dv_prefix[..., 1]  # (B,Pnn,T-1)
+            dw = omega[..., 1:] - omega[..., :-1]
+            dw_limit_bpt = dw_limit.unsqueeze(-1).expand(B, Pnn, T - 1)
+            dw_ste = self._ste_scalar_clip(x=dw, limit=dw_limit_bpt, eta=eta,
+                                           eps=eps)
+            dw_prefix = torch.cumsum(dw_ste, dim=2)
 
-        vx_out = torch.cat([vx0, vx_tail], dim=2)  # (B,Pnn,T)
-        vy_out = torch.cat([vy0, vy_tail], dim=2)  # (B,Pnn,T)
+            w0 = omega[..., :1]
+            w_tail = w0 + dw_prefix
+            omega_out = torch.cat([w0, w_tail], dim=2)
 
-        # ------------------------
-        # 2) 요각속도 증분 dw: (B,Pnn,T-1)
-        # ------------------------
-        dw = omega[..., 1:] - omega[..., :-1]  # (B,Pnn,T-1)
+            return vx_out, vy_out, omega_out
 
-        dw_limit = (alpha_max.to(dtype=omega.dtype, device=omega.device) *
-                    float(dt))  # (B,Pnn)
-        dw_limit_bpt = dw_limit.unsqueeze(-1).expand(B, Pnn,
-                                                     T - 1)  # (B,Pnn,T-1)
+        # 여기부터: target_current_control이 있는 경우
+        if target_current_control.dim() != 3 or int(
+                target_current_control.shape[-1]) != 3:
+            raise ValueError("target_current_control은 (B,Pnn,3) 이어야 합니다.")
+        if tuple(target_current_control.shape[:2]) != (int(B), int(Pnn)):
+            raise ValueError("target_current_control의 (B,Pnn)이 입력과 다릅니다.")
 
-        dw_ste = self._ste_scalar_clip(
-            x=dw,  # (B,Pnn,T-1)
-            limit=dw_limit_bpt,  # (B,Pnn,T-1)
-            eta=eta,
-            eps=eps,
-        )  # (B,Pnn,T-1)
+        use_prev_bp: torch.Tensor
+        if target_current_control_valid is None:
+            use_prev_bp = torch.ones((int(B), int(Pnn)), device=vx_b.device,
+                                     dtype=torch.bool)
+        else:
+            if target_current_control_valid.dim() != 2:
+                raise ValueError(
+                    "target_current_control_valid는 (B,Pnn) 2D여야 합니다.")
+            if tuple(target_current_control_valid.shape) != (int(B), int(Pnn)):
+                raise ValueError(
+                    "target_current_control_valid shape이 (B,Pnn)과 다릅니다.")
+            use_prev_bp = self._to_bool_mask(target_current_control_valid).to(
+                device=vx_b.device)
 
-        dw_prefix = torch.cumsum(dw_ste, dim=2)  # (B,Pnn,T-1)
+        # 전부 False면: 기존 방식과 동일하게 처리
+        if not bool(use_prev_bp.any().item()):
+            return self._apply_S2_accel_alpha_limits_ste_batch(
+                vx_b=vx_b, vy_b=vy_b, omega=omega,
+                a_max=a_max, alpha_max=alpha_max,
+                dt=dt, eta=eta, eps=eps,
+                target_current_control=None,
+                target_current_control_valid=None,
+            )
 
-        w0 = omega[..., :1]  # (B,Pnn,1)
-        w_tail = w0 + dw_prefix  # (B,Pnn,T-1)
-        omega_out = torch.cat([w0, w_tail], dim=2)  # (B,Pnn,T)
+        # 혼합(부분 True/False)이면:
+        # - old: k>=1만
+        vx_old, vy_old, w_old = self._apply_S2_accel_alpha_limits_ste_batch(
+            vx_b=vx_b, vy_b=vy_b, omega=omega,
+            a_max=a_max, alpha_max=alpha_max,
+            dt=dt, eta=eta, eps=eps,
+            target_current_control=None,
+            target_current_control_valid=None,
+        )
 
-        return vx_out, vy_out, omega_out
+        # - new: k=0부터 (단, invalid 행은 tc를 0으로 눌러 안정화)
+        tc = target_current_control.to(device=vx_b.device,
+                                       dtype=vx_b.dtype)  # (B,Pnn,3)
+        tc = tc.masked_fill(~use_prev_bp.unsqueeze(-1), 0.0)
+
+        dv_limit = (a_max.to(dtype=vx_b.dtype, device=vx_b.device) * float(dt))
+        dw_limit = (alpha_max.to(dtype=omega.dtype,
+                                 device=omega.device) * float(dt))
+
+        vx_prev0 = tc[..., 0]
+        vy_prev0 = tc[..., 1]
+        w_prev0 = tc[..., 2]
+
+        dvx0 = vx_b[..., :1] - vx_prev0.unsqueeze(-1)
+        dvy0 = vy_b[..., :1] - vy_prev0.unsqueeze(-1)
+        dvx_rest = vx_b[..., 1:] - vx_b[..., :-1]
+        dvy_rest = vy_b[..., 1:] - vy_b[..., :-1]
+
+        dvx = torch.cat([dvx0, dvx_rest], dim=2)
+        dvy = torch.cat([dvy0, dvy_rest], dim=2)
+        dv = torch.stack([dvx, dvy], dim=-1)  # (B,Pnn,T,2)
+
+        dv_limit_bpt = dv_limit.unsqueeze(-1).expand(B, Pnn, T)
+        dv_ste = self._ste_increment_vec_nd(dv=dv, limit=dv_limit_bpt, eta=eta,
+                                            eps=eps)
+        dv_prefix = torch.cumsum(dv_ste, dim=2)
+
+        vx_new = vx_prev0.unsqueeze(-1) + dv_prefix[..., 0]
+        vy_new = vy_prev0.unsqueeze(-1) + dv_prefix[..., 1]
+
+        dw0 = omega[..., :1] - w_prev0.unsqueeze(-1)
+        dw_rest = omega[..., 1:] - omega[..., :-1]
+        dw = torch.cat([dw0, dw_rest], dim=2)
+
+        dw_limit_bpt = dw_limit.unsqueeze(-1).expand(B, Pnn, T)
+        dw_ste = self._ste_scalar_clip(x=dw, limit=dw_limit_bpt, eta=eta,
+                                       eps=eps)
+        dw_prefix = torch.cumsum(dw_ste, dim=2)
+        w_new = w_prev0.unsqueeze(-1) + dw_prefix
+
+        # 행 단위로 선택: valid 행은 new, invalid 행은 old
+        m = use_prev_bp.unsqueeze(-1)  # (B,Pnn,1)
+        vx_out = torch.where(m, vx_new, vx_old)
+        vy_out = torch.where(m, vy_new, vy_old)
+        w_out = torch.where(m, w_new, w_old)
+
+        return vx_out, vy_out, w_out
+
 
     # [추가 요망] (S3: 속도-연동 각속도 한계 — w clip, no slip angle)
     def _apply_S3_omega_clip_ste(
@@ -3522,19 +3570,20 @@ class FeasibleProjector(nn.Module):
     def _filter_and_integrate_sequential(
             self,
             unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
-            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
-            unnorm_cur_future_seg_body_control: torch.Tensor,
-            # (B, Pnn, future_len, 3)
-            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T)
+            unnorm_cur_future_seg_body_control: torch.Tensor,  # (B,Pnn,T,3)
+            near_class_one_hot: torch.Tensor,  # (B,Pnn,3)
             filter_active_idx: Optional[torch.Tensor] = None,
-            # (B_filter,) or None
+            target_current_control: Optional[torch.Tensor] = None,
+            # (B,Pnn,3) or None (unnorm)
+            target_current_control_valid: Optional[torch.Tensor] = None,
+            # (B,Pnn) or (B,Pnn==1) or None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """sequential 적분 + (선택적) 제약 필터 적용.
 
-        Returns:
-            unnorm_integrated_trajectory: (B,Pnn,T,4)
-            unnorm_control_constraint_diff: (B,Pnn,T,3)
-            unnorm_control_sequence: (B,Pnn,T,3)  # 필터 적용 후 최종 control (무효 구간은 0)
+        k=0 처리 규칙
+        - prev_valid=True인 행: k=0에서도 S2를 적용
+        - prev_valid=False인 행: k=0에서는 S2를 적용하지 않음(기존 동작)
         """
         B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
         device = unnorm_cur_future_seg_body_control.device
@@ -3553,115 +3602,144 @@ class FeasibleProjector(nn.Module):
         apply_filter_any: bool = True if (filter_active_idx is None) else (
                     int(filter_active_idx.numel()) > 0)
 
-        key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
-            near_class_one_hot, device=device, dtype=dtype
-        )
-
+        key_to_limit_bp = self._build_per_agent_limits(near_class_one_hot,
+                                                       device=device,
+                                                       dtype=dtype)
         vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
-            unnorm_cur_future_seg_body_control
-        )  # (B,Pnn,T) 각각
+            unnorm_cur_future_seg_body_control)
 
         x_k = unnorm_near_current_state[..., 0]
         y_k = unnorm_near_current_state[..., 1]
         cos_yaw_k = unnorm_near_current_state[..., 2]
         sin_yaw_k = unnorm_near_current_state[..., 3]
 
-        vx_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
-        vy_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
-        omega_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+        # prev 사용 마스크 (B,Pnn)
+        if target_current_control is None:
+            use_prev_bp = torch.zeros((int(B), int(Pnn)), device=device,
+                                      dtype=torch.bool)
+            vx_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+            vy_b_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+            omega_prev = torch.zeros((B, Pnn), device=device, dtype=dtype)
+        else:
+            if target_current_control.dim() != 3 or int(
+                    target_current_control.shape[-1]) != 3:
+                raise ValueError("target_current_control은 (B,Pnn,3)이어야 합니다.")
+            if target_current_control_valid is None:
+                use_prev_bp = torch.ones((int(B), int(Pnn)), device=device,
+                                         dtype=torch.bool)
+            else:
+                if target_current_control_valid.dim() != 2:
+                    raise ValueError(
+                        "target_current_control_valid는 (B,Pnn) 2D여야 합니다.")
+                use_prev_bp = self._to_bool_mask(
+                    target_current_control_valid).to(device=device)
 
-        x_list: List[torch.Tensor] = []
-        y_list: List[torch.Tensor] = []
-        cos_list: List[torch.Tensor] = []
-        sin_list: List[torch.Tensor] = []
-        vx_list: List[torch.Tensor] = []
-        vy_list: List[torch.Tensor] = []
-        omega_list: List[torch.Tensor] = []
+            tc = target_current_control.to(device=device,
+                                           dtype=dtype)  # (B,Pnn,3)
+            tc = tc.masked_fill(~use_prev_bp.unsqueeze(-1), 0.0)
+
+            vx_b_prev = tc[..., 0]
+            vy_b_prev = tc[..., 1]
+            omega_prev = tc[..., 2]
+
+        x_list, y_list, cos_list, sin_list = [], [], [], []
+        vx_list, vy_list, omega_list = [], [], []
 
         for k in range(future_len):
-            apply_S2_k = (k > 0)
-            apply_S4_ax_k = (k > 0)
-
-            vx_b_k_raw = vx_b_raw[..., k]  # (B,Pnn)
-            vy_b_k_raw = vy_b_raw[..., k]  # (B,Pnn)
-            yaw_rate_k_raw = omega_raw[..., k]  # (B,Pnn)
+            vx_b_k_raw = vx_b_raw[..., k]
+            vy_b_k_raw = vy_b_raw[..., k]
+            w_k_raw = omega_raw[..., k]
 
             vx_b_k = vx_b_k_raw
             vy_b_k = vy_b_k_raw
-            yaw_rate_k = yaw_rate_k_raw
+            w_k = w_k_raw
 
             if self.use_feasible_filter and apply_filter_any:
-                vx_f, vy_f, w_f = self._apply_constraints_step(
-                    vx_b_prev=vx_b_prev,
-                    vy_b_prev=vy_b_prev,
-                    omega_prev=omega_prev,
-                    vx_b_k=vx_b_k_raw,
-                    vy_b_k=vy_b_k_raw,
-                    omega_k=yaw_rate_k_raw,
-                    hp=self.constraints_h_params,
-                    key_to_limit_bp=key_to_limit_bp,
-                    apply_S2=apply_S2_k,
-                    apply_S4_ax=apply_S4_ax_k,
-                )
+                if k == 0:
+                    # k=0: S2 적용/미적용을 둘 다 계산하고, prev_valid로 선택
+                    vx_s2, vy_s2, w_s2 = self._apply_constraints_step(
+                        vx_b_prev=vx_b_prev, vy_b_prev=vy_b_prev,
+                        omega_prev=omega_prev,
+                        vx_b_k=vx_b_k_raw, vy_b_k=vy_b_k_raw, omega_k=w_k_raw,
+                        hp=self.constraints_h_params,
+                        key_to_limit_bp=key_to_limit_bp,
+                        apply_S2=True,
+                        apply_S4_ax=False,
+                    )
+                    vx_n, vy_n, w_n = self._apply_constraints_step(
+                        vx_b_prev=vx_b_prev, vy_b_prev=vy_b_prev,
+                        omega_prev=omega_prev,
+                        vx_b_k=vx_b_k_raw, vy_b_k=vy_b_k_raw, omega_k=w_k_raw,
+                        hp=self.constraints_h_params,
+                        key_to_limit_bp=key_to_limit_bp,
+                        apply_S2=False,
+                        apply_S4_ax=False,
+                    )
+
+                    vx_f = torch.where(use_prev_bp, vx_s2, vx_n)
+                    vy_f = torch.where(use_prev_bp, vy_s2, vy_n)
+                    w_f = torch.where(use_prev_bp, w_s2, w_n)
+                else:
+                    vx_f, vy_f, w_f = self._apply_constraints_step(
+                        vx_b_prev=vx_b_prev, vy_b_prev=vy_b_prev,
+                        omega_prev=omega_prev,
+                        vx_b_k=vx_b_k_raw, vy_b_k=vy_b_k_raw, omega_k=w_k_raw,
+                        hp=self.constraints_h_params,
+                        key_to_limit_bp=key_to_limit_bp,
+                        apply_S2=True,
+                        apply_S4_ax=True,
+                    )
 
                 vx_b_k = torch.where(apply_filter_mask_bp, vx_f, vx_b_k_raw)
                 vy_b_k = torch.where(apply_filter_mask_bp, vy_f, vy_b_k_raw)
-                yaw_rate_k = torch.where(apply_filter_mask_bp, w_f,
-                                         yaw_rate_k_raw)
+                w_k = torch.where(apply_filter_mask_bp, w_f, w_k_raw)
 
             x_k1, y_k1, cos_k1, sin_k1 = self._integrate_midpoint_step(
-                x_k=x_k,
-                y_k=y_k,
-                cos_yaw_k=cos_yaw_k,
-                sin_yaw_k=sin_yaw_k,
-                vx_b_k=vx_b_k,
-                vy_b_k=vy_b_k,
-                omega_k=yaw_rate_k,
+                x_k=x_k, y_k=y_k, cos_yaw_k=cos_yaw_k, sin_yaw_k=sin_yaw_k,
+                vx_b_k=vx_b_k, vy_b_k=vy_b_k, omega_k=w_k,
                 hp=self.constraints_h_params,
             )
 
-            x_list.append(x_k1)
+            x_list.append(x_k1);
             y_list.append(y_k1)
-            cos_list.append(cos_k1)
+            cos_list.append(cos_k1);
             sin_list.append(sin_k1)
-            vx_list.append(vx_b_k)
-            vy_list.append(vy_b_k)
-            omega_list.append(yaw_rate_k)
+            vx_list.append(vx_b_k);
+            vy_list.append(vy_b_k);
+            omega_list.append(w_k)
 
             x_k, y_k, cos_yaw_k, sin_yaw_k = x_k1, y_k1, cos_k1, sin_k1
-            vx_b_prev, vy_b_prev, omega_prev = vx_b_k, vy_b_k, yaw_rate_k
+            vx_b_prev, vy_b_prev, omega_prev = vx_b_k, vy_b_k, w_k
 
-        key_to_all_states: Dict[str, torch.Tensor] = {
-            "x_next": torch.stack(x_list, dim=2),  # (B,Pnn,T)
-            "y_next": torch.stack(y_list, dim=2),  # (B,Pnn,T)
-            "cos_next": torch.stack(cos_list, dim=2),  # (B,Pnn,T)
-            "sin_next": torch.stack(sin_list, dim=2),  # (B,Pnn,T)
-            "vx_after": torch.stack(vx_list, dim=2),  # (B,Pnn,T)
-            "vy_after": torch.stack(vy_list, dim=2),  # (B,Pnn,T)
-            "omega_after": torch.stack(omega_list, dim=2),  # (B,Pnn,T)
+        key_to_all_states = {
+            "x_next": torch.stack(x_list, dim=2),
+            "y_next": torch.stack(y_list, dim=2),
+            "cos_next": torch.stack(cos_list, dim=2),
+            "sin_next": torch.stack(sin_list, dim=2),
+            "vx_after": torch.stack(vx_list, dim=2),
+            "vy_after": torch.stack(vy_list, dim=2),
+            "omega_after": torch.stack(omega_list, dim=2),
         }
 
-        # unnorm_control_sequence: (B,Pnn,T,3)  (무효 구간은 0)
         unnorm_control_sequence = torch.stack(
             [key_to_all_states["vx_after"], key_to_all_states["vy_after"],
              key_to_all_states["omega_after"]],
             dim=-1,
         )  # (B,Pnn,T,3)
 
-        mask_node = near_cur_future_valid.to(torch.bool)  # (B,Pnn,1+T)
-        mask_interval = mask_node[..., :-1] & mask_node[..., 1:]  # (B,Pnn,T)
+        mask_node = near_cur_future_valid.to(torch.bool)
+        mask_interval = mask_node[..., :-1] & mask_node[..., 1:]
         unnorm_control_sequence = unnorm_control_sequence.masked_fill(
             ~mask_interval.unsqueeze(-1), 0.0)
 
         unnorm_integrated_trajectory, unnorm_control_constraint_diff = self._assemble_outputs(
             key_to_all_states=key_to_all_states,
-            vx_b_raw=vx_b_raw,
-            vy_b_raw=vy_b_raw,
-            omega_raw=omega_raw,
+            vx_b_raw=vx_b_raw, vy_b_raw=vy_b_raw, omega_raw=omega_raw,
             near_cur_future_valid=near_cur_future_valid,
         )
 
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff, unnorm_control_sequence
+
 
     def _compute_active_indices_from_near_cur_future_valid(
             self,
@@ -3689,6 +3767,42 @@ class FeasibleProjector(nn.Module):
         active_indices = active_mask_flat.nonzero(as_tuple=False).squeeze(
             -1)  # (N_active,)
         return active_indices, active_mask_flat
+
+    def _gather_active_target_current_control_for_filter_and_integrate(
+        self,
+        target_current_control: torch.Tensor,  # (B, Pnn, 3)
+        active_indices: torch.Tensor,  # (N_active,)
+    ) -> torch.Tensor:
+        """active 슬롯만 모아 (N_active, 1, 3) 형태로 압축합니다.
+
+        Args:
+            target_current_control (torch.Tensor):
+                shape: (B, Pnn, 3)
+                현재 시점 제어. [v_x^b, v_y^b, w]
+            active_indices (torch.Tensor):
+                shape: (N_active,)
+                (B*Pnn)으로 펼쳤을 때의 active row 인덱스.
+
+        Returns:
+            torch.Tensor:
+                shape: (N_active, 1, 3)
+                active 슬롯에 해당하는 현재 시점 제어만 모은 텐서.
+        """
+        if target_current_control.dim() != 3 or int(target_current_control.shape[-1]) != 3:
+            raise ValueError(
+                "[_gather_active_target_current_control_for_filter_and_integrate] "
+                "target_current_control은 (B,Pnn,3) 이어야 합니다. "
+                f"got shape={tuple(target_current_control.shape)}"
+            )
+
+        B, Pnn, _ = target_current_control.shape
+        B_Pnn = int(B * Pnn)
+
+        ctrl_flat = target_current_control.reshape(B_Pnn, 3)  # (B*Pnn, 3)
+        idx = active_indices.to(device=ctrl_flat.device, dtype=torch.long)  # (N_active,)
+        ctrl_active = ctrl_flat.index_select(0, idx).unsqueeze(1)  # (N_active, 1, 3)
+        return ctrl_active
+
 
     def _gather_active_subset_for_filter_and_integrate(
         self,
@@ -4018,6 +4132,38 @@ class FeasibleProjector(nn.Module):
                                       3)  # (B,Pnn,T,3)
         return out_ctrl
 
+    def _gather_active_target_current_control_valid_for_filter_and_integrate(
+        self,
+        target_current_control_valid: torch.Tensor,  # (B,Pnn) bool/0-1
+        active_indices: torch.Tensor,  # (N_active,)
+    ) -> torch.Tensor:
+        """active 슬롯에 해당하는 prev_valid만 모읍니다.
+
+        Args:
+            target_current_control_valid (torch.Tensor):
+                마지막 과거 구간이 유효하면 True.
+                shape: (B, Pnn)
+            active_indices (torch.Tensor):
+                (B*Pnn)으로 펼쳤을 때의 active row 인덱스.
+                shape: (N_active,)
+
+        Returns:
+            torch.Tensor:
+                active 슬롯만 모은 prev_valid.
+                shape: (N_active, 1)  (Pnn을 1로 압축했기 때문)
+        """
+        if target_current_control_valid.dim() != 2:
+            raise ValueError(
+                "target_current_control_valid는 (B,Pnn) 2D여야 합니다. "
+                f"got {tuple(target_current_control_valid.shape)}"
+            )
+        mask_bool = self._to_bool_mask(target_current_control_valid)  # (B,Pnn) bool
+
+        B, Pnn = mask_bool.shape
+        mask_flat = mask_bool.reshape(int(B * Pnn))  # (B*Pnn,)
+        idx = active_indices.to(device=mask_flat.device, dtype=torch.long)
+        return mask_flat.index_select(0, idx).unsqueeze(1)  # (N_active,1)
+
     def filter_and_integrate(
             self,
             unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
@@ -4025,13 +4171,25 @@ class FeasibleProjector(nn.Module):
             unnorm_cur_future_seg_body_control: torch.Tensor,  # (B, Pnn, T, 3)
             near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
             filter_active_idx: Optional[torch.Tensor] = None,  # (B_filter,)
+            target_current_control: Optional[torch.Tensor] = None,
+            # (B, Pnn, 3) or None (unnorm)
+            target_current_control_valid: Optional[torch.Tensor] = None,
+            # (B, Pnn) or None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Filter + Integrate 래퍼.
+
+        Args:
+            target_current_control:
+                k=0에서 쓸 "이전 구간 control" (unnorm).
+                shape: (B,Pnn,3)
+            target_current_control_valid:
+                마지막 과거 구간이 유효하면 True.
+                shape: (B,Pnn)
 
         Returns:
             unnorm_integrated_trajectory: (B,Pnn,T,4)
             unnorm_control_constraint_diff: (B,Pnn,T,3)
-            unnorm_control_sequence: (B,Pnn,T,3)  # 필터 적용 후 최종 control (무효 구간은 0)
+            unnorm_control_sequence: (B,Pnn,T,3)
         """
         self._assert_cur_future_valid_mask(near_cur_future_valid,
                                            context="filter_and_integrate")
@@ -4040,8 +4198,37 @@ class FeasibleProjector(nn.Module):
         device = unnorm_cur_future_seg_body_control.device
         dtype = unnorm_cur_future_seg_body_control.dtype
 
+        if target_current_control_valid is not None and target_current_control is None:
+            raise ValueError(
+                "target_current_control_valid가 주어졌으면 target_current_control도 함께 주어져야 합니다.")
+
+        if target_current_control is not None:
+            if target_current_control.dim() != 3 or int(
+                    target_current_control.shape[-1]) != 3:
+                raise ValueError(
+                    "[filter_and_integrate] target_current_control은 (B,Pnn,3) 이어야 합니다. "
+                    f"got {tuple(target_current_control.shape)}"
+                )
+            if tuple(target_current_control.shape[:2]) != (int(B), int(Pnn)):
+                raise ValueError(
+                    "[filter_and_integrate] target_current_control의 (B,Pnn) 이 입력과 다릅니다. "
+                    f"expected ({int(B)},{int(Pnn)}), got {tuple(target_current_control.shape[:2])}"
+                )
+
+        if target_current_control_valid is not None:
+            if target_current_control_valid.dim() != 2:
+                raise ValueError(
+                    "[filter_and_integrate] target_current_control_valid는 (B,Pnn) 2D여야 합니다. "
+                    f"got {tuple(target_current_control_valid.shape)}"
+                )
+            if tuple(target_current_control_valid.shape) != (int(B), int(Pnn)):
+                raise ValueError(
+                    "[filter_and_integrate] target_current_control_valid shape이 (B,Pnn)과 다릅니다. "
+                    f"expected ({int(B)},{int(Pnn)}), got {tuple(target_current_control_valid.shape)}"
+                )
+
         active_indices, active_mask_flat = self._compute_active_indices_from_near_cur_future_valid(
-            near_cur_future_valid=near_cur_future_valid,  # (B,Pnn,1+T)
+            near_cur_future_valid=near_cur_future_valid,
         )
 
         filter_active_idx_active = self._convert_filter_active_idx_to_active_subset_indices(
@@ -4050,22 +4237,18 @@ class FeasibleProjector(nn.Module):
             active_mask_flat=active_mask_flat,
             B=int(B),
             Pnn=int(Pnn),
-        )  # (N_filter_active,) or None
+        )
 
         if int(active_indices.numel()) == 0:
-            unnorm_integrated_trajectory = unnorm_cur_future_seg_body_control.new_zeros(
-                (B, Pnn, T, 4))
-            unnorm_control_constraint_diff = unnorm_cur_future_seg_body_control.new_zeros(
-                (B, Pnn, T, 3))
-            unnorm_control_sequence = unnorm_cur_future_seg_body_control.new_zeros(
-                (B, Pnn, T, 3))
-            return unnorm_integrated_trajectory, unnorm_control_constraint_diff, unnorm_control_sequence
+            z4 = unnorm_cur_future_seg_body_control.new_zeros((B, Pnn, T, 4))
+            z3 = unnorm_cur_future_seg_body_control.new_zeros((B, Pnn, T, 3))
+            return z4, z3, z3
 
         (
-            unnorm_near_current_state_active,  # (N_active, 1, 4)
-            near_cur_future_valid_active,  # (N_active, 1, 1+T)
-            unnorm_cur_future_seg_body_control_active,  # (N_active, 1, T, 3)
-            near_class_one_hot_active,  # (N_active, 1, 3)
+            unnorm_near_current_state_active,  # (N_active,1,4)
+            near_cur_future_valid_active,  # (N_active,1,1+T)
+            unnorm_cur_future_seg_body_control_active,  # (N_active,1,T,3)
+            near_class_one_hot_active,  # (N_active,1,3)
         ) = self._gather_active_subset_for_filter_and_integrate(
             unnorm_near_current_state=unnorm_near_current_state,
             near_cur_future_valid=near_cur_future_valid,
@@ -4074,6 +4257,30 @@ class FeasibleProjector(nn.Module):
             active_indices=active_indices,
         )
 
+        target_current_control_active: Optional[torch.Tensor] = None
+        target_current_control_valid_active: Optional[torch.Tensor] = None
+
+        if target_current_control is not None:
+            target_current_control_active = self._gather_active_target_current_control_for_filter_and_integrate(
+                target_current_control=target_current_control.to(device=device,
+                                                                 dtype=dtype),
+                active_indices=active_indices,
+            )  # (N_active,1,3)
+
+            if target_current_control_valid is None:
+                # valid 마스크를 안 주면 "전부 유효"로 취급
+                target_current_control_valid_active = torch.ones(
+                    (int(active_indices.numel()), 1),
+                    device=device,
+                    dtype=torch.bool,
+                )
+            else:
+                target_current_control_valid_active = self._gather_active_target_current_control_valid_for_filter_and_integrate(
+                    target_current_control_valid=target_current_control_valid.to(
+                        device=device),
+                    active_indices=active_indices,
+                )  # (N_active,1)
+
         if not self.use_batch_integration:
             traj_active, diff_active, ctrl_active = self._filter_and_integrate_sequential(
                 unnorm_near_current_state=unnorm_near_current_state_active,
@@ -4081,6 +4288,8 @@ class FeasibleProjector(nn.Module):
                 unnorm_cur_future_seg_body_control=unnorm_cur_future_seg_body_control_active,
                 near_class_one_hot=near_class_one_hot_active,
                 filter_active_idx=filter_active_idx_active,
+                target_current_control=target_current_control_active,
+                target_current_control_valid=target_current_control_valid_active,
             )
         else:
             traj_active, diff_active, ctrl_active = self._filter_and_integrate_batch(
@@ -4089,13 +4298,13 @@ class FeasibleProjector(nn.Module):
                 unnorm_cur_future_seg_body_control=unnorm_cur_future_seg_body_control_active,
                 near_class_one_hot=near_class_one_hot_active,
                 filter_active_idx=filter_active_idx_active,
+                target_current_control=target_current_control_active,
+                target_current_control_valid=target_current_control_valid_active,
             )
 
         unnorm_integrated_trajectory, unnorm_control_constraint_diff = self._scatter_active_subset_for_filter_and_integrate(
             unnorm_integrated_trajectory_active=traj_active,
-            # (N_active, 1, T, 4)
             unnorm_control_constraint_diff_active=diff_active,
-            # (N_active, 1, T, 3)
             active_indices=active_indices,
             B=int(B),
             Pnn=int(Pnn),
@@ -4105,7 +4314,7 @@ class FeasibleProjector(nn.Module):
         )
 
         unnorm_control_sequence = self._scatter_active_subset_for_control_sequence(
-            control_sequence_active=ctrl_active,  # (N_active, 1, T, 3)
+            control_sequence_active=ctrl_active,
             active_indices=active_indices,
             B=int(B),
             Pnn=int(Pnn),
@@ -4115,6 +4324,7 @@ class FeasibleProjector(nn.Module):
         )
 
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff, unnorm_control_sequence
+
 
     # ================================================================
     # [REFACTOR] Savitzky–Golay 유틸들 (모두 torch-only, 미분 가능)
@@ -4161,21 +4371,16 @@ class FeasibleProjector(nn.Module):
 
     def _filter_and_integrate_batch(
             self,
-            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
-            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+future_len) bool
-            unnorm_cur_future_seg_body_control: torch.Tensor,
-            # (B, Pnn, future_len, 3)
-            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+            unnorm_near_current_state: torch.Tensor,  # (B,Pnn,4)
+            near_cur_future_valid: torch.Tensor,  # (B,Pnn,1+T)
+            unnorm_cur_future_seg_body_control: torch.Tensor,  # (B,Pnn,T,3)
+            near_class_one_hot: torch.Tensor,  # (B,Pnn,3)
             filter_active_idx: Optional[torch.Tensor] = None,
-            # (B_filter,) or None
+            target_current_control: Optional[torch.Tensor] = None,
+            # (B,Pnn,3) or None (unnorm)
+            target_current_control_valid: Optional[torch.Tensor] = None,
+            # (B,Pnn) or None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """batch 적분 + (선택적) 제약 필터 적용.
-
-        Returns:
-            unnorm_integrated_trajectory: (B,Pnn,T,4)
-            unnorm_control_constraint_diff: (B,Pnn,T,3)
-            unnorm_control_sequence: (B,Pnn,T,3)  # 필터 적용 후 최종 control (무효 구간은 0)
-        """
         B, Pnn, future_len, _ = unnorm_cur_future_seg_body_control.shape
         device = unnorm_cur_future_seg_body_control.device
         dtype = unnorm_cur_future_seg_body_control.dtype
@@ -4184,26 +4389,19 @@ class FeasibleProjector(nn.Module):
             raise ValueError("future_len=0: 적분할 미래 세그먼트가 없습니다.")
 
         apply_filter_mask_bp = self._build_apply_filter_mask_bp_from_filter_active_idx(
-            B=int(B),
-            Pnn=int(Pnn),
-            filter_active_idx=filter_active_idx,
-            device=device,
-        )  # (B,Pnn)
+            B=int(B), Pnn=int(Pnn), filter_active_idx=filter_active_idx,
+            device=device
+        )
         apply_filter_any: bool = True if (filter_active_idx is None) else (
                     int(filter_active_idx.numel()) > 0)
 
-        key_to_limit_bp: Dict[str, torch.Tensor] = self._build_per_agent_limits(
-            near_class_one_hot,
-            device=device,
-            dtype=dtype,
-        )
-
+        key_to_limit_bp = self._build_per_agent_limits(near_class_one_hot,
+                                                       device=device,
+                                                       dtype=dtype)
         vx_b_raw, vy_b_raw, omega_raw = self._split_controls(
-            unnorm_cur_future_seg_body_control)  # (B,Pnn,T)
+            unnorm_cur_future_seg_body_control)
 
-        vx_b_after = vx_b_raw
-        vy_b_after = vy_b_raw
-        omega_after = omega_raw
+        vx_b_after, vy_b_after, omega_after = vx_b_raw, vy_b_raw, omega_raw
 
         if self.use_feasible_filter and apply_filter_any:
             vx_f, vy_f, w_f = self._apply_constraints_batch(
@@ -4212,39 +4410,39 @@ class FeasibleProjector(nn.Module):
                 omega_raw=omega_raw,
                 key_to_limit_bp=key_to_limit_bp,
                 hp=self.constraints_h_params,
-            )  # (B,Pnn,T)
+                target_current_control=target_current_control,
+                target_current_control_valid=target_current_control_valid,
+            )
 
-            mask_bp1 = apply_filter_mask_bp.unsqueeze(-1)  # (B,Pnn,1)
+            mask_bp1 = apply_filter_mask_bp.unsqueeze(-1)
             vx_b_after = torch.where(mask_bp1, vx_f, vx_b_raw)
             vy_b_after = torch.where(mask_bp1, vy_f, vy_b_raw)
             omega_after = torch.where(mask_bp1, w_f, omega_raw)
 
-        # unnorm_control_sequence: (B,Pnn,T,3)  (무효 구간은 0)
-        unnorm_control_sequence = torch.stack([vx_b_after, vy_b_after, omega_after],
-                                       dim=-1)  # (B,Pnn,T,3)
-        mask_node = near_cur_future_valid.to(torch.bool)  # (B,Pnn,1+T)
-        mask_interval = mask_node[..., :-1] & mask_node[..., 1:]  # (B,Pnn,T)
+        unnorm_control_sequence = torch.stack(
+            [vx_b_after, vy_b_after, omega_after], dim=-1)
+        mask_node = near_cur_future_valid.to(torch.bool)
+        mask_interval = mask_node[..., :-1] & mask_node[..., 1:]
         unnorm_control_sequence = unnorm_control_sequence.masked_fill(
             ~mask_interval.unsqueeze(-1), 0.0)
 
         key_to_all_states = self._integrate_midpoint_batch(
-            unnorm_near_current_state=unnorm_near_current_state,  # (B,Pnn,4)
-            vx_b_seq=vx_b_after,  # (B,Pnn,T)
-            vy_b_seq=vy_b_after,  # (B,Pnn,T)
-            omega_seq=omega_after,  # (B,Pnn,T)
+            unnorm_near_current_state=unnorm_near_current_state,
+            vx_b_seq=vx_b_after,
+            vy_b_seq=vy_b_after,
+            omega_seq=omega_after,
             dt=self.constraints_h_params.dt,
             eps=self.constraints_h_params.eps,
         )
 
         unnorm_integrated_trajectory, unnorm_control_constraint_diff = self._assemble_outputs(
             key_to_all_states=key_to_all_states,
-            vx_b_raw=vx_b_raw,
-            vy_b_raw=vy_b_raw,
-            omega_raw=omega_raw,
+            vx_b_raw=vx_b_raw, vy_b_raw=vy_b_raw, omega_raw=omega_raw,
             near_cur_future_valid=near_cur_future_valid,
         )
 
         return unnorm_integrated_trajectory, unnorm_control_constraint_diff, unnorm_control_sequence
+
 
     def _compute_world_linear_velocity_via_sg(
         self,

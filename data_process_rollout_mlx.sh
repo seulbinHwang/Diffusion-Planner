@@ -116,10 +116,16 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$TRAIN_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "amortized_fine_tuning_lr_2e5" \
-  --name "amortized_fine_tuning_lr_2e5" \
+  --load_name "8_control_only_new_network_1e-3" \
+  --name "8_control_only_new_network_1e-3" \
   --eval_method "train" \
   --batch_size 1536 \
+  --pose_based False \
+  --profile_feasible False \
+  --use_feasible True \
+  --use_feasible_dl False \
+  --use_feasible_filter True \
+  --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
   --wosac_metric_is_active False \

@@ -806,7 +806,7 @@ def _forward_model_with_autocast(
     else:
         with torch.autocast("cuda", dtype=AMP_DTYPE):
             _, decoder_output = model(merged_inputs)
-    return decoder_output  # decoder_output["score"], ["integrated_trajectory"], ...
+    return decoder_output  # decoder_output["x0"], ["integrated_trajectory"], ...
 
 
 def _extract_score_from_decoder(future_len: int,
@@ -818,9 +818,9 @@ def _extract_score_from_decoder(future_len: int,
     Returns:
         score: (B, (1+)Pnn, future_len, 4) 또는 (B, (1+)Pnn, future_len, 3)
     """
-    # decoder_output["score"]: (B, one_or_Pnn, 1+future_len, 4)
+    # decoder_output["x0"]: (B, one_or_Pnn, 1+future_len, 4)
     score: torch.Tensor = decoder_output[
-        "score"][:, :,-future_len:, :]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+        "x0"][:, :,-future_len:, :]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     score = _require_finite("decoder_output['score']", score)
     return score
 

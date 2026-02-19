@@ -1959,7 +1959,7 @@ def _forward_model_for_validation(
         Dict[str, Any]:
             decoder_output dict.
             예: norm 값임
-            "score" : (B, (1+)Pnn, 1+T, 4)
+            "x0" : (B, (1+)Pnn, 1+T, 4)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
     """
     use_deepspeed_requested = bool(getattr(args, "use_deepspeed", False))
@@ -2966,7 +2966,7 @@ def _predict_rollouts_batched_one_chunk(
                     raise KeyError("Decoder 출력에 'control_sequence' 키가 없거나 텐서가 아닙니다. "
                                    "rollout_time_chunk_size > 1이면서 pose_based=False인 경우, "
                                       "모델이 'control_sequence'를 출력하도록 해야 합니다.")
-                    # target_future_control_seq = decoder_output["score"]
+                    # target_future_control_seq = decoder_output["x0"]
 
             # ---------------------------------------------------------
             # ✅ 첫 forward 성공 이후에만 시각화 슬롯 예약

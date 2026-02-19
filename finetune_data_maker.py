@@ -1763,137 +1763,183 @@ def _remove_invalid_data(
     neighbor_agents_past = npz_payload_dict.get("neighbor_agents_past", None)
     if neighbor_agents_past is not None:
         assert neighbor_agents_is_valid is not None, (
-            "neighbor_agents_is_valid가 None인데 neighbor_agents_past가 존재합니다.")
+            "neighbor_agents_is_valid가 None인데 neighbor_agents_past가 존재합니다."
+        )
         neighbor_agents_is_valid = neighbor_agents_is_valid.astype(bool)
         npz_payload_dict["neighbor_agents_past"] = npz_payload_dict[
-            "neighbor_agents_past"][
-                neighbor_agents_is_valid]  # (valid_chosen_agent_num, time_len, 11)
+            "neighbor_agents_past"
+        ][neighbor_agents_is_valid]  # (valid_chosen_agent_num, time_len, 11)
         npz_payload_dict["neighbor_future_gt_3_dim"] = npz_payload_dict[
-            "neighbor_future_gt_3_dim"][
-                neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 3)
+            "neighbor_future_gt_3_dim"
+        ][neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 3)
         npz_payload_dict["neighbor_future_gt_11_dim"] = npz_payload_dict[
-            "neighbor_future_gt_11_dim"][
-                neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 3)
+            "neighbor_future_gt_11_dim"
+        ][neighbor_agents_is_valid]  # (valid_chosen_agent_num, future_len, 11)
 
+    # ------------------------------------------------------------
+    # ✅ (추가) future_seg_control_gt_3_dim: (1+Pnn, future_len, 3)
+    # - ego(0번)는 항상 유지(True)
+    # - neighbor(1..Pnn)는 neighbor_agents_is_valid로 필터링
+    # ✅ (추가) past_seg_control_gt_3_dim도 동일한 full_mask로 같이 필터링
+    # ------------------------------------------------------------
+    future_seg_control_gt_3_dim = npz_payload_dict.get("future_seg_control_gt_3_dim", None)
+    if future_seg_control_gt_3_dim is not None:
+        if not isinstance(future_seg_control_gt_3_dim, np.ndarray):
+            raise TypeError(
+                "future_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
+                f"type={type(future_seg_control_gt_3_dim)}"
+            )
+        if future_seg_control_gt_3_dim.ndim != 3 or int(future_seg_control_gt_3_dim.shape[-1]) != 3:
+            raise ValueError(
+                "future_seg_control_gt_3_dim은 (1+Pnn, future_len, 3)이어야 합니다. "
+                f"got shape={tuple(future_seg_control_gt_3_dim.shape)}"
+            )
+
+        agent_count = int(future_seg_control_gt_3_dim.shape[0])  # 1+Pnn
+        pnn = int(max(0, agent_count - 1))
+
+        if pnn == 0:
+            # ego만 있는 경우: 그대로 둠
+            npz_payload_dict["future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim
+        else:
+            if neighbor_agents_is_valid is None:
+                raise ValueError(
+                    "future_seg_control_gt_3_dim에 neighbor가 있는데 "
+                    "neighbor_agents_is_valid가 None입니다."
+                )
+
+            neighbor_mask = np.asarray(neighbor_agents_is_valid).astype(bool)
+            if neighbor_mask.ndim != 1:
+                neighbor_mask = neighbor_mask.reshape(-1)
+
+            if int(neighbor_mask.shape[0]) != int(pnn):
+                raise ValueError(
+                    "neighbor_agents_is_valid 길이와 future_seg_control_gt_3_dim의 Pnn이 다릅니다. "
+                    f"len(mask)={int(neighbor_mask.shape[0])}, Pnn={int(pnn)}, "
+                    f"control_shape={tuple(future_seg_control_gt_3_dim.shape)}"
+                )
+
+            # ego는 항상 True
+            full_mask = np.concatenate([np.array([True], dtype=bool), neighbor_mask], axis=0)  # (1+Pnn,)
+
+            # (1+valid_neighbor_num, future_len, 3)
+            npz_payload_dict["future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim[full_mask]
+
+            # ------------------------------------------------------------
+            # ✅ (핵심) past_seg_control_gt_3_dim도 같은 full_mask로 필터링
+            # 기대 shape: (1+Pnn, past_len, 3)
+            # ------------------------------------------------------------
+            past_seg_control_gt_3_dim = npz_payload_dict.get("past_seg_control_gt_3_dim", None)
+            if past_seg_control_gt_3_dim is not None:
+                if not isinstance(past_seg_control_gt_3_dim, np.ndarray):
+                    raise TypeError(
+                        "past_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
+                        f"type={type(past_seg_control_gt_3_dim)}"
+                    )
+                if past_seg_control_gt_3_dim.ndim != 3 or int(past_seg_control_gt_3_dim.shape[-1]) != 3:
+                    raise ValueError(
+                        "past_seg_control_gt_3_dim은 (1+Pnn, past_len, 3)이어야 합니다. "
+                        f"got shape={tuple(past_seg_control_gt_3_dim.shape)}"
+                    )
+                if int(past_seg_control_gt_3_dim.shape[0]) != int(agent_count):
+                    raise ValueError(
+                        "past_seg_control_gt_3_dim의 agent 축(첫 차원)이 "
+                        "future_seg_control_gt_3_dim과 일치해야 합니다. "
+                        f"past_agent_count={int(past_seg_control_gt_3_dim.shape[0])}, "
+                        f"future_agent_count={int(agent_count)}"
+                    )
+
+                # (1+valid_neighbor_num, past_len, 3)
+                npz_payload_dict["past_seg_control_gt_3_dim"] = past_seg_control_gt_3_dim[full_mask]
+
+    # --- 이하 기존 코드 그대로 ---
     lanes = npz_payload_dict["lanes"]  # (chosen_lane_num, lane_len, 12)
     if lanes is not None:
         assert lanes_is_valid is not None, (
-            "lanes_is_valid가 None인데 lanes가 존재합니다.")
+            "lanes_is_valid가 None인데 lanes가 존재합니다."
+        )
         lanes_is_valid = lanes_is_valid.astype(bool)
-        # (valid_chosen_lane_num, lane_len, 12)
-        npz_payload_dict["lanes"] = lanes[
-            lanes_is_valid]  # (valid_chosen_lane_num, lane_len, 12)
-        npz_payload_dict["lanes_speed_limit"] = npz_payload_dict[
-            "lanes_speed_limit"][lanes_is_valid]  # (valid_chosen_lane_num, 1)
-        npz_payload_dict["lanes_has_speed_limit"] = npz_payload_dict[
-            "lanes_has_speed_limit"][
-                lanes_is_valid]  # (valid_chosen_lane_num, 1)
-        # lane_type: (chosen_lane_num, 4) / "left_line_type" : (chosen_lane_num, 13) / "right_line_type" : (chosen_lane_num, 13)
+        npz_payload_dict["lanes"] = lanes[lanes_is_valid]
+        npz_payload_dict["lanes_speed_limit"] = npz_payload_dict["lanes_speed_limit"][lanes_is_valid]
+        npz_payload_dict["lanes_has_speed_limit"] = npz_payload_dict["lanes_has_speed_limit"][lanes_is_valid]
+
         lane_type = npz_payload_dict.get("lane_type", None)
         left_line_type = npz_payload_dict.get("left_line_type", None)
         right_line_type = npz_payload_dict.get("right_line_type", None)
         if lane_type is not None:
-            npz_payload_dict["lane_type"] = lane_type[
-                lanes_is_valid]  # (valid_chosen_lane_num, 4)
+            npz_payload_dict["lane_type"] = lane_type[lanes_is_valid]
         if left_line_type is not None:
-            npz_payload_dict["left_line_type"] = npz_payload_dict[
-                "left_line_type"][lanes_is_valid]  # (valid_chosen_lane_num, 13)
+            npz_payload_dict["left_line_type"] = npz_payload_dict["left_line_type"][lanes_is_valid]
         if right_line_type is not None:
-            npz_payload_dict["right_line_type"] = npz_payload_dict[
-                "right_line_type"][
-                    lanes_is_valid]  # (valid_chosen_lane_num, 13)
+            npz_payload_dict["right_line_type"] = npz_payload_dict["right_line_type"][lanes_is_valid]
 
-    agent_route_lane_order = npz_payload_dict.get("agent_route_lane_order",
-                                                  None)
+    agent_route_lane_order = npz_payload_dict.get("agent_route_lane_order", None)
     if agent_route_lane_order is not None and neighbor_agents_past is not None and lanes is not None:
-        # "agent_route_lane_order",#check#check  # (chosen_agent_num, chosen_lane_num) -> (valid_chosen_agent_num, valid_chosen_lane_num)
         npz_payload_dict["agent_route_lane_order"] = agent_route_lane_order[
-            neighbor_agents_is_valid][:,
-                                      lanes_is_valid]  # (valid_chosen_agent_num, valid_chosen_lane_num)
+            neighbor_agents_is_valid
+        ][:, lanes_is_valid]
 
-    route_lanes = npz_payload_dict.get(
-        "route_lanes", None)  # (chosen_route_lane_num, route_len, 12)
+    route_lanes = npz_payload_dict.get("route_lanes", None)
     if route_lanes is not None:
         assert route_lanes_is_valid is not None, (
-            "route_lanes_is_valid가 None인데 route_lanes가 존재합니다.")
+            "route_lanes_is_valid가 None인데 route_lanes가 존재합니다."
+        )
         route_lanes_is_valid = route_lanes_is_valid.astype(bool)
-        npz_payload_dict["route_lanes"] = route_lanes[
-            route_lanes_is_valid]  # (valid_chosen_route_lane_num, route_len, 12)
-        npz_payload_dict["route_lanes_speed_limit"] = npz_payload_dict[
-            "route_lanes_speed_limit"][
-                route_lanes_is_valid]  # (valid_chosen_route_lane_num, 1)
-        npz_payload_dict["route_lanes_has_speed_limit"] = npz_payload_dict[
-            "route_lanes_has_speed_limit"][
-                route_lanes_is_valid]  # (valid_chosen_route_lane_num, 1)
-    """
-    # stop_sign_points : (stop_sign_num, safety_len, 2) / crosswalk_points: (crosswalk_num, safety_len, 2)
-    speed_bump_points : (speed_bump_num, safety_len, 2) / driveway_points : (driveway_num, safety_len, 2)
-    road_edge : (chosen_edge_num, safety_len, 2) 
-    이 5개는 2차원 (x,y) 값이 전부 0. 이면 무효다. 그리고 전 safety_len 점이 모두 유효해야 유효한 객체다.
-    """
-    stop_sign_points = npz_payload_dict.get(
-        "stop_sign_points", None)  # (stop_sign_num, safety_len, 2)
+        npz_payload_dict["route_lanes"] = route_lanes[route_lanes_is_valid]
+        npz_payload_dict["route_lanes_speed_limit"] = npz_payload_dict["route_lanes_speed_limit"][route_lanes_is_valid]
+        npz_payload_dict["route_lanes_has_speed_limit"] = npz_payload_dict["route_lanes_has_speed_limit"][route_lanes_is_valid]
+
+    stop_sign_points = npz_payload_dict.get("stop_sign_points", None)
     if stop_sign_points is not None:
         assert stop_sign_is_valid is not None, (
-            "stop_sign_points_is_valid가 None인데 stop_sign_points가 존재합니다.")
+            "stop_sign_points_is_valid가 None인데 stop_sign_points가 존재합니다."
+        )
         stop_sign_is_valid = stop_sign_is_valid.astype(bool)
-        npz_payload_dict["stop_sign_points"] = stop_sign_points[
-            stop_sign_is_valid]  # (valid_stop_sign_num, safety_len, 2)
+        npz_payload_dict["stop_sign_points"] = stop_sign_points[stop_sign_is_valid]
 
-    speed_bump_points = npz_payload_dict.get(
-        "speed_bump_points", None)  # (speed_bump_num, safety_len, 2)
+    speed_bump_points = npz_payload_dict.get("speed_bump_points", None)
     if speed_bump_points is not None:
         assert speed_bump_is_valid is not None, (
-            "speed_bump_points_is_valid가 None인데 speed_bump_points가 존재합니다.")
-        # (valid_speed_bump_num, safety_len, 2)
+            "speed_bump_points_is_valid가 None인데 speed_bump_points가 존재합니다."
+        )
         speed_bump_is_valid = speed_bump_is_valid.astype(bool)
-        npz_payload_dict["speed_bump_points"] = speed_bump_points[
-            speed_bump_is_valid]  # (valid_speed_bump_num, safety_len, 2)
+        npz_payload_dict["speed_bump_points"] = speed_bump_points[speed_bump_is_valid]
 
-    crosswalk_points = npz_payload_dict.get(
-        "crosswalk_points", None)  # (crosswalk_num, safety_len, 2)
+    crosswalk_points = npz_payload_dict.get("crosswalk_points", None)
     if crosswalk_points is not None:
         assert crosswalk_is_valid is not None, (
-            "crosswalk_points_is_valid가 None인데 crosswalk_points가 존재합니다.")
-        # (valid_crosswalk_num, safety_len, 2)
+            "crosswalk_points_is_valid가 None인데 crosswalk_points가 존재합니다."
+        )
         crosswalk_is_valid = crosswalk_is_valid.astype(bool)
-        npz_payload_dict["crosswalk_points"] = crosswalk_points[
-            crosswalk_is_valid]  # (valid_crosswalk_num, safety_len, 2)
+        npz_payload_dict["crosswalk_points"] = crosswalk_points[crosswalk_is_valid]
 
-    driveway_points = npz_payload_dict.get(
-        "driveway_points", None)  # (driveway_num, safety_len, 2)
+    driveway_points = npz_payload_dict.get("driveway_points", None)
     if driveway_points is not None:
         assert driveway_is_valid is not None, (
-            "driveway_points_is_valid가 None인데 driveway_points가 존재합니다.")
+            "driveway_points_is_valid가 None인데 driveway_points가 존재합니다."
+        )
         driveway_is_valid = driveway_is_valid.astype(bool)
-        # (valid_driveway_num, safety_len, 2)
-        npz_payload_dict["driveway_points"] = driveway_points[
-            driveway_is_valid]  # (valid_driveway_num, safety_len, 2)
+        npz_payload_dict["driveway_points"] = driveway_points[driveway_is_valid]
 
-    road_edge = npz_payload_dict.get("road_edge",
-                                     None)  # (chosen_edge_num, safety_len, 2)
+    road_edge = npz_payload_dict.get("road_edge", None)
     if road_edge is not None:
         assert road_edge_is_valid is not None, (
-            "road_edge_is_valid가 None인데 road_edge가 존재합니다.")
+            "road_edge_is_valid가 None인데 road_edge가 존재합니다."
+        )
         road_edge_is_valid = road_edge_is_valid.astype(bool)
-        npz_payload_dict["road_edge"] = road_edge[
-            road_edge_is_valid]  # (valid_chosen_edge_num, safety_len, 2)
+        npz_payload_dict["road_edge"] = road_edge[road_edge_is_valid]
+        npz_payload_dict["road_edge_type"] = npz_payload_dict["road_edge_type"][road_edge_is_valid]
 
-        # road_edge_type : (chosen_edge_num, 3)  -> (valid_chosen_edge_num, 3)
-        npz_payload_dict["road_edge_type"] = npz_payload_dict["road_edge_type"][
-            road_edge_is_valid]  # (valid_chosen_edge_num , 3)
-
-    # static_objects : (chosen_static_num, 10) 뒤 10개 속성 중, 앞 5개가 전부 0. 이면 무효
-    static_objects = npz_payload_dict.get("static_objects",
-                                          None)  # (chosen_static_num, 10)
+    static_objects = npz_payload_dict.get("static_objects", None)
     if static_objects is not None:
         assert static_objects_is_valid is not None, (
-            "static_objects_is_valid가 None인데 static_objects가 존재합니다.")
+            "static_objects_is_valid가 None인데 static_objects가 존재합니다."
+        )
         static_objects_is_valid = static_objects_is_valid.astype(bool)
-        npz_payload_dict["static_objects"] = static_objects[
-            static_objects_is_valid]  # (valid_chosen_static_num, 10)
+        npz_payload_dict["static_objects"] = static_objects[static_objects_is_valid]
 
     return npz_payload_dict
+
 
 
 def _apply_unvalid_at_unnorm_selected_traj_raw(
@@ -2318,6 +2364,7 @@ def _predict_one_rollout_sequential(
                 unnorm_outputs_for_save = dict(unnorm_outputs_copy)
                 # ego_future_gt_4_dim: (B, future_len, 4)
                 # near_future_gt_4_dim: (B, Pnn, future_len, 4)
+                # future_seg_control_gt_3_dim: (B, (1+)Pnn, future_len, 3)
                 (ego_future_gt_4_dim, near_future_gt_4_dim, future_seg_control_gt_3_dim
                 ) = _build_generated_demo_futures_from_selected_traj(
                     unnorm_selected_gt_traj=
@@ -2327,6 +2374,11 @@ def _predict_one_rollout_sequential(
                     "ego_future_gt_4_dim"] = ego_future_gt_4_dim  # (B, future_len, 4)
                 unnorm_outputs_for_save[
                     "near_future_gt_4_dim"] = near_future_gt_4_dim  # (B, Pnn, future_len, 4)
+
+                # ✅ (추가) pose_based=False용 학습 데이터 저장
+                # shape: (B, 1+Pnn, future_len, 3)
+                unnorm_outputs_for_save[
+                    "future_seg_control_gt_3_dim"] = future_seg_control_gt_3_dim
                 _save_inference_data(
                     args.save_cache_path,
                     unnorm_inputs_for_save,
@@ -2377,6 +2429,43 @@ def _predict_one_rollout_sequential(
         args=args,
         state=vis_state,
     )
+
+def _augment_inputs_with_future_seg_control_for_npz(
+    a_inputs_dict: Dict[str, Any],
+    a_outputs_dict: Dict[str, Any],
+) -> None:
+    """future_seg_control_gt_3_dim을 npz 저장 대상(dict)에 포함시킵니다.
+
+    - rollout에서 만든 future_seg_control_gt_3_dim은 보통 outputs 쪽에 들어옵니다.
+    - 하지만 저장 payload는 a_inputs_dict 기준으로 만들어지므로,
+      outputs에 있는 값을 inputs로 옮겨 담습니다.
+
+    기대 shape
+    - future_seg_control_gt_3_dim: (1+Pnn, future_len, 3)
+
+    Args:
+        a_inputs_dict (Dict[str, Any]): 샘플 1개 입력 dict. shape: ()
+        a_outputs_dict (Dict[str, Any]): 샘플 1개 출력 dict. shape: ()
+
+    Returns:
+        None
+    """
+    ctrl = a_outputs_dict.get("future_seg_control_gt_3_dim", None)
+    if ctrl is None:
+        return
+
+    if not isinstance(ctrl, np.ndarray):
+        raise TypeError(
+            "future_seg_control_gt_3_dim은 np.ndarray여야 합니다. "
+            f"type={type(ctrl)}"
+        )
+    if ctrl.ndim != 3 or int(ctrl.shape[-1]) != 3:
+        raise ValueError(
+            "future_seg_control_gt_3_dim은 (1+Pnn, future_len, 3)이어야 합니다. "
+            f"got shape={tuple(ctrl.shape)}"
+        )
+
+    a_inputs_dict["future_seg_control_gt_3_dim"] = ctrl
 
 
 from typing import Any, Dict
@@ -2704,6 +2793,12 @@ def _save_inference_data(
 
         # 함수 2
         _augment_inputs_with_neighbor_futures_for_npz(
+            a_inputs_dict=a_inputs_dict,
+            a_outputs_dict=a_outputs_dict,
+        )
+
+        # ✅ (추가) future_seg_control_gt_3_dim을 inputs 쪽에 포함
+        _augment_inputs_with_future_seg_control_for_npz(
             a_inputs_dict=a_inputs_dict,
             a_outputs_dict=a_outputs_dict,
         )
@@ -3455,7 +3550,7 @@ def _forward_and_score_candidate_batch(
             raise KeyError("Decoder 출력에 'control_sequence' 키가 없거나 텐서가 아닙니다. "
                            "rollout_time_chunk_size > 1이면서 pose_based=False인 경우, "
                            "모델이 'control_sequence'를 출력하도록 해야 합니다.")
-            # target_future_control_seq = decoder_output["score"]
+            # target_future_control_seq = decoder_output["x0"]
 
 
     cand_traj = cand_traj_flat.reshape(
@@ -4105,266 +4200,298 @@ def _apply_recovery_if_needed(
 
     return out
 
+def _traj11_to_traj3_heading(traj_11: torch.Tensor) -> torch.Tensor:
+    """(x,y,cos,sin,...) 상태열에서 (x,y,heading)으로 바꿉니다.
 
-def _traj11_to_traj3_heading(traj_11: ArrayF) -> ArrayF:
-    """11차원 궤적을 (x, y, heading) 3차원으로 바꿉니다.
+    주의:
+        - 입력은 마지막 차원에 최소 4개(x,y,cos,sin)가 있어야 합니다.
+        - 이름은 traj11이지만, 실제로는 (..., >=4)도 허용합니다.
 
     Args:
-        traj_11 (np.ndarray):
-            - (T, 11) 또는 (N, T, 11)
-            - 11차원 = [x, y, cos, sin, vx, vy, width, length, onehot(3)]
+        traj_11 (torch.Tensor): 상태열. shape: (..., C) where C>=4
 
     Returns:
-        np.ndarray:
-            - (T, 3) 또는 (N, T, 3)
-            - 3차원 = [x, y, heading]
+        torch.Tensor: (x,y,heading) 상태열. shape: (..., 3)
     """
-    arr = np.asarray(traj_11)
-    if arr.ndim == 2:
-        if arr.shape[-1] != 11:
-            raise ValueError(f"traj_11 마지막 차원은 11이어야 합니다. got {arr.shape}")
-        heading = np.arctan2(arr[:, 3], arr[:, 2]).astype(np.float32, copy=False)
-        return np.stack([arr[:, 0], arr[:, 1], heading], axis=-1).astype(np.float32, copy=False)
-    if arr.ndim == 3:
-        if arr.shape[-1] != 11:
-            raise ValueError(f"traj_11 마지막 차원은 11이어야 합니다. got {arr.shape}")
-        heading = np.arctan2(arr[:, :, 3], arr[:, :, 2]).astype(np.float32, copy=False)
-        return np.stack([arr[:, :, 0], arr[:, :, 1], heading], axis=-1).astype(np.float32, copy=False)
-    raise ValueError(f"traj_11은 (T,11) 또는 (N,T,11) 이어야 합니다. got {arr.shape}")
+    if not isinstance(traj_11, torch.Tensor):
+        raise TypeError(f"traj_11은 torch.Tensor여야 합니다. got {type(traj_11)}")
+    if traj_11.dim() < 1:
+        raise ValueError(f"traj_11은 최소 1차원이어야 합니다. got dim={traj_11.dim()}")
+    if int(traj_11.shape[-1]) < 4:
+        raise ValueError(
+            "traj_11 마지막 차원은 최소 4(x,y,cos,sin)이어야 합니다. "
+            f"got shape={tuple(traj_11.shape)}"
+        )
+
+    x = traj_11[..., 0]
+    y = traj_11[..., 1]
+    cos_h = traj_11[..., 2]
+    sin_h = traj_11[..., 3]
+    heading = torch.atan2(sin_h, cos_h)
+    return torch.stack([x, y, heading], dim=-1)
+
+from typing import Tuple
+import torch
 
 
-def _wrap_to_pi(delta: ArrayF) -> ArrayF:
+def _wrap_to_pi(delta: torch.Tensor) -> torch.Tensor:
     """각도 차이를 (-pi, pi] 범위로 접습니다.
 
     Args:
-        delta (np.ndarray): 각도 차이. shape 자유.
+        delta (torch.Tensor): 각도 차이(라디안). shape: (...,)
 
     Returns:
-        np.ndarray: (-pi, pi] 범위로 접힌 각도 차이. shape는 입력과 동일.
+        torch.Tensor: (-pi, pi] 범위로 접힌 각도 차이. shape: (...,)
     """
-    return np.arctan2(np.sin(delta), np.cos(delta)).astype(delta.dtype, copy=False)
+    return torch.atan2(torch.sin(delta), torch.cos(delta))
 
 
-def _normalize_cos_sin(cos_seq: ArrayF, sin_seq: ArrayF, eps: float) -> Tuple[ArrayF, ArrayF]:
+def _normalize_cos_sin(
+    cos_seq: torch.Tensor,
+    sin_seq: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """(cos, sin) 쌍을 길이 1이 되도록 정리합니다.
 
     Args:
-        cos_seq (np.ndarray): cos 값들. shape 자유.
-        sin_seq (np.ndarray): sin 값들. shape는 cos_seq와 동일.
-        eps (float): 0으로 나누는 것을 피하기 위한 작은 값.
+        cos_seq (torch.Tensor): cos 값들. shape: (...)
+        sin_seq (torch.Tensor): sin 값들. shape: (...)
+        eps (float): 0 나눗셈 방지 값. shape: ()
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]:
+        Tuple[torch.Tensor, torch.Tensor]:
             (cos_norm, sin_norm) - 입력과 동일한 shape
     """
-    r = np.sqrt(cos_seq * cos_seq + sin_seq * sin_seq + eps).astype(cos_seq.dtype, copy=False)
-    return (cos_seq / r).astype(cos_seq.dtype, copy=False), (sin_seq / r).astype(sin_seq.dtype, copy=False)
+    r = torch.sqrt(cos_seq * cos_seq + sin_seq * sin_seq + float(eps))
+    cos_norm = cos_seq / r
+    sin_norm = sin_seq / r
+    return cos_norm, sin_norm
+from typing import Union
 
+def _to_scalar_dt(value: Union[float, np.ndarray], ref: NDArray[np.generic]) -> np.floating:
+    """dt를 ref와 같은 dtype의 '스칼라'로 정리합니다."""
+    dt_arr = np.asarray(value, dtype=ref.dtype)
+    if dt_arr.size != 1:
+        raise ValueError(f"dt는 스칼라여야 합니다. got shape={dt_arr.shape}, size={dt_arr.size}")
+    return dt_arr.reshape(()).item()
 
 def differentiate_numpy_pose3_to_control3(
-    cur_future_pose_gt_3_dim: ArrayF,  # (P, 1+T, 3) = (x, y, heading)
-    dt: Union[float, np.ndarray],
+    cur_future_pose_gt_3_dim: torch.Tensor,  # (B, P, 1+T, 3)
+    dt: float,
     *,
     eps: float = 1e-8,
     normalize_yaw: bool = True,
     wrap_heading: bool = True,
-) -> ArrayF:
-    """(x,y,heading) 궤적에서 구간별 제어(vx_b, vy_b, omega)를 차분으로 복원합니다.
+) -> torch.Tensor:
+    """(x,y,heading) 상태열에서 구간 제어(vx_b, vy_b, yaw_rate)를 만듭니다 (torch/batch 지원).
 
     입력:
-        cur_future_pose_gt_3_dim: (P, 1+T, 3)
-            - 마지막 3은 (x, y, heading[rad]) 입니다.
-            - 시간축은 k=0..T (총 1+T개 상태)
+        cur_future_pose_gt_3_dim:
+            - shape: (B, P, 1+T, 3)
+            - 마지막 3: (x, y, heading[rad])
 
     출력:
-        future_seg_control_gt_3_dim: (P, T, 3)
-            - 마지막 3은 (v_x^b, v_y^b, omega) 입니다.
-            - 시간축은 구간 k=0..T-1 (총 T개 구간)
+        future_seg_control_gt_3_dim:
+            - shape: (B, P, T, 3)
+            - 마지막 3: (v_x^b, v_y^b, yaw_rate)
     """
-    pose = np.asarray(cur_future_pose_gt_3_dim)
-    if pose.ndim != 3 or int(pose.shape[-1]) != 3:
+    if not isinstance(cur_future_pose_gt_3_dim, torch.Tensor):
+        raise TypeError("cur_future_pose_gt_3_dim은 torch.Tensor여야 합니다.")
+    if cur_future_pose_gt_3_dim.dim() != 4 or int(cur_future_pose_gt_3_dim.shape[-1]) != 3:
         raise ValueError(
-            "cur_future_pose_gt_3_dim은 (P, 1+T, 3) 3D 배열이어야 합니다. "
-            f"got shape={pose.shape}"
+            "cur_future_pose_gt_3_dim은 (B, P, 1+T, 3)이어야 합니다. "
+            f"got shape={tuple(cur_future_pose_gt_3_dim.shape)}"
         )
 
-    # float dtype 강제(삼각함수/나눗셈 안정)
-    pose = pose.astype(np.float32 if pose.dtype.kind != "f" else pose.dtype, copy=False)
+    dt_f = float(dt)
+    if (not torch.isfinite(torch.tensor(dt_f))) or dt_f <= 0.0:
+        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt_f}")
 
-    _, time_len, _ = pose.shape  # last dim=3
-    T = int(time_len - 1)
-    if T <= 0:
-        raise ValueError(f"time_len(=1+T)은 최소 2여야 합니다. got time_len={time_len}")
+    pose = cur_future_pose_gt_3_dim.to(dtype=torch.float32)
 
-    dt_s = _to_scalar_dt(dt, ref=pose)
-    if (not np.isfinite(dt_s)) or float(dt_s) <= 0.0:
-        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt_s}")
-
-    # 분해: (P, 1+T)
+    # (B, P, 1+T)
     x = pose[..., 0]
     y = pose[..., 1]
     heading = pose[..., 2]
 
-    # 구간별 slice: (P, T)
+    # (B, P, T)
     x0, x1 = x[..., :-1], x[..., 1:]
     y0, y1 = y[..., :-1], y[..., 1:]
     th0, th1 = heading[..., :-1], heading[..., 1:]
 
-    # 1) Δθ, omega
-    delta_theta = (th1 - th0).astype(pose.dtype, copy=False)  # (P, T)
+    # yaw_rate
+    delta_theta = th1 - th0  # (B, P, T)
     if wrap_heading:
-        delta_theta = _wrap_to_pi(delta_theta)  # (P, T)
-    omega = (delta_theta / dt_s).astype(pose.dtype, copy=False)  # (P, T)
+        delta_theta = _wrap_to_pi(delta_theta)
+    yaw_rate = delta_theta / dt_f  # (B, P, T)
 
-    # 2) 중간 방향 -> (cos, sin)
-    th_mid = (th0 + 0.5 * delta_theta).astype(pose.dtype, copy=False)  # (P, T)
-    cos_mid = np.cos(th_mid).astype(pose.dtype, copy=False)            # (P, T)
-    sin_mid = np.sin(th_mid).astype(pose.dtype, copy=False)            # (P, T)
-
+    # 중간 방향
+    th_mid = th0 + 0.5 * delta_theta
+    cos_mid = torch.cos(th_mid)
+    sin_mid = torch.sin(th_mid)
     if normalize_yaw:
         cos_mid, sin_mid = _normalize_cos_sin(cos_mid, sin_mid, eps=float(eps))
 
-    # 3) 지도 기준 속도
-    vwx = ((x1 - x0) / dt_s).astype(pose.dtype, copy=False)  # (P, T)
-    vwy = ((y1 - y0) / dt_s).astype(pose.dtype, copy=False)  # (P, T)
+    # world 속도
+    vwx = (x1 - x0) / dt_f
+    vwy = (y1 - y0) / dt_f
 
-    # 4) 지도 -> 차량(몸체) (중간 방향으로 거꾸로 회전)
-    vx_b = (cos_mid * vwx + sin_mid * vwy).astype(pose.dtype, copy=False)     # (P, T)
-    vy_b = (-sin_mid * vwx + cos_mid * vwy).astype(pose.dtype, copy=False)   # (P, T)
+    # world -> body (중간 방향 기준)
+    vx_b = cos_mid * vwx + sin_mid * vwy
+    vy_b = -sin_mid * vwx + cos_mid * vwy
 
-    # 출력: (P, T, 3)
-    future_seg_control_gt_3_dim = np.stack([vx_b, vy_b, omega], axis=-1).astype(pose.dtype, copy=False)
-    return future_seg_control_gt_3_dim
-
+    out = torch.stack([vx_b, vy_b, yaw_rate], dim=-1)  # (B, P, T, 3)
+    return out.to(dtype=cur_future_pose_gt_3_dim.dtype)
 
 def _build_seg_control_gt_and_seg_valid_from_all11(
-    ego_all11: ArrayF,  # (T,11)
-    neighbor_all11: ArrayF,  # (N,T,11)
+    ego_all11: torch.Tensor,       # (B, 1+T, C>=4)
+    neighbor_all11: torch.Tensor,  # (B, Pnn, 1+T, C>=4)
     *,
     current_index: int,
     dt: float,
     eps: float = 1e-8,
-) -> Tuple[ArrayF, NDArray[np.bool_]]:
-    """11차원 궤적에서 구간 제어와 구간 유효 마스크를 계산합니다.
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """상태열에서 구간 제어와 구간 유효 마스크를 계산합니다 (torch/batch 지원).
 
-    동작 요약:
-        - (x,y,cos,sin,...) 값이 모두 0에 가깝다면 그 프레임은 무효로 봅니다.
-        - 두 프레임이 연속으로 유효일 때만 그 사이 "구간"을 유효로 봅니다(seg_valid=True).
-        - current_index 위치의 프레임이 무효라면(현재가 무효),
-          해당 에이전트의 전체 궤적을 0으로 만들어 결과도 전부 0이 되게 합니다.
+    유효 판정
+    --------
+    - 한 프레임에서 앞쪽 값들(최대 8개, 없으면 가능한 만큼) 중 하나라도 0이 아니면 유효.
+    - 구간(seg)은 양 끝 프레임이 모두 유효일 때만 유효.
+
+    추가 안전 규칙
+    ------------
+    - current_index 프레임이 무효인 agent는 해당 agent의 전체 상태열을 0으로 만들어
+      결과(control)가 전부 0이 되게 합니다.
 
     Args:
-        ego_all11 (np.ndarray): ego 궤적. shape: (T, 11)
-        neighbor_all11 (np.ndarray): neighbor 궤적. shape: (N, T, 11)
-        current_index (int): "현재 프레임"이 들어있는 인덱스
-        dt (float): 시간 간격
-        eps (float): 0 판정 기준
+        ego_all11 (torch.Tensor): ego 상태열. shape: (B, 1+T, C), C>=4
+        neighbor_all11 (torch.Tensor): near 상태열. shape: (B, Pnn, 1+T, C), C>=4
+        current_index (int): 현재 프레임 인덱스. shape: ()
+        dt (float): 시간 간격. shape: ()
+        eps (float): 0 판정 기준. shape: ()
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]:
-            controls: shape (1+N, T-1, 3)
-                - 마지막 3은 (v_x^b, v_y^b, yaw_rate)
-            seg_valid: shape (1+N, T-1) bool
-                - 구간이 유효하면 True
+        Tuple[torch.Tensor, torch.Tensor]:
+            - controls: shape (B, 1+Pnn, T, 3)
+            - seg_valid: shape (B, 1+Pnn, T) bool
     """
-    ego11 = np.asarray(ego_all11)
-    nbr11 = np.asarray(neighbor_all11)
+    if not isinstance(ego_all11, torch.Tensor):
+        raise TypeError("ego_all11은 torch.Tensor여야 합니다.")
+    if not isinstance(neighbor_all11, torch.Tensor):
+        raise TypeError("neighbor_all11은 torch.Tensor여야 합니다.")
 
-    if ego11.ndim != 2 or int(ego11.shape[-1]) != 11:
-        raise ValueError(f"ego_all11 shape는 (T,11) 이어야 합니다. got {ego11.shape}")
-    if nbr11.ndim != 3 or int(nbr11.shape[-1]) != 11:
-        raise ValueError(f"neighbor_all11 shape는 (N,T,11) 이어야 합니다. got {nbr11.shape}")
-    if int(nbr11.shape[1]) != int(ego11.shape[0]):
-        raise ValueError(f"T 차원이 일치해야 합니다. got ego T={ego11.shape[0]} vs nbr T={nbr11.shape[1]}")
+    if ego_all11.dim() != 3:
+        raise ValueError(f"ego_all11은 (B, 1+T, C) 이어야 합니다. got {tuple(ego_all11.shape)}")
+    if neighbor_all11.dim() != 4:
+        raise ValueError(f"neighbor_all11은 (B, Pnn, 1+T, C) 이어야 합니다. got {tuple(neighbor_all11.shape)}")
 
-    T = int(ego11.shape[0])
-    if T <= 1:
-        raise ValueError(f"T는 최소 2 이상이어야 합니다. got T={T}")
+    b = int(ego_all11.shape[0])
+    t_all = int(ego_all11.shape[1])          # 1+T
+    c = int(ego_all11.shape[2])              # C
+    pnn = int(neighbor_all11.shape[1])
 
-    dt = float(dt)
-    if (not np.isfinite(dt)) or dt <= 0.0:
-        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
+    if t_all <= 1:
+        raise ValueError(f"1+T는 최소 2 이상이어야 합니다. got {t_all}")
+    if c < 4 or int(neighbor_all11.shape[-1]) < 4:
+        raise ValueError(
+            "입력 마지막 차원은 최소 4(x,y,cos,sin)이어야 합니다. "
+            f"ego C={c}, near C={int(neighbor_all11.shape[-1])}"
+        )
+    if int(neighbor_all11.shape[0]) != b or int(neighbor_all11.shape[2]) != t_all:
+        raise ValueError(
+            "neighbor_all11의 (B, 1+T) 축이 ego_all11과 같아야 합니다. "
+            f"ego={tuple(ego_all11.shape)}, neighbor={tuple(neighbor_all11.shape)}"
+        )
+
+    dt_f = float(dt)
+    if (not torch.isfinite(torch.tensor(dt_f))) or dt_f <= 0.0:
+        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt_f}")
 
     cur_idx = int(current_index)
     if cur_idx < 0:
-        cur_idx += T
-    if not (0 <= cur_idx < T):
-        raise ValueError(f"current_index 범위가 잘못되었습니다. got {current_index}, T={T}")
+        cur_idx += t_all
+    if not (0 <= cur_idx < t_all):
+        raise ValueError(f"current_index 범위가 잘못되었습니다. got {current_index}, (1+T)={t_all}")
 
-    # float dtype 강제(삼각함수/나눗셈 안정)
-    ego11 = ego11.astype(np.float32 if ego11.dtype.kind != "f" else ego11.dtype, copy=False)
-    nbr11 = nbr11.astype(ego11.dtype, copy=False)
+    # 유효 판정에 쓸 차원 수(최대 8개, 없으면 가능한 만큼)
+    valid_dim = int(min(8, c, int(neighbor_all11.shape[-1])))
 
-    # (안전) "현재"가 무효면 그 에이전트 전체를 0으로
-    ego_cur_valid = bool((np.abs(ego11[cur_idx, :8]) > eps).any())
-    if not ego_cur_valid:
-        ego11 = np.zeros_like(ego11)
+    ego11 = ego_all11.to(dtype=torch.float32)
+    nbr11 = neighbor_all11.to(dtype=torch.float32)
 
-    N = int(nbr11.shape[0])
-    if N > 0:
-        nbr_cur_valid_mask = (np.abs(nbr11[:, cur_idx, :8]) > eps).any(axis=1)  # (N,)
-        if not np.all(nbr_cur_valid_mask):
-            nbr11 = np.array(nbr11, copy=True)
-            nbr11[~nbr_cur_valid_mask, :, :] = 0.0
+    # (1) current_index가 무효인 agent는 전체를 0으로
+    # ego_cur_valid: (B,)
+    ego_cur_valid = torch.any(torch.abs(ego11[:, cur_idx, :valid_dim]) > float(eps), dim=-1)
+    ego11 = ego11 * ego_cur_valid[:, None, None].to(dtype=ego11.dtype)
 
-    # 11D -> pose3(x,y,heading)
-    ego_pose3 = _traj11_to_traj3_heading(ego11)  # (T,3)
-    nbr_pose3 = _traj11_to_traj3_heading(nbr11)  # (N,T,3)
-    all_pose3 = np.concatenate([ego_pose3[None, ...], nbr_pose3], axis=0).astype(np.float32, copy=False)
-    # all_pose3: (1+N, T, 3)
+    if pnn > 0:
+        # nbr_cur_valid: (B, Pnn)
+        nbr_cur_valid = torch.any(torch.abs(nbr11[:, :, cur_idx, :valid_dim]) > float(eps), dim=-1)
+        nbr11 = nbr11 * nbr_cur_valid[:, :, None, None].to(dtype=nbr11.dtype)
 
-    # frame valid -> seg valid
-    ego_valid = (np.abs(ego11[:, :8]) > eps).any(axis=1)            # (T,)
-    nbr_valid = (np.abs(nbr11[:, :, :8]) > eps).any(axis=2)         # (N,T)
-    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N,T)
-    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)  # (1+N,T-1)
+    # (2) ego + near 합치기: (B, 1+Pnn, 1+T, C)
+    all11 = torch.cat([ego11[:, None, :, :], nbr11], dim=1)
 
-    # controls
-    controls = differentiate_numpy_pose3_to_control3(all_pose3, dt=dt).astype(np.float32, copy=False)
-    # controls: (1+N, T-1, 3)
+    # (3) seg_valid 만들기
+    # frame_valid: (B, 1+Pnn, 1+T)
+    frame_valid = torch.any(torch.abs(all11[..., :valid_dim]) > float(eps), dim=-1)
+    # seg_valid: (B, 1+Pnn, T)
+    seg_valid = frame_valid[..., :-1] & frame_valid[..., 1:]
 
-    return controls, seg_valid
+    # (4) pose3 -> control3
+    pose3 = _traj11_to_traj3_heading(all11)  # (B, 1+Pnn, 1+T, 3)
+    controls = differentiate_numpy_pose3_to_control3(pose3, dt=dt_f, eps=float(eps))  # (B, 1+Pnn, T, 3)
+
+    # (5) 무효 구간은 0
+    controls = controls * seg_valid[..., None].to(dtype=controls.dtype)
+
+    return controls.to(dtype=ego_all11.dtype), seg_valid
+from typing import Tuple
+import torch
 
 
 def _build_generated_demo_futures_from_selected_traj(
     *,
-    unnorm_selected_gt_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, 4)
-) -> Tuple[torch.Tensor, torch.Tensor,
-           torch.Tensor]:  # (B, future_len, 4) / (B, Pnn, future_len, 4)
-    """선택(및 복구)된 경로로 저장용 미래 GT 텐서를 만듭니다.
-
-    동작
-    ----
-    - 선택된 경로의 미래(1..future_len)를 저장용 GT로 사용합니다.
-    - 단, (샘플, 에이전트)별로 GT가 실제로 존재하는 스텝 수만 남기고,
-      그 뒤는 0으로 만듭니다.
-      (rollout에서 step이 앞으로 갈수록 뒤쪽 GT가 0으로 사라지는 상황을 그대로 유지)
+    unnorm_selected_gt_traj: torch.Tensor,  # (B, 1+Pnn, 1+future_len, C>=4)
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """선택된 경로로 저장용 미래 포즈와 미래 구간 제어를 만듭니다.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - ego_future_gt_4_dim:  (B_all, future_len, 4)
-            - near_future_gt_4_dim: (B_all, Pnn, future_len, 4)
-            - future_seg_control_gt_3_dim: (B_all, 1+Pnn, future_len, 3)
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - ego_future_gt_4_dim:  (B, future_len, 4)
+            - near_future_gt_4_dim: (B, Pnn, future_len, 4)
+            - future_seg_control_gt_3_dim: (B, 1+Pnn, future_len, 3)
     """
-    # selected_future_all: (B_all, 1+Pnn, future_len, 4)
-    selected_future_all = unnorm_selected_gt_traj[:, :, 1:, :]
-    # demo_ego:  (B_all, future_len, 4)
-    # demo_near: (B_all, Pnn, future_len, 4)  (Pnn이 0이면 (B_all,0,future_len,4))
-    demo_ego = selected_future_all[:, 0, :, :] # (B_all, future_len, 4)
-    demo_near = selected_future_all[:, 1:, :, :] # (B_all, Pnn, future_len, 4)
+    if not isinstance(unnorm_selected_gt_traj, torch.Tensor):
+        raise TypeError("unnorm_selected_gt_traj는 torch.Tensor여야 합니다.")
+    if unnorm_selected_gt_traj.dim() != 4:
+        raise ValueError(
+            "unnorm_selected_gt_traj는 (B, 1+Pnn, 1+future_len, C) 이어야 합니다. "
+            f"got shape={tuple(unnorm_selected_gt_traj.shape)}"
+        )
+    if int(unnorm_selected_gt_traj.shape[-1]) < 4:
+        raise ValueError(
+            "unnorm_selected_gt_traj 마지막 차원은 최소 4(x,y,cos,sin)이어야 합니다. "
+            f"got shape={tuple(unnorm_selected_gt_traj.shape)}"
+        )
 
-    # future_seg_control_gt_3_dim : (1+Pnn, future_len, 3)
-    future_seg_control_gt_3_dim, seg_valid =_build_seg_control_gt_and_seg_valid_from_all11(
-        ego_all11=unnorm_selected_gt_traj[:, 0, :, :],              # (1+Tf,11)
-        neighbor_all11=unnorm_selected_gt_traj[:, 1, :, :],         # (N,1+Tf,11)
-        current_index=0,                  # future에서 현재는 첫 프레임
+    # 미래 포즈(저장용): (B, 1+Pnn, future_len, 4)
+    selected_future_pose4 = unnorm_selected_gt_traj[:, :, 1:, 0:4]
+
+    demo_ego = selected_future_pose4[:, 0, :, :]    # (B, future_len, 4)
+    demo_near = selected_future_pose4[:, 1:, :, :]  # (B, Pnn, future_len, 4)
+
+    # 미래 구간 제어: (B, 1+Pnn, future_len, 3)
+    future_seg_control_gt_3_dim, _seg_valid = _build_seg_control_gt_and_seg_valid_from_all11(
+        ego_all11=unnorm_selected_gt_traj[:, 0, :, :],      # (B, 1+future_len, C)
+        neighbor_all11=unnorm_selected_gt_traj[:, 1:, :, :], # ✅ (B, Pnn, 1+future_len, C)
+        current_index=0,
         dt=float(0.1),
         eps=float(1e-8),
     )
-    future_seg_control_gt_3_dim[~seg_valid] = 0.0
-
 
     return demo_ego, demo_near, future_seg_control_gt_3_dim
+
 
 
 def _get_ego_future_11(

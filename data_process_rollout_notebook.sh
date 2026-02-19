@@ -33,9 +33,9 @@ fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
 #EVAL_SET_PATH="${WOMD_PATH}/processed_womd_final/validation"
-EVAL_SET_PATH="${USER_PATH}/nuplan/dataset/processed_compressed"
-EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_processed_compressed.json"
 
+EVAL_SET_PATH="${WOMD_PATH}/processed_womd_0124/validation"
+EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
 #EVAL_SET_PATH="${WOMD_PATH}/processed_womd_0124/validation"
 #EVAL_SET_LIST_PATH="${USER_PATH}/PycharmProjects/Diffusion-Planner/diffusion_planner_validation.json"
 ###################################
@@ -169,16 +169,22 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "wosac_final_0128" \
-  --name "wosac_final_0128" \
+  --load_name "38_control_only_new_network_1e-3" \
+  --name "38_control_only_new_network_1e-3" \
   --eval_method "fine_tune_data_maker" \
   --batch_size 1 \
+  --pose_based False \
+  --profile_feasible False \
+  --use_feasible True \
+  --use_feasible_dl False \
+  --use_feasible_filter True \
+  --feasible_grad_to_dit False \
   --use_wandb False \
   --use_deepspeed True \
   --save_image True \
   --save_video True \
-  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0131_6" \
-  --save_inference_data False \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0218" \
+  --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --fine_tune_gen_k 16 \
