@@ -1819,9 +1819,9 @@ class Decoder(nn.Module):
                                               dtype=torch.bool,
                                               device=xT.device)
 
-        # (1) 모델 1회 호출: x0_pred (flat)
+        # (1) 모델 1회 호출: diffusion_output (flat)
         """
-        # 2) x0_pred and xT_f32
+        # 2) diffusion_output and xT_f32
         pose_based = True
             (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
         pose_based = False
@@ -1838,14 +1838,14 @@ class Decoder(nn.Module):
             cross_mask=scene_encoding_token_mask,  # (B, token_num)
             low_t_mask=low_t_mask,  # (B,)
         )
-        # # (2) guidance를 x0_pred에 반영 (선택)
+        # # (2) guidance를 diffusion_output에 반영 (선택)
         # if self._guidance_fn is not None and float(
         #         self.config.guidance_scale) != 0.0:
         #     # guidance_fn이 low_t_mask를 쓰는 경우를 위해 전달(너의 기존 의도 유지)
         #     classifier_kwargs["low_t_mask"] = low_t_mask
-            # x0_pred = self._apply_classifier_guidance_for_amortized_one_step(
+            # diffusion_output = self._apply_classifier_guidance_for_amortized_one_step(
             #     xT_flat=xT_f32,  # (B,Pnn,F)
-            #     x0_pred_flat=x0_pred,  # (B,Pnn,F)
+            #     diffusion_output_flat=diffusion_output,  # (B,Pnn,F)
             #     t_tau=t_tau,  # (B,future_len)
             #     classifier_kwargs=classifier_kwargs,
             #     guidance_scale=self.config.guidance_scale,
@@ -1854,9 +1854,9 @@ class Decoder(nn.Module):
         #
         # # (3) correcting_xt_fn을 x0 공간에서 1회 적용 (선택)
         # if correcting_xt_fn is not None:
-        #     x0_pred = correcting_xt_fn(diffusion_output, t_tau, 0)
+        #     diffusion_output = correcting_xt_fn(diffusion_output, t_tau, 0)
         #
-        # _require_finite("amortized_one_step_x0", x0_pred)
+        # _require_finite("amortized_one_step_x0", diffusion_output)
         return diffusion_output
 
     def _reshape_inference_x0_to_sequence(
@@ -2414,7 +2414,7 @@ class Decoder(nn.Module):
         one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
         """ decoder_output_dict
-        diffusion_trajectory : (B, (1+)Pnn, 1+T, 4)
+        diffusion_trajectory : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
         "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
         "control_constraint_diff" : (B, (1+)Pnn, T, 3)
         "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2569,14 +2569,8 @@ class Decoder(nn.Module):
                         self._amortized_buffer = control_sequence  # (B, 1+Pnn, T, 3)
 
                 else:
-                    # TODO: self.dit.norm_dit_returns.diffusion_trajectory 를 쓸게 아니고,
-                    #  correction function까지 거친 궤적을 써야한다.
                     # (B, 1+Pnn, T, 4 or 3)
-                    diffusion_trajectory = self.dit.norm_dit_returns.diffusion_trajectory.to(
-                        device=target_current_xyyaw.device,
-                        dtype=target_current_xyyaw.dtype,
-                    ).detach()
-                    self._amortized_buffer = diffusion_trajectory[:, :,
+                    self._amortized_buffer = diffusion_cur_future_trajectory[:, :,
                                                                   -self.config.
                                                                   future_len:, :].detach(
                                                                   )
@@ -2653,6 +2647,7 @@ class Decoder(nn.Module):
         if self.training:
             """ decoder_output_dict
             diffusion_output : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
+            diffusion_trajectory : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             "control_constraint_diff" : (B, (1+)Pnn, T, 3)
             "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2672,7 +2667,7 @@ class Decoder(nn.Module):
             )
         else:
             """ decoder_output_dict
-            diffusion_trajectory : (B, (1+)Pnn, 1+T, 4)
+            diffusion_trajectory : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             "control_constraint_diff" : (B, (1+)Pnn, T, 3)
             "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -4398,12 +4393,8 @@ else
             control_constraint_diff = control_constraint_diff.masked_fill(
                 ~target_future_valid.unsqueeze(-1), 0.0)
 
-            self.norm_dit_returns = DiTReturns(
-                integrated_trajectory=
-                integrated_trajectory,  # (B, (1+)Pnn, future_len, 4)
-                control_constraint_diff=
-                control_constraint_diff,  # (B, (1+)Pnn, future_len, 3)
-            )
+            self.norm_dit_returns.integrated_trajectory = integrated_trajectory  # (B,(1+)Pnn,future_len,4)
+            self.norm_dit_returns.control_constraint_diff = control_constraint_diff  # (B,(1+)Pnn,future_len,3)
 
     def _feasible_projection_core_vel(
         self,
@@ -4493,14 +4484,9 @@ else
             })["seg_body_control"].masked_fill(
                 ~target_future_valid.unsqueeze(-1), 0.0)
 
-            self.norm_dit_returns = DiTReturns(
-                integrated_trajectory=integrated_trajectory,
-                control_constraint_diff=control_constraint_diff,
-                control_sequence=norm_control_sequence,
-            )
-            self.norm_dit_returns.integrated_trajectory = integrated_trajectory  # (B,Pnn,future_len,4)
-            self.norm_dit_returns.control_constraint_diff = control_constraint_diff  # (B,Pnn,future_len,3)
-            self.norm_dit_returns.control_sequence = norm_control_sequence  # (B,Pnn,future_len,3)
+            self.norm_dit_returns.integrated_trajectory = integrated_trajectory  # (B,(1+)Pnn,future_len,4)
+            self.norm_dit_returns.control_constraint_diff = control_constraint_diff  # (B,(1+)Pnn,future_len,3)
+            self.norm_dit_returns.control_sequence = norm_control_sequence  # (B,(1+)Pnn,future_len,3)
 
     def _ddp_touch_feasible_projector_params(
         self,
