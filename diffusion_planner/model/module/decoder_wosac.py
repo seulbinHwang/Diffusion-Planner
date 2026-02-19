@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Callable
 import torch.nn as nn
+import diffusion_planner.model.diffusion_utils.dpm_solver_pytorch
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple, Any
@@ -548,8 +549,8 @@ class Decoder(nn.Module):
             last_dim = 3
         diffusion_output = diffusion_output.reshape(B, one_or_Pnn, -1, last_dim)
         # 마지막 (1+T)만 사용: (B, Pnn, T, 4 or 3)
-        diffusion_future_output = diffusion_output[:, :, -(
-            self._future_len):, :]
+        diffusion_future_output = diffusion_output[:, :,
+                                                   -(self._future_len):, :]
         return diffusion_future_output
 
     def _append_training_feasible_outputs(
@@ -660,7 +661,7 @@ class Decoder(nn.Module):
             dim=-1)  # [B, (1+)pnn, time_len + future_len] bool
         return target_past_cur_future_valid
 
-    def _reshape_xt_with_current_state(
+    def _inpainting_past_cur_and_reshape(
         self,
         xt: torch.Tensor,  # shape: (B, Pnn, flattened_dim)
         batch_size: int,
@@ -1150,7 +1151,7 @@ class Decoder(nn.Module):
                                                     0.0)
         return x_seq_out
 
-    def _mask_invalid_timesteps_in_flat_xyyaw(
+    def _mask_zero_at_invalid_timestep_in_seq_flat(
             self,
             x_flat: torch.Tensor,
             # (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (past_len + future_len)*3)
@@ -1242,7 +1243,7 @@ class Decoder(nn.Module):
         pose_based = False
             (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
         """
-        xt_sequence: torch.Tensor = self._reshape_xt_with_current_state(
+        xt_sequence: torch.Tensor = self._inpainting_past_cur_and_reshape(
             xt=xt,
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
@@ -1275,7 +1276,7 @@ class Decoder(nn.Module):
             )
         xt_sequence_flattened = xt_sequence.reshape(B, one_or_Pnn, -1)
         # ✅ 추가: 무효(패딩) 타임스텝을 항상 0으로 강제
-        xt_sequence_flattened = self._mask_invalid_timesteps_in_flat_xyyaw(
+        xt_sequence_flattened = self._mask_zero_at_invalid_timestep_in_seq_flat(
             x_flat=xt_sequence_flattened,  # (B, (1+)Pnn, F)
             target_past_cur_future_valid=
             target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
@@ -1369,7 +1370,6 @@ class Decoder(nn.Module):
         t_eff: torch.Tensor = t_tau.mean(dim=1).to(torch.float32)
         return t_eff
 
-
     def _build_classifier_kwargs_for_guidance(
         self,
         *,
@@ -1406,6 +1406,131 @@ class Decoder(nn.Module):
             "config": self.config,
         }
         return classifier_kwargs
+
+    def _compute_sigma2_over_alpha_for_guidance(
+            self,
+            t_eff: torch.Tensor,
+            reference_tensor_for_device: torch.Tensor,
+    ) -> torch.Tensor:
+        """대표 시간값 t_eff에서 guidance 보정 스케일(sigma^2/alpha)을 계산합니다.
+
+        이 구현은 DPM-Solver가 쓰는 NoiseScheduleVP(schedule="linear")의
+        marginal_alpha / marginal_std를 그대로 재사용합니다.
+
+        Args:
+            t_eff (torch.Tensor):
+                대표 시간값.
+                shape: (B,)
+                dtype: float32 권장
+            reference_tensor_for_device (torch.Tensor):
+                device/dtype 기준 텐서.
+                shape: 임의
+
+        Returns:
+            torch.Tensor:
+                sigma^2/alpha 값.
+                shape: (B, 1, 1)
+                dtype: float32
+        """
+        if t_eff.dim() != 1:
+            raise ValueError(f"t_eff must be 1D (B,). got {tuple(t_eff.shape)}")
+
+        B: int = int(t_eff.shape[0])
+        device = reference_tensor_for_device.device
+
+        t: torch.Tensor = t_eff.detach().to(device=device,
+                                            dtype=torch.float32).view(B)  # (B,)
+
+        # VPSDE_linear와 동일한 beta 범위를 NoiseScheduleVP에 그대로 전달
+        beta_0: float = float(getattr(self._sde, "_beta_min", 0.1))
+        beta_1: float = float(getattr(self._sde, "_beta_max", 20.0))
+
+        noise_schedule = dpm.NoiseScheduleVP(
+            schedule="linear",
+            continuous_beta_0=beta_0,
+            continuous_beta_1=beta_1,
+            dtype=torch.float32,
+        )
+
+        alpha: torch.Tensor = noise_schedule.marginal_alpha(t)  # (B,)
+        sigma: torch.Tensor = noise_schedule.marginal_std(t)  # (B,)
+
+        alpha_safe: torch.Tensor = torch.clamp(alpha, min=1e-6)
+        sigma2_over_alpha: torch.Tensor = (sigma * sigma) / alpha_safe  # (B,)
+
+        return sigma2_over_alpha.view(B, 1, 1)  # (B,1,1)
+
+    def _compute_guidance_grad_wrt_x(
+        self,
+        x_t_flat: torch.Tensor,
+        t_eff: torch.Tensor,
+        classifier_kwargs: Dict[str, object],
+    ) -> torch.Tensor:
+        """guidance_fn 출력(점수)을 x에 대해 미분한 값을 구합니다.
+
+        Args:
+            x_t_flat (torch.Tensor):
+                점수를 평가할 입력 x.
+                보통 "현재 샘플 x_t" 역할을 하는 텐서를 넣습니다.
+                shape: (B, P, F)
+            t_eff (torch.Tensor):
+                대표 시간값.
+                shape: (B,)
+            classifier_kwargs (Dict[str, object]):
+                guidance_fn에 그대로 전달할 추가 정보.
+
+        Returns:
+            torch.Tensor:
+                guidance_fn 점수의 x에 대한 미분값.
+                shape: (B, P, F)
+                dtype: float32
+        """
+        if self._guidance_fn is None:
+            raise RuntimeError(
+                "self._guidance_fn is None, but guidance grad was requested.")
+        if x_t_flat.dim() != 3:
+            raise ValueError(
+                f"x_t_flat must be 3D (B,P,F). got {tuple(x_t_flat.shape)}")
+        if t_eff.dim() != 1:
+            raise ValueError(f"t_eff must be 1D (B,). got {tuple(t_eff.shape)}")
+
+        # 바깥이 torch.no_grad / torch.inference_mode 여도 여기서는 미분이 가능해야 합니다.
+        with torch.inference_mode(False), torch.enable_grad():
+            x_in: torch.Tensor = (x_t_flat.detach().to(
+                dtype=torch.float32).clone().requires_grad_(True)
+                                 )  # (B,P,F) float32, requires_grad=True
+
+            t_in: torch.Tensor = t_eff.detach().to(
+                device=x_in.device,
+                dtype=torch.float32,
+            )  # (B,)
+
+            # guidance_fn 시그니처가 (x,t,model_out,**kw) 또는 (x,t,**kw) 둘 다 가능하게 처리
+            try:
+                score = self._guidance_fn(x_in, t_in, None, **classifier_kwargs)
+            except TypeError:
+                score = self._guidance_fn(x_in, t_in, **classifier_kwargs)
+
+            if not isinstance(score, torch.Tensor):
+                raise TypeError("guidance_fn must return a torch.Tensor. "
+                                f"got {type(score)}")
+
+            score_sum: torch.Tensor = score.float().sum()
+
+            grad = torch.autograd.grad(
+                outputs=score_sum,
+                inputs=x_in,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+
+        if grad is None:
+            raise RuntimeError(
+                "guidance gradient is None. guidance_fn 내부에서 x와의 연결이 끊겼을 수 있습니다."
+            )
+
+        return grad.detach()  # (B,P,F) float32
 
     def _run_dpm_sampler_for_inference(
         self,
@@ -1496,30 +1621,59 @@ class Decoder(nn.Module):
         pose_based = False
             (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
         """
-        # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
-        diffusion_output: torch.Tensor = self.dit(
+
+        # (1) 모델 1회 호출 (side-effect로 self.dit.diffusion_trajectory_flat = x0 후보가 채워짐)
+        _ = self.dit(
             target_input_norm_xT=xT_f32,  # (B, Pnn, F)
             diffusion_time=t_tau,  # (B, future_len)
-            target_agents_past=target_agents_past,  # (B, (1+)Pnn, time_len, 11)
+            target_agents_past=target_agents_past,
             target_past_cur_future_valid=target_past_cur_future_valid,
-            # (B, (1+)Pnn, time_len_total)
-            cross_c=scene_encoding_token,  # (B, token_num, D)
-            cross_mask=scene_encoding_token_mask,  # (B, token_num)
-            low_t_mask=low_t_mask,  # (B,)
+            cross_c=scene_encoding_token,
+            cross_mask=scene_encoding_token_mask,
+            low_t_mask=low_t_mask,
         )
-        # TODO
-        """ TODO
-        amortized diffusion 과정 중, diffusion_steps = 1 인 과정에도,
-        dpm_solver.sample(..., denoise_to_zero=True) 에서 수행하는 것처럼
-            denoise_to_zero_fn 에 상응하는 걸 호출하고,
-            correcting_xt_fn 을 호출해야 합니다.
-        이를 통해 diffusion_trajectory 
-            pose_based = True
-                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-            pose_based = False
-                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
-        가 최종 출력 형태로 나와야 합니다.
-        """
+
+        # (2) denoise_to_zero 역할: DiT가 저장해둔 x0 후보(flat)를 가져온다.
+        x0_base_flat = getattr(self.dit, "diffusion_trajectory_flat", None)
+        if not isinstance(x0_base_flat, torch.Tensor):
+            raise RuntimeError("self.dit.diffusion_trajectory_flat is not set. "
+                               "DiT.forward가 x0 후보를 저장하지 못했습니다.")
+        x0_base_flat = x0_base_flat.to(device=xT_f32.device,
+                                       dtype=torch.float32)  # (B,P,F)
+
+        # (3) guidance/correction에 쓸 대표 시간 t_eff: (B,)
+        t_eff: torch.Tensor = self._compute_amortized_t_eff(t_tau).to(
+            device=xT_f32.device, dtype=torch.float32)  # (B,)
+
+        # (4) (옵션) classifier guidance를 x0에 반영
+        x0_guided_flat: torch.Tensor = x0_base_flat
+        guidance_scale: float = float(
+            getattr(self.config, "guidance_scale", 0.0))
+
+        if (self._guidance_fn is not None) and (guidance_scale != 0.0):
+            # grad: (B,P,F) float32
+            grad: torch.Tensor = self._compute_guidance_grad_wrt_x(
+                x_t_flat=xT_f32,  # DPM-Solver에서의 x_t 역할
+                t_eff=t_eff,  # 대표 시간
+                classifier_kwargs=classifier_kwargs,
+            )
+
+            # scale: (B,1,1) float32
+            sigma2_over_alpha: torch.Tensor = self._compute_sigma2_over_alpha_for_guidance(
+                t_eff=t_eff,
+                reference_tensor_for_device=xT_f32,
+            )
+
+            # x0_guided = x0_base + guidance_scale * (sigma^2/alpha) * grad
+            x0_guided_flat = x0_base_flat + (guidance_scale *
+                                             sigma2_over_alpha) * grad
+
+        # (5) correcting_xt_fn을 마지막에 1회 호출 (마스크/현재상태 주입/단위원 정리 포함)
+        diffusion_trajectory: torch.Tensor = correcting_xt_fn(
+            x0_guided_flat.detach(),  # (B,P,F)
+            t_eff,  # (B,)
+            0,  # step
+        )
         return diffusion_trajectory
 
     def _reshape_inference_x0_to_sequence(
@@ -1557,7 +1711,7 @@ class Decoder(nn.Module):
                 last_dim,
             )
             diffusion_cur_future_trajectory = diffusion_cur_future_trajectory[:, :,
-                                                                      -seq_len:, :]
+                                                                              -seq_len:, :]
             return diffusion_cur_future_trajectory
         if self.config.use_current_input:
             diffusion_cur_future_trajectory = diffusion_trajectory.reshape(
@@ -1568,7 +1722,7 @@ class Decoder(nn.Module):
                 [
                     target_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
                     diffusion_trajectory.reshape(B, one_or_Pnn, seq_len,
-                                             last_dim),  # (B,Pnn,T,4)
+                                                 last_dim),  # (B,Pnn,T,4)
                 ],
                 dim=2,
             )  # (B,Pnn,1+T,4)
@@ -1663,7 +1817,7 @@ class Decoder(nn.Module):
         (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
         """
         # ✅ 추가: DiT 입력에서도 무효 타임스텝 0 처리(실수로 downstream에서 쓰여도 안전)
-        xT_input_flat = self._mask_invalid_timesteps_in_flat_xyyaw(
+        xT_input_flat = self._mask_zero_at_invalid_timestep_in_seq_flat(
             x_flat=xT_input_flat,
             target_past_cur_future_valid=
             target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
@@ -1726,7 +1880,8 @@ class Decoder(nn.Module):
         "control_constraint_diff" : (B, (1+)Pnn, T, 3)
         "control_sequence" : (B, (1+)Pnn, T, 3)
         """
-        decoder_output_dict["diffusion_trajectory"] = self.dit.norm_dit_returns.diffusion_trajectory
+        decoder_output_dict[
+            "diffusion_trajectory"] = self.dit.norm_dit_returns.diffusion_trajectory
         # 4) feasible 출력 추가(옵션)
         self._append_training_feasible_outputs(
             decoder_output_dict=decoder_output_dict,
@@ -2173,7 +2328,7 @@ class Decoder(nn.Module):
                 # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
             )  # (B,Pnn,F)
             # ✅ 추가: 샘플링 시작점부터 무효 타임스텝 0 처리
-            xT = self._mask_invalid_timesteps_in_flat_xyyaw(
+            xT = self._mask_zero_at_invalid_timestep_in_seq_flat(
                 x_flat=xT,
                 target_past_cur_future_valid=
                 target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
@@ -2217,7 +2372,8 @@ class Decoder(nn.Module):
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
             # 6) diffusion_cur_future_trajectory: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
-            decoder_output_dict["diffusion_trajectory"] = diffusion_cur_future_trajectory
+            decoder_output_dict[
+                "diffusion_trajectory"] = diffusion_cur_future_trajectory
             # self.dit.norm_dit_returns.integrated_trajectory : (B, (1+)Pnn, T, 4) 정규화 상태
             if self.config.use_amortized_diffusion:
                 if self.config.use_feasible:
@@ -2237,9 +2393,12 @@ class Decoder(nn.Module):
                 else:
                     # (B, 1+Pnn, T, 4 or 3)
                     self._amortized_buffer = diffusion_cur_future_trajectory[:, :,
-                                                                  -self.config.
-                                                                  future_len:, :].detach(
-                                                                  )
+                                                                             -self
+                                                                             .
+                                                                             config
+                                                                             .
+                                                                             future_len:, :].detach(
+                                                                             )
 
                 rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
                 rollout_time_chunk_size_int = int(
@@ -2262,7 +2421,7 @@ class Decoder(nn.Module):
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
             """ decoder_output_dict
-            "diffusion_output" : (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
+            "diffusion_output" : (B, (1+)Pnn, T, 4) / (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             "control_constraint_diff" : (B, (1+)Pnn, T, 3)
             "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2385,6 +2544,7 @@ class DiT(nn.Module):
                  model_type="x_start"):
         super().__init__()
         self.norm_dit_returns = None
+        self.diffusion_trajectory_flat = None
         self.config = config
         self._future_len: int = config.future_len  # <추가하자>
         self._time_len: int = config.time_len  # <추가하자>
@@ -3700,11 +3860,6 @@ else
             #     diffusion_time=diffusion_time,
             # )
         elif self._model_type == "v":
-            """
-            $\hat{x}_0=\alpha_t x_t-\sigma_t\hat{v}_t$ 수식을 이용해서, x_0 를 복원하는 코딩을 구현하고 싶다.
-            
-             # x_t_flat: (B, (1+)Pnn, F)
-            """
             x0 = self._get_x0_from_v(diffusion_output, diffusion_time,
                                      target_past_cur_future_valid, x_t_flat)
         elif self._model_type == "x_start":
@@ -3713,20 +3868,30 @@ else
             x0 = diffusion_output
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
-            """ x0_4dim
+        """ self.diffusion_trajectory_flat = x0
+        pose_based:
+            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
+        else:
+            (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
+        """
+        self.diffusion_trajectory_flat = x0
+        """ x0_4dim
         pose_based:
             (B, (1+)Pnn, (time_len+ T) ,4) or (B, (1+)Pnn, T,4) or (B, (1+)Pnn, (1+T),4)
         else:
             (B, (1+)Pnn, (past_len + T) ,3) or (B, (1+)Pnn, T,3)
-            """
+        """
         if self.config.pose_based:
             x0_4dim = x0.reshape(B, one_or_Pnn, -1, 4)  # (B, (1+)Pnn, T_any, 4)
-            target_current_xyyaw = target_agents_past[:, :, -1:, :4]  # (B,P,1,4)
-            x0_future_4dim = x0_4dim[:, :, -self._future_len:, :] # (B,P,F_future,4)
-            x0_4dim = torch.cat([target_current_xyyaw, x0_future_4dim], dim=2)  # (B,P,1+T,4)
+            target_current_xyyaw = target_agents_past[:, :,
+                                                      -1:, :4]  # (B,P,1,4)
+            x0_future_4dim = x0_4dim[:, :,
+                                     -self._future_len:, :]  # (B,P,F_future,4)
+            x0_4dim = torch.cat([target_current_xyyaw, x0_future_4dim],
+                                dim=2)  # (B,P,1+T,4)
         else:
             x0_4dim = x0.reshape(B, one_or_Pnn, -1, 3)  # (B, (1+)Pnn, T_any, 3)
-            x0_4dim = x0_4dim[:, :, -self._future_len:, :] # (B,P,F_future,3)
+            x0_4dim = x0_4dim[:, :, -self._future_len:, :]  # (B,P,F_future,3)
         """
         diffusion_trajectory
             pose_based:

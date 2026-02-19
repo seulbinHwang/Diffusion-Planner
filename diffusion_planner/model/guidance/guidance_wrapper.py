@@ -17,6 +17,30 @@ class GuidanceWrapper:
 
     def __call__(self, x_in, t_input, cond, *args, **kwargs):
         """
+        TODO
+2) GuidanceWrapper는 무조건 (...,4)로 reshape 함 → pose_based=False면 바로 터짐
+
+GuidanceWrapper에서 x_fix = x_fix.reshape(B,P,-1,4) / x_dit = x_dit.reshape(B,P,-1,4)를 고정으로 함.
+
+그러면 pose_based=False(3차원 control)에서는 shape이 3의 배수라서 바로 에러 날 거야.
+
+3) model_type="v"일 때 GuidanceWrapper의 “의미”가 어긋날 수 있음
+
+GuidanceWrapper는 x_dit를 사실상 model(x_in, t) 출력으로 만들고(= x_in + (model(x_in,t)-x_in)),
+
+그걸 “정규화된 pose 궤적”처럼 reshape해서 feasible_guidance_fn(x_dit, ...)에 넣고 있어.
+
+그런데 네 DiT는
+
+model_type="x_start"면 model(...) 출력이 x0라서 괜찮을 수 있는데,
+
+model_type="v"면 model(...) 출력이 v(속도 파라미터) 이고, 그걸 pose처럼 취급하면 guidance 의미가 깨질 가능성이 커.
+
+→ 설계안에서 너가 강조한 “x0_base를 기반으로 마지막 정리” 관점과도 어긋나.
+(v를 쓰는 경우라면, guidance가 참조할 “x_dit”를 model.diffusion_trajectory_flat(= x0) 쪽으로 잡는 게 더 일관돼.)
+
+        """
+        """
         This function is a wrapper for the guidance functions in the model.
 
         kwargs
@@ -59,7 +83,7 @@ class GuidanceWrapper:
 
         assert x_fix.requires_grad, \
             " GuidanceWrapper 입력이 x_in에 대한 gradient를 가지지 않습니다."
-        feasible_returns = model.dit_returns
+        feasible_returns = model.norm_dit_returns
         kwargs[
             "integrated_trajectory"] = feasible_returns.integrated_trajectory  # (B,Pnn,T,4)
         kwargs[
