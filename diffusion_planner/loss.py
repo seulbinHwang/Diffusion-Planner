@@ -821,11 +821,10 @@ def _forward_model_with_autocast(
 
 
 def extract_diffusion_output_from_decoder(
-    future_len: int,
     decoder_output: Dict[str, torch.Tensor],
 ) -> torch.Tensor:
     """decoder_output 에서 미래 diffusion_output 만 꺼내고 모양을 확인한다.
-        # (B,(1+)Pnn,1+T,4) or (B, (1+)Pnn, T, 3)
+        # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     Args:
         decoder_output: model(...) 의 두 번째 반환 dict.
     Returns:
@@ -833,7 +832,7 @@ def extract_diffusion_output_from_decoder(
     """
     # decoder_output["x0"]: (B, one_or_Pnn, 1+future_len, 4)
     diffusion_output: torch.Tensor = decoder_output[
-        "diffusion_output"][:, :, -future_len:, :]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+        "diffusion_output"]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     diffusion_output = _require_finite("decoder_output['diffusion_output']", diffusion_output)
     return diffusion_output
 
@@ -841,56 +840,62 @@ def extract_diffusion_output_from_decoder(
 def _compute_dpm_loss(
         args: Any,
         model_type: str,
-        diffusion_output: torch.
-    Tensor,  # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, T, 3)
-        std: torch.Tensor,  # (B, 1, 1, 1)
-        random_noise: torch.Tensor,  # (B, (1+)Pnn, future_len, 4 or 3)
-        normed_target_future_seq_gt: torch.
-    Tensor,  # (B, (1+)Pnn, future_len, 4 or 3)
+        diffusion_output: torch.Tensor,  # (B, (1+)Pnn, T, C)
+        std: torch.Tensor,               # (B, 1, 1, 1) or (B, 1, T, 1)
+        random_noise: torch.Tensor,      # (B, (1+)Pnn, T, C)
+        normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, T, C)
 ) -> torch.Tensor:
-    """기존 diffusion 손실(score/x_start)을 (B,P,future_len) 형태로 계산한다.
+    """diffusion 학습 손실을 (B,P,T) 형태로 계산한다.
 
-    Args:
-        args: args.use_huber_loss 사용.
-        model_type: "score" 또는 "x_start".
-
-    Returns:
-        dpm_loss: (B, (1+)Pnn, future_len) 위치별 손실 값.
+    지원하는 예측 타입:
+      - "x_start": 정답 x0와의 차이
+      - "v"      : 정답 v와의 차이 (v = α*ε - σ*x0)
     """
     HUBER_DELTA: float = 1.0
 
-    if args.use_huber_loss:
-        # err: (B, (1+)Pnn, future_len, 4 or 3)
-        if model_type == "score":
-            raise NotImplementedError("score 방식은 지원하지 않음")
-            # err: torch.Tensor = score * std + random_noise
-        elif model_type == "x_start":
-            # err: (B, (1+)Pnn, future_len, 4 or 3)
-            err = diffusion_output - normed_target_future_seq_gt
+    if bool(getattr(args, "use_huber_loss", False)):
+        if model_type == "x_start":
+            target = normed_target_future_seq_gt  # (B,P,T,C)
+        elif model_type == "v":
+            target = _get_v_target_future_seq_gt(
+                normed_target_future_seq_gt=normed_target_future_seq_gt,  # (B,P,T,C)
+                random_noise=random_noise,                                # (B,P,T,C)
+                std=std,                                                  # (B,1,1,1) or (B,1,T,1)
+                target_future_valid=None,
+            )  # (B,P,T,C)
+        elif model_type == "score":
+            raise NotImplementedError("score 방식은 현재 코드에서 지원하지 않음")
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
-        abs_err: torch.Tensor = err.abs()  # (B, (1+)Pnn, future_len, 4 or 3)
-        quad: torch.Tensor = 0.5 * err.pow(
-            2)  # (B, (1+)Pnn, future_len, 4 or 3)
-        lin: torch.Tensor = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA
-                                          )  # (B, (1+)Pnn, future_len, 4 or 3)
-        huber: torch.Tensor = torch.where(
-            abs_err <= HUBER_DELTA, quad,
-            lin)  # (B, (1+)Pnn, future_len, 4 or 3)
-        dpm_loss: torch.Tensor = huber.sum(dim=-1)  # (B, (1+)Pnn, future_len)
+        err = diffusion_output - target  # (B,P,T,C)
+
+        abs_err: torch.Tensor = err.abs()              # (B,P,T,C)
+        quad: torch.Tensor = 0.5 * err.pow(2)          # (B,P,T,C)
+        lin: torch.Tensor = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA)  # (B,P,T,C)
+        huber: torch.Tensor = torch.where(abs_err <= HUBER_DELTA, quad, lin)  # (B,P,T,C)
+        dpm_loss: torch.Tensor = huber.sum(dim=-1)     # (B,P,T)
+
     else:
-        if model_type == "score":
-            dpm_loss = torch.sum((score * std + random_noise)**2,
-                                 dim=-1)  # (B, (1+)Pnn, future_len)
-        elif model_type == "x_start":
-            dpm_loss = torch.sum(
-                (score - normed_target_future_seq_gt)**2, dim=-1
-            )  # (B, (1+)Pnn, future_len, 4 or 3) -> (B, (1+)Pnn, future_len)
+        if model_type == "x_start":
+            target = normed_target_future_seq_gt       # (B,P,T,C)
+        elif model_type == "v":
+            target = _get_v_target_future_seq_gt(
+                normed_target_future_seq_gt=normed_target_future_seq_gt,
+                random_noise=random_noise,
+                std=std,
+                target_future_valid=None,
+            )  # (B,P,T,C)
+        elif model_type == "score":
+            raise NotImplementedError("score 방식은 현재 코드에서 지원하지 않음")
         else:
             raise ValueError(f"Unknown model type: {model_type}")
+
+        diff = diffusion_output - target               # (B,P,T,C)
+        dpm_loss = torch.sum(diff.pow(2), dim=-1)      # (B,P,T)
 
     return dpm_loss
+
 
 
 def _aggregate_weighted_loss(
@@ -1231,13 +1236,92 @@ def _should_compute_xy_yaw_metrics_this_step(args: Any) -> bool:
 
     return (step_idx % interval) == 0
 
-def _get_v_target_future_seq_gt(normed_target_future_seq_gt: torch.Tensor) -> torch.Tensor:
-    """
-    # normed_target_future_seq_gt: (B, (1+)Pnn, future_len, 4 or 3)
+from typing import Optional
+import torch
 
-    TODO : $(v = \alpha_t\epsilon - \sigma_t x)$
+def _get_v_target_future_seq_gt(
+    normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, T, C)
+    random_noise: torch.Tensor,                 # (B, (1+)Pnn, T, C)  == epsilon
+    std: torch.Tensor,                          # (B, 1, 1, 1) or (B, 1, T, 1) == sigma(t)
+    target_future_valid: Optional[torch.Tensor] = None,  # (B, (1+)Pnn, T) or None
+    *,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """v 예측 학습에 쓰는 정답(v target)을 만든다.
+
+    이 프로젝트(VPSDE_linear)에서 noisy 값은 아래처럼 만들어집니다.
+
+        x_t = α(t) * x_0 + σ(t) * ε
+
+    여기서
+      - x_0  : 정답(노이즈 없는) 값
+      - ε    : 평균 0, 표준편차 1인 무작위 텐서 (random_noise)
+      - σ(t) : std 텐서
+      - α(t) : VPSDE_linear 정의로부터 α(t) = sqrt(1 - σ(t)^2)
+
+    v 예측의 정답은 아래입니다.
+
+        v = α(t) * ε - σ(t) * x_0
+
+    Args:
+        normed_target_future_seq_gt: 정답 미래 시퀀스. shape: (B, P, T, C)
+        random_noise: x_t를 만들 때 사용한 무작위 텐서(ε). shape: (B, P, T, C)
+        std: σ(t). shape: (B, 1, 1, 1) 또는 (B, 1, T, 1)
+        target_future_valid: 유효 마스크. shape: (B, P, T). None이면 마스킹하지 않음.
+        eps: 수치 안전용 작은 값.
+
+    Returns:
+        v_target: v 정답 텐서. shape: (B, P, T, C), dtype: float32
     """
-    return
+    # ----- shape 체크 -----
+    if normed_target_future_seq_gt.shape != random_noise.shape:
+        raise ValueError(
+            "normed_target_future_seq_gt and random_noise must have same shape. "
+            f"got x0={tuple(normed_target_future_seq_gt.shape)}, eps={tuple(random_noise.shape)}"
+        )
+
+    if std.dim() != 4:
+        raise ValueError(f"std must be 4D (B,1,1,1) or (B,1,T,1). got {tuple(std.shape)}")
+
+    B, P, T, C = normed_target_future_seq_gt.shape  # (B, P, T, C)
+
+    if int(std.shape[0]) != int(B) or int(std.shape[1]) != 1 or int(std.shape[3]) != 1:
+        raise ValueError(
+            "std shape must be (B,1,1,1) or (B,1,T,1). "
+            f"got std={tuple(std.shape)}, expected B={B}"
+        )
+    if int(std.shape[2]) not in (1, int(T)):
+        raise ValueError(
+            "std time dimension must be 1 or T. "
+            f"got std.shape[2]={int(std.shape[2])}, T={int(T)}"
+        )
+
+    if target_future_valid is not None:
+        if target_future_valid.shape != (B, P, T):
+            raise ValueError(
+                "target_future_valid must have shape (B,P,T). "
+                f"got {tuple(target_future_valid.shape)}, expected {(B,P,T)}"
+            )
+
+    # ----- 계산 (float32로 올려서 안정적으로) -----
+    x0_f = normed_target_future_seq_gt.float()  # (B, P, T, C)
+    eps_f = random_noise.float()                # (B, P, T, C)
+    sigma_f = std.float()                       # (B, 1, 1, 1) or (B, 1, T, 1)
+
+    # VPSDE_linear에서 α(t) = sqrt(1 - σ(t)^2)
+    alpha_sq = (1.0 - sigma_f * sigma_f).clamp_min(0.0)  # (B,1,1,1) or (B,1,T,1)
+    alpha_f = torch.sqrt(alpha_sq)         # (B,1,1,1) or (B,1,T,1)
+
+    # v = α*ε - σ*x0
+    v_target = alpha_f * eps_f - sigma_f * x0_f          # (B, P, T, C)
+
+    # (선택) invalid는 0으로 덮어서 디버그/로그가 더 깔끔해지게
+    if target_future_valid is not None:
+        valid_bpt = _to_bool_mask(target_future_valid).to(device=v_target.device)  # (B,P,T)
+        v_target = v_target.masked_fill(~valid_bpt.unsqueeze(-1), 0.0)             # (B,P,T,C)
+
+    v_target = _require_finite("v_target_future_seq_gt", v_target)
+    return v_target
 
 def diffusion_loss_func(
     args: Any,
@@ -1332,7 +1416,9 @@ def diffusion_loss_func(
         past_future_seg_control_gt_3_dim = torch.cat([
             past_seg_control_gt_3_dim,
             future_seg_control_gt_3_dim,
-        ])  # (B, 1+Pnn, past_len + future_len, 3)
+        ],
+        dim=2
+        )  # (B, 1+Pnn, past_len + future_len, 3)
         assert past_future_seg_control_gt_3_dim.shape[2] == (args.time_len - 1 +
                                                              future_len)
         # past_seg_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
@@ -1381,8 +1467,6 @@ def diffusion_loss_func(
      normed_target_future_seq_gt) = _split_normed_target_seq_gt(
          args.pose_based, normed_target_seq_gt
      )  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
-    if args.diffusion_model_type == "v":
-        v_target_future_seq_gt = _get_v_target_future_seq_gt(normed_target_future_seq_gt)
     """
         target_seq_norm_xT: 
             (B, (1+)Pnn, 1+future_len, 4) 현재 GT + 미래 x_T
@@ -1414,8 +1498,7 @@ def diffusion_loss_func(
     )
 
     # diffusion_output:  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
-    diffusion_output: torch.Tensor = extract_diffusion_output_from_decoder(
-        future_len=args.future_len, decoder_output=decoder_output)
+    diffusion_output: torch.Tensor = extract_diffusion_output_from_decoder( decoder_output=decoder_output)
 
     # dpm_loss: (B, (1+)Pnn, future_len)
     dpm_loss: torch.Tensor = _compute_dpm_loss(
