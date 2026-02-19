@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import io
@@ -7,13 +6,12 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Iterator, Union
 
-
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Sampler
 
-
 _LOCAL_SHARD_FORMAT = "dp_local_shards_v1"
+
 
 class _ReadOnlyMemoryViewIO(io.RawIOBase):
     """memoryview를 '파일처럼(read/seek)' 다룰 수 있게 만드는 read-only IO 래퍼.
@@ -142,7 +140,8 @@ def is_local_shard_manifest_path(path: Any) -> bool:
     try:
         with open(path, "r", encoding="utf-8") as f:
             obj = json.load(f)
-        return isinstance(obj, dict) and obj.get("format") == _LOCAL_SHARD_FORMAT
+        return isinstance(obj,
+                          dict) and obj.get("format") == _LOCAL_SHARD_FORMAT
     except Exception:
         return False
 
@@ -235,34 +234,32 @@ class LocalShardDataset(Dataset):
                 f"shard_size*shard_count={self._shard_size * self._shard_count}"
             )
 
-        manifest_predicted = _safe_int(manifest.get("predicted_neighbor_num"), -1)
-        manifest_use_aro = _safe_bool(manifest.get("use_agent_route_lane_order"), False)
+        manifest_predicted = _safe_int(manifest.get("predicted_neighbor_num"),
+                                       -1)
+        manifest_use_aro = _safe_bool(
+            manifest.get("use_agent_route_lane_order"), False)
         manifest_eval_method = str(manifest.get("eval_method", "")).lower()
 
         if int(manifest_predicted) != int(expected_predicted_neighbor_num):
-            raise ValueError(
-                "predicted_neighbor_num mismatch.\n"
-                f"  manifest={manifest_predicted}\n"
-                f"  current={expected_predicted_neighbor_num}\n"
-                "→ shard를 현재 설정으로 다시 생성해야 합니다."
-            )
+            raise ValueError("predicted_neighbor_num mismatch.\n"
+                             f"  manifest={manifest_predicted}\n"
+                             f"  current={expected_predicted_neighbor_num}\n"
+                             "→ shard를 현재 설정으로 다시 생성해야 합니다.")
         if bool(manifest_use_aro) != bool(expected_use_agent_route_lane_order):
             raise ValueError(
                 "use_agent_route_lane_order mismatch.\n"
                 f"  manifest={manifest_use_aro}\n"
                 f"  current={expected_use_agent_route_lane_order}\n"
-                "→ shard를 현재 설정으로 다시 생성해야 합니다."
-            )
+                "→ shard를 현재 설정으로 다시 생성해야 합니다.")
         if manifest_eval_method != str(expected_eval_method).lower():
-            raise ValueError(
-                "eval_method mismatch.\n"
-                f"  manifest={manifest_eval_method}\n"
-                f"  current={expected_eval_method}\n"
-                "→ shard manifest를 확인하거나 shard를 다시 생성해야 합니다."
-            )
+            raise ValueError("eval_method mismatch.\n"
+                             f"  manifest={manifest_eval_method}\n"
+                             f"  current={expected_eval_method}\n"
+                             "→ shard manifest를 확인하거나 shard를 다시 생성해야 합니다.")
 
         expected_keys = manifest.get("expected_keys", None)
-        if not isinstance(expected_keys, list) or not all(isinstance(k, str) for k in expected_keys):
+        if not isinstance(expected_keys, list) or not all(
+                isinstance(k, str) for k in expected_keys):
             raise TypeError("manifest.expected_keys must be List[str].")
         self._expected_keys: List[str] = list(expected_keys)
 
@@ -270,8 +267,7 @@ class LocalShardDataset(Dataset):
         if not isinstance(shards, list) or len(shards) != self._shard_count:
             raise ValueError(
                 f"manifest.shards length mismatch. got={len(shards) if isinstance(shards, list) else None}, "
-                f"expected={self._shard_count}"
-            )
+                f"expected={self._shard_count}")
 
         self._shard_paths: List[ShardPaths] = []
         for item in shards:
@@ -280,18 +276,23 @@ class LocalShardDataset(Dataset):
             sid = _safe_int(item.get("shard_id"), -1)
             bin_rel = item.get("bin", None)
             idx_rel = item.get("idx", None)
-            if sid < 0 or not isinstance(bin_rel, str) or not isinstance(idx_rel, str):
+            if sid < 0 or not isinstance(bin_rel, str) or not isinstance(
+                    idx_rel, str):
                 raise ValueError(f"invalid shard entry: {item}")
 
-            bin_path = bin_rel if os.path.isabs(bin_rel) else os.path.join(self._shard_root, bin_rel)
-            idx_path = idx_rel if os.path.isabs(idx_rel) else os.path.join(self._shard_root, idx_rel)
+            bin_path = bin_rel if os.path.isabs(bin_rel) else os.path.join(
+                self._shard_root, bin_rel)
+            idx_path = idx_rel if os.path.isabs(idx_rel) else os.path.join(
+                self._shard_root, idx_rel)
 
-            self._shard_paths.append(ShardPaths(shard_id=sid, bin_path=bin_path, idx_path=idx_path))
+            self._shard_paths.append(
+                ShardPaths(shard_id=sid, bin_path=bin_path, idx_path=idx_path))
 
         # --- worker 프로세스 단위 캐시 ---
         self._cached_shard_id: Optional[int] = None
         self._cached_bin_fp: Optional[io.BufferedReader] = None
-        self._cached_idx_table: Optional[np.ndarray] = None  # shape: (shard_size, 2), dtype=uint64
+        self._cached_idx_table: Optional[
+            np.ndarray] = None  # shape: (shard_size, 2), dtype=uint64
 
     @property
     def shard_size(self) -> int:
@@ -386,7 +387,8 @@ class LocalShardDataset(Dataset):
 
                             v = data[k]
                             # 문자열 scalar(np.array("..."))는 python str로 변환
-                            if isinstance(v, np.ndarray) and v.shape == () and v.dtype.kind in ("U", "S"):
+                            if isinstance(v, np.ndarray) and v.shape == (
+                            ) and v.dtype.kind in ("U", "S"):
                                 try:
                                     sample[k] = str(v.item())
                                 except Exception:
@@ -404,7 +406,8 @@ class LocalShardDataset(Dataset):
                     continue
 
                 v = data[k]
-                if isinstance(v, np.ndarray) and v.shape == () and v.dtype.kind in ("U", "S"):
+                if isinstance(v, np.ndarray) and v.shape == (
+                ) and v.dtype.kind in ("U", "S"):
                     try:
                         sample[k] = str(v.item())
                     except Exception:
@@ -413,14 +416,14 @@ class LocalShardDataset(Dataset):
                     sample[k] = v
         return sample
 
-
     def _read_one_blob(self, *, offset: int, length: int) -> bytes:
         """bin 파일에서 (offset,length)만큼 읽어 blob을 돌려줍니다."""
         assert self._cached_bin_fp is not None
         self._cached_bin_fp.seek(int(offset))
         blob = self._cached_bin_fp.read(int(length))
         if len(blob) != int(length):
-            raise IOError(f"failed to read full blob: want={length}, got={len(blob)}")
+            raise IOError(
+                f"failed to read full blob: want={length}, got={len(blob)}")
         return blob
 
     def _read_many_blobs_one_chunk(
@@ -463,7 +466,8 @@ class LocalShardDataset(Dataset):
         self._cached_bin_fp.seek(start)
         chunk = self._cached_bin_fp.read(total_len)
         if len(chunk) != total_len:
-            raise IOError(f"failed to read chunk: want={total_len}, got={len(chunk)}")
+            raise IOError(
+                f"failed to read chunk: want={total_len}, got={len(chunk)}")
 
         mv = memoryview(chunk)  # shape: (total_len,)
 
@@ -473,7 +477,6 @@ class LocalShardDataset(Dataset):
             ln = int(l)
             out.append(mv[rel:rel + ln])  # ✅ tobytes() 제거 (추가 복사 없음)
         return out
-
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """샘플 1개를 읽어 sample dict로 반환합니다."""
@@ -490,7 +493,8 @@ class LocalShardDataset(Dataset):
         offset_u64 = self._cached_idx_table[int(local_id), 0]
         length_u64 = self._cached_idx_table[int(local_id), 1]
 
-        blob = self._read_one_blob(offset=int(offset_u64), length=int(length_u64))
+        blob = self._read_one_blob(offset=int(offset_u64),
+                                   length=int(length_u64))
         return self._decode_blob_to_sample(blob)
 
     def __getitems__(self, indices: Sequence[int]) -> List[Dict[str, Any]]:
@@ -540,7 +544,8 @@ class LocalShardDataset(Dataset):
             offsets_u64 = self._cached_idx_table[lids, 0]  # (N_g,)
             lengths_u64 = self._cached_idx_table[lids, 1]  # (N_g,)
 
-            blobs = self._read_many_blobs_one_chunk(offsets_u64, lengths_u64)  # length=N_g
+            blobs = self._read_many_blobs_one_chunk(offsets_u64,
+                                                    lengths_u64)  # length=N_g
 
             for p, blob in zip(pos_list, blobs):
                 out[p] = self._decode_blob_to_sample(blob)
@@ -549,7 +554,8 @@ class LocalShardDataset(Dataset):
         final: List[Dict[str, Any]] = []
         for item in out:
             if item is None:
-                raise RuntimeError("internal error: some samples were not filled.")
+                raise RuntimeError(
+                    "internal error: some samples were not filled.")
             final.append(item)
         return final
 

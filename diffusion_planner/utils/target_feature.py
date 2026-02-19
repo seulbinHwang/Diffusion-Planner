@@ -37,17 +37,16 @@ def build_target_future_tensors_and_masks_for_inference(
 
 def build_target_future_tensors_and_masks(
     args: Any,
-        norm_ego_cur_gt_4_dim: torch.Tensor,  # (B, 4)
-        normed_ego_future_gt_4_dim: torch.Tensor,  # (B, future_len, 4)
-        ego_cur_future_gt_is_valid: torch.Tensor,  # (B, 1+future_len)
-        norm_near_current_4_dim: torch.Tensor,  # (B, Pnn, 4)
-        normed_near_future_gt_4_dim: torch.Tensor,  # (B, Pnn, future_len, 4)
+    norm_ego_cur_gt_4_dim: torch.Tensor,  # (B, 4)
+    normed_ego_future_gt_4_dim: torch.Tensor,  # (B, future_len, 4)
+    ego_cur_future_gt_is_valid: torch.Tensor,  # (B, 1+future_len)
+    norm_near_current_4_dim: torch.Tensor,  # (B, Pnn, 4)
+    normed_near_future_gt_4_dim: torch.Tensor,  # (B, Pnn, future_len, 4)
     near_cur_future_gt_is_valid: torch.Tensor,  # (B, Pnn, 1 + future_len)
 ) -> Tuple[
         torch.
         Tensor,  # normed_target_seq_gt_4_dim: (B, (1+)Pnn, 1+future_len, 4)
-        torch.
-        Tensor,  # target_seq_is_valid: (B, (1+)Pnn, 1 + future_len)
+        torch.Tensor,  # target_seq_is_valid: (B, (1+)Pnn, 1 + future_len)
 ]:
     """ego를 예측 대상에 포함할지 여부에 따라, 학습에 쓸 target 텐서/마스크를 만든다.
 
@@ -126,10 +125,10 @@ def build_target_future_tensors_and_masks(
 
 
 def build_target_future_tensors_and_masks_vel(
-    args: Any,
-    future_seg_control_gt_3_dim: torch.Tensor,  # (B, 1+Pnn, future_len, 3)
-    ego_cur_future_gt_is_valid: torch.Tensor,        # (B, 1+future_len)
-    near_cur_future_gt_is_valid: torch.Tensor,       # (B, Pnn, 1+future_len)
+        args: Any,
+        future_seg_control_gt_3_dim: torch.Tensor,  # (B, 1+Pnn, future_len, 3)
+        ego_cur_future_gt_is_valid: torch.Tensor,  # (B, 1+future_len)
+        near_cur_future_gt_is_valid: torch.Tensor,  # (B, Pnn, 1+future_len)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """속도/요레이트 기반 학습 타깃 텐서와 유효 마스크를 만든다.
 
@@ -157,6 +156,7 @@ def build_target_future_tensors_and_masks_vel(
         target_seq_is_valid: (B, (1+)Pnn, future_len) bool
             구간(세그먼트) 단위 유효 마스크.
     """
+
     def _to_bool_mask(x: torch.Tensor) -> torch.Tensor:
         """0/1 또는 실수 마스크를 bool로 안전 변환한다. shape은 유지."""
         if x.dtype == torch.bool:
@@ -165,25 +165,29 @@ def build_target_future_tensors_and_masks_vel(
             return x > 0.5
         return x != 0
 
-    ego_valid = _to_bool_mask(ego_cur_future_gt_is_valid)          # (B, 1+future_len) bool
-    near_valid = _to_bool_mask(near_cur_future_gt_is_valid)        # (B, Pnn, 1+future_len) bool
+    ego_valid = _to_bool_mask(
+        ego_cur_future_gt_is_valid)  # (B, 1+future_len) bool
+    near_valid = _to_bool_mask(
+        near_cur_future_gt_is_valid)  # (B, Pnn, 1+future_len) bool
 
     # 구간 유효: (t, t+1)이 둘 다 True여야 True
-    ego_seg_valid = ego_valid[:, :-1] & ego_valid[:, 1:]           # (B, future_len) bool
-    near_seg_valid = near_valid[:, :, :-1] & near_valid[:, :, 1:]  # (B, Pnn, future_len) bool
+    ego_seg_valid = ego_valid[:, :-1] & ego_valid[:, 1:]  # (B, future_len) bool
+    near_seg_valid = near_valid[:, :, :
+                                -1] & near_valid[:, :,
+                                                 1:]  # (B, Pnn, future_len) bool
 
     do_ego_predict = bool(getattr(args, "do_ego_predict", False))
     if not do_ego_predict:
         # ego(0번)를 제외
-        normed_target_seq_gt = future_seg_control_gt_3_dim[:, 1:]  # (B, Pnn, future_len, 3)
-        target_seq_is_valid = near_seg_valid                                  # (B, Pnn, future_len)
+        normed_target_seq_gt = future_seg_control_gt_3_dim[:,
+                                                           1:]  # (B, Pnn, future_len, 3)
+        target_seq_is_valid = near_seg_valid  # (B, Pnn, future_len)
         return normed_target_seq_gt, target_seq_is_valid
 
     # ego 포함
-    normed_target_seq_gt = future_seg_control_gt_3_dim             # (B, 1+Pnn, future_len, 3)
+    normed_target_seq_gt = future_seg_control_gt_3_dim  # (B, 1+Pnn, future_len, 3)
     target_seq_is_valid = torch.cat(
         [ego_seg_valid.unsqueeze(1), near_seg_valid],
         dim=1,
     )  # (B, 1+Pnn, future_len) bool
     return normed_target_seq_gt, target_seq_is_valid
-

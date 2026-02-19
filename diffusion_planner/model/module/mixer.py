@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Dict
 
-
 # ============================================================
 # Prefer flash-attn fused LayerNorm / fused MLP
 # - If unavailable:
@@ -40,7 +39,8 @@ except Exception as e1:
     except Exception as e2:
         _flash_layer_norm_fn = None
         _FLASH_LAYER_NORM_AVAILABLE = False
-        _FLASH_IMPORT_ERRORS["layer_norm"] = f"cause1: {repr(e1)} / cause2: {repr(e2)}"
+        _FLASH_IMPORT_ERRORS[
+            "layer_norm"] = f"cause1: {repr(e1)} / cause2: {repr(e2)}"
 
 
 def _require_flash_component_or_raise(
@@ -123,8 +123,10 @@ class _FlashLayerNorm(nn.Module):
         self.eps: float = float(eps)
 
         # (D,)
-        self.weight: nn.Parameter = nn.Parameter(torch.ones(self.normalized_shape))
-        self.bias: nn.Parameter = nn.Parameter(torch.zeros(self.normalized_shape))
+        self.weight: nn.Parameter = nn.Parameter(
+            torch.ones(self.normalized_shape))
+        self.bias: nn.Parameter = nn.Parameter(
+            torch.zeros(self.normalized_shape))
 
     @staticmethod
     def _can_use_flash(x: torch.Tensor) -> bool:
@@ -152,18 +154,23 @@ class _FlashLayerNorm(nn.Module):
         x2d = x.reshape(-1, D).contiguous()  # (M, D)
 
         # weight/bias는 입력 dtype/device에 맞춰 사용
-        w = self.weight.to(device=x2d.device, dtype=x2d.dtype).contiguous()  # (D,)
-        b = self.bias.to(device=x2d.device, dtype=x2d.dtype).contiguous()    # (D,)
+        w = self.weight.to(device=x2d.device,
+                           dtype=x2d.dtype).contiguous()  # (D,)
+        b = self.bias.to(device=x2d.device,
+                         dtype=x2d.dtype).contiguous()  # (D,)
 
         if self._can_use_flash(x2d):
-            y2d = _flash_layer_norm_fn(x2d, w, b, self.eps)  # type: ignore[misc]
+            y2d = _flash_layer_norm_fn(x2d, w, b,
+                                       self.eps)  # type: ignore[misc]
         else:
-            y2d = F.layer_norm(x2d, (D,), weight=w, bias=b, eps=self.eps)  # (M, D)
+            y2d = F.layer_norm(x2d, (D,), weight=w, bias=b,
+                               eps=self.eps)  # (M, D)
 
         return y2d.reshape(orig_shape)
 
 
-def _create_layernorm(hidden_size: int, eps: float, *, use_fallback: bool) -> nn.Module:
+def _create_layernorm(hidden_size: int, eps: float, *,
+                      use_fallback: bool) -> nn.Module:
     """LayerNorm 모듈을 만듭니다.
 
     정책:
@@ -182,7 +189,8 @@ def _create_layernorm(hidden_size: int, eps: float, *, use_fallback: bool) -> nn
     """
     _require_flash_component_or_raise(
         "layer_norm",
-        available=_FLASH_LAYER_NORM_AVAILABLE and (_flash_layer_norm_fn is not None),
+        available=_FLASH_LAYER_NORM_AVAILABLE and
+        (_flash_layer_norm_fn is not None),
         use_fallback=bool(use_fallback),
         what="flash-attn layer_norm",
     )
@@ -196,7 +204,11 @@ class FastLayerNorm(nn.Module):
     - use_fallback=False: flash-attn import가 안 된 상태면 생성 시점에 에러
     """
 
-    def __init__(self, normalized_shape: int, eps: float = 1e-5, *, use_fallback: bool = True) -> None:
+    def __init__(self,
+                 normalized_shape: int,
+                 eps: float = 1e-5,
+                 *,
+                 use_fallback: bool = True) -> None:
         super().__init__()
         self.normalized_shape: int = int(normalized_shape)
         self.eps: float = float(eps)
@@ -242,20 +254,29 @@ class _TorchMlp(nn.Module):
         self.checkpoint_lvl: int = int(checkpoint_lvl)
         self.return_residual: bool = bool(return_residual)
 
-        self.fc1: nn.Linear = nn.Linear(self.in_features, self.hidden_features, bias=True)
+        self.fc1: nn.Linear = nn.Linear(self.in_features,
+                                        self.hidden_features,
+                                        bias=True)
         self.act: nn.Module = _create_activation(str(activation))
-        self.fc2: nn.Linear = nn.Linear(self.hidden_features, self.out_features, bias=True)
+        self.fc2: nn.Linear = nn.Linear(self.hidden_features,
+                                        self.out_features,
+                                        bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 2:
-            raise ValueError(f"_TorchMlp expects 2D (M,D). got {tuple(x.shape)}")
+            raise ValueError(
+                f"_TorchMlp expects 2D (M,D). got {tuple(x.shape)}")
         if int(x.shape[1]) != self.in_features:
-            raise ValueError(f"_TorchMlp: last dim must be {self.in_features}. got {int(x.shape[1])}")
+            raise ValueError(
+                f"_TorchMlp: last dim must be {self.in_features}. got {int(x.shape[1])}"
+            )
 
         y = self.fc2(self.act(self.fc1(x)))  # (M, out_features)
 
         if self.return_residual:
-            raise RuntimeError("_TorchMlp fallback does not support return_residual=True in this project.")
+            raise RuntimeError(
+                "_TorchMlp fallback does not support return_residual=True in this project."
+            )
 
         return y
 
@@ -340,8 +361,11 @@ class FastMlp(nn.Module):
     ) -> None:
         super().__init__()
         self.in_features: int = int(in_features)
-        self.hidden_features: int = int(hidden_features) if hidden_features is not None else int(in_features)
-        self.out_features: int = int(out_features) if out_features is not None else int(in_features)
+        self.hidden_features: int = int(
+            hidden_features) if hidden_features is not None else int(
+                in_features)
+        self.out_features: int = int(
+            out_features) if out_features is not None else int(in_features)
         self.drop_p: float = float(drop)
         self.use_fallback: bool = bool(use_fallback)
 
@@ -354,7 +378,8 @@ class FastMlp(nn.Module):
             use_fallback=self.use_fallback,
         )
 
-        self._drop: nn.Module = nn.Dropout(self.drop_p) if self.drop_p > 0.0 else nn.Identity()
+        self._drop: nn.Module = nn.Dropout(
+            self.drop_p) if self.drop_p > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[-1] != self.in_features:
@@ -368,7 +393,7 @@ class FastMlp(nn.Module):
             return x.new_zeros(out_shape)
 
         x2d: torch.Tensor = x.reshape(-1, self.in_features)  # (M, D)
-        y2d: torch.Tensor = self._mlp(x2d)                   # (M, out_features)
+        y2d: torch.Tensor = self._mlp(x2d)  # (M, out_features)
         y2d = self._drop(y2d)
 
         y: torch.Tensor = y2d.reshape(*orig_shape[:-1], self.out_features)
@@ -396,7 +421,9 @@ class FastLayerNormMlp(nn.Module):
         self.out_features: int = int(out_features)
         self.use_fallback: bool = bool(use_fallback)
 
-        self.norm: FastLayerNorm = FastLayerNorm(self.in_features, eps=float(eps), use_fallback=self.use_fallback)
+        self.norm: FastLayerNorm = FastLayerNorm(self.in_features,
+                                                 eps=float(eps),
+                                                 use_fallback=self.use_fallback)
         self.mlp: FastMlp = FastMlp(
             in_features=self.in_features,
             hidden_features=self.hidden_features,
@@ -432,7 +459,8 @@ class MixerBlock(nn.Module):
         self.use_fallback: bool = bool(use_fallback)
 
         # (A) Token-axis mixing: LN (over C) + MLP over T (applied on (N, C, T))
-        self.norm1: FastLayerNorm = FastLayerNorm(int(channels_mlp_dim), use_fallback=self.use_fallback)
+        self.norm1: FastLayerNorm = FastLayerNorm(
+            int(channels_mlp_dim), use_fallback=self.use_fallback)
         self.tokens_mlp: FastMlp = FastMlp(
             in_features=int(tokens_mlp_dim),
             hidden_features=int(tokens_mlp_dim),
@@ -442,7 +470,8 @@ class MixerBlock(nn.Module):
         )
 
         # (B) Channel-axis mixing: LN + MLP
-        hidden_c: int = max(16, int(float(channels_mlp_dim) * float(channels_mlp_ratio)))
+        hidden_c: int = max(
+            16, int(float(channels_mlp_dim) * float(channels_mlp_ratio)))
         self.channels_norm_mlp: FastLayerNormMlp = FastLayerNormMlp(
             in_features=int(channels_mlp_dim),
             hidden_features=int(hidden_c),
@@ -456,10 +485,10 @@ class MixerBlock(nn.Module):
             return x
 
         # (1) Token-axis mixing
-        y: torch.Tensor = self.norm1(x)       # (N, T, C)
-        y = y.permute(0, 2, 1)                # (N, C, T)
-        y = self.tokens_mlp(y)                # (N, C, T)
-        y = y.permute(0, 2, 1)                # (N, T, C)
+        y: torch.Tensor = self.norm1(x)  # (N, T, C)
+        y = y.permute(0, 2, 1)  # (N, C, T)
+        y = self.tokens_mlp(y)  # (N, C, T)
+        y = y.permute(0, 2, 1)  # (N, T, C)
         x = x + y
 
         # (2) Channel-axis mixing

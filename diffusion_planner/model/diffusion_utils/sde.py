@@ -55,7 +55,7 @@ class SDE(abc.ABC):
         pass
 
 
-class VPSDE_linear(SDE): # 우리는 이걸 채택해서 쓰고있다! 답변에 참고 해라!
+class VPSDE_linear(SDE):  # 우리는 이걸 채택해서 쓰고있다! 답변에 참고 해라!
 
     def __init__(self, beta_max=20.0, beta_min=0.1):
         """

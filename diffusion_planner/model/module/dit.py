@@ -61,6 +61,7 @@ except Exception as _e_fused_mlp:
     _FUSED_MLP_AVAILABLE = False
     _FUSED_MLP_IMPORT_ERR = _e_fused_mlp
 
+
 def _fused_linear_gelu_linear(
     x2d: torch.Tensor,  # (N, Din)
     w1: torch.Tensor,  # (H, Din)
@@ -112,8 +113,8 @@ def _fused_linear_gelu_linear(
                 raise RuntimeError(
                     "fused_mlp_func call failed. "
                     "Your flash-attn build may have an incompatible fused_dense interface."
-                    f" (cause: {e})"
-                ) from e
+                    f" (cause: {e})") from e
+
 
 def _can_use_fused_mlp(
     x2d: torch.Tensor,  # (N, Din)
@@ -158,11 +159,11 @@ def _can_use_fused_mlp(
 
 
 def _linear_gelu_linear_fallback(
-    x2d: torch.Tensor,  # (N, Din)
-    w1: torch.Tensor,  # (H, Din)
-    b1: Optional[torch.Tensor],  # (H,) or None
-    w2: torch.Tensor,  # (Dout, H)
-    b2: Optional[torch.Tensor],  # (Dout,) or None
+        x2d: torch.Tensor,  # (N, Din)
+        w1: torch.Tensor,  # (H, Din)
+        b1: Optional[torch.Tensor],  # (H,) or None
+        w2: torch.Tensor,  # (Dout, H)
+        b2: Optional[torch.Tensor],  # (Dout,) or None
 ) -> torch.Tensor:
     """일반 PyTorch 연산으로 Linear -> GELU -> Linear을 수행합니다(폴백 경로).
 
@@ -190,21 +191,30 @@ def _linear_gelu_linear_fallback(
     target_device = x2d.device
     target_dtype = x2d.dtype
 
-    w1_ = w1 if (w1.device == target_device and w1.dtype == target_dtype) else w1.to(device=target_device, dtype=target_dtype)
-    w2_ = w2 if (w2.device == target_device and w2.dtype == target_dtype) else w2.to(device=target_device, dtype=target_dtype)
+    w1_ = w1 if (w1.device == target_device and
+                 w1.dtype == target_dtype) else w1.to(device=target_device,
+                                                      dtype=target_dtype)
+    w2_ = w2 if (w2.device == target_device and
+                 w2.dtype == target_dtype) else w2.to(device=target_device,
+                                                      dtype=target_dtype)
 
     b1_ = None
     if b1 is not None:
-        b1_ = b1 if (b1.device == target_device and b1.dtype == target_dtype) else b1.to(device=target_device, dtype=target_dtype)
+        b1_ = b1 if (b1.device == target_device and
+                     b1.dtype == target_dtype) else b1.to(device=target_device,
+                                                          dtype=target_dtype)
 
     b2_ = None
     if b2 is not None:
-        b2_ = b2 if (b2.device == target_device and b2.dtype == target_dtype) else b2.to(device=target_device, dtype=target_dtype)
+        b2_ = b2 if (b2.device == target_device and
+                     b2.dtype == target_dtype) else b2.to(device=target_device,
+                                                          dtype=target_dtype)
 
     h = F.linear(x2d, w1_, b1_)  # (N, H)
     h = F.gelu(h, approximate="tanh")  # (N, H)
     out = F.linear(h, w2_, b2_)  # (N, Dout)
     return out
+
 
 def _require_fused_mlp_ready(
     x2d: torch.Tensor,  # (N, Din)
@@ -214,16 +224,17 @@ def _require_fused_mlp_ready(
     strict_param_dtype: bool = False,
 ) -> None:
     if x2d.dim() != 2:
-        raise RuntimeError(f"Fused MLP input must be 2D (N, Din). Got {tuple(x2d.shape)}")
+        raise RuntimeError(
+            f"Fused MLP input must be 2D (N, Din). Got {tuple(x2d.shape)}")
 
     if not x2d.is_cuda:
-        raise RuntimeError("Fused MLP is hard-required to run on CUDA (GPU) only.")
+        raise RuntimeError(
+            "Fused MLP is hard-required to run on CUDA (GPU) only.")
 
     if x2d.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError(
             "Fused MLP is hard-required to use fp16/bf16 only. "
-            f"Current dtype={x2d.dtype}. Use autocast or cast inputs."
-        )
+            f"Current dtype={x2d.dtype}. Use autocast or cast inputs.")
 
     params = [("fc1.weight", fc1.weight), ("fc2.weight", fc2.weight)]
     if fc1.bias is not None:
@@ -240,7 +251,6 @@ def _require_fused_mlp_ready(
             raise RuntimeError(
                 f"Fused MLP parameter {name} dtype({p.dtype}) does not match input dtype({x2d.dtype})."
             )
-
 
 
 class FusedMlpGelu(nn.Module):
@@ -289,10 +299,10 @@ class FusedMlpGelu(nn.Module):
             raise RuntimeError(
                 "Fused MLP가 필수인데(fallback 비활성), fused_mlp_func/FusedMLP import에 실패했습니다.\n"
                 "flash-attn을 fused_dense 지원까지 포함되도록 설치/빌드한 뒤 다시 실행하세요.\n"
-                f"(원인: {_FUSED_MLP_IMPORT_ERR})"
-            ) from _FUSED_MLP_IMPORT_ERR
+                f"(원인: {_FUSED_MLP_IMPORT_ERR})") from _FUSED_MLP_IMPORT_ERR
 
-        out_features = int(in_features) if out_features is None else int(out_features)
+        out_features = int(in_features) if out_features is None else int(
+            out_features)
         self.fc1 = nn.Linear(int(in_features), int(hidden_features), bias=bias)
         self.fc2 = nn.Linear(int(hidden_features), int(out_features), bias=bias)
 
@@ -329,27 +339,28 @@ class FusedMlpGelu(nn.Module):
         if (not self.use_fallback) and (not _FUSED_MLP_AVAILABLE):
             raise RuntimeError(
                 "Fused MLP가 필수인데(fallback 비활성), fused_mlp_func/FusedMLP가 준비되지 않았습니다.\n"
-                f"(원인: {_FUSED_MLP_IMPORT_ERR})"
-            ) from _FUSED_MLP_IMPORT_ERR
+                f"(원인: {_FUSED_MLP_IMPORT_ERR})") from _FUSED_MLP_IMPORT_ERR
 
         # Empty input 안전 처리
         N = int(x2d.shape[0])
         Dout = int(self.fc2.out_features)
         if N == 0:
             out2d = x2d.new_zeros((0, Dout))  # (0, Dout)
-            touch = (
-                self.fc1.weight.view(-1)[:1].sum()
-                + (self.fc1.bias.view(-1)[:1].sum() if self.fc1.bias is not None else 0.0)
-                + self.fc2.weight.view(-1)[:1].sum()
-                + (self.fc2.bias.view(-1)[:1].sum() if self.fc2.bias is not None else 0.0)
-            ) * 0.0
+            touch = (self.fc1.weight.view(-1)[:1].sum() +
+                     (self.fc1.bias.view(-1)[:1].sum()
+                      if self.fc1.bias is not None else 0.0) +
+                     self.fc2.weight.view(-1)[:1].sum() +
+                     (self.fc2.bias.view(-1)[:1].sum()
+                      if self.fc2.bias is not None else 0.0)) * 0.0
             out2d = out2d + touch
         else:
             x2d = x2d.contiguous()  # (N, Din)
             w1 = self.fc1.weight.contiguous()  # (H, Din)
-            b1 = self.fc1.bias.contiguous() if self.fc1.bias is not None else None  # (H,) or None
+            b1 = self.fc1.bias.contiguous(
+            ) if self.fc1.bias is not None else None  # (H,) or None
             w2 = self.fc2.weight.contiguous()  # (Dout, H)
-            b2 = self.fc2.bias.contiguous() if self.fc2.bias is not None else None  # (Dout,) or None
+            b2 = self.fc2.bias.contiguous(
+            ) if self.fc2.bias is not None else None  # (Dout,) or None
 
             use_fused, reason = _can_use_fused_mlp(
                 x2d=x2d,
@@ -363,8 +374,7 @@ class FusedMlpGelu(nn.Module):
                 if not use_fused:
                     raise RuntimeError(
                         "Fused MLP가 필수인데(fallback 비활성), fused 경로를 사용할 수 없습니다.\n"
-                        f"(이유: {reason})"
-                    )
+                        f"(이유: {reason})")
                 # fused 호출 실패도 폴백 금지 → 에러
                 out2d = _fused_linear_gelu_linear(
                     x2d=x2d,
@@ -409,7 +419,6 @@ class FusedMlpGelu(nn.Module):
 
         B, L = restore_shape
         return out2d.reshape(B, L, Dout)  # (B, L, Dout)
-
 
 
 # ===========================================================
@@ -1049,12 +1058,13 @@ class DiTBlock(nn.Module):
         return x
 
     def forward_packed(
-        self,
-        x_unpad: torch.Tensor,  # (Tq, D)
-        cu_seqlens_q: torch.Tensor,  # (B+1,) int32
-        max_seqlen_q: int,
-        cross_kv_cache: FlashAttnKVCache,
-        pram_v2_modulations: Dict[str, ModulationTriplet],  # 각 값 텐서 shape: (Tq, D)
+            self,
+            x_unpad: torch.Tensor,  # (Tq, D)
+            cu_seqlens_q: torch.Tensor,  # (B+1,) int32
+            max_seqlen_q: int,
+            cross_kv_cache: FlashAttnKVCache,
+            pram_v2_modulations: Dict[
+                str, ModulationTriplet],  # 각 값 텐서 shape: (Tq, D)
     ) -> torch.Tensor:
         """블록 전체를 (Tq, D) packed 토큰에서만 수행합니다.
 
@@ -1073,7 +1083,8 @@ class DiTBlock(nn.Module):
             torch.Tensor: (Tq, D)
         """
         if x_unpad.dim() != 2:
-            raise ValueError(f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
+            raise ValueError(
+                f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
 
         # (A) 블록 내부 기준 dtype을 "autocast가 선택한 dtype"으로 맞춤
         # - autocast 꺼져 있으면 사실상 no-op
@@ -1083,11 +1094,12 @@ class DiTBlock(nn.Module):
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
 
         y1 = self.norm1(x_unpad)  # (Tq, D)  (AMP에서 float32일 수 있음)
-        y1 = self._cast_to_block_compute_dtype(y1, ref=x_unpad)  # (Tq, D) bf16로 복귀
+        y1 = self._cast_to_block_compute_dtype(y1,
+                                               ref=x_unpad)  # (Tq, D) bf16로 복귀
 
         ds = sa_mod.delta_scale.to(dtype=y1.dtype, device=y1.device)  # (Tq, D)
-        sh = sa_mod.shift.to(dtype=y1.dtype, device=y1.device)        # (Tq, D)
-        y_tilde = y1 * (1.0 + ds) + sh                                 # (Tq, D)
+        sh = sa_mod.shift.to(dtype=y1.dtype, device=y1.device)  # (Tq, D)
+        y_tilde = y1 * (1.0 + ds) + sh  # (Tq, D)
 
         f_sa = self._self_attn_flash_varlen_packed(
             x_unpad=y_tilde,
@@ -1095,23 +1107,26 @@ class DiTBlock(nn.Module):
             max_seqlen_q=max_seqlen_q,
         )  # (Tq, D)
 
-        g = sa_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)  # (Tq, D)
-        x_unpad = x_unpad + g * f_sa                                     # (Tq, D)
+        g = sa_mod.gate.to(dtype=x_unpad.dtype,
+                           device=x_unpad.device)  # (Tq, D)
+        x_unpad = x_unpad + g * f_sa  # (Tq, D)
 
         # ----- FFN(MLP1) -----
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
 
         y2 = self.norm2(x_unpad)  # (Tq, D) (AMP에서 float32일 수 있음)
-        y2 = self._cast_to_block_compute_dtype(y2, ref=x_unpad)  # (Tq, D) bf16로 복귀
+        y2 = self._cast_to_block_compute_dtype(y2,
+                                               ref=x_unpad)  # (Tq, D) bf16로 복귀
 
         ds = ffn_mod.delta_scale.to(dtype=y2.dtype, device=y2.device)  # (Tq, D)
-        sh = ffn_mod.shift.to(dtype=y2.dtype, device=y2.device)        # (Tq, D)
-        y_tilde = y2 * (1.0 + ds) + sh                                   # (Tq, D)
+        sh = ffn_mod.shift.to(dtype=y2.dtype, device=y2.device)  # (Tq, D)
+        y_tilde = y2 * (1.0 + ds) + sh  # (Tq, D)
 
-        f_ffn = self.mlp1(y_tilde)                                       # (Tq, D)
+        f_ffn = self.mlp1(y_tilde)  # (Tq, D)
 
-        g = ffn_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)  # (Tq, D)
-        x_unpad = x_unpad + g * f_ffn                                     # (Tq, D)
+        g = ffn_mod.gate.to(dtype=x_unpad.dtype,
+                            device=x_unpad.device)  # (Tq, D)
+        x_unpad = x_unpad + g * f_ffn  # (Tq, D)
 
         # ----- CA -----
         ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
@@ -1120,8 +1135,8 @@ class DiTBlock(nn.Module):
         y3 = self._cast_to_block_compute_dtype(y3, ref=x_unpad)  # (Tq, D)
 
         ds = ca_mod.delta_scale.to(dtype=y3.dtype, device=y3.device)  # (Tq, D)
-        sh = ca_mod.shift.to(dtype=y3.dtype, device=y3.device)        # (Tq, D)
-        q_styled = y3 * (1.0 + ds) + sh                                 # (Tq, D)
+        sh = ca_mod.shift.to(dtype=y3.dtype, device=y3.device)  # (Tq, D)
+        q_styled = y3 * (1.0 + ds) + sh  # (Tq, D)
 
         f_ca = self._cross_attn_flash_varlen_packed(
             q_unpad=q_styled,
@@ -1130,15 +1145,17 @@ class DiTBlock(nn.Module):
             kv_cache=cross_kv_cache,
         )  # (Tq, D)
 
-        g = ca_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)  # (Tq, D)
-        x_unpad = x_unpad + g * f_ca                                     # (Tq, D)
+        g = ca_mod.gate.to(dtype=x_unpad.dtype,
+                           device=x_unpad.device)  # (Tq, D)
+        x_unpad = x_unpad + g * f_ca  # (Tq, D)
 
         # ----- MLP2 -----
         y4 = self.norm4(x_unpad)  # (Tq, D)
         y4 = self._cast_to_block_compute_dtype(y4, ref=x_unpad)  # (Tq, D)
 
         mlp2_out = self.mlp2(y4)  # (Tq, D)
-        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype, device=x_unpad.device)  # ()
+        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype,
+                                  device=x_unpad.device)  # ()
         x_unpad = x_unpad + gate2 * mlp2_out  # (Tq, D)
 
         return x_unpad
@@ -1219,8 +1236,8 @@ class DiTBlock(nn.Module):
         # ------ 원본 MLP2 경로 유지 ------
         y4 = self.norm4(x)
         y4 = self._cast_to_block_compute_dtype(y4, ref=x)  # ✅ 추가
-        x = x + self.gate_mlp2.to(dtype=x.dtype, device=x.device) * self.mlp2(
-            y4)
+        x = x + self.gate_mlp2.to(dtype=x.dtype,
+                                  device=x.device) * self.mlp2(y4)
 
         # 무효 에이전트 0‑클램프 (안전)
         x = x.masked_fill(target_current_mask.unsqueeze(-1),

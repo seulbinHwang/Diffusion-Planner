@@ -63,7 +63,8 @@ def profile_block(
         yield
         return
 
-    is_cuda: bool = isinstance(device_type, str) and device_type.startswith("cuda")
+    is_cuda: bool = isinstance(device_type,
+                               str) and device_type.startswith("cuda")
     if is_cuda and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -93,13 +94,13 @@ def profile_block(
         avg_cnt_now = avg_cnt_prev
         avg_sum_now = avg_sum_prev
 
-    avg_ms: float = (avg_sum_now / float(avg_cnt_now)) if avg_cnt_now > 0 else 0.0
+    avg_ms: float = (avg_sum_now /
+                     float(avg_cnt_now)) if avg_cnt_now > 0 else 0.0
     warmup_left: int = max(0, int(_PROFILE_WARMUP_CALLS) - total_now)
 
     print(
         f"[PROFILE] {name}: {elapsed_ms:.3f} ms | avg {avg_ms:.3f} ms | n={avg_cnt_now} | warmup_left={warmup_left}"
     )
-
 
 
 # ===== FlashAttention-2 varlen import (2.x 표준 경로 + 백업 경로) =====
@@ -1205,8 +1206,7 @@ class SelfAttentionBlock(nn.Module):
             mlp_ratio=4.0):
         super().__init__()
 
-        self.norm1 = FastLayerNorm(dim,use_fallback=config.use_fallback)
-
+        self.norm1 = FastLayerNorm(dim, use_fallback=config.use_fallback)
 
         # FlashAttention-2 사용 가능 여부에 따라 폴백(MHA) 준비
         self.use_fallback_mha = not _FA2_AVAILABLE
@@ -1229,14 +1229,13 @@ class SelfAttentionBlock(nn.Module):
         self._drop_path_scale_by_keep: bool = bool(
             getattr(self.drop_path, "scale_by_keep", True))
 
-        self.norm2 = FastLayerNorm(dim,use_fallback=config.use_fallback)
+        self.norm2 = FastLayerNorm(dim, use_fallback=config.use_fallback)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = FastMlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            out_features=dim,
-            drop=float(ffn_drop_p),use_fallback=config.use_fallback
-        )
+        self.mlp = FastMlp(in_features=dim,
+                           hidden_features=mlp_hidden_dim,
+                           out_features=dim,
+                           drop=float(ffn_drop_p),
+                           use_fallback=config.use_fallback)
 
         # === FlashAttention‑2용 QKV/출력 프로젝션 ===
         self.num_heads = heads
@@ -2448,7 +2447,7 @@ class LaneFusionEncoder(nn.Module):
 
     def __init__(
         self,
-            config,
+        config,
         lane_len,
         drop_path_rate=0.3,
         hidden_dim=192,
@@ -2540,14 +2539,16 @@ class LaneFusionEncoder(nn.Module):
             in_features=2 * int(channels_mlp_dim),
             hidden_features=int(lane_post_hidden_dim),
             out_features=int(channels_mlp_dim),
-            drop=float(drop_path_rate), use_fallback=config.use_fallback,
+            drop=float(drop_path_rate),
+            use_fallback=config.use_fallback,
         )
 
         self.emb_project: FastLayerNormMlp = FastLayerNormMlp(
             in_features=int(channels_mlp_dim),
             hidden_features=int(hidden_dim),
             out_features=int(hidden_dim),
-            drop=float(drop_path_rate), use_fallback=config.use_fallback,
+            drop=float(drop_path_rate),
+            use_fallback=config.use_fallback,
         )
 
     # -------------------------- 새로 추가된 유틸 -------------------------- #
@@ -3196,15 +3197,14 @@ class LaneFusionEncoder(nn.Module):
                 dim=-1)  # (num_valid, 2C)
             lanes_valid = self.lane_post(pooled_2c)  # (num_valid, C)
 
-
         # ============================================================
         # (8) 최종 projection + scatter
         # ============================================================
         with profile_block("LaneFusionEncoder.final_projection",
                            enabled=enable_profile,
                            device_type=device_type):
-            lanes_valid = self.emb_project(lanes_valid)  # (num_valid, hidden_dim)
-
+            lanes_valid = self.emb_project(
+                lanes_valid)  # (num_valid, hidden_dim)
 
             lane_embedding_flat: torch.Tensor = torch.zeros(
                 (total_count, lanes_valid.shape[-1]),
