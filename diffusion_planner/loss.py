@@ -835,7 +835,7 @@ def extract_from_decoder(
     diffusion_output: torch.Tensor = decoder_output[
         "diffusion_output"]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     assert diffusion_output.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
-    # "diffusion_trajectory"
+    # "diffusion_sequence"
     """
     diffusion_trajectory
         pose_based:
@@ -843,7 +843,7 @@ def extract_from_decoder(
         else:
             (B, (1+)Pnn, T,3)
     """
-    diffusion_trajectory: torch.Tensor = decoder_output["diffusion_trajectory"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+    diffusion_trajectory: torch.Tensor = decoder_output["diffusion_sequence"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     assert diffusion_trajectory.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
 
     diffusion_output = _require_finite("decoder_output['diffusion_output']", diffusion_output)

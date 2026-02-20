@@ -1,7 +1,7 @@
 from functools import partial
 from typing import Callable
 import torch.nn as nn
-import diffusion_planner.model.diffusion_utils.dpm_solver_pytorch
+from sympy.polys.benchmarks.bench_solvers import x0
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple, Any
@@ -25,6 +25,7 @@ from diffusion_planner.model.module.pram_wosac import (
 from typing import Tuple, Optional
 from diffusion_planner.model.module.feasible import FeasibleProjector
 from diffusion_planner.loss import AMP_DTYPE
+import diffusion_planner.model.diffusion_utils.dpm_solver_pytorch as dpm
 
 from typing import NamedTuple
 
@@ -1408,9 +1409,9 @@ class Decoder(nn.Module):
         return classifier_kwargs
 
     def _compute_sigma2_over_alpha_for_guidance(
-            self,
-            t_eff: torch.Tensor,
-            reference_tensor_for_device: torch.Tensor,
+        self,
+        t_eff: torch.Tensor,
+        reference_tensor_for_device: torch.Tensor,
     ) -> torch.Tensor:
         """대표 시간값 t_eff에서 guidance 보정 스케일(sigma^2/alpha)을 계산합니다.
 
@@ -1536,6 +1537,9 @@ class Decoder(nn.Module):
         self,
         xT: torch.Tensor,
         target_agents_past: Optional[torch.Tensor],
+        target_seq_past: Optional[
+            torch.
+            Tensor],  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
         scene_encoding_token: torch.Tensor,
         scene_encoding_token_mask: torch.Tensor,
         target_past_cur_future_valid: torch.Tensor,
@@ -1544,7 +1548,7 @@ class Decoder(nn.Module):
                                    torch.Tensor],
         diffusion_steps: int,
     ) -> torch.Tensor:
-        """dpm_sampler(또는 amortized 1-step)을 통해 최종 샘플 diffusion_trajectory(flat)을 얻는다."""
+        """dpm_sampler(또는 amortized 1-step)을 통해 최종 샘플 diffusion_sequence(flat)을 얻는다."""
         classifier_kwargs: Dict[
             str, object] = self._build_classifier_kwargs_for_guidance(
                 target_agents_past=target_agents_past,
@@ -1559,13 +1563,13 @@ class Decoder(nn.Module):
         # -----------------------------
         if diffusion_steps > 1:
             """
-            # 2) xT and diffusion_trajectory
+            # 2) xT and diffusion_sequence
             pose_based = True
                 (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
             pose_based = False
                 (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
             """
-            diffusion_trajectory: torch.Tensor = dpm_sampler(
+            diffusion_sequence: torch.Tensor = dpm_sampler(
                 self.dit,
                 xT.float(),
                 diffusion_steps=diffusion_steps,
@@ -1593,10 +1597,68 @@ class Decoder(nn.Module):
                                       is not None else "uncond"),
                 },
             )
-            return diffusion_trajectory
+            if self.config.use_amortized_diffusion:
+                """ 2. WARM-UP step
+                1. diffusion_sequence 에 다시 noise를 준다.
+                2. buffer에 저장한다.
+                """
+                B, one_or_Pnn, _ = diffusion_sequence.shape
+                target_current_xyyaw = target_agents_past[:, :, -1, :
+                                                          4]  # (B,(1+)Pnn,4)
+                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
+                amortized_random_noise = self._get_amortized_random_noise_from_inputs(
+                    inputs=inputs,
+                    batch_size=int(B),
+                    one_or_Pnn=int(one_or_Pnn),
+                    target_current_xyyaw=target_current_xyyaw,
+                )
+                """
+                # 2) xT and diffusion_sequence
+                pose_based = True
+                    (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+                pose_based = False
+                    (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+                """
+                # 6) diffusion_cur_future_sequence: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
+                diffusion_cur_future_sequence: torch.Tensor = self._reshape_inference_x0_to_sequence(
+                    diffusion_sequence=diffusion_sequence,
+                    target_current_xyyaw=target_current_xyyaw,
+                    # (B, (1+)Pnn, 4)
+                )
+                diffusion_future_sequence = diffusion_cur_future_sequence[:, :, -(
+                    self.config.future_len):, :]
+                # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
+                self._set_amortized_buffer_from_sequence(
+                    diffusion_future_sequence=diffusion_future_sequence,
+                    # (B*R, (1+)Pnn, T, 4 or 3)
+                    random_noise=
+                    amortized_random_noise,  # (B*R, (1+)Pnn, future_len, 4or 3)
+                    do_shift=False,
+                )
+                """
+                # 2) xT(flat) 생성
+                pose_based = True
+                    (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
+                pose_based = False
+                    (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
+                """
+                xT: torch.Tensor = self._build_inference_xT_from_noise(
+                    noise=self._amortized_buffer,  # (B,(1+)Pnn,T,4 or 3)
+                    target_seq_past=target_seq_past,
+                    # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
+                )  # (B,Pnn,F)
+                xT = self._mask_zero_at_invalid_timestep_in_seq_flat(
+                    x_flat=xT,
+                    target_past_cur_future_valid=target_past_cur_future_valid,
+                    # (B, (1+)Pnn, time_len + future_len)
+                )
+                diffusion_steps = 1
+            else:
+                return diffusion_sequence
 
         # -----------------------------
         # diffusion_steps == 1 (amortized 1-step)
+        # 4.1 & 4.2
         # -----------------------------
         assert diffusion_steps == 1, "diffusion_steps must be >= 1"
         B: int = int(xT.shape[0])
@@ -1622,7 +1684,7 @@ class Decoder(nn.Module):
             (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
         """
 
-        # (1) 모델 1회 호출 (side-effect로 self.dit.diffusion_trajectory_flat = x0 후보가 채워짐)
+        # (1) 모델 1회 호출 (side-effect로 self.dit.diffusion_sequence_flat = x0 후보가 채워짐)
         _ = self.dit(
             target_input_norm_xT=xT_f32,  # (B, Pnn, F)
             diffusion_time=t_tau,  # (B, future_len)
@@ -1634,10 +1696,7 @@ class Decoder(nn.Module):
         )
 
         # (2) denoise_to_zero 역할: DiT가 저장해둔 x0 후보(flat)를 가져온다.
-        x0_base_flat = getattr(self.dit, "diffusion_trajectory_flat", None)
-        if not isinstance(x0_base_flat, torch.Tensor):
-            raise RuntimeError("self.dit.diffusion_trajectory_flat is not set. "
-                               "DiT.forward가 x0 후보를 저장하지 못했습니다.")
+        x0_base_flat = self.dit.diffusion_sequence_flat
         x0_base_flat = x0_base_flat.to(device=xT_f32.device,
                                        dtype=torch.float32)  # (B,P,F)
 
@@ -1669,21 +1728,21 @@ class Decoder(nn.Module):
                                              sigma2_over_alpha) * grad
 
         # (5) correcting_xt_fn을 마지막에 1회 호출 (마스크/현재상태 주입/단위원 정리 포함)
-        diffusion_trajectory: torch.Tensor = correcting_xt_fn(
+        diffusion_sequence: torch.Tensor = correcting_xt_fn(
             x0_guided_flat.detach(),  # (B,P,F)
             t_eff,  # (B,)
             0,  # step
         )
-        return diffusion_trajectory
+        return diffusion_sequence
 
     def _reshape_inference_x0_to_sequence(
             self,
-            diffusion_trajectory: torch.Tensor,
+            diffusion_sequence: torch.Tensor,
             # (B, Pnn, (time_len+T)*4) or (B, Pnn, (1+T)*4) or (B, Pnn, T*4)
             target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
     ) -> torch.Tensor:
         """
-        # 2) diffusion_trajectory
+        # 2) diffusion_sequence
         pose_based = True
             (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
         pose_based = False
@@ -1691,7 +1750,7 @@ class Decoder(nn.Module):
         """
         """
         Returns:
-            diffusion_cur_future_trajectory:
+            diffusion_cur_future_sequence:
                 shape: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
         """
         if self.config.pose_based:
@@ -1701,35 +1760,35 @@ class Decoder(nn.Module):
             last_dim = 3
             seq_len = self._future_len
 
-        batch_size, one_or_Pnn = diffusion_trajectory.shape[:2]
+        batch_size, one_or_Pnn = diffusion_sequence.shape[:2]
         B: int = batch_size
         if self.config.use_past_dit_input:
-            diffusion_cur_future_trajectory = diffusion_trajectory.reshape(
+            diffusion_cur_future_sequence = diffusion_sequence.reshape(
                 B,
                 one_or_Pnn,
                 -1,
                 last_dim,
             )
-            diffusion_cur_future_trajectory = diffusion_cur_future_trajectory[:, :,
-                                                                              -seq_len:, :]
-            return diffusion_cur_future_trajectory
+            diffusion_cur_future_sequence = diffusion_cur_future_sequence[:, :,
+                                                                          -seq_len:, :]
+            return diffusion_cur_future_sequence
         if self.config.use_current_input:
-            diffusion_cur_future_trajectory = diffusion_trajectory.reshape(
+            diffusion_cur_future_sequence = diffusion_sequence.reshape(
                 B, one_or_Pnn, seq_len, last_dim)
-            return diffusion_cur_future_trajectory
+            return diffusion_cur_future_sequence
         if self.config.pose_based:
-            diffusion_cur_future_trajectory = torch.cat(
+            diffusion_cur_future_sequence = torch.cat(
                 [
                     target_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
-                    diffusion_trajectory.reshape(B, one_or_Pnn, seq_len,
-                                                 last_dim),  # (B,Pnn,T,4)
+                    diffusion_sequence.reshape(B, one_or_Pnn, seq_len,
+                                               last_dim),  # (B,Pnn,T,4)
                 ],
                 dim=2,
             )  # (B,Pnn,1+T,4)
         else:
-            diffusion_cur_future_trajectory = diffusion_trajectory.reshape(
+            diffusion_cur_future_sequence = diffusion_sequence.reshape(
                 B, one_or_Pnn, seq_len, last_dim)
-        return diffusion_cur_future_trajectory
+        return diffusion_cur_future_sequence
 
     def _append_inference_feasible_outputs(
             self,
@@ -1871,7 +1930,7 @@ class Decoder(nn.Module):
             "diffusion_output"] = diffusion_future_output  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
         """ decoder_output_dict
         diffusion_output : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
-        diffusion_trajectory
+        diffusion_sequence
             pose_based:
                 (B, (1+)Pnn, (1+T),4)
             else:
@@ -1881,7 +1940,7 @@ class Decoder(nn.Module):
         "control_sequence" : (B, (1+)Pnn, T, 3)
         """
         decoder_output_dict[
-            "diffusion_trajectory"] = self.dit.norm_dit_returns.diffusion_trajectory
+            "diffusion_sequence"] = self.dit.norm_dit_returns.diffusion_sequence
         # 4) feasible 출력 추가(옵션)
         self._append_training_feasible_outputs(
             decoder_output_dict=decoder_output_dict,
@@ -1890,12 +1949,15 @@ class Decoder(nn.Module):
 
         return decoder_output_dict
 
-    def _get_noise_trajectory_from_prev_trajectory(
-            self,
-            rollout_time_chunk_size: int,
-            random_noise: torch.Tensor,  # (B*R, (1+)Pnn, future_len, 4or 3)
-    ) -> torch.Tensor:
-        """이전 step의 버퍼(self._amortized_buffer)로부터 다음 step의 noise_trajectory를 만듭니다.
+    def _set_amortized_buffer_from_sequence(
+        self,
+        diffusion_future_sequence: torch.Tensor,
+        # (B*R, (1+)Pnn, future_len, 4or 3)
+        random_noise: torch.Tensor,  # (B*R, (1+)Pnn, future_len, 4or 3)
+        rollout_time_chunk_size: Optional[int] = None,
+        do_shift: bool = True,
+    ) -> None:
+        """ diffusion_future_sequence 로부터 다음 step의 noise_trajectory를 만듭니다.
 
         변경점(핵심)
         ----------
@@ -1909,45 +1971,41 @@ class Decoder(nn.Module):
                 표준정규 랜덤 텐서.
                 shape: (B, (1+)Pnn, future_len, 4)
 
-        Returns:
-            torch.Tensor:
-                noise_trajectory: (B, (1+)Pnn, future_len, 4 or 3)
         """
-        if self._amortized_buffer is None:
-            raise RuntimeError("self._amortized_buffer is None.")
 
         if not isinstance(random_noise, torch.Tensor):
             raise TypeError("random_noise must be torch.Tensor.")
 
-        if tuple(random_noise.shape) != tuple(self._amortized_buffer.shape):
+        if tuple(random_noise.shape) != tuple(diffusion_future_sequence.shape):
             raise ValueError(
                 "random_noise shape가 self._x0_for_amortized_inference와 같아야 합니다. "
                 f"random_noise={tuple(random_noise.shape)}, "
-                f"buffer={tuple(self._amortized_buffer.shape)}")
-
-        # (B, (1+)Pnn, future_len, 4 or 3)
-        x0_shifted = torch.zeros_like(self._amortized_buffer)
-        B = int(x0_shifted.shape[0])
-
-        # 앞쪽으로 당기기 (rollout_time_chunk_size 만큼)
-        # self._amortized_buffer: (B, 1+Pnn, T, 4 or 3)
-        if int(rollout_time_chunk_size) > 0:
-            x0_shifted[:, :, :-int(rollout_time_chunk_size), :] = \
-                self._amortized_buffer[
-                    :, :, int(rollout_time_chunk_size):, :]
-
+                f"buffer={tuple(diffusion_future_sequence.shape)}")
         # batch_diffusion_time: (B, future_len)
+        B = int(diffusion_future_sequence.shape[0])
         batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
-            B, 1).to(device=self._amortized_buffer.device)
+            B, 1).to(device=diffusion_future_sequence.device)
+        if do_shift:
+            assert rollout_time_chunk_size is not None, "rollout_time_chunk_size must be set."
+            # (B, (1+)Pnn, future_len, 4 or 3)
+            x0_shifted = torch.zeros_like(diffusion_future_sequence)
 
+            # 앞쪽으로 당기기 (rollout_time_chunk_size 만큼)
+            # diffusion_future_sequence: (B, 1+Pnn, T, 4 or 3)
+            if int(rollout_time_chunk_size) > 0:
+                x0_shifted[:, :, :-int(rollout_time_chunk_size), :] = \
+                    diffusion_future_sequence[
+                        :, :, int(rollout_time_chunk_size):, :]
+        else:
+            x0_shifted = diffusion_future_sequence
         mean, std = self.sde.marginal_prob(x0_shifted, batch_diffusion_time)
 
         # ✅ 외부에서 받은 랜덤 사용
         random_noise = _ensure_tensor_on_ref(random_noise,
-                                             self._amortized_buffer)
+                                             diffusion_future_sequence)
 
         noise_trajectory: torch.Tensor = mean + std * random_noise
-        return noise_trajectory
+        self._amortized_buffer = noise_trajectory  # (B, (1+)Pnn, future_len, 4 or 3)
 
     @staticmethod
     def _normalize_cos_sin_for_rotation(
@@ -2138,37 +2196,36 @@ class Decoder(nn.Module):
         pose_4_dim[..., 2] = torch.where(valid_mask_bool, cos_new, cos_h)
         pose_4_dim[..., 3] = torch.where(valid_mask_bool, sin_new, sin_h)
 
-    def _update_amortized_future_buffer_origin(
+    def _update_diffusion_future_sequence_origin(
             self,
+            diffusion_future_sequence: torch.Tensor,  # (B, 1+Pnn, T, 4 or 3)
             rollout_time_chunk_size: int,
             target_future_valid: torch.Tensor,  # (B, (1+)Pnn, future_len)
-    ) -> None:
-        """amortized 추론에서 재사용하는 '미래 버퍼'의 좌표 기준을 다음 스텝 기준으로 맞춥니다.
+    ) -> torch.Tensor:  # (B, 1+Pnn, T, 4 or 3)
+        """amortized 추론에서 재사용하는 'diffusion_future_sequence'의 좌표 기준을 다음 스텝 기준으로 맞춥니다.
 
         이 함수가 필요한 이유
         -------------------
         평가/롤아웃 코드에서는 매 스텝(또는 chunk)마다 입력 전체를 "새 ego 기준(0,0)"으로 바꿉니다.
         그런데 Decoder 안의 미래 버퍼(self._amortized_buffer)는 다음 스텝에도 재사용되므로,
-        이 버퍼도 똑같이 기준을 바꾸지 않으면,
+        diffusion_future_sequence도 똑같이 기준을 바꾸지 않으면,
         다음 스텝에서 "과거/현재(새 기준)"과 "미래 버퍼(옛 기준)"가 섞일 수 있습니다.
 
         처리 순서(중요)
         -------------
-        self._amortized_buffer 는 모델이 쓰는 스케일(정규화된 값)로 저장되어 있습니다.
+        diffusion_future_sequence 는 모델이 쓰는 스케일(정규화된 값)로 저장되어 있습니다.
         이동/회전은 실제 단위에서 하는 것이 안전하므로 아래 순서를 지킵니다.
 
-          1) 버퍼를 state_normalizer.inverse 로 실제 단위로 되돌립니다.
+          1) diffusion_future_sequence를 state_normalizer.inverse 로 실제 단위로 되돌립니다.
           2) rollout_time_chunk_size 시점의 ego 포즈를 기준점으로 삼습니다.
-          3) 버퍼 전체를 같은 기준으로 이동/회전합니다.
+          3) diffusion_future_sequence 전체를 같은 기준으로 이동/회전합니다.
           4) 다시 state_normalizer 로 모델 입력 스케일로 맞춥니다.
           5) (cos, sin)이 길이 1이 되도록 한 번 더 정리합니다.
 
         """
-        if self._amortized_buffer is None:
-            return
 
         # buffer_norm: (B, (1+)Pnn, future_len, 4)
-        buffer_norm: torch.Tensor = self._amortized_buffer
+        buffer_norm: torch.Tensor = diffusion_future_sequence
 
         # dtype/device 보존용
         original_dtype = buffer_norm.dtype
@@ -2219,7 +2276,8 @@ class Decoder(nn.Module):
         buffer_norm_new = self._project_future_yaw_to_unit_circle(
             buffer_norm_new)
 
-        self._amortized_buffer = buffer_norm_new
+        diffusion_future_sequence = buffer_norm_new
+        return diffusion_future_sequence
 
     def _forward_inference_mode(
         self,
@@ -2235,7 +2293,7 @@ class Decoder(nn.Module):
         one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
         """ decoder_output_dict
-        diffusion_trajectory : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
+        diffusion_sequence : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
         "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
         "control_constraint_diff" : (B, (1+)Pnn, T, 3)
         "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2274,25 +2332,8 @@ class Decoder(nn.Module):
                         "When using amortized diffusion during inference, "
                         "if inference_noise is not provided, "
                         "self._amortized_buffer must be set.")
-
-                    rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
-                    rollout_time_chunk_size_int = int(
-                        rollout_time_chunk_size[0].item())
-
-                    # ✅ cand_idx 기반 seed로 만든 랜덤을 inputs에서 받아 사용
-                    # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
-                    amortized_random_noise = self._get_amortized_random_noise_from_inputs(
-                        inputs=inputs,
-                        batch_size=int(B),
-                        one_or_Pnn=int(one_or_Pnn),
-                        target_current_xyyaw=target_current_xyyaw,
-                    )
                     # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
-                    noise_future_sequence = self._get_noise_trajectory_from_prev_trajectory(
-                        rollout_time_chunk_size=rollout_time_chunk_size_int,
-                        random_noise=
-                        amortized_random_noise,  # (B*R, (1+)Pnn, future_len, 4or 3)
-                    )
+                    noise_future_sequence = self._amortized_buffer
             else:  # 기존 DPM-Solver 경로
                 assert self._amortized_buffer is None, (
                     "self._amortized_buffer should be None when not using amortized diffusion."
@@ -2327,13 +2368,11 @@ class Decoder(nn.Module):
                 target_seq_past=target_seq_past,
                 # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
             )  # (B,Pnn,F)
-            # ✅ 추가: 샘플링 시작점부터 무효 타임스텝 0 처리
             xT = self._mask_zero_at_invalid_timestep_in_seq_flat(
                 x_flat=xT,
                 target_past_cur_future_valid=
                 target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
             )
-
             # 4) 샘플링 중 보정 함수 구성
             correcting_xt_fn = self._build_inference_correcting_xt_fn(
                 batch_size=B,
@@ -2346,15 +2385,17 @@ class Decoder(nn.Module):
 
             # 5) dpm_sampler 실행
             """
-            # 2) xT and diffusion_trajectory
+            # 2) xT and diffusion_sequence (x,y,cos,sin) or (v_x^b, v_y^b, yaw_rate)
             pose_based = True
                 (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
             pose_based = False
                 (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
             """
-            diffusion_trajectory: torch.Tensor = self._run_dpm_sampler_for_inference(
+            diffusion_sequence: torch.Tensor = self._run_dpm_sampler_for_inference(
                 xT=xT,
                 target_agents_past=target_agents_past,  # (B,Pnn,time_len,11)
+                target_seq_past=
+                target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
                 target_past_cur_future_valid=target_past_cur_future_valid,
@@ -2364,16 +2405,19 @@ class Decoder(nn.Module):
             )
 
             # dtype 맞춤(기존 로직 유지)
-            diffusion_trajectory = diffusion_trajectory.to(xT.dtype)
+            diffusion_sequence = diffusion_sequence.to(xT.dtype)
 
-            # 6) diffusion_cur_future_trajectory: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
-            diffusion_cur_future_trajectory: torch.Tensor = self._reshape_inference_x0_to_sequence(
-                diffusion_trajectory=diffusion_trajectory,
+            # 6) diffusion_cur_future_sequence: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
+            diffusion_cur_future_sequence: torch.Tensor = self._reshape_inference_x0_to_sequence(
+                diffusion_sequence=diffusion_sequence,
                 target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
             )
-            # 6) diffusion_cur_future_trajectory: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
+            # 6) diffusion_cur_future_sequence: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
             decoder_output_dict[
-                "diffusion_trajectory"] = diffusion_cur_future_trajectory
+                "diffusion_sequence"] = diffusion_cur_future_sequence
+            """
+            4.3 # self._amortized_buffer 채우기 (noise 주고 채워야 한다!)
+            """
             # self.dit.norm_dit_returns.integrated_trajectory : (B, (1+)Pnn, T, 4) 정규화 상태
             if self.config.use_amortized_diffusion:
                 if self.config.use_feasible:
@@ -2382,37 +2426,57 @@ class Decoder(nn.Module):
                             device=target_current_xyyaw.device,
                             dtype=target_current_xyyaw.dtype,
                         ).detach()
-                        self._amortized_buffer = integrated  # (B, 1+Pnn, T, 4)
+                        diffusion_future_sequence = integrated  # (B, 1+Pnn, T, 4)
                     else:
                         control_sequence = self.dit.norm_dit_returns.control_sequence.to(
                             device=target_current_xyyaw.device,
                             dtype=target_current_xyyaw.dtype,
                         ).detach()
-                        self._amortized_buffer = control_sequence  # (B, 1+Pnn, T, 3)
+                        diffusion_future_sequence = control_sequence  # (B, 1+Pnn, T, 3)
 
                 else:
                     # (B, 1+Pnn, T, 4 or 3)
-                    self._amortized_buffer = diffusion_cur_future_trajectory[:, :,
-                                                                             -self
-                                                                             .
-                                                                             config
-                                                                             .
-                                                                             future_len:, :].detach(
-                                                                             )
-
+                    diffusion_future_sequence = diffusion_cur_future_sequence[:, :,
+                                                                              -self
+                                                                              .
+                                                                              config
+                                                                              .
+                                                                              future_len:, :].detach(
+                                                                              )
                 rollout_time_chunk_size = inputs["rollout_time_chunk_size"]
                 rollout_time_chunk_size_int = int(
                     rollout_time_chunk_size[0].item())
+
+                # ✅ cand_idx 기반 seed로 만든 랜덤을 inputs에서 받아 사용
+                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
+                amortized_random_noise = self._get_amortized_random_noise_from_inputs(
+                    inputs=inputs,
+                    batch_size=int(B),
+                    one_or_Pnn=int(one_or_Pnn),
+                    target_current_xyyaw=target_current_xyyaw,
+                )
+
                 # target_future_valid: (B, (1+)Pnn, T)
                 target_future_valid = target_past_cur_future_valid[:, :, -self.
                                                                    _future_len:].detach(
                                                                    )
                 # ✅ 미래 버퍼도 다음 스텝 기준 좌표로 맞추기
                 if self.config.pose_based:
-                    self._update_amortized_future_buffer_origin(
+                    diffusion_future_sequence = self._update_diffusion_future_sequence_origin(
+                        diffusion_future_sequence=diffusion_future_sequence,
                         rollout_time_chunk_size=rollout_time_chunk_size_int,
                         target_future_valid=target_future_valid,
                     )
+
+                # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
+                self._set_amortized_buffer_from_sequence(
+                    diffusion_future_sequence=
+                    diffusion_future_sequence,  # (B, 1+Pnn, T, 4 or 3)
+                    random_noise=
+                    amortized_random_noise,  # (B*R, (1+)Pnn, future_len, 4or 3)
+                    rollout_time_chunk_size=rollout_time_chunk_size_int,
+                    do_shift=True,
+                )
 
             # 8) Feasible 출력(옵션)
             # decoder_output_dict["integrated_trajectory"] : (B, (1+)Pnn, 1+T, 4)
@@ -2422,6 +2486,7 @@ class Decoder(nn.Module):
             )
             """ decoder_output_dict
             "diffusion_output" : (B, (1+)Pnn, T, 4) / (B, (1+)Pnn, T, 3)
+            "diffusion_sequence" : (B, (1+)Pnn, T, 4) / (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             "control_constraint_diff" : (B, (1+)Pnn, T, 3)
             "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2472,7 +2537,7 @@ class Decoder(nn.Module):
         if self.training:
             """ decoder_output_dict
             diffusion_output : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
-            diffusion_trajectory : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
+            diffusion_sequence : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             "control_constraint_diff" : (B, (1+)Pnn, T, 3)
             "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2492,7 +2557,7 @@ class Decoder(nn.Module):
             )
         else:
             """ decoder_output_dict
-            diffusion_trajectory : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
+            diffusion_sequence : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
             "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
             "control_constraint_diff" : (B, (1+)Pnn, T, 3)
             "control_sequence" : (B, (1+)Pnn, T, 3)
@@ -2517,14 +2582,14 @@ from dataclasses import dataclass
 @dataclass(frozen=False)
 class DiTReturns:
     """
-    diffusion_trajectory
+    diffusion_sequence
         pose_based:
             (B, (1+)Pnn, (1+T),4)
         else:
             (B, (1+)Pnn, T,3)
 
     """
-    diffusion_trajectory: Optional[torch.Tensor] = None
+    diffusion_sequence: Optional[torch.Tensor] = None
     integrated_trajectory: Optional[torch.Tensor] = None  # (B, Pnn, T, 4)
     control_constraint_diff: Optional[torch.Tensor] = None  # (B, Pnn, T, 3)
     control_sequence: Optional[torch.Tensor] = None  # (B, Pnn, T, 3)
@@ -2544,7 +2609,7 @@ class DiT(nn.Module):
                  model_type="x_start"):
         super().__init__()
         self.norm_dit_returns = None
-        self.diffusion_trajectory_flat = None
+        self.diffusion_sequence_flat = None
         self.config = config
         self._future_len: int = config.future_len  # <추가하자>
         self._time_len: int = config.time_len  # <추가하자>
@@ -2978,32 +3043,33 @@ class DiT(nn.Module):
 
             if self.config.use_past_dit_input:
                 # x_for_feasible: (B,P, (time_len+T)*4) -> (B,P,time_len+T,4) -> 마지막 1+T만
-                diffusion_trajectory = x_for_feasible.reshape(B, P, -1,
-                                                              4).contiguous()
-                diffusion_trajectory = diffusion_trajectory[:, :, -(
-                    future_len + 1):, :]  # (B,P,1+T,4)
-                diffusion_trajectory[:, :,
-                                     0, :] = target_current_xyyaw_for_feasible
-                return diffusion_trajectory.contiguous()
+                diffusion_sequence = x_for_feasible.reshape(B, P, -1,
+                                                            4).contiguous()
+                diffusion_sequence = diffusion_sequence[:, :,
+                                                        -(future_len +
+                                                          1):, :]  # (B,P,1+T,4)
+                diffusion_sequence[:, :,
+                                   0, :] = target_current_xyyaw_for_feasible
+                return diffusion_sequence.contiguous()
 
             if self.config.use_current_input:
                 # x_for_feasible: (B,P,(1+T)*4) -> (B,P,1+T,4)
-                diffusion_trajectory = x_for_feasible.reshape(B, P, -1,
-                                                              4).contiguous()
-                diffusion_trajectory[:, :,
-                                     0, :] = target_current_xyyaw_for_feasible
-                return diffusion_trajectory.contiguous()
+                diffusion_sequence = x_for_feasible.reshape(B, P, -1,
+                                                            4).contiguous()
+                diffusion_sequence[:, :,
+                                   0, :] = target_current_xyyaw_for_feasible
+                return diffusion_sequence.contiguous()
 
             # use_current_input=False: x_for_feasible는 미래만 (B,P,T*4)
             diffusion_future = x_for_feasible.reshape(B, P, -1, 4)  # (B,P,T,4)
-            diffusion_trajectory = torch.cat(
+            diffusion_sequence = torch.cat(
                 [
                     target_current_xyyaw_for_feasible.unsqueeze(2),
                     diffusion_future
                 ],
                 dim=2,
             ).contiguous()  # (B,P,1+T,4)
-            return diffusion_trajectory
+            return diffusion_sequence
 
         # -------- pose_based=False: future control 만들기 --------
         if int(x_for_feasible.shape[-1]) % 3 != 0:
@@ -3482,7 +3548,7 @@ class DiT(nn.Module):
         )
 
         if self.config.pose_based:
-            diffusion_trajectory = self._build_diffusion_inputs_for_feasible_projection(
+            diffusion_sequence = self._build_diffusion_inputs_for_feasible_projection(
                 x_for_feasible=x_for_feasible,
                 target_current_xyyaw_for_feasible=
                 target_current_xyyaw_for_feasible,
@@ -3491,7 +3557,7 @@ class DiT(nn.Module):
             )  # (B,P,1+T,4)
 
             self._feasible_projection(
-                diffusion_trajectory=diffusion_trajectory,
+                diffusion_sequence=diffusion_sequence,
                 target_past_11_dim=target_past_11_dim,
                 target_class_one_hot=target_class_one_hot,
                 target_past_cur_future_valid=
@@ -3868,13 +3934,13 @@ else
             x0 = diffusion_output
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
-        """ self.diffusion_trajectory_flat = x0
+        """ self.diffusion_sequence_flat = x0
         pose_based:
             (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
         else:
             (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
         """
-        self.diffusion_trajectory_flat = x0
+        self.diffusion_sequence_flat = x0
         """ x0_4dim
         pose_based:
             (B, (1+)Pnn, (time_len+ T) ,4) or (B, (1+)Pnn, T,4) or (B, (1+)Pnn, (1+T),4)
@@ -3893,13 +3959,13 @@ else
             x0_4dim = x0.reshape(B, one_or_Pnn, -1, 3)  # (B, (1+)Pnn, T_any, 3)
             x0_4dim = x0_4dim[:, :, -self._future_len:, :]  # (B,P,F_future,3)
         """
-        diffusion_trajectory
+        diffusion_sequence
             pose_based:
                 (B, (1+)Pnn, (1+T),4)
             else:
                 (B, (1+)Pnn, T,3)
         """
-        self.norm_dit_returns.diffusion_trajectory = x0_4dim
+        self.norm_dit_returns.diffusion_sequence = x0_4dim
         if self.config.use_feasible:
             self.do_feasible_projection(
                 x=x0,
@@ -4004,7 +4070,7 @@ else
     # : stride 기반 down/up 샘플링을 통합한 새 파이프라인
     def _feasible_projection_core(
             self,
-            diffusion_trajectory: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
+            diffusion_sequence: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
             target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
             target_past_cur_future_valid: torch.Tensor,
             # (B, (1+)Pnn, time_len=1+past_len+future_len) bool
@@ -4026,14 +4092,13 @@ else
             5) 업샘플된 현재~미래 구간 제어를 가지고
                filter_and_integrate 로 최종 적분 궤적과 제약 위반량을 계산.
         """
-        device_type: str = diffusion_trajectory.device.type
+        device_type: str = diffusion_sequence.device.type
         use_profile: bool = bool(getattr(self.config, "profile_feasible",
                                          False))
 
         # Feasible 파트는 모두 FP32로 고정
         with torch.autocast(device_type=device_type, enabled=False):
-            diffusion_trajectory = diffusion_trajectory.float(
-            )  # (B, Pnn, 1+T, 4)
+            diffusion_sequence = diffusion_sequence.float()  # (B, Pnn, 1+T, 4)
             target_class_one_hot = target_class_one_hot.float()  # (B, Pnn, 3)
             target_past_cur_future_valid = target_past_cur_future_valid.to(
                 torch.bool)  # (B, Pnn, time_len+future_len)
@@ -4041,7 +4106,7 @@ else
                 target_past_11_dim = target_past_11_dim.float(
                 )  # (B, Pnn, past_len, 11)
 
-            B, Pnn, one_future_len, _ = diffusion_trajectory.shape
+            B, Pnn, one_future_len, _ = diffusion_sequence.shape
             future_len: int = int(one_future_len - 1)  # T
 
             # stride 및 SG 윈도 관련 하이퍼 계산
@@ -4055,7 +4120,7 @@ else
             target_cur_future_valid = target_past_cur_future_valid[:, :, -(
                 one_future_len):]  # (B, Pnn, 1+T) bool
             unnorm_diffusion_trajectory = self.config.state_normalizer.inverse(
-                data=diffusion_trajectory,  # (B, Pnn, 1+T, 4)
+                data=diffusion_sequence,  # (B, Pnn, 1+T, 4)
                 valid_mask=target_cur_future_valid)  # (B, Pnn, 1+T)
             unnorm_near_current_state = unnorm_diffusion_trajectory[:, :,
                                                                     0, :]  # (B, Pnn, 4)
@@ -4087,7 +4152,7 @@ else
                 past_len_ds,  # int
                 future_len_ds,  # int (T_ds)
             ) = self.feasible_projector.build_downsampled_feasible_inputs(
-                diffusion_trajectory=diffusion_trajectory,  # (B, Pnn, 1+T, 4)
+                diffusion_trajectory=diffusion_sequence,  # (B, Pnn, 1+T, 4)
                 target_past=target_past_11_dim,
                 # (B, Pnn, past_len, 11) or None
                 target_past_cur_future_valid=
@@ -4369,7 +4434,7 @@ else
 
     def _feasible_projection(
             self,
-            diffusion_trajectory: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
+            diffusion_sequence: torch.Tensor,  # (B, (1+)Pnn, 1+future_len, 4)
             target_past_11_dim: torch.Tensor,
             # (B, (1+)Pnn, past_len, 11) 또는 None
             target_class_one_hot: torch.Tensor,  # (B, (1+)Pnn, 3)
@@ -4377,9 +4442,9 @@ else
             # (B, (1+)Pnn, time_len(=1+past_len) + future_len) bool
             low_t_mask: torch.Tensor,  # (B, )
     ) -> None:
-        B, Pnn, one_future_len, _ = diffusion_trajectory.shape
+        B, Pnn, one_future_len, _ = diffusion_sequence.shape
         future_len = one_future_len - 1
-        device = diffusion_trajectory.device
+        device = diffusion_sequence.device
 
         # [B] -> bool 로 정리
         low_t_mask = low_t_mask.to(device=device)
@@ -4389,10 +4454,10 @@ else
         # 기본값:
         #   - integrated_trajectory: 원 궤적(x_start) 그대로 (t=1..future_len)
         #   - control_constraint_diff: 전부 0
-        # diffusion_trajectory 는 정규화 상태라고 가정
-        base_integrated = diffusion_trajectory[:, :, 1:, :].detach(
+        # diffusion_sequence 는 정규화 상태라고 가정
+        base_integrated = diffusion_sequence[:, :, 1:, :].detach(
         )  # (B,Pnn,future_len,4)
-        base_constraint = diffusion_trajectory.new_zeros(
+        base_constraint = diffusion_sequence.new_zeros(
             (B, Pnn, future_len, 3))  # (B,Pnn,future_len,3)
 
         # ✅ DDP 안전용: feasible_projector 파라미터를 "0배로" 그래프에 등장시키는 스칼라
@@ -4417,7 +4482,7 @@ else
 
         # ---- active subset만 projector 파이프라인 실행 ----
         self._feasible_projection_core(
-            diffusion_trajectory[active_idx],
+            diffusion_sequence[active_idx],
             target_class_one_hot[active_idx],
             target_past_cur_future_valid[active_idx],
             target_past_11_dim[active_idx]
