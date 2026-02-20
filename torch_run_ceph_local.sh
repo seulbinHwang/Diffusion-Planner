@@ -110,7 +110,7 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "38_control_only_new_network_1e-3" \
+    --name "v_pred_grad_max_normalization" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -121,7 +121,9 @@ export DP_ENABLE_CPU_MONITOR=0
     --use_feasible_filter False \
     --feasible_grad_to_dit False \
     --feasible_stride_dt 0.1 \
+    --diffusion_model_type "v" \
     --num_workers 3 \
+    --max_grad_norm 0.5 \
     --prefetch_factor 8 \
     --p_sat 0.4 \
     --w_dir 1.0 \
