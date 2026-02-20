@@ -354,6 +354,9 @@ class Decoder(nn.Module):
         # = <diffusion_planner/model/guidance/guidance_wrapper.py> 의 GuidanceWrapper 인스턴스가 들어옴
         self._guidance_fn = getattr(config, "guidance_fn", None)
         self._amortized_buffer = None  # (B, 1+Pnn, T, 4 or 3)
+        # ✅ (추가) z를 만들 때 사용한 표준정규 노이즈(eps) 버퍼
+        # shape: (B, 1+Pnn, T, 4 or 3)
+        self._amortized_buffer_eps = None
         future_len = self.config.future_len  # e.g., 80
         # Future-only amortized schedule: [1/T, 2/T, ..., 1]
         # ✅ [수정] amortized schedule에서 t=1을 정확히 쓰지 않도록 마지막을 1-eps로 제한
@@ -1461,23 +1464,26 @@ class Decoder(nn.Module):
         return sigma2_over_alpha.view(B, 1, 1)  # (B,1,1)
 
     def _compute_guidance_grad_wrt_x(
-        self,
-        x_t_flat: torch.Tensor,
-        t_eff: torch.Tensor,
-        classifier_kwargs: Dict[str, object],
+            self,
+            x_t_flat: torch.Tensor,
+            t_eff: torch.Tensor,
+            classifier_kwargs: Dict[str, object],
     ) -> torch.Tensor:
         """guidance_fn 출력(점수)을 x에 대해 미분한 값을 구합니다.
+
+        핵심 안전장치
+        - 바깥이 autocast(bf16) 컨텍스트여도, guidance_fn 계산 구간만 FP32로 고정합니다.
+        - 바깥이 torch.no_grad()/inference_mode 여도, 여기서는 미분이 가능하도록 다시 켭니다.
 
         Args:
             x_t_flat (torch.Tensor):
                 점수를 평가할 입력 x.
-                보통 "현재 샘플 x_t" 역할을 하는 텐서를 넣습니다.
                 shape: (B, P, F)
             t_eff (torch.Tensor):
                 대표 시간값.
                 shape: (B,)
             classifier_kwargs (Dict[str, object]):
-                guidance_fn에 그대로 전달할 추가 정보.
+                guidance_fn에 전달할 추가 정보.
 
         Returns:
             torch.Tensor:
@@ -1487,35 +1493,53 @@ class Decoder(nn.Module):
         """
         if self._guidance_fn is None:
             raise RuntimeError(
-                "self._guidance_fn is None, but guidance grad was requested.")
+                "self._guidance_fn is None, but guidance grad was requested."
+            )
         if x_t_flat.dim() != 3:
             raise ValueError(
-                f"x_t_flat must be 3D (B,P,F). got {tuple(x_t_flat.shape)}")
+                f"x_t_flat must be 3D (B,P,F). got {tuple(x_t_flat.shape)}"
+            )
         if t_eff.dim() != 1:
             raise ValueError(f"t_eff must be 1D (B,). got {tuple(t_eff.shape)}")
 
+        device_type: str = "cuda" if x_t_flat.is_cuda else "cpu"
+
         # 바깥이 torch.no_grad / torch.inference_mode 여도 여기서는 미분이 가능해야 합니다.
         with torch.inference_mode(False), torch.enable_grad():
-            x_in: torch.Tensor = (x_t_flat.detach().to(
-                dtype=torch.float32).clone().requires_grad_(True)
-                                 )  # (B,P,F) float32, requires_grad=True
+            x_in: torch.Tensor = (
+                x_t_flat.detach()
+                .to(dtype=torch.float32)
+                .clone()
+                .requires_grad_(True)
+            )  # (B,P,F) float32, requires_grad=True
 
             t_in: torch.Tensor = t_eff.detach().to(
                 device=x_in.device,
                 dtype=torch.float32,
             )  # (B,)
 
-            # guidance_fn 시그니처가 (x,t,model_out,**kw) 또는 (x,t,**kw) 둘 다 가능하게 처리
-            try:
-                score = self._guidance_fn(x_in, t_in, None, **classifier_kwargs)
-            except TypeError:
-                score = self._guidance_fn(x_in, t_in, **classifier_kwargs)
+            # ✅ guidance_fn 계산 구간만 autocast OFF로 고정 (bf16 노출 차단)
+            with torch.autocast(device_type=device_type, enabled=False):
+                try:
+                    score = self._guidance_fn(x_in, t_in, None,
+                                              **classifier_kwargs)
+                except TypeError:
+                    score = self._guidance_fn(x_in, t_in, **classifier_kwargs)
 
-            if not isinstance(score, torch.Tensor):
-                raise TypeError("guidance_fn must return a torch.Tensor. "
-                                f"got {type(score)}")
+                if not isinstance(score, torch.Tensor):
+                    raise TypeError(
+                        "guidance_fn must return a torch.Tensor. "
+                        f"got {type(score)}"
+                    )
+                # ✅ no_grad/inference_mode/연결 끊김으로 guidance가 조용히 무력화되는 걸 방지
+                if not score.requires_grad:
+                    raise RuntimeError(
+                        "guidance_fn output does not require grad w.r.t x. "
+                        "guidance가 no_grad/inference_mode 영향으로 조용히 꺼졌거나, "
+                        "guidance_fn 내부에서 x와의 연결이 끊겼을 수 있습니다."
+                    )
 
-            score_sum: torch.Tensor = score.float().sum()
+                score_sum: torch.Tensor = score.float().sum()
 
             grad = torch.autograd.grad(
                 outputs=score_sum,
@@ -1949,73 +1973,162 @@ class Decoder(nn.Module):
 
         return decoder_output_dict
 
+    # =========================================================
+    # 3) Decoder._set_amortized_buffer_from_sequence 를 교체
+    # =========================================================
     def _set_amortized_buffer_from_sequence(
-        self,
-        diffusion_future_sequence: torch.Tensor,
-        # (B*R, (1+)Pnn, future_len, 4or 3)
-        random_noise: torch.Tensor,  # (B*R, (1+)Pnn, future_len, 4or 3)
-        rollout_time_chunk_size: Optional[int] = None,
-        do_shift: bool = True,
+            self,
+            diffusion_future_sequence: torch.Tensor,
+            # (B, (1+)Pnn, future_len, 4 or 3)  == "x0" 역할
+            random_noise: torch.Tensor,
+            # (B, (1+)Pnn, future_len, 4 or 3)  == "새로 받은 eps 후보(전체 T)"  (do_shift=True면 tail만 사용)
+            rollout_time_chunk_size: Optional[int] = None,
+            do_shift: bool = True,
     ) -> None:
-        """ diffusion_future_sequence 로부터 다음 step의 noise_trajectory를 만듭니다.
+        """diffusion_future_sequence(x0)와 eps로 다음 스텝의 noisy 버퍼(z)를 만듭니다.
 
-        변경점(핵심)
+        핵심 동작
         ----------
-        - 기존: torch.randn_like(...)로 내부에서 랜덤 생성
-        - 변경: 외부에서 전달된 random_noise를 사용 (cand_idx 기반 seed로 재현 가능)
+        - Warm-up(do_shift=False):
+          - eps 전체(T칸)를 1번 저장합니다.
+          - z = alpha(t_tau) * x0 + sigma(t_tau) * eps 로 만들어 self._amortized_buffer(z)에 저장합니다.
+        - AR 업데이트(do_shift=True):
+          - x0도 gap만큼 shift합니다.
+          - eps도 "기존 eps 버퍼"를 gap만큼 shift합니다.
+          - 새로 생긴 tail(gap칸)만 random_noise의 tail을 사용해 eps를 채웁니다.
+          - z는 전체 T칸을 한 번에 다시 계산합니다.
+          - self._amortized_buffer(z)와 self._amortized_buffer_eps(eps)를 같이 갱신합니다.
 
         Args:
-            rollout_time_chunk_size (int):
-                이번에 실행(execute)한 시간 길이(gap).
+            diffusion_future_sequence (torch.Tensor):
+                x0 역할 텐서.
+                shape: (B, (1+)Pnn, future_len, C)  C=4(pose) 또는 3(control)
             random_noise (torch.Tensor):
-                표준정규 랜덤 텐서.
-                shape: (B, (1+)Pnn, future_len, 4)
+                표준정규 노이즈(eps) 텐서.
+                shape: (B, (1+)Pnn, future_len, C)
+                - do_shift=True일 때는 tail(gap) 구간만 사용합니다.
+            rollout_time_chunk_size (Optional[int]):
+                gap. do_shift=True일 때만 필요합니다.
+            do_shift (bool):
+                True면 AR 업데이트(shift + tail append),
+                False면 warm-up(전체 eps 저장) 입니다.
 
+        Returns:
+            None
         """
-
         if not isinstance(random_noise, torch.Tensor):
             raise TypeError("random_noise must be torch.Tensor.")
 
         if tuple(random_noise.shape) != tuple(diffusion_future_sequence.shape):
             raise ValueError(
-                "random_noise shape가 self._x0_for_amortized_inference와 같아야 합니다. "
+                "random_noise shape가 diffusion_future_sequence와 같아야 합니다. "
                 f"random_noise={tuple(random_noise.shape)}, "
-                f"buffer={tuple(diffusion_future_sequence.shape)}")
-        # batch_diffusion_time: (B, future_len)
-        B = int(diffusion_future_sequence.shape[0])
-        batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
-            B, 1).to(device=diffusion_future_sequence.device)
-        device_type = diffusion_future_sequence.device.type
-        if do_shift:
-            assert rollout_time_chunk_size is not None, "rollout_time_chunk_size must be set."
-            # (B, (1+)Pnn, future_len, 4 or 3)
-            x0_shifted = torch.zeros_like(diffusion_future_sequence)
+                f"diffusion_future_sequence={tuple(diffusion_future_sequence.shape)}"
+            )
 
-            # 앞쪽으로 당기기 (rollout_time_chunk_size 만큼)
-            # diffusion_future_sequence: (B, 1+Pnn, T, 4 or 3)
-            if int(rollout_time_chunk_size) > 0:
-                x0_shifted[:, :, :-int(rollout_time_chunk_size), :] = \
-                    diffusion_future_sequence[
-                        :, :, int(rollout_time_chunk_size):, :]
+        B = int(diffusion_future_sequence.shape[0])
+        future_len = int(diffusion_future_sequence.shape[2])
+        device_type = diffusion_future_sequence.device.type
+
+        # t_tau: (B, future_len)
+        batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(B,
+                                                                            1).to(
+            device=diffusion_future_sequence.device
+        )
+
+        # -------------------------
+        # (A) x0 shift 준비
+        # -------------------------
+        if do_shift:
+            assert rollout_time_chunk_size is not None, "rollout_time_chunk_size must be set when do_shift=True."
+            gap = int(rollout_time_chunk_size)
+            gap = max(0, min(gap, future_len))
+
+            x0_shifted = torch.zeros_like(
+                diffusion_future_sequence)  # (B,P,T,C)
+            if gap > 0 and gap < future_len:
+                x0_shifted[:, :, :future_len - gap, :] = \
+                diffusion_future_sequence[:, :, gap:, :]
+            elif gap == 0:
+                x0_shifted = diffusion_future_sequence
+            # gap == future_len 이면 전부 0 유지
         else:
+            gap = 0
             x0_shifted = diffusion_future_sequence
 
-        # mean/std + noise 적용만 fp32로
+        # -------------------------
+        # (B) eps shift + tail append
+        # -------------------------
+        if do_shift:
+            if self._amortized_buffer_eps is None:
+                raise RuntimeError(
+                    "do_shift=True 인데 self._amortized_buffer_eps가 없습니다. "
+                    "warm-up(do_shift=False)에서 eps 버퍼를 먼저 세팅해야 합니다."
+                )
+            if tuple(self._amortized_buffer_eps.shape) != tuple(
+                    diffusion_future_sequence.shape):
+                raise RuntimeError(
+                    "self._amortized_buffer_eps shape가 현재 diffusion_future_sequence와 다릅니다. "
+                    f"eps={tuple(self._amortized_buffer_eps.shape)}, "
+                    f"x0={tuple(diffusion_future_sequence.shape)}"
+                )
+
+            prev_eps = self._amortized_buffer_eps.to(
+                device=diffusion_future_sequence.device,
+                dtype=diffusion_future_sequence.dtype,
+            )
+
+            eps_shifted = torch.zeros_like(
+                diffusion_future_sequence)  # (B,P,T,C)
+
+            if gap > 0 and gap < future_len:
+                # 기존 eps를 앞으로 당김
+                eps_shifted[:, :, :future_len - gap, :] = prev_eps[
+                    :, :, gap:, :]
+                # tail(gap)만 새 eps로 채움 (random_noise의 tail만 사용)
+                eps_shifted[:, :, future_len - gap:, :] = random_noise[
+                    :, :, future_len - gap:, :]
+            elif gap == 0:
+                eps_shifted = prev_eps
+            else:
+                # gap == future_len: 전부 새 tail(=전체)로
+                eps_shifted = random_noise.to(
+                    device=diffusion_future_sequence.device,
+                    dtype=diffusion_future_sequence.dtype,
+                )
+        else:
+            # warm-up: eps 전체를 그대로 저장
+            eps_shifted = random_noise.to(
+                device=diffusion_future_sequence.device,
+                dtype=diffusion_future_sequence.dtype,
+            )
+
+        # -------------------------
+        # (C) z 재계산: z = alpha*x0 + sigma*eps
+        #     (계산은 fp32로)
+        # -------------------------
         with torch.autocast(device_type=device_type, enabled=False):
             x0_f32 = x0_shifted.to(dtype=torch.float32)
             t_f32 = batch_diffusion_time.to(dtype=torch.float32)
 
-            mean_f32, std_f32 = self.sde.marginal_prob(x0_f32, t_f32)
+            mean_f32, std_f32 = self.sde.marginal_prob(x0_f32,
+                                                       t_f32)  # mean=alpha*x0, std=sigma
+            eps_f32 = eps_shifted.to(device=x0_f32.device, dtype=torch.float32)
 
-            noise_f32 = random_noise.to(device=x0_f32.device,
-                                        dtype=torch.float32)
-            noise_traj_f32 = mean_f32 + std_f32 * noise_f32
+            z_f32 = mean_f32 + std_f32 * eps_f32  # (B,P,T,C)
 
-        # 최종 버퍼는 기존 dtype 유지(메모리/속도)
-        self._amortized_buffer = noise_traj_f32.to(
+        # -------------------------
+        # (D) 버퍼 갱신 (dtype/device는 x0 기준으로 맞춤)
+        # -------------------------
+        self._amortized_buffer = z_f32.to(
             device=diffusion_future_sequence.device,
             dtype=diffusion_future_sequence.dtype,
-        )
+        ).detach()
+
+        self._amortized_buffer_eps = eps_shifted.to(
+            device=diffusion_future_sequence.device,
+            dtype=diffusion_future_sequence.dtype,
+        ).detach()
 
     @staticmethod
     def _normalize_cos_sin_for_rotation(
@@ -2327,7 +2440,9 @@ class Decoder(nn.Module):
             noise_future_sequence = inputs.get("inference_noise", None)
             if self.config.use_amortized_diffusion:
                 if noise_future_sequence is not None:  # 첫번쨰 샘플링
+                    # ✅ (중요) 새 rollout 시작이면 z/eps 둘 다 리셋
                     self._amortized_buffer = None
+                    self._amortized_buffer_eps = None
                     # noise_future_sequence: (B,(1+)Pnn,T,4 or 3)
                     noise_future_sequence = self._get_inference_noise_from_inputs(
                         inputs=inputs,
@@ -2345,6 +2460,7 @@ class Decoder(nn.Module):
                     # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
                     noise_future_sequence = self._amortized_buffer
             else:  # 기존 DPM-Solver 경로
+                self._amortized_buffer_eps = None
                 assert self._amortized_buffer is None, (
                     "self._amortized_buffer should be None when not using amortized diffusion."
                 )

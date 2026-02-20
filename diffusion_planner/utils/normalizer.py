@@ -389,6 +389,8 @@ class ObservationNormalizer:
 
         _mask("near_agents_past", "near_agents_past_is_valid")
         _mask("non_near_agents_past", "non_near_agents_past_is_valid")
+        _mask("past_seg_control_gt_3_dim", "past_seg_control_gt_3_dim")
+        _mask("future_seg_control_gt_3_dim", "future_seg_control_gt_3_dim")
 
     def to_dict(self):
         return {

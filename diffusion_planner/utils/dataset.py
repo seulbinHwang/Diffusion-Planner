@@ -36,6 +36,8 @@ _PRECOMPUTED_VALIDITY_KEYS: List[str] = [
     "speed_bump_is_valid",
     "driveway_is_valid",
     "road_edge_is_valid",
+    "past_seg_control_is_valid",
+    "future_seg_control_is_valid",
 ]
 
 _PRECOMPUTED_NEAR_KEYS: List[str] = [
@@ -156,6 +158,24 @@ def _ensure_validity_keys_if_needed_inplace(sample: Dict[str, Any]) -> None:
             return sample.get("neighbor_agents_past", None) is not None
         if key == "neighbor_future_gt_is_valid":
             return sample.get("neighbor_future_gt_11_dim", None) is not None
+        if key == "past_seg_control_is_valid":
+            return sample.get("ego_agent_past",
+                              None) is not None and sample.get(
+                "neighbor_agents_past", None) is not None
+
+        if key == "future_seg_control_is_valid":
+            has_ego_future = (sample.get("planner_future_11_dim",
+                                         None) is not None) or (
+                                         sample.get("ego_future_gt_11_dim",
+                                                    None) is not None)
+            has_neighbor_future = sample.get("neighbor_future_gt_11_dim",
+                                             None) is not None
+            return (
+                    sample.get("ego_agent_past", None) is not None
+                    and sample.get("neighbor_agents_past", None) is not None
+                    and has_ego_future
+                    and has_neighbor_future
+            )
         return False
 
     need_compute = False

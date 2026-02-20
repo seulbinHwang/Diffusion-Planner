@@ -320,18 +320,44 @@ def model_wrapper(
     def cond_grad_fn(x, t_input):
         """
         Compute the gradient of the classifier, i.e. nabla_{x} log p_t(cond | x_t).
-        """
-        with torch.inference_mode(False):
-            with torch.enable_grad():
-                # x_in = x.detach().requires_grad_(True)
-                x_in = x.clone().detach().requires_grad_(True)
 
-                assert x_in.requires_grad, \
-                    " cond_grad_fn 출력이 x에 대한 gradient를 가지지 않습니다."
-                # x_dit에 의존하는 0 텐서 (B,)
+        안전장치
+        - 바깥이 autocast(bf16) 컨텍스트여도, classifier_fn 계산 구간만 FP32로 고정합니다.
+        - 바깥이 torch.no_grad()/inference_mode 여도, 여기서는 미분이 가능하도록 다시 켭니다.
+        - 출력이 x에 대해 grad를 못 가지면(조용한 무력화) 즉시 에러로 잡습니다.
+        """
+        device_type: str = "cuda" if x.is_cuda else "cpu"
+
+        with torch.inference_mode(False), torch.enable_grad():
+            x_in = x.clone().detach().requires_grad_(True)
+
+            if not x_in.requires_grad:
+                raise RuntimeError("cond_grad_fn: x_in does not require grad.")
+
+            # ✅ classifier_fn 계산 구간만 autocast OFF로 고정 (bf16 노출 차단)
+            with torch.autocast(device_type=device_type, enabled=False):
                 log_prob = classifier_fn(x_in, t_input, condition,
                                          **classifier_kwargs)
-                return torch.autograd.grad(log_prob.sum(), x_in)[0]
+
+                if not isinstance(log_prob, torch.Tensor):
+                    raise TypeError(
+                        f"classifier_fn must return torch.Tensor, got {type(log_prob)}"
+                    )
+                # ✅ no_grad/inference_mode/연결 끊김으로 guidance가 조용히 무력화되는 걸 방지
+                if not log_prob.requires_grad:
+                    raise RuntimeError(
+                        "classifier_fn output does not require grad w.r.t x. "
+                        "guidance가 no_grad/inference_mode 영향으로 조용히 꺼졌거나, "
+                        "classifier_fn 내부에서 x와의 연결이 끊겼을 수 있습니다."
+                    )
+
+                log_prob_sum = log_prob.float().sum()
+
+            grad = torch.autograd.grad(log_prob_sum, x_in, retain_graph=False,
+                                       create_graph=False)[0]
+            if grad is None:
+                raise RuntimeError("cond_grad_fn: grad is None.")
+            return grad.detach()
 
     def model_fn(x, t_continuous):
         """

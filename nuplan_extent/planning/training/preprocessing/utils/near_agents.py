@@ -224,6 +224,7 @@ def _add_near_agents_info_for_one_sample_inplace(
                 end=near_num,
             )
 
+
     agent_route_lane_order_is_valid = sample.get(
         "agent_route_lane_order_is_valid", None)
     if agent_route_lane_order_is_valid is not None:

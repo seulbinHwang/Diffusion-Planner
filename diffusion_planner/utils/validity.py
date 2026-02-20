@@ -249,6 +249,155 @@ def build_validity_key_dict(
                 prefix_dim=8,  # 마지막 11차원 중 앞 8개 값이 전부 0이면 False(무효)
             ),  # shape (A, future_len)
         )
+
+    # ---------- NEW: past_seg_control_is_valid / future_seg_control_is_valid ----------
+    def _pick_validity_value(key: str) -> Any:
+        """out에 있으면 out, 없으면(또는 None이면) sample에서 fallback."""
+        v = out.get(key, None)
+        if v is None:
+            v = sample.get(key, None)
+        return v
+
+    def _to_bool_mask_any(x: Any) -> Any:
+        """np/torch 모두에서 0/1, float, bool을 안전하게 bool로 변환."""
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            if x.dtype == torch.bool:
+                return x
+            if torch.is_floating_point(x):
+                return x > 0.5
+            return x != 0
+        x_np = np.asarray(x)
+        if x_np.dtype == np.bool_:
+            return x_np
+        if np.issubdtype(x_np.dtype, np.floating):
+            return x_np > 0.5
+        return x_np != 0
+
+    ego_past_valid = _to_bool_mask_any(_pick_validity_value("ego_agent_past_is_valid"))
+    nbr_past_valid = _to_bool_mask_any(_pick_validity_value("neighbor_agents_past_is_valid"))
+    ego_fut_valid = _to_bool_mask_any(_pick_validity_value("ego_future_gt_is_valid"))
+    nbr_fut_valid = _to_bool_mask_any(_pick_validity_value("neighbor_future_gt_is_valid"))
+
+    # (1) past_seg_control_is_valid: past node valid -> segment valid
+    if ego_past_valid is None or nbr_past_valid is None:
+        _set_or_skip(out, "past_seg_control_is_valid", None)
+    else:
+        if isinstance(nbr_past_valid, torch.Tensor):
+            # 기대: (A,T) 또는 (B,A,T)
+            if nbr_past_valid.dim() == 2:
+                if ego_past_valid.dim() != 1:
+                    raise ValueError(
+                        f"ego_agent_past_is_valid must be (T,) when neighbor is (A,T). got {tuple(ego_past_valid.shape)}"
+                    )
+                target_past_valid = torch.cat([ego_past_valid.unsqueeze(0), nbr_past_valid], dim=0)  # (1+A,T)
+            elif nbr_past_valid.dim() == 3:
+                if ego_past_valid.dim() != 2:
+                    raise ValueError(
+                        f"ego_agent_past_is_valid must be (B,T) when neighbor is (B,A,T). got {tuple(ego_past_valid.shape)}"
+                    )
+                target_past_valid = torch.cat([ego_past_valid.unsqueeze(1), nbr_past_valid], dim=1)  # (B,1+A,T)
+            else:
+                raise ValueError(f"neighbor_agents_past_is_valid ndim must be 2 or 3. got {nbr_past_valid.dim()}")
+
+            past_seg_valid = (target_past_valid[..., :-1] & target_past_valid[..., 1:]).to(torch.bool)
+        else:
+            nbr = np.asarray(nbr_past_valid, dtype=bool)
+            ego = np.asarray(ego_past_valid, dtype=bool)
+            if nbr.ndim == 2:
+                if ego.ndim != 1:
+                    raise ValueError(f"ego_agent_past_is_valid must be (T,) when neighbor is (A,T). got {ego.shape}")
+                target_past_valid = np.concatenate([ego[None, :], nbr], axis=0)  # (1+A,T)
+            elif nbr.ndim == 3:
+                if ego.ndim != 2:
+                    raise ValueError(f"ego_agent_past_is_valid must be (B,T) when neighbor is (B,A,T). got {ego.shape}")
+                target_past_valid = np.concatenate([ego[:, None, :], nbr], axis=1)  # (B,1+A,T)
+            else:
+                raise ValueError(f"neighbor_agents_past_is_valid ndim must be 2 or 3. got {nbr.ndim}")
+
+            past_seg_valid = (target_past_valid[..., :-1] & target_past_valid[..., 1:]).astype(bool)
+
+        _set_or_skip(out, "past_seg_control_is_valid", past_seg_valid)
+
+    # (2) future_seg_control_is_valid: (current+future) node valid -> segment valid
+    # current valid을 만들려면 past_valid가 필요하므로, 4개가 다 있어야 계산 가능
+    if ego_past_valid is None or nbr_past_valid is None or ego_fut_valid is None or nbr_fut_valid is None:
+        _set_or_skip(out, "future_seg_control_is_valid", None)
+    else:
+        if isinstance(nbr_past_valid, torch.Tensor):
+            if nbr_past_valid.dim() == 2:
+                # no batch: ego (T,), nbr (A,T), ego_fut (Tf,), nbr_fut (A,Tf)
+                ego_cur = ego_past_valid[-1:].to(torch.bool)  # (1,)
+                if ego_fut_valid.dim() != 1:
+                    raise ValueError(f"ego_future_gt_is_valid must be (Tf,) here. got {tuple(ego_fut_valid.shape)}")
+                ego_cur_fut = torch.cat([ego_cur, ego_fut_valid.to(torch.bool)], dim=0)  # (1+Tf,)
+
+                nbr_cur = nbr_past_valid[:, -1:].to(torch.bool)  # (A,1)
+                if nbr_fut_valid.dim() != 2:
+                    raise ValueError(f"neighbor_future_gt_is_valid must be (A,Tf) here. got {tuple(nbr_fut_valid.shape)}")
+                nbr_cur_fut = torch.cat([nbr_cur, nbr_fut_valid.to(torch.bool)], dim=1)  # (A,1+Tf)
+
+                target_cur_fut = torch.cat([ego_cur_fut.unsqueeze(0), nbr_cur_fut], dim=0)  # (1+A,1+Tf)
+
+            elif nbr_past_valid.dim() == 3:
+                # batch: ego (B,T), nbr (B,A,T), ego_fut (B,Tf), nbr_fut (B,A,Tf)
+                ego_cur = ego_past_valid[:, -1:].to(torch.bool)  # (B,1)
+                if ego_fut_valid.dim() != 2:
+                    raise ValueError(f"ego_future_gt_is_valid must be (B,Tf) here. got {tuple(ego_fut_valid.shape)}")
+                ego_cur_fut = torch.cat([ego_cur, ego_fut_valid.to(torch.bool)], dim=1)  # (B,1+Tf)
+
+                nbr_cur = nbr_past_valid[:, :, -1:].to(torch.bool)  # (B,A,1)
+                if nbr_fut_valid.dim() != 3:
+                    raise ValueError(f"neighbor_future_gt_is_valid must be (B,A,Tf) here. got {tuple(nbr_fut_valid.shape)}")
+                nbr_cur_fut = torch.cat([nbr_cur, nbr_fut_valid.to(torch.bool)], dim=2)  # (B,A,1+Tf)
+
+                target_cur_fut = torch.cat([ego_cur_fut.unsqueeze(1), nbr_cur_fut], dim=1)  # (B,1+A,1+Tf)
+
+            else:
+                raise ValueError(f"neighbor_agents_past_is_valid ndim must be 2 or 3. got {nbr_past_valid.dim()}")
+
+            future_seg_valid = (target_cur_fut[..., :-1] & target_cur_fut[..., 1:]).to(torch.bool)
+
+        else:
+            nbrp = np.asarray(nbr_past_valid, dtype=bool)
+            egop = np.asarray(ego_past_valid, dtype=bool)
+            egof = np.asarray(ego_fut_valid, dtype=bool)
+            nbrf = np.asarray(nbr_fut_valid, dtype=bool)
+
+            if nbrp.ndim == 2:
+                ego_cur = egop[-1:]  # (1,)
+                if egof.ndim != 1:
+                    raise ValueError(f"ego_future_gt_is_valid must be (Tf,) here. got {egof.shape}")
+                ego_cur_fut = np.concatenate([ego_cur, egof], axis=0)  # (1+Tf,)
+
+                nbr_cur = nbrp[:, -1:]  # (A,1)
+                if nbrf.ndim != 2:
+                    raise ValueError(f"neighbor_future_gt_is_valid must be (A,Tf) here. got {nbrf.shape}")
+                nbr_cur_fut = np.concatenate([nbr_cur, nbrf], axis=1)  # (A,1+Tf)
+
+                target_cur_fut = np.concatenate([ego_cur_fut[None, :], nbr_cur_fut], axis=0)  # (1+A,1+Tf)
+
+            elif nbrp.ndim == 3:
+                ego_cur = egop[:, -1:]  # (B,1)
+                if egof.ndim != 2:
+                    raise ValueError(f"ego_future_gt_is_valid must be (B,Tf) here. got {egof.shape}")
+                ego_cur_fut = np.concatenate([ego_cur, egof], axis=1)  # (B,1+Tf)
+
+                nbr_cur = nbrp[:, :, -1:]  # (B,A,1)
+                if nbrf.ndim != 3:
+                    raise ValueError(f"neighbor_future_gt_is_valid must be (B,A,Tf) here. got {nbrf.shape}")
+                nbr_cur_fut = np.concatenate([nbr_cur, nbrf], axis=2)  # (B,A,1+Tf)
+
+                target_cur_fut = np.concatenate([ego_cur_fut[:, None, :], nbr_cur_fut], axis=1)  # (B,1+A,1+Tf)
+
+            else:
+                raise ValueError(f"neighbor_agents_past_is_valid ndim must be 2 or 3. got {nbrp.ndim}")
+
+            future_seg_valid = (target_cur_fut[..., :-1] & target_cur_fut[..., 1:]).astype(bool)
+
+        _set_or_skip(out, "future_seg_control_is_valid", future_seg_valid)
+
     # ---------- f: stop_sign_is_valid ----------
     stop_sign_points = sample.get("stop_sign_points", None)
     if stop_sign_points is None or (not _is_array_like(stop_sign_points)):

@@ -269,6 +269,13 @@ def get_args():
                         type=float,
                         help='augmentation probability',
                         default=0.5)
+    parser.add_argument(
+        '--diffusion_time_eps',
+        type=float,
+        default=1e-3,
+        help='diffusion 시간 t가 0/1에 너무 붙지 않게 피하는 작은 값(학습/추론 공통).',
+    )
+
     parser.add_argument('--feasible_learn_noise_thresh',
                         type=float,
                         help='feasible_learn_noise_thresh',

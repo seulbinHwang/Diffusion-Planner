@@ -257,6 +257,40 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(msg)
     return tensor
 
+import math
+from typing import Any
+
+
+def _get_diffusion_time_eps(args: Any, fallback_eps: float) -> float:
+    """diffusion 시간 샘플링에서 사용할 eps를 한 값으로 통일합니다.
+
+    eps는 시간값 t가 0이나 1에 너무 가까워지는 것을 피하기 위한 작은 값입니다.
+    학습(loss)과 추론(decoder)에서 같은 eps를 쓰도록,
+    args.diffusion_time_eps가 있으면 그 값을 우선 사용합니다.
+
+    Args:
+        args (Any): 설정 객체. diffusion_time_eps 속성이 있을 수 있습니다. shape: ()
+        fallback_eps (float): args에 값이 없거나 읽기 실패 시 사용할 기본값. shape: ()
+
+    Returns:
+        float: 사용할 eps 값. (0, 1) 범위로 안전하게 제한됩니다. shape: ()
+    """
+    raw = getattr(args, "diffusion_time_eps", None)
+    if raw is None:
+        eps_val = float(fallback_eps)
+    else:
+        try:
+            eps_val = float(raw)
+        except Exception:
+            eps_val = float(fallback_eps)
+
+    if not math.isfinite(eps_val):
+        eps_val = float(fallback_eps)
+
+    # t_max = 1 - eps 형태로 쓰이므로, (0, 1) 범위를 벗어나면 깨질 수 있어 안전 클램프
+    eps_val = max(1e-8, min(eps_val, 1.0 - 1e-8))
+    return float(eps_val)
+
 
 def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     """마스크 텐서를 bool로 통일합니다.
@@ -1435,9 +1469,10 @@ def diffusion_loss_func(
         normed_target_seq_gt : (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
         target_seq_is_valid : (B, (1+)Pnn, future_len)
         """
+        # past_seg_control_gt_3_dim: (B, 1+Pnn, past_len, 3)
         past_seg_control_gt_3_dim = norm_inputs["past_seg_control_gt_3_dim"]
         future_seg_control_gt_3_dim = norm_outputs[
-            "future_seg_control_gt_3_dim"]
+            "future_seg_control_gt_3_dim"] # (B, (1+)Pnn, future_len, 3)
         past_future_seg_control_gt_3_dim = torch.cat([
             past_seg_control_gt_3_dim,
             future_seg_control_gt_3_dim,
@@ -1446,14 +1481,10 @@ def diffusion_loss_func(
         )  # (B, 1+Pnn, past_len + future_len, 3)
         assert past_future_seg_control_gt_3_dim.shape[2] == (args.time_len - 1 +
                                                              future_len)
-        # past_seg_control_gt_3_dim: (B, (1+)Pnn, past_len, 3)
-        past_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :, :
-                                                                     -future_len, :]
         if not args.do_ego_predict:
             past_seg_control_gt_3_dim = past_seg_control_gt_3_dim[:, 1:, :, :]
-        # (B, (1+)Pnn, future_len, 3)
-        future_seg_control_gt_3_dim = past_future_seg_control_gt_3_dim[:, :,
-                                                                       -future_len:, :]
+            future_seg_control_gt_3_dim = future_seg_control_gt_3_dim[:, 1:, :, :]
+
         (
             normed_target_seq_gt,  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
             target_seq_is_valid,  # (B, (1+)Pnn, future_len)
@@ -1476,10 +1507,11 @@ def diffusion_loss_func(
     # low_t_mask: (B,)
     # random_noise: (B, (1+)Pnn, future_len, 4 or 3)
     """
+    eps_used: float = _get_diffusion_time_eps(args=args, fallback_eps=float(eps))
     (batch_diffusion_time, low_t_mask, random_noise
     ) = _sample_diffusion_time_and_noise(
         normed_target_seq_gt,  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
-        eps,
+        eps_used,
         args,
     )
     # low_t_mask_3_ndim: (B,1,1)

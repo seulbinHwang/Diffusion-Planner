@@ -199,7 +199,7 @@ taskset -c "${CPUSET}" \
   --profile_feasible False \
   --use_feasible True \
   --use_feasible_dl False \
-  --use_feasible_filter True \
+  --use_feasible_filter False \
   --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
@@ -212,6 +212,6 @@ taskset -c "${CPUSET}" \
   --total_save_image_trial_num 200 \
   --rollout_number 1 \
   --do_data_statistics False \
-  --use_amortized_diffusion False
+  --use_amortized_diffusion True
 
 #  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
