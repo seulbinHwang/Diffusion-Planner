@@ -2916,7 +2916,7 @@ def _predict_rollouts_batched_one_chunk(
 
             # (B) amortized + step_start>0에서는 Decoder 내부 랜덤 대신
             #     rollout_idx(seed) 기반 표준정규 노이즈를 inputs로 전달
-            if use_amortized and int(step_start) > 0:
+            if use_amortized:
                 # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
                 # ✅ 표준정규를 맞추기 위해 noise_std=1.0
                 # (B) amortized_random_noise

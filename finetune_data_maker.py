@@ -3462,7 +3462,7 @@ def _forward_and_score_candidate_batch(
 
     need_initial_inference_noise = (not use_amortized) or (use_amortized and
                                                            int(step_idx) == 0)
-    need_amortized_random_noise = (use_amortized and int(step_idx) > 0)
+    need_amortized_random_noise = use_amortized
     pose_based_flag = bool(getattr(args, "pose_based", True))
     if need_initial_inference_noise:
         # inference_noise_flat: (B*rollout_repeat, 1+Pnn, future_len, 4 or 3)

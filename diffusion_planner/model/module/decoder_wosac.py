@@ -1,7 +1,6 @@
 from functools import partial
 from typing import Callable
 import torch.nn as nn
-from sympy.polys.benchmarks.bench_solvers import x0
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple, Any
@@ -1776,11 +1775,12 @@ class Decoder(nn.Module):
             diffusion_cur_future_sequence = diffusion_sequence.reshape(
                 B, one_or_Pnn, seq_len, last_dim)
             return diffusion_cur_future_sequence
+        # self.config.use_current_input = False 일 때
         if self.config.pose_based:
             diffusion_cur_future_sequence = torch.cat(
                 [
                     target_current_xyyaw.unsqueeze(2),  # (B,Pnn,1,4)
-                    diffusion_sequence.reshape(B, one_or_Pnn, seq_len,
+                    diffusion_sequence.reshape(B, one_or_Pnn, self._future_len,
                                                last_dim),  # (B,Pnn,T,4)
                 ],
                 dim=2,
@@ -2343,12 +2343,6 @@ class Decoder(nn.Module):
                     raise ValueError(
                         "inference_noise must be provided "
                         "in inputs when not using amortized diffusion.")
-                    # noise_future_sequence: torch.Tensor = self._sample_inference_noise(
-                    #     target_current_xyyaw=
-                    #     target_current_xyyaw,  # (B,(1+)Pnn,4)
-                    #     batch_size=B,
-                    #     one_or_Pnn=one_or_Pnn,
-                    # )  # (B,(1+)Pnn,T,4)
                 else:
                     noise_future_sequence: torch.Tensor = self._get_inference_noise_from_inputs(
                         inputs=inputs,
@@ -3827,6 +3821,29 @@ else
                                          T_any * per_step_dim)  # (B,P,F)
         return x0_hat_flat
 
+    def _get_target_current_control(
+        self,
+        target_input_norm_xT: torch.Tensor,
+    ):
+        # target_current_control: (B, (1+)Pnn, 3)  마지막 과거 구간 control (vxᵇ, vyᵇ, yaw_rate)
+        # target_input_norm_xT 로 부터 추출하자.
+        # not self.config.pose_based and self.config.use_past_dit_input 조건에서는
+        # target_input_norm_xT는 (B, (1+)Pnn, (past_len + T) *3) shape일거야.
+        B_tmp, P_tmp, F_tmp = target_input_norm_xT.shape
+        if F_tmp % 3 != 0:
+            raise ValueError(
+                "pose_based=False expects target_input_norm_xT last dim to be multiple of 3. "
+                f"got shape={tuple(target_input_norm_xT.shape)}")
+        total_seg_len = F_tmp // 3
+        assert total_seg_len == (
+            self._future_len + self._past_len
+        ), f"Expected total_seg_len to be future_len + past_len = {self._future_len + self._past_len}, but got {total_seg_len} from target_input_norm_xT shape {tuple(target_input_norm_xT.shape)}"
+        past_len = total_seg_len - int(self._future_len)
+        # target_current_control : (B, (1+)Pnn, 3)  마지막 과거 구간 control (vxᵇ, vyᵇ, yaw_rate)
+        target_current_control = target_input_norm_xT.reshape(
+            B_tmp, P_tmp, total_seg_len, 3)[:, :, past_len - 1, :]
+        return target_current_control
+
     def forward(
             self,
             target_input_norm_xT: torch.Tensor,
@@ -3848,22 +3865,9 @@ else
                 (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
         """
         if not self.config.pose_based and self.config.use_past_dit_input:
-            # target_current_control: (B, (1+)Pnn, 3)  마지막 과거 구간 control (vxᵇ, vyᵇ, yaw_rate)
-            # target_input_norm_xT 로 부터 추출하자.  not self.config.pose_based and self.config.use_past_dit_input 조건에서는
-            # target_input_norm_xT는 (B, (1+)Pnn, (past_len + T) *3) shape일거야.
-            B_tmp, P_tmp, F_tmp = target_input_norm_xT.shape
-            if F_tmp % 3 != 0:
-                raise ValueError(
-                    "pose_based=False expects target_input_norm_xT last dim to be multiple of 3. "
-                    f"got shape={tuple(target_input_norm_xT.shape)}")
-            total_seg_len = F_tmp // 3
-            assert total_seg_len == (
-                self._future_len + self._past_len
-            ), f"Expected total_seg_len to be future_len + past_len = {self._future_len + self._past_len}, but got {total_seg_len} from target_input_norm_xT shape {tuple(target_input_norm_xT.shape)}"
-            past_len = total_seg_len - int(self._future_len)
-            # target_current_control : (B, (1+)Pnn, 3)  마지막 과거 구간 control (vxᵇ, vyᵇ, yaw_rate)
-            target_current_control = target_input_norm_xT.reshape(
-                B_tmp, P_tmp, total_seg_len, 3)[:, :, past_len - 1, :]
+            target_current_control = self._get_target_current_control(
+                target_input_norm_xT)
+
         else:
             target_current_control = None
 
@@ -3930,7 +3934,6 @@ else
                                      target_past_cur_future_valid, x_t_flat)
         elif self._model_type == "x_start":
             # x 를 대부분의 경우에 그대로 반환
-
             x0 = diffusion_output
         else:
             raise ValueError(f"Unknown model type: {self._model_type}")
