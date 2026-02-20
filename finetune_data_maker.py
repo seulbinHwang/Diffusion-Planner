@@ -2391,13 +2391,13 @@ def _predict_one_rollout_sequential(
                 unnorm_target_control_chunk = None
             else:
                 norm_temp_dict = {
-                    "seg_body_control": best_control_seq}
+                    "future_seg_control_gt_3_dim": best_control_seq}
                 unnorm_temp_dict = observation_normalizer.inverse(
                     norm_temp_dict
                 )
                 # best_control_seq : (B, 1+Pnn, future_len, 3)
                 unnorm_best_control_seq = unnorm_temp_dict[
-                    "seg_body_control"]
+                    "future_seg_control_gt_3_dim"]
                 # unnorm_target_control_chunk: (B, 1+Pnn, gap, 3)
                 unnorm_target_control_chunk = unnorm_best_control_seq[:, :, :gap, :]
 

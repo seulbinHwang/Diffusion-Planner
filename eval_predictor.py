@@ -2500,10 +2500,18 @@ def _get_unnorm_target_pose_chunk(
     # near: (B*R, Pnn, gap, 4)
     normed_near_pose_chunk = normed_trajectories[:, 1:, 1:gap + 1, :]
     if target_future_control_seq is None:
-        normed_target_chunk_control_seq = None
+        unnorm_target_control_chunk = None
     else:
+        norm_temp_dict = {"future_seg_control_gt_3_dim": target_future_control_seq}
+        unnorm_temp_dict = observation_normalizer.inverse(
+            norm_temp_dict
+        )
+        unnorm_target_future_control_seq = unnorm_temp_dict["future_seg_control_gt_3_dim"]
+
         # (B*R, (1+)Pnn, T, 3) ->  (B*R, (1+)Pnn, gap, 3)
-        normed_target_chunk_control_seq = target_future_control_seq[:, :, :gap, :] #
+        unnorm_target_control_chunk = unnorm_target_future_control_seq[:, :, :gap, :] #
+        # unnorm_target_control_chunk: (B*R, (1+)Pnn, gap, 3)
+
     # target: (B*R, (1+)Pnn, gap, 4)
     normed_target_pose_chunk = torch.cat(
         [normed_ego_pose_chunk[:, None, :, :], normed_near_pose_chunk],
@@ -2518,15 +2526,6 @@ def _get_unnorm_target_pose_chunk(
         data=normed_target_pose_chunk,
         valid_mask=target_gap_valid,
     )
-    if normed_target_chunk_control_seq is None:
-        unnorm_target_control_chunk = None
-    else:
-        # unnorm_target_control_chunk: (B*R, (1+)Pnn, gap, 3)
-        norm_temp_dict = {"seg_body_control": normed_target_chunk_control_seq}
-        unnorm_temp_dict = observation_normalizer.inverse(
-            norm_temp_dict
-        )
-        unnorm_target_control_chunk = unnorm_temp_dict["seg_body_control"]
     return unnorm_target_pose_chunk, unnorm_target_control_chunk
 
 

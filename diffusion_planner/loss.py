@@ -1087,14 +1087,14 @@ def _add_xy_yaw_metric_losses(
 
         else:
             # --- (1) control 공간(vx,vy,yaw_rate) 지표 ---
-            temp_dict = {"seg_body_control": diffusion_trajectory}
+            temp_dict = {"future_seg_control_gt_3_dim": diffusion_trajectory}
             denorm_temp_dict = observation_normalizer.inverse(temp_dict)
-            score_denorm = denorm_temp_dict["seg_body_control"]  # (B,P,T,3)
+            score_denorm = denorm_temp_dict["future_seg_control_gt_3_dim"]  # (B,P,T,3)
 
-            temp_dict = {"seg_body_control": normed_target_future_seq_gt}
+            temp_dict = {"future_seg_control_gt_3_dim": normed_target_future_seq_gt}
             denorm_temp_dict = observation_normalizer.inverse(temp_dict)
             target_future_ctrl_gt = denorm_temp_dict[
-                "seg_body_control"]  # (B,P,T,3)
+                "future_seg_control_gt_3_dim"]  # (B,P,T,3)
 
             vxy_yaw_losses = _compute_vxy_yaw_losses(
                 score_denorm,  # (B,P,T,3)
@@ -1154,10 +1154,10 @@ def _add_xy_yaw_metric_losses(
 
         # --- (4) control_constraint_diff 물리 단위 통계 ---
         if control_constraint_diff is not None:
-            temp_dict = {"seg_body_control": control_constraint_diff}
+            temp_dict = {"future_seg_control_gt_3_dim": control_constraint_diff}
             temp_dict = observation_normalizer.inverse(temp_dict)
             constraint_diff_denorm: torch.Tensor = temp_dict[
-                "seg_body_control"]  # (B,P,T,3)
+                "future_seg_control_gt_3_dim"]  # (B,P,T,3)
 
             constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
                 constraint_diff_denorm,
