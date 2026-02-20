@@ -1985,6 +1985,7 @@ class Decoder(nn.Module):
         B = int(diffusion_future_sequence.shape[0])
         batch_diffusion_time: torch.Tensor = self.t_tau.unsqueeze(0).repeat(
             B, 1).to(device=diffusion_future_sequence.device)
+        device_type = diffusion_future_sequence.device.type
         if do_shift:
             assert rollout_time_chunk_size is not None, "rollout_time_chunk_size must be set."
             # (B, (1+)Pnn, future_len, 4 or 3)
@@ -1998,14 +1999,23 @@ class Decoder(nn.Module):
                         :, :, int(rollout_time_chunk_size):, :]
         else:
             x0_shifted = diffusion_future_sequence
-        mean, std = self.sde.marginal_prob(x0_shifted, batch_diffusion_time)
 
-        # ✅ 외부에서 받은 랜덤 사용
-        random_noise = _ensure_tensor_on_ref(random_noise,
-                                             diffusion_future_sequence)
+        # mean/std + noise 적용만 fp32로
+        with torch.autocast(device_type=device_type, enabled=False):
+            x0_f32 = x0_shifted.to(dtype=torch.float32)
+            t_f32 = batch_diffusion_time.to(dtype=torch.float32)
 
-        noise_trajectory: torch.Tensor = mean + std * random_noise
-        self._amortized_buffer = noise_trajectory  # (B, (1+)Pnn, future_len, 4 or 3)
+            mean_f32, std_f32 = self.sde.marginal_prob(x0_f32, t_f32)
+
+            noise_f32 = random_noise.to(device=x0_f32.device,
+                                        dtype=torch.float32)
+            noise_traj_f32 = mean_f32 + std_f32 * noise_f32
+
+        # 최종 버퍼는 기존 dtype 유지(메모리/속도)
+        self._amortized_buffer = noise_traj_f32.to(
+            device=diffusion_future_sequence.device,
+            dtype=diffusion_future_sequence.dtype,
+        )
 
     @staticmethod
     def _normalize_cos_sin_for_rotation(

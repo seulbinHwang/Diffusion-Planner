@@ -78,7 +78,84 @@ from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
+# =========================
+# finetune_data_maker.py 상단(import 아래) 어딘가에 추가
+# =========================
+from typing import Any
+import os
+import torch.nn as nn
 
+
+def _force_disable_amortized_diffusion_for_finetune_data_maker(args: Any) -> None:
+    """이 스크립트에서 use_amortized_diffusion을 항상 False로 강제합니다.
+
+    이유:
+        후보 K개를 한 번에 만들어(best 선택) 롤아웃을 진행하는 구조에서는,
+        모델 내부에 남는 버퍼 때문에 다음 스텝에서 상태가 섞일 수 있습니다.
+        그래서 이 스크립트에서는 amortized diffusion을 사용하지 않도록 고정합니다.
+
+    Args:
+        args (Any): argparse.Namespace 같은 설정 객체. shape: ()
+
+    Returns:
+        None
+    """
+    was_enabled = bool(getattr(args, "use_amortized_diffusion", False))
+    setattr(args, "use_amortized_diffusion", False)
+
+    # 로그는 rank 0만 찍기(DDP일 때 중복 방지)
+    if was_enabled:
+        rank = 0
+        try:
+            rank = int(os.environ.get("RANK", "0"))
+        except Exception:
+            rank = 0
+        if rank == 0:
+            print(
+                "[finetune_data_maker] use_amortized_diffusion=True 설정이 감지되어 "
+                "안전을 위해 False로 강제합니다."
+            )
+
+
+def _force_disable_amortized_diffusion_in_model(model: nn.Module) -> None:
+    """모델 내부 설정에서도 use_amortized_diffusion을 False로 강제합니다.
+
+    - args를 False로 고정해도, 체크포인트 로드/구성 경로에 따라
+      모델 내부 config 값이 다시 True가 되는 상황을 방지합니다.
+    - Decoder 내부 버퍼(_amortized_buffer)가 남아 있으면 None으로 비웁니다.
+
+    Args:
+        model (nn.Module): 추론에 사용할 모델. shape: ()
+
+    Returns:
+        None
+    """
+    # 1) 자주 쓰는 위치들에서 config를 찾아 use_amortized_diffusion을 끕니다.
+    candidates = []
+
+    cfg0 = getattr(model, "config", None)
+    if cfg0 is not None:
+        candidates.append(cfg0)
+
+    dec = getattr(model, "decoder", None)
+    if dec is not None:
+        cfg1 = getattr(dec, "config", None)
+        if cfg1 is not None:
+            candidates.append(cfg1)
+
+        # 2) Decoder 버퍼는 혹시 남아있으면 비움
+        if hasattr(dec, "_amortized_buffer"):
+            try:
+                setattr(dec, "_amortized_buffer", None)
+            except Exception:
+                pass
+
+    for cfg in candidates:
+        if hasattr(cfg, "use_amortized_diffusion"):
+            try:
+                setattr(cfg, "use_amortized_diffusion", False)
+            except Exception:
+                pass
 
 def _clone_nested_value_for_rollout(
     value: Any,
@@ -697,6 +774,14 @@ def model_validation(
              global_rank=global_rank,
              use_deepspeed=use_deepspeed,
          )
+        # ✅ (추가) 혹시 중간에 값이 바뀌었어도 다시 한 번 강제
+        _force_disable_amortized_diffusion_for_finetune_data_maker(args)
+        _force_disable_amortized_diffusion_in_model(diffusion_planner)
+        # EMA 모델도 실제 추론에 쓰이므로 같이 강제
+        ema_model = getattr(model_ema, "ema",
+                            None) if model_ema is not None else None
+        if isinstance(ema_model, nn.Module):
+            _force_disable_amortized_diffusion_in_model(ema_model)
         args._global_update_step = 0
 
         _update_validation_heartbeat_stage(args, "running validation loop")
@@ -6144,6 +6229,9 @@ def main() -> None:
     """
     # 1) 분산 초기화 및 rank 정보
     args = args_util.get_args()
+    # ✅ (추가) 이 스크립트에서는 amortized diffusion을 항상 끔
+    _force_disable_amortized_diffusion_for_finetune_data_maker(args)
+
     global_rank, rank, world_size, use_deepspeed = init_distributed(args)
 
     set_save_path(

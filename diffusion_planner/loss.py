@@ -843,7 +843,7 @@ def extract_from_decoder(
         else:
             (B, (1+)Pnn, T,3)
     """
-    diffusion_trajectory: torch.Tensor = decoder_output["diffusion_sequence"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+    diffusion_trajectory: torch.Tensor = decoder_output["diffusion_trajectory"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     assert diffusion_trajectory.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
 
     diffusion_output = _require_finite("decoder_output['diffusion_output']", diffusion_output)
@@ -948,6 +948,8 @@ def _compute_integration_and_constraint_losses(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
            Optional[torch.Tensor]]:
     """통합 궤적/제어 편차 기반 보조 손실을 계산한다.
+
+    - model_type과 무관하게(예: "x_start"/"v") 보조 손실로 사용할 수 있습니다.
 
     내부 계산은 float32로 수행해서 수치 불안정 가능성을 줄입니다.
 
@@ -1348,22 +1350,33 @@ def diffusion_loss_func(
     observation_normalizer: Any,
     eps: float = 1e-3,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
-    """diffusion 학습에 쓰이는 전체 손실을 계산한다.
-    Args:
-        args: 학습 설정/옵션이 들어 있는 객체.
-        model: 학습 중인 모델(Diffusion_Planner 또는 DDP 래퍼).
-        norm_inputs: 정규화된 관측 dict.
-        norm_outputs: 정규화된 출력 dict.
-        marginal_prob: SDE marginal_prob 함수.
-        state_normalizer: 상태 정규화/역정규화 도우미.
-        loss_dict: 손실/통계를 쌓아갈 dict (in-place 업데이트).
-        model_type: "score" 또는 "x_start".
-        observation_normalizer: 제어 역정규화 도우미.
-        eps: diffusion time 샘플링 하한.
+    """diffusion 학습에 쓰이는 전체 손실을 계산합니다.
+
+    이 함수는 아래 2종류의 손실을 계산해 loss_dict에 넣습니다.
+
+    1) 주 손실: neighbor_prediction_loss
+       - model_type에 따라 목표가 달라집니다.
+         - "x_start": 미래 x0(노이즈 없는 값) 예측 오차
+         - "v": v 예측 오차 (v = α*ε - σ*x0)
+       - 계산은 (B,P,T,C) 오차를 만든 뒤 (B,P,T)로 줄이고,
+         유효 마스크/시간 가중치로 스칼라 1개로 합칩니다.
+
+    2) 보조 손실: integration_loss, constraint_loss
+       - model_type과 무관하게 계산합니다. ("x_start"/"v" 모두)
+       - decoder_output에 아래 키가 존재할 때만 유효합니다.
+         - "integrated_trajectory"  : 적분된 미래 궤적 (있으면 integration_loss 계산)
+         - "control_constraint_diff": 제약 위반량(또는 그 차이) (있으면 constraint_loss 계산)
+       - 위 키가 없으면 해당 보조 손실은 0으로 둡니다.
+
+    참고:
+        - 이 함수는 보조 손실 값을 loss_dict에 "항상 기록"합니다.
+        - 보조 손실을 실제로 총 손실에 얼마나 반영할지(가중치/사용 여부)는
+          학습 루프(또는 상위 로직)에서 결정하는 구조를 전제로 합니다.
 
     Returns:
-        loss_dict: 다양한 손실 항목이 담긴 dict.
-        decoder_output: 모델 decoder 의 출력 dict.
+        Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+            - loss_dict: 손실/지표가 담긴 dict (in-place 업데이트됨)
+            - decoder_output: 모델 decoder 출력 dict
     """
     # norm_inputs 의 각 텐서 NaN/Inf 체크
     # norm_inputs = _sanitize_norm_inputs(norm_inputs)
@@ -1551,7 +1564,6 @@ def diffusion_loss_func(
     )
     loss_dict["neighbor_prediction_loss"] = loss_val
 
-    # x_start 모드에서만 Feasible 관련 손실/지표 계산
     # 통합 궤적/제어 제약 손실
     """
     integration_loss_val: 스칼라
