@@ -5,8 +5,8 @@ from typing import Dict
 from timm.models.layers import Mlp
 from typing import Tuple, Optional
 from flash_attn.bert_padding import unpad_input, pad_input
-from diffusion_planner.model.module.pram_v2 import ModulationTriplet
-from diffusion_planner.model.module.pram_v2 import (
+from diffusion_planner.model.module.pram_wosac import ModulationTriplet
+from diffusion_planner.model.module.pram_wosac import (
     apply_pram_v2_path_modulation,
     style_queries_for_cross_attention,
 )
