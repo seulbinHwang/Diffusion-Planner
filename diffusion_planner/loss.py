@@ -1471,7 +1471,7 @@ def diffusion_loss_func(
         """
         # past_seg_control_gt_3_dim: (B, 1+Pnn, past_len, 3)
         past_seg_control_gt_3_dim = norm_inputs["past_seg_control_gt_3_dim"]
-        future_seg_control_gt_3_dim = norm_outputs[
+        future_seg_control_gt_3_dim = norm_inputs[
             "future_seg_control_gt_3_dim"] # (B, (1+)Pnn, future_len, 3)
         past_future_seg_control_gt_3_dim = torch.cat([
             past_seg_control_gt_3_dim,
