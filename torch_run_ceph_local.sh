@@ -110,23 +110,23 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "v_pred_grad_max2.0_normalization" \
+    --name "w_integ_loss_thres_1." \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --pose_based False \
     --profile_feasible False \
-    --use_feasible False \
+    --use_feasible True \
     --use_feasible_dl False \
     --use_feasible_filter False \
-    --feasible_grad_to_dit False \
+    --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
-    --diffusion_model_type "v" \
     --num_workers 3 \
-    --max_grad_norm 2.0 \
+    --max_grad_norm 1.0 \
     --prefetch_factor 8 \
-    --p_sat 0.4 \
+    --feasible_learn_noise_thresh 1.0 \
+    --p_sat 0.5 \
     --w_dir 1.0 \
     --w_int_min 0.05 \
-    --w_int_max 3.0 \
-    --w_const 0.02
+    --w_int_max 1.0 \
+    --w_const 0.0
