@@ -509,8 +509,7 @@ def _collect_valid_xy_from_input_data(
             ys_local.extend(r_valid[:, 1].tolist())
 
     # ego past, ego pred, ego future
-    for key in ("ego_agent_past", "ego_agent_next_11_dim",
-                "planner_future_11_dim", "planner_future_11_dim"):
+    for key in ("ego_agent_past", "ego_agent_next_11_dim", "ego_future_gt_11_dim"):
         A = input_data.get(key)
         if A is None or np.asarray(A).size == 0:
             continue
@@ -4187,7 +4186,7 @@ def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
                     f"Unsupported EGO_draw_diffusion_mode: {draw_option.EGO_draw_diffusion_mode}"
                 )
         else:
-            ego_future_11_dim = input_data.get("planner_future_11_dim", None)
+            ego_future_11_dim = input_data.get("ego_future_gt_11_dim", None)
         if ego_future_11_dim is not None:
             draw_planner_future_11_dim(ax, ego_future_11_dim, draw_option)
     ### [EGO FUTURE GT 11] ###

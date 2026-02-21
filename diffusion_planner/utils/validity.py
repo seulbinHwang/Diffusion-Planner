@@ -192,7 +192,7 @@ def build_validity_key_dict(
 
     # ---------- b: ego_future_gt_is_valid ----------
     ego_future_11 = _get_first_non_none_value(
-        sample, ["planner_future_11_dim", "ego_future_gt_11_dim"])
+        sample, ["ego_future_gt_11_dim"])
     if ego_future_11 is None or (not _is_array_like(ego_future_11)):
         _set_or_skip(out, "ego_future_gt_is_valid", None)
     else:

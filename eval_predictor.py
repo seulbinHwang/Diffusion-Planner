@@ -5248,13 +5248,13 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     ego_future_gt_4_dim[:, future_len - gap:, :] = 0.0
     unnorm_outputs_b_r_copy["ego_future_gt_4_dim"] = ego_future_gt_4_dim
 
-    # planner_future_11_dim shift
-    planner_future_11_dim = unnorm_inputs_b_r_copy[
-        "planner_future_11_dim"]  # (B*R, future_len, 11)
-    planner_future_11_dim[:, :future_len -
-                          gap, :] = planner_future_11_dim[:, gap:, :].clone()
-    planner_future_11_dim[:, future_len - gap:, :] = 0.0
-    unnorm_inputs_b_r_copy["planner_future_11_dim"] = planner_future_11_dim
+    # ego_future_gt_11_dim shift
+    ego_future_gt_11_dim = unnorm_inputs_b_r_copy[
+        "ego_future_gt_11_dim"]  # (B*R, future_len, 11)
+    ego_future_gt_11_dim[:, :future_len -
+                          gap, :] = ego_future_gt_11_dim[:, gap:, :].clone()
+    ego_future_gt_11_dim[:, future_len - gap:, :] = 0.0
+    unnorm_inputs_b_r_copy["ego_future_gt_11_dim"] = ego_future_gt_11_dim
 
     # ego_future_gt_is_valid shift
     ego_future_gt_is_valid = unnorm_outputs_b_r_copy[
@@ -5508,7 +5508,7 @@ def _transform_origin_step4_planner_future_inplace(
     Returns:
         None
     """
-    planner_future_11_dim = unnorm_inputs_b_r_copy.get("planner_future_11_dim",
+    planner_future_11_dim = unnorm_inputs_b_r_copy.get("ego_future_gt_11_dim",
                                                        None)
     if not isinstance(planner_future_11_dim,
                       torch.Tensor) or planner_future_11_dim.numel() == 0:

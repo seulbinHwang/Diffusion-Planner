@@ -32,7 +32,6 @@ class DiffusionPlannerCollate:
     _FIXED_STACK_EGO_KEYS: Tuple[str, ...] = (
         "ego_agent_past", # (time_len, 11)
         "ego_future_gt_3_dim", # (future_len, 3)
-        "planner_future_11_dim", # (future_len, 11)
         "ego_agent_past_is_valid", # (time_len,)
         "ego_future_gt_is_valid", # (future_len,)
     )

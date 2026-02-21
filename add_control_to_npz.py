@@ -430,7 +430,6 @@ def _build_expected_keys_for_done(
     expected.update(
         {
             "scenario_id",
-            "planner_future_11_dim",  # ego_future_gt_11_dim의 alias 저장
         }
     )
 
@@ -1432,7 +1431,6 @@ def _get_dataset_npz_keys(
     npz_keys: List[str] = both_keys + nuplan_only_keys + womd_only_keys + wosac_only_keys
 
     npz_key_to_new_key: Dict[str, str] = {
-        "ego_future_gt_11_dim": "planner_future_11_dim",
         "driveway": "driveway_points",
     }
     return npz_keys, npz_key_to_new_key

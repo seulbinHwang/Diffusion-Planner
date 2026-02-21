@@ -371,7 +371,6 @@ class ObservationNormalizer:
                 return
             norm_data[data_key] = self._apply_valid_mask_out_of_place(x, valid)
         _mask("ego_agent_past", "ego_agent_past_is_valid")
-        _mask("planner_future_11_dim", "ego_future_gt_is_valid")
         _mask("neighbor_agents_past", "neighbor_agents_past_is_valid")
 
         _mask("stop_sign_points", "stop_sign_is_valid")

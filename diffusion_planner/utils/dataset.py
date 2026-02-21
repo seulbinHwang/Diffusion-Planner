@@ -129,8 +129,7 @@ def _ensure_validity_keys_if_needed_inplace(sample: Dict[str, Any]) -> None:
     def _has_source_for(key: str) -> bool:
         if key == "ego_future_gt_is_valid":
             # planner_future_11_dim(=ego_future_gt_11_dim rename)이 있으면 계산 가능
-            return sample.get("planner_future_11_dim",
-                              None) is not None or sample.get(
+            return sample.get(
                                   "ego_future_gt_11_dim", None) is not None
         if key == "driveway_is_valid":
             return sample.get(
@@ -164,8 +163,7 @@ def _ensure_validity_keys_if_needed_inplace(sample: Dict[str, Any]) -> None:
                 "neighbor_agents_past", None) is not None
 
         if key == "future_seg_control_is_valid":
-            has_ego_future = (sample.get("planner_future_11_dim",
-                                         None) is not None) or (
+            has_ego_future = (
                                          sample.get("ego_future_gt_11_dim",
                                                     None) is not None)
             has_neighbor_future = sample.get("neighbor_future_gt_11_dim",

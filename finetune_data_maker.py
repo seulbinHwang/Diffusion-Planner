@@ -322,7 +322,7 @@ def _build_inference_npz_payload_for_save(
        - diff_token_to_future_gt_3_dim
        - non_near_agents_past
        - near_agents_past
-    3) 저장은 ego_future_gt_11_dim 만 남기고 planner_future_11_dim 은 제외합니다.
+    3) 저장은 ego_future_gt_11_dim 만 남기고 ego_future_gt_11_dim 은 제외합니다.
 
     Args:
         sample_dict (Dict[str, Any]): 샘플 1개 dict. shape: ()
@@ -339,10 +339,6 @@ def _build_inference_npz_payload_for_save(
             continue
         if not isinstance(v, np.ndarray):
             continue
-        if key == "planner_future_11_dim":
-            # (3) planner는 저장하지 않음(ego와 동일하다는 assert는 위에서 수행)
-            key = "ego_future_gt_11_dim"
-
         out[key] = v
 
     return out
@@ -2660,7 +2656,7 @@ def _augment_inputs_with_ego_futures_for_npz(
     하는 일
     ------
     1) ego_future_gt_4_dim -> ego_future_gt_3_dim 생성
-    2) ego 현재 상태(11차원)로 planner_future_11_dim 생성
+    2) ego 현재 상태(11차원)로 ego_future_gt_11_dim 생성
        - GT가 없는 칸은 앞 8개 값을 0으로 처리
 
     Returns:
@@ -2691,16 +2687,16 @@ def _augment_inputs_with_ego_futures_for_npz(
     # ego_agent_current: (11,)
     ego_agent_current = ego_agent_past[-1, :]
 
-    # planner_future_11_dim: (future_len, 11)
-    planner_future_11_dim = np.tile(
+    # ego_future_gt_11_dim: (future_len, 11)
+    ego_future_gt_11_dim = np.tile(
         ego_agent_current[np.newaxis, :],
         (int(ego_future_gt_4_np.shape[0]), 1),
     )
-    planner_future_11_dim[:, 0:4] = ego_future_gt_4_np  # (future_len, 11)
+    ego_future_gt_11_dim[:, 0:4] = ego_future_gt_4_np  # (future_len, 11)
 
     # ego_future_gt_is_valid: (future_len,) bool
-    planner_future_11_dim[~ego_future_gt_is_valid, :8] = 0.0
-    a_inputs_dict["planner_future_11_dim"] = planner_future_11_dim
+    ego_future_gt_11_dim[~ego_future_gt_is_valid, :8] = 0.0
+    a_inputs_dict["ego_future_gt_11_dim"] = ego_future_gt_11_dim
 
 
 def _augment_inputs_with_neighbor_futures_for_npz(
@@ -4593,7 +4589,7 @@ def _draw_one_batch_one_rollout(
 
     ego_gt_future_11 = ego_future_11[1:, :].copy()  # (T, 11)
     ego_gt_future_11[:, 0:4] = a_unnorm_ego_future_gt_4_dim  # (future_len, 4)
-    a_unnorm_inputs_np["planner_future_11_dim"] = ego_gt_future_11
+    a_unnorm_inputs_np["ego_future_gt_11_dim"] = ego_gt_future_11
 
     near_agents_current = a_unnorm_inputs_np[
         "near_agents_past"][:, -1, :]  # (Pnn, 11)
@@ -5326,7 +5322,7 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
             필요한 키/shape:
               - ego_future_gt_4_dim: (B, future_len, 4)
               - near_future_gt_4_dim: (B, Pnn, future_len, 4)
-              - planner_future_11_dim: (B, future_len, 11)
+              - ego_future_gt_11_dim: (B, future_len, 11)
               - ego_future_gt_is_valid: (B, future_len)
               - near_future_gt_is_valid: (B, Pnn, future_len)
 
@@ -5353,13 +5349,13 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     ego_future_gt_4_dim[:, future_len - gap:, :] = 0.0
     unnorm_outputs_copy["ego_future_gt_4_dim"] = ego_future_gt_4_dim
 
-    # planner_future_11_dim shift
-    planner_future_11_dim = unnorm_inputs_copy[
-        "planner_future_11_dim"]  # (B, future_len, 11)
-    planner_future_11_dim[:, :future_len -
-                          gap, :] = planner_future_11_dim[:, gap:, :].clone()
-    planner_future_11_dim[:, future_len - gap:, :] = 0.0
-    unnorm_inputs_copy["planner_future_11_dim"] = planner_future_11_dim
+    # ego_future_gt_11_dim shift
+    ego_future_gt_11_dim = unnorm_inputs_copy[
+        "ego_future_gt_11_dim"]  # (B, future_len, 11)
+    ego_future_gt_11_dim[:, :future_len -
+                          gap, :] = ego_future_gt_11_dim[:, gap:, :].clone()
+    ego_future_gt_11_dim[:, future_len - gap:, :] = 0.0
+    unnorm_inputs_copy["ego_future_gt_11_dim"] = ego_future_gt_11_dim
 
     # ego_future_gt_is_valid shift
     ego_future_gt_is_valid = unnorm_outputs_copy[
@@ -5708,7 +5704,7 @@ def _transform_origin_step4_planner_future_inplace(
 
     Args:
         unnorm_inputs_copy: 입력 dict (inplace 변경).
-            - planner_future_11_dim: (B, future_len, 11) 또는 None
+            - ego_future_gt_11_dim: (B, future_len, 11) 또는 None
             - ego_future_gt_is_valid: (B, future_len) (없을 수도 있음)
         delta_xy: 새 기준의 위치 이동 값. shape (B, 2)
         cos_delta: 새 기준의 방향 cos 값. shape (B,)
@@ -5717,15 +5713,15 @@ def _transform_origin_step4_planner_future_inplace(
     Returns:
         None
     """
-    planner_future_11_dim = unnorm_inputs_copy.get("planner_future_11_dim",
+    ego_future_gt_11_dim = unnorm_inputs_copy.get("ego_future_gt_11_dim",
                                                    None)
-    if not isinstance(planner_future_11_dim,
-                      torch.Tensor) or planner_future_11_dim.numel() == 0:
+    if not isinstance(ego_future_gt_11_dim,
+                      torch.Tensor) or ego_future_gt_11_dim.numel() == 0:
         return
     valid_mask = unnorm_outputs_copy["ego_future_gt_is_valid"]
 
     _transform_state_11_dim_inplace(
-        state_11=planner_future_11_dim,  # (B, future_len, 11)
+        state_11=ego_future_gt_11_dim,  # (B, future_len, 11)
         delta_xy=delta_xy,  # (B, 2)
         cos_delta=cos_delta,  # (B,)
         sin_delta=sin_delta,  # (B,)
