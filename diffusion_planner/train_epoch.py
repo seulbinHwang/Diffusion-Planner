@@ -644,14 +644,16 @@ def _prepare_batch_for_device(
     target_keys = {
         "ego_future_gt_4_dim",  # output 에서만 꺼내도록
         "near_future_gt_4_dim",  # output 에서만 꺼내도록
-        "ego_future_gt_is_valid",  # input / output 둘다
-        "near_future_gt_is_valid",  # input / output 둘다
+        "future_seg_control_gt_3_dim",  # output 에서만 꺼내도록
+        "ego_future_gt_is_valid",  # output 에서만 꺼내도록
+        "near_future_gt_is_valid",  # output 에서만 꺼내도록
+        "future_seg_control_is_valid",  # output 에서만 꺼내도록
     }
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
         if key in target_keys:
-            # TODO: 나중에 pop으로 바꾸기
-            value = batch_on_device[key]
+            # pop으로 꺼내자.
+            value = batch_on_device.pop(key, None)
             if value is None:
                 continue
             # value = batch_on_device.pop(key)
@@ -1177,6 +1179,10 @@ def train_epoch(
             data=outputs["near_future_gt_4_dim"],
             valid_mask=outputs["near_future_gt_is_valid"],
         )
+        outputs["future_seg_control_gt_3_dim"] = args.state_normalizer(
+            data=outputs["future_seg_control_gt_3_dim"],
+            valid_mask=outputs["future_seg_control_is_valid"],
+        )
 
         # 2) grad 초기화
         if args.use_deepspeed and hasattr(model, "zero_grad"):
@@ -1198,7 +1204,6 @@ def train_epoch(
             state_normalizer=args.state_normalizer,
             loss_dict=raw_loss_dict,
             model_type=args.diffusion_model_type,
-            observation_normalizer=args.observation_normalizer,
         )
 
         loss_dict: Dict[str, torch.Tensor] = _compute_loss_dict(

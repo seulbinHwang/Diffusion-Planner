@@ -7,16 +7,16 @@
         "mean": [10, 0, 0, 0],
         "std": [20, 20, 1, 1]
     },
-      "seg_body_control": {
-        "mean": [1.7, 0, 0],
+    "seg_body_control": {
+        "mean": [0, 0, 0],
         "std": [3.5, 0.3, 1]
     },
     "past_seg_control_gt_3_dim": {
-        "mean": [1.7, 0, 0],
+        "mean": [0, 0, 0],
         "std": [3.5, 0.3, 1]
     },
     "future_seg_control_gt_3_dim": {
-        "mean": [1.7, 0, 0],
+        "mean": [0, 0, 0],
         "std": [3.5, 0.3, 1]
     },
     "ego_agent_past": {

@@ -12,80 +12,101 @@ except Exception:
 
 
 import torch
-from typing import Any
-
+from typing import Any, Optional
 
 class StateNormalizer:
+    """입력 텐서의 마지막 차원에 따라 정규화/역정규화를 수행하는 클래스입니다.
 
-    def __init__(self, mean: object, std: object) -> None:
-        self.mean = self._to_1d4(mean, name="mean")  # (4,)
-        self.std = self._to_1d4(std, name="std")  # (4,)
+    - 마지막 차원 4: normalization.json의 "neighbor" 통계(mean/std) 사용
+    - 마지막 차원 3: normalization.json의 "seg_body_control" 통계(mean/std) 사용
+    - valid_mask가 False인 위치는 결과를 0으로 만듭니다(out-of-place).
+    """
+
+    def __init__(
+        self,
+        mean: object,
+        std: object,
+        seg_mean: Optional[object] = None,
+        seg_std: Optional[object] = None,
+    ) -> None:
+        """정규화 통계를 저장합니다.
+
+        Args:
+            mean: "neighbor" 평균. 길이 4여야 합니다.
+            std: "neighbor" 표준편차. 길이 4여야 합니다.
+            seg_mean: "seg_body_control" 평균. 길이 3이어야 합니다(선택).
+            seg_std: "seg_body_control" 표준편차. 길이 3이어야 합니다(선택).
+
+        Notes:
+            - seg_mean/seg_std를 주지 않으면, 마지막 차원이 3인 입력을 처리할 때 에러를 냅니다.
+        """
+        self.mean_4 = self._to_1d(values=mean, numel=4, name="neighbor.mean")  # (4,)
+        self.std_4 = self._to_1d(values=std, numel=4, name="neighbor.std")    # (4,)
+
+        self.mean_3 = None if seg_mean is None else self._to_1d(values=seg_mean, numel=3, name="seg_body_control.mean")  # (3,)
+        self.std_3 = None if seg_std is None else self._to_1d(values=seg_std, numel=3, name="seg_body_control.std")      # (3,)
 
     @classmethod
-    def from_json(cls, args):
+    def from_json(cls, args) -> "StateNormalizer":
         data = openjson(args.normalization_file_path)
-        mean = data["neighbor"]["mean"]
-        std = data["neighbor"]["std"]
-        return cls(mean, std)
+        mean4 = data["neighbor"]["mean"]
+        std4 = data["neighbor"]["std"]
+        mean3 = data["seg_body_control"]["mean"]
+        std3 = data["seg_body_control"]["std"]
+        return cls(mean=mean4, std=std4, seg_mean=mean3, seg_std=std3)
 
     @classmethod
-    def from_json2(cls, args_dict):
-        path_str = args_dict.get("normalization_file_path",
-                                 "normalization.json")
+    def from_json2(cls, args_dict) -> "StateNormalizer":
+        path_str = args_dict.get("normalization_file_path", "normalization.json")
         data = openjson(to_absolute_path(path_str))
-        mean = data["neighbor"]["mean"]
-        std = data["neighbor"]["std"]
-        return cls(mean, std)
+        mean4 = data["neighbor"]["mean"]
+        std4 = data["neighbor"]["std"]
+        mean3 = data["seg_body_control"]["mean"]
+        std3 = data["seg_body_control"]["std"]
+        return cls(mean=mean4, std=std4, seg_mean=mean3, seg_std=std3)
 
     @staticmethod
-    def _to_1d4(values: object, name: str) -> torch.Tensor:
+    def _to_1d(values: object, numel: int, name: str) -> torch.Tensor:
+        """입력을 1차원 텐서로 만들고, 원소 개수가 기대값과 같은지 검사합니다.
+
+        Args:
+            values: 리스트/튜플/텐서 등 숫자 값.
+            numel: 기대하는 원소 개수.
+            name: 에러 메시지에 표시할 이름.
+
+        Returns:
+            torch.Tensor: shape (numel,)의 float32 텐서.
+
+        Raises:
+            ValueError: 원소 개수가 numel이 아니면 발생합니다.
+        """
         values_t = torch.as_tensor(values, dtype=torch.float32).reshape(-1)
-        if values_t.numel() != 4:
+        if int(values_t.numel()) != int(numel):
             raise ValueError(
-                f"{name}는 총 4개 값이어야 합니다. "
+                f"{name}는 총 {numel}개 값이어야 합니다. "
                 f"(받은 원소 개수={values_t.numel()}, 받은 shape={tuple(torch.as_tensor(values).shape)})"
             )
         return values_t
 
     @staticmethod
-    def _reshape_stats_for_data(stats_1d4: torch.Tensor,
-                                data: torch.Tensor) -> torch.Tensor:
-        """stats(4,)를 data(...,4)에 맞게 reshape + dtype/device를 data와 맞춥니다.
-
-        Args:
-            stats_1d4: (4,)
-            data: (..., 4)
-
-        Returns:
-            (..., 4)에 broadcast 가능한 shape의 stats 텐서.
-            dtype/device는 data와 동일.
-        """
+    def _reshape_stats_for_data(stats_1d: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+        """stats(C,)를 data(...,C)에 맞게 reshape + dtype/device를 data와 맞춥니다."""
+        c = int(data.shape[-1])
+        if int(stats_1d.numel()) != c:
+            raise ValueError(
+                "stats의 길이와 data 마지막 차원이 맞지 않습니다. "
+                f"stats.numel()={int(stats_1d.numel())}, data.shape={tuple(data.shape)}"
+            )
         leading_ones = [1] * (data.ndim - 1)
-        return stats_1d4.to(device=data.device,
-                            dtype=data.dtype).view(*leading_ones, 4)
+        return stats_1d.to(device=data.device, dtype=data.dtype).view(*leading_ones, c)
 
     @staticmethod
-    def _broadcast_valid_mask(valid_mask: Any,
-                              data: torch.Tensor) -> torch.Tensor:
-        """valid_mask를 data와 같은 shape로 브로드캐스트 가능한 형태로 정리합니다.
-
-        Args:
-            valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크.
-            data: (..., 4) 텐서.
-
-        Returns:
-            torch.Tensor: data와 같은 shape로 broadcast 가능한 bool 마스크.
-                - 일반적으로 (...., 1)로 확장됩니다.
-
-        Raises:
-            ValueError: valid_mask 모양이 data와 맞지 않는 경우.
-        """
+    def _broadcast_valid_mask(valid_mask: Any, data: torch.Tensor) -> torch.Tensor:
         mask = torch.as_tensor(valid_mask, device=data.device).to(torch.bool)
 
         if mask.shape == data.shape:
             return mask
 
-        # 보통 valid_mask는 data의 마지막 채널(4)을 뺀 모양임: (...,)
         if mask.shape == data.shape[:-1]:
             return mask.unsqueeze(-1)
 
@@ -96,78 +117,60 @@ class StateNormalizer:
 
     @staticmethod
     def _mask_out_of_place(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """in-place 없이 마스크 False 위치를 0으로 만듭니다.
-
-        Args:
-            x: data와 동일 shape 텐서.
-            mask: x와 동일 shape (또는 broadcast 가능한) bool 마스크.
-
-        Returns:
-            torch.Tensor: mask가 False인 위치가 0인 새 텐서.
-        """
         return torch.where(mask, x, torch.zeros_like(x))
 
+    def _select_stats(self, last_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """data의 마지막 차원 크기에 맞는 mean/std를 고릅니다."""
+        if last_dim == 4:
+            return self.mean_4, self.std_4
+        if last_dim == 3:
+            if self.mean_3 is None or self.std_3 is None:
+                raise ValueError("마지막 차원이 3인 입력을 처리하려면 seg_mean/seg_std가 필요합니다.")
+            return self.mean_3, self.std_3
+        raise ValueError(f"지원하지 않는 마지막 차원입니다. last_dim={last_dim} (허용: 3 또는 4)")
+
     def __call__(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
-        """data를 정규화합니다(마스크는 out-of-place로 적용).
+        last_dim = int(data.shape[-1])
+        mean_1d, std_1d = self._select_stats(last_dim)
 
-        핵심 변경:
-            - mean/std를 data와 같은 dtype으로 맞춘 뒤 계산합니다.
-              (입력이 bf16면 bf16로 계산/출력)
-
-        Args:
-            data: (..., 4)
-            valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크
-
-        Returns:
-            (..., 4) 정규화 결과. invalid 위치는 0.
-        """
-        if data.shape[-1] != 4:
-            raise ValueError(
-                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
-
-        # autocast는 끄고, dtype은 '입력 data dtype'을 그대로 존중합니다.
         with torch.amp.autocast(data.device.type, enabled=False):
-            mean = self._reshape_stats_for_data(self.mean, data)
-            std = self._reshape_stats_for_data(self.std, data)
+            mean = self._reshape_stats_for_data(mean_1d, data)
+            std = self._reshape_stats_for_data(std_1d, data)
             norm_data = (data - mean) / std
             mask = self._broadcast_valid_mask(valid_mask, data)
             return self._mask_out_of_place(norm_data, mask)
 
     def inverse(self, data: torch.Tensor, valid_mask) -> torch.Tensor:
-        """정규화된 data를 역변환합니다(마스크는 out-of-place로 적용).
-
-        핵심 변경:
-            - mean/std를 data와 같은 dtype으로 맞춘 뒤 계산합니다.
-              (입력이 bf16면 bf16로 계산/출력)
-
-        Args:
-            data: (..., 4)
-            valid_mask: 보통 data.shape[:-1] 모양의 bool 마스크
-
-        Returns:
-            (..., 4) 역변환 결과. invalid 위치는 0.
-        """
-        if data.shape[-1] != 4:
-            raise ValueError(
-                f"data의 마지막 차원은 4여야 합니다. (받은 shape={tuple(data.shape)})")
+        last_dim = int(data.shape[-1])
+        mean_1d, std_1d = self._select_stats(last_dim)
 
         with torch.amp.autocast(data.device.type, enabled=False):
-            mean = self._reshape_stats_for_data(self.mean, data)
-            std = self._reshape_stats_for_data(self.std, data)
+            mean = self._reshape_stats_for_data(mean_1d, data)
+            std = self._reshape_stats_for_data(std_1d, data)
             inv_data = data * std + mean
             mask = self._broadcast_valid_mask(valid_mask, data)
             return self._mask_out_of_place(inv_data, mask)
 
     def to_dict(self) -> dict:
-        """현재 mean/std를 저장용 dict로 바꿉니다.
-
-        Returns:
-            dict: {"mean": ..., "std": ...}
-                mean/std는 (1, 1, 4) 모양의 중첩 리스트로 내보냅니다.
-        """
-        mean_1x1x4 = self.mean.view(1, 1, 4).detach().cpu().numpy().tolist()
-        std_1x1x4 = self.std.view(1, 1, 4).detach().cpu().numpy().tolist()
+        """기존 동작 호환: neighbor(4차원) mean/std만 저장 포맷으로 내보냅니다."""
+        mean_1x1x4 = self.mean_4.view(1, 1, 4).detach().cpu().numpy().tolist()
+        std_1x1x4 = self.std_4.view(1, 1, 4).detach().cpu().numpy().tolist()
         return {"mean": mean_1x1x4, "std": std_1x1x4}
+
+    def to_dict_extended(self) -> dict:
+        """확장 저장: neighbor(4) + seg_body_control(3) 둘 다 내보냅니다."""
+        out = {
+            "neighbor": {
+                "mean": self.mean_4.detach().cpu().numpy().tolist(),
+                "std": self.std_4.detach().cpu().numpy().tolist(),
+            }
+        }
+        if self.mean_3 is not None and self.std_3 is not None:
+            out["seg_body_control"] = {
+                "mean": self.mean_3.detach().cpu().numpy().tolist(),
+                "std": self.std_3.detach().cpu().numpy().tolist(),
+            }
+        return out
 
 
 from copy import copy
@@ -190,7 +193,7 @@ class ObservationNormalizer:
         data = openjson(path)
         ndt = {}
         for k, v in data.items():
-            if k not in ["ego", "neighbor"]:
+            if k not in ["ego", "neighbor", "future_seg_control_gt_3_dim"]:
                 ndt[k] = {
                     "mean": torch.tensor(v["mean"], dtype=torch.float32),
                     "std": torch.tensor(v["std"], dtype=torch.float32)
@@ -205,7 +208,7 @@ class ObservationNormalizer:
 
         ndt = {}
         for k, v in data.items():
-            if k in ["ego", "neighbor"]:
+            if k in ["ego", "neighbor", "future_seg_control_gt_3_dim"]:
                 continue
             ndt[k] = {
                 "mean": torch.tensor(v["mean"], dtype=torch.float32),
@@ -367,7 +370,6 @@ class ObservationNormalizer:
             if not torch.is_tensor(valid) or not torch.is_tensor(x):
                 return
             norm_data[data_key] = self._apply_valid_mask_out_of_place(x, valid)
-
         _mask("ego_agent_past", "ego_agent_past_is_valid")
         _mask("planner_future_11_dim", "ego_future_gt_is_valid")
         _mask("neighbor_agents_past", "neighbor_agents_past_is_valid")
@@ -390,7 +392,6 @@ class ObservationNormalizer:
         _mask("near_agents_past", "near_agents_past_is_valid")
         _mask("non_near_agents_past", "non_near_agents_past_is_valid")
         _mask("past_seg_control_gt_3_dim", "past_seg_control_is_valid")
-        _mask("future_seg_control_gt_3_dim", "future_seg_control_is_valid")
 
     def to_dict(self):
         return {

@@ -132,8 +132,8 @@ def _prepare_diffusion_time_for_dit(
 
 def _ensure_tensor_on_ref(noise: torch.Tensor,
                           ref: torch.Tensor) -> torch.Tensor:
-    """noise를 ref와 같은 device/dtype으로 맞춥니다."""
-    return noise.to(device=ref.device, dtype=ref.dtype)
+    """noise를 ref와 같은 device 맞춥니다."""
+    return noise.to(device=ref.device)
 
 
 def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
@@ -4124,7 +4124,7 @@ else
         하는 일
         - target_current_control_norm(정규화)이 있으면:
           - 마지막 과거 구간이 유효한지(prev_valid)를 계산합니다.
-          - control을 observation_normalizer.inverse로 unnorm으로 바꿉니다.
+          - control을  unnorm으로 바꿉니다.
           - 유효하지 않은 행은 0으로 눌러 둡니다.
         - past가 없거나(prev 구간이 정의되지 않으면) None을 반환합니다.
 
@@ -4184,13 +4184,12 @@ else
         ctrl_norm = target_current_control_norm.to(
             device=device, dtype=torch.float32)  # (B,Pnn,3)
         ctrl_norm_t = ctrl_norm.unsqueeze(2)  # (B,Pnn,1,3)
+        prev_valid_unsqueeze = prev_valid.unsqueeze(-1) # (B,Pnn,1)
 
-        # observation_normalizer.inverse는 (B,Pnn,T,3) 입력을 기대하므로 T=1로 맞춤
-        unnorm_dict = self.config.observation_normalizer.inverse(
-            {"seg_body_control": ctrl_norm_t})
-        ctrl_unnorm_t = unnorm_dict["seg_body_control"]  # (B,Pnn,1,3)
+        # state_normalizer.inverse는 (B,Pnn,T,3) 입력을 기대하므로 T=1로 맞춤
+        ctrl_unnorm_t = self.config.state_normalizer.inverse(ctrl_norm_t,
+                                                                   valid_mask=prev_valid_unsqueeze)
         ctrl_unnorm = ctrl_unnorm_t.squeeze(2)  # (B,Pnn,3)
-
         # 유효하지 않은 행은 0으로 (혹시라도 잘못 쓰여도 안전)
         ctrl_unnorm = ctrl_unnorm.masked_fill(~prev_valid.unsqueeze(-1), 0.0)
 
@@ -4273,8 +4272,8 @@ else
             (
                 unnorm_diffusion_trajectory_stride,  # (B, Pnn, 1+T_ds, 4)
                 unnorm_near_past_xyyaw_stride,
-                # (B, Pnn, past_len_ds, 4) or None
-                near_past_cur_future_valid_stride,
+                # (B, 1+Pnn, past_len_ds, 4) or None
+                target_past_cur_future_valid_stride,
                 # (B, Pnn, past_len_ds+1+T_ds) bool
                 diffusion_trajectory_stride_norm,  # (B, Pnn, 1+T_ds, 4)
                 near_past_xyyaw_stride_norm,  # (B, Pnn, past_len_ds, 4) or None
@@ -4308,7 +4307,7 @@ else
                     unnorm_diffusion_trajectory_stride,  # (B, Pnn, 1+T_ds, 4)
                     unnorm_near_past_xyyaw_stride,
                     # (B, Pnn, past_len_ds, 4) or None
-                    near_past_cur_future_valid_stride,
+                    target_past_cur_future_valid_stride,
                     # (B, Pnn, past_len_ds+1+T_ds) bool
                     dt=dt_for_savgol,
                     polyorder=2,
@@ -4324,22 +4323,24 @@ else
             ):
                 # (B, Pnn, segment_len_ds, 3)  [v_x^b, v_y^b, ω]_mid (stride 타임라인 기준)
                 """무효 구간(점이 무효한 구간)은 0.0으로 출력됩니다."""
-                unnorm_seg_body_control_stride = self.feasible_projector.compute_midpoint_controls(
+                # # (B, Pnn, segment_len_ds, 3) # (B, Pnn, segment_len_ds)
+                unnorm_seg_body_control_stride, seg_valid = self.feasible_projector.compute_midpoint_controls(
                     unnorm_diffusion_trajectory_stride,  # (B, Pnn, 1+T_ds, 4)
                     unnorm_near_past_xyyaw_stride,
                     # (B, Pnn, past_len_ds, 4) or None
                     unnorm_points_world_control_stride,
                     # (B, Pnn, point_len_ds, 3)
-                    near_past_cur_future_valid_stride,
+                    target_past_cur_future_valid_stride,
                     # (B, Pnn, past_len_ds+1+T_ds) bool
                     point_len_inputs=point_len_inputs_stride,
                 )
+                seg_valid = seg_valid > 0.5
 
             # --- (3) 관측 정규화 → FeasibleProjector 네트워크(TCN) 보정 ---
-            temp_dict = {"future_seg_control_gt_3_dim": unnorm_seg_body_control_stride}
-            norm_temp_dict = self.config.observation_normalizer(temp_dict)
-            seg_body_control_stride = norm_temp_dict[
-                "future_seg_control_gt_3_dim"]  # (B, Pnn, segment_len_ds, 3)
+            # (B, Pnn, segment_len_ds, 3)
+            seg_body_control_stride = self.config.state_normalizer(data=unnorm_seg_body_control_stride,
+                                                                   valid_mask=seg_valid
+                                                                   )
 
             with torch.autocast(
                     device_type=device_type,
@@ -4353,7 +4354,7 @@ else
                 ):
                     # (B, Pnn, segment_len_ds, 3)  정규화 공간 제어
                     seg_body_control_stride_ref = self.feasible_projector(
-                        near_past_cur_future_valid_stride,
+                        target_past_cur_future_valid_stride,
                         # (B, Pnn, past_len_ds+1+T_ds)
                         diffusion_trajectory_stride_norm,  # (B, Pnn, 1+T_ds, 4)
                         near_past_xyyaw_stride_norm,
@@ -4368,13 +4369,14 @@ else
                     seg_body_control_stride_ref = seg_body_control_stride_ref + touch
 
             seg_body_control_stride_ref = seg_body_control_stride_ref.float()
-            norm_temp_dict = {"future_seg_control_gt_3_dim": seg_body_control_stride_ref}
-            temp_dict = self.config.observation_normalizer.inverse(
-                norm_temp_dict)
-            unnorm_seg_body_control_stride_ref = temp_dict[
-                "future_seg_control_gt_3_dim"]  # (B, Pnn, segment_len_ds, 3)
+            # (B, Pnn, segment_len_ds, 3)
+            unnorm_seg_body_control_stride_ref = self.config.state_normalizer.inverse(
+                data=seg_body_control_stride_ref,
+                valid_mask=seg_valid,
+            )
 
-            # --- (4) 미래 구간 제어만 원래 future_len 개수로 업샘플링 ---
+
+            # --- (4) 미래 구간 제어만 원래 future_len 개수로 업샘플링 --- (여기서 과거 걸 짜르는듯)
             # (B, Pnn, future_len, 3)
             unnorm_fut_seg_body_control = self.feasible_projector.upsample_future_controls_from_stride(
                 unnorm_seg_body_control_stride=
@@ -4412,16 +4414,18 @@ else
             # 정규화해서 DiTReturns 로 저장
             target_future_valid = target_cur_future_valid[:, :,
                                                           1:]  # (B, Pnn, future_len) bool
+            # target_cur_future_valid: (B, Pnn, 1+future_len) # 앞뒤 점이 모두 유호이면 유효
+            # target_segment_valid : (B, Pnn, future_len)
+            target_segment_valid = target_cur_future_valid[:, :, 1:] & target_cur_future_valid[:, :, :-1]
             integrated_trajectory = self.config.state_normalizer(
                 data=unnorm_integrated_trajectory,
                 valid_mask=target_future_valid)  # (B, Pnn, future_len, 4)
 
-            temp_dict = {"future_seg_control_gt_3_dim": unnorm_control_constraint_diff}
-            norm_temp_dict = self.config.observation_normalizer(temp_dict)
-            control_constraint_diff = norm_temp_dict[
-                "future_seg_control_gt_3_dim"]  # (B, Pnn, future_len, 3)
+            # (B, Pnn, future_len, 3)
+            control_constraint_diff = self.config.state_normalizer(unnorm_control_constraint_diff,
+                                                                  valid_mask=target_segment_valid)
             control_constraint_diff = control_constraint_diff.masked_fill(
-                ~target_future_valid.unsqueeze(-1), 0.0)
+                ~target_segment_valid.unsqueeze(-1), 0.0)
 
             self.norm_dit_returns.integrated_trajectory = integrated_trajectory  # (B,(1+)Pnn,future_len,4)
             self.norm_dit_returns.control_constraint_diff = control_constraint_diff  # (B,(1+)Pnn,future_len,3)
@@ -4461,12 +4465,15 @@ else
                 data=target_current_xyyaw,
                 valid_mask=target_cur_valid,
             )  # (B,Pnn,4)
-
+            # target_cur_future_valid: (B,Pnn,1+T)
+            # target_seg_future_valid : (B,Pnn,T)
+            target_seg_future_valid = target_cur_future_valid[:, :, 1:] & target_cur_future_valid[:, :, :-1]
             # 미래 control unnorm
-            unnorm_temp_dict = self.config.observation_normalizer.inverse(
-                {"future_seg_control_gt_3_dim": diffusion_control_traj})
-            unnorm_diffusion_control_traj = unnorm_temp_dict[
-                "future_seg_control_gt_3_dim"]  # (B,Pnn,T,3)
+            # (B,Pnn,T,3)
+            unnorm_diffusion_control_traj = self.config.state_normalizer.inverse(data=diffusion_control_traj,
+                                                                valid_mask=target_seg_future_valid,
+                                                                                 )
+
 
             # ✅ (1) prev control을 unnorm으로 변환 + ✅ (2) prev_valid 계산
             unnorm_prev_control, prev_control_valid = self._prepare_prev_control_for_filter_and_integrate(
@@ -4504,15 +4511,15 @@ else
                 valid_mask=target_future_valid,
             )
 
-            control_constraint_diff = self.config.observation_normalizer({
-                "future_seg_control_gt_3_dim": unnorm_control_constraint_diff
-            })["future_seg_control_gt_3_dim"].masked_fill(
-                ~target_future_valid.unsqueeze(-1), 0.0)
+            control_constraint_diff = self.config.state_normalizer(unnorm_control_constraint_diff,
+                                                                   valid_mask=target_seg_future_valid)
+            control_constraint_diff = control_constraint_diff.masked_fill(
+                ~target_seg_future_valid.unsqueeze(-1), 0.0)
 
-            norm_control_sequence = self.config.observation_normalizer({
-                "future_seg_control_gt_3_dim": unnorm_control_sequence
-            })["future_seg_control_gt_3_dim"].masked_fill(
-                ~target_future_valid.unsqueeze(-1), 0.0)
+            norm_control_sequence = self.config.state_normalizer(unnorm_control_sequence
+                                                                 ,valid_mask=target_seg_future_valid) #
+            norm_control_sequence = norm_control_sequence.masked_fill(
+                ~target_seg_future_valid.unsqueeze(-1), 0.0)
 
             self.norm_dit_returns.integrated_trajectory = integrated_trajectory  # (B,(1+)Pnn,future_len,4)
             self.norm_dit_returns.control_constraint_diff = control_constraint_diff  # (B,(1+)Pnn,future_len,3)

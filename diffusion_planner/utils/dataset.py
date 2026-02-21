@@ -925,7 +925,6 @@ class DiffusionPlannerData(Dataset):
                                                  precomputed_extra_keys)
 
         npz_key_to_new_key: Dict[str, str] = {
-            "ego_future_gt_11_dim": "planner_future_11_dim",
             "driveway": "driveway_points",
         }
 

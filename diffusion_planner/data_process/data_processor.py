@@ -4194,7 +4194,7 @@ class DataProcessor(object):
         # -----------------------
         projector = _get_feasible_sg_projector()
         with torch.no_grad():
-            seg_body_control_t = projector.compute_midpoint_controls(
+            seg_body_control_t,_ = projector.compute_midpoint_controls(
                 unnorm_diffusion_trajectory=
                 unnorm_diffusion_trajectory_t,  # (1,1+N,1+future_len,4)
                 unnorm_near_past_xyyaw=

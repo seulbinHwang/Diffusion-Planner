@@ -4615,7 +4615,7 @@ def build_target_past_future_body_seg_control_for_cache(
     # ------------------------------------------------------------
     fp = _get_feasible_projector_for_cache()
     with torch.no_grad():
-        target_body_seg_control_t = fp.compute_midpoint_controls(
+        target_body_seg_control_t,_ = fp.compute_midpoint_controls(
             unnorm_diffusion_trajectory=unnorm_diffusion_trajectory_t.float(),
             unnorm_near_past_xyyaw=None if unnorm_near_past_xyyaw_t is None else unnorm_near_past_xyyaw_t.float(),
             unnorm_points_world_control=target_past_future_control_t.float(),

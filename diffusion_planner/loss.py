@@ -1053,7 +1053,6 @@ def _add_xy_yaw_metric_losses(
         pose_based: bool,
         loss_dict: Dict[str, Any],
         state_normalizer: StateNormalizer,
-        observation_normalizer: Any,
         diffusion_sequence: torch.Tensor,  # (B,P,T,4) or (B,P,T,3)
         normed_target_future_seq_gt: torch.Tensor,  # (B,P,T,4 or 3)
         norm_target_future_gt_4_dim: torch.
@@ -1087,14 +1086,17 @@ def _add_xy_yaw_metric_losses(
 
         else:
             # --- (1) control 공간(vx,vy,yaw_rate) 지표 ---
-            temp_dict = {"future_seg_control_gt_3_dim": diffusion_sequence}
-            denorm_temp_dict = observation_normalizer.inverse(temp_dict)
-            score_denorm = denorm_temp_dict["future_seg_control_gt_3_dim"]  # (B,P,T,3)
+            # diffusion_sequence: (B, (1+)Pnn, future_len, 3)
+            score_denorm = state_normalizer.inverse(data=diffusion_sequence,
+                                                    valid_mask=target_future_valid_bool,
+                                                    )
 
-            temp_dict = {"future_seg_control_gt_3_dim": normed_target_future_seq_gt}
-            denorm_temp_dict = observation_normalizer.inverse(temp_dict)
-            target_future_ctrl_gt = denorm_temp_dict[
-                "future_seg_control_gt_3_dim"]  # (B,P,T,3)
+            # normed_target_future_seq_gt: (B, (1+)Pnn, future_len, 3)
+
+            target_future_ctrl_gt = state_normalizer.inverse(data=normed_target_future_seq_gt,
+                                                             valid_mask=target_future_valid_bool,
+                                                             )
+
 
             vxy_yaw_losses = _compute_vxy_yaw_losses(
                 score_denorm,  # (B,P,T,3)
@@ -1154,10 +1156,11 @@ def _add_xy_yaw_metric_losses(
 
         # --- (4) control_constraint_diff 물리 단위 통계 ---
         if control_constraint_diff is not None:
-            temp_dict = {"future_seg_control_gt_3_dim": control_constraint_diff}
-            temp_dict = observation_normalizer.inverse(temp_dict)
-            constraint_diff_denorm: torch.Tensor = temp_dict[
-                "future_seg_control_gt_3_dim"]  # (B,P,T,3)
+            # control_constraint_diff: (B, (1+)Pnn, future_len, 3)
+            # target_future_valid_bool :  (B, (1 +) Pnn, future_len)
+            constraint_diff_denorm = state_normalizer.inverse(data=control_constraint_diff,
+                                                             valid_mask=target_future_valid_bool,
+                                                             )
 
             constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
                 constraint_diff_denorm,
@@ -1381,7 +1384,6 @@ def diffusion_loss_func(
     state_normalizer: StateNormalizer,
     loss_dict: Dict[str, Any],
     model_type: str,
-    observation_normalizer: Any,
     eps: float = 1e-3,
 ) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
     """diffusion 학습에 쓰이는 전체 손실을 계산합니다.
@@ -1427,7 +1429,7 @@ def diffusion_loss_func(
     ego_cur_future_gt_is_valid = torch.cat(
         [
             norm_inputs["ego_agent_past_is_valid"][:, -1:],
-            norm_inputs["ego_future_gt_is_valid"]
+            norm_outputs["ego_future_gt_is_valid"]
         ],
         dim=1,
     )
@@ -1471,7 +1473,7 @@ def diffusion_loss_func(
         """
         # past_seg_control_gt_3_dim: (B, 1+Pnn, past_len, 3)
         past_seg_control_gt_3_dim = norm_inputs["past_seg_control_gt_3_dim"]
-        future_seg_control_gt_3_dim = norm_inputs[
+        future_seg_control_gt_3_dim = norm_outputs[
             "future_seg_control_gt_3_dim"] # (B, (1+)Pnn, future_len, 3)
         past_future_seg_control_gt_3_dim = torch.cat([
             past_seg_control_gt_3_dim,
@@ -1652,7 +1654,7 @@ def diffusion_loss_func(
             # (B, Pnn)
             target_cur_gt_is_valid = near_cur_gt_is_valid
 
-        # unnorm_target_cur_gt_4_dim: (B, (1+)Pnn, 4) 또는 (B, Pnn, 4)
+        # unnorm_target_cur_gt_4_dim: (B, (1+)Pnn, 4)
         unnorm_target_cur_gt_4_dim = state_normalizer.inverse(
             norm_target_cur_gt_4_dim,
             target_cur_gt_is_valid,
@@ -1661,7 +1663,6 @@ def diffusion_loss_func(
             pose_based=args.pose_based,
             loss_dict=loss_dict,
             state_normalizer=state_normalizer,
-            observation_normalizer=observation_normalizer,
             diffusion_sequence=diffusion_sequence,  #  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
             normed_target_future_seq_gt=
             normed_target_future_seq_gt,  # # (B, (1+)Pnn, future_len, 4 or 3)

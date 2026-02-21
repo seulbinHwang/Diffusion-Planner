@@ -1826,7 +1826,7 @@ class FeasibleProjector(nn.Module):
         # (B, Pnn, time_len(=1+past_len) + future_len) bool
         *,
         point_len_inputs: Optional[PointLenInputs] = None,
-    ) -> torch.Tensor:  # (B, Pnn, segment_len, 3)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:  # (B, Pnn, segment_len, 3) # (B, Pnn, segment_len)
         """구간 [t_k, t_{k+1})마다 중점(midpoint) 제어 [v_x^b, v_y^b, w]를 계산한다.
 
         변경점:
@@ -1927,7 +1927,7 @@ class FeasibleProjector(nn.Module):
             seg_valid=seg_valid,
         )  # (B, Pnn, segment_len, 3)
 
-        return unnorm_seg_body_control
+        return unnorm_seg_body_control, seg_valid
 
     # <추가하자>
     def _build_midpoint_segment_valid_masks(
