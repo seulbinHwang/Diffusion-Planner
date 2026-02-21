@@ -871,17 +871,17 @@ def extract_from_decoder(
     assert diffusion_output.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
     # "diffusion_sequence"
     """
-    diffusion_trajectory
+    diffusion_sequence
         pose_based:
             (B, (1+)Pnn, (1+T),4)
         else:
             (B, (1+)Pnn, T,3)
     """
-    diffusion_trajectory: torch.Tensor = decoder_output["diffusion_trajectory"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
-    assert diffusion_trajectory.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
+    diffusion_sequence: torch.Tensor = decoder_output["diffusion_sequence"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+    assert diffusion_sequence.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
 
     diffusion_output = _require_finite("decoder_output['diffusion_output']", diffusion_output)
-    return diffusion_output, diffusion_trajectory
+    return diffusion_output, diffusion_sequence
 
 
 def _compute_dpm_loss(
@@ -1054,7 +1054,7 @@ def _add_xy_yaw_metric_losses(
         loss_dict: Dict[str, Any],
         state_normalizer: StateNormalizer,
         observation_normalizer: Any,
-        diffusion_trajectory: torch.Tensor,  # (B,P,T,4) or (B,P,T,3)
+        diffusion_sequence: torch.Tensor,  # (B,P,T,4) or (B,P,T,3)
         normed_target_future_seq_gt: torch.Tensor,  # (B,P,T,4 or 3)
         norm_target_future_gt_4_dim: torch.
     Tensor,  # (B, (1+)Pnn, future_len, 4)
@@ -1066,13 +1066,13 @@ def _add_xy_yaw_metric_losses(
     """xy / yaw 관련 보기용 지표를 loss_dict에 추가합니다."""
     with torch.no_grad():
         target_future_valid_bool = _to_bool_mask(target_future_valid).to(
-            device=diffusion_trajectory.device)
+            device=diffusion_sequence.device)
 
         if pose_based:
             # score_denorm: (B,P,T,4)
             # target_future_valid_bool :  (B, (1 +) Pnn, future_len)
             score_denorm: torch.Tensor = state_normalizer.inverse(
-                diffusion_trajectory, target_future_valid_bool)
+                diffusion_sequence, target_future_valid_bool)
 
             # target_future_gt: (B,P,T,4)
             target_future_gt: torch.Tensor = state_normalizer.inverse(
@@ -1087,7 +1087,7 @@ def _add_xy_yaw_metric_losses(
 
         else:
             # --- (1) control 공간(vx,vy,yaw_rate) 지표 ---
-            temp_dict = {"future_seg_control_gt_3_dim": diffusion_trajectory}
+            temp_dict = {"future_seg_control_gt_3_dim": diffusion_sequence}
             denorm_temp_dict = observation_normalizer.inverse(temp_dict)
             score_denorm = denorm_temp_dict["future_seg_control_gt_3_dim"]  # (B,P,T,3)
 
@@ -1555,8 +1555,8 @@ def diffusion_loss_func(
     )
 
     # diffusion_output:  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
-    # diffusion_trajectory : (B, (1+)Pnn, T,4) or (B, (1+)Pnn, T,3)
-    diffusion_output, diffusion_trajectory = extract_from_decoder(future_len=args.future_len, decoder_output=decoder_output)
+    # diffusion_sequence : (B, (1+)Pnn, T,4) or (B, (1+)Pnn, T,3)
+    diffusion_output, diffusion_sequence = extract_from_decoder(future_len=args.future_len, decoder_output=decoder_output)
 
     # dpm_loss: (B, (1+)Pnn, future_len)
     dpm_loss: torch.Tensor = _compute_dpm_loss(
@@ -1662,7 +1662,7 @@ def diffusion_loss_func(
             loss_dict=loss_dict,
             state_normalizer=state_normalizer,
             observation_normalizer=observation_normalizer,
-            diffusion_trajectory=diffusion_trajectory,  #  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+            diffusion_sequence=diffusion_sequence,  #  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
             normed_target_future_seq_gt=
             normed_target_future_seq_gt,  # # (B, (1+)Pnn, future_len, 4 or 3)
             norm_target_future_gt_4_dim=
