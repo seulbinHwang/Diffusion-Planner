@@ -3283,73 +3283,114 @@ class DiT(nn.Module):
         return idx.clamp_(0, T - 1)
 
     def _build_pose_roll_norm(
-        self,
-        *,
-        step_fut: torch.Tensor,         # (B,P,T,step_dim)
-        step_valid_fut: torch.Tensor,   # (B,P,T) bool
-        pose_cur_norm: torch.Tensor,    # (B,P,4)
-        agent_valid: torch.Tensor,      # (B,P) bool
+            self,
+            *,
+            step_fut: torch.Tensor,  # (B,P,T,step_dim)
+            step_valid_fut: torch.Tensor,  # (B,P,T) bool
+            pose_cur_norm: torch.Tensor,  # (B,P,4)
+            agent_valid: torch.Tensor,  # (B,P) bool
     ) -> torch.Tensor:
         """Cross-Attn이 볼 ‘대략의 위치 기준’ pose_roll_norm을 만듭니다.
 
         pose_based=True:
-            - 입력의 미래 pose(노이즈 포함)를 그대로 사용
+            - 입력의 미래 pose(노이즈 포함)를 그대로 사용합니다.
+
         pose_based=False:
-            - 미래 control(노이즈 포함)을 unnorm -> midpoint 적분 -> norm
+            - 미래 control(노이즈 포함)을 실제 단위로 되돌린 뒤,
+              midpoint 방식으로 적분해서 미래 pose를 만들고,
+              다시 모델 입력 스케일로 맞춥니다.
+
+        변경점(중요):
+            - 기본 동작에서 더 이상 "autocast off + FP32 강제"를 하지 않습니다.
+            - 대신, 현재 AMP 계산 dtype(bf16/fp16)을 그대로 따라가서
+              (B,P,T)급 큰 텐서들이 FP32로 부풀어 오르는 것을 막습니다.
+            - fp16에서 수치 문제가 걱정되면 아래 옵션으로 FP32를 강제할 수 있습니다.
+              - config.pose_roll_force_fp32 = True  -> 항상 FP32로 계산
+              - config.pose_roll_fp16_use_fp32 = True(기본) -> fp16이면 FP32로만 계산
+
+        Returns:
+            pose_roll_norm: (B,P,T,4)
+                무효 시점은 0으로 채워집니다.
         """
         if bool(self.config.pose_based):
             pose_roll = step_fut[..., 0:4]  # (B,P,T,4)
             pose_roll = self._normalize_pose_4d_cos_sin(pose_roll)
-            pose_roll = pose_roll.masked_fill(~step_valid_fut.unsqueeze(-1), 0.0)
+            pose_roll = pose_roll.masked_fill(~step_valid_fut.unsqueeze(-1),
+                                              0.0)
             return pose_roll
 
+        # -------------------------
         # pose_based=False
+        # -------------------------
         ctrl_fut_norm = step_fut[..., 0:3]  # (B,P,T,3)
-        device_type = ctrl_fut_norm.device.type
         dt = float(self._get_integration_dt())
 
-        with torch.autocast(device_type=device_type, enabled=False):
-            pose_cur_norm_f32 = pose_cur_norm.to(dtype=torch.float32)  # (B,P,4)
-            ctrl_fut_norm_f32 = ctrl_fut_norm.to(dtype=torch.float32)  # (B,P,T,3)
+        # (핵심) 계산 dtype 결정: 기본은 AMP dtype을 따르되, 필요시 FP32로만 올림
+        force_fp32: bool = bool(
+            getattr(self.config, "pose_roll_force_fp32", False))
+        compute_dtype: torch.dtype = torch.float32 if force_fp32 else _infer_fast_compute_dtype(
+            ctrl_fut_norm)
 
-            pose_cur_unnorm = self.config.state_normalizer.inverse(
-                data=pose_cur_norm_f32,
-                valid_mask=agent_valid,
-            )  # (B,P,4) float32
+        # fp16은 범위가 좁아 적분/삼각함수에서 불안정할 수 있어, 기본은 fp32로 올립니다.
+        if (compute_dtype == torch.float16) and bool(
+                getattr(self.config, "pose_roll_fp16_use_fp32", True)):
+            compute_dtype = torch.float32
 
-            ctrl_fut_unnorm = self.config.state_normalizer.inverse(
-                data=ctrl_fut_norm_f32,
-                valid_mask=step_valid_fut,
-            )  # (B,P,T,3) float32
+        # dtype/device 정렬(이미 같으면 복사 없음)
+        pose_cur_norm_work = pose_cur_norm.to(dtype=compute_dtype,
+                                              device=ctrl_fut_norm.device)  # (B,P,4)
+        ctrl_fut_norm_work = ctrl_fut_norm.to(dtype=compute_dtype,
+                                              device=ctrl_fut_norm.device)  # (B,P,T,3)
 
-            ctrl_fut_unnorm = ctrl_fut_unnorm * step_valid_fut.to(torch.float32).unsqueeze(-1)
+        # 1) 현재 pose / 미래 control 을 실제 단위로 되돌리기
+        pose_cur_unnorm = self.config.state_normalizer.inverse(
+            data=pose_cur_norm_work,
+            valid_mask=agent_valid,
+        )  # (B,P,4) compute_dtype
 
-            vx_b = ctrl_fut_unnorm[..., 0]  # (B,P,T)
-            vy_b = ctrl_fut_unnorm[..., 1]  # (B,P,T)
-            omega = ctrl_fut_unnorm[..., 2]  # (B,P,T)
+        ctrl_fut_unnorm = self.config.state_normalizer.inverse(
+            data=ctrl_fut_norm_work,
+            valid_mask=step_valid_fut,
+        )  # (B,P,T,3) compute_dtype
 
-            states = FeasibleProjector.integrate_midpoint_batch(
-                unnorm_near_current_state=pose_cur_unnorm,  # (B,P,4)
-                vx_b_seq=vx_b,  # (B,P,T)
-                vy_b_seq=vy_b,  # (B,P,T)
-                omega_seq=omega,  # (B,P,T)
-                dt=float(dt),
-                eps=1e-6,
-            )
+        # 2) 무효 시점은 0으로(혹시라도 뒤 연산에 섞이지 않게)
+        valid_f = step_valid_fut.to(dtype=compute_dtype,
+                                    device=ctrl_fut_unnorm.device).unsqueeze(
+            -1)  # (B,P,T,1)
+        ctrl_fut_unnorm = ctrl_fut_unnorm * valid_f  # (B,P,T,3)
 
-            pose_roll_unnorm = torch.stack(
-                [states["x_next"], states["y_next"], states["cos_next"], states["sin_next"]],
-                dim=-1,
-            )  # (B,P,T,4) float32
+        vx_b = ctrl_fut_unnorm[..., 0]  # (B,P,T)
+        vy_b = ctrl_fut_unnorm[..., 1]  # (B,P,T)
+        omega = ctrl_fut_unnorm[..., 2]  # (B,P,T)
 
-            pose_roll_norm_f32 = self.config.state_normalizer(
-                data=pose_roll_unnorm,
-                valid_mask=step_valid_fut,
-            )  # (B,P,T,4) float32
+        # 3) midpoint 적분으로 미래 pose 생성
+        states = FeasibleProjector.integrate_midpoint_batch(
+            unnorm_near_current_state=pose_cur_unnorm,  # (B,P,4)
+            vx_b_seq=vx_b,  # (B,P,T)
+            vy_b_seq=vy_b,  # (B,P,T)
+            omega_seq=omega,  # (B,P,T)
+            dt=float(dt),
+            eps=1e-6,
+        )
 
-        pose_roll_norm = pose_roll_norm_f32.to(dtype=step_fut.dtype, device=step_fut.device)
+        pose_roll_unnorm = torch.stack(
+            [states["x_next"], states["y_next"], states["cos_next"],
+             states["sin_next"]],
+            dim=-1,
+        )  # (B,P,T,4) compute_dtype
+
+        # 4) 다시 모델 스케일로
+        pose_roll_norm_work = self.config.state_normalizer(
+            data=pose_roll_unnorm,
+            valid_mask=step_valid_fut,
+        )  # (B,P,T,4) compute_dtype
+
+        # 5) 최종 출력 dtype/device는 원래 step_fut 기준으로(기존 로직 유지)
+        pose_roll_norm = pose_roll_norm_work.to(dtype=step_fut.dtype,
+                                                device=step_fut.device)  # (B,P,T,4)
         pose_roll_norm = self._normalize_pose_4d_cos_sin(pose_roll_norm)
-        pose_roll_norm = pose_roll_norm.masked_fill(~step_valid_fut.unsqueeze(-1), 0.0)
+        pose_roll_norm = pose_roll_norm.masked_fill(
+            ~step_valid_fut.unsqueeze(-1), 0.0)
         return pose_roll_norm
 
     def _compute_cross_q_bias_full(
