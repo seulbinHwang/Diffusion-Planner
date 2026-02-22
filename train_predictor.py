@@ -2868,7 +2868,7 @@ def model_training(
     )
     core_model = _unwrap_to_core_torch_module(diffusion_planner)
     if int(global_rank) == 0:
-        print_param_report(core_model)
+        print_param_report(core_model) # 여기 코드에서, 한국어로 적힌 부분 영어로 수정한 코드 보여줘
     best_loss = _run_training_loop(
         args=args,
         diffusion_planner=diffusion_planner,

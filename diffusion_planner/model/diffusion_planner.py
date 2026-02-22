@@ -627,10 +627,12 @@ def print_param_report(model: nn.Module) -> None:
     encoder = summarize_module_params(model.encoder)
     decoder = summarize_module_params(model.decoder)
 
-    print("[모듈 기준 파라미터 개수]")
-    print(f"- 전체: total={whole.total:,} / trainable={whole.trainable:,}")
-    print(f"- 인코더: total={encoder.total:,} / trainable={encoder.trainable:,}")
-    print(f"- 디코더: total={decoder.total:,} / trainable={decoder.trainable:,}")
+    print("[Module-wise Parameter Count]")
+    print(f"- Total: total={whole.total:,} / trainable={whole.trainable:,}")
+    print(
+        f"- Encoder: total={encoder.total:,} / trainable={encoder.trainable:,}")
+    print(
+        f"- Decoder: total={decoder.total:,} / trainable={decoder.trainable:,}")
 
     # 2) 그룹 기준
     has_group_iters: bool = all(
@@ -647,21 +649,27 @@ def print_param_report(model: nn.Module) -> None:
             model.iter_group_encoder_global_parameters())
         group_c = summarize_iter_params(model.iter_group_decoder_parameters())
 
-        print("\n[그룹 기준 파라미터 개수 (A/B/C iterator 기준)]")
+        print("\n[Parameter Count by Group (A/B/C iterator basis)]")
         print(
-            f"- Group A(로컬 인코더): total={group_a.total:,} / trainable={group_a.trainable:,}"
+            f"- Group A(Local Encoder): total={group_a.total:,} / trainable={group_a.trainable:,}"
         )
         print(
-            f"- Group B(글로벌 인코더): total={group_b.total:,} / trainable={group_b.trainable:,}"
+            f"- Group B(Global Encoder): total={group_b.total:,} / trainable={group_b.trainable:,}"
         )
         print(
-            f"- Group C(디코더): total={group_c.total:,} / trainable={group_c.trainable:,}"
+            f"- Group C(Decoder): total={group_c.total:,} / trainable={group_c.trainable:,}"
         )
 
         group_sum_total: int = group_a.total + group_b.total + group_c.total
         group_sum_trainable: int = group_a.trainable + group_b.trainable + group_c.trainable
         print(
-            f"- A+B+C 합: total={group_sum_total:,} / trainable={group_sum_trainable:,}"
+            f"- A+B+C Sum: total={group_sum_total:,} / trainable={group_sum_trainable:,}"
+        )
+
+        group_sum_total: int = group_a.total + group_b.total + group_c.total
+        group_sum_trainable: int = group_a.trainable + group_b.trainable + group_c.trainable
+        print(
+            f"- A+B+C Sum: total={group_sum_total:,} / trainable={group_sum_trainable:,}"
         )
 
     # ------------------------------------------------------------
@@ -684,20 +692,21 @@ def print_param_report(model: nn.Module) -> None:
     sum_total = dit_core.total + feasible.total + pram.total + others.total
     sum_trainable = dit_core.trainable + feasible.trainable + pram.trainable + others.trainable
 
-    print("\n[디코더 내부 카테고리별 파라미터 개수]")
+    print("\n[Decoder Parameter Count by Category]")
     print(
-        f"- DiT(Feasible/PRAM 제외): total={dit_core.total:,} / trainable={dit_core.trainable:,}"
+        f"- DiT(excluding Feasible/PRAM): total={dit_core.total:,} / trainable={dit_core.trainable:,}"
     )
     print(
         f"- FeasibleProjector: total={feasible.total:,} / trainable={feasible.trainable:,}"
     )
     print(f"- PRAM-v2: total={pram.total:,} / trainable={pram.trainable:,}")
-    print(f"- 기타: total={others.total:,} / trainable={others.trainable:,}")
-    print(f"- (4개 합): total={sum_total:,} / trainable={sum_trainable:,}")
+    print(f"- Others: total={others.total:,} / trainable={others.trainable:,}")
+    print(
+        f"- (4 categories sum): total={sum_total:,} / trainable={sum_trainable:,}")
 
     if sum_total != dec_total.total:
         print(
-            f"  [주의] (4개 합)과 디코더 total이 다릅니다: decoder_total={dec_total.total:,}"
+            f"  [Warning] (4 categories sum) and decoder total mismatch: decoder_total={dec_total.total:,}"
         )
         # ------------------------------------------------------------
         # ✅ (추가) 인코더 내부 8카테고리별 파라미터 개수
@@ -728,7 +737,7 @@ def print_param_report(model: nn.Module) -> None:
                      lane_summary.trainable + fusion_core.trainable +
                      self_attn.trainable + others.trainable)
 
-    print("\n[인코더 내부 카테고리별 파라미터 개수]")
+    print("\n[Encoder Parameter Count by Category]")
     print(
         f"- AgentFusionEncoder: total={agent.total:,} / trainable={agent.trainable:,}"
     )
@@ -745,21 +754,21 @@ def print_param_report(model: nn.Module) -> None:
         f"- LaneSummaryTokenPooler: total={lane_summary.total:,} / trainable={lane_summary.trainable:,}"
     )
     print(
-        f"- FusionEncoder(SelfAttentionBlock 제외): total={fusion_core.total:,} / trainable={fusion_core.trainable:,}"
+        f"- FusionEncoder(excluding SelfAttentionBlock): total={fusion_core.total:,} / trainable={fusion_core.trainable:,}"
     )
     print(
         f"- SelfAttentionBlock: total={self_attn.total:,} / trainable={self_attn.trainable:,}"
     )
-    print(f"- 기타: total={others.total:,} / trainable={others.trainable:,}")
-    print(f"- (8개 합): total={sum_total:,} / trainable={sum_trainable:,}")
+    print(f"- Others: total={others.total:,} / trainable={others.trainable:,}")
+    print(f"- (8 categories sum): total={sum_total:,} / trainable={sum_trainable:,}")
 
     if sum_total != enc_total.total:
         print(
-            f"  [주의] (8개 합)과 인코더 total이 다릅니다: encoder_total={enc_total.total:,}"
+            f"  [Warning] (8 categories sum) and encoder total mismatch: encoder_total={enc_total.total:,}"
         )
 
     # ------------------------------------------------------------
-    # ✅ (추가) PRAM-v2 내부에서 "어느 부분이 큰지" 더 자세히 출력
+    # ✅ (Added) Detailed Breakdown of PRAM-v2 (Largest Parts)
     # ------------------------------------------------------------
     dit_module = getattr(dec_module, "dit", None)
     if isinstance(dit_module, nn.Module) and pram.total > 0:
@@ -775,16 +784,16 @@ def print_param_report(model: nn.Module) -> None:
         pram_top_sum_trainable: int = sum(
             r.trainable for _, r in pram_top_sorted)
 
-        print("\n[PRAM-v2 내부 파라미터(큰 순서)]")
+        print("\n[PRAM-v2 Parameter Count (Largest First)]")
         for key, res in pram_top_sorted:
             print(f"- {key}: total={res.total:,} / trainable={res.trainable:,}")
 
         if pram_top_sum_total != pram.total:
             print(
-                f"  [주의] PRAM-v2 합이 다릅니다: pram_total={pram.total:,}, grouped={pram_top_sum_total:,}"
+                f"  [Warning] PRAM-v2 sum mismatch: pram_total={pram.total:,}, grouped={pram_top_sum_total:,}"
             )
 
-        # (B) 자주 큰 덩어리 3~5개를 더 잘게 쪼개서 확인
+        # (B) Further breakdown of top 3~5 large groups
         detail_targets: List[str] = [
             "pram_v2_out_proj",
             "pram_v2_composer",
@@ -804,16 +813,16 @@ def print_param_report(model: nn.Module) -> None:
             )
             sub_sorted = _sort_param_count_results(sub_groups)
 
-            # 의미 있는 분해가 없으면(1개뿐이면) 출력 생략
+            # Skip if no meaningful breakdown (only 1 item)
             if len(sub_sorted) <= 1:
                 continue
 
             base_total: int = int(pram_top_groups[base].total)
             sub_sum_total: int = sum(r.total for _, r in sub_sorted)
 
-            print(f"\n[PRAM-v2 상세: {base}]")
+            print(f"\n[PRAM-v2 Detail: {base}]")
             for full_key, res in sub_sorted:
-                # "pram_v2_composer.adapt_S" -> "adapt_S" 처럼 짧게 표시
+                # "pram_v2_composer.adapt_S" -> "adapt_S" shorten
                 short_key: str = full_key
                 if full_key.startswith(base + "."):
                     short_key = full_key[len(base) + 1:]
@@ -823,14 +832,14 @@ def print_param_report(model: nn.Module) -> None:
 
             if sub_sum_total != base_total:
                 print(
-                    f"  [주의] {base} 합이 다릅니다: base_total={base_total:,}, grouped={sub_sum_total:,}"
+                    f"  [Warning] {base} sum mismatch: base_total={base_total:,}, grouped={sub_sum_total:,}"
                 )
     # ------------------------------------------------------------
-    # ✅ (추가) DiT(Feasible/PRAM 제외) 내부에서 "어느 부분이 큰지" 자세히 출력
+    # ✅ (Added) Detailed Breakdown of DiT (excluding Feasible/PRAM)
     # ------------------------------------------------------------
     dit_module = getattr(dec_module, "dit", None)
     if isinstance(dit_module, nn.Module) and dit_core.total > 0:
-        # (A) DiT core 큰 덩어리: blocks / preproj / t_embedder ...
+        # (A) DiT core major groups: blocks / preproj / t_embedder ...
         dit_top_groups = summarize_dit_core_param_groups(
             dit_module=dit_module,
             base_prefix=None,
@@ -841,13 +850,13 @@ def print_param_report(model: nn.Module) -> None:
         dit_top_sum_total: int = sum(r.total for _, r in dit_top_sorted)
         dit_top_sum_trainable: int = sum(r.trainable for _, r in dit_top_sorted)
 
-        print("\n[DiT(Feasible/PRAM 제외) 내부 파라미터(큰 순서)]")
+        print("\n[DiT (excluding Feasible/PRAM) Parameter Count (Largest First)]")
         for key, res in dit_top_sorted:
             print(f"- {key}: total={res.total:,} / trainable={res.trainable:,}")
 
         if dit_top_sum_total != dit_core.total:
             print(
-                f"  [주의] DiT core 합이 다릅니다: dit_core_total={dit_core.total:,}, grouped={dit_top_sum_total:,}"
+                f"  [Warning] DiT core sum mismatch: dit_core_total={dit_core.total:,}, grouped={dit_top_sum_total:,}"
             )
 
         # (B) preproj 상세(fc1 vs fc2)
@@ -872,10 +881,10 @@ def print_param_report(model: nn.Module) -> None:
                     )
                 if preproj_sum_total != preproj_total:
                     print(
-                        f"  [주의] preproj 합이 다릅니다: base_total={preproj_total:,}, grouped={preproj_sum_total:,}"
+                        f"  [Warning] preproj sum mismatch: base_total={preproj_total:,}, grouped={preproj_sum_total:,}"
                     )
 
-        # (C) t_embedder 상세(mlp.0 vs mlp.2)
+        # (C) t_embedder detail (mlp.0 vs mlp.2)
         if "t_embedder" in dit_top_groups:
             t_groups = summarize_dit_core_param_groups(
                 dit_module=dit_module,
@@ -887,7 +896,7 @@ def print_param_report(model: nn.Module) -> None:
             t_total: int = int(dit_top_groups["t_embedder"].total)
 
             if len(t_sorted) > 1:
-                print("\n[DiT 상세: t_embedder]")
+                print("\n[DiT Detail: t_embedder]")
                 for full_key, res in t_sorted:
                     short_key = full_key[len("t_embedder."
                                             ):] if full_key.startswith(
@@ -897,10 +906,10 @@ def print_param_report(model: nn.Module) -> None:
                     )
                 if t_sum_total != t_total:
                     print(
-                        f"  [주의] t_embedder 합이 다릅니다: base_total={t_total:,}, grouped={t_sum_total:,}"
+                        f"  [Warning] t_embedder sum mismatch: base_total={t_total:,}, grouped={t_sum_total:,}"
                     )
 
-        # (D) blocks 상세(블록 번호를 없애고 묶어서 출력)
+        # (D) blocks detail
         if "blocks" in dit_top_groups:
             blocks_raw = summarize_dit_core_param_groups(
                 dit_module=dit_module,
@@ -913,7 +922,7 @@ def print_param_report(model: nn.Module) -> None:
             blocks_sum_total: int = sum(r.total for _, r in blocks_sorted)
             blocks_total: int = int(dit_top_groups["blocks"].total)
 
-            print("\n[DiT 상세: blocks(묶음, 큰 순서)]")
+            print("\n[DiT Detail: blocks (merged, Largest First)]")
             for key, res in blocks_sorted:
                 print(
                     f"- {key}: total={res.total:,} / trainable={res.trainable:,}"
@@ -921,7 +930,7 @@ def print_param_report(model: nn.Module) -> None:
 
             if blocks_sum_total != blocks_total:
                 print(
-                    f"  [주의] blocks 합이 다릅니다: base_total={blocks_total:,}, grouped={blocks_sum_total:,}"
+                    f"  [Warning] blocks sum mismatch: base_total={blocks_total:,}, grouped={blocks_sum_total:,}"
                 )
 
 
