@@ -1063,100 +1063,85 @@ class DiTBlock(nn.Module):
             cu_seqlens_q: torch.Tensor,  # (B+1,) int32
             max_seqlen_q: int,
             cross_kv_cache: FlashAttnKVCache,
-            pram_v2_modulations: Dict[
-                str, ModulationTriplet],  # 각 값 텐서 shape: (Tq, D)
+            pram_v2_modulations: Dict[str, ModulationTriplet],  # 각 값: (Tq, D)
+            cross_q_bias_unpad: Optional[torch.Tensor] = None,
+            # (Tq, D) 또는 None
     ) -> torch.Tensor:
         """블록 전체를 (Tq, D) packed 토큰에서만 수행합니다.
 
-        - LayerNorm은 AMP 정책대로 fp32가 될 수 있습니다.
-        - 하지만 그 다음 MLP/Attention 경로는 bf16이 되도록, LN 출력만 다시 캐스팅합니다.
-
-        Args:
-            x_unpad: (Tq, D)
-            cu_seqlens_q: (B+1,)
-            max_seqlen_q: int
-            cross_kv_cache: KV 캐시
-            pram_v2_modulations: {"SA","FFN","CA"} 각 ModulationTriplet
-                - delta_scale/shift/gate: (Tq, D)
-
-        Returns:
-            torch.Tensor: (Tq, D)
+        추가:
+            cross_q_bias_unpad가 주어지면 Cross-Attn의 Q 입력에 더합니다.
+            - shape: (Tq, D)
         """
         if x_unpad.dim() != 2:
             raise ValueError(
                 f"x_unpad must be 2D (Tq,D). got {tuple(x_unpad.shape)}")
 
-        # (A) 블록 내부 기준 dtype을 "autocast가 선택한 dtype"으로 맞춤
-        # - autocast 꺼져 있으면 사실상 no-op
         x_unpad = self._cast_to_block_compute_dtype(x_unpad, ref=x_unpad)
 
         # ----- SA -----
         sa_mod: ModulationTriplet = pram_v2_modulations["SA"]
-
-        y1 = self.norm1(x_unpad)  # (Tq, D)  (AMP에서 float32일 수 있음)
-        y1 = self._cast_to_block_compute_dtype(y1,
-                                               ref=x_unpad)  # (Tq, D) bf16로 복귀
-
-        ds = sa_mod.delta_scale.to(dtype=y1.dtype, device=y1.device)  # (Tq, D)
-        sh = sa_mod.shift.to(dtype=y1.dtype, device=y1.device)  # (Tq, D)
-        y_tilde = y1 * (1.0 + ds) + sh  # (Tq, D)
-
+        y1 = self.norm1(x_unpad)
+        y1 = self._cast_to_block_compute_dtype(y1, ref=x_unpad)
+        ds = sa_mod.delta_scale.to(dtype=y1.dtype, device=y1.device)
+        sh = sa_mod.shift.to(dtype=y1.dtype, device=y1.device)
+        y_tilde = y1 * (1.0 + ds) + sh
         f_sa = self._self_attn_flash_varlen_packed(
             x_unpad=y_tilde,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
-        )  # (Tq, D)
-
-        g = sa_mod.gate.to(dtype=x_unpad.dtype,
-                           device=x_unpad.device)  # (Tq, D)
-        x_unpad = x_unpad + g * f_sa  # (Tq, D)
+        )
+        g = sa_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        x_unpad = x_unpad + g * f_sa
 
         # ----- FFN(MLP1) -----
         ffn_mod: ModulationTriplet = pram_v2_modulations["FFN"]
-
-        y2 = self.norm2(x_unpad)  # (Tq, D) (AMP에서 float32일 수 있음)
-        y2 = self._cast_to_block_compute_dtype(y2,
-                                               ref=x_unpad)  # (Tq, D) bf16로 복귀
-
-        ds = ffn_mod.delta_scale.to(dtype=y2.dtype, device=y2.device)  # (Tq, D)
-        sh = ffn_mod.shift.to(dtype=y2.dtype, device=y2.device)  # (Tq, D)
-        y_tilde = y2 * (1.0 + ds) + sh  # (Tq, D)
-
-        f_ffn = self.mlp1(y_tilde)  # (Tq, D)
-
-        g = ffn_mod.gate.to(dtype=x_unpad.dtype,
-                            device=x_unpad.device)  # (Tq, D)
-        x_unpad = x_unpad + g * f_ffn  # (Tq, D)
+        y2 = self.norm2(x_unpad)
+        y2 = self._cast_to_block_compute_dtype(y2, ref=x_unpad)
+        ds = ffn_mod.delta_scale.to(dtype=y2.dtype, device=y2.device)
+        sh = ffn_mod.shift.to(dtype=y2.dtype, device=y2.device)
+        y_tilde = y2 * (1.0 + ds) + sh
+        f_ffn = self.mlp1(y_tilde)
+        g = ffn_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        x_unpad = x_unpad + g * f_ffn
 
         # ----- CA -----
         ca_mod: ModulationTriplet = pram_v2_modulations["CA"]
-
-        y3 = self.norm3(x_unpad)  # (Tq, D)
-        y3 = self._cast_to_block_compute_dtype(y3, ref=x_unpad)  # (Tq, D)
-
-        ds = ca_mod.delta_scale.to(dtype=y3.dtype, device=y3.device)  # (Tq, D)
-        sh = ca_mod.shift.to(dtype=y3.dtype, device=y3.device)  # (Tq, D)
+        y3 = self.norm3(x_unpad)
+        y3 = self._cast_to_block_compute_dtype(y3, ref=x_unpad)
+        ds = ca_mod.delta_scale.to(dtype=y3.dtype, device=y3.device)
+        sh = ca_mod.shift.to(dtype=y3.dtype, device=y3.device)
         q_styled = y3 * (1.0 + ds) + sh  # (Tq, D)
+
+        # ✅ (추가) cross_q_bias_unpad를 Q 입력에 더하기
+        if cross_q_bias_unpad is not None:
+            if cross_q_bias_unpad.dim() != 2:
+                raise ValueError(
+                    f"cross_q_bias_unpad must be 2D (Tq,D). got {tuple(cross_q_bias_unpad.shape)}"
+                )
+            if tuple(cross_q_bias_unpad.shape) != tuple(q_styled.shape):
+                raise ValueError(
+                    "cross_q_bias_unpad shape mismatch. "
+                    f"expected={tuple(q_styled.shape)}, got={tuple(cross_q_bias_unpad.shape)}"
+                )
+            q_styled = q_styled + cross_q_bias_unpad.to(dtype=q_styled.dtype,
+                                                        device=q_styled.device)
 
         f_ca = self._cross_attn_flash_varlen_packed(
             q_unpad=q_styled,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
             kv_cache=cross_kv_cache,
-        )  # (Tq, D)
-
-        g = ca_mod.gate.to(dtype=x_unpad.dtype,
-                           device=x_unpad.device)  # (Tq, D)
-        x_unpad = x_unpad + g * f_ca  # (Tq, D)
+        )
+        g = ca_mod.gate.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        x_unpad = x_unpad + g * f_ca
 
         # ----- MLP2 -----
-        y4 = self.norm4(x_unpad)  # (Tq, D)
-        y4 = self._cast_to_block_compute_dtype(y4, ref=x_unpad)  # (Tq, D)
-
-        mlp2_out = self.mlp2(y4)  # (Tq, D)
-        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype,
-                                  device=x_unpad.device)  # ()
-        x_unpad = x_unpad + gate2 * mlp2_out  # (Tq, D)
+        y4 = self.norm4(x_unpad)
+        y4 = self._cast_to_block_compute_dtype(y4, ref=x_unpad)
+        mlp2_out = self.mlp2(y4)
+        gate2 = self.gate_mlp2.to(dtype=x_unpad.dtype, device=x_unpad.device)
+        x_unpad = x_unpad + gate2 * mlp2_out
 
         return x_unpad
 

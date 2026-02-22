@@ -2518,12 +2518,12 @@ class LaneFusionEncoder(nn.Module):
         # ✅ 토큰 단계 MixerBlock: 토큰 섞기는 유지, 특징 쪽 변환은 ratio로 축소
         self.blocks = nn.ModuleList([
             MixerBlock(
-                int(tokens_mlp_dim),
-                int(channels_mlp_dim),
-                float(drop_path_rate),
-                channels_mlp_ratio=float(mixer_channels_mlp_ratio),
+                int(tokens_mlp_dim), # 16
+                int(channels_mlp_dim), # 192
+                float(drop_path_rate), # 0.3
+                channels_mlp_ratio=float(mixer_channels_mlp_ratio), # 0.25
                 use_fallback=config.use_fallback,
-            ) for _ in range(depth)
+            ) for _ in range(depth) # 4
         ])
 
         self._hidden_out_dim: int = int(hidden_dim)

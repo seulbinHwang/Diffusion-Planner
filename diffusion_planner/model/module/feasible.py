@@ -1374,94 +1374,100 @@ class FeasibleProjector(nn.Module):
     # ----------------------------
     # [NEW] 시간축 전체 배치 중점 적분 (cumsum 기반)
     # ----------------------------
-    def _integrate_midpoint_batch(
-        self,
-        unnorm_near_current_state: torch.
-        Tensor,  # (B, Pnn, 4)  [x0, y0, cos0, sin0]
-        vx_b_seq: torch.Tensor,  # (B, Pnn, T)  바디 기준 x속도 시퀀스
-        vy_b_seq: torch.Tensor,  # (B, Pnn, T)  바디 기준 y속도 시퀀스
-        omega_seq: torch.Tensor,  # (B, Pnn, T)  요각속도 시퀀스
+
+    @staticmethod
+    def integrate_midpoint_batch(
+        unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)  [x0, y0, cos0, sin0]
+        vx_b_seq: torch.Tensor,  # (B, Pnn, T)
+        vy_b_seq: torch.Tensor,  # (B, Pnn, T)
+        omega_seq: torch.Tensor,  # (B, Pnn, T)
         dt: float,
         eps: float = 1e-6,
     ) -> Dict[str, torch.Tensor]:
-        """시간축 전체에 대해 '중점 적분'을 한 번에 수행한다.
+        """미래 control(바디 기준)을 midpoint 방식으로 적분해 미래 pose를 만든다.
 
-        - 각 구간 k 에 대해,
-          yaw_k 에서 시작해서 yaw_k + w_k*dt 까지 회전한다고 보고
-          중간 각(yaw_mid)을 이용해 세계 좌표 속도를 계산한다.
-        - 이 세계 좌표 속도를 dt만큼 계속 더해 가며 위치를 만든다.
-        - 모든 계산을 시간축에 대해 cumsum 으로 처리하므로,
-          python for 루프 없이 한 번에 연산한다.
+        Args:
+            unnorm_near_current_state: 현재 pose(실제 단위). shape: (B, Pnn, 4)
+            vx_b_seq: 바디 x속도 시퀀스(실제 단위). shape: (B, Pnn, T)
+            vy_b_seq: 바디 y속도 시퀀스(실제 단위). shape: (B, Pnn, T)
+            omega_seq: 요각속도 시퀀스(실제 단위). shape: (B, Pnn, T)
+            dt: 시간 간격(초).
+            eps: 수치 안정용 작은 값.
+
+        Returns:
+            Dict[str, torch.Tensor]:
+                - x_next, y_next, cos_next, sin_next: 각 (B, Pnn, T)
+                - vx_after, vy_after, omega_after: 입력 그대로 (B, Pnn, T)
         """
         B, Pnn, T = vx_b_seq.shape  # T = future_len
         device = vx_b_seq.device
         dtype = vx_b_seq.dtype
 
-        # 초기 위치/자세 (노드 0)
+        # 현재 pose
         x0 = unnorm_near_current_state[..., 0]  # (B,Pnn)
         y0 = unnorm_near_current_state[..., 1]  # (B,Pnn)
         cos0 = unnorm_near_current_state[..., 2]  # (B,Pnn)
         sin0 = unnorm_near_current_state[..., 3]  # (B,Pnn)
 
-        # yaw0 (라디안) 복원
         yaw0 = torch.atan2(sin0, cos0)  # (B,Pnn)
 
-        # 각속도 적분: Δθ_k = w_k * dt
-        dtheta_seq = omega_seq * dt  # (B,Pnn,T)
-
-        # 누적합: sum_{j<=k} Δθ_j
+        dtheta_seq = omega_seq * float(dt)  # (B,Pnn,T)
         dtheta_prefix = torch.cumsum(dtheta_seq, dim=2)  # (B,Pnn,T)
 
-        # 각 구간 시작 각도 yaw_k = yaw0 + sum_{j<k} Δθ_j  (exclusive cumsum)
         zero_pad = torch.zeros_like(dtheta_seq[..., :1])  # (B,Pnn,1)
-        dtheta_exclusive = torch.cat(
-            [zero_pad, dtheta_prefix[..., :-1]],
-            dim=2,
-        )  # (B,Pnn,T)
-        yaw_start = yaw0.unsqueeze(-1) + dtheta_exclusive  # (B,Pnn,T)
+        dtheta_exclusive = torch.cat([zero_pad, dtheta_prefix[..., :-1]], dim=2)  # (B,Pnn,T)
 
-        # 중점/종단 각도
+        yaw_start = yaw0.unsqueeze(-1) + dtheta_exclusive  # (B,Pnn,T)
         yaw_mid = yaw_start + 0.5 * dtheta_seq  # (B,Pnn,T)
         yaw_next = yaw_start + dtheta_seq  # (B,Pnn,T)
 
         cos_mid = torch.cos(yaw_mid)  # (B,Pnn,T)
         sin_mid = torch.sin(yaw_mid)  # (B,Pnn,T)
 
-        # 세계 기준 중점 속도
         vwx_mid = cos_mid * vx_b_seq - sin_mid * vy_b_seq  # (B,Pnn,T)
         vwy_mid = sin_mid * vx_b_seq + cos_mid * vy_b_seq  # (B,Pnn,T)
 
-        # dt 만큼 이동량
-        dx_seq = vwx_mid * dt  # (B,Pnn,T)
-        dy_seq = vwy_mid * dt  # (B,Pnn,T)
+        dx_seq = vwx_mid * float(dt)  # (B,Pnn,T)
+        dy_seq = vwy_mid * float(dt)  # (B,Pnn,T)
 
-        # 누적합으로 위치 만들기
-        x_cumsum = torch.cumsum(dx_seq, dim=2)  # (B,Pnn,T)
-        y_cumsum = torch.cumsum(dy_seq, dim=2)  # (B,Pnn,T)
+        x_next = x0.unsqueeze(-1) + torch.cumsum(dx_seq, dim=2)  # (B,Pnn,T)
+        y_next = y0.unsqueeze(-1) + torch.cumsum(dy_seq, dim=2)  # (B,Pnn,T)
 
-        x_next = x0.unsqueeze(-1) + x_cumsum  # (B,Pnn,T)
-        y_next = y0.unsqueeze(-1) + y_cumsum  # (B,Pnn,T)
-
-        # 최종 yaw(k+1) → cos/sin
         cos_next = torch.cos(yaw_next)  # (B,Pnn,T)
         sin_next = torch.sin(yaw_next)  # (B,Pnn,T)
 
-        # 수치 오차 보정용 정규화
-        norm_cs = torch.sqrt(cos_next * cos_next + sin_next * sin_next +
-                             eps)  # (B,Pnn,T)
+        norm_cs = torch.sqrt(cos_next * cos_next + sin_next * sin_next + float(eps))  # (B,Pnn,T)
         cos_next = cos_next / norm_cs
         sin_next = sin_next / norm_cs
 
-        key_to_all_states: Dict[str, torch.Tensor] = {
-            "x_next": x_next,  # (B,Pnn,T)
-            "y_next": y_next,  # (B,Pnn,T)
-            "cos_next": cos_next,  # (B,Pnn,T)
-            "sin_next": sin_next,  # (B,Pnn,T)
-            "vx_after": vx_b_seq,  # (B,Pnn,T)
-            "vy_after": vy_b_seq,  # (B,Pnn,T)
-            "omega_after": omega_seq,  # (B,Pnn,T)
+        return {
+            "x_next": x_next,
+            "y_next": y_next,
+            "cos_next": cos_next,
+            "sin_next": sin_next,
+            "vx_after": vx_b_seq,
+            "vy_after": vy_b_seq,
+            "omega_after": omega_seq,
         }
-        return key_to_all_states
+
+    def _integrate_midpoint_batch(
+        self,
+        unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+        vx_b_seq: torch.Tensor,  # (B, Pnn, T)
+        vy_b_seq: torch.Tensor,  # (B, Pnn, T)
+        omega_seq: torch.Tensor,  # (B, Pnn, T)
+        dt: float,
+        eps: float = 1e-6,
+    ) -> Dict[str, torch.Tensor]:
+        """기존 코드 호환용 래퍼(내부 호출은 유지, 외부 재사용은 static 메서드 사용)."""
+        return FeasibleProjector.integrate_midpoint_batch(
+            unnorm_near_current_state=unnorm_near_current_state,
+            vx_b_seq=vx_b_seq,
+            vy_b_seq=vy_b_seq,
+            omega_seq=omega_seq,
+            dt=dt,
+            eps=eps,
+        )
 
     def _sg_build_design_matrix_and_gram(
         self,

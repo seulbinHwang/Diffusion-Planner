@@ -931,17 +931,23 @@ def _compute_dpm_loss(
         raise ValueError(f"Unknown model type: {model_type}")
 
     # ----- (핵심) 손실 계산은 항상 float32로 통일 -----
+    # loss.py 안 _compute_dpm_loss 내부에서
+    C = diffusion_output.shape[-1]  # pose_based=False면 3
+    if C == 3:
+        yaw_w = float(getattr(args, "yaw_rate_loss_weight", 2.0))
+        w = diffusion_output.new_tensor([1.0, 1.0, yaw_w]).view(1, 1, 1, 3)
+    else:
+        w = diffusion_output.new_ones((1, 1, 1, C))
     diff_f32: torch.Tensor = diffusion_output.float() - target.float()  # (B,P,T,C)
 
     if use_huber:
-        abs_err: torch.Tensor = diff_f32.abs()                         # (B,P,T,C)
-        quad: torch.Tensor = 0.5 * diff_f32.pow(2)                     # (B,P,T,C)
-        lin: torch.Tensor = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA) # (B,P,T,C)
-        huber: torch.Tensor = torch.where(abs_err <= HUBER_DELTA, quad, lin)  # (B,P,T,C)
-        dpm_loss: torch.Tensor = huber.sum(dim=-1)                     # (B,P,T) float32
+        abs_err = diff_f32.abs()
+        quad = 0.5 * diff_f32.pow(2)
+        lin = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA)
+        huber_elem = torch.where(abs_err <= HUBER_DELTA, quad, lin)  # (B,P,T,C)
+        dpm_loss = (huber_elem * w.float()).sum(dim=-1)  # (B,P,T)
     else:
-        dpm_loss = diff_f32.pow(2).sum(dim=-1)                         # (B,P,T) float32
-
+        dpm_loss = (diff_f32.pow(2) * w.float()).sum(dim=-1)  # (B,P,T)
     return dpm_loss
 
 
@@ -973,6 +979,7 @@ def _aggregate_weighted_loss(
 
 
 def _compute_integration_and_constraint_losses(
+args,
     decoder_output: Dict[str, torch.Tensor],
     norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
     target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
@@ -1017,10 +1024,11 @@ def _compute_integration_and_constraint_losses(
                                                 1:, :]  # (B, (1+)Pnn, T, 4)
 
         # per_step: (B,(1+)Pnn,T) float32
-        diff = (
-            integrated_trajectory -
-            norm_target_future_gt_4_dim).float()  # (B, (1+)Pnn, future_len, 4)
-        per_step = (diff**2).sum(dim=-1)
+        yaw_pose_w = float(getattr(args, "integration_yaw_weight", 2.0))
+        w_pose = integrated_trajectory.new_tensor(
+            [1.0, 1.0, yaw_pose_w, yaw_pose_w]).view(1, 1, 1, 4)
+        diff = (integrated_trajectory - norm_target_future_gt_4_dim).float()  # (B,P,T,4)
+        per_step = (diff.pow(2) * w_pose.float()).sum(dim=-1)  # (B,P,T)
 
         w_f = w_t.float()
         denom = (valid_low_f * w_f).sum().clamp_min(1e-6)
@@ -1606,10 +1614,11 @@ def diffusion_loss_func(
     integrated_trajectory: (B, (1+)Pnn, T, 4) 또는 None
     control_constraint_diff: (B, (1+)Pnn, T, 3) 또는 None
     
-=        """
+    """
     # norm_target_future_gt_4_dim  # (B, (1+)Pnn, future_len, 4)
     (integration_loss_val, constraint_loss_val, integrated_trajectory,
      control_constraint_diff) = _compute_integration_and_constraint_losses(
+        args,
          decoder_output=decoder_output,
          norm_target_future_gt_4_dim=
          norm_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
