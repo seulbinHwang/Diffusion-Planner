@@ -2867,7 +2867,8 @@ def model_training(
         allow_val_change=allow_val_change,
     )
     core_model = _unwrap_to_core_torch_module(diffusion_planner)
-    print_param_report(core_model)
+    if int(global_rank) == 0:
+        print_param_report(core_model)
     best_loss = _run_training_loop(
         args=args,
         diffusion_planner=diffusion_planner,
