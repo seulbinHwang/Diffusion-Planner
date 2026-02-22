@@ -2882,7 +2882,7 @@ class DiT(nn.Module):
                 tokens_mlp_dim=int(self._future_len), # 80
                 channels_mlp_dim=int(hidden_dim), # 192
                 drop_path_rate=float(temporal_drop),
-                channels_mlp_ratio=0.5,
+                channels_mlp_ratio=0.4,
                 use_fallback=use_fallback,
             ) for _ in range(temporal_depth)
         ])
