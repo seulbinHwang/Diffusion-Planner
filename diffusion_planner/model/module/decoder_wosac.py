@@ -2875,7 +2875,7 @@ class DiT(nn.Module):
         # ✅ (추가) Temporal Residual Head 시간축 다운샘플 stride
         # - 예: stride=4면 T=80 -> T_ds=20에서만 temporal_mixer를 돌림
         self._temporal_residual_stride: int = int(
-            getattr(self.config, "temporal_residual_stride", 4)
+            getattr(self.config, "temporal_residual_stride", 5)
         )
         self._temporal_residual_stride = int(
             max(1, min(self._temporal_residual_stride, int(self._future_len)))
