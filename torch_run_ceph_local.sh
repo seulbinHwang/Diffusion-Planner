@@ -105,25 +105,25 @@ export DP_ENABLE_CPU_MONITOR=0
 
 ### ---- 학습은 로컬 데이터로 ----
 "$RUN_PYTHON_PATH" "${PY_ARGS[@]}" -m torch.distributed.run \
-  --nnodes 1 --nproc-per-node 1 --standalone \
+  --nnodes 1 --nproc-per-node 6 --standalone \
   "${TORCHRUN_LOG_ARGS[@]}" \
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
     --name "w_integ_loss_thres_new_model_yaw_loss_weight_2" \
-    --batch_size 256 \
+    --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --pose_based False \
-    --profile_feasible True \
+    --profile_feasible False \
     --use_feasible True \
     --use_feasible_dl False \
     --use_feasible_filter False \
     --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
-    --num_workers 4 \
+    --num_workers 3 \
     --max_grad_norm 1.0 \
-    --prefetch_factor 4 \
+    --prefetch_factor 8 \
     --feasible_learn_noise_thresh 1.0 \
     --p_sat 0.25 \
     --w_dir 1.0 \
