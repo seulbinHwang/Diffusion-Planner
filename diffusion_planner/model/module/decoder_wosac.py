@@ -2,7 +2,7 @@ from functools import partial
 from typing import Callable
 import torch.nn as nn
 from timm.models.layers import Mlp
-from timm.layers import DropPath
+import torch.nn.functional as F
 from typing import Optional, Dict, Tuple, Any
 from flash_attn.bert_padding import unpad_input, pad_input
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
@@ -2858,16 +2858,32 @@ class DiT(nn.Module):
 
         # -------------------------------------------------
         # (개선 3) Temporal Residual Head: Hr(병목 폭)로 계산
+        #  + (추가) 시간축 다운샘플(stride)로 T -> T_ds에서만 계산
         # -------------------------------------------------
         # config.temporal_residual_hidden_dim이 있으면 그 값 사용, 없으면 기본 128
         temporal_residual_hidden_dim: int = int(
-            getattr(self.config, "temporal_residual_hidden_dim", int(new_hidden_dim))
+            getattr(self.config, "temporal_residual_hidden_dim",
+                    int(new_hidden_dim))
         )
         temporal_residual_hidden_dim = 96
         temporal_residual_hidden_dim = int(
             max(32, min(temporal_residual_hidden_dim, int(hidden_dim)))
         )
-        self._temporal_residual_hidden_dim: int = int(temporal_residual_hidden_dim)
+        self._temporal_residual_hidden_dim: int = int(
+            temporal_residual_hidden_dim)
+
+        # ✅ (추가) Temporal Residual Head 시간축 다운샘플 stride
+        # - 예: stride=4면 T=80 -> T_ds=20에서만 temporal_mixer를 돌림
+        self._temporal_residual_stride: int = int(
+            getattr(self.config, "temporal_residual_stride", 4)
+        )
+        self._temporal_residual_stride = int(
+            max(1, min(self._temporal_residual_stride, int(self._future_len)))
+        )
+        self._temporal_residual_future_len_ds: int = int(
+            (
+                        int(self._future_len) + self._temporal_residual_stride - 1) // self._temporal_residual_stride
+        )  # ceil(T/stride)
 
         # StepEmbed0: (step_dim=6/5) -> Hr (마지막 Linear 0-init)
         self.step_embed0 = self._build_zero_init_mlp(
@@ -2883,15 +2899,17 @@ class DiT(nn.Module):
             out_features=int(self._temporal_residual_hidden_dim),
         )
 
-        # TemporalMixer: (N_active, T, Hr)에서 T축만 섞기 (MixerBlock 재사용)
+        # TemporalMixer: (N_active, T_ds, Hr)에서 시간축만 섞기 (MixerBlock 재사용)
         temporal_depth = int(getattr(self.config, "temporal_mixer_depth", 1))
         temporal_depth = int(max(1, min(temporal_depth, 4)))
-        temporal_drop = float(getattr(self.config, "encoder_drop_path_rate", 0.3))
+        temporal_drop = float(
+            getattr(self.config, "encoder_drop_path_rate", 0.3))
         use_fallback = bool(getattr(self.config, "use_fallback", True))
 
         self.temporal_mixer = nn.Sequential(*[
             MixerBlock(
-                tokens_mlp_dim=int(self._future_len),                 # T
+                tokens_mlp_dim=int(self._temporal_residual_future_len_ds),
+                # ✅ T_ds
                 channels_mlp_dim=int(self._temporal_residual_hidden_dim),  # Hr
                 drop_path_rate=float(temporal_drop),
                 channels_mlp_ratio=0.5,
@@ -2900,13 +2918,114 @@ class DiT(nn.Module):
         ])
 
         # CtxProj0: (B,P,H) -> (B,P,Hr) (0-init)
-        self.ctx_proj0 = nn.Linear(int(hidden_dim), int(self._temporal_residual_hidden_dim), bias=True)
+        self.ctx_proj0 = nn.Linear(int(hidden_dim),
+                                   int(self._temporal_residual_hidden_dim),
+                                   bias=True)
         self._zero_init_linear_(self.ctx_proj0)
 
         # DeltaHead0: Hr -> 4(pose) or 3(control) (0-init)
         delta_out_dim = 4 if bool(self.config.pose_based) else 3
-        self.delta_head0 = nn.Linear(int(self._temporal_residual_hidden_dim), int(delta_out_dim), bias=True)
+        self.delta_head0 = nn.Linear(int(self._temporal_residual_hidden_dim),
+                                     int(delta_out_dim), bias=True)
         self._zero_init_linear_(self.delta_head0)
+
+    @staticmethod
+    def _downsample_time_mean(
+            x_ntc: torch.Tensor,  # (N, T, C)
+            valid_nt: torch.Tensor,  # (N, T) bool or 0/1
+            stride: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """시간축을 stride 단위로 묶어 대표값(유효 칸 가중 평균)으로 줄입니다.
+
+        동작:
+            - 유효(valid_nt=True)인 칸만 평균에 포함합니다.
+            - 한 묶음에서 유효 칸이 0개면 출력은 0으로 둡니다.
+            - 출력 valid_ds는 묶음 안에 유효 칸이 하나라도 있으면 True입니다.
+
+        Args:
+            x_ntc (torch.Tensor): 입력 값. shape: (N, T, C)
+            valid_nt (torch.Tensor): 유효 마스크. shape: (N, T)
+            stride (int): 묶음 크기. 1 이상.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                x_ds: 다운샘플 값. shape: (N, T_ds, C), T_ds=ceil(T/stride)
+                valid_ds: 다운샘플 유효 마스크. shape: (N, T_ds) bool
+        """
+        if x_ntc.dim() != 3:
+            raise ValueError(f"x_ntc must be (N,T,C). got {tuple(x_ntc.shape)}")
+        if valid_nt.dim() != 2:
+            raise ValueError(
+                f"valid_nt must be (N,T). got {tuple(valid_nt.shape)}")
+
+        N, T, C = x_ntc.shape
+        s = int(max(1, stride))
+        if T == 0:
+            return x_ntc, valid_nt.to(torch.bool)
+
+        if valid_nt.dtype != torch.bool:
+            valid_nt = valid_nt > 0.5
+        valid_nt = valid_nt.to(device=x_ntc.device)
+
+        T_ds = int((T + s - 1) // s)  # ceil
+        pad_len = int(T_ds * s - T)
+
+        if pad_len > 0:
+            x_pad = x_ntc.new_zeros((N, pad_len, C))
+            v_pad = torch.zeros((N, pad_len), device=x_ntc.device,
+                                dtype=torch.bool)
+            x_full = torch.cat([x_ntc, x_pad], dim=1)  # (N, T_ds*s, C)
+            v_full = torch.cat([valid_nt, v_pad], dim=1)  # (N, T_ds*s)
+        else:
+            x_full = x_ntc
+            v_full = valid_nt
+
+        x_w = x_full.reshape(N, T_ds, s, C)  # (N, T_ds, s, C)
+        v_w = v_full.reshape(N, T_ds, s)  # (N, T_ds, s)
+
+        v_f = v_w.to(dtype=x_w.dtype).unsqueeze(-1)  # (N, T_ds, s, 1)
+        sum_v = v_f.sum(dim=2)  # (N, T_ds, 1)
+        sum_x = (x_w * v_f).sum(dim=2)  # (N, T_ds, C)
+
+        denom = sum_v.clamp_min(1.0)
+        x_ds = sum_x / denom  # (N, T_ds, C)
+        valid_ds = v_w.any(dim=2)  # (N, T_ds)
+
+        return x_ds, valid_ds
+
+    @staticmethod
+    def _upsample_time_linear(
+            x_ntc: torch.Tensor,  # (N, T_in, C)
+            out_len: int,
+    ) -> torch.Tensor:
+        """시간축을 선형 보간으로 out_len까지 늘립니다.
+
+        Args:
+            x_ntc (torch.Tensor): 입력 값. shape: (N, T_in, C)
+            out_len (int): 목표 길이 T_out
+
+        Returns:
+            torch.Tensor: 업샘플 값. shape: (N, T_out, C)
+        """
+        if x_ntc.dim() != 3:
+            raise ValueError(f"x_ntc must be (N,T,C). got {tuple(x_ntc.shape)}")
+        N, T_in, C = x_ntc.shape
+        T_out = int(out_len)
+        if T_out <= 0:
+            return x_ntc.new_zeros((N, 0, C))
+
+        if T_in == T_out:
+            return x_ntc
+
+        x_ct = x_ntc.permute(0, 2, 1)  # (N, C, T_in)
+
+        if T_in <= 1:
+            x_up = x_ct.expand(N, C, T_out)
+        else:
+            x_up = F.interpolate(x_ct, size=T_out, mode="linear",
+                                 align_corners=False)
+
+        return x_up.permute(0, 2, 1)  # (N, T_out, C)
 
     def _get_time_embedding(self, diffusion_time: torch.Tensor,
                             ref: torch.Tensor) -> torch.Tensor:
@@ -3341,87 +3460,122 @@ class DiT(nn.Module):
         return touch
 
     def _compute_temporal_residual_delta(
-        self,
-        *,
-        step_fut: torch.Tensor,         # (B,P,T,step_dim)
-        pose_roll_norm: torch.Tensor,   # (B,P,T,4)
-        pose_cur_norm: torch.Tensor,    # (B,P,4)
-        step_valid_fut: torch.Tensor,   # (B,P,T) bool
-        x_hidden: torch.Tensor,         # (B,P,H)
-        agent_valid: torch.Tensor,      # (B,P) bool
+            self,
+            *,
+            step_fut: torch.Tensor,  # (B,P,T,step_dim)
+            pose_roll_norm: torch.Tensor,  # (B,P,T,4)
+            pose_cur_norm: torch.Tensor,  # (B,P,4)
+            step_valid_fut: torch.Tensor,  # (B,P,T) bool
+            x_hidden: torch.Tensor,  # (B,P,H)
+            agent_valid: torch.Tensor,  # (B,P) bool
     ) -> torch.Tensor:
         """미래 T 구간에 더할 delta를 (B,P,T,data_dim)로 만듭니다.
-        (개선 2) 패딩 에이전트는 아예 계산하지 않습니다.
+
+        변경점(핵심):
+            - 시간축 T 전체에서 계산하지 않고,
+              stride로 줄인 T_ds에서만 temporal_mixer를 돌립니다.
+            - delta_ds를 선형 보간으로 다시 T로 늘린 뒤,
+              기존처럼 미래 T 구간에 더합니다.
 
         Args:
-            step_fut (torch.Tensor): 미래 step 입력.
-                shape: (B, P, T, step_dim)
-            pose_roll_norm (torch.Tensor): 미래 pose 힌트(대략 위치/방향).
-                shape: (B, P, T, 4)
-            pose_cur_norm (torch.Tensor): 현재 pose(정규화).
-                shape: (B, P, 4)
-            step_valid_fut (torch.Tensor): 미래 시점 유효 마스크.
-                shape: (B, P, T)  dtype: bool
-            x_hidden (torch.Tensor): DiT 본체 hidden.
-                shape: (B, P, H)
-            agent_valid (torch.Tensor): 현재 프레임 기준 유효 에이전트 마스크.
-                shape: (B, P)  dtype: bool
+            step_fut: (B,P,T,step_dim)
+            pose_roll_norm: (B,P,T,4)
+            pose_cur_norm: (B,P,4)
+            step_valid_fut: (B,P,T) bool
+            x_hidden: (B,P,H)
+            agent_valid: (B,P) bool
 
         Returns:
-            torch.Tensor: delta.
-                shape: (B, P, T, data_dim)
-                - 패딩 에이전트 위치는 항상 0입니다.
+            torch.Tensor: (B,P,T,data_dim)  (무효 에이전트/무효 시점은 0)
         """
         B, P, T, step_dim = step_fut.shape
         data_dim = int(self._data_dim)
 
-        active_idx = self._get_flat_active_agent_indices(agent_valid)  # (N_active,)
+        active_idx = self._get_flat_active_agent_indices(
+            agent_valid)  # (N_active,)
         if int(active_idx.numel()) == 0:
-            # 유효 에이전트가 하나도 없으면 전부 0 (DDP 안전 touch 포함)
             delta_zero = x_hidden.new_zeros((B, P, T, data_dim))
-            touch = self._ddp_touch_temporal_residual_params(device=delta_zero.device, dtype=delta_zero.dtype)
+            touch = self._ddp_touch_temporal_residual_params(
+                device=delta_zero.device, dtype=delta_zero.dtype)
             return delta_zero + touch
 
-        # -------------------------
-        # (1) (B,P,...) -> (B*P,...)로 펼친 뒤, 유효 에이전트만 gather
-        # -------------------------
-        flat_step = step_fut.reshape(B * P, T, step_dim)               # (B*P,T,step_dim)
-        flat_pose_roll = pose_roll_norm.reshape(B * P, T, 4)           # (B*P,T,4)
-        flat_pose_cur = pose_cur_norm.reshape(B * P, 4)                # (B*P,4)
-        flat_step_valid = step_valid_fut.reshape(B * P, T)             # (B*P,T)
-        flat_x_hidden = x_hidden.reshape(B * P, int(x_hidden.shape[-1]))  # (B*P,H)
+        # (B,P,...) -> (B*P,...)로 펼친 뒤, 유효 에이전트만 gather
+        flat_step = step_fut.reshape(B * P, T, step_dim)  # (B*P,T,step_dim)
+        flat_pose_roll = pose_roll_norm.reshape(B * P, T, 4)  # (B*P,T,4)
+        flat_pose_cur = pose_cur_norm.reshape(B * P, 4)  # (B*P,4)
+        flat_step_valid = step_valid_fut.reshape(B * P, T)  # (B*P,T)
+        flat_x_hidden = x_hidden.reshape(B * P,
+                                         int(x_hidden.shape[-1]))  # (B*P,H)
 
-        step_a = flat_step.index_select(0, active_idx)                 # (N,T,step_dim)
-        pose_roll_a = flat_pose_roll.index_select(0, active_idx)       # (N,T,4)
-        pose_cur_a = flat_pose_cur.index_select(0, active_idx)         # (N,4)
-        step_valid_a = flat_step_valid.index_select(0, active_idx)     # (N,T)
-        x_hidden_a = flat_x_hidden.index_select(0, active_idx)         # (N,H)
+        step_a = flat_step.index_select(0, active_idx)  # (N,T,step_dim)
+        pose_roll_a = flat_pose_roll.index_select(0, active_idx)  # (N,T,4)
+        pose_cur_a = flat_pose_cur.index_select(0, active_idx)  # (N,4)
+        step_valid_a = flat_step_valid.index_select(0, active_idx)  # (N,T)
+        x_hidden_a = flat_x_hidden.index_select(0, active_idx)  # (N,H)
+
+        if step_valid_a.dtype != torch.bool:
+            step_valid_a = step_valid_a > 0.5
+
+        # -------------------------
+        # (A) 시간축 다운샘플: T -> T_ds
+        # -------------------------
+        stride = int(getattr(self, "_temporal_residual_stride", 1))
+        stride = int(max(1, stride))
+
+        if stride > 1 and int(T) > 1:
+            step_ds, valid_ds = self._downsample_time_mean(step_a, step_valid_a,
+                                                           stride=stride)  # (N,T_ds,step_dim), (N,T_ds)
+            pose_roll_ds, _ = self._downsample_time_mean(pose_roll_a,
+                                                         step_valid_a,
+                                                         stride=stride)  # (N,T_ds,4)
+            pose_roll_ds = self._normalize_pose_4d_cos_sin(
+                pose_roll_ds)  # cos/sin 정리
+        else:
+            step_ds = step_a
+            pose_roll_ds = pose_roll_a
+            valid_ds = step_valid_a
 
         # dtype/device 정렬
-        step_in = _cast_like(step_a, x_hidden_a)  # (N,T,step_dim)
+        step_in = _cast_like(step_ds, x_hidden_a)  # (N,T_ds,step_dim)
 
         # -------------------------
-        # (2) temporal branch (N_active, T, Hr)만 계산
+        # (B) temporal branch: (N, T_ds, Hr)에서만 계산
         # -------------------------
-        h_time = self.step_embed0(step_in)  # (N,T,Hr)
+        h_time = self.step_embed0(step_in)  # (N,T_ds,Hr)
 
-        dxy_t = pose_roll_a[..., 0:2] - pose_cur_a[:, None, 0:2]  # (N,T,2)
-        dir_t = pose_roll_a[..., 2:4]                              # (N,T,2)
-        pose_hint = torch.cat([dxy_t, dir_t], dim=-1)              # (N,T,4)
+        dxy_t = pose_roll_ds[..., 0:2] - pose_cur_a[:, None, 0:2]  # (N,T_ds,2)
+        dir_t = pose_roll_ds[..., 2:4]  # (N,T_ds,2)
+        pose_hint = torch.cat([dxy_t, dir_t], dim=-1)  # (N,T_ds,4)
 
-        h_time = h_time + self.pose_hint_embed0(_cast_like(pose_hint, h_time))  # (N,T,Hr)
+        h_time = h_time + self.pose_hint_embed0(
+            _cast_like(pose_hint, h_time))  # (N,T_ds,Hr)
 
-        h_mix = self.temporal_mixer(h_time)  # (N,T,Hr)
+        h_mix = self.temporal_mixer(h_time)  # (N,T_ds,Hr)
 
         ctx = self.ctx_proj0(x_hidden_a)  # (N,Hr)
         ctx = _cast_like(ctx, h_mix)
-        h_mix = h_mix + ctx[:, None, :]   # (N,T,Hr)
+        h_mix = h_mix + ctx[:, None, :]  # (N,T_ds,Hr)
 
-        delta_a = self.delta_head0(h_mix)  # (N,T,data_dim)
-        delta_a = delta_a * step_valid_a.to(dtype=delta_a.dtype, device=delta_a.device).unsqueeze(-1)
+        delta_ds = self.delta_head0(h_mix)  # (N,T_ds,data_dim)
+        delta_ds = delta_ds * valid_ds.to(dtype=delta_ds.dtype,
+                                          device=delta_ds.device).unsqueeze(-1)
 
         # -------------------------
-        # (3) (N_active,...) -> (B,P,...) 자리로 scatter
+        # (C) 업샘플: T_ds -> T (선형 보간)
+        # -------------------------
+        if delta_ds.shape[1] != int(T):
+            delta_a = self._upsample_time_linear(delta_ds, out_len=int(
+                T))  # (N,T,data_dim)
+        else:
+            delta_a = delta_ds
+
+        # 최종 안전: 원래 step_valid 기준으로 무효 시점은 0
+        delta_a = delta_a * step_valid_a.to(dtype=delta_a.dtype,
+                                            device=delta_a.device).unsqueeze(
+            -1)  # (N,T,data_dim)
+
+        # -------------------------
+        # (D) (N_active,...) -> (B,P,...) 자리로 scatter
         # -------------------------
         delta_flat = delta_a.new_zeros((B * P, T, data_dim))  # (B*P,T,data_dim)
         delta_flat = delta_flat.index_copy(0, active_idx, delta_a)
