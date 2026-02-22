@@ -2873,7 +2873,7 @@ class DiT(nn.Module):
         )
 
         # TemporalMixer: (B*P, T, H)에서 T축만 섞기 (MixerBlock 재사용)
-        temporal_depth = int(getattr(self.config, "temporal_mixer_depth", 2))
+        temporal_depth = int(getattr(self.config, "temporal_mixer_depth", 1))
         temporal_depth = int(max(1, min(temporal_depth, 4)))
         temporal_drop = float(getattr(self.config, "encoder_drop_path_rate", 0.3))
         use_fallback = bool(getattr(self.config, "use_fallback", True))
