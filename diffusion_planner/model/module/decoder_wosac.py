@@ -2775,7 +2775,7 @@ class DiT(nn.Module):
         # S/E/R를 저차원으로 정리(RMSNorm 포함) → 쌍곱(SE/ER/RS) → 혼합 MLP → base 모듈레이션(Δs,b,logit g)을 산출.
         self.pram_v2_composer = PRAMV2Composer(
             hidden_dim=hidden_dim,
-            adapter_hidden_dim=128,
+            adapter_hidden_dim=96,
             composed_hidden_dim=128,
             activation="gelu",
             gate_init_bias=-3.0,
@@ -2801,10 +2801,10 @@ class DiT(nn.Module):
         self.pram_v2_final_norm = nn.LayerNorm(hidden_dim)
         self.pram_v2_out_proj = nn.Sequential(
             # nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_dim, hidden_dim * 4, bias=True),
+            nn.Linear(hidden_dim, hidden_dim * 3, bias=True),
             nn.GELU(approximate="tanh"),
             # nn.LayerNorm(hidden_size * 4),
-            nn.Linear(hidden_dim * 4, output_dim, bias=True))
+            nn.Linear(hidden_dim * 3, output_dim, bias=True))
         nn.init.zeros_(
             self.pram_v2_out_proj[-1].weight)  # pram_v2_out_proj의 마지막 Linear
         nn.init.zeros_(self.pram_v2_out_proj[-1].bias)

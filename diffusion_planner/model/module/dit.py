@@ -504,9 +504,9 @@ class TimestepEmbedder(nn.Module):
     ) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.Linear(frequency_embedding_size, hidden_size//2, bias=True),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.Linear(hidden_size//2, hidden_size, bias=True),
         )
         self.frequency_embedding_size = int(frequency_embedding_size)
         self.max_period = float(max_period)
