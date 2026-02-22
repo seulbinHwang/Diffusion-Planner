@@ -2855,6 +2855,15 @@ class DiT(nn.Module):
         # QBiasProj0: H -> H (0-init)
         self.q_bias_proj0 = nn.Linear(int(hidden_dim), int(hidden_dim), bias=True)
         self._zero_init_linear_(self.q_bias_proj0)
+        # ===== (A) q_bias_adapter 추가: anchor_sum(B,P,H) -> (B,P,H) =====
+        # q_bias_proj0 아래에 추가
+        q_bias_adapter_hidden_dim: int = 128  # 고정(요청 스펙)
+        self.q_bias_adapter = self._build_zero_init_mlp(
+            in_features=int(hidden_dim),
+            hidden_features=int(q_bias_adapter_hidden_dim),
+            out_features=int(hidden_dim),
+            zero_init_last=True,  # 마지막 Linear 0-init
+        )
 
         # -------------------------------------------------
         # (개선 3) Temporal Residual Head: Hr(병목 폭)로 계산
@@ -2871,7 +2880,14 @@ class DiT(nn.Module):
         )
         self._temporal_residual_hidden_dim: int = int(
             temporal_residual_hidden_dim)
-
+        # ===== (B) temporal_ctx_film 추가: (B,P,H) -> (B,P,2*Hr) =====
+        # self._temporal_residual_hidden_dim 결정(=Hr) 된 직후에 추가
+        self.temporal_ctx_film = nn.Linear(
+            int(hidden_dim),
+            int(2 * self._temporal_residual_hidden_dim),  # 2*Hr
+            bias=True,
+        )
+        self._zero_init_linear_(self.temporal_ctx_film)  # 0-init
         # ✅ (추가) Temporal Residual Head 시간축 다운샘플 stride
         # - 예: stride=4면 T=80 -> T_ds=20에서만 temporal_mixer를 돌림
         self._temporal_residual_stride: int = int(
@@ -3394,22 +3410,33 @@ class DiT(nn.Module):
         return pose_roll_norm
 
     def _compute_cross_q_bias_full(
-        self,
-        *,
-        pose_roll_norm: torch.Tensor,   # (B,P,T,4)
-        t_fut: torch.Tensor,            # (B,P,T)
-        step_valid_fut: torch.Tensor,   # (B,P,T) bool
-        pose_cur_norm: torch.Tensor,    # (B,P,4)
-        agent_valid: torch.Tensor,      # (B,P) bool
+            self,
+            *,
+            pose_roll_norm: torch.Tensor,  # (B,P,T,4)
+            t_fut: torch.Tensor,  # (B,P,T)
+            step_valid_fut: torch.Tensor,  # (B,P,T) bool
+            pose_cur_norm: torch.Tensor,  # (B,P,4)
+            agent_valid: torch.Tensor,  # (B,P) bool
     ) -> torch.Tensor:
         """Cross-Attn Q에 더할 q_bias를 (B,P,H)로 만듭니다."""
         B, P, T, _ = pose_roll_norm.shape
         H = int(self.q_bias_proj0.out_features)
 
         K = int(self._q_bias_anchor_k)
-        idx = self._build_anchor_indices(future_len=T, anchor_k=K, device=pose_roll_norm.device)  # (K,)
+        idx = self._build_anchor_indices(
+            future_len=T, anchor_k=K, device=pose_roll_norm.device
+        )  # (K,)
         if int(idx.numel()) == 0:
-            return pose_roll_norm.new_zeros((B, P, H))
+            # 안전: 이 경우는 거의 없지만, DDP에서 unused를 피하려면 파라미터를 0배로 한 번 터치
+            touch = torch.zeros((), device=pose_roll_norm.device,
+                                dtype=pose_roll_norm.dtype)
+            for m in [self.anchor_mlp, self.q_bias_proj0, self.q_bias_adapter]:
+                for p in m.parameters():
+                    if p is None or (not p.requires_grad) or (p.numel() == 0):
+                        continue
+                    touch = touch + (p.view(-1)[0].to(device=touch.device,
+                                                      dtype=touch.dtype) * 0.0)
+            return pose_roll_norm.new_zeros((B, P, H)) + touch
 
         pose_a = pose_roll_norm.index_select(2, idx)  # (B,P,K,4)
         t_a = t_fut.index_select(2, idx)  # (B,P,K)
@@ -3419,7 +3446,11 @@ class DiT(nn.Module):
         dir_a = pose_a[..., 2:4]  # (B,P,K,2)
 
         if T <= 1:
-            tau_vec = torch.zeros((int(idx.numel()),), device=pose_roll_norm.device, dtype=pose_roll_norm.dtype)
+            tau_vec = torch.zeros(
+                (int(idx.numel()),),
+                device=pose_roll_norm.device,
+                dtype=pose_roll_norm.dtype,
+            )
         else:
             tau_vec = idx.to(dtype=pose_roll_norm.dtype) / float(T - 1)  # (K,)
         tau = tau_vec.view(1, 1, -1, 1).expand(B, P, -1, 1)  # (B,P,K,1)
@@ -3429,9 +3460,14 @@ class DiT(nn.Module):
         e = self.anchor_mlp(_cast_like(feat_a, pose_roll_norm))  # (B,P,K,H)
 
         w = (1.0 - t_a).clamp(0.0, 1.0) * v_a.to(dtype=e.dtype)  # (B,P,K)
-        anchor_sum = (w.unsqueeze(-1) * e).sum(dim=2) / float(K + 1e-6)  # (B,P,H)
+        anchor_sum = (w.unsqueeze(-1) * e).sum(dim=2) / float(
+            K + 1e-6)  # (B,P,H)
 
-        q_bias_full = self.q_bias_proj0(anchor_sum)  # (B,P,H)
+        # ✅ 변경점: q_bias_proj0 + q_bias_adapter
+        q_bias_base = self.q_bias_proj0(anchor_sum)  # (B,P,H)
+        q_bias_adapt = self.q_bias_adapter(anchor_sum)  # (B,P,H)
+        q_bias_full = q_bias_base + q_bias_adapt  # (B,P,H)
+
         q_bias_full = q_bias_full.masked_fill(~agent_valid.unsqueeze(-1), 0.0)
         return q_bias_full
 
@@ -3477,27 +3513,27 @@ class DiT(nn.Module):
         return active_idx
 
     def _ddp_touch_temporal_residual_params(
-        self,
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
+            self,
+            *,
+            device: torch.device,
+            dtype: torch.dtype,
     ) -> torch.Tensor:
-        """이번 배치에서 temporal residual이 통째로 스킵될 때, DDP unused 파라미터를 피하기 위한 0 스칼라를 만듭니다.
-
-        Args:
-            device (torch.device): 결과 스칼라 device
-            dtype (torch.dtype): 결과 스칼라 dtype
-
-        Returns:
-            torch.Tensor: shape=(), 값은 0.0
-        """
+        """이번 배치에서 temporal residual이 통째로 스킵될 때, DDP unused 파라미터를 피하기 위한 0 스칼라를 만듭니다."""
         touch = torch.zeros((), device=device, dtype=dtype)
-        modules = [self.step_embed0, self.pose_hint_embed0, self.temporal_mixer, self.ctx_proj0, self.delta_head0]
+        modules = [
+            self.step_embed0,
+            self.pose_hint_embed0,
+            self.temporal_mixer,
+            self.ctx_proj0,
+            self.temporal_ctx_film,  # ✅ 추가
+            self.delta_head0,
+        ]
         for m in modules:
             for p in m.parameters():
                 if p is None or (not p.requires_grad) or (p.numel() == 0):
                     continue
-                touch = touch + (p.view(-1)[0].to(device=device, dtype=dtype) * 0.0)
+                touch = touch + (
+                            p.view(-1)[0].to(device=device, dtype=dtype) * 0.0)
         return touch
 
     def _compute_temporal_residual_delta(
@@ -3596,7 +3632,13 @@ class DiT(nn.Module):
         ctx = self.ctx_proj0(x_hidden_a)  # (N,Hr)
         ctx = _cast_like(ctx, h_mix)
         h_mix = h_mix + ctx[:, None, :]  # (N,T_ds,Hr)
+        # ===== (B) temporal_ctx_film 적용: per-agent scale/shift를 시간축에 브로드캐스트 =====
+        film = self.temporal_ctx_film(x_hidden_a)  # (N, 2*Hr)
+        film = _cast_like(film, h_mix)
+        scale, shift = film.chunk(2, dim=-1)  # (N,Hr), (N,Hr)
 
+        one = scale.new_tensor(1.0)
+        h_mix = h_mix * (one + scale[:, None, :]) + shift[:, None, :]
         delta_ds = self.delta_head0(h_mix)  # (N,T_ds,data_dim)
         delta_ds = delta_ds * valid_ds.to(dtype=delta_ds.dtype,
                                           device=delta_ds.device).unsqueeze(-1)
