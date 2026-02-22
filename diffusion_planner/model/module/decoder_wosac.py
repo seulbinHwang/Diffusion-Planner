@@ -2841,12 +2841,13 @@ class DiT(nn.Module):
             getattr(self.config, "q_bias_anchor_k", 6))
         self._q_bias_anchor_k = int(max(4, min(self._q_bias_anchor_k, 8)))
 
+        new_hidden_dim = 128
         # AnchorMLP: (dxy=2, dir=2, tau=1) => 5 -> H
         # ✅ 주의: 여기까지도 0-init이면 anchor_sum이 0이 되어 q_bias_proj0 weight 학습이 막힐 수 있음
         # ✅ 따라서 anchor_mlp는 "마지막 Linear 0-init"을 끄고, 대신 q_bias_proj0를 0-init으로 유지
         self.anchor_mlp = self._build_zero_init_mlp(
             in_features=5,
-            hidden_features=int(hidden_dim),
+            hidden_features=int(new_hidden_dim),
             out_features=int(hidden_dim),
             zero_init_last=False,  # ✅ 핵심 변경
             last_init_std=0.02,
@@ -2860,14 +2861,14 @@ class DiT(nn.Module):
         # StepEmbed0: (step_dim=6/5) -> H (마지막 Linear 0-init)
         self.step_embed0 = self._build_zero_init_mlp(
             in_features=int(self._step_dim),
-            hidden_features=int(hidden_dim),
+            hidden_features=int(new_hidden_dim),
             out_features=int(hidden_dim),
         )
 
         # PoseHintEmbed0: (dxy=2 + dir=2) = 4 -> H (마지막 Linear 0-init)
         self.pose_hint_embed0 = self._build_zero_init_mlp(
             in_features=4,
-            hidden_features=int(hidden_dim),
+            hidden_features=int(new_hidden_dim),
             out_features=int(hidden_dim),
         )
 
@@ -2882,7 +2883,7 @@ class DiT(nn.Module):
                 tokens_mlp_dim=int(self._future_len), # 80
                 channels_mlp_dim=int(hidden_dim), # 192
                 drop_path_rate=float(temporal_drop),
-                channels_mlp_ratio=0.4,
+                channels_mlp_ratio=0.5,
                 use_fallback=use_fallback,
             ) for _ in range(temporal_depth)
         ])
