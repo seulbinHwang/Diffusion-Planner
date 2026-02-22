@@ -115,7 +115,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
     --pose_based False \
-    --profile_feasible False \
+    --profile_feasible True \
     --use_feasible True \
     --use_feasible_dl False \
     --use_feasible_filter False \
