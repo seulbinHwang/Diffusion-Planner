@@ -5299,6 +5299,7 @@ def _update_neighbor_past_and_valid_inplace_for_time_chunk(
 
 
 def _update_future_gt_and_valid_inplace_for_time_chunk(
+    unnorm_inputs_copy: Dict[str, Any],
     unnorm_outputs_copy: Dict[str, Any],
     gap: int,
 ) -> None:
@@ -5364,7 +5365,7 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     unnorm_outputs_copy["near_future_gt_is_valid"] = near_future_gt_is_valid
 
     # neighbor는 near와 같은 valid로 맞춤
-    unnorm_outputs_copy["neighbor_future_gt_is_valid"] = near_future_gt_is_valid
+    unnorm_inputs_copy["neighbor_future_gt_is_valid"] = near_future_gt_is_valid
     """
     future_seg_control_gt_3_dim: (B*R, (1+)Pnn, future_len, 3)
     future_seg_control_gt_3_dim 도 마찬가지로 shift 해주고, 뒤쪽 gap 구간은 0으로 채우고, bool로 맞춰야 합니다.
@@ -5540,6 +5541,7 @@ def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     )
     # 5) 미래 GT/valid 갱신
     _update_future_gt_and_valid_inplace_for_time_chunk(
+        unnorm_inputs_copy=unnorm_inputs_copy,
         unnorm_outputs_copy=unnorm_outputs_copy,
         gap=int(gap),
     )

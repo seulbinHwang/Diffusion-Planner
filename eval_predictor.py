@@ -4694,7 +4694,7 @@ def _update_ego_past_and_valid_inplace_for_time_chunk(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_ego_pose_chunk: torch.Tensor,
 ) -> None:
-    """1) ego past와 ego_agent_past_is_valid를 gap만큼 앞으로 당겨 업데이트합니다.
+    """1) ego past 와 ego_agent_past_is_valid 를 gap만큼 앞으로 당겨 업데이트합니다.
 
     Args:
         unnorm_inputs_b_r_copy (Dict[str, Any]):
@@ -4956,14 +4956,12 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
     near_future_gt_is_valid[:, :, future_len - gap:] = 0
     near_future_gt_is_valid = near_future_gt_is_valid.to(dtype=torch.bool)
 
-    unnorm_inputs_b_r_copy["near_future_gt_is_valid"] = near_future_gt_is_valid
     unnorm_outputs_b_r_copy["near_future_gt_is_valid"] = near_future_gt_is_valid
 
     # neighbor는 near와 같은 valid로 맞춤
     unnorm_inputs_b_r_copy[
         "neighbor_future_gt_is_valid"] = near_future_gt_is_valid
-    unnorm_outputs_b_r_copy[
-        "neighbor_future_gt_is_valid"] = near_future_gt_is_valid
+
     """
     future_seg_control_gt_3_dim: (B*R, (1+)Pnn, future_len, 3)
     future_seg_control_gt_3_dim 도 마찬가지로 shift 해주고, 뒤쪽 gap 구간은 0으로 채우고, bool로 맞춰야 합니다.
