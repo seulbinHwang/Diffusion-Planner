@@ -141,16 +141,6 @@ from typing import Any, Dict, Set
 import numpy as np
 import torch
 
-_INFERENCE_NPZ_EXCLUDED_EXACT_KEYS: Set[str] = {
-    "diff_token_to_future_gt_3_dim",
-    "non_near_agents_past",
-    "near_agents_past",
-    "ego_future_gt_11_dim",
-    "near_future_gt_4_dim",
-    "ego_future_gt_4_dim",
-    "target_future_valid",
-    "scenario_id",
-}
 
 
 def _as_numpy_array_strict(value: Any, key_name: str) -> np.ndarray:
@@ -2672,6 +2662,12 @@ def _predict_rollouts_batched_one_chunk(
         data=norm_outputs["future_seg_control_gt_3_dim"],
         valid_mask=norm_outputs["future_seg_control_is_valid"],
     )
+    # (B, (1+)Pnn, future_len, 3)
+    norm_outputs["future_seg_control_gt_3_dim"] = state_normalizer(
+        data=norm_outputs["future_seg_control_gt_3_dim"],
+        valid_mask=norm_outputs["future_seg_control_is_valid"],
+    )
+
     # -----------------------------------------
     # ✅ 저장 요청값은 보관만 하고,
     #    카운트 증가는 "첫 그림 그리기 직전"에만 수행
@@ -3050,8 +3046,6 @@ def _draw_one_batch_one_rollout(
     TODO: diff_token_to_future_gt_3_dim : Dict[str, np.ndarray] # (1+T, 3)
 
 
-        ego_future_gt_4_dim: torch.Tensor # (B, future_len, 4)
-        near_future_gt_4_dim: torch.Tensor # (B, Pnn, future_len, 4)
     """
 
     output_data = {}
@@ -3840,46 +3834,6 @@ def _expand_target_z_to_rollout_grid(
     return target_z_grid
 
 
-def _get_sim_agents_challenge_type_from_args(
-    args: Any,) -> submission_specs.ChallengeType:
-    """args에서 Sim Agents 평가 규칙 종류를 안전하게 고릅니다.
-
-    이 함수가 필요한 이유
-    -------------------
-    Waymo 1.6.7 환경에서는 challenge type이 "protobuf enum"이 아니라
-    submission_specs.ChallengeType(파이썬 enum) 입니다.
-
-    Args:
-        args (Any):
-            아래 중 하나가 있으면 사용합니다.
-            - args.sim_agents_challenge_type: str 또는 ChallengeType
-            - args.challenge_type: str 또는 ChallengeType
-
-    Returns:
-        submission_specs.ChallengeType:
-            - SIM_AGENTS 또는 SCENARIO_GEN
-            shape: ()
-    """
-    raw = getattr(args, "sim_agents_challenge_type", None)
-    if raw is None:
-        raw = getattr(args, "challenge_type", None)
-
-    if raw is None:
-        return submission_specs.ChallengeType.SIM_AGENTS
-
-    if isinstance(raw, submission_specs.ChallengeType):
-        return raw
-
-    raw_str = str(raw).strip().lower()
-
-    if raw_str in ("sim_agents", "simagents", "sim_agent", "sim"):
-        return submission_specs.ChallengeType.SIM_AGENTS
-    if raw_str in ("scenario_gen", "scenariogen", "scenario", "gen"):
-        return submission_specs.ChallengeType.SCENARIO_GEN
-
-    raise ValueError("challenge_type을 해석할 수 없습니다. "
-                     f"raw='{raw}'. 예: 'sim_agents' 또는 'scenario_gen'")
-
 
 def _read_scenario_proto_from_tfrecord(
     tfrecord_path: str,
@@ -3976,180 +3930,6 @@ def _get_evaluation_sim_agent_ids_cached(
 
     return tuple(int(x) for x in list(eval_ids))
 
-
-def _build_padded_eval_object_ids_tensor_for_batch(
-    tfrecord_path: List[str],
-    scenario_id: List[str],
-    challenge_type: submission_specs.ChallengeType,
-    device: torch.device,
-    pad_value: int = 0,
-) -> torch.Tensor:
-    """배치(B개 시나리오)의 eval_object_ids를 (B, K) 텐서로 패딩해서 만듭니다.
-
-    Shape
-    -----
-    - 입력:
-      - tfrecord_path: List[str], 길이 B
-      - scenario_id:   List[str], 길이 B
-    - 출력:
-      - eval_object_ids: torch.Tensor, shape (B, K), dtype torch.long
-
-    Args:
-        tfrecord_path (List[str]):
-            배치의 TFRecord 경로 리스트. len = B
-        scenario_id (List[str]):
-            배치의 시나리오 id 리스트. len = B
-        challenge_type (submission_specs.ChallengeType):
-            평가 규칙 종류. shape: ()
-        device (torch.device):
-            반환 텐서 device.
-        pad_value (int):
-            패딩 값(기본 0).
-
-    Returns:
-        torch.Tensor:
-            eval_object_ids 텐서. shape (B, K)
-    """
-    if int(len(tfrecord_path)) != int(len(scenario_id)):
-        raise ValueError(
-            "tfrecord_path와 scenario_id 길이가 다릅니다. "
-            f"len(tfrecord_path)={len(tfrecord_path)}, len(scenario_id)={len(scenario_id)}"
-        )
-
-    batch_size = int(len(scenario_id))
-    eval_id_lists: List[List[int]] = []
-    max_k = 0
-
-    for p, sid in zip(tfrecord_path, scenario_id):
-        ids = list(
-            _get_evaluation_sim_agent_ids_cached(
-                tfrecord_path=str(p),
-                scenario_id=str(sid),
-                challenge_type=challenge_type,
-            ))
-        eval_id_lists.append(ids)
-        if len(ids) > max_k:
-            max_k = int(len(ids))
-
-    k = int(max(1, max_k))
-
-    out = torch.full(
-        (batch_size, k),
-        fill_value=int(pad_value),
-        device=device,
-        dtype=torch.long,
-    )
-
-    for b_idx, ids in enumerate(eval_id_lists):
-        if len(ids) == 0:
-            continue
-        ids_tensor = torch.tensor(ids, device=device, dtype=torch.long)  # (Kb,)
-        out[b_idx, :ids_tensor.numel()] = ids_tensor
-
-    return out
-
-
-def _update_min_ade_for_validation_batch(
-    outputs: Dict[str, torch.Tensor],  # unnorm
-    inputs: Dict[str, Any],  # unnorm
-    pred_traj: torch.Tensor,
-    agent_batch: torch.Tensor,  # (N,)
-    target_id: torch.Tensor,  # (N,)
-    eval_object_ids: Optional[torch.Tensor],  # (B, K) or (K,) or None
-    min_ade: minADE,
-) -> None:
-    """minADE metric을 업데이트합니다(평가 대상 object id를 함께 전달).
-
-    하는 일
-    ------
-    1) GT(정답) 미래 궤적을 (ego 기준)에서 (world 기준)으로 바꿉니다.
-    2) GT가 0으로 채워진(없는 데이터) 구간은 valid=False로 둡니다.
-    3) pred_traj(예측)과 GT를 minADE에 누적 업데이트합니다.
-    4) eval_object_ids가 있으면, minADE 내부에서 "평가 대상 agent만" 평가에 포함합니다.
-
-    Shape 요약
-    ---------
-    - outputs["ego_future_gt_4_dim"]: (B, T, 4)
-    - outputs["near_future_gt_4_dim"]: (B, Pnn, T, 4)
-    - GT 합치면: (B, (1+)Pnn, T, 4)
-    - 펼치면: (N, T, 4), N=B*(1+Pnn)
-    - world로 바꾸고 xy만 쓰면: (N, T, 2)
-    - pred_traj: (N, R, T, 2)
-    - target_id: (N,)
-    - eval_object_ids: (B, K) 또는 (K,)
-
-    Args:
-        pred_traj (torch.Tensor):
-            예측 xy 궤적.
-            shape: (N, R, T, 2)
-        agent_batch (torch.Tensor):
-            각 agent가 어느 시나리오(batch index)에 속하는지.
-            shape: (N,)
-        target_id (torch.Tensor):
-            agent object id.
-            shape: (N,)
-        eval_object_ids (Optional[torch.Tensor]):
-            시나리오별 평가 대상 object id 목록.
-            shape: (B, K) 또는 (K,) (없으면 None)
-        min_ade (minADE):
-            update(...)로 누적합니다.
-
-    Returns:
-        None
-    """
-    unnorm_ego_future_gt_4_dim = outputs["ego_future_gt_4_dim"]  # (B, T, 4)
-    unnorm_near_future_gt_4_dim = outputs[
-        "near_future_gt_4_dim"]  # (B, Pnn, T, 4)
-
-    # (B, (1+)Pnn, T, 4)
-    unnorm_target_future_gt_4_dim = torch.cat(
-        [
-            unnorm_ego_future_gt_4_dim[:, None, :, :],
-            unnorm_near_future_gt_4_dim,
-        ],
-        dim=1,
-    )
-
-    # (N, T, 4)
-    unnorm_target_future_gt_4_dim_flat = unnorm_target_future_gt_4_dim.reshape(
-        -1,
-        unnorm_target_future_gt_4_dim.shape[2],
-        unnorm_target_future_gt_4_dim.shape[3],
-    )
-
-    unnorm_origin_pose_world = inputs["origin_world_pose"]  # (B, 4)
-
-    # (N, T, 4) (world)
-    unnorm_target_future_gt_4_dim_world = _covert_from_ego_to_world(
-        target_poses=unnorm_target_future_gt_4_dim_flat,  # (N, T, 4)
-        origin_world_pose=unnorm_origin_pose_world,  # (B, 4)
-    )
-
-    # (N, T, 2)
-    unnorm_target_future_gt_xy_world = unnorm_target_future_gt_4_dim_world[:, :, :
-                                                                           2]
-
-    # target_future_valid_flat: (N, T)  마지막 4차원이 전부 0이면 그 스텝은 무효
-    ego_future_gt_is_valid = outputs["ego_future_gt_is_valid"]  # (B, T)
-    near_future_gt_is_valid = outputs["near_future_gt_is_valid"]  # (B, Pnn, T)
-    target_future_valid = torch.cat(
-        [
-            ego_future_gt_is_valid[:, None, :],
-            near_future_gt_is_valid,
-        ],
-        dim=1,
-    )  # (B, (1+)Pnn, T)
-    target_future_valid_flat = target_future_valid.reshape(
-        -1, target_future_valid.shape[2])  # (N, T)
-    if min_ade.is_active:
-        min_ade.update(
-            pred=pred_traj,
-            target=unnorm_target_future_gt_xy_world,
-            target_valid=target_future_valid_flat,
-            agent_batch=agent_batch,
-            agent_id=target_id,  # (N,)
-            eval_object_ids=eval_object_ids,  # (B, K) or (K,) or None
-        )
 
 
 def validate_func(
@@ -4365,50 +4145,6 @@ def validate_func(
                 should_validate=args.validate_scenario_rollouts,
             )
 
-    if min_ade.is_active:
-        _update_validation_heartbeat_stage(args, f"{tag} | computing minADE")
-
-        eval_object_ids: Optional[torch.Tensor] = None
-        if bool(min_ade.only_eval_targets_to_predict):
-            challenge_type = _get_sim_agents_challenge_type_from_args(args)
-            eval_object_ids = _build_padded_eval_object_ids_tensor_for_batch(
-                tfrecord_path=tfrecord_path,
-                scenario_id=scenario_id,
-                challenge_type=challenge_type,
-                device=pred_traj.device,
-                pad_value=0,
-            )
-
-        _update_min_ade_for_validation_batch(
-            outputs=outputs,
-            inputs=inputs,
-            pred_traj=pred_traj,
-            agent_batch=agent_batch,
-            target_id=target_id,
-            eval_object_ids=eval_object_ids,
-            min_ade=min_ade,
-        )
-
-    _update_validation_heartbeat_stage(args, f"{tag} | finalizing batch")
-
-
-# _transform_origin에서 실제로 좌표를 바꾸는 키들(먼저 들어가는 키가 Tensor가 되도록 순서 고정)
-_ORIGIN_TRANSFORM_TENSOR_KEYS_IN_ORDER: List[str] = [
-    "ego_agent_past",
-    "near_agents_past",
-    "non_near_agents_past",
-    "neighbor_agents_past",
-    "ego_future_gt_4_dim",
-    "near_future_gt_4_dim",
-    "stop_sign_points",
-    "crosswalk_points",
-    "speed_bump_points",
-    "driveway_points",
-    "road_edge",
-    "lanes",
-    "route_lanes",
-    "static_objects",
-]
 
 # points를 변환할 때 같이 필요한 "유효/무효" 마스크 키들
 _ORIGIN_TRANSFORM_MASK_KEYS_IN_ORDER: List[str] = [
@@ -4419,55 +4155,7 @@ _ORIGIN_TRANSFORM_MASK_KEYS_IN_ORDER: List[str] = [
     "road_edge_is_valid",
 ]
 
-# StateNormalizer로 따로 처리해야 하는 (x,y,cos,sin) 4차원 포즈 키들
-_STATE_NORMALIZER_4DIM_KEYS: List[str] = [
-    "ego_future_gt_4_dim",
-    "near_future_gt_4_dim",
-]
 
-
-def _build_origin_transform_working_sets(
-    norm_inputs_copy: Dict[str, Any],) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """원점/방향 기준 바꾸기에 필요한 값들만 골라서 묶습니다.
-
-    이 함수가 하는 일
-    ----------------
-    rollout 한 스텝마다 `_transform_origin`이 여러 키의 (x, y, 방향)을 바꿉니다.
-    그런데 전체 dict를 매번 다루면 불필요한 연산이 많아질 수 있어서,
-    실제로 변환에 쓰이는 키만 따로 모읍니다.
-
-    Args:
-        norm_inputs_copy (Dict[str, Any]):
-            모델 입력 dict(값 크기 맞춘 상태).
-            예시 shape:
-              - ego_agent_past: (B, T_past, 11)
-              - near_agents_past: (B, Pnn, T_past, 11)
-              - lanes: (B, lane_num, lane_len, 12)
-              - stop_sign_points: (B, N, L, 2)
-              - stop_sign_is_valid: (B, N, L) 또는 (B, N)
-
-    Returns:
-        Tuple[Dict[str, Any], Dict[str, Any]]:
-            (working_tensors, working_masks)
-
-            - working_tensors:
-                `_transform_origin`이 직접 좌표를 바꿀 가능성이 큰 값들.
-                (대부분 torch.Tensor)
-            - working_masks:
-                points 변환에 필요한 "유효/무효" 표시 값들.
-                (torch.Tensor일 수도 있고, 0/1 값일 수도 있습니다)
-    """
-    working_tensors: Dict[str, Any] = {}
-    for key in _ORIGIN_TRANSFORM_TENSOR_KEYS_IN_ORDER:
-        if key in norm_inputs_copy:
-            working_tensors[key] = norm_inputs_copy[key]
-
-    working_masks: Dict[str, Any] = {}
-    for key in _ORIGIN_TRANSFORM_MASK_KEYS_IN_ORDER:
-        if key in norm_inputs_copy:
-            working_masks[key] = norm_inputs_copy[key]
-
-    return working_tensors, working_masks
 
 
 from typing import Any, Dict, List
@@ -5219,11 +4907,6 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
         unnorm_outputs_b_r_copy (Dict[str, Any]):
             출력/정답 dict(원래 단위, inplace 갱신).
             필요한 키/shape:
-              - ego_future_gt_4_dim: (B*R, future_len, 4)
-              - near_future_gt_4_dim: (B*R, Pnn, future_len, 4)
-              - planner_future_11_dim: (B*R, future_len, 11)
-              - ego_future_gt_is_valid: (B*R, future_len)
-              - near_future_gt_is_valid: (B*R, Pnn, future_len)
 
         gap (int):
             이번에 한 번에 진행한 스텝 수. shape: ()
@@ -5247,14 +4930,6 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
                         gap, :] = ego_future_gt_4_dim[:, gap:, :].clone()
     ego_future_gt_4_dim[:, future_len - gap:, :] = 0.0
     unnorm_outputs_b_r_copy["ego_future_gt_4_dim"] = ego_future_gt_4_dim
-
-    # ego_future_gt_11_dim shift
-    ego_future_gt_11_dim = unnorm_inputs_b_r_copy[
-        "ego_future_gt_11_dim"]  # (B*R, future_len, 11)
-    ego_future_gt_11_dim[:, :future_len -
-                          gap, :] = ego_future_gt_11_dim[:, gap:, :].clone()
-    ego_future_gt_11_dim[:, future_len - gap:, :] = 0.0
-    unnorm_inputs_b_r_copy["ego_future_gt_11_dim"] = ego_future_gt_11_dim
 
     # ego_future_gt_is_valid shift
     ego_future_gt_is_valid = unnorm_outputs_b_r_copy[
@@ -5489,40 +5164,6 @@ def _transform_origin_step3_future_gt_inplace(
         )
 
 
-def _transform_origin_step4_planner_future_inplace(
-        unnorm_inputs_b_r_copy: Dict[str, Any],
-        unnorm_outputs_b_r_copy: Dict[str, Any],
-        delta_xy: torch.Tensor,  # (B*R, 2)
-        cos_delta: torch.Tensor,  # (B*R,)
-        sin_delta: torch.Tensor,  # (B*R,)
-) -> None:
-    """4) planner_future_11_dim을 새 기준으로 바꿉니다.
-
-    Args:
-        unnorm_inputs_b_r_copy: 입력 dict (inplace 변경).
-            - planner_future_11_dim: (B*R, future_len, 11) 또는 None
-        delta_xy: 새 기준의 위치 이동 값. shape (B*R, 2)
-        cos_delta: 새 기준의 방향 cos 값. shape (B*R,)
-        sin_delta: 새 기준의 방향 sin 값. shape (B*R,)
-
-    Returns:
-        None
-    """
-    planner_future_11_dim = unnorm_inputs_b_r_copy.get("ego_future_gt_11_dim",
-                                                       None)
-    if not isinstance(planner_future_11_dim,
-                      torch.Tensor) or planner_future_11_dim.numel() == 0:
-        return
-    valid_mask = unnorm_outputs_b_r_copy["ego_future_gt_is_valid"]
-
-    _transform_state_11_dim_inplace(
-        state_11=planner_future_11_dim,  # (B*R, future_len, 11)
-        delta_xy=delta_xy,  # (B*R, 2)
-        cos_delta=cos_delta,  # (B*R,)
-        sin_delta=sin_delta,  # (B*R,)
-        valid_mask=valid_mask,  # (B*R, future_len)
-    )
-
 
 def _transform_origin_step5_points_inplace(
         unnorm_inputs_b_r_copy: Dict[str, Any],
@@ -5688,7 +5329,7 @@ def _transform_origin(
         sin_delta=sin_delta,
     )
 
-    # 3) future GT (ego/near)
+    # 3) future GT (ego/near) # ego_future_gt_4_dim / near_future_gt_4_dim
     _transform_origin_step3_future_gt_inplace(
         unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
         delta_xy=delta_xy,
@@ -5696,14 +5337,6 @@ def _transform_origin(
         sin_delta=sin_delta,
     )
 
-    # 4) planner future
-    _transform_origin_step4_planner_future_inplace(
-        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
-        unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
-        delta_xy=delta_xy,
-        cos_delta=cos_delta,
-        sin_delta=sin_delta,
-    )
 
     # 5) points
     _transform_origin_step5_points_inplace(

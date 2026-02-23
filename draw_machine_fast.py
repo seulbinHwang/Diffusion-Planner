@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import matplotlib.pyplot as plt
 
+
 def _get_ego_current_xy_from_input_data(
     input_data: Dict[str, Any],
     options: "DrawingOptions",
@@ -94,6 +95,7 @@ def set_axes_limits_centered_on_xy(
 
     ax.set_xlim(cx - half_span, cx + half_span)
     ax.set_ylim(cy - half_span, cy + half_span)
+
 
 Array = np.ndarray
 WorldModelFeature = Dict[str, Array]
@@ -509,7 +511,8 @@ def _collect_valid_xy_from_input_data(
             ys_local.extend(r_valid[:, 1].tolist())
 
     # ego past, ego pred, ego future
-    for key in ("ego_agent_past", "ego_agent_next_11_dim", "ego_future_gt_11_dim"):
+    for key in ("ego_agent_past", "ego_agent_next_11_dim",
+                "planner_future_11_dim"):
         A = input_data.get(key)
         if A is None or np.asarray(A).size == 0:
             continue
@@ -715,7 +718,7 @@ class DrawInfos:
         }  # (History_len, 11)
         """
             interpolation으로, 생성된 미래 궤적에 속도를 추가한 것
-            
+
         EGO_draw_planner_future_11_dim = True일 떄,
             EGO_draw_diffusion = True이면, ego_interp_np_traj_wrt_ego 로 그림그리고, (+assert not None)
             EGO_draw_diffusion = False이면, planner_future_11_dim 로 그림그리자.
@@ -729,7 +732,7 @@ class DrawInfos:
         }  # (1 + Future_len, 11)
         """
         interpolation 궤적 생성 후, next_iteration 시점 waypoint를 array로 변환한 것
-        
+
         EGO_draw_ego_agent_next_11_dim = True일 떄, 
             EGO_draw_diffusion = True이면, ego_next_wp_wrt_ego 로 그림그리고, (+assert not None)
             EGO_draw_diffusion = False이면, ego_agent_next_11_dim 로 그림그리자.
@@ -798,8 +801,7 @@ def draw_neighbor_future_gt_3_dim(
     if draw_mode not in ("point", "line", "arrow"):
         raise ValueError(
             f"지원하지 않는 DIFF_future_gt_3_dim_draw_mode 값입니다: {draw_mode!r}. "
-            f"'point', 'line', 'arrow' 중 하나여야 합니다."
-        )
+            f"'point', 'line', 'arrow' 중 하나여야 합니다.")
 
     for track_token, future_gt_3_dim in diff_token_to_future_gt_3_dim.items():
         if draw_token_list is not None and track_token not in draw_token_list:
@@ -817,12 +819,12 @@ def draw_neighbor_future_gt_3_dim(
         if draw_mode == "line":
             valid_mask: Array = (
                 (np.abs(future_gt_3_dim[:, 0]) > eps) |
-                (np.abs(future_gt_3_dim[:, 1]) > eps)
-            )  # shape: (T,)
+                (np.abs(future_gt_3_dim[:, 1]) > eps))  # shape: (T,)
 
             valid_xy: Array = future_gt_3_dim[valid_mask, :2]  # shape: (K,2)
             if valid_xy.shape[0] >= 2:
-                segments: Array = np.stack([valid_xy[:-1], valid_xy[1:]], axis=1)  # (K-1,2,2)
+                segments: Array = np.stack([valid_xy[:-1], valid_xy[1:]],
+                                           axis=1)  # (K-1,2,2)
                 _add_line_collection(
                     ax=ax,
                     segments_xy=segments,
@@ -962,6 +964,7 @@ def _build_diff_token_to_future_gt_3_dim_from_neighbor_np(
 # 옵션/스타일
 # =============================================================================
 
+
 # =============================================================================
 # 유틸리티(도형/화살표/클래스/유효성/범위)
 # =============================================================================
@@ -987,6 +990,7 @@ def _is_dashed_linestyle(linestyle: Any) -> bool:
     if isinstance(linestyle, str):
         return linestyle not in ("-", "solid", "")
     return False
+
 
 def _normalize_mpl_capstyle(value: Any) -> str:
     """Matplotlib capstyle 값을 LineCollection이 받을 수 있는 짧은 문자열로 바꿉니다.
@@ -1060,6 +1064,7 @@ def _normalize_mpl_joinstyle(value: Any) -> str:
         return "miter"
     return s
 
+
 def _get_cap_and_join_style_for_linestyle(linestyle: Any) -> Tuple[str, str]:
     """linestyle에 맞는 선 끝 모양(cap)과 꺾임 모양(join)을 고릅니다.
 
@@ -1078,12 +1083,12 @@ def _get_cap_and_join_style_for_linestyle(linestyle: Any) -> Tuple[str, str]:
     if _is_dashed_linestyle(linestyle):
         cap_raw = mpl.rcParams["lines.dash_capstyle"]
         join_raw = mpl.rcParams["lines.dash_joinstyle"]
-        return _normalize_mpl_capstyle(cap_raw), _normalize_mpl_joinstyle(join_raw)
+        return _normalize_mpl_capstyle(cap_raw), _normalize_mpl_joinstyle(
+            join_raw)
 
     cap_raw = mpl.rcParams["lines.solid_capstyle"]
     join_raw = mpl.rcParams["lines.solid_joinstyle"]
     return _normalize_mpl_capstyle(cap_raw), _normalize_mpl_joinstyle(join_raw)
-
 
 
 def _add_line_collection(
@@ -1142,11 +1147,8 @@ def _add_line_collection(
 
     # ax.plot 기본 동작과 맞추기(안티앨리어싱/스냅)
     line_collection.set_antialiaseds(
-        bool(mpl.rcParams.get("lines.antialiased", True))
-    )
-    line_collection.set_snap(
-        bool(mpl.rcParams.get("path.snap", False))
-    )
+        bool(mpl.rcParams.get("lines.antialiased", True)))
+    line_collection.set_snap(bool(mpl.rcParams.get("path.snap", False)))
 
     ax.add_collection(line_collection)
 
@@ -1170,7 +1172,8 @@ def _build_line_segments_from_points_xy(
             실제로 그릴 선분들만 모은 배열.
     """
     pts: Array = np.asarray(points_xy)  # shape: (T, 2)
-    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(-1)  # shape: (T-1,)
+    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(
+        -1)  # shape: (T-1,)
 
     if pts.ndim != 2 or pts.shape[1] != 2:
         raise ValueError(f"points_xy shape는 (T,2) 이어야 합니다. got {pts.shape}")
@@ -1218,7 +1221,8 @@ def _build_double_line_segments_from_center_and_boundary_xy(
     """
     cxy: Array = np.asarray(center_xy, dtype=np.float64)  # shape: (T, 2)
     bxy: Array = np.asarray(boundary_xy, dtype=np.float64)  # shape: (T, 2)
-    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(-1)  # shape: (T-1,)
+    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(
+        -1)  # shape: (T-1,)
 
     if cxy.ndim != 2 or cxy.shape[1] != 2:
         raise ValueError(f"center_xy shape는 (T,2) 이어야 합니다. got {cxy.shape}")
@@ -1252,7 +1256,11 @@ def _build_double_line_segments_from_center_and_boundary_xy(
     center_mid: Array = 0.5 * (c0 + c1)  # shape: (K, 2)
     to_center: Array = center_mid - boundary_mid  # shape: (K, 2)
 
-    dot: Array = normal[:, 0] * to_center[:, 0] + normal[:, 1] * to_center[:, 1]  # shape: (K,)
+    dot: Array = normal[:,
+                        0] * to_center[:,
+                                       0] + normal[:,
+                                                   1] * to_center[:,
+                                                                  1]  # shape: (K,)
     flip_mask: Array = dot < 0.0  # shape: (K,)
     normal[flip_mask] *= -1.0
 
@@ -1264,7 +1272,8 @@ def _build_double_line_segments_from_center_and_boundary_xy(
     p1_out: Array = p1 - shift  # shape: (K, 2)
 
     inner_segments: Array = np.stack([p0_in, p1_in], axis=1)  # shape: (K, 2, 2)
-    outer_segments: Array = np.stack([p0_out, p1_out], axis=1)  # shape: (K, 2, 2)
+    outer_segments: Array = np.stack([p0_out, p1_out],
+                                     axis=1)  # shape: (K, 2, 2)
     return inner_segments, outer_segments
 
 
@@ -1624,7 +1633,8 @@ def is_valid_agent_row(row11: Array, eps: float) -> bool:
 
 def _get_neighbor_edge_color_for_current_t(
     agent_idx: int,
-    neighbor_role: Optional[Array],  # shape: (A,2) bool, [interest, predict]
+    neighbor_role: Optional[Array],
+    # shape: (A,2) bool, [interest, predict]
     default_edge_color: str,
     options: DrawingOptions,
 ) -> str:
@@ -2547,7 +2557,8 @@ def _draw_lane_boundary_segments_with_plan(
 
     cxy: Array = np.asarray(center_xy)  # shape: (T, 2)
     bxy: Array = np.asarray(boundary_xy)  # shape: (T, 2)
-    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(-1)  # shape: (T-1,)
+    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(
+        -1)  # shape: (T-1,)
 
     if cxy.ndim != 2 or cxy.shape[1] != 2:
         raise ValueError(f"center_xy shape는 (T,2) 이어야 합니다. got {cxy.shape}")
@@ -2634,7 +2645,6 @@ def _draw_lane_boundary_segments_with_plan(
     )
 
 
-
 def _draw_lane_boundary_highlight_segments(
     ax: plt.Axes,
     boundary_xy: Array,  # shape: (T, 2)
@@ -2649,7 +2659,8 @@ def _draw_lane_boundary_highlight_segments(
     여기서는 선분들을 모아서 LineCollection 1개로 그립니다.
     """
     bxy: Array = np.asarray(boundary_xy)  # (T, 2)
-    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(-1)  # (T-1,)
+    seg_ok: Array = np.asarray(segment_drawable).astype(bool).reshape(
+        -1)  # (T-1,)
 
     if bxy.ndim != 2 or bxy.shape[1] != 2:
         raise ValueError(f"boundary_xy shape는 (T,2) 이어야 합니다. got {bxy.shape}")
@@ -2671,7 +2682,6 @@ def _draw_lane_boundary_highlight_segments(
         linestyle="-",
         zorder=int(zorder),
     )
-
 
 
 def draw_lane_boundaries(
@@ -2962,14 +2972,15 @@ def _choose_lane_centerline_color(
 
 
 def draw_lane_centerlines(
-    ax: plt.Axes,
-    lanes: Array,  # (lane_num, lane_len, 12)
-    lanes_speed_limit: Array,  #  (lane_num, 1)
-    lanes_has_speed_limit: Array,  # (lane_num, 1)
-    options: DrawingOptions,
-    agent_route_lane_order: Optional[Array] = None,  # (max_agent_num, lane_num)
-    draw_token_int_list: Optional[List[int]] = None,
-    lane_type: Optional[Array] = None,  # (lane_num, 4) or None
+        ax: plt.Axes,
+        lanes: Array,  # (lane_num, lane_len, 12)
+        lanes_speed_limit: Array,  # (lane_num, 1)
+        lanes_has_speed_limit: Array,  # (lane_num, 1)
+        options: DrawingOptions,
+        agent_route_lane_order: Optional[Array] = None,
+        # (max_agent_num, lane_num)
+        draw_token_int_list: Optional[List[int]] = None,
+        lane_type: Optional[Array] = None,  # (lane_num, 4) or None
 ) -> None:
     """차선 센터라인을 그립니다(센터라인 선 모드 고속화).
 
@@ -3040,7 +3051,8 @@ def draw_lane_centerlines(
                 point_y: float = float(lane_j_center[point_idx, 1])
 
                 for count, agent_idx in enumerate(valid_agent_idxs.tolist()):
-                    if (not draw_all) and (agent_idx not in draw_token_int_list):
+                    if (not draw_all) and (agent_idx
+                                           not in draw_token_int_list):
                         continue
                     rank_ij: int = int(ranks_j[int(agent_idx)])
                     label: str = f"{rank_ij}"
@@ -3061,7 +3073,8 @@ def draw_lane_centerlines(
     for lane_idx, lane_i in enumerate(lanes):
         center: Array = lane_i[:, 0:2]  # (lane_len, 2)
         signals: Array = lane_i[:, 8:12]  # (lane_len, 4)
-        valid_mask: Array = np.any(np.abs(lane_i[:, :8]) > eps, axis=1)  # (lane_len,)
+        valid_mask: Array = np.any(np.abs(lane_i[:, :8]) > eps,
+                                   axis=1)  # (lane_len,)
 
         if center.shape[0] < 2:
             continue
@@ -3076,7 +3089,8 @@ def draw_lane_centerlines(
             )
 
         # 신호 상태 index
-        signal_state_idx: Array = _signal_rows4_to_state_indices(signals)  # (lane_len,)
+        signal_state_idx: Array = _signal_rows4_to_state_indices(
+            signals)  # (lane_len,)
 
         # 속도 제한 텍스트 준비(기존 유지)
         has_speed_limit: bool = False
@@ -3119,7 +3133,8 @@ def draw_lane_centerlines(
             )
 
         # 속도 제한 텍스트(기존 유지)
-        if use_speed_limit_label and has_speed_limit and (speed_kmh is not None):
+        if use_speed_limit_label and has_speed_limit and (speed_kmh
+                                                          is not None):
             valid_indices: Array = np.nonzero(valid_mask)[0]
             if valid_indices.size > 0:
                 mid_idx: int = int(valid_indices[len(valid_indices) // 2])
@@ -3137,7 +3152,6 @@ def draw_lane_centerlines(
                     va="center",
                     zorder=3,
                 )
-
 
 
 def draw_neighbor_past(
@@ -3274,7 +3288,7 @@ def annotate_neighbor_indices_for_past(ax: plt.Axes, neighbor_track_token: List[
         ax.text(
             x + options.NEI_past_token_place_offset_m,
             y + options.NEI_past_token_place_offset_m,
-            str(track_token),  #[:5],
+            str(track_token),  # [:5],
             color=options.NEI_past_token_color,
             fontsize=options.NEI_past_token_fontsize,
             ha='left',
@@ -3574,8 +3588,7 @@ def draw_token_trajectory_non_rects(
         return None
     if traj_11.ndim != 2 or traj_11.shape[1] != 11:
         raise ValueError(
-            "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다."
-        )
+            "token_to_future_traj_wrt_ego의 각 value는 (future_len, 4)이어야 합니다.")
 
     eps: float = float(options.invalid_eps)
     traj: Array = traj_11[:, :4]  # shape: (T, 4)
@@ -3586,7 +3599,8 @@ def draw_token_trajectory_non_rects(
 
     # ───────── line 모드(고속) ─────────
     if mode == "line":
-        valid_mask: Array = np.any(np.abs(traj[:, :4]) > eps, axis=1)  # shape: (T,)
+        valid_mask: Array = np.any(np.abs(traj[:, :4]) > eps,
+                                   axis=1)  # shape: (T,)
         seg_ok: Array = valid_mask[:-1] & valid_mask[1:]  # shape: (T-1,)
 
         segments: Array = _build_line_segments_from_points_xy(
@@ -3607,7 +3621,8 @@ def draw_token_trajectory_non_rects(
         first_valid_xy: Optional[Tuple[float, float]] = None
         if np.any(seg_ok):
             first_idx: int = int(np.nonzero(seg_ok)[0][0])
-            first_valid_xy = (float(traj_xy[first_idx, 0]), float(traj_xy[first_idx, 1]))
+            first_valid_xy = (float(traj_xy[first_idx,
+                                            0]), float(traj_xy[first_idx, 1]))
 
         # 속도 텍스트(기존과 동일: 유효한 점들에 대해 t%10==0일 때만)
         if draw_velocity:
@@ -3696,7 +3711,6 @@ def draw_token_trajectory_non_rects(
             first_valid_xy = (x, y)
 
     return first_valid_xy
-
 
 
 def draw_traj_dict_as_unfilled_rects(
@@ -4186,7 +4200,7 @@ def draw_ego(ax: plt.Axes, input_data: WorldModelFeature,
                     f"Unsupported EGO_draw_diffusion_mode: {draw_option.EGO_draw_diffusion_mode}"
                 )
         else:
-            ego_future_11_dim = input_data.get("ego_future_gt_11_dim", None)
+            ego_future_11_dim = input_data.get("planner_future_11_dim", None)
         if ego_future_11_dim is not None:
             draw_planner_future_11_dim(ax, ego_future_11_dim, draw_option)
     ### [EGO FUTURE GT 11] ###
@@ -4453,6 +4467,8 @@ def draw_world_model_to_png(
 
     # 6) 저장
     save_figure_to_png(fig, save_path)
+
+
 def _list_sorted_png_frame_paths(save_dir: str) -> List[str]:
     """폴더 안의 PNG 프레임들을 '숫자 파일명' 기준으로 정렬해 반환합니다.
 
@@ -4539,7 +4555,8 @@ def _load_png_as_rgb_uint8(
             target_h, target_w = int(target_hw[0]), int(target_hw[1])
             # PIL resize는 (W, H) 순서로 받습니다.
             if (img_rgb.size[0] != target_w) or (img_rgb.size[1] != target_h):
-                img_rgb = img_rgb.resize((target_w, target_h), resample=Image.BILINEAR)
+                img_rgb = img_rgb.resize((target_w, target_h),
+                                         resample=Image.BILINEAR)
 
         frame_rgb: np.ndarray = np.asarray(img_rgb, dtype=np.uint8)  # (H, W, 3)
     return frame_rgb
@@ -4606,8 +4623,7 @@ def _pad_rgb_uint8_frame_to_even_hw(frame_rgb: np.ndarray) -> np.ndarray:
 
     if frame_rgb_arr.ndim != 3 or frame_rgb_arr.shape[2] != 3:
         raise ValueError(
-            f"frame_rgb는 shape (H, W, 3) 이어야 합니다. got {frame_rgb_arr.shape}"
-        )
+            f"frame_rgb는 shape (H, W, 3) 이어야 합니다. got {frame_rgb_arr.shape}")
 
     if frame_rgb_arr.dtype != np.uint8:
         frame_rgb_arr = frame_rgb_arr.astype(np.uint8)
@@ -4616,7 +4632,7 @@ def _pad_rgb_uint8_frame_to_even_hw(frame_rgb: np.ndarray) -> np.ndarray:
     width: int = int(frame_rgb_arr.shape[1])
 
     pad_h: int = int(height % 2)  # 0 또는 1
-    pad_w: int = int(width % 2)   # 0 또는 1
+    pad_w: int = int(width % 2)  # 0 또는 1
 
     if pad_h == 0 and pad_w == 0:
         return frame_rgb_arr
@@ -4628,6 +4644,7 @@ def _pad_rgb_uint8_frame_to_even_hw(frame_rgb: np.ndarray) -> np.ndarray:
         constant_values=0,  # 검은색
     )
     return padded_frame
+
 
 from typing import List
 import numpy as np
@@ -4661,10 +4678,8 @@ def _write_mp4_from_png_frames(
     try:
         import imageio.v2 as imageio
     except Exception as e:
-        raise RuntimeError(
-            "mp4 저장을 위해 imageio가 필요합니다. "
-            "설치: pip install imageio imageio-ffmpeg"
-        ) from e
+        raise RuntimeError("mp4 저장을 위해 imageio가 필요합니다. "
+                           "설치: pip install imageio imageio-ffmpeg") from e
 
     if len(frame_paths) == 0:
         raise ValueError("frame_paths가 비어 있습니다. PNG 프레임이 필요합니다.")
@@ -4701,11 +4716,9 @@ def _write_mp4_from_png_frames(
             )  # shape: (base_h, base_w, 3)
 
             frame_rgb_even: np.ndarray = _pad_rgb_uint8_frame_to_even_hw(
-                frame_rgb
-            )  # shape: (H_even, W_even, 3)
+                frame_rgb)  # shape: (H_even, W_even, 3)
 
             writer.append_data(frame_rgb_even)
-
 
 
 def _write_gif_from_png_frames(
@@ -4737,25 +4750,29 @@ def _write_gif_from_png_frames(
         import imageio.v2 as imageio
     except Exception as e:
         raise RuntimeError(
-            "gif 저장을 위해 imageio가 필요합니다. 설치: pip install imageio"
-        ) from e
+            "gif 저장을 위해 imageio가 필요합니다. 설치: pip install imageio") from e
 
-    first_frame = _load_png_as_rgb_uint8(frame_paths[0], target_hw=None)  # (H, W, 3)
+    first_frame = _load_png_as_rgb_uint8(frame_paths[0],
+                                         target_hw=None)  # (H, W, 3)
     target_h, target_w = int(first_frame.shape[0]), int(first_frame.shape[1])
 
     duration_sec = 1.0 / float(max(1, int(fps)))
 
     # mode="I"는 프레임을 이어붙이는 방식(일반적인 애니메이션 GIF)
-    with imageio.get_writer(output_gif_path, mode="I", duration=duration_sec) as writer:
+    with imageio.get_writer(output_gif_path, mode="I",
+                            duration=duration_sec) as writer:
         for p in frame_paths:
-            frame = _load_png_as_rgb_uint8(p, target_hw=(target_h, target_w))  # (H, W, 3)
+            frame = _load_png_as_rgb_uint8(p, target_hw=(target_h,
+                                                         target_w))  # (H, W, 3)
             writer.append_data(frame)
 
 
-def make_video_from_all_png(save_dir: str, draw_scenario_id: str,
-                            new_save_dir: str,
-                            run_count: Optional[int] = None,
-                            ) -> None:
+def make_video_from_all_png(
+    save_dir: str,
+    draw_scenario_id: str,
+    new_save_dir: str,
+    run_count: Optional[int] = None,
+) -> None:
     """폴더 내 PNG들을 시간 순서대로 이어서 mp4/gif 영상을 저장합니다.
 
     전제(입력 폴더 구조)
@@ -4821,6 +4838,7 @@ def make_video_from_all_png(save_dir: str, draw_scenario_id: str,
         output_gif_path=out_gif_path,
         fps=int(fps),
     )
+
 
 if __name__ == "__main__":
     save_dir = "/home/user/PycharmProjects/Diffusion-Planner/training_log/nuplan_womd/2025-12-25-05:37:26/debug_vis_1bc8784d42f1b632"

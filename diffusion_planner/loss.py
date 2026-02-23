@@ -1458,16 +1458,13 @@ def diffusion_loss_func(
             ego_cur_future_gt_is_valid=ego_cur_future_gt_is_valid,
             # (B, 1 + future_len)
             norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
-            normed_near_future_gt_4_dim=norm_outputs[
-                "near_future_gt_4_dim"],  # (B, Pnn, future_len, 4)
+            normed_near_future_gt_4_dim=near_future_gt_4_dim,  # (B, Pnn, future_len, 4)
             near_cur_future_gt_is_valid=
             near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
         )
         past_seg_control_gt_3_dim = None
     else:  # velocity_based
         """
-        past_future_seg_control_gt_3_dim: (B, 1+Pnn, past_len + future_len, 3)
-        
         normed_target_seq_gt : (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
         target_seq_is_valid : (B, (1+)Pnn, future_len)
         """
@@ -1475,14 +1472,7 @@ def diffusion_loss_func(
         past_seg_control_gt_3_dim = norm_inputs["past_seg_control_gt_3_dim"]
         future_seg_control_gt_3_dim = norm_outputs[
             "future_seg_control_gt_3_dim"] # (B, (1+)Pnn, future_len, 3)
-        past_future_seg_control_gt_3_dim = torch.cat([
-            past_seg_control_gt_3_dim,
-            future_seg_control_gt_3_dim,
-        ],
-        dim=2
-        )  # (B, 1+Pnn, past_len + future_len, 3)
-        assert past_future_seg_control_gt_3_dim.shape[2] == (args.time_len - 1 +
-                                                             future_len)
+
         if not args.do_ego_predict:
             past_seg_control_gt_3_dim = past_seg_control_gt_3_dim[:, 1:, :, :]
             future_seg_control_gt_3_dim = future_seg_control_gt_3_dim[:, 1:, :, :]

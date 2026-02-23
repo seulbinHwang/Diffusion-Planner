@@ -648,6 +648,8 @@ def _prepare_batch_for_device(
         "ego_future_gt_is_valid",  # output 에서만 꺼내도록
         "near_future_gt_is_valid",  # output 에서만 꺼내도록
         "future_seg_control_is_valid",  # output 에서만 꺼내도록
+        # "ego_future_gt_11_dim", # (B, future_len, 11)
+        # "neighbor_future_gt_11_dim", # (B, Pnn, future_len, 11)
     }
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):

@@ -128,7 +128,6 @@ def _ensure_validity_keys_if_needed_inplace(sample: Dict[str, Any]) -> None:
 
     def _has_source_for(key: str) -> bool:
         if key == "ego_future_gt_is_valid":
-            # planner_future_11_dim(=ego_future_gt_11_dim rename)이 있으면 계산 가능
             return sample.get(
                                   "ego_future_gt_11_dim", None) is not None
         if key == "driveway_is_valid":
@@ -158,22 +157,11 @@ def _ensure_validity_keys_if_needed_inplace(sample: Dict[str, Any]) -> None:
         if key == "neighbor_future_gt_is_valid":
             return sample.get("neighbor_future_gt_11_dim", None) is not None
         if key == "past_seg_control_is_valid":
-            return sample.get("ego_agent_past",
-                              None) is not None and sample.get(
-                "neighbor_agents_past", None) is not None
-
+            return sample.get("past_seg_control_gt_3_dim",
+                              None) is not None
         if key == "future_seg_control_is_valid":
-            has_ego_future = (
-                                         sample.get("ego_future_gt_11_dim",
-                                                    None) is not None)
-            has_neighbor_future = sample.get("neighbor_future_gt_11_dim",
-                                             None) is not None
-            return (
-                    sample.get("ego_agent_past", None) is not None
-                    and sample.get("neighbor_agents_past", None) is not None
-                    and has_ego_future
-                    and has_neighbor_future
-            )
+            return sample.get("future_seg_control_gt_3_dim",
+                              None) is not None
         return False
 
     need_compute = False
