@@ -5343,7 +5343,89 @@ class FeasibleProjector(nn.Module):
         return derivative_out
 
     @classmethod
-    def loss_weights_by_progress(cls, progress: float,
+    def loss_weights_by_progress(
+            cls,
+            progress: float,
+            args: Any,
+    ) -> Tuple[float, float, float]:
+        """손실 가중치(w_dir, w_int, w_const)를 반환합니다.
+
+        동작 요약
+        ----------
+        1) auto_tune_aux_weights=False (기본):
+            - 기존 로직 그대로 progress에 따라 w_int를 선형 증가시키고,
+              w_const는 고정 값을 사용합니다.
+
+        2) auto_tune_aux_weights=True:
+            - w_dir은 그대로 고정(앵커).
+            - w_int / w_const는 train_epoch에서 epoch 끝에 업데이트한 값을 사용합니다.
+              (args._auto_aux_weight_state 안의 w_int/w_const)
+
+        Args:
+            progress (float):
+                전체 학습 진행도 p∈[0,1].
+                - auto 모드에서는 참고용(로그)이고, 가중치에는 직접 쓰지 않습니다.
+            args (Any):
+                학습 설정 객체. 아래 항목을 사용합니다.
+                - w_dir, w_int_min, w_int_max, w_const
+                - auto_tune_aux_weights, w_const_min, w_const_max
+
+        Returns:
+            Tuple[float, float, float]:
+                (w_direct, w_integration, w_constraint)
+        """
+        # -------------------------
+        # (A) auto 모드: epoch 끝에서 계산된 동적 가중치 사용
+        # -------------------------
+        if bool(getattr(args, "auto_tune_aux_weights", False)):
+            w_dir = float(getattr(args, "w_dir", 1.0))
+
+            w_int_min = float(getattr(args, "w_int_min", 0.0))
+            w_int_max = float(getattr(args, "w_int_max", w_int_min))
+
+            w_const_min = float(getattr(args, "w_const_min", 0.01))
+            w_const_max = float(
+                getattr(args, "w_const_max", max(w_const_min, 1.0)))
+
+            # 안전장치: min/max 관계 보정
+            if w_int_max < w_int_min:
+                w_int_max = w_int_min
+            if w_const_min <= 0.0:
+                w_const_min = 1e-6
+            if w_const_max < w_const_min:
+                w_const_max = w_const_min
+
+            state = getattr(args, "_auto_aux_weight_state", None)
+
+            if state is not None and hasattr(state, "w_int") and hasattr(state,
+                                                                         "w_const"):
+                w_int = float(getattr(state, "w_int"))
+                w_const = float(getattr(state, "w_const"))
+            else:
+                # state가 없으면(초기 epoch 시작 전) 안전한 초기값 사용
+                w_int = w_int_min
+                w_const_init = float(getattr(args, "w_const", 0.0))
+                w_const = w_const_init if w_const_init > 0.0 else w_const_min
+
+            # 범위 클램프
+            w_int = float(max(w_int_min, min(w_int_max, w_int)))
+            w_const = float(max(w_const_min, min(w_const_max, w_const)))
+
+            return w_dir, w_int, w_const
+
+        # -------------------------
+        # (B) 기존 progress 스케줄(그대로 유지)
+        # -------------------------
+        p = float(max(0.0, min(1.0, progress)))
+        if p < args.p_sat:
+            w_int = args.w_int_min + (args.w_int_max - args.w_int_min) * (
+                        p / args.p_sat)
+        else:
+            w_int = args.w_int_max
+        return args.w_dir, float(w_int), float(args.w_const)
+
+    @classmethod
+    def loss_weights_by_progress2(cls, progress: float,
                                  args: Any) -> Tuple[float, float, float]:
         """손실 가중치 스케줄러.
 

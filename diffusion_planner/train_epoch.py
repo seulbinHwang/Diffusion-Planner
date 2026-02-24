@@ -12,7 +12,8 @@ from diffusion_planner.model.module.feasible import FeasibleProjector
 # =====================================================================
 from typing import Dict, Tuple, Optional, List, Any
 import argparse
-
+from dataclasses import dataclass
+import math
 import torch
 from torch import nn
 from typing import Tuple
@@ -284,6 +285,247 @@ def _is_main_process() -> bool:
         # 단일 프로세스/분산 미초기화 등
         return True
 
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+import math
+import argparse
+
+
+@dataclass
+class _AutoAuxWeightState:
+    """auto_tune_aux_weights에서 쓰는 내부 상태입니다.
+
+    Attributes:
+        w_int (float): 현재 integration 가중치.
+        w_const (float): 현재 constraint 가중치.
+
+        ema_dir (Optional[float]): diffusion loss의 이동 평균(최근 값에 더 비중을 둔 평균).
+        ema_int (Optional[float]): integration loss의 이동 평균.
+        ema_const (Optional[float]): constraint loss의 이동 평균.
+
+        best_dir (Optional[float]): diffusion loss 이동 평균의 지금까지 최솟값.
+        best_int (Optional[float]): integration loss 이동 평균의 지금까지 최솟값.
+        best_const (Optional[float]): constraint loss 이동 평균의 지금까지 최솟값.
+    """
+    w_int: float
+    w_const: float
+
+    ema_dir: Optional[float] = None
+    ema_int: Optional[float] = None
+    ema_const: Optional[float] = None
+
+    best_dir: Optional[float] = None
+    best_int: Optional[float] = None
+    best_const: Optional[float] = None
+
+
+def _is_finite_float(value: Any) -> bool:
+    """값이 유한한(float로 변환 가능한) 숫자인지 확인합니다."""
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return False
+
+
+def _ema_update(prev: Optional[float], new: float, alpha: float) -> float:
+    """이동 평균을 1번 업데이트합니다.
+
+    Args:
+        prev (Optional[float]): 이전 이동 평균 값(없으면 None).
+        new (float): 이번 epoch 평균 값.
+        alpha (float): 새 값을 얼마나 반영할지(0~1).
+
+    Returns:
+        float: 업데이트된 이동 평균 값.
+    """
+    a = float(alpha)
+    if prev is None:
+        return float(new)
+    return (1.0 - a) * float(prev) + a * float(new)
+
+
+def _min_update(prev: Optional[float], new: float) -> float:
+    """best-so-far(최솟값)을 업데이트합니다."""
+    if prev is None:
+        return float(new)
+    return float(min(float(prev), float(new)))
+
+
+def _clip(v: float, vmin: float, vmax: float) -> float:
+    """v를 [vmin, vmax] 범위로 자릅니다."""
+    return float(max(float(vmin), min(float(vmax), float(v))))
+
+
+def _maybe_init_auto_aux_weight_state(args: argparse.Namespace) -> None:
+    """auto_tune_aux_weights를 쓸 때 내부 상태를 1회 초기화합니다.
+
+    초기화 규칙
+    ----------
+    - w_int 시작값: args.w_int_min
+    - w_const 시작값:
+        - args.w_const > 0 이면 그 값
+        - args.w_const <= 0 이면 args.w_const_min (반드시 0보다 큰 값)
+
+    Args:
+        args (argparse.Namespace): 학습 설정 객체.
+
+    Returns:
+        None
+    """
+    if not bool(getattr(args, "auto_tune_aux_weights", False)):
+        return
+
+    if isinstance(getattr(args, "_auto_aux_weight_state", None), _AutoAuxWeightState):
+        return
+
+    w_int0 = float(getattr(args, "w_int_min", 0.0))
+
+    w_const_min = float(getattr(args, "w_const_min", 0.01))
+    if w_const_min <= 0.0:
+        w_const_min = 1e-6
+
+    w_const0_raw = float(getattr(args, "w_const", 0.0))
+    w_const0 = w_const0_raw if w_const0_raw > 0.0 else w_const_min
+
+    args._auto_aux_weight_state = _AutoAuxWeightState(
+        w_int=w_int0,
+        w_const=w_const0,
+    )
+
+
+def _update_auto_aux_weight_state_from_epoch_mean(
+    args: argparse.Namespace,
+    epoch_mean_loss: Dict[str, float],
+) -> None:
+    """epoch 평균 loss로 w_int/w_const를 '천천히' 자동 업데이트합니다.
+
+    핵심 규칙
+    ----------
+    1) diffusion(neighbor_prediction_loss)은 앵커로 둡니다.
+    2) integration/constraint는 "지금까지 가장 좋았던 값(best)"에서
+       (1+delta)만큼 여유를 둔 목표(target)를 만들고,
+       ratio = (이동평균 / target)로 w를 곱셈 업데이트합니다.
+    3) diffusion이 best 대비 확실히 나빠지면(aux 가중치의 '증가'만 금지)합니다.
+    4) constraint는 low_t 샘플이 0이던 epoch이면 best/이동평균 업데이트를 스킵합니다.
+       (0이 best로 들어가 목표가 망가지는 상황 방지)
+
+    Args:
+        args (argparse.Namespace): 학습 설정 객체(하이퍼파라미터는 args_util.py에서 정의).
+        epoch_mean_loss (Dict[str, float]): epoch 평균 loss dict.
+
+    Returns:
+        None
+    """
+    if not bool(getattr(args, "auto_tune_aux_weights", False)):
+        return
+
+    # feasible이 꺼져 있으면 integration/constraint 의미가 약해서 업데이트를 하지 않습니다.
+    if not bool(getattr(args, "use_feasible", False)):
+        return
+
+    _maybe_init_auto_aux_weight_state(args)
+    state: _AutoAuxWeightState = getattr(args, "_auto_aux_weight_state")
+
+    # ---- 하이퍼파라미터(args에서만 읽음) ----
+    alpha = float(getattr(args, "auto_aux_ema_alpha", 0.1))
+
+    delta_int = float(getattr(args, "auto_aux_delta_int", 0.2))
+    delta_const = float(getattr(args, "auto_aux_delta_const", 0.2))
+    delta_dir = float(getattr(args, "auto_aux_delta_dir", 0.05))
+
+    deadzone = float(getattr(args, "auto_aux_deadzone", 0.05))
+    eta = float(getattr(args, "auto_aux_eta", 0.1))
+    gamma = float(getattr(args, "auto_aux_anchor_gamma", 0.1))
+
+    eps_int = float(getattr(args, "auto_aux_eps_int", 1e-4))
+    eps_const = float(getattr(args, "auto_aux_eps_const", 1e-4))
+    eps_dir = float(getattr(args, "auto_aux_eps_dir", 1e-4))
+
+    w_int_min = float(getattr(args, "w_int_min", 0.0))
+    w_int_max = float(getattr(args, "w_int_max", w_int_min))
+    if w_int_max < w_int_min:
+        w_int_max = w_int_min
+
+    w_const_min = float(getattr(args, "w_const_min", 0.01))
+    w_const_max = float(getattr(args, "w_const_max", max(w_const_min, 1.0)))
+    if w_const_min <= 0.0:
+        w_const_min = 1e-6
+    if w_const_max < w_const_min:
+        w_const_max = w_const_min
+
+    # ---- epoch 평균 loss 읽기(가중치 없는 값) ----
+    l_dir = epoch_mean_loss.get("neighbor_prediction_loss", None)
+    l_int = epoch_mean_loss.get("integration_loss", None)
+    l_const = epoch_mean_loss.get("constraint_loss", None)
+    low_t_frac = epoch_mean_loss.get("low_t_mask_fraction", None)
+
+    # ---- 이동 평균 + best 업데이트 ----
+    if l_dir is not None and _is_finite_float(l_dir):
+        state.ema_dir = _ema_update(state.ema_dir, float(l_dir), alpha)
+        state.best_dir = _min_update(state.best_dir, state.ema_dir)
+
+    if l_int is not None and _is_finite_float(l_int):
+        state.ema_int = _ema_update(state.ema_int, float(l_int), alpha)
+        state.best_int = _min_update(state.best_int, state.ema_int)
+
+    # constraint는 low_t가 "실제로" 있었던 epoch에서만 업데이트
+    if (
+        l_const is not None and _is_finite_float(l_const)
+        and low_t_frac is not None and _is_finite_float(low_t_frac)
+        and float(low_t_frac) > 0.0
+    ):
+        state.ema_const = _ema_update(state.ema_const, float(l_const), alpha)
+        state.best_const = _min_update(state.best_const, state.ema_const)
+
+    # ---- target / ratio 계산 ----
+    def _target(best: Optional[float], delta: float, eps_floor: float) -> Optional[float]:
+        if best is None:
+            return None
+        return max(float(best) * (1.0 + float(delta)), float(eps_floor))
+
+    t_dir = _target(state.best_dir, delta_dir, eps_dir)
+    t_int = _target(state.best_int, delta_int, eps_int)
+    t_const = _target(state.best_const, delta_const, eps_const)
+
+    r_dir = None if (t_dir is None or state.ema_dir is None) else float(state.ema_dir) / float(t_dir)
+    r_int = None if (t_int is None or state.ema_int is None) else float(state.ema_int) / float(t_int)
+    r_const = None if (t_const is None or state.ema_const is None) else float(state.ema_const) / float(t_const)
+
+    # ---- 가중치 곱셈 업데이트(데드존 포함) ----
+    w_int_old = float(state.w_int)
+    w_const_old = float(state.w_const)
+
+    w_int_new = w_int_old
+    w_const_new = w_const_old
+
+    if r_int is not None and abs(float(r_int) - 1.0) > float(deadzone):
+        r = max(0.0, float(r_int))
+        w_int_new = _clip(w_int_old * (r ** float(eta)), w_int_min, w_int_max)
+
+    if r_const is not None and abs(float(r_const) - 1.0) > float(deadzone):
+        r = max(0.0, float(r_const))
+        w_const_new = _clip(w_const_old * (r ** float(eta)), w_const_min, w_const_max)
+
+    # ---- 앵커 보호: diffusion이 나쁘면 aux '증가'만 금지 ----
+    if r_dir is not None and float(r_dir) > (1.0 + float(gamma)):
+        w_int_new = min(w_int_new, w_int_old)
+        w_const_new = min(w_const_new, w_const_old)
+
+    # ---- 상태 저장 ----
+    state.w_int = float(_clip(w_int_new, w_int_min, w_int_max))
+    state.w_const = float(_clip(w_const_new, w_const_min, w_const_max))
+
+    # (선택) verbose면 rank0에서만 간단 출력
+    if bool(getattr(args, "verbose", False)) and _is_main_process():
+        print(
+            f"[auto_aux] w_int {w_int_old:.6f}->{state.w_int:.6f} | "
+            f"w_const {w_const_old:.6f}->{state.w_const:.6f} | "
+            f"r_dir={None if r_dir is None else round(r_dir, 4)} "
+            f"r_int={None if r_int is None else round(r_int, 4)} "
+            f"r_const={None if r_const is None else round(r_const, 4)} "
+            f"low_t_frac={None if low_t_frac is None else round(float(low_t_frac), 4)}"
+        )
 
 # name -> 호출 횟수 / 누적 시간(ms)
 # - total_* : 전체 호출 기준(워밍업 포함)
@@ -1162,6 +1404,9 @@ def train_epoch(
     """
     model.train()
 
+    # ✅ 추가: auto 모드면 내부 상태를 1회 초기화
+    _maybe_init_auto_aux_weight_state(args)
+
     stat_device: torch.device = torch.device(args.device)
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
@@ -1258,5 +1503,8 @@ def train_epoch(
 
     if ddp.get_rank() == 0 and "loss" in epoch_mean_loss:
         print(f"epoch train loss: {epoch_mean_loss['loss']:.4f}\n")
+
+    # ✅ 추가: epoch 평균 loss로 w_int/w_const 업데이트(다음 epoch부터 적용)
+    _update_auto_aux_weight_state_from_epoch_mean(args, epoch_mean_loss)
 
     return epoch_mean_loss, epoch_mean_loss.get("loss", float("nan"))

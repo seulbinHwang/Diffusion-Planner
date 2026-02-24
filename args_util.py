@@ -262,6 +262,96 @@ def get_args():
         ),
     )
 
+    #########################
+    parser.add_argument(
+        "--auto_tune_aux_weights",
+        default=False,
+        type=boolean,
+        help=(
+            "True이면 epoch 평균(가중치 없는) loss를 보고 w_int/w_const를 자동으로 천천히 조절합니다. "
+            "neighbor_prediction_loss는 기준(앵커)으로 고정해두고, "
+            "integration/constraint가 best-so-far(여유 포함)에서 크게 나빠지지 않게 합니다."
+        ),
+    )
+
+    # -------------------------
+    # auto_tune_aux_weights용 하이퍼파라미터 (모두 기본값 포함)
+    # -------------------------
+    parser.add_argument(
+        "--auto_aux_ema_alpha",
+        type=float,
+        default=0.1,
+        help="epoch 평균 loss를 부드럽게 만들 때 쓰는 '이동 평균'의 새 값 반영 비율(0~1).",
+    )
+    parser.add_argument(
+        "--auto_aux_delta_int",
+        type=float,
+        default=0.2,
+        help="integration 목표를 best 대비 얼마나 여유 있게 둘지(예: 0.2 = 20%).",
+    )
+    parser.add_argument(
+        "--auto_aux_delta_const",
+        type=float,
+        default=0.2,
+        help="constraint 목표를 best 대비 얼마나 여유 있게 둘지(예: 0.2 = 20%).",
+    )
+    parser.add_argument(
+        "--auto_aux_delta_dir",
+        type=float,
+        default=0.05,
+        help="diffusion(앵커) 목표 여유(예: 0.05 = 5%).",
+    )
+    parser.add_argument(
+        "--auto_aux_deadzone",
+        type=float,
+        default=0.05,
+        help="ratio가 1±deadzone 안이면 가중치 업데이트를 하지 않습니다(출렁임 방지).",
+    )
+    parser.add_argument(
+        "--auto_aux_eta",
+        type=float,
+        default=0.1,
+        help="가중치 곱셈 업데이트 강도(작게 둘수록 '천천히' 변합니다).",
+    )
+    parser.add_argument(
+        "--auto_aux_anchor_gamma",
+        type=float,
+        default=0.1,
+        help="diffusion(앵커)이 best 대비 확실히 나빠지면(aux 가중치 '증가'만 금지) 기준 비율.",
+    )
+    parser.add_argument(
+        "--auto_aux_eps_int",
+        type=float,
+        default=1e-4,
+        help="integration 목표(target)의 최소 바닥값(0 근처로 망가지는 것 방지).",
+    )
+    parser.add_argument(
+        "--auto_aux_eps_const",
+        type=float,
+        default=1e-4,
+        help="constraint 목표(target)의 최소 바닥값(0 근처로 망가지는 것 방지).",
+    )
+    parser.add_argument(
+        "--auto_aux_eps_dir",
+        type=float,
+        default=1e-4,
+        help="diffusion(앵커) 목표(target)의 최소 바닥값.",
+    )
+
+    # constraint 가중치 범위(곱셈 업데이트를 쓰므로 min은 0보다 커야 함)
+    parser.add_argument(
+        "--w_const_min",
+        type=float,
+        default=0.01,
+        help="constraint 가중치 최솟값(0이면 곱셈 업데이트가 영원히 0이라 반드시 양수 권장).",
+    )
+    parser.add_argument(
+        "--w_const_max",
+        type=float,
+        default=1.0,
+        help="constraint 가중치 최댓값(폭주 방지).",
+    )
+
 
     # DataLoader parameters
     # DataLoader parameters
@@ -279,7 +369,7 @@ def get_args():
     parser.add_argument('--feasible_learn_noise_thresh',
                         type=float,
                         help='feasible_learn_noise_thresh',
-                        default=0.26)
+                        default=0.33)
     parser.add_argument('--normalization_file_path',
                         default='normalization.json',
                         help='filepath of normalization.json',
