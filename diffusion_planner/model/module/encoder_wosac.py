@@ -325,6 +325,9 @@ class Encoder(nn.Module):
         # False면 로컬 인코더는 부모 모드(train/eval)를 그대로 따름.
         self._force_encoder_local_eval: Optional[bool] = None
 
+        self._eval_frozen_encoder_global: bool = True
+        self._force_encoder_global_eval: Optional[bool] = None
+
     def _build_pos_embedding_module(
         self,
         in_dim: int,
@@ -484,6 +487,66 @@ class Encoder(nn.Module):
                 return False
         return has_any_param
 
+    def are_encoder_global_parameters_frozen(self) -> bool:
+        """글로벌 인코더 파라미터가 전부 '고정' 상태인지 확인합니다.
+
+        여기서 "고정"은 requires_grad=False를 의미합니다.
+
+        Returns:
+            bool:
+                - 글로벌 인코더에 속한 파라미터가 하나라도 있고,
+                  그 파라미터들이 전부 requires_grad=False이면 True
+                - 그 외에는 False
+        """
+        has_any_param: bool = False
+        for p in self.iter_encoder_global_parameters():
+            has_any_param = True
+            if p.requires_grad:
+                return False
+        return has_any_param
+
+    def _encoder_global_modules(self) -> Tuple[nn.Module, ...]:
+        """글로벌 인코더로 취급할 서브모듈 목록을 반환합니다."""
+        mods: List[nn.Module] = []
+        if isinstance(getattr(self, "fusion", None), nn.Module):
+            mods.append(self.fusion)
+        pooler = getattr(self, "lane_summary_pooler", None)
+        if isinstance(pooler, nn.Module):
+            mods.append(pooler)
+        return tuple(mods)
+
+    def _sync_encoder_global_train_eval_mode(self) -> None:
+        """현재 설정과 파라미터 고정 상태에 따라, 글로벌 인코더 서브모듈의 모드를 맞춥니다.
+
+        목표:
+            - 글로벌 인코더가 고정(requires_grad=False)인 상태에서,
+              학습 모드에서만 발생하는 무작위 꺼짐 동작(드롭아웃/드롭패스)을 막기 위해
+              글로벌 인코더를 eval로 유지합니다.
+        """
+        global_modules = self._encoder_global_modules()
+
+        # 강제 설정이 있으면 최우선
+        if self._force_encoder_global_eval is True:
+            self._set_modules_train_mode(global_modules, mode=False)
+            return
+        if self._force_encoder_global_eval is False:
+            self._set_modules_train_mode(global_modules,
+                                         mode=bool(self.training))
+            return
+
+        # 자동 모드: "글로벌 파라미터가 전부 고정"일 때만 eval로 내림
+        if not bool(self._eval_frozen_encoder_global):
+            self._set_modules_train_mode(global_modules,
+                                         mode=bool(self.training))
+            return
+
+        global_is_frozen: bool = self.are_encoder_global_parameters_frozen()
+        if bool(self.training) and global_is_frozen:
+            self._set_modules_train_mode(global_modules, mode=False)
+        else:
+            self._set_modules_train_mode(global_modules,
+                                         mode=bool(self.training))
+
     def _encoder_local_modules(self) -> Tuple[nn.Module, ...]:
         """로컬 인코더로 취급할 서브모듈 목록을 반환합니다.
 
@@ -560,6 +623,7 @@ class Encoder(nn.Module):
         """
         super().train(mode)
         self._sync_encoder_local_train_eval_mode()
+        self._sync_encoder_global_train_eval_mode()  # ✅ 추가
         return self
 
     def _zero_with_touch(self, ref: torch.Tensor,
@@ -1142,6 +1206,7 @@ class Encoder(nn.Module):
             print(
                 "\n\n\n\n=============[DEBUG] Encoder.forward 호출 =============")
         self._sync_encoder_local_train_eval_mode()
+        self._sync_encoder_global_train_eval_mode()  # ✅ 추가
         device_type: str = inputs["ego_agent_past"].device.type
 
         with profile_block(

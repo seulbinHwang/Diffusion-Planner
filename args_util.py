@@ -508,6 +508,12 @@ def get_args():
         default=False,
         help='True이면 encoder_local(Group A)을 학습에서 제외합니다.',
     )
+    parser.add_argument(
+        '--freeze_encoder_global',
+        type=boolean,
+        default=False,
+        help='True이면 encoder_global(Group B)을 학습에서 제외합니다.',
+    )
 
     parser.add_argument(
         '--encoder_local_lr_scale',

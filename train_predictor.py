@@ -742,6 +742,33 @@ def _set_requires_grad_for_encoder_local(
         if isinstance(param, nn.Parameter):
             param.requires_grad_(requires_grad)
 
+def _set_requires_grad_for_encoder_global(
+    model: nn.Module,
+    requires_grad: bool,
+) -> None:
+    """encoder_global(Group B) 파라미터들의 requires_grad 값을 일괄 변경합니다.
+
+    목적:
+        - encoder_global(=fusion, lane_summary_pooler)을 학습에서 완전히 제외하거나,
+          다시 학습 가능하게 만들기 위해 사용합니다.
+        - requires_grad=False이면 optimizer 파라미터 그룹에서 자동으로 빠집니다.
+
+    Args:
+        model (nn.Module):
+            Diffusion_Planner 또는 동일한 인터페이스를 가진 모델.
+            (iter_group_encoder_global_parameters() 메서드를 제공해야 합니다.)
+        requires_grad (bool):
+            True이면 학습 가능, False이면 고정.
+
+    Returns:
+        None
+    """
+    if not hasattr(model, "iter_group_encoder_global_parameters"):
+        return
+
+    for param in model.iter_group_encoder_global_parameters():
+        if isinstance(param, nn.Parameter):
+            param.requires_grad_(requires_grad)
 
 def _build_param_role_mapping(model: nn.Module,) -> Dict[int, str]:
     """모델 파라미터 id → 역할 이름(encoder_local/global/decoder/default) 매핑을 만든다.
@@ -1251,69 +1278,45 @@ def _build_optimizer_with_roles_from_args(
     base_model: nn.Module,
     args: argparse.Namespace,
 ) -> optim.Optimizer:
-    """Group A/B/C lr 배율과 freeze 설정을 반영한 AdamW 옵티마이저를 만든다.
+    """Group A/B/C lr 배율과 freeze 설정을 반영한 AdamW 옵티마이저를 만듭니다.
 
-    처리 순서:
-      1) freeze_encoder_local 이 True 이면
-         Group A(encoder_local) 파라미터들의 requires_grad 를 False 로 바꿔
-         옵티마이저에서 완전히 제외한다.
-      2) encoder_local_lr_scale / encoder_global_lr_scale / decoder_lr_scale / default
-         값을 읽어 role_to_lr_scale 딕셔너리를 구성한다.
-      3) build_adamw_with_param_groups(...) 를 호출해
-         역할별 lr 배율이 반영된 AdamW(또는 8bit AdamW)를 만든다.
-      4) 각 param_group 에
-         - "lr_max": 기준 학습률
-         - "wd_max": 기준 weight_decay
-         필드를 채워 이후 WD warmdown 에서 사용할 수 있도록 한다.
-
-    Args:
-        base_model (nn.Module):
-            - ddp.get_model 으로 래퍼가 벗겨진 실제 모델.
-            - iter_group_encoder_local_parameters / iter_group_encoder_global_parameters /
-              iter_group_decoder_parameters 메서드를 제공해야 Group A/B/C 제어가 적용된다.
-        args (argparse.Namespace):
-            - learning_rate (float)
-            - weight_decay (float)
-            - use_8bit_optimizer (bool)
-            - freeze_encoder_local (bool)
-            - encoder_local_lr_scale (float)
-            - encoder_global_lr_scale (float)
-            - decoder_lr_scale (float)
-
-    Returns:
-        optim.Optimizer:
-            - torch.optim.AdamW 또는 bnb.optim.AdamW8bit 옵티마이저.
-            - optimizer.param_groups[i]["params"] 리스트 안에는
-              다양한 shape의 nn.Parameter 텐서들이 들어 있다.
+    추가:
+      - freeze_encoder_global(True)면 Group B(encoder_global)도 requires_grad=False 처리합니다.
     """
-    # 1) Group A freeze (Stage2 에서 encoder_local 고정)
-    if args.freeze_encoder_local:
+    # 1) Group A freeze
+    if bool(getattr(args, "freeze_encoder_local", False)):
         _set_requires_grad_for_encoder_local(
             model=base_model,
             requires_grad=False,
         )
 
-    # 2) 역할별 lr 스케일 설정
+    # 2) Group B freeze (✅ 추가)
+    if bool(getattr(args, "freeze_encoder_global", False)):
+        _set_requires_grad_for_encoder_global(
+            model=base_model,
+            requires_grad=False,
+        )
+
+    # 3) 역할별 lr 스케일 설정
     role_to_lr_scale: Dict[str, float] = {
-        "encoder_local": float(args.encoder_local_lr_scale),
-        "encoder_global": float(args.encoder_global_lr_scale),
-        "decoder": float(args.decoder_lr_scale),
+        "encoder_local": float(getattr(args, "encoder_local_lr_scale", 1.0)),
+        "encoder_global": float(getattr(args, "encoder_global_lr_scale", 1.0)),
+        "decoder": float(getattr(args, "decoder_lr_scale", 1.0)),
         "default": 1.0,
     }
-    # 변경
+
     optimizer, _ = build_adamw_with_param_groups(
         model=base_model,
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,  # 예: 1e-2
+        lr=float(args.learning_rate),
+        weight_decay=float(args.weight_decay),
         include_seed_params=True,
-        use_8bit_optimizer=args.use_8bit_optimizer,
+        use_8bit_optimizer=bool(getattr(args, "use_8bit_optimizer", False)),
         role_to_lr_scale=role_to_lr_scale,
     )
 
-    # 각 param_group 에 기준 lr, wd 기록
     for pg in optimizer.param_groups:
-        pg.setdefault("lr_max", float(pg["lr"]))  # 기준 LR (역할별로 다를 수 있음)
-        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))  # 기준 WD
+        pg.setdefault("lr_max", float(pg["lr"]))
+        pg.setdefault("wd_max", float(pg.get("weight_decay", 0.0)))
 
     return optimizer
 
