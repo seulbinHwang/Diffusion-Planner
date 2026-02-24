@@ -74,8 +74,9 @@ export DP_ENABLE_CPU_MONITOR=0
     --freeze_encoder_local True \
     --freeze_encoder_global True \
     --batch_size 1536 \
+    --train_epochs 275 \
     --learning_rate 1e-4 \
-    --min_learning_rate 1e-6 \
+    --min_learning_rate 5e-6 \
     --pose_based False \
     --profile_feasible False \
     --use_feasible True \
