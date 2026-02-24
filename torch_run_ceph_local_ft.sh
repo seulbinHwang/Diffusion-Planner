@@ -72,7 +72,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --resume_wandb_model_name latest \
     --resume_model_only True \
     --freeze_encoder_local True \
-    --freeze_encoder_global True \
+    --freeze_encoder_global False \
     --batch_size 1536 \
     --train_epochs 275 \
     --learning_rate 1e-4 \
