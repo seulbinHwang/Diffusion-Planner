@@ -974,80 +974,83 @@ def _aggregate_weighted_loss(
 
 def _compute_integration_and_constraint_losses(
     decoder_output: Dict[str, torch.Tensor],
-    norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
-    target_future_valid: torch.Tensor,  # (B, (1 +) Pnn, future_len)
-    low_t_mask_3_ndim: torch.Tensor,  # (B, 1, 1)
-    w_t: torch.Tensor,  # (1, 1, T)
+    norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, T, 4)
+    target_future_valid: torch.Tensor,          # (B, (1+)Pnn, T)
+    low_t_mask_3_ndim: torch.Tensor,            # (B, 1, 1)
+    w_t: torch.Tensor,                          # (1, 1, T)
     base_loss: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
-           Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """통합 궤적/제어 편차 기반 보조 손실을 계산한다.
 
-    - model_type과 무관하게(예: "x_start"/"v") 보조 손실로 사용할 수 있습니다.
-
-    내부 계산은 float32로 수행해서 수치 불안정 가능성을 줄입니다.
+    변경점
+    ------
+    - integration_loss_val:
+        - low_t_mask_3_ndim을 **무시**하고, target_future_valid만으로 loss를 계산한다.
+    - constraint_loss_val:
+        - 기존처럼 low_t_mask_3_ndim과 target_future_valid를 **둘 다** 만족하는 구간에서만 loss를 계산한다.
 
     Args:
-        norm_target_future_gt_4_dim: (B, (1+)Pnn, future_len, 4)
-        target_future_valid: ((B, (1 +) Pnn, future_len)
-        low_t_mask_3_ndim: (B, 1, 1)
-        w_t: (1, 1, T)
+        decoder_output: 모델 decoder 출력 dict.
+        norm_target_future_gt_4_dim: 정규화된 GT 미래 포즈. shape: (B, P, T, 4)
+        target_future_valid: GT 유효 마스크. shape: (B, P, T)
+        low_t_mask_3_ndim: 저노이즈(=low t) 배치 마스크. shape: (B, 1, 1)
+        w_t: 시간 가중치. shape: (1, 1, T)
+        base_loss: device/dtype 기준용 스칼라 텐서.
 
     Returns:
-        integration_loss_val: 스칼라, float32
-        constraint_loss_val: 스칼라, float32
-        integrated_trajectory: (B, (1+)Pnn, T, 4) 또는 None
-        control_constraint_diff: (B, (1+)Pnn, T, 3) 또는 None
+        integration_loss_val: 스칼라 (float32)
+        constraint_loss_val: 스칼라 (float32)
+        integrated_trajectory: (B, P, T, 4) 또는 None
+        control_constraint_diff: (B, P, T, 3) 또는 None
     """
-    target_future_valid = _to_bool_mask(target_future_valid)
-    low_t_mask_3_ndim = _to_bool_mask(low_t_mask_3_ndim)
-    valid_low = target_future_valid & low_t_mask_3_ndim  # (B, (1 +) Pnn, future_len) bool
-    valid_low_f = valid_low.float()
+    target_future_valid_bool = _to_bool_mask(target_future_valid)
+    low_t_mask_bool = _to_bool_mask(low_t_mask_3_ndim)  # (B,1,1) -> broadcast 가능
+
+    # --- 마스크 분리 ---
+    valid_for_integration = target_future_valid_bool              # (B,P,T)
+    valid_for_constraint = target_future_valid_bool & low_t_mask_bool  # (B,P,T)
 
     integrated_trajectory: Optional[torch.Tensor] = None
     control_constraint_diff: Optional[torch.Tensor] = None
 
-    # --- L_integration ---
-    if ("integrated_trajectory" in decoder_output):
+    # --- L_integration: target_future_valid만 사용 ---
+    if "integrated_trajectory" in decoder_output:
         integrated_full = _require_finite(
             "decoder_output['integrated_trajectory']",
             decoder_output["integrated_trajectory"],
-        )  # (B, (1+)Pnn, 1+T, 4)
-        integrated_trajectory = integrated_full[:, :,
-                                                1:, :]  # (B, (1+)Pnn, T, 4)
+        )  # 보통 (B, P, 1+T, 4)
 
-        # per_step: (B,(1+)Pnn,T) float32
-        diff = (
-            integrated_trajectory -
-            norm_target_future_gt_4_dim).float()  # (B, (1+)Pnn, future_len, 4)
-        per_step = (diff**2).sum(dim=-1)
+        # (B, P, T, 4)
+        integrated_trajectory = integrated_full[:, :, 1:, :]
 
-        w_f = w_t.float()
-        denom = (valid_low_f * w_f).sum().clamp_min(1e-6)
-        integration_loss_val = (per_step * w_f * valid_low_f).sum() / denom
+        # diff: (B, P, T, 4) -> per_step: (B, P, T)
+        diff = (integrated_trajectory - norm_target_future_gt_4_dim).float()
+        per_step = (diff ** 2).sum(dim=-1).float()  # (B,P,T)
+
+        w_f = w_t.float()  # (1,1,T)
+        valid_int_f = valid_for_integration.float()  # (B,P,T)
+
+        denom = (valid_int_f * w_f).sum().clamp_min(1e-6)  # scalar
+        integration_loss_val = (per_step * w_f * valid_int_f).sum() / denom
     else:
-        integration_loss_val = torch.zeros((),
-                                           device=base_loss.device,
-                                           dtype=torch.float32)
+        integration_loss_val = torch.zeros((), device=base_loss.device, dtype=torch.float32)
 
-    # --- L_constraint ---
+    # --- L_constraint: 기존처럼 target_future_valid & low_t_mask ---
     if "control_constraint_diff" in decoder_output:
         control_constraint_diff = _require_finite(
             "decoder_output['control_constraint_diff']",
             decoder_output["control_constraint_diff"],
         )  # (B,P,T,3)
+
         constraint_loss_val = _masked_weighted_mse_from_diff(
-            control_constraint_diff,  # (B, (1+)Pnn, future_len, 3)
-            valid_low,  # (B, (1 +) Pnn, future_len)
-            w_t,  # (1, 1, future_len)
+            control_constraint_diff,   # (B,P,T,3)
+            valid_for_constraint,      # (B,P,T)
+            w_t,                       # (1,1,T)
         )
     else:
-        constraint_loss_val = torch.zeros((),
-                                          device=base_loss.device,
-                                          dtype=torch.float32)
+        constraint_loss_val = torch.zeros((), device=base_loss.device, dtype=torch.float32)
 
     return integration_loss_val, constraint_loss_val, integrated_trajectory, control_constraint_diff
-
 
 def _add_xy_yaw_metric_losses(
         pose_based: bool,

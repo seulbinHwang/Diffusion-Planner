@@ -163,61 +163,6 @@ def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
     return mask != 0
 
 
-def _compute_time_padding_mask_from_state(
-    target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
-    check_dims: int = 8,
-    eps: float = 0.0,
-) -> torch.Tensor:
-    """에이전트 상태 시퀀스에서 '빈 슬롯(패딩)'을 time 축으로 판단하는 마스크를 만듭니다.
-
-    판단 규칙(프레임 단위)
-    ----------------------
-    아래 중 하나라도 만족하면 그 프레임은 패딩(True)으로 봅니다.
-      1) check_dims 범위 안에 NaN/inf가 섞여 있음
-      2) check_dims 범위 값들이 전부 0(또는 eps 이하)로 비어 있음
-
-    Args:
-        target_agents_past (torch.Tensor):
-            에이전트 상태 시퀀스.
-            shape: (B, (1+)Pnn, time_len, 11)
-        check_dims (int):
-            패딩 판정에 사용할 마지막 차원 D의 앞부분 길이.
-            보통 (x,y,cos,sin,vx,vy,w,l) 같은 연속값 영역만 체크하려고 8을 사용합니다.
-        eps (float):
-            "전부 0" 판정을 조금 느슨하게 하고 싶을 때 쓰는 값.
-            기본은 0.0 입니다.
-
-    Returns:
-        target_past_current_mask: (B, Pnn, (1+)time_len)
-            패딩 마스크(True=패딩, False=유효).
-
-    Raises:
-        ValueError:
-            target_agents_past shape이 4D가 아니면 발생합니다.
-    """
-    if target_agents_past.dim() != 4:
-        raise ValueError(
-            f"target_agents_past must be 4D (B,Pnn,time_len,D), got {tuple(target_agents_past.shape)}"
-        )
-
-    last_dim: int = int(target_agents_past.size(-1))
-    used_dims: int = int(min(max(check_dims, 1), last_dim))
-
-    state_slice = target_agents_past[
-        ..., :used_dims]  # (B,(1+)Pnn,time_len,used_dims)
-
-    # NaN/inf 방어
-    is_finite = torch.isfinite(state_slice).all(dim=-1)  # (B,(1+)Pnn,time_len)
-
-    # 0(또는 거의 0) 방어
-    is_non_zero = state_slice.abs().sum(dim=-1) > float(
-        eps)  # (B,(1+)Pnn,time_len)
-
-    is_valid = is_finite & is_non_zero  # (B,(1+)Pnn,time_len)
-    target_past_current_mask = ~is_valid
-    return target_past_current_mask
-
-
 import time
 from contextlib import contextmanager
 from typing import Dict, Iterator
@@ -586,83 +531,6 @@ class Decoder(nn.Module):
                 # dtype/device는 integrated_trajectory와 맞춰 둠(불필요한 변환 방지)
                 decoder_output_dict["control_sequence"] = _cast_like(
                     control_sequence, integrated_trajectory)
-
-    def _assert_past_cur_valid_mask(
-        self,
-        valid_bpt: torch.Tensor,
-        context: str = "savgol_filter_for_control_past_cur",
-    ) -> None:
-        """과거~현재(valid_bpt)의 유효 마스크가 행마다 0*1* (단조 증가)인지 검증.
-
-        Args:
-            valid_bpt: (B, Pnn, T1) bool
-            context: 에러 메시지용 위치 정보
-
-        Raises:
-            ValueError: 1→0 전이가 하나라도 있으면(단조 증가 위반) 예외
-        """
-        # <추가하자>
-        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 이어야 합니다."
-        B, Pnn, T1 = valid_bpt.shape
-        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
-        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
-
-        has_10 = (d < 0).any(dim=1)  # 1→0 전이(단조 증가 위반)
-        if has_10.any():
-            bad_idx = torch.nonzero(has_10, as_tuple=False).flatten()
-            max_show = min(int(bad_idx.numel()), 8)
-            sample = bad_idx[:max_show].tolist()
-            b_list = [(i // Pnn) for i in sample]
-            p_list = [(i % Pnn) for i in sample]
-            raise ValueError(
-                f"[{context}] past_cur 유효 마스크는 0*1* 형태여야 합니다(단조 증가). "
-                f"1→0 전이가 감지되었습니다. 오류 row 수={int(bad_idx.numel())}, "
-                f"예시 (b,p)={list(zip(b_list, p_list))}.")
-
-    def _assert_cur_future_valid_mask(
-            self,
-            valid_bpt: torch.Tensor,
-            context: str = "savgol_filter_for_control") -> None:
-        """유효 마스크가 행마다 True*False* (단조 감소)인지 검증.
-
-        Args:
-            valid_bpt: (B, Pnn, T1) bool, 시간 축 마지막.
-            context: 에러 메시지에 표시할 호출 위치 문자열.
-
-        Raises:
-            ValueError: 0→1 전이가 하나라도 발견되면(내부 구멍 또는 선행 무효 후 유효)
-        """
-        assert valid_bpt.dim() == 3, "valid_bpt는 (B,Pnn,T1) 여야 합니다."
-        B, Pnn, T1 = valid_bpt.shape
-        v = valid_bpt.reshape(-1, T1).to(torch.int8)  # (B*Pnn, T1)
-        d = v[:, 1:] - v[:, :-1]  # (B*Pnn, T1-1)
-        has_01 = (d > 0).any(dim=1)  # 0→1 전이 여부
-        if has_01.any():
-            bad_idx = torch.nonzero(has_01, as_tuple=False).flatten()
-            # 가독성을 위해 일부만 표시
-            max_show = min(int(bad_idx.numel()), 8)
-            bad_idx_sample = bad_idx[:max_show].tolist()
-            # (b,p) 인덱스 매핑
-            b_list = [(i // Pnn) for i in bad_idx_sample]
-            p_list = [(i % Pnn) for i in bad_idx_sample]
-            raise ValueError(
-                f"[{context}] near_cur_future_valid violates the per-row monotonic constraint (True* then False*). \n"
-                f"A 0→1 transition was detected. Number of invalid rows={int(bad_idx.numel())},  \n"
-                f"example (b,p)={list(zip(b_list, p_list))}.  \n"
-                f"Internal holes (1→0→1) or becoming valid after being invalid (0→1) are not allowed."
-            )
-
-    def _get_target_past_cur_future_valid(
-        self,
-        target_past_current_mask: torch.
-        Tensor,  # (B, (1+)Pnn, (1+)time_len) True=무효  True=빈 슬롯(무효 에이전트)
-        target_future_valid: torch.Tensor,  # (B, (1+) Pnn, future_len) bool
-    ) -> torch.Tensor:  # (B, (1+)Pnn, time_len + future_len)
-        target_past_current_valid = ~target_past_current_mask  # [B, (1+)pnn, time_len]  True=유효 에이전트
-        target_past_cur_future_valid = torch.cat(
-            [target_past_current_valid, target_future_valid],
-            dim=-1)  # [B, (1+)pnn, time_len + future_len] bool
-        return target_past_cur_future_valid
 
     def _inpainting_past_cur_and_reshape(
         self,
@@ -1040,29 +908,6 @@ class Decoder(nn.Module):
             scene_encoding_token,
             scene_encoding_token_mask,
         )
-
-    def _sample_inference_noise(
-        self,
-        target_current_xyyaw: torch.Tensor,  # (B, (1+)Pnn, 4)
-        batch_size: int,
-        one_or_Pnn: int,
-    ) -> torch.Tensor:
-        """추론 모드에서 시작점으로 쓸 미래 노이즈 궤적을 만든다.
-
-        Returns:
-            noise:
-                미래 프레임 노이즈.
-                shape: (B, Pnn, T, 4)
-        """
-        if self.config.pose_based:
-            last_dim = 4
-        else:
-            last_dim = 3
-        B: int = batch_size
-        noise: torch.Tensor = target_current_xyyaw.new_empty(
-            (B, one_or_Pnn, self._future_len, last_dim),).normal_(
-                0.0, self.config.eval_temperature)  # (B, (1+)Pnn, T, 4)
-        return noise
 
     def _build_inference_xT_from_noise(
         self,
@@ -3605,34 +3450,6 @@ class DiT(nn.Module):
         x_out = x_out.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
         return x_out
 
-    def _forward_score_branch(
-            self,
-            x: torch.Tensor,
-            # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-            diffusion_time: torch.Tensor,  # (B,)
-    ) -> torch.Tensor:
-        """model_type 이 'score' 인 경우 출력 텐서를 만드는 함수.
-
-        Args:
-            x (torch.Tensor):
-                DiT 본체 출력.
-                shape: (B, Pnn, F_out)
-            diffusion_time (torch.Tensor):
-                확산 시간 t.
-                shape: (B,)
-
-        Returns:
-            torch.Tensor:
-                score(x_t) 추정값.
-                shape: (B, Pnn, F_out)
-        """
-        # std: (B, 1, 1)  FP32
-        std: torch.Tensor = self.marginal_prob_std(diffusion_time).float()[:,
-                                                                           None,
-                                                                           None]
-        out: torch.Tensor = (x.float() / (std + 1e-6)).to(x.dtype)
-        return out
-
     def do_feasible_projection(
             self,
             x: torch.Tensor,
@@ -4051,10 +3868,6 @@ else
         # model_type 분기
         if self._model_type == "score":
             raise NotImplementedError("Score model type is not implemented.")
-            # return self._forward_score_branch(
-            #     x=x,  # x:  # (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-            #     diffusion_time=diffusion_time,
-            # )
         elif self._model_type == "v":
             x0 = self._get_x0_from_v(diffusion_output, diffusion_time,
                                      target_past_cur_future_valid, x_t_flat)
