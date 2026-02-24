@@ -94,3 +94,4 @@ export DP_ENABLE_CPU_MONITOR=0
     --w_const_max 1.0 \
     --w_int_min 0.05 \
     --w_int_max 2.0 \
+    --use_amortized_diffusion false
