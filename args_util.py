@@ -261,22 +261,6 @@ def get_args():
             "wosac_submission 결과 폴더를 지우지 않고 이어서 저장합니다."
         ),
     )
-
-    #########################
-    parser.add_argument(
-        "--auto_tune_aux_weights",
-        default=False,
-        type=boolean,
-        help=(
-            "True이면 epoch 평균(가중치 없는) loss를 보고 w_int/w_const를 자동으로 천천히 조절합니다. "
-            "neighbor_prediction_loss는 기준(앵커)으로 고정해두고, "
-            "integration/constraint가 best-so-far(여유 포함)에서 크게 나빠지지 않게 합니다."
-        ),
-    )
-
-
-
-    # DataLoader parameters
     # DataLoader parameters
     parser.add_argument('--augment_prob',
                         type=float,
