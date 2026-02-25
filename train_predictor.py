@@ -2136,10 +2136,11 @@ def _log_and_save(
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
     save_interval: int = max(1, int(args.save_utd))
-    is_first_epoch: bool = (epoch == 0)
+    # is_first_epoch: bool = (epoch == 0)
 
     # 첫 epoch(=epoch 0)은 무조건 저장, 그 이후에는 save_utd 주기로 저장
-    if (not is_first_epoch) and ((epoch + 1) % save_interval != 0):
+    # if (not is_first_epoch) and ((epoch + 1) % save_interval != 0):
+    if (epoch + 1) % save_interval != 0:
         print("Skipping checkpoint save for this epoch.\n")
         return best_loss
 
