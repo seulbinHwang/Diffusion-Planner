@@ -257,6 +257,7 @@ def _require_finite(name: str, tensor: torch.Tensor) -> torch.Tensor:
         raise ValueError(msg)
     return tensor
 
+
 import math
 from typing import Any
 
@@ -855,8 +856,8 @@ def _forward_model_with_autocast(
 
 
 def extract_from_decoder(
-        future_len: int,
-        decoder_output: Dict[str, torch.Tensor],
+    future_len: int,
+    decoder_output: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """decoder_output 에서 미래 diffusion_output 만 꺼내고 모양을 확인한다.
         # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
@@ -868,7 +869,8 @@ def extract_from_decoder(
     # decoder_output["x0"]: (B, one_or_Pnn, 1+future_len, 4)
     diffusion_output: torch.Tensor = decoder_output[
         "diffusion_output"]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
-    assert diffusion_output.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
+    assert diffusion_output.shape[
+        2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
     # "diffusion_sequence"
     """
     diffusion_sequence
@@ -877,20 +879,24 @@ def extract_from_decoder(
         else:
             (B, (1+)Pnn, T,3)
     """
-    diffusion_sequence: torch.Tensor = decoder_output["diffusion_sequence"][:, :, -future_len:] # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
-    assert diffusion_sequence.shape[2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
+    diffusion_sequence: torch.Tensor = decoder_output[
+        "diffusion_sequence"][:, :,
+                              -future_len:]  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+    assert diffusion_sequence.shape[
+        2] == future_len, f"Expected diffusion_output shape to be (B, (1+)Pnn, {future_len}, C), but got {diffusion_output.shape}"
 
-    diffusion_output = _require_finite("decoder_output['diffusion_output']", diffusion_output)
+    diffusion_output = _require_finite("decoder_output['diffusion_output']",
+                                       diffusion_output)
     return diffusion_output, diffusion_sequence
 
 
 def _compute_dpm_loss(
-    args: Any,
-    model_type: str,
-    diffusion_output: torch.Tensor,            # (B, (1+)Pnn, T, C)
-    std: torch.Tensor,                         # (B, 1, 1, 1) or (B, 1, T, 1)
-    random_noise: torch.Tensor,                # (B, (1+)Pnn, T, C)
-    normed_target_future_seq_gt: torch.Tensor, # (B, (1+)Pnn, T, C)
+        args: Any,
+        model_type: str,
+        diffusion_output: torch.Tensor,  # (B, (1+)Pnn, T, C)
+        std: torch.Tensor,  # (B, 1, 1, 1) or (B, 1, T, 1)
+        random_noise: torch.Tensor,  # (B, (1+)Pnn, T, C)
+        normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, T, C)
 ) -> torch.Tensor:
     """diffusion 학습 손실을 (B,P,T) 형태로 계산한다. (손실 계산은 항상 float32)
 
@@ -921,8 +927,8 @@ def _compute_dpm_loss(
     elif model_type == "v":
         target = _get_v_target_future_seq_gt(
             normed_target_future_seq_gt=normed_target_future_seq_gt,  # (B,P,T,C)
-            random_noise=random_noise,                                # (B,P,T,C)
-            std=std,                                                  # (B,1,1,1) or (B,1,T,1)
+            random_noise=random_noise,  # (B,P,T,C)
+            std=std,  # (B,1,1,1) or (B,1,T,1)
             target_future_valid=None,
         )  # (B,P,T,C) float32
     elif model_type == "score":
@@ -931,20 +937,21 @@ def _compute_dpm_loss(
         raise ValueError(f"Unknown model type: {model_type}")
 
     # ----- (핵심) 손실 계산은 항상 float32로 통일 -----
-    diff_f32: torch.Tensor = diffusion_output.float() - target.float()  # (B,P,T,C)
+    diff_f32: torch.Tensor = diffusion_output.float() - target.float(
+    )  # (B,P,T,C)
 
     if use_huber:
-        abs_err: torch.Tensor = diff_f32.abs()                         # (B,P,T,C)
-        quad: torch.Tensor = 0.5 * diff_f32.pow(2)                     # (B,P,T,C)
-        lin: torch.Tensor = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA) # (B,P,T,C)
-        huber: torch.Tensor = torch.where(abs_err <= HUBER_DELTA, quad, lin)  # (B,P,T,C)
-        dpm_loss: torch.Tensor = huber.sum(dim=-1)                     # (B,P,T) float32
+        abs_err: torch.Tensor = diff_f32.abs()  # (B,P,T,C)
+        quad: torch.Tensor = 0.5 * diff_f32.pow(2)  # (B,P,T,C)
+        lin: torch.Tensor = HUBER_DELTA * (abs_err - 0.5 * HUBER_DELTA
+                                          )  # (B,P,T,C)
+        huber: torch.Tensor = torch.where(abs_err <= HUBER_DELTA, quad,
+                                          lin)  # (B,P,T,C)
+        dpm_loss: torch.Tensor = huber.sum(dim=-1)  # (B,P,T) float32
     else:
-        dpm_loss = diff_f32.pow(2).sum(dim=-1)                         # (B,P,T) float32
+        dpm_loss = diff_f32.pow(2).sum(dim=-1)  # (B,P,T) float32
 
     return dpm_loss
-
-
 
 
 def _aggregate_weighted_loss(
@@ -975,11 +982,12 @@ def _aggregate_weighted_loss(
 def _compute_integration_and_constraint_losses(
     decoder_output: Dict[str, torch.Tensor],
     norm_target_future_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, T, 4)
-    target_future_valid: torch.Tensor,          # (B, (1+)Pnn, T)
-    low_t_mask_3_ndim: torch.Tensor,            # (B, 1, 1)
-    w_t: torch.Tensor,                          # (1, 1, T)
+    target_future_valid: torch.Tensor,  # (B, (1+)Pnn, T)
+    low_t_mask_3_ndim: torch.Tensor,  # (B, 1, 1)
+    w_t: torch.Tensor,  # (1, 1, T)
     base_loss: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor],
+           Optional[torch.Tensor]]:
     """통합 궤적/제어 편차 기반 보조 손실을 계산한다.
 
     변경점
@@ -1004,10 +1012,11 @@ def _compute_integration_and_constraint_losses(
         control_constraint_diff: (B, P, T, 3) 또는 None
     """
     target_future_valid_bool = _to_bool_mask(target_future_valid)
-    low_t_mask_bool = _to_bool_mask(low_t_mask_3_ndim)  # (B,1,1) -> broadcast 가능
+    low_t_mask_bool = _to_bool_mask(
+        low_t_mask_3_ndim)  # (B,1,1) -> broadcast 가능
 
     # --- 마스크 분리 ---
-    valid_for_integration = target_future_valid_bool              # (B,P,T)
+    valid_for_integration = target_future_valid_bool  # (B,P,T)
     valid_for_constraint = target_future_valid_bool & low_t_mask_bool  # (B,P,T)
 
     integrated_trajectory: Optional[torch.Tensor] = None
@@ -1025,7 +1034,7 @@ def _compute_integration_and_constraint_losses(
 
         # diff: (B, P, T, 4) -> per_step: (B, P, T)
         diff = (integrated_trajectory - norm_target_future_gt_4_dim).float()
-        per_step = (diff ** 2).sum(dim=-1).float()  # (B,P,T)
+        per_step = (diff**2).sum(dim=-1).float()  # (B,P,T)
 
         w_f = w_t.float()  # (1,1,T)
         valid_int_f = valid_for_integration.float()  # (B,P,T)
@@ -1033,7 +1042,9 @@ def _compute_integration_and_constraint_losses(
         denom = (valid_int_f * w_f).sum().clamp_min(1e-6)  # scalar
         integration_loss_val = (per_step * w_f * valid_int_f).sum() / denom
     else:
-        integration_loss_val = torch.zeros((), device=base_loss.device, dtype=torch.float32)
+        integration_loss_val = torch.zeros((),
+                                           device=base_loss.device,
+                                           dtype=torch.float32)
 
     # --- L_constraint: 기존처럼 target_future_valid & low_t_mask ---
     if "control_constraint_diff" in decoder_output:
@@ -1043,14 +1054,17 @@ def _compute_integration_and_constraint_losses(
         )  # (B,P,T,3)
 
         constraint_loss_val = _masked_weighted_mse_from_diff(
-            control_constraint_diff,   # (B,P,T,3)
-            valid_for_constraint,      # (B,P,T)
-            w_t,                       # (1,1,T)
+            control_constraint_diff,  # (B,P,T,3)
+            valid_for_constraint,  # (B,P,T)
+            w_t,  # (1,1,T)
         )
     else:
-        constraint_loss_val = torch.zeros((), device=base_loss.device, dtype=torch.float32)
+        constraint_loss_val = torch.zeros((),
+                                          device=base_loss.device,
+                                          dtype=torch.float32)
 
     return integration_loss_val, constraint_loss_val, integrated_trajectory, control_constraint_diff
+
 
 def _add_xy_yaw_metric_losses(
         pose_based: bool,
@@ -1090,16 +1104,17 @@ def _add_xy_yaw_metric_losses(
         else:
             # --- (1) control 공간(vx,vy,yaw_rate) 지표 ---
             # diffusion_sequence: (B, (1+)Pnn, future_len, 3)
-            score_denorm = state_normalizer.inverse(data=diffusion_sequence,
-                                                    valid_mask=target_future_valid_bool,
-                                                    )
+            score_denorm = state_normalizer.inverse(
+                data=diffusion_sequence,
+                valid_mask=target_future_valid_bool,
+            )
 
             # normed_target_future_seq_gt: (B, (1+)Pnn, future_len, 3)
 
-            target_future_ctrl_gt = state_normalizer.inverse(data=normed_target_future_seq_gt,
-                                                             valid_mask=target_future_valid_bool,
-                                                             )
-
+            target_future_ctrl_gt = state_normalizer.inverse(
+                data=normed_target_future_seq_gt,
+                valid_mask=target_future_valid_bool,
+            )
 
             vxy_yaw_losses = _compute_vxy_yaw_losses(
                 score_denorm,  # (B,P,T,3)
@@ -1161,9 +1176,10 @@ def _add_xy_yaw_metric_losses(
         if control_constraint_diff is not None:
             # control_constraint_diff: (B, (1+)Pnn, future_len, 3)
             # target_future_valid_bool :  (B, (1 +) Pnn, future_len)
-            constraint_diff_denorm = state_normalizer.inverse(data=control_constraint_diff,
-                                                             valid_mask=target_future_valid_bool,
-                                                             )
+            constraint_diff_denorm = state_normalizer.inverse(
+                data=control_constraint_diff,
+                valid_mask=target_future_valid_bool,
+            )
 
             constraint_xy_yaw_losses = _compute_control_xy_yaw_diff(
                 constraint_diff_denorm,
@@ -1293,14 +1309,17 @@ def _should_compute_xy_yaw_metrics_this_step(args: Any) -> bool:
 
     return (step_idx % interval) == 0
 
+
 from typing import Optional
 import torch
 
+
 def _get_v_target_future_seq_gt(
-    normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, T, C)
-    random_noise: torch.Tensor,                 # (B, (1+)Pnn, T, C)  == epsilon
-    std: torch.Tensor,                          # (B, 1, 1, 1) or (B, 1, T, 1) == sigma(t)
-    target_future_valid: Optional[torch.Tensor] = None,  # (B, (1+)Pnn, T) or None
+        normed_target_future_seq_gt: torch.Tensor,  # (B, (1+)Pnn, T, C)
+        random_noise: torch.Tensor,  # (B, (1+)Pnn, T, C)  == epsilon
+        std: torch.Tensor,  # (B, 1, 1, 1) or (B, 1, T, 1) == sigma(t)
+        target_future_valid: Optional[
+            torch.Tensor] = None,  # (B, (1+)Pnn, T) or None
 ) -> torch.Tensor:
     """v 예측 학습에 쓰는 정답(v target)을 만든다.
 
@@ -1335,47 +1354,48 @@ def _get_v_target_future_seq_gt(
         )
 
     if std.dim() != 4:
-        raise ValueError(f"std must be 4D (B,1,1,1) or (B,1,T,1). got {tuple(std.shape)}")
+        raise ValueError(
+            f"std must be 4D (B,1,1,1) or (B,1,T,1). got {tuple(std.shape)}")
 
     B, P, T, C = normed_target_future_seq_gt.shape  # (B, P, T, C)
 
-    if int(std.shape[0]) != int(B) or int(std.shape[1]) != 1 or int(std.shape[3]) != 1:
-        raise ValueError(
-            "std shape must be (B,1,1,1) or (B,1,T,1). "
-            f"got std={tuple(std.shape)}, expected B={B}"
-        )
+    if int(std.shape[0]) != int(B) or int(std.shape[1]) != 1 or int(
+            std.shape[3]) != 1:
+        raise ValueError("std shape must be (B,1,1,1) or (B,1,T,1). "
+                         f"got std={tuple(std.shape)}, expected B={B}")
     if int(std.shape[2]) not in (1, int(T)):
-        raise ValueError(
-            "std time dimension must be 1 or T. "
-            f"got std.shape[2]={int(std.shape[2])}, T={int(T)}"
-        )
+        raise ValueError("std time dimension must be 1 or T. "
+                         f"got std.shape[2]={int(std.shape[2])}, T={int(T)}")
 
     if target_future_valid is not None:
         if target_future_valid.shape != (B, P, T):
             raise ValueError(
                 "target_future_valid must have shape (B,P,T). "
-                f"got {tuple(target_future_valid.shape)}, expected {(B,P,T)}"
-            )
+                f"got {tuple(target_future_valid.shape)}, expected {(B,P,T)}")
 
     # ----- 계산 (float32로 올려서 안정적으로) -----
     x0_f = normed_target_future_seq_gt.float()  # (B, P, T, C)
-    eps_f = random_noise.float()                # (B, P, T, C)
-    sigma_f = std.float()                       # (B, 1, 1, 1) or (B, 1, T, 1)
+    eps_f = random_noise.float()  # (B, P, T, C)
+    sigma_f = std.float()  # (B, 1, 1, 1) or (B, 1, T, 1)
 
     # VPSDE_linear에서 α(t) = sqrt(1 - σ(t)^2)
-    alpha_sq = (1.0 - sigma_f * sigma_f).clamp_min(0.0)  # (B,1,1,1) or (B,1,T,1)
-    alpha_f = torch.sqrt(alpha_sq)         # (B,1,1,1) or (B,1,T,1)
+    alpha_sq = (1.0 - sigma_f * sigma_f).clamp_min(
+        0.0)  # (B,1,1,1) or (B,1,T,1)
+    alpha_f = torch.sqrt(alpha_sq)  # (B,1,1,1) or (B,1,T,1)
 
     # v = α*ε - σ*x0
-    v_target = alpha_f * eps_f - sigma_f * x0_f          # (B, P, T, C)
+    v_target = alpha_f * eps_f - sigma_f * x0_f  # (B, P, T, C)
 
     # (선택) invalid는 0으로 덮어서 디버그/로그가 더 깔끔해지게
     if target_future_valid is not None:
-        valid_bpt = _to_bool_mask(target_future_valid).to(device=v_target.device)  # (B,P,T)
-        v_target = v_target.masked_fill(~valid_bpt.unsqueeze(-1), 0.0)             # (B,P,T,C)
+        valid_bpt = _to_bool_mask(target_future_valid).to(
+            device=v_target.device)  # (B,P,T)
+        v_target = v_target.masked_fill(~valid_bpt.unsqueeze(-1),
+                                        0.0)  # (B,P,T,C)
 
     v_target = _require_finite("v_target_future_seq_gt", v_target)
     return v_target
+
 
 def diffusion_loss_func(
     args: Any,
@@ -1461,7 +1481,8 @@ def diffusion_loss_func(
             ego_cur_future_gt_is_valid=ego_cur_future_gt_is_valid,
             # (B, 1 + future_len)
             norm_near_current_4_dim=norm_near_current_4_dim,  # (B, Pnn, 4)
-            normed_near_future_gt_4_dim=near_future_gt_4_dim,  # (B, Pnn, future_len, 4)
+            normed_near_future_gt_4_dim=
+            near_future_gt_4_dim,  # (B, Pnn, future_len, 4)
             near_cur_future_gt_is_valid=
             near_cur_future_gt_is_valid,  # (B, Pnn, 1 + future_len)
         )
@@ -1474,11 +1495,12 @@ def diffusion_loss_func(
         # past_seg_control_gt_3_dim: (B, 1+Pnn, past_len, 3)
         past_seg_control_gt_3_dim = norm_inputs["past_seg_control_gt_3_dim"]
         future_seg_control_gt_3_dim = norm_outputs[
-            "future_seg_control_gt_3_dim"] # (B, (1+)Pnn, future_len, 3)
+            "future_seg_control_gt_3_dim"]  # (B, (1+)Pnn, future_len, 3)
 
         if not args.do_ego_predict:
             past_seg_control_gt_3_dim = past_seg_control_gt_3_dim[:, 1:, :, :]
-            future_seg_control_gt_3_dim = future_seg_control_gt_3_dim[:, 1:, :, :]
+            future_seg_control_gt_3_dim = future_seg_control_gt_3_dim[:,
+                                                                      1:, :, :]
 
         (
             normed_target_seq_gt,  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
@@ -1502,7 +1524,8 @@ def diffusion_loss_func(
     # low_t_mask: (B,)
     # random_noise: (B, (1+)Pnn, future_len, 4 or 3)
     """
-    eps_used: float = _get_diffusion_time_eps(args=args, fallback_eps=float(eps))
+    eps_used: float = _get_diffusion_time_eps(args=args,
+                                              fallback_eps=float(eps))
     (batch_diffusion_time, low_t_mask, random_noise
     ) = _sample_diffusion_time_and_noise(
         normed_target_seq_gt,  # (B, (1+)Pnn,  (1+future_len, 4) or (future_len, 3))
@@ -1551,13 +1574,15 @@ def diffusion_loss_func(
 
     # diffusion_output:  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
     # diffusion_sequence : (B, (1+)Pnn, T,4) or (B, (1+)Pnn, T,3)
-    diffusion_output, diffusion_sequence = extract_from_decoder(future_len=args.future_len, decoder_output=decoder_output)
+    diffusion_output, diffusion_sequence = extract_from_decoder(
+        future_len=args.future_len, decoder_output=decoder_output)
 
     # dpm_loss: (B, (1+)Pnn, future_len)
     dpm_loss: torch.Tensor = _compute_dpm_loss(
         args=args,
         model_type=model_type,
-        diffusion_output=diffusion_output,  # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, future_len, 3)
+        diffusion_output=
+        diffusion_output,  # (B, (1+)Pnn, future_len, 4) or (B, (1+)Pnn, future_len, 3)
         std=std,  # (B, 1, 1, 1)
         random_noise=random_noise,  # (B, (1+)Pnn, future_len, 4 or 3)
         normed_target_future_seq_gt=
@@ -1606,8 +1631,7 @@ def diffusion_loss_func(
          decoder_output=decoder_output,
          norm_target_future_gt_4_dim=
          norm_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
-         target_future_valid=
-         target_future_valid,  # (B, (1 +) Pnn, future_len)
+         target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
          low_t_mask_3_ndim=low_t_mask_3_ndim,  # (B,1,1)
          w_t=w_t,  # (1, 1, future_len)
          base_loss=loss_val,  # scalar
@@ -1629,10 +1653,7 @@ def diffusion_loss_func(
         if bool(getattr(args, "do_ego_predict", True)):
             # (B, 1+Pnn, 4)
             norm_target_cur_gt_4_dim = torch.cat(
-                [
-                    norm_ego_cur_gt_4_dim.unsqueeze(1),
-                    norm_near_current_4_dim
-                ],
+                [norm_ego_cur_gt_4_dim.unsqueeze(1), norm_near_current_4_dim],
                 dim=1,
             )
             # (B, 1+Pnn)
@@ -1656,13 +1677,13 @@ def diffusion_loss_func(
             pose_based=args.pose_based,
             loss_dict=loss_dict,
             state_normalizer=state_normalizer,
-            diffusion_sequence=diffusion_sequence,  #  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
+            diffusion_sequence=
+            diffusion_sequence,  #  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
             normed_target_future_seq_gt=
             normed_target_future_seq_gt,  # # (B, (1+)Pnn, future_len, 4 or 3)
             norm_target_future_gt_4_dim=
             norm_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
-            target_future_valid=
-            target_future_valid,  # (B, (1 +) Pnn, future_len)
+            target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
             integrated_trajectory=
             integrated_trajectory,  # (B, (1+)Pnn, T, 4) 또는 None
             control_constraint_diff=
