@@ -89,7 +89,6 @@ export DP_ENABLE_CPU_MONITOR=0
     --max_grad_norm 1.0 \
     --prefetch_factor 8 \
     --feasible_learn_noise_thresh 1.0 \
-    --auto_tune_aux_weights false \
     --use_amortized_diffusion false \
     --p_sat 0.0 \
     --w_dir 1.0 \
