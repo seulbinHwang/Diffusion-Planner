@@ -86,7 +86,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --feasible_learn_noise_thresh 0.33 \
     --p_sat 0.0 \
     --w_dir 1.0 \
-    --w_int_min 1.0 \
-    --w_int_max 1.0 \
+    --w_int_min 0. \
+    --w_int_max 0. \
     --w_const 0. \
     --use_amortized_diffusion false
