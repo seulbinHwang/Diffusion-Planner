@@ -12,7 +12,21 @@ from timm.models.layers import Mlp
 
 PathName = Literal["SA", "FFN", "CA"]
 # -*- coding: utf-8 -*-
+import math
 
+def _safe_logit(prob: float, eps: float = 1e-6) -> float:
+    """확률(prob)을 logit으로 바꿉니다.
+
+    Args:
+        prob (float): (0,1) 범위의 값.
+        eps (float): 0/1 근처로 붙는 걸 막는 작은 값.
+
+    Returns:
+        float: log(prob/(1-prob))
+    """
+    p = float(prob)
+    p = max(float(eps), min(p, 1.0 - float(eps)))
+    return math.log(p / (1.0 - p))
 
 class PRAMV2StateTokenEncoder(nn.Module):
     """현재 프레임 상태를 더 풍부한 토큰으로 바꿉니다(그룹별 처리 후 합치기).
@@ -869,56 +883,86 @@ class PRAMV2TimeModulator(nn.Module):
 class PRAMV2BlockPathScalars(nn.Module):
     """블록×경로 토글 스칼라 및 게이트 편향.
 
-    내부에 학습 가능한 스칼라 4종을 둔다:
-      - k_s     : Δscale 강도 스케일
-      - k_sh    : shift 강도 스케일
-      - k_g     : gate 강도 스케일
-      - beta_g  : gate 전용 편향
+    게이트는 보통 아래처럼 만들어집니다.
+        gate = sigmoid(logit_time + k_g * logit_base + beta_g)
 
-    Args:
-        depth: DiT 블록 개수
-        num_paths: 3 (SA/FFN/CA)
+    여기서 초기에는 logit_time≈-3, logit_base≈-3 이라서
+        sigmoid(-6)≈0.0025 로 거의 꺼진 상태가 됩니다.
+
+    그래서 CA 경로(beta_g[:, CA])만 초기값을 올려
+    학습 초반부터 CA가 실제로 작동하게 합니다.
     """
 
     PATH_INDEX = {"SA": 0, "FFN": 1, "CA": 2}
 
-    def __init__(self, depth: int, num_paths: int = 3) -> None:
-        super().__init__()
-        self.depth = depth
-        self.num_paths = num_paths
+    def __init__(
+        self,
+        depth: int,
+        num_paths: int = 3,
+        *,
+        ca_gate_init_prob: float = 0.25,
+        base_gate_logit_bias: float = -6.0,
+    ) -> None:
+        """초기 게이트를 CA만 열어둡니다.
 
-        # [depth, num_paths] 모양의 파라미터로 구현
-        # 초기화: k_*는 1.0 부근, beta_g는 0.0 부근
-        self.k_s = nn.Parameter(torch.ones(depth, num_paths))
-        self.k_sh = nn.Parameter(torch.ones(depth, num_paths))
-        self.k_g = nn.Parameter(torch.ones(depth, num_paths))
-        self.beta_g = nn.Parameter(torch.zeros(depth, num_paths))
+        Args:
+            depth (int): 블록 개수.
+            num_paths (int): 경로 개수(기본 3: SA/FFN/CA).
+            ca_gate_init_prob (float): CA 게이트가 처음에 갖길 원하는 대략적인 값(0~1).
+            base_gate_logit_bias (float):
+                초기 상태에서 (logit_time + k_g*logit_base)의 값.
+                지금 코드 초기화라면 보통 -6.0 근처입니다.
+        """
+        super().__init__()
+        self.depth = int(depth)
+        self.num_paths = int(num_paths)
+
+        self.k_s = nn.Parameter(torch.ones(self.depth, self.num_paths))
+        self.k_sh = nn.Parameter(torch.ones(self.depth, self.num_paths))
+        self.k_g = nn.Parameter(torch.ones(self.depth, self.num_paths))
+        self.beta_g = nn.Parameter(torch.zeros(self.depth, self.num_paths))
+
+        self._init_ca_gate_bias(
+            ca_gate_init_prob=float(ca_gate_init_prob),
+            base_gate_logit_bias=float(base_gate_logit_bias),
+        )
+
+    def _init_ca_gate_bias(
+        self,
+        *,
+        ca_gate_init_prob: float,
+        base_gate_logit_bias: float,
+    ) -> None:
+        """CA 경로의 beta_g만 초기값을 설정합니다.
+
+        목표:
+            gate_CA ≈ ca_gate_init_prob
+
+        계산:
+            gate = sigmoid(base_logit + beta)
+            => beta = logit(gate_target) - base_logit
+
+        Args:
+            ca_gate_init_prob (float): 원하는 CA 게이트 값(0~1).
+            base_gate_logit_bias (float): 초기 base_logit 값(보통 -6.0).
+        """
+        ca_idx = int(self.PATH_INDEX["CA"])
+        target_logit = _safe_logit(float(ca_gate_init_prob))  # scalar
+        beta_init = float(target_logit) - float(base_gate_logit_bias)  # scalar
+
+        with torch.no_grad():
+            self.beta_g[:, ca_idx].fill_(beta_init)
 
     def _path_to_index(self, path: PathName) -> int:
-        """경로명 → 인덱스 변환.
-
-        # path: PathName = Literal["SA", "FFN", "CA"]
-        # PATH_INDEX = {"SA": 0, "FFN": 1, "CA": 2}
-        """
         return self.PATH_INDEX[path]
 
     def get_scalars(
         self,
         block_index: int,
-        path: PathName  # Literal["SA", "FFN", "CA"]
+        path: PathName,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """블록/경로별 스칼라 4종(k_s, k_sh, k_g, beta_g)을 반환.
-
-        Args:
-            block_index: 0..depth-1
-            path: "SA" | "FFN" | "CA"
-
-        Returns:
-            (k_s, k_sh, k_g, beta_g): 각 0-D 또는 [1] 텐서(브로드캐스트 용이)
-        """
-        i = block_index
+        i = int(block_index)
         j = self._path_to_index(path)
-        # 0-D 텐서 반환 (필요 시 .view(1,1,1)로 브로드캐스트)
         return (
             self.k_s[i, j],
             self.k_sh[i, j],

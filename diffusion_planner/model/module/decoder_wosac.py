@@ -2640,7 +2640,27 @@ class DiT(nn.Module):
             nn.init.zeros_(self.pram_v2_motion_proj.weight)
 
         # 블록×경로 토글 스칼라 및 게이트 편향.
-        self.pram_v2_block_path_scalars = PRAMV2BlockPathScalars(depth=depth)
+        # ---- CA 게이트 초기 오픈(기본 0.25) ----
+        # - config로 조절 가능:
+        #   - pram_ca_gate_init_prob: float (기본 0.25)
+        ca_gate_init_prob: float = float(
+            getattr(config, "pram_ca_gate_init_prob", 0.25))
+
+        # 초기 base logit(대략 -6)을 "실제 모듈 바이어스"에서 읽어 계산
+        # - time 모듈 바이어스(보통 -3) + composer head 바이어스(보통 -3)
+        time_bias: float = float(
+            self.pram_v2_time_mod.lin_logit_gate.bias.detach().view(-1)[
+                0].item())
+        base_bias: float = float(
+            self.pram_v2_composer.head_logit_gate.bias.detach().view(-1)[
+                0].item())
+        base_gate_logit_bias: float = time_bias + base_bias  # 보통 -6.0
+
+        self.pram_v2_block_path_scalars = PRAMV2BlockPathScalars(
+            depth=depth,
+            ca_gate_init_prob=ca_gate_init_prob,
+            base_gate_logit_bias=base_gate_logit_bias,
+        )
 
         # 9단계: v2 전용 최종 LN/Linear(출력 투영)
         self.pram_v2_final_norm = nn.LayerNorm(hidden_dim)
@@ -2674,6 +2694,85 @@ class DiT(nn.Module):
         #################
         self._sde = sde
         self.marginal_prob_std = self._sde.marginal_prob_std
+
+    from typing import Optional
+
+    def _build_ca_gate_type_logit_bias_packed(
+            self,
+            *,
+            target_current_11_dim: torch.Tensor,  # (B, P, 11)
+            agent_indices: torch.Tensor,  # (T,)  unpad 인덱스(b*P + p)
+            reference_tensor: torch.Tensor,  # dtype/device 기준
+    ) -> Optional[torch.Tensor]:
+        """에이전트 타입에 따라 CA 게이트(logit)에 더할 bias를 packed 형태로 만듭니다.
+
+        이 bias는 "CA 경로"에만 더해집니다(= SA/FFN에는 영향 없음).
+
+        입력/출력 shape
+        - target_current_11_dim: (B, P, 11)
+          - type one-hot은 [:, :, 8:11] (3개) 라고 가정합니다. (vehicle/ped/bicycle)
+        - agent_indices: (T,)  (unpad된 유효 에이전트 토큰의 flatten 인덱스)
+        - 반환: (1, 1, T, 1)  (gate logit에 브로드캐스트로 더하기 좋게)
+
+        config로 조절(없으면 기본값 사용)
+        - pram_ca_type_gate_bias_enabled: bool (기본 True)
+        - pram_ca_vehicle_gate_logit_bias: float (기본 +1.0)
+        - pram_ca_ped_gate_logit_bias: float (기본 +0.0)
+        - pram_ca_bike_gate_logit_bias: float (기본 +0.0)
+
+        Returns:
+            Optional[torch.Tensor]:
+                - enabled면 (1,1,T,1)
+                - disabled거나 T==0이면 None
+        """
+        enabled: bool = bool(
+            getattr(self.config, "pram_ca_type_gate_bias_enabled", True))
+        if not enabled:
+            return None
+
+        if agent_indices.numel() == 0:
+            return None
+
+        if target_current_11_dim.dim() != 3 or int(
+                target_current_11_dim.shape[-1]) != 11:
+            raise ValueError(
+                f"target_current_11_dim must be (B,P,11). got {tuple(target_current_11_dim.shape)}"
+            )
+
+        B: int = int(target_current_11_dim.shape[0])
+        P: int = int(target_current_11_dim.shape[1])
+
+        # type one-hot: (B,P,3)
+        type_one_hot: torch.Tensor = target_current_11_dim[..., 8:11].to(
+            torch.float32)
+
+        # 타입별 logit bias (스칼라)
+        veh_b: float = float(
+            getattr(self.config, "pram_ca_vehicle_gate_logit_bias", 1.0))
+        ped_b: float = float(
+            getattr(self.config, "pram_ca_ped_gate_logit_bias", 0.0))
+        bik_b: float = float(
+            getattr(self.config, "pram_ca_bike_gate_logit_bias", 0.0))
+
+        bias_vec = torch.tensor([veh_b, ped_b, bik_b],
+                                device=type_one_hot.device,
+                                dtype=torch.float32)  # (3,)
+
+        # (B,P)
+        bias_bp: torch.Tensor = (type_one_hot * bias_vec.view(1, 1, 3)).sum(
+            dim=-1)
+
+        # (B*P)
+        bias_flat: torch.Tensor = bias_bp.reshape(B * P)
+
+        idx = agent_indices.to(dtype=torch.long,
+                               device=bias_flat.device)  # (T,)
+        bias_packed: torch.Tensor = bias_flat.index_select(0, idx)  # (T,)
+
+        # (1,1,T,1) + dtype/device 맞춤
+        bias_packed = bias_packed.view(1, 1, -1, 1).to(
+            device=reference_tensor.device, dtype=reference_tensor.dtype)
+        return bias_packed
 
     def _get_time_embedding(self, diffusion_time: torch.Tensor,
                             ref: torch.Tensor) -> torch.Tensor:
@@ -3374,8 +3473,30 @@ class DiT(nn.Module):
             # 최종 packed 모듈레이션: (depth,3,T,H)
             ds_packed_all = ds_time_p + k_s * ds_base_p
             sh_packed_all = sh_time_p + k_sh * sh_base_p
-            gate_packed_all = torch.sigmoid(lg_time_p + k_g * lg_base_p +
-                                            beta_g)
+            # ---- (추가) 타입별 CA 게이트 logit bias (vehicle에 더 크게) ----
+            ca_type_bias = self._build_ca_gate_type_logit_bias_packed(
+                target_current_11_dim=target_current_11_dim,  # (B,P,11)
+                agent_indices=agent_indices,  # (T,)
+                reference_tensor=ref_for_dtype,
+            )  # (1,1,T,1) or None
+
+            # ---- SA/FFN은 기존과 동일, CA만 bias를 추가 ----
+            gate_sa = torch.sigmoid(
+                lg_time_p + k_g[:, 0:1] * lg_base_p + beta_g[
+                    :, 0:1])  # (depth,1,T,H)
+            gate_ffn = torch.sigmoid(
+                lg_time_p + k_g[:, 1:2] * lg_base_p + beta_g[
+                    :, 1:2])  # (depth,1,T,H)
+
+            gate_ca_logit = (lg_time_p + k_g[:, 2:3] * lg_base_p + beta_g[
+                :, 2:3])  # (depth,1,T,H)
+            if ca_type_bias is not None:
+                gate_ca_logit = gate_ca_logit + ca_type_bias  # vehicle이면 더 큰 값
+
+            gate_ca = torch.sigmoid(gate_ca_logit)  # (depth,1,T,H)
+
+            gate_packed_all = torch.cat([gate_sa, gate_ffn, gate_ca],
+                                        dim=1)  # (depth,3,T,H)
 
         # 7) 블록 스택: packed로만 수행
         with profile_block(
