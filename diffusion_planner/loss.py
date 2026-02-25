@@ -1509,7 +1509,6 @@ def diffusion_loss_func(
         eps_used,
         args,
     )
-    loss_dict["low_t_mask_fraction"] = low_t_mask.float().mean().detach()
     # low_t_mask_3_ndim: (B,1,1)
     low_t_mask_3_ndim: torch.Tensor = low_t_mask.view(B, 1, 1)
     """
