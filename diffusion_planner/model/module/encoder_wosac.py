@@ -2517,10 +2517,10 @@ class LaneFusionEncoder(nn.Module):
         drop_path_rate=0.3,
         hidden_dim=192,
         depth=3,
-        tokens_mlp_dim: int = 64,  # ✅ 기본값: 64 -> 16 (압축 토큰 길이)
+        tokens_mlp_dim: int = 16,  # ✅ 기본값: 64 -> 16 (압축 토큰 길이)
         token_pre_hidden_dim: int = 64,  # ✅ token_pre_project의 중간 길이
         channels_mlp_dim=192,
-        mixer_channels_mlp_ratio: float = 1.,  # ✅ 토큰 단계에서 '큰 특징 변환' 줄이기
+        mixer_channels_mlp_ratio: float = 0.25,  # ✅ 토큰 단계에서 '큰 특징 변환' 줄이기
         lane_post_hidden_dim: Optional[
             int] = None,  # ✅ pool 이후 큰 MLP 중간 길이(기본 자동)
         num_fourier_frequencies=4,
