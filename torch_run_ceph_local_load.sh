@@ -67,12 +67,12 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "w_integ_loss_thres_1_p_sat_0.25_ft_test_freeze" \
+    --name "w_integ_loss_thres_1_p_sat_0.25_ft_test_freeze2" \
     --load_name "w_integ_loss_thres_1_p_sat_0.25" \
     --resume_wandb_model_name latest \
     --resume_model_only True \
     --freeze_encoder_local True \
-    --freeze_encoder_global False \
+    --freeze_encoder_global True \
     --batch_size 1536 \
     --warm_up_epoch 0 \
     --train_epochs 275 \
