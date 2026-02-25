@@ -93,3 +93,4 @@ export DP_ENABLE_CPU_MONITOR=0
     --use_amortized_diffusion true \
     --p_sat 0.0 \
     --w_dir 1.0 \
+    --w_int_max 1.0
