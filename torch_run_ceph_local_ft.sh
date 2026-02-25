@@ -67,7 +67,7 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
+    --name "w_integ_loss_thres_1_p_sat_0.25_ft_2_no_acc" \
     --load_name "w_integ_loss_thres_1_p_sat_0.25" \
     --resume_wandb_model_name latest \
     --resume_model_only True \
