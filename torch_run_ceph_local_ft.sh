@@ -53,11 +53,6 @@ RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
 LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
 LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
 
-# ====== 여기만 너 상황에 맞게 바꾸면 됨 ======
-PRETRAIN_NAME="w_integ_loss_thres_1_p_sat_0.25"   # torch_run_ceph_local.sh에서 썼던 --name
-FT_NAME="ft_freeze_encoder_wosac_${RUN_ID}"       # 새 fine-tune 실험 이름
-RESUME_ALIAS="latest"                             # 현재 코드가 latest만 허용
-# ==============================================
 
 export DP_ENABLE_CPU_MONITOR=0
 

@@ -2662,11 +2662,6 @@ def _predict_rollouts_batched_one_chunk(
         data=norm_outputs["future_seg_control_gt_3_dim"],
         valid_mask=norm_outputs["future_seg_control_is_valid"],
     )
-    # (B, (1+)Pnn, future_len, 3)
-    norm_outputs["future_seg_control_gt_3_dim"] = state_normalizer(
-        data=norm_outputs["future_seg_control_gt_3_dim"],
-        valid_mask=norm_outputs["future_seg_control_is_valid"],
-    )
 
     # -----------------------------------------
     # ✅ 저장 요청값은 보관만 하고,
