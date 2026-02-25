@@ -76,8 +76,8 @@ export DP_ENABLE_CPU_MONITOR=0
     --batch_size 1536 \
     --warm_up_epoch 0 \
     --train_epochs 275 \
-    --learning_rate 4e-4 \
-    --min_learning_rate 2e-5 \
+    --learning_rate 1e-3 \
+    --min_learning_rate 5e-5 \
     --pose_based False \
     --profile_feasible False \
     --use_feasible True \
