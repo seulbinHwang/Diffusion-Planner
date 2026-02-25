@@ -1203,19 +1203,20 @@ class FeasibleProjector(nn.Module):
             eps=hp.eps,
         )
 
-        vx_after, vy_after, omega_after = self._apply_S2_accel_alpha_limits_ste_batch(
-            vx_b=vx_after,
-            vy_b=vy_after,
-            omega=omega_raw,
-            a_max=key_to_limit_bp["a_max"],
-            alpha_max=key_to_limit_bp["alpha_max"],
-            dt=float(hp.dt),
-            eta=float(hp.eta_inc),
-            eps=float(hp.eps),
-            is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # ✅ 추가
-            target_current_control=target_current_control,
-            target_current_control_valid=target_current_control_valid,
-        )
+        # vx_after, vy_after, omega_after = self._apply_S2_accel_alpha_limits_ste_batch(
+        #     vx_b=vx_after,
+        #     vy_b=vy_after,
+        #     omega=omega_raw,
+        #     a_max=key_to_limit_bp["a_max"],
+        #     alpha_max=key_to_limit_bp["alpha_max"],
+        #     dt=float(hp.dt),
+        #     eta=float(hp.eta_inc),
+        #     eps=float(hp.eps),
+        #     is_nonholonomic=key_to_limit_bp["is_nonholonomic"],  # ✅ 추가
+        #     target_current_control=target_current_control,
+        #     target_current_control_valid=target_current_control_valid,
+        # )
+        omega_after = omega_raw
 
         omega_after = self._apply_S3_omega_clip_ste(
             vx_b=vx_after,
