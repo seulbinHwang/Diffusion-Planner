@@ -62,7 +62,7 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "w_integ_loss_thres_1_p_sat_0.25_ft_2_w_const_0" \
+    --name "w_integ_loss_thres_1_p_sat_0.25_ft_2_w_const_0_flnt_1" \
     --load_name "w_integ_loss_thres_1_p_sat_0.25" \
     --resume_wandb_model_name latest \
     --resume_model_only True \
@@ -83,7 +83,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --num_workers 3 \
     --max_grad_norm 1.0 \
     --prefetch_factor 8 \
-    --feasible_learn_noise_thresh 0.33 \
+    --feasible_learn_noise_thresh 1 \
     --p_sat 0.0 \
     --w_dir 1.0 \
     --w_int_min 0. \
