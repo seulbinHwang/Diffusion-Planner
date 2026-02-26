@@ -354,7 +354,12 @@ def get_args():
         default=True,
         type=boolean,
         help='True이면 AdamW 옵티마이저 상태를 8비트로 저장해 GPU 메모리 사용을 줄입니다.')
-
+    parser.add_argument(
+        "--move_by_recovery",
+        action="store_true",
+        default=True,
+        help="True면 rollout에서 실제 이동(execute)도 recovery 적용 후 궤적으로 진행합니다.",
+    )
     parser.add_argument('--train_epochs',
                         type=int,
                         help='epochs of training',

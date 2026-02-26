@@ -2269,6 +2269,76 @@ def _convert_target_chunk_to_world(
     return unnorm_target_pose_chunk_world
 
 
+from typing import Any
+import torch
+
+
+def _should_move_by_recovery(args: Any) -> bool:
+    """rollout에서 실제 이동(execute)에 recovery 궤적을 쓸지 결정합니다.
+
+    Args:
+        args (Any): 설정 객체. args.move_by_recovery(bool)를 사용합니다. shape: ()
+
+    Returns:
+        bool:
+            - True: recovery 적용 후 궤적으로 이동
+            - False: 기존(best) 궤적으로 이동
+            shape: ()
+    """
+    return bool(getattr(args, "move_by_recovery", False))
+
+
+def _compute_seg_control_from_pose4(
+    pose_4_dim: torch.Tensor,  # (B, 1+Pnn, 1+T, 4)
+    dt: float,
+) -> torch.Tensor:  # (B, 1+Pnn, T, 3)
+    """(x,y,cos,sin) 포즈열에서 구간 제어(vx_b, vy_b, yaw_rate)를 계산합니다.
+
+    - 입력은 (현재 1칸 + 미래 T칸) 포즈입니다.
+    - 출력은 구간(T개) 제어입니다.
+    - 포즈가 전부 0인 프레임(패딩)은 무효로 보고, 그 구간 제어는 0으로 둡니다.
+
+    Args:
+        pose_4_dim (torch.Tensor):
+            포즈 시퀀스.
+            shape: (B, 1+Pnn, 1+T, 4)
+        dt (float):
+            시간 간격(초). shape: ()
+
+    Returns:
+        torch.Tensor:
+            구간 제어 시퀀스.
+            shape: (B, 1+Pnn, T, 3)
+    """
+    if pose_4_dim.dim() != 4 or int(pose_4_dim.shape[-1]) != 4:
+        raise ValueError(
+            "pose_4_dim은 (B, 1+Pnn, 1+T, 4) 이어야 합니다. "
+            f"got shape={tuple(pose_4_dim.shape)}"
+        )
+
+    # (B, 1+Pnn, 1+T, 3)
+    pose_3_dim = _traj11_to_traj3_heading(pose_4_dim)
+
+    # (B, 1+Pnn, T, 3)
+    ctrl = differentiate_numpy_pose3_to_control3(
+        pose_3_dim,
+        dt=float(dt),
+        eps=1e-8,
+        normalize_yaw=True,
+        wrap_heading=True,
+    )
+
+    # 프레임 유효: (B, 1+Pnn, 1+T)
+    frame_valid = _build_valid_mask_for_pose_4_dim(pose_4_dim)
+
+    # 구간 유효: 양 끝 프레임이 둘 다 유효할 때만 True
+    # (B, 1+Pnn, T)
+    seg_valid = frame_valid[..., :-1] & frame_valid[..., 1:]
+
+    # 무효 구간은 0으로
+    ctrl = ctrl * seg_valid.unsqueeze(-1).to(dtype=ctrl.dtype)
+    return ctrl
+
 def _predict_one_rollout_sequential(
     args: Any,
     model: nn.Module,
@@ -2461,36 +2531,59 @@ def _predict_one_rollout_sequential(
                         sample_idx_offset
                     ),  # npz 파일명 충돌 방지용 오프셋(보통 rollout_idx * B).
                 )
-
             # ✅ execute: 앞 gap 스텝 반영
-            # unnorm_best_traj: (B, 1+Pnn, 1+future_len, 4)
-            # unnorm_target_pose_chunk: (B, 1+Pnn, gap, 4)
-            unnorm_target_pose_chunk = unnorm_best_traj[:, :, 1:gap + 1, :]
+            # 기존: unnorm_best_traj로만 이동
+            # 변경: args.move_by_recovery=True면 recovery 적용 후 궤적으로도 이동 가능
 
-            unnorm_origin_pose_world = unnorm_inputs_copy[
-                "origin_world_pose"]  # (B, 4) (x,y,cos,sin)
-            # unnorm_origin_pose_world: (B, (1+)Pnn, gap, 4)
+            move_by_recovery = _should_move_by_recovery(args)
+
+            # ✅ 실제 이동에 쓸 trajectory 선택
+            # - recovery 적용 후(raw) : unnorm_selected_traj_raw
+            # - 기존(best)            : unnorm_best_traj
+            #
+            # 주의: unnorm_selected_gt_traj는 "GT 없는 칸을 0으로 마스킹"한 값이라
+            #       이동에 쓰면 0으로 튈 수 있어 raw를 사용합니다.
+            execute_traj = unnorm_selected_traj_raw if move_by_recovery else unnorm_best_traj  # (B, 1+Pnn, 1+future_len, 4)
+
+            # unnorm_target_pose_chunk: (B, 1+Pnn, gap, 4)
+            unnorm_target_pose_chunk = execute_traj[:, :, 1:gap + 1, :]
+
+            # ✅ pose_based=False면, past_seg_control에도 "실제로 이동한 포즈"에서 나온 control을 넣는 게 더 일관적입니다.
+            # - move_by_recovery=False일 때는 기존대로(model이 준 best_control_seq) 사용
+            # - move_by_recovery=True일 때만, execute_traj 기반으로 control chunk를 다시 계산해 덮어씁니다.
+            pose_based = bool(getattr(args, "pose_based", True))
+            if (not pose_based) and move_by_recovery:
+                # (B, 1+Pnn, 1+gap, 4)  = 현재 포함
+                pose4_for_ctrl = execute_traj[:, :, :gap + 1, 0:4]
+                unnorm_target_control_chunk = _compute_seg_control_from_pose4(
+                    pose_4_dim=pose4_for_ctrl,
+                    dt=float(0.1),  # 기존 저장 로직과 동일하게 0.1 사용
+                )  # (B, 1+Pnn, gap, 3)
+
+            unnorm_origin_pose_world = unnorm_inputs_copy["origin_world_pose"]  # (B, 4) (x,y,cos,sin)
+
+            # unnorm_target_pose_chunk_world: (B, 1+Pnn, gap, 4)
             unnorm_target_pose_chunk_world = _convert_target_chunk_to_world(
                 unnorm_target_pose_chunk=unnorm_target_pose_chunk,
                 gap=int(gap),
                 unnorm_origin_pose_world=unnorm_origin_pose_world,
             )
-            # (B, 4)
-            unnorm_inputs_copy[
-                "origin_world_pose"] = unnorm_target_pose_chunk_world[:, 0,
-                                                                      -1, :]
-            unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:,
-                                                             0, :, :]  # (B, gap, 4)
-            unnorm_near_pose_chunk = unnorm_target_pose_chunk[:,
-                                                              1:, :, :]  # (B, Pnn, gap, 4)
-            (unnorm_inputs_copy, unnorm_outputs_copy
-            ) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
+
+            # (B, 4) - ego의 마지막 월드 포즈로 갱신
+            unnorm_inputs_copy["origin_world_pose"] = unnorm_target_pose_chunk_world[:, 0, -1, :]
+
+            # (B, gap, 4)
+            unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:, 0, :, :]
+
+            # (B, Pnn, gap, 4)
+            unnorm_near_pose_chunk = unnorm_target_pose_chunk[:, 1:, :, :]
+
+            (unnorm_inputs_copy, unnorm_outputs_copy) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
                 unnorm_inputs_copy=unnorm_inputs_copy,
                 unnorm_outputs_copy=unnorm_outputs_copy,
-                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,  # (B, gap, 4)
-                unnorm_near_pose_chunk=unnorm_near_pose_chunk,  # (B, Pnn, gap, 4)
-                unnorm_target_control_chunk=unnorm_target_control_chunk,
-                # Optional[(B, (1+)Pnn, gap, 3)]
+                unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
+                unnorm_near_pose_chunk=unnorm_near_pose_chunk,
+                unnorm_target_control_chunk=unnorm_target_control_chunk,  # Optional[(B, 1+Pnn, gap, 3)]
                 cached_valid_masks=cached_valid_masks,
             )
 
