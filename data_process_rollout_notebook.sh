@@ -182,7 +182,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_wandb False \
   --use_deepspeed True \
   --save_image True \
-  --save_video True \
+  --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0226" \
   --save_inference_data False \
   --finish_when_no_updated_pt False \
@@ -192,7 +192,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --fine_tune_temperature 0.8 \
   --use_recovery True \
   --select_jointly True \
-  --recovery_threshold_m 1. \
+  --recovery_threshold_m 1.0 \
   --scenario_finish_step 10 \
   --time_step_for_compare 80 \
   --time_step_for_recover 10 \

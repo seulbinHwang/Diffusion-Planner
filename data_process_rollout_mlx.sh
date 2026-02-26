@@ -32,7 +32,7 @@ fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
 TRAIN_SET_PATH="${USER_PATH}/dataset/processed"
-TRAIN_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_fine_tuning.json"
+TRAIN_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_fine_tuning24000.json"
 ###################################
 # If validation list json is missing, create it from *.npz in TRAIN_SET_PATH
 ###################################
@@ -118,7 +118,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --resume_model_only True \
   --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
-  --eval_method "train" \
+  --eval_method "fine_tune_data_maker" \
   --batch_size 1536 \
   --pose_based False \
   --profile_feasible False \
@@ -127,11 +127,9 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_feasible_filter True \
   --feasible_grad_to_dit False \
   --use_deepspeed True \
-  --wosac_sub_is_active False \
-  --wosac_metric_is_active False \
   --save_image False \
   --save_video False \
---save_cache_path "/mnt/nuplan/dataset/processed_rollout" \
+--save_cache_path "/workspace/processed_rollout" \
   --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
@@ -140,10 +138,11 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --fine_tune_temperature 0.8 \
   --use_recovery True \
   --select_jointly True \
-  --recovery_threshold_m 1. \
+  --recovery_threshold_m 1.0 \
   --scenario_finish_step 10 \
-  --time_step_for_compare 20 \
-  --use_data_percent 33 \
+  --time_step_for_compare 80 \
+  --use_data_percent 100 \
+  --time_step_for_recover 10 \
   --rollout_number 3 \
   --use_amortized_diffusion False \
   --move_by_recovery True
