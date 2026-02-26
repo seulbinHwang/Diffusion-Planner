@@ -119,7 +119,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --eval_method "fine_tune_data_maker" \
-  --batch_size 720 \
+  --batch_size 600 \
   --pose_based False \
   --profile_feasible False \
   --use_feasible True \
