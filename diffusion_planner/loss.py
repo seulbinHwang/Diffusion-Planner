@@ -940,7 +940,7 @@ def _compute_dpm_loss(
     # loss.py 안 _compute_dpm_loss 내부에서
     C = diffusion_output.shape[-1]  # pose_based=False면 3
     if C == 3:
-        yaw_w = float(getattr(args, "yaw_rate_loss_weight", 2.0))
+        yaw_w = float(getattr(args, "yaw_rate_loss_weight", 1.0))
         w = diffusion_output.new_tensor([1.0, 1.0, yaw_w]).view(1, 1, 1, 3)
     else:
         w = diffusion_output.new_ones((1, 1, 1, C))
@@ -1029,7 +1029,7 @@ def _compute_integration_and_constraint_losses(
                                                 1:, :]  # (B, (1+)Pnn, T, 4)
 
         # per_step: (B,(1+)Pnn,T) float32
-        yaw_pose_w = float(getattr(args, "integration_yaw_weight", 2.0))
+        yaw_pose_w = float(getattr(args, "integration_yaw_weight", 1.0))
         w_pose = integrated_trajectory.new_tensor(
             [1.0, 1.0, yaw_pose_w, yaw_pose_w]).view(1, 1, 1, 4)
         diff = (integrated_trajectory -
