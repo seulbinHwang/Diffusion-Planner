@@ -31,7 +31,7 @@ if [[ -z "${RUN_PYTHON_PATH}" ]]; then
 fi
 echo "[INFO] RUN_PYTHON_PATH=${RUN_PYTHON_PATH}"
 
-TRAIN_SET_PATH="${USER_PATH}/dataset/processed"
+TRAIN_SET_PATH="/workspace/local_shards_v1"
 TRAIN_SET_LIST_PATH="${USER_PATH}/projects/Diffusion-Planner/diffusion_planner_fine_tuning24000.json"
 ###################################
 # If validation list json is missing, create it from *.npz in TRAIN_SET_PATH
