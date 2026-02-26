@@ -194,7 +194,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --select_jointly True \
   --recovery_threshold_m 1. \
   --scenario_finish_step 40 \
-  --time_step_for_compare 60 \
+  --time_step_for_compare 20 \
   --rollout_number 1 \
   --use_amortized_diffusion True
 

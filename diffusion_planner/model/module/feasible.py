@@ -175,7 +175,7 @@ class FeasibleProjector(nn.Module):
                     R_min_m=0.00001,
                     omega_max_abs_radps=3.3,
                     v_b_y_max=1.3,
-                    beta_max_rad=10.0,  # ✅ TODO: (라디안) 통계값 넣기
+                    beta_max_rad=10.0,
                 ),
             ActorClass.BICYCLE:
                 DynamicLimits(

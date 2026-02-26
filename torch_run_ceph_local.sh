@@ -110,7 +110,7 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2" \
+    --name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2_no_amor" \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -131,3 +131,4 @@ export DP_ENABLE_CPU_MONITOR=0
     --w_int_max 1.0 \
     --w_const 0.0 \
     --lane_summary_num 0 \
+    --use_amortized_diffusion False
