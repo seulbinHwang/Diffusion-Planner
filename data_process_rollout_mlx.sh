@@ -110,7 +110,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 6 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
- finetune_data_maker.py \
+ finetune_data_maker_custom.py \
  --port 23001 \
   --eval_set "$TRAIN_SET_PATH" \
   --eval_set_list "$TRAIN_SET_LIST_PATH" \
