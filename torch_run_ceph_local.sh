@@ -128,7 +128,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --p_sat 0.25 \
     --w_dir 1.0 \
     --w_int_min 0.05 \
-    --w_int_max 1.0 \
+    --w_int_max 2.0 \
     --w_const 0.0 \
     --lane_summary_num 0 \
     --use_amortized_diffusion False
