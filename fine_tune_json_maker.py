@@ -177,7 +177,7 @@ def main() -> None:
     # 사용자가 output을 안 주면, 요청하신 '...fine_tuning{2N}.json' 형태로 생성
     if args.output is None:
         two_n = 2 * args.n
-        output_path = Path(f"/mnt/nuplan/projects/Diffusion-Planner.diffusion_planner_fine_tuning{two_n}.json")
+        output_path = Path(f"/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_fine_tuning{two_n}.json")
     else:
         output_path = Path(args.output)
 
