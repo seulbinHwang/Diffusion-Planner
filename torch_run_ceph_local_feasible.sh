@@ -49,8 +49,15 @@ else
 fi
 
 RUN_PYTHON_PATH="/mnt/nuplan/miniforge/envs/diffusion_planner/bin/python"
-LOCAL_TRAIN_SET_PATH="/workspace/processed_fine_tuning"
-LOCAL_TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_real_ft.json"
+
+LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
+LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
+
+# ====== 여기만 너 상황에 맞게 바꾸면 됨 ======
+PRETRAIN_NAME="w_integ_loss_thres_1_p_sat_0.25"   # torch_run_ceph_local.sh에서 썼던 --name
+FT_NAME="ft_freeze_encoder_wosac_${RUN_ID}"       # 새 fine-tune 실험 이름
+RESUME_ALIAS="latest"                             # 현재 코드가 latest만 허용
+# ==============================================
 
 export DP_ENABLE_CPU_MONITOR=0
 
@@ -60,7 +67,7 @@ export DP_ENABLE_CPU_MONITOR=0
   train_predictor.py \
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-    --name "w_integ_loss_thres_1_p_sat_0.25_sft" \
+    --name "w_integ_loss_thres_1_p_sat_0.25_ft_flnt_1_w_const_0.5" \
     --load_name "w_integ_loss_thres_1_p_sat_0.25" \
     --resume_wandb_model_name latest \
     --resume_model_only True \
@@ -75,7 +82,7 @@ export DP_ENABLE_CPU_MONITOR=0
     --profile_feasible False \
     --use_feasible True \
     --use_feasible_dl False \
-    --use_feasible_filter False \
+    --use_feasible_filter True \
     --feasible_grad_to_dit True \
     --feasible_stride_dt 0.1 \
     --num_workers 3 \
@@ -86,5 +93,5 @@ export DP_ENABLE_CPU_MONITOR=0
     --w_dir 1.0 \
     --w_int_min 1.0 \
     --w_int_max 1.0 \
-    --w_const 0.0 \
+    --w_const 0.5 \
     --use_amortized_diffusion false

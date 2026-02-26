@@ -289,6 +289,8 @@ def get_args():
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
+    parser.add_argument('--yaw_rate_loss_weight', default=1., type=float)
+    parser.add_argument('--integration_yaw_weight', default=1., type=int)
     parser.add_argument('--num_workers', default=3, type=int)
     parser.add_argument('--prefetch_factor', type=int, default=8)
 

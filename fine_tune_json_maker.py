@@ -193,4 +193,4 @@ if __name__ == "__main__":
     main()
 
 
-# python3 fine_tune_json_maker.py --n 5000 --seed 0
+# python3 fine_tune_json_maker.py --n 360000 --seed 0
