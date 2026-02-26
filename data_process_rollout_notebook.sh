@@ -181,10 +181,10 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --feasible_grad_to_dit False \
   --use_wandb False \
   --use_deepspeed True \
-  --save_image True \
+  --save_image False \
   --save_video False \
   --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0226" \
-  --save_inference_data False \
+  --save_inference_data True \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --fine_tune_gen_k 64 \
@@ -198,4 +198,5 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --time_step_for_recover 10 \
   --rollout_number 1 \
   --use_amortized_diffusion False \
-  --move_by_recovery True
+  --move_by_recovery True \
+  --verbose True
