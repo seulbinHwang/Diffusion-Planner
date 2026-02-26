@@ -356,7 +356,7 @@ def get_args():
         help='True이면 AdamW 옵티마이저 상태를 8비트로 저장해 GPU 메모리 사용을 줄입니다.')
     parser.add_argument(
         "--move_by_recovery",
-        action="store_true",
+        type=boolean,
         default=True,
         help="True면 rollout에서 실제 이동(execute)도 recovery 적용 후 궤적으로 진행합니다.",
     )

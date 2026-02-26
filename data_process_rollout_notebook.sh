@@ -169,8 +169,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "38_control_only_new_network_1e-3" \
-  --name "38_control_only_new_network_1e-3" \
+  --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
+  --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --eval_method "fine_tune_data_maker" \
   --batch_size 1 \
   --pose_based False \
@@ -183,8 +183,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_deepspeed True \
   --save_image True \
   --save_video True \
-  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0218" \
-  --save_inference_data True \
+  --save_cache_path "/home/user/nuplan/dataset/processed_rollout_0226" \
+  --save_inference_data False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
   --fine_tune_gen_k 16 \
@@ -193,9 +193,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_recovery True \
   --select_jointly True \
   --recovery_threshold_m 1. \
-  --scenario_finish_step 40 \
+  --scenario_finish_step 10 \
   --time_step_for_compare 20 \
   --rollout_number 1 \
-  --use_amortized_diffusion True
-
-#  --resume_local_path_model_path "/mnt/nuplan/projects/Diffusion-Planner/training_log/new-adaLN-weighted-loss-h-two/2025-09-21-13:25:45" \
+  --use_amortized_diffusion False \
+  --move_by_recovery True

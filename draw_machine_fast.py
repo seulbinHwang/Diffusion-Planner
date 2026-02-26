@@ -171,9 +171,9 @@ class DrawingOptions:
     """
     background_color: str = BLACK
     show_axis: bool = False
-    fig_size: Tuple[float, float] = (13.0, 13.0)
-    dpi: int = 300
-    margin_m: float = 5.0
+    fig_size: Tuple[float, float] = (15.0, 15.0)
+    dpi: int = 400
+    margin_m: float = 3.0
     equal_aspect: bool = True
     invalid_eps: float = 0.0
 

@@ -116,8 +116,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --eval_set_list "$TRAIN_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "8_control_only_new_network_1e-3" \
-  --name "8_control_only_new_network_1e-3" \
+  --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
+  --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --eval_method "train" \
   --batch_size 1536 \
   --pose_based False \
@@ -141,9 +141,9 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --use_recovery True \
   --select_jointly True \
   --recovery_threshold_m 1. \
-  --scenario_finish_step 20 \
-  --time_step_for_compare 60 \
-  --use_data_percent 2 \
+  --scenario_finish_step 10 \
+  --time_step_for_compare 20 \
+  --use_data_percent 33 \
   --rollout_number 3 \
-  --use_amortized_diffusion True \
-  --dp_sample_k_candidate_batch_size 4
+  --use_amortized_diffusion False \
+  --move_by_recovery True
