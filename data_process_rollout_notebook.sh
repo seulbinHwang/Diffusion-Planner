@@ -163,7 +163,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 
 
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" --redirects 3 --tee "$TEE" \
- finetune_data_maker.py \
+ finetune_data_maker_custom.py \
  --port 23001 \
   --eval_set "$EVAL_SET_PATH" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
@@ -187,14 +187,15 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --save_inference_data False \
   --finish_when_no_updated_pt False \
   --run_count "$RUN_COUNT" \
-  --fine_tune_gen_k 16 \
+  --fine_tune_gen_k 64 \
   --rollout_time_chunk_size 1 \
   --fine_tune_temperature 0.8 \
   --use_recovery True \
   --select_jointly True \
   --recovery_threshold_m 1. \
   --scenario_finish_step 10 \
-  --time_step_for_compare 20 \
+  --time_step_for_compare 80 \
+  --time_step_for_recover 10 \
   --rollout_number 1 \
   --use_amortized_diffusion False \
   --move_by_recovery True
