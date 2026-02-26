@@ -119,7 +119,7 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
   --eval_method "fine_tune_data_maker" \
-  --batch_size 1536 \
+  --batch_size 1440 \
   --pose_based False \
   --profile_feasible False \
   --use_feasible True \
@@ -145,4 +145,5 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
   --time_step_for_recover 10 \
   --rollout_number 3 \
   --use_amortized_diffusion False \
-  --move_by_recovery True
+  --move_by_recovery True \
+  --verbose True
