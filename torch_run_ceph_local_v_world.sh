@@ -84,22 +84,22 @@ TRAIN_SET_PATH="/mnt/nuplan/dataset/processed"
 TRAIN_SET_LIST_PATH="/mnt/nuplan/projects/Diffusion-Planner/diffusion_planner_training.json"
 
 # (로컬) 학습에 사용할 경로
-LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v1"
-LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v1/diffusion_planner_training.json"
+LOCAL_TRAIN_SET_PATH="/workspace/local_shards_v_world"
+LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v_world/diffusion_planner_training.json"
 
 # 복사 강제 옵션: 1이면 항상 다시 복사
 FORCE_REBUILD=0
 
-### 로컬 데이터 준비(복사 1회 + 로컬 리스트 생성)
-#"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
-#  --src_root "$TRAIN_SET_PATH" \
-#  --src_list "$TRAIN_SET_LIST_PATH" \
-#  --dst_root "$LOCAL_TRAIN_SET_PATH" \
-#  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-#  --force_rebuild "$FORCE_REBUILD" \
-#  --num_workers 24
-# python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
-#"$RUN_PYTHON_PATH" add_control_to_npz.py --skip_sample_keys --workers 24
+## 로컬 데이터 준비(복사 1회 + 로컬 리스트 생성)
+"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
+  --src_root "$TRAIN_SET_PATH" \
+  --src_list "$TRAIN_SET_LIST_PATH" \
+  --dst_root "$LOCAL_TRAIN_SET_PATH" \
+  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
+  --force_rebuild "$FORCE_REBUILD" \
+  --num_workers 24
+ python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
+"$RUN_PYTHON_PATH" add_control_to_npz.py --skip_sample_keys --workers 24
 #
 #export DP_ENABLE_CPU_MONITOR=0
 #
@@ -111,9 +111,6 @@ FORCE_REBUILD=0
     --train_set "$LOCAL_TRAIN_SET_PATH"/ \
     --train_set_list "$LOCAL_TRAIN_SET_LIST_PATH" \
     --name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2_no_amor" \
-    --load_name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2_no_amor" \
-        --resume_wandb_model_name latest \
-    --resume_model_only False \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
@@ -134,6 +131,4 @@ FORCE_REBUILD=0
     --w_int_max 2.0 \
     --w_const 0.0 \
     --lane_summary_num 0 \
-    --yaw_rate_loss_weight 2. \
-    --integration_yaw_weight 2. \
     --use_amortized_diffusion False
