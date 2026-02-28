@@ -131,5 +131,8 @@ FORCE_REBUILD=0
     --w_int_max 2.0 \
     --w_const 0.0 \
     --lane_summary_num 0 \
+    --save_utd 0 \
+    --yaw_rate_loss_weight 2. \
+    --integration_yaw_weight 2. \
     --use_amortized_diffusion False \
     --use_body_vel False
