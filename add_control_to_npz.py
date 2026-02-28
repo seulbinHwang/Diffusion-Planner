@@ -1161,132 +1161,6 @@ def _get_near_future_segment_valid(
     return near_cur_future_valid, near_future_segment_valid
 
 
-def _build_past_future_seg_control_gt_and_seg_valid_from_npz_arrays(
-    ego_agent_past: ArrayF,  # (Tp,11)
-    ego_future_gt_11_dim: ArrayF,  # (Tf,11)
-    neighbor_agents_past: ArrayF,  # (N,Tp,11)
-    neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
-    *,
-    dt: float,
-    eps: float = 1e-8,
-) -> Tuple[ArrayF, NDArray[np.bool_]]:
-    """(과거~미래) 구간 제어와 seg_valid를 함께 계산합니다.
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray]:
-            controls: shape (1+N, (Tp-1)+Tf, 3)
-                마지막 3은 (v_x^b, v_y^b, yaw_rate)
-            seg_valid: shape (1+N, (Tp-1)+Tf) bool
-                구간이 유효하면 True
-
-    Notes:
-        - 통계 모드에서는 seg_valid=True인 controls만 모아서 mean/std를 계산합니다.
-        - 여기서는 controls를 '그대로' 반환합니다(유효하지 않은 구간을 0으로 만들지 않음).
-          (필요하면 호출자가 seg_valid로 걸러서 쓰면 됩니다.)
-    """
-    ego_past = np.asarray(ego_agent_past)
-    ego_fut11 = np.asarray(ego_future_gt_11_dim)
-    nbr_past = np.asarray(neighbor_agents_past)
-    nbr_fut11 = np.asarray(neighbor_future_gt_11_dim)
-
-    if ego_past.ndim != 2 or ego_past.shape[-1] != 11:
-        raise ValueError(f"ego_agent_past shape는 (Tp,11)이어야 합니다. got {ego_past.shape}")
-    if ego_fut11.ndim != 2 or ego_fut11.shape[-1] != 11:
-        raise ValueError(f"ego_future_gt_11_dim shape는 (Tf,11)이어야 합니다. got {ego_fut11.shape}")
-    if nbr_past.ndim != 3 or nbr_past.shape[-1] != 11:
-        raise ValueError(f"neighbor_agents_past shape는 (N,Tp,11)이어야 합니다. got {nbr_past.shape}")
-    if nbr_fut11.ndim != 3 or nbr_fut11.shape[-1] != 11:
-        raise ValueError(f"neighbor_future_gt_11_dim shape는 (N,Tf,11)이어야 합니다. got {nbr_fut11.shape}")
-
-    Tp = int(ego_past.shape[0])   # (past+cur) = 21
-    Tf = int(ego_fut11.shape[0])  # 80
-    N = int(nbr_past.shape[0])
-
-    if Tp <= 1:
-        raise ValueError(f"Tp는 최소 2 이상이어야 합니다. got Tp={Tp}")
-    if int(nbr_past.shape[1]) != Tp:
-        raise ValueError(f"neighbor_agents_past의 Tp가 ego와 같아야 합니다. got {nbr_past.shape[1]} vs {Tp}")
-    if int(nbr_fut11.shape[0]) != N:
-        raise ValueError(f"neighbor_future_gt_11_dim의 N이 neighbor_agents_past와 같아야 합니다. got {nbr_fut11.shape[0]} vs {N}")
-    if int(nbr_fut11.shape[1]) != Tf:
-        raise ValueError(f"neighbor_future_gt_11_dim의 Tf가 ego_future와 같아야 합니다. got {nbr_fut11.shape[1]} vs {Tf}")
-
-    dt = float(dt)
-    if (not np.isfinite(dt)) or dt <= 0.0:
-        raise ValueError(f"dt는 0보다 큰 유한한 값이어야 합니다. got dt={dt}")
-
-    # float32로 정리 (삼각함수/나눗셈 안정)
-    ego_past = ego_past.astype(np.float32 if ego_past.dtype.kind != "f" else ego_past.dtype, copy=False)
-    ego_fut11 = ego_fut11.astype(ego_past.dtype, copy=False)
-    nbr_past = nbr_past.astype(ego_past.dtype, copy=False)
-    nbr_fut11 = nbr_fut11.astype(ego_past.dtype, copy=False)
-
-    # (1) 과거+현재+미래 11D 타임라인 만들기
-    ego_all11 = np.concatenate([ego_past, ego_fut11], axis=0).astype(np.float32, copy=False)  # (Tp+Tf,11)
-    nbr_all11 = np.concatenate([nbr_past, nbr_fut11], axis=1).astype(np.float32, copy=False)  # (N,Tp+Tf,11)
-
-    # (안전) 현재가 무효면 그 에이전트 전체를 0으로
-    ego_cur_valid = bool((np.abs(ego_past[-1, :8]) > eps).any())
-    if not ego_cur_valid:
-        ego_all11[:] = 0.0
-
-    if N > 0:
-        nbr_cur_valid_mask = (np.abs(nbr_past[:, -1, :8]) > eps).any(axis=1)  # (N,)
-        if not np.all(nbr_cur_valid_mask):
-            nbr_all11 = np.array(nbr_all11, copy=True)
-            nbr_all11[~nbr_cur_valid_mask, :, :] = 0.0
-
-    # (2) 11D -> pose3(x,y,heading)
-    ego_pose_all3 = _traj11_to_traj3_heading(ego_all11)  # (Tp+Tf,3)
-    nbr_pose_all3 = _traj11_to_traj3_heading(nbr_all11)  # (N,Tp+Tf,3)
-
-    all_pose = np.concatenate([ego_pose_all3[None, ...], nbr_pose_all3], axis=0).astype(np.float32, copy=False)
-    # all_pose: (1+N, Tp+Tf, 3)
-
-    # (3) seg_valid 만들기
-    ego_valid = (np.abs(ego_all11[:, :8]) > eps).any(axis=1)          # (Tp+Tf,)
-    nbr_valid = (np.abs(nbr_all11[:, :, :8]) > eps).any(axis=2)       # (N,Tp+Tf)
-    all_valid = np.concatenate([ego_valid[None, :], nbr_valid], axis=0).astype(bool)  # (1+N,Tp+Tf)
-
-    seg_valid = (all_valid[:, :-1] & all_valid[:, 1:]).astype(bool)   # (1+N,Tp+Tf-1)
-
-    # (4) controls 계산
-    controls = differentiate_numpy_pose3_to_control3(all_pose, dt=dt).astype(np.float32, copy=False)
-    # controls: (1+N, Tp+Tf-1, 3)
-
-    return controls, seg_valid
-
-
-def build_past_future_seg_control_gt_3_dim_from_npz_arrays(
-    ego_agent_past: ArrayF,  # (Tp,11)  Tp=20+1
-    ego_future_gt_11_dim: ArrayF,  # (Tf,11)  Tf=80
-    neighbor_agents_past: ArrayF,  # (N,Tp,11)
-    neighbor_future_gt_11_dim: ArrayF,  # (N,Tf,11)
-    *,
-    dt: float,
-    eps: float = 1e-8,
-) -> ArrayF:
-    """npz 내부의 11차원 궤적들로부터 (과거~미래) 구간 제어를 만듭니다.
-
-    Returns:
-        np.ndarray:
-            past_future_seg_control_gt_3_dim, shape (1+N, (Tp-1)+Tf, 3)
-            - 마지막 3: (v_x^b, v_y^b, yaw_rate)
-            - 무효 구간은 0.0
-    """
-    controls, seg_valid = _build_past_future_seg_control_gt_and_seg_valid_from_npz_arrays(
-        ego_agent_past=ego_agent_past,
-        ego_future_gt_11_dim=ego_future_gt_11_dim,
-        neighbor_agents_past=neighbor_agents_past,
-        neighbor_future_gt_11_dim=neighbor_future_gt_11_dim,
-        dt=float(dt),
-        eps=float(eps),
-    )
-
-    # controls: (1+N, Tseg, 3)
-    # seg_valid: (1+N, Tseg)
-    controls[~seg_valid] = 0.0
-    return controls
 
 
 
@@ -2157,19 +2031,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset_dir",
         type=str,
-        default="/workspace/local_shards_v1",
+        default="/workspace/local_shards_v_world",
         help="npz 파일들이 들어있는 폴더(내부 폴더 없음)",
     )
     parser.add_argument(
         "--train_json",
         type=str,
-        default="/workspace/local_shards_v1/diffusion_planner_training.json",
+        default="/workspace/local_shards_v_world/diffusion_planner_training.json",
         help="학습에 쓰는 npz 파일명 리스트(json)",
     )
     parser.add_argument(
         "--use_body_vel",
         type=_str2bool,
-        default=True,
+        default=False,
         help=(
             "True면 (v_x^b, v_y^b, yaw_rate)처럼 heading 기준으로 회전한 몸체 좌표계 속도를 저장합니다. "
             "False면 (x,y)가 표현된 좌표계에서 (v_x, v_y, yaw_rate) = (dx/dt, dy/dt, d(yaw)/dt)로 저장합니다."
