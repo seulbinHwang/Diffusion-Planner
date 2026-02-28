@@ -57,7 +57,30 @@ import os
 from typing import Optional
 import argparse
 import logging
+from typing import Any
 
+
+def _should_rotate_seg_control_xy_in_origin_transform(args: Any) -> bool:
+    """_transform_origin에서 seg control의 (vx, vy)를 회전할지 결정합니다.
+
+    의미:
+        - pose_based=False 이고 use_body_vel=False 인 경우:
+          control의 (vx, vy)가 좌표축 기준 성분이므로, 좌표 기준을 회전할 때 같이 회전해야 합니다.
+        - 그 외:
+          (vx, vy) 회전이 필요 없다고 보고 기존 로직을 유지합니다.
+
+    Args:
+        args (Any):
+            - args.pose_based: bool (없으면 True로 간주)
+            - args.use_body_vel: bool (없으면 True로 간주)
+
+    Returns:
+        bool:
+            True면 (vx, vy) 회전 적용.
+    """
+    pose_based = bool(getattr(args, "pose_based", True))
+    use_body_vel = bool(getattr(args, "use_body_vel", True))
+    return (not pose_based) and (not use_body_vel)
 
 def _unwrap_to_core_torch_module(model: nn.Module) -> nn.Module:
     """감싸진 모델에서 실제 torch 모델(nn.Module)을 꺼냅니다.
@@ -2729,6 +2752,8 @@ def _predict_rollouts_batched_one_chunk(
     # time_chunk_size는 time_len 이하로 제한
     time_chunk_size = int(min(requested_time_chunk_size, time_len))
 
+    rotate_seg_control_xy_in_origin: bool = _should_rotate_seg_control_xy_in_origin_transform(
+        args)
     with torch.inference_mode():
         step_start = 0
         while step_start < future_len:
@@ -2921,14 +2946,15 @@ def _predict_rollouts_batched_one_chunk(
             unnorm_ego_pose_chunk = unnorm_target_pose_chunk[:, 0, :, :] # (B*R, gap, 4)
             unnorm_near_pose_chunk = unnorm_target_pose_chunk[:, 1:, :, :] # (B*R, Pnn, gap, 4)
 
-            (unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
-            ) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
+            (unnorm_inputs_b_r_copy,
+             unnorm_outputs_b_r_copy) = _update_merged_inputs_unnorm_inplace_for_time_chunk(
                 unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
                 unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
                 unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
                 unnorm_near_pose_chunk=unnorm_near_pose_chunk,
-                unnorm_target_control_chunk=unnorm_target_control_chunk, # Optional[(B*R, (1+)Pnn, gap, 3)]
+                unnorm_target_control_chunk=unnorm_target_control_chunk,
                 cached_valid_masks_br=cached_valid_masks_br,
+                rotate_seg_control_xy_in_origin=rotate_seg_control_xy_in_origin,
             )
 
             step_start += gap
@@ -4979,68 +5005,62 @@ def _update_future_gt_and_valid_inplace_for_time_chunk(
 
 
 
+
 def _update_merged_inputs_unnorm_inplace_for_time_chunk(
     unnorm_inputs_b_r_copy: Dict[str, Any],
     unnorm_outputs_b_r_copy: Dict[str, Any],
-    unnorm_ego_pose_chunk: torch.Tensor,  # (B*R, gap, 4)
-    unnorm_near_pose_chunk: torch.Tensor,  # (B*R, Pnn, gap, 4)
-    unnorm_target_control_chunk: Optional[torch.Tensor],  # (B*R, 1+Pnn, gap, 3)
+    unnorm_ego_pose_chunk: torch.Tensor,                 # (B*R, gap, 4)
+    unnorm_near_pose_chunk: torch.Tensor,                # (B*R, Pnn, gap, 4)
+    unnorm_target_control_chunk: Optional[torch.Tensor], # (B*R, 1+Pnn, gap, 3)
     cached_valid_masks_br: Optional[Dict[str, torch.Tensor]],
+    *,
+    rotate_seg_control_xy_in_origin: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    1) 여러 스텝(gap개)을 한 번에 past/GT에 반영하고,
-    2) 좌표 기준을 마지막 스텝으로 맞춥니다.
-
-    Returns:
-        Tuple[Dict[str, Any], Dict[str, Any]]:
-            (unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy)
-    """
+    """time chunk 반영 + origin 변환까지 수행합니다."""
     gap = int(unnorm_ego_pose_chunk.shape[1])
     if gap <= 0:
         return unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
 
-    # 1) ego past/valid
     _update_ego_past_and_valid_inplace_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
         unnorm_ego_pose_chunk=unnorm_ego_pose_chunk,
     )
 
-    # 2) near past/valid (+ Pnn 획득)
     _update_near_past_and_valid_inplace_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
         unnorm_near_pose_chunk=unnorm_near_pose_chunk,
     )
-    # 3) non-near 지원 조건 확인
-    _assert_non_near_agents_not_supported_for_time_chunk(
-        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,)
 
-    # 4) neighbor past/valid (near와 동일하게)
+    _assert_non_near_agents_not_supported_for_time_chunk(
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+    )
+
     _update_neighbor_past_and_valid_inplace_for_time_chunk(
-        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,)
-    # ✅ (추가) past_seg_control_gt_3_dim 업데이트 ( past_seg_control_is_valid 도 업데이트 해야함)
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+    )
+
     _update_target_seg_control_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
-        unnorm_target_control_chunk=unnorm_target_control_chunk,  # (B*R, 1+Pnn, gap, 3) or None
+        unnorm_target_control_chunk=unnorm_target_control_chunk,
     )
-    # 5) 미래 GT/valid 갱신
+
     _update_future_gt_and_valid_inplace_for_time_chunk(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
         unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
         gap=int(gap),
     )
 
-
-    # 6) 좌표 기준 변환은 "마지막(gap번째) ego 포즈"로 1번만
+    # 마지막 ego 포즈 기준으로 origin 변환 1번
     unnorm_ego_new_cur_pose = unnorm_ego_pose_chunk[:, -1, :]  # (B*R, 4)
     _transform_origin(
-        unnorm_inputs_b_r_copy,
-        unnorm_outputs_b_r_copy,
-        unnorm_ego_new_cur_pose, # (B*R, 4)
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+        unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
+        unnorm_ego_new_cur_pose=unnorm_ego_new_cur_pose,
         cached_valid_masks_br=cached_valid_masks_br,
+        rotate_seg_control_xy=bool(rotate_seg_control_xy_in_origin),
     )
 
     return unnorm_inputs_b_r_copy, unnorm_outputs_b_r_copy
-
 
 from typing import Any, Dict, Optional, Tuple
 import torch
@@ -5296,15 +5316,88 @@ def _transform_origin_step7_static_objects_inplace(
     )
 
 
+
+def _transform_origin_step4_seg_controls_inplace(
+    unnorm_inputs_b_r_copy: Dict[str, Any],
+    unnorm_outputs_b_r_copy: Dict[str, Any],
+    cos_delta: torch.Tensor,  # (B*R,)
+    sin_delta: torch.Tensor,  # (B*R,)
+    *,
+    rotate_seg_control_xy: bool,
+) -> None:
+    """past/future seg control의 (vx, vy)를 새 기준으로 회전합니다.
+
+    적용 대상
+    - unnorm_inputs_b_r_copy["past_seg_control_gt_3_dim"]  : (B*R, 1+Pnn, past_len, 3)
+    - unnorm_outputs_b_r_copy["future_seg_control_gt_3_dim"]: (B*R, 1+Pnn, future_len, 3)
+
+    Args:
+        rotate_seg_control_xy (bool):
+            True일 때만 (vx, vy) 회전 수행.
+
+    Returns:
+        None
+    """
+    if not bool(rotate_seg_control_xy):
+        return
+
+    # 1) past seg control (inputs)
+    past_ctrl = unnorm_inputs_b_r_copy.get("past_seg_control_gt_3_dim", None)
+    past_valid = unnorm_inputs_b_r_copy.get("past_seg_control_is_valid", None)
+    if isinstance(past_ctrl, torch.Tensor) and past_ctrl.numel() > 0:
+        _transform_seg_control_3_dim_xy_inplace(
+            control_3=past_ctrl,         # (B*R, 1+Pnn, past_len, 3)
+            cos_delta=cos_delta,         # (B*R,)
+            sin_delta=sin_delta,         # (B*R,)
+            valid_mask=past_valid,       # (B*R, 1+Pnn, past_len) or None
+        )
+
+    # 2) future seg control (outputs)
+    fut_ctrl = unnorm_outputs_b_r_copy.get("future_seg_control_gt_3_dim", None)
+    fut_valid = unnorm_outputs_b_r_copy.get("future_seg_control_is_valid", None)
+    if isinstance(fut_ctrl, torch.Tensor) and fut_ctrl.numel() > 0:
+        _transform_seg_control_3_dim_xy_inplace(
+            control_3=fut_ctrl,          # (B*R, 1+Pnn, future_len, 3)
+            cos_delta=cos_delta,         # (B*R,)
+            sin_delta=sin_delta,         # (B*R,)
+            valid_mask=fut_valid,        # (B*R, 1+Pnn, future_len) or None
+        )
+
+
 def _transform_origin(
     unnorm_inputs_b_r_copy: Dict[str, torch.Tensor],
     unnorm_outputs_b_r_copy: Dict[str, torch.Tensor],
     unnorm_ego_new_cur_pose: torch.Tensor,  # (B*R, 4)
     cached_valid_masks_br: Optional[Dict[str, torch.Tensor]] = None,
+    *,
+    rotate_seg_control_xy: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """unnorm_ego_new_cur_pose 기준으로 입력 전체의 좌표 기준을 바꿉니다."""
-    (delta_xy, cos_delta, sin_delta,
-     yaw_delta) = _extract_delta_pose_params(unnorm_ego_new_cur_pose)
+    """unnorm_ego_new_cur_pose 기준으로 입력 전체의 좌표 기준을 바꿉니다.
+
+    추가 동작(이번 수정의 핵심)
+    - rotate_seg_control_xy=True 인 경우:
+      past/future seg control의 (vx, vy)도 좌표 기준에 맞게 회전합니다.
+      (state_11[..., 4:6]은 건드리지 않습니다: 기존 로직 유지)
+
+    Args:
+        unnorm_inputs_b_r_copy:
+            입력 dict (unnorm).
+        unnorm_outputs_b_r_copy:
+            출력/정답 dict (unnorm).
+        unnorm_ego_new_cur_pose:
+            새 기준이 될 ego 포즈. shape: (B*R, 4)
+        cached_valid_masks_br:
+            lanes/route_lanes/static_objects 마스크 캐시.
+        rotate_seg_control_xy:
+            True면 seg control (vx, vy) 회전.
+
+    Returns:
+        Dict[str, torch.Tensor]:
+            갱신된 unnorm_inputs_b_r_copy (참조를 그대로 반환)
+    """
+    (delta_xy, cos_delta, sin_delta, yaw_delta) = _extract_delta_pose_params(
+        unnorm_ego_new_cur_pose
+    )
 
     # 1) ego past
     _transform_origin_step1_ego_past_inplace(
@@ -5322,7 +5415,7 @@ def _transform_origin(
         sin_delta=sin_delta,
     )
 
-    # 3) future GT (ego/near) # ego_future_gt_4_dim / near_future_gt_4_dim
+    # 3) future GT pose (ego/near)
     _transform_origin_step3_future_gt_inplace(
         unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
         delta_xy=delta_xy,
@@ -5330,6 +5423,14 @@ def _transform_origin(
         sin_delta=sin_delta,
     )
 
+    # ✅ 4) seg control (past/future) (vx, vy) 회전 (필요할 때만)
+    _transform_origin_step4_seg_controls_inplace(
+        unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
+        unnorm_outputs_b_r_copy=unnorm_outputs_b_r_copy,
+        cos_delta=cos_delta,
+        sin_delta=sin_delta,
+        rotate_seg_control_xy=bool(rotate_seg_control_xy),
+    )
 
     # 5) points
     _transform_origin_step5_points_inplace(
@@ -5339,7 +5440,7 @@ def _transform_origin(
         sin_delta=sin_delta,
     )
 
-    # 6) lanes / route_lanes (캐시 마스크 필수)
+    # 6) lanes / route_lanes
     _transform_origin_step6_lanes_inplace(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
         delta_xy=delta_xy,
@@ -5348,7 +5449,7 @@ def _transform_origin(
         cached_valid_masks_br=cached_valid_masks_br,
     )
 
-    # 7) static_objects (캐시 마스크 필수)
+    # 7) static_objects
     _transform_origin_step7_static_objects_inplace(
         unnorm_inputs_b_r_copy=unnorm_inputs_b_r_copy,
         delta_xy=delta_xy,
@@ -5414,6 +5515,75 @@ def _transform_points_to_new_origin(
     y_new = -sin_b * dx + cos_b * dy
     return torch.stack([x_new, y_new], dim=-1)
 
+from typing import Optional
+import torch
+
+
+def _transform_seg_control_3_dim_xy_inplace(
+    control_3: torch.Tensor,           # (B, ..., 3)
+    cos_delta: torch.Tensor,           # (B,)
+    sin_delta: torch.Tensor,           # (B,)
+    valid_mask: Optional[torch.Tensor] # (B, ...) or None
+) -> None:
+    """seg control의 (vx, vy)만 새 기준으로 회전합니다.
+
+    - control_3[..., 0:2] = (vx, vy)만 회전
+    - control_3[..., 2] = yaw_rate는 그대로 유지
+    - valid_mask가 있으면 True인 칸만 회전(나머지는 그대로)
+
+    Args:
+        control_3 (torch.Tensor):
+            control 텐서.
+            shape: (B, A, T, 3) 또는 (B, ..., 3)
+        cos_delta (torch.Tensor):
+            새 기준 회전 cos 값.
+            shape: (B,)
+        sin_delta (torch.Tensor):
+            새 기준 회전 sin 값.
+            shape: (B,)
+        valid_mask (Optional[torch.Tensor]):
+            유효 구간 마스크.
+            shape: control_3.shape[:-1] 또는 None
+
+    Returns:
+        None
+    """
+    if not isinstance(control_3, torch.Tensor) or control_3.numel() == 0:
+        return
+    if control_3.dim() < 2 or int(control_3.shape[-1]) != 3:
+        raise ValueError(
+            "control_3는 (..., 3)이어야 합니다. "
+            f"got shape={tuple(control_3.shape)}"
+        )
+
+    # dtype/device 정렬(불필요한 승격 방지)
+    cos_delta = cos_delta.to(device=control_3.device, dtype=control_3.dtype)
+    sin_delta = sin_delta.to(device=control_3.device, dtype=control_3.dtype)
+
+    v_xy = control_3[..., 0:2]  # (B, ..., 2)
+    v_xy_new = _rotate_vectors_to_new_origin(
+        vectors_xy=v_xy,
+        cos_delta=cos_delta,
+        sin_delta=sin_delta,
+    )  # (B, ..., 2)
+
+    if valid_mask is None:
+        control_3[..., 0:2] = v_xy_new
+        return
+
+    if not isinstance(valid_mask, torch.Tensor) or valid_mask.numel() == 0:
+        control_3[..., 0:2] = v_xy_new
+        return
+
+    # valid_mask shape이 정확히 맞을 때만 마스킹 적용(안 맞으면 전체 회전으로 처리)
+    expected = tuple(int(x) for x in control_3.shape[:-1])
+    got = tuple(int(x) for x in valid_mask.shape)
+    if got != expected:
+        control_3[..., 0:2] = v_xy_new
+        return
+
+    vm = valid_mask.to(device=control_3.device, dtype=torch.bool)  # (B, ...,)
+    control_3[..., 0:2] = torch.where(vm.unsqueeze(-1), v_xy_new, v_xy)
 
 def _rotate_vectors_to_new_origin(
         vectors_xy: torch.Tensor,  # (B, ..., 2)
