@@ -314,6 +314,89 @@ def _to_bool_mask(mask: torch.Tensor, threshold: float = 0.5) -> torch.Tensor:
         return mask > float(threshold)
     return mask != 0
 
+def _integrate_midpoint_controls_to_pose_denorm_world(
+    unnorm_target_cur_gt_4_dim: torch.Tensor,  # (B, P, 4)
+    seg_world_control_denorm: torch.Tensor,  # (B, P, T, 3)
+    target_future_valid: torch.Tensor,  # (B, P, T)
+    *,
+    dt: float = 0.1,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """세계/ego 좌표계 속도(denorm)를 현재 포즈(denorm)에서 시작해 미래 포즈를 만든다.
+
+    핵심 규칙
+    - seg_world_control_denorm[..., 0:2]는 (x,y)가 쓰는 좌표계에서의 속도라고 가정한다.
+      따라서 (vx, vy)는 회전하지 않고 그대로 누적한다.
+    - yaw_rate는 dt만큼 누적해서 yaw를 업데이트한다.
+    - 유효 마스크가 False인 스텝은 0으로 만든다.
+
+    Args:
+        unnorm_target_cur_gt_4_dim (torch.Tensor):
+            현재 포즈. shape: (B, P, 4) = [x0, y0, cos0, sin0]
+        seg_world_control_denorm (torch.Tensor):
+            미래 세그먼트 제어(속도). shape: (B, P, T, 3) = [v_x, v_y, yaw_rate]
+            - v_x, v_y는 (x,y)와 같은 좌표계 기준 속도라고 가정.
+            - yaw_rate 단위는 rad/s 가정.
+        target_future_valid (torch.Tensor):
+            미래 노드 유효 마스크. shape: (B, P, T) (bool 또는 0/1)
+        dt (float):
+            시간 간격(초)
+        eps (float):
+            cos/sin 정규화용 작은 값
+
+    Returns:
+        torch.Tensor:
+            미래 포즈 시퀀스. shape: (B, P, T, 4) = [x, y, cos, sin]
+            무효 스텝은 0으로 마스킹된다.
+    """
+    B, P, T, _ = seg_world_control_denorm.shape
+    future_valid = _to_bool_mask(target_future_valid).to(device=seg_world_control_denorm.device)
+
+    # 현재 유효 여부(현재 포즈가 invalid면 보통 cos/sin이 0으로 마스킹되어 있음)
+    cos0 = unnorm_target_cur_gt_4_dim[..., 2]
+    sin0 = unnorm_target_cur_gt_4_dim[..., 3]
+    cur_valid = ((cos0 * cos0 + sin0 * sin0) > 0.25)  # (B,P) bool
+
+    # 세그먼트 유효: 현재 노드와 미래 노드가 모두 유효해야 함
+    seg_valid = cur_valid.unsqueeze(-1) & future_valid  # (B,P,T) bool
+
+    # float32로 올려서 안정적으로 계산(지표용)
+    cur_f = unnorm_target_cur_gt_4_dim.float()          # (B,P,4)
+    ctrl_f = seg_world_control_denorm.float()           # (B,P,T,3)
+    seg_valid_f = seg_valid.to(dtype=torch.float32, device=ctrl_f.device)  # (B,P,T)
+
+    vx_w = ctrl_f[..., 0] * seg_valid_f  # (B,P,T)
+    vy_w = ctrl_f[..., 1] * seg_valid_f  # (B,P,T)
+    omega = ctrl_f[..., 2] * seg_valid_f  # (B,P,T)
+
+    x0_f = cur_f[..., 0]  # (B,P)
+    y0_f = cur_f[..., 1]  # (B,P)
+    cos0_f = cur_f[..., 2]  # (B,P)
+    sin0_f = cur_f[..., 3]  # (B,P)
+    yaw0 = torch.atan2(sin0_f, cos0_f)  # (B,P)
+
+    # yaw 누적
+    dtheta = omega * float(dt)  # (B,P,T)
+    yaw_next = yaw0.unsqueeze(-1) + torch.cumsum(dtheta, dim=2)  # (B,P,T)
+
+    # 위치 누적(회전 없음)
+    dx = vx_w * float(dt)  # (B,P,T)
+    dy = vy_w * float(dt)  # (B,P,T)
+    x_next = x0_f.unsqueeze(-1) + torch.cumsum(dx, dim=2)  # (B,P,T)
+    y_next = y0_f.unsqueeze(-1) + torch.cumsum(dy, dim=2)  # (B,P,T)
+
+    cos_next = torch.cos(yaw_next)  # (B,P,T)
+    sin_next = torch.sin(yaw_next)  # (B,P,T)
+    norm_cs = torch.sqrt(cos_next * cos_next + sin_next * sin_next + float(eps))  # (B,P,T)
+    cos_next = cos_next / norm_cs
+    sin_next = sin_next / norm_cs
+
+    score_pose_denorm = torch.stack([x_next, y_next, cos_next, sin_next], dim=-1)  # (B,P,T,4)
+
+    # 노드 유효 마스크: 현재가 무효면 미래도 전부 무효 처리
+    node_valid = future_valid & cur_valid.unsqueeze(-1)  # (B,P,T)
+    score_pose_denorm = score_pose_denorm.masked_fill(~node_valid.unsqueeze(-1), 0.0)
+    return score_pose_denorm
 
 def _integrate_midpoint_controls_to_pose_denorm(
     unnorm_target_cur_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, 4)
@@ -518,7 +601,7 @@ def _compute_control_xy_yaw_diff(
 
 
 def _compute_xy_yaw_losses(
-        score_denorm: torch.Tensor,  # (B, (1+)Pnn, T, 4)
+        unnorm_diffusion_sequence: torch.Tensor,  # (B, (1+)Pnn, T, 4)
         target_future_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 4)
         target_future_valid: torch.Tensor,
         early_stage_num: int = 5,
@@ -527,10 +610,10 @@ def _compute_xy_yaw_losses(
     Compute separate XY and Yaw RMSE losses for ego and neighbors.
 
     Args:
-        score_denorm (Tensor(B, Pnn, T, 4)):
+        unnorm_diffusion_sequence (Tensor(B, Pnn, T, 4)):
             Model output trajectories, where last dim is [dx, dy, cos(yaw), sin(yaw)].
         target_future_gt # (B, (1+)Pnn, future_len, 4)
-            Ground truth trajectories in same format as score_denorm.
+            Ground truth trajectories in same format as unnorm_diffusion_sequence.
         target_future_valid (BoolTensor[B, Pnn, T]):
             Mask for valid neighbor entries (excludes ego at index 0).
     Returns:
@@ -539,9 +622,9 @@ def _compute_xy_yaw_losses(
         - 'neighbor_prediction_loss_yaw' (float): mean abs angular error (deg) for neighbors.
     """
     target_future_valid = _to_bool_mask(target_future_valid).to(
-        device=score_denorm.device)
-    # score_denorm[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
-    pred_xy = score_denorm[..., :2]  # [B, Pnn, T, 2]
+        device=unnorm_diffusion_sequence.device)
+    # unnorm_diffusion_sequence[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
+    pred_xy = unnorm_diffusion_sequence[..., :2]  # [B, Pnn, T, 2]
     gt_xy = target_future_gt[..., :2]  # # (B, (1+)Pnn, future_len, 2)
     # Euclidean distance: sqrt((dx)^2 + (dy)^2)
     dist_ = torch.sqrt(((pred_xy - gt_xy).pow(2).sum(-1)) + 1e-6)  # [B, Pnn, T]
@@ -562,8 +645,8 @@ def _compute_xy_yaw_losses(
     ) > 0 else torch.tensor(0.0, device=dist_.device)
 
     # Compute yaw angles from cos/sin
-    pred_cos = score_denorm[..., 2]  # [B, P, T]
-    pred_sin = score_denorm[..., 3]
+    pred_cos = unnorm_diffusion_sequence[..., 2]  # [B, P, T]
+    pred_sin = unnorm_diffusion_sequence[..., 3]
     gt_cos = target_future_gt[..., 2]  # (B, (1+)Pnn, future_len)
     gt_sin = target_future_gt[..., 3]  # (B, (1+)Pnn, future_len)
     yaw_pred = torch.atan2(pred_sin, pred_cos)  # [B, P, T]
@@ -594,15 +677,15 @@ def _compute_xy_yaw_losses(
 
 
 def _compute_vxy_yaw_losses(
-        score_denorm: torch.Tensor,  # (B, (1+)Pnn, T, 3)
+        unnorm_diffusion_sequence: torch.Tensor,  # (B, (1+)Pnn, T, 3)
         target_future_gt: torch.Tensor,  # (B, (1+)Pnn, future_len, 3)
         target_future_valid: torch.Tensor,
         early_stage_num: int = 5,
         prefix: str = "neighbor_prediction_loss") -> Dict[str, torch.Tensor]:
     target_future_valid = _to_bool_mask(target_future_valid).to(
-        device=score_denorm.device)
-    # score_denorm[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
-    pred_xy = score_denorm[..., :2]  # [B, Pnn, T, 2]
+        device=unnorm_diffusion_sequence.device)
+    # unnorm_diffusion_sequence[..., :2]: Tensor[B, Pnn, T, 2] -> (x, y)
+    pred_xy = unnorm_diffusion_sequence[..., :2]  # [B, Pnn, T, 2]
     gt_xy = target_future_gt[..., :2]  # # (B, (1+)Pnn, future_len, 2)
     # Euclidean distance: sqrt((dx)^2 + (dy)^2)
     dist_ = torch.sqrt(((pred_xy - gt_xy).pow(2).sum(-1)) + 1e-6)  # [B, Pnn, T]
@@ -623,7 +706,7 @@ def _compute_vxy_yaw_losses(
     ) > 0 else torch.tensor(0.0, device=dist_.device)
 
     # Compute yaw angles from cos/sin
-    yaw_pred = score_denorm[..., 2]  # [B, P, T]
+    yaw_pred = unnorm_diffusion_sequence[..., 2]  # [B, P, T]
     yaw_gt = target_future_gt[..., 2]  # [B, P, T]
     yaw_err_deg = torch.rad2deg(yaw_pred - yaw_gt)
     dist_yaw = torch.abs(yaw_err_deg)  # abs error in degrees # [B, P, T]
@@ -1075,6 +1158,7 @@ def _add_xy_yaw_metric_losses(
         integrated_trajectory: Optional[torch.Tensor],  # (B,P,T,4) or None
         control_constraint_diff: Optional[torch.Tensor],  # (B,P,T,3) or None
         unnorm_target_cur_gt_4_dim: torch.Tensor,  # (B, (1+)Pnn, 4)
+        use_body_vel: bool,
 ) -> None:
     """xy / yaw 관련 보기용 지표를 loss_dict에 추가합니다."""
     with torch.no_grad():
@@ -1082,9 +1166,9 @@ def _add_xy_yaw_metric_losses(
             device=diffusion_sequence.device)
 
         if pose_based:
-            # score_denorm: (B,P,T,4)
+            # unnorm_diffusion_sequence: (B,P,T,4)
             # target_future_valid_bool :  (B, (1 +) Pnn, future_len)
-            score_denorm: torch.Tensor = state_normalizer.inverse(
+            unnorm_diffusion_sequence: torch.Tensor = state_normalizer.inverse(
                 diffusion_sequence, target_future_valid_bool)
 
             # target_future_gt: (B,P,T,4)
@@ -1092,7 +1176,7 @@ def _add_xy_yaw_metric_losses(
                 normed_target_future_seq_gt, target_future_valid_bool)
 
             xy_yaw_losses = _compute_xy_yaw_losses(
-                score_denorm,  # (B,P,T,4)
+                unnorm_diffusion_sequence,  # (B,P,T,4)
                 target_future_gt,  # (B,P,T,4)
                 target_future_valid_bool,  # (B, (1 +) Pnn, future_len)
             )
@@ -1101,7 +1185,7 @@ def _add_xy_yaw_metric_losses(
         else:
             # --- (1) control 공간(vx,vy,yaw_rate) 지표 ---
             # diffusion_sequence: (B, (1+)Pnn, future_len, 3)
-            score_denorm = state_normalizer.inverse(
+            unnorm_diffusion_sequence = state_normalizer.inverse(
                 data=diffusion_sequence,
                 valid_mask=target_future_valid_bool,
             )
@@ -1114,7 +1198,7 @@ def _add_xy_yaw_metric_losses(
             )
 
             vxy_yaw_losses = _compute_vxy_yaw_losses(
-                score_denorm,  # (B,P,T,3)
+                unnorm_diffusion_sequence,  # (B,P,T,3)
                 target_future_ctrl_gt,  # (B,P,T,3)
                 target_future_valid_bool,  # (B, (1 +) Pnn, future_len)
             )
@@ -1128,17 +1212,24 @@ def _add_xy_yaw_metric_losses(
                 target_future_valid_bool  # (B, (1 +) Pnn, future_len)
             )
 
-            # pred control -> pred pose (denorm): (B,P,T,4)
-            score_pose_denorm = _integrate_midpoint_controls_to_pose_denorm(
-                unnorm_target_cur_gt_4_dim=
-                unnorm_target_cur_gt_4_dim,  # (B, (1+)Pnn, 4)
-                seg_body_control_denorm=
-                score_denorm,  # (B,(1 +) Pnn,future_len,3)
-                target_future_valid=
-                target_future_valid_bool,  # (B, (1 +) Pnn, future_len)
-                dt=0.1,
-                eps=1e-6,
-            )
+            # ✅ (핵심) use_body_vel에 따라 적분 함수 분기
+            if bool(use_body_vel):
+                score_pose_denorm = _integrate_midpoint_controls_to_pose_denorm(
+                    unnorm_target_cur_gt_4_dim=unnorm_target_cur_gt_4_dim,      # (B,P,4)
+                    seg_body_control_denorm=unnorm_diffusion_sequence,          # (B,P,T,3) body
+                    target_future_valid=target_future_valid_bool,              # (B,P,T)
+                    dt=0.1,
+                    eps=1e-6,
+                )
+            else:
+                score_pose_denorm = _integrate_midpoint_controls_to_pose_denorm_world(
+                    unnorm_target_cur_gt_4_dim=unnorm_target_cur_gt_4_dim,      # (B,P,4)
+                    seg_world_control_denorm=unnorm_diffusion_sequence,         # (B,P,T,3) world/ego
+                    target_future_valid=target_future_valid_bool,              # (B,P,T)
+                    dt=0.1,
+                    eps=1e-6,
+                )
+
 
             xy_yaw_losses = _compute_xy_yaw_losses(
                 score_pose_denorm,  # (B,P,T,4)
