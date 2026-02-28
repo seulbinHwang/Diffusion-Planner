@@ -91,13 +91,13 @@ LOCAL_TRAIN_SET_LIST_PATH="/workspace/local_shards_v_world/diffusion_planner_tra
 FORCE_REBUILD=0
 
 ## 로컬 데이터 준비(복사 1회 + 로컬 리스트 생성)
-"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
-  --src_root "$TRAIN_SET_PATH" \
-  --src_list "$TRAIN_SET_LIST_PATH" \
-  --dst_root "$LOCAL_TRAIN_SET_PATH" \
-  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
-  --force_rebuild "$FORCE_REBUILD" \
-  --num_workers 24
+#"$RUN_PYTHON_PATH" tools/prepare_local_train_set.py \
+#  --src_root "$TRAIN_SET_PATH" \
+#  --src_list "$TRAIN_SET_LIST_PATH" \
+#  --dst_root "$LOCAL_TRAIN_SET_PATH" \
+#  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
+#  --force_rebuild "$FORCE_REBUILD" \
+#  --num_workers 24
  python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
 "$RUN_PYTHON_PATH" add_control_to_npz.py --skip_sample_keys --workers 24
 #
@@ -131,4 +131,5 @@ FORCE_REBUILD=0
     --w_int_max 2.0 \
     --w_const 0.0 \
     --lane_summary_num 0 \
-    --use_amortized_diffusion False
+    --use_amortized_diffusion False \
+    --use_body_vel False
