@@ -1762,6 +1762,7 @@ def diffusion_loss_func(
             norm_target_cur_gt_4_dim,
             target_cur_gt_is_valid,
         )
+        use_body_vel = bool(getattr(args, "use_body_vel", True))
         _add_xy_yaw_metric_losses(
             pose_based=args.pose_based,
             loss_dict=loss_dict,
@@ -1779,6 +1780,7 @@ def diffusion_loss_func(
             control_constraint_diff,  # (B, (1+)Pnn, T, 3) 또는 None
             unnorm_target_cur_gt_4_dim=
             unnorm_target_cur_gt_4_dim,  # (B, (1+)Pnn, 4)
+            use_body_vel=use_body_vel,
         )
     # # dpm_loss 전체가 유한값인지 마지막으로 검사
     # assert torch.isfinite(dpm_loss).all().item(), \
