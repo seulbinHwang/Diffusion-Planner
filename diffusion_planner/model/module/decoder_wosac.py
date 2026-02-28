@@ -4424,6 +4424,7 @@ else
                     enabled=use_profile,
                     device_type=device_type,
             ):
+                use_body_vel = bool(getattr(self.config, "use_body_vel", True))
                 (
                     unnorm_integrated_trajectory,  # (B,Pnn,T,4)
                     unnorm_control_constraint_diff,  # (B,Pnn,T,3)
@@ -4436,6 +4437,7 @@ else
                     filter_active_idx,
                     target_current_control=unnorm_prev_control,  # ✅ unnorm으로 넣기
                     target_current_control_valid=prev_control_valid,
+                    use_body_vel=use_body_vel
                     # ✅ k=0 S2 적용 마스크
                 )
 

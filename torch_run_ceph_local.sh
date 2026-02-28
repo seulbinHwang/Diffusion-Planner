@@ -136,4 +136,5 @@ FORCE_REBUILD=0
     --lane_summary_num 0 \
     --yaw_rate_loss_weight 2. \
     --integration_yaw_weight 2. \
-    --use_amortized_diffusion False
+    --use_amortized_diffusion False \
+    --use_body_vel True
