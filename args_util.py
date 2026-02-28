@@ -370,7 +370,7 @@ def get_args():
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',
-                        default=7)
+                        default=5)
     parser.add_argument('--xy_yaw_metric_interval_steps',
                         type=int,
                         help='save frequency',
