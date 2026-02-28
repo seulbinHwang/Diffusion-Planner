@@ -1594,6 +1594,160 @@ class FeasibleProjector(nn.Module):
         denom = (a_valid + b_valid).clamp_min(eps)
         return (a_valid * a + b_valid * b) / denom
 
+    def _compute_segment_mid_cos_sin_from_omega(
+            self,
+            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+            omega_seq: torch.Tensor,  # (B, Pnn, T)
+            *,
+            dt: float,
+            eps: float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """세그먼트 k의 '중간 방향(yaw_mid)'에 대한 cos/sin 시퀀스를 만듭니다.
+
+        이 함수는 다음을 계산합니다.
+
+        - 입력:
+            - 현재 방향(yaw0): unnorm_near_current_state의 (cos0, sin0)
+            - 각속도 시퀀스(omega_seq): 세그먼트마다의 yaw 변화율
+        - 계산:
+            - Δθ_k = omega_k * dt
+            - yaw_start[k] = yaw0 + sum_{j<k} Δθ_j
+            - yaw_mid[k]   = yaw_start[k] + 0.5 * Δθ_k
+        - 출력:
+            - cos_mid, sin_mid: (B, Pnn, T)
+
+        Args:
+            unnorm_near_current_state (torch.Tensor):
+                shape (B, Pnn, 4) = [x0, y0, cos0, sin0]
+            omega_seq (torch.Tensor):
+                shape (B, Pnn, T)
+            dt (float):
+                시간 간격(초)
+            eps (float):
+                수치 안정용 작은 값
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                cos_mid: (B, Pnn, T)
+                sin_mid: (B, Pnn, T)
+        """
+        if unnorm_near_current_state.dim() != 3 or int(
+                unnorm_near_current_state.shape[-1]) != 4:
+            raise ValueError(
+                "_compute_segment_mid_cos_sin_from_omega: unnorm_near_current_state는 (B,Pnn,4) 여야 합니다. "
+                f"got shape={tuple(unnorm_near_current_state.shape)}"
+            )
+        if omega_seq.dim() != 3:
+            raise ValueError(
+                "_compute_segment_mid_cos_sin_from_omega: omega_seq는 (B,Pnn,T) 여야 합니다. "
+                f"got shape={tuple(omega_seq.shape)}"
+            )
+        if tuple(omega_seq.shape[:2]) != tuple(
+                unnorm_near_current_state.shape[:2]):
+            raise ValueError(
+                "_compute_segment_mid_cos_sin_from_omega: (B,Pnn)이 서로 다릅니다. "
+                f"state(B,Pnn)={tuple(unnorm_near_current_state.shape[:2])}, omega(B,Pnn)={tuple(omega_seq.shape[:2])}"
+            )
+
+        # dtype/device 정렬 (cos/sin만 맞추면 충분)
+        cos0 = unnorm_near_current_state[..., 2].to(dtype=omega_seq.dtype,
+                                                    device=omega_seq.device)  # (B,Pnn)
+        sin0 = unnorm_near_current_state[..., 3].to(dtype=omega_seq.dtype,
+                                                    device=omega_seq.device)  # (B,Pnn)
+
+        # (cos,sin) 정규화(혹시 모를 수치 오차 방지)
+        norm0 = torch.sqrt(cos0 * cos0 + sin0 * sin0 + float(eps))
+        cos0 = cos0 / norm0
+        sin0 = sin0 / norm0
+
+        yaw0 = torch.atan2(sin0, cos0)  # (B,Pnn)
+
+        # Δθ_k = omega_k * dt
+        dtheta_seq = omega_seq * float(dt)  # (B,Pnn,T)
+
+        # sum_{j<=k} Δθ_j
+        dtheta_prefix = torch.cumsum(dtheta_seq, dim=2)  # (B,Pnn,T)
+
+        # sum_{j<k} Δθ_j (exclusive)
+        zero_pad = torch.zeros_like(
+            dtheta_seq[..., :1])  # (B,Pnn,1) (T==0이면 (B,Pnn,0))
+        dtheta_exclusive = torch.cat([zero_pad, dtheta_prefix[..., :-1]],
+                                     dim=2)  # (B,Pnn,T)
+
+        yaw_start = yaw0.unsqueeze(-1) + dtheta_exclusive  # (B,Pnn,T)
+        yaw_mid = yaw_start + 0.5 * dtheta_seq  # (B,Pnn,T)
+
+        cos_mid = torch.cos(yaw_mid)  # (B,Pnn,T)
+        sin_mid = torch.sin(yaw_mid)  # (B,Pnn,T)
+        return cos_mid, sin_mid
+
+    def _convert_world_controls_to_body_for_filter_and_integrate(
+            self,
+            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+            unnorm_cur_future_seg_world_control: torch.Tensor,  # (B, Pnn, T, 3)
+            *,
+            dt: float,
+            eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """세계(ego) 기준 세그먼트 제어를 바디(몸체) 기준으로 바꿉니다.
+
+        - 입력 제어의 의미(use_body_vel=False일 때):
+            unnorm_cur_future_seg_world_control[..., 0] = v_x_world
+            unnorm_cur_future_seg_world_control[..., 1] = v_y_world
+            unnorm_cur_future_seg_world_control[..., 2] = omega (yaw 변화율)
+
+        - 변환 방법:
+            세그먼트 k의 '중간 방향(yaw_mid[k])'을 만든 뒤,
+            v_body = R(-yaw_mid) * v_world 로 회전합니다.
+
+        Args:
+            unnorm_near_current_state:
+                (B, Pnn, 4) = [x0, y0, cos0, sin0]
+            unnorm_cur_future_seg_world_control:
+                (B, Pnn, T, 3) = [v_x_world, v_y_world, omega]
+            dt:
+                시간 간격(초)
+            eps:
+                수치 안정용 작은 값
+
+        Returns:
+            torch.Tensor:
+                (B, Pnn, T, 3) = [v_x_body, v_y_body, omega]
+        """
+        if unnorm_cur_future_seg_world_control.dim() != 4 or int(
+                unnorm_cur_future_seg_world_control.shape[-1]) != 3:
+            raise ValueError(
+                "_convert_world_controls_to_body_for_filter_and_integrate: "
+                "unnorm_cur_future_seg_world_control은 (B,Pnn,T,3) 여야 합니다. "
+                f"got shape={tuple(unnorm_cur_future_seg_world_control.shape)}"
+            )
+        if tuple(unnorm_cur_future_seg_world_control.shape[:2]) != tuple(
+                unnorm_near_current_state.shape[:2]):
+            raise ValueError(
+                "_convert_world_controls_to_body_for_filter_and_integrate: (B,Pnn)이 서로 다릅니다. "
+                f"state(B,Pnn)={tuple(unnorm_near_current_state.shape[:2])}, ctrl(B,Pnn)={tuple(unnorm_cur_future_seg_world_control.shape[:2])}"
+            )
+
+        vx_w = unnorm_cur_future_seg_world_control[..., 0]  # (B,Pnn,T)
+        vy_w = unnorm_cur_future_seg_world_control[..., 1]  # (B,Pnn,T)
+        omega = unnorm_cur_future_seg_world_control[..., 2]  # (B,Pnn,T)
+
+        cos_mid, sin_mid = self._compute_segment_mid_cos_sin_from_omega(
+            unnorm_near_current_state=unnorm_near_current_state,  # (B,Pnn,4)
+            omega_seq=omega,  # (B,Pnn,T)
+            dt=float(dt),
+            eps=float(eps),
+        )  # (B,Pnn,T) each
+
+        vx_b, vy_b = self._world_to_body(
+            vx_w=vx_w,  # (B,Pnn,T)
+            vy_w=vy_w,  # (B,Pnn,T)
+            cos_yaw=cos_mid,  # (B,Pnn,T)
+            sin_yaw=sin_mid,  # (B,Pnn,T)
+        )
+
+        return torch.stack([vx_b, vy_b, omega], dim=-1)  # (B,Pnn,T,3)
+
     @staticmethod
     def _world_to_body(
         vx_w: torch.Tensor,
@@ -3879,26 +4033,46 @@ class FeasibleProjector(nn.Module):
         return mask_flat.index_select(0, idx).unsqueeze(1)  # (N_active,1)
 
     def filter_and_integrate(
-        self,
-        unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
-        near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T) bool
-        unnorm_cur_future_seg_body_control: torch.Tensor,  # (B, Pnn, T, 3)
-        near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
-        filter_active_idx: Optional[torch.Tensor] = None,  # (B_filter,)
-        target_current_control: Optional[torch.Tensor] = None,
-        # (B, Pnn, 3) or None (unnorm)
-        target_current_control_valid: Optional[torch.Tensor] = None,
-        # (B, Pnn) or None
+            self,
+            unnorm_near_current_state: torch.Tensor,  # (B, Pnn, 4)
+            near_cur_future_valid: torch.Tensor,  # (B, Pnn, 1+T) bool
+            unnorm_cur_future_seg_body_control: torch.Tensor,  # (B, Pnn, T, 3)
+            near_class_one_hot: torch.Tensor,  # (B, Pnn, 3)
+            filter_active_idx: Optional[torch.Tensor] = None,  # (B_filter,)
+            target_current_control: Optional[torch.Tensor] = None,
+            # (B, Pnn, 3) or None (unnorm)
+            target_current_control_valid: Optional[torch.Tensor] = None,
+            # (B, Pnn) or None
+            *,
+            use_body_vel: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Filter + Integrate 래퍼.
 
         Args:
+            unnorm_near_current_state:
+                (B,Pnn,4) = [x0, y0, cos0, sin0]
+            near_cur_future_valid:
+                (B,Pnn,1+T) bool
+            unnorm_cur_future_seg_body_control:
+                (B,Pnn,T,3)
+                - use_body_vel=True:
+                    [v_x_body, v_y_body, omega] 로 해석합니다. (기존 동작)
+                - use_body_vel=False:
+                    [v_x_world, v_y_world, omega] 로 해석합니다.
+                    이 경우 내부에서 바디 기준으로 회전 변환 후 기존 로직을 그대로 탑니다.
+            near_class_one_hot:
+                (B,Pnn,3)
+            filter_active_idx:
+                (B_filter,) 또는 None
             target_current_control:
-                k=0에서 쓸 "이전 구간 control" (unnorm).
-                shape: (B,Pnn,3)
+                k=0에서 쓸 "이전 구간 control"(unnorm).
+                - use_body_vel=True: [v_x_body, v_y_body, omega]
+                - use_body_vel=False: [v_x_world, v_y_world, omega] 로 보고 바디로 변환합니다.
             target_current_control_valid:
-                마지막 과거 구간이 유효하면 True.
-                shape: (B,Pnn)
+                (B,Pnn) 또는 None
+            use_body_vel:
+                True면 입력 속도를 바디 기준으로 봅니다.
+                False면 입력 속도를 세계(ego) 기준으로 보고, 내부에서 바디 기준으로 바꿉니다.
 
         Returns:
             unnorm_integrated_trajectory: (B,Pnn,T,4)
@@ -3922,7 +4096,8 @@ class FeasibleProjector(nn.Module):
                     target_current_control.shape[-1]) != 3:
                 raise ValueError(
                     "[filter_and_integrate] target_current_control은 (B,Pnn,3) 이어야 합니다. "
-                    f"got {tuple(target_current_control.shape)}")
+                    f"got {tuple(target_current_control.shape)}"
+                )
             if tuple(target_current_control.shape[:2]) != (int(B), int(Pnn)):
                 raise ValueError(
                     "[filter_and_integrate] target_current_control의 (B,Pnn) 이 입력과 다릅니다. "
@@ -3933,15 +4108,59 @@ class FeasibleProjector(nn.Module):
             if target_current_control_valid.dim() != 2:
                 raise ValueError(
                     "[filter_and_integrate] target_current_control_valid는 (B,Pnn) 2D여야 합니다. "
-                    f"got {tuple(target_current_control_valid.shape)}")
+                    f"got {tuple(target_current_control_valid.shape)}"
+                )
             if tuple(target_current_control_valid.shape) != (int(B), int(Pnn)):
                 raise ValueError(
                     "[filter_and_integrate] target_current_control_valid shape이 (B,Pnn)과 다릅니다. "
                     f"expected ({int(B)},{int(Pnn)}), got {tuple(target_current_control_valid.shape)}"
                 )
 
+        # ==========================================================
+        # [NEW] 입력 속도 좌표계 처리
+        #  - use_body_vel=True  : 기존대로 body 속도
+        #  - use_body_vel=False : world(ego) 속도 -> body 속도로 변환 후 기존 로직 사용
+        # ==========================================================
+        if not bool(use_body_vel):
+            unnorm_cur_future_seg_body_control = self._convert_world_controls_to_body_for_filter_and_integrate(
+                unnorm_near_current_state=unnorm_near_current_state.to(
+                    device=device, dtype=dtype),
+                unnorm_cur_future_seg_world_control=unnorm_cur_future_seg_body_control,
+                dt=float(self.constraints_h_params.dt),
+                eps=float(self.constraints_h_params.eps),
+            )  # (B,Pnn,T,3) now treated as body control
+
+            if target_current_control is not None:
+                # 현재 시점(prev)도 같은 좌표계라고 보고 body로 맞춰 줌
+                cos0 = unnorm_near_current_state[..., 2].to(device=device,
+                                                            dtype=dtype)  # (B,Pnn)
+                sin0 = unnorm_near_current_state[..., 3].to(device=device,
+                                                            dtype=dtype)  # (B,Pnn)
+                norm0 = torch.sqrt(cos0 * cos0 + sin0 * sin0 + float(
+                    self.constraints_h_params.eps))
+                cos0 = cos0 / norm0
+                sin0 = sin0 / norm0
+
+                tc_w = target_current_control.to(device=device,
+                                                 dtype=dtype)  # (B,Pnn,3)
+                vx_w0 = tc_w[..., 0]  # (B,Pnn)
+                vy_w0 = tc_w[..., 1]  # (B,Pnn)
+                w0 = tc_w[..., 2]  # (B,Pnn)
+
+                vx_b0, vy_b0 = self._world_to_body(
+                    vx_w=vx_w0,
+                    vy_w=vy_w0,
+                    cos_yaw=cos0,
+                    sin_yaw=sin0,
+                )
+                target_current_control = torch.stack([vx_b0, vy_b0, w0],
+                                                     dim=-1)  # (B,Pnn,3)
+
+        # ==========================================================
+
         active_indices, active_mask_flat = self._compute_active_indices_from_near_cur_future_valid(
-            near_cur_future_valid=near_cur_future_valid,)
+            near_cur_future_valid=near_cur_future_valid,
+        )
 
         filter_active_idx_active = self._convert_filter_active_idx_to_active_subset_indices(
             filter_active_idx=filter_active_idx,
@@ -3964,8 +4183,7 @@ class FeasibleProjector(nn.Module):
         ) = self._gather_active_subset_for_filter_and_integrate(
             unnorm_near_current_state=unnorm_near_current_state,
             near_cur_future_valid=near_cur_future_valid,
-            unnorm_cur_future_seg_body_control=
-            unnorm_cur_future_seg_body_control,
+            unnorm_cur_future_seg_body_control=unnorm_cur_future_seg_body_control,
             near_class_one_hot=near_class_one_hot,
             active_indices=active_indices,
         )
@@ -3981,7 +4199,6 @@ class FeasibleProjector(nn.Module):
             )  # (N_active,1,3)
 
             if target_current_control_valid is None:
-                # valid 마스크를 안 주면 "전부 유효"로 취급
                 target_current_control_valid_active = torch.ones(
                     (int(active_indices.numel()), 1),
                     device=device,
@@ -3989,8 +4206,8 @@ class FeasibleProjector(nn.Module):
                 )
             else:
                 target_current_control_valid_active = self._gather_active_target_current_control_valid_for_filter_and_integrate(
-                    target_current_control_valid=target_current_control_valid.
-                    to(device=device),
+                    target_current_control_valid=target_current_control_valid.to(
+                        device=device),
                     active_indices=active_indices,
                 )  # (N_active,1)
 
@@ -3998,8 +4215,7 @@ class FeasibleProjector(nn.Module):
             traj_active, diff_active, ctrl_active = self._filter_and_integrate_sequential(
                 unnorm_near_current_state=unnorm_near_current_state_active,
                 near_cur_future_valid=near_cur_future_valid_active,
-                unnorm_cur_future_seg_body_control=
-                unnorm_cur_future_seg_body_control_active,
+                unnorm_cur_future_seg_body_control=unnorm_cur_future_seg_body_control_active,
                 near_class_one_hot=near_class_one_hot_active,
                 filter_active_idx=filter_active_idx_active,
                 target_current_control=target_current_control_active,
@@ -4009,8 +4225,7 @@ class FeasibleProjector(nn.Module):
             traj_active, diff_active, ctrl_active = self._filter_and_integrate_batch(
                 unnorm_near_current_state=unnorm_near_current_state_active,
                 near_cur_future_valid=near_cur_future_valid_active,
-                unnorm_cur_future_seg_body_control=
-                unnorm_cur_future_seg_body_control_active,
+                unnorm_cur_future_seg_body_control=unnorm_cur_future_seg_body_control_active,
                 near_class_one_hot=near_class_one_hot_active,
                 filter_active_idx=filter_active_idx_active,
                 target_current_control=target_current_control_active,
