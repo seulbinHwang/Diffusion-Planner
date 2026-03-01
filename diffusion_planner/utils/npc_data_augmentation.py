@@ -3206,12 +3206,11 @@ class NPCStatePerturbation:
             )  # controls_sel: (Bk, 1+A, Tp-1, 3), seg_valid_sel: (Bk, 1+A, Tp-1)
 
             # write-back (dtype 유지)
-            past_ctrl[idx_keep].copy_(controls_sel.to(dtype=past_ctrl.dtype))
+            past_ctrl[idx_keep] = controls_sel.to(dtype=past_ctrl.dtype)
             if past_ctrl_valid.dtype == torch.bool:
-                past_ctrl_valid[idx_keep].copy_(seg_valid_sel)
+                past_ctrl_valid[idx_keep] = seg_valid_sel
             else:
-                past_ctrl_valid[idx_keep].copy_(
-                    seg_valid_sel.to(dtype=past_ctrl_valid.dtype))
+                past_ctrl_valid[idx_keep] = seg_valid_sel.to(dtype=past_ctrl_valid.dtype)
 
         # future_seg_control (outputs)
         fut_ctrl = outputs.get("future_seg_control_gt_3_dim", None)
@@ -3285,12 +3284,11 @@ class NPCStatePerturbation:
                 use_body_vel=bool(use_body_vel),
             )  # controls_sel: (Bk, 1+A, Tf, 3)
 
-            fut_ctrl[idx_keep].copy_(controls_sel.to(dtype=fut_ctrl.dtype))
+            fut_ctrl[idx_keep] = controls_sel.to(dtype=fut_ctrl.dtype)
             if fut_ctrl_valid.dtype == torch.bool:
-                fut_ctrl_valid[idx_keep].copy_(seg_valid_sel)
+                fut_ctrl_valid[idx_keep] = seg_valid_sel
             else:
-                fut_ctrl_valid[idx_keep].copy_(
-                    seg_valid_sel.to(dtype=fut_ctrl_valid.dtype))
+                fut_ctrl_valid[idx_keep] = seg_valid_sel.to(dtype=fut_ctrl_valid.dtype)
         # -----------------------------
         # Step 15) origin_world_pose 업데이트(ego가 증강된 샘플만)
         # -----------------------------
