@@ -3016,84 +3016,159 @@ class NPCStatePerturbation:
             fut_f[sel_i] = s_fut
 
         # ego past/future
-        # 타입별로 정확히 처리(ego)
+        # -----------------------------
+        # Step 11/12) past/future quintic 보간 (증강된 agent만)
+        # -----------------------------
+
+        # ✅ 핵심: idx_keep로 뽑은 텐서는 원본과 메모리를 공유하지 않을 수 있으므로
+        #         "작업용 텐서"에서 보간을 수행한 뒤, 마지막에 원본에 다시 써줍니다.
+        ego_past_work = ego_agent_past[idx_keep].clone()   # (Bk, Tp, 11)
+        ego_fut_work = ego_future_11[idx_keep].clone()     # (Bk, Tf, 11)
+
+        if A > 0:
+            nbr_past_work = nbr_past[idx_keep].clone()     # (Bk, A, Tp, 11)
+            nbr_fut_work = nbr_future_11[idx_keep].clone() # (Bk, A, Tf, 11)
+
+        # 타입별 마스크(선택 샘플 내부 Bk 기준)
         ego_aug_car = aug_ego_sel & ego_is_car_sel
         ego_aug_cyc = aug_ego_sel & ego_is_cyc_sel
         ego_aug_ped = aug_ego_sel & ego_is_ped_sel
 
+        # ---- past (ego) ----
         if bool(torch.any(ego_aug_car)):
-            _apply_past_interp_for_mask(ego_agent_past[idx_keep],
-                                        ego_acc_past_sel, ego_cur_acc_new,
-                                        ego_aug_car, Np_car,
-                                        float(Np_car) * self._dt)
+            _apply_past_interp_for_mask(
+                traj_past=ego_past_work,
+                acc_past=ego_acc_past_sel,
+                cur_acc_new=ego_cur_acc_new,
+                mask=ego_aug_car,
+                Np=Np_car,
+                Tsec=float(Np_car) * self._dt,
+            )
         if bool(torch.any(ego_aug_cyc)):
-            _apply_past_interp_for_mask(ego_agent_past[idx_keep],
-                                        ego_acc_past_sel, ego_cur_acc_new,
-                                        ego_aug_cyc, Np_cyc,
-                                        float(Np_cyc) * self._dt)
+            _apply_past_interp_for_mask(
+                traj_past=ego_past_work,
+                acc_past=ego_acc_past_sel,
+                cur_acc_new=ego_cur_acc_new,
+                mask=ego_aug_cyc,
+                Np=Np_cyc,
+                Tsec=float(Np_cyc) * self._dt,
+            )
         if bool(torch.any(ego_aug_ped)):
-            _apply_past_interp_for_mask(ego_agent_past[idx_keep],
-                                        ego_acc_past_sel, ego_cur_acc_new,
-                                        ego_aug_ped, Np_ped,
-                                        float(Np_ped) * self._dt)
+            _apply_past_interp_for_mask(
+                traj_past=ego_past_work,
+                acc_past=ego_acc_past_sel,
+                cur_acc_new=ego_cur_acc_new,
+                mask=ego_aug_ped,
+                Np=Np_ped,
+                Tsec=float(Np_ped) * self._dt,
+            )
 
-        # future(ego): current state는 past[t_cur] 사용
-        ego_cur_new_frame = ego_agent_past[idx_keep, t_cur, :]  # (Bk,11)
+        # ---- future (ego) ----
+        # current state는 past[t_cur] 사용
+        ego_cur_new_frame = ego_past_work[:, t_cur, :]  # (Bk, 11)
+
         if bool(torch.any(ego_aug_car)):
-            _apply_future_interp_for_mask(ego_future_11[idx_keep],
-                                          ego_acc_fut_sel, ego_cur_new_frame,
-                                          ego_cur_acc_new, ego_aug_car, Nf_car,
-                                          float(Nf_car) * self._dt)
+            _apply_future_interp_for_mask(
+                traj_future=ego_fut_work,
+                acc_future=ego_acc_fut_sel,
+                cur_past=ego_cur_new_frame,
+                cur_acc_new=ego_cur_acc_new,
+                mask=ego_aug_car,
+                Nf=Nf_car,
+                Tsec=float(Nf_car) * self._dt,
+            )
         if bool(torch.any(ego_aug_cyc)):
-            _apply_future_interp_for_mask(ego_future_11[idx_keep],
-                                          ego_acc_fut_sel, ego_cur_new_frame,
-                                          ego_cur_acc_new, ego_aug_cyc, Nf_cyc,
-                                          float(Nf_cyc) * self._dt)
+            _apply_future_interp_for_mask(
+                traj_future=ego_fut_work,
+                acc_future=ego_acc_fut_sel,
+                cur_past=ego_cur_new_frame,
+                cur_acc_new=ego_cur_acc_new,
+                mask=ego_aug_cyc,
+                Nf=Nf_cyc,
+                Tsec=float(Nf_cyc) * self._dt,
+            )
         if bool(torch.any(ego_aug_ped)):
-            _apply_future_interp_for_mask(ego_future_11[idx_keep],
-                                          ego_acc_fut_sel, ego_cur_new_frame,
-                                          ego_cur_acc_new, ego_aug_ped, Nf_ped,
-                                          float(Nf_ped) * self._dt)
+            _apply_future_interp_for_mask(
+                traj_future=ego_fut_work,
+                acc_future=ego_acc_fut_sel,
+                cur_past=ego_cur_new_frame,
+                cur_acc_new=ego_cur_acc_new,
+                mask=ego_aug_ped,
+                Nf=Nf_ped,
+                Tsec=float(Nf_ped) * self._dt,
+            )
 
-        # neighbor past/future
+        # ---- neighbor past/future ----
         if A > 0:
             nbr_aug_car = aug_nbr_sel & nbr_is_car_sel
             nbr_aug_cyc = aug_nbr_sel & nbr_is_cyc_sel
             nbr_aug_ped = aug_nbr_sel & nbr_is_ped_sel
 
+            # past + future를 "같은 작업용 텐서"에 적용
             if bool(torch.any(nbr_aug_car)):
-                _apply_past_interp_for_mask(nbr_past[idx_keep],
-                                            nbr_acc_past_sel, nbr_cur_acc_new,
-                                            nbr_aug_car, Np_car,
-                                            float(Np_car) * self._dt)
-                _apply_future_interp_for_mask(nbr_future_11[idx_keep],
-                                              nbr_acc_fut_sel,
-                                              nbr_past[idx_keep, :, t_cur, :],
-                                              nbr_cur_acc_new, nbr_aug_car,
-                                              Nf_car,
-                                              float(Nf_car) * self._dt)
+                _apply_past_interp_for_mask(
+                    traj_past=nbr_past_work,
+                    acc_past=nbr_acc_past_sel,
+                    cur_acc_new=nbr_cur_acc_new,
+                    mask=nbr_aug_car,
+                    Np=Np_car,
+                    Tsec=float(Np_car) * self._dt,
+                )
+                _apply_future_interp_for_mask(
+                    traj_future=nbr_fut_work,
+                    acc_future=nbr_acc_fut_sel,
+                    cur_past=nbr_past_work[:, :, t_cur, :],
+                    cur_acc_new=nbr_cur_acc_new,
+                    mask=nbr_aug_car,
+                    Nf=Nf_car,
+                    Tsec=float(Nf_car) * self._dt,
+                )
+
             if bool(torch.any(nbr_aug_cyc)):
-                _apply_past_interp_for_mask(nbr_past[idx_keep],
-                                            nbr_acc_past_sel, nbr_cur_acc_new,
-                                            nbr_aug_cyc, Np_cyc,
-                                            float(Np_cyc) * self._dt)
-                _apply_future_interp_for_mask(nbr_future_11[idx_keep],
-                                              nbr_acc_fut_sel,
-                                              nbr_past[idx_keep, :, t_cur, :],
-                                              nbr_cur_acc_new, nbr_aug_cyc,
-                                              Nf_cyc,
-                                              float(Nf_cyc) * self._dt)
+                _apply_past_interp_for_mask(
+                    traj_past=nbr_past_work,
+                    acc_past=nbr_acc_past_sel,
+                    cur_acc_new=nbr_cur_acc_new,
+                    mask=nbr_aug_cyc,
+                    Np=Np_cyc,
+                    Tsec=float(Np_cyc) * self._dt,
+                )
+                _apply_future_interp_for_mask(
+                    traj_future=nbr_fut_work,
+                    acc_future=nbr_acc_fut_sel,
+                    cur_past=nbr_past_work[:, :, t_cur, :],
+                    cur_acc_new=nbr_cur_acc_new,
+                    mask=nbr_aug_cyc,
+                    Nf=Nf_cyc,
+                    Tsec=float(Nf_cyc) * self._dt,
+                )
+
             if bool(torch.any(nbr_aug_ped)):
-                _apply_past_interp_for_mask(nbr_past[idx_keep],
-                                            nbr_acc_past_sel, nbr_cur_acc_new,
-                                            nbr_aug_ped, Np_ped,
-                                            float(Np_ped) * self._dt)
-                _apply_future_interp_for_mask(nbr_future_11[idx_keep],
-                                              nbr_acc_fut_sel,
-                                              nbr_past[idx_keep, :, t_cur, :],
-                                              nbr_cur_acc_new, nbr_aug_ped,
-                                              Nf_ped,
-                                              float(Nf_ped) * self._dt)
+                _apply_past_interp_for_mask(
+                    traj_past=nbr_past_work,
+                    acc_past=nbr_acc_past_sel,
+                    cur_acc_new=nbr_cur_acc_new,
+                    mask=nbr_aug_ped,
+                    Np=Np_ped,
+                    Tsec=float(Np_ped) * self._dt,
+                )
+                _apply_future_interp_for_mask(
+                    traj_future=nbr_fut_work,
+                    acc_future=nbr_acc_fut_sel,
+                    cur_past=nbr_past_work[:, :, t_cur, :],
+                    cur_acc_new=nbr_cur_acc_new,
+                    mask=nbr_aug_ped,
+                    Nf=Nf_ped,
+                    Tsec=float(Nf_ped) * self._dt,
+                )
+
+        # ✅ 핵심: 보간 결과를 원본 텐서에 "반드시" 반영
+        ego_agent_past[idx_keep] = ego_past_work
+        ego_future_11[idx_keep] = ego_fut_work
+        if A > 0:
+            nbr_past[idx_keep] = nbr_past_work
+            nbr_future_11[idx_keep] = nbr_fut_work
+
 
         # ego current 정렬 강제(안전)
         ego_agent_past[idx_keep, t_cur, self.IDX_X] = 0.0

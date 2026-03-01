@@ -34,6 +34,29 @@ import math
 import torch.nn.functional as F
 from diffusion_planner.model.module.dit import TimestepEmbedder
 
+# ---------------------------
+# (DEBUG) 같은 경고를 너무 많이 찍지 않기 위한 "한 번만 출력" 헬퍼
+# ---------------------------
+from typing import Dict
+
+_DEBUG_PRINT_ONCE_COUNTER: Dict[str, int] = {}
+
+def _debug_print_rank0_once(key: str, msg: str, max_times: int = 1) -> None:
+    """rank0에서만 특정 메시지를 최대 max_times번 출력합니다.
+
+    Args:
+        key (str): 같은 메시지를 묶는 키.
+        msg (str): 출력할 문자열.
+        max_times (int): 최대 출력 횟수.
+    """
+    if not _is_rank0():
+        return
+    prev = int(_DEBUG_PRINT_ONCE_COUNTER.get(key, 0))
+    if prev >= int(max_times):
+        return
+    _DEBUG_PRINT_ONCE_COUNTER[key] = prev + 1
+    print(msg)
+
 def _is_rank0() -> bool:
     """DDP에서 rank0만 출력하기 위한 헬퍼.
 
@@ -2520,7 +2543,9 @@ class SimpleSelfAttention(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
-            raise ValueError(f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}")
+            raise ValueError(
+                f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}"
+            )
         self.heads = int(heads)
         self.head_dim = int(hidden_dim // heads)
         self.qkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=True)
@@ -2535,15 +2560,19 @@ class SimpleSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """agent self-attention.
 
+        추가 디버그 포인트
+        ----------------
+        - 어떤 배치에서 key_padding_mask가 전부 True면(=볼 수 있는 대상이 0개),
+          attention 내부 계산이 NaN을 만들 수 있습니다.
+        - 이 케이스를 잡아서 (배치 인덱스) 로그를 찍고,
+          해당 배치는 attention 계산을 생략하고 0을 반환합니다.
+
         Args:
-            x:
-                shape: (B, P, H)
-            key_padding_mask:
-                shape: (B, P), True=pad
+            x (torch.Tensor): 값 텐서. shape=(B, P, H)
+            key_padding_mask (torch.Tensor): pad 마스크(True=pad). shape=(B, P)
 
         Returns:
-            torch.Tensor:
-                shape: (B, P, H)
+            torch.Tensor: shape=(B, P, H)
         """
         if x.dim() != 3:
             raise ValueError(f"x must be (B,P,H). got {tuple(x.shape)}")
@@ -2551,6 +2580,19 @@ class SimpleSelfAttention(nn.Module):
 
         if key_padding_mask.dtype != torch.bool:
             key_padding_mask = key_padding_mask.to(torch.bool)
+
+        # (B,) True면 "해당 배치에서 P개 토큰이 전부 pad"
+        all_masked_b = key_padding_mask.all(dim=1)  # (B,)
+
+        if bool(all_masked_b.any().item()):
+            idx = torch.nonzero(all_masked_b, as_tuple=False).view(-1)
+            # valid 개수(=pad가 아닌 개수)도 같이 표시
+            valid_cnt = (P - key_padding_mask.to(torch.int32).sum(dim=1)).detach().cpu().tolist()
+            _debug_print_rank0_once(
+                "SA_ALL_MASKED",
+                f"[NAN-CAUSE] SA all-masked batch detected. idx={idx.detach().cpu().tolist()} valid_cnt(per batch)={valid_cnt}",
+                max_times=50,
+            )
 
         qkv = self.qkv(x)  # (B, P, 3H)
         qkv = qkv.view(B, P, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)  # (3,B,heads,P,hd)
@@ -2560,18 +2602,24 @@ class SimpleSelfAttention(nn.Module):
         attn_mask = key_padding_mask[:, None, None, :]  # (B,1,1,P)
 
         drop_p = self.attn_drop if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=float(drop_p),
-            is_causal=False,
-        )  # (B, heads, P, hd)
+
+        # ✅ "전부 마스크" 배치는 attention 계산을 스킵
+        out = q.new_zeros((B, self.heads, P, self.head_dim))  # (B, heads, P, hd)
+        valid_b = ~all_masked_b  # (B,)
+
+        if bool(valid_b.any().item()):
+            out_valid = F.scaled_dot_product_attention(
+                q[valid_b], k[valid_b], v[valid_b],
+                attn_mask=attn_mask[valid_b],
+                dropout_p=float(drop_p),
+                is_causal=False,
+            )  # (B_valid, heads, P, hd)
+            out[valid_b] = out_valid
 
         out = out.transpose(1, 2).contiguous().view(B, P, H)  # (B, P, H)
         out = self.out_proj(out)
         out = self.proj_drop(out)
         return out
-
 
 class TopKScoreBiasedCrossAttention(nn.Module):
     def __init__(
@@ -2583,21 +2631,18 @@ class TopKScoreBiasedCrossAttention(nn.Module):
     ) -> None:
         super().__init__()
         if hidden_dim % heads != 0:
-            raise ValueError(f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}")
+            raise ValueError(
+                f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}"
+            )
 
-        # --- hyper (config 없으면 기본값) ---
         self.topk_k: int = int(getattr(config, "ca_topk_k", 64))
         self.s_d: float = float(getattr(config, "ca_topk_s_d", 10.0))
-        self.neg_value: float = float(getattr(config, "ca_topk_neg", -1e4))
+
+        neg_cfg: float = float(getattr(config, "ca_topk_neg", -1e9))
+        self.neg_value: float = min(neg_cfg, -1e9)
+
         self.eps: float = float(getattr(config, "ca_topk_eps", 1e-6))
         self.agent_chunk_size: int = int(getattr(config, "ca_topk_agent_chunk_size", 64))
-
-        # --- debug switches (기본 OFF) ---
-        self._debug_nan_check: bool = bool(getattr(config, "debug_nan_check", False))
-        self._debug_nan_raise: bool = bool(getattr(config, "debug_nan_raise", True))
-        self._debug_nan_print: bool = bool(getattr(config, "debug_nan_print", True))
-        self._debug_report_limit: int = int(getattr(config, "debug_nan_report_limit", 5))
-        self._debug_reported: int = 0
 
         self.heads = int(heads)
         self.head_dim = int(hidden_dim // heads)
@@ -2609,43 +2654,70 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.proj_drop = nn.Dropout(float(proj_drop))
 
-    def _maybe_report_and_raise(
-        self,
-        *,
-        title: str,
-        extra: str,
-    ) -> None:
-        """디버그 메시지를 (일부만) 출력하고, 필요하면 예외를 던집니다."""
-        if self._debug_nan_print and (self._debug_reported < self._debug_report_limit):
-            _debug_print_rank0(f"[NAN-CHECK] {title}\n{extra}")
-            self._debug_reported += 1
-        if self._debug_nan_raise:
-            raise FloatingPointError(title)
+        # ✅ 디버그 플래그/기준값(없으면 기본값)
+        self._debug_nan_check: bool = bool(getattr(config, "debug_nan_check", True))
+        self._pos_abs_max_warn: float = float(getattr(config, "debug_ca_pos_abs_max_warn", 1e6))
+
+
+
+    @staticmethod
+    def _masked_softmax(
+        logits: torch.Tensor,  # (..., K)
+        mask: torch.Tensor,    # (..., K) True=가릴 위치
+        dim: int = -1,
+    ) -> torch.Tensor:
+        """마스크가 있는 softmax를 안전하게 계산합니다.
+
+        Args:
+            logits (torch.Tensor): 점수 텐서. shape=(..., K)
+            mask (torch.Tensor): True인 곳은 무효. shape=logits와 동일
+            dim (int): softmax 축
+
+        Returns:
+            torch.Tensor: 확률 텐서. shape=logits와 동일, mask=True 위치는 항상 0
+        """
+        if mask.dtype != torch.bool:
+            mask = mask.to(torch.bool)
+
+        logits_masked = logits.masked_fill(mask, float("-inf"))
+        attn = torch.softmax(logits_masked, dim=dim)
+        attn = attn.masked_fill(mask, 0.0)
+        return attn
 
     def forward(
-        self,
-        *,
-        query: torch.Tensor,  # (B, P, H)
-        agent_pose4: torch.Tensor,  # (B, P, 4)
-        target_current_mask: torch.Tensor,  # (B, P) True=pad
-        scene_encoding_token: torch.Tensor,  # (B, token_num, H)
-        scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
-        scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
-        score_beta: torch.Tensor,  # scalar parameter
+            self,
+            *,
+            query: torch.Tensor,  # (B, P, H)
+            agent_pose4: torch.Tensor,  # (B, P, 4)
+            target_current_mask: torch.Tensor,  # (B, P) True=pad
+            scene_encoding_token: torch.Tensor,  # (B, token_num, H)
+            scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
+            scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
+            score_beta: torch.Tensor,  # scalar parameter
     ) -> torch.Tensor:
         """거리 기반 top-K 선택 + score bias를 logits에 더하는 cross-attention.
 
+        원인 판별용 체크
+        --------------
+        - agent_pose4 / scene_encoding_pos_2d 가 NaN/Inf면 즉시 로그로 표시
+        - 좌표 절댓값이 너무 크면(overflow 위험) 경고 로그 표시
+        - score_keep 가 NaN/Inf면 "좌표 스케일 문제" 가능성이 매우 큼
+
         Returns:
-            torch.Tensor: out (B, P, H)
+            torch.Tensor: shape=(B, P, H)
         """
         if query.dim() != 3:
             raise ValueError(f"query must be (B,P,H). got {tuple(query.shape)}")
         if agent_pose4.dim() != 3 or int(agent_pose4.shape[-1]) != 4:
-            raise ValueError(f"agent_pose4 must be (B,P,4). got {tuple(agent_pose4.shape)}")
+            raise ValueError(
+                f"agent_pose4 must be (B,P,4). got {tuple(agent_pose4.shape)}")
         if scene_encoding_token.dim() != 3:
-            raise ValueError(f"scene_encoding_token must be (B,token_num,H). got {tuple(scene_encoding_token.shape)}")
-        if scene_encoding_pos_2d.dim() != 3 or int(scene_encoding_pos_2d.shape[-1]) != 9:
-            raise ValueError(f"scene_encoding_pos_2d must be (B,token_num,9). got {tuple(scene_encoding_pos_2d.shape)}")
+            raise ValueError(
+                f"scene_encoding_token must be (B,token_num,H). got {tuple(scene_encoding_token.shape)}")
+        if scene_encoding_pos_2d.dim() != 3 or int(
+                scene_encoding_pos_2d.shape[-1]) != 9:
+            raise ValueError(
+                f"scene_encoding_pos_2d must be (B,token_num,9). got {tuple(scene_encoding_pos_2d.shape)}")
 
         if target_current_mask.dtype != torch.bool:
             target_current_mask = target_current_mask.to(torch.bool)
@@ -2662,6 +2734,57 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         s_d: float = max(float(self.s_d), 1e-6)
         NEG: float = float(self.neg_value)
 
+        # ---- (DEBUG) 입력 유한값/스케일 체크 ----
+        if self._debug_nan_check:
+            if not torch.isfinite(scene_encoding_token).all().item():
+                _debug_print_rank0_once(
+                    "CA_SCENE_TOKEN_NONFINITE",
+                    _debug_tensor_summary("ca.scene_encoding_token",
+                                          scene_encoding_token),
+                    max_times=10,
+                )
+                raise RuntimeError(
+                    "CA 입력(scene_encoding_token)에 NaN/Inf가 있습니다.")
+            if not torch.isfinite(scene_encoding_pos_2d).all().item():
+                _debug_print_rank0_once(
+                    "CA_SCENE_POS_NONFINITE",
+                    _debug_tensor_summary("ca.scene_encoding_pos_2d",
+                                          scene_encoding_pos_2d),
+                    max_times=10,
+                )
+                raise RuntimeError(
+                    "CA 입력(scene_encoding_pos_2d)에 NaN/Inf가 있습니다.")
+            if not torch.isfinite(agent_pose4).all().item():
+                _debug_print_rank0_once(
+                    "CA_AGENT_POSE_NONFINITE",
+                    _debug_tensor_summary("ca.agent_pose4", agent_pose4),
+                    max_times=10,
+                )
+                raise RuntimeError("CA 입력(agent_pose4)에 NaN/Inf가 있습니다.")
+
+            # 좌표 스케일 경고(너무 크면 dx*dx에서 Inf로 튈 수 있음)
+            agent_xy_safe = torch.nan_to_num(
+                agent_pose4[..., 0:2].detach().to(torch.float32),
+                nan=0.0, posinf=0.0, neginf=0.0
+            )
+            token_xy_safe = torch.nan_to_num(
+                scene_encoding_pos_2d[..., 0:2].detach().to(torch.float32),
+                nan=0.0, posinf=0.0, neginf=0.0
+            )
+            agent_abs_max = float(
+                agent_xy_safe.abs().max().item()) if agent_xy_safe.numel() > 0 else 0.0
+            token_abs_max = float(
+                token_xy_safe.abs().max().item()) if token_xy_safe.numel() > 0 else 0.0
+            if (agent_abs_max > self._pos_abs_max_warn) or (
+                    token_abs_max > self._pos_abs_max_warn):
+                _debug_print_rank0_once(
+                    "CA_POS_TOO_LARGE",
+                    f"[NAN-CAUSE] CA pos scale looks too large. "
+                    f"abs_max(agent_xy)={agent_abs_max:.6g}, abs_max(token_xy)={token_abs_max:.6g} "
+                    f"(warn_th={self._pos_abs_max_warn:.6g})",
+                    max_times=50,
+                )
+
         # token_xy: (B, token_num, 2)
         token_xy: torch.Tensor = scene_encoding_pos_2d[:, :, 0:2].to(
             device=query.device, dtype=torch.float32
@@ -2670,121 +2793,131 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         token_y: torch.Tensor = token_xy[:, :, 1]  # (B, token_num)
 
         out_all = query.new_zeros((B, P, H))  # (B, P, H)
-
         chunk: int = max(1, int(self.agent_chunk_size))
-        beta_f32: torch.Tensor = score_beta.to(device=query.device, dtype=torch.float32)
-        beta_val: float = float(beta_f32.detach().view(-1)[0].item())  # scalar
+        beta_f32: torch.Tensor = score_beta.to(device=query.device,
+                                               dtype=torch.float32)
 
         for start in range(0, P, chunk):
             end = min(P, start + chunk)
 
             q_chunk = query[:, start:end, :]  # (B, Pc, H)
             pose_chunk = agent_pose4[:, start:end, :]  # (B, Pc, 4)
-            agent_pad_chunk = target_current_mask[:, start:end]  # (B, Pc)
+            agent_pad_chunk = target_current_mask[
+                :, start:end]  # (B, Pc) True=pad
 
-            agent_xy = pose_chunk[..., 0:2].to(torch.float32)  # (B, Pc, 2)
+            Pc = int(end - start)
+
+            # agent_xy: (B, Pc, 2)
+            agent_xy = pose_chunk[..., 0:2].to(torch.float32)
             agent_x = agent_xy[..., 0]  # (B, Pc)
             agent_y = agent_xy[..., 1]  # (B, Pc)
 
-            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)  # (B, Pc, token_num)
-            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)  # (B, Pc, token_num)
+            # dx, dy: (B, Pc, token_num)
+            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)
+            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)
 
-            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))  # (B, Pc, token_num)
-            score = -(dist / s_d)  # (B, Pc, token_num)
+            # dist: (B, Pc, token_num)
+            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))
 
-            score = score.masked_fill(scene_encoding_token_mask.unsqueeze(1), NEG)
-            score = score.masked_fill(agent_pad_chunk.unsqueeze(-1), NEG)
+            # score_raw: (B, Pc, token_num)
+            score_raw = -(dist / s_d)
 
-            topk_idx = torch.topk(score, k=K, dim=-1, largest=True).indices  # (B, Pc, K)
-            score_keep = torch.gather(score, dim=-1, index=topk_idx)  # (B, Pc, K) float32
+            # invalid_score_mask: (B, Pc, token_num) True=무효(pad token 또는 pad agent)
+            invalid_score_mask = scene_encoding_token_mask.unsqueeze(
+                1) | agent_pad_chunk.unsqueeze(-1)
 
+            # top-K 선택용 score: pad는 -inf
+            score_for_topk = score_raw.masked_fill(invalid_score_mask,
+                                                   float("-inf"))
+
+            # bias/후속 계산용 score: pad는 유한 NEG
+            score = score_raw.masked_fill(invalid_score_mask, NEG)
+
+            # topk_idx: (B, Pc, K)
+            topk_idx = torch.topk(score_for_topk, k=K, dim=-1,
+                                  largest=True).indices
+
+            # score_keep: (B, Pc, K)
+            score_keep = torch.gather(score, dim=-1, index=topk_idx)
+
+            # ✅ (DEBUG) score_keep가 NaN/Inf면 "좌표 overflow"가 강력 후보
+            if self._debug_nan_check:
+                if not torch.isfinite(score_keep).all().item():
+                    _debug_print_rank0_once(
+                        "CA_SCORE_KEEP_NONFINITE",
+                        _debug_tensor_summary("ca.score_keep", score_keep),
+                        max_times=10,
+                    )
+                    _debug_print_rank0_once(
+                        "CA_BETA",
+                        f"[NAN-CAUSE] ca_score_beta={float(beta_f32.detach().cpu().view(-1)[0].item()):.6g}",
+                        max_times=10,
+                    )
+                    raise RuntimeError(
+                        "CA에서 score_keep에 NaN/Inf가 생겼습니다. "
+                        "agent_pose4 / scene_encoding_pos_2d 좌표 스케일이 너무 크거나, "
+                        "거리 계산(dx*dx)이 Inf로 튀는 케이스일 가능성이 큽니다."
+                    )
+
+            # ✅ 디버그가 꺼져도 안전하게: 혹시 모를 NaN/Inf 확산 방지
+            score_keep = torch.nan_to_num(score_keep, nan=0.0, posinf=0.0,
+                                          neginf=0.0)
+
+            # sel_pad_mask: (B, Pc, K) True=pad
             sel_pad_mask = scene_encoding_token_mask.unsqueeze(1).expand(
-                B, end - start, token_num
-            ).gather(dim=2, index=topk_idx)  # (B, Pc, K)
+                B, Pc, token_num
+            ).gather(dim=2, index=topk_idx)
 
-            scene_exp = scene_encoding_token.unsqueeze(1).expand(B, end - start, token_num, H)
-            idx_exp = topk_idx.unsqueeze(-1).expand(B, end - start, K, H)
-            kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)  # (B, Pc, K, H)
+            # kv_sel: (B, Pc, K, H)
+            scene_exp = scene_encoding_token.unsqueeze(1).expand(B, Pc,
+                                                                 token_num, H)
+            idx_exp = topk_idx.unsqueeze(-1).expand(B, Pc, K, H)
+            kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)
             kv_sel = kv_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
 
+            # ---- attention ----
             q_lin = self.q_proj(q_chunk)  # (B,Pc,H)
-            k_lin = self.k_proj(kv_sel)   # (B,Pc,K,H)
-            v_lin = self.v_proj(kv_sel)   # (B,Pc,K,H)
+            k_lin = self.k_proj(kv_sel)  # (B,Pc,K,H)
+            v_lin = self.v_proj(kv_sel)  # (B,Pc,K,H)
 
-            Pc = int(end - start)
-            qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1, 3)  # (B,h,Pc,hd)
-            kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
-            vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
+            qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1,
+                                                                      3)  # (B,h,Pc,hd)
+            kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3,
+                                                                         1, 2,
+                                                                         4)  # (B,h,Pc,K,hd)
+            vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3,
+                                                                         1, 2,
+                                                                         4)  # (B,h,Pc,K,hd)
 
             qf = qh.to(torch.float32)
             kf = kh.to(torch.float32)
 
-            logits = (qf.unsqueeze(3) * kf).sum(dim=-1) * float(self.scale)  # (B,h,Pc,K)
+            # logits: (B,h,Pc,K)
+            logits = (qf.unsqueeze(3) * kf).sum(dim=-1) * float(self.scale)
 
-            # ==============================
-            # ✅ (핵심) 0 * (±Inf/NaN) 체크
-            # ==============================
-            if self._debug_nan_check:
-                score_keep_bad = ~torch.isfinite(score_keep)
-                if bool(score_keep_bad.any().item()) and (beta_val == 0.0):
-                    extra = "\n".join([
-                        f"beta_val={beta_val} (==0)",
-                        _debug_tensor_summary("score_keep", score_keep),
-                        _debug_tensor_summary("dist", dist),
-                        _debug_tensor_summary("agent_xy", agent_xy),
-                        _debug_tensor_summary("token_xy", token_xy),
-                        "의미: beta==0 인 상태에서 score_keep에 Inf/NaN이 섞여 있으면 "
-                        "beta*score_keep 에서 0*Inf -> NaN 이 바로 발생할 수 있습니다.",
-                    ])
-                    self._maybe_report_and_raise(
-                        title="TopKScoreBiasedCrossAttention: beta==0 & score_keep has non-finite -> potential 0*Inf => NaN",
-                        extra=extra,
-                    )
+            # bias: (B,1,Pc,K)
+            logits = logits + beta_f32 * score_keep.unsqueeze(1)
 
-            logits = logits + beta_f32 * score_keep.unsqueeze(1)  # (B,1,Pc,K) broadcast
-
-            logits = logits.masked_fill(sel_pad_mask.unsqueeze(1), NEG)
-
-            if self._debug_nan_check:
-                if not bool(torch.isfinite(logits).all().item()):
-                    extra = "\n".join([
-                        f"beta_val={beta_val}",
-                        _debug_tensor_summary("logits(after_bias)", logits),
-                        _debug_tensor_summary("score_keep", score_keep),
-                        _debug_tensor_summary("qf", qf),
-                        _debug_tensor_summary("kf", kf),
-                    ])
-                    self._maybe_report_and_raise(
-                        title="TopKScoreBiasedCrossAttention: logits became non-finite (after bias/mask)",
-                        extra=extra,
-                    )
-
-            attn = torch.softmax(logits, dim=-1)  # (B,h,Pc,K)
-
-            if self._debug_nan_check:
-                if not bool(torch.isfinite(attn).all().item()):
-                    extra = "\n".join([
-                        _debug_tensor_summary("attn(softmax)", attn),
-                        _debug_tensor_summary("logits(before_softmax)", logits),
-                    ])
-                    self._maybe_report_and_raise(
-                        title="TopKScoreBiasedCrossAttention: softmax(attn) became non-finite",
-                        extra=extra,
-                    )
+            pad_mask_logits = sel_pad_mask.unsqueeze(1)  # (B,1,Pc,K) True=pad
+            attn = self._masked_softmax(logits, mask=pad_mask_logits,
+                                        dim=-1)  # (B,h,Pc,K)
 
             vf = vh.to(torch.float32)
             out = (attn.unsqueeze(-1) * vf).sum(dim=3)  # (B,h,Pc,hd)
 
-            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc, H)  # (B,Pc,H)
+            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc,
+                                                            H)  # (B,Pc,H)
             out = out.to(dtype=q_chunk.dtype)
 
             out = self.out_proj(out)
             out = self.proj_drop(out)
 
+            # pad agent는 0
             out = out.masked_fill(agent_pad_chunk.unsqueeze(-1), 0.0)
             out_all[:, start:end, :] = out
 
         return out_all
+
 
 class DiTBlock(nn.Module):
     def __init__(
@@ -3422,6 +3555,28 @@ class DiT(nn.Module):
         if target_current_mask.dtype != torch.bool:
             target_current_mask = target_current_mask.to(torch.bool)
 
+        # ✅ (추가) "유효 agent 0개" / "ego invalid" / "마스크 이상" 원인 판별
+        if bool(self._debug_nan_check):
+            B_tmp, P_tmp = target_current_mask.shape
+            valid_cnt = target_current_valid.to(torch.int32).sum(dim=1)  # (B,)
+            zero_idx = torch.nonzero(valid_cnt == 0, as_tuple=False).view(-1)
+            if int(zero_idx.numel()) > 0:
+                _debug_print_rank0_once(
+                    "DIT_VALID_COUNT_ZERO",
+                    f"[NAN-CAUSE] target_current_valid count==0 found. idx={zero_idx.detach().cpu().tolist()} (P={P_tmp})",
+                    max_times=50,
+                )
+
+            # do_ego_predict=True라면 보통 ego(0번)가 항상 유효여야 정상인 경우가 많음
+            if bool(getattr(self.config, "do_ego_predict", False)) and P_tmp > 0:
+                ego_invalid = ~target_current_valid[:, 0].to(torch.bool)  # (B,)
+                ego_bad_idx = torch.nonzero(ego_invalid, as_tuple=False).view(-1)
+                if int(ego_bad_idx.numel()) > 0:
+                    _debug_print_rank0_once(
+                        "DIT_EGO_INVALID",
+                        f"[NAN-CAUSE] ego token appears invalid. idx={ego_bad_idx.detach().cpu().tolist()}",
+                        max_times=50,
+                    )
         B, P, _ = target_input_norm_xT.shape
         depth: int = int(len(self.blocks))
 
@@ -3435,6 +3590,46 @@ class DiT(nn.Module):
         cross_pos_2d = cross_pos_2d.to(device=x.device,
                                        dtype=torch.float32)  # dist 계산용
 
+        # ✅ (추가) encoder 출력 쪽이 깨끗한지 / 스케일이 비정상인지 체크
+        if bool(self._debug_nan_check):
+            if not torch.isfinite(cross_c).all().item():
+                _debug_print_rank0_once(
+                    "DIT_CROSS_C_NONFINITE",
+                    _debug_tensor_summary("dit.cross_c_in", cross_c),
+                    max_times=10,
+                )
+                raise RuntimeError("DiT에 들어오는 cross_c(encoder token)에 NaN/Inf가 있습니다.")
+
+            if not torch.isfinite(cross_pos_2d).all().item():
+                _debug_print_rank0_once(
+                    "DIT_CROSS_POS_NONFINITE",
+                    _debug_tensor_summary("dit.cross_pos_2d_in", cross_pos_2d),
+                    max_times=10,
+                )
+                raise RuntimeError("DiT에 들어오는 cross_pos_2d(encoder pos)에 NaN/Inf가 있습니다.")
+
+            # scene token이 전부 pad면 CA가 실질적으로 무의미(0 출력)일 수 있음 → 원인 단서
+            all_scene_pad = cross_mask.all(dim=1)  # (B,)
+            bad_scene_idx = torch.nonzero(all_scene_pad, as_tuple=False).view(-1)
+            if int(bad_scene_idx.numel()) > 0:
+                _debug_print_rank0_once(
+                    "DIT_ALL_SCENE_PAD",
+                    f"[NAN-CAUSE] cross_mask is all True (all scene tokens padded). idx={bad_scene_idx.detach().cpu().tolist()}",
+                    max_times=50,
+                )
+
+            # 좌표 스케일 경고
+            cross_xy_safe = torch.nan_to_num(
+                cross_pos_2d[..., 0:2].detach().to(torch.float32),
+                nan=0.0, posinf=0.0, neginf=0.0
+            )
+            cross_abs_max = float(cross_xy_safe.abs().max().item()) if cross_xy_safe.numel() > 0 else 0.0
+            if cross_abs_max > float(getattr(self.config, "debug_ca_pos_abs_max_warn", 1e6)):
+                _debug_print_rank0_once(
+                    "DIT_CROSS_POS_TOO_LARGE",
+                    f"[NAN-CAUSE] cross_pos_2d xy abs_max too large: {cross_abs_max:.6g}",
+                    max_times=50,
+                )
         # 3) timestep embedding
         t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
                                                              ref=x)
