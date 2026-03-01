@@ -1171,7 +1171,6 @@ def train_epoch(
     # ✅ (추가) NPC/ego current state 증강기 1회 생성(매 step 새로 만들지 않음)
     npc_state_augmenter: Optional[NPCStatePerturbation] = None
     use_npc_data_augment = bool(getattr(args, "use_npc_data_augment", False))
-    print("use_npc_data_augment:", use_npc_data_augment)
     if use_npc_data_augment:
         npc_state_augmenter = NPCStatePerturbation(
             dt=float(getattr(args, "feasible_stride_dt", 0.1)),
@@ -1184,7 +1183,7 @@ def train_epoch(
         # ✅ (추가) 정규화 전에 증강 적용
         if npc_state_augmenter is not None:
             # ---- env로 시각화 on/off (argparse 추가 없이) ----
-            enable_vis = True
+            enable_vis = False
 
             debug_vis_dir: Optional[str] = None
             if enable_vis and _is_main_process():
