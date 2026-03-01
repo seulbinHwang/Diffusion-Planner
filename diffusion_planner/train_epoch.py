@@ -654,6 +654,8 @@ def _prepare_batch_for_device(
     }
     outputs: Dict[str, torch.Tensor] = {}
     for key in list(batch_on_device.keys()):
+        print("key:", key, "shape:", batch_on_device[key].shape if isinstance(
+            batch_on_device[key], torch.Tensor) else type(batch_on_device[key]))
         if key in target_keys:
             # pop으로 꺼내자.
             value = batch_on_device.pop(key, None)
