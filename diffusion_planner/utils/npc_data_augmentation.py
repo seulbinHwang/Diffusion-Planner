@@ -176,6 +176,118 @@ def _vel_dir_yaw_rate_at_tcur(
     out = torch.where(seg_valid, dpsi / float(dt), torch.zeros_like(dpsi))
     return out
 
+def _obb_intersects_others_vs_others(
+    oth_xy: Tensor,  # (B, A, 2)
+    oth_cs: Tensor,  # (B, A, 2) = (cos, sin)
+    oth_wl: Tensor,  # (B, A, 2) = (width, length)
+    oth_valid: Tensor,  # (B, A) bool
+    pair_mask: Optional[Tensor] = None,  # (B, A, A) bool
+    eps: float = 1e-6,
+) -> Tensor:
+    """다른 agent들끼리 현재 시점에서 겹치는지 검사합니다.
+
+    Args:
+        oth_xy (Tensor): shape (B, A, 2). agent 중심 위치 (x,y).
+        oth_cs (Tensor): shape (B, A, 2). agent 방향 (cos,sin).
+        oth_wl (Tensor): shape (B, A, 2). (width,length).
+        oth_valid (Tensor): shape (B, A) bool. 유효 agent 마스크.
+        pair_mask (Optional[Tensor]): shape (B, A, A) bool.
+            - True인 (i,j) 쌍만 검사합니다.
+            - None이면 모든 i<j 쌍을 검사합니다.
+        eps (float): 수치 안정용 작은 값.
+
+    Returns:
+        Tensor: shape (B,) bool. True면 그 샘플에서 어떤 pair라도 겹칩니다.
+    """
+    if oth_xy.ndim != 3 or int(oth_xy.shape[-1]) != 2:
+        raise ValueError(f"oth_xy must be (B,A,2). got shape={tuple(oth_xy.shape)}")
+    B = int(oth_xy.shape[0])
+    A = int(oth_xy.shape[1])
+    if A <= 1:
+        return torch.zeros((B,), device=oth_xy.device, dtype=torch.bool)
+
+    if (not isinstance(oth_cs, torch.Tensor)) or oth_cs.ndim != 3 or int(oth_cs.shape[-1]) != 2:
+        raise ValueError(f"oth_cs must be (B,A,2). got shape={tuple(getattr(oth_cs, 'shape', []))}")
+    if (not isinstance(oth_wl, torch.Tensor)) or oth_wl.ndim != 3 or int(oth_wl.shape[-1]) != 2:
+        raise ValueError(f"oth_wl must be (B,A,2). got shape={tuple(getattr(oth_wl, 'shape', []))}")
+    if (not isinstance(oth_valid, torch.Tensor)) or oth_valid.ndim != 2:
+        raise ValueError(f"oth_valid must be (B,A). got shape={tuple(getattr(oth_valid, 'shape', []))}")
+
+    if int(oth_cs.shape[0]) != B or int(oth_cs.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: oth_cs")
+    if int(oth_wl.shape[0]) != B or int(oth_wl.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: oth_wl")
+    if int(oth_valid.shape[0]) != B or int(oth_valid.shape[1]) != A:
+        raise ValueError("batch/agent size mismatch: oth_valid")
+
+    x = oth_xy[..., 0]  # (B,A)
+    y = oth_xy[..., 1]  # (B,A)
+
+    cos_v = oth_cs[..., 0]  # (B,A)
+    sin_v = oth_cs[..., 1]  # (B,A)
+
+    # half extents
+    half_W = 0.5 * oth_wl[..., 0]  # (B,A)
+    half_L = 0.5 * oth_wl[..., 1]  # (B,A)
+
+    # pairwise center diff: t = cJ - cI  -> (B,A,A)
+    tx = x[:, None, :] - x[:, :, None]
+    ty = y[:, None, :] - y[:, :, None]
+
+    cos_i = cos_v[:, :, None]  # (B,A,1)
+    sin_i = sin_v[:, :, None]  # (B,A,1)
+    cos_j = cos_v[:, None, :]  # (B,1,A)
+    sin_j = sin_v[:, None, :]  # (B,1,A)
+
+    # t in I frame
+    tIx = tx * cos_i + ty * sin_i
+    tIy = -tx * sin_i + ty * cos_i
+
+    # Rotation matrix between axes of I and J
+    R00 = cos_i * cos_j + sin_i * sin_j
+    R01 = cos_i * (-sin_j) + sin_i * cos_j
+    R10 = (-sin_i) * cos_j + cos_i * sin_j
+    R11 = (-sin_i) * (-sin_j) + cos_i * cos_j
+
+    absR00 = torch.abs(R00) + float(eps)
+    absR01 = torch.abs(R01) + float(eps)
+    absR10 = torch.abs(R10) + float(eps)
+    absR11 = torch.abs(R11) + float(eps)
+
+    aW = half_W[:, :, None]  # (B,A,1)
+    aL = half_L[:, :, None]  # (B,A,1)
+    bW = half_W[:, None, :]  # (B,1,A)
+    bL = half_L[:, None, :]  # (B,1,A)
+
+    # axis uI / vI
+    cond0 = torch.abs(tIx) <= (aL + bL * absR00 + bW * absR01)
+    cond1 = torch.abs(tIy) <= (aW + bL * absR10 + bW * absR11)
+
+    # t in J frame: tJ = R^T * tI
+    tJx = tIx * R00 + tIy * R10
+    tJy = tIx * R01 + tIy * R11
+
+    # axis uJ / vJ
+    cond2 = torch.abs(tJx) <= (bL + aL * absR00 + aW * absR10)
+    cond3 = torch.abs(tJy) <= (bW + aL * absR01 + aW * absR11)
+
+    # valid pair mask (i<j only)
+    valid_ij = oth_valid[:, :, None] & oth_valid[:, None, :]  # (B,A,A)
+    upper = torch.triu(
+        torch.ones((A, A), device=oth_xy.device, dtype=torch.bool),
+        diagonal=1,
+    )  # (A,A)
+    valid_ij = valid_ij & upper  # broadcast to (B,A,A)
+
+    if pair_mask is not None:
+        pm = _as_bool_mask(pair_mask)
+        if pm.shape != (B, A, A):
+            raise ValueError(f"pair_mask must be (B,A,A). got shape={tuple(pm.shape)}")
+        valid_ij = valid_ij & pm
+
+    intersect = valid_ij & cond0 & cond1 & cond2 & cond3  # (B,A,A)
+    collide_sample = torch.any(intersect, dim=(1, 2))  # (B,)
+    return collide_sample
 
 def _obb_intersects_ego_vs_others(
     ego_xy: Tensor,  # (B, 2)
@@ -2040,6 +2152,40 @@ class NPCStatePerturbation:
             nbr_is_ped = torch.zeros((B, 0), device=device, dtype=torch.bool)
             nbr_is_cyc = torch.zeros((B, 0), device=device, dtype=torch.bool)
 
+        def _update_cos_sin_from_vxvy(
+            *,
+            vx: Tensor,        # (..., K)
+            vy: Tensor,        # (..., K)
+            cos_old: Tensor,   # (..., K)
+            sin_old: Tensor,   # (..., K)
+            speed_eps: float,
+        ) -> Tuple[Tensor, Tensor]:
+            """속도 방향으로 (cos,sin)을 만들고, 너무 느리면 기존 값을 유지합니다.
+
+            Args:
+                vx (Tensor): shape (..., K) x방향 속도.
+                vy (Tensor): shape (..., K) y방향 속도.
+                cos_old (Tensor): shape (..., K) 기존 cos 값.
+                sin_old (Tensor): shape (..., K) 기존 sin 값.
+                speed_eps (float): sqrt(vx^2+vy^2)가 이 값보다 작으면 기존 방향을 유지합니다.
+
+            Returns:
+                Tuple[Tensor, Tensor]:
+                    - cos_new: shape (..., K)
+                    - sin_new: shape (..., K)
+            """
+            speed = torch.sqrt(vx * vx + vy * vy)
+            use_new = speed > float(speed_eps)
+
+            yaw = torch.atan2(vy, vx)
+            cos_new = torch.cos(yaw)
+            sin_new = torch.sin(yaw)
+
+            cos_out = torch.where(use_new, cos_new, cos_old)
+            sin_out = torch.where(use_new, sin_new, sin_old)
+            cos_out, sin_out = _normalize_cos_sin(cos_out, sin_out)
+            return cos_out, sin_out
+
         # 타입별 보간 길이(step)
         def _N_from_T(T: float) -> int:
             return int(round(float(T) / float(self._dt)))
@@ -2491,7 +2637,10 @@ class NPCStatePerturbation:
             nbr_cur_acc_after = nbr_cur_acc
 
         # -----------------------------
-        # Step 8) 현재 충돌 검사(ego vs others) -> 충돌이면 샘플 전체 증강 포기
+        # Step 8) 현재 충돌 검사
+        #   (1) ego vs others
+        #   (2) others vs others (neighbor끼리)
+        #       - 속도/데이터 손실을 줄이기 위해 "증강된 neighbor가 포함된 pair"만 검사
         # -----------------------------
         sel = torch.nonzero(do_sample_aug, as_tuple=True)[0]
         if int(sel.numel()) == 0:
@@ -2525,6 +2674,7 @@ class NPCStatePerturbation:
             ],
                                      dim=-1)  # (Bs,A,2)
             oth_valid_sel = nbr_cur_valid[sel, :]  # (Bs,A)
+
             collide_sel = _obb_intersects_ego_vs_others(
                 ego_xy=ego_xy_sel,
                 ego_cs=ego_cs_sel,
@@ -2534,13 +2684,39 @@ class NPCStatePerturbation:
                 oth_wl=oth_wl_sel,
                 oth_valid=oth_valid_sel,
             )  # (Bs,)
+
+            # --- neighbor-neighbor collision (증강된 neighbor가 포함된 pair만) ---
+            collide_nbr_sel = torch.zeros_like(collide_sel)  # (Bs,)
+            if A > 1:
+                aug_nbr_sel_mask = aug_nbr[sel]  # (Bs,A)
+                any_aug_nbr_sel = torch.any(aug_nbr_sel_mask, dim=1)  # (Bs,)
+                if bool(torch.any(any_aug_nbr_sel)):
+                    idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[0]  # (Bs2,)
+
+                    # (i,j) 중 하나라도 증강된 neighbor이면 True
+                    pair_mask_sub = (aug_nbr_sel_mask[idx_sub, :, None] |
+                                     aug_nbr_sel_mask[idx_sub, None, :])  # (Bs2,A,A)
+
+                    collide_sub = _obb_intersects_others_vs_others(
+                        oth_xy=oth_xy_sel[idx_sub],
+                        oth_cs=oth_cs_sel[idx_sub],
+                        oth_wl=oth_wl_sel[idx_sub],
+                        oth_valid=oth_valid_sel[idx_sub],
+                        pair_mask=pair_mask_sub,
+                    )  # (Bs2,)
+                    collide_nbr_sel[idx_sub] = collide_sub
         else:
             collide_sel = torch.zeros((int(sel.numel()),),
                                       device=device,
                                       dtype=torch.bool)
+            collide_nbr_sel = torch.zeros_like(collide_sel)
 
         final_aug_sample_mask = do_sample_aug.clone()
-        final_aug_sample_mask[sel] = final_aug_sample_mask[sel] & (~collide_sel)
+        final_aug_sample_mask[sel] = final_aug_sample_mask[sel] & (~(collide_sel | collide_nbr_sel))
+
+        if not bool(torch.any(final_aug_sample_mask)):
+            return
+
 
         if not bool(torch.any(final_aug_sample_mask)):
             return
@@ -2872,10 +3048,10 @@ class NPCStatePerturbation:
 
         # ---- past 보간 helper (ego 또는 neighbor 공용) ----
         def _apply_past_interp_for_mask(
-            traj_past: Tensor,  # (Bk, ..., Tp, 11)
-            acc_past: Tensor,  # (Bk, ..., Tp, 2)
-            cur_acc_new: Tensor,  # (Bk, ..., 2)
-            mask: Tensor,  # (Bk, ...) bool : 보간 대상
+            traj_past: Tensor,      # (Bk, ..., Tp, 11)
+            acc_past: Tensor,       # (Bk, ..., Tp, 2)
+            cur_acc_new: Tensor,    # (Bk, ..., 2)
+            mask: Tensor,           # (Bk, ...) bool
             Np: int,
             Tsec: float,
         ) -> None:
@@ -2883,13 +3059,15 @@ class NPCStatePerturbation:
                 return
             if t_cur - int(Np) < 0:
                 return
-            # flatten
-            lead = traj_past.shape[:-2]  # (Bk,...) leading dims
+
+            lead = traj_past.shape[:-2]  # (Bk, ...)
             Tloc = int(traj_past.shape[-2])
             flat_n = int(torch.prod(torch.tensor(lead, device=device)).item())
+
             traj_f = traj_past.reshape(flat_n, Tloc, 11)
             acc_f = acc_past.reshape(flat_n, Tloc, 2)
             curacc_f = cur_acc_new.reshape(flat_n, 2)
+
             m_f = mask.reshape(flat_n)
             sel_i = torch.nonzero(m_f, as_tuple=True)[0]
             if int(sel_i.numel()) == 0:
@@ -2897,9 +3075,9 @@ class NPCStatePerturbation:
 
             tA = t_cur - int(Np)
 
-            s_tr = traj_f[sel_i]  # (M,Tp,11)
-            s_ac = acc_f[sel_i]  # (M,Tp,2)
-            s_ca = curacc_f[sel_i]  # (M,2)
+            s_tr = traj_f[sel_i]   # (M, Tp, 11)
+            s_ac = acc_f[sel_i]    # (M, Tp, 2)
+            s_ca = curacc_f[sel_i] # (M, 2)
 
             xA = s_tr[:, tA, self.IDX_X]
             yA = s_tr[:, tA, self.IDX_Y]
@@ -2915,23 +3093,16 @@ class NPCStatePerturbation:
             ax0 = s_ca[:, 0]
             ay0 = s_ca[:, 1]
 
-            # quintic (start=A, end=cur)
-            x_seq, vx_seq = self._quintic_1d(x0=xA,
-                                             v0=vxA,
-                                             a0=axA,
-                                             x1=x0,
-                                             v1=vx0,
-                                             a1=ax0,
-                                             T=float(Tsec),
-                                             N=int(Np))
-            y_seq, vy_seq = self._quintic_1d(x0=yA,
-                                             v0=vyA,
-                                             a0=ayA,
-                                             x1=y0,
-                                             v1=vy0,
-                                             a1=ay0,
-                                             T=float(Tsec),
-                                             N=int(Np))
+            x_seq, vx_seq = self._quintic_1d(
+                x0=xA, v0=vxA, a0=axA,
+                x1=x0, v1=vx0, a1=ax0,
+                T=float(Tsec), N=int(Np)
+            )
+            y_seq, vy_seq = self._quintic_1d(
+                x0=yA, v0=vyA, a0=ayA,
+                x1=y0, v1=vy0, a1=ay0,
+                T=float(Tsec), N=int(Np)
+            )
 
             # write back segment [tA:t_cur]
             s_tr[:, tA:(t_cur + 1), self.IDX_X] = x_seq
@@ -2939,16 +3110,33 @@ class NPCStatePerturbation:
             s_tr[:, tA:(t_cur + 1), self.IDX_VX] = vx_seq
             s_tr[:, tA:(t_cur + 1), self.IDX_VY] = vy_seq
 
+            # ✅ 보간으로 바뀐 "중간 프레임"의 heading을 속도 방향으로 맞춤 (끝점은 유지)
+            if int(Np) >= 2:
+                # interior: tA+1 ... t_cur-1  -> 길이 Np-1
+                cos_old = s_tr[:, (tA + 1):t_cur, self.IDX_COS]  # (M, Np-1)
+                sin_old = s_tr[:, (tA + 1):t_cur, self.IDX_SIN]  # (M, Np-1)
+                vx_mid = vx_seq[:, 1:-1]  # (M, Np-1)
+                vy_mid = vy_seq[:, 1:-1]  # (M, Np-1)
+
+                cos_new, sin_new = _update_cos_sin_from_vxvy(
+                    vx=vx_mid,
+                    vy=vy_mid,
+                    cos_old=cos_old,
+                    sin_old=sin_old,
+                    speed_eps=1e-3,
+                )
+                s_tr[:, (tA + 1):t_cur, self.IDX_COS] = cos_new
+                s_tr[:, (tA + 1):t_cur, self.IDX_SIN] = sin_new
+
             traj_f[sel_i] = s_tr
-            # view라 원본 반영됨
 
         # ---- future 보간 helper ----
         def _apply_future_interp_for_mask(
-            traj_future: Tensor,  # (Bk, ..., Tf, 11)  (t=dt..)
-            acc_future: Tensor,  # (Bk, ..., Tf, 2)
-            cur_past: Tensor,  # (Bk, ..., 11) 현재 state (t=0)
-            cur_acc_new: Tensor,  # (Bk, ..., 2) 현재 acc (t=0)
-            mask: Tensor,  # (Bk, ...) bool
+            traj_future: Tensor,    # (Bk, ..., Tf, 11)
+            acc_future: Tensor,     # (Bk, ..., Tf, 2)
+            cur_past: Tensor,       # (Bk, ..., 11)  현재(t=0)
+            cur_acc_new: Tensor,    # (Bk, ..., 2)   현재(t=0)
+            mask: Tensor,           # (Bk, ...) bool
             Nf: int,
             Tsec: float,
         ) -> None:
@@ -2960,21 +3148,23 @@ class NPCStatePerturbation:
             lead = traj_future.shape[:-2]
             Tloc = int(traj_future.shape[-2])
             flat_n = int(torch.prod(torch.tensor(lead, device=device)).item())
+
             fut_f = traj_future.reshape(flat_n, Tloc, 11)
             acc_f = acc_future.reshape(flat_n, Tloc, 2)
             cur_f = cur_past.reshape(flat_n, 11)
             curacc_f = cur_acc_new.reshape(flat_n, 2)
+
             m_f = mask.reshape(flat_n)
             sel_i = torch.nonzero(m_f, as_tuple=True)[0]
             if int(sel_i.numel()) == 0:
                 return
 
-            kT = int(Nf) - 1  # future index for Tf
+            kT = int(Nf) - 1  # future index
 
-            s_fut = fut_f[sel_i]  # (M,Tf,11)
-            s_acc = acc_f[sel_i]  # (M,Tf,2)
-            s_cur = cur_f[sel_i]  # (M,11)
-            s_ca = curacc_f[sel_i]  # (M,2)
+            s_fut = fut_f[sel_i]     # (M, Tf, 11)
+            s_acc = acc_f[sel_i]     # (M, Tf, 2)
+            s_cur = cur_f[sel_i]     # (M, 11)
+            s_ca = curacc_f[sel_i]   # (M, 2)
 
             x0 = s_cur[:, self.IDX_X]
             y0 = s_cur[:, self.IDX_Y]
@@ -2990,28 +3180,40 @@ class NPCStatePerturbation:
             axT = s_acc[:, kT, 0]
             ayT = s_acc[:, kT, 1]
 
-            x_seq, vx_seq = self._quintic_1d(x0=x0,
-                                             v0=vx0,
-                                             a0=ax0,
-                                             x1=xT,
-                                             v1=vxT,
-                                             a1=axT,
-                                             T=float(Tsec),
-                                             N=int(Nf))
-            y_seq, vy_seq = self._quintic_1d(x0=y0,
-                                             v0=vy0,
-                                             a0=ay0,
-                                             x1=yT,
-                                             v1=vyT,
-                                             a1=ayT,
-                                             T=float(Tsec),
-                                             N=int(Nf))
+            x_seq, vx_seq = self._quintic_1d(
+                x0=x0, v0=vx0, a0=ax0,
+                x1=xT, v1=vxT, a1=axT,
+                T=float(Tsec), N=int(Nf)
+            )
+            y_seq, vy_seq = self._quintic_1d(
+                x0=y0, v0=vy0, a0=ay0,
+                x1=yT, v1=vyT, a1=ayT,
+                T=float(Tsec), N=int(Nf)
+            )
 
-            # x_seq[:,0]는 현재(t=0), future 텐서에는 없음 -> 1..Nf를 0..Nf-1에 씀
+            # future에는 현재(t=0)가 없으므로, 1..Nf를 0..Nf-1에 저장
             s_fut[:, :int(Nf), self.IDX_X] = x_seq[:, 1:]
             s_fut[:, :int(Nf), self.IDX_Y] = y_seq[:, 1:]
             s_fut[:, :int(Nf), self.IDX_VX] = vx_seq[:, 1:]
             s_fut[:, :int(Nf), self.IDX_VY] = vy_seq[:, 1:]
+
+            # ✅ 보간으로 바뀐 "중간 프레임"의 heading을 속도 방향으로 맞춤
+            #    - 마지막 프레임(kT)은 원래 값 유지 (뒤쪽 구간과의 연결 보호)
+            if int(Nf) >= 2:
+                cos_old = s_fut[:, :(int(Nf) - 1), self.IDX_COS]  # (M, Nf-1)
+                sin_old = s_fut[:, :(int(Nf) - 1), self.IDX_SIN]  # (M, Nf-1)
+                vx_mid = vx_seq[:, 1:-1]  # (M, Nf-1)
+                vy_mid = vy_seq[:, 1:-1]  # (M, Nf-1)
+
+                cos_new, sin_new = _update_cos_sin_from_vxvy(
+                    vx=vx_mid,
+                    vy=vy_mid,
+                    cos_old=cos_old,
+                    sin_old=sin_old,
+                    speed_eps=1e-3,
+                )
+                s_fut[:, :(int(Nf) - 1), self.IDX_COS] = cos_new
+                s_fut[:, :(int(Nf) - 1), self.IDX_SIN] = sin_new
 
             fut_f[sel_i] = s_fut
 
