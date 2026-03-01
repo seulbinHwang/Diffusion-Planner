@@ -98,8 +98,8 @@ FORCE_REBUILD=0
 #  --dst_list "$LOCAL_TRAIN_SET_LIST_PATH" \
 #  --force_rebuild "$FORCE_REBUILD" \
 #  --num_workers 24
- python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
-"$RUN_PYTHON_PATH" add_control_to_npz.py --skip_sample_keys --workers 24
+# python /mnt/nuplan/projects/Diffusion-Planner/add_control_to_npz.py --skip_sample_keys
+#"$RUN_PYTHON_PATH" add_control_to_npz.py --skip_sample_keys --workers 24
 #
 #export DP_ENABLE_CPU_MONITOR=0
 #
