@@ -1526,7 +1526,7 @@ def diffusion_loss_func(
             - decoder_output: 모델 decoder 출력 dict
     """
     # norm_inputs 의 각 텐서 NaN/Inf 체크
-    # norm_inputs = _sanitize_norm_inputs(norm_inputs)
+    norm_inputs = _sanitize_norm_inputs(norm_inputs)
 
     # near_cur_future_gt_is_valid : (B, Pnn, 1 + future_len)
     near_cur_future_gt_is_valid = _get_near_cur_future_gt_is_valid(

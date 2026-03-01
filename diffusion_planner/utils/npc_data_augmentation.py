@@ -3016,16 +3016,6 @@ class NPCStatePerturbation:
             fut_f[sel_i] = s_fut
 
         # ego past/future
-        _apply_past_interp_for_mask(
-            traj_past=ego_agent_past[idx_keep],  # (Bk,Tp,11)
-            acc_past=ego_acc_past_sel,  # (Bk,Tp,2)
-            cur_acc_new=ego_cur_acc_new,  # (Bk,2)
-            mask=(aug_ego_sel),  # (Bk,)
-            Np=(Np_car if True else Np_car),
-            Tsec=2.0,  # 타입별로 아래에서 분기 적용
-        )
-        # 위는 "타입별"을 반영하려면 분기가 필요하니, 아래에서 정확히 처리합니다.
-
         # 타입별로 정확히 처리(ego)
         ego_aug_car = aug_ego_sel & ego_is_car_sel
         ego_aug_cyc = aug_ego_sel & ego_is_cyc_sel
