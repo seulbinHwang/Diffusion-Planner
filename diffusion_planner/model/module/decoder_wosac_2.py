@@ -2542,7 +2542,7 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             raise ValueError(f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}")
 
         # --- hyper (config 없으면 기본값) ---
-        self.topk_k: int = int(getattr(config, "ca_topk_k", 256))
+        self.topk_k: int = int(getattr(config, "ca_topk_k", 64))
         self.s_d: float = float(getattr(config, "ca_topk_s_d", 10.0))
         self.neg_value: float = float(getattr(config, "ca_topk_neg", -1e4))
         self.eps: float = float(getattr(config, "ca_topk_eps", 1e-6))

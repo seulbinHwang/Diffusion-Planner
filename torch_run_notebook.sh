@@ -73,5 +73,5 @@ TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_plan
     --integration_yaw_weight 2. \
     --use_amortized_diffusion False \
     --use_body_vel False \
-    --use_npc_data_augment True
+    --use_npc_data_augment False
 
