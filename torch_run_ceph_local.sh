@@ -136,4 +136,4 @@ FORCE_REBUILD=0
     --use_amortized_diffusion False \
     --use_body_vel False \
     --use_npc_data_augment False \
-    --ca_topk_k 48
+    --ca_topk_k 32
