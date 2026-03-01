@@ -39,8 +39,8 @@ export TORCHELASTIC_ERROR_FILE="$LOG_DIR/torchelastic_error.json"
 # User Configuration Section
 ###################################
 RUN_PYTHON_PATH="/home/user/miniforge3/envs/diffusion_planner/bin/python"
-TRAIN_SET_PATH="/home/user/nuplan/dataset/processed"
-TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_training.json"
+TRAIN_SET_PATH="/home/user/womd_v1_3/processed_womd_0124/training"
+TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_planner_training_womd.json"
 ###################################
 "$RUN_PYTHON_PATH" -u -X faulthandler -m torch.distributed.run \
 --nnodes 1 --nproc-per-node 1 --standalone --log_dir "$LOG_DIR" \
@@ -48,7 +48,7 @@ TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_plan
  train_predictor.py \
   --train_set "$TRAIN_SET_PATH"/ \
   --train_set_list "$TRAIN_SET_LIST_PATH" \
-  --name "augment_test" \
+  --name "augment_test_womd" \
   --batch_size 4 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \

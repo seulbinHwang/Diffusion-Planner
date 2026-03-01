@@ -1,4 +1,4 @@
-from tqdm import tqdm
+import os
 import numpy as np
 from torch import nn
 from typing import Tuple
@@ -1168,9 +1168,54 @@ def train_epoch(
     epoch_loss_sums: Dict[str, torch.Tensor] = {}
     epoch_loss_counts: Dict[str, torch.Tensor] = {}
 
+    # ✅ (추가) NPC/ego current state 증강기 1회 생성(매 step 새로 만들지 않음)
+    npc_state_augmenter: Optional[NPCStatePerturbation] = None
+    use_npc_data_augment = bool(getattr(args, "use_npc_data_augment", False))
+    print("use_npc_data_augment:", use_npc_data_augment)
+    if use_npc_data_augment:
+        npc_state_augmenter = NPCStatePerturbation(
+            dt=float(getattr(args, "feasible_stride_dt", 0.1)),
+            time_len=int(getattr(args, "time_len", 21)),
+            future_len=int(getattr(args, "future_len", 80)),
+        )
+
     for batch in data_loader:
         inputs, outputs = _prepare_batch_for_device(batch, device=args.device)
+        # ✅ (추가) 정규화 전에 증강 적용
+        if npc_state_augmenter is not None:
+            # ---- env로 시각화 on/off (argparse 추가 없이) ----
+            enable_vis = True
 
+            debug_vis_dir: Optional[str] = None
+            if enable_vis and _is_main_process():
+                # 경로를 명시하면 그 경로 사용, 없으면 save_path 아래 기본 폴더 사용
+                debug_vis_dir = os.environ.get("DP_NPC_AUG_VIS_DIR", "").strip()
+                if debug_vis_dir == "":
+                    debug_vis_dir = os.path.join(
+                        str(getattr(args, "save_path", ".")), "npc_aug_vis")
+                print("debug_vis_dir:", debug_vis_dir)
+
+            npc_state_augmenter.apply_inplace(
+                inputs=inputs,
+                outputs=outputs,
+                augment_prob=float(getattr(args, "augment_prob", 0.5)),
+                agent_prob=float(getattr(args, "augment_prob", 0.5)),
+                use_body_vel=bool(getattr(args, "use_body_vel", True)),
+
+                # ---- debug vis args (추가) ----
+                debug_vis_dir=debug_vis_dir,
+                debug_step=int(getattr(args, "_global_update_step", 0)),
+                debug_max_scenes=int(
+                    os.environ.get("DP_NPC_AUG_VIS_MAX_SCENES", "2")),
+                debug_every_n_steps=int(
+                    os.environ.get("DP_NPC_AUG_VIS_EVERY", "100")),
+                debug_past_stride=int(
+                    os.environ.get("DP_NPC_AUG_VIS_PAST_STRIDE", "1")),
+                debug_future_stride=int(
+                    os.environ.get("DP_NPC_AUG_VIS_FUTURE_STRIDE", "1")),
+                debug_vel_arrow_len_m=float(
+                    os.environ.get("DP_NPC_AUG_VIS_VEL_ARROW_LEN_M", "1.0")),
+            )
         # 1) 관측 정규화
         norm_inputs: Dict[str,
                           torch.Tensor] = args.observation_normalizer(inputs)

@@ -7,7 +7,7 @@ export NUPLAN_DATA_ROOT="/home/user/nuplan/dataset" #"REPLACE_WITH_DATA_DIR"  # 
 NUPLAN_DATA_PATH="${NUPLAN_DATA_ROOT}/nuplan-v1.1/splits/trainval" # nuplan training data path (e.g., "/data/nuplan-v1.1/trainval")
 NUPLAN_MAP_PATH="${NUPLAN_DATA_ROOT}/maps" # nuplan map path (e.g., "/data/nuplan-v1.1/maps")
 
-TRAIN_SET_PATH="${NUPLAN_DATA_ROOT}/processed_nuplan_0124" # preprocess training data
+TRAIN_SET_PATH="${NUPLAN_DATA_ROOT}/processed" # preprocess training data
 ###################################
 
 python data_process.py \
@@ -15,7 +15,6 @@ python data_process.py \
 --map_path $NUPLAN_MAP_PATH \
 --save_path $TRAIN_SET_PATH \
 --total_scenarios 120 \
---num_workers 1 \
---save_image false \
---save_integration_traj false
+--num_workers 12 \
+
 
