@@ -34,6 +34,48 @@ import math
 import torch.nn.functional as F
 from diffusion_planner.model.module.dit import TimestepEmbedder
 
+def _is_rank0() -> bool:
+    """DDP에서 rank0만 출력하기 위한 헬퍼.
+
+    Returns:
+        bool: 분산이 아니거나 rank==0이면 True
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank()) == 0
+    return True
+
+
+def _debug_print_rank0(msg: str) -> None:
+    """rank0에서만 print 합니다."""
+    if _is_rank0():
+        print(msg)
+
+
+def _debug_tensor_summary(name: str, x: torch.Tensor) -> str:
+    """텐서의 NaN/Inf 개수와 대략적인 스케일을 문자열로 요약합니다.
+
+    Args:
+        name (str): 출력에 붙일 이름
+        x (torch.Tensor): 임의 shape 텐서
+
+    Returns:
+        str: 요약 문자열
+    """
+    xd = x.detach()
+    nan_cnt = int(torch.isnan(xd).sum().item())
+    inf_cnt = int(torch.isinf(xd).sum().item())
+    numel = int(xd.numel())
+
+    # 스케일만 대략 확인(Inf/NaN은 0으로 치환)
+    x_f32 = xd.to(dtype=torch.float32)
+    x_safe = torch.nan_to_num(x_f32, nan=0.0, posinf=0.0, neginf=0.0)
+    abs_max = float(x_safe.abs().max().item()) if numel > 0 else 0.0
+
+    return (
+        f"[NAN-CHECK] {name}: shape={tuple(xd.shape)} dtype={xd.dtype} device={xd.device} "
+        f"numel={numel} nan={nan_cnt} inf={inf_cnt} abs_max~{abs_max:.6g}"
+    )
+
 def _infer_fast_compute_dtype(reference_tensor: torch.Tensor) -> torch.dtype:
     """모델이 실제로 계산할 때 쓸 가능성이 큰 dtype을 고릅니다.
 
@@ -2550,6 +2592,13 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         self.eps: float = float(getattr(config, "ca_topk_eps", 1e-6))
         self.agent_chunk_size: int = int(getattr(config, "ca_topk_agent_chunk_size", 64))
 
+        # --- debug switches (기본 OFF) ---
+        self._debug_nan_check: bool = bool(getattr(config, "debug_nan_check", False))
+        self._debug_nan_raise: bool = bool(getattr(config, "debug_nan_raise", True))
+        self._debug_nan_print: bool = bool(getattr(config, "debug_nan_print", True))
+        self._debug_report_limit: int = int(getattr(config, "debug_nan_report_limit", 5))
+        self._debug_reported: int = 0
+
         self.heads = int(heads)
         self.head_dim = int(hidden_dim // heads)
         self.scale = 1.0 / math.sqrt(float(self.head_dim))
@@ -2559,6 +2608,19 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.proj_drop = nn.Dropout(float(proj_drop))
+
+    def _maybe_report_and_raise(
+        self,
+        *,
+        title: str,
+        extra: str,
+    ) -> None:
+        """디버그 메시지를 (일부만) 출력하고, 필요하면 예외를 던집니다."""
+        if self._debug_nan_print and (self._debug_reported < self._debug_report_limit):
+            _debug_print_rank0(f"[NAN-CHECK] {title}\n{extra}")
+            self._debug_reported += 1
+        if self._debug_nan_raise:
+            raise FloatingPointError(title)
 
     def forward(
         self,
@@ -2573,15 +2635,8 @@ class TopKScoreBiasedCrossAttention(nn.Module):
     ) -> torch.Tensor:
         """거리 기반 top-K 선택 + score bias를 logits에 더하는 cross-attention.
 
-        핵심 규칙
-        --------
-        - score = -(dist / s_d)
-        - pad 토큰/에이전트는 score를 neg_value(유한)로 눌러서 NaN 위험 제거
-        - 선택된 K에 대해서만 attention 수행
-
         Returns:
-            out:
-                shape: (B, P, H)
+            torch.Tensor: out (B, P, H)
         """
         if query.dim() != 3:
             raise ValueError(f"query must be (B,P,H). got {tuple(query.shape)}")
@@ -2600,7 +2655,6 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         B, P, H = query.shape
         token_num: int = int(scene_encoding_token.shape[1])
 
-        # 토큰이 아예 없으면(거의 없겠지만) 그냥 0 반환
         if token_num <= 0 or self.topk_k <= 0:
             return query.new_zeros((B, P, H))
 
@@ -2619,6 +2673,7 @@ class TopKScoreBiasedCrossAttention(nn.Module):
 
         chunk: int = max(1, int(self.agent_chunk_size))
         beta_f32: torch.Tensor = score_beta.to(device=query.device, dtype=torch.float32)
+        beta_val: float = float(beta_f32.detach().view(-1)[0].item())  # scalar
 
         for start in range(0, P, chunk):
             end = min(P, start + chunk)
@@ -2627,51 +2682,36 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             pose_chunk = agent_pose4[:, start:end, :]  # (B, Pc, 4)
             agent_pad_chunk = target_current_mask[:, start:end]  # (B, Pc)
 
-            # agent_xy: (B, Pc, 2)
-            agent_xy = pose_chunk[..., 0:2].to(torch.float32)
+            agent_xy = pose_chunk[..., 0:2].to(torch.float32)  # (B, Pc, 2)
             agent_x = agent_xy[..., 0]  # (B, Pc)
             agent_y = agent_xy[..., 1]  # (B, Pc)
 
-            # dx, dy: (B, Pc, token_num)
-            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)
-            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)
+            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)  # (B, Pc, token_num)
+            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)  # (B, Pc, token_num)
 
-            # dist: (B, Pc, token_num)
-            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))
+            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))  # (B, Pc, token_num)
+            score = -(dist / s_d)  # (B, Pc, token_num)
 
-            # score: (B, Pc, token_num)
-            score = -(dist / s_d)
-
-            # pad 토큰 제외(유한 NEG)
             score = score.masked_fill(scene_encoding_token_mask.unsqueeze(1), NEG)
-            # pad agent 제외(유한 NEG)
             score = score.masked_fill(agent_pad_chunk.unsqueeze(-1), NEG)
 
-            # topk_idx: (B, Pc, K)
-            topk_idx = torch.topk(score, k=K, dim=-1, largest=True).indices
+            topk_idx = torch.topk(score, k=K, dim=-1, largest=True).indices  # (B, Pc, K)
+            score_keep = torch.gather(score, dim=-1, index=topk_idx)  # (B, Pc, K) float32
 
-            # score_keep: (B, Pc, K)
-            score_keep = torch.gather(score, dim=-1, index=topk_idx)  # float32
-
-            # sel_pad_mask: (B, Pc, K) True=pad
             sel_pad_mask = scene_encoding_token_mask.unsqueeze(1).expand(
                 B, end - start, token_num
-            ).gather(dim=2, index=topk_idx)
+            ).gather(dim=2, index=topk_idx)  # (B, Pc, K)
 
-            # kv_sel: (B, Pc, K, H)
             scene_exp = scene_encoding_token.unsqueeze(1).expand(B, end - start, token_num, H)
             idx_exp = topk_idx.unsqueeze(-1).expand(B, end - start, K, H)
-            kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)
+            kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)  # (B, Pc, K, H)
             kv_sel = kv_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
 
-            # ---- attention ----
             q_lin = self.q_proj(q_chunk)  # (B,Pc,H)
             k_lin = self.k_proj(kv_sel)   # (B,Pc,K,H)
             v_lin = self.v_proj(kv_sel)   # (B,Pc,K,H)
 
             Pc = int(end - start)
-
-            # reshape to heads
             qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1, 3)  # (B,h,Pc,hd)
             kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
             vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
@@ -2679,16 +2719,58 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             qf = qh.to(torch.float32)
             kf = kh.to(torch.float32)
 
-            # logits: (B,h,Pc,K)
-            logits = (qf.unsqueeze(3) * kf).sum(dim=-1) * float(self.scale)
+            logits = (qf.unsqueeze(3) * kf).sum(dim=-1) * float(self.scale)  # (B,h,Pc,K)
 
-            # bias: (B,1,Pc,K)
-            logits = logits + beta_f32 * score_keep.unsqueeze(1)
+            # ==============================
+            # ✅ (핵심) 0 * (±Inf/NaN) 체크
+            # ==============================
+            if self._debug_nan_check:
+                score_keep_bad = ~torch.isfinite(score_keep)
+                if bool(score_keep_bad.any().item()) and (beta_val == 0.0):
+                    extra = "\n".join([
+                        f"beta_val={beta_val} (==0)",
+                        _debug_tensor_summary("score_keep", score_keep),
+                        _debug_tensor_summary("dist", dist),
+                        _debug_tensor_summary("agent_xy", agent_xy),
+                        _debug_tensor_summary("token_xy", token_xy),
+                        "의미: beta==0 인 상태에서 score_keep에 Inf/NaN이 섞여 있으면 "
+                        "beta*score_keep 에서 0*Inf -> NaN 이 바로 발생할 수 있습니다.",
+                    ])
+                    self._maybe_report_and_raise(
+                        title="TopKScoreBiasedCrossAttention: beta==0 & score_keep has non-finite -> potential 0*Inf => NaN",
+                        extra=extra,
+                    )
 
-            # pad 선택은 logits에서 강하게 마스킹(유한값)
+            logits = logits + beta_f32 * score_keep.unsqueeze(1)  # (B,1,Pc,K) broadcast
+
             logits = logits.masked_fill(sel_pad_mask.unsqueeze(1), NEG)
 
+            if self._debug_nan_check:
+                if not bool(torch.isfinite(logits).all().item()):
+                    extra = "\n".join([
+                        f"beta_val={beta_val}",
+                        _debug_tensor_summary("logits(after_bias)", logits),
+                        _debug_tensor_summary("score_keep", score_keep),
+                        _debug_tensor_summary("qf", qf),
+                        _debug_tensor_summary("kf", kf),
+                    ])
+                    self._maybe_report_and_raise(
+                        title="TopKScoreBiasedCrossAttention: logits became non-finite (after bias/mask)",
+                        extra=extra,
+                    )
+
             attn = torch.softmax(logits, dim=-1)  # (B,h,Pc,K)
+
+            if self._debug_nan_check:
+                if not bool(torch.isfinite(attn).all().item()):
+                    extra = "\n".join([
+                        _debug_tensor_summary("attn(softmax)", attn),
+                        _debug_tensor_summary("logits(before_softmax)", logits),
+                    ])
+                    self._maybe_report_and_raise(
+                        title="TopKScoreBiasedCrossAttention: softmax(attn) became non-finite",
+                        extra=extra,
+                    )
 
             vf = vh.to(torch.float32)
             out = (attn.unsqueeze(-1) * vf).sum(dim=3)  # (B,h,Pc,hd)
@@ -2699,13 +2781,10 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             out = self.out_proj(out)
             out = self.proj_drop(out)
 
-            # pad agent는 0
             out = out.masked_fill(agent_pad_chunk.unsqueeze(-1), 0.0)
-
             out_all[:, start:end, :] = out
 
         return out_all
-
 
 class DiTBlock(nn.Module):
     def __init__(
@@ -2935,8 +3014,21 @@ class DiT(nn.Module):
         self._sde = sde
         self.marginal_prob_std = self._sde.marginal_prob_std
         self.ca_score_beta = nn.Parameter(torch.tensor(0.0))
+        self._debug_nan_check: bool = bool(
+            getattr(config, "debug_nan_check", True))
 
     from typing import Optional
+
+    def _debug_require_finite(self, name: str, x: torch.Tensor) -> None:
+        """debug_nan_check가 켜졌을 때만 _require_finite로 NaN/Inf를 즉시 잡습니다.
+
+        Args:
+            name (str): 체크 이름(출력용)
+            x (torch.Tensor): 임의 shape 텐서
+        """
+        if not bool(self._debug_nan_check):
+            return
+        _require_finite(name, x)
 
     def _build_ca_gate_type_logit_bias(
             self,
@@ -3336,7 +3428,7 @@ class DiT(nn.Module):
         # 1) pre-proj (B,P,H)
         x: torch.Tensor = self.preproj(target_input_norm_xT)
         x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
-
+        self._debug_require_finite("dit.preproj_out", x)
         # 2) cross 입력 정리
         cross_c = _cast_like(cross_c, x)
         cross_mask = _to_bool_mask(cross_mask).to(device=x.device)  # True=pad
@@ -3467,6 +3559,7 @@ class DiT(nn.Module):
                 ca_score_beta=self.ca_score_beta,  # scalar
                 pram_v2_modulations=pram_mods,
             )
+            self._debug_require_finite(f"dit.block_{block_index:02d}_out", x)
 
         # feasible용 저장
         if getattr(self.config, "feasible_grad_to_dit", False):
@@ -3487,6 +3580,8 @@ class DiT(nn.Module):
         )
 
         x_out = x_out.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
+        self._debug_require_finite("dit.final_out", x_out)
+
         return x_out
 
     def do_feasible_projection(
