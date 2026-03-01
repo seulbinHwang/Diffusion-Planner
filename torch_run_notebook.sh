@@ -68,10 +68,10 @@ TRAIN_SET_LIST_PATH="/home/user/PycharmProjects/Diffusion-Planner/diffusion_plan
     --w_int_min 0.05 \
     --w_int_max 2.0 \
     --w_const 0.0 \
-    --save_utd 10 \
+    --save_utd 100000 \
     --yaw_rate_loss_weight 2. \
     --integration_yaw_weight 2. \
     --use_amortized_diffusion False \
     --use_body_vel False \
-    --use_npc_data_augment False
+    --use_npc_data_augment True
 

@@ -1183,7 +1183,7 @@ def train_epoch(
         # ✅ (추가) 정규화 전에 증강 적용
         if npc_state_augmenter is not None:
             # ---- env로 시각화 on/off (argparse 추가 없이) ----
-            enable_vis = False
+            enable_vis = True
 
             debug_vis_dir: Optional[str] = None
             if enable_vis and _is_main_process():
