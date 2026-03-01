@@ -3540,8 +3540,10 @@ class DiT(nn.Module):
         cross_mask = _to_bool_mask(cross_mask).to(device=x.device)  # True=pad
         dist_dtype = (x.dtype if x.dtype in (torch.float16,
                                              torch.bfloat16) else torch.float32)
-        cross_pos_2d = cross_pos_2d.to(device=x.device, dtype=dist_dtype)
-
+        dist_dtype = (x.dtype if x.dtype in (torch.float16,
+                                             torch.bfloat16) else torch.float32)
+        if cross_pos_2d.device != x.device or cross_pos_2d.dtype != dist_dtype:
+            cross_pos_2d = cross_pos_2d.to(device=x.device, dtype=dist_dtype)
         # 3) timestep embedding
         t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
                                                              ref=x)
