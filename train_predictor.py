@@ -598,38 +598,42 @@ def print_parameter_index_mapping(model):
         print(f"{idx}: {name}")
 
 
+def _create_wandb_api_with_timeout() -> Any:
+    """wandb.Api()를 timeout을 늘려서 생성합니다.
+
+    목적:
+        - W&B Public API(GraphQL) 호출이 짧은 시간 제한 때문에 실패하는 경우를 줄입니다.
+
+    Returns:
+        Any: wandb.Api 인스턴스.
+    """
+    timeout_sec = _get_env_int("DP_WANDB_PUBLIC_API_TIMEOUT", 120)  # shape: ()
+    try:
+        return wandb.Api(timeout=int(timeout_sec))
+    except TypeError:
+        # 일부 버전은 timeout 인자를 안 받을 수 있음
+        return wandb.Api()
+
+
 def _prune_old_wandb_artifact_versions(
     collection_name: str,
     alias: str,
 ) -> None:
-    """지정한 모델 묶음에서 현재 버전을 제외하고 나머지 W&B 아티팩트를 지운다.
+    """지정한 모델 묶음에서 현재 버전을 제외하고 나머지 W&B 아티팩트를 지웁니다.
 
-    학습 도중에 너무 많은 버전이 쌓이지 않도록,
-    방금 올린 버전(alias 기준)만 남기고 나머지는 삭제한다.
-
-    Args:
-        collection_name: W&B에서 모델을 묶을 때 쓰는 이름.
-            예: f"{args.name}_latest-model", f"{args.name}_best-model".
-        alias: 남기고 싶은 버전에 붙인 별칭.
-            예: "latest", "best".
-
-    Returns:
-        None: 삭제 작업만 수행하고 값을 돌려주지 않는다.
+    네트워크/서버 문제로 실패할 수 있으므로, 실패해도 학습이 죽지 않게 스킵합니다.
     """
-    # 아직 run이 없으면(초기화 전이거나 offline 특수 상황 등) 아무 것도 하지 않는다.
     if not wandb.run:
         return
 
     try:
-        api = wandb.Api()
+        api = _create_wandb_api_with_timeout()
         entity = wandb.run.entity
         project = wandb.run.project
         coll_path = f"{entity}/{project}/{collection_name}"
 
-        # 현재 alias가 가리키는 버전
         current = api.artifact(f"{coll_path}:{alias}")
 
-        # 이 컬렉션 안의 모든 버전 목록
         versions = safe_get_artifacts(api, "model", coll_path)
         if not versions:
             return
@@ -647,7 +651,7 @@ def _prune_old_wandb_artifact_versions(
                     f"[PRUNE] {collection_name}: 이전 버전 {art.id} 삭제 실패 - {str(e)}"
                 )
     except Exception as e:
-        print(f"[PRUNE] {collection_name}: 버전 정리 중 오류 발생 - {str(e)}")
+        print(f"[PRUNE][SKIP] {collection_name}: 네트워크/서버 문제로 정리 스킵 - {e}")
 
 
 # --- put this in a utils file or near your optimizer build code ---
@@ -1886,6 +1890,40 @@ def _copy_dir_to_temp_wandb(
         return None
 
 
+def _safe_wandb_log_artifact_and_wait(
+    artifact: Any,
+    aliases: list[str],
+    context: str,
+) -> bool:
+    """wandb.log_artifact를 안전하게 실행합니다.
+
+    목적:
+        - 네트워크 timeout 등으로 log_artifact가 예외를 내면 학습이 죽을 수 있습니다.
+        - 여기서는 예외를 잡고 스킵해서 학습을 계속 진행합니다.
+
+    Args:
+        artifact (Any): wandb.Artifact 객체. shape: ()
+        aliases (list[str]): 붙일 별칭 목록. length: (K,)
+        context (str): 로그에 남길 문맥 문자열. shape: ()
+
+    Returns:
+        bool:
+            - True: 업로드 요청 성공(그리고 wait까지 성공)
+            - False: 실패(스킵)
+    """
+    try:
+        wandb.log_artifact(artifact, aliases=list(aliases))
+        try:
+            artifact.wait()
+        except Exception:
+            # wait 실패는 치명적이지 않아서 스킵 처리
+            pass
+        return True
+    except Exception as e:
+        print(f"[WANDB][SKIP] log_artifact failed ({context}): {e}")
+        return False
+
+
 def _log_wandb_checkpoint_artifacts(
     args: argparse.Namespace,
     epoch: int,
@@ -1895,14 +1933,11 @@ def _log_wandb_checkpoint_artifacts(
     tag_latest: Optional[str],
     tag_best: Optional[str],
 ) -> None:
-    """한 epoch가 끝난 뒤 local 체크포인트를 W&B 아티팩트로 올린다.
+    """한 epoch가 끝난 뒤 local 체크포인트를 W&B 아티팩트로 올립니다.
 
-    - PyTorch/DDP 학습: latest.pth / best.pth 파일만 업로드
-    - DeepSpeed 학습: latest.pth / best.pth + DeepSpeed tag 디렉터리도 함께 업로드
-
-    주의:
-    - alias는 DeepSpeed 여부와 무관하게 항상 ["latest"] / ["best"] 로만 붙인다.
-    - epoch 정보는 metadata에 넣으면 충분하므로 alias에 epoch를 포함하지 않는다.
+    변경점:
+        - 네트워크/서버 문제로 업로드가 실패해도 학습이 죽지 않게
+          wandb.log_artifact 를 try/except로 보호합니다.
     """
     if args.save_path is None:
         return
@@ -1963,14 +1998,17 @@ def _log_wandb_checkpoint_artifacts(
                         dst_dir_name=tag_latest,
                     )
                     if local_latest_tag_dir is not None:
-                        latest_art.add_dir(local_latest_tag_dir,
-                                           name=tag_latest)
+                        latest_art.add_dir(local_latest_tag_dir, name=tag_latest)
                 else:
                     latest_art.add_dir(latest_tag_dir, name=tag_latest)
 
-        # ✅ alias는 항상 "latest" 하나만
-        wandb.log_artifact(latest_art, aliases=["latest"])
-        latest_art.wait()
+        ok_latest = _safe_wandb_log_artifact_and_wait(
+            artifact=latest_art,
+            aliases=["latest"],
+            context="latest",
+        )
+        if not ok_latest:
+            return
 
         if getattr(args, "delete_wb_weight_when_running", False):
             _prune_old_wandb_artifact_versions(
@@ -2023,9 +2061,13 @@ def _log_wandb_checkpoint_artifacts(
                 else:
                     best_art.add_dir(best_tag_dir, name=tag_best)
 
-        # ✅ alias는 항상 "best" 하나만
-        wandb.log_artifact(best_art, aliases=["best"])
-        best_art.wait()
+        ok_best = _safe_wandb_log_artifact_and_wait(
+            artifact=best_art,
+            aliases=["best"],
+            context="best",
+        )
+        if not ok_best:
+            return
 
         if getattr(args, "delete_wb_weight_when_running", False):
             _prune_old_wandb_artifact_versions(
@@ -2039,9 +2081,7 @@ def _log_wandb_checkpoint_artifacts(
                 shutil.rmtree(temp_root_dir, ignore_errors=True)
                 print(f"[W&B TEMP] removed temp dir: {temp_root_dir}")
             except Exception as e:
-                print(
-                    f"[W&B TEMP] failed to remove temp dir '{temp_root_dir}': {e}"
-                )
+                print(f"[W&B TEMP] failed to remove temp dir '{temp_root_dir}': {e}")
 
 
 def _log_and_save(
@@ -2132,7 +2172,10 @@ def _log_and_save(
 
     # 1) 메트릭 로그
     if global_rank == 0:
-        wandb_logger.log_metrics(metrics, step=epoch + 1)
+        try:
+            wandb_logger.log_metrics(metrics, step=epoch + 1)
+        except Exception as e:
+            print(f"[WANDB][SKIP] log_metrics failed: {e}")
 
     # 2) 저장 주기 확인 (DeepSpeed / PyTorch 공통)
     save_interval: int = max(1, int(args.save_utd))
@@ -2196,13 +2239,18 @@ def _log_and_save(
             print(f"Model saved in {args.save_path}\n")
     # 5) W&B 아티팩트 업로드
     if global_rank == 0:
-        _log_wandb_checkpoint_artifacts(args=args,
-                                        epoch=epoch,
-                                        train_total_loss=train_total_loss,
-                                        save_best=save_best,
-                                        use_deepspeed=use_deepspeed,
-                                        tag_latest=tag_latest,
-                                        tag_best=tag_best)
+        try:
+            _log_wandb_checkpoint_artifacts(
+                args=args,
+                epoch=epoch,
+                train_total_loss=train_total_loss,
+                save_best=save_best,
+                use_deepspeed=use_deepspeed,
+                tag_latest=tag_latest,
+                tag_best=tag_best,
+            )
+        except Exception as e:
+            print(f"[WANDB][SKIP] checkpoint artifact upload failed: {e}")
 
     return best_loss
 
@@ -2630,7 +2678,16 @@ def _finalize_training_cleanup(
     if ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
     if global_rank == 0:
-        wandb_logger.finish()
+        try:
+            wandb_logger.finish()
+        except Exception as e:
+            print(f"[WANDB][SKIP] wandb_logger.finish failed: {e}")
+
+    if args.use_wandb and wandb.run is not None:
+        try:
+            wandb.finish()
+        except Exception as e:
+            print(f"[WANDB][SKIP] wandb.finish failed: {e}")
     # 2) W&B / TensorBoard 종료
     if args.use_wandb and wandb.run is not None:
         wandb.finish()
@@ -2895,6 +2952,49 @@ def model_training(
         wandb_logger=wandb_logger,
     )
 
+def _get_env_int(name: str, default: int) -> int:
+    """환경변수에서 int 값을 읽습니다.
+
+    Args:
+        name (str): 환경변수 이름. shape: ()
+        default (int): 기본값. shape: ()
+
+    Returns:
+        int: 읽은 값. shape: ()
+    """
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return int(default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
+
+
+def _set_wandb_timeout_env_defaults() -> None:
+    """W&B 네트워크 요청 timeout 기본값을 설정합니다.
+
+    목적:
+        - W&B 서버 응답이 잠깐 느려질 때(예: 20초 안에 응답이 안 옴),
+          학습 전체가 예외로 종료되는 상황을 줄입니다.
+        - Pod yaml에 env를 못 넣었어도, 코드에서 기본값을 넣어줍니다.
+        - 이미 env가 설정돼 있으면 그 값은 유지합니다.
+
+    설정(초 단위):
+        - WANDB_HTTP_TIMEOUT: API 요청 기다리는 시간. shape: ()
+        - WANDB_FILE_PUSHER_TIMEOUT: 파일/아티팩트 업로드 기다리는 시간. shape: ()
+        - WANDB_INIT_TIMEOUT: wandb 초기화 기다리는 시간. shape: ()
+
+    Returns:
+        None
+    """
+    os.environ.setdefault("WANDB_HTTP_TIMEOUT",
+                          str(_get_env_int("WANDB_HTTP_TIMEOUT", 300)))
+    os.environ.setdefault(
+        "WANDB_FILE_PUSHER_TIMEOUT",
+        str(_get_env_int("WANDB_FILE_PUSHER_TIMEOUT", 300)))
+    os.environ.setdefault("WANDB_INIT_TIMEOUT",
+                          str(_get_env_int("WANDB_INIT_TIMEOUT", 600)))
 
 def main() -> None:
     """train_predictor 진입점.
@@ -2909,6 +3009,7 @@ def main() -> None:
     """
     # 1) 분산 초기화 및 rank 정보
     args = args_util.get_args()
+    _set_wandb_timeout_env_defaults()
     global_rank, rank, world_size, use_deepspeed = init_distributed(args)
     set_save_path(
         args=args,

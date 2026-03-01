@@ -27,7 +27,11 @@ def setup_logger_and_purge(
     wandb_id: Optional[str],
     allow_val_change: bool,
 ) -> Logger:
-    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리한다."""
+    """TensorBoard / W&B 로거를 만들고, 기존 아티팩트를 정리합니다.
+
+    변경점:
+        - purge 과정에서 네트워크 timeout이 나도 학습이 죽지 않게 스킵합니다.
+    """
     wandb_logger = Logger(
         args,
         wandb_resume_id=wandb_id,
@@ -36,13 +40,17 @@ def setup_logger_and_purge(
     )
 
     if global_rank == 0 and args.remove_existing_wb_weight:
-        api = wandb.Api()
-        entity = wandb.run.entity
-        project = wandb.run.project
-        purge_collection(api, entity, project, f"{args.name}_latest-model")
-        purge_collection(api, entity, project, f"{args.name}_best-model")
+        try:
+            api = _create_wandb_api_with_timeout()
+            if wandb.run is None:
+                raise RuntimeError("wandb.run is None")
+            entity = wandb.run.entity
+            project = wandb.run.project
+            purge_collection(api, entity, project, f"{args.name}_latest-model")
+            purge_collection(api, entity, project, f"{args.name}_best-model")
+        except Exception as e:
+            print(f"[WANDB][SKIP] purge_collection failed: {e}")
 
-    # ✅ 분산이 "실제로 초기화된 경우"에만 barrier 호출
     if bool(getattr(args, "ddp", False)) and ddp.is_dist_avail_and_initialized():
         torch.distributed.barrier()
 
@@ -101,9 +109,8 @@ def purge_collection(api, entity, project, coll_name):
 def safe_get_artifacts(api, type_name, path):
     try:
         return list(api.artifacts(type_name, path))
-    except (wandb.errors.CommError, HTTPError) as e:
-        # 404 또는 권한 오류 → 컬렉션이 아직 없다고 판단
-        print(f"[SKIP] '{path}' 컬렉션 없음/권한 문제: {e}")
+    except (wandb.errors.CommError, HTTPError, Exception) as e:
+        print(f"[SKIP] '{path}' 컬렉션 없음/권한 문제/네트워크 문제: {e}")
         return []
 
 
@@ -828,6 +835,17 @@ def _load_state_dict_into_base_and_ema_model_only(
 
     return model_ema
 
+def _create_wandb_api_with_timeout() -> wandb.Api:
+    """wandb.Api()를 timeout을 늘려서 생성합니다.
+
+    Returns:
+        wandb.Api: API 객체. shape: ()
+    """
+    timeout_sec = int(os.environ.get("DP_WANDB_PUBLIC_API_TIMEOUT", "120"))
+    try:
+        return wandb.Api(timeout=timeout_sec)
+    except TypeError:
+        return wandb.Api()
 
 def _load_model_and_ema_state_only_from_pytorch_checkpoint(
     save_path: str,
@@ -1690,7 +1708,7 @@ def prepare_wandb_resume(args: argparse.Namespace,) -> bool:
     checkpoint_filename : str
         - local에 내려 받을 파일 이름. 예: 'latest.pth', 'best.pth'.
     """
-    api = wandb.Api()
+    api = _create_wandb_api_with_timeout()
     resume_alias, collection_name, checkpoint_filename = \
         _determine_wandb_artifact_config(args)
     if args.save_path is not None:
