@@ -2485,6 +2485,25 @@ class DiTReturns:
     control_constraint_diff: Optional[torch.Tensor] = None  # (B, Pnn, T, 3)
     control_sequence: Optional[torch.Tensor] = None  # (B, Pnn, T, 3)
 
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class CrossTopKCache:
+    """Cross-Attention에서 거리 기반 top-K 선택 결과를 재사용하기 위한 캐시.
+
+    Attributes:
+        topk_idx (torch.Tensor): top-K 토큰 인덱스. shape: (B, P, K), dtype: int64
+        sel_pad_mask (torch.Tensor): top-K로 뽑힌 토큰이 pad인지 마스크. shape: (B, P, K), dtype: bool
+        score_keep_f32 (torch.Tensor): top-K 토큰의 거리 점수(= -(dist/s_d)). shape: (B, P, K), dtype: float32
+        agent_pad_mask (torch.Tensor): agent pad 마스크(True=pad). shape: (B, P), dtype: bool
+        K (int): 실제 사용된 top-K 값 (token_num과 비교해 min 적용된 값)
+    """
+    topk_idx: torch.Tensor
+    sel_pad_mask: torch.Tensor
+    score_keep_f32: torch.Tensor
+    agent_pad_mask: torch.Tensor
+    K: int
+
 class SimpleSelfAttention(nn.Module):
     def __init__(
         self,
@@ -2637,27 +2656,126 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         if mask.dtype != torch.bool:
             mask = mask.to(torch.bool)
 
+        # 전부 mask인 행이 있으면 softmax가 NaN이 될 수 있어 방어
+        all_masked = mask.all(dim=dim, keepdim=True)  # (..., 1)
         logits_masked = logits.masked_fill(mask, float("-inf"))
+        logits_masked = torch.where(all_masked, torch.zeros_like(logits_masked), logits_masked)
+
         attn = torch.softmax(logits_masked, dim=dim)
         attn = attn.masked_fill(mask, 0.0)
         return attn
 
     @staticmethod
-    def _choose_distance_dtype(query: torch.Tensor) -> torch.dtype:
-        """거리 계산에 사용할 dtype을 고릅니다.
+    def _choose_dist_compute_dtype(ref: torch.Tensor) -> torch.dtype:
+        """거리 계산에서 사용할 dtype을 고릅니다.
 
-        - query가 bf16/fp16이면 그 dtype을 사용해 메모리를 줄입니다.
-        - 그 외에는 float32로 둡니다.
+        - bf16/fp16이면 그대로 사용(빠름)
+        - 그 외는 float32
 
         Args:
-            query (torch.Tensor): (B, P, H)
+            ref (torch.Tensor): 기준 텐서. shape: 임의
 
         Returns:
             torch.dtype: 거리 계산 dtype
         """
-        if query.dtype in (torch.float16, torch.bfloat16):
-            return query.dtype
+        if ref.dtype in (torch.float16, torch.bfloat16):
+            return ref.dtype
         return torch.float32
+
+    def _compute_topk_from_geometry(
+        self,
+        *,
+        agent_pose4: torch.Tensor,              # (B, P, 4)
+        agent_pad_mask: torch.Tensor,           # (B, P) True=pad
+        scene_encoding_token_mask: torch.Tensor,# (B, token_num) True=pad
+        scene_encoding_pos_2d: torch.Tensor,    # (B, token_num, 9)
+        reference_tensor: torch.Tensor,         # dtype/device 기준
+    ) -> CrossTopKCache:
+        """거리 기반 top-K를 1번 계산해 캐시를 만든다(블록들에서 재사용).
+
+        핵심 최적화
+        - topK 선택은 sqrt 없이(제곱거리) 수행
+        - sqrt는 topK에 선택된 K개에 대해서만 수행 (score_keep 계산용)
+
+        Returns:
+            CrossTopKCache
+        """
+        if agent_pad_mask.dtype != torch.bool:
+            agent_pad_mask = agent_pad_mask.to(torch.bool)
+        if scene_encoding_token_mask.dtype != torch.bool:
+            scene_encoding_token_mask = scene_encoding_token_mask.to(torch.bool)
+
+        B, P, _ = agent_pose4.shape
+        token_num = int(scene_encoding_pos_2d.shape[1])
+        if token_num <= 0 or int(self.topk_k) <= 0:
+            K = 0
+            return CrossTopKCache(
+                topk_idx=torch.zeros((B, P, 0), device=reference_tensor.device, dtype=torch.int64),
+                sel_pad_mask=torch.ones((B, P, 0), device=reference_tensor.device, dtype=torch.bool),
+                score_keep_f32=torch.zeros((B, P, 0), device=reference_tensor.device, dtype=torch.float32),
+                agent_pad_mask=agent_pad_mask.to(device=reference_tensor.device),
+                K=K,
+            )
+
+        K = min(int(self.topk_k), token_num)
+        s_d: float = max(float(self.s_d), 1e-6)
+        NEG: float = float(self.neg_value)
+
+        device = reference_tensor.device
+        dist_dtype = self._choose_dist_compute_dtype(reference_tensor)
+
+        # token_x/y: (B, token_num)
+        token_xy = scene_encoding_pos_2d[:, :, 0:2].to(device=device, dtype=dist_dtype)
+        token_x = token_xy[:, :, 0]
+        token_y = token_xy[:, :, 1]
+
+        topk_idx_all = torch.empty((B, P, K), device=device, dtype=torch.int64)
+        sel_pad_mask_all = torch.empty((B, P, K), device=device, dtype=torch.bool)
+        score_keep_all = torch.empty((B, P, K), device=device, dtype=torch.float32)
+
+        chunk = max(1, int(self.agent_chunk_size))
+
+        for start in range(0, P, chunk):
+            end = min(P, start + chunk)
+            Pc = int(end - start)
+
+            pose_chunk = agent_pose4[:, start:end, :].to(device=device, dtype=dist_dtype)  # (B,Pc,4)
+            pad_chunk = agent_pad_mask[:, start:end].to(device=device)                    # (B,Pc)
+
+            agent_x = pose_chunk[..., 0]  # (B,Pc)
+            agent_y = pose_chunk[..., 1]  # (B,Pc)
+
+            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)  # (B,Pc,token_num)
+            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)  # (B,Pc,token_num)
+
+            # dist2: (B,Pc,token_num)  (sqrt 없음)
+            dist2 = dx * dx + dy * dy + float(self.eps)
+
+            invalid = scene_encoding_token_mask.unsqueeze(1) | pad_chunk.unsqueeze(-1)  # (B,Pc,token_num)
+            dist2_masked = dist2.masked_fill(invalid, float("inf"))
+
+            # ✅ topk 선택은 제곱거리로 (smallest)
+            topk_idx = torch.topk(dist2_masked, k=K, dim=-1, largest=False).indices  # (B,Pc,K)
+
+            # ✅ sqrt는 topK에 선택된 K개에 대해서만
+            dist2_sel = torch.gather(dist2_masked, dim=-1, index=topk_idx).to(torch.float32)  # (B,Pc,K)
+            dist_sel = torch.sqrt(dist2_sel)  # (B,Pc,K)
+            score_keep = -(dist_sel / float(s_d))  # (B,Pc,K)
+            score_keep = torch.clamp(score_keep, min=NEG)  # invalid -> NEG
+
+            sel_pad_mask = scene_encoding_token_mask.unsqueeze(1).expand(B, Pc, token_num).gather(dim=2, index=topk_idx)
+
+            topk_idx_all[:, start:end, :] = topk_idx
+            sel_pad_mask_all[:, start:end, :] = sel_pad_mask
+            score_keep_all[:, start:end, :] = score_keep
+
+        return CrossTopKCache(
+            topk_idx=topk_idx_all,
+            sel_pad_mask=sel_pad_mask_all,
+            score_keep_f32=score_keep_all,
+            agent_pad_mask=agent_pad_mask.to(device=device),
+            K=int(K),
+        )
 
     def forward(
         self,
@@ -2669,6 +2787,7 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
         scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
         score_beta: torch.Tensor,  # scalar
+        topk_cache: Optional[CrossTopKCache] = None,
     ) -> torch.Tensor:
         if query.dim() != 3:
             raise ValueError(f"query must be (B,P,H). got {tuple(query.shape)}")
@@ -2691,85 +2810,62 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         B, P, H = query.shape
         token_num: int = int(scene_encoding_token.shape[1])
 
-        if token_num <= 0 or self.topk_k <= 0:
+        if token_num <= 0 or int(self.topk_k) <= 0:
             return query.new_zeros((B, P, H))
 
-        K: int = min(int(self.topk_k), token_num)
-        s_d: float = max(float(self.s_d), 1e-6)
-        NEG: float = float(self.neg_value)
+        # --- (A) topK 캐시가 없으면 1회 계산 (fallback) ---
+        if topk_cache is None:
+            topk_cache = self._compute_topk_from_geometry(
+                agent_pose4=agent_pose4,
+                agent_pad_mask=target_current_mask,
+                scene_encoding_token_mask=scene_encoding_token_mask,
+                scene_encoding_pos_2d=scene_encoding_pos_2d,
+                reference_tensor=query,
+            )
 
-        # (핵심) 거리 계산 dtype: 가능하면 bf16/fp16 사용
-        dist_dtype: torch.dtype = self._choose_distance_dtype(query)
+        K = int(topk_cache.K)
+        if K <= 0:
+            return query.new_zeros((B, P, H))
 
-        # token_xy: (B, token_num, 2)
-        token_xy: torch.Tensor = scene_encoding_pos_2d[:, :, 0:2].to(
-            device=query.device, dtype=dist_dtype
-        )
-        token_x: torch.Tensor = token_xy[:, :, 0]  # (B, token_num)
-        token_y: torch.Tensor = token_xy[:, :, 1]  # (B, token_num)
-
-        out_all = query.new_zeros((B, P, H))  # (B, P, H)
-        chunk: int = max(1, int(self.agent_chunk_size))
+        out_all = query.new_zeros((B, P, H))
+        chunk = max(1, int(self.agent_chunk_size))
         beta_f32: torch.Tensor = score_beta.to(device=query.device, dtype=torch.float32)
 
         for start in range(0, P, chunk):
             end = min(P, start + chunk)
-            q_chunk = query[:, start:end, :]                    # (B, Pc, H)
-            pose_chunk = agent_pose4[:, start:end, :]           # (B, Pc, 4)
-            agent_pad_chunk = target_current_mask[:, start:end] # (B, Pc) True=pad
             Pc = int(end - start)
 
-            # agent_xy: (B, Pc, 2)
-            agent_xy = pose_chunk[..., 0:2].to(device=query.device, dtype=dist_dtype)
-            agent_x = agent_xy[..., 0]  # (B, Pc)
-            agent_y = agent_xy[..., 1]  # (B, Pc)
+            q_chunk = query[:, start:end, :]  # (B,Pc,H)
+            agent_pad_chunk = topk_cache.agent_pad_mask[:, start:end]  # (B,Pc)
 
-            # (B, Pc, token_num)
-            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)
-            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)
+            topk_idx = topk_cache.topk_idx[:, start:end, :]          # (B,Pc,K)
+            sel_pad_mask = topk_cache.sel_pad_mask[:, start:end, :]   # (B,Pc,K)
+            score_keep = topk_cache.score_keep_f32[:, start:end, :]   # (B,Pc,K) float32
 
-            # dist: (B, Pc, token_num)
-            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))
-
-            # score_for_topk: (B, Pc, token_num)
-            # - invalid는 -inf로 두고, topk에서 제외
-            invalid_score_mask = scene_encoding_token_mask.unsqueeze(1) | agent_pad_chunk.unsqueeze(-1)
-            score_for_topk = -(dist / s_d)
-            score_for_topk = score_for_topk.masked_fill(invalid_score_mask, float("-inf"))
-
-            # topk_idx: (B, Pc, K)
-            topk_idx = torch.topk(score_for_topk, k=K, dim=-1, largest=True).indices
-
-            # score_keep: (B, Pc, K)
-            # - 예전 코드의 "NEG 채우기" 의미를 유지하기 위해 -inf는 NEG로 바꿉니다.
-            score_keep = torch.gather(score_for_topk, dim=-1, index=topk_idx)
-            score_keep = torch.clamp(score_keep, min=NEG)
-
-            # sel_pad_mask: (B, Pc, K)
-            sel_pad_mask = scene_encoding_token_mask.unsqueeze(1).expand(B, Pc, token_num).gather(dim=2, index=topk_idx)
-
-            # kv_sel: (B, Pc, K, H)
-            scene_exp = scene_encoding_token.unsqueeze(1).expand(B, Pc, token_num, H)
+            # kv_sel: (B,Pc,K,H)
             idx_exp = topk_idx.unsqueeze(-1).expand(B, Pc, K, H)
-            kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)
+            kv_sel = torch.gather(
+                scene_encoding_token.unsqueeze(1).expand(B, Pc, token_num, H),
+                dim=2,
+                index=idx_exp,
+            )
             kv_sel = kv_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
 
-            q_lin = self.q_proj(q_chunk)  # (B, Pc, H)
-            k_lin = self.k_proj(kv_sel)   # (B, Pc, K, H)
-            v_lin = self.v_proj(kv_sel)   # (B, Pc, K, H)
+            q_lin = self.q_proj(q_chunk)  # (B,Pc,H)
+            k_lin = self.k_proj(kv_sel)   # (B,Pc,K,H)
+            v_lin = self.v_proj(kv_sel)   # (B,Pc,K,H)
 
             qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1, 3)        # (B,h,Pc,hd)
             kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
             vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
 
-            # logits는 softmax 안정 위해 float32 유지
             logits = (qh.to(torch.float32).unsqueeze(3) * kh.to(torch.float32)).sum(dim=-1) * float(self.scale)  # (B,h,Pc,K)
-            logits = logits + beta_f32 * score_keep.to(torch.float32).unsqueeze(1)  # (B,h,Pc,K)
+            logits = logits + beta_f32 * score_keep.unsqueeze(1)  # (B,h,Pc,K)
 
             attn = self._masked_softmax(logits, mask=sel_pad_mask.unsqueeze(1), dim=-1)  # (B,h,Pc,K)
             out = (attn.unsqueeze(-1) * vh.to(torch.float32)).sum(dim=3)  # (B,h,Pc,hd)
 
-            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc, H).to(dtype=q_chunk.dtype)  # (B,Pc,H)
+            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc, H).to(dtype=q_chunk.dtype)
             out = self.out_proj(out)
             out = self.proj_drop(out)
 
@@ -2817,38 +2913,33 @@ class DiTBlock(nn.Module):
         return x_norm * (1.0 + mod.delta_scale) + mod.shift
 
     def forward(
-        self,
-        *,
-        x: torch.Tensor,  # (B, P, H)
-        target_current_mask: torch.Tensor,  # (B, P) True=pad
-        cross_c: torch.Tensor,  # (B, token_num, H)
-        cross_mask: torch.Tensor,  # (B, token_num) True=pad
-        cross_pos_2d: torch.Tensor,  # (B, token_num, 9)
-        agent_pose4: torch.Tensor,  # (B, P, 4)
-        ca_score_beta: torch.Tensor,  # scalar
-        pram_v2_modulations: Dict[str, ModulationTriplet],
+            self,
+            *,
+            x: torch.Tensor,  # (B, P, H)
+            target_current_mask: torch.Tensor,  # (B, P) True=pad
+            cross_c: torch.Tensor,  # (B, token_num, H)
+            cross_mask: torch.Tensor,  # (B, token_num) True=pad
+            cross_pos_2d: torch.Tensor,  # (B, token_num, 9)
+            agent_pose4: torch.Tensor,  # (B, P, 4)
+            ca_score_beta: torch.Tensor,  # scalar
+            pram_v2_modulations: Dict[str, ModulationTriplet],
+            ca_topk_cache: Optional[CrossTopKCache] = None,  # ✅ 추가
     ) -> torch.Tensor:
-        """SA + CA(topK+bias) + FFN 블록.
-
-        Returns:
-            x_out:
-                shape: (B, P, H)
-        """
         if target_current_mask.dtype != torch.bool:
             target_current_mask = target_current_mask.to(torch.bool)
 
         # ---- SA ----
         sa_mod = pram_v2_modulations["SA"]
         h = self.norm_sa(x)
-        h = self._apply_modulation(h, sa_mod)  # (B,P,H)
-        sa_out = self.sa(h, key_padding_mask=target_current_mask)  # (B,P,H)
+        h = self._apply_modulation(h, sa_mod)
+        sa_out = self.sa(h, key_padding_mask=target_current_mask)
         sa_out = sa_out * sa_mod.gate
         x = x + self.drop_path_sa(sa_out)
 
         # ---- CA ----
         ca_mod = pram_v2_modulations["CA"]
         h = self.norm_ca(x)
-        h = self._apply_modulation(h, ca_mod)  # (B,P,H)
+        h = self._apply_modulation(h, ca_mod)
         ca_out = self.ca(
             query=h,
             agent_pose4=agent_pose4,
@@ -2857,7 +2948,8 @@ class DiTBlock(nn.Module):
             scene_encoding_token_mask=cross_mask,
             scene_encoding_pos_2d=cross_pos_2d,
             score_beta=ca_score_beta,
-        )  # (B,P,H)
+            topk_cache=ca_topk_cache,  # ✅ 추가
+        )
         ca_out = ca_out * ca_mod.gate
         x = x + self.drop_path_ca(ca_out)
 
@@ -2870,6 +2962,7 @@ class DiTBlock(nn.Module):
         x = x + self.drop_path_ffn(ffn_out)
 
         return x
+
 
 class DiT(nn.Module):
 
@@ -3445,9 +3538,9 @@ class DiT(nn.Module):
         # 2) cross 입력 정리
         cross_c = _cast_like(cross_c, x)
         cross_mask = _to_bool_mask(cross_mask).to(device=x.device)  # True=pad
-        cross_pos_2d = cross_pos_2d.to(device=x.device,
-                                       dtype=torch.float32)  # dist 계산용
-
+        dist_dtype = (x.dtype if x.dtype in (torch.float16,
+                                             torch.bfloat16) else torch.float32)
+        cross_pos_2d = cross_pos_2d.to(device=x.device, dtype=dist_dtype)
 
         # 3) timestep embedding
         t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
@@ -3519,7 +3612,18 @@ class DiT(nn.Module):
 
         # agent_pose4: (B,P,4)
         agent_pose4 = target_current_11_dim[..., 0:4]  # (B,P,4)
-
+        # ✅ 거리 top-K 결과는 블록마다 동일하므로 1번만 계산해서 재사용
+        ca_topk_cache: Optional[CrossTopKCache] = None
+        use_cache: bool = bool(
+            getattr(self.config, "ca_topk_cache_enabled", True))
+        if use_cache:
+            ca_topk_cache = self.blocks[0].ca._compute_topk_from_geometry(
+                agent_pose4=agent_pose4,
+                agent_pad_mask=target_current_mask,  # (B,P) True=pad
+                scene_encoding_token_mask=cross_mask,  # (B,token_num) True=pad
+                scene_encoding_pos_2d=cross_pos_2d,  # (B,token_num,9)
+                reference_tensor=x,  # dtype/device 기준
+            )
         # path scalars: (depth,3)
         k_s = self.pram_v2_block_path_scalars.k_s.to(dtype=x.dtype,
                                                      device=x.device)
@@ -3565,14 +3669,15 @@ class DiT(nn.Module):
             }
 
             x = block(
-                x=x,  # (B,P,H)
-                target_current_mask=target_current_mask,  # (B,P)
-                cross_c=cross_c,  # (B,token_num,H)
-                cross_mask=cross_mask,  # (B,token_num)
-                cross_pos_2d=cross_pos_2d,  # (B,token_num,9)
-                agent_pose4=agent_pose4,  # (B,P,4)
-                ca_score_beta=ca_score_beta_for_ca,  # ✅ (shape: ())
+                x=x,
+                target_current_mask=target_current_mask,
+                cross_c=cross_c,
+                cross_mask=cross_mask,
+                cross_pos_2d=cross_pos_2d,
+                agent_pose4=agent_pose4,
+                ca_score_beta=ca_score_beta_for_ca,
                 pram_v2_modulations=pram_mods,
+                ca_topk_cache=ca_topk_cache,  # ✅ 추가
             )
 
         # feasible용 저장
