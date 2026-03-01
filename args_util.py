@@ -287,7 +287,7 @@ def get_args():
     parser.add_argument('--do_ego_predict', default=True, type=boolean)
     parser.add_argument('--use_ego_data_augment', default=False, type=boolean)
     parser.add_argument('--use_npc_data_augment', default=False, type=boolean)
-    parser.add_argument('--use_body_vel', default=True, type=boolean)
+    parser.add_argument('--use_body_vel', default=False, type=boolean)
     parser.add_argument('--scenario_finish_step', default=-1, type=int)
     parser.add_argument('--rollout_time_chunk_size', default=1, type=int)
     parser.add_argument('--yaw_rate_loss_weight', default=1., type=float)
@@ -367,6 +367,10 @@ def get_args():
                         type=int,
                         help='epochs of training',
                         default=550)
+    parser.add_argument('--ca_topk_k',
+                        type=int,
+                        help='ca_topk_k',
+                        default=64)
     parser.add_argument('--save_utd',
                         type=int,
                         help='save frequency',

@@ -2152,6 +2152,7 @@ class Decoder(nn.Module):
         inputs: Dict[str, torch.Tensor],
         scene_encoding_token: torch.Tensor,
         scene_encoding_token_mask: torch.Tensor,
+        scene_encoding_pos_2d: torch.Tensor,
         # (B, (1+)Pnn, time_len, 11)
         target_agents_past: torch.Tensor,
         # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
@@ -2263,6 +2264,7 @@ class Decoder(nn.Module):
                 target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
+                scene_encoding_pos_2d=scene_encoding_pos_2d,
                 target_past_cur_future_valid=target_past_cur_future_valid,
                 inputs=inputs,
                 correcting_xt_fn=correcting_xt_fn,
