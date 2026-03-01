@@ -113,6 +113,7 @@ FORCE_REBUILD=0
     --name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2_no_amor_v_world" \
     --load_name "w_integ_loss_thres_1_p_sat_0.25_no_lane_summary_yaw_weight_2_no_amor_v_world" \
     --resume_model_only False \
+    --resume_wandb_model_name latest \
     --batch_size 1536 \
     --learning_rate 1e-3 \
     --min_learning_rate 1e-6 \
