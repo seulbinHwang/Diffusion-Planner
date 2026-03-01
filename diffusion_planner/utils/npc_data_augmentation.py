@@ -137,45 +137,6 @@ def _compute_acc_from_vxvy(vxvy: Tensor, valid: Tensor, dt: float) -> Tensor:
     return acc
 
 
-def _vel_dir_yaw_rate_at_tcur(
-    vxvy: Tensor,  # (..., T, 2)
-    valid: Tensor,  # (..., T)
-    t_cur: int,
-    dt: float,
-) -> Tensor:
-    """현재 시점 t_cur에서 '속도 방향 각속도'를 계산합니다.
-
-    계산:
-      psi[t] = atan2(vy, vx)
-      yaw_rate[t_cur] = wrap(psi[t_cur] - psi[t_cur-1]) / dt
-      단, valid[t_cur] & valid[t_cur-1]일 때만, 아니면 0.
-
-    Args:
-        vxvy (Tensor): shape (..., T, 2)
-        valid (Tensor): shape (..., T) bool
-        t_cur (int): 현재 인덱스 (time_len-1)
-        dt (float): 시간 간격
-
-    Returns:
-        Tensor: shape (...)  (t_cur에서의 yaw_rate)
-    """
-    T = int(vxvy.shape[-2])
-    if T <= 1 or t_cur <= 0 or t_cur >= T:
-        return torch.zeros(vxvy.shape[:-2],
-                           device=vxvy.device,
-                           dtype=vxvy.dtype)
-
-    v_cur = vxvy[..., t_cur, :]  # (..., 2)
-    v_prev = vxvy[..., t_cur - 1, :]  # (..., 2)
-
-    psi_cur = torch.atan2(v_cur[..., 1], v_cur[..., 0])
-    psi_prev = torch.atan2(v_prev[..., 1], v_prev[..., 0])
-
-    dpsi = _wrap_to_pi(psi_cur - psi_prev)
-    seg_valid = valid[..., t_cur] & valid[..., t_cur - 1]
-    out = torch.where(seg_valid, dpsi / float(dt), torch.zeros_like(dpsi))
-    return out
-
 def _obb_intersects_others_vs_others(
     oth_xy: Tensor,  # (B, A, 2)
     oth_cs: Tensor,  # (B, A, 2) = (cos, sin)
@@ -382,8 +343,6 @@ class _TypeParams:
     """agent 타입별 상수 묶음."""
     # 증강 후보 속도 조건
     min_speed_for_aug: float
-    # yaw_rate clip
-    yaw_rate_clip: float
     # past/future 보간 길이(초)
     T_past: float
     T_fut: float
@@ -451,7 +410,6 @@ class NPCStatePerturbation:
         # 타입별 상수(너 표/규칙 그대로)
         self._car = _TypeParams(
             min_speed_for_aug=2.0,
-            yaw_rate_clip=0.85,
             T_past=2.0,
             T_fut=2.0,
             dy=0.75,
@@ -465,7 +423,6 @@ class NPCStatePerturbation:
         )
         self._cyc = _TypeParams(
             min_speed_for_aug=1.0,
-            yaw_rate_clip=1.5,
             T_past=1.5,
             T_fut=1.5,
             dy=0.40,
@@ -479,7 +436,6 @@ class NPCStatePerturbation:
         )
         self._ped = _TypeParams(
             min_speed_for_aug=0.3,
-            yaw_rate_clip=3.0,
             T_past=1.0,
             T_fut=1.0,
             dy=0.30,
@@ -2335,17 +2291,6 @@ class NPCStatePerturbation:
         else:
             nbr_cur_acc = torch.zeros((B, 0, 2), device=device, dtype=dtype)
 
-        ego_yaw_rate = _vel_dir_yaw_rate_at_tcur(ego_v_past,
-                                                 ego_past_valid,
-                                                 t_cur=t_cur,
-                                                 dt=self._dt)  # (B,)
-        if A > 0:
-            nbr_yaw_rate = _vel_dir_yaw_rate_at_tcur(nbr_v_past,
-                                                     nbr_past_valid,
-                                                     t_cur=t_cur,
-                                                     dt=self._dt)  # (B,A)
-        else:
-            nbr_yaw_rate = torch.zeros((B, 0), device=device, dtype=dtype)
 
         # -----------------------------
         # Step 5) self 좌표계 변환(현재)
@@ -2488,19 +2433,23 @@ class NPCStatePerturbation:
 
         # 안전장치: car/cyc는 vx>=0, lateral clamp
         def _apply_type_safety_self(
-            vx: Tensor,
-            vy: Tensor,
-            ax: Tensor,
-            ay: Tensor,
-            yaw_rate: Tensor,
-            is_car: Tensor,
-            is_cyc: Tensor,
-            is_ped: Tensor,
-        ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+                vx: Tensor,
+                vy: Tensor,
+                ax: Tensor,
+                ay: Tensor,
+                is_car: Tensor,
+                is_cyc: Tensor,
+                is_ped: Tensor,
+        ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+            """타입별 최소 안전장치만 적용합니다.
+
+            - car/cyc: vx는 0 이상으로 제한
+            - 모든 타입: vy/ay는 타입별 범위로 제한
+            """
             # vx >= 0 for car/cyc
             vx2 = torch.where((is_car | is_cyc), torch.clamp_min(vx, 0.0), vx)
 
-            # lateral clamp (너무 옆으로 튀지 않게)
+            # lateral clamp
             car_vy_lim = float(self._car.vy_clamp)
             cyc_vy_lim = float(self._cyc.vy_clamp)
             ped_vy_lim = float(self._ped.vy_clamp)
@@ -2509,36 +2458,31 @@ class NPCStatePerturbation:
             cyc_ay_lim = float(self._cyc.ay_clamp)
             ped_ay_lim = float(self._ped.ay_clamp)
 
-            vy_lim = (is_car.to(vy.dtype) * car_vy_lim +
-                      is_cyc.to(vy.dtype) * cyc_vy_lim +
-                      is_ped.to(vy.dtype) * ped_vy_lim)
-            ay_lim = (is_car.to(ay.dtype) * car_ay_lim +
-                      is_cyc.to(ay.dtype) * cyc_ay_lim +
-                      is_ped.to(ay.dtype) * ped_ay_lim)
+            vy_lim = (
+                    is_car.to(vy.dtype) * car_vy_lim
+                    + is_cyc.to(vy.dtype) * cyc_vy_lim
+                    + is_ped.to(vy.dtype) * ped_vy_lim
+            )
+            ay_lim = (
+                    is_car.to(ay.dtype) * car_ay_lim
+                    + is_cyc.to(ay.dtype) * cyc_ay_lim
+                    + is_ped.to(ay.dtype) * ped_ay_lim
+            )
 
             vy2 = torch.clamp(vy, -vy_lim, vy_lim)
             ay2 = torch.clamp(ay, -ay_lim, ay_lim)
 
-            # yaw_rate clip + 저속이면 0
-            speed = torch.sqrt(vx2 * vx2 + vy2 * vy2)
-            low_speed = speed <= 0.2
+            return vx2, vy2, ax, ay2
 
-            clip_val = (
-                is_car.to(yaw_rate.dtype) * float(self._car.yaw_rate_clip) +
-                is_cyc.to(yaw_rate.dtype) * float(self._cyc.yaw_rate_clip) +
-                is_ped.to(yaw_rate.dtype) * float(self._ped.yaw_rate_clip))
-            yaw_rate2 = torch.clamp(yaw_rate, -clip_val, clip_val)
-            yaw_rate2 = torch.where((is_car | is_cyc) & low_speed,
-                                    torch.zeros_like(yaw_rate2), yaw_rate2)
-            return vx2, vy2, ax, ay2, yaw_rate2
-
-        ego_vx_self_p, ego_vy_self_p, ego_ax_self_p, ego_ay_self_p, ego_yaw_rate_p = _apply_type_safety_self(
+        ego_vx_self_p, ego_vy_self_p, ego_ax_self_p, ego_ay_self_p = _apply_type_safety_self(
             ego_vx_self_p, ego_vy_self_p, ego_ax_self_p, ego_ay_self_p,
-            ego_yaw_rate, ego_is_car, ego_is_cyc, ego_is_ped)
+            ego_is_car, ego_is_cyc, ego_is_ped,
+        )
         if A > 0:
-            nbr_vx_self_p, nbr_vy_self_p, nbr_ax_self_p, nbr_ay_self_p, nbr_yaw_rate_p = _apply_type_safety_self(
+            nbr_vx_self_p, nbr_vy_self_p, nbr_ax_self_p, nbr_ay_self_p = _apply_type_safety_self(
                 nbr_vx_self_p, nbr_vy_self_p, nbr_ax_self_p, nbr_ay_self_p,
-                nbr_yaw_rate, nbr_is_car, nbr_is_cyc, nbr_is_ped)
+                nbr_is_car, nbr_is_cyc, nbr_is_ped,
+            )
         else:
             nbr_yaw_rate_p = torch.zeros((B, 0), device=device, dtype=dtype)
 
