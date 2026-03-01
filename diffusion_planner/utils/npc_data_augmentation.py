@@ -755,6 +755,643 @@ class NPCStatePerturbation:
             )
         return cache
 
+    def _draw_before_after_png_extreme(
+        self,
+        *,
+        before_inputs: Dict[str, Any],
+        before_outputs: Dict[str, Any],
+        after_inputs: Dict[str, Any],
+        after_outputs: Dict[str, Tensor],
+        batch_index: int,
+        save_path: str,
+        aug_ego: bool,
+        aug_nbr_mask: Optional[Tensor],  # (A,) bool or None
+        frame_params: Tuple[float, float, float, float],  # (xe,ye,ce,se)
+        past_stride: int,
+        future_stride: int,
+        vel_arrow_len_m: float,
+    ) -> None:
+        """before/after 변화가 '극명'하게 보이도록 2x2 PNG를 저장합니다.
+
+        패널 구성:
+            - (0,0) BEFORE(aligned): before를 after frame으로 변환해서 표시
+            - (0,1) AFTER
+            - (1,0) OVERLAY: before/after를 겹쳐 그리고, aug agent에 Δ 화살표/수치 표시
+            - (1,1) ZOOM: aug agent 주변 자동 확대(변화가 작은 경우에도 잘 보임)
+
+        Args:
+            before_inputs/before_outputs:
+                배치 차원 없는(샘플 단위) before 스냅샷. CPU 텐서.
+            after_inputs/after_outputs:
+                현재 배치(dict). batch_index로 1개 샘플을 꺼냅니다.
+            aug_ego:
+                ego가 증강된 경우 True.
+            aug_nbr_mask:
+                shape (A,) bool. neighbor 증강 여부.
+            frame_params:
+                (xe, ye, ce, se) = after frame 변환 파라미터.
+                - old -> new: x' = ce*(x-xe) + se*(y-ye), y' = -se*(x-xe) + ce*(y-ye)
+            past_stride/future_stride:
+                박스 표시 간격.
+            vel_arrow_len_m:
+                속도 방향 화살표 고정 길이[m].
+        """
+        os.environ.setdefault("MPLBACKEND", "Agg")
+        import numpy as np
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import LineCollection
+        from matplotlib.patches import Polygon, FancyArrowPatch
+
+        xe, ye, ce, se = (float(frame_params[0]), float(frame_params[1]),
+                          float(frame_params[2]), float(frame_params[3]))
+
+        def _to_np_f32(t: Tensor) -> np.ndarray:
+            return t.detach().to(dtype=torch.float32).cpu().numpy()
+
+        def _to_np_bool(t: Tensor) -> np.ndarray:
+            arr = t.detach().cpu().numpy()
+            if arr.dtype == np.bool_:
+                return arr
+            return (arr != 0)
+
+        def _wrap_pi(a: np.ndarray) -> np.ndarray:
+            return np.arctan2(np.sin(a), np.cos(a)).astype(np.float32, copy=False)
+
+        def _yaw_from_cs(c: np.ndarray, s_: np.ndarray) -> np.ndarray:
+            return np.arctan2(s_, c).astype(np.float32, copy=False)
+
+        def _speed(vx: np.ndarray, vy: np.ndarray) -> np.ndarray:
+            return np.hypot(vx, vy).astype(np.float32, copy=False)
+
+        def _tf_xy(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            dx = x - xe
+            dy = y - ye
+            x2 = ce * dx + se * dy
+            y2 = -se * dx + ce * dy
+            return x2.astype(np.float32, copy=False), y2.astype(np.float32, copy=False)
+
+        def _tf_vec(vx: np.ndarray, vy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            vx2 = ce * vx + se * vy
+            vy2 = -se * vx + ce * vy
+            return vx2.astype(np.float32, copy=False), vy2.astype(np.float32, copy=False)
+
+        def _tf_traj11(traj11: np.ndarray) -> np.ndarray:
+            out = traj11.copy()
+            x2, y2 = _tf_xy(out[..., self.IDX_X], out[..., self.IDX_Y])
+            out[..., self.IDX_X] = x2
+            out[..., self.IDX_Y] = y2
+
+            hc2, hs2 = _tf_vec(out[..., self.IDX_COS], out[..., self.IDX_SIN])
+            out[..., self.IDX_COS] = hc2
+            out[..., self.IDX_SIN] = hs2
+
+            vx2, vy2 = _tf_vec(out[..., self.IDX_VX], out[..., self.IDX_VY])
+            out[..., self.IDX_VX] = vx2
+            out[..., self.IDX_VY] = vy2
+            return out
+
+        def _tf_lanes(lanes12: np.ndarray) -> np.ndarray:
+            out = lanes12.copy()
+            cx2, cy2 = _tf_xy(out[..., 0], out[..., 1])
+            out[..., 0] = cx2
+            out[..., 1] = cy2
+            for s0 in (2, 4, 6):
+                vx2, vy2 = _tf_vec(out[..., s0], out[..., s0 + 1])
+                out[..., s0] = vx2
+                out[..., s0 + 1] = vy2
+            return out
+
+        def _tf_points(points: np.ndarray) -> np.ndarray:
+            # (...,2)
+            out = points.copy()
+            x2, y2 = _tf_xy(out[..., 0], out[..., 1])
+            out[..., 0] = x2
+            out[..., 1] = y2
+            return out
+
+        def _tf_static_objects(so10: np.ndarray) -> np.ndarray:
+            out = so10.copy()
+            x2, y2 = _tf_xy(out[..., 0], out[..., 1])
+            out[..., 0] = x2
+            out[..., 1] = y2
+            hc2, hs2 = _tf_vec(out[..., 2], out[..., 3])
+            out[..., 2] = hc2
+            out[..., 3] = hs2
+            return out
+
+        def _oriented_box_corners(x: float, y: float, c: float, s_: float, length: float, width: float) -> np.ndarray:
+            half_L = 0.5 * float(length)
+            half_W = 0.5 * float(width)
+            local = np.array(
+                [[+half_L, +half_W], [+half_L, -half_W], [-half_L, -half_W], [-half_L, +half_W]],
+                dtype=np.float32,
+            )
+            R = np.array([[c, -s_], [s_, c]], dtype=np.float32)
+            return (local @ R.T) + np.array([x, y], dtype=np.float32)
+
+        def _add_arrow(ax: plt.Axes, x0: float, y0: float, x1: float, y1: float, color: str, lw: float, alpha: float, z: int) -> None:
+            ax.add_patch(
+                FancyArrowPatch(
+                    (x0, y0),
+                    (x1, y1),
+                    arrowstyle="-|>",
+                    mutation_scale=8.0,
+                    linewidth=float(lw),
+                    color=color,
+                    alpha=float(alpha),
+                    zorder=int(z),
+                    shrinkA=0.0,
+                    shrinkB=0.0,
+                )
+            )
+
+        def _add_vel_arrow_unit(ax: plt.Axes, x: float, y: float, vx: float, vy: float, color: str, lw: float, alpha: float, z: int) -> None:
+            mag = float(np.hypot(vx, vy))
+            if mag < 1e-6:
+                return
+            dx = float(vel_arrow_len_m) * (vx / mag)
+            dy = float(vel_arrow_len_m) * (vy / mag)
+            _add_arrow(ax, x, y, x + dx, y + dy, color=color, lw=lw, alpha=alpha, z=z)
+
+        def _draw_map(ax: plt.Axes, lanes_np: Optional[np.ndarray], lanes_valid: Optional[np.ndarray]) -> None:
+            ax.set_facecolor("#000000")
+            if lanes_np is None or lanes_valid is None:
+                return
+
+            segments_center: List[np.ndarray] = []
+            segments_left: List[np.ndarray] = []
+            segments_right: List[np.ndarray] = []
+
+            L = int(lanes_np.shape[0])
+            eps_vec = 1e-6
+            for li in range(L):
+                vmask = lanes_valid[li].astype(bool)
+                if not bool(np.any(vmask)):
+                    continue
+                lane = lanes_np[li]  # (20,12)
+                center = lane[:, 0:2]
+                left_vec = lane[:, 4:6]
+                right_vec = lane[:, 6:8]
+
+                seg_ok = vmask[:-1] & vmask[1:]
+                if bool(np.any(seg_ok)):
+                    p0 = center[:-1][seg_ok]
+                    p1 = center[1:][seg_ok]
+                    segments_center.append(np.stack([p0, p1], axis=1))
+
+                left_ok = (np.linalg.norm(left_vec, axis=1) > eps_vec)
+                right_ok = (np.linalg.norm(right_vec, axis=1) > eps_vec)
+
+                segL = seg_ok & left_ok[:-1] & left_ok[1:]
+                if bool(np.any(segL)):
+                    left_xy = center + left_vec
+                    p0 = left_xy[:-1][segL]
+                    p1 = left_xy[1:][segL]
+                    segments_left.append(np.stack([p0, p1], axis=1))
+
+                segR = seg_ok & right_ok[:-1] & right_ok[1:]
+                if bool(np.any(segR)):
+                    right_xy = center + right_vec
+                    p0 = right_xy[:-1][segR]
+                    p1 = right_xy[1:][segR]
+                    segments_right.append(np.stack([p0, p1], axis=1))
+
+            if len(segments_center) > 0:
+                seg = np.concatenate(segments_center, axis=0)
+                ax.add_collection(LineCollection(seg, colors="#808080", linewidths=0.6, linestyles=(0, (4, 4)), zorder=1, alpha=0.25))
+            if len(segments_left) > 0:
+                seg = np.concatenate(segments_left, axis=0)
+                ax.add_collection(LineCollection(seg, colors="#E6E6FA", linewidths=0.8, linestyles="-", zorder=2, alpha=0.35))
+            if len(segments_right) > 0:
+                seg = np.concatenate(segments_right, axis=0)
+                ax.add_collection(LineCollection(seg, colors="#E6E6FA", linewidths=0.8, linestyles="-", zorder=2, alpha=0.35))
+
+        def _draw_agents(
+            ax: plt.Axes,
+            *,
+            ego_past: np.ndarray, ego_past_v: np.ndarray,
+            ego_fut: np.ndarray, ego_fut_v: np.ndarray,
+            nbr_past: np.ndarray, nbr_past_v: np.ndarray,
+            nbr_fut: np.ndarray, nbr_fut_v: np.ndarray,
+            aug_nbr_np: Optional[np.ndarray],
+            mode: str,
+        ) -> Tuple[List[float], List[float]]:
+            """mode:
+            - 'before' / 'after' : 일반 표시(aug는 약간 진하게)
+            - 'overlay_before' / 'overlay_after' : 겹쳐그리기용(aug만 매우 진하게, 비-aug는 거의 안 보이게)
+            """
+            xs: List[float] = []
+            ys: List[float] = []
+
+            Tp = int(ego_past.shape[0])
+            t_cur = Tp - 1
+
+            def _draw_traj(
+                traj: np.ndarray,
+                valid: np.ndarray,
+                *,
+                color: str,
+                lw: float,
+                alpha: float,
+                fill_cur: bool,
+                fill_color: Optional[str],
+                fill_alpha: float,
+                stride: int,
+                z: int,
+            ) -> None:
+                T = int(traj.shape[0])
+                for t in range(0, T, int(stride)):
+                    if not bool(valid[t]):
+                        continue
+                    row = traj[t]
+                    x = float(row[self.IDX_X]); y = float(row[self.IDX_Y])
+                    c = float(row[self.IDX_COS]); s_ = float(row[self.IDX_SIN])
+                    r = float(np.hypot(c, s_))
+                    if r < 1e-8:
+                        c, s_ = 1.0, 0.0
+                    else:
+                        c, s_ = c / r, s_ / r
+
+                    vx = float(row[self.IDX_VX]); vy = float(row[self.IDX_VY])
+                    W = float(row[self.IDX_W]);  L = float(row[self.IDX_L])
+
+                    corners = _oriented_box_corners(x, y, c, s_, L, W)
+                    face = "none"
+                    a = float(alpha)
+                    if fill_cur and (t == t_cur) and (fill_color is not None):
+                        face = fill_color
+                        a = float(fill_alpha)
+
+                    ax.add_patch(
+                        Polygon(
+                            corners,
+                            closed=True,
+                            facecolor=face,
+                            edgecolor=color,
+                            linewidth=float(lw),
+                            alpha=float(a),
+                            zorder=int(z + (2 if (t == t_cur) else 0)),
+                        )
+                    )
+
+                    # heading line
+                    hx = x + 0.5 * L * c
+                    hy = y + 0.5 * L * s_
+                    ax.plot([x, hx], [y, hy], color=color, linewidth=float(lw), alpha=float(alpha), zorder=int(z + 1))
+
+                    # velocity arrow: 현재 프레임만
+                    if t == t_cur:
+                        _add_vel_arrow_unit(ax, x, y, vx, vy, color=color, lw=max(0.6, float(lw)), alpha=float(alpha), z=int(z + 2))
+
+                    xs.append(x); ys.append(y)
+
+            # ego
+            if mode in ("before", "after"):
+                ego_alpha = 1.0 if aug_ego else 0.7
+                ego_lw = 1.3 if aug_ego else 0.9
+                ego_color = "#FFD700" if aug_ego else "#BBBBBB"
+            else:
+                ego_alpha = 1.0
+                ego_lw = 1.6
+                ego_color = "#00FFFF" if mode == "overlay_before" else "#FFD700"
+
+            _draw_traj(
+                ego_past, ego_past_v,
+                color=ego_color, lw=ego_lw, alpha=ego_alpha,
+                fill_cur=True, fill_color="#FFFFFF", fill_alpha=0.55 if aug_ego else 0.35,
+                stride=int(past_stride), z=30,
+            )
+            _draw_traj(
+                ego_fut, ego_fut_v,
+                color=ego_color, lw=max(0.5, ego_lw * 0.6), alpha=ego_alpha,
+                fill_cur=False, fill_color=None, fill_alpha=0.0,
+                stride=int(future_stride), z=20,
+            )
+
+            # neighbors
+            A = int(nbr_past.shape[0])
+            for i in range(A):
+                if not bool(nbr_past_v[i, t_cur]):
+                    continue
+
+                hi = bool(aug_nbr_np[i]) if (aug_nbr_np is not None and i < int(aug_nbr_np.shape[0])) else False
+                base_color = "#84E573"  # default car-like
+                # 타입별 색
+                if float(nbr_past[i, t_cur, self.IDX_OH_PED]) > 0.5:
+                    base_color = "#4D83E1"
+                elif float(nbr_past[i, t_cur, self.IDX_OH_CYC]) > 0.5:
+                    base_color = "#FFA500"
+
+                if mode in ("before", "after"):
+                    col = "#FFD700" if hi else base_color
+                    a = 1.0 if hi else 0.15
+                    lw = 1.1 if hi else 0.35
+                    draw_full = hi  # ✅ 일반 패널에서도 변화된 agent만 “시간축”을 그림
+                else:
+                    # overlay에서는 hi만 거의 전부 보이게
+                    col = "#00FFFF" if (mode == "overlay_before") else "#FFD700"
+                    a = 1.0 if hi else 0.03
+                    lw = 1.2 if hi else 0.25
+                    draw_full = hi
+
+                if draw_full:
+                    _draw_traj(
+                        nbr_past[i], nbr_past_v[i],
+                        color=col, lw=lw, alpha=a,
+                        fill_cur=True, fill_color=base_color, fill_alpha=0.18 if hi else 0.05,
+                        stride=int(past_stride), z=12,
+                    )
+                    _draw_traj(
+                        nbr_fut[i], nbr_fut_v[i],
+                        color=col, lw=max(0.4, lw * 0.7), alpha=a,
+                        fill_cur=False, fill_color=None, fill_alpha=0.0,
+                        stride=int(future_stride), z=10,
+                    )
+                else:
+                    # 비-aug는 현재만 아주 희미하게
+                    row = nbr_past[i, t_cur]
+                    x = float(row[self.IDX_X]); y = float(row[self.IDX_Y])
+                    c = float(row[self.IDX_COS]); s_ = float(row[self.IDX_SIN])
+                    r = float(np.hypot(c, s_))
+                    if r < 1e-8:
+                        c, s_ = 1.0, 0.0
+                    else:
+                        c, s_ = c / r, s_ / r
+                    W = float(row[self.IDX_W]); L = float(row[self.IDX_L])
+                    corners = _oriented_box_corners(x, y, c, s_, L, W)
+                    ax.add_patch(
+                        Polygon(corners, closed=True, fill=False, edgecolor=base_color,
+                                linewidth=0.25, alpha=float(a), zorder=5)
+                    )
+                    xs.append(x); ys.append(y)
+
+            return xs, ys
+
+        # ---------- before(샘플) / after(배치) numpy 준비 ----------
+        def _get_scene_from_before() -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            # before는 CPU 텐서(샘플 단위) 그대로 들어있음
+            out["ego_past"] = _to_np_f32(before_inputs["ego_agent_past"])
+            out["ego_past_v"] = _to_np_bool(_as_bool_mask(before_inputs["ego_agent_past_is_valid"]))
+            out["ego_fut"] = _to_np_f32(before_inputs["ego_future_gt_11_dim"])
+            out["ego_fut_v"] = _to_np_bool(_as_bool_mask(before_outputs["ego_future_gt_is_valid"]))
+
+            out["nbr_past"] = _to_np_f32(before_inputs["neighbor_agents_past"])
+            out["nbr_past_v"] = _to_np_bool(_as_bool_mask(before_inputs["neighbor_agents_past_is_valid"]))
+            out["nbr_fut"] = _to_np_f32(before_inputs["neighbor_future_gt_11_dim"])
+            out["nbr_fut_v"] = _to_np_bool(_as_bool_mask(before_inputs["neighbor_future_gt_is_valid"]))
+
+            lanes = before_inputs.get("lanes", None)
+            lv = before_inputs.get("lanes_len_is_valid", None)
+            out["lanes"] = _to_np_f32(lanes) if isinstance(lanes, torch.Tensor) else None
+            out["lanes_v"] = _to_np_bool(_as_bool_mask(lv)) if isinstance(lv, torch.Tensor) else None
+
+            return out
+
+        def _get_scene_from_after() -> Dict[str, Any]:
+            b = int(batch_index)
+            out: Dict[str, Any] = {}
+            out["ego_past"] = _to_np_f32(after_inputs["ego_agent_past"][b])
+            out["ego_past_v"] = _to_np_bool(_as_bool_mask(after_inputs["ego_agent_past_is_valid"][b]))
+            out["ego_fut"] = _to_np_f32(after_inputs["ego_future_gt_11_dim"][b])
+            out["ego_fut_v"] = _to_np_bool(_as_bool_mask(after_outputs["ego_future_gt_is_valid"][b]))
+
+            out["nbr_past"] = _to_np_f32(after_inputs["neighbor_agents_past"][b])
+            out["nbr_past_v"] = _to_np_bool(_as_bool_mask(after_inputs["neighbor_agents_past_is_valid"][b]))
+            out["nbr_fut"] = _to_np_f32(after_inputs["neighbor_future_gt_11_dim"][b])
+            out["nbr_fut_v"] = _to_np_bool(_as_bool_mask(after_inputs["neighbor_future_gt_is_valid"][b]))
+
+            lanes = after_inputs.get("lanes", None)
+            lv = after_inputs.get("lanes_len_is_valid", None)
+            if isinstance(lanes, torch.Tensor) and isinstance(lv, torch.Tensor):
+                out["lanes"] = _to_np_f32(lanes[b])
+                out["lanes_v"] = _to_np_bool(_as_bool_mask(lv[b]))
+            else:
+                out["lanes"] = None
+                out["lanes_v"] = None
+            return out
+
+        before = _get_scene_from_before()
+        after = _get_scene_from_after()
+
+        # before를 after frame으로 정렬
+        before_aligned = {
+            "ego_past": _tf_traj11(before["ego_past"]),
+            "ego_past_v": before["ego_past_v"],
+            "ego_fut": _tf_traj11(before["ego_fut"]),
+            "ego_fut_v": before["ego_fut_v"],
+            "nbr_past": _tf_traj11(before["nbr_past"]),
+            "nbr_past_v": before["nbr_past_v"],
+            "nbr_fut": _tf_traj11(before["nbr_fut"]),
+            "nbr_fut_v": before["nbr_fut_v"],
+            "lanes": _tf_lanes(before["lanes"]) if before["lanes"] is not None else None,
+            "lanes_v": before["lanes_v"],
+        }
+
+        aug_nbr_np = _to_np_bool(aug_nbr_mask) if isinstance(aug_nbr_mask, torch.Tensor) else None
+
+        # ---------- figure ----------
+        fig, axes = plt.subplots(2, 2, figsize=(26.0, 14.0), dpi=220)
+        fig.patch.set_facecolor("#000000")
+
+        ax00, ax01 = axes[0, 0], axes[0, 1]
+        ax10, ax11 = axes[1, 0], axes[1, 1]
+
+        # 지도는 after 기준으로 그리는게 가장 안정적(둘이 거의 같아야 정상)
+        for ax in (ax00, ax01, ax10, ax11):
+            _draw_map(ax, after["lanes"], after["lanes_v"])
+            ax.axis("off")
+            ax.set_aspect("equal", adjustable="box")
+
+        ax00.set_title("BEFORE (aligned to AFTER frame)", color="#FFFFFF", fontsize=12)
+        ax01.set_title("AFTER", color="#FFFFFF", fontsize=12)
+        ax10.set_title("OVERLAY + Δ vectors (aug only)", color="#FFFFFF", fontsize=12)
+        ax11.set_title("ZOOM (aug agents)", color="#FFFFFF", fontsize=12)
+
+        # (0,0) before aligned
+        xs0, ys0 = _draw_agents(
+            ax00,
+            ego_past=before_aligned["ego_past"], ego_past_v=before_aligned["ego_past_v"],
+            ego_fut=before_aligned["ego_fut"], ego_fut_v=before_aligned["ego_fut_v"],
+            nbr_past=before_aligned["nbr_past"], nbr_past_v=before_aligned["nbr_past_v"],
+            nbr_fut=before_aligned["nbr_fut"], nbr_fut_v=before_aligned["nbr_fut_v"],
+            aug_nbr_np=aug_nbr_np,
+            mode="before",
+        )
+
+        # (0,1) after
+        xs1, ys1 = _draw_agents(
+            ax01,
+            ego_past=after["ego_past"], ego_past_v=after["ego_past_v"],
+            ego_fut=after["ego_fut"], ego_fut_v=after["ego_fut_v"],
+            nbr_past=after["nbr_past"], nbr_past_v=after["nbr_past_v"],
+            nbr_fut=after["nbr_fut"], nbr_fut_v=after["nbr_fut_v"],
+            aug_nbr_np=aug_nbr_np,
+            mode="after",
+        )
+
+        # (1,0) overlay (before=cyan, after=gold)
+        _draw_agents(
+            ax10,
+            ego_past=before_aligned["ego_past"], ego_past_v=before_aligned["ego_past_v"],
+            ego_fut=before_aligned["ego_fut"], ego_fut_v=before_aligned["ego_fut_v"],
+            nbr_past=before_aligned["nbr_past"], nbr_past_v=before_aligned["nbr_past_v"],
+            nbr_fut=before_aligned["nbr_fut"], nbr_fut_v=before_aligned["nbr_fut_v"],
+            aug_nbr_np=aug_nbr_np,
+            mode="overlay_before",
+        )
+        _draw_agents(
+            ax10,
+            ego_past=after["ego_past"], ego_past_v=after["ego_past_v"],
+            ego_fut=after["ego_fut"], ego_fut_v=after["ego_fut_v"],
+            nbr_past=after["nbr_past"], nbr_past_v=after["nbr_past_v"],
+            nbr_fut=after["nbr_fut"], nbr_fut_v=after["nbr_fut_v"],
+            aug_nbr_np=aug_nbr_np,
+            mode="overlay_after",
+        )
+
+        # Δ 벡터 + 수치 표시(현재 프레임 기준)
+        Tp = int(after["ego_past"].shape[0])
+        t_cur = Tp - 1
+
+        def _annotate_delta_for_one_agent(
+            ax: plt.Axes,
+            *,
+            name: str,
+            p_before: np.ndarray,  # (2,)
+            yaw_before: float,
+            spd_before: float,
+            p_after: np.ndarray,   # (2,)
+            yaw_after: float,
+            spd_after: float,
+            color: str,
+        ) -> None:
+            dx = float(p_after[0] - p_before[0])
+            dy = float(p_after[1] - p_before[1])
+            dp = float(np.hypot(dx, dy))
+            dyaw = float(_wrap_pi(np.array([yaw_after - yaw_before], dtype=np.float32))[0])
+            dyaw_deg = dyaw * 180.0 / float(np.pi)
+            dspd = float(spd_after - spd_before)
+
+            _add_arrow(ax, float(p_before[0]), float(p_before[1]),
+                       float(p_after[0]), float(p_after[1]),
+                       color=color, lw=1.8, alpha=0.95, z=80)
+
+            ax.text(
+                float(p_after[0]),
+                float(p_after[1]),
+                f"{name}\n|Δp|={dp:.2f}m\nΔyaw={dyaw_deg:.1f}deg\nΔv={dspd:.2f}m/s",
+                color=color,
+                fontsize=8,
+                ha="left",
+                va="bottom",
+                zorder=90,
+                clip_on=True,
+            )
+
+        # ego delta
+        ego_b = before_aligned["ego_past"][t_cur]
+        ego_a = after["ego_past"][t_cur]
+        pB = ego_b[0:2]; pA = ego_a[0:2]
+        yawB = float(_yaw_from_cs(np.array([ego_b[2]]), np.array([ego_b[3]]))[0])
+        yawA = float(_yaw_from_cs(np.array([ego_a[2]]), np.array([ego_a[3]]))[0])
+        spB = float(_speed(np.array([ego_b[4]]), np.array([ego_b[5]]))[0])
+        spA = float(_speed(np.array([ego_a[4]]), np.array([ego_a[5]]))[0])
+
+        if bool(aug_ego):
+            _annotate_delta_for_one_agent(
+                ax10,
+                name="EGO",
+                p_before=pB, yaw_before=yawB, spd_before=spB,
+                p_after=pA, yaw_after=yawA, spd_after=spA,
+                color="#FF3333",
+            )
+
+        # neighbor delta (aug만)
+        if aug_nbr_np is not None:
+            A = int(aug_nbr_np.shape[0])
+            for i in range(A):
+                if not bool(aug_nbr_np[i]):
+                    continue
+                nb_b = before_aligned["nbr_past"][i, t_cur]
+                nb_a = after["nbr_past"][i, t_cur]
+                pb = nb_b[0:2]; pa = nb_a[0:2]
+                yb = float(_yaw_from_cs(np.array([nb_b[2]]), np.array([nb_b[3]]))[0])
+                ya = float(_yaw_from_cs(np.array([nb_a[2]]), np.array([nb_a[3]]))[0])
+                sb = float(_speed(np.array([nb_b[4]]), np.array([nb_b[5]]))[0])
+                sa = float(_speed(np.array([nb_a[4]]), np.array([nb_a[5]]))[0])
+                _annotate_delta_for_one_agent(
+                    ax10,
+                    name=f"N{i}",
+                    p_before=pb, yaw_before=yb, spd_before=sb,
+                    p_after=pa, yaw_after=ya, spd_after=sa,
+                    color="#FF3333",
+                )
+
+        # (1,1) zoom: overlay를 그대로 그리고 축만 줄임
+        _draw_agents(
+            ax11,
+            ego_past=before_aligned["ego_past"], ego_past_v=before_aligned["ego_past_v"],
+            ego_fut=before_aligned["ego_fut"], ego_fut_v=before_aligned["ego_fut_v"],
+            nbr_past=before_aligned["nbr_past"], nbr_past_v=before_aligned["nbr_past_v"],
+            nbr_fut=before_aligned["nbr_fut"], nbr_fut_v=before_aligned["nbr_fut_v"],
+            aug_nbr_np=aug_nbr_np,
+            mode="overlay_before",
+        )
+        _draw_agents(
+            ax11,
+            ego_past=after["ego_past"], ego_past_v=after["ego_past_v"],
+            ego_fut=after["ego_fut"], ego_fut_v=after["ego_fut_v"],
+            nbr_past=after["nbr_past"], nbr_past_v=after["nbr_past_v"],
+            nbr_fut=after["nbr_fut"], nbr_fut_v=after["nbr_fut_v"],
+            aug_nbr_np=aug_nbr_np,
+            mode="overlay_after",
+        )
+
+        # ---------- 축 범위 ----------
+        # global: 너무 커지지 않게 clamp
+        xs = (xs0 + xs1)
+        ys = (ys0 + ys1)
+        if len(xs) == 0:
+            global_half = 60.0
+        else:
+            global_half = max(30.0, min(120.0, float(max(np.max(np.abs(xs)), np.max(np.abs(ys))) + 8.0)))
+
+        for ax in (ax00, ax01, ax10):
+            ax.set_xlim(-global_half, global_half)
+            ax.set_ylim(-global_half, global_half)
+
+        # zoom: aug agent 주변 자동
+        zoom_pts: List[Tuple[float, float]] = []
+        if bool(aug_ego):
+            zoom_pts.append((float(pA[0]), float(pA[1])))
+            zoom_pts.append((float(pB[0]), float(pB[1])))
+        if aug_nbr_np is not None:
+            A = int(aug_nbr_np.shape[0])
+            for i in range(A):
+                if not bool(aug_nbr_np[i]):
+                    continue
+                pb = before_aligned["nbr_past"][i, t_cur, 0:2]
+                pa = after["nbr_past"][i, t_cur, 0:2]
+                zoom_pts.append((float(pb[0]), float(pb[1])))
+                zoom_pts.append((float(pa[0]), float(pa[1])))
+
+        if len(zoom_pts) == 0:
+            zoom_half = 20.0
+            zx, zy = 0.0, 0.0
+        else:
+            zx = float(np.mean([p[0] for p in zoom_pts]))
+            zy = float(np.mean([p[1] for p in zoom_pts]))
+            max_dx = float(max(abs(p[0] - zx) for p in zoom_pts))
+            max_dy = float(max(abs(p[1] - zy) for p in zoom_pts))
+            zoom_half = max(8.0, min(50.0, max(max_dx, max_dy) + 6.0))
+
+        ax11.set_xlim(zx - zoom_half, zx + zoom_half)
+        ax11.set_ylim(zy - zoom_half, zy + zoom_half)
+
+        fig.savefig(save_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+
     def _maybe_save_augmented_debug_png(
         self,
         *,
@@ -771,19 +1408,8 @@ class NPCStatePerturbation:
         future_stride: int,
         vel_arrow_len_m: float,
         debug_before_cache: Dict[int, Tuple[Dict[str, Any], Dict[str, Any]]],
+        debug_frame_params_cache: Dict[int, Tuple[float, float, float, float]],  # ✅ 추가
     ) -> None:
-        """증강 전/후를 한 장(좌/우)으로 저장합니다.
-
-        Args:
-            idx_keep:
-                shape (Bk,) long. 실제로 증강이 적용된 샘플 인덱스.
-            aug_ego:
-                shape (B,) bool. ego가 증강된 샘플 표시.
-            aug_nbr:
-                shape (B,A) bool. neighbor가 증강된 경우 표시.
-            debug_before_cache:
-                batch_index -> (before_inputs, before_outputs).
-        """
         if not self._debug_should_run(
             debug_vis_dir=debug_vis_dir,
             debug_step=debug_step,
@@ -803,12 +1429,12 @@ class NPCStatePerturbation:
         if (not isinstance(idx_keep, torch.Tensor)) or int(idx_keep.numel()) == 0:
             return
 
-        # "실제 저장"은 idx_keep 중에서 before 캐시에 있는 것만 선택(좌/우 비교 보장)
         idx_keep_cpu = idx_keep.detach().to("cpu").tolist()
+
         picked: List[int] = []
         for b in idx_keep_cpu:
             bi = int(b)
-            if bi in debug_before_cache:
+            if (bi in debug_before_cache) and (bi in debug_frame_params_cache):
                 picked.append(bi)
             if len(picked) >= int(debug_max_scenes):
                 break
@@ -821,13 +1447,18 @@ class NPCStatePerturbation:
 
         for bi in picked:
             before_inp, before_out = debug_before_cache[bi]
+            frame_params = debug_frame_params_cache[bi]  # (xe,ye,ce,se)
+
             scenario_id = str(before_inp.get("scenario_id", f"b{bi:03d}"))
-            save_path = os.path.join(str(debug_vis_dir), f"{step_str}_{scenario_id}_before_after.png")
+            save_path = os.path.join(
+                str(debug_vis_dir),
+                f"{step_str}_{scenario_id}_extreme.png",
+            )
 
             aug_ego_b = bool(aug_ego[bi].item()) if isinstance(aug_ego, torch.Tensor) else False
             aug_nbr_b = aug_nbr[bi].detach() if (isinstance(aug_nbr, torch.Tensor) and aug_nbr.ndim == 2) else None
 
-            self._draw_before_after_png(
+            self._draw_before_after_png_extreme(
                 before_inputs=before_inp,
                 before_outputs=before_out,
                 after_inputs=inputs,
@@ -835,7 +1466,8 @@ class NPCStatePerturbation:
                 batch_index=int(bi),
                 save_path=str(save_path),
                 aug_ego=bool(aug_ego_b),
-                aug_nbr_mask=aug_nbr_b,  # (A,) bool or None
+                aug_nbr_mask=aug_nbr_b,
+                frame_params=frame_params,
                 past_stride=max(1, int(past_stride)),
                 future_stride=max(1, int(future_stride)),
                 vel_arrow_len_m=float(vel_arrow_len_m),
@@ -1980,6 +2612,30 @@ class NPCStatePerturbation:
         ego_se = ego_cur2[:, self.IDX_SIN]
         ego_ce, ego_se = _normalize_cos_sin(ego_ce, ego_se)
 
+        # -----------------------------
+        # [DEBUG] before를 after frame으로 정렬하기 위한 파라미터 저장
+        # - old -> new ego frame 변환: (xe, ye, ce, se)
+        # -----------------------------
+        debug_frame_params_cache: Dict[int, Tuple[float, float, float, float]] = {}
+        if debug_enabled:
+            idx_keep_cpu = idx_keep.detach().to("cpu")
+            xe_cpu = ego_xe.detach().to(dtype=torch.float32).cpu()
+            ye_cpu = ego_ye.detach().to(dtype=torch.float32).cpu()
+            ce_cpu = ego_ce.detach().to(dtype=torch.float32).cpu()
+            se_cpu = ego_se.detach().to(dtype=torch.float32).cpu()
+
+            # idx_keep의 j번째가 원 배치의 b 인덱스
+            for j, b in enumerate(idx_keep_cpu.tolist()):
+                bi = int(b)
+                debug_frame_params_cache[bi] = (
+                    float(xe_cpu[j].item()),
+                    float(ye_cpu[j].item()),
+                    float(ce_cpu[j].item()),
+                    float(se_cpu[j].item()),
+                )
+        else:
+            debug_frame_params_cache = {}
+
         # (A) ego/neighbor past/future 변환
         def _transform_agent_traj11_inplace(traj: Tensor,
                                             valid: Tensor) -> None:
@@ -2708,5 +3364,7 @@ class NPCStatePerturbation:
             future_stride=int(debug_future_stride),
             vel_arrow_len_m=float(debug_vel_arrow_len_m),
             debug_before_cache=debug_before_cache,
+            debug_frame_params_cache=debug_frame_params_cache,  # ✅ 추가
+
         )
         return

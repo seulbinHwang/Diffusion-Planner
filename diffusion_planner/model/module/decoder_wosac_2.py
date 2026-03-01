@@ -4,13 +4,10 @@ import torch.nn as nn
 from timm.models.layers import Mlp
 from timm.layers import DropPath
 from typing import Optional, Dict, Tuple, Any
-from flash_attn.bert_padding import unpad_input, pad_input
 from diffusion_planner.model.diffusion_utils.sampling import dpm_sampler
 from diffusion_planner.model.diffusion_utils.sde import SDE, VPSDE_linear
 from diffusion_planner.utils.normalizer import ObservationNormalizer, \
     StateNormalizer
-from diffusion_planner.model.module.mixer import MixerBlock
-from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock
 from diffusion_planner.loss import _require_finite
 # decoder.py 상단 import 섹션에 추가
 from diffusion_planner.model.module.pram_wosac import (
@@ -26,7 +23,6 @@ from diffusion_planner.model.module.feasible import FeasibleProjector
 from diffusion_planner.loss import AMP_DTYPE
 import diffusion_planner.model.diffusion_utils.dpm_solver_pytorch as dpm
 
-from typing import NamedTuple
 
 # decoder.py 또는 feasible.py 상단 import 근처에 추가
 import time
@@ -34,9 +30,9 @@ from contextlib import contextmanager
 from typing import Iterator
 import torch
 from typing import Tuple
-from diffusion_planner.model.module.dit import TimestepEmbedder, DiTBlock, \
-    FlashAttnKVCache
-
+import math
+import torch.nn.functional as F
+from diffusion_planner.model.module.dit import TimestepEmbedder
 
 def _infer_fast_compute_dtype(reference_tensor: torch.Tensor) -> torch.dtype:
     """모델이 실제로 계산할 때 쓸 가능성이 큰 dtype을 고릅니다.
@@ -78,6 +74,34 @@ def _prepare_bool_mask_on_device(
         m = m.to(device=device)
     return m
 
+def _prepare_cross_pos_2d_for_dit(
+    cross_pos_2d: torch.Tensor,  # (B, token_num, 9)
+    reference_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """scene token의 (x,y,...) 정보를 DiT에서 바로 쓰기 좋게 정리합니다.
+
+    목표
+    ----
+    - device를 reference_tensor와 동일하게 맞춥니다.
+    - 거리 계산은 float32가 안전하므로 dtype은 float32로 둡니다.
+
+    Args:
+        cross_pos_2d:
+            shape: (B, token_num, 9)
+        reference_tensor:
+            device 기준 텐서. shape: 임의
+
+    Returns:
+        torch.Tensor:
+            shape: (B, token_num, 9)
+            device: reference_tensor.device
+            dtype: float32
+    """
+    if cross_pos_2d.device != reference_tensor.device:
+        cross_pos_2d = cross_pos_2d.to(device=reference_tensor.device)
+    if cross_pos_2d.dtype != torch.float32:
+        cross_pos_2d = cross_pos_2d.to(dtype=torch.float32)
+    return cross_pos_2d
 
 def _prepare_cross_inputs_for_dit(
     cross_c: torch.Tensor,  # (B, token_num, D)
@@ -885,30 +909,34 @@ class Decoder(nn.Module):
         )
 
     def _unpack_encoder_outputs(
-        self,
-        encoder_outputs: Dict[str, torch.Tensor],
+            self,
+            encoder_outputs: Dict[str, torch.Tensor],
     ) -> Tuple[
-            torch.Tensor,
-            torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
-        """ encoder_outputs dict 에서 디코더가 쓰는 텐서들을 꺼낸다.
-
-        Args:
-            encoder_outputs: Encoder 단계에서 만들어진 출력 dict.
+        """encoder_outputs dict 에서 디코더가 쓰는 텐서들을 꺼낸다.
 
         Returns:
-            scene_encoding_token: (B, token_num, D) 장면 토큰.
-            scene_encoding_token_mask: (B, token_num) bool 마스크.
+            scene_encoding_token:
+                (B, token_num, D)
+            scene_encoding_token_mask:
+                (B, token_num)  True=pad
+            scene_encoding_pos_2d:
+                (B, token_num, 9)
         """
         scene_encoding_token: torch.Tensor = encoder_outputs[
             "encoding"]  # (B, token_num, D)
         scene_encoding_token_mask: torch.Tensor = encoder_outputs[
-            "encoding_mask"]  # (B, token_num) bool
+            "encoding_mask"]  # (B, token_num) True=pad
+        scene_encoding_pos_2d: torch.Tensor = encoder_outputs[
+            "encoding_pos_2d"]  # (B, token_num, 9)
         return (
             scene_encoding_token,
             scene_encoding_token_mask,
+            scene_encoding_pos_2d,
         )
-
     def _build_inference_xT_from_noise(
         self,
         noise: torch.Tensor,  # (B,(1+)Pnn,T,4 or 3)
@@ -1219,30 +1247,28 @@ class Decoder(nn.Module):
         return t_eff
 
     def _build_classifier_kwargs_for_guidance(
-        self,
-        *,
-        target_agents_past: Optional[torch.Tensor],
-        scene_encoding_token: torch.Tensor,  # (B, token_num, D)
-        scene_encoding_token_mask: torch.Tensor,  # (B, token_num)
-        target_past_cur_future_valid: torch.
-        Tensor,  # (B, (1+)Pnn, time_len_total)
-        inputs: Dict[str, torch.Tensor],
+            self,
+            *,
+            target_agents_past: Optional[torch.Tensor],
+            scene_encoding_token: torch.Tensor,  # (B, token_num, D)
+            scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
+            scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
+            target_past_cur_future_valid: torch.Tensor,
+            # (B, (1+)Pnn, time_len_total)
+            inputs: Dict[str, torch.Tensor],
     ) -> Dict[str, object]:
         """guidance 함수가 필요로 하는 부가 정보를 한 번에 구성합니다.
 
-        이 함수는
-            DPM-Solver 경로(diffusion_steps>1) 와
-            amortized 1-step 경로(diffusion_steps==1) 에서
-        **같은 형태의 classifier_kwargs**를 쓰도록 만들기 위한 공통 유틸입니다.
         Returns:
             Dict[str, object]:
-                GuidanceWrapper가 받는 **classifier_kwargs** dict.
+                GuidanceWrapper가 받는 classifier_kwargs dict.
         """
         model_condition: Dict[str, Any] = {
             "target_agents_past": target_agents_past,
             "target_past_cur_future_valid": target_past_cur_future_valid,
             "cross_c": scene_encoding_token,
             "cross_mask": scene_encoding_token_mask,
+            "cross_pos_2d": scene_encoding_pos_2d,  # ✅ (B, token_num, 9)
         }
 
         classifier_kwargs: Dict[str, object] = {
@@ -1402,205 +1428,130 @@ class Decoder(nn.Module):
         return grad.detach()  # (B,P,F) float32
 
     def _run_dpm_sampler_for_inference(
-        self,
-        xT: torch.Tensor,
-        target_agents_past: Optional[torch.Tensor],
-        target_seq_past: Optional[
-            torch.
-            Tensor],  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-        scene_encoding_token: torch.Tensor,
-        scene_encoding_token_mask: torch.Tensor,
-        target_past_cur_future_valid: torch.Tensor,
-        inputs: Dict[str, torch.Tensor],
-        correcting_xt_fn: Callable[[torch.Tensor, torch.Tensor, int],
-                                   torch.Tensor],
-        diffusion_steps: int,
+            self,
+            xT: torch.Tensor,
+            target_agents_past: Optional[torch.Tensor],
+            target_seq_past: Optional[torch.Tensor],
+            scene_encoding_token: torch.Tensor,
+            scene_encoding_token_mask: torch.Tensor,
+            scene_encoding_pos_2d: torch.Tensor,  # ✅ 추가 (B, token_num, 9)
+            target_past_cur_future_valid: torch.Tensor,
+            inputs: Dict[str, torch.Tensor],
+            correcting_xt_fn: Callable[
+                [torch.Tensor, torch.Tensor, int], torch.Tensor],
+            diffusion_steps: int,
     ) -> torch.Tensor:
-        """dpm_sampler(또는 amortized 1-step)을 통해 최종 샘플 diffusion_sequence(flat)을 얻는다."""
+        """dpm_sampler(또는 amortized 1-step)로 diffusion_sequence(flat)을 얻습니다."""
         classifier_kwargs: Dict[
             str, object] = self._build_classifier_kwargs_for_guidance(
-                target_agents_past=target_agents_past,
-                scene_encoding_token=scene_encoding_token,
-                scene_encoding_token_mask=scene_encoding_token_mask,
-                target_past_cur_future_valid=target_past_cur_future_valid,
-                inputs=inputs,
-            )
+            target_agents_past=target_agents_past,
+            scene_encoding_token=scene_encoding_token,
+            scene_encoding_token_mask=scene_encoding_token_mask,
+            scene_encoding_pos_2d=scene_encoding_pos_2d,  # ✅ 추가
+            target_past_cur_future_valid=target_past_cur_future_valid,
+            inputs=inputs,
+        )
 
-        # -----------------------------
-        # diffusion_steps > 1 (기존 DPM-Solver 경로)
-        # -----------------------------
         if diffusion_steps > 1:
-            """
-            # 2) xT and diffusion_sequence
-            pose_based = True
-                (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-            pose_based = False
-                (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
-            """
             diffusion_sequence: torch.Tensor = dpm_sampler(
                 self.dit,
                 xT.float(),
                 diffusion_steps=diffusion_steps,
                 other_model_params={
-                    "target_agents_past":
-                        target_agents_past,
-                    "target_past_cur_future_valid":
-                        target_past_cur_future_valid,
-                    "cross_c":
-                        scene_encoding_token,
-                    "cross_mask":
-                        scene_encoding_token_mask,
+                    "target_agents_past": target_agents_past,
+                    "target_past_cur_future_valid": target_past_cur_future_valid,
+                    "cross_c": scene_encoding_token,
+                    "cross_mask": scene_encoding_token_mask,
+                    "cross_pos_2d": scene_encoding_pos_2d,  # ✅ 여기 NameError 방지
                 },
-                dpm_solver_params={
-                    "correcting_xt_fn": correcting_xt_fn,
-                },
+                dpm_solver_params={"correcting_xt_fn": correcting_xt_fn},
                 model_wrapper_params={
-                    "classifier_fn":
-                        self._guidance_fn,
-                    "classifier_kwargs":
-                        classifier_kwargs,
-                    "guidance_scale":
-                        self.config.guidance_scale,
-                    "guidance_type": ("classifier" if self._guidance_fn
-                                      is not None else "uncond"),
+                    "classifier_fn": self._guidance_fn,
+                    "classifier_kwargs": classifier_kwargs,
+                    "guidance_scale": self.config.guidance_scale,
+                    "guidance_type": (
+                        "classifier" if self._guidance_fn is not None else "uncond"),
                 },
             )
-            if self.config.use_amortized_diffusion:
-                """ 2. WARM-UP step
-                1. diffusion_sequence 에 다시 noise를 준다.
-                2. buffer에 저장한다.
-                """
-                B, one_or_Pnn, _ = diffusion_sequence.shape
-                target_current_xyyaw = target_agents_past[:, :, -1, :
-                                                          4]  # (B,(1+)Pnn,4)
-                # amortized_random_noise: (B*R, (1+)Pnn, future_len, 4 or 3)
-                amortized_random_noise = self._get_amortized_random_noise_from_inputs(
-                    inputs=inputs,
-                    batch_size=int(B),
-                    one_or_Pnn=int(one_or_Pnn),
-                    target_current_xyyaw=target_current_xyyaw,
-                )
-                """
-                # 2) xT and diffusion_sequence
-                pose_based = True
-                    (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-                pose_based = False
-                    (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
-                """
-                # 6) diffusion_cur_future_sequence: (B, (1+)Pnn, 1+T, 4) / (B, (1+)Pnn, T, 3)
-                diffusion_cur_future_sequence: torch.Tensor = self._reshape_inference_x0_to_sequence(
-                    diffusion_sequence=diffusion_sequence,
-                    target_current_xyyaw=target_current_xyyaw,
-                    # (B, (1+)Pnn, 4)
-                )
-                diffusion_future_sequence = diffusion_cur_future_sequence[:, :, -(
-                    self.config.future_len):, :]
-                # noise_future_sequence ; (B,(1+)Pnn,T,4 or 3)
-                self._set_amortized_buffer_from_sequence(
-                    diffusion_future_sequence=diffusion_future_sequence,
-                    # (B*R, (1+)Pnn, T, 4 or 3)
-                    random_noise=
-                    amortized_random_noise,  # (B*R, (1+)Pnn, future_len, 4or 3)
-                    do_shift=False,
-                )
-                """
-                # 2) xT(flat) 생성
-                pose_based = True
-                    (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-                pose_based = False
-                    (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
-                """
-                xT: torch.Tensor = self._build_inference_xT_from_noise(
-                    noise=self._amortized_buffer,  # (B,(1+)Pnn,T,4 or 3)
-                    target_seq_past=target_seq_past,
-                    # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-                )  # (B,Pnn,F)
-                xT = self._mask_zero_at_invalid_timestep_in_seq_flat(
-                    x_flat=xT,
-                    target_past_cur_future_valid=target_past_cur_future_valid,
-                    # (B, (1+)Pnn, time_len + future_len)
-                )
-                diffusion_steps = 1
-            else:
+            if not self.config.use_amortized_diffusion:
                 return diffusion_sequence
 
-        # -----------------------------
-        # diffusion_steps == 1 (amortized 1-step)
-        # 4.1 & 4.2
-        # -----------------------------
-        assert diffusion_steps == 1, "diffusion_steps must be >= 1"
-        B: int = int(xT.shape[0])
-        xT_f32: torch.Tensor = xT.float()  # (B, Pnn, F)
+            # amortized warm-up 로직은 네 코드 그대로 이어짐...
+            # (중요) 아래 amortized 1-step에서 self.dit 호출할 때도 cross_pos_2d를 넘겨야 함
+            B, one_or_Pnn, _ = diffusion_sequence.shape
+            target_current_xyyaw = target_agents_past[:, :, -1, :4]
+            amortized_random_noise = self._get_amortized_random_noise_from_inputs(
+                inputs=inputs,
+                batch_size=int(B),
+                one_or_Pnn=int(one_or_Pnn),
+                target_current_xyyaw=target_current_xyyaw,
+            )
 
-        # t_tau: (B, future_len)
-        t_tau: torch.Tensor = self._build_amortized_t_tau(
-            batch_size=B,
-            reference_tensor_for_device=xT_f32,
-        )
+            diffusion_cur_future_sequence = self._reshape_inference_x0_to_sequence(
+                diffusion_sequence=diffusion_sequence,
+                target_current_xyyaw=target_current_xyyaw,
+            )
+            diffusion_future_sequence = diffusion_cur_future_sequence[
+                :, :, -(self.config.future_len):, :]
 
-        # low_t_mask: (B,)  amortized에서는 feasible을 항상 실행시키기 위한 마스크(기존 의도 유지)
-        low_t_mask: torch.Tensor = torch.ones((B,),
-                                              dtype=torch.bool,
-                                              device=xT.device)
+            self._set_amortized_buffer_from_sequence(
+                diffusion_future_sequence=diffusion_future_sequence,
+                random_noise=amortized_random_noise,
+                do_shift=False,
+            )
 
-        # (1) 모델 1회 호출: diffusion_output (flat)
-        """
-        # 2) diffusion_output and xT_f32
-        pose_based = True
-            (B, (1+)Pnn, (time_len+T)*4) or (B, (1+)Pnn, (1+T)*4) or (B, Pnn, T*4)
-        pose_based = False
-            (B, (1+)Pnn, (past_len+T)*3) or (B, (1+)Pnn, (T)*3)
-        """
+            xT = self._build_inference_xT_from_noise(
+                noise=self._amortized_buffer,
+                target_seq_past=target_seq_past,
+            )
+            xT = self._mask_zero_at_invalid_timestep_in_seq_flat(
+                x_flat=xT,
+                target_past_cur_future_valid=target_past_cur_future_valid,
+            )
+            diffusion_steps = 1
 
-        # (1) 모델 1회 호출 (side-effect로 self.dit.diffusion_sequence_flat = x0 후보가 채워짐)
+        # -------- diffusion_steps == 1 (amortized 1-step) --------
+        assert diffusion_steps == 1
+        B = int(xT.shape[0])
+        xT_f32 = xT.float()
+
+        t_tau = self._build_amortized_t_tau(batch_size=B,
+                                            reference_tensor_for_device=xT_f32)
+        low_t_mask = torch.ones((B,), dtype=torch.bool, device=xT.device)
+
         _ = self.dit(
-            target_input_norm_xT=xT_f32,  # (B, Pnn, F)
-            diffusion_time=t_tau,  # (B, future_len)
+            target_input_norm_xT=xT_f32,
+            diffusion_time=t_tau,
             target_agents_past=target_agents_past,
             target_past_cur_future_valid=target_past_cur_future_valid,
             cross_c=scene_encoding_token,
             cross_mask=scene_encoding_token_mask,
+            cross_pos_2d=scene_encoding_pos_2d,  # ✅ 여기 NameError 방지
             low_t_mask=low_t_mask,
         )
 
-        # (2) denoise_to_zero 역할: DiT가 저장해둔 x0 후보(flat)를 가져온다.
-        x0_base_flat = self.dit.diffusion_sequence_flat
-        x0_base_flat = x0_base_flat.to(device=xT_f32.device,
-                                       dtype=torch.float32)  # (B,P,F)
+        x0_base_flat = self.dit.diffusion_sequence_flat.to(device=xT_f32.device,
+                                                           dtype=torch.float32)
+        t_eff = self._compute_amortized_t_eff(t_tau).to(device=xT_f32.device,
+                                                        dtype=torch.float32)
 
-        # (3) guidance/correction에 쓸 대표 시간 t_eff: (B,)
-        t_eff: torch.Tensor = self._compute_amortized_t_eff(t_tau).to(
-            device=xT_f32.device, dtype=torch.float32)  # (B,)
-
-        # (4) (옵션) classifier guidance를 x0에 반영
-        x0_guided_flat: torch.Tensor = x0_base_flat
+        x0_guided_flat = x0_base_flat
         guidance_scale: float = float(
             getattr(self.config, "guidance_scale", 0.0))
-
         if (self._guidance_fn is not None) and (guidance_scale != 0.0):
-            # grad: (B,P,F) float32
-            grad: torch.Tensor = self._compute_guidance_grad_wrt_x(
-                x_t_flat=xT_f32,  # DPM-Solver에서의 x_t 역할
-                t_eff=t_eff,  # 대표 시간
+            grad = self._compute_guidance_grad_wrt_x(
+                x_t_flat=xT_f32,
+                t_eff=t_eff,
                 classifier_kwargs=classifier_kwargs,
             )
-
-            # scale: (B,1,1) float32
-            sigma2_over_alpha: torch.Tensor = self._compute_sigma2_over_alpha_for_guidance(
+            sigma2_over_alpha = self._compute_sigma2_over_alpha_for_guidance(
                 t_eff=t_eff,
                 reference_tensor_for_device=xT_f32,
             )
+            x0_guided_flat = x0_base_flat + (
+                        guidance_scale * sigma2_over_alpha) * grad
 
-            # x0_guided = x0_base + guidance_scale * (sigma^2/alpha) * grad
-            x0_guided_flat = x0_base_flat + (guidance_scale *
-                                             sigma2_over_alpha) * grad
-
-        # (5) correcting_xt_fn을 마지막에 1회 호출 (마스크/현재상태 주입/단위원 정리 포함)
-        diffusion_sequence: torch.Tensor = correcting_xt_fn(
-            x0_guided_flat.detach(),  # (B,P,F)
-            t_eff,  # (B,)
-            0,  # step
-        )
+        diffusion_sequence = correcting_xt_fn(x0_guided_flat.detach(), t_eff, 0)
         return diffusion_sequence
 
     def _reshape_inference_x0_to_sequence(
@@ -1711,113 +1662,62 @@ class Decoder(nn.Module):
                     control_sequence, integrated_trajectory)
 
     def _forward_training_mode(
-        self,
-        inputs: Dict[str, torch.Tensor],
-        scene_encoding_token: torch.Tensor,
-        scene_encoding_token_mask: torch.Tensor,
-        target_agents_past: torch.Tensor,  # (B, (1+)Pnn, time_len, 11)
-        target_seq_past: torch.
-        Tensor,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-        target_past_cur_future_valid: torch.
-        Tensor,  # (B, (1+)Pnn, time_len + future_len)
-        batch_size: int,
-        one_or_Pnn: int,
+            self,
+            inputs: Dict[str, torch.Tensor],
+            scene_encoding_token: torch.Tensor,
+            scene_encoding_token_mask: torch.Tensor,
+            scene_encoding_pos_2d: torch.Tensor,  # ✅ 추가
+            target_agents_past: torch.Tensor,
+            target_seq_past: torch.Tensor,
+            target_past_cur_future_valid: torch.Tensor,
+            batch_size: int,
+            one_or_Pnn: int,
     ) -> Dict[str, torch.Tensor]:
         """훈련 모드에서 한 배치에 대해 decoder 를 한 번 돌린다."""
         decoder_output_dict: Dict[str, torch.Tensor] = {}
 
         B: int = batch_size
-        diffusion_time: torch.Tensor = inputs[
-            "diffusion_time"]  # (B,) or (B, future_len)
+        diffusion_time: torch.Tensor = inputs["diffusion_time"]
 
-        # 1) DiT 입력 준비 (flatten + 목표점 주입 옵션)
-        """ xT_input_flat
-        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, (future_len)*4)
-        (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
-        """
-        xT_input_flat = self._build_training_dit_inputs(
-            inputs=inputs,
-            target_seq_past=
-            target_seq_past,  # (B, (1+)Pnn, (time_len, 4) or (past_len(=time_len-1), 3))
-        )
-        """ xT_input_flat (input / output)
-        (B, (1+)Pnn, (time_len+future_len)*4) or (B, (1+)Pnn, (1+future_len)*4) or (B, (1+)Pnn, (future_len)*4)
-        (B, (1+)Pnn, (past_len + future_len)*3) or (B, (1+)Pnn, (future_len)*3)
-        """
-        # ✅ 추가: DiT 입력에서도 무효 타임스텝 0 처리(실수로 downstream에서 쓰여도 안전)
+        xT_input_flat = self._build_training_dit_inputs(inputs=inputs,
+                                                        target_seq_past=target_seq_past)
         xT_input_flat = self._mask_zero_at_invalid_timestep_in_seq_flat(
             x_flat=xT_input_flat,
-            target_past_cur_future_valid=
-            target_past_cur_future_valid,  # (B, (1+)Pnn, time_len + future_len)
-        )
-        # ✅ (B) diffusion_time: 미리 GPU float32로 맞춤 (DiT 내부 .to()가 no-op 되도록)
-        diffusion_time = _prepare_diffusion_time_for_dit(
-            diffusion_time=diffusion_time,  # (B,) or (B,future_len)
-            reference_tensor=xT_input_flat,  # device 기준
+            target_past_cur_future_valid=target_past_cur_future_valid,
         )
 
-        # ✅ (C) low_t_mask도 bool + 같은 device로 (필요하면만) 변환
-        low_t_mask_in: torch.Tensor = inputs["low_t_mask"]  # (B,) bool/0-1
-        low_t_mask: torch.Tensor = _prepare_bool_mask_on_device(
-            low_t_mask_in,
-            device=xT_input_flat.device,
-        )  # (B,) bool
-        """ diffusion_output / xT_input_flat
-        if pose_based
-            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-        else
-            (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
-        """
+        diffusion_time = _prepare_diffusion_time_for_dit(
+            diffusion_time=diffusion_time, reference_tensor=xT_input_flat)
+        low_t_mask = _prepare_bool_mask_on_device(inputs["low_t_mask"],
+                                                  device=xT_input_flat.device)
+
         diffusion_output: torch.Tensor = self.dit(
             target_input_norm_xT=xT_input_flat,
-            diffusion_time=diffusion_time,  # (B,)  or (B, future_len)
+            diffusion_time=diffusion_time,
             target_agents_past=target_agents_past,
-            # # (B, (1+)Pnn, time_len, 11)
             target_past_cur_future_valid=target_past_cur_future_valid,
-            # (B, (1+)Pnn, time_len+future_len)
-            cross_c=scene_encoding_token,  # (B, token_num, D)
-            cross_mask=scene_encoding_token_mask,  # (B, token_num)
+            cross_c=scene_encoding_token,
+            cross_mask=scene_encoding_token_mask,
+            cross_pos_2d=scene_encoding_pos_2d,  # ✅ 여기 NameError 방지
             low_t_mask=low_t_mask,
         )
         _require_finite("decoder_dit_output", diffusion_output)
-        # (B, (1+)Pnn, 4)
+
         target_current_xyyaw = target_agents_past[:, :, -1, :4]
-        """ diffusion_output / xT_input_flat
-        if pose_based
-            (B, (1+)Pnn, (time_len+ T) *4) or (B, (1+)Pnn, T*4) or (B, (1+)Pnn, (1+T)*4)
-        else
-            (B, (1+)Pnn, (past_len + T) *4) or (B, (1+)Pnn, T*4)
-        """
-        # 3) (B,(1+)Pnn,F_out) ->
-        # diffusion_future_output : (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
         diffusion_future_output: torch.Tensor = self._extract_future_from_diffusion_output(
             diffusion_output=diffusion_output,
             batch_size=B,
             one_or_Pnn=one_or_Pnn,
         )
-        decoder_output_dict[
-            "diffusion_output"] = diffusion_future_output  # (B,(1+)Pnn,T,4) or (B, (1+)Pnn, T, 3)
-        """ decoder_output_dict
-        diffusion_output : (B, (1+)Pnn, 1+T, 4) or (B, (1+)Pnn, T, 3)
-        diffusion_sequence
-            pose_based:
-                (B, (1+)Pnn, (1+T),4)
-            else:
-                (B, (1+)Pnn, T,3)
-        "integrated_trajectory" : (B, (1+)Pnn, 1+T, 4)
-        "control_constraint_diff" : (B, (1+)Pnn, T, 3)
-        "control_sequence" : (B, (1+)Pnn, T, 3)
-        """
+        decoder_output_dict["diffusion_output"] = diffusion_future_output
         decoder_output_dict[
             "diffusion_sequence"] = self.dit.norm_dit_returns.diffusion_sequence
-        # 4) feasible 출력 추가(옵션)
+
         self._append_training_feasible_outputs(
             decoder_output_dict=decoder_output_dict,
-            target_current_xyyaw=target_current_xyyaw,  # (B, (1+)Pnn, 4)
+            target_current_xyyaw=target_current_xyyaw,
         )
-
         return decoder_output_dict
-
     # =========================================================
     # 3) Decoder._set_amortized_buffer_from_sequence 를 교체
     # =========================================================
@@ -2487,16 +2387,20 @@ class Decoder(nn.Module):
             one_or_Pnn,
         ) = self._prepare_target_trajectories_and_masks(inputs)
         (
-            scene_encoding_token,  # (B, token_num, D)
-            scene_encoding_token_mask,  # (B, token_num)
-        ) = self._unpack_encoder_outputs(encoder_outputs=encoder_outputs,)
-        # ✅ (A) cross_c / (C) cross_mask 를 DiT 호출 전에 미리 정리
-        # - training에서 작은 dtype 계산을 쓰는 경우(bf16/fp16), 여기서 맞춰 두면
-        #   DiT 내부의 _cast_like(cross_c, x)가 복사 없이 끝납니다.
+            scene_encoding_token,
+            scene_encoding_token_mask,
+            scene_encoding_pos_2d,
+        ) = self._unpack_encoder_outputs(encoder_outputs=encoder_outputs)
+
         scene_encoding_token, scene_encoding_token_mask = _prepare_cross_inputs_for_dit(
-            cross_c=scene_encoding_token,  # (B, token_num, D)
-            cross_mask=scene_encoding_token_mask,  # (B, token_num)
-            reference_tensor=target_agents_past,  # device/dtype 기준
+            cross_c=scene_encoding_token,
+            cross_mask=scene_encoding_token_mask,
+            reference_tensor=target_agents_past,
+        )
+
+        scene_encoding_pos_2d = _prepare_cross_pos_2d_for_dit(
+            cross_pos_2d=scene_encoding_pos_2d,  # (B, token_num, 9)
+            reference_tensor=target_agents_past,  # device 기준
         )
 
         if self.training:
@@ -2511,6 +2415,7 @@ class Decoder(nn.Module):
                 inputs=inputs,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
+                scene_encoding_pos_2d=scene_encoding_pos_2d,  # ✅ 추가
                 target_agents_past=
                 target_agents_past,  # (B, (1+)Pnn, time_len, 11)
                 target_seq_past=
@@ -2531,6 +2436,8 @@ class Decoder(nn.Module):
                 inputs=inputs,
                 scene_encoding_token=scene_encoding_token,
                 scene_encoding_token_mask=scene_encoding_token_mask,
+                scene_encoding_pos_2d=scene_encoding_pos_2d,  # ✅ 추가
+
                 target_agents_past=target_agents_past,
                 # (B, (1+)Pnn, time_len, 11)
                 target_seq_past=target_seq_past,
@@ -2559,6 +2466,337 @@ class DiTReturns:
     control_constraint_diff: Optional[torch.Tensor] = None  # (B, Pnn, T, 3)
     control_sequence: Optional[torch.Tensor] = None  # (B, Pnn, T, 3)
 
+class SimpleSelfAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        heads: int,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % heads != 0:
+            raise ValueError(f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}")
+        self.heads = int(heads)
+        self.head_dim = int(hidden_dim // heads)
+        self.qkv = nn.Linear(hidden_dim, hidden_dim * 3, bias=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.attn_drop = float(attn_drop)
+        self.proj_drop = nn.Dropout(float(proj_drop))
+
+    def forward(
+        self,
+        x: torch.Tensor,  # (B, P, H)
+        key_padding_mask: torch.Tensor,  # (B, P) True=pad
+    ) -> torch.Tensor:
+        """agent self-attention.
+
+        Args:
+            x:
+                shape: (B, P, H)
+            key_padding_mask:
+                shape: (B, P), True=pad
+
+        Returns:
+            torch.Tensor:
+                shape: (B, P, H)
+        """
+        if x.dim() != 3:
+            raise ValueError(f"x must be (B,P,H). got {tuple(x.shape)}")
+        B, P, H = x.shape
+
+        if key_padding_mask.dtype != torch.bool:
+            key_padding_mask = key_padding_mask.to(torch.bool)
+
+        qkv = self.qkv(x)  # (B, P, 3H)
+        qkv = qkv.view(B, P, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)  # (3,B,heads,P,hd)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, heads, P, hd)
+
+        # key padding mask -> attn_mask (B,1,1,P), True=mask
+        attn_mask = key_padding_mask[:, None, None, :]  # (B,1,1,P)
+
+        drop_p = self.attn_drop if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=float(drop_p),
+            is_causal=False,
+        )  # (B, heads, P, hd)
+
+        out = out.transpose(1, 2).contiguous().view(B, P, H)  # (B, P, H)
+        out = self.out_proj(out)
+        out = self.proj_drop(out)
+        return out
+
+
+class TopKScoreBiasedCrossAttention(nn.Module):
+    def __init__(
+        self,
+        config,
+        hidden_dim: int,
+        heads: int,
+        proj_drop: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % heads != 0:
+            raise ValueError(f"hidden_dim must be divisible by heads. hidden_dim={hidden_dim}, heads={heads}")
+
+        # --- hyper (config 없으면 기본값) ---
+        self.topk_k: int = int(getattr(config, "ca_topk_k", 256))
+        self.s_d: float = float(getattr(config, "ca_topk_s_d", 10.0))
+        self.neg_value: float = float(getattr(config, "ca_topk_neg", -1e4))
+        self.eps: float = float(getattr(config, "ca_topk_eps", 1e-6))
+        self.agent_chunk_size: int = int(getattr(config, "ca_topk_agent_chunk_size", 64))
+
+        self.heads = int(heads)
+        self.head_dim = int(hidden_dim // heads)
+        self.scale = 1.0 / math.sqrt(float(self.head_dim))
+
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.proj_drop = nn.Dropout(float(proj_drop))
+
+    def forward(
+        self,
+        *,
+        query: torch.Tensor,  # (B, P, H)
+        agent_pose4: torch.Tensor,  # (B, P, 4)
+        target_current_mask: torch.Tensor,  # (B, P) True=pad
+        scene_encoding_token: torch.Tensor,  # (B, token_num, H)
+        scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
+        scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
+        score_beta: torch.Tensor,  # scalar parameter
+    ) -> torch.Tensor:
+        """거리 기반 top-K 선택 + score bias를 logits에 더하는 cross-attention.
+
+        핵심 규칙
+        --------
+        - score = -(dist / s_d)
+        - pad 토큰/에이전트는 score를 neg_value(유한)로 눌러서 NaN 위험 제거
+        - 선택된 K에 대해서만 attention 수행
+
+        Returns:
+            out:
+                shape: (B, P, H)
+        """
+        if query.dim() != 3:
+            raise ValueError(f"query must be (B,P,H). got {tuple(query.shape)}")
+        if agent_pose4.dim() != 3 or int(agent_pose4.shape[-1]) != 4:
+            raise ValueError(f"agent_pose4 must be (B,P,4). got {tuple(agent_pose4.shape)}")
+        if scene_encoding_token.dim() != 3:
+            raise ValueError(f"scene_encoding_token must be (B,token_num,H). got {tuple(scene_encoding_token.shape)}")
+        if scene_encoding_pos_2d.dim() != 3 or int(scene_encoding_pos_2d.shape[-1]) != 9:
+            raise ValueError(f"scene_encoding_pos_2d must be (B,token_num,9). got {tuple(scene_encoding_pos_2d.shape)}")
+
+        if target_current_mask.dtype != torch.bool:
+            target_current_mask = target_current_mask.to(torch.bool)
+        if scene_encoding_token_mask.dtype != torch.bool:
+            scene_encoding_token_mask = scene_encoding_token_mask.to(torch.bool)
+
+        B, P, H = query.shape
+        token_num: int = int(scene_encoding_token.shape[1])
+
+        # 토큰이 아예 없으면(거의 없겠지만) 그냥 0 반환
+        if token_num <= 0 or self.topk_k <= 0:
+            return query.new_zeros((B, P, H))
+
+        K: int = min(int(self.topk_k), token_num)
+        s_d: float = max(float(self.s_d), 1e-6)
+        NEG: float = float(self.neg_value)
+
+        # token_xy: (B, token_num, 2)
+        token_xy: torch.Tensor = scene_encoding_pos_2d[:, :, 0:2].to(
+            device=query.device, dtype=torch.float32
+        )
+        token_x: torch.Tensor = token_xy[:, :, 0]  # (B, token_num)
+        token_y: torch.Tensor = token_xy[:, :, 1]  # (B, token_num)
+
+        out_all = query.new_zeros((B, P, H))  # (B, P, H)
+
+        chunk: int = max(1, int(self.agent_chunk_size))
+        beta_f32: torch.Tensor = score_beta.to(device=query.device, dtype=torch.float32)
+
+        for start in range(0, P, chunk):
+            end = min(P, start + chunk)
+
+            q_chunk = query[:, start:end, :]  # (B, Pc, H)
+            pose_chunk = agent_pose4[:, start:end, :]  # (B, Pc, 4)
+            agent_pad_chunk = target_current_mask[:, start:end]  # (B, Pc)
+
+            # agent_xy: (B, Pc, 2)
+            agent_xy = pose_chunk[..., 0:2].to(torch.float32)
+            agent_x = agent_xy[..., 0]  # (B, Pc)
+            agent_y = agent_xy[..., 1]  # (B, Pc)
+
+            # dx, dy: (B, Pc, token_num)
+            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)
+            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)
+
+            # dist: (B, Pc, token_num)
+            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))
+
+            # score: (B, Pc, token_num)
+            score = -(dist / s_d)
+
+            # pad 토큰 제외(유한 NEG)
+            score = score.masked_fill(scene_encoding_token_mask.unsqueeze(1), NEG)
+            # pad agent 제외(유한 NEG)
+            score = score.masked_fill(agent_pad_chunk.unsqueeze(-1), NEG)
+
+            # topk_idx: (B, Pc, K)
+            topk_idx = torch.topk(score, k=K, dim=-1, largest=True).indices
+
+            # score_keep: (B, Pc, K)
+            score_keep = torch.gather(score, dim=-1, index=topk_idx)  # float32
+
+            # sel_pad_mask: (B, Pc, K) True=pad
+            sel_pad_mask = scene_encoding_token_mask.unsqueeze(1).expand(
+                B, end - start, token_num
+            ).gather(dim=2, index=topk_idx)
+
+            # kv_sel: (B, Pc, K, H)
+            scene_exp = scene_encoding_token.unsqueeze(1).expand(B, end - start, token_num, H)
+            idx_exp = topk_idx.unsqueeze(-1).expand(B, end - start, K, H)
+            kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)
+            kv_sel = kv_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
+
+            # ---- attention ----
+            q_lin = self.q_proj(q_chunk)  # (B,Pc,H)
+            k_lin = self.k_proj(kv_sel)   # (B,Pc,K,H)
+            v_lin = self.v_proj(kv_sel)   # (B,Pc,K,H)
+
+            Pc = int(end - start)
+
+            # reshape to heads
+            qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1, 3)  # (B,h,Pc,hd)
+            kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
+            vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
+
+            qf = qh.to(torch.float32)
+            kf = kh.to(torch.float32)
+
+            # logits: (B,h,Pc,K)
+            logits = (qf.unsqueeze(3) * kf).sum(dim=-1) * float(self.scale)
+
+            # bias: (B,1,Pc,K)
+            logits = logits + beta_f32 * score_keep.unsqueeze(1)
+
+            # pad 선택은 logits에서 강하게 마스킹(유한값)
+            logits = logits.masked_fill(sel_pad_mask.unsqueeze(1), NEG)
+
+            attn = torch.softmax(logits, dim=-1)  # (B,h,Pc,K)
+
+            vf = vh.to(torch.float32)
+            out = (attn.unsqueeze(-1) * vf).sum(dim=3)  # (B,h,Pc,hd)
+
+            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc, H)  # (B,Pc,H)
+            out = out.to(dtype=q_chunk.dtype)
+
+            out = self.out_proj(out)
+            out = self.proj_drop(out)
+
+            # pad agent는 0
+            out = out.masked_fill(agent_pad_chunk.unsqueeze(-1), 0.0)
+
+            out_all[:, start:end, :] = out
+
+        return out_all
+
+
+class DiTBlock(nn.Module):
+    def __init__(
+        self,
+        config,
+        hidden_dim: int,
+        heads: int,
+        dropout: float,
+        mlp_ratio: float = 4.0,
+    ) -> None:
+        super().__init__()
+        self.norm_sa = nn.LayerNorm(hidden_dim)
+        self.norm_ca = nn.LayerNorm(hidden_dim)
+        self.norm_ffn = nn.LayerNorm(hidden_dim)
+
+        self.sa = SimpleSelfAttention(hidden_dim=hidden_dim, heads=heads)
+        self.ca = TopKScoreBiasedCrossAttention(config=config, hidden_dim=hidden_dim, heads=heads)
+
+        mlp_hidden = int(hidden_dim * float(mlp_ratio))
+        self.mlp = Mlp(
+            in_features=hidden_dim,
+            hidden_features=mlp_hidden,
+            out_features=hidden_dim,
+            act_layer=nn.GELU,
+            drop=0.0,
+        )
+
+        drop_path_rate = float(dropout)
+        self.drop_path_sa = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.drop_path_ca = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.drop_path_ffn = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+
+    @staticmethod
+    def _apply_modulation(
+        x_norm: torch.Tensor,  # (B,P,H)
+        mod: ModulationTriplet,  # delta_scale/shift/gate: (B,P,H)
+    ) -> torch.Tensor:
+        return x_norm * (1.0 + mod.delta_scale) + mod.shift
+
+    def forward(
+        self,
+        *,
+        x: torch.Tensor,  # (B, P, H)
+        target_current_mask: torch.Tensor,  # (B, P) True=pad
+        cross_c: torch.Tensor,  # (B, token_num, H)
+        cross_mask: torch.Tensor,  # (B, token_num) True=pad
+        cross_pos_2d: torch.Tensor,  # (B, token_num, 9)
+        agent_pose4: torch.Tensor,  # (B, P, 4)
+        ca_score_beta: torch.Tensor,  # scalar
+        pram_v2_modulations: Dict[str, ModulationTriplet],
+    ) -> torch.Tensor:
+        """SA + CA(topK+bias) + FFN 블록.
+
+        Returns:
+            x_out:
+                shape: (B, P, H)
+        """
+        if target_current_mask.dtype != torch.bool:
+            target_current_mask = target_current_mask.to(torch.bool)
+
+        # ---- SA ----
+        sa_mod = pram_v2_modulations["SA"]
+        h = self.norm_sa(x)
+        h = self._apply_modulation(h, sa_mod)  # (B,P,H)
+        sa_out = self.sa(h, key_padding_mask=target_current_mask)  # (B,P,H)
+        sa_out = sa_out * sa_mod.gate
+        x = x + self.drop_path_sa(sa_out)
+
+        # ---- CA ----
+        ca_mod = pram_v2_modulations["CA"]
+        h = self.norm_ca(x)
+        h = self._apply_modulation(h, ca_mod)  # (B,P,H)
+        ca_out = self.ca(
+            query=h,
+            agent_pose4=agent_pose4,
+            target_current_mask=target_current_mask,
+            scene_encoding_token=cross_c,
+            scene_encoding_token_mask=cross_mask,
+            scene_encoding_pos_2d=cross_pos_2d,
+            score_beta=ca_score_beta,
+        )  # (B,P,H)
+        ca_out = ca_out * ca_mod.gate
+        x = x + self.drop_path_ca(ca_out)
+
+        # ---- FFN ----
+        ffn_mod = pram_v2_modulations["FFN"]
+        h = self.norm_ffn(x)
+        h = self._apply_modulation(h, ffn_mod)
+        ffn_out = self.mlp(h)
+        ffn_out = ffn_out * ffn_mod.gate
+        x = x + self.drop_path_ffn(ffn_out)
+
+        return x
 
 class DiT(nn.Module):
 
@@ -2694,59 +2932,34 @@ class DiT(nn.Module):
         #################
         self._sde = sde
         self.marginal_prob_std = self._sde.marginal_prob_std
+        self.ca_score_beta = nn.Parameter(torch.tensor(0.0))
 
     from typing import Optional
 
-    def _build_ca_gate_type_logit_bias_packed(
+    def _build_ca_gate_type_logit_bias(
             self,
             *,
             target_current_11_dim: torch.Tensor,  # (B, P, 11)
-            agent_indices: torch.Tensor,  # (T,)  unpad 인덱스(b*P + p)
-            reference_tensor: torch.Tensor,  # dtype/device 기준
+            target_current_mask: torch.Tensor,  # (B, P) True=pad
+            reference_tensor: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        """에이전트 타입에 따라 CA 게이트(logit)에 더할 bias를 packed 형태로 만듭니다.
-
-        이 bias는 "CA 경로"에만 더해집니다(= SA/FFN에는 영향 없음).
-
-        입력/출력 shape
-        - target_current_11_dim: (B, P, 11)
-          - type one-hot은 [:, :, 8:11] (3개) 라고 가정합니다. (vehicle/ped/bicycle)
-        - agent_indices: (T,)  (unpad된 유효 에이전트 토큰의 flatten 인덱스)
-        - 반환: (1, 1, T, 1)  (gate logit에 브로드캐스트로 더하기 좋게)
-
-        config로 조절(없으면 기본값 사용)
-        - pram_ca_type_gate_bias_enabled: bool (기본 True)
-        - pram_ca_vehicle_gate_logit_bias: float (기본 +1.0)
-        - pram_ca_ped_gate_logit_bias: float (기본 +0.0)
-        - pram_ca_bike_gate_logit_bias: float (기본 +0.0)
-
-        Returns:
-            Optional[torch.Tensor]:
-                - enabled면 (1,1,T,1)
-                - disabled거나 T==0이면 None
-        """
+        """에이전트 타입에 따라 CA 게이트(logit)에 더할 bias를 (B,P,1)로 만듭니다."""
         enabled: bool = bool(
             getattr(self.config, "pram_ca_type_gate_bias_enabled", True))
         if not enabled:
             return None
 
-        if agent_indices.numel() == 0:
-            return None
-
         if target_current_11_dim.dim() != 3 or int(
                 target_current_11_dim.shape[-1]) != 11:
             raise ValueError(
-                f"target_current_11_dim must be (B,P,11). got {tuple(target_current_11_dim.shape)}"
-            )
+                f"target_current_11_dim must be (B,P,11). got {tuple(target_current_11_dim.shape)}")
 
-        B: int = int(target_current_11_dim.shape[0])
-        P: int = int(target_current_11_dim.shape[1])
+        if target_current_mask.dtype != torch.bool:
+            target_current_mask = target_current_mask.to(torch.bool)
 
-        # type one-hot: (B,P,3)
         type_one_hot: torch.Tensor = target_current_11_dim[..., 8:11].to(
-            torch.float32)
+            torch.float32)  # (B,P,3)
 
-        # 타입별 logit bias (스칼라)
         veh_b: float = float(
             getattr(self.config, "pram_ca_vehicle_gate_logit_bias", 1.0))
         ped_b: float = float(
@@ -2757,22 +2970,13 @@ class DiT(nn.Module):
         bias_vec = torch.tensor([veh_b, ped_b, bik_b],
                                 device=type_one_hot.device,
                                 dtype=torch.float32)  # (3,)
+        bias_bp = (type_one_hot * bias_vec.view(1, 1, 3)).sum(dim=-1)  # (B,P)
 
-        # (B,P)
-        bias_bp: torch.Tensor = (type_one_hot * bias_vec.view(1, 1, 3)).sum(
-            dim=-1)
+        # pad agent는 0
+        bias_bp = bias_bp.masked_fill(target_current_mask, 0.0)
 
-        # (B*P)
-        bias_flat: torch.Tensor = bias_bp.reshape(B * P)
-
-        idx = agent_indices.to(dtype=torch.long,
-                               device=bias_flat.device)  # (T,)
-        bias_packed: torch.Tensor = bias_flat.index_select(0, idx)  # (T,)
-
-        # (1,1,T,1) + dtype/device 맞춤
-        bias_packed = bias_packed.view(1, 1, -1, 1).to(
-            device=reference_tensor.device, dtype=reference_tensor.dtype)
-        return bias_packed
+        return bias_bp.unsqueeze(-1).to(device=reference_tensor.device,
+                                        dtype=reference_tensor.dtype)  # (B,P,1)
 
     def _get_time_embedding(self, diffusion_time: torch.Tensor,
                             ref: torch.Tensor) -> torch.Tensor:
@@ -2802,178 +3006,6 @@ class DiT(nn.Module):
 
         raise ValueError(
             f"diffusion_time must be (B,) or (B,T). got {tuple(diffusion_time.shape)}"
-        )
-
-    @staticmethod
-    def _unpad_input_with_valid_mask(
-        x: torch.Tensor,  # (B, L, C)
-        valid_mask: torch.Tensor  # (B, L) True=valid
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """flash_attn.bert_padding.unpad_input 결과를 버전 차이(4/5개 반환)와 무관하게 정리합니다.
-
-        Args:
-            x (torch.Tensor): (B, L, C) 입력
-            valid_mask (torch.Tensor): (B, L) True=유효 토큰
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-                - x_unpad: (T, C)
-                - indices: (T,)
-                - cu_seqlens: (B+1,) int32
-                - max_seqlen: int
-        """
-        if valid_mask.dtype != torch.bool:
-            valid_mask = valid_mask.to(torch.bool)
-
-        res = unpad_input(x, valid_mask)
-        if len(res) == 4:
-            x_unpad, indices, cu_seqlens, max_seqlen = res
-        elif len(res) == 5:
-            x_unpad, indices, cu_seqlens, max_seqlen, _ = res
-        else:
-            raise RuntimeError(
-                f"unexpected unpad_input return size: {len(res)}")
-
-        cu_seqlens = cu_seqlens.to(torch.int32)
-        max_seqlen_int = int(max_seqlen)
-        return x_unpad, indices, cu_seqlens, max_seqlen_int
-
-    def preproj_varlen_packed(
-        self,
-        target_input_norm_xT: torch.Tensor,  # (B, P, F)
-        target_current_mask: torch.Tensor,  # (B, P) True=pad
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """pre-proj를 유효 에이전트 토큰만 대상으로 수행하고, packed(T,D)로 반환합니다.
-
-        Args:
-            target_input_norm_xT (torch.Tensor): (B, P, F)
-            target_current_mask (torch.Tensor): (B, P) True=무효(패딩)
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-                - x_unpad: (T, D)
-                - indices: (T,)
-                - cu_seqlens: (B+1,) int32
-                - max_seqlen: int
-        """
-        if target_current_mask.dtype != torch.bool:
-            target_current_mask = target_current_mask.to(torch.bool)
-
-        valid_mask = (~target_current_mask)  # (B, P) True=valid
-        xT_unpad, indices, cu_seqlens, max_seqlen = self._unpad_input_with_valid_mask(
-            target_input_norm_xT, valid_mask)
-
-        if xT_unpad.numel() == 0 or max_seqlen == 0:
-            # 파라미터 터치(DDP unused 방지용)
-            touch = (self.preproj.fc1.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc1.bias.view(-1)[:1].sum()
-                      if self.preproj.fc1.bias is not None else 0) +
-                     self.preproj.fc2.weight.view(-1)[:1].sum() +
-                     (self.preproj.fc2.bias.view(-1)[:1].sum()
-                      if self.preproj.fc2.bias is not None else 0)) * 0.0
-            D_out = int(self.preproj.fc2.out_features)
-            return xT_unpad.new_zeros(
-                (0, D_out)) + touch, indices, cu_seqlens, max_seqlen
-
-        x_unpad = self.preproj(xT_unpad)  # (T, D)
-        return x_unpad, indices, cu_seqlens, max_seqlen
-
-    def _inject_state_token_to_agent_tokens_packed(
-            self,
-            x_unpad: torch.Tensor,  # (T, H)
-            state_token_in: torch.Tensor,  # (B, P, H)
-            agent_indices: torch.Tensor,  # (T,)
-    ) -> torch.Tensor:
-        """preproj 출력(packed 에이전트 토큰)에 현재 상태 토큰을 직접 더합니다.
-
-        목적:
-            - 에이전트 토큰이 블록에 들어가기 전부터 "현재 상태 기준"을 내용으로 갖게 해서,
-              장면 토큰(차선/정적물 등)을 참고할 때 필요한 기준을 더 빨리/직접적으로 제공하려는 것입니다.
-
-        동작(팩트):
-            1) state_token_in (B,P,H)를 (B*P,H)로 펼칩니다.
-            2) unpad_input이 만든 agent_indices로 유효 에이전트만 (T,H)로 뽑습니다.
-            3) 0 초기화 Linear(H->H)을 통과시킨 뒤 x_unpad에 더합니다.
-               - 초기에는 Linear 출력이 0이므로, 기존 출력과 동일합니다.
-
-        Args:
-            x_unpad (torch.Tensor):
-                preproj 결과(유효 에이전트만 모은 packed 토큰).
-                shape: (T, H)
-            state_token_in (torch.Tensor):
-                현재 상태 토큰(패딩 위치는 0).
-                shape: (B, P, H)
-            agent_indices (torch.Tensor):
-                unpad_input이 만든 인덱스. 보통 b*P + p 형태.
-                shape: (T,)
-
-        Returns:
-            torch.Tensor:
-                상태 주입이 반영된 packed 에이전트 토큰.
-                shape: (T, H)
-        """
-        if x_unpad.dim() != 2:
-            raise ValueError(
-                f"x_unpad must be 2D (T,H). got {tuple(x_unpad.shape)}")
-        if state_token_in.dim() != 3:
-            raise ValueError(
-                f"state_token_in must be 3D (B,P,H). got {tuple(state_token_in.shape)}"
-            )
-        if agent_indices.dim() != 1:
-            raise ValueError(
-                f"agent_indices must be 1D (T,). got {tuple(agent_indices.shape)}"
-            )
-
-        # 유효 토큰이 0개면(=T=0) 이 레이어 파라미터도 "사용된 것"으로 보이게 0값 스칼라를 한 번 섞어둡니다.
-        # (여러 GPU 학습에서 특정 배치가 완전히 비면 오류가 나는 경우를 피하기 위한 안전장치)
-        if x_unpad.numel() == 0 or agent_indices.numel() == 0:
-            touch = (self.state_token_injector.weight.view(-1)[:1].sum() +
-                     (self.state_token_injector.bias.view(-1)[:1].sum() if self.
-                      state_token_injector.bias is not None else 0.0)) * 0.0
-            touch = touch.to(device=x_unpad.device, dtype=x_unpad.dtype)
-            return x_unpad + touch
-
-        B: int = int(state_token_in.shape[0])
-        P: int = int(state_token_in.shape[1])
-        H: int = int(state_token_in.shape[2])
-
-        if int(x_unpad.shape[1]) != H:
-            raise ValueError(
-                "hidden dim mismatch. "
-                f"x_unpad H={int(x_unpad.shape[1])}, state_token_in H={H}")
-
-        idx = agent_indices
-        if idx.dtype != torch.long:
-            idx = idx.to(torch.long)
-
-        # (B,P,H) -> (B*P,H)
-        state_flat = state_token_in.reshape(B * P, H)  # (B*P, H)
-
-        # 유효 에이전트만 (T,H)
-        state_unpad = state_flat.index_select(0, idx)  # (T, H)
-
-        # 0-init Linear(H->H)
-        state_add = self.state_token_injector(state_unpad)  # (T, H)
-        state_add = _cast_like(state_add, x_unpad)
-
-        return x_unpad + state_add
-
-    def _build_cross_kv_cache(
-            self,
-            cross_c: torch.Tensor,  # (B, Lk, D)
-            cross_mask: torch.Tensor,  # (B, Lk) True=pad
-    ) -> FlashAttnKVCache:
-        """scene 토큰(cross_c)을 한 번만 unpad해서 KV 캐시로 만듭니다."""
-        if cross_mask.dtype != torch.bool:
-            cross_mask = cross_mask.to(torch.bool)
-
-        kv_valid = (~cross_mask)  # (B, Lk) True=valid
-        kv_unpad, _, cu_k, max_k = self._unpad_input_with_valid_mask(
-            cross_c, kv_valid)
-        return FlashAttnKVCache(
-            kv_unpad=kv_unpad,
-            cu_seqlens_k=cu_k,
-            max_seqlen_k=int(max_k),
         )
 
     def _select_tensors_for_feasible_projection(
@@ -3271,303 +3303,187 @@ class DiT(nn.Module):
         return cur_motion_norm, cur_motion_valid
 
     def _run_dit_core_with_pram_v2(
-        self,
-        target_input_norm_xT: torch.Tensor,  #  (B, (1+)Pnn, _ * 6 or 5)
-        diffusion_time: torch.Tensor,
-        cross_c: torch.Tensor,
-        cross_mask: torch.Tensor,
-        target_current_11_dim: torch.Tensor,
-        target_current_valid: torch.Tensor,
+            self,
+            target_input_norm_xT: torch.Tensor,  # (B, (1+)Pnn, _ * 6 or 5)
+            diffusion_time: torch.Tensor,
+            cross_c: torch.Tensor,  # (B, token_num, H)
+            cross_mask: torch.Tensor,  # (B, token_num) True=pad
+            cross_pos_2d: torch.Tensor,  # (B, token_num, 9)
+            target_current_11_dim: torch.Tensor,  # (B, P, 11)
+            target_current_valid: torch.Tensor,  # (B, P)
     ) -> torch.Tensor:
-        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 한 번 수행합니다.
+        """DiT 본체(프리프로젝션 + PRAM-v2 블록 + 최종 투영)를 수행합니다.
 
-        핵심 변경점:
-          - 에이전트 토큰은 시작에 1번만 unpad하여 (T,D) packed로 블록 전체를 수행
-          - scene 토큰 KV는 시작에 1번만 unpad하여 모든 블록에서 재사용
-          - 블록별 PRAM 모듈레이션은 depth 전체를 한 번에 계산하고, 블록에서는 슬라이스만 사용
-          - masked_fill은 최종 출력에서 1번만 수행
+        변경점(핵심)
+        ----------
+        - FlashAttention/unpad/pad/KV-cache/packed 경로 제거
+        - cross-attn은 "거리 기반 top-K + score bias(beta)"만 사용
+
+        Returns:
+            x_out:
+                shape: (B, P, output_dim)
         """
-        device_type: str = target_input_norm_xT.device.type
+        target_current_mask = (
+            ~target_current_valid.to(torch.bool))  # (B,P) True=pad
+        if target_current_mask.dtype != torch.bool:
+            target_current_mask = target_current_mask.to(torch.bool)
 
-        target_current_mask = (~target_current_valid.to(torch.bool)
-                              )  # (B, P) True=pad
-        B, one_or_Pnn, _ = target_input_norm_xT.shape
+        B, P, _ = target_input_norm_xT.shape
         depth: int = int(len(self.blocks))
 
-        # 1) pre-proj (packed)
-        with profile_block(
-                "DiT.preproj_varlen_packed",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            x_unpad, agent_indices, cu_q, max_q = self.preproj_varlen_packed(
-                target_input_norm_xT=target_input_norm_xT,  # (B,P,F)
-                target_current_mask=_to_bool_mask(target_current_mask),  # (B,P)
-            )
+        # 1) pre-proj (B,P,H)
+        x: torch.Tensor = self.preproj(target_input_norm_xT)
+        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
-        # dtype/device 정렬 기준은 x_unpad로
-        # (packed이 비어있을 때도 dtype/device는 target_input_norm_xT와 같게 유지)
-        ref_for_dtype = x_unpad if x_unpad.numel() > 0 else target_input_norm_xT
-
-        # 2) cross 입력 정렬 + KV 캐시(1회)
-        cross_c = _cast_like(cross_c, ref_for_dtype)
-        cross_mask = _to_bool_mask(cross_mask).to(device=ref_for_dtype.device)
-
-        with profile_block(
-                "DiT.cross_kv_unpad_once",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            kv_cache = self._build_cross_kv_cache(cross_c=cross_c,
-                                                  cross_mask=cross_mask)
+        # 2) cross 입력 정리
+        cross_c = _cast_like(cross_c, x)
+        cross_mask = _to_bool_mask(cross_mask).to(device=x.device)  # True=pad
+        cross_pos_2d = cross_pos_2d.to(device=x.device,
+                                       dtype=torch.float32)  # dist 계산용
 
         # 3) timestep embedding
-        with profile_block(
-                "DiT._get_time_embedding",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            t_embedding: torch.Tensor = self._get_time_embedding(
-                diffusion_time, ref=ref_for_dtype)
+        t_embedding: torch.Tensor = self._get_time_embedding(diffusion_time,
+                                                             ref=x)
 
-        # 4) state_token_in (B,P,D)
-        target_current_mask = _to_bool_mask(target_current_mask).to(
-            device=ref_for_dtype.device)
+        # 4) state_token_in (B,P,H)
+        state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
+            target_cur_norm=target_current_11_dim.to(dtype=x.dtype,
+                                                     device=x.device),
+            target_current_mask=target_current_mask,
+        )
 
-        with profile_block(
-                "DiT.pram_v2_state_token_encoder",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            state_token_in: torch.Tensor = self.pram_v2_state_token_encoder(
-                target_cur_norm=target_current_11_dim.to(
-                    dtype=ref_for_dtype.dtype, device=ref_for_dtype.device),
-                target_current_mask=target_current_mask,
-            )
-        # [추가] pose_based=False인 경우에만:
-        # 현재 motion(마지막 과거 구간 control)을 state_token_in에 안전하게 더합니다.
-        # - pram_v2_motion_proj 가중치가 0으로 시작하므로, 초기에는 기존과 완전히 동일하게 동작합니다.
+        # pose_based=False일 때 motion token 추가(기존 로직 유지)
         if self.pram_v2_motion_proj is not None:
             cur_motion_norm, cur_motion_valid = self._extract_last_past_segment_control_for_pram(
-                target_input_norm_xT=target_input_norm_xT,  # (B,P,T_any*5)
+                target_input_norm_xT=target_input_norm_xT,
             )
-
-            # dtype/device 정렬
             cur_motion_norm = _cast_like(cur_motion_norm, state_token_in)
             cur_motion_valid_f = cur_motion_valid.to(
                 dtype=cur_motion_norm.dtype,
-                device=cur_motion_norm.device,
-            ).unsqueeze(-1)  # (B,P,1)
+                device=cur_motion_norm.device).unsqueeze(-1)  # (B,P,1)
+            cur_motion_norm = cur_motion_norm * cur_motion_valid_f
 
-            # 유효하지 않은 구간은 0으로
-            cur_motion_norm = cur_motion_norm * cur_motion_valid_f  # (B,P,3)
-
-            # motion -> hidden_dim
             motion_token = self.pram_v2_motion_proj(cur_motion_norm)  # (B,P,H)
-
-            # 현재 에이전트가 패딩이면 0
             motion_token = motion_token.masked_fill(
                 target_current_mask.unsqueeze(-1), 0.0)
             motion_token = _cast_like(motion_token, state_token_in)
-
-            # 최종 반영: state_token_in = token_geom + token_motion
             state_token_in = state_token_in + motion_token
 
-        with profile_block(
-                "DiT.state_token_inject_to_agents_packed",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            x_unpad = self._inject_state_token_to_agent_tokens_packed(
-                x_unpad=x_unpad,  # (T,H)
-                state_token_in=state_token_in,  # (B,P,H)
-                agent_indices=agent_indices,  # (T,)
-            )
+        # 5) state_token_in을 agent 토큰에 주입(0-init Linear라 초기에는 영향 0)
+        state_add = self.state_token_injector(state_token_in)
+        state_add = _cast_like(state_add, x)
+        x = x + state_add
+        x = x.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
 
-        # 5) composer + time modulation
-        with profile_block(
-                "DiT.pram_v2_composer",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            composer_out = self.pram_v2_composer(
-                state_token_in=state_token_in,
-                target_current_mask=target_current_mask,
-            )
+        # 6) composer + time modulation
+        composer_out = self.pram_v2_composer(
+            state_token_in=state_token_in,
+            target_current_mask=target_current_mask,
+        )
+        time_out = self.pram_v2_time_mod(t_embedding)
 
-        with profile_block(
-                "DiT.pram_v2_time_mod",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            time_out = self.pram_v2_time_mod(t_embedding)
+        # 7) 블록별 PRAM 모듈레이션 준비(일반(B,P,H))
+        ds_base = composer_out.delta_scale_base.to(dtype=x.dtype,
+                                                   device=x.device)  # (B,P,H)
+        sh_base = composer_out.shift_base.to(dtype=x.dtype,
+                                             device=x.device)  # (B,P,H)
+        lg_base = composer_out.logit_gate_base.to(dtype=x.dtype,
+                                                  device=x.device)  # (B,P,H)
 
-        # 6) PRAM 모듈레이션을 depth 전체에 대해 1번에 계산 (packed 기준)
-        with profile_block(
-                "DiT.pram_v2_modulations_packed_all_blocks",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            if agent_indices.dtype != torch.long:
-                agent_indices = agent_indices.to(torch.long)
+        ds_time = time_out.delta_scale_time.to(dtype=x.dtype,
+                                               device=x.device)  # (B,1,H)
+        sh_time = time_out.shift_time.to(dtype=x.dtype,
+                                         device=x.device)  # (B,1,H)
+        lg_time = time_out.logit_gate_time.to(dtype=x.dtype,
+                                              device=x.device)  # (B,1,H)
 
-            P: int = int(one_or_Pnn)
-            H: int = int(state_token_in.shape[-1])
-            T: int = int(agent_indices.numel())
+        # (B,1,H) -> (B,P,H)
+        ds_time = ds_time.expand(B, P, -1).contiguous()
+        sh_time = sh_time.expand(B, P, -1).contiguous()
+        lg_time = lg_time.expand(B, P, -1).contiguous()
 
-            # indices = b*P + p 이므로, 배치 인덱스는 indices//P
-            batch_indices = (agent_indices // P).to(torch.long)  # (T,)
+        # 타입별 CA gate bias (B,P,1)
+        ca_type_bias = self._build_ca_gate_type_logit_bias(
+            target_current_11_dim=target_current_11_dim,
+            target_current_mask=target_current_mask,
+            reference_tensor=x,
+        )
 
-            # base (B,P,H) -> (T,H)
-            ds_base = composer_out.delta_scale_base.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).reshape(B * P, H)
-            sh_base = composer_out.shift_base.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).reshape(B * P, H)
-            lg_base = composer_out.logit_gate_base.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).reshape(B * P, H)
+        # agent_pose4: (B,P,4)
+        agent_pose4 = target_current_11_dim[..., 0:4]  # (B,P,4)
 
-            ds_base_p = ds_base.index_select(0, agent_indices)  # (T,H)
-            sh_base_p = sh_base.index_select(0, agent_indices)  # (T,H)
-            lg_base_p = lg_base.index_select(0, agent_indices)  # (T,H)
+        # path scalars: (depth,3)
+        k_s = self.pram_v2_block_path_scalars.k_s.to(dtype=x.dtype,
+                                                     device=x.device)
+        k_sh = self.pram_v2_block_path_scalars.k_sh.to(dtype=x.dtype,
+                                                       device=x.device)
+        k_g = self.pram_v2_block_path_scalars.k_g.to(dtype=x.dtype,
+                                                     device=x.device)
+        beta_g = self.pram_v2_block_path_scalars.beta_g.to(dtype=x.dtype,
+                                                           device=x.device)
 
-            # time (B,1,H) -> (B,H) -> (T,H) (배치별로 동일)
-            ds_time_b = time_out.delta_scale_time.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).squeeze(1)  # (B,H)
-            sh_time_b = time_out.shift_time.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).squeeze(1)  # (B,H)
-            lg_time_b = time_out.logit_gate_time.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).squeeze(1)  # (B,H)
-
-            ds_time_p = ds_time_b.index_select(0, batch_indices)  # (T,H)
-            sh_time_p = sh_time_b.index_select(0, batch_indices)  # (T,H)
-            lg_time_p = lg_time_b.index_select(0, batch_indices)  # (T,H)
-
-            # path scalars: (depth,3)
-            k_s = self.pram_v2_block_path_scalars.k_s.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).view(depth, 3, 1, 1)
-            k_sh = self.pram_v2_block_path_scalars.k_sh.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).view(depth, 3, 1, 1)
-            k_g = self.pram_v2_block_path_scalars.k_g.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).view(depth, 3, 1, 1)
-            beta_g = self.pram_v2_block_path_scalars.beta_g.to(
-                dtype=ref_for_dtype.dtype,
-                device=ref_for_dtype.device).view(depth, 3, 1, 1)
-
-            # (T,H) -> (1,1,T,H)
-            ds_base_p = ds_base_p.view(1, 1, T, H)
-            sh_base_p = sh_base_p.view(1, 1, T, H)
-            lg_base_p = lg_base_p.view(1, 1, T, H)
-            ds_time_p = ds_time_p.view(1, 1, T, H)
-            sh_time_p = sh_time_p.view(1, 1, T, H)
-            lg_time_p = lg_time_p.view(1, 1, T, H)
-
-            # 최종 packed 모듈레이션: (depth,3,T,H)
-            ds_packed_all = ds_time_p + k_s * ds_base_p
-            sh_packed_all = sh_time_p + k_sh * sh_base_p
-            # ---- (추가) 타입별 CA 게이트 logit bias (vehicle에 더 크게) ----
-            ca_type_bias = self._build_ca_gate_type_logit_bias_packed(
-                target_current_11_dim=target_current_11_dim,  # (B,P,11)
-                agent_indices=agent_indices,  # (T,)
-                reference_tensor=ref_for_dtype,
-            )  # (1,1,T,1) or None
-
-            # ---- SA/FFN은 기존과 동일, CA만 bias를 추가 ----
+        for block_index, block in enumerate(self.blocks):
+            # SA mods
+            ds_sa = ds_time + ds_base * k_s[block_index, 0]
+            sh_sa = sh_time + sh_base * k_sh[block_index, 0]
             gate_sa = torch.sigmoid(
-                lg_time_p + k_g[:, 0:1] * lg_base_p + beta_g[
-                    :, 0:1])  # (depth,1,T,H)
+                lg_time + lg_base * k_g[block_index, 0] + beta_g[
+                    block_index, 0])
+
+            # FFN mods
+            ds_ffn = ds_time + ds_base * k_s[block_index, 1]
+            sh_ffn = sh_time + sh_base * k_sh[block_index, 1]
             gate_ffn = torch.sigmoid(
-                lg_time_p + k_g[:, 1:2] * lg_base_p + beta_g[
-                    :, 1:2])  # (depth,1,T,H)
+                lg_time + lg_base * k_g[block_index, 1] + beta_g[
+                    block_index, 1])
 
-            gate_ca_logit = (lg_time_p + k_g[:, 2:3] * lg_base_p + beta_g[
-                :, 2:3])  # (depth,1,T,H)
+            # CA mods (+ type bias)
+            ds_ca = ds_time + ds_base * k_s[block_index, 2]
+            sh_ca = sh_time + sh_base * k_sh[block_index, 2]
+            gate_ca_logit = lg_time + lg_base * k_g[block_index, 2] + beta_g[
+                block_index, 2]
             if ca_type_bias is not None:
-                gate_ca_logit = gate_ca_logit + ca_type_bias  # vehicle이면 더 큰 값
+                gate_ca_logit = gate_ca_logit + ca_type_bias  # (B,P,H)로 broadcast
+            gate_ca = torch.sigmoid(gate_ca_logit)
 
-            gate_ca = torch.sigmoid(gate_ca_logit)  # (depth,1,T,H)
+            pram_mods = {
+                "SA": ModulationTriplet(delta_scale=ds_sa, shift=sh_sa,
+                                        gate=gate_sa),
+                "FFN": ModulationTriplet(delta_scale=ds_ffn, shift=sh_ffn,
+                                         gate=gate_ffn),
+                "CA": ModulationTriplet(delta_scale=ds_ca, shift=sh_ca,
+                                        gate=gate_ca),
+            }
 
-            gate_packed_all = torch.cat([gate_sa, gate_ffn, gate_ca],
-                                        dim=1)  # (depth,3,T,H)
-
-        # 7) 블록 스택: packed로만 수행
-        with profile_block(
-                "DiT.blocks_total_packed",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            for block_index, block in enumerate(self.blocks):
-                with profile_block(
-                        f"DiT.block_packed[{block_index}]",
-                        enabled=self.config.profile_feasible,
-                        device_type=device_type,
-                ):
-                    pram_mods = {
-                        "SA":
-                            ModulationTriplet(
-                                delta_scale=ds_packed_all[block_index, 0],
-                                shift=sh_packed_all[block_index, 0],
-                                gate=gate_packed_all[block_index, 0],
-                            ),
-                        "FFN":
-                            ModulationTriplet(
-                                delta_scale=ds_packed_all[block_index, 1],
-                                shift=sh_packed_all[block_index, 1],
-                                gate=gate_packed_all[block_index, 1],
-                            ),
-                        "CA":
-                            ModulationTriplet(
-                                delta_scale=ds_packed_all[block_index, 2],
-                                shift=sh_packed_all[block_index, 2],
-                                gate=gate_packed_all[block_index, 2],
-                            ),
-                    }
-
-                    x_unpad = block.forward_packed(
-                        x_unpad=x_unpad,  # (T,D)
-                        cu_seqlens_q=cu_q,  # (B+1,)
-                        max_seqlen_q=max_q,  # int
-                        cross_kv_cache=kv_cache,  # cached KV
-                        pram_v2_modulations=pram_mods,  # packed mods
-                    )
-
-        # 8) blocks 출력(hidden)을 (B,P,H)로 1회 pad 복원(Feasible용 저장 포함)
-        x_hidden: torch.Tensor = pad_input(x_unpad, agent_indices, B,
-                                           one_or_Pnn)  # (B,P,H)
-
-        if getattr(self.config, "feasible_grad_to_dit", False):
-            self.final_hidden_tokens = x_hidden.float()
-        else:
-            self.final_hidden_tokens = x_hidden.detach().clone().float()
-
-        # 9) PRAM-v2 최종 레이어(기존 함수 사용)
-        with profile_block(
-                "DiT.apply_pram_v2_final_layer",
-                enabled=self.config.profile_feasible,
-                device_type=device_type,
-        ):
-            x_out = apply_pram_v2_final_layer(
-                x=x_hidden,
-                composer_out=composer_out,
-                time_out=time_out,
-                final_norm=self.pram_v2_final_norm,
-                out_proj=self.pram_v2_out_proj,
-                target_current_mask=target_current_mask,
-                final_scalars=(
-                    self.pram_v2_final_scale_scalar,
-                    self.pram_v2_final_shift_scalar,
-                ),
+            x = block(
+                x=x,  # (B,P,H)
+                target_current_mask=target_current_mask,  # (B,P)
+                cross_c=cross_c,  # (B,token_num,H)
+                cross_mask=cross_mask,  # (B,token_num)
+                cross_pos_2d=cross_pos_2d,  # (B,token_num,9)
+                agent_pose4=agent_pose4,  # (B,P,4)
+                ca_score_beta=self.ca_score_beta,  # scalar
+                pram_v2_modulations=pram_mods,
             )
 
-        # ✅ masked_fill은 최종 1회만
+        # feasible용 저장
+        if getattr(self.config, "feasible_grad_to_dit", False):
+            self.final_hidden_tokens = x.float()
+        else:
+            self.final_hidden_tokens = x.detach().clone().float()
+
+        # 9) PRAM-v2 final layer
+        x_out = apply_pram_v2_final_layer(
+            x=x,
+            composer_out=composer_out,
+            time_out=time_out,
+            final_norm=self.pram_v2_final_norm,
+            out_proj=self.pram_v2_out_proj,
+            target_current_mask=target_current_mask,
+            final_scalars=(self.pram_v2_final_scale_scalar,
+                           self.pram_v2_final_shift_scalar),
+        )
+
         x_out = x_out.masked_fill(target_current_mask.unsqueeze(-1), 0.0)
         return x_out
 
@@ -3911,15 +3827,13 @@ else
     def forward(
             self,
             target_input_norm_xT: torch.Tensor,
-            #  F 에서 시간 길이는 time_len + future_len 또는 1 + future_len 또는 future_len
-            diffusion_time: torch.Tensor,  # (B,) or (B, future_len)
-            target_agents_past: torch.
-        Tensor,  # (B, (1+)Pnn, time_len(=past_len+1), 11)
+            diffusion_time: torch.Tensor,
+            target_agents_past: torch.Tensor,
             target_past_cur_future_valid: torch.Tensor,
-            # (B, (1+)Pnn, 1+past_len+future_len) bool
-            cross_c: torch.Tensor,  # (B, token_num, D)
-            cross_mask: torch.Tensor,  # (B, token_num)
-            low_t_mask: Optional[torch.Tensor] = None,  # (B,) bool
+            cross_c: torch.Tensor,
+            cross_mask: torch.Tensor,
+            cross_pos_2d: torch.Tensor,  # ✅ 추가 (B, token_num, 9)
+            low_t_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """DiT 전체 forward 를 수행하는 진입점.
         target_input_norm_xT (input) 혹은 xT_input_flat (output)
@@ -3977,13 +3891,13 @@ else
             (B, (1+)Pnn, (past_len + T) *3) or (B, (1+)Pnn, T*3)
             """
             diffusion_output: torch.Tensor = self._run_dit_core_with_pram_v2(
-                target_input_norm_xT=
-                target_input_norm_xT,  #  (B, (1+)Pnn, _ * 6 or 5)
-                diffusion_time=diffusion_time,  # (B,) or (B, future_len)
+                target_input_norm_xT=target_input_norm_xT,
+                diffusion_time=diffusion_time,
                 cross_c=cross_c,
                 cross_mask=cross_mask,
-                target_current_11_dim=target_current_11_dim,  # (B, (1+)Pnn, 11)
-                target_current_valid=target_current_valid,  # (B, (1+)Pnn)
+                cross_pos_2d=cross_pos_2d,  # ✅ 추가
+                target_current_11_dim=target_current_11_dim,
+                target_current_valid=target_current_valid,
             )
         self.norm_dit_returns = DiTReturns()
         # model_type 분기
