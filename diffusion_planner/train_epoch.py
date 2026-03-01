@@ -1205,9 +1205,9 @@ def train_epoch(
                 debug_vis_dir=debug_vis_dir,
                 debug_step=int(getattr(args, "_global_update_step", 0)),
                 debug_max_scenes=int(
-                    os.environ.get("DP_NPC_AUG_VIS_MAX_SCENES", "2")),
+                    os.environ.get("DP_NPC_AUG_VIS_MAX_SCENES", "20")),
                 debug_every_n_steps=int(
-                    os.environ.get("DP_NPC_AUG_VIS_EVERY", "100")),
+                    os.environ.get("DP_NPC_AUG_VIS_EVERY", "1")),
                 debug_past_stride=int(
                     os.environ.get("DP_NPC_AUG_VIS_PAST_STRIDE", "1")),
                 debug_future_stride=int(

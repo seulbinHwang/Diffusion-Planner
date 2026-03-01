@@ -92,29 +92,33 @@ def _prepare_cross_pos_2d_for_dit(
     cross_pos_2d: torch.Tensor,  # (B, token_num, 9)
     reference_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    """scene token의 (x,y,...) 정보를 DiT에서 바로 쓰기 좋게 정리합니다.
+    """scene token의 (x,y,...) 정보를 DiT에서 쓰기 좋게 정리합니다.
 
     목표
     ----
     - device를 reference_tensor와 동일하게 맞춥니다.
-    - 거리 계산은 float32가 안전하므로 dtype은 float32로 둡니다.
+    - dtype은 "모델이 실제로 계산할 dtype"(대개 bf16/fp16)을 따르도록 하여,
+      큰 텐서(cross_pos_2d)가 불필요하게 float32로 커지는 것을 피합니다.
 
     Args:
         cross_pos_2d:
             shape: (B, token_num, 9)
         reference_tensor:
-            device 기준 텐서. shape: 임의
+            dtype/device 기준 텐서. shape: 임의
 
     Returns:
         torch.Tensor:
             shape: (B, token_num, 9)
             device: reference_tensor.device
-            dtype: float32
+            dtype: (가능하면) bf16/fp16, 아니면 reference_tensor.dtype
     """
     if cross_pos_2d.device != reference_tensor.device:
         cross_pos_2d = cross_pos_2d.to(device=reference_tensor.device)
-    if cross_pos_2d.dtype != torch.float32:
-        cross_pos_2d = cross_pos_2d.to(dtype=torch.float32)
+
+    dtype = _infer_fast_compute_dtype(reference_tensor)
+    if cross_pos_2d.dtype != dtype:
+        cross_pos_2d = cross_pos_2d.to(dtype=dtype)
+
     return cross_pos_2d
 
 def _prepare_cross_inputs_for_dit(
@@ -2638,6 +2642,23 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         attn = attn.masked_fill(mask, 0.0)
         return attn
 
+    @staticmethod
+    def _choose_distance_dtype(query: torch.Tensor) -> torch.dtype:
+        """거리 계산에 사용할 dtype을 고릅니다.
+
+        - query가 bf16/fp16이면 그 dtype을 사용해 메모리를 줄입니다.
+        - 그 외에는 float32로 둡니다.
+
+        Args:
+            query (torch.Tensor): (B, P, H)
+
+        Returns:
+            torch.dtype: 거리 계산 dtype
+        """
+        if query.dtype in (torch.float16, torch.bfloat16):
+            return query.dtype
+        return torch.float32
+
     def forward(
         self,
         *,
@@ -2677,9 +2698,13 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         s_d: float = max(float(self.s_d), 1e-6)
         NEG: float = float(self.neg_value)
 
+        # (핵심) 거리 계산 dtype: 가능하면 bf16/fp16 사용
+        dist_dtype: torch.dtype = self._choose_distance_dtype(query)
+
+        # token_xy: (B, token_num, 2)
         token_xy: torch.Tensor = scene_encoding_pos_2d[:, :, 0:2].to(
-            device=query.device, dtype=torch.float32
-        )  # (B, token_num, 2)
+            device=query.device, dtype=dist_dtype
+        )
         token_x: torch.Tensor = token_xy[:, :, 0]  # (B, token_num)
         token_y: torch.Tensor = token_xy[:, :, 1]  # (B, token_num)
 
@@ -2689,46 +2714,57 @@ class TopKScoreBiasedCrossAttention(nn.Module):
 
         for start in range(0, P, chunk):
             end = min(P, start + chunk)
-            q_chunk = query[:, start:end, :]               # (B, Pc, H)
-            pose_chunk = agent_pose4[:, start:end, :]      # (B, Pc, 4)
-            agent_pad_chunk = target_current_mask[:, start:end]  # (B, Pc) True=pad
+            q_chunk = query[:, start:end, :]                    # (B, Pc, H)
+            pose_chunk = agent_pose4[:, start:end, :]           # (B, Pc, 4)
+            agent_pad_chunk = target_current_mask[:, start:end] # (B, Pc) True=pad
             Pc = int(end - start)
 
-            agent_xy = pose_chunk[..., 0:2].to(torch.float32)  # (B, Pc, 2)
+            # agent_xy: (B, Pc, 2)
+            agent_xy = pose_chunk[..., 0:2].to(device=query.device, dtype=dist_dtype)
             agent_x = agent_xy[..., 0]  # (B, Pc)
             agent_y = agent_xy[..., 1]  # (B, Pc)
 
-            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)  # (B, Pc, token_num)
-            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)  # (B, Pc, token_num)
-            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))  # (B, Pc, token_num)
+            # (B, Pc, token_num)
+            dx = token_x.unsqueeze(1) - agent_x.unsqueeze(2)
+            dy = token_y.unsqueeze(1) - agent_y.unsqueeze(2)
 
-            score_raw = -(dist / s_d)  # (B, Pc, token_num)
+            # dist: (B, Pc, token_num)
+            dist = torch.sqrt(dx * dx + dy * dy + float(self.eps))
 
+            # score_for_topk: (B, Pc, token_num)
+            # - invalid는 -inf로 두고, topk에서 제외
             invalid_score_mask = scene_encoding_token_mask.unsqueeze(1) | agent_pad_chunk.unsqueeze(-1)
+            score_for_topk = -(dist / s_d)
+            score_for_topk = score_for_topk.masked_fill(invalid_score_mask, float("-inf"))
 
-            score_for_topk = score_raw.masked_fill(invalid_score_mask, float("-inf"))
-            score = score_raw.masked_fill(invalid_score_mask, NEG)
+            # topk_idx: (B, Pc, K)
+            topk_idx = torch.topk(score_for_topk, k=K, dim=-1, largest=True).indices
 
-            topk_idx = torch.topk(score_for_topk, k=K, dim=-1, largest=True).indices  # (B, Pc, K)
-            score_keep = torch.gather(score, dim=-1, index=topk_idx)                  # (B, Pc, K)
+            # score_keep: (B, Pc, K)
+            # - 예전 코드의 "NEG 채우기" 의미를 유지하기 위해 -inf는 NEG로 바꿉니다.
+            score_keep = torch.gather(score_for_topk, dim=-1, index=topk_idx)
+            score_keep = torch.clamp(score_keep, min=NEG)
 
+            # sel_pad_mask: (B, Pc, K)
             sel_pad_mask = scene_encoding_token_mask.unsqueeze(1).expand(B, Pc, token_num).gather(dim=2, index=topk_idx)
 
+            # kv_sel: (B, Pc, K, H)
             scene_exp = scene_encoding_token.unsqueeze(1).expand(B, Pc, token_num, H)
             idx_exp = topk_idx.unsqueeze(-1).expand(B, Pc, K, H)
             kv_sel = torch.gather(scene_exp, dim=2, index=idx_exp)
             kv_sel = kv_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
 
-            q_lin = self.q_proj(q_chunk)  # (B,Pc,H)
-            k_lin = self.k_proj(kv_sel)   # (B,Pc,K,H)
-            v_lin = self.v_proj(kv_sel)   # (B,Pc,K,H)
+            q_lin = self.q_proj(q_chunk)  # (B, Pc, H)
+            k_lin = self.k_proj(kv_sel)   # (B, Pc, K, H)
+            v_lin = self.v_proj(kv_sel)   # (B, Pc, K, H)
 
             qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1, 3)        # (B,h,Pc,hd)
             kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
             vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
 
+            # logits는 softmax 안정 위해 float32 유지
             logits = (qh.to(torch.float32).unsqueeze(3) * kh.to(torch.float32)).sum(dim=-1) * float(self.scale)  # (B,h,Pc,K)
-            logits = logits + beta_f32 * score_keep.unsqueeze(1)  # (B,h,Pc,K)
+            logits = logits + beta_f32 * score_keep.to(torch.float32).unsqueeze(1)  # (B,h,Pc,K)
 
             attn = self._masked_softmax(logits, mask=sel_pad_mask.unsqueeze(1), dim=-1)  # (B,h,Pc,K)
             out = (attn.unsqueeze(-1) * vh.to(torch.float32)).sum(dim=3)  # (B,h,Pc,hd)
@@ -2741,7 +2777,6 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             out_all[:, start:end, :] = out
 
         return out_all
-
 
 class DiTBlock(nn.Module):
     def __init__(
