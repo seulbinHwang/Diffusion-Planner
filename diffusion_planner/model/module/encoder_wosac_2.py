@@ -1021,13 +1021,24 @@ class Encoder(nn.Module):
     ) -> Tuple[
         torch.Tensor,  # encoding_input_with_pos: (B, token_num, H)
         torch.Tensor,  # encoding_mask_2d:        (B, token_num)
+        torch.Tensor,  # encoding_pos_2d:         (B, token_num, 9)
     ]:
         """agents/static/lanes/road_safety 토큰을 한 줄로 이어 붙이고, 위치 임베딩을 더합니다.
 
         변경점(핵심)
         ----------
         - ✅ lane 토큰은 절대 요약하지 않습니다.
-        - FusionEncoder에는 입력으로 들어온 lane 토큰 전체(N_lanes개)를 그대로 넣습니다.
+        - ✅ encoding_pos_2d(B, token_num, 9)를 외부(Decoder)로 내려보내기 위해 반환합니다.
+        - ✅ pad 토큰의 encoding_pos_2d는 0으로 고정합니다. (Decoder에서 실수로 쓰여도 안전)
+
+        Returns:
+            encoding_input_with_pos:
+                shape: (B, token_num, H)
+            encoding_mask_2d:
+                shape: (B, token_num)  True=pad
+            encoding_pos_2d:
+                shape: (B, token_num, 9)
+                [x,y,cos,sin] + type_onehot(5)
         """
 
         # ✅ 항상 원본 lane 토큰을 그대로 사용
@@ -1045,6 +1056,9 @@ class Encoder(nn.Module):
             [static_mask, lanes_mask_for_fusion, road_safety_mask],
             dim=1,
         )  # (B, token_num)
+
+        if encoding_mask_2d.dtype != torch.bool:
+            encoding_mask_2d = encoding_mask_2d.to(torch.bool)
 
         # (2) pos dtype/device 통일
         pos_dtype: torch.dtype = encoding_input.dtype
@@ -1066,29 +1080,45 @@ class Encoder(nn.Module):
             dim=1,
         )  # (B, token_num, 9)
 
+        # ✅ pad 토큰 pos는 0으로 고정
+        encoding_pos_2d = encoding_pos_2d.masked_fill(
+            encoding_mask_2d.unsqueeze(-1), 0.0
+        )  # (B, token_num, 9)
+
         # (3) pos_emb 더하기
         encoding_input_with_pos: torch.Tensor = self._add_pos_embedding_to_tokens(
             token_embeddings=encoding_input,  # (B, token_num, H)
             token_pos=encoding_pos_2d,  # (B, token_num, 9)
             token_mask=encoding_mask_2d,  # (B, token_num)
         )
-        return encoding_input_with_pos, encoding_mask_2d
+
+        return encoding_input_with_pos, encoding_mask_2d, encoding_pos_2d
 
     def _run_fusion_and_route_encoder(
             self,
             encoding_input_with_pos: torch.Tensor,  # (B, token_num, H)
             encoding_mask_2d: torch.Tensor,  # (B, token_num)
+            encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
     ) -> Dict[str, torch.Tensor]:
         """FusionEncoder + route-lane 인코더까지 실행해 출력 dict를 만든다.
 
         Args:
-            encoding_input_with_pos: (B, token_num, H)  위치 임베딩까지 포함된 입력 토큰.
-            encoding_mask_2d:        (B, token_num)     True=pad.
+            encoding_input_with_pos:
+                shape: (B, token_num, H)
+                위치 임베딩까지 포함된 입력 토큰.
+            encoding_mask_2d:
+                shape: (B, token_num)
+                True=pad.
+            encoding_pos_2d:
+                shape: (B, token_num, 9)
+                [x,y,cos,sin] + type_onehot(5)
+                Decoder에서 top-K 거리 선택에 쓰기 위해 그대로 내려보냄.
 
         Returns:
             encoder_outputs:
-                - "encoding":                  (B, token_num, H)
-                - "encoding_mask":             (B, token_num)
+                - "encoding":          (B, token_num, H)
+                - "encoding_mask":     (B, token_num)
+                - "encoding_pos_2d":   (B, token_num, 9)
         """
         encoder_outputs: Dict[str, torch.Tensor] = {}
 
@@ -1100,6 +1130,10 @@ class Encoder(nn.Module):
 
         encoder_outputs["encoding"] = encoding_tokens
         encoder_outputs["encoding_mask"] = fused_mask
+
+        # ✅ Decoder에서 top-K 선택에 사용할 pos 정보 추가
+        encoder_outputs["encoding_pos_2d"] = encoding_pos_2d
+
         return encoder_outputs
 
     # --------------------------------------------------------------------- #
@@ -1138,17 +1172,18 @@ class Encoder(nn.Module):
                     device_type=device_type,
             ):
                 (encoding_input_with_pos,
-                 encoding_mask_2d) = self._build_fusion_inputs(
-                     encoding_static=encoding_static,
-                     static_mask=static_mask,
-                     static_pos=static_pos,
-                     encoding_lanes=encoding_lanes,
-                     lanes_mask=lanes_mask,
-                     lane_pos=lane_pos,
-                     encoding_road_safety=encoding_road_safety,
-                     road_safety_mask=road_safety_mask,
-                     road_safety_pos=road_safety_pos,
-                 )
+                 encoding_mask_2d,
+                 encoding_pos_2d) = self._build_fusion_inputs(
+                    encoding_static=encoding_static,
+                    static_mask=static_mask,
+                    static_pos=static_pos,
+                    encoding_lanes=encoding_lanes,
+                    lanes_mask=lanes_mask,
+                    lane_pos=lane_pos,
+                    encoding_road_safety=encoding_road_safety,
+                    road_safety_mask=road_safety_mask,
+                    road_safety_pos=road_safety_pos,
+                )
 
             with profile_block(
                     "Encoder._run_fusion_and_route_encoder",
@@ -1157,9 +1192,10 @@ class Encoder(nn.Module):
             ):
                 encoder_outputs: Dict[
                     str, torch.Tensor] = self._run_fusion_and_route_encoder(
-                        encoding_input_with_pos=encoding_input_with_pos,
-                        encoding_mask_2d=encoding_mask_2d,
-                    )
+                    encoding_input_with_pos=encoding_input_with_pos,
+                    encoding_mask_2d=encoding_mask_2d,
+                    encoding_pos_2d=encoding_pos_2d,
+                )
 
             return encoder_outputs
 
