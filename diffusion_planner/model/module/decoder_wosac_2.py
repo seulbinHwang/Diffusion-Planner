@@ -2560,19 +2560,12 @@ class SimpleSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """agent self-attention.
 
-        추가 디버그 포인트
-        ----------------
-        - 어떤 배치에서 key_padding_mask가 전부 True면(=볼 수 있는 대상이 0개),
-          attention 내부 계산이 NaN을 만들 수 있습니다.
-        - 이 케이스를 잡아서 (배치 인덱스) 로그를 찍고,
-          해당 배치는 attention 계산을 생략하고 0을 반환합니다.
-
         Args:
-            x (torch.Tensor): 값 텐서. shape=(B, P, H)
-            key_padding_mask (torch.Tensor): pad 마스크(True=pad). shape=(B, P)
+            x (torch.Tensor): (B, P, H)
+            key_padding_mask (torch.Tensor): (B, P) True=pad(무효)
 
         Returns:
-            torch.Tensor: shape=(B, P, H)
+            torch.Tensor: (B, P, H)
         """
         if x.dim() != 3:
             raise ValueError(f"x must be (B,P,H). got {tuple(x.shape)}")
@@ -2586,7 +2579,6 @@ class SimpleSelfAttention(nn.Module):
 
         if bool(all_masked_b.any().item()):
             idx = torch.nonzero(all_masked_b, as_tuple=False).view(-1)
-            # valid 개수(=pad가 아닌 개수)도 같이 표시
             valid_cnt = (P - key_padding_mask.to(torch.int32).sum(dim=1)).detach().cpu().tolist()
             _debug_print_rank0_once(
                 "SA_ALL_MASKED",
@@ -2598,12 +2590,14 @@ class SimpleSelfAttention(nn.Module):
         qkv = qkv.view(B, P, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)  # (3,B,heads,P,hd)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, heads, P, hd)
 
-        # key padding mask -> attn_mask (B,1,1,P), True=mask
-        attn_mask = key_padding_mask[:, None, None, :]  # (B,1,1,P)
+        # ✅ SDPA bool attn_mask: True=참여(keep) 이므로, True=pad인 key_padding_mask를 뒤집어야 함
+        # key_keep_mask: (B, P) True=유효 key
+        key_keep_mask = (~key_padding_mask)  # (B, P)
+        attn_mask = key_keep_mask[:, None, None, :]  # (B,1,1,P) broadcast to (B,heads,P,P)
 
         drop_p = self.attn_drop if self.training else 0.0
 
-        # ✅ "전부 마스크" 배치는 attention 계산을 스킵
+        # "전부 pad" 배치는 attention 계산을 스킵(안정성)
         out = q.new_zeros((B, self.heads, P, self.head_dim))  # (B, heads, P, hd)
         valid_b = ~all_masked_b  # (B,)
 
@@ -2619,6 +2613,9 @@ class SimpleSelfAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, P, H)  # (B, P, H)
         out = self.out_proj(out)
         out = self.proj_drop(out)
+
+        # ✅ pad query 위치는 항상 0 (out_proj bias까지 포함해서 완전히 차단)
+        out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         return out
 
 class TopKScoreBiasedCrossAttention(nn.Module):
@@ -3162,6 +3159,38 @@ class DiT(nn.Module):
         if not bool(self._debug_nan_check):
             return
         _require_finite(name, x)
+
+    def _get_ca_score_beta_for_cross_attention(self) -> torch.Tensor:
+        """Cross-Attention에서 사용할 거리 가중치 beta를 안전하게 만듭니다.
+
+        이 beta는 "거리 점수(score_keep)"에 곱해져 attention 점수(logits)에 더해집니다.
+        - score_keep는 거리가 멀수록 더 작은 값(더 음수)입니다.
+        - beta가 음수가 되면, 멀리 있는 토큰이 오히려 유리해질 수 있습니다.
+
+        이 함수는 설정에 따라 beta를 항상 0 이상이 되도록 바꿔 반환합니다.
+
+        Returns:
+            torch.Tensor:
+                beta 값 텐서
+                - shape: ()
+                - dtype: self.ca_score_beta.dtype
+                - device: self.ca_score_beta.device
+        """
+        force_nonneg: bool = bool(
+            getattr(self.config, "ca_score_beta_force_nonneg", True)
+        )
+        if not force_nonneg:
+            return self.ca_score_beta  # shape: ()
+
+        # softplus의 샤프니스(클수록 0 근처 출력이 더 작아져, 초기 동작이 거의 0과 비슷해집니다)
+        softplus_beta: float = float(
+            getattr(self.config, "ca_score_beta_softplus_beta", 1000.0)
+        )
+        if (not math.isfinite(softplus_beta)) or (softplus_beta <= 0.0):
+            softplus_beta = 1000.0
+
+        # 항상 0 이상
+        return F.softplus(self.ca_score_beta, beta=softplus_beta)  # shape: ()
 
     def _build_ca_gate_type_logit_bias(
             self,
@@ -3710,6 +3739,7 @@ class DiT(nn.Module):
                                                      device=x.device)
         beta_g = self.pram_v2_block_path_scalars.beta_g.to(dtype=x.dtype,
                                                            device=x.device)
+        ca_score_beta_for_ca: torch.Tensor = self._get_ca_score_beta_for_cross_attention()  # shape: ()
 
         for block_index, block in enumerate(self.blocks):
             # SA mods
@@ -3751,7 +3781,7 @@ class DiT(nn.Module):
                 cross_mask=cross_mask,  # (B,token_num)
                 cross_pos_2d=cross_pos_2d,  # (B,token_num,9)
                 agent_pose4=agent_pose4,  # (B,P,4)
-                ca_score_beta=self.ca_score_beta,  # scalar
+                ca_score_beta=ca_score_beta_for_ca,  # ✅ (shape: ())
                 pram_v2_modulations=pram_mods,
             )
             self._debug_require_finite(f"dit.block_{block_index:02d}_out", x)
