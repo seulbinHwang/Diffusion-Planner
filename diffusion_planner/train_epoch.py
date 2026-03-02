@@ -1227,7 +1227,7 @@ def train_epoch(
                     inputs=inputs,
                     outputs=outputs,
                     augment_prob=float(getattr(args, "augment_prob", 0.5)),
-                    agent_prob=0.75,
+                    agent_prob=1.,
                     use_body_vel=bool(getattr(args, "use_body_vel", True)),
 
                     # ---- debug vis args ----
