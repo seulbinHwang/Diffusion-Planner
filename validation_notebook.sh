@@ -191,15 +191,15 @@ taskset -c "${CPUSET}" \
   --eval_set_list "$EVAL_SET_LIST_PATH" \
   --resume_wandb_model_name latest \
   --resume_model_only True \
-  --load_name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
-  --name "w_integ_loss_thres_1_p_sat_0.25_ft_1" \
+  --load_name "w_integ_loss_thres_1_p_sat_0.25_sft" \
+  --name "w_integ_loss_thres_1_p_sat_0.25_sft" \
   --eval_method "validation" \
   --batch_size 1 \
   --pose_based False \
   --profile_feasible False \
   --use_feasible True \
   --use_feasible_dl False \
-  --use_feasible_filter True \
+  --use_feasible_filter False \
   --feasible_grad_to_dit False \
   --use_deepspeed True \
   --wosac_sub_is_active False \
