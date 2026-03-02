@@ -9,7 +9,11 @@ from diffusion_planner.model.module.mixer import (
     FastLayerNormMlp,
 )
 from flash_attn.bert_padding import unpad_input, pad_input
-
+from diffusion_planner.utils.geometry_pruning import (
+    build_agents_xy_and_valid_from_past,
+    prune_lanes_by_distance_to_agents,
+    prune_road_safety_by_distance_to_agents,
+)
 # ==== (encoder.py 상단 import 근처에 추가) ====
 from typing import Tuple  # 이미 있으면 중복 추가 불필요
 
@@ -617,38 +621,26 @@ class Encoder(nn.Module):
 
     @staticmethod
     def _road_safety_has_any_geometry(
-        stop_sign_points: Optional[torch.Tensor],
-        crosswalk_points: Optional[torch.Tensor],
-        speed_bump_points: Optional[torch.Tensor],
-        driveway_points: Optional[torch.Tensor],
-        road_edge: Optional[torch.Tensor],
+            stop_sign_points: Optional[torch.Tensor],
+            crosswalk_points: Optional[torch.Tensor],
+            speed_bump_points: Optional[torch.Tensor],
+            driveway_points: Optional[torch.Tensor],
+            road_edge: Optional[torch.Tensor],
     ) -> bool:
         """road-safety에서 '점(geometry) 텐서'가 하나라도 들어왔는지 확인합니다.
 
-        목적:
-            is_valid/type 같은 보조 텐서만 단독으로 들어오는 케이스가 있을 수 있습니다.
-            이때 geometry(points)가 하나도 없으면 RoadSafetyFusionEncoder.forward()는
-            내부에서 처리할 대상이 없어 에러가 날 수 있습니다.
-
-        Args:
-            stop_sign_points: (B, Ns, S, 2) 또는 None
-            crosswalk_points: (B, Nc, S, 2) 또는 None
-            speed_bump_points: (B, Nb, S, 2) 또는 None
-            driveway_points: (B, Nd, S, 2) 또는 None
-            road_edge: (B, Ne, S, 2) 또는 None
-
-        Returns:
-            bool:
-                - points 텐서가 하나라도 있으면 True
-                - 전부 None이면 False
+        변경:
+            - None이 아니더라도, (B,0,...) 같이 완전히 빈 텐서면 "없음"으로 봅니다.
+              (pruning으로 0개가 된 케이스에서 encoder 호출을 피하려는 목적)
         """
-        return any(t is not None for t in [
+        tensors = [
             stop_sign_points,
             crosswalk_points,
             speed_bump_points,
             driveway_points,
             road_edge,
-        ])
+        ]
+        return any((t is not None) and (int(t.numel()) > 0) for t in tensors)
 
     def _build_empty_road_safety_tokens(
             self,
@@ -798,26 +790,67 @@ class Encoder(nn.Module):
         return placeholder_static_objects, static_objects_is_valid_tensor
 
     def _encode_agents_static_lanes(
-        self,
-        inputs: Dict[str, torch.Tensor],
+            self,
+            inputs: Dict[str, torch.Tensor],
     ) -> Tuple[
-            torch.Tensor,  # encoding_static:       (B, N_static, H)
-            torch.Tensor,  # static_mask:           (B, N_static)
-            torch.Tensor,  # static_pos:            (B, N_static, 9)
-            torch.Tensor,  # encoding_lanes:        (B, N_lanes, H)
-            torch.Tensor,  # lanes_mask:            (B, N_lanes)
-            torch.Tensor,  # lane_pos:              (B, N_lanes, 9)
-            torch.Tensor,  # encoding_road_safety:  (B, N_road_safety, H)
-            torch.Tensor,  # road_safety_mask:      (B, N_road_safety)
-            torch.Tensor,  # road_safety_pos:       (B, N_road_safety, 9)
+        torch.Tensor,  # encoding_static:       (B, N_static, H)
+        torch.Tensor,  # static_mask:           (B, N_static)
+        torch.Tensor,  # static_pos:            (B, N_static, 9)
+        torch.Tensor,  # encoding_lanes:        (B, N_lanes, H)
+        torch.Tensor,  # lanes_mask:            (B, N_lanes)
+        torch.Tensor,  # lane_pos:              (B, N_lanes, 9)
+        torch.Tensor,  # encoding_road_safety:  (B, N_road_safety, H)
+        torch.Tensor,  # road_safety_mask:      (B, N_road_safety)
+        torch.Tensor,  # road_safety_pos:       (B, N_road_safety, 9)
     ]:
         """에이전트 / 정적 객체 / 차선 인코더를 한 번에 호출한다."""
         lanes = inputs["lanes"]  # (B, L, lane_len, D_lane)
         device_type: str = lanes.device.type
 
+        # ------------------------------------------------------------
+        # (0) pruning에 쓸 agent 현재 (x,y) 구성 (ego + near, 마지막 시점)
+        # ------------------------------------------------------------
+        agents_xy: Optional[torch.Tensor] = None
+        agents_valid: Optional[torch.Tensor] = None
+
+        ego_agent_past = inputs.get("ego_agent_past", None)
+        near_agents_past = inputs.get("near_agents_past", None)
+        ego_agent_past_is_valid = inputs.get("ego_agent_past_is_valid", None)
+        near_agents_past_is_valid = inputs.get("near_agents_past_is_valid",
+                                               None)
+
+        if (ego_agent_past is not None) and (near_agents_past is not None):
+            agents_xy, agents_valid = build_agents_xy_and_valid_from_past(
+                ego_agent_past=ego_agent_past,
+                near_agents_past=near_agents_past,
+                ego_agent_past_is_valid=ego_agent_past_is_valid,
+                near_agents_past_is_valid=near_agents_past_is_valid,
+            )
+            if agents_xy.device != lanes.device:
+                agents_xy = agents_xy.to(device=lanes.device)
+            if agents_valid.device != lanes.device:
+                agents_valid = agents_valid.to(device=lanes.device)
+            agents_valid = agents_valid.to(torch.bool)
+
+        # pruning 하이퍼파라미터(없으면 0 -> 비활성)
+        lane_prune_topk: int = int(
+            getattr(self.config, "lane_prune_topk",
+                    getattr(self.config, "lane_prune_num", 0))
+        )
+        road_safety_prune_topk: int = int(
+            getattr(self.config, "road_safety_prune_topk",
+                    getattr(self.config, "road_safety_prune_num", 0))
+        )
+        road_edge_prune_topk: int = int(
+            getattr(self.config, "road_edge_prune_topk",
+                    getattr(self.config, "road_edge_prune_num", 0))
+        )
+        pruning_use_batch_max_k: bool = bool(
+            getattr(self.config, "pruning_use_batch_max_k", True))
+
         # --- static encoder ---
-        static_objects: Optional[torch.Tensor] = inputs.get(
-            "static_objects", None)
+        static_objects: Optional[torch.Tensor] = inputs.get("static_objects",
+                                                            None)
         static_objects_is_valid: Optional[torch.Tensor] = inputs.get(
             "static_objects_is_valid", None)
 
@@ -835,22 +868,63 @@ class Encoder(nn.Module):
                 device_type=device_type,
         ):
             encoding_static, static_pos = self.static_encoder(
-                static_objects_tensor, static_objects_is_valid)
+                static_objects_tensor, static_objects_is_valid
+            )
 
         static_mask = ~static_objects_is_valid
 
-        # --- lane encoder ---
-        lanes_speed_limit = inputs["lanes_speed_limit"]  # (B, L, 1) or None
-        lanes_has_speed_limit = inputs[
-            "lanes_has_speed_limit"]  # (B, L, 1) or None
+        # ------------------------------------------------------------
+        # (1) lane encoder 입력 준비 + (✅ 추가) lane pruning
+        # ------------------------------------------------------------
+        lanes_speed_limit = inputs["lanes_speed_limit"]  # (B, L, 1)
+        lanes_has_speed_limit = inputs["lanes_has_speed_limit"]  # (B, L, 1)
         lane_type = inputs.get("lane_type", None)  # (B, L, 4) or None
         left_line_type = inputs.get("left_line_type",
                                     None)  # (B, L, 13) or None
         right_line_type = inputs.get("right_line_type",
                                      None)  # (B, L, 13) or None
 
-        lanes_is_valid = inputs["lanes_is_valid"]  # (B, L)
-        lanes_is_valid = lanes_is_valid.to(torch.bool)
+        lanes_is_valid = inputs["lanes_is_valid"].to(torch.bool)  # (B, L)
+
+        # lanes_len_is_valid는 있을 수도/없을 수도 있음
+        lanes_len_is_valid = inputs.get("lanes_len_is_valid",
+                                        None)  # (B, L, lane_len) or None
+
+        if (
+                (agents_xy is not None)
+                and (agents_valid is not None)
+                and (lane_prune_topk > 0)
+                and (lanes.shape[1] > 0)
+        ):
+            with profile_block(
+                    "Encoder._encode_agents_static_lanes.lane_pruning",
+                    enabled=self.config.profile_feasible,
+                    device_type=device_type,
+            ):
+                (
+                    lanes,
+                    lanes_is_valid,
+                    lanes_speed_limit,
+                    lanes_has_speed_limit,
+                    lane_type,
+                    left_line_type,
+                    right_line_type,
+                    lanes_len_is_valid,
+                    _selected_lane_idx,
+                ) = prune_lanes_by_distance_to_agents(
+                    lanes=lanes,
+                    lanes_is_valid=lanes_is_valid,
+                    agents_xy=agents_xy,
+                    agents_valid=agents_valid,
+                    topk=lane_prune_topk,
+                    lanes_len_is_valid=lanes_len_is_valid,
+                    lanes_speed_limit=lanes_speed_limit,
+                    lanes_has_speed_limit=lanes_has_speed_limit,
+                    lane_type=lane_type,
+                    left_line_type=left_line_type,
+                    right_line_type=right_line_type,
+                    use_batch_max_k=pruning_use_batch_max_k,
+                )
 
         with profile_block(
                 "Encoder._encode_agents_static_lanes.lane_encoder",
@@ -869,7 +943,9 @@ class Encoder(nn.Module):
 
         lanes_mask = ~lanes_is_valid
 
-        # --- road safety encoder (입력이 전부 None이면 "빈 토큰"으로 대체) ---
+        # ------------------------------------------------------------
+        # (2) road safety encoder 입력 + (✅ 추가) road-safety pruning
+        # ------------------------------------------------------------
         stop_sign_points = inputs.get("stop_sign_points", None)
         stop_sign_is_valid = inputs.get("stop_sign_is_valid", None)
         crosswalk_points = inputs.get("crosswalk_points", None)
@@ -881,6 +957,47 @@ class Encoder(nn.Module):
         road_edge = inputs.get("road_edge", None)
         road_edge_is_valid = inputs.get("road_edge_is_valid", None)
         road_edge_type = inputs.get("road_edge_type", None)
+
+        if (
+                (agents_xy is not None)
+                and (agents_valid is not None)
+                and ((road_safety_prune_topk > 0) or (road_edge_prune_topk > 0))
+        ):
+            with profile_block(
+                    "Encoder._encode_agents_static_lanes.road_safety_pruning",
+                    enabled=self.config.profile_feasible,
+                    device_type=device_type,
+            ):
+                (
+                    stop_sign_points,
+                    stop_sign_is_valid,
+                    crosswalk_points,
+                    crosswalk_is_valid,
+                    speed_bump_points,
+                    speed_bump_is_valid,
+                    driveway_points,
+                    driveway_is_valid,
+                    road_edge,
+                    road_edge_is_valid,
+                    road_edge_type,
+                ) = prune_road_safety_by_distance_to_agents(
+                    agents_xy=agents_xy,
+                    agents_valid=agents_valid,
+                    stop_sign_points=stop_sign_points,
+                    stop_sign_is_valid=stop_sign_is_valid,
+                    crosswalk_points=crosswalk_points,
+                    crosswalk_is_valid=crosswalk_is_valid,
+                    speed_bump_points=speed_bump_points,
+                    speed_bump_is_valid=speed_bump_is_valid,
+                    driveway_points=driveway_points,
+                    driveway_is_valid=driveway_is_valid,
+                    road_edge=road_edge,
+                    road_edge_is_valid=road_edge_is_valid,
+                    road_edge_type=road_edge_type,
+                    topk_total=road_safety_prune_topk,
+                    topk_road_edge=road_edge_prune_topk,
+                    use_batch_max_k=pruning_use_batch_max_k,
+                )
 
         has_any_geometry: bool = self._road_safety_has_any_geometry(
             stop_sign_points=stop_sign_points,
@@ -898,9 +1015,10 @@ class Encoder(nn.Module):
             ):
                 (encoding_road_safety, road_safety_mask,
                  road_safety_pos) = self._build_empty_road_safety_tokens(
-                     batch_size=int(lanes.shape[0]),
-                     ref_encoding=encoding_lanes,
-                     ref_pos=lane_pos)
+                    batch_size=int(lanes.shape[0]),
+                    ref_encoding=encoding_lanes,
+                    ref_pos=lane_pos,
+                )
         else:
             with profile_block(
                     "Encoder._encode_agents_static_lanes.road_safety_encoder",
@@ -909,22 +1027,24 @@ class Encoder(nn.Module):
             ):
                 (encoding_road_safety, road_safety_mask,
                  road_safety_pos) = self.road_safety_encoder(
-                     stop_sign_points,
-                     stop_sign_is_valid,
-                     crosswalk_points,
-                     crosswalk_is_valid,
-                     speed_bump_points,
-                     speed_bump_is_valid,
-                     driveway_points,
-                     driveway_is_valid,
-                     road_edge,
-                     road_edge_is_valid,
-                     road_edge_type,
-                 )
+                    stop_sign_points,
+                    stop_sign_is_valid,
+                    crosswalk_points,
+                    crosswalk_is_valid,
+                    speed_bump_points,
+                    speed_bump_is_valid,
+                    driveway_points,
+                    driveway_is_valid,
+                    road_edge,
+                    road_edge_is_valid,
+                    road_edge_type,
+                )
 
-        return (encoding_static, static_mask, static_pos, encoding_lanes,
-                lanes_mask, lane_pos, encoding_road_safety, road_safety_mask,
-                road_safety_pos)
+        return (
+            encoding_static, static_mask, static_pos,
+            encoding_lanes, lanes_mask, lane_pos,
+            encoding_road_safety, road_safety_mask, road_safety_pos,
+        )
 
     def _add_pos_embedding_to_tokens(
             self,
