@@ -1676,30 +1676,29 @@ def diffusion_loss_func(
         normed_target_future_seq_gt=
         normed_target_future_seq_gt,  # (B, (1+)Pnn, future_len, 4 or 3)
     )
-    if args.use_timestep_weight_loss:
-        # 시간 가중치(w_t) 생성
-        time_step_s: float = 0.1
-        half_life_s: float = 2.0
-        # w_t: (1, 1, future_len)
-        w_t: torch.Tensor = _build_half_life_weights(
-            future_len,
-            dt_s=time_step_s,
-            half_life_s=half_life_s,
-            device=dpm_loss.device,  # (B, (1+)Pnn, future_len)
-            dtype=torch.float32,
-        )
-    else:
-        # 균등 가중치
-        # w_t: (1, 1, future_len)
-        w_t = torch.ones((1, 1, future_len),
-                         device=dpm_loss.device,
-                         dtype=torch.float32)
+    # if args.use_timestep_weight_loss:
+    # 시간 가중치(w_t) 생성
+    time_step_s: float = 0.1
+    half_life_s: float = 3.0
+    # w_t_for_dpm_loss: (1, 1, future_len)
+    w_t_for_dpm_loss: torch.Tensor = _build_half_life_weights(
+        future_len,
+        dt_s=time_step_s,
+        half_life_s=half_life_s,
+        device=dpm_loss.device,  # (B, (1+)Pnn, future_len)
+        dtype=torch.float32,
+    )
+    # 균등 가중치
+    # w_t_for_integration: (1, 1, future_len)
+    w_t_for_integration = torch.ones((1, 1, future_len),
+                     device=dpm_loss.device,
+                     dtype=torch.float32)
 
     # neighbor_prediction_loss: loss_val = (스칼라)
     loss_val: torch.Tensor = _aggregate_weighted_loss(
         per_step_loss=dpm_loss,  # (B, (1+)Pnn, future_len)
         target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
-        w_t=w_t,  # (1, 1, future_len)
+        w_t=w_t_for_dpm_loss,  # (1, 1, future_len)
         eps=1e-6,
     )
     loss_dict["neighbor_prediction_loss"] = loss_val
@@ -1722,7 +1721,7 @@ def diffusion_loss_func(
          norm_target_future_gt_4_dim,  # (B, (1+)Pnn, future_len, 4)
          target_future_valid=target_future_valid,  # (B, (1 +) Pnn, future_len)
          low_t_mask_3_ndim=low_t_mask_3_ndim,  # (B,1,1)
-         w_t=w_t,  # (1, 1, future_len)
+         w_t=w_t_for_integration,  # (1, 1, future_len)
          base_loss=loss_val,  # scalar
      )
 
