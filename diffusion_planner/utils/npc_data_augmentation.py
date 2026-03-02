@@ -2507,8 +2507,6 @@ class NPCStatePerturbation:
                 nbr_vx_self_p, nbr_vy_self_p, nbr_ax_self_p, nbr_ay_self_p,
                 nbr_is_car, nbr_is_cyc, nbr_is_ped,
             )
-        else:
-            nbr_yaw_rate_p = torch.zeros((B, 0), device=device, dtype=dtype)
 
         # -----------------------------
         # Step 7) self -> old ego 복원 (현재만)
@@ -2611,8 +2609,6 @@ class NPCStatePerturbation:
         #       - 속도/데이터 손실을 줄이기 위해 "증강된 neighbor가 포함된 pair"만 검사
         # -----------------------------
         sel = sel_do  # ✅ 위에서 만든 걸 재사용
-        if int(sel.numel()) == 0:
-            return
 
         ego_xy_sel = torch.stack(
             [ego_cur_after[sel, self.IDX_X], ego_cur_after[sel, self.IDX_Y]],
@@ -2656,11 +2652,10 @@ class NPCStatePerturbation:
             # --- neighbor-neighbor collision (증강된 neighbor가 포함된 pair만) ---
             collide_nbr_sel = torch.zeros_like(collide_sel)  # (Bs,)
             if A > 1:
+                aug_nbr_sel_mask = aug_nbr[sel]  # (Bs, A)
                 any_aug_nbr_sel = torch.any(aug_nbr_sel_mask, dim=1)  # (Bs,)
-                idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[
-                    0]  # (Bs2,)
+                idx_sub = torch.nonzero(any_aug_nbr_sel, as_tuple=True)[0]
                 if int(idx_sub.numel()) != 0:
-                    # (i,j) 중 하나라도 증강된 neighbor이면 True
                     pair_mask_sub = (aug_nbr_sel_mask[idx_sub, :, None] |
                                      aug_nbr_sel_mask[
                                          idx_sub, None, :])  # (Bs2,A,A)
@@ -2694,49 +2689,79 @@ class NPCStatePerturbation:
         aug_nbr = aug_nbr & final_aug_sample_mask[:, None]
 
         # ego current 업데이트
-        if bool(torch.any(aug_ego[idx_keep])):
-            ego_agent_past[idx_keep, t_cur, self.IDX_X] = torch.where(
-                aug_ego[idx_keep], ego_cur_after[idx_keep, self.IDX_X],
-                ego_agent_past[idx_keep, t_cur, self.IDX_X])
-            ego_agent_past[idx_keep, t_cur, self.IDX_Y] = torch.where(
-                aug_ego[idx_keep], ego_cur_after[idx_keep, self.IDX_Y],
-                ego_agent_past[idx_keep, t_cur, self.IDX_Y])
-            ego_agent_past[idx_keep, t_cur, self.IDX_COS] = torch.where(
-                aug_ego[idx_keep], ego_cur_after[idx_keep, self.IDX_COS],
-                ego_agent_past[idx_keep, t_cur, self.IDX_COS])
-            ego_agent_past[idx_keep, t_cur, self.IDX_SIN] = torch.where(
-                aug_ego[idx_keep], ego_cur_after[idx_keep, self.IDX_SIN],
-                ego_agent_past[idx_keep, t_cur, self.IDX_SIN])
-            ego_agent_past[idx_keep, t_cur, self.IDX_VX] = torch.where(
-                aug_ego[idx_keep], ego_cur_after[idx_keep, self.IDX_VX],
-                ego_agent_past[idx_keep, t_cur, self.IDX_VX])
-            ego_agent_past[idx_keep, t_cur, self.IDX_VY] = torch.where(
-                aug_ego[idx_keep], ego_cur_after[idx_keep, self.IDX_VY],
-                ego_agent_past[idx_keep, t_cur, self.IDX_VY])
+        # ego current 업데이트 (GPU sync 없는 버전)
+        ego_keep_local = torch.nonzero(aug_ego[idx_keep], as_tuple=True)[
+            0]  # (Me,)
+        if int(ego_keep_local.numel()) != 0:
+            idx_ego_keep = idx_keep.index_select(0, ego_keep_local)  # (Me,)
+            ego_m = aug_ego[idx_ego_keep]  # (Me,) bool
 
-        # neighbor current 업데이트
-        if A > 0 and bool(torch.any(aug_nbr[idx_keep])):
-            mask = aug_nbr[idx_keep]  # (Bk,A)
-            # (Bk,A) -> (Bk,A,1)
-            m1 = mask.unsqueeze(-1)
-            nbr_past[idx_keep, :, t_cur, self.IDX_X] = torch.where(
-                m1[..., 0], nbr_cur_after[idx_keep, :, self.IDX_X],
-                nbr_past[idx_keep, :, t_cur, self.IDX_X])
-            nbr_past[idx_keep, :, t_cur, self.IDX_Y] = torch.where(
-                m1[..., 0], nbr_cur_after[idx_keep, :, self.IDX_Y],
-                nbr_past[idx_keep, :, t_cur, self.IDX_Y])
-            nbr_past[idx_keep, :, t_cur, self.IDX_COS] = torch.where(
-                m1[..., 0], nbr_cur_after[idx_keep, :, self.IDX_COS],
-                nbr_past[idx_keep, :, t_cur, self.IDX_COS])
-            nbr_past[idx_keep, :, t_cur, self.IDX_SIN] = torch.where(
-                m1[..., 0], nbr_cur_after[idx_keep, :, self.IDX_SIN],
-                nbr_past[idx_keep, :, t_cur, self.IDX_SIN])
-            nbr_past[idx_keep, :, t_cur, self.IDX_VX] = torch.where(
-                m1[..., 0], nbr_cur_after[idx_keep, :, self.IDX_VX],
-                nbr_past[idx_keep, :, t_cur, self.IDX_VX])
-            nbr_past[idx_keep, :, t_cur, self.IDX_VY] = torch.where(
-                m1[..., 0], nbr_cur_after[idx_keep, :, self.IDX_VY],
-                nbr_past[idx_keep, :, t_cur, self.IDX_VY])
+            ego_agent_past[idx_ego_keep, t_cur, self.IDX_X] = torch.where(
+                ego_m, ego_cur_after[idx_ego_keep, self.IDX_X],
+                ego_agent_past[idx_ego_keep, t_cur, self.IDX_X]
+            )
+            ego_agent_past[idx_ego_keep, t_cur, self.IDX_Y] = torch.where(
+                ego_m, ego_cur_after[idx_ego_keep, self.IDX_Y],
+                ego_agent_past[idx_ego_keep, t_cur, self.IDX_Y]
+            )
+            ego_agent_past[idx_ego_keep, t_cur, self.IDX_COS] = torch.where(
+                ego_m, ego_cur_after[idx_ego_keep, self.IDX_COS],
+                ego_agent_past[idx_ego_keep, t_cur, self.IDX_COS]
+            )
+            ego_agent_past[idx_ego_keep, t_cur, self.IDX_SIN] = torch.where(
+                ego_m, ego_cur_after[idx_ego_keep, self.IDX_SIN],
+                ego_agent_past[idx_ego_keep, t_cur, self.IDX_SIN]
+            )
+            ego_agent_past[idx_ego_keep, t_cur, self.IDX_VX] = torch.where(
+                ego_m, ego_cur_after[idx_ego_keep, self.IDX_VX],
+                ego_agent_past[idx_ego_keep, t_cur, self.IDX_VX]
+            )
+            ego_agent_past[idx_ego_keep, t_cur, self.IDX_VY] = torch.where(
+                ego_m, ego_cur_after[idx_ego_keep, self.IDX_VY],
+                ego_agent_past[idx_ego_keep, t_cur, self.IDX_VY]
+            )
+        # neighbor current 업데이트 (GPU sync 없는 버전)
+        if A > 0:
+            nbr_mask_keep = aug_nbr[idx_keep]  # (Bk, A)
+            nbr_rows = \
+            torch.nonzero(torch.any(nbr_mask_keep, dim=1), as_tuple=True)[
+                0]  # (Mn,)
+
+            if int(nbr_rows.numel()) != 0:
+                idx_nbr_keep = idx_keep.index_select(0, nbr_rows)  # (Mn,)
+                mask = aug_nbr[idx_nbr_keep]  # (Mn, A)
+                m1 = mask.unsqueeze(-1)  # (Mn, A, 1)
+
+                nbr_past[idx_nbr_keep, :, t_cur, self.IDX_X] = torch.where(
+                    m1[..., 0],
+                    nbr_cur_after[idx_nbr_keep, :, self.IDX_X],
+                    nbr_past[idx_nbr_keep, :, t_cur, self.IDX_X],
+                )
+                nbr_past[idx_nbr_keep, :, t_cur, self.IDX_Y] = torch.where(
+                    m1[..., 0],
+                    nbr_cur_after[idx_nbr_keep, :, self.IDX_Y],
+                    nbr_past[idx_nbr_keep, :, t_cur, self.IDX_Y],
+                )
+                nbr_past[idx_nbr_keep, :, t_cur, self.IDX_COS] = torch.where(
+                    m1[..., 0],
+                    nbr_cur_after[idx_nbr_keep, :, self.IDX_COS],
+                    nbr_past[idx_nbr_keep, :, t_cur, self.IDX_COS],
+                )
+                nbr_past[idx_nbr_keep, :, t_cur, self.IDX_SIN] = torch.where(
+                    m1[..., 0],
+                    nbr_cur_after[idx_nbr_keep, :, self.IDX_SIN],
+                    nbr_past[idx_nbr_keep, :, t_cur, self.IDX_SIN],
+                )
+                nbr_past[idx_nbr_keep, :, t_cur, self.IDX_VX] = torch.where(
+                    m1[..., 0],
+                    nbr_cur_after[idx_nbr_keep, :, self.IDX_VX],
+                    nbr_past[idx_nbr_keep, :, t_cur, self.IDX_VX],
+                )
+                nbr_past[idx_nbr_keep, :, t_cur, self.IDX_VY] = torch.where(
+                    m1[..., 0],
+                    nbr_cur_after[idx_nbr_keep, :, self.IDX_VY],
+                    nbr_past[idx_nbr_keep, :, t_cur, self.IDX_VY],
+                )
 
         # -----------------------------
         # Step 10) perturbed ego 기준 new ego 좌표계 변환(딱 1번)

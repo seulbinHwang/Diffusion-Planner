@@ -2,9 +2,9 @@ from __future__ import annotations
 import torch.nn as nn
 
 # from diffusion_planner.model.module.encoder import Encoder
-from diffusion_planner.model.module.encoder_wosac_2 import Encoder
+from diffusion_planner.model.module.encoder_wosac import Encoder
 # from diffusion_planner.model.module.decoder import Decoder
-from diffusion_planner.model.module.decoder_wosac_2 import Decoder
+from diffusion_planner.model.module.decoder_wosac import Decoder
 from typing import Iterator
 
 from dataclasses import dataclass
