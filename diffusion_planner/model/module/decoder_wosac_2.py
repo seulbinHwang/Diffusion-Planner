@@ -2504,6 +2504,42 @@ class CrossTopKCache:
     agent_pad_mask: torch.Tensor
     K: int
 
+from dataclasses import dataclass
+from typing import Optional
+import torch
+
+
+@dataclass(frozen=True)
+class SelfAttnUnpadCache:
+    """Self-Attention에서 unpad 관련 정보를 블록마다 다시 만들지 않기 위한 캐시입니다.
+
+    목적:
+        - key_padding_mask(=target_current_mask)가 한 forward 동안 고정일 때,
+          indices / cu_seqlens / max_seqlen 같은 "준비 정보"를 1번만 만들고 재사용합니다.
+
+    Attributes:
+        indices (torch.Tensor):
+            valid 토큰의 1D 인덱스입니다.
+            - shape: (T,)
+            - dtype: torch.int64
+            - 값 범위: [0, B*P)
+        cu_seqlens (torch.Tensor):
+            배치별 누적 길이입니다.
+            - shape: (B+1,)
+            - dtype: torch.int32
+        max_seqlen (int):
+            배치 안에서 valid 토큰 수의 최댓값입니다.
+        B (int):
+            배치 크기입니다.
+        P (int):
+            토큰 길이(여기서는 agent 수)입니다.
+    """
+    indices: torch.Tensor
+    cu_seqlens: torch.Tensor
+    max_seqlen: int
+    B: int
+    P: int
+
 class SimpleSelfAttention(nn.Module):
     def __init__(
         self,
@@ -2542,10 +2578,65 @@ class SimpleSelfAttention(nn.Module):
             touch = touch + p.view(-1)[:1].sum().to(dtype=ref.dtype, device=ref.device)
         return touch * 0.0
 
+    @staticmethod
+    def build_unpad_cache(key_padding_mask: torch.Tensor) -> SelfAttnUnpadCache:
+        """(B,P) 마스크에서 unpad에 필요한 정보를 1번만 만듭니다.
+
+        Args:
+            key_padding_mask (torch.Tensor):
+                pad 마스크입니다.
+                - shape: (B, P)
+                - dtype: bool 권장 (True=pad)
+
+        Returns:
+            SelfAttnUnpadCache:
+                - indices: (T,) int64
+                - cu_seqlens: (B+1,) int32
+                - max_seqlen: int
+                - B, P: int
+        """
+        if key_padding_mask.dim() != 2:
+            raise ValueError(
+                f"key_padding_mask must be (B,P). got {tuple(key_padding_mask.shape)}"
+            )
+
+        if key_padding_mask.dtype != torch.bool:
+            key_padding_mask = key_padding_mask.to(torch.bool)
+
+        B, P = key_padding_mask.shape
+        valid_mask = (~key_padding_mask).to(torch.bool)  # (B,P)
+
+        # seqlens: (B,) int32
+        seqlens = valid_mask.sum(dim=1).to(dtype=torch.int32)
+
+        # cu_seqlens: (B+1,) int32
+        cu_seqlens = torch.zeros(
+            (int(B) + 1,),
+            device=key_padding_mask.device,
+            dtype=torch.int32,
+        )
+        if int(B) > 0:
+            cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
+
+        max_seqlen = int(seqlens.max().item()) if int(B) > 0 else 0
+
+        # indices: (T,) int64  (flatten된 (B*P)에서 valid 위치)
+        indices = torch.nonzero(valid_mask.reshape(-1), as_tuple=False).squeeze(-1)
+        indices = indices.to(dtype=torch.int64)
+
+        return SelfAttnUnpadCache(
+            indices=indices,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=int(max_seqlen),
+            B=int(B),
+            P=int(P),
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # (B, P, H)
         key_padding_mask: torch.Tensor,  # (B, P) True=pad
+        unpad_cache: Optional[SelfAttnUnpadCache] = None,
     ) -> torch.Tensor:
         if x.dim() != 3:
             raise ValueError(f"x must be (B,P,H). got {tuple(x.shape)}")
@@ -2554,9 +2645,73 @@ class SimpleSelfAttention(nn.Module):
         if key_padding_mask.dtype != torch.bool:
             key_padding_mask = key_padding_mask.to(torch.bool)
 
-        # 유효 토큰(True=valid)만 unpad
-        valid_mask = (~key_padding_mask).to(torch.bool)  # (B,P)
+        # -------- fast path: cache 재사용 --------
+        if unpad_cache is not None:
+            if int(unpad_cache.B) != int(B) or int(unpad_cache.P) != int(P):
+                raise ValueError(
+                    "unpad_cache shape mismatch. "
+                    f"cache(B,P)=({unpad_cache.B},{unpad_cache.P}), input(B,P)=({B},{P})"
+                )
 
+            indices = unpad_cache.indices
+            if indices.device != x.device:
+                indices = indices.to(device=x.device)
+            if indices.dtype != torch.int64:
+                indices = indices.to(dtype=torch.int64)
+
+            max_seqlen_int = int(unpad_cache.max_seqlen)
+            T = int(indices.numel())
+
+            # 유효 토큰이 0개면: 출력은 전부 0 (하지만 파라미터는 0계수로 연결)
+            if T == 0 or max_seqlen_int == 0:
+                out = x.new_zeros((B, P, H))
+                out = out + self._touch_params_zero(out)
+                out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+                return out
+
+            x_flat = x.reshape(int(B) * int(P), int(H))  # (B*P, H)
+            x_unpad = x_flat.index_select(0, indices)  # (T, H)
+
+            comp_dtype = self._get_compute_dtype(x_unpad)
+            if comp_dtype not in (torch.float16, torch.bfloat16):
+                raise RuntimeError(
+                    f"FlashAttention compute dtype must be fp16/bf16. got {comp_dtype}. "
+                    "autocast(bf16/fp16) 켜거나 모델/입력을 half/bfloat16으로 맞춰주세요."
+                )
+
+            qkv = self.qkv(x_unpad)  # (T, 3H)
+            qkv = qkv.view(T, 3, self.heads, self.head_dim).to(dtype=comp_dtype)
+
+            cu = unpad_cache.cu_seqlens
+            if cu.device != qkv.device:
+                cu = cu.to(device=qkv.device)
+            cu = cu.to(dtype=torch.int32)
+
+            drop_p = self.attn_drop if self.training else 0.0
+
+            out_unpad = flash_attn_varlen_qkvpacked_func(
+                qkv,
+                cu_seqlens=cu,
+                max_seqlen=max_seqlen_int,
+                dropout_p=float(drop_p),
+                softmax_scale=None,
+                causal=False,
+            )  # (T, heads, head_dim)
+
+            out_unpad = out_unpad.reshape(T, H)  # (T, H)
+            out_unpad = self.out_proj(out_unpad.to(dtype=x_unpad.dtype))
+            out_unpad = self.proj_drop(out_unpad)
+
+            # pad back: (B*P, H) -> (B, P, H)
+            out_flat = x.new_zeros((int(B) * int(P), int(H)))  # (B*P, H)
+            out_flat = out_flat.index_copy(0, indices, out_unpad)
+            out = out_flat.view(int(B), int(P), int(H))
+
+            out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+            return out
+
+        # -------- fallback path: 기존 로직 유지(unpad_input/pad_input) --------
+        valid_mask = (~key_padding_mask).to(torch.bool)  # (B,P)
         res = unpad_input(x, valid_mask)
         if len(res) == 4:
             x_unpad, indices, cu_seqlens, max_seqlen = res
@@ -2568,14 +2723,12 @@ class SimpleSelfAttention(nn.Module):
         T = int(x_unpad.shape[0])
         max_seqlen_int = int(max_seqlen) if not isinstance(max_seqlen, int) else int(max_seqlen)
 
-        # 유효 토큰이 0개면: 출력은 전부 0 (하지만 파라미터는 0계수로 연결)
         if T == 0 or max_seqlen_int == 0:
             out = x.new_zeros((B, P, H))
             out = out + self._touch_params_zero(out)
             out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
             return out
 
-        # FlashAttention은 보통 fp16/bf16만 안정적으로 지원하는 경우가 많음
         comp_dtype = self._get_compute_dtype(x_unpad)
         if comp_dtype not in (torch.float16, torch.bfloat16):
             raise RuntimeError(
@@ -2583,36 +2736,28 @@ class SimpleSelfAttention(nn.Module):
                 "autocast(bf16/fp16) 켜거나 모델/입력을 half/bfloat16으로 맞춰주세요."
             )
 
-        # qkv: (T, 3H) -> (T, 3, heads, head_dim)
         qkv = self.qkv(x_unpad)  # (T, 3H)
         qkv = qkv.view(T, 3, self.heads, self.head_dim).to(dtype=comp_dtype)
 
         cu = cu_seqlens.to(device=qkv.device, dtype=torch.int32)
-
         drop_p = self.attn_drop if self.training else 0.0
 
-        # out: (T, heads, head_dim)
         out = flash_attn_varlen_qkvpacked_func(
             qkv,
             cu_seqlens=cu,
             max_seqlen=max_seqlen_int,
             dropout_p=float(drop_p),
-            softmax_scale=None,  # 기본 1/sqrt(head_dim)
+            softmax_scale=None,
             causal=False,
         )
 
-        # (T, H)
         out = out.reshape(T, H)
-
-        # out_proj + dropout (dtype는 입력과 맞춤)
         out = self.out_proj(out.to(dtype=x_unpad.dtype))
         out = self.proj_drop(out)
 
-        # pad back: (B, P, H)
         out = pad_input(out, indices, B, P)
         out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         return out
-
 
 class TopKScoreBiasedCrossAttention(nn.Module):
     def __init__(
@@ -2778,26 +2923,28 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         )
 
     def forward(
-        self,
-        *,
-        query: torch.Tensor,  # (B, P, H)
-        agent_pose4: torch.Tensor,  # (B, P, 4)
-        target_current_mask: torch.Tensor,  # (B, P) True=pad
-        scene_encoding_token: torch.Tensor,  # (B, token_num, H)
-        scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
-        scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
-        score_beta: torch.Tensor,  # scalar
-        topk_cache: Optional[CrossTopKCache] = None,
+            self,
+            *,
+            query: torch.Tensor,  # (B, P, H)
+            agent_pose4: torch.Tensor,  # (B, P, 4)
+            target_current_mask: torch.Tensor,  # (B, P) True=pad
+            scene_encoding_token: torch.Tensor,  # (B, token_num, H)
+            scene_encoding_token_mask: torch.Tensor,  # (B, token_num) True=pad
+            scene_encoding_pos_2d: torch.Tensor,  # (B, token_num, 9)
+            score_beta: torch.Tensor,  # scalar
+            topk_cache: Optional[CrossTopKCache] = None,
     ) -> torch.Tensor:
         if query.dim() != 3:
             raise ValueError(f"query must be (B,P,H). got {tuple(query.shape)}")
         if agent_pose4.dim() != 3 or int(agent_pose4.shape[-1]) != 4:
-            raise ValueError(f"agent_pose4 must be (B,P,4). got {tuple(agent_pose4.shape)}")
+            raise ValueError(
+                f"agent_pose4 must be (B,P,4). got {tuple(agent_pose4.shape)}")
         if scene_encoding_token.dim() != 3:
             raise ValueError(
                 f"scene_encoding_token must be (B,token_num,H). got {tuple(scene_encoding_token.shape)}"
             )
-        if scene_encoding_pos_2d.dim() != 3 or int(scene_encoding_pos_2d.shape[-1]) != 9:
+        if scene_encoding_pos_2d.dim() != 3 or int(
+                scene_encoding_pos_2d.shape[-1]) != 9:
             raise ValueError(
                 f"scene_encoding_pos_2d must be (B,token_num,9). got {tuple(scene_encoding_pos_2d.shape)}"
             )
@@ -2829,7 +2976,13 @@ class TopKScoreBiasedCrossAttention(nn.Module):
 
         out_all = query.new_zeros((B, P, H))
         chunk = max(1, int(self.agent_chunk_size))
-        beta_f32: torch.Tensor = score_beta.to(device=query.device, dtype=torch.float32)
+        beta_f32: torch.Tensor = score_beta.to(device=query.device,
+                                               dtype=torch.float32)
+
+        # ✅ 핵심 최적화: K/V projection을 token 전체에 대해 1번만 수행
+        # k_all, v_all: (B, token_num, H)
+        k_all = self.k_proj(scene_encoding_token)
+        v_all = self.v_proj(scene_encoding_token)
 
         for start in range(0, P, chunk):
             end = min(P, start + chunk)
@@ -2838,34 +2991,53 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             q_chunk = query[:, start:end, :]  # (B,Pc,H)
             agent_pad_chunk = topk_cache.agent_pad_mask[:, start:end]  # (B,Pc)
 
-            topk_idx = topk_cache.topk_idx[:, start:end, :]          # (B,Pc,K)
-            sel_pad_mask = topk_cache.sel_pad_mask[:, start:end, :]   # (B,Pc,K)
-            score_keep = topk_cache.score_keep_f32[:, start:end, :]   # (B,Pc,K) float32
+            topk_idx = topk_cache.topk_idx[:, start:end, :]  # (B,Pc,K)
+            sel_pad_mask = topk_cache.sel_pad_mask[:, start:end, :]  # (B,Pc,K)
+            score_keep = topk_cache.score_keep_f32[
+                :, start:end, :]  # (B,Pc,K) float32
 
-            # kv_sel: (B,Pc,K,H)
-            idx_exp = topk_idx.unsqueeze(-1).expand(B, Pc, K, H)
-            kv_sel = torch.gather(
-                scene_encoding_token.unsqueeze(1).expand(B, Pc, token_num, H),
+            # q_lin: (B,Pc,H)
+            q_lin = self.q_proj(q_chunk)
+
+            # ✅ gather는 projection 이후에 수행 (출력 의미 동일)
+            idx_exp = topk_idx.unsqueeze(-1).expand(B, Pc, K, H)  # (B,Pc,K,H)
+
+            # k_sel, v_sel: (B,Pc,K,H)
+            k_sel = torch.gather(
+                k_all.unsqueeze(1).expand(B, Pc, token_num, H),
                 dim=2,
                 index=idx_exp,
             )
-            kv_sel = kv_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
+            v_sel = torch.gather(
+                v_all.unsqueeze(1).expand(B, Pc, token_num, H),
+                dim=2,
+                index=idx_exp,
+            )
 
-            q_lin = self.q_proj(q_chunk)  # (B,Pc,H)
-            k_lin = self.k_proj(kv_sel)   # (B,Pc,K,H)
-            v_lin = self.v_proj(kv_sel)   # (B,Pc,K,H)
+            # 안전장치: mask 위치는 0으로 (0*NaN 같은 문제 방지)
+            k_sel = k_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
+            v_sel = v_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
 
-            qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1, 3)        # (B,h,Pc,hd)
-            kh = k_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
-            vh = v_lin.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3, 1, 2, 4)  # (B,h,Pc,K,hd)
+            qh = q_lin.view(B, Pc, self.heads, self.head_dim).permute(0, 2, 1,
+                                                                      3)  # (B,h,Pc,hd)
+            kh = k_sel.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3,
+                                                                         1, 2,
+                                                                         4)  # (B,h,Pc,K,hd)
+            vh = v_sel.view(B, Pc, K, self.heads, self.head_dim).permute(0, 3,
+                                                                         1, 2,
+                                                                         4)  # (B,h,Pc,K,hd)
 
-            logits = (qh.to(torch.float32).unsqueeze(3) * kh.to(torch.float32)).sum(dim=-1) * float(self.scale)  # (B,h,Pc,K)
+            logits = (qh.to(torch.float32).unsqueeze(3) * kh.to(
+                torch.float32)).sum(dim=-1) * float(self.scale)  # (B,h,Pc,K)
             logits = logits + beta_f32 * score_keep.unsqueeze(1)  # (B,h,Pc,K)
 
-            attn = self._masked_softmax(logits, mask=sel_pad_mask.unsqueeze(1), dim=-1)  # (B,h,Pc,K)
-            out = (attn.unsqueeze(-1) * vh.to(torch.float32)).sum(dim=3)  # (B,h,Pc,hd)
+            attn = self._masked_softmax(logits, mask=sel_pad_mask.unsqueeze(1),
+                                        dim=-1)  # (B,h,Pc,K)
+            out = (attn.unsqueeze(-1) * vh.to(torch.float32)).sum(
+                dim=3)  # (B,h,Pc,hd)
 
-            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc, H).to(dtype=q_chunk.dtype)
+            out = out.permute(0, 2, 1, 3).contiguous().view(B, Pc, H).to(
+                dtype=q_chunk.dtype)
             out = self.out_proj(out)
             out = self.proj_drop(out)
 
@@ -2923,7 +3095,8 @@ class DiTBlock(nn.Module):
             agent_pose4: torch.Tensor,  # (B, P, 4)
             ca_score_beta: torch.Tensor,  # scalar
             pram_v2_modulations: Dict[str, ModulationTriplet],
-            ca_topk_cache: Optional[CrossTopKCache] = None,  # ✅ 추가
+            ca_topk_cache: Optional[CrossTopKCache] = None,
+            sa_unpad_cache: Optional[SelfAttnUnpadCache] = None,  # ✅ 추가
     ) -> torch.Tensor:
         if target_current_mask.dtype != torch.bool:
             target_current_mask = target_current_mask.to(torch.bool)
@@ -2932,11 +3105,12 @@ class DiTBlock(nn.Module):
         sa_mod = pram_v2_modulations["SA"]
         h = self.norm_sa(x)
         h = self._apply_modulation(h, sa_mod)
-        sa_out = self.sa(h, key_padding_mask=target_current_mask)
+        sa_out = self.sa(h, key_padding_mask=target_current_mask,
+                         unpad_cache=sa_unpad_cache)  # ✅ cache 전달
         sa_out = sa_out * sa_mod.gate
         x = x + self.drop_path_sa(sa_out)
 
-        # ---- CA ----
+        # ---- CA ---- (기존 그대로)
         ca_mod = pram_v2_modulations["CA"]
         h = self.norm_ca(x)
         h = self._apply_modulation(h, ca_mod)
@@ -2948,12 +3122,12 @@ class DiTBlock(nn.Module):
             scene_encoding_token_mask=cross_mask,
             scene_encoding_pos_2d=cross_pos_2d,
             score_beta=ca_score_beta,
-            topk_cache=ca_topk_cache,  # ✅ 추가
+            topk_cache=ca_topk_cache,
         )
         ca_out = ca_out * ca_mod.gate
         x = x + self.drop_path_ca(ca_out)
 
-        # ---- FFN ----
+        # ---- FFN ---- (기존 그대로)
         ffn_mod = pram_v2_modulations["FFN"]
         h = self.norm_ffn(x)
         h = self._apply_modulation(h, ffn_mod)
@@ -3637,6 +3811,14 @@ class DiT(nn.Module):
                                                            device=x.device)
         ca_score_beta_for_ca: torch.Tensor = self._get_ca_score_beta_for_cross_attention()  # shape: ()
 
+        # target_current_mask가 준비된 뒤(블록 루프 전에) 1번만 생성
+        sa_unpad_cache: Optional[SelfAttnUnpadCache] = None
+        use_sa_cache: bool = bool(
+            getattr(self.config, "sa_unpad_cache_enabled", True))
+        if use_sa_cache:
+            sa_unpad_cache = SimpleSelfAttention.build_unpad_cache(
+                key_padding_mask=target_current_mask  # (B,P) True=pad
+            )
         for block_index, block in enumerate(self.blocks):
             # SA mods
             ds_sa = ds_time + ds_base * k_s[block_index, 0]
@@ -3679,7 +3861,8 @@ class DiT(nn.Module):
                 agent_pose4=agent_pose4,
                 ca_score_beta=ca_score_beta_for_ca,
                 pram_v2_modulations=pram_mods,
-                ca_topk_cache=ca_topk_cache,  # ✅ 추가
+                ca_topk_cache=ca_topk_cache,
+                sa_unpad_cache=sa_unpad_cache,  # ✅ 추가
             )
 
         # feasible용 저장
