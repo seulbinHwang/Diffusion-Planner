@@ -2793,6 +2793,57 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         self.proj_drop = nn.Dropout(float(proj_drop))
 
     @staticmethod
+    def _gather_tokens_by_topk(
+        token_all: torch.Tensor,       # (B, token_num, H)
+        topk_idx: torch.Tensor,        # (B, Pc, K)
+        batch_index: torch.Tensor,     # (B, 1, 1)
+    ) -> torch.Tensor:
+        """(B, token_num, H)에서 (B, Pc, K, H)만 빠르게 뽑습니다.
+
+        목적:
+            - token_all을 (B,Pc,token_num,H)로 expand한 뒤 gather하는 방식은,
+              구현은 간단하지만 내부 처리 부담이 커서 느려질 수 있습니다.
+            - 여기서는 "배치 인덱싱"을 사용해 expand 없이 바로 (B,Pc,K,H)를 만듭니다.
+
+        Args:
+            token_all (torch.Tensor):
+                전체 토큰 텐서.
+                shape: (B, token_num, H)
+            topk_idx (torch.Tensor):
+                top-k 토큰 인덱스.
+                shape: (B, Pc, K)
+                dtype: int64 권장
+            batch_index (torch.Tensor):
+                배치 인덱스.
+                shape: (B, 1, 1)
+                dtype: int64 권장
+
+        Returns:
+            torch.Tensor:
+                선택된 토큰.
+                shape: (B, Pc, K, H)
+        """
+        if token_all.dim() != 3:
+            raise ValueError(f"token_all must be (B,token_num,H). got {tuple(token_all.shape)}")
+        if topk_idx.dim() != 3:
+            raise ValueError(f"topk_idx must be (B,Pc,K). got {tuple(topk_idx.shape)}")
+        if batch_index.dim() != 3:
+            raise ValueError(f"batch_index must be (B,1,1). got {tuple(batch_index.shape)}")
+
+        B = int(token_all.shape[0])
+        if int(topk_idx.shape[0]) != B:
+            raise ValueError(
+                "topk_idx batch size mismatch. "
+                f"B_token={B}, B_idx={int(topk_idx.shape[0])}"
+            )
+
+        idx = topk_idx.to(device=token_all.device, dtype=torch.long)
+        b = batch_index.to(device=token_all.device, dtype=torch.long)
+
+        # 결과: (B, Pc, K, H)
+        return token_all[b, idx]
+
+    @staticmethod
     def _masked_softmax(
         logits: torch.Tensor,  # (..., K)
         mask: torch.Tensor,    # (..., K) True=가릴 위치
@@ -2984,6 +3035,10 @@ class TopKScoreBiasedCrossAttention(nn.Module):
         k_all = self.k_proj(scene_encoding_token)
         v_all = self.v_proj(scene_encoding_token)
 
+        # ✅ expand 없이 뽑기 위한 배치 인덱스 (B,1,1)
+        batch_index = torch.arange(B, device=query.device,
+                                   dtype=torch.long).view(B, 1, 1)
+
         for start in range(0, P, chunk):
             end = min(P, start + chunk)
             Pc = int(end - start)
@@ -2999,22 +3054,19 @@ class TopKScoreBiasedCrossAttention(nn.Module):
             # q_lin: (B,Pc,H)
             q_lin = self.q_proj(q_chunk)
 
-            # ✅ gather는 projection 이후에 수행 (출력 의미 동일)
-            idx_exp = topk_idx.unsqueeze(-1).expand(B, Pc, K, H)  # (B,Pc,K,H)
+            # ✅ (B,token_num,H)에서 바로 (B,Pc,K,H)로 뽑기 (expand 제거)
+            k_sel = self._gather_tokens_by_topk(
+                token_all=k_all,  # (B, token_num, H)
+                topk_idx=topk_idx,  # (B, Pc, K)
+                batch_index=batch_index  # (B, 1, 1)
+            )  # (B,Pc,K,H)
+            v_sel = self._gather_tokens_by_topk(
+                token_all=v_all,
+                topk_idx=topk_idx,
+                batch_index=batch_index
+            )  # (B,Pc,K,H)
 
-            # k_sel, v_sel: (B,Pc,K,H)
-            k_sel = torch.gather(
-                k_all.unsqueeze(1).expand(B, Pc, token_num, H),
-                dim=2,
-                index=idx_exp,
-            )
-            v_sel = torch.gather(
-                v_all.unsqueeze(1).expand(B, Pc, token_num, H),
-                dim=2,
-                index=idx_exp,
-            )
-
-            # 안전장치: mask 위치는 0으로 (0*NaN 같은 문제 방지)
+            # mask 위치는 0으로
             k_sel = k_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
             v_sel = v_sel.masked_fill(sel_pad_mask.unsqueeze(-1), 0.0)
 
