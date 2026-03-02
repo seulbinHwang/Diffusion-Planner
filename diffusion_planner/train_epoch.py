@@ -1177,10 +1177,13 @@ def train_epoch(
             time_len=int(getattr(args, "time_len", 21)),
             future_len=int(getattr(args, "future_len", 80)),
         )
-
     for batch in data_loader:
+        # ✅ (추가) profile_block 활성화 여부/디바이스 타입을 step 초반에 준비
+        enable_profile: bool = bool(getattr(args, "profile_feasible", False))
+        device_type: str = ("cuda" if "cuda" in str(args.device) else "cpu")
+
         inputs, outputs = _prepare_batch_for_device(batch, device=args.device)
-        # ✅ (추가) 정규화 전에 증강 적용
+
         # ✅ (추가) 정규화 전에 증강 적용
         if npc_state_augmenter is not None:
             # ---- 시각화 on/off ----
@@ -1206,7 +1209,6 @@ def train_epoch(
                 debug_vel_arrow_len_m: float = float(
                     os.environ.get("DP_NPC_AUG_VIS_VEL_ARROW_LEN_M", "1.0"))
             else:
-                # ✅ 완전 OFF: apply_inplace 내부에서 debug 관련 분기 자체가 절대 실행되지 않게
                 debug_vis_dir = None
                 debug_step = None
                 debug_max_scenes = 0
@@ -1215,22 +1217,29 @@ def train_epoch(
                 debug_future_stride = 1
                 debug_vel_arrow_len_m = 1.0
 
-            npc_state_augmenter.apply_inplace(
-                inputs=inputs,
-                outputs=outputs,
-                augment_prob=float(getattr(args, "augment_prob", 0.5)),
-                agent_prob=float(getattr(args, "augment_prob", 0.5)),
-                use_body_vel=bool(getattr(args, "use_body_vel", True)),
+            # ✅ (추가) apply_inplace 구간 시간 측정
+            with profile_block(
+                    "train_epoch.npc_state_augmenter.apply_inplace",
+                    enabled=enable_profile,
+                    device_type=device_type,
+            ):
+                npc_state_augmenter.apply_inplace(
+                    inputs=inputs,
+                    outputs=outputs,
+                    augment_prob=float(getattr(args, "augment_prob", 0.5)),
+                    agent_prob=float(getattr(args, "augment_prob", 0.5)),
+                    use_body_vel=bool(getattr(args, "use_body_vel", True)),
 
-                # ---- debug vis args ----
-                debug_vis_dir=debug_vis_dir,
-                debug_step=debug_step,
-                debug_max_scenes=debug_max_scenes,
-                debug_every_n_steps=debug_every_n_steps,
-                debug_past_stride=debug_past_stride,
-                debug_future_stride=debug_future_stride,
-                debug_vel_arrow_len_m=debug_vel_arrow_len_m,
-            )
+                    # ---- debug vis args ----
+                    debug_vis_dir=debug_vis_dir,
+                    debug_step=debug_step,
+                    debug_max_scenes=debug_max_scenes,
+                    debug_every_n_steps=debug_every_n_steps,
+                    debug_past_stride=debug_past_stride,
+                    debug_future_stride=debug_future_stride,
+                    debug_vel_arrow_len_m=debug_vel_arrow_len_m,
+                )
+
         # 1) 관측 정규화
         norm_inputs: Dict[str,
                           torch.Tensor] = args.observation_normalizer(inputs)
